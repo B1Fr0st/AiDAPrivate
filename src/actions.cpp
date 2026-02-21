@@ -1,0 +1,825 @@
+#include "aida_pro.hpp"
+#include <regex>
+#include "chat_widget.hpp"
+
+static bool ensure_ai_client(aida_plugin_t* plugin)
+{
+    if (!plugin || !plugin->ai_client || !plugin->ai_client->is_available())
+    {
+        warning(OBFSTR_C("AiDA: No AI client is available. Please configure a provider in Settings."));
+        return false;
+    }
+    return true;
+}
+
+int idaapi action_handler::activate(action_activation_ctx_t* ctx)
+{
+    action_func(ctx, plugin);
+    return 1;
+}
+
+action_state_t idaapi action_handler::update(action_update_ctx_t* ctx)
+{
+    if (action_func == handle_toggle_mcp)
+    {
+        bool is_running = plugin->mcp_server && plugin->mcp_server->is_running();
+        update_action_label("ai_assistant:toggle_mcp",
+            is_running ? "Stop MCP Server" : "Start MCP Server");
+        return AST_ENABLE_ALWAYS;
+    }
+
+    if (action_func == handle_show_settings || action_func == handle_scan_for_offsets
+        || action_func == handle_check_for_updates || action_func == handle_open_chat
+        || action_func == handle_cancel_request || action_func == handle_save_database_context)
+        return AST_ENABLE_ALWAYS;
+
+    return (ctx->widget_type == BWN_PSEUDOCODE || ctx->widget_type == BWN_DISASM)
+        ? AST_ENABLE : AST_DISABLE;
+}
+
+void handle_analyze_function(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
+{
+    if (!ensure_ai_client(plugin)) return;
+    func_t* pfn = ida_utils::get_function_for_item(ctx->cur_ea);
+    if (pfn == nullptr)
+        return;
+    const ea_t func_ea = pfn->start_ea;
+
+    auto on_complete = [func_ea](const std::string& analysis) {
+        action_helpers::handle_ai_response(analysis, "AI Analysis for 0x%a",
+            [func_ea](const std::string& content) {
+                qstring title;
+                title.sprnt("AI Analysis for 0x%a", func_ea);
+                show_text_in_viewer(title.c_str(), content);
+            });
+    };
+    plugin->ai_client->analyze_function(func_ea, on_complete);
+}
+
+void handle_auto_comment(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
+{
+    if (!ensure_ai_client(plugin)) return;
+    func_t* pfn = ida_utils::get_function_for_item(ctx->cur_ea);
+    if (pfn == nullptr)
+        return;
+    const ea_t func_ea = pfn->start_ea;
+
+    auto on_complete = [func_ea](const std::string& json_comments) {
+        action_helpers::handle_ai_response(json_comments, "AI Comments",
+            [func_ea](const std::string& content) {
+                std::string json_str = content;
+                static const std::regex md_json_re("```(?:json)?\\s*([\\s\\S]*?)\\s*```");
+                std::smatch match;
+                if (std::regex_search(content, match, md_json_re) && match.size() > 1)
+                {
+                    json_str = match[1].str();
+                }
+
+                try
+                {
+                    cfuncptr_t cfunc(nullptr);
+                    if (init_hexrays_plugin())
+                    {
+                        func_t* pfn_for_decomp = get_func(func_ea);
+                        if (pfn_for_decomp != nullptr)
+                        {
+                            try { cfunc = decompile(pfn_for_decomp); }
+                            catch (const vd_failure_t&)
+                            {
+                                msg(OBFSTR_C("AiDA: Decompilation failed for 0x%a, comments will only be added to disassembly.\n"), func_ea);
+                            }
+                        }
+                    }
+
+                    auto comments = nlohmann::json::parse(json_str);
+                    if (!comments.is_array())
+                    {
+                        warning(OBFSTR_C("AiDA: AI response for comments is not a JSON array."));
+                        return;
+                    }
+
+                    int count = 0;
+                    for (const auto& item : comments)
+                    {
+                        if (!item.is_object() || !item.contains("address") || !item.contains("comment"))
+                            continue;
+
+                        std::string addr_str = item["address"];
+                        std::string comment_str = item["comment"];
+
+                        ea_t ea;
+                        if (sscanf(addr_str.c_str(), "0x%llX", &ea) != 1 && sscanf(addr_str.c_str(), "%llX", &ea) != 1)
+                            continue;
+
+                        if (!is_mapped(ea))
+                            continue;
+
+                        qstring q_comment = comment_str.c_str();
+                        q_comment.trim2();
+                        if (q_comment.empty())
+                            continue;
+
+                        qstring existing_comment;
+                        get_cmt(&existing_comment, ea, false);
+
+                        qstring new_comment;
+                        if (existing_comment.empty())
+                        {
+                            new_comment = q_comment;
+                        }
+                        else
+                        {
+                            new_comment.sprnt("%s\n%s", q_comment.c_str(), existing_comment.c_str());
+                        }
+                        
+                        set_cmt(ea, new_comment.c_str(), false);
+                        count++;
+
+                        if (cfunc != nullptr)
+                        {
+                            treeloc_t loc;
+                            loc.ea = ea;
+                            loc.itp = ITP_BLOCK1;
+
+                            const char* existing_pcomment = cfunc->get_user_cmt(loc, RETRIEVE_ALWAYS);
+                            qstring new_pcomment;
+                            if (existing_pcomment == nullptr || *existing_pcomment == '\0')
+                            {
+                                new_pcomment = q_comment;
+                            }
+                            else
+                            {
+                                new_pcomment.sprnt("%s\n%s", q_comment.c_str(), existing_pcomment);
+                            }
+                            cfunc->set_user_cmt(loc, new_pcomment.c_str());
+                        }
+                    }
+
+                    if (count > 0)
+                    {
+                        msg(OBFSTR_C("AiDA: Added %d comments to function at 0x%a.\n"), count, func_ea);
+                        if (cfunc != nullptr)
+                        {
+                            cfunc->save_user_cmts();
+                            cfunc->refresh_func_ctext(); 
+                        }
+                        mark_builtin_widgets(IWID_DISASM);
+                    }
+                    else
+                    {
+                        msg(OBFSTR_C("AiDA: AI did not provide any valid comments.\n"));
+                    }
+                }
+                catch (const nlohmann::json::parse_error& e)
+                {
+                    warning(OBFSTR_C("AiDA: Failed to parse AI response as JSON: %s"), e.what());
+                }
+            });
+    };
+    plugin->ai_client->generate_comments(func_ea, on_complete);
+}
+
+void handle_generate_struct(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
+{
+    if (!ensure_ai_client(plugin)) return;
+    func_t* pfn = ida_utils::get_function_for_item(ctx->cur_ea);
+    if (pfn == nullptr)
+        return;
+    const ea_t func_ea = pfn->start_ea;
+
+    auto on_complete = [func_ea](const std::string& struct_cpp) {
+        action_helpers::handle_ai_response(struct_cpp, "Generated Struct",
+            [func_ea](const std::string& content) {
+                std::string target_param;
+                static const std::regex apply_to_re("//\\s*APPLY_TO:\\s*(\\S+)");
+                std::smatch apply_match;
+                if (std::regex_search(content, apply_match, apply_to_re) && apply_match.size() > 1)
+                {
+                    target_param = apply_match[1].str();
+                    msg(OBFSTR_C("AiDA: AI suggests applying type to parameter '%s'.\n"), target_param.c_str());
+                }
+                ida_utils::apply_struct_from_cpp_ex(content, func_ea, target_param);
+            });
+    };
+    plugin->ai_client->generate_struct(func_ea, on_complete);
+}
+
+void handle_generate_hook(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
+{
+    if (!ensure_ai_client(plugin)) return;
+    func_t* pfn = ida_utils::get_function_for_item(ctx->cur_ea);
+    if (pfn == nullptr)
+        return;
+    const ea_t func_ea = pfn->start_ea;
+
+    auto on_complete = [func_ea](const std::string& hook_code) {
+        action_helpers::handle_ai_response(hook_code, "Generated Hook",
+            [func_ea](const std::string& content) {
+                qstring func_name;
+                get_func_name(&func_name, func_ea);
+                qstring title;
+                title.sprnt("MinHook Snippet for %s", func_name.c_str());
+                show_text_in_viewer(title.c_str(), content);
+            });
+    };
+    plugin->ai_client->generate_hook(func_ea, on_complete);
+}
+
+void handle_copy_context(action_activation_ctx_t* ctx, aida_plugin_t*)
+{
+    func_t* pfn = ida_utils::get_function_for_item(ctx->cur_ea);
+    if (pfn == nullptr)
+        return;
+    const ea_t func_ea = pfn->start_ea;
+
+    nlohmann::json context = ida_utils::get_context_for_prompt(func_ea, true);
+    
+    if (!(context.contains("ok") && context["ok"].is_boolean() && context["ok"].get<bool>()))
+    {
+        warning(OBFSTR_C("AiDA: Failed to gather context: %s"), json_str(context, "message", "Unknown error").c_str());
+        return;
+    }
+
+    std::string clipboard_text = ida_utils::format_context_for_clipboard(context);
+
+    if (ida_utils::set_clipboard_text(clipboard_text.c_str()))
+    {
+        qstring func_name;
+        get_func_name(&func_name, func_ea);
+        msg(OBFSTR_C("AiDA: Context for function '%s' (0x%a) copied to clipboard.\n"), func_name.c_str(), func_ea);
+    }
+    else
+    {
+        warning(OBFSTR_C("AiDA: Failed to copy context to clipboard."));
+    }
+}
+
+void handle_rename_all(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
+{
+    if (!ensure_ai_client(plugin)) return;
+    func_t* pfn = ida_utils::get_function_for_item(ctx->cur_ea);
+    if (pfn == nullptr)
+        return;
+    const ea_t func_ea = pfn->start_ea;
+
+    auto on_complete = [func_ea](const std::string& rename_suggestions) {
+        action_helpers::handle_ai_response(rename_suggestions, "Rename Suggestions",
+            [func_ea](const std::string& content) {
+                qstring summary = ida_utils::apply_renames_from_ai(func_ea, content);
+                if (summary.empty())
+                {
+                    msg(OBFSTR_C("AiDA: No valid renames suggested by AI or nothing to rename.\n"));
+                    return;
+                }
+
+                qstring title;
+                title.sprnt("Renaming summary for 0x%a", func_ea);
+                show_text_in_viewer(title.c_str(), summary.c_str());
+
+                if (init_hexrays_plugin())
+                {
+                    mark_cfunc_dirty(func_ea, true);
+                }
+                mark_builtin_widgets(IWID_DISASM | IWID_PSEUDOCODE);
+            });
+    };
+    plugin->ai_client->rename_all(func_ea, on_complete);
+}
+
+void handle_scan_for_offsets(action_activation_ctx_t*, aida_plugin_t*)
+{
+    msg("====================================================\n");
+    msg("--- Starting Unreal Engine Pointer Scan ---\n");
+    warning("Scan for Engine Pointers is not yet implemented in the C++ version.");
+}
+
+void handle_show_settings(action_activation_ctx_t*, aida_plugin_t* plugin)
+{
+    SettingsForm::show_and_apply(plugin);
+}
+
+void handle_save_database_context(action_activation_ctx_t*, aida_plugin_t*)
+{
+    char* file_path = ask_file(true, "*.txt", "Save database context to...");
+    if (file_path == nullptr)
+    {
+        msg(OBFSTR_C("AiDA: Operation cancelled.\n"));
+        return;
+    }
+
+    FILE* fp = qfopen(file_path, "w");
+    if (fp == nullptr)
+    {
+        warning(OBFSTR_C("AiDA: Could not open file for writing: %s"), file_path);
+        return;
+    }
+    file_janitor_t fj(fp);
+
+    show_wait_box("HIDECANCEL\nExporting database context...");
+
+    const size_t func_qty = get_func_qty();
+    bool hexrays_available = init_hexrays_plugin();
+
+    for (size_t i = 0; i < func_qty; ++i)
+    {
+        if (user_cancelled())
+        {
+            msg(OBFSTR_C("AiDA: Database export cancelled by user.\n"));
+            break;
+        }
+
+        replace_wait_box("Exporting function %zu of %zu...", i + 1, func_qty);
+
+        func_t* pfn = getn_func(i);
+        if (pfn == nullptr)
+            continue;
+
+        qstring func_name;
+        get_func_name(&func_name, pfn->start_ea);
+
+        qfprintf(fp, "==================================================\n");
+        qfprintf(fp, "Function: %s (0x%a)\n", func_name.c_str(), pfn->start_ea);
+        qfprintf(fp, "==================================================\n\n");
+
+        qfprintf(fp, "--- Decompiled C/C++ Code ---\n");
+        if (hexrays_available)
+        {
+            try
+            {
+                cfuncptr_t cfunc = decompile(pfn);
+                if (cfunc != nullptr)
+                {
+                    qstring code_qstr;
+                    qstring_printer_t printer(cfunc.operator->(), code_qstr, false);
+                    cfunc->print_func(printer);
+                    tag_remove(&code_qstr, code_qstr.c_str());
+                    qfprintf(fp, "%s\n", code_qstr.c_str());
+                }
+                else
+                {
+                    qfprintf(fp, "// Decompilation failed.\n\n");
+                }
+            }
+            catch (const vd_failure_t&)
+            {
+                qfprintf(fp, "// Decompilation failed.\n\n");
+            }
+        }
+        else
+        {
+            qfprintf(fp, "// Hex-Rays decompiler not available.\n\n");
+        }
+
+        qfprintf(fp, "--- Disassembly ---\n");
+        text_t disasm_text;
+        gen_disasm_text(disasm_text, pfn->start_ea, pfn->end_ea, false);
+        for (const twinline_t& tw_line : disasm_text)
+        {
+            qstring clean_line;
+            tag_remove(&clean_line, tw_line.line.c_str());
+            qfprintf(fp, "%s\n", clean_line.c_str());
+        }
+        qfprintf(fp, "\n");
+
+        qfprintf(fp, "--- Referenced Strings ---\n");
+        std::set<qstring> found_strings;
+        func_item_iterator_t fii(pfn);
+        for (bool ok = fii.first(); ok; ok = fii.next_head())
+        {
+            xrefblk_t xb;
+            for (bool ok_ref = xb.first_from(fii.current(), XREF_DATA); ok_ref; ok_ref = xb.next_from())
+            {
+                flags64_t s_flags = get_flags(xb.to);
+                if (is_strlit(s_flags))
+                {
+                    int32 strtype = get_str_type(xb.to);
+                    qstring s;
+                    if (get_strlit_contents(&s, xb.to, -1, strtype) > 0)
+                    {
+                        found_strings.insert(s);
+                    }
+                }
+            }
+        }
+
+        if (found_strings.empty())
+        {
+            qfprintf(fp, "// No string literals referenced.\n");
+        }
+        else
+        {
+            for (const auto& s : found_strings)
+            {
+                qfprintf(fp, "\"%s\"\n", s.c_str());
+            }
+        }
+        qfprintf(fp, "\n\n");
+    }
+
+    hide_wait_box();
+    msg(OBFSTR_C("AiDA: Successfully saved database context to %s\n"), file_path);
+}
+
+namespace action_helpers {
+void handle_ai_response(const std::string& result, const qstring& title_prefix,
+                        std::function<void(const std::string&)> success_action)
+{
+    if (!result.empty() && result.find("Error:") == std::string::npos)
+    {
+        success_action(result);
+    }
+    else if (!result.empty())
+    {
+        warning(OBFSTR_C("AiDA: %s"), result.c_str());
+    }
+}
+}
+
+namespace tool_executor {
+
+std::vector<tool_call_t> parse_tool_calls(const std::string& json_response)
+{
+    std::vector<tool_call_t> calls;
+
+    std::string json_text = json_response;
+    static const std::regex md_json_re("```(?:json)?\\s*([\\s\\S]*?)\\s*```");
+    std::smatch match;
+    if (std::regex_search(json_response, match, md_json_re) && match.size() > 1)
+    {
+        json_text = match[1].str();
+    }
+
+    try
+    {
+        auto j = nlohmann::json::parse(json_text);
+
+        if (!j.contains("actions") || !j["actions"].is_array())
+        {
+            msg(OBFSTR_C("AiDA: AI response does not contain an 'actions' array.\n"));
+            return calls;
+        }
+
+        for (const auto& action : j["actions"])
+        {
+            if (!action.is_object() || !action.contains("type"))
+                continue;
+
+            tool_call_t tc;
+            tc.type = action["type"].get<std::string>();
+            tc.reasoning = json_str(action, "reasoning");
+            tc.params = (action.contains("params") && action["params"].is_object()) ? action["params"] : nlohmann::json::object();
+            calls.push_back(std::move(tc));
+        }
+    }
+    catch (const nlohmann::json::parse_error& e)
+    {
+        msg(OBFSTR_C("AiDA: Failed to parse tool calls JSON: %s\n"), e.what());
+    }
+
+    return calls;
+}
+
+std::string format_tool_calls_for_review(const std::vector<tool_call_t>& calls)
+{
+    std::stringstream ss;
+    ss << "=== Proposed AI Actions ===\n\n";
+
+    for (size_t i = 0; i < calls.size(); ++i)
+    {
+        const auto& tc = calls[i];
+        ss << "[" << (i + 1) << "] " << tc.type << "\n";
+        if (!tc.reasoning.empty())
+            ss << "    Reason: " << tc.reasoning << "\n";
+
+        if (tc.type == "rename_function")
+        {
+            ss << "    Address: " << json_str(tc.params, "address", "??") << "\n";
+            ss << "    New name: " << json_str(tc.params, "new_name", "??") << "\n";
+        }
+        else if (tc.type == "rename_variable")
+        {
+            ss << "    Original: " << json_str(tc.params, "original_name", "??") << "\n";
+            ss << "    New name: " << json_str(tc.params, "new_name", "??") << "\n";
+        }
+        else if (tc.type == "set_comment")
+        {
+            ss << "    Address: " << json_str(tc.params, "address", "??") << "\n";
+            ss << "    Comment: " << json_str(tc.params, "comment", "??") << "\n";
+        }
+        else if (tc.type == "create_type")
+        {
+            std::string def = json_str(tc.params, "definition");
+            if (def.length() > 200) def = def.substr(0, 200) + "...";
+            ss << "    Definition: " << def << "\n";
+        }
+        else if (tc.type == "apply_type")
+        {
+            ss << "    Param: " << json_str(tc.params, "param_name", "??") << "\n";
+            ss << "    Type: " << json_str(tc.params, "type_name", "??") << "\n";
+        }
+        else if (tc.type == "rename_global")
+        {
+            ss << "    Address: " << json_str(tc.params, "address", "??") << "\n";
+            ss << "    New name: " << json_str(tc.params, "new_name", "??") << "\n";
+        }
+        ss << "\n";
+    }
+    return ss.str();
+}
+
+qstring execute_tool_calls(ea_t func_ea, const std::vector<tool_call_t>& calls)
+{
+    qstring summary;
+    int success_count = 0;
+    int fail_count = 0;
+
+    func_t* pfn = get_func(func_ea);
+    cfuncptr_t cfunc(nullptr);
+
+    if (pfn && init_hexrays_plugin())
+    {
+        try { cfunc = decompile(pfn); }
+        catch (const vd_failure_t&) {}
+    }
+
+    for (const auto& tc : calls)
+    {
+        if (tc.type == "rename_function")
+        {
+            std::string addr_str = json_str(tc.params, "address");
+            std::string new_name = json_str(tc.params, "new_name");
+            ea_t target_ea = func_ea;
+
+            if (!addr_str.empty())
+            {
+                try { target_ea = std::stoull(addr_str, nullptr, 16); }
+                catch (...) {}
+            }
+
+            if (!new_name.empty() && set_name(target_ea, new_name.c_str(), SN_FORCE | SN_NODUMMY))
+            {
+                summary.cat_sprnt("Renamed function at 0x%llx to '%s'\n", target_ea, new_name.c_str());
+                success_count++;
+            }
+            else
+            {
+                summary.cat_sprnt("FAILED: Rename function to '%s'\n", new_name.c_str());
+                fail_count++;
+            }
+        }
+        else if (tc.type == "rename_variable")
+        {
+            std::string original = json_str(tc.params, "original_name");
+            std::string new_name = json_str(tc.params, "new_name");
+
+            if (!original.empty() && !new_name.empty())
+            {
+                if (rename_lvar(func_ea, original.c_str(), new_name.c_str()))
+                {
+                    summary.cat_sprnt("Renamed variable: %s -> %s\n", original.c_str(), new_name.c_str());
+                    success_count++;
+                }
+                else
+                {
+                    summary.cat_sprnt("FAILED: Rename variable '%s' -> '%s'\n", original.c_str(), new_name.c_str());
+                    fail_count++;
+                }
+            }
+        }
+        else if (tc.type == "set_comment")
+        {
+            std::string addr_str = json_str(tc.params, "address");
+            std::string comment = json_str(tc.params, "comment");
+            ea_t target_ea = BADADDR;
+
+            if (!addr_str.empty())
+            {
+                try { target_ea = std::stoull(addr_str, nullptr, 16); }
+                catch (...) {}
+            }
+
+            if (target_ea != BADADDR && is_mapped(target_ea) && !comment.empty())
+            {
+                set_cmt(target_ea, comment.c_str(), false);
+                summary.cat_sprnt("Comment at 0x%llx: %s\n", target_ea, comment.substr(0, 60).c_str());
+                success_count++;
+
+                if (cfunc)
+                {
+                    treeloc_t loc;
+                    loc.ea = target_ea;
+                    loc.itp = ITP_BLOCK1;
+                    cfunc->set_user_cmt(loc, comment.c_str());
+                }
+            }
+            else
+            {
+                summary.cat_sprnt("FAILED: Set comment at '%s'\n", addr_str.c_str());
+                fail_count++;
+            }
+        }
+        else if (tc.type == "create_type")
+        {
+            std::string definition = json_str(tc.params, "definition");
+            if (!definition.empty())
+            {
+                til_t* idati = get_idati();
+                if (parse_decls(idati, definition.c_str(), msg, HTI_DCL) == 0)
+                {
+                    summary.cat_sprnt("Created type from definition\n");
+                    success_count++;
+                }
+                else
+                {
+                    summary.cat_sprnt("FAILED: Create type (parse error)\n");
+                    fail_count++;
+                }
+            }
+        }
+        else if (tc.type == "apply_type")
+        {
+            std::string param_name = json_str(tc.params, "param_name");
+            std::string type_name = json_str(tc.params, "type_name");
+
+            if (!param_name.empty() && !type_name.empty() && cfunc && pfn)
+            {
+                lvars_t* lvars = cfunc->get_lvars();
+                bool done = false;
+                if (lvars)
+                {
+                    for (lvar_t& lv : *lvars)
+                    {
+                        if (lv.name == param_name.c_str())
+                        {
+                            tinfo_t tif;
+                            if (tif.parse(type_name.c_str()))
+                            {
+                                lvar_saved_info_t lsi;
+                                lsi.ll = lv;
+                                lsi.type = tif;
+                                if (modify_user_lvar_info(func_ea, MLI_TYPE, lsi))
+                                {
+                                    summary.cat_sprnt("Applied type '%s' to '%s'\n", type_name.c_str(), param_name.c_str());
+                                    success_count++;
+                                    done = true;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                if (!done)
+                {
+                    summary.cat_sprnt("FAILED: Apply type '%s' to '%s'\n", type_name.c_str(), param_name.c_str());
+                    fail_count++;
+                }
+            }
+        }
+        else if (tc.type == "rename_global")
+        {
+            std::string addr_str = json_str(tc.params, "address");
+            std::string new_name = json_str(tc.params, "new_name");
+            ea_t target_ea = BADADDR;
+
+            if (!addr_str.empty())
+            {
+                try { target_ea = std::stoull(addr_str, nullptr, 16); }
+                catch (...) {}
+            }
+
+            if (target_ea != BADADDR && !new_name.empty())
+            {
+                if (set_name(target_ea, new_name.c_str(), SN_FORCE | SN_NODUMMY))
+                {
+                    summary.cat_sprnt("Renamed global at 0x%llx to '%s'\n", target_ea, new_name.c_str());
+                    success_count++;
+                }
+                else
+                {
+                    summary.cat_sprnt("FAILED: Rename global to '%s'\n", new_name.c_str());
+                    fail_count++;
+                }
+            }
+        }
+    }
+
+    if (cfunc)
+    {
+        cfunc->save_user_cmts();
+        cfunc->refresh_func_ctext();
+    }
+
+    if (success_count > 0 || fail_count > 0)
+    {
+        if (pfn && init_hexrays_plugin())
+            mark_cfunc_dirty(func_ea, true);
+        mark_builtin_widgets(IWID_DISASM | IWID_PSEUDOCODE);
+    }
+
+    summary.cat_sprnt("\n--- Results: %d succeeded, %d failed ---\n", success_count, fail_count);
+    return summary;
+}
+
+}
+
+void handle_check_for_updates(action_activation_ctx_t*, aida_plugin_t* plugin)
+{
+    if (plugin)
+    {
+        msg(OBFSTR_C("AiDA: Checking for updates...\n"));
+        plugin->check_for_updates();
+    }
+}
+
+void handle_open_chat(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
+{
+    chat_widget::open_chat(ctx, plugin);
+}
+
+void handle_fix_analysis(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
+{
+    if (!ensure_ai_client(plugin)) return;
+    func_t* pfn = ida_utils::get_function_for_item(ctx->cur_ea);
+    if (pfn == nullptr)
+        return;
+    const ea_t func_ea = pfn->start_ea;
+
+    auto on_complete = [func_ea](const std::string& fix_response) {
+        action_helpers::handle_ai_response(fix_response, "Analysis Correction",
+            [func_ea](const std::string& content) {
+                auto calls = tool_executor::parse_tool_calls(content);
+
+                if (!calls.empty())
+                {
+
+                    std::string cleaned_code;
+                    try
+                    {
+                        std::string json_text = content;
+                        static const std::regex md_json_re("```(?:json)?\\s*([\\s\\S]*?)\\s*```");
+                        std::smatch match;
+                        if (std::regex_search(content, match, md_json_re) && match.size() > 1)
+                            json_text = match[1].str();
+
+                        auto j = nlohmann::json::parse(json_text);
+                        cleaned_code = json_str(j, "cleaned_code");
+                    }
+                    catch (...) {}
+
+
+                    std::string review = tool_executor::format_tool_calls_for_review(calls);
+
+                    qstring display_text;
+                    if (!cleaned_code.empty())
+                    {
+                        display_text.sprnt("=== Cleaned Code ===\n\n%s\n\n=== Proposed Actions ===\n\n%s",
+                            cleaned_code.c_str(), review.c_str());
+                    }
+                    else
+                    {
+                        display_text = review.c_str();
+                    }
+
+                    qstring title;
+                    title.sprnt("Analysis Corrections for 0x%a", func_ea);
+                    show_text_in_viewer(title.c_str(), display_text.c_str());
+
+                    qstring confirm_msg;
+                    confirm_msg.sprnt(OBFSTR_C("Proposes %zu correction(s). Apply all?"), calls.size());
+                    if (ask_yn(ASKBTN_YES, confirm_msg.c_str()) == ASKBTN_YES)
+                    {
+                        qstring summary = tool_executor::execute_tool_calls(func_ea, calls);
+                        msg(OBFSTR_C("AiDA: Analysis corrections applied.\n%s"), summary.c_str());
+                    }
+                    else
+                    {
+                        msg(OBFSTR_C("AiDA: Analysis corrections cancelled.\n"));
+                    }
+                }
+                else
+                {
+
+                    qstring title;
+                    title.sprnt("Analysis Corrections for 0x%a", func_ea);
+                    show_text_in_viewer(title.c_str(), content);
+                }
+            });
+    };
+    plugin->ai_client->fix_analysis(func_ea, on_complete);
+}
+
+void handle_cancel_request(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
+{
+    if (plugin && plugin->ai_client)
+    {
+        plugin->ai_client->cancel_current_request();
+        msg(OBFSTR_C("AiDA: Cancel requested.\n"));
+    }
+}
+
+void handle_toggle_mcp(action_activation_ctx_t*, aida_plugin_t* plugin)
+{
+    if (!plugin)
+        return;
+    plugin->toggle_mcp_server();
+}

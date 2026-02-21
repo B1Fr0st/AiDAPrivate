@@ -1,0 +1,49 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.vcxproj.user
+bin/
+obj/
+Debug/
+Release/
+x64/
+*.log
+
+# CMake / Linux Build
+build/
+.cache
+compile_commands.json
+
+# Artifacts / distribution
+artifacts/
+dist/
+*.zip
+
+# IDA SDK (fetched by CI)
+idasdk/
+ida-sdk/
+
+# CI helper
+.github/scripts/__pycache__/
+
+# vcpkg
+vcpkg_installed/
+
+# Models cache
+models.json
+
+# just in case
+ai_assistant.cfg
