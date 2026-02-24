@@ -1,5 +1,51 @@
 #include "aida_pro.hpp"
 
+static constexpr uint8_t CFG_OBF_KEY[] = {
+    0xA3, 0x7B, 0x1E, 0xD4, 0x5F, 0x92, 0xC8, 0x06,
+    0xE1, 0x3A, 0x8D, 0x47, 0xB0, 0x6C, 0xF5, 0x29
+};
+static constexpr const char CFG_OBF_PREFIX[] = "enc1:";
+
+static std::string obfuscate_key(const std::string& plain)
+{
+    if (plain.empty())
+        return plain;
+
+    std::string out;
+    out.reserve(plain.size() * 2 + sizeof(CFG_OBF_PREFIX));
+    out = CFG_OBF_PREFIX;
+
+    for (size_t i = 0; i < plain.size(); ++i)
+    {
+        uint8_t b = static_cast<uint8_t>(plain[i]) ^ CFG_OBF_KEY[i % sizeof(CFG_OBF_KEY)];
+        char hex[3];
+        qsnprintf(hex, sizeof(hex), "%02x", b);
+        out += hex;
+    }
+    return out;
+}
+
+static std::string deobfuscate_key(const std::string& encoded)
+{
+    if (encoded.empty())
+        return encoded;
+
+    if (encoded.compare(0, sizeof(CFG_OBF_PREFIX) - 1, CFG_OBF_PREFIX) != 0)
+        return encoded;
+
+    std::string hex_part = encoded.substr(sizeof(CFG_OBF_PREFIX) - 1);
+    std::string out;
+    out.reserve(hex_part.size() / 2);
+
+    for (size_t i = 0; i + 1 < hex_part.size(); i += 2)
+    {
+        uint8_t b = static_cast<uint8_t>(std::stoi(hex_part.substr(i, 2), nullptr, 16));
+        b ^= CFG_OBF_KEY[(i / 2) % sizeof(CFG_OBF_KEY)];
+        out.push_back(static_cast<char>(b));
+    }
+    return out;
+}
+
 static std::string get_trimmed_json_string(const nlohmann::json& j, const char* key, const std::string& default_val)
 {
     std::string val = j.value(key, default_val);
@@ -8,227 +54,235 @@ static std::string get_trimmed_json_string(const nlohmann::json& j, const char* 
     return q_val.c_str();
 }
 
+static std::string get_trimmed_key_string(const nlohmann::json& j, const char* key, const std::string& default_val)
+{
+    std::string raw = get_trimmed_json_string(j, key, default_val);
+    return deobfuscate_key(raw);
+}
+
 settings_t g_settings;
 
 const std::vector<std::string> settings_t::gemini_models = {
-    "gemini-3-pro-preview",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-pro-latest",
-    "gemini-1.5-pro",
-    "gemini-1.5-pro-002",
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
-    "gemini-1.5-flash-8b-latest",
-    "gemini-2.0-flash-exp",
-    "gemini-2.0-flash-lite-preview",
-    "gemini-2.0-pro-exp",
-    "gemini-2.0-flash-thinking-exp",
-    "gemma-3-1b-it",
-    "gemma-3-4b-it",
-    "gemma-3-12b-it",
-    "gemma-3-27b-it",
-    "gemma-3n-e4b-it",
-    "gemma-3n-e2b-it"
+    OBFSTR("gemini-3-pro-preview"),
+    OBFSTR("gemini-2.5-pro"),
+    OBFSTR("gemini-2.5-flash"),
+    OBFSTR("gemini-2.5-flash-lite"),
+    OBFSTR("gemini-2.0-flash"),
+    OBFSTR("gemini-2.0-flash-lite"),
+    OBFSTR("gemini-1.5-pro-latest"),
+    OBFSTR("gemini-1.5-pro"),
+    OBFSTR("gemini-1.5-pro-002"),
+    OBFSTR("gemini-1.5-flash-latest"),
+    OBFSTR("gemini-1.5-flash"),
+    OBFSTR("gemini-1.5-flash-8b"),
+    OBFSTR("gemini-1.5-flash-8b-latest"),
+    OBFSTR("gemini-2.0-flash-exp"),
+    OBFSTR("gemini-2.0-flash-lite-preview"),
+    OBFSTR("gemini-2.0-pro-exp"),
+    OBFSTR("gemini-2.0-flash-thinking-exp"),
+    OBFSTR("gemma-3-1b-it"),
+    OBFSTR("gemma-3-4b-it"),
+    OBFSTR("gemma-3-12b-it"),
+    OBFSTR("gemma-3-27b-it"),
+    OBFSTR("gemma-3n-e4b-it"),
+    OBFSTR("gemma-3n-e2b-it")
 };
 
 const std::vector<std::string> settings_t::openai_models = {
-  "gpt-5.1 Instant",
-  "gpt-5.1 Thinking",
-  "gpt-5",
-  "gpt-5-mini",
-  "gpt-5-nano",
-  "o3-pro",
-  "o3",
-  "o3-mini",
-  "o1-pro",
-  "o1",
-  "o4-mini",
-  "gpt-4.5-preview",
-  "gpt-4.1",
-  "gpt-4.1-mini",
-  "gpt-4.1-nano",
-  "gpt-4o",
-  "gpt-4-turbo",
-  "gpt-4",
-  "gpt-4o-mini",
-  "gpt-3.5-turbo",
-  "gpt-3.5-turbo-16k",
+  OBFSTR("gpt-5.1 Instant"),
+  OBFSTR("gpt-5.1 Thinking"),
+  OBFSTR("gpt-5"),
+  OBFSTR("gpt-5-mini"),
+  OBFSTR("gpt-5-nano"),
+  OBFSTR("o3-pro"),
+  OBFSTR("o3"),
+  OBFSTR("o3-mini"),
+  OBFSTR("o1-pro"),
+  OBFSTR("o1"),
+  OBFSTR("o4-mini"),
+  OBFSTR("gpt-4.5-preview"),
+  OBFSTR("gpt-4.1"),
+  OBFSTR("gpt-4.1-mini"),
+  OBFSTR("gpt-4.1-nano"),
+  OBFSTR("gpt-4o"),
+  OBFSTR("gpt-4-turbo"),
+  OBFSTR("gpt-4"),
+  OBFSTR("gpt-4o-mini"),
+  OBFSTR("gpt-3.5-turbo"),
+  OBFSTR("gpt-3.5-turbo-16k"),
 };
 
 const std::vector<std::string> settings_t::openrouter_models = {
-  "moonshotai/kimi-k2:free",
-  "openai/gpt-oss-20b:free",
-  "z-ai/glm-4.5-air:free",
-  "tngtech/deepseek-r1t2-chimera:free",
+  OBFSTR("moonshotai/kimi-k2:free"),
+  OBFSTR("openai/gpt-oss-20b:free"),
+  OBFSTR("z-ai/glm-4.5-air:free"),
+  OBFSTR("tngtech/deepseek-r1t2-chimera:free"),
   
 };
 
 const std::vector<std::string> settings_t::anthropic_models = {
-  "claude-opus-4-5 (High Effort)",
-  "claude-opus-4-5 (Medium Effort)",
-  "claude-opus-4-5 (Low Effort)",
-  "claude-sonnet-4-5",
-  "claude-haiku-4-5",
-  "claude-opus-4-1",
-  "claude-opus-4",
-  "claude-sonnet-4",
-  "claude-3-7-sonnet-thought",
-  "claude-3-7-sonnet",
-  "claude-3.5-sonnet-latest",
-  "claude-3.5-haiku-latest",
-  "claude-3-opus-latest",
-  "claude-3-sonnet-latest",
-  "claude-3-haiku-latest",
-  "claude-2.1",
-  "claude-2",
-  "claude-instant-v1.2",
+  OBFSTR("claude-opus-4-5 (High Effort)"),
+  OBFSTR("claude-opus-4-5 (Medium Effort)"),
+  OBFSTR("claude-opus-4-5 (Low Effort)"),
+  OBFSTR("claude-sonnet-4-5"),
+  OBFSTR("claude-haiku-4-5"),
+  OBFSTR("claude-opus-4-1"),
+  OBFSTR("claude-opus-4"),
+  OBFSTR("claude-sonnet-4"),
+  OBFSTR("claude-3-7-sonnet-thought"),
+  OBFSTR("claude-3-7-sonnet"),
+  OBFSTR("claude-3.5-sonnet-latest"),
+  OBFSTR("claude-3.5-haiku-latest"),
+  OBFSTR("claude-3-opus-latest"),
+  OBFSTR("claude-3-sonnet-latest"),
+  OBFSTR("claude-3-haiku-latest"),
+  OBFSTR("claude-2.1"),
+  OBFSTR("claude-2"),
+  OBFSTR("claude-instant-v1.2"),
 };
 
 const std::vector<std::string> settings_t::copilot_models = {
-    "claude-sonnet-4",
-    "claude-3.7-sonnet-thought",
-    "gemini-2.5-pro",
-    "claude-3.7-sonnet",
-    "gpt-4.1-2025-04-14",
-    "gpt-4.1",
-    "o4-mini-2025-04-16",
-    "o4-mini",
-    "o3-mini-2025-01-31",
-    "o3-mini",
-    "o3-mini-paygo",
-    "claude-3.5-sonnet",
-    "gemini-2.0-flash-001",
-    "gpt-4o-2024-11-20",
-    "gpt-4o-2024-08-06",
-    "gpt-4o-2024-05-13",
-    "gpt-4o",
-    "gpt-4o-copilot",
-    "gpt-4-o-preview",
-    "gpt-4-0125-preview",
-    "gpt-4",
-    "gpt-4-0613",
-    "gpt-4o-mini-2024-07-18",
-    "gpt-4o-mini",
-    "gpt-3.5-turbo",
-    "gpt-3.5-turbo-0613",
+    OBFSTR("claude-sonnet-4"),
+    OBFSTR("claude-3.7-sonnet-thought"),
+    OBFSTR("gemini-2.5-pro"),
+    OBFSTR("claude-3.7-sonnet"),
+    OBFSTR("gpt-4.1-2025-04-14"),
+    OBFSTR("gpt-4.1"),
+    OBFSTR("o4-mini-2025-04-16"),
+    OBFSTR("o4-mini"),
+    OBFSTR("o3-mini-2025-01-31"),
+    OBFSTR("o3-mini"),
+    OBFSTR("o3-mini-paygo"),
+    OBFSTR("claude-3.5-sonnet"),
+    OBFSTR("gemini-2.0-flash-001"),
+    OBFSTR("gpt-4o-2024-11-20"),
+    OBFSTR("gpt-4o-2024-08-06"),
+    OBFSTR("gpt-4o-2024-05-13"),
+    OBFSTR("gpt-4o"),
+    OBFSTR("gpt-4o-copilot"),
+    OBFSTR("gpt-4-o-preview"),
+    OBFSTR("gpt-4-0125-preview"),
+    OBFSTR("gpt-4"),
+    OBFSTR("gpt-4-0613"),
+    OBFSTR("gpt-4o-mini-2024-07-18"),
+    OBFSTR("gpt-4o-mini"),
+    OBFSTR("gpt-3.5-turbo"),
+    OBFSTR("gpt-3.5-turbo-0613"),
 };
 
 const std::vector<std::string> settings_t::local_llm_models = {
-    "llama3.3:latest",
-    "llama3.1:latest",
-    "llama3:latest",
-    "qwen3:latest",
-    "qwen2.5-coder:latest",
-    "deepseek-r1:latest",
-    "deepseek-coder-v2:latest",
-    "codellama:latest",
-    "mistral:latest",
-    "mixtral:latest",
-    "phi4:latest",
-    "gemma3:latest",
-    "command-r:latest",
+    OBFSTR("llama3.3:latest"),
+    OBFSTR("llama3.1:latest"),
+    OBFSTR("llama3:latest"),
+    OBFSTR("qwen3:latest"),
+    OBFSTR("qwen2.5-coder:latest"),
+    OBFSTR("deepseek-r1:latest"),
+    OBFSTR("deepseek-coder-v2:latest"),
+    OBFSTR("codellama:latest"),
+    OBFSTR("mistral:latest"),
+    OBFSTR("mixtral:latest"),
+    OBFSTR("phi4:latest"),
+    OBFSTR("gemma3:latest"),
+    OBFSTR("command-r:latest"),
 };
 
 static void to_json(nlohmann::json& j, const settings_t& s)
 {
     j = nlohmann::json{
-        {"api_provider", s.api_provider},
-        {"gemini_api_key", s.gemini_api_key},
-        {"gemini_model_name", s.gemini_model_name},
-        {"gemini_base_url", s.gemini_base_url},
-        {"openai_api_key", s.openai_api_key},
-        {"openai_model_name", s.openai_model_name},
-        {"openai_base_url", s.openai_base_url},
-        {"openrouter_api_key", s.openrouter_api_key},
-        {"openrouter_model_name", s.openrouter_model_name},
-        {"anthropic_api_key", s.anthropic_api_key},
-        {"anthropic_model_name", s.anthropic_model_name},
-        {"anthropic_base_url", s.anthropic_base_url},
-        {"copilot_proxy_address", s.copilot_proxy_address},
-        {"copilot_model_name", s.copilot_model_name},
-        {"local_llm_base_url", s.local_llm_base_url},
-        {"local_llm_model_name", s.local_llm_model_name},
-        {"local_llm_api_key", s.local_llm_api_key},
-        {"local_llm_context_window", s.local_llm_context_window},
-        {"xref_context_count", s.xref_context_count},
-        {"xref_analysis_depth", s.xref_analysis_depth},
-        {"xref_code_snippet_lines", s.xref_code_snippet_lines},
-        {"bulk_processing_delay", s.bulk_processing_delay},
-        {"max_root_func_scan_count", s.max_root_func_scan_count},
-        {"max_root_func_candidates", s.max_root_func_candidates},
-        {"custom_prompts", s.custom_prompts},
-        {"active_prompt_name", s.active_prompt_name},
-        {"temperature", s.temperature},
-        {"check_for_updates", s.check_for_updates},
-        {"mcp_enabled", s.mcp_enabled},
-        {"mcp_port", s.mcp_port},
-        {"license_key", s.license_key},
-        {"license_validated_at", s.license_validated_at},
-        {"license_hwid", s.license_hwid}
+        {OBFSTR_C("api_provider"), s.api_provider},
+        {OBFSTR_C("gemini_api_key"), obfuscate_key(s.gemini_api_key)},
+        {OBFSTR_C("gemini_model_name"), s.gemini_model_name},
+        {OBFSTR_C("gemini_base_url"), s.gemini_base_url},
+        {OBFSTR_C("openai_api_key"), obfuscate_key(s.openai_api_key)},
+        {OBFSTR_C("openai_model_name"), s.openai_model_name},
+        {OBFSTR_C("openai_base_url"), s.openai_base_url},
+        {OBFSTR_C("openrouter_api_key"), obfuscate_key(s.openrouter_api_key)},
+        {OBFSTR_C("openrouter_model_name"), s.openrouter_model_name},
+        {OBFSTR_C("anthropic_api_key"), obfuscate_key(s.anthropic_api_key)},
+        {OBFSTR_C("anthropic_model_name"), s.anthropic_model_name},
+        {OBFSTR_C("anthropic_base_url"), s.anthropic_base_url},
+        {OBFSTR_C("copilot_proxy_address"), s.copilot_proxy_address},
+        {OBFSTR_C("copilot_model_name"), s.copilot_model_name},
+        {OBFSTR_C("local_llm_base_url"), s.local_llm_base_url},
+        {OBFSTR_C("local_llm_model_name"), s.local_llm_model_name},
+        {OBFSTR_C("local_llm_api_key"), obfuscate_key(s.local_llm_api_key)},
+        {OBFSTR_C("local_llm_context_window"), s.local_llm_context_window},
+        {OBFSTR_C("xref_context_count"), s.xref_context_count},
+        {OBFSTR_C("xref_analysis_depth"), s.xref_analysis_depth},
+        {OBFSTR_C("xref_code_snippet_lines"), s.xref_code_snippet_lines},
+        {OBFSTR_C("bulk_processing_delay"), s.bulk_processing_delay},
+        {OBFSTR_C("max_root_func_scan_count"), s.max_root_func_scan_count},
+        {OBFSTR_C("max_root_func_candidates"), s.max_root_func_candidates},
+        {OBFSTR_C("custom_prompts"), s.custom_prompts},
+        {OBFSTR_C("active_prompt_name"), s.active_prompt_name},
+        {OBFSTR_C("temperature"), s.temperature},
+        {OBFSTR_C("check_for_updates"), s.check_for_updates},
+        {OBFSTR_C("mcp_enabled"), s.mcp_enabled},
+        {OBFSTR_C("mcp_port"), s.mcp_port},
+        {OBFSTR_C("license_key"), obfuscate_key(s.license_key)},
+        {OBFSTR_C("license_validated_at"), s.license_validated_at},
+        {OBFSTR_C("license_hwid"), s.license_hwid},
+        {OBFSTR_C("firebase_api_key"), obfuscate_key(s.firebase_api_key)}
     };
 }
 
 static void from_json(const nlohmann::json& j, settings_t& s)
 {
     settings_t d;
-    s.api_provider = j.value("api_provider", d.api_provider);
+    s.api_provider = j.value(OBFSTR_C("api_provider"), d.api_provider);
 
-    s.gemini_api_key = get_trimmed_json_string(j, "gemini_api_key", d.gemini_api_key);
-    s.gemini_model_name = j.value("gemini_model_name", d.gemini_model_name);
-    s.gemini_base_url = get_trimmed_json_string(j, "gemini_base_url", d.gemini_base_url);
+    s.gemini_api_key = get_trimmed_key_string(j, OBFSTR_C("gemini_api_key"), d.gemini_api_key);
+    s.gemini_model_name = j.value(OBFSTR_C("gemini_model_name"), d.gemini_model_name);
+    s.gemini_base_url = get_trimmed_json_string(j, OBFSTR_C("gemini_base_url"), d.gemini_base_url);
 
-    s.openai_api_key = get_trimmed_json_string(j, "openai_api_key", d.openai_api_key);
-    s.openai_model_name = j.value("openai_model_name", d.openai_model_name);
-    s.openai_base_url = get_trimmed_json_string(j, "openai_base_url", d.openai_base_url);
+    s.openai_api_key = get_trimmed_key_string(j, OBFSTR_C("openai_api_key"), d.openai_api_key);
+    s.openai_model_name = j.value(OBFSTR_C("openai_model_name"), d.openai_model_name);
+    s.openai_base_url = get_trimmed_json_string(j, OBFSTR_C("openai_base_url"), d.openai_base_url);
 
-    s.openrouter_api_key = get_trimmed_json_string(j, "openrouter_api_key", d.openrouter_api_key);
-    s.openrouter_model_name = j.value("openrouter_model_name", d.openrouter_model_name);
+    s.openrouter_api_key = get_trimmed_key_string(j, OBFSTR_C("openrouter_api_key"), d.openrouter_api_key);
+    s.openrouter_model_name = j.value(OBFSTR_C("openrouter_model_name"), d.openrouter_model_name);
 
-    s.anthropic_api_key = get_trimmed_json_string(j, "anthropic_api_key", d.anthropic_api_key);
-    s.anthropic_model_name = j.value("anthropic_model_name", d.anthropic_model_name);
-    s.anthropic_base_url = get_trimmed_json_string(j, "anthropic_base_url", d.anthropic_base_url);
+    s.anthropic_api_key = get_trimmed_key_string(j, OBFSTR_C("anthropic_api_key"), d.anthropic_api_key);
+    s.anthropic_model_name = j.value(OBFSTR_C("anthropic_model_name"), d.anthropic_model_name);
+    s.anthropic_base_url = get_trimmed_json_string(j, OBFSTR_C("anthropic_base_url"), d.anthropic_base_url);
 
-    s.copilot_proxy_address = j.value("copilot_proxy_address", d.copilot_proxy_address);
-    s.copilot_model_name = j.value("copilot_model_name", d.copilot_model_name);
+    s.copilot_proxy_address = j.value(OBFSTR_C("copilot_proxy_address"), d.copilot_proxy_address);
+    s.copilot_model_name = j.value(OBFSTR_C("copilot_model_name"), d.copilot_model_name);
 
-    s.local_llm_base_url = get_trimmed_json_string(j, "local_llm_base_url", d.local_llm_base_url);
-    s.local_llm_model_name = j.value("local_llm_model_name", d.local_llm_model_name);
-    s.local_llm_api_key = get_trimmed_json_string(j, "local_llm_api_key", d.local_llm_api_key);
-    s.local_llm_context_window = j.value("local_llm_context_window", d.local_llm_context_window);
+    s.local_llm_base_url = get_trimmed_json_string(j, OBFSTR_C("local_llm_base_url"), d.local_llm_base_url);
+    s.local_llm_model_name = j.value(OBFSTR_C("local_llm_model_name"), d.local_llm_model_name);
+    s.local_llm_api_key = get_trimmed_key_string(j, OBFSTR_C("local_llm_api_key"), d.local_llm_api_key);
+    s.local_llm_context_window = j.value(OBFSTR_C("local_llm_context_window"), d.local_llm_context_window);
 
-    s.xref_context_count = j.value("xref_context_count", d.xref_context_count);
-    s.xref_analysis_depth = j.value("xref_analysis_depth", d.xref_analysis_depth);
-    s.xref_code_snippet_lines = j.value("xref_code_snippet_lines", d.xref_code_snippet_lines);
+    s.xref_context_count = j.value(OBFSTR_C("xref_context_count"), d.xref_context_count);
+    s.xref_analysis_depth = j.value(OBFSTR_C("xref_analysis_depth"), d.xref_analysis_depth);
+    s.xref_code_snippet_lines = j.value(OBFSTR_C("xref_code_snippet_lines"), d.xref_code_snippet_lines);
 
-    s.bulk_processing_delay = j.value("bulk_processing_delay", d.bulk_processing_delay);
+    s.bulk_processing_delay = j.value(OBFSTR_C("bulk_processing_delay"), d.bulk_processing_delay);
 
-    s.max_root_func_scan_count = j.value("max_root_func_scan_count", d.max_root_func_scan_count);
-    s.max_root_func_candidates = j.value("max_root_func_candidates", d.max_root_func_candidates);
+    s.max_root_func_scan_count = j.value(OBFSTR_C("max_root_func_scan_count"), d.max_root_func_scan_count);
+    s.max_root_func_candidates = j.value(OBFSTR_C("max_root_func_candidates"), d.max_root_func_candidates);
 
-    s.temperature = j.value("temperature", d.temperature);
-    s.check_for_updates = j.value("check_for_updates", d.check_for_updates);
+    s.temperature = j.value(OBFSTR_C("temperature"), d.temperature);
+    s.check_for_updates = j.value(OBFSTR_C("check_for_updates"), d.check_for_updates);
 
-    s.mcp_enabled = j.value("mcp_enabled", d.mcp_enabled);
-    s.mcp_port = j.value("mcp_port", d.mcp_port);
+    s.mcp_enabled = j.value(OBFSTR_C("mcp_enabled"), d.mcp_enabled);
+    s.mcp_port = j.value(OBFSTR_C("mcp_port"), d.mcp_port);
 
-    s.license_key = j.value("license_key", d.license_key);
-    s.license_validated_at = j.value("license_validated_at", d.license_validated_at);
-    s.license_hwid = j.value("license_hwid", d.license_hwid);
+    s.license_key = deobfuscate_key(j.value(OBFSTR_C("license_key"), d.license_key));
+    s.license_validated_at = j.value(OBFSTR_C("license_validated_at"), d.license_validated_at);
+    s.license_hwid = j.value(OBFSTR_C("license_hwid"), d.license_hwid);
+    s.firebase_api_key = get_trimmed_key_string(j, OBFSTR_C("firebase_api_key"), d.firebase_api_key);
 
-    if (j.contains("custom_prompts"))
-        j.at("custom_prompts").get_to(s.custom_prompts);
-    s.active_prompt_name = j.value("active_prompt_name", d.active_prompt_name);
+    if (j.contains(OBFSTR_C("custom_prompts")))
+        j.at(OBFSTR_C("custom_prompts")).get_to(s.custom_prompts);
+    s.active_prompt_name = j.value(OBFSTR_C("active_prompt_name"), d.active_prompt_name);
 }
 
 static qstring get_config_file()
 {
     qstring path = get_user_idadir();
-    path.append("/ai_assistant.cfg");
+    path.append(OBFSTR_C("/ai_assistant.cfg"));
     return path;
 }
 
@@ -294,22 +348,23 @@ static bool load_settings_from_file(settings_t& settings, const qstring& path)
 
         bool missing = false;
         auto req = [&](const char* key){ if (!j.contains(key)) missing = true; };
-        req("api_provider");
-        req("gemini_api_key"); req("gemini_model_name"); req("gemini_base_url");
-        req("openai_api_key"); req("openai_model_name"); req("openai_base_url");
-        req("openrouter_api_key"); req("openrouter_model_name");
-        req("anthropic_api_key"); req("anthropic_model_name"); req("anthropic_base_url");
-        req("copilot_proxy_address"); req("copilot_model_name");
-        req("local_llm_base_url"); req("local_llm_model_name"); req("local_llm_api_key");
-        req("local_llm_context_window");
-        req("xref_context_count"); req("xref_analysis_depth"); req("xref_code_snippet_lines");
-        req("bulk_processing_delay");
-        req("max_root_func_scan_count"); req("max_root_func_candidates");
-        req("custom_prompts"); req("active_prompt_name");
-        req("temperature");
-        req("check_for_updates");
-        req("mcp_enabled");
-        req("mcp_port");
+        req(OBFSTR_C("api_provider"));
+        req(OBFSTR_C("gemini_api_key")); req(OBFSTR_C("gemini_model_name")); req(OBFSTR_C("gemini_base_url"));
+        req(OBFSTR_C("openai_api_key")); req(OBFSTR_C("openai_model_name")); req(OBFSTR_C("openai_base_url"));
+        req(OBFSTR_C("openrouter_api_key")); req(OBFSTR_C("openrouter_model_name"));
+        req(OBFSTR_C("anthropic_api_key")); req(OBFSTR_C("anthropic_model_name")); req(OBFSTR_C("anthropic_base_url"));
+        req(OBFSTR_C("copilot_proxy_address")); req(OBFSTR_C("copilot_model_name"));
+        req(OBFSTR_C("local_llm_base_url")); req(OBFSTR_C("local_llm_model_name")); req(OBFSTR_C("local_llm_api_key"));
+        req(OBFSTR_C("local_llm_context_window"));
+        req(OBFSTR_C("xref_context_count")); req(OBFSTR_C("xref_analysis_depth")); req(OBFSTR_C("xref_code_snippet_lines"));
+        req(OBFSTR_C("bulk_processing_delay"));
+        req(OBFSTR_C("max_root_func_scan_count")); req(OBFSTR_C("max_root_func_candidates"));
+        req(OBFSTR_C("custom_prompts")); req(OBFSTR_C("active_prompt_name"));
+        req(OBFSTR_C("temperature"));
+        req(OBFSTR_C("check_for_updates"));
+        req(OBFSTR_C("mcp_enabled"));
+        req(OBFSTR_C("mcp_port"));
+        req(OBFSTR_C("firebase_api_key"));
 
         settings = j.get<settings_t>();
 
@@ -330,19 +385,19 @@ static bool load_settings_from_file(settings_t& settings, const qstring& path)
 settings_t::settings_t() :
     api_provider(""),
     gemini_api_key(""),
-    gemini_model_name("gemini-2.5-flash"),
+    gemini_model_name(OBFSTR("gemini-2.5-flash")),
     gemini_base_url(""),
     openai_api_key(""),
-    openai_model_name("gpt-5"),
+    openai_model_name(OBFSTR("gpt-5")),
     openai_base_url(""),
     openrouter_api_key(""),
-    openrouter_model_name("moonshotai/kimi-k2:free"),
+    openrouter_model_name(OBFSTR("moonshotai/kimi-k2:free")),
     anthropic_api_key(""),
-    anthropic_model_name("claude-sonnet-4-5"),
+    anthropic_model_name(OBFSTR("claude-sonnet-4-5")),
     anthropic_base_url(""),
-    copilot_proxy_address("http://127.0.0.1:4141"),
-    copilot_model_name("gpt-4.1"),
-    local_llm_base_url("http://localhost:1234"),
+    copilot_proxy_address(OBFSTR("http://127.0.0.1:4141")),
+    copilot_model_name(OBFSTR("gpt-4.1")),
+    local_llm_base_url(OBFSTR("http://localhost:1234")),
     local_llm_model_name(""),
     local_llm_api_key(""),
     local_llm_context_window(8192),
@@ -358,7 +413,8 @@ settings_t::settings_t() :
     mcp_port(13120),
     license_key(""),
     license_validated_at(0),
-    license_hwid("")
+    license_hwid(""),
+    firebase_api_key("")
 {
 }
 
@@ -372,25 +428,25 @@ void settings_t::load(aida_plugin_t* plugin_instance)
     bool has_env_keys = false;
     qstring val;
 
-    if (gemini_api_key.empty() && qgetenv("GEMINI_API_KEY", &val))
+    if (gemini_api_key.empty() && qgetenv(OBFSTR_C("GEMINI_API_KEY"), &val))
     {
         val.trim2();
         gemini_api_key = val.c_str();
         has_env_keys = true;
     }
-    if (openai_api_key.empty() && qgetenv("OPENAI_API_KEY", &val))
+    if (openai_api_key.empty() && qgetenv(OBFSTR_C("OPENAI_API_KEY"), &val))
     {
         val.trim2();
         openai_api_key = val.c_str();
         has_env_keys = true;
     }
-    if (openrouter_api_key.empty() && qgetenv("OPENROUTER_API_KEY", &val))
+    if (openrouter_api_key.empty() && qgetenv(OBFSTR_C("OPENROUTER_API_KEY"), &val))
     {
         val.trim2();
         openrouter_api_key = val.c_str();
         has_env_keys = true;
     }
-    if (anthropic_api_key.empty() && qgetenv("ANTHROPIC_API_KEY", &val))
+    if (anthropic_api_key.empty() && qgetenv(OBFSTR_C("ANTHROPIC_API_KEY"), &val))
     {
         val.trim2();
         anthropic_api_key = val.c_str();
@@ -407,19 +463,19 @@ void settings_t::load(aida_plugin_t* plugin_instance)
     if (custom_prompts.empty())
     {
         msg(OBFSTR_C("No custom prompts found, loading defaults.\n"));
-        custom_prompts["Anti-Cheat / Anti-Tamper"] = ANTICHEAT_RE_PROMPT;
-        custom_prompts["Windows Kernel / Drivers"] = KERNEL_DRIVER_PROMPT;
-        custom_prompts["Crackme / CTF Challenges"] = CRACKME_PROMPT;
-        custom_prompts["Malware Analysis"] = MALWARE_ANALYSIS_PROMPT;
-        custom_prompts["Application RE (General)"] = APPLICATION_RE_PROMPT;
-        custom_prompts["Firmware / Embedded"] = FIRMWARE_ANALYSIS_PROMPT;
-        custom_prompts["Cryptography"] = CRYPTO_ANALYSIS_PROMPT;
-        custom_prompts["Network Protocol"] = NETWORK_PROTOCOL_PROMPT;
-        custom_prompts["iOS / macOS"] = IOS_MACOS_RE_PROMPT;
-        custom_prompts["Android"] = ANDROID_RE_PROMPT;
-        custom_prompts["Linux Userspace / Kernel"] = LINUX_RE_PROMPT;
-        custom_prompts["Unity Game (IL2CPP)"] = UNITY_GAME_PROMPT;
-        custom_prompts["Cheat Loader / Malware"] = CHEAT_LOADER_PROMPT;
+        custom_prompts[OBFSTR("Anti-Cheat / Anti-Tamper")] = ANTICHEAT_RE_PROMPT;
+        custom_prompts[OBFSTR("Windows Kernel / Drivers")] = KERNEL_DRIVER_PROMPT;
+        custom_prompts[OBFSTR("Crackme / CTF Challenges")] = CRACKME_PROMPT;
+        custom_prompts[OBFSTR("Malware Analysis")] = MALWARE_ANALYSIS_PROMPT;
+        custom_prompts[OBFSTR("Application RE (General)")] = APPLICATION_RE_PROMPT;
+        custom_prompts[OBFSTR("Firmware / Embedded")] = FIRMWARE_ANALYSIS_PROMPT;
+        custom_prompts[OBFSTR("Cryptography")] = CRYPTO_ANALYSIS_PROMPT;
+        custom_prompts[OBFSTR("Network Protocol")] = NETWORK_PROTOCOL_PROMPT;
+        custom_prompts[OBFSTR("iOS / macOS")] = IOS_MACOS_RE_PROMPT;
+        custom_prompts[OBFSTR("Android")] = ANDROID_RE_PROMPT;
+        custom_prompts[OBFSTR("Linux Userspace / Kernel")] = LINUX_RE_PROMPT;
+        custom_prompts[OBFSTR("Unity Game (IL2CPP)")] = UNITY_GAME_PROMPT;
+        custom_prompts[OBFSTR("Cheat Loader / Malware")] = CHEAT_LOADER_PROMPT;
         save();
     }
 
@@ -449,105 +505,105 @@ bool settings_t::load_from_file()
 std::string settings_t::get_active_api_key() const
 {
     qstring provider = ida_utils::qstring_tolower(api_provider.c_str());
-    if (provider == "gemini") return gemini_api_key;
-    if (provider == "openai") return openai_api_key;
-    if (provider == "openrouter") return openrouter_api_key;
-    if (provider == "anthropic") return anthropic_api_key;
-    if (provider == "copilot") return copilot_proxy_address;
-    if (provider == "local llm") return local_llm_base_url;
+    if (provider == OBFSTR_C("gemini")) return gemini_api_key;
+    if (provider == OBFSTR_C("openai")) return openai_api_key;
+    if (provider == OBFSTR_C("openrouter")) return openrouter_api_key;
+    if (provider == OBFSTR_C("anthropic")) return anthropic_api_key;
+    if (provider == OBFSTR_C("copilot")) return copilot_proxy_address;
+    if (provider == OBFSTR_C("local llm")) return local_llm_base_url;
     return "";
 }
 
 int settings_t::get_model_context_window(const std::string& model_name)
 {
     static const std::unordered_map<std::string, int> context_windows = {
-        {"gemini-3-pro-preview",             1000000},
-        {"gemini-2.5-pro",                   1048576},
-        {"gemini-2.5-flash",                 1048576},
-        {"gemini-2.5-flash-lite",            1048576},
-        {"gemini-2.0-flash",                 1048576},
-        {"gemini-2.0-flash-lite",            1048576},
-        {"gemini-1.5-pro-latest",            2097152},
-        {"gemini-1.5-pro",                   2097152},
-        {"gemini-1.5-pro-002",               2097152},
-        {"gemini-1.5-flash-latest",          1048576},
-        {"gemini-1.5-flash",                 1048576},
-        {"gemini-1.5-flash-8b",              1048576},
-        {"gemini-1.5-flash-8b-latest",       1048576},
-        {"gemini-2.0-flash-exp",             1048576},
-        {"gemini-2.0-flash-lite-preview",    1048576},
-        {"gemini-2.0-pro-exp",               1048576},
-        {"gemini-2.0-flash-thinking-exp",    1048576},
-        {"gemma-3-1b-it",                      32768},
-        {"gemma-3-4b-it",                      32768},
-        {"gemma-3-12b-it",                     32768},
-        {"gemma-3-27b-it",                     32768},
-        {"gemma-3n-e4b-it",                    32768},
-        {"gemma-3n-e2b-it",                    32768},
+        {OBFSTR("gemini-3-pro-preview"),             1000000},
+        {OBFSTR("gemini-2.5-pro"),                   1048576},
+        {OBFSTR("gemini-2.5-flash"),                 1048576},
+        {OBFSTR("gemini-2.5-flash-lite"),            1048576},
+        {OBFSTR("gemini-2.0-flash"),                 1048576},
+        {OBFSTR("gemini-2.0-flash-lite"),            1048576},
+        {OBFSTR("gemini-1.5-pro-latest"),            2097152},
+        {OBFSTR("gemini-1.5-pro"),                   2097152},
+        {OBFSTR("gemini-1.5-pro-002"),               2097152},
+        {OBFSTR("gemini-1.5-flash-latest"),          1048576},
+        {OBFSTR("gemini-1.5-flash"),                 1048576},
+        {OBFSTR("gemini-1.5-flash-8b"),              1048576},
+        {OBFSTR("gemini-1.5-flash-8b-latest"),       1048576},
+        {OBFSTR("gemini-2.0-flash-exp"),             1048576},
+        {OBFSTR("gemini-2.0-flash-lite-preview"),    1048576},
+        {OBFSTR("gemini-2.0-pro-exp"),               1048576},
+        {OBFSTR("gemini-2.0-flash-thinking-exp"),    1048576},
+        {OBFSTR("gemma-3-1b-it"),                      32768},
+        {OBFSTR("gemma-3-4b-it"),                      32768},
+        {OBFSTR("gemma-3-12b-it"),                     32768},
+        {OBFSTR("gemma-3-27b-it"),                     32768},
+        {OBFSTR("gemma-3n-e4b-it"),                    32768},
+        {OBFSTR("gemma-3n-e2b-it"),                    32768},
 
-        {"gpt-5.1 Instant",                  1047576},
-        {"gpt-5.1 Thinking",                 1047576},
-        {"gpt-5",                             1047576},
-        {"gpt-5-mini",                        1047576},
-        {"gpt-5-nano",                         524288},
-        {"o3-pro",                             200000},
-        {"o3",                                 200000},
-        {"o3-mini",                            200000},
-        {"o1-pro",                             200000},
-        {"o1",                                 200000},
-        {"o4-mini",                            200000},
-        {"gpt-4.5-preview",                   128000},
-        {"gpt-4.1",                           1047576},
-        {"gpt-4.1-mini",                      1047576},
-        {"gpt-4.1-nano",                      1047576},
-        {"gpt-4o",                             128000},
-        {"gpt-4-turbo",                        128000},
-        {"gpt-4",                                8192},
-        {"gpt-4o-mini",                        128000},
-        {"gpt-3.5-turbo",                      16385},
-        {"gpt-3.5-turbo-16k",                  16385},
+        {OBFSTR("gpt-5.1 Instant"),                  1047576},
+        {OBFSTR("gpt-5.1 Thinking"),                 1047576},
+        {OBFSTR("gpt-5"),                             1047576},
+        {OBFSTR("gpt-5-mini"),                        1047576},
+        {OBFSTR("gpt-5-nano"),                         524288},
+        {OBFSTR("o3-pro"),                             200000},
+        {OBFSTR("o3"),                                 200000},
+        {OBFSTR("o3-mini"),                            200000},
+        {OBFSTR("o1-pro"),                             200000},
+        {OBFSTR("o1"),                                 200000},
+        {OBFSTR("o4-mini"),                            200000},
+        {OBFSTR("gpt-4.5-preview"),                   128000},
+        {OBFSTR("gpt-4.1"),                           1047576},
+        {OBFSTR("gpt-4.1-mini"),                      1047576},
+        {OBFSTR("gpt-4.1-nano"),                      1047576},
+        {OBFSTR("gpt-4o"),                             128000},
+        {OBFSTR("gpt-4-turbo"),                        128000},
+        {OBFSTR("gpt-4"),                                8192},
+        {OBFSTR("gpt-4o-mini"),                        128000},
+        {OBFSTR("gpt-3.5-turbo"),                      16385},
+        {OBFSTR("gpt-3.5-turbo-16k"),                  16385},
 
-        {"moonshotai/kimi-k2:free",            131072},
-        {"openai/gpt-oss-20b:free",            128000},
-        {"z-ai/glm-4.5-air:free",             128000},
-        {"tngtech/deepseek-r1t2-chimera:free", 164000},
+        {OBFSTR("moonshotai/kimi-k2:free"),            131072},
+        {OBFSTR("openai/gpt-oss-20b:free"),            128000},
+        {OBFSTR("z-ai/glm-4.5-air:free"),             128000},
+        {OBFSTR("tngtech/deepseek-r1t2-chimera:free"), 164000},
 
-        {"claude-opus-4-5 (High Effort)",      200000},
-        {"claude-opus-4-5 (Medium Effort)",    200000},
-        {"claude-opus-4-5 (Low Effort)",       200000},
-        {"claude-sonnet-4-5",                  200000},
-        {"claude-haiku-4-5",                   200000},
-        {"claude-opus-4-1",                    200000},
-        {"claude-opus-4",                      200000},
-        {"claude-sonnet-4",                    200000},
-        {"claude-3-7-sonnet-thought",          200000},
-        {"claude-3-7-sonnet",                  200000},
-        {"claude-3.7-sonnet-thought",          200000},
-        {"claude-3.7-sonnet",                  200000},
-        {"claude-3.5-sonnet-latest",           200000},
-        {"claude-3.5-haiku-latest",            200000},
-        {"claude-3.5-sonnet",                  200000},
-        {"claude-3-opus-latest",               200000},
-        {"claude-3-sonnet-latest",             200000},
-        {"claude-3-haiku-latest",              200000},
-        {"claude-2.1",                         200000},
-        {"claude-2",                           100000},
-        {"claude-instant-v1.2",                100000},
+        {OBFSTR("claude-opus-4-5 (High Effort)"),      200000},
+        {OBFSTR("claude-opus-4-5 (Medium Effort)"),    200000},
+        {OBFSTR("claude-opus-4-5 (Low Effort)"),       200000},
+        {OBFSTR("claude-sonnet-4-5"),                  200000},
+        {OBFSTR("claude-haiku-4-5"),                   200000},
+        {OBFSTR("claude-opus-4-1"),                    200000},
+        {OBFSTR("claude-opus-4"),                      200000},
+        {OBFSTR("claude-sonnet-4"),                    200000},
+        {OBFSTR("claude-3-7-sonnet-thought"),          200000},
+        {OBFSTR("claude-3-7-sonnet"),                  200000},
+        {OBFSTR("claude-3.7-sonnet-thought"),          200000},
+        {OBFSTR("claude-3.7-sonnet"),                  200000},
+        {OBFSTR("claude-3.5-sonnet-latest"),           200000},
+        {OBFSTR("claude-3.5-haiku-latest"),            200000},
+        {OBFSTR("claude-3.5-sonnet"),                  200000},
+        {OBFSTR("claude-3-opus-latest"),               200000},
+        {OBFSTR("claude-3-sonnet-latest"),             200000},
+        {OBFSTR("claude-3-haiku-latest"),              200000},
+        {OBFSTR("claude-2.1"),                         200000},
+        {OBFSTR("claude-2"),                           100000},
+        {OBFSTR("claude-instant-v1.2"),                100000},
 
-        {"gpt-4.1-2025-04-14",               1047576},
-        {"o4-mini-2025-04-16",                 200000},
-        {"o3-mini-2025-01-31",                 200000},
-        {"o3-mini-paygo",                      200000},
-        {"gemini-2.0-flash-001",              1048576},
-        {"gpt-4o-2024-11-20",                  128000},
-        {"gpt-4o-2024-08-06",                  128000},
-        {"gpt-4o-2024-05-13",                  128000},
-        {"gpt-4o-copilot",                     128000},
-        {"gpt-4-o-preview",                    128000},
-        {"gpt-4-0125-preview",                 128000},
-        {"gpt-4-0613",                           8192},
-        {"gpt-4o-mini-2024-07-18",             128000},
-        {"gpt-3.5-turbo-0613",                  16385},
+        {OBFSTR("gpt-4.1-2025-04-14"),               1047576},
+        {OBFSTR("o4-mini-2025-04-16"),                 200000},
+        {OBFSTR("o3-mini-2025-01-31"),                 200000},
+        {OBFSTR("o3-mini-paygo"),                      200000},
+        {OBFSTR("gemini-2.0-flash-001"),              1048576},
+        {OBFSTR("gpt-4o-2024-11-20"),                  128000},
+        {OBFSTR("gpt-4o-2024-08-06"),                  128000},
+        {OBFSTR("gpt-4o-2024-05-13"),                  128000},
+        {OBFSTR("gpt-4o-copilot"),                     128000},
+        {OBFSTR("gpt-4-o-preview"),                    128000},
+        {OBFSTR("gpt-4-0125-preview"),                 128000},
+        {OBFSTR("gpt-4-0613"),                           8192},
+        {OBFSTR("gpt-4o-mini-2024-07-18"),             128000},
+        {OBFSTR("gpt-3.5-turbo-0613"),                  16385},
     };
 
     auto it = context_windows.find(model_name);
@@ -561,12 +617,12 @@ int settings_t::get_active_context_window() const
 {
     qstring provider = ida_utils::qstring_tolower(api_provider.c_str());
     std::string model;
-    if (provider == "gemini")          model = gemini_model_name;
-    else if (provider == "openai")     model = openai_model_name;
-    else if (provider == "openrouter") model = openrouter_model_name;
-    else if (provider == "anthropic")  model = anthropic_model_name;
-    else if (provider == "copilot")    model = copilot_model_name;
-    else if (provider == "local llm") return local_llm_context_window > 0 ? local_llm_context_window : 8192;
+    if (provider == OBFSTR_C("gemini"))          model = gemini_model_name;
+    else if (provider == OBFSTR_C("openai"))     model = openai_model_name;
+    else if (provider == OBFSTR_C("openrouter")) model = openrouter_model_name;
+    else if (provider == OBFSTR_C("anthropic"))  model = anthropic_model_name;
+    else if (provider == OBFSTR_C("copilot"))    model = copilot_model_name;
+    else if (provider == OBFSTR_C("local llm")) return local_llm_context_window > 0 ? local_llm_context_window : 8192;
     else                               return 128000;
     return get_model_context_window(model);
 }
@@ -575,13 +631,13 @@ void settings_t::prompt_for_api_key()
 {
     qstring provider = ida_utils::qstring_tolower(api_provider.c_str());
 
-    if (provider == "copilot")
+    if (provider == OBFSTR_C("copilot"))
     {
         warning(OBFSTR_C("Copilot provider is selected, but the proxy address is not configured. Please set it in the settings dialog."));
         return;
     }
 
-    if (provider == "local llm")
+    if (provider == OBFSTR_C("local llm"))
     {
         warning(OBFSTR_C("Local LLM provider is selected, but the server URL is not configured. Please set it in the settings dialog."));
         return;
@@ -595,13 +651,13 @@ void settings_t::prompt_for_api_key()
 
     qstring key;
     qstring question;
-    question.sprnt("Please enter your %s API key to continue:", provider_name.c_str());
+    question.sprnt(OBFSTR_C("Please enter your %s API key to continue:"), provider_name.c_str());
     if (ask_str(&key, HIST_SRCH, question.c_str()))
     {
-        if (provider == "gemini") gemini_api_key = key.c_str();
-        else if (provider == "openai") openai_api_key = key.c_str();
-        else if (provider == "openrouter") openrouter_api_key = key.c_str();
-        else if (provider == "anthropic") anthropic_api_key = key.c_str();
+        if (provider == OBFSTR_C("gemini")) gemini_api_key = key.c_str();
+        else if (provider == OBFSTR_C("openai")) openai_api_key = key.c_str();
+        else if (provider == OBFSTR_C("openrouter")) openrouter_api_key = key.c_str();
+        else if (provider == OBFSTR_C("anthropic")) anthropic_api_key = key.c_str();
         save();
     }
     else

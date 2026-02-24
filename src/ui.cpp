@@ -81,16 +81,20 @@ static std::vector<std::string> fetch_models_from_api(
 
 static bool is_chat_model(const std::string& id)
 {
-    static const char* const excludes[] = {
-        "embedding", "embeddings", "whisper", "audio", "tts", "dall-e",
-        "image", "vision-preview", "stable-diffusion", "sd-", "moderation"
+    auto excludes = [](const std::string& s) -> bool {
+        return s.find(OBFSTR_C("embedding")) != std::string::npos
+            || s.find(OBFSTR_C("embeddings")) != std::string::npos
+            || s.find(OBFSTR_C("whisper")) != std::string::npos
+            || s.find(OBFSTR_C("audio")) != std::string::npos
+            || s.find(OBFSTR_C("tts")) != std::string::npos
+            || s.find(OBFSTR_C("dall-e")) != std::string::npos
+            || s.find(OBFSTR_C("image")) != std::string::npos
+            || s.find(OBFSTR_C("vision-preview")) != std::string::npos
+            || s.find(OBFSTR_C("stable-diffusion")) != std::string::npos
+            || s.find(OBFSTR_C("sd-")) != std::string::npos
+            || s.find(OBFSTR_C("moderation")) != std::string::npos;
     };
-    for (const auto& ex : excludes)
-    {
-        if (id.find(ex) != std::string::npos)
-            return false;
-    }
-    return true;
+    return !excludes(id);
 }
 
 static std::vector<std::string> fetch_openrouter_models_via_api(const qstring& api_key)
@@ -98,16 +102,18 @@ static std::vector<std::string> fetch_openrouter_models_via_api(const qstring& a
     if (api_key.empty())
         return {};
     std::string auth = api_key.c_str();
-    if (auth.find("Bearer ") != 0)
-        auth = "Bearer " + auth;
-    return fetch_models_from_api("https://openrouter.ai", "/api/v1/models",
-        {{"Authorization", auth}},
+    if (auth.find(OBFSTR_C("Bearer ")) != 0)
+        auth = OBFSTR("Bearer ") + auth;
+    return fetch_models_from_api(OBFSTR_C("https://openrouter.ai"), OBFSTR_C("/api/v1/models"),
+        {{OBFSTR_C("Authorization"), auth}},
         [](const nlohmann::json& j) {
             std::vector<std::string> models;
-            if (!j.contains("data") || !j["data"].is_array()) return models;
-            for (const auto& m : j["data"]) {
-                if (!m.contains("id")) continue;
-                std::string id = m["id"].get<std::string>();
+            std::string k_data = OBFSTR("data");
+            std::string k_id = OBFSTR("id");
+            if (!j.contains(k_data) || !j[k_data].is_array()) return models;
+            for (const auto& m : j[k_data]) {
+                if (!m.contains(k_id)) continue;
+                std::string id = m[k_id].get<std::string>();
                 if (is_chat_model(id))
                     models.push_back(std::move(id));
             }
@@ -119,16 +125,18 @@ static std::vector<std::string> fetch_openai_models_via_api(const qstring& api_k
 {
     if (api_key.empty())
         return {};
-    return fetch_models_from_api("https://api.openai.com", "/v1/models",
-        {{"Authorization", std::string("Bearer ") + api_key.c_str()}},
+    return fetch_models_from_api(OBFSTR_C("https://api.openai.com"), OBFSTR_C("/v1/models"),
+        {{OBFSTR_C("Authorization"), OBFSTR("Bearer ") + api_key.c_str()}},
         [](const nlohmann::json& j) {
             std::vector<std::string> models;
-            if (!j.contains("data") || !j["data"].is_array()) return models;
-            for (const auto& m : j["data"]) {
-                if (!m.contains("id")) continue;
-                std::string id = m["id"].get<std::string>();
-                bool is_relevant = (id.find("gpt") != std::string::npos
-                    || id.find("o1") == 0 || id.find("o3") == 0 || id.find("o4") == 0);
+            std::string k_data = OBFSTR("data");
+            std::string k_id = OBFSTR("id");
+            if (!j.contains(k_data) || !j[k_data].is_array()) return models;
+            for (const auto& m : j[k_data]) {
+                if (!m.contains(k_id)) continue;
+                std::string id = m[k_id].get<std::string>();
+                bool is_relevant = (id.find(OBFSTR_C("gpt")) != std::string::npos
+                    || id.find(OBFSTR_C("o1")) == 0 || id.find(OBFSTR_C("o3")) == 0 || id.find(OBFSTR_C("o4")) == 0);
                 if (is_relevant && is_chat_model(id))
                     models.push_back(std::move(id));
             }
@@ -140,24 +148,29 @@ static std::vector<std::string> fetch_gemini_models_via_api(const qstring& api_k
 {
     if (api_key.empty())
         return {};
-    std::string path = "/v1beta/models?key=" + std::string(api_key.c_str());
-    return fetch_models_from_api("https://generativelanguage.googleapis.com", path,
+    std::string path = OBFSTR("/v1beta/models?key=") + std::string(api_key.c_str());
+    return fetch_models_from_api(OBFSTR_C("https://generativelanguage.googleapis.com"), path,
         {},
         [](const nlohmann::json& j) {
             std::vector<std::string> models;
-            if (!j.contains("models") || !j["models"].is_array()) return models;
-            for (const auto& m : j["models"]) {
-                auto methods = m.value("supportedGenerationMethods", nlohmann::json::array());
+            std::string k_models = OBFSTR("models");
+            std::string k_name = OBFSTR("name");
+            std::string k_methods = OBFSTR("supportedGenerationMethods");
+            std::string k_gen = OBFSTR("generateContent");
+            std::string k_prefix = OBFSTR("models/");
+            if (!j.contains(k_models) || !j[k_models].is_array()) return models;
+            for (const auto& m : j[k_models]) {
+                auto methods = m.value(k_methods, nlohmann::json::array());
                 bool supports_generate = false;
                 for (const auto& method : methods) {
-                    if (method.get<std::string>().find("generateContent") != std::string::npos) {
+                    if (method.get<std::string>().find(k_gen) != std::string::npos) {
                         supports_generate = true;
                         break;
                     }
                 }
                 if (supports_generate) {
-                    std::string name = m.value("name", "");
-                    if (name.find("models/") == 0)
+                    std::string name = m.value(k_name, std::string(""));
+                    if (name.find(k_prefix) == 0)
                         name = name.substr(7);
                     if (!name.empty())
                         models.push_back(std::move(name));
@@ -171,17 +184,19 @@ static std::vector<std::string> fetch_anthropic_models_via_api(const qstring& ap
 {
     if (api_key.empty())
         return {};
-    return fetch_models_from_api("https://api.anthropic.com", "/v1/models",
+    return fetch_models_from_api(OBFSTR_C("https://api.anthropic.com"), OBFSTR_C("/v1/models"),
         {
-            {"x-api-key", std::string(api_key.c_str())},
-            {"anthropic-version", "2023-06-01"}
+            {OBFSTR_C("x-api-key"), std::string(api_key.c_str())},
+            {OBFSTR_C("anthropic-version"), OBFSTR("2023-06-01")}
         },
         [](const nlohmann::json& j) {
             std::vector<std::string> models;
-            if (!j.contains("data") || !j["data"].is_array()) return models;
-            for (const auto& m : j["data"]) {
-                if (!m.contains("id")) continue;
-                models.push_back(m["id"].get<std::string>());
+            std::string k_data = OBFSTR("data");
+            std::string k_id = OBFSTR("id");
+            if (!j.contains(k_data) || !j[k_data].is_array()) return models;
+            for (const auto& m : j[k_data]) {
+                if (!m.contains(k_id)) continue;
+                models.push_back(m[k_id].get<std::string>());
             }
             return models;
         });
@@ -191,14 +206,16 @@ static std::vector<std::string> fetch_copilot_models_via_api(const qstring& prox
 {
     if (proxy_address.empty())
         return {};
-    return fetch_models_from_api(std::string(proxy_address.c_str()), "/v1/models",
+    return fetch_models_from_api(std::string(proxy_address.c_str()), OBFSTR("/v1/models"),
         {},
         [](const nlohmann::json& j) {
             std::vector<std::string> models;
-            if (!j.contains("data") || !j["data"].is_array()) return models;
-            for (const auto& m : j["data"]) {
-                if (!m.contains("id")) continue;
-                std::string id = m["id"].get<std::string>();
+            std::string k_data = OBFSTR("data");
+            std::string k_id = OBFSTR("id");
+            if (!j.contains(k_data) || !j[k_data].is_array()) return models;
+            for (const auto& m : j[k_data]) {
+                if (!m.contains(k_id)) continue;
+                std::string id = m[k_id].get<std::string>();
                 if (is_chat_model(id))
                     models.push_back(std::move(id));
             }
@@ -213,16 +230,18 @@ static std::vector<std::string> fetch_local_llm_models_via_api(const qstring& ba
 
     std::string host = base_url.c_str();
 
-    auto models = fetch_models_from_api(host, "/v1/models",
+    auto models = fetch_models_from_api(host, OBFSTR("/v1/models"),
         {},
         [](const nlohmann::json& j) {
             std::vector<std::string> result;
-            if (j.contains("data") && j["data"].is_array())
+            std::string k_data = OBFSTR("data");
+            std::string k_id = OBFSTR("id");
+            if (j.contains(k_data) && j[k_data].is_array())
             {
-                for (const auto& m : j["data"])
+                for (const auto& m : j[k_data])
                 {
-                    if (!m.contains("id")) continue;
-                    std::string id = m["id"].get<std::string>();
+                    if (!m.contains(k_id)) continue;
+                    std::string id = m[k_id].get<std::string>();
                     if (is_chat_model(id))
                         result.push_back(std::move(id));
                 }
@@ -233,15 +252,17 @@ static std::vector<std::string> fetch_local_llm_models_via_api(const qstring& ba
     if (!models.empty())
         return models;
 
-    models = fetch_models_from_api(host, "/api/tags",
+    models = fetch_models_from_api(host, OBFSTR("/api/tags"),
         {},
         [](const nlohmann::json& j) {
             std::vector<std::string> result;
-            if (j.contains("models") && j["models"].is_array())
+            std::string k_models = OBFSTR("models");
+            std::string k_name = OBFSTR("name");
+            if (j.contains(k_models) && j[k_models].is_array())
             {
-                for (const auto& m : j["models"])
+                for (const auto& m : j[k_models])
                 {
-                    std::string name = m.value("name", "");
+                    std::string name = m.value(k_name, std::string(""));
                     if (!name.empty())
                         result.push_back(std::move(name));
                 }
@@ -1017,11 +1038,11 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
     qstring provider_setting = g_settings.api_provider.c_str();
     provider_setting = ida_utils::qstring_tolower(provider_setting.c_str());
     int provider_idx = 0;
-    if (provider_setting == "openai")          provider_idx = 1;
-    else if (provider_setting == "openrouter") provider_idx = 2;
-    else if (provider_setting == "anthropic")  provider_idx = 3;
-    else if (provider_setting == "copilot")    provider_idx = 4;
-    else if (provider_setting == "local llm")  provider_idx = 5;
+    if (provider_setting == OBFSTR_C("openai"))          provider_idx = 1;
+    else if (provider_setting == OBFSTR_C("openrouter")) provider_idx = 2;
+    else if (provider_setting == OBFSTR_C("anthropic"))  provider_idx = 3;
+    else if (provider_setting == OBFSTR_C("copilot"))    provider_idx = 4;
+    else if (provider_setting == OBFSTR_C("local llm"))  provider_idx = 5;
 
     QComboBox* providerCombo = new QComboBox();
     for (int i = 0; i < num_providers; ++i)
@@ -1480,7 +1501,7 @@ void show_text_in_viewer(const char* title, const std::string& text_content)
 {
     if (text_content.empty() || text_content.find_first_not_of(" \t\n\r") == std::string::npos)
     {
-        warning("AI returned an empty or whitespace-only response. Nothing to display.");
+        warning(OBFSTR_C("AI returned an empty or whitespace-only response. Nothing to display."));
         return;
     }
 
@@ -1508,7 +1529,7 @@ void show_text_in_viewer(const char* title, const std::string& text_content)
     TWidget* viewer = create_custom_viewer(title, &s1, &s2, &s1, nullptr, lines_ptr, nullptr, nullptr);
     if (viewer == nullptr)
     {
-        warning("Could not create viewer '%s'.", title);
+        warning(OBFSTR_C("Could not create viewer '%s'."), title);
         delete lines_ptr;
         return;
     }
@@ -1785,7 +1806,7 @@ void show_prompt_manager_dialog()
             return;
         }
         std::string nameStd = item->text().toStdString();
-        if (nameStd == "Default (Game Hacking)")
+        if (nameStd == OBFSTR_C("Default (Game Hacking)"))
         {
             QMessageBox::warning(&dlg, QStringLiteral("Cannot Delete"),
                 QStringLiteral("The default prompt cannot be deleted."));

@@ -170,30 +170,61 @@ namespace search_tools
 
 namespace debugger_tools
 {
+    // Process control
     tool_result_t get_debugger_state(const nlohmann::json& params);
     tool_result_t start_process(const nlohmann::json& params);
     tool_result_t exit_process(const nlohmann::json& params);
     tool_result_t attach_process(const nlohmann::json& params);
     tool_result_t detach_process(const nlohmann::json& params);
+    tool_result_t get_processes(const nlohmann::json& params);
+
+    // Execution control
     tool_result_t continue_execution(const nlohmann::json& params);
     tool_result_t run_to_address(const nlohmann::json& params);
     tool_result_t step_into(const nlohmann::json& params);
     tool_result_t step_over(const nlohmann::json& params);
     tool_result_t step_out(const nlohmann::json& params);
     tool_result_t suspend(const nlohmann::json& params);
+    tool_result_t wait_for_event(const nlohmann::json& params);
+
+    // Breakpoints
     tool_result_t list_breakpoints(const nlohmann::json& params);
     tool_result_t add_breakpoint(const nlohmann::json& params);
     tool_result_t delete_breakpoint(const nlohmann::json& params);
     tool_result_t toggle_breakpoint(const nlohmann::json& params);
+    tool_result_t set_breakpoint_condition(const nlohmann::json& params);
+    tool_result_t add_hardware_breakpoint(const nlohmann::json& params);
+
+    // Registers
     tool_result_t get_registers(const nlohmann::json& params);
     tool_result_t set_register(const nlohmann::json& params);
+
+    // Stack and memory
     tool_result_t get_call_stack(const nlohmann::json& params);
     tool_result_t read_memory(const nlohmann::json& params);
     tool_result_t write_memory(const nlohmann::json& params);
+    tool_result_t get_memory_map(const nlohmann::json& params);
+
+    // Threads
     tool_result_t get_threads(const nlohmann::json& params);
     tool_result_t select_thread(const nlohmann::json& params);
+    tool_result_t suspend_thread(const nlohmann::json& params);
+    tool_result_t resume_thread(const nlohmann::json& params);
+
+    // Modules
     tool_result_t get_modules(const nlohmann::json& params);
-    
+
+    // Tracing
+    tool_result_t enable_tracing(const nlohmann::json& params);
+    tool_result_t get_trace_events(const nlohmann::json& params);
+    tool_result_t get_trace_status(const nlohmann::json& params);
+    tool_result_t clear_trace_events(const nlohmann::json& params);
+    tool_result_t set_trace_size_tool(const nlohmann::json& params);
+
+    // Exceptions and options
+    tool_result_t get_exceptions(const nlohmann::json& params);
+    tool_result_t set_debugger_options_tool(const nlohmann::json& params);
+
     void register_tools();
 }
 

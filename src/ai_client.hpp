@@ -64,6 +64,7 @@ public:
                       callback_t callback) override;
 
     void cancel_current_request();
+    void set_max_output_tokens(int tokens);
 
     std::string blocking_generate(const std::string& prompt_text, double temperature);
     std::string streaming_blocking_generate(const std::string& prompt_text, double temperature, stream_callback_t on_chunk);
@@ -85,6 +86,7 @@ protected:
     std::string _last_http_host;
 
     std::atomic<bool> _cancelled{false};
+    std::atomic<int> _max_output_tokens{16384};
 
     void _generate(const std::string& prompt_text, callback_t callback, double temperature, const qstring& request_type);
     std::string _blocking_generate(const std::string& prompt_text, double temperature);

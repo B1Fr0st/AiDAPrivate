@@ -107,6 +107,7 @@ target_include_directories(AiDA PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/cpp-httplib"
     "${CMAKE_CURRENT_SOURCE_DIR}/libs"
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/VMProtect3.9.4/Include/C"
 )
 
 target_compile_definitions(AiDA PRIVATE
@@ -133,7 +134,17 @@ if(WIN32)
         OPENSSL_NO_DYNAMIC_ENGINE
         QT_DLL
         QT_THREAD_SUPPORT
+        AIDA_USE_VMP
     )
+
+    target_link_directories(AiDA PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/VMProtect3.9.4/Lib/Windows"
+    )
+
+    # Delay-load VMProtectSDK64.dll so AiDA.dll loads even when the DLL is only
+    # in the plugins folder. DllMain resolves it by full path before first VMP call.
+    target_link_options(AiDA PRIVATE /DELAYLOAD:VMProtectSDK64.dll)
+    target_link_libraries(AiDA PRIVATE delayimp)
 elseif(APPLE)
     target_compile_definitions(AiDA PRIVATE __MAC__)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")

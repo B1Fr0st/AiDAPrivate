@@ -1,30 +1,5 @@
 #pragma once
 
-// ============================================================================
-// Compile-Time String Encryption (XOR-based Obfuscation)
-// ============================================================================
-//
-// Purpose: Prevent static string analysis of the compiled binary.
-// Every string wrapped with OBFSTR("...") is XOR-encrypted at compile time
-// and decrypted at runtime. This means tools like `strings`, IDA's string
-// view, or hex editors will NOT find plaintext "AiDA", "AI Assistant", etc.
-//
-// How it works:
-//   1. derive_key(__LINE__) produces a unique uint8_t key per source line.
-//   2. encrypted_string<N,K> XOR-encrypts each byte at compile time using
-//      a position-dependent cipher: byte[i] ^= (K ^ (i*7+3)) & 0xFF.
-//   3. OBFSTR(s) expands to a lambda that holds the encrypted bytes as a
-//      'static constexpr' (forces compile-time evaluation), then decrypts
-//      into a std::string at runtime.
-//   4. The returned std::string temporary lives until the end of the
-//      full-expression, so  msg(OBFSTR("fmt %s").c_str(), arg)  is safe.
-//
-// Verified against IDA SDK:
-//   - msg(), warning(), info() take  const char *format  (kernwin.hpp L7226)
-//   - OBFSTR("...").c_str() returns a valid const char* for the lifetime
-//     of the enclosing full-expression per C++17 [class.temporary]/6.
-// ============================================================================
-
 #include <string>
 #include <cstdint>
 #include <cstddef>
@@ -84,3 +59,99 @@ public:
 }())
 
 #define OBFSTR_C(s) (OBFSTR(s).c_str())
+
+namespace obf {
+namespace detail {
+
+constexpr wchar_t cipher_wbyte(wchar_t c, uint8_t key, size_t idx) noexcept
+{
+    const uint16_t effective_key = static_cast<uint16_t>(
+        (static_cast<uint16_t>(key) ^ static_cast<uint16_t>((idx * 11u + 7u) & 0xFFu)) & 0xFFFFu);
+    return static_cast<wchar_t>(static_cast<uint16_t>(c) ^ effective_key);
+}
+
+template<size_t N, uint8_t K>
+class encrypted_wstring
+{
+    wchar_t m_data[N];
+public:
+    constexpr encrypted_wstring(const wchar_t (&str)[N]) noexcept : m_data{}
+    {
+        for (size_t i = 0; i < N; ++i)
+            m_data[i] = cipher_wbyte(str[i], K, i);
+    }
+
+#ifdef _MSC_VER
+    __forceinline
+#else
+    __attribute__((always_inline))
+#endif
+    std::wstring decrypt() const
+    {
+        std::wstring result(N - 1, L'\0');
+        for (size_t i = 0; i < N - 1; ++i)
+            result[i] = cipher_wbyte(m_data[i], K, i);
+        return result;
+    }
+};
+
+} // namespace detail
+} // namespace obf
+
+#define WOBFSTR(s) ([]() -> std::wstring {                                 \
+    static constexpr ::obf::detail::encrypted_wstring<                     \
+        sizeof(s) / sizeof(wchar_t),                                       \
+        ::obf::detail::derive_key(                                         \
+            static_cast<uint32_t>(__LINE__) ^ 0xC7D9u)> _enc_wdata(s);    \
+    return _enc_wdata.decrypt();                                           \
+}())
+
+#define WOBFSTR_C(s) (WOBFSTR(s).c_str())
+
+namespace obf {
+namespace detail {
+
+constexpr uint8_t cipher_secret_byte(uint8_t c, uint8_t key, size_t idx) noexcept
+{
+    uint8_t k1 = static_cast<uint8_t>((key ^ (idx * 13u + 17u)) & 0xFFu);
+    uint8_t k2 = static_cast<uint8_t>(((key >> 4) ^ (idx * 7u + 3u)) & 0xFFu);
+    uint8_t k3 = static_cast<uint8_t>(((idx + key) * 11u) & 0xFFu);
+    return c ^ k1 ^ k2 ^ k3;
+}
+
+template<size_t N, uint8_t K>
+class encrypted_secret
+{
+    uint8_t m_data[N];
+public:
+    constexpr encrypted_secret(const char (&str)[N]) noexcept : m_data{}
+    {
+        for (size_t i = 0; i < N; ++i)
+            m_data[i] = cipher_secret_byte(static_cast<uint8_t>(str[i]), K, i);
+    }
+
+#ifdef _MSC_VER
+    __declspec(noinline) __forceinline
+#else
+    __attribute__((noinline, always_inline))
+#endif
+    std::string decrypt() const
+    {
+        std::string result(N - 1, '\0');
+        for (size_t i = 0; i < N - 1; ++i)
+            result[i] = static_cast<char>(cipher_secret_byte(m_data[i], K, i));
+        return result;
+    }
+};
+
+} // namespace detail
+} // namespace obf
+
+#define OBFBYTES(s) ([]() -> std::string {                                 \
+    static constexpr ::obf::detail::encrypted_secret<                      \
+        sizeof(s),                                                         \
+        ::obf::detail::derive_key(                                         \
+            static_cast<uint32_t>(__LINE__) ^ 0xE5A3u                       \
+            ^ static_cast<uint32_t>(__COUNTER__))> _enc_secret(s);        \
+    return _enc_secret.decrypt();                                          \
+}())

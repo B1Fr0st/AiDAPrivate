@@ -1887,7 +1887,7 @@ namespace ida_utils
         if (max_len != 0 || !pfn)
         {
             json context = get_context_for_prompt(ea, include_struct_context, max_len);
-            if (context.contains("ok") && context["ok"].is_boolean() && context["ok"].get<bool>())
+            if (context.contains(OBFSTR_C("ok")) && context[OBFSTR_C("ok")].is_boolean() && context[OBFSTR_C("ok")].get<bool>())
             {
                 json rag = get_rag_context(ea, settings, &context);
                 context["binary_metadata"] = json_str(rag, "binary_metadata", "// No metadata available.");
@@ -1911,7 +1911,7 @@ namespace ida_utils
         }
 
         json context = get_context_for_prompt(ea, true, 0);
-        if (!(context.contains("ok") && context["ok"].is_boolean() && context["ok"].get<bool>()))
+        if (!(context.contains(OBFSTR_C("ok")) && context[OBFSTR_C("ok")].is_boolean() && context[OBFSTR_C("ok")].get<bool>()))
             return context;
 
         json rag = get_rag_context(ea, settings, &context);

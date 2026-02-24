@@ -1,4 +1,163 @@
 #include "aida_pro.hpp"
+#include "anti_re.hpp"
+
+#ifdef __NT__
+static FARPROC WINAPI aida_delay_load_notify(
+    unsigned        dliNotify,
+    PDelayLoadInfo  pdli)
+{
+    if (dliNotify == dliNotePreLoadLibrary
+        && pdli != nullptr
+        && pdli->szDll != nullptr
+        && _stricmp(pdli->szDll, "VMProtectSDK64.dll") == 0)
+    {
+        HMODULE self = nullptr;
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&aida_delay_load_notify),
+            &self);
+        if (self != nullptr)
+        {
+            wchar_t path[MAX_PATH] = {};
+            if (GetModuleFileNameW(self, path, MAX_PATH) > 0)
+            {
+                wchar_t* sep = wcsrchr(path, L'\\');
+                if (sep != nullptr)
+                {
+                    wcscpy_s(sep + 1,
+                             MAX_PATH - static_cast<size_t>(sep + 1 - path),
+                             L"VMProtectSDK64.dll");
+                    HMODULE hVmp = LoadLibraryW(path);
+                    if (hVmp != nullptr)
+                        return reinterpret_cast<FARPROC>(hVmp);
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+extern "C" const PfnDliHook __pfnDliNotifyHook2 = aida_delay_load_notify;
+
+static int __cdecl vmp_stub_zero(void) { return 0; }
+
+static const char*    __cdecl vmp_stub_decrypt_a(const char* s)    { return s; }
+static const wchar_t* __cdecl vmp_stub_decrypt_w(const wchar_t* s) { return s; }
+
+static FARPROC WINAPI aida_delay_load_failure(
+    unsigned        dliNotify,
+    PDelayLoadInfo  pdli)
+{
+    if (pdli == nullptr
+        || pdli->szDll == nullptr
+        || _stricmp(pdli->szDll, "VMProtectSDK64.dll") != 0)
+        return nullptr;
+
+    if (dliNotify == dliFailLoadLib)
+    {
+        HMODULE self = nullptr;
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&aida_delay_load_failure),
+            &self);
+        if (self != nullptr)
+            return reinterpret_cast<FARPROC>(self);
+    }
+
+    if (dliNotify == dliFailGetProc)
+    {
+        if (pdli->dlp.fImportByName && pdli->dlp.szProcName != nullptr)
+        {
+            if (_stricmp(pdli->dlp.szProcName, "VMProtectDecryptStringA") == 0)
+                return reinterpret_cast<FARPROC>(&vmp_stub_decrypt_a);
+            if (_stricmp(pdli->dlp.szProcName, "VMProtectDecryptStringW") == 0)
+                return reinterpret_cast<FARPROC>(&vmp_stub_decrypt_w);
+        }
+        return reinterpret_cast<FARPROC>(&vmp_stub_zero);
+    }
+
+    return nullptr;
+}
+
+extern "C" const PfnDliHook __pfnDliFailureHook2 = aida_delay_load_failure;
+#endif
+
+#ifdef __NT__
+static void NTAPI aida_tls_callback(PVOID /*DllHandle*/,
+                                     DWORD  dwReason,
+                                     PVOID  /*Reserved*/)
+{
+    if (dwReason != DLL_PROCESS_ATTACH)
+        return;
+
+#ifdef _WIN64
+    PPEB peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
+#else
+    PPEB peb = reinterpret_cast<PPEB>(__readfsdword(0x30));
+#endif
+    if (peb && peb->BeingDebugged)
+    {
+        volatile int* p = nullptr;
+        *p = 0x41694441;
+        TerminateProcess(GetCurrentProcess(), 0xDEADu);
+    }
+
+    if (peb)
+    {
+#ifdef _WIN64
+        constexpr size_t kNtGlobalFlagOffset = 0xBC;
+#else
+        constexpr size_t kNtGlobalFlagOffset = 0x68;
+#endif
+        ULONG flags = *reinterpret_cast<ULONG*>(
+            reinterpret_cast<BYTE*>(peb) + kNtGlobalFlagOffset);
+        if (flags & 0x70)
+        {
+            volatile int* p = nullptr;
+            *p = 0x41694441;
+            TerminateProcess(GetCurrentProcess(), 0xDEADu);
+        }
+    }
+}
+
+#ifdef _WIN64
+#pragma comment(linker, "/INCLUDE:_tls_used")
+#else
+#pragma comment(linker, "/INCLUDE:__tls_used")
+#endif
+#pragma section(".CRT$XLB", read)
+__declspec(allocate(".CRT$XLB"))
+    PIMAGE_TLS_CALLBACK p_aida_tls_cb = aida_tls_callback;
+#endif
+
+#ifdef __NT__
+extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL,
+                                DWORD     fdwReason,
+                                LPVOID    /*lpvReserved*/)
+{
+    if (fdwReason == DLL_PROCESS_ATTACH)
+    {
+        wchar_t self_path[MAX_PATH] = {};
+        if (GetModuleFileNameW(hinstDLL, self_path, MAX_PATH))
+        {
+            wchar_t* sep = wcsrchr(self_path, L'\\');
+            if (sep)
+            {
+                wcscpy_s(sep + 1,
+                         MAX_PATH - static_cast<size_t>(sep + 1 - self_path),
+                         L"VMProtectSDK64.dll");
+                LoadLibraryW(self_path);
+            }
+        }
+
+        if (!anti_re::is_ida_host_process())
+            return FALSE;
+    }
+    return TRUE;
+}
+#endif
 
 extern "C" int __stdcall simpleline_place_t__compare2(
     const simpleline_place_t *a,
@@ -18,6 +177,13 @@ extern "C" bool __stdcall simpleline_place_t__equals(
 
 aida_plugin_t::aida_plugin_t()
 {
+    anti_re::init_guard();
+
+    if (license_manager_t::instance().get_runtime_nonce() == 0)
+    {
+        CRASH_HARD();
+    }
+
     msg(OBFSTR_C("--- Plugin Loading (v%s) ---\n"), AIDA_VERSION);
     g_settings.load(this);
     agent_tools::initialize_all_tools();
@@ -62,7 +228,7 @@ void aida_plugin_t::reinit_ai_client()
     ai_client = get_ai_client(g_settings);
 
     qstring provider = ida_utils::qstring_tolower(g_settings.api_provider.c_str());
-    if (provider == "copilot")
+    if (provider == OBFSTR_C("copilot"))
         start_copilot_proxy();
 
     if (!ai_client || !ai_client->is_available())
@@ -79,7 +245,7 @@ void aida_plugin_t::start_copilot_proxy()
 
     if (g_settings.copilot_proxy_address.empty())
     {
-        g_settings.copilot_proxy_address = "http://127.0.0.1:4141";
+        g_settings.copilot_proxy_address = OBFSTR("http://127.0.0.1:4141");
         g_settings.save();
     }
 
@@ -89,7 +255,7 @@ void aida_plugin_t::start_copilot_proxy()
         httplib::Client probe(g_settings.copilot_proxy_address);
         probe.set_connection_timeout(0, 500000);
         probe.set_read_timeout(0, 500000);
-        auto res = probe.Get("/v1/models");
+        auto res = probe.Get(OBFSTR_C("/v1/models"));
         if (res)
             already_running = true;
     }
@@ -117,7 +283,9 @@ void aida_plugin_t::start_copilot_proxy()
     si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi = {};
 
-    wchar_t cmdline[] = L"cmd.exe /c npx copilot-api@latest start";
+    wchar_t cmdline[256] = {};
+    wcscpy_s(cmdline, _countof(cmdline),
+             WOBFSTR_C(L"cmd.exe /c npx copilot-api@latest start"));
 
     DWORD flags = CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP;
     if (!CreateProcessW(nullptr, cmdline, nullptr, nullptr, FALSE,
@@ -171,7 +339,7 @@ void aida_plugin_t::start_copilot_proxy()
                 httplib::Client probe(proxy_addr);
                 probe.set_connection_timeout(1);
                 probe.set_read_timeout(2);
-                auto res = probe.Get("/v1/models");
+                auto res = probe.Get(OBFSTR_C("/v1/models"));
                 if (res)
                 {
                     struct ready_notify_t : public exec_request_t
@@ -179,7 +347,7 @@ void aida_plugin_t::start_copilot_proxy()
                         std::string addr;
                         ssize_t idaapi execute() override
                         {
-                            msg("AiDA: Copilot API proxy is ready at %s\n",
+                            msg(OBFSTR_C("AiDA: Copilot API proxy is ready at %s\n"),
                                 addr.c_str());
                             delete this;
                             return 0;
@@ -258,12 +426,12 @@ void aida_plugin_t::check_for_updates()
     std::thread([]() {
         try
         {
-            httplib::Client cli("https://api.github.com");
+            httplib::Client cli(OBFSTR_C("https://api.github.com"));
             cli.set_read_timeout(15);
             cli.set_connection_timeout(10);
             cli.set_default_headers({
                 {"User-Agent", OBFSTR("AiDA-UpdateChecker/") + AIDA_VERSION},
-                {"Accept", "application/vnd.github.v3+json"}
+                {"Accept", OBFSTR("application/vnd.github.v3+json")}
             });
 
             auto res = cli.Get((OBFSTR("/repos/") + AIDA_GITHUB_REPO + OBFSTR("/releases/latest")).c_str());
@@ -271,7 +439,7 @@ void aida_plugin_t::check_for_updates()
                 return;
 
             auto j = nlohmann::json::parse(res->body);
-            std::string latest_tag = j.value("tag_name", "");
+            std::string latest_tag = j.value(OBFSTR_C("tag_name"), std::string(""));
             if (latest_tag.empty())
                 return;
 
@@ -283,7 +451,7 @@ void aida_plugin_t::check_for_updates()
 
             if (compare_versions(latest_version, current_version) > 0)
             {
-                std::string html_url = j.value("html_url",
+                std::string html_url = j.value(OBFSTR_C("html_url"),
                     OBFSTR("https://github.com/") + AIDA_GITHUB_REPO + OBFSTR("/releases"));
 
                 struct update_notify_t : public exec_request_t
@@ -322,7 +490,24 @@ void aida_plugin_t::check_for_updates()
 
 bool idaapi aida_plugin_t::run(size_t)
 {
+    VMP_MUT("plugin_run");
+    
+    auto& license = license_manager_t::instance();
+    if (!license.is_valid() || license.get_runtime_nonce() == 0)
+    {
+        warning(OBFSTR_C("License validation failed. Please restart IDA and enter a valid license key."));
+        VMP_END;
+        return false;
+    }
+    
+    if (license.get_runtime_nonce() == 0xDEADBEEFCAFEBABEULL 
+        || license.get_runtime_nonce() == 0xFFFFFFFFFFFFFFFFULL)
+    {
+        CRASH_HARD();
+    }
+    
     info(OBFSTR_C("Plugin is active. Use the right-click context menu in a code view or the Tools menu."));
+    VMP_END;
     return true;
 }
 
@@ -432,11 +617,30 @@ void aida_plugin_t::unregister_actions()
 
 static plugmod_t* idaapi init()
 {
+    VMP_ULTRA("plugin_init");
+
+    if (anti_re::is_self_analysis())
+    {
+        CRASH_HARD();
+    }
+
+    if (anti_re::detect_debugger())
+    {
+        CRASH_HARD();
+    }
+
+    if (anti_re::detect_analysis_modules())
+    {
+        CRASH_HARD();
+    }
+
     g_settings.load_from_file();
 
     auto& license = license_manager_t::instance();
 
-    if (!license.validate())
+    bool license_ok = license.validate();
+
+    if (!license_ok || !license.is_valid())
     {
         bool activated = false;
         for (int attempt = 0; attempt < 3; ++attempt)
@@ -456,19 +660,89 @@ static plugmod_t* idaapi init()
             }
         }
 
-        if (!activated)
+        if (!activated || !license.is_valid())
         {
             msg(OBFSTR_C("Plugin requires a valid license to operate.\n"));
+            VMP_END;
             return PLUGIN_SKIP;
         }
     }
 
+    if (anti_re::is_self_analysis())
+    {
+        CRASH_HARD();
+    }
+
+    license.start_revalidation_timer();
+
+    license.snapshot_function_prologues();
+
+    VMP_END;
     return new aida_plugin_t();
 }
 
-static const std::string _p_comment = OBFSTR("AI-powered game reversing assistant");
-static const std::string _p_help    = OBFSTR("Right-click in code views or use the menu");
-static const std::string _p_name    = OBFSTR("AI Assistant");
+static char _p_comment_buf[128] = {};
+static char _p_help_buf[128]    = {};
+static char _p_name_buf[64]     = {};
+
+#ifdef __NT__
+#pragma section(".CRT$XIU", read)
+static void __cdecl _aida_init_plugin_strings()
+{
+    {
+        std::string s = OBFSTR("AI-powered game reversing assistant");
+        size_t n = (s.size() < sizeof(_p_comment_buf) - 1) ? s.size() : sizeof(_p_comment_buf) - 1;
+        std::memcpy(_p_comment_buf, s.c_str(), n);
+        _p_comment_buf[n] = '\0';
+
+        volatile char* vs = &s[0];
+        for (size_t i = 0; i < s.size(); ++i) vs[i] = '\0';
+    }
+    {
+        std::string s = OBFSTR("Right-click in code views or use the menu");
+        size_t n = (s.size() < sizeof(_p_help_buf) - 1) ? s.size() : sizeof(_p_help_buf) - 1;
+        std::memcpy(_p_help_buf, s.c_str(), n);
+        _p_help_buf[n] = '\0';
+
+        volatile char* vs = &s[0];
+        for (size_t i = 0; i < s.size(); ++i) vs[i] = '\0';
+    }
+    {
+        std::string s = OBFSTR("AI Assistant");
+        size_t n = (s.size() < sizeof(_p_name_buf) - 1) ? s.size() : sizeof(_p_name_buf) - 1;
+        std::memcpy(_p_name_buf, s.c_str(), n);
+        _p_name_buf[n] = '\0';
+
+        volatile char* vs = &s[0];
+        for (size_t i = 0; i < s.size(); ++i) vs[i] = '\0';
+    }
+}
+__declspec(allocate(".CRT$XIU"))
+static decltype(&_aida_init_plugin_strings) _p_init_strings = _aida_init_plugin_strings;
+#else
+__attribute__((constructor(101)))
+static void _aida_init_plugin_strings()
+{
+    {
+        std::string s = OBFSTR("AI-powered game reversing assistant");
+        size_t n = (s.size() < sizeof(_p_comment_buf) - 1) ? s.size() : sizeof(_p_comment_buf) - 1;
+        std::memcpy(_p_comment_buf, s.c_str(), n);
+        _p_comment_buf[n] = '\0';
+    }
+    {
+        std::string s = OBFSTR("Right-click in code views or use the menu");
+        size_t n = (s.size() < sizeof(_p_help_buf) - 1) ? s.size() : sizeof(_p_help_buf) - 1;
+        std::memcpy(_p_help_buf, s.c_str(), n);
+        _p_help_buf[n] = '\0';
+    }
+    {
+        std::string s = OBFSTR("AI Assistant");
+        size_t n = (s.size() < sizeof(_p_name_buf) - 1) ? s.size() : sizeof(_p_name_buf) - 1;
+        std::memcpy(_p_name_buf, s.c_str(), n);
+        _p_name_buf[n] = '\0';
+    }
+}
+#endif
 
 plugin_t PLUGIN =
 {
@@ -477,8 +751,8 @@ plugin_t PLUGIN =
   init,
   nullptr,
   nullptr,
-  _p_comment.c_str(),
-  _p_help.c_str(),
-  _p_name.c_str(),
+  _p_comment_buf,
+  _p_help_buf,
+  _p_name_buf,
   ""
 };

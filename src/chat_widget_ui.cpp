@@ -2351,22 +2351,22 @@ void AiDAChatPanel::saveToDisk() const
         for (const auto& conv : m_savedConversations)
         {
             nlohmann::json jconv;
-            jconv["title"] = conv.title.toStdString();
-            jconv["timestamp"] = conv.timestamp.toStdString();
+            jconv[OBFSTR_C("title")] = conv.title.toStdString();
+            jconv[OBFSTR_C("timestamp")] = conv.timestamp.toStdString();
 
             nlohmann::json msgs = nlohmann::json::array();
             for (const auto& msg : conv.messages)
             {
                 nlohmann::json jmsg;
-                jmsg["role"] = msg.first;
-                jmsg["content"] = msg.second;
+                jmsg[OBFSTR_C("role")] = msg.first;
+                jmsg[OBFSTR_C("content")] = msg.second;
                 msgs.push_back(std::move(jmsg));
             }
-            jconv["messages"] = std::move(msgs);
+            jconv[OBFSTR_C("messages")] = std::move(msgs);
             convArray.push_back(std::move(jconv));
         }
 
-        root["conversations"] = std::move(convArray);
+        root[OBFSTR_C("conversations")] = std::move(convArray);
 
         std::string json_str = root.dump(2);
         qstring path = getHistoryFilePath();
@@ -2409,20 +2409,20 @@ void AiDAChatPanel::loadFromDisk()
     {
         nlohmann::json root = nlohmann::json::parse(json_data.c_str());
 
-        if (!root.contains("conversations") || !root["conversations"].is_array())
+        if (!root.contains(OBFSTR_C("conversations")) || !root[OBFSTR_C("conversations")].is_array())
             return;
 
         m_savedConversations.clear();
 
-        for (const auto& jconv : root["conversations"])
+        for (const auto& jconv : root[OBFSTR_C("conversations")])
         {
             SavedConversation conv;
             conv.title = QString::fromStdString(jconv.value("title", ""));
             conv.timestamp = QString::fromStdString(jconv.value("timestamp", ""));
 
-            if (jconv.contains("messages") && jconv["messages"].is_array())
+            if (jconv.contains(OBFSTR_C("messages")) && jconv[OBFSTR_C("messages")].is_array())
             {
-                for (const auto& jmsg : jconv["messages"])
+                for (const auto& jmsg : jconv[OBFSTR_C("messages")])
                 {
                     std::string role = jmsg.value("role", "");
                     std::string content = jmsg.value("content", "");

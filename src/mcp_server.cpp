@@ -10,7 +10,12 @@ static constexpr int JSONRPC_METHOD_NOT_FOUND = -32601;
 static constexpr int JSONRPC_INVALID_PARAMS   = -32602;
 static constexpr int JSONRPC_INTERNAL_ERROR   = -32603;
 
-static const char* const MCP_PROTOCOL_VERSION = "2024-11-05";
+static const std::string& get_mcp_protocol_version()
+{
+    static const std::string v = OBFSTR("2024-11-05");
+    return v;
+}
+#define MCP_PROTOCOL_VERSION get_mcp_protocol_version().c_str()
 
 static std::string generate_session_id()
 {
@@ -53,20 +58,20 @@ struct mcp_resource_exec_request_t : public exec_request_t
 static json make_jsonrpc_result(const json& id, const json& result)
 {
     return {
-        {"jsonrpc", "2.0"},
-        {"id",      id},
-        {"result",  result}
+        {OBFSTR_C("jsonrpc"), OBFSTR_C("2.0")},
+        {OBFSTR_C("id"),      id},
+        {OBFSTR_C("result"),  result}
     };
 }
 
 static json make_jsonrpc_error(const json& id, int code, const std::string& message)
 {
     return {
-        {"jsonrpc", "2.0"},
-        {"id",      id},
-        {"error",   {
-            {"code",    code},
-            {"message", message}
+        {OBFSTR_C("jsonrpc"), OBFSTR_C("2.0")},
+        {OBFSTR_C("id"),      id},
+        {OBFSTR_C("error"),   {
+            {OBFSTR_C("code"),    code},
+            {OBFSTR_C("message"), message}
         }}
     };
 }
@@ -267,7 +272,7 @@ static json build_mcp_tools_list()
     for (const auto* tool : all_tools)
     {
         json input_schema = json::object();
-        input_schema["type"] = "object";
+        input_schema[OBFSTR_C("type")] = "object";
 
         json properties = json::object();
         json required_arr = json::array();
@@ -275,14 +280,14 @@ static json build_mcp_tools_list()
         for (const auto& param : tool->parameters)
         {
             json p;
-            p["type"] = param.type;
-            p["description"] = param.description;
+            p[OBFSTR_C("type")] = param.type;
+            p[OBFSTR_C("description")] = param.description;
             if (!param.enum_values.empty())
                 p["enum"] = param.enum_values;
             if (param.type == "array" && !param.items_schema.is_null())
                 p["items"] = param.items_schema;
             else if (param.type == "array")
-                p["items"] = json::object({{"type", "object"}});
+                p["items"] = json::object({{OBFSTR_C("type"), "object"}});
             properties[param.name] = p;
             if (param.required)
                 required_arr.push_back(param.name);
@@ -300,9 +305,9 @@ static json build_mcp_tools_list()
         annotations["openWorldHint"]   = (tool->name == "execute_python");
 
         json t;
-        t["name"]        = tool->name;
-        t["description"] = tool->description;
-        t["inputSchema"] = input_schema;
+        t[OBFSTR_C("name")]        = tool->name;
+        t[OBFSTR_C("description")] = tool->description;
+        t[OBFSTR_C("inputSchema")] = input_schema;
         t["annotations"] = annotations;
         tools.push_back(t);
     }
@@ -313,19 +318,19 @@ static json build_mcp_tools_list()
 static json handle_initialize(const json& id, const json& /*params*/)
 {
     json capabilities;
-    capabilities["tools"]     = {{"listChanged", true}};
-    capabilities["resources"] = {{"listChanged", true}};
-    capabilities["prompts"]   = {{"listChanged", true}};
+    capabilities[OBFSTR_C("tools")]     = {{"listChanged", true}};
+    capabilities[OBFSTR_C("resources")] = {{"listChanged", true}};
+    capabilities[OBFSTR_C("prompts")]   = {{"listChanged", true}};
     capabilities["logging"]   = json::object();
 
     json server_info;
-    server_info["name"] = OBFSTR("AiDA - IDA Pro AI Assistant");
+    server_info[OBFSTR_C("name")] = OBFSTR("AiDA - IDA Pro AI Assistant");
     server_info["version"] = AIDA_VERSION;
 
     json result;
-    result["protocolVersion"] = MCP_PROTOCOL_VERSION;
-    result["capabilities"] = capabilities;
-    result["serverInfo"] = server_info;
+    result[OBFSTR_C("protocolVersion")] = MCP_PROTOCOL_VERSION;
+    result[OBFSTR_C("capabilities")] = capabilities;
+    result[OBFSTR_C("serverInfo")] = server_info;
     result["instructions"] =
         "MANDATORY RULE: For ALL number base conversions (hexadecimal to decimal, decimal to "
         "hexadecimal, binary conversions, computing byte representations of integers, "
@@ -349,17 +354,17 @@ static json handle_ping(const json& id)
 static json handle_tools_list(const json& id)
 {
     json result;
-    result["tools"] = build_mcp_tools_list();
+    result[OBFSTR_C("tools")] = build_mcp_tools_list();
     return make_jsonrpc_result(id, result);
 }
 
 static json handle_tools_call(const json& id, const json& params)
 {
-    if (!params.contains("name") || !params["name"].is_string())
+    if (!params.contains(OBFSTR_C("name")) || !params[OBFSTR_C("name")].is_string())
         return make_jsonrpc_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'name'");
 
-    std::string tool_name = params["name"].get<std::string>();
-    json arguments = params.contains("arguments") && params["arguments"].is_object()
+    std::string tool_name = params[OBFSTR_C("name")].get<std::string>();
+    json arguments = params.contains(OBFSTR_C("arguments")) && params["arguments"].is_object()
                    ? params["arguments"]
                    : json::object();
 
@@ -370,8 +375,8 @@ static json handle_tools_call(const json& id, const json& params)
     if (!tool_result.output.empty())
     {
         content.push_back({
-            {"type", "text"},
-            {"text", sanitize_utf8(tool_result.output)}
+            {OBFSTR_C("type"), "text"},
+            {OBFSTR_C("text"), sanitize_utf8(tool_result.output)}
         });
     }
 
@@ -379,21 +384,21 @@ static json handle_tools_call(const json& id, const json& params)
     {
         std::string data_text = json_dump_safe(tool_result.data, 2);
         content.push_back({
-            {"type", "text"},
-            {"text", sanitize_utf8(data_text)}
+            {OBFSTR_C("type"), "text"},
+            {OBFSTR_C("text"), sanitize_utf8(data_text)}
         });
     }
 
     if (content.empty())
     {
         content.push_back({
-            {"type", "text"},
-            {"text", tool_result.success ? "Tool executed successfully (no output)." : "Tool execution failed (no details)."}
+            {OBFSTR_C("type"), "text"},
+            {OBFSTR_C("text"), tool_result.success ? "Tool executed successfully (no output)." : "Tool execution failed (no details)."}
         });
     }
 
     json result;
-    result["content"] = content;
+    result[OBFSTR_C("content")] = content;
     if (!tool_result.success)
         result["isError"] = true;
 
@@ -406,24 +411,24 @@ static json handle_resources_list(const json& id)
     for (const auto& rdef : get_resource_definitions())
     {
         json r;
-        r["uri"] = rdef.uri;
-        r["name"] = rdef.name;
-        r["description"] = rdef.description;
+        r[OBFSTR_C("uri")] = rdef.uri;
+        r[OBFSTR_C("name")] = rdef.name;
+        r[OBFSTR_C("description")] = rdef.description;
         r["mimeType"] = rdef.mime_type;
         resources.push_back(r);
     }
 
     json result;
-    result["resources"] = resources;
+    result[OBFSTR_C("resources")] = resources;
     return make_jsonrpc_result(id, result);
 }
 
 static json handle_resources_read(const json& id, const json& params)
 {
-    if (!params.contains("uri") || !params["uri"].is_string())
+    if (!params.contains(OBFSTR_C("uri")) || !params[OBFSTR_C("uri")].is_string())
         return make_jsonrpc_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'uri'");
 
-    std::string uri = params["uri"].get<std::string>();
+    std::string uri = params[OBFSTR_C("uri")].get<std::string>();
 
     const mcp_resource_def_t* found = nullptr;
     for (const auto& rdef : get_resource_definitions())
@@ -448,9 +453,9 @@ static json handle_resources_read(const json& id, const json& params)
 
     json contents = json::array();
     contents.push_back({
-        {"uri",      found->uri},
+        {OBFSTR_C("uri"),      found->uri},
         {"mimeType", found->mime_type},
-        {"text",     text_content}
+        {OBFSTR_C("text"),     text_content}
     });
 
     json result;
@@ -464,15 +469,15 @@ static json handle_resources_templates_list(const json& id)
 
     templates.push_back({
         {"uriTemplate", "ida://function/{address}"},
-        {"name", "Function by Address"},
-        {"description", "Access a function's decompiled code by its hexadecimal address"},
+        {OBFSTR_C("name"), "Function by Address"},
+        {OBFSTR_C("description"), "Access a function's decompiled code by its hexadecimal address"},
         {"mimeType", "application/json"}
     });
 
     templates.push_back({
         {"uriTemplate", "ida://address/{address}"},
-        {"name", "Address Information"},
-        {"description", "Get detailed information about any address in the binary"},
+        {OBFSTR_C("name"), "Address Information"},
+        {OBFSTR_C("description"), "Get detailed information about any address in the binary"},
         {"mimeType", "application/json"}
     });
 
@@ -487,16 +492,16 @@ static json handle_prompts_list(const json& id)
     for (const auto& pdef : get_prompt_definitions())
     {
         json p;
-        p["name"] = pdef.name;
-        p["description"] = pdef.description;
+        p[OBFSTR_C("name")] = pdef.name;
+        p[OBFSTR_C("description")] = pdef.description;
         if (!pdef.arguments.empty())
         {
             json args = json::array();
             for (const auto& arg : pdef.arguments)
             {
                 args.push_back({
-                    {"name", arg.name},
-                    {"description", arg.description},
+                    {OBFSTR_C("name"), arg.name},
+                    {OBFSTR_C("description"), arg.description},
                     {"required", arg.required}
                 });
             }
@@ -506,7 +511,7 @@ static json handle_prompts_list(const json& id)
     }
 
     json result;
-    result["prompts"] = prompts_arr;
+    result[OBFSTR_C("prompts")] = prompts_arr;
     return make_jsonrpc_result(id, result);
 }
 
@@ -601,10 +606,10 @@ static std::string build_rag_section(const std::string& addr_str)
 
 static json handle_prompts_get(const json& id, const json& params)
 {
-    if (!params.contains("name") || !params["name"].is_string())
+    if (!params.contains(OBFSTR_C("name")) || !params[OBFSTR_C("name")].is_string())
         return make_jsonrpc_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'name'");
 
-    std::string name = params["name"].get<std::string>();
+    std::string name = params[OBFSTR_C("name")].get<std::string>();
     json arguments = params.value("arguments", json::object());
 
     const mcp_prompt_def_t* found = nullptr;
@@ -684,7 +689,7 @@ static json handle_prompts_get(const json& id, const json& params)
 
         messages.push_back({
             {"role", "user"},
-            {"content", {{"type", "text"}, {"text", sanitize_utf8(prompt_text)}}}
+            {OBFSTR_C("content"), {{OBFSTR_C("type"), "text"}, {OBFSTR_C("text"), sanitize_utf8(prompt_text)}}}
         });
     }
     else if (name == "binary_overview")
@@ -710,7 +715,7 @@ static json handle_prompts_get(const json& id, const json& params)
 
         messages.push_back({
             {"role", "user"},
-            {"content", {{"type", "text"}, {"text", sanitize_utf8(overview)}}}
+            {OBFSTR_C("content"), {{OBFSTR_C("type"), "text"}, {OBFSTR_C("text"), sanitize_utf8(overview)}}}
         });
     }
     else if (name == "explain_address")
@@ -738,7 +743,7 @@ static json handle_prompts_get(const json& id, const json& params)
 
         messages.push_back({
             {"role", "user"},
-            {"content", {{"type", "text"}, {"text", sanitize_utf8(text)}}}
+            {OBFSTR_C("content"), {{OBFSTR_C("type"), "text"}, {OBFSTR_C("text"), sanitize_utf8(text)}}}
         });
     }
 
@@ -749,12 +754,12 @@ static json handle_prompts_get(const json& id, const json& params)
 
     messages.insert(messages.begin(), {
         {"role", "user"},
-        {"content", {{"type", "text"}, {"text", convert_number_instruction}}}
+        {OBFSTR_C("content"), {{OBFSTR_C("type"), "text"}, {OBFSTR_C("text"), convert_number_instruction}}}
     });
 
     json result;
-    result["description"] = found->description;
-    result["messages"] = messages;
+    result[OBFSTR_C("description")] = found->description;
+    result[OBFSTR_C("messages")] = messages;
     return make_jsonrpc_result(id, result);
 }
 
@@ -775,8 +780,8 @@ static json handle_completion_complete(const json& id, const json& params)
             for (const auto& func : result.data)
             {
                 std::string display;
-                if (func.contains("name") && func["name"].is_string())
-                    display = func["name"].get<std::string>();
+                if (func.contains(OBFSTR_C("name")) && func[OBFSTR_C("name")].is_string())
+                    display = func[OBFSTR_C("name")].get<std::string>();
                 else if (func.contains("address") && func["address"].is_string())
                     display = func["address"].get<std::string>();
                 if (!display.empty())
@@ -786,65 +791,65 @@ static json handle_completion_complete(const json& id, const json& params)
     }
 
     json completion;
-    completion["values"] = values;
-    completion["total"] = values.size();
-    completion["hasMore"] = false;
+    completion[OBFSTR_C("values")] = values;
+    completion[OBFSTR_C("total")] = values.size();
+    completion[OBFSTR_C("hasMore")] = false;
     return make_jsonrpc_result(id, completion);
 }
 
 static json dispatch_single_message(const json& msg)
 {
     if (!msg.is_object())
-        return make_jsonrpc_error(nullptr, JSONRPC_INVALID_REQUEST, "Request must be a JSON object");
+        return make_jsonrpc_error(nullptr, JSONRPC_INVALID_REQUEST, OBFSTR("Request must be a JSON object"));
 
-    std::string method = msg.value("method", "");
+    std::string method = msg.value(OBFSTR_C("method"), "");
     if (method.empty())
-        return make_jsonrpc_error(msg.value("id", json(nullptr)), JSONRPC_INVALID_REQUEST, "Missing 'method' field");
+        return make_jsonrpc_error(msg.value(OBFSTR_C("id"), json(nullptr)), JSONRPC_INVALID_REQUEST, OBFSTR("Missing 'method' field"));
 
-    json id = msg.contains("id") ? msg["id"] : json(nullptr);
-    json params = msg.value("params", json::object());
-    bool is_notification = !msg.contains("id");
+    json id = msg.contains(OBFSTR_C("id")) ? msg[OBFSTR_C("id")] : json(nullptr);
+    json params = msg.value(OBFSTR_C("params"), json::object());
+    bool is_notification = !msg.contains(OBFSTR_C("id"));
 
-    if (method == "initialize")
+    if (method == OBFSTR_C("initialize"))
         return handle_initialize(id, params);
 
-    if (method == "notifications/initialized")
+    if (method == OBFSTR_C("notifications/initialized"))
         return json();
 
-    if (method == "ping")
+    if (method == OBFSTR_C("ping"))
         return handle_ping(id);
 
-    if (method == "tools/list")
+    if (method == OBFSTR_C("tools/list"))
         return handle_tools_list(id);
 
-    if (method == "tools/call")
+    if (method == OBFSTR_C("tools/call"))
         return handle_tools_call(id, params);
 
-    if (method == "resources/list")
+    if (method == OBFSTR_C("resources/list"))
         return handle_resources_list(id);
 
-    if (method == "resources/read")
+    if (method == OBFSTR_C("resources/read"))
         return handle_resources_read(id, params);
 
-    if (method == "resources/templates/list")
+    if (method == OBFSTR_C("resources/templates/list"))
         return handle_resources_templates_list(id);
 
-    if (method == "prompts/list")
+    if (method == OBFSTR_C("prompts/list"))
         return handle_prompts_list(id);
 
-    if (method == "prompts/get")
+    if (method == OBFSTR_C("prompts/get"))
         return handle_prompts_get(id, params);
 
-    if (method == "completion/complete")
+    if (method == OBFSTR_C("completion/complete"))
         return handle_completion_complete(id, params);
 
-    if (method == "notifications/cancelled" || method == "logging/setLevel")
+    if (method == OBFSTR_C("notifications/cancelled") || method == OBFSTR_C("logging/setLevel"))
         return json();
 
     if (is_notification)
         return json();
 
-    return make_jsonrpc_error(id, JSONRPC_METHOD_NOT_FOUND, "Unknown method: " + method);
+    return make_jsonrpc_error(id, JSONRPC_METHOD_NOT_FOUND, OBFSTR("Unknown method: ") + method);
 }
 
 static std::string handle_mcp_body(const std::string& body)
@@ -960,9 +965,22 @@ int mcp_server_t::get_port() const
 
 bool mcp_server_t::start(int port)
 {
+    VMP_VIRT("mcp_start");
+
+    {
+        auto& lm = license_manager_t::instance();
+        if (!lm.is_valid() || lm.get_runtime_nonce() == 0)
+        {
+            msg(OBFSTR_C("AiDA MCP: Cannot start — license not active.\n"));
+            VMP_END;
+            return false;
+        }
+    }
+
     if (_running.load())
     {
         msg(OBFSTR_C("AiDA MCP: Server is already running on port %d.\n"), _port);
+        VMP_END;
         return true;
     }
 
@@ -976,6 +994,7 @@ bool mcp_server_t::start(int port)
     catch (const std::exception& e)
     {
         msg(OBFSTR_C("AiDA MCP: Failed to start server thread: %s\n"), e.what());
+        VMP_END;
         return false;
     }
 
@@ -989,6 +1008,7 @@ bool mcp_server_t::start(int port)
         msg(OBFSTR_C("AiDA MCP: %zu tools available.\n"), tool_count);
         msg(OBFSTR_C("AiDA MCP: Streamable HTTP  -> http://127.0.0.1:%d/mcp  (also /sse)\n"), port);
         msg(OBFSTR_C("AiDA MCP: Legacy SSE       -> http://127.0.0.1:%d/sse\n"), port);
+        VMP_END;
         return true;
     }
     else
@@ -996,6 +1016,7 @@ bool mcp_server_t::start(int port)
         msg(OBFSTR_C("AiDA MCP: Server failed to start on port %d (port may be in use).\n"), port);
         if (_server_thread.joinable())
             _server_thread.join();
+        VMP_END;
         return false;
     }
 }
@@ -1149,9 +1170,9 @@ void mcp_server_t::server_thread_func(int port)
         for (const auto& rdef : get_resource_definitions())
         {
             resources.push_back({
-                {"uri",         rdef.uri},
-                {"name",        rdef.name},
-                {"description", rdef.description},
+                {OBFSTR_C("uri"),         rdef.uri},
+                {OBFSTR_C("name"),        rdef.name},
+                {OBFSTR_C("description"), rdef.description},
                 {"mimeType",    rdef.mime_type}
             });
         }
@@ -1186,12 +1207,12 @@ void mcp_server_t::server_thread_func(int port)
 
         auto tool_result = execute_resource_read(*found);
         json resp;
-        resp["uri"] = found->uri;
+        resp[OBFSTR_C("uri")] = found->uri;
         resp["success"] = tool_result.success;
         if (!tool_result.data.is_null() && !tool_result.data.empty())
             resp["data"] = tool_result.data;
         else
-            resp["text"] = sanitize_utf8(tool_result.output);
+            resp[OBFSTR_C("text")] = sanitize_utf8(tool_result.output);
 
         res.set_content(json_dump_safe(resp, 2), "application/json");
     });
@@ -1895,7 +1916,7 @@ static bool mcp_write_vscode_settings(const std::string& path, const std::string
         config["mcp"]["servers"] = json::object();
 
     json entry;
-    entry["type"] = "sse";
+    entry[OBFSTR_C("type")] = "sse";
     entry["url"] = url;
     config["mcp"]["servers"][MCP_SERVER_NAME] = entry;
 
@@ -1917,7 +1938,7 @@ static bool mcp_write_vscode_mcp_json(const std::string& path, const std::string
         config["servers"] = json::object();
 
     json entry;
-    entry["type"] = "sse";
+    entry[OBFSTR_C("type")] = "sse";
     entry["url"] = url;
     config["servers"][MCP_SERVER_NAME] = entry;
 
@@ -1996,7 +2017,7 @@ static bool mcp_write_claude_code_json(const std::string& path, const std::strin
         config["mcpServers"] = json::object();
 
     json entry;
-    entry["type"] = "sse";
+    entry[OBFSTR_C("type")] = "sse";
     entry["url"] = url;
     config["mcpServers"][MCP_SERVER_NAME] = entry;
 
@@ -2055,7 +2076,7 @@ static void mcp_write_reference_config(
     };
 
     config["generic_http"] = {
-        {"description", "For any MCP client that supports Streamable HTTP or SSE transport"},
+        {OBFSTR_C("description"), "For any MCP client that supports Streamable HTTP or SSE transport"},
         {"streamable_http_url", http_url},
         {"sse_url", sse_url}
     };

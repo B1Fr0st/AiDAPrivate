@@ -46,7 +46,7 @@ nlohmann::json extract_tool_calls(const std::string& response)
         try
         {
             json j = json::parse(code_block);
-            if (j.contains("tool_calls") && j["tool_calls"].is_array())
+            if (j.contains(OBFSTR_C("tool_calls")) && j[OBFSTR_C("tool_calls")].is_array())
                 return j;
         }
         catch (const json::parse_error&) {}
@@ -73,7 +73,7 @@ nlohmann::json extract_tool_calls(const std::string& response)
                 try
                 {
                     json j = json::parse(json_block);
-                    if (j.contains("tool_calls") && j["tool_calls"].is_array())
+                    if (j.contains(OBFSTR_C("tool_calls")) && j[OBFSTR_C("tool_calls")].is_array())
                         return j;
                 }
                 catch (const json::parse_error&) {}
@@ -84,7 +84,7 @@ nlohmann::json extract_tool_calls(const std::string& response)
     try
     {
         json j = json::parse(response);
-        if (j.contains("tool_calls") && j["tool_calls"].is_array())
+        if (j.contains(OBFSTR_C("tool_calls")) && j[OBFSTR_C("tool_calls")].is_array())
             return j;
     }
     catch (const json::parse_error&) {}
@@ -98,16 +98,16 @@ std::string strip_tool_artifacts(const std::string& text)
 
     while (true)
     {
-        size_t start = result.find("[Tool Results]");
+        size_t start = result.find(OBFSTR_C("[Tool Results]"));
         if (start == std::string::npos) break;
-        size_t end = result.find("[End Tool Results]", start);
+        size_t end = result.find(OBFSTR_C("[End Tool Results]"), start);
         if (end != std::string::npos)
             result.erase(start, end + 18 - start);
         else
             result.erase(start);
     }
 
-    static const std::string CONT_PREFIX = "Based on the tool results above";
+    static const std::string CONT_PREFIX = OBFSTR("Based on the tool results above");
     size_t pos;
     while ((pos = result.find(CONT_PREFIX)) != std::string::npos)
     {
@@ -149,36 +149,36 @@ size_t estimate_tokens(const std::string& text)
 std::string format_tool_results(const std::vector<tool_execution_t>& results, size_t max_chars_per_result)
 {
     std::ostringstream ss;
-    ss << "\n[Tool Results]\n";
+    ss << OBFSTR("\n[Tool Results]\n");
     
     for (const auto& r : results)
     {
-        ss << "Tool: " << r.tool_name << "\n";
-        ss << "Status: " << (r.success ? "SUCCESS" : "FAILED") << "\n";
-        ss << "Message: " << r.message << "\n";
+        ss << OBFSTR("Tool: ") << r.tool_name << "\n";
+        ss << OBFSTR("Status: ") << (r.success ? OBFSTR_C("SUCCESS") : OBFSTR_C("FAILED")) << "\n";
+        ss << OBFSTR("Message: ") << r.message << "\n";
         if (!r.data.is_null() && !r.data.empty())
         {
-            std::string data_str = json_dump_fast(r.data, 2);
+            std::string data_str = json_dump_fast(r.data);
             if (data_str.length() > max_chars_per_result)
-                data_str = data_str.substr(0, max_chars_per_result) + "\n... (truncated, " + std::to_string(data_str.length()) + " bytes total)";
-            ss << "Data: " << data_str << "\n";
+                data_str = data_str.substr(0, max_chars_per_result) + OBFSTR("\n... (truncated, ") + std::to_string(data_str.length()) + OBFSTR(" bytes total)");
+            ss << OBFSTR("Data: ") << data_str << "\n";
         }
         ss << "\n";
     }
     
-    ss << "[End Tool Results]\n";
+    ss << OBFSTR("[End Tool Results]\n");
     return ss.str();
 }
 
 std::string summarize_turn(const conversation_turn_t& turn)
 {
     std::ostringstream ss;
-    ss << "[Compacted Iteration Summary]\n";
+    ss << OBFSTR("[Compacted Iteration Summary]\n");
 
     std::string reasoning = turn.ai_response;
     if (reasoning.size() > 300)
         reasoning = reasoning.substr(0, 300) + "...";
-    ss << "AI reasoning: " << reasoning << "\n";
+    ss << OBFSTR("AI reasoning: ") << reasoning << "\n";
 
     for (const auto& tr : turn.tool_results)
     {
@@ -216,7 +216,7 @@ std::string summarize_turn(const conversation_turn_t& turn)
         }
         ss << "\n";
     }
-    ss << "[End Summary]\n";
+    ss << OBFSTR("[End Summary]\n");
     return ss.str();
 }
 
@@ -269,23 +269,18 @@ std::string build_conversation(
 
             if (turn.tool_results.empty())
             {
-                conversation += "\n\n[Assistant attempted to provide a final answer prematurely]\n";
+                conversation += OBFSTR("\n\n[Assistant attempted to provide a final answer prematurely]\n");
                 conversation += turn.ai_response;
-                conversation += "\n\n[SYSTEM OVERRIDE \xe2\x80\x94 REJECTED] Your answer above is INCOMPLETE and has been "
-                                "REJECTED. You stopped far too early. Go back and re-read the user's ORIGINAL "
-                                "request at the top of this conversation. Identify EVERY objective they listed. "
-                                "For each objective, ask yourself: did I deliver a concrete, verified result? "
-                                "If the answer is NO for ANY objective, you MUST emit tool_calls JSON RIGHT NOW "
-                                "to continue the investigation. Do NOT repeat the same answer. Do NOT summarize. "
-                                "EMIT TOOL CALLS.";
+                conversation += OBFSTR("\n\n[REJECTED] Premature answer — re-read user request, check each objective. "
+                                "If ANY unresolved, emit tool_calls now. No summaries. EMIT TOOL CALLS.");
             }
             else
             {
-                conversation += "\n\n[Assistant Action]\n";
+                conversation += OBFSTR("\n\n[Assistant Action]\n");
                 if (!reasoning.empty())
-                    conversation += "Reasoning: " + reasoning + "\n";
+                    conversation += OBFSTR("Reasoning: ") + reasoning + "\n";
 
-                conversation += "Tools called: ";
+                conversation += OBFSTR("Tools called: ");
                 for (size_t i = 0; i < turn.tool_results.size(); ++i)
                 {
                     if (i > 0) conversation += ", ";
@@ -297,32 +292,19 @@ std::string build_conversation(
 
                 if (is_last_turn)
                 {
-                    conversation += "\n\n[DIRECTIVE — ITERATION " + std::to_string(turn_number)
-                        + "] CRITICAL: DO NOT STOP. DO NOT WRITE A SUMMARY. DO NOT WRITE \"Next Steps\". "
-                          "Analyze the tool results above and IMMEDIATELY emit more tool_calls JSON to "
-                          "continue your investigation. You MUST: (1) decompile every interesting function "
-                          "you discovered, (2) trace every cross-reference chain to its conclusion, "
-                          "(3) follow every pointer offset until you reach concrete data, (4) perform "
-                          "every action the user requested (renames, type creation, annotation). "
-                          "BATCH 5-10 TOOL CALLS MINIMUM. Only provide a final plain-text answer when "
-                          "you have addressed EVERY objective in the user's request with verified evidence.";
+                    conversation += OBFSTR("\n\n[ITER ") + std::to_string(turn_number)
+                        + OBFSTR("] Emit tool_calls JSON now. Batch 5-10 calls min. "
+                          "Decompile, trace xrefs, follow pointers, apply renames/types. "
+                          "Final answer ONLY when ALL user objectives verified.");
 
                     if (turn_number <= 3)
-                    {
-                        conversation += " WARNING: You are only on iteration "
-                            + std::to_string(turn_number) + ". A thorough reverse engineering analysis "
-                              "requires 8-15+ iterations minimum. You are NOWHERE NEAR done. Keep going.";
-                    }
+                        conversation += OBFSTR(" [EARLY — need 8-15+ iters, keep going]");
                     else if (turn_number <= 6)
-                    {
-                        conversation += " You have completed " + std::to_string(turn_number)
-                            + " iterations. Re-read the user's ENTIRE request. Have you addressed EVERY "
-                              "specific objective they mentioned? If not, keep working.";
-                    }
+                        conversation += OBFSTR(" [MID — re-check all user objectives]");
                 }
                 else
                 {
-                    conversation += "\n\n[Continue — emit more tool_calls]";
+                    conversation += OBFSTR("\n\n[Continue — emit more tool_calls]");
                 }
             }
         }
@@ -414,7 +396,7 @@ struct cached_tool_catalog_t
         auto& registry = agent_tools::ToolRegistry::instance();
         tools_desc = registry.generate_tools_description();
         json tools_schema = registry.generate_tools_schema();
-        tools_schema_str = json_dump_fast(tools_schema, 2);
+        tools_schema_str = json_dump_fast(tools_schema);
 
         std::vector<std::string> names = registry.get_tool_names();
         std::ostringstream ns;
@@ -434,7 +416,6 @@ std::string build_agentic_prompt(
 {
     static const cached_tool_catalog_t catalog;
 
-    const std::string& tools_desc  = catalog.tools_desc;
     const std::string& names_list  = catalog.tool_names_str;
     
     std::ostringstream ss;
@@ -553,18 +534,9 @@ or a verified memory offset. Replace phrases like "likely", "probably", "I belie
 verify it before finalizing your answer.
 
 **REMINDER — RULE 0: USE `convert_number` FOR BASE CONVERSIONS AND ASCII INTERPRETATION.**
-Never interpret hex byte sequences as ASCII or convert between number bases yourself.
-Always use the `convert_number` tool for those operations. Simple same-base arithmetic
-(addition, subtraction of decimal numbers) is fine to do mentally — then pass the result
-to `convert_number` if you need its ASCII character or hex representation.
-REMEMBER: `convert_number` returns `min_size_bytes` showing the value's natural byte width.
-It also returns `signed_decimal`, per-width `as_intN_signed` fields, and both LE/BE byte
-representations (`bytes_le`/`bytes_be`, `as_intN_le`/`as_intN_be`), plus `octal` output.
-`ascii` gives LE-order characters; `ascii_be` gives BE / natural-string-order characters.
-`as_float` and `as_double` give IEEE 754 interpretations (useful for game floats).
-Negative input like "-1" is accepted and yields two's complement uint64.
-When a pointer to a stack variable is used to read beyond that width, the extra bytes come
-from ADJACENT stack variables, NOT zeros. Convert each variable separately and concatenate.
+Never convert between number bases or interpret hex as ASCII manually. Use `convert_number`.
+When stack pointers read beyond a variable's byte width, extra bytes come from adjacent stack
+variables. Convert each variable separately and concatenate `bytes_le` representations.
 
 ## STRICT Tool Calling Protocol
 
@@ -600,74 +572,38 @@ If a tool name is not in the list below, it DOES NOT EXIST.
 
 ## Analysis Methodology
 
-### Phase 1: Reconnaissance (batch all in ONE turn)
-- `get_binary_info` to understand the target
-- `decompile_function` on the starting function
-- `get_callers` and `get_callees` to map relationships
-- `search_strings` for relevant string literals
-- Aim for 6-8 tool calls in the first turn
+### Phase 1: Reconnaissance (batch 6-8 calls in ONE turn)
+`get_binary_info`, `decompile_function`, `get_callers`, `get_callees`, `search_strings`
 
-### Phase 2: Deep Exploration (multiple turns, 5-10 calls each)
-- Decompile EVERY significant caller and callee — do NOT stop at one function
-- Trace cross-references with `get_xrefs_to` / `get_xrefs_from`
-- Use `build_call_graph` depth 3+ for architecture understanding
-- Use `find_immediate` to locate specific offsets/constants across the binary
-- Use `get_struct` / `search_structs` to understand data structures
-- If you find a global pointer, use `read_integer` to read its value, then
-  `decompile_function` on functions that use it
+### Phase 2: Deep Exploration (5-10 calls each turn)
+Decompile every significant function, trace xrefs, use `build_call_graph` depth 3+,
+`find_immediate` for offsets, `get_struct`/`search_structs` for data structures.
 
 ### Phase 3: Action (DO, don't describe)
-- `batch_rename` for bulk renaming (efficient for 10+ renames)
-- `rename_function`, `rename_variable`, `rename_address` for targeted renames
-- `set_comment`, `set_decompiler_comment` to annotate
-- `declare_type`, `create_struct` to create types
-- `execute_python` for anything the other tools can't do
+`batch_rename` for bulk, `rename_function`/`rename_variable`/`rename_address` for targeted,
+`set_comment`/`set_decompiler_comment`, `declare_type`/`create_struct`, `execute_python`.
 
 ### Phase 4: Verification
-- Re-decompile modified functions to confirm changes
-- Verify renames and types were applied
+Re-decompile to confirm changes. Verify renames and types applied.
 
-### MANDATORY: Number Conversions
-- **ALWAYS** use `convert_number` to interpret hex values as ASCII (e.g., 0x426D416C to chars)
-- When you see stack-constructed hex values, call `convert_number` to decode their bytes/ASCII
-- When you need to know what ASCII character a hex or decimal value represents, use `convert_number`
-- Use `ascii_be` (big-endian / natural reading order) when reconstructing human-readable strings
-  from hex constants; `ascii` gives LE byte order which is the raw x86 memory layout
-- Use `signed_decimal` and `as_intN_signed` fields to interpret values as signed integers
-  (e.g. 0xFF → as_int8_signed = -1, 0xFFFFFFFF → as_int32_signed = -1)
-- Use `bytes_be` / `as_intN_be` fields when analyzing big-endian protocols or file formats
-- Use `as_float` / `as_double` to check if a hex constant represents a floating-point value
-  (common in game code for health, damage, coordinates, timers, etc.)
-- Negative input is accepted (e.g. "-1" → decimal=18446744073709551615, hex=0xFFFFFFFFFFFFFFFF)
-- **When a pointer to a stack variable is used beyond its byte width, check `min_size_bytes`** to
-  determine the variable's actual size — bytes beyond that come from adjacent stack variables,
-  NOT from zero-padding. You MUST call `convert_number` on EACH adjacent variable separately
-  and concatenate their `bytes_le` to reconstruct the true contiguous memory layout
-- You MAY do simple arithmetic (addition/subtraction) mentally — then use `convert_number` on
-  the RESULT if you need to interpret it as a character or convert its base
-- Batch `convert_number` calls with other tool calls to avoid wasting iterations
+### Number Conversions
+ALWAYS use `convert_number` for hex→ASCII, base conversions, signed interpretation.
+Use `ascii_be` for human-readable strings from hex constants.
+Use `as_float`/`as_double` for IEEE 754. Negative input accepted.
+When stack pointer reads beyond variable width, convert each adjacent variable separately.
+Batch `convert_number` calls with other tool calls.
 
-## Key Tool Usage Notes
-
-- `rename_function`: params `{"address": "0x...", "new_name": "..."}`
-- `rename_address`: params `{"address": "0x...", "new_name": "..."}` (globals/labels)
-- `rename_variable`: params `{"address": "0x...", "original_name": "v5", "new_name": "..."}`
-- `batch_rename`: params `{"renames": [{"address": "0x...", "name": "..."}, ...]}`
-- `decompile_function`: returns code + local variables + prototype + string refs
-- `execute_python`: full IDAPython API — use when built-in tools are insufficient
-- Addresses: use hex string format "0x1234ABCD"
-
-## Detailed Tool Reference
-)" << tools_desc;
+Addresses: use hex string format "0x1234ABCD"
+)";
     
     if (!chat_history.empty())
     {
-        ss << "\n## Conversation History\n" << chat_history << "\n";
+        ss << OBFSTR("\n## Conversation History\n") << chat_history << "\n";
     }
     
-    ss << "\n## IDA Analysis Context\n" << context_block << "\n";
+    ss << OBFSTR("\n## IDA Analysis Context\n") << context_block << "\n";
     
-    ss << "\n## User Request\n" << user_message << "\n";
+    ss << OBFSTR("\n## User Request\n") << user_message << "\n";
     
     return ss.str();
 }
@@ -717,24 +653,26 @@ result_t run(
     int compact_retry_count = 0;
     size_t dynamic_tool_result_chars = static_cast<size_t>(config.max_tool_result_chars);
 
+    client->set_max_output_tokens(config.agentic_output_tokens);
+
     for (int iter = 0; iter < config.max_iterations; iter++)
     {
         if (cancelled && cancelled->load())
         {
             result.was_cancelled = true;
-            result.final_response = "Operation cancelled by user.";
+            result.final_response = OBFSTR("Operation cancelled by user.");
             break;
         }
 
         if (on_progress)
-            on_progress(iter + 1, "Calling AI (iteration " + std::to_string(iter + 1) + ")...");
+            on_progress(iter + 1, OBFSTR("Calling AI (iteration ") + std::to_string(iter + 1) + ")...");
         
         if (on_status)
         {
             status_update_t status;
             status.type = status_type_t::calling_ai;
             status.iteration = iter + 1;
-            status.message = "Calling AI (iteration " + std::to_string(iter + 1) + ")...";
+            status.message = OBFSTR("Calling AI (iteration ") + std::to_string(iter + 1) + ")...";
             status.reasoning = status.message;
             on_status(status);
         }
@@ -754,25 +692,25 @@ result_t run(
 
         if (estimated_tokens > token_budget * 95 / 100)
         {
-            conversation += "\n\n[SYSTEM OVERRIDE — CONTEXT LIMIT] You are at the context length limit. "
+            conversation += OBFSTR("\n\n[SYSTEM OVERRIDE — CONTEXT LIMIT] You are at the context length limit. "
                            "You MUST provide your final answer RIGHT NOW as plain text. Do NOT emit "
                            "tool_calls JSON. Synthesize ALL findings into a single detailed response. "
                            "Include: every address you found, every function you decompiled, every "
                            "struct offset you identified, every rename you performed. If you were asked "
                            "to DO something and haven't finished, state exactly what was done and what "
-                           "remains with specific addresses. Be EXHAUSTIVE — this is your LAST chance to respond.";
+                           "remains with specific addresses. Be EXHAUSTIVE — this is your LAST chance to respond.");
         }
 
         if (iter == config.max_iterations - 1)
         {
-            conversation += "\n\n[SYSTEM OVERRIDE — FINAL ITERATION] This is iteration "
-                           + std::to_string(iter + 1) + " of " + std::to_string(config.max_iterations) +
-                           ". You have NO more tool calls available. Provide your COMPLETE final answer "
+            conversation += OBFSTR("\n\n[SYSTEM OVERRIDE — FINAL ITERATION] This is iteration ")
+                           + std::to_string(iter + 1) + OBFSTR(" of ") + std::to_string(config.max_iterations) +
+                           OBFSTR(". You have NO more tool calls available. Provide your COMPLETE final answer "
                            "as plain text NOW. Do NOT emit tool_calls JSON — it will be ignored. "
                            "Your answer must include: (1) every concrete finding with specific addresses, "
                            "(2) all actions you performed (renames, type changes, comments), "
                            "(3) reconstructed structs or data layouts if applicable, "
-                           "(4) any remaining work that could not be completed, with exact addresses to check.";
+                           "(4) any remaining work that could not be completed, with exact addresses to check.");
         }
 
         std::string ai_response = client->streaming_blocking_generate(conversation, config.temperature, on_stream);
@@ -787,13 +725,13 @@ result_t run(
         if (cancelled && cancelled->load())
         {
             result.was_cancelled = true;
-            result.final_response = "Operation cancelled by user.";
+            result.final_response = OBFSTR("Operation cancelled by user.");
             break;
         }
 
         bool response_truncated = false;
         {
-            static const std::string TRUNC_MARKER = "\n\n[RESPONSE_TRUNCATED]";
+            static const std::string TRUNC_MARKER = OBFSTR("\n\n[RESPONSE_TRUNCATED]");
             size_t trunc_pos = ai_response.rfind(TRUNC_MARKER);
             if (trunc_pos != std::string::npos)
             {
@@ -818,7 +756,7 @@ result_t run(
             if (has_tool_calls(ai_response))
             {
                 json trunc_parsed = extract_tool_calls(ai_response);
-                if (!trunc_parsed.contains("tool_calls") || trunc_parsed["tool_calls"].empty())
+                if (!trunc_parsed.contains(OBFSTR_C("tool_calls")) || trunc_parsed[OBFSTR_C("tool_calls")].empty())
                 {
                     if (compact_retry_count < 2)
                     {
@@ -840,7 +778,7 @@ result_t run(
 
             if (!has_tool_calls(ai_response))
             {
-                result.final_response = ai_response + "\n\n*(Response was truncated due to context length limit)*";
+                result.final_response = ai_response + OBFSTR("\n\n*(Response was truncated due to context length limit)*");
                 result.total_iterations = iter + 1;
                 if (config.verbose_logging)
                     msg(OBFSTR_C("AiDA Agent: Using truncated response as final answer.\n"));
@@ -883,7 +821,7 @@ result_t run(
         }
 
         json parsed = extract_tool_calls(ai_response);
-        if (!parsed.contains("tool_calls") || parsed["tool_calls"].empty())
+        if (!parsed.contains(OBFSTR_C("tool_calls")) || parsed[OBFSTR_C("tool_calls")].empty())
         {
             std::string cleaned = strip_tool_artifacts(ai_response);
             if (!cleaned.empty())
@@ -899,9 +837,9 @@ result_t run(
                 msg(OBFSTR_C("AiDA Agent: Tool call parse failed and no clean text found. Forcing final answer...\n"));
 
             std::string force_prompt = conversation +
-                "\n\n[SYSTEM OVERRIDE — PARSE ERROR] Your previous response was malformed. "
+                OBFSTR("\n\n[SYSTEM OVERRIDE — PARSE ERROR] Your previous response was malformed. "
                 "Respond ONLY with plain text — no JSON, no tool_calls. Provide your complete "
-                "analysis including all addresses, findings, and actions performed so far.";
+                "analysis including all addresses, findings, and actions performed so far.");
 
             std::string forced_response = client->blocking_generate(force_prompt, config.temperature);
             if (!forced_response.empty() && forced_response.substr(0, 6) != "Error:")
@@ -915,8 +853,8 @@ result_t run(
                 }
             }
 
-            result.final_response = "The AI agent was unable to produce a final answer after "
-                + std::to_string(iter + 1) + " iteration(s). Please try again with a more specific question.";
+            result.final_response = OBFSTR("The AI agent was unable to produce a final answer after ")
+                + std::to_string(iter + 1) + OBFSTR(" iteration(s). Please try again with a more specific question.");
             result.total_iterations = iter + 1;
             break;
         }
@@ -924,7 +862,7 @@ result_t run(
         std::string reasoning = json_str(parsed, "reasoning");
 
         std::vector<std::string> pending_tool_names;
-        for (const auto& tc : parsed["tool_calls"])
+        for (const auto& tc : parsed[OBFSTR_C("tool_calls")])
         {
             pending_tool_names.push_back(json_str(tc, "tool", "?"));
         }
@@ -936,41 +874,41 @@ result_t run(
             status.iteration = iter + 1;
             status.reasoning = reasoning;
             status.pending_tools = pending_tool_names;
-            status.message = "Reasoning: " + (reasoning.empty() ? "(no reasoning provided)" : reasoning);
+            status.message = OBFSTR("Reasoning: ") + (reasoning.empty() ? OBFSTR("(no reasoning provided)") : reasoning);
             on_status(status);
         }
 
         if (config.verbose_logging)
         {
-            size_t num_calls = parsed["tool_calls"].size();
+            size_t num_calls = parsed[OBFSTR_C("tool_calls")].size();
             msg(OBFSTR_C("AiDA Agent: AI requested %zu tool call(s): %s\n"),
                 num_calls, reasoning.c_str());
-            for (const auto& tc : parsed["tool_calls"])
+            for (const auto& tc : parsed[OBFSTR_C("tool_calls")])
             {
                 std::string nm = json_str(tc, "tool", "?");
-                msg("  → %s\n", nm.c_str());
+                msg(OBFSTR_C("  → %s\n"), nm.c_str());
             }
         }
 
         if (on_progress)
         {
-            size_t num_calls = parsed["tool_calls"].size();
-            on_progress(iter + 1, "Executing " + std::to_string(num_calls) + " tool(s)...");
+            size_t num_calls = parsed[OBFSTR_C("tool_calls")].size();
+            on_progress(iter + 1, OBFSTR("Executing ") + std::to_string(num_calls) + OBFSTR(" tool(s)..."));
         }
 
         std::vector<tool_execution_t> all_tool_results;
 
-        for (size_t tool_idx = 0; tool_idx < parsed["tool_calls"].size(); ++tool_idx)
+        for (size_t tool_idx = 0; tool_idx < parsed[OBFSTR_C("tool_calls")].size(); ++tool_idx)
         {
             if (cancelled && cancelled->load())
                 break;
 
-            const auto& tc = parsed["tool_calls"][tool_idx];
-            if (!tc.contains("tool") || !tc["tool"].is_string())
+            const auto& tc = parsed[OBFSTR_C("tool_calls")][tool_idx];
+            if (!tc.contains(OBFSTR_C("tool")) || !tc[OBFSTR_C("tool")].is_string())
                 continue;
 
-            std::string tool_name = tc["tool"].get<std::string>();
-            json params = tc.contains("params") && !tc["params"].is_null() ? tc["params"] : json::object();
+            std::string tool_name = tc[OBFSTR_C("tool")].get<std::string>();
+            json params = tc.contains(OBFSTR_C("params")) && !tc[OBFSTR_C("params")].is_null() ? tc[OBFSTR_C("params")] : json::object();
 
             if (on_status)
             {
@@ -978,7 +916,7 @@ result_t run(
                 status.type = status_type_t::executing_tool;
                 status.iteration = iter + 1;
                 status.tool_name = tool_name;
-                status.message = "Executing: " + tool_name;
+                status.message = OBFSTR("Executing: ") + tool_name;
                 status.pending_tools = pending_tool_names;
                 on_status(status);
             }
@@ -1011,8 +949,8 @@ result_t run(
         {
             for (const auto& r : all_tool_results)
             {
-                msg("  ← %s: %s — %s\n", r.tool_name.c_str(),
-                    r.success ? "OK" : "FAIL", r.message.c_str());
+                msg(OBFSTR_C("  ← %s: %s — %s\n"), r.tool_name.c_str(),
+                    r.success ? OBFSTR_C("OK") : OBFSTR_C("FAIL"), r.message.c_str());
             }
         }
 
@@ -1034,14 +972,14 @@ result_t run(
             msg(OBFSTR_C("AiDA Agent: Max iterations reached. Attempting forced summarization...\n"));
 
         std::string summary_prompt = build_conversation(initial_prompt, turns, dynamic_tool_result_chars);
-        summary_prompt += "\n\n[SYSTEM OVERRIDE — MAX ITERATIONS EXHAUSTED] You have used all "
-                         + std::to_string(config.max_iterations) + " iterations. Provide your COMPLETE "
+        summary_prompt += OBFSTR("\n\n[SYSTEM OVERRIDE — MAX ITERATIONS EXHAUSTED] You have used all ")
+                         + std::to_string(config.max_iterations) + OBFSTR(" iterations. Provide your COMPLETE "
                          "final answer NOW as plain text. Do NOT emit tool_calls JSON. Include: "
                          "(1) every address, offset, and function you discovered, "
                          "(2) all renames, type changes, and comments you applied, "
                          "(3) reconstructed data structures with field offsets, "
                          "(4) specific addresses for any remaining uninvestigated leads. "
-                         "Present findings in a structured format with code blocks and hex addresses.";
+                         "Present findings in a structured format with code blocks and hex addresses.");
 
         if (!(cancelled && cancelled->load()))
         {
@@ -1060,19 +998,21 @@ result_t run(
 
         result.hit_max_iterations = true;
         result.total_iterations = config.max_iterations;
-        result.final_response = "I reached the maximum number of iterations (" +
-            std::to_string(config.max_iterations) + ") without completing the analysis. "
-            "Here's a summary of what I found so far:\n\n";
+        result.final_response = OBFSTR("I reached the maximum number of iterations (") +
+            std::to_string(config.max_iterations) + OBFSTR(") without completing the analysis. "
+            "Here's a summary of what I found so far:\n\n");
 
         for (const auto& it : result.iterations)
         {
-            result.final_response += "Iteration " + std::to_string(it.number) + ": " + it.ai_reasoning + "\n";
+            result.final_response += OBFSTR("Iteration ") + std::to_string(it.number) + ": " + it.ai_reasoning + "\n";
             for (const auto& tr : it.tool_results)
             {
                 result.final_response += "  " + tr.tool_name + ": " + (tr.success ? "OK" : "FAIL") + " — " + tr.message + "\n";
             }
         }
     }
+
+    client->set_max_output_tokens(16384);
 
     return result;
 }

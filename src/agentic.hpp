@@ -24,6 +24,7 @@ struct config_t
     int output_token_reserve = 65536;
     int max_tool_result_chars = 24576;
     int compact_keep_turns = 4;
+    int agentic_output_tokens = 16384;
 };
 
 struct tool_execution_t
