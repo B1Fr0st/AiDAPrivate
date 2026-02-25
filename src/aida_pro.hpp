@@ -28,6 +28,7 @@
 #include <memory>
 #include <functional>
 #include <thread>
+#include <chrono>
 #include <regex>
 #include <future>
 #include <sstream>

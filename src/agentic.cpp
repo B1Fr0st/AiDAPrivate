@@ -586,6 +586,85 @@ Decompile every significant function, trace xrefs, use `build_call_graph` depth 
 ### Phase 4: Verification
 Re-decompile to confirm changes. Verify renames and types applied.
 
+### Phase 5: Debugger-Assisted Analysis (when debugger is active)
+Use `get_debugger_state` first to check if a debugger session is running.
+If active, you have access to powerful dynamic analysis tools:
+
+**Breakpoint Analysis:**
+`analyze_breakpoint_context` — gathers registers, decompiled code, disassembly, call stack,
+stack memory, and recent events at a breakpoint. Use this as your first call when stopped.
+
+**Execution Snapshots:**
+`snapshot_execution_state` — capture full register + stack + call stack state with a label.
+`compare_execution_states` — diff two snapshots to see what changed (registers, stack, depth).
+Use before/after patterns: snapshot before a call, step over, snapshot after, compare.
+
+**Virtual Dispatch Tracing:**
+`trace_virtual_dispatch` — dynamically trace indirect calls/jumps to discover runtime targets.
+Sets temp breakpoints, steps into the dispatch, records each target with decompilation.
+
+**VM/Obfuscation Detection:**
+`detect_vm_handler_pattern` — scan code for VM dispatcher patterns (indirect jumps, CMP chains, loops).
+`map_vm_handler_table` — read and resolve a handler/dispatch table from memory or IDB.
+Use `use_debugger=true` to read from live process memory for packed/encrypted tables.
+
+**Event Monitoring:**
+`get_debugger_event_log` — read recent HT_DBG events (breakpoint hits, exceptions, module loads).
+`clear_debugger_event_log` — reset the event log for a clean monitoring window.
+
+**Devirtualization Workflow:**
+1. `detect_vm_handler_pattern` to confirm VM and find dispatcher
+2. `map_vm_handler_table` to enumerate all handlers
+3. Decompile each handler to classify its operation
+4. `snapshot_execution_state` + `step_into` + `snapshot_execution_state` + `compare_execution_states`
+   to understand what each VM opcode does dynamically
+5. Reconstruct the original logic and document with comments/renames
+
+### Phase 6: Advanced Static Analysis (for obfuscated/packed binaries)
+Use these tools when dealing with obfuscated, virtualized, or packed code:
+
+**Obfuscation Detection:**
+`detect_obfuscation_patterns` — scan a function for CFF, opaque predicates, dead code, junk.
+Returns an obfuscation score (0-100) and detailed pattern list. Use this FIRST on any
+suspicious function before attempting manual analysis.
+
+**Control Flow Analysis:**
+`analyze_control_flow` — build detailed CFG with block/edge counts, loop detection,
+cyclomatic complexity. Essential for understanding flattened or obfuscated control flow.
+
+**Complexity Metrics:**
+`get_function_complexity` — compute cyclomatic complexity, branch ratio, block stats.
+Use to prioritize which functions need the most analysis effort.
+
+**String Decryption Detection:**
+`analyze_string_decryption` — identify XOR loops, byte transforms, encrypted data refs.
+Returns a decryptor score. Use on functions that appear to decode/decrypt strings at runtime.
+
+**Indirect Call Analysis:**
+`analyze_indirect_calls` — find register calls, vtable dispatches, computed jumps.
+Essential for understanding virtual dispatch and function pointer tables.
+
+**Crypto Identification:**
+`find_crypto_constants` — scan for AES S-box, SHA-256, MD5, CRC32, Blowfish, ChaCha, TEA
+constants both as byte patterns and immediate operands in code.
+
+**Data Flow:**
+`analyze_data_flow` — trace memory reads/writes per basic block, identify high-write blocks
+that may be decryption/decompression routines.
+
+**Anti-Analysis Detection:**
+`detect_anti_analysis` — find anti-debug APIs (IsDebuggerPresent, NtQueryInformationProcess),
+timing checks (rdtsc, QueryPerformanceCounter), anti-VM (cpuid), inline tricks (int2d, int3).
+
+**Obfuscated Binary Workflow:**
+1. `detect_obfuscation_patterns` on entry point and key functions
+2. `find_crypto_constants` to identify encryption algorithms
+3. `detect_anti_analysis` to map all anti-RE protections
+4. `analyze_string_decryption` on suspected decryptor functions
+5. `analyze_indirect_calls` to map dispatch tables
+6. Use debugger tools to step through decryption at runtime
+7. `analyze_control_flow` + `get_function_complexity` to find the real logic
+
 ### Number Conversions
 ALWAYS use `convert_number` for hex→ASCII, base conversions, signed interpretation.
 Use `ascii_be` for human-readable strings from hex constants.

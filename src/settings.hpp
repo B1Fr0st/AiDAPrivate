@@ -69,6 +69,7 @@ public:
     void load(aida_plugin_t* plugin_instance);
     bool load_from_file();
     std::string get_active_api_key() const;
+    bool has_custom_base_url() const;
     int get_active_context_window() const;
     static int get_model_context_window(const std::string& model_name);
 

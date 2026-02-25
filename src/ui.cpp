@@ -121,13 +121,19 @@ static std::vector<std::string> fetch_openrouter_models_via_api(const qstring& a
         });
 }
 
-static std::vector<std::string> fetch_openai_models_via_api(const qstring& api_key)
+static std::vector<std::string> fetch_openai_models_via_api(const qstring& api_key, const qstring& base_url = qstring())
 {
-    if (api_key.empty())
+    bool has_custom_url = !base_url.empty();
+    if (api_key.empty() && !has_custom_url)
         return {};
-    return fetch_models_from_api(OBFSTR_C("https://api.openai.com"), OBFSTR_C("/v1/models"),
-        {{OBFSTR_C("Authorization"), OBFSTR("Bearer ") + api_key.c_str()}},
-        [](const nlohmann::json& j) {
+    std::string host = has_custom_url ? std::string(base_url.c_str()) : OBFSTR("https://api.openai.com");
+    httplib::Headers headers;
+    if (!api_key.empty())
+        headers.emplace(OBFSTR_C("Authorization"), OBFSTR("Bearer ") + api_key.c_str());
+    bool skip_filter = has_custom_url;
+    return fetch_models_from_api(host, OBFSTR_C("/v1/models"),
+        headers,
+        [skip_filter](const nlohmann::json& j) {
             std::vector<std::string> models;
             std::string k_data = OBFSTR("data");
             std::string k_id = OBFSTR("id");
@@ -135,24 +141,65 @@ static std::vector<std::string> fetch_openai_models_via_api(const qstring& api_k
             for (const auto& m : j[k_data]) {
                 if (!m.contains(k_id)) continue;
                 std::string id = m[k_id].get<std::string>();
-                bool is_relevant = (id.find(OBFSTR_C("gpt")) != std::string::npos
-                    || id.find(OBFSTR_C("o1")) == 0 || id.find(OBFSTR_C("o3")) == 0 || id.find(OBFSTR_C("o4")) == 0);
-                if (is_relevant && is_chat_model(id))
-                    models.push_back(std::move(id));
+                if (skip_filter)
+                {
+                    if (is_chat_model(id))
+                        models.push_back(std::move(id));
+                }
+                else
+                {
+                    bool is_relevant = (id.find(OBFSTR_C("gpt")) != std::string::npos
+                        || id.find(OBFSTR_C("o1")) == 0 || id.find(OBFSTR_C("o3")) == 0 || id.find(OBFSTR_C("o4")) == 0);
+                    if (is_relevant && is_chat_model(id))
+                        models.push_back(std::move(id));
+                }
             }
             return models;
         });
 }
 
-static std::vector<std::string> fetch_gemini_models_via_api(const qstring& api_key)
+static std::vector<std::string> fetch_gemini_models_via_api(const qstring& api_key, const qstring& base_url = qstring())
 {
-    if (api_key.empty())
+    bool has_custom_url = !base_url.empty();
+    if (api_key.empty() && !has_custom_url)
         return {};
-    std::string path = OBFSTR("/v1beta/models?key=") + std::string(api_key.c_str());
-    return fetch_models_from_api(OBFSTR_C("https://generativelanguage.googleapis.com"), path,
-        {},
-        [](const nlohmann::json& j) {
+
+    std::string host, path;
+    httplib::Headers headers;
+
+    if (has_custom_url)
+    {
+        host = base_url.c_str();
+        path = OBFSTR("/v1/models");
+    }
+    else
+    {
+        host = OBFSTR("https://generativelanguage.googleapis.com");
+        path = OBFSTR("/v1beta/models?key=") + std::string(api_key.c_str());
+    }
+
+    return fetch_models_from_api(host, path,
+        headers,
+        [has_custom_url](const nlohmann::json& j) {
             std::vector<std::string> models;
+            // Custom base URLs typically expose OpenAI-compatible /v1/models (data array)
+            if (has_custom_url)
+            {
+                std::string k_data = OBFSTR("data");
+                std::string k_id = OBFSTR("id");
+                if (j.contains(k_data) && j[k_data].is_array())
+                {
+                    for (const auto& m : j[k_data])
+                    {
+                        if (!m.contains(k_id)) continue;
+                        std::string id = m[k_id].get<std::string>();
+                        if (is_chat_model(id))
+                            models.push_back(std::move(id));
+                    }
+                    return models;
+                }
+            }
+            // Native Gemini API response format
             std::string k_models = OBFSTR("models");
             std::string k_name = OBFSTR("name");
             std::string k_methods = OBFSTR("supportedGenerationMethods");
@@ -180,23 +227,43 @@ static std::vector<std::string> fetch_gemini_models_via_api(const qstring& api_k
         });
 }
 
-static std::vector<std::string> fetch_anthropic_models_via_api(const qstring& api_key)
+static std::vector<std::string> fetch_anthropic_models_via_api(const qstring& api_key, const qstring& base_url = qstring())
 {
-    if (api_key.empty())
+    bool has_custom_url = !base_url.empty();
+    if (api_key.empty() && !has_custom_url)
         return {};
-    return fetch_models_from_api(OBFSTR_C("https://api.anthropic.com"), OBFSTR_C("/v1/models"),
-        {
-            {OBFSTR_C("x-api-key"), std::string(api_key.c_str())},
-            {OBFSTR_C("anthropic-version"), OBFSTR("2023-06-01")}
-        },
-        [](const nlohmann::json& j) {
+    std::string host = has_custom_url ? std::string(base_url.c_str()) : OBFSTR("https://api.anthropic.com");
+    httplib::Headers headers;
+    if (!api_key.empty())
+        headers.emplace(OBFSTR_C("x-api-key"), std::string(api_key.c_str()));
+    headers.emplace(OBFSTR_C("anthropic-version"), OBFSTR("2023-06-01"));
+    return fetch_models_from_api(host, OBFSTR_C("/v1/models"),
+        headers,
+        [has_custom_url](const nlohmann::json& j) {
             std::vector<std::string> models;
             std::string k_data = OBFSTR("data");
             std::string k_id = OBFSTR("id");
-            if (!j.contains(k_data) || !j[k_data].is_array()) return models;
-            for (const auto& m : j[k_data]) {
-                if (!m.contains(k_id)) continue;
-                models.push_back(m[k_id].get<std::string>());
+            if (j.contains(k_data) && j[k_data].is_array())
+            {
+                for (const auto& m : j[k_data]) {
+                    if (!m.contains(k_id)) continue;
+                    models.push_back(m[k_id].get<std::string>());
+                }
+                return models;
+            }
+            // Some custom endpoints use OpenAI-compatible format with "models" key
+            if (has_custom_url)
+            {
+                std::string k_models = OBFSTR("models");
+                if (j.contains(k_models) && j[k_models].is_array())
+                {
+                    for (const auto& m : j[k_models])
+                    {
+                        std::string id = m.value(OBFSTR("id"), m.value(OBFSTR("name"), std::string("")));
+                        if (!id.empty() && is_chat_model(id))
+                            models.push_back(std::move(id));
+                    }
+                }
             }
             return models;
         });
@@ -934,6 +1001,7 @@ struct ProviderTabData
     QLineEdit*   urlEdit      = nullptr;
     QLineEdit*   extraKeyEdit = nullptr;
     QSpinBox*    ctxWindowSpin= nullptr;
+    QPushButton* refreshBtn   = nullptr;
 };
 
 static QWidget* buildProviderTab(
@@ -979,7 +1047,23 @@ static QWidget* buildProviderTab(
         }
     }
     out.modelCombo->setCurrentIndex(selectedIdx);
-    layout->addWidget(makeFieldRow(QStringLiteral("Model"), out.modelCombo));
+
+    QWidget* modelRow = new QWidget();
+    QHBoxLayout* modelRowLay = new QHBoxLayout(modelRow);
+    modelRowLay->setContentsMargins(2, 2, 2, 2);
+    modelRowLay->setSpacing(6);
+    QLabel* modelLbl = new QLabel(QStringLiteral("Model"));
+    modelLbl->setObjectName(QStringLiteral("fieldLabel"));
+    modelLbl->setFixedWidth(130);
+    modelLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    modelRowLay->addWidget(modelLbl);
+    modelRowLay->addWidget(out.modelCombo, 1);
+    out.refreshBtn = new QPushButton(QStringLiteral("Refresh"));
+    out.refreshBtn->setObjectName(QStringLiteral("secondaryBtn"));
+    out.refreshBtn->setToolTip(QStringLiteral("Fetch available models from the API endpoint"));
+    out.refreshBtn->setFixedWidth(80);
+    modelRowLay->addWidget(out.refreshBtn);
+    layout->addWidget(modelRow);
 
     if (!providerName.isEmpty())
     {
@@ -1063,13 +1147,13 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
 
     std::vector<std::string> gemini_models_vec;
     if (provider_idx == 0)
-        gemini_models_vec = fetch_gemini_models_via_api(g_settings.gemini_api_key.c_str());
+        gemini_models_vec = fetch_gemini_models_via_api(g_settings.gemini_api_key.c_str(), g_settings.gemini_base_url.c_str());
     if (gemini_models_vec.empty())
         gemini_models_vec = settings_t::gemini_models;
 
     std::vector<std::string> openai_models_vec;
     if (provider_idx == 1)
-        openai_models_vec = fetch_openai_models_via_api(g_settings.openai_api_key.c_str());
+        openai_models_vec = fetch_openai_models_via_api(g_settings.openai_api_key.c_str(), g_settings.openai_base_url.c_str());
     if (openai_models_vec.empty())
         openai_models_vec = settings_t::openai_models;
 
@@ -1081,7 +1165,7 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
 
     std::vector<std::string> anthropic_models_vec;
     if (provider_idx == 3)
-        anthropic_models_vec = fetch_anthropic_models_via_api(g_settings.anthropic_api_key.c_str());
+        anthropic_models_vec = fetch_anthropic_models_via_api(g_settings.anthropic_api_key.c_str(), g_settings.anthropic_base_url.c_str());
     if (anthropic_models_vec.empty())
         anthropic_models_vec = settings_t::anthropic_models;
 
@@ -1144,7 +1228,24 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
             }
         }
         openrouterTab.modelCombo->setCurrentIndex(orIdx);
-        orLay->addWidget(makeFieldRow(QStringLiteral("Model"), openrouterTab.modelCombo));
+        {
+            QWidget* orModelRow = new QWidget();
+            QHBoxLayout* orModelRowLay = new QHBoxLayout(orModelRow);
+            orModelRowLay->setContentsMargins(2, 2, 2, 2);
+            orModelRowLay->setSpacing(6);
+            QLabel* orModelLbl = new QLabel(QStringLiteral("Model"));
+            orModelLbl->setObjectName(QStringLiteral("fieldLabel"));
+            orModelLbl->setFixedWidth(130);
+            orModelLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            orModelRowLay->addWidget(orModelLbl);
+            orModelRowLay->addWidget(openrouterTab.modelCombo, 1);
+            openrouterTab.refreshBtn = new QPushButton(QStringLiteral("Refresh"));
+            openrouterTab.refreshBtn->setObjectName(QStringLiteral("secondaryBtn"));
+            openrouterTab.refreshBtn->setToolTip(QStringLiteral("Fetch available models from the API endpoint"));
+            openrouterTab.refreshBtn->setFixedWidth(80);
+            orModelRowLay->addWidget(openrouterTab.refreshBtn);
+            orLay->addWidget(orModelRow);
+        }
         orLay->addStretch();
         tabs->addTab(orPage, QStringLiteral("OpenRouter"));
     }
@@ -1188,7 +1289,24 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
             }
         }
         copilotTab.modelCombo->setCurrentIndex(copIdx);
-        copLay->addWidget(makeFieldRow(QStringLiteral("Model"), copilotTab.modelCombo));
+        {
+            QWidget* copModelRow = new QWidget();
+            QHBoxLayout* copModelRowLay = new QHBoxLayout(copModelRow);
+            copModelRowLay->setContentsMargins(2, 2, 2, 2);
+            copModelRowLay->setSpacing(6);
+            QLabel* copModelLbl = new QLabel(QStringLiteral("Model"));
+            copModelLbl->setObjectName(QStringLiteral("fieldLabel"));
+            copModelLbl->setFixedWidth(130);
+            copModelLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            copModelRowLay->addWidget(copModelLbl);
+            copModelRowLay->addWidget(copilotTab.modelCombo, 1);
+            copilotTab.refreshBtn = new QPushButton(QStringLiteral("Refresh"));
+            copilotTab.refreshBtn->setObjectName(QStringLiteral("secondaryBtn"));
+            copilotTab.refreshBtn->setToolTip(QStringLiteral("Fetch available models from the API endpoint"));
+            copilotTab.refreshBtn->setFixedWidth(80);
+            copModelRowLay->addWidget(copilotTab.refreshBtn);
+            copLay->addWidget(copModelRow);
+        }
         copLay->addStretch();
         tabs->addTab(copPage, QStringLiteral("Copilot"));
     }
@@ -1225,7 +1343,24 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
             }
         }
         localLlmTab.modelCombo->setCurrentIndex(llmIdx);
-        llmLay->addWidget(makeFieldRow(QStringLiteral("Model"), localLlmTab.modelCombo));
+        {
+            QWidget* llmModelRow = new QWidget();
+            QHBoxLayout* llmModelRowLay = new QHBoxLayout(llmModelRow);
+            llmModelRowLay->setContentsMargins(2, 2, 2, 2);
+            llmModelRowLay->setSpacing(6);
+            QLabel* llmModelLbl = new QLabel(QStringLiteral("Model"));
+            llmModelLbl->setObjectName(QStringLiteral("fieldLabel"));
+            llmModelLbl->setFixedWidth(130);
+            llmModelLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            llmModelRowLay->addWidget(llmModelLbl);
+            llmModelRowLay->addWidget(localLlmTab.modelCombo, 1);
+            localLlmTab.refreshBtn = new QPushButton(QStringLiteral("Refresh"));
+            localLlmTab.refreshBtn->setObjectName(QStringLiteral("secondaryBtn"));
+            localLlmTab.refreshBtn->setToolTip(QStringLiteral("Fetch available models from the API endpoint"));
+            localLlmTab.refreshBtn->setFixedWidth(80);
+            llmModelRowLay->addWidget(localLlmTab.refreshBtn);
+            llmLay->addWidget(llmModelRow);
+        }
 
         localLlmTab.extraKeyEdit = new QLineEdit(QString::fromStdString(g_settings.local_llm_api_key));
         localLlmTab.extraKeyEdit->setEchoMode(QLineEdit::Password);
@@ -1246,6 +1381,94 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
 
     QObject::connect(providerCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
         [tabs](int idx) { if (idx >= 0 && idx < tabs->count()) tabs->setCurrentIndex(idx); });
+
+    // Helper: repopulate a model combo from a fetched model list, preserving current selection
+    auto repopulateModels = [](QComboBox* combo, const std::vector<std::string>& models) {
+        QString prev = combo->currentText();
+        combo->clear();
+        int selIdx = 0;
+        for (size_t i = 0; i < models.size(); ++i)
+        {
+            combo->addItem(QString::fromStdString(models[i]));
+            if (QString::fromStdString(models[i]) == prev)
+                selIdx = static_cast<int>(i);
+        }
+        if (!prev.isEmpty())
+        {
+            bool found = false;
+            for (int i = 0; i < combo->count(); ++i)
+                if (combo->itemText(i) == prev) { found = true; break; }
+            if (!found)
+            {
+                combo->addItem(prev);
+                selIdx = combo->count() - 1;
+            }
+        }
+        combo->setCurrentIndex(selIdx);
+    };
+
+    // Gemini refresh
+    QObject::connect(geminiTab.refreshBtn, &QPushButton::clicked,
+        [&geminiTab, repopulateModels]() {
+            qstring key(geminiTab.keyEdit->text().toUtf8().constData());
+            qstring url(geminiTab.urlEdit ? geminiTab.urlEdit->text().trimmed().toUtf8().constData() : "");
+            auto models = fetch_gemini_models_via_api(key, url);
+            if (models.empty())
+                models = settings_t::gemini_models;
+            repopulateModels(geminiTab.modelCombo, models);
+        });
+
+    // OpenAI refresh
+    QObject::connect(openaiTab.refreshBtn, &QPushButton::clicked,
+        [&openaiTab, repopulateModels]() {
+            qstring key(openaiTab.keyEdit->text().toUtf8().constData());
+            qstring url(openaiTab.urlEdit ? openaiTab.urlEdit->text().trimmed().toUtf8().constData() : "");
+            auto models = fetch_openai_models_via_api(key, url);
+            if (models.empty())
+                models = settings_t::openai_models;
+            repopulateModels(openaiTab.modelCombo, models);
+        });
+
+    // OpenRouter refresh
+    QObject::connect(openrouterTab.refreshBtn, &QPushButton::clicked,
+        [&openrouterTab, repopulateModels]() {
+            qstring key(openrouterTab.keyEdit->text().toUtf8().constData());
+            auto models = fetch_openrouter_models_via_api(key);
+            if (models.empty())
+                models = settings_t::openrouter_models;
+            repopulateModels(openrouterTab.modelCombo, models);
+        });
+
+    // Anthropic refresh
+    QObject::connect(anthropicTab.refreshBtn, &QPushButton::clicked,
+        [&anthropicTab, repopulateModels]() {
+            qstring key(anthropicTab.keyEdit->text().toUtf8().constData());
+            qstring url(anthropicTab.urlEdit ? anthropicTab.urlEdit->text().trimmed().toUtf8().constData() : "");
+            auto models = fetch_anthropic_models_via_api(key, url);
+            if (models.empty())
+                models = settings_t::anthropic_models;
+            repopulateModels(anthropicTab.modelCombo, models);
+        });
+
+    // Copilot refresh
+    QObject::connect(copilotTab.refreshBtn, &QPushButton::clicked,
+        [&copilotTab, repopulateModels]() {
+            qstring url(copilotTab.urlEdit->text().trimmed().toUtf8().constData());
+            auto models = fetch_copilot_models_via_api(url);
+            if (models.empty())
+                models = settings_t::copilot_models;
+            repopulateModels(copilotTab.modelCombo, models);
+        });
+
+    // Local LLM refresh
+    QObject::connect(localLlmTab.refreshBtn, &QPushButton::clicked,
+        [&localLlmTab, repopulateModels]() {
+            qstring url(localLlmTab.urlEdit->text().trimmed().toUtf8().constData());
+            auto models = fetch_local_llm_models_via_api(url);
+            if (models.empty())
+                models = settings_t::local_llm_models;
+            repopulateModels(localLlmTab.modelCombo, models);
+        });
 
     mainLayout->addWidget(tabs, 0);
 

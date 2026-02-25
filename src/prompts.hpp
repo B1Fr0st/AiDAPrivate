@@ -698,3 +698,132 @@ Return a JSON object with actions to apply. Use these tool types:
 ```
 --- END CONTEXT ---
 )V0G0N";
+
+// ── Debugger-aware prompts ───────────────────────────────────────────
+
+const char* const DEBUGGER_ANALYSIS_PROMPT = R"V0G0N(
+You are an expert debugger analyst. You have been given a rich execution context snapshot at a breakpoint.
+Analyze the following debugger state and provide actionable insights.
+
+**Your analysis must cover:**
+
+1. **Current Execution Point:** What is the code doing right now? Explain the current instruction and its purpose within the function.
+
+2. **Register State Analysis:** Examine the register values. Identify:
+   - Which registers hold pointers vs. immediate values
+   - Likely argument values (RCX, RDX, R8, R9 for x64 Microsoft ABI)
+   - Return value if post-call (RAX)
+   - Stack pointer alignment and frame setup
+
+3. **Call Stack Interpretation:** Trace the execution path:
+   - What called this function and why
+   - Is this a callback, virtual call, or direct call
+   - Identify any interesting callers (game engine functions, system APIs)
+
+4. **Memory Analysis:** From the stack dump:
+   - Identify saved return addresses
+   - Spot pointer values vs. data values
+   - Look for string pointers or vtable pointers
+
+5. **Pattern Detection:**
+   - Anti-debugging checks (IsDebuggerPresent, timing checks, exception-based)
+   - VM handler patterns (opcode fetch, dispatch table, virtual register file)
+   - Obfuscation (control flow flattening, opaque predicates, junk code)
+   - Packing/encryption (self-modifying code, runtime decryption)
+
+6. **Recommended Actions:**
+   - Specific breakpoints to set next (with addresses and conditions)
+   - Memory regions to watch (hardware breakpoints)
+   - Registers to monitor across steps
+   - Functions to trace for understanding the larger flow
+
+--- DEBUGGER CONTEXT ---
+
+{debugger_context}
+
+--- END DEBUGGER CONTEXT ---
+)V0G0N";
+
+const char* const DEVIRTUALIZATION_PROMPT = R"V0G0N(
+You are an expert in code devirtualization and VM-based obfuscation analysis.
+Your task is to reverse engineer virtualized code and reconstruct the original logic.
+
+**VM Architecture Analysis Framework:**
+
+1. **VM Entry Point:** Identify how the VM is entered:
+   - Context save (pushad/pushaq equivalent)
+   - Virtual register file initialization
+   - Bytecode pointer setup
+   - VM stack allocation
+
+2. **Dispatcher/Fetch-Decode-Execute Loop:**
+   - Opcode fetch mechanism (byte/word/dword opcodes)
+   - Dispatch method (switch/jump table/computed goto)
+   - Handler table location and format
+   - Opcode encoding (direct, encrypted, compressed)
+
+3. **Handler Classification:** For each VM handler, determine:
+   - **Arithmetic:** vm_add, vm_sub, vm_mul, vm_div, vm_xor, vm_and, vm_or, vm_not, vm_shl, vm_shr
+   - **Stack:** vm_push, vm_pop, vm_dup, vm_swap
+   - **Memory:** vm_load, vm_store (byte/word/dword/qword variants)
+   - **Control Flow:** vm_jmp, vm_jcc (conditional), vm_call, vm_ret
+   - **Register:** vm_mov_reg, vm_load_reg, vm_store_reg
+   - **System:** vm_nop, vm_exit, vm_syscall, vm_cpuid
+
+4. **Virtual Register Mapping:**
+   - How many virtual registers exist
+   - Which real registers/memory locations back them
+   - Special registers (virtual IP, virtual SP, virtual flags)
+
+5. **Bytecode Reconstruction:**
+   - Disassemble the VM bytecode into virtual instructions
+   - Build a control flow graph of the virtual program
+   - Identify loops, conditionals, and function calls
+   - Map virtual addresses to real addresses
+
+6. **Deobfuscated Output:**
+   - Produce equivalent C/C++ pseudocode
+   - Document the VM opcode table
+   - Add IDB comments and renames for all identified components
+
+--- VM ANALYSIS CONTEXT ---
+
+{vm_context}
+
+--- END VM ANALYSIS CONTEXT ---
+)V0G0N";
+
+const char* const TRACE_DISPATCH_PROMPT = R"V0G0N(
+You are analyzing an indirect call/jump dispatch mechanism.
+This could be a C++ vtable call, a function pointer dispatch, a VM handler table, or an import thunk.
+
+**Analysis Requirements:**
+
+1. **Dispatch Mechanism:** Identify the type:
+   - C++ virtual method call (vtable + offset)
+   - Function pointer from struct/class member
+   - Switch/case jump table
+   - VM opcode dispatch table
+   - Import address table (IAT) call
+
+2. **Target Enumeration:** For each discovered target:
+   - Function name and address
+   - Brief description of what it does
+   - How it relates to other targets (same interface? same handler set?)
+
+3. **Pattern Recognition:**
+   - If vtable: identify the class hierarchy and interface
+   - If VM dispatch: map opcodes to handlers
+   - If switch: identify the selector variable and case values
+
+4. **Exploitation Opportunities:**
+   - Can the dispatch be hooked to intercept specific calls?
+   - Can the target table be modified for redirection?
+   - Are there unused/dead entries that could be repurposed?
+
+--- DISPATCH CONTEXT ---
+
+{dispatch_context}
+
+--- END DISPATCH CONTEXT ---
+)V0G0N";

@@ -31,6 +31,10 @@ void handle_fix_analysis(action_activation_ctx_t* ctx, aida_plugin_t* plugin);
 void handle_cancel_request(action_activation_ctx_t* ctx, aida_plugin_t* plugin);
 void handle_toggle_mcp(action_activation_ctx_t* ctx, aida_plugin_t* plugin);
 
+void handle_debug_analyze(action_activation_ctx_t* ctx, aida_plugin_t* plugin);
+void handle_debug_devirtualize(action_activation_ctx_t* ctx, aida_plugin_t* plugin);
+void handle_debug_trace_dispatch(action_activation_ctx_t* ctx, aida_plugin_t* plugin);
+
 namespace action_helpers {
 void handle_ai_response(const std::string& result, const qstring& title_prefix,
                         std::function<void(const std::string&)> success_action);

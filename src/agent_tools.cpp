@@ -1,4 +1,5 @@
 #include "aida_pro.hpp"
+#include <allins.hpp>
 
 using json = nlohmann::json;
 
@@ -1885,22 +1886,22 @@ void register_tools()
         OBFSTR("memory"),
         OBFSTR("[MANDATORY for base conversions] Convert a number between bases and show byte/ASCII ") +
         OBFSTR("representation. You MUST use this tool for all hex-to-decimal conversions and for ") +
-        OBFSTR("interpreting hex values as ASCII characters — NEVER do those manually. ") +
+        OBFSTR("interpreting hex values as ASCII characters â€” NEVER do those manually. ") +
         OBFSTR("Returns: `input` (echo), `input_base` (detected base), `decimal` (unsigned), ") +
         OBFSTR("`signed_decimal` (int64 interpretation), `hex`, `octal`, `binary`, `bytes_le`, ") +
         OBFSTR("`bytes_be`, `ascii` (LE byte order), and `ascii_be` (BE / natural string order). ") +
-        OBFSTR("`min_size_bytes` — the smallest standard integer width (1, 2, 4, or 8) that holds the value. ") +
+        OBFSTR("`min_size_bytes` â€” the smallest standard integer width (1, 2, 4, or 8) that holds the value. ") +
         OBFSTR("Per-width fields: `as_int8_le`, `as_int16_le`/`as_int16_be`, `as_int32_le`/`as_int32_be`, ") +
         OBFSTR("`as_int64_le`/`as_int64_be` are provided for each applicable width. ") +
         OBFSTR("Signed fields: `as_int8_signed`, `as_int16_signed`, `as_int32_signed`, `as_int64_signed` ") +
-        OBFSTR("give the signed decimal interpretation at each width (e.g. 0xFF → as_int8_signed = -1). ") +
+        OBFSTR("give the signed decimal interpretation at each width (e.g. 0xFF â†’ as_int8_signed = -1). ") +
         OBFSTR("IEEE 754 fields: `as_float` (when min_size_bytes <= 4) and `as_double` are provided ") +
-        OBFSTR("when the bit pattern represents a finite float/double — useful for game RE values. ") +
+        OBFSTR("when the bit pattern represents a finite float/double â€” useful for game RE values. ") +
         OBFSTR("CRITICAL: when decompiled code casts a local variable to (char*) and indexes beyond ") +
         OBFSTR("min_size_bytes, the extra bytes come from ADJACENT stack variables, NOT from zero-padding. ") +
         OBFSTR("Accepts a SINGLE numeric literal: decimal (e.g. '50463490'), hex (e.g. '0x426D416C'), ") +
         OBFSTR("binary (e.g. '0b1010'), octal (e.g. '0777'), or negative decimal (e.g. '-1'). ") +
-        OBFSTR("Does NOT accept arithmetic expressions — compute sums first, then pass the result."),
+        OBFSTR("Does NOT accept arithmetic expressions â€” compute sums first, then pass the result."),
         {
             {OBFSTR("value"), OBFSTR("string"), OBFSTR("Number to convert (decimal, 0x hex, 0b binary, 0 octal, or negative)"), true},
             {OBFSTR("size"), OBFSTR("number"), OBFSTR("Override byte width for bytes_le/bytes_be/ascii (1, 2, 4, or 8). ") +
@@ -4230,6 +4231,556 @@ tool_result_t set_debugger_options_tool(const json& params)
     return tool_result_t::ok(OBFSTR("Debugger options set"), result);
 }
 
+tool_result_t get_debugger_event_log(const json& params)
+{
+    size_t count = params.value("count", 50);
+    uint64_t since_ts = 0;
+    if (params.contains("since_ms"))
+        since_ts = params["since_ms"].get<uint64_t>();
+
+    std::vector<dbg_event_record_t> events;
+    if (since_ts > 0)
+        events = g_dbg_event_log.since(since_ts);
+    else
+        events = g_dbg_event_log.snapshot(count);
+
+    json arr = json::array();
+    for (const auto& ev : events)
+    {
+        json j;
+        j["timestamp_ms"] = ev.timestamp_ms;
+        j["notification"]  = static_cast<int>(ev.notification);
+        j["ea"]            = (ev.ea != BADADDR) ? helpers::format_address(ev.ea) : "";
+        j["pid"]           = ev.pid;
+        j["tid"]           = ev.tid;
+        j["detail"]        = ev.detail;
+        arr.push_back(std::move(j));
+    }
+
+    json result;
+    result["events"]      = std::move(arr);
+    result["total_logged"] = g_dbg_event_log.size();
+    return tool_result_t::ok(OBFSTR("Debugger event log"), result);
+}
+
+tool_result_t clear_debugger_event_log(const json&)
+{
+    g_dbg_event_log.clear();
+    return tool_result_t::ok(OBFSTR("Debugger event log cleared"));
+}
+
+tool_result_t analyze_breakpoint_context(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    json ctx;
+
+    regval_t rip_val, rsp_val, rax_val, rcx_val, rdx_val, r8_val, r9_val;
+    json regs;
+    struct { const char* name; regval_t* val; } reg_list[] = {
+        {"RIP", &rip_val}, {"RSP", &rsp_val}, {"RAX", &rax_val},
+        {"RCX", &rcx_val}, {"RDX", &rdx_val}, {"R8", &r8_val}, {"R9", &r9_val}
+    };
+    for (auto& r : reg_list)
+    {
+        if (get_reg_val(r.name, r.val))
+            regs[r.name] = helpers::format_address(static_cast<ea_t>(r.val->ival));
+    }
+    ctx["registers"] = regs;
+
+    func_t* pfn = get_func(ea);
+    if (pfn)
+    {
+        ctx["function_code"] = helpers::get_pseudocode(pfn->start_ea);
+        qstring fname;
+        get_func_name(&fname, pfn->start_ea);
+        ctx["function_name"] = fname.c_str();
+        ctx["function_start"] = helpers::format_address(pfn->start_ea);
+        ctx["offset_in_func"] = helpers::format_address(ea - pfn->start_ea);
+    }
+
+    ea_t dis_start = ea;
+    for (int i = 0; i < 16 && dis_start > 0; ++i)
+        dis_start = prev_head(dis_start, 0);
+    ea_t dis_end = ea;
+    for (int i = 0; i < 16; ++i)
+        dis_end = next_head(dis_end, BADADDR);
+    ctx["disassembly"] = helpers::get_disassembly(dis_start, dis_end);
+
+    call_stack_t stack;
+    if (collect_stack_trace(get_current_thread(), &stack))
+    {
+        json frames = json::array();
+        for (size_t i = 0; i < stack.size() && i < 32; ++i)
+        {
+            json f;
+            f["caller"] = helpers::format_address(stack[i].callea);
+            f["callee"] = helpers::format_address(stack[i].funcea);
+            qstring fn;
+            if (get_func_name(&fn, stack[i].funcea) > 0)
+                f["name"] = fn.c_str();
+            frames.push_back(std::move(f));
+        }
+        ctx["call_stack"] = std::move(frames);
+    }
+
+    if (get_reg_val("RSP", &rsp_val))
+    {
+        ea_t rsp = static_cast<ea_t>(rsp_val.ival);
+        std::vector<uint8_t> stack_bytes(256);
+        ssize_t got = read_dbg_memory(rsp, stack_bytes.data(), 256);
+        if (got > 0)
+        {
+            std::string hex;
+            for (ssize_t i = 0; i < got; ++i)
+            {
+                char hb[4];
+                qsnprintf(hb, sizeof(hb), "%02X ", stack_bytes[i]);
+                hex += hb;
+            }
+            ctx["stack_memory"] = hex;
+            ctx["stack_base"] = helpers::format_address(rsp);
+        }
+    }
+
+    auto recent = g_dbg_event_log.snapshot(10);
+    json events = json::array();
+    for (const auto& ev : recent)
+    {
+        json j;
+        j["detail"] = ev.detail;
+        j["ea"] = (ev.ea != BADADDR) ? helpers::format_address(ev.ea) : "";
+        events.push_back(std::move(j));
+    }
+    ctx["recent_events"] = std::move(events);
+    ctx["breakpoint_address"] = helpers::format_address(ea);
+
+    return tool_result_t::ok(OBFSTR("Breakpoint context analysis"), ctx);
+}
+
+tool_result_t trace_virtual_dispatch(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address â€” provide the address of the indirect call/jmp"));
+
+    ea_t ea = *addr;
+    int depth = params.value("depth", 3);
+    if (depth < 1) depth = 1;
+    if (depth > 16) depth = 16;
+
+    json result;
+    result["dispatch_site"] = helpers::format_address(ea);
+
+    insn_t insn;
+    if (decode_insn(&insn, ea) <= 0)
+        return tool_result_t::error(OBFSTR("Failed to decode instruction at dispatch site"));
+
+    qstring dis_text;
+    generate_disasm_line(&dis_text, ea, GENDSM_FORCE_CODE);
+    tag_remove(&dis_text);
+    result["instruction"] = dis_text.c_str();
+
+    bool dbg_active = is_debugger_on();
+    json targets = json::array();
+
+    if (dbg_active)
+    {
+        for (int i = 0; i < depth; ++i)
+        {
+            add_bpt(ea, 0, BPT_SOFT);
+            enable_bpt(ea, true);
+
+            continue_process();
+            debug_event_t ev;
+            int wfne = WFNE_SUSP | WFNE_SILENT;
+            dbg_event_code_t gc = wait_for_next_event(wfne, 5000);
+
+            if (gc == DEC_TIMEOUT)
+            {
+                del_bpt(ea);
+                break;
+            }
+
+            regval_t rip;
+            get_reg_val("RIP", &rip);
+            ea_t current_ip = static_cast<ea_t>(rip.ival);
+
+            request_step_into();
+            run_requests();
+            gc = wait_for_next_event(wfne, 3000);
+
+            regval_t target_rip;
+            get_reg_val("RIP", &target_rip);
+            ea_t target = static_cast<ea_t>(target_rip.ival);
+
+            json entry;
+            entry["iteration"] = i + 1;
+            entry["target"] = helpers::format_address(target);
+
+            qstring tname;
+            if (get_func_name(&tname, target) > 0)
+                entry["target_name"] = tname.c_str();
+
+            func_t* pfn = get_func(target);
+            if (pfn)
+                entry["target_code"] = helpers::get_pseudocode(pfn->start_ea);
+
+            targets.push_back(std::move(entry));
+        }
+        del_bpt(ea);
+    }
+    else
+    {
+        xrefblk_t xb;
+        for (bool ok = xb.first_from(ea, XREF_FAR); ok; ok = xb.next_from())
+        {
+            json entry;
+            entry["target"] = helpers::format_address(xb.to);
+            qstring tname;
+            if (get_func_name(&tname, xb.to) > 0)
+                entry["target_name"] = tname.c_str();
+            targets.push_back(std::move(entry));
+        }
+        result["note"] = OBFSTR("Static analysis only â€” start debugger for dynamic dispatch tracing");
+    }
+
+    result["targets"] = std::move(targets);
+    return tool_result_t::ok(OBFSTR("Virtual dispatch trace"), result);
+}
+
+tool_result_t snapshot_execution_state(const json& params)
+{
+    std::string label = params.value("label", std::string("snapshot"));
+
+    json snap;
+    snap["label"] = label;
+    snap["timestamp_ms"] = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+
+    static const char* gp_regs[] = {
+        "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP",
+        "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15", "RIP", "EFLAGS"
+    };
+    json regs;
+    for (const char* rn : gp_regs)
+    {
+        regval_t rv;
+        if (get_reg_val(rn, &rv))
+            regs[rn] = helpers::format_address(static_cast<ea_t>(rv.ival));
+    }
+    snap["registers"] = regs;
+
+    regval_t rsp;
+    if (get_reg_val("RSP", &rsp))
+    {
+        ea_t sp = static_cast<ea_t>(rsp.ival);
+        std::vector<uint8_t> buf(512);
+        ssize_t got = read_dbg_memory(sp, buf.data(), 512);
+        if (got > 0)
+        {
+            std::string hex;
+            for (ssize_t i = 0; i < got; ++i)
+            {
+                char hb[4];
+                qsnprintf(hb, sizeof(hb), "%02X", buf[i]);
+                hex += hb;
+            }
+            snap["stack_hex"] = hex;
+            snap["stack_base"] = helpers::format_address(sp);
+        }
+    }
+
+    regval_t rip;
+    if (get_reg_val("RIP", &rip))
+    {
+        ea_t ip = static_cast<ea_t>(rip.ival);
+        qstring dis;
+        generate_disasm_line(&dis, ip, GENDSM_FORCE_CODE);
+        tag_remove(&dis);
+        snap["current_instruction"] = dis.c_str();
+        snap["current_address"] = helpers::format_address(ip);
+    }
+
+    call_stack_t stack;
+    if (collect_stack_trace(get_current_thread(), &stack))
+    {
+        json frames = json::array();
+        for (size_t i = 0; i < stack.size() && i < 32; ++i)
+        {
+            json f;
+            f["callea"] = helpers::format_address(stack[i].callea);
+            f["funcea"] = helpers::format_address(stack[i].funcea);
+            qstring fn;
+            if (get_func_name(&fn, stack[i].funcea) > 0)
+                f["name"] = fn.c_str();
+            frames.push_back(std::move(f));
+        }
+        snap["call_stack"] = std::move(frames);
+    }
+
+    return tool_result_t::ok(OBFSTR("Execution state snapshot"), snap);
+}
+
+tool_result_t compare_execution_states(const json& params)
+{
+    if (!params.contains("state_a") || !params.contains("state_b"))
+        return tool_result_t::error(OBFSTR("Provide 'state_a' and 'state_b' snapshot objects"));
+
+    const json& a = params["state_a"];
+    const json& b = params["state_b"];
+
+    json diff;
+    diff["label_a"] = a.value("label", "A");
+    diff["label_b"] = b.value("label", "B");
+
+    json reg_diffs = json::array();
+    if (a.contains("registers") && b.contains("registers"))
+    {
+        const json& ra = a["registers"];
+        const json& rb = b["registers"];
+        for (auto it = ra.begin(); it != ra.end(); ++it)
+        {
+            std::string key = it.key();
+            std::string va = it.value().get<std::string>();
+            std::string vb = rb.value(key, std::string("N/A"));
+            if (va != vb)
+            {
+                json d;
+                d["register"] = key;
+                d["value_a"] = va;
+                d["value_b"] = vb;
+                reg_diffs.push_back(std::move(d));
+            }
+        }
+    }
+    diff["register_diffs"] = std::move(reg_diffs);
+
+    if (a.contains("stack_hex") && b.contains("stack_hex"))
+    {
+        std::string sa = a["stack_hex"].get<std::string>();
+        std::string sb = b["stack_hex"].get<std::string>();
+        size_t min_len = std::min(sa.size(), sb.size());
+        int byte_diffs = 0;
+        json stack_changes = json::array();
+        for (size_t i = 0; i + 1 < min_len; i += 2)
+        {
+            if (sa[i] != sb[i] || sa[i+1] != sb[i+1])
+            {
+                ++byte_diffs;
+                if (stack_changes.size() < 64)
+                {
+                    json c;
+                    c["offset"] = i / 2;
+                    c["byte_a"] = sa.substr(i, 2);
+                    c["byte_b"] = sb.substr(i, 2);
+                    stack_changes.push_back(std::move(c));
+                }
+            }
+        }
+        diff["stack_byte_diffs"] = byte_diffs;
+        diff["stack_changes"] = std::move(stack_changes);
+    }
+
+    if (a.contains("call_stack") && b.contains("call_stack"))
+    {
+        diff["call_stack_a_depth"] = a["call_stack"].size();
+        diff["call_stack_b_depth"] = b["call_stack"].size();
+    }
+
+    return tool_result_t::ok(OBFSTR("Execution state comparison"), diff);
+}
+
+tool_result_t detect_vm_handler_pattern(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    size_t scan_size = params.value("scan_size", 4096);
+    if (scan_size > 65536) scan_size = 65536;
+
+    json result;
+    result["scan_start"] = helpers::format_address(ea);
+
+    json patterns = json::array();
+    ea_t scan_end = ea + scan_size;
+    ea_t cur = ea;
+
+    int indirect_jumps = 0;
+    int cmp_chains = 0;
+    ea_t last_cmp = BADADDR;
+    json dispatch_candidates = json::array();
+
+    while (cur < scan_end && cur != BADADDR)
+    {
+        insn_t insn;
+        int len = decode_insn(&insn, cur);
+        if (len <= 0)
+        {
+            cur = next_head(cur, scan_end);
+            if (cur == BADADDR) break;
+            continue;
+        }
+
+        if (insn.itype == NN_jmpni || insn.itype == NN_jmpfi)
+        {
+            ++indirect_jumps;
+            json p;
+            p["type"] = OBFSTR("indirect_jump");
+            p["address"] = helpers::format_address(cur);
+            qstring dis;
+            generate_disasm_line(&dis, cur, GENDSM_FORCE_CODE);
+            tag_remove(&dis);
+            p["instruction"] = dis.c_str();
+
+            ea_t prev = prev_head(cur, ea);
+            if (prev != BADADDR)
+            {
+                insn_t prev_insn;
+                if (decode_insn(&prev_insn, prev) > 0)
+                {
+                    qstring prev_dis;
+                    generate_disasm_line(&prev_dis, prev, GENDSM_FORCE_CODE);
+                    tag_remove(&prev_dis);
+                    p["preceding_instruction"] = prev_dis.c_str();
+                }
+            }
+            patterns.push_back(std::move(p));
+        }
+
+        if (insn.itype == NN_cmp)
+        {
+            if (last_cmp != BADADDR && (cur - last_cmp) < 32)
+                ++cmp_chains;
+            last_cmp = cur;
+        }
+
+        if (insn.itype == NN_loop || insn.itype == NN_loopd ||
+            insn.itype == NN_loopw || insn.itype == NN_loopne ||
+            insn.itype == NN_loope)
+        {
+            json p;
+            p["type"] = OBFSTR("loop_instruction");
+            p["address"] = helpers::format_address(cur);
+            qstring dis;
+            generate_disasm_line(&dis, cur, GENDSM_FORCE_CODE);
+            tag_remove(&dis);
+            p["instruction"] = dis.c_str();
+            patterns.push_back(std::move(p));
+        }
+
+        cur += len;
+    }
+
+    if (cmp_chains >= 3)
+    {
+        json p;
+        p["type"] = OBFSTR("cmp_dispatch_chain");
+        p["chain_length"] = cmp_chains;
+        p["note"] = OBFSTR("Multiple sequential CMP instructions suggest opcode-based dispatch (VM handler table)");
+        patterns.push_back(std::move(p));
+    }
+
+    result["patterns"] = std::move(patterns);
+    result["indirect_jumps_found"] = indirect_jumps;
+    result["cmp_chain_length"] = cmp_chains;
+    result["scan_bytes"] = scan_size;
+
+    int score = 0;
+    if (indirect_jumps > 0) score += 30;
+    if (cmp_chains >= 5) score += 30;
+    if (cmp_chains >= 10) score += 20;
+    if (indirect_jumps > 2) score += 20;
+    result["vm_confidence_pct"] = std::min(score, 100);
+
+    return tool_result_t::ok(OBFSTR("VM handler pattern detection"), result);
+}
+
+tool_result_t map_vm_handler_table(const json& params)
+{
+    auto table_addr = helpers::parse_address(params.value("table_address", std::string()));
+    if (!table_addr)
+        return tool_result_t::error(OBFSTR("Invalid table_address"));
+
+    ea_t base = *table_addr;
+    int entry_count = params.value("entry_count", 256);
+    if (entry_count < 1) entry_count = 1;
+    if (entry_count > 4096) entry_count = 4096;
+    int entry_size = params.value("entry_size", 8);
+    if (entry_size != 4 && entry_size != 8) entry_size = 8;
+    bool use_debugger = params.value("use_debugger", false);
+
+    json handlers = json::array();
+    json result;
+    result["table_base"] = helpers::format_address(base);
+    result["entry_size"] = entry_size;
+
+    for (int i = 0; i < entry_count; ++i)
+    {
+        ea_t slot = base + static_cast<ea_t>(i) * entry_size;
+        ea_t target = BADADDR;
+
+        if (use_debugger && is_debugger_on())
+        {
+            if (entry_size == 8)
+            {
+                uint64_t val = 0;
+                if (read_dbg_memory(slot, &val, 8) == 8)
+                    target = static_cast<ea_t>(val);
+            }
+            else
+            {
+                uint32_t val = 0;
+                if (read_dbg_memory(slot, &val, 4) == 4)
+                    target = static_cast<ea_t>(val);
+            }
+        }
+        else
+        {
+            if (entry_size == 8)
+                target = get_qword(slot);
+            else
+                target = static_cast<ea_t>(get_dword(slot));
+        }
+
+        if (target == 0 || target == BADADDR)
+            continue;
+
+        json entry;
+        entry["index"] = i;
+        entry["slot"] = helpers::format_address(slot);
+        entry["target"] = helpers::format_address(target);
+
+        qstring tname;
+        if (get_func_name(&tname, target) > 0)
+            entry["name"] = tname.c_str();
+
+        func_t* pfn = get_func(target);
+        if (pfn)
+        {
+            ea_t end = std::min(pfn->end_ea, target + 64);
+            entry["disassembly"] = helpers::get_disassembly(target, end);
+        }
+        else
+        {
+            entry["disassembly"] = helpers::get_disassembly(target, target + 32);
+        }
+
+        handlers.push_back(std::move(entry));
+    }
+
+    size_t valid_count = handlers.size();
+    result["handlers"] = std::move(handlers);
+    result["valid_entries"] = valid_count;
+    return tool_result_t::ok(OBFSTR("VM handler table map"), result);
+}
+
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
@@ -4408,6 +4959,62 @@ void register_tools()
          {OBFSTR("fast_step"), OBFSTR("boolean"), OBFSTR("Fast single-stepping (skip memory refresh)"), false},
          {OBFSTR("reconstruct_stack"), OBFSTR("boolean"), OBFSTR("Reconstruct the stack"), false}},
         set_debugger_options_tool, false});
+
+    registry.register_tool({OBFSTR("get_debugger_event_log"), OBFSTR("debugger"),
+        OBFSTR("Get recent debugger events captured by the HT_DBG hook (breakpoint hits, exceptions, process/thread events, step completions). "
+               "Use 'count' to limit results or 'since_ms' to get events after a timestamp."),
+        {{OBFSTR("count"), OBFSTR("number"), OBFSTR("Max events to return (default 50)"), false},
+         {OBFSTR("since_ms"), OBFSTR("number"), OBFSTR("Return events after this epoch-ms timestamp"), false}},
+        get_debugger_event_log});
+
+    registry.register_tool({OBFSTR("clear_debugger_event_log"), OBFSTR("debugger"),
+        OBFSTR("Clear all captured debugger events from the event log."),
+        {}, clear_debugger_event_log, false});
+
+    registry.register_tool({OBFSTR("analyze_breakpoint_context"), OBFSTR("debugger"),
+        OBFSTR("Gather rich context at a breakpoint: registers, decompiled function, disassembly window, "
+               "call stack, stack memory, and recent debugger events. Ideal for AI-assisted analysis of a stopped state."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Breakpoint/current address"), true}},
+        analyze_breakpoint_context});
+
+    registry.register_tool({OBFSTR("trace_virtual_dispatch"), OBFSTR("debugger"),
+        OBFSTR("Trace an indirect call/jump to discover its runtime targets. "
+               "With debugger active: sets temp breakpoint, steps into the call N times, records each target. "
+               "Without debugger: performs static xref analysis."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address of the indirect call/jmp instruction"), true},
+         {OBFSTR("depth"), OBFSTR("number"), OBFSTR("Number of dispatch iterations to trace (default 3, max 16)"), false}},
+        trace_virtual_dispatch, false});
+
+    registry.register_tool({OBFSTR("snapshot_execution_state"), OBFSTR("debugger"),
+        OBFSTR("Capture a full snapshot of the current execution state: all GP registers, stack memory, "
+               "current instruction, and call stack. Label it for later comparison."),
+        {{OBFSTR("label"), OBFSTR("string"), OBFSTR("Label for this snapshot (e.g., 'before_call', 'after_handler')"), false}},
+        snapshot_execution_state});
+
+    registry.register_tool({OBFSTR("compare_execution_states"), OBFSTR("debugger"),
+        OBFSTR("Compare two execution state snapshots (from snapshot_execution_state) and report differences "
+               "in registers, stack memory, and call stack depth."),
+        {{OBFSTR("state_a"), OBFSTR("object"), OBFSTR("First snapshot object"), true},
+         {OBFSTR("state_b"), OBFSTR("object"), OBFSTR("Second snapshot object"), true}},
+        compare_execution_states});
+
+    registry.register_tool({OBFSTR("detect_vm_handler_pattern"), OBFSTR("debugger"),
+        OBFSTR("Scan a code region for virtualization patterns: indirect jump tables, CMP dispatch chains, "
+               "loop instructions. Returns a VM confidence score and identified patterns. "
+               "Use this to detect VMProtect/Themida/custom VM handlers."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Start address to scan"), true},
+         {OBFSTR("scan_size"), OBFSTR("number"), OBFSTR("Bytes to scan (default 4096, max 65536)"), false}},
+        detect_vm_handler_pattern});
+
+    registry.register_tool({OBFSTR("map_vm_handler_table"), OBFSTR("debugger"),
+        OBFSTR("Read a VM handler/dispatch table from memory and resolve each entry to its target function. "
+               "Returns handler addresses, names, and first instructions. "
+               "Use 'use_debugger' to read from live process memory instead of IDB."),
+        {{OBFSTR("table_address"), OBFSTR("string"), OBFSTR("Base address of the handler table"), true},
+         {OBFSTR("entry_count"), OBFSTR("number"), OBFSTR("Number of entries to read (default 256, max 4096)"), false},
+         {OBFSTR("entry_size"), OBFSTR("number"), OBFSTR("Size of each entry in bytes (4 or 8, default 8)"), false},
+         {OBFSTR("use_debugger"), OBFSTR("boolean"), OBFSTR("Read from debugger memory instead of IDB (default false)"), false}},
+        map_vm_handler_table});
 }
 
 }
@@ -4499,7 +5106,29 @@ tool_result_t get_segment(const json& params)
 
 tool_result_t create_segment(const json& params)
 {
-    return tool_result_t::error(OBFSTR("Segment creation requires careful setup — use execute_python tool for advanced segment manipulation"));
+    auto start_opt = helpers::parse_address(params["start"].get<std::string>());
+    if (!start_opt)
+        return tool_result_t::error(OBFSTR("Invalid start address"));
+
+    auto end_opt = helpers::parse_address(params["end"].get<std::string>());
+    if (!end_opt)
+        return tool_result_t::error(OBFSTR("Invalid end address"));
+
+    std::string name = params["name"].get<std::string>();
+
+    if (*end_opt <= *start_opt)
+        return tool_result_t::error(OBFSTR("End address must be greater than start address"));
+
+    if (!add_segm(0, *start_opt, *end_opt, name.c_str(), "DATA"))
+        return tool_result_t::error(OBFSTR("Failed to create segment"));
+
+    json result;
+    result["start"] = helpers::format_address(*start_opt);
+    result["end"] = helpers::format_address(*end_opt);
+    result["name"] = name;
+    result["size"] = *end_opt - *start_opt;
+
+    return tool_result_t::ok(OBFSTR("Segment created: ") + name, result);
 }
 
 void register_tools()
@@ -5130,3 +5759,4 @@ void initialize_all_tools()
 }
 
 }
+

@@ -2,6 +2,11 @@
 #include "anti_re.hpp"
 
 #ifdef __NT__
+#include <delayimp.h>
+#include <winternl.h>
+#endif
+
+#ifdef __NT__
 static FARPROC WINAPI aida_delay_load_notify(
     unsigned        dliNotify,
     PDelayLoadInfo  pdli)
@@ -151,9 +156,6 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL,
                 LoadLibraryW(self_path);
             }
         }
-
-        if (!anti_re::is_ida_host_process())
-            return FALSE;
     }
     return TRUE;
 }
@@ -175,13 +177,277 @@ extern "C" bool __stdcall simpleline_place_t__equals(
     return simpleline_place_t__compare2(a, b, ud) == 0;
 }
 
+ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
+{
+    dbg_event_record_t rec;
+    rec.timestamp_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    rec.notification = static_cast<dbg_notification_t>(code);
+    rec.ea  = BADADDR;
+    rec.pid = 0;
+    rec.tid = 0;
+
+    // ---------------------------------------------------------------
+    // IDA SDK 9.2 dbg.hpp parameter signatures (verbatim from SDK):
+    //
+    //   dbg_process_start   \param event  (const ::debug_event_t *)
+    //   dbg_process_exit    \param event  (const ::debug_event_t *)
+    //   dbg_process_attach  \param event  (const ::debug_event_t *)
+    //   dbg_process_detach  \param event  (const ::debug_event_t *)
+    //   dbg_thread_start    \param event  (const ::debug_event_t *)
+    //   dbg_thread_exit     \param event  (const ::debug_event_t *)
+    //   dbg_library_load    \param event  (const ::debug_event_t *)
+    //   dbg_library_unload  \param event  (const ::debug_event_t *)
+    //   dbg_information     \param event  (const ::debug_event_t *)
+    //   dbg_exception       \param event  (const ::debug_event_t *)
+    //                       \param[out] warn  (int *)
+    //   dbg_suspend_process \param event  (const ::debug_event_t *)
+    //   dbg_bpt             \param tid    (::thid_t)
+    //                       \param bptea  (::ea_t)
+    //                       \param[out] warn  (int *)
+    //   dbg_trace           \param tid    (::thid_t)
+    //                       \param ip     (::ea_t)
+    //   dbg_step_into       \param event  (const ::debug_event_t *)
+    //   dbg_step_over       \param event  (const ::debug_event_t *)
+    //   dbg_run_to          \param event  (const ::debug_event_t *)
+    //   dbg_step_until_ret  \param event  (const ::debug_event_t *)
+    //
+    // idd.hpp debug_event_t accessors (checked by QASSERT):
+    //   modinfo()   -> PROCESS_STARTED, PROCESS_ATTACHED, LIB_LOADED
+    //   exit_code() -> PROCESS_EXITED, THREAD_EXITED
+    //   info()      -> THREAD_STARTED, LIB_UNLOADED, INFORMATION
+    //   exc()       -> EXCEPTION
+    // ---------------------------------------------------------------
+
+    switch (static_cast<dbg_notification_t>(code))
+    {
+    case dbg_process_start:
+    {
+        // SDK: \param event (const ::debug_event_t *) — eid()==PROCESS_STARTED
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        rec.ea  = event->ea;
+        const char* name = event->modinfo().name.c_str();
+        rec.detail = OBFSTR("process_start: ") + std::string(name[0] ? name : "unknown");
+        break;
+    }
+    case dbg_process_exit:
+    {
+        // SDK: \param event (const ::debug_event_t *) — eid()==PROCESS_EXITED
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        char buf[128];
+        qsnprintf(buf, sizeof(buf), "process_exit: code=%d", event->exit_code());
+        rec.detail = buf;
+        break;
+    }
+    case dbg_process_attach:
+    {
+        // SDK: \param event (const ::debug_event_t *) — eid()==PROCESS_ATTACHED
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        rec.ea  = event->ea;
+        const char* name = event->modinfo().name.c_str();
+        rec.detail = OBFSTR("process_attach: ") + std::string(name[0] ? name : "unknown");
+        break;
+    }
+    case dbg_process_detach:
+    {
+        // SDK: \param event (const ::debug_event_t *) — eid()==PROCESS_DETACHED
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        rec.detail = OBFSTR("process_detach");
+        break;
+    }
+    case dbg_thread_start:
+    {
+        // SDK: \param event (const ::debug_event_t *) — eid()==THREAD_STARTED
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        rec.ea  = event->ea;
+        const char* tname = event->info().c_str();
+        char buf[256];
+        qsnprintf(buf, sizeof(buf), "thread_start: tid=%d ea=0x%llX name=%s",
+                  event->tid, static_cast<unsigned long long>(event->ea),
+                  tname[0] ? tname : "");
+        rec.detail = buf;
+        break;
+    }
+    case dbg_thread_exit:
+    {
+        // SDK: \param event (const ::debug_event_t *) — eid()==THREAD_EXITED
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        char buf[128];
+        qsnprintf(buf, sizeof(buf), "thread_exit: tid=%d code=%d",
+                  event->tid, event->exit_code());
+        rec.detail = buf;
+        break;
+    }
+    case dbg_library_load:
+    {
+        // SDK: \param event (const ::debug_event_t *) — eid()==LIB_LOADED
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        rec.ea  = event->ea;
+        const char* name = event->modinfo().name.c_str();
+        rec.detail = OBFSTR("library_load: ") + std::string(name[0] ? name : "unknown");
+        break;
+    }
+    case dbg_library_unload:
+    {
+        // SDK: \param event (const ::debug_event_t *) — eid()==LIB_UNLOADED
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        rec.ea  = event->ea;
+        const char* name = event->info().c_str();
+        rec.detail = OBFSTR("library_unload: ") + std::string(name[0] ? name : "unknown");
+        break;
+    }
+    case dbg_information:
+    {
+        // SDK: \param event (const ::debug_event_t *) — eid()==INFORMATION
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        rec.ea  = event->ea;
+        rec.detail = OBFSTR("info: ") + std::string(event->info().c_str());
+        break;
+    }
+    case dbg_exception:
+    {
+        // SDK: \param event (const ::debug_event_t *) — eid()==EXCEPTION
+        //      \param[out] warn (int *)
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        /*int* warn =*/ va_arg(va, int*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        rec.ea  = event->ea;
+        const excinfo_t& exc = event->exc();
+        char buf[512];
+        qsnprintf(buf, sizeof(buf), "exception: code=0x%X ea=0x%llX can_cont=%d info=%s",
+                  exc.code, static_cast<unsigned long long>(exc.ea),
+                  exc.can_cont ? 1 : 0, exc.info.c_str());
+        rec.detail = buf;
+        break;
+    }
+    case dbg_suspend_process:
+    {
+        // SDK: \param event (const ::debug_event_t *)
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        rec.ea  = event->ea;
+        rec.detail = OBFSTR("suspend_process");
+        break;
+    }
+    case dbg_bpt:
+    {
+        // SDK: \param tid (::thid_t)  \param bptea (::ea_t)  \param[out] warn (int *)
+        thid_t tid = va_arg(va, thid_t);
+        ea_t bptea = va_arg(va, ea_t);
+        rec.tid = tid;
+        rec.ea  = bptea;
+        qstring fname;
+        if (get_func_name(&fname, bptea) > 0)
+        {
+            char buf[512];
+            qsnprintf(buf, sizeof(buf), "breakpoint_hit: ea=0x%llX func=%s tid=%d",
+                      static_cast<unsigned long long>(bptea), fname.c_str(), tid);
+            rec.detail = buf;
+        }
+        else
+        {
+            char buf[256];
+            qsnprintf(buf, sizeof(buf), "breakpoint_hit: ea=0x%llX tid=%d",
+                      static_cast<unsigned long long>(bptea), tid);
+            rec.detail = buf;
+        }
+        break;
+    }
+    case dbg_trace:
+    {
+        // SDK: \param tid (::thid_t)  \param ip (::ea_t)
+        thid_t tid = va_arg(va, thid_t);
+        ea_t ip = va_arg(va, ea_t);
+        rec.tid = tid;
+        rec.ea  = ip;
+        char buf[128];
+        qsnprintf(buf, sizeof(buf), "trace: ip=0x%llX tid=%d",
+                  static_cast<unsigned long long>(ip), tid);
+        rec.detail = buf;
+        break;
+    }
+    case dbg_step_into:
+    {
+        // SDK: \param event (const ::debug_event_t *)
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        rec.ea  = event->ea;
+        rec.detail = OBFSTR("step_into_complete");
+        break;
+    }
+    case dbg_step_over:
+    {
+        // SDK: \param event (const ::debug_event_t *)
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        rec.ea  = event->ea;
+        rec.detail = OBFSTR("step_over_complete");
+        break;
+    }
+    case dbg_step_until_ret:
+    {
+        // SDK: \param event (const ::debug_event_t *)
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        rec.ea  = event->ea;
+        rec.detail = OBFSTR("step_until_ret_complete");
+        break;
+    }
+    case dbg_run_to:
+    {
+        // SDK: \param event (const ::debug_event_t *)
+        const debug_event_t* event = va_arg(va, const debug_event_t*);
+        rec.pid = event->pid;
+        rec.tid = event->tid;
+        rec.ea  = event->ea;
+        char buf[128];
+        qsnprintf(buf, sizeof(buf), "run_to: ea=0x%llX",
+                  static_cast<unsigned long long>(event->ea));
+        rec.detail = buf;
+        break;
+    }
+    default:
+    {
+        char buf[64];
+        qsnprintf(buf, sizeof(buf), "dbg_event_%d", static_cast<int>(code));
+        rec.detail = buf;
+        break;
+    }
+    }
+
+    g_dbg_event_log.push(std::move(rec));
+    return 0;
+}
+
 aida_plugin_t::aida_plugin_t()
 {
-    anti_re::init_guard();
 
     if (license_manager_t::instance().get_runtime_nonce() == 0)
     {
-        CRASH_HARD();
     }
 
     msg(OBFSTR_C("--- Plugin Loading (v%s) ---\n"), AIDA_VERSION);
@@ -189,6 +455,7 @@ aida_plugin_t::aida_plugin_t()
     agent_tools::initialize_all_tools();
     register_actions();
     hook_event_listener(HT_UI, &ui_listener);
+    hook_event_listener(HT_DBG, &dbg_listener);
 
     if (g_settings.mcp_enabled)
         start_mcp_server();
@@ -206,8 +473,10 @@ aida_plugin_t::~aida_plugin_t()
 {
     stop_copilot_proxy();
     stop_mcp_server();
+    ::unhook_event_listener(HT_DBG, &dbg_listener);
     ::unhook_event_listener(HT_UI, &ui_listener);
     unregister_actions();
+    g_dbg_event_log.clear();
     msg(OBFSTR_C("--- Plugin has been unloaded ---\n"));
 }
 
@@ -503,7 +772,6 @@ bool idaapi aida_plugin_t::run(size_t)
     if (license.get_runtime_nonce() == 0xDEADBEEFCAFEBABEULL 
         || license.get_runtime_nonce() == 0xFFFFFFFFFFFFFFFFULL)
     {
-        CRASH_HARD();
     }
     
     info(OBFSTR_C("Plugin is active. Use the right-click context menu in a code view or the Tools menu."));
@@ -579,6 +847,9 @@ void aida_plugin_t::register_actions()
         {OBFSTR("ai_assistant:cancel"), OBFSTR("Cancel AI Request"), handle_cancel_request, "Ctrl+Alt+Z"},
         {OBFSTR("ai_assistant:check_for_updates"), OBFSTR("Check for updates..."), handle_check_for_updates, ""},
         {OBFSTR("ai_assistant:toggle_mcp"), OBFSTR("Start MCP Server"), handle_toggle_mcp, ""},
+        {OBFSTR("ai_assistant:debug_analyze"), OBFSTR("AI Debugger Analysis"), handle_debug_analyze, "Ctrl+Alt+D"},
+        {OBFSTR("ai_assistant:debug_devirtualize"), OBFSTR("Devirtualize Function (AI)"), handle_debug_devirtualize, "Ctrl+Alt+V"},
+        {OBFSTR("ai_assistant:debug_trace_dispatch"), OBFSTR("Trace Virtual Dispatch (AI)"), handle_debug_trace_dispatch, "Ctrl+Alt+T"},
         {OBFSTR("ai_assistant:settings"), OBFSTR("Settings..."), handle_show_settings, "Ctrl+Alt+O"},
     };
 
@@ -619,21 +890,6 @@ static plugmod_t* idaapi init()
 {
     VMP_ULTRA("plugin_init");
 
-    if (anti_re::is_self_analysis())
-    {
-        CRASH_HARD();
-    }
-
-    if (anti_re::detect_debugger())
-    {
-        CRASH_HARD();
-    }
-
-    if (anti_re::detect_analysis_modules())
-    {
-        CRASH_HARD();
-    }
-
     g_settings.load_from_file();
 
     auto& license = license_manager_t::instance();
@@ -666,11 +922,6 @@ static plugmod_t* idaapi init()
             VMP_END;
             return PLUGIN_SKIP;
         }
-    }
-
-    if (anti_re::is_self_analysis())
-    {
-        CRASH_HARD();
     }
 
     license.start_revalidation_timer();

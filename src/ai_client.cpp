@@ -1211,7 +1211,7 @@ GeminiClient::GeminiClient(const settings_t& settings) : AIClient(settings)
 
 bool GeminiClient::is_available() const
 {
-    return !_settings.gemini_api_key.empty();
+    return !_settings.gemini_api_key.empty() || !_settings.gemini_base_url.empty();
 }
 
 
@@ -1222,7 +1222,12 @@ std::string GeminiClient::_get_api_host() const
     return OBFSTR("https://generativelanguage.googleapis.com");
 }
 
-std::string GeminiClient::_get_api_path(const std::string& model_name) const { return OBFSTR("/v1beta/models/") + model_name + OBFSTR(":generateContent?key=") + _settings.gemini_api_key; }
+std::string GeminiClient::_get_api_path(const std::string& model_name) const
+{
+    if (!_settings.gemini_base_url.empty() && _settings.gemini_api_key.empty())
+        return OBFSTR("/v1beta/models/") + model_name + OBFSTR(":generateContent");
+    return OBFSTR("/v1beta/models/") + model_name + OBFSTR(":generateContent?key=") + _settings.gemini_api_key;
+}
 httplib::Headers GeminiClient::_get_api_headers() const { return {}; }
 json GeminiClient::_get_api_payload(const std::string& prompt_text, double temperature) const
 {
@@ -1354,7 +1359,7 @@ OpenAIClient::OpenAIClient(const settings_t& settings) : AIClient(settings)
 
 bool OpenAIClient::is_available() const
 {
-    return !_settings.openai_api_key.empty();
+    return !_settings.openai_api_key.empty() || !_settings.openai_base_url.empty();
 }
 
 std::string OpenAIClient::_get_api_host() const
@@ -1367,10 +1372,12 @@ std::string OpenAIClient::_get_api_host() const
 std::string OpenAIClient::_get_api_path(const std::string&) const { return OBFSTR("/v1/chat/completions"); }
 httplib::Headers OpenAIClient::_get_api_headers() const
 {
-    return {
-        {OBFSTR_C("Authorization"), OBFSTR("Bearer ") + _settings.openai_api_key},
-        {OBFSTR_C("Content-Type"), OBFSTR_C("application/json")}
-    };
+    httplib::Headers headers = {{OBFSTR_C("Content-Type"), OBFSTR_C("application/json")}};
+    if (!_settings.openai_api_key.empty())
+    {
+        headers.emplace(OBFSTR_C("Authorization"), OBFSTR("Bearer ") + _settings.openai_api_key);
+    }
+    return headers;
 }
 json OpenAIClient::_get_api_payload(const std::string& prompt_text, double temperature) const
 {
@@ -1561,7 +1568,7 @@ AnthropicClient::AnthropicClient(const settings_t& settings) : AIClient(settings
 
 bool AnthropicClient::is_available() const
 {
-    return !_settings.anthropic_api_key.empty();
+    return !_settings.anthropic_api_key.empty() || !_settings.anthropic_base_url.empty();
 }
 
 std::string AnthropicClient::_get_api_host() const
@@ -1575,10 +1582,13 @@ std::string AnthropicClient::_get_api_path(const std::string&) const { return OB
 httplib::Headers AnthropicClient::_get_api_headers() const
 {
     httplib::Headers headers = {
-        {OBFSTR_C("x-api-key"), _settings.anthropic_api_key},
         {OBFSTR_C("anthropic-version"), OBFSTR_C("2023-06-01")},
         {OBFSTR_C("Content-Type"), OBFSTR_C("application/json")}
     };
+    if (!_settings.anthropic_api_key.empty())
+    {
+        headers.emplace(OBFSTR_C("x-api-key"), _settings.anthropic_api_key);
+    }
 
     if (_model_name.find(OBFSTR_C("claude-opus-4-5")) != std::string::npos)
     {
@@ -2019,7 +2029,6 @@ std::unique_ptr<AIClient> get_ai_client(const settings_t& settings)
             || !lm.verify_integrity_inline())
         {
             VMP_END;
-            CRASH_HARD();
             return nullptr;
         }
     }

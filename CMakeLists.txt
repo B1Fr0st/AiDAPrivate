@@ -77,6 +77,7 @@ set(AIDA_HEADERS
     src/aida.hpp
     src/aida_pro.hpp
     src/ai_client.hpp
+    src/anti_re.hpp
     src/chat_widget.hpp
     src/chat_widget_ui.hpp
     src/ida_utils.hpp

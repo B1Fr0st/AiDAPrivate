@@ -121,6 +121,10 @@ const std::vector<std::string> settings_t::openrouter_models = {
 };
 
 const std::vector<std::string> settings_t::anthropic_models = {
+  OBFSTR("claude-opus-4-6"),
+  OBFSTR("claude-opus-4-6 (Max Effort)"),
+  OBFSTR("claude-opus-4-6 (Standard)"),
+  OBFSTR("claude-sonnet-4-6"),
   OBFSTR("claude-opus-4-5 (High Effort)"),
   OBFSTR("claude-opus-4-5 (Medium Effort)"),
   OBFSTR("claude-opus-4-5 (Low Effort)"),
@@ -491,7 +495,7 @@ void settings_t::load(aida_plugin_t* plugin_instance)
         msg(OBFSTR_C("Loaded settings from %s\n"), get_config_file().c_str());
     }
 
-    if (!api_provider.empty() && get_active_api_key().empty())
+    if (!api_provider.empty() && get_active_api_key().empty() && !has_custom_base_url())
     {
         prompt_for_api_key();
     }
@@ -505,10 +509,10 @@ bool settings_t::load_from_file()
 std::string settings_t::get_active_api_key() const
 {
     qstring provider = ida_utils::qstring_tolower(api_provider.c_str());
-    if (provider == OBFSTR_C("gemini")) return gemini_api_key;
-    if (provider == OBFSTR_C("openai")) return openai_api_key;
+    if (provider == OBFSTR_C("gemini")) return gemini_api_key.empty() ? gemini_base_url : gemini_api_key;
+    if (provider == OBFSTR_C("openai")) return openai_api_key.empty() ? openai_base_url : openai_api_key;
     if (provider == OBFSTR_C("openrouter")) return openrouter_api_key;
-    if (provider == OBFSTR_C("anthropic")) return anthropic_api_key;
+    if (provider == OBFSTR_C("anthropic")) return anthropic_api_key.empty() ? anthropic_base_url : anthropic_api_key;
     if (provider == OBFSTR_C("copilot")) return copilot_proxy_address;
     if (provider == OBFSTR_C("local llm")) return local_llm_base_url;
     return "";
@@ -627,9 +631,23 @@ int settings_t::get_active_context_window() const
     return get_model_context_window(model);
 }
 
+bool settings_t::has_custom_base_url() const
+{
+    qstring provider = ida_utils::qstring_tolower(api_provider.c_str());
+    if (provider == OBFSTR_C("gemini")) return !gemini_base_url.empty();
+    if (provider == OBFSTR_C("openai")) return !openai_base_url.empty();
+    if (provider == OBFSTR_C("anthropic")) return !anthropic_base_url.empty();
+    if (provider == OBFSTR_C("copilot")) return !copilot_proxy_address.empty();
+    if (provider == OBFSTR_C("local llm")) return !local_llm_base_url.empty();
+    return false;
+}
+
 void settings_t::prompt_for_api_key()
 {
     qstring provider = ida_utils::qstring_tolower(api_provider.c_str());
+
+    if (has_custom_base_url())
+        return;
 
     if (provider == OBFSTR_C("copilot"))
     {
