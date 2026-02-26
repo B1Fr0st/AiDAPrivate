@@ -6,7 +6,7 @@
 static bool ensure_licensed_and_ready(aida_plugin_t* plugin)
 {
     VMP_ULTRA("ensure_licensed");
-
+    ANTI_RE_GUARD();
     VERIFY_LICENSE_INLINE();
 
     auto& license = license_manager_t::instance();

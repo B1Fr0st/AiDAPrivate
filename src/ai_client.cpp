@@ -250,6 +250,7 @@ void AIClient::set_max_output_tokens(int tokens)
 
 void AIClient::_generate(const std::string& prompt_text, callback_t callback, double temperature, const qstring& request_type)
 {
+    ANTI_RE_GUARD();
     VERIFY_LICENSE_INLINE();
 
     if (!is_available())
@@ -923,6 +924,7 @@ void AIClient::fix_analysis(ea_t ea, callback_t callback)
 
 void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t callback)
 {
+    ANTI_RE_GUARD();
     VERIFY_LICENSE_INLINE();
 
     if (!is_available())
@@ -1055,6 +1057,7 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
                             const std::vector<std::pair<std::string, std::string>>& history,
                             callback_t callback)
 {
+    ANTI_RE_GUARD();
     VERIFY_LICENSE_INLINE();
 
     if (!is_available())
@@ -2014,6 +2017,7 @@ std::string LocalLLMClient::_extract_sse_content(const nlohmann::json& j) const
 std::unique_ptr<AIClient> get_ai_client(const settings_t& settings)
 {
     VMP_ULTRA("get_ai_client");
+    ANTI_RE_GUARD();
     VERIFY_LICENSE_INLINE();
 
     auto& lm = license_manager_t::instance();

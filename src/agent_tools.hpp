@@ -267,6 +267,23 @@ namespace analysis_tools
     void register_tools();
 }
 
+namespace driver_tools
+{
+    tool_result_t driver_connect(const nlohmann::json& params);
+    tool_result_t driver_status(const nlohmann::json& params);
+    tool_result_t driver_attach(const nlohmann::json& params);
+    tool_result_t driver_read_memory(const nlohmann::json& params);
+    tool_result_t driver_write_memory(const nlohmann::json& params);
+    tool_result_t driver_dump_module(const nlohmann::json& params);
+    tool_result_t driver_scan_pattern(const nlohmann::json& params);
+    tool_result_t driver_read_string(const nlohmann::json& params);
+    tool_result_t driver_read_pointer_chain(const nlohmann::json& params);
+    tool_result_t driver_enumerate_modules(const nlohmann::json& params);
+    tool_result_t driver_dump_to_idb(const nlohmann::json& params);
+    tool_result_t driver_bypass_and_dump(const nlohmann::json& params);
+    void register_tools();
+}
+
 namespace helpers
 {
     std::optional<ea_t> parse_address(const std::string& addr_str);

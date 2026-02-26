@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 
 project(AiDA
     VERSION   1.2.8
-    LANGUAGES CXX
+    LANGUAGES CXX ASM_MASM
 )
 
 set(CMAKE_CXX_STANDARD 17)
@@ -68,7 +68,14 @@ set(AIDA_SOURCES
     src/mcp_server.cpp
     src/settings.cpp
     src/ui.cpp
+    driver/comm.cpp
 )
+
+# --- x64 indirect syscall stub (MASM) ---
+if(WIN32)
+    set(AIDA_ASM_SOURCES driver/syscall.asm)
+    set_source_files_properties(${AIDA_ASM_SOURCES} PROPERTIES LANGUAGE ASM_MASM)
+endif()
 
 set(AIDA_HEADERS
     src/actions.hpp
@@ -89,7 +96,15 @@ set(AIDA_HEADERS
     src/ui.hpp
 )
 
-add_library(AiDA SHARED ${AIDA_SOURCES} ${AIDA_HEADERS})
+add_library(AiDA SHARED ${AIDA_SOURCES} ${AIDA_HEADERS} ${AIDA_ASM_SOURCES})
+
+# --- Export control: only export the PLUGIN symbol required by IDA ---
+# Reference: IDA SDK loader.hpp line 643:
+#   idaman ida_module_data plugin_t PLUGIN;
+# IDA's plugin loader searches for "PLUGIN" by name. All other exports are hidden.
+if(WIN32)
+    target_sources(AiDA PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/AiDA.def")
+endif()
 
 set_target_properties(AiDA PROPERTIES
     OUTPUT_NAME "AiDA"
@@ -109,6 +124,7 @@ target_include_directories(AiDA PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/libs"
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/VMProtect3.9.4/Include/C"
+    "${CMAKE_CURRENT_SOURCE_DIR}/driver"
 )
 
 target_compile_definitions(AiDA PRIVATE
@@ -171,12 +187,41 @@ if(WIN32)
         /Gy
         /Gw
         /Oi
+        /Ob2
+        /GL
         /wd4946
         /wd4826
         /wd4628
         /wd4718
         /wd5219
         /wd5240
+    )
+
+    # --- Anti-RE linker hardening ---
+    # /OPT:REF,ICF removes unreferenced code and folds identical COMDATs.
+    # /PDBALTPATH strips the real PDB path from the binary.
+    # /RELEASE sets the checksum in the PE header.
+    # /LTCG enables link-time code generation for whole-program optimization,
+    #   which merges and inlines across translation units, reducing visible functions.
+    #
+    # NOTE: /MERGE:.pdata=.text is NOT used because .pdata contains x64 SEH
+    # unwind data. The Windows loader resolves the Exception Directory
+    # (IMAGE_DIRECTORY_ENTRY_EXCEPTION, data directory index 3) to locate
+    # .pdata for stack unwinding. Merging it into .text changes the section
+    # characteristics from IMAGE_SCN_MEM_READ to IMAGE_SCN_MEM_EXECUTE|READ,
+    # which corrupts unwind resolution and crashes during LoadLibrary.
+    #
+    # NOTE: /MERGE:.rdata=.text is NOT used because merging read-only data
+    # into an executable section changes memory protection attributes.
+    # The loader sets .text pages to PAGE_EXECUTE_READ but .rdata expects
+    # PAGE_READONLY. This can trigger DEP violations or corrupt relocations
+    # during DLL initialization, causing crashes at LoadLibrary time.
+    target_link_options(AiDA PRIVATE
+        /OPT:REF,ICF
+        /RELEASE
+        /LTCG
+        /PDBALTPATH:none
+        /EMITTOOLVERSIONINFO:NO
     )
 
     set(OPENSSL_USE_STATIC_LIBS TRUE)
@@ -342,5 +387,26 @@ elseif(UNIX)
         else()
             message(WARNING "Qt6 headers not found on Linux. Set QTDIR or install qt6-base-dev.")
         endif()
+    endif()
+    
+endif()
+
+# --- Post-build PE protection step ---
+# Runs pe_protect.py to strip debug info, randomize section names,
+# wipe non-essential exports, and add junk overlay data.
+# This makes static analysis in IDA/Ghidra/BinaryNinja extremely difficult.
+# Must be outside the platform if/elseif block so it actually runs on WIN32.
+if(WIN32)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_FOUND)
+        add_custom_command(TARGET AiDA POST_BUILD
+            COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/pe_protect.py"
+                    "$<TARGET_FILE:AiDA>"
+            COMMENT "Applying PE protection transformations to AiDA.dll..."
+            VERBATIM
+        )
+    else()
+        message(WARNING "Python3 not found. Post-build PE protection will be skipped.")
     endif()
 endif()

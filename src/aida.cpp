@@ -1,11 +1,12 @@
 #include "aida_pro.hpp"
-#include "anti_re.hpp"
 
 #ifdef __NT__
 #include <delayimp.h>
-#include <winternl.h>
 #endif
 
+// --- Delay-load hooks for VMProtectSDK64.dll ---
+// These resolve the VMP DLL from the same directory as AiDA.dll,
+// and provide safe stubs if the DLL is not found.
 #ifdef __NT__
 static FARPROC WINAPI aida_delay_load_notify(
     unsigned        dliNotify,
@@ -89,74 +90,14 @@ static FARPROC WINAPI aida_delay_load_failure(
 extern "C" const PfnDliHook __pfnDliFailureHook2 = aida_delay_load_failure;
 #endif
 
-#ifdef __NT__
-static void NTAPI aida_tls_callback(PVOID /*DllHandle*/,
-                                     DWORD  dwReason,
-                                     PVOID  /*Reserved*/)
-{
-    if (dwReason != DLL_PROCESS_ATTACH)
-        return;
-
-#ifdef _WIN64
-    PPEB peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
-#else
-    PPEB peb = reinterpret_cast<PPEB>(__readfsdword(0x30));
-#endif
-    if (peb && peb->BeingDebugged)
-    {
-        volatile int* p = nullptr;
-        *p = 0x41694441;
-        TerminateProcess(GetCurrentProcess(), 0xDEADu);
-    }
-
-    if (peb)
-    {
-#ifdef _WIN64
-        constexpr size_t kNtGlobalFlagOffset = 0xBC;
-#else
-        constexpr size_t kNtGlobalFlagOffset = 0x68;
-#endif
-        ULONG flags = *reinterpret_cast<ULONG*>(
-            reinterpret_cast<BYTE*>(peb) + kNtGlobalFlagOffset);
-        if (flags & 0x70)
-        {
-            volatile int* p = nullptr;
-            *p = 0x41694441;
-            TerminateProcess(GetCurrentProcess(), 0xDEADu);
-        }
-    }
-}
-
-#ifdef _WIN64
-#pragma comment(linker, "/INCLUDE:_tls_used")
-#else
-#pragma comment(linker, "/INCLUDE:__tls_used")
-#endif
-#pragma section(".CRT$XLB", read)
-__declspec(allocate(".CRT$XLB"))
-    PIMAGE_TLS_CALLBACK p_aida_tls_cb = aida_tls_callback;
-#endif
-
+// --- Minimal DllMain: only DisableThreadLibraryCalls ---
 #ifdef __NT__
 extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL,
                                 DWORD     fdwReason,
                                 LPVOID    /*lpvReserved*/)
 {
     if (fdwReason == DLL_PROCESS_ATTACH)
-    {
-        wchar_t self_path[MAX_PATH] = {};
-        if (GetModuleFileNameW(hinstDLL, self_path, MAX_PATH))
-        {
-            wchar_t* sep = wcsrchr(self_path, L'\\');
-            if (sep)
-            {
-                wcscpy_s(sep + 1,
-                         MAX_PATH - static_cast<size_t>(sep + 1 - self_path),
-                         L"VMProtectSDK64.dll");
-                LoadLibraryW(self_path);
-            }
-        }
-    }
+        DisableThreadLibraryCalls(hinstDLL);
     return TRUE;
 }
 #endif
@@ -188,43 +129,10 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     rec.pid = 0;
     rec.tid = 0;
 
-    // ---------------------------------------------------------------
-    // IDA SDK 9.2 dbg.hpp parameter signatures (verbatim from SDK):
-    //
-    //   dbg_process_start   \param event  (const ::debug_event_t *)
-    //   dbg_process_exit    \param event  (const ::debug_event_t *)
-    //   dbg_process_attach  \param event  (const ::debug_event_t *)
-    //   dbg_process_detach  \param event  (const ::debug_event_t *)
-    //   dbg_thread_start    \param event  (const ::debug_event_t *)
-    //   dbg_thread_exit     \param event  (const ::debug_event_t *)
-    //   dbg_library_load    \param event  (const ::debug_event_t *)
-    //   dbg_library_unload  \param event  (const ::debug_event_t *)
-    //   dbg_information     \param event  (const ::debug_event_t *)
-    //   dbg_exception       \param event  (const ::debug_event_t *)
-    //                       \param[out] warn  (int *)
-    //   dbg_suspend_process \param event  (const ::debug_event_t *)
-    //   dbg_bpt             \param tid    (::thid_t)
-    //                       \param bptea  (::ea_t)
-    //                       \param[out] warn  (int *)
-    //   dbg_trace           \param tid    (::thid_t)
-    //                       \param ip     (::ea_t)
-    //   dbg_step_into       \param event  (const ::debug_event_t *)
-    //   dbg_step_over       \param event  (const ::debug_event_t *)
-    //   dbg_run_to          \param event  (const ::debug_event_t *)
-    //   dbg_step_until_ret  \param event  (const ::debug_event_t *)
-    //
-    // idd.hpp debug_event_t accessors (checked by QASSERT):
-    //   modinfo()   -> PROCESS_STARTED, PROCESS_ATTACHED, LIB_LOADED
-    //   exit_code() -> PROCESS_EXITED, THREAD_EXITED
-    //   info()      -> THREAD_STARTED, LIB_UNLOADED, INFORMATION
-    //   exc()       -> EXCEPTION
-    // ---------------------------------------------------------------
-
     switch (static_cast<dbg_notification_t>(code))
     {
     case dbg_process_start:
     {
-        // SDK: \param event (const ::debug_event_t *) — eid()==PROCESS_STARTED
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         rec.pid = event->pid;
         rec.tid = event->tid;
@@ -235,7 +143,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_process_exit:
     {
-        // SDK: \param event (const ::debug_event_t *) — eid()==PROCESS_EXITED
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         rec.pid = event->pid;
         rec.tid = event->tid;
@@ -246,7 +153,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_process_attach:
     {
-        // SDK: \param event (const ::debug_event_t *) — eid()==PROCESS_ATTACHED
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         rec.pid = event->pid;
         rec.tid = event->tid;
@@ -257,7 +163,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_process_detach:
     {
-        // SDK: \param event (const ::debug_event_t *) — eid()==PROCESS_DETACHED
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         rec.pid = event->pid;
         rec.tid = event->tid;
@@ -266,7 +171,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_thread_start:
     {
-        // SDK: \param event (const ::debug_event_t *) — eid()==THREAD_STARTED
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         rec.pid = event->pid;
         rec.tid = event->tid;
@@ -281,7 +185,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_thread_exit:
     {
-        // SDK: \param event (const ::debug_event_t *) — eid()==THREAD_EXITED
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         rec.pid = event->pid;
         rec.tid = event->tid;
@@ -293,7 +196,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_library_load:
     {
-        // SDK: \param event (const ::debug_event_t *) — eid()==LIB_LOADED
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         rec.pid = event->pid;
         rec.tid = event->tid;
@@ -304,7 +206,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_library_unload:
     {
-        // SDK: \param event (const ::debug_event_t *) — eid()==LIB_UNLOADED
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         rec.pid = event->pid;
         rec.tid = event->tid;
@@ -315,7 +216,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_information:
     {
-        // SDK: \param event (const ::debug_event_t *) — eid()==INFORMATION
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         rec.pid = event->pid;
         rec.tid = event->tid;
@@ -325,8 +225,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_exception:
     {
-        // SDK: \param event (const ::debug_event_t *) — eid()==EXCEPTION
-        //      \param[out] warn (int *)
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         /*int* warn =*/ va_arg(va, int*);
         rec.pid = event->pid;
@@ -342,7 +240,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_suspend_process:
     {
-        // SDK: \param event (const ::debug_event_t *)
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         rec.pid = event->pid;
         rec.tid = event->tid;
@@ -352,7 +249,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_bpt:
     {
-        // SDK: \param tid (::thid_t)  \param bptea (::ea_t)  \param[out] warn (int *)
         thid_t tid = va_arg(va, thid_t);
         ea_t bptea = va_arg(va, ea_t);
         rec.tid = tid;
@@ -376,7 +272,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_trace:
     {
-        // SDK: \param tid (::thid_t)  \param ip (::ea_t)
         thid_t tid = va_arg(va, thid_t);
         ea_t ip = va_arg(va, ea_t);
         rec.tid = tid;
@@ -389,7 +284,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_step_into:
     {
-        // SDK: \param event (const ::debug_event_t *)
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         rec.pid = event->pid;
         rec.tid = event->tid;
@@ -399,7 +293,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_step_over:
     {
-        // SDK: \param event (const ::debug_event_t *)
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         rec.pid = event->pid;
         rec.tid = event->tid;
@@ -409,7 +302,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_step_until_ret:
     {
-        // SDK: \param event (const ::debug_event_t *)
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         rec.pid = event->pid;
         rec.tid = event->tid;
@@ -419,7 +311,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     }
     case dbg_run_to:
     {
-        // SDK: \param event (const ::debug_event_t *)
         const debug_event_t* event = va_arg(va, const debug_event_t*);
         rec.pid = event->pid;
         rec.tid = event->tid;
@@ -445,7 +336,6 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
 
 aida_plugin_t::aida_plugin_t()
 {
-
     if (license_manager_t::instance().get_runtime_nonce() == 0)
     {
     }
@@ -760,7 +650,7 @@ void aida_plugin_t::check_for_updates()
 bool idaapi aida_plugin_t::run(size_t)
 {
     VMP_MUT("plugin_run");
-    
+
     auto& license = license_manager_t::instance();
     if (!license.is_valid() || license.get_runtime_nonce() == 0)
     {
@@ -932,69 +822,12 @@ static plugmod_t* idaapi init()
     return new aida_plugin_t();
 }
 
-static char _p_comment_buf[128] = {};
-static char _p_help_buf[128]    = {};
-static char _p_name_buf[64]     = {};
-
-#ifdef __NT__
-#pragma section(".CRT$XIU", read)
-static void __cdecl _aida_init_plugin_strings()
-{
-    {
-        std::string s = OBFSTR("AI-powered game reversing assistant");
-        size_t n = (s.size() < sizeof(_p_comment_buf) - 1) ? s.size() : sizeof(_p_comment_buf) - 1;
-        std::memcpy(_p_comment_buf, s.c_str(), n);
-        _p_comment_buf[n] = '\0';
-
-        volatile char* vs = &s[0];
-        for (size_t i = 0; i < s.size(); ++i) vs[i] = '\0';
-    }
-    {
-        std::string s = OBFSTR("Right-click in code views or use the menu");
-        size_t n = (s.size() < sizeof(_p_help_buf) - 1) ? s.size() : sizeof(_p_help_buf) - 1;
-        std::memcpy(_p_help_buf, s.c_str(), n);
-        _p_help_buf[n] = '\0';
-
-        volatile char* vs = &s[0];
-        for (size_t i = 0; i < s.size(); ++i) vs[i] = '\0';
-    }
-    {
-        std::string s = OBFSTR("AI Assistant");
-        size_t n = (s.size() < sizeof(_p_name_buf) - 1) ? s.size() : sizeof(_p_name_buf) - 1;
-        std::memcpy(_p_name_buf, s.c_str(), n);
-        _p_name_buf[n] = '\0';
-
-        volatile char* vs = &s[0];
-        for (size_t i = 0; i < s.size(); ++i) vs[i] = '\0';
-    }
-}
-__declspec(allocate(".CRT$XIU"))
-static decltype(&_aida_init_plugin_strings) _p_init_strings = _aida_init_plugin_strings;
-#else
-__attribute__((constructor(101)))
-static void _aida_init_plugin_strings()
-{
-    {
-        std::string s = OBFSTR("AI-powered game reversing assistant");
-        size_t n = (s.size() < sizeof(_p_comment_buf) - 1) ? s.size() : sizeof(_p_comment_buf) - 1;
-        std::memcpy(_p_comment_buf, s.c_str(), n);
-        _p_comment_buf[n] = '\0';
-    }
-    {
-        std::string s = OBFSTR("Right-click in code views or use the menu");
-        size_t n = (s.size() < sizeof(_p_help_buf) - 1) ? s.size() : sizeof(_p_help_buf) - 1;
-        std::memcpy(_p_help_buf, s.c_str(), n);
-        _p_help_buf[n] = '\0';
-    }
-    {
-        std::string s = OBFSTR("AI Assistant");
-        size_t n = (s.size() < sizeof(_p_name_buf) - 1) ? s.size() : sizeof(_p_name_buf) - 1;
-        std::memcpy(_p_name_buf, s.c_str(), n);
-        _p_name_buf[n] = '\0';
-    }
-}
-#endif
-
+// IDA SDK loader.hpp line 642:
+//   idaman ida_module_data plugin_t PLUGIN;
+// IDA SDK loader.hpp line 577-634:
+//   class plugin_t { ... const char *comment; const char *help;
+//   const char *wanted_name; const char *wanted_hotkey; };
+// Plain string literals are safe — no CRT initializer needed.
 plugin_t PLUGIN =
 {
   IDP_INTERFACE_VERSION,
@@ -1002,8 +835,8 @@ plugin_t PLUGIN =
   init,
   nullptr,
   nullptr,
-  _p_comment_buf,
-  _p_help_buf,
-  _p_name_buf,
+  "AI-powered reversing assistant",
+  "Right-click in code views or use the menu",
+  "AI Assistant",
   ""
 };

@@ -27,6 +27,10 @@
 !/tools/
 !/tools/pe_protect.py
 
+# 9. Allow driver folder
+!/driver/
+!/driver/**
+
 # 8. Hard Exclusions (Noise/Binary/Build artifacts)
 **/node_modules/**
 **/build/**

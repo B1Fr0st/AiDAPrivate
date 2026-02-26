@@ -1,0 +1,11 @@
+; AiDA.def - Module definition file
+; Only export the PLUGIN symbol required by IDA's plugin loader.
+; All other symbols are hidden to minimize the attack surface for
+; static analysis in IDA Pro, Ghidra, and Binary Ninja.
+;
+; Reference: IDA SDK loader.hpp line 643:
+;   idaman ida_module_data plugin_t PLUGIN;
+; IDA's plugin loader searches for the "PLUGIN" export by name.
+
+EXPORTS
+    PLUGIN DATA

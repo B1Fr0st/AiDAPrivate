@@ -1,4 +1,5 @@
 #include "aida_pro.hpp"
+#include "vmp.hpp"
 
 static constexpr uint8_t CFG_OBF_KEY[] = {
     0xA3, 0x7B, 0x1E, 0xD4, 0x5F, 0x92, 0xC8, 0x06,
@@ -8,8 +9,12 @@ static constexpr const char CFG_OBF_PREFIX[] = "enc1:";
 
 static std::string obfuscate_key(const std::string& plain)
 {
+    VMP_VIRT("obf_key");
     if (plain.empty())
+    {
+        VMP_END;
         return plain;
+    }
 
     std::string out;
     out.reserve(plain.size() * 2 + sizeof(CFG_OBF_PREFIX));
@@ -22,16 +27,24 @@ static std::string obfuscate_key(const std::string& plain)
         qsnprintf(hex, sizeof(hex), "%02x", b);
         out += hex;
     }
+    VMP_END;
     return out;
 }
 
 static std::string deobfuscate_key(const std::string& encoded)
 {
+    VMP_VIRT("deobf_key");
     if (encoded.empty())
+    {
+        VMP_END;
         return encoded;
+    }
 
     if (encoded.compare(0, sizeof(CFG_OBF_PREFIX) - 1, CFG_OBF_PREFIX) != 0)
+    {
+        VMP_END;
         return encoded;
+    }
 
     std::string hex_part = encoded.substr(sizeof(CFG_OBF_PREFIX) - 1);
     std::string out;
@@ -43,6 +56,7 @@ static std::string deobfuscate_key(const std::string& encoded)
         b ^= CFG_OBF_KEY[(i / 2) % sizeof(CFG_OBF_KEY)];
         out.push_back(static_cast<char>(b));
     }
+    VMP_END;
     return out;
 }
 
@@ -508,14 +522,23 @@ bool settings_t::load_from_file()
 
 std::string settings_t::get_active_api_key() const
 {
+    VMP_MUT("get_active_key");
+    std::string result;
     qstring provider = ida_utils::qstring_tolower(api_provider.c_str());
-    if (provider == OBFSTR_C("gemini")) return gemini_api_key.empty() ? gemini_base_url : gemini_api_key;
-    if (provider == OBFSTR_C("openai")) return openai_api_key.empty() ? openai_base_url : openai_api_key;
-    if (provider == OBFSTR_C("openrouter")) return openrouter_api_key;
-    if (provider == OBFSTR_C("anthropic")) return anthropic_api_key.empty() ? anthropic_base_url : anthropic_api_key;
-    if (provider == OBFSTR_C("copilot")) return copilot_proxy_address;
-    if (provider == OBFSTR_C("local llm")) return local_llm_base_url;
-    return "";
+    if (provider == OBFSTR_C("gemini"))
+        result = gemini_api_key.empty() ? gemini_base_url : gemini_api_key;
+    else if (provider == OBFSTR_C("openai"))
+        result = openai_api_key.empty() ? openai_base_url : openai_api_key;
+    else if (provider == OBFSTR_C("openrouter"))
+        result = openrouter_api_key;
+    else if (provider == OBFSTR_C("anthropic"))
+        result = anthropic_api_key.empty() ? anthropic_base_url : anthropic_api_key;
+    else if (provider == OBFSTR_C("copilot"))
+        result = copilot_proxy_address;
+    else if (provider == OBFSTR_C("local llm"))
+        result = local_llm_base_url;
+    VMP_END;
+    return result;
 }
 
 int settings_t::get_model_context_window(const std::string& model_name)

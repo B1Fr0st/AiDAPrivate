@@ -13,6 +13,7 @@
 #define VMP_IS_DEBUGGER(check_kernel)  (VMProtectIsDebuggerPresent(check_kernel) != 0)
 #define VMP_IS_VIRTUAL_MACHINE         (VMProtectIsVirtualMachinePresent() != 0)
 #define VMP_IS_PROTECTED               (VMProtectIsProtected() != 0)
+#define VMP_IS_VALID_CRC               (VMProtectIsValidImageCRC() != 0)
 
 #define VMP_STR_A(s)    VMProtectDecryptStringA(s)
 #define VMP_STR_W(s)    VMProtectDecryptStringW(s)
@@ -31,6 +32,7 @@
 #define VMP_IS_DEBUGGER(check_kernel)  (false)
 #define VMP_IS_VIRTUAL_MACHINE         (false)
 #define VMP_IS_PROTECTED               (false)
+#define VMP_IS_VALID_CRC               (true)
 
 #define VMP_STR_A(s)    (s)
 #define VMP_STR_W(s)    (s)

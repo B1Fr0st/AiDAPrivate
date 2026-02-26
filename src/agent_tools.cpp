@@ -1,5 +1,6 @@
 #include "aida_pro.hpp"
 #include <allins.hpp>
+#include "../driver/comm.h"
 
 using json = nlohmann::json;
 
@@ -5678,6 +5679,1120 @@ void register_tools()
 
 }
 
+namespace analysis_tools
+{
+
+tool_result_t detect_obfuscation_patterns(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* pfn = get_func(ea);
+    if (!pfn)
+        return tool_result_t::error(OBFSTR("No function at ") + helpers::format_address(ea));
+
+    size_t scan_size = params.value("scan_size", 0);
+    ea_t scan_start = pfn->start_ea;
+    ea_t scan_end   = pfn->end_ea;
+    if (scan_size > 0)
+        scan_end = std::min(scan_start + static_cast<ea_t>(scan_size), pfn->end_ea);
+
+    json result;
+    result["function"] = helpers::get_name_or_address(pfn->start_ea);
+    result["start"]    = helpers::format_address(scan_start);
+    result["end"]      = helpers::format_address(scan_end);
+
+    json patterns = json::array();
+    int opaque_predicates = 0;
+    int dead_code_blocks  = 0;
+    int junk_sequences    = 0;
+    int indirect_jumps    = 0;
+    int self_modifying    = 0;
+    int stack_manip       = 0;
+
+    ea_t cur = scan_start;
+    ea_t prev_ea = BADADDR;
+    int nop_run = 0;
+
+    while (cur < scan_end && cur != BADADDR)
+    {
+        insn_t insn;
+        int len = decode_insn(&insn, cur);
+        if (len <= 0)
+        {
+            cur = next_head(cur, scan_end);
+            if (cur == BADADDR) break;
+            continue;
+        }
+
+        if (insn.itype == NN_nop)
+        {
+            ++nop_run;
+            if (nop_run == 4)
+            {
+                ++junk_sequences;
+                json p;
+                p["type"]    = OBFSTR("nop_sled");
+                p["address"] = helpers::format_address(cur - 3);
+                p["note"]    = OBFSTR("4+ consecutive NOPs suggest junk insertion");
+                patterns.push_back(std::move(p));
+            }
+        }
+        else
+        {
+            nop_run = 0;
+        }
+
+        if (prev_ea != BADADDR && (insn.itype == NN_jz || insn.itype == NN_jnz ||
+            insn.itype == NN_jbe || insn.itype == NN_ja))
+        {
+            insn_t prev_insn;
+            if (decode_insn(&prev_insn, prev_ea) > 0)
+            {
+                bool is_opaque = false;
+                if (prev_insn.itype == NN_xor && prev_insn.ops[0].type == o_reg &&
+                    prev_insn.ops[1].type == o_reg && prev_insn.ops[0].reg == prev_insn.ops[1].reg)
+                    is_opaque = true;
+                if (prev_insn.itype == NN_test && prev_insn.ops[0].type == o_reg &&
+                    prev_insn.ops[1].type == o_reg && prev_insn.ops[0].reg == prev_insn.ops[1].reg)
+                    is_opaque = true;
+
+                if (is_opaque)
+                {
+                    ++opaque_predicates;
+                    json p;
+                    p["type"]    = OBFSTR("opaque_predicate");
+                    p["address"] = helpers::format_address(cur);
+                    qstring dis;
+                    generate_disasm_line(&dis, cur, GENDSM_FORCE_CODE);
+                    tag_remove(&dis);
+                    p["instruction"] = dis.c_str();
+                    patterns.push_back(std::move(p));
+                }
+            }
+        }
+
+        if (insn.itype == NN_jmpni || insn.itype == NN_jmpfi)
+        {
+            ++indirect_jumps;
+            json p;
+            p["type"]    = OBFSTR("indirect_jump");
+            p["address"] = helpers::format_address(cur);
+            qstring dis;
+            generate_disasm_line(&dis, cur, GENDSM_FORCE_CODE);
+            tag_remove(&dis);
+            p["instruction"] = dis.c_str();
+            patterns.push_back(std::move(p));
+        }
+
+        if (insn.itype == NN_push && prev_ea != BADADDR)
+        {
+            ea_t next = cur + len;
+            insn_t next_insn;
+            if (next < scan_end && decode_insn(&next_insn, next) > 0 && next_insn.itype == NN_retn)
+            {
+                ++stack_manip;
+                json p;
+                p["type"]    = OBFSTR("push_ret_redirect");
+                p["address"] = helpers::format_address(cur);
+                p["note"]    = OBFSTR("push+ret pattern used as indirect jump (anti-disassembly)");
+                patterns.push_back(std::move(p));
+            }
+        }
+
+        prev_ea = cur;
+        cur += len;
+    }
+
+    func_item_iterator_t fii(pfn);
+    std::set<ea_t> reachable;
+    for (bool ok = fii.first(); ok; ok = fii.next_head())
+    {
+        ea_t item = fii.current();
+        xrefblk_t xb;
+        bool has_incoming = false;
+        if (item == pfn->start_ea)
+            has_incoming = true;
+        else
+        {
+            for (bool xok = xb.first_to(item, XREF_ALL); xok; xok = xb.next_to())
+            {
+                if (xb.iscode && func_contains(pfn, xb.from))
+                {
+                    has_incoming = true;
+                    break;
+                }
+            }
+        }
+        if (!has_incoming)
+        {
+            ++dead_code_blocks;
+            if (dead_code_blocks <= 10)
+            {
+                json p;
+                p["type"]    = OBFSTR("dead_code");
+                p["address"] = helpers::format_address(item);
+                p["note"]    = OBFSTR("No incoming code xrefs within function - possibly dead/junk code");
+                patterns.push_back(std::move(p));
+            }
+        }
+    }
+
+    result["patterns"]           = std::move(patterns);
+    result["opaque_predicates"]  = opaque_predicates;
+    result["dead_code_blocks"]   = dead_code_blocks;
+    result["junk_sequences"]     = junk_sequences;
+    result["indirect_jumps"]     = indirect_jumps;
+    result["stack_manipulation"] = stack_manip;
+
+    int score = 0;
+    if (opaque_predicates > 0) score += std::min(opaque_predicates * 10, 25);
+    if (dead_code_blocks > 2)  score += 15;
+    if (junk_sequences > 0)    score += std::min(junk_sequences * 8, 20);
+    if (indirect_jumps > 0)    score += std::min(indirect_jumps * 15, 25);
+    if (stack_manip > 0)       score += 15;
+    result["obfuscation_score_pct"] = std::min(score, 100);
+
+    return tool_result_t::ok(OBFSTR("Obfuscation pattern detection complete"), result);
+}
+
+tool_result_t analyze_control_flow(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* pfn = get_func(ea);
+    if (!pfn)
+        return tool_result_t::error(OBFSTR("No function at ") + helpers::format_address(ea));
+
+    json result;
+    result["function"] = helpers::get_name_or_address(pfn->start_ea);
+    result["start"]    = helpers::format_address(pfn->start_ea);
+    result["end"]      = helpers::format_address(pfn->end_ea);
+    result["size"]     = pfn->end_ea - pfn->start_ea;
+
+    json blocks = json::array();
+    int block_count = 0;
+    int edge_count  = 0;
+    int back_edges  = 0;
+    std::set<ea_t> block_starts;
+    block_starts.insert(pfn->start_ea);
+
+    func_item_iterator_t fii(pfn);
+    for (bool ok = fii.first(); ok; ok = fii.next_head())
+    {
+        ea_t item = fii.current();
+        insn_t insn;
+        if (decode_insn(&insn, item) <= 0)
+            continue;
+
+        if (is_basic_block_end(insn, false))
+        {
+            ea_t fall = item + insn.size;
+            if (fall < pfn->end_ea && func_contains(pfn, fall))
+                block_starts.insert(fall);
+
+            xrefblk_t xb;
+            for (bool xok = xb.first_from(item, XREF_ALL); xok; xok = xb.next_from())
+            {
+                if (xb.iscode && func_contains(pfn, xb.to))
+                    block_starts.insert(xb.to);
+            }
+        }
+    }
+
+    for (ea_t bs : block_starts)
+    {
+        ++block_count;
+        ea_t block_end = pfn->end_ea;
+        auto it = block_starts.upper_bound(bs);
+        if (it != block_starts.end())
+            block_end = *it;
+
+        int insn_count = 0;
+        ea_t last_insn = bs;
+        for (ea_t a = bs; a < block_end && a != BADADDR;)
+        {
+            insn_t insn;
+            int len = decode_insn(&insn, a);
+            if (len <= 0) break;
+            ++insn_count;
+            last_insn = a;
+            a += len;
+        }
+
+        json blk;
+        blk["start"]       = helpers::format_address(bs);
+        blk["end"]         = helpers::format_address(block_end);
+        blk["instructions"] = insn_count;
+
+        json successors = json::array();
+        xrefblk_t xb;
+        for (bool xok = xb.first_from(last_insn, XREF_ALL); xok; xok = xb.next_from())
+        {
+            if (xb.iscode && func_contains(pfn, xb.to))
+            {
+                ++edge_count;
+                successors.push_back(helpers::format_address(xb.to));
+                if (xb.to <= bs)
+                    ++back_edges;
+            }
+        }
+        
+        ea_t fall = last_insn;
+        insn_t last;
+        if (decode_insn(&last, last_insn) > 0)
+        {
+            fall = last_insn + last.size;
+            if (fall < pfn->end_ea && func_contains(pfn, fall) && !is_basic_block_end(last, true))
+            {
+                ++edge_count;
+                successors.push_back(helpers::format_address(fall));
+            }
+        }
+        blk["successors"] = std::move(successors);
+
+        if (blocks.size() < 200)
+            blocks.push_back(std::move(blk));
+    }
+
+    result["basic_blocks"]  = std::move(blocks);
+    result["block_count"]   = block_count;
+    result["edge_count"]    = edge_count;
+    result["back_edges"]    = back_edges;
+
+    int cyclomatic = edge_count - block_count + 2;
+    if (cyclomatic < 1) cyclomatic = 1;
+    result["cyclomatic_complexity"] = cyclomatic;
+
+    return tool_result_t::ok(OBFSTR("Control flow analysis complete"), result);
+}
+
+tool_result_t get_function_complexity(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* pfn = get_func(ea);
+    if (!pfn)
+        return tool_result_t::error(OBFSTR("No function at ") + helpers::format_address(ea));
+
+    json result;
+    qstring fname;
+    get_func_name(&fname, pfn->start_ea);
+    result["function"] = fname.c_str();
+    result["start"]    = helpers::format_address(pfn->start_ea);
+    result["size"]     = pfn->end_ea - pfn->start_ea;
+
+    int total_insns = 0, call_count = 0, branch_count = 0, ret_count = 0;
+    int arith_count = 0, mem_access = 0, string_ops = 0;
+    std::set<ea_t> block_starts;
+    block_starts.insert(pfn->start_ea);
+    int edge_count = 0;
+
+    func_item_iterator_t fii(pfn);
+    for (bool ok = fii.first(); ok; ok = fii.next_head())
+    {
+        ea_t item = fii.current();
+        insn_t insn;
+        if (decode_insn(&insn, item) <= 0) continue;
+        ++total_insns;
+
+        if (insn.itype == NN_call || insn.itype == NN_callni || insn.itype == NN_callfi)
+            ++call_count;
+        if (insn.itype == NN_retn || insn.itype == NN_retf)
+            ++ret_count;
+        if (insn.itype >= NN_ja && insn.itype <= NN_jz)
+            ++branch_count;
+        if (insn.itype == NN_add || insn.itype == NN_sub || insn.itype == NN_imul ||
+            insn.itype == NN_idiv || insn.itype == NN_mul || insn.itype == NN_div ||
+            insn.itype == NN_shl || insn.itype == NN_shr || insn.itype == NN_sar)
+            ++arith_count;
+        if (insn.itype == NN_movs || insn.itype == NN_stos || insn.itype == NN_cmps ||
+            insn.itype == NN_scas || insn.itype == NN_lods)
+            ++string_ops;
+
+        for (int oi = 0; oi < UA_MAXOP; ++oi)
+        {
+            if (insn.ops[oi].type == o_mem || insn.ops[oi].type == o_phrase ||
+                insn.ops[oi].type == o_displ)
+            {
+                ++mem_access;
+                break;
+            }
+        }
+
+        if (is_basic_block_end(insn, false))
+        {
+            ea_t fall = item + insn.size;
+            if (func_contains(pfn, fall)) { block_starts.insert(fall); ++edge_count; }
+            xrefblk_t xb;
+            for (bool xok = xb.first_from(item, XREF_ALL); xok; xok = xb.next_from())
+            {
+                if (xb.iscode && func_contains(pfn, xb.to))
+                {
+                    block_starts.insert(xb.to);
+                    ++edge_count;
+                }
+            }
+        }
+    }
+
+    int block_count = static_cast<int>(block_starts.size());
+    int cyclomatic = edge_count - block_count + 2;
+    if (cyclomatic < 1) cyclomatic = 1;
+
+    result["instruction_count"]    = total_insns;
+    result["basic_block_count"]    = block_count;
+    result["edge_count"]           = edge_count;
+    result["cyclomatic_complexity"] = cyclomatic;
+    result["call_count"]           = call_count;
+    result["branch_count"]         = branch_count;
+    result["return_count"]         = ret_count;
+    result["arithmetic_ops"]       = arith_count;
+    result["memory_accesses"]      = mem_access;
+    result["string_operations"]    = string_ops;
+
+    std::set<uint16> unique_ops;
+    std::set<uint64_t> unique_operands;
+    func_item_iterator_t fii2(pfn);
+    for (bool ok = fii2.first(); ok; ok = fii2.next_head())
+    {
+        insn_t insn;
+        if (decode_insn(&insn, fii2.current()) <= 0) continue;
+        unique_ops.insert(insn.itype);
+        for (int oi = 0; oi < UA_MAXOP && insn.ops[oi].type != o_void; ++oi)
+        {
+            uint64_t key = (static_cast<uint64_t>(insn.ops[oi].type) << 48) |
+                           (static_cast<uint64_t>(insn.ops[oi].reg) << 32) |
+                           static_cast<uint64_t>(insn.ops[oi].value & 0xFFFFFFFF);
+            unique_operands.insert(key);
+        }
+    }
+    result["unique_operators"] = unique_ops.size();
+    result["unique_operands"]  = unique_operands.size();
+
+    std::string complexity_rating;
+    if (cyclomatic <= 5)       complexity_rating = "simple";
+    else if (cyclomatic <= 10) complexity_rating = "moderate";
+    else if (cyclomatic <= 20) complexity_rating = "complex";
+    else if (cyclomatic <= 50) complexity_rating = "very_complex";
+    else                       complexity_rating = "extremely_complex";
+    result["complexity_rating"] = complexity_rating;
+
+    return tool_result_t::ok(OBFSTR("Function complexity analysis"), result);
+}
+
+tool_result_t analyze_string_decryption(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* pfn = get_func(ea);
+    if (!pfn)
+        return tool_result_t::error(OBFSTR("No function at ") + helpers::format_address(ea));
+
+    json result;
+    result["function"] = helpers::get_name_or_address(pfn->start_ea);
+
+    json candidates = json::array();
+    int xor_loops = 0, byte_manip_chains = 0, stack_strings = 0;
+
+    func_item_iterator_t fii(pfn);
+    ea_t xor_chain_start = BADADDR;
+    int xor_chain_len = 0;
+    int mov_byte_chain = 0;
+    ea_t mov_byte_start = BADADDR;
+
+    for (bool ok = fii.first(); ok; ok = fii.next_head())
+    {
+        ea_t item = fii.current();
+        insn_t insn;
+        if (decode_insn(&insn, item) <= 0) continue;
+
+        if (insn.itype == NN_xor)
+        {
+            bool self_xor = (insn.ops[0].type == o_reg && insn.ops[1].type == o_reg &&
+                             insn.ops[0].reg == insn.ops[1].reg);
+            if (!self_xor)
+            {
+                if (xor_chain_start == BADADDR) xor_chain_start = item;
+                ++xor_chain_len;
+            }
+            else
+            {
+                if (xor_chain_len >= 2)
+                {
+                    ++xor_loops;
+                    json c;
+                    c["type"]    = OBFSTR("xor_decryption");
+                    c["start"]   = helpers::format_address(xor_chain_start);
+                    c["length"]  = xor_chain_len;
+                    c["note"]    = OBFSTR("Consecutive XOR operations suggest string/data decryption");
+                    candidates.push_back(std::move(c));
+                }
+                xor_chain_start = BADADDR;
+                xor_chain_len = 0;
+            }
+        }
+        else
+        {
+            if (xor_chain_len >= 2)
+            {
+                ++xor_loops;
+                json c;
+                c["type"]    = OBFSTR("xor_decryption");
+                c["start"]   = helpers::format_address(xor_chain_start);
+                c["length"]  = xor_chain_len;
+                candidates.push_back(std::move(c));
+            }
+            xor_chain_start = BADADDR;
+            xor_chain_len = 0;
+        }
+
+        if (insn.itype == NN_mov && insn.ops[0].type == o_displ &&
+            insn.ops[1].type == o_imm && insn.ops[1].value >= 0x20 && insn.ops[1].value <= 0x7E)
+        {
+            if (mov_byte_start == BADADDR) mov_byte_start = item;
+            ++mov_byte_chain;
+        }
+        else
+        {
+            if (mov_byte_chain >= 4)
+            {
+                ++stack_strings;
+                json c;
+                c["type"]    = OBFSTR("stack_string");
+                c["start"]   = helpers::format_address(mov_byte_start);
+                c["length"]  = mov_byte_chain;
+                c["note"]    = OBFSTR("Sequential byte MOVs to stack - likely stack-constructed string");
+
+                std::string reconstructed;
+                ea_t scan = mov_byte_start;
+                for (int i = 0; i < mov_byte_chain && scan < pfn->end_ea; ++i)
+                {
+                    insn_t si;
+                    if (decode_insn(&si, scan) > 0 && si.itype == NN_mov &&
+                        si.ops[1].type == o_imm && si.ops[1].value >= 0x20 && si.ops[1].value <= 0x7E)
+                    {
+                        reconstructed += static_cast<char>(si.ops[1].value);
+                    }
+                    scan = next_head(scan, pfn->end_ea);
+                }
+                if (!reconstructed.empty())
+                    c["reconstructed"] = reconstructed;
+
+                candidates.push_back(std::move(c));
+            }
+            mov_byte_chain = 0;
+            mov_byte_start = BADADDR;
+        }
+
+        if (insn.itype == NN_call || insn.itype == NN_callni)
+        {
+            ea_t target = BADADDR;
+            if (insn.ops[0].type == o_near || insn.ops[0].type == o_far)
+                target = insn.ops[0].addr;
+            if (target != BADADDR)
+            {
+                qstring tname;
+                if (get_func_name(&tname, target) > 0)
+                {
+                    std::string name_lower(tname.c_str());
+                    std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);
+                    if (name_lower.find("decrypt") != std::string::npos ||
+                        name_lower.find("decode") != std::string::npos ||
+                        name_lower.find("deobfus") != std::string::npos ||
+                        name_lower.find("unpack") != std::string::npos)
+                    {
+                        json c;
+                        c["type"]      = OBFSTR("decrypt_call");
+                        c["address"]   = helpers::format_address(item);
+                        c["target"]    = tname.c_str();
+                        candidates.push_back(std::move(c));
+                    }
+                }
+            }
+        }
+    }
+
+    result["candidates"]       = std::move(candidates);
+    result["xor_patterns"]     = xor_loops;
+    result["stack_strings"]    = stack_strings;
+
+    return tool_result_t::ok(OBFSTR("String decryption analysis"), result);
+}
+
+tool_result_t analyze_indirect_calls(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* pfn = get_func(ea);
+    if (!pfn)
+        return tool_result_t::error(OBFSTR("No function at ") + helpers::format_address(ea));
+
+    json result;
+    result["function"] = helpers::get_name_or_address(pfn->start_ea);
+
+    json calls = json::array();
+    int vtable_calls = 0, func_ptr_calls = 0, register_calls = 0;
+
+    func_item_iterator_t fii(pfn);
+    for (bool ok = fii.first(); ok; ok = fii.next_head())
+    {
+        ea_t item = fii.current();
+        insn_t insn;
+        if (decode_insn(&insn, item) <= 0) continue;
+
+        bool is_indirect_call = (insn.itype == NN_callni || insn.itype == NN_callfi);
+        bool is_indirect_jmp  = (insn.itype == NN_jmpni || insn.itype == NN_jmpfi);
+
+        if (!is_indirect_call && !is_indirect_jmp) continue;
+
+        json entry;
+        entry["address"] = helpers::format_address(item);
+        entry["type"]    = is_indirect_call ? "indirect_call" : "indirect_jump";
+
+        qstring dis;
+        generate_disasm_line(&dis, item, GENDSM_FORCE_CODE);
+        tag_remove(&dis);
+        entry["instruction"] = dis.c_str();
+
+        if (insn.ops[0].type == o_displ)
+        {
+            ++vtable_calls;
+            entry["classification"] = OBFSTR("vtable_call");
+            entry["base_register"]  = static_cast<int>(insn.ops[0].reg);
+            entry["offset"]         = static_cast<int64_t>(insn.ops[0].addr);
+        }
+        else if (insn.ops[0].type == o_mem)
+        {
+            ++func_ptr_calls;
+            entry["classification"] = OBFSTR("function_pointer");
+            entry["target_address"] = helpers::format_address(static_cast<ea_t>(insn.ops[0].addr));
+            qstring tname;
+            if (get_name(&tname, static_cast<ea_t>(insn.ops[0].addr)) > 0)
+                entry["target_name"] = tname.c_str();
+        }
+        else if (insn.ops[0].type == o_reg)
+        {
+            ++register_calls;
+            entry["classification"] = OBFSTR("register_call");
+            entry["register"]       = static_cast<int>(insn.ops[0].reg);
+        }
+        else
+        {
+            entry["classification"] = OBFSTR("other");
+        }
+
+        json targets = json::array();
+        xrefblk_t xb;
+        for (bool xok = xb.first_from(item, XREF_FAR); xok; xok = xb.next_from())
+        {
+            if (xb.iscode)
+            {
+                json t;
+                t["address"] = helpers::format_address(xb.to);
+                qstring tname;
+                if (get_func_name(&tname, xb.to) > 0)
+                    t["name"] = tname.c_str();
+                targets.push_back(std::move(t));
+            }
+        }
+        if (!targets.empty())
+            entry["resolved_targets"] = std::move(targets);
+
+        calls.push_back(std::move(entry));
+    }
+
+    result["indirect_calls"]   = std::move(calls);
+    result["vtable_calls"]     = vtable_calls;
+    result["func_ptr_calls"]   = func_ptr_calls;
+    result["register_calls"]   = register_calls;
+    result["total"]            = vtable_calls + func_ptr_calls + register_calls;
+
+    return tool_result_t::ok(OBFSTR("Indirect call analysis"), result);
+}
+
+tool_result_t find_crypto_constants(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    size_t scan_size = params.value("scan_size", 65536);
+    if (scan_size > 1048576) scan_size = 1048576;
+
+    ea_t start_ea;
+    ea_t end_ea;
+
+    if (addr)
+    {
+        start_ea = *addr;
+        func_t* pfn = get_func(start_ea);
+        if (pfn)
+            end_ea = pfn->end_ea;
+        else
+            end_ea = start_ea + static_cast<ea_t>(scan_size);
+    }
+    else
+    {
+        start_ea = inf_get_min_ea();
+        end_ea   = std::min(start_ea + static_cast<ea_t>(scan_size), inf_get_max_ea());
+    }
+
+    struct crypto_sig_t {
+        const char* name;
+        const char* algorithm;
+        uint32_t    value;
+    };
+    static const crypto_sig_t signatures[] = {
+        {"SHA-256 H0",     "SHA-256",    0x6A09E667},
+        {"SHA-256 H1",     "SHA-256",    0xBB67AE85},
+        {"SHA-256 H2",     "SHA-256",    0x3C6EF372},
+        {"SHA-256 H3",     "SHA-256",    0xA54FF53A},
+        {"SHA-256 K[0]",   "SHA-256",    0x428A2F98},
+        {"SHA-256 K[1]",   "SHA-256",    0x71374491},
+        {"MD5 T[1]",       "MD5",        0xD76AA478},
+        {"MD5 T[2]",       "MD5",        0xE8C7B756},
+        {"MD5 T[3]",       "MD5",        0x242070DB},
+        {"MD5 init A",     "MD5",        0x67452301},
+        {"MD5 init B",     "MD5",        0xEFCDAB89},
+        {"MD5 init C",     "MD5",        0x98BADCFE},
+        {"MD5 init D",     "MD5",        0x10325476},
+        {"AES Te0[0]",     "AES",        0xC66363A5},
+        {"AES Te0[1]",     "AES",        0xF87C7C84},
+        {"AES Td0[0]",     "AES",        0x51F4A750},
+        {"AES sbox[0..3]", "AES",        0x637C777B},
+        {"CRC32 poly",     "CRC32",      0xEDB88320},
+        {"CRC32 poly alt", "CRC32",      0x04C11DB7},
+        {"Blowfish P[0]",  "Blowfish",   0x243F6A88},
+        {"Blowfish P[1]",  "Blowfish",   0x85A308D3},
+        {"SHA-1 K0",       "SHA-1",      0x5A827999},
+        {"SHA-1 K1",       "SHA-1",      0x6ED9EBA1},
+        {"SHA-1 K2",       "SHA-1",      0x8F1BBCDC},
+        {"SHA-1 K3",       "SHA-1",      0xCA62C1D6},
+        {"TEA delta",      "TEA/XTEA",   0x9E3779B9},
+        {"RC5/RC6 P32",    "RC5/RC6",    0xB7E15163},
+        {"RC5/RC6 Q32",    "RC5/RC6",    0x9E3779B9},
+        {"ChaCha20",       "ChaCha20",   0x61707865},
+        {"Salsa20",        "Salsa20",    0x61707865},
+    };
+
+    json found = json::array();
+    std::set<std::string> found_algos;
+
+    for (ea_t cur = start_ea; cur < end_ea && cur != BADADDR;)
+    {
+        insn_t insn;
+        int len = decode_insn(&insn, cur);
+        if (len <= 0)
+        {
+            cur = next_head(cur, end_ea);
+            if (cur == BADADDR) break;
+            continue;
+        }
+
+        for (int oi = 0; oi < UA_MAXOP && insn.ops[oi].type != o_void; ++oi)
+        {
+            if (insn.ops[oi].type != o_imm) continue;
+            uint32_t val = static_cast<uint32_t>(insn.ops[oi].value);
+            for (const auto& sig : signatures)
+            {
+                if (val == sig.value)
+                {
+                    json f;
+                    f["address"]   = helpers::format_address(cur);
+                    f["constant"]  = sig.name;
+                    f["algorithm"] = sig.algorithm;
+                    f["value"]     = helpers::format_address(static_cast<ea_t>(val));
+                    qstring dis;
+                    generate_disasm_line(&dis, cur, GENDSM_FORCE_CODE);
+                    tag_remove(&dis);
+                    f["instruction"] = dis.c_str();
+                    found.push_back(std::move(f));
+                    found_algos.insert(sig.algorithm);
+                }
+            }
+        }
+        cur += len;
+    }
+
+    for (ea_t cur = start_ea; cur + 4 <= end_ea; cur += 4)
+    {
+        if (!is_loaded(cur)) continue;
+        uint32_t val = static_cast<uint32_t>(get_dword(cur));
+        for (const auto& sig : signatures)
+        {
+            if (val == sig.value)
+            {
+                bool dup = false;
+                for (const auto& f : found)
+                {
+                    if (f.value("address", "") == helpers::format_address(cur))
+                    { dup = true; break; }
+                }
+                if (!dup)
+                {
+                    json f;
+                    f["address"]   = helpers::format_address(cur);
+                    f["constant"]  = sig.name;
+                    f["algorithm"] = sig.algorithm;
+                    f["value"]     = helpers::format_address(static_cast<ea_t>(val));
+                    f["source"]    = OBFSTR("data");
+                    found.push_back(std::move(f));
+                    found_algos.insert(sig.algorithm);
+                }
+            }
+        }
+    }
+
+    json result;
+    result["scan_start"]  = helpers::format_address(start_ea);
+    result["scan_end"]    = helpers::format_address(end_ea);
+    result["matches"]     = std::move(found);
+    result["match_count"] = found.size();
+
+    json algos = json::array();
+    for (const auto& a : found_algos)
+        algos.push_back(a);
+    result["algorithms_detected"] = std::move(algos);
+
+    return tool_result_t::ok(OBFSTR("Crypto constant scan"), result);
+}
+
+tool_result_t analyze_data_flow(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* pfn = get_func(ea);
+    if (!pfn)
+        return tool_result_t::error(OBFSTR("No function at ") + helpers::format_address(ea));
+
+    int max_depth = params.value("max_depth", 32);
+    if (max_depth < 1) max_depth = 1;
+    if (max_depth > 256) max_depth = 256;
+
+    json result;
+    result["function"] = helpers::get_name_or_address(pfn->start_ea);
+    result["start_address"] = helpers::format_address(ea);
+
+    json defs = json::array();
+    json uses = json::array();
+
+    ea_t scan = ea;
+    int steps = 0;
+    std::set<ea_t> visited;
+    while (scan >= pfn->start_ea && steps < max_depth)
+    {
+        if (visited.count(scan)) break;
+        visited.insert(scan);
+        insn_t insn;
+        if (decode_insn(&insn, scan) <= 0) break;
+        if (scan != ea)
+        {
+            bool is_def = (insn.itype == NN_mov || insn.itype == NN_lea ||
+                insn.itype == NN_xor || insn.itype == NN_add || insn.itype == NN_sub ||
+                insn.itype == NN_and || insn.itype == NN_or || insn.itype == NN_shl ||
+                insn.itype == NN_shr || insn.itype == NN_imul || insn.itype == NN_movzx ||
+                insn.itype == NN_movsx);
+            if (is_def)
+            {
+                json d;
+                d["address"] = helpers::format_address(scan);
+                qstring dis;
+                generate_disasm_line(&dis, scan, GENDSM_FORCE_CODE);
+                tag_remove(&dis);
+                d["instruction"] = dis.c_str();
+                d["direction"] = OBFSTR("backward");
+                d["distance"] = steps;
+                defs.push_back(std::move(d));
+            }
+        }
+        scan = prev_head(scan, pfn->start_ea);
+        ++steps;
+    }
+
+    scan = ea; steps = 0; visited.clear();
+    while (scan < pfn->end_ea && steps < max_depth)
+    {
+        if (visited.count(scan)) break;
+        visited.insert(scan);
+        insn_t insn;
+        if (decode_insn(&insn, scan) <= 0) break;
+        if (scan != ea)
+        {
+            json u;
+            u["address"] = helpers::format_address(scan);
+            qstring dis;
+            generate_disasm_line(&dis, scan, GENDSM_FORCE_CODE);
+            tag_remove(&dis);
+            u["instruction"] = dis.c_str();
+            u["direction"] = OBFSTR("forward");
+            u["distance"] = steps;
+            if (insn.itype == NN_call || insn.itype == NN_callni)
+                u["usage_type"] = OBFSTR("call_argument");
+            else if (insn.itype == NN_cmp || insn.itype == NN_test)
+                u["usage_type"] = OBFSTR("comparison");
+            else if (insn.itype == NN_mov && insn.ops[0].type == o_mem)
+                u["usage_type"] = OBFSTR("store");
+            else if (insn.itype == NN_push)
+                u["usage_type"] = OBFSTR("push");
+            else
+                u["usage_type"] = OBFSTR("computation");
+            uses.push_back(std::move(u));
+        }
+        scan = next_head(scan, pfn->end_ea);
+        ++steps;
+    }
+
+    result["definitions"] = std::move(defs);
+    result["uses"] = std::move(uses);
+    result["pseudocode"] = helpers::get_pseudocode(pfn->start_ea);
+
+    return tool_result_t::ok(OBFSTR("Data flow analysis"), result);
+}
+
+tool_result_t detect_anti_analysis(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* pfn = get_func(ea);
+    ea_t scan_start = pfn ? pfn->start_ea : ea;
+    ea_t scan_end = pfn ? pfn->end_ea : ea + 4096;
+
+    json result;
+    if (pfn) result["function"] = helpers::get_name_or_address(pfn->start_ea);
+    result["scan_start"] = helpers::format_address(scan_start);
+    result["scan_end"] = helpers::format_address(scan_end);
+
+    json detections = json::array();
+    int anti_debug = 0, anti_vm = 0, anti_disasm = 0, timing_checks = 0;
+
+    static const char* dbg_apis[] = {
+        "IsDebuggerPresent", "CheckRemoteDebuggerPresent",
+        "NtQueryInformationProcess", "NtSetInformationThread",
+        "OutputDebugString", "GetTickCount", "QueryPerformanceCounter",
+        "NtQuerySystemInformation", "DbgBreakPoint", "DbgUiRemoteBreakin",
+        nullptr
+    };
+    static const char* vm_apis[] = {
+        "GetSystemFirmwareTable", "EnumSystemFirmwareTable", nullptr
+    };
+    static const char* vm_strings[] = {
+        "VMware", "VBox", "VBOX", "Virtual", "QEMU", "Xen",
+        "vmtoolsd", "vmwaretray", "vboxservice", nullptr
+    };
+
+    auto check_insn = [&](ea_t item) {
+        insn_t insn;
+        if (decode_insn(&insn, item) <= 0) return;
+
+        if (insn.itype == NN_call || insn.itype == NN_callni || insn.itype == NN_callfi)
+        {
+            ea_t target = BADADDR;
+            if (insn.ops[0].type == o_near || insn.ops[0].type == o_far)
+                target = insn.ops[0].addr;
+            else if (insn.ops[0].type == o_mem)
+                target = static_cast<ea_t>(insn.ops[0].addr);
+            if (target != BADADDR)
+            {
+                qstring tname;
+                if (get_name(&tname, target) > 0)
+                {
+                    for (int i = 0; dbg_apis[i]; ++i)
+                    {
+                        if (tname.find(dbg_apis[i]) != qstring::npos)
+                        {
+                            ++anti_debug;
+                            json d; d["type"] = OBFSTR("anti_debug_api");
+                            d["address"] = helpers::format_address(item);
+                            d["api"] = tname.c_str();
+                            detections.push_back(std::move(d)); break;
+                        }
+                    }
+                    for (int i = 0; vm_apis[i]; ++i)
+                    {
+                        if (tname.find(vm_apis[i]) != qstring::npos)
+                        {
+                            ++anti_vm;
+                            json d; d["type"] = OBFSTR("anti_vm_api");
+                            d["address"] = helpers::format_address(item);
+                            d["api"] = tname.c_str();
+                            detections.push_back(std::move(d)); break;
+                        }
+                    }
+                }
+            }
+        }
+        if (insn.itype == NN_cpuid)
+        {
+            ++anti_vm;
+            json d; d["type"] = OBFSTR("cpuid_check");
+            d["address"] = helpers::format_address(item);
+            d["note"] = OBFSTR("CPUID for VM/hypervisor detection");
+            detections.push_back(std::move(d));
+        }
+        if (insn.itype == NN_rdtsc)
+        {
+            ++timing_checks;
+            json d; d["type"] = OBFSTR("timing_check");
+            d["address"] = helpers::format_address(item);
+            d["note"] = OBFSTR("RDTSC timing-based anti-debug");
+            detections.push_back(std::move(d));
+        }
+        if (insn.itype == NN_int && insn.ops[0].type == o_imm && insn.ops[0].value == 0x2D)
+        {
+            ++anti_debug;
+            json d; d["type"] = OBFSTR("int2d_anti_debug");
+            d["address"] = helpers::format_address(item);
+            detections.push_back(std::move(d));
+        }
+        if (insn.itype == NN_int3)
+        {
+            ++anti_debug;
+            json d; d["type"] = OBFSTR("int3_trap");
+            d["address"] = helpers::format_address(item);
+            detections.push_back(std::move(d));
+        }
+        if (insn.itype == NN_in)
+        {
+            ++anti_vm;
+            json d; d["type"] = OBFSTR("port_io_check");
+            d["address"] = helpers::format_address(item);
+            d["note"] = OBFSTR("IN instruction for VMware backdoor");
+            detections.push_back(std::move(d));
+        }
+    };
+
+    if (pfn)
+    {
+        func_item_iterator_t fii(pfn);
+        for (bool ok = fii.first(); ok; ok = fii.next_head())
+            check_insn(fii.current());
+    }
+    else
+    {
+        for (ea_t cur = scan_start; cur < scan_end && cur != BADADDR;)
+        {
+            check_insn(cur);
+            insn_t tmp;
+            int len = decode_insn(&tmp, cur);
+            cur = (len > 0) ? cur + len : next_head(cur, scan_end);
+            if (cur == BADADDR) break;
+        }
+    }
+
+    if (pfn)
+    {
+        func_item_iterator_t fii2(pfn);
+        for (bool ok = fii2.first(); ok; ok = fii2.next_head())
+        {
+            xrefblk_t xb;
+            for (bool xok = xb.first_from(fii2.current(), XREF_DATA); xok; xok = xb.next_from())
+            {
+                flags64_t f = get_flags(xb.to);
+                if (!is_strlit(f)) continue;
+                qstring s;
+                if (get_strlit_contents(&s, xb.to, -1, get_str_type(xb.to)) <= 0) continue;
+                for (int i = 0; vm_strings[i]; ++i)
+                {
+                    if (s.find(vm_strings[i]) != qstring::npos)
+                    {
+                        ++anti_vm;
+                        json d; d["type"] = OBFSTR("anti_vm_string");
+                        d["address"] = helpers::format_address(fii2.current());
+                        d["string"] = s.c_str();
+                        d["pattern"] = vm_strings[i];
+                        detections.push_back(std::move(d)); break;
+                    }
+                }
+            }
+        }
+    }
+
+    result["detections"] = std::move(detections);
+    result["anti_debug"] = anti_debug;
+    result["anti_vm"] = anti_vm;
+    result["anti_disasm"] = anti_disasm;
+    result["timing_checks"] = timing_checks;
+
+    int score = 0;
+    if (anti_debug > 0) score += std::min(anti_debug * 15, 40);
+    if (anti_vm > 0) score += std::min(anti_vm * 15, 30);
+    if (timing_checks > 0) score += std::min(timing_checks * 15, 20);
+    if (anti_disasm > 0) score += 10;
+    result["anti_analysis_score_pct"] = std::min(score, 100);
+
+    return tool_result_t::ok(OBFSTR("Anti-analysis detection"), result);
+}
+
+void register_tools()
+{
+    auto& registry = ToolRegistry::instance();
+
+    registry.register_tool({OBFSTR("detect_obfuscation_patterns"), OBFSTR("analysis"),
+        OBFSTR("Scan a function for obfuscation patterns: opaque predicates, dead code, "
+               "junk insertion, indirect jumps, push/ret redirects. Returns obfuscation score."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true},
+         {OBFSTR("scan_size"), OBFSTR("number"), OBFSTR("Max bytes to scan (default: full function)"), false}},
+        detect_obfuscation_patterns});
+
+    registry.register_tool({OBFSTR("analyze_control_flow"), OBFSTR("analysis"),
+        OBFSTR("Analyze function control flow: basic blocks, edges, back-edges, cyclomatic complexity."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
+        analyze_control_flow});
+
+    registry.register_tool({OBFSTR("get_function_complexity"), OBFSTR("analysis"),
+        OBFSTR("Compute complexity metrics: cyclomatic complexity, instruction counts, Halstead metrics."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
+        get_function_complexity});
+
+    registry.register_tool({OBFSTR("analyze_string_decryption"), OBFSTR("analysis"),
+        OBFSTR("Detect string decryption patterns: XOR loops, stack strings, decrypt calls."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
+        analyze_string_decryption});
+
+    registry.register_tool({OBFSTR("analyze_indirect_calls"), OBFSTR("analysis"),
+        OBFSTR("Find and classify indirect calls/jumps: vtable, function pointer, register calls."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
+        analyze_indirect_calls});
+
+    registry.register_tool({OBFSTR("find_crypto_constants"), OBFSTR("analysis"),
+        OBFSTR("Scan for well-known crypto constants (AES, SHA-256, MD5, CRC32, Blowfish, TEA, ChaCha20)."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Start address (optional)"), false},
+         {OBFSTR("scan_size"), OBFSTR("number"), OBFSTR("Bytes to scan (default 65536)"), false}},
+        find_crypto_constants});
+
+    registry.register_tool({OBFSTR("analyze_data_flow"), OBFSTR("analysis"),
+        OBFSTR("Track data flow around an instruction: backward defs, forward uses, usage classification."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Instruction address"), true},
+         {OBFSTR("register"), OBFSTR("string"), OBFSTR("Register to track (optional)"), false},
+         {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Max scan depth per direction (default 32)"), false}},
+        analyze_data_flow});
+
+    registry.register_tool({OBFSTR("detect_anti_analysis"), OBFSTR("analysis"),
+        OBFSTR("Detect anti-debug/anti-VM techniques: API calls, CPUID/RDTSC, INT traps, VM strings."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function or start address"), true}},
+        detect_anti_analysis});
+}
+
+} // namespace analysis_tools
+
 void initialize_all_tools()
 {
     function_tools::register_tools();
@@ -5691,6 +6806,8 @@ void initialize_all_tools()
     binary_tools::register_tools();
     python_tools::register_tools();
     navigation_tools::register_tools();
+    analysis_tools::register_tools();
+    driver_tools::register_tools();
     
     ToolRegistry::instance().register_tool({
         OBFSTR("patch_instruction"), OBFSTR("memory"),
@@ -5709,7 +6826,7 @@ void initialize_all_tools()
         {
             {OBFSTR("category"), OBFSTR("string"),
              OBFSTR("Optional: filter by category (function, memory, comment, type, ") +
-             OBFSTR("import, search, debugger, segment, binary, python, navigation, meta)"),
+             OBFSTR("import, search, debugger, segment, binary, python, navigation, analysis, meta)"),
              false}
         },
         [](const json& params) -> tool_result_t {
