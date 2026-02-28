@@ -267,6 +267,33 @@ namespace analysis_tools
     void register_tools();
 }
 
+namespace deobfuscation_tools
+{
+    tool_result_t nop_junk_instructions(const nlohmann::json& params);
+    tool_result_t resolve_opaque_predicates(const nlohmann::json& params);
+    tool_result_t patch_anti_debug(const nlohmann::json& params);
+    tool_result_t decode_strings_in_function(const nlohmann::json& params);
+    tool_result_t rebuild_function(const nlohmann::json& params);
+    tool_result_t identify_protector(const nlohmann::json& params);
+    tool_result_t deobfuscate_control_flow(const nlohmann::json& params);
+    tool_result_t reconstruct_imports(const nlohmann::json& params);
+    tool_result_t unpack_section(const nlohmann::json& params);
+    tool_result_t full_deobfuscation_pass(const nlohmann::json& params);
+    void register_tools();
+}
+
+namespace advanced_analysis_tools
+{
+    tool_result_t aggressive_function_discovery(const nlohmann::json& params);
+    tool_result_t force_create_code_region(const nlohmann::json& params);
+    tool_result_t deep_reconstruct_imports(const nlohmann::json& params);
+    tool_result_t analyze_pe_header(const nlohmann::json& params);
+    tool_result_t deep_analysis_sweep(const nlohmann::json& params);
+    tool_result_t create_functions_from_xrefs(const nlohmann::json& params);
+    tool_result_t signature_scan_and_define(const nlohmann::json& params);
+    void register_tools();
+}
+
 namespace driver_tools
 {
     tool_result_t driver_connect(const nlohmann::json& params);
@@ -281,6 +308,11 @@ namespace driver_tools
     tool_result_t driver_enumerate_modules(const nlohmann::json& params);
     tool_result_t driver_dump_to_idb(const nlohmann::json& params);
     tool_result_t driver_bypass_and_dump(const nlohmann::json& params);
+    tool_result_t driver_enumerate_kernel_modules(const nlohmann::json& params);
+    tool_result_t driver_dump_kernel_module(const nlohmann::json& params);
+    tool_result_t driver_read_kernel_memory(const nlohmann::json& params);
+    tool_result_t driver_write_kernel_memory(const nlohmann::json& params);
+    tool_result_t driver_kernel_dump_module(const nlohmann::json& params);
     void register_tools();
 }
 

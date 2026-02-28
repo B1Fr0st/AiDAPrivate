@@ -251,6 +251,7 @@ namespace voyager {
         std::uint64_t find_image() noexcept;
 
         void solve_dtb() noexcept;
+        void solve_kernel_dtb() noexcept;
 
         template<typename T>
         [[nodiscard]] T read(std::uint64_t address) const noexcept;
@@ -260,6 +261,9 @@ namespace voyager {
 
         std::size_t read_raw(std::uint64_t address, void* buffer, std::size_t size) const noexcept;
         std::size_t write_raw(std::uint64_t address, const void* buffer, std::size_t size) const noexcept;
+
+        std::size_t read_kernel_raw(std::uint64_t address, void* buffer, std::size_t size) const noexcept;
+        std::size_t write_kernel_raw(std::uint64_t address, const void* buffer, std::size_t size) const noexcept;
 
         void move_mouse(std::int32_t input_x, std::int32_t input_y, std::uint32_t mouse_flags);
         void send_key(unsigned short button);
@@ -309,15 +313,18 @@ namespace voyager {
         [[nodiscard]] std::uint32_t get_process_id() const noexcept { return process_id_; }
         [[nodiscard]] std::uint64_t get_base_address() const noexcept { return base_address_; }
         [[nodiscard]] std::uint64_t get_dtb() const noexcept { return dtb_; }
+        [[nodiscard]] std::uint64_t get_kernel_dtb() const noexcept { return kernel_dtb_; }
 
         void set_process_id(std::uint32_t pid) noexcept { process_id_ = pid; }
         void set_base_address(std::uint64_t base) noexcept { base_address_ = base; }
+        void set_kernel_dtb(std::uint64_t dtb) noexcept { kernel_dtb_ = dtb; }
 
     private:
         HANDLE driver_handle_ = INVALID_HANDLE_VALUE;
         std::uint32_t process_id_ = 0;
         std::uint64_t base_address_ = 0;
         std::uint64_t dtb_ = 0;
+        std::uint64_t kernel_dtb_ = 0;
         std::uint64_t shellcode_address_ = 0;
         std::uint64_t spoof_gadget_ = 0;
         std::uint32_t session_key_ = 0;

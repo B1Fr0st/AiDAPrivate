@@ -78,6 +78,19 @@ ssize_t idaapi chat_event_listener_t::on_event(ssize_t code, va_list va)
             g_chat.widget = nullptr;
         }
     }
+    else if (code == ui_desktop_applied)
+    {
+        if (g_chat.widget != nullptr)
+        {
+            activate_widget(g_chat.widget, true);
+        }
+        else
+        {
+            TWidget* w = find_widget(OBFSTR_C("AiDA Chat"));
+            if (w != nullptr)
+                activate_widget(w, true);
+        }
+    }
     return 0;
 }
 
@@ -123,7 +136,7 @@ void open_chat(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 
     g_chat.widget = create_empty_widget(OBFSTR_C("AiDA Chat"));
 
-    display_widget(g_chat.widget, WOPN_DP_TAB | WOPN_DP_SZHINT);
+    display_widget(g_chat.widget, WOPN_DP_TAB | WOPN_DP_SZHINT | WOPN_PERSIST);
     set_dock_pos(OBFSTR_C("AiDA Chat"), nullptr, DP_RIGHT);
 }
 

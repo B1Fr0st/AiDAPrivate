@@ -175,26 +175,26 @@ target_link_libraries(AiDA PRIVATE "${IDA_LINK_LIB}")
 
 if(WIN32)
     target_compile_options(AiDA PRIVATE
-        /W3
-        /Zc:__cplusplus
-        /permissive-
-        /Zp8
-        /EHsc
-        /MD
-        /GR
-        /GS
-        /GF
-        /Gy
-        /Gw
-        /Oi
-        /Ob2
-        /GL
-        /wd4946
-        /wd4826
-        /wd4628
-        /wd4718
-        /wd5219
-        /wd5240
+        $<$<COMPILE_LANGUAGE:CXX>:/W3>
+        $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
+        $<$<COMPILE_LANGUAGE:CXX>:/permissive->
+        $<$<COMPILE_LANGUAGE:CXX>:/Zp8>
+        $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+        $<$<COMPILE_LANGUAGE:CXX>:/MD>
+        $<$<COMPILE_LANGUAGE:CXX>:/GR>
+        $<$<COMPILE_LANGUAGE:CXX>:/GS>
+        $<$<COMPILE_LANGUAGE:CXX>:/GF>
+        $<$<COMPILE_LANGUAGE:CXX>:/Gy>
+        $<$<COMPILE_LANGUAGE:CXX>:/Gw>
+        $<$<COMPILE_LANGUAGE:CXX>:/Oi>
+        $<$<COMPILE_LANGUAGE:CXX>:/Ob2>
+        $<$<COMPILE_LANGUAGE:CXX>:/GL>
+        $<$<COMPILE_LANGUAGE:CXX>:/wd4946>
+        $<$<COMPILE_LANGUAGE:CXX>:/wd4826>
+        $<$<COMPILE_LANGUAGE:CXX>:/wd4628>
+        $<$<COMPILE_LANGUAGE:CXX>:/wd4718>
+        $<$<COMPILE_LANGUAGE:CXX>:/wd5219>
+        $<$<COMPILE_LANGUAGE:CXX>:/wd5240>
     )
 
     # --- Anti-RE linker hardening ---

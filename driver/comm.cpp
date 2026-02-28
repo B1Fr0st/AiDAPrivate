@@ -7,6 +7,7 @@
 #include "spoofer/spoof.hpp"
 #include <string>
 #include <windows.h>
+#include <winternl.h>
 #include <winioctl.h>
 #include <tlhelp32.h>
 #include <cstdint>
@@ -14,6 +15,11 @@
 #include <cstdio>
 
 #pragma comment(lib, "ntdll.lib")
+
+#ifndef _PCLIENT_ID_DEFINED
+#define _PCLIENT_ID_DEFINED
+typedef CLIENT_ID* PCLIENT_ID;
+#endif
 
 #ifndef IMAGE_DOS_SIGNATURE
 #define IMAGE_DOS_SIGNATURE 0x5A4D
@@ -26,20 +32,6 @@
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #endif
-
-typedef struct _CLIENT_ID {
-    HANDLE UniqueProcess;
-    HANDLE UniqueThread;
-} CLIENT_ID, *PCLIENT_ID;
-
-typedef struct _OBJECT_ATTRIBUTES {
-    ULONG Length;
-    HANDLE RootDirectory;
-    PVOID ObjectName;
-    ULONG Attributes;
-    PVOID SecurityDescriptor;
-    PVOID SecurityQualityOfService;
-} OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
 
 namespace syscall_indices {
     inline std::uint32_t NtOpenThread_idx = 0;
@@ -193,6 +185,7 @@ void voyager::device_t::disconnect() noexcept {
     process_id_ = 0;
     base_address_ = 0;
     dtb_ = 0;
+    kernel_dtb_ = 0;
     spoof_gadget_ = 0;
     session_key_ = 0;
     last_heartbeat_tsc_ = 0;
@@ -315,6 +308,91 @@ void voyager::device_t::solve_dtb() noexcept {
     } else {
         dtb_ = 0;
     }
+}
+
+void voyager::device_t::solve_kernel_dtb() noexcept {
+    SPOOF_FUNC;
+    
+    // PID 4 = System process; its DTB maps all kernel virtual addresses
+    detail::dtb_solve req{};
+    req.pid = 4;
+    req.padding = 0;
+    req.dtb = 0;
+    
+    if (send_request(ioctl_codes::DTB(), &req, sizeof(req)) && req.dtb != 0) {
+        kernel_dtb_ = req.dtb;
+    } else {
+        // Fallback: any process DTB can translate kernel addresses (shared page tables)
+        if (dtb_ != 0) {
+            kernel_dtb_ = dtb_;
+        } else {
+            kernel_dtb_ = 0;
+        }
+    }
+}
+
+std::size_t voyager::device_t::read_kernel_raw(std::uint64_t address, void* buffer, std::size_t size) const noexcept {
+    SPOOF_FUNC;
+    
+    if (!buffer || size == 0 || !is_connected()) {
+        return 0;
+    }
+
+    if (size > 0x10000000) {
+        return 0;
+    }
+
+    // Determine which DTB to use: kernel_dtb_ preferred, fallback to process dtb_
+    std::uint64_t use_dtb = kernel_dtb_;
+    if (use_dtb == 0) use_dtb = dtb_;
+    if (use_dtb == 0) return 0;
+
+    detail::physical_request req{};
+    req.pid = 4; // System
+    req.dtb = use_dtb;
+    req.address = reinterpret_cast<void*>(address);
+    req.buffer = buffer;
+    req.size = size;
+    req.ret_size = 0;
+    req.should_write = 0;
+    std::memset(req.padding_2, 0, sizeof(req.padding_2));
+
+    if (send_request(ioctl_codes::PHYS(), &req, sizeof(req))) {
+        return req.ret_size;
+    }
+    
+    return 0;
+}
+
+std::size_t voyager::device_t::write_kernel_raw(std::uint64_t address, const void* buffer, std::size_t size) const noexcept {
+    SPOOF_FUNC;
+    
+    if (!buffer || size == 0 || !is_connected()) {
+        return 0;
+    }
+
+    if (size > 0x10000000) {
+        return 0;
+    }
+
+    std::uint64_t use_dtb = kernel_dtb_;
+    if (use_dtb == 0) use_dtb = dtb_;
+    if (use_dtb == 0) return 0;
+
+    detail::physical_request req{};
+    req.pid = 4;
+    req.dtb = use_dtb;
+    req.address = reinterpret_cast<void*>(address);
+    req.buffer = const_cast<void*>(buffer);
+    req.size = size;
+    req.ret_size = 0;
+    req.should_write = 1;
+    std::memset(req.padding_2, 0, sizeof(req.padding_2));
+
+    if (send_request(ioctl_codes::PHYS(), &req, sizeof(req))) {
+        return req.ret_size;
+    }
+    return 0;
 }
 
 std::uint64_t voyager::device_t::find_image() noexcept {

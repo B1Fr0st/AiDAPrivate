@@ -280,6 +280,8 @@ AiDAChatPanel::AiDAChatPanel(QWidget* parent,
     , m_completer(nullptr)
     , m_completerActive(false)
     , m_typewriterTimer(nullptr)
+    , m_userScrolledStreaming(false)
+    , m_userScrolledChat(false)
 {
     setObjectName(QString::fromStdString(OBFSTR("aidaChatPanel")));
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
@@ -456,6 +458,14 @@ void AiDAChatPanel::setupUI()
 
     chatAreaLayout->addWidget(m_chatDisplay, 1);
 
+    QObject::connect(m_chatDisplay->verticalScrollBar(), &QScrollBar::sliderPressed, [this]() {
+        m_userScrolledChat = true;
+    });
+    QObject::connect(m_chatDisplay->verticalScrollBar(), &QScrollBar::valueChanged, [this](int value) {
+        QScrollBar* sb = m_chatDisplay->verticalScrollBar();
+        if (value >= sb->maximum() - 4)
+            m_userScrolledChat = false;
+    });
     m_thinkingContainer = new QWidget(chatArea);
     m_thinkingContainer->setObjectName(QStringLiteral("thinkingContainer"));
     m_thinkingContainer->setVisible(false);
@@ -541,6 +551,14 @@ void AiDAChatPanel::setupUI()
     m_streamingDisplay->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_streamingDisplay->setLineWrapMode(QTextEdit::WidgetWidth);
     m_streamingDisplay->document()->setDocumentMargin(10);
+    QObject::connect(m_streamingDisplay->verticalScrollBar(), &QScrollBar::sliderPressed, [this]() {
+        m_userScrolledStreaming = true;
+    });
+    QObject::connect(m_streamingDisplay->verticalScrollBar(), &QScrollBar::valueChanged, [this](int value) {
+        QScrollBar* sb = m_streamingDisplay->verticalScrollBar();
+        if (value >= sb->maximum() - 4)
+            m_userScrolledStreaming = false;
+    });
     detailsLayout->addWidget(m_streamingDisplay);
 
     thinkingLayout->addWidget(m_thinkingDetails);
@@ -655,8 +673,11 @@ void AiDAChatPanel::setupUI()
         QTextCursor cursor = m_streamingDisplay->textCursor();
         cursor.movePosition(QTextCursor::End);
         cursor.insertText(batch);
-        m_streamingDisplay->setTextCursor(cursor);
-        m_streamingDisplay->ensureCursorVisible();
+        if (!m_userScrolledStreaming)
+        {
+            m_streamingDisplay->setTextCursor(cursor);
+            m_streamingDisplay->ensureCursorVisible();
+        }
     });
 }
 
@@ -1455,6 +1476,7 @@ void AiDAChatPanel::sendMessage()
         aiMessage += "\n\n[Tagged References]\n" + tagContext.toStdString();
 
     m_history.emplace_back("User", text.toStdString());
+    m_userScrolledChat = false;
     rebuildChatDisplay();
     m_inputField->clear();
 
@@ -1515,6 +1537,7 @@ void AiDAChatPanel::setThinkingState(bool thinking)
     {
         m_thinkingContainer->setVisible(true);
         m_thinkingToggleBtn->setVisible(true);
+        m_userScrolledStreaming = false;
         m_typingDotCount = 0;
         m_typingLabel->setText(QStringLiteral("Thinking"));
         m_currentToolLabel->clear();
@@ -1536,8 +1559,11 @@ void AiDAChatPanel::setThinkingState(bool thinking)
             QTextCursor cursor = m_streamingDisplay->textCursor();
             cursor.movePosition(QTextCursor::End);
             cursor.insertText(m_typewriterQueue);
-            m_streamingDisplay->setTextCursor(cursor);
-            m_streamingDisplay->ensureCursorVisible();
+            if (!m_userScrolledStreaming)
+            {
+                m_streamingDisplay->setTextCursor(cursor);
+                m_streamingDisplay->ensureCursorVisible();
+            }
             m_typewriterQueue.clear();
         }
 
@@ -1652,8 +1678,11 @@ void AiDAChatPanel::addToolResult(const QString& toolName, bool success, const Q
         cursor.insertText(QStringLiteral("  ") + displayMsg, msgFmt);
     }
 
-    m_streamingDisplay->setTextCursor(cursor);
-    m_streamingDisplay->ensureCursorVisible();
+    if (!m_userScrolledStreaming)
+    {
+        m_streamingDisplay->setTextCursor(cursor);
+        m_streamingDisplay->ensureCursorVisible();
+    }
 }
 
 void AiDAChatPanel::setThinkingExpanded(bool expanded)
@@ -1792,6 +1821,8 @@ void AiDAChatPanel::rebuildChatDisplay()
 
 void AiDAChatPanel::scrollToBottom()
 {
+    if (m_userScrolledChat)
+        return;
     QScrollBar* sb = m_chatDisplay->verticalScrollBar();
     sb->setValue(sb->maximum());
 }

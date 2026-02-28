@@ -264,4 +264,7 @@ private:
 
     QTimer*                  m_typewriterTimer;
     QString                  m_typewriterQueue;
+
+    bool                     m_userScrolledStreaming;
+    bool                     m_userScrolledChat;
 };

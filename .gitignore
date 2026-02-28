@@ -47,3 +47,5 @@ models.json
 
 # just in case
 ai_assistant.cfg
+
+driver/WhosWho/packages/

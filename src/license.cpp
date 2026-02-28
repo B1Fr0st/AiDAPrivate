@@ -805,7 +805,7 @@ bool license_manager_t::show_activation_dialog()
     qstring key_input;
 
     if (!ask_str(&key_input, 0,
-                 OBFSTR_C("Enter your license key to activate the plugin:")))
+                 OBFSTR_C("Enter your license key to activate AiDA:")))
     {
         VMP_END;
         return false;
@@ -815,7 +815,7 @@ bool license_manager_t::show_activation_dialog()
     if (key_input.empty())
     {
         warning(OBFSTR_C("No license key entered. "
-                          "The plugin cannot load without a valid license."));
+                          "AiDA cannot load without a valid license."));
         VMP_END;
         return false;
     }

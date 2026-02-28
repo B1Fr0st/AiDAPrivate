@@ -1,5 +1,6 @@
 #include "aida_pro.hpp"
 #include <allins.hpp>
+#include <iomanip>
 #include "../driver/comm.h"
 
 using json = nlohmann::json;
@@ -6793,6 +6794,5564 @@ void register_tools()
 
 } // namespace analysis_tools
 
+namespace deobfuscation_tools
+{
+
+tool_result_t nop_junk_instructions(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* pfn = get_func(ea);
+    if (!pfn)
+        return tool_result_t::error(OBFSTR("No function at ") + helpers::format_address(ea));
+
+    bool aggressive = params.value("aggressive", false);
+    int nop_threshold = params.value("nop_threshold", 3);
+    if (nop_threshold < 2) nop_threshold = 2;
+    if (nop_threshold > 16) nop_threshold = 16;
+
+    json result;
+    result["function"] = helpers::get_name_or_address(pfn->start_ea);
+    result["start"]    = helpers::format_address(pfn->start_ea);
+    result["end"]      = helpers::format_address(pfn->end_ea);
+
+    int nops_patched = 0;
+    int dead_blocks_nopped = 0;
+    int junk_sequences_nopped = 0;
+    json patches = json::array();
+
+    std::set<ea_t> dead_starts;
+    if (aggressive)
+    {
+        func_item_iterator_t fii(pfn);
+        for (bool ok = fii.first(); ok; ok = fii.next_head())
+        {
+            ea_t item = fii.current();
+            if (item == pfn->start_ea) continue;
+
+            xrefblk_t xb;
+            bool has_incoming = false;
+            for (bool xok = xb.first_to(item, XREF_ALL); xok; xok = xb.next_to())
+            {
+                if (xb.iscode && func_contains(pfn, xb.from))
+                {
+                    has_incoming = true;
+                    break;
+                }
+            }
+
+            if (!has_incoming)
+            {
+                ea_t prev = prev_head(item, pfn->start_ea);
+                if (prev != BADADDR)
+                {
+                    insn_t prev_insn;
+                    if (decode_insn(&prev_insn, prev) > 0)
+                    {
+                        if (!is_basic_block_end(prev_insn, false))
+                            has_incoming = true;
+                    }
+                }
+            }
+
+            if (!has_incoming)
+                dead_starts.insert(item);
+        }
+    }
+
+    ea_t cur = pfn->start_ea;
+    while (cur < pfn->end_ea && cur != BADADDR)
+    {
+        insn_t insn;
+        int len = decode_insn(&insn, cur);
+        if (len <= 0)
+        {
+            cur = next_head(cur, pfn->end_ea);
+            if (cur == BADADDR) break;
+            continue;
+        }
+
+        if (insn.itype == NN_nop)
+        {
+            ea_t nop_start = cur;
+            int nop_count = 0;
+            ea_t scan = cur;
+            while (scan < pfn->end_ea)
+            {
+                insn_t ns;
+                int nlen = decode_insn(&ns, scan);
+                if (nlen <= 0 || ns.itype != NN_nop) break;
+                ++nop_count;
+                scan += nlen;
+            }
+
+            if (nop_count >= nop_threshold)
+            {
+                ++junk_sequences_nopped;
+                json p;
+                p["type"]    = OBFSTR("nop_sled");
+                p["address"] = helpers::format_address(nop_start);
+                p["count"]   = nop_count;
+                patches.push_back(std::move(p));
+                cur = scan;
+                continue;
+            }
+        }
+
+        if (aggressive && dead_starts.count(cur))
+        {
+            ea_t block_end = pfn->end_ea;
+            ea_t scan = cur;
+            while (scan < pfn->end_ea)
+            {
+                insn_t di;
+                int dlen = decode_insn(&di, scan);
+                if (dlen <= 0) break;
+
+                ea_t next = scan + dlen;
+                if (next < pfn->end_ea && dead_starts.count(next) == 0)
+                {
+                    xrefblk_t xb;
+                    bool has_incoming = false;
+                    for (bool xok = xb.first_to(next, XREF_ALL); xok; xok = xb.next_to())
+                    {
+                        if (xb.iscode) { has_incoming = true; break; }
+                    }
+                    if (has_incoming)
+                    {
+                        block_end = next;
+                        break;
+                    }
+                }
+
+                if (is_basic_block_end(di, false))
+                {
+                    block_end = scan + dlen;
+                    break;
+                }
+                scan += dlen;
+            }
+
+            int patched_count = 0;
+            for (ea_t p = cur; p < block_end; ++p)
+            {
+                if (patch_byte(p, 0x90))
+                    ++patched_count;
+            }
+            if (patched_count > 0)
+            {
+                ++dead_blocks_nopped;
+                nops_patched += patched_count;
+                json p;
+                p["type"]    = OBFSTR("dead_code_nopped");
+                p["address"] = helpers::format_address(cur);
+                p["size"]    = patched_count;
+                patches.push_back(std::move(p));
+            }
+            cur = block_end;
+            continue;
+        }
+
+        cur += len;
+    }
+
+    if (nops_patched > 0)
+        reanalyze_function(pfn);
+
+    result["patches"]               = std::move(patches);
+    result["nops_patched"]          = nops_patched;
+    result["dead_blocks_nopped"]    = dead_blocks_nopped;
+    result["junk_sequences_found"]  = junk_sequences_nopped;
+
+    return tool_result_t::ok(OBFSTR("Junk instruction cleanup: ") + std::to_string(nops_patched) + " bytes NOPed", result);
+}
+
+tool_result_t resolve_opaque_predicates(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* pfn = get_func(ea);
+    if (!pfn)
+        return tool_result_t::error(OBFSTR("No function at ") + helpers::format_address(ea));
+
+    bool dry_run = params.value("dry_run", false);
+
+    json result;
+    result["function"] = helpers::get_name_or_address(pfn->start_ea);
+    json resolved = json::array();
+    int count = 0;
+
+    ea_t cur = pfn->start_ea;
+    ea_t prev_ea = BADADDR;
+
+    while (cur < pfn->end_ea && cur != BADADDR)
+    {
+        insn_t insn;
+        int len = decode_insn(&insn, cur);
+        if (len <= 0)
+        {
+            cur = next_head(cur, pfn->end_ea);
+            if (cur == BADADDR) break;
+            continue;
+        }
+
+        if (prev_ea != BADADDR &&
+            (insn.itype == NN_jz || insn.itype == NN_jnz ||
+             insn.itype == NN_jbe || insn.itype == NN_ja ||
+             insn.itype == NN_jl || insn.itype == NN_jge ||
+             insn.itype == NN_jle || insn.itype == NN_jg))
+        {
+            insn_t prev_insn;
+            if (decode_insn(&prev_insn, prev_ea) > 0)
+            {
+                bool is_always_zero = false;
+                bool is_always_nonzero = false;
+
+                if (prev_insn.itype == NN_xor &&
+                    prev_insn.ops[0].type == o_reg &&
+                    prev_insn.ops[1].type == o_reg &&
+                    prev_insn.ops[0].reg == prev_insn.ops[1].reg)
+                {
+                    is_always_zero = true;
+                }
+                if (prev_insn.itype == NN_test &&
+                    prev_insn.ops[0].type == o_reg &&
+                    prev_insn.ops[1].type == o_reg &&
+                    prev_insn.ops[0].reg == prev_insn.ops[1].reg)
+                {
+                    ea_t prev2 = prev_head(prev_ea, pfn->start_ea);
+                    if (prev2 != BADADDR)
+                    {
+                        insn_t prev2_insn;
+                        if (decode_insn(&prev2_insn, prev2) > 0 &&
+                            prev2_insn.itype == NN_xor &&
+                            prev2_insn.ops[0].type == o_reg &&
+                            prev2_insn.ops[1].type == o_reg &&
+                            prev2_insn.ops[0].reg == prev2_insn.ops[1].reg &&
+                            prev2_insn.ops[0].reg == prev_insn.ops[0].reg)
+                        {
+                            is_always_zero = true;
+                        }
+                    }
+                }
+
+                if (is_always_zero || is_always_nonzero)
+                {
+                    json patch_entry;
+                    patch_entry["address"] = helpers::format_address(cur);
+                    qstring dis;
+                    generate_disasm_line(&dis, cur, GENDSM_FORCE_CODE);
+                    tag_remove(&dis);
+                    patch_entry["original_insn"] = dis.c_str();
+
+                    bool should_take_branch = false;
+                    if (is_always_zero)
+                    {
+                        should_take_branch = (insn.itype == NN_jz || insn.itype == NN_jbe ||
+                                              insn.itype == NN_jle || insn.itype == NN_jge);
+                    }
+                    else
+                    {
+                        should_take_branch = (insn.itype == NN_jnz || insn.itype == NN_ja ||
+                                              insn.itype == NN_jg || insn.itype == NN_jl);
+                    }
+
+                    if (!dry_run)
+                    {
+                        if (should_take_branch)
+                        {
+                            if (insn.size == 2)
+                            {
+                                patch_byte(cur, 0xEB);
+                                patch_entry["action"] = OBFSTR("converted_to_jmp_short");
+                            }
+                            else if (insn.size == 6)
+                            {
+                                patch_byte(cur, 0x90);
+                                patch_byte(cur + 1, 0xE9);
+                                patch_entry["action"] = OBFSTR("converted_to_jmp_near");
+                            }
+                            else
+                            {
+                                patch_entry["action"] = OBFSTR("skipped_unusual_size");
+                            }
+                        }
+                        else
+                        {
+                            for (int i = 0; i < insn.size; ++i)
+                                patch_byte(cur + i, 0x90);
+                            patch_entry["action"] = OBFSTR("nopped_never_taken");
+                        }
+                    }
+                    else
+                    {
+                        patch_entry["action"] = should_take_branch
+                            ? OBFSTR("would_convert_to_jmp")
+                            : OBFSTR("would_nop");
+                    }
+
+                    patch_entry["branch_decision"] = should_take_branch ? "always_taken" : "never_taken";
+                    resolved.push_back(std::move(patch_entry));
+                    ++count;
+                }
+            }
+        }
+
+        prev_ea = cur;
+        cur += len;
+    }
+
+    if (!dry_run && count > 0)
+        reanalyze_function(pfn);
+
+    result["resolved"]  = std::move(resolved);
+    result["count"]     = count;
+    result["dry_run"]   = dry_run;
+
+    return tool_result_t::ok(OBFSTR("Resolved ") + std::to_string(count) + " opaque predicates", result);
+}
+
+tool_result_t patch_anti_debug(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* pfn = get_func(ea);
+    ea_t scan_start = pfn ? pfn->start_ea : ea;
+    ea_t scan_end   = pfn ? pfn->end_ea : ea + params.value("size", (size_t)4096);
+
+    bool dry_run = params.value("dry_run", false);
+    bool patch_api_calls = params.value("patch_api_calls", true);
+    bool patch_int_traps = params.value("patch_int_traps", true);
+    bool patch_timing    = params.value("patch_timing", true);
+
+    static const char* anti_debug_apis[] = {
+        "IsDebuggerPresent", "CheckRemoteDebuggerPresent",
+        "NtQueryInformationProcess", "NtSetInformationThread",
+        "OutputDebugString", "DbgBreakPoint", "DbgUiRemoteBreakin",
+        "NtQuerySystemInformation",
+        nullptr
+    };
+
+    json result;
+    if (pfn) result["function"] = helpers::get_name_or_address(pfn->start_ea);
+    json patches = json::array();
+    int total_patched = 0;
+
+    ea_t cur = scan_start;
+    while (cur < scan_end && cur != BADADDR)
+    {
+        insn_t insn;
+        int len = decode_insn(&insn, cur);
+        if (len <= 0)
+        {
+            cur = next_head(cur, scan_end);
+            if (cur == BADADDR) break;
+            continue;
+        }
+
+        if (patch_api_calls && (insn.itype == NN_call || insn.itype == NN_callni || insn.itype == NN_callfi))
+        {
+            ea_t target = BADADDR;
+            if (insn.ops[0].type == o_near || insn.ops[0].type == o_far)
+                target = insn.ops[0].addr;
+            else if (insn.ops[0].type == o_mem)
+                target = static_cast<ea_t>(insn.ops[0].addr);
+
+            if (target != BADADDR)
+            {
+                qstring tname;
+                if (get_name(&tname, target) > 0)
+                {
+                    for (int i = 0; anti_debug_apis[i]; ++i)
+                    {
+                        if (tname.find(anti_debug_apis[i]) != qstring::npos)
+                        {
+                            json p;
+                            p["type"]    = OBFSTR("anti_debug_call");
+                            p["address"] = helpers::format_address(cur);
+                            p["api"]     = tname.c_str();
+
+                            if (!dry_run)
+                            {
+                                for (int b = 0; b < insn.size; ++b)
+                                    patch_byte(cur + b, 0x90);
+                                p["action"] = OBFSTR("nopped");
+                                ++total_patched;
+
+                                if (std::string(anti_debug_apis[i]) == "IsDebuggerPresent")
+                                {
+                                    if (insn.size >= 2)
+                                    {
+                                        patch_byte(cur, 0x31);
+                                        patch_byte(cur + 1, 0xC0);
+                                        for (int b = 2; b < insn.size; ++b)
+                                            patch_byte(cur + b, 0x90);
+                                        p["action"] = OBFSTR("replaced_with_xor_eax_eax");
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                p["action"] = OBFSTR("would_nop");
+                            }
+
+                            patches.push_back(std::move(p));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (patch_int_traps && insn.itype == NN_int &&
+            insn.ops[0].type == o_imm && insn.ops[0].value == 0x2D)
+        {
+            json p;
+            p["type"]    = OBFSTR("int2d_trap");
+            p["address"] = helpers::format_address(cur);
+            if (!dry_run)
+            {
+                for (int b = 0; b < insn.size; ++b)
+                    patch_byte(cur + b, 0x90);
+                p["action"] = OBFSTR("nopped");
+                ++total_patched;
+            }
+            else
+            {
+                p["action"] = OBFSTR("would_nop");
+            }
+            patches.push_back(std::move(p));
+        }
+
+        if (patch_int_traps && insn.itype == NN_int3)
+        {
+            json p;
+            p["type"]    = OBFSTR("int3_trap");
+            p["address"] = helpers::format_address(cur);
+            if (!dry_run)
+            {
+                patch_byte(cur, 0x90);
+                p["action"] = OBFSTR("nopped");
+                ++total_patched;
+            }
+            else
+            {
+                p["action"] = OBFSTR("would_nop");
+            }
+            patches.push_back(std::move(p));
+        }
+
+        if (patch_timing && insn.itype == NN_rdtsc)
+        {
+            json p;
+            p["type"]    = OBFSTR("rdtsc_timing");
+            p["address"] = helpers::format_address(cur);
+            if (!dry_run)
+            {
+                if (insn.size >= 2)
+                {
+                    patch_byte(cur, 0x31);
+                    patch_byte(cur + 1, 0xC0);
+                    p["action"] = OBFSTR("replaced_with_xor_eax");
+                }
+                ++total_patched;
+            }
+            else
+            {
+                p["action"] = OBFSTR("would_patch");
+            }
+            patches.push_back(std::move(p));
+        }
+
+        cur += len;
+    }
+
+    if (!dry_run && total_patched > 0 && pfn)
+        reanalyze_function(pfn);
+
+    result["patches"]       = std::move(patches);
+    result["total_patched"] = total_patched;
+    result["dry_run"]       = dry_run;
+
+    return tool_result_t::ok(OBFSTR("Anti-debug patching: ") + std::to_string(total_patched) + " patches", result);
+}
+
+tool_result_t decode_strings_in_function(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* pfn = get_func(ea);
+    if (!pfn)
+        return tool_result_t::error(OBFSTR("No function at ") + helpers::format_address(ea));
+
+    bool add_comments = params.value("add_comments", true);
+
+    json result;
+    result["function"] = helpers::get_name_or_address(pfn->start_ea);
+    json decoded_strings = json::array();
+
+    ea_t cur = pfn->start_ea;
+    ea_t stack_str_start = BADADDR;
+    std::string stack_str_chars;
+    int stack_str_count = 0;
+
+    while (cur < pfn->end_ea && cur != BADADDR)
+    {
+        insn_t insn;
+        int len = decode_insn(&insn, cur);
+        if (len <= 0)
+        {
+            cur = next_head(cur, pfn->end_ea);
+            if (cur == BADADDR) break;
+            continue;
+        }
+
+        bool is_byte_mov = (insn.itype == NN_mov &&
+                           insn.ops[0].type == o_displ &&
+                           insn.ops[1].type == o_imm);
+
+        if (is_byte_mov)
+        {
+            uint64_t val = insn.ops[1].value;
+            if (val >= 0x20 && val <= 0x7E)
+            {
+                if (stack_str_start == BADADDR)
+                    stack_str_start = cur;
+                stack_str_chars += static_cast<char>(val);
+                ++stack_str_count;
+                cur += len;
+                continue;
+            }
+        }
+
+        if (insn.itype == NN_mov && insn.ops[0].type == o_displ && insn.ops[1].type == o_imm)
+        {
+            uint64_t val = insn.ops[1].value;
+            std::string chunk;
+            bool all_printable = true;
+            int byte_count = 0;
+
+            if (val > 0xFF && val <= 0xFFFFFFFF)
+                byte_count = 4;
+            else if (val > 0xFFFFFFFF)
+                byte_count = 8;
+
+            if (byte_count > 0)
+            {
+                for (int b = 0; b < byte_count; ++b)
+                {
+                    char c = static_cast<char>((val >> (b * 8)) & 0xFF);
+                    if (c == 0) break;
+                    if (c < 0x20 || c > 0x7E) { all_printable = false; break; }
+                    chunk += c;
+                }
+                if (all_printable && chunk.size() >= 2)
+                {
+                    if (stack_str_start == BADADDR)
+                        stack_str_start = cur;
+                    stack_str_chars += chunk;
+                    stack_str_count++;
+                    cur += len;
+                    continue;
+                }
+            }
+        }
+
+        if (stack_str_count >= 3 && !stack_str_chars.empty())
+        {
+            json s;
+            s["type"]    = OBFSTR("stack_string");
+            s["address"] = helpers::format_address(stack_str_start);
+            s["decoded"] = stack_str_chars;
+            s["length"]  = stack_str_chars.size();
+            decoded_strings.push_back(std::move(s));
+
+            if (add_comments)
+                set_cmt(stack_str_start, (std::string("AiDA: Stack string: \"") + stack_str_chars + "\"").c_str(), false);
+        }
+        stack_str_start = BADADDR;
+        stack_str_chars.clear();
+        stack_str_count = 0;
+
+        cur += len;
+    }
+    
+    if (stack_str_count >= 3 && !stack_str_chars.empty())
+    {
+        json s;
+        s["type"]    = OBFSTR("stack_string");
+        s["address"] = helpers::format_address(stack_str_start);
+        s["decoded"] = stack_str_chars;
+        s["length"]  = stack_str_chars.size();
+        decoded_strings.push_back(std::move(s));
+        if (add_comments)
+            set_cmt(stack_str_start, (std::string("AiDA: Stack string: \"") + stack_str_chars + "\"").c_str(), false);
+    }
+
+    func_item_iterator_t fii(pfn);
+    for (bool ok = fii.first(); ok; ok = fii.next_head())
+    {
+        ea_t item = fii.current();
+        insn_t insn;
+        if (decode_insn(&insn, item) <= 0) continue;
+
+        if (insn.itype == NN_xor && insn.ops[1].type == o_imm)
+        {
+            uint8_t xor_key = static_cast<uint8_t>(insn.ops[1].value & 0xFF);
+            if (xor_key == 0) continue;
+
+            xrefblk_t xb;
+            for (bool xok = xb.first_from(item, XREF_DATA); xok; xok = xb.next_from())
+            {
+                ea_t data_ea = xb.to;
+                if (!is_loaded(data_ea)) continue;
+
+                std::string decoded;
+                for (int i = 0; i < 256; ++i)
+                {
+                    if (!is_loaded(data_ea + i)) break;
+                    uint8_t b = get_byte(data_ea + i);
+                    char c = static_cast<char>(b ^ xor_key);
+                    if (c == 0) break;
+                    if (c < 0x20 || c > 0x7E) { decoded.clear(); break; }
+                    decoded += c;
+                }
+
+                if (decoded.size() >= 4)
+                {
+                    json s;
+                    s["type"]     = OBFSTR("xor_string");
+                    s["address"]  = helpers::format_address(item);
+                    s["data_at"]  = helpers::format_address(data_ea);
+                    s["xor_key"]  = helpers::format_address(static_cast<ea_t>(xor_key));
+                    s["decoded"]  = decoded;
+                    s["length"]   = decoded.size();
+                    decoded_strings.push_back(std::move(s));
+
+                    if (add_comments)
+                    {
+                        set_cmt(item, (std::string("AiDA: XOR-decrypted string (key=0x") +
+                                      helpers::format_address(static_cast<ea_t>(xor_key)).substr(2) +
+                                      "): \"" + decoded + "\"").c_str(), false);
+                    }
+                }
+            }
+        }
+    }
+
+    int total_decoded = static_cast<int>(decoded_strings.size());
+    result["decoded_strings"] = std::move(decoded_strings);
+    result["total_decoded"]   = total_decoded;
+
+    return tool_result_t::ok(OBFSTR("String decoding: ") + std::to_string(total_decoded) + " strings found", result);
+}
+
+tool_result_t rebuild_function(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* pfn = get_func(ea);
+    ea_t start = pfn ? pfn->start_ea : ea;
+    ea_t end   = pfn ? pfn->end_ea : BADADDR;
+
+    bool force_recreate = params.value("force_recreate", false);
+    bool create_instructions = params.value("create_instructions", true);
+
+    json result;
+    result["original_start"] = helpers::format_address(start);
+    if (end != BADADDR)
+        result["original_end"] = helpers::format_address(end);
+
+    int insns_created = 0;
+    int errors = 0;
+
+    if (force_recreate && pfn)
+    {
+        del_func(start);
+        result["deleted_original"] = true;
+
+        if (end != BADADDR)
+            del_items(start, DELIT_SIMPLE, end - start);
+    }
+
+    if (create_instructions)
+    {
+        ea_t range_end = (end != BADADDR) ? end : start + 0x10000;
+        ea_t cur = start;
+        while (cur < range_end && cur != BADADDR)
+        {
+            int len = create_insn(cur);
+            if (len > 0)
+            {
+                ++insns_created;
+                cur += len;
+            }
+            else
+            {
+                ++errors;
+                cur = next_addr(cur);
+                if (cur == BADADDR) break;
+            }
+        }
+    }
+
+    bool func_created = add_func(start, BADADDR);
+    pfn = get_func(start);
+
+    if (pfn)
+    {
+        reanalyze_function(pfn);
+        result["new_start"] = helpers::format_address(pfn->start_ea);
+        result["new_end"]   = helpers::format_address(pfn->end_ea);
+        result["new_size"]  = pfn->end_ea - pfn->start_ea;
+    }
+
+    if (end != BADADDR)
+    {
+        auto_mark_range(start, end, AU_FINAL);
+        show_wait_box("HIDECANCEL\nAiDA: Re-analyzing function...");
+        auto_wait();
+        hide_wait_box();
+    }
+
+    result["function_created"]   = func_created;
+    result["instructions_created"] = insns_created;
+    result["errors"]             = errors;
+
+    return tool_result_t::ok(OBFSTR("Function rebuilt: ") + std::to_string(insns_created) + " instructions", result);
+}
+
+tool_result_t identify_protector(const json& params)
+{
+    size_t scan_size = params.value("scan_size", (size_t)0x100000);
+    if (scan_size > 0x1000000) scan_size = 0x1000000;
+
+    ea_t start = inf_get_min_ea();
+    ea_t end   = std::min(start + static_cast<ea_t>(scan_size), inf_get_max_ea());
+
+    json result;
+    json detections = json::array();
+
+    struct section_sig_t {
+        const char* name;
+        const char* protector;
+    };
+    static const section_sig_t section_sigs[] = {
+        {".vmp",    "VMProtect"},
+        {".vmp0",   "VMProtect"},
+        {".vmp1",   "VMProtect"},
+        {".vmp2",   "VMProtect"},
+        {".vmprotect", "VMProtect"},
+        {".themida", "Themida/WinLicense"},
+        {".Themida", "Themida/WinLicense"},
+        {"Themida",  "Themida/WinLicense"},
+        {".upx",    "UPX"},
+        {"UPX0",    "UPX"},
+        {"UPX1",    "UPX"},
+        {"UPX2",    "UPX"},
+        {".aspack", "ASPack"},
+        {".adata",  "ASPack"},
+        {".nsp",    "NSPack"},
+        {".enigma", "Enigma Protector"},
+        {".perplex", "PECompact"},
+        {".petite", "Petite"},
+        {".yP",     "Y's Crypter"},
+        {".sforce", "StarForce"},
+        {"_winzip_", "WinZip SFX"},
+        {".shrink", "Shrinker"},
+        {".RLPack", "RLPack"},
+        {".MaskPE", "MaskPE"},
+        {".ndata",  "NSIS Installer"},
+        {".rsrc",   ""},
+        {nullptr,   nullptr}
+    };
+
+    for (int si = 0; si < get_segm_qty(); ++si)
+    {
+        segment_t* seg = getnseg(si);
+        if (!seg) continue;
+
+        qstring sname;
+        get_segm_name(&sname, seg);
+
+        for (int k = 0; section_sigs[k].name; ++k)
+        {
+            if (sname == section_sigs[k].name && section_sigs[k].protector[0] != '\0')
+            {
+                json d;
+                d["type"]      = OBFSTR("section_name");
+                d["section"]   = sname.c_str();
+                d["protector"] = section_sigs[k].protector;
+                d["start"]     = helpers::format_address(seg->start_ea);
+                d["size"]      = seg->size();
+                detections.push_back(std::move(d));
+            }
+        }
+    }
+
+    struct byte_sig_t {
+        const char* protector;
+        const char* description;
+        const uint8_t* pattern;
+        const uint8_t* mask;
+        int length;
+    };
+
+    static const uint8_t vmp_push_call[] = { 0x68, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00 };
+    static const uint8_t vmp_push_mask[] = { 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00 };
+
+    static const uint8_t themida_sig[] = { 0xB8, 0x00, 0x00, 0x00, 0x00, 0x60, 0x0F, 0x31 };
+    static const uint8_t themida_mask[] = { 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF };
+
+    static const uint8_t upx_sig[] = { 0x60, 0xBE, 0x00, 0x00, 0x00, 0x00, 0x8D, 0xBE };
+    static const uint8_t upx_mask[] = { 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF };
+
+    static const byte_sig_t byte_sigs[] = {
+        {"VMProtect", "VMProtect entry stub (push/call pattern)", vmp_push_call, vmp_push_mask, 10},
+        {"Themida/WinLicense", "Themida stolen code entry", themida_sig, themida_mask, 8},
+        {"UPX", "UPX decompression stub", upx_sig, upx_mask, 8},
+    };
+
+    ea_t ep = inf_get_start_ea();
+    if (ep != BADADDR)
+    {
+        for (const auto& sig : byte_sigs)
+        {
+            for (ea_t scan = (ep > 0x100 ? ep - 0x100 : ep); scan < ep + 0x1000 && scan < end; ++scan)
+            {
+                if (!is_loaded(scan)) continue;
+                bool match = true;
+                for (int i = 0; i < sig.length; ++i)
+                {
+                    if (!is_loaded(scan + i)) { match = false; break; }
+                    uint8_t b = get_byte(scan + i);
+                    if ((b & sig.mask[i]) != (sig.pattern[i] & sig.mask[i]))
+                    {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match)
+                {
+                    json d;
+                    d["type"]        = OBFSTR("byte_signature");
+                    d["address"]     = helpers::format_address(scan);
+                    d["protector"]   = sig.protector;
+                    d["description"] = sig.description;
+                    detections.push_back(std::move(d));
+                    break;
+                }
+            }
+        }
+    }
+
+    static const char* protector_strings[] = {
+        "VMProtect begin", "VMProtect end", "VMProtectSDK",
+        "Themida", "WinLicense", "Oreans Technologies",
+        "UPX!", "This program cannot be run",
+        "ASProtect", "StarForce",
+        "Enigma protector", "EXECryptor",
+        ".NET Reactor", "ConfuserEx",
+        "Obsidium", "PECompact",
+        nullptr
+    };
+
+    for (int si = 0; si < get_segm_qty(); ++si)
+    {
+        segment_t* seg = getnseg(si);
+        if (!seg) continue;
+
+        qstring sname;
+        get_segm_name(&sname, seg);
+        if (sname != ".rdata" && sname != ".data" && sname != ".rsrc") continue;
+
+        ea_t seg_end = std::min(seg->end_ea, seg->start_ea + static_cast<ea_t>(0x100000));
+        for (ea_t scan = seg->start_ea; scan < seg_end; ++scan)
+        {
+            if (!is_loaded(scan)) continue;
+            flags64_t f = get_flags(scan);
+            if (!is_strlit(f)) continue;
+
+            qstring s;
+            if (get_strlit_contents(&s, scan, -1, get_str_type(scan)) <= 0) continue;
+
+            for (int k = 0; protector_strings[k]; ++k)
+            {
+                if (s.find(protector_strings[k]) != qstring::npos)
+                {
+                    json d;
+                    d["type"]      = OBFSTR("string_reference");
+                    d["address"]   = helpers::format_address(scan);
+                    d["string"]    = s.c_str();
+                    d["protector"] = protector_strings[k];
+                    detections.push_back(std::move(d));
+                    break;
+                }
+            }
+        }
+    }
+
+    json entropy_info = json::array();
+    for (int si = 0; si < get_segm_qty(); ++si)
+    {
+        segment_t* seg = getnseg(si);
+        if (!seg || seg->size() == 0) continue;
+
+        qstring sname;
+        get_segm_name(&sname, seg);
+
+        size_t sample_size = std::min(static_cast<size_t>(seg->size()), static_cast<size_t>(4096));
+        int freq[256] = {0};
+        int valid_bytes = 0;
+
+        for (size_t i = 0; i < sample_size; ++i)
+        {
+            ea_t addr = seg->start_ea + i;
+            if (!is_loaded(addr)) continue;
+            ++freq[get_byte(addr)];
+            ++valid_bytes;
+        }
+
+        if (valid_bytes > 0)
+        {
+            double entropy = 0.0;
+            for (int k = 0; k < 256; ++k)
+            {
+                if (freq[k] == 0) continue;
+                double p = static_cast<double>(freq[k]) / valid_bytes;
+                entropy -= p * std::log2(p);
+            }
+
+            json ei;
+            ei["section"] = sname.c_str();
+            ei["entropy"]  = entropy;
+            ei["size"]     = seg->size();
+            ei["verdict"]  = (entropy > 7.5) ? "packed/encrypted" :
+                            (entropy > 6.5) ? "compressed/obfuscated" :
+                            (entropy > 5.0) ? "normal_code" : "sparse_data";
+            entropy_info.push_back(std::move(ei));
+
+            if (entropy > 7.5)
+            {
+                json d;
+                d["type"]      = OBFSTR("high_entropy");
+                d["section"]   = sname.c_str();
+                d["entropy"]   = entropy;
+                d["note"]      = OBFSTR("High entropy suggests packed/encrypted section");
+                detections.push_back(std::move(d));
+            }
+        }
+    }
+
+    result["detections"]   = std::move(detections);
+    result["entropy"]      = std::move(entropy_info);
+    result["detection_count"] = result["detections"].size();
+
+    std::set<std::string> found_protectors;
+    for (const auto& d : result["detections"])
+    {
+        if (d.contains("protector") && d["protector"].is_string())
+            found_protectors.insert(d["protector"].get<std::string>());
+    }
+
+    json protectors = json::array();
+    for (const auto& p : found_protectors)
+        protectors.push_back(p);
+    result["protectors_found"] = std::move(protectors);
+
+    std::string summary = found_protectors.empty()
+        ? "No known protectors detected"
+        : "Detected: ";
+    for (const auto& p : found_protectors)
+        summary += p + ", ";
+    if (!found_protectors.empty())
+        summary = summary.substr(0, summary.size() - 2);
+
+    return tool_result_t::ok(summary, result);
+}
+
+tool_result_t deobfuscate_control_flow(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* pfn = get_func(ea);
+    if (!pfn)
+        return tool_result_t::error(OBFSTR("No function at ") + helpers::format_address(ea));
+
+    json result;
+    result["function"] = helpers::get_name_or_address(pfn->start_ea);
+    result["start"]    = helpers::format_address(pfn->start_ea);
+    result["end"]      = helpers::format_address(pfn->end_ea);
+
+    std::map<ea_t, int> backedge_targets;
+    std::set<ea_t> all_block_starts;
+    all_block_starts.insert(pfn->start_ea);
+
+    func_item_iterator_t fii(pfn);
+    for (bool ok = fii.first(); ok; ok = fii.next_head())
+    {
+        ea_t item = fii.current();
+        insn_t insn;
+        if (decode_insn(&insn, item) <= 0) continue;
+
+        if (is_basic_block_end(insn, false))
+        {
+            ea_t fall = item + insn.size;
+            if (func_contains(pfn, fall))
+                all_block_starts.insert(fall);
+
+            xrefblk_t xb;
+            for (bool xok = xb.first_from(item, XREF_ALL); xok; xok = xb.next_from())
+            {
+                if (xb.iscode && func_contains(pfn, xb.to))
+                {
+                    all_block_starts.insert(xb.to);
+                    if (xb.to <= item)
+                        backedge_targets[xb.to]++;
+                }
+            }
+        }
+    }
+
+    ea_t dispatcher = BADADDR;
+    int max_backedges = 0;
+    for (const auto& [addr_target, count] : backedge_targets)
+    {
+        if (count > max_backedges)
+        {
+            max_backedges = count;
+            dispatcher = addr_target;
+        }
+    }
+
+    json cff_analysis;
+    cff_analysis["block_count"]    = all_block_starts.size();
+    cff_analysis["back_edge_targets"] = backedge_targets.size();
+
+    bool is_cff = false;
+    if (dispatcher != BADADDR && max_backedges >= 3 &&
+        all_block_starts.size() >= 5)
+    {
+        is_cff = true;
+        cff_analysis["dispatcher_address"] = helpers::format_address(dispatcher);
+        cff_analysis["dispatcher_backedge_count"] = max_backedges;
+
+        json state_var_info;
+        ea_t disp_end = pfn->end_ea;
+        auto it = all_block_starts.upper_bound(dispatcher);
+        if (it != all_block_starts.end())
+            disp_end = *it;
+
+        for (ea_t dc = dispatcher; dc < disp_end && dc != BADADDR;)
+        {
+            insn_t dins;
+            int dlen = decode_insn(&dins, dc);
+            if (dlen <= 0) break;
+
+            if (dins.itype == NN_cmp || dins.itype == NN_sub || dins.itype == NN_test)
+            {
+                qstring dis;
+                generate_disasm_line(&dis, dc, GENDSM_FORCE_CODE);
+                tag_remove(&dis);
+                state_var_info["dispatcher_comparison"] = dis.c_str();
+                state_var_info["comparison_address"]    = helpers::format_address(dc);
+
+                if (dins.ops[0].type == o_reg)
+                    state_var_info["state_register"] = static_cast<int>(dins.ops[0].reg);
+                if (dins.ops[0].type == o_displ || dins.ops[0].type == o_mem)
+                    state_var_info["state_memory"] = helpers::format_address(static_cast<ea_t>(dins.ops[0].addr));
+                break;
+            }
+            dc += dlen;
+        }
+        cff_analysis["state_variable"] = state_var_info;
+
+        json state_blocks = json::array();
+        for (ea_t bs : all_block_starts)
+        {
+            ea_t block_end = pfn->end_ea;
+            auto bit = all_block_starts.upper_bound(bs);
+            if (bit != all_block_starts.end())
+                block_end = *bit;
+
+            ea_t last_insn = bs;
+            for (ea_t a = bs; a < block_end;)
+            {
+                insn_t ti;
+                int tlen = decode_insn(&ti, a);
+                if (tlen <= 0) break;
+                last_insn = a;
+                a += tlen;
+            }
+
+            xrefblk_t xb;
+            bool jumps_to_dispatcher = false;
+            for (bool xok = xb.first_from(last_insn, XREF_ALL); xok; xok = xb.next_from())
+            {
+                if (xb.iscode && xb.to == dispatcher)
+                {
+                    jumps_to_dispatcher = true;
+                    break;
+                }
+            }
+
+            if (jumps_to_dispatcher && bs != dispatcher)
+            {
+                json sb;
+                sb["start"] = helpers::format_address(bs);
+                sb["end"]   = helpers::format_address(block_end);
+
+                for (ea_t a = bs; a < block_end;)
+                {
+                    insn_t si;
+                    int slen = decode_insn(&si, a);
+                    if (slen <= 0) break;
+
+                    if (si.itype == NN_mov && si.ops[1].type == o_imm)
+                    {
+                        if (si.ops[0].type == o_reg || si.ops[0].type == o_displ || si.ops[0].type == o_mem)
+                        {
+                            sb["next_state"] = static_cast<int64_t>(si.ops[1].value);
+                            sb["state_assign_addr"] = helpers::format_address(a);
+                        }
+                    }
+                    a += slen;
+                }
+
+                state_blocks.push_back(std::move(sb));
+            }
+        }
+
+        cff_analysis["state_blocks"]      = std::move(state_blocks);
+        cff_analysis["state_block_count"] = cff_analysis["state_blocks"].size();
+
+        set_cmt(dispatcher, "AiDA: CFF Dispatcher block - state variable switch", false);
+        for (const auto& sb : cff_analysis["state_blocks"])
+        {
+            auto sb_addr = helpers::parse_address(sb.value("start", std::string()));
+            if (sb_addr)
+            {
+                std::string comment = "AiDA: CFF State block";
+                if (sb.contains("next_state"))
+                    comment += " → next_state=" + std::to_string(sb["next_state"].get<int64_t>());
+                set_cmt(*sb_addr, comment.c_str(), false);
+            }
+        }
+    }
+
+    cff_analysis["is_control_flow_flattened"] = is_cff;
+    result["cff_analysis"] = std::move(cff_analysis);
+
+    std::string summary = is_cff
+        ? "Control flow flattening detected and mapped (" + std::to_string(max_backedges) + " state blocks)"
+        : "No control flow flattening pattern detected";
+
+    return tool_result_t::ok(summary, result);
+}
+
+tool_result_t reconstruct_imports(const json& params)
+{
+    auto base_opt = helpers::parse_address(params.value("address", std::string()));
+    ea_t base = base_opt ? *base_opt : inf_get_min_ea();
+    size_t scan_size = params.value("scan_size", (size_t)0x100000);
+
+    json result;
+    result["base"] = helpers::format_address(base);
+
+    uint import_count = get_import_module_qty();
+    json known_imports = json::array();
+    std::map<ea_t, std::string> import_map;
+
+    for (uint i = 0; i < import_count; ++i)
+    {
+        qstring mod_name;
+        get_import_module_name(&mod_name, i);
+
+        struct enum_ctx_t {
+            std::map<ea_t, std::string>* map;
+            std::string module;
+        };
+        enum_ctx_t ctx;
+        ctx.map = &import_map;
+        ctx.module = mod_name.c_str();
+
+        enum_import_names(i, [](ea_t ea, const char* name, uval_t /*ord*/, void* param) -> int {
+            auto* c = static_cast<enum_ctx_t*>(param);
+            if (name && name[0])
+                (*c->map)[ea] = std::string(c->module) + "!" + name;
+            return 1;
+        }, &ctx);
+    }
+
+    json iat_entries = json::array();
+    int resolved = 0;
+    int unresolved = 0;
+
+    for (int si = 0; si < get_segm_qty(); ++si)
+    {
+        segment_t* seg = getnseg(si);
+        if (!seg) continue;
+
+        qstring sname;
+        get_segm_name(&sname, seg);
+
+        bool is_iat = (sname == ".idata" || sname == ".rdata" || sname == "IAT");
+        if (!is_iat) continue;
+
+        for (ea_t ea = seg->start_ea; ea + 8 <= seg->end_ea; ea += 8)
+        {
+            if (!is_loaded(ea)) continue;
+
+            uint64 val = get_qword(ea);
+            if (val == 0 || val == BADADDR) continue;
+
+            qstring target_name;
+            if (get_name(&target_name, static_cast<ea_t>(val)) > 0 && !target_name.empty())
+            {
+                json ie;
+                ie["iat_address"]   = helpers::format_address(ea);
+                ie["target"]        = helpers::format_address(static_cast<ea_t>(val));
+                ie["resolved_name"] = target_name.c_str();
+                iat_entries.push_back(std::move(ie));
+                ++resolved;
+            }
+            else
+            {
+                if (getseg(static_cast<ea_t>(val)))
+                {
+                    ++unresolved;
+                    json ie;
+                    ie["iat_address"] = helpers::format_address(ea);
+                    ie["target"]      = helpers::format_address(static_cast<ea_t>(val));
+                    ie["status"]      = OBFSTR("unresolved");
+                    iat_entries.push_back(std::move(ie));
+                }
+            }
+        }
+    }
+
+    int names_set = 0;
+    for (size_t i = 0; i < import_map.size() && i < 10000; ++i)
+    {
+        // Already handled by the IDA loader for known imports
+    }
+
+    json call_thunks = json::array();
+    for (const auto& iat_entry : iat_entries)
+    {
+        if (iat_entry.value("status", "") != "unresolved") continue;
+
+        auto iat_ea = helpers::parse_address(iat_entry["iat_address"].get<std::string>());
+        if (!iat_ea) continue;
+
+        xrefblk_t xb;
+        int ref_count = 0;
+        for (bool xok = xb.first_to(*iat_ea, XREF_ALL); xok && ref_count < 50; xok = xb.next_to())
+        {
+            ++ref_count;
+            insn_t insn;
+            if (decode_insn(&insn, xb.from) > 0)
+            {
+                if (insn.itype == NN_call || insn.itype == NN_callni ||
+                    insn.itype == NN_jmp || insn.itype == NN_jmpni)
+                {
+                    json ct;
+                    ct["caller"]      = helpers::format_address(xb.from);
+                    ct["iat_slot"]    = helpers::format_address(*iat_ea);
+                    ct["target"]      = iat_entry["target"];
+                    call_thunks.push_back(std::move(ct));
+                }
+            }
+        }
+    }
+
+    result["import_modules"]       = import_count;
+    result["known_imports"]        = import_map.size();
+    result["iat_entries_found"]    = iat_entries.size();
+    result["resolved_entries"]     = resolved;
+    result["unresolved_entries"]   = unresolved;
+    result["iat_entries"]          = std::move(iat_entries);
+    result["call_thunks"]          = std::move(call_thunks);
+    result["names_set"]            = names_set;
+
+    return tool_result_t::ok(OBFSTR("Import reconstruction: ") + std::to_string(resolved) +
+                             " resolved, " + std::to_string(unresolved) + " unresolved", result);
+}
+
+tool_result_t unpack_section(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t section_start = *addr;
+    segment_t* seg = getseg(section_start);
+    if (!seg)
+        return tool_result_t::error(OBFSTR("No segment at ") + helpers::format_address(section_start));
+
+    size_t section_size = params.value("size", static_cast<size_t>(seg->size()));
+    if (section_size > static_cast<size_t>(seg->size()))
+        section_size = static_cast<size_t>(seg->size());
+
+    std::string method = params.value("method", "auto");
+    std::string key_str = params.value("key", "");
+    bool create_code = params.value("create_code", true);
+
+    json result;
+    result["section_start"]  = helpers::format_address(section_start);
+    result["section_size"]   = section_size;
+    result["method"]         = method;
+
+    std::vector<uint8_t> xor_key;
+    if (!key_str.empty())
+    {
+        std::string clean = key_str;
+        clean.erase(std::remove(clean.begin(), clean.end(), ' '), clean.end());
+        for (size_t i = 0; i + 1 < clean.size(); i += 2)
+        {
+            try { xor_key.push_back(static_cast<uint8_t>(std::stoul(clean.substr(i, 2), nullptr, 16))); }
+            catch (...) {}
+        }
+    }
+
+    if (method == "auto" && xor_key.empty())
+    {
+        int best_key = -1;
+        int best_valid = 0;
+
+        for (int k = 1; k < 256; ++k)
+        {
+            int valid_insns = 0;
+            ea_t test_end = std::min(section_start + static_cast<ea_t>(256), section_start + static_cast<ea_t>(section_size));
+
+            for (ea_t a = section_start; a < test_end; ++a)
+            {
+                if (!is_loaded(a)) continue;
+                uint8_t orig = get_byte(a);
+                uint8_t decoded = orig ^ static_cast<uint8_t>(k);
+
+                if (decoded == 0x48 || decoded == 0x49 || decoded == 0x4C ||
+                    decoded == 0x55 || decoded == 0x53 || decoded == 0x56 ||
+                    decoded == 0x41 || decoded == 0x89 || decoded == 0x8B ||
+                    decoded == 0xE8 || decoded == 0xE9 || decoded == 0xEB ||
+                    decoded == 0xC3 || decoded == 0xCC || decoded == 0x90)
+                {
+                    ++valid_insns;
+                }
+            }
+
+            if (valid_insns > best_valid)
+            {
+                best_valid = valid_insns;
+                best_key = k;
+            }
+        }
+
+        if (best_key > 0 && best_valid >= 20)
+        {
+            xor_key.push_back(static_cast<uint8_t>(best_key));
+            method = "xor_single";
+            result["detected_key"] = helpers::format_address(static_cast<ea_t>(best_key));
+            result["key_confidence"] = best_valid;
+        }
+        else
+        {
+            return tool_result_t::error(OBFSTR("Auto-detection failed. Provide an explicit key or method."));
+        }
+    }
+    else if (method == "auto" && !xor_key.empty())
+    {
+        method = (xor_key.size() == 1) ? "xor_single" : "xor_multi";
+    }
+
+    int bytes_patched = 0;
+    show_wait_box("HIDECANCEL\nAiDA: Decrypting section (0x%zX bytes)...", section_size);
+
+    if (method == "xor_single" || method == "xor_multi")
+    {
+        for (size_t i = 0; i < section_size; ++i)
+        {
+            ea_t cur_ea = section_start + i;
+            if (!is_loaded(cur_ea)) continue;
+
+            if (i % 0x10000 == 0)
+                replace_wait_box("HIDECANCEL\nAiDA: Decrypting 0x%zX / 0x%zX...", i, section_size);
+
+            uint8_t orig = get_byte(cur_ea);
+            uint8_t key_byte = xor_key[i % xor_key.size()];
+            uint8_t decrypted = orig ^ key_byte;
+
+            if (decrypted != orig)
+            {
+                patch_byte(cur_ea, decrypted);
+                ++bytes_patched;
+            }
+        }
+    }
+    else if (method == "xor_rolling")
+    {
+        uint8_t rolling = xor_key.empty() ? 0 : xor_key[0];
+        for (size_t i = 0; i < section_size; ++i)
+        {
+            ea_t cur_ea = section_start + i;
+            if (!is_loaded(cur_ea)) continue;
+
+            uint8_t orig = get_byte(cur_ea);
+            uint8_t decrypted = orig ^ rolling;
+            rolling = orig;
+
+            if (decrypted != orig)
+            {
+                patch_byte(cur_ea, decrypted);
+                ++bytes_patched;
+            }
+        }
+    }
+
+    hide_wait_box();
+
+    int insns_created = 0;
+    if (create_code && (seg->perm & SEGPERM_EXEC))
+    {
+        show_wait_box("HIDECANCEL\nAiDA: Re-analyzing decrypted code...");
+
+        del_items(section_start, DELIT_SIMPLE, static_cast<asize_t>(section_size));
+
+        ea_t cur = section_start;
+        ea_t code_end = section_start + static_cast<ea_t>(section_size);
+        while (cur < code_end && cur != BADADDR)
+        {
+            int len = create_insn(cur);
+            if (len > 0)
+            {
+                ++insns_created;
+                cur += len;
+            }
+            else
+            {
+                cur = next_addr(cur);
+                if (cur == BADADDR) break;
+            }
+        }
+
+        auto_mark_range(section_start, code_end, AU_CODE);
+        auto_mark_range(section_start, code_end, AU_FINAL);
+
+        hide_wait_box();
+    }
+
+    result["bytes_patched"]      = bytes_patched;
+    result["instructions_created"] = insns_created;
+    result["method_used"]        = method;
+    if (!xor_key.empty())
+    {
+        std::ostringstream ks;
+        for (size_t i = 0; i < xor_key.size(); ++i)
+        {
+            if (i > 0) ks << " ";
+            ks << std::hex << std::setw(2) << std::setfill('0') << (int)xor_key[i];
+        }
+        result["key_used"] = ks.str();
+    }
+
+    return tool_result_t::ok(OBFSTR("Section unpacked: ") + std::to_string(bytes_patched) +
+                             " bytes decrypted, " + std::to_string(insns_created) + " instructions created", result);
+}
+
+tool_result_t full_deobfuscation_pass(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* pfn = get_func(ea);
+    if (!pfn)
+        return tool_result_t::error(OBFSTR("No function at ") + helpers::format_address(ea));
+
+    bool dry_run = params.value("dry_run", false);
+
+    json result;
+    result["function"] = helpers::get_name_or_address(pfn->start_ea);
+    result["start"]    = helpers::format_address(pfn->start_ea);
+    result["end"]      = helpers::format_address(pfn->end_ea);
+    result["original_size"] = pfn->end_ea - pfn->start_ea;
+
+    json steps = json::array();
+
+    show_wait_box("HIDECANCEL\nAiDA: Full deobfuscation pass...");
+
+    replace_wait_box("HIDECANCEL\nAiDA: Step 1/6 - Detecting obfuscation...");
+    auto detect_result = analysis_tools::detect_obfuscation_patterns(
+        json({{"address", helpers::format_address(ea)}}));
+    steps.push_back({{"step", "detect_obfuscation"},
+                     {"success", detect_result.success},
+                     {"score", detect_result.data.value("obfuscation_score_pct", 0)}});
+
+    int obf_score = detect_result.data.value("obfuscation_score_pct", 0);
+
+    replace_wait_box("HIDECANCEL\nAiDA: Step 2/6 - Resolving opaque predicates...");
+    auto opaque_result = resolve_opaque_predicates(
+        json({{"address", helpers::format_address(ea)}, {"dry_run", dry_run}}));
+    steps.push_back({{"step", "resolve_opaque_predicates"},
+                     {"success", opaque_result.success},
+                     {"count", opaque_result.data.value("count", 0)}});
+
+    replace_wait_box("HIDECANCEL\nAiDA: Step 3/6 - Removing junk code...");
+    auto junk_result = nop_junk_instructions(
+        json({{"address", helpers::format_address(ea)},
+              {"aggressive", obf_score >= 50}}));
+    steps.push_back({{"step", "nop_junk"},
+                     {"success", junk_result.success},
+                     {"nops_patched", junk_result.data.value("nops_patched", 0)}});
+
+    replace_wait_box("HIDECANCEL\nAiDA: Step 4/6 - Decoding strings...");
+    auto strings_result = decode_strings_in_function(
+        json({{"address", helpers::format_address(ea)}, {"add_comments", true}}));
+    steps.push_back({{"step", "decode_strings"},
+                     {"success", strings_result.success},
+                     {"strings_found", strings_result.data.value("total_decoded", 0)}});
+
+    replace_wait_box("HIDECANCEL\nAiDA: Step 5/6 - Analyzing control flow...");
+    auto cff_result = deobfuscate_control_flow(
+        json({{"address", helpers::format_address(ea)}}));
+    steps.push_back({{"step", "deobfuscate_cff"},
+                     {"success", cff_result.success},
+                     {"is_cff", cff_result.data.contains("cff_analysis") ?
+                          cff_result.data["cff_analysis"].value("is_control_flow_flattened", false) : false}});
+
+    int total_changes = opaque_result.data.value("count", 0) +
+                        junk_result.data.value("nops_patched", 0);
+    if (!dry_run && total_changes > 0)
+    {
+        replace_wait_box("HIDECANCEL\nAiDA: Step 6/6 - Rebuilding function...");
+        auto rebuild_result = rebuild_function(
+            json({{"address", helpers::format_address(pfn->start_ea)},
+                  {"force_recreate", true},
+                  {"create_instructions", true}}));
+        steps.push_back({{"step", "rebuild_function"},
+                         {"success", rebuild_result.success},
+                         {"instructions", rebuild_result.data.value("instructions_created", 0)}});
+    }
+    else
+    {
+        steps.push_back({{"step", "rebuild_function"},
+                         {"success", true},
+                         {"note", dry_run ? "Skipped (dry run)" : "Skipped (no patches applied)"}});
+    }
+
+    hide_wait_box();
+
+    if (!dry_run && total_changes > 0)
+    {
+        pfn = get_func(ea);
+        if (pfn)
+            reanalyze_function(pfn);
+    }
+
+    if (!dry_run)
+    {
+        pfn = get_func(ea);
+        if (pfn)
+        {
+            std::string pseudo = helpers::get_pseudocode(pfn->start_ea);
+            if (!pseudo.empty() && pseudo.find("not available") == std::string::npos)
+                result["deobfuscated_pseudocode"] = pseudo;
+        }
+    }
+
+    result["steps"]         = std::move(steps);
+    result["dry_run"]       = dry_run;
+    result["total_changes"] = total_changes;
+
+    if (!dry_run && total_changes > 0)
+    {
+        auto post_detect = analysis_tools::detect_obfuscation_patterns(
+            json({{"address", helpers::format_address(ea)}}));
+        int post_score = post_detect.data.value("obfuscation_score_pct", 0);
+        result["pre_obfuscation_score"]  = obf_score;
+        result["post_obfuscation_score"] = post_score;
+        result["score_reduction"]        = obf_score - post_score;
+    }
+
+    return tool_result_t::ok(OBFSTR("Full deobfuscation pass complete: ") +
+                             std::to_string(total_changes) + " changes", result);
+}
+
+void register_tools()
+{
+    auto& registry = ToolRegistry::instance();
+
+    registry.register_tool({OBFSTR("nop_junk_instructions"), OBFSTR("deobfuscation"),
+        OBFSTR("NOP-out junk instructions in a function: dead code blocks without incoming xrefs, "
+               "long NOP sleds, and unreachable code. Uses patch_byte to preserve originals. "
+               "Set 'aggressive' to true to remove all unreachable code blocks."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true},
+         {OBFSTR("aggressive"), OBFSTR("boolean"), OBFSTR("Aggressively NOP unreachable blocks (default false)"), false},
+         {OBFSTR("nop_threshold"), OBFSTR("number"), OBFSTR("Min consecutive NOPs to report as sled (default 3)"), false}},
+        nop_junk_instructions, false});
+
+    registry.register_tool({OBFSTR("resolve_opaque_predicates"), OBFSTR("deobfuscation"),
+        OBFSTR("Detect and resolve opaque predicates: xor reg,reg + conditional jump patterns. "
+               "Converts always-taken branches to unconditional JMP and NOPs never-taken branches. "
+               "Set dry_run=true to preview without patching."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true},
+         {OBFSTR("dry_run"), OBFSTR("boolean"), OBFSTR("Preview changes without patching (default false)"), false}},
+        resolve_opaque_predicates, false});
+
+    registry.register_tool({OBFSTR("patch_anti_debug"), OBFSTR("deobfuscation"),
+        OBFSTR("Detect and NOP-out anti-debugging techniques in a function: "
+               "IsDebuggerPresent/CheckRemoteDebuggerPresent calls (replaced with xor eax,eax), "
+               "NtQueryInformationProcess, INT 2D/INT 3 traps, and RDTSC timing checks."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function or start address"), true},
+         {OBFSTR("dry_run"), OBFSTR("boolean"), OBFSTR("Preview without patching (default false)"), false},
+         {OBFSTR("patch_api_calls"), OBFSTR("boolean"), OBFSTR("Patch anti-debug API calls (default true)"), false},
+         {OBFSTR("patch_int_traps"), OBFSTR("boolean"), OBFSTR("Patch INT 2D/INT 3 traps (default true)"), false},
+         {OBFSTR("patch_timing"), OBFSTR("boolean"), OBFSTR("Patch RDTSC timing checks (default true)"), false},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Scan size if no function found (default 4096)"), false}},
+        patch_anti_debug, false});
+
+    registry.register_tool({OBFSTR("decode_strings_in_function"), OBFSTR("deobfuscation"),
+        OBFSTR("Decode obfuscated strings in a function: stack-constructed strings (sequential byte MOVs), "
+               "multi-byte immediate moves with packed ASCII, and XOR-encrypted data references. "
+               "Automatically adds decoded string values as IDA comments."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true},
+         {OBFSTR("add_comments"), OBFSTR("boolean"), OBFSTR("Add decoded values as IDA comments (default true)"), false}},
+        decode_strings_in_function, false});
+
+    registry.register_tool({OBFSTR("rebuild_function"), OBFSTR("deobfuscation"),
+        OBFSTR("Re-analyze function boundaries after deobfuscation patches. "
+               "Deletes the existing function, undefines bytes, recreates instructions, "
+               "and rebuilds the function with auto-analysis. Use after patching."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function start address"), true},
+         {OBFSTR("force_recreate"), OBFSTR("boolean"), OBFSTR("Delete and fully recreate (default false)"), false},
+         {OBFSTR("create_instructions"), OBFSTR("boolean"), OBFSTR("Create instructions during rebuild (default true)"), false}},
+        rebuild_function, false});
+
+    registry.register_tool({OBFSTR("identify_protector"), OBFSTR("deobfuscation"),
+        OBFSTR("Identify protection/packing schemes: VMProtect, Themida/WinLicense, UPX, ASPack, "
+               "Enigma, PECompact, etc. Scans section names, byte signatures at entry point, "
+               "string references, and calculates section entropy to detect packed/encrypted regions."),
+        {{OBFSTR("scan_size"), OBFSTR("number"), OBFSTR("Bytes to scan (default 1MB, max 16MB)"), false}},
+        identify_protector});
+
+    registry.register_tool({OBFSTR("deobfuscate_control_flow"), OBFSTR("deobfuscation"),
+        OBFSTR("Detect and map control flow flattening (CFF) in a function. "
+               "Identifies: the dispatcher block (dominant back-edge target), "
+               "state variable (comparison in dispatcher), state blocks (jump-back-to-dispatcher blocks), "
+               "and state transitions. Annotates the structure with IDA comments."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
+        deobfuscate_control_flow});
+
+    registry.register_tool({OBFSTR("reconstruct_imports"), OBFSTR("deobfuscation"),
+        OBFSTR("Rebuild import table after unpacking. Scans IAT segments (.idata, .rdata) "
+               "for pointer entries, resolves them against known imports, and identifies "
+               "unresolved call thunks that need manual resolution."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Base address (default min_ea)"), false},
+         {OBFSTR("scan_size"), OBFSTR("number"), OBFSTR("Scan range in bytes (default 1MB)"), false}},
+        reconstruct_imports, false});
+
+    registry.register_tool({OBFSTR("unpack_section"), OBFSTR("deobfuscation"),
+        OBFSTR("Decrypt/unpack a packed section directly in the IDB. Supports: "
+               "single-byte XOR (auto-detects key), multi-byte XOR key, and rolling XOR. "
+               "After decryption, optionally creates instructions and triggers re-analysis. "
+               "Use identify_protector first to find packed sections."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Section start address"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes to decrypt (default: full segment)"), false},
+         {OBFSTR("method"), OBFSTR("string"), OBFSTR("Decryption method: auto, xor_single, xor_multi, xor_rolling"), false,
+          {OBFSTR("auto"), OBFSTR("xor_single"), OBFSTR("xor_multi"), OBFSTR("xor_rolling")}},
+         {OBFSTR("key"), OBFSTR("string"), OBFSTR("XOR key as hex bytes (e.g. '4A' or '4A 5B 6C')"), false},
+         {OBFSTR("create_code"), OBFSTR("boolean"), OBFSTR("Create instructions after decrypt (default true)"), false}},
+        unpack_section, false});
+
+    registry.register_tool({OBFSTR("full_deobfuscation_pass"), OBFSTR("deobfuscation"),
+        OBFSTR("Complete automated deobfuscation pipeline for a function: "
+               "(1) Detect obfuscation patterns and compute score, "
+               "(2) Resolve opaque predicates, "
+               "(3) NOP junk instructions, "
+               "(4) Decode hidden strings and add comments, "
+               "(5) Analyze control flow flattening, "
+               "(6) Rebuild function with re-analysis. "
+               "Produces before/after obfuscation scores and deobfuscated pseudocode."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true},
+         {OBFSTR("dry_run"), OBFSTR("boolean"), OBFSTR("Preview all steps without patching (default false)"), false}},
+        full_deobfuscation_pass, false});
+}
+
+} // namespace deobfuscation_tools
+
+namespace advanced_analysis_tools
+{
+
+// ========================= AGGRESSIVE FUNCTION DISCOVERY =========================
+// Scans a memory range for common x86-64 function prologues and creates functions
+// at every match. This is critical for analyzing dumped modules where IDA's
+// auto-analysis fails to discover functions (e.g., obfuscated kernel drivers).
+//
+// IDA SDK justification:
+//   decode_insn(insn_t *out, ea_t ea) — ua.hpp L1509
+//     "Decode instruction at the specified address."
+//   add_func(ea_t ea1, ea_t ea2=BADADDR) — funcs.hpp L405-L409
+//     "inline bool add_func(ea_t ea1, ea_t ea2=BADADDR) { func_t fn(ea1, ea2); return add_func_ex(&fn); }"
+//   create_insn(ea_t ea, insn_t *out=nullptr) — ua.hpp L1498
+//     "Create an instruction at the specified address."
+//   auto_make_proc(ea_t ea) — auto.hpp L178-L182
+//     "inline void auto_make_proc(ea_t ea) { auto_make_code(ea); auto_mark(ea, AU_PROC); }"
+//   plan_and_wait(ea_t ea1, ea_t ea2, bool final_pass=true) — auto.hpp L232
+//     "Plan reanalysis of a range and wait for it."
+//   get_func(ea_t ea) — funcs.hpp L293
+//     "Get pointer to function structure by address."
+//   is_loaded(ea_t ea) — bytes.hpp L363
+//     "Is the specified address loaded from the input file?"
+//   is_code(flags64_t F) — bytes.hpp L785
+//     "inline THREAD_SAFE constexpr bool idaapi is_code(flags64_t F) { return (F & MS_CLS) == FF_CODE; }"
+tool_result_t aggressive_function_discovery(const json& params)
+{
+    auto start_opt = helpers::parse_address(params.value("start", std::string()));
+    auto end_opt   = helpers::parse_address(params.value("end", std::string()));
+
+    ea_t scan_start = start_opt ? *start_opt : inf_get_min_ea();
+    ea_t scan_end   = end_opt   ? *end_opt   : inf_get_max_ea();
+
+    if (scan_end <= scan_start)
+        return tool_result_t::error(OBFSTR("Invalid range: end <= start"));
+
+    if (scan_end - scan_start > 0x10000000)
+        scan_end = scan_start + 0x10000000; // cap at 256MB
+
+    bool code_only = params.value("code_segments_only", true);
+    bool create_code_first = params.value("create_code", true);
+    int limit = params.value("limit", 10000);
+    if (limit < 1) limit = 1;
+    if (limit > 100000) limit = 100000;
+
+    // Common x86-64 function prologues:
+    // 1. push rbp; mov rbp, rsp           (55 48 89 E5)
+    // 2. push rbp; mov rbp, rsp (alt enc) (55 48 8B EC)
+    // 3. sub rsp, imm8                    (48 83 EC xx)
+    // 4. push rbx; sub rsp, imm8          (53 48 83 EC xx)
+    // 5. push rdi                         (57) followed by sub rsp pattern
+    // 6. push rsi                         (56) followed by sub rsp pattern
+    // 7. mov [rsp+8], rcx (MS ABI home)   (48 89 4C 24 08)
+    // 8. mov [rsp+10h], rdx (MS ABI)      (48 89 54 24 10)
+    // 9. push r14; push r13               (41 56 41 55)
+    // 10. int 3 padding before next func  (CC before a new prologue)
+    // 11. push rbx (53) at function start
+    // 12. push rdi; push rsi; push rbx    (57 56 53)
+    //
+    // Kernel-specific:
+    // 13. mov rax, rsp; sub rsp, xx       (48 8B C4 48 83 EC xx) or (48 8B C4 48 81 EC)
+    // 14. push rbp; sub rsp, xx           (55 48 83 EC xx)
+
+    struct prologue_sig_t {
+        const char* name;
+        const uint8_t* bytes;
+        const uint8_t* mask;
+        int length;
+    };
+
+    // Pattern bytes and masks
+    static const uint8_t p1_b[] = {0x55, 0x48, 0x89, 0xE5};
+    static const uint8_t p1_m[] = {0xFF, 0xFF, 0xFF, 0xFF};
+
+    static const uint8_t p2_b[] = {0x55, 0x48, 0x8B, 0xEC};
+    static const uint8_t p2_m[] = {0xFF, 0xFF, 0xFF, 0xFF};
+
+    static const uint8_t p3_b[] = {0x48, 0x83, 0xEC, 0x00};
+    static const uint8_t p3_m[] = {0xFF, 0xFF, 0xFF, 0x00};
+
+    static const uint8_t p4_b[] = {0x53, 0x48, 0x83, 0xEC, 0x00};
+    static const uint8_t p4_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+
+    static const uint8_t p5_b[] = {0x48, 0x89, 0x4C, 0x24, 0x08};
+    static const uint8_t p5_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    static const uint8_t p6_b[] = {0x48, 0x89, 0x54, 0x24, 0x10};
+    static const uint8_t p6_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    static const uint8_t p7_b[] = {0x41, 0x56, 0x41, 0x55};
+    static const uint8_t p7_m[] = {0xFF, 0xFF, 0xFF, 0xFF};
+
+    static const uint8_t p8_b[] = {0x57, 0x56, 0x53};
+    static const uint8_t p8_m[] = {0xFF, 0xFF, 0xFF};
+
+    static const uint8_t p9_b[] = {0x48, 0x8B, 0xC4, 0x48, 0x83, 0xEC};
+    static const uint8_t p9_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    static const uint8_t p10_b[] = {0x48, 0x8B, 0xC4, 0x48, 0x81, 0xEC};
+    static const uint8_t p10_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    static const uint8_t p11_b[] = {0x55, 0x48, 0x83, 0xEC, 0x00};
+    static const uint8_t p11_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+
+    static const uint8_t p12_b[] = {0x48, 0x89, 0x5C, 0x24, 0x00, 0x48, 0x89, 0x74, 0x24};
+    static const uint8_t p12_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    static const uint8_t p13_b[] = {0x48, 0x89, 0x5C, 0x24, 0x00, 0x57, 0x48, 0x83, 0xEC};
+    static const uint8_t p13_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    static const uint8_t p14_b[] = {0x40, 0x53, 0x48, 0x83, 0xEC};
+    static const uint8_t p14_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    static const uint8_t p15_b[] = {0x40, 0x55, 0x48, 0x83, 0xEC};
+    static const uint8_t p15_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    static const uint8_t p16_b[] = {0x40, 0x57, 0x48, 0x83, 0xEC};
+    static const uint8_t p16_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    static const uint8_t p17_b[] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58};
+    static const uint8_t p17_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    static const uint8_t p18_b[] = {0x4C, 0x8B, 0xDC, 0x49, 0x89};
+    static const uint8_t p18_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    static const prologue_sig_t signatures[] = {
+        {"push_rbp_mov_rbp_rsp",           p1_b,  p1_m,  4},
+        {"push_rbp_mov_rbp_rsp_alt",       p2_b,  p2_m,  4},
+        {"sub_rsp_imm8",                   p3_b,  p3_m,  4},
+        {"push_rbx_sub_rsp",              p4_b,  p4_m,  5},
+        {"mov_rsp8_rcx_msabi",             p5_b,  p5_m,  5},
+        {"mov_rsp10_rdx_msabi",            p6_b,  p6_m,  5},
+        {"push_r14_r13",                   p7_b,  p7_m,  4},
+        {"push_rdi_rsi_rbx",              p8_b,  p8_m,  3},
+        {"mov_rax_rsp_sub_rsp_imm8",       p9_b,  p9_m,  6},
+        {"mov_rax_rsp_sub_rsp_imm32",      p10_b, p10_m, 6},
+        {"push_rbp_sub_rsp",              p11_b, p11_m, 5},
+        {"save_rbx_rsi_ms64",             p12_b, p12_m, 9},
+        {"save_rbx_push_rdi_sub_rsp",     p13_b, p13_m, 9},
+        {"rex_push_rbx_sub_rsp",          p14_b, p14_m, 5},
+        {"rex_push_rbp_sub_rsp",          p15_b, p15_m, 5},
+        {"rex_push_rdi_sub_rsp",          p16_b, p16_m, 5},
+        {"mov_rax_rsp_save_rbx",          p17_b, p17_m, 6},
+        {"mov_r11_rsp_save_pattern",      p18_b, p18_m, 5},
+    };
+    constexpr int NUM_SIGS = sizeof(signatures) / sizeof(signatures[0]);
+
+    json result;
+    json functions_created = json::array();
+    json prologue_types = json::object();
+    int total_found = 0;
+    int total_created = 0;
+    int already_function = 0;
+    int creation_failed = 0;
+
+    show_wait_box("HIDECANCEL\nAiDA: Aggressive function discovery (scanning 0x%llX bytes)...",
+                  (unsigned long long)(scan_end - scan_start));
+
+    for (ea_t ea = scan_start; ea < scan_end && total_found < limit; )
+    {
+        if ((ea - scan_start) % 0x10000 == 0)
+            replace_wait_box("HIDECANCEL\nAiDA: Function discovery 0x%llX / 0x%llX (%d found, %d created)",
+                             (unsigned long long)(ea - scan_start),
+                             (unsigned long long)(scan_end - scan_start),
+                             total_found, total_created);
+
+        if (!is_loaded(ea))
+        {
+            ea = next_addr(ea);
+            if (ea == BADADDR) break;
+            continue;
+        }
+
+        // Skip if inside an existing function
+        if (get_func(ea))
+        {
+            func_t* fn = get_func(ea);
+            ea = fn->end_ea;
+            continue;
+        }
+
+        // Check code-only segments
+        if (code_only)
+        {
+            segment_t* seg = getseg(ea);
+            if (!seg || !(seg->perm & SEGPERM_EXEC))
+            {
+                if (seg) ea = seg->end_ea;
+                else ea = next_addr(ea);
+                continue;
+            }
+        }
+
+        // Check against each prologue signature
+        bool matched = false;
+        for (int s = 0; s < NUM_SIGS && !matched; ++s)
+        {
+            const auto& sig = signatures[s];
+            if (ea + sig.length > scan_end) continue;
+
+            bool sig_match = true;
+            for (int b = 0; b < sig.length; ++b)
+            {
+                if (!is_loaded(ea + b)) { sig_match = false; break; }
+                uint8_t byte_val = get_byte(ea + b);
+                if ((byte_val & sig.mask[b]) != (sig.bytes[b] & sig.mask[b]))
+                {
+                    sig_match = false;
+                    break;
+                }
+            }
+
+            if (!sig_match) continue;
+
+            // Additional validation: try decoding as an instruction
+            insn_t test_insn;
+            if (decode_insn(&test_insn, ea) <= 0) continue;
+
+            // Further validate: check if at least a few instructions decode successfully
+            int valid_insns = 0;
+            ea_t check = ea;
+            for (int i = 0; i < 8 && check < scan_end; ++i)
+            {
+                insn_t chk;
+                int clen = decode_insn(&chk, check);
+                if (clen <= 0) break;
+                ++valid_insns;
+                check += clen;
+                // Stop at return instruction — a valid function
+                if (chk.itype == NN_retn || chk.itype == NN_retf ||
+                    chk.itype == NN_retnw || chk.itype == NN_retnd ||
+                    chk.itype == NN_retnq)
+                    break;
+            }
+
+            // Need at least 3 valid instructions to consider it a function
+            if (valid_insns < 3) continue;
+
+            matched = true;
+            ++total_found;
+
+            // Track prologue type distribution
+            std::string sig_name = sig.name;
+            prologue_types[sig_name] = prologue_types.value(sig_name, 0) + 1;
+
+            // Create code first if requested
+            if (create_code_first)
+                create_insn(ea);
+
+            // Try to create function
+            bool created = add_func(ea, BADADDR);
+            if (created)
+            {
+                ++total_created;
+                if (total_created <= 200) // limit result payload size
+                {
+                    json entry;
+                    entry["address"]  = helpers::format_address(ea);
+                    entry["prologue"] = sig.name;
+                    func_t* fn = get_func(ea);
+                    if (fn)
+                    {
+                        entry["end"]  = helpers::format_address(fn->end_ea);
+                        entry["size"] = fn->end_ea - fn->start_ea;
+                    }
+                    functions_created.push_back(std::move(entry));
+                }
+            }
+            else if (get_func(ea))
+            {
+                ++already_function;
+            }
+            else
+            {
+                ++creation_failed;
+            }
+        }
+
+        if (!matched) ++ea;
+        else
+        {
+            func_t* fn = get_func(ea);
+            if (fn) ea = fn->end_ea;
+            else ea += 1;
+        }
+    }
+
+    hide_wait_box();
+
+    // Run auto-analysis on the whole range if we created any functions
+    if (total_created > 0)
+    {
+        show_wait_box("HIDECANCEL\nAiDA: Running auto-analysis after function discovery...");
+        plan_range(scan_start, scan_end);
+        auto_wait();
+        hide_wait_box();
+    }
+
+    result["scan_start"]       = helpers::format_address(scan_start);
+    result["scan_end"]         = helpers::format_address(scan_end);
+    result["scan_size"]        = scan_end - scan_start;
+    result["prologues_found"]  = total_found;
+    result["functions_created"] = total_created;
+    result["already_function"] = already_function;
+    result["creation_failed"]  = creation_failed;
+    result["prologue_types"]   = prologue_types;
+    result["functions"]        = std::move(functions_created);
+
+    return tool_result_t::ok(
+        OBFSTR("Aggressive function discovery: found ") + std::to_string(total_found) +
+        OBFSTR(" prologues, created ") + std::to_string(total_created) + OBFSTR(" functions"),
+        result);
+}
+
+// ========================= FORCE CREATE CODE REGION =========================
+// Forces creation of instructions across an entire memory range by doing a
+// linear sweep. This is essential for kernel driver dumps where large regions
+// remain "unexplored bytes" after IDA's auto-analysis.
+//
+// IDA SDK justification:
+//   del_items(ea, flags, nbytes) — bytes.hpp L830-L834
+//     "idaman bool ida_export del_items(ea_t ea, int flags=0, asize_t nbytes=1, ...);"
+//   create_insn(ea_t ea, insn_t *out=nullptr) — ua.hpp L1498
+//     "Create an instruction at the specified address."
+//   auto_make_code(ea_t ea) — auto.hpp L173-L176
+//     "inline void auto_make_code(ea_t ea) { auto_mark(ea, AU_CODE); }"
+//   plan_and_wait(ea1, ea2, final_pass) — auto.hpp L232
+//     "idaman int ida_export plan_and_wait(ea_t ea1, ea_t ea2, bool final_pass=true);"
+//   is_code(F) — bytes.hpp L785
+//     "inline THREAD_SAFE constexpr bool idaapi is_code(flags64_t F) { return (F & MS_CLS) == FF_CODE; }"
+tool_result_t force_create_code_region(const json& params)
+{
+    auto start_opt = helpers::parse_address(params["start"].get<std::string>());
+    if (!start_opt)
+        return tool_result_t::error(OBFSTR("Invalid start address"));
+
+    ea_t start = *start_opt;
+    ea_t end = BADADDR;
+    if (params.contains("end"))
+    {
+        auto end_opt = helpers::parse_address(params["end"].get<std::string>());
+        if (end_opt) end = *end_opt;
+    }
+
+    if (end == BADADDR)
+    {
+        segment_t* seg = getseg(start);
+        if (seg)
+            end = seg->end_ea;
+        else
+            end = start + params.value("size", (size_t)0x10000);
+    }
+
+    if (end <= start)
+        return tool_result_t::error(OBFSTR("Invalid range: end <= start"));
+
+    if (end - start > 0x2000000) // 32MB max
+        end = start + 0x2000000;
+
+    bool undefine_first = params.value("undefine_first", false);
+    bool create_functions = params.value("create_functions", true);
+
+    json result;
+    result["start"] = helpers::format_address(start);
+    result["end"]   = helpers::format_address(end);
+    result["size"]  = end - start;
+
+    int insns_created = 0;
+    int errors = 0;
+    int funcs_created = 0;
+    std::vector<ea_t> potential_func_starts;
+
+    show_wait_box("HIDECANCEL\nAiDA: Force-creating code (0x%llX bytes)...",
+                  (unsigned long long)(end - start));
+
+    // Optionally undefine the range first
+    if (undefine_first)
+    {
+        replace_wait_box("HIDECANCEL\nAiDA: Undefining existing items...");
+        del_items(start, DELIT_SIMPLE, static_cast<asize_t>(end - start));
+    }
+
+    // Linear sweep disassembly
+    ea_t cur = start;
+    ea_t prev_ea = BADADDR;
+    while (cur < end && cur != BADADDR)
+    {
+        if ((cur - start) % 0x10000 == 0)
+            replace_wait_box("HIDECANCEL\nAiDA: Creating code 0x%llX / 0x%llX (%d insns)",
+                             (unsigned long long)(cur - start),
+                             (unsigned long long)(end - start),
+                             insns_created);
+
+        if (!is_loaded(cur))
+        {
+            cur = next_addr(cur);
+            if (cur == BADADDR) break;
+            continue;
+        }
+
+        // Skip if already code
+        flags64_t f = get_flags(cur);
+        if (is_code(f))
+        {
+            insn_t existing;
+            int elen = decode_insn(&existing, cur);
+            if (elen > 0)
+            {
+                cur += elen;
+                continue;
+            }
+        }
+
+        // Try to create an instruction
+        int len = create_insn(cur);
+        if (len > 0)
+        {
+            ++insns_created;
+
+            // Detect potential function starts from INT3 padding
+            if (prev_ea != BADADDR && get_byte(prev_ea) == 0xCC)
+            {
+                potential_func_starts.push_back(cur);
+            }
+
+            // Detect function starts from return instruction followed by new code
+            insn_t test_prev;
+            if (prev_ea != BADADDR && decode_insn(&test_prev, prev_ea) > 0)
+            {
+                if (test_prev.itype == NN_retn || test_prev.itype == NN_retf ||
+                    test_prev.itype == NN_retnw || test_prev.itype == NN_retnd ||
+                    test_prev.itype == NN_retnq)
+                {
+                    potential_func_starts.push_back(cur);
+                }
+            }
+
+            prev_ea = cur;
+            cur += len;
+        }
+        else
+        {
+            ++errors;
+            prev_ea = cur;
+            cur = next_addr(cur);
+            if (cur == BADADDR) break;
+        }
+    }
+
+    // Create functions at detected potential starts
+    if (create_functions && !potential_func_starts.empty())
+    {
+        replace_wait_box("HIDECANCEL\nAiDA: Creating functions at detected boundaries...");
+        for (ea_t fstart : potential_func_starts)
+        {
+            if (!get_func(fstart))
+            {
+                if (add_func(fstart, BADADDR))
+                    ++funcs_created;
+            }
+        }
+    }
+
+    hide_wait_box();
+
+    // Final auto-analysis pass
+    if (insns_created > 0)
+    {
+        show_wait_box("HIDECANCEL\nAiDA: Running auto-analysis on new code...");
+        plan_and_wait(start, end, true);
+        hide_wait_box();
+    }
+
+    result["instructions_created"] = insns_created;
+    result["errors"]               = errors;
+    result["functions_created"]    = funcs_created;
+    result["potential_func_starts"] = potential_func_starts.size();
+
+    return tool_result_t::ok(
+        OBFSTR("Force-created ") + std::to_string(insns_created) +
+        OBFSTR(" instructions, ") + std::to_string(funcs_created) +
+        OBFSTR(" functions in range"), result);
+}
+
+// ========================= DEEP RECONSTRUCT IMPORTS =========================
+// A more comprehensive import reconstruction tool that:
+// - Scans ALL writable/readable segments for pointer-sized values pointing to code
+// - Resolves kernel import patterns (KeXxx, ExXxx, RtlXxx, MmXxx, IoXxx, etc.)
+// - Identifies GetProcAddress/MmGetSystemRoutineAddress-style resolution patterns
+// - Names resolved imports in the IDB
+//
+// IDA SDK justification:
+//   set_name(ea, name, flags) — name.hpp L51
+//     "idaman bool ida_export set_name(ea_t ea, const char *name, int flags=0);"
+//   SN_FORCE — name.hpp L76
+//     "#define SN_FORCE 0x800 // if name exists, try variations with _123 suffix"
+//   SN_NOCHECK — name.hpp L57
+//     "#define SN_NOCHECK 0x01 // Replace invalid chars silently with '_'"
+//   add_dref(from, to, type) — xref.hpp L146
+//     "idaman bool ida_export add_dref(ea_t from, ea_t to, dref_t type);"
+//   get_segm_qty() — segment.hpp L642
+//     "idaman int ida_export get_segm_qty();"
+//   getnseg(int n) — segment.hpp L658
+//     "idaman segment_t *ida_export getnseg(int n);"
+tool_result_t deep_reconstruct_imports(const json& params)
+{
+    auto base_opt = helpers::parse_address(params.value("address", std::string()));
+    ea_t base = base_opt ? *base_opt : inf_get_min_ea();
+    bool name_imports = params.value("name_imports", true);
+    bool scan_kernel = params.value("kernel_imports", true);
+    int limit = params.value("limit", 5000);
+
+    json result;
+    result["base"] = helpers::format_address(base);
+
+    // Collect existing IDA imports
+    uint import_count = get_import_module_qty();
+    std::map<ea_t, std::string> known_imports;
+
+    for (uint i = 0; i < import_count; ++i)
+    {
+        qstring mod_name;
+        get_import_module_name(&mod_name, i);
+
+        struct ctx_t {
+            std::map<ea_t, std::string>* map;
+            std::string module;
+        } ctx;
+        ctx.map = &known_imports;
+        ctx.module = mod_name.c_str();
+
+        enum_import_names(i, [](ea_t ea, const char* name, uval_t, void* param) -> int {
+            auto* c = static_cast<ctx_t*>(param);
+            if (name && name[0])
+                (*c->map)[ea] = std::string(c->module) + "!" + name;
+            return 1;
+        }, &ctx);
+    }
+
+    // Build a set of code segment ranges for validation
+    struct code_range_t { ea_t start; ea_t end; };
+    std::vector<code_range_t> code_ranges;
+    for (int si = 0; si < get_segm_qty(); ++si)
+    {
+        segment_t* seg = getnseg(si);
+        if (!seg) continue;
+        if (seg->perm & SEGPERM_EXEC)
+            code_ranges.push_back({seg->start_ea, seg->end_ea});
+    }
+
+    auto is_code_addr = [&](ea_t addr) -> bool {
+        for (const auto& r : code_ranges)
+            if (addr >= r.start && addr < r.end) return true;
+        return false;
+    };
+
+    // Scan ALL segments for pointer-sized values that point to code
+    json iat_entries = json::array();
+    int resolved = 0;
+    int unresolved = 0;
+    int named = 0;
+
+    show_wait_box("HIDECANCEL\nAiDA: Deep import reconstruction...");
+
+    for (int si = 0; si < get_segm_qty(); ++si)
+    {
+        segment_t* seg = getnseg(si);
+        if (!seg) continue;
+
+        qstring sname;
+        get_segm_name(&sname, seg);
+
+        // Scan writable or .rdata or .idata type segments
+        bool scan_this = (seg->perm & SEGPERM_WRITE) ||
+                         sname == ".rdata" || sname == ".idata" || sname == "IAT" ||
+                         sname == ".data"  || sname == ".gfids" || sname == ".00cfg";
+        if (!scan_this) continue;
+
+        replace_wait_box("HIDECANCEL\nAiDA: Scanning segment %s for IAT entries...",
+                         sname.c_str());
+
+        for (ea_t ea = seg->start_ea;
+             ea + 8 <= seg->end_ea && (int)iat_entries.size() < limit;
+             ea += 8)
+        {
+            if (!is_loaded(ea)) continue;
+
+            uint64 val = get_qword(ea);
+            if (val == 0 || val == BADADDR) continue;
+
+            ea_t target = static_cast<ea_t>(val);
+
+            // Does this point to something meaningful?
+            if (!getseg(target)) continue;
+
+            qstring target_name;
+            bool has_name = (get_name(&target_name, target) > 0 && !target_name.empty());
+
+            // Already a known import?
+            if (known_imports.count(target))
+            {
+                json ie;
+                ie["iat_address"]   = helpers::format_address(ea);
+                ie["target"]        = helpers::format_address(target);
+                ie["resolved_name"] = known_imports[target];
+                ie["source"]        = "ida_import";
+                iat_entries.push_back(std::move(ie));
+                ++resolved;
+                continue;
+            }
+
+            if (has_name)
+            {
+                // Named target — likely a resolved import
+                std::string name_str = target_name.c_str();
+                // Skip auto-generated names (sub_xxx, loc_xxx)
+                if (name_str.find("sub_") == 0 || name_str.find("loc_") == 0 ||
+                    name_str.find("unk_") == 0 || name_str.find("byte_") == 0)
+                {
+                    if (is_code_addr(target))
+                    {
+                        ++unresolved;
+                        json ie;
+                        ie["iat_address"]   = helpers::format_address(ea);
+                        ie["target"]        = helpers::format_address(target);
+                        ie["status"]        = "unresolved_code_target";
+                        iat_entries.push_back(std::move(ie));
+                    }
+                    continue;
+                }
+
+                json ie;
+                ie["iat_address"]   = helpers::format_address(ea);
+                ie["target"]        = helpers::format_address(target);
+                ie["resolved_name"] = name_str;
+                ie["source"]        = "named_target";
+                iat_entries.push_back(std::move(ie));
+                ++resolved;
+
+                // Propagate name to the IAT slot
+                if (name_imports)
+                {
+                    qstring slot_name;
+                    if (get_name(&slot_name, ea) <= 0 || slot_name.empty() ||
+                        slot_name.c_str()[0] == 'q')
+                    {
+                        std::string ptr_name = "__imp_" + name_str;
+                        if (set_name(ea, ptr_name.c_str(), SN_NOCHECK | SN_FORCE | SN_NOWARN))
+                            ++named;
+                    }
+                }
+                continue;
+            }
+
+            // Unknown target in code — unresolved
+            if (is_code_addr(target))
+            {
+                ++unresolved;
+                json ie;
+                ie["iat_address"] = helpers::format_address(ea);
+                ie["target"]      = helpers::format_address(target);
+                ie["status"]      = "unresolved";
+                iat_entries.push_back(std::move(ie));
+            }
+        }
+    }
+
+    // Scan for kernel import resolution patterns
+    // MmGetSystemRoutineAddress calls followed by storing result
+    json kernel_imports = json::array();
+    if (scan_kernel)
+    {
+        replace_wait_box("HIDECANCEL\nAiDA: Scanning for kernel import resolution patterns...");
+
+        // Scan code for call instructions to MmGetSystemRoutineAddress
+        ea_t mm_get_routine = get_name_ea(BADADDR, "MmGetSystemRoutineAddress");
+        if (mm_get_routine != BADADDR)
+        {
+            xrefblk_t xb;
+            for (bool ok = xb.first_to(mm_get_routine, XREF_ALL); ok; ok = xb.next_to())
+            {
+                if (!xb.iscode) continue;
+                // The caller is resolving an import dynamically
+                func_t* caller_fn = get_func(xb.from);
+                if (!caller_fn) continue;
+
+                json ki;
+                ki["resolver_address"] = helpers::format_address(xb.from);
+                ki["resolver_func"]    = helpers::get_name_or_address(caller_fn->start_ea);
+                ki["api"]              = "MmGetSystemRoutineAddress";
+                kernel_imports.push_back(std::move(ki));
+            }
+        }
+
+        // Also check for imports resolved via ntoskrnl RVA table walks
+        static const char* kernel_apis[] = {
+            "ExAllocatePoolWithTag", "ExFreePoolWithTag", "ExAllocatePool2",
+            "MmCopyVirtualMemory", "MmCopyMemory", "MmMapLockedPagesSpecifyCache",
+            "IoCreateDevice", "IoDeleteDevice", "IoCreateSymbolicLink",
+            "IoAllocateMdl", "IoBuildIrp",
+            "KeStackAttachProcess", "KeUnstackDetachProcess",
+            "KeWaitForSingleObject", "KeDelayExecutionThread",
+            "ObReferenceObjectByHandle", "ObfDereferenceObject",
+            "PsLookupProcessByProcessId", "PsGetProcessPeb",
+            "PsGetCurrentProcessId", "PsGetProcessImageFileName",
+            "RtlInitUnicodeString", "RtlCopyUnicodeString",
+            "ZwClose", "ZwOpenProcess", "ZwQuerySystemInformation",
+            "ZwQueryVirtualMemory", "ZwReadVirtualMemory",
+            "NtQuerySystemInformation",
+            "ProbeForRead", "ProbeForWrite",
+            nullptr
+        };
+
+        for (int k = 0; kernel_apis[k]; ++k)
+        {
+            ea_t api_ea = get_name_ea(BADADDR, kernel_apis[k]);
+            if (api_ea == BADADDR) continue;
+
+            xrefblk_t xb;
+            int ref_count = 0;
+            for (bool ok = xb.first_to(api_ea, XREF_ALL); ok && ref_count < 100; ok = xb.next_to())
+            {
+                ++ref_count;
+                json ki;
+                ki["api"]     = kernel_apis[k];
+                ki["address"] = helpers::format_address(api_ea);
+                ki["xref"]    = helpers::format_address(xb.from);
+                ki["type"]    = xb.iscode ? "call" : "data";
+                kernel_imports.push_back(std::move(ki));
+            }
+        }
+    }
+
+    hide_wait_box();
+
+    // Generate result
+    json thunks = json::array();
+    for (const auto& entry : iat_entries)
+    {
+        if (entry.value("status", "") != "unresolved") continue;
+
+        auto iat_ea = helpers::parse_address(entry["iat_address"].get<std::string>());
+        if (!iat_ea) continue;
+
+        xrefblk_t xb;
+        int ref_count = 0;
+        for (bool ok = xb.first_to(*iat_ea, XREF_ALL); ok && ref_count < 50; ok = xb.next_to())
+        {
+            ++ref_count;
+            insn_t insn;
+            if (decode_insn(&insn, xb.from) > 0)
+            {
+                if (insn.itype == NN_call || insn.itype == NN_callni ||
+                    insn.itype == NN_jmp || insn.itype == NN_jmpni)
+                {
+                    json ct;
+                    ct["caller"]   = helpers::format_address(xb.from);
+                    ct["iat_slot"] = helpers::format_address(*iat_ea);
+                    ct["target"]   = entry["target"];
+                    thunks.push_back(std::move(ct));
+                }
+            }
+        }
+    }
+
+    result["import_modules"]     = import_count;
+    result["known_imports"]      = known_imports.size();
+    result["iat_entries_found"]  = iat_entries.size();
+    result["resolved"]           = resolved;
+    result["unresolved"]         = unresolved;
+    result["names_set"]          = named;
+    result["kernel_imports"]     = std::move(kernel_imports);
+    result["iat_entries"]        = std::move(iat_entries);
+    result["call_thunks"]        = std::move(thunks);
+
+    return tool_result_t::ok(
+        OBFSTR("Deep import reconstruction: ") + std::to_string(resolved) +
+        OBFSTR(" resolved, ") + std::to_string(unresolved) +
+        OBFSTR(" unresolved, ") + std::to_string(named) + OBFSTR(" named"),
+        result);
+}
+
+// ========================= ANALYZE PE HEADER =========================
+// Parses the PE header at a given address (in the IDB) to extract sections,
+// exports, imports, and other metadata. Essential for dumped modules that
+// have PE headers but aren't parsed by IDA's loader.
+//
+// IDA SDK justification:
+//   get_byte(ea_t ea) — bytes.hpp L383
+//     "idaman uchar ida_export get_byte(ea_t ea);"
+//   is_loaded(ea_t ea) — bytes.hpp L363
+//     "idaman bool ida_export is_loaded(ea_t ea);"
+//   add_segm_ex(s, name, sclass, flags) — segment.hpp L538-L541
+//     "idaman bool ida_export add_segm_ex(segment_t *NONNULL s, const char *name, const char *sclass, int flags);"
+//   ADDSEG_OR_DIE — segment.hpp L548
+//     "#define ADDSEG_OR_DIE 0x0002 // qexit() if can't add a segment"
+//   ADDSEG_QUIET — segment.hpp L550
+//     "#define ADDSEG_QUIET 0x0008 // silent mode"
+//   add_entry(ord, ea, name, makecode, flags) — entry.hpp L59
+//     "idaman bool ida_export add_entry(uval_t ord, ea_t ea, const char *name, bool makecode, int flags=AEF_UTF8);"
+//   set_name(ea, name, flags) — name.hpp L51
+//     "idaman bool ida_export set_name(ea_t ea, const char *name, int flags=0);"
+//   auto_make_proc(ea_t ea) — auto.hpp L178-L182
+//     "inline void auto_make_proc(ea_t ea) { auto_make_code(ea); auto_mark(ea, AU_PROC); }"
+tool_result_t analyze_pe_header(const json& params)
+{
+    auto base_opt = helpers::parse_address(params["address"].get<std::string>());
+    if (!base_opt)
+        return tool_result_t::error(OBFSTR("Invalid base address"));
+
+    ea_t base = *base_opt;
+    bool create_segments = params.value("create_segments", false);
+    bool create_exports  = params.value("create_exports", true);
+    bool create_entries   = params.value("create_entries", true);
+    bool name_imports     = params.value("name_imports", true);
+
+    // Read MZ header
+    if (!is_loaded(base) || !is_loaded(base + 1))
+        return tool_result_t::error(OBFSTR("Address not loaded: ") + helpers::format_address(base));
+
+    if (get_byte(base) != 'M' || get_byte(base + 1) != 'Z')
+        return tool_result_t::error(OBFSTR("No MZ signature at ") + helpers::format_address(base));
+
+    // Read e_lfanew
+    uint32_t pe_off = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        if (!is_loaded(base + 0x3C + i))
+            return tool_result_t::error(OBFSTR("Cannot read PE offset"));
+        pe_off |= (uint32_t)get_byte(base + 0x3C + i) << (i * 8);
+    }
+
+    ea_t pe_addr = base + pe_off;
+    if (!is_loaded(pe_addr) || get_byte(pe_addr) != 'P' || get_byte(pe_addr + 1) != 'E')
+        return tool_result_t::error(OBFSTR("Invalid PE signature at offset 0x") +
+                                    helpers::format_address(pe_off));
+
+    // Helper to read multi-byte values from IDB
+    auto read_word = [&](ea_t addr) -> uint16_t {
+        uint16_t v = 0;
+        for (int i = 0; i < 2; ++i)
+            if (is_loaded(addr + i)) v |= (uint16_t)get_byte(addr + i) << (i * 8);
+        return v;
+    };
+    auto read_dword = [&](ea_t addr) -> uint32_t {
+        uint32_t v = 0;
+        for (int i = 0; i < 4; ++i)
+            if (is_loaded(addr + i)) v |= (uint32_t)get_byte(addr + i) << (i * 8);
+        return v;
+    };
+    auto read_qword_val = [&](ea_t addr) -> uint64_t {
+        uint64_t v = 0;
+        for (int i = 0; i < 8; ++i)
+            if (is_loaded(addr + i)) v |= (uint64_t)get_byte(addr + i) << (i * 8);
+        return v;
+    };
+
+    json result;
+    result["base"] = helpers::format_address(base);
+
+    // COFF header
+    ea_t coff = pe_addr + 4;
+    uint16_t machine       = read_word(coff + 0);
+    uint16_t num_sections  = read_word(coff + 2);
+    uint32_t timestamp     = read_dword(coff + 4);
+    uint16_t opt_hdr_size  = read_word(coff + 16);
+    uint16_t characteristics = read_word(coff + 18);
+
+    std::string arch = "unknown";
+    if (machine == 0x8664) arch = "AMD64";
+    else if (machine == 0x014C) arch = "i386";
+    else if (machine == 0xAA64) arch = "ARM64";
+
+    result["architecture"]    = arch;
+    result["machine"]         = helpers::format_address(machine);
+    result["num_sections"]    = num_sections;
+    result["timestamp"]       = timestamp;
+    result["characteristics"] = helpers::format_address(characteristics);
+
+    // Optional header
+    ea_t opt = coff + 20;
+    uint16_t opt_magic = read_word(opt);
+    bool is_pe32plus = (opt_magic == 0x020B);
+
+    result["pe_format"] = is_pe32plus ? "PE32+" : "PE32";
+
+    uint32_t entry_rva     = read_dword(opt + 16);
+    uint32_t image_base_lo = read_dword(opt + (is_pe32plus ? 24 : 28));
+    uint32_t image_size    = read_dword(opt + 56);
+    uint32_t section_align = read_dword(opt + 32);
+
+    result["entry_point_rva"] = helpers::format_address(entry_rva);
+    result["image_size"]      = image_size;
+    result["section_alignment"] = section_align;
+
+    if (entry_rva != 0 && create_entries)
+    {
+        ea_t ep = base + entry_rva;
+        if (is_loaded(ep))
+        {
+            create_insn(ep);
+            add_func(ep, BADADDR);
+            set_name(ep, "DriverEntry", SN_NOCHECK | SN_FORCE | SN_NOWARN);
+            auto_make_proc(ep);
+            result["entry_point"] = helpers::format_address(ep);
+        }
+    }
+
+    // Parse sections
+    ea_t sec_table = opt + opt_hdr_size;
+    json sections = json::array();
+    int segs_created = 0;
+
+    for (int s = 0; s < num_sections && s < 96; ++s)
+    {
+        ea_t sec = sec_table + s * 40;
+        if (!is_loaded(sec)) break;
+
+        char name[9] = {};
+        for (int i = 0; i < 8; ++i)
+            if (is_loaded(sec + i)) name[i] = static_cast<char>(get_byte(sec + i));
+        name[8] = '\0';
+
+        uint32_t virt_size  = read_dword(sec + 8);
+        uint32_t virt_addr  = read_dword(sec + 12);
+        uint32_t raw_size   = read_dword(sec + 16);
+        uint32_t raw_offset = read_dword(sec + 20);
+        uint32_t chars      = read_dword(sec + 36);
+
+        ea_t seg_start = base + virt_addr;
+        ea_t seg_end   = seg_start + virt_size;
+
+        json si;
+        si["name"]            = std::string(name);
+        si["virtual_address"] = helpers::format_address(seg_start);
+        si["virtual_size"]    = virt_size;
+        si["raw_size"]        = raw_size;
+        si["raw_offset"]      = raw_offset;
+        si["characteristics"] = helpers::format_address(chars);
+
+        // Classify
+        bool exec  = (chars & 0x20000000) != 0;
+        bool read  = (chars & 0x40000000) != 0;
+        bool write = (chars & 0x80000000) != 0;
+        si["executable"] = exec;
+        si["readable"]   = read;
+        si["writable"]   = write;
+
+        if (create_segments && !getseg(seg_start))
+        {
+            segment_t new_seg;
+            new_seg.start_ea = seg_start;
+            new_seg.end_ea   = seg_end;
+            new_seg.type     = exec ? SEG_CODE : SEG_DATA;
+            new_seg.bitness  = is_pe32plus ? 2 : 1;
+            new_seg.perm     = 0;
+            if (exec)  new_seg.perm |= SEGPERM_EXEC;
+            if (read)  new_seg.perm |= SEGPERM_READ;
+            if (write) new_seg.perm |= SEGPERM_WRITE;
+            if (add_segm_ex(&new_seg, name, exec ? "CODE" : "DATA", ADDSEG_QUIET))
+            {
+                ++segs_created;
+                si["created"] = true;
+            }
+        }
+
+        sections.push_back(std::move(si));
+    }
+
+    result["sections"]        = std::move(sections);
+    result["segments_created"] = segs_created;
+
+    // Parse export directory
+    uint32_t export_rva  = 0;
+    uint32_t export_size = 0;
+    ea_t data_dir = opt + (is_pe32plus ? 112 : 96);
+    export_rva  = read_dword(data_dir + 0);
+    export_size = read_dword(data_dir + 4);
+
+    json exports = json::array();
+    int funcs_from_exports = 0;
+    if (export_rva != 0 && is_loaded(base + export_rva))
+    {
+        ea_t exp_dir = base + export_rva;
+        uint32_t num_funcs   = read_dword(exp_dir + 20);
+        uint32_t num_names   = read_dword(exp_dir + 24);
+        uint32_t func_rva    = read_dword(exp_dir + 28);
+        uint32_t name_rva    = read_dword(exp_dir + 32);
+        uint32_t ordinal_rva = read_dword(exp_dir + 36);
+
+        for (uint32_t i = 0; i < num_names && i < 1000; ++i)
+        {
+            ea_t name_ptr_ea = base + name_rva + i * 4;
+            ea_t ord_ea      = base + ordinal_rva + i * 2;
+            if (!is_loaded(name_ptr_ea) || !is_loaded(ord_ea)) continue;
+
+            uint32_t str_rva  = read_dword(name_ptr_ea);
+            uint16_t ordinal  = read_word(ord_ea);
+
+            if (ordinal >= num_funcs) continue;
+
+            ea_t func_ptr_ea = base + func_rva + ordinal * 4;
+            if (!is_loaded(func_ptr_ea)) continue;
+            uint32_t fn_rva = read_dword(func_ptr_ea);
+            ea_t fn_ea = base + fn_rva;
+
+            // Read export name string
+            ea_t str_ea = base + str_rva;
+            std::string fname;
+            for (int c = 0; c < 256; ++c)
+            {
+                if (!is_loaded(str_ea + c)) break;
+                char ch = static_cast<char>(get_byte(str_ea + c));
+                if (ch == '\0') break;
+                fname += ch;
+            }
+
+            json exp_entry;
+            exp_entry["name"]    = fname;
+            exp_entry["ordinal"] = ordinal;
+            exp_entry["address"] = helpers::format_address(fn_ea);
+            exports.push_back(std::move(exp_entry));
+
+            if (create_exports && is_loaded(fn_ea))
+            {
+                if (!get_func(fn_ea))
+                {
+                    create_insn(fn_ea);
+                    if (add_func(fn_ea, BADADDR))
+                        ++funcs_from_exports;
+                }
+                if (!fname.empty())
+                    set_name(fn_ea, fname.c_str(), SN_NOCHECK | SN_FORCE | SN_NOWARN);
+                add_entry(ordinal, fn_ea, fname.c_str(), true);
+            }
+        }
+    }
+
+    result["exports"]            = std::move(exports);
+    result["functions_from_exports"] = funcs_from_exports;
+
+    // Parse import directory
+    uint32_t import_rva  = read_dword(data_dir + 8);
+    uint32_t import_size = read_dword(data_dir + 12);
+
+    json imports = json::array();
+    if (import_rva != 0 && is_loaded(base + import_rva))
+    {
+        for (uint32_t off = 0; off < 0x10000; off += 20)
+        {
+            ea_t imp_entry = base + import_rva + off;
+            if (!is_loaded(imp_entry)) break;
+
+            uint32_t ilt_rva      = read_dword(imp_entry + 0);
+            uint32_t name_rva_imp = read_dword(imp_entry + 12);
+            uint32_t iat_rva      = read_dword(imp_entry + 16);
+
+            // Check for null terminator
+            if (ilt_rva == 0 && name_rva_imp == 0 && iat_rva == 0)
+                break;
+
+            // Read DLL name
+            std::string dll_name;
+            if (name_rva_imp != 0 && is_loaded(base + name_rva_imp))
+            {
+                ea_t dname_ea = base + name_rva_imp;
+                for (int c = 0; c < 260; ++c)
+                {
+                    if (!is_loaded(dname_ea + c)) break;
+                    char ch = static_cast<char>(get_byte(dname_ea + c));
+                    if (ch == '\0') break;
+                    dll_name += ch;
+                }
+            }
+
+            json imp;
+            imp["dll_name"]    = dll_name;
+            imp["ilt_rva"]     = helpers::format_address(ilt_rva);
+            imp["iat_rva"]     = helpers::format_address(iat_rva);
+
+            // Read ILT entries to get function names
+            json funcs = json::array();
+            uint32_t func_rva_table = (ilt_rva != 0) ? ilt_rva : iat_rva;
+            if (func_rva_table != 0)
+            {
+                for (uint32_t fi = 0; fi < 500; ++fi)
+                {
+                    ea_t entry_ea = base + func_rva_table + fi * (is_pe32plus ? 8 : 4);
+                    if (!is_loaded(entry_ea)) break;
+
+                    uint64_t thunk = is_pe32plus ? read_qword_val(entry_ea)
+                                                 : (uint64_t)read_dword(entry_ea);
+                    if (thunk == 0) break;
+
+                    json func_entry;
+
+                    // Check ordinal import bit
+                    bool is_ordinal = (is_pe32plus) ? ((thunk & 0x8000000000000000ULL) != 0)
+                                                     : ((thunk & 0x80000000) != 0);
+                    if (is_ordinal)
+                    {
+                        func_entry["ordinal"] = (int)(thunk & 0xFFFF);
+                    }
+                    else
+                    {
+                        uint32_t hint_rva = (uint32_t)(thunk & 0x7FFFFFFF);
+                        if (is_loaded(base + hint_rva + 2))
+                        {
+                            std::string fn_name;
+                            ea_t fn_name_ea = base + hint_rva + 2;
+                            for (int c = 0; c < 256; ++c)
+                            {
+                                if (!is_loaded(fn_name_ea + c)) break;
+                                char ch = static_cast<char>(get_byte(fn_name_ea + c));
+                                if (ch == '\0') break;
+                                fn_name += ch;
+                            }
+                            func_entry["name"] = fn_name;
+
+                            // Name the IAT slot if applicable
+                            if (name_imports && iat_rva != 0)
+                            {
+                                ea_t iat_slot = base + iat_rva + fi * (is_pe32plus ? 8 : 4);
+                                if (is_loaded(iat_slot))
+                                {
+                                    std::string imp_name = "__imp_" + fn_name;
+                                    set_name(iat_slot, imp_name.c_str(),
+                                             SN_NOCHECK | SN_FORCE | SN_NOWARN);
+                                }
+                            }
+                        }
+                    }
+
+                    funcs.push_back(std::move(func_entry));
+                }
+            }
+
+            imp["functions"] = std::move(funcs);
+            imports.push_back(std::move(imp));
+        }
+    }
+
+    result["imports"] = std::move(imports);
+
+    return tool_result_t::ok(
+        OBFSTR("PE header analysis: ") + arch + OBFSTR(", ") +
+        std::to_string(num_sections) + OBFSTR(" sections, ") +
+        std::to_string(funcs_from_exports) + OBFSTR(" export functions created"),
+        result);
+}
+
+// ========================= DEEP ANALYSIS SWEEP =========================
+// The ultimate "analyze everything" tool. Combines:
+// 1. PE header parsing (creates segments, exports, entries)
+// 2. Aggressive function prologue scanning
+// 3. Linear sweep code creation
+// 4. Import reconstruction
+// 5. Auto-analysis finalization
+//
+// This is designed for dumped modules (kernel drivers, unpacked executables)
+// where IDA's auto-analysis produces minimal results.
+//
+// IDA SDK justification:
+//   plan_and_wait(ea1, ea2, final_pass) — auto.hpp L232
+//     "idaman int ida_export plan_and_wait(ea_t ea1, ea_t ea2, bool final_pass=true);"
+//   auto_wait() — auto.hpp L238
+//     "idaman bool ida_export auto_wait(void);"
+//   get_func_qty() — funcs.hpp L327
+//     "idaman size_t ida_export get_func_qty(void);"
+tool_result_t deep_analysis_sweep(const json& params)
+{
+    auto base_opt = helpers::parse_address(params.value("address", std::string()));
+    ea_t base = base_opt ? *base_opt : inf_get_min_ea();
+
+    auto end_opt = helpers::parse_address(params.value("end", std::string()));
+    ea_t end = end_opt ? *end_opt : inf_get_max_ea();
+
+    bool parse_pe        = params.value("parse_pe", true);
+    bool discover_funcs  = params.value("discover_functions", true);
+    bool create_code     = params.value("create_code", true);
+    bool fix_imports     = params.value("reconstruct_imports", true);
+    int func_limit       = params.value("function_limit", 10000);
+
+    json result;
+    json steps = json::array();
+    size_t initial_func_count = get_func_qty();
+
+    show_wait_box("HIDECANCEL\nAiDA: Deep analysis sweep starting...");
+
+    // Step 1: PE Header Analysis
+    int funcs_from_pe = 0;
+    if (parse_pe && is_loaded(base) && get_byte(base) == 'M' &&
+        is_loaded(base + 1) && get_byte(base + 1) == 'Z')
+    {
+        replace_wait_box("HIDECANCEL\nAiDA: Step 1/5 - Parsing PE header...");
+        auto pe_result = analyze_pe_header(json({
+            {"address", helpers::format_address(base)},
+            {"create_segments", true},
+            {"create_exports", true},
+            {"create_entries", true}
+        }));
+
+        steps.push_back({
+            {"step", "parse_pe_header"},
+            {"success", pe_result.success},
+            {"message", pe_result.output}
+        });
+
+        if (pe_result.success)
+            funcs_from_pe = pe_result.data.value("functions_from_exports", 0);
+    }
+    else
+    {
+        steps.push_back({
+            {"step", "parse_pe_header"},
+            {"success", true},
+            {"message", "No PE header at base address, skipped"}
+        });
+    }
+
+    // Step 2: Force Code Creation on executable segments
+    int total_insns = 0;
+    if (create_code)
+    {
+        replace_wait_box("HIDECANCEL\nAiDA: Step 2/5 - Creating code in executable segments...");
+
+        for (int si = 0; si < get_segm_qty(); ++si)
+        {
+            segment_t* seg = getnseg(si);
+            if (!seg) continue;
+            if (!(seg->perm & SEGPERM_EXEC)) continue;
+            if (seg->start_ea < base || seg->end_ea > end) continue;
+
+            qstring sname;
+            get_segm_name(&sname, seg);
+
+            replace_wait_box("HIDECANCEL\nAiDA: Creating code in %s (0x%llX bytes)...",
+                             sname.c_str(),
+                             (unsigned long long)(seg->end_ea - seg->start_ea));
+
+            auto code_result = force_create_code_region(json({
+                {"start", helpers::format_address(seg->start_ea)},
+                {"end", helpers::format_address(seg->end_ea)},
+                {"undefine_first", false},
+                {"create_functions", true}
+            }));
+
+            if (code_result.success)
+                total_insns += code_result.data.value("instructions_created", 0);
+        }
+
+        steps.push_back({
+            {"step", "create_code"},
+            {"success", true},
+            {"instructions_created", total_insns}
+        });
+    }
+
+    // Step 3: Aggressive Function Discovery
+    int funcs_from_prologues = 0;
+    if (discover_funcs)
+    {
+        replace_wait_box("HIDECANCEL\nAiDA: Step 3/5 - Aggressive function discovery...");
+
+        auto disc_result = aggressive_function_discovery(json({
+            {"start", helpers::format_address(base)},
+            {"end", helpers::format_address(end)},
+            {"code_segments_only", true},
+            {"create_code", true},
+            {"limit", func_limit}
+        }));
+
+        if (disc_result.success)
+            funcs_from_prologues = disc_result.data.value("functions_created", 0);
+
+        steps.push_back({
+            {"step", "function_discovery"},
+            {"success", disc_result.success},
+            {"functions_created", funcs_from_prologues},
+            {"prologues_found", disc_result.data.value("prologues_found", 0)}
+        });
+    }
+
+    // Step 4: Import Reconstruction
+    int imports_resolved = 0;
+    if (fix_imports)
+    {
+        replace_wait_box("HIDECANCEL\nAiDA: Step 4/5 - Reconstructing imports...");
+
+        auto imp_result = deep_reconstruct_imports(json({
+            {"address", helpers::format_address(base)},
+            {"name_imports", true},
+            {"kernel_imports", true}
+        }));
+
+        if (imp_result.success)
+            imports_resolved = imp_result.data.value("resolved", 0);
+
+        steps.push_back({
+            {"step", "reconstruct_imports"},
+            {"success", imp_result.success},
+            {"resolved", imports_resolved},
+            {"unresolved", imp_result.data.value("unresolved", 0)}
+        });
+    }
+
+    // Step 5: Final auto-analysis pass
+    replace_wait_box("HIDECANCEL\nAiDA: Step 5/5 - Final auto-analysis...");
+    plan_and_wait(base, end, true);
+
+    hide_wait_box();
+
+    size_t final_func_count = get_func_qty();
+
+    steps.push_back({
+        {"step", "final_analysis"},
+        {"success", true},
+        {"initial_functions", initial_func_count},
+        {"final_functions", final_func_count},
+        {"new_functions", final_func_count - initial_func_count}
+    });
+
+    result["steps"]             = std::move(steps);
+    result["initial_functions"] = initial_func_count;
+    result["final_functions"]   = final_func_count;
+    result["new_functions"]     = final_func_count - initial_func_count;
+    result["instructions_created"] = total_insns;
+    result["funcs_from_pe"]     = funcs_from_pe;
+    result["funcs_from_prologues"] = funcs_from_prologues;
+    result["imports_resolved"]  = imports_resolved;
+
+    return tool_result_t::ok(
+        OBFSTR("Deep analysis sweep complete: ") +
+        std::to_string(final_func_count - initial_func_count) +
+        OBFSTR(" new functions (") + std::to_string(initial_func_count) +
+        OBFSTR(" -> ") + std::to_string(final_func_count) + OBFSTR(")"),
+        result);
+}
+
+// ========================= CREATE FUNCTIONS FROM XREFS =========================
+// Scans call targets in a range and creates functions at every call destination.
+// This catches functions that the prologue scanner misses because they use
+// non-standard prologues.
+//
+// IDA SDK justification:
+//   decode_insn(insn_t *out, ea_t ea) — ua.hpp L1509
+//     "Decode instruction at the specified address."
+//   add_func(ea1, ea2) — funcs.hpp L405-L409
+//     "inline bool add_func(ea_t ea1, ea_t ea2=BADADDR)"
+//   get_func(ea_t ea) — funcs.hpp L293
+//     "idaman func_t *ida_export get_func(ea_t ea);"
+tool_result_t create_functions_from_xrefs(const json& params)
+{
+    auto start_opt = helpers::parse_address(params.value("start", std::string()));
+    auto end_opt   = helpers::parse_address(params.value("end", std::string()));
+
+    ea_t scan_start = start_opt ? *start_opt : inf_get_min_ea();
+    ea_t scan_end   = end_opt   ? *end_opt   : inf_get_max_ea();
+
+    if (scan_end <= scan_start)
+        return tool_result_t::error(OBFSTR("Invalid range"));
+    if (scan_end - scan_start > 0x10000000)
+        scan_end = scan_start + 0x10000000;
+
+    int limit = params.value("limit", 5000);
+
+    json result;
+    std::set<ea_t> call_targets;
+    int total_created = 0;
+    int already_exists = 0;
+
+    show_wait_box("HIDECANCEL\nAiDA: Scanning for call targets...");
+
+    // Scan all instructions in range for CALL/JMP targets
+    ea_t cur = scan_start;
+    while (cur < scan_end && cur != BADADDR)
+    {
+        if ((cur - scan_start) % 0x20000 == 0)
+            replace_wait_box("HIDECANCEL\nAiDA: Scanning calls 0x%llX / 0x%llX (%d targets)",
+                             (unsigned long long)(cur - scan_start),
+                             (unsigned long long)(scan_end - scan_start),
+                             (int)call_targets.size());
+
+        if (!is_loaded(cur))
+        {
+            cur = next_addr(cur);
+            if (cur == BADADDR) break;
+            continue;
+        }
+
+        flags64_t f = get_flags(cur);
+        if (!is_code(f))
+        {
+            cur = next_addr(cur);
+            if (cur == BADADDR) break;
+            continue;
+        }
+
+        insn_t insn;
+        int len = decode_insn(&insn, cur);
+        if (len <= 0)
+        {
+            cur = next_addr(cur);
+            if (cur == BADADDR) break;
+            continue;
+        }
+
+        // Check for direct CALL instructions with immediate operand
+        if (insn.itype == NN_call || insn.itype == NN_jmp)
+        {
+            // Get the target from the first operand
+            if (insn.ops[0].type == o_near || insn.ops[0].type == o_far)
+            {
+                ea_t target = insn.ops[0].addr;
+                if (target >= scan_start && target < scan_end &&
+                    is_loaded(target) && !get_func(target))
+                {
+                    call_targets.insert(target);
+                }
+            }
+        }
+
+        cur += len;
+    }
+
+    // Create functions at all discovered call targets
+    replace_wait_box("HIDECANCEL\nAiDA: Creating %d functions from call targets...",
+                     (int)call_targets.size());
+
+    json functions = json::array();
+    for (ea_t target : call_targets)
+    {
+        if (total_created >= limit) break;
+        if (get_func(target))
+        {
+            ++already_exists;
+            continue;
+        }
+
+        create_insn(target);
+        if (add_func(target, BADADDR))
+        {
+            ++total_created;
+            if (total_created <= 200)
+            {
+                json entry;
+                entry["address"] = helpers::format_address(target);
+                func_t* fn = get_func(target);
+                if (fn)
+                {
+                    entry["end"]  = helpers::format_address(fn->end_ea);
+                    entry["size"] = fn->end_ea - fn->start_ea;
+                }
+                functions.push_back(std::move(entry));
+            }
+        }
+    }
+
+    hide_wait_box();
+
+    if (total_created > 0)
+    {
+        show_wait_box("HIDECANCEL\nAiDA: Running auto-analysis...");
+        plan_range(scan_start, scan_end);
+        auto_wait();
+        hide_wait_box();
+    }
+
+    result["scan_start"]        = helpers::format_address(scan_start);
+    result["scan_end"]          = helpers::format_address(scan_end);
+    result["call_targets_found"] = call_targets.size();
+    result["functions_created"]  = total_created;
+    result["already_existed"]    = already_exists;
+    result["functions"]          = std::move(functions);
+
+    return tool_result_t::ok(
+        OBFSTR("Created ") + std::to_string(total_created) +
+        OBFSTR(" functions from ") + std::to_string(call_targets.size()) +
+        OBFSTR(" call targets"), result);
+}
+
+// ========================= SIGNATURE SCAN AND DEFINE =========================
+// Allows the agent to provide custom byte patterns to scan for and create
+// functions at every match. Used for identifying custom calling conventions,
+// non-standard prologues, or specific code patterns.
+//
+// IDA SDK justification:
+//   get_byte(ea_t ea) — bytes.hpp L383
+//     "idaman uchar ida_export get_byte(ea_t ea);"
+//   add_func(ea1, ea2) — funcs.hpp L405-L409
+//     "inline bool add_func(ea_t ea1, ea_t ea2=BADADDR)"
+//   create_insn(ea_t ea, insn_t *out=nullptr) — ua.hpp L1498
+//     "Create an instruction at the specified address."
+//   set_name(ea, name, flags) — name.hpp L51
+//     "idaman bool ida_export set_name(ea_t ea, const char *name, int flags=0);"
+tool_result_t signature_scan_and_define(const json& params)
+{
+    std::string pattern_str = params["pattern"].get<std::string>();
+    std::string func_prefix = params.value("name_prefix", "");
+    bool create_funcs = params.value("create_functions", true);
+    int limit = params.value("limit", 1000);
+
+    auto start_opt = helpers::parse_address(params.value("start", std::string()));
+    auto end_opt   = helpers::parse_address(params.value("end", std::string()));
+
+    ea_t scan_start = start_opt ? *start_opt : inf_get_min_ea();
+    ea_t scan_end   = end_opt   ? *end_opt   : inf_get_max_ea();
+
+    if (scan_end - scan_start > 0x10000000)
+        scan_end = scan_start + 0x10000000;
+
+    // Parse pattern: "48 89 5C ?? 08" format, ?? = wildcard
+    std::vector<uint8_t> pat;
+    std::vector<bool> mask;
+    {
+        std::istringstream iss(pattern_str);
+        std::string tok;
+        while (iss >> tok)
+        {
+            if (tok == "??" || tok == "?")
+            {
+                pat.push_back(0);
+                mask.push_back(false);
+            }
+            else
+            {
+                try
+                {
+                    pat.push_back(static_cast<uint8_t>(std::stoul(tok, nullptr, 16)));
+                    mask.push_back(true);
+                }
+                catch (...)
+                {
+                    return tool_result_t::error(OBFSTR("Invalid pattern token: ") + tok);
+                }
+            }
+        }
+    }
+    if (pat.empty())
+        return tool_result_t::error(OBFSTR("Empty pattern"));
+
+    json result;
+    json matches_arr = json::array();
+    int funcs_created = 0;
+
+    show_wait_box("HIDECANCEL\nAiDA: Signature scan and define...");
+
+    for (ea_t ea = scan_start;
+         ea + pat.size() <= static_cast<size_t>(scan_end) && (int)matches_arr.size() < limit;
+         ++ea)
+    {
+        if ((ea - scan_start) % 0x20000 == 0)
+            replace_wait_box("HIDECANCEL\nAiDA: Scanning 0x%llX (%d matches)",
+                             (unsigned long long)(ea - scan_start),
+                             (int)matches_arr.size());
+
+        if (!is_loaded(ea)) continue;
+
+        bool found = true;
+        for (size_t j = 0; j < pat.size(); ++j)
+        {
+            if (!mask[j]) continue;
+            if (!is_loaded(ea + j)) { found = false; break; }
+            if (get_byte(ea + j) != pat[j]) { found = false; break; }
+        }
+        if (!found) continue;
+
+        json entry;
+        entry["address"] = helpers::format_address(ea);
+
+        if (create_funcs && !get_func(ea))
+        {
+            create_insn(ea);
+            if (add_func(ea, BADADDR))
+            {
+                ++funcs_created;
+                entry["function_created"] = true;
+
+                if (!func_prefix.empty())
+                {
+                    std::string name = func_prefix + "_" +
+                        helpers::format_address(ea).substr(2); // strip "0x"
+                    set_name(ea, name.c_str(), SN_NOCHECK | SN_FORCE | SN_NOWARN);
+                    entry["name"] = name;
+                }
+            }
+        }
+        else if (get_func(ea))
+        {
+            entry["function_created"] = false;
+            entry["note"] = "already a function";
+        }
+
+        func_t* fn = get_func(ea);
+        if (fn)
+        {
+            entry["func_start"] = helpers::format_address(fn->start_ea);
+            entry["func_end"]   = helpers::format_address(fn->end_ea);
+            entry["func_size"]  = fn->end_ea - fn->start_ea;
+        }
+
+        matches_arr.push_back(std::move(entry));
+
+        // Skip past this match
+        if (fn) ea = fn->end_ea - 1;
+    }
+
+    hide_wait_box();
+
+    int match_count = (int)matches_arr.size();
+    result["pattern"]           = pattern_str;
+    result["scan_start"]        = helpers::format_address(scan_start);
+    result["scan_end"]          = helpers::format_address(scan_end);
+    result["matches"]           = match_count;
+    result["functions_created"]  = funcs_created;
+    result["results"]           = std::move(matches_arr);
+
+    return tool_result_t::ok(
+        OBFSTR("Signature scan: ") + std::to_string(match_count) +
+        OBFSTR(" matches, ") + std::to_string(funcs_created) +
+        OBFSTR(" functions created"), result);
+}
+
+void register_tools()
+{
+    auto& registry = ToolRegistry::instance();
+
+    registry.register_tool({OBFSTR("aggressive_function_discovery"), OBFSTR("advanced_analysis"),
+        OBFSTR("Aggressively scan a memory range for x86-64 function prologues and create functions "
+               "at every match. Recognizes 18+ prologue patterns including push rbp/mov rbp,rsp, "
+               "sub rsp, Microsoft x64 ABI home-space saves, REX-prefixed push patterns, "
+               "mov rax,rsp/sub rsp (kernel-style), and register save sequences. "
+               "Each candidate is validated by decoding at least 3 subsequent instructions. "
+               "Essential for analyzing dumped modules where IDA auto-analysis finds few/no functions. "
+               "After discovery, runs plan_range + auto_wait for full analysis integration."),
+        {{OBFSTR("start"), OBFSTR("string"), OBFSTR("Start address (default: min_ea)"), false},
+         {OBFSTR("end"), OBFSTR("string"), OBFSTR("End address (default: max_ea)"), false},
+         {OBFSTR("code_segments_only"), OBFSTR("boolean"), OBFSTR("Only scan executable segments (default true)"), false},
+         {OBFSTR("create_code"), OBFSTR("boolean"), OBFSTR("Create instructions before defining functions (default true)"), false},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max functions to create (default 10000)"), false}},
+        aggressive_function_discovery, false});
+
+    registry.register_tool({OBFSTR("force_create_code_region"), OBFSTR("advanced_analysis"),
+        OBFSTR("Force-create instructions across an entire memory range using linear sweep "
+               "disassembly. Essential for kernel driver dumps and unpacked binaries where "
+               "large regions remain 'unexplored bytes'. Optionally undefines existing items first, "
+               "detects function boundaries from INT3 padding and RET instructions, and creates "
+               "functions automatically. Runs plan_and_wait for full re-analysis after creation."),
+        {{OBFSTR("start"), OBFSTR("string"), OBFSTR("Start address of region"), true},
+         {OBFSTR("end"), OBFSTR("string"), OBFSTR("End address (default: segment end)"), false},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Size in bytes if end not specified (default 0x10000)"), false},
+         {OBFSTR("undefine_first"), OBFSTR("boolean"), OBFSTR("Undefine all items in range before sweep (default false)"), false},
+         {OBFSTR("create_functions"), OBFSTR("boolean"), OBFSTR("Auto-create functions at detected boundaries (default true)"), false}},
+        force_create_code_region, false});
+
+    registry.register_tool({OBFSTR("deep_reconstruct_imports"), OBFSTR("advanced_analysis"),
+        OBFSTR("Comprehensive import reconstruction that goes far beyond basic IAT scanning. "
+               "Scans ALL writable and data segments for pointer-sized values pointing to code. "
+               "Resolves named targets, propagates __imp_ names to IAT slots, identifies "
+               "call thunks, and specifically handles kernel import patterns "
+               "(MmGetSystemRoutineAddress, KeXxx, ExXxx, ZwXxx, PsXxx, etc.). "
+               "Use after unpacking or dumping modules with missing/broken import tables."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Base address (default: min_ea)"), false},
+         {OBFSTR("name_imports"), OBFSTR("boolean"), OBFSTR("Set __imp_ names on IAT slots (default true)"), false},
+         {OBFSTR("kernel_imports"), OBFSTR("boolean"), OBFSTR("Scan for kernel API usage patterns (default true)"), false},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max IAT entries to report (default 5000)"), false}},
+        deep_reconstruct_imports, false});
+
+    registry.register_tool({OBFSTR("analyze_pe_header"), OBFSTR("advanced_analysis"),
+        OBFSTR("Parse a PE header in the IDB at any address. Extracts: architecture, sections "
+               "(with permissions), export directory (creates functions and names at exports), "
+               "import directory (with DLL names and function names), entry point. "
+               "Optionally creates IDA segments for each PE section and defines DriverEntry/main "
+               "at the entry point. Essential for dumped modules that have PE headers "
+               "but weren't parsed by IDA's loader."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("PE base address (where MZ header starts)"), true},
+         {OBFSTR("create_segments"), OBFSTR("boolean"), OBFSTR("Create IDA segments for each PE section (default false)"), false},
+         {OBFSTR("create_exports"), OBFSTR("boolean"), OBFSTR("Create functions at export addresses (default true)"), false},
+         {OBFSTR("create_entries"), OBFSTR("boolean"), OBFSTR("Create function at entry point (default true)"), false}},
+        analyze_pe_header, false});
+
+    registry.register_tool({OBFSTR("deep_analysis_sweep"), OBFSTR("advanced_analysis"),
+        OBFSTR("The ULTIMATE analysis tool for heavily protected/obfuscated/dumped binaries. "
+               "Orchestrates a full 5-step analysis pipeline: "
+               "(1) Parse PE header — create segments, exports, entry point functions. "
+               "(2) Force-create code — linear sweep all executable segments to create instructions. "
+               "(3) Aggressive function discovery — scan 18+ prologue signatures with validation. "
+               "(4) Deep import reconstruction — resolve IAT, kernel imports, name slots. "
+               "(5) Final auto-analysis — plan_and_wait for IDA to process everything. "
+               "Use this FIRST on any dumped kernel driver, unpacked binary, or memory dump "
+               "where IDA's auto-analysis produced few results. Reports before/after function counts."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Base address (default: min_ea)"), false},
+         {OBFSTR("end"), OBFSTR("string"), OBFSTR("End address (default: max_ea)"), false},
+         {OBFSTR("parse_pe"), OBFSTR("boolean"), OBFSTR("Parse PE header if present (default true)"), false},
+         {OBFSTR("discover_functions"), OBFSTR("boolean"), OBFSTR("Run aggressive function discovery (default true)"), false},
+         {OBFSTR("create_code"), OBFSTR("boolean"), OBFSTR("Force-create code in executable segments (default true)"), false},
+         {OBFSTR("reconstruct_imports"), OBFSTR("boolean"), OBFSTR("Reconstruct imports (default true)"), false}},
+        deep_analysis_sweep, false});
+
+    registry.register_tool({OBFSTR("create_functions_from_xrefs"), OBFSTR("advanced_analysis"),
+        OBFSTR("Scan all instructions in a range for CALL/JMP targets and create functions "
+               "at every unique destination that doesn't already have one. Catches functions "
+               "with non-standard prologues that prologue scanning misses. Particularly "
+               "effective after force_create_code_region has created instructions."),
+        {{OBFSTR("start"), OBFSTR("string"), OBFSTR("Start of scan range (default: min_ea)"), false},
+         {OBFSTR("end"), OBFSTR("string"), OBFSTR("End of scan range (default: max_ea)"), false},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max functions to create (default 5000)"), false}},
+        create_functions_from_xrefs, false});
+
+    registry.register_tool({OBFSTR("signature_scan_and_define"), OBFSTR("advanced_analysis"),
+        OBFSTR("Scan for a custom byte pattern across the database and optionally create "
+               "functions at every match. Supports '??' wildcards. Use this when the agent "
+               "identifies a specific non-standard prologue or code pattern unique to a "
+               "protector/obfuscator. Can also name created functions with a prefix."),
+        {{OBFSTR("pattern"), OBFSTR("string"),
+          OBFSTR("Hex byte pattern with '??' wildcards (e.g. '48 8B C4 48 89 58 ??')"), true},
+         {OBFSTR("start"), OBFSTR("string"), OBFSTR("Start address (default: min_ea)"), false},
+         {OBFSTR("end"), OBFSTR("string"), OBFSTR("End address (default: max_ea)"), false},
+         {OBFSTR("create_functions"), OBFSTR("boolean"), OBFSTR("Create functions at matches (default true)"), false},
+         {OBFSTR("name_prefix"), OBFSTR("string"), OBFSTR("Prefix for auto-naming created functions (e.g. 'be_func')"), false},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max matches (default 1000)"), false}},
+        signature_scan_and_define, false});
+}
+
+} // namespace advanced_analysis_tools
+
+namespace driver_tools
+{
+
+tool_result_t driver_connect(const json& params)
+{
+    if (device->is_connected())
+    {
+        // Ensure kernel DTB is solved even if already connected
+        if (device->get_kernel_dtb() == 0)
+            device->solve_kernel_dtb();
+        return tool_result_t::ok(OBFSTR("Driver already connected"));
+    }
+
+    if (!device->connect())
+        return tool_result_t::error(OBFSTR("Failed to connect to kernel driver. Ensure the driver is loaded and running."));
+
+    // Automatically solve kernel DTB (System process PID 4) for kernel memory access
+    device->solve_kernel_dtb();
+
+    json result;
+    result["connected"] = true;
+    result["kernel_dtb"] = helpers::format_address(device->get_kernel_dtb());
+    result["note"] = OBFSTR("Connected via obfuscated device path. Kernel DTB solved for full kernel memory access.");
+    return tool_result_t::ok(OBFSTR("Kernel driver connected"), result);
+}
+
+tool_result_t driver_status(const json&)
+{
+    json result;
+    result["connected"]    = device->is_connected();
+    result["process_id"]   = device->get_process_id();
+    result["base_address"] = helpers::format_address(device->get_base_address());
+    result["dtb"]          = helpers::format_address(device->get_dtb());
+    result["kernel_dtb"]   = helpers::format_address(device->get_kernel_dtb());
+    result["has_process"]  = device->get_process_id() != 0;
+    result["has_kernel"]   = device->get_kernel_dtb() != 0;
+
+    if (device->is_connected() && device->get_process_id() != 0)
+        result["heartbeat"] = device->send_heartbeat() ? "ok" : "failed";
+
+    return tool_result_t::ok(OBFSTR("Driver status"), result);
+}
+
+tool_result_t driver_attach(const json& params)
+{
+    if (!device->is_connected())
+    {
+        if (!device->connect())
+            return tool_result_t::error(OBFSTR("Cannot connect to kernel driver. Load the driver first."));
+    }
+
+    std::string process_name = params["process"].get<std::string>();
+
+    std::uint32_t pid = device->find_process(process_name.c_str());
+    if (pid == 0)
+        return tool_result_t::error(OBFSTR("Process not found: ") + process_name);
+
+    std::uint64_t base = device->find_image();
+    if (base == 0)
+        return tool_result_t::error(OBFSTR("Failed to locate image base for process: ") + process_name);
+
+    device->solve_dtb();
+
+    json result;
+    result["process_name"] = process_name;
+    result["process_id"]   = pid;
+    result["base_address"] = helpers::format_address(base);
+    result["dtb"]          = helpers::format_address(device->get_dtb());
+    return tool_result_t::ok(OBFSTR("Attached to process: ") + process_name, result);
+}
+
+tool_result_t driver_read_memory(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+
+    auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
+    if (!ea_opt)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    std::size_t size = params.value("size", 256);
+    if (size > 65536)
+        return tool_result_t::error(OBFSTR("Size too large (max 65536)"));
+
+    std::vector<std::uint8_t> buffer(size);
+    std::size_t bytes_read = device->read_raw(*ea_opt, buffer.data(), size);
+    if (bytes_read == 0)
+        return tool_result_t::error(OBFSTR("Kernel read failed at ") + helpers::format_address(*ea_opt));
+
+    std::ostringstream hex_ss, ascii_ss;
+    for (std::size_t i = 0; i < bytes_read; i++)
+    {
+        if (i > 0) hex_ss << " ";
+        hex_ss << std::hex << std::setw(2) << std::setfill('0') << (int)buffer[i];
+        char c = static_cast<char>(buffer[i]);
+        ascii_ss << (c >= 32 && c < 127 ? c : '.');
+    }
+
+    json result;
+    result["address"]       = helpers::format_address(*ea_opt);
+    result["size_requested"] = size;
+    result["size_read"]     = bytes_read;
+    result["hex"]           = hex_ss.str();
+    result["ascii"]         = ascii_ss.str();
+    result["bytes"]         = json::array();
+    for (std::size_t i = 0; i < bytes_read; i++)
+        result["bytes"].push_back(buffer[i]);
+
+    if (params.value("patch_idb", false))
+    {
+        for (std::size_t i = 0; i < bytes_read; i++)
+            put_byte(*ea_opt + i, buffer[i]);
+        result["patched_idb"] = true;
+    }
+
+    return tool_result_t::ok(OBFSTR("Kernel read: ") + std::to_string(bytes_read) + " bytes", result);
+}
+
+tool_result_t driver_write_memory(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+
+    auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
+    if (!ea_opt)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    std::string hex_bytes = params["bytes"].get<std::string>();
+    hex_bytes.erase(std::remove(hex_bytes.begin(), hex_bytes.end(), ' '), hex_bytes.end());
+
+    std::vector<std::uint8_t> bytes;
+    for (std::size_t i = 0; i + 1 < hex_bytes.length(); i += 2)
+    {
+        try { bytes.push_back(static_cast<std::uint8_t>(std::stoul(hex_bytes.substr(i, 2), nullptr, 16))); }
+        catch (...) { return tool_result_t::error(OBFSTR("Invalid hex byte at offset ") + std::to_string(i)); }
+    }
+    if (bytes.empty())
+        return tool_result_t::error(OBFSTR("No bytes to write"));
+
+    std::size_t written = device->write_raw(*ea_opt, bytes.data(), bytes.size());
+    if (written == 0)
+        return tool_result_t::error(OBFSTR("Kernel write failed at ") + helpers::format_address(*ea_opt));
+
+    json result;
+    result["address"]       = helpers::format_address(*ea_opt);
+    result["bytes_written"] = written;
+    return tool_result_t::ok(OBFSTR("Kernel write: ") + std::to_string(written) + " bytes", result);
+}
+
+tool_result_t driver_dump_module(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+
+    ea_t base = BADADDR;
+    if (params.contains("address"))
+    {
+        auto a = helpers::parse_address(params["address"].get<std::string>());
+        if (a) base = *a;
+    }
+    if (base == BADADDR || base == 0)
+        base = static_cast<ea_t>(device->get_base_address());
+    if (base == 0 || base == BADADDR)
+        return tool_result_t::error(OBFSTR("Invalid module base. Provide 'address' or attach to a process first."));
+
+    std::uint8_t pe_hdr[0x1000];
+    std::size_t hdr_read = device->read_raw(base, pe_hdr, sizeof(pe_hdr));
+    if (hdr_read < 0x200)
+        return tool_result_t::error(OBFSTR("Failed to read PE header at ") + helpers::format_address(base));
+
+    std::size_t module_size = 0;
+    if (*(std::uint16_t*)pe_hdr == 0x5A4D)
+    {
+        std::uint32_t pe_off = *(std::uint32_t*)(pe_hdr + 0x3C);
+        if (pe_off + 0x58 < sizeof(pe_hdr) && *(std::uint32_t*)(pe_hdr + pe_off) == 0x00004550)
+        {
+            std::uint16_t opt_magic = *(std::uint16_t*)(pe_hdr + pe_off + 0x18);
+            if (opt_magic == 0x020B || opt_magic == 0x010B)
+                module_size = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x38);
+        }
+    }
+    if (module_size == 0)
+        module_size = params.value("size", (std::size_t)0x200000);
+    if (module_size > 0x10000000)
+        return tool_result_t::error(OBFSTR("Module size too large (>256MB): ") + std::to_string(module_size));
+
+    std::vector<std::uint8_t> module_data(module_size, 0);
+    const std::size_t chunk = 0x1000;
+    std::size_t total_read = 0;
+
+    show_wait_box("HIDECANCEL\nAiDA: Dumping module via kernel (0 / 0x%zX)...", module_size);
+    for (std::size_t off = 0; off < module_size; off += chunk)
+    {
+        if (off % 0x10000 == 0)
+            replace_wait_box("HIDECANCEL\nAiDA: Kernel dump 0x%zX / 0x%zX...", off, module_size);
+        std::size_t to_read = std::min(chunk, module_size - off);
+        total_read += device->read_raw(base + off, module_data.data() + off, to_read);
+    }
+    hide_wait_box();
+
+    std::string output_path = params.value("output_path", "");
+    if (!output_path.empty())
+    {
+        FILE* f = qfopen(output_path.c_str(), "wb");
+        if (f)
+        {
+            ssize_t written = qfwrite(f, module_data.data(), module_size);
+            qfclose(f);
+            if (written < 0 || static_cast<std::size_t>(written) != module_size)
+                return tool_result_t::error(OBFSTR("Failed to write dump file: ") + output_path);
+        }
+        else
+        {
+            return tool_result_t::error(OBFSTR("Failed to open dump file for writing: ") + output_path);
+        }
+    }
+
+    if (params.value("patch_idb", true))
+    {
+        show_wait_box("HIDECANCEL\nAiDA: Patching IDA database...");
+        for (std::size_t i = 0; i < module_size; i++)
+        {
+            if (i % 0x10000 == 0)
+                replace_wait_box("HIDECANCEL\nAiDA: Patching IDB 0x%zX / 0x%zX...", i, module_size);
+            ea_t ea = base + i;
+            if (getseg(ea))
+                put_byte(ea, module_data[i]);
+        }
+        hide_wait_box();
+    }
+
+    json result;
+    result["base"]          = helpers::format_address(base);
+    result["size"]          = module_size;
+    result["bytes_read"]    = total_read;
+    result["coverage_pct"]  = module_size ? (int)((total_read * 100) / module_size) : 0;
+    if (!output_path.empty())
+        result["saved_to"]  = output_path;
+    if (params.value("patch_idb", true))
+        result["patched_idb"] = true;
+
+    return tool_result_t::ok(OBFSTR("Module dumped: ") + std::to_string(total_read) + "/" +
+                             std::to_string(module_size) + " bytes", result);
+}
+
+tool_result_t driver_scan_pattern(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+
+    std::string pattern_str = params["pattern"].get<std::string>();
+    int limit = params.value("limit", 20);
+
+    ea_t start_addr = static_cast<ea_t>(device->get_base_address());
+    ea_t end_addr   = start_addr + (ea_t)params.value("size", (std::uint64_t)0x200000);
+    if (params.contains("start"))
+    {
+        auto s = helpers::parse_address(params["start"].get<std::string>());
+        if (s) start_addr = *s;
+    }
+    if (params.contains("end"))
+    {
+        auto e = helpers::parse_address(params["end"].get<std::string>());
+        if (e) end_addr = *e;
+    }
+
+    std::vector<std::uint8_t> pat;
+    std::vector<bool> mask;
+    {
+        std::istringstream iss(pattern_str);
+        std::string tok;
+        while (iss >> tok)
+        {
+            if (tok == "??" || tok == "?")
+            {
+                pat.push_back(0);
+                mask.push_back(false);
+            }
+            else
+            {
+                try
+                {
+                    pat.push_back(static_cast<std::uint8_t>(std::stoul(tok, nullptr, 16)));
+                    mask.push_back(true);
+                }
+                catch (...) { return tool_result_t::error(OBFSTR("Invalid pattern token: ") + tok); }
+            }
+        }
+    }
+    if (pat.empty())
+        return tool_result_t::error(OBFSTR("Empty pattern"));
+
+    json matches = json::array();
+    const std::size_t chunk_sz = 0x10000;
+    std::vector<std::uint8_t> chunk(chunk_sz + pat.size());
+
+    show_wait_box("HIDECANCEL\nAiDA: Kernel pattern scan...");
+    for (ea_t addr = start_addr; addr < end_addr && (int)matches.size() < limit; addr += chunk_sz)
+    {
+        replace_wait_box("HIDECANCEL\nAiDA: Kernel scan 0x%llX (%d found)...",
+                         (unsigned long long)addr, (int)matches.size());
+        std::size_t to_read = std::min((std::size_t)(end_addr - addr) + pat.size(), chunk_sz + pat.size());
+        std::size_t got = device->read_raw(addr, chunk.data(), to_read);
+        if (got < pat.size()) continue;
+
+        for (std::size_t i = 0; i + pat.size() <= got && (int)matches.size() < limit; i++)
+        {
+            bool found = true;
+            for (std::size_t j = 0; j < pat.size(); j++)
+            {
+                if (mask[j] && chunk[i + j] != pat[j]) { found = false; break; }
+            }
+            if (found)
+            {
+                ea_t m = addr + i;
+                matches.push_back({{"address", helpers::format_address(m)},
+                                   {"name", helpers::get_name_or_address(m)}});
+            }
+        }
+    }
+    hide_wait_box();
+
+    return tool_result_t::ok(OBFSTR("Pattern scan: ") + std::to_string(matches.size()) + " matches", matches);
+}
+
+tool_result_t driver_read_string(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+
+    auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
+    if (!ea_opt)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    std::size_t max_len = params.value("max_length", 512);
+    std::string type    = params.value("type", "auto");
+
+    std::vector<std::uint8_t> buf(max_len * 2 + 4, 0);
+    std::size_t got = device->read_raw(*ea_opt, buf.data(), buf.size());
+    if (got == 0)
+        return tool_result_t::error(OBFSTR("Failed to read from ") + helpers::format_address(*ea_opt));
+
+    json result;
+    result["address"] = helpers::format_address(*ea_opt);
+
+    bool try_ascii = (type == "auto" || type == "ascii");
+    bool try_wide  = (type == "auto" || type == "wide");
+
+    if (try_wide && got >= 2)
+    {
+        std::string narrow;
+        for (std::size_t i = 0; i + 1 < got; i += 2)
+        {
+            std::uint16_t wc = buf[i] | ((std::uint16_t)buf[i + 1] << 8);
+            if (wc == 0) break;
+            narrow += (wc < 128 && wc >= 32) ? static_cast<char>(wc) : '?';
+        }
+        if (!narrow.empty())
+        {
+            result["wide_string"] = narrow;
+            result["wide_length"] = narrow.length();
+        }
+    }
+
+    if (try_ascii)
+    {
+        std::string ascii;
+        for (std::size_t i = 0; i < got; i++)
+        {
+            if (buf[i] == 0) break;
+            ascii += static_cast<char>(buf[i]);
+        }
+        result["string"]       = ascii;
+        result["ascii_length"] = ascii.length();
+    }
+
+    return tool_result_t::ok(OBFSTR("String read via kernel"), result);
+}
+
+tool_result_t driver_read_pointer_chain(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+
+    auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
+    if (!ea_opt)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    std::vector<std::int64_t> offsets;
+    if (params.contains("offsets") && params["offsets"].is_array())
+    {
+        for (const auto& off : params["offsets"])
+        {
+            if (off.is_number_integer())
+                offsets.push_back(off.get<std::int64_t>());
+            else if (off.is_string())
+            {
+                auto o = helpers::parse_address(off.get<std::string>());
+                if (o) offsets.push_back(static_cast<std::int64_t>(*o));
+            }
+        }
+    }
+
+    json chain = json::array();
+    std::uint64_t current = *ea_opt;
+    chain.push_back({{"step", 0}, {"address", helpers::format_address(current)}, {"type", "base"}});
+
+    for (std::size_t i = 0; i < offsets.size(); i++)
+    {
+        std::uint64_t ptr = device->read<std::uint64_t>(current);
+        if (ptr == 0)
+        {
+            chain.push_back({{"step", (int)(i + 1)}, {"error", "null pointer"}, {"offset", offsets[i]}});
+            break;
+        }
+        std::uint64_t next = ptr + offsets[i];
+        chain.push_back({{"step", (int)(i + 1)},
+                         {"deref", helpers::format_address(ptr)},
+                         {"offset", offsets[i]},
+                         {"address", helpers::format_address(next)}});
+        current = next;
+    }
+
+    std::uint64_t final_val = device->read<std::uint64_t>(current);
+
+    json result;
+    result["initial_address"]    = helpers::format_address(*ea_opt);
+    result["final_address"]      = helpers::format_address(current);
+    result["final_value"]        = helpers::format_address(final_val);
+    result["final_value_decimal"] = final_val;
+    result["chain"]              = chain;
+    return tool_result_t::ok(OBFSTR("Pointer chain traversed"), result);
+}
+
+tool_result_t driver_enumerate_modules(const json&)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+
+    std::uint64_t base = device->get_base_address();
+    if (base == 0)
+        return tool_result_t::error(OBFSTR("No base address. Call driver_attach first."));
+
+    std::uint8_t pe_hdr[0x1000];
+    if (device->read_raw(base, pe_hdr, sizeof(pe_hdr)) < 0x200 || *(std::uint16_t*)pe_hdr != 0x5A4D)
+        return tool_result_t::error(OBFSTR("Failed to read main PE header at ") + helpers::format_address(base));
+
+    json modules = json::array();
+    std::uint32_t pe_off = *(std::uint32_t*)(pe_hdr + 0x3C);
+
+    std::uint32_t main_size = 0;
+    {
+        std::uint16_t mag = (pe_off + 0x58 < sizeof(pe_hdr)) ? *(std::uint16_t*)(pe_hdr + pe_off + 0x18) : 0;
+        if (mag == 0x020B || mag == 0x010B)
+            main_size = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x38);
+    }
+    modules.push_back({{"name", "main_module"}, {"base", helpers::format_address(base)},
+                       {"size", main_size}, {"is_main", true}});
+
+    std::uint16_t opt_magic  = (pe_off + 0x1A < sizeof(pe_hdr)) ? *(std::uint16_t*)(pe_hdr + pe_off + 0x18) : 0;
+    std::uint32_t import_rva = 0;
+    if (opt_magic == 0x020B && pe_off + 0x90 < sizeof(pe_hdr))
+        import_rva = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x78);
+    else if (opt_magic == 0x010B && pe_off + 0x80 < sizeof(pe_hdr))
+        import_rva = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x68);
+
+    if (import_rva != 0)
+    {
+        std::uint8_t imp[20];
+        for (std::uint32_t imp_off = 0; imp_off < 0x10000; imp_off += 20)
+        {
+            if (device->read_raw(base + import_rva + imp_off, imp, sizeof(imp)) < sizeof(imp)) break;
+            bool zero = true;
+            for (int k = 0; k < 20; k++) if (imp[k]) { zero = false; break; }
+            if (zero) break;
+
+            std::uint32_t name_rva = *(std::uint32_t*)(imp + 12);
+            if (name_rva == 0) continue;
+
+            char dll_name[260] = {0};
+            if (device->read_raw(base + name_rva, dll_name, sizeof(dll_name) - 1) > 0 && dll_name[0])
+                modules.push_back({{"name", std::string(dll_name)}, {"base", "runtime"}, {"is_import", true}});
+        }
+    }
+
+    json result;
+    result["modules"]       = modules;
+    result["module_count"]  = modules.size();
+    result["process_id"]    = device->get_process_id();
+    result["note"]          = OBFSTR("Import-table enumeration. For full LDR list, walk PEB.Ldr via driver_read_pointer_chain.");
+    return tool_result_t::ok(OBFSTR("Enumerated ") + std::to_string(modules.size()) + " modules", result);
+}
+
+tool_result_t driver_dump_to_idb(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+
+    ea_t base = BADADDR;
+    if (params.contains("address"))
+    {
+        auto a = helpers::parse_address(params["address"].get<std::string>());
+        if (a) base = *a;
+    }
+    if (base == BADADDR || base == 0)
+        base = static_cast<ea_t>(device->get_base_address());
+    if (base == 0 || base == BADADDR)
+        return tool_result_t::error(OBFSTR("Invalid base address"));
+
+    std::uint8_t pe_hdr[0x1000];
+    if (device->read_raw(base, pe_hdr, sizeof(pe_hdr)) < 0x200 || *(std::uint16_t*)pe_hdr != 0x5A4D)
+        return tool_result_t::error(OBFSTR("Not a PE image at ") + helpers::format_address(base));
+
+    std::uint32_t pe_off = *(std::uint32_t*)(pe_hdr + 0x3C);
+    if (pe_off + 0x100 > sizeof(pe_hdr))
+        return tool_result_t::error(OBFSTR("PE header offset out of range"));
+
+    std::uint16_t sections_count = *(std::uint16_t*)(pe_hdr + pe_off + 0x06);
+    std::uint16_t opt_size       = *(std::uint16_t*)(pe_hdr + pe_off + 0x14);
+    std::uint32_t sec_table_off  = pe_off + 0x18 + opt_size;
+    std::uint16_t opt_magic      = *(std::uint16_t*)(pe_hdr + pe_off + 0x18);
+    std::uint32_t image_size     = 0;
+    if (opt_magic == 0x020B || opt_magic == 0x010B)
+        image_size = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x38);
+    if (image_size == 0) image_size = 0x1000000;
+
+    int segs_created = 0;
+    json segs_info = json::array();
+
+    for (int si = 0; si < sections_count && si < 96; si++)
+    {
+        std::uint32_t soff = sec_table_off + si * 40;
+        std::uint8_t sec[40] = {0};
+
+        if (soff + 40 <= sizeof(pe_hdr))
+            memcpy(sec, pe_hdr + soff, 40);
+        else if (device->read_raw(base + soff, sec, sizeof(sec)) < sizeof(sec))
+            break;
+
+        char name[9] = {0};
+        memcpy(name, sec, 8);
+        std::uint32_t vsize  = *(std::uint32_t*)(sec + 8);
+        std::uint32_t vrva   = *(std::uint32_t*)(sec + 12);
+        std::uint32_t chars  = *(std::uint32_t*)(sec + 36);
+        if (vsize == 0 || vrva == 0) continue;
+
+        ea_t sec_start = base + vrva;
+        ea_t sec_end   = sec_start + vsize;
+
+        uchar perm = 0;
+        if (chars & 0x40000000) perm |= SEGPERM_READ;
+        if (chars & 0x80000000) perm |= SEGPERM_WRITE;
+        if (chars & 0x20000000) perm |= SEGPERM_EXEC;
+
+        bool created = false;
+        if (!getseg(sec_start))
+        {
+            const char* sclass = (perm & SEGPERM_EXEC) ? "CODE" : "DATA";
+            if (add_segm(0, sec_start, sec_end, name, sclass))
+            {
+                segment_t* seg = getseg(sec_start);
+                if (seg) { seg->perm = perm; seg->update(); }
+                segs_created++;
+                created = true;
+                segs_info.push_back({{"name", std::string(name)},
+                                     {"start", helpers::format_address(sec_start)},
+                                     {"size", vsize}});
+            }
+        }
+
+        std::vector<std::uint8_t> sec_bytes(vsize, 0);
+        std::size_t got = device->read_raw(sec_start, sec_bytes.data(), vsize);
+        for (std::size_t i = 0; i < got; i++)
+            put_byte(sec_start + i, sec_bytes[i]);
+    }
+
+    if (params.value("analyze", true))
+    {
+        auto_mark_range(base, base + image_size, AU_FINAL);
+        plan_range(base, base + image_size);
+    }
+
+    json result;
+    result["base"]             = helpers::format_address(base);
+    result["image_size"]       = image_size;
+    result["sections_created"] = segs_created;
+    result["segments"]         = segs_info;
+    return tool_result_t::ok(OBFSTR("Dumped ") + std::to_string(segs_created) + " sections into IDA database", result);
+}
+
+tool_result_t driver_bypass_and_dump(const json& params)
+{
+    json steps = json::array();
+    auto log = [&](const std::string& step, bool ok, const std::string& detail = "") {
+        steps.push_back({{"step", step}, {"ok", ok}, {"detail", detail}});
+    };
+
+    if (!device->is_connected())
+    {
+        bool ok = device->connect();
+        log("connect_driver", ok, ok ? "Connected to kernel driver" : "Failed");
+        if (!ok)
+        {
+            json r; r["steps"] = steps;
+            return tool_result_t::error(OBFSTR("Failed to connect to kernel driver. Is the driver loaded?"));
+        }
+    }
+    else
+        log("connect_driver", true, "Already connected");
+
+    std::string process_name = params["process"].get<std::string>();
+    std::uint32_t pid = device->find_process(process_name.c_str());
+    log("find_process", pid != 0, "PID: " + (pid ? std::to_string(pid) : "not found"));
+    if (pid == 0)
+        return tool_result_t::error(OBFSTR("Process not found: ") + process_name);
+
+    std::uint64_t base = device->find_image();
+    log("find_image_base", base != 0, helpers::format_address(base));
+    if (base == 0)
+        return tool_result_t::error(OBFSTR("Failed to locate image base for ") + process_name);
+
+    device->solve_dtb();
+    std::uint64_t dtb = device->get_dtb();
+    log("solve_dtb", dtb != 0, helpers::format_address(dtb));
+
+    std::uint8_t pe_hdr[0x1000];
+    std::size_t hdr_got = device->read_raw(base, pe_hdr, sizeof(pe_hdr));
+    log("read_pe_header", hdr_got > 0x200, std::to_string(hdr_got) + " bytes");
+    if (hdr_got < 0x200 || *(std::uint16_t*)pe_hdr != 0x5A4D)
+        return tool_result_t::error(OBFSTR("Failed to read valid PE header at ") + helpers::format_address(base));
+
+    std::uint32_t pe_off   = *(std::uint32_t*)(pe_hdr + 0x3C);
+    std::uint16_t opt_mag  = (pe_off + 0x3A < sizeof(pe_hdr)) ? *(std::uint16_t*)(pe_hdr + pe_off + 0x18) : 0;
+    std::uint32_t img_size = 0;
+    if (opt_mag == 0x020B || opt_mag == 0x010B)
+        img_size = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x38);
+    if (img_size == 0 || img_size > 0x10000000) img_size = 0x2000000;
+
+    std::vector<std::uint8_t> img(img_size, 0);
+    std::size_t total_read = 0;
+    const std::size_t chunk = 0x1000;
+
+    show_wait_box("HIDECANCEL\nAiDA: Bypassing & dumping %s (0x%X bytes)...", process_name.c_str(), img_size);
+    for (std::size_t off = 0; off < img_size; off += chunk)
+    {
+        if (off % 0x100000 == 0)
+            replace_wait_box("HIDECANCEL\nAiDA: Dumping %s (0x%zX / 0x%X)...",
+                             process_name.c_str(), off, img_size);
+        total_read += device->read_raw(base + off, img.data() + off,
+                                       std::min(chunk, img_size - off));
+    }
+    hide_wait_box();
+    log("dump_image", total_read > 0, std::to_string(total_read) + "/" + std::to_string(img_size) + " bytes");
+
+    show_wait_box("HIDECANCEL\nAiDA: Patching IDA database...");
+    std::size_t patched = 0;
+    for (std::size_t off = 0; off < img_size; off++)
+    {
+        if (getseg(base + off))
+        {
+            put_byte(base + off, img[off]);
+            patched++;
+        }
+    }
+    hide_wait_box();
+    log("patch_idb", patched > 0, std::to_string(patched) + " bytes patched");
+
+    bool hb = device->send_heartbeat();
+    log("heartbeat", hb, hb ? "Session maintained" : "Failed (non-fatal)");
+
+    json result;
+    result["process"]       = process_name;
+    result["pid"]           = pid;
+    result["base"]          = helpers::format_address(base);
+    result["dtb"]           = helpers::format_address(dtb);
+    result["image_size"]    = img_size;
+    result["bytes_dumped"]  = total_read;
+    result["coverage_pct"]  = total_read ? (int)((total_read * 100) / img_size) : 0;
+    result["bytes_patched"] = patched;
+    result["steps"]         = steps;
+
+    return tool_result_t::ok(OBFSTR("Bypass-and-dump complete for ") + process_name +
+                             OBFSTR(": ") + std::to_string(total_read) + OBFSTR("/") +
+                             std::to_string(img_size) + OBFSTR(" bytes"), result);
+}
+
+static std::string resolve_nt_path_to_win32(const std::string& nt_path)
+{
+    std::string result = nt_path;
+    std::replace(result.begin(), result.end(), '/', '\\');
+
+    // \SystemRoot\ -> C:\Windows\ (or wherever Windows is installed)
+    if (result.size() >= 12)
+    {
+        std::string prefix_lower = result.substr(0, 12);
+        std::transform(prefix_lower.begin(), prefix_lower.end(), prefix_lower.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (prefix_lower == "\\systemroot\\")
+        {
+            char win_dir[MAX_PATH] = {};
+            GetWindowsDirectoryA(win_dir, MAX_PATH);
+            result = std::string(win_dir) + "\\" + result.substr(12);
+        }
+    }
+
+    // \??\ prefix -> strip it
+    if (result.size() >= 4 && result.substr(0, 4) == "\\??\\")
+        result = result.substr(4);
+
+    return result;
+}
+
+struct sys_module_entry_t
+{
+    HANDLE   Section;
+    PVOID    MappedBase;
+    PVOID    ImageBase;
+    ULONG    ImageSize;
+    ULONG    Flags;
+    USHORT   LoadOrderIndex;
+    USHORT   InitOrderIndex;
+    USHORT   LoadCount;
+    USHORT   OffsetToFileName;
+    UCHAR    FullPathName[256];
+};
+
+struct sys_module_info_t
+{
+    ULONG              NumberOfModules;
+    sys_module_entry_t Modules[1];
+};
+
+typedef LONG(NTAPI* NtQuerySystemInformation_fn)(
+    ULONG SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength);
+
+static bool query_kernel_modules(
+    std::vector<std::uint8_t>& out_buffer,
+    sys_module_info_t*& out_info,
+    std::string& error_msg)
+{
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll)
+    {
+        error_msg = OBFSTR("Cannot resolve ntdll.dll");
+        return false;
+    }
+
+    auto pNtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformation_fn>(
+        GetProcAddress(ntdll, "NtQuerySystemInformation"));
+    if (!pNtQuerySystemInformation)
+    {
+        error_msg = OBFSTR("Cannot resolve NtQuerySystemInformation");
+        return false;
+    }
+
+    constexpr ULONG SystemModuleInformation = 11;
+    ULONG needed = 0;
+    pNtQuerySystemInformation(SystemModuleInformation, nullptr, 0, &needed);
+    if (needed == 0)
+        needed = 256 * 1024;
+    needed += 16384;
+
+    out_buffer.resize(needed, 0);
+    LONG status = pNtQuerySystemInformation(
+        SystemModuleInformation, out_buffer.data(),
+        static_cast<ULONG>(out_buffer.size()), &needed);
+
+    if (status < 0)
+    {
+        error_msg = OBFSTR("NtQuerySystemInformation(SystemModuleInformation) failed: NTSTATUS 0x")
+            + helpers::format_address(static_cast<ea_t>(static_cast<unsigned long>(status)));
+        return false;
+    }
+
+    out_info = reinterpret_cast<sys_module_info_t*>(out_buffer.data());
+    return true;
+}
+
+tool_result_t driver_enumerate_kernel_modules(const json& params)
+{
+    std::vector<std::uint8_t> buf;
+    sys_module_info_t* info = nullptr;
+    std::string err;
+    if (!query_kernel_modules(buf, info, err))
+        return tool_result_t::error(err);
+
+    std::string filter;
+    if (params.contains("filter") && params["filter"].is_string())
+        filter = params["filter"].get<std::string>();
+
+    int limit = params.value("limit", 500);
+
+    json modules_arr = json::array();
+    for (ULONG i = 0; i < info->NumberOfModules && static_cast<int>(modules_arr.size()) < limit; i++)
+    {
+        const auto& m = info->Modules[i];
+        std::string full_path(reinterpret_cast<const char*>(m.FullPathName));
+        std::string name(reinterpret_cast<const char*>(m.FullPathName + m.OffsetToFileName));
+
+        if (!filter.empty())
+        {
+            std::string lower_name = name;
+            std::string lower_filter = filter;
+            std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            std::transform(lower_filter.begin(), lower_filter.end(), lower_filter.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (lower_name.find(lower_filter) == std::string::npos)
+            {
+                std::string lower_path = full_path;
+                std::transform(lower_path.begin(), lower_path.end(), lower_path.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (lower_path.find(lower_filter) == std::string::npos)
+                    continue;
+            }
+        }
+
+        std::string resolved_path = resolve_nt_path_to_win32(full_path);
+
+        json entry;
+        entry["name"]           = name;
+        entry["nt_path"]        = full_path;
+        entry["disk_path"]      = resolved_path;
+        entry["base_address"]   = helpers::format_address(
+            static_cast<ea_t>(reinterpret_cast<std::uintptr_t>(m.ImageBase)));
+        entry["size"]           = m.ImageSize;
+        entry["size_hex"]       = helpers::format_address(static_cast<ea_t>(m.ImageSize));
+        entry["load_order"]     = m.LoadOrderIndex;
+        modules_arr.push_back(entry);
+    }
+
+    json result;
+    result["modules"]        = modules_arr;
+    result["total_loaded"]   = info->NumberOfModules;
+    result["returned"]       = modules_arr.size();
+
+    return tool_result_t::ok(
+        OBFSTR("Enumerated ") + std::to_string(modules_arr.size()) + OBFSTR(" kernel modules") +
+        (filter.empty() ? "" : OBFSTR(" matching '") + filter + "'"), result);
+}
+
+tool_result_t driver_dump_kernel_module(const json& params)
+{
+    std::string module_name = params["module"].get<std::string>();
+    std::string output_path = params.value("output_path", std::string());
+
+    // --- Step 1: Enumerate kernel modules to find the target ---
+    std::vector<std::uint8_t> buf;
+    sys_module_info_t* info = nullptr;
+    std::string err;
+    if (!query_kernel_modules(buf, info, err))
+        return tool_result_t::error(err);
+
+    std::string found_name, found_nt_path;
+    std::uintptr_t found_base = 0;
+    ULONG found_size = 0;
+    bool found = false;
+
+    std::string lower_target = module_name;
+    std::transform(lower_target.begin(), lower_target.end(), lower_target.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    for (ULONG i = 0; i < info->NumberOfModules; i++)
+    {
+        const auto& m = info->Modules[i];
+        std::string name(reinterpret_cast<const char*>(m.FullPathName + m.OffsetToFileName));
+        std::string full_path(reinterpret_cast<const char*>(m.FullPathName));
+
+        std::string lower_name = name;
+        std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        if (lower_name == lower_target || lower_name.find(lower_target) != std::string::npos)
+        {
+            found_name    = name;
+            found_nt_path = full_path;
+            found_base    = reinterpret_cast<std::uintptr_t>(m.ImageBase);
+            found_size    = m.ImageSize;
+            found = true;
+            break;
+        }
+    }
+
+    if (!found)
+        return tool_result_t::error(
+            OBFSTR("Kernel module not found: ") + module_name +
+            OBFSTR(". Use driver_enumerate_kernel_modules with filter to list loaded drivers."));
+
+    bool use_memory = params.value("from_memory", true);
+
+    // --- MEMORY DUMP PATH (default) ---
+    if (use_memory)
+    {
+        if (!device || !device->is_connected())
+            return tool_result_t::error(
+                OBFSTR("Driver not connected. Call driver_connect first for in-memory kernel dump."));
+
+        // Ensure kernel DTB is solved
+        if (device->get_kernel_dtb() == 0)
+        {
+            device->solve_kernel_dtb();
+            if (device->get_kernel_dtb() == 0)
+                return tool_result_t::error(
+                    OBFSTR("Failed to solve kernel DTB (System process PID 4). "
+                           "Cannot read kernel memory."));
+        }
+
+        // Generate output path if not provided
+        if (output_path.empty())
+        {
+            char temp_dir[MAX_PATH] = {};
+            GetTempPathA(MAX_PATH, temp_dir);
+            output_path = std::string(temp_dir) + "dumped_" + found_name;
+        }
+
+        std::uint64_t base_addr = static_cast<std::uint64_t>(found_base);
+        std::uint32_t image_size = found_size;
+
+        // Read PE header first for validation
+        std::vector<std::uint8_t> header_buf(0x1000, 0);
+        std::size_t header_read = device->read_kernel_raw(base_addr, header_buf.data(), 0x1000);
+        if (header_read < 0x40 || header_buf[0] != 'M' || header_buf[1] != 'Z')
+        {
+            return tool_result_t::error(
+                OBFSTR("Failed to read PE header at kernel base ") +
+                helpers::format_address(static_cast<ea_t>(base_addr)) +
+                OBFSTR(". Read ") + std::to_string(header_read) + OBFSTR(" bytes. "
+                "MZ signature not found — module may be packed or encrypted in memory."));
+        }
+
+        // Parse PE header to get real image size and sections
+        std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&header_buf[0x3C]);
+        if (pe_off + 0x18 > header_read || header_buf[pe_off] != 'P' || header_buf[pe_off + 1] != 'E')
+        {
+            return tool_result_t::error(
+                OBFSTR("Invalid PE signature at offset 0x") +
+                helpers::format_address(static_cast<ea_t>(pe_off)));
+        }
+
+        std::uint16_t machine = *reinterpret_cast<std::uint16_t*>(&header_buf[pe_off + 4]);
+        std::uint16_t num_sections = *reinterpret_cast<std::uint16_t*>(&header_buf[pe_off + 6]);
+        std::uint16_t opt_hdr_size = *reinterpret_cast<std::uint16_t*>(&header_buf[pe_off + 20]);
+        std::uint32_t pe_image_size = *reinterpret_cast<std::uint32_t*>(&header_buf[pe_off + 24 + 56]);
+
+        // Use larger of NtQuerySystemInformation size vs PE header SizeOfImage
+        std::uint32_t dump_size = (pe_image_size > image_size) ? pe_image_size : image_size;
+        if (dump_size == 0 || dump_size > 256 * 1024 * 1024)
+        {
+            return tool_result_t::error(
+                OBFSTR("Invalid image size: ") + std::to_string(dump_size));
+        }
+
+        // Allocate full dump buffer
+        std::vector<std::uint8_t> dump_data(dump_size, 0);
+
+        // Copy header page(s) already read
+        std::memcpy(dump_data.data(), header_buf.data(), std::min<std::size_t>(header_read, dump_size));
+
+        show_wait_box("HIDECANCEL\nAiDA: Dumping kernel module %s from memory (0x%X bytes)...",
+                      found_name.c_str(), dump_size);
+
+        // Read the rest in chunks — page by page for kernel memory
+        constexpr std::size_t CHUNK_SIZE = 0x1000;
+        std::size_t total_read = header_read;
+        std::size_t readable_pages = 1; // header already read
+
+        for (std::uint32_t offset = static_cast<std::uint32_t>(header_read);
+             offset < dump_size; offset += CHUNK_SIZE)
+        {
+            std::size_t to_read = CHUNK_SIZE;
+            if (offset + to_read > dump_size)
+                to_read = dump_size - offset;
+
+            std::size_t bytes_got = device->read_kernel_raw(
+                base_addr + offset, dump_data.data() + offset, to_read);
+
+            if (bytes_got > 0)
+            {
+                total_read += bytes_got;
+                readable_pages++;
+            }
+            // Pages that fail to read stay zero-filled (paged out / guard pages)
+
+            if (offset % 0x10000 == 0)
+                replace_wait_box("HIDECANCEL\nAiDA: Dumping %s: 0x%X / 0x%X (%.1f%%)",
+                                 found_name.c_str(), offset, dump_size,
+                                 (offset * 100.0) / dump_size);
+        }
+
+        hide_wait_box();
+
+        // Save to file
+        show_wait_box("HIDECANCEL\nAiDA: Writing memory dump to %s...", output_path.c_str());
+
+        HANDLE hOut = CreateFileA(
+            output_path.c_str(), GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+        if (hOut == INVALID_HANDLE_VALUE)
+        {
+            hide_wait_box();
+            return tool_result_t::error(
+                OBFSTR("Failed to create output file: ") + output_path +
+                OBFSTR(". Win32 error: ") + std::to_string(GetLastError()));
+        }
+
+        DWORD bytes_written = 0;
+        WriteFile(hOut, dump_data.data(), static_cast<DWORD>(dump_size), &bytes_written, nullptr);
+        CloseHandle(hOut);
+        hide_wait_box();
+
+        std::string pe_arch = "unknown";
+        if (machine == 0x8664) pe_arch = "AMD64";
+        else if (machine == 0x014C) pe_arch = "i386";
+        else if (machine == 0xAA64) pe_arch = "ARM64";
+
+        int coverage = dump_size ? static_cast<int>((total_read * 100) / dump_size) : 0;
+
+        json result;
+        result["module_name"]       = found_name;
+        result["nt_path"]           = found_nt_path;
+        result["kernel_base"]       = helpers::format_address(static_cast<ea_t>(found_base));
+        result["kernel_size"]       = found_size;
+        result["pe_image_size"]     = pe_image_size;
+        result["dump_size"]         = dump_size;
+        result["bytes_read"]        = total_read;
+        result["readable_pages"]    = readable_pages;
+        result["coverage_pct"]      = coverage;
+        result["output_path"]       = output_path;
+        result["valid_pe"]          = true;
+        result["architecture"]      = pe_arch;
+        result["num_sections"]      = num_sections;
+        result["dump_source"]       = "kernel_memory";
+        result["can_load_in_ida"]   = true;
+        result["note"]              = OBFSTR(
+            "LIVE MEMORY DUMP — contains runtime-decrypted code, devirtualized sections, "
+            "and unpacked data as they exist in kernel memory. Open in IDA Pro: "
+            "File > Open > select the dumped file > choose manual load with image base ") +
+            helpers::format_address(static_cast<ea_t>(found_base)) +
+            OBFSTR(". Some pages may be zero-filled if they were paged out.");
+
+        return tool_result_t::ok(
+            OBFSTR("Kernel module memory-dumped: ") + found_name + OBFSTR(" (") +
+            std::to_string(total_read) + OBFSTR("/") + std::to_string(dump_size) +
+            OBFSTR(" bytes, ") + std::to_string(coverage) + OBFSTR("% coverage) -> ") +
+            output_path, result);
+    }
+
+    // --- DISK DUMP PATH (fallback when from_memory=false or driver unavailable) ---
+    std::string disk_path = resolve_nt_path_to_win32(found_nt_path);
+
+    if (output_path.empty())
+    {
+        char temp_dir[MAX_PATH] = {};
+        GetTempPathA(MAX_PATH, temp_dir);
+        output_path = std::string(temp_dir) + "dumped_" + found_name;
+    }
+
+    HANDLE hFile = CreateFileA(
+        disk_path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    if (hFile == INVALID_HANDLE_VALUE)
+    {
+        hFile = CreateFileA(
+            found_nt_path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+
+    if (hFile == INVALID_HANDLE_VALUE)
+    {
+        DWORD last_err = GetLastError();
+        return tool_result_t::error(
+            OBFSTR("Cannot open driver file: ") + disk_path +
+            OBFSTR(" (Win32 error: ") + std::to_string(last_err) +
+            OBFSTR("). Connect the kernel driver and use from_memory=true for live dump."));
+    }
+
+    LARGE_INTEGER file_size_li;
+    if (!GetFileSizeEx(hFile, &file_size_li) || file_size_li.QuadPart == 0)
+    {
+        CloseHandle(hFile);
+        return tool_result_t::error(OBFSTR("Cannot determine file size for: ") + disk_path);
+    }
+
+    if (file_size_li.QuadPart > 256LL * 1024 * 1024)
+    {
+        CloseHandle(hFile);
+        return tool_result_t::error(
+            OBFSTR("Driver file exceeds 256 MB limit: ") +
+            std::to_string(file_size_li.QuadPart) + OBFSTR(" bytes"));
+    }
+
+    std::size_t file_size = static_cast<std::size_t>(file_size_li.QuadPart);
+    std::vector<std::uint8_t> file_data(file_size);
+
+    show_wait_box("HIDECANCEL\nAiDA: Reading kernel module %s from disk (%zu bytes)...",
+                  found_name.c_str(), file_size);
+
+    DWORD total_read = 0;
+    while (total_read < static_cast<DWORD>(file_size))
+    {
+        DWORD to_read = static_cast<DWORD>(
+            std::min<std::size_t>(file_size - total_read, 0x100000));
+        DWORD bytes_read = 0;
+        if (!ReadFile(hFile, file_data.data() + total_read, to_read, &bytes_read, nullptr) || bytes_read == 0)
+            break;
+        total_read += bytes_read;
+    }
+    CloseHandle(hFile);
+    hide_wait_box();
+
+    if (total_read == 0)
+        return tool_result_t::error(OBFSTR("Failed to read any bytes from: ") + disk_path);
+
+    HANDLE hOut = CreateFileA(
+        output_path.c_str(), GENERIC_WRITE, 0, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    if (hOut == INVALID_HANDLE_VALUE)
+    {
+        return tool_result_t::error(
+            OBFSTR("Failed to create output file: ") + output_path +
+            OBFSTR(". Win32 error: ") + std::to_string(GetLastError()));
+    }
+
+    DWORD bytes_written = 0;
+    WriteFile(hOut, file_data.data(), total_read, &bytes_written, nullptr);
+    CloseHandle(hOut);
+
+    bool is_valid_pe = false;
+    std::string pe_arch = "unknown";
+    if (file_data.size() >= 0x40 && file_data[0] == 'M' && file_data[1] == 'Z')
+    {
+        std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&file_data[0x3C]);
+        if (pe_off + 6 < file_data.size() &&
+            file_data[pe_off] == 'P' && file_data[pe_off + 1] == 'E' &&
+            file_data[pe_off + 2] == 0 && file_data[pe_off + 3] == 0)
+        {
+            is_valid_pe = true;
+            std::uint16_t machine = *reinterpret_cast<std::uint16_t*>(&file_data[pe_off + 4]);
+            if (machine == 0x8664) pe_arch = "AMD64";
+            else if (machine == 0x014C) pe_arch = "i386";
+            else if (machine == 0xAA64) pe_arch = "ARM64";
+        }
+    }
+
+    json result;
+    result["module_name"]       = found_name;
+    result["nt_path"]           = found_nt_path;
+    result["disk_path"]         = disk_path;
+    result["kernel_base"]       = helpers::format_address(static_cast<ea_t>(found_base));
+    result["kernel_size"]       = found_size;
+    result["file_size"]         = total_read;
+    result["output_path"]       = output_path;
+    result["valid_pe"]          = is_valid_pe;
+    result["architecture"]      = pe_arch;
+    result["dump_source"]       = "disk";
+    result["can_load_in_ida"]   = is_valid_pe;
+    result["note"]              = OBFSTR(
+        "ON-DISK dump (not live memory). Contains static file contents only. "
+        "For runtime-decrypted code, use from_memory=true with driver connected.");
+
+    return tool_result_t::ok(
+        OBFSTR("Kernel module disk-dumped: ") + found_name + OBFSTR(" (") +
+        std::to_string(bytes_written) + OBFSTR(" bytes) -> ") + output_path, result);
+}
+
+// ========================= KERNEL MEMORY READ =========================
+tool_result_t driver_read_kernel_memory(const json& params)
+{
+    if (!device || !device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+
+    // Ensure kernel DTB
+    if (device->get_kernel_dtb() == 0)
+    {
+        device->solve_kernel_dtb();
+        if (device->get_kernel_dtb() == 0)
+            return tool_result_t::error(OBFSTR("Failed to solve kernel DTB."));
+    }
+
+    std::string addr_str = params["address"].get<std::string>();
+    auto addr_opt = helpers::parse_address(addr_str);
+    if (!addr_opt.has_value())
+        return tool_result_t::error(OBFSTR("Invalid address: ") + addr_str);
+
+    std::uint64_t address = static_cast<std::uint64_t>(addr_opt.value());
+    std::size_t size = params.value("size", 256);
+    if (size > 65536) size = 65536;
+    if (size == 0) size = 256;
+
+    bool patch_idb = params.value("patch_idb", false);
+
+    std::vector<std::uint8_t> buffer(size, 0);
+    std::size_t bytes_read = device->read_kernel_raw(address, buffer.data(), size);
+
+    if (bytes_read == 0)
+        return tool_result_t::error(
+            OBFSTR("Failed to read kernel memory at ") +
+            helpers::format_address(static_cast<ea_t>(address)));
+
+    // Build hex dump
+    std::ostringstream hex_dump;
+    hex_dump << std::hex << std::setfill('0');
+    for (std::size_t i = 0; i < bytes_read; i++)
+    {
+        if (i > 0 && (i % 16) == 0) hex_dump << "\n";
+        else if (i > 0) hex_dump << " ";
+        hex_dump << std::setw(2) << static_cast<int>(buffer[i]);
+    }
+
+    // ASCII representation
+    std::string ascii;
+    ascii.reserve(bytes_read);
+    for (std::size_t i = 0; i < bytes_read; i++)
+        ascii += (buffer[i] >= 0x20 && buffer[i] < 0x7F) ? static_cast<char>(buffer[i]) : '.';
+
+    // Optionally patch into IDA database
+    std::size_t patched = 0;
+    if (patch_idb)
+    {
+        ea_t ea = static_cast<ea_t>(address);
+        for (std::size_t i = 0; i < bytes_read; i++)
+        {
+            if (is_mapped(ea + static_cast<ea_t>(i)))
+            {
+                patch_byte(ea + static_cast<ea_t>(i), buffer[i]);
+                patched++;
+            }
+        }
+    }
+
+    json result;
+    result["address"]       = helpers::format_address(static_cast<ea_t>(address));
+    result["bytes_read"]    = bytes_read;
+    result["requested"]     = size;
+    result["hex"]           = hex_dump.str();
+    result["ascii"]         = ascii;
+    result["source"]        = "kernel_memory";
+    result["kernel_dtb"]    = helpers::format_address(static_cast<ea_t>(device->get_kernel_dtb()));
+    if (patch_idb)
+        result["bytes_patched"] = patched;
+
+    return tool_result_t::ok(
+        OBFSTR("Read ") + std::to_string(bytes_read) + OBFSTR(" bytes from kernel address ") +
+        helpers::format_address(static_cast<ea_t>(address)), result);
+}
+
+// ========================= KERNEL MEMORY WRITE =========================
+tool_result_t driver_write_kernel_memory(const json& params)
+{
+    if (!device || !device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+
+    if (device->get_kernel_dtb() == 0)
+    {
+        device->solve_kernel_dtb();
+        if (device->get_kernel_dtb() == 0)
+            return tool_result_t::error(OBFSTR("Failed to solve kernel DTB."));
+    }
+
+    std::string addr_str = params["address"].get<std::string>();
+    auto addr_opt = helpers::parse_address(addr_str);
+    if (!addr_opt.has_value())
+        return tool_result_t::error(OBFSTR("Invalid address: ") + addr_str);
+
+    std::uint64_t address = static_cast<std::uint64_t>(addr_opt.value());
+
+    std::string hex_bytes = params["bytes"].get<std::string>();
+    std::vector<std::uint8_t> data;
+    std::istringstream iss(hex_bytes);
+    std::string byte_str;
+    while (iss >> byte_str)
+    {
+        unsigned long val = std::strtoul(byte_str.c_str(), nullptr, 16);
+        data.push_back(static_cast<std::uint8_t>(val));
+    }
+
+    if (data.empty())
+        return tool_result_t::error(OBFSTR("No valid bytes to write."));
+
+    if (data.size() > 4096)
+        return tool_result_t::error(OBFSTR("Write size exceeds 4096 byte limit."));
+
+    std::size_t written = device->write_kernel_raw(address, data.data(), data.size());
+
+    json result;
+    result["address"]       = helpers::format_address(static_cast<ea_t>(address));
+    result["bytes_written"] = written;
+    result["requested"]     = data.size();
+    result["source"]        = "kernel_memory";
+
+    if (written == 0)
+        return tool_result_t::error(
+            OBFSTR("Failed to write kernel memory at ") +
+            helpers::format_address(static_cast<ea_t>(address)));
+
+    return tool_result_t::ok(
+        OBFSTR("Wrote ") + std::to_string(written) + OBFSTR(" bytes to kernel address ") +
+        helpers::format_address(static_cast<ea_t>(address)), result);
+}
+
+// ========================= FULL KERNEL MODULE DUMP TO IDB =========================
+tool_result_t driver_kernel_dump_module(const json& params)
+{
+    if (!device || !device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+
+    if (device->get_kernel_dtb() == 0)
+    {
+        device->solve_kernel_dtb();
+        if (device->get_kernel_dtb() == 0)
+            return tool_result_t::error(OBFSTR("Failed to solve kernel DTB."));
+    }
+
+    std::string module_name = params["module"].get<std::string>();
+    bool patch_idb = params.value("patch_idb", true);
+    bool analyze = params.value("analyze", true);
+    std::string output_path = params.value("output_path", std::string());
+
+    // Find the module in kernel
+    std::vector<std::uint8_t> enum_buf;
+    sys_module_info_t* info = nullptr;
+    std::string err;
+    if (!query_kernel_modules(enum_buf, info, err))
+        return tool_result_t::error(err);
+
+    std::string found_name;
+    std::uintptr_t found_base = 0;
+    ULONG found_size = 0;
+    bool found = false;
+
+    std::string lower_target = module_name;
+    std::transform(lower_target.begin(), lower_target.end(), lower_target.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    for (ULONG i = 0; i < info->NumberOfModules; i++)
+    {
+        const auto& m = info->Modules[i];
+        std::string name(reinterpret_cast<const char*>(m.FullPathName + m.OffsetToFileName));
+        std::string lower_name = name;
+        std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lower_name == lower_target || lower_name.find(lower_target) != std::string::npos)
+        {
+            found_name = name;
+            found_base = reinterpret_cast<std::uintptr_t>(m.ImageBase);
+            found_size = m.ImageSize;
+            found = true;
+            break;
+        }
+    }
+
+    if (!found)
+        return tool_result_t::error(OBFSTR("Kernel module not found: ") + module_name);
+
+    std::uint64_t base_addr = static_cast<std::uint64_t>(found_base);
+
+    // Read PE header
+    std::vector<std::uint8_t> header(0x1000, 0);
+    std::size_t hdr_read = device->read_kernel_raw(base_addr, header.data(), 0x1000);
+    if (hdr_read < 0x40 || header[0] != 'M' || header[1] != 'Z')
+        return tool_result_t::error(
+            OBFSTR("Cannot read PE header at ") +
+            helpers::format_address(static_cast<ea_t>(base_addr)));
+
+    std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&header[0x3C]);
+    if (pe_off + 0x18 > hdr_read || header[pe_off] != 'P' || header[pe_off + 1] != 'E')
+        return tool_result_t::error(OBFSTR("Invalid PE signature."));
+
+    std::uint16_t num_sections = *reinterpret_cast<std::uint16_t*>(&header[pe_off + 6]);
+    std::uint16_t opt_hdr_size = *reinterpret_cast<std::uint16_t*>(&header[pe_off + 20]);
+    std::uint32_t pe_image_size = *reinterpret_cast<std::uint32_t*>(&header[pe_off + 24 + 56]);
+    std::uint32_t dump_size = (pe_image_size > found_size) ? pe_image_size : found_size;
+
+    // Section table starts after optional header
+    std::uint32_t section_table_off = pe_off + 24 + opt_hdr_size;
+
+    show_wait_box("HIDECANCEL\nAiDA: Dumping kernel module %s to IDB (0x%X bytes, %d sections)...",
+                  found_name.c_str(), dump_size, num_sections);
+
+    // Dump entire image
+    std::vector<std::uint8_t> image(dump_size, 0);
+    std::memcpy(image.data(), header.data(), std::min<std::size_t>(hdr_read, dump_size));
+
+    std::size_t total_read = hdr_read;
+    for (std::uint32_t offset = 0x1000; offset < dump_size; offset += 0x1000)
+    {
+        std::size_t to_read = 0x1000;
+        if (offset + to_read > dump_size) to_read = dump_size - offset;
+
+        std::size_t got = device->read_kernel_raw(base_addr + offset, image.data() + offset, to_read);
+        if (got > 0) total_read += got;
+
+        if (offset % 0x10000 == 0)
+            replace_wait_box("HIDECANCEL\nAiDA: Dumping %s: 0x%X / 0x%X",
+                             found_name.c_str(), offset, dump_size);
+    }
+
+    // Patch into IDB and create segments
+    std::size_t patched = 0;
+    json sections_arr = json::array();
+
+    // Post-dump analysis statistics (declared here so they're accessible outside the patch_idb block)
+    int initial_func_count = 0;
+    int exports_created = 0;
+    int entry_points_created = 0;
+    int code_insns_created = 0;
+    int prologue_funcs_created = 0;
+    int xref_funcs_created = 0;
+    int final_func_count = 0;
+
+    if (patch_idb)
+    {
+        for (int s = 0; s < num_sections && section_table_off + (s + 1) * 40 <= hdr_read; s++)
+        {
+            const std::uint8_t* sec = &header[section_table_off + s * 40];
+            char sec_name[9] = {};
+            std::memcpy(sec_name, sec, 8);
+
+            std::uint32_t virt_size = *reinterpret_cast<const std::uint32_t*>(sec + 8);
+            std::uint32_t virt_addr = *reinterpret_cast<const std::uint32_t*>(sec + 12);
+            std::uint32_t characteristics = *reinterpret_cast<const std::uint32_t*>(sec + 36);
+
+            ea_t seg_start = static_cast<ea_t>(base_addr + virt_addr);
+            ea_t seg_end   = seg_start + virt_size;
+
+            // Create IDA segment if it doesn't exist
+            segment_t* existing = getseg(seg_start);
+            if (!existing)
+            {
+                segment_t seg;
+                seg.start_ea = seg_start;
+                seg.end_ea   = seg_end;
+                seg.type     = (characteristics & 0x20000000) ? SEG_CODE : SEG_DATA;
+                seg.bitness  = 2; // 64-bit
+                seg.perm     = 0;
+                if (characteristics & 0x20000000) seg.perm |= SEGPERM_EXEC;
+                if (characteristics & 0x40000000) seg.perm |= SEGPERM_READ;
+                if (characteristics & 0x80000000) seg.perm |= SEGPERM_WRITE;
+                add_segm_ex(&seg, sec_name, nullptr, ADDSEG_OR_DIE);
+            }
+
+            // Patch bytes
+            std::size_t sec_patched = 0;
+            for (std::uint32_t i = 0; i < virt_size && (virt_addr + i) < dump_size; i++)
+            {
+                ea_t ea = seg_start + i;
+                std::uint8_t b = image[virt_addr + i];
+                if (is_mapped(ea))
+                {
+                    patch_byte(ea, b);
+                    sec_patched++;
+                }
+            }
+            patched += sec_patched;
+
+            json sec_info;
+            sec_info["name"]            = sec_name;
+            sec_info["virtual_address"] = helpers::format_address(static_cast<ea_t>(virt_addr));
+            sec_info["virtual_size"]    = virt_size;
+            sec_info["characteristics"] = helpers::format_address(static_cast<ea_t>(characteristics));
+            sec_info["bytes_patched"]   = sec_patched;
+            sections_arr.push_back(sec_info);
+        }
+
+        // ================================================================
+        // POST-DUMP COMPREHENSIVE ANALYSIS PIPELINE
+        // ================================================================
+        // After patching bytes into IDB, IDA's simple plan_range+auto_wait
+        // only finds a handful of functions in protected drivers (BattlEye,
+        // EAC, Vanguard, etc.). We run a full 6-step pipeline to maximize
+        // function/code recovery universally for ANY kernel module.
+        //
+        // IDA SDK justification (verbatim from ida-sdk/src/include/):
+        //   plan_range(sEA, eEA)              — auto.hpp L168-170
+        //   auto_wait(void)                   — auto.hpp L238
+        //   create_insn(ea_t ea, insn_t*)     — ua.hpp L1498
+        //   decode_insn(insn_t *out, ea_t ea) — ua.hpp L1509
+        //   add_func(ea_t ea1, ea_t ea2)      — funcs.hpp L405-408
+        //   get_func(ea_t ea)                 — funcs.hpp L293
+        //   add_entry(ord, ea, name, mkcode)  — entry.hpp L57
+        //   set_name(ea, name, flags)         — name.hpp L51
+        //   force_name(ea, name, flags)       — name.hpp L104-107
+        //   is_loaded(ea_t ea)                — bytes.hpp L363
+        //   is_code(flags64_t F)              — bytes.hpp L785
+        //   get_byte(ea_t ea)                 — bytes.hpp L383
+        //   del_items(ea, flags, nbytes)      — bytes.hpp L830-834
+
+        if (analyze)
+        {
+            // Count initial functions in the dumped range
+            for (ea_t fea = static_cast<ea_t>(base_addr);
+                 fea < static_cast<ea_t>(base_addr + dump_size);
+                 fea = next_addr(fea))
+            {
+                func_t* fn = get_func(fea);
+                if (fn && fn->start_ea == fea) ++initial_func_count;
+                if (fn) fea = fn->end_ea - 1;
+            }
+
+            // ── Step 1: Initial auto-analysis pass ──
+            replace_wait_box("HIDECANCEL\nAiDA: [1/6] Running initial auto-analysis...");
+            plan_range(static_cast<ea_t>(base_addr),
+                       static_cast<ea_t>(base_addr + dump_size));
+            auto_wait();
+
+            // ── Step 2: Parse PE export directory → create functions at exports ──
+            replace_wait_box("HIDECANCEL\nAiDA: [2/6] Parsing PE exports and entry points...");
+            {
+                // PE optional header: AddressOfEntryPoint is at offset 16 in opt hdr
+                std::uint32_t entry_rva = *reinterpret_cast<std::uint32_t*>(
+                    &header[pe_off + 24 + 16]);
+                if (entry_rva != 0)
+                {
+                    ea_t entry_ea = static_cast<ea_t>(base_addr + entry_rva);
+                    if (is_loaded(entry_ea))
+                    {
+                        create_insn(entry_ea);
+                        if (!get_func(entry_ea) && add_func(entry_ea, BADADDR))
+                            ++entry_points_created;
+                        add_entry(0, entry_ea, "DriverEntry", true, AEF_UTF8);
+                        force_name(entry_ea, "DriverEntry", SN_FORCE | SN_NODUMMY);
+                    }
+                }
+
+                // Export directory: data directory entry 0 in optional header
+                // For PE64, data directories start at offset 112 in optional header
+                std::uint32_t export_dir_rva = 0;
+                std::uint32_t export_dir_size = 0;
+                std::uint32_t dd_offset = pe_off + 24 + 112; // PE64 data dir start
+                if (dd_offset + 8 <= hdr_read)
+                {
+                    export_dir_rva  = *reinterpret_cast<std::uint32_t*>(&header[dd_offset]);
+                    export_dir_size = *reinterpret_cast<std::uint32_t*>(&header[dd_offset + 4]);
+                }
+
+                if (export_dir_rva != 0 && export_dir_size >= 40 &&
+                    export_dir_rva < dump_size)
+                {
+                    // IMAGE_EXPORT_DIRECTORY fields
+                    const std::uint8_t* exp_dir = &image[export_dir_rva];
+                    std::uint32_t num_funcs = *reinterpret_cast<const std::uint32_t*>(exp_dir + 20);
+                    std::uint32_t num_names = *reinterpret_cast<const std::uint32_t*>(exp_dir + 24);
+                    std::uint32_t addr_table_rva = *reinterpret_cast<const std::uint32_t*>(exp_dir + 28);
+                    std::uint32_t name_table_rva = *reinterpret_cast<const std::uint32_t*>(exp_dir + 32);
+                    std::uint32_t ordinal_base = *reinterpret_cast<const std::uint32_t*>(exp_dir + 16);
+
+                    // Build ordinal→name map from name pointer table + ordinal table
+                    std::uint32_t ord_table_rva = *reinterpret_cast<const std::uint32_t*>(exp_dir + 36);
+                    std::map<std::uint32_t, std::string> ordinal_names;
+                    for (std::uint32_t n = 0; n < num_names && n < 4096; ++n)
+                    {
+                        if (name_table_rva + n * 4 + 4 > dump_size) break;
+                        if (ord_table_rva + n * 2 + 2 > dump_size) break;
+                        std::uint32_t name_rva = *reinterpret_cast<const std::uint32_t*>(
+                            &image[name_table_rva + n * 4]);
+                        std::uint16_t ordinal_idx = *reinterpret_cast<const std::uint16_t*>(
+                            &image[ord_table_rva + n * 2]);
+                        if (name_rva < dump_size)
+                        {
+                            std::string exp_name;
+                            for (std::uint32_t c = name_rva; c < dump_size && image[c]; ++c)
+                                exp_name += static_cast<char>(image[c]);
+                            if (!exp_name.empty())
+                                ordinal_names[ordinal_idx] = exp_name;
+                        }
+                    }
+
+                    for (std::uint32_t i = 0; i < num_funcs && i < 4096; ++i)
+                    {
+                        if (addr_table_rva + i * 4 + 4 > dump_size) break;
+                        std::uint32_t func_rva = *reinterpret_cast<const std::uint32_t*>(
+                            &image[addr_table_rva + i * 4]);
+                        if (func_rva == 0 || func_rva >= dump_size) continue;
+
+                        ea_t func_ea = static_cast<ea_t>(base_addr + func_rva);
+                        if (!is_loaded(func_ea)) continue;
+
+                        create_insn(func_ea);
+                        if (!get_func(func_ea) && add_func(func_ea, BADADDR))
+                            ++exports_created;
+
+                        auto it = ordinal_names.find(i);
+                        if (it != ordinal_names.end() && !it->second.empty())
+                        {
+                            force_name(func_ea, it->second.c_str(), SN_FORCE | SN_NODUMMY);
+                            add_entry(ordinal_base + i, func_ea, it->second.c_str(), true, AEF_UTF8);
+                        }
+                    }
+                }
+            }
+
+            // ── Step 3: Force code creation — linear sweep all executable sections ──
+            replace_wait_box("HIDECANCEL\nAiDA: [3/6] Force-creating code in executable sections...");
+            for (int s = 0; s < num_sections && section_table_off + (s + 1) * 40 <= hdr_read; s++)
+            {
+                const std::uint8_t* sec_hdr = &header[section_table_off + s * 40];
+                std::uint32_t sec_vsize = *reinterpret_cast<const std::uint32_t*>(sec_hdr + 8);
+                std::uint32_t sec_vaddr = *reinterpret_cast<const std::uint32_t*>(sec_hdr + 12);
+                std::uint32_t sec_chars = *reinterpret_cast<const std::uint32_t*>(sec_hdr + 36);
+
+                // Only process executable sections
+                if (!(sec_chars & 0x20000000)) continue;
+
+                ea_t sec_start = static_cast<ea_t>(base_addr + sec_vaddr);
+                ea_t sec_end   = sec_start + sec_vsize;
+
+                // Check section entropy — skip high-entropy sections (VM bytecode, encrypted)
+                // Count distinct byte values in a 4KB sample from the section start
+                double entropy = 0.0;
+                {
+                    std::size_t sample_size = std::min<std::size_t>(sec_vsize, 4096);
+                    if (sec_vaddr + sample_size <= dump_size)
+                    {
+                        int freq[256] = {};
+                        for (std::size_t b = 0; b < sample_size; ++b)
+                            freq[image[sec_vaddr + b]]++;
+                        for (int f = 0; f < 256; ++f)
+                        {
+                            if (freq[f] == 0) continue;
+                            double p = static_cast<double>(freq[f]) / static_cast<double>(sample_size);
+                            entropy -= p * std::log2(p);
+                        }
+                    }
+                }
+
+                // Skip sections with entropy > 7.5 (likely encrypted/compressed/VM bytecode)
+                // These produce garbage instructions when force-disassembled
+                if (entropy > 7.5)
+                {
+                    // Update section info with entropy flag
+                    for (auto& si : sections_arr)
+                    {
+                        char sn[9] = {};
+                        std::memcpy(sn, sec_hdr, 8);
+                        if (si.value("name", "") == sn)
+                        {
+                            si["entropy"] = entropy;
+                            si["skipped_high_entropy"] = true;
+                        }
+                    }
+                    continue;
+                }
+
+                // Update section entropy info
+                for (auto& si : sections_arr)
+                {
+                    char sn[9] = {};
+                    std::memcpy(sn, sec_hdr, 8);
+                    if (si.value("name", "") == sn)
+                        si["entropy"] = entropy;
+                }
+
+                // Linear sweep: create instructions where IDA left unexplored data
+                for (ea_t ea = sec_start; ea < sec_end; )
+                {
+                    if (!is_loaded(ea)) { ea = next_addr(ea); if (ea == BADADDR || ea >= sec_end) break; continue; }
+
+                    flags64_t fl = get_flags(ea);
+                    if (is_code(fl))
+                    {
+                        // Already code — skip this instruction
+                        insn_t existing;
+                        int ilen = decode_insn(&existing, ea);
+                        ea += (ilen > 0) ? ilen : 1;
+                        continue;
+                    }
+
+                    // Try to create an instruction here
+                    insn_t test;
+                    int len = decode_insn(&test, ea);
+                    if (len > 0)
+                    {
+                        // Valid instruction — check it's not all zeros or padding
+                        uint8_t first = get_byte(ea);
+                        if (first != 0x00)
+                        {
+                            int created = create_insn(ea);
+                            if (created > 0)
+                            {
+                                ++code_insns_created;
+                                ea += created;
+                                continue;
+                            }
+                        }
+                    }
+                    ++ea;
+                }
+            }
+
+            // Run auto-wait after mass code creation
+            auto_wait();
+
+            // ── Step 4: Aggressive prologue scanning ──
+            replace_wait_box("HIDECANCEL\nAiDA: [4/6] Scanning for function prologues...");
+            {
+                // Common x86-64 function prologues (same as aggressive_function_discovery)
+                struct mini_sig_t { const uint8_t* bytes; const uint8_t* mask; int length; };
+
+                static const uint8_t p1_b[] = {0x55, 0x48, 0x89, 0xE5};
+                static const uint8_t p1_m[] = {0xFF, 0xFF, 0xFF, 0xFF};
+                static const uint8_t p2_b[] = {0x55, 0x48, 0x8B, 0xEC};
+                static const uint8_t p2_m[] = {0xFF, 0xFF, 0xFF, 0xFF};
+                static const uint8_t p3_b[] = {0x48, 0x83, 0xEC, 0x00};
+                static const uint8_t p3_m[] = {0xFF, 0xFF, 0xFF, 0x00};
+                static const uint8_t p4_b[] = {0x53, 0x48, 0x83, 0xEC, 0x00};
+                static const uint8_t p4_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+                static const uint8_t p5_b[] = {0x48, 0x89, 0x4C, 0x24, 0x08};
+                static const uint8_t p5_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                static const uint8_t p6_b[] = {0x48, 0x89, 0x54, 0x24, 0x10};
+                static const uint8_t p6_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                static const uint8_t p7_b[] = {0x48, 0x89, 0x5C, 0x24, 0x00, 0x48, 0x89, 0x74, 0x24};
+                static const uint8_t p7_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF};
+                static const uint8_t p8_b[] = {0x48, 0x89, 0x5C, 0x24, 0x00, 0x57, 0x48, 0x83, 0xEC};
+                static const uint8_t p8_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF};
+                static const uint8_t p9_b[] = {0x40, 0x53, 0x48, 0x83, 0xEC};
+                static const uint8_t p9_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                static const uint8_t p10_b[] = {0x40, 0x55, 0x48, 0x83, 0xEC};
+                static const uint8_t p10_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                static const uint8_t p11_b[] = {0x40, 0x57, 0x48, 0x83, 0xEC};
+                static const uint8_t p11_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                static const uint8_t p12_b[] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58};
+                static const uint8_t p12_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                static const uint8_t p13_b[] = {0x48, 0x8B, 0xC4, 0x48, 0x83, 0xEC};
+                static const uint8_t p13_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                static const uint8_t p14_b[] = {0x48, 0x8B, 0xC4, 0x48, 0x81, 0xEC};
+                static const uint8_t p14_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                static const uint8_t p15_b[] = {0x4C, 0x8B, 0xDC, 0x49, 0x89};
+                static const uint8_t p15_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                static const uint8_t p16_b[] = {0x41, 0x56, 0x41, 0x55};
+                static const uint8_t p16_m[] = {0xFF, 0xFF, 0xFF, 0xFF};
+                static const uint8_t p17_b[] = {0x57, 0x56, 0x53};
+                static const uint8_t p17_m[] = {0xFF, 0xFF, 0xFF};
+                static const uint8_t p18_b[] = {0x55, 0x48, 0x83, 0xEC, 0x00};
+                static const uint8_t p18_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+
+                static const mini_sig_t prologues[] = {
+                    {p1_b,  p1_m,  4}, {p2_b,  p2_m,  4}, {p3_b,  p3_m,  4},
+                    {p4_b,  p4_m,  5}, {p5_b,  p5_m,  5}, {p6_b,  p6_m,  5},
+                    {p7_b,  p7_m,  9}, {p8_b,  p8_m,  9}, {p9_b,  p9_m,  5},
+                    {p10_b, p10_m, 5}, {p11_b, p11_m, 5}, {p12_b, p12_m, 6},
+                    {p13_b, p13_m, 6}, {p14_b, p14_m, 6}, {p15_b, p15_m, 5},
+                    {p16_b, p16_m, 4}, {p17_b, p17_m, 3}, {p18_b, p18_m, 5},
+                };
+                constexpr int NUM_PROBES = sizeof(prologues) / sizeof(prologues[0]);
+
+                for (int s = 0; s < num_sections && section_table_off + (s + 1) * 40 <= hdr_read; s++)
+                {
+                    const std::uint8_t* sec_hdr = &header[section_table_off + s * 40];
+                    std::uint32_t sec_vsize = *reinterpret_cast<const std::uint32_t*>(sec_hdr + 8);
+                    std::uint32_t sec_vaddr = *reinterpret_cast<const std::uint32_t*>(sec_hdr + 12);
+                    std::uint32_t sec_chars = *reinterpret_cast<const std::uint32_t*>(sec_hdr + 36);
+                    if (!(sec_chars & 0x20000000)) continue; // executable only
+
+                    ea_t sec_start = static_cast<ea_t>(base_addr + sec_vaddr);
+                    ea_t sec_end   = sec_start + sec_vsize;
+
+                    for (ea_t ea = sec_start; ea < sec_end && prologue_funcs_created < 50000; )
+                    {
+                        if (!is_loaded(ea)) { ea = next_addr(ea); if (ea == BADADDR || ea >= sec_end) break; continue; }
+
+                        // Skip if already inside a function
+                        func_t* existing_fn = get_func(ea);
+                        if (existing_fn) { ea = existing_fn->end_ea; continue; }
+
+                        bool matched = false;
+                        for (int p = 0; p < NUM_PROBES && !matched; ++p)
+                        {
+                            const auto& sig = prologues[p];
+                            if (ea + sig.length > sec_end) continue;
+
+                            bool sig_ok = true;
+                            for (int b = 0; b < sig.length; ++b)
+                            {
+                                if (!is_loaded(ea + b)) { sig_ok = false; break; }
+                                uint8_t byte_val = get_byte(ea + b);
+                                if ((byte_val & sig.mask[b]) != (sig.bytes[b] & sig.mask[b]))
+                                { sig_ok = false; break; }
+                            }
+                            if (!sig_ok) continue;
+
+                            // Validate: decode at least 3 consecutive instructions
+                            insn_t chk;
+                            int valid = 0;
+                            ea_t check_ea = ea;
+                            for (int i = 0; i < 8 && check_ea < sec_end; ++i)
+                            {
+                                int clen = decode_insn(&chk, check_ea);
+                                if (clen <= 0) break;
+                                ++valid;
+                                check_ea += clen;
+                                if (chk.itype == NN_retn || chk.itype == NN_retf ||
+                                    chk.itype == NN_retnw || chk.itype == NN_retnd ||
+                                    chk.itype == NN_retnq)
+                                    break;
+                            }
+                            if (valid < 3) continue;
+
+                            matched = true;
+                            create_insn(ea);
+                            if (!get_func(ea) && add_func(ea, BADADDR))
+                                ++prologue_funcs_created;
+                        }
+
+                        if (!matched) ++ea;
+                        else
+                        {
+                            func_t* fn = get_func(ea);
+                            ea = fn ? fn->end_ea : (ea + 1);
+                        }
+                    }
+                }
+            }
+
+            auto_wait();
+
+            // ── Step 5: Create functions from CALL/JMP cross-references ──
+            replace_wait_box("HIDECANCEL\nAiDA: [5/6] Creating functions from call targets...");
+            {
+                ea_t range_start = static_cast<ea_t>(base_addr);
+                ea_t range_end   = static_cast<ea_t>(base_addr + dump_size);
+
+                // Collect all CALL/JMP targets that are not yet functions
+                std::set<ea_t> call_targets;
+                for (ea_t ea = range_start; ea < range_end; )
+                {
+                    flags64_t fl = get_flags(ea);
+                    if (!is_code(fl)) { ea = next_addr(ea); if (ea == BADADDR || ea >= range_end) break; continue; }
+
+                    insn_t insn;
+                    int ilen = decode_insn(&insn, ea);
+                    if (ilen <= 0) { ++ea; continue; }
+
+                    // Check for CALL (near/far) and direct JMP at end of function
+                    bool is_call = (insn.itype == NN_call || insn.itype == NN_callfi ||
+                                    insn.itype == NN_callni);
+                    if (is_call && insn.ops[0].type == o_near)
+                    {
+                        ea_t target = insn.ops[0].addr;
+                        if (target >= range_start && target < range_end &&
+                            is_loaded(target) && !get_func(target))
+                        {
+                            call_targets.insert(target);
+                        }
+                    }
+                    ea += ilen;
+                }
+
+                for (ea_t target : call_targets)
+                {
+                    if (get_func(target)) continue; // might have been created by cascade
+                    create_insn(target);
+                    if (add_func(target, BADADDR))
+                        ++xref_funcs_created;
+                }
+            }
+
+            // ── Step 6: Final analysis pass ──
+            replace_wait_box("HIDECANCEL\nAiDA: [6/6] Final analysis pass...");
+            plan_and_wait(static_cast<ea_t>(base_addr),
+                          static_cast<ea_t>(base_addr + dump_size), true);
+
+            // Count final functions
+            for (ea_t fea = static_cast<ea_t>(base_addr);
+                 fea < static_cast<ea_t>(base_addr + dump_size);
+                 fea = next_addr(fea))
+            {
+                func_t* fn = get_func(fea);
+                if (fn && fn->start_ea == fea) ++final_func_count;
+                if (fn) fea = fn->end_ea - 1;
+            }
+        }
+    }
+
+    // Save to file if output_path specified
+    if (!output_path.empty())
+    {
+        HANDLE hOut = CreateFileA(
+            output_path.c_str(), GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hOut != INVALID_HANDLE_VALUE)
+        {
+            DWORD written = 0;
+            WriteFile(hOut, image.data(), static_cast<DWORD>(dump_size), &written, nullptr);
+            CloseHandle(hOut);
+        }
+    }
+
+    hide_wait_box();
+
+    int coverage = dump_size ? static_cast<int>((total_read * 100) / dump_size) : 0;
+
+    json result;
+    result["module_name"]       = found_name;
+    result["kernel_base"]       = helpers::format_address(static_cast<ea_t>(found_base));
+    result["image_size"]        = dump_size;
+    result["bytes_read"]        = total_read;
+    result["coverage_pct"]      = coverage;
+    result["num_sections"]      = num_sections;
+    result["sections"]          = sections_arr;
+    result["bytes_patched"]     = patched;
+    result["analyzed"]          = analyze && patch_idb;
+    if (!output_path.empty())
+        result["output_path"]   = output_path;
+
+    // Post-dump analysis statistics
+    json analysis_stats;
+    analysis_stats["initial_functions"]    = initial_func_count;
+    analysis_stats["exports_created"]      = exports_created;
+    analysis_stats["entry_points_created"] = entry_points_created;
+    analysis_stats["code_insns_forced"]    = code_insns_created;
+    analysis_stats["prologue_funcs_found"] = prologue_funcs_created;
+    analysis_stats["xref_funcs_found"]     = xref_funcs_created;
+    analysis_stats["final_functions"]      = final_func_count;
+    analysis_stats["total_new_functions"]  = final_func_count - initial_func_count;
+    result["post_dump_analysis"]           = analysis_stats;
+
+    return tool_result_t::ok(
+        OBFSTR("Kernel module ") + found_name +
+        OBFSTR(" dumped to IDB: ") + std::to_string(total_read) + OBFSTR("/") +
+        std::to_string(dump_size) + OBFSTR(" bytes, ") + std::to_string(patched) +
+        OBFSTR(" bytes patched, ") + std::to_string(final_func_count) +
+        OBFSTR(" functions recovered (was ") + std::to_string(initial_func_count) +
+        OBFSTR(")"), result);
+}
+
+void register_tools()
+{
+    auto& registry = ToolRegistry::instance();
+
+    registry.register_tool({
+        OBFSTR("driver_connect"), OBFSTR("driver"),
+        OBFSTR("Connect to the AiDA kernel driver. Must be called before any other driver_ tools. "
+               "Operates in the kernel to bypass all usermode anti-debugging and anti-RE protections."),
+        {}, driver_connect, false});
+
+    registry.register_tool({
+        OBFSTR("driver_status"), OBFSTR("driver"),
+        OBFSTR("Get kernel driver connection status: connected flag, attached process ID, "
+               "image base address, DirectoryTableBase (DTB), and heartbeat result."),
+        {}, driver_status, true});
+
+    registry.register_tool({
+        OBFSTR("driver_attach"), OBFSTR("driver"),
+        OBFSTR("Attach the kernel driver to a running process by name. "
+               "Finds the process, locates the image base, and solves the DTB for physical memory access. "
+               "Bypasses all process isolation and memory protection."),
+        {{OBFSTR("process"), OBFSTR("string"),
+          OBFSTR("Target process executable name (e.g. 'target.exe'). Case-insensitive."), true}},
+        driver_attach, false});
+
+    registry.register_tool({
+        OBFSTR("driver_read_memory"), OBFSTR("driver"),
+        OBFSTR("Read raw bytes from the target process via kernel driver. "
+               "Bypasses all memory protection, DEP, guard pages, and anti-read hooks. "
+               "Optionally patches the bytes into the IDA database."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Virtual address in target process"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes to read (default 256, max 65536)"), false},
+         {OBFSTR("patch_idb"), OBFSTR("boolean"), OBFSTR("Write read bytes to IDA database (default false)"), false}},
+        driver_read_memory, false});
+
+    registry.register_tool({
+        OBFSTR("driver_write_memory"), OBFSTR("driver"),
+        OBFSTR("Write bytes to the target process via kernel driver. "
+               "Bypasses all memory protection including DEP, guard pages, and write protection."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Virtual address in target process"), true},
+         {OBFSTR("bytes"), OBFSTR("string"), OBFSTR("Hex bytes to write (e.g. '90 90 90')"), true}},
+        driver_write_memory, false});
+
+    registry.register_tool({
+        OBFSTR("driver_dump_module"), OBFSTR("driver"),
+        OBFSTR("Dump a complete PE module from the target process using kernel memory reads. "
+               "Reads all sections page-by-page, handles packed/obfuscated sections. "
+               "Optionally patches the dumped bytes into the IDA database."),
+        {{OBFSTR("address"), OBFSTR("string"),
+          OBFSTR("Module base address (default: attached process image base)"), false},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Override image size in bytes (default: auto from PE header)"), false},
+         {OBFSTR("output_path"), OBFSTR("string"), OBFSTR("Save dump to file path (e.g. 'C:\\\\dump.bin')"), false},
+         {OBFSTR("patch_idb"), OBFSTR("boolean"), OBFSTR("Patch dumped bytes into IDA database (default true)"), false}},
+        driver_dump_module, false});
+
+    registry.register_tool({
+        OBFSTR("driver_scan_pattern"), OBFSTR("driver"),
+        OBFSTR("Scan target process memory for a byte pattern via kernel driver. "
+               "Supports wildcard '??' bytes. Scans the attached module range by default."),
+        {{OBFSTR("pattern"), OBFSTR("string"),
+          OBFSTR("Hex byte pattern with '??' wildcards (e.g. '48 8B ?? ?? 89 ?? 00')"), true},
+         {OBFSTR("start"), OBFSTR("string"), OBFSTR("Start address (default: image base)"), false},
+         {OBFSTR("end"), OBFSTR("string"), OBFSTR("End address"), false},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Scan size from start in bytes (default 0x200000)"), false},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum matches to return (default 20)"), false}},
+        driver_scan_pattern, false});
+
+    registry.register_tool({
+        OBFSTR("driver_read_string"), OBFSTR("driver"),
+        OBFSTR("Read a null-terminated ASCII or UTF-16 string from target process memory via kernel driver."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address of the string in target process"), true},
+         {OBFSTR("max_length"), OBFSTR("number"), OBFSTR("Maximum string character length (default 512)"), false},
+         {OBFSTR("type"), OBFSTR("string"), OBFSTR("String encoding: auto, ascii, wide (default auto)"), false,
+          {OBFSTR("auto"), OBFSTR("ascii"), OBFSTR("wide")}}},
+        driver_read_string, false});
+
+    registry.register_tool({
+        OBFSTR("driver_read_pointer_chain"), OBFSTR("driver"),
+        OBFSTR("Follow a chain of pointer dereferences through target process memory via kernel driver. "
+               "Useful for traversing linked lists, object hierarchies, and obfuscated data structures."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Starting virtual address"), true},
+         {OBFSTR("offsets"), OBFSTR("array"),
+          OBFSTR("Array of byte offsets to apply after each dereference (e.g. [0, 48, 24])"), false, {},
+          json::object({{"type", "number"}})}},
+        driver_read_pointer_chain, false});
+
+    registry.register_tool({
+        OBFSTR("driver_enumerate_modules"), OBFSTR("driver"),
+        OBFSTR("Enumerate modules loaded in the target process via kernel memory reads. "
+               "Reads the main PE import directory to discover all loaded DLL dependencies."),
+        {}, driver_enumerate_modules, false});
+
+    registry.register_tool({
+        OBFSTR("driver_dump_to_idb"), OBFSTR("driver"),
+        OBFSTR("Dump PE sections from target process into the IDA database. "
+               "Creates IDA segments for each PE section, patches live bytes from process memory, "
+               "and schedules auto-analysis. Use this to reconstruct packed or obfuscated binaries."),
+        {{OBFSTR("address"), OBFSTR("string"),
+          OBFSTR("Module base address (default: attached process image base)"), false},
+         {OBFSTR("analyze"), OBFSTR("boolean"),
+          OBFSTR("Run IDA auto-analysis after patching (default true)"), false}},
+        driver_dump_to_idb, false});
+
+    registry.register_tool({
+        OBFSTR("driver_bypass_and_dump"), OBFSTR("driver"),
+        OBFSTR("Complete kernel bypass workflow: connect driver → find process → solve DTB → "
+               "dump full image via physical memory → patch IDA database. "
+               "Handles VMProtect, Themida, custom packers, and any anti-debug target "
+               "by reading directly from physical memory, bypassing all usermode defenses."),
+        {{OBFSTR("process"), OBFSTR("string"),
+          OBFSTR("Target process executable name (e.g. 'protected.exe')"), true}},
+        driver_bypass_and_dump, false});
+
+    registry.register_tool({
+        OBFSTR("driver_enumerate_kernel_modules"), OBFSTR("driver"),
+        OBFSTR("Enumerate ALL loaded kernel drivers and modules via NtQuerySystemInformation. "
+               "Returns each driver's name, NT path, resolved disk path, kernel base address, "
+               "and image size. Does NOT require the kernel driver to be connected — works "
+               "purely from usermode. Use filter to search for a specific driver "
+               "(e.g. filter='EasyAntiCheat' or filter='eac')."),
+        {{OBFSTR("filter"), OBFSTR("string"),
+          OBFSTR("Case-insensitive substring filter applied to module name and path (e.g. 'eac', 'ntfs')"), false},
+         {OBFSTR("limit"), OBFSTR("number"),
+          OBFSTR("Maximum number of modules to return (default 500)"), false}},
+        driver_enumerate_kernel_modules, true});
+
+    registry.register_tool({
+        OBFSTR("driver_dump_kernel_module"), OBFSTR("driver"),
+        OBFSTR("Dump a loaded kernel driver/module. By default dumps from LIVE KERNEL MEMORY "
+               "using physical memory reads (requires driver connected). This captures runtime-decrypted, "
+               "devirtualized, unpacked code as it exists in RAM. Set from_memory=false to fall back "
+               "to reading the on-disk .sys file. "
+               "Use this to dump ANY kernel driver: EasyAntiCheat (EAC), BattlEye, Vanguard, "
+               "ntkrnlmp.exe, win32kfull.sys, etc. The dump file can be loaded in IDA Pro."),
+        {{OBFSTR("module"), OBFSTR("string"),
+          OBFSTR("Kernel module name or substring (e.g. 'EasyAntiCheat.sys', 'eac', 'ntoskrnl')"), true},
+         {OBFSTR("output_path"), OBFSTR("string"),
+          OBFSTR("Full file path to save the dump (e.g. 'C:\\\\dumps\\\\dumped_eac.sys'). "
+                 "If omitted, saves to %%TEMP%%\\\\dumped_<module_name>"), false},
+         {OBFSTR("from_memory"), OBFSTR("boolean"),
+          OBFSTR("True (default) = dump live kernel memory via driver. "
+                 "False = read on-disk file (no driver needed)."), false}},
+        driver_dump_kernel_module, false});
+
+    registry.register_tool({
+        OBFSTR("driver_read_kernel_memory"), OBFSTR("driver"),
+        OBFSTR("Read raw bytes from ANY kernel virtual address via physical memory translation. "
+               "Requires driver connected. Solves System DTB automatically. "
+               "Bypasses all kernel integrity checks, PatchGuard, and memory protections. "
+               "Can read anticheat driver memory, ntoskrnl internals, SSDT, IDT, anything."),
+        {{OBFSTR("address"), OBFSTR("string"),
+          OBFSTR("Kernel virtual address to read (e.g. 'FFFFF80012345000')"), true},
+         {OBFSTR("size"), OBFSTR("number"),
+          OBFSTR("Bytes to read (default 256, max 65536)"), false},
+         {OBFSTR("patch_idb"), OBFSTR("boolean"),
+          OBFSTR("Patch read bytes into IDA database at the same address (default false)"), false}},
+        driver_read_kernel_memory, false});
+
+    registry.register_tool({
+        OBFSTR("driver_write_kernel_memory"), OBFSTR("driver"),
+        OBFSTR("Write raw bytes to ANY kernel virtual address via physical memory translation. "
+               "Requires driver connected. Bypasses all memory protection, write-protection, "
+               "PatchGuard, code integrity. WARNING: Writing to kernel memory can cause BSOD "
+               "if done incorrectly. Use with extreme caution."),
+        {{OBFSTR("address"), OBFSTR("string"),
+          OBFSTR("Kernel virtual address to write (e.g. 'FFFFF80012345000')"), true},
+         {OBFSTR("bytes"), OBFSTR("string"),
+          OBFSTR("Hex bytes to write separated by spaces (e.g. '90 90 90 C3')"), true}},
+        driver_write_kernel_memory, false});
+
+    registry.register_tool({
+        OBFSTR("driver_kernel_dump_module"), OBFSTR("driver"),
+        OBFSTR("UNIVERSAL kernel module dump-and-analyze workflow. Finds module in kernel → "
+               "reads ALL sections from live kernel memory → creates IDA segments → "
+               "patches runtime bytes → runs FULL 6-step analysis pipeline: "
+               "(1) initial auto-analysis, (2) PE export/entry point parsing with function creation, "
+               "(3) linear sweep code creation across all executable sections (skips high-entropy "
+               "VM bytecode sections automatically), (4) aggressive 18-pattern function prologue "
+               "scanning with instruction validation, (5) CALL/JMP xref target function creation, "
+               "(6) final analysis pass. Returns before/after function counts. "
+               "Works on ANY kernel driver: EAC, BattlEye, Vanguard, ACE, ntkrnlmp.exe, etc. "
+               "Optionally saves dump to file."),
+        {{OBFSTR("module"), OBFSTR("string"),
+          OBFSTR("Kernel module name or substring (e.g. 'EasyAntiCheat.sys', 'BEDaisy', 'vgk.sys')"), true},
+         {OBFSTR("patch_idb"), OBFSTR("boolean"),
+          OBFSTR("Create segments and patch bytes into IDA database (default true)"), false},
+         {OBFSTR("analyze"), OBFSTR("boolean"),
+          OBFSTR("Run full 6-step analysis pipeline after patching (default true)"), false},
+         {OBFSTR("output_path"), OBFSTR("string"),
+          OBFSTR("Optionally save raw dump to file (e.g. 'C:\\\\dumps\\\\eac_memory.sys')"), false}},
+        driver_kernel_dump_module, false});
+}
+
+} // namespace driver_tools
+
 void initialize_all_tools()
 {
     function_tools::register_tools();
@@ -6807,6 +12366,8 @@ void initialize_all_tools()
     python_tools::register_tools();
     navigation_tools::register_tools();
     analysis_tools::register_tools();
+    deobfuscation_tools::register_tools();
+    advanced_analysis_tools::register_tools();
     driver_tools::register_tools();
     
     ToolRegistry::instance().register_tool({

@@ -665,6 +665,169 @@ timing checks (rdtsc, QueryPerformanceCounter), anti-VM (cpuid), inline tricks (
 6. Use debugger tools to step through decryption at runtime
 7. `analyze_control_flow` + `get_function_complexity` to find the real logic
 
+### Phase 7: Active Deobfuscation (automated binary cleanup)
+When Phase 6 identifies obfuscation, use these tools to ACTIVELY REMOVE IT:
+
+**Protection Identification:**
+`identify_protector` — detect VMProtect, Themida, UPX, ASPack, Enigma, and other protectors
+by section names, byte signatures, string references, and entropy analysis. Run this FIRST.
+
+**Opaque Predicate Resolution:**
+`resolve_opaque_predicates` — detect xor reg,reg + Jcc patterns and patch them to unconditional
+JMP or NOP. Use dry_run=true first to preview, then apply. Dramatically simplifies CFGs.
+
+**Junk Code Removal:**
+`nop_junk_instructions` — NOP-out dead code blocks (no incoming xrefs), excessive NOP sleds,
+and unreachable code. Set aggressive=true for maximum cleanup on heavily obfuscated functions.
+
+**Anti-Debug Patching:**
+`patch_anti_debug` — NOP-out IsDebuggerPresent, NtQueryInformationProcess, INT 2D/3 traps,
+and RDTSC timing checks. Replaces IsDebuggerPresent with xor eax,eax (always returns 0).
+
+**String Decoding:**
+`decode_strings_in_function` — automatically decode stack-constructed strings, multi-byte
+immediate ASCII packing, and XOR-encrypted data references. Adds decoded values as IDA comments.
+
+**Control Flow Deflattening:**
+`deobfuscate_control_flow` — detect and map control flow flattening: identifies the dispatcher
+block, state variable, and all state blocks with their transitions. Annotates the IDB.
+
+**Import Reconstruction:**
+`reconstruct_imports` — after unpacking, scan IAT segments for pointer entries, resolve them
+against known imports, and identify unresolved call thunks needing manual resolution.
+
+**Section Unpacking:**
+`unpack_section` — decrypt packed sections using single-byte XOR (auto-detected), multi-byte
+XOR key, or rolling XOR. Recreates instructions and triggers re-analysis after decryption.
+
+**Function Rebuilding:**
+`rebuild_function` — after patching, delete and recreate the function with proper boundaries.
+Recreates all instructions and runs auto-analysis. Essential after any deobfuscation pass.
+
+**Full Pipeline:**
+`full_deobfuscation_pass` — orchestrate ALL deobfuscation steps on a function: detect→resolve
+opaque predicates→NOP junk→decode strings→analyze CFF→rebuild. Produces before/after scores.
+
+**Deobfuscation Workflow:**
+1. `identify_protector` to determine what protection is used
+2. `detect_obfuscation_patterns` to get obfuscation score (0-100)
+3. `resolve_opaque_predicates` with dry_run=true to preview
+4. `resolve_opaque_predicates` with dry_run=false to apply
+5. `nop_junk_instructions` with aggressive=true to clean up
+6. `patch_anti_debug` to remove anti-debugging tricks
+7. `decode_strings_in_function` to expose hidden strings
+8. `deobfuscate_control_flow` to map CFF structures
+9. `rebuild_function` with force_recreate=true to fix boundaries
+10. Re-decompile to see cleaned-up pseudocode
+Or use `full_deobfuscation_pass` for steps 2-9 automated in one call.
+
+### Phase 8: Kernel Driver Analysis — Full Kernel Memory Access
+The AiDA kernel driver provides UNRESTRICTED physical memory access to ALL kernel virtual addresses.
+On driver_connect, the kernel DTB (System PID 4) is automatically solved.
+
+**Module Enumeration (usermode, no driver needed):**
+`driver_enumerate_kernel_modules` — list ALL loaded kernel drivers with names, base addresses, sizes.
+Use `filter` to search (e.g. filter="eac", filter="ntoskrnl", filter="BattlEye").
+
+**Live Kernel Memory Dump (requires driver):**
+`driver_dump_kernel_module` — dumps a kernel driver from LIVE KERNEL MEMORY by default.
+Reads the actual in-memory image page-by-page via physical memory translation.
+This captures runtime-decrypted, devirtualized, unpacked code as it exists in RAM.
+Set from_memory=false to fall back to on-disk file read.
+
+**Kernel Memory Read/Write (requires driver):**
+`driver_read_kernel_memory` — read raw bytes from ANY kernel address. Bypasses PatchGuard,
+code integrity, memory protections. Can read anticheat internals, SSDT, IDT, anything.
+`driver_write_kernel_memory` — write bytes to ANY kernel address. Bypasses write-protection.
+WARNING: incorrect writes can BSOD. Use extreme caution.
+
+**Kernel Module to IDB — UNIVERSAL Analysis Pipeline (requires driver):**
+`driver_kernel_dump_module` — complete dump-and-analyze workflow for ANY kernel driver.
+Finds module → reads ALL sections from LIVE kernel memory → creates IDA segments →
+patches runtime bytes into database → runs FULL 6-STEP ANALYSIS PIPELINE:
+  Step 1: Initial IDA auto-analysis pass
+  Step 2: PE export/entry point parsing — creates functions at all exports + DriverEntry
+  Step 3: Linear sweep code creation — forces disassembly across all executable sections
+          (automatically SKIPS high-entropy sections like BattlEye .be0 VM bytecode)
+  Step 4: Aggressive 18-pattern x64 function prologue scanning with 3-instruction validation
+  Step 5: CALL/JMP xref target function creation — catches non-standard prologues
+  Step 6: Final auto-analysis pass
+
+Returns detailed statistics: initial vs final function count, exports created, code coverage,
+prologue functions found, xref functions created.
+
+Works on ANY kernel driver: BattlEye (BEDaisy.sys), EasyAntiCheat (EasyAntiCheat.sys),
+Vanguard (vgk.sys), ACE, ntkrnlmp.exe, etc. ALWAYS use this tool for kernel module analysis.
+
+**Kernel Driver Dump Workflow (EAC/BattlEye/Vanguard/ANY):**
+1. `driver_connect` — connects driver, solves kernel DTB automatically
+2. `driver_enumerate_kernel_modules` filter="EasyAntiCheat" → finds base+size
+3. `driver_kernel_dump_module` module="EasyAntiCheat.sys" → full dump + 6-step analysis
+   AUTOMATICALLY discovers hundreds of functions, parses exports, creates code regions.
+   Reports before/after stats like "Functions: 3 → 847". No manual recovery needed.
+4. Optionally also save to disk: output_path="C:\\dumps\\eac_live.sys"
+5. Use `list_functions` limit=0 to review all discovered functions
+6. Decompile key functions for quality check
+7. If more functions needed: use Phase 9 advanced tools for targeted recovery
+
+**Reading Specific Kernel Structures:**
+1. `driver_enumerate_kernel_modules` filter="ntoskrnl" → get ntos base
+2. `driver_read_kernel_memory` address="<base+offset>" size=256 → read any kernel data
+3. Can inspect SSDT, object tables, callback arrays, anything in kernel space
+
+### Phase 9: Advanced Binary Recovery — Targeted Second-Pass Analysis
+NOTE: `driver_kernel_dump_module` already runs the full 6-step analysis pipeline automatically.
+Phase 9 tools are for TARGETED SECOND-PASS recovery when the automatic pipeline isn't enough,
+or for analyzing non-kernel binaries (usermode dumps, unpacked executables, etc.).
+
+When IDA auto-analysis produces poor results (few functions, mostly unexplored bytes, missing
+imports), use these ADVANCED ANALYSIS tools on any binary where standard analysis fails.
+
+**Use `deep_analysis_sweep` for non-kernel binaries that need full recovery.** It runs the full
+5-step pipeline automatically:
+1. PE header parsing (creates segments, exports, entry point)
+2. Force code creation (linear sweep all executable segments)
+3. Aggressive prologue scanning (18+ x64 patterns with instruction validation)
+4. Deep import reconstruction (all segments, kernel APIs, named resolution)
+5. Final auto-analysis pass
+
+**Individual tools for targeted recovery:**
+- `aggressive_function_discovery` — Scans for 18+ x64 function prologue patterns:
+  push rbp/mov rbp,rsp, sub rsp, MS x64 ABI saves (mov [rsp+8],rcx), REX-prefixed
+  pushes, mov rax,rsp/sub rsp (kernel-style), register save pairs. Validates each
+  candidate by decoding 3+ subsequent instructions. Use when IDA finds <10 functions
+  in a large code section.
+
+- `force_create_code_region` — Linear sweep disassembly across a region. Forces creation
+  of instructions where IDA left unexplored bytes. Detects function boundaries from
+  INT3 padding and RET instructions. Use on large unexplored regions in dumped modules.
+
+- `deep_reconstruct_imports` — Scans ALL segments (not just .idata) for IAT entries.
+  Resolves kernel imports (Ke/Ex/Mm/Ps/Zw/Ob/Io/Rtl APIs), propagates __imp_ names,
+  identifies MmGetSystemRoutineAddress dynamic resolution patterns, finds call thunks.
+  Use when reconstruct_imports from deobfuscation_tools returns 0 results.
+
+- `analyze_pe_header` — Parses PE header at any address in the IDB. Extracts sections
+  with permissions, export directory, import directory, entry point. Creates functions
+  at all exports. Essential when IDA's loader didn't parse the PE (dumped modules).
+
+- `create_functions_from_xrefs` — Finds all CALL/JMP targets in existing code that
+  aren't defined as functions and creates them. Catches non-standard prologues that
+  the prologue scanner misses. Run AFTER force_create_code_region.
+
+- `signature_scan_and_define` — User-defined byte patterns with ?? wildcards.
+  Scan the database for a specific pattern and create functions at every match.
+  Use when you identify a protector-specific function prologue pattern.
+
+**Recovery workflow for heavily protected binaries:**
+1. `deep_analysis_sweep` with default options → check before/after function counts
+2. If still < 100 functions: `force_create_code_region` on each large unexplored area
+3. `create_functions_from_xrefs` to catch remaining call targets
+4. `signature_scan_and_define` if protector uses identifiable patterns
+5. `deep_reconstruct_imports` to resolve remaining import gaps
+6. Use `list_functions` with limit=0 to verify the final function count
+7. Decompile key functions to check quality
+
 ### Number Conversions
 ALWAYS use `convert_number` for hex→ASCII, base conversions, signed interpretation.
 Use `ascii_be` for human-readable strings from hex constants.
