@@ -182,7 +182,6 @@ static std::vector<std::string> fetch_gemini_models_via_api(const qstring& api_k
         headers,
         [has_custom_url](const nlohmann::json& j) {
             std::vector<std::string> models;
-            // Custom base URLs typically expose OpenAI-compatible /v1/models (data array)
             if (has_custom_url)
             {
                 std::string k_data = OBFSTR("data");
@@ -199,7 +198,6 @@ static std::vector<std::string> fetch_gemini_models_via_api(const qstring& api_k
                     return models;
                 }
             }
-            // Native Gemini API response format
             std::string k_models = OBFSTR("models");
             std::string k_name = OBFSTR("name");
             std::string k_methods = OBFSTR("supportedGenerationMethods");
@@ -251,7 +249,6 @@ static std::vector<std::string> fetch_anthropic_models_via_api(const qstring& ap
                 }
                 return models;
             }
-            // Some custom endpoints use OpenAI-compatible format with "models" key
             if (has_custom_url)
             {
                 std::string k_models = OBFSTR("models");
@@ -288,6 +285,113 @@ static std::vector<std::string> fetch_copilot_models_via_api(const qstring& prox
             }
             return models;
         });
+}
+
+static std::string fetch_copilot_github_user()
+{
+    std::string result;
+#ifdef __NT__
+    // Helper: query GitHub API with a token to get the login username
+    auto query_github_user = [](const std::string& token) -> std::string {
+        if (token.empty()) return {};
+        try
+        {
+            httplib::Client cli("https://api.github.com");
+            cli.set_connection_timeout(3);
+            cli.set_read_timeout(3);
+            httplib::Headers hdrs = {
+                {"Authorization", "token " + token},
+                {"User-Agent", "AiDA-Plugin"},
+                {"Accept", "application/json"}
+            };
+            auto res = cli.Get("/user", hdrs);
+            if (res && res->status == 200)
+            {
+                auto uj = nlohmann::json::parse(res->body, nullptr, false);
+                if (!uj.is_discarded())
+                {
+                    std::string login = uj.value("login", std::string());
+                    if (!login.empty()) return login;
+                }
+            }
+        }
+        catch (...) {}
+        return {};
+    };
+
+    // --- 1. Check copilot-api token file (~/.local/share/copilot-api/github_token) ---
+    char userprofile_buf[MAX_PATH] = {};
+    DWORD uplen = GetEnvironmentVariableA("USERPROFILE", userprofile_buf, MAX_PATH);
+    if (uplen > 0 && uplen < MAX_PATH)
+    {
+        std::string token_path = std::string(userprofile_buf, uplen) +
+            "\\.local\\share\\copilot-api\\github_token";
+        std::ifstream tf(token_path);
+        if (tf.is_open())
+        {
+            std::string token;
+            std::getline(tf, token);
+            // Trim whitespace
+            while (!token.empty() && (token.back() == '\n' || token.back() == '\r' || token.back() == ' '))
+                token.pop_back();
+            if (!token.empty())
+            {
+                // The file may be plain token or JSON
+                if (token.front() == '{')
+                {
+                    auto j = nlohmann::json::parse(token, nullptr, false);
+                    if (!j.is_discarded())
+                    {
+                        std::string user = j.value("user", std::string());
+                        if (!user.empty()) return user;
+                        token = j.value("token", j.value("oauth_token", std::string()));
+                    }
+                }
+                std::string user = query_github_user(token);
+                if (!user.empty()) return user;
+            }
+        }
+    }
+
+    // --- 2. Fallback: check GitHub Copilot VS Code config (hosts.json / apps.json) ---
+    char localappdata_buf[MAX_PATH] = {};
+    DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", localappdata_buf, MAX_PATH);
+    if (len > 0 && len < MAX_PATH)
+    {
+        std::string localappdata(localappdata_buf, len);
+        std::vector<std::string> paths = {
+            localappdata + "\\github-copilot\\hosts.json",
+            localappdata + "\\github-copilot\\apps.json"
+        };
+
+        for (const auto& path : paths)
+        {
+            std::ifstream f(path);
+            if (!f.is_open()) continue;
+
+            try
+            {
+                std::string content((std::istreambuf_iterator<char>(f)),
+                                     std::istreambuf_iterator<char>());
+                auto j = nlohmann::json::parse(content, nullptr, false);
+                if (j.is_discarded() || !j.is_object()) continue;
+
+                for (auto it = j.begin(); it != j.end(); ++it)
+                {
+                    if (!it->is_object()) continue;
+                    std::string user = it->value("user", std::string());
+                    if (!user.empty()) return user;
+
+                    std::string token = it->value("oauth_token", std::string());
+                    user = query_github_user(token);
+                    if (!user.empty()) return user;
+                }
+            }
+            catch (...) {}
+        }
+    }
+#endif
+    return result;
 }
 
 static std::vector<std::string> fetch_local_llm_models_via_api(const qstring& base_url)
@@ -1307,6 +1411,100 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
             copModelRowLay->addWidget(copilotTab.refreshBtn);
             copLay->addWidget(copModelRow);
         }
+        // --- Account row: status label + Switch Account button ---
+        {
+            QWidget* accountRow = new QWidget();
+            QHBoxLayout* accountLay = new QHBoxLayout(accountRow);
+            accountLay->setContentsMargins(2, 6, 2, 2);
+            accountLay->setSpacing(6);
+
+            QLabel* accountLbl = new QLabel(QStringLiteral("Account"));
+            accountLbl->setObjectName(QStringLiteral("fieldLabel"));
+            accountLbl->setFixedWidth(130);
+            accountLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            accountLay->addWidget(accountLbl);
+
+            QLabel* copilotUserLabel = new QLabel(QStringLiteral("Checking..."));
+            copilotUserLabel->setObjectName(QStringLiteral("copilotAccountStatus"));
+            copilotUserLabel->setStyleSheet(QStringLiteral(
+                "QLabel { font-style: italic; padding: 2px 6px; }"));
+            accountLay->addWidget(copilotUserLabel, 1);
+
+            QPushButton* switchAccountBtn = new QPushButton(QStringLiteral("Switch Account"));
+            switchAccountBtn->setObjectName(QStringLiteral("secondaryBtn"));
+            switchAccountBtn->setToolTip(QStringLiteral(
+                "Open a terminal to re-authenticate your GitHub Copilot account"));
+            switchAccountBtn->setFixedWidth(120);
+            accountLay->addWidget(switchAccountBtn);
+            copLay->addWidget(accountRow);
+
+            // Fetch the current user in a background thread and update the label
+            auto refreshUser = [copilotUserLabel]() {
+                std::thread([copilotUserLabel]() {
+                    std::string user = fetch_copilot_github_user();
+                    QMetaObject::invokeMethod(copilotUserLabel, [copilotUserLabel, user]() {
+                        if (user.empty())
+                            copilotUserLabel->setText(QStringLiteral("Not logged in"));
+                        else
+                        {
+                            copilotUserLabel->setText(
+                                QStringLiteral("Logged in as <b>%1</b>").arg(QString::fromStdString(user)));
+                            msg("AiDA: Copilot account — Logged in as %s\n", user.c_str());
+                        }
+                    });
+                }).detach();
+            };
+
+            // Initial fetch
+            refreshUser();
+
+            // Periodic refresh every 30 seconds
+            QTimer* authTimer = new QTimer(copPage);
+            QObject::connect(authTimer, &QTimer::timeout, copilotUserLabel, refreshUser);
+            authTimer->start(30000);
+
+            // Switch Account button: open a visible CMD window with auth command
+            QObject::connect(switchAccountBtn, &QPushButton::clicked, copilotUserLabel,
+                [refreshUser]() {
+#ifdef __NT__
+                    STARTUPINFOW si = {};
+                    si.cb = sizeof(si);
+                    si.dwFlags = STARTF_USESHOWWINDOW;
+                    si.wShowWindow = SW_SHOW;
+                    PROCESS_INFORMATION pi = {};
+
+                    wchar_t cmdline[512] = {};
+                    wcscpy_s(cmdline, _countof(cmdline),
+                             L"cmd.exe /c npx copilot-api@latest auth & pause");
+
+                    DWORD flags = CREATE_NEW_CONSOLE;
+                    if (CreateProcessW(nullptr, cmdline, nullptr, nullptr, FALSE,
+                        flags, nullptr, nullptr, &si, &pi))
+                    {
+                        msg("AiDA: Launched Copilot auth — complete the login in the CMD window.\n");
+                        // Wait for the auth process to finish in a background thread,
+                        // then refresh the user label
+                        std::thread([pi, refreshUser]() {
+                            WaitForSingleObject(pi.hProcess, INFINITE);
+                            CloseHandle(pi.hProcess);
+                            CloseHandle(pi.hThread);
+
+                            // Give a moment for config to be written
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+                            refreshUser();
+                        }).detach();
+                    }
+                    else
+                    {
+                        DWORD err = GetLastError();
+                        msg("AiDA: Failed to launch Copilot auth (error %lu). "
+                            "Ensure Node.js and npx are installed.\n",
+                            static_cast<unsigned long>(err));
+                    }
+#endif
+                });
+        }
+
         copLay->addStretch();
         tabs->addTab(copPage, QStringLiteral("Copilot"));
     }
@@ -1382,7 +1580,6 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
     QObject::connect(providerCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
         [tabs](int idx) { if (idx >= 0 && idx < tabs->count()) tabs->setCurrentIndex(idx); });
 
-    // Helper: repopulate a model combo from a fetched model list, preserving current selection
     auto repopulateModels = [](QComboBox* combo, const std::vector<std::string>& models) {
         QString prev = combo->currentText();
         combo->clear();

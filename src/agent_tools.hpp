@@ -282,18 +282,6 @@ namespace deobfuscation_tools
     void register_tools();
 }
 
-namespace advanced_analysis_tools
-{
-    tool_result_t aggressive_function_discovery(const nlohmann::json& params);
-    tool_result_t force_create_code_region(const nlohmann::json& params);
-    tool_result_t deep_reconstruct_imports(const nlohmann::json& params);
-    tool_result_t analyze_pe_header(const nlohmann::json& params);
-    tool_result_t deep_analysis_sweep(const nlohmann::json& params);
-    tool_result_t create_functions_from_xrefs(const nlohmann::json& params);
-    tool_result_t signature_scan_and_define(const nlohmann::json& params);
-    void register_tools();
-}
-
 namespace driver_tools
 {
     tool_result_t driver_connect(const nlohmann::json& params);
@@ -313,6 +301,9 @@ namespace driver_tools
     tool_result_t driver_read_kernel_memory(const nlohmann::json& params);
     tool_result_t driver_write_kernel_memory(const nlohmann::json& params);
     tool_result_t driver_kernel_dump_module(const nlohmann::json& params);
+    tool_result_t driver_allocate_memory(const nlohmann::json& params);
+    tool_result_t driver_free_memory(const nlohmann::json& params);
+    tool_result_t driver_call_function(const nlohmann::json& params);
     void register_tools();
 }
 

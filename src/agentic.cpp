@@ -741,6 +741,20 @@ code integrity, memory protections. Can read anticheat internals, SSDT, IDT, any
 `driver_write_kernel_memory` — write bytes to ANY kernel address. Bypasses write-protection.
 WARNING: incorrect writes can BSOD. Use extreme caution.
 
+**Remote Code Execution in Target Process (requires attached process):**
+`driver_call_function` — execute ANY function inside the target process by hijacking a thread.
+Suspends a waiting thread, redirects RIP to injected polymorphic shellcode, polls for completion,
+restores original context. Call stack is spoofed via JMP-RBX gadget.
+Supports up to 4 arguments (RCX, RDX, R8, R9) and returns the function's return value (RAX).
+Use cases: call LoadLibraryA, LdrGetProcedureAddress, VirtualProtect, game/anticheat functions.
+WARNING: wrong address or arguments = process crash. Verify function signatures first.
+
+**Process Memory Allocation (requires attached process):**
+`driver_allocate_memory` — allocate PAGE_EXECUTE_READWRITE memory in target (max 16MB).
+Uses kernel ZwAllocateVirtualMemory. Returns the allocated address.
+`driver_free_memory` — free previously allocated memory in target.
+Use allocate+write+call_function together to inject and execute code sequences.
+
 **Kernel Module to IDB — UNIVERSAL Analysis Pipeline (requires driver):**
 `driver_kernel_dump_module` — complete dump-and-analyze workflow for ANY kernel driver.
 Finds module → reads ALL sections from LIVE kernel memory → creates IDA segments →
@@ -768,65 +782,11 @@ Vanguard (vgk.sys), ACE, ntkrnlmp.exe, etc. ALWAYS use this tool for kernel modu
 4. Optionally also save to disk: output_path="C:\\dumps\\eac_live.sys"
 5. Use `list_functions` limit=0 to review all discovered functions
 6. Decompile key functions for quality check
-7. If more functions needed: use Phase 9 advanced tools for targeted recovery
 
 **Reading Specific Kernel Structures:**
 1. `driver_enumerate_kernel_modules` filter="ntoskrnl" → get ntos base
 2. `driver_read_kernel_memory` address="<base+offset>" size=256 → read any kernel data
 3. Can inspect SSDT, object tables, callback arrays, anything in kernel space
-
-### Phase 9: Advanced Binary Recovery — Targeted Second-Pass Analysis
-NOTE: `driver_kernel_dump_module` already runs the full 6-step analysis pipeline automatically.
-Phase 9 tools are for TARGETED SECOND-PASS recovery when the automatic pipeline isn't enough,
-or for analyzing non-kernel binaries (usermode dumps, unpacked executables, etc.).
-
-When IDA auto-analysis produces poor results (few functions, mostly unexplored bytes, missing
-imports), use these ADVANCED ANALYSIS tools on any binary where standard analysis fails.
-
-**Use `deep_analysis_sweep` for non-kernel binaries that need full recovery.** It runs the full
-5-step pipeline automatically:
-1. PE header parsing (creates segments, exports, entry point)
-2. Force code creation (linear sweep all executable segments)
-3. Aggressive prologue scanning (18+ x64 patterns with instruction validation)
-4. Deep import reconstruction (all segments, kernel APIs, named resolution)
-5. Final auto-analysis pass
-
-**Individual tools for targeted recovery:**
-- `aggressive_function_discovery` — Scans for 18+ x64 function prologue patterns:
-  push rbp/mov rbp,rsp, sub rsp, MS x64 ABI saves (mov [rsp+8],rcx), REX-prefixed
-  pushes, mov rax,rsp/sub rsp (kernel-style), register save pairs. Validates each
-  candidate by decoding 3+ subsequent instructions. Use when IDA finds <10 functions
-  in a large code section.
-
-- `force_create_code_region` — Linear sweep disassembly across a region. Forces creation
-  of instructions where IDA left unexplored bytes. Detects function boundaries from
-  INT3 padding and RET instructions. Use on large unexplored regions in dumped modules.
-
-- `deep_reconstruct_imports` — Scans ALL segments (not just .idata) for IAT entries.
-  Resolves kernel imports (Ke/Ex/Mm/Ps/Zw/Ob/Io/Rtl APIs), propagates __imp_ names,
-  identifies MmGetSystemRoutineAddress dynamic resolution patterns, finds call thunks.
-  Use when reconstruct_imports from deobfuscation_tools returns 0 results.
-
-- `analyze_pe_header` — Parses PE header at any address in the IDB. Extracts sections
-  with permissions, export directory, import directory, entry point. Creates functions
-  at all exports. Essential when IDA's loader didn't parse the PE (dumped modules).
-
-- `create_functions_from_xrefs` — Finds all CALL/JMP targets in existing code that
-  aren't defined as functions and creates them. Catches non-standard prologues that
-  the prologue scanner misses. Run AFTER force_create_code_region.
-
-- `signature_scan_and_define` — User-defined byte patterns with ?? wildcards.
-  Scan the database for a specific pattern and create functions at every match.
-  Use when you identify a protector-specific function prologue pattern.
-
-**Recovery workflow for heavily protected binaries:**
-1. `deep_analysis_sweep` with default options → check before/after function counts
-2. If still < 100 functions: `force_create_code_region` on each large unexplored area
-3. `create_functions_from_xrefs` to catch remaining call targets
-4. `signature_scan_and_define` if protector uses identifiable patterns
-5. `deep_reconstruct_imports` to resolve remaining import gaps
-6. Use `list_functions` with limit=0 to verify the final function count
-7. Decompile key functions to check quality
 
 ### Number Conversions
 ALWAYS use `convert_number` for hex→ASCII, base conversions, signed interpretation.

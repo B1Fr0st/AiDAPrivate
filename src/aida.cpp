@@ -4,9 +4,6 @@
 #include <delayimp.h>
 #endif
 
-// --- Delay-load hooks for VMProtectSDK64.dll ---
-// These resolve the VMP DLL from the same directory as AiDA.dll,
-// and provide safe stubs if the DLL is not found.
 #ifdef __NT__
 static FARPROC WINAPI aida_delay_load_notify(
     unsigned        dliNotify,
@@ -90,7 +87,6 @@ static FARPROC WINAPI aida_delay_load_failure(
 extern "C" const PfnDliHook __pfnDliFailureHook2 = aida_delay_load_failure;
 #endif
 
-// --- Minimal DllMain: only DisableThreadLibraryCalls ---
 #ifdef __NT__
 extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL,
                                 DWORD     fdwReason,
@@ -822,12 +818,6 @@ static plugmod_t* idaapi init()
     return new aida_plugin_t();
 }
 
-// IDA SDK loader.hpp line 642:
-//   idaman ida_module_data plugin_t PLUGIN;
-// IDA SDK loader.hpp line 577-634:
-//   class plugin_t { ... const char *comment; const char *help;
-//   const char *wanted_name; const char *wanted_hotkey; };
-// Plain string literals are safe — no CRT initializer needed.
 plugin_t PLUGIN =
 {
   IDP_INTERFACE_VERSION,
