@@ -42,6 +42,18 @@ namespace ioctl_codes {
     __forceinline ULONG AM()  { return make(6); }
     __forceinline ULONG FM()  { return make(7); }
     __forceinline ULONG HB()  { return make(8); }
+
+    // Debugger capability IOCTL codes
+    __forceinline ULONG TCTX()  { return make(9); }   // Thread context get/set
+    __forceinline ULONG TENUM() { return make(10); }   // Thread enumerate
+    __forceinline ULONG TSR()   { return make(11); }   // Thread suspend/resume
+    __forceinline ULONG QM()    { return make(12); }   // Query memory
+    __forceinline ULONG PM()    { return make(13); }   // Protect memory
+    __forceinline ULONG ER()    { return make(14); }   // Enumerate regions
+    __forceinline ULONG RPEB()  { return make(15); }   // Read PEB
+    __forceinline ULONG SDF()   { return make(16); }   // Spoof debug flags
+    __forceinline ULONG MEX()   { return make(17); }   // Module export
+    __forceinline ULONG V2P()   { return make(18); }   // Virtual to physical
 }
 
 namespace dispatcher {
@@ -299,6 +311,97 @@ namespace dispatcher {
             if (input_size >= sizeof(_FM) && output_size >= sizeof(_FM)) {
                 status = functions::handle7784((p_free_mem)buffer);
                 bytes = sizeof(_FM);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        // === Debugger capability IOCTL handlers ===
+        else if (code == ioctl_codes::TCTX()) {
+            if (input_size >= sizeof(thread_ctx) && output_size >= sizeof(thread_ctx)) {
+                status = functions::handle_thread_ctx((p_thread_ctx)buffer);
+                bytes = sizeof(thread_ctx);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::TENUM()) {
+            if (input_size >= sizeof(thread_enum) && output_size >= sizeof(thread_enum)) {
+                status = functions::handle_thread_enum((p_thread_enum)buffer);
+                bytes = sizeof(thread_enum);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::TSR()) {
+            if (input_size >= sizeof(suspend_resume_thread) && output_size >= sizeof(suspend_resume_thread)) {
+                status = functions::handle_suspend_resume_thread((p_suspend_resume_thread)buffer);
+                bytes = sizeof(suspend_resume_thread);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::QM()) {
+            if (input_size >= sizeof(query_memory) && output_size >= sizeof(query_memory)) {
+                status = functions::handle_query_memory((p_query_memory)buffer);
+                bytes = sizeof(query_memory);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::PM()) {
+            if (input_size >= sizeof(protect_memory) && output_size >= sizeof(protect_memory)) {
+                status = functions::handle_protect_memory((p_protect_memory)buffer);
+                bytes = sizeof(protect_memory);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::ER()) {
+            if (input_size >= sizeof(enum_regions) && output_size >= sizeof(enum_regions)) {
+                status = functions::handle_enum_regions((p_enum_regions)buffer);
+                bytes = sizeof(enum_regions);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::RPEB()) {
+            if (input_size >= sizeof(read_peb) && output_size >= sizeof(read_peb)) {
+                status = functions::handle_read_peb((p_read_peb)buffer);
+                bytes = sizeof(read_peb);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::SDF()) {
+            if (input_size >= sizeof(spoof_debug) && output_size >= sizeof(spoof_debug)) {
+                status = functions::handle_spoof_debug_flags((p_spoof_debug)buffer);
+                bytes = sizeof(spoof_debug);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::MEX()) {
+            if (input_size >= sizeof(module_export) && output_size >= sizeof(module_export)) {
+                status = functions::handle_get_module_export((p_module_export)buffer);
+                bytes = sizeof(module_export);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::V2P()) {
+            if (input_size >= sizeof(virt_to_phys) && output_size >= sizeof(virt_to_phys)) {
+                status = functions::handle_virt_to_phys((p_virt_to_phys)buffer);
+                bytes = sizeof(virt_to_phys);
             }
             else {
                 status = STATUS_INFO_LENGTH_MISMATCH;

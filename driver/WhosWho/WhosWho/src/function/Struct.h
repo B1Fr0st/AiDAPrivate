@@ -135,6 +135,186 @@ typedef struct _HB {
 } heartbeat, * p_heartbeat;
 static_assert(sizeof(heartbeat) == 24, "heartbeat size must be 24 bytes");
 
+//=============================================================================
+// Thread context get/set
+//=============================================================================
+typedef struct _TCTX {
+    UINT32 pid;
+    UINT32 tid;
+    UINT32 should_set;       // 0 = get, 1 = set
+    UINT32 padding;
+    UINT64 register_mask;    // bitmask of which registers to set (only used for set)
+    // General purpose registers
+    UINT64 rax;
+    UINT64 rbx;
+    UINT64 rcx;
+    UINT64 rdx;
+    UINT64 rsi;
+    UINT64 rdi;
+    UINT64 rbp;
+    UINT64 rsp;
+    UINT64 r8;
+    UINT64 r9;
+    UINT64 r10;
+    UINT64 r11;
+    UINT64 r12;
+    UINT64 r13;
+    UINT64 r14;
+    UINT64 r15;
+    UINT64 rip;
+    UINT64 rflags;
+    // Segment registers
+    UINT64 cs;
+    UINT64 ss;
+    // Debug registers
+    UINT64 dr0;
+    UINT64 dr1;
+    UINT64 dr2;
+    UINT64 dr3;
+    UINT64 dr6;
+    UINT64 dr7;
+} thread_ctx, * p_thread_ctx;
+static_assert(sizeof(thread_ctx) == 232, "thread_ctx size must be 232 bytes");
+
+//=============================================================================
+// Thread enumerate
+//=============================================================================
+#define MAX_ENUM_THREADS 256
+
+typedef struct _THREAD_ENTRY {
+    UINT32 tid;
+    UINT32 state;       // 0=running, 1=waiting, etc.
+    UINT64 rip;
+} THREAD_ENTRY;
+static_assert(sizeof(THREAD_ENTRY) == 16, "THREAD_ENTRY size must be 16 bytes");
+
+typedef struct _TENUM {
+    UINT32 pid;
+    UINT32 thread_count;
+    THREAD_ENTRY entries[MAX_ENUM_THREADS];
+} thread_enum, * p_thread_enum;
+static_assert(sizeof(thread_enum) == 8 + sizeof(THREAD_ENTRY) * MAX_ENUM_THREADS, "thread_enum size check");
+
+//=============================================================================
+// Thread suspend/resume
+//=============================================================================
+typedef struct _TSR {
+    UINT32 tid;
+    UINT32 should_resume;   // 0 = suspend, 1 = resume
+    ULONG  previous_count;
+    UINT32 padding;
+} suspend_resume_thread, * p_suspend_resume_thread;
+static_assert(sizeof(suspend_resume_thread) == 16, "suspend_resume_thread size must be 16 bytes");
+
+//=============================================================================
+// Query virtual memory region
+//=============================================================================
+typedef struct _QM {
+    UINT32 pid;
+    UINT32 padding;
+    UINT64 address;
+    // Output
+    UINT64 region_base;
+    UINT64 region_size;
+    UINT32 state;
+    UINT32 protect;
+    UINT32 type;
+    UINT32 allocation_protect;
+    UINT64 allocation_base;
+} query_memory, * p_query_memory;
+static_assert(sizeof(query_memory) == 56, "query_memory size must be 56 bytes");
+
+//=============================================================================
+// Protect virtual memory
+//=============================================================================
+typedef struct _PM {
+    UINT32 pid;
+    UINT32 new_protect;
+    UINT64 address;
+    UINT64 size;
+    UINT32 old_protect;
+    UINT32 padding;
+} protect_memory, * p_protect_memory;
+static_assert(sizeof(protect_memory) == 32, "protect_memory size must be 32 bytes");
+
+//=============================================================================
+// Enumerate memory regions
+//=============================================================================
+#define MAX_ENUM_REGIONS 4096
+
+typedef struct _REGION_ENTRY {
+    UINT64 base;
+    UINT64 size;
+    UINT32 state;
+    UINT32 protect;
+    UINT32 type;
+    UINT32 padding;
+} REGION_ENTRY;
+static_assert(sizeof(REGION_ENTRY) == 32, "REGION_ENTRY size must be 32 bytes");
+
+typedef struct _EREGS {
+    UINT32 pid;
+    UINT32 include_all;     // if nonzero, include free/reserved regions too
+    UINT64 start_address;
+    UINT64 max_address;
+    UINT32 region_count;    // output: number of regions filled
+    UINT32 padding;
+    REGION_ENTRY entries[MAX_ENUM_REGIONS];
+} enum_regions, * p_enum_regions;
+static_assert(sizeof(enum_regions) == 32 + sizeof(REGION_ENTRY) * MAX_ENUM_REGIONS, "enum_regions size check");
+
+//=============================================================================
+// Read PEB
+//=============================================================================
+typedef struct _RPEB {
+    UINT32 pid;
+    UINT32 padding;
+    // Output fields
+    UINT64 peb_address;
+    UINT64 image_base;
+    UINT8  being_debugged;
+    UINT8  pad1[3];
+    UINT32 nt_global_flag;
+    UINT64 ldr_address;
+    UINT64 process_heap;
+    UINT32 number_of_heaps;
+    UINT32 max_heaps;
+    UINT64 process_heaps;
+} read_peb, * p_read_peb;
+static_assert(sizeof(read_peb) == 64, "read_peb size must be 64 bytes");
+
+//=============================================================================
+// Spoof debug flags (clear anti-debug indicators)
+//=============================================================================
+typedef struct _SDF {
+    UINT32 pid;
+    UINT32 result_flags;    // output: bitmask of what was cleared
+} spoof_debug, * p_spoof_debug;
+static_assert(sizeof(spoof_debug) == 8, "spoof_debug size must be 8 bytes");
+
+//=============================================================================
+// Module export resolution
+//=============================================================================
+typedef struct _MEX {
+    UINT64 dtb;
+    UINT64 module_base;
+    char   export_name[128];
+    UINT64 resolved_address;
+    UINT32 ordinal;
+    UINT32 padding;
+} module_export, * p_module_export;
+static_assert(sizeof(module_export) == 160, "module_export size must be 160 bytes");
+
+//=============================================================================
+// Virtual to physical address translation
+//=============================================================================
+typedef struct _V2P {
+    UINT64 dtb;
+    UINT64 virtual_address;
+    UINT64 physical_address;
+} virt_to_phys, * p_virt_to_phys;
+static_assert(sizeof(virt_to_phys) == 24, "virt_to_phys size must be 24 bytes");
+
 #pragma pack(pop)
 
 #define DTB_CACHE_SIZE 32

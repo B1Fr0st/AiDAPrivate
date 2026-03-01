@@ -3086,7 +3086,7 @@ tool_result_t search_strings(const json& params)
     size_t total = get_strlist_qty();
     if (total == 0)
     {
-        show_wait_box("HIDECANCEL\nAiDA: Building string list...");
+        show_wait_box("NODELAY\nAiDA: Building string list...");
         build_strlist();
         hide_wait_box();
         total = get_strlist_qty();
@@ -3096,13 +3096,15 @@ tool_result_t search_strings(const json& params)
     int count = 0;
     int skipped = 0;
     
-    show_wait_box("HIDECANCEL\nAiDA: Searching strings (0 / %zu)...", total);
+    show_wait_box("NODELAY\nAiDA: Searching strings (0 / %zu)...", total);
     
     for (size_t i = 0; i < total && count < limit; i++)
     {
-        if (i % 5000 == 0)
+        if (i % 500 == 0)
         {
-            replace_wait_box("HIDECANCEL\nAiDA: Searching strings (%zu / %zu)...", i, total);
+            replace_wait_box("AiDA: Searching strings (%zu / %zu)...", i, total);
+            if (user_cancelled())
+                break;
         }
         
         string_info_t si;
@@ -3168,15 +3170,16 @@ tool_result_t find_bytes(const json& params)
     json matches = json::array();
     ea_t current = start_ea;
     
-    show_wait_box("HIDECANCEL\nAiDA: Searching byte pattern...");
+    show_wait_box("NODELAY\nAiDA: Searching byte pattern...");
     
     for (int i = 0; i < limit; i++)
     {
-        replace_wait_box("HIDECANCEL\nAiDA: Searching byte pattern (%d found)...", i);
-        user_cancelled();
+        replace_wait_box("AiDA: Searching byte pattern (%d found)...", i);
+        if (user_cancelled())
+            break;
         
         ea_t found = bin_search(current, end_ea, binpat,
-                                BIN_SEARCH_FORWARD | BIN_SEARCH_NOBREAK | BIN_SEARCH_NOSHOW);
+                                BIN_SEARCH_FORWARD);
         if (found == BADADDR)
             break;
         
@@ -3210,15 +3213,16 @@ tool_result_t find_instructions(const json& params)
     json matches = json::array();
     ea_t ea = start_ea;
     
-    show_wait_box("HIDECANCEL\nAiDA: Searching instructions...");
+    show_wait_box("NODELAY\nAiDA: Searching instructions...");
     
     while (ea < end_ea && (int)matches.size() < limit)
     {
-        replace_wait_box("HIDECANCEL\nAiDA: Searching instructions (%zu found)...", matches.size());
-        user_cancelled();
+        replace_wait_box("AiDA: Searching instructions (%zu found)...", matches.size());
+        if (user_cancelled())
+            break;
         
         ea_t found = find_text(ea, 0, 0, pattern.c_str(),
-                               SEARCH_DOWN | SEARCH_NEXT | SEARCH_NOSHOW);
+                               SEARCH_DOWN | SEARCH_NEXT);
         if (found == BADADDR)
             break;
         
@@ -3272,15 +3276,16 @@ tool_result_t find_immediate(const json& params)
     json matches = json::array();
     ea_t ea = start_ea;
     
-    show_wait_box("HIDECANCEL\nAiDA: Searching immediate values...");
+    show_wait_box("NODELAY\nAiDA: Searching immediate values...");
     
     for (int i = 0; i < limit; i++)
     {
-        replace_wait_box("HIDECANCEL\nAiDA: Searching immediate values (%d found)...", i);
-        user_cancelled();
+        replace_wait_box("AiDA: Searching immediate values (%d found)...", i);
+        if (user_cancelled())
+            break;
         
         int opnum = -1;
-        ea_t found = find_imm(ea, SEARCH_DOWN | SEARCH_NEXT | SEARCH_NOSHOW,
+        ea_t found = find_imm(ea, SEARCH_DOWN | SEARCH_NEXT,
                               (uval_t)value, &opnum);
         if (found == BADADDR)
             break;
@@ -3318,19 +3323,20 @@ tool_result_t search_text(const json& params)
         if (s) start_ea = *s;
     }
     
-    int flags = SEARCH_DOWN | SEARCH_NEXT | SEARCH_NOSHOW;
+    int flags = SEARCH_DOWN | SEARCH_NEXT;
     if (case_sensitive)
         flags |= SEARCH_CASE;
     
     json matches = json::array();
     ea_t ea = start_ea;
     
-    show_wait_box("HIDECANCEL\nAiDA: Searching text...");
+    show_wait_box("NODELAY\nAiDA: Searching text...");
     
     for (int i = 0; i < limit; i++)
     {
-        replace_wait_box("HIDECANCEL\nAiDA: Searching text (%d / %d)...", i + 1, limit);
-        user_cancelled();
+        replace_wait_box("AiDA: Searching text (%d / %d)...", i + 1, limit);
+        if (user_cancelled())
+            break;
         
         ea_t found = find_text(ea, 0, 0, text.c_str(), flags);
         if (found == BADADDR)
@@ -10757,6 +10763,488 @@ tool_result_t driver_call_function(const json& params)
         OBFSTR(" returned ") + helpers::format_address(static_cast<ea_t>(ret)), result);
 }
 
+//=============================================================================
+// Debugger capability tools
+//=============================================================================
+
+tool_result_t driver_get_thread_context(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+
+    std::uint32_t tid = 0;
+    if (params.contains("tid")) {
+        if (params["tid"].is_string())
+            tid = static_cast<std::uint32_t>(helpers::parse_address(params["tid"].get<std::string>()).value_or(0));
+        else
+            tid = params["tid"].get<std::uint32_t>();
+    }
+    if (tid == 0) return tool_result_t::error(OBFSTR("Thread ID (tid) is required"));
+
+    voyager::device_t::thread_context ctx{};
+    if (!device->get_thread_context(tid, ctx))
+        return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
+
+    json result;
+    result["tid"] = tid;
+    result["rax"] = helpers::format_address(static_cast<ea_t>(ctx.rax));
+    result["rbx"] = helpers::format_address(static_cast<ea_t>(ctx.rbx));
+    result["rcx"] = helpers::format_address(static_cast<ea_t>(ctx.rcx));
+    result["rdx"] = helpers::format_address(static_cast<ea_t>(ctx.rdx));
+    result["rsi"] = helpers::format_address(static_cast<ea_t>(ctx.rsi));
+    result["rdi"] = helpers::format_address(static_cast<ea_t>(ctx.rdi));
+    result["rbp"] = helpers::format_address(static_cast<ea_t>(ctx.rbp));
+    result["rsp"] = helpers::format_address(static_cast<ea_t>(ctx.rsp));
+    result["r8"]  = helpers::format_address(static_cast<ea_t>(ctx.r8));
+    result["r9"]  = helpers::format_address(static_cast<ea_t>(ctx.r9));
+    result["r10"] = helpers::format_address(static_cast<ea_t>(ctx.r10));
+    result["r11"] = helpers::format_address(static_cast<ea_t>(ctx.r11));
+    result["r12"] = helpers::format_address(static_cast<ea_t>(ctx.r12));
+    result["r13"] = helpers::format_address(static_cast<ea_t>(ctx.r13));
+    result["r14"] = helpers::format_address(static_cast<ea_t>(ctx.r14));
+    result["r15"] = helpers::format_address(static_cast<ea_t>(ctx.r15));
+    result["rip"] = helpers::format_address(static_cast<ea_t>(ctx.rip));
+    result["rflags"] = helpers::format_address(static_cast<ea_t>(ctx.rflags));
+    result["dr0"] = helpers::format_address(static_cast<ea_t>(ctx.dr0));
+    result["dr1"] = helpers::format_address(static_cast<ea_t>(ctx.dr1));
+    result["dr2"] = helpers::format_address(static_cast<ea_t>(ctx.dr2));
+    result["dr3"] = helpers::format_address(static_cast<ea_t>(ctx.dr3));
+    result["dr6"] = helpers::format_address(static_cast<ea_t>(ctx.dr6));
+    result["dr7"] = helpers::format_address(static_cast<ea_t>(ctx.dr7));
+
+    return tool_result_t::ok(OBFSTR("Thread context for TID ") + std::to_string(tid), result);
+}
+
+tool_result_t driver_set_thread_context(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+
+    std::uint32_t tid = 0;
+    if (params.contains("tid")) {
+        if (params["tid"].is_string())
+            tid = static_cast<std::uint32_t>(helpers::parse_address(params["tid"].get<std::string>()).value_or(0));
+        else
+            tid = params["tid"].get<std::uint32_t>();
+    }
+    if (tid == 0) return tool_result_t::error(OBFSTR("Thread ID (tid) is required"));
+
+    voyager::device_t::thread_context ctx{};
+    std::uint64_t mask = 0;
+
+    auto set_reg = [&](const char* name, std::uint64_t& reg, int bit) {
+        if (params.contains(name)) {
+            if (params[name].is_string())
+                reg = helpers::parse_address(params[name].get<std::string>()).value_or(0);
+            else
+                reg = params[name].get<std::uint64_t>();
+            mask |= (1ULL << bit);
+        }
+    };
+
+    set_reg("rax", ctx.rax, 0);  set_reg("rbx", ctx.rbx, 1);
+    set_reg("rcx", ctx.rcx, 2);  set_reg("rdx", ctx.rdx, 3);
+    set_reg("rsi", ctx.rsi, 4);  set_reg("rdi", ctx.rdi, 5);
+    set_reg("rbp", ctx.rbp, 6);  set_reg("rsp", ctx.rsp, 7);
+    set_reg("r8",  ctx.r8,  8);  set_reg("r9",  ctx.r9,  9);
+    set_reg("r10", ctx.r10, 10); set_reg("r11", ctx.r11, 11);
+    set_reg("r12", ctx.r12, 12); set_reg("r13", ctx.r13, 13);
+    set_reg("r14", ctx.r14, 14); set_reg("r15", ctx.r15, 15);
+    set_reg("rip", ctx.rip, 16); set_reg("rflags", ctx.rflags, 17);
+    set_reg("dr0", ctx.dr0, 18); set_reg("dr1", ctx.dr1, 19);
+    set_reg("dr2", ctx.dr2, 20); set_reg("dr3", ctx.dr3, 21);
+    set_reg("dr6", ctx.dr6, 22); set_reg("dr7", ctx.dr7, 23);
+
+    if (mask == 0) return tool_result_t::error(OBFSTR("No registers specified to set"));
+
+    if (!device->set_thread_context(tid, ctx, mask))
+        return tool_result_t::error(OBFSTR("Failed to set thread context for TID ") + std::to_string(tid));
+
+    json result;
+    result["tid"] = tid;
+    result["register_mask"] = helpers::format_address(static_cast<ea_t>(mask));
+    return tool_result_t::ok(OBFSTR("Thread context updated for TID ") + std::to_string(tid), result);
+}
+
+tool_result_t driver_enumerate_threads(const json& params)
+{
+    (void)params;
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+
+    auto threads = device->enumerate_threads();
+    if (threads.empty())
+        return tool_result_t::error(OBFSTR("No threads found or enumeration failed"));
+
+    json result;
+    result["process_id"] = device->get_process_id();
+    result["thread_count"] = threads.size();
+    json arr = json::array();
+    for (const auto& t : threads) {
+        json tj;
+        tj["tid"] = t.tid;
+        tj["state"] = t.state;
+        if (t.rip) tj["rip"] = helpers::format_address(static_cast<ea_t>(t.rip));
+        arr.push_back(tj);
+    }
+    result["threads"] = arr;
+    return tool_result_t::ok(OBFSTR("Enumerated ") + std::to_string(threads.size()) + OBFSTR(" threads"), result);
+}
+
+tool_result_t driver_suspend_thread(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+
+    std::uint32_t tid = 0;
+    if (params.contains("tid")) {
+        if (params["tid"].is_string())
+            tid = static_cast<std::uint32_t>(helpers::parse_address(params["tid"].get<std::string>()).value_or(0));
+        else
+            tid = params["tid"].get<std::uint32_t>();
+    }
+    if (tid == 0) return tool_result_t::error(OBFSTR("Thread ID (tid) is required"));
+
+    std::uint32_t prev = 0;
+    if (!device->suspend_thread(tid, &prev))
+        return tool_result_t::error(OBFSTR("Failed to suspend thread ") + std::to_string(tid));
+
+    json result;
+    result["tid"] = tid;
+    result["previous_suspend_count"] = prev;
+    return tool_result_t::ok(OBFSTR("Thread ") + std::to_string(tid) + OBFSTR(" suspended"), result);
+}
+
+tool_result_t driver_resume_thread(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+
+    std::uint32_t tid = 0;
+    if (params.contains("tid")) {
+        if (params["tid"].is_string())
+            tid = static_cast<std::uint32_t>(helpers::parse_address(params["tid"].get<std::string>()).value_or(0));
+        else
+            tid = params["tid"].get<std::uint32_t>();
+    }
+    if (tid == 0) return tool_result_t::error(OBFSTR("Thread ID (tid) is required"));
+
+    std::uint32_t prev = 0;
+    if (!device->resume_thread(tid, &prev))
+        return tool_result_t::error(OBFSTR("Failed to resume thread ") + std::to_string(tid));
+
+    json result;
+    result["tid"] = tid;
+    result["previous_suspend_count"] = prev;
+    return tool_result_t::ok(OBFSTR("Thread ") + std::to_string(tid) + OBFSTR(" resumed"), result);
+}
+
+tool_result_t driver_query_memory(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+
+    std::uint64_t address = 0;
+    if (params.contains("address"))
+        address = helpers::parse_address(params["address"].get<std::string>()).value_or(0);
+    if (address == 0)
+        address = device->get_base_address();
+
+    voyager::device_t::memory_region_info info{};
+    if (!device->query_memory(address, info))
+        return tool_result_t::error(OBFSTR("Failed to query memory at ") + helpers::format_address(static_cast<ea_t>(address)));
+
+    auto prot_str = [](std::uint32_t p) -> std::string {
+        std::string s;
+        if (p & 0x10) s += "EXECUTE ";
+        if (p & 0x20) s += "EXECUTE_READ ";
+        if (p & 0x40) s += "EXECUTE_READWRITE ";
+        if (p & 0x80) s += "EXECUTE_WRITECOPY ";
+        if (p & 0x01) s += "NOACCESS ";
+        if (p & 0x02) s += "READONLY ";
+        if (p & 0x04) s += "READWRITE ";
+        if (p & 0x08) s += "WRITECOPY ";
+        if (p & 0x100) s += "GUARD ";
+        if (p & 0x200) s += "NOCACHE ";
+        if (s.empty()) s = "UNKNOWN";
+        return s;
+    };
+
+    json result;
+    result["address"] = helpers::format_address(static_cast<ea_t>(address));
+    result["region_base"] = helpers::format_address(static_cast<ea_t>(info.base));
+    result["region_size"] = helpers::format_address(static_cast<ea_t>(info.size));
+    result["state"] = (info.state == 0x1000) ? "MEM_COMMIT" : 
+                      (info.state == 0x2000) ? "MEM_RESERVE" : 
+                      (info.state == 0x10000) ? "MEM_FREE" : std::to_string(info.state);
+    result["protect"] = prot_str(info.protect);
+    result["protect_raw"] = info.protect;
+    result["type"] = (info.type == 0x20000) ? "MEM_PRIVATE" :
+                     (info.type == 0x40000) ? "MEM_MAPPED" :
+                     (info.type == 0x1000000) ? "MEM_IMAGE" : std::to_string(info.type);
+    result["allocation_base"] = helpers::format_address(static_cast<ea_t>(info.allocation_base));
+    result["allocation_protect"] = prot_str(info.allocation_protect);
+
+    return tool_result_t::ok(OBFSTR("Memory region info"), result);
+}
+
+tool_result_t driver_protect_memory(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+
+    std::uint64_t address = 0;
+    if (params.contains("address"))
+        address = helpers::parse_address(params["address"].get<std::string>()).value_or(0);
+    if (address == 0)
+        return tool_result_t::error(OBFSTR("Address is required"));
+
+    std::uint64_t size = 0x1000;
+    if (params.contains("size")) {
+        if (params["size"].is_string())
+            size = helpers::parse_address(params["size"].get<std::string>()).value_or(0x1000);
+        else
+            size = params["size"].get<std::uint64_t>();
+    }
+
+    std::uint32_t new_protect = 0x40; // PAGE_EXECUTE_READWRITE default
+    if (params.contains("protect")) {
+        if (params["protect"].is_string())
+            new_protect = static_cast<std::uint32_t>(helpers::parse_address(params["protect"].get<std::string>()).value_or(0x40));
+        else
+            new_protect = params["protect"].get<std::uint32_t>();
+    }
+
+    std::uint32_t old_protect = 0;
+    if (!device->protect_memory(address, size, new_protect, &old_protect))
+        return tool_result_t::error(OBFSTR("Failed to change protection at ") + helpers::format_address(static_cast<ea_t>(address)));
+
+    json result;
+    result["address"] = helpers::format_address(static_cast<ea_t>(address));
+    result["size"] = helpers::format_address(static_cast<ea_t>(size));
+    result["new_protect"] = new_protect;
+    result["old_protect"] = old_protect;
+    return tool_result_t::ok(OBFSTR("Memory protection changed"), result);
+}
+
+tool_result_t driver_enumerate_memory_regions(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+
+    std::uint64_t start = 0;
+    if (params.contains("start"))
+        start = helpers::parse_address(params["start"].get<std::string>()).value_or(0);
+
+    std::uint64_t end_addr = 0;
+    if (params.contains("end"))
+        end_addr = helpers::parse_address(params["end"].get<std::string>()).value_or(0);
+
+    bool include_all = false;
+    if (params.contains("include_all") && params["include_all"].is_boolean())
+        include_all = params["include_all"].get<bool>();
+
+    auto regions = device->enumerate_memory_regions(start, end_addr, include_all);
+    if (regions.empty())
+        return tool_result_t::error(OBFSTR("No memory regions found"));
+
+    auto prot_str = [](std::uint32_t p) -> std::string {
+        if (p & 0x40) return "ERW";
+        if (p & 0x20) return "ER";
+        if (p & 0x10) return "E";
+        if (p & 0x04) return "RW";
+        if (p & 0x02) return "R";
+        if (p & 0x01) return "NA";
+        return std::to_string(p);
+    };
+
+    json result;
+    result["process_id"] = device->get_process_id();
+    result["region_count"] = regions.size();
+    json arr = json::array();
+    for (const auto& r : regions) {
+        json rj;
+        rj["base"] = helpers::format_address(static_cast<ea_t>(r.base));
+        rj["size"] = helpers::format_address(static_cast<ea_t>(r.size));
+        rj["state"] = (r.state == 0x1000) ? "COMMIT" :
+                      (r.state == 0x2000) ? "RESERVE" : "FREE";
+        rj["protect"] = prot_str(r.protect);
+        rj["type"] = (r.type == 0x20000) ? "PRIVATE" :
+                     (r.type == 0x40000) ? "MAPPED" :
+                     (r.type == 0x1000000) ? "IMAGE" : std::to_string(r.type);
+        arr.push_back(rj);
+    }
+    result["regions"] = arr;
+    return tool_result_t::ok(OBFSTR("Enumerated ") + std::to_string(regions.size()) + OBFSTR(" regions"), result);
+}
+
+tool_result_t driver_read_peb(const json& params)
+{
+    (void)params;
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+
+    voyager::device_t::peb_info info{};
+    if (!device->read_peb(info))
+        return tool_result_t::error(OBFSTR("Failed to read PEB"));
+
+    json result;
+    result["peb_address"] = helpers::format_address(static_cast<ea_t>(info.peb_address));
+    result["image_base"] = helpers::format_address(static_cast<ea_t>(info.image_base));
+    result["being_debugged"] = info.being_debugged ? true : false;
+    result["nt_global_flag"] = helpers::format_address(static_cast<ea_t>(info.nt_global_flag));
+    result["ldr_address"] = helpers::format_address(static_cast<ea_t>(info.ldr_address));
+    result["process_heap"] = helpers::format_address(static_cast<ea_t>(info.process_heap));
+    result["number_of_heaps"] = info.number_of_heaps;
+    result["max_heaps"] = info.max_heaps;
+    result["process_heaps"] = helpers::format_address(static_cast<ea_t>(info.process_heaps));
+    return tool_result_t::ok(OBFSTR("PEB info for PID ") + std::to_string(device->get_process_id()), result);
+}
+
+tool_result_t driver_spoof_debug_flags(const json& params)
+{
+    (void)params;
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+
+    std::uint32_t flags = 0;
+    if (!device->spoof_debug_flags(&flags))
+        return tool_result_t::error(OBFSTR("Failed to spoof debug flags"));
+
+    json result;
+    result["process_id"] = device->get_process_id();
+    result["cleared_debug_port"] = (flags & 1) != 0;
+    result["cleared_being_debugged"] = (flags & 2) != 0;
+    result["cleared_nt_global_flag"] = (flags & 4) != 0;
+    return tool_result_t::ok(OBFSTR("Anti-debug flags cleared"), result);
+}
+
+tool_result_t driver_set_hw_breakpoint(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+
+    std::uint32_t tid = 0;
+    if (params.contains("tid")) {
+        if (params["tid"].is_string())
+            tid = static_cast<std::uint32_t>(helpers::parse_address(params["tid"].get<std::string>()).value_or(0));
+        else
+            tid = params["tid"].get<std::uint32_t>();
+    }
+    if (tid == 0) return tool_result_t::error(OBFSTR("Thread ID (tid) is required"));
+
+    std::uint64_t address = 0;
+    if (params.contains("address"))
+        address = helpers::parse_address(params["address"].get<std::string>()).value_or(0);
+    if (address == 0) return tool_result_t::error(OBFSTR("Address is required"));
+
+    int index = 0;
+    if (params.contains("index")) index = params["index"].get<int>();
+
+    int type = 0; // 0=exec
+    if (params.contains("type")) {
+        std::string t = params["type"].get<std::string>();
+        if (t == "write") type = 1;
+        else if (t == "readwrite" || t == "rw") type = 3;
+        else type = 0; // exec
+    }
+
+    int size = 0; // 0=1byte
+    if (params.contains("size")) {
+        int s = params["size"].get<int>();
+        if (s == 2) size = 1;
+        else if (s == 4) size = 3;
+        else if (s == 8) size = 2;
+        else size = 0;
+    }
+
+    if (!device->set_hardware_breakpoint(tid, index, address, type, size))
+        return tool_result_t::error(OBFSTR("Failed to set hardware breakpoint"));
+
+    json result;
+    result["tid"] = tid;
+    result["index"] = index;
+    result["address"] = helpers::format_address(static_cast<ea_t>(address));
+    result["type"] = (type == 0) ? "execute" : (type == 1) ? "write" : "readwrite";
+    return tool_result_t::ok(OBFSTR("Hardware breakpoint set on DR") + std::to_string(index), result);
+}
+
+tool_result_t driver_clear_hw_breakpoint(const json& params)
+{
+    if (!device->is_connected() || device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+
+    std::uint32_t tid = 0;
+    if (params.contains("tid")) {
+        if (params["tid"].is_string())
+            tid = static_cast<std::uint32_t>(helpers::parse_address(params["tid"].get<std::string>()).value_or(0));
+        else
+            tid = params["tid"].get<std::uint32_t>();
+    }
+    if (tid == 0) return tool_result_t::error(OBFSTR("Thread ID (tid) is required"));
+
+    int index = 0;
+    if (params.contains("index")) index = params["index"].get<int>();
+
+    if (!device->clear_hardware_breakpoint(tid, index))
+        return tool_result_t::error(OBFSTR("Failed to clear hardware breakpoint"));
+
+    json result;
+    result["tid"] = tid;
+    result["index"] = index;
+    return tool_result_t::ok(OBFSTR("Hardware breakpoint cleared on DR") + std::to_string(index), result);
+}
+
+tool_result_t driver_resolve_export(const json& params)
+{
+    if (!device->is_connected() || device->get_dtb() == 0)
+        return tool_result_t::error(OBFSTR("Driver not connected or DTB not solved"));
+
+    std::uint64_t module_base = 0;
+    if (params.contains("module_base"))
+        module_base = helpers::parse_address(params["module_base"].get<std::string>()).value_or(0);
+    if (module_base == 0)
+        module_base = device->get_base_address();
+    if (module_base == 0)
+        return tool_result_t::error(OBFSTR("Module base required"));
+
+    std::string export_name;
+    if (params.contains("name"))
+        export_name = params["name"].get<std::string>();
+    if (export_name.empty())
+        return tool_result_t::error(OBFSTR("Export name required"));
+
+    std::uint64_t addr = device->resolve_export(module_base, export_name.c_str());
+    if (addr == 0)
+        return tool_result_t::error(OBFSTR("Export '") + export_name + OBFSTR("' not found"));
+
+    json result;
+    result["export_name"] = export_name;
+    result["module_base"] = helpers::format_address(static_cast<ea_t>(module_base));
+    result["resolved_address"] = helpers::format_address(static_cast<ea_t>(addr));
+    return tool_result_t::ok(OBFSTR("Export resolved: ") + export_name + OBFSTR(" -> ") + helpers::format_address(static_cast<ea_t>(addr)), result);
+}
+
+tool_result_t driver_virtual_to_physical(const json& params)
+{
+    if (!device->is_connected() || device->get_dtb() == 0)
+        return tool_result_t::error(OBFSTR("Driver not connected or DTB not solved"));
+
+    std::uint64_t vaddr = 0;
+    if (params.contains("address"))
+        vaddr = helpers::parse_address(params["address"].get<std::string>()).value_or(0);
+    if (vaddr == 0) return tool_result_t::error(OBFSTR("Address is required"));
+
+    std::uint64_t paddr = device->virtual_to_physical(vaddr);
+    if (paddr == 0)
+        return tool_result_t::error(OBFSTR("Translation failed for ") + helpers::format_address(static_cast<ea_t>(vaddr)));
+
+    json result;
+    result["virtual_address"] = helpers::format_address(static_cast<ea_t>(vaddr));
+    result["physical_address"] = helpers::format_address(static_cast<ea_t>(paddr));
+    return tool_result_t::ok(OBFSTR("Virtual -> Physical translation"), result);
+}
+
 
 void register_tools()
 {
@@ -10992,6 +11480,161 @@ void register_tools()
          {OBFSTR("arg4"), OBFSTR("string"),
           OBFSTR("Fourth argument (R9). Hex address or integer. Default 0"), false}},
         driver_call_function, false});
+
+    // === Debugger capability tools ===
+
+    registry.register_tool({
+        OBFSTR("driver_get_thread_context"), OBFSTR("driver"),
+        OBFSTR("Get the full register state of a thread in the attached process via kernel PsGetContextThread. "
+               "Returns all general purpose registers (RAX-R15), RIP, RFLAGS, and debug registers (DR0-DR7). "
+               "Thread must exist in the attached process. Bypasses all anti-debug since it operates from kernel."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true}},
+        driver_get_thread_context, true});
+
+    registry.register_tool({
+        OBFSTR("driver_set_thread_context"), OBFSTR("driver"),
+        OBFSTR("Set registers of a thread in the attached process via kernel PsSetContextThread. "
+               "Only specified registers are modified; unspecified registers are untouched. "
+               "Can set RIP to redirect execution, modify debug registers for HW breakpoints, "
+               "change RSP, or any other register. Operates from kernel, bypasses all protection."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
+         {OBFSTR("rax"), OBFSTR("string"), OBFSTR("RAX value (hex)"), false},
+         {OBFSTR("rbx"), OBFSTR("string"), OBFSTR("RBX value"), false},
+         {OBFSTR("rcx"), OBFSTR("string"), OBFSTR("RCX value"), false},
+         {OBFSTR("rdx"), OBFSTR("string"), OBFSTR("RDX value"), false},
+         {OBFSTR("rsi"), OBFSTR("string"), OBFSTR("RSI value"), false},
+         {OBFSTR("rdi"), OBFSTR("string"), OBFSTR("RDI value"), false},
+         {OBFSTR("rbp"), OBFSTR("string"), OBFSTR("RBP value"), false},
+         {OBFSTR("rsp"), OBFSTR("string"), OBFSTR("RSP value"), false},
+         {OBFSTR("r8"), OBFSTR("string"), OBFSTR("R8 value"), false},
+         {OBFSTR("r9"), OBFSTR("string"), OBFSTR("R9 value"), false},
+         {OBFSTR("r10"), OBFSTR("string"), OBFSTR("R10 value"), false},
+         {OBFSTR("r11"), OBFSTR("string"), OBFSTR("R11 value"), false},
+         {OBFSTR("r12"), OBFSTR("string"), OBFSTR("R12 value"), false},
+         {OBFSTR("r13"), OBFSTR("string"), OBFSTR("R13 value"), false},
+         {OBFSTR("r14"), OBFSTR("string"), OBFSTR("R14 value"), false},
+         {OBFSTR("r15"), OBFSTR("string"), OBFSTR("R15 value"), false},
+         {OBFSTR("rip"), OBFSTR("string"), OBFSTR("RIP value"), false},
+         {OBFSTR("rflags"), OBFSTR("string"), OBFSTR("RFLAGS value"), false},
+         {OBFSTR("dr0"), OBFSTR("string"), OBFSTR("DR0 value"), false},
+         {OBFSTR("dr1"), OBFSTR("string"), OBFSTR("DR1 value"), false},
+         {OBFSTR("dr2"), OBFSTR("string"), OBFSTR("DR2 value"), false},
+         {OBFSTR("dr3"), OBFSTR("string"), OBFSTR("DR3 value"), false},
+         {OBFSTR("dr6"), OBFSTR("string"), OBFSTR("DR6 value"), false},
+         {OBFSTR("dr7"), OBFSTR("string"), OBFSTR("DR7 value"), false}},
+        driver_set_thread_context, false});
+
+    registry.register_tool({
+        OBFSTR("driver_enumerate_threads"), OBFSTR("driver"),
+        OBFSTR("Enumerate all threads in the attached process via kernel PsGetNextProcessThread. "
+               "Returns each thread's TID. Useful for finding threads to suspend, set breakpoints on, "
+               "or inspect context of."),
+        {}, driver_enumerate_threads, true});
+
+    registry.register_tool({
+        OBFSTR("driver_suspend_thread"), OBFSTR("driver"),
+        OBFSTR("Suspend a thread in the attached process via kernel PsSuspendThread. "
+               "Thread execution is paused until resumed. Returns previous suspend count."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID to suspend"), true}},
+        driver_suspend_thread, false});
+
+    registry.register_tool({
+        OBFSTR("driver_resume_thread"), OBFSTR("driver"),
+        OBFSTR("Resume a suspended thread in the attached process via kernel PsResumeThread. "
+               "Returns previous suspend count. Thread resumes execution."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID to resume"), true}},
+        driver_resume_thread, false});
+
+    registry.register_tool({
+        OBFSTR("driver_query_memory"), OBFSTR("driver"),
+        OBFSTR("Query virtual memory region information at an address in the attached process. "
+               "Uses kernel ZwQueryVirtualMemory. Returns region base, size, state (commit/reserve/free), "
+               "protection (RWX flags), and type (private/mapped/image)."),
+        {{OBFSTR("address"), OBFSTR("string"),
+          OBFSTR("Virtual address to query (default: image base)"), false}},
+        driver_query_memory, true});
+
+    registry.register_tool({
+        OBFSTR("driver_protect_memory"), OBFSTR("driver"),
+        OBFSTR("Change virtual memory protection in the attached process via kernel ZwProtectVirtualMemory. "
+               "Bypasses usermode hooks on VirtualProtect. Can set any protection including executable. "
+               "Returns the old protection value."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Virtual address"), true},
+         {OBFSTR("size"), OBFSTR("string"), OBFSTR("Region size (default 0x1000)"), false},
+         {OBFSTR("protect"), OBFSTR("string"),
+          OBFSTR("New protection value: 0x40=PAGE_EXECUTE_READWRITE, 0x20=PAGE_EXECUTE_READ, "
+                 "0x04=PAGE_READWRITE, 0x02=PAGE_READONLY"), false}},
+        driver_protect_memory, false});
+
+    registry.register_tool({
+        OBFSTR("driver_enumerate_memory_regions"), OBFSTR("driver"),
+        OBFSTR("Walk the entire virtual address space of the attached process, enumerating all "
+               "committed memory regions. Returns base, size, state, protection, and type for each. "
+               "Useful for finding all executable regions, mapped images, private memory, etc."),
+        {{OBFSTR("start"), OBFSTR("string"), OBFSTR("Start address (default 0)"), false},
+         {OBFSTR("end"), OBFSTR("string"), OBFSTR("End address (default max user-mode)"), false},
+         {OBFSTR("include_all"), OBFSTR("boolean"),
+          OBFSTR("Include free/reserved regions too (default false, only committed)"), false}},
+        driver_enumerate_memory_regions, true});
+
+    registry.register_tool({
+        OBFSTR("driver_read_peb"), OBFSTR("driver"),
+        OBFSTR("Read the Process Environment Block (PEB) of the attached process via kernel. "
+               "Returns PEB address, image base, BeingDebugged flag, NtGlobalFlag, "
+               "loader data address, process heap, and heap info."),
+        {}, driver_read_peb, true});
+
+    registry.register_tool({
+        OBFSTR("driver_spoof_debug_flags"), OBFSTR("driver"),
+        OBFSTR("Clear ALL anti-debug indicators in the attached process from kernel space. "
+               "Zeroes EPROCESS.DebugPort, PEB.BeingDebugged, clears PEB.NtGlobalFlag heap debug flags. "
+               "Completely invisible to the target process. Call this before the target's anti-debug "
+               "checks run to bypass IsDebuggerPresent, NtQueryInformationProcess, etc."),
+        {}, driver_spoof_debug_flags, false});
+
+    registry.register_tool({
+        OBFSTR("driver_set_hw_breakpoint"), OBFSTR("driver"),
+        OBFSTR("Set a hardware breakpoint on a thread in the attached process using debug registers. "
+               "Uses DR0-DR3 (4 breakpoints max per thread). Operates via kernel PsSetContextThread "
+               "so it's invisible to usermode anti-debug. Types: execute (break on execution), "
+               "write (break on memory write), readwrite (break on read or write). "
+               "After setting, the thread will trigger a SINGLE_STEP exception when the breakpoint fires."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
+         {OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to break on"), true},
+         {OBFSTR("index"), OBFSTR("number"),
+          OBFSTR("Debug register index 0-3 (default 0). Each thread supports 4 HW breakpoints."), false},
+         {OBFSTR("type"), OBFSTR("string"),
+          OBFSTR("Breakpoint type: execute (default), write, readwrite"), false,
+          {OBFSTR("execute"), OBFSTR("write"), OBFSTR("readwrite")}},
+         {OBFSTR("size"), OBFSTR("number"),
+          OBFSTR("Watched region size in bytes: 1 (default), 2, 4, or 8"), false}},
+        driver_set_hw_breakpoint, false});
+
+    registry.register_tool({
+        OBFSTR("driver_clear_hw_breakpoint"), OBFSTR("driver"),
+        OBFSTR("Clear a hardware breakpoint on a thread. Removes the address from the specified "
+               "debug register and disables it in DR7."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
+         {OBFSTR("index"), OBFSTR("number"),
+          OBFSTR("Debug register index 0-3 to clear (default 0)"), false}},
+        driver_clear_hw_breakpoint, false});
+
+    registry.register_tool({
+        OBFSTR("driver_resolve_export"), OBFSTR("driver"),
+        OBFSTR("Resolve an export function address from a PE module in the attached process. "
+               "Walks the PE export directory via physical memory reads. Useful for finding API "
+               "addresses without relying on import tables (which may be obfuscated by packers)."),
+        {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Export function name to resolve"), true},
+         {OBFSTR("module_base"), OBFSTR("string"),
+          OBFSTR("Module base address (default: attached process image base)"), false}},
+        driver_resolve_export, true});
+
+    registry.register_tool({
+        OBFSTR("driver_virtual_to_physical"), OBFSTR("driver"),
+        OBFSTR("Translate a virtual address to its physical address using the process DTB. "
+               "Performs a full 4-level page table walk (PML4->PDPT->PD->PT) in kernel."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Virtual address to translate"), true}},
+        driver_virtual_to_physical, true});
 }
 
 } // namespace driver_tools

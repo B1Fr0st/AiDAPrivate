@@ -304,6 +304,23 @@ namespace driver_tools
     tool_result_t driver_allocate_memory(const nlohmann::json& params);
     tool_result_t driver_free_memory(const nlohmann::json& params);
     tool_result_t driver_call_function(const nlohmann::json& params);
+
+    // Debugger capability tools
+    tool_result_t driver_get_thread_context(const nlohmann::json& params);
+    tool_result_t driver_set_thread_context(const nlohmann::json& params);
+    tool_result_t driver_enumerate_threads(const nlohmann::json& params);
+    tool_result_t driver_suspend_thread(const nlohmann::json& params);
+    tool_result_t driver_resume_thread(const nlohmann::json& params);
+    tool_result_t driver_query_memory(const nlohmann::json& params);
+    tool_result_t driver_protect_memory(const nlohmann::json& params);
+    tool_result_t driver_enumerate_memory_regions(const nlohmann::json& params);
+    tool_result_t driver_read_peb(const nlohmann::json& params);
+    tool_result_t driver_spoof_debug_flags(const nlohmann::json& params);
+    tool_result_t driver_set_hw_breakpoint(const nlohmann::json& params);
+    tool_result_t driver_clear_hw_breakpoint(const nlohmann::json& params);
+    tool_result_t driver_resolve_export(const nlohmann::json& params);
+    tool_result_t driver_virtual_to_physical(const nlohmann::json& params);
+
     void register_tools();
 }
 

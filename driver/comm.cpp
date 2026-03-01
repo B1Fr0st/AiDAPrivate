@@ -1207,3 +1207,295 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
 
     return result != FALSE;
 }
+
+//=============================================================================
+// Debugger Capability Methods
+//=============================================================================
+
+bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ctx) noexcept {
+    if (!is_connected() || process_id_ == 0 || tid == 0) return false;
+
+    voyager::detail::thread_ctx_request req{};
+    req.pid = process_id_;
+    req.tid = tid;
+    req.should_set = 0;
+    req.register_mask = 0;
+
+    if (!send_request(ioctl_codes::TCTX(), &req, sizeof(req))) return false;
+
+    ctx.rax = req.rax; ctx.rbx = req.rbx; ctx.rcx = req.rcx; ctx.rdx = req.rdx;
+    ctx.rsi = req.rsi; ctx.rdi = req.rdi; ctx.rbp = req.rbp; ctx.rsp = req.rsp;
+    ctx.r8 = req.r8;   ctx.r9 = req.r9;   ctx.r10 = req.r10; ctx.r11 = req.r11;
+    ctx.r12 = req.r12; ctx.r13 = req.r13; ctx.r14 = req.r14; ctx.r15 = req.r15;
+    ctx.rip = req.rip; ctx.rflags = req.rflags;
+    ctx.cs = req.cs;   ctx.ss = req.ss;
+    ctx.dr0 = req.dr0; ctx.dr1 = req.dr1; ctx.dr2 = req.dr2; ctx.dr3 = req.dr3;
+    ctx.dr6 = req.dr6; ctx.dr7 = req.dr7;
+
+    return true;
+}
+
+bool voyager::device_t::set_thread_context(std::uint32_t tid, const thread_context& ctx, std::uint64_t register_mask) noexcept {
+    if (!is_connected() || process_id_ == 0 || tid == 0) return false;
+
+    voyager::detail::thread_ctx_request req{};
+    req.pid = process_id_;
+    req.tid = tid;
+    req.should_set = 1;
+    req.register_mask = register_mask;
+
+    req.rax = ctx.rax; req.rbx = ctx.rbx; req.rcx = ctx.rcx; req.rdx = ctx.rdx;
+    req.rsi = ctx.rsi; req.rdi = ctx.rdi; req.rbp = ctx.rbp; req.rsp = ctx.rsp;
+    req.r8 = ctx.r8;   req.r9 = ctx.r9;   req.r10 = ctx.r10; req.r11 = ctx.r11;
+    req.r12 = ctx.r12; req.r13 = ctx.r13; req.r14 = ctx.r14; req.r15 = ctx.r15;
+    req.rip = ctx.rip; req.rflags = ctx.rflags;
+    req.cs = ctx.cs;   req.ss = ctx.ss;
+    req.dr0 = ctx.dr0; req.dr1 = ctx.dr1; req.dr2 = ctx.dr2; req.dr3 = ctx.dr3;
+    req.dr6 = ctx.dr6; req.dr7 = ctx.dr7;
+
+    return send_request(ioctl_codes::TCTX(), &req, sizeof(req));
+}
+
+std::vector<voyager::device_t::thread_info> voyager::device_t::enumerate_threads() noexcept {
+    std::vector<thread_info> result;
+    if (!is_connected() || process_id_ == 0) return result;
+
+    auto* req = new (std::nothrow) voyager::detail::thread_enum_request{};
+    if (!req) return result;
+
+    req->pid = process_id_;
+    req->thread_count = 0;
+
+    if (send_request(ioctl_codes::TENUM(), req, sizeof(*req))) {
+        result.reserve(req->thread_count);
+        for (std::uint32_t i = 0; i < req->thread_count && i < voyager::detail::MAX_ENUM_THREADS; i++) {
+            thread_info ti;
+            ti.tid = req->entries[i].tid;
+            ti.state = req->entries[i].state;
+            ti.rip = req->entries[i].rip;
+            result.push_back(ti);
+        }
+    }
+
+    delete req;
+    return result;
+}
+
+bool voyager::device_t::suspend_thread(std::uint32_t tid, std::uint32_t* prev_count) noexcept {
+    if (!is_connected() || tid == 0) return false;
+
+    voyager::detail::suspend_resume_request req{};
+    req.tid = tid;
+    req.should_resume = 0;
+
+    bool ok = send_request(ioctl_codes::TSR(), &req, sizeof(req));
+    if (ok && prev_count) *prev_count = req.previous_count;
+    return ok;
+}
+
+bool voyager::device_t::resume_thread(std::uint32_t tid, std::uint32_t* prev_count) noexcept {
+    if (!is_connected() || tid == 0) return false;
+
+    voyager::detail::suspend_resume_request req{};
+    req.tid = tid;
+    req.should_resume = 1;
+
+    bool ok = send_request(ioctl_codes::TSR(), &req, sizeof(req));
+    if (ok && prev_count) *prev_count = req.previous_count;
+    return ok;
+}
+
+bool voyager::device_t::query_memory(std::uint64_t address, memory_region_info& info) noexcept {
+    if (!is_connected() || process_id_ == 0) return false;
+
+    voyager::detail::query_memory_request req{};
+    req.pid = process_id_;
+    req.address = address;
+
+    if (!send_request(ioctl_codes::QM(), &req, sizeof(req))) return false;
+
+    info.base = req.region_base;
+    info.size = req.region_size;
+    info.state = req.state;
+    info.protect = req.protect;
+    info.type = req.type;
+    info.allocation_protect = req.allocation_protect;
+    info.allocation_base = req.allocation_base;
+
+    return true;
+}
+
+bool voyager::device_t::protect_memory(std::uint64_t address, std::uint64_t size, std::uint32_t new_protect, std::uint32_t* old_protect) noexcept {
+    if (!is_connected() || process_id_ == 0 || size == 0) return false;
+
+    voyager::detail::protect_memory_request req{};
+    req.pid = process_id_;
+    req.address = address;
+    req.size = size;
+    req.new_protect = new_protect;
+
+    bool ok = send_request(ioctl_codes::PM(), &req, sizeof(req));
+    if (ok && old_protect) *old_protect = req.old_protect;
+    return ok;
+}
+
+std::vector<voyager::detail::region_entry> voyager::device_t::enumerate_memory_regions(std::uint64_t start, std::uint64_t end_addr, bool include_all) noexcept {
+    std::vector<voyager::detail::region_entry> result;
+    if (!is_connected() || process_id_ == 0) return result;
+
+    auto* req = new (std::nothrow) voyager::detail::enum_regions_request{};
+    if (!req) return result;
+
+    req->pid = process_id_;
+    req->include_all = include_all ? 1 : 0;
+    req->start_address = start;
+    req->max_address = end_addr;
+    req->region_count = 0;
+
+    if (send_request(ioctl_codes::ER(), req, sizeof(*req))) {
+        result.reserve(req->region_count);
+        for (std::uint32_t i = 0; i < req->region_count && i < voyager::detail::MAX_ENUM_REGIONS; i++) {
+            result.push_back(req->entries[i]);
+        }
+    }
+
+    delete req;
+    return result;
+}
+
+bool voyager::device_t::read_peb(peb_info& info) noexcept {
+    if (!is_connected() || process_id_ == 0) return false;
+
+    voyager::detail::read_peb_request req{};
+    req.pid = process_id_;
+
+    if (!send_request(ioctl_codes::RPEB(), &req, sizeof(req))) return false;
+
+    info.peb_address = req.peb_address;
+    info.image_base = req.image_base;
+    info.being_debugged = req.being_debugged;
+    info.nt_global_flag = req.nt_global_flag;
+    info.ldr_address = req.ldr_address;
+    info.process_heap = req.process_heap;
+    info.number_of_heaps = req.number_of_heaps;
+    info.max_heaps = req.max_heaps;
+    info.process_heaps = req.process_heaps;
+
+    return true;
+}
+
+bool voyager::device_t::spoof_debug_flags(std::uint32_t* result_flags) noexcept {
+    if (!is_connected() || process_id_ == 0) return false;
+
+    voyager::detail::spoof_debug_request req{};
+    req.pid = process_id_;
+
+    bool ok = send_request(ioctl_codes::SDF(), &req, sizeof(req));
+    if (ok && result_flags) *result_flags = req.result_flags;
+    return ok;
+}
+
+std::uint64_t voyager::device_t::resolve_export(std::uint64_t module_base, const char* export_name) noexcept {
+    if (!is_connected() || dtb_ == 0 || module_base == 0 || !export_name) return 0;
+
+    voyager::detail::module_export_request req{};
+    req.dtb = dtb_;
+    req.module_base = module_base;
+    std::memset(req.export_name, 0, sizeof(req.export_name));
+    for (int i = 0; i < 127 && export_name[i]; i++) {
+        req.export_name[i] = export_name[i];
+    }
+
+    if (!send_request(ioctl_codes::MEX(), &req, sizeof(req))) return 0;
+    return req.resolved_address;
+}
+
+std::uint64_t voyager::device_t::virtual_to_physical(std::uint64_t virtual_address) noexcept {
+    if (!is_connected() || dtb_ == 0 || virtual_address == 0) return 0;
+
+    voyager::detail::virt_to_phys_request req{};
+    req.dtb = dtb_;
+    req.virtual_address = virtual_address;
+
+    if (!send_request(ioctl_codes::V2P(), &req, sizeof(req))) return 0;
+    return req.physical_address;
+}
+
+bool voyager::device_t::set_hardware_breakpoint(std::uint32_t tid, int index, std::uint64_t address, int type, int size) noexcept {
+    if (!is_connected() || process_id_ == 0 || tid == 0 || index < 0 || index > 3) return false;
+
+    // Get current thread context to read existing DR values
+    thread_context ctx{};
+    if (!get_thread_context(tid, ctx)) return false;
+
+    // Set the address in the appropriate DR register
+    switch (index) {
+        case 0: ctx.dr0 = address; break;
+        case 1: ctx.dr1 = address; break;
+        case 2: ctx.dr2 = address; break;
+        case 3: ctx.dr3 = address; break;
+    }
+
+    // Clear DR6 status bits
+    ctx.dr6 = 0;
+
+    // Configure DR7:
+    // Bits 0,2,4,6: Local enable for DR0-DR3
+    // Bits 16-17: R/W for DR0 (00=exec, 01=write, 11=rw)
+    // Bits 18-19: LEN for DR0 (00=1, 01=2, 11=4)
+    // DR1 at 20-23, DR2 at 24-27, DR3 at 28-31
+    std::uint64_t dr7 = ctx.dr7;
+
+    // Clear existing bits for this breakpoint
+    int rw_shift = 16 + index * 4;
+    int len_shift = 18 + index * 4;
+    dr7 &= ~(1ULL << (index * 2));     // clear local enable
+    dr7 &= ~(3ULL << rw_shift);         // clear R/W
+    dr7 &= ~(3ULL << len_shift);        // clear LEN
+
+    // Set local enable
+    dr7 |= (1ULL << (index * 2));
+
+    // Set R/W: 0=exec, 1=write, 3=read/write
+    std::uint64_t rw_val = static_cast<std::uint64_t>(type) & 3;
+    dr7 |= (rw_val << rw_shift);
+
+    // Set LEN: 0=1byte, 1=2byte, 3=4byte, 2=8byte
+    std::uint64_t len_val = static_cast<std::uint64_t>(size) & 3;
+    dr7 |= (len_val << len_shift);
+
+    ctx.dr7 = dr7;
+
+    // Build register mask for DR registers only
+    // Bits 18-23 = dr0-dr3, dr6, dr7
+    std::uint64_t mask = (1ULL << 22) | (1ULL << 23); // dr6 + dr7
+    mask |= (1ULL << (18 + index)); // The specific DR register we set
+
+    return set_thread_context(tid, ctx, mask);
+}
+
+bool voyager::device_t::clear_hardware_breakpoint(std::uint32_t tid, int index) noexcept {
+    if (!is_connected() || process_id_ == 0 || tid == 0 || index < 0 || index > 3) return false;
+
+    thread_context ctx{};
+    if (!get_thread_context(tid, ctx)) return false;
+
+    // Clear address register
+    switch (index) {
+        case 0: ctx.dr0 = 0; break;
+        case 1: ctx.dr1 = 0; break;
+        case 2: ctx.dr2 = 0; break;
+        case 3: ctx.dr3 = 0; break;
+    }
+
+    // Clear local enable and condition bits in DR7
+    std::uint64_t dr7 = ctx.dr7;
+    dr7 &= ~(1ULL << (index * 2));         // clear local enable
+    dr7 &= ~(3ULL << (16 + index * 4));     // clear R/W
+    dr7 &= ~(3ULL << (18 + index * 4));     // clear LEN
+    ctx.dr7 = dr7;
+
+    std::uint64_t mask = (1ULL << (18 + index)) | (1ULL << 23); // DRx + DR7
+
+    return set_thread_context(tid, ctx, mask);
+}

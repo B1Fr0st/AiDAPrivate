@@ -7,6 +7,7 @@
 #include <memory>
 #include <type_traits>
 #include <string>
+#include <vector>
 #include <intrin.h>
 
 namespace dynamic_key {
@@ -73,6 +74,18 @@ namespace ioctl_codes {
     __forceinline DWORD AM()   { return make(6); }
     __forceinline DWORD FM()   { return make(7); }
     __forceinline DWORD HB()   { return make(8); }
+
+    // Debugger capability IOCTL codes
+    __forceinline DWORD TCTX()  { return make(9); }   // Thread context get/set
+    __forceinline DWORD TENUM() { return make(10); }   // Thread enumerate
+    __forceinline DWORD TSR()   { return make(11); }   // Thread suspend/resume
+    __forceinline DWORD QM()    { return make(12); }   // Query memory
+    __forceinline DWORD PM()    { return make(13); }   // Protect memory
+    __forceinline DWORD ER()    { return make(14); }   // Enumerate regions
+    __forceinline DWORD RPEB()  { return make(15); }   // Read PEB
+    __forceinline DWORD SDF()   { return make(16); }   // Spoof debug flags
+    __forceinline DWORD MEX()   { return make(17); }   // Module export
+    __forceinline DWORD V2P()   { return make(18); }   // Virtual to physical
 }
 
 namespace voyager {
@@ -181,6 +194,132 @@ namespace voyager {
         constexpr std::size_t CTX_RBX_BACKUP = 0x48;
         constexpr std::size_t CTX_EXEC_DONE = 0x50;
         constexpr std::size_t CTX_TRAMPOLINE = 0x58;
+
+        //=== Debugger capability request structures ===
+
+        struct thread_ctx_request {
+            std::uint32_t pid;
+            std::uint32_t tid;
+            std::uint32_t should_set;
+            std::uint32_t padding;
+            std::uint64_t register_mask;
+            std::uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp;
+            std::uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+            std::uint64_t rip, rflags;
+            std::uint64_t cs, ss;
+            std::uint64_t dr0, dr1, dr2, dr3, dr6, dr7;
+        };
+        static_assert(sizeof(thread_ctx_request) == 232, "thread_ctx_request size mismatch with kernel driver");
+
+        static constexpr std::size_t MAX_ENUM_THREADS = 256;
+
+        struct thread_entry {
+            std::uint32_t tid;
+            std::uint32_t state;
+            std::uint64_t rip;
+        };
+        static_assert(sizeof(thread_entry) == 16, "thread_entry size mismatch");
+
+        struct thread_enum_request {
+            std::uint32_t pid;
+            std::uint32_t thread_count;
+            thread_entry entries[MAX_ENUM_THREADS];
+        };
+        static_assert(sizeof(thread_enum_request) == 8 + sizeof(thread_entry) * MAX_ENUM_THREADS, "thread_enum_request size mismatch");
+
+        struct suspend_resume_request {
+            std::uint32_t tid;
+            std::uint32_t should_resume;
+            std::uint32_t previous_count;
+            std::uint32_t padding;
+        };
+        static_assert(sizeof(suspend_resume_request) == 16, "suspend_resume_request size mismatch");
+
+        struct query_memory_request {
+            std::uint32_t pid;
+            std::uint32_t padding;
+            std::uint64_t address;
+            std::uint64_t region_base;
+            std::uint64_t region_size;
+            std::uint32_t state;
+            std::uint32_t protect;
+            std::uint32_t type;
+            std::uint32_t allocation_protect;
+            std::uint64_t allocation_base;
+        };
+        static_assert(sizeof(query_memory_request) == 56, "query_memory_request size mismatch");
+
+        struct protect_memory_request {
+            std::uint32_t pid;
+            std::uint32_t new_protect;
+            std::uint64_t address;
+            std::uint64_t size;
+            std::uint32_t old_protect;
+            std::uint32_t padding;
+        };
+        static_assert(sizeof(protect_memory_request) == 32, "protect_memory_request size mismatch");
+
+        static constexpr std::size_t MAX_ENUM_REGIONS = 4096;
+
+        struct region_entry {
+            std::uint64_t base;
+            std::uint64_t size;
+            std::uint32_t state;
+            std::uint32_t protect;
+            std::uint32_t type;
+            std::uint32_t padding;
+        };
+        static_assert(sizeof(region_entry) == 32, "region_entry size mismatch");
+
+        struct enum_regions_request {
+            std::uint32_t pid;
+            std::uint32_t include_all;
+            std::uint64_t start_address;
+            std::uint64_t max_address;
+            std::uint32_t region_count;
+            std::uint32_t padding;
+            region_entry entries[MAX_ENUM_REGIONS];
+        };
+        static_assert(sizeof(enum_regions_request) == 32 + sizeof(region_entry) * MAX_ENUM_REGIONS, "enum_regions_request size mismatch");
+
+        struct read_peb_request {
+            std::uint32_t pid;
+            std::uint32_t padding;
+            std::uint64_t peb_address;
+            std::uint64_t image_base;
+            std::uint8_t  being_debugged;
+            std::uint8_t  pad1[3];
+            std::uint32_t nt_global_flag;
+            std::uint64_t ldr_address;
+            std::uint64_t process_heap;
+            std::uint32_t number_of_heaps;
+            std::uint32_t max_heaps;
+            std::uint64_t process_heaps;
+        };
+        static_assert(sizeof(read_peb_request) == 64, "read_peb_request size mismatch");
+
+        struct spoof_debug_request {
+            std::uint32_t pid;
+            std::uint32_t result_flags;
+        };
+        static_assert(sizeof(spoof_debug_request) == 8, "spoof_debug_request size mismatch");
+
+        struct module_export_request {
+            std::uint64_t dtb;
+            std::uint64_t module_base;
+            char export_name[128];
+            std::uint64_t resolved_address;
+            std::uint32_t ordinal;
+            std::uint32_t padding;
+        };
+        static_assert(sizeof(module_export_request) == 160, "module_export_request size mismatch");
+
+        struct virt_to_phys_request {
+            std::uint64_t dtb;
+            std::uint64_t virtual_address;
+            std::uint64_t physical_address;
+        };
+        static_assert(sizeof(virt_to_phys_request) == 24, "virt_to_phys_request size mismatch");
     }
 
     namespace device_names_um {
@@ -309,6 +448,58 @@ namespace voyager {
         }
         
         std::uint64_t find_gadget(const char* pattern, std::size_t pattern_size) noexcept;
+
+        // Debugger capability methods
+        struct thread_context {
+            std::uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp;
+            std::uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+            std::uint64_t rip, rflags;
+            std::uint64_t cs, ss;
+            std::uint64_t dr0, dr1, dr2, dr3, dr6, dr7;
+        };
+
+        struct thread_info {
+            std::uint32_t tid;
+            std::uint32_t state;
+            std::uint64_t rip;
+        };
+
+        struct memory_region_info {
+            std::uint64_t base;
+            std::uint64_t size;
+            std::uint32_t state;
+            std::uint32_t protect;
+            std::uint32_t type;
+            std::uint32_t allocation_protect;
+            std::uint64_t allocation_base;
+        };
+
+        struct peb_info {
+            std::uint64_t peb_address;
+            std::uint64_t image_base;
+            std::uint8_t  being_debugged;
+            std::uint32_t nt_global_flag;
+            std::uint64_t ldr_address;
+            std::uint64_t process_heap;
+            std::uint32_t number_of_heaps;
+            std::uint32_t max_heaps;
+            std::uint64_t process_heaps;
+        };
+
+        bool get_thread_context(std::uint32_t tid, thread_context& ctx) noexcept;
+        bool set_thread_context(std::uint32_t tid, const thread_context& ctx, std::uint64_t register_mask) noexcept;
+        std::vector<thread_info> enumerate_threads() noexcept;
+        bool suspend_thread(std::uint32_t tid, std::uint32_t* prev_count = nullptr) noexcept;
+        bool resume_thread(std::uint32_t tid, std::uint32_t* prev_count = nullptr) noexcept;
+        bool query_memory(std::uint64_t address, memory_region_info& info) noexcept;
+        bool protect_memory(std::uint64_t address, std::uint64_t size, std::uint32_t new_protect, std::uint32_t* old_protect = nullptr) noexcept;
+        std::vector<detail::region_entry> enumerate_memory_regions(std::uint64_t start = 0, std::uint64_t end_addr = 0, bool include_all = false) noexcept;
+        bool read_peb(peb_info& info) noexcept;
+        bool spoof_debug_flags(std::uint32_t* result_flags = nullptr) noexcept;
+        std::uint64_t resolve_export(std::uint64_t module_base, const char* export_name) noexcept;
+        std::uint64_t virtual_to_physical(std::uint64_t virtual_address) noexcept;
+        bool set_hardware_breakpoint(std::uint32_t tid, int index, std::uint64_t address, int type = 0, int size = 0) noexcept;
+        bool clear_hardware_breakpoint(std::uint32_t tid, int index) noexcept;
 
         [[nodiscard]] std::uint32_t get_process_id() const noexcept { return process_id_; }
         [[nodiscard]] std::uint64_t get_base_address() const noexcept { return base_address_; }

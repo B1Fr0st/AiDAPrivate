@@ -194,6 +194,18 @@ inline VOID               (NTAPI* _KeUnstackDetachProcess)         (PKAPC_STATE)
 inline NTSTATUS           (NTAPI* _ZwAllocateVirtualMemory)        (HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
 inline NTSTATUS           (NTAPI* _ZwFreeVirtualMemory)            (HANDLE, PVOID*, PSIZE_T, ULONG);
 inline VOID               (NTAPI* _IoDeleteDevice)                 (PDEVICE_OBJECT);
+
+// New APIs for debugger capabilities
+inline NTSTATUS           (NTAPI* _PsLookupThreadByThreadId)       (HANDLE, PETHREAD*);
+inline PETHREAD           (NTAPI* _PsGetNextProcessThread)         (PEPROCESS, PETHREAD);
+inline HANDLE             (NTAPI* _PsGetThreadId)                  (PETHREAD);
+inline NTSTATUS           (NTAPI* _PsGetContextThread)             (PETHREAD, PCONTEXT, KPROCESSOR_MODE);
+inline NTSTATUS           (NTAPI* _PsSetContextThread)             (PETHREAD, PCONTEXT, KPROCESSOR_MODE);
+inline NTSTATUS           (NTAPI* _PsSuspendThread)                (PETHREAD, PULONG);
+inline NTSTATUS           (NTAPI* _PsResumeThread)                 (PETHREAD, PULONG);
+inline PVOID              (NTAPI* _PsGetProcessPeb)                (PEPROCESS);
+inline NTSTATUS           (NTAPI* _ZwQueryVirtualMemory)           (HANDLE, PVOID, MEMORY_INFORMATION_CLASS, PVOID, SIZE_T, PSIZE_T);
+inline NTSTATUS           (NTAPI* _ZwProtectVirtualMemory)         (HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
 inline bool SetupFunctions() {
     PVOID kernelBase = (PVOID)get_nt_base();
     
@@ -239,6 +251,18 @@ inline bool SetupFunctions() {
     *(PVOID*)&_ZwFreeVirtualMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwFreeVirtualMemory"));
     *(PVOID*)&_IoDeleteDevice = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoDeleteDevice"));
 
+    // New API resolutions for debugger capabilities
+    *(PVOID*)&_PsLookupThreadByThreadId = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsLookupThreadByThreadId"));
+    *(PVOID*)&_PsGetNextProcessThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetNextProcessThread"));
+    *(PVOID*)&_PsGetThreadId = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetThreadId"));
+    *(PVOID*)&_PsGetContextThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetContextThread"));
+    *(PVOID*)&_PsSetContextThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetContextThread"));
+    *(PVOID*)&_PsSuspendThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSuspendThread"));
+    *(PVOID*)&_PsResumeThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsResumeThread"));
+    *(PVOID*)&_PsGetProcessPeb = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetProcessPeb"));
+    *(PVOID*)&_ZwQueryVirtualMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwQueryVirtualMemory"));
+    *(PVOID*)&_ZwProtectVirtualMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwProtectVirtualMemory"));
+
     if (!_RtlInitUnicodeString || !_IoCreateDevice ||
         !_IoCreateSymbolicLink || !_IofCompleteRequest || !_MmCopyMemory ||
         !_PsLookupProcessByProcessId || !_PsGetProcessSectionBaseAddress ||
@@ -251,7 +275,11 @@ inline bool SetupFunctions() {
         !_PsCreateSystemThread || !_KeDelayExecutionThread || !_PsTerminateSystemThread ||
         !_KeStackAttachProcess || !_KeUnstackDetachProcess ||
         !_ZwAllocateVirtualMemory || !_ZwFreeVirtualMemory ||
-        !_IoDeleteDevice) {
+        !_IoDeleteDevice ||
+        !_PsLookupThreadByThreadId || !_PsGetNextProcessThread ||
+        !_PsGetThreadId || !_PsGetContextThread || !_PsSetContextThread ||
+        !_PsSuspendThread || !_PsResumeThread || !_PsGetProcessPeb ||
+        !_ZwQueryVirtualMemory || !_ZwProtectVirtualMemory) {
         return false;
     }
 
