@@ -95,7 +95,7 @@ namespace function_tools
     tool_result_t build_call_graph(const nlohmann::json& params);
     tool_result_t export_function(const nlohmann::json& params);
     tool_result_t get_basic_blocks(const nlohmann::json& params);
-    
+
     void register_tools();
 }
 
@@ -112,7 +112,7 @@ namespace memory_tools
     tool_result_t undefine(const nlohmann::json& params);
     tool_result_t list_globals(const nlohmann::json& params);
     tool_result_t convert_number(const nlohmann::json& params);
-    
+
     void register_tools();
 }
 
@@ -125,7 +125,7 @@ namespace comment_tools
     tool_result_t set_extra_comment(const nlohmann::json& params);
     tool_result_t rename_variable(const nlohmann::json& params);
     tool_result_t rename_address(const nlohmann::json& params);
-    
+
     void register_tools();
 }
 
@@ -145,7 +145,7 @@ namespace type_tools
     tool_result_t list_types(const nlohmann::json& params);
     tool_result_t get_enum(const nlohmann::json& params);
     tool_result_t create_enum(const nlohmann::json& params);
-    
+
     void register_tools();
 }
 
@@ -305,7 +305,7 @@ namespace driver_tools
     tool_result_t driver_free_memory(const nlohmann::json& params);
     tool_result_t driver_call_function(const nlohmann::json& params);
 
-    // Debugger capability tools
+
     tool_result_t driver_get_thread_context(const nlohmann::json& params);
     tool_result_t driver_set_thread_context(const nlohmann::json& params);
     tool_result_t driver_enumerate_threads(const nlohmann::json& params);

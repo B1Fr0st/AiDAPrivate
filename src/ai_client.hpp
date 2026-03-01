@@ -20,6 +20,7 @@ public:
     using callback_t = std::function<void(const std::string&)>;
     using addr_callback_t = std::function<void(ea_t)>;
     using stream_callback_t = std::function<void(const std::string& chunk)>;
+    using stop_predicate_t = std::function<bool(const std::string& accumulated_text)>;
 
     virtual ~AIClientBase() = default;
 
@@ -67,7 +68,7 @@ public:
     void set_max_output_tokens(int tokens);
 
     std::string blocking_generate(const std::string& prompt_text, double temperature);
-    std::string streaming_blocking_generate(const std::string& prompt_text, double temperature, stream_callback_t on_chunk);
+    std::string streaming_blocking_generate(const std::string& prompt_text, double temperature, stream_callback_t on_chunk, stop_predicate_t stop_check = nullptr);
 
     std::atomic<bool> _task_done{true};
     std::atomic<bool> _is_request_active{false};
@@ -90,7 +91,7 @@ protected:
 
     void _generate(const std::string& prompt_text, callback_t callback, double temperature, const qstring& request_type);
     std::string _blocking_generate(const std::string& prompt_text, double temperature);
-    std::string _streaming_blocking_generate(const std::string& prompt_text, double temperature, stream_callback_t on_chunk);
+    std::string _streaming_blocking_generate(const std::string& prompt_text, double temperature, stream_callback_t on_chunk, stop_predicate_t stop_check = nullptr);
     std::string _http_post_request(
         const std::string& host,
         const std::string& path,
@@ -106,7 +107,8 @@ protected:
         const std::string& path,
         const httplib::Headers& headers,
         const std::string& body,
-        stream_callback_t on_chunk);
+        stream_callback_t on_chunk,
+        stop_predicate_t stop_check = nullptr);
 protected:
     virtual std::string _get_api_host() const = 0;
     virtual std::string _get_api_path(const std::string& model_name) const = 0;
@@ -120,7 +122,7 @@ protected:
 
 private:
     std::shared_ptr<void> _validity_token;
-    
+
     struct ai_request_t;
 };
 

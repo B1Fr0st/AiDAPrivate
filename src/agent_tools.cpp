@@ -83,17 +83,17 @@ std::vector<const tool_definition_t*> ToolRegistry::get_all_tools() const
 json ToolRegistry::generate_tools_schema() const
 {
     json tools_array = json::array();
-    
+
     for (const auto& [_, tool] : _tools)
     {
         json tool_json;
         tool_json["name"] = tool.name;
         tool_json["category"] = tool.category;
         tool_json["description"] = tool.description;
-        
+
         json params = json::object();
         json required_params = json::array();
-        
+
         for (const auto& param : tool.parameters)
         {
             json param_json;
@@ -106,31 +106,31 @@ json ToolRegistry::generate_tools_schema() const
             else if (param.type == "array")
                 param_json["items"] = json::object({{"type", "object"}});
             params[param.name] = param_json;
-            
+
             if (param.required)
                 required_params.push_back(param.name);
         }
-        
+
         tool_json["parameters"] = {
             {"type", "object"},
             {"properties", params},
             {"required", required_params}
         };
-        
+
         tools_array.push_back(tool_json);
     }
-    
+
     return tools_array;
 }
 
 std::string ToolRegistry::generate_tools_description() const
 {
     std::ostringstream ss;
-    
+
     std::map<std::string, std::vector<const tool_definition_t*>> by_category;
     for (const auto& [_, tool] : _tools)
         by_category[tool.category].push_back(&tool);
-    
+
     for (const auto& [category, tools] : by_category)
     {
         ss << "\n## " << category << " Tools\n\n";
@@ -148,7 +148,7 @@ std::string ToolRegistry::generate_tools_description() const
             ss << "\n";
         }
     }
-    
+
     return ss.str();
 }
 
@@ -157,7 +157,7 @@ tool_result_t ToolRegistry::execute_tool(const std::string& name, const json& pa
     const auto* tool = get_tool(name);
     if (!tool)
         return tool_result_t::error(OBFSTR("Unknown tool: ") + name);
-    
+
     json sanitized_params = params.is_object() ? params : json::object();
 
     for (const auto& param : tool->parameters)
@@ -193,7 +193,7 @@ tool_result_t ToolRegistry::execute_tool(const std::string& name, const json& pa
             }
         }
     }
-    
+
     try
     {
         return tool->handler(sanitized_params);
@@ -213,31 +213,19 @@ static std::string get_downloads_folder()
     return "C:\\Users\\Public\\Downloads\\";
 }
 
-// Recursively create all directories in the path leading to `file_path`.
-// Uses only Win32 API (CreateDirectoryA) - no <shlobj.h> dependency.
+
 static void ensure_parent_dir_exists(const std::string& file_path)
 {
     std::string::size_type pos = 0;
     while ((pos = file_path.find_first_of("\\/", pos + 1)) != std::string::npos)
     {
         std::string dir = file_path.substr(0, pos);
-        if (dir.size() == 2 && dir[1] == ':') { pos++; continue; } // skip "C:"
+        if (dir.size() == 2 && dir[1] == ':') { pos++; continue; }
         CreateDirectoryA(dir.c_str(), nullptr);
     }
 }
 
-/// Non-blocking replacement for auto_wait().
-/// Uses auto_make_step() to process analysis items one at a time, periodically
-/// calling user_cancelled() and replace_wait_box() to pump the UI message queue.
-///
-/// IDA SDK auto.hpp (line ~249):
-///   auto_make_step(ea1, ea2): "Analyze one address in the specified range
-///     and return true. \return if processed anything."
-///   auto_is_ok(): "Are all queues empty?" (line ~261)
-/// IDA SDK kernwin.hpp (line ~6993):
-///   HIDECANCEL: "user_cancelled() will always return false
-///     (but can be called to refresh UI)"
-///
+
 static bool responsive_auto_wait(ea_t ea1, ea_t ea2, const char* step_label = nullptr)
 {
     int step_count = 0;
@@ -250,13 +238,13 @@ static bool responsive_auto_wait(ea_t ea1, ea_t ea2, const char* step_label = nu
         bool did_work = auto_make_step(ea1, ea2);
         if (!did_work)
         {
-            // Items may exist in queues outside our range, try globally
+
             did_work = auto_make_step(0, BADADDR);
             if (!did_work)
             {
                 if (++idle_spins > MAX_IDLE_SPINS)
                     break;
-                // Pump UI even when idle to prevent "(Not Responding)"
+
                 user_cancelled();
                 continue;
             }
@@ -265,7 +253,7 @@ static bool responsive_auto_wait(ea_t ea1, ea_t ea2, const char* step_label = nu
 
         if (++step_count % UI_PUMP_INTERVAL == 0)
         {
-            // Pump UI to avoid Windows marking IDA as "(Not Responding)"
+
             if (step_label)
                 replace_wait_box("HIDECANCEL\nAiDA: %s (%dk steps...)",
                                  step_label, step_count / 1000);
@@ -276,28 +264,16 @@ static bool responsive_auto_wait(ea_t ea1, ea_t ea2, const char* step_label = nu
     return true;
 }
 
-/// Non-blocking replacement for plan_and_wait().
-/// Replicates the behaviour documented in IDA SDK auto.hpp (line ~228):
-///   "Analyze the specified range. Try to create instructions where possible.
-///    Make the final pass over the specified range if specified.
-///    This function doesn't return until the range is analyzed."
-///
-/// We break this into:
-///   1. plan_range()             — marks range as AU_USED  (auto.hpp line ~163)
-///   2. auto_mark_range(AU_CODE) — marks for instruction creation (AU_CODE=20, line ~39)
-///   3. responsive_auto_wait()   — drains queues while pumping UI
-///   4. if final_pass: auto_mark_range(AU_FINAL) — final pass queue (AU_FINAL=200, line ~52)
-///   5. responsive_auto_wait()   — drains final-pass queue while pumping UI
-///
+
 static int responsive_plan_and_wait(ea_t ea1, ea_t ea2, bool final_pass,
                                     const char* step_label)
 {
-    // Phase 1: queue for instruction creation + reanalysis
+
     auto_mark_range(ea1, ea2, AU_CODE);
     plan_range(ea1, ea2);
     responsive_auto_wait(ea1, ea2, step_label);
 
-    // Phase 2: final pass if requested
+
     if (final_pass)
     {
         auto_mark_range(ea1, ea2, AU_FINAL);
@@ -314,35 +290,35 @@ std::optional<ea_t> parse_address(const std::string& addr_str)
 {
     if (addr_str.empty())
         return std::nullopt;
-    
+
     try
     {
         size_t idx = 0;
         ea_t addr;
         if (addr_str.substr(0, 2) == "0x" || addr_str.substr(0, 2) == "0X")
             addr = std::stoull(addr_str, &idx, 16);
-        else if (std::all_of(addr_str.begin(), addr_str.end(), 
+        else if (std::all_of(addr_str.begin(), addr_str.end(),
                             [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; }))
             addr = std::stoull(addr_str, &idx, 16);
         else
             addr = std::stoull(addr_str, &idx, 0);
-        
+
         if (idx == addr_str.length())
             return addr;
     }
     catch (...) {}
-    
+
     ea_t ea = get_name_ea(BADADDR, addr_str.c_str());
     if (ea != BADADDR)
         return ea;
-    
+
     return std::nullopt;
 }
 
 std::vector<ea_t> parse_addresses(const json& param)
 {
     std::vector<ea_t> result;
-    
+
     if (param.is_string())
     {
         std::string s = param.get<std::string>();
@@ -378,7 +354,7 @@ std::vector<ea_t> parse_addresses(const json& param)
     {
         result.push_back(static_cast<ea_t>(param.get<uint64_t>()));
     }
-    
+
     return result;
 }
 
@@ -386,17 +362,17 @@ std::string get_pseudocode(ea_t ea)
 {
     if (!init_hexrays_plugin())
         return "// Hex-Rays decompiler not available";
-    
+
     func_t* pfn = get_func(ea);
     if (!pfn)
         return "// No function at address";
-    
+
     try
     {
         cfuncptr_t cfunc = decompile(pfn);
         if (!cfunc)
             return "// Decompilation failed";
-        
+
         qstring code;
         qstring_printer_t printer(cfunc, code, false);
         cfunc->print_func(printer);
@@ -418,10 +394,10 @@ std::string get_disassembly(ea_t start, ea_t end)
         else
             end = start + 0x100;
     }
-    
+
     text_t text;
     gen_disasm_text(text, start, end, false);
-    
+
     std::ostringstream ss;
     for (const auto& line : text)
     {
@@ -457,9 +433,9 @@ tool_result_t get_function(const json& params)
     auto addresses = helpers::parse_addresses(params["address"]);
     if (addresses.empty())
         return tool_result_t::error(OBFSTR("Invalid or no address provided"));
-    
+
     json functions = json::array();
-    
+
     for (ea_t ea : addresses)
     {
         func_t* pfn = get_func(ea);
@@ -471,10 +447,10 @@ tool_result_t get_function(const json& params)
             });
             continue;
         }
-        
+
         qstring func_name;
         get_func_name(&func_name, pfn->start_ea);
-        
+
         json func_info;
         func_info["address"] = helpers::format_address(pfn->start_ea);
         func_info["end_address"] = helpers::format_address(pfn->end_ea);
@@ -484,7 +460,7 @@ tool_result_t get_function(const json& params)
         func_info["is_library"] = (pfn->flags & FUNC_LIB) != 0;
         func_info["is_thunk"] = (pfn->flags & FUNC_THUNK) != 0;
         func_info["does_return"] = pfn->does_return();
-        
+
         tinfo_t tif;
         if (get_tinfo(&tif, pfn->start_ea))
         {
@@ -492,10 +468,10 @@ tool_result_t get_function(const json& params)
             tif.print(&proto);
             func_info["prototype"] = proto.c_str();
         }
-        
+
         functions.push_back(func_info);
     }
-    
+
     std::ostringstream ss;
     ss << "Found " << functions.size() << " function(s)";
     return tool_result_t::ok(ss.str(), functions);
@@ -506,10 +482,10 @@ tool_result_t list_functions(const json& params)
     int offset = params.value("offset", 0);
     int limit = params.value("limit", 100);
     std::string filter = params.value("filter", "");
-    
+
     size_t total = get_func_qty();
     json functions = json::array();
-    
+
     std::regex filter_regex;
     bool use_filter = !filter.empty();
     if (use_filter)
@@ -517,27 +493,27 @@ tool_result_t list_functions(const json& params)
         try { filter_regex = std::regex(filter, std::regex::icase); }
         catch (...) { return tool_result_t::error(OBFSTR("Invalid filter regex")); }
     }
-    
+
     int count = 0;
     int skipped = 0;
-    
+
     for (size_t i = 0; i < total && count < limit; i++)
     {
         func_t* pfn = getn_func(i);
         if (!pfn) continue;
-        
+
         qstring name;
         get_func_name(&name, pfn->start_ea);
-        
+
         if (use_filter && !std::regex_search(name.c_str(), filter_regex))
             continue;
-        
+
         if (skipped < offset)
         {
             skipped++;
             continue;
         }
-        
+
         functions.push_back({
             {"index", i},
             {"address", helpers::format_address(pfn->start_ea)},
@@ -546,14 +522,14 @@ tool_result_t list_functions(const json& params)
         });
         count++;
     }
-    
+
     json result;
     result["functions"] = functions;
     result["total"] = total;
     result["offset"] = offset;
     result["limit"] = limit;
     result["returned"] = count;
-    
+
     std::ostringstream ss;
     ss << "Listed " << count << " functions (total: " << total << ")";
     return tool_result_t::ok(ss.str(), result);
@@ -660,28 +636,28 @@ tool_result_t disassemble_function(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     func_t* pfn = get_func(*ea_opt);
     if (!pfn)
         return tool_result_t::error(OBFSTR("No function at address"));
-    
+
     std::string disasm = helpers::get_disassembly(pfn->start_ea, pfn->end_ea);
-    
+
     json result;
     result["address"] = helpers::format_address(pfn->start_ea);
     result["end_address"] = helpers::format_address(pfn->end_ea);
     result["disassembly"] = disasm;
-    
+
     qstring func_name;
     get_func_name(&func_name, pfn->start_ea);
     result["name"] = func_name.c_str();
     result["size"] = pfn->end_ea - pfn->start_ea;
-    
+
     result["frame_size"] = get_frame_size(pfn);
     result["local_vars_size"] = pfn->frsize;
     result["saved_regs_size"] = pfn->frregs;
     result["args_size"] = pfn->argsize;
-    
+
     return tool_result_t::ok(OBFSTR("Disassembly complete"), result);
 }
 
@@ -690,16 +666,16 @@ tool_result_t get_xrefs_to(const json& params)
     auto addresses = helpers::parse_addresses(params["address"]);
     if (addresses.empty())
         return tool_result_t::error(OBFSTR("Invalid or no address provided"));
-    
+
     int limit = params.value("limit", 100);
-    
+
     json all_xrefs = json::array();
-    
+
     for (ea_t ea : addresses)
     {
         json xrefs_for_addr = json::array();
         int count = 0;
-        
+
         xrefblk_t xb;
         for (bool ok = xb.first_to(ea, XREF_ALL); ok && count < limit; ok = xb.next_to())
         {
@@ -709,20 +685,20 @@ tool_result_t get_xrefs_to(const json& params)
             xref["is_code"] = xb.iscode;
             xref["type"] = xb.type;
             xref["is_user"] = xb.user;
-            
+
             xref["from_name"] = helpers::get_name_or_address(xb.from);
-            
+
             xrefs_for_addr.push_back(xref);
             count++;
         }
-        
+
         all_xrefs.push_back({
             {"target", helpers::format_address(ea)},
             {"xrefs", xrefs_for_addr},
             {"count", count}
         });
     }
-    
+
     return tool_result_t::ok(OBFSTR("Cross-references retrieved"), all_xrefs);
 }
 
@@ -731,16 +707,16 @@ tool_result_t get_xrefs_from(const json& params)
     auto addresses = helpers::parse_addresses(params["address"]);
     if (addresses.empty())
         return tool_result_t::error(OBFSTR("Invalid or no address provided"));
-    
+
     int limit = params.value("limit", 100);
-    
+
     json all_xrefs = json::array();
-    
+
     for (ea_t ea : addresses)
     {
         json xrefs_for_addr = json::array();
         int count = 0;
-        
+
         xrefblk_t xb;
         for (bool ok = xb.first_from(ea, XREF_ALL); ok && count < limit; ok = xb.next_from())
         {
@@ -750,20 +726,20 @@ tool_result_t get_xrefs_from(const json& params)
             xref["is_code"] = xb.iscode;
             xref["type"] = xb.type;
             xref["is_user"] = xb.user;
-            
+
             xref["to_name"] = helpers::get_name_or_address(xb.to);
-            
+
             xrefs_for_addr.push_back(xref);
             count++;
         }
-        
+
         all_xrefs.push_back({
             {"source", helpers::format_address(ea)},
             {"xrefs", xrefs_for_addr},
             {"count", count}
         });
     }
-    
+
     return tool_result_t::ok(OBFSTR("Cross-references retrieved"), all_xrefs);
 }
 
@@ -772,13 +748,13 @@ tool_result_t get_callees(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     func_t* pfn = get_func(*ea_opt);
     if (!pfn)
         return tool_result_t::error(OBFSTR("No function at address"));
-    
+
     std::set<ea_t> callees;
-    
+
     func_item_iterator_t fii;
     for (bool ok = fii.set(pfn); ok; ok = fii.next_addr())
     {
@@ -794,7 +770,7 @@ tool_result_t get_callees(const json& params)
             }
         }
     }
-    
+
     json result = json::array();
     for (ea_t callee_ea : callees)
     {
@@ -805,7 +781,7 @@ tool_result_t get_callees(const json& params)
             {"name", name.c_str()}
         });
     }
-    
+
     std::ostringstream ss;
     ss << "Found " << result.size() << " callees";
     return tool_result_t::ok(ss.str(), result);
@@ -816,13 +792,13 @@ tool_result_t get_callers(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     func_t* pfn = get_func(*ea_opt);
     if (!pfn)
         return tool_result_t::error(OBFSTR("No function at address"));
-    
+
     std::set<ea_t> callers;
-    
+
     xrefblk_t xb;
     for (bool ok = xb.first_to(pfn->start_ea, XREF_ALL); ok; ok = xb.next_to())
     {
@@ -833,7 +809,7 @@ tool_result_t get_callers(const json& params)
                 callers.insert(caller->start_ea);
         }
     }
-    
+
     json result = json::array();
     for (ea_t caller_ea : callers)
     {
@@ -844,7 +820,7 @@ tool_result_t get_callers(const json& params)
             {"name", name.c_str()}
         });
     }
-    
+
     std::ostringstream ss;
     ss << "Found " << result.size() << " callers";
     return tool_result_t::ok(ss.str(), result);
@@ -855,17 +831,17 @@ tool_result_t rename_function(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string new_name = params["new_name"].get<std::string>();
     if (new_name.empty())
         return tool_result_t::error(OBFSTR("New name cannot be empty"));
-    
+
     func_t* pfn = get_func(*ea_opt);
     if (!pfn)
         return tool_result_t::error(OBFSTR("No function at address"));
-    
+
     bool success = set_name(pfn->start_ea, new_name.c_str(), SN_FORCE | SN_NODUMMY);
-    
+
     if (success)
         return tool_result_t::ok(OBFSTR("Function renamed to: ") + new_name);
     else
@@ -877,16 +853,16 @@ tool_result_t define_function(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     ea_t end_ea = BADADDR;
     if (params.contains("end"))
     {
         auto end_opt = helpers::parse_address(params["end"].get<std::string>());
         if (end_opt) end_ea = *end_opt;
     }
-    
+
     bool success = add_func(*ea_opt, end_ea);
-    
+
     if (success)
         return tool_result_t::ok(OBFSTR("Function defined at ") + helpers::format_address(*ea_opt));
     else
@@ -898,26 +874,26 @@ tool_result_t get_stack_frame(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     func_t* pfn = get_func(*ea_opt);
     if (!pfn)
         return tool_result_t::error(OBFSTR("No function at address"));
-    
+
     tinfo_t frame_tif;
     if (!get_func_frame(&frame_tif, pfn))
         return tool_result_t::error(OBFSTR("No stack frame available"));
-    
+
     udt_type_data_t udt;
     if (!frame_tif.get_udt_details(&udt))
         return tool_result_t::error(OBFSTR("Cannot get frame details"));
-    
+
     json vars = json::array();
     for (size_t i = 0; i < udt.size(); i++)
     {
         const udm_t& member = udt[i];
         qstring type_str;
         member.type.print(&type_str);
-        
+
         vars.push_back({
             {"name", member.name.c_str()},
             {"offset", member.offset / 8},
@@ -925,13 +901,13 @@ tool_result_t get_stack_frame(const json& params)
             {"type", type_str.c_str()}
         });
     }
-    
+
     json result;
     result["function"] = helpers::format_address(pfn->start_ea);
     result["frame_size"] = get_frame_size(pfn);
     result["local_vars_size"] = pfn->frsize;
     result["variables"] = vars;
-    
+
     return tool_result_t::ok(OBFSTR("Stack frame retrieved"), result);
 }
 
@@ -940,22 +916,22 @@ tool_result_t get_function_signature(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     func_t* pfn = get_func(*ea_opt);
     if (!pfn)
         return tool_result_t::error(OBFSTR("No function at address"));
-    
+
     tinfo_t tif;
     if (!get_tinfo(&tif, pfn->start_ea))
         return tool_result_t::error(OBFSTR("No type information available"));
-    
+
     qstring proto;
     tif.print(&proto);
-    
+
     json result;
     result["address"] = helpers::format_address(pfn->start_ea);
     result["signature"] = proto.c_str();
-    
+
     func_type_data_t ftd;
     if (tif.get_func_details(&ftd))
     {
@@ -971,12 +947,12 @@ tool_result_t get_function_signature(const json& params)
             });
         }
         result["arguments"] = args;
-        
+
         qstring ret_type;
         ftd.rettype.print(&ret_type);
         result["return_type"] = ret_type.c_str();
     }
-    
+
     return tool_result_t::ok(OBFSTR("Function signature retrieved"), result);
 }
 
@@ -985,17 +961,17 @@ tool_result_t set_function_signature(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string signature = params["signature"].get<std::string>();
-    
+
     tinfo_t tif;
     qstring name;
     if (!parse_decl(&tif, &name, nullptr, signature.c_str(), PT_SIL))
         return tool_result_t::error(OBFSTR("Failed to parse signature: ") + signature);
-    
+
     if (!apply_tinfo(*ea_opt, tif, TINFO_DEFINITE))
         return tool_result_t::error(OBFSTR("Failed to apply type"));
-    
+
     return tool_result_t::ok(OBFSTR("Function signature applied"));
 }
 
@@ -1004,30 +980,30 @@ tool_result_t analyze_function(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     func_t* pfn = get_func(*ea_opt);
     if (!pfn)
         return tool_result_t::error(OBFSTR("No function at address"));
-    
+
     json result;
-    
+
     qstring func_name;
     get_func_name(&func_name, pfn->start_ea);
     result["name"] = func_name.c_str();
     result["address"] = helpers::format_address(pfn->start_ea);
     result["end_address"] = helpers::format_address(pfn->end_ea);
     result["size"] = pfn->end_ea - pfn->start_ea;
-    
+
     result["decompiled_code"] = helpers::get_pseudocode(pfn->start_ea);
-    
+
     {
         auto callers_result = get_callers({{"address", helpers::format_address(pfn->start_ea)}});
         result["callers"] = callers_result.data;
-        
+
         auto callees_result = get_callees({{"address", helpers::format_address(pfn->start_ea)}});
         result["callees"] = callees_result.data;
     }
-    
+
     {
         json strings = json::array();
         func_item_iterator_t fii;
@@ -1049,7 +1025,7 @@ tool_result_t analyze_function(const json& params)
         }
         result["strings"] = strings;
     }
-    
+
     return tool_result_t::ok(OBFSTR("Comprehensive analysis complete"), result);
 }
 
@@ -1058,29 +1034,29 @@ tool_result_t build_call_graph(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     int depth = params.value("depth", 3);
-    
+
     std::map<ea_t, json> nodes;
     std::set<std::pair<ea_t, ea_t>> edges;
-    
+
     std::function<void(ea_t, int)> traverse;
     traverse = [&](ea_t ea, int current_depth) {
         if (current_depth > depth) return;
         if (nodes.count(ea)) return;
-        
+
         func_t* pfn = get_func(ea);
         if (!pfn) return;
-        
+
         qstring name;
         get_func_name(&name, pfn->start_ea);
-        
+
         nodes[ea] = {
             {"address", helpers::format_address(ea)},
             {"name", name.c_str()},
             {"depth", current_depth}
         };
-        
+
         func_item_iterator_t fii;
         for (bool ok = fii.set(pfn); ok; ok = fii.next_addr())
         {
@@ -1099,14 +1075,14 @@ tool_result_t build_call_graph(const json& params)
             }
         }
     };
-    
+
     traverse(*ea_opt, 0);
-    
+
     json result;
     result["nodes"] = json::array();
     for (const auto& [_, node] : nodes)
         result["nodes"].push_back(node);
-    
+
     result["edges"] = json::array();
     for (const auto& [from, to] : edges)
     {
@@ -1115,7 +1091,7 @@ tool_result_t build_call_graph(const json& params)
             {"to", helpers::format_address(to)}
         });
     }
-    
+
     return tool_result_t::ok(OBFSTR("Call graph built"), result);
 }
 
@@ -1124,27 +1100,27 @@ tool_result_t get_basic_blocks(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     func_t* pfn = get_func(*ea_opt);
     if (!pfn)
         return tool_result_t::error(OBFSTR("No function at address"));
-    
+
     qflow_chart_t fc;
     fc.create("", pfn, BADADDR, BADADDR, FC_RESERVED);
-    
+
     json blocks = json::array();
     for (int i = 0; i < fc.size(); i++)
     {
         const qbasic_block_t& bb = fc.blocks[i];
-        
+
         json successors = json::array();
         for (int j = 0; j < fc.nsucc(i); j++)
             successors.push_back(fc.succ(i, j));
-        
+
         json predecessors = json::array();
         for (int j = 0; j < fc.npred(i); j++)
             predecessors.push_back(fc.pred(i, j));
-        
+
         blocks.push_back({
             {"id", i},
             {"start", helpers::format_address(bb.start_ea)},
@@ -1153,7 +1129,7 @@ tool_result_t get_basic_blocks(const json& params)
             {"predecessors", predecessors}
         });
     }
-    
+
     return tool_result_t::ok(OBFSTR("Basic blocks retrieved"), blocks);
 }
 
@@ -1162,15 +1138,15 @@ tool_result_t export_function(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string format = params.value("format", "json");
-    
+
     func_t* pfn = get_func(*ea_opt);
     if (!pfn)
         return tool_result_t::error(OBFSTR("No function at address"));
-    
+
     json result;
-    
+
     if (format == "json")
     {
         qstring name;
@@ -1196,14 +1172,14 @@ tool_result_t export_function(const json& params)
             tif.print(&proto);
         result["prototype"] = proto.c_str();
     }
-    
+
     return tool_result_t::ok(OBFSTR("Function exported"), result);
 }
 
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
-    
+
     registry.register_tool({
         OBFSTR("get_function"),
         OBFSTR("function"),
@@ -1211,7 +1187,7 @@ void register_tools()
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (0x...) or function name"), true}},
         get_function
     });
-    
+
     registry.register_tool({
         OBFSTR("list_functions"),
         OBFSTR("function"),
@@ -1223,7 +1199,7 @@ void register_tools()
         },
         list_functions
     });
-    
+
     registry.register_tool({
         OBFSTR("decompile_function"),
         OBFSTR("function"),
@@ -1231,7 +1207,7 @@ void register_tools()
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address to decompile"), true}},
         decompile_function
     });
-    
+
     registry.register_tool({
         OBFSTR("disassemble_function"),
         OBFSTR("function"),
@@ -1239,7 +1215,7 @@ void register_tools()
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
         disassemble_function
     });
-    
+
     registry.register_tool({
         OBFSTR("get_xrefs_to"),
         OBFSTR("function"),
@@ -1250,7 +1226,7 @@ void register_tools()
         },
         get_xrefs_to
     });
-    
+
     registry.register_tool({
         OBFSTR("get_xrefs_from"),
         OBFSTR("function"),
@@ -1261,7 +1237,7 @@ void register_tools()
         },
         get_xrefs_from
     });
-    
+
     registry.register_tool({
         OBFSTR("get_callees"),
         OBFSTR("function"),
@@ -1269,7 +1245,7 @@ void register_tools()
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
         get_callees
     });
-    
+
     registry.register_tool({
         OBFSTR("get_callers"),
         OBFSTR("function"),
@@ -1277,7 +1253,7 @@ void register_tools()
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
         get_callers
     });
-    
+
     registry.register_tool({
         OBFSTR("rename_function"),
         OBFSTR("function"),
@@ -1289,7 +1265,7 @@ void register_tools()
         rename_function,
         false
     });
-    
+
     registry.register_tool({
         OBFSTR("define_function"),
         OBFSTR("function"),
@@ -1301,7 +1277,7 @@ void register_tools()
         define_function,
         false
     });
-    
+
     registry.register_tool({
         OBFSTR("get_stack_frame"),
         OBFSTR("function"),
@@ -1309,7 +1285,7 @@ void register_tools()
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
         get_stack_frame
     });
-    
+
     registry.register_tool({
         OBFSTR("get_function_signature"),
         OBFSTR("function"),
@@ -1317,7 +1293,7 @@ void register_tools()
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
         get_function_signature
     });
-    
+
     registry.register_tool({
         OBFSTR("set_function_signature"),
         OBFSTR("function"),
@@ -1329,7 +1305,7 @@ void register_tools()
         set_function_signature,
         false
     });
-    
+
     registry.register_tool({
         OBFSTR("analyze_function"),
         OBFSTR("function"),
@@ -1337,7 +1313,7 @@ void register_tools()
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
         analyze_function
     });
-    
+
     registry.register_tool({
         OBFSTR("build_call_graph"),
         OBFSTR("function"),
@@ -1348,7 +1324,7 @@ void register_tools()
         },
         build_call_graph
     });
-    
+
     registry.register_tool({
         OBFSTR("get_basic_blocks"),
         OBFSTR("function"),
@@ -1356,7 +1332,7 @@ void register_tools()
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
         get_basic_blocks
     });
-    
+
     registry.register_tool({
         OBFSTR("export_function"),
         OBFSTR("function"),
@@ -1379,33 +1355,33 @@ tool_result_t read_bytes(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     size_t size = params.value("size", 16);
     if (size > 4096)
         return tool_result_t::error(OBFSTR("Size too large (max 4096)"));
-    
+
     std::vector<uint8_t> buffer(size);
     ssize_t bytes_read = get_bytes(buffer.data(), size, *ea_opt);
-    
+
     if (bytes_read < 0)
         return tool_result_t::error(OBFSTR("Failed to read bytes"));
-    
+
     std::ostringstream hex_ss;
     for (ssize_t i = 0; i < bytes_read; i++)
     {
         if (i > 0) hex_ss << " ";
         hex_ss << std::hex << std::setw(2) << std::setfill('0') << (int)buffer[i];
     }
-    
+
     json result;
     result["address"] = helpers::format_address(*ea_opt);
     result["size"] = bytes_read;
     result["hex"] = hex_ss.str();
-    
+
     result["bytes"] = json::array();
     for (ssize_t i = 0; i < bytes_read; i++)
         result["bytes"].push_back(buffer[i]);
-    
+
     return tool_result_t::ok(OBFSTR("Bytes read successfully"), result);
 }
 
@@ -1414,13 +1390,13 @@ tool_result_t read_integer(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string type = params.value("type", "u64");
-    
+
     uint64_t value = 0;
     int64_t signed_value = 0;
     bool is_signed = type[0] == 'i';
-    
+
     if (type == "i8" || type == "u8")
     {
         value = get_byte(*ea_opt);
@@ -1445,14 +1421,14 @@ tool_result_t read_integer(const json& params)
     {
         return tool_result_t::error(OBFSTR("Unknown type: ") + type);
     }
-    
+
     json result;
     result["address"] = helpers::format_address(*ea_opt);
     result["type"] = type;
     result["unsigned_value"] = value;
     result["signed_value"] = signed_value;
     result["hex"] = helpers::format_address(value);
-    
+
     return tool_result_t::ok(OBFSTR("Integer read successfully"), result);
 }
 
@@ -1461,36 +1437,36 @@ tool_result_t read_string(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     int max_len = params.value("max_length", 1024);
-    
+
     qstring str;
     if (get_strlit_contents(&str, *ea_opt, max_len, STRTYPE_C) <= 0)
         return tool_result_t::error(OBFSTR("No string at address or read failed"));
-    
+
     json result;
     result["address"] = helpers::format_address(*ea_opt);
     result["value"] = str.c_str();
     result["length"] = str.length();
-    
+
     return tool_result_t::ok(OBFSTR("String read successfully"), result);
 }
 
 tool_result_t read_global(const json& params)
 {
     std::string name_or_addr = params["name"].get<std::string>();
-    
+
     auto ea_opt = helpers::parse_address(name_or_addr);
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address or name"));
-    
+
     asize_t item_size = get_item_size(*ea_opt);
-    
+
     json result;
     result["address"] = helpers::format_address(*ea_opt);
     result["name"] = helpers::get_name_or_address(*ea_opt);
     result["size"] = item_size;
-    
+
     if (item_size <= 8)
     {
         uval_t value;
@@ -1500,7 +1476,7 @@ tool_result_t read_global(const json& params)
             result["hex"] = helpers::format_address(value);
         }
     }
-    
+
     return tool_result_t::ok(OBFSTR("Global read successfully"), result);
 }
 
@@ -1509,15 +1485,15 @@ tool_result_t patch_bytes(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string hex_bytes = params["bytes"].get<std::string>();
-    
+
     std::vector<uint8_t> bytes;
     std::istringstream iss(hex_bytes);
     std::string token;
-    
+
     hex_bytes.erase(std::remove(hex_bytes.begin(), hex_bytes.end(), ' '), hex_bytes.end());
-    
+
     for (size_t i = 0; i + 1 < hex_bytes.length(); i += 2)
     {
         std::string byte_str = hex_bytes.substr(i, 2);
@@ -1530,20 +1506,20 @@ tool_result_t patch_bytes(const json& params)
             return tool_result_t::error(OBFSTR("Invalid hex byte: ") + byte_str);
         }
     }
-    
+
     if (bytes.empty())
         return tool_result_t::error(OBFSTR("No bytes to patch"));
-    
+
     for (size_t i = 0; i < bytes.size(); i++)
     {
         if (!put_byte(*ea_opt + i, bytes[i]))
             return tool_result_t::error(OBFSTR("Failed to patch byte at offset ") + std::to_string(i));
     }
-    
+
     json result;
     result["address"] = helpers::format_address(*ea_opt);
     result["size"] = bytes.size();
-    
+
     return tool_result_t::ok(OBFSTR("Bytes patched successfully"), result);
 }
 
@@ -1552,14 +1528,14 @@ tool_result_t make_code(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     insn_t insn;
     if (decode_insn(&insn, *ea_opt) <= 0)
         return tool_result_t::error(OBFSTR("Failed to decode instruction"));
-    
+
     if (create_insn(*ea_opt) == 0)
         return tool_result_t::error(OBFSTR("Failed to create instruction"));
-    
+
     return tool_result_t::ok(OBFSTR("Code created at ") + helpers::format_address(*ea_opt));
 }
 
@@ -1568,18 +1544,18 @@ tool_result_t make_data(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string type = params.value("type", "byte");
-    
+
     bool ok = false;
     if (type == "word")       ok = create_word(*ea_opt, 2);
     else if (type == "dword") ok = create_dword(*ea_opt, 4);
     else if (type == "qword") ok = create_qword(*ea_opt, 8);
     else                       ok = create_byte(*ea_opt, 1);
-    
+
     if (!ok)
         return tool_result_t::error(OBFSTR("Failed to create data"));
-    
+
     return tool_result_t::ok(OBFSTR("Data created at ") + helpers::format_address(*ea_opt));
 }
 
@@ -1588,19 +1564,19 @@ tool_result_t undefine(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     asize_t size = params.value("size", 1);
-    
+
     if (params.contains("end"))
     {
         auto end_opt = helpers::parse_address(params["end"].get<std::string>());
         if (end_opt)
             size = *end_opt - *ea_opt;
     }
-    
+
     if (!del_items(*ea_opt, DELIT_SIMPLE, size))
         return tool_result_t::error(OBFSTR("Failed to undefine"));
-    
+
     return tool_result_t::ok(OBFSTR("Undefined ") + std::to_string(size) + " bytes");
 }
 
@@ -1609,7 +1585,7 @@ tool_result_t list_globals(const json& params)
     int offset = params.value("offset", 0);
     int limit = params.value("limit", 100);
     std::string filter = params.value("filter", "");
-    
+
     std::regex filter_regex;
     bool use_filter = !filter.empty();
     if (use_filter)
@@ -1617,30 +1593,30 @@ tool_result_t list_globals(const json& params)
         try { filter_regex = std::regex(filter, std::regex::icase); }
         catch (...) { return tool_result_t::error(OBFSTR("Invalid filter regex")); }
     }
-    
+
     json globals = json::array();
     int count = 0;
     int skipped = 0;
-    
+
     for (size_t i = 0; i < get_nlist_size() && count < limit; i++)
     {
         ea_t ea = get_nlist_ea(i);
-        
+
         if (get_func(ea))
             continue;
-        
+
         const char* nname = get_nlist_name(i);
         qstring name = nname ? nname : "";
-        
+
         if (use_filter && !std::regex_search(name.c_str(), filter_regex))
             continue;
-        
+
         if (skipped < offset)
         {
             skipped++;
             continue;
         }
-        
+
         globals.push_back({
             {"address", helpers::format_address(ea)},
             {"name", name.c_str()},
@@ -1648,30 +1624,30 @@ tool_result_t list_globals(const json& params)
         });
         count++;
     }
-    
+
     json result;
     result["globals"] = globals;
     result["returned"] = count;
-    
+
     return tool_result_t::ok(OBFSTR("Globals listed"), result);
 }
 
 tool_result_t convert_number(const json& params)
 {
     std::string value_str = params["value"].get<std::string>();
-    
+
     while (!value_str.empty() && std::isspace(static_cast<unsigned char>(value_str.front())))
         value_str.erase(value_str.begin());
     while (!value_str.empty() && std::isspace(static_cast<unsigned char>(value_str.back())))
         value_str.pop_back();
-    
+
     if (value_str.empty())
         return tool_result_t::error(OBFSTR("Empty value string"));
-    
+
     uint64_t value = 0;
     bool parsed = false;
     std::string input_base = "unknown";
-    
+
     bool is_negative = (!value_str.empty() && value_str[0] == '-');
     if (is_negative)
     {
@@ -1688,7 +1664,7 @@ tool_result_t convert_number(const json& params)
         }
         catch (...) {}
     }
-    
+
     if (!parsed)
     {
         ea_t ea_val = 0;
@@ -1696,7 +1672,7 @@ tool_result_t convert_number(const json& params)
         {
             value = static_cast<uint64_t>(ea_val);
             parsed = true;
-            
+
             if (value_str.size() > 2
                 && value_str[0] == '0'
                 && (value_str[1] == 'x' || value_str[1] == 'X'))
@@ -1713,7 +1689,7 @@ tool_result_t convert_number(const json& params)
                 input_base = "decimal";
         }
     }
-    
+
     if (!parsed)
     {
         try
@@ -1749,10 +1725,10 @@ tool_result_t convert_number(const json& params)
         }
         catch (...) {}
     }
-    
+
     if (!parsed)
         return tool_result_t::error(OBFSTR("Invalid number: ") + value_str);
-    
+
     int min_bytes;
     if (value <= 0xFFULL)
         min_bytes = 1;
@@ -1762,7 +1738,7 @@ tool_result_t convert_number(const json& params)
         min_bytes = 4;
     else
         min_bytes = 8;
-    
+
     int display_bytes = min_bytes;
     if (params.contains("size") && params["size"].is_number())
     {
@@ -1770,23 +1746,23 @@ tool_result_t convert_number(const json& params)
         if (requested == 1 || requested == 2 || requested == 4 || requested == 8)
             display_bytes = std::max(requested, min_bytes);
     }
-    
+
     json result;
-    
+
     result["input"] = value_str;
     result["input_base"] = input_base;
-    
+
     result["decimal"] = value;
     result["signed_decimal"] = static_cast<int64_t>(value);
-    
+
     std::ostringstream hex_ss;
     hex_ss << "0x" << std::hex << std::uppercase << value;
     result["hex"] = hex_ss.str();
-    
+
     std::ostringstream oct_ss;
     oct_ss << "0" << std::oct << value;
     result["octal"] = oct_ss.str();
-    
+
     std::string binary;
     uint64_t temp = value;
     do {
@@ -1794,9 +1770,9 @@ tool_result_t convert_number(const json& params)
         temp >>= 1;
     } while (temp);
     result["binary"] = "0b" + binary;
-    
+
     result["min_size_bytes"] = min_bytes;
-    
+
     auto format_bytes_le = [](uint64_t val, int num_bytes) -> std::string {
         std::ostringstream ss;
         for (int i = 0; i < num_bytes; i++)
@@ -1807,7 +1783,7 @@ tool_result_t convert_number(const json& params)
         }
         return ss.str();
     };
-    
+
     auto format_bytes_be = [](uint64_t val, int num_bytes) -> std::string {
         std::ostringstream ss;
         for (int i = num_bytes - 1; i >= 0; i--)
@@ -1818,10 +1794,10 @@ tool_result_t convert_number(const json& params)
         }
         return ss.str();
     };
-    
+
     result["bytes_le"] = format_bytes_le(value, display_bytes);
     result["bytes_be"] = format_bytes_be(value, display_bytes);
-    
+
     if (min_bytes <= 1)
     {
         result["as_int8_le"] = format_bytes_le(value, 1);
@@ -1842,7 +1818,7 @@ tool_result_t convert_number(const json& params)
     result["as_int64_le"] = format_bytes_le(value, 8);
     result["as_int64_be"] = format_bytes_be(value, 8);
     result["as_int64_signed"] = static_cast<int64_t>(value);
-    
+
     std::string ascii_le;
     for (int i = 0; i < display_bytes; i++)
     {
@@ -1853,7 +1829,7 @@ tool_result_t convert_number(const json& params)
             ascii_le += '.';
     }
     result["ascii"] = ascii_le;
-    
+
     std::string ascii_be;
     for (int i = display_bytes - 1; i >= 0; i--)
     {
@@ -1864,7 +1840,7 @@ tool_result_t convert_number(const json& params)
             ascii_be += '.';
     }
     result["ascii_be"] = ascii_be;
-    
+
     if (min_bytes <= 4)
     {
         uint32_t f_bits = static_cast<uint32_t>(value & 0xFFFFFFFF);
@@ -1873,21 +1849,21 @@ tool_result_t convert_number(const json& params)
         if (std::isfinite(f))
             result["as_float"] = f;
     }
-    
+
     {
         double d;
         std::memcpy(&d, &value, sizeof(double));
         if (std::isfinite(d))
             result["as_double"] = d;
     }
-    
+
     return tool_result_t::ok(OBFSTR("Number converted"), result);
 }
 
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
-    
+
     registry.register_tool({
         OBFSTR("read_bytes"),
         OBFSTR("memory"),
@@ -1898,7 +1874,7 @@ void register_tools()
         },
         read_bytes
     });
-    
+
     registry.register_tool({
         OBFSTR("read_integer"),
         OBFSTR("memory"),
@@ -1909,7 +1885,7 @@ void register_tools()
         },
         read_integer
     });
-    
+
     registry.register_tool({
         OBFSTR("read_string"),
         OBFSTR("memory"),
@@ -1920,7 +1896,7 @@ void register_tools()
         },
         read_string
     });
-    
+
     registry.register_tool({
         OBFSTR("read_global"),
         OBFSTR("memory"),
@@ -1928,7 +1904,7 @@ void register_tools()
         {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Address or name of the global variable"), true}},
         read_global
     });
-    
+
     registry.register_tool({
         OBFSTR("patch_bytes"),
         OBFSTR("memory"),
@@ -1940,7 +1916,7 @@ void register_tools()
         patch_bytes,
         false
     });
-    
+
     registry.register_tool({
         OBFSTR("make_code"),
         OBFSTR("memory"),
@@ -1949,7 +1925,7 @@ void register_tools()
         make_code,
         false
     });
-    
+
     registry.register_tool({
         OBFSTR("make_data"),
         OBFSTR("memory"),
@@ -1961,7 +1937,7 @@ void register_tools()
         make_data,
         false
     });
-    
+
     registry.register_tool({
         OBFSTR("undefine"),
         OBFSTR("memory"),
@@ -1974,7 +1950,7 @@ void register_tools()
         undefine,
         false
     });
-    
+
     registry.register_tool({
         OBFSTR("list_globals"),
         OBFSTR("memory"),
@@ -1986,7 +1962,7 @@ void register_tools()
         },
         list_globals
     });
-    
+
     registry.register_tool({
         OBFSTR("convert_number"),
         OBFSTR("memory"),
@@ -2027,12 +2003,12 @@ tool_result_t set_comment(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string comment = params["comment"].get<std::string>();
-    
+
     if (!set_cmt(*ea_opt, comment.c_str(), false))
         return tool_result_t::error(OBFSTR("Failed to set comment"));
-    
+
     return tool_result_t::ok(OBFSTR("Comment set at ") + helpers::format_address(*ea_opt));
 }
 
@@ -2041,12 +2017,12 @@ tool_result_t set_repeatable_comment(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string comment = params["comment"].get<std::string>();
-    
+
     if (!set_cmt(*ea_opt, comment.c_str(), true))
         return tool_result_t::error(OBFSTR("Failed to set repeatable comment"));
-    
+
     return tool_result_t::ok(OBFSTR("Repeatable comment set"));
 }
 
@@ -2055,17 +2031,17 @@ tool_result_t set_function_comment(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     func_t* pfn = get_func(*ea_opt);
     if (!pfn)
         return tool_result_t::error(OBFSTR("No function at address"));
-    
+
     std::string comment = params["comment"].get<std::string>();
     bool repeatable = params.value("repeatable", false);
-    
+
     if (!set_func_cmt(pfn, comment.c_str(), repeatable))
         return tool_result_t::error(OBFSTR("Failed to set function comment"));
-    
+
     return tool_result_t::ok(OBFSTR("Function comment set"));
 }
 
@@ -2074,16 +2050,16 @@ tool_result_t get_comment(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     qstring regular_cmt, repeatable_cmt;
     get_cmt(&regular_cmt, *ea_opt, false);
     get_cmt(&repeatable_cmt, *ea_opt, true);
-    
+
     json result;
     result["address"] = helpers::format_address(*ea_opt);
     result["comment"] = regular_cmt.c_str();
     result["repeatable_comment"] = repeatable_cmt.c_str();
-    
+
     return tool_result_t::ok(OBFSTR("Comment retrieved"), result);
 }
 
@@ -2092,14 +2068,14 @@ tool_result_t set_extra_comment(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string comment = params["comment"].get<std::string>();
     std::string position = params.value("position", "anterior");
-    
+
     int line_idx = (position == "posterior") ? E_NEXT : E_PREV;
-    
+
     update_extra_cmt(*ea_opt, line_idx, comment.c_str());
-    
+
     return tool_result_t::ok(OBFSTR("Extra comment set"));
 }
 
@@ -2108,27 +2084,27 @@ tool_result_t rename_variable(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string original_name = params["original_name"].get<std::string>();
     std::string new_name = params["new_name"].get<std::string>();
-    
+
     if (!init_hexrays_plugin())
         return tool_result_t::error(OBFSTR("Hex-Rays not available"));
-    
+
     func_t* pfn = get_func(*ea_opt);
     if (!pfn)
         return tool_result_t::error(OBFSTR("No function at address"));
-    
+
     try
     {
         cfuncptr_t cfunc = decompile(pfn);
         if (!cfunc)
             return tool_result_t::error(OBFSTR("Decompilation failed"));
-        
+
         lvars_t* lvars = cfunc->get_lvars();
         if (!lvars)
             return tool_result_t::error(OBFSTR("No local variables"));
-        
+
         for (size_t i = 0; i < lvars->size(); i++)
         {
             lvar_t& lvar = (*lvars)[i];
@@ -2143,7 +2119,7 @@ tool_result_t rename_variable(const json& params)
                     return tool_result_t::error(OBFSTR("Failed to rename variable"));
             }
         }
-        
+
         return tool_result_t::error(OBFSTR("Variable not found: ") + original_name);
     }
     catch (const vd_failure_t& e)
@@ -2157,19 +2133,19 @@ tool_result_t rename_address(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string new_name = params["new_name"].get<std::string>();
-    
+
     if (!set_name(*ea_opt, new_name.c_str(), SN_FORCE | SN_NODUMMY))
         return tool_result_t::error(OBFSTR("Failed to rename"));
-    
+
     return tool_result_t::ok(OBFSTR("Address renamed to: ") + new_name);
 }
 
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
-    
+
     registry.register_tool({
         OBFSTR("set_comment"),
         OBFSTR("comment"),
@@ -2181,7 +2157,7 @@ void register_tools()
         set_comment,
         false
     });
-    
+
     registry.register_tool({
         OBFSTR("set_repeatable_comment"),
         OBFSTR("comment"),
@@ -2193,7 +2169,7 @@ void register_tools()
         set_repeatable_comment,
         false
     });
-    
+
     registry.register_tool({
         OBFSTR("set_function_comment"),
         OBFSTR("comment"),
@@ -2206,7 +2182,7 @@ void register_tools()
         set_function_comment,
         false
     });
-    
+
     registry.register_tool({
         OBFSTR("get_comment"),
         OBFSTR("comment"),
@@ -2214,7 +2190,7 @@ void register_tools()
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address"), true}},
         get_comment
     });
-    
+
     registry.register_tool({
         OBFSTR("set_extra_comment"),
         OBFSTR("comment"),
@@ -2227,7 +2203,7 @@ void register_tools()
         set_extra_comment,
         false
     });
-    
+
     registry.register_tool({
         OBFSTR("rename_variable"),
         OBFSTR("comment"),
@@ -2240,7 +2216,7 @@ void register_tools()
         rename_variable,
         false
     });
-    
+
     registry.register_tool({
         OBFSTR("rename_address"),
         OBFSTR("comment"),
@@ -2262,15 +2238,15 @@ namespace type_tools
 tool_result_t declare_type(const json& params)
 {
     std::string declaration = params["declaration"].get<std::string>();
-    
+
     til_t* ti = get_idati();
     if (!ti)
         return tool_result_t::error(OBFSTR("Cannot get local type library"));
-    
+
     int count = parse_decls(ti, declaration.c_str(), nullptr, HTI_DCL);
     if (count <= 0)
         return tool_result_t::error(OBFSTR("Failed to parse type declaration"));
-    
+
     json result;
     result["types_added"] = count;
     return tool_result_t::ok(OBFSTR("Declared ") + std::to_string(count) + " type(s)", result);
@@ -2281,17 +2257,17 @@ tool_result_t apply_type(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string type_str = params["type"].get<std::string>();
-    
+
     tinfo_t tif;
     qstring name;
     if (!parse_decl(&tif, &name, nullptr, type_str.c_str(), PT_SIL))
         return tool_result_t::error(OBFSTR("Failed to parse type: ") + type_str);
-    
+
     if (!apply_tinfo(*ea_opt, tif, TINFO_DEFINITE))
         return tool_result_t::error(OBFSTR("Failed to apply type at address"));
-    
+
     return tool_result_t::ok(OBFSTR("Type applied at ") + helpers::format_address(*ea_opt));
 }
 
@@ -2300,21 +2276,21 @@ tool_result_t infer_type(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     tinfo_t tif;
     int result_code = guess_tinfo(&tif, *ea_opt);
-    
+
     if (result_code == GUESS_FUNC_FAILED)
         return tool_result_t::error(OBFSTR("Failed to infer type"));
-    
+
     qstring type_str;
     tif.print(&type_str);
-    
+
     json result;
     result["address"] = helpers::format_address(*ea_opt);
     result["type"] = type_str.c_str();
     result["confidence"] = (result_code == GUESS_FUNC_OK) ? "high" : "low";
-    
+
     return tool_result_t::ok(OBFSTR("Type inferred"), result);
 }
 
@@ -2322,27 +2298,27 @@ tool_result_t search_structs(const json& params)
 {
     std::string pattern = params["pattern"].get<std::string>();
     int limit = params.value("limit", 50);
-    
+
     std::regex filter_regex;
     try { filter_regex = std::regex(pattern, std::regex::icase); }
     catch (...) { return tool_result_t::error(OBFSTR("Invalid regex pattern")); }
-    
+
     til_t* ti = get_idati();
     if (!ti)
         return tool_result_t::error(OBFSTR("Cannot get local type library"));
-    
+
     json structs = json::array();
     uint32 count = get_ordinal_count(ti);
-    
+
     for (uint32 i = 1; i <= count && (int)structs.size() < limit; i++)
     {
         const char* tname = get_numbered_type_name(ti, i);
         if (!tname)
             continue;
-        
+
         if (!std::regex_search(tname, filter_regex))
             continue;
-        
+
         tinfo_t tif;
         if (tif.get_numbered_type(ti, i))
         {
@@ -2359,26 +2335,26 @@ tool_result_t search_structs(const json& params)
             });
         }
     }
-    
+
     return tool_result_t::ok(OBFSTR("Found ") + std::to_string(structs.size()) + " matching types", structs);
 }
 
 tool_result_t get_struct(const json& params)
 {
     std::string name = params["name"].get<std::string>();
-    
+
     til_t* ti = get_idati();
     if (!ti)
         return tool_result_t::error(OBFSTR("Cannot get local type library"));
-    
+
     int32 ordinal = get_type_ordinal(ti, name.c_str());
     if (ordinal <= 0)
         return tool_result_t::error(OBFSTR("Type not found: ") + name);
-    
+
     tinfo_t tif;
     if (!tif.get_numbered_type(ti, ordinal))
         return tool_result_t::error(OBFSTR("Cannot load type"));
-    
+
     json result;
     result["name"] = name;
     result["ordinal"] = ordinal;
@@ -2386,7 +2362,7 @@ tool_result_t get_struct(const json& params)
     result["is_struct"] = tif.is_struct();
     result["is_union"] = tif.is_union();
     result["is_enum"] = tif.is_enum();
-    
+
     if (tif.is_struct() || tif.is_union())
     {
         udt_type_data_t udt;
@@ -2424,46 +2400,46 @@ tool_result_t get_struct(const json& params)
             result["members"] = members;
         }
     }
-    
+
     qstring printed;
     tif.print(&printed);
     result["declaration"] = printed.c_str();
-    
+
     return tool_result_t::ok(OBFSTR("Type retrieved"), result);
 }
 
 tool_result_t create_struct(const json& params)
 {
     std::string name = params["name"].get<std::string>();
-    
+
     tinfo_t tif;
     udt_type_data_t udt;
     udt.taudt_bits |= TAUDT_UNALIGNED;
-    
+
     if (params.contains("members") && params["members"].is_array())
     {
         for (const auto& mem : params["members"])
         {
             udm_t m;
             m.name = (mem.contains("name") && mem["name"].is_string()) ? mem["name"].get<std::string>().c_str() : "field";
-            
+
             std::string type_str = (mem.contains("type") && mem["type"].is_string()) ? mem["type"].get<std::string>() : "int";
             tinfo_t mt;
             if (!parse_decl(&mt, nullptr, nullptr, (type_str + " x;").c_str(), PT_SIL | PT_VAR))
                 mt = tinfo_t(BT_INT32);
             m.type = mt;
             m.size = mt.get_size() * 8;
-            
+
             if (mem.contains("offset") && mem["offset"].is_number())
                 m.offset = mem["offset"].get<uint64_t>() * 8;
-            
+
             udt.push_back(m);
         }
     }
-    
+
     tif.create_udt(udt, BTF_STRUCT);
     tif.set_named_type(get_idati(), name.c_str());
-    
+
     return tool_result_t::ok(OBFSTR("Struct created: ") + name);
 }
 
@@ -2472,38 +2448,38 @@ tool_result_t add_struct_member(const json& params)
     std::string struct_name = params["struct_name"].get<std::string>();
     std::string member_name = params["member_name"].get<std::string>();
     std::string type_str = params.value("type", "int");
-    
+
     til_t* ti = get_idati();
     int32 ordinal = get_type_ordinal(ti, struct_name.c_str());
     if (ordinal <= 0)
         return tool_result_t::error(OBFSTR("Struct not found: ") + struct_name);
-    
+
     tinfo_t tif;
     if (!tif.get_numbered_type(ti, ordinal))
         return tool_result_t::error(OBFSTR("Cannot load struct"));
-    
+
     udt_type_data_t udt;
     if (!tif.get_udt_details(&udt))
         return tool_result_t::error(OBFSTR("Not a struct/union"));
-    
+
     udm_t m;
     m.name = member_name.c_str();
-    
+
     tinfo_t mt;
     if (!parse_decl(&mt, nullptr, nullptr, (type_str + " x;").c_str(), PT_SIL | PT_VAR))
         mt = tinfo_t(BT_INT32);
     m.type = mt;
     m.size = mt.get_size() * 8;
-    
+
     if (params.contains("offset"))
         m.offset = params["offset"].get<uint64_t>() * 8;
-    
+
     udt.push_back(m);
-    
+
     tinfo_t new_tif;
     new_tif.create_udt(udt, BTF_STRUCT);
     new_tif.set_named_type(ti, struct_name.c_str(), NTF_REPLACE);
-    
+
     return tool_result_t::ok(OBFSTR("Member added to ") + struct_name);
 }
 
@@ -2512,20 +2488,20 @@ tool_result_t get_struct_field_xrefs(const json& params)
     std::string struct_name = params["struct_name"].get<std::string>();
     std::string field_name = params["field_name"].get<std::string>();
     int limit = params.value("limit", 100);
-    
+
     til_t* ti = get_idati();
     int32 ordinal = get_type_ordinal(ti, struct_name.c_str());
     if (ordinal <= 0)
         return tool_result_t::error(OBFSTR("Struct not found: ") + struct_name);
-    
+
     tinfo_t tif;
     if (!tif.get_numbered_type(ti, ordinal))
         return tool_result_t::error(OBFSTR("Cannot load struct"));
-    
+
     udt_type_data_t udt;
     if (!tif.get_udt_details(&udt))
         return tool_result_t::error(OBFSTR("Not a struct/union"));
-    
+
     uint64_t field_offset = 0;
     bool found = false;
     for (size_t i = 0; i < udt.size(); i++)
@@ -2537,16 +2513,16 @@ tool_result_t get_struct_field_xrefs(const json& params)
             break;
         }
     }
-    
+
     if (!found)
         return tool_result_t::error(OBFSTR("Field not found: ") + field_name);
-    
+
     json result;
     result["struct"] = struct_name;
     result["field"] = field_name;
     result["field_offset"] = field_offset;
     result["note"] = "Use find_immediate or search to find accesses to this offset";
-    
+
     return tool_result_t::ok(OBFSTR("Struct field info retrieved"), result);
 }
 
@@ -2555,22 +2531,22 @@ tool_result_t create_stack_var(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     func_t* pfn = get_func(*ea_opt);
     if (!pfn)
         return tool_result_t::error(OBFSTR("No function at address"));
-    
+
     sval_t offset = params["offset"].get<int64_t>();
     std::string var_name = params["name"].get<std::string>();
     std::string type_str = params.value("type", "__int64");
-    
+
     tinfo_t mt;
     if (!parse_decl(&mt, nullptr, nullptr, (type_str + " x;").c_str(), PT_SIL | PT_VAR))
         mt = tinfo_t(BT_INT64);
-    
+
     if (!define_stkvar(pfn, var_name.c_str(), offset, mt))
         return tool_result_t::error(OBFSTR("Failed to create stack variable"));
-    
+
     return tool_result_t::ok(OBFSTR("Stack variable created: ") + var_name);
 }
 
@@ -2579,14 +2555,14 @@ tool_result_t delete_stack_var(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     func_t* pfn = get_func(*ea_opt);
     if (!pfn)
         return tool_result_t::error(OBFSTR("No function at address"));
-    
+
     std::string var_name = params["name"].get<std::string>();
-    
-    std::string py_code = 
+
+    std::string py_code =
         "import ida_frame, ida_funcs, ida_struct\n"
         "pfn = ida_funcs.get_func(" + std::to_string(*ea_opt) + ")\n"
         "_aida_del_result = False\n"
@@ -2599,21 +2575,21 @@ tool_result_t delete_stack_var(const json& params)
         "                ida_struct.del_struc_member(frame, m.soff)\n"
         "                _aida_del_result = True\n"
         "                break\n";
-    
+
     extlang_object_t python = find_extlang_by_name("python");
     if (!python)
         return tool_result_t::error(OBFSTR("Python not available for stack var deletion"));
-    
+
     qstring errbuf;
     if (!python->eval_snippet(py_code.c_str(), &errbuf))
         return tool_result_t::error(OBFSTR("Python error: ") + std::string(errbuf.c_str()));
-    
+
     idc_value_t rv;
     qstring eval_err;
     if (python->eval_expr(&rv, BADADDR, "_aida_del_result", &eval_err)
         && rv.is_integral() && (rv.vtype == VT_INT64 ? rv.i64 : rv.num) != 0)
         return tool_result_t::ok(OBFSTR("Stack variable deleted: ") + var_name);
-    
+
     return tool_result_t::error(OBFSTR("Variable not found in stack frame: ") + var_name);
 }
 
@@ -2622,37 +2598,37 @@ tool_result_t read_struct_field(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string struct_name = params["struct_name"].get<std::string>();
     std::string field_name = params["field_name"].get<std::string>();
-    
+
     til_t* ti = get_idati();
     int32 ordinal = get_type_ordinal(ti, struct_name.c_str());
     if (ordinal <= 0)
         return tool_result_t::error(OBFSTR("Struct not found"));
-    
+
     tinfo_t tif;
     if (!tif.get_numbered_type(ti, ordinal))
         return tool_result_t::error(OBFSTR("Cannot load struct"));
-    
+
     udt_type_data_t udt;
     if (!tif.get_udt_details(&udt))
         return tool_result_t::error(OBFSTR("Not a struct"));
-    
+
     for (size_t i = 0; i < udt.size(); i++)
     {
         if (udt[i].name == field_name.c_str())
         {
             ea_t field_ea = *ea_opt + udt[i].offset / 8;
             asize_t field_bytes = udt[i].size / 8;
-            
+
             json result;
             result["address"] = helpers::format_address(*ea_opt);
             result["field_address"] = helpers::format_address(field_ea);
             result["field_name"] = field_name;
             result["field_offset"] = udt[i].offset / 8;
             result["field_size"] = field_bytes;
-            
+
             if (field_bytes <= 8)
             {
                 uval_t val;
@@ -2662,11 +2638,11 @@ tool_result_t read_struct_field(const json& params)
                     result["hex"] = helpers::format_address(val);
                 }
             }
-            
+
             return tool_result_t::ok(OBFSTR("Field value read"), result);
         }
     }
-    
+
     return tool_result_t::error(OBFSTR("Field not found: ") + field_name);
 }
 
@@ -2675,7 +2651,7 @@ tool_result_t list_types(const json& params)
     int offset = params.value("offset", 0);
     int limit = params.value("limit", 100);
     std::string filter = params.value("filter", "");
-    
+
     std::regex filter_regex;
     bool use_filter = !filter.empty();
     if (use_filter)
@@ -2683,33 +2659,33 @@ tool_result_t list_types(const json& params)
         try { filter_regex = std::regex(filter, std::regex::icase); }
         catch (...) { return tool_result_t::error(OBFSTR("Invalid filter regex")); }
     }
-    
+
     til_t* ti = get_idati();
     if (!ti)
         return tool_result_t::error(OBFSTR("No local type library"));
-    
+
     json types = json::array();
     uint32 total = get_ordinal_count(ti);
     int skipped = 0;
-    
+
     for (uint32 i = 1; i <= total && (int)types.size() < limit; i++)
     {
         const char* tname = get_numbered_type_name(ti, i);
         if (!tname)
             continue;
-        
+
         if (use_filter && !std::regex_search(tname, filter_regex))
             continue;
-        
+
         if (skipped < offset)
         {
             skipped++;
             continue;
         }
-        
+
         tinfo_t tif;
         tif.get_numbered_type(ti, i);
-        
+
         types.push_back({
             {"ordinal", i},
             {"name", tname},
@@ -2719,12 +2695,12 @@ tool_result_t list_types(const json& params)
             {"size", (size_t)tif.get_size()}
         });
     }
-    
+
     json result;
     result["types"] = types;
     result["total"] = total;
     result["returned"] = types.size();
-    
+
     return tool_result_t::ok(OBFSTR("Types listed"), result);
 }
 
@@ -2736,10 +2712,10 @@ tool_result_t get_enum(const json& params)
 tool_result_t create_enum(const json& params)
 {
     std::string name = params["name"].get<std::string>();
-    
+
     tinfo_t tif;
     enum_type_data_t etd;
-    
+
     if (params.contains("members") && params["members"].is_array())
     {
         for (const auto& mem : params["members"])
@@ -2750,44 +2726,44 @@ tool_result_t create_enum(const json& params)
             etd.push_back(m);
         }
     }
-    
+
     tif.create_enum(etd);
     tif.set_named_type(get_idati(), name.c_str());
-    
+
     return tool_result_t::ok(OBFSTR("Enum created: ") + name);
 }
 
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
-    
+
     registry.register_tool({OBFSTR("declare_type"), OBFSTR("type"),
         OBFSTR("Parse and declare C type(s) in the local type library."),
         {{OBFSTR("declaration"), OBFSTR("string"), OBFSTR("C type declaration (struct, enum, typedef, etc.)"), true}},
         declare_type, false});
-    
+
     registry.register_tool({OBFSTR("apply_type"), OBFSTR("type"),
         OBFSTR("Apply a C type to a function, global, or address."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address"), true},
          {OBFSTR("type"), OBFSTR("string"), OBFSTR("C type declaration (e.g., 'int __fastcall(void*, int)')"), true}},
         apply_type, false});
-    
+
     registry.register_tool({OBFSTR("infer_type"), OBFSTR("type"),
         OBFSTR("Infer/guess the type at an address using Hex-Rays or heuristics."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to analyze"), true}},
         infer_type});
-    
+
     registry.register_tool({OBFSTR("search_structs"), OBFSTR("type"),
         OBFSTR("Search structures/types by name pattern (regex)."),
         {{OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Regex pattern"), true},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 50)"), false}},
         search_structs});
-    
+
     registry.register_tool({OBFSTR("get_struct"), OBFSTR("type"),
         OBFSTR("Get detailed struct/type info including all members."),
         {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Type name"), true}},
         get_struct});
-    
+
     registry.register_tool({OBFSTR("create_struct"), OBFSTR("type"),
         OBFSTR("Create a new struct type."),
         {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Struct name"), true},
@@ -2803,7 +2779,7 @@ void register_tools()
           })
         }},
         create_struct, false});
-    
+
     registry.register_tool({OBFSTR("add_struct_member"), OBFSTR("type"),
         OBFSTR("Add a member to an existing struct."),
         {{OBFSTR("struct_name"), OBFSTR("string"), OBFSTR("Struct name"), true},
@@ -2811,14 +2787,14 @@ void register_tools()
          {OBFSTR("type"), OBFSTR("string"), OBFSTR("Member C type (default 'int')"), false},
          {OBFSTR("offset"), OBFSTR("number"), OBFSTR("Byte offset in struct"), false}},
         add_struct_member, false});
-    
+
     registry.register_tool({OBFSTR("get_struct_field_xrefs"), OBFSTR("type"),
         OBFSTR("Get cross-references to a specific struct field."),
         {{OBFSTR("struct_name"), OBFSTR("string"), OBFSTR("Struct name"), true},
          {OBFSTR("field_name"), OBFSTR("string"), OBFSTR("Field name"), true},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results"), false}},
         get_struct_field_xrefs});
-    
+
     registry.register_tool({OBFSTR("create_stack_var"), OBFSTR("type"),
         OBFSTR("Create a stack variable in a function's frame."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true},
@@ -2826,32 +2802,32 @@ void register_tools()
          {OBFSTR("name"), OBFSTR("string"), OBFSTR("Variable name"), true},
          {OBFSTR("type"), OBFSTR("string"), OBFSTR("C type (default '__int64')"), false}},
         create_stack_var, false});
-    
+
     registry.register_tool({OBFSTR("delete_stack_var"), OBFSTR("type"),
         OBFSTR("Delete a stack variable by name."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true},
          {OBFSTR("name"), OBFSTR("string"), OBFSTR("Variable name to delete"), true}},
         delete_stack_var, false});
-    
+
     registry.register_tool({OBFSTR("read_struct_field"), OBFSTR("type"),
         OBFSTR("Read the value of a struct field at a specific address."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Base address of the struct instance"), true},
          {OBFSTR("struct_name"), OBFSTR("string"), OBFSTR("Struct type name"), true},
          {OBFSTR("field_name"), OBFSTR("string"), OBFSTR("Field name to read"), true}},
         read_struct_field});
-    
+
     registry.register_tool({OBFSTR("list_types"), OBFSTR("type"),
         OBFSTR("List all types in the local type library (paginated, filtered)."),
         {{OBFSTR("offset"), OBFSTR("number"), OBFSTR("Starting offset"), false},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 100)"), false},
          {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Regex filter"), false}},
         list_types});
-    
+
     registry.register_tool({OBFSTR("get_enum"), OBFSTR("type"),
         OBFSTR("Get enum type details including all members/values."),
         {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Enum name"), true}},
         get_enum});
-    
+
     registry.register_tool({OBFSTR("create_enum"), OBFSTR("type"),
         OBFSTR("Create a new enum type."),
         {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Enum name"), true},
@@ -2887,11 +2863,11 @@ static int idaapi import_enum_cb(ea_t ea, const char* name, uval_t ord, void* pa
     auto* data = static_cast<import_data_t*>(param);
     if (data->count >= data->limit)
         return 0;
-    
+
     std::string import_name = name ? name : "";
     if (data->filter && !import_name.empty() && !std::regex_search(import_name, *data->filter))
         return 1;
-    
+
     json entry;
     entry["address"] = helpers::format_address(ea);
     entry["name"] = import_name;
@@ -2907,7 +2883,7 @@ tool_result_t list_imports(const json& params)
     int offset = params.value("offset", 0);
     int limit = params.value("limit", 200);
     std::string filter = params.value("filter", "");
-    
+
     std::regex filter_regex;
     std::regex* filter_ptr = nullptr;
     if (!filter.empty())
@@ -2918,26 +2894,26 @@ tool_result_t list_imports(const json& params)
         }
         catch (...) { return tool_result_t::error(OBFSTR("Invalid filter regex")); }
     }
-    
+
     json all_imports = json::array();
     uint module_count = get_import_module_qty();
     int total_count = 0;
     int skipped = 0;
-    
+
     for (uint i = 0; i < module_count && total_count < limit; i++)
     {
         qstring mod_name;
         get_import_module_name(&mod_name, i);
-        
+
         import_data_t data;
         data.imports = json::array();
         data.limit = limit - total_count;
         data.count = 0;
         data.module_name = mod_name.c_str();
         data.filter = filter_ptr;
-        
+
         enum_import_names(i, import_enum_cb, &data);
-        
+
         for (auto& imp : data.imports)
         {
             if (skipped < offset)
@@ -2949,12 +2925,12 @@ tool_result_t list_imports(const json& params)
             total_count++;
         }
     }
-    
+
     json result;
     result["imports"] = all_imports;
     result["module_count"] = module_count;
     result["returned"] = total_count;
-    
+
     return tool_result_t::ok(OBFSTR("Listed ") + std::to_string(total_count) + " imports", result);
 }
 
@@ -2963,7 +2939,7 @@ tool_result_t list_exports(const json& params)
     int offset = params.value("offset", 0);
     int limit = params.value("limit", 200);
     std::string filter = params.value("filter", "");
-    
+
     std::regex filter_regex;
     bool use_filter = !filter.empty();
     if (use_filter)
@@ -2971,31 +2947,31 @@ tool_result_t list_exports(const json& params)
         try { filter_regex = std::regex(filter, std::regex::icase); }
         catch (...) { return tool_result_t::error(OBFSTR("Invalid filter regex")); }
     }
-    
+
     json exports = json::array();
     size_t total = get_entry_qty();
     int count = 0;
     int skipped = 0;
-    
+
     for (size_t i = 0; i < total && count < limit; i++)
     {
         uval_t ord = get_entry_ordinal(i);
         ea_t ea = get_entry(ord);
         if (ea == BADADDR)
             continue;
-        
+
         qstring ename;
         get_entry_name(&ename, ord);
-        
+
         if (use_filter && !std::regex_search(ename.c_str(), filter_regex))
             continue;
-        
+
         if (skipped < offset)
         {
             skipped++;
             continue;
         }
-        
+
         exports.push_back({
             {"address", helpers::format_address(ea)},
             {"name", ename.c_str()},
@@ -3003,31 +2979,31 @@ tool_result_t list_exports(const json& params)
         });
         count++;
     }
-    
+
     json result;
     result["exports"] = exports;
     result["total"] = total;
     result["returned"] = count;
-    
+
     return tool_result_t::ok(OBFSTR("Listed ") + std::to_string(count) + " exports", result);
 }
 
 tool_result_t get_import(const json& params)
 {
     std::string name_or_addr = params["name"].get<std::string>();
-    
+
     auto ea_opt = helpers::parse_address(name_or_addr);
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Cannot resolve import"));
-    
+
     qstring imp_name;
     if (get_name(&imp_name, *ea_opt) <= 0)
         return tool_result_t::error(OBFSTR("No name at address"));
-    
+
     json result;
     result["address"] = helpers::format_address(*ea_opt);
     result["name"] = imp_name.c_str();
-    
+
     xrefblk_t xb;
     json xrefs = json::array();
     int count = 0;
@@ -3040,28 +3016,28 @@ tool_result_t get_import(const json& params)
         count++;
     }
     result["references"] = xrefs;
-    
+
     return tool_result_t::ok(OBFSTR("Import info retrieved"), result);
 }
 
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
-    
+
     registry.register_tool({OBFSTR("list_imports"), OBFSTR("import"),
         OBFSTR("List all imported symbols with module names (paginated, filtered)."),
         {{OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start offset"), false},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 200)"), false},
          {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Regex filter for import names"), false}},
         list_imports});
-    
+
     registry.register_tool({OBFSTR("list_exports"), OBFSTR("import"),
         OBFSTR("List all exported symbols (paginated, filtered)."),
         {{OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start offset"), false},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 200)"), false},
          {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Regex filter"), false}},
         list_exports});
-    
+
     registry.register_tool({OBFSTR("get_import"), OBFSTR("import"),
         OBFSTR("Get details about a specific import by name or address."),
         {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Import name or address"), true}},
@@ -3078,11 +3054,11 @@ tool_result_t search_strings(const json& params)
     std::string pattern = params["pattern"].get<std::string>();
     int limit = params.value("limit", 100);
     int offset = params.value("offset", 0);
-    
+
     std::regex filter_regex;
     try { filter_regex = std::regex(pattern, std::regex::icase); }
     catch (...) { return tool_result_t::error(OBFSTR("Invalid regex pattern")); }
-    
+
     size_t total = get_strlist_qty();
     if (total == 0)
     {
@@ -3091,13 +3067,13 @@ tool_result_t search_strings(const json& params)
         hide_wait_box();
         total = get_strlist_qty();
     }
-    
+
     json strings = json::array();
     int count = 0;
     int skipped = 0;
-    
+
     show_wait_box("NODELAY\nAiDA: Searching strings (0 / %zu)...", total);
-    
+
     for (size_t i = 0; i < total && count < limit; i++)
     {
         if (i % 500 == 0)
@@ -3106,24 +3082,24 @@ tool_result_t search_strings(const json& params)
             if (user_cancelled())
                 break;
         }
-        
+
         string_info_t si;
         if (!get_strlist_item(&si, i))
             continue;
-        
+
         qstring str;
         if (get_strlit_contents(&str, si.ea, si.length, si.type) <= 0)
             continue;
-        
+
         if (!std::regex_search(str.c_str(), filter_regex))
             continue;
-        
+
         if (skipped < offset)
         {
             skipped++;
             continue;
         }
-        
+
         strings.push_back({
             {"address", helpers::format_address(si.ea)},
             {"value", str.c_str()},
@@ -3132,14 +3108,14 @@ tool_result_t search_strings(const json& params)
         });
         count++;
     }
-    
+
     hide_wait_box();
-    
+
     json result;
     result["strings"] = strings;
     result["total_strings"] = total;
     result["returned"] = count;
-    
+
     return tool_result_t::ok(OBFSTR("Found ") + std::to_string(count) + " matching strings", result);
 }
 
@@ -3147,10 +3123,10 @@ tool_result_t find_bytes(const json& params)
 {
     std::string pattern = params["pattern"].get<std::string>();
     int limit = params.value("limit", 20);
-    
+
     ea_t start_ea = inf_get_min_ea();
     ea_t end_ea = inf_get_max_ea();
-    
+
     if (params.contains("start"))
     {
         auto s = helpers::parse_address(params["start"].get<std::string>());
@@ -3161,38 +3137,38 @@ tool_result_t find_bytes(const json& params)
         auto e = helpers::parse_address(params["end"].get<std::string>());
         if (e) end_ea = *e;
     }
-    
+
     compiled_binpat_vec_t binpat;
     qstring errbuf;
     if (!parse_binpat_str(&binpat, start_ea, pattern.c_str(), 16, PBSENC_DEF1BPU, &errbuf))
         return tool_result_t::error(OBFSTR("Invalid byte pattern: ") + std::string(errbuf.c_str()));
-    
+
     json matches = json::array();
     ea_t current = start_ea;
-    
+
     show_wait_box("NODELAY\nAiDA: Searching byte pattern...");
-    
+
     for (int i = 0; i < limit; i++)
     {
         replace_wait_box("AiDA: Searching byte pattern (%d found)...", i);
         if (user_cancelled())
             break;
-        
+
         ea_t found = bin_search(current, end_ea, binpat,
                                 BIN_SEARCH_FORWARD);
         if (found == BADADDR)
             break;
-        
+
         matches.push_back({
             {"address", helpers::format_address(found)},
             {"name", helpers::get_name_or_address(found)}
         });
-        
+
         current = found + 1;
     }
-    
+
     hide_wait_box();
-    
+
     return tool_result_t::ok(OBFSTR("Found ") + std::to_string(matches.size()) + " matches", matches);
 }
 
@@ -3200,32 +3176,32 @@ tool_result_t find_instructions(const json& params)
 {
     std::string pattern = params["pattern"].get<std::string>();
     int limit = params.value("limit", 20);
-    
+
     ea_t start_ea = inf_get_min_ea();
     ea_t end_ea = inf_get_max_ea();
-    
+
     if (params.contains("start"))
     {
         auto s = helpers::parse_address(params["start"].get<std::string>());
         if (s) start_ea = *s;
     }
-    
+
     json matches = json::array();
     ea_t ea = start_ea;
-    
+
     show_wait_box("NODELAY\nAiDA: Searching instructions...");
-    
+
     while (ea < end_ea && (int)matches.size() < limit)
     {
         replace_wait_box("AiDA: Searching instructions (%zu found)...", matches.size());
         if (user_cancelled())
             break;
-        
+
         ea_t found = find_text(ea, 0, 0, pattern.c_str(),
                                SEARCH_DOWN | SEARCH_NEXT);
         if (found == BADADDR)
             break;
-        
+
         insn_t insn;
         if (decode_insn(&insn, found) > 0)
         {
@@ -3233,19 +3209,19 @@ tool_result_t find_instructions(const json& params)
             generate_disasm_line(&disasm_line, found, GENDSM_FORCE_CODE);
             qstring clean;
             tag_remove(&clean, disasm_line.c_str());
-            
+
             matches.push_back({
                 {"address", helpers::format_address(found)},
                 {"disassembly", clean.c_str()},
                 {"size", insn.size}
             });
         }
-        
+
         ea = found + 1;
     }
-    
+
     hide_wait_box();
-    
+
     return tool_result_t::ok(OBFSTR("Found ") + std::to_string(matches.size()) + " instructions", matches);
 }
 
@@ -3263,50 +3239,50 @@ tool_result_t find_immediate(const json& params)
     {
         value = params["value"].get<uint64_t>();
     }
-    
+
     int limit = params.value("limit", 20);
-    
+
     ea_t start_ea = inf_get_min_ea();
     if (params.contains("start"))
     {
         auto s = helpers::parse_address(params["start"].get<std::string>());
         if (s) start_ea = *s;
     }
-    
+
     json matches = json::array();
     ea_t ea = start_ea;
-    
+
     show_wait_box("NODELAY\nAiDA: Searching immediate values...");
-    
+
     for (int i = 0; i < limit; i++)
     {
         replace_wait_box("AiDA: Searching immediate values (%d found)...", i);
         if (user_cancelled())
             break;
-        
+
         int opnum = -1;
         ea_t found = find_imm(ea, SEARCH_DOWN | SEARCH_NEXT,
                               (uval_t)value, &opnum);
         if (found == BADADDR)
             break;
-        
+
         qstring disasm_line;
         generate_disasm_line(&disasm_line, found, GENDSM_FORCE_CODE);
         qstring clean;
         tag_remove(&clean, disasm_line.c_str());
-        
+
         matches.push_back({
             {"address", helpers::format_address(found)},
             {"operand", opnum},
             {"disassembly", clean.c_str()},
             {"function", helpers::get_name_or_address(found)}
         });
-        
+
         ea = found + 1;
     }
-    
+
     hide_wait_box();
-    
+
     return tool_result_t::ok(OBFSTR("Found ") + std::to_string(matches.size()) + " occurrences", matches);
 }
 
@@ -3315,43 +3291,43 @@ tool_result_t search_text(const json& params)
     std::string text = params["text"].get<std::string>();
     int limit = params.value("limit", 20);
     bool case_sensitive = params.value("case_sensitive", false);
-    
+
     ea_t start_ea = inf_get_min_ea();
     if (params.contains("start"))
     {
         auto s = helpers::parse_address(params["start"].get<std::string>());
         if (s) start_ea = *s;
     }
-    
+
     int flags = SEARCH_DOWN | SEARCH_NEXT;
     if (case_sensitive)
         flags |= SEARCH_CASE;
-    
+
     json matches = json::array();
     ea_t ea = start_ea;
-    
+
     show_wait_box("NODELAY\nAiDA: Searching text...");
-    
+
     for (int i = 0; i < limit; i++)
     {
         replace_wait_box("AiDA: Searching text (%d / %d)...", i + 1, limit);
         if (user_cancelled())
             break;
-        
+
         ea_t found = find_text(ea, 0, 0, text.c_str(), flags);
         if (found == BADADDR)
             break;
-        
+
         matches.push_back({
             {"address", helpers::format_address(found)},
             {"name", helpers::get_name_or_address(found)}
         });
-        
+
         ea = found + 1;
     }
-    
+
     hide_wait_box();
-    
+
     return tool_result_t::ok(OBFSTR("Found ") + std::to_string(matches.size()) + " matches", matches);
 }
 
@@ -3359,7 +3335,7 @@ tool_result_t advanced_search(const json& params)
 {
     std::string search_type = params["type"].get<std::string>();
     json result;
-    
+
     if (search_type == "immediate")
     {
         return find_immediate(params);
@@ -3390,12 +3366,12 @@ tool_result_t advanced_search(const json& params)
         auto ea_opt = helpers::parse_address(params["value"].get<std::string>());
         if (!ea_opt)
             return tool_result_t::error(OBFSTR("Invalid address"));
-        
+
         json xrefs = json::array();
         xrefblk_t xb;
         int count = 0;
         int limit = params.value("limit", 50);
-        
+
         for (bool ok = xb.first_to(*ea_opt, XREF_ALL); ok && count < limit; ok = xb.next_to())
         {
             if (xb.iscode)
@@ -3415,12 +3391,12 @@ tool_result_t advanced_search(const json& params)
         auto ea_opt = helpers::parse_address(params["value"].get<std::string>());
         if (!ea_opt)
             return tool_result_t::error(OBFSTR("Invalid address"));
-        
+
         json xrefs = json::array();
         xrefblk_t xb;
         int count = 0;
         int limit = params.value("limit", 50);
-        
+
         for (bool ok = xb.first_to(*ea_opt, XREF_ALL); ok && count < limit; ok = xb.next_to())
         {
             if (!xb.iscode)
@@ -3435,21 +3411,21 @@ tool_result_t advanced_search(const json& params)
         }
         return tool_result_t::ok(OBFSTR("Data references found"), xrefs);
     }
-    
+
     return tool_result_t::error(OBFSTR("Unknown search type: ") + search_type);
 }
 
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
-    
+
     registry.register_tool({OBFSTR("search_strings"), OBFSTR("search"),
         OBFSTR("Search strings with case-insensitive regex (paginated)."),
         {{OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Regex pattern to match"), true},
          {OBFSTR("offset"), OBFSTR("number"), OBFSTR("Pagination offset"), false},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 100)"), false}},
         search_strings});
-    
+
     registry.register_tool({OBFSTR("find_bytes"), OBFSTR("search"),
         OBFSTR("Find byte pattern(s) in binary. Supports wildcards with '??' (e.g., '48 8B ?? ?? 89')."),
         {{OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Hex byte pattern (e.g., '48 8B ?? ??')"), true},
@@ -3457,21 +3433,21 @@ void register_tools()
          {OBFSTR("end"), OBFSTR("string"), OBFSTR("End address (optional)"), false},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 20)"), false}},
         find_bytes});
-    
+
     registry.register_tool({OBFSTR("find_instructions"), OBFSTR("search"),
         OBFSTR("Find instruction sequence(s) in code by text match."),
         {{OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Instruction text to search for"), true},
          {OBFSTR("start"), OBFSTR("string"), OBFSTR("Start address (optional)"), false},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 20)"), false}},
         find_instructions});
-    
+
     registry.register_tool({OBFSTR("find_immediate"), OBFSTR("search"),
         OBFSTR("Find immediate value occurrences in instructions."),
         {{OBFSTR("value"), OBFSTR("string"), OBFSTR("Immediate value (decimal or 0x hex)"), true},
          {OBFSTR("start"), OBFSTR("string"), OBFSTR("Start address (optional)"), false},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 20)"), false}},
         find_immediate});
-    
+
     registry.register_tool({OBFSTR("search_text"), OBFSTR("search"),
         OBFSTR("Search for text in disassembly listing."),
         {{OBFSTR("text"), OBFSTR("string"), OBFSTR("Text to search for"), true},
@@ -3479,7 +3455,7 @@ void register_tools()
          {OBFSTR("case_sensitive"), OBFSTR("boolean"), OBFSTR("Case-sensitive search (default false)"), false},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 20)"), false}},
         search_text});
-    
+
     registry.register_tool({OBFSTR("advanced_search"), OBFSTR("search"),
         OBFSTR("Advanced search: immediate values, strings, data/code references."),
         {{OBFSTR("type"), OBFSTR("string"), OBFSTR("Search type"), true, {OBFSTR("immediate"), OBFSTR("text"), OBFSTR("bytes"), OBFSTR("strings"), OBFSTR("code_ref"), OBFSTR("data_ref")}},
@@ -3497,19 +3473,19 @@ namespace debugger_tools
 tool_result_t get_debugger_state(const json&)
 {
     int state = get_process_state();
-    
+
     json result;
     result["state"] = state;
     result["state_name"] = state == DSTATE_SUSP ? "suspended"
                          : state == DSTATE_NOTASK ? "no_process"
                          : state == DSTATE_RUN ? "running" : "unknown";
     result["has_debugger"] = dbg != nullptr;
-    
+
     if (dbg != nullptr)
     {
         result["debugger_name"] = dbg->name;
     }
-    
+
     return tool_result_t::ok(OBFSTR("Debugger state retrieved"), result);
 }
 
@@ -3518,17 +3494,17 @@ tool_result_t start_process(const json& params)
     std::string path = params.value("path", "");
     std::string args = params.value("args", "");
     std::string sdir = params.value("sdir", "");
-    
+
     int rc = ::start_process(
         path.empty() ? nullptr : path.c_str(),
         args.empty() ? nullptr : args.c_str(),
         sdir.empty() ? nullptr : sdir.c_str());
-    
+
     if (rc < 0)
         return tool_result_t::error(OBFSTR("Cannot create process"));
     if (rc == 0)
         return tool_result_t::error(OBFSTR("Process start cancelled"));
-    
+
     return tool_result_t::ok(OBFSTR("Process started"));
 }
 
@@ -3543,7 +3519,7 @@ tool_result_t attach_process(const json& params)
 {
     pid_t pid = params.value("pid", (int)NO_PROCESS);
     int rc = ::attach_process(pid);
-    
+
     if (rc < 0)
         return tool_result_t::error(OBFSTR("Cannot attach to process"));
     if (rc == 0)
@@ -3570,7 +3546,7 @@ tool_result_t run_to_address(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     if (!::run_to(*ea_opt))
         return tool_result_t::error(OBFSTR("Failed to run to address"));
     return tool_result_t::ok(OBFSTR("Running to ") + helpers::format_address(*ea_opt));
@@ -3608,7 +3584,7 @@ tool_result_t list_breakpoints(const json&)
 {
     int count = get_bpt_qty();
     json bps = json::array();
-    
+
     for (int i = 0; i < count; i++)
     {
         bpt_t bpt;
@@ -3623,7 +3599,7 @@ tool_result_t list_breakpoints(const json&)
             });
         }
     }
-    
+
     return tool_result_t::ok(OBFSTR("Found ") + std::to_string(count) + " breakpoints", bps);
 }
 
@@ -3632,7 +3608,7 @@ tool_result_t add_breakpoint(const json& params)
     auto addresses = helpers::parse_addresses(params["address"]);
     if (addresses.empty())
         return tool_result_t::error(OBFSTR("No valid address"));
-    
+
     json results = json::array();
     for (ea_t ea : addresses)
     {
@@ -3642,7 +3618,7 @@ tool_result_t add_breakpoint(const json& params)
             {"success", ok}
         });
     }
-    
+
     return tool_result_t::ok(OBFSTR("Breakpoints processed"), results);
 }
 
@@ -3651,7 +3627,7 @@ tool_result_t delete_breakpoint(const json& params)
     auto addresses = helpers::parse_addresses(params["address"]);
     if (addresses.empty())
         return tool_result_t::error(OBFSTR("No valid address"));
-    
+
     json results = json::array();
     for (ea_t ea : addresses)
     {
@@ -3661,7 +3637,7 @@ tool_result_t delete_breakpoint(const json& params)
             {"success", ok}
         });
     }
-    
+
     return tool_result_t::ok(OBFSTR("Breakpoints deleted"), results);
 }
 
@@ -3670,40 +3646,40 @@ tool_result_t toggle_breakpoint(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     bool enable = params.value("enable", true);
-    
+
     if (!::enable_bpt(*ea_opt, enable))
         return tool_result_t::error(OBFSTR("Failed to toggle breakpoint"));
-    
+
     return tool_result_t::ok(std::string(enable ? "Enabled" : "Disabled") + " breakpoint at " + helpers::format_address(*ea_opt));
 }
 
 tool_result_t get_registers(const json& params)
 {
     std::string mode = params.value("mode", "gp_current");
-    
+
     if (get_process_state() != DSTATE_SUSP)
         return tool_result_t::error(OBFSTR("Process must be suspended to read registers"));
-    
+
     json regs = json::array();
-    
+
     if (dbg == nullptr)
         return tool_result_t::error(OBFSTR("No debugger loaded"));
-    
+
     auto read_regs_for_thread = [&](thid_t tid, bool gp_only) {
         json thread_regs = json::object();
         thread_regs["thread_id"] = tid;
         json reg_values = json::array();
-        
+
         for (int i = 0; i < dbg->nregisters; i++)
         {
             const register_info_t& ri = dbg->regs(i);
-            
+
             if (gp_only && (ri.flags & (REGISTER_IP | REGISTER_SP | REGISTER_FP | REGISTER_ADDRESS)) == 0
                 && ri.dtype != dt_qword && ri.dtype != dt_dword)
                 continue;
-            
+
             regval_t rv;
             if (get_reg_val(ri.name, &rv))
             {
@@ -3714,11 +3690,11 @@ tool_result_t get_registers(const json& params)
                 reg_values.push_back(reg);
             }
         }
-        
+
         thread_regs["registers"] = reg_values;
         return thread_regs;
     };
-    
+
     if (mode == "all_current" || mode == "gp_current")
     {
         bool gp_only = (mode == "gp_current");
@@ -3731,14 +3707,14 @@ tool_result_t get_registers(const json& params)
         json all_threads = json::array();
         int thread_count = get_thread_qty();
         thid_t original = get_current_thread();
-        
+
         for (int i = 0; i < thread_count; i++)
         {
             thid_t tid = getn_thread(i);
             select_thread(tid);
             all_threads.push_back(read_regs_for_thread(tid, false));
         }
-        
+
         select_thread(original);
         return tool_result_t::ok(OBFSTR("All thread registers read"), all_threads);
     }
@@ -3746,7 +3722,7 @@ tool_result_t get_registers(const json& params)
     {
         if (!params.contains("names"))
             return tool_result_t::error(OBFSTR("Parameter 'names' required for named mode"));
-        
+
         json result = json::array();
         for (const auto& name_val : params["names"])
         {
@@ -3768,7 +3744,7 @@ tool_result_t get_registers(const json& params)
         }
         return tool_result_t::ok(OBFSTR("Named registers read"), result);
     }
-    
+
     return tool_result_t::error(OBFSTR("Unknown mode: ") + mode);
 }
 
@@ -3776,13 +3752,13 @@ tool_result_t set_register(const json& params)
 {
     std::string name = params["name"].get<std::string>();
     uint64_t value = params["value"].get<uint64_t>();
-    
+
     if (get_process_state() != DSTATE_SUSP)
         return tool_result_t::error(OBFSTR("Process must be suspended"));
-    
+
     if (!::set_reg_val(name.c_str(), value))
         return tool_result_t::error(OBFSTR("Failed to set register: ") + name);
-    
+
     return tool_result_t::ok(OBFSTR("Register ") + name + " set to " + helpers::format_address(value));
 }
 
@@ -3790,33 +3766,33 @@ tool_result_t get_call_stack(const json& params)
 {
     if (get_process_state() != DSTATE_SUSP)
         return tool_result_t::error(OBFSTR("Process must be suspended"));
-    
+
     thid_t tid = get_current_thread();
     if (params.contains("thread_id"))
         tid = params["thread_id"].get<thid_t>();
-    
+
     call_stack_t stack;
     if (!collect_stack_trace(tid, &stack))
         return tool_result_t::error(OBFSTR("Failed to collect stack trace"));
-    
+
     json frames = json::array();
     for (size_t i = 0; i < stack.size(); i++)
     {
         const call_stack_info_t& frame = stack[i];
-        
+
         json f;
         f["index"] = i;
         f["return_address"] = helpers::format_address(frame.callea);
         f["function_address"] = helpers::format_address(frame.funcea);
         f["frame_pointer"] = helpers::format_address(frame.fp);
-        
+
         if (frame.funcok)
         {
             qstring fname;
             get_func_name(&fname, frame.funcea);
             f["function_name"] = fname.c_str();
         }
-        
+
         segment_t* seg = getseg(frame.callea);
         if (seg)
         {
@@ -3824,10 +3800,10 @@ tool_result_t get_call_stack(const json& params)
             get_segm_name(&seg_name, seg);
             f["module"] = seg_name.c_str();
         }
-        
+
         frames.push_back(f);
     }
-    
+
     return tool_result_t::ok(OBFSTR("Call stack collected"), frames);
 }
 
@@ -3836,32 +3812,32 @@ tool_result_t read_memory(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     size_t size = params.value("size", 256);
     if (size > 65536)
         return tool_result_t::error(OBFSTR("Size too large (max 65536)"));
-    
+
     if (get_process_state() == DSTATE_NOTASK)
         return tool_result_t::error(OBFSTR("No process running"));
-    
+
     std::vector<uint8_t> buffer(size);
     ssize_t bytes_read = ::read_dbg_memory(*ea_opt, buffer.data(), size);
-    
+
     if (bytes_read <= 0)
         return tool_result_t::error(OBFSTR("Failed to read debugger memory"));
-    
+
     std::ostringstream hex_ss;
     for (ssize_t i = 0; i < bytes_read; i++)
     {
         if (i > 0) hex_ss << " ";
         hex_ss << std::hex << std::setw(2) << std::setfill('0') << (int)buffer[i];
     }
-    
+
     json result;
     result["address"] = helpers::format_address(*ea_opt);
     result["size"] = bytes_read;
     result["hex"] = hex_ss.str();
-    
+
     return tool_result_t::ok(OBFSTR("Memory read"), result);
 }
 
@@ -3870,28 +3846,28 @@ tool_result_t write_memory(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string hex_bytes = params["bytes"].get<std::string>();
     hex_bytes.erase(std::remove(hex_bytes.begin(), hex_bytes.end(), ' '), hex_bytes.end());
-    
+
     std::vector<uint8_t> bytes;
     for (size_t i = 0; i + 1 < hex_bytes.length(); i += 2)
     {
         try { bytes.push_back(static_cast<uint8_t>(std::stoul(hex_bytes.substr(i, 2), nullptr, 16))); }
         catch (...) { return tool_result_t::error(OBFSTR("Invalid hex byte")); }
     }
-    
+
     if (get_process_state() == DSTATE_NOTASK)
         return tool_result_t::error(OBFSTR("No process running"));
-    
+
     ssize_t written = ::write_dbg_memory(*ea_opt, bytes.data(), bytes.size());
     if (written <= 0)
         return tool_result_t::error(OBFSTR("Failed to write debugger memory"));
-    
+
     json result;
     result["address"] = helpers::format_address(*ea_opt);
     result["bytes_written"] = written;
-    
+
     return tool_result_t::ok(OBFSTR("Memory written"), result);
 }
 
@@ -3900,12 +3876,12 @@ tool_result_t get_threads(const json&)
     json threads = json::array();
     int count = get_thread_qty();
     thid_t current = get_current_thread();
-    
+
     for (int i = 0; i < count; i++)
     {
         thid_t tid = getn_thread(i);
         const char* tname = getn_thread_name(i);
-        
+
         threads.push_back({
             {"index", i},
             {"thread_id", tid},
@@ -3913,17 +3889,17 @@ tool_result_t get_threads(const json&)
             {"is_current", tid == current}
         });
     }
-    
+
     return tool_result_t::ok(OBFSTR("Found ") + std::to_string(count) + " threads", threads);
 }
 
 tool_result_t select_thread(const json& params)
 {
     thid_t tid = params["thread_id"].get<thid_t>();
-    
+
     if (!::select_thread(tid))
         return tool_result_t::error(OBFSTR("Failed to select thread"));
-    
+
     return tool_result_t::ok(OBFSTR("Thread selected: ") + std::to_string(tid));
 }
 
@@ -4896,61 +4872,61 @@ tool_result_t map_vm_handler_table(const json& params)
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
-    
+
     registry.register_tool({OBFSTR("get_debugger_state"), OBFSTR("debugger"), OBFSTR("Get current debugger process state."),
         {}, get_debugger_state});
-    
+
     registry.register_tool({OBFSTR("start_process"), OBFSTR("debugger"), OBFSTR("Start debugger process."),
         {{OBFSTR("path"), OBFSTR("string"), OBFSTR("Executable path (optional, uses IDB)"), false},
          {OBFSTR("args"), OBFSTR("string"), OBFSTR("Command line arguments"), false},
          {OBFSTR("sdir"), OBFSTR("string"), OBFSTR("Start directory"), false}},
         start_process, false});
-    
+
     registry.register_tool({OBFSTR("exit_process"), OBFSTR("debugger"), OBFSTR("Exit/terminate debugger process."),
         {}, exit_process, false});
-    
+
     registry.register_tool({OBFSTR("attach_process"), OBFSTR("debugger"), OBFSTR("Attach to a running process."),
         {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Process ID (optional, shows dialog if omitted)"), false}},
         attach_process, false});
-    
+
     registry.register_tool({OBFSTR("detach_process"), OBFSTR("debugger"), OBFSTR("Detach from debugged process."),
         {}, detach_process, false});
-    
+
     registry.register_tool({OBFSTR("continue_execution"), OBFSTR("debugger"), OBFSTR("Continue execution of debugged process."),
         {}, continue_execution, false});
-    
+
     registry.register_tool({OBFSTR("run_to_address"), OBFSTR("debugger"), OBFSTR("Run until the specified address is reached."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address"), true}},
         run_to_address, false});
-    
+
     registry.register_tool({OBFSTR("step_into"), OBFSTR("debugger"), OBFSTR("Step into next instruction."),
         {}, step_into, false});
-    
+
     registry.register_tool({OBFSTR("step_over"), OBFSTR("debugger"), OBFSTR("Step over next instruction (skip calls)."),
         {}, step_over, false});
-    
+
     registry.register_tool({OBFSTR("step_out"), OBFSTR("debugger"), OBFSTR("Step out of current function (run until return)."),
         {}, step_out, false});
-    
+
     registry.register_tool({OBFSTR("suspend"), OBFSTR("debugger"), OBFSTR("Suspend executing process."),
         {}, suspend, false});
-    
+
     registry.register_tool({OBFSTR("list_breakpoints"), OBFSTR("debugger"), OBFSTR("List all breakpoints."),
         {}, list_breakpoints});
-    
+
     registry.register_tool({OBFSTR("add_breakpoint"), OBFSTR("debugger"), OBFSTR("Add breakpoint(s) at address(es)."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address(es) - single, comma-separated, or array"), true}},
         add_breakpoint, false});
-    
+
     registry.register_tool({OBFSTR("delete_breakpoint"), OBFSTR("debugger"), OBFSTR("Delete breakpoint(s) at address(es)."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address(es)"), true}},
         delete_breakpoint, false});
-    
+
     registry.register_tool({OBFSTR("toggle_breakpoint"), OBFSTR("debugger"), OBFSTR("Enable/disable a breakpoint."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Breakpoint address"), true},
          {OBFSTR("enable"), OBFSTR("boolean"), OBFSTR("Enable (true) or disable (false)"), false}},
         toggle_breakpoint, false});
-    
+
     registry.register_tool({OBFSTR("get_registers"), OBFSTR("debugger"),
         OBFSTR("Read registers. Modes: gp_current, all_current, all_threads, named."),
         {{OBFSTR("mode"), OBFSTR("string"), OBFSTR("Mode"), false, {OBFSTR("gp_current"), OBFSTR("all_current"), OBFSTR("all_threads"), OBFSTR("named")}},
@@ -4958,33 +4934,33 @@ void register_tools()
           json::object({{"type", "string"}})
         }},
         get_registers});
-    
+
     registry.register_tool({OBFSTR("set_register"), OBFSTR("debugger"), OBFSTR("Set a register value."),
         {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Register name"), true},
          {OBFSTR("value"), OBFSTR("number"), OBFSTR("Value to set"), true}},
         set_register, false});
-    
+
     registry.register_tool({OBFSTR("get_call_stack"), OBFSTR("debugger"), OBFSTR("Get call stack with module/symbol info."),
         {{OBFSTR("thread_id"), OBFSTR("number"), OBFSTR("Thread ID (optional, current thread)"), false}},
         get_call_stack});
-    
+
     registry.register_tool({OBFSTR("read_memory"), OBFSTR("debugger"), OBFSTR("Read memory from debugged process."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address"), true},
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes to read (default 256, max 65536)"), false}},
         read_memory});
-    
+
     registry.register_tool({OBFSTR("write_memory"), OBFSTR("debugger"), OBFSTR("Write memory to debugged process."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address"), true},
          {OBFSTR("bytes"), OBFSTR("string"), OBFSTR("Hex bytes (e.g., '90 90 90')"), true}},
         write_memory, false});
-    
+
     registry.register_tool({OBFSTR("get_threads"), OBFSTR("debugger"), OBFSTR("List all threads with names."),
         {}, get_threads});
-    
+
     registry.register_tool({OBFSTR("select_thread"), OBFSTR("debugger"), OBFSTR("Switch to a specific thread."),
         {{OBFSTR("thread_id"), OBFSTR("number"), OBFSTR("Thread ID"), true}},
         select_thread, false});
-    
+
     registry.register_tool({OBFSTR("get_modules"), OBFSTR("debugger"), OBFSTR("List loaded modules using debugger module API (falls back to segments)."),
         {}, get_modules});
 
@@ -5138,23 +5114,23 @@ tool_result_t list_segments(const json&)
 {
     json segments = json::array();
     int count = get_segm_qty();
-    
+
     for (int i = 0; i < count; i++)
     {
         segment_t* seg = getnseg(i);
         if (!seg)
             continue;
-        
+
         qstring name, sclass;
         get_segm_name(&name, seg);
         get_segm_class(&sclass, seg);
-        
+
         const char* perm_str = "";
         std::string perms;
         if (seg->perm & SEGPERM_READ)  perms += "R";
         if (seg->perm & SEGPERM_WRITE) perms += "W";
         if (seg->perm & SEGPERM_EXEC)  perms += "X";
-        
+
         segments.push_back({
             {"index", i},
             {"name", name.c_str()},
@@ -5167,14 +5143,14 @@ tool_result_t list_segments(const json&)
             {"type", seg->type}
         });
     }
-    
+
     return tool_result_t::ok(OBFSTR("Listed ") + std::to_string(count) + " segments", segments);
 }
 
 tool_result_t get_segment(const json& params)
 {
     ea_t ea = BADADDR;
-    
+
     if (params.contains("address"))
     {
         auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
@@ -5185,23 +5161,23 @@ tool_result_t get_segment(const json& params)
         segment_t* seg = get_segm_by_name(params["name"].get<std::string>().c_str());
         if (seg) ea = seg->start_ea;
     }
-    
+
     if (ea == BADADDR)
         return tool_result_t::error(OBFSTR("Segment not found"));
-    
+
     segment_t* seg = getseg(ea);
     if (!seg)
         return tool_result_t::error(OBFSTR("No segment at address"));
-    
+
     qstring name, sclass;
     get_segm_name(&name, seg);
     get_segm_class(&sclass, seg);
-    
+
     std::string perms;
     if (seg->perm & SEGPERM_READ) perms += "R";
     if (seg->perm & SEGPERM_WRITE) perms += "W";
     if (seg->perm & SEGPERM_EXEC) perms += "X";
-    
+
     json result;
     result["name"] = name.c_str();
     result["class"] = sclass.c_str();
@@ -5212,7 +5188,7 @@ tool_result_t get_segment(const json& params)
     result["bitness"] = seg->bitness == 0 ? 16 : seg->bitness == 1 ? 32 : 64;
     result["alignment"] = seg->align;
     result["type"] = seg->type;
-    
+
     return tool_result_t::ok(OBFSTR("Segment info retrieved"), result);
 }
 
@@ -5232,27 +5208,17 @@ tool_result_t create_segment(const json& params)
     if (*end_opt <= *start_opt)
         return tool_result_t::error(OBFSTR("End address must be greater than start address"));
 
-    // Align start DOWN and end UP to page boundaries to avoid
-    // IDA's "bad segment start" error. Per the IDA SDK segment.hpp:
-    //   "if s.end_ea < s.start_ea, then fail."
-    //   "if start==#BADADDR then start <- to_ea(para,0)."
-    // The add_segm(para,...) form computes a base from 'para' which can
-    // conflict with high kernel addresses. Using add_segm_ex() directly
-    // with explicit start_ea/end_ea avoids this issue entirely.
+
     ea_t aligned_start = *start_opt & ~0xFULL;
     ea_t aligned_end   = (*end_opt + 0xF) & ~0xFULL;
     if (aligned_end <= aligned_start)
         aligned_end = aligned_start + 0x1000;
 
-    // Check if segment already exists at this range
+
     if (getseg(aligned_start))
         return tool_result_t::error(OBFSTR("Segment already exists at ") + helpers::format_address(aligned_start));
 
-    // Use add_segm_ex for full control over segment properties.
-    // SDK segment.hpp add_segm_ex():
-    //   "s->start_ea, s->end_ea: range of the segment"
-    //   "s->bitness: 0=16bit, 1=32bit, 2=64bit"
-    //   "ADDSEG_QUIET: silent mode, no 'Adding segment...' in messages"
+
     segment_t seg;
     seg.start_ea = aligned_start;
     seg.end_ea   = aligned_end;
@@ -5290,17 +5256,17 @@ tool_result_t create_segment(const json& params)
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
-    
+
     registry.register_tool({OBFSTR("list_segments"), OBFSTR("segment"),
         OBFSTR("List all segments/sections in the binary."),
         {}, list_segments});
-    
+
     registry.register_tool({OBFSTR("get_segment"), OBFSTR("segment"),
         OBFSTR("Get detailed info about a segment by address or name."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address within segment"), false},
          {OBFSTR("name"), OBFSTR("string"), OBFSTR("Segment name"), false}},
         get_segment});
-    
+
     registry.register_tool({OBFSTR("create_segment"), OBFSTR("segment"),
         OBFSTR("Create a new segment with proper alignment. Automatically aligns addresses to paragraph "
                "boundaries and sets correct bitness (64/32/16) based on the current binary. "
@@ -5320,7 +5286,7 @@ namespace binary_tools
 tool_result_t get_binary_info(const json&)
 {
     json result;
-    
+
     qstring procname = inf_get_procname();
     result["processor"] = procname.c_str();
     result["bitness"] = inf_get_app_bitness();
@@ -5330,42 +5296,42 @@ tool_result_t get_binary_info(const json&)
     result["file_type"] = (int)inf_get_filetype();
     result["min_ea"] = helpers::format_address(inf_get_min_ea());
     result["max_ea"] = helpers::format_address(inf_get_max_ea());
-    
+
     result["function_count"] = (size_t)get_func_qty();
     result["segment_count"] = get_segm_qty();
     result["entry_count"] = (size_t)get_entry_qty();
     result["import_module_count"] = get_import_module_qty();
-    
+
     return tool_result_t::ok(OBFSTR("Binary info retrieved"), result);
 }
 
 tool_result_t get_idb_info(const json&)
 {
     json result;
-    
+
     result["binary_info"] = get_binary_info({}).data;
-    
+
     if (get_strlist_qty() == 0)
         build_strlist();
     result["string_count"] = (size_t)get_strlist_qty();
-    
+
     til_t* ti = get_idati();
     if (ti)
         result["local_type_count"] = get_ordinal_count(ti);
-    
+
     result["named_count"] = (size_t)get_nlist_size();
-    
+
     return tool_result_t::ok(OBFSTR("IDB info retrieved"), result);
 }
 
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
-    
+
     registry.register_tool({OBFSTR("get_binary_info"), OBFSTR("binary"),
         OBFSTR("Get binary file metadata (processor, bitness, file type, etc)."),
         {}, get_binary_info});
-    
+
     registry.register_tool({OBFSTR("get_idb_info"), OBFSTR("binary"),
         OBFSTR("Get IDA database info (function count, types, strings, etc)."),
         {}, get_idb_info});
@@ -5379,7 +5345,7 @@ namespace python_tools
 tool_result_t execute_python(const json& params)
 {
     std::string code = params["code"].get<std::string>();
-    
+
     std::string wrapper = R"PY(
 import sys, io, json as _json
 _aida_stdout = io.StringIO()
@@ -5410,17 +5376,17 @@ _aida_out = _json.dumps({
     "stderr": _aida_stderr.getvalue()
 })
 )PY";
-    
+
     extlang_object_t python = find_extlang_by_name("python");
     if (!python)
         return tool_result_t::error(OBFSTR("Python interpreter not available in IDA"));
-    
+
     qstring errbuf;
     bool ok = python->eval_snippet(wrapper.c_str(), &errbuf);
-    
+
     if (!ok)
         return tool_result_t::error(OBFSTR("Python execution failed: ") + std::string(errbuf.c_str()));
-    
+
     idc_value_t rv;
     qstring eval_err;
     if (python->eval_expr(&rv, BADADDR, "_aida_out", &eval_err))
@@ -5433,14 +5399,14 @@ _aida_out = _json.dumps({
         }
         catch (...) {}
     }
-    
+
     return tool_result_t::ok(OBFSTR("Python executed (no structured output)"));
 }
 
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
-    
+
     registry.register_tool({OBFSTR("execute_python"), OBFSTR("python"),
         OBFSTR("Execute arbitrary Python code in IDA context. Returns dict with result/stdout/stderr. ") +
         OBFSTR("Supports Jupyter-style evaluation (expressions auto-return, statements exec)."),
@@ -5458,9 +5424,9 @@ tool_result_t patch_instruction(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    
+
     std::string assembly = params["assembly"].get<std::string>();
-    
+
     std::string py_code = "import ida_idp, ida_bytes, idc\n"
         "ea = " + std::to_string(*ea_opt) + "\n"
         "ok, buf = ida_idp.assemble(ea, 0, ea, True, '" + assembly + "')\n"
@@ -5470,15 +5436,15 @@ tool_result_t patch_instruction(const json& params)
         "    ida_bytes.patch_bytes(ea, bytes(buf))\n"
         "    _aida_patch_result = True\n"
         "    _aida_patch_size = len(buf)\n";
-    
+
     extlang_object_t python = find_extlang_by_name("python");
     if (!python)
         return tool_result_t::error(OBFSTR("Python not available for assembly"));
-    
+
     qstring errbuf;
     if (!python->eval_snippet(py_code.c_str(), &errbuf))
         return tool_result_t::error(OBFSTR("Assembly failed: ") + std::string(errbuf.c_str()));
-    
+
     idc_value_t rv;
     qstring eval_err;
     if (python->eval_expr(&rv, BADADDR, "_aida_patch_result", &eval_err)
@@ -5488,13 +5454,13 @@ tool_result_t patch_instruction(const json& params)
         int patch_sz = 0;
         if (python->eval_expr(&sz, BADADDR, "_aida_patch_size", &eval_err) && sz.is_integral())
             patch_sz = (int)(sz.vtype == VT_INT64 ? sz.i64 : sz.num);
-        
+
         json result;
         result["address"] = helpers::format_address(*ea_opt);
         result["bytes_patched"] = patch_sz;
         return tool_result_t::ok(OBFSTR("Instruction patched at ") + helpers::format_address(*ea_opt), result);
     }
-    
+
     return tool_result_t::error(OBFSTR("Assembly failed: assembler could not encode '") + assembly + "' at " + helpers::format_address(*ea_opt));
 }
 
@@ -6103,7 +6069,7 @@ tool_result_t analyze_control_flow(const json& params)
                     ++back_edges;
             }
         }
-        
+
         ea_t fall = last_insn;
         insn_t last;
         if (decode_insn(&last, last_insn) > 0)
@@ -6952,7 +6918,7 @@ void register_tools()
         detect_anti_analysis});
 }
 
-} // namespace analysis_tools
+}
 
 namespace deobfuscation_tools
 {
@@ -7547,7 +7513,7 @@ tool_result_t decode_strings_in_function(const json& params)
 
         cur += len;
     }
-    
+
     if (stack_str_count >= 3 && !stack_str_chars.empty())
     {
         json s;
@@ -8153,7 +8119,7 @@ tool_result_t reconstruct_imports(const json& params)
         ctx.map = &import_map;
         ctx.module = mod_name.c_str();
 
-        enum_import_names(i, [](ea_t ea, const char* name, uval_t /*ord*/, void* param) -> int {
+        enum_import_names(i, [](ea_t ea, const char* name, uval_t , void* param) -> int {
             auto* c = static_cast<enum_ctx_t*>(param);
             if (name && name[0])
                 (*c->map)[ea] = std::string(c->module) + "!" + name;
@@ -8211,7 +8177,7 @@ tool_result_t reconstruct_imports(const json& params)
     int names_set = 0;
     for (size_t i = 0; i < import_map.size() && i < 10000; ++i)
     {
-        // Already handled by the IDA loader for known imports
+
     }
 
     json call_thunks = json::array();
@@ -8656,7 +8622,7 @@ void register_tools()
         full_deobfuscation_pass, false});
 }
 
-} // namespace deobfuscation_tools
+}
 
 namespace driver_tools
 {
@@ -8844,7 +8810,7 @@ tool_result_t driver_dump_module(const json& params)
         return tool_result_t::error(OBFSTR("Module size too large (>256MB): ") + std::to_string(module_size));
 
     std::vector<std::uint8_t> module_data(module_size, 0);
-    // Use 64KB chunks instead of 4KB for significantly faster reads
+
     const std::size_t chunk = 0x10000;
     std::size_t total_read = 0;
 
@@ -8859,8 +8825,7 @@ tool_result_t driver_dump_module(const json& params)
     }
     hide_wait_box();
 
-    // ALWAYS save to Downloads folder first, before any IDB patching.
-    // This ensures the user has the raw dump file even if IDA stalls during patching.
+
     std::string output_path = params.value("output_path", std::string());
     if (output_path.empty())
     {
@@ -8868,7 +8833,7 @@ tool_result_t driver_dump_module(const json& params)
                       helpers::format_address(base) + ".bin";
     }
 
-    // Save dump to file IMMEDIATELY
+
     ensure_parent_dir_exists(output_path);
     {
         HANDLE hFile = CreateFileA(output_path.c_str(), GENERIC_WRITE, 0, nullptr,
@@ -8889,13 +8854,11 @@ tool_result_t driver_dump_module(const json& params)
 
     if (params.value("patch_idb", true))
     {
-        // Use put_bytes() for bulk patching instead of per-byte put_byte().
-        // SDK bytes.hpp put_bytes(): "Modify the specified number of bytes of the program."
-        // This is orders of magnitude faster than individual put_byte() calls
-        // and prevents IDA from freezing on large modules.
+
+
         show_wait_box("HIDECANCEL\nAiDA: Patching IDA database (bulk)...");
 
-        // Patch segment by segment for correctness (only write to mapped areas)
+
         int seg_count = get_segm_qty();
         for (int si = 0; si < seg_count; ++si)
         {
@@ -9182,362 +9145,8 @@ tool_result_t driver_enumerate_modules(const json&)
     return tool_result_t::ok(OBFSTR("Enumerated ") + std::to_string(modules.size()) + " modules", result);
 }
 
-struct post_dump_stats_t
-{
-    int initial_func_count   = 0;
-    int exports_created      = 0;
-    int entry_points_created = 0;
-    int code_insns_created   = 0;
-    int prologue_funcs_created = 0;
-    int xref_funcs_created   = 0;
-    int final_func_count     = 0;
 
-    json to_json() const
-    {
-        json j;
-        j["initial_functions"]    = initial_func_count;
-        j["exports_created"]      = exports_created;
-        j["entry_points_created"] = entry_points_created;
-        j["code_insns_forced"]    = code_insns_created;
-        j["prologue_funcs_found"] = prologue_funcs_created;
-        j["xref_funcs_found"]     = xref_funcs_created;
-        j["final_functions"]      = final_func_count;
-        j["total_new_functions"]  = final_func_count - initial_func_count;
-        return j;
-    }
-};
 
-static void run_post_dump_analysis(
-    std::uint64_t base_addr,
-    std::size_t   dump_size,
-    const std::uint8_t* pe_header,
-    std::size_t   hdr_size,
-    const std::uint8_t* image_data,
-    std::size_t   image_len,
-    bool          is_kernel,
-    post_dump_stats_t& stats,
-    json*         sections_arr = nullptr)
-{
-    ea_t range_start = static_cast<ea_t>(base_addr);
-    ea_t range_end   = static_cast<ea_t>(base_addr + dump_size);
-
-    if (hdr_size < 0x40 || pe_header[0] != 'M' || pe_header[1] != 'Z')
-        return;
-    std::uint32_t pe_off = *reinterpret_cast<const std::uint32_t*>(&pe_header[0x3C]);
-    if (pe_off + 0x18 > hdr_size || pe_header[pe_off] != 'P' || pe_header[pe_off + 1] != 'E')
-        return;
-
-    std::uint16_t num_sections = *reinterpret_cast<const std::uint16_t*>(&pe_header[pe_off + 0x06]);
-    std::uint16_t opt_size = *reinterpret_cast<const std::uint16_t*>(&pe_header[pe_off + 0x14]);
-    std::uint32_t section_table_off = pe_off + 0x18 + opt_size;
-    bool is_pe64 = (*reinterpret_cast<const std::uint16_t*>(&pe_header[pe_off + 0x18]) == 0x020B);
-
-    for (ea_t fea = range_start; fea < range_end; fea = next_addr(fea))
-    {
-        func_t* fn = get_func(fea);
-        if (fn && fn->start_ea == fea) ++stats.initial_func_count;
-        if (fn) fea = fn->end_ea - 1;
-    }
-
-    replace_wait_box("HIDECANCEL\nAiDA: [1/6] Running initial auto-analysis...");
-    plan_range(range_start, range_end);
-    responsive_auto_wait(range_start, range_end, "[1/6] Running initial auto-analysis...");
-
-    replace_wait_box("HIDECANCEL\nAiDA: [2/6] Parsing PE exports and entry points...");
-    {
-        if (pe_off + 24 + 20 <= hdr_size)
-        {
-            std::uint32_t entry_rva = *reinterpret_cast<const std::uint32_t*>(
-                &pe_header[pe_off + 24 + 16]);
-            if (entry_rva != 0)
-            {
-                ea_t entry_ea = static_cast<ea_t>(base_addr + entry_rva);
-                if (is_loaded(entry_ea))
-                {
-                    create_insn(entry_ea);
-                    if (!get_func(entry_ea) && add_func(entry_ea, BADADDR))
-                        ++stats.entry_points_created;
-                    const char* ep_name = is_kernel ? "DriverEntry" : "ModuleEntryPoint";
-                    add_entry(0, entry_ea, ep_name, true, AEF_UTF8);
-                    force_name(entry_ea, ep_name, SN_FORCE | SN_NODUMMY);
-                }
-            }
-        }
-
-        if (image_data && image_len > 0)
-        {
-            std::uint32_t dd_offset = pe_off + 24 + (is_pe64 ? 112 : 96);
-            std::uint32_t export_dir_rva = 0, export_dir_size = 0;
-            if (dd_offset + 8 <= hdr_size)
-            {
-                export_dir_rva  = *reinterpret_cast<const std::uint32_t*>(&pe_header[dd_offset]);
-                export_dir_size = *reinterpret_cast<const std::uint32_t*>(&pe_header[dd_offset + 4]);
-            }
-
-            if (export_dir_rva != 0 && export_dir_size >= 40 && export_dir_rva < image_len)
-            {
-                const std::uint8_t* exp_dir = &image_data[export_dir_rva];
-                std::uint32_t nf  = *reinterpret_cast<const std::uint32_t*>(exp_dir + 20);
-                std::uint32_t nn  = *reinterpret_cast<const std::uint32_t*>(exp_dir + 24);
-                std::uint32_t atr = *reinterpret_cast<const std::uint32_t*>(exp_dir + 28);
-                std::uint32_t ntr = *reinterpret_cast<const std::uint32_t*>(exp_dir + 32);
-                std::uint32_t ob  = *reinterpret_cast<const std::uint32_t*>(exp_dir + 16);
-                std::uint32_t otr = *reinterpret_cast<const std::uint32_t*>(exp_dir + 36);
-
-                std::map<std::uint32_t, std::string> ordinal_names;
-                for (std::uint32_t n = 0; n < nn && n < 4096; ++n)
-                {
-                    if (ntr + n * 4 + 4 > image_len || otr + n * 2 + 2 > image_len) break;
-                    std::uint32_t name_rva = *reinterpret_cast<const std::uint32_t*>(&image_data[ntr + n * 4]);
-                    std::uint16_t oi = *reinterpret_cast<const std::uint16_t*>(&image_data[otr + n * 2]);
-                    if (name_rva < image_len)
-                    {
-                        std::string en;
-                        for (std::uint32_t c = name_rva; c < image_len && image_data[c]; ++c)
-                            en += static_cast<char>(image_data[c]);
-                        if (!en.empty()) ordinal_names[oi] = en;
-                    }
-                }
-
-                for (std::uint32_t i = 0; i < nf && i < 4096; ++i)
-                {
-                    if (atr + i * 4 + 4 > image_len) break;
-                    std::uint32_t fr = *reinterpret_cast<const std::uint32_t*>(&image_data[atr + i * 4]);
-                    if (fr == 0 || fr >= image_len) continue;
-                    ea_t fea = static_cast<ea_t>(base_addr + fr);
-                    if (!is_loaded(fea)) continue;
-                    create_insn(fea);
-                    if (!get_func(fea) && add_func(fea, BADADDR))
-                        ++stats.exports_created;
-                    auto it = ordinal_names.find(i);
-                    if (it != ordinal_names.end() && !it->second.empty())
-                    {
-                        force_name(fea, it->second.c_str(), SN_FORCE | SN_NODUMMY);
-                        add_entry(ob + i, fea, it->second.c_str(), true, AEF_UTF8);
-                    }
-                }
-            }
-        }
-    }
-
-    replace_wait_box("HIDECANCEL\nAiDA: [3/6] Force-creating code in executable sections...");
-    for (int s = 0; s < num_sections && section_table_off + (s + 1) * 40 <= hdr_size; s++)
-    {
-        const std::uint8_t* sec_hdr = &pe_header[section_table_off + s * 40];
-        std::uint32_t sec_vsize = *reinterpret_cast<const std::uint32_t*>(sec_hdr + 8);
-        std::uint32_t sec_vaddr = *reinterpret_cast<const std::uint32_t*>(sec_hdr + 12);
-        std::uint32_t sec_chars = *reinterpret_cast<const std::uint32_t*>(sec_hdr + 36);
-        if (!(sec_chars & 0x20000000)) continue;
-
-        ea_t sec_start = static_cast<ea_t>(base_addr + sec_vaddr);
-        ea_t sec_end   = sec_start + sec_vsize;
-
-        double entropy = 0.0;
-        {
-            std::size_t sample_size = std::min<std::size_t>(sec_vsize, 4096);
-            int freq[256] = {};
-            std::size_t counted = 0;
-            for (std::size_t b = 0; b < sample_size; ++b)
-            {
-                if (!is_loaded(sec_start + b)) continue;
-                freq[get_byte(sec_start + b)]++;
-                ++counted;
-            }
-            if (counted > 0)
-            {
-                for (int f = 0; f < 256; ++f)
-                {
-                    if (freq[f] == 0) continue;
-                    double p = static_cast<double>(freq[f]) / static_cast<double>(counted);
-                    entropy -= p * std::log2(p);
-                }
-            }
-        }
-
-        if (sections_arr)
-        {
-            char sn[9] = {};
-            std::memcpy(sn, sec_hdr, 8);
-            for (auto& si : *sections_arr)
-            {
-                if (si.value("name", "") == sn)
-                {
-                    si["entropy"] = entropy;
-                    if (entropy > 7.5) si["skipped_high_entropy"] = true;
-                }
-            }
-        }
-        if (entropy > 7.5) continue;
-
-        for (ea_t ea = sec_start; ea < sec_end; )
-        {
-            if (!is_loaded(ea)) { ea = next_addr(ea); if (ea == BADADDR || ea >= sec_end) break; continue; }
-            flags64_t fl = get_flags(ea);
-            if (is_code(fl))
-            {
-                insn_t existing;
-                int ilen = decode_insn(&existing, ea);
-                ea += (ilen > 0) ? ilen : 1;
-                continue;
-            }
-            insn_t test;
-            int len = decode_insn(&test, ea);
-            if (len > 0 && get_byte(ea) != 0x00)
-            {
-                int created = create_insn(ea);
-                if (created > 0) { ++stats.code_insns_created; ea += created; continue; }
-            }
-            ++ea;
-        }
-    }
-    responsive_auto_wait(range_start, range_end, "[3/6] Force-creating code...");
-
-    replace_wait_box("HIDECANCEL\nAiDA: [4/6] Scanning for function prologues...");
-    {
-        struct mini_sig_t { const uint8_t* bytes; const uint8_t* mask; int length; };
-        static const uint8_t p1_b[]  = {0x55, 0x48, 0x89, 0xE5};
-        static const uint8_t p1_m[]  = {0xFF, 0xFF, 0xFF, 0xFF};
-        static const uint8_t p2_b[]  = {0x55, 0x48, 0x8B, 0xEC};
-        static const uint8_t p2_m[]  = {0xFF, 0xFF, 0xFF, 0xFF};
-        static const uint8_t p3_b[]  = {0x48, 0x83, 0xEC, 0x00};
-        static const uint8_t p3_m[]  = {0xFF, 0xFF, 0xFF, 0x00};
-        static const uint8_t p4_b[]  = {0x53, 0x48, 0x83, 0xEC, 0x00};
-        static const uint8_t p4_m[]  = {0xFF, 0xFF, 0xFF, 0xFF, 0x00};
-        static const uint8_t p5_b[]  = {0x48, 0x89, 0x4C, 0x24, 0x08};
-        static const uint8_t p5_m[]  = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-        static const uint8_t p6_b[]  = {0x48, 0x89, 0x54, 0x24, 0x10};
-        static const uint8_t p6_m[]  = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-        static const uint8_t p7_b[]  = {0x48, 0x89, 0x5C, 0x24, 0x00, 0x48, 0x89, 0x74, 0x24};
-        static const uint8_t p7_m[]  = {0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF};
-        static const uint8_t p8_b[]  = {0x48, 0x89, 0x5C, 0x24, 0x00, 0x57, 0x48, 0x83, 0xEC};
-        static const uint8_t p8_m[]  = {0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF};
-        static const uint8_t p9_b[]  = {0x40, 0x53, 0x48, 0x83, 0xEC};
-        static const uint8_t p9_m[]  = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-        static const uint8_t p10_b[] = {0x40, 0x55, 0x48, 0x83, 0xEC};
-        static const uint8_t p10_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-        static const uint8_t p11_b[] = {0x40, 0x57, 0x48, 0x83, 0xEC};
-        static const uint8_t p11_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-        static const uint8_t p12_b[] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58};
-        static const uint8_t p12_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-        static const uint8_t p13_b[] = {0x48, 0x8B, 0xC4, 0x48, 0x83, 0xEC};
-        static const uint8_t p13_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-        static const uint8_t p14_b[] = {0x48, 0x8B, 0xC4, 0x48, 0x81, 0xEC};
-        static const uint8_t p14_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-        static const uint8_t p15_b[] = {0x4C, 0x8B, 0xDC, 0x49, 0x89};
-        static const uint8_t p15_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-        static const uint8_t p16_b[] = {0x41, 0x56, 0x41, 0x55};
-        static const uint8_t p16_m[] = {0xFF, 0xFF, 0xFF, 0xFF};
-        static const uint8_t p17_b[] = {0x57, 0x56, 0x53};
-        static const uint8_t p17_m[] = {0xFF, 0xFF, 0xFF};
-        static const uint8_t p18_b[] = {0x55, 0x48, 0x83, 0xEC, 0x00};
-        static const uint8_t p18_m[] = {0xFF, 0xFF, 0xFF, 0xFF, 0x00};
-
-        static const mini_sig_t prologues[] = {
-            {p1_b,  p1_m,  4}, {p2_b,  p2_m,  4}, {p3_b,  p3_m,  4},
-            {p4_b,  p4_m,  5}, {p5_b,  p5_m,  5}, {p6_b,  p6_m,  5},
-            {p7_b,  p7_m,  9}, {p8_b,  p8_m,  9}, {p9_b,  p9_m,  5},
-            {p10_b, p10_m, 5}, {p11_b, p11_m, 5}, {p12_b, p12_m, 6},
-            {p13_b, p13_m, 6}, {p14_b, p14_m, 6}, {p15_b, p15_m, 5},
-            {p16_b, p16_m, 4}, {p17_b, p17_m, 3}, {p18_b, p18_m, 5},
-        };
-        constexpr int NUM_PROBES = sizeof(prologues) / sizeof(prologues[0]);
-
-        for (int s = 0; s < num_sections && section_table_off + (s + 1) * 40 <= hdr_size; s++)
-        {
-            const std::uint8_t* sec_hdr = &pe_header[section_table_off + s * 40];
-            std::uint32_t sec_vsize = *reinterpret_cast<const std::uint32_t*>(sec_hdr + 8);
-            std::uint32_t sec_vaddr = *reinterpret_cast<const std::uint32_t*>(sec_hdr + 12);
-            std::uint32_t sec_chars = *reinterpret_cast<const std::uint32_t*>(sec_hdr + 36);
-            if (!(sec_chars & 0x20000000)) continue;
-
-            ea_t sec_start = static_cast<ea_t>(base_addr + sec_vaddr);
-            ea_t sec_end   = sec_start + sec_vsize;
-
-            for (ea_t ea = sec_start; ea < sec_end && stats.prologue_funcs_created < 50000; )
-            {
-                if (!is_loaded(ea)) { ea = next_addr(ea); if (ea == BADADDR || ea >= sec_end) break; continue; }
-                func_t* efn = get_func(ea);
-                if (efn) { ea = efn->end_ea; continue; }
-
-                bool matched = false;
-                for (int p = 0; p < NUM_PROBES && !matched; ++p)
-                {
-                    const auto& sig = prologues[p];
-                    if (ea + sig.length > sec_end) continue;
-                    bool sig_ok = true;
-                    for (int b = 0; b < sig.length; ++b)
-                    {
-                        if (!is_loaded(ea + b)) { sig_ok = false; break; }
-                        if ((get_byte(ea + b) & sig.mask[b]) != (sig.bytes[b] & sig.mask[b]))
-                        { sig_ok = false; break; }
-                    }
-                    if (!sig_ok) continue;
-
-                    insn_t chk;
-                    int valid_count = 0;
-                    ea_t check_ea = ea;
-                    for (int ci = 0; ci < 8 && check_ea < sec_end; ++ci)
-                    {
-                        int clen = decode_insn(&chk, check_ea);
-                        if (clen <= 0) break;
-                        ++valid_count;
-                        check_ea += clen;
-                        if (chk.itype == NN_retn || chk.itype == NN_retf ||
-                            chk.itype == NN_retnw || chk.itype == NN_retnd ||
-                            chk.itype == NN_retnq) break;
-                    }
-                    if (valid_count < 3) continue;
-                    matched = true;
-                    create_insn(ea);
-                    if (!get_func(ea) && add_func(ea, BADADDR))
-                        ++stats.prologue_funcs_created;
-                }
-                if (!matched) ++ea;
-                else { func_t* fn = get_func(ea); ea = fn ? fn->end_ea : (ea + 1); }
-            }
-        }
-    }
-    responsive_auto_wait(range_start, range_end, "[4/6] Scanning for prologues...");
-
-    replace_wait_box("HIDECANCEL\nAiDA: [5/6] Creating functions from call targets...");
-    {
-        std::set<ea_t> call_targets;
-        for (ea_t ea = range_start; ea < range_end; )
-        {
-            flags64_t fl = get_flags(ea);
-            if (!is_code(fl)) { ea = next_addr(ea); if (ea == BADADDR || ea >= range_end) break; continue; }
-            insn_t insn;
-            int ilen = decode_insn(&insn, ea);
-            if (ilen <= 0) { ++ea; continue; }
-            if ((insn.itype == NN_call || insn.itype == NN_callfi || insn.itype == NN_callni)
-                && insn.ops[0].type == o_near)
-            {
-                ea_t target = insn.ops[0].addr;
-                if (target >= range_start && target < range_end &&
-                    is_loaded(target) && !get_func(target))
-                    call_targets.insert(target);
-            }
-            ea += ilen;
-        }
-        for (ea_t target : call_targets)
-        {
-            if (get_func(target)) continue;
-            create_insn(target);
-            if (add_func(target, BADADDR))
-                ++stats.xref_funcs_created;
-        }
-    }
-
-    replace_wait_box("HIDECANCEL\nAiDA: [6/6] Final analysis pass...");
-    responsive_plan_and_wait(range_start, range_end, true, "[6/6] Final analysis pass...");
-
-    for (ea_t fea = range_start; fea < range_end; fea = next_addr(fea))
-    {
-        func_t* fn = get_func(fea);
-        if (fn && fn->start_ea == fea) ++stats.final_func_count;
-        if (fn) fea = fn->end_ea - 1;
-    }
-}
 
 tool_result_t driver_dump_to_idb(const json& params)
 {
@@ -9603,10 +9212,8 @@ tool_result_t driver_dump_to_idb(const json& params)
         bool created = false;
         if (!getseg(sec_start))
         {
-            // Use add_segm_ex() instead of add_segm(0,...) per SDK segment.hpp:
-            //   "add_segm_ex(): full control over segment properties"
-            //   "ADDSEG_QUIET: silent mode"
-            // This avoids "bad segment start" for high kernel addresses.
+
+
             segment_t new_seg;
             new_seg.start_ea = sec_start;
             new_seg.end_ea   = sec_end;
@@ -9628,8 +9235,7 @@ tool_result_t driver_dump_to_idb(const json& params)
             }
         }
 
-        // Use put_bytes() for bulk write instead of per-byte put_byte().
-        // SDK bytes.hpp put_bytes(): "Modify the specified number of bytes of the program."
+
         std::vector<std::uint8_t> sec_bytes(vsize, 0);
         std::size_t got = device->read_raw(sec_start, sec_bytes.data(), vsize);
         if (got > 0)
@@ -9639,7 +9245,7 @@ tool_result_t driver_dump_to_idb(const json& params)
     std::vector<std::uint8_t> full_image(image_size, 0);
     device->read_raw(base, full_image.data(), image_size);
 
-    // Save dump to Downloads IMMEDIATELY, before analysis
+
     std::string output_path = get_downloads_folder() + "dumped_module_" +
                               helpers::format_address(base) + ".bin";
     ensure_parent_dir_exists(output_path);
@@ -9655,20 +9261,6 @@ tool_result_t driver_dump_to_idb(const json& params)
         }
     }
 
-    post_dump_stats_t dump_stats;
-    if (params.value("analyze", true))
-    {
-        show_wait_box("HIDECANCEL\nAiDA: Running post-dump analysis pipeline...");
-        run_post_dump_analysis(
-            static_cast<std::uint64_t>(base), image_size,
-            pe_hdr, sizeof(pe_hdr),
-            full_image.data(), full_image.size(),
-            false,
-            dump_stats,
-            &segs_info);
-        hide_wait_box();
-    }
-
     json result;
     result["base"]             = helpers::format_address(base);
     result["image_size"]       = image_size;
@@ -9676,16 +9268,16 @@ tool_result_t driver_dump_to_idb(const json& params)
     result["segments"]         = segs_info;
     result["saved_to"]         = output_path;
     result["can_load_in_ida"]  = true;
-    result["post_dump_analysis"] = dump_stats.to_json();
     result["note"]             = OBFSTR(
-        "Dump file saved to: ") + output_path + OBFSTR(". "
-        "For best results, open this file in a NEW IDA Pro instance: "
-        "File > Open > select the dumped file. Use manual load with image base ") +
-        helpers::format_address(base) + OBFSTR(".");
+        "IMPORTANT: The dump file has been saved to: ") + output_path + OBFSTR(". "
+        "To get full and correct analysis you MUST open this file in a NEW IDA Pro instance: "
+        "File -> Open -> select the dumped .bin file -> enable 'Manual load' -> "
+        "set the image base to ") + helpers::format_address(base) + OBFSTR(". "
+        "IDA's built-in loader/autoanalysis will handle code creation, function detection, "
+        "FLIRT signatures, and type library application automatically.");
     return tool_result_t::ok(
-        OBFSTR("Dumped ") + std::to_string(segs_created) + " sections, " +
-        std::to_string(dump_stats.final_func_count) + " functions recovered (was " +
-        std::to_string(dump_stats.initial_func_count) + ") -> " + output_path, result);
+        OBFSTR("Dumped ") + std::to_string(segs_created) + OBFSTR(" sections -> ") + output_path +
+        OBFSTR(". Open this file in a NEW IDA Pro instance for proper analysis."), result);
 }
 
 tool_result_t driver_bypass_and_dump(const json& params)
@@ -9738,7 +9330,7 @@ tool_result_t driver_bypass_and_dump(const json& params)
 
     std::vector<std::uint8_t> img(img_size, 0);
     std::size_t total_read = 0;
-    // Use 64KB chunks for faster reads instead of 4KB
+
     const std::size_t chunk = 0x10000;
 
     show_wait_box("HIDECANCEL\nAiDA: Bypassing & dumping %s (0x%X bytes)...", process_name.c_str(), img_size);
@@ -9753,8 +9345,7 @@ tool_result_t driver_bypass_and_dump(const json& params)
     hide_wait_box();
     log("dump_image", total_read > 0, std::to_string(total_read) + "/" + std::to_string(img_size) + " bytes");
 
-    // Save dump to Downloads IMMEDIATELY before any IDB patching.
-    // This ensures the user always gets the raw dump even if IDA stalls.
+
     std::string output_path = get_downloads_folder() + "dumped_" + process_name + "_" +
                               helpers::format_address(static_cast<ea_t>(base)) + ".bin";
     ensure_parent_dir_exists(output_path);
@@ -9771,8 +9362,7 @@ tool_result_t driver_bypass_and_dump(const json& params)
         log("save_to_disk", true, output_path);
     }
 
-    // Use put_bytes() bulk API instead of per-byte put_byte() to avoid UI freeze.
-    // SDK bytes.hpp put_bytes(): "Modify the specified number of bytes of the program."
+
     show_wait_box("HIDECANCEL\nAiDA: Patching IDA database (bulk)...");
     std::size_t patched = 0;
     int seg_count = get_segm_qty();
@@ -9799,22 +9389,6 @@ tool_result_t driver_bypass_and_dump(const json& params)
     bool hb = device->send_heartbeat();
     log("heartbeat", hb, hb ? "Session maintained" : "Failed (non-fatal)");
 
-    post_dump_stats_t dump_stats;
-    if (params.value("analyze", true))
-    {
-        show_wait_box("HIDECANCEL\nAiDA: Running post-dump analysis pipeline...");
-        run_post_dump_analysis(
-            static_cast<std::uint64_t>(base), img_size,
-            pe_hdr, sizeof(pe_hdr),
-            img.data(), img.size(),
-            false,
-            dump_stats);
-        hide_wait_box();
-        log("post_dump_analysis", dump_stats.final_func_count > dump_stats.initial_func_count,
-            std::to_string(dump_stats.final_func_count) + " functions (was " +
-            std::to_string(dump_stats.initial_func_count) + ")");
-    }
-
     json result;
     result["process"]       = process_name;
     result["pid"]           = pid;
@@ -9827,18 +9401,18 @@ tool_result_t driver_bypass_and_dump(const json& params)
     result["saved_to"]      = output_path;
     result["can_load_in_ida"] = true;
     result["steps"]         = steps;
-    result["post_dump_analysis"] = dump_stats.to_json();
     result["note"]          = OBFSTR(
-        "Dump file saved to: ") + output_path + OBFSTR(". "
-        "For best static analysis, open this file in a NEW IDA Pro instance: "
-        "File > Open > select the dumped file. Use manual load with image base ") +
-        helpers::format_address(static_cast<ea_t>(base)) + OBFSTR(".");
+        "IMPORTANT: The dump file has been saved to: ") + output_path + OBFSTR(". "
+        "To get full and correct analysis you MUST open this file in a NEW IDA Pro instance: "
+        "File -> Open -> select the dumped .bin file -> enable 'Manual load' -> "
+        "set the image base to ") + helpers::format_address(static_cast<ea_t>(base)) + OBFSTR(". "
+        "IDA's built-in loader/autoanalysis will handle code creation, function detection, "
+        "FLIRT signatures, and type library application automatically.");
 
     return tool_result_t::ok(OBFSTR("Bypass-and-dump complete for ") + process_name +
                              OBFSTR(": ") + std::to_string(total_read) + OBFSTR("/") +
-                             std::to_string(img_size) + OBFSTR(" bytes, ") +
-                             std::to_string(dump_stats.final_func_count) +
-                             OBFSTR(" functions recovered -> ") + output_path, result);
+                             std::to_string(img_size) + OBFSTR(" bytes -> ") + output_path +
+                             OBFSTR(". Open this file in a NEW IDA Pro instance for proper analysis."), result);
 }
 
 static std::string resolve_nt_path_to_win32(const std::string& nt_path)
@@ -10106,7 +9680,7 @@ tool_result_t driver_dump_kernel_module(const json& params)
         show_wait_box("HIDECANCEL\nAiDA: Dumping kernel module %s from memory (0x%X bytes)...",
                       found_name.c_str(), dump_size);
 
-        constexpr std::size_t CHUNK_SIZE = 0x10000;  // 64KB chunks for faster kernel reads
+        constexpr std::size_t CHUNK_SIZE = 0x10000;
         std::size_t total_read = header_read;
         std::size_t readable_pages = 1;
 
@@ -10519,7 +10093,7 @@ tool_result_t driver_kernel_dump_module(const json& params)
     std::memcpy(image.data(), header.data(), std::min<std::size_t>(hdr_read, dump_size));
 
     std::size_t total_read = hdr_read;
-    constexpr std::size_t K_CHUNK = 0x10000;  // 64KB chunks for faster kernel reads
+    constexpr std::size_t K_CHUNK = 0x10000;
     for (std::uint32_t offset = 0x1000; offset < dump_size; offset += K_CHUNK)
     {
         std::size_t to_read = K_CHUNK;
@@ -10534,7 +10108,7 @@ tool_result_t driver_kernel_dump_module(const json& params)
                              (offset * 100.0) / dump_size);
     }
 
-    // Always save raw dump to Downloads for user to open in new IDA instance
+
     std::string saved_to = output_path;
     if (saved_to.empty())
         saved_to = get_downloads_folder() + "dumped_" + found_name;
@@ -10558,7 +10132,6 @@ tool_result_t driver_kernel_dump_module(const json& params)
 
     std::size_t patched = 0;
     json sections_arr = json::array();
-    post_dump_stats_t stats;
 
     if (patch_idb)
     {
@@ -10590,7 +10163,7 @@ tool_result_t driver_kernel_dump_module(const json& params)
                 add_segm_ex(&seg, sec_name, nullptr, ADDSEG_QUIET | ADDSEG_NOSREG);
             }
 
-            // Bulk write entire section data at once instead of per-byte patch_byte()
+
             std::uint32_t copy_len = virt_size;
             if (virt_addr + copy_len > dump_size)
                 copy_len = dump_size - virt_addr;
@@ -10612,16 +10185,9 @@ tool_result_t driver_kernel_dump_module(const json& params)
             sections_arr.push_back(sec_info);
         }
 
-        if (analyze)
-        {
-            run_post_dump_analysis(
-                base_addr, dump_size,
-                header.data(), hdr_read,
-                image.data(), image.size(),
-                true,
-                stats,
-                &sections_arr);
-        }
+        // Heavy analysis (code creation, prologue scanning, call-target
+        // resolution) is deliberately skipped — users should open the
+        // saved dump in a NEW IDA Pro instance for proper autoanalysis.
     }
 
     hide_wait_box();
@@ -10642,19 +10208,21 @@ tool_result_t driver_kernel_dump_module(const json& params)
     result["saved_to"]          = saved_to;
     result["can_load_in_ida"]   = true;
     result["note"]              = OBFSTR(
-        "Kernel module dumped and saved to disk. Open in a NEW IDA Pro instance: "
-        "File > Open > select the dumped file > choose manual load with image base ") +
+        "IMPORTANT: Kernel module dumped and saved to disk. "
+        "To get full and correct analysis you MUST open this file in a NEW IDA Pro instance: "
+        "File -> Open -> select the dumped file -> enable 'Manual load' -> "
+        "set the image base to ") +
         helpers::format_address(static_cast<ea_t>(found_base)) +
-        OBFSTR(". Some pages may be zero-filled if they were paged out.");
-    result["post_dump_analysis"] = stats.to_json();
+        OBFSTR(". IDA's built-in loader/autoanalysis will handle code creation, function "
+        "detection, FLIRT signatures, and type library application automatically. "
+        "Some pages may be zero-filled if they were paged out.");
 
     return tool_result_t::ok(
         OBFSTR("Kernel module ") + found_name +
-        OBFSTR(" dumped to IDB: ") + std::to_string(total_read) + OBFSTR("/") +
+        OBFSTR(" dumped: ") + std::to_string(total_read) + OBFSTR("/") +
         std::to_string(dump_size) + OBFSTR(" bytes, ") + std::to_string(patched) +
-        OBFSTR(" bytes patched, ") + std::to_string(stats.final_func_count) +
-        OBFSTR(" functions recovered (was ") + std::to_string(stats.initial_func_count) +
-        OBFSTR(")"), result);
+        OBFSTR(" bytes patched -> ") + saved_to +
+        OBFSTR(". Open this file in a NEW IDA Pro instance for proper analysis."), result);
 }
 
 tool_result_t driver_allocate_memory(const json& params)
@@ -10763,9 +10331,6 @@ tool_result_t driver_call_function(const json& params)
         OBFSTR(" returned ") + helpers::format_address(static_cast<ea_t>(ret)), result);
 }
 
-//=============================================================================
-// Debugger capability tools
-//=============================================================================
 
 tool_result_t driver_get_thread_context(const json& params)
 {
@@ -10974,8 +10539,8 @@ tool_result_t driver_query_memory(const json& params)
     result["address"] = helpers::format_address(static_cast<ea_t>(address));
     result["region_base"] = helpers::format_address(static_cast<ea_t>(info.base));
     result["region_size"] = helpers::format_address(static_cast<ea_t>(info.size));
-    result["state"] = (info.state == 0x1000) ? "MEM_COMMIT" : 
-                      (info.state == 0x2000) ? "MEM_RESERVE" : 
+    result["state"] = (info.state == 0x1000) ? "MEM_COMMIT" :
+                      (info.state == 0x2000) ? "MEM_RESERVE" :
                       (info.state == 0x10000) ? "MEM_FREE" : std::to_string(info.state);
     result["protect"] = prot_str(info.protect);
     result["protect_raw"] = info.protect;
@@ -11007,7 +10572,7 @@ tool_result_t driver_protect_memory(const json& params)
             size = params["size"].get<std::uint64_t>();
     }
 
-    std::uint32_t new_protect = 0x40; // PAGE_EXECUTE_READWRITE default
+    std::uint32_t new_protect = 0x40;
     if (params.contains("protect")) {
         if (params["protect"].is_string())
             new_protect = static_cast<std::uint32_t>(helpers::parse_address(params["protect"].get<std::string>()).value_or(0x40));
@@ -11141,15 +10706,15 @@ tool_result_t driver_set_hw_breakpoint(const json& params)
     int index = 0;
     if (params.contains("index")) index = params["index"].get<int>();
 
-    int type = 0; // 0=exec
+    int type = 0;
     if (params.contains("type")) {
         std::string t = params["type"].get<std::string>();
         if (t == "write") type = 1;
         else if (t == "readwrite" || t == "rw") type = 3;
-        else type = 0; // exec
+        else type = 0;
     }
 
-    int size = 0; // 0=1byte
+    int size = 0;
     if (params.contains("size")) {
         int s = params["size"].get<int>();
         if (s == 2) size = 1;
@@ -11481,7 +11046,6 @@ void register_tools()
           OBFSTR("Fourth argument (R9). Hex address or integer. Default 0"), false}},
         driver_call_function, false});
 
-    // === Debugger capability tools ===
 
     registry.register_tool({
         OBFSTR("driver_get_thread_context"), OBFSTR("driver"),
@@ -11637,7 +11201,7 @@ void register_tools()
         driver_virtual_to_physical, true});
 }
 
-} // namespace driver_tools
+}
 
 void initialize_all_tools()
 {
@@ -11655,7 +11219,7 @@ void initialize_all_tools()
     analysis_tools::register_tools();
     deobfuscation_tools::register_tools();
     driver_tools::register_tools();
-    
+
     ToolRegistry::instance().register_tool({
         OBFSTR("patch_instruction"), OBFSTR("memory"),
         OBFSTR("Patch assembly instruction at the given address."),
@@ -11716,11 +11280,10 @@ void initialize_all_tools()
                 summary += OBFSTR(" in category '") + filter_category + OBFSTR("'");
             return tool_result_t::ok(summary, tools_arr);
         },
-        true  // read-only
+        true
     });
 
     msg(OBFSTR_C("AiDA: Initialized %zu agent tools\n"), ToolRegistry::instance().get_tool_names().size());
 }
 
 }
-

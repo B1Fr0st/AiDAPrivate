@@ -208,7 +208,7 @@ void handle_auto_comment(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
                         {
                             new_comment.sprnt("%s\n%s", q_comment.c_str(), existing_comment.c_str());
                         }
-                        
+
                         set_cmt(ea, new_comment.c_str(), false);
                         count++;
 
@@ -238,7 +238,7 @@ void handle_auto_comment(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
                         if (cfunc != nullptr)
                         {
                             cfunc->save_user_cmts();
-                            cfunc->refresh_func_ctext(); 
+                            cfunc->refresh_func_ctext();
                         }
                         mark_builtin_widgets(IWID_DISASM);
                     }
@@ -310,7 +310,7 @@ void handle_copy_context(action_activation_ctx_t* ctx, aida_plugin_t*)
     const ea_t func_ea = pfn->start_ea;
 
     nlohmann::json context = ida_utils::get_context_for_prompt(func_ea, true);
-    
+
     if (!(context.contains(OBFSTR_C("ok")) && context[OBFSTR_C("ok")].is_boolean() && context[OBFSTR_C("ok")].get<bool>()))
     {
         warning(OBFSTR_C("AiDA: Failed to gather context: %s"), json_str(context, OBFSTR_C("message"), OBFSTR_C("Unknown error")).c_str());

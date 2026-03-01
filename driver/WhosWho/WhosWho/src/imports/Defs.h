@@ -275,13 +275,11 @@ inline bool SetupFunctions() {
         !_PsCreateSystemThread || !_KeDelayExecutionThread || !_PsTerminateSystemThread ||
         !_KeStackAttachProcess || !_KeUnstackDetachProcess ||
         !_ZwAllocateVirtualMemory || !_ZwFreeVirtualMemory ||
-        !_IoDeleteDevice ||
-        !_PsLookupThreadByThreadId || !_PsGetNextProcessThread ||
-        !_PsGetThreadId || !_PsGetContextThread || !_PsSetContextThread ||
-        !_PsSuspendThread || !_PsResumeThread || !_PsGetProcessPeb ||
-        !_ZwQueryVirtualMemory || !_ZwProtectVirtualMemory) {
+        !_IoDeleteDevice) {
         return false;
     }
+    // Debugger APIs are optional - not all are exported on every Windows build.
+    // Individual handlers null-check these pointers and return STATUS_PROCEDURE_NOT_FOUND.
 
     return true;
 }

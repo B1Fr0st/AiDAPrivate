@@ -46,7 +46,7 @@ Analyze the provided function and its context from a game. Produce a detailed, s
 
 **Target Function's Decompiled {language} Code:**
 ```cpp
-// Function at address: {func_ea_hex}
+
 {code}
 ```
 
@@ -94,7 +94,7 @@ You are an expert reverse engineer specializing in C++ game engines. Your task i
     - Deduce the data type (`float`, `bool`, `FVector*`, `UObject*`, etc.) and a descriptive name for each member. Pay close attention to the size of the memory operation (e.g., a `mov` to `eax` implies a 4-byte member, `al` implies a 1-byte member).
     - Identify the VTable by looking for virtual function calls (e.g., `call qword ptr [rax+1B8h]`). The VTable is almost always the first member at offset `0x0`. Name it `__vftable`.
     - **CRITICAL: You MUST account for padding.** If there is a gap between members, you MUST fill it with a `char pad_...[size];` member. This is the most common reason for parsing failure.
-4.  **Target Parameter:** If the struct applies to a specific function parameter, include a `// APPLY_TO: <param_name>` comment on the first line of your struct definition. This tells the plugin which parameter to apply the type to.
+4.  **Target Parameter:** If the struct applies to a specific function parameter, include a `
 5.  **Final Output:**
     - **Return ONLY the C++ struct definition inside a single markdown code block.**
     - **DO NOT include any other text, explanations, or markdown formatting outside of the single code block.**
@@ -172,7 +172,7 @@ You are a world-class expert in reverse engineering modern C++ games. Your task 
 
 **Output Format:** Your entire output MUST be a single, valid JSON array of objects. Each object must have:
     - `address`: The hexadecimal address (as a string, e.g., "0x140001234").
-    - `comment`: The comment string. Do NOT include `//`. Use `\n` for multi-line.
+    - `comment`: The comment string. Do NOT include `
 
 **Example Output (shows the desired density of comments):**
 ```json
@@ -439,7 +439,7 @@ You MUST provide the output within a single C++ code block. Each line must follo
 
 **Target Function's Decompiled {language} Code:**
 ```cpp
-// Function at address: {func_ea_hex}
+
 {code}
 ```
 
@@ -557,7 +557,7 @@ JSON output format (MODE 1 only):
 
 **Target Function's Decompiled {language} Code:**
 ```cpp
-// Function at address: {func_ea_hex}
+
 {code}
 ```
 
@@ -663,7 +663,7 @@ Return a JSON object with actions to apply. Use these tool types:
 
 **Target Function's Decompiled {language} Code:**
 ```cpp
-// Function at address: {func_ea_hex}
+
 {code}
 ```
 

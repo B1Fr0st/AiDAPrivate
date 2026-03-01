@@ -291,7 +291,7 @@ static std::string fetch_copilot_github_user()
 {
     std::string result;
 #ifdef __NT__
-    // Helper: query GitHub API with a token to get the login username
+
     auto query_github_user = [](const std::string& token) -> std::string {
         if (token.empty()) return {};
         try
@@ -319,7 +319,7 @@ static std::string fetch_copilot_github_user()
         return {};
     };
 
-    // --- 1. Check copilot-api token file (~/.local/share/copilot-api/github_token) ---
+
     char userprofile_buf[MAX_PATH] = {};
     DWORD uplen = GetEnvironmentVariableA("USERPROFILE", userprofile_buf, MAX_PATH);
     if (uplen > 0 && uplen < MAX_PATH)
@@ -331,12 +331,12 @@ static std::string fetch_copilot_github_user()
         {
             std::string token;
             std::getline(tf, token);
-            // Trim whitespace
+
             while (!token.empty() && (token.back() == '\n' || token.back() == '\r' || token.back() == ' '))
                 token.pop_back();
             if (!token.empty())
             {
-                // The file may be plain token or JSON
+
                 if (token.front() == '{')
                 {
                     auto j = nlohmann::json::parse(token, nullptr, false);
@@ -353,7 +353,7 @@ static std::string fetch_copilot_github_user()
         }
     }
 
-    // --- 2. Fallback: check GitHub Copilot VS Code config (hosts.json / apps.json) ---
+
     char localappdata_buf[MAX_PATH] = {};
     DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", localappdata_buf, MAX_PATH);
     if (len > 0 && len < MAX_PATH)
@@ -1411,7 +1411,7 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
             copModelRowLay->addWidget(copilotTab.refreshBtn);
             copLay->addWidget(copModelRow);
         }
-        // --- Account row: status label + Switch Account button ---
+
         {
             QWidget* accountRow = new QWidget();
             QHBoxLayout* accountLay = new QHBoxLayout(accountRow);
@@ -1438,7 +1438,7 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
             accountLay->addWidget(switchAccountBtn);
             copLay->addWidget(accountRow);
 
-            // Fetch the current user in a background thread and update the label
+
             auto refreshUser = [copilotUserLabel]() {
                 std::thread([copilotUserLabel]() {
                     std::string user = fetch_copilot_github_user();
@@ -1455,15 +1455,15 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
                 }).detach();
             };
 
-            // Initial fetch
+
             refreshUser();
 
-            // Periodic refresh every 30 seconds
+
             QTimer* authTimer = new QTimer(copPage);
             QObject::connect(authTimer, &QTimer::timeout, copilotUserLabel, refreshUser);
             authTimer->start(30000);
 
-            // Switch Account button: open a visible CMD window with auth command
+
             QObject::connect(switchAccountBtn, &QPushButton::clicked, copilotUserLabel,
                 [refreshUser]() {
 #ifdef __NT__
@@ -1482,14 +1482,14 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
                         flags, nullptr, nullptr, &si, &pi))
                     {
                         msg("AiDA: Launched Copilot auth — complete the login in the CMD window.\n");
-                        // Wait for the auth process to finish in a background thread,
-                        // then refresh the user label
+
+
                         std::thread([pi, refreshUser]() {
                             WaitForSingleObject(pi.hProcess, INFINITE);
                             CloseHandle(pi.hProcess);
                             CloseHandle(pi.hThread);
 
-                            // Give a moment for config to be written
+
                             std::this_thread::sleep_for(std::chrono::milliseconds(1500));
                             refreshUser();
                         }).detach();
@@ -1604,7 +1604,7 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
         combo->setCurrentIndex(selIdx);
     };
 
-    // Gemini refresh
+
     QObject::connect(geminiTab.refreshBtn, &QPushButton::clicked,
         [&geminiTab, repopulateModels]() {
             qstring key(geminiTab.keyEdit->text().toUtf8().constData());
@@ -1615,7 +1615,7 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
             repopulateModels(geminiTab.modelCombo, models);
         });
 
-    // OpenAI refresh
+
     QObject::connect(openaiTab.refreshBtn, &QPushButton::clicked,
         [&openaiTab, repopulateModels]() {
             qstring key(openaiTab.keyEdit->text().toUtf8().constData());
@@ -1626,7 +1626,7 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
             repopulateModels(openaiTab.modelCombo, models);
         });
 
-    // OpenRouter refresh
+
     QObject::connect(openrouterTab.refreshBtn, &QPushButton::clicked,
         [&openrouterTab, repopulateModels]() {
             qstring key(openrouterTab.keyEdit->text().toUtf8().constData());
@@ -1636,7 +1636,7 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
             repopulateModels(openrouterTab.modelCombo, models);
         });
 
-    // Anthropic refresh
+
     QObject::connect(anthropicTab.refreshBtn, &QPushButton::clicked,
         [&anthropicTab, repopulateModels]() {
             qstring key(anthropicTab.keyEdit->text().toUtf8().constData());
@@ -1647,7 +1647,7 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
             repopulateModels(anthropicTab.modelCombo, models);
         });
 
-    // Copilot refresh
+
     QObject::connect(copilotTab.refreshBtn, &QPushButton::clicked,
         [&copilotTab, repopulateModels]() {
             qstring url(copilotTab.urlEdit->text().trimmed().toUtf8().constData());
@@ -1657,7 +1657,7 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
             repopulateModels(copilotTab.modelCombo, models);
         });
 
-    // Local LLM refresh
+
     QObject::connect(localLlmTab.refreshBtn, &QPushButton::clicked,
         [&localLlmTab, repopulateModels]() {
             qstring url(localLlmTab.urlEdit->text().trimmed().toUtf8().constData());

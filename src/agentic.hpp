@@ -16,7 +16,7 @@ namespace agentic
 
 struct config_t
 {
-    int max_iterations = 25;
+    int max_iterations = 15;
     double temperature = 0.15;
     bool auto_approve = true;
     bool verbose_logging = true;
@@ -25,6 +25,7 @@ struct config_t
     int max_tool_result_chars = 24576;
     int compact_keep_turns = 4;
     int agentic_output_tokens = 16384;
+    int max_tools_per_iteration = 12;
 };
 
 struct tool_execution_t

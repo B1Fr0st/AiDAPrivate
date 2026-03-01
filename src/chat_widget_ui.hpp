@@ -42,7 +42,7 @@ public:
     std::function<void(const QUrl&)> onAnchorDoubleClicked;
 
 protected:
-    void doSetSource(const QUrl&, QTextDocument::ResourceType) override { /* no-op */ }
+    void doSetSource(const QUrl&, QTextDocument::ResourceType) override {  }
 
     void mouseReleaseEvent(QMouseEvent* e) override
     {
@@ -178,6 +178,8 @@ private:
     void rebuildChatDisplay();
     void scrollToBottom();
     void copyMessageToClipboard(int index);
+    void undoToMessage(int index);
+    void showToast(const QString& message);
 
     void toggleHistoryPanel();
     void loadConversation(int index);
@@ -252,12 +254,18 @@ private:
     QWidget*                 m_thinkingDetails;
     QTextEdit*               m_streamingDisplay;
     QLabel*                  m_currentToolLabel;
+    QLabel*                  m_thinkingElapsedLabel;
     bool                     m_thinkingExpanded;
     QString                  m_streamBuffer;
+    QElapsedTimer            m_thinkingStopwatch;
+    QTimer*                  m_thinkingElapsedTimer;
 
     QWidget*                 m_historyPanel;
     QListWidget*             m_historyList;
     bool                     m_historyVisible;
+
+    QLabel*                  m_toastLabel;
+    QTimer*                  m_toastTimer;
 
     FunctionCompleterPopup*  m_completer;
     bool                     m_completerActive;

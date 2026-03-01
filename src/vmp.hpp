@@ -21,7 +21,7 @@
 
 #define VMP_GET_HWID(buf, size) VMProtectGetCurrentHWID(buf, size)
 
-#else // !AIDA_USE_VMP
+#else
 
 #define VMP_ULTRA(name)       ((void)0)
 #define VMP_VIRT(name)        ((void)0)
@@ -40,4 +40,4 @@
 
 #define VMP_GET_HWID(buf, size) (0)
 
-#endif // AIDA_USE_VMP
+#endif

@@ -90,7 +90,7 @@ extern "C" const PfnDliHook __pfnDliFailureHook2 = aida_delay_load_failure;
 #ifdef __NT__
 extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL,
                                 DWORD     fdwReason,
-                                LPVOID    /*lpvReserved*/)
+                                LPVOID    )
 {
     if (fdwReason == DLL_PROCESS_ATTACH)
         DisableThreadLibraryCalls(hinstDLL);
@@ -222,7 +222,7 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     case dbg_exception:
     {
         const debug_event_t* event = va_arg(va, const debug_event_t*);
-        /*int* warn =*/ va_arg(va, int*);
+         va_arg(va, int*);
         rec.pid = event->pid;
         rec.tid = event->tid;
         rec.ea  = event->ea;
@@ -654,12 +654,12 @@ bool idaapi aida_plugin_t::run(size_t)
         VMP_END;
         return false;
     }
-    
-    if (license.get_runtime_nonce() == 0xDEADBEEFCAFEBABEULL 
+
+    if (license.get_runtime_nonce() == 0xDEADBEEFCAFEBABEULL
         || license.get_runtime_nonce() == 0xFFFFFFFFFFFFFFFFULL)
     {
     }
-    
+
     info(OBFSTR_C("Plugin is active. Use the right-click context menu in a code view or the Tools menu."));
     VMP_END;
     return true;

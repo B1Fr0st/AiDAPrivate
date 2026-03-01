@@ -446,11 +446,11 @@ std::string AIClient::blocking_generate(const std::string& prompt_text, double t
     return _blocking_generate(prompt_text, temperature);
 }
 
-std::string AIClient::streaming_blocking_generate(const std::string& prompt_text, double temperature, stream_callback_t on_chunk)
+std::string AIClient::streaming_blocking_generate(const std::string& prompt_text, double temperature, stream_callback_t on_chunk, stop_predicate_t stop_check)
 {
     if (on_chunk)
     {
-        std::string streamed = _streaming_blocking_generate(prompt_text, temperature, on_chunk);
+        std::string streamed = _streaming_blocking_generate(prompt_text, temperature, on_chunk, stop_check);
         if (streamed.rfind(OBFSTR_C("Error: API returned status "), 0) == 0)
         {
             msg(OBFSTR_C("AiDA: Streaming request failed; retrying once with non-streaming generation.\n"));
@@ -495,7 +495,7 @@ std::string AIClient::_extract_sse_content(const nlohmann::json& j) const
     return "";
 }
 
-std::string AIClient::_streaming_blocking_generate(const std::string& prompt_text, double temperature, stream_callback_t on_chunk)
+std::string AIClient::_streaming_blocking_generate(const std::string& prompt_text, double temperature, stream_callback_t on_chunk, stop_predicate_t stop_check)
 {
     if (!is_available())
         return OBFSTR("Error: AI client is not initialized. Check API key.");
@@ -505,7 +505,7 @@ std::string AIClient::_streaming_blocking_generate(const std::string& prompt_tex
     auto host = _get_api_host();
     auto path = _get_streaming_api_path(_model_name);
 
-    return _streaming_http_post_request(host, path, headers, json_dump_fast(payload), on_chunk);
+    return _streaming_http_post_request(host, path, headers, json_dump_fast(payload), on_chunk, stop_check);
 }
 
 std::string AIClient::_streaming_http_post_request(
@@ -513,7 +513,8 @@ std::string AIClient::_streaming_http_post_request(
     const std::string& path,
     const httplib::Headers& headers,
     const std::string& body,
-    stream_callback_t on_chunk)
+    stream_callback_t on_chunk,
+    stop_predicate_t stop_check)
 {
     std::shared_ptr<httplib::Client> current_client;
     try
@@ -528,6 +529,7 @@ std::string AIClient::_streaming_http_post_request(
         size_t sse_buf_start = 0;
         bool stream_error = false;
         bool stream_truncated = false;
+        bool early_stopped = false;
 
         httplib::Request req;
         req.method = OBFSTR("POST");
@@ -581,21 +583,21 @@ std::string AIClient::_streaming_http_post_request(
                     if (chunk_json.is_discarded())
                         continue;
 
-                    // openai
+
                     if (chunk_json.contains(OBFSTR_C("choices")) && chunk_json[OBFSTR_C("choices")].is_array() && !chunk_json[OBFSTR_C("choices")].empty())
                     {
                         std::string fr = json_str(chunk_json[OBFSTR_C("choices")][0], OBFSTR_C("finish_reason"));
                         if (fr == OBFSTR_C("length") || fr == OBFSTR_C("LENGTH"))
                             stream_truncated = true;
                     }
-                    // gemini
+
                     if (chunk_json.contains(OBFSTR_C("candidates")) && chunk_json[OBFSTR_C("candidates")].is_array() && !chunk_json[OBFSTR_C("candidates")].empty())
                     {
                         std::string fr = json_str(chunk_json[OBFSTR_C("candidates")][0], OBFSTR_C("finishReason"));
                         if (fr == OBFSTR_C("MAX_TOKENS") || fr == OBFSTR_C("LENGTH"))
                             stream_truncated = true;
                     }
-                    // anthropic
+
                     if (json_str(chunk_json, OBFSTR_C("type")) == OBFSTR_C("message_delta"))
                     {
                         auto delta = chunk_json.value(OBFSTR_C("delta"), json::object());
@@ -616,6 +618,19 @@ std::string AIClient::_streaming_http_post_request(
                         }
                         catch (const std::exception&) {}
 
+
+                        if (stop_check && !early_stopped)
+                        {
+                            try
+                            {
+                                if (stop_check(accumulated_text))
+                                {
+                                    early_stopped = true;
+                                    return false;
+                                }
+                            }
+                            catch (const std::exception&) {}
+                        }
 
                     }
                 }
@@ -647,6 +662,10 @@ std::string AIClient::_streaming_http_post_request(
 
         auto res = current_client->send(req);
 
+
+        if (early_stopped && !accumulated_text.empty())
+            return accumulated_text;
+
         if (_cancelled.load())
             return OBFSTR("Error: Operation cancelled.");
 
@@ -655,7 +674,12 @@ std::string AIClient::_streaming_http_post_request(
             auto err = res.error();
             _reset_http_client();
             if (err == httplib::Error::Canceled)
+            {
+
+                if (!accumulated_text.empty())
+                    return accumulated_text;
                 return OBFSTR("Error: Operation cancelled.");
+            }
             return OBFSTR("Error: HTTP request failed: ") + httplib::to_string(err);
         }
 
@@ -774,12 +798,12 @@ void AIClient::generate_hook(ea_t ea, callback_t callback)
     qstring q_func_name;
     get_func_name(&q_func_name, ea);
     std::string func_name = q_func_name.c_str();
-    
+
     std::string clean_func_name;
     clean_func_name.reserve(func_name.size());
     for (char c : func_name)
         clean_func_name.push_back((qisalnum(c) || c == '_') ? c : '_');
-    
+
     context[OBFSTR_C("func_name")] = clean_func_name;
 
     std::string prompt = ida_utils::format_prompt(GENERATE_HOOK_PROMPT, context);
@@ -935,7 +959,7 @@ void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t ca
     }
 
     std::ostringstream ctx_ss;
-    
+
     json context = ida_utils::get_full_cached_context(ea, g_settings);
     if (context.contains(OBFSTR_C("ok")) && context[OBFSTR_C("ok")].is_boolean() && context[OBFSTR_C("ok")].get<bool>())
     {
@@ -956,32 +980,32 @@ void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t ca
         ctx_ss << OBFSTR_C("**Binary Metadata:**\n") << ida_utils::get_binary_metadata() << "\n\n";
         ctx_ss << OBFSTR_C("No function selected at the current address.\n");
     }
-    
+
     std::string agentic_prompt = agentic::build_agentic_prompt(question, ctx_ss.str());
-    
+
     std::lock_guard<std::mutex> lock(_worker_thread_mutex);
     if (_worker_thread.joinable())
         _worker_thread.join();
-    
+
     _cancelled = false;
     _task_done = false;
     _is_request_active = false;
     _current_request_type = OBFSTR_C("agentic query");
     _elapsed_secs = 0;
-    
+
     qtimer_t timer = register_timer(1000, timer_cb, this);
     auto req = new ai_request_t(callback, timer, OBFSTR_C("agentic query"), _validity_token);
-    
+
     auto worker_func = [this, agentic_prompt, req, validity_token = this->_validity_token]() {
         std::string result;
         try
         {
             agentic::config_t config;
-            config.max_iterations = 25;
+            config.max_iterations = 15;
             config.temperature = _settings.temperature;
             config.verbose_logging = true;
             config.max_context_tokens = g_settings.get_active_context_window();
-            
+
             auto on_status = [](const agentic::status_update_t& status) {
                 auto* sreq = new status_update_request_t(status);
                 execute_sync(*sreq, MFF_NOWAIT);
@@ -991,7 +1015,7 @@ void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t ca
                 auto* creq = new stream_chunk_request_t(chunk);
                 execute_sync(*creq, MFF_NOWAIT);
             };
-            
+
             auto agentic_result = agentic::run(
                 this, agentic_prompt, config, &_cancelled,
                 [](int iter, const std::string& status) {
@@ -999,7 +1023,7 @@ void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t ca
                 },
                 on_status,
                 on_stream);
-            
+
             if (agentic_result.was_cancelled)
             {
                 req->was_cancelled = true;
@@ -1007,7 +1031,7 @@ void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t ca
             else
             {
                 std::ostringstream response_ss;
-                
+
                 if (!agentic_result.iterations.empty())
                 {
                     response_ss << OBFSTR_C("**Agent Actions Taken (") << agentic_result.total_iterations << OBFSTR_C(" iteration(s)):**\n");
@@ -1021,7 +1045,7 @@ void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t ca
                     }
                     response_ss << "\n---\n\n";
                 }
-                
+
                 response_ss << agentic_result.final_response;
                 result = response_ss.str();
             }
@@ -1031,14 +1055,14 @@ void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t ca
             result = OBFSTR("Error: Agentic engine exception: ");
             result += e.what();
         }
-        
+
         _task_done = true;
         req->was_cancelled = _cancelled.load();
         if (!req->was_cancelled)
             req->result = std::move(result);
         execute_sync(*req, MFF_NOWAIT);
     };
-    
+
     try
     {
         _worker_thread = std::thread(worker_func);
@@ -1068,7 +1092,7 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
     }
 
     std::ostringstream ctx_ss;
-    
+
     func_t* pfn = get_func(ea);
     if (pfn != nullptr)
     {
@@ -1093,7 +1117,7 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
         ctx_ss << OBFSTR_C("**Binary Metadata:**\n") << ida_utils::get_binary_metadata() << "\n\n";
         ctx_ss << OBFSTR_C("No function selected.\n");
     }
-    
+
     std::string history_str;
     size_t max_history_tokens = static_cast<size_t>(g_settings.get_active_context_window()) / 6;
     size_t history_token_count = 0;
@@ -1110,32 +1134,32 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
         history_token_count += entry_tokens;
         history_str = entry + history_str;
     }
-    
+
     std::string agentic_prompt = agentic::build_agentic_prompt(message, ctx_ss.str(), history_str);
-    
+
     std::lock_guard<std::mutex> lock(_worker_thread_mutex);
     if (_worker_thread.joinable())
         _worker_thread.join();
-    
+
     _cancelled = false;
     _task_done = false;
     _is_request_active = false;
     _current_request_type = OBFSTR_C("agentic chat");
     _elapsed_secs = 0;
-    
+
     qtimer_t timer = register_timer(1000, timer_cb, this);
     auto req = new ai_request_t(callback, timer, OBFSTR_C("agentic chat"), _validity_token);
-    
+
     auto worker_func = [this, agentic_prompt, req, validity_token = this->_validity_token]() {
         std::string result;
         try
         {
             agentic::config_t config;
-            config.max_iterations = 25;
+            config.max_iterations = 15;
             config.temperature = _settings.temperature;
             config.verbose_logging = true;
             config.max_context_tokens = g_settings.get_active_context_window();
-            
+
             auto on_status = [](const agentic::status_update_t& status) {
                 auto* sreq = new status_update_request_t(status);
                 execute_sync(*sreq, MFF_NOWAIT);
@@ -1145,7 +1169,7 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
                 auto* creq = new stream_chunk_request_t(chunk);
                 execute_sync(*creq, MFF_NOWAIT);
             };
-            
+
             auto agentic_result = agentic::run(
                 this, agentic_prompt, config, &_cancelled,
                 [](int iter, const std::string& status) {
@@ -1153,7 +1177,7 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
                 },
                 on_status,
                 on_stream);
-            
+
             if (agentic_result.was_cancelled)
             {
                 req->was_cancelled = true;
@@ -1161,7 +1185,7 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
             else
             {
                 std::ostringstream response_ss;
-                
+
                 if (!agentic_result.iterations.empty())
                 {
                     response_ss << OBFSTR_C("**Agent Actions (") << agentic_result.total_iterations << OBFSTR_C(" iteration(s)):**\n");
@@ -1175,7 +1199,7 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
                     }
                     response_ss << "\n---\n\n";
                 }
-                
+
                 response_ss << agentic_result.final_response;
                 result = response_ss.str();
             }
@@ -1185,14 +1209,14 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
             result = OBFSTR("Error: Agentic engine exception: ");
             result += e.what();
         }
-        
+
         _task_done = true;
         req->was_cancelled = _cancelled.load();
         if (!req->was_cancelled)
             req->result = std::move(result);
         execute_sync(*req, MFF_NOWAIT);
     };
-    
+
     try
     {
         _worker_thread = std::thread(worker_func);

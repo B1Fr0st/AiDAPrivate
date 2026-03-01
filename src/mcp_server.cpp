@@ -315,7 +315,7 @@ static json build_mcp_tools_list()
     return tools;
 }
 
-static json handle_initialize(const json& id, const json& /*params*/)
+static json handle_initialize(const json& id, const json& )
 {
     json capabilities;
     capabilities[OBFSTR_C("tools")]     = {{"listChanged", true}};
@@ -1277,7 +1277,7 @@ void mcp_server_t::server_thread_func(int port)
 
                 return !session->closed.load(std::memory_order_relaxed);
             },
-            [session, &sse_sessions, &sse_mtx](bool /*success*/) {
+            [session, &sse_sessions, &sse_mtx](bool ) {
                 session->close();
                 std::lock_guard<std::mutex> lk(sse_mtx);
                 sse_sessions.erase(session->id);
@@ -1361,14 +1361,14 @@ void mcp_server_t::server_thread_func(int port)
 
 enum class mcp_cfg_format_t
 {
-    mcpservers_url, // {"mcpServers":{"name":{"url":"..."}}}
-    mcpservers_serverurl, // {"mcpServers":{"name":{"serverUrl":"..."}}} (Windsurf)
-    vscode_mcp, // settings.json: {"mcp":{"servers":{"name":{"type":"sse","url":"..."}}}}
-    vscode_mcp_json, // mcp.json: {"servers":{"name":{"type":"sse","url":"..."}}}
-    cline_mcp, // {"mcpServers":{"name":{"url":"...","disabled":false,"autoApprove":[]}}}
-    zed_context, // settings.json: {"context_servers":{"name":{"settings":{"url":"..."}}}}
-    codex_toml, // TOML: [mcp_servers.name] type="sse" url="..."
-    claude_code_json, // ~/.claude.json: {"mcpServers":{"name":{"url":"..."}}}
+    mcpservers_url,
+    mcpservers_serverurl,
+    vscode_mcp,
+    vscode_mcp_json,
+    cline_mcp,
+    zed_context,
+    codex_toml,
+    claude_code_json,
 };
 
 struct mcp_client_def_t

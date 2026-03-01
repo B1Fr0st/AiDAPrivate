@@ -36,7 +36,7 @@ __forceinline bool always_false()
     return (t & 0) != 0;
 }
 
-} // namespace opaque
+}
 
 __forceinline bool check_peb_debugger()
 {
@@ -759,7 +759,7 @@ __forceinline bool run_fast_checks()
 
 inline std::atomic<bool> g_sentinel_tripped{false};
 
-inline int idaapi sentinel_timer_callback(void* /*ud*/)
+inline int idaapi sentinel_timer_callback(void* )
 {
     VMP_VIRT("are_sentinel");
 
@@ -1000,9 +1000,9 @@ inline void initialize()
     VMP_END; \
 } while (0)
 
-} // namespace anti_re
+}
 
-#else // !__NT__
+#else
 
 namespace anti_re {
 
@@ -1017,6 +1017,6 @@ inline std::atomic<bool> g_sentinel_tripped{false};
 #define ANTI_RE_GUARD() ((void)0)
 #define ANTI_RE_GUARD_OPAQUE() ((void)0)
 
-} // namespace anti_re
+}
 
-#endif // __NT__
+#endif

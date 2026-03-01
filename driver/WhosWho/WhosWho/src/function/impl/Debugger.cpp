@@ -32,6 +32,8 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     }
 
     if (!_PsLookupProcessByProcessId || !_PsLookupThreadByThreadId ||
+        !_PsGetContextThread || !_PsSetContextThread ||
+        !_KeStackAttachProcess || !_KeUnstackDetachProcess ||
         !_ObfDereferenceObject) {
         return STATUS_PROCEDURE_NOT_FOUND;
     }

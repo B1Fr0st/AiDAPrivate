@@ -1029,7 +1029,7 @@ namespace ida_utils
         {
             qstring question;
             question.sprnt("A struct named '%s' already exists. What would you like to do?", final_struct_name.c_str());
-            
+
             int choice = ask_buttons("~O~verwrite", "~R~ename", "~C~ancel", ASKBTN_CANCEL, question.c_str());
 
             if (choice == ASKBTN_YES)
@@ -1185,8 +1185,8 @@ namespace ida_utils
         size_t idaapi get_count() const override { return funcs.size(); }
         void idaapi get_row(
             qstrvec_t* out,
-            int* /*out_icon*/,
-            chooser_item_attrs_t* /*out_attrs*/,
+            int* ,
+            chooser_item_attrs_t* ,
             size_t n) const override
         {
             qstring func_name;
@@ -1253,7 +1253,7 @@ namespace ida_utils
 
         return get_func(func_vec[selected_idx]);
     }
-    
+
     qstring qstring_tolower(const qstring& s)
     {
         qstring lower_s = s;
@@ -1261,7 +1261,7 @@ namespace ida_utils
         return lower_s;
     }
 
-    bool get_address_from_line_pos(ea_t* out_ea, const char* /*line*/, int /*x*/)
+    bool get_address_from_line_pos(ea_t* out_ea, const char* , int )
     {
         TWidget* view = get_current_viewer();
         if (view == nullptr)
@@ -1374,7 +1374,7 @@ namespace ida_utils
             if (pipe) {
                 fwrite(text.c_str(), 1, text.length(), pipe);
                 pclose(pipe);
-                return true; 
+                return true;
             }
         }
         warning(OBFSTR_C("AiDA: Could not find 'wl-copy' or 'xclip' to set clipboard."));
@@ -1472,7 +1472,7 @@ namespace ida_utils
             size_t comment_pos = right_part_str.find("//");
             if (comment_pos != std::string::npos)
                 right_part_str = right_part_str.substr(0, comment_pos);
-            
+
             qstring q_left(left_part_str.c_str());
             q_left.trim2();
             if (q_left.ends_with(";"))
@@ -1490,7 +1490,7 @@ namespace ida_utils
                 ssize_t paren = s.find('(');
                 if (paren != -1)
                     s.resize(paren);
-                
+
                 ssize_t bracket = s.find('[');
                 if (bracket != -1)
                     s.resize(bracket);
@@ -1500,10 +1500,10 @@ namespace ida_utils
                 ssize_t pos = s.rfind(' ');
                 if (pos == -1)
                     pos = s.rfind('*');
-                
+
                 if (pos != -1)
                     s = s.substr(pos + 1);
-                
+
                 s.trim2();
             };
 
@@ -1579,7 +1579,7 @@ namespace ida_utils
                     }
                 }
             }
-            
+
             if (!renamed)
             {
                 segment_t* seg = get_segm_by_name(original_name.c_str());
@@ -1787,7 +1787,7 @@ namespace ida_utils
         return result.c_str();
     }
 
-    nlohmann::json get_rag_context(ea_t ea, const settings_t& /*settings*/, const nlohmann::json* cached_context)
+    nlohmann::json get_rag_context(ea_t ea, const settings_t& , const nlohmann::json* cached_context)
     {
         nlohmann::json rag;
 
@@ -2051,7 +2051,7 @@ namespace ida_utils
                             break;
                         }
                     }
-                    
+
                     if (!target_lvar)
                     {
                         for (auto& lv : *lvars)

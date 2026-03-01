@@ -131,7 +131,7 @@ const std::vector<std::string> settings_t::openrouter_models = {
   OBFSTR("openai/gpt-oss-20b:free"),
   OBFSTR("z-ai/glm-4.5-air:free"),
   OBFSTR("tngtech/deepseek-r1t2-chimera:free"),
-  
+
 };
 
 const std::vector<std::string> settings_t::anthropic_models = {

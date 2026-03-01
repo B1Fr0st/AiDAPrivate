@@ -47,8 +47,8 @@ public:
     }
 };
 
-} // namespace detail
-} // namespace obf
+}
+}
 
 #define OBFSTR(s) ([]() -> std::string {                                   \
     static constexpr ::obf::detail::encrypted_string<                      \
@@ -95,8 +95,8 @@ public:
     }
 };
 
-} // namespace detail
-} // namespace obf
+}
+}
 
 #define WOBFSTR(s) ([]() -> std::wstring {                                 \
     static constexpr ::obf::detail::encrypted_wstring<                     \
@@ -144,8 +144,8 @@ public:
     }
 };
 
-} // namespace detail
-} // namespace obf
+}
+}
 
 #define OBFBYTES(s) ([]() -> std::string {                                 \
     static constexpr ::obf::detail::encrypted_secret<                      \

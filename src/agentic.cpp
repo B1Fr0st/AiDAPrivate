@@ -38,58 +38,103 @@ static std::string extract_json_by_bracket_match(const std::string& text, size_t
 
 nlohmann::json extract_tool_calls(const std::string& response)
 {
-    static const std::regex md_json_re("```(?:json)?\\s*([\\s\\S]*?)\\s*```");
-    std::smatch match;
-    if (std::regex_search(response, match, md_json_re) && match.size() > 1)
-    {
-        std::string code_block = match[1].str();
-        try
-        {
-            json j = json::parse(code_block);
-            if (j.contains(OBFSTR_C("tool_calls")) && j[OBFSTR_C("tool_calls")].is_array())
-                return j;
-        }
-        catch (const json::parse_error&) {}
-    }
+    json merged_tool_calls = json::array();
+    std::string first_reasoning;
 
-    size_t tc_pos = response.find("\"tool_calls\"");
-    if (tc_pos != std::string::npos)
-    {
-        size_t brace_start = std::string::npos;
-        for (size_t i = tc_pos; i > 0; --i)
-        {
-            if (response[i - 1] == '{')
-            {
-                brace_start = i - 1;
-                break;
-            }
-        }
 
-        if (brace_start != std::string::npos)
+    {
+        static const std::regex md_json_re("```(?:json)?\\s*([\\s\\S]*?)\\s*```");
+        auto begin = std::sregex_iterator(response.begin(), response.end(), md_json_re);
+        auto end   = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it)
         {
-            std::string json_block = extract_json_by_bracket_match(response, brace_start);
-            if (!json_block.empty())
+            try
             {
-                try
+                json j = json::parse((*it)[1].str());
+                if (j.contains(OBFSTR_C("tool_calls")) && j[OBFSTR_C("tool_calls")].is_array())
                 {
-                    json j = json::parse(json_block);
-                    if (j.contains(OBFSTR_C("tool_calls")) && j[OBFSTR_C("tool_calls")].is_array())
-                        return j;
+                    for (const auto& tc : j[OBFSTR_C("tool_calls")])
+                        merged_tool_calls.push_back(tc);
+                    if (first_reasoning.empty())
+                        first_reasoning = json_str(j, "reasoning");
                 }
-                catch (const json::parse_error&) {}
             }
+            catch (const json::parse_error&) {}
         }
     }
 
-    try
-    {
-        json j = json::parse(response);
-        if (j.contains(OBFSTR_C("tool_calls")) && j[OBFSTR_C("tool_calls")].is_array())
-            return j;
-    }
-    catch (const json::parse_error&) {}
 
-    return json::object();
+    {
+        size_t search_from = 0;
+        while (search_from < response.size())
+        {
+            size_t tc_pos = response.find("\"tool_calls\"", search_from);
+            if (tc_pos == std::string::npos)
+                break;
+
+
+            size_t brace_start = std::string::npos;
+            for (size_t i = tc_pos; i > 0; --i)
+            {
+                if (response[i - 1] == '{')
+                {
+                    brace_start = i - 1;
+                    break;
+                }
+            }
+
+            if (brace_start == std::string::npos)
+            {
+                search_from = tc_pos + 12;
+                continue;
+            }
+
+            std::string json_block = extract_json_by_bracket_match(response, brace_start);
+            if (json_block.empty())
+            {
+                search_from = tc_pos + 12;
+                continue;
+            }
+
+            try
+            {
+                json j = json::parse(json_block);
+                if (j.contains(OBFSTR_C("tool_calls")) && j[OBFSTR_C("tool_calls")].is_array())
+                {
+                    for (const auto& tc : j[OBFSTR_C("tool_calls")])
+                        merged_tool_calls.push_back(tc);
+                    if (first_reasoning.empty())
+                        first_reasoning = json_str(j, "reasoning");
+                }
+            }
+            catch (const json::parse_error&) {}
+
+            search_from = brace_start + std::max(json_block.size(), static_cast<size_t>(1));
+        }
+    }
+
+    if (merged_tool_calls.empty())
+        return json::object();
+
+
+    json unique_calls = json::array();
+    std::unordered_set<std::string> seen_keys;
+    for (const auto& tc : merged_tool_calls)
+    {
+        if (!tc.contains(OBFSTR_C("tool")) || !tc[OBFSTR_C("tool")].is_string())
+            continue;
+        std::string key = tc[OBFSTR_C("tool")].get<std::string>() + "|"
+            + (tc.contains(OBFSTR_C("params")) && !tc[OBFSTR_C("params")].is_null()
+                ? tc[OBFSTR_C("params")].dump(-1, ' ', false, json::error_handler_t::replace)
+                : "{}");
+        if (seen_keys.insert(key).second)
+            unique_calls.push_back(tc);
+    }
+
+    json result;
+    result[OBFSTR_C("tool_calls")] = unique_calls;
+    result["reasoning"] = first_reasoning;
+    return result;
 }
 
 std::string strip_tool_artifacts(const std::string& text)
@@ -146,11 +191,113 @@ size_t estimate_tokens(const std::string& text)
     return text.size() / 3 + 1;
 }
 
+static bool is_code_field(const std::string& name)
+{
+
+
+    static const char* const code_fields[] = {
+        "code", "disassembly", "pseudocode", "decompiled", "assembly",
+        "decompiled_code", "function_code", "target_code",
+        "source", "listing", "output", "result_code"
+    };
+    for (const auto& cf : code_fields)
+    {
+        if (name == cf)
+            return true;
+    }
+    return false;
+}
+
+
+static void emit_structured_data(std::ostringstream& ss, const json& data, size_t max_chars)
+{
+    if (data.is_object())
+    {
+
+        for (auto it = data.begin(); it != data.end(); ++it)
+        {
+            if (is_code_field(it.key()) && it->is_string())
+            {
+                std::string code_text = it->get<std::string>();
+                if (!code_text.empty())
+                {
+                    if (code_text.length() > max_chars)
+                        code_text = code_text.substr(0, max_chars) + "\n... (truncated)";
+                    ss << it.key() << ":\n```\n" << code_text << "\n```\n";
+                }
+            }
+        }
+
+
+        json remaining = json::object();
+        for (auto it = data.begin(); it != data.end(); ++it)
+        {
+            if (!is_code_field(it.key()))
+                remaining[it.key()] = it.value();
+        }
+
+        if (!remaining.empty())
+        {
+            std::string remaining_str = json_dump_fast(remaining, 2);
+            if (remaining_str.length() > max_chars)
+                remaining_str = remaining_str.substr(0, max_chars) + "\n... (truncated)";
+            ss << remaining_str << "\n";
+        }
+    }
+    else if (data.is_array())
+    {
+
+
+        bool any_has_code = false;
+        for (const auto& item : data)
+        {
+            if (item.is_object())
+            {
+                for (auto it = item.begin(); it != item.end(); ++it)
+                {
+                    if (is_code_field(it.key()) && it->is_string())
+                    {
+                        any_has_code = true;
+                        break;
+                    }
+                }
+            }
+            if (any_has_code) break;
+        }
+
+        if (any_has_code)
+        {
+
+
+            for (size_t i = 0; i < data.size(); ++i)
+            {
+                if (i > 0) ss << "---\n";
+                emit_structured_data(ss, data[i], max_chars);
+            }
+        }
+        else
+        {
+            std::string data_str = json_dump_fast(data, 2);
+            if (data_str.length() > max_chars)
+                data_str = data_str.substr(0, max_chars) + "\n... (truncated)";
+            ss << data_str << "\n";
+        }
+    }
+    else
+    {
+
+        std::string data_str = json_dump_fast(data, 2);
+        if (data_str.length() > max_chars)
+            data_str = data_str.substr(0, max_chars) + "\n... (truncated)";
+        ss << data_str << "\n";
+    }
+}
+
 std::string format_tool_results(const std::vector<tool_execution_t>& results, size_t max_chars_per_result)
 {
     std::ostringstream ss;
     ss << OBFSTR("\n[Tool Results]\n");
-    
+
     for (const auto& r : results)
     {
         ss << OBFSTR("Tool: ") << r.tool_name << "\n";
@@ -158,14 +305,12 @@ std::string format_tool_results(const std::vector<tool_execution_t>& results, si
         ss << OBFSTR("Message: ") << r.message << "\n";
         if (!r.data.is_null() && !r.data.empty())
         {
-            std::string data_str = json_dump_fast(r.data);
-            if (data_str.length() > max_chars_per_result)
-                data_str = data_str.substr(0, max_chars_per_result) + OBFSTR("\n... (truncated, ") + std::to_string(data_str.length()) + OBFSTR(" bytes total)");
-            ss << OBFSTR("Data: ") << data_str << "\n";
+            ss << OBFSTR("Data:\n");
+            emit_structured_data(ss, r.data, max_chars_per_result);
         }
         ss << "\n";
     }
-    
+
     ss << OBFSTR("[End Tool Results]\n");
     return ss.str();
 }
@@ -223,17 +368,11 @@ std::string summarize_turn(const conversation_turn_t& turn)
 static bool looks_incomplete(const std::string& text)
 {
     static const char* const markers[] = {
-        "Next Steps", "next steps", "Next steps",
-        "next phase", "Next Phase", "Next phase",
-        "future work", "Future Work", "Future work",
-        "further analysis", "Further analysis", "Further Analysis",
-        "remains to be", "remaining work", "Remaining Work",
-        "I plan to", "I will now", "I would recommend",
-        "should focus on", "could not be completed", "was not completed",
-        "### Next", "## Next", "**Next Steps",
-        "additional investigation", "Additional investigation",
-        "need to investigate", "needs further",
-        "haven't yet", "have not yet"
+        "### Next Steps", "## Next Steps", "**Next Steps**",
+        "### Future Work", "## Future Work", "**Future Work**",
+        "### Remaining Work", "## Remaining Work",
+        "could not be completed", "was not completed",
+        "haven't yet completed", "have not yet completed"
     };
     for (const auto& marker : markers)
     {
@@ -293,18 +432,9 @@ std::string build_conversation(
                 if (is_last_turn)
                 {
                     conversation += OBFSTR("\n\n[ITER ") + std::to_string(turn_number)
-                        + OBFSTR("] Emit tool_calls JSON now. Batch 5-10 calls min. "
-                          "Decompile, trace xrefs, follow pointers, apply renames/types. "
-                          "Final answer ONLY when ALL user objectives verified.");
-
-                    if (turn_number <= 3)
-                        conversation += OBFSTR(" [EARLY — need 8-15+ iters, keep going]");
-                    else if (turn_number <= 6)
-                        conversation += OBFSTR(" [MID — re-check all user objectives]");
-                }
-                else
-                {
-                    conversation += OBFSTR("\n\n[Continue — emit more tool_calls]");
+                        + OBFSTR("] Continue analysis or provide your final answer if all user objectives are met. "
+                          "Do NOT repeat tool calls already made — duplicates are skipped automatically. "
+                          "Only emit tool_calls that provide NEW information toward the goal.");
                 }
             }
         }
@@ -417,9 +547,9 @@ std::string build_agentic_prompt(
     static const cached_tool_catalog_t catalog;
 
     const std::string& names_list  = catalog.tool_names_str;
-    
+
     std::ostringstream ss;
-    
+
     ss << R"(You are an elite-tier AI reverse engineering agent fully integrated into IDA Pro.
 You have direct access to every tool needed to read, modify, and analyze the IDA database:
 decompilation, disassembly, cross-references, type systems, debugger control, pattern search,
@@ -484,16 +614,19 @@ You are FORBIDDEN from writing phrases like:
 If you find yourself about to write ANY of these, STOP and instead emit tool_calls JSON to
 actually DO the thing you were about to describe. Planning is wasted output. ACTION is required.
 
-**RULE 2: NEVER STOP BEFORE THE JOB IS DONE.**
-You have up to 25 iterations. Use them ALL if needed. If you have used fewer than 8 iterations,
-you have almost certainly NOT done enough work. The user is paying for thorough, exhaustive
-analysis. Surface-level results are unacceptable. If you found interesting offsets, pointers,
-or functions — you MUST decompile and trace them IN THIS SESSION, not describe them for later.
+**RULE 2: COMPLETE THE JOB EFFICIENTLY.**
+You have multiple iterations available, but efficiency matters. Focus each iteration on
+advancing toward the user's goal — do not repeat searches or re-explore already-covered ground.
+If you have concrete findings that fully answer the user's question, provide your final answer
+immediately. Surface-level results are unacceptable, but redundant exploration is equally wasteful.
+Avoid calling the same tool with the same parameters more than once — duplicates are automatically
+skipped and waste an iteration slot.
 
-**RULE 3: ALWAYS BATCH 5-10 TOOL CALLS PER TURN.**
-Every time you emit tool_calls, include 5-10 calls. For example, if you found 5 interesting
-callees, decompile ALL 5 in one turn. If you need to check xrefs for 4 addresses, batch them.
-Single tool calls per turn are wasteful and lazy. Maximize throughput.
+**RULE 3: BATCH TOOL CALLS EFFICIENTLY.**
+When you need multiple related data points, batch them into a single turn (3-8 calls).
+Only call tools that provide NEW information — never re-call a tool with identical parameters
+you already used in a previous turn. Duplicate tool calls are skipped automatically and return
+cached results. Maximize information gain per iteration, not raw call count.
 
 **RULE 4: YOUR FINAL ANSWER MUST CONTAIN CONCRETE DELIVERABLES.**
 Acceptable final answers include: specific addresses, reconstructed structs with field offsets,
@@ -551,7 +684,16 @@ When you need to gather information or perform actions, respond with ONLY a JSON
 }
 ```
 
-CRITICAL: Include 5-10 tool calls per turn. Batch aggressively.
+**CRITICAL OUTPUT FORMAT RULE — OUTPUT EXACTLY ONE JSON BLOCK, THEN STOP.**
+Your response must contain AT MOST ONE tool_calls JSON block. After emitting it, STOP
+WRITING IMMEDIATELY. Do NOT output a second JSON block, do NOT narrate "let me try another
+approach", do NOT generate alternative tool calls. The system executes ALL tool calls from
+your single JSON block and returns results in the next iteration. If a tool fails, you will
+see the failure and can retry in the next iteration. NEVER generate multiple JSON blocks
+in one response — only the first is used; the rest waste time.
+
+Batch related tool calls efficiently (3-8 per turn). Never re-call a tool with
+identical parameters — duplicates are automatically skipped.
 
 When you have gathered ALL necessary information and completed ALL requested actions,
 respond with plain text (NO JSON wrapping, no tool_calls key). Your plain text final
@@ -797,16 +939,16 @@ Batch `convert_number` calls with other tool calls.
 
 Addresses: use hex string format "0x1234ABCD"
 )";
-    
+
     if (!chat_history.empty())
     {
         ss << OBFSTR("\n## Conversation History\n") << chat_history << "\n";
     }
-    
+
     ss << OBFSTR("\n## IDA Analysis Context\n") << context_block << "\n";
-    
+
     ss << OBFSTR("\n## User Request\n") << user_message << "\n";
-    
+
     return ss.str();
 }
 
@@ -855,6 +997,8 @@ result_t run(
     int compact_retry_count = 0;
     size_t dynamic_tool_result_chars = static_cast<size_t>(config.max_tool_result_chars);
 
+    std::unordered_map<std::string, tool_execution_t> tool_cache;
+
     client->set_max_output_tokens(config.agentic_output_tokens);
 
     for (int iter = 0; iter < config.max_iterations; iter++)
@@ -868,7 +1012,7 @@ result_t run(
 
         if (on_progress)
             on_progress(iter + 1, OBFSTR("Calling AI (iteration ") + std::to_string(iter + 1) + ")...");
-        
+
         if (on_status)
         {
             status_update_t status;
@@ -915,7 +1059,44 @@ result_t run(
                            "(4) any remaining work that could not be completed, with exact addresses to check.");
         }
 
-        std::string ai_response = client->streaming_blocking_generate(conversation, config.temperature, on_stream);
+        std::string ai_response = client->streaming_blocking_generate(
+            conversation, config.temperature, on_stream,
+
+
+            [](const std::string& accumulated) -> bool
+            {
+                size_t tc_pos = accumulated.find("\"tool_calls\"");
+                if (tc_pos == std::string::npos)
+                    return false;
+
+
+                size_t brace_start = std::string::npos;
+                for (size_t i = tc_pos; i > 0; --i)
+                {
+                    if (accumulated[i - 1] == '{')
+                    {
+                        brace_start = i - 1;
+                        break;
+                    }
+                }
+                if (brace_start == std::string::npos)
+                    return false;
+
+                std::string json_block = extract_json_by_bracket_match(accumulated, brace_start);
+                if (json_block.empty())
+                    return false;
+
+                try
+                {
+                    auto j = json::parse(json_block);
+                    if (j.contains("tool_calls") && j["tool_calls"].is_array()
+                        && !j["tool_calls"].empty())
+                        return true;
+                }
+                catch (const json::parse_error&) {}
+
+                return false;
+            });
 
         if (ai_response.substr(0, 6) == "Error:")
         {
@@ -996,9 +1177,9 @@ result_t run(
 
             bool has_incomplete_markers = looks_incomplete(result.final_response);
             bool is_premature = false;
-            if (iter < 2 && result.final_response.size() < 2000)
+            if (iter == 0 && result.final_response.size() < 400)
                 is_premature = true;
-            else if (has_incomplete_markers && iter < config.max_iterations - 2)
+            else if (has_incomplete_markers && iter < 3)
                 is_premature = true;
 
             if (is_premature && iter < config.max_iterations - 1)
@@ -1100,7 +1281,15 @@ result_t run(
 
         std::vector<tool_execution_t> all_tool_results;
 
-        for (size_t tool_idx = 0; tool_idx < parsed[OBFSTR_C("tool_calls")].size(); ++tool_idx)
+        size_t max_tools = static_cast<size_t>(config.max_tools_per_iteration);
+        size_t requested_count = parsed[OBFSTR_C("tool_calls")].size();
+        size_t effective_count = std::min(requested_count, max_tools);
+
+        if (requested_count > max_tools && config.verbose_logging)
+            msg(OBFSTR_C("AiDA Agent: Capping tool calls from %zu to %zu per iteration limit.\n"),
+                requested_count, max_tools);
+
+        for (size_t tool_idx = 0; tool_idx < effective_count; ++tool_idx)
         {
             if (cancelled && cancelled->load())
                 break;
@@ -1111,6 +1300,35 @@ result_t run(
 
             std::string tool_name = tc[OBFSTR_C("tool")].get<std::string>();
             json params = tc.contains(OBFSTR_C("params")) && !tc[OBFSTR_C("params")].is_null() ? tc[OBFSTR_C("params")] : json::object();
+
+            auto& registry = agent_tools::ToolRegistry::instance();
+            const auto* tool_def = registry.get_tool(tool_name);
+
+
+            std::string cache_key = tool_name + "|" + params.dump(-1, ' ', false, json::error_handler_t::replace);
+            if (tool_def && tool_def->read_only)
+            {
+                auto cache_it = tool_cache.find(cache_key);
+                if (cache_it != tool_cache.end())
+                {
+                    if (config.verbose_logging)
+                        msg(OBFSTR_C("AiDA Agent: Skipping duplicate tool call: %s (cached)\n"), tool_name.c_str());
+
+                    all_tool_results.push_back(cache_it->second);
+
+                    if (on_status)
+                    {
+                        status_update_t status;
+                        status.type = status_type_t::tool_complete;
+                        status.iteration = iter + 1;
+                        status.tool_name = cache_it->second.tool_name;
+                        status.tool_success = cache_it->second.success;
+                        status.message = cache_it->second.message + OBFSTR(" (cached)");
+                        on_status(status);
+                    }
+                    continue;
+                }
+            }
 
             if (on_status)
             {
@@ -1127,11 +1345,13 @@ result_t run(
             exec_req.tool_name = tool_name;
             exec_req.params = params;
 
-            auto& registry = agent_tools::ToolRegistry::instance();
-            const auto* tool_def = registry.get_tool(tool_name);
             int mff_flag = (tool_def && tool_def->read_only) ? MFF_READ : MFF_WRITE;
 
             execute_sync(exec_req, mff_flag);
+
+
+            if (tool_def && tool_def->read_only && exec_req.result.success)
+                tool_cache[cache_key] = exec_req.result;
 
             if (on_status)
             {

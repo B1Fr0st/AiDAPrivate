@@ -60,6 +60,15 @@ static QFont createChatUiFont()
     return font;
 }
 
+static QString formatElapsedTime(qint64 seconds)
+{
+    if (seconds < 60)
+        return QStringLiteral("%1s").arg(seconds);
+    if (seconds < 3600)
+        return QStringLiteral("%1m %2s").arg(seconds / 60).arg(seconds % 60);
+    return QStringLiteral("%1h %2m").arg(seconds / 3600).arg((seconds % 3600) / 60);
+}
+
 
 FunctionCompleterPopup::FunctionCompleterPopup(QWidget* parent)
     : QFrame(parent, Qt::ToolTip | Qt::FramelessWindowHint)
@@ -273,12 +282,16 @@ AiDAChatPanel::AiDAChatPanel(QWidget* parent,
     , m_thinkingDetails(nullptr)
     , m_streamingDisplay(nullptr)
     , m_currentToolLabel(nullptr)
+    , m_thinkingElapsedLabel(nullptr)
     , m_thinkingExpanded(false)
     , m_historyPanel(nullptr)
     , m_historyList(nullptr)
     , m_historyVisible(false)
+    , m_toastLabel(nullptr)
+    , m_toastTimer(nullptr)
     , m_completer(nullptr)
     , m_completerActive(false)
+    , m_thinkingElapsedTimer(nullptr)
     , m_typewriterTimer(nullptr)
     , m_userScrolledStreaming(false)
     , m_userScrolledChat(false)
@@ -300,6 +313,10 @@ AiDAChatPanel::~AiDAChatPanel()
         m_typingPulse->stop();
     if (m_typewriterTimer != nullptr)
         m_typewriterTimer->stop();
+    if (m_thinkingElapsedTimer != nullptr)
+        m_thinkingElapsedTimer->stop();
+    if (m_toastTimer != nullptr)
+        m_toastTimer->stop();
     saveCurrentConversation();
     saveToDisk();
 }
@@ -411,8 +428,8 @@ void AiDAChatPanel::setupUI()
 
     QWidget* chatArea = new QWidget(bodyContainer);
     QVBoxLayout* chatAreaLayout = new QVBoxLayout(chatArea);
-    chatAreaLayout->setContentsMargins(10, 12, 10, 10);
-    chatAreaLayout->setSpacing(10);
+    chatAreaLayout->setContentsMargins(6, 6, 6, 6);
+    chatAreaLayout->setSpacing(6);
 
     m_chatDisplay = new ChatTextBrowser(chatArea);
     m_chatDisplay->setObjectName(QStringLiteral("chatDisplay"));
@@ -429,6 +446,16 @@ void AiDAChatPanel::setupUI()
             int idx = path.toInt(&ok);
             if (ok)
                 copyMessageToClipboard(idx);
+        }
+        else if (scheme == QStringLiteral("undo"))
+        {
+            QString path = url.path();
+            if (path.startsWith(QChar('/')))
+                path.remove(0, 1);
+            bool ok = false;
+            int idx = path.toInt(&ok);
+            if (ok)
+                undoToMessage(idx);
         }
         else if (scheme == QStringLiteral("nav"))
         {
@@ -482,7 +509,7 @@ void AiDAChatPanel::setupUI()
 
     m_thinkingToggleBtn = new QPushButton(thinkingHeader);
     m_thinkingToggleBtn->setObjectName(QStringLiteral("thinkingToggleBtn"));
-    m_thinkingToggleBtn->setText(QStringLiteral(">"));
+    m_thinkingToggleBtn->setText(QString(QChar(0x25B6)));
     m_thinkingToggleBtn->setFixedSize(20, 20);
     m_thinkingToggleBtn->setCursor(Qt::PointingHandCursor);
     QObject::connect(m_thinkingToggleBtn, &QPushButton::clicked, [this]() {
@@ -526,6 +553,11 @@ void AiDAChatPanel::setupUI()
     thinkingHeaderLayout->addWidget(m_typingWidget);
     thinkingHeaderLayout->addStretch();
 
+    m_thinkingElapsedLabel = new QLabel(thinkingHeader);
+    m_thinkingElapsedLabel->setObjectName(QStringLiteral("thinkingElapsedLabel"));
+    m_thinkingElapsedLabel->setVisible(false);
+    thinkingHeaderLayout->addWidget(m_thinkingElapsedLabel);
+
     thinkingLayout->addWidget(thinkingHeader);
 
     m_thinkingDetails = new QWidget(m_thinkingContainer);
@@ -545,8 +577,8 @@ void AiDAChatPanel::setupUI()
     m_streamingDisplay->setObjectName(QStringLiteral("streamingDisplay"));
     m_streamingDisplay->setReadOnly(true);
     m_streamingDisplay->setAcceptRichText(false);
-    m_streamingDisplay->setMinimumHeight(74);
-    m_streamingDisplay->setMaximumHeight(340);
+    m_streamingDisplay->setMinimumHeight(60);
+    m_streamingDisplay->setMaximumHeight(280);
     m_streamingDisplay->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     m_streamingDisplay->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_streamingDisplay->setLineWrapMode(QTextEdit::WidgetWidth);
@@ -571,8 +603,8 @@ void AiDAChatPanel::setupUI()
     QWidget* inputContainer = new QWidget(this);
     inputContainer->setObjectName(QStringLiteral("inputContainer"));
     QVBoxLayout* inputOuterLay = new QVBoxLayout(inputContainer);
-    inputOuterLay->setContentsMargins(16, 12, 16, 16);
-    inputOuterLay->setSpacing(12);
+    inputOuterLay->setContentsMargins(14, 8, 14, 12);
+    inputOuterLay->setSpacing(8);
 
     m_inputField = new QTextEdit(inputContainer);
     m_inputField->setObjectName(QStringLiteral("chatInput"));
@@ -650,7 +682,7 @@ void AiDAChatPanel::setupUI()
     });
 
     m_typewriterTimer = new QTimer(this);
-    m_typewriterTimer->setInterval(12);
+    m_typewriterTimer->setInterval(8);
     QObject::connect(m_typewriterTimer, &QTimer::timeout, [this]() {
         if (m_typewriterQueue.isEmpty())
         {
@@ -658,14 +690,21 @@ void AiDAChatPanel::setupUI()
             return;
         }
 
-        int batchSize = 1;
+
+        int batchSize;
         int queueLen = static_cast<int>(m_typewriterQueue.length());
-        if (queueLen > 200)
-            batchSize = 8;
+        if (queueLen > 2000)
+            batchSize = queueLen;
+        else if (queueLen > 500)
+            batchSize = 200;
+        else if (queueLen > 200)
+            batchSize = 80;
         else if (queueLen > 100)
-            batchSize = 4;
+            batchSize = 40;
         else if (queueLen > 50)
-            batchSize = 2;
+            batchSize = 16;
+        else
+            batchSize = 6;
 
         QString batch = m_typewriterQueue.left(batchSize);
         m_typewriterQueue.remove(0, batchSize);
@@ -678,6 +717,27 @@ void AiDAChatPanel::setupUI()
             m_streamingDisplay->setTextCursor(cursor);
             m_streamingDisplay->ensureCursorVisible();
         }
+    });
+
+    m_thinkingElapsedTimer = new QTimer(this);
+    m_thinkingElapsedTimer->setInterval(1000);
+    QObject::connect(m_thinkingElapsedTimer, &QTimer::timeout, [this]() {
+        qint64 elapsed = m_thinkingStopwatch.elapsed() / 1000;
+        m_thinkingElapsedLabel->setText(formatElapsedTime(elapsed));
+        m_thinkingElapsedLabel->setVisible(true);
+    });
+
+    m_toastLabel = new QLabel(this);
+    m_toastLabel->setObjectName(QStringLiteral("toastLabel"));
+    m_toastLabel->setAlignment(Qt::AlignCenter);
+    m_toastLabel->setVisible(false);
+    m_toastLabel->setAttribute(Qt::WA_TransparentForMouseEvents);
+    m_toastLabel->setFixedHeight(34);
+
+    m_toastTimer = new QTimer(this);
+    m_toastTimer->setSingleShot(true);
+    QObject::connect(m_toastTimer, &QTimer::timeout, [this]() {
+        m_toastLabel->setVisible(false);
     });
 }
 
@@ -819,7 +879,7 @@ void AiDAChatPanel::updateThemeColors()
     if (m_streamingDisplay != nullptr)
     {
         QPalette streamPal = m_streamingDisplay->palette();
-        streamPal.setColor(QPalette::Base, blendColor(m_theme.panelBg, m_theme.inputBg, 0.22));
+        streamPal.setColor(QPalette::Base, blendColor(m_theme.panelBg, m_theme.inputBg, 0.38));
         streamPal.setColor(QPalette::Text, m_theme.textPrimary);
         m_streamingDisplay->setPalette(streamPal);
     }
@@ -886,8 +946,8 @@ QString AiDAChatPanel::buildWidgetStylesheet() const
         "  background-color: %1;"
         "  border: 1px solid %2;"
         "  border-left: 3px solid %3;"
-        "  border-radius: 14px;"
-        "  margin: 10px 10px 12px 10px;"
+        "  border-radius: 2px 8px 8px 2px;"
+        "  margin: 6px 8px 8px 8px;"
         "  padding: 0px;"
         "}")
         .arg(colorToRgb(blendColor(t.panelBg, t.messageBgSystem, 0.55)),
@@ -896,7 +956,7 @@ QString AiDAChatPanel::buildWidgetStylesheet() const
     css += QStringLiteral(
         "QWidget#thinkingHeader {"
         "  background-color: transparent;"
-        "  border-radius: 10px;"
+        "  border-radius: 6px;"
         "}");
     css += QStringLiteral(
         "QPushButton#thinkingToggleBtn {"
@@ -911,19 +971,26 @@ QString AiDAChatPanel::buildWidgetStylesheet() const
         "QWidget#thinkingDetails { background-color: transparent; }");
     css += QStringLiteral(
         "QTextEdit#streamingDisplay {"
-              "  color: %1; font-size: 9.5pt; padding: 8px 10px;"
+        "  color: %1; font-size: 9pt; padding: 8px 10px;"
         "  background-color: %2;"
-           "  border: 1px solid %3; border-radius: 8px;"
-          "  font-family: 'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;"
-           "  selection-background-color: %4;"
+        "  border: 1px solid %3; border-radius: 6px;"
+        "  font-family: 'Cascadia Mono', 'Consolas', 'Courier New', monospace;"
+        "  selection-background-color: %4;"
         "}")
         .arg(colorToRgb(t.textSecondary),
-               colorToRgb(blendColor(t.panelBg, t.inputBg, 0.22)),
-               colorToRgb(t.messageBorder),
+             colorToRgb(blendColor(t.panelBg, t.inputBg, 0.38)),
+             colorToRgb(t.messageBorder),
              colorToRgb(t.selectionBg));
     css += QStringLiteral(
           "QLabel#currentToolLabel { color: %1; font-size: 9pt; font-weight: 500; padding: 2px 0px; }")
         .arg(colorToRgb(t.accentColor));
+
+    css += QStringLiteral(
+        "QLabel#thinkingElapsedLabel {"
+        "  color: %1; font-size: 8.5pt; font-weight: 500;"
+        "  padding: 2px 8px; background: transparent;"
+        "}")
+        .arg(colorToRgb(t.textMuted));
 
     css += QStringLiteral(
         "QWidget#inputContainer { background-color: %1; border-top: 1px solid %2; }")
@@ -952,15 +1019,15 @@ QString AiDAChatPanel::buildWidgetStylesheet() const
     css += QStringLiteral(
         "QPushButton#cancelBtn { background-color: %1; color: %2; border: 1px solid %3; border-radius: 10px;"
         "  padding: 6px 20px; font-size: 10pt; font-weight: 650; min-height: 32px; min-width: 88px; }")
-        .arg(colorToRgb(blendColor(QColor(180, 60, 60), t.panelBg, 0.25)),
+        .arg(colorToRgb(blendColor(QColor(160, 55, 55), t.panelBg, 0.40)),
              colorToRgb(t.textPrimary),
-             colorToRgb(blendColor(QColor(180, 60, 60), t.panelBg, 0.35)));
+             colorToRgb(blendColor(QColor(160, 55, 55), t.panelBg, 0.50)));
     css += QStringLiteral(
         "QPushButton#cancelBtn:hover { background-color: %1; }")
-        .arg(colorToRgb(blendColor(QColor(200, 70, 70), t.panelBg, 0.20)));
+        .arg(colorToRgb(blendColor(QColor(175, 65, 65), t.panelBg, 0.32)));
     css += QStringLiteral(
         "QPushButton#cancelBtn:pressed { background-color: %1; }")
-        .arg(colorToRgb(blendColor(QColor(160, 50, 50), t.panelBg, 0.30)));
+        .arg(colorToRgb(blendColor(QColor(145, 50, 50), t.panelBg, 0.45)));
 
     css += QStringLiteral(
         "QPushButton#clearBtn, QPushButton#tagBtn { background-color: transparent; color: %1;"
@@ -1006,6 +1073,20 @@ QString AiDAChatPanel::buildWidgetStylesheet() const
     css += QStringLiteral(
         "FunctionCompleterPopup QListWidget::item:hover { background-color: %1; }")
         .arg(colorToRgb(t.historyItemHover));
+
+    css += QStringLiteral(
+        "QLabel#toastLabel {"
+        "  background-color: %1;"
+        "  color: %2;"
+        "  border: 1px solid %3;"
+        "  border-radius: 12px;"
+        "  padding: 6px 18px;"
+        "  font-size: 9pt;"
+        "  font-weight: 600;"
+        "}")
+        .arg(colorToRgb(t.headerBg),
+             colorToRgb(t.textPrimary),
+             colorToRgb(t.messageBorder));
 
     return css;
 }
@@ -1081,9 +1162,19 @@ QString AiDAChatPanel::buildDocumentCss() const
     css += QStringLiteral(".msg-actions { text-align: right; padding-top: 10px; margin: 0; }");
 
     css += QStringLiteral(
+        ".msg-sender-label {"
+        "  font-size: 8.5pt;"
+        "  font-weight: 650;"
+        "  color: %1;"
+        "  padding: 0 4px 4px 4px;"
+        "  margin: 0;"
+        "}")
+        .arg(colorToHex(t.textMuted));
+
+    css += QStringLiteral(
         ".copy-btn-user, .copy-btn {"
         "  color: %1;"
-        "  font-size: 9pt;"
+        "  font-size: 8.5pt;"
         "  font-weight: 600;"
         "  text-decoration: none;"
         "}")
@@ -1093,8 +1184,9 @@ QString AiDAChatPanel::buildDocumentCss() const
     css += QStringLiteral(
         ".copy-btn-outline {"
         "  border: 1px solid %1;"
-        "  border-radius: 8px;"
-        "  padding: 4px 10px;"
+        "  border-radius: 10px;"
+        "  padding: 4px 12px;"
+        "  margin: 0 2px;"
         "}")
         .arg(colorToHex(t.messageBorder));
 
@@ -1193,7 +1285,7 @@ void AiDAChatPanel::setupStyle()
     m_inputField->setPalette(inputPal);
 
     QPalette streamPal = m_streamingDisplay->palette();
-    streamPal.setColor(QPalette::Base, blendColor(m_theme.panelBg, m_theme.inputBg, 0.22));
+    streamPal.setColor(QPalette::Base, blendColor(m_theme.panelBg, m_theme.inputBg, 0.38));
     streamPal.setColor(QPalette::Text, m_theme.textPrimary);
     m_streamingDisplay->setPalette(streamPal);
 }
@@ -1540,12 +1632,16 @@ void AiDAChatPanel::setThinkingState(bool thinking)
         m_userScrolledStreaming = false;
         m_typingDotCount = 0;
         m_typingLabel->setText(QStringLiteral("Thinking"));
+        m_thinkingStopwatch.start();
+        m_thinkingElapsedLabel->setText(QStringLiteral("0s"));
+        m_thinkingElapsedLabel->setVisible(true);
+        m_thinkingElapsedTimer->start();
         m_currentToolLabel->clear();
         m_currentToolLabel->setVisible(false);
         m_typingTimer->start(500);
         m_typingPulse->start();
         clearThinkingStatus();
-        setThinkingExpanded(true);
+        setThinkingExpanded(false);
     }
     else
     {
@@ -1553,6 +1649,7 @@ void AiDAChatPanel::setThinkingState(bool thinking)
         m_typingPulse->stop();
         m_typingOpacity->setOpacity(1.0);
         m_typewriterTimer->stop();
+        m_thinkingElapsedTimer->stop();
 
         if (!m_typewriterQueue.isEmpty())
         {
@@ -1568,26 +1665,36 @@ void AiDAChatPanel::setThinkingState(bool thinking)
         }
 
         bool hasContent = !m_streamingDisplay->toPlainText().trimmed().isEmpty();
-        m_typingLabel->setText(QStringLiteral("Thought"));
-        m_typingWidget->setVisible(true);
+        {
+            qint64 elapsed = m_thinkingStopwatch.elapsed() / 1000;
+            if (elapsed > 0)
+                m_typingLabel->setText(QStringLiteral("Thought for ") + formatElapsedTime(elapsed));
+            else
+                m_typingLabel->setText(QStringLiteral("Thought"));
+        }
 
         if (hasContent)
         {
+            m_typingWidget->setVisible(true);
             m_thinkingToggleBtn->setVisible(true);
+            m_thinkingElapsedLabel->setVisible(false);
             setThinkingExpanded(false);
+            m_thinkingContainer->setVisible(true);
         }
         else
         {
+            m_typingWidget->setVisible(false);
             m_thinkingToggleBtn->setVisible(false);
             m_thinkingExpanded = false;
             m_thinkingDetails->setVisible(false);
             m_currentToolLabel->clear();
             m_currentToolLabel->setVisible(false);
+            m_thinkingContainer->setVisible(false);
         }
-
-        m_thinkingContainer->setVisible(true);
     }
 }
+
+static QString stripCodeFences(const QString& text);
 
 void AiDAChatPanel::updateThinkingStatus(const QString& reasoning, const QStringList& pendingTools, const QString& currentTool)
 {
@@ -1604,8 +1711,9 @@ void AiDAChatPanel::updateThinkingStatus(const QString& reasoning, const QString
             m_typewriterQueue += sep;
             m_streamBuffer += sep;
         }
-        m_typewriterQueue += reasoning;
-        m_streamBuffer += reasoning;
+        QString cleanedReasoning = stripCodeFences(reasoning);
+        m_typewriterQueue += cleanedReasoning;
+        m_streamBuffer += cleanedReasoning;
 
         if (!m_typewriterTimer->isActive())
             m_typewriterTimer->start();
@@ -1689,7 +1797,7 @@ void AiDAChatPanel::setThinkingExpanded(bool expanded)
 {
     m_thinkingExpanded = expanded;
     m_thinkingDetails->setVisible(expanded);
-    m_thinkingToggleBtn->setText(expanded ? QStringLiteral("v") : QStringLiteral(">"));
+    m_thinkingToggleBtn->setText(expanded ? QString(QChar(0x25BC)) : QString(QChar(0x25B6)));
 }
 
 void AiDAChatPanel::clearThinkingStatus()
@@ -1701,13 +1809,31 @@ void AiDAChatPanel::clearThinkingStatus()
     m_currentToolLabel->setVisible(false);
 }
 
+static QString stripCodeFences(const QString& text)
+{
+    QString result;
+    result.reserve(text.size());
+    QStringList lines = text.split(QChar('\n'));
+    for (int i = 0; i < lines.size(); ++i)
+    {
+        QString trimmed = lines[i].trimmed();
+        if (trimmed.startsWith(QStringLiteral("```")))
+            continue;
+        if (i > 0)
+            result += QChar('\n');
+        result += lines[i];
+    }
+    return result;
+}
+
 void AiDAChatPanel::appendStreamChunk(const QString& chunk)
 {
     if (!m_isWaiting)
         return;
 
-    m_streamBuffer += chunk;
-    m_typewriterQueue += chunk;
+    QString cleaned = stripCodeFences(chunk);
+    m_streamBuffer += cleaned;
+    m_typewriterQueue += cleaned;
     m_thinkingToggleBtn->setVisible(true);
 
     if (!m_typewriterTimer->isActive())
@@ -1745,6 +1871,8 @@ void AiDAChatPanel::clearHistory()
 {
     m_history.clear();
     m_conversationTags.clear();
+    clearThinkingStatus();
+    m_thinkingContainer->setVisible(false);
     m_history.emplace_back("System", "Conversation cleared.");
     rebuildChatDisplay();
 }
@@ -1769,13 +1897,41 @@ void AiDAChatPanel::copyMessageToClipboard(int index)
     const auto& entry = m_history[index];
     QString text = QString::fromStdString(entry.second);
     QApplication::clipboard()->setText(text);
+    showToast(QString(QChar(0x2713)) + QStringLiteral(" Copied to clipboard"));
+}
 
-    m_typingWidget->setVisible(true);
-    m_typingLabel->setText(QString(QChar(0x2713)) + QStringLiteral(" Copied to clipboard!"));
-    QTimer::singleShot(1500, [this]() {
-        if (!m_isWaiting)
-            m_typingWidget->setVisible(false);
-    });
+void AiDAChatPanel::showToast(const QString& message)
+{
+    m_toastLabel->setText(message);
+    m_toastLabel->setFixedWidth(qMin(280, width() - 40));
+    int x = (width() - m_toastLabel->width()) / 2;
+    int y = height() - 90;
+    m_toastLabel->move(x, y);
+    m_toastLabel->setVisible(true);
+    m_toastLabel->raise();
+    m_toastTimer->start(1800);
+}
+
+void AiDAChatPanel::undoToMessage(int index)
+{
+    if (index < 0 || index >= static_cast<int>(m_history.size()))
+        return;
+
+    int answer = ask_yn(ASKBTN_NO,
+        "HIDECANCEL\n"
+        "Undo conversation to this message?\n\n"
+        "All messages after this point will be removed.\n"
+        "This action cannot be undone.");
+
+    if (answer != ASKBTN_YES)
+        return;
+
+    m_history.erase(m_history.begin() + index + 1, m_history.end());
+
+    rebuildChatDisplay();
+    saveCurrentConversation();
+    saveToDisk();
+    showToast(QStringLiteral("Conversation rewound"));
 }
 
 void AiDAChatPanel::rebuildChatDisplay()
@@ -1854,9 +2010,15 @@ QString AiDAChatPanel::formatUserMessageHtml(const QString& msg, int index) cons
     return QStringLiteral(
         "<table class='msg-row' width='100%' cellspacing='0' cellpadding='0'><tr>"
         "<td class='msg-side'></td>"
-        "<td class='msg-cell-right'><div class='bubble-user' style='%3'>"
+        "<td class='msg-cell-right'>"
+        "<div class='msg-sender-label' style='text-align:right;'>You</div>"
+        "<div class='bubble-user' style='%3'>"
         "<div class='msg-content'>%2</div>"
-        "<div class='msg-actions'><span class='copy-btn-outline'><a href='copy:%1' class='copy-btn-user'>Copy</a></span></div>"
+        "<div class='msg-actions'>"
+        "<span class='copy-btn-outline'><a href='undo:%1' class='copy-btn-user'>&#x21A9; Undo</a></span>"
+        "&nbsp;&nbsp;"
+        "<span class='copy-btn-outline'><a href='copy:%1' class='copy-btn-user'>Copy</a></span>"
+        "</div>"
         "</div></td>"
         "</tr></table>\n")
         .arg(index)
@@ -1885,9 +2047,15 @@ QString AiDAChatPanel::formatAiMessageHtml(const QString& msg, int index) const
 
     return QStringLiteral(
         "<table class='msg-row' width='100%' cellspacing='0' cellpadding='0'><tr>"
-        "<td class='msg-cell-left'><div class='bubble-ai' style='%3'>"
+        "<td class='msg-cell-left'>"
+        "<div class='msg-sender-label'>AiDA</div>"
+        "<div class='bubble-ai' style='%3'>"
         "<div class='msg-content'>%2</div>"
-        "<div class='msg-actions'><span class='copy-btn-outline'><a href='copy:%1' class='copy-btn'>Copy</a></span></div>"
+        "<div class='msg-actions'>"
+        "<span class='copy-btn-outline'><a href='undo:%1' class='copy-btn'>&#x21A9; Undo</a></span>"
+        "&nbsp;&nbsp;"
+        "<span class='copy-btn-outline'><a href='copy:%1' class='copy-btn'>Copy</a></span>"
+        "</div>"
         "</div></td><td class='msg-side'></td>"
         "</tr></table>\n")
         .arg(index)
@@ -1915,6 +2083,7 @@ QString AiDAChatPanel::markdownToHtml(const QString& md) const
     QStringList lines = md.split(QChar('\n'));
     bool inCodeBlock = false;
     QString codeAccum;
+    bool lastLineWasBlank = false;
 
     for (int i = 0; i < lines.size(); ++i)
     {
@@ -1930,6 +2099,7 @@ QString AiDAChatPanel::markdownToHtml(const QString& md) const
                        +  QStringLiteral("</pre>");
                 codeAccum.clear();
                 inCodeBlock = false;
+                lastLineWasBlank = false;
             }
             else
             {
@@ -1946,32 +2116,153 @@ QString AiDAChatPanel::markdownToHtml(const QString& md) const
             continue;
         }
 
-        QString processed = escapeHtml(line);
+        if (trimmed.isEmpty())
+        {
+            if (!lastLineWasBlank)
+                result += QStringLiteral("<br>\n");
+            lastLineWasBlank = true;
+            continue;
+        }
+        lastLineWasBlank = false;
 
+        if (QRegularExpression(QStringLiteral("^-{3,}$|^\\*{3,}$|^_{3,}$")).match(trimmed).hasMatch())
+        {
+            result += QStringLiteral("<hr style='border:none;border-top:1px solid;opacity:0.22;margin:14px 0;'>\n");
+            continue;
+        }
+
+        int headingLevel = 0;
+        QString lineContent = trimmed;
+        if (trimmed.startsWith(QStringLiteral("### ")))
+        {
+            headingLevel = 3;
+            lineContent = trimmed.mid(4);
+        }
+        else if (trimmed.startsWith(QStringLiteral("## ")))
+        {
+            headingLevel = 2;
+            lineContent = trimmed.mid(3);
+        }
+        else if (trimmed.startsWith(QStringLiteral("# ")))
+        {
+            headingLevel = 1;
+            lineContent = trimmed.mid(2);
+        }
+
+        bool isBlockquote = false;
+        if (headingLevel == 0 && trimmed.startsWith(QStringLiteral("> ")))
+        {
+            isBlockquote = true;
+            lineContent = trimmed.mid(2);
+        }
+        else if (headingLevel == 0 && trimmed == QStringLiteral(">"))
+        {
+            isBlockquote = true;
+            lineContent.clear();
+        }
+
+        bool isBulletItem = false;
+        bool isNumberedItem = false;
+        QString listNumber;
+        if (headingLevel == 0 && !isBlockquote)
+        {
+            if (lineContent.startsWith(QStringLiteral("- ")) || lineContent.startsWith(QStringLiteral("* ")))
+            {
+                isBulletItem = true;
+                lineContent = lineContent.mid(2);
+            }
+            else
+            {
+                QRegularExpression numListRe(QStringLiteral("^(\\d+)\\.\\s(.*)$"));
+                auto numMatch = numListRe.match(lineContent);
+                if (numMatch.hasMatch())
+                {
+                    isNumberedItem = true;
+                    listNumber = numMatch.captured(1);
+                    lineContent = numMatch.captured(2);
+                }
+            }
+        }
+
+        QString processed = escapeHtml(lineContent);
+
+        struct InlineCodeSlot
+        {
+            QString marker;
+            QString html;
+        };
+        std::vector<InlineCodeSlot> codeSlots;
         {
             QRegularExpression inlineCodeRe(QStringLiteral("`([^`]+)`"));
-            QString newProcessed;
+            QString out;
             qsizetype lastEnd = 0;
+            int slotIdx = 0;
             auto matchIt = inlineCodeRe.globalMatch(processed);
             while (matchIt.hasNext())
             {
                 auto match = matchIt.next();
-                newProcessed += processed.mid(lastEnd, match.capturedStart() - lastEnd);
+                out += processed.mid(lastEnd, match.capturedStart() - lastEnd);
                 QString codeContent = match.captured(1);
-                newProcessed += linkifyCodeContent(codeContent);
+                QString marker = QStringLiteral("\x01IC%1\x01").arg(slotIdx++);
+                codeSlots.push_back({marker, linkifyCodeContent(codeContent)});
+                out += marker;
                 lastEnd = static_cast<qsizetype>(match.capturedEnd());
             }
-            newProcessed += processed.mid(lastEnd);
-            processed = newProcessed;
+            out += processed.mid(lastEnd);
+            processed = out;
         }
+
+        processed.replace(
+            QRegularExpression(QStringLiteral("\\*\\*\\*([^*]+)\\*\\*\\*")),
+            QStringLiteral("<b><i>\\1</i></b>"));
 
         processed.replace(
             QRegularExpression(QStringLiteral("\\*\\*([^*]+)\\*\\*")),
             QStringLiteral("<b>\\1</b>"));
 
         processed.replace(
+            QRegularExpression(QStringLiteral("~~([^~]+)~~")),
+            QStringLiteral("<s>\\1</s>"));
+
+        processed.replace(
             QRegularExpression(QStringLiteral("(?<!\\*)\\*([^*]+)\\*(?!\\*)")),
             QStringLiteral("<i>\\1</i>"));
+
+
+        {
+            QRegularExpression mdLinkRe(QStringLiteral("\\[([^\\]]+)\\]\\(([^\\)]+)\\)"));
+            QString linkOut;
+            qsizetype linkLast = 0;
+            bool hasLinks = false;
+            auto linkIt = mdLinkRe.globalMatch(processed);
+            while (linkIt.hasNext())
+            {
+                hasLinks = true;
+                auto lm = linkIt.next();
+                linkOut += processed.mid(linkLast, lm.capturedStart() - linkLast);
+                QString linkText = lm.captured(1);
+                QString linkUrl = lm.captured(2);
+                if (linkUrl.startsWith(QStringLiteral("nav:")))
+                {
+                    linkOut += QStringLiteral("<a href='%1' class='nav-link'>%2</a>")
+                        .arg(linkUrl, linkText);
+                }
+                else
+                {
+                    linkOut += QStringLiteral("<a href='%1' style='color:%2;text-decoration:underline;'>%3</a>")
+                        .arg(linkUrl, colorToHex(m_theme.linkColor), linkText);
+                }
+                linkLast = static_cast<qsizetype>(lm.capturedEnd());
+            }
+            if (hasLinks)
+            {
+                linkOut += processed.mid(linkLast);
+                processed = linkOut;
+            }
+        }
+
+        for (const auto& slot : codeSlots)
+            processed.replace(slot.marker, slot.html);
 
         {
             QRegularExpression bareHexRe(QStringLiteral("(?<!href=')(?<!>)(0x[0-9a-fA-F]{4,})(?!</a>)"));
@@ -1987,18 +2278,18 @@ QString AiDAChatPanel::markdownToHtml(const QString& md) const
                 qsizetype lastOpenCode = before.lastIndexOf(QStringLiteral("<code>"));
                 qsizetype lastCloseCode = before.lastIndexOf(QStringLiteral("</code>"));
                 qsizetype lastNavLink = before.lastIndexOf(QStringLiteral("nav-link"));
-                
+
                 bool insideAnchor = lastOpenA > lastCloseA;
                 bool insideCode = lastOpenCode > lastCloseCode;
                 bool alreadyLinked = lastNavLink > lastCloseA && lastNavLink > -1;
-                
+
                 if (insideAnchor || insideCode || alreadyLinked)
                 {
                     newProcessed += processed.mid(lastEnd, match.capturedEnd() - lastEnd);
                     lastEnd = static_cast<qsizetype>(match.capturedEnd());
                     continue;
                 }
-                
+
                 newProcessed += processed.mid(lastEnd, match.capturedStart() - lastEnd);
                 QString addr = match.captured(1);
                 QString hexOnly = addr.mid(2);
@@ -2024,18 +2315,18 @@ QString AiDAChatPanel::markdownToHtml(const QString& md) const
                 qsizetype lastOpenCode = before.lastIndexOf(QStringLiteral("<code>"));
                 qsizetype lastCloseCode = before.lastIndexOf(QStringLiteral("</code>"));
                 qsizetype lastNavLink = before.lastIndexOf(QStringLiteral("nav-link"));
-                
+
                 bool insideAnchor = lastOpenA > lastCloseA;
                 bool insideCode = lastOpenCode > lastCloseCode;
                 bool alreadyLinked = lastNavLink > lastCloseA && lastNavLink > -1;
-                
+
                 if (insideAnchor || insideCode || alreadyLinked)
                 {
                     newProcessed += processed.mid(lastEnd, match.capturedEnd() - lastEnd);
                     lastEnd = static_cast<qsizetype>(match.capturedEnd());
                     continue;
                 }
-                
+
                 newProcessed += processed.mid(lastEnd, match.capturedStart() - lastEnd);
                 QString name = match.captured(1);
                 qsizetype underscorePos = name.indexOf(QChar('_'));
@@ -2059,44 +2350,39 @@ QString AiDAChatPanel::markdownToHtml(const QString& md) const
             QRegularExpression(QStringLiteral("@(\\w+)")),
             QStringLiteral("<span class='tag-ref'>@\\1</span>"));
 
-        if (QRegularExpression(QStringLiteral("^-{3,}$|^\\*{3,}$|^_{3,}$")).match(trimmed).hasMatch())
+        if (headingLevel > 0)
         {
-            result += QStringLiteral("<hr style='border: none; border-top: 1px solid; opacity: 0.3; margin: 12px 0;'>\n");
-            continue;
+            QString hClass = QStringLiteral("md-h%1").arg(headingLevel);
+            result += QStringLiteral("<span class='md-heading %1'>%2</span><br>\n")
+                .arg(hClass, processed);
         }
-
-        QRegularExpressionMatch numMatch;
-        if (processed.trimmed().contains(QRegularExpression(QStringLiteral("^\\d+\\.\\s")), &numMatch))
+        else if (isBlockquote)
         {
-            processed = QStringLiteral("&nbsp;&nbsp;") + processed.trimmed();
+            result += QStringLiteral(
+                "<div style='border-left:3px solid %1;padding:2px 0 2px 12px;"
+                "margin:4px 0;color:%2;'>%3</div>\n")
+                .arg(colorToHex(m_theme.accentColor),
+                     colorToHex(m_theme.textSecondary),
+                     processed);
         }
-        else if (processed.trimmed().startsWith(QStringLiteral("- "))
-            || processed.trimmed().startsWith(QStringLiteral("* ")))
+        else if (isBulletItem)
         {
-            processed = QStringLiteral("&nbsp;&nbsp;&bull;&nbsp;")
-                      + processed.trimmed().mid(2);
+            result += QStringLiteral(
+                "<div style='padding-left:18px;text-indent:-14px;margin:2px 0;'>"
+                "<span style='color:%1;'>\u2022</span>&nbsp;%2</div>\n")
+                .arg(colorToHex(m_theme.accentColor), processed);
         }
-
-        if (processed.trimmed().startsWith(QStringLiteral("### ")))
+        else if (isNumberedItem)
         {
-            processed = QStringLiteral("<span class='md-heading md-h3'>")
-                      + processed.trimmed().mid(4)
-                      + QStringLiteral("</span>");
+            result += QStringLiteral(
+                "<div style='padding-left:18px;text-indent:-14px;margin:2px 0;'>"
+                "<span style='color:%1;font-weight:600;'>%2.</span>&nbsp;%3</div>\n")
+                .arg(colorToHex(m_theme.accentColor), listNumber, processed);
         }
-        else if (processed.trimmed().startsWith(QStringLiteral("## ")))
+        else
         {
-            processed = QStringLiteral("<span class='md-heading md-h2'>")
-                      + processed.trimmed().mid(3)
-                      + QStringLiteral("</span>");
+            result += processed + QStringLiteral("<br>\n");
         }
-        else if (processed.trimmed().startsWith(QStringLiteral("# ")))
-        {
-            processed = QStringLiteral("<span class='md-heading md-h1'>")
-                      + processed.trimmed().mid(2)
-                      + QStringLiteral("</span>");
-        }
-
-        result += processed + QStringLiteral("<br>\n");
     }
 
     if (inCodeBlock && !codeAccum.isEmpty())
@@ -2122,7 +2408,7 @@ QString AiDAChatPanel::escapeHtml(const QString& text) const
 static QString linkifyCodeContent(const QString& codeContent)
 {
     QString content = codeContent;
-    
+
     QRegularExpression hexAddrRe(QStringLiteral("^(0x[0-9a-fA-F]+)$"));
     QRegularExpressionMatch hexMatch = hexAddrRe.match(content);
     if (hexMatch.hasMatch())
@@ -2133,7 +2419,7 @@ static QString linkifyCodeContent(const QString& codeContent)
             .arg(hexOnly)
             .arg(addr);
     }
-    
+
     QRegularExpression subLocRe(QStringLiteral("^((?:sub|loc|SUB|LOC|Sub|Loc)_[0-9a-fA-F]+)$"));
     QRegularExpressionMatch subLocMatch = subLocRe.match(content);
     if (subLocMatch.hasMatch())
@@ -2148,7 +2434,7 @@ static QString linkifyCodeContent(const QString& codeContent)
                 .arg(name);
         }
     }
-    
+
     QRegularExpression identRe(QStringLiteral("^([a-zA-Z_][a-zA-Z0-9_]*)$"));
     QRegularExpressionMatch identMatch = identRe.match(content);
     if (identMatch.hasMatch())
@@ -2164,7 +2450,7 @@ static QString linkifyCodeContent(const QString& codeContent)
                 .arg(name);
         }
     }
-    
+
     return QStringLiteral("<code>%1</code>").arg(content);
 }
 
@@ -2294,6 +2580,8 @@ void AiDAChatPanel::startNewConversation()
     saveCurrentConversation();
     m_history.clear();
     m_conversationTags.clear();
+    clearThinkingStatus();
+    m_thinkingContainer->setVisible(false);
     m_activeConversationIndex = -1;
     rebuildChatDisplay();
     m_inputField->clear();

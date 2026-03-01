@@ -37,7 +37,7 @@ static std::string get_effective_firebase_api_key()
 {
     VMP_MUT("get_eff_key");
     std::string key = get_hardcoded_firebase_api_key();
-    
+
     if (key.find("XXXXXXX") != std::string::npos || key.empty())
     {
         key = g_settings.firebase_api_key;
@@ -277,7 +277,7 @@ nlohmann::json license_manager_t::read_license_config() const
     try
     {
         nlohmann::json j = nlohmann::json::parse(data.c_str());
-        
+
         std::string enc_blob = j.value(OBFSTR_C("license_blob"), std::string(""));
         if (!enc_blob.empty())
         {
@@ -285,7 +285,7 @@ nlohmann::json license_manager_t::read_license_config() const
             try
             {
                 nlohmann::json lic = nlohmann::json::parse(decrypted);
-                
+
                 for (auto it = lic.begin(); it != lic.end(); ++it)
                     j[it.key()] = it.value();
             }
@@ -323,7 +323,7 @@ bool license_manager_t::write_license_config(const nlohmann::json& config) const
             }
         }
     }
-    
+
     static const char* license_keys[] = {
         "license_key", "license_validated_at", "license_hwid", "license_plan"
     };
@@ -341,12 +341,12 @@ bool license_manager_t::write_license_config(const nlohmann::json& config) const
             lic_data[k] = merged[k];
         }
     }
-    
+
     if (!lic_data.empty())
     {
         merged[OBFSTR("license_blob")] = encrypt_local(lic_data.dump());
     }
-    
+
     for (auto it = config.begin(); it != config.end(); ++it)
     {
         bool is_license_key = false;
@@ -388,12 +388,12 @@ std::string license_manager_t::generate_hwid() const
     GetVolumeInformationW(L"C:\\", nullptr, 0, &volume_serial,
                           nullptr, nullptr, nullptr, 0);
 
-                          
+
     wchar_t computer_name[MAX_COMPUTERNAME_LENGTH + 1] = {};
     DWORD name_size = MAX_COMPUTERNAME_LENGTH + 1;
     GetComputerNameW(computer_name, &name_size);
 
-    
+
     int cpu_info[4] = {};
     __cpuid(cpu_info, 0);
     int cpu_info_ext[4] = {};
@@ -409,7 +409,7 @@ std::string license_manager_t::generate_hwid() const
     for (DWORD i = 0; i < name_size; ++i)
         fnv_mix(static_cast<uint64_t>(computer_name[i]));
 
-        
+
     {
         ULONG buf_len = 0;
         GetAdaptersInfo(nullptr, &buf_len);
@@ -885,7 +885,7 @@ bool license_manager_t::show_activation_dialog()
     return false;
 }
 
-static int idaapi license_revalidation_timer_cb(void* /*ud*/)
+static int idaapi license_revalidation_timer_cb(void* )
 {
     VMP_VIRT("reval_timer_cb");
     auto& lm = license_manager_t::instance();

@@ -73,13 +73,13 @@ private:
     VMP_MUT("vli_" AIDA_VLI_TOSTR(__LINE__)); \
     const auto& _lic = license_manager_t::instance(); \
     uint64_t _n = _lic.get_runtime_nonce(); \
-    /* XOR with line-specific constant to create unique check */ \
+     \
     uint64_t _check = _n ^ (0xA5B4C3D2E1F0ULL + __LINE__); \
-    /* Must be non-zero and not a known patch pattern */ \
+     \
     if (_n == 0 || _n == 0xFFFFFFFFFFFFFFFFULL \
         || _n == 0xDEADBEEFCAFEBABEULL \
         || _check == 0xA5B4C3D2E1F0ULL + __LINE__) { \
-        /* Unhookable crash via __fastfail */ \
+         \
         __fastfail(FAST_FAIL_FATAL_APP_EXIT); \
         TerminateProcess(GetCurrentProcess(), 0xDEADu); \
         volatile int* _p = nullptr; *_p = 0x41694441; \
