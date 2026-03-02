@@ -83,4 +83,3 @@ namespace skc
                     return crypted; }()
 
 #define VO(str) (static_cast<const char*>(skCrypt(str)))
-

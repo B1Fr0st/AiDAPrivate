@@ -4,9 +4,6 @@
 #include "../CoreSecurity.h"
 #include "../Struct.h"
 
-//=============================================================================
-// Kernel APIs resolved dynamically (added in Defs.h SetupFunctions)
-//=============================================================================
 
 namespace dbg_guard {
     inline volatile ULONG g_dbg_entropy = 0xABCD1234u;
@@ -20,12 +17,7 @@ namespace dbg_guard {
     }
 }
 
-//=============================================================================
-// handle_thread_ctx: Get/Set full thread CONTEXT via KeStackAttachProcess
-//
-// When should_set == 0: reads the CONTEXT of the specified thread
-// When should_set == 1: writes the specified register values into thread CONTEXT
-//=============================================================================
+
 NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     if (!request || request->pid == 0 || request->tid == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -64,7 +56,7 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     strong::kmemset(&ctx, 0, sizeof(ctx));
 
     if (request->should_set == 0) {
-        // GET context
+
         ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
 
         status = _PsGetContextThread(thread, &ctx, UserMode);
@@ -99,12 +91,12 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
         }
     }
     else {
-        // SET context — first get current, then modify requested fields
+
         ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
         status = _PsGetContextThread(thread, &ctx, UserMode);
 
         if (NT_SUCCESS(status)) {
-            // Use the register_mask to select which registers to update
+
             UINT64 mask = request->register_mask;
             if (mask & (1ULL << 0))  ctx.Rax    = request->rax;
             if (mask & (1ULL << 1))  ctx.Rbx    = request->rbx;
@@ -143,10 +135,7 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     return status;
 }
 
-//=============================================================================
-// handle_thread_enum: Enumerate threads of a given process
-// Returns TIDs and their states via kernel PsGetNextProcessThread
-//=============================================================================
+
 NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
     if (!request || request->pid == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -169,23 +158,21 @@ NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
     UINT32 count = 0;
     PETHREAD thread = nullptr;
 
-    // PsGetNextProcessThread(Process, NULL) returns first thread
-    // PsGetNextProcessThread(Process, Thread) returns next, derefs previous
+
     thread = _PsGetNextProcessThread(process, nullptr);
     while (thread != nullptr && count < MAX_ENUM_THREADS) {
         __try {
             HANDLE tid = _PsGetThreadId(thread);
             request->entries[count].tid = (UINT32)(ULONG_PTR)tid;
-            request->entries[count].state = 0; // Running placeholder
+            request->entries[count].state = 0;
 
-            // Read RIP from KTHREAD.TrapFrame if available
-            // KTHREAD offset to TrapFrame varies by build; use safe default
+
             request->entries[count].rip = 0;
 
             count++;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            // Skip problematic threads
+
         }
 
         thread = _PsGetNextProcessThread(process, thread);
@@ -197,9 +184,7 @@ NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
     return STATUS_SUCCESS;
 }
 
-//=============================================================================
-// handle_suspend_resume_thread: Suspend or resume a thread by TID
-//=============================================================================
+
 NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request) {
     if (!request || request->tid == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -232,10 +217,7 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
     return status;
 }
 
-//=============================================================================
-// handle_query_memory: Query virtual memory region info in target process
-// Uses ZwQueryVirtualMemory to get region base, size, state, protect, type
-//=============================================================================
+
 NTSTATUS functions::handle_query_memory(p_query_memory request) {
     if (!request || request->pid == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -285,10 +267,7 @@ NTSTATUS functions::handle_query_memory(p_query_memory request) {
     return status;
 }
 
-//=============================================================================
-// handle_protect_memory: Change virtual memory protection in target process
-// Uses ZwProtectVirtualMemory
-//=============================================================================
+
 NTSTATUS functions::handle_protect_memory(p_protect_memory request) {
     if (!request || request->pid == 0 || request->size == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -331,10 +310,7 @@ NTSTATUS functions::handle_protect_memory(p_protect_memory request) {
     return status;
 }
 
-//=============================================================================
-// handle_enum_memory_regions: Walk entire virtual address space of target
-// Returns up to MAX_ENUM_REGIONS regions
-//=============================================================================
+
 NTSTATUS functions::handle_enum_regions(p_enum_regions request) {
     if (!request || request->pid == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -380,7 +356,7 @@ NTSTATUS functions::handle_enum_regions(p_enum_regions request) {
             break;
         }
 
-        // Only record committed regions unless requested otherwise
+
         if (mbi.State == MEM_COMMIT || request->include_all) {
             request->entries[count].base    = (UINT64)mbi.BaseAddress;
             request->entries[count].size    = (UINT64)mbi.RegionSize;
@@ -391,7 +367,7 @@ NTSTATUS functions::handle_enum_regions(p_enum_regions request) {
         }
 
         UINT64 next = (UINT64)mbi.BaseAddress + mbi.RegionSize;
-        if (next <= addr) break; // overflow guard
+        if (next <= addr) break;
         addr = next;
     }
 
@@ -402,9 +378,7 @@ NTSTATUS functions::handle_enum_regions(p_enum_regions request) {
     return STATUS_SUCCESS;
 }
 
-//=============================================================================
-// handle_read_peb: Read PEB fields of target process
-//=============================================================================
+
 NTSTATUS functions::handle_read_peb(p_read_peb request) {
     if (!request || request->pid == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -431,19 +405,11 @@ NTSTATUS functions::handle_read_peb(p_read_peb request) {
 
     request->peb_address = (UINT64)peb;
 
-    // Attach to read usermode PEB
+
     KAPC_STATE apc_state;
     _KeStackAttachProcess(process, &apc_state);
 
-    // x64 PEB offsets (stable across Win10/Win11):
-    // +0x002 BeingDebugged      (BOOLEAN)
-    // +0x010 ImageBaseAddress    (PVOID)
-    // +0x018 Ldr                 (PVOID)
-    // +0x030 ProcessHeap         (PVOID)
-    // +0x0BC NtGlobalFlag        (ULONG)
-    // +0x0E8 NumberOfHeaps       (ULONG)
-    // +0x0EC MaximumNumberOfHeaps(ULONG)
-    // +0x0F0 ProcessHeaps        (PVOID*)
+
     __try {
         UCHAR* peb_base = (UCHAR*)peb;
         request->image_base      = *(UINT64*)(peb_base + 0x10);
@@ -467,10 +433,7 @@ NTSTATUS functions::handle_read_peb(p_read_peb request) {
     return STATUS_SUCCESS;
 }
 
-//=============================================================================
-// handle_spoof_debug_flags: Clear anti-debug indicators
-// Clears PEB.BeingDebugged, PEB.NtGlobalFlag, EPROCESS.DebugPort
-//=============================================================================
+
 NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
     if (!request || request->pid == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -491,24 +454,21 @@ NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
 
     UINT32 cleared = 0;
 
-    // Clear EPROCESS.DebugPort
-    // DebugPort offset is 0x578 on Win10 22H2+ / Win11
-    // 0x578 for RS5+, was 0x420 on RS1
-    // We'll use a safe offset based on the build
+
     {
         ULONG build = strong::get_windows_version();
         ULONG debug_port_offset = 0;
         if (build >= 22000) {
-            debug_port_offset = 0x578; // Win11
+            debug_port_offset = 0x578;
         }
         else if (build >= 19041) {
-            debug_port_offset = 0x578; // Win10 20H1+
+            debug_port_offset = 0x578;
         }
         else if (build >= 17763) {
-            debug_port_offset = 0x550; // Win10 1809
+            debug_port_offset = 0x550;
         }
         else {
-            debug_port_offset = 0x420; // Win10 RS1-RS4
+            debug_port_offset = 0x420;
         }
 
         if (debug_port_offset > 0) {
@@ -520,14 +480,12 @@ NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
                 }
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Ignore
+
             }
         }
     }
 
-    // Clear PEB flags using raw offsets (x64):
-    // +0x002 BeingDebugged (BOOLEAN)
-    // +0x0BC NtGlobalFlag  (ULONG)
+
     PVOID peb = (PVOID)_PsGetProcessPeb(process);
     if (peb) {
         KAPC_STATE apc_state;
@@ -540,13 +498,13 @@ NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
                 cleared |= 2;
             }
             if (*(UINT32*)(peb_base + 0xBC) != 0) {
-                // Clear heap debug flags: FLG_HEAP_ENABLE_TAIL_CHECK | FLG_HEAP_ENABLE_FREE_CHECK | FLG_HEAP_VALIDATE_PARAMETERS
+
                 *(UINT32*)(peb_base + 0xBC) &= ~(0x70u);
                 cleared |= 4;
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            // Ignore
+
         }
 
         _KeUnstackDetachProcess(&apc_state);
@@ -558,10 +516,7 @@ NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
     return STATUS_SUCCESS;
 }
 
-//=============================================================================
-// handle_get_module_export: Resolve an export from a module in the target process
-// Walks the PE export directory of the specified module
-//=============================================================================
+
 NTSTATUS functions::handle_get_module_export(p_module_export request) {
     if (!request || request->module_base == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -575,7 +530,7 @@ NTSTATUS functions::handle_get_module_export(p_module_export request) {
     UINT64 dtb = request->dtb;
     UINT64 base = request->module_base;
 
-    // Read DOS header
+
     UINT8 dos_hdr[64];
     SIZE_T bytes_read = 0;
     UINT64 phys = strong::translate_virtual_address(dtb, base);
@@ -588,7 +543,7 @@ NTSTATUS functions::handle_get_module_export(p_module_export request) {
     UINT32 pe_off = *(UINT32*)(dos_hdr + 0x3C);
     if (pe_off > 0x1000) return STATUS_INVALID_IMAGE_FORMAT;
 
-    // Read PE header
+
     UINT8 pe_hdr[0x200];
     phys = strong::translate_virtual_address(dtb, base + pe_off);
     if (!phys) return STATUS_INVALID_ADDRESS;
@@ -599,15 +554,15 @@ NTSTATUS functions::handle_get_module_export(p_module_export request) {
     UINT16 opt_magic = *(UINT16*)(pe_hdr + 0x18);
     UINT32 export_rva = 0;
     if (opt_magic == 0x020B) {
-        export_rva = *(UINT32*)(pe_hdr + 0x18 + 0x70); // PE64
+        export_rva = *(UINT32*)(pe_hdr + 0x18 + 0x70);
     }
     else if (opt_magic == 0x010B) {
-        export_rva = *(UINT32*)(pe_hdr + 0x18 + 0x60); // PE32
+        export_rva = *(UINT32*)(pe_hdr + 0x18 + 0x60);
     }
 
     if (export_rva == 0) return STATUS_NOT_FOUND;
 
-    // Read export directory
+
     UINT8 exp_dir[40];
     phys = strong::translate_virtual_address(dtb, base + export_rva);
     if (!phys) return STATUS_INVALID_ADDRESS;
@@ -620,23 +575,23 @@ NTSTATUS functions::handle_get_module_export(p_module_export request) {
     UINT32 addr_of_ords_rva  = *(UINT32*)(exp_dir + 36);
     UINT32 ordinal_base      = *(UINT32*)(exp_dir + 16);
 
-    // Read the target export name from the request
+
     char target_name[128];
     strong::kmemset(target_name, 0, sizeof(target_name));
     for (int i = 0; i < 127 && request->export_name[i]; i++) {
         target_name[i] = request->export_name[i];
     }
 
-    // Search exports
+
     for (UINT32 i = 0; i < num_names && i < 8192; i++) {
-        // Read name RVA
+
         UINT32 name_rva = 0;
         phys = strong::translate_virtual_address(dtb, base + addr_of_names_rva + i * 4);
         if (!phys) continue;
         strong::read_physical(phys, &name_rva, 4, &bytes_read);
         if (name_rva == 0) continue;
 
-        // Read name string
+
         char exp_name[128];
         strong::kmemset(exp_name, 0, sizeof(exp_name));
         phys = strong::translate_virtual_address(dtb, base + name_rva);
@@ -644,7 +599,7 @@ NTSTATUS functions::handle_get_module_export(p_module_export request) {
         strong::read_physical(phys, exp_name, 127, &bytes_read);
         exp_name[127] = 0;
 
-        // Compare
+
         bool match = true;
         for (int c = 0; c < 127; c++) {
             if (target_name[c] == 0 && exp_name[c] == 0) break;
@@ -652,13 +607,13 @@ NTSTATUS functions::handle_get_module_export(p_module_export request) {
         }
 
         if (match) {
-            // Read ordinal
+
             UINT16 ordinal = 0;
             phys = strong::translate_virtual_address(dtb, base + addr_of_ords_rva + i * 2);
             if (!phys) return STATUS_UNSUCCESSFUL;
             strong::read_physical(phys, &ordinal, 2, &bytes_read);
 
-            // Read function RVA
+
             UINT32 func_rva = 0;
             phys = strong::translate_virtual_address(dtb, base + addr_of_funcs_rva + ordinal * 4);
             if (!phys) return STATUS_UNSUCCESSFUL;
@@ -674,9 +629,7 @@ NTSTATUS functions::handle_get_module_export(p_module_export request) {
     return STATUS_NOT_FOUND;
 }
 
-//=============================================================================
-// handle_virt_to_phys: Translate virtual address to physical using process DTB
-//=============================================================================
+
 NTSTATUS functions::handle_virt_to_phys(p_virt_to_phys request) {
     if (!request || request->dtb == 0 || request->virtual_address == 0) {
         return STATUS_INVALID_PARAMETER;

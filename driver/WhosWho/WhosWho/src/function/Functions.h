@@ -14,7 +14,7 @@ namespace functions {
     NTSTATUS handle7783(p_alloc_mem request);
     NTSTATUS handle7784(p_free_mem request);
 
-    // Debugger capability handlers
+
     NTSTATUS handle_thread_ctx(p_thread_ctx request);
     NTSTATUS handle_thread_enum(p_thread_enum request);
     NTSTATUS handle_suspend_resume_thread(p_suspend_resume_thread request);

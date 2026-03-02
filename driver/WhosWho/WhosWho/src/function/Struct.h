@@ -86,21 +86,21 @@ static_assert(sizeof(call_result) == 24, "call_result size must be 24 bytes");
 
 #pragma pack(push, 1)
 typedef struct _SHELLCODE_CONTEXT {
-    UINT64 target_function;    // 0x00
-    UINT64 spoof_return;       // 0x08
-    UINT64 arg1;               // 0x10
-    UINT64 arg2;               // 0x18
-    UINT64 arg3;               // 0x20
-    UINT64 arg4;               // 0x28
-    UINT64 result;             // 0x30
-    UINT64 saved_rsp;          // 0x38
-    UINT64 original_rip;       // 0x40
-    UINT64 rbx_backup;         // 0x48
-    volatile UINT64 completed; // 0x50
-    UINT64 trampoline_addr;    // 0x58
-    UINT64 stack_backup[8];    // 0x60-0x9F
-    UINT64 xmm_backup[12];     // 0xA0-0xFF - XMM0-XMM5 (16 bytes each)
-    UINT64 reserved[8];        // 0x100-0x13F - extra space for alignment
+    UINT64 target_function;
+    UINT64 spoof_return;
+    UINT64 arg1;
+    UINT64 arg2;
+    UINT64 arg3;
+    UINT64 arg4;
+    UINT64 result;
+    UINT64 saved_rsp;
+    UINT64 original_rip;
+    UINT64 rbx_backup;
+    volatile UINT64 completed;
+    UINT64 trampoline_addr;
+    UINT64 stack_backup[8];
+    UINT64 xmm_backup[12];
+    UINT64 reserved[8];
 } SHELLCODE_CONTEXT, *PSHELLCODE_CONTEXT;
 static_assert(sizeof(SHELLCODE_CONTEXT) == 320, "SHELLCODE_CONTEXT must be 320 bytes");
 static_assert(offsetof(SHELLCODE_CONTEXT, result) == 0x30, "result must be at 0x30 in SHELLCODE_CONTEXT");
@@ -135,16 +135,14 @@ typedef struct _HB {
 } heartbeat, * p_heartbeat;
 static_assert(sizeof(heartbeat) == 24, "heartbeat size must be 24 bytes");
 
-//=============================================================================
-// Thread context get/set
-//=============================================================================
+
 typedef struct _TCTX {
     UINT32 pid;
     UINT32 tid;
-    UINT32 should_set;       // 0 = get, 1 = set
+    UINT32 should_set;
     UINT32 padding;
-    UINT64 register_mask;    // bitmask of which registers to set (only used for set)
-    // General purpose registers
+    UINT64 register_mask;
+
     UINT64 rax;
     UINT64 rbx;
     UINT64 rcx;
@@ -163,10 +161,10 @@ typedef struct _TCTX {
     UINT64 r15;
     UINT64 rip;
     UINT64 rflags;
-    // Segment registers
+
     UINT64 cs;
     UINT64 ss;
-    // Debug registers
+
     UINT64 dr0;
     UINT64 dr1;
     UINT64 dr2;
@@ -176,14 +174,12 @@ typedef struct _TCTX {
 } thread_ctx, * p_thread_ctx;
 static_assert(sizeof(thread_ctx) == 232, "thread_ctx size must be 232 bytes");
 
-//=============================================================================
-// Thread enumerate
-//=============================================================================
+
 #define MAX_ENUM_THREADS 256
 
 typedef struct _THREAD_ENTRY {
     UINT32 tid;
-    UINT32 state;       // 0=running, 1=waiting, etc.
+    UINT32 state;
     UINT64 rip;
 } THREAD_ENTRY;
 static_assert(sizeof(THREAD_ENTRY) == 16, "THREAD_ENTRY size must be 16 bytes");
@@ -195,25 +191,21 @@ typedef struct _TENUM {
 } thread_enum, * p_thread_enum;
 static_assert(sizeof(thread_enum) == 8 + sizeof(THREAD_ENTRY) * MAX_ENUM_THREADS, "thread_enum size check");
 
-//=============================================================================
-// Thread suspend/resume
-//=============================================================================
+
 typedef struct _TSR {
     UINT32 tid;
-    UINT32 should_resume;   // 0 = suspend, 1 = resume
+    UINT32 should_resume;
     ULONG  previous_count;
     UINT32 padding;
 } suspend_resume_thread, * p_suspend_resume_thread;
 static_assert(sizeof(suspend_resume_thread) == 16, "suspend_resume_thread size must be 16 bytes");
 
-//=============================================================================
-// Query virtual memory region
-//=============================================================================
+
 typedef struct _QM {
     UINT32 pid;
     UINT32 padding;
     UINT64 address;
-    // Output
+
     UINT64 region_base;
     UINT64 region_size;
     UINT32 state;
@@ -224,9 +216,7 @@ typedef struct _QM {
 } query_memory, * p_query_memory;
 static_assert(sizeof(query_memory) == 56, "query_memory size must be 56 bytes");
 
-//=============================================================================
-// Protect virtual memory
-//=============================================================================
+
 typedef struct _PM {
     UINT32 pid;
     UINT32 new_protect;
@@ -237,9 +227,7 @@ typedef struct _PM {
 } protect_memory, * p_protect_memory;
 static_assert(sizeof(protect_memory) == 32, "protect_memory size must be 32 bytes");
 
-//=============================================================================
-// Enumerate memory regions
-//=============================================================================
+
 #define MAX_ENUM_REGIONS 4096
 
 typedef struct _REGION_ENTRY {
@@ -254,22 +242,20 @@ static_assert(sizeof(REGION_ENTRY) == 32, "REGION_ENTRY size must be 32 bytes");
 
 typedef struct _EREGS {
     UINT32 pid;
-    UINT32 include_all;     // if nonzero, include free/reserved regions too
+    UINT32 include_all;
     UINT64 start_address;
     UINT64 max_address;
-    UINT32 region_count;    // output: number of regions filled
+    UINT32 region_count;
     UINT32 padding;
     REGION_ENTRY entries[MAX_ENUM_REGIONS];
 } enum_regions, * p_enum_regions;
 static_assert(sizeof(enum_regions) == 32 + sizeof(REGION_ENTRY) * MAX_ENUM_REGIONS, "enum_regions size check");
 
-//=============================================================================
-// Read PEB
-//=============================================================================
+
 typedef struct _RPEB {
     UINT32 pid;
     UINT32 padding;
-    // Output fields
+
     UINT64 peb_address;
     UINT64 image_base;
     UINT8  being_debugged;
@@ -283,18 +269,14 @@ typedef struct _RPEB {
 } read_peb, * p_read_peb;
 static_assert(sizeof(read_peb) == 64, "read_peb size must be 64 bytes");
 
-//=============================================================================
-// Spoof debug flags (clear anti-debug indicators)
-//=============================================================================
+
 typedef struct _SDF {
     UINT32 pid;
-    UINT32 result_flags;    // output: bitmask of what was cleared
+    UINT32 result_flags;
 } spoof_debug, * p_spoof_debug;
 static_assert(sizeof(spoof_debug) == 8, "spoof_debug size must be 8 bytes");
 
-//=============================================================================
-// Module export resolution
-//=============================================================================
+
 typedef struct _MEX {
     UINT64 dtb;
     UINT64 module_base;
@@ -305,9 +287,7 @@ typedef struct _MEX {
 } module_export, * p_module_export;
 static_assert(sizeof(module_export) == 160, "module_export size must be 160 bytes");
 
-//=============================================================================
-// Virtual to physical address translation
-//=============================================================================
+
 typedef struct _V2P {
     UINT64 dtb;
     UINT64 virtual_address;
@@ -346,9 +326,9 @@ __forceinline BOOLEAN LookupDTBCache(UINT32 pid, PUINT64 out_dtb) {
     if (!out_dtb || pid == 0) {
         return FALSE;
     }
-    
+
     AcquireCacheLock();
-    
+
     for (int i = 0; i < DTB_CACHE_SIZE; i++) {
         if (g_dtb_cache[i].valid && g_dtb_cache[i].pid == pid) {
             *out_dtb = g_dtb_cache[i].dtb;
@@ -357,7 +337,7 @@ __forceinline BOOLEAN LookupDTBCache(UINT32 pid, PUINT64 out_dtb) {
             return TRUE;
         }
     }
-    
+
     ReleaseCacheLock();
     return FALSE;
 }
@@ -366,9 +346,9 @@ __forceinline void InsertDTBCache(UINT32 pid, UINT64 dtb) {
     if (pid == 0 || dtb == 0) {
         return;
     }
-    
+
     AcquireCacheLock();
-    
+
     for (int i = 0; i < DTB_CACHE_SIZE; i++) {
         if (g_dtb_cache[i].valid && g_dtb_cache[i].pid == pid) {
             g_dtb_cache[i].dtb = dtb;
@@ -377,10 +357,10 @@ __forceinline void InsertDTBCache(UINT32 pid, UINT64 dtb) {
             return;
         }
     }
-    
+
     int target_idx = 0;
     UINT64 oldest_time = ~0ULL;
-    
+
     for (int i = 0; i < DTB_CACHE_SIZE; i++) {
         if (!g_dtb_cache[i].valid) {
             target_idx = i;
@@ -391,25 +371,25 @@ __forceinline void InsertDTBCache(UINT32 pid, UINT64 dtb) {
             target_idx = i;
         }
     }
-    
+
     g_dtb_cache[target_idx].pid = pid;
     g_dtb_cache[target_idx].dtb = dtb;
     g_dtb_cache[target_idx].last_access = __rdtsc();
     KeMemoryBarrier();
     g_dtb_cache[target_idx].valid = TRUE;
-    
+
     ReleaseCacheLock();
 }
 
 __forceinline void InvalidateDTBCache(UINT32 pid) {
     AcquireCacheLock();
-    
+
     for (int i = 0; i < DTB_CACHE_SIZE; i++) {
         if (g_dtb_cache[i].pid == pid) {
             g_dtb_cache[i].valid = FALSE;
             KeMemoryBarrier();
         }
     }
-    
+
     ReleaseCacheLock();
 }

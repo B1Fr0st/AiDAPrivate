@@ -12,7 +12,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     if (!SetupFunctions()) {
         return STATUS_UNSUCCESSFUL;
     }
-    
+
     if (!device_names::initialize_names()) {
         return STATUS_UNSUCCESSFUL;
     }
@@ -23,15 +23,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     PDEVICE_OBJECT deviceObject = nullptr;
 
     NTSTATUS status = _IoCreateDevice(
-        DriverObject, 
-        0,                      
-        &deviceName, 
-        FILE_DEVICE_UNKNOWN,  
-        FILE_DEVICE_SECURE_OPEN, 
-        FALSE,    
+        DriverObject,
+        0,
+        &deviceName,
+        FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN,
+        FALSE,
         &deviceObject
     );
-    
+
     if (!NT_SUCCESS(status)) {
         return status;
     }
@@ -50,7 +50,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     DriverObject->MajorFunction[IRP_MJ_CREATE]         = dispatcher::Pilot;
     DriverObject->MajorFunction[IRP_MJ_CLOSE]          = dispatcher::Pilot;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = dispatcher::Controller;
-    
+
     DriverObject->DriverUnload = nullptr;
 
     ClearFlag(deviceObject->Flags, DO_DEVICE_INITIALIZING);

@@ -43,22 +43,22 @@ namespace syscall_indices {
     inline std::uint32_t NtDelayExecution_idx = 0;
     inline std::uint8_t* syscall_instruction_addr = nullptr;
     inline volatile bool indices_resolved = false;
-    
+
     __forceinline std::uint8_t* find_syscall_ret() {
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (!ntdll) return nullptr;
-        
+
         std::uint8_t* base = reinterpret_cast<std::uint8_t*>(ntdll);
         PIMAGE_DOS_HEADER dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
         if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
-        
+
         PIMAGE_NT_HEADERS nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
         if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
-        
+
         std::uint32_t text_size = nt->OptionalHeader.SizeOfCode;
         std::uint32_t text_rva = nt->OptionalHeader.BaseOfCode;
         std::uint8_t* text = base + text_rva;
-        
+
         for (std::uint32_t i = 0; i < text_size - 3; i++) {
             if (text[i] == 0x0F && text[i + 1] == 0x05 && text[i + 2] == 0xC3) {
                 return &text[i];
@@ -66,16 +66,16 @@ namespace syscall_indices {
         }
         return nullptr;
     }
-    
+
     __forceinline bool resolve_syscall_indices() {
         if (indices_resolved) return true;
-        
+
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (!ntdll) return false;
-        
+
         syscall_instruction_addr = find_syscall_ret();
         if (!syscall_instruction_addr) return false;
-        
+
         auto get_syscall_number = [&](const char* name) -> std::uint32_t {
             PVOID func = reinterpret_cast<PVOID>(GetProcAddress(ntdll, name));
             if (!func) return 0;
@@ -93,7 +93,7 @@ namespace syscall_indices {
             }
             return 0;
         };
-        
+
         NtOpenThread_idx = get_syscall_number("NtOpenThread");
         NtSuspendThread_idx = get_syscall_number("NtSuspendThread");
         NtResumeThread_idx = get_syscall_number("NtResumeThread");
@@ -101,7 +101,7 @@ namespace syscall_indices {
         NtSetContextThread_idx = get_syscall_number("NtSetContextThread");
         NtClose_idx = get_syscall_number("NtClose");
         NtDelayExecution_idx = get_syscall_number("NtDelayExecution");
-        
+
         indices_resolved = (NtOpenThread_idx && NtSuspendThread_idx && NtResumeThread_idx &&
                            NtGetContextThread_idx && NtSetContextThread_idx && NtClose_idx &&
                            syscall_instruction_addr);
@@ -120,7 +120,7 @@ namespace anti_debug {
         volatile std::uint64_t elapsed = __rdtsc() - start;
         return elapsed < 0x100000;
     }
-    
+
     __forceinline bool check_hardware_bp() {
         CONTEXT ctx{};
         ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -135,7 +135,7 @@ namespace anti_debug {
 
 bool voyager::device_t::connect() noexcept {
     SPOOF_FUNC;
-    
+
     if (is_connected()) {
         return true;
     }
@@ -171,17 +171,17 @@ bool voyager::device_t::connect() noexcept {
 
 void voyager::device_t::disconnect() noexcept {
     SPOOF_FUNC;
-    
+
     if (shellcode_address_ != 0 && process_id_ != 0) {
         free_memory(shellcode_address_);
         shellcode_address_ = 0;
     }
-    
+
     if (is_connected()) {
         CloseHandle(driver_handle_);
         driver_handle_ = INVALID_HANDLE_VALUE;
     }
-    
+
     process_id_ = 0;
     base_address_ = 0;
     dtb_ = 0;
@@ -193,7 +193,7 @@ void voyager::device_t::disconnect() noexcept {
 
 std::uint32_t voyager::device_t::find_process(const char* process_name) noexcept {
     SPOOF_FUNC;
-    
+
     if (!process_name || std::strlen(process_name) == 0 || std::strlen(process_name) >= MAX_PATH) {
         return 0;
     }
@@ -249,7 +249,7 @@ std::uint32_t voyager::device_t::find_process(const char* process_name) noexcept
 
 bool voyager::device_t::send_heartbeat() noexcept {
     SPOOF_FUNC;
-    
+
     if (!is_connected()) {
         return false;
     }
@@ -292,7 +292,7 @@ bool voyager::device_t::refresh_heartbeat() noexcept {
 
 void voyager::device_t::solve_dtb() noexcept {
     SPOOF_FUNC;
-    
+
     if (process_id_ == 0) {
         dtb_ = 0;
         return;
@@ -302,7 +302,7 @@ void voyager::device_t::solve_dtb() noexcept {
     req.pid = process_id_;
     req.padding = 0;
     req.dtb = 0;
-    
+
     if (send_request(ioctl_codes::DTB(), &req, sizeof(req)) && req.dtb != 0) {
         dtb_ = req.dtb;
     } else {
@@ -312,17 +312,17 @@ void voyager::device_t::solve_dtb() noexcept {
 
 void voyager::device_t::solve_kernel_dtb() noexcept {
     SPOOF_FUNC;
-    
-    // PID 4 = System process; its DTB maps all kernel virtual addresses
+
+
     detail::dtb_solve req{};
     req.pid = 4;
     req.padding = 0;
     req.dtb = 0;
-    
+
     if (send_request(ioctl_codes::DTB(), &req, sizeof(req)) && req.dtb != 0) {
         kernel_dtb_ = req.dtb;
     } else {
-        // Fallback: any process DTB can translate kernel addresses (shared page tables)
+
         if (dtb_ != 0) {
             kernel_dtb_ = dtb_;
         } else {
@@ -333,7 +333,7 @@ void voyager::device_t::solve_kernel_dtb() noexcept {
 
 std::size_t voyager::device_t::read_kernel_raw(std::uint64_t address, void* buffer, std::size_t size) const noexcept {
     SPOOF_FUNC;
-    
+
     if (!buffer || size == 0 || !is_connected()) {
         return 0;
     }
@@ -342,13 +342,13 @@ std::size_t voyager::device_t::read_kernel_raw(std::uint64_t address, void* buff
         return 0;
     }
 
-    // Determine which DTB to use: kernel_dtb_ preferred, fallback to process dtb_
+
     std::uint64_t use_dtb = kernel_dtb_;
     if (use_dtb == 0) use_dtb = dtb_;
     if (use_dtb == 0) return 0;
 
     detail::physical_request req{};
-    req.pid = 4; // System
+    req.pid = 4;
     req.dtb = use_dtb;
     req.address = reinterpret_cast<void*>(address);
     req.buffer = buffer;
@@ -360,13 +360,13 @@ std::size_t voyager::device_t::read_kernel_raw(std::uint64_t address, void* buff
     if (send_request(ioctl_codes::PHYS(), &req, sizeof(req))) {
         return req.ret_size;
     }
-    
+
     return 0;
 }
 
 std::size_t voyager::device_t::write_kernel_raw(std::uint64_t address, const void* buffer, std::size_t size) const noexcept {
     SPOOF_FUNC;
-    
+
     if (!buffer || size == 0 || !is_connected()) {
         return 0;
     }
@@ -397,7 +397,7 @@ std::size_t voyager::device_t::write_kernel_raw(std::uint64_t address, const voi
 
 std::uint64_t voyager::device_t::find_image() noexcept {
     SPOOF_FUNC;
-    
+
     std::uint64_t image_address = 0;
 
     detail::base_address_request req{};
@@ -414,7 +414,7 @@ std::uint64_t voyager::device_t::find_image() noexcept {
 
 std::size_t voyager::device_t::read_raw(std::uint64_t address, void* buffer, std::size_t size) const noexcept {
     SPOOF_FUNC;
-    
+
     if (!buffer || size == 0 || !is_connected() || dtb_ == 0) {
         return 0;
     }
@@ -436,13 +436,13 @@ std::size_t voyager::device_t::read_raw(std::uint64_t address, void* buffer, std
     if (send_request(ioctl_codes::PHYS(), &req, sizeof(req))) {
         return req.ret_size;
     }
-    
+
     return 0;
 }
 
 std::size_t voyager::device_t::write_raw(std::uint64_t address, const void* buffer, std::size_t size) const noexcept {
     SPOOF_FUNC;
-    
+
     if (!buffer || size == 0 || !is_connected() || dtb_ == 0) {
         return 0;
     }
@@ -469,7 +469,7 @@ std::size_t voyager::device_t::write_raw(std::uint64_t address, const void* buff
 
 void voyager::device_t::move_mouse(std::int32_t input_x, std::int32_t input_y, std::uint32_t mouse_flags) {
     SPOOF_FUNC;
-    
+
     if (!is_connected()) {
         return;
     }
@@ -484,7 +484,7 @@ void voyager::device_t::move_mouse(std::int32_t input_x, std::int32_t input_y, s
 
 void voyager::device_t::send_key(unsigned short button) {
     SPOOF_FUNC;
-    
+
     if (!is_connected()) {
         return;
     }
@@ -499,7 +499,7 @@ void voyager::device_t::send_key(unsigned short button) {
 
 std::uint64_t voyager::device_t::allocate_memory(std::size_t size) noexcept {
     SPOOF_FUNC;
-    
+
     if (!is_connected() || process_id_ == 0 || size == 0) {
         return 0;
     }
@@ -520,7 +520,7 @@ std::uint64_t voyager::device_t::allocate_memory(std::size_t size) noexcept {
 
 bool voyager::device_t::free_memory(std::uint64_t address) noexcept {
     SPOOF_FUNC;
-    
+
     if (!is_connected() || process_id_ == 0 || address == 0) {
         return false;
     }
@@ -535,7 +535,7 @@ bool voyager::device_t::free_memory(std::uint64_t address) noexcept {
 
 bool voyager::device_t::ensure_shellcode_allocated() noexcept {
     SPOOF_FUNC;
-    
+
     if (shellcode_address_ != 0) {
         return true;
     }
@@ -546,7 +546,7 @@ bool voyager::device_t::ensure_shellcode_allocated() noexcept {
 
 bool voyager::device_t::find_spoof_gadget() noexcept {
     SPOOF_FUNC;
-    
+
     if (spoof_gadget_ != 0) {
         return true;
     }
@@ -631,7 +631,7 @@ bool voyager::device_t::find_spoof_gadget() noexcept {
 
 std::uint64_t voyager::device_t::find_gadget(const char* pattern, std::size_t pattern_size) noexcept {
     SPOOF_FUNC;
-    
+
     if (!pattern || pattern_size == 0 || base_address_ == 0 || dtb_ == 0) {
         return 0;
     }
@@ -642,7 +642,7 @@ std::uint64_t voyager::device_t::find_gadget(const char* pattern, std::size_t pa
     }
 
     std::uint32_t e_lfanew = *reinterpret_cast<std::uint32_t*>(&dos_header[60]);
-    
+
     std::uint8_t nt_headers[264] = {};
     if (read_raw(base_address_ + e_lfanew, nt_headers, sizeof(nt_headers)) != sizeof(nt_headers)) {
         return 0;
@@ -693,7 +693,7 @@ namespace thread_hijack {
     typedef NTSTATUS(NTAPI* NtDelayExecution_t)(BOOLEAN, PLARGE_INTEGER);
     typedef NTSTATUS(NTAPI* NtYieldExecution_t)();
     typedef NTSTATUS(NTAPI* NtQuerySystemTime_t)(PLARGE_INTEGER);
-    
+
     inline NtSuspendThread_t pNtSuspendThread = nullptr;
     inline NtResumeThread_t pNtResumeThread = nullptr;
     inline NtGetContextThread_t pNtGetContextThread = nullptr;
@@ -705,9 +705,9 @@ namespace thread_hijack {
     inline NtQuerySystemTime_t pNtQuerySystemTime = nullptr;
     inline volatile bool g_initialized = false;
     inline volatile std::uint64_t g_entropy_pool = 0;
-    
+
     extern "C" NTSTATUS do_syscall_4(std::uint32_t syscall_idx, std::uint8_t* syscall_addr, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4);
-    
+
     __forceinline NTSTATUS syscall_NtOpenThread(PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PCLIENT_ID ClientId) {
         if (syscall_indices::syscall_instruction_addr && syscall_indices::NtOpenThread_idx) {
             return do_syscall_4(
@@ -721,7 +721,7 @@ namespace thread_hijack {
         }
         return pNtOpenThread(ThreadHandle, DesiredAccess, ObjectAttributes, ClientId);
     }
-    
+
     __forceinline NTSTATUS syscall_NtSuspendThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount) {
         if (syscall_indices::syscall_instruction_addr && syscall_indices::NtSuspendThread_idx) {
             return do_syscall_4(
@@ -734,7 +734,7 @@ namespace thread_hijack {
         }
         return pNtSuspendThread(ThreadHandle, PreviousSuspendCount);
     }
-    
+
     __forceinline NTSTATUS syscall_NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount) {
         if (syscall_indices::syscall_instruction_addr && syscall_indices::NtResumeThread_idx) {
             return do_syscall_4(
@@ -747,7 +747,7 @@ namespace thread_hijack {
         }
         return pNtResumeThread(ThreadHandle, PreviousSuspendCount);
     }
-    
+
     __forceinline NTSTATUS syscall_NtGetContextThread(HANDLE ThreadHandle, PCONTEXT ThreadContext) {
         if (syscall_indices::syscall_instruction_addr && syscall_indices::NtGetContextThread_idx) {
             return do_syscall_4(
@@ -760,7 +760,7 @@ namespace thread_hijack {
         }
         return pNtGetContextThread(ThreadHandle, ThreadContext);
     }
-    
+
     __forceinline NTSTATUS syscall_NtSetContextThread(HANDLE ThreadHandle, PCONTEXT ThreadContext) {
         if (syscall_indices::syscall_instruction_addr && syscall_indices::NtSetContextThread_idx) {
             return do_syscall_4(
@@ -773,7 +773,7 @@ namespace thread_hijack {
         }
         return pNtSetContextThread(ThreadHandle, ThreadContext);
     }
-    
+
     __forceinline NTSTATUS syscall_NtClose(HANDLE Handle) {
         if (syscall_indices::syscall_instruction_addr && syscall_indices::NtClose_idx) {
             return do_syscall_4(
@@ -785,34 +785,34 @@ namespace thread_hijack {
         }
         return pNtClose(Handle);
     }
-    
+
 #pragma warning(push)
 #pragma warning(disable: 4100)
     __forceinline NTSTATUS indirect_NtOpenThread(PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PCLIENT_ID ClientId) {
         return syscall_NtOpenThread(ThreadHandle, DesiredAccess, ObjectAttributes, ClientId);
     }
-    
+
     __forceinline NTSTATUS indirect_NtSuspendThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount) {
         return syscall_NtSuspendThread(ThreadHandle, PreviousSuspendCount);
     }
-    
+
     __forceinline NTSTATUS indirect_NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount) {
         return syscall_NtResumeThread(ThreadHandle, PreviousSuspendCount);
     }
-    
+
     __forceinline NTSTATUS indirect_NtGetContextThread(HANDLE ThreadHandle, PCONTEXT ThreadContext) {
         return syscall_NtGetContextThread(ThreadHandle, ThreadContext);
     }
-    
+
     __forceinline NTSTATUS indirect_NtSetContextThread(HANDLE ThreadHandle, PCONTEXT ThreadContext) {
         return syscall_NtSetContextThread(ThreadHandle, ThreadContext);
     }
-    
+
     __forceinline NTSTATUS indirect_NtClose(HANDLE Handle) {
         return syscall_NtClose(Handle);
     }
 #pragma warning(pop)
-    
+
     __forceinline void collect_entropy() {
         std::uint64_t tsc = __rdtsc();
         std::uint64_t mix = tsc ^ (tsc >> 17);
@@ -821,24 +821,24 @@ namespace thread_hijack {
         mix *= 0xc4ceb9fe1a85ec53ULL;
         g_entropy_pool ^= mix;
     }
-    
+
     __forceinline bool initialize() {
         if (g_initialized) return true;
-        
+
         collect_entropy();
-        
+
         if (!syscall_indices::resolve_syscall_indices()) {
             return false;
         }
-        
+
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (!ntdll) return false;
-        
+
         auto get_func = [&](const char* name) -> void* {
             void* addr = reinterpret_cast<void*>(GetProcAddress(ntdll, name));
             return addr;
         };
-        
+
         pNtSuspendThread = (NtSuspendThread_t)get_func("NtSuspendThread");
         pNtResumeThread = (NtResumeThread_t)get_func("NtResumeThread");
         pNtGetContextThread = (NtGetContextThread_t)get_func("NtGetContextThread");
@@ -848,14 +848,14 @@ namespace thread_hijack {
         pNtDelayExecution = (NtDelayExecution_t)get_func("NtDelayExecution");
         pNtYieldExecution = (NtYieldExecution_t)get_func("NtYieldExecution");
         pNtQuerySystemTime = (NtQuerySystemTime_t)get_func("NtQuerySystemTime");
-        
-        g_initialized = (pNtSuspendThread && pNtResumeThread && pNtGetContextThread && 
+
+        g_initialized = (pNtSuspendThread && pNtResumeThread && pNtGetContextThread &&
                         pNtSetContextThread && pNtOpenThread && pNtClose && pNtDelayExecution);
-        
+
         collect_entropy();
         return g_initialized;
     }
-    
+
     __forceinline void delay_random() {
         collect_entropy();
         if (pNtYieldExecution) {
@@ -865,7 +865,7 @@ namespace thread_hijack {
             }
         }
     }
-    
+
     __forceinline void delay_us(LONGLONG microseconds) {
         collect_entropy();
         LONGLONG jitter = static_cast<LONGLONG>((g_entropy_pool ^ __rdtsc()) & 0x3F);
@@ -875,7 +875,7 @@ namespace thread_hijack {
             pNtDelayExecution(FALSE, &interval);
         }
     }
-    
+
     __forceinline void scatter_timing() {
         collect_entropy();
         std::uint32_t pattern = static_cast<std::uint32_t>(g_entropy_pool & 0x7);
@@ -891,7 +891,7 @@ namespace thread_hijack {
 
 std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, std::uint64_t arg1, std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4) noexcept {
     SPOOF_FUNC;
-    
+
     if (!is_connected() || dtb_ == 0 || function_address == 0) {
         return 0;
     }
@@ -903,11 +903,11 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
     if (!find_spoof_gadget()) {
         return 0;
     }
-    
+
     if (!thread_hijack::initialize()) {
         return 0;
     }
-    
+
     thread_hijack::scatter_timing();
 
     std::uint64_t context_base = shellcode_address_;
@@ -931,9 +931,9 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
     if (!send_request(ioctl_codes::RC(), &req, sizeof(req))) {
         return 0;
     }
-    
+
     std::uint64_t code_entry = req.shellcode_address;
-    
+
     thread_hijack::scatter_timing();
 
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -943,20 +943,20 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
 
     THREADENTRY32 te{};
     te.dwSize = sizeof(THREADENTRY32);
-    
+
     DWORD target_tid = 0;
     HANDLE target_thread = nullptr;
-    
+
     DWORD current_tid = GetCurrentThreadId();
     DWORD current_pid = GetCurrentProcessId();
     std::uint32_t thread_scan_count = 0;
     constexpr std::uint32_t MAX_THREAD_SCANS = 128;
-    
+
     std::int32_t best_priority = -999;
     HANDLE best_thread = nullptr;
     DWORD best_tid = 0;
     CONTEXT best_ctx{};
-    
+
     DWORD main_tid = 0;
     THREADENTRY32 first_te{};
     first_te.dwSize = sizeof(THREADENTRY32);
@@ -974,17 +974,17 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
     if (Thread32First(snapshot, &te)) {
         do {
             if (thread_scan_count++ > MAX_THREAD_SCANS) break;
-            
+
             if (te.th32OwnerProcessID == process_id_ && te.th32ThreadID != current_tid && te.th32ThreadID != main_tid) {
                 thread_hijack::scatter_timing();
-                
+
                 OBJECT_ATTRIBUTES objAttr = {};
                 objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
-                
+
                 CLIENT_ID clientId = {};
                 clientId.UniqueProcess = nullptr;
                 clientId.UniqueThread = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(te.th32ThreadID));
-                
+
                 HANDLE th = nullptr;
                 NTSTATUS status = thread_hijack::indirect_NtOpenThread(
                     &th,
@@ -992,30 +992,30 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
                     &objAttr,
                     &clientId
                 );
-                
+
                 if (status >= 0 && th) {
                     thread_hijack::scatter_timing();
-                    
+
                     ULONG prev_count = 0;
                     status = thread_hijack::indirect_NtSuspendThread(th, &prev_count);
-                    
+
                     if (status >= 0) {
                         CONTEXT ctx{};
                         ctx.ContextFlags = CONTEXT_FULL;
-                        
+
                         thread_hijack::scatter_timing();
-                        
+
                         if (thread_hijack::indirect_NtGetContextThread(th, &ctx) >= 0) {
                             if (ctx.Rip > 0x10000 && ctx.Rip < 0x00007FFFFFFFFFFFULL &&
                                 ctx.Rsp > 0x10000 && ctx.Rsp < 0x00007FFFFFFFFFFFULL &&
                                 (ctx.Rsp & 0xF) == 0) {
                                 std::int32_t priority = static_cast<std::int32_t>(te.tpBasePri);
-                                
+
                                 bool is_waiting = (ctx.Rip >= 0x00007FF000000000ULL);
                                 if (is_waiting) {
                                     priority += 10;
                                 }
-                                
+
                                 if (priority > best_priority) {
                                     if (best_thread) {
                                         thread_hijack::indirect_NtResumeThread(best_thread, nullptr);
@@ -1034,22 +1034,22 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
                     thread_hijack::indirect_NtClose(th);
                 }
             }
-            
+
             if ((thread_scan_count & 0xF) == 0) {
                 thread_hijack::scatter_timing();
             }
         } while (Thread32Next(snapshot, &te));
     }
-    
+
     CloseHandle(snapshot);
-    
+
     if (!best_thread || best_tid == 0) {
         return 0;
     }
-    
+
     target_thread = best_thread;
     target_tid = best_tid;
-    
+
     thread_hijack::scatter_timing();
 
     CONTEXT original_ctx = best_ctx;
@@ -1058,12 +1058,12 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
 
     CONTEXT hijack_ctx = original_ctx;
     hijack_ctx.Rip = code_entry;
-    
+
     std::uint64_t aligned_rsp = (hijack_ctx.Rsp - 0x100) & ~0xFULL;
     hijack_ctx.Rsp = aligned_rsp;
-    
+
     thread_hijack::scatter_timing();
-    
+
     if (thread_hijack::indirect_NtSetContextThread(target_thread, &hijack_ctx) < 0) {
         thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
         thread_hijack::indirect_NtClose(target_thread);
@@ -1071,16 +1071,16 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
     }
 
     thread_hijack::collect_entropy();
-    
+
     thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
 
     constexpr int MAX_WAIT_ITERATIONS = 12000;
     constexpr int FAST_POLL_THRESHOLD = 500;
     constexpr int MEDIUM_POLL_THRESHOLD = 3000;
-    
+
     std::uint64_t result = 0;
     bool completed = false;
-    
+
     thread_hijack::collect_entropy();
 
     for (int i = 0; i < MAX_WAIT_ITERATIONS && !completed; ++i) {
@@ -1092,10 +1092,10 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
         } else {
             base_delay = 200;
         }
-        
+
         std::uint64_t jitter = static_cast<std::uint64_t>((thread_hijack::g_entropy_pool ^ __rdtsc()) & 0x7F);
         thread_hijack::delay_us(static_cast<LONGLONG>(base_delay + jitter));
-        
+
         detail::call_result_request result_req{};
         result_req.dtb = dtb_;
         result_req.result_address = context_base;
@@ -1112,18 +1112,18 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
             &bytes_ret,
             nullptr
         );
-        
+
         if (ioctl_result && bytes_ret >= sizeof(result_req)) {
             volatile std::uint64_t exec_done = 0;
             read_raw(context_base + detail::CTX_EXEC_DONE, const_cast<std::uint64_t*>(&exec_done), sizeof(exec_done));
-            
+
             if (exec_done != 0) {
                 read_raw(context_base + detail::CTX_RET_VALUE, &result, sizeof(result));
                 completed = true;
                 break;
             }
         }
-        
+
         if ((i & 0x3F) == 0) {
             thread_hijack::scatter_timing();
             thread_hijack::collect_entropy();
@@ -1132,16 +1132,16 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
     }
 
     thread_hijack::scatter_timing();
-    
+
     ULONG suspend_count = 0;
     thread_hijack::indirect_NtSuspendThread(target_thread, &suspend_count);
-    
+
     thread_hijack::scatter_timing();
-    
+
     if (!completed) {
         thread_hijack::indirect_NtSetContextThread(target_thread, &original_ctx);
     }
-    
+
     thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
     thread_hijack::indirect_NtClose(target_thread);
 
@@ -1182,7 +1182,7 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
 
     spoofer::scatter_execution();
     thread_hijack::collect_entropy();
-    
+
     volatile std::uint32_t pre_delay = static_cast<std::uint32_t>((__rdtsc() ^ thread_hijack::g_entropy_pool) & 0x7);
     while (pre_delay--) {
         _mm_pause();
@@ -1190,7 +1190,7 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
     }
 
     DWORD bytes_returned = 0;
-    
+
     BOOL result = DeviceIoControl(
         driver_handle_,
         control_code,
@@ -1208,9 +1208,6 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
     return result != FALSE;
 }
 
-//=============================================================================
-// Debugger Capability Methods
-//=============================================================================
 
 bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ctx) noexcept {
     if (!is_connected() || process_id_ == 0 || tid == 0) return false;
@@ -1424,11 +1421,11 @@ std::uint64_t voyager::device_t::virtual_to_physical(std::uint64_t virtual_addre
 bool voyager::device_t::set_hardware_breakpoint(std::uint32_t tid, int index, std::uint64_t address, int type, int size) noexcept {
     if (!is_connected() || process_id_ == 0 || tid == 0 || index < 0 || index > 3) return false;
 
-    // Get current thread context to read existing DR values
+
     thread_context ctx{};
     if (!get_thread_context(tid, ctx)) return false;
 
-    // Set the address in the appropriate DR register
+
     switch (index) {
         case 0: ctx.dr0 = address; break;
         case 1: ctx.dr1 = address; break;
@@ -1436,40 +1433,35 @@ bool voyager::device_t::set_hardware_breakpoint(std::uint32_t tid, int index, st
         case 3: ctx.dr3 = address; break;
     }
 
-    // Clear DR6 status bits
+
     ctx.dr6 = 0;
 
-    // Configure DR7:
-    // Bits 0,2,4,6: Local enable for DR0-DR3
-    // Bits 16-17: R/W for DR0 (00=exec, 01=write, 11=rw)
-    // Bits 18-19: LEN for DR0 (00=1, 01=2, 11=4)
-    // DR1 at 20-23, DR2 at 24-27, DR3 at 28-31
+
     std::uint64_t dr7 = ctx.dr7;
 
-    // Clear existing bits for this breakpoint
+
     int rw_shift = 16 + index * 4;
     int len_shift = 18 + index * 4;
-    dr7 &= ~(1ULL << (index * 2));     // clear local enable
-    dr7 &= ~(3ULL << rw_shift);         // clear R/W
-    dr7 &= ~(3ULL << len_shift);        // clear LEN
+    dr7 &= ~(1ULL << (index * 2));
+    dr7 &= ~(3ULL << rw_shift);
+    dr7 &= ~(3ULL << len_shift);
 
-    // Set local enable
+
     dr7 |= (1ULL << (index * 2));
 
-    // Set R/W: 0=exec, 1=write, 3=read/write
+
     std::uint64_t rw_val = static_cast<std::uint64_t>(type) & 3;
     dr7 |= (rw_val << rw_shift);
 
-    // Set LEN: 0=1byte, 1=2byte, 3=4byte, 2=8byte
+
     std::uint64_t len_val = static_cast<std::uint64_t>(size) & 3;
     dr7 |= (len_val << len_shift);
 
     ctx.dr7 = dr7;
 
-    // Build register mask for DR registers only
-    // Bits 18-23 = dr0-dr3, dr6, dr7
-    std::uint64_t mask = (1ULL << 22) | (1ULL << 23); // dr6 + dr7
-    mask |= (1ULL << (18 + index)); // The specific DR register we set
+
+    std::uint64_t mask = (1ULL << 22) | (1ULL << 23);
+    mask |= (1ULL << (18 + index));
 
     return set_thread_context(tid, ctx, mask);
 }
@@ -1480,7 +1472,7 @@ bool voyager::device_t::clear_hardware_breakpoint(std::uint32_t tid, int index) 
     thread_context ctx{};
     if (!get_thread_context(tid, ctx)) return false;
 
-    // Clear address register
+
     switch (index) {
         case 0: ctx.dr0 = 0; break;
         case 1: ctx.dr1 = 0; break;
@@ -1488,14 +1480,14 @@ bool voyager::device_t::clear_hardware_breakpoint(std::uint32_t tid, int index) 
         case 3: ctx.dr3 = 0; break;
     }
 
-    // Clear local enable and condition bits in DR7
+
     std::uint64_t dr7 = ctx.dr7;
-    dr7 &= ~(1ULL << (index * 2));         // clear local enable
-    dr7 &= ~(3ULL << (16 + index * 4));     // clear R/W
-    dr7 &= ~(3ULL << (18 + index * 4));     // clear LEN
+    dr7 &= ~(1ULL << (index * 2));
+    dr7 &= ~(3ULL << (16 + index * 4));
+    dr7 &= ~(3ULL << (18 + index * 4));
     ctx.dr7 = dr7;
 
-    std::uint64_t mask = (1ULL << (18 + index)) | (1ULL << 23); // DRx + DR7
+    std::uint64_t mask = (1ULL << (18 + index)) | (1ULL << 23);
 
     return set_thread_context(tid, ctx, mask);
 }

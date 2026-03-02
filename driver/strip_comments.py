@@ -6,43 +6,13 @@ Preserves string literals containing comment tokens.
 import re
 import os
 
-WORKSPACE = r"C:\Users\diskt\AiDA\src"
-
-CPP_FILES = [
-    "actions.cpp",
-    "actions.hpp",
-    "agentic.cpp",
-    "agentic.hpp",
-    "agent_tools.cpp",
-    "agent_tools.hpp",
-    "aida.cpp",
-    "aida.hpp",
-    "aida_pro.hpp",
-    "ai_client.cpp",
-    "ai_client.hpp",
-    "anti_re.hpp",
-    "chat_widget.cpp",
-    "chat_widget.hpp",
-    "chat_widget_ui.cpp",
-    "chat_widget_ui.hpp",
-    "ida_utils.cpp",
-    "ida_utils.hpp",
-    "license.cpp",
-    "license.hpp",
-    "mcp_server.cpp",
-    "mcp_server.hpp",
-    "obfuscation.hpp",
-    "prompts.hpp",
-    "settings.cpp",
-    "settings.hpp",
-    "ui.cpp",
-    "ui.hpp",
-    "vmp.hpp",
+WORKSPACES = [
+    r"C:\Users\diskt\AiDA\driver",
 ]
 
-CMAKE_FILES = [
-    "CMakeLists.txt",
-]
+CPP_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.inl'}
+ASM_EXTENSIONS = {'.asm'}
+SKIP_DIRS = {'build', '.vs', 'x64', 'Debug', 'Release'}
 
 
 def strip_cpp_comments(source: str) -> str:
@@ -171,35 +141,84 @@ def process_file(filepath: str, is_cmake: bool = False) -> bool:
     return False
 
 
+def strip_asm_comments(source: str) -> str:
+    result = []
+    i = 0
+    n = len(source)
+    while i < n:
+        if source[i] == '"':
+            j = i + 1
+            while j < n:
+                if source[j] == '\\': j += 2; continue
+                if source[j] == '"': j += 1; break
+                j += 1
+            result.append(source[i:j])
+            i = j
+        elif source[i] == ';':
+            j = i + 1
+            while j < n and source[j] != '\n':
+                j += 1
+            i = j
+        else:
+            result.append(source[i])
+            i += 1
+    return ''.join(result)
+
+
+def process_workspace(workspace: str, modified: list) -> int:
+    """Walk one workspace directory, strip comments, return number of files scanned."""
+    total = 0
+    script_abs = os.path.abspath(__file__)
+
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fname in files:
+            ext = os.path.splitext(fname)[1].lower()
+            filepath = os.path.join(root, fname)
+
+            # Never modify the script itself.
+            if os.path.abspath(filepath) == script_abs:
+                continue
+
+            relpath = os.path.relpath(filepath, workspace)
+            display = os.path.join(os.path.basename(workspace), relpath)
+
+            if ext in CPP_EXTENSIONS:
+                total += 1
+                if process_file(filepath, is_cmake=False):
+                    print(f"  MODIFIED: {display}")
+                    modified.append(display)
+                else:
+                    print(f"  unchanged: {display}")
+            elif ext in ASM_EXTENSIONS:
+                total += 1
+                with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                    original = f.read()
+                processed = strip_asm_comments(original)
+                processed = clean_blank_lines(processed)
+                if processed != original:
+                    with open(filepath, 'w', encoding='utf-8', newline='\n') as f:
+                        f.write(processed)
+                    print(f"  MODIFIED: {display}")
+                    modified.append(display)
+                else:
+                    print(f"  unchanged: {display}")
+
+    return total
+
+
 def main():
     modified = []
-    skipped = []
+    total = 0
 
-    for relpath in CPP_FILES:
-        filepath = os.path.join(WORKSPACE, relpath)
-        if not os.path.exists(filepath):
-            print(f"  SKIP (not found): {relpath}")
-            skipped.append(relpath)
+    for workspace in WORKSPACES:
+        if not os.path.isdir(workspace):
+            print(f"[SKIP] Directory not found: {workspace}")
             continue
-        if process_file(filepath, is_cmake=False):
-            print(f"  MODIFIED: {relpath}")
-            modified.append(relpath)
-        else:
-            print(f"  unchanged: {relpath}")
+        print(f"\n[Processing] {workspace}")
+        total += process_workspace(workspace, modified)
 
-    for relpath in CMAKE_FILES:
-        filepath = os.path.join(WORKSPACE, relpath)
-        if not os.path.exists(filepath):
-            print(f"  SKIP (not found): {relpath}")
-            skipped.append(relpath)
-            continue
-        if process_file(filepath, is_cmake=True):
-            print(f"  MODIFIED: {relpath}")
-            modified.append(relpath)
-        else:
-            print(f"  unchanged: {relpath}")
-
-    print(f"\n=== Done. Modified {len(modified)} file(s), skipped {len(skipped)} ===")
+    print(f"\n=== Done. Scanned {total} file(s), modified {len(modified)} ===")
     for f in modified:
         print(f"  - {f}")
 

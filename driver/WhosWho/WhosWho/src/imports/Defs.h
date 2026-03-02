@@ -53,14 +53,14 @@ namespace func_obfuscate {
         while (*t) { h = h * 31 + *t++; }
         return h ^ 0x5A5A5A5A5A5A5A5AULL;
     }
-    
+
     constexpr std::uintptr_t KEY = compute_key();
-    
+
     template<typename T>
     __forceinline T decode(T encoded) {
         return (T)((std::uintptr_t)encoded ^ KEY);
     }
-    
+
     template<typename T>
     __forceinline T encode(T raw) {
         return (T)((std::uintptr_t)raw ^ KEY);
@@ -102,57 +102,52 @@ inline PVOID GetProcAddress(PVOID ModBase, CHAR Name[]) {
     return nullptr;
 }
 
-// Safe implementation of get_nt_base using ZwQuerySystemInformation
-// This replaces the unsafe assembly version that caused PAGE_FAULT_IN_NONPAGED_AREA (0x50)
-// when memory pages become invalid due to driver loading order or memory pressure.
-//
-// The assembly version (ntoskernel_base.asm) performs raw memory reads without MmIsAddressValid
-// checks, causing crashes when another driver (like the spoofer) modifies kernel memory layout.
+
 inline std::uintptr_t get_nt_base() {
     ULONG requiredSize = 0;
-    
-    // First call to get required buffer size
+
+
     NTSTATUS status = ZwQuerySystemInformation(
         SystemModuleInformationInternal,
         nullptr,
         0,
         &requiredSize
     );
-    
+
     if (requiredSize == 0) {
         return 0;
     }
-    
-    // Add extra space for safety
+
+
     requiredSize += sizeof(RTL_PROCESS_MODULE_INFORMATION) * 4;
-    
+
     PRTL_PROCESS_MODULES moduleInfo = static_cast<PRTL_PROCESS_MODULES>(
         ExAllocatePool2(POOL_FLAG_NON_PAGED, requiredSize, 'tNgW')
     );
-    
+
     if (!moduleInfo) {
         return 0;
     }
-    
+
     status = ZwQuerySystemInformation(
         SystemModuleInformationInternal,
         moduleInfo,
         requiredSize,
         nullptr
     );
-    
+
     if (!NT_SUCCESS(status)) {
         ExFreePoolWithTag(moduleInfo, 'tNgW');
         return 0;
     }
-    
+
     std::uintptr_t kernelBase = 0;
-    
-    // ntoskrnl.exe is always the first module in the list
+
+
     if (moduleInfo->NumberOfModules > 0) {
         kernelBase = reinterpret_cast<std::uintptr_t>(moduleInfo->Modules[0].ImageBase);
     }
-    
+
     ExFreePoolWithTag(moduleInfo, 'tNgW');
     return kernelBase;
 }
@@ -195,7 +190,7 @@ inline NTSTATUS           (NTAPI* _ZwAllocateVirtualMemory)        (HANDLE, PVOI
 inline NTSTATUS           (NTAPI* _ZwFreeVirtualMemory)            (HANDLE, PVOID*, PSIZE_T, ULONG);
 inline VOID               (NTAPI* _IoDeleteDevice)                 (PDEVICE_OBJECT);
 
-// New APIs for debugger capabilities
+
 inline NTSTATUS           (NTAPI* _PsLookupThreadByThreadId)       (HANDLE, PETHREAD*);
 inline PETHREAD           (NTAPI* _PsGetNextProcessThread)         (PEPROCESS, PETHREAD);
 inline HANDLE             (NTAPI* _PsGetThreadId)                  (PETHREAD);
@@ -208,11 +203,11 @@ inline NTSTATUS           (NTAPI* _ZwQueryVirtualMemory)           (HANDLE, PVOI
 inline NTSTATUS           (NTAPI* _ZwProtectVirtualMemory)         (HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
 inline bool SetupFunctions() {
     PVOID kernelBase = (PVOID)get_nt_base();
-    
+
     if (!kernelBase) {
         return false;
     }
-    
+
     *(PVOID*)&_RtlInitUnicodeString = GetProcAddress(kernelBase, (PCHAR)skCrypt("RtlInitUnicodeString"));
     *(PVOID*)&_IoCreateDevice = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoCreateDevice"));
     *(PVOID*)&_IoCreateSymbolicLink = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoCreateSymbolicLink"));
@@ -232,7 +227,7 @@ inline bool SetupFunctions() {
     *(PVOID*)&_MmIsAddressValid = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmIsAddressValid"));
     *(PVOID*)&_ZwOpenProcess = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwOpenProcess"));
     *(PVOID*)&_ZwClose = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwClose"));
-    
+
     *(PVOID*)&_IoAllocateMdl = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoAllocateMdl"));
     *(PVOID*)&_IoFreeMdl = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoFreeMdl"));
     *(PVOID*)&_MmBuildMdlForNonPagedPool = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmBuildMdlForNonPagedPool"));
@@ -240,7 +235,7 @@ inline bool SetupFunctions() {
     *(PVOID*)&_MmUnmapLockedPages = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmUnmapLockedPages"));
     *(PVOID*)&_MmProbeAndLockPages = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmProbeAndLockPages"));
     *(PVOID*)&_MmUnlockPages = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmUnlockPages"));
-    
+
     *(PVOID*)&_PsCreateSystemThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsCreateSystemThread"));
     *(PVOID*)&_KeDelayExecutionThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeDelayExecutionThread"));
     *(PVOID*)&_PsTerminateSystemThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsTerminateSystemThread"));
@@ -251,7 +246,7 @@ inline bool SetupFunctions() {
     *(PVOID*)&_ZwFreeVirtualMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwFreeVirtualMemory"));
     *(PVOID*)&_IoDeleteDevice = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoDeleteDevice"));
 
-    // New API resolutions for debugger capabilities
+
     *(PVOID*)&_PsLookupThreadByThreadId = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsLookupThreadByThreadId"));
     *(PVOID*)&_PsGetNextProcessThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetNextProcessThread"));
     *(PVOID*)&_PsGetThreadId = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetThreadId"));
@@ -278,8 +273,7 @@ inline bool SetupFunctions() {
         !_IoDeleteDevice) {
         return false;
     }
-    // Debugger APIs are optional - not all are exported on every Windows build.
-    // Individual handlers null-check these pointers and return STATUS_PROCEDURE_NOT_FOUND.
+
 
     return true;
 }

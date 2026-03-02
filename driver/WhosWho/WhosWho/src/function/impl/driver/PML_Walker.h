@@ -37,13 +37,13 @@ namespace pml4
         if (_InterlockedCompareExchange(&g_pfndb_initialized, 1, 0) == 2) {
             return g_mmonp_MmPfnDatabase ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
         }
-        
+
         LONG prev = _InterlockedCompareExchange(&g_pfndb_initialized, 1, 0);
-        
+
         if (prev == 2) {
             return g_mmonp_MmPfnDatabase ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
         }
-        
+
         if (prev == 1) {
             while (_InterlockedCompareExchange(&g_pfndb_initialized, 2, 2) != 2) {
                 YieldProcessor();
@@ -87,7 +87,7 @@ namespace pml4
         }
 
         found += patterns.bytes_size;
-        
+
         void* pfn_db = nullptr;
         if (patterns.hard_coded) {
             pfn_db = *reinterpret_cast<void**>(found);
@@ -122,7 +122,7 @@ namespace pml4
             return 0;
         }
 
-        virt_addr_t virt_base{}; 
+        virt_addr_t virt_base{};
         virt_base.value = base;
 
         SIZE_T read_size = 0;
@@ -133,7 +133,7 @@ namespace pml4
         }
 
         uintptr_t result = 0;
-        
+
         const ULONGLONG MAX_TOTAL_PAGES = 0x100000;
         ULONGLONG total_pages_checked = 0;
 
@@ -147,15 +147,15 @@ namespace pml4
             ULONGLONG page_count = elem->NumberOfBytes.QuadPart / 0x1000;
 
             for (ULONGLONG j = 0; j < page_count; j++, current_phys_address += 0x1000) {
-                
+
                 if (++total_pages_checked > MAX_TOTAL_PAGES) {
                     goto cleanup;
                 }
-                
+
                 if ((total_pages_checked & 0xFFF) == 0) {
                     YieldProcessor();
                 }
-                
+
                 _MMPFN* pnfinfo = (_MMPFN*)((uintptr_t)g_mmonp_MmPfnDatabase + (current_phys_address >> 12) * sizeof(_MMPFN));
 
                 if (pnfinfo->u4.PteFrame != (current_phys_address >> 12)) {
@@ -199,7 +199,7 @@ namespace pml4
 
 cleanup:
         ExFreePool(ranges);
-        
+
         return result;
     }
 }

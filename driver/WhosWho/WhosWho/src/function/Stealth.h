@@ -16,16 +16,16 @@ namespace stealth {
     inline PVOID   (NTAPI* _ExAllocatePoolWithTag)(ULONG PoolType, SIZE_T NumberOfBytes, ULONG Tag) = nullptr;
     inline VOID    (NTAPI* _ExFreePoolWithTag)(PVOID P, ULONG Tag) = nullptr;
     inline PVOID   g_PsLoadedModuleResource = nullptr;
-    
+
     inline volatile ULONG g_NtBuildNumber = 0;
     inline volatile LONG g_VersionResolved = 0;
-    
+
     __forceinline ULONG GetNtBuildNumber() {
         LONG state = _InterlockedCompareExchange(&g_VersionResolved, 0, 0);
         if (state == 2) {
             return g_NtBuildNumber;
         }
-        
+
         LONG prev = _InterlockedCompareExchange(&g_VersionResolved, 1, 0);
         if (prev == 2) return g_NtBuildNumber;
         if (prev == 1) {
@@ -34,23 +34,23 @@ namespace stealth {
             }
             return g_NtBuildNumber;
         }
-        
+
         RTL_OSVERSIONINFOW version_info = { sizeof(RTL_OSVERSIONINFOW) };
         if (_RtlGetVersion && NT_SUCCESS(_RtlGetVersion(&version_info))) {
             g_NtBuildNumber = version_info.dwBuildNumber;
         } else {
             g_NtBuildNumber = 19045;
         }
-        
+
         KeMemoryBarrier();
         _InterlockedExchange(&g_VersionResolved, 2);
         return g_NtBuildNumber;
     }
-    
+
     __forceinline BOOLEAN IsWindows11() {
         return GetNtBuildNumber() >= 22000;
     }
-    
+
     __forceinline BOOLEAN IsWindows11_24H2OrNewer() {
         return GetNtBuildNumber() >= 26100;
     }
@@ -84,7 +84,7 @@ namespace stealth {
 
         g_PsLoadedModuleResource = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsLoadedModuleResource"));
 
-        return (_ExAcquireResourceExclusiveLite && _ExAcquireResourceSharedLite && 
+        return (_ExAcquireResourceExclusiveLite && _ExAcquireResourceSharedLite &&
                 _ExReleaseResourceLite && _KeEnterCriticalRegion && _KeLeaveCriticalRegion &&
                 _RtlLookupElementGenericTableAvl && _RtlDeleteElementGenericTableAvl);
     }
@@ -96,7 +96,7 @@ namespace stealth {
         NTSTATUS       LoadStatus;
         char           _pad0[16];
     } PIDDB_CACHE_ENTRY, * PPIDDB_CACHE_ENTRY;
-    
+
     typedef struct _PIDDB_CACHE_ENTRY_WIN11 {
         LIST_ENTRY     List;
         UNICODE_STRING DriverName;
@@ -113,9 +113,7 @@ namespace stealth {
         LARGE_INTEGER  UnloadTime;
     } MM_UNLOADED_DRIVER, * PMM_UNLOADED_DRIVER;
 
-    // Safe pattern scanning with page validation.
-    // Checks MmIsAddressValid before reading each page to prevent
-    // PAGE_FAULT_IN_NONPAGED_AREA (0x50) when pages become invalid.
+
     inline PVOID FindPattern(PVOID base, SIZE_T size, const UCHAR* pattern, const char* mask) {
         SIZE_T maskLen = 0;
         while (mask[maskLen]) maskLen++;
@@ -127,24 +125,24 @@ namespace stealth {
         constexpr SIZE_T pageSize = 0x1000;
 
         for (SIZE_T i = 0; i <= size - maskLen; ) {
-            // Check if current page is valid before accessing
+
             ULONG_PTR currentAddr = reinterpret_cast<ULONG_PTR>(data + i);
             ULONG_PTR currentPage = currentAddr & ~(pageSize - 1);
-            
+
             if (!_MmIsAddressValid(reinterpret_cast<PVOID>(currentPage))) {
-                // Skip to next page boundary
+
                 ULONG_PTR nextPage = currentPage + pageSize;
                 SIZE_T skip = nextPage - currentAddr;
                 i += skip;
                 continue;
             }
 
-            // Calculate how far we can safely scan within this page
+
             ULONG_PTR pageEnd = currentPage + pageSize;
             SIZE_T maxIndexThisPage = pageEnd - reinterpret_cast<ULONG_PTR>(data);
             if (maxIndexThisPage > size) maxIndexThisPage = size;
 
-            // Scan within the valid page
+
             for (; i <= maxIndexThisPage - maskLen && i <= size - maskLen; ++i) {
                 bool hit = true;
                 for (SIZE_T j = 0; j < maskLen; ++j) {
@@ -160,19 +158,18 @@ namespace stealth {
         return nullptr;
     }
 
-    // Safe relative address resolution with validation.
-    // Returns nullptr if the instruction address is not valid.
+
     __forceinline PVOID ResolveRelative(PVOID insn, ULONG dispOffset, ULONG insnSize) {
         if (!insn)
             return nullptr;
-        
+
         UCHAR* p = static_cast<UCHAR*>(insn);
-        
-        // Validate the address containing the displacement is readable
+
+
         PVOID dispAddr = p + dispOffset;
         if (!_MmIsAddressValid(dispAddr))
             return nullptr;
-        
+
         INT32 disp = *reinterpret_cast<INT32*>(dispAddr);
         return p + insnSize + disp;
     }
@@ -449,7 +446,7 @@ namespace stealth {
                 available_indices[available_count++] = i;
             }
         }
-        
+
         int chosen = -1;
         if (available_count > 0) {
             UINT64 entropy = __rdtsc();
@@ -640,12 +637,12 @@ namespace stealth {
         for (SIZE_T i = 0; i < tableSize; i++) {
             __try {
                 PPOOL_TRACKER_BIG_PAGES entry = &table[i];
-                
+
                 if (!_MmIsAddressValid(entry))
                     continue;
 
                 volatile ULONGLONG va = entry->Va;
-                
+
                 if (va >= driverStart && va < driverEnd) {
                     POOL_TRACKER_BIG_PAGES zeroEntry = {};
                     zeroEntry.Va = 1;
@@ -700,9 +697,7 @@ namespace stealth {
         return true;
     }
 
-    // Safe version of FindPatternFrom that validates page accessibility before reading.
-    // This prevents PAGE_FAULT_IN_NONPAGED_AREA (0x50) when kernel memory pages
-    // become invalid due to driver loading, memory pressure, or page table modifications.
+
     inline PVOID FindPatternFrom(PVOID base, SIZE_T size, SIZE_T startOffset, const UCHAR* pattern, const char* mask) {
         SIZE_T maskLen = 0;
         while (mask[maskLen]) maskLen++;
@@ -714,30 +709,30 @@ namespace stealth {
         constexpr SIZE_T pageSize = 0x1000;
 
         for (SIZE_T i = startOffset; i <= size - maskLen; ) {
-            // Check if current page is valid before accessing
+
             ULONG_PTR currentAddr = reinterpret_cast<ULONG_PTR>(data + i);
             ULONG_PTR currentPage = currentAddr & ~(pageSize - 1);
-            
+
             if (!_MmIsAddressValid(reinterpret_cast<PVOID>(currentPage))) {
-                // Skip to next page boundary
+
                 ULONG_PTR nextPage = currentPage + pageSize;
                 SIZE_T skip = nextPage - currentAddr;
                 i += skip;
                 continue;
             }
 
-            // Calculate how far we can safely scan within this page
+
             ULONG_PTR pageEnd = currentPage + pageSize;
             SIZE_T maxIndexThisPage = pageEnd - reinterpret_cast<ULONG_PTR>(data);
             if (maxIndexThisPage > size) maxIndexThisPage = size;
 
-            // Scan within the valid page
+
             for (; i <= maxIndexThisPage - maskLen && i <= size - maskLen; ++i) {
-                // Also verify the end of pattern doesn't cross into invalid page
+
                 ULONG_PTR patternEndAddr = reinterpret_cast<ULONG_PTR>(data + i + maskLen - 1);
                 ULONG_PTR patternEndPage = patternEndAddr & ~(pageSize - 1);
                 if (patternEndPage != currentPage && !_MmIsAddressValid(reinterpret_cast<PVOID>(patternEndPage))) {
-                    // Pattern would cross into invalid page, skip to that page
+
                     i = patternEndPage - reinterpret_cast<ULONG_PTR>(data);
                     break;
                 }
@@ -1240,43 +1235,43 @@ namespace stealth {
 
     inline VOID NTAPI DelayedHideThreadRoutine(PVOID StartContext) {
         UNREFERENCED_PARAMETER(StartContext);
-        
+
         UINT64 tsc = __rdtsc();
         ULONG delay_variation = (ULONG)((tsc >> 8) & 0x1F);
         LONG64 base_delay = -30000000LL;
         LONG64 extra_delay = -(LONG64)(delay_variation * 625000LL);
-        
+
         LARGE_INTEGER delay;
         delay.QuadPart = base_delay + extra_delay;
-        
+
         if (_KeDelayExecutionThread) {
             _KeDelayExecutionThread(KernelMode, FALSE, &delay);
         }
-        
+
         PDRIVER_OBJECT drvObj = g_DelayedHideContext.DriverObject;
-        
-        if (drvObj && _MmIsAddressValid(drvObj) && 
+
+        if (drvObj && _MmIsAddressValid(drvObj) &&
             drvObj->DriverSection && _MmIsAddressValid(drvObj->DriverSection)) {
             bool stealthReady = SetupStealthFunctions();
             PVOID ntBase = (PVOID)get_nt_base();
             auto ldrEntry = static_cast<PLDR_DATA_TABLE_ENTRY>(drvObj->DriverSection);
-            
+
             ULONG order = (ULONG)((__rdtsc() >> 4) % 6);
-            
+
             if (stealthReady && ntBase && ldrEntry && ldrEntry->DllBase) {
                 CleanPiDDBCacheTable(ntBase, ldrEntry);
             }
-            
+
             volatile ULONG spin = 8 + (order & 0x7);
             while (spin--) YieldProcessor();
-            
+
             if (ntBase && ldrEntry && ldrEntry->BaseDllName.Buffer) {
                 CleanKernelHashBucketList(ntBase, &ldrEntry->BaseDllName);
             }
-            
+
             spin = 4 + (order & 0x3);
             while (spin--) YieldProcessor();
-            
+
             if (ntBase) {
                 CleanMmUnloadedDrivers(ntBase);
             }
@@ -1291,22 +1286,22 @@ namespace stealth {
             if (ntBase) {
                 DisableEtwThreatIntel(ntBase);
             }
-            
+
             if (ldrEntry) {
                 ScrubPEMetadata(drvObj);
                 DisguiseModuleEntry(drvObj);
             }
         }
-        
+
         g_DelayedHideContext.DriverObject = nullptr;
         _InterlockedExchange(&g_DelayedHideContext.ReadyToHide, 0);
-        
+
         if (_KeDelayExecutionThread) {
             LARGE_INTEGER shortDelay;
             shortDelay.QuadPart = -100000LL;
             _KeDelayExecutionThread(KernelMode, FALSE, &shortDelay);
         }
-        
+
         if (_PsTerminateSystemThread) {
             _PsTerminateSystemThread(STATUS_SUCCESS);
         }
@@ -1315,15 +1310,15 @@ namespace stealth {
     inline bool ScheduleDelayedHide(PDRIVER_OBJECT DriverObject) {
         if (!DriverObject || !DriverObject->DriverSection)
             return false;
-        
+
         if (!_PsCreateSystemThread || !_ZwClose)
             return false;
-        
+
         if (_InterlockedCompareExchange(&g_DelayedHideContext.ReadyToHide, 1, 0) != 0)
             return false;
-        
+
         g_DelayedHideContext.DriverObject = DriverObject;
-        
+
         HANDLE threadHandle = nullptr;
         NTSTATUS status = _PsCreateSystemThread(
             &threadHandle,
@@ -1334,17 +1329,17 @@ namespace stealth {
             (PKSTART_ROUTINE)DelayedHideThreadRoutine,
             nullptr
         );
-        
+
         if (!NT_SUCCESS(status)) {
             g_DelayedHideContext.DriverObject = nullptr;
             _InterlockedExchange(&g_DelayedHideContext.ReadyToHide, 0);
             return false;
         }
-        
+
         if (threadHandle) {
             _ZwClose(threadHandle);
         }
-        
+
         return true;
     }
 }

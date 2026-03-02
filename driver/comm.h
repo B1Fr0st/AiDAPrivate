@@ -75,17 +75,17 @@ namespace ioctl_codes {
     __forceinline DWORD FM()   { return make(7); }
     __forceinline DWORD HB()   { return make(8); }
 
-    // Debugger capability IOCTL codes
-    __forceinline DWORD TCTX()  { return make(9); }   // Thread context get/set
-    __forceinline DWORD TENUM() { return make(10); }   // Thread enumerate
-    __forceinline DWORD TSR()   { return make(11); }   // Thread suspend/resume
-    __forceinline DWORD QM()    { return make(12); }   // Query memory
-    __forceinline DWORD PM()    { return make(13); }   // Protect memory
-    __forceinline DWORD ER()    { return make(14); }   // Enumerate regions
-    __forceinline DWORD RPEB()  { return make(15); }   // Read PEB
-    __forceinline DWORD SDF()   { return make(16); }   // Spoof debug flags
-    __forceinline DWORD MEX()   { return make(17); }   // Module export
-    __forceinline DWORD V2P()   { return make(18); }   // Virtual to physical
+
+    __forceinline DWORD TCTX()  { return make(9); }
+    __forceinline DWORD TENUM() { return make(10); }
+    __forceinline DWORD TSR()   { return make(11); }
+    __forceinline DWORD QM()    { return make(12); }
+    __forceinline DWORD PM()    { return make(13); }
+    __forceinline DWORD ER()    { return make(14); }
+    __forceinline DWORD RPEB()  { return make(15); }
+    __forceinline DWORD SDF()   { return make(16); }
+    __forceinline DWORD MEX()   { return make(17); }
+    __forceinline DWORD V2P()   { return make(18); }
 }
 
 namespace voyager {
@@ -110,17 +110,17 @@ namespace voyager {
             std::uint64_t dtb;
         };
         static_assert(sizeof(dtb_solve) == 16, "dtb_solve size mismatch with kernel driver");
-        
+
         struct physical_request {
             std::uint32_t pid;
             std::uint32_t padding_1;
-            std::uint64_t dtb;     
-            void* address;    
-            void* buffer;  
-            std::size_t size;   
+            std::uint64_t dtb;
+            void* address;
+            void* buffer;
+            std::size_t size;
             std::size_t ret_size;
-            std::uint8_t should_write; 
-            std::uint8_t padding_2[7]; 
+            std::uint8_t should_write;
+            std::uint8_t padding_2[7];
         };
         static_assert(sizeof(physical_request) == 56, "physical_request size mismatch with kernel driver");
 
@@ -181,7 +181,7 @@ namespace voyager {
         constexpr std::size_t CONTEXT_OFFSET = 0x0;
         constexpr std::size_t CODE_OFFSET = 0x200;
         constexpr std::size_t EPILOGUE_OFFSET = 0x600;
-        
+
         constexpr std::size_t CTX_TARGET_FUNC = 0x00;
         constexpr std::size_t CTX_SPOOF_GADGET = 0x08;
         constexpr std::size_t CTX_PARAM1 = 0x10;
@@ -195,7 +195,6 @@ namespace voyager {
         constexpr std::size_t CTX_EXEC_DONE = 0x50;
         constexpr std::size_t CTX_TRAMPOLINE = 0x58;
 
-        //=== Debugger capability request structures ===
 
         struct thread_ctx_request {
             std::uint32_t pid;
@@ -409,27 +408,27 @@ namespace voyager {
 
         std::uint64_t allocate_memory(std::size_t size) noexcept;
         bool free_memory(std::uint64_t address) noexcept;
-        
+
         std::uint64_t call_function(std::uint64_t function_address, std::uint64_t arg1 = 0, std::uint64_t arg2 = 0, std::uint64_t arg3 = 0, std::uint64_t arg4 = 0) noexcept;
-        
+
         template<typename RetType = std::uint64_t>
         RetType call(std::uint64_t function_address) noexcept {
             return static_cast<RetType>(call_function(function_address, 0, 0, 0, 0));
         }
-        
+
         template<typename RetType = std::uint64_t, typename A1>
         RetType call(std::uint64_t function_address, A1 a1) noexcept {
-            return static_cast<RetType>(call_function(function_address, 
+            return static_cast<RetType>(call_function(function_address,
                 static_cast<std::uint64_t>(a1), 0, 0, 0));
         }
-        
+
         template<typename RetType = std::uint64_t, typename A1, typename A2>
         RetType call(std::uint64_t function_address, A1 a1, A2 a2) noexcept {
             return static_cast<RetType>(call_function(function_address,
                 static_cast<std::uint64_t>(a1),
                 static_cast<std::uint64_t>(a2), 0, 0));
         }
-        
+
         template<typename RetType = std::uint64_t, typename A1, typename A2, typename A3>
         RetType call(std::uint64_t function_address, A1 a1, A2 a2, A3 a3) noexcept {
             return static_cast<RetType>(call_function(function_address,
@@ -437,7 +436,7 @@ namespace voyager {
                 static_cast<std::uint64_t>(a2),
                 static_cast<std::uint64_t>(a3), 0));
         }
-        
+
         template<typename RetType = std::uint64_t, typename A1, typename A2, typename A3, typename A4>
         RetType call(std::uint64_t function_address, A1 a1, A2 a2, A3 a3, A4 a4) noexcept {
             return static_cast<RetType>(call_function(function_address,
@@ -446,10 +445,10 @@ namespace voyager {
                 static_cast<std::uint64_t>(a3),
                 static_cast<std::uint64_t>(a4)));
         }
-        
+
         std::uint64_t find_gadget(const char* pattern, std::size_t pattern_size) noexcept;
 
-        // Debugger capability methods
+
         struct thread_context {
             std::uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp;
             std::uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
