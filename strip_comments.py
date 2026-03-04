@@ -7,7 +7,7 @@ import re
 import os
 
 WORKSPACES = [
-    r"C:\Users\diskt\AiDA\driver",
+    r"C:\Users\diskt\AiDA\src",
 ]
 
 CPP_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.inl'}

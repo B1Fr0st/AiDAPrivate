@@ -163,6 +163,15 @@ struct status_update_request_t : public exec_request_t
                         QString::fromStdString(status.message));
                     break;
                 }
+                case agentic::status_type_t::new_round:
+                {
+                    panel->resetStreamBuffer();
+                    panel->updateThinkingStatus(
+                        QString::fromStdString(status.message),
+                        QStringList(),
+                        QString());
+                    break;
+                }
                 default:
                     break;
             }
@@ -982,6 +991,7 @@ void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t ca
     }
 
     std::string agentic_prompt = agentic::build_agentic_prompt(question, ctx_ss.str());
+    std::string query_context_str = ctx_ss.str();
 
     std::lock_guard<std::mutex> lock(_worker_thread_mutex);
     if (_worker_thread.joinable())
@@ -996,14 +1006,15 @@ void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t ca
     qtimer_t timer = register_timer(1000, timer_cb, this);
     auto req = new ai_request_t(callback, timer, OBFSTR_C("agentic query"), _validity_token);
 
-    auto worker_func = [this, agentic_prompt, req, validity_token = this->_validity_token]() {
+    auto worker_func = [this, agentic_prompt, req, question, query_context_str, validity_token = this->_validity_token]() {
         std::string result;
         try
         {
             agentic::config_t config;
-            config.max_iterations = 15;
             config.temperature = _settings.temperature;
             config.verbose_logging = true;
+            config.user_message = question;
+            config.context_block = query_context_str;
             config.max_context_tokens = g_settings.get_active_context_window();
 
             auto on_status = [](const agentic::status_update_t& status) {
@@ -1018,8 +1029,8 @@ void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t ca
 
             auto agentic_result = agentic::run(
                 this, agentic_prompt, config, &_cancelled,
-                [](int iter, const std::string& status) {
-                    msg(OBFSTR_C("AiDA Agent: [%d] %s\n"), iter, status.c_str());
+                [](int round, const std::string& status) {
+                    msg(OBFSTR_C("AiDA Agent: [%d] %s\n"), round, status.c_str());
                 },
                 on_status,
                 on_stream);
@@ -1032,16 +1043,13 @@ void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t ca
             {
                 std::ostringstream response_ss;
 
-                if (!agentic_result.iterations.empty())
+                if (!agentic_result.tool_results.empty())
                 {
-                    response_ss << OBFSTR_C("**Agent Actions Taken (") << agentic_result.total_iterations << OBFSTR_C(" iteration(s)):**\n");
-                    for (const auto& iter : agentic_result.iterations)
+                    response_ss << OBFSTR_C("**Agent Actions:**\n");
+                    for (const auto& tr : agentic_result.tool_results)
                     {
-                        for (const auto& tr : iter.tool_results)
-                        {
-                            response_ss << "- `" << tr.tool_name << "`: "
-                                        << (tr.success ? "âœ“" : "âœ—") << " " << tr.message << "\n";
-                        }
+                        response_ss << "- `" << tr.tool_name << "`: "
+                                    << (tr.success ? "âœ“" : "âœ—") << " " << tr.message << "\n";
                     }
                     response_ss << "\n---\n\n";
                 }
@@ -1136,6 +1144,8 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
     }
 
     std::string agentic_prompt = agentic::build_agentic_prompt(message, ctx_ss.str(), history_str);
+    std::string chat_context_str = ctx_ss.str();
+    std::string chat_user_msg = message;
 
     std::lock_guard<std::mutex> lock(_worker_thread_mutex);
     if (_worker_thread.joinable())
@@ -1150,14 +1160,16 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
     qtimer_t timer = register_timer(1000, timer_cb, this);
     auto req = new ai_request_t(callback, timer, OBFSTR_C("agentic chat"), _validity_token);
 
-    auto worker_func = [this, agentic_prompt, req, validity_token = this->_validity_token]() {
+    auto worker_func = [this, agentic_prompt, req, chat_user_msg, chat_context_str, history_str, validity_token = this->_validity_token]() {
         std::string result;
         try
         {
             agentic::config_t config;
-            config.max_iterations = 15;
             config.temperature = _settings.temperature;
             config.verbose_logging = true;
+            config.user_message = chat_user_msg;
+            config.context_block = chat_context_str;
+            config.chat_history = history_str;
             config.max_context_tokens = g_settings.get_active_context_window();
 
             auto on_status = [](const agentic::status_update_t& status) {
@@ -1172,8 +1184,8 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
 
             auto agentic_result = agentic::run(
                 this, agentic_prompt, config, &_cancelled,
-                [](int iter, const std::string& status) {
-                    msg(OBFSTR_C("AiDA Agent: [%d] %s\n"), iter, status.c_str());
+                [](int round, const std::string& status) {
+                    msg(OBFSTR_C("AiDA Agent: [%d] %s\n"), round, status.c_str());
                 },
                 on_status,
                 on_stream);
@@ -1186,16 +1198,13 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
             {
                 std::ostringstream response_ss;
 
-                if (!agentic_result.iterations.empty())
+                if (!agentic_result.tool_results.empty())
                 {
-                    response_ss << OBFSTR_C("**Agent Actions (") << agentic_result.total_iterations << OBFSTR_C(" iteration(s)):**\n");
-                    for (const auto& iter : agentic_result.iterations)
+                    response_ss << OBFSTR_C("**Agent Actions:**\n");
+                    for (const auto& tr : agentic_result.tool_results)
                     {
-                        for (const auto& tr : iter.tool_results)
-                        {
-                            response_ss << "- `" << tr.tool_name << "`: "
-                                        << (tr.success ? "âœ“" : "âœ—") << " " << tr.message << "\n";
-                        }
+                        response_ss << "- `" << tr.tool_name << "`: "
+                                    << (tr.success ? "âœ“" : "âœ—") << " " << tr.message << "\n";
                     }
                     response_ss << "\n---\n\n";
                 }

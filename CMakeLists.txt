@@ -411,47 +411,4 @@ if(WIN32)
     endif()
 endif()
 
-# =============================================================================
-# EACLogger — Standalone EAC tracer .exe using the AiDA kernel driver
-# =============================================================================
-if(WIN32)
-    set(EACLOGGER_SOURCES
-        eac_logger/eac_logger.cpp
-        driver/comm.cpp
-    )
-    set(EACLOGGER_ASM driver/syscall.asm)
-    set_source_files_properties(${EACLOGGER_ASM} PROPERTIES LANGUAGE ASM_MASM)
 
-    add_executable(EACLogger ${EACLOGGER_SOURCES} ${EACLOGGER_ASM})
-
-    target_include_directories(EACLogger PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/driver"
-        "${CMAKE_CURRENT_SOURCE_DIR}/driver/encrypt"
-        "${CMAKE_CURRENT_SOURCE_DIR}/driver/spoofer"
-    )
-
-    target_compile_definitions(EACLogger PRIVATE
-        _CRT_SECURE_NO_WARNINGS
-        NOMINMAX
-        WIN32_LEAN_AND_MEAN
-    )
-
-    target_compile_options(EACLogger PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:/W3>
-        $<$<COMPILE_LANGUAGE:CXX>:/O2>
-        $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
-        $<$<COMPILE_LANGUAGE:CXX>:/MD>
-        $<$<COMPILE_LANGUAGE:CXX>:/GS->
-        $<$<COMPILE_LANGUAGE:CXX>:/GL>
-        $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
-        $<$<COMPILE_LANGUAGE:CXX>:/std:c++20>
-    )
-
-    target_link_options(EACLogger PRIVATE /LTCG /OPT:REF /OPT:ICF /SUBSYSTEM:CONSOLE)
-    target_link_libraries(EACLogger PRIVATE ntdll psapi shell32)
-
-    set_target_properties(EACLogger PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
-        OUTPUT_NAME "EACLogger"
-    )
-endif()

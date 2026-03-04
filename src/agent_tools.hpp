@@ -294,13 +294,10 @@ namespace driver_tools
     tool_result_t driver_read_string(const nlohmann::json& params);
     tool_result_t driver_read_pointer_chain(const nlohmann::json& params);
     tool_result_t driver_enumerate_modules(const nlohmann::json& params);
-    tool_result_t driver_dump_to_idb(const nlohmann::json& params);
-    tool_result_t driver_bypass_and_dump(const nlohmann::json& params);
     tool_result_t driver_enumerate_kernel_modules(const nlohmann::json& params);
     tool_result_t driver_dump_kernel_module(const nlohmann::json& params);
     tool_result_t driver_read_kernel_memory(const nlohmann::json& params);
     tool_result_t driver_write_kernel_memory(const nlohmann::json& params);
-    tool_result_t driver_kernel_dump_module(const nlohmann::json& params);
     tool_result_t driver_allocate_memory(const nlohmann::json& params);
     tool_result_t driver_free_memory(const nlohmann::json& params);
     tool_result_t driver_call_function(const nlohmann::json& params);
@@ -321,7 +318,86 @@ namespace driver_tools
     tool_result_t driver_resolve_export(const nlohmann::json& params);
     tool_result_t driver_virtual_to_physical(const nlohmann::json& params);
 
+    tool_result_t driver_defer_action(const nlohmann::json& params);
+    tool_result_t driver_list_deferred_actions(const nlohmann::json& params);
+    tool_result_t driver_cancel_deferred_action(const nlohmann::json& params);
+    tool_result_t driver_get_deferred_results(const nlohmann::json& params);
+
     void register_tools();
+
+
+    struct deferred_action_result_t
+    {
+        std::string action_type;
+        bool success = false;
+        std::string message;
+        nlohmann::json data;
+    };
+
+    enum class deferred_status
+    {
+        pending,
+        watching,
+        triggered,
+        completed,
+        failed,
+        cancelled,
+        timed_out
+    };
+
+    struct deferred_action_t
+    {
+        int id = 0;
+        std::string condition_type;
+        std::string target_name;
+
+        struct queued_tool_call_t
+        {
+            std::string tool_name;
+            nlohmann::json params;
+        };
+        std::vector<queued_tool_call_t> tool_calls;
+
+        int timeout_seconds = 300;
+        int poll_interval_ms = 50;
+
+        std::atomic<deferred_status> status{deferred_status::pending};
+        std::string trigger_info;
+        std::vector<deferred_action_result_t> results;
+        std::string error;
+        std::chrono::steady_clock::time_point created;
+        std::chrono::steady_clock::time_point triggered_at;
+    };
+
+    class DeferredActionManager
+    {
+    public:
+        static DeferredActionManager& instance();
+
+        int register_action(std::unique_ptr<deferred_action_t> action);
+        bool cancel_action(int id);
+        const deferred_action_t* get_action(int id) const;
+        std::vector<const deferred_action_t*> get_all_actions() const;
+        void shutdown();
+
+        bool poll_kernel_module_load(const std::string& target, std::uint64_t& out_base, std::uint32_t& out_size, std::string& out_name, std::string& out_path);
+        bool poll_process_start(const std::string& target, std::uint32_t& out_pid);
+
+    private:
+        DeferredActionManager() = default;
+        ~DeferredActionManager();
+
+        void watcher_thread_func(int action_id);
+        std::string resolve_template(const std::string& value, const nlohmann::json& context);
+        nlohmann::json resolve_params(const nlohmann::json& params, const nlohmann::json& context);
+        void execute_deferred_tools(deferred_action_t& action, const nlohmann::json& context);
+
+        mutable std::mutex _mutex;
+        std::map<int, std::unique_ptr<deferred_action_t>> _actions;
+        std::map<int, std::thread> _watchers;
+        int _next_id = 1;
+        std::atomic<bool> _shutdown{false};
+    };
 }
 
 namespace helpers

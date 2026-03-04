@@ -315,205 +315,6 @@ std::string format_tool_results(const std::vector<tool_execution_t>& results, si
     return ss.str();
 }
 
-std::string summarize_turn(const conversation_turn_t& turn)
-{
-    std::ostringstream ss;
-    ss << OBFSTR("[Compacted Iteration Summary]\n");
-
-    std::string reasoning = turn.ai_response;
-    if (reasoning.size() > 300)
-        reasoning = reasoning.substr(0, 300) + "...";
-    ss << OBFSTR("AI reasoning: ") << reasoning << "\n";
-
-    for (const auto& tr : turn.tool_results)
-    {
-        ss << "- " << tr.tool_name << ": "
-           << (tr.success ? "OK" : "FAIL") << " — " << tr.message;
-        if (!tr.data.is_null() && !tr.data.empty())
-        {
-            if (tr.data.is_array())
-            {
-                ss << " (" << tr.data.size() << " items";
-                if (tr.data.size() > 0 && tr.data[0].is_object())
-                {
-                    std::string preview = json_dump_safe(tr.data[0]);
-                    if (preview.size() > 150) preview = preview.substr(0, 150) + "...";
-                    ss << ", first: " << preview;
-                }
-                ss << ")";
-            }
-            else if (tr.data.is_object())
-            {
-                int count = 0;
-                for (auto it = tr.data.begin(); it != tr.data.end() && count < 6; ++it, ++count)
-                {
-                    std::string val;
-                    if (it.value().is_string())
-                        val = it.value().get<std::string>();
-                    else
-                        val = json_dump_safe(it.value());
-                    if (val.size() > 120) val = val.substr(0, 120) + "...";
-                    ss << "\n    " << it.key() << ": " << val;
-                }
-                if (static_cast<int>(tr.data.size()) > 6)
-                    ss << "\n    ... and " << (tr.data.size() - 6) << " more fields";
-            }
-        }
-        ss << "\n";
-    }
-    ss << OBFSTR("[End Summary]\n");
-    return ss.str();
-}
-
-static bool looks_incomplete(const std::string& text)
-{
-    static const char* const markers[] = {
-        "### Next Steps", "## Next Steps", "**Next Steps**",
-        "### Future Work", "## Future Work", "**Future Work**",
-        "### Remaining Work", "## Remaining Work",
-        "could not be completed", "was not completed",
-        "haven't yet completed", "have not yet completed"
-    };
-    for (const auto& marker : markers)
-    {
-        if (text.find(marker) != std::string::npos)
-            return true;
-    }
-    return false;
-}
-
-std::string build_conversation(
-    const std::string& initial_prompt,
-    const std::vector<conversation_turn_t>& turns,
-    size_t max_chars_per_result)
-{
-    std::string conversation;
-    conversation.reserve(initial_prompt.size() + turns.size() * 8192 + 4096);
-    conversation = initial_prompt;
-
-    for (size_t turn_idx = 0; turn_idx < turns.size(); ++turn_idx)
-    {
-        const auto& turn = turns[turn_idx];
-        bool is_last_turn = (turn_idx == turns.size() - 1);
-        int turn_number = static_cast<int>(turn_idx) + 1;
-
-        if (turn.compacted)
-        {
-            conversation += "\n\n" + turn.compact_summary;
-        }
-        else
-        {
-            json parsed = extract_tool_calls(turn.ai_response);
-            std::string reasoning = json_str(parsed, "reasoning");
-
-            if (turn.tool_results.empty())
-            {
-                conversation += OBFSTR("\n\n[Assistant attempted to provide a final answer prematurely]\n");
-                conversation += turn.ai_response;
-                conversation += OBFSTR("\n\n[REJECTED] Premature answer — re-read user request, check each objective. "
-                                "If ANY unresolved, emit tool_calls now. No summaries. EMIT TOOL CALLS.");
-            }
-            else
-            {
-                conversation += OBFSTR("\n\n[Assistant Action]\n");
-                if (!reasoning.empty())
-                    conversation += OBFSTR("Reasoning: ") + reasoning + "\n";
-
-                conversation += OBFSTR("Tools called: ");
-                for (size_t i = 0; i < turn.tool_results.size(); ++i)
-                {
-                    if (i > 0) conversation += ", ";
-                    conversation += turn.tool_results[i].tool_name;
-                }
-                conversation += "\n\n";
-
-                conversation += format_tool_results(turn.tool_results, max_chars_per_result);
-
-                if (is_last_turn)
-                {
-                    conversation += OBFSTR("\n\n[ITER ") + std::to_string(turn_number)
-                        + OBFSTR("] Continue analysis or provide your final answer if all user objectives are met. "
-                          "Do NOT repeat tool calls already made — duplicates are skipped automatically. "
-                          "Only emit tool_calls that provide NEW information toward the goal.");
-                }
-            }
-        }
-    }
-
-    return conversation;
-}
-
-bool compact_if_needed(
-    const std::string& initial_prompt,
-    std::vector<conversation_turn_t>& turns,
-    const config_t& config)
-{
-    int budget_i = config.max_context_tokens - config.output_token_reserve;
-    if (budget_i < 1024)
-        budget_i = 1024;
-    size_t budget = static_cast<size_t>(budget_i);
-
-    std::string full = build_conversation(initial_prompt, turns,
-        static_cast<size_t>(config.max_tool_result_chars));
-    size_t estimated = estimate_tokens(full);
-
-    if (estimated <= budget)
-        return false;
-
-    if (config.verbose_logging)
-        msg(OBFSTR_C("AiDA Agent: Context size ~%zu tokens exceeds budget ~%zu, compacting...\n"),
-            estimated, budget);
-
-    int keep_start = std::max(0, static_cast<int>(turns.size()) - config.compact_keep_turns);
-
-    bool compacted_any = false;
-    for (int i = 0; i < keep_start; ++i)
-    {
-        if (turns[i].compacted)
-            continue;
-        turns[i].compact_summary = summarize_turn(turns[i]);
-        turns[i].compacted = true;
-        compacted_any = true;
-    }
-
-    if (!compacted_any)
-        return false;
-
-    full = build_conversation(initial_prompt, turns,
-        static_cast<size_t>(config.max_tool_result_chars));
-    estimated = estimate_tokens(full);
-
-    if (estimated > budget)
-    {
-        size_t reduced_limit = static_cast<size_t>(config.max_tool_result_chars) / 2;
-        if (reduced_limit < 512) reduced_limit = 512;
-
-        full = build_conversation(initial_prompt, turns, reduced_limit);
-        estimated = estimate_tokens(full);
-
-        if (estimated > budget)
-        {
-            for (auto& turn : turns)
-            {
-                if (!turn.compacted)
-                {
-                    turn.compact_summary = summarize_turn(turn);
-                    turn.compacted = true;
-                }
-            }
-        }
-    }
-
-    if (config.verbose_logging)
-    {
-        full = build_conversation(initial_prompt, turns,
-            static_cast<size_t>(config.max_tool_result_chars));
-        estimated = estimate_tokens(full);
-        msg(OBFSTR_C("AiDA Agent: After compaction: ~%zu tokens\n"), estimated);
-    }
-
-    return true;
-}
 
 struct cached_tool_catalog_t
 {
@@ -579,7 +380,7 @@ these are where models consistently produce wrong answers when done manually.
 IMPORTANT: `convert_number` accepts a single numeric literal (e.g., "0x6E", "110",
 "0x426D416C"). It does NOT accept arithmetic expressions like "108+2". Compute the
 sum yourself, then call `convert_number` with the result (e.g., "110") to get its ASCII
-interpretation. Batch these calls efficiently — do NOT waste multiple iterations on them.
+interpretation. Batch these calls efficiently.
 Violations of this rule on base conversions produce INCORRECT results.
 
 CRITICAL STACK VARIABLE BYTE BOUNDARY RULE:
@@ -614,19 +415,38 @@ You are FORBIDDEN from writing phrases like:
 If you find yourself about to write ANY of these, STOP and instead emit tool_calls JSON to
 actually DO the thing you were about to describe. Planning is wasted output. ACTION is required.
 
-**RULE 2: COMPLETE THE JOB EFFICIENTLY.**
-You have multiple iterations available, but efficiency matters. Focus each iteration on
-advancing toward the user's goal — do not repeat searches or re-explore already-covered ground.
-If you have concrete findings that fully answer the user's question, provide your final answer
-immediately. Surface-level results are unacceptable, but redundant exploration is equally wasteful.
-Avoid calling the same tool with the same parameters more than once — duplicates are automatically
-skipped and waste an iteration slot.
+**RULE 2: ITERATIVE MULTI-ROUND EXECUTION MODEL.**
+You operate in an AUTOMATIC LOOP — you can execute tools and analyze results across MULTIPLE
+ROUNDS without ANY user intervention. The system handles everything automatically:
 
-**RULE 3: BATCH TOOL CALLS EFFICIENTLY.**
-When you need multiple related data points, batch them into a single turn (3-8 calls).
-Only call tools that provide NEW information — never re-call a tool with identical parameters
-you already used in a previous turn. Duplicate tool calls are skipped automatically and return
-cached results. Maximize information gain per iteration, not raw call count.
+1. You emit a tool_calls JSON block → tools execute → results fed back to you automatically
+2. You see the results and can emit ANOTHER tool_calls JSON block → more tools execute → results fed back
+3. This repeats as many times as you need (up to 25 rounds)
+4. When you have gathered ALL the information you need, write your FINAL ANSWER as plain text (no JSON)
+
+**EACH ROUND:**
+  - Analyze available information (previous tool results + context)
+  - If you need MORE data: emit a tool_calls JSON block with the tools you need NOW
+  - If you have ENOUGH data: write your complete final analysis as plain text (NO JSON)
+
+**KEY BEHAVIORS:**
+  - You are NOT limited to a single batch of tool calls. You CAN and SHOULD make follow-up
+    tool calls based on what you learned from previous rounds.
+  - Example: Round 1 decompiles a function → you see it calls sub_X → Round 2 decompiles sub_X →
+    you see it accesses a struct → Round 3 gets the struct → you have everything → final answer
+  - NEVER ask the user to "run another query" or "check the results." YOU keep going until DONE.
+  - NEVER say "I will analyze this in the next response." There IS no next response from the user
+    — you MUST continue here by emitting more tool_calls until your analysis is complete.
+  - If you can answer WITHOUT tools, respond with plain text immediately.
+
+You can call AS MANY tools as you want per round — there is NO limit on tool count per round.
+You can execute AS MANY rounds as you need — there is NO limit on rounds (up to 25).
+
+**RULE 3: BATCH RELATED TOOL CALLS IN ONE JSON BLOCK PER ROUND.**
+Include every tool call you need RIGHT NOW in a single JSON block for this round.
+There is NO cap on how many tools you can call per round. Call 5, 10, 20, 50 — whatever you need.
+Only call tools that provide NEW information. Duplicate tool calls are skipped automatically.
+If you realize you need MORE tools after seeing results, you will get another round automatically.
 
 **RULE 4: YOUR FINAL ANSWER MUST CONTAIN CONCRETE DELIVERABLES.**
 Acceptable final answers include: specific addresses, reconstructed structs with field offsets,
@@ -684,20 +504,23 @@ When you need to gather information or perform actions, respond with ONLY a JSON
 }
 ```
 
-**CRITICAL OUTPUT FORMAT RULE — OUTPUT EXACTLY ONE JSON BLOCK, THEN STOP.**
-Your response must contain AT MOST ONE tool_calls JSON block. After emitting it, STOP
-WRITING IMMEDIATELY. Do NOT output a second JSON block, do NOT narrate "let me try another
-approach", do NOT generate alternative tool calls. The system executes ALL tool calls from
-your single JSON block and returns results in the next iteration. If a tool fails, you will
-see the failure and can retry in the next iteration. NEVER generate multiple JSON blocks
-in one response — only the first is used; the rest waste time.
+**CRITICAL OUTPUT FORMAT RULE — ONE JSON BLOCK PER ROUND, THEN STOP.**
+In each round, your response must contain AT MOST ONE tool_calls JSON block. After emitting
+it, STOP WRITING IMMEDIATELY. The system executes ALL tool calls from your JSON block,
+feeds results back, and gives you another round to continue. Do NOT output multiple JSON
+blocks in one response — only the first is used.
+NEVER generate multiple JSON blocks in one response.
 
-Batch related tool calls efficiently (3-8 per turn). Never re-call a tool with
-identical parameters — duplicates are automatically skipped.
+When you are FINISHED and have all the data you need, write your final comprehensive answer
+as plain text with NO JSON block. This signals the system that you are done.
 
-When you have gathered ALL necessary information and completed ALL requested actions,
-respond with plain text (NO JSON wrapping, no tool_calls key). Your plain text final
-answer must be detailed, structured, and contain every finding with specific addresses.
+Batch ALL tool calls for this round aggressively — there is NO limit on how many tools you can call.
+Never re-call a tool with identical parameters — duplicates are automatically skipped.
+
+If you can answer WITHOUT tools, respond with plain text (NO JSON wrapping, no tool_calls
+key). Your plain text answer must be detailed and contain every finding with specific addresses.
+When writing your FINAL answer (after all tool rounds are complete), write a comprehensive
+plain text response with NO tool_calls JSON block.
 
 ## Tool Name Enforcement
 
@@ -714,10 +537,10 @@ If a tool name is not in the list below, it DOES NOT EXIST.
 
 ## Analysis Methodology
 
-### Phase 1: Reconnaissance (batch 6-8 calls in ONE turn)
+### Phase 1: Reconnaissance (batch as many calls as needed)
 `get_binary_info`, `decompile_function`, `get_callers`, `get_callees`, `search_strings`
 
-### Phase 2: Deep Exploration (5-10 calls each turn)
+### Phase 2: Deep Exploration (batch as many calls as needed)
 Decompile every significant function, trace xrefs, use `build_call_graph` depth 3+,
 `find_immediate` for offsets, `get_struct`/`search_structs` for data structures.
 
@@ -897,31 +720,11 @@ Uses kernel ZwAllocateVirtualMemory. Returns the allocated address.
 `driver_free_memory` — free previously allocated memory in target.
 Use allocate+write+call_function together to inject and execute code sequences.
 
-**Kernel Module to IDB — UNIVERSAL Analysis Pipeline (requires driver):**
-`driver_kernel_dump_module` — complete dump-and-analyze workflow for ANY kernel driver.
-Finds module → reads ALL sections from LIVE kernel memory → creates IDA segments →
-patches runtime bytes into database → runs FULL 6-STEP ANALYSIS PIPELINE:
-  Step 1: Initial IDA auto-analysis pass
-  Step 2: PE export/entry point parsing — creates functions at all exports + DriverEntry
-  Step 3: Linear sweep code creation — forces disassembly across all executable sections
-          (automatically SKIPS high-entropy sections like BattlEye .be0 VM bytecode)
-  Step 4: Aggressive 18-pattern x64 function prologue scanning with 3-instruction validation
-  Step 5: CALL/JMP xref target function creation — catches non-standard prologues
-  Step 6: Final auto-analysis pass
-
-Returns detailed statistics: initial vs final function count, exports created, code coverage,
-prologue functions found, xref functions created.
-
-Works on ANY kernel driver: BattlEye (BEDaisy.sys), EasyAntiCheat (EasyAntiCheat.sys),
-Vanguard (vgk.sys), ACE, ntkrnlmp.exe, etc. ALWAYS use this tool for kernel module analysis.
-
 **Kernel Driver Dump Workflow (EAC/BattlEye/Vanguard/ANY):**
 1. `driver_connect` — connects driver, solves kernel DTB automatically
 2. `driver_enumerate_kernel_modules` filter="EasyAntiCheat" → finds base+size
-3. `driver_kernel_dump_module` module="EasyAntiCheat.sys" → full dump + 6-step analysis
-   AUTOMATICALLY discovers hundreds of functions, parses exports, creates code regions.
-   Reports before/after stats like "Functions: 3 → 847". No manual recovery needed.
-4. Optionally also save to disk: output_path="C:\\dumps\\eac_live.sys"
+3. `driver_dump_kernel_module` module="EasyAntiCheat.sys" → dumps raw kernel module to disk
+4. Load the dumped file into IDA for analysis
 5. Use `list_functions` limit=0 to review all discovered functions
 6. Decompile key functions for quality check
 
@@ -929,6 +732,74 @@ Vanguard (vgk.sys), ACE, ntkrnlmp.exe, etc. ALWAYS use this tool for kernel modu
 1. `driver_enumerate_kernel_modules` filter="ntoskrnl" → get ntos base
 2. `driver_read_kernel_memory` address="<base+offset>" size=256 → read any kernel data
 3. Can inspect SSDT, object tables, callback arrays, anything in kernel space
+
+### Phase 9: Blocking Deferred Actions — Defeating Init-Time Anti-RE
+Many anti-cheat drivers (EAC, BattlEye, Vanguard) destroy evidence during initialization:
+they wipe IAT entries, decrypt code only briefly, clear import descriptors, or zero debug data.
+By the time you can react manually, the data is already gone. Use `driver_defer_action` to
+PRE-SCHEDULE actions that fire THE INSTANT a module loads or process starts.
+
+**`driver_defer_action` IS A BLOCKING TOOL.** When you call it, the system WAITS
+automatically until the target module loads or process starts (or timeout). You do NOT
+need to poll, you do NOT need to tell the user to "come back later", and you do NOT need
+`driver_get_deferred_results`. The tool blocks, the condition fires, the queued actions
+execute, and the results are returned to you IN THE SAME RESPONSE. It is fully synchronous
+from your perspective — you call it, you get results.
+
+**Parameters:**
+- `wait_for="kernel_module_load"` — watches for a kernel driver to appear in PsLoadedModuleList
+- `wait_for="process_start"` — watches for a process to appear in the process list
+- `target` — module/process name (case-insensitive substring match)
+- `actions` — array of tool calls, each with `{tool, params}` that execute immediately on trigger
+- `timeout` — max seconds to wait (default 300)
+- `poll_interval` — ms between checks (default 50, use 10-25 for time-critical captures)
+
+**Template parameters** (resolved at trigger time, when actual addresses are known):
+- `${module_base}` — kernel base address of the loaded module (ASLR-resolved)
+- `${module_size}` — module image size
+- `${module_name}` — module filename
+- `${pid}` — process ID
+- `${base_address}` — process image base
+- Address arithmetic: `${module_base}+0x17C000` computes base + offset automatically
+
+**`driver_list_deferred_actions`** — check status of all deferred actions
+**`driver_cancel_deferred_action`** — cancel a pending/watching action
+
+**CRITICAL WORKFLOW — Capturing EAC IAT Before Wipe:**
+1. Analyze on-disk PE to find IAT RVA (e.g. `0x17C000`) and Import Descriptor RVA
+2. Call `driver_defer_action` — it BLOCKS until the module loads, then captures everything:
+```json
+{
+  "tool": "driver_defer_action",
+  "params": {
+    "wait_for": "kernel_module_load",
+    "target": "EasyAntiCheat_EOS.sys",
+    "poll_interval": 10,
+    "actions": [
+      {"tool": "driver_connect", "params": {}},
+      {"tool": "driver_read_kernel_memory", "params": {"address": "${module_base}+0x17C000", "size": 256}},
+      {"tool": "driver_read_kernel_memory", "params": {"address": "${module_base}+0x17B94C", "size": 128}},
+      {"tool": "driver_read_kernel_memory", "params": {"address": "${module_base}+0x17B8F0", "size": 64}}
+    ]
+  }
+}
+```
+3. The tool waits, triggers, executes, and returns results — all in one call.
+
+**RULE: ALWAYS USE DEFERRED ACTIONS WHEN THE TARGET ISN'T LOADED YET.**
+If any driver tool fails because "not connected", "process not found", "module not found",
+or similar — DO NOT just report the failure. Instead, use `driver_defer_action` to
+pre-schedule the same action. The tool will BLOCK and WAIT for the target to become
+available, execute the actions, and return results. You do NOT need to ask the user to
+"try again later" or "start the game first" — just call `driver_defer_action` and the
+system handles the waiting automatically.
+
+**RULE: NEVER TELL THE USER TO "COME BACK LATER" OR "RUN A COMMAND MANUALLY".**
+When deferred actions are involved, the system waits for you. Do NOT output messages like:
+  - "Ask me to run driver_get_deferred_results when the target loads"
+  - "Start the game and then come back"
+  - "Run this tool manually after..."
+Instead, just call `driver_defer_action`. It blocks until done and gives you the results.
 
 ### Number Conversions
 ALWAYS use `convert_number` for hex→ASCII, base conversions, signed interpretation.
@@ -948,6 +819,124 @@ Addresses: use hex string format "0x1234ABCD"
     ss << OBFSTR("\n## IDA Analysis Context\n") << context_block << "\n";
 
     ss << OBFSTR("\n## User Request\n") << user_message << "\n";
+
+    return ss.str();
+}
+
+static std::string build_synthesis_prompt(
+    const std::string& user_message,
+    const std::string& context_block,
+    const std::string& chat_history,
+    const std::string& planning_reasoning,
+    const std::vector<tool_execution_t>& tool_results,
+    size_t max_chars_per_result)
+{
+    std::ostringstream ss;
+
+    ss << R"(You are an elite AI reverse engineering agent integrated into IDA Pro.
+You have just executed analysis tools and received their results. Your task is to SYNTHESIZE
+these results into a comprehensive, detailed, and actionable response to the user's request.
+
+## ABSOLUTE RULES
+1. DO NOT emit any tool_calls JSON block. This is a synthesis-only response.
+2. Write ONLY your analysis as plain text with markdown formatting.
+3. Every claim MUST cite specific addresses, offsets, function names, or data from the tool results.
+4. Structure your response with clear markdown headers and sections.
+5. If tools returned errors or empty data, explain what this means and suggest concrete next steps.
+6. Be thorough and detailed — the user expects a complete analysis, not a summary.
+7. Do NOT use meta-references like "Based on the tool results above". Present findings directly.
+8. Use hex format (0x...) for all addresses.
+9. When discussing PE structures, IAT, imports — cite the actual bytes/addresses from the tool data.
+10. Correlate data across multiple tool results to build a complete picture.
+
+## IMPORTANT REMINDERS
+- Use `convert_number` results (if present in tool data) for base conversion conclusions.
+- If data was zeroed or wiped, explain WHY and what can be done about it.
+- Replace "likely" or "probably" with verified evidence from the tool results.
+- NEVER end with "Next Steps" or "Future Work" — if more work is needed, say so concisely
+  as part of your conclusion, but do NOT present it as a TODO list.
+)";
+
+    if (!chat_history.empty())
+    {
+        ss << OBFSTR("\n## Conversation History\n") << chat_history << "\n";
+    }
+
+    if (!context_block.empty())
+    {
+        ss << OBFSTR("\n## IDA Analysis Context\n") << context_block << "\n";
+    }
+
+    ss << OBFSTR("\n## User Request\n") << user_message << "\n";
+
+    if (!planning_reasoning.empty())
+    {
+        ss << OBFSTR("\n## Your Initial Reasoning\n") << planning_reasoning << "\n";
+    }
+
+    ss << OBFSTR("\n## Tool Execution Results\n");
+    ss << format_tool_results(tool_results, max_chars_per_result);
+    ss << "\n";
+
+    ss << R"(
+Now synthesize ALL the above tool results into a comprehensive response to the user's request.
+Do NOT repeat raw tool data verbatim — analyze, correlate, and present actionable findings.
+Address every part of the user's request with concrete evidence from the tools.
+If multiple tools returned related data, cross-reference them to draw conclusions.
+)";
+
+    return ss.str();
+}
+
+static std::string build_continuation_prompt(
+    const std::string& initial_system_prompt,
+    const std::vector<std::pair<std::string, std::vector<tool_execution_t>>>& round_results,
+    size_t max_chars_per_result,
+    int current_round,
+    int max_rounds)
+{
+    std::ostringstream ss;
+
+    ss << initial_system_prompt;
+
+    ss << OBFSTR("\n\n## Previous Analysis Rounds\n\n");
+    ss << OBFSTR("You have already executed ") << round_results.size()
+       << OBFSTR(" round(s) of tool calls. Here are the results:\n\n");
+
+    for (size_t i = 0; i < round_results.size(); ++i)
+    {
+        const auto& [reasoning, results] = round_results[i];
+
+        ss << OBFSTR("### Round ") << (i + 1) << OBFSTR(" Results\n");
+
+        if (!reasoning.empty())
+            ss << OBFSTR("**Your reasoning:** ") << reasoning << "\n\n";
+
+        ss << format_tool_results(results, max_chars_per_result);
+        ss << "\n";
+    }
+
+    ss << OBFSTR("\n## Continue Your Analysis (Round ") << current_round << " of " << max_rounds << OBFSTR(")\n\n");
+
+    ss << R"(You have received the results of your previous tool calls above.
+Analyze them carefully. Based on these results, you MUST do one of the following:
+
+**OPTION A — Call more tools:** If you need MORE information to fully answer the user's request,
+emit another tool_calls JSON block. Follow up on leads from the previous results:
+- Decompile functions you discovered in call chains
+- Trace xrefs to structures you identified
+- Read memory at addresses you found
+- Rename/comment things you've now identified
+Do NOT re-call tools with the same parameters — those results are already above.
+
+**OPTION B — Write your final answer:** If you have gathered ALL the information needed to
+comprehensively answer the user's request, write your complete analysis as plain text.
+Your final answer must be thorough, cite specific addresses and data from the tool results,
+and address EVERY part of the user's original request. Do NOT include any tool_calls JSON.
+
+IMPORTANT: Do NOT write "I need to check X" or "Let me investigate Y" as text — instead,
+just emit the tool_calls to actually DO IT. Action, not narration.
+)";
 
     return ss.str();
 }
@@ -993,15 +982,61 @@ result_t run(
     stream_fn on_stream)
 {
     result_t result;
-    std::vector<conversation_turn_t> turns;
-    int compact_retry_count = 0;
-    size_t dynamic_tool_result_chars = static_cast<size_t>(config.max_tool_result_chars);
-
     std::unordered_map<std::string, tool_execution_t> tool_cache;
 
     client->set_max_output_tokens(config.agentic_output_tokens);
 
-    for (int iter = 0; iter < config.max_iterations; iter++)
+    if (cancelled && cancelled->load())
+    {
+        result.was_cancelled = true;
+        result.final_response = OBFSTR("Operation cancelled by user.");
+        client->set_max_output_tokens(16384);
+        return result;
+    }
+
+    const int max_rounds = config.max_rounds > 0 ? config.max_rounds : 25;
+
+    auto stop_predicate = [](const std::string& accumulated) -> bool
+    {
+        size_t tc_pos = accumulated.find("\"tool_calls\"");
+        if (tc_pos == std::string::npos)
+            return false;
+
+        size_t brace_start = std::string::npos;
+        for (size_t i = tc_pos; i > 0; --i)
+        {
+            if (accumulated[i - 1] == '{')
+            {
+                brace_start = i - 1;
+                break;
+            }
+        }
+        if (brace_start == std::string::npos)
+            return false;
+
+        std::string json_block = extract_json_by_bracket_match(accumulated, brace_start);
+        if (json_block.empty())
+            return false;
+
+        try
+        {
+            auto j = json::parse(json_block);
+            if (j.contains("tool_calls") && j["tool_calls"].is_array()
+                && !j["tool_calls"].empty())
+                return true;
+        }
+        catch (const json::parse_error&) {}
+
+        return false;
+    };
+
+    std::vector<std::pair<std::string, std::vector<tool_execution_t>>> all_round_results;
+    std::string current_prompt = initial_prompt;
+    std::string last_ai_response;
+    std::string last_reasoning;
+    bool finished = false;
+
+    for (int current_round = 1; current_round <= max_rounds && !finished; ++current_round)
     {
         if (cancelled && cancelled->load())
         {
@@ -1010,98 +1045,40 @@ result_t run(
             break;
         }
 
+        if (current_round > 1 && on_status)
+        {
+            status_update_t status;
+            status.type = status_type_t::new_round;
+            status.round = current_round;
+            status.message = OBFSTR("Round ") + std::to_string(current_round)
+                + OBFSTR(" of ") + std::to_string(max_rounds);
+            on_status(status);
+        }
+
         if (on_progress)
-            on_progress(iter + 1, OBFSTR("Calling AI (iteration ") + std::to_string(iter + 1) + ")...");
+            on_progress(current_round, OBFSTR("Calling AI (round ")
+                + std::to_string(current_round) + OBFSTR(")..."));
 
         if (on_status)
         {
             status_update_t status;
             status.type = status_type_t::calling_ai;
-            status.iteration = iter + 1;
-            status.message = OBFSTR("Calling AI (iteration ") + std::to_string(iter + 1) + ")...";
+            status.round = current_round;
+            status.message = OBFSTR("Calling AI (round ")
+                + std::to_string(current_round) + OBFSTR(")...");
             status.reasoning = status.message;
             on_status(status);
         }
 
         if (config.verbose_logging)
-            msg(OBFSTR_C("AiDA Agent: Iteration %d/%d — calling AI...\n"), iter + 1, config.max_iterations);
-
-        compact_if_needed(initial_prompt, turns, config);
-
-        std::string conversation = build_conversation(initial_prompt, turns, dynamic_tool_result_chars);
-
-        size_t estimated_tokens = estimate_tokens(conversation);
-        int token_budget_i = config.max_context_tokens - config.output_token_reserve;
-        if (token_budget_i < 1024)
-            token_budget_i = 1024;
-        size_t token_budget = static_cast<size_t>(token_budget_i);
-
-        if (estimated_tokens > token_budget * 95 / 100)
-        {
-            conversation += OBFSTR("\n\n[SYSTEM OVERRIDE — CONTEXT LIMIT] You are at the context length limit. "
-                           "You MUST provide your final answer RIGHT NOW as plain text. Do NOT emit "
-                           "tool_calls JSON. Synthesize ALL findings into a single detailed response. "
-                           "Include: every address you found, every function you decompiled, every "
-                           "struct offset you identified, every rename you performed. If you were asked "
-                           "to DO something and haven't finished, state exactly what was done and what "
-                           "remains with specific addresses. Be EXHAUSTIVE — this is your LAST chance to respond.");
-        }
-
-        if (iter == config.max_iterations - 1)
-        {
-            conversation += OBFSTR("\n\n[SYSTEM OVERRIDE — FINAL ITERATION] This is iteration ")
-                           + std::to_string(iter + 1) + OBFSTR(" of ") + std::to_string(config.max_iterations) +
-                           OBFSTR(". You have NO more tool calls available. Provide your COMPLETE final answer "
-                           "as plain text NOW. Do NOT emit tool_calls JSON — it will be ignored. "
-                           "Your answer must include: (1) every concrete finding with specific addresses, "
-                           "(2) all actions you performed (renames, type changes, comments), "
-                           "(3) reconstructed structs or data layouts if applicable, "
-                           "(4) any remaining work that could not be completed, with exact addresses to check.");
-        }
+            msg(OBFSTR_C("AiDA Agent: Calling AI (round %d/%d)...\n"), current_round, max_rounds);
 
         std::string ai_response = client->streaming_blocking_generate(
-            conversation, config.temperature, on_stream,
-
-
-            [](const std::string& accumulated) -> bool
-            {
-                size_t tc_pos = accumulated.find("\"tool_calls\"");
-                if (tc_pos == std::string::npos)
-                    return false;
-
-
-                size_t brace_start = std::string::npos;
-                for (size_t i = tc_pos; i > 0; --i)
-                {
-                    if (accumulated[i - 1] == '{')
-                    {
-                        brace_start = i - 1;
-                        break;
-                    }
-                }
-                if (brace_start == std::string::npos)
-                    return false;
-
-                std::string json_block = extract_json_by_bracket_match(accumulated, brace_start);
-                if (json_block.empty())
-                    return false;
-
-                try
-                {
-                    auto j = json::parse(json_block);
-                    if (j.contains("tool_calls") && j["tool_calls"].is_array()
-                        && !j["tool_calls"].empty())
-                        return true;
-                }
-                catch (const json::parse_error&) {}
-
-                return false;
-            });
+            current_prompt, config.temperature, on_stream, stop_predicate);
 
         if (ai_response.substr(0, 6) == "Error:")
         {
             result.final_response = ai_response;
-            result.total_iterations = iter + 1;
             break;
         }
 
@@ -1112,94 +1089,28 @@ result_t run(
             break;
         }
 
-        bool response_truncated = false;
         {
             static const std::string TRUNC_MARKER = OBFSTR("\n\n[RESPONSE_TRUNCATED]");
             size_t trunc_pos = ai_response.rfind(TRUNC_MARKER);
             if (trunc_pos != std::string::npos)
             {
-                response_truncated = true;
                 ai_response = ai_response.substr(0, trunc_pos);
-                dynamic_tool_result_chars = std::max(static_cast<size_t>(512), dynamic_tool_result_chars / 2);
-                for (auto& t : turns)
-                {
-                    if (!t.compacted)
-                    {
-                        t.compact_summary = summarize_turn(t);
-                        t.compacted = true;
-                    }
-                }
                 if (config.verbose_logging)
-                    msg(OBFSTR_C("AiDA Agent: Response was truncated by API. Reducing context (tool_result_chars=%zu). Attempting recovery...\n"), dynamic_tool_result_chars);
+                    msg(OBFSTR_C("AiDA Agent: Response was truncated by API.\n"));
             }
         }
 
-        if (response_truncated)
-        {
-            if (has_tool_calls(ai_response))
-            {
-                json trunc_parsed = extract_tool_calls(ai_response);
-                if (!trunc_parsed.contains(OBFSTR_C("tool_calls")) || trunc_parsed[OBFSTR_C("tool_calls")].empty())
-                {
-                    if (compact_retry_count < 2)
-                    {
-                        compact_retry_count++;
-                        for (auto& t : turns)
-                        {
-                            if (!t.compacted)
-                            {
-                                t.compact_summary = summarize_turn(t);
-                                t.compacted = true;
-                            }
-                        }
-                        if (config.verbose_logging)
-                            msg(OBFSTR_C("AiDA Agent: Incomplete tool call from truncation. Compact retry %d...\n"), compact_retry_count);
-                        continue;
-                    }
-                }
-            }
-
-            if (!has_tool_calls(ai_response))
-            {
-                result.final_response = ai_response + OBFSTR("\n\n*(Response was truncated due to context length limit)*");
-                result.total_iterations = iter + 1;
-                if (config.verbose_logging)
-                    msg(OBFSTR_C("AiDA Agent: Using truncated response as final answer.\n"));
-                break;
-            }
-        }
+        last_ai_response = ai_response;
 
         if (!has_tool_calls(ai_response))
         {
-            result.final_response = strip_tool_artifacts(ai_response);
-            if (result.final_response.empty())
-                result.final_response = ai_response;
-
-            bool has_incomplete_markers = looks_incomplete(result.final_response);
-            bool is_premature = false;
-            if (iter == 0 && result.final_response.size() < 400)
-                is_premature = true;
-            else if (has_incomplete_markers && iter < 3)
-                is_premature = true;
-
-            if (is_premature && iter < config.max_iterations - 1)
-            {
-                if (config.verbose_logging)
-                    msg(OBFSTR_C("AiDA Agent: Premature/incomplete answer detected at iteration %d (%zu chars, incomplete_markers=%d). Pushing AI to continue...\n"),
-                        iter + 1, result.final_response.size(), has_incomplete_markers ? 1 : 0);
-
-                conversation_turn_t push_turn;
-                push_turn.ai_response = ai_response;
-                push_turn.tool_results = {};
-                turns.push_back(std::move(push_turn));
-                result.final_response.clear();
-                continue;
-            }
-
-            result.total_iterations = iter + 1;
+            std::string cleaned = strip_tool_artifacts(ai_response);
+            result.final_response = cleaned.empty() ? ai_response : cleaned;
 
             if (config.verbose_logging)
-                msg(OBFSTR_C("AiDA Agent: Final answer received after %d iteration(s).\n"), iter + 1);
+                msg(OBFSTR_C("AiDA Agent: Round %d — final answer (no tool calls).\n"), current_round);
+
+            finished = true;
             break;
         }
 
@@ -1207,89 +1118,53 @@ result_t run(
         if (!parsed.contains(OBFSTR_C("tool_calls")) || parsed[OBFSTR_C("tool_calls")].empty())
         {
             std::string cleaned = strip_tool_artifacts(ai_response);
-            if (!cleaned.empty())
-            {
-                result.final_response = cleaned;
-                result.total_iterations = iter + 1;
-                if (config.verbose_logging)
-                    msg(OBFSTR_C("AiDA Agent: Tool call parse failed, using cleaned response as final answer.\n"));
-                break;
-            }
+            result.final_response = cleaned.empty()
+                ? OBFSTR("The AI agent's response could not be parsed. Please try again.")
+                : cleaned;
 
             if (config.verbose_logging)
-                msg(OBFSTR_C("AiDA Agent: Tool call parse failed and no clean text found. Forcing final answer...\n"));
+                msg(OBFSTR_C("AiDA Agent: Round %d — tool call parse failed, using cleaned response.\n"), current_round);
 
-            std::string force_prompt = conversation +
-                OBFSTR("\n\n[SYSTEM OVERRIDE — PARSE ERROR] Your previous response was malformed. "
-                "Respond ONLY with plain text — no JSON, no tool_calls. Provide your complete "
-                "analysis including all addresses, findings, and actions performed so far.");
-
-            std::string forced_response = client->blocking_generate(force_prompt, config.temperature);
-            if (!forced_response.empty() && forced_response.substr(0, 6) != "Error:")
-            {
-                cleaned = strip_tool_artifacts(forced_response);
-                if (!cleaned.empty() && !has_tool_calls(cleaned))
-                {
-                    result.final_response = cleaned;
-                    result.total_iterations = iter + 1;
-                    break;
-                }
-            }
-
-            result.final_response = OBFSTR("The AI agent was unable to produce a final answer after ")
-                + std::to_string(iter + 1) + OBFSTR(" iteration(s). Please try again with a more specific question.");
-            result.total_iterations = iter + 1;
+            finished = true;
             break;
         }
 
         std::string reasoning = json_str(parsed, "reasoning");
+        last_reasoning = reasoning;
 
         std::vector<std::string> pending_tool_names;
         for (const auto& tc : parsed[OBFSTR_C("tool_calls")])
-        {
             pending_tool_names.push_back(json_str(tc, "tool", "?"));
-        }
 
         if (on_status)
         {
             status_update_t status;
             status.type = status_type_t::thinking;
-            status.iteration = iter + 1;
+            status.round = current_round;
             status.reasoning = reasoning;
             status.pending_tools = pending_tool_names;
-            status.message = OBFSTR("Reasoning: ") + (reasoning.empty() ? OBFSTR("(no reasoning provided)") : reasoning);
+            status.message = OBFSTR("Round ") + std::to_string(current_round) + OBFSTR(": ")
+                + (reasoning.empty() ? OBFSTR("(no reasoning provided)") : reasoning);
             on_status(status);
         }
 
+        size_t num_calls = parsed[OBFSTR_C("tool_calls")].size();
+
         if (config.verbose_logging)
         {
-            size_t num_calls = parsed[OBFSTR_C("tool_calls")].size();
-            msg(OBFSTR_C("AiDA Agent: AI requested %zu tool call(s): %s\n"),
-                num_calls, reasoning.c_str());
+            msg(OBFSTR_C("AiDA Agent: Round %d — AI requested %zu tool call(s): %s\n"),
+                current_round, num_calls, reasoning.c_str());
             for (const auto& tc : parsed[OBFSTR_C("tool_calls")])
-            {
-                std::string nm = json_str(tc, "tool", "?");
-                msg(OBFSTR_C("  → %s\n"), nm.c_str());
-            }
+                msg(OBFSTR_C("  \xe2\x86\x92 %s\n"), json_str(tc, "tool", "?").c_str());
         }
 
         if (on_progress)
-        {
-            size_t num_calls = parsed[OBFSTR_C("tool_calls")].size();
-            on_progress(iter + 1, OBFSTR("Executing ") + std::to_string(num_calls) + OBFSTR(" tool(s)..."));
-        }
+            on_progress(current_round, OBFSTR("Round ") + std::to_string(current_round)
+                + OBFSTR(": Executing ") + std::to_string(num_calls) + OBFSTR(" tool(s)..."));
 
-        std::vector<tool_execution_t> all_tool_results;
+        std::vector<tool_execution_t> round_tool_results;
 
-        size_t max_tools = static_cast<size_t>(config.max_tools_per_iteration);
-        size_t requested_count = parsed[OBFSTR_C("tool_calls")].size();
-        size_t effective_count = std::min(requested_count, max_tools);
-
-        if (requested_count > max_tools && config.verbose_logging)
-            msg(OBFSTR_C("AiDA Agent: Capping tool calls from %zu to %zu per iteration limit.\n"),
-                requested_count, max_tools);
-
-        for (size_t tool_idx = 0; tool_idx < effective_count; ++tool_idx)
+        for (size_t tool_idx = 0; tool_idx < num_calls; ++tool_idx)
         {
             if (cancelled && cancelled->load())
                 break;
@@ -1299,11 +1174,11 @@ result_t run(
                 continue;
 
             std::string tool_name = tc[OBFSTR_C("tool")].get<std::string>();
-            json params = tc.contains(OBFSTR_C("params")) && !tc[OBFSTR_C("params")].is_null() ? tc[OBFSTR_C("params")] : json::object();
+            json params = tc.contains(OBFSTR_C("params")) && !tc[OBFSTR_C("params")].is_null()
+                ? tc[OBFSTR_C("params")] : json::object();
 
             auto& registry = agent_tools::ToolRegistry::instance();
             const auto* tool_def = registry.get_tool(tool_name);
-
 
             std::string cache_key = tool_name + "|" + params.dump(-1, ' ', false, json::error_handler_t::replace);
             if (tool_def && tool_def->read_only)
@@ -1314,13 +1189,13 @@ result_t run(
                     if (config.verbose_logging)
                         msg(OBFSTR_C("AiDA Agent: Skipping duplicate tool call: %s (cached)\n"), tool_name.c_str());
 
-                    all_tool_results.push_back(cache_it->second);
+                    round_tool_results.push_back(cache_it->second);
 
                     if (on_status)
                     {
                         status_update_t status;
                         status.type = status_type_t::tool_complete;
-                        status.iteration = iter + 1;
+                        status.round = current_round;
                         status.tool_name = cache_it->second.tool_name;
                         status.tool_success = cache_it->second.success;
                         status.message = cache_it->second.message + OBFSTR(" (cached)");
@@ -1334,7 +1209,7 @@ result_t run(
             {
                 status_update_t status;
                 status.type = status_type_t::executing_tool;
-                status.iteration = iter + 1;
+                status.round = current_round;
                 status.tool_name = tool_name;
                 status.message = OBFSTR("Executing: ") + tool_name;
                 status.pending_tools = pending_tool_names;
@@ -1349,7 +1224,6 @@ result_t run(
 
             execute_sync(exec_req, mff_flag);
 
-
             if (tool_def && tool_def->read_only && exec_req.result.success)
                 tool_cache[cache_key] = exec_req.result;
 
@@ -1357,82 +1231,239 @@ result_t run(
             {
                 status_update_t status;
                 status.type = status_type_t::tool_complete;
-                status.iteration = iter + 1;
+                status.round = current_round;
                 status.tool_name = exec_req.result.tool_name;
                 status.tool_success = exec_req.result.success;
                 status.message = exec_req.result.message;
                 on_status(status);
             }
 
-            all_tool_results.push_back(std::move(exec_req.result));
+            round_tool_results.push_back(std::move(exec_req.result));
+        }
+
+        for (auto& tr : round_tool_results)
+        {
+            if (tr.tool_name != OBFSTR_C("driver_defer_action"))
+                continue;
+            if (!tr.success || !tr.data.contains("action_id"))
+                continue;
+
+            int action_id = tr.data["action_id"].get<int>();
+
+            if (config.verbose_logging)
+                msg(OBFSTR_C("AiDA Agent: Waiting for deferred action #%d to complete...\n"), action_id);
+
+            if (on_status)
+            {
+                status_update_t status;
+                status.type = status_type_t::executing_tool;
+                status.round = current_round;
+                status.tool_name = OBFSTR("driver_defer_action");
+                status.message = OBFSTR("Waiting for deferred action #") + std::to_string(action_id)
+                    + OBFSTR(" (target: ") + tr.data.value("target", "?") + OBFSTR(")...");
+                on_status(status);
+            }
+
+            if (on_progress)
+                on_progress(current_round, OBFSTR("Waiting for deferred action #") + std::to_string(action_id) + "...");
+
+            auto wait_start = std::chrono::steady_clock::now();
+
+            while (true)
+            {
+                if (cancelled && cancelled->load())
+                {
+                    agent_tools::driver_tools::DeferredActionManager::instance().cancel_action(action_id);
+                    break;
+                }
+
+                const auto* action = agent_tools::driver_tools::DeferredActionManager::instance().get_action(action_id);
+                if (!action)
+                    break;
+
+                auto st = action->status.load();
+                if (st == agent_tools::driver_tools::deferred_status::completed
+                    || st == agent_tools::driver_tools::deferred_status::failed
+                    || st == agent_tools::driver_tools::deferred_status::timed_out
+                    || st == agent_tools::driver_tools::deferred_status::cancelled)
+                {
+                    json deferred_results = json::object();
+                    deferred_results["action_id"] = action_id;
+                    deferred_results["final_status"] = (st == agent_tools::driver_tools::deferred_status::completed) ? "completed"
+                        : (st == agent_tools::driver_tools::deferred_status::failed) ? "failed"
+                        : (st == agent_tools::driver_tools::deferred_status::timed_out) ? "timed_out"
+                        : "cancelled";
+
+                    if (!action->trigger_info.empty())
+                    {
+                        try { deferred_results["trigger_info"] = json::parse(action->trigger_info); }
+                        catch (...) { deferred_results["trigger_info"] = action->trigger_info; }
+                    }
+
+                    if (!action->error.empty())
+                        deferred_results["error"] = action->error;
+
+                    json results_arr = json::array();
+                    int succeeded = 0;
+                    for (const auto& r : action->results)
+                    {
+                        json rj;
+                        rj["tool"] = r.action_type;
+                        rj["success"] = r.success;
+                        rj["message"] = r.message;
+                        if (!r.data.is_null() && !r.data.empty())
+                            rj["data"] = r.data;
+                        results_arr.push_back(rj);
+                        if (r.success) succeeded++;
+                    }
+                    deferred_results["tool_results"] = results_arr;
+                    deferred_results["succeeded"] = succeeded;
+                    deferred_results["failed"] = static_cast<int>(action->results.size()) - succeeded;
+
+                    tr.data["deferred_results"] = deferred_results;
+                    tr.success = (st == agent_tools::driver_tools::deferred_status::completed);
+                    tr.message = OBFSTR("Deferred action #") + std::to_string(action_id) + OBFSTR(": ")
+                        + deferred_results["final_status"].get<std::string>()
+                        + OBFSTR(" (") + std::to_string(succeeded) + "/" + std::to_string(action->results.size())
+                        + OBFSTR(" tools succeeded)");
+
+                    if (config.verbose_logging)
+                        msg(OBFSTR_C("AiDA Agent: Deferred action #%d %s.\n"), action_id,
+                            deferred_results["final_status"].get<std::string>().c_str());
+
+                    if (on_status)
+                    {
+                        status_update_t status;
+                        status.type = status_type_t::tool_complete;
+                        status.round = current_round;
+                        status.tool_name = OBFSTR("driver_defer_action");
+                        status.tool_success = tr.success;
+                        status.message = tr.message;
+                        on_status(status);
+                    }
+                    break;
+                }
+
+                auto elapsed = std::chrono::steady_clock::now() - wait_start;
+                auto elapsed_secs = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+
+                if (elapsed_secs % 10 == 0 && elapsed_secs > 0)
+                {
+                    if (on_status)
+                    {
+                        status_update_t status;
+                        status.type = status_type_t::executing_tool;
+                        status.round = current_round;
+                        status.tool_name = OBFSTR("driver_defer_action");
+                        status.message = OBFSTR("Still waiting for deferred action #")
+                            + std::to_string(action_id) + OBFSTR(" (")
+                            + std::to_string(elapsed_secs) + OBFSTR("s elapsed)...");
+                        on_status(status);
+                    }
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
         }
 
         if (config.verbose_logging)
         {
-            for (const auto& r : all_tool_results)
+            msg(OBFSTR_C("AiDA Agent: Round %d — %zu tool(s) executed:\n"), current_round, round_tool_results.size());
+            for (const auto& r : round_tool_results)
             {
-                msg(OBFSTR_C("  ← %s: %s — %s\n"), r.tool_name.c_str(),
+                msg(OBFSTR_C("  \xe2\x86\x90 %s: %s \xe2\x80\x94 %s\n"), r.tool_name.c_str(),
                     r.success ? OBFSTR_C("OK") : OBFSTR_C("FAIL"), r.message.c_str());
             }
         }
 
-        iteration_t iteration;
-        iteration.number = iter + 1;
-        iteration.ai_reasoning = reasoning;
-        iteration.tool_results = all_tool_results;
-        result.iterations.push_back(std::move(iteration));
+        for (auto& tr : round_tool_results)
+            result.tool_results.push_back(tr);
 
-        conversation_turn_t turn;
-        turn.ai_response = ai_response;
-        turn.tool_results = all_tool_results;
-        turns.push_back(std::move(turn));
+        all_round_results.push_back({reasoning, std::move(round_tool_results)});
+
+        if (current_round < max_rounds)
+        {
+            current_prompt = build_continuation_prompt(
+                initial_prompt, all_round_results,
+                static_cast<size_t>(config.max_tool_result_chars),
+                current_round + 1, max_rounds);
+        }
     }
 
-    if (result.final_response.empty())
+    if (!finished && !result.was_cancelled && result.final_response.empty())
     {
         if (config.verbose_logging)
-            msg(OBFSTR_C("AiDA Agent: Max iterations reached. Attempting forced summarization...\n"));
+            msg(OBFSTR_C("AiDA Agent: Max rounds (%d) reached, forcing synthesis...\n"), max_rounds);
 
-        std::string summary_prompt = build_conversation(initial_prompt, turns, dynamic_tool_result_chars);
-        summary_prompt += OBFSTR("\n\n[SYSTEM OVERRIDE — MAX ITERATIONS EXHAUSTED] You have used all ")
-                         + std::to_string(config.max_iterations) + OBFSTR(" iterations. Provide your COMPLETE "
-                         "final answer NOW as plain text. Do NOT emit tool_calls JSON. Include: "
-                         "(1) every address, offset, and function you discovered, "
-                         "(2) all renames, type changes, and comments you applied, "
-                         "(3) reconstructed data structures with field offsets, "
-                         "(4) specific addresses for any remaining uninvestigated leads. "
-                         "Present findings in a structured format with code blocks and hex addresses.");
+        if (on_progress)
+            on_progress(max_rounds + 1, OBFSTR("Synthesizing final response..."));
 
-        if (!(cancelled && cancelled->load()))
+        if (on_status)
         {
-            std::string summary_response = client->blocking_generate(summary_prompt, config.temperature);
-            if (!summary_response.empty() && summary_response.substr(0, 6) != "Error:")
-            {
-                std::string cleaned = strip_tool_artifacts(summary_response);
-                if (!cleaned.empty())
-                {
-                    result.final_response = cleaned;
-                    result.total_iterations = config.max_iterations;
-                    return result;
-                }
-            }
+            status_update_t status;
+            status.type = status_type_t::new_round;
+            status.round = max_rounds + 1;
+            status.message = OBFSTR("Synthesizing final response...");
+            on_status(status);
         }
 
-        result.hit_max_iterations = true;
-        result.total_iterations = config.max_iterations;
-        result.final_response = OBFSTR("I reached the maximum number of iterations (") +
-            std::to_string(config.max_iterations) + OBFSTR(") without completing the analysis. "
-            "Here's a summary of what I found so far:\n\n");
-
-        for (const auto& it : result.iterations)
+        if (on_status)
         {
-            result.final_response += OBFSTR("Iteration ") + std::to_string(it.number) + ": " + it.ai_reasoning + "\n";
-            for (const auto& tr : it.tool_results)
-            {
-                result.final_response += "  " + tr.tool_name + ": " + (tr.success ? "OK" : "FAIL") + " — " + tr.message + "\n";
-            }
+            status_update_t status;
+            status.type = status_type_t::calling_ai;
+            status.round = max_rounds + 1;
+            status.message = OBFSTR("Synthesizing final response from all tool results...");
+            on_status(status);
+        }
+
+        std::string planning_reasoning = last_reasoning;
+        std::string cleaned_pre_text = strip_tool_artifacts(last_ai_response);
+        if (!cleaned_pre_text.empty())
+            planning_reasoning = cleaned_pre_text;
+
+        std::string synthesis_prompt = build_synthesis_prompt(
+            config.user_message, config.context_block, config.chat_history,
+            planning_reasoning, result.tool_results,
+            static_cast<size_t>(config.max_tool_result_chars));
+
+        client->set_max_output_tokens(config.synthesis_output_tokens);
+
+        std::string synthesis_response = client->streaming_blocking_generate(
+            synthesis_prompt, config.temperature, on_stream, nullptr);
+
+        if (cancelled && cancelled->load())
+        {
+            result.was_cancelled = true;
+            result.final_response = OBFSTR("Operation cancelled by user.");
+        }
+        else if (synthesis_response.substr(0, 6) == "Error:")
+        {
+            if (config.verbose_logging)
+                msg(OBFSTR_C("AiDA Agent: Synthesis call failed: %s\n"), synthesis_response.c_str());
+
+            std::string fallback = strip_tool_artifacts(last_ai_response);
+            result.final_response = fallback.empty() ? last_reasoning : fallback;
+            if (result.final_response.empty())
+                result.final_response = OBFSTR("Tool execution complete but synthesis failed. See agent actions above for results.");
+        }
+        else
+        {
+            std::string cleaned_synthesis = strip_tool_artifacts(synthesis_response);
+            result.final_response = cleaned_synthesis.empty() ? synthesis_response : cleaned_synthesis;
+
+            if (config.verbose_logging)
+                msg(OBFSTR_C("AiDA Agent: Synthesis complete (%zu chars).\n"), result.final_response.size());
         }
     }
+
+    if (result.final_response.empty() && !result.was_cancelled)
+    {
+        result.final_response = OBFSTR("Tool execution complete. See agent actions above for results.");
+    }
+
+    if (config.verbose_logging)
+        msg(OBFSTR_C("AiDA Agent: Agent cycle complete. %d round(s), %zu total tool(s) executed.\n"),
+            static_cast<int>(all_round_results.size()), result.tool_results.size());
 
     client->set_max_output_tokens(16384);
 

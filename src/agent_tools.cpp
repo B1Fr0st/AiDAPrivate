@@ -1,4 +1,4 @@
-﻿#include "aida_pro.hpp"
+#include "aida_pro.hpp"
 #include <allins.hpp>
 #include <iomanip>
 #include <loader.hpp>
@@ -282,6 +282,1411 @@ static int responsive_plan_and_wait(ea_t ea1, ea_t ea2, bool final_pass,
 
     return 1;
 }
+
+
+struct pe_fix_result_t
+{
+    bool success = false;
+    std::string error;
+    int sections_fixed = 0;
+    int iat_entries_restored = 0;
+    int import_dlls_found = 0;
+    bool entry_point_valid = false;
+    bool entry_point_fixed = false;
+    std::uint32_t original_ep_rva = 0;
+    std::uint32_t fixed_ep_rva = 0;
+    bool security_dir_cleared = false;
+    bool debug_dir_cleared = false;
+    bool checksum_cleared = false;
+    bool file_alignment_fixed = false;
+    bool is_pe64 = false;
+    bool reloc_dir_cleared = false;
+    bool relocs_stripped_flag_set = false;
+    bool reloc_section_zeroed = false;
+    bool tls_dir_cleared = false;
+    bool loadconfig_dir_cleared = false;
+    bool delay_import_dir_cleared = false;
+    bool com_dir_cleared = false;
+    bool imagebase_updated = false;
+    std::uint64_t original_imagebase = 0;
+    std::uint64_t updated_imagebase = 0;
+    bool ep_prologue_scanned = false;
+    std::vector<std::string> import_dll_names;
+};
+
+static pe_fix_result_t fix_dumped_pe_image(
+    std::vector<std::uint8_t>& image,
+    std::uint64_t module_base)
+{
+    pe_fix_result_t result;
+
+    if (image.size() < 0x100)
+    {
+        result.error = "Image too small for PE";
+        return result;
+    }
+
+
+    if (image[0] != 'M' || image[1] != 'Z')
+    {
+        result.error = "Invalid MZ signature";
+        return result;
+    }
+
+    std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&image[0x3C]);
+    if (pe_off + 0x18 >= static_cast<std::uint32_t>(image.size()))
+    {
+        result.error = "PE header offset out of range";
+        return result;
+    }
+
+
+    if (image[pe_off] != 'P' || image[pe_off + 1] != 'E' ||
+        image[pe_off + 2] != 0   || image[pe_off + 3] != 0)
+    {
+        result.error = "Invalid PE signature";
+        return result;
+    }
+
+    std::uint16_t num_sections  = *reinterpret_cast<std::uint16_t*>(&image[pe_off + 6]);
+    std::uint16_t opt_hdr_size  = *reinterpret_cast<std::uint16_t*>(&image[pe_off + 20]);
+    std::uint32_t opt_off       = pe_off + 24;
+
+    if (opt_off + 2 >= static_cast<std::uint32_t>(image.size()))
+    {
+        result.error = "Optional header out of range";
+        return result;
+    }
+
+    std::uint16_t opt_magic = *reinterpret_cast<std::uint16_t*>(&image[opt_off]);
+    result.is_pe64 = (opt_magic == 0x020B);
+    bool is_pe32   = (opt_magic == 0x010B);
+
+    if (!result.is_pe64 && !is_pe32)
+    {
+        result.error = "Unknown PE optional header magic";
+        return result;
+    }
+
+    std::uint32_t image_size_from_header = 0;
+    if (opt_off + 60 <= static_cast<std::uint32_t>(image.size()))
+        image_size_from_header = *reinterpret_cast<std::uint32_t*>(&image[opt_off + 56]);
+
+    std::uint32_t section_table_off = pe_off + 24 + opt_hdr_size;
+
+
+    std::uint32_t dd_base = result.is_pe64 ? (opt_off + 112) : (opt_off + 96);
+
+
+    if (opt_off + 40 <= static_cast<std::uint32_t>(image.size()))
+    {
+        std::uint32_t sec_align = *reinterpret_cast<std::uint32_t*>(&image[opt_off + 32]);
+        std::uint32_t fil_align = *reinterpret_cast<std::uint32_t*>(&image[opt_off + 36]);
+        if (sec_align != 0 && fil_align != sec_align)
+        {
+            *reinterpret_cast<std::uint32_t*>(&image[opt_off + 36]) = sec_align;
+            result.file_alignment_fixed = true;
+        }
+    }
+
+
+    if (module_base != 0)
+    {
+        if (result.is_pe64)
+        {
+            if (opt_off + 32 <= static_cast<std::uint32_t>(image.size()))
+            {
+                result.original_imagebase = *reinterpret_cast<std::uint64_t*>(&image[opt_off + 24]);
+                *reinterpret_cast<std::uint64_t*>(&image[opt_off + 24]) = module_base;
+                result.updated_imagebase = module_base;
+                result.imagebase_updated = (result.original_imagebase != module_base);
+            }
+        }
+        else
+        {
+            if (opt_off + 32 <= static_cast<std::uint32_t>(image.size()))
+            {
+                result.original_imagebase = *reinterpret_cast<std::uint32_t*>(&image[opt_off + 28]);
+                *reinterpret_cast<std::uint32_t*>(&image[opt_off + 28]) =
+                    static_cast<std::uint32_t>(module_base);
+                result.updated_imagebase = module_base;
+                result.imagebase_updated = (result.original_imagebase != module_base);
+            }
+        }
+    }
+
+
+    for (int i = 0; i < num_sections && i < 96; i++)
+    {
+        std::uint32_t sec_off = section_table_off + i * 40;
+        if (sec_off + 40 > static_cast<std::uint32_t>(image.size())) break;
+
+        std::uint32_t virt_size = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 8]);
+        std::uint32_t virt_addr = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 12]);
+        std::uint32_t raw_size  = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 16]);
+
+        if (virt_addr == 0 || virt_size == 0) continue;
+
+
+        *reinterpret_cast<std::uint32_t*>(&image[sec_off + 20]) = virt_addr;
+
+
+        std::uint32_t new_raw = (virt_size > raw_size) ? virt_size : raw_size;
+        if (virt_addr + new_raw > static_cast<std::uint32_t>(image.size()))
+            new_raw = static_cast<std::uint32_t>(image.size()) - virt_addr;
+        *reinterpret_cast<std::uint32_t*>(&image[sec_off + 16]) = new_raw;
+
+
+        *reinterpret_cast<std::uint32_t*>(&image[sec_off + 24]) = 0;
+        *reinterpret_cast<std::uint16_t*>(&image[sec_off + 32]) = 0;
+        *reinterpret_cast<std::uint16_t*>(&image[sec_off + 34]) = 0;
+
+        result.sections_fixed++;
+    }
+
+
+    if (opt_off + 68 <= static_cast<std::uint32_t>(image.size()))
+    {
+        *reinterpret_cast<std::uint32_t*>(&image[opt_off + 64]) = 0;
+        result.checksum_cleared = true;
+    }
+
+
+    {
+        std::uint32_t sec_dir_off = dd_base + 4 * 8;
+        if (sec_dir_off + 8 <= static_cast<std::uint32_t>(image.size()))
+        {
+            std::uint32_t sec_rva = *reinterpret_cast<std::uint32_t*>(&image[sec_dir_off]);
+            if (sec_rva != 0)
+            {
+                *reinterpret_cast<std::uint32_t*>(&image[sec_dir_off])     = 0;
+                *reinterpret_cast<std::uint32_t*>(&image[sec_dir_off + 4]) = 0;
+                result.security_dir_cleared = true;
+            }
+        }
+    }
+
+
+    {
+        std::uint32_t dbg_dir_off = dd_base + 6 * 8;
+        if (dbg_dir_off + 8 <= static_cast<std::uint32_t>(image.size()))
+        {
+            std::uint32_t dbg_rva = *reinterpret_cast<std::uint32_t*>(&image[dbg_dir_off]);
+            if (dbg_rva != 0)
+            {
+                *reinterpret_cast<std::uint32_t*>(&image[dbg_dir_off])     = 0;
+                *reinterpret_cast<std::uint32_t*>(&image[dbg_dir_off + 4]) = 0;
+                result.debug_dir_cleared = true;
+            }
+        }
+    }
+
+
+    {
+        std::uint32_t reloc_dir_off = dd_base + 5 * 8;
+        if (reloc_dir_off + 8 <= static_cast<std::uint32_t>(image.size()))
+        {
+            std::uint32_t reloc_rva = *reinterpret_cast<std::uint32_t*>(&image[reloc_dir_off]);
+            if (reloc_rva != 0)
+            {
+                *reinterpret_cast<std::uint32_t*>(&image[reloc_dir_off])     = 0;
+                *reinterpret_cast<std::uint32_t*>(&image[reloc_dir_off + 4]) = 0;
+                result.reloc_dir_cleared = true;
+            }
+        }
+    }
+
+
+    {
+        std::uint32_t tls_dir_off = dd_base + 9 * 8;
+        if (tls_dir_off + 8 <= static_cast<std::uint32_t>(image.size()))
+        {
+            std::uint32_t tls_rva = *reinterpret_cast<std::uint32_t*>(&image[tls_dir_off]);
+            if (tls_rva != 0)
+            {
+                *reinterpret_cast<std::uint32_t*>(&image[tls_dir_off])     = 0;
+                *reinterpret_cast<std::uint32_t*>(&image[tls_dir_off + 4]) = 0;
+                result.tls_dir_cleared = true;
+            }
+        }
+    }
+
+
+    {
+        std::uint32_t lc_dir_off = dd_base + 10 * 8;
+        if (lc_dir_off + 8 <= static_cast<std::uint32_t>(image.size()))
+        {
+            std::uint32_t lc_rva = *reinterpret_cast<std::uint32_t*>(&image[lc_dir_off]);
+            if (lc_rva != 0)
+            {
+                *reinterpret_cast<std::uint32_t*>(&image[lc_dir_off])     = 0;
+                *reinterpret_cast<std::uint32_t*>(&image[lc_dir_off + 4]) = 0;
+                result.loadconfig_dir_cleared = true;
+            }
+        }
+    }
+
+
+    {
+        std::uint32_t di_dir_off = dd_base + 13 * 8;
+        if (di_dir_off + 8 <= static_cast<std::uint32_t>(image.size()))
+        {
+            std::uint32_t di_rva = *reinterpret_cast<std::uint32_t*>(&image[di_dir_off]);
+            if (di_rva != 0)
+            {
+                *reinterpret_cast<std::uint32_t*>(&image[di_dir_off])     = 0;
+                *reinterpret_cast<std::uint32_t*>(&image[di_dir_off + 4]) = 0;
+                result.delay_import_dir_cleared = true;
+            }
+        }
+    }
+
+
+    {
+        std::uint32_t com_dir_off = dd_base + 14 * 8;
+        if (com_dir_off + 8 <= static_cast<std::uint32_t>(image.size()))
+        {
+            std::uint32_t com_rva = *reinterpret_cast<std::uint32_t*>(&image[com_dir_off]);
+            if (com_rva != 0)
+            {
+                *reinterpret_cast<std::uint32_t*>(&image[com_dir_off])     = 0;
+                *reinterpret_cast<std::uint32_t*>(&image[com_dir_off + 4]) = 0;
+                result.com_dir_cleared = true;
+            }
+        }
+    }
+
+
+    {
+        std::uint32_t chars_off = pe_off + 18;
+        if (chars_off + 2 <= static_cast<std::uint32_t>(image.size()))
+        {
+            std::uint16_t characteristics = *reinterpret_cast<std::uint16_t*>(&image[chars_off]);
+            if (!(characteristics & 0x0001))
+            {
+                characteristics |= 0x0001;
+                *reinterpret_cast<std::uint16_t*>(&image[chars_off]) = characteristics;
+                result.relocs_stripped_flag_set = true;
+            }
+        }
+    }
+
+
+    for (int i = 0; i < num_sections && i < 96; i++)
+    {
+        std::uint32_t sec_off = section_table_off + i * 40;
+        if (sec_off + 40 > static_cast<std::uint32_t>(image.size())) break;
+
+        char sec_name[9] = {};
+        std::memcpy(sec_name, &image[sec_off], 8);
+
+        if (std::strcmp(sec_name, ".reloc") == 0)
+        {
+            std::uint32_t virt_addr = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 12]);
+            std::uint32_t raw_size  = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 16]);
+
+            if (virt_addr > 0 && virt_addr < static_cast<std::uint32_t>(image.size()))
+            {
+                std::uint32_t zero_end = virt_addr + raw_size;
+                if (zero_end > static_cast<std::uint32_t>(image.size()))
+                    zero_end = static_cast<std::uint32_t>(image.size());
+                std::memset(&image[virt_addr], 0, zero_end - virt_addr);
+                result.reloc_section_zeroed = true;
+            }
+            break;
+        }
+    }
+
+
+    {
+        std::uint32_t ep_rva = *reinterpret_cast<std::uint32_t*>(&image[opt_off + 16]);
+        result.original_ep_rva = ep_rva;
+        result.fixed_ep_rva    = ep_rva;
+
+        bool ep_ok = false;
+
+
+        if (ep_rva > 0 && ep_rva < static_cast<std::uint32_t>(image.size()))
+        {
+            for (int i = 0; i < num_sections && i < 96; i++)
+            {
+                std::uint32_t sec_off = section_table_off + i * 40;
+                if (sec_off + 40 > static_cast<std::uint32_t>(image.size())) break;
+
+                std::uint32_t va  = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 12]);
+                std::uint32_t vs  = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 8]);
+                std::uint32_t ch  = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 36]);
+
+                if (ep_rva >= va && ep_rva < va + vs && (ch & 0x20000000))
+                {
+
+                    if (image[ep_rva] != 0x00 && image[ep_rva] != 0xCC)
+                        ep_ok = true;
+                    break;
+                }
+            }
+        }
+
+
+        if (!ep_ok && (ep_rva == 0 || ep_rva >= static_cast<std::uint32_t>(image.size())))
+        {
+            if (dd_base + 8 <= static_cast<std::uint32_t>(image.size()))
+            {
+                std::uint32_t export_rva  = *reinterpret_cast<std::uint32_t*>(&image[dd_base]);
+                std::uint32_t export_size = *reinterpret_cast<std::uint32_t*>(&image[dd_base + 4]);
+                (void)export_size;
+
+                if (export_rva != 0 && export_rva + 40 <= static_cast<std::uint32_t>(image.size()))
+                {
+                    std::uint32_t num_funcs   = *reinterpret_cast<std::uint32_t*>(&image[export_rva + 20]);
+                    std::uint32_t num_names   = *reinterpret_cast<std::uint32_t*>(&image[export_rva + 24]);
+                    std::uint32_t funcs_rva   = *reinterpret_cast<std::uint32_t*>(&image[export_rva + 28]);
+                    std::uint32_t names_rva   = *reinterpret_cast<std::uint32_t*>(&image[export_rva + 32]);
+                    std::uint32_t ords_rva    = *reinterpret_cast<std::uint32_t*>(&image[export_rva + 36]);
+                    (void)num_funcs;
+
+                    static const char* const entry_names[] = {
+                        "DriverEntry", "GsDriverEntry", "DllMain",
+                        "DllEntryPoint", "main", "wmain", "WinMain",
+                        "wWinMain", "_DllMainCRTStartup", "mainCRTStartup"
+                    };
+
+                    for (std::uint32_t j = 0; j < num_names && j < 10000; j++)
+                    {
+                        if (names_rva + (j + 1) * 4 > static_cast<std::uint32_t>(image.size())) break;
+                        std::uint32_t nrva = *reinterpret_cast<std::uint32_t*>(
+                            &image[names_rva + j * 4]);
+                        if (nrva == 0 || nrva >= static_cast<std::uint32_t>(image.size())) continue;
+
+                        const char* exp_name = reinterpret_cast<const char*>(&image[nrva]);
+                        bool matched = false;
+                        for (auto en : entry_names)
+                        {
+                            if (std::strcmp(exp_name, en) == 0) { matched = true; break; }
+                        }
+                        if (!matched) continue;
+
+                        if (ords_rva + (j + 1) * 2 > static_cast<std::uint32_t>(image.size())) break;
+                        std::uint16_t ordinal = *reinterpret_cast<std::uint16_t*>(
+                            &image[ords_rva + j * 2]);
+                        if (funcs_rva + (ordinal + 1) * 4 > static_cast<std::uint32_t>(image.size())) break;
+                        std::uint32_t frva = *reinterpret_cast<std::uint32_t*>(
+                            &image[funcs_rva + ordinal * 4]);
+
+                        if (frva > 0 && frva < static_cast<std::uint32_t>(image.size()))
+                        {
+                            *reinterpret_cast<std::uint32_t*>(&image[opt_off + 16]) = frva;
+                            result.fixed_ep_rva      = frva;
+                            result.entry_point_fixed = true;
+                            ep_ok = true;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+
+        if (!ep_ok && ep_rva > 0 && ep_rva < static_cast<std::uint32_t>(image.size()) &&
+            (image[ep_rva] == 0x00 || image[ep_rva] == 0xCC))
+        {
+
+
+            static const struct { const std::uint8_t bytes[8]; int len; } prologues[] = {
+                {{0x48, 0x89, 0x5C, 0x24},          4},
+                {{0x48, 0x83, 0xEC},                 3},
+                {{0x48, 0x8B, 0xC4},                 3},
+                {{0x4C, 0x8B, 0xDC},                 3},
+                {{0x48, 0x89, 0x4C, 0x24},           4},
+                {{0x40, 0x55},                       2},
+                {{0x40, 0x53},                       2},
+                {{0x55, 0x48, 0x8B, 0xEC},           4},
+                {{0x48, 0x81, 0xEC},                 3},
+                {{0x48, 0x8D, 0x6C, 0x24},           4},
+                {{0xE9},                             1},
+                {{0x55, 0x8B, 0xEC},                 3},
+            };
+
+            bool found_prologue = false;
+            for (int i = 0; i < num_sections && i < 96 && !found_prologue; i++)
+            {
+                std::uint32_t sec_off = section_table_off + i * 40;
+                if (sec_off + 40 > static_cast<std::uint32_t>(image.size())) break;
+
+                std::uint32_t va = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 12]);
+                std::uint32_t vs = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 8]);
+                std::uint32_t ch = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 36]);
+
+                if (!(ch & 0x20000000) || va == 0 || vs == 0) continue;
+
+                std::uint32_t scan_end = va + vs;
+                if (scan_end > static_cast<std::uint32_t>(image.size()))
+                    scan_end = static_cast<std::uint32_t>(image.size());
+
+                if (scan_end - va > 0x10000) scan_end = va + 0x10000;
+
+                for (std::uint32_t off = va; off + 8 < scan_end; off++)
+                {
+
+                    if (image[off] == 0x00 || image[off] == 0xCC) continue;
+
+                    for (const auto& p : prologues)
+                    {
+                        if (off + p.len > scan_end) continue;
+                        if (std::memcmp(&image[off], p.bytes, p.len) == 0)
+                        {
+                            *reinterpret_cast<std::uint32_t*>(&image[opt_off + 16]) = off;
+                            result.fixed_ep_rva      = off;
+                            result.entry_point_fixed = true;
+                            result.ep_prologue_scanned = true;
+                            ep_ok = true;
+                            found_prologue = true;
+                            break;
+                        }
+                    }
+                    if (found_prologue) break;
+                }
+            }
+
+
+            if (!found_prologue)
+            {
+                for (int i = 0; i < num_sections && i < 96; i++)
+                {
+                    std::uint32_t sec_off = section_table_off + i * 40;
+                    if (sec_off + 40 > static_cast<std::uint32_t>(image.size())) break;
+
+                    std::uint32_t va = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 12]);
+                    std::uint32_t ch = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 36]);
+
+                    if ((ch & 0x20000000) && va > 0 && va < static_cast<std::uint32_t>(image.size()) &&
+                        image[va] != 0x00)
+                    {
+                        *reinterpret_cast<std::uint32_t*>(&image[opt_off + 16]) = va;
+                        result.fixed_ep_rva      = va;
+                        result.entry_point_fixed = true;
+                        ep_ok = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        result.entry_point_valid = ep_ok;
+    }
+
+
+    {
+        std::uint32_t import_dir_off = dd_base + 1 * 8;
+        if (import_dir_off + 8 <= static_cast<std::uint32_t>(image.size()))
+        {
+            std::uint32_t import_rva  = *reinterpret_cast<std::uint32_t*>(&image[import_dir_off]);
+            std::uint32_t import_size = *reinterpret_cast<std::uint32_t*>(&image[import_dir_off + 4]);
+            (void)import_size;
+
+            if (import_rva != 0 && import_rva < static_cast<std::uint32_t>(image.size()))
+            {
+                std::uint32_t thunk_size = result.is_pe64 ? 8u : 4u;
+                std::uint64_t ordinal_flag = result.is_pe64
+                    ? 0x8000000000000000ULL : 0x80000000ULL;
+
+                for (std::uint32_t imp_idx = 0; imp_idx < 0x2000; imp_idx++)
+                {
+                    std::uint32_t desc_off = import_rva + imp_idx * 20;
+                    if (desc_off + 20 > static_cast<std::uint32_t>(image.size())) break;
+
+                    std::uint32_t int_rva  = *reinterpret_cast<std::uint32_t*>(&image[desc_off]);
+                    std::uint32_t name_rva = *reinterpret_cast<std::uint32_t*>(&image[desc_off + 12]);
+                    std::uint32_t iat_rva  = *reinterpret_cast<std::uint32_t*>(&image[desc_off + 16]);
+
+
+                    if (int_rva == 0 && name_rva == 0 && iat_rva == 0) break;
+                    if (iat_rva == 0) continue;
+
+
+                    if (name_rva > 0 && name_rva < static_cast<std::uint32_t>(image.size()))
+                    {
+                        std::string dll_name;
+                        for (std::uint32_t k = name_rva;
+                             k < static_cast<std::uint32_t>(image.size()) && image[k] != 0;
+                             k++)
+                        {
+                            if (dll_name.size() >= 260) break;
+                            dll_name += static_cast<char>(image[k]);
+                        }
+                        if (!dll_name.empty())
+                            result.import_dll_names.push_back(dll_name);
+                    }
+                    result.import_dlls_found++;
+
+
+                    *reinterpret_cast<std::uint32_t*>(&image[desc_off + 4]) = 0;
+
+                    *reinterpret_cast<std::uint32_t*>(&image[desc_off + 8]) = static_cast<std::uint32_t>(-1);
+
+
+                    if (int_rva == 0 || int_rva == iat_rva) continue;
+                    if (int_rva >= static_cast<std::uint32_t>(image.size()) ||
+                        iat_rva >= static_cast<std::uint32_t>(image.size())) continue;
+
+
+                    bool int_valid = true;
+                    int  thunk_count = 0;
+
+                    for (int t = 0; t < 0x10000; t++)
+                    {
+                        std::uint32_t ie = int_rva + t * thunk_size;
+                        if (ie + thunk_size > static_cast<std::uint32_t>(image.size()))
+                        { int_valid = false; break; }
+
+                        std::uint64_t tv = 0;
+                        if (result.is_pe64)
+                            tv = *reinterpret_cast<std::uint64_t*>(&image[ie]);
+                        else
+                            tv = *reinterpret_cast<std::uint32_t*>(&image[ie]);
+
+                        if (tv == 0) break;
+
+                        if (!(tv & ordinal_flag))
+                        {
+
+                            std::uint32_t nva = static_cast<std::uint32_t>(tv & 0x7FFFFFFF);
+                            if (nva == 0 || nva + 3 >= static_cast<std::uint32_t>(image.size()))
+                            { int_valid = false; break; }
+
+
+                            bool printable = false;
+                            for (int k = 2; k < 8 && nva + k < static_cast<std::uint32_t>(image.size()); k++)
+                            {
+                                char c = static_cast<char>(image[nva + k]);
+                                if (c == 0) { printable = (k > 2); break; }
+                                if (c >= 0x21 && c <= 0x7E) { printable = true; break; }
+                            }
+                            if (!printable) { int_valid = false; break; }
+                        }
+                        thunk_count++;
+                    }
+
+
+                    if (int_valid && thunk_count > 0)
+                    {
+                        for (int t = 0; t <= thunk_count; t++)
+                        {
+                            std::uint32_t src = int_rva + t * thunk_size;
+                            std::uint32_t dst = iat_rva + t * thunk_size;
+                            if (src + thunk_size > static_cast<std::uint32_t>(image.size()) ||
+                                dst + thunk_size > static_cast<std::uint32_t>(image.size()))
+                                break;
+                            std::memcpy(&image[dst], &image[src], thunk_size);
+                        }
+                        result.iat_entries_restored += thunk_count;
+                    }
+                }
+            }
+        }
+    }
+
+
+    {
+        std::uint32_t bound_off = dd_base + 11 * 8;
+        if (bound_off + 8 <= static_cast<std::uint32_t>(image.size()))
+        {
+            std::uint32_t brva = *reinterpret_cast<std::uint32_t*>(&image[bound_off]);
+            if (brva != 0)
+            {
+                *reinterpret_cast<std::uint32_t*>(&image[bound_off])     = 0;
+                *reinterpret_cast<std::uint32_t*>(&image[bound_off + 4]) = 0;
+            }
+        }
+    }
+
+
+    result.success = true;
+    return result;
+}
+
+
+static nlohmann::json pe_fix_to_json(const pe_fix_result_t& fix)
+{
+    auto fmt_rva = [](std::uint32_t v) -> std::string {
+        std::ostringstream ss;
+        ss << "0x" << std::hex << std::uppercase << v;
+        return ss.str();
+    };
+
+    auto fmt_addr = [](std::uint64_t v) -> std::string {
+        std::ostringstream ss;
+        ss << "0x" << std::hex << std::uppercase << v;
+        return ss.str();
+    };
+
+    nlohmann::json j;
+    j["pe_fixed"]              = fix.success;
+    j["sections_fixed"]        = fix.sections_fixed;
+    j["iat_entries_restored"]  = fix.iat_entries_restored;
+    j["import_dlls_found"]     = fix.import_dlls_found;
+    j["entry_point_valid"]     = fix.entry_point_valid;
+    j["entry_point_fixed"]     = fix.entry_point_fixed;
+    if (fix.ep_prologue_scanned)
+        j["ep_prologue_scanned"] = true;
+    j["original_ep_rva"]       = fmt_rva(fix.original_ep_rva);
+    j["fixed_ep_rva"]          = fmt_rva(fix.fixed_ep_rva);
+    j["security_dir_cleared"]  = fix.security_dir_cleared;
+    j["debug_dir_cleared"]     = fix.debug_dir_cleared;
+    j["checksum_cleared"]      = fix.checksum_cleared;
+    j["file_alignment_fixed"]  = fix.file_alignment_fixed;
+    j["reloc_dir_cleared"]     = fix.reloc_dir_cleared;
+    j["relocs_stripped"]       = fix.relocs_stripped_flag_set;
+    if (fix.reloc_section_zeroed)
+        j["reloc_section_zeroed"] = true;
+    if (fix.tls_dir_cleared)
+        j["tls_dir_cleared"]     = true;
+    if (fix.loadconfig_dir_cleared)
+        j["loadconfig_dir_cleared"] = true;
+    if (fix.delay_import_dir_cleared)
+        j["delay_import_dir_cleared"] = true;
+    if (fix.com_dir_cleared)
+        j["com_dir_cleared"]     = true;
+    if (fix.imagebase_updated)
+    {
+        j["imagebase_updated"]       = true;
+        j["original_imagebase"]      = fmt_addr(fix.original_imagebase);
+        j["updated_imagebase"]       = fmt_addr(fix.updated_imagebase);
+    }
+    if (!fix.import_dll_names.empty())
+        j["import_dlls"]       = fix.import_dll_names;
+    if (!fix.error.empty())
+        j["pe_fix_error"]      = fix.error;
+    return j;
+}
+
+
+struct module_range_t
+{
+    std::string name;
+    std::uint64_t base;
+    std::uint64_t size;
+};
+
+struct iat_rebuild_result_t
+{
+    bool success = false;
+    int imports_resolved = 0;
+    int imports_failed = 0;
+    int descriptors_rebuilt = 0;
+    bool section_added = false;
+    std::vector<std::string> resolved_dlls;
+    std::string error;
+};
+
+
+static std::vector<module_range_t> enumerate_ldr_modules_for_iat(
+    voyager::device_t* dev)
+{
+    std::vector<module_range_t> modules;
+
+    if (!dev || !dev->is_connected() || dev->get_process_id() == 0)
+        return modules;
+
+    voyager::device_t::peb_info peb{};
+    if (!dev->read_peb(peb) || peb.ldr_address == 0)
+        return modules;
+
+
+    std::uint64_t list_head = peb.ldr_address + 0x10;
+    std::uint64_t first_entry = dev->read<std::uint64_t>(list_head);
+
+    if (first_entry == 0 || first_entry == list_head)
+        return modules;
+
+    std::uint64_t current = first_entry;
+    int max_iter = 1024;
+
+    while (current != list_head && current != 0 && max_iter-- > 0)
+    {
+
+
+        module_range_t m;
+        m.base = dev->read<std::uint64_t>(current + 0x30);
+        m.size = static_cast<std::uint64_t>(dev->read<std::uint32_t>(current + 0x40));
+
+
+        std::uint16_t name_len = dev->read<std::uint16_t>(current + 0x58);
+        std::uint64_t name_ptr = dev->read<std::uint64_t>(current + 0x58 + 8);
+
+        if (name_len > 0 && name_len < 520 && name_ptr != 0)
+        {
+            std::vector<std::uint8_t> raw(name_len, 0);
+            dev->read_raw(name_ptr, raw.data(), name_len);
+            m.name.reserve(name_len / 2);
+            for (std::size_t i = 0; i + 1 < name_len; i += 2)
+            {
+                std::uint16_t wc = raw[i] | (static_cast<std::uint16_t>(raw[i + 1]) << 8);
+                if (wc == 0) break;
+                m.name += (wc < 128 && wc >= 32) ? static_cast<char>(wc) : '?';
+            }
+        }
+
+        if (m.base != 0 && m.size != 0 && !m.name.empty())
+            modules.push_back(m);
+
+        std::uint64_t next = dev->read<std::uint64_t>(current);
+        if (next == current) break;
+        current = next;
+    }
+
+    return modules;
+}
+
+
+static std::vector<module_range_t> enumerate_kernel_modules_for_iat()
+{
+    std::vector<module_range_t> modules;
+
+    struct km_entry_t
+    {
+        HANDLE   Section;
+        PVOID    MappedBase;
+        PVOID    ImageBase;
+        ULONG    ImageSize;
+        ULONG    Flags;
+        USHORT   LoadOrderIndex;
+        USHORT   InitOrderIndex;
+        USHORT   LoadCount;
+        USHORT   OffsetToFileName;
+        UCHAR    FullPathName[256];
+    };
+
+    struct km_info_t
+    {
+        ULONG       NumberOfModules;
+        km_entry_t  Modules[1];
+    };
+
+    typedef LONG(NTAPI* NtQSI_fn)(ULONG, PVOID, ULONG, PULONG);
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return modules;
+
+    auto pNtQSI = reinterpret_cast<NtQSI_fn>(
+        GetProcAddress(ntdll, "NtQuerySystemInformation"));
+    if (!pNtQSI) return modules;
+
+    constexpr ULONG SysModInfo = 11;
+    ULONG needed = 0;
+    pNtQSI(SysModInfo, nullptr, 0, &needed);
+    if (needed == 0) needed = 256 * 1024;
+    needed += 16384;
+
+    std::vector<std::uint8_t> buf(needed, 0);
+    LONG status = pNtQSI(SysModInfo, buf.data(),
+        static_cast<ULONG>(buf.size()), &needed);
+    if (status < 0) return modules;
+
+    auto* info = reinterpret_cast<km_info_t*>(buf.data());
+    modules.reserve(info->NumberOfModules);
+    for (ULONG i = 0; i < info->NumberOfModules; i++)
+    {
+        const auto& e = info->Modules[i];
+        module_range_t mr;
+        mr.name = std::string(reinterpret_cast<const char*>(
+            e.FullPathName + e.OffsetToFileName));
+        mr.base = reinterpret_cast<std::uintptr_t>(e.ImageBase);
+        mr.size = e.ImageSize;
+        modules.push_back(mr);
+    }
+
+    return modules;
+}
+
+
+static bool resolve_import_address(
+    voyager::device_t* dev,
+    const std::vector<module_range_t>& modules,
+    std::uint64_t resolved_addr,
+    bool is_kernel,
+    std::string& out_dll,
+    std::string& out_func,
+    std::uint16_t& out_hint,
+    bool& out_by_ordinal,
+    std::uint16_t& out_ordinal)
+{
+    out_dll.clear();
+    out_func.clear();
+    out_hint = 0;
+    out_ordinal = 0;
+    out_by_ordinal = false;
+
+
+    const module_range_t* target = nullptr;
+    for (const auto& m : modules)
+    {
+        if (resolved_addr >= m.base && resolved_addr < m.base + m.size)
+        {
+            target = &m;
+            break;
+        }
+    }
+    if (!target) return false;
+
+    out_dll = target->name;
+
+
+    std::uint8_t pe_hdr[0x1000];
+    std::size_t hdr_read = is_kernel
+        ? dev->read_kernel_raw(target->base, pe_hdr, sizeof(pe_hdr))
+        : dev->read_raw(target->base, pe_hdr, sizeof(pe_hdr));
+
+    if (hdr_read < 0x100 || pe_hdr[0] != 'M' || pe_hdr[1] != 'Z')
+        return false;
+
+    std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&pe_hdr[0x3C]);
+    if (pe_off + 0x18 >= hdr_read ||
+        pe_hdr[pe_off] != 'P' || pe_hdr[pe_off + 1] != 'E')
+        return false;
+
+    std::uint16_t opt_magic = *reinterpret_cast<std::uint16_t*>(&pe_hdr[pe_off + 0x18]);
+    bool pe64 = (opt_magic == 0x020B);
+
+    std::uint32_t dd_off = pe_off + 0x18 + (pe64 ? 112 : 96);
+    if (dd_off + 8 > hdr_read) return false;
+
+    std::uint32_t export_rva  = *reinterpret_cast<std::uint32_t*>(&pe_hdr[dd_off]);
+    if (export_rva == 0) return false;
+
+
+    std::uint8_t edir[40];
+    std::size_t er = is_kernel
+        ? dev->read_kernel_raw(target->base + export_rva, edir, 40)
+        : dev->read_raw(target->base + export_rva, edir, 40);
+    if (er < 40) return false;
+
+    std::uint32_t ordinal_base  = *reinterpret_cast<std::uint32_t*>(&edir[16]);
+    std::uint32_t num_functions = *reinterpret_cast<std::uint32_t*>(&edir[20]);
+    std::uint32_t num_names     = *reinterpret_cast<std::uint32_t*>(&edir[24]);
+    std::uint32_t funcs_rva     = *reinterpret_cast<std::uint32_t*>(&edir[28]);
+    std::uint32_t names_rva     = *reinterpret_cast<std::uint32_t*>(&edir[32]);
+    std::uint32_t ords_rva      = *reinterpret_cast<std::uint32_t*>(&edir[36]);
+
+    if (num_functions == 0 || num_functions > 200000) return false;
+
+
+    std::size_t ft_bytes = num_functions * 4;
+    if (ft_bytes > 0x200000) return false;
+    std::vector<std::uint32_t> func_rvas(num_functions);
+
+    std::size_t ft_read = is_kernel
+        ? dev->read_kernel_raw(target->base + funcs_rva, func_rvas.data(), ft_bytes)
+        : dev->read_raw(target->base + funcs_rva, func_rvas.data(), ft_bytes);
+    if (ft_read < ft_bytes) return false;
+
+
+    std::uint32_t target_rva = static_cast<std::uint32_t>(resolved_addr - target->base);
+    std::uint32_t found_idx = UINT32_MAX;
+
+    for (std::uint32_t i = 0; i < num_functions; i++)
+    {
+        if (func_rvas[i] == target_rva)
+        {
+            found_idx = i;
+            break;
+        }
+    }
+    if (found_idx == UINT32_MAX) return false;
+
+    out_ordinal = static_cast<std::uint16_t>(found_idx + ordinal_base);
+
+    if (num_names == 0)
+    {
+        out_by_ordinal = true;
+        return true;
+    }
+
+
+    std::vector<std::uint16_t> ordinals(num_names);
+    is_kernel
+        ? dev->read_kernel_raw(target->base + ords_rva, ordinals.data(), num_names * 2)
+        : dev->read_raw(target->base + ords_rva, ordinals.data(), num_names * 2);
+
+    for (std::uint32_t ni = 0; ni < num_names; ni++)
+    {
+        if (ordinals[ni] == found_idx)
+        {
+            std::uint32_t name_rva = 0;
+            is_kernel
+                ? dev->read_kernel_raw(target->base + names_rva + ni * 4, &name_rva, 4)
+                : dev->read_raw(target->base + names_rva + ni * 4, &name_rva, 4);
+
+            if (name_rva != 0)
+            {
+                char nbuf[300] = {};
+                is_kernel
+                    ? dev->read_kernel_raw(target->base + name_rva, nbuf, sizeof(nbuf) - 1)
+                    : dev->read_raw(target->base + name_rva, nbuf, sizeof(nbuf) - 1);
+
+                out_func = nbuf;
+                out_hint = static_cast<std::uint16_t>(ni);
+                return true;
+            }
+        }
+    }
+
+
+    out_by_ordinal = true;
+    return true;
+}
+
+
+static iat_rebuild_result_t reconstruct_iat_runtime(
+    std::vector<std::uint8_t>& image,
+    std::uint64_t module_base,
+    voyager::device_t* dev,
+    bool is_kernel)
+{
+    iat_rebuild_result_t result;
+
+    if (!dev || !dev->is_connected())
+    {
+        result.error = "Device not connected";
+        return result;
+    }
+
+    if (image.size() < 0x200)
+    {
+        result.error = "Image too small for PE";
+        return result;
+    }
+
+    if (image[0] != 'M' || image[1] != 'Z')
+    {
+        result.error = "Invalid MZ signature";
+        return result;
+    }
+
+    std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&image[0x3C]);
+    if (pe_off + 0x18 >= static_cast<std::uint32_t>(image.size()) ||
+        image[pe_off] != 'P' || image[pe_off + 1] != 'E')
+    {
+        result.error = "Invalid PE header";
+        return result;
+    }
+
+    std::uint16_t num_sections = *reinterpret_cast<std::uint16_t*>(&image[pe_off + 6]);
+    std::uint16_t opt_hdr_size = *reinterpret_cast<std::uint16_t*>(&image[pe_off + 20]);
+    std::uint32_t opt_off      = pe_off + 24;
+    std::uint16_t opt_magic    = *reinterpret_cast<std::uint16_t*>(&image[opt_off]);
+    bool is_pe64 = (opt_magic == 0x020B);
+
+    if (!is_pe64 && opt_magic != 0x010B)
+    {
+        result.error = "Unknown PE optional header magic";
+        return result;
+    }
+
+    std::uint32_t section_alignment = *reinterpret_cast<std::uint32_t*>(&image[opt_off + 32]);
+    if (section_alignment == 0) section_alignment = 0x1000;
+
+    std::uint32_t dd_base = is_pe64 ? (opt_off + 112) : (opt_off + 96);
+    std::uint32_t import_dir_off = dd_base + 1 * 8;
+    if (import_dir_off + 8 > static_cast<std::uint32_t>(image.size()))
+    {
+        result.success = true;
+        return result;
+    }
+
+    std::uint32_t import_rva = *reinterpret_cast<std::uint32_t*>(&image[import_dir_off]);
+    if (import_rva == 0 || import_rva >= static_cast<std::uint32_t>(image.size()))
+    {
+        result.success = true;
+        return result;
+    }
+
+    std::uint32_t thunk_size = is_pe64 ? 8u : 4u;
+    std::uint64_t ordinal_flag = is_pe64 ? 0x8000000000000000ULL : 0x80000000ULL;
+
+
+    std::vector<module_range_t> modules;
+    if (is_kernel)
+        modules = enumerate_kernel_modules_for_iat();
+    else
+        modules = enumerate_ldr_modules_for_iat(dev);
+
+    if (modules.empty())
+    {
+        result.error = "No modules found for IAT resolution";
+        return result;
+    }
+
+
+    struct thunk_info_t
+    {
+        std::uint64_t resolved_addr;
+        std::string   func_name;
+        std::uint16_t hint;
+        std::uint16_t ordinal;
+        bool by_ordinal;
+        bool needs_fix;
+        bool is_null;
+    };
+
+    struct descriptor_info_t
+    {
+        std::uint32_t desc_off;
+        std::uint32_t iat_rva;
+        std::string   dll_name;
+        std::vector<thunk_info_t> thunks;
+        bool needs_rebuild;
+    };
+
+    std::vector<descriptor_info_t> descriptors;
+
+    for (std::uint32_t di = 0; di < 0x2000; di++)
+    {
+        std::uint32_t desc_off = import_rva + di * 20;
+        if (desc_off + 20 > static_cast<std::uint32_t>(image.size())) break;
+
+        std::uint32_t int_rva  = *reinterpret_cast<std::uint32_t*>(&image[desc_off]);
+        std::uint32_t name_rva = *reinterpret_cast<std::uint32_t*>(&image[desc_off + 12]);
+        std::uint32_t iat_rva  = *reinterpret_cast<std::uint32_t*>(&image[desc_off + 16]);
+
+        if (int_rva == 0 && name_rva == 0 && iat_rva == 0) break;
+        if (iat_rva == 0) continue;
+
+
+        std::string dll_name;
+        if (name_rva > 0 && name_rva < static_cast<std::uint32_t>(image.size()))
+        {
+            for (std::uint32_t k = name_rva;
+                 k < static_cast<std::uint32_t>(image.size()) && image[k] != 0;
+                 k++)
+            {
+                if (dll_name.size() >= 260) break;
+                dll_name += static_cast<char>(image[k]);
+            }
+        }
+
+        descriptor_info_t di_info;
+        di_info.desc_off = desc_off;
+        di_info.iat_rva  = iat_rva;
+        di_info.dll_name = dll_name;
+        di_info.needs_rebuild = false;
+
+        for (int ti = 0; ti < 0x10000; ti++)
+        {
+            std::uint32_t iat_off = iat_rva + ti * thunk_size;
+            if (iat_off + thunk_size > static_cast<std::uint32_t>(image.size())) break;
+
+            std::uint64_t thunk_val = 0;
+            if (is_pe64)
+                thunk_val = *reinterpret_cast<std::uint64_t*>(&image[iat_off]);
+            else
+                thunk_val = *reinterpret_cast<std::uint32_t*>(&image[iat_off]);
+
+            thunk_info_t ti_info;
+            ti_info.resolved_addr = 0;
+            ti_info.hint = 0;
+            ti_info.ordinal = 0;
+            ti_info.by_ordinal = false;
+            ti_info.needs_fix = false;
+            ti_info.is_null = false;
+
+            if (thunk_val == 0)
+            {
+                ti_info.is_null = true;
+                di_info.thunks.push_back(ti_info);
+                break;
+            }
+
+
+            if (thunk_val & ordinal_flag)
+            {
+                di_info.thunks.push_back(ti_info);
+                continue;
+            }
+
+
+            bool already_valid = false;
+            if (thunk_val < static_cast<std::uint64_t>(image.size()) &&
+                thunk_val + 3 < static_cast<std::uint64_t>(image.size()))
+            {
+                char c = static_cast<char>(image[static_cast<std::size_t>(thunk_val) + 2]);
+                if (c >= 0x21 && c <= 0x7E)
+                    already_valid = true;
+            }
+
+            if (already_valid)
+            {
+                di_info.thunks.push_back(ti_info);
+                continue;
+            }
+
+
+            std::uint64_t live_addr = 0;
+            if (is_kernel)
+                dev->read_kernel_raw(module_base + iat_off, &live_addr, thunk_size);
+            else
+                dev->read_raw(module_base + iat_off, &live_addr, thunk_size);
+
+            if (!is_pe64)
+                live_addr &= 0xFFFFFFFF;
+
+
+            if (live_addr == 0)
+                live_addr = thunk_val;
+
+            ti_info.resolved_addr = live_addr;
+            ti_info.needs_fix = true;
+            di_info.needs_rebuild = true;
+
+
+            std::string mod, func;
+            std::uint16_t hint = 0, ordinal = 0;
+            bool by_ord = false;
+
+            if (live_addr != 0 &&
+                resolve_import_address(dev, modules, live_addr, is_kernel,
+                                       mod, func, hint, by_ord, ordinal))
+            {
+                ti_info.func_name  = func;
+                ti_info.hint       = hint;
+                ti_info.ordinal    = ordinal;
+                ti_info.by_ordinal = by_ord;
+                result.imports_resolved++;
+            }
+            else
+            {
+                result.imports_failed++;
+            }
+
+            di_info.thunks.push_back(ti_info);
+        }
+
+        if (di_info.needs_rebuild)
+            descriptors.push_back(di_info);
+    }
+
+    if (descriptors.empty())
+    {
+        result.success = true;
+        return result;
+    }
+
+
+    std::uint32_t original_image_size = static_cast<std::uint32_t>(image.size());
+    std::uint32_t new_section_rva =
+        (original_image_size + section_alignment - 1) & ~(section_alignment - 1);
+
+
+    std::size_t names_total = 0;
+    for (const auto& desc : descriptors)
+    {
+        for (const auto& tk : desc.thunks)
+        {
+            if (tk.needs_fix && !tk.func_name.empty() && !tk.by_ordinal)
+            {
+                std::size_t entry = 2 + tk.func_name.size() + 1;
+                if (entry & 1) entry++;
+                names_total += entry;
+            }
+        }
+    }
+
+    std::size_t int_total = 0;
+    for (const auto& desc : descriptors)
+        int_total += (desc.thunks.size() + 1) * thunk_size;
+
+    std::size_t new_data_raw = names_total + int_total;
+    std::uint32_t new_section_vsize =
+        (static_cast<std::uint32_t>(new_data_raw) + section_alignment - 1) & ~(section_alignment - 1);
+
+    if (new_section_vsize == 0)
+        new_section_vsize = section_alignment;
+
+
+    image.resize(new_section_rva + new_section_vsize, 0);
+
+
+    std::uint32_t sec_table_off = pe_off + 24 + opt_hdr_size;
+    std::uint32_t new_sec_off   = sec_table_off + num_sections * 40;
+
+    if (new_sec_off + 40 <= new_section_rva && new_sec_off + 40 <= static_cast<std::uint32_t>(image.size()))
+    {
+        std::memset(&image[new_sec_off], 0, 40);
+        std::memcpy(&image[new_sec_off], ".aidat\0\0", 8);
+        *reinterpret_cast<std::uint32_t*>(&image[new_sec_off + 8])  = new_section_vsize;
+        *reinterpret_cast<std::uint32_t*>(&image[new_sec_off + 12]) = new_section_rva;
+        *reinterpret_cast<std::uint32_t*>(&image[new_sec_off + 16]) = new_section_vsize;
+        *reinterpret_cast<std::uint32_t*>(&image[new_sec_off + 20]) = new_section_rva;
+        *reinterpret_cast<std::uint32_t*>(&image[new_sec_off + 36]) = 0xC0000040;
+
+        *reinterpret_cast<std::uint16_t*>(&image[pe_off + 6]) =
+            static_cast<std::uint16_t>(num_sections + 1);
+        result.section_added = true;
+    }
+
+
+    *reinterpret_cast<std::uint32_t*>(&image[opt_off + 56]) = new_section_rva + new_section_vsize;
+
+
+    struct name_loc_t { std::uint32_t rva; int desc_idx; int thunk_idx; };
+    std::vector<name_loc_t> name_locs;
+
+    std::uint32_t cursor = new_section_rva;
+
+    for (int d = 0; d < static_cast<int>(descriptors.size()); d++)
+    {
+        for (int t = 0; t < static_cast<int>(descriptors[d].thunks.size()); t++)
+        {
+            const auto& tk = descriptors[d].thunks[t];
+            if (!tk.needs_fix || tk.func_name.empty() || tk.by_ordinal)
+                continue;
+
+            std::uint32_t entry_rva = cursor;
+
+
+            *reinterpret_cast<std::uint16_t*>(&image[cursor]) = tk.hint;
+            cursor += 2;
+
+
+            std::memcpy(&image[cursor], tk.func_name.c_str(), tk.func_name.size());
+            cursor += static_cast<std::uint32_t>(tk.func_name.size());
+            image[cursor++] = 0;
+
+
+            if (cursor & 1) cursor++;
+
+            name_locs.push_back({entry_rva, d, t});
+        }
+    }
+
+
+    for (int d = 0; d < static_cast<int>(descriptors.size()); d++)
+    {
+        auto& desc = descriptors[d];
+        std::uint32_t new_int_rva = cursor;
+
+
+        if (desc.desc_off + 20 <= static_cast<std::uint32_t>(image.size()))
+            *reinterpret_cast<std::uint32_t*>(&image[desc.desc_off]) = new_int_rva;
+
+        for (int t = 0; t < static_cast<int>(desc.thunks.size()); t++)
+        {
+            const auto& tk = desc.thunks[t];
+            std::uint64_t new_val = 0;
+
+            if (tk.is_null)
+            {
+                new_val = 0;
+            }
+            else if (!tk.needs_fix)
+            {
+
+                std::uint32_t iat_off = desc.iat_rva + t * thunk_size;
+                if (iat_off + thunk_size <= static_cast<std::uint32_t>(image.size()))
+                {
+                    if (is_pe64)
+                        new_val = *reinterpret_cast<std::uint64_t*>(&image[iat_off]);
+                    else
+                        new_val = *reinterpret_cast<std::uint32_t*>(&image[iat_off]);
+                }
+            }
+            else if (tk.by_ordinal)
+            {
+                new_val = ordinal_flag | tk.ordinal;
+            }
+            else if (!tk.func_name.empty())
+            {
+
+                for (const auto& nl : name_locs)
+                {
+                    if (nl.desc_idx == d && nl.thunk_idx == t)
+                    {
+                        new_val = nl.rva;
+                        break;
+                    }
+                }
+            }
+
+
+            if (cursor + thunk_size <= static_cast<std::uint32_t>(image.size()))
+            {
+                if (is_pe64)
+                    *reinterpret_cast<std::uint64_t*>(&image[cursor]) = new_val;
+                else
+                    *reinterpret_cast<std::uint32_t*>(&image[cursor]) =
+                        static_cast<std::uint32_t>(new_val);
+            }
+            cursor += thunk_size;
+
+
+            if (tk.needs_fix || tk.is_null)
+            {
+                std::uint32_t iat_off = desc.iat_rva + t * thunk_size;
+                if (iat_off + thunk_size <= static_cast<std::uint32_t>(image.size()))
+                {
+                    if (is_pe64)
+                        *reinterpret_cast<std::uint64_t*>(&image[iat_off]) = new_val;
+                    else
+                        *reinterpret_cast<std::uint32_t*>(&image[iat_off]) =
+                            static_cast<std::uint32_t>(new_val);
+                }
+            }
+        }
+
+
+        if (cursor + thunk_size <= static_cast<std::uint32_t>(image.size()))
+        {
+            if (is_pe64)
+                *reinterpret_cast<std::uint64_t*>(&image[cursor]) = 0;
+            else
+                *reinterpret_cast<std::uint32_t*>(&image[cursor]) = 0;
+        }
+        cursor += thunk_size;
+
+        result.descriptors_rebuilt++;
+        if (!desc.dll_name.empty())
+        {
+            bool already = false;
+            for (const auto& rd : result.resolved_dlls)
+                if (rd == desc.dll_name) { already = true; break; }
+            if (!already)
+                result.resolved_dlls.push_back(desc.dll_name);
+        }
+    }
+
+
+    for (std::uint32_t di = 0; di < 0x2000; di++)
+    {
+        std::uint32_t desc_off = import_rva + di * 20;
+        if (desc_off + 20 > static_cast<std::uint32_t>(image.size())) break;
+        std::uint32_t v0 = *reinterpret_cast<std::uint32_t*>(&image[desc_off]);
+        std::uint32_t v3 = *reinterpret_cast<std::uint32_t*>(&image[desc_off + 12]);
+        std::uint32_t v4 = *reinterpret_cast<std::uint32_t*>(&image[desc_off + 16]);
+        if (v0 == 0 && v3 == 0 && v4 == 0) break;
+        *reinterpret_cast<std::uint32_t*>(&image[desc_off + 4]) = 0;
+        *reinterpret_cast<std::uint32_t*>(&image[desc_off + 8]) = static_cast<std::uint32_t>(-1);
+    }
+
+    result.success = true;
+    return result;
+}
+
+
+static nlohmann::json iat_rebuild_to_json(const iat_rebuild_result_t& r)
+{
+    nlohmann::json j;
+    j["iat_runtime_rebuild"]  = r.success;
+    j["imports_resolved"]     = r.imports_resolved;
+    j["imports_failed"]       = r.imports_failed;
+    j["descriptors_rebuilt"]  = r.descriptors_rebuilt;
+    j["section_added"]        = r.section_added;
+    if (!r.resolved_dlls.empty())
+        j["resolved_import_dlls"] = r.resolved_dlls;
+    if (!r.error.empty())
+        j["iat_rebuild_error"]    = r.error;
+    return j;
+}
+
 
 namespace helpers
 {
@@ -8773,8 +10178,37 @@ tool_result_t driver_write_memory(const json& params)
 
 tool_result_t driver_dump_module(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+    json steps = json::array();
+    auto log = [&](const std::string& step, bool ok, const std::string& detail = "") {
+        steps.push_back({{"step", step}, {"ok", ok}, {"detail", detail}});
+    };
+
+    if (!device->is_connected())
+    {
+        bool ok = device->connect();
+        log("connect_driver", ok, ok ? "Connected to kernel driver" : "Failed");
+        if (!ok)
+            return tool_result_t::error(OBFSTR("Failed to connect to kernel driver. Is the driver loaded?"));
+    }
+    else
+        log("connect_driver", true, "Already connected");
+
+    if (params.contains("process"))
+    {
+        std::string process_name = params["process"].get<std::string>();
+        std::uint32_t pid = device->find_process(process_name.c_str());
+        log("find_process", pid != 0, "PID: " + (pid ? std::to_string(pid) : "not found"));
+        if (pid == 0)
+            return tool_result_t::error(OBFSTR("Process not found: ") + process_name);
+    }
+
+    if (device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("No process attached. Provide 'process' param or call driver_attach first."));
+
+    if (device->get_dtb() == 0)
+        device->solve_dtb();
+    std::uint64_t dtb = device->get_dtb();
+    log("solve_dtb", dtb != 0, helpers::format_address(dtb));
 
     ea_t base = BADADDR;
     if (params.contains("address"))
@@ -8783,48 +10217,75 @@ tool_result_t driver_dump_module(const json& params)
         if (a) base = *a;
     }
     if (base == BADADDR || base == 0)
-        base = static_cast<ea_t>(device->get_base_address());
+    {
+        std::uint64_t img_base = device->find_image();
+        if (img_base == 0) img_base = device->get_base_address();
+        base = static_cast<ea_t>(img_base);
+    }
     if (base == 0 || base == BADADDR)
         return tool_result_t::error(OBFSTR("Invalid module base. Provide 'address' or attach to a process first."));
+    log("find_image_base", true, helpers::format_address(base));
 
     std::uint8_t pe_hdr[0x1000];
     std::size_t hdr_read = device->read_raw(base, pe_hdr, sizeof(pe_hdr));
-    if (hdr_read < 0x200)
-        return tool_result_t::error(OBFSTR("Failed to read PE header at ") + helpers::format_address(base));
+    log("read_pe_header", hdr_read > 0x200, std::to_string(hdr_read) + " bytes");
+    if (hdr_read < 0x200 || *(std::uint16_t*)pe_hdr != 0x5A4D)
+        return tool_result_t::error(OBFSTR("Failed to read valid PE header at ") + helpers::format_address(base));
+
+    std::uint32_t pe_off = *(std::uint32_t*)(pe_hdr + 0x3C);
+    if (pe_off + 0x100 > sizeof(pe_hdr) || *(std::uint32_t*)(pe_hdr + pe_off) != 0x00004550)
+        return tool_result_t::error(OBFSTR("Invalid PE signature at ") + helpers::format_address(base));
+
+    std::uint16_t opt_magic      = *(std::uint16_t*)(pe_hdr + pe_off + 0x18);
+    std::uint16_t sections_count = *(std::uint16_t*)(pe_hdr + pe_off + 0x06);
+    std::uint16_t opt_size       = *(std::uint16_t*)(pe_hdr + pe_off + 0x14);
+    std::uint32_t sec_table_off  = pe_off + 0x18 + opt_size;
 
     std::size_t module_size = 0;
-    std::string module_name = "module";
-    if (*(std::uint16_t*)pe_hdr == 0x5A4D)
-    {
-        std::uint32_t pe_off = *(std::uint32_t*)(pe_hdr + 0x3C);
-        if (pe_off + 0x58 < sizeof(pe_hdr) && *(std::uint32_t*)(pe_hdr + pe_off) == 0x00004550)
-        {
-            std::uint16_t opt_magic = *(std::uint16_t*)(pe_hdr + pe_off + 0x18);
-            if (opt_magic == 0x020B || opt_magic == 0x010B)
-                module_size = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x38);
-        }
-    }
+    if (opt_magic == 0x020B || opt_magic == 0x010B)
+        module_size = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x38);
     if (module_size == 0)
-        module_size = params.value("size", (std::size_t)0x200000);
+        module_size = params.value("size", (std::size_t)0x2000000);
     if (module_size > 0x10000000)
         return tool_result_t::error(OBFSTR("Module size too large (>256MB): ") + std::to_string(module_size));
 
     std::vector<std::uint8_t> module_data(module_size, 0);
-
     const std::size_t chunk = 0x10000;
     std::size_t total_read = 0;
+    std::string module_name = params.value("process", std::string("module"));
 
-    show_wait_box("HIDECANCEL\nAiDA: Dumping module via kernel (0 / 0x%zX)...", module_size);
+    show_wait_box("HIDECANCEL\nAiDA: Dumping %s via kernel (0x%zX bytes)...", module_name.c_str(), module_size);
     for (std::size_t off = 0; off < module_size; off += chunk)
     {
-        if (off % 0x40000 == 0)
-            replace_wait_box("HIDECANCEL\nAiDA: Kernel dump 0x%zX / 0x%zX (%.1f%%)...",
-                             off, module_size, (off * 100.0) / module_size);
+        if (off % 0x100000 == 0)
+            replace_wait_box("HIDECANCEL\nAiDA: Dumping %s (0x%zX / 0x%zX, %.1f%%)...",
+                             module_name.c_str(), off, module_size, (off * 100.0) / module_size);
         std::size_t to_read = std::min(chunk, module_size - off);
         total_read += device->read_raw(base + off, module_data.data() + off, to_read);
     }
     hide_wait_box();
+    log("dump_image", total_read > 0, std::to_string(total_read) + "/" + std::to_string(module_size) + " bytes");
 
+    pe_fix_result_t pe_fix = fix_dumped_pe_image(module_data, base);
+    if (pe_fix.success)
+    {
+        msg(OBFSTR_C("AiDA: PE fixed — %d sections, %d IAT entries restored, EP %s\n"),
+            pe_fix.sections_fixed, pe_fix.iat_entries_restored,
+            pe_fix.entry_point_valid ? "valid" : "fallback");
+        log("pe_fix", true, std::to_string(pe_fix.sections_fixed) + " sections, " +
+            std::to_string(pe_fix.iat_entries_restored) + " IAT entries restored");
+    }
+
+    iat_rebuild_result_t iat_rebuild = reconstruct_iat_runtime(module_data, base, device.get(), false);
+    if (iat_rebuild.success && iat_rebuild.descriptors_rebuilt > 0)
+    {
+        msg(OBFSTR_C("AiDA: Runtime IAT reconstruction — %d imports resolved, %d failed, %d descriptors rebuilt\n"),
+            iat_rebuild.imports_resolved, iat_rebuild.imports_failed, iat_rebuild.descriptors_rebuilt);
+        log("iat_rebuild", true, std::to_string(iat_rebuild.imports_resolved) + " imports resolved, " +
+            std::to_string(iat_rebuild.descriptors_rebuilt) + " descriptors rebuilt");
+    }
+    else if (!iat_rebuild.error.empty())
+        msg(OBFSTR_C("AiDA: IAT rebuild note: %s\n"), iat_rebuild.error.c_str());
 
     std::string output_path = params.value("output_path", std::string());
     if (output_path.empty())
@@ -8832,8 +10293,6 @@ tool_result_t driver_dump_module(const json& params)
         output_path = get_downloads_folder() + "dumped_" + module_name + "_" +
                       helpers::format_address(base) + ".bin";
     }
-
-
     ensure_parent_dir_exists(output_path);
     {
         HANDLE hFile = CreateFileA(output_path.c_str(), GENERIC_WRITE, 0, nullptr,
@@ -8846,55 +10305,119 @@ tool_result_t driver_dump_module(const json& params)
             msg(OBFSTR_C("AiDA: Dump saved to %s (%zu bytes)\n"), output_path.c_str(), module_size);
         }
         else
-        {
             msg(OBFSTR_C("AiDA: WARNING - Failed to save dump file: %s (error %lu)\n"),
                 output_path.c_str(), GetLastError());
-        }
     }
+    log("save_to_disk", true, output_path);
 
-    if (params.value("patch_idb", true))
+    bool patch_idb = params.value("patch_idb", true);
+    std::size_t patched = 0;
+    int segs_created = 0;
+    json segs_info = json::array();
+
+    if (patch_idb)
     {
+        show_wait_box("HIDECANCEL\nAiDA: Creating IDB segments and patching bytes...");
 
-
-        show_wait_box("HIDECANCEL\nAiDA: Patching IDA database (bulk)...");
-
-
-        int seg_count = get_segm_qty();
-        for (int si = 0; si < seg_count; ++si)
+        for (int si = 0; si < sections_count && si < 96; si++)
         {
-            segment_t* seg = getnseg(si);
-            if (!seg) continue;
-            if (seg->start_ea >= base + module_size || seg->end_ea <= base) continue;
+            std::uint32_t soff = sec_table_off + si * 40;
+            std::uint8_t sec[40] = {0};
 
-            ea_t patch_start = std::max(seg->start_ea, base);
-            ea_t patch_end   = std::min(seg->end_ea, base + static_cast<ea_t>(module_size));
-            std::size_t offset = static_cast<std::size_t>(patch_start - base);
-            std::size_t length = static_cast<std::size_t>(patch_end - patch_start);
+            if (soff + 40 <= sizeof(pe_hdr))
+                memcpy(sec, pe_hdr + soff, 40);
+            else if (device->read_raw(base + soff, sec, sizeof(sec)) < sizeof(sec))
+                break;
 
-            if (offset < module_size && length > 0)
-                put_bytes(patch_start, module_data.data() + offset, length);
+            char name[9] = {0};
+            memcpy(name, sec, 8);
+            std::uint32_t vsize = *(std::uint32_t*)(sec + 8);
+            std::uint32_t vrva  = *(std::uint32_t*)(sec + 12);
+            std::uint32_t chars = *(std::uint32_t*)(sec + 36);
+            if (vsize == 0 || vrva == 0) continue;
+
+            ea_t sec_start = base + vrva;
+            ea_t sec_end   = sec_start + vsize;
+
+            uchar perm = 0;
+            if (chars & 0x40000000) perm |= SEGPERM_READ;
+            if (chars & 0x80000000) perm |= SEGPERM_WRITE;
+            if (chars & 0x20000000) perm |= SEGPERM_EXEC;
+
+            if (!getseg(sec_start))
+            {
+                segment_t new_seg;
+                new_seg.start_ea = sec_start;
+                new_seg.end_ea   = sec_end;
+                new_seg.type     = (perm & SEGPERM_EXEC) ? SEG_CODE : SEG_DATA;
+                new_seg.bitness  = (opt_magic == 0x020B) ? 2 : 1;
+                new_seg.perm     = perm;
+                new_seg.align    = saRelByte;
+                new_seg.comb     = scPub;
+                const char* sclass = (perm & SEGPERM_EXEC) ? "CODE" : "DATA";
+                if (add_segm_ex(&new_seg, name, sclass, ADDSEG_QUIET | ADDSEG_NOSREG))
+                {
+                    segment_t* seg = getseg(sec_start);
+                    if (seg) { seg->perm = perm; seg->update(); }
+                    segs_created++;
+                    segs_info.push_back({{"name", std::string(name)},
+                                         {"start", helpers::format_address(sec_start)},
+                                         {"size", vsize}});
+                }
+            }
+
+            if (vrva < module_size && vsize > 0)
+            {
+                std::uint32_t copy_len = vsize;
+                if (vrva + copy_len > module_size)
+                    copy_len = static_cast<std::uint32_t>(module_size - vrva);
+                if (copy_len > 0 && is_mapped(sec_start))
+                {
+                    put_bytes(sec_start, module_data.data() + vrva, copy_len);
+                    patched += copy_len;
+                }
+            }
         }
 
         hide_wait_box();
+        log("patch_idb", patched > 0, std::to_string(patched) + " bytes patched, " +
+            std::to_string(segs_created) + " segments created");
     }
 
+    bool hb = device->send_heartbeat();
+    log("heartbeat", hb, hb ? "Session maintained" : "Failed (non-fatal)");
+
     json result;
-    result["base"]          = helpers::format_address(base);
-    result["size"]          = module_size;
-    result["bytes_read"]    = total_read;
-    result["coverage_pct"]  = module_size ? (int)((total_read * 100) / module_size) : 0;
-    result["saved_to"]      = output_path;
-    if (params.value("patch_idb", true))
-        result["patched_idb"] = true;
+    result["base"]            = helpers::format_address(base);
+    result["image_size"]      = module_size;
+    result["bytes_dumped"]    = total_read;
+    result["coverage_pct"]    = module_size ? (int)((total_read * 100) / module_size) : 0;
+    result["saved_to"]        = output_path;
     result["can_load_in_ida"] = true;
-    result["note"]          = OBFSTR(
-        "Dump file saved to: ") + output_path + OBFSTR(". "
-        "For best static analysis results, open this file in a NEW IDA Pro instance: "
-        "File > Open > select the dumped file. Use manual load with image base ") +
-        helpers::format_address(base) + OBFSTR(".");
+    result["steps"]           = steps;
+    if (patch_idb)
+    {
+        result["patched_idb"]      = true;
+        result["bytes_patched"]    = patched;
+        result["sections_created"] = segs_created;
+        if (!segs_info.empty())
+            result["segments"] = segs_info;
+    }
+    if (pe_fix.success)
+        result["pe_fix"] = pe_fix_to_json(pe_fix);
+    if (iat_rebuild.success && iat_rebuild.descriptors_rebuilt > 0)
+        result["iat_rebuild"] = iat_rebuild_to_json(iat_rebuild);
+    result["note"] = OBFSTR(
+        "IMPORTANT: The dump file has been saved to: ") + output_path + OBFSTR(". "
+        "To get full and correct analysis you MUST open this file in a NEW IDA Pro instance: "
+        "File -> Open -> select the dumped .bin file -> enable 'Manual load' -> "
+        "set the image base to ") + helpers::format_address(base) + OBFSTR(". "
+        "IDA's built-in loader/autoanalysis will handle code creation, function detection, "
+        "FLIRT signatures, and type library application automatically.");
 
     return tool_result_t::ok(OBFSTR("Module dumped: ") + std::to_string(total_read) + "/" +
-                             std::to_string(module_size) + " bytes -> " + output_path, result);
+                             std::to_string(module_size) + " bytes -> " + output_path +
+                             OBFSTR(". Open this file in a NEW IDA Pro instance for proper analysis."), result);
 }
 
 tool_result_t driver_scan_pattern(const json& params)
@@ -9145,276 +10668,6 @@ tool_result_t driver_enumerate_modules(const json&)
     return tool_result_t::ok(OBFSTR("Enumerated ") + std::to_string(modules.size()) + " modules", result);
 }
 
-
-
-
-tool_result_t driver_dump_to_idb(const json& params)
-{
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
-
-    ea_t base = BADADDR;
-    if (params.contains("address"))
-    {
-        auto a = helpers::parse_address(params["address"].get<std::string>());
-        if (a) base = *a;
-    }
-    if (base == BADADDR || base == 0)
-        base = static_cast<ea_t>(device->get_base_address());
-    if (base == 0 || base == BADADDR)
-        return tool_result_t::error(OBFSTR("Invalid base address"));
-
-    std::uint8_t pe_hdr[0x1000];
-    if (device->read_raw(base, pe_hdr, sizeof(pe_hdr)) < 0x200 || *(std::uint16_t*)pe_hdr != 0x5A4D)
-        return tool_result_t::error(OBFSTR("Not a PE image at ") + helpers::format_address(base));
-
-    std::uint32_t pe_off = *(std::uint32_t*)(pe_hdr + 0x3C);
-    if (pe_off + 0x100 > sizeof(pe_hdr))
-        return tool_result_t::error(OBFSTR("PE header offset out of range"));
-
-    std::uint16_t sections_count = *(std::uint16_t*)(pe_hdr + pe_off + 0x06);
-    std::uint16_t opt_size       = *(std::uint16_t*)(pe_hdr + pe_off + 0x14);
-    std::uint32_t sec_table_off  = pe_off + 0x18 + opt_size;
-    std::uint16_t opt_magic      = *(std::uint16_t*)(pe_hdr + pe_off + 0x18);
-    std::uint32_t image_size     = 0;
-    if (opt_magic == 0x020B || opt_magic == 0x010B)
-        image_size = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x38);
-    if (image_size == 0) image_size = 0x1000000;
-
-    int segs_created = 0;
-    json segs_info = json::array();
-
-    for (int si = 0; si < sections_count && si < 96; si++)
-    {
-        std::uint32_t soff = sec_table_off + si * 40;
-        std::uint8_t sec[40] = {0};
-
-        if (soff + 40 <= sizeof(pe_hdr))
-            memcpy(sec, pe_hdr + soff, 40);
-        else if (device->read_raw(base + soff, sec, sizeof(sec)) < sizeof(sec))
-            break;
-
-        char name[9] = {0};
-        memcpy(name, sec, 8);
-        std::uint32_t vsize  = *(std::uint32_t*)(sec + 8);
-        std::uint32_t vrva   = *(std::uint32_t*)(sec + 12);
-        std::uint32_t chars  = *(std::uint32_t*)(sec + 36);
-        if (vsize == 0 || vrva == 0) continue;
-
-        ea_t sec_start = base + vrva;
-        ea_t sec_end   = sec_start + vsize;
-
-        uchar perm = 0;
-        if (chars & 0x40000000) perm |= SEGPERM_READ;
-        if (chars & 0x80000000) perm |= SEGPERM_WRITE;
-        if (chars & 0x20000000) perm |= SEGPERM_EXEC;
-
-        bool created = false;
-        if (!getseg(sec_start))
-        {
-
-
-            segment_t new_seg;
-            new_seg.start_ea = sec_start;
-            new_seg.end_ea   = sec_end;
-            new_seg.type     = (perm & SEGPERM_EXEC) ? SEG_CODE : SEG_DATA;
-            new_seg.bitness  = (opt_magic == 0x020B) ? 2 : 1;
-            new_seg.perm     = perm;
-            new_seg.align    = saRelByte;
-            new_seg.comb     = scPub;
-            const char* sclass = (perm & SEGPERM_EXEC) ? "CODE" : "DATA";
-            if (add_segm_ex(&new_seg, name, sclass, ADDSEG_QUIET | ADDSEG_NOSREG))
-            {
-                segment_t* seg = getseg(sec_start);
-                if (seg) { seg->perm = perm; seg->update(); }
-                segs_created++;
-                created = true;
-                segs_info.push_back({{"name", std::string(name)},
-                                     {"start", helpers::format_address(sec_start)},
-                                     {"size", vsize}});
-            }
-        }
-
-
-        std::vector<std::uint8_t> sec_bytes(vsize, 0);
-        std::size_t got = device->read_raw(sec_start, sec_bytes.data(), vsize);
-        if (got > 0)
-            put_bytes(sec_start, sec_bytes.data(), std::min(got, static_cast<std::size_t>(vsize)));
-    }
-
-    std::vector<std::uint8_t> full_image(image_size, 0);
-    device->read_raw(base, full_image.data(), image_size);
-
-
-    std::string output_path = get_downloads_folder() + "dumped_module_" +
-                              helpers::format_address(base) + ".bin";
-    ensure_parent_dir_exists(output_path);
-    {
-        HANDLE hFile = CreateFileA(output_path.c_str(), GENERIC_WRITE, 0, nullptr,
-                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile != INVALID_HANDLE_VALUE)
-        {
-            DWORD written = 0;
-            WriteFile(hFile, full_image.data(), static_cast<DWORD>(image_size), &written, nullptr);
-            CloseHandle(hFile);
-            msg(OBFSTR_C("AiDA: Dump saved to %s (%u bytes)\n"), output_path.c_str(), image_size);
-        }
-    }
-
-    json result;
-    result["base"]             = helpers::format_address(base);
-    result["image_size"]       = image_size;
-    result["sections_created"] = segs_created;
-    result["segments"]         = segs_info;
-    result["saved_to"]         = output_path;
-    result["can_load_in_ida"]  = true;
-    result["note"]             = OBFSTR(
-        "IMPORTANT: The dump file has been saved to: ") + output_path + OBFSTR(". "
-        "To get full and correct analysis you MUST open this file in a NEW IDA Pro instance: "
-        "File -> Open -> select the dumped .bin file -> enable 'Manual load' -> "
-        "set the image base to ") + helpers::format_address(base) + OBFSTR(". "
-        "IDA's built-in loader/autoanalysis will handle code creation, function detection, "
-        "FLIRT signatures, and type library application automatically.");
-    return tool_result_t::ok(
-        OBFSTR("Dumped ") + std::to_string(segs_created) + OBFSTR(" sections -> ") + output_path +
-        OBFSTR(". Open this file in a NEW IDA Pro instance for proper analysis."), result);
-}
-
-tool_result_t driver_bypass_and_dump(const json& params)
-{
-    json steps = json::array();
-    auto log = [&](const std::string& step, bool ok, const std::string& detail = "") {
-        steps.push_back({{"step", step}, {"ok", ok}, {"detail", detail}});
-    };
-
-    if (!device->is_connected())
-    {
-        bool ok = device->connect();
-        log("connect_driver", ok, ok ? "Connected to kernel driver" : "Failed");
-        if (!ok)
-        {
-            json r; r["steps"] = steps;
-            return tool_result_t::error(OBFSTR("Failed to connect to kernel driver. Is the driver loaded?"));
-        }
-    }
-    else
-        log("connect_driver", true, "Already connected");
-
-    std::string process_name = params["process"].get<std::string>();
-    std::uint32_t pid = device->find_process(process_name.c_str());
-    log("find_process", pid != 0, "PID: " + (pid ? std::to_string(pid) : "not found"));
-    if (pid == 0)
-        return tool_result_t::error(OBFSTR("Process not found: ") + process_name);
-
-    std::uint64_t base = device->find_image();
-    log("find_image_base", base != 0, helpers::format_address(base));
-    if (base == 0)
-        return tool_result_t::error(OBFSTR("Failed to locate image base for ") + process_name);
-
-    device->solve_dtb();
-    std::uint64_t dtb = device->get_dtb();
-    log("solve_dtb", dtb != 0, helpers::format_address(dtb));
-
-    std::uint8_t pe_hdr[0x1000];
-    std::size_t hdr_got = device->read_raw(base, pe_hdr, sizeof(pe_hdr));
-    log("read_pe_header", hdr_got > 0x200, std::to_string(hdr_got) + " bytes");
-    if (hdr_got < 0x200 || *(std::uint16_t*)pe_hdr != 0x5A4D)
-        return tool_result_t::error(OBFSTR("Failed to read valid PE header at ") + helpers::format_address(base));
-
-    std::uint32_t pe_off   = *(std::uint32_t*)(pe_hdr + 0x3C);
-    std::uint16_t opt_mag  = (pe_off + 0x3A < sizeof(pe_hdr)) ? *(std::uint16_t*)(pe_hdr + pe_off + 0x18) : 0;
-    std::uint32_t img_size = 0;
-    if (opt_mag == 0x020B || opt_mag == 0x010B)
-        img_size = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x38);
-    if (img_size == 0 || img_size > 0x10000000) img_size = 0x2000000;
-
-    std::vector<std::uint8_t> img(img_size, 0);
-    std::size_t total_read = 0;
-
-    const std::size_t chunk = 0x10000;
-
-    show_wait_box("HIDECANCEL\nAiDA: Bypassing & dumping %s (0x%X bytes)...", process_name.c_str(), img_size);
-    for (std::size_t off = 0; off < img_size; off += chunk)
-    {
-        if (off % 0x100000 == 0)
-            replace_wait_box("HIDECANCEL\nAiDA: Dumping %s (0x%zX / 0x%X, %.1f%%)...",
-                             process_name.c_str(), off, img_size, (off * 100.0) / img_size);
-        total_read += device->read_raw(base + off, img.data() + off,
-                                       std::min(chunk, img_size - off));
-    }
-    hide_wait_box();
-    log("dump_image", total_read > 0, std::to_string(total_read) + "/" + std::to_string(img_size) + " bytes");
-
-
-    std::string output_path = get_downloads_folder() + "dumped_" + process_name + "_" +
-                              helpers::format_address(static_cast<ea_t>(base)) + ".bin";
-    ensure_parent_dir_exists(output_path);
-    {
-        HANDLE hFile = CreateFileA(output_path.c_str(), GENERIC_WRITE, 0, nullptr,
-                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile != INVALID_HANDLE_VALUE)
-        {
-            DWORD written = 0;
-            WriteFile(hFile, img.data(), static_cast<DWORD>(img_size), &written, nullptr);
-            CloseHandle(hFile);
-            msg(OBFSTR_C("AiDA: Dump saved to %s (%u bytes)\n"), output_path.c_str(), img_size);
-        }
-        log("save_to_disk", true, output_path);
-    }
-
-
-    show_wait_box("HIDECANCEL\nAiDA: Patching IDA database (bulk)...");
-    std::size_t patched = 0;
-    int seg_count = get_segm_qty();
-    for (int si = 0; si < seg_count; ++si)
-    {
-        segment_t* seg = getnseg(si);
-        if (!seg) continue;
-        if (seg->start_ea >= base + img_size || seg->end_ea <= base) continue;
-
-        ea_t patch_start = std::max(seg->start_ea, static_cast<ea_t>(base));
-        ea_t patch_end   = std::min(seg->end_ea, static_cast<ea_t>(base + img_size));
-        std::size_t offset = static_cast<std::size_t>(patch_start - base);
-        std::size_t length = static_cast<std::size_t>(patch_end - patch_start);
-
-        if (offset < img_size && length > 0)
-        {
-            put_bytes(patch_start, img.data() + offset, length);
-            patched += length;
-        }
-    }
-    hide_wait_box();
-    log("patch_idb", patched > 0, std::to_string(patched) + " bytes patched");
-
-    bool hb = device->send_heartbeat();
-    log("heartbeat", hb, hb ? "Session maintained" : "Failed (non-fatal)");
-
-    json result;
-    result["process"]       = process_name;
-    result["pid"]           = pid;
-    result["base"]          = helpers::format_address(base);
-    result["dtb"]           = helpers::format_address(dtb);
-    result["image_size"]    = img_size;
-    result["bytes_dumped"]  = total_read;
-    result["coverage_pct"]  = total_read ? (int)((total_read * 100) / img_size) : 0;
-    result["bytes_patched"] = patched;
-    result["saved_to"]      = output_path;
-    result["can_load_in_ida"] = true;
-    result["steps"]         = steps;
-    result["note"]          = OBFSTR(
-        "IMPORTANT: The dump file has been saved to: ") + output_path + OBFSTR(". "
-        "To get full and correct analysis you MUST open this file in a NEW IDA Pro instance: "
-        "File -> Open -> select the dumped .bin file -> enable 'Manual load' -> "
-        "set the image base to ") + helpers::format_address(static_cast<ea_t>(base)) + OBFSTR(". "
-        "IDA's built-in loader/autoanalysis will handle code creation, function detection, "
-        "FLIRT signatures, and type library application automatically.");
-
-    return tool_result_t::ok(OBFSTR("Bypass-and-dump complete for ") + process_name +
-                             OBFSTR(": ") + std::to_string(total_read) + OBFSTR("/") +
-                             std::to_string(img_size) + OBFSTR(" bytes -> ") + output_path +
-                             OBFSTR(". Open this file in a NEW IDA Pro instance for proper analysis."), result);
-}
-
 static std::string resolve_nt_path_to_win32(const std::string& nt_path)
 {
     std::string result = nt_path;
@@ -9575,6 +10828,9 @@ tool_result_t driver_dump_kernel_module(const json& params)
 {
     std::string module_name = params["module"].get<std::string>();
     std::string output_path = params.value("output_path", std::string());
+    bool use_memory = params.value("from_memory", true);
+    bool patch_idb  = params.value("patch_idb", true);
+    bool analyze    = params.value("analyze", true);
 
     std::vector<std::uint8_t> buf;
     sys_module_info_t* info = nullptr;
@@ -9616,8 +10872,6 @@ tool_result_t driver_dump_kernel_module(const json& params)
         return tool_result_t::error(
             OBFSTR("Kernel module not found: ") + module_name +
             OBFSTR(". Use driver_enumerate_kernel_modules with filter to list loaded drivers."));
-
-    bool use_memory = params.value("from_memory", true);
 
     if (use_memory)
     {
@@ -9665,6 +10919,7 @@ tool_result_t driver_dump_kernel_module(const json& params)
         std::uint16_t num_sections = *reinterpret_cast<std::uint16_t*>(&header_buf[pe_off + 6]);
         std::uint16_t opt_hdr_size = *reinterpret_cast<std::uint16_t*>(&header_buf[pe_off + 20]);
         std::uint32_t pe_image_size = *reinterpret_cast<std::uint32_t*>(&header_buf[pe_off + 24 + 56]);
+        std::uint32_t section_table_off = pe_off + 24 + opt_hdr_size;
 
         std::uint32_t dump_size = (pe_image_size > image_size) ? pe_image_size : image_size;
         if (dump_size == 0 || dump_size > 256 * 1024 * 1024)
@@ -9682,7 +10937,6 @@ tool_result_t driver_dump_kernel_module(const json& params)
 
         constexpr std::size_t CHUNK_SIZE = 0x10000;
         std::size_t total_read = header_read;
-        std::size_t readable_pages = 1;
 
         for (std::uint32_t offset = static_cast<std::uint32_t>(header_read);
              offset < dump_size; offset += CHUNK_SIZE)
@@ -9695,10 +10949,7 @@ tool_result_t driver_dump_kernel_module(const json& params)
                 base_addr + offset, dump_data.data() + offset, to_read);
 
             if (bytes_got > 0)
-            {
                 total_read += bytes_got;
-                readable_pages++;
-            }
 
             if (offset % 0x40000 == 0)
                 replace_wait_box("HIDECANCEL\nAiDA: Dumping %s: 0x%X / 0x%X (%.1f%%)",
@@ -9707,6 +10958,20 @@ tool_result_t driver_dump_kernel_module(const json& params)
         }
 
         hide_wait_box();
+
+
+        pe_fix_result_t pe_fix = fix_dumped_pe_image(dump_data, base_addr);
+        if (pe_fix.success)
+            msg(OBFSTR_C("AiDA: PE fixed — %d sections, %d IAT entries restored, EP %s\n"),
+                pe_fix.sections_fixed, pe_fix.iat_entries_restored,
+                pe_fix.entry_point_valid ? "valid" : "fallback");
+
+        iat_rebuild_result_t iat_rebuild = reconstruct_iat_runtime(dump_data, base_addr, device.get(), true);
+        if (iat_rebuild.success && iat_rebuild.descriptors_rebuilt > 0)
+            msg(OBFSTR_C("AiDA: Kernel IAT reconstruction — %d imports resolved, %d failed, %d descriptors rebuilt\n"),
+                iat_rebuild.imports_resolved, iat_rebuild.imports_failed, iat_rebuild.descriptors_rebuilt);
+        else if (!iat_rebuild.error.empty())
+            msg(OBFSTR_C("AiDA: Kernel IAT rebuild note: %s\n"), iat_rebuild.error.c_str());
 
         show_wait_box("HIDECANCEL\nAiDA: Writing memory dump to %s...", output_path.c_str());
         ensure_parent_dir_exists(output_path);
@@ -9727,6 +10992,64 @@ tool_result_t driver_dump_kernel_module(const json& params)
         WriteFile(hOut, dump_data.data(), static_cast<DWORD>(dump_size), &bytes_written, nullptr);
         CloseHandle(hOut);
         hide_wait_box();
+        msg(OBFSTR_C("AiDA: Dump saved to %s (%u bytes)\n"), output_path.c_str(), dump_size);
+
+        std::size_t patched = 0;
+        json sections_arr = json::array();
+
+        if (patch_idb)
+        {
+            show_wait_box("HIDECANCEL\nAiDA: Creating IDB segments and patching bytes...");
+
+            for (int s = 0; s < num_sections && section_table_off + (s + 1) * 40 <= header_read; s++)
+            {
+                const std::uint8_t* sec = &header_buf[section_table_off + s * 40];
+                char sec_name[9] = {};
+                std::memcpy(sec_name, sec, 8);
+
+                std::uint32_t virt_size       = *reinterpret_cast<const std::uint32_t*>(sec + 8);
+                std::uint32_t virt_addr       = *reinterpret_cast<const std::uint32_t*>(sec + 12);
+                std::uint32_t characteristics = *reinterpret_cast<const std::uint32_t*>(sec + 36);
+
+                ea_t seg_start = static_cast<ea_t>(base_addr + virt_addr);
+                ea_t seg_end   = seg_start + virt_size;
+
+                if (!getseg(seg_start))
+                {
+                    segment_t seg;
+                    seg.start_ea = seg_start;
+                    seg.end_ea   = seg_end;
+                    seg.type     = (characteristics & 0x20000000) ? SEG_CODE : SEG_DATA;
+                    seg.bitness  = 2;
+                    seg.perm     = 0;
+                    if (characteristics & 0x20000000) seg.perm |= SEGPERM_EXEC;
+                    if (characteristics & 0x40000000) seg.perm |= SEGPERM_READ;
+                    if (characteristics & 0x80000000) seg.perm |= SEGPERM_WRITE;
+                    add_segm_ex(&seg, sec_name, nullptr, ADDSEG_QUIET | ADDSEG_NOSREG);
+                }
+
+                std::uint32_t copy_len = virt_size;
+                if (virt_addr + copy_len > dump_size) copy_len = dump_size - virt_addr;
+
+                std::size_t sec_patched = 0;
+                if (copy_len > 0 && is_mapped(seg_start))
+                {
+                    put_bytes(seg_start, dump_data.data() + virt_addr, copy_len);
+                    sec_patched = copy_len;
+                }
+                patched += sec_patched;
+
+                json sec_info;
+                sec_info["name"]            = sec_name;
+                sec_info["virtual_address"] = helpers::format_address(static_cast<ea_t>(virt_addr));
+                sec_info["virtual_size"]    = virt_size;
+                sec_info["characteristics"] = helpers::format_address(static_cast<ea_t>(characteristics));
+                sec_info["bytes_patched"]   = sec_patched;
+                sections_arr.push_back(sec_info);
+            }
+
+            hide_wait_box();
+        }
 
         std::string pe_arch = "unknown";
         if (machine == 0x8664) pe_arch = "AMD64";
@@ -9739,30 +11062,36 @@ tool_result_t driver_dump_kernel_module(const json& params)
         result["module_name"]       = found_name;
         result["nt_path"]           = found_nt_path;
         result["kernel_base"]       = helpers::format_address(static_cast<ea_t>(found_base));
-        result["kernel_size"]       = found_size;
-        result["pe_image_size"]     = pe_image_size;
-        result["dump_size"]         = dump_size;
+        result["image_size"]        = dump_size;
         result["bytes_read"]        = total_read;
-        result["readable_pages"]    = readable_pages;
         result["coverage_pct"]      = coverage;
         result["output_path"]       = output_path;
+        result["saved_to"]          = output_path;
         result["valid_pe"]          = true;
         result["architecture"]      = pe_arch;
         result["num_sections"]      = num_sections;
         result["dump_source"]       = "kernel_memory";
         result["can_load_in_ida"]   = true;
+        result["analyzed"]          = analyze && patch_idb;
+        if (patch_idb)
+        {
+            result["bytes_patched"] = patched;
+            result["sections"]      = sections_arr;
+        }
+        if (pe_fix.success)
+            result["pe_fix"] = pe_fix_to_json(pe_fix);
+        if (iat_rebuild.success && iat_rebuild.descriptors_rebuilt > 0)
+            result["iat_rebuild"] = iat_rebuild_to_json(iat_rebuild);
         result["note"]              = OBFSTR(
-            "LIVE MEMORY DUMP Ã¢â‚¬â€ contains runtime-decrypted code, devirtualized sections, "
-            "and unpacked data as they exist in kernel memory. Open in IDA Pro: "
-            "File > Open > select the dumped file > choose manual load with image base ") +
-            helpers::format_address(static_cast<ea_t>(found_base)) +
-            OBFSTR(". Some pages may be zero-filled if they were paged out.");
+            "Live kernel memory dump - contains runtime-decrypted code, devirtualized sections, "
+            "and unpacked data. Open this file in a NEW IDA Pro instance for proper analysis. "
+            "Some pages may be zero-filled if they were paged out.");
 
         return tool_result_t::ok(
-            OBFSTR("Kernel module memory-dumped: ") + found_name + OBFSTR(" (") +
+            OBFSTR("Kernel module dumped: ") + found_name + OBFSTR(" (") +
             std::to_string(total_read) + OBFSTR("/") + std::to_string(dump_size) +
             OBFSTR(" bytes, ") + std::to_string(coverage) + OBFSTR("% coverage) -> ") +
-            output_path, result);
+            output_path + OBFSTR(". Open this file in a NEW IDA Pro instance for proper analysis."), result);
     }
 
     std::string disk_path = resolve_nt_path_to_win32(found_nt_path);
@@ -10012,217 +11341,6 @@ tool_result_t driver_write_kernel_memory(const json& params)
     return tool_result_t::ok(
         OBFSTR("Wrote ") + std::to_string(written) + OBFSTR(" bytes to kernel address ") +
         helpers::format_address(static_cast<ea_t>(address)), result);
-}
-
-tool_result_t driver_kernel_dump_module(const json& params)
-{
-    if (!device || !device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
-
-    if (device->get_kernel_dtb() == 0)
-    {
-        device->solve_kernel_dtb();
-        if (device->get_kernel_dtb() == 0)
-            return tool_result_t::error(OBFSTR("Failed to solve kernel DTB."));
-    }
-
-    std::string module_name = params["module"].get<std::string>();
-    bool patch_idb = params.value("patch_idb", true);
-    bool analyze = params.value("analyze", true);
-    std::string output_path = params.value("output_path", std::string());
-
-    std::vector<std::uint8_t> enum_buf;
-    sys_module_info_t* info = nullptr;
-    std::string err;
-    if (!query_kernel_modules(enum_buf, info, err))
-        return tool_result_t::error(err);
-
-    std::string found_name;
-    std::uintptr_t found_base = 0;
-    ULONG found_size = 0;
-    bool found = false;
-
-    std::string lower_target = module_name;
-    std::transform(lower_target.begin(), lower_target.end(), lower_target.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-    for (ULONG i = 0; i < info->NumberOfModules; i++)
-    {
-        const auto& m = info->Modules[i];
-        std::string name(reinterpret_cast<const char*>(m.FullPathName + m.OffsetToFileName));
-        std::string lower_name = name;
-        std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
-            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (lower_name == lower_target || lower_name.find(lower_target) != std::string::npos)
-        {
-            found_name = name;
-            found_base = reinterpret_cast<std::uintptr_t>(m.ImageBase);
-            found_size = m.ImageSize;
-            found = true;
-            break;
-        }
-    }
-
-    if (!found)
-        return tool_result_t::error(OBFSTR("Kernel module not found: ") + module_name);
-
-    std::uint64_t base_addr = static_cast<std::uint64_t>(found_base);
-
-    std::vector<std::uint8_t> header(0x1000, 0);
-    std::size_t hdr_read = device->read_kernel_raw(base_addr, header.data(), 0x1000);
-    if (hdr_read < 0x40 || header[0] != 'M' || header[1] != 'Z')
-        return tool_result_t::error(
-            OBFSTR("Cannot read PE header at ") +
-            helpers::format_address(static_cast<ea_t>(base_addr)));
-
-    std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&header[0x3C]);
-    if (pe_off + 0x18 > hdr_read || header[pe_off] != 'P' || header[pe_off + 1] != 'E')
-        return tool_result_t::error(OBFSTR("Invalid PE signature."));
-
-    std::uint16_t num_sections = *reinterpret_cast<std::uint16_t*>(&header[pe_off + 6]);
-    std::uint16_t opt_hdr_size = *reinterpret_cast<std::uint16_t*>(&header[pe_off + 20]);
-    std::uint32_t pe_image_size = *reinterpret_cast<std::uint32_t*>(&header[pe_off + 24 + 56]);
-    std::uint32_t dump_size = (pe_image_size > found_size) ? pe_image_size : found_size;
-
-    std::uint32_t section_table_off = pe_off + 24 + opt_hdr_size;
-
-    show_wait_box("HIDECANCEL\nAiDA: Dumping kernel module %s to IDB (0x%X bytes, %d sections)...",
-                  found_name.c_str(), dump_size, num_sections);
-
-    std::vector<std::uint8_t> image(dump_size, 0);
-    std::memcpy(image.data(), header.data(), std::min<std::size_t>(hdr_read, dump_size));
-
-    std::size_t total_read = hdr_read;
-    constexpr std::size_t K_CHUNK = 0x10000;
-    for (std::uint32_t offset = 0x1000; offset < dump_size; offset += K_CHUNK)
-    {
-        std::size_t to_read = K_CHUNK;
-        if (offset + to_read > dump_size) to_read = dump_size - offset;
-
-        std::size_t got = device->read_kernel_raw(base_addr + offset, image.data() + offset, to_read);
-        if (got > 0) total_read += got;
-
-        if (offset % 0x40000 == 0)
-            replace_wait_box("HIDECANCEL\nAiDA: Dumping %s: 0x%X / 0x%X (%.1f%%)",
-                             found_name.c_str(), offset, dump_size,
-                             (offset * 100.0) / dump_size);
-    }
-
-
-    std::string saved_to = output_path;
-    if (saved_to.empty())
-        saved_to = get_downloads_folder() + "dumped_" + found_name;
-    ensure_parent_dir_exists(saved_to);
-    {
-        HANDLE hSave = CreateFileA(
-            saved_to.c_str(), GENERIC_WRITE, 0, nullptr,
-            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hSave == INVALID_HANDLE_VALUE)
-        {
-            hide_wait_box();
-            return tool_result_t::error(
-                OBFSTR("Failed to save dump file: ") + saved_to +
-                OBFSTR(". Win32 error: ") + std::to_string(GetLastError()));
-        }
-        DWORD written = 0;
-        WriteFile(hSave, image.data(), static_cast<DWORD>(dump_size), &written, nullptr);
-        CloseHandle(hSave);
-        msg(OBFSTR_C("AiDA: Dump saved to %s (%u bytes)\n"), saved_to.c_str(), dump_size);
-    }
-
-    std::size_t patched = 0;
-    json sections_arr = json::array();
-
-    if (patch_idb)
-    {
-        for (int s = 0; s < num_sections && section_table_off + (s + 1) * 40 <= hdr_read; s++)
-        {
-            const std::uint8_t* sec = &header[section_table_off + s * 40];
-            char sec_name[9] = {};
-            std::memcpy(sec_name, sec, 8);
-
-            std::uint32_t virt_size = *reinterpret_cast<const std::uint32_t*>(sec + 8);
-            std::uint32_t virt_addr = *reinterpret_cast<const std::uint32_t*>(sec + 12);
-            std::uint32_t characteristics = *reinterpret_cast<const std::uint32_t*>(sec + 36);
-
-            ea_t seg_start = static_cast<ea_t>(base_addr + virt_addr);
-            ea_t seg_end   = seg_start + virt_size;
-
-            segment_t* existing = getseg(seg_start);
-            if (!existing)
-            {
-                segment_t seg;
-                seg.start_ea = seg_start;
-                seg.end_ea   = seg_end;
-                seg.type     = (characteristics & 0x20000000) ? SEG_CODE : SEG_DATA;
-                seg.bitness  = 2;
-                seg.perm     = 0;
-                if (characteristics & 0x20000000) seg.perm |= SEGPERM_EXEC;
-                if (characteristics & 0x40000000) seg.perm |= SEGPERM_READ;
-                if (characteristics & 0x80000000) seg.perm |= SEGPERM_WRITE;
-                add_segm_ex(&seg, sec_name, nullptr, ADDSEG_QUIET | ADDSEG_NOSREG);
-            }
-
-
-            std::uint32_t copy_len = virt_size;
-            if (virt_addr + copy_len > dump_size)
-                copy_len = dump_size - virt_addr;
-
-            std::size_t sec_patched = 0;
-            if (copy_len > 0 && is_mapped(seg_start))
-            {
-                put_bytes(seg_start, image.data() + virt_addr, copy_len);
-                sec_patched = copy_len;
-            }
-            patched += sec_patched;
-
-            json sec_info;
-            sec_info["name"]            = sec_name;
-            sec_info["virtual_address"] = helpers::format_address(static_cast<ea_t>(virt_addr));
-            sec_info["virtual_size"]    = virt_size;
-            sec_info["characteristics"] = helpers::format_address(static_cast<ea_t>(characteristics));
-            sec_info["bytes_patched"]   = sec_patched;
-            sections_arr.push_back(sec_info);
-        }
-
-        // Heavy analysis (code creation, prologue scanning, call-target
-        // resolution) is deliberately skipped — users should open the
-        // saved dump in a NEW IDA Pro instance for proper autoanalysis.
-    }
-
-    hide_wait_box();
-
-    int coverage = dump_size ? static_cast<int>((total_read * 100) / dump_size) : 0;
-
-    json result;
-    result["module_name"]       = found_name;
-    result["kernel_base"]       = helpers::format_address(static_cast<ea_t>(found_base));
-    result["image_size"]        = dump_size;
-    result["bytes_read"]        = total_read;
-    result["coverage_pct"]      = coverage;
-    result["num_sections"]      = num_sections;
-    result["sections"]          = sections_arr;
-    result["bytes_patched"]     = patched;
-    result["analyzed"]          = analyze && patch_idb;
-    result["output_path"]       = saved_to;
-    result["saved_to"]          = saved_to;
-    result["can_load_in_ida"]   = true;
-    result["note"]              = OBFSTR(
-        "IMPORTANT: Kernel module dumped and saved to disk. "
-        "To get full and correct analysis you MUST open this file in a NEW IDA Pro instance: "
-        "File -> Open -> select the dumped file -> enable 'Manual load' -> "
-        "set the image base to ") +
-        helpers::format_address(static_cast<ea_t>(found_base)) +
-        OBFSTR(". IDA's built-in loader/autoanalysis will handle code creation, function "
-        "detection, FLIRT signatures, and type library application automatically. "
-        "Some pages may be zero-filled if they were paged out.");
-
-    return tool_result_t::ok(
-        OBFSTR("Kernel module ") + found_name +
-        OBFSTR(" dumped: ") + std::to_string(total_read) + OBFSTR("/") +
-        std::to_string(dump_size) + OBFSTR(" bytes, ") + std::to_string(patched) +
-        OBFSTR(" bytes patched -> ") + saved_to +
-        OBFSTR(". Open this file in a NEW IDA Pro instance for proper analysis."), result);
 }
 
 tool_result_t driver_allocate_memory(const json& params)
@@ -10811,6 +11929,651 @@ tool_result_t driver_virtual_to_physical(const json& params)
 }
 
 
+DeferredActionManager& DeferredActionManager::instance()
+{
+    static DeferredActionManager mgr;
+    return mgr;
+}
+
+DeferredActionManager::~DeferredActionManager()
+{
+    shutdown();
+}
+
+void DeferredActionManager::shutdown()
+{
+    _shutdown.store(true);
+    std::lock_guard<std::mutex> lock(_mutex);
+    for (auto& [id, action] : _actions)
+    {
+        auto st = action->status.load();
+        if (st == deferred_status::pending || st == deferred_status::watching)
+            action->status.store(deferred_status::cancelled);
+    }
+    for (auto& [id, thread] : _watchers)
+    {
+        if (thread.joinable())
+            thread.join();
+    }
+    _watchers.clear();
+}
+
+int DeferredActionManager::register_action(std::unique_ptr<deferred_action_t> action)
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    int id = _next_id++;
+    action->id = id;
+    action->created = std::chrono::steady_clock::now();
+    action->status.store(deferred_status::pending);
+
+    _actions[id] = std::move(action);
+
+    _watchers[id] = std::thread(&DeferredActionManager::watcher_thread_func, this, id);
+
+    return id;
+}
+
+bool DeferredActionManager::cancel_action(int id)
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto it = _actions.find(id);
+    if (it == _actions.end())
+        return false;
+
+    auto st = it->second->status.load();
+    if (st == deferred_status::pending || st == deferred_status::watching)
+    {
+        it->second->status.store(deferred_status::cancelled);
+        if (_watchers.count(id) && _watchers[id].joinable())
+        {
+            _mutex.unlock();
+            _watchers[id].join();
+            _mutex.lock();
+        }
+        return true;
+    }
+    return false;
+}
+
+const deferred_action_t* DeferredActionManager::get_action(int id) const
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto it = _actions.find(id);
+    return (it != _actions.end()) ? it->second.get() : nullptr;
+}
+
+std::vector<const deferred_action_t*> DeferredActionManager::get_all_actions() const
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    std::vector<const deferred_action_t*> result;
+    for (const auto& [id, action] : _actions)
+        result.push_back(action.get());
+    return result;
+}
+
+bool DeferredActionManager::poll_kernel_module_load(
+    const std::string& target,
+    std::uint64_t& out_base,
+    std::uint32_t& out_size,
+    std::string& out_name,
+    std::string& out_path)
+{
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return false;
+
+    auto pNtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformation_fn>(
+        GetProcAddress(ntdll, "NtQuerySystemInformation"));
+    if (!pNtQuerySystemInformation) return false;
+
+    constexpr ULONG SystemModuleInformation = 11;
+    ULONG needed = 0;
+    pNtQuerySystemInformation(SystemModuleInformation, nullptr, 0, &needed);
+    if (needed == 0) needed = 256 * 1024;
+    needed += 16384;
+
+    std::vector<std::uint8_t> buf(needed, 0);
+    LONG status = pNtQuerySystemInformation(
+        SystemModuleInformation, buf.data(),
+        static_cast<ULONG>(buf.size()), &needed);
+    if (status < 0) return false;
+
+    auto* info = reinterpret_cast<sys_module_info_t*>(buf.data());
+
+    std::string lower_target = target;
+    std::transform(lower_target.begin(), lower_target.end(), lower_target.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    for (ULONG i = 0; i < info->NumberOfModules; i++)
+    {
+        const auto& m = info->Modules[i];
+        std::string name(reinterpret_cast<const char*>(m.FullPathName + m.OffsetToFileName));
+        std::string full_path(reinterpret_cast<const char*>(m.FullPathName));
+
+        std::string lower_name = name;
+        std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        if (lower_name == lower_target || lower_name.find(lower_target) != std::string::npos)
+        {
+            out_base = reinterpret_cast<std::uintptr_t>(m.ImageBase);
+            out_size = m.ImageSize;
+            out_name = name;
+            out_path = full_path;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool DeferredActionManager::poll_process_start(
+    const std::string& target,
+    std::uint32_t& out_pid)
+{
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(PROCESSENTRY32W);
+
+    bool found = false;
+    if (Process32FirstW(snapshot, &entry))
+    {
+        do {
+            std::string exe_name;
+            for (int i = 0; entry.szExeFile[i]; i++)
+                exe_name.push_back(static_cast<char>(entry.szExeFile[i]));
+
+            std::string lower_exe = exe_name;
+            std::string lower_target = target;
+            std::transform(lower_exe.begin(), lower_exe.end(), lower_exe.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            std::transform(lower_target.begin(), lower_target.end(), lower_target.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+            if (lower_exe == lower_target || lower_exe.find(lower_target) != std::string::npos)
+            {
+                out_pid = entry.th32ProcessID;
+                found = true;
+                break;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return found;
+}
+
+std::string DeferredActionManager::resolve_template(const std::string& value, const json& context)
+{
+    std::string result = value;
+
+    auto replace_all = [&](const std::string& placeholder, const std::string& replacement) {
+        size_t pos = 0;
+        while ((pos = result.find(placeholder, pos)) != std::string::npos)
+        {
+            result.replace(pos, placeholder.size(), replacement);
+            pos += replacement.size();
+        }
+    };
+
+    if (context.contains("module_base"))
+        replace_all("${module_base}", context["module_base"].get<std::string>());
+    if (context.contains("module_size"))
+        replace_all("${module_size}", context["module_size"].get<std::string>());
+    if (context.contains("module_name"))
+        replace_all("${module_name}", context["module_name"].get<std::string>());
+    if (context.contains("pid"))
+        replace_all("${pid}", context["pid"].get<std::string>());
+    if (context.contains("base_address"))
+        replace_all("${base_address}", context["base_address"].get<std::string>());
+
+
+    static const std::regex offset_re("0x([0-9A-Fa-f]+)\\+0x([0-9A-Fa-f]+)");
+    std::smatch match;
+    if (std::regex_match(result, match, offset_re))
+    {
+        std::uint64_t base_val = std::stoull(match[1].str(), nullptr, 16);
+        std::uint64_t offset_val = std::stoull(match[2].str(), nullptr, 16);
+        std::ostringstream ss;
+        ss << "0x" << std::hex << std::uppercase << (base_val + offset_val);
+        result = ss.str();
+    }
+
+    return result;
+}
+
+json DeferredActionManager::resolve_params(const json& params, const json& context)
+{
+    if (params.is_string())
+        return resolve_template(params.get<std::string>(), context);
+
+    if (params.is_object())
+    {
+        json resolved = json::object();
+        for (auto it = params.begin(); it != params.end(); ++it)
+            resolved[it.key()] = resolve_params(it.value(), context);
+        return resolved;
+    }
+
+    if (params.is_array())
+    {
+        json resolved = json::array();
+        for (const auto& item : params)
+            resolved.push_back(resolve_params(item, context));
+        return resolved;
+    }
+
+    return params;
+}
+
+void DeferredActionManager::execute_deferred_tools(deferred_action_t& action, const json& context)
+{
+
+
+    struct deferred_exec_request_t : public exec_request_t
+    {
+        std::string tool_name;
+        json params;
+        tool_result_t tool_result;
+
+        ssize_t idaapi execute() override
+        {
+            tool_result = ToolRegistry::instance().execute_tool(tool_name, params);
+            return 0;
+        }
+    };
+
+    for (const auto& tc : action.tool_calls)
+    {
+        json resolved_params = resolve_params(tc.params, context);
+        deferred_action_result_t result;
+        result.action_type = tc.tool_name;
+
+        try
+        {
+            const auto* tool_def = ToolRegistry::instance().get_tool(tc.tool_name);
+            int mff_flag = (tool_def && tool_def->read_only) ? MFF_READ : MFF_WRITE;
+
+            deferred_exec_request_t req;
+            req.tool_name = tc.tool_name;
+            req.params = resolved_params;
+
+
+            execute_sync(req, mff_flag);
+
+            result.success = req.tool_result.success;
+            result.message = req.tool_result.output;
+            result.data = req.tool_result.data;
+        }
+        catch (const std::exception& e)
+        {
+            result.success = false;
+            result.message = std::string("Exception: ") + e.what();
+        }
+
+        action.results.push_back(std::move(result));
+    }
+}
+
+void DeferredActionManager::watcher_thread_func(int action_id)
+{
+    deferred_action_t* action = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        auto it = _actions.find(action_id);
+        if (it == _actions.end()) return;
+        action = it->second.get();
+    }
+
+    action->status.store(deferred_status::watching);
+
+    auto start_time = std::chrono::steady_clock::now();
+    auto timeout = std::chrono::seconds(action->timeout_seconds);
+    auto poll_interval = std::chrono::milliseconds(action->poll_interval_ms);
+
+    msg(OBFSTR_C("AiDA: Deferred action #%d watching for %s '%s' (timeout: %ds, poll: %dms)\n"),
+        action->id, action->condition_type.c_str(), action->target_name.c_str(),
+        action->timeout_seconds, action->poll_interval_ms);
+
+    json trigger_context;
+
+    while (!_shutdown.load())
+    {
+        auto st = action->status.load();
+        if (st == deferred_status::cancelled)
+        {
+            msg(OBFSTR_C("AiDA: Deferred action #%d cancelled\n"), action->id);
+            return;
+        }
+
+
+        auto elapsed = std::chrono::steady_clock::now() - start_time;
+        if (elapsed >= timeout)
+        {
+            action->status.store(deferred_status::timed_out);
+            action->error = OBFSTR("Timed out waiting for ") + action->condition_type +
+                OBFSTR(": ") + action->target_name;
+            msg(OBFSTR_C("AiDA: Deferred action #%d timed out after %ds\n"),
+                action->id, action->timeout_seconds);
+            return;
+        }
+
+        bool condition_met = false;
+
+        if (action->condition_type == "kernel_module_load")
+        {
+            std::uint64_t base = 0;
+            std::uint32_t size = 0;
+            std::string name, path;
+            if (poll_kernel_module_load(action->target_name, base, size, name, path))
+            {
+                condition_met = true;
+                std::ostringstream base_ss, size_ss;
+                base_ss << "0x" << std::hex << std::uppercase << base;
+                size_ss << "0x" << std::hex << std::uppercase << size;
+
+                trigger_context["module_base"] = base_ss.str();
+                trigger_context["module_size"] = size_ss.str();
+                trigger_context["module_name"] = name;
+                trigger_context["module_path"] = path;
+
+                action->trigger_info = trigger_context.dump();
+            }
+        }
+        else if (action->condition_type == "process_start")
+        {
+            std::uint32_t pid = 0;
+            if (poll_process_start(action->target_name, pid))
+            {
+                condition_met = true;
+                trigger_context["pid"] = std::to_string(pid);
+
+
+                if (device && !device->is_connected())
+                    device->connect();
+
+                if (device && device->is_connected())
+                {
+                    device->find_process(action->target_name.c_str());
+                    std::uint64_t img_base = device->find_image();
+                    device->solve_dtb();
+
+                    std::ostringstream base_ss;
+                    base_ss << "0x" << std::hex << std::uppercase << img_base;
+                    trigger_context["base_address"] = base_ss.str();
+                    trigger_context["pid"] = std::to_string(device->get_process_id());
+                }
+
+                action->trigger_info = trigger_context.dump();
+            }
+        }
+
+        if (condition_met)
+        {
+            action->triggered_at = std::chrono::steady_clock::now();
+            action->status.store(deferred_status::triggered);
+
+            auto trigger_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                action->triggered_at - start_time).count();
+            msg(OBFSTR_C("AiDA: Deferred action #%d TRIGGERED! %s '%s' detected after %lldms. "
+                "Executing %zu queued tool call(s) IMMEDIATELY...\n"),
+                action->id, action->condition_type.c_str(), action->target_name.c_str(),
+                trigger_elapsed, action->tool_calls.size());
+
+
+            execute_deferred_tools(*action, trigger_context);
+
+            bool any_failed = false;
+            for (const auto& r : action->results)
+            {
+                msg(OBFSTR_C("AiDA: Deferred action #%d - %s: %s — %s\n"),
+                    action->id, r.action_type.c_str(),
+                    r.success ? "OK" : "FAIL", r.message.c_str());
+                if (!r.success) any_failed = true;
+            }
+
+            action->status.store(any_failed ? deferred_status::failed : deferred_status::completed);
+
+            msg(OBFSTR_C("AiDA: Deferred action #%d %s. %zu/%zu actions succeeded.\n"),
+                action->id,
+                any_failed ? "completed with failures" : "completed successfully",
+                std::count_if(action->results.begin(), action->results.end(),
+                    [](const deferred_action_result_t& r) { return r.success; }),
+                action->results.size());
+
+            return;
+        }
+
+        std::this_thread::sleep_for(poll_interval);
+    }
+}
+
+
+static std::string deferred_status_to_string(deferred_status s)
+{
+    switch (s)
+    {
+        case deferred_status::pending:    return "pending";
+        case deferred_status::watching:   return "watching";
+        case deferred_status::triggered:  return "triggered";
+        case deferred_status::completed:  return "completed";
+        case deferred_status::failed:     return "failed";
+        case deferred_status::cancelled:  return "cancelled";
+        case deferred_status::timed_out:  return "timed_out";
+        default: return "unknown";
+    }
+}
+
+tool_result_t driver_defer_action(const json& params)
+{
+    std::string wait_for;
+    if (params.contains("wait_for"))
+        wait_for = params["wait_for"].get<std::string>();
+    if (wait_for.empty())
+        return tool_result_t::error(OBFSTR("'wait_for' is required: 'kernel_module_load' or 'process_start'"));
+
+    if (wait_for != "kernel_module_load" && wait_for != "process_start")
+        return tool_result_t::error(OBFSTR("'wait_for' must be 'kernel_module_load' or 'process_start'"));
+
+    std::string target;
+    if (params.contains("target"))
+        target = params["target"].get<std::string>();
+    if (target.empty())
+        return tool_result_t::error(OBFSTR("'target' is required: module or process name to watch for"));
+
+    int timeout = params.value("timeout", 300);
+    int poll_interval = params.value("poll_interval", 50);
+
+    if (!params.contains("actions") || !params["actions"].is_array() || params["actions"].empty())
+        return tool_result_t::error(OBFSTR("'actions' array is required with at least one tool call"));
+
+    auto action = std::make_unique<deferred_action_t>();
+    action->condition_type = wait_for;
+    action->target_name = target;
+    action->timeout_seconds = timeout;
+    action->poll_interval_ms = poll_interval;
+
+    for (const auto& act : params["actions"])
+    {
+        if (!act.contains("tool") || !act["tool"].is_string())
+            return tool_result_t::error(OBFSTR("Each action must have a 'tool' field with the tool name"));
+
+        deferred_action_t::queued_tool_call_t tc;
+        tc.tool_name = act["tool"].get<std::string>();
+        tc.params = act.contains("params") ? act["params"] : json::object();
+
+
+        if (!ToolRegistry::instance().get_tool(tc.tool_name))
+            return tool_result_t::error(OBFSTR("Unknown tool: ") + tc.tool_name);
+
+        action->tool_calls.push_back(std::move(tc));
+    }
+
+
+    bool already_met = false;
+    if (wait_for == "kernel_module_load")
+    {
+        std::uint64_t base = 0;
+        std::uint32_t size = 0;
+        std::string name, path;
+        auto& mgr = DeferredActionManager::instance();
+        if (mgr.poll_kernel_module_load(target, base, size, name, path))
+            already_met = true;
+    }
+    else if (wait_for == "process_start")
+    {
+        std::uint32_t pid = 0;
+        auto& mgr = DeferredActionManager::instance();
+        if (mgr.poll_process_start(target, pid))
+            already_met = true;
+    }
+
+    int action_id = DeferredActionManager::instance().register_action(std::move(action));
+
+    json result;
+    result["action_id"] = action_id;
+    result["condition"] = wait_for;
+    result["target"] = target;
+    result["timeout_seconds"] = timeout;
+    result["poll_interval_ms"] = poll_interval;
+    result["num_queued_actions"] = params["actions"].size();
+    result["status"] = already_met ? "target_already_loaded_executing_now" : "watching";
+    result["note"] = already_met
+        ? OBFSTR("Target '") + target + OBFSTR("' is ALREADY loaded! Actions are being executed immediately.")
+        : OBFSTR("Background watcher started. Actions will execute THE INSTANT '") + target +
+          OBFSTR("' loads. Use driver_get_deferred_results with action_id=") +
+          std::to_string(action_id) + OBFSTR(" to check results.");
+
+    return tool_result_t::ok(
+        already_met
+            ? OBFSTR("Deferred action #") + std::to_string(action_id) + OBFSTR(" — target already loaded, executing immediately!")
+            : OBFSTR("Deferred action #") + std::to_string(action_id) + OBFSTR(" registered — watching for '") + target + "'",
+        result);
+}
+
+tool_result_t driver_list_deferred_actions(const json&)
+{
+    auto actions = DeferredActionManager::instance().get_all_actions();
+
+    json arr = json::array();
+    for (const auto* action : actions)
+    {
+        json entry;
+        entry["id"] = action->id;
+        entry["condition"] = action->condition_type;
+        entry["target"] = action->target_name;
+        entry["status"] = deferred_status_to_string(action->status.load());
+        entry["num_actions"] = action->tool_calls.size();
+        entry["timeout_seconds"] = action->timeout_seconds;
+
+        if (!action->trigger_info.empty())
+        {
+            try { entry["trigger_info"] = json::parse(action->trigger_info); }
+            catch (...) { entry["trigger_info"] = action->trigger_info; }
+        }
+
+        if (!action->error.empty())
+            entry["error"] = action->error;
+
+        entry["num_results"] = action->results.size();
+        int succeeded = 0;
+        for (const auto& r : action->results)
+            if (r.success) succeeded++;
+        entry["succeeded"] = succeeded;
+        entry["failed"] = static_cast<int>(action->results.size()) - succeeded;
+
+        arr.push_back(entry);
+    }
+
+    json result;
+    result["actions"] = arr;
+    result["total"] = arr.size();
+    return tool_result_t::ok(
+        OBFSTR("Found ") + std::to_string(arr.size()) + OBFSTR(" deferred action(s)"), result);
+}
+
+tool_result_t driver_cancel_deferred_action(const json& params)
+{
+    int id = 0;
+    if (params.contains("action_id"))
+    {
+        if (params["action_id"].is_string())
+            id = std::stoi(params["action_id"].get<std::string>());
+        else
+            id = params["action_id"].get<int>();
+    }
+    if (id == 0)
+        return tool_result_t::error(OBFSTR("'action_id' is required"));
+
+    if (DeferredActionManager::instance().cancel_action(id))
+    {
+        json result;
+        result["action_id"] = id;
+        result["status"] = "cancelled";
+        return tool_result_t::ok(OBFSTR("Deferred action #") + std::to_string(id) + OBFSTR(" cancelled"), result);
+    }
+
+    return tool_result_t::error(OBFSTR("Cannot cancel action #") + std::to_string(id) +
+        OBFSTR(" — not found or already completed/triggered"));
+}
+
+tool_result_t driver_get_deferred_results(const json& params)
+{
+    int id = 0;
+    if (params.contains("action_id"))
+    {
+        if (params["action_id"].is_string())
+            id = std::stoi(params["action_id"].get<std::string>());
+        else
+            id = params["action_id"].get<int>();
+    }
+    if (id == 0)
+        return tool_result_t::error(OBFSTR("'action_id' is required"));
+
+    const auto* action = DeferredActionManager::instance().get_action(id);
+    if (!action)
+        return tool_result_t::error(OBFSTR("Action #") + std::to_string(id) + OBFSTR(" not found"));
+
+    json result;
+    result["action_id"] = action->id;
+    result["condition"] = action->condition_type;
+    result["target"] = action->target_name;
+    result["status"] = deferred_status_to_string(action->status.load());
+
+    if (!action->trigger_info.empty())
+    {
+        try { result["trigger_info"] = json::parse(action->trigger_info); }
+        catch (...) { result["trigger_info"] = action->trigger_info; }
+    }
+
+    if (!action->error.empty())
+        result["error"] = action->error;
+
+    json results_arr = json::array();
+    for (const auto& r : action->results)
+    {
+        json rj;
+        rj["tool"] = r.action_type;
+        rj["success"] = r.success;
+        rj["message"] = r.message;
+        if (!r.data.is_null() && !r.data.empty())
+            rj["data"] = r.data;
+        results_arr.push_back(rj);
+    }
+    result["results"] = results_arr;
+
+    int succeeded = 0;
+    for (const auto& r : action->results)
+        if (r.success) succeeded++;
+    result["succeeded"] = succeeded;
+    result["failed"] = static_cast<int>(action->results.size()) - succeeded;
+    result["total_actions"] = action->tool_calls.size();
+
+    std::string status_str = deferred_status_to_string(action->status.load());
+    return tool_result_t::ok(
+        OBFSTR("Deferred action #") + std::to_string(id) + OBFSTR(": ") + status_str, result);
+}
+
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
@@ -10858,8 +12621,12 @@ void register_tools()
         OBFSTR("driver_dump_module"), OBFSTR("driver"),
         OBFSTR("Dump a complete PE module from the target process using kernel memory reads. "
                "Reads all sections page-by-page, handles packed/obfuscated sections. "
-               "Optionally patches the dumped bytes into the IDA database."),
-        {{OBFSTR("address"), OBFSTR("string"),
+               "Creates IDA segments and patches dumped bytes into the database. "
+               "Can auto-connect to a process by name via the 'process' parameter."),
+        {{OBFSTR("process"), OBFSTR("string"),
+          OBFSTR("Target process name to auto-connect (e.g. 'game.exe'). "
+                 "If omitted, uses currently attached process."), false},
+         {OBFSTR("address"), OBFSTR("string"),
           OBFSTR("Module base address (default: attached process image base)"), false},
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Override image size in bytes (default: auto from PE header)"), false},
          {OBFSTR("output_path"), OBFSTR("string"), OBFSTR("Save dump to file path (e.g. 'C:\\\\dump.bin')"), false},
@@ -10904,27 +12671,6 @@ void register_tools()
         {}, driver_enumerate_modules, false});
 
     registry.register_tool({
-        OBFSTR("driver_dump_to_idb"), OBFSTR("driver"),
-        OBFSTR("Dump PE sections from target process into the IDA database. "
-               "Creates IDA segments for each PE section, patches live bytes from process memory, "
-               "and schedules auto-analysis. Use this to reconstruct packed or obfuscated binaries."),
-        {{OBFSTR("address"), OBFSTR("string"),
-          OBFSTR("Module base address (default: attached process image base)"), false},
-         {OBFSTR("analyze"), OBFSTR("boolean"),
-          OBFSTR("Run IDA auto-analysis after patching (default true)"), false}},
-        driver_dump_to_idb, false});
-
-    registry.register_tool({
-        OBFSTR("driver_bypass_and_dump"), OBFSTR("driver"),
-        OBFSTR("Complete kernel bypass workflow: connect driver Ã¢â€ â€™ find process Ã¢â€ â€™ solve DTB Ã¢â€ â€™ "
-               "dump full image via physical memory Ã¢â€ â€™ patch IDA database. "
-               "Handles VMProtect, Themida, custom packers, and any anti-debug target "
-               "by reading directly from physical memory, bypassing all usermode defenses."),
-        {{OBFSTR("process"), OBFSTR("string"),
-          OBFSTR("Target process executable name (e.g. 'protected.exe')"), true}},
-        driver_bypass_and_dump, false});
-
-    registry.register_tool({
         OBFSTR("driver_enumerate_kernel_modules"), OBFSTR("driver"),
         OBFSTR("Enumerate ALL loaded kernel drivers and modules via NtQuerySystemInformation. "
                "Returns each driver's name, NT path, resolved disk path, kernel base address, "
@@ -10935,14 +12681,15 @@ void register_tools()
           OBFSTR("Case-insensitive substring filter applied to module name and path (e.g. 'eac', 'ntfs')"), false},
          {OBFSTR("limit"), OBFSTR("number"),
           OBFSTR("Maximum number of modules to return (default 500)"), false}},
-        driver_enumerate_kernel_modules, true});
+        driver_enumerate_kernel_modules, false});
 
     registry.register_tool({
         OBFSTR("driver_dump_kernel_module"), OBFSTR("driver"),
-        OBFSTR("Dump a loaded kernel driver/module. By default dumps from LIVE KERNEL MEMORY "
-               "using physical memory reads (requires driver connected). This captures runtime-decrypted, "
+        OBFSTR("UNIVERSAL kernel module dump tool. By default dumps from LIVE KERNEL MEMORY "
+               "using physical memory reads (requires driver connected). Captures runtime-decrypted, "
                "devirtualized, unpacked code as it exists in RAM. Set from_memory=false to fall back "
                "to reading the on-disk .sys file. "
+               "When patch_idb=true, creates IDA segments for each PE section and patches live bytes. "
                "Use this to dump ANY kernel driver: EasyAntiCheat (EAC), BattlEye, Vanguard, "
                "ntkrnlmp.exe, win32kfull.sys, etc. The dump file can be loaded in IDA Pro."),
         {{OBFSTR("module"), OBFSTR("string"),
@@ -10952,7 +12699,11 @@ void register_tools()
                  "If omitted, saves to %%TEMP%%\\\\dumped_<module_name>"), false},
          {OBFSTR("from_memory"), OBFSTR("boolean"),
           OBFSTR("True (default) = dump live kernel memory via driver. "
-                 "False = read on-disk file (no driver needed)."), false}},
+                 "False = read on-disk file (no driver needed)."), false},
+         {OBFSTR("patch_idb"), OBFSTR("boolean"),
+          OBFSTR("Create IDA segments and patch dumped bytes into the database (default true)"), false},
+         {OBFSTR("analyze"), OBFSTR("boolean"),
+          OBFSTR("Run analysis after patching (default true)"), false}},
         driver_dump_kernel_module, false});
 
     registry.register_tool({
@@ -10981,27 +12732,6 @@ void register_tools()
           OBFSTR("Hex bytes to write separated by spaces (e.g. '90 90 90 C3')"), true}},
         driver_write_kernel_memory, false});
 
-    registry.register_tool({
-        OBFSTR("driver_kernel_dump_module"), OBFSTR("driver"),
-        OBFSTR("UNIVERSAL kernel module dump-and-analyze workflow. Finds module in kernel Ã¢â€ â€™ "
-               "reads ALL sections from live kernel memory Ã¢â€ â€™ creates IDA segments Ã¢â€ â€™ "
-               "patches runtime bytes Ã¢â€ â€™ runs FULL 6-step analysis pipeline: "
-               "(1) initial auto-analysis, (2) PE export/entry point parsing with function creation, "
-               "(3) linear sweep code creation across all executable sections (skips high-entropy "
-               "VM bytecode sections automatically), (4) aggressive 18-pattern function prologue "
-               "scanning with instruction validation, (5) CALL/JMP xref target function creation, "
-               "(6) final analysis pass. Returns before/after function counts. "
-               "Works on ANY kernel driver: EAC, BattlEye, Vanguard, ACE, ntkrnlmp.exe, etc. "
-               "Optionally saves dump to file."),
-        {{OBFSTR("module"), OBFSTR("string"),
-          OBFSTR("Kernel module name or substring (e.g. 'EasyAntiCheat.sys', 'BEDaisy', 'vgk.sys')"), true},
-         {OBFSTR("patch_idb"), OBFSTR("boolean"),
-          OBFSTR("Create segments and patch bytes into IDA database (default true)"), false},
-         {OBFSTR("analyze"), OBFSTR("boolean"),
-          OBFSTR("Run full 6-step analysis pipeline after patching (default true)"), false},
-         {OBFSTR("output_path"), OBFSTR("string"),
-          OBFSTR("Optionally save raw dump to file (e.g. 'C:\\\\dumps\\\\eac_memory.sys')"), false}},
-        driver_kernel_dump_module, false});
 
     registry.register_tool({
         OBFSTR("driver_allocate_memory"), OBFSTR("driver"),
@@ -11199,6 +12929,75 @@ void register_tools()
                "Performs a full 4-level page table walk (PML4->PDPT->PD->PT) in kernel."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Virtual address to translate"), true}},
         driver_virtual_to_physical, true});
+
+
+    registry.register_tool({
+        OBFSTR("driver_defer_action"), OBFSTR("driver"),
+        OBFSTR("PRE-SCHEDULE driver tool calls to execute THE INSTANT a kernel module loads "
+               "or a process starts. This solves the critical timing problem: many drivers "
+               "(EAC, BattlEye, Vanguard) wipe their IAT, decrypt code, or perform anti-RE "
+               "operations during initialization. By the time you can manually react, the "
+               "evidence is already destroyed. This tool lets you queue actions (read memory, "
+               "set HW breakpoints, dump module, etc.) that fire IMMEDIATELY when the target "
+               "appears — before its init routine runs. "
+               "\n\nTemplate parameters in action params are resolved at trigger time:\n"
+               "  ${module_base} — runtime kernel base address of the loaded module\n"
+               "  ${module_size} — module image size\n"
+               "  ${module_name} — resolved module filename\n"
+               "  ${pid} — process ID (for process_start)\n"
+               "  ${base_address} — process image base (for process_start)\n"
+               "\nAddress arithmetic: '${module_base}+0x17C000' computes base+offset automatically.\n"
+               "\nExample: to capture EAC's IAT before it's wiped:\n"
+               "  wait_for='kernel_module_load', target='EasyAntiCheat_EOS.sys',\n"
+               "  actions=[{tool:'driver_read_kernel_memory', params:{address:'${module_base}+0x17C000', size:64}}]"),
+        {{OBFSTR("wait_for"), OBFSTR("string"),
+          OBFSTR("Condition type: 'kernel_module_load' or 'process_start'"), true, {},
+          {OBFSTR("kernel_module_load"), OBFSTR("process_start")}},
+         {OBFSTR("target"), OBFSTR("string"),
+          OBFSTR("Module or process name to watch for (case-insensitive substring match). "
+                 "E.g. 'EasyAntiCheat_EOS.sys', 'BEService.exe'"), true},
+         {OBFSTR("actions"), OBFSTR("array"),
+          OBFSTR("Array of tool calls to execute when condition is met. "
+                 "Each entry: {\"tool\": \"tool_name\", \"params\": {...}}. "
+                 "Params may use ${module_base}, ${module_size}, ${pid}, ${base_address} templates."), true, {},
+          json::object({{"type", "object"},
+                        {"properties", json::object({
+                            {"tool", json::object({{"type", "string"}})},
+                            {"params", json::object({{"type", "object"}})}
+                        })}
+          })},
+         {OBFSTR("timeout"), OBFSTR("number"),
+          OBFSTR("Maximum seconds to wait for the condition (default 300 = 5 minutes)"), false},
+         {OBFSTR("poll_interval"), OBFSTR("number"),
+          OBFSTR("Milliseconds between condition checks (default 50ms). Lower = faster reaction "
+                 "but more CPU. For IAT capture, use 10-25ms."), false}},
+        driver_defer_action, false});
+
+    registry.register_tool({
+        OBFSTR("driver_list_deferred_actions"), OBFSTR("driver"),
+        OBFSTR("List all registered deferred actions and their current status "
+               "(pending, watching, triggered, completed, failed, cancelled, timed_out). "
+               "Shows condition, target, number of queued actions, trigger info, and result counts."),
+        {},
+        driver_list_deferred_actions, false});
+
+    registry.register_tool({
+        OBFSTR("driver_cancel_deferred_action"), OBFSTR("driver"),
+        OBFSTR("Cancel a pending/watching deferred action by its action_id. "
+               "Only works if the action hasn't been triggered yet."),
+        {{OBFSTR("action_id"), OBFSTR("number"),
+          OBFSTR("The action ID returned by driver_defer_action"), true}},
+        driver_cancel_deferred_action, false});
+
+    registry.register_tool({
+        OBFSTR("driver_get_deferred_results"), OBFSTR("driver"),
+        OBFSTR("Get the detailed results of a deferred action after it has been triggered. "
+               "Returns the trigger context (module base, PID, etc.), the status of each "
+               "queued tool call (success/failure, output data), and timing information. "
+               "Use this to retrieve data captured by pre-scheduled actions."),
+        {{OBFSTR("action_id"), OBFSTR("number"),
+          OBFSTR("The action ID returned by driver_defer_action"), true}},
+        driver_get_deferred_results, false});
 }
 
 }

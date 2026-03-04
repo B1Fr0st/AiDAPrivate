@@ -86,6 +86,7 @@ async function fbPatch(path, data) {
 const PLANS = ['pro', 'basic', 'enterprise', 'lifetime', 'trial'];
 
 const DURATION_CHOICES = [
+    { name: '1 day',     value: 1   },
     { name: '7 days',    value: 7   },
     { name: '30 days',   value: 30  },
     { name: '90 days',   value: 90  },
