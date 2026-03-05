@@ -191,6 +191,18 @@ tool_result_t ToolRegistry::execute_tool(const std::string& name, const json& pa
             {
                 val = std::to_string(val.get<double>());
             }
+            else if (param.type == "number" && val.is_string())
+            {
+                std::string sv = val.get<std::string>();
+                try {
+                    if (sv.size() > 2 && sv[0] == '0' && (sv[1] == 'x' || sv[1] == 'X'))
+                        val = static_cast<uint64_t>(std::stoull(sv, nullptr, 16));
+                    else if (!sv.empty())
+                        val = static_cast<uint64_t>(std::stoull(sv, nullptr, 0));
+                    else
+                        val = 0;
+                } catch (...) { val = 0; }
+            }
         }
     }
 
@@ -307,11 +319,19 @@ struct pe_fix_result_t
     bool loadconfig_dir_cleared = false;
     bool delay_import_dir_cleared = false;
     bool com_dir_cleared = false;
+    bool is_dotnet = false;
+    bool dotnet_com_preserved = false;
+    bool dotnet_com_restored = false;
     bool imagebase_updated = false;
     std::uint64_t original_imagebase = 0;
     std::uint64_t updated_imagebase = 0;
     bool ep_prologue_scanned = false;
     std::vector<std::string> import_dll_names;
+    bool extended_image = false;
+    std::uint32_t original_size_of_image = 0;
+    std::uint32_t updated_size_of_image = 0;
+    bool vad_section_added = false;
+    int vad_sections_added = 0;
 };
 
 static pe_fix_result_t fix_dumped_pe_image(
@@ -544,14 +564,97 @@ static pe_fix_result_t fix_dumped_pe_image(
 
     {
         std::uint32_t com_dir_off = dd_base + 14 * 8;
-        if (com_dir_off + 8 <= static_cast<std::uint32_t>(image.size()))
+
+
+        bool dotnet_detected = false;
+        std::uint32_t bsjb_rva = 0;
         {
-            std::uint32_t com_rva = *reinterpret_cast<std::uint32_t*>(&image[com_dir_off]);
-            if (com_rva != 0)
+            constexpr std::size_t SCAN_LIMIT = 0x800000;
+            std::size_t scan_end = std::min(image.size(), SCAN_LIMIT);
+            for (std::size_t i = 0x200; i + 4 <= scan_end; i++)
             {
-                *reinterpret_cast<std::uint32_t*>(&image[com_dir_off])     = 0;
-                *reinterpret_cast<std::uint32_t*>(&image[com_dir_off + 4]) = 0;
-                result.com_dir_cleared = true;
+                if (image[i] == 0x42 && image[i + 1] == 0x53 &&
+                    image[i + 2] == 0x4A && image[i + 3] == 0x42)
+                {
+                    dotnet_detected = true;
+                    bsjb_rva = static_cast<std::uint32_t>(i);
+                    break;
+                }
+            }
+        }
+
+        result.is_dotnet = dotnet_detected;
+
+        if (dotnet_detected)
+        {
+            if (com_dir_off + 8 <= static_cast<std::uint32_t>(image.size()))
+            {
+                std::uint32_t com_rva  = *reinterpret_cast<std::uint32_t*>(&image[com_dir_off]);
+                std::uint32_t com_size = *reinterpret_cast<std::uint32_t*>(&image[com_dir_off + 4]);
+
+                if (com_rva != 0 && com_rva < static_cast<std::uint32_t>(image.size()) && com_size >= 72)
+                {
+                    result.dotnet_com_preserved = true;
+                }
+                else if (bsjb_rva > 0)
+                {
+
+                    std::uint32_t metadata_rva = 0;
+                    std::uint32_t metadata_size = 0;
+
+
+                    if (bsjb_rva >= 16)
+                    {
+                        for (std::uint32_t scan = bsjb_rva - 16; scan > 0x200 && scan > bsjb_rva - 0x2000; scan--)
+                        {
+                            if (scan + 72 > static_cast<std::uint32_t>(image.size())) continue;
+
+                            std::uint32_t cb = *reinterpret_cast<std::uint32_t*>(&image[scan]);
+                            if (cb < 72 || cb > 0x1000) continue;
+
+                            std::uint16_t major = *reinterpret_cast<std::uint16_t*>(&image[scan + 4]);
+                            std::uint16_t minor = *reinterpret_cast<std::uint16_t*>(&image[scan + 6]);
+                            if (major < 1 || major > 5) continue;
+                            if (minor > 10) continue;
+
+                            std::uint32_t meta_rva  = *reinterpret_cast<std::uint32_t*>(&image[scan + 8]);
+                            std::uint32_t meta_size = *reinterpret_cast<std::uint32_t*>(&image[scan + 12]);
+
+                            if (meta_rva > 0 && meta_rva < static_cast<std::uint32_t>(image.size()) &&
+                                meta_size > 0 && meta_rva + meta_size <= static_cast<std::uint32_t>(image.size()))
+                            {
+
+                                if (meta_rva <= bsjb_rva && bsjb_rva < meta_rva + meta_size)
+                                {
+                                    *reinterpret_cast<std::uint32_t*>(&image[com_dir_off])     = scan;
+                                    *reinterpret_cast<std::uint32_t*>(&image[com_dir_off + 4]) = cb;
+                                    result.dotnet_com_restored = true;
+                                    metadata_rva = meta_rva;
+                                    metadata_size = meta_size;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (!result.dotnet_com_restored)
+                    {
+                        result.dotnet_com_preserved = true;
+                    }
+                }
+            }
+        }
+        else
+        {
+            if (com_dir_off + 8 <= static_cast<std::uint32_t>(image.size()))
+            {
+                std::uint32_t com_rva = *reinterpret_cast<std::uint32_t*>(&image[com_dir_off]);
+                if (com_rva != 0)
+                {
+                    *reinterpret_cast<std::uint32_t*>(&image[com_dir_off])     = 0;
+                    *reinterpret_cast<std::uint32_t*>(&image[com_dir_off + 4]) = 0;
+                    result.com_dir_cleared = true;
+                }
             }
         }
     }
@@ -901,6 +1004,104 @@ static pe_fix_result_t fix_dumped_pe_image(
     }
 
 
+    result.original_size_of_image = image_size_from_header;
+
+    std::uint32_t sec_align_val = 0x1000;
+    if (opt_off + 36 <= static_cast<std::uint32_t>(image.size()))
+    {
+        std::uint32_t sa = *reinterpret_cast<std::uint32_t*>(&image[opt_off + 32]);
+        if (sa >= 0x200 && sa <= 0x100000)
+            sec_align_val = sa;
+    }
+
+    if (static_cast<std::uint32_t>(image.size()) > image_size_from_header)
+    {
+        result.extended_image = true;
+
+        std::uint32_t last_sec_end = 0;
+        for (int i = 0; i < num_sections && i < 96; i++)
+        {
+            std::uint32_t sec_off = section_table_off + i * 40;
+            if (sec_off + 40 > static_cast<std::uint32_t>(image.size())) break;
+            std::uint32_t va = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 12]);
+            std::uint32_t vs = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 8]);
+            std::uint32_t raw = *reinterpret_cast<std::uint32_t*>(&image[sec_off + 16]);
+            std::uint32_t end = va + ((vs > raw) ? vs : raw);
+            if (end > last_sec_end)
+                last_sec_end = end;
+        }
+
+        std::uint32_t aligned_last = (last_sec_end + sec_align_val - 1) & ~(sec_align_val - 1);
+        if (aligned_last < image_size_from_header)
+            aligned_last = image_size_from_header;
+
+        if (static_cast<std::uint32_t>(image.size()) > aligned_last)
+        {
+            std::uint16_t cur_num_sections = *reinterpret_cast<std::uint16_t*>(&image[pe_off + 6]);
+            std::uint32_t cur_sec_table_off = pe_off + 24 + opt_hdr_size;
+
+            std::uint32_t remaining_start = aligned_last;
+            std::uint32_t remaining_total = static_cast<std::uint32_t>(image.size()) - remaining_start;
+
+            constexpr std::uint32_t MAX_VAD_SECTION_SIZE = 0x40000000u;
+            int vad_idx = 0;
+
+            while (remaining_total > 0 && vad_idx < 16)
+            {
+                std::uint32_t chunk_size = remaining_total;
+                if (chunk_size > MAX_VAD_SECTION_SIZE)
+                    chunk_size = MAX_VAD_SECTION_SIZE;
+
+                std::uint32_t chunk_aligned = (chunk_size + sec_align_val - 1) & ~(sec_align_val - 1);
+
+                std::uint32_t new_sec_header_off = cur_sec_table_off + cur_num_sections * 40;
+                if (new_sec_header_off + 40 > remaining_start &&
+                    new_sec_header_off + 40 > static_cast<std::uint32_t>(image.size()))
+                    break;
+
+                if (new_sec_header_off + 40 > remaining_start)
+                    break;
+
+                char sec_name_buf[9] = {};
+                if (vad_idx == 0)
+                    std::memcpy(sec_name_buf, ".vad\0\0\0\0", 8);
+                else
+                    qsnprintf(sec_name_buf, sizeof(sec_name_buf), ".vad%d", vad_idx);
+
+                std::memset(&image[new_sec_header_off], 0, 40);
+                std::memcpy(&image[new_sec_header_off], sec_name_buf, 8);
+                *reinterpret_cast<std::uint32_t*>(&image[new_sec_header_off + 8])  = chunk_aligned;
+                *reinterpret_cast<std::uint32_t*>(&image[new_sec_header_off + 12]) = remaining_start;
+                *reinterpret_cast<std::uint32_t*>(&image[new_sec_header_off + 16]) = chunk_aligned;
+                *reinterpret_cast<std::uint32_t*>(&image[new_sec_header_off + 20]) = remaining_start;
+                *reinterpret_cast<std::uint32_t*>(&image[new_sec_header_off + 36]) = 0xE0000060u;
+
+                cur_num_sections++;
+                result.vad_sections_added++;
+                result.sections_fixed++;
+
+                remaining_start += chunk_aligned;
+                remaining_total = (remaining_start < static_cast<std::uint32_t>(image.size()))
+                    ? static_cast<std::uint32_t>(image.size()) - remaining_start
+                    : 0;
+                vad_idx++;
+            }
+
+            *reinterpret_cast<std::uint16_t*>(&image[pe_off + 6]) = cur_num_sections;
+            result.vad_section_added = (result.vad_sections_added > 0);
+        }
+
+        std::uint32_t new_soi = (static_cast<std::uint32_t>(image.size()) + sec_align_val - 1)
+                                & ~(sec_align_val - 1);
+        *reinterpret_cast<std::uint32_t*>(&image[opt_off + 56]) = new_soi;
+        result.updated_size_of_image = new_soi;
+    }
+    else
+    {
+        result.updated_size_of_image = image_size_from_header;
+    }
+
+
     result.success = true;
     return result;
 }
@@ -947,6 +1148,14 @@ static nlohmann::json pe_fix_to_json(const pe_fix_result_t& fix)
         j["delay_import_dir_cleared"] = true;
     if (fix.com_dir_cleared)
         j["com_dir_cleared"]     = true;
+    if (fix.is_dotnet)
+    {
+        j["is_dotnet"]           = true;
+        if (fix.dotnet_com_preserved)
+            j["dotnet_com_preserved"] = true;
+        if (fix.dotnet_com_restored)
+            j["dotnet_com_restored"]  = true;
+    }
     if (fix.imagebase_updated)
     {
         j["imagebase_updated"]       = true;
@@ -955,6 +1164,14 @@ static nlohmann::json pe_fix_to_json(const pe_fix_result_t& fix)
     }
     if (!fix.import_dll_names.empty())
         j["import_dlls"]       = fix.import_dll_names;
+    if (fix.extended_image)
+    {
+        j["extended_image"]         = true;
+        j["original_size_of_image"] = fmt_rva(fix.original_size_of_image);
+        j["updated_size_of_image"]  = fmt_rva(fix.updated_size_of_image);
+        if (fix.vad_section_added)
+            j["vad_sections_added"]  = fix.vad_sections_added;
+    }
     if (!fix.error.empty())
         j["pe_fix_error"]      = fix.error;
     return j;
@@ -1685,6 +1902,666 @@ static nlohmann::json iat_rebuild_to_json(const iat_rebuild_result_t& r)
     if (!r.error.empty())
         j["iat_rebuild_error"]    = r.error;
     return j;
+}
+
+
+struct export_entry_info_t
+{
+    std::string   dll_name;
+    std::string   func_name;
+    std::uint16_t hint;
+    std::uint16_t ordinal;
+    bool          by_ordinal;
+};
+
+
+static std::unordered_map<std::uint64_t, export_entry_info_t> build_module_export_map(
+    voyager::device_t* dev,
+    const std::vector<module_range_t>& modules,
+    bool is_kernel)
+{
+    std::unordered_map<std::uint64_t, export_entry_info_t> map;
+    map.reserve(32768);
+
+    for (const auto& m : modules)
+    {
+        std::uint8_t hdr[0x1000];
+        std::size_t hdr_read = is_kernel
+            ? dev->read_kernel_raw(m.base, hdr, sizeof(hdr))
+            : dev->read_raw(m.base, hdr, sizeof(hdr));
+
+        if (hdr_read < 0x100 || hdr[0] != 'M' || hdr[1] != 'Z')
+            continue;
+
+        std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&hdr[0x3C]);
+        if (pe_off + 0x18 >= hdr_read) continue;
+        if (hdr[pe_off] != 'P' || hdr[pe_off + 1] != 'E') continue;
+
+        std::uint16_t opt_mag = *reinterpret_cast<std::uint16_t*>(&hdr[pe_off + 0x18]);
+        bool pe64 = (opt_mag == 0x020B);
+        std::uint32_t dd_off = pe_off + 0x18 + (pe64 ? 112 : 96);
+        if (dd_off + 8 > hdr_read) continue;
+
+        std::uint32_t export_rva  = *reinterpret_cast<std::uint32_t*>(&hdr[dd_off]);
+        std::uint32_t export_size = *reinterpret_cast<std::uint32_t*>(&hdr[dd_off + 4]);
+        if (export_rva == 0 || export_size == 0) continue;
+
+        std::uint8_t edir[40];
+        std::size_t er = is_kernel
+            ? dev->read_kernel_raw(m.base + export_rva, edir, 40)
+            : dev->read_raw(m.base + export_rva, edir, 40);
+        if (er < 40) continue;
+
+        std::uint32_t ordinal_base  = *reinterpret_cast<std::uint32_t*>(&edir[16]);
+        std::uint32_t num_functions = *reinterpret_cast<std::uint32_t*>(&edir[20]);
+        std::uint32_t num_names     = *reinterpret_cast<std::uint32_t*>(&edir[24]);
+        std::uint32_t funcs_rva     = *reinterpret_cast<std::uint32_t*>(&edir[28]);
+        std::uint32_t names_rva     = *reinterpret_cast<std::uint32_t*>(&edir[32]);
+        std::uint32_t ords_rva      = *reinterpret_cast<std::uint32_t*>(&edir[36]);
+
+        if (num_functions == 0 || num_functions > 200000) continue;
+
+        std::size_t ft_bytes = static_cast<std::size_t>(num_functions) * 4;
+        if (ft_bytes > 0x200000) continue;
+        std::vector<std::uint32_t> func_rvas(num_functions);
+        std::size_t ft_read = is_kernel
+            ? dev->read_kernel_raw(m.base + funcs_rva, func_rvas.data(), ft_bytes)
+            : dev->read_raw(m.base + funcs_rva, func_rvas.data(), ft_bytes);
+        if (ft_read < ft_bytes) continue;
+
+        std::unordered_map<std::uint32_t, std::pair<std::string, std::uint16_t>> ord_to_name;
+        if (num_names > 0 && num_names <= 200000)
+        {
+            std::vector<std::uint16_t> ordinals(num_names);
+            std::vector<std::uint32_t> name_rva_arr(num_names);
+            is_kernel
+                ? dev->read_kernel_raw(m.base + ords_rva, ordinals.data(), num_names * 2)
+                : dev->read_raw(m.base + ords_rva, ordinals.data(), num_names * 2);
+            is_kernel
+                ? dev->read_kernel_raw(m.base + names_rva, name_rva_arr.data(), num_names * 4)
+                : dev->read_raw(m.base + names_rva, name_rva_arr.data(), num_names * 4);
+
+            for (std::uint32_t ni = 0; ni < num_names; ni++)
+            {
+                if (name_rva_arr[ni] == 0) continue;
+                char nbuf[300] = {};
+                is_kernel
+                    ? dev->read_kernel_raw(m.base + name_rva_arr[ni], nbuf, sizeof(nbuf) - 1)
+                    : dev->read_raw(m.base + name_rva_arr[ni], nbuf, sizeof(nbuf) - 1);
+                if (nbuf[0] != 0)
+                    ord_to_name[ordinals[ni]] = { std::string(nbuf), static_cast<std::uint16_t>(ni) };
+            }
+        }
+
+        std::string dll_name = m.name;
+        auto slash_pos = dll_name.find_last_of("\\/");
+        if (slash_pos != std::string::npos)
+            dll_name = dll_name.substr(slash_pos + 1);
+
+        for (std::uint32_t i = 0; i < num_functions; i++)
+        {
+            if (func_rvas[i] == 0) continue;
+            if (func_rvas[i] >= export_rva && func_rvas[i] < export_rva + export_size)
+                continue;
+
+            std::uint64_t addr = m.base + func_rvas[i];
+
+            export_entry_info_t info;
+            info.dll_name = dll_name;
+            info.ordinal  = static_cast<std::uint16_t>(i + ordinal_base);
+
+            auto nit = ord_to_name.find(i);
+            if (nit != ord_to_name.end())
+            {
+                info.func_name  = nit->second.first;
+                info.hint       = nit->second.second;
+                info.by_ordinal = false;
+            }
+            else
+            {
+                info.by_ordinal = true;
+                info.hint       = 0;
+            }
+
+            map.emplace(addr, std::move(info));
+        }
+    }
+
+    return map;
+}
+
+
+static int patch_import_call_references(
+    std::vector<std::uint8_t>& image,
+    const std::unordered_map<std::uint32_t, std::uint32_t>& old_iat_to_new_iat,
+    bool is_pe64)
+{
+    if (!is_pe64 || old_iat_to_new_iat.empty())
+        return 0;
+
+    if (image.size() < 0x200)
+        return 0;
+
+    std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&image[0x3C]);
+    std::uint16_t num_sections = *reinterpret_cast<std::uint16_t*>(&image[pe_off + 6]);
+    std::uint16_t opt_size     = *reinterpret_cast<std::uint16_t*>(&image[pe_off + 0x14]);
+    std::uint32_t sec_table    = pe_off + 0x18 + opt_size;
+
+    int patched = 0;
+
+    for (int si = 0; si < num_sections && si < 96; si++)
+    {
+        std::uint32_t soff = sec_table + si * 40;
+        if (soff + 40 > static_cast<std::uint32_t>(image.size())) break;
+
+        std::uint32_t vrva  = *reinterpret_cast<std::uint32_t*>(&image[soff + 12]);
+        std::uint32_t vsize = *reinterpret_cast<std::uint32_t*>(&image[soff + 8]);
+        std::uint32_t chars = *reinterpret_cast<std::uint32_t*>(&image[soff + 36]);
+
+        if (!(chars & 0x20000000)) continue;
+        if (vrva == 0 || vsize == 0) continue;
+
+        std::uint32_t scan_end = vrva + vsize;
+        if (scan_end > static_cast<std::uint32_t>(image.size()))
+            scan_end = static_cast<std::uint32_t>(image.size());
+
+        for (std::uint32_t off = vrva; off + 6 < scan_end; off++)
+        {
+            bool is_call = (image[off] == 0xFF && image[off + 1] == 0x15);
+            bool is_jmp  = (off + 7 < scan_end &&
+                            image[off] == 0x48 && image[off + 1] == 0xFF && image[off + 2] == 0x25);
+
+
+            bool is_mov_rip = (off + 7 < scan_end &&
+                               (image[off] == 0x48 || image[off] == 0x4C) &&
+                               image[off + 1] == 0x8B &&
+                               (image[off + 2] & 0xC7) == 0x05);
+
+            if (!is_call && !is_jmp && !is_mov_rip) continue;
+
+            std::uint32_t disp_off = is_call ? (off + 2) : (off + 3);
+            std::uint32_t inst_end = is_call ? (off + 6) : (off + 7);
+
+            if (disp_off + 4 > static_cast<std::uint32_t>(image.size())) continue;
+
+            std::int32_t disp = *reinterpret_cast<std::int32_t*>(&image[disp_off]);
+            std::uint32_t target_rva = static_cast<std::uint32_t>(
+                static_cast<std::int64_t>(inst_end) + disp);
+
+            auto it = old_iat_to_new_iat.find(target_rva);
+            if (it == old_iat_to_new_iat.end()) continue;
+
+            std::int32_t new_disp = static_cast<std::int32_t>(
+                static_cast<std::int64_t>(it->second) - static_cast<std::int64_t>(inst_end));
+            *reinterpret_cast<std::int32_t*>(&image[disp_off]) = new_disp;
+            patched++;
+        }
+    }
+
+    return patched;
+}
+
+
+static iat_rebuild_result_t full_iat_scan_and_rebuild(
+    std::vector<std::uint8_t>& image,
+    std::uint64_t module_base,
+    voyager::device_t* dev,
+    bool is_kernel)
+{
+    iat_rebuild_result_t result;
+
+    if (!dev || !dev->is_connected())
+    {
+        result.error = "Device not connected";
+        return result;
+    }
+
+    if (image.size() < 0x200 || image[0] != 'M' || image[1] != 'Z')
+    {
+        result.error = "Invalid PE image";
+        return result;
+    }
+
+    std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&image[0x3C]);
+    if (pe_off + 0x18 >= static_cast<std::uint32_t>(image.size()) ||
+        image[pe_off] != 'P' || image[pe_off + 1] != 'E')
+    {
+        result.error = "Invalid PE header";
+        return result;
+    }
+
+    std::uint16_t num_sections = *reinterpret_cast<std::uint16_t*>(&image[pe_off + 6]);
+    std::uint16_t opt_hdr_size = *reinterpret_cast<std::uint16_t*>(&image[pe_off + 20]);
+    std::uint32_t opt_off      = pe_off + 24;
+    std::uint16_t opt_magic    = *reinterpret_cast<std::uint16_t*>(&image[opt_off]);
+    bool is_pe64 = (opt_magic == 0x020B);
+
+    if (!is_pe64 && opt_magic != 0x010B)
+    {
+        result.error = "Unknown PE magic";
+        return result;
+    }
+
+    std::uint32_t section_alignment = *reinterpret_cast<std::uint32_t*>(&image[opt_off + 32]);
+    if (section_alignment == 0) section_alignment = 0x1000;
+
+    std::uint32_t sec_table_off = pe_off + 24 + opt_hdr_size;
+    std::uint32_t thunk_size    = is_pe64 ? 8u : 4u;
+    std::uint32_t dd_base       = is_pe64 ? (opt_off + 112) : (opt_off + 96);
+
+    std::vector<module_range_t> modules;
+    if (is_kernel)
+        modules = enumerate_kernel_modules_for_iat();
+    else
+        modules = enumerate_ldr_modules_for_iat(dev);
+
+    if (modules.empty())
+    {
+        result.error = "No modules found for export map";
+        return result;
+    }
+
+    msg(OBFSTR_C("AiDA: Building export address map from %zu modules...\n"), modules.size());
+    auto export_map = build_module_export_map(dev, modules, is_kernel);
+
+    if (export_map.empty())
+    {
+        result.error = "Export map empty — no module exports readable";
+        return result;
+    }
+
+    msg(OBFSTR_C("AiDA: Export map built with %zu entries, scanning image for imports...\n"),
+        export_map.size());
+
+    struct found_import_t
+    {
+        std::uint32_t iat_offset;
+        std::string   dll_name;
+        std::string   func_name;
+        std::uint16_t hint;
+        std::uint16_t ordinal;
+        bool          by_ordinal;
+    };
+
+    std::map<std::string, std::vector<found_import_t>> dll_imports;
+    std::set<std::uint32_t> found_offsets;
+
+    auto try_resolve = [&](std::uint32_t off, std::uint64_t val) -> bool
+    {
+        if (val == 0 || found_offsets.count(off))
+            return false;
+
+        auto it = export_map.find(val);
+        if (it == export_map.end())
+            return false;
+
+        if (val >= module_base && val < module_base + static_cast<std::uint64_t>(image.size()))
+            return false;
+
+        const auto& info = it->second;
+        found_offsets.insert(off);
+
+        std::string dll_key = info.dll_name;
+        for (auto& c : dll_key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        found_import_t fi;
+        fi.iat_offset  = off;
+        fi.dll_name    = info.dll_name;
+        fi.func_name   = info.func_name;
+        fi.hint        = info.hint;
+        fi.ordinal     = info.ordinal;
+        fi.by_ordinal  = info.by_ordinal;
+        dll_imports[dll_key].push_back(fi);
+        return true;
+    };
+
+    for (int si = 0; si < num_sections && si < 96; si++)
+    {
+        std::uint32_t soff  = sec_table_off + si * 40;
+        if (soff + 40 > static_cast<std::uint32_t>(image.size())) break;
+
+        std::uint32_t vrva  = *reinterpret_cast<std::uint32_t*>(&image[soff + 12]);
+        std::uint32_t vsize = *reinterpret_cast<std::uint32_t*>(&image[soff + 8]);
+        std::uint32_t chars = *reinterpret_cast<std::uint32_t*>(&image[soff + 36]);
+
+        if (vrva == 0 || vsize == 0) continue;
+        if (chars & 0x20000000) continue;
+
+        std::uint32_t scan_end = vrva + vsize;
+        if (scan_end > static_cast<std::uint32_t>(image.size()))
+            scan_end = static_cast<std::uint32_t>(image.size());
+
+        for (std::uint32_t off = vrva; off + thunk_size <= scan_end; off += thunk_size)
+        {
+            std::uint64_t dump_val = 0;
+            if (is_pe64)
+                dump_val = *reinterpret_cast<std::uint64_t*>(&image[off]);
+            else
+                dump_val = *reinterpret_cast<std::uint32_t*>(&image[off]);
+
+            if (dump_val == 0) continue;
+
+            if (try_resolve(off, dump_val))
+                continue;
+
+            std::uint64_t live_val = 0;
+            if (is_kernel)
+                dev->read_kernel_raw(module_base + off, &live_val, thunk_size);
+            else
+                dev->read_raw(module_base + off, &live_val, thunk_size);
+            if (!is_pe64)
+                live_val &= 0xFFFFFFFF;
+
+            if (live_val != 0 && live_val != dump_val)
+                try_resolve(off, live_val);
+        }
+    }
+
+    if (is_pe64)
+    {
+        for (int si = 0; si < num_sections && si < 96; si++)
+        {
+            std::uint32_t soff  = sec_table_off + si * 40;
+            if (soff + 40 > static_cast<std::uint32_t>(image.size())) break;
+
+            std::uint32_t vrva  = *reinterpret_cast<std::uint32_t*>(&image[soff + 12]);
+            std::uint32_t vsize = *reinterpret_cast<std::uint32_t*>(&image[soff + 8]);
+            std::uint32_t chars = *reinterpret_cast<std::uint32_t*>(&image[soff + 36]);
+
+            if (!(chars & 0x20000000)) continue;
+            if (vrva == 0 || vsize == 0) continue;
+
+            std::uint32_t scan_end = vrva + vsize;
+            if (scan_end > static_cast<std::uint32_t>(image.size()))
+                scan_end = static_cast<std::uint32_t>(image.size());
+
+            for (std::uint32_t off = vrva; off + 7 < scan_end; off++)
+            {
+                bool is_call = (image[off] == 0xFF && image[off + 1] == 0x15);
+                bool is_jmp  = (off + 7 < scan_end &&
+                                image[off] == 0x48 && image[off + 1] == 0xFF && image[off + 2] == 0x25);
+
+                if (!is_call && !is_jmp) continue;
+
+                std::uint32_t disp_off = is_call ? (off + 2) : (off + 3);
+                std::uint32_t inst_end = is_call ? (off + 6) : (off + 7);
+                if (disp_off + 4 > static_cast<std::uint32_t>(image.size())) continue;
+
+                std::int32_t disp = *reinterpret_cast<std::int32_t*>(&image[disp_off]);
+                std::int64_t target_rva64 = static_cast<std::int64_t>(inst_end) + disp;
+                if (target_rva64 < 0 || target_rva64 + static_cast<std::int64_t>(thunk_size) >
+                    static_cast<std::int64_t>(image.size()))
+                    continue;
+
+                std::uint32_t target_off = static_cast<std::uint32_t>(target_rva64);
+
+                std::uint64_t slot_val = *reinterpret_cast<std::uint64_t*>(&image[target_off]);
+                if (slot_val == 0) continue;
+
+                if (!try_resolve(target_off, slot_val))
+                {
+                    std::uint64_t live_val = 0;
+                    if (is_kernel)
+                        dev->read_kernel_raw(module_base + target_off, &live_val, 8);
+                    else
+                        dev->read_raw(module_base + target_off, &live_val, 8);
+                    if (live_val != 0 && live_val != slot_val)
+                        try_resolve(target_off, live_val);
+                }
+            }
+        }
+    }
+
+    int total_imports = 0;
+    for (const auto& [k, v] : dll_imports)
+        total_imports += static_cast<int>(v.size());
+
+    if (total_imports == 0)
+    {
+        result.success = true;
+        return result;
+    }
+
+    msg(OBFSTR_C("AiDA: Full IAT scan found %d imports across %zu DLLs\n"),
+        total_imports, dll_imports.size());
+
+    std::size_t descriptors_size = (dll_imports.size() + 1) * 20;
+    std::size_t dll_names_size   = 0;
+    std::size_t hint_names_size  = 0;
+    std::size_t ilt_total        = 0;
+    std::size_t iat_total        = 0;
+
+    for (const auto& [dll_key, entries] : dll_imports)
+    {
+        if (entries.empty()) continue;
+        dll_names_size += entries[0].dll_name.size() + 1;
+        if (dll_names_size & 1) dll_names_size++;
+
+        for (const auto& e : entries)
+        {
+            if (!e.by_ordinal && !e.func_name.empty())
+            {
+                std::size_t entry = 2 + e.func_name.size() + 1;
+                if (entry & 1) entry++;
+                hint_names_size += entry;
+            }
+        }
+
+        ilt_total += (entries.size() + 1) * thunk_size;
+        iat_total += (entries.size() + 1) * thunk_size;
+    }
+
+    std::size_t new_data_raw = descriptors_size + dll_names_size + hint_names_size + ilt_total + iat_total;
+
+    std::uint32_t original_image_size = static_cast<std::uint32_t>(image.size());
+    std::uint32_t new_section_rva =
+        (original_image_size + section_alignment - 1) & ~(section_alignment - 1);
+    std::uint32_t new_section_vsize =
+        (static_cast<std::uint32_t>(new_data_raw) + section_alignment - 1) & ~(section_alignment - 1);
+    if (new_section_vsize == 0) new_section_vsize = section_alignment;
+
+    image.resize(new_section_rva + new_section_vsize, 0);
+
+    std::uint32_t new_sec_hdr = sec_table_off + num_sections * 40;
+    if (new_sec_hdr + 40 <= new_section_rva &&
+        new_sec_hdr + 40 <= static_cast<std::uint32_t>(image.size()))
+    {
+        std::memset(&image[new_sec_hdr], 0, 40);
+        std::memcpy(&image[new_sec_hdr], ".aidai\0\0", 8);
+        *reinterpret_cast<std::uint32_t*>(&image[new_sec_hdr + 8])  = new_section_vsize;
+        *reinterpret_cast<std::uint32_t*>(&image[new_sec_hdr + 12]) = new_section_rva;
+        *reinterpret_cast<std::uint32_t*>(&image[new_sec_hdr + 16]) = new_section_vsize;
+        *reinterpret_cast<std::uint32_t*>(&image[new_sec_hdr + 20]) = new_section_rva;
+        *reinterpret_cast<std::uint32_t*>(&image[new_sec_hdr + 36]) = 0xC0000040;
+
+        *reinterpret_cast<std::uint16_t*>(&image[pe_off + 6]) =
+            static_cast<std::uint16_t>(num_sections + 1);
+        result.section_added = true;
+    }
+
+    *reinterpret_cast<std::uint32_t*>(&image[opt_off + 56]) = new_section_rva + new_section_vsize;
+
+    std::uint32_t cursor = new_section_rva;
+
+    std::uint32_t descriptors_rva = cursor;
+    std::uint32_t descriptors_end = cursor + static_cast<std::uint32_t>(descriptors_size);
+    cursor = descriptors_end;
+
+    struct dll_layout_t
+    {
+        std::string dll_key;
+        std::uint32_t name_rva;
+        std::uint32_t ilt_rva;
+        std::uint32_t iat_rva;
+        std::vector<std::uint32_t> hint_name_rvas;
+        std::vector<bool> by_ordinal_flags;
+        std::vector<std::uint16_t> ordinals;
+    };
+    std::vector<dll_layout_t> layouts;
+
+    for (const auto& [dll_key, entries] : dll_imports)
+    {
+        if (entries.empty()) continue;
+        dll_layout_t layout;
+        layout.dll_key = dll_key;
+
+        layout.name_rva = cursor;
+        const std::string& dn = entries[0].dll_name;
+        std::memcpy(&image[cursor], dn.c_str(), dn.size());
+        cursor += static_cast<std::uint32_t>(dn.size());
+        image[cursor++] = 0;
+        if (cursor & 1) cursor++;
+
+        for (const auto& e : entries)
+        {
+            layout.by_ordinal_flags.push_back(e.by_ordinal);
+            layout.ordinals.push_back(e.ordinal);
+
+            if (!e.by_ordinal && !e.func_name.empty())
+            {
+                std::uint32_t hn_rva = cursor;
+                *reinterpret_cast<std::uint16_t*>(&image[cursor]) = e.hint;
+                cursor += 2;
+                std::memcpy(&image[cursor], e.func_name.c_str(), e.func_name.size());
+                cursor += static_cast<std::uint32_t>(e.func_name.size());
+                image[cursor++] = 0;
+                if (cursor & 1) cursor++;
+                layout.hint_name_rvas.push_back(hn_rva);
+            }
+            else
+            {
+                layout.hint_name_rvas.push_back(0);
+            }
+        }
+
+        layouts.push_back(std::move(layout));
+    }
+
+    std::unordered_map<std::uint32_t, std::uint32_t> old_to_new_iat;
+
+    int layout_idx = 0;
+    for (auto& [dll_key, entries] : dll_imports)
+    {
+        if (entries.empty()) continue;
+        auto& layout = layouts[layout_idx++];
+
+        layout.ilt_rva = cursor;
+        for (std::size_t i = 0; i < entries.size(); i++)
+        {
+            std::uint64_t val = 0;
+            if (layout.by_ordinal_flags[i])
+                val = (is_pe64 ? 0x8000000000000000ULL : 0x80000000ULL) | layout.ordinals[i];
+            else
+                val = layout.hint_name_rvas[i];
+
+            if (is_pe64)
+                *reinterpret_cast<std::uint64_t*>(&image[cursor]) = val;
+            else
+                *reinterpret_cast<std::uint32_t*>(&image[cursor]) = static_cast<std::uint32_t>(val);
+            cursor += thunk_size;
+        }
+        if (is_pe64)
+            *reinterpret_cast<std::uint64_t*>(&image[cursor]) = 0;
+        else
+            *reinterpret_cast<std::uint32_t*>(&image[cursor]) = 0;
+        cursor += thunk_size;
+
+        layout.iat_rva = cursor;
+        for (std::size_t i = 0; i < entries.size(); i++)
+        {
+            std::uint64_t val = 0;
+            if (layout.by_ordinal_flags[i])
+                val = (is_pe64 ? 0x8000000000000000ULL : 0x80000000ULL) | layout.ordinals[i];
+            else
+                val = layout.hint_name_rvas[i];
+
+            if (is_pe64)
+                *reinterpret_cast<std::uint64_t*>(&image[cursor]) = val;
+            else
+                *reinterpret_cast<std::uint32_t*>(&image[cursor]) = static_cast<std::uint32_t>(val);
+
+            old_to_new_iat[entries[i].iat_offset] = cursor;
+            cursor += thunk_size;
+        }
+        if (is_pe64)
+            *reinterpret_cast<std::uint64_t*>(&image[cursor]) = 0;
+        else
+            *reinterpret_cast<std::uint32_t*>(&image[cursor]) = 0;
+        cursor += thunk_size;
+    }
+
+    layout_idx = 0;
+    for (auto& [dll_key, entries] : dll_imports)
+    {
+        if (entries.empty()) continue;
+        auto& layout = layouts[layout_idx];
+        std::uint32_t desc_off = descriptors_rva + layout_idx * 20;
+
+        *reinterpret_cast<std::uint32_t*>(&image[desc_off + 0])  = layout.ilt_rva;
+        *reinterpret_cast<std::uint32_t*>(&image[desc_off + 4])  = 0;
+        *reinterpret_cast<std::uint32_t*>(&image[desc_off + 8])  = static_cast<std::uint32_t>(-1);
+        *reinterpret_cast<std::uint32_t*>(&image[desc_off + 12]) = layout.name_rva;
+        *reinterpret_cast<std::uint32_t*>(&image[desc_off + 16]) = layout.iat_rva;
+
+        layout_idx++;
+
+        bool dll_already = false;
+        for (const auto& rd : result.resolved_dlls)
+            if (rd == entries[0].dll_name) { dll_already = true; break; }
+        if (!dll_already)
+            result.resolved_dlls.push_back(entries[0].dll_name);
+    }
+
+    std::uint32_t null_desc_off = descriptors_rva + layout_idx * 20;
+    if (null_desc_off + 20 <= static_cast<std::uint32_t>(image.size()))
+        std::memset(&image[null_desc_off], 0, 20);
+
+    std::uint32_t import_dir_off = dd_base + 1 * 8;
+    if (import_dir_off + 8 <= static_cast<std::uint32_t>(image.size()))
+    {
+        *reinterpret_cast<std::uint32_t*>(&image[import_dir_off])     = descriptors_rva;
+        *reinterpret_cast<std::uint32_t*>(&image[import_dir_off + 4]) =
+            static_cast<std::uint32_t>(descriptors_size);
+    }
+
+    for (auto& [dll_key, entries] : dll_imports)
+    {
+        for (const auto& e : entries)
+        {
+            std::uint32_t off = e.iat_offset;
+            if (off + thunk_size > original_image_size) continue;
+
+            auto new_it = old_to_new_iat.find(off);
+            if (new_it == old_to_new_iat.end()) continue;
+
+            std::uint32_t new_iat_off = new_it->second;
+            if (new_iat_off + thunk_size > static_cast<std::uint32_t>(image.size())) continue;
+
+            if (is_pe64)
+            {
+                std::uint64_t new_val = *reinterpret_cast<std::uint64_t*>(&image[new_iat_off]);
+                *reinterpret_cast<std::uint64_t*>(&image[off]) = new_val;
+            }
+            else
+            {
+                std::uint32_t new_val = *reinterpret_cast<std::uint32_t*>(&image[new_iat_off]);
+                *reinterpret_cast<std::uint32_t*>(&image[off]) = new_val;
+            }
+        }
+    }
+
+    int xrefs_patched = patch_import_call_references(image, old_to_new_iat, is_pe64);
+    if (xrefs_patched > 0)
+        msg(OBFSTR_C("AiDA: Patched %d import call/jmp cross-references to new IAT\n"), xrefs_patched);
+
+    result.success = true;
+    result.imports_resolved = total_imports;
+    result.descriptors_rebuilt = static_cast<int>(dll_imports.size());
+
+    msg(OBFSTR_C("AiDA: Full IAT rebuild complete — %d imports, %d DLLs, %d xrefs patched\n"),
+        total_imports, static_cast<int>(dll_imports.size()), xrefs_patched);
+
+    return result;
 }
 
 
@@ -10176,6 +11053,825 @@ tool_result_t driver_write_memory(const json& params)
     return tool_result_t::ok(OBFSTR("Kernel write: ") + std::to_string(written) + " bytes", result);
 }
 
+
+struct vad_dump_plan_t
+{
+    std::uint64_t module_base = 0;
+    std::uint64_t pe_size_of_image = 0;
+    std::uint64_t total_span = 0;
+    std::uint64_t total_committed_bytes = 0;
+    int committed_region_count = 0;
+    bool used_vad = false;
+
+    struct region_t
+    {
+        std::uint64_t offset;
+        std::uint64_t size;
+        std::uint32_t protect;
+    };
+    std::vector<region_t> regions;
+};
+
+
+static std::vector<voyager::detail::region_entry> enumerate_all_memory_regions_paginated(
+    voyager::device_t* dev,
+    std::uint64_t start,
+    std::uint64_t end_addr,
+    bool include_all)
+{
+
+
+    std::vector<voyager::detail::region_entry> all_regions;
+    std::uint64_t current_start = start;
+    constexpr int MAX_PAGINATION_ROUNDS = 256;
+
+    for (int round = 0; round < MAX_PAGINATION_ROUNDS; round++)
+    {
+        if (current_start >= end_addr)
+            break;
+
+        auto batch = dev->enumerate_memory_regions(current_start, end_addr, include_all);
+        if (batch.empty())
+            break;
+
+        std::uint64_t batch_max_end = 0;
+        for (const auto& r : batch)
+        {
+            all_regions.push_back(r);
+            std::uint64_t rend = r.base + r.size;
+            if (rend > batch_max_end)
+                batch_max_end = rend;
+        }
+
+
+        if (batch.size() < voyager::detail::MAX_ENUM_REGIONS)
+            break;
+
+
+        if (batch_max_end <= current_start)
+            break;
+        current_start = batch_max_end;
+    }
+
+    return all_regions;
+}
+
+static std::uint64_t get_ldr_module_size(voyager::device_t* dev, std::uint64_t module_base)
+{
+
+
+    if (!dev || !dev->is_connected() || dev->get_process_id() == 0)
+        return 0;
+
+    voyager::device_t::peb_info peb{};
+    if (!dev->read_peb(peb) || peb.ldr_address == 0)
+        return 0;
+
+
+    std::uint64_t list_head = peb.ldr_address + 0x10;
+    std::uint64_t first_entry = dev->read<std::uint64_t>(list_head);
+    if (first_entry == 0 || first_entry == list_head)
+        return 0;
+
+    std::uint64_t current = first_entry;
+    int max_iter = 1024;
+
+    while (current != list_head && current != 0 && max_iter-- > 0)
+    {
+        std::uint64_t dll_base = dev->read<std::uint64_t>(current + 0x30);
+        if (dll_base == module_base)
+        {
+            std::uint32_t ldr_size = dev->read<std::uint32_t>(current + 0x40);
+            if (ldr_size > 0)
+                return static_cast<std::uint64_t>(ldr_size);
+        }
+        std::uint64_t next = dev->read<std::uint64_t>(current);
+        if (next == current) break;
+        current = next;
+    }
+
+    return 0;
+}
+
+static void cleanup_exception_directory(
+    std::vector<std::uint8_t>& image,
+    bool is_pe64)
+{
+
+
+    if (image.size() < 0x200 || !is_pe64)
+        return;
+
+    std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&image[0x3C]);
+    std::uint32_t opt_off = pe_off + 24;
+
+
+    std::uint32_t dd_base = opt_off + 112;
+    std::uint32_t exc_dir_off = dd_base + 3 * 8;
+    if (exc_dir_off + 8 > static_cast<std::uint32_t>(image.size()))
+        return;
+
+    std::uint32_t exc_rva  = *reinterpret_cast<std::uint32_t*>(&image[exc_dir_off]);
+    std::uint32_t exc_size = *reinterpret_cast<std::uint32_t*>(&image[exc_dir_off + 4]);
+
+    if (exc_rva == 0 || exc_size == 0)
+        return;
+    if (exc_rva >= static_cast<std::uint32_t>(image.size()))
+        return;
+
+
+    constexpr std::uint32_t RTFUNC_SIZE = 12;
+    std::uint32_t image_size = static_cast<std::uint32_t>(image.size());
+    int cleaned = 0;
+
+    for (std::uint32_t off = exc_rva; off + RTFUNC_SIZE <= exc_rva + exc_size && off + RTFUNC_SIZE <= image_size; off += RTFUNC_SIZE)
+    {
+        std::uint32_t begin_addr   = *reinterpret_cast<std::uint32_t*>(&image[off]);
+        std::uint32_t end_addr     = *reinterpret_cast<std::uint32_t*>(&image[off + 4]);
+        std::uint32_t unwind_addr  = *reinterpret_cast<std::uint32_t*>(&image[off + 8]);
+
+        if (begin_addr == 0 && end_addr == 0 && unwind_addr == 0)
+            continue;
+
+        bool valid = true;
+
+
+        if (begin_addr >= image_size || end_addr >= image_size)
+            valid = false;
+        if (begin_addr >= end_addr)
+            valid = false;
+        if (unwind_addr >= image_size)
+            valid = false;
+
+
+        if (valid && unwind_addr > 0 && unwind_addr < image_size)
+        {
+            std::uint8_t version = image[unwind_addr] & 0x07;
+            if (version != 1 && version != 2)
+                valid = false;
+        }
+
+        if (!valid)
+        {
+            std::memset(&image[off], 0, RTFUNC_SIZE);
+            cleaned++;
+        }
+    }
+
+    if (cleaned > 0)
+        msg(OBFSTR_C("AiDA: Cleaned %d invalid runtime function entries from exception directory\n"), cleaned);
+}
+
+
+static std::string get_ldr_module_file_path(
+    voyager::device_t* dev,
+    std::uint64_t module_base)
+{
+    if (!dev || !dev->is_connected() || dev->get_process_id() == 0)
+        return {};
+
+    voyager::device_t::peb_info peb{};
+    if (!dev->read_peb(peb) || peb.ldr_address == 0)
+        return {};
+
+
+    std::uint64_t list_head = peb.ldr_address + 0x10;
+    std::uint64_t first_entry = dev->read<std::uint64_t>(list_head);
+    if (first_entry == 0 || first_entry == list_head)
+        return {};
+
+    std::uint64_t current = first_entry;
+    int max_iter = 1024;
+
+    while (current != list_head && current != 0 && max_iter-- > 0)
+    {
+
+        std::uint64_t dll_base = dev->read<std::uint64_t>(current + 0x30);
+        if (dll_base == module_base)
+        {
+
+
+            std::uint16_t name_len = dev->read<std::uint16_t>(current + 0x48);
+            std::uint64_t name_ptr = dev->read<std::uint64_t>(current + 0x50);
+
+            if (name_len > 0 && name_len < 1024 && name_ptr != 0)
+            {
+                std::vector<std::uint8_t> raw(name_len, 0);
+                dev->read_raw(name_ptr, raw.data(), name_len);
+                std::string path;
+                path.reserve(name_len / 2);
+                for (std::size_t i = 0; i + 1 < name_len; i += 2)
+                {
+                    std::uint16_t wc = raw[i] | (static_cast<std::uint16_t>(raw[i + 1]) << 8);
+                    if (wc == 0) break;
+                    path += (wc < 128 && wc >= 32) ? static_cast<char>(wc) : '?';
+                }
+                return path;
+            }
+            return {};
+        }
+
+        std::uint64_t next = dev->read<std::uint64_t>(current);
+        if (next == current) break;
+        current = next;
+    }
+
+    return {};
+}
+
+
+static int try_fill_from_disk_pe(
+    std::vector<std::uint8_t>& image,
+    const std::vector<std::size_t>& failed_offsets,
+    const std::string& disk_path,
+    nlohmann::json& steps_log)
+{
+    if (disk_path.empty() || failed_offsets.empty())
+        return 0;
+
+    HANDLE hFile = CreateFileA(disk_path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return 0;
+
+    LARGE_INTEGER file_size_li;
+    if (!GetFileSizeEx(hFile, &file_size_li) || file_size_li.QuadPart < 0x100)
+    {
+        CloseHandle(hFile);
+        return 0;
+    }
+
+
+    std::vector<std::uint8_t> disk_hdr(std::min<std::size_t>(
+        static_cast<std::size_t>(file_size_li.QuadPart), 0x1000), 0);
+    DWORD hdr_read = 0;
+    if (!ReadFile(hFile, disk_hdr.data(), static_cast<DWORD>(disk_hdr.size()), &hdr_read, nullptr) ||
+        hdr_read < 0x100 || disk_hdr[0] != 'M' || disk_hdr[1] != 'Z')
+    {
+        CloseHandle(hFile);
+        return 0;
+    }
+
+    std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&disk_hdr[0x3C]);
+    if (pe_off + 0x18 >= hdr_read || disk_hdr[pe_off] != 'P' || disk_hdr[pe_off + 1] != 'E')
+    {
+        CloseHandle(hFile);
+        return 0;
+    }
+
+    std::uint16_t num_sections = *reinterpret_cast<std::uint16_t*>(&disk_hdr[pe_off + 6]);
+    std::uint16_t opt_size = *reinterpret_cast<std::uint16_t*>(&disk_hdr[pe_off + 0x14]);
+    std::uint32_t sec_table = pe_off + 0x18 + opt_size;
+
+
+    struct sec_map_t {
+        std::uint32_t rva;
+        std::uint32_t vsize;
+        std::uint32_t raw_offset;
+        std::uint32_t raw_size;
+    };
+    std::vector<sec_map_t> sec_map;
+    for (int i = 0; i < num_sections && i < 96; i++)
+    {
+        std::uint32_t soff = sec_table + i * 40;
+        if (soff + 40 > hdr_read) break;
+        sec_map_t sm;
+        sm.vsize      = *reinterpret_cast<std::uint32_t*>(&disk_hdr[soff + 8]);
+        sm.rva        = *reinterpret_cast<std::uint32_t*>(&disk_hdr[soff + 12]);
+        sm.raw_size   = *reinterpret_cast<std::uint32_t*>(&disk_hdr[soff + 16]);
+        sm.raw_offset = *reinterpret_cast<std::uint32_t*>(&disk_hdr[soff + 20]);
+        if (sm.rva > 0 && sm.raw_size > 0 && sm.raw_offset > 0)
+            sec_map.push_back(sm);
+    }
+
+    constexpr std::size_t PAGE_SIZE = 0x1000;
+    int recovered = 0;
+
+    for (std::size_t pg_off : failed_offsets)
+    {
+        if (pg_off >= image.size()) continue;
+        std::size_t pg_sz = std::min(PAGE_SIZE, image.size() - pg_off);
+
+
+        bool has_data = false;
+        for (std::size_t i = 0; i < pg_sz; i++)
+        {
+            if (image[pg_off + i] != 0) { has_data = true; break; }
+        }
+        if (has_data) continue;
+
+
+        for (const auto& sm : sec_map)
+        {
+            if (pg_off >= sm.rva && pg_off < sm.rva + sm.vsize)
+            {
+                std::uint32_t offset_in_sec = static_cast<std::uint32_t>(pg_off - sm.rva);
+                if (offset_in_sec < sm.raw_size)
+                {
+                    std::uint32_t file_offset = sm.raw_offset + offset_in_sec;
+                    std::uint32_t copy_size = std::min<std::uint32_t>(
+                        static_cast<std::uint32_t>(pg_sz),
+                        sm.raw_size - offset_in_sec);
+
+                    LARGE_INTEGER seek_pos;
+                    seek_pos.QuadPart = file_offset;
+                    if (SetFilePointerEx(hFile, seek_pos, nullptr, FILE_BEGIN))
+                    {
+                        DWORD rd = 0;
+                        if (ReadFile(hFile, image.data() + pg_off, copy_size, &rd, nullptr) && rd > 0)
+                            recovered++;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    CloseHandle(hFile);
+
+    if (recovered > 0)
+    {
+        steps_log.push_back({{"step", "disk_fallback"}, {"ok", true},
+            {"detail", std::to_string(recovered) + " pages recovered from on-disk PE: " + disk_path}});
+        msg(OBFSTR_C("AiDA: Disk fallback recovered %d pages from %s\n"),
+            recovered, disk_path.c_str());
+    }
+
+    return recovered;
+}
+
+
+static vad_dump_plan_t build_vad_dump_plan(
+    voyager::device_t* dev,
+    std::uint64_t module_base,
+    std::uint64_t pe_size_of_image,
+    nlohmann::json& steps_log)
+{
+    vad_dump_plan_t plan;
+    plan.module_base = module_base;
+    plan.pe_size_of_image = pe_size_of_image;
+    plan.total_span = pe_size_of_image;
+
+
+    std::uint64_t ldr_size = get_ldr_module_size(dev, module_base);
+    if (ldr_size > pe_size_of_image)
+    {
+        steps_log.push_back({{"step", "ldr_size_check"}, {"ok", true},
+            {"detail", "LDR reports larger SizeOfImage (0x" +
+                       (std::ostringstream() << std::hex << std::uppercase << ldr_size).str() +
+                       " vs PE header 0x" +
+                       (std::ostringstream() << std::hex << std::uppercase << pe_size_of_image).str() +
+                       "), using LDR value"}});
+        pe_size_of_image = ldr_size;
+        plan.pe_size_of_image = pe_size_of_image;
+        plan.total_span = pe_size_of_image;
+    }
+    else if (ldr_size > 0)
+    {
+        steps_log.push_back({{"step", "ldr_size_check"}, {"ok", true},
+            {"detail", "LDR SizeOfImage matches PE header"}});
+    }
+
+    constexpr std::uint64_t MAX_SCAN_RANGE = 0x200000000ULL;
+    std::uint64_t scan_end = module_base + MAX_SCAN_RANGE;
+    if (scan_end < module_base)
+        scan_end = 0x7FFFFFFFFFFFFFFFULL;
+
+
+    auto all_regions = enumerate_all_memory_regions_paginated(dev, module_base, scan_end, true);
+
+    if (all_regions.empty())
+    {
+        steps_log.push_back({{"step", "vad_walk"}, {"ok", false},
+            {"detail", "enumerate_memory_regions returned empty, falling back to SizeOfImage"}});
+        plan.regions.push_back({0, pe_size_of_image, 0});
+        plan.total_committed_bytes = pe_size_of_image;
+        plan.committed_region_count = 1;
+        return plan;
+    }
+
+    std::sort(all_regions.begin(), all_regions.end(),
+        [](const voyager::detail::region_entry& a, const voyager::detail::region_entry& b) {
+            return a.base < b.base;
+        });
+
+    constexpr std::uint32_t VMEM_COMMIT  = 0x1000;
+    constexpr std::uint32_t VMEM_RESERVE = 0x2000;
+    constexpr std::uint32_t VMEM_FREE    = 0x10000;
+
+
+    constexpr std::uint64_t MAX_GAP     = 0x80000000ULL;
+
+    std::uint64_t current_max_extent = module_base + pe_size_of_image;
+
+    for (const auto& r : all_regions)
+    {
+        if (r.state == VMEM_FREE)
+            continue;
+
+        if (r.base + r.size <= module_base)
+            continue;
+
+        if (r.base > current_max_extent + MAX_GAP)
+            break;
+
+        std::uint64_t region_end = r.base + r.size;
+        if (region_end > current_max_extent)
+            current_max_extent = region_end;
+
+        if (r.state & VMEM_COMMIT)
+        {
+            std::uint64_t read_base = r.base;
+            std::uint64_t read_size = r.size;
+
+            if (read_base < module_base)
+            {
+                std::uint64_t skip = module_base - read_base;
+                read_base = module_base;
+                read_size = (read_size > skip) ? (read_size - skip) : 0;
+            }
+
+            if (read_size > 0)
+            {
+                vad_dump_plan_t::region_t region;
+                region.offset = read_base - module_base;
+                region.size = read_size;
+                region.protect = r.protect;
+
+                plan.regions.push_back(region);
+                plan.total_committed_bytes += read_size;
+                plan.committed_region_count++;
+            }
+        }
+    }
+
+    plan.total_span = current_max_extent - module_base;
+
+    if (plan.total_span < pe_size_of_image)
+        plan.total_span = pe_size_of_image;
+
+    constexpr std::uint64_t MAX_DUMP_SIZE = 0x200000000ULL;
+    if (plan.total_span > MAX_DUMP_SIZE)
+        plan.total_span = MAX_DUMP_SIZE;
+
+    plan.used_vad = true;
+
+    if (plan.regions.empty())
+    {
+        plan.regions.push_back({0, pe_size_of_image, 0});
+        plan.total_committed_bytes = pe_size_of_image;
+        plan.committed_region_count = 1;
+        plan.used_vad = false;
+    }
+
+    std::ostringstream detail_ss;
+    detail_ss << plan.committed_region_count << " committed regions, span 0x"
+              << std::hex << std::uppercase << plan.total_span
+              << " (" << std::dec << (plan.total_span / (1024 * 1024)) << " MB)"
+              << ", PE SizeOfImage 0x" << std::hex << pe_size_of_image
+              << " (" << std::dec << (pe_size_of_image / (1024 * 1024)) << " MB)";
+    if (plan.total_span > pe_size_of_image)
+        detail_ss << ", extended by " << std::dec
+                  << ((plan.total_span - pe_size_of_image) / (1024 * 1024)) << " MB";
+    if (ldr_size > 0)
+        detail_ss << ", LDR size 0x" << std::hex << ldr_size;
+
+    steps_log.push_back({{"step", "vad_walk"}, {"ok", true}, {"detail", detail_ss.str()}});
+
+    return plan;
+}
+
+
+static double calculate_page_entropy(const std::uint8_t* data, std::size_t size)
+{
+    if (size == 0) return 0.0;
+    std::uint32_t freq[256] = {};
+    for (std::size_t i = 0; i < size; i++)
+        freq[data[i]]++;
+    double entropy = 0.0;
+    double inv_size = 1.0 / static_cast<double>(size);
+    for (int i = 0; i < 256; i++)
+    {
+        if (freq[i] == 0) continue;
+        double p = static_cast<double>(freq[i]) * inv_size;
+        entropy -= p * std::log2(p);
+    }
+    return entropy;
+}
+
+
+struct protection_analysis_t
+{
+    bool is_packed = false;
+    bool is_vmprotected = false;
+    bool is_themida = false;
+    bool is_upx = false;
+    bool has_encrypted_sections = false;
+    bool header_was_wiped = false;
+    int zero_code_pages = 0;
+    int high_entropy_pages = 0;
+    int total_code_pages = 0;
+    int encrypted_section_count = 0;
+    double avg_code_entropy = 0.0;
+    std::vector<std::string> detected_protections;
+};
+
+
+static protection_analysis_t analyze_module_protection(
+    voyager::device_t* dev,
+    std::uint64_t base,
+    const std::uint8_t* pe_hdr,
+    std::size_t hdr_read,
+    bool has_valid_pe,
+    bool header_wiped,
+    std::uint32_t pe_off,
+    std::uint16_t sections_count,
+    std::uint32_t sec_table_off,
+    std::uint32_t image_size,
+    bool is_kernel,
+    nlohmann::json& steps)
+{
+    protection_analysis_t result;
+    result.header_was_wiped = header_wiped;
+
+    if (header_wiped)
+        result.detected_protections.push_back(OBFSTR("Header wiped (anti-dump/anti-cheat)"));
+
+    if (!has_valid_pe || hdr_read < 0x200)
+    {
+        steps.push_back({{"step", "dynamic_analysis"}, {"ok", true},
+            {"detail", "PE header invalid/wiped — skipping detailed analysis, will use aggressive dump strategy"}});
+        return result;
+    }
+
+    for (int si = 0; si < sections_count && si < 96; si++)
+    {
+        std::uint32_t soff = sec_table_off + si * 40;
+        if (soff + 40 > static_cast<std::uint32_t>(hdr_read)) break;
+
+        char sec_name[9] = {};
+        std::memcpy(sec_name, pe_hdr + soff, 8);
+
+        if (std::strstr(sec_name, ".vmp") || std::strstr(sec_name, "VMPr") ||
+            std::strstr(sec_name, ".VMP"))
+        {
+            result.is_vmprotected = true;
+            result.is_packed = true;
+            result.detected_protections.push_back(
+                OBFSTR("VMProtect (section: ") + std::string(sec_name) + ")");
+        }
+        else if (std::strstr(sec_name, ".them") || std::strstr(sec_name, ".winl") ||
+                 std::strcmp(sec_name, ".boot") == 0)
+        {
+            result.is_themida = true;
+            result.is_packed = true;
+            result.detected_protections.push_back(
+                OBFSTR("Themida/WinLicense (section: ") + std::string(sec_name) + ")");
+        }
+        else if (std::strcmp(sec_name, "UPX0") == 0 || std::strcmp(sec_name, "UPX1") == 0 ||
+                 std::strcmp(sec_name, "UPX2") == 0 || std::strcmp(sec_name, ".UPX0") == 0)
+        {
+            result.is_upx = true;
+            result.is_packed = true;
+            result.detected_protections.push_back(
+                OBFSTR("UPX (section: ") + std::string(sec_name) + ")");
+        }
+    }
+
+    double total_entropy = 0.0;
+    int entropy_pages = 0;
+    constexpr std::size_t ENTROPY_PAGE = 0x1000;
+
+    for (int si = 0; si < sections_count && si < 96; si++)
+    {
+        std::uint32_t soff = sec_table_off + si * 40;
+        if (soff + 40 > static_cast<std::uint32_t>(hdr_read)) break;
+
+        std::uint32_t vsize = *reinterpret_cast<const std::uint32_t*>(pe_hdr + soff + 8);
+        std::uint32_t vrva  = *reinterpret_cast<const std::uint32_t*>(pe_hdr + soff + 12);
+        std::uint32_t chars = *reinterpret_cast<const std::uint32_t*>(pe_hdr + soff + 36);
+
+        if (vsize == 0 || vrva == 0) continue;
+        if (!(chars & 0x20) && !(chars & 0x20000000)) continue;
+
+        std::uint32_t max_sample_pages = std::min<std::uint32_t>(vsize / static_cast<std::uint32_t>(ENTROPY_PAGE), 64);
+        if (max_sample_pages == 0) max_sample_pages = 1;
+        std::vector<std::uint8_t> page_buf(ENTROPY_PAGE);
+
+        int sec_zero_pages = 0;
+        int sec_high_entropy_pages = 0;
+        int sec_total_pages = 0;
+
+        for (std::uint32_t pi = 0; pi < max_sample_pages; pi++)
+        {
+            std::uint64_t pg_addr = base + vrva + pi * ENTROPY_PAGE;
+            if (vrva + pi * ENTROPY_PAGE + ENTROPY_PAGE > image_size) break;
+
+            std::memset(page_buf.data(), 0, ENTROPY_PAGE);
+            std::size_t got = is_kernel
+                ? dev->read_kernel_raw(pg_addr, page_buf.data(), ENTROPY_PAGE)
+                : dev->read_raw(pg_addr, page_buf.data(), ENTROPY_PAGE);
+            result.total_code_pages++;
+            sec_total_pages++;
+
+            if (got < ENTROPY_PAGE)
+            {
+                result.zero_code_pages++;
+                sec_zero_pages++;
+                continue;
+            }
+
+            bool is_empty = true;
+            for (std::size_t i = 0; i < ENTROPY_PAGE; i++)
+            {
+                if (page_buf[i] != 0x00 && page_buf[i] != 0xCC)
+                {
+                    is_empty = false;
+                    break;
+                }
+            }
+
+            if (is_empty)
+            {
+                result.zero_code_pages++;
+                sec_zero_pages++;
+                continue;
+            }
+
+            double ent = calculate_page_entropy(page_buf.data(), ENTROPY_PAGE);
+            total_entropy += ent;
+            entropy_pages++;
+
+            if (ent > 7.0)
+            {
+                result.high_entropy_pages++;
+                sec_high_entropy_pages++;
+            }
+        }
+
+        if (sec_total_pages > 0 &&
+            (sec_zero_pages == sec_total_pages ||
+             sec_high_entropy_pages > sec_total_pages / 2))
+        {
+            result.encrypted_section_count++;
+        }
+    }
+
+    if (entropy_pages > 0)
+        result.avg_code_entropy = total_entropy / entropy_pages;
+
+    if (result.zero_code_pages > 0)
+    {
+        result.has_encrypted_sections = true;
+        result.detected_protections.push_back(
+            OBFSTR("Encrypted/guarded code sections (") + std::to_string(result.zero_code_pages) +
+            "/" + std::to_string(result.total_code_pages) + OBFSTR(" pages empty)"));
+    }
+
+    if (result.high_entropy_pages > entropy_pages / 2 && entropy_pages > 4)
+    {
+        result.has_encrypted_sections = true;
+        std::ostringstream ent_ss;
+        ent_ss << std::fixed << std::setprecision(2) << result.avg_code_entropy;
+        result.detected_protections.push_back(
+            OBFSTR("High entropy code (") + std::to_string(result.high_entropy_pages) +
+            "/" + std::to_string(entropy_pages) + OBFSTR(" pages >7.0 bits, avg=") +
+            ent_ss.str() + ")");
+    }
+
+    std::string detail;
+    if (result.detected_protections.empty())
+    {
+        std::ostringstream ent_ss;
+        ent_ss << std::fixed << std::setprecision(2) << result.avg_code_entropy;
+        detail = OBFSTR("No known protections detected, avg code entropy = ") + ent_ss.str();
+    }
+    else
+    {
+        detail = OBFSTR("Detected: ");
+        for (std::size_t i = 0; i < result.detected_protections.size(); i++)
+        {
+            if (i > 0) detail += "; ";
+            detail += result.detected_protections[i];
+        }
+    }
+
+    steps.push_back({{"step", "dynamic_analysis"}, {"ok", true}, {"detail", detail}});
+    msg(OBFSTR_C("AiDA: Pre-dump dynamic analysis — %s\n"), detail.c_str());
+
+    return result;
+}
+
+
+static int force_code_pages_in_memory(
+    voyager::device_t* dev,
+    std::uint64_t base,
+    const std::uint8_t* pe_hdr,
+    std::size_t hdr_read,
+    bool has_valid_pe,
+    std::uint32_t pe_off,
+    std::uint16_t sections_count,
+    std::uint32_t sec_table_off,
+    std::uint32_t image_size,
+    nlohmann::json& steps)
+{
+    if (!has_valid_pe || !dev || !dev->is_connected() || dev->get_process_id() == 0)
+        return 0;
+
+    auto modules = enumerate_ldr_modules_for_iat(dev);
+
+    std::uint64_t kernel32_base = 0;
+    for (const auto& m : modules)
+    {
+        std::string lower = m.name;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lower == "kernel32.dll")
+        {
+            kernel32_base = m.base;
+            break;
+        }
+    }
+
+    if (kernel32_base == 0)
+    {
+        steps.push_back({{"step", "force_page_in"}, {"ok", false},
+            {"detail", "kernel32.dll not found in target — skipping active page forcing"}});
+        return 0;
+    }
+
+    std::uint64_t vp_addr = dev->resolve_export(kernel32_base, "VirtualProtect");
+    if (vp_addr == 0)
+    {
+        steps.push_back({{"step", "force_page_in"}, {"ok", false},
+            {"detail", "Could not resolve VirtualProtect — skipping active page forcing"}});
+        return 0;
+    }
+
+    std::uint64_t old_prot_buf = dev->allocate_memory(0x1000);
+    if (old_prot_buf == 0)
+    {
+        steps.push_back({{"step", "force_page_in"}, {"ok", false},
+            {"detail", "Could not allocate scratch buffer — skipping active page forcing"}});
+        return 0;
+    }
+
+    int pages_forced = 0;
+    constexpr std::uint32_t kPageExecReadWrite = 0x40;
+    constexpr std::uint64_t VP_CHUNK = 0x10000;
+
+    for (int si = 0; si < sections_count && si < 96; si++)
+    {
+        std::uint32_t soff = sec_table_off + si * 40;
+        if (soff + 40 > static_cast<std::uint32_t>(hdr_read)) break;
+
+        std::uint32_t vsize = *reinterpret_cast<const std::uint32_t*>(pe_hdr + soff + 8);
+        std::uint32_t vrva  = *reinterpret_cast<const std::uint32_t*>(pe_hdr + soff + 12);
+        std::uint32_t chars = *reinterpret_cast<const std::uint32_t*>(pe_hdr + soff + 36);
+
+        if (vsize == 0 || vrva == 0 || !(chars & 0x20000000)) continue;
+
+        std::uint64_t sec_addr = base + vrva;
+        std::uint64_t sec_size = std::min<std::uint64_t>(vsize,
+            (vrva < image_size) ? (image_size - vrva) : 0);
+        if (sec_size == 0) continue;
+
+        for (std::uint64_t off = 0; off < sec_size; off += VP_CHUNK)
+        {
+            std::uint64_t chunk_size = std::min(VP_CHUNK, sec_size - off);
+            std::uint64_t ret = dev->call_function(vp_addr,
+                sec_addr + off,
+                chunk_size,
+                kPageExecReadWrite,
+                old_prot_buf);
+
+            if (ret != 0)
+                pages_forced += static_cast<int>(chunk_size / 0x1000);
+        }
+    }
+
+    dev->free_memory(old_prot_buf);
+
+    if (pages_forced > 0)
+    {
+        Sleep(150);
+
+        steps.push_back({{"step", "force_page_in"}, {"ok", true},
+            {"detail", std::to_string(pages_forced) +
+                " code pages forced via VirtualProtect to trigger decryption/COW"}});
+        msg(OBFSTR_C("AiDA: Forced %d code pages into memory via VirtualProtect\n"), pages_forced);
+    }
+    else
+    {
+        steps.push_back({{"step", "force_page_in"}, {"ok", false},
+            {"detail", "VirtualProtect calls returned 0 — anti-cheat may have blocked protection changes"}});
+    }
+
+    return pages_forced;
+}
+
+
 tool_result_t driver_dump_module(const json& params)
 {
     json steps = json::array();
@@ -10226,45 +11922,576 @@ tool_result_t driver_dump_module(const json& params)
         return tool_result_t::error(OBFSTR("Invalid module base. Provide 'address' or attach to a process first."));
     log("find_image_base", true, helpers::format_address(base));
 
+    bool header_wiped = false;
+    bool has_valid_pe = false;
     std::uint8_t pe_hdr[0x1000];
+    std::memset(pe_hdr, 0, sizeof(pe_hdr));
     std::size_t hdr_read = device->read_raw(base, pe_hdr, sizeof(pe_hdr));
-    log("read_pe_header", hdr_read > 0x200, std::to_string(hdr_read) + " bytes");
-    if (hdr_read < 0x200 || *(std::uint16_t*)pe_hdr != 0x5A4D)
-        return tool_result_t::error(OBFSTR("Failed to read valid PE header at ") + helpers::format_address(base));
 
-    std::uint32_t pe_off = *(std::uint32_t*)(pe_hdr + 0x3C);
-    if (pe_off + 0x100 > sizeof(pe_hdr) || *(std::uint32_t*)(pe_hdr + pe_off) != 0x00004550)
-        return tool_result_t::error(OBFSTR("Invalid PE signature at ") + helpers::format_address(base));
+    std::uint32_t pe_off = 0;
+    std::uint16_t opt_magic      = 0x020B;
+    std::uint16_t sections_count = 0;
+    std::uint16_t opt_size       = 0;
+    std::uint32_t sec_table_off  = 0;
+    std::uint32_t pe_size_of_image = 0;
 
-    std::uint16_t opt_magic      = *(std::uint16_t*)(pe_hdr + pe_off + 0x18);
-    std::uint16_t sections_count = *(std::uint16_t*)(pe_hdr + pe_off + 0x06);
-    std::uint16_t opt_size       = *(std::uint16_t*)(pe_hdr + pe_off + 0x14);
-    std::uint32_t sec_table_off  = pe_off + 0x18 + opt_size;
+    if (hdr_read >= 0x200 && *(std::uint16_t*)pe_hdr == 0x5A4D)
+    {
+        pe_off = *(std::uint32_t*)(pe_hdr + 0x3C);
+        if (pe_off + 0x100 <= sizeof(pe_hdr) && *(std::uint32_t*)(pe_hdr + pe_off) == 0x00004550)
+        {
+            has_valid_pe = true;
+            opt_magic      = *(std::uint16_t*)(pe_hdr + pe_off + 0x18);
+            sections_count = *(std::uint16_t*)(pe_hdr + pe_off + 0x06);
+            opt_size       = *(std::uint16_t*)(pe_hdr + pe_off + 0x14);
+            sec_table_off  = pe_off + 0x18 + opt_size;
+            if (opt_magic == 0x020B || opt_magic == 0x010B)
+                pe_size_of_image = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x38);
 
-    std::size_t module_size = 0;
-    if (opt_magic == 0x020B || opt_magic == 0x010B)
-        module_size = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x38);
-    if (module_size == 0)
-        module_size = params.value("size", (std::size_t)0x2000000);
-    if (module_size > 0x10000000)
-        return tool_result_t::error(OBFSTR("Module size too large (>256MB): ") + std::to_string(module_size));
+            log("read_pe_header", true, std::to_string(hdr_read) + " bytes, " +
+                std::to_string(sections_count) + " sections, SizeOfImage=0x" +
+                helpers::format_address(static_cast<ea_t>(pe_size_of_image)));
+        }
+        else
+        {
+            header_wiped = true;
+            log("read_pe_header", false, "MZ found but PE signature invalid/corrupt — will synthesize header after dump");
+        }
+    }
+    else
+    {
+        header_wiped = true;
+        msg(OBFSTR_C("AiDA: WARNING - MZ signature not found at base %s (read %zu bytes). "
+            "Header likely wiped by anti-cheat. Will synthesize PE header after dump.\n"),
+            helpers::format_address(base).c_str(), hdr_read);
+        log("read_pe_header", false,
+            "MZ signature wiped/missing — anti-cheat header erasure detected. Will synthesize after dump.");
+    }
 
-    std::vector<std::uint8_t> module_data(module_size, 0);
-    const std::size_t chunk = 0x10000;
-    std::size_t total_read = 0;
+    if (pe_size_of_image == 0)
+    {
+
+        std::uint64_t ldr_sz = get_ldr_module_size(device.get(), base);
+        if (ldr_sz > 0)
+            pe_size_of_image = static_cast<std::uint32_t>(ldr_sz);
+        else
+            pe_size_of_image = static_cast<std::uint32_t>(params.value("size", (std::size_t)0x2000000));
+    }
+
     std::string module_name = params.value("process", std::string("module"));
 
-    show_wait_box("HIDECANCEL\nAiDA: Dumping %s via kernel (0x%zX bytes)...", module_name.c_str(), module_size);
-    for (std::size_t off = 0; off < module_size; off += chunk)
+
+    std::string module_disk_path = get_ldr_module_file_path(device.get(), base);
+    if (!module_disk_path.empty())
+        log("resolve_disk_path", true, module_disk_path);
+
+    device->solve_dtb();
+    if (device->get_dtb() == 0)
+        return tool_result_t::error(OBFSTR("DTB solve failed before dump. Cannot read process memory."));
+
+    protection_analysis_t protection = analyze_module_protection(
+        device.get(), base, pe_hdr, hdr_read, has_valid_pe, header_wiped,
+        pe_off, sections_count, sec_table_off, pe_size_of_image, false, steps);
+
+    if (has_valid_pe && !header_wiped)
     {
-        if (off % 0x100000 == 0)
-            replace_wait_box("HIDECANCEL\nAiDA: Dumping %s (0x%zX / 0x%zX, %.1f%%)...",
-                             module_name.c_str(), off, module_size, (off * 100.0) / module_size);
-        std::size_t to_read = std::min(chunk, module_size - off);
-        total_read += device->read_raw(base + off, module_data.data() + off, to_read);
+        int forced = force_code_pages_in_memory(
+            device.get(), base, pe_hdr, hdr_read, has_valid_pe,
+            pe_off, sections_count, sec_table_off, pe_size_of_image, steps);
+        if (forced > 0)
+            msg(OBFSTR_C("AiDA: Pre-dump page forcing complete — %d pages touched\n"), forced);
     }
+
+    vad_dump_plan_t vad_plan = build_vad_dump_plan(device.get(), base, pe_size_of_image, steps);
+
+    std::size_t module_size = static_cast<std::size_t>(vad_plan.total_span);
+    if (module_size == 0)
+        module_size = static_cast<std::size_t>(pe_size_of_image);
+    if (module_size > 0x200000000ULL)
+        return tool_result_t::error(OBFSTR("Module size too large (>8GB): ") + std::to_string(module_size));
+
+    msg(OBFSTR_C("AiDA: VAD dump plan — %d committed regions, span 0x%zX (%zu MB), PE SizeOfImage 0x%X (%u MB)\n"),
+        vad_plan.committed_region_count, module_size, module_size / (1024 * 1024),
+        pe_size_of_image, pe_size_of_image / (1024 * 1024));
+
+
+    std::vector<std::uint32_t> suspended_tids;
+    {
+        auto threads = device->enumerate_threads();
+        for (const auto& t : threads)
+        {
+            std::uint32_t prev = 0;
+            if (device->suspend_thread(t.tid, &prev))
+                suspended_tids.push_back(t.tid);
+        }
+        log("suspend_threads", !suspended_tids.empty(),
+            std::to_string(suspended_tids.size()) + "/" + std::to_string(threads.size()) +
+            " threads suspended for consistent snapshot");
+        if (!suspended_tids.empty())
+            msg(OBFSTR_C("AiDA: Suspended %zu/%zu threads for dump consistency\n"),
+                suspended_tids.size(), threads.size());
+    }
+
+
+    struct thread_resume_guard_t {
+        voyager::device_t* dev;
+        std::vector<std::uint32_t>& tids;
+        bool released = false;
+        ~thread_resume_guard_t() { if (!released) resume(); }
+        void resume() {
+            for (std::uint32_t tid : tids) dev->resume_thread(tid);
+            released = true;
+        }
+    } thread_guard{device.get(), suspended_tids};
+
+    std::vector<std::uint8_t> module_data(module_size, 0);
+    std::size_t total_read = 0;
+    int failed_pages = 0;
+
+    std::memcpy(module_data.data(), pe_hdr, std::min<std::size_t>(hdr_read, module_size));
+    total_read = std::min<std::size_t>(hdr_read, module_size);
+
+    show_wait_box("HIDECANCEL\nAiDA: Dumping %s via kernel — %d regions, 0x%zX bytes (%zu MB)...",
+                  module_name.c_str(), vad_plan.committed_region_count, module_size,
+                  module_size / (1024 * 1024));
+
+    constexpr std::size_t DUMP_CHUNK = 0x10000;
+    constexpr std::size_t DUMP_PAGE  = 0x1000;
+    std::vector<std::size_t> failed_offsets;
+    int region_idx = 0;
+
+
+    struct code_section_range_t {
+        std::size_t offset;
+        std::size_t size;
+    };
+    std::vector<code_section_range_t> code_sections;
+    if (has_valid_pe)
+    {
+        std::uint32_t fixed_pe_off = pe_off;
+        std::uint16_t fixed_nsec = sections_count;
+        std::uint32_t fixed_sec_table = sec_table_off;
+        for (int si = 0; si < fixed_nsec && si < 96; si++)
+        {
+            std::uint32_t soff = fixed_sec_table + si * 40;
+            if (soff + 40 > sizeof(pe_hdr)) break;
+            std::uint32_t vsize = *(std::uint32_t*)(pe_hdr + soff + 8);
+            std::uint32_t vrva  = *(std::uint32_t*)(pe_hdr + soff + 12);
+            std::uint32_t chars = *(std::uint32_t*)(pe_hdr + soff + 36);
+            if (vsize == 0 || vrva == 0) continue;
+            if (chars & 0x20)
+            {
+                std::size_t sec_end = static_cast<std::size_t>(vrva) + vsize;
+                if (sec_end > module_size) sec_end = module_size;
+                if (vrva < module_size)
+                    code_sections.push_back({static_cast<std::size_t>(vrva), sec_end - vrva});
+            }
+        }
+    }
+
+    for (const auto& region : vad_plan.regions)
+    {
+        region_idx++;
+        if (region.offset >= module_size) continue;
+
+        std::size_t read_size = static_cast<std::size_t>(
+            std::min(region.size, static_cast<std::uint64_t>(module_size - region.offset)));
+
+        std::size_t start_off = 0;
+        if (region.offset == 0)
+            start_off = std::min<std::size_t>(hdr_read, read_size);
+
+        for (std::size_t chunk_off = start_off; chunk_off < read_size; chunk_off += DUMP_CHUNK)
+        {
+            std::size_t buf_offset = static_cast<std::size_t>(region.offset) + chunk_off;
+
+            if (buf_offset % 0x400000 == 0)
+                replace_wait_box("HIDECANCEL\nAiDA: Dumping %s — region %d/%d (0x%zX / 0x%zX, %.1f%%)...",
+                                 module_name.c_str(), region_idx, vad_plan.committed_region_count,
+                                 buf_offset, module_size, (buf_offset * 100.0) / module_size);
+
+            std::size_t to_read = std::min(DUMP_CHUNK, read_size - chunk_off);
+            std::size_t got = device->read_raw(base + buf_offset, module_data.data() + buf_offset, to_read);
+
+            if (got >= to_read)
+            {
+                total_read += got;
+                continue;
+            }
+
+            for (std::size_t pg = 0; pg < to_read; pg += DUMP_PAGE)
+            {
+                std::size_t pg_off = buf_offset + pg;
+                if (pg_off >= module_size) break;
+                std::size_t pg_sz  = std::min(DUMP_PAGE, module_size - pg_off);
+                std::size_t pg_got = device->read_raw(
+                    base + pg_off, module_data.data() + pg_off, pg_sz);
+                if (pg_got > 0)
+                    total_read += pg_got;
+                else
+                {
+                    failed_pages++;
+                    failed_offsets.push_back(pg_off);
+                }
+            }
+        }
+    }
+
+
+    if (!failed_offsets.empty())
+    {
+        replace_wait_box("HIDECANCEL\nAiDA: Re-solving DTB and retrying %d failed pages...",
+                         static_cast<int>(failed_offsets.size()));
+        device->solve_dtb();
+
+        int recovered = 0;
+        for (std::size_t fo : failed_offsets)
+        {
+            if (fo >= module_size) continue;
+            std::size_t pg_sz  = std::min(DUMP_PAGE, module_size - fo);
+            std::size_t pg_got = device->read_raw(
+                base + fo, module_data.data() + fo, pg_sz);
+            if (pg_got > 0)
+            {
+                total_read += pg_got;
+                recovered++;
+            }
+        }
+
+        if (recovered > 0)
+            msg(OBFSTR_C("AiDA: DTB re-solve recovered %d/%d failed pages\n"),
+                recovered, static_cast<int>(failed_offsets.size()));
+
+        failed_pages -= recovered;
+    }
+
+
+    if (!code_sections.empty())
+    {
+        constexpr int MAX_DECRYPT_ROUNDS = 8;
+        constexpr int MIN_RECOVERY_PER_ROUND = 1;
+
+
+        std::vector<std::size_t> encrypted_pages;
+        for (const auto& cs : code_sections)
+        {
+            for (std::size_t pg_off = cs.offset; pg_off < cs.offset + cs.size; pg_off += DUMP_PAGE)
+            {
+                if (pg_off >= module_size) break;
+                std::size_t pg_sz = std::min(DUMP_PAGE, module_size - pg_off);
+
+
+                bool is_empty = true;
+                for (std::size_t i = 0; i < pg_sz; i++)
+                {
+                    std::uint8_t b = module_data[pg_off + i];
+                    if (b != 0x00 && b != 0xCC)
+                    {
+                        is_empty = false;
+                        break;
+                    }
+                }
+                if (is_empty)
+                    encrypted_pages.push_back(pg_off);
+            }
+        }
+
+        if (!encrypted_pages.empty())
+        {
+            int total_recovered_pages = 0;
+            msg(OBFSTR_C("AiDA: Found %zu potentially encrypted code pages, starting decrypt retry loop...\n"),
+                encrypted_pages.size());
+
+            for (int round = 0; round < MAX_DECRYPT_ROUNDS; round++)
+            {
+                replace_wait_box("HIDECANCEL\nAiDA: Decrypt retry round %d/%d — %zu pages remaining...",
+                                 round + 1, MAX_DECRYPT_ROUNDS, encrypted_pages.size());
+
+
+                DWORD backoff_ms = static_cast<DWORD>(50u << round);
+                if (backoff_ms > 6400) backoff_ms = 6400;
+
+
+                if (!suspended_tids.empty() && round > 0)
+                {
+                    for (std::uint32_t tid : suspended_tids)
+                        device->resume_thread(tid);
+                    Sleep(backoff_ms);
+                    for (std::uint32_t tid : suspended_tids)
+                    {
+                        std::uint32_t prev = 0;
+                        device->suspend_thread(tid, &prev);
+                    }
+                }
+                else
+                {
+                    Sleep(backoff_ms);
+                }
+
+
+                device->solve_dtb();
+
+                int round_recovered = 0;
+                std::vector<std::size_t> still_encrypted;
+
+                for (std::size_t pg_off : encrypted_pages)
+                {
+                    if (pg_off >= module_size) continue;
+                    std::size_t pg_sz = std::min(DUMP_PAGE, module_size - pg_off);
+
+
+                    std::vector<std::uint8_t> tmp(pg_sz, 0);
+                    std::size_t pg_got = device->read_raw(base + pg_off, tmp.data(), pg_sz);
+
+                    if (pg_got >= pg_sz)
+                    {
+
+                        bool still_empty = true;
+                        for (std::size_t i = 0; i < pg_sz; i++)
+                        {
+                            if (tmp[i] != 0x00 && tmp[i] != 0xCC)
+                            {
+                                still_empty = false;
+                                break;
+                            }
+                        }
+
+                        if (!still_empty)
+                        {
+
+                            std::memcpy(module_data.data() + pg_off, tmp.data(), pg_sz);
+                            total_read += pg_sz;
+                            round_recovered++;
+                        }
+                        else
+                        {
+                            still_encrypted.push_back(pg_off);
+                        }
+                    }
+                    else
+                    {
+                        still_encrypted.push_back(pg_off);
+                    }
+                }
+
+                total_recovered_pages += round_recovered;
+                encrypted_pages = std::move(still_encrypted);
+
+                msg(OBFSTR_C("AiDA: Decrypt round %d: recovered %d pages, %zu remaining\n"),
+                    round + 1, round_recovered, encrypted_pages.size());
+
+                if (encrypted_pages.empty())
+                    break;
+                if (round_recovered < MIN_RECOVERY_PER_ROUND && round > 0)
+                    break;
+            }
+
+            if (total_recovered_pages > 0)
+            {
+                log("decrypt_retry", true, std::to_string(total_recovered_pages) + " encrypted pages recovered, " +
+                    std::to_string(encrypted_pages.size()) + " still encrypted");
+                msg(OBFSTR_C("AiDA: Decrypt retry total: %d pages recovered\n"), total_recovered_pages);
+            }
+        }
+    }
+
+
+    for (const auto& cs : code_sections)
+    {
+        for (std::size_t pg_off = cs.offset; pg_off < cs.offset + cs.size; pg_off += DUMP_PAGE)
+        {
+            if (pg_off >= module_size) break;
+            std::size_t pg_sz = std::min(DUMP_PAGE, module_size - pg_off);
+
+            bool is_all_zero = true;
+            for (std::size_t i = 0; i < pg_sz; i++)
+            {
+                if (module_data[pg_off + i] != 0x00)
+                {
+                    is_all_zero = false;
+                    break;
+                }
+            }
+            if (is_all_zero)
+                std::memset(module_data.data() + pg_off, 0x90, pg_sz);
+        }
+    }
+
     hide_wait_box();
-    log("dump_image", total_read > 0, std::to_string(total_read) + "/" + std::to_string(module_size) + " bytes");
+
+
+    if (!failed_offsets.empty() && !module_disk_path.empty())
+    {
+        int disk_recovered = try_fill_from_disk_pe(module_data, failed_offsets, module_disk_path, steps);
+        if (disk_recovered > 0)
+        {
+            failed_pages -= disk_recovered;
+            total_read += static_cast<std::size_t>(disk_recovered) * DUMP_PAGE;
+        }
+    }
+
+    log("dump_image", total_read > 0, std::to_string(total_read) + "/" + std::to_string(module_size) + " bytes" +
+        (failed_pages > 0 ? (", " + std::to_string(failed_pages) + " pages unreadable") : ""));
+
+
+    thread_guard.resume();
+    log("resume_threads", true, std::to_string(suspended_tids.size()) + " threads resumed");
+
+
+    if (header_wiped)
+    {
+        msg(OBFSTR_C("AiDA: Synthesizing PE header for headerless user-mode dump...\n"));
+
+        struct discovered_section_t {
+            std::uint32_t rva;
+            std::uint32_t size;
+            bool is_executable;
+            bool is_writable;
+        };
+        std::vector<discovered_section_t> discovered;
+
+        constexpr std::uint32_t SCAN_GRANULARITY = 0x1000;
+        std::uint32_t current_start = 0;
+        bool in_section = false;
+        bool sec_exec = false;
+        bool sec_write = false;
+
+        for (std::uint32_t off = 0; off < static_cast<std::uint32_t>(module_size); off += SCAN_GRANULARITY)
+        {
+            bool page_has_data = false;
+            bool page_looks_code = false;
+            std::uint32_t page_end = std::min(off + SCAN_GRANULARITY, static_cast<std::uint32_t>(module_size));
+
+            for (std::uint32_t i = off; i < page_end; i++)
+            {
+                if (module_data[i] != 0) { page_has_data = true; break; }
+            }
+
+            if (page_has_data && page_end - off >= 16)
+            {
+                int code_heuristic = 0;
+                for (std::uint32_t i = off; i < page_end - 4; i += 64)
+                {
+                    std::uint8_t b = module_data[i];
+                    if (b == 0xCC || b == 0xC3 || b == 0xC2 ||
+                        b == 0xE8 || b == 0xE9 || b == 0xFF ||
+                        b == 0x48 || b == 0x4C || b == 0x41 ||
+                        b == 0x0F || b == 0x55 || b == 0x53)
+                        code_heuristic++;
+                }
+                page_looks_code = (code_heuristic > 3);
+            }
+
+            if (page_has_data && !in_section)
+            {
+                current_start = off;
+                in_section = true;
+                sec_exec = page_looks_code;
+                sec_write = !page_looks_code;
+            }
+            else if (page_has_data && in_section)
+            {
+                if (page_looks_code) sec_exec = true;
+            }
+            else if (!page_has_data && in_section)
+            {
+                std::uint32_t lookahead_end = std::min(off + 0x10000, static_cast<std::uint32_t>(module_size));
+                bool resumes = false;
+                for (std::uint32_t la = off + SCAN_GRANULARITY; la < lookahead_end; la += SCAN_GRANULARITY)
+                {
+                    for (std::uint32_t i = la; i < std::min(la + SCAN_GRANULARITY, static_cast<std::uint32_t>(module_size)); i++)
+                    {
+                        if (module_data[i] != 0) { resumes = true; break; }
+                    }
+                    if (resumes) break;
+                }
+                if (!resumes)
+                {
+                    discovered.push_back({current_start, off - current_start, sec_exec, sec_write});
+                    in_section = false;
+                }
+            }
+        }
+        if (in_section)
+            discovered.push_back({current_start, static_cast<std::uint32_t>(module_size) - current_start, sec_exec, sec_write});
+        if (discovered.empty())
+            discovered.push_back({0, static_cast<std::uint32_t>(module_size), true, false});
+
+        int max_synth_sections = std::min<int>(static_cast<int>(discovered.size()), 16);
+        std::uint32_t synth_pe_off = 0x80;
+        std::uint32_t synth_opt_size = 0xF0;
+        std::uint32_t synth_sec_table = synth_pe_off + 0x18 + synth_opt_size;
+
+
+        module_data[0x00] = 'M'; module_data[0x01] = 'Z';
+        module_data[0x02] = 0x90; module_data[0x03] = 0x00;
+        *reinterpret_cast<std::uint32_t*>(&module_data[0x3C]) = synth_pe_off;
+
+
+        module_data[synth_pe_off + 0] = 'P';
+        module_data[synth_pe_off + 1] = 'E';
+        module_data[synth_pe_off + 2] = 0;
+        module_data[synth_pe_off + 3] = 0;
+
+
+        *reinterpret_cast<std::uint16_t*>(&module_data[synth_pe_off + 4]) = 0x8664;
+        *reinterpret_cast<std::uint16_t*>(&module_data[synth_pe_off + 6]) =
+            static_cast<std::uint16_t>(max_synth_sections);
+        *reinterpret_cast<std::uint16_t*>(&module_data[synth_pe_off + 0x16]) = 0x0022;
+        *reinterpret_cast<std::uint16_t*>(&module_data[synth_pe_off + 0x14]) = synth_opt_size;
+
+
+        std::uint32_t synth_opt_off = synth_pe_off + 0x18;
+        *reinterpret_cast<std::uint16_t*>(&module_data[synth_opt_off + 0]) = 0x020B;
+        *reinterpret_cast<std::uint32_t*>(&module_data[synth_opt_off + 0x38]) =
+            (static_cast<std::uint32_t>(module_size) + 0xFFF) & ~0xFFFu;
+        *reinterpret_cast<std::uint32_t*>(&module_data[synth_opt_off + 0x3C]) = 0x1000;
+        *reinterpret_cast<std::uint64_t*>(&module_data[synth_opt_off + 0x18]) = base;
+        *reinterpret_cast<std::uint32_t*>(&module_data[synth_opt_off + 0x10]) =
+            discovered.empty() ? 0x1000 : discovered[0].rva;
+        *reinterpret_cast<std::uint16_t*>(&module_data[synth_opt_off + 0x44]) = 0x0A;
+        *reinterpret_cast<std::uint32_t*>(&module_data[synth_opt_off + 0x6C]) = 0;
+
+
+        for (int si = 0; si < max_synth_sections; si++)
+        {
+            const auto& ds = discovered[si];
+            std::uint32_t sec_hdr_off = synth_sec_table + si * 40;
+            if (sec_hdr_off + 40 > 0x1000) break;
+
+            char sname[9] = {};
+            if (si == 0 && ds.is_executable) std::memcpy(sname, ".text\0\0\0", 8);
+            else if (si == 0 && !ds.is_executable) std::memcpy(sname, ".data\0\0\0", 8);
+            else if (ds.is_executable) qsnprintf(sname, sizeof(sname), ".text%d", si);
+            else qsnprintf(sname, sizeof(sname), ".data%d", si);
+
+            std::memcpy(&module_data[sec_hdr_off], sname, 8);
+            *reinterpret_cast<std::uint32_t*>(&module_data[sec_hdr_off + 8]) = ds.size;
+            *reinterpret_cast<std::uint32_t*>(&module_data[sec_hdr_off + 12]) = ds.rva;
+            *reinterpret_cast<std::uint32_t*>(&module_data[sec_hdr_off + 16]) = ds.size;
+            *reinterpret_cast<std::uint32_t*>(&module_data[sec_hdr_off + 20]) = ds.rva;
+
+            std::uint32_t chars = 0x40000000u;
+            if (ds.is_executable) chars |= 0x20000000u | 0x00000020u;
+            if (ds.is_writable)   chars |= 0x80000000u;
+            chars |= 0x00000040u;
+            *reinterpret_cast<std::uint32_t*>(&module_data[sec_hdr_off + 36]) = chars;
+        }
+
+
+        opt_magic      = 0x020B;
+        sections_count = static_cast<std::uint16_t>(max_synth_sections);
+        pe_off         = synth_pe_off;
+        opt_size       = synth_opt_size;
+        sec_table_off  = synth_sec_table;
+        has_valid_pe   = true;
+
+        log("synthesize_header", true,
+            "Built synthetic PE header with " + std::to_string(max_synth_sections) +
+            " discovered sections from memory content analysis");
+        msg(OBFSTR_C("AiDA: Synthesized PE header — %d sections discovered via memory scanning\n"),
+            max_synth_sections);
+    }
 
     pe_fix_result_t pe_fix = fix_dumped_pe_image(module_data, base);
     if (pe_fix.success)
@@ -10276,6 +12503,10 @@ tool_result_t driver_dump_module(const json& params)
             std::to_string(pe_fix.iat_entries_restored) + " IAT entries restored");
     }
 
+
+    cleanup_exception_directory(module_data, pe_fix.is_pe64 || (opt_magic == 0x020B));
+    log("exception_cleanup", true, "Invalid runtime function entries cleaned");
+
     iat_rebuild_result_t iat_rebuild = reconstruct_iat_runtime(module_data, base, device.get(), false);
     if (iat_rebuild.success && iat_rebuild.descriptors_rebuilt > 0)
     {
@@ -10286,6 +12517,31 @@ tool_result_t driver_dump_module(const json& params)
     }
     else if (!iat_rebuild.error.empty())
         msg(OBFSTR_C("AiDA: IAT rebuild note: %s\n"), iat_rebuild.error.c_str());
+
+    if (iat_rebuild.descriptors_rebuilt == 0 || iat_rebuild.imports_resolved == 0)
+    {
+        msg(OBFSTR_C("AiDA: Standard IAT rebuild found nothing — running full export-scan IAT reconstruction...\n"));
+        replace_wait_box("HIDECANCEL\nAiDA: Scanning image for imports via export address matching...");
+
+        iat_rebuild_result_t scan_result = full_iat_scan_and_rebuild(module_data, base, device.get(), false);
+        if (scan_result.success && scan_result.imports_resolved > 0)
+        {
+            iat_rebuild = scan_result;
+            msg(OBFSTR_C("AiDA: Full IAT scan — %d imports resolved, %d DLLs, section %s\n"),
+                scan_result.imports_resolved, scan_result.descriptors_rebuilt,
+                scan_result.section_added ? "added" : "reused");
+            log("iat_full_scan", true, std::to_string(scan_result.imports_resolved) + " imports resolved via full scan, " +
+                std::to_string(scan_result.descriptors_rebuilt) + " DLLs");
+        }
+        else
+        {
+            msg(OBFSTR_C("AiDA: Full IAT scan found no additional imports%s\n"),
+                scan_result.error.empty() ? "" : (std::string(" (") + scan_result.error + ")").c_str());
+            log("iat_full_scan", false, scan_result.error.empty() ? "No imports found" : scan_result.error);
+        }
+
+        hide_wait_box();
+    }
 
     std::string output_path = params.value("output_path", std::string());
     if (output_path.empty())
@@ -10299,10 +12555,29 @@ tool_result_t driver_dump_module(const json& params)
                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hFile != INVALID_HANDLE_VALUE)
         {
-            DWORD written = 0;
-            WriteFile(hFile, module_data.data(), static_cast<DWORD>(module_size), &written, nullptr);
+            const std::uint8_t* write_ptr = module_data.data();
+            std::size_t remaining = module_size;
+            bool write_ok = true;
+
+            while (remaining > 0)
+            {
+                DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(remaining, 0x40000000ULL));
+                DWORD written = 0;
+                if (!WriteFile(hFile, write_ptr, chunk, &written, nullptr) || written != chunk)
+                {
+                    write_ok = false;
+                    msg(OBFSTR_C("AiDA: WARNING - WriteFile failed at offset 0x%zX (error %lu)\n"),
+                        module_size - remaining, GetLastError());
+                    break;
+                }
+                write_ptr += written;
+                remaining -= written;
+            }
+
             CloseHandle(hFile);
-            msg(OBFSTR_C("AiDA: Dump saved to %s (%zu bytes)\n"), output_path.c_str(), module_size);
+            if (write_ok)
+                msg(OBFSTR_C("AiDA: Dump saved to %s (%zu bytes, %zu MB)\n"),
+                    output_path.c_str(), module_size, module_size / (1024 * 1024));
         }
         else
             msg(OBFSTR_C("AiDA: WARNING - Failed to save dump file: %s (error %lu)\n"),
@@ -10319,15 +12594,25 @@ tool_result_t driver_dump_module(const json& params)
     {
         show_wait_box("HIDECANCEL\nAiDA: Creating IDB segments and patching bytes...");
 
-        for (int si = 0; si < sections_count && si < 96; si++)
+        std::uint16_t fixed_sections_count = sections_count;
+        std::uint32_t fixed_sec_table_off  = sec_table_off;
+        if (pe_fix.success && module_size > 0x200)
         {
-            std::uint32_t soff = sec_table_off + si * 40;
-            std::uint8_t sec[40] = {0};
+            std::uint32_t fixed_pe_off = *reinterpret_cast<std::uint32_t*>(module_data.data() + 0x3C);
+            if (fixed_pe_off + 0x18 < module_size)
+            {
+                fixed_sections_count = *reinterpret_cast<std::uint16_t*>(module_data.data() + fixed_pe_off + 6);
+                std::uint16_t fixed_opt_size = *reinterpret_cast<std::uint16_t*>(module_data.data() + fixed_pe_off + 0x14);
+                fixed_sec_table_off = fixed_pe_off + 0x18 + fixed_opt_size;
+            }
+        }
 
-            if (soff + 40 <= sizeof(pe_hdr))
-                memcpy(sec, pe_hdr + soff, 40);
-            else if (device->read_raw(base + soff, sec, sizeof(sec)) < sizeof(sec))
-                break;
+        for (int si = 0; si < fixed_sections_count && si < 96; si++)
+        {
+            std::uint32_t soff = fixed_sec_table_off + si * 40;
+            if (soff + 40 > module_size) break;
+
+            const std::uint8_t* sec = module_data.data() + soff;
 
             char name[9] = {0};
             memcpy(name, sec, 8);
@@ -10390,11 +12675,42 @@ tool_result_t driver_dump_module(const json& params)
     json result;
     result["base"]            = helpers::format_address(base);
     result["image_size"]      = module_size;
+    result["pe_size_of_image"] = static_cast<std::size_t>(pe_size_of_image);
     result["bytes_dumped"]    = total_read;
     result["coverage_pct"]    = module_size ? (int)((total_read * 100) / module_size) : 0;
     result["saved_to"]        = output_path;
     result["can_load_in_ida"] = true;
+    result["header_wiped"]    = header_wiped;
+    result["header_synthesized"] = header_wiped;
+    result["threads_suspended"]  = static_cast<int>(suspended_tids.size());
+    if (!module_disk_path.empty())
+        result["disk_path"] = module_disk_path;
+    if (!protection.detected_protections.empty())
+    {
+        result["protections_detected"] = protection.detected_protections;
+        result["is_packed"] = protection.is_packed;
+        if (protection.is_vmprotected) result["vmprotect"] = true;
+        if (protection.is_themida) result["themida"] = true;
+        if (protection.is_upx) result["upx"] = true;
+    }
+    if (protection.total_code_pages > 0)
+    {
+        json analysis;
+        analysis["total_code_pages"] = protection.total_code_pages;
+        analysis["zero_pages"] = protection.zero_code_pages;
+        analysis["high_entropy_pages"] = protection.high_entropy_pages;
+        analysis["avg_entropy"] = protection.avg_code_entropy;
+        result["pre_dump_analysis"] = analysis;
+    }
     result["steps"]           = steps;
+    if (vad_plan.used_vad)
+    {
+        result["vad_regions"]          = vad_plan.committed_region_count;
+        result["vad_committed_bytes"]  = vad_plan.total_committed_bytes;
+        result["vad_extended"]         = (vad_plan.total_span > vad_plan.pe_size_of_image);
+        if (vad_plan.total_span > vad_plan.pe_size_of_image)
+            result["vad_extension_mb"] = (vad_plan.total_span - vad_plan.pe_size_of_image) / (1024 * 1024);
+    }
     if (patch_idb)
     {
         result["patched_idb"]      = true;
@@ -10407,8 +12723,11 @@ tool_result_t driver_dump_module(const json& params)
         result["pe_fix"] = pe_fix_to_json(pe_fix);
     if (iat_rebuild.success && iat_rebuild.descriptors_rebuilt > 0)
         result["iat_rebuild"] = iat_rebuild_to_json(iat_rebuild);
-    result["note"] = OBFSTR(
-        "IMPORTANT: The dump file has been saved to: ") + output_path + OBFSTR(". "
+    result["note"] = std::string(
+        header_wiped ? OBFSTR("WARNING: Original PE header was wiped by anti-cheat. "
+            "A synthetic header has been constructed from memory analysis. "
+            "Section boundaries are approximate. ") : "") +
+        OBFSTR("IMPORTANT: The dump file has been saved to: ") + output_path + OBFSTR(". "
         "To get full and correct analysis you MUST open this file in a NEW IDA Pro instance: "
         "File -> Open -> select the dumped .bin file -> enable 'Manual load' -> "
         "set the image base to ") + helpers::format_address(base) + OBFSTR(". "
@@ -10426,10 +12745,28 @@ tool_result_t driver_scan_pattern(const json& params)
         return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
 
     std::string pattern_str = params["pattern"].get<std::string>();
-    int limit = params.value("limit", 20);
+
+    int limit = 20;
+    if (params.contains("limit")) {
+        if (params["limit"].is_number())
+            limit = params["limit"].get<int>();
+        else if (params["limit"].is_string()) {
+            try { limit = std::stoi(params["limit"].get<std::string>()); } catch (...) {}
+        }
+    }
+
+    std::uint64_t scan_size = 0x200000;
+    if (params.contains("size")) {
+        if (params["size"].is_number())
+            scan_size = params["size"].get<std::uint64_t>();
+        else if (params["size"].is_string()) {
+            auto sz = helpers::parse_address(params["size"].get<std::string>());
+            if (sz) scan_size = *sz;
+        }
+    }
 
     ea_t start_addr = static_cast<ea_t>(device->get_base_address());
-    ea_t end_addr   = start_addr + (ea_t)params.value("size", (std::uint64_t)0x200000);
+    ea_t end_addr   = start_addr + (ea_t)scan_size;
     if (params.contains("start"))
     {
         auto s = helpers::parse_address(params["start"].get<std::string>());
@@ -10614,58 +12951,102 @@ tool_result_t driver_enumerate_modules(const json&)
     if (!device->is_connected() || device->get_process_id() == 0)
         return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
 
-    std::uint64_t base = device->get_base_address();
-    if (base == 0)
-        return tool_result_t::error(OBFSTR("No base address. Call driver_attach first."));
+    if (device->get_dtb() == 0)
+    {
+        device->solve_dtb();
+        if (device->get_dtb() == 0)
+            return tool_result_t::error(OBFSTR("Failed to solve DTB. Cannot enumerate modules."));
+    }
 
-    std::uint8_t pe_hdr[0x1000];
-    if (device->read_raw(base, pe_hdr, sizeof(pe_hdr)) < 0x200 || *(std::uint16_t*)pe_hdr != 0x5A4D)
-        return tool_result_t::error(OBFSTR("Failed to read main PE header at ") + helpers::format_address(base));
+    voyager::device_t::peb_info peb{};
+    if (!device->read_peb(peb) || peb.ldr_address == 0)
+        return tool_result_t::error(OBFSTR("Failed to read PEB or PEB_LDR_DATA is null. "
+            "Ensure the process is running and fully initialized."));
+
+
+    std::uint64_t list_head = peb.ldr_address + 0x10;
+    std::uint64_t first_entry = device->read<std::uint64_t>(list_head);
+
+    if (first_entry == 0 || first_entry == list_head)
+        return tool_result_t::error(OBFSTR("InLoadOrderModuleList is empty or unreadable."));
 
     json modules = json::array();
-    std::uint32_t pe_off = *(std::uint32_t*)(pe_hdr + 0x3C);
+    std::uint64_t current = first_entry;
+    int max_iter = 1024;
+    std::uint64_t main_base = device->get_base_address();
 
-    std::uint32_t main_size = 0;
+    while (current != list_head && current != 0 && max_iter-- > 0)
     {
-        std::uint16_t mag = (pe_off + 0x58 < sizeof(pe_hdr)) ? *(std::uint16_t*)(pe_hdr + pe_off + 0x18) : 0;
-        if (mag == 0x020B || mag == 0x010B)
-            main_size = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x38);
-    }
-    modules.push_back({{"name", "main_module"}, {"base", helpers::format_address(base)},
-                       {"size", main_size}, {"is_main", true}});
 
-    std::uint16_t opt_magic  = (pe_off + 0x1A < sizeof(pe_hdr)) ? *(std::uint16_t*)(pe_hdr + pe_off + 0x18) : 0;
-    std::uint32_t import_rva = 0;
-    if (opt_magic == 0x020B && pe_off + 0x90 < sizeof(pe_hdr))
-        import_rva = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x78);
-    else if (opt_magic == 0x010B && pe_off + 0x80 < sizeof(pe_hdr))
-        import_rva = *(std::uint32_t*)(pe_hdr + pe_off + 0x18 + 0x68);
 
-    if (import_rva != 0)
-    {
-        std::uint8_t imp[20];
-        for (std::uint32_t imp_off = 0; imp_off < 0x10000; imp_off += 20)
+        std::uint64_t dll_base    = device->read<std::uint64_t>(current + 0x30);
+        std::uint64_t entry_point = device->read<std::uint64_t>(current + 0x38);
+        std::uint32_t size_of_img = device->read<std::uint32_t>(current + 0x40);
+
+
+        std::uint16_t base_name_len = device->read<std::uint16_t>(current + 0x58);
+        std::uint64_t base_name_ptr = device->read<std::uint64_t>(current + 0x60);
+
+        std::string base_name;
+        if (base_name_len > 0 && base_name_len < 520 && base_name_ptr != 0)
         {
-            if (device->read_raw(base + import_rva + imp_off, imp, sizeof(imp)) < sizeof(imp)) break;
-            bool zero = true;
-            for (int k = 0; k < 20; k++) if (imp[k]) { zero = false; break; }
-            if (zero) break;
-
-            std::uint32_t name_rva = *(std::uint32_t*)(imp + 12);
-            if (name_rva == 0) continue;
-
-            char dll_name[260] = {0};
-            if (device->read_raw(base + name_rva, dll_name, sizeof(dll_name) - 1) > 0 && dll_name[0])
-                modules.push_back({{"name", std::string(dll_name)}, {"base", "runtime"}, {"is_import", true}});
+            std::vector<std::uint8_t> raw(base_name_len, 0);
+            device->read_raw(base_name_ptr, raw.data(), base_name_len);
+            base_name.reserve(base_name_len / 2);
+            for (std::size_t i = 0; i + 1 < base_name_len; i += 2)
+            {
+                std::uint16_t wc = raw[i] | (static_cast<std::uint16_t>(raw[i + 1]) << 8);
+                if (wc == 0) break;
+                base_name += (wc < 128 && wc >= 32) ? static_cast<char>(wc) : '?';
+            }
         }
+
+
+        std::uint16_t full_name_len = device->read<std::uint16_t>(current + 0x48);
+        std::uint64_t full_name_ptr = device->read<std::uint64_t>(current + 0x50);
+
+        std::string full_name;
+        if (full_name_len > 0 && full_name_len < 1024 && full_name_ptr != 0)
+        {
+            std::vector<std::uint8_t> raw(full_name_len, 0);
+            device->read_raw(full_name_ptr, raw.data(), full_name_len);
+            full_name.reserve(full_name_len / 2);
+            for (std::size_t i = 0; i + 1 < full_name_len; i += 2)
+            {
+                std::uint16_t wc = raw[i] | (static_cast<std::uint16_t>(raw[i + 1]) << 8);
+                if (wc == 0) break;
+                full_name += (wc < 128 && wc >= 32) ? static_cast<char>(wc) : '?';
+            }
+        }
+
+        if (dll_base != 0 && !base_name.empty())
+        {
+            json entry;
+            entry["name"]        = base_name;
+            entry["base"]        = helpers::format_address(static_cast<ea_t>(dll_base));
+            entry["size"]        = size_of_img;
+            entry["size_hex"]    = helpers::format_address(static_cast<ea_t>(size_of_img));
+            entry["entry_point"] = helpers::format_address(static_cast<ea_t>(entry_point));
+            if (!full_name.empty())
+                entry["path"]    = full_name;
+            entry["is_main"]     = (dll_base == main_base);
+            modules.push_back(entry);
+        }
+
+        std::uint64_t next = device->read<std::uint64_t>(current);
+        if (next == current || next == 0) break;
+        current = next;
     }
 
     json result;
-    result["modules"]       = modules;
-    result["module_count"]  = modules.size();
-    result["process_id"]    = device->get_process_id();
-    result["note"]          = OBFSTR("Import-table enumeration. For full LDR list, walk PEB.Ldr via driver_read_pointer_chain.");
-    return tool_result_t::ok(OBFSTR("Enumerated ") + std::to_string(modules.size()) + " modules", result);
+    result["modules"]      = modules;
+    result["module_count"] = modules.size();
+    result["process_id"]   = device->get_process_id();
+    result["peb_address"]  = helpers::format_address(static_cast<ea_t>(peb.peb_address));
+    result["ldr_address"]  = helpers::format_address(static_cast<ea_t>(peb.ldr_address));
+    result["image_base"]   = helpers::format_address(static_cast<ea_t>(main_base));
+    return tool_result_t::ok(OBFSTR("Enumerated ") + std::to_string(modules.size()) +
+        OBFSTR(" modules via PEB InLoadOrderModuleList"), result);
 }
 
 static std::string resolve_nt_path_to_win32(const std::string& nt_path)
@@ -10896,60 +13277,185 @@ tool_result_t driver_dump_kernel_module(const json& params)
         std::uint64_t base_addr = static_cast<std::uint64_t>(found_base);
         std::uint32_t image_size = found_size;
 
+        json steps = json::array();
+        auto log = [&](const std::string& step, bool ok, const std::string& detail) {
+            steps.push_back({{"step", step}, {"ok", ok}, {"detail", detail}});
+        };
+
         std::vector<std::uint8_t> header_buf(0x1000, 0);
         std::size_t header_read = device->read_kernel_raw(base_addr, header_buf.data(), 0x1000);
-        if (header_read < 0x40 || header_buf[0] != 'M' || header_buf[1] != 'Z')
+
+        bool has_valid_mz = (header_read >= 0x40 && header_buf[0] == 'M' && header_buf[1] == 'Z');
+        bool has_valid_pe = false;
+        bool header_wiped = false;
+
+        std::uint16_t machine        = 0x8664;
+        std::uint16_t num_sections   = 0;
+        std::uint16_t opt_hdr_size   = 0;
+        std::uint32_t pe_image_size  = 0;
+        std::uint32_t pe_off         = 0;
+        std::uint32_t section_table_off = 0;
+
+        if (has_valid_mz)
         {
-            return tool_result_t::error(
-                OBFSTR("Failed to read PE header at kernel base ") +
+            pe_off = *reinterpret_cast<std::uint32_t*>(&header_buf[0x3C]);
+            if (pe_off + 0x18 <= header_read &&
+                header_buf[pe_off] == 'P' && header_buf[pe_off + 1] == 'E' &&
+                header_buf[pe_off + 2] == 0 && header_buf[pe_off + 3] == 0)
+            {
+                has_valid_pe    = true;
+                machine         = *reinterpret_cast<std::uint16_t*>(&header_buf[pe_off + 4]);
+                num_sections    = *reinterpret_cast<std::uint16_t*>(&header_buf[pe_off + 6]);
+                opt_hdr_size    = *reinterpret_cast<std::uint16_t*>(&header_buf[pe_off + 20]);
+                pe_image_size   = *reinterpret_cast<std::uint32_t*>(&header_buf[pe_off + 24 + 56]);
+                section_table_off = pe_off + 24 + opt_hdr_size;
+            }
+
+            log("read_header", true, has_valid_pe
+                ? ("MZ+PE valid, " + std::to_string(num_sections) + " sections, SizeOfImage=0x" +
+                   helpers::format_address(static_cast<ea_t>(pe_image_size)))
+                : "MZ found but PE signature invalid/corrupt");
+        }
+        else
+        {
+            header_wiped = true;
+            msg(OBFSTR_C("AiDA: WARNING - MZ signature not found at kernel base %s (read %zu bytes). "
+                "Header likely wiped by anti-cheat. Using module info as source of truth.\n"),
+                helpers::format_address(static_cast<ea_t>(base_addr)).c_str(), header_read);
+            log("read_header", false,
+                "MZ signature wiped/missing at base " +
                 helpers::format_address(static_cast<ea_t>(base_addr)) +
-                OBFSTR(". Read ") + std::to_string(header_read) + OBFSTR(" bytes. "
-                "MZ signature not found Ã¢â‚¬â€ module may be packed or encrypted in memory."));
+                " - anti-cheat header erasure detected. Will synthesize PE header.");
         }
 
-        std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&header_buf[0x3C]);
-        if (pe_off + 0x18 > header_read || header_buf[pe_off] != 'P' || header_buf[pe_off + 1] != 'E')
+        // --- Pre-dump protection analysis (kernel mode) ---
+        protection_analysis_t kd_protection = analyze_module_protection(
+            device.get(), base_addr, header_buf.data(), header_read,
+            has_valid_pe, header_wiped, pe_off, num_sections,
+            section_table_off, image_size, true, steps);
+
+        if (kd_protection.is_packed || kd_protection.is_vmprotected ||
+            kd_protection.is_themida)
         {
-            return tool_result_t::error(
-                OBFSTR("Invalid PE signature at offset 0x") +
-                helpers::format_address(static_cast<ea_t>(pe_off)));
+            msg(OBFSTR_C("AiDA: kernel module protection detected - VMProtect=%s Themida=%s Packed=%s "
+                "encrypted_sections=%d high_entropy_pages=%d\n"),
+                kd_protection.is_vmprotected ? "YES" : "no",
+                kd_protection.is_themida ? "YES" : "no",
+                kd_protection.is_packed ? "YES" : "no",
+                kd_protection.encrypted_section_count,
+                kd_protection.high_entropy_pages);
+            log("protection_analysis", true,
+                "Kernel module protections: VMProtect=" +
+                std::string(kd_protection.is_vmprotected ? "YES" : "no") +
+                " Themida=" + std::string(kd_protection.is_themida ? "YES" : "no") +
+                " packed=" + std::string(kd_protection.is_packed ? "YES" : "no") +
+                " encrypted_sections=" + std::to_string(kd_protection.encrypted_section_count) +
+                " avg_entropy=" + std::to_string(kd_protection.avg_code_entropy));
         }
 
-        std::uint16_t machine = *reinterpret_cast<std::uint16_t*>(&header_buf[pe_off + 4]);
-        std::uint16_t num_sections = *reinterpret_cast<std::uint16_t*>(&header_buf[pe_off + 6]);
-        std::uint16_t opt_hdr_size = *reinterpret_cast<std::uint16_t*>(&header_buf[pe_off + 20]);
-        std::uint32_t pe_image_size = *reinterpret_cast<std::uint32_t*>(&header_buf[pe_off + 24 + 56]);
-        std::uint32_t section_table_off = pe_off + 24 + opt_hdr_size;
+        std::uint32_t dump_size = image_size;
+        if (has_valid_pe && pe_image_size > dump_size)
+            dump_size = pe_image_size;
+        if (dump_size == 0)
+            dump_size = 0x100000;
+        if (dump_size > 0x40000000u)
+            return tool_result_t::error(OBFSTR("Image size exceeds 1GB limit: ") + std::to_string(dump_size));
 
-        std::uint32_t dump_size = (pe_image_size > image_size) ? pe_image_size : image_size;
-        if (dump_size == 0 || dump_size > 256 * 1024 * 1024)
+        log("size_source", true,
+            "Module info ImageSize=0x" + helpers::format_address(static_cast<ea_t>(image_size)) +
+            (has_valid_pe ? (", PE SizeOfImage=0x" + helpers::format_address(static_cast<ea_t>(pe_image_size))) : "") +
+            ", using dump_size=0x" + helpers::format_address(static_cast<ea_t>(dump_size)));
+
+        constexpr std::uint32_t PROBE_CHUNK = 0x10000;
+        constexpr int MAX_EMPTY_RUNS = 32;
+        int empty_run = 0;
+        std::uint32_t extended_end = dump_size;
+        std::vector<std::uint8_t> probe_buf(PROBE_CHUNK, 0);
+        std::uint64_t probe_limit = static_cast<std::uint64_t>(dump_size) * 4;
+        if (probe_limit > 0x40000000ULL) probe_limit = 0x40000000ULL;
+
+        for (std::uint64_t probe_off = dump_size; probe_off < probe_limit; probe_off += PROBE_CHUNK)
         {
-            return tool_result_t::error(
-                OBFSTR("Invalid image size: ") + std::to_string(dump_size));
+            std::memset(probe_buf.data(), 0, PROBE_CHUNK);
+            std::size_t probe_got = device->read_kernel_raw(
+                base_addr + probe_off, probe_buf.data(), PROBE_CHUNK);
+            if (probe_got == 0)
+                break;
+
+            bool all_zero = true;
+            for (std::size_t i = 0; i < probe_got; i++)
+            {
+                if (probe_buf[i] != 0) { all_zero = false; break; }
+            }
+
+            if (all_zero)
+            {
+                empty_run++;
+                if (empty_run >= MAX_EMPTY_RUNS) break;
+            }
+            else
+            {
+                empty_run = 0;
+                extended_end = static_cast<std::uint32_t>(probe_off + PROBE_CHUNK);
+            }
+        }
+
+        if (extended_end > dump_size)
+        {
+            msg(OBFSTR_C("AiDA: Extended kernel dump from 0x%X to 0x%X (+%u MB beyond base size)\n"),
+                dump_size, extended_end, (extended_end - dump_size) / (1024 * 1024));
+            log("probe_extend", true,
+                "Extended dump by " + std::to_string((extended_end - dump_size) / (1024 * 1024)) +
+                " MB via memory probing");
+            dump_size = extended_end;
         }
 
         std::vector<std::uint8_t> dump_data(dump_size, 0);
 
         std::memcpy(dump_data.data(), header_buf.data(), std::min<std::size_t>(header_read, dump_size));
 
-        show_wait_box("HIDECANCEL\nAiDA: Dumping kernel module %s from memory (0x%X bytes)...",
-                      found_name.c_str(), dump_size);
+        show_wait_box("HIDECANCEL\nAiDA: Dumping kernel module %s from memory (0x%X bytes, %u MB)...",
+                      found_name.c_str(), dump_size, dump_size / (1024 * 1024));
 
-        constexpr std::size_t CHUNK_SIZE = 0x10000;
-        std::size_t total_read = header_read;
+        constexpr std::size_t KD_CHUNK = 0x10000;
+        constexpr std::size_t KD_PAGE  = 0x1000;
+        std::size_t total_read = std::min<std::size_t>(header_read, dump_size);
+        int kd_failed_pages = 0;
+        std::vector<std::uint32_t> kd_failed_offsets;
 
-        for (std::uint32_t offset = static_cast<std::uint32_t>(header_read);
-             offset < dump_size; offset += CHUNK_SIZE)
+        for (std::uint32_t offset = static_cast<std::uint32_t>(
+                 std::min<std::size_t>(header_read, dump_size));
+             offset < dump_size; offset += static_cast<std::uint32_t>(KD_CHUNK))
         {
-            std::size_t to_read = CHUNK_SIZE;
+            std::size_t to_read = KD_CHUNK;
             if (offset + to_read > dump_size)
                 to_read = dump_size - offset;
 
             std::size_t bytes_got = device->read_kernel_raw(
                 base_addr + offset, dump_data.data() + offset, to_read);
 
-            if (bytes_got > 0)
+            if (bytes_got >= to_read)
+            {
                 total_read += bytes_got;
+            }
+            else
+            {
+
+                for (std::size_t pg = 0; pg < to_read; pg += KD_PAGE)
+                {
+                    std::size_t pg_sz  = std::min(KD_PAGE, to_read - pg);
+                    std::size_t pg_got = device->read_kernel_raw(
+                        base_addr + offset + pg,
+                        dump_data.data() + offset + static_cast<std::uint32_t>(pg), pg_sz);
+                    if (pg_got > 0)
+                        total_read += pg_got;
+                    else
+                    {
+                        kd_failed_pages++;
+                        kd_failed_offsets.push_back(offset + static_cast<std::uint32_t>(pg));
+                    }
+                }
+            }
 
             if (offset % 0x40000 == 0)
                 replace_wait_box("HIDECANCEL\nAiDA: Dumping %s: 0x%X / 0x%X (%.1f%%)",
@@ -10957,21 +13463,332 @@ tool_result_t driver_dump_kernel_module(const json& params)
                                  (offset * 100.0) / dump_size);
         }
 
+
+        if (!kd_failed_offsets.empty())
+        {
+            replace_wait_box("HIDECANCEL\nAiDA: Re-solving kernel DTB and retrying %d pages...",
+                             static_cast<int>(kd_failed_offsets.size()));
+            device->solve_kernel_dtb();
+
+            int kd_recovered = 0;
+            for (std::uint32_t fo : kd_failed_offsets)
+            {
+                std::size_t pg_sz  = std::min(KD_PAGE, static_cast<std::size_t>(dump_size - fo));
+                std::size_t pg_got = device->read_kernel_raw(
+                    base_addr + fo, dump_data.data() + fo, pg_sz);
+                if (pg_got > 0)
+                {
+                    total_read += pg_got;
+                    kd_recovered++;
+                }
+            }
+
+            if (kd_recovered > 0)
+                msg(OBFSTR_C("AiDA: Kernel DTB re-solve recovered %d/%d failed pages\n"),
+                    kd_recovered, static_cast<int>(kd_failed_offsets.size()));
+
+            kd_failed_pages -= kd_recovered;
+        }
+
+
+        if (!kd_failed_offsets.empty())
+        {
+            std::string kd_disk_path = resolve_nt_path_to_win32(found_nt_path);
+            if (!kd_disk_path.empty())
+            {
+                std::vector<std::size_t> kd_fail_sizes;
+                kd_fail_sizes.reserve(kd_failed_offsets.size());
+                for (std::uint32_t fo : kd_failed_offsets)
+                    kd_fail_sizes.push_back(static_cast<std::size_t>(fo));
+
+                int disk_recovered = try_fill_from_disk_pe(dump_data, kd_fail_sizes, kd_disk_path, steps);
+                if (disk_recovered > 0)
+                {
+                    kd_failed_pages -= disk_recovered;
+                    total_read += static_cast<std::size_t>(disk_recovered) * KD_PAGE;
+                }
+            }
+        }
+
         hide_wait_box();
+
+        log("dump_memory", total_read > 0,
+            std::to_string(total_read) + "/" + std::to_string(dump_size) + " bytes" +
+            (kd_failed_pages > 0 ? (", " + std::to_string(kd_failed_pages) + " pages unreadable (paged-out/shadow)") : ""));
+
+        if (header_wiped || !has_valid_pe)
+        {
+            msg(OBFSTR_C("AiDA: Synthesizing PE header for headerless kernel dump...\n"));
+
+            struct discovered_section_t {
+                std::uint32_t rva;
+                std::uint32_t size;
+                bool is_executable;
+                bool is_writable;
+                bool has_data;
+            };
+            std::vector<discovered_section_t> discovered;
+
+            constexpr std::uint32_t SCAN_GRANULARITY = 0x1000;
+            std::uint32_t current_start = 0;
+            bool in_section = false;
+            bool sec_exec = false;
+            bool sec_write = false;
+            bool sec_has_data = false;
+
+            for (std::uint32_t off = 0; off < dump_size; off += SCAN_GRANULARITY)
+            {
+                bool page_has_data = false;
+                bool page_looks_code = false;
+                std::uint32_t page_end = std::min(off + SCAN_GRANULARITY, dump_size);
+
+                for (std::uint32_t i = off; i < page_end; i++)
+                {
+                    if (dump_data[i] != 0) { page_has_data = true; break; }
+                }
+
+                if (page_has_data && page_end - off >= 16)
+                {
+                    int code_heuristic = 0;
+                    for (std::uint32_t i = off; i < page_end - 4; i += 64)
+                    {
+                        std::uint8_t b = dump_data[i];
+                        if (b == 0xCC || b == 0xC3 || b == 0xC2 ||
+                            b == 0xE8 || b == 0xE9 || b == 0xFF ||
+                            b == 0x48 || b == 0x4C || b == 0x41 ||
+                            b == 0x0F || b == 0x55 || b == 0x53)
+                            code_heuristic++;
+                    }
+                    page_looks_code = (code_heuristic > 3);
+                }
+
+                if (page_has_data && !in_section)
+                {
+                    current_start = off;
+                    in_section = true;
+                    sec_exec = page_looks_code;
+                    sec_write = !page_looks_code;
+                    sec_has_data = true;
+                }
+                else if (page_has_data && in_section)
+                {
+                    if (page_looks_code) sec_exec = true;
+                    sec_has_data = true;
+                }
+                else if (!page_has_data && in_section)
+                {
+                    std::uint32_t lookahead_end = std::min(off + 0x10000, dump_size);
+                    bool resumes = false;
+                    for (std::uint32_t la = off + SCAN_GRANULARITY; la < lookahead_end; la += SCAN_GRANULARITY)
+                    {
+                        for (std::uint32_t i = la; i < std::min(la + SCAN_GRANULARITY, dump_size); i++)
+                        {
+                            if (dump_data[i] != 0) { resumes = true; break; }
+                        }
+                        if (resumes) break;
+                    }
+
+                    if (!resumes)
+                    {
+                        discovered.push_back({current_start, off - current_start,
+                                              sec_exec, sec_write, sec_has_data});
+                        in_section = false;
+                    }
+                }
+            }
+
+            if (in_section)
+            {
+                discovered.push_back({current_start, dump_size - current_start,
+                                      sec_exec, sec_write, sec_has_data});
+            }
+
+            if (discovered.empty())
+            {
+                discovered.push_back({0, dump_size, true, false, true});
+            }
+
+            int max_synth_sections = std::min<int>(static_cast<int>(discovered.size()), 16);
+            std::uint32_t synth_pe_off = 0x80;
+            std::uint32_t synth_opt_size = 0xF0;
+            std::uint32_t synth_sec_table = synth_pe_off + 0x18 + synth_opt_size;
+            std::uint32_t synth_header_end = synth_sec_table + max_synth_sections * 40;
+
+            if (synth_header_end > 0x1000) synth_header_end = 0x1000;
+
+            dump_data[0x00] = 'M'; dump_data[0x01] = 'Z';
+            dump_data[0x02] = 0x90; dump_data[0x03] = 0x00;
+            *reinterpret_cast<std::uint32_t*>(&dump_data[0x3C]) = synth_pe_off;
+
+            dump_data[synth_pe_off + 0] = 'P';
+            dump_data[synth_pe_off + 1] = 'E';
+            dump_data[synth_pe_off + 2] = 0;
+            dump_data[synth_pe_off + 3] = 0;
+
+            *reinterpret_cast<std::uint16_t*>(&dump_data[synth_pe_off + 4]) = 0x8664;
+            *reinterpret_cast<std::uint16_t*>(&dump_data[synth_pe_off + 6]) =
+                static_cast<std::uint16_t>(max_synth_sections);
+
+            std::uint16_t pe_characteristics = 0x0022;
+            *reinterpret_cast<std::uint16_t*>(&dump_data[synth_pe_off + 0x16]) = pe_characteristics;
+
+            *reinterpret_cast<std::uint16_t*>(&dump_data[synth_pe_off + 0x14]) = synth_opt_size;
+
+            std::uint32_t opt_off = synth_pe_off + 0x18;
+            *reinterpret_cast<std::uint16_t*>(&dump_data[opt_off + 0]) = 0x020B;
+            *reinterpret_cast<std::uint32_t*>(&dump_data[opt_off + 0x38]) =
+                (dump_size + 0xFFF) & ~0xFFFu;
+            *reinterpret_cast<std::uint32_t*>(&dump_data[opt_off + 0x3C]) = 0x1000;
+            *reinterpret_cast<std::uint64_t*>(&dump_data[opt_off + 0x18]) = base_addr;
+            *reinterpret_cast<std::uint32_t*>(&dump_data[opt_off + 0x10]) =
+                discovered.empty() ? 0x1000 : discovered[0].rva;
+            *reinterpret_cast<std::uint16_t*>(&dump_data[opt_off + 0x44]) = 0x0A;
+            *reinterpret_cast<std::uint32_t*>(&dump_data[opt_off + 0x6C]) = 0;
+
+            for (int si = 0; si < max_synth_sections; si++)
+            {
+                const auto& ds = discovered[si];
+                std::uint32_t sec_off = synth_sec_table + si * 40;
+                if (sec_off + 40 > 0x1000) break;
+
+                char sname[9] = {};
+                if (ds.is_executable)
+                    qsnprintf(sname, sizeof(sname), ".text%d", si);
+                else
+                    qsnprintf(sname, sizeof(sname), ".data%d", si);
+                if (si == 0 && ds.is_executable) std::memcpy(sname, ".text\0\0\0", 8);
+                if (si == 0 && !ds.is_executable) std::memcpy(sname, ".data\0\0\0", 8);
+
+                std::memcpy(&dump_data[sec_off], sname, 8);
+                *reinterpret_cast<std::uint32_t*>(&dump_data[sec_off + 8]) = ds.size;
+                *reinterpret_cast<std::uint32_t*>(&dump_data[sec_off + 12]) = ds.rva;
+                *reinterpret_cast<std::uint32_t*>(&dump_data[sec_off + 16]) = ds.size;
+                *reinterpret_cast<std::uint32_t*>(&dump_data[sec_off + 20]) = ds.rva;
+
+                std::uint32_t chars = 0x40000000u;
+                if (ds.is_executable) chars |= 0x20000000u | 0x00000020u;
+                if (ds.is_writable)   chars |= 0x80000000u;
+                chars |= 0x00000040u;
+                *reinterpret_cast<std::uint32_t*>(&dump_data[sec_off + 36]) = chars;
+            }
+
+            machine         = 0x8664;
+            num_sections    = static_cast<std::uint16_t>(max_synth_sections);
+            pe_off          = synth_pe_off;
+            opt_hdr_size    = synth_opt_size;
+            section_table_off = synth_sec_table;
+            pe_image_size   = dump_size;
+            has_valid_pe    = true;
+
+            log("synthesize_header", true,
+                "Built synthetic PE header with " + std::to_string(max_synth_sections) +
+                " discovered sections from memory content analysis");
+            msg(OBFSTR_C("AiDA: Synthesized PE header - %d sections discovered via memory scanning\n"),
+                max_synth_sections);
+        }
 
 
         pe_fix_result_t pe_fix = fix_dumped_pe_image(dump_data, base_addr);
         if (pe_fix.success)
-            msg(OBFSTR_C("AiDA: PE fixed — %d sections, %d IAT entries restored, EP %s\n"),
+        {
+            msg(OBFSTR_C("AiDA: PE fixed - %d sections, %d IAT entries restored, EP %s\n"),
                 pe_fix.sections_fixed, pe_fix.iat_entries_restored,
                 pe_fix.entry_point_valid ? "valid" : "fallback");
+            log("pe_fix", true, std::to_string(pe_fix.sections_fixed) + " sections, " +
+                std::to_string(pe_fix.iat_entries_restored) + " IAT entries");
+        }
+
+        cleanup_exception_directory(dump_data, pe_fix.is_pe64 || (machine == 0x8664));
+        log("exception_cleanup", true, "Invalid runtime function entries cleaned");
+
+        {
+            std::uint16_t kd_sec_count = num_sections;
+            std::uint32_t kd_sec_table = section_table_off;
+            if (pe_fix.success && dump_size > 0x200)
+            {
+                std::uint32_t fpo = *reinterpret_cast<std::uint32_t*>(dump_data.data() + 0x3C);
+                if (fpo + 0x18 < dump_size)
+                {
+                    kd_sec_count = *reinterpret_cast<std::uint16_t*>(dump_data.data() + fpo + 6);
+                    std::uint16_t fo = *reinterpret_cast<std::uint16_t*>(dump_data.data() + fpo + 0x14);
+                    kd_sec_table = fpo + 0x18 + fo;
+                }
+            }
+
+            int kd_nop_filled = 0;
+            for (int si = 0; si < kd_sec_count && si < 96; si++)
+            {
+                std::uint32_t soff = kd_sec_table + si * 40;
+                if (soff + 40 > dump_size) break;
+
+                std::uint32_t vsize = *reinterpret_cast<std::uint32_t*>(dump_data.data() + soff + 8);
+                std::uint32_t vrva  = *reinterpret_cast<std::uint32_t*>(dump_data.data() + soff + 12);
+                std::uint32_t chars = *reinterpret_cast<std::uint32_t*>(dump_data.data() + soff + 36);
+
+                if (vsize == 0 || vrva == 0 || !(chars & 0x20000000)) continue;
+
+                for (std::uint32_t pg_off = vrva; pg_off < vrva + vsize; pg_off += 0x1000)
+                {
+                    if (pg_off >= dump_size) break;
+                    std::uint32_t pg_sz = std::min<std::uint32_t>(0x1000, dump_size - pg_off);
+
+                    bool is_all_zero = true;
+                    for (std::uint32_t i = 0; i < pg_sz; i++)
+                    {
+                        if (dump_data[pg_off + i] != 0x00)
+                        {
+                            is_all_zero = false;
+                            break;
+                        }
+                    }
+                    if (is_all_zero)
+                    {
+                        std::memset(dump_data.data() + pg_off, 0x90, pg_sz);
+                        kd_nop_filled++;
+                    }
+                }
+            }
+
+            if (kd_nop_filled > 0)
+            {
+                log("nop_fill", true, std::to_string(kd_nop_filled) +
+                    " zero code pages NOP-filled to prevent IDA treating them as data");
+                msg(OBFSTR_C("AiDA: NOP-filled %d zero code pages in kernel dump\n"), kd_nop_filled);
+            }
+        }
 
         iat_rebuild_result_t iat_rebuild = reconstruct_iat_runtime(dump_data, base_addr, device.get(), true);
         if (iat_rebuild.success && iat_rebuild.descriptors_rebuilt > 0)
-            msg(OBFSTR_C("AiDA: Kernel IAT reconstruction — %d imports resolved, %d failed, %d descriptors rebuilt\n"),
+        {
+            msg(OBFSTR_C("AiDA: Kernel IAT reconstruction - %d imports resolved, %d failed, %d descriptors rebuilt\n"),
                 iat_rebuild.imports_resolved, iat_rebuild.imports_failed, iat_rebuild.descriptors_rebuilt);
+            log("iat_rebuild", true, std::to_string(iat_rebuild.imports_resolved) + " imports, " +
+                std::to_string(iat_rebuild.descriptors_rebuilt) + " descriptors");
+        }
         else if (!iat_rebuild.error.empty())
+        {
             msg(OBFSTR_C("AiDA: Kernel IAT rebuild note: %s\n"), iat_rebuild.error.c_str());
+            log("iat_rebuild", false, iat_rebuild.error);
+        }
+
+        if (iat_rebuild.descriptors_rebuilt == 0 || iat_rebuild.imports_resolved == 0)
+        {
+            msg(OBFSTR_C("AiDA: Standard kernel IAT rebuild found nothing — running full export-scan reconstruction...\n"));
+            iat_rebuild_result_t scan_result = full_iat_scan_and_rebuild(dump_data, base_addr, device.get(), true);
+            if (scan_result.success && scan_result.imports_resolved > 0)
+            {
+                iat_rebuild = scan_result;
+                msg(OBFSTR_C("AiDA: Kernel full IAT scan — %d imports resolved, %d DLLs\n"),
+                    scan_result.imports_resolved, scan_result.descriptors_rebuilt);
+                log("iat_full_scan", true, std::to_string(scan_result.imports_resolved) +
+                    " imports via full scan, " + std::to_string(scan_result.descriptors_rebuilt) + " DLLs");
+            }
+            else
+            {
+                msg(OBFSTR_C("AiDA: Kernel full IAT scan found no additional imports\n"));
+                log("iat_full_scan", false, scan_result.error.empty() ? "No imports found" : scan_result.error);
+            }
+        }
 
         show_wait_box("HIDECANCEL\nAiDA: Writing memory dump to %s...", output_path.c_str());
         ensure_parent_dir_exists(output_path);
@@ -10989,10 +13806,24 @@ tool_result_t driver_dump_kernel_module(const json& params)
         }
 
         DWORD bytes_written = 0;
-        WriteFile(hOut, dump_data.data(), static_cast<DWORD>(dump_size), &bytes_written, nullptr);
+        {
+            const std::uint8_t* wp = dump_data.data();
+            std::size_t rem = dump_size;
+            bool wok = true;
+            while (rem > 0 && wok)
+            {
+                DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(rem, 0x40000000ULL));
+                DWORD w = 0;
+                if (!WriteFile(hOut, wp, chunk, &w, nullptr) || w != chunk)
+                    wok = false;
+                else { wp += w; rem -= w; bytes_written += w; }
+            }
+        }
         CloseHandle(hOut);
         hide_wait_box();
-        msg(OBFSTR_C("AiDA: Dump saved to %s (%u bytes)\n"), output_path.c_str(), dump_size);
+        msg(OBFSTR_C("AiDA: Dump saved to %s (%u bytes, %u MB)\n"),
+            output_path.c_str(), dump_size, dump_size / (1024 * 1024));
+        log("save_to_disk", true, output_path + " (" + std::to_string(dump_size) + " bytes)");
 
         std::size_t patched = 0;
         json sections_arr = json::array();
@@ -11001,15 +13832,33 @@ tool_result_t driver_dump_kernel_module(const json& params)
         {
             show_wait_box("HIDECANCEL\nAiDA: Creating IDB segments and patching bytes...");
 
-            for (int s = 0; s < num_sections && section_table_off + (s + 1) * 40 <= header_read; s++)
+            std::uint16_t final_num_sections = num_sections;
+            std::uint32_t final_section_table_off = section_table_off;
+            if (pe_fix.success && dump_size > 0x200)
             {
-                const std::uint8_t* sec = &header_buf[section_table_off + s * 40];
+                std::uint32_t fpo = *reinterpret_cast<std::uint32_t*>(dump_data.data() + 0x3C);
+                if (fpo + 0x18 < dump_size)
+                {
+                    final_num_sections = *reinterpret_cast<std::uint16_t*>(dump_data.data() + fpo + 6);
+                    std::uint16_t fo = *reinterpret_cast<std::uint16_t*>(dump_data.data() + fpo + 0x14);
+                    final_section_table_off = fpo + 0x18 + fo;
+                }
+            }
+
+            for (int s = 0; s < final_num_sections && s < 96; s++)
+            {
+                std::uint32_t s_off = final_section_table_off + s * 40;
+                if (s_off + 40 > dump_size) break;
+
+                const std::uint8_t* sec = dump_data.data() + s_off;
                 char sec_name[9] = {};
                 std::memcpy(sec_name, sec, 8);
 
                 std::uint32_t virt_size       = *reinterpret_cast<const std::uint32_t*>(sec + 8);
                 std::uint32_t virt_addr       = *reinterpret_cast<const std::uint32_t*>(sec + 12);
-                std::uint32_t characteristics = *reinterpret_cast<const std::uint32_t*>(sec + 36);
+                std::uint32_t sec_chars       = *reinterpret_cast<const std::uint32_t*>(sec + 36);
+
+                if (virt_size == 0) continue;
 
                 ea_t seg_start = static_cast<ea_t>(base_addr + virt_addr);
                 ea_t seg_end   = seg_start + virt_size;
@@ -11019,12 +13868,12 @@ tool_result_t driver_dump_kernel_module(const json& params)
                     segment_t seg;
                     seg.start_ea = seg_start;
                     seg.end_ea   = seg_end;
-                    seg.type     = (characteristics & 0x20000000) ? SEG_CODE : SEG_DATA;
+                    seg.type     = (sec_chars & 0x20000000) ? SEG_CODE : SEG_DATA;
                     seg.bitness  = 2;
                     seg.perm     = 0;
-                    if (characteristics & 0x20000000) seg.perm |= SEGPERM_EXEC;
-                    if (characteristics & 0x40000000) seg.perm |= SEGPERM_READ;
-                    if (characteristics & 0x80000000) seg.perm |= SEGPERM_WRITE;
+                    if (sec_chars & 0x20000000) seg.perm |= SEGPERM_EXEC;
+                    if (sec_chars & 0x40000000) seg.perm |= SEGPERM_READ;
+                    if (sec_chars & 0x80000000) seg.perm |= SEGPERM_WRITE;
                     add_segm_ex(&seg, sec_name, nullptr, ADDSEG_QUIET | ADDSEG_NOSREG);
                 }
 
@@ -11043,12 +13892,13 @@ tool_result_t driver_dump_kernel_module(const json& params)
                 sec_info["name"]            = sec_name;
                 sec_info["virtual_address"] = helpers::format_address(static_cast<ea_t>(virt_addr));
                 sec_info["virtual_size"]    = virt_size;
-                sec_info["characteristics"] = helpers::format_address(static_cast<ea_t>(characteristics));
+                sec_info["characteristics"] = helpers::format_address(static_cast<ea_t>(sec_chars));
                 sec_info["bytes_patched"]   = sec_patched;
                 sections_arr.push_back(sec_info);
             }
 
             hide_wait_box();
+            log("patch_idb", patched > 0, std::to_string(patched) + " bytes patched into IDB");
         }
 
         std::string pe_arch = "unknown";
@@ -11059,20 +13909,26 @@ tool_result_t driver_dump_kernel_module(const json& params)
         int coverage = dump_size ? static_cast<int>((total_read * 100) / dump_size) : 0;
 
         json result;
-        result["module_name"]       = found_name;
-        result["nt_path"]           = found_nt_path;
-        result["kernel_base"]       = helpers::format_address(static_cast<ea_t>(found_base));
-        result["image_size"]        = dump_size;
-        result["bytes_read"]        = total_read;
-        result["coverage_pct"]      = coverage;
-        result["output_path"]       = output_path;
-        result["saved_to"]          = output_path;
-        result["valid_pe"]          = true;
-        result["architecture"]      = pe_arch;
-        result["num_sections"]      = num_sections;
-        result["dump_source"]       = "kernel_memory";
-        result["can_load_in_ida"]   = true;
-        result["analyzed"]          = analyze && patch_idb;
+        result["module_name"]        = found_name;
+        result["nt_path"]            = found_nt_path;
+        result["kernel_base"]        = helpers::format_address(static_cast<ea_t>(found_base));
+        result["image_size"]         = dump_size;
+        result["module_info_size"]   = image_size;
+        result["bytes_read"]         = total_read;
+        result["coverage_pct"]       = coverage;
+        result["output_path"]        = output_path;
+        result["saved_to"]           = output_path;
+        result["valid_pe"]           = has_valid_pe;
+        result["header_wiped"]       = header_wiped;
+        result["header_synthesized"] = header_wiped || !has_valid_mz;
+        result["architecture"]       = pe_arch;
+        result["num_sections"]       = static_cast<int>(num_sections);
+        result["dump_source"]        = "kernel_memory";
+        result["can_load_in_ida"]    = true;
+        result["analyzed"]           = analyze && patch_idb;
+        result["steps"]              = steps;
+        if (kd_failed_pages > 0)
+            result["unreadable_pages"] = kd_failed_pages;
         if (patch_idb)
         {
             result["bytes_patched"] = patched;
@@ -11082,16 +13938,43 @@ tool_result_t driver_dump_kernel_module(const json& params)
             result["pe_fix"] = pe_fix_to_json(pe_fix);
         if (iat_rebuild.success && iat_rebuild.descriptors_rebuilt > 0)
             result["iat_rebuild"] = iat_rebuild_to_json(iat_rebuild);
-        result["note"]              = OBFSTR(
-            "Live kernel memory dump - contains runtime-decrypted code, devirtualized sections, "
-            "and unpacked data. Open this file in a NEW IDA Pro instance for proper analysis. "
-            "Some pages may be zero-filled if they were paged out.");
+
+        result["protections_detected"] = kd_protection.is_packed ||
+            kd_protection.is_vmprotected || kd_protection.is_themida;
+        result["vmprotect"]  = kd_protection.is_vmprotected;
+        result["themida"]    = kd_protection.is_themida;
+        result["upx"]        = kd_protection.is_upx;
+        result["is_packed"]  = kd_protection.is_packed;
+        {
+            json pa;
+            pa["total_code_pages"]    = kd_protection.total_code_pages;
+            pa["zero_pages"]          = kd_protection.zero_code_pages;
+            pa["high_entropy_pages"]  = kd_protection.high_entropy_pages;
+            pa["avg_entropy"]         = kd_protection.avg_code_entropy;
+            pa["encrypted_sections"]  = kd_protection.encrypted_section_count;
+
+            result["pre_dump_analysis"] = pa;
+        }
+
+        std::string note_str;
+        if (header_wiped)
+            note_str = OBFSTR("WARNING: Original PE header was wiped by anti-cheat. "
+                "A synthetic header has been constructed from memory analysis. "
+                "Section boundaries are approximate. ");
+        note_str += OBFSTR("Live kernel memory dump - contains runtime-decrypted code. "
+            "Open this file in a NEW IDA Pro instance for proper analysis. ");
+        if (kd_failed_pages > 0)
+            note_str += std::to_string(kd_failed_pages) +
+                OBFSTR(" pages were unreadable (paged-out, shadow-mapped, or EPT-protected). ");
+        result["note"] = note_str;
 
         return tool_result_t::ok(
             OBFSTR("Kernel module dumped: ") + found_name + OBFSTR(" (") +
             std::to_string(total_read) + OBFSTR("/") + std::to_string(dump_size) +
-            OBFSTR(" bytes, ") + std::to_string(coverage) + OBFSTR("% coverage) -> ") +
-            output_path + OBFSTR(". Open this file in a NEW IDA Pro instance for proper analysis."), result);
+            OBFSTR(" bytes, ") + std::to_string(coverage) + OBFSTR("% coverage") +
+            (header_wiped ? OBFSTR(", header synthesized") : "") +
+            OBFSTR(") -> ") + output_path +
+            OBFSTR(". Open this file in a NEW IDA Pro instance for proper analysis."), result);
     }
 
     std::string disk_path = resolve_nt_path_to_win32(found_nt_path);
@@ -12666,8 +15549,9 @@ void register_tools()
 
     registry.register_tool({
         OBFSTR("driver_enumerate_modules"), OBFSTR("driver"),
-        OBFSTR("Enumerate modules loaded in the target process via kernel memory reads. "
-               "Reads the main PE import directory to discover all loaded DLL dependencies."),
+        OBFSTR("Enumerate ALL modules loaded in the attached process by walking the PEB LDR "
+               "InLoadOrderModuleList. Returns each module's name, base address, size, entry point, "
+               "full path, and whether it is the main executable. Requires driver_attach first."),
         {}, driver_enumerate_modules, false});
 
     registry.register_tool({
