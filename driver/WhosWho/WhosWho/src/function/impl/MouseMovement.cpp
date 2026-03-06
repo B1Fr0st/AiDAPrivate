@@ -272,8 +272,11 @@ namespace mouse_guard {
 
 NTSTATUS functions::handle7780(p_mouse_move req) {
     if (!req) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] MouseMove: null request\n");
         return STATUS_INVALID_PARAMETER;
     }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] MouseMove: X=%d Y=%d flags=0x%X\n", req->inputX, req->inputY, req->buttonFlags);
 
     mouse_guard::scatter();
 
@@ -286,6 +289,7 @@ NTSTATUS functions::handle7780(p_mouse_move req) {
 
     NTSTATUS status = EnsureMouseInitialized(&callback, &device);
     if (!NT_SUCCESS(status)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] MouseMove: EnsureMouseInitialized FAILED status=0x%08X\n", status);
         return status;
     }
 
@@ -359,6 +363,8 @@ NTSTATUS functions::handle7780(p_mouse_move req) {
     if (raised_irql && _KeLowerIrql) {
         _KeLowerIrql(old_irql);
     }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] MouseMove: completed status=0x%08X consumed=%u\n", result, consumed);
 
     return result;
 }

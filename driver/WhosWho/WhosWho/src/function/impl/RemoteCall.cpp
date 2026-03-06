@@ -89,6 +89,14 @@ namespace shellcode_builder {
 
         i += poly_engine::emit_junk(&buf[i], 3);
 
+        buf[i++] = 0x50;
+        buf[i++] = 0x48; buf[i++] = 0xB8;
+        *(UINT64*)&buf[i] = ctx_addr;
+        i += 8;
+        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x60; buf[i++] = 0x60;
+        buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0x40; buf[i++] = 0x60; buf[i++] = 0x08;
+        buf[i++] = 0x58;
+
         buf[i++] = 0x9C;
 
         ULONG push_order = poly_engine::poly_rand();
@@ -114,7 +122,18 @@ namespace shellcode_builder {
         buf[i++] = 0x41; buf[i++] = 0x56;
         buf[i++] = 0x41; buf[i++] = 0x57;
 
+        buf[i++] = 0x48; buf[i++] = 0xBE;
+        *(UINT64*)&buf[i] = ctx_addr;
+        i += 8;
+
+        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x5E; buf[i++] = 0x48;
+
+        buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0xE4; buf[i++] = 0xF0;
+
         buf[i++] = 0x48; buf[i++] = 0x81; buf[i++] = 0xEC; buf[i++] = 0x80; buf[i++] = 0x00; buf[i++] = 0x00; buf[i++] = 0x00;
+
+        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x66; buf[i++] = 0x38;
+
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x04; buf[i++] = 0x24;
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x4C; buf[i++] = 0x24; buf[i++] = 0x10;
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x54; buf[i++] = 0x24; buf[i++] = 0x20;
@@ -122,18 +141,8 @@ namespace shellcode_builder {
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x64; buf[i++] = 0x24; buf[i++] = 0x40;
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x6C; buf[i++] = 0x24; buf[i++] = 0x50;
 
-        buf[i++] = 0x48; buf[i++] = 0xBE;
-        *(UINT64*)&buf[i] = ctx_addr;
-        i += 8;
-
-        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x5E; buf[i++] = 0x48;
-
-        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x66; buf[i++] = 0x38;
-
-        buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0xE4; buf[i++] = 0xF0;
-
         buf[i++] = 0x48; buf[i++] = 0x81; buf[i++] = 0xEC;
-        *(UINT32*)&buf[i] = 0x28;
+        *(UINT32*)&buf[i] = 0x20;
         i += 4;
 
         buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x4E; buf[i++] = 0x10;
@@ -185,6 +194,7 @@ namespace shellcode_builder {
         buf[i++] = 0x48; buf[i++] = 0xBE;
         *(UINT64*)&buf[i] = ctx_addr;
         i += 8;
+        buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x66; buf[i++] = 0x60;
         buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x46; buf[i++] = 0x40;
         buf[i++] = 0xFF; buf[i++] = 0xE0;
 
@@ -193,6 +203,14 @@ namespace shellcode_builder {
 
     __forceinline SIZE_T build_jmp_rbx_spoofed(PUINT8 buf, UINT64 ctx_addr, UINT64 jmp_rbx_gadget, UINT64 epilogue_addr) {
         SIZE_T i = 0;
+
+        buf[i++] = 0x50;
+        buf[i++] = 0x48; buf[i++] = 0xB8;
+        *(UINT64*)&buf[i] = ctx_addr;
+        i += 8;
+        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x60; buf[i++] = 0x60;
+        buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0x40; buf[i++] = 0x60; buf[i++] = 0x08;
+        buf[i++] = 0x58;
 
         buf[i++] = 0x9C;
 
@@ -212,7 +230,18 @@ namespace shellcode_builder {
         buf[i++] = 0x41; buf[i++] = 0x56;
         buf[i++] = 0x41; buf[i++] = 0x57;
 
+        buf[i++] = 0x48; buf[i++] = 0xBE;
+        *(UINT64*)&buf[i] = ctx_addr;
+        i += 8;
+
+        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x5E; buf[i++] = 0x48;
+
+        buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0xE4; buf[i++] = 0xF0;
+
         buf[i++] = 0x48; buf[i++] = 0x81; buf[i++] = 0xEC; buf[i++] = 0x80; buf[i++] = 0x00; buf[i++] = 0x00; buf[i++] = 0x00;
+
+        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x66; buf[i++] = 0x38;
+
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x04; buf[i++] = 0x24;
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x4C; buf[i++] = 0x24; buf[i++] = 0x10;
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x54; buf[i++] = 0x24; buf[i++] = 0x20;
@@ -220,18 +249,8 @@ namespace shellcode_builder {
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x64; buf[i++] = 0x24; buf[i++] = 0x40;
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x6C; buf[i++] = 0x24; buf[i++] = 0x50;
 
-        buf[i++] = 0x48; buf[i++] = 0xBE;
-        *(UINT64*)&buf[i] = ctx_addr;
-        i += 8;
-
-        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x5E; buf[i++] = 0x48;
-
-        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x66; buf[i++] = 0x38;
-
-        buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0xE4; buf[i++] = 0xF0;
-
         buf[i++] = 0x48; buf[i++] = 0x81; buf[i++] = 0xEC;
-        *(UINT32*)&buf[i] = 0x28;
+        *(UINT32*)&buf[i] = 0x20;
         i += 4;
 
         buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x4E; buf[i++] = 0x10;
@@ -307,6 +326,7 @@ namespace shellcode_builder {
         buf[i++] = 0x48; buf[i++] = 0xBE;
         *(UINT64*)&buf[i] = ctx_addr;
         i += 8;
+        buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x66; buf[i++] = 0x60;
         buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x46; buf[i++] = 0x40;
         buf[i++] = 0xFF; buf[i++] = 0xE0;
 
@@ -316,6 +336,14 @@ namespace shellcode_builder {
     __forceinline SIZE_T build_direct_call(PUINT8 buf, UINT64 ctx_addr, UINT64 epilogue_addr) {
         UNREFERENCED_PARAMETER(epilogue_addr);
         SIZE_T i = 0;
+
+        buf[i++] = 0x50;
+        buf[i++] = 0x48; buf[i++] = 0xB8;
+        *(UINT64*)&buf[i] = ctx_addr;
+        i += 8;
+        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x60; buf[i++] = 0x60;
+        buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0x40; buf[i++] = 0x60; buf[i++] = 0x08;
+        buf[i++] = 0x58;
 
         buf[i++] = 0x9C;
 
@@ -335,7 +363,18 @@ namespace shellcode_builder {
         buf[i++] = 0x41; buf[i++] = 0x56;
         buf[i++] = 0x41; buf[i++] = 0x57;
 
+        buf[i++] = 0x48; buf[i++] = 0xBE;
+        *(UINT64*)&buf[i] = ctx_addr;
+        i += 8;
+
+        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x5E; buf[i++] = 0x48;
+
+        buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0xE4; buf[i++] = 0xF0;
+
         buf[i++] = 0x48; buf[i++] = 0x81; buf[i++] = 0xEC; buf[i++] = 0x80; buf[i++] = 0x00; buf[i++] = 0x00; buf[i++] = 0x00;
+
+        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x66; buf[i++] = 0x38;
+
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x04; buf[i++] = 0x24;
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x4C; buf[i++] = 0x24; buf[i++] = 0x10;
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x54; buf[i++] = 0x24; buf[i++] = 0x20;
@@ -343,18 +382,8 @@ namespace shellcode_builder {
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x64; buf[i++] = 0x24; buf[i++] = 0x40;
         buf[i++] = 0x0F; buf[i++] = 0x29; buf[i++] = 0x6C; buf[i++] = 0x24; buf[i++] = 0x50;
 
-        buf[i++] = 0x48; buf[i++] = 0xBE;
-        *(UINT64*)&buf[i] = ctx_addr;
-        i += 8;
-
-        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x5E; buf[i++] = 0x48;
-
-        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x66; buf[i++] = 0x38;
-
-        buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0xE4; buf[i++] = 0xF0;
-
         buf[i++] = 0x48; buf[i++] = 0x81; buf[i++] = 0xEC;
-        *(UINT32*)&buf[i] = 0x28;
+        *(UINT32*)&buf[i] = 0x20;
         i += 4;
 
         buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x4E; buf[i++] = 0x10;
@@ -406,6 +435,7 @@ namespace shellcode_builder {
         buf[i++] = 0x48; buf[i++] = 0xBE;
         *(UINT64*)&buf[i] = ctx_addr;
         i += 8;
+        buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x66; buf[i++] = 0x60;
         buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x46; buf[i++] = 0x40;
         buf[i++] = 0xFF; buf[i++] = 0xE0;
 
@@ -415,22 +445,32 @@ namespace shellcode_builder {
 
 NTSTATUS functions::handle7781(p_remote_call request) {
     if (!request) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: null request\n");
         return STATUS_INVALID_PARAMETER;
     }
 
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: target=0x%llX shellcode=0x%llX DTB=0x%llX spoof=0x%llX\n",
+        request->target_function, request->shellcode_address, request->dtb, request->spoof_return);
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: arg1=0x%llX arg2=0x%llX arg3=0x%llX arg4=0x%llX\n",
+        request->arg1, request->arg2, request->arg3, request->arg4);
+
     if (!call_guard::is_valid_code_ptr(request->target_function)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: invalid target function address\n");
         return STATUS_INVALID_ADDRESS;
     }
 
     if (!call_guard::is_valid_dtb(request->dtb)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: invalid DTB\n");
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->shellcode_address == 0) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: shellcode address is zero\n");
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!call_guard::is_valid_user_range(request->shellcode_address)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: shellcode address out of user range\n");
         return STATUS_INVALID_ADDRESS;
     }
 
@@ -477,11 +517,15 @@ NTSTATUS functions::handle7781(p_remote_call request) {
         return STATUS_UNSUCCESSFUL;
     }
 
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: shellcode built sc_size=%llu ep_size=%llu code_addr=0x%llX epilogue_addr=0x%llX\n",
+        (UINT64)sc_size, (UINT64)ep_size, code_addr, epilogue_addr);
+
     SIZE_T bytes_written = 0;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
 
     UINT64 phys_ctx = strong::translate_virtual_address(dtb_clean, context_addr);
     if (!phys_ctx) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: translate FAILED for context_addr=0x%llX DTB=0x%llX\n", context_addr, dtb_clean);
         return STATUS_INVALID_ADDRESS;
     }
 
@@ -559,11 +603,14 @@ NTSTATUS functions::handle7781(p_remote_call request) {
     request->result = 0;
     request->completed = 0;
 
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: setup complete, entry=0x%llX\n", code_addr);
+
     return STATUS_SUCCESS;
 }
 
 NTSTATUS functions::handle7782(p_call_result request) {
     if (!request) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] CallResult: null request\n");
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -605,13 +652,63 @@ NTSTATUS functions::handle7782(p_call_result request) {
     KeMemoryBarrier();
 
     volatile UINT64 done_flag = ctx.exec_done;
+    request->completed = 0;
+    request->result = 0;
 
     if (done_flag != 0) {
         request->result = ctx.ret_value;
-        return STATUS_SUCCESS;
+        request->completed = 1;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] CallResult: execution complete, result=0x%llX\n", ctx.ret_value);
     }
 
-    return STATUS_PENDING;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS functions::handle7782_legacy(p_call_result request) {
+    if (!request) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] CallResultLegacy: null request\n");
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!call_guard::is_valid_dtb(request->dtb)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (request->result_address == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!call_guard::is_valid_user_range(request->result_address)) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    UINT64 dtb_clean = request->dtb & ~0xFFFULL;
+    UINT64 physical_addr = strong::translate_virtual_address(dtb_clean, request->result_address);
+
+    if (!physical_addr) {
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    CALL_CONTEXT ctx = { 0 };
+    SIZE_T bytes_read = 0;
+
+    KeMemoryBarrier();
+
+    NTSTATUS status = strong::read_physical(
+        physical_addr,
+        &ctx,
+        sizeof(ctx),
+        &bytes_read
+    );
+
+    if (!NT_SUCCESS(status) || bytes_read != sizeof(ctx)) {
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    KeMemoryBarrier();
+
+    request->result = (ctx.exec_done != 0) ? ctx.ret_value : 0;
+    return STATUS_SUCCESS;
 }
 
 namespace alloc_internal {
@@ -627,16 +724,21 @@ namespace alloc_internal {
 
 NTSTATUS functions::handle7783(p_alloc_mem request) {
     if (!request) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] AllocMem: null request\n");
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->pid == 0 || request->pid <= 4) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] AllocMem: invalid PID=%u\n", request->pid);
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->size == 0 || request->size > 0x1000000) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] AllocMem: invalid size=0x%llX\n", request->size);
         return STATUS_INVALID_BUFFER_SIZE;
     }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] AllocMem: PID=%u size=0x%llX\n", request->pid, request->size);
 
     if (!_KeStackAttachProcess || !_KeUnstackDetachProcess || !_ZwAllocateVirtualMemory) {
         return STATUS_PROCEDURE_NOT_FOUND;
@@ -668,15 +770,29 @@ NTSTATUS functions::handle7783(p_alloc_mem request) {
         PAGE_EXECUTE_READWRITE
     );
 
+    if (NT_SUCCESS(status) && base_addr) {
+        __try {
+            volatile UCHAR* p = (volatile UCHAR*)base_addr;
+            for (SIZE_T off = 0; off < region_size; off += 0x1000) {
+                p[off] = 0;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] AllocMem: page fault-in exception at 0x%llX\n", (UINT64)base_addr);
+        }
+    }
+
     _KeUnstackDetachProcess(&apc_state);
     _ObfDereferenceObject(process);
 
     if (NT_SUCCESS(status) && base_addr) {
         request->allocated_address = (UINT64)base_addr;
         request->actual_size = region_size;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] AllocMem: allocated=0x%llX actual_size=0x%llX\n", (UINT64)base_addr, (UINT64)region_size);
     } else {
         request->allocated_address = 0;
         request->actual_size = 0;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] AllocMem: FAILED status=0x%08X\n", status);
     }
 
     return status;
@@ -684,16 +800,21 @@ NTSTATUS functions::handle7783(p_alloc_mem request) {
 
 NTSTATUS functions::handle7784(p_free_mem request) {
     if (!request) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] FreeMem: null request\n");
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->pid == 0 || request->pid <= 4) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] FreeMem: invalid PID=%u\n", request->pid);
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->address == 0) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] FreeMem: address is zero\n");
         return STATUS_INVALID_PARAMETER;
     }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] FreeMem: PID=%u address=0x%llX\n", request->pid, request->address);
 
     if (!call_guard::is_valid_user_range(request->address)) {
         return STATUS_INVALID_ADDRESS;
@@ -724,6 +845,8 @@ NTSTATUS functions::handle7784(p_free_mem request) {
         &region_size,
         MEM_RELEASE
     );
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] FreeMem: status=0x%08X\n", status);
 
     _KeUnstackDetachProcess(&apc_state);
     _ObfDereferenceObject(process);

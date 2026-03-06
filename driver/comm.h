@@ -158,8 +158,9 @@ namespace voyager {
             std::uint64_t dtb;
             std::uint64_t result_address;
             std::uint64_t result;
+            std::uint64_t completed;
         };
-        static_assert(sizeof(call_result_request) == 24, "call_result_request size mismatch with kernel driver");
+        static_assert(sizeof(call_result_request) == 32, "call_result_request size mismatch with kernel driver");
 
         struct alloc_mem_request {
             std::uint32_t pid;

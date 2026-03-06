@@ -34,8 +34,11 @@ namespace dtb_guard {
 
 NTSTATUS functions::handle777d(p_dtb_solve request) {
     if (!request || request->pid == 0) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] DTB: invalid parameter\n");
         return STATUS_INVALID_PARAMETER;
     }
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] DTB: resolving for PID=%u\n", request->pid);
 
     if (!dtb_guard::is_valid_target_pid(request->pid)) {
         return STATUS_ACCESS_DENIED;
@@ -46,6 +49,7 @@ NTSTATUS functions::handle777d(p_dtb_solve request) {
     UINT64 cached_dtb = 0;
     if (LookupDTBCache(request->pid, &cached_dtb)) {
         request->dtb = cached_dtb;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] DTB: cache hit PID=%u DTB=0x%llX\n", request->pid, cached_dtb);
         dtb_guard::timing_scatter();
         return STATUS_SUCCESS;
     }
@@ -55,6 +59,7 @@ NTSTATUS functions::handle777d(p_dtb_solve request) {
 
     status = stack_spoof::spoofed_PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)request->pid, &process);
     if (!NT_SUCCESS(status) || !process) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] DTB: PsLookupProcessByProcessId FAILED PID=%u status=0x%08X\n", request->pid, status);
         return status;
     }
 
@@ -75,9 +80,11 @@ NTSTATUS functions::handle777d(p_dtb_solve request) {
 
         InsertDTBCache(request->pid, request->dtb);
 
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] DTB: resolved PID=%u DTB=0x%llX\n", request->pid, request->dtb);
         status = STATUS_SUCCESS;
     } else {
         request->dtb = 0;
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] DTB: resolution FAILED PID=%u dir_base=0x%llX\n", request->pid, dir_base);
         status = STATUS_UNSUCCESSFUL;
     }
 

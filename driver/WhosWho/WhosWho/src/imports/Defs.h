@@ -1,6 +1,7 @@
 #pragma once
 #include <ntifs.h>
 #include <ntimage.h>
+#include <intrin.h>
 #include <cstdint>
 
 #include <Crypter.h>
@@ -201,6 +202,373 @@ inline NTSTATUS           (NTAPI* _PsResumeThread)                 (PETHREAD, PU
 inline PVOID              (NTAPI* _PsGetProcessPeb)                (PEPROCESS);
 inline NTSTATUS           (NTAPI* _ZwQueryVirtualMemory)           (HANDLE, PVOID, MEMORY_INFORMATION_CLASS, PVOID, SIZE_T, PSIZE_T);
 inline NTSTATUS           (NTAPI* _ZwProtectVirtualMemory)         (HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
+inline NTSTATUS           (NTAPI* _ObOpenObjectByPointer)          (PVOID, ULONG, PACCESS_STATE, ACCESS_MASK, POBJECT_TYPE, KPROCESSOR_MODE, PHANDLE);
+inline NTSTATUS           (NTAPI* _ZwSuspendThread)                (HANDLE, PULONG);
+inline NTSTATUS           (NTAPI* _ZwResumeThread)                 (HANDLE, PULONG);
+
+// SSDT-based resolution for NtSuspendThread/NtResumeThread
+// These are not exported by ntoskrnl on Windows 10 19045, so we resolve them
+// through the System Service Descriptor Table using syscall indices from ntdll
+namespace ssdt_resolver {
+    typedef struct _KSERVICE_TABLE_DESCRIPTOR {
+        PLONG   ServiceTable;
+        PVOID   CounterTable;
+        ULONG64 ServiceLimit;
+        PUCHAR  ArgumentTable;
+    } KSERVICE_TABLE_DESCRIPTOR, *PKSERVICE_TABLE_DESCRIPTOR;
+
+    typedef NTSTATUS (NTAPI* fn_NtSuspendThread)(HANDLE, PULONG);
+    typedef NTSTATUS (NTAPI* fn_NtResumeThread)(HANDLE, PULONG);
+    typedef NTSTATUS (NTAPI* fn_NtGetContextThread)(HANDLE, PCONTEXT);
+    typedef NTSTATUS (NTAPI* fn_NtSetContextThread)(HANDLE, PCONTEXT);
+
+    inline PKSERVICE_TABLE_DESCRIPTOR g_ssdt = nullptr;
+    inline fn_NtSuspendThread g_NtSuspendThread = nullptr;
+    inline fn_NtResumeThread  g_NtResumeThread  = nullptr;
+    inline fn_NtGetContextThread g_NtGetContextThread = nullptr;
+    inline fn_NtSetContextThread g_NtSetContextThread = nullptr;
+    inline volatile LONG g_ssdt_found = 0;
+    inline volatile LONG g_funcs_resolved = 0;
+    inline volatile LONG g_ctx_funcs_resolved = 0;
+
+    // KTHREAD.PreviousMode offset for Windows 10 build 19041-19045
+    constexpr ULONG KTHREAD_PREVIOUSMODE_OFFSET = 0x232;
+
+    __forceinline BOOLEAN find_ssdt() {
+        LONG prev = _InterlockedCompareExchange(&g_ssdt_found, 1, 0);
+        if (prev == 2) return g_ssdt != nullptr;
+        if (prev == 1) {
+            while (_InterlockedCompareExchange(&g_ssdt_found, 0, 0) == 1)
+                YieldProcessor();
+            return g_ssdt != nullptr;
+        }
+
+        __try {
+            // KiSystemCall64 (or KiSystemCall64Shadow on KPTI systems) is at MSR_LSTAR
+            UINT64 lstar = __readmsr(0xC0000082);
+            if (lstar < 0xFFFF800000000000ULL) {
+                _InterlockedExchange(&g_ssdt_found, 2);
+                return FALSE;
+            }
+
+            PUCHAR scan = (PUCHAR)lstar;
+
+            // Scan for: lea r10, [rip+disp32] = 4C 8D 15 XX XX XX XX
+            // This references KeServiceDescriptorTable from KiSystemCall64
+            for (ULONG i = 0; i < 0x500; i++) {
+                if (!_MmIsAddressValid || !_MmIsAddressValid(&scan[i + 6]))
+                    break;
+
+                if (scan[i] == 0x4C && scan[i + 1] == 0x8D && scan[i + 2] == 0x15) {
+                    LONG disp = *(PLONG)&scan[i + 3];
+                    UINT64 target = (UINT64)&scan[i + 7] + (LONG64)disp;
+
+                    if (target > 0xFFFF800000000000ULL &&
+                        _MmIsAddressValid((PVOID)target)) {
+                        PKSERVICE_TABLE_DESCRIPTOR candidate = (PKSERVICE_TABLE_DESCRIPTOR)target;
+                        // Validate: ServiceTable should be a kernel pointer, ServiceLimit should be sane
+                        if (_MmIsAddressValid(candidate->ServiceTable) &&
+                            candidate->ServiceLimit > 0 && candidate->ServiceLimit < 0x2000) {
+                            g_ssdt = candidate;
+                            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                                "[WhosWho] SSDT found: base=%p limit=%llu\n",
+                                candidate->ServiceTable, candidate->ServiceLimit);
+                            break;
+                        }
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[WhosWho] SSDT scan exception\n");
+        }
+
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_ssdt_found, 2);
+        return g_ssdt != nullptr;
+    }
+
+    __forceinline PVOID get_ssdt_entry(ULONG index) {
+        if (!g_ssdt || !g_ssdt->ServiceTable) return nullptr;
+        if (index >= (ULONG)g_ssdt->ServiceLimit) return nullptr;
+        // x64 SSDT entries: signed offset from ServiceTable base, shifted left 4
+        LONG entry = g_ssdt->ServiceTable[index];
+        return (PVOID)((PUCHAR)g_ssdt->ServiceTable + (entry >> 4));
+    }
+
+    // Resolve NtSuspendThread/NtResumeThread from SSDT via ntdll syscall indices
+    // MUST be called from user process context (IOCTL handler)
+    __forceinline BOOLEAN resolve_suspend_resume() {
+        LONG state = _InterlockedCompareExchange(&g_funcs_resolved, 0, 0);
+        if (state == 2) return g_NtSuspendThread != nullptr && g_NtResumeThread != nullptr;
+
+        LONG prev = _InterlockedCompareExchange(&g_funcs_resolved, 1, 0);
+        if (prev == 2) return g_NtSuspendThread != nullptr && g_NtResumeThread != nullptr;
+        if (prev == 1) {
+            while (_InterlockedCompareExchange(&g_funcs_resolved, 0, 0) == 1)
+                YieldProcessor();
+            return g_NtSuspendThread != nullptr && g_NtResumeThread != nullptr;
+        }
+
+        if (!g_ssdt || !_PsGetProcessPeb) {
+            _InterlockedExchange(&g_funcs_resolved, 2);
+            return FALSE;
+        }
+
+        __try {
+            // Get PEB of current (calling) process - ntdll is mapped there
+            PVOID peb = _PsGetProcessPeb(PsGetCurrentProcess());
+            if (!peb) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "[WhosWho] SSDT resolve: no PEB\n");
+                _InterlockedExchange(&g_funcs_resolved, 2);
+                return FALSE;
+            }
+
+            // PEB.Ldr at offset 0x18 (x64)
+            PVOID ldr = *(PVOID*)((UCHAR*)peb + 0x18);
+            if (!ldr) {
+                _InterlockedExchange(&g_funcs_resolved, 2);
+                return FALSE;
+            }
+
+            // PEB_LDR_DATA.InLoadOrderModuleList at offset 0x10
+            PLIST_ENTRY head = (PLIST_ENTRY)((UCHAR*)ldr + 0x10);
+            PLIST_ENTRY entry = head->Flink;
+
+            // First module = exe, second = ntdll.dll
+            if (entry == head) { _InterlockedExchange(&g_funcs_resolved, 2); return FALSE; }
+            entry = entry->Flink;
+            if (entry == head) { _InterlockedExchange(&g_funcs_resolved, 2); return FALSE; }
+
+            // LDR_DATA_TABLE_ENTRY.DllBase at offset 0x30 (x64)
+            PVOID ntdll_base = *(PVOID*)((UCHAR*)entry + 0x30);
+            if (!ntdll_base) {
+                _InterlockedExchange(&g_funcs_resolved, 2);
+                return FALSE;
+            }
+
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[WhosWho] SSDT resolve: ntdll base=%p\n", ntdll_base);
+
+            // Resolve NtSuspendThread / NtResumeThread from ntdll's export table
+            CHAR suspend_name[] = { 'N','t','S','u','s','p','e','n','d','T','h','r','e','a','d',0 };
+            CHAR resume_name[]  = { 'N','t','R','e','s','u','m','e','T','h','r','e','a','d',0 };
+
+            PVOID suspend_stub = GetProcAddress(ntdll_base, suspend_name);
+            PVOID resume_stub  = GetProcAddress(ntdll_base, resume_name);
+
+            if (!suspend_stub || !resume_stub) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "[WhosWho] SSDT resolve: ntdll export lookup failed suspend=%p resume=%p\n",
+                    suspend_stub, resume_stub);
+                _InterlockedExchange(&g_funcs_resolved, 2);
+                return FALSE;
+            }
+
+            // Read syscall numbers from ntdll stubs
+            // ntdll Nt stub format: 4C 8B D1 (mov r10, rcx) B8 XX XX 00 00 (mov eax, <index>)
+            PUCHAR s_bytes = (PUCHAR)suspend_stub;
+            PUCHAR r_bytes = (PUCHAR)resume_stub;
+
+            if (s_bytes[0] != 0x4C || s_bytes[1] != 0x8B || s_bytes[2] != 0xD1 || s_bytes[3] != 0xB8) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "[WhosWho] SSDT resolve: NtSuspendThread stub format mismatch [%02X %02X %02X %02X]\n",
+                    s_bytes[0], s_bytes[1], s_bytes[2], s_bytes[3]);
+                _InterlockedExchange(&g_funcs_resolved, 2);
+                return FALSE;
+            }
+            if (r_bytes[0] != 0x4C || r_bytes[1] != 0x8B || r_bytes[2] != 0xD1 || r_bytes[3] != 0xB8) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "[WhosWho] SSDT resolve: NtResumeThread stub format mismatch [%02X %02X %02X %02X]\n",
+                    r_bytes[0], r_bytes[1], r_bytes[2], r_bytes[3]);
+                _InterlockedExchange(&g_funcs_resolved, 2);
+                return FALSE;
+            }
+
+            ULONG suspend_idx = *(PULONG)&s_bytes[4];
+            ULONG resume_idx  = *(PULONG)&r_bytes[4];
+
+            if (suspend_idx >= (ULONG)g_ssdt->ServiceLimit ||
+                resume_idx  >= (ULONG)g_ssdt->ServiceLimit) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "[WhosWho] SSDT resolve: syscall index out of range suspend=%u resume=%u limit=%llu\n",
+                    suspend_idx, resume_idx, g_ssdt->ServiceLimit);
+                _InterlockedExchange(&g_funcs_resolved, 2);
+                return FALSE;
+            }
+
+            g_NtSuspendThread = (fn_NtSuspendThread)get_ssdt_entry(suspend_idx);
+            g_NtResumeThread  = (fn_NtResumeThread)get_ssdt_entry(resume_idx);
+
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[WhosWho] SSDT resolve: NtSuspendThread[%u]=%p NtResumeThread[%u]=%p\n",
+                suspend_idx, g_NtSuspendThread, resume_idx, g_NtResumeThread);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[WhosWho] SSDT resolve: exception during ntdll read\n");
+        }
+
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_funcs_resolved, 2);
+        return g_NtSuspendThread != nullptr && g_NtResumeThread != nullptr;
+    }
+
+    // Call NtSuspendThread/NtResumeThread with KernelMode PreviousMode
+    // Nt system calls probe user-mode buffers based on PreviousMode;
+    // we temporarily set it to KernelMode so kernel-space pointers are accepted
+    __forceinline NTSTATUS call_NtSuspendThread(HANDLE thread_handle, PULONG prev_count) {
+        if (!g_NtSuspendThread) return STATUS_PROCEDURE_NOT_FOUND;
+
+        PUCHAR kthread = (PUCHAR)PsGetCurrentThread();
+        CHAR saved_mode = kthread[KTHREAD_PREVIOUSMODE_OFFSET];
+        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = KernelMode;
+
+        NTSTATUS status = g_NtSuspendThread(thread_handle, prev_count);
+
+        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = saved_mode;
+        return status;
+    }
+
+    __forceinline NTSTATUS call_NtResumeThread(HANDLE thread_handle, PULONG prev_count) {
+        if (!g_NtResumeThread) return STATUS_PROCEDURE_NOT_FOUND;
+
+        PUCHAR kthread = (PUCHAR)PsGetCurrentThread();
+        CHAR saved_mode = kthread[KTHREAD_PREVIOUSMODE_OFFSET];
+        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = KernelMode;
+
+        NTSTATUS status = g_NtResumeThread(thread_handle, prev_count);
+
+        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = saved_mode;
+        return status;
+    }
+
+    __forceinline BOOLEAN resolve_thread_context() {
+        LONG state = _InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0);
+        if (state == 2) return g_NtGetContextThread != nullptr && g_NtSetContextThread != nullptr;
+
+        LONG prev = _InterlockedCompareExchange(&g_ctx_funcs_resolved, 1, 0);
+        if (prev == 2) return g_NtGetContextThread != nullptr && g_NtSetContextThread != nullptr;
+        if (prev == 1) {
+            while (_InterlockedCompareExchange(&g_ctx_funcs_resolved, 0, 0) == 1)
+                YieldProcessor();
+            return g_NtGetContextThread != nullptr && g_NtSetContextThread != nullptr;
+        }
+
+        if (!g_ssdt || !_PsGetProcessPeb) {
+            _InterlockedExchange(&g_ctx_funcs_resolved, 2);
+            return FALSE;
+        }
+
+        __try {
+            PVOID peb = _PsGetProcessPeb(PsGetCurrentProcess());
+            if (!peb) {
+                _InterlockedExchange(&g_ctx_funcs_resolved, 2);
+                return FALSE;
+            }
+
+            PVOID ldr = *(PVOID*)((UCHAR*)peb + 0x18);
+            if (!ldr) {
+                _InterlockedExchange(&g_ctx_funcs_resolved, 2);
+                return FALSE;
+            }
+
+            PLIST_ENTRY head = (PLIST_ENTRY)((UCHAR*)ldr + 0x10);
+            PLIST_ENTRY entry = head->Flink;
+            if (entry == head) { _InterlockedExchange(&g_ctx_funcs_resolved, 2); return FALSE; }
+            entry = entry->Flink;
+            if (entry == head) { _InterlockedExchange(&g_ctx_funcs_resolved, 2); return FALSE; }
+
+            PVOID ntdll_base = *(PVOID*)((UCHAR*)entry + 0x30);
+            if (!ntdll_base) {
+                _InterlockedExchange(&g_ctx_funcs_resolved, 2);
+                return FALSE;
+            }
+
+            CHAR get_name[] = { 'N','t','G','e','t','C','o','n','t','e','x','t','T','h','r','e','a','d',0 };
+            CHAR set_name[] = { 'N','t','S','e','t','C','o','n','t','e','x','t','T','h','r','e','a','d',0 };
+
+            PUCHAR get_bytes = (PUCHAR)GetProcAddress(ntdll_base, get_name);
+            PUCHAR set_bytes = (PUCHAR)GetProcAddress(ntdll_base, set_name);
+
+            if (!get_bytes || !set_bytes) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "[WhosWho] SSDT resolve: thread context export lookup failed get=%p set=%p\n",
+                    get_bytes, set_bytes);
+                _InterlockedExchange(&g_ctx_funcs_resolved, 2);
+                return FALSE;
+            }
+
+            if (get_bytes[0] != 0x4C || get_bytes[1] != 0x8B || get_bytes[2] != 0xD1 || get_bytes[3] != 0xB8) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "[WhosWho] SSDT resolve: NtGetContextThread stub format mismatch [%02X %02X %02X %02X]\n",
+                    get_bytes[0], get_bytes[1], get_bytes[2], get_bytes[3]);
+                _InterlockedExchange(&g_ctx_funcs_resolved, 2);
+                return FALSE;
+            }
+
+            if (set_bytes[0] != 0x4C || set_bytes[1] != 0x8B || set_bytes[2] != 0xD1 || set_bytes[3] != 0xB8) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "[WhosWho] SSDT resolve: NtSetContextThread stub format mismatch [%02X %02X %02X %02X]\n",
+                    set_bytes[0], set_bytes[1], set_bytes[2], set_bytes[3]);
+                _InterlockedExchange(&g_ctx_funcs_resolved, 2);
+                return FALSE;
+            }
+
+            ULONG get_idx = *(PULONG)&get_bytes[4];
+            ULONG set_idx = *(PULONG)&set_bytes[4];
+
+            if (get_idx >= (ULONG)g_ssdt->ServiceLimit || set_idx >= (ULONG)g_ssdt->ServiceLimit) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                    "[WhosWho] SSDT resolve: thread context syscall index out of range get=%u set=%u limit=%llu\n",
+                    get_idx, set_idx, g_ssdt->ServiceLimit);
+                _InterlockedExchange(&g_ctx_funcs_resolved, 2);
+                return FALSE;
+            }
+
+            g_NtGetContextThread = (fn_NtGetContextThread)get_ssdt_entry(get_idx);
+            g_NtSetContextThread = (fn_NtSetContextThread)get_ssdt_entry(set_idx);
+
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[WhosWho] SSDT resolve: NtGetContextThread[%u]=%p NtSetContextThread[%u]=%p\n",
+                get_idx, g_NtGetContextThread, set_idx, g_NtSetContextThread);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "[WhosWho] SSDT resolve: exception during thread context ntdll read\n");
+        }
+
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_ctx_funcs_resolved, 2);
+        return g_NtGetContextThread != nullptr && g_NtSetContextThread != nullptr;
+    }
+
+    __forceinline NTSTATUS call_NtGetContextThread(HANDLE thread_handle, PCONTEXT context) {
+        if (!g_NtGetContextThread) return STATUS_PROCEDURE_NOT_FOUND;
+
+        PUCHAR kthread = (PUCHAR)PsGetCurrentThread();
+        CHAR saved_mode = kthread[KTHREAD_PREVIOUSMODE_OFFSET];
+        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = KernelMode;
+
+        NTSTATUS status = g_NtGetContextThread(thread_handle, context);
+
+        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = saved_mode;
+        return status;
+    }
+
+    __forceinline NTSTATUS call_NtSetContextThread(HANDLE thread_handle, PCONTEXT context) {
+        if (!g_NtSetContextThread) return STATUS_PROCEDURE_NOT_FOUND;
+
+        PUCHAR kthread = (PUCHAR)PsGetCurrentThread();
+        CHAR saved_mode = kthread[KTHREAD_PREVIOUSMODE_OFFSET];
+        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = KernelMode;
+
+        NTSTATUS status = g_NtSetContextThread(thread_handle, context);
+
+        kthread[KTHREAD_PREVIOUSMODE_OFFSET] = saved_mode;
+        return status;
+    }
+}
+
 inline bool SetupFunctions() {
     PVOID kernelBase = (PVOID)get_nt_base();
 
@@ -257,6 +625,36 @@ inline bool SetupFunctions() {
     *(PVOID*)&_PsGetProcessPeb = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetProcessPeb"));
     *(PVOID*)&_ZwQueryVirtualMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwQueryVirtualMemory"));
     *(PVOID*)&_ZwProtectVirtualMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwProtectVirtualMemory"));
+    *(PVOID*)&_ObOpenObjectByPointer = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObOpenObjectByPointer"));
+    *(PVOID*)&_ZwSuspendThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwSuspendThread"));
+    *(PVOID*)&_ZwResumeThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwResumeThread"));
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] Thread function resolution:\n");
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho]   PsLookupThreadByThreadId=%p\n", _PsLookupThreadByThreadId);
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho]   PsGetNextProcessThread=%p PsGetThreadId=%p\n", _PsGetNextProcessThread, _PsGetThreadId);
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho]   PsGetContextThread=%p PsSetContextThread=%p\n", _PsGetContextThread, _PsSetContextThread);
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho]   PsSuspendThread=%p PsResumeThread=%p\n", _PsSuspendThread, _PsResumeThread);
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho]   PsGetProcessPeb=%p\n", _PsGetProcessPeb);
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho]   ZwQueryVirtualMemory=%p ZwProtectVirtualMemory=%p\n", _ZwQueryVirtualMemory, _ZwProtectVirtualMemory);
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho]   ObOpenObjectByPointer=%p ZwSuspendThread=%p ZwResumeThread=%p\n", _ObOpenObjectByPointer, _ZwSuspendThread, _ZwResumeThread);
+
+    if (!_PsSuspendThread || !_PsResumeThread) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] PsSuspendThread/PsResumeThread not exported, trying Zw fallback\n");
+    }
+    if (!_ObOpenObjectByPointer || !_ZwSuspendThread || !_ZwResumeThread) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] Zw suspend/resume fallback: ObOpen=%p ZwSuspend=%p ZwResume=%p\n",
+            _ObOpenObjectByPointer, _ZwSuspendThread, _ZwResumeThread);
+    }
+
+    // If neither Ps nor Zw suspend/resume are available, find the SSDT
+    // so we can lazily resolve NtSuspendThread/NtResumeThread on first use
+    if (!_PsSuspendThread && !_ZwSuspendThread) {
+        if (ssdt_resolver::find_ssdt()) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SSDT found, will resolve NtSuspendThread/NtResumeThread on first use\n");
+        } else {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] WARNING: SSDT not found, suspend/resume will not work\n");
+        }
+    }
 
     if (!_RtlInitUnicodeString || !_IoCreateDevice ||
         !_IoCreateSymbolicLink || !_IofCompleteRequest || !_MmCopyMemory ||

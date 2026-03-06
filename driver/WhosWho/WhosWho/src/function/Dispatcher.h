@@ -228,6 +228,9 @@ namespace dispatcher {
         const ULONG output_size = stack->Parameters.DeviceIoControl.OutputBufferLength;
         PVOID buffer = irp->AssociatedIrp.SystemBuffer;
 
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] Controller: IOCTL=0x%08X in=%u out=%u\n",
+            code, input_size, output_size);
+
         if (!buffer) {
             irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
             irp->IoStatus.Information = 0;
@@ -293,6 +296,10 @@ namespace dispatcher {
             if (input_size >= sizeof(_CR) && output_size >= sizeof(_CR)) {
                 status = functions::handle7782((p_call_result)buffer);
                 bytes = sizeof(_CR);
+            }
+            else if (input_size >= (sizeof(_CR) - sizeof(UINT64)) && output_size >= (sizeof(_CR) - sizeof(UINT64))) {
+                status = functions::handle7782_legacy((p_call_result)buffer);
+                bytes = sizeof(_CR) - sizeof(UINT64);
             }
             else {
                 status = STATUS_INFO_LENGTH_MISMATCH;
@@ -414,6 +421,7 @@ namespace dispatcher {
                 ULONG expectedMagic = get_heartbeat_magic();
 
                 if (hb->magic == expectedMagic) {
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] Heartbeat: magic OK, session_key=0x%X\n", hb->session_key);
                     {
                         LARGE_INTEGER current_time;
                         KeQuerySystemTime(&current_time);
@@ -435,6 +443,7 @@ namespace dispatcher {
 
                             if (existing_key == 0) {
                                 caller_validation::register_client();
+                                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] Heartbeat: new session activated\n");
                             }
 
                             hb->response = (UINT64)g_heartbeat_counter ^ dynamic_key::get();
@@ -446,6 +455,8 @@ namespace dispatcher {
                     }
                 } else {
                     hb->response = 0;
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] Heartbeat: magic MISMATCH expected=0x%X got=0x%X\n",
+                        expectedMagic, hb->magic);
                     status = STATUS_INVALID_PARAMETER;
                 }
                 bytes = sizeof(_HB);
@@ -460,6 +471,8 @@ namespace dispatcher {
         }
 
         add_timing_noise();
+
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] Controller: status=0x%08X bytes=%u\n", status, bytes);
 
         irp->IoStatus.Status = status;
         irp->IoStatus.Information = bytes;

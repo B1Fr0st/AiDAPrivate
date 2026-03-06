@@ -11,6 +11,7 @@ namespace functions {
     NTSTATUS handle7780(p_mouse_move request);
     NTSTATUS handle7781(p_remote_call request);
     NTSTATUS handle7782(p_call_result request);
+    NTSTATUS handle7782_legacy(p_call_result request);
     NTSTATUS handle7783(p_alloc_mem request);
     NTSTATUS handle7784(p_free_mem request);
 

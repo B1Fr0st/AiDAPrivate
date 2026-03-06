@@ -81,8 +81,9 @@ typedef struct _CR {
     UINT64 dtb;
     UINT64 result_address;
     UINT64 result;
+    UINT64 completed;
 } call_result, * p_call_result;
-static_assert(sizeof(call_result) == 24, "call_result size must be 24 bytes");
+static_assert(sizeof(call_result) == 32, "call_result size must be 32 bytes");
 
 #pragma pack(push, 1)
 typedef struct _SHELLCODE_CONTEXT {

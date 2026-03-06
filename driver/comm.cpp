@@ -604,28 +604,13 @@ bool voyager::device_t::find_spoof_gadget() noexcept {
         }
 
         for (std::size_t i = 0; i < to_read - 2; ++i) {
-            if (buffer[i] == 0xFF && buffer[i + 1] == 0x23) {
-                spoof_gadget_ = code_start + offset + i;
-                return true;
-            }
-        }
-
-        for (std::size_t i = 0; i < to_read - 2; ++i) {
             if (buffer[i] == 0xFF && buffer[i + 1] == 0xE3) {
-                spoof_gadget_ = code_start + offset + i;
-                return true;
-            }
-        }
-
-        for (std::size_t i = 0; i < to_read - 2; ++i) {
-            if (buffer[i] == 0xFF && buffer[i + 1] == 0x25) {
                 spoof_gadget_ = code_start + offset + i;
                 return true;
             }
         }
     }
 
-    spoof_gadget_ = base_address_ + base_of_code + 0x100;
     return true;
 }
 
@@ -892,19 +877,36 @@ namespace thread_hijack {
 std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, std::uint64_t arg1, std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4) noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] call_function: target=0x%llX args=[0x%llX, 0x%llX, 0x%llX, 0x%llX]\n",
+        function_address, arg1, arg2, arg3, arg4);
+    fprintf(stderr, "[WhosWho-UM] call_function: pid=%u dtb=0x%llX base=0x%llX spoof_gadget=0x%llX shellcode=0x%llX\n",
+        process_id_, dtb_, base_address_, spoof_gadget_, shellcode_address_);
+
     if (!is_connected() || dtb_ == 0 || function_address == 0) {
+        fprintf(stderr, "[WhosWho-UM] call_function: precondition fail connected=%d dtb=0x%llX func=0x%llX\n",
+            is_connected(), dtb_, function_address);
         return 0;
     }
 
     if (!ensure_shellcode_allocated()) {
+        fprintf(stderr, "[WhosWho-UM] call_function: ensure_shellcode_allocated FAILED\n");
         return 0;
     }
+    fprintf(stderr, "[WhosWho-UM] call_function: shellcode_address=0x%llX\n", shellcode_address_);
 
     if (!find_spoof_gadget()) {
+        fprintf(stderr, "[WhosWho-UM] call_function: find_spoof_gadget FAILED\n");
         return 0;
     }
+    fprintf(stderr, "[WhosWho-UM] call_function: spoof_gadget=0x%llX\n", spoof_gadget_);
 
     if (!thread_hijack::initialize()) {
+        fprintf(stderr, "[WhosWho-UM] call_function: thread_hijack::initialize FAILED\n");
+        fprintf(stderr, "[WhosWho-UM] call_function: syscall_addr=%p NtOpenThread=%u NtSuspend=%u NtResume=%u NtGetCtx=%u NtSetCtx=%u NtClose=%u\n",
+            syscall_indices::syscall_instruction_addr,
+            syscall_indices::NtOpenThread_idx, syscall_indices::NtSuspendThread_idx,
+            syscall_indices::NtResumeThread_idx, syscall_indices::NtGetContextThread_idx,
+            syscall_indices::NtSetContextThread_idx, syscall_indices::NtClose_idx);
         return 0;
     }
 
@@ -929,15 +931,18 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
     thread_hijack::scatter_timing();
 
     if (!send_request(ioctl_codes::RC(), &req, sizeof(req))) {
+        fprintf(stderr, "[WhosWho-UM] call_function: RC ioctl FAILED\n");
         return 0;
     }
 
     std::uint64_t code_entry = req.shellcode_address;
+    fprintf(stderr, "[WhosWho-UM] call_function: RC ioctl OK, code_entry=0x%llX\n", code_entry);
 
     thread_hijack::scatter_timing();
 
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "[WhosWho-UM] call_function: CreateToolhelp32Snapshot FAILED err=%lu\n", GetLastError());
         return 0;
     }
 
@@ -948,34 +953,20 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
     HANDLE target_thread = nullptr;
 
     DWORD current_tid = GetCurrentThreadId();
-    DWORD current_pid = GetCurrentProcessId();
     std::uint32_t thread_scan_count = 0;
-    constexpr std::uint32_t MAX_THREAD_SCANS = 128;
+    constexpr std::uint32_t MAX_TARGET_THREAD_SCANS = 64;
 
     std::int32_t best_priority = -999;
     HANDLE best_thread = nullptr;
     DWORD best_tid = 0;
     CONTEXT best_ctx{};
 
-    DWORD main_tid = 0;
-    THREADENTRY32 first_te{};
-    first_te.dwSize = sizeof(THREADENTRY32);
-    if (Thread32First(snapshot, &first_te)) {
-        do {
-            if (first_te.th32OwnerProcessID == process_id_) {
-                main_tid = first_te.th32ThreadID;
-                break;
-            }
-        } while (Thread32Next(snapshot, &first_te));
-    }
-    SetFilePointer(snapshot, 0, nullptr, FILE_BEGIN);
-    te.dwSize = sizeof(THREADENTRY32);
-
     if (Thread32First(snapshot, &te)) {
         do {
-            if (thread_scan_count++ > MAX_THREAD_SCANS) break;
+            if (thread_scan_count >= MAX_TARGET_THREAD_SCANS) break;
 
-            if (te.th32OwnerProcessID == process_id_ && te.th32ThreadID != current_tid && te.th32ThreadID != main_tid) {
+            if (te.th32OwnerProcessID == process_id_ && te.th32ThreadID != current_tid) {
+                thread_scan_count++;
                 thread_hijack::scatter_timing();
 
                 OBJECT_ATTRIBUTES objAttr = {};
@@ -1008,7 +999,7 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
                         if (thread_hijack::indirect_NtGetContextThread(th, &ctx) >= 0) {
                             if (ctx.Rip > 0x10000 && ctx.Rip < 0x00007FFFFFFFFFFFULL &&
                                 ctx.Rsp > 0x10000 && ctx.Rsp < 0x00007FFFFFFFFFFFULL &&
-                                (ctx.Rsp & 0xF) == 0) {
+                                (ctx.Rsp & 0x7) == 0) {
                                 std::int32_t priority = static_cast<std::int32_t>(te.tpBasePri);
 
                                 bool is_waiting = (ctx.Rip >= 0x00007FF000000000ULL);
@@ -1043,7 +1034,11 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
 
     CloseHandle(snapshot);
 
+    fprintf(stderr, "[WhosWho-UM] call_function: thread scan done, scanned=%u best_tid=%lu best_priority=%d\n",
+        thread_scan_count, best_tid, best_priority);
+
     if (!best_thread || best_tid == 0) {
+        fprintf(stderr, "[WhosWho-UM] call_function: no suitable thread found for hijack\n");
         return 0;
     }
 
@@ -1059,16 +1054,22 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
     CONTEXT hijack_ctx = original_ctx;
     hijack_ctx.Rip = code_entry;
 
-    std::uint64_t aligned_rsp = (hijack_ctx.Rsp - 0x100) & ~0xFULL;
-    hijack_ctx.Rsp = aligned_rsp;
+    std::uint64_t shellcode_rsp = ((hijack_ctx.Rsp - 0x108) & ~0xFULL) + 0x8;
+    hijack_ctx.Rsp = shellcode_rsp;
+
+    fprintf(stderr, "[WhosWho-UM] call_function: hijacking tid=%lu original_rip=0x%llX original_rsp=0x%llX -> new_rip=0x%llX new_rsp=0x%llX\n",
+        target_tid, original_ctx.Rip, original_ctx.Rsp, hijack_ctx.Rip, hijack_ctx.Rsp);
 
     thread_hijack::scatter_timing();
 
-    if (thread_hijack::indirect_NtSetContextThread(target_thread, &hijack_ctx) < 0) {
+    NTSTATUS set_status = thread_hijack::indirect_NtSetContextThread(target_thread, &hijack_ctx);
+    if (set_status < 0) {
+        fprintf(stderr, "[WhosWho-UM] call_function: NtSetContextThread FAILED status=0x%lX\n", set_status);
         thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
         thread_hijack::indirect_NtClose(target_thread);
         return 0;
     }
+    fprintf(stderr, "[WhosWho-UM] call_function: NtSetContextThread OK, resuming thread\n");
 
     thread_hijack::collect_entropy();
 
@@ -1080,6 +1081,7 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
 
     std::uint64_t result = 0;
     bool completed = false;
+    int consecutive_poll_failures = 0;
 
     thread_hijack::collect_entropy();
 
@@ -1100,6 +1102,7 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
         result_req.dtb = dtb_;
         result_req.result_address = context_base;
         result_req.result = 0;
+        result_req.completed = 0;
 
         DWORD bytes_ret = 0;
         BOOL ioctl_result = DeviceIoControl(
@@ -1114,14 +1117,31 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
         );
 
         if (ioctl_result && bytes_ret >= sizeof(result_req)) {
-            volatile std::uint64_t exec_done = 0;
-            read_raw(context_base + detail::CTX_EXEC_DONE, const_cast<std::uint64_t*>(&exec_done), sizeof(exec_done));
-
-            if (exec_done != 0) {
-                read_raw(context_base + detail::CTX_RET_VALUE, &result, sizeof(result));
+            if (result_req.completed != 0) {
+                result = result_req.result;
                 completed = true;
                 break;
             }
+
+            consecutive_poll_failures = 0;
+            continue;
+        }
+
+        if (!ioctl_result) {
+            DWORD poll_error = GetLastError();
+
+            if (poll_error == ERROR_IO_PENDING || poll_error == ERROR_IO_INCOMPLETE) {
+                consecutive_poll_failures = 0;
+            } else {
+                ++consecutive_poll_failures;
+                if (consecutive_poll_failures >= 8) {
+                    fprintf(stderr, "[WhosWho-UM] call_function: aborting result poll after repeated CR failures err=%lu\n",
+                        poll_error);
+                    break;
+                }
+            }
+        } else {
+            consecutive_poll_failures = 0;
         }
 
         if ((i & 0x3F) == 0) {
@@ -1139,7 +1159,10 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
     thread_hijack::scatter_timing();
 
     if (!completed) {
+        fprintf(stderr, "[WhosWho-UM] call_function: TIMED OUT after polling, restoring original context\n");
         thread_hijack::indirect_NtSetContextThread(target_thread, &original_ctx);
+    } else {
+        fprintf(stderr, "[WhosWho-UM] call_function: completed, result=0x%llX\n", result);
     }
 
     thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
@@ -1150,6 +1173,8 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
 
 bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD input_size) const noexcept {
     if (!is_connected() || !input || input_size == 0) {
+        fprintf(stderr, "[WhosWho-UM] send_request: precondition fail connected=%d input=%p size=%u\n",
+            is_connected(), input, input_size);
         return false;
     }
 
@@ -1205,12 +1230,22 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
     spoofer::scatter_execution();
     thread_hijack::collect_entropy();
 
+    if (!result) {
+        DWORD err = GetLastError();
+        fprintf(stderr, "[WhosWho-UM] send_request: DeviceIoControl FAILED ioctl=0x%08X err=%u(0x%X) bytes_returned=%u\n",
+            control_code, err, err, bytes_returned);
+    }
+
     return result != FALSE;
 }
 
 
 bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ctx) noexcept {
-    if (!is_connected() || process_id_ == 0 || tid == 0) return false;
+    if (!is_connected() || process_id_ == 0 || tid == 0) {
+        fprintf(stderr, "[WhosWho-UM] get_thread_context: precondition fail connected=%d pid=%u tid=%u\n",
+            is_connected(), process_id_, tid);
+        return false;
+    }
 
     voyager::detail::thread_ctx_request req{};
     req.pid = process_id_;
@@ -1218,7 +1253,16 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
     req.should_set = 0;
     req.register_mask = 0;
 
-    if (!send_request(ioctl_codes::TCTX(), &req, sizeof(req))) return false;
+    fprintf(stderr, "[WhosWho-UM] get_thread_context: sending TCTX ioctl=0x%08X for PID=%u TID=%u\n",
+        ioctl_codes::TCTX(), process_id_, tid);
+
+    if (!send_request(ioctl_codes::TCTX(), &req, sizeof(req))) {
+        fprintf(stderr, "[WhosWho-UM] get_thread_context: send_request FAILED for TID=%u\n", tid);
+        return false;
+    }
+
+    fprintf(stderr, "[WhosWho-UM] get_thread_context: response RIP=0x%llX RSP=0x%llX RAX=0x%llX DR0=0x%llX DR7=0x%llX\n",
+        req.rip, req.rsp, req.rax, req.dr0, req.dr7);
 
     ctx.rax = req.rax; ctx.rbx = req.rbx; ctx.rcx = req.rcx; ctx.rdx = req.rdx;
     ctx.rsi = req.rsi; ctx.rdi = req.rdi; ctx.rbp = req.rbp; ctx.rsp = req.rsp;
@@ -1233,7 +1277,16 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
 }
 
 bool voyager::device_t::set_thread_context(std::uint32_t tid, const thread_context& ctx, std::uint64_t register_mask) noexcept {
-    if (!is_connected() || process_id_ == 0 || tid == 0) return false;
+    if (!is_connected() || process_id_ == 0 || tid == 0) {
+        fprintf(stderr, "[WhosWho-UM] set_thread_context: precondition fail connected=%d pid=%u tid=%u\n",
+            is_connected(), process_id_, tid);
+        return false;
+    }
+
+    fprintf(stderr, "[WhosWho-UM] set_thread_context: PID=%u TID=%u mask=0x%llX\n",
+        process_id_, tid, register_mask);
+    fprintf(stderr, "[WhosWho-UM] set_thread_context: RIP=0x%llX RSP=0x%llX DR0=0x%llX DR7=0x%llX\n",
+        ctx.rip, ctx.rsp, ctx.dr0, ctx.dr7);
 
     voyager::detail::thread_ctx_request req{};
     req.pid = process_id_;
@@ -1255,7 +1308,10 @@ bool voyager::device_t::set_thread_context(std::uint32_t tid, const thread_conte
 
 std::vector<voyager::device_t::thread_info> voyager::device_t::enumerate_threads() noexcept {
     std::vector<thread_info> result;
-    if (!is_connected() || process_id_ == 0) return result;
+    if (!is_connected() || process_id_ == 0) {
+        fprintf(stderr, "[WhosWho-UM] enumerate_threads: precondition fail\n");
+        return result;
+    }
 
     auto* req = new (std::nothrow) voyager::detail::thread_enum_request{};
     if (!req) return result;
@@ -1419,11 +1475,23 @@ std::uint64_t voyager::device_t::virtual_to_physical(std::uint64_t virtual_addre
 }
 
 bool voyager::device_t::set_hardware_breakpoint(std::uint32_t tid, int index, std::uint64_t address, int type, int size) noexcept {
-    if (!is_connected() || process_id_ == 0 || tid == 0 || index < 0 || index > 3) return false;
+    if (!is_connected() || process_id_ == 0 || tid == 0 || index < 0 || index > 3) {
+        fprintf(stderr, "[WhosWho-UM] set_hw_bp: precondition fail connected=%d pid=%u tid=%u index=%d\n",
+            is_connected(), process_id_, tid, index);
+        return false;
+    }
 
+    fprintf(stderr, "[WhosWho-UM] set_hw_bp: TID=%u index=%d addr=0x%llX type=%d size=%d\n",
+        tid, index, address, type, size);
 
     thread_context ctx{};
-    if (!get_thread_context(tid, ctx)) return false;
+    if (!get_thread_context(tid, ctx)) {
+        fprintf(stderr, "[WhosWho-UM] set_hw_bp: get_thread_context FAILED for TID=%u\n", tid);
+        return false;
+    }
+
+    fprintf(stderr, "[WhosWho-UM] set_hw_bp: current DR0=0x%llX DR1=0x%llX DR2=0x%llX DR3=0x%llX DR6=0x%llX DR7=0x%llX\n",
+        ctx.dr0, ctx.dr1, ctx.dr2, ctx.dr3, ctx.dr6, ctx.dr7);
 
 
     switch (index) {
@@ -1459,18 +1527,30 @@ bool voyager::device_t::set_hardware_breakpoint(std::uint32_t tid, int index, st
 
     ctx.dr7 = dr7;
 
-
     std::uint64_t mask = (1ULL << 22) | (1ULL << 23);
     mask |= (1ULL << (18 + index));
+
+    fprintf(stderr, "[WhosWho-UM] set_hw_bp: new DR%d=0x%llX DR7=0x%llX mask=0x%llX\n",
+        index, address, dr7, mask);
 
     return set_thread_context(tid, ctx, mask);
 }
 
 bool voyager::device_t::clear_hardware_breakpoint(std::uint32_t tid, int index) noexcept {
-    if (!is_connected() || process_id_ == 0 || tid == 0 || index < 0 || index > 3) return false;
+    if (!is_connected() || process_id_ == 0 || tid == 0 || index < 0 || index > 3) {
+        fprintf(stderr, "[WhosWho-UM] clear_hw_bp: precondition fail\n");
+        return false;
+    }
+
+    fprintf(stderr, "[WhosWho-UM] clear_hw_bp: TID=%u index=%d\n", tid, index);
 
     thread_context ctx{};
-    if (!get_thread_context(tid, ctx)) return false;
+    if (!get_thread_context(tid, ctx)) {
+        fprintf(stderr, "[WhosWho-UM] clear_hw_bp: get_thread_context FAILED for TID=%u\n", tid);
+        return false;
+    }
+
+    fprintf(stderr, "[WhosWho-UM] clear_hw_bp: current DR0=0x%llX DR7=0x%llX\n", ctx.dr0, ctx.dr7);
 
 
     switch (index) {
