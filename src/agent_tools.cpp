@@ -11764,13 +11764,6 @@ static protection_analysis_t analyze_module_protection(
 }
 
 
-// Forces decryption of encrypted code pages by injecting shellcode that touches
-// each page from usermode context. This triggers Hyperion-style hooked exception
-// dispatchers (KiUserExceptionDispatcher hooks) which decrypt pages on
-// STATUS_ACCESS_VIOLATION and change their protection to EXECUTE_READ.
-// Must be called BEFORE VirtualProtect-based forcing, since VirtualProtect would
-// change NOACCESS to RWX without triggering the exception handler, leaving
-// page content encrypted.
 static int force_decrypt_via_shellcode(
     voyager::device_t* dev,
     std::uint64_t base,
@@ -11786,9 +11779,7 @@ static int force_decrypt_via_shellcode(
     if (!dev || !dev->is_connected() || dev->get_process_id() == 0)
         return 0;
 
-    // Identify committed NOACCESS pages within code sections that need decryption.
-    // We enumerate memory regions and collect page addresses that are committed
-    // but NOACCESS — these are pages set up for on-demand VEH-based decryption.
+
     struct page_range_t { std::uint64_t start; std::uint64_t end; };
     std::vector<page_range_t> code_ranges;
 
@@ -11802,7 +11793,7 @@ static int force_decrypt_via_shellcode(
             std::uint32_t vrva  = *reinterpret_cast<const std::uint32_t*>(pe_hdr + soff + 12);
             std::uint32_t chars = *reinterpret_cast<const std::uint32_t*>(pe_hdr + soff + 36);
             if (vsize == 0 || vrva == 0) continue;
-            // CODE or EXECUTE sections
+
             if (chars & (0x20000000 | 0x00000020))
             {
                 std::uint64_t sec_start = base + vrva;
@@ -11815,14 +11806,14 @@ static int force_decrypt_via_shellcode(
     }
     else
     {
-        // No PE header — treat entire image as potential code
+
         code_ranges.push_back({base, base + image_size});
     }
 
     if (code_ranges.empty())
         return 0;
 
-    // Enumerate memory regions to find committed NOACCESS pages within code ranges
+
     constexpr std::uint32_t VMEM_COMMIT = 0x1000;
     constexpr std::uint32_t PROT_NOACCESS = 0x01;
 
@@ -11834,14 +11825,14 @@ static int force_decrypt_via_shellcode(
         if (!(r.state & VMEM_COMMIT) || r.protect != PROT_NOACCESS)
             continue;
 
-        // Check if this region overlaps any code range
+
         for (const auto& cr : code_ranges)
         {
             std::uint64_t overlap_start = std::max(r.base, cr.start);
             std::uint64_t overlap_end = std::min(r.base + r.size, cr.end);
             if (overlap_start >= overlap_end) continue;
 
-            // Collect individual page addresses within the overlap
+
             for (std::uint64_t addr = overlap_start & ~0xFFFULL; addr < overlap_end; addr += 0x1000)
             {
                 if (addr >= cr.start && addr < cr.end)
@@ -11852,34 +11843,28 @@ static int force_decrypt_via_shellcode(
 
     if (noaccess_pages.empty())
     {
-        // No NOACCESS code pages — also try touching all code pages in case the
-        // region enumeration missed some (e.g., pages within a larger ER region
-        // that are individually encrypted but not distinguished at VAD level).
-        // Build a simple sequential shellcode that touches every page in code sections.
 
-        // x64 shellcode: touch every page from base to base + count*0x1000
-        // rcx = start address, rdx = page count
-        // Returns number of pages touched
+
         static const std::uint8_t touch_sc[] = {
-            0x53,                                           // push rbx
-            0x56,                                           // push rsi
-            0x57,                                           // push rdi
-            0x48, 0x89, 0xCB,                               // mov rbx, rcx
-            0x48, 0x89, 0xD6,                               // mov rsi, rdx
-            0x31, 0xFF,                                     // xor edi, edi
-            // .loop:
-            0x48, 0x39, 0xF7,                               // cmp rdi, rsi
-            0x7D, 0x0F,                                     // jge .done (+15)
-            0x0F, 0xB6, 0x03,                               // movzx eax, byte [rbx]
-            0x48, 0x81, 0xC3, 0x00, 0x10, 0x00, 0x00,       // add rbx, 0x1000
-            0x48, 0xFF, 0xC7,                               // inc rdi
-            0xEB, 0xEC,                                     // jmp .loop (-20)
-            // .done:
-            0x48, 0x89, 0xF8,                               // mov rax, rdi
-            0x5F,                                           // pop rdi
-            0x5E,                                           // pop rsi
-            0x5B,                                           // pop rbx
-            0xC3                                            // ret
+            0x53,
+            0x56,
+            0x57,
+            0x48, 0x89, 0xCB,
+            0x48, 0x89, 0xD6,
+            0x31, 0xFF,
+
+            0x48, 0x39, 0xF7,
+            0x7D, 0x0F,
+            0x0F, 0xB6, 0x03,
+            0x48, 0x81, 0xC3, 0x00, 0x10, 0x00, 0x00,
+            0x48, 0xFF, 0xC7,
+            0xEB, 0xEC,
+
+            0x48, 0x89, 0xF8,
+            0x5F,
+            0x5E,
+            0x5B,
+            0xC3
         };
 
         std::uint64_t sc_mem = dev->allocate_memory(0x1000);
@@ -11909,11 +11894,10 @@ static int force_decrypt_via_shellcode(
         return total_touched;
     }
 
-    // We have specific NOACCESS pages to decrypt.
-    // Allocate memory for: shellcode + address list
+
     std::size_t addr_list_size = noaccess_pages.size() * sizeof(std::uint64_t);
     std::size_t alloc_size = 0x1000 + ((addr_list_size + 0xFFF) & ~0xFFFULL);
-    if (alloc_size > 0x1000000) alloc_size = 0x1000000; // cap at 16MB
+    if (alloc_size > 0x1000000) alloc_size = 0x1000000;
 
     std::uint64_t sc_mem = dev->allocate_memory(alloc_size);
     if (sc_mem == 0)
@@ -11923,36 +11907,33 @@ static int force_decrypt_via_shellcode(
         return 0;
     }
 
-    // Shellcode that reads from a list of addresses:
-    // rcx = pointer to uint64_t address array
-    // rdx = number of entries
-    // Returns: pages touched
+
     static const std::uint8_t list_sc[] = {
-        0x53,                                           // push rbx
-        0x56,                                           // push rsi
-        0x57,                                           // push rdi
-        0x48, 0x89, 0xCB,                               // mov rbx, rcx  (addr list)
-        0x48, 0x89, 0xD6,                               // mov rsi, rdx  (count)
-        0x31, 0xFF,                                     // xor edi, edi  (index)
-        // .loop:
-        0x48, 0x39, 0xF7,                               // cmp rdi, rsi
-        0x7D, 0x0C,                                     // jge .done (+12)
-        0x48, 0x8B, 0x0C, 0xFB,                         // mov rcx, [rbx + rdi*8]
-        0x0F, 0xB6, 0x01,                               // movzx eax, byte [rcx]
-        0x48, 0xFF, 0xC7,                               // inc rdi
-        0xEB, 0xEF,                                     // jmp .loop (-17)
-        // .done:
-        0x48, 0x89, 0xF8,                               // mov rax, rdi
-        0x5F,                                           // pop rdi
-        0x5E,                                           // pop rsi
-        0x5B,                                           // pop rbx
-        0xC3                                            // ret
+        0x53,
+        0x56,
+        0x57,
+        0x48, 0x89, 0xCB,
+        0x48, 0x89, 0xD6,
+        0x31, 0xFF,
+
+        0x48, 0x39, 0xF7,
+        0x7D, 0x0C,
+        0x48, 0x8B, 0x0C, 0xFB,
+        0x0F, 0xB6, 0x01,
+        0x48, 0xFF, 0xC7,
+        0xEB, 0xEF,
+
+        0x48, 0x89, 0xF8,
+        0x5F,
+        0x5E,
+        0x5B,
+        0xC3
     };
 
-    // Write shellcode at start of allocation
+
     dev->write_raw(sc_mem, list_sc, sizeof(list_sc));
 
-    // Write address list right after shellcode (at offset 0x100 for alignment)
+
     std::uint64_t addr_list_base = sc_mem + 0x100;
     std::size_t max_entries = (alloc_size - 0x100) / sizeof(std::uint64_t);
     std::size_t entries = std::min(noaccess_pages.size(), max_entries);
@@ -11963,7 +11944,7 @@ static int force_decrypt_via_shellcode(
     msg(OBFSTR_C("AiDA: Injecting decrypt shellcode — %zu NOACCESS code pages to trigger...\n"),
         entries);
 
-    // Call shellcode: rcx = addr_list, rdx = count
+
     std::uint64_t ret = dev->call_function(sc_mem, addr_list_base, entries, 0, 0);
 
     dev->free_memory(sc_mem);
@@ -12212,12 +12193,7 @@ tool_result_t driver_dump_module(const json& params)
         device.get(), base, pe_hdr, hdr_read, has_valid_pe, header_wiped,
         pe_off, sections_count, sec_table_off, pe_size_of_image, false, steps);
 
-    // STEP 1: Force-decrypt encrypted pages via usermode fault-trigger shellcode.
-    // This must run BEFORE VirtualProtect-based forcing because VirtualProtect
-    // changes NOACCESS to RWX without triggering the exception handler, leaving
-    // page content encrypted. The shellcode causes real ACCESS_VIOLATION faults
-    // that are handled by Hyperion's hooked KiUserExceptionDispatcher, which
-    // decrypts the page in-place and changes protection to EXECUTE_READ.
+
     {
         int decrypted = force_decrypt_via_shellcode(
             device.get(), base, pe_hdr, hdr_read, has_valid_pe,
@@ -12226,8 +12202,7 @@ tool_result_t driver_dump_module(const json& params)
             msg(OBFSTR_C("AiDA: Pre-dump exception-based decryption complete — %d pages triggered\n"), decrypted);
     }
 
-    // STEP 2: VirtualProtect fallback for any remaining pages (e.g., COW pages,
-    // guard pages, or pages that weren't handled by the exception-based approach).
+
     if (has_valid_pe && !header_wiped)
     {
         int forced = force_code_pages_in_memory(
@@ -12442,8 +12417,8 @@ tool_result_t driver_dump_module(const json& params)
             }
             if (decrypt_timeout_s <= 0)
             {
-                // Shellcode-based decryption should have already triggered all pages.
-                // This polling is just a safety net — keep timeout short.
+
+
                 decrypt_timeout_s = 10 + static_cast<int>(encrypted_pages.size()) / 256;
                 if (decrypt_timeout_s > 30) decrypt_timeout_s = 30;
             }

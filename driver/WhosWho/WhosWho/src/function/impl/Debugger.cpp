@@ -65,26 +65,176 @@ namespace dbg_guard {
 }
 
 
+namespace trapframe_ctx {
+
+    constexpr ULONG KTHREAD_TRAPFRAME_OFFSET = 0x90;
+
+
+    constexpr ULONG TF_RAX    = 0x30;
+    constexpr ULONG TF_RCX    = 0x38;
+    constexpr ULONG TF_RDX    = 0x40;
+    constexpr ULONG TF_R8     = 0x48;
+    constexpr ULONG TF_R9     = 0x50;
+    constexpr ULONG TF_R10    = 0x58;
+    constexpr ULONG TF_R11    = 0x60;
+    constexpr ULONG TF_DR0    = 0xD8;
+    constexpr ULONG TF_DR1    = 0xE0;
+    constexpr ULONG TF_DR2    = 0xE8;
+    constexpr ULONG TF_DR3    = 0xF0;
+    constexpr ULONG TF_DR6    = 0xF8;
+    constexpr ULONG TF_DR7    = 0x100;
+    constexpr ULONG TF_RBX    = 0x140;
+    constexpr ULONG TF_RDI    = 0x148;
+    constexpr ULONG TF_RSI    = 0x150;
+    constexpr ULONG TF_RBP    = 0x158;
+    constexpr ULONG TF_RIP    = 0x168;
+    constexpr ULONG TF_SEGCS  = 0x170;
+    constexpr ULONG TF_EFLAGS = 0x178;
+    constexpr ULONG TF_RSP    = 0x180;
+    constexpr ULONG TF_SEGSS  = 0x188;
+
+    NTSTATUS get_context(PETHREAD thread, p_thread_ctx request) {
+        __try {
+            PUCHAR kthread = (PUCHAR)thread;
+            PUCHAR tf = *(PUCHAR*)(kthread + KTHREAD_TRAPFRAME_OFFSET);
+
+            if (!tf || !_MmIsAddressValid(tf) || !_MmIsAddressValid(tf + TF_SEGSS + 7)) {
+                return STATUS_UNSUCCESSFUL;
+            }
+
+
+            UINT16 cs_check = *(UINT16*)(tf + TF_SEGCS);
+            if (cs_check != 0x33) {
+                PUCHAR user_tf = nullptr;
+
+                for (ULONG off = 0x190; off < 0x4000; off += 8) {
+                    PUCHAR candidate = tf + off;
+                    if (!_MmIsAddressValid(candidate + TF_SEGSS + 7))
+                        break;
+                    UINT16 cand_cs  = *(UINT16*)(candidate + TF_SEGCS);
+                    UINT16 cand_ss  = *(UINT16*)(candidate + TF_SEGSS);
+                    UINT64 cand_rip = *(UINT64*)(candidate + TF_RIP);
+                    UINT64 cand_rsp = *(UINT64*)(candidate + TF_RSP);
+
+                    if (cand_cs == 0x33 && cand_ss == 0x2B &&
+                        cand_rip < 0x7FFFFFFFFFFULL && cand_rsp < 0x7FFFFFFFFFFULL) {
+                        user_tf = candidate;
+                        break;
+                    }
+                }
+                if (user_tf) {
+                    tf = user_tf;
+                } else {
+                }
+            }
+
+            request->rax = *(UINT64*)(tf + TF_RAX);
+            request->rcx = *(UINT64*)(tf + TF_RCX);
+            request->rdx = *(UINT64*)(tf + TF_RDX);
+            request->r8  = *(UINT64*)(tf + TF_R8);
+            request->r9  = *(UINT64*)(tf + TF_R9);
+            request->r10 = *(UINT64*)(tf + TF_R10);
+            request->r11 = *(UINT64*)(tf + TF_R11);
+            request->rdi = *(UINT64*)(tf + TF_RDI);
+            request->rsi = *(UINT64*)(tf + TF_RSI);
+            request->rbp = *(UINT64*)(tf + TF_RBP);
+            request->rip = *(UINT64*)(tf + TF_RIP);
+            request->rsp = *(UINT64*)(tf + TF_RSP);
+            request->rflags = (UINT64)*(UINT32*)(tf + TF_EFLAGS);
+            request->cs  = (UINT64)*(UINT16*)(tf + TF_SEGCS);
+            request->ss  = (UINT64)*(UINT16*)(tf + TF_SEGSS);
+            request->dr0 = *(UINT64*)(tf + TF_DR0);
+            request->dr1 = *(UINT64*)(tf + TF_DR1);
+            request->dr2 = *(UINT64*)(tf + TF_DR2);
+            request->dr3 = *(UINT64*)(tf + TF_DR3);
+            request->dr6 = *(UINT64*)(tf + TF_DR6);
+            request->dr7 = *(UINT64*)(tf + TF_DR7);
+
+
+            request->rbx = *(UINT64*)(tf + TF_RBX);
+            request->r12 = 0;
+            request->r13 = 0;
+            request->r14 = 0;
+            request->r15 = 0;
+
+
+            return STATUS_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+    }
+
+    NTSTATUS set_context(PETHREAD thread, p_thread_ctx request) {
+        __try {
+            PUCHAR kthread = (PUCHAR)thread;
+            PUCHAR tf = *(PUCHAR*)(kthread + KTHREAD_TRAPFRAME_OFFSET);
+
+            if (!tf || !_MmIsAddressValid(tf) || !_MmIsAddressValid(tf + TF_SEGSS + 7)) {
+                return STATUS_UNSUCCESSFUL;
+            }
+
+
+            UINT16 cs_check = *(UINT16*)(tf + TF_SEGCS);
+            if (cs_check != 0x33) {
+                for (ULONG off = 0x190; off < 0x4000; off += 8) {
+                    PUCHAR candidate = tf + off;
+                    if (!_MmIsAddressValid(candidate + TF_SEGSS + 7))
+                        break;
+                    UINT16 cand_cs  = *(UINT16*)(candidate + TF_SEGCS);
+                    UINT16 cand_ss  = *(UINT16*)(candidate + TF_SEGSS);
+                    UINT64 cand_rip = *(UINT64*)(candidate + TF_RIP);
+                    UINT64 cand_rsp = *(UINT64*)(candidate + TF_RSP);
+                    if (cand_cs == 0x33 && cand_ss == 0x2B &&
+                        cand_rip < 0x7FFFFFFFFFFULL && cand_rsp < 0x7FFFFFFFFFFULL) {
+                        tf = candidate;
+                        break;
+                    }
+                }
+            }
+
+            UINT64 mask = request->register_mask;
+
+            if (mask & (1ULL << 0))  *(UINT64*)(tf + TF_RAX) = request->rax;
+            if (mask & (1ULL << 2))  *(UINT64*)(tf + TF_RCX) = request->rcx;
+            if (mask & (1ULL << 3))  *(UINT64*)(tf + TF_RDX) = request->rdx;
+            if (mask & (1ULL << 4))  *(UINT64*)(tf + TF_RSI) = request->rsi;
+            if (mask & (1ULL << 5))  *(UINT64*)(tf + TF_RDI) = request->rdi;
+            if (mask & (1ULL << 6))  *(UINT64*)(tf + TF_RBP) = request->rbp;
+            if (mask & (1ULL << 7))  *(UINT64*)(tf + TF_RSP) = request->rsp;
+            if (mask & (1ULL << 8))  *(UINT64*)(tf + TF_R8) = request->r8;
+            if (mask & (1ULL << 9))  *(UINT64*)(tf + TF_R9) = request->r9;
+            if (mask & (1ULL << 10)) *(UINT64*)(tf + TF_R10) = request->r10;
+            if (mask & (1ULL << 11)) *(UINT64*)(tf + TF_R11) = request->r11;
+            if (mask & (1ULL << 1))  *(UINT64*)(tf + TF_RBX) = request->rbx;
+
+            if (mask & (1ULL << 16)) *(UINT64*)(tf + TF_RIP) = request->rip;
+            if (mask & (1ULL << 17)) *(UINT32*)(tf + TF_EFLAGS) = (UINT32)request->rflags;
+            if (mask & (1ULL << 18)) *(UINT64*)(tf + TF_DR0) = request->dr0;
+            if (mask & (1ULL << 19)) *(UINT64*)(tf + TF_DR1) = request->dr1;
+            if (mask & (1ULL << 20)) *(UINT64*)(tf + TF_DR2) = request->dr2;
+            if (mask & (1ULL << 21)) *(UINT64*)(tf + TF_DR3) = request->dr3;
+            if (mask & (1ULL << 22)) *(UINT64*)(tf + TF_DR6) = request->dr6;
+            if (mask & (1ULL << 23)) *(UINT64*)(tf + TF_DR7) = request->dr7;
+
+
+            return STATUS_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+    }
+}
+
+
 NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     if (!request || request->pid == 0 || request->tid == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: invalid params (request=%p pid=%u tid=%u)\n",
-            request, request ? request->pid : 0, request ? request->tid : 0);
         return STATUS_INVALID_PARAMETER;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: PID=%u TID=%u %s mask=0x%llX\n",
-        request->pid, request->tid, request->should_set ? "SET" : "GET", request->register_mask);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: func ptrs PsLookupProcess=%p PsLookupThread=%p PsGetCtx=%p PsSetCtx=%p ObDeref=%p\n",
-        _PsLookupProcessByProcessId, _PsLookupThreadByThreadId,
-        _PsGetContextThread, _PsSetContextThread, _ObfDereferenceObject);
 
     if (!_PsLookupProcessByProcessId || !_PsLookupThreadByThreadId ||
         !_PsGetContextThread || !_PsSetContextThread ||
         !_ObfDereferenceObject) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: required functions not resolved: PsLookupProcess=%d PsLookupThread=%d PsGetCtx=%d PsSetCtx=%d ObDeref=%d\n",
-            _PsLookupProcessByProcessId != nullptr, _PsLookupThreadByThreadId != nullptr,
-            _PsGetContextThread != nullptr, _PsSetContextThread != nullptr, _ObfDereferenceObject != nullptr);
         return STATUS_PROCEDURE_NOT_FOUND;
     }
 
@@ -94,44 +244,31 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     NTSTATUS status = _PsLookupProcessByProcessId(
         (HANDLE)(ULONG_PTR)request->pid, &process);
     if (!NT_SUCCESS(status) || !process) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: process lookup FAILED PID=%u status=0x%08X\n", request->pid, status);
         return status;
     }
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: process lookup OK EPROCESS=%p\n", process);
 
     PETHREAD thread = nullptr;
     status = _PsLookupThreadByThreadId(
         (HANDLE)(ULONG_PTR)request->tid, &thread);
     if (!NT_SUCCESS(status) || !thread) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: thread lookup FAILED TID=%u status=0x%08X\n", request->tid, status);
         _ObfDereferenceObject(process);
         return status;
     }
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: thread lookup OK ETHREAD=%p\n", thread);
 
-    // Verify the thread belongs to the correct process
+
     __try {
         PEPROCESS thread_process = IoThreadToProcess(thread);
         if (thread_process != process) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: WARNING thread EPROCESS=%p != target EPROCESS=%p\n",
-                thread_process, process);
         } else {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: thread belongs to correct process confirmed\n");
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: exception verifying thread ownership\n");
     }
 
     dbg_guard::timing_scatter();
 
-    // Log current IRQL and thread state for diagnostics
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: current IRQL=%u calling thread=%p\n",
-        (ULONG)KeGetCurrentIrql(), PsGetCurrentThread());
 
-    // PsGetContextThread/PsSetContextThread use APC-based context exchange.
-    // The target thread MUST be suspended for the APC to deliver reliably.
-    // Without suspension, PsGetContextThread returns STATUS_UNSUCCESSFUL (0xC0000001)
-    // because the kernel APC cannot fire on an actively running thread.
+
+
     HANDLE ctx_thread_handle = nullptr;
     BOOLEAN ctx_thread_suspended = FALSE;
 
@@ -159,32 +296,28 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
 
             if (NT_SUCCESS(suspend_status)) {
                 ctx_thread_suspended = TRUE;
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: suspended thread TID=%u prev_count=%u\n",
-                    request->tid, prev_count);
             } else {
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: suspend FAILED TID=%u status=0x%08X\n",
-                    request->tid, suspend_status);
             }
         } else {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: ObOpenObjectByPointer FAILED status=0x%08X\n", open_status);
         }
     }
 
     CONTEXT ctx;
     strong::kmemset(&ctx, 0, sizeof(ctx));
-    BOOLEAN use_nt_context = (ctx_thread_handle != nullptr) && ssdt_resolver::resolve_thread_context();
+
+
+    BOOLEAN use_ps_direct = (_PsGetContextThread != nullptr && _PsSetContextThread != nullptr);
+    BOOLEAN use_nt_context = !use_ps_direct && (ctx_thread_handle != nullptr) && ssdt_resolver::resolve_thread_context();
 
     if (request->should_set == 0) {
 
         ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
-        if (use_nt_context) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx GET: calling NtGetContextThread(handle=%p, ctx=%p) ContextFlags=0x%X\n",
-                ctx_thread_handle, &ctx, ctx.ContextFlags);
+        if (use_ps_direct) {
+            status = _PsGetContextThread(thread, &ctx, KernelMode);
+        } else if (use_nt_context) {
             status = ssdt_resolver::call_NtGetContextThread(ctx_thread_handle, &ctx);
         } else {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx GET: calling PsGetContextThread(thread=%p, ctx=%p, mode=KernelMode) ContextFlags=0x%X\n",
-                thread, &ctx, ctx.ContextFlags);
-            status = _PsGetContextThread(thread, &ctx, KernelMode);
+            status = STATUS_PROCEDURE_NOT_FOUND;
         }
 
         if (NT_SUCCESS(status)) {
@@ -214,34 +347,24 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
             request->dr3 = ctx.Dr3;
             request->dr6 = ctx.Dr6;
             request->dr7 = ctx.Dr7;
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx GET SUCCESS: RIP=0x%llX RSP=0x%llX RAX=0x%llX RBX=0x%llX\n",
-                ctx.Rip, ctx.Rsp, ctx.Rax, ctx.Rbx);
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx GET SUCCESS: DR0=0x%llX DR1=0x%llX DR2=0x%llX DR3=0x%llX DR6=0x%llX DR7=0x%llX\n",
-                ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3, ctx.Dr6, ctx.Dr7);
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx GET SUCCESS: CS=0x%X SS=0x%X Flags=0x%X ContextFlags=0x%X\n",
-                ctx.SegCs, ctx.SegSs, ctx.EFlags, ctx.ContextFlags);
         } else {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx GET FAILED: PsGetContextThread returned 0x%08X for TID=%u ETHREAD=%p\n",
-                status, request->tid, thread);
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx GET FAILED: ContextFlags after call=0x%X (requested CONTEXT_FULL|CONTEXT_DEBUG_REGISTERS=0x%X)\n",
-                ctx.ContextFlags, (ULONG)(CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS));
+
+
+            status = trapframe_ctx::get_context(thread, request);
         }
     }
     else {
 
         ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx SET: first reading current context from TID=%u\n", request->tid);
-        if (use_nt_context) {
-            status = ssdt_resolver::call_NtGetContextThread(ctx_thread_handle, &ctx);
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx SET: NtGetContextThread status=0x%08X (for reading before set)\n", status);
-        } else {
+        if (use_ps_direct) {
             status = _PsGetContextThread(thread, &ctx, KernelMode);
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx SET: PsGetContextThread status=0x%08X (for reading before set)\n", status);
+        } else if (use_nt_context) {
+            status = ssdt_resolver::call_NtGetContextThread(ctx_thread_handle, &ctx);
+        } else {
+            status = STATUS_PROCEDURE_NOT_FOUND;
         }
 
         if (NT_SUCCESS(status)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx SET: current RIP=0x%llX RSP=0x%llX before applying mask=0x%llX\n",
-                ctx.Rip, ctx.Rsp, request->register_mask);
 
             UINT64 mask = request->register_mask;
             if (mask & (1ULL << 0))  ctx.Rax    = request->rax;
@@ -270,21 +393,27 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
             if (mask & (1ULL << 23)) ctx.Dr7    = request->dr7;
 
             ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx SET: calling %s ContextFlags=0x%X\n",
-                use_nt_context ? "NtSetContextThread" : "PsSetContextThread", ctx.ContextFlags);
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx SET: values to write: RIP=0x%llX RSP=0x%llX DR0=0x%llX DR7=0x%llX\n",
-                ctx.Rip, ctx.Rsp, ctx.Dr0, ctx.Dr7);
-            status = use_nt_context
-                ? ssdt_resolver::call_NtSetContextThread(ctx_thread_handle, &ctx)
-                : _PsSetContextThread(thread, &ctx, KernelMode);
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx SET: final set mask=0x%llX status=0x%08X\n",
-                mask, status);
+            if (use_ps_direct) {
+                status = _PsSetContextThread(thread, &ctx, KernelMode);
+            } else if (use_nt_context) {
+                status = ssdt_resolver::call_NtSetContextThread(ctx_thread_handle, &ctx);
+            } else {
+                status = STATUS_PROCEDURE_NOT_FOUND;
+            }
+
+
+            if (!NT_SUCCESS(status)) {
+                status = trapframe_ctx::set_context(thread, request);
+            }
+
         } else {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx SET FAILED: could not read current context first, status=0x%08X\n", status);
+
+
+            status = trapframe_ctx::set_context(thread, request);
         }
     }
 
-    // Resume the thread if we suspended it for context access
+
     if (ctx_thread_suspended && ctx_thread_handle) {
         ULONG prev_count = 0;
         NTSTATUS resume_status = STATUS_PROCEDURE_NOT_FOUND;
@@ -297,8 +426,6 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
             resume_status = ssdt_resolver::call_NtResumeThread(ctx_thread_handle, &prev_count);
         }
 
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: resumed thread TID=%u prev_count=%u resume_status=0x%08X\n",
-            request->tid, prev_count, resume_status);
     }
     if (ctx_thread_handle) {
         _ZwClose(ctx_thread_handle);
@@ -307,7 +434,6 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     _ObfDereferenceObject(thread);
     _ObfDereferenceObject(process);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadCtx: completed status=0x%08X\n", status);
 
     return status;
 }
@@ -315,13 +441,10 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
 
 NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
     if (!request || request->pid == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadEnum: invalid params\n");
         return STATUS_INVALID_PARAMETER;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadEnum: PID=%u\n", request->pid);
     if (!_PsLookupProcessByProcessId || !_ObfDereferenceObject) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadEnum: required functions not resolved\n");
         return STATUS_PROCEDURE_NOT_FOUND;
     }
 
@@ -331,7 +454,6 @@ NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
     NTSTATUS status = _PsLookupProcessByProcessId(
         (HANDLE)(ULONG_PTR)request->pid, &process);
     if (!NT_SUCCESS(status) || !process) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadEnum: process lookup FAILED PID=%u status=0x%08X\n", request->pid, status);
         return status;
     }
 
@@ -346,7 +468,6 @@ NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
 
     if (status != STATUS_INFO_LENGTH_MISMATCH || required_length < sizeof(SYSTEM_PROCESS_INFORMATION_LOCAL)) {
         _ObfDereferenceObject(process);
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadEnum: initial query FAILED status=0x%08X len=0x%X\n", status, required_length);
         return NT_SUCCESS(status) ? STATUS_UNSUCCESSFUL : status;
     }
 
@@ -380,7 +501,6 @@ NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
     if (!NT_SUCCESS(status)) {
         ExFreePoolWithTag(buffer, sysinfo_guard::kThreadInfoTag);
         _ObfDereferenceObject(process);
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadEnum: query FAILED status=0x%08X\n", status);
         return status;
     }
 
@@ -416,11 +536,9 @@ NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
     request->thread_count = count;
 
     if (!process_found) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadEnum: PID=%u not present in system snapshot\n", request->pid);
         return STATUS_NOT_FOUND;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ThreadEnum: found %u threads\n", count);
 
     return STATUS_SUCCESS;
 }
@@ -428,30 +546,24 @@ NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
 
 NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request) {
     if (!request || request->tid == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SuspendResume: invalid params\n");
         return STATUS_INVALID_PARAMETER;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SuspendResume: TID=%u %s\n",
-        request->tid, request->should_resume ? "RESUME" : "SUSPEND");
 
     BOOLEAN use_ps = (_PsSuspendThread != nullptr && _PsResumeThread != nullptr);
     BOOLEAN use_zw = (_ObOpenObjectByPointer != nullptr && _ZwSuspendThread != nullptr && _ZwResumeThread != nullptr && _ZwClose != nullptr);
     BOOLEAN use_ssdt = FALSE;
 
     if (!use_ps && !use_zw) {
-        // Neither Ps nor Zw functions available - try SSDT-based resolution
-        // This resolves NtSuspendThread/NtResumeThread by reading syscall indices
-        // from ntdll in the calling process and looking up the SSDT
+
+
         if (_ObOpenObjectByPointer != nullptr && _ZwClose != nullptr &&
             ssdt_resolver::resolve_suspend_resume()) {
             use_ssdt = TRUE;
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SuspendResume: using SSDT-resolved NtSuspendThread/NtResumeThread\n");
         }
     }
 
     if (!_PsLookupThreadByThreadId || !_ObfDereferenceObject || (!use_ps && !use_zw && !use_ssdt)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SuspendResume: required functions not resolved (Ps=%d Zw=%d Ssdt=%d)\n", use_ps, use_zw, use_ssdt);
         return STATUS_PROCEDURE_NOT_FOUND;
     }
 
@@ -461,7 +573,6 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
     NTSTATUS status = _PsLookupThreadByThreadId(
         (HANDLE)(ULONG_PTR)request->tid, &thread);
     if (!NT_SUCCESS(status) || !thread) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SuspendResume: thread lookup FAILED TID=%u status=0x%08X\n", request->tid, status);
         return status;
     }
 
@@ -476,7 +587,7 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
         }
     }
     else {
-        // Zw or SSDT path: both need a thread handle via ObOpenObjectByPointer
+
         HANDLE thread_handle = nullptr;
         status = _ObOpenObjectByPointer(
             thread,
@@ -497,9 +608,8 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
                 }
             }
             else {
-                // SSDT path: call NtSuspendThread/NtResumeThread resolved from SSDT
-                // with PreviousMode temporarily set to KernelMode so kernel pointers
-                // pass the Nt probe checks
+
+
                 if (request->should_resume == 0) {
                     status = ssdt_resolver::call_NtSuspendThread(thread_handle, &prev_count);
                 }
@@ -510,14 +620,12 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
             _ZwClose(thread_handle);
         }
         else {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SuspendResume: ObOpenObjectByPointer FAILED status=0x%08X\n", status);
         }
     }
 
     request->previous_count = prev_count;
     _ObfDereferenceObject(thread);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SuspendResume: prev_count=%u status=0x%08X\n", prev_count, status);
 
     return status;
 }
@@ -525,12 +633,9 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
 
 NTSTATUS functions::handle_query_memory(p_query_memory request) {
     if (!request || request->pid == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] QueryMem: invalid params\n");
         return STATUS_INVALID_PARAMETER;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] QueryMem: PID=%u addr=0x%llX\n",
-        request->pid, request->address);
     if (!_PsLookupProcessByProcessId || !_KeStackAttachProcess ||
         !_KeUnstackDetachProcess || !_ZwQueryVirtualMemory || !_ObfDereferenceObject) {
         return STATUS_PROCEDURE_NOT_FOUND;
@@ -568,14 +673,11 @@ NTSTATUS functions::handle_query_memory(p_query_memory request) {
         request->type           = mbi.Type;
         request->allocation_base = (UINT64)mbi.AllocationBase;
         request->allocation_protect = mbi.AllocationProtect;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] QueryMem: base=0x%llX size=0x%llX state=0x%X protect=0x%X\n",
-            (UINT64)mbi.BaseAddress, (UINT64)mbi.RegionSize, mbi.State, mbi.Protect);
     }
 
     _KeUnstackDetachProcess(&apc_state);
     _ObfDereferenceObject(process);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] QueryMem: status=0x%08X\n", status);
 
     return status;
 }
@@ -583,15 +685,11 @@ NTSTATUS functions::handle_query_memory(p_query_memory request) {
 
 NTSTATUS functions::handle_protect_memory(p_protect_memory request) {
     if (!request || request->pid == 0 || request->size == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ProtectMem: invalid params\n");
         return STATUS_INVALID_PARAMETER;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ProtectMem: PID=%u addr=0x%llX size=0x%llX new_protect=0x%X\n",
-        request->pid, request->address, request->size, request->new_protect);
     if (!_PsLookupProcessByProcessId || !_KeStackAttachProcess ||
         !_KeUnstackDetachProcess || !_ZwProtectVirtualMemory || !_ObfDereferenceObject) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ProtectMem: required functions not resolved\n");
         return STATUS_PROCEDURE_NOT_FOUND;
     }
 
@@ -601,7 +699,6 @@ NTSTATUS functions::handle_protect_memory(p_protect_memory request) {
     NTSTATUS status = _PsLookupProcessByProcessId(
         (HANDLE)(ULONG_PTR)request->pid, &process);
     if (!NT_SUCCESS(status) || !process) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ProtectMem: process lookup FAILED PID=%u status=0x%08X\n", request->pid, status);
         return status;
     }
 
@@ -621,7 +718,6 @@ NTSTATUS functions::handle_protect_memory(p_protect_memory request) {
 
     if (NT_SUCCESS(status)) {
         request->old_protect = old_protect;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ProtectMem: old_protect=0x%X status=0x%08X\n", old_protect, status);
     }
 
     _KeUnstackDetachProcess(&apc_state);
@@ -633,15 +729,11 @@ NTSTATUS functions::handle_protect_memory(p_protect_memory request) {
 
 NTSTATUS functions::handle_enum_regions(p_enum_regions request) {
     if (!request || request->pid == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] EnumRegions: invalid params\n");
         return STATUS_INVALID_PARAMETER;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] EnumRegions: PID=%u start=0x%llX\n",
-        request->pid, request->start_address);
     if (!_PsLookupProcessByProcessId || !_KeStackAttachProcess ||
         !_KeUnstackDetachProcess || !_ZwQueryVirtualMemory || !_ObfDereferenceObject) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] EnumRegions: required functions not resolved\n");
         return STATUS_PROCEDURE_NOT_FOUND;
     }
 
@@ -651,7 +743,6 @@ NTSTATUS functions::handle_enum_regions(p_enum_regions request) {
     NTSTATUS status = _PsLookupProcessByProcessId(
         (HANDLE)(ULONG_PTR)request->pid, &process);
     if (!NT_SUCCESS(status) || !process) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] EnumRegions: process lookup FAILED PID=%u status=0x%08X\n", request->pid, status);
         return status;
     }
 
@@ -702,7 +793,6 @@ NTSTATUS functions::handle_enum_regions(p_enum_regions request) {
 
     request->region_count = count;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] EnumRegions: found %u regions\n", count);
 
     return STATUS_SUCCESS;
 }
@@ -710,14 +800,11 @@ NTSTATUS functions::handle_enum_regions(p_enum_regions request) {
 
 NTSTATUS functions::handle_read_peb(p_read_peb request) {
     if (!request || request->pid == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ReadPEB: invalid params\n");
         return STATUS_INVALID_PARAMETER;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ReadPEB: PID=%u\n", request->pid);
     if (!_PsLookupProcessByProcessId || !_PsGetProcessPeb ||
         !_KeStackAttachProcess || !_KeUnstackDetachProcess || !_ObfDereferenceObject) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ReadPEB: required functions not resolved\n");
         return STATUS_PROCEDURE_NOT_FOUND;
     }
 
@@ -727,13 +814,11 @@ NTSTATUS functions::handle_read_peb(p_read_peb request) {
     NTSTATUS status = _PsLookupProcessByProcessId(
         (HANDLE)(ULONG_PTR)request->pid, &process);
     if (!NT_SUCCESS(status) || !process) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ReadPEB: process lookup FAILED PID=%u status=0x%08X\n", request->pid, status);
         return status;
     }
 
     PVOID peb = (PVOID)_PsGetProcessPeb(process);
     if (!peb) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ReadPEB: PEB is NULL for PID=%u\n", request->pid);
         _ObfDereferenceObject(process);
         return STATUS_NOT_FOUND;
     }
@@ -755,11 +840,8 @@ NTSTATUS functions::handle_read_peb(p_read_peb request) {
         request->number_of_heaps = *(UINT32*)(peb_base + 0xE8);
         request->max_heaps       = *(UINT32*)(peb_base + 0xEC);
         request->process_heaps   = *(UINT64*)(peb_base + 0xF0);
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ReadPEB: peb=0x%llX image_base=0x%llX debugged=%u heap=0x%llX\n",
-            (UINT64)peb, request->image_base, request->being_debugged, request->process_heap);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ReadPEB: access violation reading PEB for PID=%u\n", request->pid);
         _KeUnstackDetachProcess(&apc_state);
         _ObfDereferenceObject(process);
         return STATUS_ACCESS_VIOLATION;
@@ -774,14 +856,11 @@ NTSTATUS functions::handle_read_peb(p_read_peb request) {
 
 NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
     if (!request || request->pid == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SpoofDebug: invalid params\n");
         return STATUS_INVALID_PARAMETER;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SpoofDebug: PID=%u\n", request->pid);
     if (!_PsLookupProcessByProcessId || !_PsGetProcessPeb ||
         !_KeStackAttachProcess || !_KeUnstackDetachProcess || !_ObfDereferenceObject) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SpoofDebug: required functions not resolved\n");
         return STATUS_PROCEDURE_NOT_FOUND;
     }
 
@@ -791,7 +870,6 @@ NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
     NTSTATUS status = _PsLookupProcessByProcessId(
         (HANDLE)(ULONG_PTR)request->pid, &process);
     if (!NT_SUCCESS(status) || !process) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SpoofDebug: process lookup FAILED PID=%u status=0x%08X\n", request->pid, status);
         return status;
     }
 
@@ -857,7 +935,6 @@ NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
 
     request->result_flags = cleared;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SpoofDebug: cleared_flags=0x%X\n", cleared);
 
     return STATUS_SUCCESS;
 }
@@ -865,16 +942,12 @@ NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
 
 NTSTATUS functions::handle_get_module_export(p_module_export request) {
     if (!request || request->module_base == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ModExport: invalid params\n");
         return STATUS_INVALID_PARAMETER;
     }
     if (request->dtb == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ModExport: DTB is zero\n");
         return STATUS_INVALID_PARAMETER;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ModExport: DTB=0x%llX base=0x%llX name=%s\n",
-        request->dtb, request->module_base, request->export_name);
 
     dbg_guard::timing_scatter();
 
@@ -972,29 +1045,23 @@ NTSTATUS functions::handle_get_module_export(p_module_export request) {
 
             request->resolved_address = base + func_rva;
             request->ordinal = ordinal_base + ordinal;
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ModExport: FOUND addr=0x%llX ordinal=%u\n",
-                base + func_rva, ordinal_base + ordinal);
             return STATUS_SUCCESS;
         }
     }
 
     request->resolved_address = 0;
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] ModExport: NOT FOUND\n");
     return STATUS_NOT_FOUND;
 }
 
 
 NTSTATUS functions::handle_virt_to_phys(p_virt_to_phys request) {
     if (!request || request->dtb == 0 || request->virtual_address == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] VirtToPhys: invalid params\n");
         return STATUS_INVALID_PARAMETER;
     }
 
     UINT64 physical = strong::translate_virtual_address(request->dtb, request->virtual_address);
     request->physical_address = physical;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] VirtToPhys: DTB=0x%llX virt=0x%llX phys=0x%llX\n",
-        request->dtb, request->virtual_address, physical);
 
     return (physical != 0) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }

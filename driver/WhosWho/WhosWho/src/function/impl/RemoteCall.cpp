@@ -445,32 +445,23 @@ namespace shellcode_builder {
 
 NTSTATUS functions::handle7781(p_remote_call request) {
     if (!request) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: null request\n");
         return STATUS_INVALID_PARAMETER;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: target=0x%llX shellcode=0x%llX DTB=0x%llX spoof=0x%llX\n",
-        request->target_function, request->shellcode_address, request->dtb, request->spoof_return);
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: arg1=0x%llX arg2=0x%llX arg3=0x%llX arg4=0x%llX\n",
-        request->arg1, request->arg2, request->arg3, request->arg4);
 
     if (!call_guard::is_valid_code_ptr(request->target_function)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: invalid target function address\n");
         return STATUS_INVALID_ADDRESS;
     }
 
     if (!call_guard::is_valid_dtb(request->dtb)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: invalid DTB\n");
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->shellcode_address == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: shellcode address is zero\n");
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!call_guard::is_valid_user_range(request->shellcode_address)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: shellcode address out of user range\n");
         return STATUS_INVALID_ADDRESS;
     }
 
@@ -517,15 +508,12 @@ NTSTATUS functions::handle7781(p_remote_call request) {
         return STATUS_UNSUCCESSFUL;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: shellcode built sc_size=%llu ep_size=%llu code_addr=0x%llX epilogue_addr=0x%llX\n",
-        (UINT64)sc_size, (UINT64)ep_size, code_addr, epilogue_addr);
 
     SIZE_T bytes_written = 0;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
 
     UINT64 phys_ctx = strong::translate_virtual_address(dtb_clean, context_addr);
     if (!phys_ctx) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: translate FAILED for context_addr=0x%llX DTB=0x%llX\n", context_addr, dtb_clean);
         return STATUS_INVALID_ADDRESS;
     }
 
@@ -603,14 +591,12 @@ NTSTATUS functions::handle7781(p_remote_call request) {
     request->result = 0;
     request->completed = 0;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] RemoteCall: setup complete, entry=0x%llX\n", code_addr);
 
     return STATUS_SUCCESS;
 }
 
 NTSTATUS functions::handle7782(p_call_result request) {
     if (!request) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] CallResult: null request\n");
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -658,7 +644,6 @@ NTSTATUS functions::handle7782(p_call_result request) {
     if (done_flag != 0) {
         request->result = ctx.ret_value;
         request->completed = 1;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] CallResult: execution complete, result=0x%llX\n", ctx.ret_value);
     }
 
     return STATUS_SUCCESS;
@@ -666,7 +651,6 @@ NTSTATUS functions::handle7782(p_call_result request) {
 
 NTSTATUS functions::handle7782_legacy(p_call_result request) {
     if (!request) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] CallResultLegacy: null request\n");
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -724,21 +708,17 @@ namespace alloc_internal {
 
 NTSTATUS functions::handle7783(p_alloc_mem request) {
     if (!request) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] AllocMem: null request\n");
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->pid == 0 || request->pid <= 4) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] AllocMem: invalid PID=%u\n", request->pid);
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->size == 0 || request->size > 0x1000000) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] AllocMem: invalid size=0x%llX\n", request->size);
         return STATUS_INVALID_BUFFER_SIZE;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] AllocMem: PID=%u size=0x%llX\n", request->pid, request->size);
 
     if (!_KeStackAttachProcess || !_KeUnstackDetachProcess || !_ZwAllocateVirtualMemory) {
         return STATUS_PROCEDURE_NOT_FOUND;
@@ -778,7 +758,6 @@ NTSTATUS functions::handle7783(p_alloc_mem request) {
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] AllocMem: page fault-in exception at 0x%llX\n", (UINT64)base_addr);
         }
     }
 
@@ -788,11 +767,9 @@ NTSTATUS functions::handle7783(p_alloc_mem request) {
     if (NT_SUCCESS(status) && base_addr) {
         request->allocated_address = (UINT64)base_addr;
         request->actual_size = region_size;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] AllocMem: allocated=0x%llX actual_size=0x%llX\n", (UINT64)base_addr, (UINT64)region_size);
     } else {
         request->allocated_address = 0;
         request->actual_size = 0;
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] AllocMem: FAILED status=0x%08X\n", status);
     }
 
     return status;
@@ -800,21 +777,17 @@ NTSTATUS functions::handle7783(p_alloc_mem request) {
 
 NTSTATUS functions::handle7784(p_free_mem request) {
     if (!request) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] FreeMem: null request\n");
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->pid == 0 || request->pid <= 4) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] FreeMem: invalid PID=%u\n", request->pid);
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->address == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] FreeMem: address is zero\n");
         return STATUS_INVALID_PARAMETER;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] FreeMem: PID=%u address=0x%llX\n", request->pid, request->address);
 
     if (!call_guard::is_valid_user_range(request->address)) {
         return STATUS_INVALID_ADDRESS;
@@ -846,7 +819,6 @@ NTSTATUS functions::handle7784(p_free_mem request) {
         MEM_RELEASE
     );
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] FreeMem: status=0x%08X\n", status);
 
     _KeUnstackDetachProcess(&apc_state);
     _ObfDereferenceObject(process);

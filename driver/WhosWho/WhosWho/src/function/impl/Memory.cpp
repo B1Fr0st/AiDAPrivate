@@ -26,19 +26,16 @@ namespace mem_guard {
 
 NTSTATUS functions::handle777e(p_physical_rw request) {
     if (!request) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] PhysRW: null request\n");
         return STATUS_INVALID_PARAMETER;
     }
 
     mem_guard::timing_scatter();
 
     if (!request->buffer || request->size == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] PhysRW: invalid buffer or size\n");
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->dtb == 0) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] PhysRW: DTB is zero\n");
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -51,8 +48,6 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
         return STATUS_ACCESS_DENIED;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] PhysRW: %s PID=%u DTB=0x%llX addr=0x%llX size=0x%llX\n",
-        request->shouldWrite ? "WRITE" : "READ", request->pid, request->dtb, (UINT64)request->address, (UINT64)request->size);
 
     const UINT64 process_dir_base = request->dtb;
 
@@ -115,7 +110,6 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
 
     request->retSize = total_bytes_transferred;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] PhysRW: completed, transferred=0x%llX\n", (UINT64)total_bytes_transferred);
 
     return (total_bytes_transferred > 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }

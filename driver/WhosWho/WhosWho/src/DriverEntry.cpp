@@ -9,21 +9,16 @@
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
     UNREFERENCED_PARAMETER(RegistryPath);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] DriverEntry called\n");
 
     if (!SetupFunctions()) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SetupFunctions FAILED\n");
         return STATUS_UNSUCCESSFUL;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] SetupFunctions succeeded\n");
 
     if (!device_names::initialize_names()) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] initialize_names FAILED\n");
         return STATUS_UNSUCCESSFUL;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] Device name initialized: %ws\n", device_names::get_device_name());
 
     UNICODE_STRING deviceName = {};
     _RtlInitUnicodeString(&deviceName, device_names::get_device_name());
@@ -41,23 +36,19 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     );
 
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] IoCreateDevice FAILED: 0x%08X\n", status);
         return status;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] IoCreateDevice succeeded, DeviceObject=%p\n", deviceObject);
 
     UNICODE_STRING symLink = {};
     _RtlInitUnicodeString(&symLink, device_names::get_symlink_name());
 
     status = _IoCreateSymbolicLink(&symLink, &deviceName);
     if (!NT_SUCCESS(status)) {
-        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] IoCreateSymbolicLink FAILED: 0x%08X\n", status);
         _IoDeleteDevice(deviceObject);
         return status;
     }
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] Symbolic link created: %ws\n", device_names::get_symlink_name());
 
     SetFlag(deviceObject->Flags, DO_BUFFERED_IO);
 
@@ -73,7 +64,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     signed_memory::RelocateDispatchToSignedMemory(DriverObject, 0x800);
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho] DriverEntry completed successfully\n");
 
     return STATUS_SUCCESS;
 }
