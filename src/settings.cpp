@@ -1,11 +1,118 @@
 #include "aida_pro.hpp"
 #include "vmp.hpp"
 
+#ifdef __NT__
+#include <windows.h>
+#include <wincrypt.h>
+#pragma comment(lib, "Crypt32.lib")
+#endif
+
 static constexpr uint8_t CFG_OBF_KEY[] = {
     0xA3, 0x7B, 0x1E, 0xD4, 0x5F, 0x92, 0xC8, 0x06,
     0xE1, 0x3A, 0x8D, 0x47, 0xB0, 0x6C, 0xF5, 0x29
 };
 static constexpr const char CFG_OBF_PREFIX[] = "enc1:";
+static constexpr const char CFG_DPAPI_PREFIX[] = "dpapi1:";
+
+static std::string hex_encode_bytes(const unsigned char* data, size_t size)
+{
+    std::string out;
+    out.reserve(size * 2);
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < size; ++i)
+    {
+        const unsigned char b = data[i];
+        out.push_back(digits[(b >> 4) & 0x0F]);
+        out.push_back(digits[b & 0x0F]);
+    }
+    return out;
+}
+
+static bool hex_decode_bytes(const std::string& text, std::vector<unsigned char>& out)
+{
+    if ((text.size() % 2) != 0)
+        return false;
+
+    out.clear();
+    out.reserve(text.size() / 2);
+    for (size_t i = 0; i < text.size(); i += 2)
+    {
+        unsigned int byte_value = 0;
+        std::istringstream iss(text.substr(i, 2));
+        iss >> std::hex >> byte_value;
+        if (iss.fail())
+            return false;
+        out.push_back(static_cast<unsigned char>(byte_value));
+    }
+    return true;
+}
+
+#ifdef __NT__
+static std::string protect_with_dpapi(const std::string& plaintext, const char* scope)
+{
+    if (plaintext.empty())
+        return plaintext;
+
+    DATA_BLOB input_blob{};
+    input_blob.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(plaintext.data()));
+    input_blob.cbData = static_cast<DWORD>(plaintext.size());
+
+    DATA_BLOB entropy_blob{};
+    entropy_blob.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(scope));
+    entropy_blob.cbData = static_cast<DWORD>(std::strlen(scope));
+
+    DATA_BLOB output_blob{};
+    if (!CryptProtectData(&input_blob,
+                          L"AiDA Secret",
+                          &entropy_blob,
+                          nullptr,
+                          nullptr,
+                          CRYPTPROTECT_UI_FORBIDDEN,
+                          &output_blob))
+    {
+        return "";
+    }
+
+    std::string protected_hex = hex_encode_bytes(output_blob.pbData, output_blob.cbData);
+    LocalFree(output_blob.pbData);
+    return std::string(CFG_DPAPI_PREFIX) + protected_hex;
+}
+
+static std::string unprotect_with_dpapi(const std::string& encoded, const char* scope)
+{
+    if (encoded.compare(0, sizeof(CFG_DPAPI_PREFIX) - 1, CFG_DPAPI_PREFIX) != 0)
+        return "";
+
+    std::vector<unsigned char> protected_bytes;
+    if (!hex_decode_bytes(encoded.substr(sizeof(CFG_DPAPI_PREFIX) - 1), protected_bytes))
+        return "";
+
+    DATA_BLOB input_blob{};
+    input_blob.pbData = protected_bytes.data();
+    input_blob.cbData = static_cast<DWORD>(protected_bytes.size());
+
+    DATA_BLOB entropy_blob{};
+    entropy_blob.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(scope));
+    entropy_blob.cbData = static_cast<DWORD>(std::strlen(scope));
+
+    DATA_BLOB output_blob{};
+    if (!CryptUnprotectData(&input_blob,
+                            nullptr,
+                            &entropy_blob,
+                            nullptr,
+                            nullptr,
+                            CRYPTPROTECT_UI_FORBIDDEN,
+                            &output_blob))
+    {
+        return "";
+    }
+
+    std::string plaintext(reinterpret_cast<const char*>(output_blob.pbData), output_blob.cbData);
+    SecureZeroMemory(output_blob.pbData, output_blob.cbData);
+    LocalFree(output_blob.pbData);
+    return plaintext;
+}
+#endif
 
 static std::string obfuscate_key(const std::string& plain)
 {
@@ -15,6 +122,15 @@ static std::string obfuscate_key(const std::string& plain)
         VMP_END;
         return plain;
     }
+
+#ifdef __NT__
+    if (std::string protected_value = protect_with_dpapi(plain, "AiDA:settings:v1");
+        !protected_value.empty())
+    {
+        VMP_END;
+        return protected_value;
+    }
+#endif
 
     std::string out;
     out.reserve(plain.size() * 2 + sizeof(CFG_OBF_PREFIX));
@@ -39,6 +155,15 @@ static std::string deobfuscate_key(const std::string& encoded)
         VMP_END;
         return encoded;
     }
+
+#ifdef __NT__
+    if (encoded.compare(0, sizeof(CFG_DPAPI_PREFIX) - 1, CFG_DPAPI_PREFIX) == 0)
+    {
+        std::string plaintext = unprotect_with_dpapi(encoded, "AiDA:settings:v1");
+        VMP_END;
+        return plaintext;
+    }
+#endif
 
     if (encoded.compare(0, sizeof(CFG_OBF_PREFIX) - 1, CFG_OBF_PREFIX) != 0)
     {

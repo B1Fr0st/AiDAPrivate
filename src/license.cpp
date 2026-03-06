@@ -4,7 +4,9 @@
 #include <windows.h>
 #include <intrin.h>
 #include <iphlpapi.h>
+#include <wincrypt.h>
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "Crypt32.lib")
 #else
 #include <unistd.h>
 #include <sys/utsname.h>
@@ -47,6 +49,110 @@ static std::string get_effective_firebase_api_key()
 }
 
 static constexpr int64_t LICENSE_CACHE_DURATION_SEC = 7 * 24 * 3600;
+
+#ifdef __NT__
+static constexpr const char* LICENSE_DPAPI_PREFIX = "dpapi2:";
+
+static std::string license_hex_encode(const unsigned char* data, size_t size)
+{
+    std::string out;
+    out.reserve(size * 2);
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < size; ++i)
+    {
+        const unsigned char b = data[i];
+        out.push_back(digits[(b >> 4) & 0x0F]);
+        out.push_back(digits[b & 0x0F]);
+    }
+    return out;
+}
+
+static bool license_hex_decode(const std::string& text, std::vector<unsigned char>& out)
+{
+    if ((text.size() % 2) != 0)
+        return false;
+
+    out.clear();
+    out.reserve(text.size() / 2);
+    for (size_t i = 0; i < text.size(); i += 2)
+    {
+        unsigned int byte_value = 0;
+        std::istringstream iss(text.substr(i, 2));
+        iss >> std::hex >> byte_value;
+        if (iss.fail())
+            return false;
+        out.push_back(static_cast<unsigned char>(byte_value));
+    }
+    return true;
+}
+
+static std::string protect_license_blob_dpapi(const std::string& plaintext, const std::string& hwid)
+{
+    if (plaintext.empty())
+        return plaintext;
+
+    DATA_BLOB input_blob{};
+    input_blob.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(plaintext.data()));
+    input_blob.cbData = static_cast<DWORD>(plaintext.size());
+
+    std::string entropy = std::string("AiDA:license:v2:") + hwid;
+    DATA_BLOB entropy_blob{};
+    entropy_blob.pbData = reinterpret_cast<BYTE*>(entropy.data());
+    entropy_blob.cbData = static_cast<DWORD>(entropy.size());
+
+    DATA_BLOB output_blob{};
+    if (!CryptProtectData(&input_blob,
+                          L"AiDA License",
+                          &entropy_blob,
+                          nullptr,
+                          nullptr,
+                          CRYPTPROTECT_UI_FORBIDDEN,
+                          &output_blob))
+    {
+        return "";
+    }
+
+    std::string protected_hex = license_hex_encode(output_blob.pbData, output_blob.cbData);
+    LocalFree(output_blob.pbData);
+    return std::string(LICENSE_DPAPI_PREFIX) + protected_hex;
+}
+
+static std::string unprotect_license_blob_dpapi(const std::string& encoded, const std::string& hwid)
+{
+    if (encoded.compare(0, std::strlen(LICENSE_DPAPI_PREFIX), LICENSE_DPAPI_PREFIX) != 0)
+        return "";
+
+    std::vector<unsigned char> protected_bytes;
+    if (!license_hex_decode(encoded.substr(std::strlen(LICENSE_DPAPI_PREFIX)), protected_bytes))
+        return "";
+
+    DATA_BLOB input_blob{};
+    input_blob.pbData = protected_bytes.data();
+    input_blob.cbData = static_cast<DWORD>(protected_bytes.size());
+
+    std::string entropy = std::string("AiDA:license:v2:") + hwid;
+    DATA_BLOB entropy_blob{};
+    entropy_blob.pbData = reinterpret_cast<BYTE*>(entropy.data());
+    entropy_blob.cbData = static_cast<DWORD>(entropy.size());
+
+    DATA_BLOB output_blob{};
+    if (!CryptUnprotectData(&input_blob,
+                            nullptr,
+                            &entropy_blob,
+                            nullptr,
+                            nullptr,
+                            CRYPTPROTECT_UI_FORBIDDEN,
+                            &output_blob))
+    {
+        return "";
+    }
+
+    std::string plaintext(reinterpret_cast<const char*>(output_blob.pbData), output_blob.cbData);
+    SecureZeroMemory(output_blob.pbData, output_blob.cbData);
+    LocalFree(output_blob.pbData);
+    return plaintext;
+}
+#endif
 
 std::string license_manager_t::compute_hmac(
     const std::string& key_str,
@@ -106,6 +212,15 @@ std::string license_manager_t::encrypt_local(const std::string& plaintext) const
     VMP_VIRT("encrypt_local");
     std::string hwid = generate_hwid();
 
+#ifdef __NT__
+    if (std::string protected_blob = protect_license_blob_dpapi(plaintext, hwid);
+        !protected_blob.empty())
+    {
+        VMP_END;
+        return protected_blob;
+    }
+#endif
+
     unsigned char salt[16];
     if (RAND_bytes(salt, sizeof(salt)) != 1)
     {
@@ -160,6 +275,18 @@ std::string license_manager_t::encrypt_local(const std::string& plaintext) const
 std::string license_manager_t::decrypt_local(const std::string& hex_input) const
 {
     VMP_VIRT("decrypt_local");
+
+#ifdef __NT__
+    if (hex_input.compare(0, std::strlen(LICENSE_DPAPI_PREFIX), LICENSE_DPAPI_PREFIX) == 0)
+    {
+        std::string plaintext = unprotect_license_blob_dpapi(hex_input, generate_hwid());
+        if (!plaintext.empty())
+        {
+            VMP_END;
+            return plaintext;
+        }
+    }
+#endif
 
     std::vector<unsigned char> raw;
     raw.reserve(hex_input.size() / 2);
