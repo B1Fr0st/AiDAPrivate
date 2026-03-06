@@ -68,6 +68,7 @@ set(AIDA_SOURCES
     src/mcp_server.cpp
     src/settings.cpp
     src/ui.cpp
+    src/driver_loader.cpp
     driver/comm.cpp
 )
 
@@ -93,6 +94,7 @@ set(AIDA_HEADERS
     src/obfuscation.hpp
     src/prompts.hpp
     src/settings.hpp
+    src/driver_loader.hpp
     src/ui.hpp
 )
 
@@ -125,6 +127,7 @@ target_include_directories(AiDA PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/VMProtect3.9.4/Include/C"
     "${CMAKE_CURRENT_SOURCE_DIR}/driver"
+    "${CMAKE_CURRENT_SOURCE_DIR}/mapper/src"
 )
 
 target_compile_definitions(AiDA PRIVATE
@@ -232,6 +235,11 @@ if(WIN32)
         OpenSSL::Crypto
         ws2_32
         crypt32
+        Shlwapi
+        setupapi
+        Psapi
+        wintrust
+        cfgmgr32
     )
 
     if(DEFINED ENV{QTDIR})

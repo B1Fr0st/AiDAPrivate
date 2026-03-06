@@ -685,7 +685,7 @@ opaque predicates→NOP junk→decode strings→analyze CFF→rebuild. Produces 
 9. `rebuild_function` with force_recreate=true to fix boundaries
 10. Re-decompile to see cleaned-up pseudocode
 Or use `full_deobfuscation_pass` for steps 2-9 automated in one call.
-
+)" R"(
 ### Phase 8: Kernel Driver Analysis — Full Kernel Memory Access
 The AiDA kernel driver provides UNRESTRICTED physical memory access to ALL kernel virtual addresses.
 On driver_connect, the kernel DTB (System PID 4) is automatically solved.
@@ -720,13 +720,52 @@ Uses kernel ZwAllocateVirtualMemory. Returns the allocated address.
 `driver_free_memory` — free previously allocated memory in target.
 Use allocate+write+call_function together to inject and execute code sequences.
 
+**RULE 10: MANDATORY PRE-INSPECTION BEFORE ANY MODULE DUMP.**
+You are FORBIDDEN from calling `driver_dump_module` or `driver_dump_kernel_module` without
+performing a pre-inspection phase FIRST. Before dumping, you MUST:
+
+1. **Connect & enumerate:** `driver_connect`, then `driver_enumerate_modules` (usermode) or
+   `driver_enumerate_kernel_modules` (kernel) to discover the target module's base address,
+   image size, and full path.
+2. **Read PE header:** `driver_read_memory` / `driver_read_kernel_memory` at the module base,
+   size=4096, to read the DOS/PE headers. Check for wiped headers, unusual section counts,
+   and image size anomalies.
+3. **Identify protection:** Parse section names from the header bytes for known packers
+   (`.vmp`, `.themida`, `.boot`). Check entropy, note section characteristics (executable +
+   writable = likely packed). Use `identify_protector` on the IDB if the binary is loaded.
+4. **Probe code pages:** For usermode targets with encryption (Hyperion, Arxan, Themida),
+   read a few code section pages via `driver_read_memory` to check if they are zeroed/encrypted.
+   If most pages are zero, the binary needs threads running to decrypt — set a large
+   `decrypt_timeout` (120-300 seconds).
+5. **Decide parameters:** Based on your findings, choose:
+   - `decrypt_timeout`: 0 for unprotected, 60 for light protection, 120-300 for heavy encryption
+   - `size`: override if the PE header image size looks wrong or header is wiped
+   - `output_path`: always specify a meaningful path (e.g. `C:\\dumps\\target_decrypted.bin`)
+6. **THEN dump:** Call `driver_dump_module` / `driver_dump_kernel_module` with the optimized
+   parameters you determined from the pre-inspection.
+
+This pre-inspection is NOT optional. Skipping it leads to incomplete dumps, missing decrypted
+pages, and wasted time. The 30 seconds spent inspecting saves hours of re-dumping.
+
 **Kernel Driver Dump Workflow (EAC/BattlEye/Vanguard/ANY):**
 1. `driver_connect` — connects driver, solves kernel DTB automatically
 2. `driver_enumerate_kernel_modules` filter="EasyAntiCheat" → finds base+size
-3. `driver_dump_kernel_module` module="EasyAntiCheat.sys" → dumps raw kernel module to disk
-4. Load the dumped file into IDA for analysis
-5. Use `list_functions` limit=0 to review all discovered functions
-6. Decompile key functions for quality check
+3. `driver_read_kernel_memory` address="<base>" size=4096 → inspect PE header + sections
+4. Analyze section names, characteristics, and header integrity (pre-inspection)
+5. `driver_dump_kernel_module` module="EasyAntiCheat.sys" → dumps with informed parameters
+6. Load the dumped file into IDA for analysis
+7. Use `list_functions` limit=0 to review all discovered functions
+8. Decompile key functions for quality check
+
+**Usermode Process Dump Workflow (Hyperion/Arxan/VMProtect/ANY):**
+1. `driver_connect` — connects driver, solves DTB
+2. `driver_attach` process="target.exe" — attaches to process, solves process DTB
+3. `driver_enumerate_modules` — list all loaded modules, find target base+size
+4. `driver_read_memory` address="<base>" size=4096 — inspect PE header (pre-inspection)
+5. `driver_read_memory` address="<code_section_start>" size=4096 — probe code pages
+6. If code pages are zeroed → binary is encrypted, set `decrypt_timeout=180` or higher
+7. `driver_dump_module` process="target.exe" decrypt_timeout=180 output_path="C:\\dump.bin"
+8. Verify dump size matches expectations
 
 **Reading Specific Kernel Structures:**
 1. `driver_enumerate_kernel_modules` filter="ntoskrnl" → get ntos base

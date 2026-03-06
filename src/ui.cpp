@@ -17,6 +17,7 @@
 #endif
 
 #include "aida_pro.hpp"
+#include "anti_re.hpp"
 #include <moves.hpp>
 #include <algorithm>
 
@@ -2027,6 +2028,15 @@ static int idaapi finish_populating_widget_popup(TWidget* widget, TPopupMenu* po
 
 ssize_t idaapi ui_event_listener_t::on_event(ssize_t code, va_list va)
 {
+#ifdef __NT__
+    if (code == ui_ready_to_run)
+    {
+        /* Deferred anti-RE initialization — runs once the database is
+           loaded and all UI elements are ready.  Safe to call IDA SDK
+           APIs, snapshot code hashes, corrupt PE headers, etc. */
+        anti_re::initialize();
+    }
+#endif
     if (code == ui_finish_populating_widget_popup)
     {
         TWidget* widget = va_arg(va, TWidget*);

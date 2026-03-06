@@ -11764,6 +11764,225 @@ static protection_analysis_t analyze_module_protection(
 }
 
 
+// Forces decryption of encrypted code pages by injecting shellcode that touches
+// each page from usermode context. This triggers Hyperion-style hooked exception
+// dispatchers (KiUserExceptionDispatcher hooks) which decrypt pages on
+// STATUS_ACCESS_VIOLATION and change their protection to EXECUTE_READ.
+// Must be called BEFORE VirtualProtect-based forcing, since VirtualProtect would
+// change NOACCESS to RWX without triggering the exception handler, leaving
+// page content encrypted.
+static int force_decrypt_via_shellcode(
+    voyager::device_t* dev,
+    std::uint64_t base,
+    const std::uint8_t* pe_hdr,
+    std::size_t hdr_read,
+    bool has_valid_pe,
+    std::uint32_t pe_off,
+    std::uint16_t sections_count,
+    std::uint32_t sec_table_off,
+    std::uint32_t image_size,
+    nlohmann::json& steps)
+{
+    if (!dev || !dev->is_connected() || dev->get_process_id() == 0)
+        return 0;
+
+    // Identify committed NOACCESS pages within code sections that need decryption.
+    // We enumerate memory regions and collect page addresses that are committed
+    // but NOACCESS — these are pages set up for on-demand VEH-based decryption.
+    struct page_range_t { std::uint64_t start; std::uint64_t end; };
+    std::vector<page_range_t> code_ranges;
+
+    if (has_valid_pe)
+    {
+        for (int si = 0; si < sections_count && si < 96; si++)
+        {
+            std::uint32_t soff = sec_table_off + si * 40;
+            if (soff + 40 > static_cast<std::uint32_t>(hdr_read)) break;
+            std::uint32_t vsize = *reinterpret_cast<const std::uint32_t*>(pe_hdr + soff + 8);
+            std::uint32_t vrva  = *reinterpret_cast<const std::uint32_t*>(pe_hdr + soff + 12);
+            std::uint32_t chars = *reinterpret_cast<const std::uint32_t*>(pe_hdr + soff + 36);
+            if (vsize == 0 || vrva == 0) continue;
+            // CODE or EXECUTE sections
+            if (chars & (0x20000000 | 0x00000020))
+            {
+                std::uint64_t sec_start = base + vrva;
+                std::uint64_t sec_end = sec_start + std::min<std::uint64_t>(vsize,
+                    (vrva < image_size) ? (image_size - vrva) : 0);
+                if (sec_end > sec_start)
+                    code_ranges.push_back({sec_start, sec_end});
+            }
+        }
+    }
+    else
+    {
+        // No PE header — treat entire image as potential code
+        code_ranges.push_back({base, base + image_size});
+    }
+
+    if (code_ranges.empty())
+        return 0;
+
+    // Enumerate memory regions to find committed NOACCESS pages within code ranges
+    constexpr std::uint32_t VMEM_COMMIT = 0x1000;
+    constexpr std::uint32_t PROT_NOACCESS = 0x01;
+
+    auto all_regions = enumerate_all_memory_regions_paginated(dev, base, base + image_size, true);
+
+    std::vector<std::uint64_t> noaccess_pages;
+    for (const auto& r : all_regions)
+    {
+        if (!(r.state & VMEM_COMMIT) || r.protect != PROT_NOACCESS)
+            continue;
+
+        // Check if this region overlaps any code range
+        for (const auto& cr : code_ranges)
+        {
+            std::uint64_t overlap_start = std::max(r.base, cr.start);
+            std::uint64_t overlap_end = std::min(r.base + r.size, cr.end);
+            if (overlap_start >= overlap_end) continue;
+
+            // Collect individual page addresses within the overlap
+            for (std::uint64_t addr = overlap_start & ~0xFFFULL; addr < overlap_end; addr += 0x1000)
+            {
+                if (addr >= cr.start && addr < cr.end)
+                    noaccess_pages.push_back(addr);
+            }
+        }
+    }
+
+    if (noaccess_pages.empty())
+    {
+        // No NOACCESS code pages — also try touching all code pages in case the
+        // region enumeration missed some (e.g., pages within a larger ER region
+        // that are individually encrypted but not distinguished at VAD level).
+        // Build a simple sequential shellcode that touches every page in code sections.
+
+        // x64 shellcode: touch every page from base to base + count*0x1000
+        // rcx = start address, rdx = page count
+        // Returns number of pages touched
+        static const std::uint8_t touch_sc[] = {
+            0x53,                                           // push rbx
+            0x56,                                           // push rsi
+            0x57,                                           // push rdi
+            0x48, 0x89, 0xCB,                               // mov rbx, rcx
+            0x48, 0x89, 0xD6,                               // mov rsi, rdx
+            0x31, 0xFF,                                     // xor edi, edi
+            // .loop:
+            0x48, 0x39, 0xF7,                               // cmp rdi, rsi
+            0x7D, 0x0F,                                     // jge .done (+15)
+            0x0F, 0xB6, 0x03,                               // movzx eax, byte [rbx]
+            0x48, 0x81, 0xC3, 0x00, 0x10, 0x00, 0x00,       // add rbx, 0x1000
+            0x48, 0xFF, 0xC7,                               // inc rdi
+            0xEB, 0xEC,                                     // jmp .loop (-20)
+            // .done:
+            0x48, 0x89, 0xF8,                               // mov rax, rdi
+            0x5F,                                           // pop rdi
+            0x5E,                                           // pop rsi
+            0x5B,                                           // pop rbx
+            0xC3                                            // ret
+        };
+
+        std::uint64_t sc_mem = dev->allocate_memory(0x1000);
+        if (sc_mem == 0) return 0;
+
+        dev->write_raw(sc_mem, touch_sc, sizeof(touch_sc));
+
+        int total_touched = 0;
+        for (const auto& cr : code_ranges)
+        {
+            std::uint64_t page_count = (cr.end - cr.start + 0xFFF) / 0x1000;
+            std::uint64_t ret = dev->call_function(sc_mem, cr.start, page_count, 0, 0);
+            total_touched += static_cast<int>(ret);
+        }
+
+        dev->free_memory(sc_mem);
+
+        if (total_touched > 0)
+        {
+            Sleep(100);
+            steps.push_back({{"step", "decrypt_shellcode"}, {"ok", true},
+                {"detail", std::to_string(total_touched) +
+                    " code pages touched via usermode fault-trigger (no NOACCESS regions detected, full sweep)"}});
+            msg(OBFSTR_C("AiDA: Shellcode touched %d code pages (full sweep, no NOACCESS pages found)\n"),
+                total_touched);
+        }
+        return total_touched;
+    }
+
+    // We have specific NOACCESS pages to decrypt.
+    // Allocate memory for: shellcode + address list
+    std::size_t addr_list_size = noaccess_pages.size() * sizeof(std::uint64_t);
+    std::size_t alloc_size = 0x1000 + ((addr_list_size + 0xFFF) & ~0xFFFULL);
+    if (alloc_size > 0x1000000) alloc_size = 0x1000000; // cap at 16MB
+
+    std::uint64_t sc_mem = dev->allocate_memory(alloc_size);
+    if (sc_mem == 0)
+    {
+        steps.push_back({{"step", "decrypt_shellcode"}, {"ok", false},
+            {"detail", "Failed to allocate shellcode memory in target process"}});
+        return 0;
+    }
+
+    // Shellcode that reads from a list of addresses:
+    // rcx = pointer to uint64_t address array
+    // rdx = number of entries
+    // Returns: pages touched
+    static const std::uint8_t list_sc[] = {
+        0x53,                                           // push rbx
+        0x56,                                           // push rsi
+        0x57,                                           // push rdi
+        0x48, 0x89, 0xCB,                               // mov rbx, rcx  (addr list)
+        0x48, 0x89, 0xD6,                               // mov rsi, rdx  (count)
+        0x31, 0xFF,                                     // xor edi, edi  (index)
+        // .loop:
+        0x48, 0x39, 0xF7,                               // cmp rdi, rsi
+        0x7D, 0x0C,                                     // jge .done (+12)
+        0x48, 0x8B, 0x0C, 0xFB,                         // mov rcx, [rbx + rdi*8]
+        0x0F, 0xB6, 0x01,                               // movzx eax, byte [rcx]
+        0x48, 0xFF, 0xC7,                               // inc rdi
+        0xEB, 0xEF,                                     // jmp .loop (-17)
+        // .done:
+        0x48, 0x89, 0xF8,                               // mov rax, rdi
+        0x5F,                                           // pop rdi
+        0x5E,                                           // pop rsi
+        0x5B,                                           // pop rbx
+        0xC3                                            // ret
+    };
+
+    // Write shellcode at start of allocation
+    dev->write_raw(sc_mem, list_sc, sizeof(list_sc));
+
+    // Write address list right after shellcode (at offset 0x100 for alignment)
+    std::uint64_t addr_list_base = sc_mem + 0x100;
+    std::size_t max_entries = (alloc_size - 0x100) / sizeof(std::uint64_t);
+    std::size_t entries = std::min(noaccess_pages.size(), max_entries);
+
+    dev->write_raw(addr_list_base, noaccess_pages.data(),
+        entries * sizeof(std::uint64_t));
+
+    msg(OBFSTR_C("AiDA: Injecting decrypt shellcode — %zu NOACCESS code pages to trigger...\n"),
+        entries);
+
+    // Call shellcode: rcx = addr_list, rdx = count
+    std::uint64_t ret = dev->call_function(sc_mem, addr_list_base, entries, 0, 0);
+
+    dev->free_memory(sc_mem);
+
+    int pages_decrypted = static_cast<int>(ret);
+
+    if (pages_decrypted > 0)
+        Sleep(100);
+
+    steps.push_back({{"step", "decrypt_shellcode"}, {"ok", pages_decrypted > 0},
+        {"detail", std::to_string(pages_decrypted) + "/" + std::to_string(entries) +
+            " NOACCESS code pages triggered via usermode exception-based decryption"}});
+    msg(OBFSTR_C("AiDA: Shellcode decryption complete — %d/%zu pages triggered\n"),
+        pages_decrypted, entries);
+
+    return pages_decrypted;
+}
+
+
 static int force_code_pages_in_memory(
     voyager::device_t* dev,
     std::uint64_t base,
@@ -11993,6 +12212,22 @@ tool_result_t driver_dump_module(const json& params)
         device.get(), base, pe_hdr, hdr_read, has_valid_pe, header_wiped,
         pe_off, sections_count, sec_table_off, pe_size_of_image, false, steps);
 
+    // STEP 1: Force-decrypt encrypted pages via usermode fault-trigger shellcode.
+    // This must run BEFORE VirtualProtect-based forcing because VirtualProtect
+    // changes NOACCESS to RWX without triggering the exception handler, leaving
+    // page content encrypted. The shellcode causes real ACCESS_VIOLATION faults
+    // that are handled by Hyperion's hooked KiUserExceptionDispatcher, which
+    // decrypts the page in-place and changes protection to EXECUTE_READ.
+    {
+        int decrypted = force_decrypt_via_shellcode(
+            device.get(), base, pe_hdr, hdr_read, has_valid_pe,
+            pe_off, sections_count, sec_table_off, pe_size_of_image, steps);
+        if (decrypted > 0)
+            msg(OBFSTR_C("AiDA: Pre-dump exception-based decryption complete — %d pages triggered\n"), decrypted);
+    }
+
+    // STEP 2: VirtualProtect fallback for any remaining pages (e.g., COW pages,
+    // guard pages, or pages that weren't handled by the exception-based approach).
     if (has_valid_pe && !header_wiped)
     {
         int forced = force_code_pages_in_memory(
@@ -12168,10 +12403,6 @@ tool_result_t driver_dump_module(const json& params)
 
     if (!code_sections.empty())
     {
-        constexpr int MAX_DECRYPT_ROUNDS = 8;
-        constexpr int MIN_RECOVERY_PER_ROUND = 1;
-
-
         std::vector<std::size_t> encrypted_pages;
         for (const auto& cs : code_sections)
         {
@@ -12198,38 +12429,72 @@ tool_result_t driver_dump_module(const json& params)
 
         if (!encrypted_pages.empty())
         {
-            int total_recovered_pages = 0;
-            msg(OBFSTR_C("AiDA: Found %zu potentially encrypted code pages, starting decrypt retry loop...\n"),
-                encrypted_pages.size());
-
-            for (int round = 0; round < MAX_DECRYPT_ROUNDS; round++)
+            int decrypt_timeout_s = 0;
+            if (params.contains("decrypt_timeout"))
             {
-                replace_wait_box("HIDECANCEL\nAiDA: Decrypt retry round %d/%d — %zu pages remaining...",
-                                 round + 1, MAX_DECRYPT_ROUNDS, encrypted_pages.size());
-
-
-                DWORD backoff_ms = static_cast<DWORD>(50u << round);
-                if (backoff_ms > 6400) backoff_ms = 6400;
-
-
-                if (!suspended_tids.empty() && round > 0)
+                if (params["decrypt_timeout"].is_number())
+                    decrypt_timeout_s = params["decrypt_timeout"].get<int>();
+                else if (params["decrypt_timeout"].is_string())
                 {
-                    for (std::uint32_t tid : suspended_tids)
-                        device->resume_thread(tid);
-                    Sleep(backoff_ms);
-                    for (std::uint32_t tid : suspended_tids)
-                    {
-                        std::uint32_t prev = 0;
-                        device->suspend_thread(tid, &prev);
-                    }
+                    try { decrypt_timeout_s = std::stoi(params["decrypt_timeout"].get<std::string>()); }
+                    catch (...) {}
                 }
-                else
+            }
+            if (decrypt_timeout_s <= 0)
+            {
+                // Shellcode-based decryption should have already triggered all pages.
+                // This polling is just a safety net — keep timeout short.
+                decrypt_timeout_s = 10 + static_cast<int>(encrypted_pages.size()) / 256;
+                if (decrypt_timeout_s > 30) decrypt_timeout_s = 30;
+            }
+
+            int initial_encrypted = static_cast<int>(encrypted_pages.size());
+            int total_recovered_pages = 0;
+            msg(OBFSTR_C("AiDA: Found %d encrypted code pages — continuous decrypt polling (timeout %ds)...\n"),
+                initial_encrypted, decrypt_timeout_s);
+
+            thread_guard.resume();
+            log("decrypt_resume", true, "Threads resumed for continuous decrypt polling (" +
+                std::to_string(decrypt_timeout_s) + "s timeout, " +
+                std::to_string(initial_encrypted) + " encrypted pages)");
+
+            Sleep(500);
+
+            DWORD poll_start = GetTickCount();
+            DWORD last_progress = poll_start;
+            DWORD last_dtb_refresh = 0;
+            constexpr DWORD STALL_TIMEOUT = 10000;
+            constexpr DWORD POLL_SLEEP = 200;
+            constexpr DWORD DTB_REFRESH_INTERVAL = 5000;
+
+            while (!encrypted_pages.empty())
+            {
+                DWORD now = GetTickCount();
+                DWORD elapsed = now - poll_start;
+
+                if (elapsed >= static_cast<DWORD>(decrypt_timeout_s) * 1000)
                 {
-                    Sleep(backoff_ms);
+                    msg(OBFSTR_C("AiDA: Decrypt polling timeout reached (%ds)\n"), decrypt_timeout_s);
+                    break;
                 }
 
+                if (now - last_progress >= STALL_TIMEOUT && total_recovered_pages > 0)
+                {
+                    msg(OBFSTR_C("AiDA: No decrypt progress for %ds, stopping\n"), STALL_TIMEOUT / 1000);
+                    break;
+                }
 
-                device->solve_dtb();
+                if (now - last_dtb_refresh >= DTB_REFRESH_INTERVAL)
+                {
+                    device->solve_dtb();
+                    last_dtb_refresh = now;
+                }
+
+                replace_wait_box(
+                    "HIDECANCEL\nAiDA: Decrypt polling — %zu/%d pages remaining, "
+                    "%d recovered (%.0fs / %ds)...",
+                    encrypted_pages.size(), initial_encrypted,
+                    total_recovered_pages, elapsed / 1000.0, decrypt_timeout_s);
 
                 int round_recovered = 0;
                 std::vector<std::size_t> still_encrypted;
@@ -12277,20 +12542,32 @@ tool_result_t driver_dump_module(const json& params)
                 total_recovered_pages += round_recovered;
                 encrypted_pages = std::move(still_encrypted);
 
-                msg(OBFSTR_C("AiDA: Decrypt round %d: recovered %d pages, %zu remaining\n"),
-                    round + 1, round_recovered, encrypted_pages.size());
+                if (round_recovered > 0)
+                {
+                    last_progress = GetTickCount();
+                    msg(OBFSTR_C("AiDA: Decrypt poll: +%d pages (%d/%d total), %zu remaining\n"),
+                        round_recovered, total_recovered_pages, initial_encrypted,
+                        encrypted_pages.size());
+                }
 
                 if (encrypted_pages.empty())
                     break;
-                if (round_recovered < MIN_RECOVERY_PER_ROUND && round > 0)
-                    break;
+
+                Sleep(POLL_SLEEP);
             }
 
             if (total_recovered_pages > 0)
             {
-                log("decrypt_retry", true, std::to_string(total_recovered_pages) + " encrypted pages recovered, " +
+                log("decrypt_poll", true, std::to_string(total_recovered_pages) + "/" +
+                    std::to_string(initial_encrypted) + " encrypted pages recovered, " +
                     std::to_string(encrypted_pages.size()) + " still encrypted");
-                msg(OBFSTR_C("AiDA: Decrypt retry total: %d pages recovered\n"), total_recovered_pages);
+                msg(OBFSTR_C("AiDA: Decrypt polling complete: %d/%d pages recovered\n"),
+                    total_recovered_pages, initial_encrypted);
+            }
+            else
+            {
+                log("decrypt_poll", false, std::to_string(encrypted_pages.size()) +
+                    " pages remain encrypted after " + std::to_string(decrypt_timeout_s) + "s polling");
             }
         }
     }
@@ -13328,7 +13605,7 @@ tool_result_t driver_dump_kernel_module(const json& params)
                 " - anti-cheat header erasure detected. Will synthesize PE header.");
         }
 
-        // --- Pre-dump protection analysis (kernel mode) ---
+
         protection_analysis_t kd_protection = analyze_module_protection(
             device.get(), base_addr, header_buf.data(), header_read,
             has_valid_pe, header_wiped, pe_off, num_sections,
@@ -15513,7 +15790,8 @@ void register_tools()
           OBFSTR("Module base address (default: attached process image base)"), false},
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Override image size in bytes (default: auto from PE header)"), false},
          {OBFSTR("output_path"), OBFSTR("string"), OBFSTR("Save dump to file path (e.g. 'C:\\\\dump.bin')"), false},
-         {OBFSTR("patch_idb"), OBFSTR("boolean"), OBFSTR("Patch dumped bytes into IDA database (default true)"), false}},
+         {OBFSTR("patch_idb"), OBFSTR("boolean"), OBFSTR("Patch dumped bytes into IDA database (default true)"), false},
+         {OBFSTR("decrypt_timeout"), OBFSTR("number"), OBFSTR("Seconds to spend polling encrypted code pages (default: auto-scaled). Set higher for large encrypted binaries."), false}},
         driver_dump_module, false});
 
     registry.register_tool({
