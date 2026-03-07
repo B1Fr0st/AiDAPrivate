@@ -23,6 +23,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include "graphrag.hpp"
+
+#include <vector>
+
 class aida_plugin_t;
 class AiDAChatPanel;
 
@@ -45,6 +49,7 @@ protected:
 private:
     void build_ui();
     void apply_theme();
+    void refresh_header_badge_layout();
     void queue_visual_refresh();
     void refresh_all_tabs();
     void refresh_header();
@@ -84,6 +89,10 @@ private:
 
     void refresh_graph_tab();
     void refresh_graph_search_results(const nlohmann::json& results);
+    void refresh_graph_visualization(ea_t focus_ea = BADADDR, const std::vector<ea_t>& explicit_addresses = {});
+    void rebuild_graph_scene(const std::vector<ea_t>& addresses = {}, ea_t focus_ea = BADADDR);
+    void show_graph_node_details(ea_t address);
+    std::vector<graphrag::edge_type_t> selected_graph_edge_types() const;
     void index_current_function();
     void reindex_binary();
     void run_graph_security_overview();
@@ -131,8 +140,16 @@ private:
     QPushButton*   m_actionCopyBtn;
 
     QLabel*        m_graphContextLabel;
+    QLabel*        m_graphStatusLabel;
     QLabel*        m_graphStatsLabel;
+    QGraphicsView* m_graphView;
+    QGraphicsScene* m_graphScene;
     QTextBrowser*  m_graphOverviewBrowser;
+    QSpinBox*      m_graphHopsSpin;
+    QCheckBox*     m_graphCallsCheck;
+    QCheckBox*     m_graphVulnCheck;
+    QCheckBox*     m_graphNetworkCheck;
+    QLabel*        m_graphZoomLabel;
     QLineEdit*     m_graphSearchEdit;
     QSpinBox*      m_graphLimitSpin;
     QTableWidget*  m_graphResultsTable;
@@ -141,6 +158,7 @@ private:
     QPushButton*   m_graphSecurityBtn;
     QPushButton*   m_graphCommunitiesBtn;
     QPushButton*   m_graphNetworkBtn;
+    ea_t           m_graphSelectedEa;
 
     QLabel*        m_ragContextLabel;
     QTextBrowser*  m_ragContextBrowser;

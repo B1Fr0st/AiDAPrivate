@@ -16,7 +16,10 @@
 #undef emit
 #endif
 
+#include <cmath>
 #include <limits>
+#include <queue>
+#include <unordered_map>
 
 #include "aida_pro.hpp"
 #include "workbench.hpp"
@@ -25,7 +28,6 @@
 #include "actions.hpp"
 #include "chat_widget_ui.hpp"
 #include "graphrag.hpp"
-#include "rlhf.hpp"
 #include "ui.hpp"
 
 namespace
@@ -133,25 +135,13 @@ struct workbench_theme_t
     QColor link;
 };
 
-static QPalette resolve_workbench_palette(const QWidget* widget)
-{
-    const QWidget* current = widget;
-    while (current != nullptr)
-    {
-        const QPalette pal = current->palette();
-        const QColor window = pal.color(QPalette::Window);
-        const QColor base = pal.color(QPalette::Base);
-        if (window.isValid() && base.isValid())
-            return pal;
-        current = current->parentWidget();
-    }
-    return QApplication::palette();
-}
-
 static workbench_theme_t detect_workbench_theme(const QWidget* widget)
 {
     workbench_theme_t theme;
-    const QPalette palette = resolve_workbench_palette(widget);
+    const QWidget* palette_source = widget != nullptr && widget->parentWidget() != nullptr
+        ? widget->parentWidget()
+        : widget;
+    const QPalette palette = palette_source != nullptr ? palette_source->palette() : QApplication::palette();
 
     const QColor window = palette.color(QPalette::Window);
     const QColor base = palette.color(QPalette::Base);
@@ -159,8 +149,6 @@ static workbench_theme_t detect_workbench_theme(const QWidget* widget)
     const QColor button_text = palette.color(QPalette::ButtonText);
     const QColor window_text = palette.color(QPalette::WindowText);
     const QColor text = palette.color(QPalette::Text);
-    const QColor mid = palette.color(QPalette::Mid);
-    const QColor alternate = palette.color(QPalette::AlternateBase);
     const QColor highlight = palette.color(QPalette::Highlight);
     const QColor highlighted_text = palette.color(QPalette::HighlightedText);
     const QColor link = palette.color(QPalette::Link);
@@ -169,45 +157,77 @@ static workbench_theme_t detect_workbench_theme(const QWidget* widget)
     theme.window_bg = window;
     theme.base_bg = base;
     theme.text_primary = window_text.isValid() ? window_text : (text.isValid() ? text : (theme.is_dark ? QColor(236, 241, 247) : QColor(29, 37, 47)));
-    theme.text_secondary = blend_color(theme.text_primary, window, theme.is_dark ? 0.38 : 0.52);
+    theme.text_secondary = blend_color(theme.text_primary, window, theme.is_dark ? 0.28 : 0.44);
     theme.accent = highlight.isValid()
         ? highlight
         : (theme.is_dark ? QColor(84, 164, 255) : QColor(51, 123, 214));
     theme.link = link.isValid() ? link : theme.accent;
 
-    const QColor border = mid.isValid()
-        ? mid
-        : blend_color(window, theme.text_primary, theme.is_dark ? 0.28 : 0.18);
-    const QColor secondary_surface = alternate.isValid()
-        ? alternate
-        : blend_color(base, button.isValid() ? button : window, 0.5);
-    const QColor button_surface = button.isValid()
-        ? button
-        : blend_color(window, base, 0.55);
     const QColor button_text_color = button_text.isValid() ? button_text : theme.text_primary;
     const QColor selected_text = highlighted_text.isValid() ? highlighted_text : button_text_color;
 
-    theme.panel_bg = window;
-    theme.header_bg = button_surface;
-    theme.header_border = border;
-    theme.elevated_bg = secondary_surface;
-    theme.accent_soft = blend_color(button_surface, theme.accent, theme.is_dark ? 0.12 : 0.08);
-    theme.accent_border = blend_color(border, theme.accent, theme.is_dark ? 0.34 : 0.26);
-    theme.button_primary = button_surface;
-    theme.button_primary_hover = blend_color(button_surface, theme.accent, theme.is_dark ? 0.12 : 0.08);
-    theme.button_primary_pressed = blend_color(button_surface, theme.accent, theme.is_dark ? 0.20 : 0.14);
-    theme.button_primary_text = button_text_color;
-    theme.button_secondary_bg = button_surface;
-    theme.button_secondary_text = button_text_color;
-    theme.button_secondary_hover = blend_color(button_surface, secondary_surface, 0.55);
-    theme.button_border = border;
-    theme.tab_bg = button_surface;
-    theme.tab_hover = blend_color(button_surface, secondary_surface, 0.52);
-    theme.tab_selected = base;
-    theme.input_bg = base;
-    theme.input_border = border;
-    theme.selection_bg = highlight.isValid() ? highlight : blend_color(theme.accent, window, 0.35);
-    theme.selection_text = selected_text.isValid() ? selected_text : theme.text_primary;
+    if (theme.is_dark)
+    {
+        const QColor panel = blend_color(window, QColor(24, 24, 24), 0.72);
+        const QColor elevated = blend_color(panel, QColor(38, 38, 38), 0.58);
+        const QColor border = blend_color(panel, QColor(72, 72, 72), 0.74);
+        const QColor bright_accent = blend_color(theme.accent, QColor(235, 235, 235), 0.12);
+
+        theme.panel_bg = panel;
+        theme.base_bg = blend_color(base, panel, 0.66);
+        theme.header_bg = blend_color(panel, QColor(18, 18, 18), 0.56);
+        theme.header_border = border;
+        theme.elevated_bg = elevated;
+        theme.accent_soft = blend_color(bright_accent, panel, 0.82);
+        theme.accent_border = blend_color(border, bright_accent, 0.32);
+        theme.button_primary = blend_color(bright_accent, panel, 0.20);
+        theme.button_primary_hover = blend_color(theme.button_primary, QColor(220, 220, 220), 0.10);
+        theme.button_primary_pressed = blend_color(theme.button_primary, QColor(16, 16, 16), 0.18);
+        theme.button_primary_text = theme.text_primary;
+        theme.button_secondary_bg = QColor(0, 0, 0, 0);
+        theme.button_secondary_text = theme.text_primary;
+        theme.button_secondary_hover = blend_color(panel, elevated, 0.82);
+        theme.button_border = blend_color(panel, border, 0.90);
+        theme.tab_bg = blend_color(theme.header_bg, elevated, 0.44);
+        theme.tab_hover = blend_color(theme.tab_bg, bright_accent, 0.08);
+        theme.tab_selected = blend_color(panel, QColor(44, 44, 44), 0.60);
+        theme.input_bg = elevated;
+        theme.input_border = border;
+        theme.selection_bg = blend_color(bright_accent, QColor(28, 28, 28), 0.36);
+        theme.selection_text = selected_text.isValid() ? selected_text : theme.text_primary;
+        theme.link = blend_color(bright_accent, QColor(245, 245, 245), 0.14);
+    }
+    else
+    {
+        const QColor panel = blend_color(window, QColor(248, 248, 248), 0.78);
+        const QColor elevated = blend_color(panel, QColor(238, 238, 238), 0.62);
+        const QColor border = blend_color(panel, QColor(208, 208, 208), 0.84);
+        const QColor soft_accent = blend_color(theme.accent, QColor(255, 255, 255), 0.30);
+
+        theme.panel_bg = panel;
+        theme.base_bg = blend_color(base, panel, 0.42);
+        theme.header_bg = blend_color(panel, QColor(240, 240, 240), 0.6);
+        theme.header_border = border;
+        theme.elevated_bg = elevated;
+        theme.accent_soft = blend_color(soft_accent, panel, 0.82);
+        theme.accent_border = blend_color(border, soft_accent, 0.20);
+        theme.button_primary = blend_color(soft_accent, QColor(110, 110, 110), 0.20);
+        theme.button_primary_hover = blend_color(theme.button_primary, QColor(255, 255, 255), 0.12);
+        theme.button_primary_pressed = blend_color(theme.button_primary, QColor(50, 50, 50), 0.14);
+        theme.button_primary_text = theme.text_primary;
+        theme.button_secondary_bg = QColor(0, 0, 0, 0);
+        theme.button_secondary_text = theme.text_primary;
+        theme.button_secondary_hover = blend_color(panel, elevated, 0.68);
+        theme.button_border = blend_color(button.isValid() ? button : panel, border, 0.72);
+        theme.tab_bg = blend_color(theme.header_bg, elevated, 0.34);
+        theme.tab_hover = blend_color(theme.tab_bg, soft_accent, 0.10);
+        theme.tab_selected = blend_color(panel, QColor(255, 255, 255), 0.34);
+        theme.input_bg = blend_color(base, elevated, 0.54);
+        theme.input_border = border;
+        theme.selection_bg = highlight.isValid() ? highlight : blend_color(soft_accent, panel, 0.42);
+        theme.selection_text = selected_text.isValid() ? selected_text : theme.text_primary;
+        theme.link = blend_color(theme.accent, QColor(20, 20, 20), 0.12);
+    }
 
     return theme;
 }
@@ -220,7 +240,7 @@ static QString build_html_document(const QString& body, const workbench_theme_t&
         "h1,h2,h3{margin:0 0 8px 0;font-weight:600;color:%1;}"
         ".card{border:1px solid %3;border-radius:10px;padding:12px;margin-bottom:12px;background:%4;}"
         ".muted{color:%5;font-size:9pt;}"
-        "pre{white-space:pre-wrap;font-family:'Cascadia Mono','Consolas',monospace;font-size:9pt;line-height:1.45;margin:0;}"
+        "pre{white-space:pre-wrap;font-family:'Cascadia Mono','Consolas',monospace;font-size:9pt;line-height:1.45;margin:0;color:%1;background:transparent;}"
         "a{color:%6;text-decoration:none;}"
         "table{border-collapse:collapse;width:100%%;}"
         "td,th{padding:6px;border-bottom:1px solid %3;text-align:left;vertical-align:top;}"
@@ -232,6 +252,19 @@ static QString build_html_document(const QString& body, const workbench_theme_t&
         .arg(style_color(theme.text_secondary))
         .arg(style_color(theme.link))
         .arg(body);
+}
+
+static void set_elided_label_text(QLabel* label)
+{
+    if (label == nullptr)
+        return;
+    const QString full_text = label->property("fullText").toString();
+    if (full_text.isEmpty())
+        return;
+    const int available = qMax(24, label->width() - 12);
+    const QString elided = label->fontMetrics().elidedText(full_text, Qt::ElideRight, available);
+    label->setText(elided);
+    label->setToolTip(elided == full_text ? QString() : full_text);
 }
 
 static QString linkify_plain_text(const QString& text)
@@ -316,6 +349,256 @@ static std::string data_path_summary()
     return path.c_str();
 }
 
+class TraversableGraphView : public QGraphicsView
+{
+public:
+    explicit TraversableGraphView(QWidget* parent = nullptr)
+        : QGraphicsView(parent)
+        , m_isPanning(false)
+    {
+        setRenderHints(QPainter::Antialiasing | QPainter::TextAntialiasing | QPainter::SmoothPixmapTransform);
+        setFrameShape(QFrame::NoFrame);
+        setDragMode(QGraphicsView::NoDrag);
+        setTransformationAnchor(QGraphicsView::AnchorUnderMouse);
+        setResizeAnchor(QGraphicsView::AnchorViewCenter);
+        setViewportUpdateMode(QGraphicsView::BoundingRectViewportUpdate);
+    }
+
+    std::function<void(ea_t)> onNodeSelected;
+    std::function<void(ea_t)> onNodeActivated;
+    std::function<void()> onViewChanged;
+
+protected:
+    void wheelEvent(QWheelEvent* event) override
+    {
+        const qreal factor = event->angleDelta().y() >= 0 ? 1.15 : (1.0 / 1.15);
+        scale(factor, factor);
+        if (onViewChanged)
+            onViewChanged();
+        event->accept();
+    }
+
+    void mousePressEvent(QMouseEvent* event) override
+    {
+        if (event->button() == Qt::MiddleButton || (event->button() == Qt::LeftButton && (event->modifiers() & Qt::AltModifier)))
+        {
+            m_isPanning = true;
+            m_lastPanPos = event->pos();
+            setCursor(Qt::ClosedHandCursor);
+            event->accept();
+            return;
+        }
+
+        if (event->button() == Qt::LeftButton && onNodeSelected)
+        {
+            ea_t address = address_for_item(itemAt(event->pos()));
+            if (address != BADADDR)
+                onNodeSelected(address);
+        }
+
+        QGraphicsView::mousePressEvent(event);
+    }
+
+    void mouseMoveEvent(QMouseEvent* event) override
+    {
+        if (!m_isPanning)
+        {
+            QGraphicsView::mouseMoveEvent(event);
+            return;
+        }
+
+        const QPoint delta = event->pos() - m_lastPanPos;
+        m_lastPanPos = event->pos();
+        horizontalScrollBar()->setValue(horizontalScrollBar()->value() - delta.x());
+        verticalScrollBar()->setValue(verticalScrollBar()->value() - delta.y());
+        event->accept();
+    }
+
+    void mouseReleaseEvent(QMouseEvent* event) override
+    {
+        if (m_isPanning && (event->button() == Qt::MiddleButton || event->button() == Qt::LeftButton))
+        {
+            m_isPanning = false;
+            unsetCursor();
+            event->accept();
+            return;
+        }
+
+        QGraphicsView::mouseReleaseEvent(event);
+    }
+
+    void mouseDoubleClickEvent(QMouseEvent* event) override
+    {
+        if (event->button() == Qt::LeftButton && onNodeActivated)
+        {
+            ea_t address = address_for_item(itemAt(event->pos()));
+            if (address != BADADDR)
+            {
+                onNodeActivated(address);
+                event->accept();
+                return;
+            }
+        }
+
+        QGraphicsView::mouseDoubleClickEvent(event);
+    }
+
+private:
+    static ea_t address_for_item(QGraphicsItem* item)
+    {
+        while (item != nullptr)
+        {
+            const QVariant data = item->data(0);
+            if (data.isValid())
+                return static_cast<ea_t>(data.toULongLong());
+            item = item->parentItem();
+        }
+        return BADADDR;
+    }
+
+    bool m_isPanning;
+    QPoint m_lastPanPos;
+};
+
+static QString graph_node_label(const graphrag::graph_node_t* node)
+{
+    if (node == nullptr)
+        return QStringLiteral("unknown");
+    QString label = to_qstring(node->name);
+    if (label.isEmpty())
+        label = format_ea(node->address);
+    if (label.size() > 28)
+        label = label.left(25) + QStringLiteral("...");
+    return label;
+}
+
+struct graph_edge_style_t
+{
+    QColor color;
+    qreal width;
+    Qt::PenStyle pen_style;
+    QString label;
+};
+
+static graph_edge_style_t graph_edge_style(graphrag::edge_type_t type)
+{
+    switch (type)
+    {
+    case graphrag::edge_type_t::CALLS:
+        return {QColor(QStringLiteral("#22d3ee")), 1.6, Qt::SolidLine, QStringLiteral("calls")};
+    case graphrag::edge_type_t::REFERENCES:
+        return {QColor(QStringLiteral("#60a5fa")), 1.4, Qt::DashLine, QStringLiteral("references")};
+    case graphrag::edge_type_t::CALLS_VULNERABLE:
+        return {QColor(QStringLiteral("#dc2626")), 1.7, Qt::SolidLine, QStringLiteral("calls-vuln")};
+    case graphrag::edge_type_t::NETWORK_SEND:
+        return {QColor(QStringLiteral("#06b6d4")), 1.6, Qt::SolidLine, QStringLiteral("network-send")};
+    case graphrag::edge_type_t::NETWORK_RECV:
+        return {QColor(QStringLiteral("#06b6d4")), 1.6, Qt::SolidLine, QStringLiteral("network-recv")};
+    case graphrag::edge_type_t::TAINT_FLOWS_TO:
+        return {QColor(QStringLiteral("#f97316")), 1.7, Qt::SolidLine, QStringLiteral("taint-flow")};
+    case graphrag::edge_type_t::VULNERABLE_VIA:
+        return {QColor(QStringLiteral("#ea580c")), 1.7, Qt::SolidLine, QStringLiteral("vulnerable-via")};
+    default:
+        return {QColor(QStringLiteral("#94a3b8")), 1.3, Qt::SolidLine, QStringLiteral("edge")};
+    }
+}
+
+static void add_graph_arrowhead(QGraphicsScene* scene, const QPointF& start, const QPointF& end, const QColor& color)
+{
+    const qreal dx = end.x() - start.x();
+    const qreal dy = end.y() - start.y();
+    const qreal length = std::sqrt(dx * dx + dy * dy);
+    if (length <= 0.001)
+        return;
+
+    const qreal ux = dx / length;
+    const qreal uy = dy / length;
+    const qreal arrow_size = 7.0;
+    const QPointF left(
+        end.x() - arrow_size * ux + (arrow_size * 0.55) * uy,
+        end.y() - arrow_size * uy - (arrow_size * 0.55) * ux);
+    const QPointF right(
+        end.x() - arrow_size * ux - (arrow_size * 0.55) * uy,
+        end.y() - arrow_size * uy + (arrow_size * 0.55) * ux);
+
+    QPolygonF polygon;
+    polygon << end << left << right;
+    QGraphicsPolygonItem* arrow = scene->addPolygon(polygon, QPen(color), QBrush(color));
+    arrow->setZValue(0.8);
+}
+
+static void add_graph_edge_label(QGraphicsScene* scene, const QPointF& center, const QString& label, const QColor& color)
+{
+    QFont font(QStringLiteral("Segoe UI"));
+    font.setPointSize(6);
+    QGraphicsTextItem* text = scene->addText(label, font);
+    text->setDefaultTextColor(color);
+    const QRectF bounds = text->boundingRect();
+    text->setPos(center.x() - bounds.width() / 2.0, center.y() - bounds.height() / 2.0);
+    text->setZValue(0.75);
+}
+
+static QRectF add_graph_node_item(
+    QGraphicsScene* scene,
+    const graphrag::graph_node_t* node,
+    const QPointF& center,
+    const QColor& fill,
+    const QColor& stroke,
+    const QColor& text_color,
+    bool emphasized)
+{
+    QFont title_font(QStringLiteral("Segoe UI"));
+    title_font.setPointSize(emphasized ? 9 : 8);
+    title_font.setBold(true);
+    QFontMetricsF title_metrics(title_font);
+
+    const QString label = graph_node_label(node);
+    const QString subtitle = format_ea(node != nullptr ? node->address : BADADDR);
+    const bool is_high_risk = node != nullptr && (node->risk_level == "HIGH" || node->risk_level == "CRITICAL");
+    const qreal width = qBound<qreal>(150.0, title_metrics.horizontalAdvance(label) + 34.0, 260.0);
+    const qreal height = emphasized ? 62.0 : (is_high_risk ? 58.0 : 52.0);
+    const QRectF rect(center.x() - width / 2.0, center.y() - height / 2.0, width, height);
+
+    QPainterPath path;
+    path.addRoundedRect(rect, emphasized ? 14.0 : 12.0, emphasized ? 14.0 : 12.0);
+    QGraphicsPathItem* shape = scene->addPath(path, QPen(stroke, emphasized ? 2.2 : 1.5), QBrush(fill));
+    shape->setZValue(1.0);
+    if (node != nullptr)
+        shape->setData(0, QVariant::fromValue<qulonglong>(static_cast<qulonglong>(node->address)));
+
+    QGraphicsTextItem* title = scene->addText(label, title_font);
+    title->setDefaultTextColor(text_color);
+    title->setPos(rect.x() + 12.0, rect.y() + 7.0);
+    title->setTextWidth(rect.width() - 24.0);
+    title->setZValue(2.0);
+    if (node != nullptr)
+        title->setData(0, QVariant::fromValue<qulonglong>(static_cast<qulonglong>(node->address)));
+
+    QFont subtitle_font(QStringLiteral("Segoe UI"));
+    subtitle_font.setPointSize(7);
+    QGraphicsTextItem* subtitle_item = scene->addText(subtitle, subtitle_font);
+    subtitle_item->setDefaultTextColor(blend_color(text_color, fill, 0.28));
+    subtitle_item->setPos(rect.x() + 12.0, rect.bottom() - 18.0);
+    subtitle_item->setZValue(2.0);
+    if (node != nullptr)
+        subtitle_item->setData(0, QVariant::fromValue<qulonglong>(static_cast<qulonglong>(node->address)));
+
+    if (is_high_risk)
+    {
+        QFont tag_font(QStringLiteral("Segoe UI"));
+        tag_font.setPointSize(6);
+        tag_font.setBold(true);
+        QGraphicsTextItem* tag = scene->addText(QStringLiteral("[VULN]"), tag_font);
+        tag->setDefaultTextColor(QColor(QStringLiteral("#fca5a5")));
+        tag->setPos(rect.right() - 42.0, rect.bottom() - 18.0);
+        tag->setZValue(2.0);
+        if (node != nullptr)
+            tag->setData(0, QVariant::fromValue<qulonglong>(static_cast<qulonglong>(node->address)));
+    }
+
+    return rect;
+}
+
 }
 
 AiDAWorkbenchPanel::AiDAWorkbenchPanel(
@@ -353,8 +636,16 @@ AiDAWorkbenchPanel::AiDAWorkbenchPanel(
     , m_actionFixBtn(nullptr)
     , m_actionCopyBtn(nullptr)
     , m_graphContextLabel(nullptr)
+    , m_graphStatusLabel(nullptr)
     , m_graphStatsLabel(nullptr)
+    , m_graphView(nullptr)
+    , m_graphScene(nullptr)
     , m_graphOverviewBrowser(nullptr)
+    , m_graphHopsSpin(nullptr)
+    , m_graphCallsCheck(nullptr)
+    , m_graphVulnCheck(nullptr)
+    , m_graphNetworkCheck(nullptr)
+    , m_graphZoomLabel(nullptr)
     , m_graphSearchEdit(nullptr)
     , m_graphLimitSpin(nullptr)
     , m_graphResultsTable(nullptr)
@@ -363,6 +654,7 @@ AiDAWorkbenchPanel::AiDAWorkbenchPanel(
     , m_graphSecurityBtn(nullptr)
     , m_graphCommunitiesBtn(nullptr)
     , m_graphNetworkBtn(nullptr)
+    , m_graphSelectedEa(BADADDR)
     , m_ragContextLabel(nullptr)
     , m_ragContextBrowser(nullptr)
     , m_ragQueryEdit(nullptr)
@@ -428,10 +720,14 @@ void AiDAWorkbenchPanel::build_ui()
 
     m_headerProviderLabel = new QLabel(header);
     m_headerProviderLabel->setObjectName(QStringLiteral("workbenchBadge"));
+    m_headerProviderLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    m_headerProviderLabel->setMinimumWidth(0);
     headerLayout->addWidget(m_headerProviderLabel);
 
     m_headerGraphLabel = new QLabel(header);
     m_headerGraphLabel->setObjectName(QStringLiteral("workbenchBadgeSecondary"));
+    m_headerGraphLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    m_headerGraphLabel->setMinimumWidth(0);
     headerLayout->addWidget(m_headerGraphLabel);
 
     QPushButton* refreshBtn = new QPushButton(QStringLiteral("Refresh"), header);
@@ -486,6 +782,7 @@ void AiDAWorkbenchPanel::apply_theme()
         "QPushButton:hover { background:%10; border-color:%6; }"
         "QPushButton:pressed { background:%12; }"
         "QLineEdit, QSpinBox, QTextEdit, QPlainTextEdit, QTextBrowser, QTableWidget { background:%13; color:%2; border:1px solid %4; border-radius:8px; }"
+        "QGraphicsView { background:%13; border:1px solid %4; border-radius:8px; }"
         "QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus { border-color:%6; }"
         "QHeaderView::section { background:%7; color:%5; border:0; border-bottom:1px solid %4; padding:6px; font-weight:600; }"
         "QTableWidget { gridline-color:%4; }"
@@ -544,6 +841,7 @@ bool AiDAWorkbenchPanel::event(QEvent* event)
         || type == QEvent::PaletteChange
         || type == QEvent::ApplicationPaletteChange
         || type == QEvent::StyleChange;
+    const bool resized = type == QEvent::Resize;
 
     const bool result = QWidget::event(event);
 
@@ -552,6 +850,9 @@ bool AiDAWorkbenchPanel::event(QEvent* event)
         apply_theme();
         queue_visual_refresh();
     }
+
+    if (visual_change || resized)
+        refresh_header_badge_layout();
 
     return result;
 }
@@ -607,21 +908,32 @@ void AiDAWorkbenchPanel::refresh_header()
     const std::string model_name = current_model_name();
     if (!model_name.empty())
         provider += QStringLiteral(" / %1").arg(to_qstring(model_name));
+    m_headerProviderLabel->setProperty("fullText", provider);
     m_headerProviderLabel->setText(provider);
 
     if (!m_binaryHash.empty())
     {
         auto stats = graphrag::GraphStore::instance().get_stats(m_binaryHash);
-        m_headerGraphLabel->setText(
-            QStringLiteral("Graph %1 nodes / %2 edges / %3 communities")
+        const QString graph_summary = QStringLiteral("Graph %1 nodes / %2 edges / %3 communities")
                 .arg(stats.nodes)
                 .arg(stats.edges)
-                .arg(stats.communities));
+                .arg(stats.communities);
+        m_headerGraphLabel->setProperty("fullText", graph_summary);
+        m_headerGraphLabel->setText(graph_summary);
     }
     else
     {
+        m_headerGraphLabel->setProperty("fullText", QStringLiteral("Graph unavailable"));
         m_headerGraphLabel->setText(QStringLiteral("Graph unavailable"));
     }
+
+    refresh_header_badge_layout();
+}
+
+void AiDAWorkbenchPanel::refresh_header_badge_layout()
+{
+    set_elided_label_text(m_headerProviderLabel);
+    set_elided_label_text(m_headerGraphLabel);
 }
 
 void AiDAWorkbenchPanel::set_busy_button(QPushButton* button, bool busy, const QString& busy_text, const QString& idle_text)
@@ -1238,20 +1550,105 @@ void AiDAWorkbenchPanel::build_graph_tab()
     m_graphStatsLabel = new QLabel(tab);
     layout->addWidget(m_graphStatsLabel);
 
-    QSplitter* splitter = new QSplitter(Qt::Vertical, tab);
-    m_graphOverviewBrowser = new QTextBrowser(splitter);
+    QFrame* graphFrame = new QFrame(tab);
+    graphFrame->setObjectName(QStringLiteral("graphFrame"));
+    QVBoxLayout* graphLayout = new QVBoxLayout(graphFrame);
+    graphLayout->setContentsMargins(10, 10, 10, 10);
+    graphLayout->setSpacing(8);
+
+    QHBoxLayout* graphControls = new QHBoxLayout();
+    QLabel* graphTitle = new QLabel(QStringLiteral("Visual Graph"), graphFrame);
+    graphTitle->setObjectName(QStringLiteral("graphTitle"));
+    graphControls->addWidget(graphTitle);
+
+    m_graphStatusLabel = new QLabel(QStringLiteral("Awaiting graph data"), graphFrame);
+    m_graphStatusLabel->setObjectName(QStringLiteral("graphStatusLabel"));
+    graphControls->addWidget(m_graphStatusLabel);
+
+    graphControls->addSpacing(10);
+    graphControls->addWidget(new QLabel(QStringLiteral("N-Hops"), graphFrame));
+    m_graphHopsSpin = new QSpinBox(graphFrame);
+    m_graphHopsSpin->setRange(1, 5);
+    m_graphHopsSpin->setValue(2);
+    m_graphHopsSpin->setToolTip(QStringLiteral("How many graph hops to expand around the selected function."));
+    graphControls->addWidget(m_graphHopsSpin);
+
+    m_graphCallsCheck = new QCheckBox(QStringLiteral("CALLS"), graphFrame);
+    m_graphCallsCheck->setChecked(true);
+    graphControls->addWidget(m_graphCallsCheck);
+
+    m_graphVulnCheck = new QCheckBox(QStringLiteral("VULN"), graphFrame);
+    m_graphVulnCheck->setChecked(true);
+    graphControls->addWidget(m_graphVulnCheck);
+
+    m_graphNetworkCheck = new QCheckBox(QStringLiteral("NETWORK"), graphFrame);
+    m_graphNetworkCheck->setChecked(true);
+    graphControls->addWidget(m_graphNetworkCheck);
+
+    graphControls->addStretch();
+
+    QPushButton* zoomOutBtn = new QPushButton(QStringLiteral("-"), graphFrame);
+    zoomOutBtn->setFixedWidth(28);
+    graphControls->addWidget(zoomOutBtn);
+
+    m_graphZoomLabel = new QLabel(QStringLiteral("100%"), graphFrame);
+    m_graphZoomLabel->setMinimumWidth(52);
+    m_graphZoomLabel->setAlignment(Qt::AlignCenter);
+    graphControls->addWidget(m_graphZoomLabel);
+
+    QPushButton* zoomInBtn = new QPushButton(QStringLiteral("+"), graphFrame);
+    zoomInBtn->setFixedWidth(28);
+    graphControls->addWidget(zoomInBtn);
+
+    QPushButton* fitBtn = new QPushButton(QStringLiteral("Fit"), graphFrame);
+    graphControls->addWidget(fitBtn);
+
+    QPushButton* refreshBtn = new QPushButton(QStringLiteral("Refresh"), graphFrame);
+    graphControls->addWidget(refreshBtn);
+
+    graphLayout->addLayout(graphControls);
+
+    QSplitter* splitter = new QSplitter(Qt::Vertical, graphFrame);
+    TraversableGraphView* graphView = new TraversableGraphView(splitter);
+    m_graphView = graphView;
+    m_graphScene = new QGraphicsScene(graphView);
+    m_graphView->setScene(m_graphScene);
+    m_graphView->setMinimumHeight(360);
+    graphView->setObjectName(QStringLiteral("semanticGraphView"));
+    graphView->onNodeSelected = [this](ea_t address) {
+        m_graphSelectedEa = address;
+        show_graph_node_details(address);
+    };
+    graphView->onNodeActivated = [this](ea_t address) {
+        jumpto(address);
+        m_graphSelectedEa = address;
+        show_graph_node_details(address);
+    };
+    graphView->onViewChanged = [this]() {
+        if (m_graphView == nullptr || m_graphZoomLabel == nullptr)
+            return;
+        m_graphZoomLabel->setText(QStringLiteral("%1%").arg(qRound(m_graphView->transform().m11() * 100.0)));
+    };
+    splitter->addWidget(m_graphView);
+
+    QWidget* lowerPane = new QWidget(splitter);
+    QHBoxLayout* lowerLayout = new QHBoxLayout(lowerPane);
+    lowerLayout->setContentsMargins(0, 0, 0, 0);
+    lowerLayout->setSpacing(8);
+
+    m_graphOverviewBrowser = new QTextBrowser(lowerPane);
     m_graphOverviewBrowser->setOpenLinks(false);
     QObject::connect(m_graphOverviewBrowser, &QTextBrowser::anchorClicked, [this](const QUrl& url) { handle_browser_link(url); });
-    splitter->addWidget(m_graphOverviewBrowser);
+    lowerLayout->addWidget(m_graphOverviewBrowser, 3);
 
-    QWidget* searchPane = new QWidget(splitter);
+    QWidget* searchPane = new QWidget(lowerPane);
     QVBoxLayout* searchLayout = new QVBoxLayout(searchPane);
     searchLayout->setContentsMargins(0, 0, 0, 0);
     searchLayout->setSpacing(6);
 
     QHBoxLayout* searchControls = new QHBoxLayout();
     m_graphSearchEdit = new QLineEdit(searchPane);
-    m_graphSearchEdit->setPlaceholderText(QStringLiteral("Search semantic graph..."));
+    m_graphSearchEdit->setPlaceholderText(QStringLiteral("Search graph..."));
     QObject::connect(m_graphSearchEdit, &QLineEdit::returnPressed, [this]() { run_graph_search(); });
     searchControls->addWidget(m_graphSearchEdit, 1);
 
@@ -1283,13 +1680,47 @@ void AiDAWorkbenchPanel::build_graph_tab()
             jumpto(ea);
     });
     searchLayout->addWidget(m_graphResultsTable, 1);
+    lowerLayout->addWidget(searchPane, 2);
 
-    splitter->addWidget(searchPane);
-    splitter->setStretchFactor(0, 2);
-    splitter->setStretchFactor(1, 1);
-    layout->addWidget(splitter, 1);
+    splitter->addWidget(lowerPane);
+    splitter->setStretchFactor(0, 4);
+    splitter->setStretchFactor(1, 2);
+    graphLayout->addWidget(splitter, 1);
+    layout->addWidget(graphFrame, 1);
 
-    m_tabs->addTab(tab, QStringLiteral("Semantic Graph"));
+    auto refreshGraph = [this]() {
+        refresh_graph_visualization(m_graphSelectedEa != BADADDR ? m_graphSelectedEa : current_function_ea());
+    };
+    QObject::connect(m_graphHopsSpin, qOverload<int>(&QSpinBox::valueChanged), [refreshGraph](int) { refreshGraph(); });
+    QObject::connect(m_graphCallsCheck, &QCheckBox::toggled, [refreshGraph](bool) { refreshGraph(); });
+    QObject::connect(m_graphVulnCheck, &QCheckBox::toggled, [refreshGraph](bool) { refreshGraph(); });
+    QObject::connect(m_graphNetworkCheck, &QCheckBox::toggled, [refreshGraph](bool) { refreshGraph(); });
+    QObject::connect(refreshBtn, &QPushButton::clicked, [refreshGraph]() { refreshGraph(); });
+    QObject::connect(zoomInBtn, &QPushButton::clicked, [this]() {
+        if (m_graphView == nullptr)
+            return;
+        m_graphView->scale(1.15, 1.15);
+        if (m_graphZoomLabel != nullptr)
+            m_graphZoomLabel->setText(QStringLiteral("%1%").arg(qRound(m_graphView->transform().m11() * 100.0)));
+    });
+    QObject::connect(zoomOutBtn, &QPushButton::clicked, [this]() {
+        if (m_graphView == nullptr)
+            return;
+        m_graphView->scale(1.0 / 1.15, 1.0 / 1.15);
+        if (m_graphZoomLabel != nullptr)
+            m_graphZoomLabel->setText(QStringLiteral("%1%").arg(qRound(m_graphView->transform().m11() * 100.0)));
+    });
+    QObject::connect(fitBtn, &QPushButton::clicked, [this]() {
+        if (m_graphView == nullptr || m_graphScene == nullptr)
+            return;
+        const QRectF bounds = m_graphScene->itemsBoundingRect().adjusted(-42.0, -42.0, 42.0, 42.0);
+        if (!bounds.isNull())
+            m_graphView->fitInView(bounds, Qt::KeepAspectRatio);
+        if (m_graphZoomLabel != nullptr)
+            m_graphZoomLabel->setText(QStringLiteral("%1%").arg(qRound(m_graphView->transform().m11() * 100.0)));
+    });
+
+    m_tabs->addTab(tab, QStringLiteral("Graph"));
 }
 
 void AiDAWorkbenchPanel::refresh_graph_tab()
@@ -1298,7 +1729,12 @@ void AiDAWorkbenchPanel::refresh_graph_tab()
 
     if (m_binaryHash.empty())
     {
-        render_text_browser(m_graphOverviewBrowser, "Graph data is unavailable because no input binary hash is active.", QStringLiteral("Semantic Graph"));
+        if (m_graphStatsLabel != nullptr)
+            m_graphStatsLabel->setText(QStringLiteral("Graph unavailable"));
+        if (m_graphStatusLabel != nullptr)
+            m_graphStatusLabel->setText(QStringLiteral("No active graph index"));
+        refresh_graph_visualization();
+        render_text_browser(m_graphOverviewBrowser, "Graph data is unavailable because no input binary hash is active.", QStringLiteral("Graph"));
         return;
     }
 
@@ -1311,15 +1747,7 @@ void AiDAWorkbenchPanel::refresh_graph_tab()
             .arg(stats.stale)
             .arg(stats.communities));
 
-    if (!has_function_context())
-    {
-        render_text_browser(m_graphOverviewBrowser,
-            "Select a function to inspect its callers, callees, taint paths, and semantic summary. Binary-wide search remains available below.",
-            QStringLiteral("Semantic Graph"));
-        return;
-    }
-
-    if (store.get_node_by_address(m_binaryHash, graphrag::node_type_t::FUNCTION, current_function_ea()) == nullptr)
+    if (has_function_context() && store.get_node_by_address(m_binaryHash, graphrag::node_type_t::FUNCTION, current_function_ea()) == nullptr)
     {
         graphrag::StructureExtractor extractor(store);
         extractor.extract_function(current_function_ea(), m_binaryHash);
@@ -1333,15 +1761,373 @@ void AiDAWorkbenchPanel::refresh_graph_tab()
                 .arg(stats.communities));
     }
 
+    if (!has_function_context())
+    {
+        if (m_graphStatusLabel != nullptr)
+            m_graphStatusLabel->setText(QStringLiteral("Showing binary overview"));
+        refresh_graph_visualization();
+        render_text_browser(m_graphOverviewBrowser,
+            "Pan with middle mouse or Alt+drag. Zoom with the mouse wheel. Double-click a node to jump to it in IDA.\n\nUse N-Hops and the edge filters above to reshape the graph, or run a search below to draw a focused graph neighborhood.",
+            QStringLiteral("Graph"));
+        return;
+    }
+
+    if (m_graphStatusLabel != nullptr)
+        m_graphStatusLabel->setText(QStringLiteral("Centered on %1").arg(format_ea(current_function_ea())));
+    refresh_graph_visualization(current_function_ea());
+    show_graph_node_details(current_function_ea());
+}
+
+std::vector<graphrag::edge_type_t> AiDAWorkbenchPanel::selected_graph_edge_types() const
+{
+    std::vector<graphrag::edge_type_t> types;
+    if (m_graphCallsCheck != nullptr && m_graphCallsCheck->isChecked())
+    {
+        types.push_back(graphrag::edge_type_t::CALLS);
+        types.push_back(graphrag::edge_type_t::REFERENCES);
+    }
+    if (m_graphVulnCheck != nullptr && m_graphVulnCheck->isChecked())
+    {
+        types.push_back(graphrag::edge_type_t::CALLS_VULNERABLE);
+        types.push_back(graphrag::edge_type_t::TAINT_FLOWS_TO);
+        types.push_back(graphrag::edge_type_t::VULNERABLE_VIA);
+    }
+    if (m_graphNetworkCheck != nullptr && m_graphNetworkCheck->isChecked())
+    {
+        types.push_back(graphrag::edge_type_t::NETWORK_SEND);
+        types.push_back(graphrag::edge_type_t::NETWORK_RECV);
+    }
+    if (types.empty())
+        types.push_back(graphrag::edge_type_t::CALLS);
+    return types;
+}
+
+void AiDAWorkbenchPanel::refresh_graph_visualization(ea_t focus_ea, const std::vector<ea_t>& explicit_addresses)
+{
+    rebuild_graph_scene(explicit_addresses, focus_ea);
+    if (m_graphView != nullptr && m_graphZoomLabel != nullptr)
+        m_graphZoomLabel->setText(QStringLiteral("%1%").arg(qRound(m_graphView->transform().m11() * 100.0)));
+}
+
+void AiDAWorkbenchPanel::rebuild_graph_scene(const std::vector<ea_t>& addresses, ea_t focus_ea)
+{
+    if (m_graphScene == nullptr)
+        return;
+
+    const workbench_theme_t theme = detect_workbench_theme(this);
+    m_graphScene->clear();
+    const QColor canvas = theme.is_dark
+        ? blend_color(theme.window_bg, QColor(7, 14, 22), 0.78)
+        : blend_color(theme.base_bg, QColor(232, 240, 246), 0.42);
+    m_graphScene->setBackgroundBrush(canvas);
+
+    if (m_binaryHash.empty())
+    {
+        m_graphScene->setSceneRect(QRectF(-280.0, -120.0, 560.0, 240.0));
+        QGraphicsTextItem* msg = m_graphScene->addText(QStringLiteral("Graph data unavailable"));
+        msg->setDefaultTextColor(theme.text_secondary);
+        msg->setPos(-90.0, -10.0);
+        if (m_graphStatusLabel != nullptr)
+            m_graphStatusLabel->setText(QStringLiteral("Graph unavailable"));
+        return;
+    }
+
+    auto& store = graphrag::GraphStore::instance();
+    const std::vector<graphrag::edge_type_t> selected_types = selected_graph_edge_types();
+    const std::vector<graphrag::graph_edge_t*> filtered_edges = store.get_edges_by_types(m_binaryHash, selected_types);
+    std::unordered_map<int, std::vector<graphrag::graph_edge_t*>> outgoing_edges;
+    std::unordered_map<int, std::vector<graphrag::graph_edge_t*>> incoming_edges;
+    for (graphrag::graph_edge_t* edge : filtered_edges)
+    {
+        if (edge == nullptr)
+            continue;
+        outgoing_edges[edge->source_id].push_back(edge);
+        incoming_edges[edge->target_id].push_back(edge);
+    }
+
+    std::vector<int> seed_ids;
+    std::set<int> visited_ids;
+    auto append_seed = [&](graphrag::graph_node_t* node) {
+        if (node == nullptr || node->address == BADADDR || node->node_type != graphrag::node_type_t::FUNCTION)
+            return;
+        if (visited_ids.insert(node->id).second)
+            seed_ids.push_back(node->id);
+    };
+
+    for (ea_t address : addresses)
+        append_seed(store.get_node_by_address(m_binaryHash, graphrag::node_type_t::FUNCTION, address));
+
+    graphrag::graph_node_t* focus_node = store.get_node_by_address(m_binaryHash, graphrag::node_type_t::FUNCTION, focus_ea);
+    if (focus_node != nullptr)
+        append_seed(focus_node);
+
+    if (seed_ids.empty() && has_function_context())
+    {
+        focus_node = store.get_node_by_address(m_binaryHash, graphrag::node_type_t::FUNCTION, current_function_ea());
+        append_seed(focus_node);
+        if (focus_node != nullptr)
+            focus_ea = focus_node->address;
+    }
+
+    if (seed_ids.empty())
+    {
+        auto all_nodes = store.get_nodes_by_type(m_binaryHash, graphrag::node_type_t::FUNCTION);
+        std::vector<std::pair<graphrag::graph_node_t*, int>> ranked;
+        ranked.reserve(all_nodes.size());
+        for (graphrag::graph_node_t* node : all_nodes)
+        {
+            const int degree = static_cast<int>(outgoing_edges[node->id].size() + incoming_edges[node->id].size());
+            ranked.push_back({node, degree});
+        }
+        std::sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) {
+            if (lhs.second != rhs.second)
+                return lhs.second > rhs.second;
+            return lhs.first->name < rhs.first->name;
+        });
+        for (int i = 0; i < static_cast<int>(ranked.size()) && i < 6; ++i)
+            append_seed(ranked[i].first);
+    }
+
+    if (seed_ids.empty())
+    {
+        m_graphScene->setSceneRect(QRectF(-280.0, -120.0, 560.0, 240.0));
+        QGraphicsTextItem* msg = m_graphScene->addText(QStringLiteral("Index functions to populate the graph"));
+        msg->setDefaultTextColor(theme.text_secondary);
+        msg->setPos(-105.0, -10.0);
+        if (m_graphStatusLabel != nullptr)
+            m_graphStatusLabel->setText(QStringLiteral("No indexed function nodes"));
+        return;
+    }
+
+    const int hop_limit = m_graphHopsSpin != nullptr ? m_graphHopsSpin->value() : 2;
+    std::unordered_map<int, int> depth_by_id;
+    std::queue<int> pending;
+    for (int id : seed_ids)
+    {
+        depth_by_id[id] = 0;
+        pending.push(id);
+    }
+
+    while (!pending.empty())
+    {
+        const int current_id = pending.front();
+        pending.pop();
+        const int depth = depth_by_id[current_id];
+        if (depth >= hop_limit)
+            continue;
+
+        auto visit_edge = [&](graphrag::graph_edge_t* edge, int neighbor_id) {
+            graphrag::graph_node_t* neighbor = store.get_node(neighbor_id);
+            if (edge == nullptr || neighbor == nullptr || neighbor->node_type != graphrag::node_type_t::FUNCTION || neighbor->address == BADADDR)
+                return;
+            if (depth_by_id.find(neighbor_id) == depth_by_id.end())
+            {
+                depth_by_id[neighbor_id] = depth + 1;
+                pending.push(neighbor_id);
+            }
+        };
+
+        for (graphrag::graph_edge_t* edge : outgoing_edges[current_id])
+            visit_edge(edge, edge->target_id);
+        for (graphrag::graph_edge_t* edge : incoming_edges[current_id])
+            visit_edge(edge, edge->source_id);
+    }
+
+    std::vector<graphrag::graph_node_t*> nodes_to_draw;
+    nodes_to_draw.reserve(depth_by_id.size());
+    for (const auto& [id, depth] : depth_by_id)
+    {
+        Q_UNUSED(depth);
+        graphrag::graph_node_t* node = store.get_node(id);
+        if (node != nullptr && node->node_type == graphrag::node_type_t::FUNCTION && node->address != BADADDR)
+            nodes_to_draw.push_back(node);
+    }
+
+    if (nodes_to_draw.size() > 24)
+    {
+        std::sort(nodes_to_draw.begin(), nodes_to_draw.end(), [&](const graphrag::graph_node_t* lhs, const graphrag::graph_node_t* rhs) {
+            const int left_depth = depth_by_id[lhs->id];
+            const int right_depth = depth_by_id[rhs->id];
+            if (left_depth != right_depth)
+                return left_depth < right_depth;
+            const int left_degree = static_cast<int>(outgoing_edges[lhs->id].size() + incoming_edges[lhs->id].size());
+            const int right_degree = static_cast<int>(outgoing_edges[rhs->id].size() + incoming_edges[rhs->id].size());
+            return left_degree > right_degree;
+        });
+        nodes_to_draw.resize(24);
+    }
+
+    std::set<int> visible_ids;
+    std::map<ea_t, QRectF> node_rects;
+    std::map<int, QPointF> centers_by_id;
+    for (graphrag::graph_node_t* node : nodes_to_draw)
+        visible_ids.insert(node->id);
+
+    int center_id = 0;
+    if (focus_node != nullptr && visible_ids.count(focus_node->id) != 0)
+        center_id = focus_node->id;
+    else if (!seed_ids.empty())
+        center_id = seed_ids.front();
+
+    if (center_id != 0 && visible_ids.count(center_id) != 0)
+        {
+        graphrag::graph_node_t* center_node = store.get_node(center_id);
+        centers_by_id[center_id] = QPointF(0.0, 0.0);
+        node_rects[center_node->address] = add_graph_node_item(
+            m_graphScene,
+            center_node,
+            QPointF(0.0, 0.0),
+            blend_color(QColor(QStringLiteral("#1f766f")), theme.accent, theme.is_dark ? 0.55 : 0.72),
+            blend_color(theme.accent_border, QColor(QStringLiteral("#86efac")), 0.22),
+            QColor(QStringLiteral("#f8fafc")),
+            true);
+
+        std::map<int, std::vector<int>> rings;
+        for (graphrag::graph_node_t* node : nodes_to_draw)
+        {
+            if (node->id == center_id)
+                continue;
+            rings[depth_by_id[node->id]].push_back(node->id);
+        }
+
+        for (const auto& ring : rings)
+        {
+            const int depth = ring.first;
+            const auto& ids = ring.second;
+            const qreal radius = 180.0 + (depth - 1) * 130.0;
+            const qreal angle_step = ids.empty() ? 0.0 : (6.283185307179586 / static_cast<qreal>(ids.size()));
+            for (int index = 0; index < static_cast<int>(ids.size()); ++index)
+            {
+                const qreal angle = (-1.5707963267948966) + angle_step * static_cast<qreal>(index);
+                centers_by_id[ids[index]] = QPointF(radius * std::cos(angle), radius * std::sin(angle));
+            }
+        }
+    }
+    else
+    {
+        const qreal radius = nodes_to_draw.size() > 1 ? 240.0 : 0.0;
+        for (int index = 0; index < static_cast<int>(nodes_to_draw.size()); ++index)
+        {
+            const qreal angle = nodes_to_draw.empty() ? 0.0 : (static_cast<qreal>(index) / static_cast<qreal>(nodes_to_draw.size())) * 6.283185307179586;
+            centers_by_id[nodes_to_draw[index]->id] = QPointF(radius * std::cos(angle), radius * std::sin(angle));
+        }
+    }
+
+    auto node_fill = [&](const graphrag::graph_node_t* node) {
+        if (node == nullptr)
+            return blend_color(theme.elevated_bg, theme.panel_bg, 0.18);
+        if (center_id != 0 && node->id == center_id)
+            return blend_color(theme.accent, QColor(QStringLiteral("#0f766e")), theme.is_dark ? 0.35 : 0.68);
+        if (node->risk_level == "HIGH" || node->risk_level == "CRITICAL")
+            return theme.is_dark ? QColor(QStringLiteral("#4c1d1d")) : QColor(QStringLiteral("#fee2e2"));
+        if (node->risk_level == "MEDIUM")
+            return theme.is_dark ? QColor(QStringLiteral("#3f2c12")) : QColor(QStringLiteral("#ffedd5"));
+        if (!node->network_apis.empty())
+            return theme.is_dark ? QColor(QStringLiteral("#102a43")) : QColor(QStringLiteral("#dbeafe"));
+        return blend_color(theme.elevated_bg, theme.panel_bg, 0.16);
+    };
+
+    auto node_border = [&](const graphrag::graph_node_t* node) {
+        if (node == nullptr)
+            return theme.button_border;
+        if (center_id != 0 && node->id == center_id)
+            return blend_color(theme.accent_border, QColor(QStringLiteral("#bbf7d0")), 0.24);
+        if (node->risk_level == "HIGH" || node->risk_level == "CRITICAL")
+            return QColor(QStringLiteral("#ef4444"));
+        if (!node->network_apis.empty())
+            return QColor(QStringLiteral("#38bdf8"));
+        return theme.button_border;
+    };
+
+    for (graphrag::graph_node_t* node : nodes_to_draw)
+    {
+        const QPointF center = centers_by_id[node->id];
+        node_rects[node->address] = add_graph_node_item(
+                m_graphScene,
+                node,
+                center,
+                node_fill(node),
+                node_border(node),
+                theme.text_primary,
+                node->id == center_id || node->address == m_graphSelectedEa);
+    }
+
+    int edges_drawn = 0;
+    for (graphrag::graph_edge_t* edge : filtered_edges)
+    {
+        if (edge == nullptr || visible_ids.count(edge->source_id) == 0 || visible_ids.count(edge->target_id) == 0)
+            continue;
+        graphrag::graph_node_t* source = store.get_node(edge->source_id);
+        graphrag::graph_node_t* target = store.get_node(edge->target_id);
+        if (source == nullptr || target == nullptr)
+            continue;
+        auto source_it = node_rects.find(source->address);
+        auto target_it = node_rects.find(target->address);
+        if (source_it == node_rects.end() || target_it == node_rects.end())
+            continue;
+
+        const QPointF start = source_it->second.center();
+        const QPointF end = target_it->second.center();
+        const qreal dx = end.x() - start.x();
+        const qreal dy = end.y() - start.y();
+        const qreal length = std::sqrt(dx * dx + dy * dy);
+        if (length < 1.0)
+            continue;
+
+        const QPointF normal(-dy / length, dx / length);
+        const qreal bend = qBound<qreal>(18.0, length * 0.15, 54.0);
+        const qreal sign = edge->source_id < edge->target_id ? 1.0 : -1.0;
+        const QPointF control1(start.x() + dx * 0.33 + normal.x() * bend * sign, start.y() + dy * 0.33 + normal.y() * bend * sign);
+        const QPointF control2(start.x() + dx * 0.66 + normal.x() * bend * sign, start.y() + dy * 0.66 + normal.y() * bend * sign);
+
+        const graph_edge_style_t style = graph_edge_style(edge->edge_type);
+        QPen edge_pen(style.color, style.width + ((source->id == center_id || target->id == center_id) ? 0.35 : 0.0), style.pen_style);
+        edge_pen.setCapStyle(Qt::RoundCap);
+        edge_pen.setJoinStyle(Qt::RoundJoin);
+
+        QPainterPath path(start);
+        path.cubicTo(control1, control2, end);
+        QGraphicsPathItem* path_item = m_graphScene->addPath(path, edge_pen);
+        path_item->setZValue(0.35);
+
+        const QPointF arrow_start = path.pointAtPercent(0.92);
+        const QPointF arrow_end = path.pointAtPercent(0.98);
+        add_graph_arrowhead(m_graphScene, arrow_start, arrow_end, style.color);
+        if (filtered_edges.size() <= 22 || edge->edge_type != graphrag::edge_type_t::CALLS)
+            add_graph_edge_label(m_graphScene, path.pointAtPercent(0.5), style.label, blend_color(style.color, QColor(QStringLiteral("#f8fafc")), theme.is_dark ? 0.18 : 0.36));
+        ++edges_drawn;
+    }
+
+    QRectF bounds;
+    for (const auto& entry : node_rects)
+        bounds = bounds.isNull() ? entry.second : bounds.united(entry.second);
+    bounds.adjust(-120.0, -120.0, 120.0, 120.0);
+    m_graphScene->setSceneRect(bounds);
+    if (m_graphView != nullptr)
+        m_graphView->fitInView(bounds, Qt::KeepAspectRatio);
+    if (m_graphStatusLabel != nullptr)
+        m_graphStatusLabel->setText(
+            QStringLiteral("Showing %1 nodes / %2 edges | %3 hop(s)")
+                .arg(node_rects.size())
+                .arg(edges_drawn)
+                .arg(hop_limit));
+}
+
+void AiDAWorkbenchPanel::show_graph_node_details(ea_t address)
+{
+    if (address == BADADDR || m_binaryHash.empty())
+        return;
+
+    auto& store = graphrag::GraphStore::instance();
     graphrag::QueryEngine qe(store);
-    nlohmann::json semantic = qe.get_semantic_analysis(m_binaryHash, current_function_ea());
-    nlohmann::json callctx = qe.get_call_context(m_binaryHash, current_function_ea(), 2);
-    nlohmann::json taint = qe.get_taint_paths(m_binaryHash, current_function_ea());
+    nlohmann::json semantic = qe.get_semantic_analysis(m_binaryHash, address);
+    nlohmann::json callctx = qe.get_call_context(m_binaryHash, address, 2);
+    nlohmann::json taint = qe.get_taint_paths(m_binaryHash, address);
 
     QString overview;
     overview += QStringLiteral("Function: %1\nAddress: %2\nRisk: %3\nActivity: %4\nConfidence: %5\n\n")
-        .arg(to_qstring(json_str(semantic, "name", get_function_name_for_ea(current_function_ea()).c_str())))
-        .arg(format_ea(current_function_ea()))
+        .arg(to_qstring(json_str(semantic, "name", get_function_name_for_ea(address).c_str())))
+        .arg(format_ea(address))
         .arg(to_qstring(json_str(semantic, "risk_level", "UNKNOWN")))
         .arg(to_qstring(json_str(semantic, "activity_profile", "N/A")))
         .arg(semantic.value("confidence", 0.0), 0, 'f', 2);
@@ -1350,7 +2136,7 @@ void AiDAWorkbenchPanel::refresh_graph_tab()
     overview += QStringLiteral("Call Context:\n%1\n\n").arg(json_pretty(callctx));
     overview += QStringLiteral("Taint Paths:\n%1").arg(json_pretty(taint));
 
-    render_text_browser(m_graphOverviewBrowser, overview.toStdString(), QStringLiteral("Current Function Graph View"));
+    render_text_browser(m_graphOverviewBrowser, overview.toStdString(), QStringLiteral("Graph Node Details"));
 }
 
 void AiDAWorkbenchPanel::refresh_graph_search_results(const nlohmann::json& results)
@@ -1386,6 +2172,7 @@ void AiDAWorkbenchPanel::index_current_function()
             (QStringLiteral("Indexed %1 at %2").arg(to_qstring(node->name)).arg(format_ea(node->address))).toStdString(),
             false);
     }
+    rebuild_graph_scene({}, current_function_ea());
     refresh_all_tabs();
 }
 
@@ -1407,6 +2194,7 @@ void AiDAWorkbenchPanel::reindex_binary()
         QStringLiteral("ReIndex Binary"),
         (QStringLiteral("Extracted %1 functions for the active binary graph.").arg(result.functions_extracted)).toStdString(),
         false);
+    rebuild_graph_scene();
     refresh_all_tabs();
 }
 
@@ -1418,6 +2206,7 @@ void AiDAWorkbenchPanel::run_graph_security_overview()
     graphrag::QueryEngine qe(graphrag::GraphStore::instance());
     nlohmann::json security = qe.get_security_analysis(m_binaryHash, 20);
     render_text_browser(m_graphOverviewBrowser, json_dump_safe(security, 2), QStringLiteral("Binary Security Overview"));
+    rebuild_graph_scene({}, current_function_ea());
 }
 
 void AiDAWorkbenchPanel::run_graph_communities()
@@ -1433,6 +2222,7 @@ void AiDAWorkbenchPanel::run_graph_communities()
     hide_wait_box();
 
     graphrag::save_graph(m_binaryHash);
+    rebuild_graph_scene({}, current_function_ea());
     refresh_all_tabs();
 }
 
@@ -1457,6 +2247,7 @@ void AiDAWorkbenchPanel::run_graph_network_flow()
         << "Send edges created: " << result.send_edges_created << "\n"
         << "Receive edges created: " << result.recv_edges_created;
     render_text_browser(m_graphOverviewBrowser, summary.str(), QStringLiteral("Network Flow Analysis"));
+    rebuild_graph_scene({}, current_function_ea());
     refresh_header();
 }
 
@@ -1472,6 +2263,22 @@ void AiDAWorkbenchPanel::run_graph_search()
     graphrag::QueryEngine qe(graphrag::GraphStore::instance());
     nlohmann::json results = qe.search_semantic(m_binaryHash, query, m_graphLimitSpin->value());
     refresh_graph_search_results(results);
+
+    std::vector<ea_t> graph_addresses;
+    if (results.is_array())
+    {
+        for (const auto& entry : results)
+        {
+            if (!entry.contains("address"))
+                continue;
+            graph_addresses.push_back(entry.value("address", ea_t(BADADDR)));
+            if (static_cast<int>(graph_addresses.size()) >= 8)
+                break;
+        }
+    }
+    refresh_graph_visualization(graph_addresses.empty() ? current_function_ea() : graph_addresses.front(), graph_addresses);
+    if (!graph_addresses.empty())
+        show_graph_node_details(graph_addresses.front());
 }
 
 void AiDAWorkbenchPanel::build_rag_tab()
@@ -1636,10 +2443,6 @@ void AiDAWorkbenchPanel::refresh_settings_tab()
         text << "Graph stats: " << graph_stats.nodes << " nodes, " << graph_stats.edges << " edges, "
              << graph_stats.communities << " communities\n";
     }
-
-    auto rlhf_stats = rlhf::FeedbackStore::instance().get_stats();
-    text << "RLHF feedback: " << rlhf_stats.total << " total, "
-         << rlhf_stats.upvotes << " upvotes, " << rlhf_stats.downvotes << " downvotes\n";
 
     render_text_browser(m_settingsBrowser, text.str(), QStringLiteral("Runtime Configuration Overview"));
 

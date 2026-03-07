@@ -140,7 +140,7 @@ void open_chat(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 
     g_chat.widget = create_empty_widget(OBFSTR_C("AiDA"));
 
-    display_widget(g_chat.widget, WOPN_DP_TAB | WOPN_DP_SZHINT | WOPN_PERSIST);
+    display_widget(g_chat.widget, WOPN_DP_TAB | WOPN_PERSIST);
     set_dock_pos(OBFSTR_C("AiDA"), nullptr, DP_RIGHT);
 }
 

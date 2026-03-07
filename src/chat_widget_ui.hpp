@@ -210,6 +210,7 @@ protected:
 private:
     void setupUI();
     void setupStyle();
+    void applyResponsiveMetrics();
     void updateContextLabel();
     void updateThemeColors();
     ThemeColors detectThemeColors() const;
