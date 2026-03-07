@@ -4,6 +4,8 @@
 
 class aida_plugin_t;
 
+bool can_use_ai(aida_plugin_t* plugin);
+
 struct action_handler : public action_handler_t
 {
     using action_func_t = void (*)(action_activation_ctx_t*, aida_plugin_t*);

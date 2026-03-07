@@ -1682,6 +1682,28 @@ namespace ida_utils
         return cached;
     }
 
+    bool is_self_target_database()
+    {
+        char input_file[QMAXPATH] = {};
+        get_input_file_path(input_file, sizeof(input_file));
+        if (input_file[0] == '\0')
+            return false;
+
+        std::string normalized = input_file;
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+
+        const std::size_t sep = normalized.find_last_of("\\/");
+        const std::string base_name = sep == std::string::npos
+            ? normalized
+            : normalized.substr(sep + 1);
+
+        return base_name == OBFSTR_C("aida.dll")
+            || base_name == OBFSTR_C("aida.pdb")
+            || base_name == OBFSTR_C("aida.i64")
+            || base_name == OBFSTR_C("aida.idb");
+    }
+
     std::string get_imports_for_function(ea_t ea)
     {
         func_t* pfn = get_func(ea);

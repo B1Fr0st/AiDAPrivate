@@ -259,7 +259,12 @@ void AIClient::set_max_output_tokens(int tokens)
 
 void AIClient::_generate(const std::string& prompt_text, callback_t callback, double temperature, const qstring& request_type)
 {
-    ANTI_RE_GUARD();
+    if (!anti_re::guard())
+    {
+        if (callback)
+            callback(OBFSTR("Error: runtime attestation failed. Restart IDA and verify the AiDA driver is loaded."));
+        return;
+    }
     VERIFY_LICENSE_INLINE();
 
     if (!is_available())
@@ -365,72 +370,117 @@ std::string AIClient::_http_post_request(
     const std::string& body,
     std::function<std::string(const json&)> response_parser)
 {
-    std::shared_ptr<httplib::Client> current_client;
-    try
+    constexpr int MAX_RETRIES = 5;
+    constexpr int BASE_DELAY_MS = 2000;
+    constexpr int MAX_DELAY_MS = 60000;
+
+    for (int attempt = 0; attempt <= MAX_RETRIES; ++attempt)
     {
-        current_client = _get_or_create_client(host, headers);
-
-        auto res = current_client->Post(
-            path.c_str(),
-            body.c_str(),
-            body.length(),
-            OBFSTR_C("application/json"),
-            [this](uint64_t, uint64_t) {
-                return !_cancelled.load();
-            });
-
-        if (_cancelled)
-            return OBFSTR("Error: Operation cancelled.");
-
-        if (!res)
-        {
-            auto err = res.error();
-            _reset_http_client();
-            if (err == httplib::Error::Canceled) {
-                return OBFSTR("Error: Operation cancelled.");
-            }
-            return OBFSTR("Error: HTTP request failed: ") + httplib::to_string(err);
-        }
-        if (res->status != 200)
-        {
-            qstring error_details = OBFSTR_C("No details in response body.");
-            if (!res->body.empty())
-            {
-                try
-                {
-                    error_details = json_dump_safe(json::parse(res->body), 2).c_str();
-                }
-                catch (const std::exception&)
-                {
-                    error_details = res->body.c_str();
-                }
-            }
-            msg(OBFSTR_C("AiDA: API Error. Host: %s, Status: %d\nResponse body: %s\n"), host.c_str(), res->status, error_details.c_str());
-            return format_api_status_error(res->status, res->body);
-        }
-        json jres = json::parse(res->body, nullptr, false);
-        if (jres.is_discarded())
-        {
-            msg(OBFSTR_C("AiDA: Failed to parse JSON response from %s.\nRaw body (first 512 chars): %.512s\n"),
-                host.c_str(), res->body.c_str());
-            return OBFSTR("Error: API returned invalid JSON response.");
-        }
+        std::shared_ptr<httplib::Client> current_client;
         try
         {
-            return response_parser(jres);
+            current_client = _get_or_create_client(host, headers);
+
+            auto res = current_client->Post(
+                path.c_str(),
+                body.c_str(),
+                body.length(),
+                OBFSTR_C("application/json"),
+                [this](uint64_t, uint64_t) {
+                    return !_cancelled.load();
+                });
+
+            if (_cancelled)
+                return OBFSTR("Error: Operation cancelled.");
+
+            if (!res)
+            {
+                auto err = res.error();
+                _reset_http_client();
+                if (err == httplib::Error::Canceled)
+                    return OBFSTR("Error: Operation cancelled.");
+                if (attempt < MAX_RETRIES)
+                {
+                    int delay = (std::min)(BASE_DELAY_MS * (1 << attempt), MAX_DELAY_MS);
+                    delay += (std::rand() % 1000);
+                    msg(OBFSTR_C("AiDA: HTTP error, retrying in %dms (attempt %d/%d)...\n"),
+                        delay, attempt + 1, MAX_RETRIES);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                    continue;
+                }
+                return OBFSTR("Error: HTTP request failed: ") + httplib::to_string(err);
+            }
+
+
+            if ((res->status == 429 || res->status == 503) && attempt < MAX_RETRIES)
+            {
+                int delay = (std::min)(BASE_DELAY_MS * (1 << attempt), MAX_DELAY_MS);
+                delay += (std::rand() % 3000);
+
+                auto retry_it = res->headers.find("Retry-After");
+                if (retry_it != res->headers.end())
+                {
+                    try { delay = std::stoi(retry_it->second) * 1000; }
+                    catch (...) {}
+                }
+                msg(OBFSTR_C("AiDA: Rate limited (HTTP %d), retrying in %dms (attempt %d/%d)...\n"),
+                    res->status, delay, attempt + 1, MAX_RETRIES);
+                _reset_http_client();
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                continue;
+            }
+
+            if (res->status != 200)
+            {
+                qstring error_details = OBFSTR_C("No details in response body.");
+                if (!res->body.empty())
+                {
+                    try
+                    {
+                        error_details = json_dump_safe(json::parse(res->body), 2).c_str();
+                    }
+                    catch (const std::exception&)
+                    {
+                        error_details = res->body.c_str();
+                    }
+                }
+                msg(OBFSTR_C("AiDA: API Error. Host: %s, Status: %d\nResponse body: %s\n"), host.c_str(), res->status, error_details.c_str());
+                return format_api_status_error(res->status, res->body);
+            }
+            json jres = json::parse(res->body, nullptr, false);
+            if (jres.is_discarded())
+            {
+                msg(OBFSTR_C("AiDA: Failed to parse JSON response from %s.\nRaw body (first 512 chars): %.512s\n"),
+                    host.c_str(), res->body.c_str());
+                return OBFSTR("Error: API returned invalid JSON response.");
+            }
+            try
+            {
+                return response_parser(jres);
+            }
+            catch (const std::exception& e)
+            {
+                msg(OBFSTR_C("AiDA: Failed to process API response from %s: %s\n"), host.c_str(), e.what());
+                return OBFSTR("Error: Failed to process API response. Details: ") + e.what();
+            }
         }
         catch (const std::exception& e)
         {
-            msg(OBFSTR_C("AiDA: Failed to process API response from %s: %s\n"), host.c_str(), e.what());
-            return OBFSTR("Error: Failed to process API response. Details: ") + e.what();
+            _reset_http_client();
+            if (attempt < MAX_RETRIES)
+            {
+                int delay = (std::min)(BASE_DELAY_MS * (1 << attempt), MAX_DELAY_MS);
+                delay += (std::rand() % 1000);
+                msg(OBFSTR_C("AiDA: Exception '%s', retrying in %dms (attempt %d/%d)...\n"),
+                    e.what(), delay, attempt + 1, MAX_RETRIES);
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                continue;
+            }
+            warning(OBFSTR_C("AI Assistant: API call to %s failed: %s\n"), host.c_str(), e.what());
+            return OBFSTR("Error: API call failed. Details: ") + e.what();
         }
     }
-    catch (const std::exception& e)
-    {
-        _reset_http_client();
-        warning(OBFSTR_C("AI Assistant: API call to %s failed: %s\n"), host.c_str(), e.what());
-        return OBFSTR("Error: API call failed. Details: ") + e.what();
-    }
+    return OBFSTR("Error: All retry attempts exhausted.");
 }
 
 std::string AIClient::_blocking_generate(const std::string& prompt_text, double temperature)
@@ -957,7 +1007,12 @@ void AIClient::fix_analysis(ea_t ea, callback_t callback)
 
 void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t callback)
 {
-    ANTI_RE_GUARD();
+    if (!anti_re::guard())
+    {
+        if (callback)
+            callback(OBFSTR("Error: runtime attestation failed. Restart IDA and verify the AiDA driver is loaded."));
+        return;
+    }
     VERIFY_LICENSE_INLINE();
 
     if (!is_available())
@@ -1089,7 +1144,12 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
                             const std::vector<std::pair<std::string, std::string>>& history,
                             callback_t callback)
 {
-    ANTI_RE_GUARD();
+    if (!anti_re::guard())
+    {
+        if (callback)
+            callback(OBFSTR("Error: runtime attestation failed. Restart IDA and verify the AiDA driver is loaded."));
+        return;
+    }
     VERIFY_LICENSE_INLINE();
 
     if (!is_available())
@@ -2050,8 +2110,20 @@ std::string LocalLLMClient::_extract_sse_content(const nlohmann::json& j) const
 std::unique_ptr<AIClient> get_ai_client(const settings_t& settings)
 {
     VMP_ULTRA("get_ai_client");
-    ANTI_RE_GUARD();
+    if (!anti_re::guard())
+    {
+        msg(OBFSTR_C("AiDA: runtime attestation failed. AI features remain disabled until the driver trust path is restored.\n"));
+        VMP_END;
+        return nullptr;
+    }
     VERIFY_LICENSE_INLINE();
+
+    if (ida_utils::is_self_target_database())
+    {
+        msg(OBFSTR_C("AiDA: AI features are disabled while AiDA itself is the active analysis target.\n"));
+        VMP_END;
+        return nullptr;
+    }
 
     auto& lm = license_manager_t::instance();
     if (!lm.is_valid())

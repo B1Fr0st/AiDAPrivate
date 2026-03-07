@@ -63,11 +63,14 @@ set(AIDA_SOURCES
     src/ai_client.cpp
     src/chat_widget.cpp
     src/chat_widget_ui.cpp
+    src/context_manager.cpp
+    src/graphrag.cpp
     src/ida_utils.cpp
     src/license.cpp
     src/mcp_server.cpp
     src/settings.cpp
     src/ui.cpp
+    src/workbench.cpp
     src/driver_loader.cpp
     driver/comm.cpp
 )
@@ -85,17 +88,22 @@ set(AIDA_HEADERS
     src/aida.hpp
     src/aida_pro.hpp
     src/ai_client.hpp
+    src/analysis_db.hpp
     src/anti_re.hpp
     src/chat_widget.hpp
     src/chat_widget_ui.hpp
+    src/context_manager.hpp
+    src/graphrag.hpp
     src/ida_utils.hpp
     src/license.hpp
     src/mcp_server.hpp
     src/obfuscation.hpp
     src/prompts.hpp
+    src/rlhf.hpp
     src/settings.hpp
     src/driver_loader.hpp
     src/ui.hpp
+    src/workbench.hpp
 )
 
 add_library(AiDA SHARED ${AIDA_SOURCES} ${AIDA_HEADERS} ${AIDA_ASM_SOURCES})

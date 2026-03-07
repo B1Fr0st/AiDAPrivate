@@ -1,6 +1,10 @@
 #include "aida_pro.hpp"
 
 #ifdef __NT__
+#include "driver_loader.hpp"
+#endif
+
+#ifdef __NT__
 #include <windows.h>
 #include <intrin.h>
 #include <iphlpapi.h>
@@ -409,6 +413,9 @@ nlohmann::json license_manager_t::read_license_config() const
         if (!enc_blob.empty())
         {
             std::string decrypted = decrypt_local(enc_blob);
+            if (decrypted.empty())
+                return nlohmann::json::object();
+
             try
             {
                 nlohmann::json lic = nlohmann::json::parse(decrypted);
@@ -416,7 +423,10 @@ nlohmann::json license_manager_t::read_license_config() const
                 for (auto it = lic.begin(); it != lic.end(); ++it)
                     j[it.key()] = it.value();
             }
-            catch (...) {}
+            catch (...)
+            {
+                return nlohmann::json::object();
+            }
         }
 
         return j;
@@ -473,6 +483,9 @@ bool license_manager_t::write_license_config(const nlohmann::json& config) const
     {
         merged[OBFSTR("license_blob")] = encrypt_local(lic_data.dump());
     }
+
+    for (const char* k : license_keys)
+        merged.erase(k);
 
     for (auto it = config.begin(); it != config.end(); ++it)
     {
@@ -803,6 +816,15 @@ bool license_manager_t::firebase_refresh_token_if_needed()
 bool license_manager_t::validate()
 {
     VMP_ULTRA("validate_license");
+
+#ifdef __NT__
+    if (!driver_loader::is_driver_loaded())
+    {
+        VMP_END;
+        return false;
+    }
+#endif
+
     auto config = read_license_config();
 
     std::string key = config.value(OBFSTR_C("license_key"), std::string(""));
@@ -916,6 +938,15 @@ bool license_manager_t::is_valid() const
         && m_runtime_nonce.load(std::memory_order_acquire) != 0;
 }
 
+void license_manager_t::invalidate_runtime()
+{
+    m_valid.store(false, std::memory_order_release);
+    m_runtime_nonce.store(0, std::memory_order_release);
+    m_integrity_seed.store(0, std::memory_order_release);
+    m_revalidation_pending.store(false, std::memory_order_release);
+    m_plan.clear();
+}
+
 std::string license_manager_t::get_plan() const
 {
     return m_plan;
@@ -1017,11 +1048,18 @@ static int idaapi license_revalidation_timer_cb(void* )
     VMP_VIRT("reval_timer_cb");
     auto& lm = license_manager_t::instance();
 
+#ifdef __NT__
+    if (!driver_loader::is_driver_loaded())
+    {
+        lm.invalidate_runtime();
+        VMP_END;
+        return 7200000;
+    }
+#endif
+
     if (!lm.verify_function_prologues())
     {
-        lm.m_valid.store(false, std::memory_order_release);
-        lm.m_runtime_nonce.store(0, std::memory_order_release);
-        lm.m_integrity_seed.store(0, std::memory_order_release);
+        lm.invalidate_runtime();
         VMP_END;
         return 7200000;
     }
@@ -1043,9 +1081,7 @@ static int idaapi license_revalidation_timer_cb(void* )
             bool ok = lm.validate_with_server(key);
             if (!ok)
             {
-                lm.m_valid.store(false, std::memory_order_release);
-                lm.m_runtime_nonce.store(0, std::memory_order_release);
-                lm.m_integrity_seed.store(0, std::memory_order_release);
+                lm.invalidate_runtime();
             }
             lm.m_revalidation_pending.store(false, std::memory_order_release);
         }

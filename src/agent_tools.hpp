@@ -400,6 +400,27 @@ namespace driver_tools
     };
 }
 
+namespace graphrag_tools
+{
+    tool_result_t get_semantic_analysis(const nlohmann::json& params);
+    tool_result_t search_semantic(const nlohmann::json& params);
+    tool_result_t get_similar_functions(const nlohmann::json& params);
+    tool_result_t get_call_context(const nlohmann::json& params);
+    tool_result_t get_taint_paths(const nlohmann::json& params);
+    tool_result_t get_community_info(const nlohmann::json& params);
+    tool_result_t index_function(const nlohmann::json& params);
+    tool_result_t reindex_all(const nlohmann::json& params);
+    tool_result_t run_security_analysis(const nlohmann::json& params);
+    tool_result_t run_taint_analysis(const nlohmann::json& params);
+    tool_result_t detect_communities(const nlohmann::json& params);
+    tool_result_t analyze_network_flow(const nlohmann::json& params);
+    tool_result_t get_graph_stats(const nlohmann::json& params);
+    tool_result_t get_security_overview(const nlohmann::json& params);
+    tool_result_t get_activity_analysis(const nlohmann::json& params);
+    tool_result_t get_all_communities(const nlohmann::json& params);
+    void register_tools();
+}
+
 namespace helpers
 {
     std::optional<ea_t> parse_address(const std::string& addr_str);

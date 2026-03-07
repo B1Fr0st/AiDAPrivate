@@ -6,8 +6,20 @@
 static bool ensure_licensed_and_ready(aida_plugin_t* plugin)
 {
     VMP_ULTRA("ensure_licensed");
-    ANTI_RE_GUARD();
+    if (!anti_re::guard())
+    {
+        warning(OBFSTR_C("AiDA: runtime attestation failed. AI actions are disabled for this session."));
+        VMP_END;
+        return false;
+    }
     VERIFY_LICENSE_INLINE();
+
+    if (ida_utils::is_self_target_database())
+    {
+        warning(OBFSTR_C("AiDA: self-analysis is blocked for this database."));
+        VMP_END;
+        return false;
+    }
 
     auto& license = license_manager_t::instance();
     if (!license.is_valid())
@@ -84,7 +96,7 @@ static bool ensure_licensed_and_ready(aida_plugin_t* plugin)
     return true;
 }
 
-static bool ensure_ai_client(aida_plugin_t* plugin)
+bool can_use_ai(aida_plugin_t* plugin)
 {
     return ensure_licensed_and_ready(plugin);
 }
@@ -116,7 +128,7 @@ action_state_t idaapi action_handler::update(action_update_ctx_t* ctx)
 
 void handle_analyze_function(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 {
-    if (!ensure_ai_client(plugin)) return;
+    if (!can_use_ai(plugin)) return;
     func_t* pfn = ida_utils::get_function_for_item(ctx->cur_ea);
     if (pfn == nullptr)
         return;
@@ -135,7 +147,7 @@ void handle_analyze_function(action_activation_ctx_t* ctx, aida_plugin_t* plugin
 
 void handle_auto_comment(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 {
-    if (!ensure_ai_client(plugin)) return;
+    if (!can_use_ai(plugin)) return;
     func_t* pfn = ida_utils::get_function_for_item(ctx->cur_ea);
     if (pfn == nullptr)
         return;
@@ -258,7 +270,7 @@ void handle_auto_comment(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 
 void handle_generate_struct(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 {
-    if (!ensure_ai_client(plugin)) return;
+    if (!can_use_ai(plugin)) return;
     func_t* pfn = ida_utils::get_function_for_item(ctx->cur_ea);
     if (pfn == nullptr)
         return;
@@ -283,7 +295,7 @@ void handle_generate_struct(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 
 void handle_generate_hook(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 {
-    if (!ensure_ai_client(plugin)) return;
+    if (!can_use_ai(plugin)) return;
     func_t* pfn = ida_utils::get_function_for_item(ctx->cur_ea);
     if (pfn == nullptr)
         return;
@@ -333,7 +345,7 @@ void handle_copy_context(action_activation_ctx_t* ctx, aida_plugin_t*)
 
 void handle_rename_all(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 {
-    if (!ensure_ai_client(plugin)) return;
+    if (!can_use_ai(plugin)) return;
     func_t* pfn = ida_utils::get_function_for_item(ctx->cur_ea);
     if (pfn == nullptr)
         return;
@@ -815,7 +827,7 @@ void handle_open_chat(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 
 void handle_fix_analysis(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 {
-    if (!ensure_ai_client(plugin)) return;
+    if (!can_use_ai(plugin)) return;
     func_t* pfn = ida_utils::get_function_for_item(ctx->cur_ea);
     if (pfn == nullptr)
         return;
@@ -904,7 +916,7 @@ void handle_toggle_mcp(action_activation_ctx_t*, aida_plugin_t* plugin)
 void handle_debug_analyze(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 {
     VMP_MUT("handle_debug_analyze");
-    if (!ensure_licensed_and_ready(plugin) || !ensure_ai_client(plugin))
+    if (!ensure_licensed_and_ready(plugin) || !can_use_ai(plugin))
     {
         VMP_END;
         return;
@@ -951,7 +963,7 @@ void handle_debug_analyze(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 void handle_debug_devirtualize(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 {
     VMP_MUT("handle_debug_devirtualize");
-    if (!ensure_licensed_and_ready(plugin) || !ensure_ai_client(plugin))
+    if (!ensure_licensed_and_ready(plugin) || !can_use_ai(plugin))
     {
         VMP_END;
         return;
@@ -1008,7 +1020,7 @@ void handle_debug_devirtualize(action_activation_ctx_t* ctx, aida_plugin_t* plug
 void handle_debug_trace_dispatch(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 {
     VMP_MUT("handle_debug_trace_dispatch");
-    if (!ensure_licensed_and_ready(plugin) || !ensure_ai_client(plugin))
+    if (!ensure_licensed_and_ready(plugin) || !can_use_ai(plugin))
     {
         VMP_END;
         return;

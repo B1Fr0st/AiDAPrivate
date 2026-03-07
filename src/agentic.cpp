@@ -1,4 +1,5 @@
 #include "aida_pro.hpp"
+#include "context_manager.hpp"
 
 using json = nlohmann::json;
 
@@ -1426,6 +1427,36 @@ result_t run(
                 initial_prompt, all_round_results,
                 static_cast<size_t>(config.max_tool_result_chars),
                 current_round + 1, max_rounds);
+
+
+            context_manager::config_t ctx_cfg;
+            ctx_cfg.max_context_tokens = config.max_context_tokens;
+            ctx_cfg.output_reserve     = config.output_token_reserve;
+            context_manager::ContextWindowManager ctx_mgr(ctx_cfg);
+
+            size_t prompt_tokens = ctx_mgr.estimate_tokens(current_prompt);
+            size_t budget = static_cast<size_t>(ctx_cfg.max_context_tokens - ctx_cfg.output_reserve);
+            if (prompt_tokens > budget)
+            {
+                if (config.verbose_logging)
+                    msg(OBFSTR_C("AiDA Agent: Context window pressure (%zu tokens > %zu budget), trimming older rounds...\n"),
+                        prompt_tokens, budget);
+
+
+                while (all_round_results.size() > 2 && prompt_tokens > budget)
+                {
+                    all_round_results.erase(all_round_results.begin());
+                    current_prompt = build_continuation_prompt(
+                        initial_prompt, all_round_results,
+                        static_cast<size_t>(config.max_tool_result_chars),
+                        current_round + 1, max_rounds);
+                    prompt_tokens = ctx_mgr.estimate_tokens(current_prompt);
+                }
+
+
+                if (prompt_tokens > budget)
+                    current_prompt = ctx_mgr.fit_to_budget(current_prompt, budget);
+            }
         }
     }
 

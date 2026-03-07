@@ -38,11 +38,52 @@ public:
         setOpenExternalLinks(false);
     }
 
+    void setMarkdownSource(const QString& markdown) { m_markdownSource = markdown; }
+    QString markdownSource() const { return m_markdownSource; }
+
     std::function<void(const QUrl&)> onAnchorClicked;
     std::function<void(const QUrl&)> onAnchorDoubleClicked;
 
 protected:
     void doSetSource(const QUrl&, QTextDocument::ResourceType) override {  }
+
+    void keyPressEvent(QKeyEvent* e) override
+    {
+        if (e->matches(QKeySequence::Copy) && !m_markdownSource.isEmpty())
+        {
+            QApplication::clipboard()->setText(m_markdownSource);
+            e->accept();
+            return;
+        }
+        QTextBrowser::keyPressEvent(e);
+    }
+
+    void contextMenuEvent(QContextMenuEvent* e) override
+    {
+        QMenu* menu = createStandardContextMenu();
+        if (menu != nullptr)
+        {
+            const QList<QAction*> actions = menu->actions();
+            for (QAction* action : actions)
+            {
+                QString text = action->text();
+                text.remove(QChar('&'));
+                if (text.compare(QStringLiteral("Copy"), Qt::CaseInsensitive) == 0)
+                {
+                    QObject::disconnect(action, nullptr, nullptr, nullptr);
+                    QObject::connect(action, &QAction::triggered, [this]() {
+                        if (!m_markdownSource.isEmpty())
+                            QApplication::clipboard()->setText(m_markdownSource);
+                    });
+                    break;
+                }
+            }
+            menu->exec(e->globalPos());
+            delete menu;
+            return;
+        }
+        QTextBrowser::contextMenuEvent(e);
+    }
 
     void mouseReleaseEvent(QMouseEvent* e) override
     {
@@ -67,6 +108,9 @@ protected:
         }
         QTextBrowser::mouseDoubleClickEvent(e);
     }
+
+private:
+    QString m_markdownSource;
 };
 
 class FunctionCompleterPopup : public QFrame
@@ -188,9 +232,8 @@ private:
     void deleteConversation(int index);
     void rebuildHistoryList();
 
-    QString formatUserMessageHtml(const QString& msg, int index) const;
-    QString formatAiMessageHtml(const QString& msg, int index) const;
-    QString formatSystemMessageHtml(const QString& msg) const;
+    QString buildConversationMarkdown() const;
+    QString formatMessageMarkdown(const QString& role, const QString& msg, int index) const;
     QString markdownToHtml(const QString& md) const;
     QString escapeHtml(const QString& text) const;
 
@@ -236,7 +279,9 @@ private:
     QLabel*                  m_contextLabel;
     QPushButton*             m_historyBtn;
     QPushButton*             m_newChatBtn;
-    ChatTextBrowser*         m_chatDisplay;
+    QScrollArea*             m_chatDisplay;
+    QWidget*                 m_chatDisplayViewport;
+    QVBoxLayout*             m_chatMessagesLayout;
     QTextEdit*               m_inputField;
     QPushButton*             m_sendBtn;
     QPushButton*             m_cancelBtn;

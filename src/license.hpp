@@ -12,6 +12,7 @@ public:
     static license_manager_t& instance();
     bool validate();
     bool is_valid() const;
+    void invalidate_runtime();
     bool show_activation_dialog();
     std::string get_plan() const;
     uint64_t get_runtime_nonce() const;

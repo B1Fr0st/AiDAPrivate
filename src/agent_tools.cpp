@@ -1,4 +1,7 @@
 #include "aida_pro.hpp"
+#include "graphrag.hpp"
+#include "analysis_db.hpp"
+#include "rlhf.hpp"
 #include <allins.hpp>
 #include <iomanip>
 #include <loader.hpp>
@@ -3125,7 +3128,20 @@ tool_result_t rename_function(const json& params)
     bool success = set_name(pfn->start_ea, new_name.c_str(), SN_FORCE | SN_NODUMMY);
 
     if (success)
+    {
+
+        auto& store = graphrag::GraphStore::instance();
+        auto* node = store.get_node_by_address(
+            aida_db::AnalysisDB::instance().get_binary_hash(),
+            graphrag::node_type_t::FUNCTION, pfn->start_ea);
+        if (node)
+        {
+            node->name = new_name;
+            store.upsert_node(*node);
+        }
+
         return tool_result_t::ok(OBFSTR("Function renamed to: ") + new_name);
+    }
     else
         return tool_result_t::error(OBFSTR("Failed to rename function"));
 }
@@ -7943,6 +7959,17 @@ tool_result_t batch_rename(const json& params)
         {
             results.push_back({{"address", addr_str}, {"success", true}, {"name", new_name}});
             success_count++;
+
+
+            auto& store = graphrag::GraphStore::instance();
+            auto* node = store.get_node_by_address(
+                aida_db::AnalysisDB::instance().get_binary_hash(),
+                graphrag::node_type_t::FUNCTION, *ea_opt);
+            if (node)
+            {
+                node->name = new_name;
+                store.upsert_node(*node);
+            }
         }
         else
         {
@@ -16139,6 +16166,499 @@ void register_tools()
 
 }
 
+
+static std::string get_current_binary_hash()
+{
+    return aida_db::AnalysisDB::instance().get_binary_hash();
+}
+
+namespace graphrag_tools
+{
+
+tool_result_t get_semantic_analysis(const json& params)
+{
+    std::string addr_str = json_str(params, "address");
+    auto addr = helpers::parse_address(addr_str);
+    if (!addr) return tool_result_t::error(OBFSTR("Invalid address"));
+
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::QueryEngine qe(store);
+    json result = qe.get_semantic_analysis(hash, *addr);
+    return tool_result_t::ok(OBFSTR("Semantic analysis for ") + addr_str, result);
+}
+
+tool_result_t search_semantic(const json& params)
+{
+    std::string query = json_str(params, "query");
+    if (query.empty()) return tool_result_t::error(OBFSTR("Missing query parameter"));
+
+    int limit = 10;
+    if (params.contains("limit") && params["limit"].is_number())
+        limit = params["limit"].get<int>();
+
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::QueryEngine qe(store);
+    json result = qe.search_semantic(hash, query, limit);
+    return tool_result_t::ok(OBFSTR("Found ") + std::to_string(result.size()) + OBFSTR(" results"), result);
+}
+
+tool_result_t get_similar_functions(const json& params)
+{
+    std::string addr_str = json_str(params, "address");
+    auto addr = helpers::parse_address(addr_str);
+    if (!addr) return tool_result_t::error(OBFSTR("Invalid address"));
+
+    int limit = 5;
+    if (params.contains("limit") && params["limit"].is_number())
+        limit = params["limit"].get<int>();
+
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::QueryEngine qe(store);
+    json result = qe.get_similar_functions(hash, *addr, limit);
+    return tool_result_t::ok(OBFSTR("Found ") + std::to_string(result.size()) + OBFSTR(" similar functions"), result);
+}
+
+tool_result_t get_call_context(const json& params)
+{
+    std::string addr_str = json_str(params, "address");
+    auto addr = helpers::parse_address(addr_str);
+    if (!addr) return tool_result_t::error(OBFSTR("Invalid address"));
+
+    int depth = 2;
+    if (params.contains("depth") && params["depth"].is_number())
+        depth = params["depth"].get<int>();
+
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::QueryEngine qe(store);
+    json result = qe.get_call_context(hash, *addr, depth);
+    return tool_result_t::ok(OBFSTR("Call context for ") + addr_str, result);
+}
+
+tool_result_t get_taint_paths(const json& params)
+{
+    std::string addr_str = json_str(params, "address");
+    auto addr = helpers::parse_address(addr_str);
+    if (!addr) return tool_result_t::error(OBFSTR("Invalid address"));
+
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::QueryEngine qe(store);
+    json result = qe.get_taint_paths(hash, *addr);
+    return tool_result_t::ok(OBFSTR("Taint paths for ") + addr_str, result);
+}
+
+tool_result_t get_community_info(const json& params)
+{
+    std::string addr_str = json_str(params, "address");
+    auto addr = helpers::parse_address(addr_str);
+    if (!addr) return tool_result_t::error(OBFSTR("Invalid address"));
+
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::QueryEngine qe(store);
+    json result = qe.get_community_info(hash, *addr);
+    return tool_result_t::ok(OBFSTR("Community info for ") + addr_str, result);
+}
+
+tool_result_t index_function(const json& params)
+{
+    std::string addr_str = json_str(params, "address");
+    auto addr = helpers::parse_address(addr_str);
+    if (!addr) return tool_result_t::error(OBFSTR("Invalid address"));
+
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::StructureExtractor extractor(store);
+    auto* node = extractor.extract_function(*addr, hash);
+    if (!node)
+        return tool_result_t::error(OBFSTR("Failed to extract function at ") + addr_str);
+
+    json result;
+    result["name"] = node->name;
+    result["address"] = node->address;
+    result["security_flags"] = node->security_flags;
+    result["risk_level"] = node->risk_level;
+    result["activity_profile"] = node->activity_profile;
+    return tool_result_t::ok(OBFSTR("Indexed function ") + node->name, result);
+}
+
+tool_result_t reindex_all(const json& params)
+{
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::StructureExtractor extractor(store);
+
+    auto result = extractor.extract_all(hash, [](int current, int total, const std::string& name) {
+        if (current % 100 == 0)
+            msg(OBFSTR_C("[AiDA GraphRAG] Indexing function %d/%d: %s\n"), current, total, name.c_str());
+    });
+
+
+    graphrag::save_graph(hash);
+
+    json data;
+    data["functions_extracted"] = result.functions_extracted;
+    auto stats = store.get_stats(hash);
+    data["total_nodes"] = stats.nodes;
+    data["total_edges"] = stats.edges;
+    return tool_result_t::ok(OBFSTR("Reindexed ") + std::to_string(result.functions_extracted) + OBFSTR(" functions"), data);
+}
+
+tool_result_t run_security_analysis(const json& params)
+{
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    auto& store = graphrag::GraphStore::instance();
+    auto nodes = store.get_nodes_by_type(hash, graphrag::node_type_t::FUNCTION);
+
+    int risky = 0;
+    json high_risk = json::array();
+    for (auto* n : nodes)
+    {
+        if (n->risk_level == "HIGH" || n->risk_level == "CRITICAL")
+        {
+            ++risky;
+            if (high_risk.size() < 50)
+            {
+                high_risk.push_back({
+                    {"name", n->name}, {"address", n->address},
+                    {"risk_level", n->risk_level}, {"security_flags", n->security_flags}
+                });
+            }
+        }
+    }
+
+    json data;
+    data["total_functions"] = nodes.size();
+    data["high_risk_count"] = risky;
+    data["high_risk_functions"] = high_risk;
+    return tool_result_t::ok(OBFSTR("Security analysis: ") + std::to_string(risky)
+        + OBFSTR(" high-risk functions found"), data);
+}
+
+tool_result_t run_taint_analysis(const json& params)
+{
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    int max_paths = 20;
+    if (params.contains("max_paths") && params["max_paths"].is_number())
+        max_paths = params["max_paths"].get<int>();
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::TaintAnalyzer analyzer(store);
+    auto paths = analyzer.find_taint_paths(hash, max_paths, true);
+
+    json data = json::array();
+    for (auto& p : paths)
+    {
+        json pj;
+        pj["source"] = p.source_name;
+        pj["sink"] = p.sink_name;
+        pj["path_length"] = p.path.size();
+        data.push_back(pj);
+    }
+
+    graphrag::save_graph(hash);
+    return tool_result_t::ok(OBFSTR("Found ") + std::to_string(paths.size()) + OBFSTR(" taint paths"), data);
+}
+
+tool_result_t detect_communities(const json& params)
+{
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    bool force = false;
+    if (params.contains("force") && params["force"].is_boolean())
+        force = params["force"].get<bool>();
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::CommunityDetector detector(store);
+    int count = detector.detect(hash, 2, 50, force);
+
+    auto communities = store.get_communities(hash);
+    json data = json::array();
+    for (auto& c : communities)
+    {
+        data.push_back({
+            {"id", c.id}, {"label", c.label},
+            {"purpose", c.purpose}, {"size", c.member_ids.size()}
+        });
+    }
+
+    graphrag::save_graph(hash);
+    return tool_result_t::ok(OBFSTR("Detected ") + std::to_string(count) + OBFSTR(" communities"), data);
+}
+
+tool_result_t analyze_network_flow(const json& params)
+{
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::NetworkFlowAnalyzer analyzer(store);
+    auto result = analyzer.analyze(hash);
+
+    json data;
+    data["send_functions"] = result.send_functions;
+    data["recv_functions"] = result.recv_functions;
+    data["send_edges_created"] = result.send_edges_created;
+    data["recv_edges_created"] = result.recv_edges_created;
+
+
+    json send_paths = json::array();
+    for (auto& fp : result.send_paths)
+    {
+        json pj;
+        pj["source"] = fp.source_name;
+        pj["target"] = fp.target_name;
+        pj["api"] = fp.api_name;
+        pj["hops"] = fp.hop_count;
+        pj["path_length"] = fp.path.size();
+        send_paths.push_back(pj);
+    }
+    data["send_paths"] = send_paths;
+
+    json recv_paths = json::array();
+    for (auto& fp : result.recv_paths)
+    {
+        json pj;
+        pj["source"] = fp.source_name;
+        pj["target"] = fp.target_name;
+        pj["api"] = fp.api_name;
+        pj["hops"] = fp.hop_count;
+        recv_paths.push_back(pj);
+    }
+    data["recv_paths"] = recv_paths;
+
+    graphrag::save_graph(hash);
+    return tool_result_t::ok(OBFSTR("Network flow: ") + std::to_string(result.send_functions.size())
+        + OBFSTR(" send, ") + std::to_string(result.recv_functions.size()) + OBFSTR(" recv, ")
+        + std::to_string(result.send_paths.size() + result.recv_paths.size()) + OBFSTR(" paths"), data);
+}
+
+tool_result_t get_graph_stats(const json& params)
+{
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    auto& store = graphrag::GraphStore::instance();
+    auto stats = store.get_stats(hash);
+
+    json data;
+    data["nodes"] = stats.nodes;
+    data["edges"] = stats.edges;
+    data["communities"] = stats.communities;
+    data["stale_nodes"] = stats.stale;
+    data["binary_hash"] = hash;
+    return tool_result_t::ok(OBFSTR("Graph: ") + std::to_string(stats.nodes) + OBFSTR(" nodes, ")
+        + std::to_string(stats.edges) + OBFSTR(" edges"), data);
+}
+
+tool_result_t get_security_overview(const json& params)
+{
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    int limit = 50;
+    if (params.contains("limit") && params["limit"].is_number())
+        limit = params["limit"].get<int>();
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::QueryEngine qe(store);
+    json data = qe.get_security_analysis(hash, limit);
+    return tool_result_t::ok(OBFSTR("Security overview: ") +
+        std::to_string(data.value("total_functions", 0)) + OBFSTR(" functions analyzed"), data);
+}
+
+tool_result_t get_activity_analysis(const json& params)
+{
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    std::string filter;
+    if (params.contains("activity_type") && params["activity_type"].is_string())
+        filter = params["activity_type"].get<std::string>();
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::QueryEngine qe(store);
+    json data = qe.get_activity_analysis(hash, filter);
+    return tool_result_t::ok(OBFSTR("Activity analysis complete"), data);
+}
+
+tool_result_t get_all_communities(const json& params)
+{
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::QueryEngine qe(store);
+    json data = qe.get_all_communities(hash);
+    return tool_result_t::ok(OBFSTR("Found ") +
+        std::to_string(data.value("total_communities", 0)) + OBFSTR(" communities"), data);
+}
+
+void register_tools()
+{
+    auto& registry = ToolRegistry::instance();
+
+    registry.register_tool({
+        OBFSTR("get_semantic_analysis"), OBFSTR("graphrag"),
+        OBFSTR("Get comprehensive semantic analysis of a function from the knowledge graph. "
+               "Returns the function's summary, security flags, risk level, callers, callees, "
+               "community membership, and decompiled code. Use this to understand what a "
+               "function does and its relationships in the codebase."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
+        get_semantic_analysis, true});
+
+    registry.register_tool({
+        OBFSTR("search_semantic"), OBFSTR("graphrag"),
+        OBFSTR("Search the knowledge graph for functions matching a natural language query. "
+               "Searches function names, summaries, and security flags. Returns matching "
+               "functions ranked by relevance with their addresses and risk levels."),
+        {{OBFSTR("query"), OBFSTR("string"), OBFSTR("Search query (e.g. 'network send', 'crypto encryption', 'buffer overflow')"), true},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results (default 10)"), false}},
+        search_semantic, true});
+
+    registry.register_tool({
+        OBFSTR("get_similar_functions"), OBFSTR("graphrag"),
+        OBFSTR("Find functions structurally similar to the given one based on shared callers "
+               "and callees in the call graph. Useful for finding related functionality, "
+               "duplicate code, or wrapper functions."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results (default 5)"), false}},
+        get_similar_functions, true});
+
+    registry.register_tool({
+        OBFSTR("get_call_context"), OBFSTR("graphrag"),
+        OBFSTR("Get multi-level call context showing callers and callees of a function to "
+               "the specified depth. Provides a tree view of the function's position in "
+               "the call graph for understanding data flow and control flow."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true},
+         {OBFSTR("depth"), OBFSTR("number"), OBFSTR("Depth of caller/callee tree (default 2)"), false}},
+        get_call_context, true});
+
+    registry.register_tool({
+        OBFSTR("get_taint_paths_for_function"), OBFSTR("graphrag"),
+        OBFSTR("Get taint analysis paths involving the specified function. Shows data flow "
+               "from untrusted sources (recv, read, scanf) to dangerous sinks (strcpy, system, "
+               "CreateProcess). Identifies potential vulnerability chains."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
+        get_taint_paths, true});
+
+    registry.register_tool({
+        OBFSTR("get_community_info"), OBFSTR("graphrag"),
+        OBFSTR("Get information about the functional community (cluster) a function belongs to. "
+               "Shows community purpose (network, crypto, file_io, etc.), all member functions, "
+               "and the community label."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
+        get_community_info, true});
+
+    registry.register_tool({
+        OBFSTR("index_function"), OBFSTR("graphrag"),
+        OBFSTR("Index a single function into the knowledge graph. Extracts its code, security "
+               "features (network/file/crypto/process APIs, dangerous functions, IP addresses), "
+               "and call edges. Use this before querying a specific function."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
+        index_function, false});
+
+    registry.register_tool({
+        OBFSTR("reindex_all"), OBFSTR("graphrag"),
+        OBFSTR("Reindex ALL functions in the binary into the knowledge graph. This extracts "
+               "structure, security features, and call edges for every function. Use this "
+               "once to build the full graph before querying. May take time for large binaries."),
+        {},
+        reindex_all, false});
+
+    registry.register_tool({
+        OBFSTR("run_security_analysis"), OBFSTR("graphrag"),
+        OBFSTR("Run security analysis across the entire knowledge graph. Identifies high-risk "
+               "functions with dangerous API usage, buffer overflow risks, command injection "
+               "vectors, and other vulnerabilities. Returns the riskiest functions."),
+        {},
+        run_security_analysis, true});
+
+    registry.register_tool({
+        OBFSTR("run_taint_analysis"), OBFSTR("graphrag"),
+        OBFSTR("Run taint analysis to find data flow paths from untrusted input sources to "
+               "dangerous sinks. Discovers potential vulnerability chains where user-controlled "
+               "data reaches unsafe operations like strcpy, system, or CreateProcess."),
+        {{OBFSTR("max_paths"), OBFSTR("number"), OBFSTR("Maximum taint paths to find (default 20)"), false}},
+        run_taint_analysis, false});
+
+    registry.register_tool({
+        OBFSTR("detect_communities"), OBFSTR("graphrag"),
+        OBFSTR("Detect functional communities (clusters) in the call graph using Label Propagation. "
+               "Groups related functions by their calling patterns and infers the purpose of each "
+               "community (network, crypto, file_io, process, init, gui, etc.)."),
+        {{OBFSTR("force"), OBFSTR("boolean"), OBFSTR("Force re-detection even if communities exist (default false)"), false}},
+        detect_communities, false});
+
+    registry.register_tool({
+        OBFSTR("analyze_network_flow"), OBFSTR("graphrag"),
+        OBFSTR("Analyze network data flow patterns in the binary. Identifies functions that "
+               "send and receive network data, creates flow edges, and maps the network "
+               "communication architecture of the binary."),
+        {},
+        analyze_network_flow, false});
+
+    registry.register_tool({
+        OBFSTR("get_graph_stats"), OBFSTR("graphrag"),
+        OBFSTR("Get statistics about the knowledge graph: total nodes, edges, communities, "
+               "and stale node count. Use to check if the graph has been indexed."),
+        {},
+        get_graph_stats, true});
+
+    registry.register_tool({
+        OBFSTR("get_security_overview"), OBFSTR("graphrag"),
+        OBFSTR("Get a comprehensive security overview of the entire binary from the knowledge "
+               "graph. Returns risk distribution (critical/high/medium/low counts), security "
+               "flag distribution across all functions, and the most dangerous functions with "
+               "their specific vulnerabilities and activity profiles."),
+        {{OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum high-risk functions to return (default 50)"), false}},
+        get_security_overview, true});
+
+    registry.register_tool({
+        OBFSTR("get_activity_analysis"), OBFSTR("graphrag"),
+        OBFSTR("Analyze activity profiles of functions in the binary. Groups functions by "
+               "their behavior: NETWORK_CLIENT, NETWORK_SERVER, FILE_RW, FILE_READER, "
+               "FILE_WRITER, CRYPTO_CIPHER, CRYPTO_ENCRYPT, CRYPTO_DECRYPT, CRYPTO_HASH, "
+               "PROCESS_INJECTOR, PROCESS_SPAWNER. Optionally filter to one activity type."),
+        {{OBFSTR("activity_type"), OBFSTR("string"), OBFSTR("Optional: filter to specific activity type (e.g. 'NETWORK_CLIENT')"), false}},
+        get_activity_analysis, true});
+
+    registry.register_tool({
+        OBFSTR("get_all_communities"), OBFSTR("graphrag"),
+        OBFSTR("List all detected functional communities (clusters) in the binary. Returns "
+               "each community's ID, label, detected purpose (network/crypto/file_io/process/"
+               "registry/init/gui/etc.), member count, and member function details."),
+        {},
+        get_all_communities, true});
+}
+
+}
+
 void initialize_all_tools()
 {
     function_tools::register_tools();
@@ -16155,6 +16675,7 @@ void initialize_all_tools()
     analysis_tools::register_tools();
     deobfuscation_tools::register_tools();
     driver_tools::register_tools();
+    graphrag_tools::register_tools();
 
     ToolRegistry::instance().register_tool({
         OBFSTR("patch_instruction"), OBFSTR("memory"),

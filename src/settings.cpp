@@ -362,9 +362,6 @@ static void to_json(nlohmann::json& j, const settings_t& s)
         {OBFSTR_C("check_for_updates"), s.check_for_updates},
         {OBFSTR_C("mcp_enabled"), s.mcp_enabled},
         {OBFSTR_C("mcp_port"), s.mcp_port},
-        {OBFSTR_C("license_key"), obfuscate_key(s.license_key)},
-        {OBFSTR_C("license_validated_at"), s.license_validated_at},
-        {OBFSTR_C("license_hwid"), s.license_hwid},
         {OBFSTR_C("firebase_api_key"), obfuscate_key(s.firebase_api_key)}
     };
 }
@@ -412,9 +409,6 @@ static void from_json(const nlohmann::json& j, settings_t& s)
     s.mcp_enabled = j.value(OBFSTR_C("mcp_enabled"), d.mcp_enabled);
     s.mcp_port = j.value(OBFSTR_C("mcp_port"), d.mcp_port);
 
-    s.license_key = deobfuscate_key(j.value(OBFSTR_C("license_key"), d.license_key));
-    s.license_validated_at = j.value(OBFSTR_C("license_validated_at"), d.license_validated_at);
-    s.license_hwid = j.value(OBFSTR_C("license_hwid"), d.license_hwid);
     s.firebase_api_key = get_trimmed_key_string(j, OBFSTR_C("firebase_api_key"), d.firebase_api_key);
 
     if (j.contains(OBFSTR_C("custom_prompts")))
@@ -433,8 +427,44 @@ static bool save_settings_to_file(const settings_t& settings, const qstring& pat
 {
     try
     {
-        nlohmann::json j = settings;
-        std::string json_str = j.dump(4);
+        nlohmann::json merged = nlohmann::json::object();
+        if (qfileexist(path.c_str()))
+        {
+            FILE* existing = qfopen(path.c_str(), "rb");
+            if (existing != nullptr)
+            {
+                file_janitor_t existing_fj(existing);
+                const uint64 existing_size = qfsize(existing);
+                if (existing_size > 0)
+                {
+                    qstring existing_json;
+                    existing_json.resize(existing_size);
+                    if (qfread(existing, existing_json.begin(), existing_size) == existing_size)
+                    {
+                        try
+                        {
+                            merged = nlohmann::json::parse(existing_json.c_str());
+                            if (!merged.is_object())
+                                merged = nlohmann::json::object();
+                        }
+                        catch (...)
+                        {
+                            merged = nlohmann::json::object();
+                        }
+                    }
+                }
+            }
+        }
+
+        nlohmann::json settings_json = settings;
+        for (auto it = settings_json.begin(); it != settings_json.end(); ++it)
+            merged[it.key()] = it.value();
+
+        merged.erase(OBFSTR_C("license_key"));
+        merged.erase(OBFSTR_C("license_validated_at"));
+        merged.erase(OBFSTR_C("license_hwid"));
+
+        std::string json_str = merged.dump(4);
 
         FILE* fp = qfopen(path.c_str(), "wb");
         if (fp == nullptr)

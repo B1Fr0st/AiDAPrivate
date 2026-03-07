@@ -1,5 +1,10 @@
 #include "aida_pro.hpp"
 
+#include "anti_re.hpp"
+#include "ida_utils.hpp"
+#include "graphrag.hpp"
+#include "analysis_db.hpp"
+
 #ifdef __NT__
 #include "driver_loader.hpp"
 #endif
@@ -343,11 +348,12 @@ aida_plugin_t::aida_plugin_t()
     msg(OBFSTR_C("--- Plugin Loading (v%s) ---\n"), AIDA_VERSION);
 
 #ifdef __NT__
-    if (!driver_loader::initialize_and_load())
-        msg(OBFSTR_C("AiDA Driver: Warning - kernel driver not loaded.\n"));
+    if (!driver_loader::is_driver_loaded())
+        msg(OBFSTR_C("AiDA Driver: Warning - kernel driver trust state was lost after initialization.\n"));
 #endif
 
     g_settings.load(this);
+    aida_db::AnalysisDB::instance().load();
     agent_tools::initialize_all_tools();
     register_actions();
     hook_event_listener(HT_UI, &ui_listener);
@@ -359,6 +365,11 @@ aida_plugin_t::aida_plugin_t()
     reinit_ai_client();
     msg(OBFSTR_C("--- Plugin Loaded Successfully ---\n"));
 
+
+    std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
+    if (!bin_hash.empty())
+        graphrag::load_graph(bin_hash);
+
     if (g_settings.check_for_updates)
     {
         check_for_updates();
@@ -367,6 +378,12 @@ aida_plugin_t::aida_plugin_t()
 
 aida_plugin_t::~aida_plugin_t()
 {
+
+    std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
+    if (!bin_hash.empty())
+        graphrag::save_graph(bin_hash);
+    aida_db::AnalysisDB::instance().save();
+
     stop_copilot_proxy();
     stop_mcp_server();
     ::unhook_event_listener(HT_DBG, &dbg_listener);
@@ -680,6 +697,12 @@ void aida_plugin_t::start_mcp_server()
     if (!g_settings.mcp_enabled)
         return;
 
+    if (ida_utils::is_self_target_database())
+    {
+        msg(OBFSTR_C("MCP: disabled while AiDA itself is the active analysis target.\n"));
+        return;
+    }
+
     if (mcp_server && mcp_server->is_running())
         return;
 
@@ -738,7 +761,7 @@ void aida_plugin_t::register_actions()
         {OBFSTR("ai_assistant:rename_all"), OBFSTR("Rename variables/functions..."), handle_rename_all, "Ctrl+Alt+R"},
         {OBFSTR("ai_assistant:scan_for_offsets"), OBFSTR("Scan for Engine Pointers (Coming Soon!)"), handle_scan_for_offsets, ""},
         {OBFSTR("ai_assistant:save_database_context"), OBFSTR("Save database context to file..."), handle_save_database_context, ""},
-        {OBFSTR("ai_assistant:open_chat"), OBFSTR("Open Chat..."), handle_open_chat, "Ctrl+Alt+I"},
+        {OBFSTR("ai_assistant:open_chat"), OBFSTR("Open AiDA Workbench..."), handle_open_chat, "Ctrl+Alt+I"},
         {OBFSTR("ai_assistant:fix_analysis"), OBFSTR("Fix Analysis (Clean Decompilation)"), handle_fix_analysis, "Ctrl+Alt+F"},
         {OBFSTR("ai_assistant:cancel"), OBFSTR("Cancel AI Request"), handle_cancel_request, "Ctrl+Alt+Z"},
         {OBFSTR("ai_assistant:check_for_updates"), OBFSTR("Check for updates..."), handle_check_for_updates, ""},
@@ -787,6 +810,18 @@ static plugmod_t* idaapi init()
     VMP_ULTRA("plugin_init");
 
     g_settings.load_from_file();
+
+#ifdef __NT__
+    if (!driver_loader::initialize_and_load())
+    {
+        msg(OBFSTR_C("AiDA: kernel driver attestation is required and could not be initialized.\n"));
+        VMP_END;
+        return PLUGIN_SKIP;
+    }
+
+    if (!anti_re::initialize())
+        msg(OBFSTR_C("AiDA: kernel-backed runtime attestation warm-up failed; runtime checks will retry on demand.\n"));
+#endif
 
     auto& license = license_manager_t::instance();
 

@@ -5,6 +5,7 @@
 
 class aida_plugin_t;
 class AiDAChatPanel;
+class AiDAWorkbenchPanel;
 
 namespace chat_widget
 {
@@ -13,4 +14,5 @@ namespace chat_widget
     void close_chat();
 
     AiDAChatPanel* get_panel();
+    AiDAWorkbenchPanel* get_workbench();
 }
