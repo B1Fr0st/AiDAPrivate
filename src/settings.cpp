@@ -1,5 +1,4 @@
 #include "aida_pro.hpp"
-#include "vmp.hpp"
 
 #ifdef __NT__
 #include <windows.h>
@@ -116,18 +115,14 @@ static std::string unprotect_with_dpapi(const std::string& encoded, const char* 
 
 static std::string obfuscate_key(const std::string& plain)
 {
-    VMP_VIRT("obf_key");
     if (plain.empty())
-    {
-        VMP_END;
         return plain;
-    }
+
 
 #ifdef __NT__
     if (std::string protected_value = protect_with_dpapi(plain, "AiDA:settings:v1");
         !protected_value.empty())
     {
-        VMP_END;
         return protected_value;
     }
 #endif
@@ -143,33 +138,26 @@ static std::string obfuscate_key(const std::string& plain)
         qsnprintf(hex, sizeof(hex), "%02x", b);
         out += hex;
     }
-    VMP_END;
     return out;
 }
 
 static std::string deobfuscate_key(const std::string& encoded)
 {
-    VMP_VIRT("deobf_key");
     if (encoded.empty())
-    {
-        VMP_END;
         return encoded;
-    }
+
 
 #ifdef __NT__
     if (encoded.compare(0, sizeof(CFG_DPAPI_PREFIX) - 1, CFG_DPAPI_PREFIX) == 0)
     {
         std::string plaintext = unprotect_with_dpapi(encoded, "AiDA:settings:v1");
-        VMP_END;
         return plaintext;
     }
 #endif
 
     if (encoded.compare(0, sizeof(CFG_OBF_PREFIX) - 1, CFG_OBF_PREFIX) != 0)
-    {
-        VMP_END;
         return encoded;
-    }
+
 
     std::string hex_part = encoded.substr(sizeof(CFG_OBF_PREFIX) - 1);
     std::string out;
@@ -181,7 +169,6 @@ static std::string deobfuscate_key(const std::string& encoded)
         b ^= CFG_OBF_KEY[(i / 2) % sizeof(CFG_OBF_KEY)];
         out.push_back(static_cast<char>(b));
     }
-    VMP_END;
     return out;
 }
 
@@ -677,7 +664,6 @@ bool settings_t::load_from_file()
 
 std::string settings_t::get_active_api_key() const
 {
-    VMP_MUT("get_active_key");
     std::string result;
     qstring provider = ida_utils::qstring_tolower(api_provider.c_str());
     if (provider == OBFSTR_C("gemini"))
@@ -692,7 +678,6 @@ std::string settings_t::get_active_api_key() const
         result = copilot_proxy_address;
     else if (provider == OBFSTR_C("local llm"))
         result = local_llm_base_url;
-    VMP_END;
     return result;
 }
 

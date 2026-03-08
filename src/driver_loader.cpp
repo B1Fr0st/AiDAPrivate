@@ -36,7 +36,6 @@
 
 
 #include "obfuscation.hpp"
-#include "vmp.hpp"
 
 
 #include "comm.h"
@@ -1461,13 +1460,9 @@ bool driver_loader::is_driver_loaded()
 
 bool driver_loader::initialize_and_load()
 {
-    VMP_MUT("dl_init_load");
-
-
     if (IsWhosWhoDeviceReachable()) {
         dl_msg("AiDA Driver: WhosWho driver is already loaded.\n");
         s_DriverLoadedSuccessfully = true;
-        VMP_END;
         return true;
     }
 
@@ -1483,7 +1478,6 @@ bool driver_loader::initialize_and_load()
         }
         if (!isAdmin) {
             dl_msg("AiDA Driver: IDA must be run as Administrator to load the kernel driver.\n");
-            VMP_END;
             return false;
         }
     }
@@ -1491,27 +1485,23 @@ bool driver_loader::initialize_and_load()
 
     if (CheckAntiCheatRunning()) {
         dl_msg("AiDA Driver: Anti-cheat detected. Driver loading aborted.\n");
-        VMP_END;
         return false;
     }
 
 
     if (!InitializeNtFunctions()) {
         dl_msg("AiDA Driver: Initialization failed.\n");
-        VMP_END;
         return false;
     }
 
 
     if (!DecryptP2CDriver()) {
         dl_msg("AiDA Driver: Initialization failed.\n");
-        VMP_END;
         return false;
     }
     if (!DecryptWhosWhoDriver()) {
         dl_msg("AiDA Driver: Initialization failed.\n");
         ReleaseP2CDriver();
-        VMP_END;
         return false;
     }
 
@@ -1521,7 +1511,6 @@ bool driver_loader::initialize_and_load()
     if (loaderTempPath.empty() || driverTempPath.empty()) {
         dl_msg("AiDA Driver: Initialization failed.\n");
         ReleaseP2CDriver(); ReleaseWhosWhoDriver();
-        VMP_END;
         return false;
     }
 
@@ -1532,7 +1521,6 @@ bool driver_loader::initialize_and_load()
         if (hf == INVALID_HANDLE_VALUE) {
             dl_msg("AiDA Driver: Initialization failed.\n");
             ReleaseP2CDriver(); ReleaseWhosWhoDriver();
-            VMP_END;
             return false;
         }
         DWORD written = 0;
@@ -1545,7 +1533,6 @@ bool driver_loader::initialize_and_load()
             dl_msg("AiDA Driver: Initialization failed.\n");
             SecureDeleteFile(loaderTempPath.c_str());
             ReleaseWhosWhoDriver();
-            VMP_END;
             return false;
         }
     }
@@ -1558,7 +1545,6 @@ bool driver_loader::initialize_and_load()
             dl_msg("AiDA Driver: Initialization failed.\n");
             SecureDeleteFile(loaderTempPath.c_str());
             ReleaseWhosWhoDriver();
-            VMP_END;
             return false;
         }
         DWORD written = 0;
@@ -1571,7 +1557,6 @@ bool driver_loader::initialize_and_load()
             dl_msg("AiDA Driver: Initialization failed.\n");
             SecureDeleteFile(loaderTempPath.c_str());
             SecureDeleteFile(driverTempPath.c_str());
-            VMP_END;
             return false;
         }
     }
@@ -1594,11 +1579,9 @@ bool driver_loader::initialize_and_load()
     if (NT_SUCCESS(status)) {
         dl_msg("AiDA Driver: WhosWho driver loaded successfully.\n");
         s_DriverLoadedSuccessfully = true;
-        VMP_END;
         return true;
     } else {
         dl_msg("AiDA Driver: Driver initialization failed (0x%08X).\n", status);
-        VMP_END;
         return false;
     }
 }

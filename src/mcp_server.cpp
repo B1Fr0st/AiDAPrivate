@@ -965,14 +965,11 @@ int mcp_server_t::get_port() const
 
 bool mcp_server_t::start(int port)
 {
-    VMP_VIRT("mcp_start");
-
     {
         auto& lm = license_manager_t::instance();
         if (!lm.is_valid() || lm.get_runtime_nonce() == 0)
         {
             msg(OBFSTR_C("AiDA MCP: Cannot start — license not active.\n"));
-            VMP_END;
             return false;
         }
     }
@@ -980,7 +977,6 @@ bool mcp_server_t::start(int port)
     if (_running.load())
     {
         msg(OBFSTR_C("AiDA MCP: Server is already running on port %d.\n"), _port);
-        VMP_END;
         return true;
     }
 
@@ -994,7 +990,6 @@ bool mcp_server_t::start(int port)
     catch (const std::exception& e)
     {
         msg(OBFSTR_C("AiDA MCP: Failed to start server thread: %s\n"), e.what());
-        VMP_END;
         return false;
     }
 
@@ -1008,7 +1003,6 @@ bool mcp_server_t::start(int port)
         msg(OBFSTR_C("AiDA MCP: %zu tools available.\n"), tool_count);
         msg(OBFSTR_C("AiDA MCP: Streamable HTTP  -> http://127.0.0.1:%d/mcp  (also /sse)\n"), port);
         msg(OBFSTR_C("AiDA MCP: Legacy SSE       -> http://127.0.0.1:%d/sse\n"), port);
-        VMP_END;
         return true;
     }
     else
@@ -1016,7 +1010,6 @@ bool mcp_server_t::start(int port)
         msg(OBFSTR_C("AiDA MCP: Server failed to start on port %d (port may be in use).\n"), port);
         if (_server_thread.joinable())
             _server_thread.join();
-        VMP_END;
         return false;
     }
 }

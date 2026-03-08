@@ -122,6 +122,23 @@ set_target_properties(AiDA PROPERTIES
     SUFFIX      ".dll"
 )
 
+if(WIN32)
+    set_target_properties(AiDA PROPERTIES
+        PDB_NAME_DEBUG "AiDA"
+        PDB_NAME_RELEASE "AiDA"
+        PDB_NAME_RELWITHDEBINFO "AiDA"
+        COMPILE_PDB_NAME_DEBUG "AiDA"
+        COMPILE_PDB_NAME_RELEASE "AiDA"
+        COMPILE_PDB_NAME_RELWITHDEBINFO "AiDA"
+        PDB_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
+        PDB_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
+        PDB_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
+        COMPILE_PDB_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
+        COMPILE_PDB_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
+        COMPILE_PDB_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
+    )
+endif()
+
 if(UNIX AND NOT APPLE)
     set_target_properties(AiDA PROPERTIES SUFFIX ".so")
 elseif(APPLE)
@@ -162,17 +179,7 @@ if(WIN32)
         OPENSSL_NO_DYNAMIC_ENGINE
         QT_DLL
         QT_THREAD_SUPPORT
-        AIDA_USE_VMP
     )
-
-    target_link_directories(AiDA PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/VMProtect3.9.4/Lib/Windows"
-    )
-
-    # Delay-load VMProtectSDK64.dll so AiDA.dll loads even when the DLL is only
-    # in the plugins folder. DllMain resolves it by full path before first VMP call.
-    target_link_options(AiDA PRIVATE /DELAYLOAD:VMProtectSDK64.dll)
-    target_link_libraries(AiDA PRIVATE delayimp)
 elseif(APPLE)
     target_compile_definitions(AiDA PRIVATE __MAC__)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
@@ -187,6 +194,7 @@ target_link_libraries(AiDA PRIVATE "${IDA_LINK_LIB}")
 if(WIN32)
     target_compile_options(AiDA PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/W3>
+        $<$<COMPILE_LANGUAGE:CXX>:/Zi>
         $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
         $<$<COMPILE_LANGUAGE:CXX>:/permissive->
         $<$<COMPILE_LANGUAGE:CXX>:/Zp8>
@@ -228,6 +236,7 @@ if(WIN32)
     # PAGE_READONLY. This can trigger DEP violations or corrupt relocations
     # during DLL initialization, causing crashes at LoadLibrary time.
     target_link_options(AiDA PRIVATE
+        /DEBUG:FULL
         /OPT:REF,ICF
         /RELEASE
         /LTCG

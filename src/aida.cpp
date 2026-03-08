@@ -10,93 +10,6 @@
 #endif
 
 #ifdef __NT__
-#include <delayimp.h>
-#endif
-
-#ifdef __NT__
-static FARPROC WINAPI aida_delay_load_notify(
-    unsigned        dliNotify,
-    PDelayLoadInfo  pdli)
-{
-    if (dliNotify == dliNotePreLoadLibrary
-        && pdli != nullptr
-        && pdli->szDll != nullptr
-        && _stricmp(pdli->szDll, "VMProtectSDK64.dll") == 0)
-    {
-        HMODULE self = nullptr;
-        GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(&aida_delay_load_notify),
-            &self);
-        if (self != nullptr)
-        {
-            wchar_t path[MAX_PATH] = {};
-            if (GetModuleFileNameW(self, path, MAX_PATH) > 0)
-            {
-                wchar_t* sep = wcsrchr(path, L'\\');
-                if (sep != nullptr)
-                {
-                    wcscpy_s(sep + 1,
-                             MAX_PATH - static_cast<size_t>(sep + 1 - path),
-                             L"VMProtectSDK64.dll");
-                    HMODULE hVmp = LoadLibraryW(path);
-                    if (hVmp != nullptr)
-                        return reinterpret_cast<FARPROC>(hVmp);
-                }
-            }
-        }
-    }
-    return nullptr;
-}
-
-extern "C" const PfnDliHook __pfnDliNotifyHook2 = aida_delay_load_notify;
-
-static int __cdecl vmp_stub_zero(void) { return 0; }
-
-static const char*    __cdecl vmp_stub_decrypt_a(const char* s)    { return s; }
-static const wchar_t* __cdecl vmp_stub_decrypt_w(const wchar_t* s) { return s; }
-
-static FARPROC WINAPI aida_delay_load_failure(
-    unsigned        dliNotify,
-    PDelayLoadInfo  pdli)
-{
-    if (pdli == nullptr
-        || pdli->szDll == nullptr
-        || _stricmp(pdli->szDll, "VMProtectSDK64.dll") != 0)
-        return nullptr;
-
-    if (dliNotify == dliFailLoadLib)
-    {
-        HMODULE self = nullptr;
-        GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(&aida_delay_load_failure),
-            &self);
-        if (self != nullptr)
-            return reinterpret_cast<FARPROC>(self);
-    }
-
-    if (dliNotify == dliFailGetProc)
-    {
-        if (pdli->dlp.fImportByName && pdli->dlp.szProcName != nullptr)
-        {
-            if (_stricmp(pdli->dlp.szProcName, "VMProtectDecryptStringA") == 0)
-                return reinterpret_cast<FARPROC>(&vmp_stub_decrypt_a);
-            if (_stricmp(pdli->dlp.szProcName, "VMProtectDecryptStringW") == 0)
-                return reinterpret_cast<FARPROC>(&vmp_stub_decrypt_w);
-        }
-        return reinterpret_cast<FARPROC>(&vmp_stub_zero);
-    }
-
-    return nullptr;
-}
-
-extern "C" const PfnDliHook __pfnDliFailureHook2 = aida_delay_load_failure;
-#endif
-
-#ifdef __NT__
 extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL,
                                 DWORD     fdwReason,
                                 LPVOID    )
@@ -672,13 +585,10 @@ void aida_plugin_t::check_for_updates()
 
 bool idaapi aida_plugin_t::run(size_t)
 {
-    VMP_MUT("plugin_run");
-
     auto& license = license_manager_t::instance();
     if (!license.is_valid() || license.get_runtime_nonce() == 0)
     {
         warning(OBFSTR_C("License validation failed. Please restart IDA and enter a valid license key."));
-        VMP_END;
         return false;
     }
 
@@ -688,7 +598,6 @@ bool idaapi aida_plugin_t::run(size_t)
     }
 
     info(OBFSTR_C("Plugin is active. Use the right-click context menu in a code view or the Tools menu."));
-    VMP_END;
     return true;
 }
 
@@ -807,15 +716,12 @@ void aida_plugin_t::unregister_actions()
 
 static plugmod_t* idaapi init()
 {
-    VMP_ULTRA("plugin_init");
-
     g_settings.load_from_file();
 
 #ifdef __NT__
     if (!driver_loader::initialize_and_load())
     {
         msg(OBFSTR_C("AiDA: kernel driver attestation is required and could not be initialized.\n"));
-        VMP_END;
         return PLUGIN_SKIP;
     }
 
@@ -850,7 +756,6 @@ static plugmod_t* idaapi init()
         if (!activated || !license.is_valid())
         {
             msg(OBFSTR_C("Plugin requires a valid license to operate.\n"));
-            VMP_END;
             return PLUGIN_SKIP;
         }
     }
@@ -859,7 +764,6 @@ static plugmod_t* idaapi init()
 
     license.snapshot_function_prologues();
 
-    VMP_END;
     return new aida_plugin_t();
 }
 

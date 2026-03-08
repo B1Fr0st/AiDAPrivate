@@ -4,8 +4,6 @@
 #include <atomic>
 #include <cstdint>
 
-#include "vmp.hpp"
-
 class license_manager_t
 {
 public:
@@ -68,10 +66,7 @@ private:
 
 #ifdef __NT__
 #include <windows.h>
-#define AIDA_VLI_STR2(x) #x
-#define AIDA_VLI_TOSTR(x) AIDA_VLI_STR2(x)
 #define VERIFY_LICENSE_INLINE() do { \
-    VMP_MUT("vli_" AIDA_VLI_TOSTR(__LINE__)); \
     const auto& _lic = license_manager_t::instance(); \
     uint64_t _n = _lic.get_runtime_nonce(); \
      \
@@ -85,7 +80,6 @@ private:
         TerminateProcess(GetCurrentProcess(), 0xDEADu); \
         volatile int* _p = nullptr; *_p = 0x41694441; \
     } \
-    VMP_END; \
 } while (0)
 #else
 #define VERIFY_LICENSE_INLINE() do { \

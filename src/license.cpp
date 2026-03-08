@@ -33,22 +33,18 @@ static const std::string& get_firebase_host()
 
 static const std::string& get_hardcoded_firebase_api_key()
 {
-    VMP_VIRT("get_fb_key");
     static const std::string key = OBFBYTES("bWLmMKBhD3TE7iYMnKizIjOrt4jXd9R1m0CVCj6P");
-    VMP_END;
     return key;
 }
 
 static std::string get_effective_firebase_api_key()
 {
-    VMP_MUT("get_eff_key");
     std::string key = get_hardcoded_firebase_api_key();
 
     if (key.find("XXXXXXX") != std::string::npos || key.empty())
     {
         key = g_settings.firebase_api_key;
     }
-    VMP_END;
     return key;
 }
 
@@ -213,14 +209,12 @@ license_manager_t& license_manager_t::instance()
 
 std::string license_manager_t::encrypt_local(const std::string& plaintext) const
 {
-    VMP_VIRT("encrypt_local");
     std::string hwid = generate_hwid();
 
 #ifdef __NT__
     if (std::string protected_blob = protect_license_blob_dpapi(plaintext, hwid);
         !protected_blob.empty())
     {
-        VMP_END;
         return protected_blob;
     }
 #endif
@@ -272,21 +266,17 @@ std::string license_manager_t::encrypt_local(const std::string& plaintext) const
     for (unsigned char b : payload)
         hex << std::setw(2) << static_cast<int>(b);
 
-    VMP_END;
     return hex.str();
 }
 
 std::string license_manager_t::decrypt_local(const std::string& hex_input) const
 {
-    VMP_VIRT("decrypt_local");
-
 #ifdef __NT__
     if (hex_input.compare(0, std::strlen(LICENSE_DPAPI_PREFIX), LICENSE_DPAPI_PREFIX) == 0)
     {
         std::string plaintext = unprotect_license_blob_dpapi(hex_input, generate_hwid());
         if (!plaintext.empty())
         {
-            VMP_END;
             return plaintext;
         }
     }
@@ -303,7 +293,6 @@ std::string license_manager_t::decrypt_local(const std::string& hex_input) const
 
     if (raw.size() < 48)
     {
-        VMP_END;
         return decrypt_local_legacy(hex_input);
     }
 
@@ -335,7 +324,6 @@ std::string license_manager_t::decrypt_local(const std::string& hex_input) const
 
     if (computed_hex != stored_hex.str())
     {
-        VMP_END;
         return decrypt_local_legacy(hex_input);
     }
 
@@ -344,7 +332,6 @@ std::string license_manager_t::decrypt_local(const std::string& hex_input) const
     for (size_t i = 0; i < ct_len; ++i)
         plaintext.push_back(static_cast<char>(ct[i] ^ enc_key[i % 32]));
 
-    VMP_END;
     return plaintext;
 }
 
@@ -511,7 +498,6 @@ bool license_manager_t::write_license_config(const nlohmann::json& config) const
 
 std::string license_manager_t::generate_hwid() const
 {
-    VMP_VIRT("generate_hwid");
     uint64_t hash = 14695981039346656037ULL;
     auto fnv_mix = [&hash](uint64_t val)
     {
@@ -592,7 +578,6 @@ std::string license_manager_t::generate_hwid() const
     char buf[17];
     qsnprintf(buf, sizeof(buf), "%016llX",
               static_cast<unsigned long long>(hash));
-    VMP_END;
     return buf;
 }
 
@@ -614,33 +599,25 @@ bool license_manager_t::is_cache_valid(int64_t validated_at) const
 
 bool license_manager_t::detect_clock_rollback() const
 {
-    VMP_VIRT("detect_rollback");
     int64_t now = static_cast<int64_t>(std::time(nullptr));
     int64_t last_known = m_last_known_time.load(std::memory_order_acquire);
 
     if (last_known > 0 && now < last_known - 300)
-    {
-        VMP_END;
         return true;
-    }
-    VMP_END;
+
     return false;
 }
 
 bool license_manager_t::validate_with_server(const std::string& key)
 {
-    VMP_ULTRA("validate_server");
-
 #ifdef __NT__
     unsigned int _tsc_aux;
     uint64_t _tsc_start = __rdtscp(&_tsc_aux);
 #endif
 
     if (!firebase_authenticate())
-    {
-        VMP_END;
         return false;
-    }
+
 
     try
     {
@@ -652,10 +629,7 @@ bool license_manager_t::validate_with_server(const std::string& key)
         {
             std::string host = get_firebase_host();
             if (host.find(OBFSTR("firebasedatabase.app")) == std::string::npos)
-            {
-                VMP_END;
                 return false;
-            }
         }
 
         std::string path = OBFSTR("/licenses/") + key + OBFSTR(".json");
@@ -664,38 +638,28 @@ bool license_manager_t::validate_with_server(const std::string& key)
         auto res = client.Get(path);
 
         if (!res || res->status != 200)
-        {
-            VMP_END;
             return false;
-        }
+
 
         if (res->body.empty() || res->body.size() > 8192)
-        {
-            VMP_END;
             return false;
-        }
+
 
         auto j = nlohmann::json::parse(res->body, nullptr, false);
         if (j.is_null() || j.is_discarded() || !j.is_object())
-        {
-            VMP_END;
             return false;
-        }
+
 
         if (!j.contains(OBFSTR_C("active"))
             || !j.contains(OBFSTR_C("expires"))
             || !j.contains(OBFSTR_C("plan")))
-        {
-            VMP_END;
             return false;
-        }
+
 
         bool active = j.value(OBFSTR_C("active"), false);
         if (!active)
-        {
-            VMP_END;
             return false;
-        }
+
 
         std::string expires = j.value(OBFSTR_C("expires"), std::string(""));
         if (!expires.empty())
@@ -710,10 +674,7 @@ bool license_manager_t::validate_with_server(const std::string& key)
             char date_buf[11];
             std::strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &tm_now);
             if (std::string(date_buf) > expires)
-            {
-                VMP_END;
                 return false;
-            }
         }
 
         std::string bound_hwid = j.value(OBFSTR_C("hwid"), std::string(""));
@@ -722,16 +683,11 @@ bool license_manager_t::validate_with_server(const std::string& key)
         if (bound_hwid.empty())
         {
             if (!bind_hwid_to_license(key, current_hwid))
-            {
-                VMP_END;
                 return false;
-            }
         }
         else if (bound_hwid != current_hwid)
-        {
-            VMP_END;
             return false;
-        }
+
 
         m_plan = j.value(OBFSTR_C("plan"), std::string("standard"));
 
@@ -739,19 +695,14 @@ bool license_manager_t::validate_with_server(const std::string& key)
         {
             uint64_t _tsc_end = __rdtscp(&_tsc_aux);
             if ((_tsc_end - _tsc_start) > 150000000000ULL)
-            {
-                VMP_END;
                 return false;
-            }
         }
 #endif
 
-        VMP_END;
         return true;
     }
     catch (...)
     {
-        VMP_END;
         return false;
     }
 }
@@ -784,25 +735,18 @@ bool license_manager_t::bind_hwid_to_license(const std::string& key,
 
 bool license_manager_t::firebase_authenticate()
 {
-    VMP_ULTRA("firebase_auth");
-
     std::string secret = get_effective_firebase_api_key();
     if (secret.empty())
-    {
-        VMP_END;
         return true;
-    }
+
 
     m_id_token = secret;
 
-    VMP_END;
     return true;
 }
 
 bool license_manager_t::firebase_refresh_token_if_needed()
 {
-    VMP_ULTRA("firebase_refresh");
-
     if (m_id_token.empty())
     {
         std::string secret = get_effective_firebase_api_key();
@@ -810,29 +754,22 @@ bool license_manager_t::firebase_refresh_token_if_needed()
             m_id_token = secret;
     }
 
-    VMP_END;
     return true;
 }
 bool license_manager_t::validate()
 {
-    VMP_ULTRA("validate_license");
-
 #ifdef __NT__
     if (!driver_loader::is_driver_loaded())
-    {
-        VMP_END;
         return false;
-    }
+
 #endif
 
     auto config = read_license_config();
 
     std::string key = config.value(OBFSTR_C("license_key"), std::string(""));
     if (key.empty())
-    {
-        VMP_END;
         return false;
-    }
+
 
     int64_t validated_at = config.value(OBFSTR_C("license_validated_at"),
                                         static_cast<int64_t>(0));
@@ -876,7 +813,6 @@ bool license_manager_t::validate()
             m_integrity_seed.store(seed, std::memory_order_release);
         }
 
-        VMP_END;
         return true;
     }
 
@@ -924,11 +860,9 @@ bool license_manager_t::validate()
             m_integrity_seed.store(seed, std::memory_order_release);
         }
 
-        VMP_END;
         return true;
     }
 
-    VMP_END;
     return false;
 }
 
@@ -959,22 +893,18 @@ uint64_t license_manager_t::get_runtime_nonce() const
 
 bool license_manager_t::show_activation_dialog()
 {
-    VMP_ULTRA("activation_dialog");
     qstring key_input;
 
     if (!ask_str(&key_input, 0,
                  OBFSTR_C("Enter your license key to activate AiDA:")))
-    {
-        VMP_END;
         return false;
-    }
+
 
     key_input.trim2();
     if (key_input.empty())
     {
         warning(OBFSTR_C("No license key entered. "
                           "AiDA cannot load without a valid license."));
-        VMP_END;
         return false;
     }
 
@@ -1030,7 +960,6 @@ bool license_manager_t::show_activation_dialog()
         }
 
         info(OBFSTR_C("License activated successfully! Thank you for your purchase."));
-        VMP_END;
         return true;
     }
 
@@ -1039,20 +968,17 @@ bool license_manager_t::show_activation_dialog()
                       "- Your key is correct\n"
                       "- Your subscription is active\n"
                       "- This hardware is authorized"));
-    VMP_END;
     return false;
 }
 
 static int idaapi license_revalidation_timer_cb(void* )
 {
-    VMP_VIRT("reval_timer_cb");
     auto& lm = license_manager_t::instance();
 
 #ifdef __NT__
     if (!driver_loader::is_driver_loaded())
     {
         lm.invalidate_runtime();
-        VMP_END;
         return 7200000;
     }
 #endif
@@ -1060,7 +986,6 @@ static int idaapi license_revalidation_timer_cb(void* )
     if (!lm.verify_function_prologues())
     {
         lm.invalidate_runtime();
-        VMP_END;
         return 7200000;
     }
 
@@ -1087,30 +1012,23 @@ static int idaapi license_revalidation_timer_cb(void* )
         }
     }
 
-    VMP_END;
     return 7200000;
 }
 
 void license_manager_t::start_revalidation_timer()
 {
-    VMP_VIRT("start_reval_timer");
     m_last_known_time.store(
         static_cast<int64_t>(std::time(nullptr)), std::memory_order_release);
 
     register_timer(7200000, license_revalidation_timer_cb, nullptr);
-    VMP_END;
 }
 
 bool license_manager_t::verify_integrity_inline() const
 {
-    VMP_ULTRA("verify_integrity");
-
     uint64_t nonce = m_runtime_nonce.load(std::memory_order_acquire);
     if (nonce == 0)
-    {
-        VMP_END;
         return false;
-    }
+
 
     static const uint64_t bad_patterns[] = {
         0xFFFFFFFFFFFFFFFFULL,
@@ -1122,10 +1040,7 @@ bool license_manager_t::verify_integrity_inline() const
     for (uint64_t bad : bad_patterns)
     {
         if (nonce == bad)
-        {
-            VMP_END;
             return false;
-        }
     }
 
     uint64_t seed = m_integrity_seed.load(std::memory_order_acquire);
@@ -1133,26 +1048,18 @@ bool license_manager_t::verify_integrity_inline() const
     {
         uint64_t expected_relation = (nonce ^ 0xA5A5A5A5A5A5A5A5ULL) * 0x5851F42D4C957F2DULL;
         if (seed != expected_relation)
-        {
-            VMP_END;
             return false;
-        }
     }
 
     if (!m_valid.load(std::memory_order_acquire))
-    {
-        VMP_END;
         return false;
-    }
 
-    VMP_END;
+
     return true;
 }
 
 uint64_t license_manager_t::compute_integrity_checksum() const
 {
-    VMP_VIRT("compute_checksum");
-
     uint64_t hash = 14695981039346656037ULL;
 
     uint64_t nonce = m_runtime_nonce.load(std::memory_order_acquire);
@@ -1171,7 +1078,6 @@ uint64_t license_manager_t::compute_integrity_checksum() const
         hash *= 1099511628211ULL;
     }
 
-    VMP_END;
     return hash;
 }
 
@@ -1188,8 +1094,6 @@ static uint64_t fnv1a_bytes(const uint8_t* data, size_t len)
 
 void license_manager_t::snapshot_function_prologues()
 {
-    VMP_ULTRA("snap_prologues");
-
     using mfp_bool_const = bool (license_manager_t::*)() const;
     using mfp_uint64_const = uint64_t (license_manager_t::*)() const;
     using mfp_bool = bool (license_manager_t::*)();
@@ -1229,18 +1133,13 @@ void license_manager_t::snapshot_function_prologues()
     }
 
     m_prologues_initialized = true;
-    VMP_END;
 }
 
 bool license_manager_t::verify_function_prologues() const
 {
-    VMP_ULTRA("verify_prologues");
-
     if (!m_prologues_initialized)
-    {
-        VMP_END;
         return true;
-    }
+
 
     const void* targets[PROLOGUE_HASH_COUNT] = {};
 
@@ -1279,12 +1178,8 @@ bool license_manager_t::verify_function_prologues() const
             reinterpret_cast<const uint8_t*>(targets[i]), PROLOGUE_BYTES);
 
         if (current != m_prologue_hashes[i])
-        {
-            VMP_END;
             return false;
-        }
     }
 
-    VMP_END;
     return true;
 }

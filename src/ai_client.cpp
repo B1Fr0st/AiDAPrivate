@@ -2109,11 +2109,9 @@ std::string LocalLLMClient::_extract_sse_content(const nlohmann::json& j) const
 
 std::unique_ptr<AIClient> get_ai_client(const settings_t& settings)
 {
-    VMP_ULTRA("get_ai_client");
     if (!anti_re::guard())
     {
         msg(OBFSTR_C("AiDA: runtime attestation failed. AI features remain disabled until the driver trust path is restored.\n"));
-        VMP_END;
         return nullptr;
     }
     VERIFY_LICENSE_INLINE();
@@ -2121,14 +2119,12 @@ std::unique_ptr<AIClient> get_ai_client(const settings_t& settings)
     if (ida_utils::is_self_target_database())
     {
         msg(OBFSTR_C("AiDA: AI features are disabled while AiDA itself is the active analysis target.\n"));
-        VMP_END;
         return nullptr;
     }
 
     auto& lm = license_manager_t::instance();
     if (!lm.is_valid())
     {
-        VMP_END;
         return nullptr;
     }
 
@@ -2137,7 +2133,6 @@ std::unique_ptr<AIClient> get_ai_client(const settings_t& settings)
         if (n == 0 || n == 0xFFFFFFFFFFFFFFFFULL
             || !lm.verify_integrity_inline())
         {
-            VMP_END;
             return nullptr;
         }
     }
@@ -2174,10 +2169,8 @@ std::unique_ptr<AIClient> get_ai_client(const settings_t& settings)
     else
     {
         warning(OBFSTR_C("Unknown AI provider '%s' in settings. No AI features will be available."), provider.c_str());
-        VMP_END;
         return nullptr;
     }
 
-    VMP_END;
     return result;
 }

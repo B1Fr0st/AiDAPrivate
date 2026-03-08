@@ -5,11 +5,9 @@
 
 static bool ensure_licensed_and_ready(aida_plugin_t* plugin)
 {
-    VMP_ULTRA("ensure_licensed");
     if (!anti_re::guard())
     {
         warning(OBFSTR_C("AiDA: runtime attestation failed. AI actions are disabled for this session."));
-        VMP_END;
         return false;
     }
     VERIFY_LICENSE_INLINE();
@@ -17,7 +15,6 @@ static bool ensure_licensed_and_ready(aida_plugin_t* plugin)
     if (ida_utils::is_self_target_database())
     {
         warning(OBFSTR_C("AiDA: self-analysis is blocked for this database."));
-        VMP_END;
         return false;
     }
 
@@ -25,7 +22,6 @@ static bool ensure_licensed_and_ready(aida_plugin_t* plugin)
     if (!license.is_valid())
     {
         warning(OBFSTR_C("AiDA: License validation failed. Please restart IDA with a valid license."));
-        VMP_END;
         return false;
     }
 
@@ -44,14 +40,12 @@ static bool ensure_licensed_and_ready(aida_plugin_t* plugin)
     {
         if (nonce == bad)
         {
-            VMP_END;
             return false;
         }
     }
 
     if (!license.verify_integrity_inline())
     {
-        VMP_END;
         return false;
     }
 
@@ -59,14 +53,12 @@ static bool ensure_licensed_and_ready(aida_plugin_t* plugin)
         uint64_t ck = license.compute_integrity_checksum();
         if (ck == 0 || ck == 0xFFFFFFFFFFFFFFFFULL || ck == nonce)
         {
-            VMP_END;
             return false;
         }
     }
 
     if (!license.verify_function_prologues())
     {
-        VMP_END;
         return false;
     }
 
@@ -79,7 +71,6 @@ static bool ensure_licensed_and_ready(aida_plugin_t* plugin)
         uint64_t tsc_end = __rdtscp(&aux);
         if ((tsc_end - tsc_begin) > 50000000ULL)
         {
-            VMP_END;
             return false;
         }
     }
@@ -88,11 +79,9 @@ static bool ensure_licensed_and_ready(aida_plugin_t* plugin)
     if (!plugin || !plugin->ai_client || !plugin->ai_client->is_available())
     {
         warning(OBFSTR_C("AiDA: No AI client is available. Please configure a provider in Settings."));
-        VMP_END;
         return false;
     }
 
-    VMP_END;
     return true;
 }
 
@@ -915,10 +904,8 @@ void handle_toggle_mcp(action_activation_ctx_t*, aida_plugin_t* plugin)
 
 void handle_debug_analyze(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 {
-    VMP_MUT("handle_debug_analyze");
     if (!ensure_licensed_and_ready(plugin) || !can_use_ai(plugin))
     {
-        VMP_END;
         return;
     }
 
@@ -926,7 +913,6 @@ void handle_debug_analyze(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
     if (ea == BADADDR)
     {
         warning(OBFSTR_C("Place cursor on an address to analyze in debugger context."));
-        VMP_END;
         return;
     }
 
@@ -956,16 +942,12 @@ void handle_debug_analyze(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
                 "Debugger Analysis",
                 [](const std::string&) {});
         });
-
-    VMP_END;
 }
 
 void handle_debug_devirtualize(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 {
-    VMP_MUT("handle_debug_devirtualize");
     if (!ensure_licensed_and_ready(plugin) || !can_use_ai(plugin))
     {
-        VMP_END;
         return;
     }
 
@@ -973,7 +955,6 @@ void handle_debug_devirtualize(action_activation_ctx_t* ctx, aida_plugin_t* plug
     if (ea == BADADDR)
     {
         warning(OBFSTR_C("Place cursor on a virtualized function or VM entry point."));
-        VMP_END;
         return;
     }
 
@@ -1013,16 +994,12 @@ void handle_debug_devirtualize(action_activation_ctx_t* ctx, aida_plugin_t* plug
                 "Devirtualization",
                 [](const std::string&) {});
         });
-
-    VMP_END;
 }
 
 void handle_debug_trace_dispatch(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 {
-    VMP_MUT("handle_debug_trace_dispatch");
     if (!ensure_licensed_and_ready(plugin) || !can_use_ai(plugin))
     {
-        VMP_END;
         return;
     }
 
@@ -1030,7 +1007,6 @@ void handle_debug_trace_dispatch(action_activation_ctx_t* ctx, aida_plugin_t* pl
     if (ea == BADADDR)
     {
         warning(OBFSTR_C("Place cursor on an indirect call/jump instruction."));
-        VMP_END;
         return;
     }
 
@@ -1054,6 +1030,4 @@ void handle_debug_trace_dispatch(action_activation_ctx_t* ctx, aida_plugin_t* pl
                 "Dispatch Trace",
                 [](const std::string&) {});
         });
-
-    VMP_END;
 }
