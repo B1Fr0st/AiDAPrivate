@@ -20,6 +20,7 @@ public:
     bool detect_clock_rollback() const;
     void snapshot_function_prologues();
     bool verify_function_prologues() const;
+    bool perform_heartbeat();
 
     friend int idaapi license_revalidation_timer_cb(void*);
 
@@ -41,6 +42,11 @@ private:
 
     bool firebase_authenticate();
     bool firebase_refresh_token_if_needed();
+    bool validate_with_cloud_function(const std::string& key, const std::string& hwid);
+    std::string generate_session_nonce() const;
+    void terminate_plugin();
+    void compute_session_credentials(const std::string& key, const std::string& hwid,
+                                     int64_t ts, const std::string& server_token);
     std::string compute_hmac(const std::string& key,
                              const unsigned char* data, size_t len) const;
 
@@ -57,6 +63,17 @@ private:
 
     std::atomic<bool> m_revalidation_pending{false};
     std::string m_cached_key;
+
+    std::string m_server_session_token;
+    std::string m_session_id;
+    int64_t m_server_issued_at{0};
+    int64_t m_server_ttl{3600};
+    std::string m_client_nonce;
+    std::atomic<int> m_consecutive_heartbeat_failures{0};
+    std::atomic<bool> m_online_validated_this_session{false};
+
+    static constexpr int MAX_HEARTBEAT_FAILURES = 3;
+    static constexpr int REVALIDATION_INTERVAL_MS = 1800000;
 
     static constexpr size_t PROLOGUE_HASH_COUNT = 8;
     static constexpr size_t PROLOGUE_BYTES      = 32;

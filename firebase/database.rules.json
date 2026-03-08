@@ -1,0 +1,16 @@
+{
+  "rules": {
+    "licenses": {
+      "$key": {
+        ".read": "auth != null",
+        ".write": false
+      }
+    },
+    "sessions": {
+      ".read": false,
+      ".write": false
+    },
+    ".read": false,
+    ".write": false
+  }
+}
