@@ -11147,37 +11147,99 @@ static std::uint64_t get_ldr_module_size(voyager::device_t* dev, std::uint64_t m
 {
 
 
-    if (!dev || !dev->is_connected() || dev->get_process_id() == 0)
-        return 0;
-
-    voyager::device_t::peb_info peb{};
-    if (!dev->read_peb(peb) || peb.ldr_address == 0)
-        return 0;
-
-
-    std::uint64_t list_head = peb.ldr_address + 0x10;
-    std::uint64_t first_entry = dev->read<std::uint64_t>(list_head);
-    if (first_entry == 0 || first_entry == list_head)
-        return 0;
-
-    std::uint64_t current = first_entry;
-    int max_iter = 1024;
-
-    while (current != list_head && current != 0 && max_iter-- > 0)
+    struct ldr_module_info_t
     {
-        std::uint64_t dll_base = dev->read<std::uint64_t>(current + 0x30);
-        if (dll_base == module_base)
-        {
-            std::uint32_t ldr_size = dev->read<std::uint32_t>(current + 0x40);
-            if (ldr_size > 0)
-                return static_cast<std::uint64_t>(ldr_size);
-        }
-        std::uint64_t next = dev->read<std::uint64_t>(current);
-        if (next == current) break;
-        current = next;
-    }
+        std::uint64_t base = 0;
+        std::uint64_t entry_point = 0;
+        std::uint32_t size = 0;
+        std::string name;
+        std::string path;
+    };
 
-    return 0;
+    auto to_lower_ascii = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return value;
+    };
+
+    auto read_remote_unicode_ascii = [](voyager::device_t* device,
+                                        std::uint64_t ptr,
+                                        std::uint16_t byte_len,
+                                        std::uint16_t max_len) -> std::string {
+        if (device == nullptr || ptr == 0 || byte_len == 0 || byte_len > max_len)
+            return {};
+
+        std::vector<std::uint8_t> raw(byte_len, 0);
+        if (device->read_raw(ptr, raw.data(), byte_len) == 0)
+            return {};
+
+        std::string text;
+        text.reserve(byte_len / 2);
+        for (std::size_t i = 0; i + 1 < raw.size(); i += 2)
+        {
+            std::uint16_t wc = raw[i] | (static_cast<std::uint16_t>(raw[i + 1]) << 8);
+            if (wc == 0)
+                break;
+            text += (wc < 128 && wc >= 32) ? static_cast<char>(wc) : '?';
+        }
+        return text;
+    };
+
+    auto visit_ldr_modules = [&](const std::function<bool(const ldr_module_info_t&)>& visitor) -> bool {
+        if (!dev || !dev->is_connected() || dev->get_process_id() == 0)
+            return false;
+
+        voyager::device_t::peb_info peb{};
+        if (!dev->read_peb(peb) || peb.ldr_address == 0)
+            return false;
+
+        std::uint64_t list_head = peb.ldr_address + 0x10;
+        std::uint64_t first_entry = dev->read<std::uint64_t>(list_head);
+        if (first_entry == 0 || first_entry == list_head)
+            return false;
+
+        std::uint64_t current = first_entry;
+        int max_iter = 1024;
+
+        while (current != list_head && current != 0 && max_iter-- > 0)
+        {
+            ldr_module_info_t info;
+            info.base        = dev->read<std::uint64_t>(current + 0x30);
+            info.entry_point = dev->read<std::uint64_t>(current + 0x38);
+            info.size        = dev->read<std::uint32_t>(current + 0x40);
+            info.path        = read_remote_unicode_ascii(
+                dev,
+                dev->read<std::uint64_t>(current + 0x50),
+                dev->read<std::uint16_t>(current + 0x48),
+                1024);
+            info.name        = read_remote_unicode_ascii(
+                dev,
+                dev->read<std::uint64_t>(current + 0x60),
+                dev->read<std::uint16_t>(current + 0x58),
+                520);
+
+            if (info.base != 0 && !info.name.empty() && visitor(info))
+                return true;
+
+            std::uint64_t next = dev->read<std::uint64_t>(current);
+            if (next == current)
+                break;
+            current = next;
+        }
+
+        return true;
+    };
+
+    ldr_module_info_t found;
+    bool matched = false;
+    visit_ldr_modules([&](const ldr_module_info_t& info) {
+        if (info.base != module_base)
+            return false;
+        found = info;
+        matched = true;
+        return true;
+    });
+    return matched ? static_cast<std::uint64_t>(found.size) : 0;
 }
 
 static void cleanup_exception_directory(
@@ -11254,55 +11316,6 @@ static std::string get_ldr_module_file_path(
     voyager::device_t* dev,
     std::uint64_t module_base)
 {
-    if (!dev || !dev->is_connected() || dev->get_process_id() == 0)
-        return {};
-
-    voyager::device_t::peb_info peb{};
-    if (!dev->read_peb(peb) || peb.ldr_address == 0)
-        return {};
-
-
-    std::uint64_t list_head = peb.ldr_address + 0x10;
-    std::uint64_t first_entry = dev->read<std::uint64_t>(list_head);
-    if (first_entry == 0 || first_entry == list_head)
-        return {};
-
-    std::uint64_t current = first_entry;
-    int max_iter = 1024;
-
-    while (current != list_head && current != 0 && max_iter-- > 0)
-    {
-
-        std::uint64_t dll_base = dev->read<std::uint64_t>(current + 0x30);
-        if (dll_base == module_base)
-        {
-
-
-            std::uint16_t name_len = dev->read<std::uint16_t>(current + 0x48);
-            std::uint64_t name_ptr = dev->read<std::uint64_t>(current + 0x50);
-
-            if (name_len > 0 && name_len < 1024 && name_ptr != 0)
-            {
-                std::vector<std::uint8_t> raw(name_len, 0);
-                dev->read_raw(name_ptr, raw.data(), name_len);
-                std::string path;
-                path.reserve(name_len / 2);
-                for (std::size_t i = 0; i + 1 < name_len; i += 2)
-                {
-                    std::uint16_t wc = raw[i] | (static_cast<std::uint16_t>(raw[i + 1]) << 8);
-                    if (wc == 0) break;
-                    path += (wc < 128 && wc >= 32) ? static_cast<char>(wc) : '?';
-                }
-                return path;
-            }
-            return {};
-        }
-
-        std::uint64_t next = dev->read<std::uint64_t>(current);
-        if (next == current) break;
-        current = next;
-    }
-
     return {};
 }
 
@@ -11435,136 +11448,28 @@ static vad_dump_plan_t build_vad_dump_plan(
     std::uint64_t pe_size_of_image,
     nlohmann::json& steps_log)
 {
+    qnotused(dev);
+
     vad_dump_plan_t plan;
     plan.module_base = module_base;
     plan.pe_size_of_image = pe_size_of_image;
     plan.total_span = pe_size_of_image;
 
+    if (plan.total_span == 0)
+        plan.total_span = 0x1000;
 
-    std::uint64_t ldr_size = get_ldr_module_size(dev, module_base);
-    if (ldr_size > pe_size_of_image)
-    {
-        steps_log.push_back({{"step", "ldr_size_check"}, {"ok", true},
-            {"detail", "LDR reports larger SizeOfImage (0x" +
-                       (std::ostringstream() << std::hex << std::uppercase << ldr_size).str() +
-                       " vs PE header 0x" +
-                       (std::ostringstream() << std::hex << std::uppercase << pe_size_of_image).str() +
-                       "), using LDR value"}});
-        pe_size_of_image = ldr_size;
-        plan.pe_size_of_image = pe_size_of_image;
-        plan.total_span = pe_size_of_image;
-    }
-    else if (ldr_size > 0)
-    {
-        steps_log.push_back({{"step", "ldr_size_check"}, {"ok", true},
-            {"detail", "LDR SizeOfImage matches PE header"}});
-    }
-
-    constexpr std::uint64_t MAX_SCAN_RANGE = 0x200000000ULL;
-    std::uint64_t scan_end = module_base + MAX_SCAN_RANGE;
-    if (scan_end < module_base)
-        scan_end = 0x7FFFFFFFFFFFFFFFULL;
-
-
-    auto all_regions = enumerate_all_memory_regions_paginated(dev, module_base, scan_end, true);
-
-    if (all_regions.empty())
-    {
-        steps_log.push_back({{"step", "vad_walk"}, {"ok", false},
-            {"detail", "enumerate_memory_regions returned empty, falling back to SizeOfImage"}});
-        plan.regions.push_back({0, pe_size_of_image, 0});
-        plan.total_committed_bytes = pe_size_of_image;
-        plan.committed_region_count = 1;
-        return plan;
-    }
-
-    std::sort(all_regions.begin(), all_regions.end(),
-        [](const voyager::detail::region_entry& a, const voyager::detail::region_entry& b) {
-            return a.base < b.base;
-        });
-
-    constexpr std::uint32_t VMEM_COMMIT  = 0x1000;
-    constexpr std::uint32_t VMEM_RESERVE = 0x2000;
-    constexpr std::uint32_t VMEM_FREE    = 0x10000;
-
-
-    constexpr std::uint64_t MAX_GAP     = 0x80000000ULL;
-
-    std::uint64_t current_max_extent = module_base + pe_size_of_image;
-
-    for (const auto& r : all_regions)
-    {
-        if (r.state == VMEM_FREE)
-            continue;
-
-        if (r.base + r.size <= module_base)
-            continue;
-
-        if (r.base > current_max_extent + MAX_GAP)
-            break;
-
-        std::uint64_t region_end = r.base + r.size;
-        if (region_end > current_max_extent)
-            current_max_extent = region_end;
-
-        if (r.state & VMEM_COMMIT)
-        {
-            std::uint64_t read_base = r.base;
-            std::uint64_t read_size = r.size;
-
-            if (read_base < module_base)
-            {
-                std::uint64_t skip = module_base - read_base;
-                read_base = module_base;
-                read_size = (read_size > skip) ? (read_size - skip) : 0;
-            }
-
-            if (read_size > 0)
-            {
-                vad_dump_plan_t::region_t region;
-                region.offset = read_base - module_base;
-                region.size = read_size;
-                region.protect = r.protect;
-
-                plan.regions.push_back(region);
-                plan.total_committed_bytes += read_size;
-                plan.committed_region_count++;
-            }
-        }
-    }
-
-    plan.total_span = current_max_extent - module_base;
-
-    if (plan.total_span < pe_size_of_image)
-        plan.total_span = pe_size_of_image;
-
-    constexpr std::uint64_t MAX_DUMP_SIZE = 0x200000000ULL;
-    if (plan.total_span > MAX_DUMP_SIZE)
-        plan.total_span = MAX_DUMP_SIZE;
-
-    plan.used_vad = true;
-
-    if (plan.regions.empty())
-    {
-        plan.regions.push_back({0, pe_size_of_image, 0});
-        plan.total_committed_bytes = pe_size_of_image;
-        plan.committed_region_count = 1;
-        plan.used_vad = false;
-    }
+    plan.regions.push_back({0, plan.total_span, 0});
+    plan.total_committed_bytes = plan.total_span;
+    plan.committed_region_count = 1;
+    plan.used_vad = false;
 
     std::ostringstream detail_ss;
-    detail_ss << plan.committed_region_count << " committed regions, span 0x"
+    detail_ss << "raw runtime snapshot over exact module span 0x"
               << std::hex << std::uppercase << plan.total_span
               << " (" << std::dec << (plan.total_span / (1024 * 1024)) << " MB)"
-              << ", PE SizeOfImage 0x" << std::hex << pe_size_of_image
-              << " (" << std::dec << (pe_size_of_image / (1024 * 1024)) << " MB)";
-    if (plan.total_span > pe_size_of_image)
-        detail_ss << ", extended by " << std::dec
-                  << ((plan.total_span - pe_size_of_image) / (1024 * 1024)) << " MB";
-    if (ldr_size > 0)
-        detail_ss << ", LDR size 0x" << std::hex << ldr_size;
+              << ", 1 region, no VAD expansion or reconstruction";
 
-    steps_log.push_back({{"step", "vad_walk"}, {"ok", true}, {"detail", detail_ss.str()}});
+    steps_log.push_back({{"step", "module_range"}, {"ok", true}, {"detail", detail_ss.str()}});
 
     return plan;
 }
@@ -12133,12 +12038,177 @@ tool_result_t driver_dump_module(const json& params)
     std::uint64_t dtb = device->get_dtb();
     log("solve_dtb", dtb != 0, helpers::format_address(dtb));
 
+    struct resolved_module_t
+    {
+        std::uint64_t base = 0;
+        std::uint64_t entry_point = 0;
+        std::uint32_t size = 0;
+        std::string name;
+        std::string path;
+    };
+
+    auto to_lower_ascii = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return value;
+    };
+
+    auto basename_of_path = [](const std::string& path) {
+        std::string::size_type pos = path.find_last_of("\\/");
+        return pos == std::string::npos ? path : path.substr(pos + 1);
+    };
+
+    auto read_remote_unicode_ascii = [](voyager::device_t* dev,
+                                        std::uint64_t ptr,
+                                        std::uint16_t byte_len,
+                                        std::uint16_t max_len) -> std::string {
+        if (dev == nullptr || ptr == 0 || byte_len == 0 || byte_len > max_len)
+            return {};
+
+        std::vector<std::uint8_t> raw(byte_len, 0);
+        if (dev->read_raw(ptr, raw.data(), byte_len) == 0)
+            return {};
+
+        std::string text;
+        text.reserve(byte_len / 2);
+        for (std::size_t i = 0; i + 1 < raw.size(); i += 2)
+        {
+            std::uint16_t wc = raw[i] | (static_cast<std::uint16_t>(raw[i + 1]) << 8);
+            if (wc == 0)
+                break;
+            text += (wc < 128 && wc >= 32) ? static_cast<char>(wc) : '?';
+        }
+        return text;
+    };
+
+    auto visit_ldr_modules = [&](const std::function<bool(const resolved_module_t&)>& visitor) -> bool {
+        voyager::device_t::peb_info peb{};
+        if (!device->read_peb(peb) || peb.ldr_address == 0)
+            return false;
+
+        std::uint64_t list_head = peb.ldr_address + 0x10;
+        std::uint64_t first_entry = device->read<std::uint64_t>(list_head);
+        if (first_entry == 0 || first_entry == list_head)
+            return false;
+
+        std::uint64_t current = first_entry;
+        int max_iter = 1024;
+
+        while (current != list_head && current != 0 && max_iter-- > 0)
+        {
+            resolved_module_t info;
+            info.base        = device->read<std::uint64_t>(current + 0x30);
+            info.entry_point = device->read<std::uint64_t>(current + 0x38);
+            info.size        = device->read<std::uint32_t>(current + 0x40);
+            info.path        = read_remote_unicode_ascii(
+                device.get(),
+                device->read<std::uint64_t>(current + 0x50),
+                device->read<std::uint16_t>(current + 0x48),
+                1024);
+            info.name        = read_remote_unicode_ascii(
+                device.get(),
+                device->read<std::uint64_t>(current + 0x60),
+                device->read<std::uint16_t>(current + 0x58),
+                520);
+
+            if (info.base != 0 && !info.name.empty() && visitor(info))
+                return true;
+
+            std::uint64_t next = device->read<std::uint64_t>(current);
+            if (next == current || next == 0)
+                break;
+            current = next;
+        }
+
+        return true;
+    };
+
+    auto find_ldr_module_by_base = [&](std::uint64_t module_base, resolved_module_t* out) {
+        bool found = false;
+        visit_ldr_modules([&](const resolved_module_t& info) {
+            if (info.base != module_base)
+                return false;
+            if (out != nullptr)
+                *out = info;
+            found = true;
+            return true;
+        });
+        return found;
+    };
+
+    auto find_ldr_module_by_query = [&](const std::string& query, resolved_module_t* out) {
+        if (query.empty())
+            return false;
+
+        const std::string needle = to_lower_ascii(query);
+        bool exact_found = false;
+        bool partial_found = false;
+        resolved_module_t exact_match;
+        resolved_module_t partial_match;
+
+        visit_ldr_modules([&](const resolved_module_t& info) {
+            const std::string lower_name = to_lower_ascii(info.name);
+            const std::string lower_path = to_lower_ascii(info.path);
+            const std::string lower_file = to_lower_ascii(basename_of_path(info.path));
+            const bool exact = lower_name == needle || lower_path == needle || lower_file == needle;
+            const bool partial = !exact && (
+                lower_name.find(needle) != std::string::npos ||
+                lower_path.find(needle) != std::string::npos ||
+                lower_file.find(needle) != std::string::npos);
+
+            if (exact)
+            {
+                exact_match = info;
+                exact_found = true;
+                return true;
+            }
+            if (!partial_found && partial)
+            {
+                partial_match = info;
+                partial_found = true;
+            }
+            return false;
+        });
+
+        if (exact_found)
+        {
+            if (out != nullptr)
+                *out = exact_match;
+            return true;
+        }
+        if (partial_found)
+        {
+            if (out != nullptr)
+                *out = partial_match;
+            return true;
+        }
+        return false;
+    };
+
+    const std::string module_query = params.value("module", std::string());
+    if (params.contains("decrypt_timeout"))
+        log("decrypt_timeout", true, "Ignored: raw runtime dump mode does not perform decrypt polling");
+
     ea_t base = BADADDR;
     if (params.contains("address"))
     {
         auto a = helpers::parse_address(params["address"].get<std::string>());
         if (a) base = *a;
     }
+
+    resolved_module_t resolved_module;
+    bool have_resolved_module = false;
+
+    if ((base == BADADDR || base == 0) && !module_query.empty())
+    {
+        have_resolved_module = find_ldr_module_by_query(module_query, &resolved_module);
+        if (!have_resolved_module)
+            return tool_result_t::error(OBFSTR("Loaded module not found: ") + module_query);
+        base = static_cast<ea_t>(resolved_module.base);
+        log("resolve_module", true,
+            resolved_module.name + " @ " + helpers::format_address(base));
+    }
+
     if (base == BADADDR || base == 0)
     {
         std::uint64_t img_base = device->find_image();
@@ -12147,6 +12217,10 @@ tool_result_t driver_dump_module(const json& params)
     }
     if (base == 0 || base == BADADDR)
         return tool_result_t::error(OBFSTR("Invalid module base. Provide 'address' or attach to a process first."));
+
+    if (!have_resolved_module)
+        have_resolved_module = find_ldr_module_by_base(static_cast<std::uint64_t>(base), &resolved_module);
+
     log("find_image_base", true, helpers::format_address(base));
 
     bool header_wiped = false;
@@ -12195,20 +12269,27 @@ tool_result_t driver_dump_module(const json& params)
             "MZ signature wiped/missing — anti-cheat header erasure detected. Will synthesize after dump.");
     }
 
-    if (pe_size_of_image == 0)
-    {
+    std::uint64_t ldr_sz = 0;
+    if (have_resolved_module && resolved_module.size > 0)
+        ldr_sz = resolved_module.size;
+    else
+        ldr_sz = get_ldr_module_size(device.get(), base);
 
-        std::uint64_t ldr_sz = get_ldr_module_size(device.get(), base);
-        if (ldr_sz > 0)
-            pe_size_of_image = static_cast<std::uint32_t>(ldr_sz);
-        else
-            pe_size_of_image = static_cast<std::uint32_t>(params.value("size", (std::size_t)0x2000000));
-    }
+    if (params.contains("size"))
+        pe_size_of_image = static_cast<std::uint32_t>(params.value("size", static_cast<std::size_t>(pe_size_of_image)));
+    else if (ldr_sz > 0)
+        pe_size_of_image = static_cast<std::uint32_t>(ldr_sz);
+    else if (pe_size_of_image == 0)
+        pe_size_of_image = 0x2000000;
 
-    std::string module_name = params.value("process", std::string("module"));
+    std::string module_name = have_resolved_module && !resolved_module.name.empty()
+        ? resolved_module.name
+        : params.value("process", std::string("module"));
 
 
-    std::string module_disk_path = get_ldr_module_file_path(device.get(), base);
+    std::string module_disk_path = have_resolved_module && !resolved_module.path.empty()
+        ? resolved_module.path
+        : get_ldr_module_file_path(device.get(), base);
     if (!module_disk_path.empty())
         log("resolve_disk_path", true, module_disk_path);
 
@@ -12220,25 +12301,6 @@ tool_result_t driver_dump_module(const json& params)
         device.get(), base, pe_hdr, hdr_read, has_valid_pe, header_wiped,
         pe_off, sections_count, sec_table_off, pe_size_of_image, false, steps);
 
-
-    {
-        int decrypted = force_decrypt_via_shellcode(
-            device.get(), base, pe_hdr, hdr_read, has_valid_pe,
-            pe_off, sections_count, sec_table_off, pe_size_of_image, steps);
-        if (decrypted > 0)
-            msg(OBFSTR_C("AiDA: Pre-dump exception-based decryption complete — %d pages triggered\n"), decrypted);
-    }
-
-
-    if (has_valid_pe && !header_wiped)
-    {
-        int forced = force_code_pages_in_memory(
-            device.get(), base, pe_hdr, hdr_read, has_valid_pe,
-            pe_off, sections_count, sec_table_off, pe_size_of_image, steps);
-        if (forced > 0)
-            msg(OBFSTR_C("AiDA: Pre-dump page forcing complete — %d pages touched\n"), forced);
-    }
-
     vad_dump_plan_t vad_plan = build_vad_dump_plan(device.get(), base, pe_size_of_image, steps);
 
     std::size_t module_size = static_cast<std::size_t>(vad_plan.total_span);
@@ -12247,7 +12309,7 @@ tool_result_t driver_dump_module(const json& params)
     if (module_size > 0x200000000ULL)
         return tool_result_t::error(OBFSTR("Module size too large (>8GB): ") + std::to_string(module_size));
 
-    msg(OBFSTR_C("AiDA: VAD dump plan — %d committed regions, span 0x%zX (%zu MB), PE SizeOfImage 0x%X (%u MB)\n"),
+    msg(OBFSTR_C("AiDA: Module dump plan — %d region, span 0x%zX (%zu MB), image size 0x%X (%u MB)\n"),
         vad_plan.committed_region_count, module_size, module_size / (1024 * 1024),
         pe_size_of_image, pe_size_of_image / (1024 * 1024));
 
@@ -12403,211 +12465,7 @@ tool_result_t driver_dump_module(const json& params)
     }
 
 
-    if (!code_sections.empty())
-    {
-        std::vector<std::size_t> encrypted_pages;
-        for (const auto& cs : code_sections)
-        {
-            for (std::size_t pg_off = cs.offset; pg_off < cs.offset + cs.size; pg_off += DUMP_PAGE)
-            {
-                if (pg_off >= module_size) break;
-                std::size_t pg_sz = std::min(DUMP_PAGE, module_size - pg_off);
-
-
-                bool is_empty = true;
-                for (std::size_t i = 0; i < pg_sz; i++)
-                {
-                    std::uint8_t b = module_data[pg_off + i];
-                    if (b != 0x00 && b != 0xCC)
-                    {
-                        is_empty = false;
-                        break;
-                    }
-                }
-                if (is_empty)
-                    encrypted_pages.push_back(pg_off);
-            }
-        }
-
-        if (!encrypted_pages.empty())
-        {
-            int decrypt_timeout_s = 0;
-            if (params.contains("decrypt_timeout"))
-            {
-                if (params["decrypt_timeout"].is_number())
-                    decrypt_timeout_s = params["decrypt_timeout"].get<int>();
-                else if (params["decrypt_timeout"].is_string())
-                {
-                    try { decrypt_timeout_s = std::stoi(params["decrypt_timeout"].get<std::string>()); }
-                    catch (...) {}
-                }
-            }
-            if (decrypt_timeout_s <= 0)
-            {
-
-
-                decrypt_timeout_s = 10 + static_cast<int>(encrypted_pages.size()) / 256;
-                if (decrypt_timeout_s > 30) decrypt_timeout_s = 30;
-            }
-
-            int initial_encrypted = static_cast<int>(encrypted_pages.size());
-            int total_recovered_pages = 0;
-            msg(OBFSTR_C("AiDA: Found %d encrypted code pages — continuous decrypt polling (timeout %ds)...\n"),
-                initial_encrypted, decrypt_timeout_s);
-
-            thread_guard.resume();
-            log("decrypt_resume", true, "Threads resumed for continuous decrypt polling (" +
-                std::to_string(decrypt_timeout_s) + "s timeout, " +
-                std::to_string(initial_encrypted) + " encrypted pages)");
-
-            Sleep(500);
-
-            DWORD poll_start = GetTickCount();
-            DWORD last_progress = poll_start;
-            DWORD last_dtb_refresh = 0;
-            constexpr DWORD STALL_TIMEOUT = 10000;
-            constexpr DWORD POLL_SLEEP = 200;
-            constexpr DWORD DTB_REFRESH_INTERVAL = 5000;
-
-            while (!encrypted_pages.empty())
-            {
-                DWORD now = GetTickCount();
-                DWORD elapsed = now - poll_start;
-
-                if (elapsed >= static_cast<DWORD>(decrypt_timeout_s) * 1000)
-                {
-                    msg(OBFSTR_C("AiDA: Decrypt polling timeout reached (%ds)\n"), decrypt_timeout_s);
-                    break;
-                }
-
-                if (now - last_progress >= STALL_TIMEOUT && total_recovered_pages > 0)
-                {
-                    msg(OBFSTR_C("AiDA: No decrypt progress for %ds, stopping\n"), STALL_TIMEOUT / 1000);
-                    break;
-                }
-
-                if (now - last_dtb_refresh >= DTB_REFRESH_INTERVAL)
-                {
-                    device->solve_dtb();
-                    last_dtb_refresh = now;
-                }
-
-                replace_wait_box(
-                    "HIDECANCEL\nAiDA: Decrypt polling — %zu/%d pages remaining, "
-                    "%d recovered (%.0fs / %ds)...",
-                    encrypted_pages.size(), initial_encrypted,
-                    total_recovered_pages, elapsed / 1000.0, decrypt_timeout_s);
-
-                int round_recovered = 0;
-                std::vector<std::size_t> still_encrypted;
-
-                for (std::size_t pg_off : encrypted_pages)
-                {
-                    if (pg_off >= module_size) continue;
-                    std::size_t pg_sz = std::min(DUMP_PAGE, module_size - pg_off);
-
-
-                    std::vector<std::uint8_t> tmp(pg_sz, 0);
-                    std::size_t pg_got = device->read_raw(base + pg_off, tmp.data(), pg_sz);
-
-                    if (pg_got >= pg_sz)
-                    {
-
-                        bool still_empty = true;
-                        for (std::size_t i = 0; i < pg_sz; i++)
-                        {
-                            if (tmp[i] != 0x00 && tmp[i] != 0xCC)
-                            {
-                                still_empty = false;
-                                break;
-                            }
-                        }
-
-                        if (!still_empty)
-                        {
-
-                            std::memcpy(module_data.data() + pg_off, tmp.data(), pg_sz);
-                            total_read += pg_sz;
-                            round_recovered++;
-                        }
-                        else
-                        {
-                            still_encrypted.push_back(pg_off);
-                        }
-                    }
-                    else
-                    {
-                        still_encrypted.push_back(pg_off);
-                    }
-                }
-
-                total_recovered_pages += round_recovered;
-                encrypted_pages = std::move(still_encrypted);
-
-                if (round_recovered > 0)
-                {
-                    last_progress = GetTickCount();
-                    msg(OBFSTR_C("AiDA: Decrypt poll: +%d pages (%d/%d total), %zu remaining\n"),
-                        round_recovered, total_recovered_pages, initial_encrypted,
-                        encrypted_pages.size());
-                }
-
-                if (encrypted_pages.empty())
-                    break;
-
-                Sleep(POLL_SLEEP);
-            }
-
-            if (total_recovered_pages > 0)
-            {
-                log("decrypt_poll", true, std::to_string(total_recovered_pages) + "/" +
-                    std::to_string(initial_encrypted) + " encrypted pages recovered, " +
-                    std::to_string(encrypted_pages.size()) + " still encrypted");
-                msg(OBFSTR_C("AiDA: Decrypt polling complete: %d/%d pages recovered\n"),
-                    total_recovered_pages, initial_encrypted);
-            }
-            else
-            {
-                log("decrypt_poll", false, std::to_string(encrypted_pages.size()) +
-                    " pages remain encrypted after " + std::to_string(decrypt_timeout_s) + "s polling");
-            }
-        }
-    }
-
-
-    for (const auto& cs : code_sections)
-    {
-        for (std::size_t pg_off = cs.offset; pg_off < cs.offset + cs.size; pg_off += DUMP_PAGE)
-        {
-            if (pg_off >= module_size) break;
-            std::size_t pg_sz = std::min(DUMP_PAGE, module_size - pg_off);
-
-            bool is_all_zero = true;
-            for (std::size_t i = 0; i < pg_sz; i++)
-            {
-                if (module_data[pg_off + i] != 0x00)
-                {
-                    is_all_zero = false;
-                    break;
-                }
-            }
-            if (is_all_zero)
-                std::memset(module_data.data() + pg_off, 0x90, pg_sz);
-        }
-    }
-
     hide_wait_box();
-
-
-    if (!failed_offsets.empty() && !module_disk_path.empty())
-    {
-        int disk_recovered = try_fill_from_disk_pe(module_data, failed_offsets, module_disk_path, steps);
-        if (disk_recovered > 0)
-        {
-            failed_pages -= disk_recovered;
-            total_read += static_cast<std::size_t>(disk_recovered) * DUMP_PAGE;
-        }
-    }
 
     log("dump_image", total_read > 0, std::to_string(total_read) + "/" + std::to_string(module_size) + " bytes" +
         (failed_pages > 0 ? (", " + std::to_string(failed_pages) + " pages unreadable") : ""));
@@ -12616,211 +12474,6 @@ tool_result_t driver_dump_module(const json& params)
     thread_guard.resume();
     log("resume_threads", true, std::to_string(suspended_tids.size()) + " threads resumed");
 
-
-    if (header_wiped)
-    {
-        msg(OBFSTR_C("AiDA: Synthesizing PE header for headerless user-mode dump...\n"));
-
-        struct discovered_section_t {
-            std::uint32_t rva;
-            std::uint32_t size;
-            bool is_executable;
-            bool is_writable;
-        };
-        std::vector<discovered_section_t> discovered;
-
-        constexpr std::uint32_t SCAN_GRANULARITY = 0x1000;
-        std::uint32_t current_start = 0;
-        bool in_section = false;
-        bool sec_exec = false;
-        bool sec_write = false;
-
-        for (std::uint32_t off = 0; off < static_cast<std::uint32_t>(module_size); off += SCAN_GRANULARITY)
-        {
-            bool page_has_data = false;
-            bool page_looks_code = false;
-            std::uint32_t page_end = std::min(off + SCAN_GRANULARITY, static_cast<std::uint32_t>(module_size));
-
-            for (std::uint32_t i = off; i < page_end; i++)
-            {
-                if (module_data[i] != 0) { page_has_data = true; break; }
-            }
-
-            if (page_has_data && page_end - off >= 16)
-            {
-                int code_heuristic = 0;
-                for (std::uint32_t i = off; i < page_end - 4; i += 64)
-                {
-                    std::uint8_t b = module_data[i];
-                    if (b == 0xCC || b == 0xC3 || b == 0xC2 ||
-                        b == 0xE8 || b == 0xE9 || b == 0xFF ||
-                        b == 0x48 || b == 0x4C || b == 0x41 ||
-                        b == 0x0F || b == 0x55 || b == 0x53)
-                        code_heuristic++;
-                }
-                page_looks_code = (code_heuristic > 3);
-            }
-
-            if (page_has_data && !in_section)
-            {
-                current_start = off;
-                in_section = true;
-                sec_exec = page_looks_code;
-                sec_write = !page_looks_code;
-            }
-            else if (page_has_data && in_section)
-            {
-                if (page_looks_code) sec_exec = true;
-            }
-            else if (!page_has_data && in_section)
-            {
-                std::uint32_t lookahead_end = std::min(off + 0x10000, static_cast<std::uint32_t>(module_size));
-                bool resumes = false;
-                for (std::uint32_t la = off + SCAN_GRANULARITY; la < lookahead_end; la += SCAN_GRANULARITY)
-                {
-                    for (std::uint32_t i = la; i < std::min(la + SCAN_GRANULARITY, static_cast<std::uint32_t>(module_size)); i++)
-                    {
-                        if (module_data[i] != 0) { resumes = true; break; }
-                    }
-                    if (resumes) break;
-                }
-                if (!resumes)
-                {
-                    discovered.push_back({current_start, off - current_start, sec_exec, sec_write});
-                    in_section = false;
-                }
-            }
-        }
-        if (in_section)
-            discovered.push_back({current_start, static_cast<std::uint32_t>(module_size) - current_start, sec_exec, sec_write});
-        if (discovered.empty())
-            discovered.push_back({0, static_cast<std::uint32_t>(module_size), true, false});
-
-        int max_synth_sections = std::min<int>(static_cast<int>(discovered.size()), 16);
-        std::uint32_t synth_pe_off = 0x80;
-        std::uint32_t synth_opt_size = 0xF0;
-        std::uint32_t synth_sec_table = synth_pe_off + 0x18 + synth_opt_size;
-
-
-        module_data[0x00] = 'M'; module_data[0x01] = 'Z';
-        module_data[0x02] = 0x90; module_data[0x03] = 0x00;
-        *reinterpret_cast<std::uint32_t*>(&module_data[0x3C]) = synth_pe_off;
-
-
-        module_data[synth_pe_off + 0] = 'P';
-        module_data[synth_pe_off + 1] = 'E';
-        module_data[synth_pe_off + 2] = 0;
-        module_data[synth_pe_off + 3] = 0;
-
-
-        *reinterpret_cast<std::uint16_t*>(&module_data[synth_pe_off + 4]) = 0x8664;
-        *reinterpret_cast<std::uint16_t*>(&module_data[synth_pe_off + 6]) =
-            static_cast<std::uint16_t>(max_synth_sections);
-        *reinterpret_cast<std::uint16_t*>(&module_data[synth_pe_off + 0x16]) = 0x0022;
-        *reinterpret_cast<std::uint16_t*>(&module_data[synth_pe_off + 0x14]) = synth_opt_size;
-
-
-        std::uint32_t synth_opt_off = synth_pe_off + 0x18;
-        *reinterpret_cast<std::uint16_t*>(&module_data[synth_opt_off + 0]) = 0x020B;
-        *reinterpret_cast<std::uint32_t*>(&module_data[synth_opt_off + 0x38]) =
-            (static_cast<std::uint32_t>(module_size) + 0xFFF) & ~0xFFFu;
-        *reinterpret_cast<std::uint32_t*>(&module_data[synth_opt_off + 0x3C]) = 0x1000;
-        *reinterpret_cast<std::uint64_t*>(&module_data[synth_opt_off + 0x18]) = base;
-        *reinterpret_cast<std::uint32_t*>(&module_data[synth_opt_off + 0x10]) =
-            discovered.empty() ? 0x1000 : discovered[0].rva;
-        *reinterpret_cast<std::uint16_t*>(&module_data[synth_opt_off + 0x44]) = 0x0A;
-        *reinterpret_cast<std::uint32_t*>(&module_data[synth_opt_off + 0x6C]) = 0;
-
-
-        for (int si = 0; si < max_synth_sections; si++)
-        {
-            const auto& ds = discovered[si];
-            std::uint32_t sec_hdr_off = synth_sec_table + si * 40;
-            if (sec_hdr_off + 40 > 0x1000) break;
-
-            char sname[9] = {};
-            if (si == 0 && ds.is_executable) std::memcpy(sname, ".text\0\0\0", 8);
-            else if (si == 0 && !ds.is_executable) std::memcpy(sname, ".data\0\0\0", 8);
-            else if (ds.is_executable) qsnprintf(sname, sizeof(sname), ".text%d", si);
-            else qsnprintf(sname, sizeof(sname), ".data%d", si);
-
-            std::memcpy(&module_data[sec_hdr_off], sname, 8);
-            *reinterpret_cast<std::uint32_t*>(&module_data[sec_hdr_off + 8]) = ds.size;
-            *reinterpret_cast<std::uint32_t*>(&module_data[sec_hdr_off + 12]) = ds.rva;
-            *reinterpret_cast<std::uint32_t*>(&module_data[sec_hdr_off + 16]) = ds.size;
-            *reinterpret_cast<std::uint32_t*>(&module_data[sec_hdr_off + 20]) = ds.rva;
-
-            std::uint32_t chars = 0x40000000u;
-            if (ds.is_executable) chars |= 0x20000000u | 0x00000020u;
-            if (ds.is_writable)   chars |= 0x80000000u;
-            chars |= 0x00000040u;
-            *reinterpret_cast<std::uint32_t*>(&module_data[sec_hdr_off + 36]) = chars;
-        }
-
-
-        opt_magic      = 0x020B;
-        sections_count = static_cast<std::uint16_t>(max_synth_sections);
-        pe_off         = synth_pe_off;
-        opt_size       = synth_opt_size;
-        sec_table_off  = synth_sec_table;
-        has_valid_pe   = true;
-
-        log("synthesize_header", true,
-            "Built synthetic PE header with " + std::to_string(max_synth_sections) +
-            " discovered sections from memory content analysis");
-        msg(OBFSTR_C("AiDA: Synthesized PE header — %d sections discovered via memory scanning\n"),
-            max_synth_sections);
-    }
-
-    pe_fix_result_t pe_fix = fix_dumped_pe_image(module_data, base);
-    if (pe_fix.success)
-    {
-        msg(OBFSTR_C("AiDA: PE fixed — %d sections, %d IAT entries restored, EP %s\n"),
-            pe_fix.sections_fixed, pe_fix.iat_entries_restored,
-            pe_fix.entry_point_valid ? "valid" : "fallback");
-        log("pe_fix", true, std::to_string(pe_fix.sections_fixed) + " sections, " +
-            std::to_string(pe_fix.iat_entries_restored) + " IAT entries restored");
-    }
-
-
-    cleanup_exception_directory(module_data, pe_fix.is_pe64 || (opt_magic == 0x020B));
-    log("exception_cleanup", true, "Invalid runtime function entries cleaned");
-
-    iat_rebuild_result_t iat_rebuild = reconstruct_iat_runtime(module_data, base, device.get(), false);
-    if (iat_rebuild.success && iat_rebuild.descriptors_rebuilt > 0)
-    {
-        msg(OBFSTR_C("AiDA: Runtime IAT reconstruction — %d imports resolved, %d failed, %d descriptors rebuilt\n"),
-            iat_rebuild.imports_resolved, iat_rebuild.imports_failed, iat_rebuild.descriptors_rebuilt);
-        log("iat_rebuild", true, std::to_string(iat_rebuild.imports_resolved) + " imports resolved, " +
-            std::to_string(iat_rebuild.descriptors_rebuilt) + " descriptors rebuilt");
-    }
-    else if (!iat_rebuild.error.empty())
-        msg(OBFSTR_C("AiDA: IAT rebuild note: %s\n"), iat_rebuild.error.c_str());
-
-    if (iat_rebuild.descriptors_rebuilt == 0 || iat_rebuild.imports_resolved == 0)
-    {
-        msg(OBFSTR_C("AiDA: Standard IAT rebuild found nothing — running full export-scan IAT reconstruction...\n"));
-        replace_wait_box("HIDECANCEL\nAiDA: Scanning image for imports via export address matching...");
-
-        iat_rebuild_result_t scan_result = full_iat_scan_and_rebuild(module_data, base, device.get(), false);
-        if (scan_result.success && scan_result.imports_resolved > 0)
-        {
-            iat_rebuild = scan_result;
-            msg(OBFSTR_C("AiDA: Full IAT scan — %d imports resolved, %d DLLs, section %s\n"),
-                scan_result.imports_resolved, scan_result.descriptors_rebuilt,
-                scan_result.section_added ? "added" : "reused");
-            log("iat_full_scan", true, std::to_string(scan_result.imports_resolved) + " imports resolved via full scan, " +
-                std::to_string(scan_result.descriptors_rebuilt) + " DLLs");
-        }
-        else
-        {
-            msg(OBFSTR_C("AiDA: Full IAT scan found no additional imports%s\n"),
-                scan_result.error.empty() ? "" : (std::string(" (") + scan_result.error + ")").c_str());
-            log("iat_full_scan", false, scan_result.error.empty() ? "No imports found" : scan_result.error);
-        }
-
-        hide_wait_box();
-    }
 
     std::string output_path = params.value("output_path", std::string());
     if (output_path.empty())
@@ -12875,7 +12528,7 @@ tool_result_t driver_dump_module(const json& params)
 
         std::uint16_t fixed_sections_count = sections_count;
         std::uint32_t fixed_sec_table_off  = sec_table_off;
-        if (pe_fix.success && module_size > 0x200)
+        if (has_valid_pe && module_size > 0x200)
         {
             std::uint32_t fixed_pe_off = *reinterpret_cast<std::uint32_t*>(module_data.data() + 0x3C);
             if (fixed_pe_off + 0x18 < module_size)
@@ -12943,6 +12596,36 @@ tool_result_t driver_dump_module(const json& params)
             }
         }
 
+        if (patched == 0 && module_size > 0)
+        {
+            if (!getseg(base))
+            {
+                segment_t raw_seg;
+                raw_seg.start_ea = base;
+                raw_seg.end_ea   = base + module_size;
+                raw_seg.type     = SEG_NORM;
+                raw_seg.bitness  = (opt_magic == 0x020B) ? 2 : 1;
+                raw_seg.perm     = SEGPERM_READ | SEGPERM_WRITE | SEGPERM_EXEC;
+                raw_seg.align    = saRelByte;
+                raw_seg.comb     = scPub;
+
+                const char* seg_name = module_name.empty() ? "runtime_dump" : module_name.c_str();
+                if (add_segm_ex(&raw_seg, seg_name, "DATA", ADDSEG_QUIET | ADDSEG_NOSREG))
+                {
+                    segs_created++;
+                    segs_info.push_back({{"name", std::string(seg_name)},
+                                         {"start", helpers::format_address(base)},
+                                         {"size", module_size}});
+                }
+            }
+
+            if (is_mapped(base))
+            {
+                put_bytes(base, module_data.data(), module_size);
+                patched = module_size;
+            }
+        }
+
         hide_wait_box();
         log("patch_idb", patched > 0, std::to_string(patched) + " bytes patched, " +
             std::to_string(segs_created) + " segments created");
@@ -12953,17 +12636,20 @@ tool_result_t driver_dump_module(const json& params)
 
     json result;
     result["base"]            = helpers::format_address(base);
+    result["module_name"]     = module_name;
     result["image_size"]      = module_size;
     result["pe_size_of_image"] = static_cast<std::size_t>(pe_size_of_image);
     result["bytes_dumped"]    = total_read;
     result["coverage_pct"]    = module_size ? (int)((total_read * 100) / module_size) : 0;
     result["saved_to"]        = output_path;
-    result["can_load_in_ida"] = true;
+    result["can_load_in_ida"] = has_valid_pe && !header_wiped;
+    result["raw_runtime_dump"] = true;
+    result["post_processing_applied"] = false;
+    result["header_valid"]    = has_valid_pe;
     result["header_wiped"]    = header_wiped;
-    result["header_synthesized"] = header_wiped;
     result["threads_suspended"]  = static_cast<int>(suspended_tids.size());
     if (!module_disk_path.empty())
-        result["disk_path"] = module_disk_path;
+        result["module_path"] = module_disk_path;
     if (!protection.detected_protections.empty())
     {
         result["protections_detected"] = protection.detected_protections;
@@ -12998,20 +12684,13 @@ tool_result_t driver_dump_module(const json& params)
         if (!segs_info.empty())
             result["segments"] = segs_info;
     }
-    if (pe_fix.success)
-        result["pe_fix"] = pe_fix_to_json(pe_fix);
-    if (iat_rebuild.success && iat_rebuild.descriptors_rebuilt > 0)
-        result["iat_rebuild"] = iat_rebuild_to_json(iat_rebuild);
     result["note"] = std::string(
-        header_wiped ? OBFSTR("WARNING: Original PE header was wiped by anti-cheat. "
-            "A synthetic header has been constructed from memory analysis. "
-            "Section boundaries are approximate. ") : "") +
-        OBFSTR("IMPORTANT: The dump file has been saved to: ") + output_path + OBFSTR(". "
-        "To get full and correct analysis you MUST open this file in a NEW IDA Pro instance: "
-        "File -> Open -> select the dumped .bin file -> enable 'Manual load' -> "
-        "set the image base to ") + helpers::format_address(base) + OBFSTR(". "
-        "IDA's built-in loader/autoanalysis will handle code creation, function detection, "
-        "FLIRT signatures, and type library application automatically.");
+        OBFSTR("This dump preserves the module exactly as it existed in target memory. "
+               "No decryption, devirtualization, header synthesis, IAT reconstruction, or disk fallback was applied. ")) +
+        (header_wiped || !has_valid_pe
+            ? OBFSTR("The in-memory image does not currently expose a clean PE header. "
+                     "Open the saved file with manual load and set the image base to ") + helpers::format_address(base) + OBFSTR(".")
+            : OBFSTR("Open the saved file in a new IDA Pro instance. If needed, use manual load with image base ") + helpers::format_address(base) + OBFSTR("."));
 
     return tool_result_t::ok(OBFSTR("Module dumped: ") + std::to_string(total_read) + "/" +
                              std::to_string(module_size) + " bytes -> " + output_path +
@@ -15781,19 +15460,23 @@ void register_tools()
 
     registry.register_tool({
         OBFSTR("driver_dump_module"), OBFSTR("driver"),
-        OBFSTR("Dump a complete PE module from the target process using kernel memory reads. "
-               "Reads all sections page-by-page, handles packed/obfuscated sections. "
-               "Creates IDA segments and patches dumped bytes into the database. "
+         OBFSTR("Dump a module from the target process using kernel memory reads. "
+             "Captures the module exactly as it exists in runtime memory without decryption, "
+             "devirtualization, header reconstruction, or import rebuilding. "
+             "Can resolve a loaded sub-module by name or path via the 'module' parameter. "
+             "Creates IDA segments and patches dumped bytes into the database. "
                "Can auto-connect to a process by name via the 'process' parameter."),
         {{OBFSTR("process"), OBFSTR("string"),
           OBFSTR("Target process name to auto-connect (e.g. 'game.exe'). "
                  "If omitted, uses currently attached process."), false},
+          {OBFSTR("module"), OBFSTR("string"),
+           OBFSTR("Loaded module name or full/partial path to dump (e.g. 'steam_api64.dll'). "
+               "If omitted, dumps the main image unless 'address' is provided."), false},
          {OBFSTR("address"), OBFSTR("string"),
-          OBFSTR("Module base address (default: attached process image base)"), false},
+           OBFSTR("Explicit module base address (overrides automatic module resolution)"), false},
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Override image size in bytes (default: auto from PE header)"), false},
          {OBFSTR("output_path"), OBFSTR("string"), OBFSTR("Save dump to file path (e.g. 'C:\\\\dump.bin')"), false},
-         {OBFSTR("patch_idb"), OBFSTR("boolean"), OBFSTR("Patch dumped bytes into IDA database (default true)"), false},
-         {OBFSTR("decrypt_timeout"), OBFSTR("number"), OBFSTR("Seconds to spend polling encrypted code pages (default: auto-scaled). Set higher for large encrypted binaries."), false}},
+          {OBFSTR("patch_idb"), OBFSTR("boolean"), OBFSTR("Patch dumped runtime bytes into IDA database (default true)"), false}},
         driver_dump_module, false});
 
     registry.register_tool({
@@ -16329,11 +16012,19 @@ tool_result_t run_security_analysis(const json& params)
     std::string hash = get_current_binary_hash();
     if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
 
+    graphrag::ensure_full_binary_index(hash, [](int current, int total, const std::string& name) {
+        if (current == 1 || (current % 100) == 0 || current == total)
+            msg(OBFSTR_C("[AiDA GraphRAG] Preparing full graph %d/%d: %s\n"), current, total, name.c_str());
+    });
+
     auto& store = graphrag::GraphStore::instance();
     auto nodes = store.get_nodes_by_type(hash, graphrag::node_type_t::FUNCTION);
 
     int risky = 0;
     json high_risk = json::array();
+    json crypto_functions = json::array();
+    std::map<std::string, int> vuln_type_counts;
+
     for (auto* n : nodes)
     {
         if (n->risk_level == "HIGH" || n->risk_level == "CRITICAL")
@@ -16347,14 +16038,31 @@ tool_result_t run_security_analysis(const json& params)
                 });
             }
         }
+
+        if (!n->crypto_apis.empty() && crypto_functions.size() < 50)
+        {
+            crypto_functions.push_back({
+                {"name", n->name}, {"address", n->address},
+                {"crypto_apis", n->crypto_apis},
+                {"activity_profile", n->activity_profile}
+            });
+        }
+
+        for (auto& f : n->security_flags)
+            if (f.find("_RISK") != std::string::npos)
+                ++vuln_type_counts[f];
     }
 
     json data;
     data["total_functions"] = nodes.size();
     data["high_risk_count"] = risky;
     data["high_risk_functions"] = high_risk;
+    data["crypto_functions_count"] = crypto_functions.size();
+    data["crypto_functions"] = crypto_functions;
+    data["vulnerability_types"] = vuln_type_counts;
     return tool_result_t::ok(OBFSTR("Security analysis: ") + std::to_string(risky)
-        + OBFSTR(" high-risk functions found"), data);
+        + OBFSTR(" high-risk functions, ") + std::to_string(crypto_functions.size())
+        + OBFSTR(" crypto routines found"), data);
 }
 
 tool_result_t run_taint_analysis(const json& params)
@@ -16377,6 +16085,10 @@ tool_result_t run_taint_analysis(const json& params)
         pj["source"] = p.source_name;
         pj["sink"] = p.sink_name;
         pj["path_length"] = p.path.size();
+        pj["path"] = p.path_names;
+        if (!p.source_apis.empty()) pj["source_apis"] = p.source_apis;
+        if (!p.sink_apis.empty()) pj["sink_apis"] = p.sink_apis;
+        if (!p.vulnerability_type.empty()) pj["vulnerability_type"] = p.vulnerability_type;
         data.push_back(pj);
     }
 

@@ -265,6 +265,10 @@ struct taint_path_t
     std::vector<int> path;
     std::string source_name;
     std::string sink_name;
+    std::vector<std::string> path_names;
+    std::vector<std::string> source_apis;
+    std::vector<std::string> sink_apis;
+    std::string vulnerability_type;
 };
 
 
@@ -534,6 +538,12 @@ private:
 
     std::string node_display_name(const graph_node_t* n) const;
 };
+
+
+bool ensure_function_indexed(const std::string& binary_hash, ea_t func_ea);
+bool ensure_full_binary_index(const std::string& binary_hash,
+                              StructureExtractor::progress_fn on_progress = nullptr,
+                              bool* reindexed = nullptr);
 
 
 void initialize(const std::string& binary_hash);

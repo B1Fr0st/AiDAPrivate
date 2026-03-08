@@ -1078,6 +1078,56 @@ StructureExtractor::extract_all(const std::string& binary_hash, progress_fn on_p
 }
 
 
+bool ensure_function_indexed(const std::string& binary_hash, ea_t func_ea)
+{
+    if (binary_hash.empty() || func_ea == BADADDR)
+        return false;
+
+    auto_wait();
+
+    auto& store = GraphStore::instance();
+    if (store.get_node_by_address(binary_hash, node_type_t::FUNCTION, func_ea) != nullptr)
+        return true;
+
+    StructureExtractor extractor(store);
+    return extractor.extract_function(func_ea, binary_hash) != nullptr;
+}
+
+
+bool ensure_full_binary_index(const std::string& binary_hash,
+                              StructureExtractor::progress_fn on_progress,
+                              bool* reindexed)
+{
+    if (reindexed != nullptr)
+        *reindexed = false;
+
+    if (binary_hash.empty())
+        return false;
+
+    auto_wait();
+
+    auto& store = GraphStore::instance();
+    const size_t total_functions = get_func_qty();
+    if (total_functions == 0)
+        return true;
+
+    const auto existing_functions = store.get_nodes_by_type(binary_hash, node_type_t::FUNCTION);
+    const auto stats = store.get_stats(binary_hash);
+    const bool needs_reindex = existing_functions.size() < total_functions || stats.stale > 0;
+    if (!needs_reindex)
+        return true;
+
+    StructureExtractor extractor(store);
+    extractor.extract_all(binary_hash, on_progress);
+    save_graph(binary_hash);
+
+    if (reindexed != nullptr)
+        *reindexed = true;
+
+    return store.get_nodes_by_type(binary_hash, node_type_t::FUNCTION).size() >= total_functions;
+}
+
+
 TaintAnalyzer::TaintAnalyzer(GraphStore& store) : m_store(store) {}
 
 const std::set<std::string>& TaintAnalyzer::taint_sources()
@@ -1213,6 +1263,8 @@ std::vector<taint_path_t> TaintAnalyzer::find_taint_paths(const std::string& bin
 {
     m_cancelled = false;
 
+    ensure_full_binary_index(binary_hash);
+
     auto sources = find_source_nodes(binary_hash);
     auto sink_nodes = find_sink_nodes(binary_hash);
 
@@ -1238,6 +1290,30 @@ std::vector<taint_path_t> TaintAnalyzer::find_taint_paths(const std::string& bin
             tp.path = path_ids;
             tp.source_name = source->name;
             tp.sink_name = sink_node->name;
+
+            for (int pid : path_ids)
+            {
+                auto* pn = m_store.get_node(pid);
+                tp.path_names.push_back(pn ? pn->name : ("node_" + std::to_string(pid)));
+            }
+
+            auto& ts = taint_sources();
+            for (auto& a : source->network_apis)
+                if (ts.count(a)) tp.source_apis.push_back(a);
+            for (auto& a : source->file_io_apis)
+                if (ts.count(a)) tp.source_apis.push_back(a);
+
+            auto& tsinks = taint_sinks();
+            for (auto& a : sink_node->network_apis)
+                if (tsinks.count(a)) tp.sink_apis.push_back(a);
+            for (auto& a : sink_node->file_io_apis)
+                if (tsinks.count(a)) tp.sink_apis.push_back(a);
+            for (auto& f : sink_node->security_flags)
+            {
+                if (f.find("_RISK") != std::string::npos && tp.vulnerability_type.empty())
+                    tp.vulnerability_type = f;
+            }
+
             paths.push_back(tp);
 
             if (create_edges)
@@ -1320,6 +1396,8 @@ int CommunityDetector::detect(const std::string& binary_hash, int min_size,
                                int max_iterations, bool force, progress_fn on_progress)
 {
     m_cancelled = false;
+
+    ensure_full_binary_index(binary_hash);
 
     if (!force && m_store.communities_exist(binary_hash))
         return static_cast<int>(m_store.get_communities(binary_hash).size());
@@ -1532,6 +1610,8 @@ NetworkFlowAnalyzer::analyze(const std::string& binary_hash, progress_fn on_prog
     m_cancelled = false;
     result_t result;
 
+    ensure_full_binary_index(binary_hash);
+
     auto send_nodes = find_send_nodes(binary_hash);
     auto recv_nodes = find_recv_nodes(binary_hash);
 
@@ -1711,6 +1791,8 @@ std::string QueryEngine::node_display_name(const graph_node_t* n) const
 
 nlohmann::json QueryEngine::get_semantic_analysis(const std::string& binary_hash, ea_t address)
 {
+    ensure_full_binary_index(binary_hash);
+
     auto* node = m_store.get_node_by_address(binary_hash, node_type_t::FUNCTION, address);
     if (!node)
     {
@@ -1772,6 +1854,8 @@ nlohmann::json QueryEngine::get_semantic_analysis(const std::string& binary_hash
 nlohmann::json QueryEngine::search_semantic(const std::string& binary_hash,
                                              const std::string& query, int limit)
 {
+    ensure_full_binary_index(binary_hash);
+
     auto results = m_store.search_nodes(binary_hash, query, limit);
     nlohmann::json j = nlohmann::json::array();
     for (auto* n : results)
@@ -1792,6 +1876,8 @@ nlohmann::json QueryEngine::search_semantic(const std::string& binary_hash,
 nlohmann::json QueryEngine::get_similar_functions(const std::string& binary_hash,
                                                    ea_t address, int limit)
 {
+    ensure_full_binary_index(binary_hash);
+
     auto* source = m_store.get_node_by_address(binary_hash, node_type_t::FUNCTION, address);
     if (!source) return nlohmann::json::array();
 
@@ -1842,6 +1928,8 @@ nlohmann::json QueryEngine::get_similar_functions(const std::string& binary_hash
 nlohmann::json QueryEngine::get_call_context(const std::string& binary_hash,
                                               ea_t address, int depth)
 {
+    ensure_full_binary_index(binary_hash);
+
     auto* node = m_store.get_node_by_address(binary_hash, node_type_t::FUNCTION, address);
     if (!node) return {{"error", "Function not found"}};
 
@@ -1878,12 +1966,50 @@ nlohmann::json QueryEngine::get_call_context(const std::string& binary_hash,
 
 nlohmann::json QueryEngine::get_taint_paths(const std::string& binary_hash, ea_t address)
 {
+    ensure_full_binary_index(binary_hash);
+
     auto* node = m_store.get_node_by_address(binary_hash, node_type_t::FUNCTION, address);
     if (!node) return {{"error", "Function not found"}};
 
 
     auto edges_from = m_store.get_edges_from(node->id);
     auto edges_to = m_store.get_edges_to(node->id);
+
+    bool has_taint_edges = false;
+    auto has_taint_edge = [](const graph_edge_t* edge) {
+        return edge != nullptr
+            && (edge->edge_type == edge_type_t::TAINT_FLOWS_TO
+                || edge->edge_type == edge_type_t::VULNERABLE_VIA);
+    };
+
+    for (auto* edge : edges_from)
+    {
+        if (has_taint_edge(edge))
+        {
+            has_taint_edges = true;
+            break;
+        }
+    }
+    if (!has_taint_edges)
+    {
+        for (auto* edge : edges_to)
+        {
+            if (has_taint_edge(edge))
+            {
+                has_taint_edges = true;
+                break;
+            }
+        }
+    }
+
+    if (!has_taint_edges)
+    {
+        TaintAnalyzer analyzer(m_store);
+        analyzer.find_taint_paths(binary_hash, 100, true);
+        save_graph(binary_hash);
+        edges_from = m_store.get_edges_from(node->id);
+        edges_to = m_store.get_edges_to(node->id);
+    }
 
     nlohmann::json j;
     j["function"] = node_display_name(node);
@@ -1919,13 +2045,22 @@ nlohmann::json QueryEngine::get_taint_paths(const std::string& binary_hash, ea_t
     j["taint_flows_to"] = taint_from;
     j["taint_flows_from"] = taint_to;
     j["is_taint_source"] = !taint_from.empty() && taint_to.empty();
-    j["is_taint_sink"] = taint_to.empty() && !taint_from.empty();
+    j["is_taint_sink"] = !taint_to.empty() && taint_from.empty();
 
     return j;
 }
 
 nlohmann::json QueryEngine::get_community_info(const std::string& binary_hash, ea_t address)
 {
+    ensure_full_binary_index(binary_hash);
+
+    if (!m_store.communities_exist(binary_hash))
+    {
+        CommunityDetector detector(m_store);
+        detector.detect(binary_hash);
+        save_graph(binary_hash);
+    }
+
     auto* node = m_store.get_node_by_address(binary_hash, node_type_t::FUNCTION, address);
     if (!node || node->community_id < 0)
         return {{"error", "Function not in a community"}};
@@ -1957,6 +2092,8 @@ nlohmann::json QueryEngine::get_community_info(const std::string& binary_hash, e
 
 nlohmann::json QueryEngine::get_security_analysis(const std::string& binary_hash, int limit)
 {
+    ensure_full_binary_index(binary_hash);
+
     auto nodes = m_store.get_nodes_by_type(binary_hash, node_type_t::FUNCTION);
 
     nlohmann::json j;
@@ -2006,6 +2143,8 @@ nlohmann::json QueryEngine::get_security_analysis(const std::string& binary_hash
 nlohmann::json QueryEngine::get_activity_analysis(const std::string& binary_hash,
                                                     const std::string& activity_filter)
 {
+    ensure_full_binary_index(binary_hash);
+
     auto nodes = m_store.get_nodes_by_type(binary_hash, node_type_t::FUNCTION);
 
     std::map<std::string, std::vector<nlohmann::json>> by_activity;
@@ -2044,6 +2183,15 @@ nlohmann::json QueryEngine::get_activity_analysis(const std::string& binary_hash
 
 nlohmann::json QueryEngine::get_all_communities(const std::string& binary_hash)
 {
+    ensure_full_binary_index(binary_hash);
+
+    if (!m_store.communities_exist(binary_hash))
+    {
+        CommunityDetector detector(m_store);
+        detector.detect(binary_hash);
+        save_graph(binary_hash);
+    }
+
     auto communities = m_store.get_communities(binary_hash);
 
     nlohmann::json j;
