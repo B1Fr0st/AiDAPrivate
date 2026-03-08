@@ -320,9 +320,15 @@ void aida_plugin_t::reinit_ai_client()
 
     stop_copilot_proxy();
 
+    qstring provider = ida_utils::qstring_tolower(g_settings.api_provider.c_str());
+    if (provider.empty())
+    {
+        ai_client.reset();
+        return;
+    }
+
     ai_client = get_ai_client(g_settings);
 
-    qstring provider = ida_utils::qstring_tolower(g_settings.api_provider.c_str());
     if (provider == OBFSTR_C("copilot"))
         start_copilot_proxy();
 

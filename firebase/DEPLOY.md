@@ -99,10 +99,16 @@ Expected output:
 ✔ functions[validateLicense(europe-west1)] Successful create operation.
 
 Function URL (validateLicense(europe-west1)):
-  https://europe-west1-aida-license-prod.cloudfunctions.net/validateLicense
+  https://validatelicense-<deployment-id>-ew.a.run.app
 ```
 
-That URL matches what's hardcoded in the plugin. You're done deploying.
+Firebase 2nd-gen functions usually print a `run.app` URL now. The plugin uses the stable
+`cloudfunctions.net` hostname and follows redirects, so either of these is valid:
+
+- `https://europe-west1-aida-license-prod.cloudfunctions.net/validateLicense`
+- The `run.app` URL shown by `firebase deploy`
+
+You're done deploying.
 
 ---
 
@@ -258,6 +264,7 @@ firebase deploy --only database
 | `firebase deploy` says "billing required" | Upgrade to Blaze plan in Firebase Console |
 | `firebase deploy` says "permission denied" | Run `firebase login` again, make sure you're signed in as the project owner |
 | Plugin gets `validate_with_cloud_function` returning false | Check function logs in Firebase Console. Most likely the license key doesn't exist in RTDB |
+| Function returns `500 Internal Server Error` for every key | Confirm the function was deployed with an explicit `databaseURL`; otherwise the Admin SDK cannot open RTDB in some 2nd-gen environments |
 | `ERR_CONNECTION_REFUSED` locally | The function URL is wrong, or function isn't deployed. Check `firebase deploy` output |
 | Bot stops working after rule deploy | It won't — the database secret bypasses all rules. But verify `FIREBASE_SECRET` env var is set |
 | HWID mismatch error | Use `/reset_hwid` in Discord to clear the binding, then re-activate from IDA |

@@ -62,6 +62,13 @@ static bool ensure_licensed_and_ready(aida_plugin_t* plugin)
         return false;
     }
 
+    {
+        if (!license.verify_nonce_consistency())
+        {
+            return false;
+        }
+    }
+
 #ifdef __NT__
     {
         unsigned int aux;

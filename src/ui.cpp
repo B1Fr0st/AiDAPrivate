@@ -462,6 +462,11 @@ static inline QColor settingsBlend(const QColor& a, const QColor& b, double t)
         static_cast<int>(a.alpha() * inv + b.alpha() * r));
 }
 
+static inline QColor settingsReadableTextColor(const QColor& bg)
+{
+    return bg.lightnessF() >= 0.62 ? QColor(24, 24, 24) : QColor(255, 255, 255);
+}
+
 struct SettingsTheme
 {
     QColor panelBg;
@@ -498,7 +503,10 @@ struct SettingsTheme
 static SettingsTheme detectSettingsTheme(QWidget* ref)
 {
     SettingsTheme t;
-    QPalette p = ref ? ref->palette() : QApplication::palette();
+    QWidget* paletteSource = ref != nullptr && ref->parentWidget() != nullptr
+        ? ref->parentWidget()
+        : ref;
+    QPalette p = paletteSource ? paletteSource->palette() : QApplication::palette();
 
     QColor windowColor = p.color(QPalette::Window);
     QColor baseColor   = p.color(QPalette::Base);
@@ -524,7 +532,8 @@ static SettingsTheme detectSettingsTheme(QWidget* ref)
         t.buttonPrimary       = t.accentColor;
         t.buttonPrimaryHover  = settingsBlend(t.accentColor, QColor(200, 200, 200), 0.16);
         t.buttonPrimaryPressed= settingsBlend(t.accentColor, QColor(24, 24, 24), 0.36);
-        t.buttonPrimaryText   = QColor(255, 255, 255);
+        t.buttonPrimaryText   = settingsReadableTextColor(
+            settingsBlend(t.buttonPrimary, t.buttonPrimaryHover, 0.5));
         t.buttonSecondaryBg   = QColor(0, 0, 0, 0);
         t.buttonSecondaryBorder = settingsBlend(base, stroke, 0.9);
         t.buttonSecondaryHover  = settingsBlend(base, elevated, 0.86);
@@ -556,7 +565,8 @@ static SettingsTheme detectSettingsTheme(QWidget* ref)
         t.buttonPrimary       = settingsBlend(t.accentColor, QColor(110, 110, 110), 0.26);
         t.buttonPrimaryHover  = settingsBlend(t.buttonPrimary, QColor(255, 255, 255), 0.12);
         t.buttonPrimaryPressed= settingsBlend(t.buttonPrimary, QColor(50, 50, 50), 0.14);
-        t.buttonPrimaryText   = QColor(255, 255, 255);
+        t.buttonPrimaryText   = settingsReadableTextColor(
+            settingsBlend(t.buttonPrimary, t.buttonPrimaryHover, 0.5));
         t.buttonSecondaryBg   = QColor(0, 0, 0, 0);
         t.buttonSecondaryBorder = stroke;
         t.buttonSecondaryHover  = settingsBlend(base, elevated, 0.68);
@@ -574,6 +584,59 @@ static SettingsTheme detectSettingsTheme(QWidget* ref)
         t.inputFocusGlow      = QColor(t.accentColor.red(), t.accentColor.green(), t.accentColor.blue(), 40);
     }
     return t;
+}
+
+static QWidget* normalizeSettingsThemeWidget(QWidget* widget)
+{
+    QWidget* current = widget;
+    while (current != nullptr && current->parentWidget() != nullptr && !current->isWindow())
+        current = current->parentWidget();
+    return current;
+}
+
+static bool isUsableSettingsThemeWidget(const QWidget* widget)
+{
+    return widget != nullptr
+        && !widget->inherits("QMenu")
+        && !widget->inherits("QToolTip")
+        && !widget->inherits("QComboBoxPrivateContainer");
+}
+
+static QWidget* resolveSettingsThemeSource(QWidget* preferred = nullptr)
+{
+    QWidget* candidate = normalizeSettingsThemeWidget(preferred);
+    if (isUsableSettingsThemeWidget(candidate))
+        return candidate;
+
+    candidate = normalizeSettingsThemeWidget(QApplication::activeWindow());
+    if (isUsableSettingsThemeWidget(candidate))
+        return candidate;
+
+    candidate = normalizeSettingsThemeWidget(QApplication::focusWidget());
+    if (isUsableSettingsThemeWidget(candidate))
+        return candidate;
+
+    QWidget* best = nullptr;
+    qint64 bestArea = -1;
+    const auto topLevelWidgets = QApplication::topLevelWidgets();
+    for (QWidget* widget : topLevelWidgets)
+    {
+        candidate = normalizeSettingsThemeWidget(widget);
+        if (!isUsableSettingsThemeWidget(candidate) || !candidate->isVisible())
+            continue;
+        if (candidate->inherits("QMainWindow"))
+            return candidate;
+
+        const QSize size = candidate->size();
+        const qint64 area = static_cast<qint64>(size.width()) * static_cast<qint64>(size.height());
+        if (area > bestArea)
+        {
+            bestArea = area;
+            best = candidate;
+        }
+    }
+
+    return best;
 }
 
 static QString buildSettingsStylesheet(const SettingsTheme& t)
@@ -1077,6 +1140,106 @@ static QString buildSettingsStylesheet(const SettingsTheme& t)
     return css;
 }
 
+static void applySettingsDialogTheme(QDialog* dialog, QWidget* preferredRef = nullptr)
+{
+    if (dialog == nullptr)
+        return;
+
+    QWidget* themeSource = resolveSettingsThemeSource(
+        preferredRef != nullptr ? preferredRef : dialog->parentWidget());
+    if (themeSource == dialog)
+        themeSource = dialog->parentWidget();
+
+    const SettingsTheme theme = detectSettingsTheme(themeSource != nullptr ? themeSource : dialog);
+    dialog->setStyleSheet(buildSettingsStylesheet(theme));
+
+    QPalette palette = dialog->palette();
+    palette.setColor(QPalette::Window, theme.panelBg);
+    palette.setColor(QPalette::WindowText, theme.textPrimary);
+    palette.setColor(QPalette::Base, theme.inputBg);
+    palette.setColor(QPalette::AlternateBase, theme.cardBg);
+    palette.setColor(QPalette::Text, theme.textPrimary);
+    palette.setColor(QPalette::Button, theme.cardBg);
+    palette.setColor(QPalette::ButtonText, theme.textPrimary);
+    palette.setColor(QPalette::Highlight, theme.accentColor);
+    palette.setColor(QPalette::HighlightedText, theme.buttonPrimaryText);
+#if QT_VERSION >= QT_VERSION_CHECK(5, 12, 0)
+    palette.setColor(
+        QPalette::PlaceholderText,
+        settingsBlend(theme.textSecondary, theme.inputBg, 0.48));
+#endif
+    dialog->setPalette(palette);
+    dialog->update();
+}
+
+static QWidget* resolveDeferredSettingsHostWindow()
+{
+    QWidget* host = resolveSettingsThemeSource(nullptr);
+    if (host == nullptr || !host->isVisible())
+        return nullptr;
+    if (host->inherits("QDialog")
+        || host->inherits("QMessageBox")
+        || host->inherits("QMenu")
+        || host->inherits("QToolTip"))
+    {
+        return nullptr;
+    }
+    return host;
+}
+
+static bool& welcomeSettingsDialogPending()
+{
+    static bool pending = false;
+    return pending;
+}
+
+static void queueWelcomeSettingsDialog(aida_plugin_t* plugin_instance, int attempt)
+{
+    QObject* app = QApplication::instance();
+    if (app == nullptr)
+    {
+        info(OBFSTR_C("Welcome! Please configure the plugin to begin."));
+        SettingsForm::show_and_apply(plugin_instance);
+        return;
+    }
+
+    if (attempt == 0)
+    {
+        if (welcomeSettingsDialogPending())
+            return;
+        welcomeSettingsDialogPending() = true;
+    }
+
+    static const int kMaxAttempts = 25;
+    static const int kRetryDelayMs = 120;
+    const int delayMs = attempt == 0 ? 0 : kRetryDelayMs;
+
+    QTimer::singleShot(delayMs, app, [plugin_instance, attempt]() {
+        QWidget* host = resolveDeferredSettingsHostWindow();
+        if (host == nullptr && attempt + 1 < kMaxAttempts)
+        {
+            queueWelcomeSettingsDialog(plugin_instance, attempt + 1);
+            return;
+        }
+
+        info(OBFSTR_C("Welcome! Please configure the plugin to begin."));
+
+        QObject* appInstance = QApplication::instance();
+        if (appInstance != nullptr)
+        {
+            QTimer::singleShot(0, appInstance, [plugin_instance]() {
+                SettingsForm::show_and_apply(plugin_instance);
+                welcomeSettingsDialogPending() = false;
+            });
+        }
+        else
+        {
+            SettingsForm::show_and_apply(plugin_instance);
+            welcomeSettingsDialogPending() = false;
+        }
+    });
+}
+
 static QWidget* makeFieldRow(const QString& label, QWidget* field, const QString& tooltip = QString())
 {
     QWidget* row = new QWidget();
@@ -1184,7 +1347,7 @@ static QWidget* buildProviderTab(
 
 void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
 {
-    QWidget* idaMainWindow = QApplication::activeWindow();
+    QWidget* idaMainWindow = resolveSettingsThemeSource(QApplication::activeWindow());
     SettingsTheme theme = detectSettingsTheme(idaMainWindow);
 
     QDialog dlg(idaMainWindow);
@@ -1192,7 +1355,6 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
     dlg.setWindowTitle(QString::fromStdString(OBFSTR("AiDA Settings")));
     const QSize baseMinSize(680, 560);
     dlg.setMinimumSize(baseMinSize);
-    dlg.setStyleSheet(buildSettingsStylesheet(theme));
 
     QVBoxLayout* mainLayout = new QVBoxLayout(&dlg);
     mainLayout->setContentsMargins(18, 12, 18, 10);
@@ -1808,6 +1970,8 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
 
     mainLayout->addLayout(btnRow);
 
+    applySettingsDialogTheme(&dlg, idaMainWindow);
+
     dlg.ensurePolished();
     if (QLayout* layout = dlg.layout())
     {
@@ -1836,6 +2000,10 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
         initialSize.setHeight(qMin(initialSize.height(), maxHeight));
     }
     dlg.resize(initialSize);
+
+    QTimer::singleShot(0, &dlg, [&dlg, idaMainWindow]() {
+        applySettingsDialogTheme(&dlg, idaMainWindow);
+    });
 
     if (dlg.exec() != QDialog::Accepted)
         return;
@@ -1910,6 +2078,11 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
         msg(OBFSTR_C("AI Assistant: Settings updated. Re-initializing AI client...\n"));
         plugin_instance->reinit_ai_client();
     }
+}
+
+void SettingsForm::show_welcome_and_apply_deferred(aida_plugin_t* plugin_instance)
+{
+    queueWelcomeSettingsDialog(plugin_instance, 0);
 }
 
 void idaapi close_handler(TWidget*, void* ud)
@@ -2048,14 +2221,12 @@ ssize_t idaapi ui_event_listener_t::on_event(ssize_t code, va_list va)
 
 void show_prompt_manager_dialog()
 {
-    QWidget* parentWidget = QApplication::activeWindow();
-    SettingsTheme theme = detectSettingsTheme(parentWidget);
+    QWidget* parentWidget = resolveSettingsThemeSource(QApplication::activeWindow());
 
     QDialog dlg(parentWidget);
     dlg.setObjectName(QString::fromStdString(OBFSTR("aidaSettingsDialog")));
     dlg.setWindowTitle(QStringLiteral("Prompt Manager"));
     dlg.setMinimumSize(520, 420);
-    dlg.setStyleSheet(buildSettingsStylesheet(theme));
 
     QVBoxLayout* mainLayout = new QVBoxLayout(&dlg);
     mainLayout->setContentsMargins(18, 12, 18, 10);
@@ -2120,7 +2291,12 @@ void show_prompt_manager_dialog()
     actionRow->addStretch();
     mainLayout->addLayout(actionRow);
 
-    QObject::connect(addBtn, &QPushButton::clicked, [&dlg, listWidget, refreshList, &theme]() {
+    applySettingsDialogTheme(&dlg, parentWidget);
+    QTimer::singleShot(0, &dlg, [&dlg, parentWidget]() {
+        applySettingsDialogTheme(&dlg, parentWidget);
+    });
+
+    QObject::connect(addBtn, &QPushButton::clicked, [&dlg, listWidget, refreshList]() {
         bool okName = false;
         QString name = QInputDialog::getText(&dlg, QStringLiteral("New Prompt"),
             QStringLiteral("Prompt name:"), QLineEdit::Normal, QString(), &okName);
@@ -2138,7 +2314,6 @@ void show_prompt_manager_dialog()
         bodyDlg.setObjectName(QString::fromStdString(OBFSTR("aidaSettingsDialog")));
         bodyDlg.setWindowTitle(QStringLiteral("Enter Prompt Body"));
         bodyDlg.setMinimumSize(500, 350);
-        bodyDlg.setStyleSheet(buildSettingsStylesheet(theme));
         QVBoxLayout* bLay = new QVBoxLayout(&bodyDlg);
         bLay->setContentsMargins(12, 10, 12, 10);
         QLabel* bLabel = new QLabel(QStringLiteral("Prompt body for '%1':").arg(name.trimmed()));
@@ -2160,6 +2335,11 @@ void show_prompt_manager_dialog()
         bBtnRow->addWidget(bOk);
         bLay->addLayout(bBtnRow);
 
+        applySettingsDialogTheme(&bodyDlg, &dlg);
+        QTimer::singleShot(0, &bodyDlg, [&bodyDlg, &dlg]() {
+            applySettingsDialogTheme(&bodyDlg, &dlg);
+        });
+
         if (bodyDlg.exec() != QDialog::Accepted)
             return;
 
@@ -2177,7 +2357,7 @@ void show_prompt_manager_dialog()
         }
     });
 
-    auto doEdit = [&dlg, listWidget, refreshList, &theme]() {
+    auto doEdit = [&dlg, listWidget, refreshList]() {
         QListWidgetItem* item = listWidget->currentItem();
         if (!item)
         {
@@ -2194,7 +2374,6 @@ void show_prompt_manager_dialog()
         bodyDlg.setObjectName(QString::fromStdString(OBFSTR("aidaSettingsDialog")));
         bodyDlg.setWindowTitle(QStringLiteral("Edit Prompt - %1").arg(item->text()));
         bodyDlg.setMinimumSize(500, 350);
-        bodyDlg.setStyleSheet(buildSettingsStylesheet(theme));
         QVBoxLayout* bLay = new QVBoxLayout(&bodyDlg);
         bLay->setContentsMargins(12, 10, 12, 10);
         QLabel* bLabel = new QLabel(QStringLiteral("Prompt body for '%1':").arg(item->text()));
@@ -2215,6 +2394,11 @@ void show_prompt_manager_dialog()
         QObject::connect(bOk, &QPushButton::clicked, &bodyDlg, &QDialog::accept);
         bBtnRow->addWidget(bOk);
         bLay->addLayout(bBtnRow);
+
+        applySettingsDialogTheme(&bodyDlg, &dlg);
+        QTimer::singleShot(0, &bodyDlg, [&bodyDlg, &dlg]() {
+            applySettingsDialogTheme(&bodyDlg, &dlg);
+        });
 
         if (bodyDlg.exec() != QDialog::Accepted)
             return;

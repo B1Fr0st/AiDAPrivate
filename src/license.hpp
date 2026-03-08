@@ -20,6 +20,7 @@ public:
     bool detect_clock_rollback() const;
     void snapshot_function_prologues();
     bool verify_function_prologues() const;
+    bool verify_nonce_consistency() const;
     bool perform_heartbeat();
 
     friend int idaapi license_revalidation_timer_cb(void*);
@@ -31,8 +32,6 @@ private:
 
     std::string generate_hwid() const;
     bool validate_with_server(const std::string& key);
-    bool bind_hwid_to_license(const std::string& key, const std::string& hwid);
-    bool is_cache_valid(int64_t validated_at) const;
     nlohmann::json read_license_config() const;
     bool write_license_config(const nlohmann::json& config) const;
 
@@ -49,6 +48,9 @@ private:
                                      int64_t ts, const std::string& server_token);
     std::string compute_hmac(const std::string& key,
                              const unsigned char* data, size_t len) const;
+    bool verify_server_signature(const std::string& response_body,
+                                 const std::string& signature) const;
+    void secure_clear_string(std::string& s) const;
 
     std::atomic<bool> m_valid{false};
     std::string m_plan;
@@ -71,8 +73,12 @@ private:
     std::string m_client_nonce;
     std::atomic<int> m_consecutive_heartbeat_failures{0};
     std::atomic<bool> m_online_validated_this_session{false};
+    std::string m_server_signature;
 
-    static constexpr int MAX_HEARTBEAT_FAILURES = 3;
+    std::atomic<uint64_t> m_nonce_canary{0};
+    std::string m_heartbeat_nonce;
+
+    static constexpr int MAX_HEARTBEAT_FAILURES = 1;
     static constexpr int REVALIDATION_INTERVAL_MS = 1800000;
 
     static constexpr size_t PROLOGUE_HASH_COUNT = 8;

@@ -641,8 +641,7 @@ void settings_t::load(aida_plugin_t* plugin_instance)
 
     if (!config_exists_and_valid || api_provider.empty())
     {
-        info(OBFSTR_C("Welcome! Please configure the plugin to begin."));
-        SettingsForm::show_and_apply(plugin_instance);
+        SettingsForm::show_welcome_and_apply_deferred(plugin_instance);
         return;
     }
 

@@ -1101,35 +1101,37 @@ void AiDAWorkbenchPanel::refresh_explain_side_panel()
     if (has_function_context() && !m_binaryHash.empty())
     {
         auto& store = graphrag::GraphStore::instance();
-        if (store.get_node_by_address(m_binaryHash, graphrag::node_type_t::FUNCTION, current_function_ea()) == nullptr)
+        if (store.get_node_by_address(m_binaryHash, graphrag::node_type_t::FUNCTION, current_function_ea()) != nullptr)
         {
-            graphrag::StructureExtractor extractor(store);
-            extractor.extract_function(current_function_ea(), m_binaryHash);
-            graphrag::save_graph(m_binaryHash);
+            graphrag::QueryEngine qe(store);
+            nlohmann::json semantic = qe.get_semantic_analysis(m_binaryHash, current_function_ea());
+            QString semantic_text;
+            semantic_text += QStringLiteral("Risk: %1\nActivity: %2\nConfidence: %3")
+                .arg(to_qstring(json_str(semantic, "risk_level", "UNKNOWN")))
+                .arg(to_qstring(json_str(semantic, "activity_profile", "N/A")))
+                .arg(semantic.value("confidence", 0.0), 0, 'f', 2);
+
+            const auto flags_it = semantic.find("security_flags");
+            if (flags_it != semantic.end() && flags_it->is_array() && !flags_it->empty())
+            {
+                semantic_text += QStringLiteral("\nFlags:\n");
+                for (const auto& flag : *flags_it)
+                    semantic_text += QStringLiteral("  - %1\n").arg(to_qstring(flag.get<std::string>()));
+            }
+
+            if (semantic.contains("summary") && semantic["summary"].is_string())
+            {
+                semantic_text += QStringLiteral("\nSummary:\n%1").arg(to_qstring(semantic["summary"].get<std::string>()));
+            }
+
+            body += plain_card(QStringLiteral("Security and Semantic Signals"), semantic_text.trimmed());
         }
-
-        graphrag::QueryEngine qe(store);
-        nlohmann::json semantic = qe.get_semantic_analysis(m_binaryHash, current_function_ea());
-        QString semantic_text;
-        semantic_text += QStringLiteral("Risk: %1\nActivity: %2\nConfidence: %3")
-            .arg(to_qstring(json_str(semantic, "risk_level", "UNKNOWN")))
-            .arg(to_qstring(json_str(semantic, "activity_profile", "N/A")))
-            .arg(semantic.value("confidence", 0.0), 0, 'f', 2);
-
-        const auto flags_it = semantic.find("security_flags");
-        if (flags_it != semantic.end() && flags_it->is_array() && !flags_it->empty())
+        else
         {
-            semantic_text += QStringLiteral("\nFlags:\n");
-            for (const auto& flag : *flags_it)
-                semantic_text += QStringLiteral("  - %1\n").arg(to_qstring(flag.get<std::string>()));
+            body += plain_card(
+                QStringLiteral("Security and Semantic Signals"),
+                QStringLiteral("The current function is not indexed in GraphRAG yet. Use Index Current or Index Binary in the Graph tab to populate semantic data."));
         }
-
-        if (semantic.contains("summary") && semantic["summary"].is_string())
-        {
-            semantic_text += QStringLiteral("\nSummary:\n%1").arg(to_qstring(semantic["summary"].get<std::string>()));
-        }
-
-        body += plain_card(QStringLiteral("Security and Semantic Signals"), semantic_text.trimmed());
     }
     else
     {
@@ -1528,7 +1530,7 @@ void AiDAWorkbenchPanel::build_graph_tab()
     QObject::connect(m_graphIndexBtn, &QPushButton::clicked, [this]() { index_current_function(); });
     controls->addWidget(m_graphIndexBtn);
 
-    m_graphReindexBtn = new QPushButton(QStringLiteral("ReIndex Binary"), tab);
+    m_graphReindexBtn = new QPushButton(QStringLiteral("Index Binary"), tab);
     QObject::connect(m_graphReindexBtn, &QPushButton::clicked, [this]() { reindex_binary(); });
     controls->addWidget(m_graphReindexBtn);
 
@@ -1747,20 +1749,6 @@ void AiDAWorkbenchPanel::refresh_graph_tab()
             .arg(stats.stale)
             .arg(stats.communities));
 
-    if (has_function_context() && store.get_node_by_address(m_binaryHash, graphrag::node_type_t::FUNCTION, current_function_ea()) == nullptr)
-    {
-        graphrag::StructureExtractor extractor(store);
-        extractor.extract_function(current_function_ea(), m_binaryHash);
-        graphrag::save_graph(m_binaryHash);
-        stats = store.get_stats(m_binaryHash);
-        m_graphStatsLabel->setText(
-            QStringLiteral("Nodes: %1 | Edges: %2 | Stale: %3 | Communities: %4")
-                .arg(stats.nodes)
-                .arg(stats.edges)
-                .arg(stats.stale)
-                .arg(stats.communities));
-    }
-
     if (!has_function_context())
     {
         if (m_graphStatusLabel != nullptr)
@@ -1775,7 +1763,21 @@ void AiDAWorkbenchPanel::refresh_graph_tab()
     if (m_graphStatusLabel != nullptr)
         m_graphStatusLabel->setText(QStringLiteral("Centered on %1").arg(format_ea(current_function_ea())));
     refresh_graph_visualization(current_function_ea());
-    show_graph_node_details(current_function_ea());
+
+    if (store.get_node_by_address(m_binaryHash, graphrag::node_type_t::FUNCTION, current_function_ea()) != nullptr)
+    {
+        render_text_browser(
+            m_graphOverviewBrowser,
+            QStringLiteral("Graph data is available for the current function. Select a node in the graph or run a graph search to inspect detailed semantic, call, and taint information.").toStdString(),
+            QStringLiteral("Graph"));
+    }
+    else
+    {
+        render_text_browser(
+            m_graphOverviewBrowser,
+            QStringLiteral("The current function is not indexed in GraphRAG yet. Use Index Current to add just this function, or Index Binary to build the full graph explicitly.").toStdString(),
+            QStringLiteral("Graph"));
+    }
 }
 
 std::vector<graphrag::edge_type_t> AiDAWorkbenchPanel::selected_graph_edge_types() const
@@ -2119,6 +2121,15 @@ void AiDAWorkbenchPanel::show_graph_node_details(ea_t address)
         return;
 
     auto& store = graphrag::GraphStore::instance();
+    if (store.get_node_by_address(m_binaryHash, graphrag::node_type_t::FUNCTION, address) == nullptr)
+    {
+        render_text_browser(
+            m_graphOverviewBrowser,
+            QStringLiteral("This function is not indexed in GraphRAG yet. Use Index Current or Index Binary before requesting graph-backed details.").toStdString(),
+            QStringLiteral("Graph Node Details"));
+        return;
+    }
+
     graphrag::QueryEngine qe(store);
     nlohmann::json semantic = qe.get_semantic_analysis(m_binaryHash, address);
     nlohmann::json callctx = qe.get_call_context(m_binaryHash, address, 2);
@@ -2181,17 +2192,17 @@ void AiDAWorkbenchPanel::reindex_binary()
     if (m_binaryHash.empty())
         return;
 
-    show_wait_box("HIDECANCEL\nRe-indexing binary for GraphRAG...");
+    show_wait_box("HIDECANCEL\nIndexing binary for GraphRAG...");
     graphrag::StructureExtractor extractor(graphrag::GraphStore::instance());
     auto result = extractor.extract_all(m_binaryHash, [](int current, int total, const std::string& name) {
         if (current == 1 || (current % 50) == 0 || current == total)
-            replace_wait_box("Re-indexing %d / %d: %s", current, total, name.c_str());
+            replace_wait_box("Indexing %d / %d: %s", current, total, name.c_str());
     });
     hide_wait_box();
 
     graphrag::save_graph(m_binaryHash);
     append_actions_log(
-        QStringLiteral("ReIndex Binary"),
+        QStringLiteral("Index Binary"),
         (QStringLiteral("Extracted %1 functions for the active binary graph.").arg(result.functions_extracted)).toStdString(),
         false);
     rebuild_graph_scene();

@@ -2139,6 +2139,9 @@ std::unique_ptr<AIClient> get_ai_client(const settings_t& settings)
 
     qstring provider = ida_utils::qstring_tolower(settings.api_provider.c_str());
 
+    if (provider.empty())
+        return nullptr;
+
     msg(OBFSTR_C("Initializing AI provider: %s\n"), provider.c_str());
 
     std::unique_ptr<AIClient> result;

@@ -12,6 +12,7 @@ class SettingsForm
 {
 public:
     static void show_and_apply(aida_plugin_t* plugin_instance);
+    static void show_welcome_and_apply_deferred(aida_plugin_t* plugin_instance);
 };
 
 void handle_manage_prompts(action_activation_ctx_t* ctx, aida_plugin_t* plugin);

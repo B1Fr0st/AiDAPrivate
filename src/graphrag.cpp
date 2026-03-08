@@ -1263,8 +1263,6 @@ std::vector<taint_path_t> TaintAnalyzer::find_taint_paths(const std::string& bin
 {
     m_cancelled = false;
 
-    ensure_full_binary_index(binary_hash);
-
     auto sources = find_source_nodes(binary_hash);
     auto sink_nodes = find_sink_nodes(binary_hash);
 
@@ -1396,8 +1394,6 @@ int CommunityDetector::detect(const std::string& binary_hash, int min_size,
                                int max_iterations, bool force, progress_fn on_progress)
 {
     m_cancelled = false;
-
-    ensure_full_binary_index(binary_hash);
 
     if (!force && m_store.communities_exist(binary_hash))
         return static_cast<int>(m_store.get_communities(binary_hash).size());
@@ -1610,8 +1606,6 @@ NetworkFlowAnalyzer::analyze(const std::string& binary_hash, progress_fn on_prog
     m_cancelled = false;
     result_t result;
 
-    ensure_full_binary_index(binary_hash);
-
     auto send_nodes = find_send_nodes(binary_hash);
     auto recv_nodes = find_recv_nodes(binary_hash);
 
@@ -1791,8 +1785,6 @@ std::string QueryEngine::node_display_name(const graph_node_t* n) const
 
 nlohmann::json QueryEngine::get_semantic_analysis(const std::string& binary_hash, ea_t address)
 {
-    ensure_full_binary_index(binary_hash);
-
     auto* node = m_store.get_node_by_address(binary_hash, node_type_t::FUNCTION, address);
     if (!node)
     {
@@ -1854,8 +1846,6 @@ nlohmann::json QueryEngine::get_semantic_analysis(const std::string& binary_hash
 nlohmann::json QueryEngine::search_semantic(const std::string& binary_hash,
                                              const std::string& query, int limit)
 {
-    ensure_full_binary_index(binary_hash);
-
     auto results = m_store.search_nodes(binary_hash, query, limit);
     nlohmann::json j = nlohmann::json::array();
     for (auto* n : results)
@@ -1876,8 +1866,6 @@ nlohmann::json QueryEngine::search_semantic(const std::string& binary_hash,
 nlohmann::json QueryEngine::get_similar_functions(const std::string& binary_hash,
                                                    ea_t address, int limit)
 {
-    ensure_full_binary_index(binary_hash);
-
     auto* source = m_store.get_node_by_address(binary_hash, node_type_t::FUNCTION, address);
     if (!source) return nlohmann::json::array();
 
@@ -1928,8 +1916,6 @@ nlohmann::json QueryEngine::get_similar_functions(const std::string& binary_hash
 nlohmann::json QueryEngine::get_call_context(const std::string& binary_hash,
                                               ea_t address, int depth)
 {
-    ensure_full_binary_index(binary_hash);
-
     auto* node = m_store.get_node_by_address(binary_hash, node_type_t::FUNCTION, address);
     if (!node) return {{"error", "Function not found"}};
 
@@ -1966,8 +1952,6 @@ nlohmann::json QueryEngine::get_call_context(const std::string& binary_hash,
 
 nlohmann::json QueryEngine::get_taint_paths(const std::string& binary_hash, ea_t address)
 {
-    ensure_full_binary_index(binary_hash);
-
     auto* node = m_store.get_node_by_address(binary_hash, node_type_t::FUNCTION, address);
     if (!node) return {{"error", "Function not found"}};
 
@@ -2052,8 +2036,6 @@ nlohmann::json QueryEngine::get_taint_paths(const std::string& binary_hash, ea_t
 
 nlohmann::json QueryEngine::get_community_info(const std::string& binary_hash, ea_t address)
 {
-    ensure_full_binary_index(binary_hash);
-
     if (!m_store.communities_exist(binary_hash))
     {
         CommunityDetector detector(m_store);
@@ -2092,8 +2074,6 @@ nlohmann::json QueryEngine::get_community_info(const std::string& binary_hash, e
 
 nlohmann::json QueryEngine::get_security_analysis(const std::string& binary_hash, int limit)
 {
-    ensure_full_binary_index(binary_hash);
-
     auto nodes = m_store.get_nodes_by_type(binary_hash, node_type_t::FUNCTION);
 
     nlohmann::json j;
@@ -2143,8 +2123,6 @@ nlohmann::json QueryEngine::get_security_analysis(const std::string& binary_hash
 nlohmann::json QueryEngine::get_activity_analysis(const std::string& binary_hash,
                                                     const std::string& activity_filter)
 {
-    ensure_full_binary_index(binary_hash);
-
     auto nodes = m_store.get_nodes_by_type(binary_hash, node_type_t::FUNCTION);
 
     std::map<std::string, std::vector<nlohmann::json>> by_activity;
@@ -2183,8 +2161,6 @@ nlohmann::json QueryEngine::get_activity_analysis(const std::string& binary_hash
 
 nlohmann::json QueryEngine::get_all_communities(const std::string& binary_hash)
 {
-    ensure_full_binary_index(binary_hash);
-
     if (!m_store.communities_exist(binary_hash))
     {
         CommunityDetector detector(m_store);

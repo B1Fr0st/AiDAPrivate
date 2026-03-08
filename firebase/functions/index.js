@@ -18,8 +18,14 @@ const { getDatabase } = require("firebase-admin/database");
 const { v4: uuidv4 } = require("uuid");
 const crypto = require("crypto");
 
-// Initialize Firebase Admin — uses Application Default Credentials when deployed
-initializeApp();
+// Initialize Firebase Admin with an explicit RTDB URL.
+// 2nd-gen runtimes do not always expose enough metadata for getDatabase()
+// to infer the database URL automatically.
+const FIREBASE_DB_URL =
+    process.env.AIDA_FIREBASE_DB_URL ||
+    "https://aida-license-prod-default-rtdb.europe-west1.firebasedatabase.app";
+
+initializeApp({ databaseURL: FIREBASE_DB_URL });
 const db = getDatabase();
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -28,6 +34,9 @@ const SESSION_TTL_SECONDS  = 3600;        // 1 hour default session TTL
 const MAX_TTL_SECONDS      = 86400;       // 24 hour maximum TTL
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;   // 1 minute window
 const RATE_LIMIT_MAX_CALLS = 30;          // max calls per window per IP
+
+// Server-side HMAC signing key — must match the client-side key in license.cpp
+const SERVER_SIGNING_KEY = "AiDA-ServerSign-v1-Kx9mPqR2sT5wY8zA";
 
 // In-memory rate limiter (per Cloud Function instance)
 const rateLimitMap = new Map();
@@ -44,6 +53,24 @@ function generateSessionToken() {
 
 function generateServerNonce() {
     return crypto.randomBytes(16).toString("hex");
+}
+
+/**
+ * Compute HMAC-SHA256 signature over a JSON payload string.
+ * The client verifies this to ensure the response was not forged.
+ */
+function signPayload(payloadObj) {
+    // Sort keys alphabetically to match C++ nlohmann::json (std::map) ordering.
+    // Without this, JSON.stringify uses insertion order while nlohmann::json
+    // uses alphabetical order, causing HMAC mismatch.
+    const sorted = Object.keys(payloadObj).sort().reduce((obj, key) => {
+        obj[key] = payloadObj[key];
+        return obj;
+    }, {});
+    const payloadStr = JSON.stringify(sorted);
+    const hmac = crypto.createHmac("sha256", SERVER_SIGNING_KEY);
+    hmac.update(payloadStr);
+    return hmac.digest("hex");
 }
 
 /**
@@ -80,7 +107,7 @@ async function lookupLicense(licenseKey) {
         return { valid: false, reason: "invalid_format" };
     }
 
-    const snapshot = await db.ref(`licenses/${licenseKey}`).once("value");
+    const snapshot = await db.ref(`licenses/${licenseKey}`).get();
     const data = snapshot.val();
 
     if (!data) {
@@ -133,7 +160,7 @@ async function storeSession(licenseKey, sessionData) {
  * Read session from RTDB under /sessions/{license_key}
  */
 async function getSession(licenseKey) {
-    const snapshot = await db.ref(`sessions/${licenseKey}`).once("value");
+    const snapshot = await db.ref(`sessions/${licenseKey}`).get();
     return snapshot.val();
 }
 
@@ -202,6 +229,18 @@ async function handleValidate(body, clientIp) {
     await storeSession(license_key, sessionData);
 
     // 6. Return response — client_nonce is echoed for anti-replay
+    //    Signature covers the critical fields so the client can verify authenticity
+    const sigPayload = {
+        status:        "valid",
+        plan:          licenseData.plan || "standard",
+        session_token: sessionToken,
+        ttl:           ttl,
+        issued_at:     issuedAt,
+        server_nonce:  serverNonce,
+        client_nonce:  client_nonce,
+    };
+    const signature = signPayload(sigPayload);
+
     return {
         status: 200,
         body: {
@@ -211,7 +250,8 @@ async function handleValidate(body, clientIp) {
             ttl:           ttl,
             issued_at:     issuedAt,
             server_nonce:  serverNonce,
-            client_nonce:  client_nonce,   // Echo back for anti-replay
+            client_nonce:  client_nonce,
+            signature:     signature,
         },
     };
 }
@@ -227,6 +267,17 @@ async function handleHeartbeat(body, clientIp) {
             status: 400,
             body: { status: "error", reason: "missing_fields" },
         };
+    }
+
+    // 1b. Validate request timestamp — reject stale requests (> 5 min drift)
+    if (body.timestamp && typeof body.timestamp === "number") {
+        const drift = Math.abs(Math.floor(Date.now() / 1000) - body.timestamp);
+        if (drift > 300) {
+            return {
+                status: 200,
+                body: { status: "invalid", reason: "clock_drift" },
+            };
+        }
     }
 
     // 2. Look up license — re-verify it's still active
@@ -250,7 +301,7 @@ async function handleHeartbeat(body, clientIp) {
     // 4. Check session hasn't expired server-side
     const now = Math.floor(Date.now() / 1000);
     if (session.issued_at && session.ttl) {
-        const expiresAt = session.issued_at + (session.ttl * 2); // Grace: 2x TTL
+        const expiresAt = session.issued_at + Math.floor(session.ttl * 1.5); // Grace: 1.5x TTL
         if (now > expiresAt) {
             return {
                 status: 200,
@@ -270,13 +321,28 @@ async function handleHeartbeat(body, clientIp) {
     // 6. Update last heartbeat timestamp
     await db.ref(`sessions/${license_key}/last_heartbeat`).set(now);
 
-    // 7. Return success with refreshed TTL
+    // 7. Generate per-heartbeat nonce and sign the response
+    const heartbeatNonce = body.heartbeat_nonce || "";
+    const serverNonce = generateServerNonce();
+
+    const sigPayload = {
+        status:          "valid",
+        plan:            lookup.data.plan || "standard",
+        ttl:             SESSION_TTL_SECONDS,
+        heartbeat_nonce: heartbeatNonce,
+        server_nonce:    serverNonce,
+    };
+    const signature = signPayload(sigPayload);
+
     return {
         status: 200,
         body: {
-            status: "valid",
-            plan:   lookup.data.plan || "standard",
-            ttl:    SESSION_TTL_SECONDS,
+            status:          "valid",
+            plan:            lookup.data.plan || "standard",
+            ttl:             SESSION_TTL_SECONDS,
+            heartbeat_nonce: heartbeatNonce,
+            server_nonce:    serverNonce,
+            signature:       signature,
         },
     };
 }
