@@ -1057,9 +1057,6 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
         if (status == OBFSTR("banned"))
         {
             invalidate_runtime();
-#ifdef __NT__
-            anti_re::enforce_self_analysis_violation();
-#endif
             return false;
         }
         if (status != OBFSTR("valid"))
@@ -1251,9 +1248,6 @@ bool license_manager_t::perform_heartbeat()
                     else if (status == OBFSTR("banned"))
                     {
                         invalidate_runtime();
-#ifdef __NT__
-                        anti_re::enforce_self_analysis_violation();
-#endif
                         return false;
                     }
                     else if (status == OBFSTR("revoked") || status == OBFSTR("invalid"))

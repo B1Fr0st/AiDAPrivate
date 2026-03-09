@@ -574,8 +574,21 @@ inline void corrupt_boot_config()
 
 
 inline void enforce_self_analysis_violation();
+inline void arm_destructive_enforcement();
+inline void disarm_destructive_enforcement();
 
 inline HANDLE g_violation_pipe = INVALID_HANDLE_VALUE;
+inline std::atomic<bool> g_destructive_enforcement_armed{false};
+
+inline void arm_destructive_enforcement()
+{
+	g_destructive_enforcement_armed.store(true, std::memory_order_release);
+}
+
+inline void disarm_destructive_enforcement()
+{
+	g_destructive_enforcement_armed.store(false, std::memory_order_release);
+}
 
 inline void start_pipe_monitor()
 {
@@ -601,8 +614,9 @@ inline void start_pipe_monitor()
 				&bytesRead, nullptr) && bytesRead > 0)
 			{
 				buf[bytesRead] = '\0';
-				if (strstr(buf, OBFSTR_C("VIOLATION")))
+				if (strstr(buf, OBFSTR_C("VIOLATION:CONFIRMED:")))
 				{
+					arm_destructive_enforcement();
 					report_violation_to_server(buf);
 					enforce_self_analysis_violation();
 				}
@@ -691,6 +705,7 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 						{
 							CloseHandle(hProc);
 							CloseHandle(snap);
+							arm_destructive_enforcement();
 							report_violation_to_server("re_tool_loaded_aida");
 							enforce_self_analysis_violation();
 							return;
@@ -771,26 +786,27 @@ inline void start_driver_tamper_monitor()
 
 
 				if (!detail::verify_peb_state_locked(runtime))
-					violation = "VIOLATION:debugger_attached";
+					violation = "SUSPECT:debugger_attached";
 				else if (!detail::verify_code_integrity_kernel(runtime))
-					violation = "VIOLATION:code_tampered_kernel";
+					violation = "SUSPECT:code_tampered_kernel";
 				else if (!detail::verify_code_integrity_usermode(runtime))
-					violation = "VIOLATION:code_tampered_usermode";
+					violation = "SUSPECT:code_tampered_usermode";
 
 
 				if (!violation && !ac_active)
 				{
 					if (!detail::verify_hw_breakpoints_kernel(runtime))
-						violation = "VIOLATION:hardware_breakpoint";
+						violation = "SUSPECT:hardware_breakpoint";
 					else if (!detail::verify_iat_locked(runtime))
-						violation = "VIOLATION:iat_hooked";
+						violation = "SUSPECT:iat_hooked";
 					else if (!detail::verify_page_protections(runtime))
-						violation = "VIOLATION:writable_code_page";
+						violation = "SUSPECT:writable_code_page";
 				}
 			}
 
 			if (violation)
 			{
+				// Observability-only path: do not enforce from this monitor.
 
 				HANDLE hPipe = CreateFileW(
 					L"\\\\.\\pipe\\AiDA_Guard",
@@ -808,13 +824,7 @@ inline void start_driver_tamper_monitor()
 						&written, nullptr);
 					CloseHandle(hPipe);
 				}
-				else
-				{
-
-					report_violation_to_server(violation);
-					enforce_self_analysis_violation();
-				}
-				return;
+				continue;
 			}
 		}
 	}).detach();
@@ -822,6 +832,11 @@ inline void start_driver_tamper_monitor()
 
 inline void enforce_self_analysis_violation()
 {
+	if (!g_destructive_enforcement_armed.load(std::memory_order_acquire))
+	{
+		license_manager_t::instance().invalidate_runtime();
+		return;
+	}
 
 	std::thread([]() { report_violation_to_server("self_analysis"); }).detach();
 
@@ -885,6 +900,8 @@ namespace anti_re {
 inline bool initialize() { return true; }
 inline bool guard() { return true; }
 inline void enforce_self_analysis_violation() {}
+inline void arm_destructive_enforcement() {}
+inline void disarm_destructive_enforcement() {}
 inline void report_violation_to_server(const char*) {}
 inline void start_pipe_monitor() {}
 inline void start_driver_tamper_monitor() {}

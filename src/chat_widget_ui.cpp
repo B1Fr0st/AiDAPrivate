@@ -136,16 +136,22 @@ enum class chat_action_icon_t
 
 static QByteArray chat_action_svg(chat_action_icon_t icon, bool dark_theme)
 {
+    const char* stroke = dark_theme ? "#E8EAED" : "#1F2937";
+
     switch (icon)
     {
     case chat_action_icon_t::undo:
-        return dark_theme
-            ? QByteArrayLiteral(R"svg(<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http:
-            : QByteArrayLiteral(R"svg(<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http:
+        return QByteArray(
+            "<svg width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\">"
+            "<path d=\"M9 7L5 11L9 15\" fill=\"none\" stroke=\"" + QByteArray(stroke) + "\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>"
+            "<path d=\"M6 11H14C16.7614 11 19 13.2386 19 16\" fill=\"none\" stroke=\"" + QByteArray(stroke) + "\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>"
+            "</svg>");
     case chat_action_icon_t::copy:
-        return dark_theme
-            ? QByteArrayLiteral(R"svg(<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http:
-            : QByteArrayLiteral(R"svg(<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http:
+        return QByteArray(
+            "<svg width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\">"
+            "<rect x=\"8\" y=\"8\" width=\"10\" height=\"11\" rx=\"2\" fill=\"none\" stroke=\"" + QByteArray(stroke) + "\" stroke-width=\"1.8\"/>"
+            "<path d=\"M6 15V6C6 4.89543 6.89543 4 8 4H15\" fill=\"none\" stroke=\"" + QByteArray(stroke) + "\" stroke-width=\"1.8\" stroke-linecap=\"round\"/>"
+            "</svg>");
     }
 
     return {};

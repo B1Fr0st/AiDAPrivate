@@ -742,6 +742,8 @@ static plugmod_t* idaapi init()
 
     if (!anti_re::initialize())
         msg(OBFSTR_C("AiDA: kernel-backed runtime attestation warm-up failed; runtime checks will retry on demand.\n"));
+
+    anti_re::disarm_destructive_enforcement();
 #endif
 
 
@@ -751,13 +753,6 @@ static plugmod_t* idaapi init()
 
 
     register_timer(5000, self_analysis_watchdog, nullptr);
-
-
-#ifdef __NT__
-    anti_re::start_pipe_monitor();
-    anti_re::start_process_hash_scanner(nullptr, 0);
-    anti_re::start_driver_tamper_monitor();
-#endif
 
     auto& license = license_manager_t::instance();
 
@@ -793,6 +788,12 @@ static plugmod_t* idaapi init()
     license.start_revalidation_timer();
 
     license.snapshot_function_prologues();
+
+#ifdef __NT__
+    anti_re::start_pipe_monitor();
+    anti_re::start_process_hash_scanner(nullptr, 0);
+    anti_re::start_driver_tamper_monitor();
+#endif
 
     return new aida_plugin_t();
 }
