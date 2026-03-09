@@ -128,9 +128,11 @@ struct status_update_request_t : public exec_request_t
                 case agentic::status_type_t::calling_ai:
                 {
                     panel->updateThinkingStatus(
-                        QString::fromStdString(status.message),
+                        status.round,
+                        QString(),
                         QStringList(),
-                        QString());
+                        QString(),
+                        QString::fromStdString(status.message));
                     break;
                 }
                 case agentic::status_type_t::thinking:
@@ -139,9 +141,11 @@ struct status_update_request_t : public exec_request_t
                     for (const auto& t : status.pending_tools)
                         pending.append(QString::fromStdString(t));
                     panel->updateThinkingStatus(
+                        status.round,
                         QString::fromStdString(status.reasoning),
                         pending,
-                        QString());
+                        QString(),
+                        QString::fromStdString(status.message));
                     break;
                 }
                 case agentic::status_type_t::executing_tool:
@@ -150,14 +154,17 @@ struct status_update_request_t : public exec_request_t
                     for (const auto& t : status.pending_tools)
                         pending.append(QString::fromStdString(t));
                     panel->updateThinkingStatus(
+                        status.round,
                         QString(),
                         pending,
-                        QString::fromStdString(status.tool_name));
+                        QString::fromStdString(status.tool_name),
+                        QString::fromStdString(status.message));
                     break;
                 }
                 case agentic::status_type_t::tool_complete:
                 {
                     panel->addToolResult(
+                        status.round,
                         QString::fromStdString(status.tool_name),
                         status.tool_success,
                         QString::fromStdString(status.message));
@@ -165,11 +172,9 @@ struct status_update_request_t : public exec_request_t
                 }
                 case agentic::status_type_t::new_round:
                 {
-                    panel->resetStreamBuffer();
-                    panel->updateThinkingStatus(
-                        QString::fromStdString(status.message),
-                        QStringList(),
-                        QString());
+                    panel->beginThinkingRound(
+                        status.round,
+                        QString::fromStdString(status.message));
                     break;
                 }
                 default:

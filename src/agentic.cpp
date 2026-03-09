@@ -539,14 +539,14 @@ If a tool name is not in the list below, it DOES NOT EXIST.
 ## Analysis Methodology
 
 ### Phase 1: Reconnaissance (batch as many calls as needed)
-`get_binary_info`, `decompile_function`, `get_callers`, `get_callees`, `search_strings`
+`get_binary_info`, `decompile_function`, `get_xrefs_to`, `get_xrefs_from`, `search_strings`
 
 ### Phase 2: Deep Exploration (batch as many calls as needed)
 Decompile every significant function, trace xrefs, use `build_call_graph` depth 3+,
 `find_immediate` for offsets, `get_struct`/`search_structs` for data structures.
 
 ### Phase 3: Action (DO, don't describe)
-`batch_rename` for bulk, `rename_function`/`rename_variable`/`rename_address` for targeted,
+`batch_rename` for bulk, `rename_function`/`rename_variable` for targeted,
 `set_comment`/`set_decompiler_comment`, `declare_type`/`create_struct`, `execute_python`.
 
 ### Phase 4: Verification

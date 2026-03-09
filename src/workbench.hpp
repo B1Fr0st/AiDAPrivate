@@ -43,16 +43,17 @@ public:
     AiDAChatPanel* query_panel() const;
     void set_context_function(ea_t ea, const QString& func_name);
 
+    QSize sizeHint() const override;
+    QSize minimumSizeHint() const override;
+
 protected:
     bool event(QEvent* event) override;
 
 private:
     void build_ui();
     void apply_theme();
-    void refresh_header_badge_layout();
     void queue_visual_refresh();
     void refresh_all_tabs();
-    void refresh_header();
 
     void build_explain_tab();
     void build_actions_tab();
@@ -115,9 +116,6 @@ private:
     bool           m_visualRefreshQueued;
     QString        m_appliedStyleSheet;
 
-    QLabel*        m_headerContextLabel;
-    QLabel*        m_headerProviderLabel;
-    QLabel*        m_headerGraphLabel;
     QTabWidget*    m_tabs;
 
     AiDAChatPanel* m_queryPanel;

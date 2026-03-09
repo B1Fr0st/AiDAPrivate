@@ -349,6 +349,12 @@ static void to_json(nlohmann::json& j, const settings_t& s)
         {OBFSTR_C("check_for_updates"), s.check_for_updates},
         {OBFSTR_C("mcp_enabled"), s.mcp_enabled},
         {OBFSTR_C("mcp_port"), s.mcp_port},
+        {OBFSTR_C("embedding_enabled"), s.embedding_enabled},
+        {OBFSTR_C("embedding_api_url"), s.embedding_api_url},
+        {OBFSTR_C("embedding_api_key"), obfuscate_key(s.embedding_api_key)},
+        {OBFSTR_C("embedding_model_name"), s.embedding_model_name},
+        {OBFSTR_C("embedding_dimensions"), s.embedding_dimensions},
+        {OBFSTR_C("embedding_batch_size"), s.embedding_batch_size},
         {OBFSTR_C("firebase_api_key"), obfuscate_key(s.firebase_api_key)}
     };
 }
@@ -395,6 +401,13 @@ static void from_json(const nlohmann::json& j, settings_t& s)
 
     s.mcp_enabled = j.value(OBFSTR_C("mcp_enabled"), d.mcp_enabled);
     s.mcp_port = j.value(OBFSTR_C("mcp_port"), d.mcp_port);
+
+    s.embedding_enabled = j.value(OBFSTR_C("embedding_enabled"), d.embedding_enabled);
+    s.embedding_api_url = get_trimmed_json_string(j, OBFSTR_C("embedding_api_url"), d.embedding_api_url);
+    s.embedding_api_key = get_trimmed_key_string(j, OBFSTR_C("embedding_api_key"), d.embedding_api_key);
+    s.embedding_model_name = j.value(OBFSTR_C("embedding_model_name"), d.embedding_model_name);
+    s.embedding_dimensions = j.value(OBFSTR_C("embedding_dimensions"), d.embedding_dimensions);
+    s.embedding_batch_size = j.value(OBFSTR_C("embedding_batch_size"), d.embedding_batch_size);
 
     s.firebase_api_key = get_trimmed_key_string(j, OBFSTR_C("firebase_api_key"), d.firebase_api_key);
 
@@ -571,6 +584,12 @@ settings_t::settings_t() :
     check_for_updates(true),
     mcp_enabled(true),
     mcp_port(13120),
+    embedding_enabled(true),
+    embedding_api_url(""),
+    embedding_api_key(""),
+    embedding_model_name(OBFSTR("text-embedding-3-small")),
+    embedding_dimensions(1536),
+    embedding_batch_size(32),
     license_key(""),
     license_validated_at(0),
     license_hwid(""),

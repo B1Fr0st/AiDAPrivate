@@ -47,6 +47,12 @@ public:
 protected:
     void doSetSource(const QUrl&, QTextDocument::ResourceType) override {  }
 
+    void wheelEvent(QWheelEvent* e) override
+    {
+        // Let the outer chat scroller handle wheel movement.
+        e->ignore();
+    }
+
     void keyPressEvent(QKeyEvent* e) override
     {
         if (e->matches(QKeySequence::Copy) && !m_markdownSource.isEmpty())
@@ -190,8 +196,9 @@ public:
     void onAiResponse(const std::string& response);
     void clearHistory();
 
-    void updateThinkingStatus(const QString& reasoning, const QStringList& pendingTools, const QString& currentTool);
-    void addToolResult(const QString& toolName, bool success, const QString& message);
+    void beginThinkingRound(int round, const QString& statusMessage);
+    void updateThinkingStatus(int round, const QString& reasoning, const QStringList& pendingTools, const QString& currentTool, const QString& statusMessage = QString());
+    void addToolResult(int round, const QString& toolName, bool success, const QString& message);
     void setThinkingExpanded(bool expanded);
     void clearThinkingStatus();
     void appendStreamChunk(const QString& chunk);
@@ -211,6 +218,10 @@ private:
     void setupUI();
     void setupStyle();
     void applyResponsiveMetrics();
+    void refreshModelPicker();
+    void applySelectedModel();
+    QString summarizeThinkingHeader(const QString& reasoning) const;
+    void appendThinkingDetail(int round, const QString& line);
     void updateContextLabel();
     void updateThemeColors();
     ThemeColors detectThemeColors() const;
@@ -286,7 +297,7 @@ private:
     QTextEdit*               m_inputField;
     QPushButton*             m_sendBtn;
     QPushButton*             m_cancelBtn;
-    QPushButton*             m_clearBtn;
+    QComboBox*               m_modelPicker;
     QPushButton*             m_tagBtn;
     QWidget*                 m_typingWidget;
     QLabel*                  m_typingLabel;
@@ -303,6 +314,14 @@ private:
     QLabel*                  m_thinkingElapsedLabel;
     bool                     m_thinkingExpanded;
     QString                  m_streamBuffer;
+    struct ThinkingRound
+    {
+        int round = 0;
+        QString header;
+        QString details;
+    };
+    std::vector<ThinkingRound> m_thinkingRounds;
+    int                      m_activeThinkingRound;
     QElapsedTimer            m_thinkingStopwatch;
     QTimer*                  m_thinkingElapsedTimer;
 

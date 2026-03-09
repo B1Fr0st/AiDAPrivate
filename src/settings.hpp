@@ -48,6 +48,13 @@ public:
     bool mcp_enabled;
     int mcp_port;
 
+    bool        embedding_enabled;
+    std::string embedding_api_url;
+    std::string embedding_api_key;
+    std::string embedding_model_name;
+    int         embedding_dimensions;
+    int         embedding_batch_size;
+
     std::string license_key;
     int64_t     license_validated_at;
     std::string license_hwid;

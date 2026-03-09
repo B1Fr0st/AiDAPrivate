@@ -3028,89 +3028,6 @@ tool_result_t get_xrefs_from(const json& params)
     return tool_result_t::ok(OBFSTR("Cross-references retrieved"), all_xrefs);
 }
 
-tool_result_t get_callees(const json& params)
-{
-    auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
-    if (!ea_opt)
-        return tool_result_t::error(OBFSTR("Invalid address"));
-
-    func_t* pfn = get_func(*ea_opt);
-    if (!pfn)
-        return tool_result_t::error(OBFSTR("No function at address"));
-
-    std::set<ea_t> callees;
-
-    func_item_iterator_t fii;
-    for (bool ok = fii.set(pfn); ok; ok = fii.next_addr())
-    {
-        ea_t item_ea = fii.current();
-        xrefblk_t xb;
-        for (bool xok = xb.first_from(item_ea, XREF_ALL); xok; xok = xb.next_from())
-        {
-            if (xb.iscode && (xb.type == fl_CN || xb.type == fl_CF))
-            {
-                func_t* callee = get_func(xb.to);
-                if (callee)
-                    callees.insert(callee->start_ea);
-            }
-        }
-    }
-
-    json result = json::array();
-    for (ea_t callee_ea : callees)
-    {
-        qstring name;
-        get_func_name(&name, callee_ea);
-        result.push_back({
-            {"address", helpers::format_address(callee_ea)},
-            {"name", name.c_str()}
-        });
-    }
-
-    std::ostringstream ss;
-    ss << "Found " << result.size() << " callees";
-    return tool_result_t::ok(ss.str(), result);
-}
-
-tool_result_t get_callers(const json& params)
-{
-    auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
-    if (!ea_opt)
-        return tool_result_t::error(OBFSTR("Invalid address"));
-
-    func_t* pfn = get_func(*ea_opt);
-    if (!pfn)
-        return tool_result_t::error(OBFSTR("No function at address"));
-
-    std::set<ea_t> callers;
-
-    xrefblk_t xb;
-    for (bool ok = xb.first_to(pfn->start_ea, XREF_ALL); ok; ok = xb.next_to())
-    {
-        if (xb.iscode && (xb.type == fl_CN || xb.type == fl_CF))
-        {
-            func_t* caller = get_func(xb.from);
-            if (caller)
-                callers.insert(caller->start_ea);
-        }
-    }
-
-    json result = json::array();
-    for (ea_t caller_ea : callers)
-    {
-        qstring name;
-        get_func_name(&name, caller_ea);
-        result.push_back({
-            {"address", helpers::format_address(caller_ea)},
-            {"name", name.c_str()}
-        });
-    }
-
-    std::ostringstream ss;
-    ss << "Found " << result.size() << " callers";
-    return tool_result_t::ok(ss.str(), result);
-}
-
 tool_result_t rename_function(const json& params)
 {
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
@@ -3209,51 +3126,6 @@ tool_result_t get_stack_frame(const json& params)
     return tool_result_t::ok(OBFSTR("Stack frame retrieved"), result);
 }
 
-tool_result_t get_function_signature(const json& params)
-{
-    auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
-    if (!ea_opt)
-        return tool_result_t::error(OBFSTR("Invalid address"));
-
-    func_t* pfn = get_func(*ea_opt);
-    if (!pfn)
-        return tool_result_t::error(OBFSTR("No function at address"));
-
-    tinfo_t tif;
-    if (!get_tinfo(&tif, pfn->start_ea))
-        return tool_result_t::error(OBFSTR("No type information available"));
-
-    qstring proto;
-    tif.print(&proto);
-
-    json result;
-    result["address"] = helpers::format_address(pfn->start_ea);
-    result["signature"] = proto.c_str();
-
-    func_type_data_t ftd;
-    if (tif.get_func_details(&ftd))
-    {
-        json args = json::array();
-        for (size_t i = 0; i < ftd.size(); i++)
-        {
-            const funcarg_t& arg = ftd[i];
-            qstring arg_type;
-            arg.type.print(&arg_type);
-            args.push_back({
-                {"name", arg.name.c_str()},
-                {"type", arg_type.c_str()}
-            });
-        }
-        result["arguments"] = args;
-
-        qstring ret_type;
-        ftd.rettype.print(&ret_type);
-        result["return_type"] = ret_type.c_str();
-    }
-
-    return tool_result_t::ok(OBFSTR("Function signature retrieved"), result);
-}
-
 tool_result_t set_function_signature(const json& params)
 {
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
@@ -3271,60 +3143,6 @@ tool_result_t set_function_signature(const json& params)
         return tool_result_t::error(OBFSTR("Failed to apply type"));
 
     return tool_result_t::ok(OBFSTR("Function signature applied"));
-}
-
-tool_result_t analyze_function(const json& params)
-{
-    auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
-    if (!ea_opt)
-        return tool_result_t::error(OBFSTR("Invalid address"));
-
-    func_t* pfn = get_func(*ea_opt);
-    if (!pfn)
-        return tool_result_t::error(OBFSTR("No function at address"));
-
-    json result;
-
-    qstring func_name;
-    get_func_name(&func_name, pfn->start_ea);
-    result["name"] = func_name.c_str();
-    result["address"] = helpers::format_address(pfn->start_ea);
-    result["end_address"] = helpers::format_address(pfn->end_ea);
-    result["size"] = pfn->end_ea - pfn->start_ea;
-
-    result["decompiled_code"] = helpers::get_pseudocode(pfn->start_ea);
-
-    {
-        auto callers_result = get_callers({{"address", helpers::format_address(pfn->start_ea)}});
-        result["callers"] = callers_result.data;
-
-        auto callees_result = get_callees({{"address", helpers::format_address(pfn->start_ea)}});
-        result["callees"] = callees_result.data;
-    }
-
-    {
-        json strings = json::array();
-        func_item_iterator_t fii;
-        for (bool ok = fii.set(pfn); ok; ok = fii.next_addr())
-        {
-            ea_t item_ea = fii.current();
-            xrefblk_t xb;
-            for (bool xok = xb.first_from(item_ea, XREF_DATA); xok; xok = xb.next_from())
-            {
-                qstring str;
-                if (get_strlit_contents(&str, xb.to, -1, STRTYPE_C) > 0)
-                {
-                    strings.push_back({
-                        {"address", helpers::format_address(xb.to)},
-                        {"value", str.c_str()}
-                    });
-                }
-            }
-        }
-        result["strings"] = strings;
-    }
-
-    return tool_result_t::ok(OBFSTR("Comprehensive analysis complete"), result);
 }
 
 tool_result_t build_call_graph(const json& params)
@@ -3431,49 +3249,6 @@ tool_result_t get_basic_blocks(const json& params)
     return tool_result_t::ok(OBFSTR("Basic blocks retrieved"), blocks);
 }
 
-tool_result_t export_function(const json& params)
-{
-    auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
-    if (!ea_opt)
-        return tool_result_t::error(OBFSTR("Invalid address"));
-
-    std::string format = params.value("format", "json");
-
-    func_t* pfn = get_func(*ea_opt);
-    if (!pfn)
-        return tool_result_t::error(OBFSTR("No function at address"));
-
-    json result;
-
-    if (format == "json")
-    {
-        qstring name;
-        get_func_name(&name, pfn->start_ea);
-        result["name"] = name.c_str();
-        result["address"] = helpers::format_address(pfn->start_ea);
-        result["code"] = helpers::get_pseudocode(pfn->start_ea);
-        result["disassembly"] = helpers::get_disassembly(pfn->start_ea, pfn->end_ea);
-    }
-    else if (format == "c_header")
-    {
-        tinfo_t tif;
-        qstring proto;
-        if (get_tinfo(&tif, pfn->start_ea))
-            tif.print(&proto);
-        result["header"] = proto.c_str();
-    }
-    else if (format == "prototype")
-    {
-        tinfo_t tif;
-        qstring proto;
-        if (get_tinfo(&tif, pfn->start_ea))
-            tif.print(&proto);
-        result["prototype"] = proto.c_str();
-    }
-
-    return tool_result_t::ok(OBFSTR("Function exported"), result);
-}
-
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
@@ -3537,22 +3312,6 @@ void register_tools()
     });
 
     registry.register_tool({
-        OBFSTR("get_callees"),
-        OBFSTR("function"),
-        OBFSTR("Get all functions called by the function at the given address."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
-        get_callees
-    });
-
-    registry.register_tool({
-        OBFSTR("get_callers"),
-        OBFSTR("function"),
-        OBFSTR("Get all functions that call the function at the given address."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
-        get_callers
-    });
-
-    registry.register_tool({
         OBFSTR("rename_function"),
         OBFSTR("function"),
         OBFSTR("Rename the function at the given address."),
@@ -3585,14 +3344,6 @@ void register_tools()
     });
 
     registry.register_tool({
-        OBFSTR("get_function_signature"),
-        OBFSTR("function"),
-        OBFSTR("Get the type signature/prototype of a function."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
-        get_function_signature
-    });
-
-    registry.register_tool({
         OBFSTR("set_function_signature"),
         OBFSTR("function"),
         OBFSTR("Set/change the type signature of a function."),
@@ -3602,14 +3353,6 @@ void register_tools()
         },
         set_function_signature,
         false
-    });
-
-    registry.register_tool({
-        OBFSTR("analyze_function"),
-        OBFSTR("function"),
-        OBFSTR("Comprehensive function analysis: decompilation, xrefs, callers, callees, strings, etc."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
-        analyze_function
     });
 
     registry.register_tool({
@@ -3631,16 +3374,6 @@ void register_tools()
         get_basic_blocks
     });
 
-    registry.register_tool({
-        OBFSTR("export_function"),
-        OBFSTR("function"),
-        OBFSTR("Export function in specified format (json, c_header, prototype)."),
-        {
-            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true},
-            {OBFSTR("format"), OBFSTR("string"), OBFSTR("Export format"), false, {OBFSTR("json"), OBFSTR("c_header"), OBFSTR("prototype")}}
-        },
-        export_function
-    });
 }
 
 }
@@ -4426,20 +4159,6 @@ tool_result_t rename_variable(const json& params)
     }
 }
 
-tool_result_t rename_address(const json& params)
-{
-    auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
-    if (!ea_opt)
-        return tool_result_t::error(OBFSTR("Invalid address"));
-
-    std::string new_name = params["new_name"].get<std::string>();
-
-    if (!set_name(*ea_opt, new_name.c_str(), SN_FORCE | SN_NODUMMY))
-        return tool_result_t::error(OBFSTR("Failed to rename"));
-
-    return tool_result_t::ok(OBFSTR("Address renamed to: ") + new_name);
-}
-
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
@@ -4515,17 +4234,6 @@ void register_tools()
         false
     });
 
-    registry.register_tool({
-        OBFSTR("rename_address"),
-        OBFSTR("comment"),
-        OBFSTR("Rename any named location (function, global, label)."),
-        {
-            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to rename"), true},
-            {OBFSTR("new_name"), OBFSTR("string"), OBFSTR("New name"), true}
-        },
-        rename_address,
-        false
-    });
 }
 
 }
@@ -5002,11 +4710,6 @@ tool_result_t list_types(const json& params)
     return tool_result_t::ok(OBFSTR("Types listed"), result);
 }
 
-tool_result_t get_enum(const json& params)
-{
-    return get_struct(params);
-}
-
 tool_result_t create_enum(const json& params)
 {
     std::string name = params["name"].get<std::string>();
@@ -5120,11 +4823,6 @@ void register_tools()
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 100)"), false},
          {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Regex filter"), false}},
         list_types});
-
-    registry.register_tool({OBFSTR("get_enum"), OBFSTR("type"),
-        OBFSTR("Get enum type details including all members/values."),
-        {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Enum name"), true}},
-        get_enum});
 
     registry.register_tool({OBFSTR("create_enum"), OBFSTR("type"),
         OBFSTR("Create a new enum type."),
@@ -5584,135 +5282,6 @@ tool_result_t find_immediate(const json& params)
     return tool_result_t::ok(OBFSTR("Found ") + std::to_string(matches.size()) + " occurrences", matches);
 }
 
-tool_result_t search_text(const json& params)
-{
-    std::string text = params["text"].get<std::string>();
-    int limit = params.value("limit", 20);
-    bool case_sensitive = params.value("case_sensitive", false);
-
-    ea_t start_ea = inf_get_min_ea();
-    if (params.contains("start"))
-    {
-        auto s = helpers::parse_address(params["start"].get<std::string>());
-        if (s) start_ea = *s;
-    }
-
-    int flags = SEARCH_DOWN | SEARCH_NEXT;
-    if (case_sensitive)
-        flags |= SEARCH_CASE;
-
-    json matches = json::array();
-    ea_t ea = start_ea;
-
-    show_wait_box("NODELAY\nAiDA: Searching text...");
-
-    for (int i = 0; i < limit; i++)
-    {
-        replace_wait_box("AiDA: Searching text (%d / %d)...", i + 1, limit);
-        if (user_cancelled())
-            break;
-
-        ea_t found = find_text(ea, 0, 0, text.c_str(), flags);
-        if (found == BADADDR)
-            break;
-
-        matches.push_back({
-            {"address", helpers::format_address(found)},
-            {"name", helpers::get_name_or_address(found)}
-        });
-
-        ea = found + 1;
-    }
-
-    hide_wait_box();
-
-    return tool_result_t::ok(OBFSTR("Found ") + std::to_string(matches.size()) + " matches", matches);
-}
-
-tool_result_t advanced_search(const json& params)
-{
-    std::string search_type = params["type"].get<std::string>();
-    json result;
-
-    if (search_type == "immediate")
-    {
-        return find_immediate(params);
-    }
-    else if (search_type == "text")
-    {
-        json adapted = params;
-        if (!adapted.contains("text") && adapted.contains("value"))
-            adapted["text"] = adapted["value"];
-        return search_text(adapted);
-    }
-    else if (search_type == "bytes")
-    {
-        json adapted = params;
-        if (!adapted.contains("pattern") && adapted.contains("value"))
-            adapted["pattern"] = adapted["value"];
-        return find_bytes(adapted);
-    }
-    else if (search_type == "strings")
-    {
-        json adapted = params;
-        if (!adapted.contains("pattern") && adapted.contains("value"))
-            adapted["pattern"] = adapted["value"];
-        return search_strings(adapted);
-    }
-    else if (search_type == "code_ref")
-    {
-        auto ea_opt = helpers::parse_address(params["value"].get<std::string>());
-        if (!ea_opt)
-            return tool_result_t::error(OBFSTR("Invalid address"));
-
-        json xrefs = json::array();
-        xrefblk_t xb;
-        int count = 0;
-        int limit = params.value("limit", 50);
-
-        for (bool ok = xb.first_to(*ea_opt, XREF_ALL); ok && count < limit; ok = xb.next_to())
-        {
-            if (xb.iscode)
-            {
-                xrefs.push_back({
-                    {"from", helpers::format_address(xb.from)},
-                    {"type", xb.type},
-                    {"name", helpers::get_name_or_address(xb.from)}
-                });
-                count++;
-            }
-        }
-        return tool_result_t::ok(OBFSTR("Code references found"), xrefs);
-    }
-    else if (search_type == "data_ref")
-    {
-        auto ea_opt = helpers::parse_address(params["value"].get<std::string>());
-        if (!ea_opt)
-            return tool_result_t::error(OBFSTR("Invalid address"));
-
-        json xrefs = json::array();
-        xrefblk_t xb;
-        int count = 0;
-        int limit = params.value("limit", 50);
-
-        for (bool ok = xb.first_to(*ea_opt, XREF_ALL); ok && count < limit; ok = xb.next_to())
-        {
-            if (!xb.iscode)
-            {
-                xrefs.push_back({
-                    {"from", helpers::format_address(xb.from)},
-                    {"type", xb.type},
-                    {"name", helpers::get_name_or_address(xb.from)}
-                });
-                count++;
-            }
-        }
-        return tool_result_t::ok(OBFSTR("Data references found"), xrefs);
-    }
-
-    return tool_result_t::error(OBFSTR("Unknown search type: ") + search_type);
-}
-
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
@@ -5746,21 +5315,6 @@ void register_tools()
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 20)"), false}},
         find_immediate});
 
-    registry.register_tool({OBFSTR("search_text"), OBFSTR("search"),
-        OBFSTR("Search for text in disassembly listing."),
-        {{OBFSTR("text"), OBFSTR("string"), OBFSTR("Text to search for"), true},
-         {OBFSTR("start"), OBFSTR("string"), OBFSTR("Start address (optional)"), false},
-         {OBFSTR("case_sensitive"), OBFSTR("boolean"), OBFSTR("Case-sensitive search (default false)"), false},
-         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 20)"), false}},
-        search_text});
-
-    registry.register_tool({OBFSTR("advanced_search"), OBFSTR("search"),
-        OBFSTR("Advanced search: immediate values, strings, data/code references."),
-        {{OBFSTR("type"), OBFSTR("string"), OBFSTR("Search type"), true, {OBFSTR("immediate"), OBFSTR("text"), OBFSTR("bytes"), OBFSTR("strings"), OBFSTR("code_ref"), OBFSTR("data_ref")}},
-         {OBFSTR("value"), OBFSTR("string"), OBFSTR("Search value/pattern"), true},
-         {OBFSTR("start"), OBFSTR("string"), OBFSTR("Start address (optional)"), false},
-         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 50)"), false}},
-        advanced_search});
 }
 
 }
@@ -7603,25 +7157,6 @@ tool_result_t get_binary_info(const json&)
     return tool_result_t::ok(OBFSTR("Binary info retrieved"), result);
 }
 
-tool_result_t get_idb_info(const json&)
-{
-    json result;
-
-    result["binary_info"] = get_binary_info({}).data;
-
-    if (get_strlist_qty() == 0)
-        build_strlist();
-    result["string_count"] = (size_t)get_strlist_qty();
-
-    til_t* ti = get_idati();
-    if (ti)
-        result["local_type_count"] = get_ordinal_count(ti);
-
-    result["named_count"] = (size_t)get_nlist_size();
-
-    return tool_result_t::ok(OBFSTR("IDB info retrieved"), result);
-}
-
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
@@ -7629,10 +7164,6 @@ void register_tools()
     registry.register_tool({OBFSTR("get_binary_info"), OBFSTR("binary"),
         OBFSTR("Get binary file metadata (processor, bitness, file type, etc)."),
         {}, get_binary_info});
-
-    registry.register_tool({OBFSTR("get_idb_info"), OBFSTR("binary"),
-        OBFSTR("Get IDA database info (function count, types, strings, etc)."),
-        {}, get_idb_info});
 }
 
 }
@@ -7710,56 +7241,6 @@ void register_tools()
         OBFSTR("Supports Jupyter-style evaluation (expressions auto-return, statements exec)."),
         {{OBFSTR("code"), OBFSTR("string"), OBFSTR("Python code to execute"), true}},
         execute_python, false});
-}
-
-}
-
-namespace memory_tools
-{
-
-tool_result_t patch_instruction(const json& params)
-{
-    auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
-    if (!ea_opt)
-        return tool_result_t::error(OBFSTR("Invalid address"));
-
-    std::string assembly = params["assembly"].get<std::string>();
-
-    std::string py_code = "import ida_idp, ida_bytes, idc\n"
-        "ea = " + std::to_string(*ea_opt) + "\n"
-        "ok, buf = ida_idp.assemble(ea, 0, ea, True, '" + assembly + "')\n"
-        "_aida_patch_result = False\n"
-        "_aida_patch_size = 0\n"
-        "if ok and buf:\n"
-        "    ida_bytes.patch_bytes(ea, bytes(buf))\n"
-        "    _aida_patch_result = True\n"
-        "    _aida_patch_size = len(buf)\n";
-
-    extlang_object_t python = find_extlang_by_name("python");
-    if (!python)
-        return tool_result_t::error(OBFSTR("Python not available for assembly"));
-
-    qstring errbuf;
-    if (!python->eval_snippet(py_code.c_str(), &errbuf))
-        return tool_result_t::error(OBFSTR("Assembly failed: ") + std::string(errbuf.c_str()));
-
-    idc_value_t rv;
-    qstring eval_err;
-    if (python->eval_expr(&rv, BADADDR, "_aida_patch_result", &eval_err)
-        && rv.is_integral() && (rv.vtype == VT_INT64 ? rv.i64 : rv.num) != 0)
-    {
-        idc_value_t sz;
-        int patch_sz = 0;
-        if (python->eval_expr(&sz, BADADDR, "_aida_patch_size", &eval_err) && sz.is_integral())
-            patch_sz = (int)(sz.vtype == VT_INT64 ? sz.i64 : sz.num);
-
-        json result;
-        result["address"] = helpers::format_address(*ea_opt);
-        result["bytes_patched"] = patch_sz;
-        return tool_result_t::ok(OBFSTR("Instruction patched at ") + helpers::format_address(*ea_opt), result);
-    }
-
-    return tool_result_t::error(OBFSTR("Assembly failed: assembler could not encode '") + assembly + "' at " + helpers::format_address(*ea_opt));
 }
 
 }
@@ -7842,40 +7323,6 @@ tool_result_t wait_for_analysis(const json&)
         return tool_result_t::error(OBFSTR("Analysis was cancelled by user"));
 
     return tool_result_t::ok(OBFSTR("Auto-analysis completed"));
-}
-
-tool_result_t get_entry_points(const json&)
-{
-    size_t qty = get_entry_qty();
-    json entries = json::array();
-
-    for (size_t i = 0; i < qty; i++)
-    {
-        uval_t ord = get_entry_ordinal(i);
-        ea_t ea = get_entry(ord);
-        if (ea == BADADDR)
-            continue;
-
-        json entry;
-        entry["ordinal"] = ord;
-        entry["address"] = helpers::format_address(ea);
-
-        qstring name;
-        if (get_entry_name(&name, ord) > 0)
-            entry["name"] = std::string(name.c_str());
-
-        qstring fwd;
-        if (get_entry_forwarder(&fwd, ord) > 0 && !fwd.empty())
-            entry["forwarder"] = std::string(fwd.c_str());
-
-        entries.push_back(entry);
-    }
-
-    json data;
-    data["count"] = qty;
-    data["entries"] = entries;
-
-    return tool_result_t::ok(OBFSTR("Found ") + std::to_string(qty) + " entry points", data);
 }
 
 tool_result_t delete_function(const json& params)
@@ -8076,11 +7523,6 @@ void register_tools()
         OBFSTR("Wait for IDA auto-analysis to complete before proceeding. Returns when all analysis queues are empty."),
         {},
         wait_for_analysis});
-
-    registry.register_tool({OBFSTR("get_entry_points"), OBFSTR("navigation"),
-        OBFSTR("List all program entry points with their ordinals, addresses, and names."),
-        {},
-        get_entry_points});
 
     registry.register_tool({OBFSTR("delete_function"), OBFSTR("navigation"),
         OBFSTR("Delete/remove a function definition at the given address."),
@@ -15858,8 +15300,26 @@ static std::string get_current_binary_hash()
 namespace graphrag_tools
 {
 
+static bool is_graph_indexed()
+{
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return false;
+    auto& store = graphrag::GraphStore::instance();
+    auto stats = store.get_stats(hash);
+    return stats.nodes > 0;
+}
+
+static tool_result_t not_indexed_error()
+{
+    return tool_result_t::error(OBFSTR("The binary is not indexed. "
+        "The user must click the 'Index Binary' button in the AiDA panel before "
+        "RAG tools can be used. Do NOT call any graphrag tools until the binary is indexed."));
+}
+
 tool_result_t get_semantic_analysis(const json& params)
 {
+    if (!is_graph_indexed()) return not_indexed_error();
+
     std::string addr_str = json_str(params, "address");
     auto addr = helpers::parse_address(addr_str);
     if (!addr) return tool_result_t::error(OBFSTR("Invalid address"));
@@ -15875,6 +15335,8 @@ tool_result_t get_semantic_analysis(const json& params)
 
 tool_result_t search_semantic(const json& params)
 {
+    if (!is_graph_indexed()) return not_indexed_error();
+
     std::string query = json_str(params, "query");
     if (query.empty()) return tool_result_t::error(OBFSTR("Missing query parameter"));
 
@@ -15893,6 +15355,8 @@ tool_result_t search_semantic(const json& params)
 
 tool_result_t get_similar_functions(const json& params)
 {
+    if (!is_graph_indexed()) return not_indexed_error();
+
     std::string addr_str = json_str(params, "address");
     auto addr = helpers::parse_address(addr_str);
     if (!addr) return tool_result_t::error(OBFSTR("Invalid address"));
@@ -15912,6 +15376,8 @@ tool_result_t get_similar_functions(const json& params)
 
 tool_result_t get_call_context(const json& params)
 {
+    if (!is_graph_indexed()) return not_indexed_error();
+
     std::string addr_str = json_str(params, "address");
     auto addr = helpers::parse_address(addr_str);
     if (!addr) return tool_result_t::error(OBFSTR("Invalid address"));
@@ -15931,6 +15397,8 @@ tool_result_t get_call_context(const json& params)
 
 tool_result_t get_taint_paths(const json& params)
 {
+    if (!is_graph_indexed()) return not_indexed_error();
+
     std::string addr_str = json_str(params, "address");
     auto addr = helpers::parse_address(addr_str);
     if (!addr) return tool_result_t::error(OBFSTR("Invalid address"));
@@ -15946,6 +15414,8 @@ tool_result_t get_taint_paths(const json& params)
 
 tool_result_t get_community_info(const json& params)
 {
+    if (!is_graph_indexed()) return not_indexed_error();
+
     std::string addr_str = json_str(params, "address");
     auto addr = helpers::parse_address(addr_str);
     if (!addr) return tool_result_t::error(OBFSTR("Invalid address"));
@@ -15959,56 +15429,10 @@ tool_result_t get_community_info(const json& params)
     return tool_result_t::ok(OBFSTR("Community info for ") + addr_str, result);
 }
 
-tool_result_t index_function(const json& params)
-{
-    std::string addr_str = json_str(params, "address");
-    auto addr = helpers::parse_address(addr_str);
-    if (!addr) return tool_result_t::error(OBFSTR("Invalid address"));
-
-    std::string hash = get_current_binary_hash();
-    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
-
-    auto& store = graphrag::GraphStore::instance();
-    graphrag::StructureExtractor extractor(store);
-    auto* node = extractor.extract_function(*addr, hash);
-    if (!node)
-        return tool_result_t::error(OBFSTR("Failed to extract function at ") + addr_str);
-
-    json result;
-    result["name"] = node->name;
-    result["address"] = node->address;
-    result["security_flags"] = node->security_flags;
-    result["risk_level"] = node->risk_level;
-    result["activity_profile"] = node->activity_profile;
-    return tool_result_t::ok(OBFSTR("Indexed function ") + node->name, result);
-}
-
-tool_result_t reindex_all(const json& params)
-{
-    std::string hash = get_current_binary_hash();
-    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
-
-    auto& store = graphrag::GraphStore::instance();
-    graphrag::StructureExtractor extractor(store);
-
-    auto result = extractor.extract_all(hash, [](int current, int total, const std::string& name) {
-        if (current % 100 == 0)
-            msg(OBFSTR_C("[AiDA GraphRAG] Indexing function %d/%d: %s\n"), current, total, name.c_str());
-    });
-
-
-    graphrag::save_graph(hash);
-
-    json data;
-    data["functions_extracted"] = result.functions_extracted;
-    auto stats = store.get_stats(hash);
-    data["total_nodes"] = stats.nodes;
-    data["total_edges"] = stats.edges;
-    return tool_result_t::ok(OBFSTR("Reindexed ") + std::to_string(result.functions_extracted) + OBFSTR(" functions"), data);
-}
-
 tool_result_t run_security_analysis(const json& params)
 {
+    if (!is_graph_indexed()) return not_indexed_error();
+
     std::string hash = get_current_binary_hash();
     if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
 
@@ -16067,6 +15491,8 @@ tool_result_t run_security_analysis(const json& params)
 
 tool_result_t run_taint_analysis(const json& params)
 {
+    if (!is_graph_indexed()) return not_indexed_error();
+
     std::string hash = get_current_binary_hash();
     if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
 
@@ -16098,6 +15524,8 @@ tool_result_t run_taint_analysis(const json& params)
 
 tool_result_t detect_communities(const json& params)
 {
+    if (!is_graph_indexed()) return not_indexed_error();
+
     std::string hash = get_current_binary_hash();
     if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
 
@@ -16125,6 +15553,8 @@ tool_result_t detect_communities(const json& params)
 
 tool_result_t analyze_network_flow(const json& params)
 {
+    if (!is_graph_indexed()) return not_indexed_error();
+
     std::string hash = get_current_binary_hash();
     if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
 
@@ -16170,6 +15600,75 @@ tool_result_t analyze_network_flow(const json& params)
         + std::to_string(result.send_paths.size() + result.recv_paths.size()) + OBFSTR(" paths"), data);
 }
 
+tool_result_t index_function(const json& params)
+{
+    std::string addr_str = json_str(params, "address");
+    auto addr = helpers::parse_address(addr_str);
+    if (!addr) return tool_result_t::error(OBFSTR("Invalid address"));
+
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    auto& store = graphrag::GraphStore::instance();
+    graphrag::StructureExtractor extractor(store);
+    auto* node = extractor.extract_function(*addr, hash);
+    if (!node) return tool_result_t::error(OBFSTR("Failed to extract function"));
+
+    // Generate embedding for this single function
+    auto& vs = graphrag::get_vector_store();
+    std::string text = graphrag::build_embedding_text(*node);
+
+    graphrag::EmbeddingClient ec;
+    std::vector<float> vec;
+    if (ec.is_available())
+        vec = ec.embed_single(text);
+    else
+    {
+        auto& lv = graphrag::get_local_vectorizer();
+        if (lv.is_built())
+            vec = lv.vectorize(text);
+    }
+
+    if (!vec.empty())
+        vs.add(node->id, std::move(vec));
+
+    graphrag::save_graph(hash);
+    graphrag::save_vectors(hash);
+
+    json data;
+    data["function_name"] = node->name;
+    data["address"] = node->address;
+    data["node_id"] = node->id;
+    data["has_embedding"] = vs.has(node->id);
+    return tool_result_t::ok(OBFSTR("Indexed function: ") + node->name, data);
+}
+
+tool_result_t reindex_all(const json& params)
+{
+    std::string hash = get_current_binary_hash();
+    if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
+
+    bool reindexed = false;
+    bool ok = graphrag::ensure_full_binary_index(hash, nullptr, &reindexed);
+    if (!ok) return tool_result_t::error(OBFSTR("Index failed"));
+
+    graphrag::save_graph(hash);
+    graphrag::save_vectors(hash);
+
+    auto& store = graphrag::GraphStore::instance();
+    auto stats = store.get_stats(hash);
+    auto& vs = graphrag::get_vector_store();
+
+    json data;
+    data["nodes"] = stats.nodes;
+    data["edges"] = stats.edges;
+    data["communities"] = stats.communities;
+    data["vector_count"] = vs.size();
+    data["reindexed"] = reindexed;
+    return tool_result_t::ok(OBFSTR("Reindexed: ") + std::to_string(stats.nodes) + OBFSTR(" nodes, ")
+        + std::to_string(vs.size()) + OBFSTR(" vectors"), data);
+}
+
 tool_result_t get_graph_stats(const json& params)
 {
     std::string hash = get_current_binary_hash();
@@ -16177,6 +15676,8 @@ tool_result_t get_graph_stats(const json& params)
 
     auto& store = graphrag::GraphStore::instance();
     auto stats = store.get_stats(hash);
+    auto& vs = graphrag::get_vector_store();
+    auto& lv = graphrag::get_local_vectorizer();
 
     json data;
     data["nodes"] = stats.nodes;
@@ -16184,12 +15685,18 @@ tool_result_t get_graph_stats(const json& params)
     data["communities"] = stats.communities;
     data["stale_nodes"] = stats.stale;
     data["binary_hash"] = hash;
+    data["vector_count"] = vs.size();
+    data["vector_dimensions"] = vs.dimensions();
+    data["vectorizer_ready"] = lv.is_built();
     return tool_result_t::ok(OBFSTR("Graph: ") + std::to_string(stats.nodes) + OBFSTR(" nodes, ")
-        + std::to_string(stats.edges) + OBFSTR(" edges"), data);
+        + std::to_string(stats.edges) + OBFSTR(" edges, ")
+        + std::to_string(vs.size()) + OBFSTR(" vectors"), data);
 }
 
 tool_result_t get_security_overview(const json& params)
 {
+    if (!is_graph_indexed()) return not_indexed_error();
+
     std::string hash = get_current_binary_hash();
     if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
 
@@ -16206,6 +15713,8 @@ tool_result_t get_security_overview(const json& params)
 
 tool_result_t get_activity_analysis(const json& params)
 {
+    if (!is_graph_indexed()) return not_indexed_error();
+
     std::string hash = get_current_binary_hash();
     if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
 
@@ -16221,6 +15730,8 @@ tool_result_t get_activity_analysis(const json& params)
 
 tool_result_t get_all_communities(const json& params)
 {
+    if (!is_graph_indexed()) return not_indexed_error();
+
     std::string hash = get_current_binary_hash();
     if (hash.empty()) return tool_result_t::error(OBFSTR("No binary loaded"));
 
@@ -16246,18 +15757,22 @@ void register_tools()
 
     registry.register_tool({
         OBFSTR("search_semantic"), OBFSTR("graphrag"),
-        OBFSTR("Search the knowledge graph for functions matching a natural language query. "
-               "Searches function names, summaries, and security flags. Returns matching "
-               "functions ranked by relevance with their addresses and risk levels."),
-        {{OBFSTR("query"), OBFSTR("string"), OBFSTR("Search query (e.g. 'network send', 'crypto encryption', 'buffer overflow')"), true},
+        OBFSTR("Search the knowledge graph using vector embeddings and keyword matching. "
+               "Searches across function names, decompiled code, strings, URLs, IPs, domains, "
+               "file paths, registry keys, API names, and security flags. MUCH FASTER than "
+               "IDA search tools for indexed binaries. Use this FIRST when looking for strings, "
+               "API usage, or code patterns in an indexed binary. Falls back to IDA search "
+               "tools only if RAG returns no results."),
+        {{OBFSTR("query"), OBFSTR("string"), OBFSTR("Search query: string literal, API name, IP, URL, domain, code pattern, or natural language"), true},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results (default 10)"), false}},
         search_semantic, true});
 
     registry.register_tool({
         OBFSTR("get_similar_functions"), OBFSTR("graphrag"),
-        OBFSTR("Find functions structurally similar to the given one based on shared callers "
-               "and callees in the call graph. Useful for finding related functionality, "
-               "duplicate code, or wrapper functions."),
+        OBFSTR("Find functions similar to the given one using vector embedding cosine "
+               "similarity. Compares function code, names, and security features in embedding "
+               "space. Falls back to call-graph structural similarity if embeddings are "
+               "unavailable. Useful for finding related functionality or duplicate code."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results (default 5)"), false}},
         get_similar_functions, true});
@@ -16286,22 +15801,6 @@ void register_tools()
                "and the community label."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
         get_community_info, true});
-
-    registry.register_tool({
-        OBFSTR("index_function"), OBFSTR("graphrag"),
-        OBFSTR("Index a single function into the knowledge graph. Extracts its code, security "
-               "features (network/file/crypto/process APIs, dangerous functions, IP addresses), "
-               "and call edges. Use this before querying a specific function."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true}},
-        index_function, false});
-
-    registry.register_tool({
-        OBFSTR("reindex_all"), OBFSTR("graphrag"),
-        OBFSTR("Reindex ALL functions in the binary into the knowledge graph. This extracts "
-               "structure, security features, and call edges for every function. Use this "
-               "once to build the full graph before querying. May take time for large binaries."),
-        {},
-        reindex_all, false});
 
     registry.register_tool({
         OBFSTR("run_security_analysis"), OBFSTR("graphrag"),
@@ -16338,7 +15837,7 @@ void register_tools()
     registry.register_tool({
         OBFSTR("get_graph_stats"), OBFSTR("graphrag"),
         OBFSTR("Get statistics about the knowledge graph: total nodes, edges, communities, "
-               "and stale node count. Use to check if the graph has been indexed."),
+               "stale node count, and vector embedding count. Use to check index status."),
         {},
         get_graph_stats, true});
 
@@ -16388,15 +15887,6 @@ void initialize_all_tools()
     deobfuscation_tools::register_tools();
     driver_tools::register_tools();
     graphrag_tools::register_tools();
-
-    ToolRegistry::instance().register_tool({
-        OBFSTR("patch_instruction"), OBFSTR("memory"),
-        OBFSTR("Patch assembly instruction at the given address."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to patch"), true},
-         {OBFSTR("assembly"), OBFSTR("string"), OBFSTR("Assembly instruction (e.g., 'nop', 'mov eax, 1')"), true}},
-        memory_tools::patch_instruction,
-        false
-    });
 
     ToolRegistry::instance().register_tool({
         OBFSTR("list_all_available_tools"), OBFSTR("meta"),

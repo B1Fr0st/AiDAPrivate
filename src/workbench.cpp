@@ -92,6 +92,15 @@ static QString style_color(const QColor& color)
         .arg(color.blue());
 }
 
+static QString style_rgba(const QColor& color, int alpha)
+{
+    return QStringLiteral("rgba(%1,%2,%3,%4)")
+        .arg(color.red())
+        .arg(color.green())
+        .arg(color.blue())
+        .arg(qBound(0, alpha, 255));
+}
+
 static QColor blend_color(const QColor& a, const QColor& b, double t)
 {
     const double ratio = qBound(0.0, t, 1.0);
@@ -234,37 +243,33 @@ static workbench_theme_t detect_workbench_theme(const QWidget* widget)
 
 static QString build_html_document(const QString& body, const workbench_theme_t& theme)
 {
+    const QColor page_bg = blend_color(theme.panel_bg, theme.elevated_bg, theme.is_dark ? 0.20 : 0.12);
+    const QColor card_bg = blend_color(theme.elevated_bg, theme.panel_bg, theme.is_dark ? 0.22 : 0.30);
+    const QColor card_border = blend_color(theme.header_border, theme.accent_border, 0.35);
+    const QColor heading = blend_color(theme.text_primary, theme.accent, 0.18);
+
     return QStringLiteral(
         "<html><head><style>"
-        "body{font-family:'Segoe UI';font-size:10pt;color:%1;background:%2;margin:0;}"
-        "h1,h2,h3{margin:0 0 8px 0;font-weight:600;color:%1;}"
-        ".card{border:1px solid %3;border-radius:10px;padding:12px;margin-bottom:12px;background:%4;}"
-        ".muted{color:%5;font-size:9pt;}"
-        "pre{white-space:pre-wrap;font-family:'Cascadia Mono','Consolas',monospace;font-size:9pt;line-height:1.45;margin:0;color:%1;background:transparent;}"
-        "a{color:%6;text-decoration:none;}"
+        "body{font-family:'Segoe UI Variable Text','Segoe UI','Nirmala UI',sans-serif;font-size:10pt;color:%1;background:%2;margin:0;letter-spacing:0.1px;}"
+        "h1,h2,h3{margin:0 0 8px 0;font-weight:700;color:%3;}"
+        "h2{font-size:12pt;}"
+        "h3{font-size:10pt;letter-spacing:0.2px;}"
+        ".card{border:1px solid %4;border-radius:11px;padding:12px 13px;margin-bottom:12px;background:%5;}"
+        ".muted{color:%6;font-size:9pt;}"
+        "pre{white-space:pre-wrap;font-family:'Cascadia Mono','Consolas',monospace;font-size:9pt;line-height:1.5;margin:0;color:%1;background:transparent;}"
+        "a{color:%7;text-decoration:none;}"
+        "a:hover{text-decoration:underline;}"
         "table{border-collapse:collapse;width:100%%;}"
-        "td,th{padding:6px;border-bottom:1px solid %3;text-align:left;vertical-align:top;}"
-        "</style></head><body>%7</body></html>")
+        "td,th{padding:7px;border-bottom:1px solid %4;text-align:left;vertical-align:top;}"
+        "</style></head><body>%8</body></html>")
         .arg(style_color(theme.text_primary))
-        .arg(style_color(theme.panel_bg))
-        .arg(style_color(theme.header_border))
-        .arg(style_color(theme.elevated_bg))
+        .arg(style_color(page_bg))
+        .arg(style_color(heading))
+        .arg(style_color(card_border))
+        .arg(style_color(card_bg))
         .arg(style_color(theme.text_secondary))
         .arg(style_color(theme.link))
         .arg(body);
-}
-
-static void set_elided_label_text(QLabel* label)
-{
-    if (label == nullptr)
-        return;
-    const QString full_text = label->property("fullText").toString();
-    if (full_text.isEmpty())
-        return;
-    const int available = qMax(24, label->width() - 12);
-    const QString elided = label->fontMetrics().elidedText(full_text, Qt::ElideRight, available);
-    label->setText(elided);
-    label->setToolTip(elided == full_text ? QString() : full_text);
 }
 
 static QString linkify_plain_text(const QString& text)
@@ -599,6 +604,87 @@ static QRectF add_graph_node_item(
     return rect;
 }
 
+static void polish_widget_style(QWidget* widget)
+{
+    if (widget == nullptr)
+        return;
+    widget->style()->unpolish(widget);
+    widget->style()->polish(widget);
+    widget->update();
+}
+
+static void configure_context_label(QLabel* label)
+{
+    if (label == nullptr)
+        return;
+
+    label->setProperty("role", QStringLiteral("contextLabel"));
+    label->setWordWrap(true);
+
+    QFont font = label->font();
+    if (font.pointSizeF() < 9.0)
+        font.setPointSizeF(9.0);
+    font.setWeight(QFont::DemiBold);
+    label->setFont(font);
+}
+
+static void configure_hint_label(QLabel* label)
+{
+    if (label == nullptr)
+        return;
+    label->setProperty("role", QStringLiteral("hintLabel"));
+}
+
+static void configure_text_browser_widget(QTextBrowser* browser)
+{
+    if (browser == nullptr)
+        return;
+
+    browser->setFrameShape(QFrame::NoFrame);
+    browser->setOpenExternalLinks(false);
+    browser->document()->setDocumentMargin(12);
+}
+
+static void configure_primary_input(QLineEdit* edit)
+{
+    if (edit == nullptr)
+        return;
+    edit->setClearButtonEnabled(true);
+    edit->setMinimumHeight(30);
+}
+
+static void configure_data_table(QTableWidget* table)
+{
+    if (table == nullptr)
+        return;
+
+    table->setAlternatingRowColors(true);
+    table->setShowGrid(false);
+    table->setCornerButtonEnabled(false);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setWordWrap(false);
+    table->setTextElideMode(Qt::ElideRight);
+    table->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
+    table->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
+    table->setFocusPolicy(Qt::StrongFocus);
+    table->verticalHeader()->setVisible(false);
+    table->verticalHeader()->setDefaultSectionSize(24);
+    table->horizontalHeader()->setMinimumSectionSize(56);
+    table->horizontalHeader()->setStretchLastSection(false);
+}
+
+static void configure_button_role(QPushButton* button, const char* role, int min_height = 30)
+{
+    if (button == nullptr)
+        return;
+
+    button->setProperty("role", QString::fromLatin1(role));
+    button->setCursor(Qt::PointingHandCursor);
+    button->setMinimumHeight(min_height);
+}
+
 }
 
 AiDAWorkbenchPanel::AiDAWorkbenchPanel(
@@ -615,9 +701,6 @@ AiDAWorkbenchPanel::AiDAWorkbenchPanel(
     , m_applyingTheme(false)
     , m_visualRefreshQueued(false)
     , m_appliedStyleSheet()
-    , m_headerContextLabel(nullptr)
-    , m_headerProviderLabel(nullptr)
-    , m_headerGraphLabel(nullptr)
     , m_tabs(nullptr)
     , m_queryPanel(nullptr)
     , m_explainContextLabel(nullptr)
@@ -669,6 +752,7 @@ AiDAWorkbenchPanel::AiDAWorkbenchPanel(
 {
     setObjectName(QStringLiteral("aidaWorkbench"));
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    setMinimumWidth(200);
     m_binaryHash = aida_db::AnalysisDB::instance().get_binary_hash();
     build_ui();
     apply_theme();
@@ -678,6 +762,16 @@ AiDAWorkbenchPanel::AiDAWorkbenchPanel(
 AiDAChatPanel* AiDAWorkbenchPanel::query_panel() const
 {
     return m_queryPanel;
+}
+
+QSize AiDAWorkbenchPanel::sizeHint() const
+{
+    return QSize(380, 600);
+}
+
+QSize AiDAWorkbenchPanel::minimumSizeHint() const
+{
+    return QSize(200, 300);
 }
 
 void AiDAWorkbenchPanel::set_context_function(ea_t ea, const QString& func_name)
@@ -695,57 +789,22 @@ void AiDAWorkbenchPanel::set_context_function(ea_t ea, const QString& func_name)
 void AiDAWorkbenchPanel::build_ui()
 {
     QVBoxLayout* root = new QVBoxLayout(this);
-    root->setContentsMargins(8, 8, 8, 8);
-    root->setSpacing(8);
-
-    QWidget* header = new QWidget(this);
-    header->setObjectName(QStringLiteral("workbenchHeader"));
-    QHBoxLayout* headerLayout = new QHBoxLayout(header);
-    headerLayout->setContentsMargins(12, 10, 12, 10);
-    headerLayout->setSpacing(10);
-
-    QVBoxLayout* titleLayout = new QVBoxLayout();
-    titleLayout->setContentsMargins(0, 0, 0, 0);
-    titleLayout->setSpacing(2);
-
-    QLabel* title = new QLabel(QStringLiteral("AiDA Workbench"), header);
-    title->setObjectName(QStringLiteral("workbenchTitle"));
-    titleLayout->addWidget(title);
-
-    m_headerContextLabel = new QLabel(header);
-    m_headerContextLabel->setObjectName(QStringLiteral("workbenchContext"));
-    titleLayout->addWidget(m_headerContextLabel);
-
-    headerLayout->addLayout(titleLayout, 1);
-
-    m_headerProviderLabel = new QLabel(header);
-    m_headerProviderLabel->setObjectName(QStringLiteral("workbenchBadge"));
-    m_headerProviderLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    m_headerProviderLabel->setMinimumWidth(0);
-    headerLayout->addWidget(m_headerProviderLabel);
-
-    m_headerGraphLabel = new QLabel(header);
-    m_headerGraphLabel->setObjectName(QStringLiteral("workbenchBadgeSecondary"));
-    m_headerGraphLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    m_headerGraphLabel->setMinimumWidth(0);
-    headerLayout->addWidget(m_headerGraphLabel);
-
-    QPushButton* refreshBtn = new QPushButton(QStringLiteral("Refresh"), header);
-    QObject::connect(refreshBtn, &QPushButton::clicked, [this]() { refresh_all_tabs(); });
-    headerLayout->addWidget(refreshBtn);
-
-    root->addWidget(header);
+    root->setContentsMargins(6, 6, 6, 6);
+    root->setSpacing(4);
 
     m_tabs = new QTabWidget(this);
+    m_tabs->setObjectName(QStringLiteral("workbenchTabs"));
     m_tabs->setDocumentMode(true);
+    m_tabs->setUsesScrollButtons(true);
+    m_tabs->setElideMode(Qt::ElideRight);
     root->addWidget(m_tabs, 1);
 
     build_explain_tab();
 
     QWidget* queryTab = new QWidget(m_tabs);
     QVBoxLayout* queryLayout = new QVBoxLayout(queryTab);
-    queryLayout->setContentsMargins(0, 0, 0, 0);
-    queryLayout->setSpacing(0);
+    queryLayout->setContentsMargins(2, 2, 2, 2);
+    queryLayout->setSpacing(2);
     m_queryPanel = new AiDAChatPanel(queryTab, m_plugin, m_contextEa, m_contextFuncName);
     queryLayout->addWidget(m_queryPanel);
     m_tabs->addTab(queryTab, QStringLiteral("Query"));
@@ -764,47 +823,191 @@ void AiDAWorkbenchPanel::apply_theme()
     m_applyingTheme = true;
     const workbench_theme_t theme = detect_workbench_theme(this);
 
-    const QString style = QStringLiteral(
-        "#aidaWorkbench { background:%1; color:%2; }"
-        "#workbenchHeader { background:%3; border:1px solid %4; border-radius:12px; }"
-        "#workbenchTitle { font-size:15pt; font-weight:700; color:%2; }"
-        "#workbenchContext { color:%5; font-size:10pt; }"
-        "#workbenchBadge, #workbenchBadgeSecondary { padding:6px 10px; border-radius:10px; border:1px solid %4; }"
-        "#workbenchBadge { background:%7; color:%8; border-color:%6; font-weight:600; }"
-        "#workbenchBadgeSecondary { background:%7; color:%2; }"
-        "QTabWidget::pane { border:1px solid %4; border-radius:12px; background:%1; top:-1px; }"
-        "QTabBar::tab { background:%9; color:%5; padding:10px 14px; border:1px solid %4; border-bottom:none; border-top-left-radius:10px; border-top-right-radius:10px; margin-right:4px; }"
-        "QTabBar::tab:hover { background:%10; color:%2; }"
-        "QTabBar::tab:selected { background:%11; color:%2; }"
-        "QGroupBox { border:1px solid %4; border-radius:10px; margin-top:10px; padding-top:10px; font-weight:600; background:%7; }"
-        "QGroupBox::title { subcontrol-origin: margin; left:10px; padding:0 4px; color:%5; }"
-        "QPushButton { background:%7; color:%8; border:1px solid %4; border-radius:8px; padding:7px 12px; }"
-        "QPushButton:hover { background:%10; border-color:%6; }"
-        "QPushButton:pressed { background:%12; }"
-        "QLineEdit, QSpinBox, QTextEdit, QPlainTextEdit, QTextBrowser, QTableWidget { background:%13; color:%2; border:1px solid %4; border-radius:8px; }"
-        "QGraphicsView { background:%13; border:1px solid %4; border-radius:8px; }"
-        "QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus { border-color:%6; }"
-        "QHeaderView::section { background:%7; color:%5; border:0; border-bottom:1px solid %4; padding:6px; font-weight:600; }"
-        "QTableWidget { gridline-color:%4; }"
-        "QTableWidget::item:selected { background:%14; color:%15; }"
+    const QColor shell_bg = blend_color(theme.panel_bg, theme.window_bg, theme.is_dark ? 0.32 : 0.12);
+    const QColor pane_bg = blend_color(theme.elevated_bg, theme.panel_bg, theme.is_dark ? 0.24 : 0.42);
+    const QColor tab_bg = blend_color(theme.header_bg, theme.tab_bg, 0.42);
+    const QColor tab_hover = blend_color(tab_bg, theme.accent_soft, theme.is_dark ? 0.26 : 0.18);
+    const QColor tab_selected = blend_color(pane_bg, theme.tab_selected, theme.is_dark ? 0.38 : 0.50);
+    const QColor field_bg = blend_color(theme.input_bg, theme.panel_bg, theme.is_dark ? 0.15 : 0.10);
+    const QColor field_border = blend_color(theme.header_border, theme.input_border, 0.65);
+    const QColor control_bg = blend_color(theme.button_secondary_bg, theme.elevated_bg, 0.82);
+    const QColor control_hover = blend_color(control_bg, theme.button_secondary_hover, 0.52);
+    const QColor control_pressed = blend_color(control_hover, theme.button_primary_pressed, 0.44);
+    const QColor primary_bg = blend_color(theme.button_primary, theme.accent, theme.is_dark ? 0.22 : 0.30);
+    const QColor primary_hover = blend_color(primary_bg, theme.button_primary_hover, 0.56);
+    const QColor primary_pressed = blend_color(primary_bg, theme.button_primary_pressed, 0.58);
+    const QColor danger_bg = theme.is_dark ? QColor(99, 45, 45) : QColor(184, 82, 82);
+    const QColor danger_hover = blend_color(danger_bg, QColor(205, 96, 96), 0.42);
+    const QColor danger_pressed = blend_color(danger_bg, QColor(88, 36, 36), 0.44);
+    const QColor table_alt = blend_color(field_bg, theme.elevated_bg, theme.is_dark ? 0.24 : 0.18);
+    const QColor splitter_handle = blend_color(theme.header_border, theme.accent_border, 0.58);
+    const QColor graph_frame = blend_color(theme.elevated_bg, theme.panel_bg, theme.is_dark ? 0.16 : 0.24);
+    const QColor graph_canvas = blend_color(field_bg, theme.base_bg, theme.is_dark ? 0.28 : 0.20);
+    const QColor focus_ring = blend_color(theme.accent_border, theme.accent, 0.38);
+
+    QString style;
+    style.reserve(7600);
+    style += QStringLiteral(
+        "#aidaWorkbench {"
+        "  background:%1;"
+        "  color:%2;"
+        "  selection-background-color:%3;"
+        "  selection-color:%4;"
+        "}")
+        .arg(style_color(shell_bg), style_color(theme.text_primary), style_color(theme.selection_bg), style_color(theme.selection_text));
+
+    style += QStringLiteral(
+        "QTabWidget::pane {"
+        "  border:1px solid %1;"
+        "  border-top:none;"
+        "  background:%2;"
+        "  border-bottom-left-radius:10px;"
+        "  border-bottom-right-radius:10px;"
+        "  padding:8px;"
+        "}")
+        .arg(style_color(theme.header_border), style_color(pane_bg));
+
+    style += QStringLiteral(
+        "QTabBar { background:transparent; }"
+        "QTabBar::tab {"
+        "  background:%1;"
+        "  color:%2;"
+        "  border:1px solid %3;"
+        "  border-bottom:none;"
+        "  border-top-left-radius:8px;"
+        "  border-top-right-radius:8px;"
+        "  padding:8px 14px;"
+        "  margin:0px 4px 0px 0px;"
+        "  min-width:56px;"
+        "}")
+        .arg(style_color(tab_bg), style_color(theme.text_secondary), style_color(theme.header_border));
+
+    style += QStringLiteral(
+        "QTabBar::tab:hover { background:%1; color:%2; }"
+        "QTabBar::tab:selected { background:%3; color:%4; border-color:%5; font-weight:600; }")
+        .arg(style_color(tab_hover), style_color(theme.text_primary), style_color(tab_selected), style_color(theme.accent), style_color(theme.accent_border));
+
+    style += QStringLiteral(
+        "QPushButton {"
+        "  background:%1;"
+        "  color:%2;"
+        "  border:1px solid %3;"
+        "  border-radius:8px;"
+        "  padding:6px 12px;"
+        "  min-height:30px;"
+        "  font-weight:500;"
+        "}"
+        "QPushButton:hover { background:%4; border-color:%5; }"
+        "QPushButton:pressed { background:%6; }"
+        "QPushButton:disabled { background:%7; color:%8; border-color:%9; }")
+        .arg(style_color(control_bg),
+            style_color(theme.text_primary),
+            style_color(theme.button_border),
+            style_color(control_hover),
+            style_color(theme.accent_border),
+            style_color(control_pressed),
+            style_color(blend_color(control_bg, pane_bg, 0.52)),
+            style_color(theme.text_secondary),
+            style_color(theme.header_border));
+
+    style += QStringLiteral(
+        "QPushButton[role='primary'] { background:%1; color:%2; border-color:%3; font-weight:600; }"
+        "QPushButton[role='primary']:hover { background:%4; border-color:%5; }"
+        "QPushButton[role='primary']:pressed { background:%6; }"
+        "QPushButton[role='danger'] { background:%7; color:%2; border-color:%8; font-weight:600; }"
+        "QPushButton[role='danger']:hover { background:%9; border-color:%8; }"
+        "QPushButton[role='danger']:pressed { background:%10; }")
+        .arg(style_color(primary_bg),
+            style_color(theme.button_primary_text),
+            style_color(blend_color(theme.accent_border, theme.accent, 0.42)),
+            style_color(primary_hover),
+            style_color(theme.accent),
+            style_color(primary_pressed),
+            style_color(danger_bg),
+            style_color(blend_color(danger_bg, QColor(255, 180, 180), 0.18)),
+            style_color(danger_hover),
+            style_color(danger_pressed));
+
+    style += QStringLiteral(
+        "QLineEdit, QSpinBox, QTextEdit, QPlainTextEdit, QTextBrowser, QTableWidget {"
+        "  background:%1;"
+        "  color:%2;"
+        "  border:1px solid %3;"
+        "  border-radius:8px;"
+        "}"
+        "QLineEdit, QSpinBox { padding:4px 8px; min-height:26px; }"
+        "QTextEdit, QPlainTextEdit, QTextBrowser { padding:6px; }"
+        "QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus { border-color:%4; }")
+        .arg(style_color(field_bg), style_color(theme.text_primary), style_color(field_border), style_color(focus_ring));
+
+    style += QStringLiteral(
+        "QHeaderView::section {"
+        "  background:%1;"
+        "  color:%2;"
+        "  border:none;"
+        "  border-bottom:1px solid %3;"
+        "  padding:7px 8px;"
+        "  font-weight:600;"
+        "}"
+        "QTableWidget {"
+        "  alternate-background-color:%4;"
+        "  gridline-color:%3;"
+        "}"
+        "QTableWidget::item { padding:2px 4px; }"
+        "QTableWidget::item:selected { background:%5; color:%6; }")
+        .arg(style_color(control_bg),
+            style_color(theme.text_secondary),
+            style_color(theme.header_border),
+            style_color(table_alt),
+            style_color(theme.selection_bg),
+            style_color(theme.selection_text));
+
+    style += QStringLiteral(
+        "QGraphicsView#semanticGraphView {"
+        "  background:%1;"
+        "  border:1px solid %2;"
+        "  border-radius:10px;"
+        "}"
+        "QFrame#graphFrame { background:%3; border:1px solid %2; border-radius:10px; }"
+        "QLabel#graphTitle { color:%4; font-weight:700; }"
+        "QLabel#graphStatusLabel { color:%5; font-size:8.5pt; }")
+        .arg(style_color(graph_canvas), style_color(theme.header_border), style_color(graph_frame), style_color(theme.text_secondary), style_color(theme.text_secondary));
+
+    style += QStringLiteral(
+        "QLabel[role='contextLabel'] { color:%1; font-weight:600; padding:2px 0px 4px 0px; }"
+        "QLabel[role='hintLabel'] { color:%2; }")
+        .arg(style_color(theme.text_primary), style_color(theme.text_secondary));
+
+    style += QStringLiteral(
+        "QCheckBox { color:%1; spacing:6px; }"
+        "QCheckBox::indicator { width:14px; height:14px; border:1px solid %2; border-radius:3px; background:%3; }"
+        "QCheckBox::indicator:checked { background:%4; border-color:%5; }")
+        .arg(style_color(theme.text_secondary), style_color(theme.button_border), style_color(field_bg), style_color(primary_bg), style_color(theme.accent));
+
+    style += QStringLiteral(
+        "QSplitter::handle { background:%1; }"
+        "QSplitter::handle:hover { background:%2; }")
+        .arg(style_rgba(splitter_handle, theme.is_dark ? 110 : 96), style_rgba(theme.accent, theme.is_dark ? 120 : 105));
+
+    style += QStringLiteral(
         "QScrollBar:vertical { background:transparent; width:12px; margin:2px; }"
-        "QScrollBar::handle:vertical { background:%4; border-radius:6px; min-height:24px; }"
-        "QLabel { color:%2; }")
-        .arg(style_color(theme.panel_bg))
-        .arg(style_color(theme.text_primary))
-        .arg(style_color(theme.header_bg))
-        .arg(style_color(theme.header_border))
-        .arg(style_color(theme.text_secondary))
-        .arg(style_color(theme.accent_border))
-        .arg(style_color(theme.button_secondary_bg))
-        .arg(style_color(theme.button_secondary_text))
-        .arg(style_color(theme.tab_bg))
-        .arg(style_color(theme.tab_hover))
-        .arg(style_color(theme.tab_selected))
-        .arg(style_color(theme.button_primary_pressed))
-        .arg(style_color(theme.input_bg))
-        .arg(style_color(theme.selection_bg))
-        .arg(style_color(theme.selection_text));
+        "QScrollBar::handle:vertical { background:%1; border-radius:6px; min-height:24px; }"
+        "QScrollBar::handle:vertical:hover { background:%2; }"
+        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0px; }"
+        "QScrollBar:horizontal { background:transparent; height:12px; margin:2px; }"
+        "QScrollBar::handle:horizontal { background:%1; border-radius:6px; min-width:24px; }"
+        "QScrollBar::handle:horizontal:hover { background:%2; }"
+        "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width:0px; }")
+        .arg(style_color(theme.header_border), style_color(theme.accent_border));
+
+    style += QStringLiteral(
+        "QToolTip {"
+        "  background:%1;"
+        "  color:%2;"
+        "  border:1px solid %3;"
+        "  padding:4px 6px;"
+        "}")
+        .arg(style_color(control_bg), style_color(theme.text_primary), style_color(theme.button_border));
 
     if (m_appliedStyleSheet != style)
     {
@@ -841,7 +1044,6 @@ bool AiDAWorkbenchPanel::event(QEvent* event)
         || type == QEvent::PaletteChange
         || type == QEvent::ApplicationPaletteChange
         || type == QEvent::StyleChange;
-    const bool resized = type == QEvent::Resize;
 
     const bool result = QWidget::event(event);
 
@@ -850,9 +1052,6 @@ bool AiDAWorkbenchPanel::event(QEvent* event)
         apply_theme();
         queue_visual_refresh();
     }
-
-    if (visual_change || resized)
-        refresh_header_badge_layout();
 
     return result;
 }
@@ -892,7 +1091,6 @@ std::string AiDAWorkbenchPanel::analysis_type_key(const char* suffix) const
 
 void AiDAWorkbenchPanel::refresh_all_tabs()
 {
-    refresh_header();
     refresh_explain_tab();
     refresh_actions_tab();
     refresh_graph_tab();
@@ -900,41 +1098,7 @@ void AiDAWorkbenchPanel::refresh_all_tabs()
     refresh_settings_tab();
 }
 
-void AiDAWorkbenchPanel::refresh_header()
-{
-    m_headerContextLabel->setText(current_function_display_name());
 
-    QString provider = QStringLiteral("Provider: %1").arg(to_qstring(g_settings.api_provider.empty() ? std::string("unconfigured") : g_settings.api_provider));
-    const std::string model_name = current_model_name();
-    if (!model_name.empty())
-        provider += QStringLiteral(" / %1").arg(to_qstring(model_name));
-    m_headerProviderLabel->setProperty("fullText", provider);
-    m_headerProviderLabel->setText(provider);
-
-    if (!m_binaryHash.empty())
-    {
-        auto stats = graphrag::GraphStore::instance().get_stats(m_binaryHash);
-        const QString graph_summary = QStringLiteral("Graph %1 nodes / %2 edges / %3 communities")
-                .arg(stats.nodes)
-                .arg(stats.edges)
-                .arg(stats.communities);
-        m_headerGraphLabel->setProperty("fullText", graph_summary);
-        m_headerGraphLabel->setText(graph_summary);
-    }
-    else
-    {
-        m_headerGraphLabel->setProperty("fullText", QStringLiteral("Graph unavailable"));
-        m_headerGraphLabel->setText(QStringLiteral("Graph unavailable"));
-    }
-
-    refresh_header_badge_layout();
-}
-
-void AiDAWorkbenchPanel::refresh_header_badge_layout()
-{
-    set_elided_label_text(m_headerProviderLabel);
-    set_elided_label_text(m_headerGraphLabel);
-}
 
 void AiDAWorkbenchPanel::set_busy_button(QPushButton* button, bool busy, const QString& busy_text, const QString& idle_text)
 {
@@ -1003,26 +1167,32 @@ void AiDAWorkbenchPanel::build_explain_tab()
 {
     QWidget* tab = new QWidget(m_tabs);
     QVBoxLayout* layout = new QVBoxLayout(tab);
-    layout->setContentsMargins(8, 8, 8, 8);
-    layout->setSpacing(8);
+    layout->setContentsMargins(10, 10, 10, 10);
+    layout->setSpacing(10);
 
     QHBoxLayout* top = new QHBoxLayout();
+    top->setSpacing(8);
     m_explainContextLabel = new QLabel(tab);
+    configure_context_label(m_explainContextLabel);
     top->addWidget(m_explainContextLabel, 1);
 
     m_explainFunctionBtn = new QPushButton(QStringLiteral("Explain Function"), tab);
+    configure_button_role(m_explainFunctionBtn, "primary");
     QObject::connect(m_explainFunctionBtn, &QPushButton::clicked, [this]() { run_explain_function(); });
     top->addWidget(m_explainFunctionBtn);
 
     m_explainLineBtn = new QPushButton(QStringLiteral("Explain Current Line"), tab);
+    configure_button_role(m_explainLineBtn, "secondary");
     QObject::connect(m_explainLineBtn, &QPushButton::clicked, [this]() { run_explain_line(); });
     top->addWidget(m_explainLineBtn);
 
     m_explainCopyBtn = new QPushButton(QStringLiteral("Copy Context"), tab);
+    configure_button_role(m_explainCopyBtn, "secondary");
     QObject::connect(m_explainCopyBtn, &QPushButton::clicked, [this]() { run_copy_context(); });
     top->addWidget(m_explainCopyBtn);
 
     m_explainClearBtn = new QPushButton(QStringLiteral("Clear Cache"), tab);
+    configure_button_role(m_explainClearBtn, "danger");
     QObject::connect(m_explainClearBtn, &QPushButton::clicked, [this]() {
         save_analysis_entry(analysis_type_key("explain.function"), std::string());
         m_lineExplainText.clear();
@@ -1033,12 +1203,16 @@ void AiDAWorkbenchPanel::build_explain_tab()
     layout->addLayout(top);
 
     QSplitter* splitter = new QSplitter(Qt::Horizontal, tab);
+    splitter->setChildrenCollapsible(false);
+    splitter->setHandleWidth(5);
     m_explainBrowser = new QTextBrowser(splitter);
+    configure_text_browser_widget(m_explainBrowser);
     m_explainBrowser->setOpenLinks(false);
     QObject::connect(m_explainBrowser, &QTextBrowser::anchorClicked, [this](const QUrl& url) { handle_browser_link(url); });
     splitter->addWidget(m_explainBrowser);
 
     m_explainDetailsBrowser = new QTextBrowser(splitter);
+    configure_text_browser_widget(m_explainDetailsBrowser);
     m_explainDetailsBrowser->setOpenLinks(false);
     QObject::connect(m_explainDetailsBrowser, &QTextBrowser::anchorClicked, [this](const QUrl& url) { handle_browser_link(url); });
     splitter->addWidget(m_explainDetailsBrowser);
@@ -1193,43 +1367,51 @@ void AiDAWorkbenchPanel::build_actions_tab()
 {
     QWidget* tab = new QWidget(m_tabs);
     QVBoxLayout* layout = new QVBoxLayout(tab);
-    layout->setContentsMargins(8, 8, 8, 8);
-    layout->setSpacing(8);
+    layout->setContentsMargins(10, 10, 10, 10);
+    layout->setSpacing(10);
 
     m_actionsContextLabel = new QLabel(tab);
+    configure_context_label(m_actionsContextLabel);
     layout->addWidget(m_actionsContextLabel);
 
     QGridLayout* grid = new QGridLayout();
-    grid->setHorizontalSpacing(8);
-    grid->setVerticalSpacing(8);
+    grid->setHorizontalSpacing(10);
+    grid->setVerticalSpacing(10);
 
     m_actionRenameBtn = new QPushButton(QStringLiteral("Rename Symbols"), tab);
+    configure_button_role(m_actionRenameBtn, "primary");
     QObject::connect(m_actionRenameBtn, &QPushButton::clicked, [this]() { run_rename_all(); });
     grid->addWidget(m_actionRenameBtn, 0, 0);
 
     m_actionCommentsBtn = new QPushButton(QStringLiteral("Add Comments"), tab);
+    configure_button_role(m_actionCommentsBtn, "primary");
     QObject::connect(m_actionCommentsBtn, &QPushButton::clicked, [this]() { run_generate_comments(); });
     grid->addWidget(m_actionCommentsBtn, 0, 1);
 
     m_actionStructBtn = new QPushButton(QStringLiteral("Generate Struct"), tab);
+    configure_button_role(m_actionStructBtn, "secondary");
     QObject::connect(m_actionStructBtn, &QPushButton::clicked, [this]() { run_generate_struct(); });
     grid->addWidget(m_actionStructBtn, 1, 0);
 
     m_actionHookBtn = new QPushButton(QStringLiteral("Generate Hook"), tab);
+    configure_button_role(m_actionHookBtn, "secondary");
     QObject::connect(m_actionHookBtn, &QPushButton::clicked, [this]() { run_generate_hook(); });
     grid->addWidget(m_actionHookBtn, 1, 1);
 
     m_actionFixBtn = new QPushButton(QStringLiteral("Fix Analysis"), tab);
+    configure_button_role(m_actionFixBtn, "secondary");
     QObject::connect(m_actionFixBtn, &QPushButton::clicked, [this]() { run_fix_analysis(); });
     grid->addWidget(m_actionFixBtn, 2, 0);
 
     m_actionCopyBtn = new QPushButton(QStringLiteral("Copy Full Context"), tab);
+    configure_button_role(m_actionCopyBtn, "secondary");
     QObject::connect(m_actionCopyBtn, &QPushButton::clicked, [this]() { run_copy_context(); });
     grid->addWidget(m_actionCopyBtn, 2, 1);
 
     layout->addLayout(grid);
 
     m_actionsLogBrowser = new QTextBrowser(tab);
+    configure_text_browser_widget(m_actionsLogBrowser);
     m_actionsLogBrowser->setOpenLinks(false);
     QObject::connect(m_actionsLogBrowser, &QTextBrowser::anchorClicked, [this](const QUrl& url) { handle_browser_link(url); });
     layout->addWidget(m_actionsLogBrowser, 1);
@@ -1519,30 +1701,37 @@ void AiDAWorkbenchPanel::build_graph_tab()
 {
     QWidget* tab = new QWidget(m_tabs);
     QVBoxLayout* layout = new QVBoxLayout(tab);
-    layout->setContentsMargins(8, 8, 8, 8);
-    layout->setSpacing(8);
+    layout->setContentsMargins(10, 10, 10, 10);
+    layout->setSpacing(10);
 
     m_graphContextLabel = new QLabel(tab);
+    configure_context_label(m_graphContextLabel);
     layout->addWidget(m_graphContextLabel);
 
     QHBoxLayout* controls = new QHBoxLayout();
+    controls->setSpacing(8);
     m_graphIndexBtn = new QPushButton(QStringLiteral("Index Current"), tab);
+    configure_button_role(m_graphIndexBtn, "primary");
     QObject::connect(m_graphIndexBtn, &QPushButton::clicked, [this]() { index_current_function(); });
     controls->addWidget(m_graphIndexBtn);
 
     m_graphReindexBtn = new QPushButton(QStringLiteral("Index Binary"), tab);
+    configure_button_role(m_graphReindexBtn, "secondary");
     QObject::connect(m_graphReindexBtn, &QPushButton::clicked, [this]() { reindex_binary(); });
     controls->addWidget(m_graphReindexBtn);
 
     m_graphSecurityBtn = new QPushButton(QStringLiteral("Security Overview"), tab);
+    configure_button_role(m_graphSecurityBtn, "secondary");
     QObject::connect(m_graphSecurityBtn, &QPushButton::clicked, [this]() { run_graph_security_overview(); });
     controls->addWidget(m_graphSecurityBtn);
 
     m_graphCommunitiesBtn = new QPushButton(QStringLiteral("Detect Communities"), tab);
+    configure_button_role(m_graphCommunitiesBtn, "secondary");
     QObject::connect(m_graphCommunitiesBtn, &QPushButton::clicked, [this]() { run_graph_communities(); });
     controls->addWidget(m_graphCommunitiesBtn);
 
     m_graphNetworkBtn = new QPushButton(QStringLiteral("Analyze Network Flow"), tab);
+    configure_button_role(m_graphNetworkBtn, "secondary");
     QObject::connect(m_graphNetworkBtn, &QPushButton::clicked, [this]() { run_graph_network_flow(); });
     controls->addWidget(m_graphNetworkBtn);
 
@@ -1550,21 +1739,24 @@ void AiDAWorkbenchPanel::build_graph_tab()
     layout->addLayout(controls);
 
     m_graphStatsLabel = new QLabel(tab);
+    configure_hint_label(m_graphStatsLabel);
     layout->addWidget(m_graphStatsLabel);
 
     QFrame* graphFrame = new QFrame(tab);
     graphFrame->setObjectName(QStringLiteral("graphFrame"));
     QVBoxLayout* graphLayout = new QVBoxLayout(graphFrame);
     graphLayout->setContentsMargins(10, 10, 10, 10);
-    graphLayout->setSpacing(8);
+    graphLayout->setSpacing(10);
 
     QHBoxLayout* graphControls = new QHBoxLayout();
+    graphControls->setSpacing(8);
     QLabel* graphTitle = new QLabel(QStringLiteral("Visual Graph"), graphFrame);
     graphTitle->setObjectName(QStringLiteral("graphTitle"));
     graphControls->addWidget(graphTitle);
 
     m_graphStatusLabel = new QLabel(QStringLiteral("Awaiting graph data"), graphFrame);
     m_graphStatusLabel->setObjectName(QStringLiteral("graphStatusLabel"));
+    configure_hint_label(m_graphStatusLabel);
     graphControls->addWidget(m_graphStatusLabel);
 
     graphControls->addSpacing(10);
@@ -1572,6 +1764,7 @@ void AiDAWorkbenchPanel::build_graph_tab()
     m_graphHopsSpin = new QSpinBox(graphFrame);
     m_graphHopsSpin->setRange(1, 5);
     m_graphHopsSpin->setValue(2);
+    m_graphHopsSpin->setMinimumHeight(30);
     m_graphHopsSpin->setToolTip(QStringLiteral("How many graph hops to expand around the selected function."));
     graphControls->addWidget(m_graphHopsSpin);
 
@@ -1590,27 +1783,34 @@ void AiDAWorkbenchPanel::build_graph_tab()
     graphControls->addStretch();
 
     QPushButton* zoomOutBtn = new QPushButton(QStringLiteral("-"), graphFrame);
+    configure_button_role(zoomOutBtn, "secondary");
     zoomOutBtn->setFixedWidth(28);
     graphControls->addWidget(zoomOutBtn);
 
     m_graphZoomLabel = new QLabel(QStringLiteral("100%"), graphFrame);
     m_graphZoomLabel->setMinimumWidth(52);
     m_graphZoomLabel->setAlignment(Qt::AlignCenter);
+    configure_hint_label(m_graphZoomLabel);
     graphControls->addWidget(m_graphZoomLabel);
 
     QPushButton* zoomInBtn = new QPushButton(QStringLiteral("+"), graphFrame);
+    configure_button_role(zoomInBtn, "secondary");
     zoomInBtn->setFixedWidth(28);
     graphControls->addWidget(zoomInBtn);
 
     QPushButton* fitBtn = new QPushButton(QStringLiteral("Fit"), graphFrame);
+    configure_button_role(fitBtn, "secondary");
     graphControls->addWidget(fitBtn);
 
     QPushButton* refreshBtn = new QPushButton(QStringLiteral("Refresh"), graphFrame);
+    configure_button_role(refreshBtn, "secondary");
     graphControls->addWidget(refreshBtn);
 
     graphLayout->addLayout(graphControls);
 
     QSplitter* splitter = new QSplitter(Qt::Vertical, graphFrame);
+    splitter->setChildrenCollapsible(false);
+    splitter->setHandleWidth(5);
     TraversableGraphView* graphView = new TraversableGraphView(splitter);
     m_graphView = graphView;
     m_graphScene = new QGraphicsScene(graphView);
@@ -1639,6 +1839,7 @@ void AiDAWorkbenchPanel::build_graph_tab()
     lowerLayout->setSpacing(8);
 
     m_graphOverviewBrowser = new QTextBrowser(lowerPane);
+    configure_text_browser_widget(m_graphOverviewBrowser);
     m_graphOverviewBrowser->setOpenLinks(false);
     QObject::connect(m_graphOverviewBrowser, &QTextBrowser::anchorClicked, [this](const QUrl& url) { handle_browser_link(url); });
     lowerLayout->addWidget(m_graphOverviewBrowser, 3);
@@ -1650,6 +1851,7 @@ void AiDAWorkbenchPanel::build_graph_tab()
 
     QHBoxLayout* searchControls = new QHBoxLayout();
     m_graphSearchEdit = new QLineEdit(searchPane);
+    configure_primary_input(m_graphSearchEdit);
     m_graphSearchEdit->setPlaceholderText(QStringLiteral("Search graph..."));
     QObject::connect(m_graphSearchEdit, &QLineEdit::returnPressed, [this]() { run_graph_search(); });
     searchControls->addWidget(m_graphSearchEdit, 1);
@@ -1657,9 +1859,11 @@ void AiDAWorkbenchPanel::build_graph_tab()
     m_graphLimitSpin = new QSpinBox(searchPane);
     m_graphLimitSpin->setRange(1, 100);
     m_graphLimitSpin->setValue(12);
+    m_graphLimitSpin->setMinimumHeight(30);
     searchControls->addWidget(m_graphLimitSpin);
 
     QPushButton* searchBtn = new QPushButton(QStringLiteral("Search"), searchPane);
+    configure_button_role(searchBtn, "primary");
     QObject::connect(searchBtn, &QPushButton::clicked, [this]() { run_graph_search(); });
     searchControls->addWidget(searchBtn);
     searchLayout->addLayout(searchControls);
@@ -1671,8 +1875,7 @@ void AiDAWorkbenchPanel::build_graph_tab()
     m_graphResultsTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     m_graphResultsTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     m_graphResultsTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
-    m_graphResultsTable->setSelectionBehavior(QAbstractItemView::SelectRows);
-    m_graphResultsTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    configure_data_table(m_graphResultsTable);
     QObject::connect(m_graphResultsTable, &QTableWidget::cellDoubleClicked, [this](int row, int) {
         QTableWidgetItem* item = m_graphResultsTable->item(row, 1);
         if (item == nullptr)
@@ -2259,7 +2462,6 @@ void AiDAWorkbenchPanel::run_graph_network_flow()
         << "Receive edges created: " << result.recv_edges_created;
     render_text_browser(m_graphOverviewBrowser, summary.str(), QStringLiteral("Network Flow Analysis"));
     rebuild_graph_scene({}, current_function_ea());
-    refresh_header();
 }
 
 void AiDAWorkbenchPanel::run_graph_search()
@@ -2296,29 +2498,37 @@ void AiDAWorkbenchPanel::build_rag_tab()
 {
     QWidget* tab = new QWidget(m_tabs);
     QVBoxLayout* layout = new QVBoxLayout(tab);
-    layout->setContentsMargins(8, 8, 8, 8);
-    layout->setSpacing(8);
+    layout->setContentsMargins(10, 10, 10, 10);
+    layout->setSpacing(10);
 
     m_ragContextLabel = new QLabel(tab);
+    configure_context_label(m_ragContextLabel);
     layout->addWidget(m_ragContextLabel);
 
     QHBoxLayout* controls = new QHBoxLayout();
+    controls->setSpacing(8);
     m_ragRefreshBtn = new QPushButton(QStringLiteral("Refresh Retrieval Context"), tab);
+    configure_button_role(m_ragRefreshBtn, "secondary");
     QObject::connect(m_ragRefreshBtn, &QPushButton::clicked, [this]() { refresh_rag_tab(); });
     controls->addWidget(m_ragRefreshBtn);
 
     m_ragQueryEdit = new QLineEdit(tab);
+    configure_primary_input(m_ragQueryEdit);
     m_ragQueryEdit->setPlaceholderText(QStringLiteral("Semantic retrieval query..."));
     QObject::connect(m_ragQueryEdit, &QLineEdit::returnPressed, [this]() { run_rag_search(); });
     controls->addWidget(m_ragQueryEdit, 1);
 
     m_ragSearchBtn = new QPushButton(QStringLiteral("Search"), tab);
+    configure_button_role(m_ragSearchBtn, "primary");
     QObject::connect(m_ragSearchBtn, &QPushButton::clicked, [this]() { run_rag_search(); });
     controls->addWidget(m_ragSearchBtn);
     layout->addLayout(controls);
 
     QSplitter* splitter = new QSplitter(Qt::Vertical, tab);
+    splitter->setChildrenCollapsible(false);
+    splitter->setHandleWidth(5);
     m_ragContextBrowser = new QTextBrowser(splitter);
+    configure_text_browser_widget(m_ragContextBrowser);
     m_ragContextBrowser->setOpenLinks(false);
     QObject::connect(m_ragContextBrowser, &QTextBrowser::anchorClicked, [this](const QUrl& url) { handle_browser_link(url); });
     splitter->addWidget(m_ragContextBrowser);
@@ -2330,8 +2540,7 @@ void AiDAWorkbenchPanel::build_rag_tab()
     m_ragResultsTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     m_ragResultsTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     m_ragResultsTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
-    m_ragResultsTable->setSelectionBehavior(QAbstractItemView::SelectRows);
-    m_ragResultsTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    configure_data_table(m_ragResultsTable);
     QObject::connect(m_ragResultsTable, &QTableWidget::cellDoubleClicked, [this](int row, int) {
         QTableWidgetItem* item = m_ragResultsTable->item(row, 1);
         if (item == nullptr)
@@ -2400,19 +2609,23 @@ void AiDAWorkbenchPanel::build_settings_tab()
 {
     QWidget* tab = new QWidget(m_tabs);
     QVBoxLayout* layout = new QVBoxLayout(tab);
-    layout->setContentsMargins(8, 8, 8, 8);
-    layout->setSpacing(8);
+    layout->setContentsMargins(10, 10, 10, 10);
+    layout->setSpacing(10);
 
     QHBoxLayout* controls = new QHBoxLayout();
+    controls->setSpacing(8);
     m_settingsOpenBtn = new QPushButton(QStringLiteral("Open Advanced Settings"), tab);
+    configure_button_role(m_settingsOpenBtn, "primary");
     QObject::connect(m_settingsOpenBtn, &QPushButton::clicked, [this]() { SettingsForm::show_and_apply(m_plugin); refresh_all_tabs(); });
     controls->addWidget(m_settingsOpenBtn);
 
     m_settingsPromptMgrBtn = new QPushButton(QStringLiteral("Prompt Manager"), tab);
+    configure_button_role(m_settingsPromptMgrBtn, "secondary");
     QObject::connect(m_settingsPromptMgrBtn, &QPushButton::clicked, [this]() { show_prompt_manager_dialog(); refresh_all_tabs(); });
     controls->addWidget(m_settingsPromptMgrBtn);
 
     m_settingsToggleMcpBtn = new QPushButton(QStringLiteral("Toggle MCP"), tab);
+    configure_button_role(m_settingsToggleMcpBtn, "danger");
     QObject::connect(m_settingsToggleMcpBtn, &QPushButton::clicked, [this]() {
         if (m_plugin != nullptr)
         {
@@ -2423,12 +2636,14 @@ void AiDAWorkbenchPanel::build_settings_tab()
     controls->addWidget(m_settingsToggleMcpBtn);
 
     m_settingsRefreshBtn = new QPushButton(QStringLiteral("Refresh Overview"), tab);
+    configure_button_role(m_settingsRefreshBtn, "secondary");
     QObject::connect(m_settingsRefreshBtn, &QPushButton::clicked, [this]() { refresh_settings_tab(); });
     controls->addWidget(m_settingsRefreshBtn);
     controls->addStretch();
     layout->addLayout(controls);
 
     m_settingsBrowser = new QTextBrowser(tab);
+    configure_text_browser_widget(m_settingsBrowser);
     m_settingsBrowser->setOpenLinks(false);
     QObject::connect(m_settingsBrowser, &QTextBrowser::anchorClicked, [this](const QUrl& url) { handle_browser_link(url); });
     layout->addWidget(m_settingsBrowser, 1);
@@ -2458,7 +2673,15 @@ void AiDAWorkbenchPanel::refresh_settings_tab()
     render_text_browser(m_settingsBrowser, text.str(), QStringLiteral("Runtime Configuration Overview"));
 
     if (m_plugin && m_plugin->mcp_server && m_plugin->mcp_server->is_running())
+    {
         m_settingsToggleMcpBtn->setText(QStringLiteral("Stop MCP"));
+        m_settingsToggleMcpBtn->setProperty("role", QStringLiteral("danger"));
+    }
     else
+    {
         m_settingsToggleMcpBtn->setText(QStringLiteral("Start MCP"));
+        m_settingsToggleMcpBtn->setProperty("role", QStringLiteral("primary"));
+    }
+
+    polish_widget_style(m_settingsToggleMcpBtn);
 }

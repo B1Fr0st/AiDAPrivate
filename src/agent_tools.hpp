@@ -84,16 +84,11 @@ namespace function_tools
     tool_result_t disassemble_function(const nlohmann::json& params);
     tool_result_t get_xrefs_to(const nlohmann::json& params);
     tool_result_t get_xrefs_from(const nlohmann::json& params);
-    tool_result_t get_callees(const nlohmann::json& params);
-    tool_result_t get_callers(const nlohmann::json& params);
     tool_result_t get_stack_frame(const nlohmann::json& params);
-    tool_result_t analyze_function(const nlohmann::json& params);
     tool_result_t define_function(const nlohmann::json& params);
     tool_result_t rename_function(const nlohmann::json& params);
-    tool_result_t get_function_signature(const nlohmann::json& params);
     tool_result_t set_function_signature(const nlohmann::json& params);
     tool_result_t build_call_graph(const nlohmann::json& params);
-    tool_result_t export_function(const nlohmann::json& params);
     tool_result_t get_basic_blocks(const nlohmann::json& params);
 
     void register_tools();
@@ -106,7 +101,6 @@ namespace memory_tools
     tool_result_t read_string(const nlohmann::json& params);
     tool_result_t read_global(const nlohmann::json& params);
     tool_result_t patch_bytes(const nlohmann::json& params);
-    tool_result_t patch_instruction(const nlohmann::json& params);
     tool_result_t make_code(const nlohmann::json& params);
     tool_result_t make_data(const nlohmann::json& params);
     tool_result_t undefine(const nlohmann::json& params);
@@ -124,7 +118,6 @@ namespace comment_tools
     tool_result_t get_comment(const nlohmann::json& params);
     tool_result_t set_extra_comment(const nlohmann::json& params);
     tool_result_t rename_variable(const nlohmann::json& params);
-    tool_result_t rename_address(const nlohmann::json& params);
 
     void register_tools();
 }
@@ -143,7 +136,6 @@ namespace type_tools
     tool_result_t delete_stack_var(const nlohmann::json& params);
     tool_result_t read_struct_field(const nlohmann::json& params);
     tool_result_t list_types(const nlohmann::json& params);
-    tool_result_t get_enum(const nlohmann::json& params);
     tool_result_t create_enum(const nlohmann::json& params);
 
     void register_tools();
@@ -163,8 +155,6 @@ namespace search_tools
     tool_result_t find_bytes(const nlohmann::json& params);
     tool_result_t find_instructions(const nlohmann::json& params);
     tool_result_t find_immediate(const nlohmann::json& params);
-    tool_result_t search_text(const nlohmann::json& params);
-    tool_result_t advanced_search(const nlohmann::json& params);
     void register_tools();
 }
 
@@ -230,7 +220,6 @@ namespace segment_tools
 namespace binary_tools
 {
     tool_result_t get_binary_info(const nlohmann::json& params);
-    tool_result_t get_idb_info(const nlohmann::json& params);
     void register_tools();
 }
 
@@ -246,7 +235,6 @@ namespace navigation_tools
     tool_result_t get_current_address(const nlohmann::json& params);
     tool_result_t demangle_name(const nlohmann::json& params);
     tool_result_t wait_for_analysis(const nlohmann::json& params);
-    tool_result_t get_entry_points(const nlohmann::json& params);
     tool_result_t delete_function(const nlohmann::json& params);
     tool_result_t set_decompiler_comment(const nlohmann::json& params);
     tool_result_t batch_rename(const nlohmann::json& params);
@@ -408,8 +396,6 @@ namespace graphrag_tools
     tool_result_t get_call_context(const nlohmann::json& params);
     tool_result_t get_taint_paths(const nlohmann::json& params);
     tool_result_t get_community_info(const nlohmann::json& params);
-    tool_result_t index_function(const nlohmann::json& params);
-    tool_result_t reindex_all(const nlohmann::json& params);
     tool_result_t run_security_analysis(const nlohmann::json& params);
     tool_result_t run_taint_analysis(const nlohmann::json& params);
     tool_result_t detect_communities(const nlohmann::json& params);

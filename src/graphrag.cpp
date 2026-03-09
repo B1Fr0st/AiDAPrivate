@@ -2,6 +2,7 @@
 
 #include "aida_pro.hpp"
 #include "graphrag.hpp"
+#include "settings.hpp"
 
 #include <sstream>
 #include <regex>
@@ -41,6 +42,730 @@ static bool has_any(const std::vector<std::string>& vec, const std::set<std::str
     for (auto& s : vec)
         if (targets.count(s)) return true;
     return false;
+}
+
+
+// ============================================================================
+//  VectorStore
+// ============================================================================
+
+float VectorStore::dot_product(const float* a, const float* b, int n)
+{
+    float sum = 0.0f;
+    int i = 0;
+#if defined(_MSC_VER) && defined(__AVX2__)
+    for (; i + 8 <= n; i += 8)
+    {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        __m256 vp = _mm256_mul_ps(va, vb);
+        __m256 hs = _mm256_hadd_ps(vp, vp);
+        hs = _mm256_hadd_ps(hs, hs);
+        sum += ((float*)&hs)[0] + ((float*)&hs)[4];
+    }
+#endif
+    for (; i < n; ++i)
+        sum += a[i] * b[i];
+    return sum;
+}
+
+void VectorStore::l2_normalize(std::vector<float>& v)
+{
+    float norm = 0.0f;
+    for (float f : v)
+        norm += f * f;
+    if (norm < 1e-12f) return;
+    norm = 1.0f / std::sqrt(norm);
+    for (float& f : v)
+        f *= norm;
+}
+
+void VectorStore::add(int node_id, std::vector<float> embedding)
+{
+    std::lock_guard<std::mutex> lk(m_mtx);
+    if (embedding.empty()) return;
+
+    if (m_dimensions == 0)
+        m_dimensions = static_cast<int>(embedding.size());
+
+    if (static_cast<int>(embedding.size()) != m_dimensions)
+        return;
+
+    l2_normalize(embedding);
+    m_embeddings[node_id] = std::move(embedding);
+}
+
+void VectorStore::remove(int node_id)
+{
+    std::lock_guard<std::mutex> lk(m_mtx);
+    m_embeddings.erase(node_id);
+}
+
+bool VectorStore::has(int node_id) const
+{
+    std::lock_guard<std::mutex> lk(m_mtx);
+    return m_embeddings.count(node_id) > 0;
+}
+
+size_t VectorStore::size() const
+{
+    std::lock_guard<std::mutex> lk(m_mtx);
+    return m_embeddings.size();
+}
+
+void VectorStore::clear()
+{
+    std::lock_guard<std::mutex> lk(m_mtx);
+    m_embeddings.clear();
+    m_dimensions = 0;
+}
+
+std::vector<VectorStore::search_result_t>
+VectorStore::search(const std::vector<float>& query, int top_k) const
+{
+    std::lock_guard<std::mutex> lk(m_mtx);
+
+    if (m_embeddings.empty() || query.empty() || m_dimensions == 0)
+        return {};
+
+    std::vector<float> q = query;
+    l2_normalize(q);
+
+    if (static_cast<int>(q.size()) != m_dimensions)
+        return {};
+
+    std::vector<search_result_t> scored;
+    scored.reserve(m_embeddings.size());
+
+    const float* qp = q.data();
+    for (auto& [id, emb] : m_embeddings)
+    {
+        float score = dot_product(qp, emb.data(), m_dimensions);
+        scored.push_back({id, score});
+    }
+
+    if (static_cast<int>(scored.size()) <= top_k)
+    {
+        std::sort(scored.begin(), scored.end(),
+                  [](auto& a, auto& b) { return a.score > b.score; });
+        return scored;
+    }
+
+    std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
+                      [](auto& a, auto& b) { return a.score > b.score; });
+    scored.resize(top_k);
+    return scored;
+}
+
+std::string VectorStore::get_embeddings_path(const std::string& binary_hash) const
+{
+    qstring dir = get_user_idadir();
+    dir.append("/aida_db");
+#ifdef __NT__
+    CreateDirectoryA(dir.c_str(), nullptr);
+#else
+    mkdir(dir.c_str(), 0755);
+#endif
+    std::string result(dir.c_str());
+    result += "/embeddings_";
+    result += binary_hash;
+    result += ".bin";
+    return result;
+}
+
+bool VectorStore::save_to_file(const std::string& path) const
+{
+    std::lock_guard<std::mutex> lk(m_mtx);
+
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs.is_open()) return false;
+
+    const char magic[4] = {'A', 'V', 'E', 'C'};
+    ofs.write(magic, 4);
+
+    int32_t version = 1;
+    ofs.write(reinterpret_cast<const char*>(&version), 4);
+
+    int32_t dims = m_dimensions;
+    ofs.write(reinterpret_cast<const char*>(&dims), 4);
+
+    int32_t count = static_cast<int32_t>(m_embeddings.size());
+    ofs.write(reinterpret_cast<const char*>(&count), 4);
+
+    for (auto& [id, emb] : m_embeddings)
+    {
+        int32_t nid = id;
+        ofs.write(reinterpret_cast<const char*>(&nid), 4);
+        ofs.write(reinterpret_cast<const char*>(emb.data()),
+                  static_cast<std::streamsize>(emb.size() * sizeof(float)));
+    }
+
+    return ofs.good();
+}
+
+bool VectorStore::load_from_file(const std::string& path)
+{
+    std::lock_guard<std::mutex> lk(m_mtx);
+
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.is_open()) return false;
+
+    char magic[4];
+    ifs.read(magic, 4);
+    if (magic[0] != 'A' || magic[1] != 'V' || magic[2] != 'E' || magic[3] != 'C')
+        return false;
+
+    int32_t version;
+    ifs.read(reinterpret_cast<char*>(&version), 4);
+    if (version != 1) return false;
+
+    int32_t dims;
+    ifs.read(reinterpret_cast<char*>(&dims), 4);
+    if (dims <= 0 || dims > 16384) return false;
+
+    int32_t count;
+    ifs.read(reinterpret_cast<char*>(&count), 4);
+    if (count < 0 || count > 1000000) return false;
+
+    m_embeddings.clear();
+    m_dimensions = dims;
+
+    for (int32_t i = 0; i < count; ++i)
+    {
+        int32_t nid;
+        ifs.read(reinterpret_cast<char*>(&nid), 4);
+
+        std::vector<float> emb(dims);
+        ifs.read(reinterpret_cast<char*>(emb.data()),
+                 static_cast<std::streamsize>(dims * sizeof(float)));
+
+        if (!ifs.good()) break;
+        m_embeddings[nid] = std::move(emb);
+    }
+
+    return true;
+}
+
+
+// ============================================================================
+//  LocalVectorizer  (TF-IDF with feature hashing — zero-API-cost fallback)
+// ============================================================================
+
+std::vector<std::string> LocalVectorizer::tokenize(const std::string& text)
+{
+    std::vector<std::string> tokens;
+    tokens.reserve(256);
+
+    std::string current;
+    auto flush = [&]()
+    {
+        if (current.size() >= 2 && current.size() <= 64)
+        {
+            std::string lower = current;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            tokens.push_back(std::move(lower));
+        }
+        current.clear();
+    };
+
+    for (size_t i = 0; i < text.size(); ++i)
+    {
+        char c = text[i];
+
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_')
+        {
+            if (!current.empty() && std::isupper(static_cast<unsigned char>(c))
+                && !std::isupper(static_cast<unsigned char>(current.back())))
+            {
+                flush();
+            }
+            current += c;
+        }
+        else
+        {
+            flush();
+        }
+    }
+    flush();
+
+    size_t n = tokens.size();
+    for (size_t i = 0; i + 1 < n; ++i)
+        tokens.push_back(tokens[i] + "_" + tokens[i + 1]);
+
+    return tokens;
+}
+
+uint32_t LocalVectorizer::hash_token(const std::string& token)
+{
+    uint32_t h = 0x811c9dc5u;
+    for (unsigned char c : token)
+    {
+        h ^= c;
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+void LocalVectorizer::build(const std::vector<std::pair<int, std::string>>& documents)
+{
+    m_idf.assign(DIMENSIONS, 0.0f);
+    m_doc_count = static_cast<int>(documents.size());
+    if (m_doc_count == 0) { m_built = false; return; }
+
+    std::vector<int> df(DIMENSIONS, 0);
+
+    for (auto& [id, text] : documents)
+    {
+        auto tokens = tokenize(text);
+        std::vector<bool> seen(DIMENSIONS, false);
+        for (auto& tok : tokens)
+        {
+            int bucket = static_cast<int>(hash_token(tok) % static_cast<uint32_t>(DIMENSIONS));
+            if (!seen[bucket])
+            {
+                ++df[bucket];
+                seen[bucket] = true;
+            }
+        }
+    }
+
+    for (int i = 0; i < DIMENSIONS; ++i)
+    {
+        if (df[i] > 0)
+            m_idf[i] = std::log(static_cast<float>(m_doc_count + 1) / static_cast<float>(df[i] + 1)) + 1.0f;
+        else
+            m_idf[i] = std::log(static_cast<float>(m_doc_count + 1)) + 1.0f;
+    }
+
+    m_built = true;
+}
+
+std::vector<float> LocalVectorizer::vectorize(const std::string& text) const
+{
+    std::vector<float> vec(DIMENSIONS, 0.0f);
+    if (text.empty()) return vec;
+
+    auto tokens = tokenize(text);
+    if (tokens.empty()) return vec;
+
+    for (auto& tok : tokens)
+    {
+        int bucket = static_cast<int>(hash_token(tok) % static_cast<uint32_t>(DIMENSIONS));
+        vec[bucket] += 1.0f;
+    }
+
+    float max_tf = *std::max_element(vec.begin(), vec.end());
+    if (max_tf > 0.0f)
+    {
+        for (int i = 0; i < DIMENSIONS; ++i)
+        {
+            if (vec[i] > 0.0f)
+                vec[i] = (0.5f + 0.5f * vec[i] / max_tf) * (m_built ? m_idf[i] : 1.0f);
+        }
+    }
+
+    return vec;
+}
+
+std::string LocalVectorizer::get_vectorizer_path(const std::string& binary_hash) const
+{
+    qstring dir = get_user_idadir();
+    dir.append("/aida_db");
+#ifdef __NT__
+    CreateDirectoryA(dir.c_str(), nullptr);
+#else
+    mkdir(dir.c_str(), 0755);
+#endif
+    std::string result(dir.c_str());
+    result += "/vectorizer_";
+    result += binary_hash;
+    result += ".bin";
+    return result;
+}
+
+bool LocalVectorizer::save_to_file(const std::string& path) const
+{
+    if (!m_built) return false;
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs.is_open()) return false;
+
+    const char magic[4] = {'T', 'F', 'I', 'D'};
+    ofs.write(magic, 4);
+    int32_t version = 1;
+    ofs.write(reinterpret_cast<const char*>(&version), 4);
+    int32_t dims = DIMENSIONS;
+    ofs.write(reinterpret_cast<const char*>(&dims), 4);
+    int32_t doc_count = m_doc_count;
+    ofs.write(reinterpret_cast<const char*>(&doc_count), 4);
+    ofs.write(reinterpret_cast<const char*>(m_idf.data()),
+              static_cast<std::streamsize>(m_idf.size() * sizeof(float)));
+    return ofs.good();
+}
+
+bool LocalVectorizer::load_from_file(const std::string& path)
+{
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.is_open()) return false;
+
+    char magic[4];
+    ifs.read(magic, 4);
+    if (magic[0] != 'T' || magic[1] != 'F' || magic[2] != 'I' || magic[3] != 'D')
+        return false;
+
+    int32_t version;
+    ifs.read(reinterpret_cast<char*>(&version), 4);
+    if (version != 1) return false;
+
+    int32_t dims;
+    ifs.read(reinterpret_cast<char*>(&dims), 4);
+    if (dims != DIMENSIONS) return false;
+
+    int32_t doc_count;
+    ifs.read(reinterpret_cast<char*>(&doc_count), 4);
+    m_doc_count = doc_count;
+
+    m_idf.resize(DIMENSIONS);
+    ifs.read(reinterpret_cast<char*>(m_idf.data()),
+             static_cast<std::streamsize>(DIMENSIONS * sizeof(float)));
+
+    m_built = ifs.good();
+    return m_built;
+}
+
+
+// ============================================================================
+//  EmbeddingClient  (OpenAI-compatible /v1/embeddings API)
+// ============================================================================
+
+EmbeddingClient::EmbeddingClient()
+{
+    configure();
+}
+
+void EmbeddingClient::configure()
+{
+    extern settings_t g_settings;
+
+    m_model_name = g_settings.embedding_model_name;
+    m_dimensions = g_settings.embedding_dimensions;
+    m_batch_size = g_settings.embedding_batch_size;
+    if (m_batch_size < 1) m_batch_size = 1;
+    if (m_batch_size > 256) m_batch_size = 256;
+
+    if (!g_settings.embedding_api_url.empty())
+        m_api_host = g_settings.embedding_api_url;
+    else if (!g_settings.openai_base_url.empty())
+        m_api_host = g_settings.openai_base_url;
+    else if (g_settings.api_provider == "openai" || g_settings.api_provider == "OpenAI")
+        m_api_host = "https://api.openai.com";
+
+    if (!g_settings.embedding_api_key.empty())
+        m_api_key = g_settings.embedding_api_key;
+    else if (!g_settings.openai_api_key.empty())
+        m_api_key = g_settings.openai_api_key;
+}
+
+bool EmbeddingClient::is_available() const
+{
+    return !m_api_host.empty() && (!m_api_key.empty() || m_api_host.find("localhost") != std::string::npos
+                                   || m_api_host.find("127.0.0.1") != std::string::npos);
+}
+
+std::shared_ptr<httplib::Client> EmbeddingClient::get_client()
+{
+    std::lock_guard<std::mutex> lk(m_client_mtx);
+    if (!m_client)
+    {
+        m_client = std::make_shared<httplib::Client>(m_api_host.c_str());
+        m_client->set_connection_timeout(10);
+        m_client->set_read_timeout(120);
+        m_client->set_write_timeout(10);
+        m_client->set_tcp_nodelay(true);
+        m_client->set_keep_alive(true);
+        m_client->set_decompress(true);
+        m_client->set_compress(true);
+    }
+    return m_client;
+}
+
+std::vector<float> EmbeddingClient::embed_single(const std::string& text)
+{
+    auto result = embed_batch({text});
+    if (result.empty()) return {};
+    return result[0];
+}
+
+std::vector<std::vector<float>> EmbeddingClient::embed_batch(const std::vector<std::string>& texts)
+{
+    if (!is_available() || texts.empty())
+        return {};
+
+    std::vector<std::vector<float>> all_embeddings;
+    all_embeddings.reserve(texts.size());
+
+    for (size_t offset = 0; offset < texts.size(); offset += static_cast<size_t>(m_batch_size))
+    {
+        size_t batch_end = (std::min)(offset + static_cast<size_t>(m_batch_size), texts.size());
+
+        nlohmann::json input_arr = nlohmann::json::array();
+        for (size_t i = offset; i < batch_end; ++i)
+        {
+            std::string truncated = texts[i];
+            if (truncated.size() > 8000)
+                truncated.resize(8000);
+            input_arr.push_back(truncated);
+        }
+
+        nlohmann::json payload;
+        payload["model"] = m_model_name;
+        payload["input"] = input_arr;
+        if (m_dimensions > 0)
+            payload["dimensions"] = m_dimensions;
+
+        httplib::Headers headers = {{"Content-Type", "application/json"}};
+        if (!m_api_key.empty())
+            headers.emplace("Authorization", "Bearer " + m_api_key);
+
+        auto client = get_client();
+        std::string body = payload.dump();
+
+        auto res = client->Post(
+            "/v1/embeddings",
+            body.c_str(), body.length(),
+            "application/json");
+
+        if (!res || res->status != 200)
+        {
+            int status = res ? res->status : 0;
+            msg("[AiDA RAG] Embedding API error: status %d\n", status);
+            for (size_t i = offset; i < batch_end; ++i)
+                all_embeddings.push_back({});
+            continue;
+        }
+
+        try
+        {
+            auto jres = nlohmann::json::parse(res->body);
+            auto& data = jres["data"];
+
+            std::vector<std::pair<int, std::vector<float>>> indexed;
+            for (auto& item : data)
+            {
+                int idx = item.value("index", 0);
+                auto& emb_arr = item["embedding"];
+                std::vector<float> emb;
+                emb.reserve(emb_arr.size());
+                for (auto& v : emb_arr)
+                    emb.push_back(v.get<float>());
+                indexed.push_back({idx, std::move(emb)});
+            }
+
+            std::sort(indexed.begin(), indexed.end(),
+                      [](auto& a, auto& b) { return a.first < b.first; });
+
+            for (auto& [idx, emb] : indexed)
+                all_embeddings.push_back(std::move(emb));
+        }
+        catch (const std::exception& e)
+        {
+            msg("[AiDA RAG] Failed to parse embedding response: %s\n", e.what());
+            for (size_t i = offset; i < batch_end; ++i)
+                all_embeddings.push_back({});
+        }
+    }
+
+    return all_embeddings;
+}
+
+
+// ============================================================================
+//  VectorStore / LocalVectorizer singletons + helper functions
+// ============================================================================
+
+VectorStore& get_vector_store()
+{
+    static VectorStore s_store;
+    return s_store;
+}
+
+LocalVectorizer& get_local_vectorizer()
+{
+    static LocalVectorizer s_vec;
+    return s_vec;
+}
+
+std::string build_embedding_text(const graph_node_t& node)
+{
+    std::string text;
+    text.reserve(3000);
+
+    text += node.name;
+    text += "\n";
+
+    if (!node.security_flags.empty())
+    {
+        for (auto& f : node.security_flags)
+        {
+            text += f;
+            text += " ";
+        }
+        text += "\n";
+    }
+
+    if (!node.activity_profile.empty())
+    {
+        text += node.activity_profile;
+        text += "\n";
+    }
+
+    if (!node.risk_level.empty() && node.risk_level != "NONE")
+    {
+        text += "RISK:";
+        text += node.risk_level;
+        text += "\n";
+    }
+
+    if (!node.llm_summary.empty())
+    {
+        text += node.llm_summary;
+        text += "\n";
+    }
+
+    if (!node.raw_code.empty())
+    {
+        std::string code = node.raw_code;
+        if (code.size() > 2000)
+            code.resize(2000);
+        text += code;
+    }
+
+    return text;
+}
+
+void index_embeddings(const std::string& binary_hash,
+                      StructureExtractor::progress_fn on_progress)
+{
+    auto& store    = GraphStore::instance();
+    auto& vs       = get_vector_store();
+    auto& lv       = get_local_vectorizer();
+
+    auto nodes = store.get_nodes_by_type(binary_hash, node_type_t::FUNCTION);
+    if (nodes.empty()) return;
+
+    int total = static_cast<int>(nodes.size());
+
+    std::vector<std::pair<int, std::string>> doc_texts;
+    doc_texts.reserve(nodes.size());
+
+    for (auto* n : nodes)
+    {
+        std::string emb_text = build_embedding_text(*n);
+        doc_texts.push_back({n->id, std::move(emb_text)});
+    }
+
+    if (on_progress)
+        on_progress(0, total, "Building local TF-IDF vectorizer...");
+
+    lv.build(doc_texts);
+
+    EmbeddingClient emb_client;
+    bool use_api = emb_client.is_available();
+
+    if (use_api)
+    {
+        msg("[AiDA RAG] Using API embeddings from %s (model: %s, dims: %d)\n",
+            "configured endpoint",
+            g_settings.embedding_model_name.c_str(),
+            g_settings.embedding_dimensions);
+
+        std::vector<std::string> batch_texts;
+        std::vector<int>         batch_ids;
+        batch_texts.reserve(emb_client.dimensions());
+        batch_ids.reserve(emb_client.dimensions());
+
+        int processed = 0;
+        for (size_t di = 0; di < doc_texts.size(); ++di)
+        {
+            batch_texts.push_back(doc_texts[di].second);
+            batch_ids.push_back(doc_texts[di].first);
+
+            bool is_last = (di + 1 == doc_texts.size());
+            if (static_cast<int>(batch_texts.size()) >= g_settings.embedding_batch_size || is_last)
+            {
+                auto embeddings = emb_client.embed_batch(batch_texts);
+                for (size_t i = 0; i < embeddings.size(); ++i)
+                {
+                    if (!embeddings[i].empty())
+                        vs.add(batch_ids[i], std::move(embeddings[i]));
+                }
+
+                processed += static_cast<int>(batch_texts.size());
+                if (on_progress)
+                    on_progress(processed, total,
+                                "Embedding (API): " + std::to_string(processed) + "/" + std::to_string(total));
+
+                batch_texts.clear();
+                batch_ids.clear();
+            }
+        }
+
+        msg("[AiDA RAG] API embeddings indexed: %zu vectors, %d dimensions\n",
+            vs.size(), vs.dimensions());
+    }
+    else
+    {
+        msg("[AiDA RAG] No embedding API configured; using local TF-IDF vectorizer (%d dims)\n",
+            LocalVectorizer::DIMENSIONS);
+
+        int processed = 0;
+        for (auto& [id, text] : doc_texts)
+        {
+            auto vec = lv.vectorize(text);
+            vs.add(id, std::move(vec));
+            ++processed;
+
+            if (on_progress && (processed % 500 == 0 || processed == total))
+                on_progress(processed, total,
+                            "Vectorizing (local): " + std::to_string(processed) + "/" + std::to_string(total));
+        }
+
+        msg("[AiDA RAG] Local TF-IDF vectors: %zu vectors, %d dimensions\n",
+            vs.size(), LocalVectorizer::DIMENSIONS);
+    }
+}
+
+void save_vectors(const std::string& binary_hash)
+{
+    if (binary_hash.empty()) return;
+
+    auto& vs = get_vector_store();
+    auto& lv = get_local_vectorizer();
+
+    std::string emb_path = vs.get_embeddings_path(binary_hash);
+    if (vs.save_to_file(emb_path))
+        msg("[AiDA RAG] Saved %zu embeddings to %s\n", vs.size(), emb_path.c_str());
+
+    if (lv.is_built())
+    {
+        std::string vec_path = lv.get_vectorizer_path(binary_hash);
+        lv.save_to_file(vec_path);
+    }
+}
+
+void load_vectors(const std::string& binary_hash)
+{
+    if (binary_hash.empty()) return;
+
+    auto& vs = get_vector_store();
+    auto& lv = get_local_vectorizer();
+
+    std::string emb_path = vs.get_embeddings_path(binary_hash);
+    if (vs.load_from_file(emb_path))
+        msg("[AiDA RAG] Loaded %zu embeddings (%d dims)\n", vs.size(), vs.dimensions());
+
+    std::string vec_path = lv.get_vectorizer_path(binary_hash);
+    lv.load_from_file(vec_path);
 }
 
 
@@ -667,6 +1392,21 @@ std::vector<graph_node_t*> GraphStore::search_nodes(const std::string& binary_ha
         tokens.push_back(tok);
     }
 
+    // Helper to check if any token matches a string (case-insensitive)
+    auto match_lower = [&](const std::string& text_lower, const std::string& t) -> bool {
+        return text_lower.find(t) != std::string::npos;
+    };
+
+    // Helper to search a vector of strings
+    auto match_vec = [&](const std::vector<std::string>& vec, const std::string& t) -> bool {
+        for (auto& s : vec)
+        {
+            std::string sl = s;
+            std::transform(sl.begin(), sl.end(), sl.begin(), ::tolower);
+            if (sl.find(t) != std::string::npos) return true;
+        }
+        return false;
+    };
 
     struct scored_t { graph_node_t* node; int score; };
     std::vector<scored_t> scored;
@@ -681,15 +1421,44 @@ std::vector<graph_node_t*> GraphStore::search_nodes(const std::string& binary_ha
         std::string summary_lower = node.llm_summary;
         std::transform(summary_lower.begin(), summary_lower.end(), summary_lower.begin(), ::tolower);
 
+        // Pre-lowercase raw_code once per node
+        std::string code_lower;
+        bool code_lowered = false;
+
         for (auto& t : tokens)
         {
-            if (name_lower.find(t) != std::string::npos) score += 3;
-            if (summary_lower.find(t) != std::string::npos) score += 2;
-            for (auto& flag : node.security_flags)
+            // Name match (highest weight)
+            if (match_lower(name_lower, t)) score += 5;
+
+            // Summary match
+            if (match_lower(summary_lower, t)) score += 3;
+
+            // Security flags
+            if (match_vec(node.security_flags, t)) score += 2;
+
+            // Extracted IOCs: URLs, IPs, file paths, domains, registry keys
+            if (match_vec(node.urls, t))           score += 4;
+            if (match_vec(node.ip_addresses, t))   score += 4;
+            if (match_vec(node.file_paths, t))     score += 4;
+            if (match_vec(node.domains, t))        score += 4;
+            if (match_vec(node.registry_keys, t))  score += 4;
+
+            // API names
+            if (match_vec(node.network_apis, t))   score += 3;
+            if (match_vec(node.file_io_apis, t))   score += 3;
+            if (match_vec(node.crypto_apis, t))    score += 3;
+            if (match_vec(node.process_apis, t))   score += 3;
+
+            // Raw code search (decompiled output — catches strings, instructions, constants)
+            if (!node.raw_code.empty())
             {
-                std::string flag_lower = flag;
-                std::transform(flag_lower.begin(), flag_lower.end(), flag_lower.begin(), ::tolower);
-                if (flag_lower.find(t) != std::string::npos) score += 1;
+                if (!code_lowered)
+                {
+                    code_lower = node.raw_code;
+                    std::transform(code_lower.begin(), code_lower.end(), code_lower.begin(), ::tolower);
+                    code_lowered = true;
+                }
+                if (match_lower(code_lower, t)) score += 1;
             }
         }
 
@@ -1107,18 +1876,35 @@ bool ensure_full_binary_index(const std::string& binary_hash,
     auto_wait();
 
     auto& store = GraphStore::instance();
+    auto& vs    = get_vector_store();
+
     const size_t total_functions = get_func_qty();
     if (total_functions == 0)
         return true;
 
     const auto existing_functions = store.get_nodes_by_type(binary_hash, node_type_t::FUNCTION);
     const auto stats = store.get_stats(binary_hash);
-    const bool needs_reindex = existing_functions.size() < total_functions || stats.stale > 0;
-    if (!needs_reindex)
+    const bool needs_graph_reindex = existing_functions.size() < total_functions || stats.stale > 0;
+    const bool needs_vector_reindex = vs.size() < total_functions;
+
+    if (!needs_graph_reindex && !needs_vector_reindex)
         return true;
 
-    StructureExtractor extractor(store);
-    extractor.extract_all(binary_hash, on_progress);
+    if (needs_graph_reindex)
+    {
+        StructureExtractor extractor(store);
+        extractor.extract_all(binary_hash, on_progress);
+    }
+
+    if (needs_graph_reindex || needs_vector_reindex)
+    {
+        if (g_settings.embedding_enabled)
+        {
+            index_embeddings(binary_hash, on_progress);
+            save_vectors(binary_hash);
+        }
+    }
+
     save_graph(binary_hash);
 
     if (reindexed != nullptr)
@@ -1846,8 +2632,67 @@ nlohmann::json QueryEngine::get_semantic_analysis(const std::string& binary_hash
 nlohmann::json QueryEngine::search_semantic(const std::string& binary_hash,
                                              const std::string& query, int limit)
 {
-    auto results = m_store.search_nodes(binary_hash, query, limit);
+    auto& vs = get_vector_store();
     nlohmann::json j = nlohmann::json::array();
+
+    // Helper to enrich a search result entry with matched IOCs/APIs
+    auto enrich_entry = [](nlohmann::json& entry, const graph_node_t* n) {
+        if (!n->urls.empty())           entry["urls"] = n->urls;
+        if (!n->ip_addresses.empty())   entry["ip_addresses"] = n->ip_addresses;
+        if (!n->file_paths.empty())     entry["file_paths"] = n->file_paths;
+        if (!n->domains.empty())        entry["domains"] = n->domains;
+        if (!n->registry_keys.empty())  entry["registry_keys"] = n->registry_keys;
+        if (!n->network_apis.empty())   entry["network_apis"] = n->network_apis;
+        if (!n->crypto_apis.empty())    entry["crypto_apis"] = n->crypto_apis;
+        if (!n->file_io_apis.empty())   entry["file_io_apis"] = n->file_io_apis;
+        if (!n->process_apis.empty())   entry["process_apis"] = n->process_apis;
+        if (!n->activity_profile.empty()) entry["activity_profile"] = n->activity_profile;
+    };
+
+    // Try real vector search first
+    if (vs.size() > 0)
+    {
+        std::vector<float> query_vec;
+
+        // Try API embeddings first, then local vectorizer
+        EmbeddingClient ec;
+        if (ec.is_available())
+        {
+            query_vec = ec.embed_single(query);
+        }
+        else
+        {
+            auto& lv = get_local_vectorizer();
+            if (lv.is_built())
+                query_vec = lv.vectorize(query);
+        }
+
+        if (!query_vec.empty() && static_cast<int>(query_vec.size()) == vs.dimensions())
+        {
+            auto hits = vs.search(query_vec, limit);
+            for (auto& hit : hits)
+            {
+                auto* n = m_store.get_node(hit.node_id);
+                if (!n || n->binary_hash != binary_hash) continue;
+
+                nlohmann::json entry;
+                entry["function_name"] = node_display_name(n);
+                entry["address"] = n->address;
+                std::string summary = n->llm_summary;
+                if (summary.size() > 200) summary = summary.substr(0, 200) + "...";
+                entry["summary"] = summary;
+                entry["security_flags"] = n->security_flags;
+                entry["risk_level"] = n->risk_level;
+                entry["similarity_score"] = hit.score;
+                enrich_entry(entry, n);
+                j.push_back(entry);
+            }
+            if (!j.empty()) return j;
+        }
+    }
+
+    // Fallback to keyword search
+    auto results = m_store.search_nodes(binary_hash, query, limit);
     for (auto* n : results)
     {
         nlohmann::json entry;
@@ -1858,6 +2703,7 @@ nlohmann::json QueryEngine::search_semantic(const std::string& binary_hash,
         entry["summary"] = summary;
         entry["security_flags"] = n->security_flags;
         entry["risk_level"] = n->risk_level;
+        enrich_entry(entry, n);
         j.push_back(entry);
     }
     return j;
@@ -1870,8 +2716,49 @@ nlohmann::json QueryEngine::get_similar_functions(const std::string& binary_hash
     if (!source) return nlohmann::json::array();
 
     nlohmann::json j = nlohmann::json::array();
-    std::set<int> seen = {source->id};
 
+    // Try vector similarity first
+    auto& vs = get_vector_store();
+    if (vs.size() > 0 && vs.has(source->id))
+    {
+        std::string src_text = build_embedding_text(*source);
+        std::vector<float> src_vec;
+
+        EmbeddingClient ec;
+        if (ec.is_available())
+            src_vec = ec.embed_single(src_text);
+        else
+        {
+            auto& lv = get_local_vectorizer();
+            if (lv.is_built())
+                src_vec = lv.vectorize(src_text);
+        }
+
+        if (!src_vec.empty() && static_cast<int>(src_vec.size()) == vs.dimensions())
+        {
+            auto hits = vs.search(src_vec, limit * 3);
+            for (auto& hit : hits)
+            {
+                if (static_cast<int>(j.size()) >= limit) break;
+                if (hit.node_id == source->id) continue;
+
+                auto* n = m_store.get_node(hit.node_id);
+                if (!n || n->binary_hash != binary_hash) continue;
+                if (n->node_type != node_type_t::FUNCTION) continue;
+
+                j.push_back({
+                    {"function_name", node_display_name(n)},
+                    {"address", n->address},
+                    {"similarity", hit.score},
+                    {"reason", "EMBEDDING_SIMILARITY"}
+                });
+            }
+            if (!j.empty()) return j;
+        }
+    }
+
+    // Fallback: graph-based similarity
+    std::set<int> seen = {source->id};
 
     auto callers = m_store.get_callers(binary_hash, source->id);
     for (auto* caller : callers)
@@ -1890,7 +2777,6 @@ nlohmann::json QueryEngine::get_similar_functions(const std::string& binary_hash
             });
         }
     }
-
 
     auto callees = m_store.get_callees(binary_hash, source->id);
     for (auto* callee : callees)
@@ -2205,10 +3091,14 @@ void initialize(const std::string& binary_hash)
     std::string path = store.get_graph_path(binary_hash);
     store.load_from_file(path);
 
-    msg("[AiDA GraphRAG] Loaded graph for %s\n", binary_hash.c_str());
+    load_vectors(binary_hash);
+
+    msg("[AiDA RAG] Loaded graph for %s\n", binary_hash.c_str());
     auto stats = store.get_stats(binary_hash);
-    msg("[AiDA GraphRAG] Nodes: %d, Edges: %d, Communities: %d\n",
-        stats.nodes, stats.edges, stats.communities);
+    auto& vs = get_vector_store();
+    msg("[AiDA RAG] Nodes: %d, Edges: %d, Communities: %d, Vectors: %zu (%d dims)\n",
+        stats.nodes, stats.edges, stats.communities,
+        vs.size(), vs.dimensions());
 }
 
 void save_graph(const std::string& binary_hash)
@@ -2217,7 +3107,7 @@ void save_graph(const std::string& binary_hash)
     auto& store = GraphStore::instance();
     std::string path = store.get_graph_path(binary_hash);
     if (store.save_to_file(path))
-        msg("[AiDA GraphRAG] Graph saved to %s\n", path.c_str());
+        msg("[AiDA RAG] Graph saved to %s\n", path.c_str());
 }
 
 void load_graph(const std::string& binary_hash)

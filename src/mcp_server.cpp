@@ -102,7 +102,7 @@ static const std::vector<mcp_resource_def_t>& get_resource_definitions()
             "Database Information",
             "IDA database (IDB) information including analysis state and statistics",
             "application/json",
-            "get_idb_info",
+            "get_binary_info",
             json::object()
         },
         {
@@ -134,7 +134,7 @@ static const std::vector<mcp_resource_def_t>& get_resource_definitions()
             "Entry Points",
             "Program entry points",
             "application/json",
-            "get_entry_points",
+            "list_exports",
             json::object()
         },
     };
@@ -243,7 +243,6 @@ static bool is_destructive_tool(const std::string& name)
         || name == "delete_breakpoint"
         || name == "delete_stack_var"
         || name == "patch_bytes"
-        || name == "patch_instruction"
         || name == "undefine"
         || name == "write_memory"
         || name == "exit_process";
@@ -698,7 +697,7 @@ static json handle_prompts_get(const json& id, const json& params)
         auto segments_result = execute_tool_in_main_thread("list_segments", json::object());
         auto imports_result = execute_tool_in_main_thread("list_imports", json::object());
         auto exports_result = execute_tool_in_main_thread("list_exports", json::object());
-        auto entries_result = execute_tool_in_main_thread("get_entry_points", json::object());
+        auto entries_result = execute_tool_in_main_thread("list_exports", json::object());
 
         std::string overview = "Provide a comprehensive analysis of the following binary loaded in IDA Pro.\n\n";
 

@@ -23,6 +23,9 @@
 #include <name.hpp>
 #include <segment.hpp>
 
+namespace httplib { class Client; }
+class settings_t;
+
 namespace graphrag
 {
 
@@ -298,6 +301,87 @@ public:
 };
 
 
+class VectorStore
+{
+public:
+    struct search_result_t
+    {
+        int   node_id = 0;
+        float score   = 0.0f;
+    };
+
+    void   add(int node_id, std::vector<float> embedding);
+    void   remove(int node_id);
+    bool   has(int node_id) const;
+    size_t size() const;
+    int    dimensions() const { return m_dimensions; }
+    void   clear();
+
+    std::vector<search_result_t> search(const std::vector<float>& query, int top_k) const;
+
+    bool save_to_file(const std::string& path) const;
+    bool load_from_file(const std::string& path);
+    std::string get_embeddings_path(const std::string& binary_hash) const;
+
+private:
+    mutable std::mutex m_mtx;
+    int m_dimensions = 0;
+    std::unordered_map<int, std::vector<float>> m_embeddings;
+
+    static float dot_product(const float* a, const float* b, int n);
+    static void  l2_normalize(std::vector<float>& v);
+};
+
+
+class LocalVectorizer
+{
+public:
+    static constexpr int DIMENSIONS = 768;
+
+    void build(const std::vector<std::pair<int, std::string>>& documents);
+    std::vector<float> vectorize(const std::string& text) const;
+    bool is_built() const { return m_built; }
+
+    bool save_to_file(const std::string& path) const;
+    bool load_from_file(const std::string& path);
+    std::string get_vectorizer_path(const std::string& binary_hash) const;
+
+private:
+    std::vector<float> m_idf;
+    int  m_doc_count = 0;
+    bool m_built     = false;
+
+    static std::vector<std::string> tokenize(const std::string& text);
+    static uint32_t hash_token(const std::string& token);
+};
+
+
+class EmbeddingClient
+{
+public:
+    EmbeddingClient();
+
+    bool is_available() const;
+    int  dimensions() const { return m_dimensions; }
+
+    std::vector<float>               embed_single(const std::string& text);
+    std::vector<std::vector<float>>  embed_batch(const std::vector<std::string>& texts);
+
+private:
+    std::string m_api_host;
+    std::string m_api_key;
+    std::string m_model_name;
+    int         m_dimensions  = 1536;
+    int         m_batch_size  = 32;
+
+    std::shared_ptr<httplib::Client> m_client;
+    std::mutex m_client_mtx;
+
+    void configure();
+    std::shared_ptr<httplib::Client> get_client();
+};
+
+
 class GraphStore
 {
 public:
@@ -544,6 +628,18 @@ bool ensure_function_indexed(const std::string& binary_hash, ea_t func_ea);
 bool ensure_full_binary_index(const std::string& binary_hash,
                               StructureExtractor::progress_fn on_progress = nullptr,
                               bool* reindexed = nullptr);
+
+
+VectorStore&     get_vector_store();
+LocalVectorizer& get_local_vectorizer();
+
+std::string build_embedding_text(const graph_node_t& node);
+
+void index_embeddings(const std::string& binary_hash,
+                      StructureExtractor::progress_fn on_progress = nullptr);
+
+void save_vectors(const std::string& binary_hash);
+void load_vectors(const std::string& binary_hash);
 
 
 void initialize(const std::string& binary_hash);
