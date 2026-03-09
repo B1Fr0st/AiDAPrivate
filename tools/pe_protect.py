@@ -7,16 +7,22 @@ DLL binary and overwrites it with a buyer-specific watermark ID.  This allows
 every distributed build to be uniquely traced back to its buyer if it leaks.
 
 Usage:
-    python pe_protect.py <dll_path>                         # no-op without --watermark
-    python pe_protect.py <dll_path> --watermark <buyer_id>  # stamp the DLL
+    1. Edit BUYER_ID below before each build
+    2. Build AiDA normally — the post-build step stamps it automatically
 
-The watermark ID must be 1-20 alphanumeric characters.  It is zero-padded to
-fill the 20-char payload area inside the sentinel.
+The watermark ID must be 1-20 alphanumeric characters.
 """
 
 import sys
 import re
 import hashlib
+import os
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHANGE THIS BEFORE EACH BUILD — set to the buyer's watermark ID
+# ═══════════════════════════════════════════════════════════════════════════════
+BUYER_ID = "AiDAOwner"   # e.g. "JOHN01", "CLIENT042", "BETA7"  (leave "" for no stamp)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 SENTINEL = b"%%AIDA_WM_00000000000000000000%%"
 SENTINEL_LEN = len(SENTINEL)      # 32 bytes total
@@ -72,12 +78,12 @@ def stamp_watermark(dll_path, watermark_id):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: pe_protect.py <dll_path> [--watermark <id>]", file=sys.stderr)
+        print("Usage: pe_protect.py <dll_path>", file=sys.stderr)
         sys.exit(1)
 
     dll_path = sys.argv[1]
 
-    # Parse --watermark flag
+    # CLI --watermark flag overrides hardcoded BUYER_ID
     watermark_id = None
     for i, arg in enumerate(sys.argv[2:], start=2):
         if arg == '--watermark' and i + 1 < len(sys.argv):
@@ -85,8 +91,10 @@ def main():
             break
 
     if watermark_id is None:
-        # No watermark requested — pass-through (no-op)
-        print("pe_protect: No --watermark flag, skipping stamp.")
+        watermark_id = BUYER_ID.strip()
+
+    if not watermark_id:
+        print("pe_protect: No watermark set (BUYER_ID is empty), skipping stamp.")
         sys.exit(0)
 
     if not stamp_watermark(dll_path, watermark_id):

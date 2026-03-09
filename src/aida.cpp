@@ -302,6 +302,7 @@ aida_plugin_t::aida_plugin_t()
 #ifdef __NT__
     anti_re::start_pipe_monitor();
     anti_re::start_process_hash_scanner(nullptr, 0);
+    anti_re::start_driver_tamper_monitor();
 #endif
 }
 

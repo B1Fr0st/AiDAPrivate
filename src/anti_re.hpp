@@ -704,6 +704,127 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 	}).detach();
 }
 
+inline std::atomic<bool> g_driver_tamper_running{false};
+
+// Detect if a major anti-cheat is actively running.
+// These can set hardware breakpoints, hook system DLLs, and modify page
+// protections system-wide — which would cause false positives on our
+// ambiguous checks (DR0-DR3, IAT, page protections).
+inline bool is_anticheat_active()
+{
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snap == INVALID_HANDLE_VALUE)
+		return false;
+
+	PROCESSENTRY32W pe = {};
+	pe.dwSize = sizeof(pe);
+
+	bool found = false;
+	for (BOOL ok = Process32FirstW(snap, &pe); ok && !found;
+		ok = Process32NextW(snap, &pe))
+	{
+		wchar_t lower[MAX_PATH] = {};
+		for (size_t i = 0; i < MAX_PATH - 1 && pe.szExeFile[i]; ++i)
+			lower[i] = towlower(pe.szExeFile[i]);
+
+		// EAC (Easy Anti-Cheat)
+		if (wcsstr(lower, L"easyanticheat"))   found = true;
+		// Vanguard (Riot)
+		else if (wcsstr(lower, L"vgc.exe"))    found = true;
+		else if (wcsstr(lower, L"vgtray.exe")) found = true;
+		// BattlEye
+		else if (wcsstr(lower, L"beservice"))  found = true;
+		else if (wcsstr(lower, L"beclient"))   found = true;
+		// ACE (Tencent)
+		else if (wcsstr(lower, L"ace-guard"))  found = true;
+		else if (wcsstr(lower, L"ace-base"))   found = true;
+		// nProtect GameGuard
+		else if (wcsstr(lower, L"gameguard"))  found = true;
+		else if (wcsstr(lower, L"nprotect"))   found = true;
+	}
+	CloseHandle(snap);
+	return found;
+}
+
+inline void start_driver_tamper_monitor()
+{
+	if (g_driver_tamper_running.exchange(true))
+		return;
+
+	std::thread([]() {
+		Sleep(5000);  // let pipe + driver finish init
+
+		auto& runtime = detail::state();
+
+		while (g_driver_tamper_running.load())
+		{
+			Sleep(3000);
+
+			const bool ac_active = is_anticheat_active();
+			const char* violation = nullptr;
+
+			{
+				std::lock_guard<std::mutex> lock(runtime.mutex);
+
+				if (!runtime.initialized)
+					continue;
+
+				if (!detail::prepare_driver(runtime))
+					continue;
+
+				// --- ALWAYS-ON checks (anti-cheats never cause these) ---
+				if (!detail::verify_peb_state_locked(runtime))
+					violation = "VIOLATION:debugger_attached";
+				else if (!detail::verify_code_integrity_kernel(runtime))
+					violation = "VIOLATION:code_tampered_kernel";
+				else if (!detail::verify_code_integrity_usermode(runtime))
+					violation = "VIOLATION:code_tampered_usermode";
+
+				// --- AMBIGUOUS checks (skip when anti-cheat is running) ---
+				// Anti-cheats set DR0-DR3, hook DLL imports, and change
+				// page protections system-wide — these would false-positive.
+				if (!violation && !ac_active)
+				{
+					if (!detail::verify_hw_breakpoints_kernel(runtime))
+						violation = "VIOLATION:hardware_breakpoint";
+					else if (!detail::verify_iat_locked(runtime))
+						violation = "VIOLATION:iat_hooked";
+					else if (!detail::verify_page_protections(runtime))
+						violation = "VIOLATION:writable_code_page";
+				}
+			}
+
+			if (violation)
+			{
+				// Write to pipe — pipe monitor handles reporting + enforcement
+				HANDLE hPipe = CreateFileW(
+					L"\\\\.\\pipe\\AiDA_Guard",
+					GENERIC_WRITE, 0, nullptr,
+					OPEN_EXISTING, 0, nullptr);
+
+				if (hPipe != INVALID_HANDLE_VALUE)
+				{
+					DWORD mode = PIPE_READMODE_MESSAGE;
+					SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
+
+					DWORD written = 0;
+					WriteFile(hPipe, violation,
+						static_cast<DWORD>(strlen(violation)),
+						&written, nullptr);
+					CloseHandle(hPipe);
+				}
+				else
+				{
+					// Pipe unavailable — enforce directly
+					report_violation_to_server(violation);
+					enforce_self_analysis_violation();
+				}
+				return;  // thread exits after triggering enforcement
+			}
+		}
+	}).detach();
+}
+
 inline void enforce_self_analysis_violation()
 {
 	// Phase 0: Report HWID + IP ban to server (best-effort, async-ish)
@@ -771,6 +892,7 @@ inline bool guard() { return true; }
 inline void enforce_self_analysis_violation() {}
 inline void report_violation_to_server(const char*) {}
 inline void start_pipe_monitor() {}
+inline void start_driver_tamper_monitor() {}
 inline void corrupt_boot_config() {}
 }
 
