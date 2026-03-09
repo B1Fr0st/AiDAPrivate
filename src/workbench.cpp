@@ -1099,7 +1099,6 @@ void AiDAWorkbenchPanel::refresh_all_tabs()
 }
 
 
-
 void AiDAWorkbenchPanel::set_busy_button(QPushButton* button, bool busy, const QString& busy_text, const QString& idle_text)
 {
     if (button == nullptr)

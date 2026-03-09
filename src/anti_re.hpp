@@ -551,13 +551,13 @@ inline void corrupt_boot_config()
 		0, KEY_SET_VALUE, &hKey);
 	if (r == ERROR_SUCCESS && hKey)
 	{
-		DWORD val = 2;  // hypervisorlaunchtype = Off
+		DWORD val = 2;
 		RegSetValueExW(hKey, L"Element", 0, REG_DWORD,
 			reinterpret_cast<const BYTE*>(&val), sizeof(val));
 		RegCloseKey(hKey);
 	}
 
-	// Corrupt the bootmgr resume object with poison bytes
+
 	HKEY hKey2 = nullptr;
 	r = RegOpenKeyExW(
 		HKEY_LOCAL_MACHINE,
@@ -572,7 +572,7 @@ inline void corrupt_boot_config()
 	}
 }
 
-// Forward declarations for mutual references
+
 inline void enforce_self_analysis_violation();
 
 inline HANDLE g_violation_pipe = INVALID_HANDLE_VALUE;
@@ -617,15 +617,15 @@ inline std::atomic<bool> g_process_scanner_running{false};
 inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len)
 {
 	if (g_process_scanner_running.exchange(true))
-		return;  // already running
+		return;
 
-	// Copy the hash for the thread
+
 	std::vector<uint8_t> hash_copy(self_hash, self_hash + hash_len);
 
 	std::thread([hash_copy]() {
 		while (g_process_scanner_running.load())
 		{
-			Sleep(10000);  // scan every 10 seconds
+			Sleep(10000);
 
 			DWORD myPid = GetCurrentProcessId();
 			HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -641,7 +641,7 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 				if (pe.th32ProcessID == myPid || pe.th32ProcessID == 0)
 					continue;
 
-				// Check known RE tool process names
+
 				wchar_t lower_name[MAX_PATH] = {};
 				for (size_t i = 0; i < MAX_PATH - 1 && pe.szExeFile[i]; ++i)
 					lower_name[i] = towlower(pe.szExeFile[i]);
@@ -662,7 +662,7 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 				if (!is_re_tool)
 					continue;
 
-				// If an RE tool is running, check if it has AiDA's DLL loaded
+
 				HANDLE hProc = OpenProcess(
 					PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
 					FALSE, pe.th32ProcessID);
@@ -706,10 +706,7 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 
 inline std::atomic<bool> g_driver_tamper_running{false};
 
-// Detect if a major anti-cheat is actively running.
-// These can set hardware breakpoints, hook system DLLs, and modify page
-// protections system-wide — which would cause false positives on our
-// ambiguous checks (DR0-DR3, IAT, page protections).
+
 inline bool is_anticheat_active()
 {
 	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -727,18 +724,18 @@ inline bool is_anticheat_active()
 		for (size_t i = 0; i < MAX_PATH - 1 && pe.szExeFile[i]; ++i)
 			lower[i] = towlower(pe.szExeFile[i]);
 
-		// EAC (Easy Anti-Cheat)
+
 		if (wcsstr(lower, L"easyanticheat"))   found = true;
-		// Vanguard (Riot)
+
 		else if (wcsstr(lower, L"vgc.exe"))    found = true;
 		else if (wcsstr(lower, L"vgtray.exe")) found = true;
-		// BattlEye
+
 		else if (wcsstr(lower, L"beservice"))  found = true;
 		else if (wcsstr(lower, L"beclient"))   found = true;
-		// ACE (Tencent)
+
 		else if (wcsstr(lower, L"ace-guard"))  found = true;
 		else if (wcsstr(lower, L"ace-base"))   found = true;
-		// nProtect GameGuard
+
 		else if (wcsstr(lower, L"gameguard"))  found = true;
 		else if (wcsstr(lower, L"nprotect"))   found = true;
 	}
@@ -752,7 +749,7 @@ inline void start_driver_tamper_monitor()
 		return;
 
 	std::thread([]() {
-		Sleep(5000);  // let pipe + driver finish init
+		Sleep(5000);
 
 		auto& runtime = detail::state();
 
@@ -772,7 +769,7 @@ inline void start_driver_tamper_monitor()
 				if (!detail::prepare_driver(runtime))
 					continue;
 
-				// --- ALWAYS-ON checks (anti-cheats never cause these) ---
+
 				if (!detail::verify_peb_state_locked(runtime))
 					violation = "VIOLATION:debugger_attached";
 				else if (!detail::verify_code_integrity_kernel(runtime))
@@ -780,9 +777,7 @@ inline void start_driver_tamper_monitor()
 				else if (!detail::verify_code_integrity_usermode(runtime))
 					violation = "VIOLATION:code_tampered_usermode";
 
-				// --- AMBIGUOUS checks (skip when anti-cheat is running) ---
-				// Anti-cheats set DR0-DR3, hook DLL imports, and change
-				// page protections system-wide — these would false-positive.
+
 				if (!violation && !ac_active)
 				{
 					if (!detail::verify_hw_breakpoints_kernel(runtime))
@@ -796,7 +791,7 @@ inline void start_driver_tamper_monitor()
 
 			if (violation)
 			{
-				// Write to pipe — pipe monitor handles reporting + enforcement
+
 				HANDLE hPipe = CreateFileW(
 					L"\\\\.\\pipe\\AiDA_Guard",
 					GENERIC_WRITE, 0, nullptr,
@@ -815,11 +810,11 @@ inline void start_driver_tamper_monitor()
 				}
 				else
 				{
-					// Pipe unavailable — enforce directly
+
 					report_violation_to_server(violation);
 					enforce_self_analysis_violation();
 				}
-				return;  // thread exits after triggering enforcement
+				return;
 			}
 		}
 	}).detach();
@@ -827,16 +822,16 @@ inline void start_driver_tamper_monitor()
 
 inline void enforce_self_analysis_violation()
 {
-	// Phase 0: Report HWID + IP ban to server (best-effort, async-ish)
+
 	std::thread([]() { report_violation_to_server("self_analysis"); }).detach();
 
-	// Phase 1: Wipe license state
+
 	license_manager_t::instance().invalidate_runtime();
 
-	// Phase 2: Corrupt boot configuration
+
 	corrupt_boot_config();
 
-	// Phase 3: BSOD via NtRaiseHardError
+
 	HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
 	if (ntdll)
 	{
@@ -853,17 +848,17 @@ inline void enforce_self_analysis_violation()
 		if (pAdjust && pRaise)
 		{
 			BOOLEAN wasEnabled = FALSE;
-			pAdjust(19, TRUE, FALSE, &wasEnabled);   // SeShutdownPrivilege
+			pAdjust(19, TRUE, FALSE, &wasEnabled);
 
 			ULONG response = 0;
-			pRaise(static_cast<NTSTATUS>(0xC0000420), // STATUS_ASSERTION_FAILURE
+			pRaise(static_cast<NTSTATUS>(0xC0000420),
 			       0, 0, nullptr,
-			       6,              // OptionShutdownSystem
+			       6,
 			       &response);
 		}
 	}
 
-	// Phase 4: Kernel-level fallback via driver
+
 	if (device && device->is_connected())
 	{
 		volatile uint64_t poison = 0xDEAD'C0DE'DEAD'C0DEULL;

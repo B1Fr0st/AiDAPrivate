@@ -255,8 +255,8 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
 static int idaapi self_analysis_watchdog(void *)
 {
     if (ida_utils::is_self_target_database())
-        return -1;   // timer auto-unregisters after enforcement
-    return 7000;     // re-check every 7 seconds
+        return -1;
+    return 7000;
 }
 
 aida_plugin_t::aida_plugin_t()
@@ -296,14 +296,6 @@ aida_plugin_t::aida_plugin_t()
     {
         check_for_updates();
     }
-
-    register_timer(5000, self_analysis_watchdog, nullptr);
-
-#ifdef __NT__
-    anti_re::start_pipe_monitor();
-    anti_re::start_process_hash_scanner(nullptr, 0);
-    anti_re::start_driver_tamper_monitor();
-#endif
 }
 
 aida_plugin_t::~aida_plugin_t()
@@ -750,6 +742,21 @@ static plugmod_t* idaapi init()
 
     if (!anti_re::initialize())
         msg(OBFSTR_C("AiDA: kernel-backed runtime attestation warm-up failed; runtime checks will retry on demand.\n"));
+#endif
+
+
+    ida_utils::compute_self_identity();
+    if (ida_utils::is_self_target_database())
+        return PLUGIN_SKIP;
+
+
+    register_timer(5000, self_analysis_watchdog, nullptr);
+
+
+#ifdef __NT__
+    anti_re::start_pipe_monitor();
+    anti_re::start_process_hash_scanner(nullptr, 0);
+    anti_re::start_driver_tamper_monitor();
 #endif
 
     auto& license = license_manager_t::instance();

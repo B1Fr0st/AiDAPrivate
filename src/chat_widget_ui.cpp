@@ -140,12 +140,12 @@ static QByteArray chat_action_svg(chat_action_icon_t icon, bool dark_theme)
     {
     case chat_action_icon_t::undo:
         return dark_theme
-            ? QByteArrayLiteral(R"svg(<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M3 10h10a5 5 0 0 1 0 10H9M3 10l4-4M3 10l4 4" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>)svg")
-            : QByteArrayLiteral(R"svg(<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M3 10h10a5 5 0 0 1 0 10H9M3 10l4-4M3 10l4 4" stroke="#000000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>)svg");
+            ? QByteArrayLiteral(R"svg(<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http:
+            : QByteArrayLiteral(R"svg(<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http:
     case chat_action_icon_t::copy:
         return dark_theme
-            ? QByteArrayLiteral(R"svg(<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><rect x="9" y="9" width="13" height="13" rx="2" stroke="#ffffff" stroke-width="2" fill="none"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>)svg")
-            : QByteArrayLiteral(R"svg(<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><rect x="9" y="9" width="13" height="13" rx="2" stroke="#000000" stroke-width="2" fill="none"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" stroke="#000000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>)svg");
+            ? QByteArrayLiteral(R"svg(<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http:
+            : QByteArrayLiteral(R"svg(<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http:
     }
 
     return {};

@@ -1790,7 +1790,7 @@ namespace ida_utils
 
     bool is_self_target_database()
     {
-        // ---- Layer 1: Filename patterns (enhanced) ----
+
         char input_file[QMAXPATH] = {};
         get_input_file_path(input_file, sizeof(input_file));
         if (input_file[0] != '\0')
@@ -1819,7 +1819,7 @@ namespace ida_utils
             }
         }
 
-        // ---- Layer 2: MD5 / SHA-256 self-hash comparison ----
+
 #ifdef __NT__
         {
             auto& id = self_identity();
@@ -1848,8 +1848,7 @@ namespace ida_utils
         }
 #endif
 
-        // ---- Layer 3: Export-table fingerprint ----
-        //   AiDA exports exactly one symbol: "PLUGIN" (DATA)
+
         {
             size_t nentries = get_entry_qty();
             if (nentries == 1)
@@ -1859,15 +1858,13 @@ namespace ida_utils
                 if (get_entry_name(&ename, ord) > 0
                     && ename == OBFSTR_C("PLUGIN"))
                 {
-                    // Single PLUGIN export — strong IDA-plugin indicator;
-                    // correlate with Layer 4 for confirmation.
-                    // (fall through to byte-pattern scan)
+
+
                 }
             }
         }
 
-        // ---- Layer 4: Unique byte-constant fingerprints ----
-        //   Scan .rdata / .data for known AiDA compile-time constants.
+
         {
             static const uint8_t FP_CFG[] = {
                 0xA3, 0x7B, 0x1E, 0xD4, 0x5F, 0x92, 0xC8, 0x06,
@@ -1886,7 +1883,7 @@ namespace ida_utils
 
             if (fp_hits >= 1)
             {
-                // Correlate: if we ALSO have the single PLUGIN export
+
                 size_t nentries = get_entry_qty();
                 bool single_plugin = false;
                 if (nentries == 1)
@@ -1897,8 +1894,8 @@ namespace ida_utils
                         && ename == OBFSTR_C("PLUGIN"))
                         single_plugin = true;
                 }
-                // Any fingerprint hit + PLUGIN export = confirmed AiDA
-                // Two fingerprint hits alone = confirmed AiDA
+
+
                 if (single_plugin || fp_hits >= 2)
                 {
                     anti_re::enforce_self_analysis_violation();

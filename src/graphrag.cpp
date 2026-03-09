@@ -45,10 +45,6 @@ static bool has_any(const std::vector<std::string>& vec, const std::set<std::str
 }
 
 
-// ============================================================================
-//  VectorStore
-// ============================================================================
-
 float VectorStore::dot_product(const float* a, const float* b, int n)
 {
     float sum = 0.0f;
@@ -247,10 +243,6 @@ bool VectorStore::load_from_file(const std::string& path)
 }
 
 
-// ============================================================================
-//  LocalVectorizer  (TF-IDF with feature hashing — zero-API-cost fallback)
-// ============================================================================
-
 std::vector<std::string> LocalVectorizer::tokenize(const std::string& text)
 {
     std::vector<std::string> tokens;
@@ -434,10 +426,6 @@ bool LocalVectorizer::load_from_file(const std::string& path)
 }
 
 
-// ============================================================================
-//  EmbeddingClient  (OpenAI-compatible /v1/embeddings API)
-// ============================================================================
-
 EmbeddingClient::EmbeddingClient()
 {
     configure();
@@ -578,10 +566,6 @@ std::vector<std::vector<float>> EmbeddingClient::embed_batch(const std::vector<s
     return all_embeddings;
 }
 
-
-// ============================================================================
-//  VectorStore / LocalVectorizer singletons + helper functions
-// ============================================================================
 
 VectorStore& get_vector_store()
 {
@@ -1392,12 +1376,12 @@ std::vector<graph_node_t*> GraphStore::search_nodes(const std::string& binary_ha
         tokens.push_back(tok);
     }
 
-    // Helper to check if any token matches a string (case-insensitive)
+
     auto match_lower = [&](const std::string& text_lower, const std::string& t) -> bool {
         return text_lower.find(t) != std::string::npos;
     };
 
-    // Helper to search a vector of strings
+
     auto match_vec = [&](const std::vector<std::string>& vec, const std::string& t) -> bool {
         for (auto& s : vec)
         {
@@ -1421,35 +1405,35 @@ std::vector<graph_node_t*> GraphStore::search_nodes(const std::string& binary_ha
         std::string summary_lower = node.llm_summary;
         std::transform(summary_lower.begin(), summary_lower.end(), summary_lower.begin(), ::tolower);
 
-        // Pre-lowercase raw_code once per node
+
         std::string code_lower;
         bool code_lowered = false;
 
         for (auto& t : tokens)
         {
-            // Name match (highest weight)
+
             if (match_lower(name_lower, t)) score += 5;
 
-            // Summary match
+
             if (match_lower(summary_lower, t)) score += 3;
 
-            // Security flags
+
             if (match_vec(node.security_flags, t)) score += 2;
 
-            // Extracted IOCs: URLs, IPs, file paths, domains, registry keys
+
             if (match_vec(node.urls, t))           score += 4;
             if (match_vec(node.ip_addresses, t))   score += 4;
             if (match_vec(node.file_paths, t))     score += 4;
             if (match_vec(node.domains, t))        score += 4;
             if (match_vec(node.registry_keys, t))  score += 4;
 
-            // API names
+
             if (match_vec(node.network_apis, t))   score += 3;
             if (match_vec(node.file_io_apis, t))   score += 3;
             if (match_vec(node.crypto_apis, t))    score += 3;
             if (match_vec(node.process_apis, t))   score += 3;
 
-            // Raw code search (decompiled output — catches strings, instructions, constants)
+
             if (!node.raw_code.empty())
             {
                 if (!code_lowered)
@@ -2635,7 +2619,7 @@ nlohmann::json QueryEngine::search_semantic(const std::string& binary_hash,
     auto& vs = get_vector_store();
     nlohmann::json j = nlohmann::json::array();
 
-    // Helper to enrich a search result entry with matched IOCs/APIs
+
     auto enrich_entry = [](nlohmann::json& entry, const graph_node_t* n) {
         if (!n->urls.empty())           entry["urls"] = n->urls;
         if (!n->ip_addresses.empty())   entry["ip_addresses"] = n->ip_addresses;
@@ -2649,12 +2633,12 @@ nlohmann::json QueryEngine::search_semantic(const std::string& binary_hash,
         if (!n->activity_profile.empty()) entry["activity_profile"] = n->activity_profile;
     };
 
-    // Try real vector search first
+
     if (vs.size() > 0)
     {
         std::vector<float> query_vec;
 
-        // Try API embeddings first, then local vectorizer
+
         EmbeddingClient ec;
         if (ec.is_available())
         {
@@ -2691,7 +2675,7 @@ nlohmann::json QueryEngine::search_semantic(const std::string& binary_hash,
         }
     }
 
-    // Fallback to keyword search
+
     auto results = m_store.search_nodes(binary_hash, query, limit);
     for (auto* n : results)
     {
@@ -2717,7 +2701,7 @@ nlohmann::json QueryEngine::get_similar_functions(const std::string& binary_hash
 
     nlohmann::json j = nlohmann::json::array();
 
-    // Try vector similarity first
+
     auto& vs = get_vector_store();
     if (vs.size() > 0 && vs.has(source->id))
     {
@@ -2757,7 +2741,7 @@ nlohmann::json QueryEngine::get_similar_functions(const std::string& binary_hash
         }
     }
 
-    // Fallback: graph-based similarity
+
     std::set<int> seen = {source->id};
 
     auto callers = m_store.get_callers(binary_hash, source->id);

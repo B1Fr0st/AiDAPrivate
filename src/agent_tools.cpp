@@ -15618,7 +15618,7 @@ tool_result_t index_function(const json& params)
     auto* node = extractor.extract_function(*addr, hash);
     if (!node) return tool_result_t::error(OBFSTR("Failed to extract function"));
 
-    // Generate embedding for this single function
+
     auto& vs = graphrag::get_vector_store();
     std::string text = graphrag::build_embedding_text(*node);
 

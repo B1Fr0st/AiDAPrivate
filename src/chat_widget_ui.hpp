@@ -49,7 +49,7 @@ protected:
 
     void wheelEvent(QWheelEvent* e) override
     {
-        // Let the outer chat scroller handle wheel movement.
+
         e->ignore();
     }
 
