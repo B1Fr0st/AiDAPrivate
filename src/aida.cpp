@@ -20,6 +20,34 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL,
 }
 #endif
 
+#ifdef __NT__
+static bool has_expected_plugin_filename()
+{
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&has_expected_plugin_filename),
+            &module) || module == nullptr)
+    {
+        return false;
+    }
+
+    wchar_t module_path[MAX_PATH] = {};
+    if (GetModuleFileNameW(module, module_path, MAX_PATH) == 0)
+        return false;
+
+    const wchar_t* base_name = module_path;
+    for (const wchar_t* p = module_path; *p != L'\0'; ++p)
+    {
+        if (*p == L'\\' || *p == L'/')
+            base_name = p + 1;
+    }
+
+    return wcscmp(base_name, L"AiDA.dll") == 0;
+}
+#endif
+
 extern "C" int __stdcall simpleline_place_t__compare2(
     const simpleline_place_t *a,
     const place_t *b,
@@ -731,6 +759,14 @@ void aida_plugin_t::unregister_actions()
 
 static plugmod_t* idaapi init()
 {
+#ifdef __NT__
+    if (!has_expected_plugin_filename())
+    {
+        msg(OBFSTR_C("AiDA: plugin filename mismatch. Expected exact name: AiDA.dll\n"));
+        return PLUGIN_SKIP;
+    }
+#endif
+
     g_settings.load_from_file();
 
 #ifdef __NT__

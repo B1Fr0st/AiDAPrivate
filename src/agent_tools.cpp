@@ -2,6 +2,7 @@
 #include "ida_utils.hpp"
 #include "graphrag.hpp"
 #include "analysis_db.hpp"
+#include "anti_re.hpp"
 #include "rlhf.hpp"
 #include <allins.hpp>
 #include <iomanip>
@@ -10461,6 +10462,8 @@ tool_result_t driver_read_memory(const json& params)
     if (size > 65536)
         return tool_result_t::error(OBFSTR("Size too large (max 65536)"));
 
+    anti_re::guard_driver_self_access(device->get_process_id(), *ea_opt, size);
+
     std::vector<std::uint8_t> buffer(size);
     std::size_t bytes_read = device->read_raw(*ea_opt, buffer.data(), size);
     if (bytes_read == 0)
@@ -10503,6 +10506,8 @@ tool_result_t driver_write_memory(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
+
+    anti_re::guard_driver_self_access(device->get_process_id(), *ea_opt, 1);
 
     std::string hex_bytes = params["bytes"].get<std::string>();
     hex_bytes.erase(std::remove(hex_bytes.begin(), hex_bytes.end(), ' '), hex_bytes.end());
@@ -11664,6 +11669,8 @@ tool_result_t driver_dump_module(const json& params)
     if (base == 0 || base == BADADDR)
         return tool_result_t::error(OBFSTR("Invalid module base. Provide 'address' or attach to a process first."));
 
+    anti_re::guard_driver_self_module(device->get_process_id(), static_cast<std::uint64_t>(base));
+
     if (!have_resolved_module)
         have_resolved_module = find_ldr_module_by_base(static_cast<std::uint64_t>(base), &resolved_module);
 
@@ -12182,6 +12189,8 @@ tool_result_t driver_scan_pattern(const json& params)
         if (e) end_addr = *e;
     }
 
+    anti_re::guard_driver_self_access(device->get_process_id(), start_addr, end_addr - start_addr);
+
     std::vector<std::uint8_t> pat;
     std::vector<bool> mask;
     {
@@ -12253,6 +12262,8 @@ tool_result_t driver_read_string(const json& params)
     std::size_t max_len = params.value("max_length", 512);
     std::string type    = params.value("type", "auto");
 
+    anti_re::guard_driver_self_access(device->get_process_id(), *ea_opt, max_len * 2 + 4);
+
     std::vector<std::uint8_t> buf(max_len * 2 + 4, 0);
     std::size_t got = device->read_raw(*ea_opt, buf.data(), buf.size());
     if (got == 0)
@@ -12319,12 +12330,15 @@ tool_result_t driver_read_pointer_chain(const json& params)
         }
     }
 
+    anti_re::guard_driver_self_access(device->get_process_id(), *ea_opt, 8);
+
     json chain = json::array();
     std::uint64_t current = *ea_opt;
     chain.push_back({{"step", 0}, {"address", helpers::format_address(current)}, {"type", "base"}});
 
     for (std::size_t i = 0; i < offsets.size(); i++)
     {
+        anti_re::guard_driver_self_access(device->get_process_id(), current, 8);
         std::uint64_t ptr = device->read<std::uint64_t>(current);
         if (ptr == 0)
         {
@@ -13703,6 +13717,8 @@ tool_result_t driver_call_function(const json& params)
 
     std::uint64_t func_addr = static_cast<std::uint64_t>(*func_opt);
 
+    anti_re::guard_driver_self_access(device->get_process_id(), func_addr, 1);
+
     std::uint64_t args[4] = {0, 0, 0, 0};
     const char* arg_names[] = {"arg1", "arg2", "arg3", "arg4"};
     for (int i = 0; i < 4; ++i)
@@ -13920,6 +13936,8 @@ tool_result_t driver_query_memory(const json& params)
     if (address == 0)
         address = device->get_base_address();
 
+    anti_re::guard_driver_self_access(device->get_process_id(), address, 1);
+
     voyager::device_t::memory_region_info info{};
     if (!device->query_memory(address, info))
         return tool_result_t::error(OBFSTR("Failed to query memory at ") + helpers::format_address(static_cast<ea_t>(address)));
@@ -13976,6 +13994,8 @@ tool_result_t driver_protect_memory(const json& params)
         else
             size = params["size"].get<std::uint64_t>();
     }
+
+    anti_re::guard_driver_self_access(device->get_process_id(), address, size);
 
     std::uint32_t new_protect = 0x40;
     if (params.contains("protect")) {
@@ -14108,6 +14128,8 @@ tool_result_t driver_set_hw_breakpoint(const json& params)
         address = helpers::parse_address(params["address"].get<std::string>()).value_or(0);
     if (address == 0) return tool_result_t::error(OBFSTR("Address is required"));
 
+    anti_re::guard_driver_self_access(device->get_process_id(), address, 1);
+
     int index = 0;
     if (params.contains("index")) index = params["index"].get<int>();
 
@@ -14184,6 +14206,8 @@ tool_result_t driver_resolve_export(const json& params)
     if (export_name.empty())
         return tool_result_t::error(OBFSTR("Export name required"));
 
+    anti_re::guard_driver_self_module(device->get_process_id(), module_base);
+
     std::uint64_t addr = device->resolve_export(module_base, export_name.c_str());
     if (addr == 0)
         return tool_result_t::error(OBFSTR("Export '") + export_name + OBFSTR("' not found"));
@@ -14204,6 +14228,8 @@ tool_result_t driver_virtual_to_physical(const json& params)
     if (params.contains("address"))
         vaddr = helpers::parse_address(params["address"].get<std::string>()).value_or(0);
     if (vaddr == 0) return tool_result_t::error(OBFSTR("Address is required"));
+
+    anti_re::guard_driver_self_access(device->get_process_id(), vaddr, 1);
 
     std::uint64_t paddr = device->virtual_to_physical(vaddr);
     if (paddr == 0)

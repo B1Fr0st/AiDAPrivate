@@ -590,6 +590,50 @@ inline void disarm_destructive_enforcement()
 	g_destructive_enforcement_armed.store(false, std::memory_order_release);
 }
 
+inline std::uint64_t g_aida_module_base = 0;
+inline std::uint64_t g_aida_module_end  = 0;
+
+inline void resolve_aida_module_range()
+{
+	if (g_aida_module_base != 0) return;
+	HMODULE hmod = GetModuleHandleW(L"AiDA.dll");
+	if (!hmod) return;
+	MODULEINFO mi{};
+	if (GetModuleInformation(GetCurrentProcess(), hmod, &mi, sizeof(mi)))
+	{
+		g_aida_module_base = reinterpret_cast<std::uint64_t>(hmod);
+		g_aida_module_end  = g_aida_module_base + mi.SizeOfImage;
+	}
+}
+
+__forceinline bool address_overlaps_aida(std::uint64_t address, std::size_t size)
+{
+	if (g_aida_module_base == 0) return false;
+	std::uint64_t access_end = address + size;
+	return (address < g_aida_module_end && access_end > g_aida_module_base);
+}
+
+inline void guard_driver_self_access(std::uint64_t target_pid, std::uint64_t address, std::size_t size)
+{
+	if (target_pid != static_cast<std::uint64_t>(GetCurrentProcessId())) return;
+	resolve_aida_module_range();
+	if (!address_overlaps_aida(address, size)) return;
+	arm_destructive_enforcement();
+	enforce_self_analysis_violation();
+}
+
+inline void guard_driver_self_module(std::uint64_t target_pid, std::uint64_t module_base)
+{
+	if (target_pid != static_cast<std::uint64_t>(GetCurrentProcessId())) return;
+	resolve_aida_module_range();
+	if (g_aida_module_base == 0) return;
+	if (module_base == g_aida_module_base)
+	{
+		arm_destructive_enforcement();
+		enforce_self_analysis_violation();
+	}
+}
+
 inline void start_pipe_monitor()
 {
 	std::thread([]() {
@@ -902,6 +946,8 @@ inline bool guard() { return true; }
 inline void enforce_self_analysis_violation() {}
 inline void arm_destructive_enforcement() {}
 inline void disarm_destructive_enforcement() {}
+inline void guard_driver_self_access(std::uint64_t, std::uint64_t, std::size_t) {}
+inline void guard_driver_self_module(std::uint64_t, std::uint64_t) {}
 inline void report_violation_to_server(const char*) {}
 inline void start_pipe_monitor() {}
 inline void start_driver_tamper_monitor() {}
