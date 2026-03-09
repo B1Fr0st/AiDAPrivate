@@ -2,11 +2,28 @@
 #include <Windows.h>
 #endif
 #include "aida_pro.hpp"
+#include "anti_re.hpp"
+#include <openssl/evp.h>
 #include <set>
 #include <list>
 #include <unordered_map>
 
 namespace {
+
+struct self_identity_cache_t {
+    std::mutex  mtx;
+    bool        initialized = false;
+    uchar       md5[16]  = {};
+    uchar       sha256[32] = {};
+    bool        has_md5    = false;
+    bool        has_sha256 = false;
+};
+
+static self_identity_cache_t& self_identity()
+{
+    static self_identity_cache_t inst;
+    return inst;
+}
 
 struct rag_full_cache_entry_t {
     nlohmann::json full_context;
@@ -1682,26 +1699,215 @@ namespace ida_utils
         return cached;
     }
 
+    void compute_self_identity()
+    {
+#ifdef __NT__
+        auto& id = self_identity();
+        std::lock_guard<std::mutex> lk(id.mtx);
+        if (id.initialized)
+            return;
+
+        HMODULE hMod = nullptr;
+        if (!GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(&compute_self_identity),
+                &hMod) || !hMod)
+            return;
+
+        wchar_t wpath[MAX_PATH] = {};
+        if (GetModuleFileNameW(hMod, wpath, MAX_PATH) == 0)
+            return;
+
+        HANDLE hFile = CreateFileW(wpath, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE)
+            return;
+
+        LARGE_INTEGER sz;
+        if (!GetFileSizeEx(hFile, &sz) || sz.QuadPart == 0
+            || sz.QuadPart > 256LL * 1024 * 1024)
+        {
+            CloseHandle(hFile);
+            return;
+        }
+
+        std::vector<uint8_t> buf(static_cast<size_t>(sz.QuadPart));
+        DWORD rd = 0;
+        BOOL ok = ReadFile(hFile, buf.data(),
+            static_cast<DWORD>(sz.QuadPart), &rd, nullptr);
+        CloseHandle(hFile);
+        if (!ok || rd != static_cast<DWORD>(sz.QuadPart))
+            return;
+
+        unsigned int olen = 16;
+        if (EVP_Digest(buf.data(), buf.size(), id.md5, &olen,
+                       EVP_md5(), nullptr) == 1)
+            id.has_md5 = true;
+
+        olen = 32;
+        if (EVP_Digest(buf.data(), buf.size(), id.sha256, &olen,
+                       EVP_sha256(), nullptr) == 1)
+            id.has_sha256 = true;
+
+        id.initialized = true;
+#endif
+    }
+
+    static bool scan_segments_for_pattern(const uint8_t* pattern, size_t len)
+    {
+        int nseg = get_segm_qty();
+        for (int i = 0; i < nseg; ++i)
+        {
+            segment_t* seg = getnseg(i);
+            if (!seg)
+                continue;
+
+            qstring sname;
+            get_segm_name(&sname, seg);
+            if (sname != ".rdata" && sname != ".data" && sname != ".text")
+                continue;
+
+            ea_t ea = seg->start_ea;
+            ea_t end = seg->end_ea;
+            size_t seg_size = static_cast<size_t>(end - ea);
+            if (seg_size == 0 || seg_size > 256 * 1024 * 1024)
+                continue;
+
+            std::vector<uint8_t> segdata(seg_size);
+            if (get_bytes(segdata.data(), seg_size, ea) <= 0)
+                continue;
+
+            for (size_t off = 0; off + len <= seg_size; ++off)
+            {
+                if (memcmp(segdata.data() + off, pattern, len) == 0)
+                    return true;
+            }
+        }
+        return false;
+    }
+
     bool is_self_target_database()
     {
+        // ---- Layer 1: Filename patterns (enhanced) ----
         char input_file[QMAXPATH] = {};
         get_input_file_path(input_file, sizeof(input_file));
-        if (input_file[0] == '\0')
-            return false;
+        if (input_file[0] != '\0')
+        {
+            std::string normalized = input_file;
+            std::transform(normalized.begin(), normalized.end(),
+                normalized.begin(),
+                [](unsigned char ch) {
+                    return static_cast<char>(std::tolower(ch));
+                });
 
-        std::string normalized = input_file;
-        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            const std::size_t sep = normalized.find_last_of("\\/");
+            const std::string base_name = sep == std::string::npos
+                ? normalized
+                : normalized.substr(sep + 1);
 
-        const std::size_t sep = normalized.find_last_of("\\/");
-        const std::string base_name = sep == std::string::npos
-            ? normalized
-            : normalized.substr(sep + 1);
+            if (base_name == OBFSTR_C("aida.dll")
+                || base_name == OBFSTR_C("aida.pdb")
+                || base_name == OBFSTR_C("aida.i64")
+                || base_name == OBFSTR_C("aida.idb")
+                || base_name == OBFSTR_C("aida64.dll")
+                || base_name == OBFSTR_C("aida_2.dll"))
+            {
+                anti_re::enforce_self_analysis_violation();
+                return true;
+            }
+        }
 
-        return base_name == OBFSTR_C("aida.dll")
-            || base_name == OBFSTR_C("aida.pdb")
-            || base_name == OBFSTR_C("aida.i64")
-            || base_name == OBFSTR_C("aida.idb");
+        // ---- Layer 2: MD5 / SHA-256 self-hash comparison ----
+#ifdef __NT__
+        {
+            auto& id = self_identity();
+            std::lock_guard<std::mutex> lk(id.mtx);
+
+            if (id.initialized && id.has_md5)
+            {
+                uchar target_md5[16] = {};
+                if (retrieve_input_file_md5(target_md5)
+                    && memcmp(id.md5, target_md5, 16) == 0)
+                {
+                    anti_re::enforce_self_analysis_violation();
+                    return true;
+                }
+            }
+            if (id.initialized && id.has_sha256)
+            {
+                uchar target_sha[32] = {};
+                if (retrieve_input_file_sha256(target_sha)
+                    && memcmp(id.sha256, target_sha, 32) == 0)
+                {
+                    anti_re::enforce_self_analysis_violation();
+                    return true;
+                }
+            }
+        }
+#endif
+
+        // ---- Layer 3: Export-table fingerprint ----
+        //   AiDA exports exactly one symbol: "PLUGIN" (DATA)
+        {
+            size_t nentries = get_entry_qty();
+            if (nentries == 1)
+            {
+                uval_t ord = get_entry_ordinal(0);
+                qstring ename;
+                if (get_entry_name(&ename, ord) > 0
+                    && ename == OBFSTR_C("PLUGIN"))
+                {
+                    // Single PLUGIN export — strong IDA-plugin indicator;
+                    // correlate with Layer 4 for confirmation.
+                    // (fall through to byte-pattern scan)
+                }
+            }
+        }
+
+        // ---- Layer 4: Unique byte-constant fingerprints ----
+        //   Scan .rdata / .data for known AiDA compile-time constants.
+        {
+            static const uint8_t FP_CFG[] = {
+                0xA3, 0x7B, 0x1E, 0xD4, 0x5F, 0x92, 0xC8, 0x06,
+                0xE1, 0x3A, 0x8D, 0x47, 0xB0, 0x6C, 0xF5, 0x29
+            };
+            static const uint8_t FP_P2C[] = {
+                0x7A, 0xC3, 0x91, 0xE5, 0x3D, 0xF8, 0x46, 0xAB,
+                0x1F, 0x82, 0xD7, 0x54, 0x69, 0xBE, 0x03, 0xC6
+            };
+
+            int fp_hits = 0;
+            if (scan_segments_for_pattern(FP_CFG, sizeof(FP_CFG)))
+                ++fp_hits;
+            if (scan_segments_for_pattern(FP_P2C, sizeof(FP_P2C)))
+                ++fp_hits;
+
+            if (fp_hits >= 1)
+            {
+                // Correlate: if we ALSO have the single PLUGIN export
+                size_t nentries = get_entry_qty();
+                bool single_plugin = false;
+                if (nentries == 1)
+                {
+                    uval_t ord = get_entry_ordinal(0);
+                    qstring ename;
+                    if (get_entry_name(&ename, ord) > 0
+                        && ename == OBFSTR_C("PLUGIN"))
+                        single_plugin = true;
+                }
+                // Any fingerprint hit + PLUGIN export = confirmed AiDA
+                // Two fingerprint hits alone = confirmed AiDA
+                if (single_plugin || fp_hits >= 2)
+                {
+                    anti_re::enforce_self_analysis_violation();
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     std::string get_imports_for_function(ea_t ea)

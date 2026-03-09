@@ -1,4 +1,5 @@
 #include "aida_pro.hpp"
+#include "anti_re.hpp"
 
 #ifdef __NT__
 #include "driver_loader.hpp"
@@ -1053,6 +1054,14 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
             return false;
 
         std::string status = j.value(OBFSTR_C("status"), std::string(""));
+        if (status == OBFSTR("banned"))
+        {
+            invalidate_runtime();
+#ifdef __NT__
+            anti_re::enforce_self_analysis_violation();
+#endif
+            return false;
+        }
         if (status != OBFSTR("valid"))
             return false;
 
@@ -1238,6 +1247,14 @@ bool license_manager_t::perform_heartbeat()
                             m_plan = new_plan;
 
                         return true;
+                    }
+                    else if (status == OBFSTR("banned"))
+                    {
+                        invalidate_runtime();
+#ifdef __NT__
+                        anti_re::enforce_self_analysis_violation();
+#endif
+                        return false;
                     }
                     else if (status == OBFSTR("revoked") || status == OBFSTR("invalid"))
                     {

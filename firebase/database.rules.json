@@ -12,6 +12,32 @@
         ".write": false
       }
     },
+    "bans": {
+      "hwid": {
+        "$hwid": {
+          ".read": false,
+          ".write": false
+        }
+      },
+      "ip": {
+        "$ip": {
+          ".read": false,
+          ".write": false
+        }
+      }
+    },
+    "violations": {
+      "$id": {
+        ".read": false,
+        ".write": false
+      }
+    },
+    "watermarks": {
+      "$wm": {
+        ".read": false,
+        ".write": false
+      }
+    },
     ".read": false,
     ".write": false
   }

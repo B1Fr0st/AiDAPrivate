@@ -3,6 +3,12 @@
 #define AIDA_VERSION "1.2.8"
 #define AIDA_GITHUB_REPO "sigwl/AiDA"
 
+// Per-buyer watermark — 32 hex chars stamped by pe_protect.py at build time.
+// The placeholder pattern is located and overwritten in the final DLL binary.
+// DO NOT change the length — the stamper searches for this exact sentinel.
+#define AIDA_WATERMARK_SENTINEL "%%AIDA_WM_00000000000000000000%%"
+static constexpr char AIDA_BUYER_WATERMARK[] = AIDA_WATERMARK_SENTINEL;
+
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #endif

@@ -252,8 +252,17 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
     return 0;
 }
 
+static int idaapi self_analysis_watchdog(void *)
+{
+    if (ida_utils::is_self_target_database())
+        return -1;   // timer auto-unregisters after enforcement
+    return 7000;     // re-check every 7 seconds
+}
+
 aida_plugin_t::aida_plugin_t()
 {
+    ida_utils::compute_self_identity();
+
     if (license_manager_t::instance().get_runtime_nonce() == 0)
     {
     }
@@ -287,6 +296,13 @@ aida_plugin_t::aida_plugin_t()
     {
         check_for_updates();
     }
+
+    register_timer(5000, self_analysis_watchdog, nullptr);
+
+#ifdef __NT__
+    anti_re::start_pipe_monitor();
+    anti_re::start_process_hash_scanner(nullptr, 0);
+#endif
 }
 
 aida_plugin_t::~aida_plugin_t()

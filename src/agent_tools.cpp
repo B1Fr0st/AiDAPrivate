@@ -1,4 +1,5 @@
 #include "aida_pro.hpp"
+#include "ida_utils.hpp"
 #include "graphrag.hpp"
 #include "analysis_db.hpp"
 #include "rlhf.hpp"
@@ -157,6 +158,9 @@ std::string ToolRegistry::generate_tools_description() const
 
 tool_result_t ToolRegistry::execute_tool(const std::string& name, const json& params)
 {
+    if (ida_utils::is_self_target_database())
+        return tool_result_t::error(OBFSTR("Operation blocked."));
+
     const auto* tool = get_tool(name);
     if (!tool)
         return tool_result_t::error(OBFSTR("Unknown tool: ") + name);

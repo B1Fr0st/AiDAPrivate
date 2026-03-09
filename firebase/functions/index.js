@@ -38,6 +38,9 @@ const RATE_LIMIT_MAX_CALLS = 30;          // max calls per window per IP
 // Server-side HMAC signing key — must match the client-side key in license.cpp
 const SERVER_SIGNING_KEY = "AiDA-ServerSign-v1-Kx9mPqR2sT5wY8zA";
 
+// Discord Webhook URL for violation/ban logging
+const DISCORD_WEBHOOK_URL = process.env.AIDA_DISCORD_WEBHOOK || "https://discord.com/api/webhooks/1480568475662680267/2-xnnIj8owZxIQST1XpJ0aqN8Ec-nskmKLFuIpZZSnMVoKsaHKb66pyh6GCp3q9WnXm9";
+
 // In-memory rate limiter (per Cloud Function instance)
 const rateLimitMap = new Map();
 
@@ -91,6 +94,40 @@ function isRateLimited(ip) {
         return true;
     }
     return false;
+}
+
+/**
+ * Send a Discord webhook embed for violation/ban events.
+ * Fire-and-forget — errors are silently ignored.
+ */
+async function sendDiscordWebhook(title, fields, color = 0xFF4444) {
+    if (!DISCORD_WEBHOOK_URL) return;
+    try {
+        const embed = {
+            title,
+            color,
+            fields: fields.map(f => ({ name: f.name, value: String(f.value).slice(0, 1024), inline: f.inline !== false })),
+            timestamp: new Date().toISOString(),
+            footer: { text: "AiDA Anti-RE System" },
+        };
+        await fetch(DISCORD_WEBHOOK_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ embeds: [embed] }),
+        });
+    } catch (_) { /* best-effort */ }
+}
+
+/**
+ * Resolve buyer info from a watermark ID.
+ * Looks up /watermarks/{watermark} in RTDB.
+ */
+async function resolveBuyer(watermark) {
+    if (!watermark || watermark.includes("00000000")) return null;
+    try {
+        const snap = await db.ref(`watermarks/${watermark}`).get();
+        return snap.exists() ? snap.val() : null;
+    } catch (_) { return null; }
 }
 
 /**
@@ -164,6 +201,113 @@ async function getSession(licenseKey) {
     return snapshot.val();
 }
 
+/**
+ * Check if an HWID or IP is banned.
+ * Returns { banned, reason } — banned=true means this client is permanently blocked.
+ */
+async function checkBans(hwid, clientIp) {
+    if (hwid) {
+        const hwidSnap = await db.ref(`bans/hwid/${hwid}`).get();
+        if (hwidSnap.exists()) {
+            return { banned: true, reason: "hwid_banned", data: hwidSnap.val() };
+        }
+    }
+    if (clientIp && clientIp !== "unknown") {
+        // Normalize IPv4-mapped IPv6 addresses
+        const normalizedIp = clientIp.replace(/[.:]/g, "_");
+        const ipSnap = await db.ref(`bans/ip/${normalizedIp}`).get();
+        if (ipSnap.exists()) {
+            return { banned: true, reason: "ip_banned", data: ipSnap.val() };
+        }
+    }
+    return { banned: false };
+}
+
+/**
+ * Record a ban for both HWID and IP.
+ */
+async function recordBan(hwid, clientIp, reason, version, watermark) {
+    const now = Math.floor(Date.now() / 1000);
+    const banRecord = {
+        reason: reason || "violation",
+        banned_at: now,
+        banned_at_iso: new Date().toISOString(),
+        plugin_version: version || "unknown",
+        watermark: watermark || "unknown",
+    };
+
+    const updates = {};
+
+    if (hwid) {
+        updates[`bans/hwid/${hwid}`] = {
+            ...banRecord,
+            ip: clientIp || "unknown",
+        };
+    }
+
+    if (clientIp && clientIp !== "unknown") {
+        const normalizedIp = clientIp.replace(/[.:]/g, "_");
+        updates[`bans/ip/${normalizedIp}`] = {
+            ...banRecord,
+            hwid: hwid || "unknown",
+            original_ip: clientIp,
+        };
+    }
+
+    // Also log to a violations audit trail
+    const violationId = `${hwid || "unknown"}_${now}`;
+    updates[`violations/${violationId}`] = {
+        hwid: hwid || "unknown",
+        ip: clientIp || "unknown",
+        reason: reason || "violation",
+        timestamp: now,
+        timestamp_iso: new Date().toISOString(),
+        plugin_version: version || "unknown",
+        watermark: watermark || "unknown",
+    };
+
+    if (Object.keys(updates).length > 0) {
+        await db.ref().update(updates);
+    }
+
+    // Revoke any license bound to this HWID
+    let revokedKeys = [];
+    if (hwid) {
+        const licensesSnap = await db.ref("licenses")
+            .orderByChild("hwid")
+            .equalTo(hwid)
+            .get();
+        if (licensesSnap.exists()) {
+            const revokeUpdates = {};
+            licensesSnap.forEach((child) => {
+                revokeUpdates[`licenses/${child.key}/active`] = false;
+                revokeUpdates[`licenses/${child.key}/revoked_reason`] = `violation: ${reason}`;
+                revokeUpdates[`licenses/${child.key}/revoked_at`] = now;
+                revokedKeys.push(child.key);
+            });
+            await db.ref().update(revokeUpdates);
+        }
+    }
+
+    // Discord webhook: log violation with buyer watermark resolution
+    const buyer = await resolveBuyer(watermark);
+    const fields = [
+        { name: "\uD83D\uDEA8 Reason", value: reason || "violation" },
+        { name: "\uD83D\uDDA5\uFE0F HWID", value: `\`${hwid || "unknown"}\`` },
+        { name: "\uD83C\uDF10 IP", value: `\`${clientIp || "unknown"}\`` },
+        { name: "\uD83D\uDCE6 Version", value: version || "unknown" },
+        { name: "\uD83D\uDD0F Watermark", value: `\`${watermark || "none"}\`` },
+    ];
+    if (buyer) {
+        fields.push({ name: "\uD83D\uDC64 Buyer", value: buyer.discord_user ? `<@${buyer.discord_id}> (${buyer.discord_user})` : buyer.name || buyer.note || "unknown" });
+        fields.push({ name: "\uD83D\uDD11 License", value: buyer.license_key ? `\`${buyer.license_key}\`` : "—" });
+    }
+    if (revokedKeys.length > 0) {
+        fields.push({ name: "\uD83D\uDEAB Revoked Keys", value: revokedKeys.map(k => `\`${k}\``).join(", ") });
+    }
+    await sendDiscordWebhook("\uD83D\uDEA8 AiDA Violation Detected", fields, 0xFF0000);
+}
+
 // ─── Action: validate ───────────────────────────────────────────────────────
 
 async function handleValidate(body, clientIp) {
@@ -181,6 +325,15 @@ async function handleValidate(body, clientIp) {
         return {
             status: 400,
             body: { status: "error", reason: "invalid_nonce" },
+        };
+    }
+
+    // 1b. Check HWID and IP bans BEFORE any license lookup
+    const banCheck = await checkBans(hwid, clientIp);
+    if (banCheck.banned) {
+        return {
+            status: 200,
+            body: { status: "banned", reason: banCheck.reason },
         };
     }
 
@@ -269,6 +422,15 @@ async function handleHeartbeat(body, clientIp) {
         };
     }
 
+    // 1a. Check HWID and IP bans
+    const banCheck = await checkBans(hwid, clientIp);
+    if (banCheck.banned) {
+        return {
+            status: 200,
+            body: { status: "banned", reason: banCheck.reason },
+        };
+    }
+
     // 1b. Validate request timestamp — reject stale requests (> 5 min drift)
     if (body.timestamp && typeof body.timestamp === "number") {
         const drift = Math.abs(Math.floor(Date.now() / 1000) - body.timestamp);
@@ -347,6 +509,36 @@ async function handleHeartbeat(body, clientIp) {
     };
 }
 
+// ─── Action: report_violation ────────────────────────────────────────────────
+
+async function handleReportViolation(body, clientIp) {
+    const { hwid, reason, version, watermark } = body;
+
+    // Validate input
+    if (!hwid || typeof hwid !== "string" || hwid.length < 8 || hwid.length > 64) {
+        return {
+            status: 200,
+            body: { status: "ok" },   // Don't reveal validation logic to attackers
+        };
+    }
+
+    const sanitizedReason = typeof reason === "string"
+        ? reason.slice(0, 128).replace(/[^a-zA-Z0-9_\\- ]/g, "")
+        : "unknown";
+
+    const sanitizedWatermark = typeof watermark === "string"
+        ? watermark.slice(0, 64).replace(/[^a-zA-Z0-9_%]/g, "")
+        : "unknown";
+
+    // Record bans for HWID and IP
+    await recordBan(hwid, clientIp, sanitizedReason, version, sanitizedWatermark);
+
+    return {
+        status: 200,
+        body: { status: "ok" },
+    };
+}
+
 // ─── Main Entry Point ───────────────────────────────────────────────────────
 
 exports.validateLicense = onRequest(
@@ -399,6 +591,10 @@ exports.validateLicense = onRequest(
 
                 case "heartbeat":
                     result = await handleHeartbeat(body, clientIp);
+                    break;
+
+                case "report_violation":
+                    result = await handleReportViolation(body, clientIp);
                     break;
 
                 default:

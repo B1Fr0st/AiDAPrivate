@@ -1,4 +1,5 @@
 #include "aida_pro.hpp"
+#include "ida_utils.hpp"
 
 #include <queue>
 
@@ -191,6 +192,9 @@ static agent_tools::tool_result_t execute_tool_in_main_thread(
     const std::string& name,
     const json& params)
 {
+    if (ida_utils::is_self_target_database())
+        return agent_tools::tool_result_t::error("Operation blocked.");
+
     const auto* tool_def = agent_tools::ToolRegistry::instance().get_tool(name);
     if (!tool_def)
         return agent_tools::tool_result_t::error("Unknown tool: " + name);

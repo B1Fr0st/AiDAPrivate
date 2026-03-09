@@ -32,6 +32,7 @@ namespace ida_utils
 
     std::string get_binary_metadata();
     bool is_self_target_database();
+    void compute_self_identity();
     std::string get_imports_for_function(ea_t ea);
     std::string get_type_context_for_function(ea_t ea);
     nlohmann::json get_rag_context(ea_t ea, const settings_t& settings, const nlohmann::json* cached_context = nullptr);
