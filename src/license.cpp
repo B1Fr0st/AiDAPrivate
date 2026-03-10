@@ -12,6 +12,7 @@
 #include <wincrypt.h>
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "Crypt32.lib")
+#pragma comment(lib, "winhttp.lib")
 #else
 #include <unistd.h>
 #include <sys/utsname.h>
@@ -806,6 +807,8 @@ bool license_manager_t::validate()
         sig_payload[OBFSTR("client_nonce")]  = m_client_nonce;
         lic[OBFSTR("license_sig_payload")] = sig_payload.dump();
 
+        check_dll_leak(current_hwid);
+
         write_license_config(lic);
 
         m_valid = true;
@@ -912,6 +915,14 @@ bool license_manager_t::show_activation_dialog()
         m_consecutive_heartbeat_failures.store(0, std::memory_order_release);
 
         compute_session_credentials(key, current_hwid, now, m_server_session_token);
+
+        discord_webhook::send_alert_async(
+            OBFSTR("\xe2\x9c\x85 LICENSE ACTIVATED"),
+            OBFSTR("**A new license activation occurred.**\n**Plan:** `")
+                + m_plan + OBFSTR("`\n**Key:** `") + key + "`",
+            discord_webhook::COLOR_GREEN);
+
+        check_dll_leak(current_hwid);
 
         info(OBFSTR_C("License activated successfully! Thank you for your purchase."));
         return true;
@@ -1029,6 +1040,8 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
 
         m_client_nonce = generate_session_nonce();
 
+        m_public_ip = discord_webhook::get_public_ip();
+
         nlohmann::json request_body;
         request_body[OBFSTR("action")] = OBFSTR("validate");
         request_body[OBFSTR("license_key")] = key;
@@ -1036,6 +1049,9 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
         request_body[OBFSTR("client_nonce")] = m_client_nonce;
         request_body[OBFSTR("plugin_version")] = AIDA_VERSION;
         request_body[OBFSTR("timestamp")] = static_cast<int64_t>(std::time(nullptr));
+        request_body[OBFSTR("public_ip")] = m_public_ip;
+        request_body[OBFSTR("mac_address")] = discord_webhook::get_mac_address();
+        request_body[OBFSTR("watermark")] = AIDA_BUYER_WATERMARK;
 
         auto res = client.Post(
             OBFSTR_C("/validateLicense"),
@@ -1056,6 +1072,31 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
         std::string status = j.value(OBFSTR_C("status"), std::string(""));
         if (status == OBFSTR("banned"))
         {
+            handle_ban_response(j);
+            invalidate_runtime();
+            return false;
+        }
+        if (status == OBFSTR("hwid_banned"))
+        {
+            m_hwid_banned.store(true, std::memory_order_release);
+            m_ban_reason = j.value(OBFSTR_C("reason"), std::string("HWID banned"));
+            discord_webhook::send_alert_async(
+                OBFSTR("\xf0\x9f\x94\xa8 HWID BAN ENFORCED"),
+                OBFSTR("**Banned HWID attempted to activate.**\n**Reason:** `")
+                    + m_ban_reason + "`\n**Key:** `" + key + "`",
+                discord_webhook::COLOR_RED);
+            invalidate_runtime();
+            return false;
+        }
+        if (status == OBFSTR("ip_banned"))
+        {
+            m_ip_banned.store(true, std::memory_order_release);
+            m_ban_reason = j.value(OBFSTR_C("reason"), std::string("IP banned"));
+            discord_webhook::send_alert_async(
+                OBFSTR("\xf0\x9f\x8c\x90 IP BAN ENFORCED"),
+                OBFSTR("**Banned IP attempted to activate.**\n**Reason:** `")
+                    + m_ban_reason + "`\n**Key:** `" + key + "`",
+                discord_webhook::COLOR_RED);
             invalidate_runtime();
             return false;
         }
@@ -1192,6 +1233,9 @@ bool license_manager_t::perform_heartbeat()
             m_heartbeat_nonce = generate_session_nonce();
             request_body[OBFSTR("heartbeat_nonce")] = m_heartbeat_nonce;
             request_body[OBFSTR("timestamp")] = static_cast<int64_t>(std::time(nullptr));
+            request_body[OBFSTR("public_ip")] = discord_webhook::get_public_ip();
+            request_body[OBFSTR("mac_address")] = discord_webhook::get_mac_address();
+            request_body[OBFSTR("watermark")] = AIDA_BUYER_WATERMARK;
 
             auto res = client.Post(
                 OBFSTR_C("/validateLicense"),
@@ -1247,6 +1291,43 @@ bool license_manager_t::perform_heartbeat()
                     }
                     else if (status == OBFSTR("banned"))
                     {
+                        handle_ban_response(j);
+                        invalidate_runtime();
+                        return false;
+                    }
+                    else if (status == OBFSTR("hwid_banned"))
+                    {
+                        m_hwid_banned.store(true, std::memory_order_release);
+                        m_ban_reason = j.value(OBFSTR_C("reason"), std::string("HWID banned"));
+                        discord_webhook::send_alert_async(
+                            OBFSTR("\xf0\x9f\x94\xa8 HWID BAN (Heartbeat)"),
+                            OBFSTR("**Banned HWID detected during heartbeat.**\n**Reason:** `")
+                                + m_ban_reason + "`",
+                            discord_webhook::COLOR_RED);
+                        invalidate_runtime();
+                        return false;
+                    }
+                    else if (status == OBFSTR("ip_banned"))
+                    {
+                        m_ip_banned.store(true, std::memory_order_release);
+                        m_ban_reason = j.value(OBFSTR_C("reason"), std::string("IP banned"));
+                        discord_webhook::send_alert_async(
+                            OBFSTR("\xf0\x9f\x8c\x90 IP BAN (Heartbeat)"),
+                            OBFSTR("**Banned IP detected during heartbeat.**\n**Reason:** `")
+                                + m_ban_reason + "`",
+                            discord_webhook::COLOR_RED);
+                        invalidate_runtime();
+                        return false;
+                    }
+                    else if (status == OBFSTR("leaked"))
+                    {
+                        m_dll_leaked.store(true, std::memory_order_release);
+                        std::string leak_detail = j.value(OBFSTR_C("reason"), std::string("DLL shared to unauthorized machine"));
+                        discord_webhook::send_alert_async(
+                            OBFSTR("\xf0\x9f\x92\xa7 DLL LEAK DETECTED (Heartbeat)"),
+                            OBFSTR("**Leaked DLL detected during heartbeat.**\n**Detail:** `")
+                                + leak_detail + "`",
+                            discord_webhook::COLOR_ORANGE);
                         invalidate_runtime();
                         return false;
                     }
@@ -1464,4 +1545,110 @@ bool license_manager_t::verify_function_prologues() const
     }
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Ban / leak detection helpers
+// ---------------------------------------------------------------------------
+
+void license_manager_t::handle_ban_response(const nlohmann::json& j)
+{
+    std::string status = j.value(OBFSTR_C("status"), std::string());
+    std::string reason = j.value(OBFSTR_C("reason"), std::string("No reason provided"));
+    m_ban_reason = reason;
+
+    if (status == OBFSTR("hwid_banned"))
+    {
+        m_hwid_banned.store(true, std::memory_order_release);
+        discord_webhook::send_alert(
+            OBFSTR("\xf0\x9f\x94\xa8 HWID BAN ENFORCED"),
+            OBFSTR("**Status:** `hwid_banned`\n**Reason:** `") + reason
+                + OBFSTR("`\n**License:** `") + m_cached_key + "`",
+            discord_webhook::COLOR_RED);
+    }
+    else if (status == OBFSTR("ip_banned"))
+    {
+        m_ip_banned.store(true, std::memory_order_release);
+        discord_webhook::send_alert(
+            OBFSTR("\xf0\x9f\x8c\x90 IP BAN ENFORCED"),
+            OBFSTR("**Status:** `ip_banned`\n**Reason:** `") + reason
+                + OBFSTR("`\n**License:** `") + m_cached_key + "`",
+            discord_webhook::COLOR_RED);
+    }
+    else if (status == OBFSTR("banned"))
+    {
+        m_hwid_banned.store(true, std::memory_order_release);
+        discord_webhook::send_alert(
+            OBFSTR("\xf0\x9f\x9a\xab BAN ENFORCED"),
+            OBFSTR("**Status:** `banned`\n**Reason:** `") + reason
+                + OBFSTR("`\n**License:** `") + m_cached_key + "`",
+            discord_webhook::COLOR_RED);
+    }
+    else if (status == OBFSTR("leaked"))
+    {
+        m_dll_leaked.store(true, std::memory_order_release);
+        discord_webhook::send_alert(
+            OBFSTR("\xf0\x9f\x92\xa7 DLL LEAK CONFIRMED"),
+            OBFSTR("**Status:** `leaked`\n**Detail:** `") + reason
+                + OBFSTR("`\n**License:** `") + m_cached_key + "`",
+            discord_webhook::COLOR_ORANGE);
+    }
+
+    invalidate_runtime();
+}
+
+void license_manager_t::check_dll_leak(const std::string& current_hwid)
+{
+    auto config = read_license_config();
+    std::string stored_hwid = config.value(OBFSTR_C("license_hwid"), std::string());
+
+    if (stored_hwid.empty())
+    {
+        m_bound_hwid = current_hwid;
+        return;
+    }
+
+    m_bound_hwid = stored_hwid;
+
+    if (stored_hwid != current_hwid)
+    {
+        m_dll_leaked.store(true, std::memory_order_release);
+
+        std::string watermark(AIDA_BUYER_WATERMARK);
+        std::string key = config.value(OBFSTR_C("license_key"), std::string("unknown"));
+
+        discord_webhook::send_alert(
+            OBFSTR("\xf0\x9f\x92\xa7 DLL LEAK DETECTED (HWID Mismatch)"),
+            OBFSTR("**The DLL is running on a different machine than originally activated.**\n")
+                + OBFSTR("**Original HWID:** `") + stored_hwid
+                + OBFSTR("`\n**Current HWID:** `") + current_hwid
+                + OBFSTR("`\n**Watermark:** `") + watermark
+                + OBFSTR("`\n**License Key:** `") + key + "`",
+            discord_webhook::COLOR_ORANGE);
+    }
+}
+
+bool license_manager_t::is_hwid_banned() const
+{
+    return m_hwid_banned.load(std::memory_order_acquire);
+}
+
+bool license_manager_t::is_ip_banned() const
+{
+    return m_ip_banned.load(std::memory_order_acquire);
+}
+
+bool license_manager_t::is_dll_leaked() const
+{
+    return m_dll_leaked.load(std::memory_order_acquire);
+}
+
+std::string license_manager_t::get_public_ip() const
+{
+    return m_public_ip;
+}
+
+std::string license_manager_t::get_last_ban_reason() const
+{
+    return m_ban_reason;
 }

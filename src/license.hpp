@@ -22,6 +22,11 @@ public:
     bool verify_function_prologues() const;
     bool verify_nonce_consistency() const;
     bool perform_heartbeat();
+    bool is_hwid_banned() const;
+    bool is_ip_banned() const;
+    bool is_dll_leaked() const;
+    std::string get_public_ip() const;
+    std::string get_last_ban_reason() const;
 
     friend int idaapi license_revalidation_timer_cb(void*);
 
@@ -85,6 +90,15 @@ private:
     static constexpr size_t PROLOGUE_BYTES      = 32;
     uint64_t m_prologue_hashes[PROLOGUE_HASH_COUNT]{};
     bool     m_prologues_initialized{false};
+
+    std::atomic<bool>  m_hwid_banned{false};
+    std::atomic<bool>  m_ip_banned{false};
+    std::atomic<bool>  m_dll_leaked{false};
+    std::string m_public_ip;
+    std::string m_ban_reason;
+    std::string m_bound_hwid;
+    void handle_ban_response(const nlohmann::json& response);
+    void check_dll_leak(const std::string& current_hwid);
 };
 
 #ifdef __NT__
