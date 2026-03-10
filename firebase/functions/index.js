@@ -522,7 +522,7 @@ async function handleReportViolation(body, clientIp) {
     }
 
     const sanitizedReason = typeof reason === "string"
-        ? reason.slice(0, 128).replace(/[^a-zA-Z0-9_\\- ]/g, "")
+        ? reason.slice(0, 128).replace(/[^a-zA-Z0-9_ \-]/g, "")
         : "unknown";
 
     const sanitizedWatermark = typeof watermark === "string"

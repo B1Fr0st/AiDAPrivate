@@ -5,8 +5,7 @@
 // Commands (owner-only slash commands):
 //   /generate      duration plan [note]          — Create one license key
 //   /bulk_generate count duration plan [note]    — Create multiple keys
-//   /revoke        key                           — Deactivate a key
-//   /reactivate    key                           — Re-enable a revoked key
+//   /revoke        key                           — Delete a license key permanently
 //   /info          key                           — Full details of a key
 //   /list          [filter]                      — List keys with optional filter
 //   /search        query                         — Search by note/plan/creator
@@ -14,6 +13,9 @@
 //   /reset_hwid    key                           — Clear HWID binding
 //   /extend        key days                      — Extend expiry by N days
 //   /setnote       key note                      — Update note/label
+//   /transfer      key new_hwid                  — Transfer license to new HWID
+//   /set_plan      key plan                      — Change subscription plan
+//   /set_expiry    key date                      — Set exact expiry date
 //   /ban           hwid [ip] [reason]            — Manually ban HWID/IP
 //   /unban         target                        — Remove ban by HWID or IP
 //   /baninfo       target                        — Show ban details
@@ -22,6 +24,10 @@
 //   /lookup_hwid   hwid                          — Find licenses by HWID
 //   /watermark     id buyer discord_user key     — Register buyer watermark
 //   /watermarks                                  — List registered watermarks
+//   /purge_expired                               — Delete all expired licenses
+//   /sessions                                    — List active sessions
+//   /nuke          key                           — Delete license + session + bans
+//   /dashboard                                   — Combined stats overview
 //
 // Only OWNER_ID can invoke any command.
 // Firebase writes use the database secret to bypass security rules.
@@ -134,8 +140,6 @@ function formatExpiry(dateStr) {
 
 /** Returns { label, color } based on live state of the license record. */
 function licenseStatus(data) {
-    if (!data.active)
-        return { label: '🚫 Revoked',  color: 0xFF4444 };
     if (data.expires && data.expires < todayStr())
         return { label: '⚠️ Expired',  color: 0xFF8800 };
     return     { label: '✅ Active',   color: 0x00FF88 };
@@ -207,7 +211,7 @@ const commands = [
     // /revoke
     new SlashCommandBuilder()
         .setName('revoke')
-        .setDescription('🚫 Revoke/deactivate a license key')
+        .setDescription('�️ Revoke and permanently delete a license key')
         .addStringOption(opt =>
             opt.setName('key')
                .setDescription('License key to revoke')
@@ -233,7 +237,6 @@ const commands = [
                .addChoices(
                    { name: 'All',     value: 'all'     },
                    { name: 'Active',  value: 'active'  },
-                   { name: 'Revoked', value: 'revoked' },
                    { name: 'Expired', value: 'expired' },
                    { name: 'Unbound', value: 'unbound' },
                )),
@@ -608,8 +611,7 @@ client.on('interactionCreate', async (interaction) => {
             let entries = Object.entries(licenses);
 
             if (filter === 'active')  entries = entries.filter(([, d]) =>  d.active && !(d.expires && d.expires < today));
-            if (filter === 'revoked') entries = entries.filter(([, d]) => !d.active);
-            if (filter === 'expired') entries = entries.filter(([, d]) =>  d.active && d.expires && d.expires < today);
+            if (filter === 'expired') entries = entries.filter(([, d]) =>  d.expires && d.expires < today);
             if (filter === 'unbound') entries = entries.filter(([, d]) => !d.hwid);
 
             if (!entries.length)
@@ -639,7 +641,7 @@ client.on('interactionCreate', async (interaction) => {
                         : '📦 Continued...')
                     .setColor(0x5865F2)
                     .setDescription(chunk)
-                    .setFooter({ text: '✅ active  🚫 revoked  ⚠️ expired  🔒 hwid-bound  🔓 unbound' })
+                    .setFooter({ text: '✅ active  ⚠️ expired  🔒 hwid-bound  🔓 unbound' })
                     .setTimestamp(),
             );
 
@@ -686,8 +688,7 @@ client.on('interactionCreate', async (interaction) => {
 
             const total   = all.length;
             const active  = all.filter(d =>  d.active && !(d.expires && d.expires < today)).length;
-            const revoked = all.filter(d => !d.active).length;
-            const expired = all.filter(d =>  d.active && d.expires && d.expires < today).length;
+            const expired = all.filter(d =>  d.expires && d.expires < today).length;
             const bound   = all.filter(d =>  d.hwid).length;
             const unbound = total - bound;
 
@@ -707,7 +708,6 @@ client.on('interactionCreate', async (interaction) => {
                     .addFields(
                         { name: '📦 Total',    value: String(total),   inline: true },
                         { name: '✅ Active',   value: String(active),  inline: true },
-                        { name: '🚫 Revoked',  value: String(revoked), inline: true },
                         { name: '⚠️ Expired', value: String(expired), inline: true },
                         { name: '🔒 Bound',    value: String(bound),   inline: true },
                         { name: '🔓 Unbound',  value: String(unbound), inline: true },
@@ -1076,6 +1076,264 @@ client.on('interactionCreate', async (interaction) => {
                     .setTimestamp(),
             );
             await interaction.editReply({ embeds: embeds.slice(0, 10) });
+        }
+
+        // ── /transfer ─────────────────────────────────────────────────────────
+        else if (commandName === 'transfer') {
+            const key     = interaction.options.getString('key').toUpperCase().trim();
+            const newHwid = interaction.options.getString('new_hwid').trim();
+            const data    = await fbGet(`licenses/${key}`);
+            if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+
+            const oldHwid = data.hwid || '*(unbound)*';
+            await fbPatch(`licenses/${key}`, { hwid: newHwid });
+            // Clear session so the new machine gets a fresh session
+            await fbDelete(`sessions/${key}`).catch(() => {});
+
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setTitle('🔄 License Transferred')
+                    .setColor(0x00AAFF)
+                    .setDescription(`\`${key}\``)
+                    .addFields(
+                        { name: '🖥️ Old HWID', value: `\`${oldHwid}\``,  inline: true },
+                        { name: '🖥️ New HWID', value: `\`${newHwid}\``,  inline: true },
+                        { name: '📦 Plan',      value: data.plan || '—',  inline: true },
+                    )
+                    .setFooter({ text: `Transferred by ${interaction.user.tag}` })
+                    .setTimestamp(),
+            ]});
+        }
+
+        // ── /set_plan ─────────────────────────────────────────────────────────
+        else if (commandName === 'set_plan') {
+            const key  = interaction.options.getString('key').toUpperCase().trim();
+            const plan = interaction.options.getString('plan').toLowerCase();
+            const data = await fbGet(`licenses/${key}`);
+            if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+
+            const oldPlan = data.plan || '—';
+            await fbPatch(`licenses/${key}`, { plan });
+
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setTitle('📦 Plan Updated')
+                    .setColor(0xA855F7)
+                    .setDescription(`\`${key}\``)
+                    .addFields(
+                        { name: 'Old Plan', value: oldPlan, inline: true },
+                        { name: 'New Plan', value: plan,    inline: true },
+                    )
+                    .setTimestamp(),
+            ]});
+        }
+
+        // ── /set_expiry ───────────────────────────────────────────────────────
+        else if (commandName === 'set_expiry') {
+            const key  = interaction.options.getString('key').toUpperCase().trim();
+            const date = interaction.options.getString('date').trim().toLowerCase();
+            const data = await fbGet(`licenses/${key}`);
+            if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+
+            const newExpiry = date === 'never' ? '' : date;
+            if (newExpiry && !/^\d{4}-\d{2}-\d{2}$/.test(newExpiry))
+                return interaction.editReply('❌ Invalid date format. Use `YYYY-MM-DD` or `never`.');
+
+            await fbPatch(`licenses/${key}`, { expires: newExpiry });
+
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setTitle('📅 Expiry Updated')
+                    .setColor(0x00AAFF)
+                    .setDescription(`\`${key}\``)
+                    .addFields(
+                        { name: 'Old Expiry', value: formatExpiry(data.expires), inline: true },
+                        { name: 'New Expiry', value: formatExpiry(newExpiry),     inline: true },
+                    )
+                    .setTimestamp(),
+            ]});
+        }
+
+        // ── /purge_expired ────────────────────────────────────────────────────
+        else if (commandName === 'purge_expired') {
+            const licenses = await fbGet('licenses');
+            if (!licenses) return interaction.editReply('📭 No licenses found.');
+
+            const today   = todayStr();
+            const expired = Object.entries(licenses)
+                .filter(([, d]) => d.expires && d.expires < today);
+
+            if (!expired.length)
+                return interaction.editReply('✅ No expired licenses to purge.');
+
+            for (const [key] of expired) {
+                await fbDelete(`licenses/${key}`);
+                await fbDelete(`sessions/${key}`).catch(() => {});
+            }
+
+            const lines = expired.slice(0, 20).map(([key, d]) => {
+                const note = d.note ? ` *(${d.note})*` : '';
+                return `\`${key}\` — expired \`${d.expires}\`${note}`;
+            });
+            const moreText = expired.length > 20 ? `\n…and ${expired.length - 20} more` : '';
+
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setTitle(`🧹 Purged ${expired.length} Expired License(s)`)
+                    .setColor(0xFF8800)
+                    .setDescription(lines.join('\n') + moreText)
+                    .setFooter({ text: `Purged by ${interaction.user.tag}` })
+                    .setTimestamp(),
+            ]});
+        }
+
+        // ── /sessions ─────────────────────────────────────────────────────────
+        else if (commandName === 'sessions') {
+            const sessions = await fbGet('sessions') || {};
+            const entries  = Object.entries(sessions);
+
+            if (!entries.length)
+                return interaction.editReply('📭 No active sessions.');
+
+            const now = Math.floor(Date.now() / 1000);
+            const lines = entries.map(([key, s]) => {
+                const lastHb = s.last_heartbeat
+                    ? `${Math.floor((now - s.last_heartbeat) / 60)}m ago`
+                    : '—';
+                const hwid = s.hwid ? `\`${s.hwid.slice(0, 12)}…\`` : '—';
+                return `🔑 \`${key}\` — ${hwid} — last heartbeat: ${lastHb}`;
+            });
+
+            const chunks = [];
+            let cur = '';
+            for (const line of lines) {
+                const next = cur ? `${cur}\n${line}` : line;
+                if (next.length > 3800) { chunks.push(cur); cur = line; }
+                else cur = next;
+            }
+            if (cur) chunks.push(cur);
+
+            const embeds = chunks.map((chunk, i) =>
+                new EmbedBuilder()
+                    .setTitle(i === 0
+                        ? `📡 Active Sessions (${entries.length})`
+                        : '📡 Continued...')
+                    .setColor(0x00AAFF)
+                    .setDescription(chunk)
+                    .setTimestamp(),
+            );
+            await interaction.editReply({ embeds: embeds.slice(0, 10) });
+        }
+
+        // ── /nuke ─────────────────────────────────────────────────────────────
+        else if (commandName === 'nuke') {
+            const key  = interaction.options.getString('key').toUpperCase().trim();
+            const data = await fbGet(`licenses/${key}`);
+            if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+
+            const nuked = ['license'];
+
+            // Delete the license
+            await fbDelete(`licenses/${key}`);
+
+            // Delete session
+            const session = await fbGet(`sessions/${key}`);
+            if (session) {
+                await fbDelete(`sessions/${key}`);
+                nuked.push('session');
+            }
+
+            // If HWID-bound, remove HWID ban
+            if (data.hwid) {
+                const hwidBan = await fbGet(`bans/hwid/${data.hwid}`);
+                if (hwidBan) {
+                    await fbDelete(`bans/hwid/${data.hwid}`);
+                    nuked.push(`HWID ban (${data.hwid.slice(0, 12)}…)`);
+                }
+            }
+
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setTitle('💣 License Nuked')
+                    .setColor(0xFF0000)
+                    .setDescription(`\`${key}\`\n\nDeleted: ${nuked.join(', ')}`)
+                    .addFields(
+                        { name: '📦 Plan', value: data.plan || '—',              inline: true },
+                        { name: '📝 Note', value: data.note || '—',              inline: true },
+                        { name: '🖥️ HWID', value: data.hwid || '*(unbound)*',  inline: true },
+                    )
+                    .setFooter({ text: `Nuked by ${interaction.user.tag}` })
+                    .setTimestamp(),
+            ]});
+        }
+
+        // ── /dashboard ────────────────────────────────────────────────────────
+        else if (commandName === 'dashboard') {
+            const [licenses, sessions, hwidBans, ipBans, violations] = await Promise.all([
+                fbGet('licenses').then(d => d || {}),
+                fbGet('sessions').then(d => d || {}),
+                fbGet('bans/hwid').then(d => d || {}),
+                fbGet('bans/ip').then(d => d || {}),
+                fbGet('violations').then(d => d || {}),
+            ]);
+
+            const all   = Object.values(licenses);
+            const today = todayStr();
+            const now   = Math.floor(Date.now() / 1000);
+
+            const total   = all.length;
+            const active  = all.filter(d =>  d.active && !(d.expires && d.expires < today)).length;
+            const expired = all.filter(d =>  d.active && d.expires && d.expires < today).length;
+            const bound   = all.filter(d =>  d.hwid).length;
+
+            // Recent activity — keys created in the last 7 days
+            const weekAgo   = addDays(todayStr(), -7);
+            const recentKeys = all.filter(d => d.created_at && d.created_at >= weekAgo).length;
+
+            // Active sessions (heartbeat within last 10 min)
+            const activeSessions = Object.values(sessions)
+                .filter(s => s.last_heartbeat && (now - s.last_heartbeat) < 600).length;
+
+            // Recent violations (last 5)
+            const recentViolations = Object.entries(violations)
+                .sort((a, b) => (b[1].timestamp || 0) - (a[1].timestamp || 0))
+                .slice(0, 5);
+
+            const violationLines = recentViolations.length
+                ? recentViolations.map(([, d]) => {
+                    const time = d.timestamp_iso ? d.timestamp_iso.slice(0, 16).replace('T', ' ') : '—';
+                    return `\`${time}\` **${d.reason || '?'}** — \`${(d.hwid || '?').slice(0, 12)}…\``;
+                }).join('\n')
+                : '*(none)*';
+
+            // Per plan breakdown
+            const perPlan = {};
+            for (const d of all)
+                perPlan[d.plan || 'unknown'] = (perPlan[d.plan || 'unknown'] || 0) + 1;
+            const planLines = Object.entries(perPlan)
+                .sort((a, b) => b[1] - a[1])
+                .map(([p, c]) => `\`${p}\`: ${c}`)
+                .join('  ·  ') || '—';
+
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setAuthor({ name: 'AiDA License System' })
+                    .setTitle('📊 Dashboard')
+                    .setColor(0x5865F2)
+                    .addFields(
+                        { name: '📦 Total Keys',       value: String(total),                  inline: true },
+                        { name: '✅ Active',           value: String(active),                  inline: true },
+                        { name: '⚠️ Expired',         value: String(expired),                 inline: true },
+                        { name: '🔒 HWID Bound',       value: String(bound),                  inline: true },
+                        { name: '📡 Online Now',        value: String(activeSessions),         inline: true },
+                        { name: '🆕 New (7d)',          value: String(recentKeys),             inline: true },
+                        { name: '📈 Plans',             value: planLines,                      inline: false },
+                        { name: '📛 Bans',              value: `${Object.keys(hwidBans).length} HWID · ${Object.keys(ipBans).length} IP`, inline: false },
+                        { name: '🚨 Recent Violations', value: violationLines,                inline: false },
+                    )
+                    .setFooter({ text: `${Object.keys(sessions).length} total sessions` })
+                    .setTimestamp(),
+            ]});
         }
 
     } catch (err) {
