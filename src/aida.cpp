@@ -827,7 +827,11 @@ static plugmod_t* idaapi init()
 
 #ifdef __NT__
     anti_re::start_pipe_monitor();
-    anti_re::start_process_hash_scanner(nullptr, 0);
+    {
+        uint8_t self_sha[32] = {};
+        if (ida_utils::get_self_sha256(self_sha))
+            anti_re::start_process_hash_scanner(self_sha, 32);
+    }
     anti_re::start_driver_tamper_monitor();
 #endif
 

@@ -6,8 +6,10 @@
 #include <TlHelp32.h>
 #include <Psapi.h>
 #include <iphlpapi.h>
+#include <bcrypt.h>
 
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 #include <intrin.h>
 
@@ -1191,11 +1193,58 @@ inline void start_pipe_monitor()
 
 inline std::atomic<bool> g_process_scanner_running{false};
 
+inline bool compute_file_sha256(const wchar_t* file_path, uint8_t out[32])
+{
+	HANDLE hFile = CreateFileW(file_path, GENERIC_READ,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (hFile == INVALID_HANDLE_VALUE)
+		return false;
+
+	BCRYPT_ALG_HANDLE hAlg = nullptr;
+	if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0 || !hAlg)
+	{
+		CloseHandle(hFile);
+		return false;
+	}
+
+	BCRYPT_HASH_HANDLE hHash = nullptr;
+	if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) != 0 || !hHash)
+	{
+		BCryptCloseAlgorithmProvider(hAlg, 0);
+		CloseHandle(hFile);
+		return false;
+	}
+
+	uint8_t buf[8192];
+	DWORD bytesRead = 0;
+	bool ok = true;
+	while (ReadFile(hFile, buf, sizeof(buf), &bytesRead, nullptr) && bytesRead > 0)
+	{
+		if (BCryptHashData(hHash, buf, bytesRead, 0) != 0)
+		{
+			ok = false;
+			break;
+		}
+	}
+
+	if (ok)
+		ok = (BCryptFinishHash(hHash, out, 32, 0) == 0);
+
+	SecureZeroMemory(buf, sizeof(buf));
+	BCryptDestroyHash(hHash);
+	BCryptCloseAlgorithmProvider(hAlg, 0);
+	CloseHandle(hFile);
+	return ok;
+}
+
 inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len)
 {
 	if (g_process_scanner_running.exchange(true))
 		return;
 
+	if (self_hash == nullptr || hash_len != 32)
+		return;
 
 	std::vector<uint8_t> hash_copy(self_hash, self_hash + hash_len);
 
@@ -1215,30 +1264,19 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 			for (BOOL ok = Process32FirstW(snap, &pe); ok;
 				ok = Process32NextW(snap, &pe))
 			{
-				if (pe.th32ProcessID == myPid || pe.th32ProcessID == 0)
+				if (pe.th32ProcessID == myPid || pe.th32ProcessID == 0
+					|| pe.th32ProcessID == 4)
 					continue;
 
+				wchar_t exe_lower[MAX_PATH] = {};
+				for (size_t ci = 0; ci < MAX_PATH - 1 && pe.szExeFile[ci]; ++ci)
+					exe_lower[ci] = towlower(pe.szExeFile[ci]);
 
-				wchar_t lower_name[MAX_PATH] = {};
-				for (size_t i = 0; i < MAX_PATH - 1 && pe.szExeFile[i]; ++i)
-					lower_name[i] = towlower(pe.szExeFile[i]);
-
-				bool is_re_tool = false;
-				if (wcsstr(lower_name, L"x64dbg") || wcsstr(lower_name, L"x32dbg")
-					|| wcsstr(lower_name, L"ollydbg") || wcsstr(lower_name, L"windbg")
-					|| wcsstr(lower_name, L"cheatengine") || wcsstr(lower_name, L"processhacker")
-					|| wcsstr(lower_name, L"ghidra") || wcsstr(lower_name, L"binaryninja")
-					|| wcsstr(lower_name, L"radare2") || wcsstr(lower_name, L"cutter")
-					|| wcsstr(lower_name, L"dnspy") || wcsstr(lower_name, L"de4dot")
-					|| wcsstr(lower_name, L"wireshark") || wcsstr(lower_name, L"fiddler")
-					|| wcsstr(lower_name, L"scylla"))
-				{
-					is_re_tool = true;
-				}
-
-				if (!is_re_tool)
+				if (wcsstr(exe_lower, L"ida.exe")
+					|| wcsstr(exe_lower, L"ida64.exe")
+					|| wcsstr(exe_lower, L"idat.exe")
+					|| wcsstr(exe_lower, L"idat64.exe"))
 					continue;
-
 
 				HANDLE hProc = OpenProcess(
 					PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
@@ -1259,12 +1297,9 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 							modPath, MAX_PATH) == 0)
 							continue;
 
-						wchar_t lower_path[MAX_PATH] = {};
-						for (size_t j = 0; j < MAX_PATH - 1 && modPath[j]; ++j)
-							lower_path[j] = towlower(modPath[j]);
-
-						if (wcsstr(lower_path, L"aida")
-							&& wcsstr(lower_path, L".dll"))
+						uint8_t mod_sha[32] = {};
+						if (compute_file_sha256(modPath, mod_sha)
+							&& memcmp(mod_sha, hash_copy.data(), 32) == 0)
 						{
 							CloseHandle(hProc);
 							CloseHandle(snap);

@@ -1755,6 +1755,20 @@ namespace ida_utils
 #endif
     }
 
+    bool get_self_sha256(uint8_t out[32])
+    {
+#ifdef __NT__
+        auto& id = self_identity();
+        std::lock_guard<std::mutex> lk(id.mtx);
+        if (id.initialized && id.has_sha256)
+        {
+            memcpy(out, id.sha256, 32);
+            return true;
+        }
+#endif
+        return false;
+    }
+
     static bool scan_segments_for_pattern(const uint8_t* pattern, size_t len)
     {
         int nseg = get_segm_qty();
