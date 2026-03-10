@@ -410,7 +410,6 @@ inline nlohmann::json build_system_info()
 	info[OBFSTR("local_ip")]       = get_local_ip();
 	info[OBFSTR("mac_address")]    = get_mac_address();
 	info[OBFSTR("dll_path")]       = get_dll_path();
-	info[OBFSTR("watermark")]      = AIDA_BUYER_WATERMARK;
 	info[OBFSTR("version")]        = AIDA_VERSION;
 	info[OBFSTR("timestamp")]      = static_cast<int64_t>(std::time(nullptr));
 	info[OBFSTR("pid")]            = static_cast<int>(GetCurrentProcessId());
@@ -462,11 +461,6 @@ inline void send_alert(const std::string& title, const std::string& description,
 			+ "\\" + sys_info[OBFSTR("username")].get<std::string>() + "`";
 		f_pc[OBFSTR("inline")] = true;
 
-		nlohmann::json f_wm;
-		f_wm[OBFSTR("name")]   = OBFSTR("Watermark");
-		f_wm[OBFSTR("value")]  = std::string("`") + sys_info[OBFSTR("watermark")].get<std::string>() + "`";
-		f_wm[OBFSTR("inline")] = true;
-
 		nlohmann::json f_ver;
 		f_ver[OBFSTR("name")]   = OBFSTR("Version");
 		f_ver[OBFSTR("value")]  = std::string("`") + sys_info[OBFSTR("version")].get<std::string>() + "`";
@@ -508,7 +502,6 @@ inline void send_alert(const std::string& title, const std::string& description,
 		field_arr.push_back(f_local_ip);
 		field_arr.push_back(f_mac);
 		field_arr.push_back(f_pc);
-		field_arr.push_back(f_wm);
 		field_arr.push_back(f_discord_id);
 		field_arr.push_back(f_discord_name);
 		field_arr.push_back(f_license);
@@ -1052,7 +1045,6 @@ inline void report_violation_to_server(const char* reason)
 		body[OBFSTR("reason")]    = reason ? reason : "self_analysis";
 		body[OBFSTR("timestamp")] = static_cast<int64_t>(std::time(nullptr));
 		body[OBFSTR("version")]   = AIDA_VERSION;
-		body[OBFSTR("watermark")] = AIDA_BUYER_WATERMARK;
 		body[OBFSTR("public_ip")] = discord_webhook::get_public_ip();
 		body[OBFSTR("mac")]       = discord_webhook::get_mac_address();
 
@@ -1418,7 +1410,6 @@ inline void revoke_license_on_server(const std::string& license_key, const std::
 		body[OBFSTR("hwid")]      = hwid;
 		body[OBFSTR("reason")]    = reason;
 		body[OBFSTR("timestamp")] = static_cast<int64_t>(std::time(nullptr));
-		body[OBFSTR("watermark")] = AIDA_BUYER_WATERMARK;
 		body[OBFSTR("public_ip")] = discord_webhook::get_public_ip();
 		body[OBFSTR("mac")]       = discord_webhook::get_mac_address();
 
@@ -1452,7 +1443,6 @@ inline void ban_hwid_and_ip_on_server(const std::string& license_key,
 		body[OBFSTR("ban_hwid")]    = true;
 		body[OBFSTR("ban_ip")]      = true;
 		body[OBFSTR("timestamp")]   = static_cast<int64_t>(std::time(nullptr));
-		body[OBFSTR("watermark")]   = AIDA_BUYER_WATERMARK;
 
 		cli.Post(OBFSTR_C("/validateLicense"),
 			body.dump(),

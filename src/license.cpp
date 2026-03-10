@@ -1068,7 +1068,6 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
         request_body[OBFSTR("timestamp")] = static_cast<int64_t>(std::time(nullptr));
         request_body[OBFSTR("public_ip")] = m_public_ip;
         request_body[OBFSTR("mac_address")] = discord_webhook::get_mac_address();
-        request_body[OBFSTR("watermark")] = AIDA_BUYER_WATERMARK;
 
         auto res = client.Post(
             OBFSTR_C("/validateLicense"),
@@ -1252,7 +1251,6 @@ bool license_manager_t::perform_heartbeat()
             request_body[OBFSTR("timestamp")] = static_cast<int64_t>(std::time(nullptr));
             request_body[OBFSTR("public_ip")] = discord_webhook::get_public_ip();
             request_body[OBFSTR("mac_address")] = discord_webhook::get_mac_address();
-            request_body[OBFSTR("watermark")] = AIDA_BUYER_WATERMARK;
 
             auto res = client.Post(
                 OBFSTR_C("/validateLicense"),
@@ -1631,7 +1629,6 @@ void license_manager_t::check_dll_leak(const std::string& current_hwid)
     {
         m_dll_leaked.store(true, std::memory_order_release);
 
-        std::string watermark(AIDA_BUYER_WATERMARK);
         std::string key = config.value(OBFSTR_C("license_key"), std::string("unknown"));
 
         discord_webhook::send_alert(
@@ -1639,7 +1636,6 @@ void license_manager_t::check_dll_leak(const std::string& current_hwid)
             OBFSTR("**The DLL is running on a different machine than originally activated.**\n")
                 + OBFSTR("**Original HWID:** `") + stored_hwid
                 + OBFSTR("`\n**Current HWID:** `") + current_hwid
-                + OBFSTR("`\n**Watermark:** `") + watermark
                 + OBFSTR("`\n**License Key:** `") + key + "`",
             discord_webhook::COLOR_ORANGE);
     }

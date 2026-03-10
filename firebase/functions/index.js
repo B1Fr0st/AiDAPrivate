@@ -119,18 +119,6 @@ async function sendDiscordWebhook(title, fields, color = 0xFF4444) {
 }
 
 /**
- * Resolve buyer info from a watermark ID.
- * Looks up /watermarks/{watermark} in RTDB.
- */
-async function resolveBuyer(watermark) {
-    if (!watermark || watermark.includes("00000000")) return null;
-    try {
-        const snap = await db.ref(`watermarks/${watermark}`).get();
-        return snap.exists() ? snap.val() : null;
-    } catch (_) { return null; }
-}
-
-/**
  * Validate a license key against the RTDB.
  * Returns { valid, data } where data is the license record if valid.
  */
@@ -226,14 +214,13 @@ async function checkBans(hwid, clientIp) {
 /**
  * Record a ban for both HWID and IP.
  */
-async function recordBan(hwid, clientIp, reason, version, watermark) {
+async function recordBan(hwid, clientIp, reason, version) {
     const now = Math.floor(Date.now() / 1000);
     const banRecord = {
         reason: reason || "violation",
         banned_at: now,
         banned_at_iso: new Date().toISOString(),
         plugin_version: version || "unknown",
-        watermark: watermark || "unknown",
     };
 
     const updates = {};
@@ -263,7 +250,6 @@ async function recordBan(hwid, clientIp, reason, version, watermark) {
         timestamp: now,
         timestamp_iso: new Date().toISOString(),
         plugin_version: version || "unknown",
-        watermark: watermark || "unknown",
     };
 
     if (Object.keys(updates).length > 0) {
@@ -288,19 +274,13 @@ async function recordBan(hwid, clientIp, reason, version, watermark) {
         }
     }
 
-    // Discord webhook: log violation with buyer watermark resolution
-    const buyer = await resolveBuyer(watermark);
+    // Discord webhook: log violation
     const fields = [
         { name: "\uD83D\uDEA8 Reason", value: reason || "violation" },
         { name: "\uD83D\uDDA5\uFE0F HWID", value: `\`${hwid || "unknown"}\`` },
         { name: "\uD83C\uDF10 IP", value: `\`${clientIp || "unknown"}\`` },
         { name: "\uD83D\uDCE6 Version", value: version || "unknown" },
-        { name: "\uD83D\uDD0F Watermark", value: `\`${watermark || "none"}\`` },
     ];
-    if (buyer) {
-        fields.push({ name: "\uD83D\uDC64 Buyer", value: buyer.discord_user ? `<@${buyer.discord_id}> (${buyer.discord_user})` : buyer.name || buyer.note || "unknown" });
-        fields.push({ name: "\uD83D\uDD11 License", value: buyer.license_key ? `\`${buyer.license_key}\`` : "—" });
-    }
     if (deletedKeys.length > 0) {
         fields.push({ name: "\uD83D\uDDD1\uFE0F Deleted Keys", value: deletedKeys.map(k => `\`${k}\``).join(", ") });
     }
@@ -511,7 +491,7 @@ async function handleHeartbeat(body, clientIp) {
 // ─── Action: report_violation ────────────────────────────────────────────────
 
 async function handleReportViolation(body, clientIp) {
-    const { hwid, reason, version, watermark } = body;
+    const { hwid, reason, version } = body;
 
     // Validate input
     if (!hwid || typeof hwid !== "string" || hwid.length < 8 || hwid.length > 64) {
@@ -525,12 +505,8 @@ async function handleReportViolation(body, clientIp) {
         ? reason.slice(0, 128).replace(/[^a-zA-Z0-9_ \-]/g, "")
         : "unknown";
 
-    const sanitizedWatermark = typeof watermark === "string"
-        ? watermark.slice(0, 64).replace(/[^a-zA-Z0-9_%]/g, "")
-        : "unknown";
-
     // Record bans for HWID and IP
-    await recordBan(hwid, clientIp, sanitizedReason, version, sanitizedWatermark);
+    await recordBan(hwid, clientIp, sanitizedReason, version);
 
     return {
         status: 200,

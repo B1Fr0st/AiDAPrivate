@@ -416,24 +416,4 @@ elseif(UNIX)
     
 endif()
 
-# --- Post-build PE protection step ---
-# Runs pe_protect.py to strip debug info, randomize section names,
-# wipe non-essential exports, and add junk overlay data.
-# This makes static analysis in IDA/Ghidra/BinaryNinja extremely difficult.
-# Must be outside the platform if/elseif block so it actually runs on WIN32.
-if(WIN32)
-    find_package(Python3 COMPONENTS Interpreter QUIET)
-    if(Python3_FOUND)
-        add_custom_command(TARGET AiDA POST_BUILD
-            COMMAND "${Python3_EXECUTABLE}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/pe_protect.py"
-                    "$<TARGET_FILE:AiDA>"
-            COMMENT "Applying PE protection transformations to AiDA.dll..."
-            VERBATIM
-        )
-    else()
-        message(WARNING "Python3 not found. Post-build PE protection will be skipped.")
-    endif()
-endif()
-
 

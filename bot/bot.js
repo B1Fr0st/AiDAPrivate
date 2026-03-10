@@ -22,8 +22,6 @@
 //   /bans                                        — List all active bans
 //   /violations    [limit]                       — View violation audit log
 //   /lookup_hwid   hwid                          — Find licenses by HWID
-//   /watermark     id buyer discord_user key     — Register buyer watermark
-//   /watermarks                                  — List registered watermarks
 //   /purge_expired                               — Delete all expired licenses
 //   /sessions                                    — List active sessions
 //   /nuke          key                           — Delete license + session + bans
@@ -350,32 +348,6 @@ const commands = [
             opt.setName('hwid')
                .setDescription('HWID to search for')
                .setRequired(true)),
-
-    // /watermark
-    new SlashCommandBuilder()
-        .setName('watermark')
-        .setDescription('🏷️ Register a per-buyer watermark for build stamping')
-        .addStringOption(opt =>
-            opt.setName('id')
-               .setDescription('Watermark ID (will be stamped into the DLL)')
-               .setRequired(true))
-        .addStringOption(opt =>
-            opt.setName('buyer')
-               .setDescription('Buyer name/tag')
-               .setRequired(true))
-        .addUserOption(opt =>
-            opt.setName('discord_user')
-               .setDescription('Buyer Discord user (optional)')
-               .setRequired(false))
-        .addStringOption(opt =>
-            opt.setName('key')
-               .setDescription('Associated license key (optional)')
-               .setRequired(false)),
-
-    // /watermarks
-    new SlashCommandBuilder()
-        .setName('watermarks')
-        .setDescription('🏷️ List all registered buyer watermarks'),
 
     // /transfer
     new SlashCommandBuilder()
@@ -892,7 +864,6 @@ client.on('interactionCreate', async (interaction) => {
             ];
             if (ban.hwid) fields.push({ name: '🖥️ HWID', value: `\`${ban.hwid}\``, inline: true });
             if (ban.ip || ban.original_ip) fields.push({ name: '🌐 IP', value: `\`${ban.original_ip || ban.ip}\``, inline: true });
-            if (ban.watermark) fields.push({ name: '🔏 Watermark', value: `\`${ban.watermark}\``, inline: true });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -959,8 +930,7 @@ client.on('interactionCreate', async (interaction) => {
 
             const lines = entries.map(([id, d]) => {
                 const time = d.timestamp_iso ? d.timestamp_iso.slice(0, 19).replace('T', ' ') : '—';
-                const wm = d.watermark && d.watermark !== 'unknown' ? ` 🔏\`${d.watermark}\`` : '';
-                return `\`${time}\` 🚨 **${d.reason || '?'}** — HWID \`${(d.hwid || '?').slice(0, 12)}…\` IP \`${d.ip || '?'}\`${wm}`;
+                return `\`${time}\` 🚨 **${d.reason || '?'}** — HWID \`${(d.hwid || '?').slice(0, 12)}…\` IP \`${d.ip || '?'}\``;
             });
 
             await interaction.editReply({ embeds: [
@@ -1002,80 +972,6 @@ client.on('interactionCreate', async (interaction) => {
                     .setFooter({ text: `${matches.length} license(s) found` })
                     .setTimestamp(),
             ]});
-        }
-
-        // ── /watermark ────────────────────────────────────────────────────────
-        else if (commandName === 'watermark') {
-            const id          = interaction.options.getString('id').trim();
-            const buyer       = interaction.options.getString('buyer').trim();
-            const discordUser = interaction.options.getUser('discord_user');
-            const licenseKey  = interaction.options.getString('key')?.toUpperCase().trim() ?? '';
-
-            // Validate watermark ID format (alphanumeric, max 32 chars)
-            if (!/^[A-Za-z0-9]{1,32}$/.test(id))
-                return interaction.editReply('❌ Watermark ID must be 1–32 alphanumeric characters.');
-
-            const record = {
-                name: buyer,
-                discord_user: discordUser ? discordUser.tag : '',
-                discord_id: discordUser ? discordUser.id : '',
-                license_key: licenseKey,
-                created_at: new Date().toISOString(),
-                created_by: interaction.user.tag,
-            };
-
-            await fbPut(`watermarks/${id}`, record);
-
-            const fields = [
-                { name: '🏷️ Watermark ID', value: `\`${id}\``,                               inline: true },
-                { name: '👤 Buyer',         value: buyer,                                       inline: true },
-                { name: '💬 Discord',       value: discordUser ? `<@${discordUser.id}>` : '—', inline: true },
-                { name: '🔑 License Key',   value: licenseKey ? `\`${licenseKey}\`` : '—',     inline: true },
-            ];
-
-            await interaction.editReply({ embeds: [
-                new EmbedBuilder()
-                    .setTitle('🏷️ Watermark Registered')
-                    .setColor(0x00FF88)
-                    .addFields(fields)
-                    .setFooter({ text: `Stamp DLL with: python pe_protect.py AiDA.dll --watermark ${id}` })
-                    .setTimestamp(),
-            ]});
-        }
-
-        // ── /watermarks ───────────────────────────────────────────────────────
-        else if (commandName === 'watermarks') {
-            const watermarks = await fbGet('watermarks') || {};
-            const entries = Object.entries(watermarks);
-
-            if (!entries.length)
-                return interaction.editReply('📭 No watermarks registered.');
-
-            const lines = entries.map(([id, d]) => {
-                const discord = d.discord_id ? `<@${d.discord_id}>` : '';
-                const key = d.license_key ? ` 🔑\`${d.license_key}\`` : '';
-                return `🏷️ \`${id}\` — **${d.name || '?'}** ${discord}${key}`;
-            });
-
-            const chunks = [];
-            let cur = '';
-            for (const line of lines) {
-                const next = cur ? `${cur}\n${line}` : line;
-                if (next.length > 3800) { chunks.push(cur); cur = line; }
-                else cur = next;
-            }
-            if (cur) chunks.push(cur);
-
-            const embeds = chunks.map((chunk, i) =>
-                new EmbedBuilder()
-                    .setTitle(i === 0
-                        ? `🏷️ Registered Watermarks (${entries.length})`
-                        : '🏷️ Continued...')
-                    .setColor(0x5865F2)
-                    .setDescription(chunk)
-                    .setTimestamp(),
-            );
-            await interaction.editReply({ embeds: embeds.slice(0, 10) });
         }
 
         // ── /transfer ─────────────────────────────────────────────────────────

@@ -32,12 +32,6 @@
         ".write": false
       }
     },
-    "watermarks": {
-      "$wm": {
-        ".read": false,
-        ".write": false
-      }
-    },
     ".read": false,
     ".write": false
   }
