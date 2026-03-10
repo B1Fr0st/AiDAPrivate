@@ -213,15 +213,6 @@ const commands = [
                .setDescription('License key to revoke')
                .setRequired(true)),
 
-    // /reactivate
-    new SlashCommandBuilder()
-        .setName('reactivate')
-        .setDescription('✅ Re-activate a previously revoked key')
-        .addStringOption(opt =>
-            opt.setName('key')
-               .setDescription('License key to reactivate')
-               .setRequired(true)),
-
     // /info
     new SlashCommandBuilder()
         .setName('info')
@@ -382,6 +373,70 @@ const commands = [
     new SlashCommandBuilder()
         .setName('watermarks')
         .setDescription('🏷️ List all registered buyer watermarks'),
+
+    // /transfer
+    new SlashCommandBuilder()
+        .setName('transfer')
+        .setDescription('🔄 Transfer a license to a new HWID')
+        .addStringOption(opt =>
+            opt.setName('key')
+               .setDescription('License key to transfer')
+               .setRequired(true))
+        .addStringOption(opt =>
+            opt.setName('new_hwid')
+               .setDescription('New HWID to bind the license to')
+               .setRequired(true)),
+
+    // /set_plan
+    new SlashCommandBuilder()
+        .setName('set_plan')
+        .setDescription('📦 Change the plan on a license key')
+        .addStringOption(opt =>
+            opt.setName('key')
+               .setDescription('License key to update')
+               .setRequired(true))
+        .addStringOption(opt =>
+            opt.setName('plan')
+               .setDescription('New plan')
+               .setRequired(true)
+               .setAutocomplete(true)),
+
+    // /set_expiry
+    new SlashCommandBuilder()
+        .setName('set_expiry')
+        .setDescription('📅 Set exact expiry date on a license key')
+        .addStringOption(opt =>
+            opt.setName('key')
+               .setDescription('License key to update')
+               .setRequired(true))
+        .addStringOption(opt =>
+            opt.setName('date')
+               .setDescription('Expiry date (YYYY-MM-DD) or "never" for perpetual')
+               .setRequired(true)),
+
+    // /purge_expired
+    new SlashCommandBuilder()
+        .setName('purge_expired')
+        .setDescription('🧹 Delete all expired licenses from the database'),
+
+    // /sessions
+    new SlashCommandBuilder()
+        .setName('sessions')
+        .setDescription('📡 List all active license sessions'),
+
+    // /nuke
+    new SlashCommandBuilder()
+        .setName('nuke')
+        .setDescription('💣 Delete a license and all associated data (session, bans)')
+        .addStringOption(opt =>
+            opt.setName('key')
+               .setDescription('License key to nuke')
+               .setRequired(true)),
+
+    // /dashboard
+    new SlashCommandBuilder()
+        .setName('dashboard')
+        .setDescription('📊 Combined dashboard: stats, recent activity, bans'),
 ];
 
 // ─── Register Commands on Ready ───────────────────────────────────────────────
@@ -494,35 +549,20 @@ client.on('interactionCreate', async (interaction) => {
             const data = await fbGet(`licenses/${key}`);
             if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
 
-            await fbPatch(`licenses/${key}`, { active: false });
+            // Revoke = delete from database entirely
+            await fbDelete(`licenses/${key}`);
+            await fbDelete(`sessions/${key}`).catch(() => {});
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
-                    .setTitle('🚫 License Revoked')
+                    .setTitle('🗑️ License Revoked & Deleted')
                     .setColor(0xFF4444)
-                    .setDescription(`\`${key}\``)
+                    .setDescription(`\`${key}\`\nLicense has been permanently removed from the database.`)
                     .addFields(
                         { name: '📝 Note', value: data.note || '—', inline: true },
                         { name: '📦 Plan', value: data.plan || '—', inline: true },
+                        { name: '🖥️ HWID', value: data.hwid || '*(unbound)*', inline: true },
                     )
-                    .setTimestamp(),
-            ]});
-        }
-
-        // ── /reactivate ───────────────────────────────────────────────────────
-        else if (commandName === 'reactivate') {
-            const key  = interaction.options.getString('key').toUpperCase().trim();
-            const data = await fbGet(`licenses/${key}`);
-            if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
-
-            await fbPatch(`licenses/${key}`, { active: true });
-
-            await interaction.editReply({ embeds: [
-                new EmbedBuilder()
-                    .setTitle('✅ License Reactivated')
-                    .setColor(0x00FF88)
-                    .setDescription(`\`${key}\``)
-                    .addFields({ name: '📝 Note', value: data.note || '—', inline: true })
                     .setTimestamp(),
             ]});
         }
@@ -762,18 +802,15 @@ client.on('interactionCreate', async (interaction) => {
                 await fbPut(`bans/ip/${normalizedIp}`, { ...banRecord, hwid, original_ip: ip });
             }
 
-            // Revoke all licenses bound to this HWID
+            // Delete all licenses bound to this HWID
             const licenses = await fbGet('licenses');
-            const revoked = [];
+            const deleted = [];
             if (licenses) {
                 for (const [key, d] of Object.entries(licenses)) {
                     if (d.hwid === hwid) {
-                        await fbPatch(`licenses/${key}`, {
-                            active: false,
-                            revoked_reason: `ban: ${reason}`,
-                            revoked_at: now,
-                        });
-                        revoked.push(key);
+                        await fbDelete(`licenses/${key}`);
+                        await fbDelete(`sessions/${key}`).catch(() => {});
+                        deleted.push(key);
                     }
                 }
             }
@@ -783,8 +820,8 @@ client.on('interactionCreate', async (interaction) => {
                 { name: '🌐 IP',      value: ip || '*(none)*', inline: true },
                 { name: '📝 Reason',   value: reason,           inline: true },
             ];
-            if (revoked.length)
-                fields.push({ name: '🚫 Revoked Keys', value: revoked.map(k => `\`${k}\``).join('\n'), inline: false });
+            if (deleted.length)
+                fields.push({ name: '🗑️ Deleted Keys', value: deleted.map(k => `\`${k}\``).join('\n'), inline: false });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()

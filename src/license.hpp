@@ -27,6 +27,7 @@ public:
     bool is_dll_leaked() const;
     std::string get_public_ip() const;
     std::string get_last_ban_reason() const;
+    std::string get_cached_key() const;
 
     friend int idaapi license_revalidation_timer_cb(void*);
 

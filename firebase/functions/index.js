@@ -270,22 +270,21 @@ async function recordBan(hwid, clientIp, reason, version, watermark) {
         await db.ref().update(updates);
     }
 
-    // Revoke any license bound to this HWID
-    let revokedKeys = [];
+    // Delete any license bound to this HWID
+    let deletedKeys = [];
     if (hwid) {
         const licensesSnap = await db.ref("licenses")
             .orderByChild("hwid")
             .equalTo(hwid)
             .get();
         if (licensesSnap.exists()) {
-            const revokeUpdates = {};
+            const deleteUpdates = {};
             licensesSnap.forEach((child) => {
-                revokeUpdates[`licenses/${child.key}/active`] = false;
-                revokeUpdates[`licenses/${child.key}/revoked_reason`] = `violation: ${reason}`;
-                revokeUpdates[`licenses/${child.key}/revoked_at`] = now;
-                revokedKeys.push(child.key);
+                deleteUpdates[`licenses/${child.key}`] = null;
+                deleteUpdates[`sessions/${child.key}`] = null;
+                deletedKeys.push(child.key);
             });
-            await db.ref().update(revokeUpdates);
+            await db.ref().update(deleteUpdates);
         }
     }
 
@@ -302,8 +301,8 @@ async function recordBan(hwid, clientIp, reason, version, watermark) {
         fields.push({ name: "\uD83D\uDC64 Buyer", value: buyer.discord_user ? `<@${buyer.discord_id}> (${buyer.discord_user})` : buyer.name || buyer.note || "unknown" });
         fields.push({ name: "\uD83D\uDD11 License", value: buyer.license_key ? `\`${buyer.license_key}\`` : "—" });
     }
-    if (revokedKeys.length > 0) {
-        fields.push({ name: "\uD83D\uDEAB Revoked Keys", value: revokedKeys.map(k => `\`${k}\``).join(", ") });
+    if (deletedKeys.length > 0) {
+        fields.push({ name: "\uD83D\uDDD1\uFE0F Deleted Keys", value: deletedKeys.map(k => `\`${k}\``).join(", ") });
     }
     await sendDiscordWebhook("\uD83D\uDEA8 AiDA Violation Detected", fields, 0xFF0000);
 }

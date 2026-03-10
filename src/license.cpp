@@ -821,6 +821,14 @@ bool license_manager_t::validate()
         return true;
     }
 
+    // Validation failed — possible DLL leak (valid key, wrong HWID)
+    discord_webhook::send_alert_async(
+        OBFSTR("\xf0\x9f\x9a\xa8 FAILED ACTIVATION ATTEMPT (Possible DLL Leak)"),
+        OBFSTR("**Someone attempted to activate a license on an unauthorized machine.**\n")
+            + OBFSTR("**Attempted Key:** `") + key
+            + OBFSTR("`\n**HWID:** `") + current_hwid + "`",
+        discord_webhook::COLOR_RED);
+
 
     return false;
 }
@@ -934,6 +942,15 @@ bool license_manager_t::show_activation_dialog()
                       "- Your subscription is active\n"
                       "- This hardware is authorized\n"
                       "- You have an active internet connection"));
+
+    // Validation failed — possible DLL leak (valid key, wrong machine)
+    discord_webhook::send_alert_async(
+        OBFSTR("\xf0\x9f\x9a\xa8 FAILED ACTIVATION ATTEMPT (Possible DLL Leak)"),
+        OBFSTR("**Someone attempted to activate a license on an unauthorized machine.**\n")
+            + OBFSTR("**Attempted Key:** `") + key
+            + OBFSTR("`\n**HWID:** `") + current_hwid + "`",
+        discord_webhook::COLOR_RED);
+
     return false;
 }
 
@@ -1651,4 +1668,9 @@ std::string license_manager_t::get_public_ip() const
 std::string license_manager_t::get_last_ban_reason() const
 {
     return m_ban_reason;
+}
+
+std::string license_manager_t::get_cached_key() const
+{
+    return m_cached_key;
 }
