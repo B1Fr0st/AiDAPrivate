@@ -199,7 +199,6 @@ public:
     void beginThinkingRound(int round, const QString& statusMessage);
     void updateThinkingStatus(int round, const QString& reasoning, const QStringList& pendingTools, const QString& currentTool, const QString& statusMessage = QString());
     void addToolResult(int round, const QString& toolName, bool success, const QString& message);
-    void setThinkingExpanded(bool expanded);
     void clearThinkingStatus();
     void appendStreamChunk(const QString& chunk);
     void resetStreamBuffer();
@@ -222,6 +221,10 @@ private:
     void applySelectedModel();
     QString summarizeThinkingHeader(const QString& reasoning) const;
     void appendThinkingDetail(int round, const QString& line);
+    QString buildLiveThinkingPreview() const;
+    void refreshThinkingPanelView();
+    void rebuildLiveThinkingBlock();
+    void updateLiveStatusLabel();
     void updateContextLabel();
     void updateThemeColors();
     ThemeColors detectThemeColors() const;
@@ -230,11 +233,14 @@ private:
 
     void sendMessage();
     void cancelRequest();
-    void setThinkingState(bool thinking);
+    void setThinkingState(bool thinking, bool rebuildDisplay = true);
     void rebuildChatDisplay();
     void scrollToBottom();
     void copyMessageToClipboard(int index);
     void undoToMessage(int index);
+    void enterEditMode(int index);
+    void cancelEditMode();
+    void commitEdit(int index);
     void showToast(const QString& message);
 
     void toggleHistoryPanel();
@@ -299,20 +305,8 @@ private:
     QPushButton*             m_cancelBtn;
     QComboBox*               m_modelPicker;
     QPushButton*             m_tagBtn;
-    QWidget*                 m_typingWidget;
-    QLabel*                  m_typingLabel;
-    QTimer*                  m_typingTimer;
-    int                      m_typingDotCount;
-    QGraphicsOpacityEffect*  m_typingOpacity;
-    QPropertyAnimation*      m_typingPulse;
-
-    QWidget*                 m_thinkingContainer;
-    QPushButton*             m_thinkingToggleBtn;
-    QWidget*                 m_thinkingDetails;
-    QTextEdit*               m_streamingDisplay;
-    QLabel*                  m_currentToolLabel;
-    QLabel*                  m_thinkingElapsedLabel;
-    bool                     m_thinkingExpanded;
+    QString                  m_currentToolStatus;
+    QString                  m_typingStatus;
     QString                  m_streamBuffer;
     struct ThinkingRound
     {
@@ -323,6 +317,9 @@ private:
     };
     std::vector<ThinkingRound> m_thinkingRounds;
     int                      m_activeThinkingRound;
+    QWidget*                 m_liveThinkingBlock;
+    QLabel*                  m_liveStreamLabel;
+    QLabel*                  m_liveStatusLabel;
     QElapsedTimer            m_thinkingStopwatch;
     QTimer*                  m_thinkingElapsedTimer;
 
@@ -339,6 +336,8 @@ private:
     QTimer*                  m_typewriterTimer;
     QString                  m_typewriterQueue;
 
-    bool                     m_userScrolledStreaming;
     bool                     m_userScrolledChat;
+
+    int                      m_editingIndex;
+    QTextEdit*               m_editingField;
 };

@@ -487,6 +487,12 @@ or a verified memory offset. Replace phrases like "likely", "probably", "I belie
 "verified in function X at address Y". If you cannot verify a claim, emit tool_calls to
 verify it before finalizing your answer.
 
+**RULE 10: DO NOT OUTPUT OPERATIONAL TOOL LOG LINES IN PLAIN-TEXT ANSWERS.**
+Do NOT include chat-noise lines like "Pending: ...", "Executing: ...", "[ok] tool_name ...",
+or per-tool progress spam in your plain-text answer. Those are internal execution details,
+not user-facing analysis. Your plain-text output should contain findings, evidence, and
+conclusions only.
+
 **REMINDER — RULE 0: USE `convert_number` FOR BASE CONVERSIONS AND ASCII INTERPRETATION.**
 Never convert between number bases or interpret hex as ASCII manually. Use `convert_number`.
 When stack pointers read beyond a variable's byte width, extra bytes come from adjacent stack
@@ -501,9 +507,20 @@ When you need to gather information or perform actions, respond with ONLY a JSON
     {"tool": "EXACT_TOOL_NAME", "params": {"param1": "value1"}},
     {"tool": "EXACT_TOOL_NAME", "params": {}}
   ],
-  "reasoning": "Brief explanation of why you are calling these tools"
+  "reasoning": "Detailed explanation of your current thinking process (3-5 sentences). Describe: what specific information you are looking for, why you chose these particular tools, what leads or patterns from previous results you are following, and what you expect to find. This text is displayed to the user as a live thinking indicator, so be thorough, specific, and analytical."
 }
 ```
+
+**RULE 11: ALWAYS PROVIDE THOROUGH REASONING.**
+Your `reasoning` field is displayed to the user as a thinking indicator. It MUST contain 3-5 sentences
+of genuine analytical reasoning: what you observed in previous results, what hypothesis you are testing,
+why these specific tools and parameters were chosen, and what you expect to discover. Never write
+generic one-liners like "Continuing analysis" or "Looking at functions". Instead, write specific,
+insightful reasoning that demonstrates your thought process, e.g.: "The NtWriteVirtualMemory syscall
+handler at 0x14001A000 takes a user-supplied buffer length in R8 without an upper bound check before
+passing it to MmCopyVirtualMemory. I need to decompile MmCopyVirtualMemory to verify whether it
+performs its own length validation, and also trace the ProbeForRead call to see if the buffer is
+properly probed before the copy. If neither validates the length, this is a kernel pool overflow."
 
 **CRITICAL OUTPUT FORMAT RULE — ONE JSON BLOCK PER ROUND, THEN STOP.**
 In each round, your response must contain AT MOST ONE tool_calls JSON block. After emitting

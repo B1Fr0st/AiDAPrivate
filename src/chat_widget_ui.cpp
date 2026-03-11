@@ -52,6 +52,29 @@ static inline QColor blendColor(const QColor& a, const QColor& b, double t)
         static_cast<int>(a.alpha() * inv + b.alpha() * ratio));
 }
 
+static inline bool isLikelyDarkSurface(const QColor& c)
+{
+    return c.lightnessF() < 0.58;
+}
+
+static inline QColor contrastSafeTextColor(const QColor& preferred, const QColor& background, bool darkSurface)
+{
+    QColor out = preferred;
+    const int contrast = qAbs(out.lightness() - background.lightness());
+
+    if (contrast < 105)
+    {
+        out = darkSurface ? QColor(241, 244, 248) : QColor(26, 30, 35);
+    }
+
+    if (darkSurface && out.lightness() < 190)
+        out = QColor(236, 240, 245);
+    if (!darkSurface && out.lightness() > 115)
+        out = QColor(30, 34, 38);
+
+    return out;
+}
+
 static QFont createChatUiFont()
 {
     QFont font(QStringLiteral("Segoe UI Variable Text"));
@@ -127,13 +150,14 @@ static void set_current_provider_model(const std::string& provider, const std::s
 }
 
 static QString stripCodeFences(const QString& text);
-static bool looksLikeJsonNoiseLine(const QString& line);
+static bool looksLikeToolStatusNoiseLine(const QString& line);
 static QString sanitizeAssistantDisplayText(const QString& raw);
 
 enum class chat_action_icon_t
 {
     undo,
     copy,
+    send,
 };
 
 static QByteArray chat_action_svg(chat_action_icon_t icon, bool dark_theme)
@@ -153,6 +177,12 @@ static QByteArray chat_action_svg(chat_action_icon_t icon, bool dark_theme)
             "<svg width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\">"
             "<rect x=\"8\" y=\"8\" width=\"10\" height=\"11\" rx=\"2\" fill=\"none\" stroke=\"" + QByteArray(stroke) + "\" stroke-width=\"1.8\"/>"
             "<path d=\"M6 15V6C6 4.89543 6.89543 4 8 4H15\" fill=\"none\" stroke=\"" + QByteArray(stroke) + "\" stroke-width=\"1.8\" stroke-linecap=\"round\"/>"
+            "</svg>");
+    case chat_action_icon_t::send:
+        return QByteArray(
+            "<svg width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\">"
+            "<path d=\"M12 19V5\" fill=\"none\" stroke=\"" + QByteArray(stroke) + "\" stroke-width=\"2\" stroke-linecap=\"round\"/>"
+            "<path d=\"M5 12L12 5L19 12\" fill=\"none\" stroke=\"" + QByteArray(stroke) + "\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>"
             "</svg>");
     }
 
@@ -381,20 +411,12 @@ AiDAChatPanel::AiDAChatPanel(QWidget* parent,
     , m_cancelBtn(nullptr)
     , m_modelPicker(nullptr)
     , m_tagBtn(nullptr)
-    , m_typingWidget(nullptr)
-    , m_typingLabel(nullptr)
-    , m_typingTimer(nullptr)
-    , m_typingDotCount(0)
-    , m_typingOpacity(nullptr)
-    , m_typingPulse(nullptr)
-    , m_thinkingContainer(nullptr)
-    , m_thinkingToggleBtn(nullptr)
-    , m_thinkingDetails(nullptr)
-    , m_streamingDisplay(nullptr)
-    , m_currentToolLabel(nullptr)
-    , m_thinkingElapsedLabel(nullptr)
-    , m_thinkingExpanded(false)
+    , m_currentToolStatus()
+    , m_typingStatus(QStringLiteral("Thinking"))
     , m_activeThinkingRound(-1)
+    , m_liveThinkingBlock(nullptr)
+    , m_liveStreamLabel(nullptr)
+    , m_liveStatusLabel(nullptr)
     , m_historyPanel(nullptr)
     , m_historyList(nullptr)
     , m_historyVisible(false)
@@ -404,8 +426,9 @@ AiDAChatPanel::AiDAChatPanel(QWidget* parent,
     , m_completerActive(false)
     , m_thinkingElapsedTimer(nullptr)
     , m_typewriterTimer(nullptr)
-    , m_userScrolledStreaming(false)
     , m_userScrolledChat(false)
+    , m_editingIndex(-1)
+    , m_editingField(nullptr)
 {
     setObjectName(QString::fromStdString(OBFSTR("aidaChatPanel")));
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
@@ -418,10 +441,6 @@ AiDAChatPanel::AiDAChatPanel(QWidget* parent,
 
 AiDAChatPanel::~AiDAChatPanel()
 {
-    if (m_typingTimer != nullptr)
-        m_typingTimer->stop();
-    if (m_typingPulse != nullptr)
-        m_typingPulse->stop();
     if (m_typewriterTimer != nullptr)
         m_typewriterTimer->stop();
     if (m_thinkingElapsedTimer != nullptr)
@@ -566,109 +585,6 @@ void AiDAChatPanel::setupUI()
         if (value >= sb->maximum() - 4)
             m_userScrolledChat = false;
     });
-    m_thinkingContainer = new QWidget(chatArea);
-    m_thinkingContainer->setObjectName(QStringLiteral("thinkingContainer"));
-    m_thinkingContainer->setVisible(false);
-    QVBoxLayout* thinkingLayout = new QVBoxLayout(m_thinkingContainer);
-    thinkingLayout->setContentsMargins(0, 0, 0, 0);
-    thinkingLayout->setSpacing(0);
-
-    QWidget* thinkingHeader = new QWidget(m_thinkingContainer);
-    thinkingHeader->setObjectName(QStringLiteral("thinkingHeader"));
-    thinkingHeader->setCursor(Qt::PointingHandCursor);
-    QHBoxLayout* thinkingHeaderLayout = new QHBoxLayout(thinkingHeader);
-    thinkingHeaderLayout->setContentsMargins(6, 4, 6, 4);
-    thinkingHeaderLayout->setSpacing(6);
-
-    m_thinkingToggleBtn = new QPushButton(thinkingHeader);
-    m_thinkingToggleBtn->setObjectName(QStringLiteral("thinkingToggleBtn"));
-    m_thinkingToggleBtn->setText(QString(QChar(0x25B6)));
-    m_thinkingToggleBtn->setFixedSize(16, 16);
-    m_thinkingToggleBtn->setCursor(Qt::PointingHandCursor);
-    QObject::connect(m_thinkingToggleBtn, &QPushButton::clicked, [this]() {
-        setThinkingExpanded(!m_thinkingExpanded);
-    });
-    thinkingHeaderLayout->addWidget(m_thinkingToggleBtn);
-
-    m_typingWidget = new QWidget(thinkingHeader);
-    m_typingWidget->setObjectName(QStringLiteral("typingWidget"));
-    QHBoxLayout* typeLay = new QHBoxLayout(m_typingWidget);
-    typeLay->setContentsMargins(0, 0, 0, 0);
-
-    m_typingLabel = new QLabel(QStringLiteral("Thinking"), m_typingWidget);
-    m_typingLabel->setObjectName(QStringLiteral("typingLabel"));
-    typeLay->addWidget(m_typingLabel);
-
-    m_typingOpacity = new QGraphicsOpacityEffect(m_typingLabel);
-    m_typingLabel->setGraphicsEffect(m_typingOpacity);
-    m_typingOpacity->setOpacity(1.0);
-
-    m_typingPulse = new QPropertyAnimation(m_typingOpacity, QByteArrayLiteral("opacity"));
-    m_typingPulse->setDuration(1400);
-    m_typingPulse->setStartValue(0.35);
-    m_typingPulse->setEndValue(1.0);
-    m_typingPulse->setEasingCurve(QEasingCurve::InOutSine);
-    m_typingPulse->setLoopCount(-1);
-
-    m_typingTimer = new QTimer(this);
-    QObject::connect(m_typingTimer, &QTimer::timeout, [this]() {
-        m_typingDotCount = (m_typingDotCount + 1) % 4;
-        QString dots;
-        for (int i = 0; i < m_typingDotCount; ++i)
-            dots += QChar('.');
-        QString statusText = m_currentToolLabel->text().isEmpty()
-            ? QStringLiteral("Thinking")
-            : m_currentToolLabel->text();
-        if (statusText.startsWith(QStringLiteral("Thinking")) || statusText.startsWith(QStringLiteral("Calling")))
-            m_typingLabel->setText(statusText + dots);
-    });
-
-    thinkingHeaderLayout->addWidget(m_typingWidget);
-    thinkingHeaderLayout->addStretch();
-
-    m_thinkingElapsedLabel = new QLabel(thinkingHeader);
-    m_thinkingElapsedLabel->setObjectName(QStringLiteral("thinkingElapsedLabel"));
-    m_thinkingElapsedLabel->setVisible(false);
-    thinkingHeaderLayout->addWidget(m_thinkingElapsedLabel);
-
-    thinkingLayout->addWidget(thinkingHeader);
-
-    m_thinkingDetails = new QWidget(m_thinkingContainer);
-    m_thinkingDetails->setObjectName(QStringLiteral("thinkingDetails"));
-    m_thinkingDetails->setVisible(false);
-    QVBoxLayout* detailsLayout = new QVBoxLayout(m_thinkingDetails);
-    detailsLayout->setContentsMargins(12, 4, 12, 10);
-    detailsLayout->setSpacing(6);
-
-    m_currentToolLabel = new QLabel(m_thinkingDetails);
-    m_currentToolLabel->setObjectName(QStringLiteral("currentToolLabel"));
-    m_currentToolLabel->setWordWrap(true);
-    m_currentToolLabel->setVisible(false);
-    detailsLayout->addWidget(m_currentToolLabel);
-
-    m_streamingDisplay = new QTextEdit(m_thinkingDetails);
-    m_streamingDisplay->setObjectName(QStringLiteral("streamingDisplay"));
-    m_streamingDisplay->setReadOnly(true);
-    m_streamingDisplay->setAcceptRichText(false);
-    m_streamingDisplay->setMinimumHeight(60);
-    m_streamingDisplay->setMaximumHeight(280);
-    m_streamingDisplay->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
-    m_streamingDisplay->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    m_streamingDisplay->setLineWrapMode(QTextEdit::WidgetWidth);
-    m_streamingDisplay->document()->setDocumentMargin(10);
-    QObject::connect(m_streamingDisplay->verticalScrollBar(), &QScrollBar::sliderPressed, [this]() {
-        m_userScrolledStreaming = true;
-    });
-    QObject::connect(m_streamingDisplay->verticalScrollBar(), &QScrollBar::valueChanged, [this](int value) {
-        QScrollBar* sb = m_streamingDisplay->verticalScrollBar();
-        if (value >= sb->maximum() - 4)
-            m_userScrolledStreaming = false;
-    });
-    detailsLayout->addWidget(m_streamingDisplay);
-
-    thinkingLayout->addWidget(m_thinkingDetails);
-
-    chatAreaLayout->addWidget(m_thinkingContainer);
     bodyLayout->addWidget(chatArea, 1);
 
     mainLayout->addWidget(bodyContainer, 1);
@@ -769,42 +685,19 @@ void AiDAChatPanel::setupUI()
             m_typewriterTimer->stop();
             return;
         }
-
-
-        int batchSize;
-        int queueLen = static_cast<int>(m_typewriterQueue.length());
-        if (queueLen > 2000)
-            batchSize = queueLen;
-        else if (queueLen > 500)
-            batchSize = 200;
-        else if (queueLen > 200)
-            batchSize = 80;
-        else if (queueLen > 100)
-            batchSize = 40;
-        else if (queueLen > 50)
-            batchSize = 16;
-        else
-            batchSize = 6;
-
-        QString batch = m_typewriterQueue.left(batchSize);
-        m_typewriterQueue.remove(0, batchSize);
-
-        QTextCursor cursor = m_streamingDisplay->textCursor();
-        cursor.movePosition(QTextCursor::End);
-        cursor.insertText(batch);
-        if (!m_userScrolledStreaming)
-        {
-            m_streamingDisplay->setTextCursor(cursor);
-            m_streamingDisplay->ensureCursorVisible();
-        }
+        m_typewriterQueue.clear();
     });
 
     m_thinkingElapsedTimer = new QTimer(this);
     m_thinkingElapsedTimer->setInterval(1000);
     QObject::connect(m_thinkingElapsedTimer, &QTimer::timeout, [this]() {
         qint64 elapsed = m_thinkingStopwatch.elapsed() / 1000;
-        m_thinkingElapsedLabel->setText(formatElapsedTime(elapsed));
-        m_thinkingElapsedLabel->setVisible(true);
+        if (m_liveStatusLabel != nullptr)
+        {
+            QString statusText = m_currentToolStatus.isEmpty()
+                ? m_typingStatus : m_currentToolStatus;
+            m_liveStatusLabel->setText(statusText + QStringLiteral("  ") + formatElapsedTime(elapsed));
+        }
     });
 
     m_toastLabel = new QLabel(this);
@@ -971,9 +864,15 @@ ThemeColors AiDAChatPanel::detectThemeColors() const
     QColor baseColor = p.color(QPalette::Base);
     QColor highlightColor = p.color(QPalette::Highlight);
 
-    bool isDark = windowColor.lightnessF() < 0.5;
+    const QColor windowTextColor = p.color(QPalette::WindowText);
+    const qreal avgLightness = (windowColor.lightnessF() + baseColor.lightnessF()) * 0.5;
+    const bool palettePrefersLightText = windowTextColor.isValid() && windowTextColor.lightnessF() > 0.62;
+    bool isDark = palettePrefersLightText || avgLightness < 0.57;
 
-    QColor textColor = isDark ? QColor(255, 255, 255) : QColor(0, 0, 0);
+    QColor textColor = windowTextColor.isValid()
+        ? windowTextColor
+        : (isDark ? QColor(255, 255, 255) : QColor(0, 0, 0));
+    textColor = contrastSafeTextColor(textColor, windowColor, isDark);
 
     QColor fallbackAccent = isDark ? QColor(110, 110, 110) : QColor(140, 140, 140);
     QColor accent = highlightColor.isValid() ? highlightColor : fallbackAccent;
@@ -1090,14 +989,6 @@ void AiDAChatPanel::updateThemeColors()
         m_inputField->setPalette(inputPal);
     }
 
-    if (m_streamingDisplay != nullptr)
-    {
-        QPalette streamPal = m_streamingDisplay->palette();
-        streamPal.setColor(QPalette::Base, blendColor(m_theme.panelBg, m_theme.inputBg, 0.38));
-        streamPal.setColor(QPalette::Text, m_theme.textPrimary);
-        m_streamingDisplay->setPalette(streamPal);
-    }
-
     rebuildChatDisplay();
     m_updatingTheme = false;
 }
@@ -1105,13 +996,14 @@ void AiDAChatPanel::updateThemeColors()
 QString AiDAChatPanel::buildWidgetStylesheet() const
 {
     const ThemeColors& t = m_theme;
-    const bool darkTheme = t.panelBg.lightnessF() < 0.5;
-    const QColor darkWhite(255, 255, 255);
-    const QColor contentText = darkTheme ? darkWhite : t.bubbleAiText;
-    const QColor bodyText = darkTheme ? darkWhite : t.textPrimary;
-    const QColor subtleText = darkTheme ? darkWhite : t.textSecondary;
+    const bool darkTheme = isLikelyDarkSurface(t.panelBg)
+        || isLikelyDarkSurface(t.messageBgAi)
+        || t.textPrimary.lightnessF() > 0.60;
     const QColor aiCardBg = blendColor(t.messageBgAi, t.panelBg, 0.30);
     const QColor aiCardBorder = blendColor(t.messageBorder, t.panelBg, 0.18);
+    const QColor contentText = contrastSafeTextColor(t.bubbleAiText, aiCardBg, darkTheme);
+    const QColor bodyText = contrastSafeTextColor(t.textPrimary, t.panelBg, darkTheme);
+    const QColor subtleText = contrastSafeTextColor(t.textSecondary, t.panelBg, darkTheme);
 
     QString css;
     css.reserve(6000);
@@ -1156,6 +1048,17 @@ QString AiDAChatPanel::buildWidgetStylesheet() const
         "QScrollArea#chatDisplay { background-color: %1; border: 1px solid %2; border-radius: 10px; }")
         .arg(colorToRgb(t.panelBg), colorToRgb(t.headerBorder));
     css += QStringLiteral(
+        "QScrollArea#chatDisplay QScrollBar:vertical {"
+        " background: %1; width: 8px; margin: 4px 2px; border-radius: 4px; }"
+        "QScrollArea#chatDisplay QScrollBar::handle:vertical {"
+        " background: %2; min-height: 30px; border-radius: 4px; }"
+        "QScrollArea#chatDisplay QScrollBar::handle:vertical:hover {"
+        " background: %3; }"
+        "QScrollArea#chatDisplay QScrollBar::add-line:vertical,"
+        "QScrollArea#chatDisplay QScrollBar::sub-line:vertical {"
+        " height: 0px; }")
+        .arg(colorToRgb(t.panelBg), colorToRgb(t.headerBorder), colorToRgb(t.textSecondary));
+    css += QStringLiteral(
         "QWidget#chatDisplayViewport { background-color: %1; }")
         .arg(colorToRgb(t.panelBg));
     css += QStringLiteral(
@@ -1172,7 +1075,7 @@ QString AiDAChatPanel::buildWidgetStylesheet() const
         "QWidget#chatAiFooter {"
         " background: transparent; border: none; }");
     css += QStringLiteral(
-        "QFrame#userBubble { background-color: %1; border: 1px solid %2; border-radius: 13px; }")
+        "QFrame#userBubble { background-color: %1; border: 1px solid %2; border-radius: 8px; }")
         .arg(colorToRgb(t.messageBgUser), colorToRgb(t.messageBorder));
     css += QStringLiteral(
         "QFrame#systemBubble { background-color: %1; border: 1px solid %2; border-radius: 8px; }")
@@ -1192,17 +1095,14 @@ QString AiDAChatPanel::buildWidgetStylesheet() const
         .arg(colorToRgba(thinkingHeaderColor));
     css += QStringLiteral(
         "QPushButton#chatThinkingHeaderBtn {"
-        " color: %1; background: %2; border: 1px solid %3; border-radius: 8px;"
-        " text-align: left; padding: 3px 8px; font-size: 8pt; font-weight: 600; }")
-        .arg(colorToRgba(thinkingHeaderColor),
-             colorToRgba(QColor(255, 255, 255, darkTheme ? 20 : 28)),
-             colorToRgba(QColor(255, 255, 255, darkTheme ? 34 : 48)));
+        " color: %1; background: transparent; border: none;"
+        " text-align: left; padding: 0px 2px; font-size: 7pt; font-weight: 500; }")
+        .arg(colorToRgba(thinkingHeaderColor));
     css += QStringLiteral(
-        "QPushButton#chatThinkingHeaderBtn:hover { background: %1; border-color: %2; }")
-        .arg(colorToRgba(QColor(255, 255, 255, darkTheme ? 28 : 36)),
-             colorToRgba(QColor(255, 255, 255, darkTheme ? 54 : 72)));
+        "QPushButton#chatThinkingHeaderBtn:hover { color: %1; text-decoration: underline; }")
+        .arg(colorToRgba(contrastSafeTextColor(t.textPrimary, t.panelBg, darkTheme)));
     css += QStringLiteral(
-        "QLabel#chatThinkingLabel { color: %1; font-size: 7.8pt; background: transparent; }")
+        "QLabel#chatThinkingLabel { color: %1; font-size: 7.2pt; background: transparent; }")
         .arg(colorToRgba(thinkingColor));
     css += QStringLiteral(
         "QPushButton#chatActionBtn { background: transparent; border: 1px solid transparent; border-radius: 7px; color: %1; padding: 3px; min-width: 28px; min-height: 28px; max-width: 28px; max-height: 28px; }")
@@ -1214,66 +1114,18 @@ QString AiDAChatPanel::buildWidgetStylesheet() const
         "QPushButton#chatActionBtn:pressed { background: %1; }")
         .arg(colorToRgba(blendColor(t.buttonSecondaryHover, t.panelBg, 0.30)));
     css += QStringLiteral(
+        "QTextEdit#chatEditField { background: %1; border: 1px solid %2; border-radius: 6px;"
+        " color: %3; font-size: 8.5pt; padding: 4px 6px; }")
+        .arg(colorToRgb(t.inputBg), colorToRgb(t.inputBorder), colorToRgb(t.textPrimary));
+    css += QStringLiteral(
         "QTextBrowser#chatMessageBrowser, ChatTextBrowser#chatMessageBrowser, QWidget#chatMessageBrowser {"
         " background: transparent; border: none; color: %1; selection-background-color: %2; padding: 0px;"
         "}")
         .arg(colorToRgb(contentText), colorToRgb(t.selectionBg));
 
-    css += QStringLiteral("QWidget#typingWidget { background-color: transparent; }");
     css += QStringLiteral(
-        "QLabel#typingLabel { color: %1; font-size: 7.5pt; font-weight: 500; padding: 0px; background: transparent; }")
-        .arg(colorToRgb(t.textSecondary));
-
-    css += QStringLiteral(
-        "QWidget#thinkingContainer {"
-        "  background-color: %1;"
-        "  border: 1px solid %2;"
-        "  border-left: 3px solid %3;"
-        "  border-radius: 2px 10px 10px 2px;"
-        "  margin: 8px 8px 10px 8px;"
-        "  padding: 0px;"
-        "}")
-        .arg(colorToRgb(blendColor(t.panelBg, t.messageBgSystem, 0.55)),
-             colorToRgb(t.messageBorder),
-             colorToRgb(t.accentColor));
-    css += QStringLiteral(
-        "QWidget#thinkingHeader {"
-        "  background-color: transparent;"
-        "  border-radius: 6px;"
-        "}");
-    css += QStringLiteral(
-        "QPushButton#thinkingToggleBtn {"
-        "  background-color: transparent; color: %1; border: none;"
-        "  font-size: 7.5pt; font-weight: 700; padding: 0px; min-width: 16px; max-width: 16px;"
-        "}")
-        .arg(colorToRgb(t.textMuted));
-    css += QStringLiteral(
-        "QPushButton#thinkingToggleBtn:hover { color: %1; }")
-        .arg(colorToRgb(t.textPrimary));
-    css += QStringLiteral(
-        "QWidget#thinkingDetails { background-color: transparent; }");
-    css += QStringLiteral(
-        "QTextEdit#streamingDisplay {"
-        "  color: %1; font-size: 8pt; padding: 5px 7px;"
-        "  background-color: %2;"
-        "  border: 1px solid %3; border-radius: 6px;"
-        "  font-family: 'Cascadia Mono', 'Consolas', 'Courier New', monospace;"
-        "  selection-background-color: %4;"
-        "}")
-        .arg(colorToRgb(t.textSecondary),
-             colorToRgb(blendColor(t.panelBg, t.inputBg, 0.38)),
-             colorToRgb(t.messageBorder),
-             colorToRgb(t.selectionBg));
-    css += QStringLiteral(
-          "QLabel#currentToolLabel { color: %1; font-size: 7.5pt; font-weight: 500; padding: 1px 0px; }")
+        "QLabel#chatLiveStatusLabel { color: %1; font-size: 7.5pt; font-weight: 500; padding: 1px 0px; background: transparent; }")
         .arg(colorToRgb(t.accentColor));
-
-    css += QStringLiteral(
-        "QLabel#thinkingElapsedLabel {"
-        "  color: %1; font-size: 7pt; font-weight: 500;"
-        "  padding: 1px 4px; background: transparent;"
-        "}")
-        .arg(colorToRgb(t.textMuted));
 
     css += QStringLiteral(
         "QWidget#inputContainer { background-color: %1; border-top: 1px solid %2; }")
@@ -1409,11 +1261,29 @@ QString AiDAChatPanel::buildWidgetStylesheet() const
 QString AiDAChatPanel::buildDocumentCss() const
 {
     const ThemeColors& t = m_theme;
-    const bool darkTheme = t.panelBg.lightnessF() < 0.5;
-    const QString mainText = darkTheme ? QStringLiteral("#FFFFFF") : colorToHex(t.bubbleAiText);
-    const QString mutedText = darkTheme ? QStringLiteral("rgba(255,255,255,0.92)") : colorToHex(t.textSecondary);
-    const QString headingText = darkTheme ? QStringLiteral("#FFFFFF") : colorToHex(t.accentColor);
-    const QString linkText = darkTheme ? QStringLiteral("#FFFFFF") : colorToHex(t.linkColor);
+    const bool darkTheme = isLikelyDarkSurface(t.panelBg)
+        || isLikelyDarkSurface(t.messageBgAi)
+        || t.textPrimary.lightnessF() > 0.60;
+    const QColor mainTextColor = contrastSafeTextColor(
+        darkTheme ? QColor(244, 247, 250) : t.bubbleAiText,
+        t.messageBgAi,
+        darkTheme);
+    const QColor mutedTextColor = contrastSafeTextColor(
+        darkTheme ? QColor(214, 220, 228) : t.textSecondary,
+        t.messageBgAi,
+        darkTheme);
+    const QColor headingTextColor = contrastSafeTextColor(
+        darkTheme ? QColor(248, 250, 252) : t.accentColor,
+        t.messageBgAi,
+        darkTheme);
+    const QColor linkTextColor = contrastSafeTextColor(
+        darkTheme ? QColor(220, 232, 247) : t.linkColor,
+        t.messageBgAi,
+        darkTheme);
+    const QString mainText = colorToHex(mainTextColor);
+    const QString mutedText = colorToHex(mutedTextColor);
+    const QString headingText = colorToHex(headingTextColor);
+    const QString linkText = colorToHex(linkTextColor);
     const QString inlineBg = darkTheme ? QStringLiteral("rgba(255,255,255,0.12)") : colorToHex(t.inlineCodeBg);
     const QString preBg = darkTheme ? QStringLiteral("rgba(255,255,255,0.08)") : colorToHex(t.codeBlockBg);
     const QString preBorder = darkTheme ? QStringLiteral("rgba(255,255,255,0.18)") : colorToHex(t.codeBlockBorder);
@@ -1435,12 +1305,11 @@ QString AiDAChatPanel::buildDocumentCss() const
 
     css += QStringLiteral(
         ".assistant-content { color: %1; }"
-        ".assistant-content * { color: inherit !important; }"
         ".assistant-content p { margin: 0 0 1px 0; }"
         ".assistant-content p:last-child { margin-bottom: 0; }"
         ".assistant-content ul, .assistant-content ol { margin: 1px 0 1px 18px; padding: 0; }"
         ".assistant-content li { margin: 0; }"
-        ".assistant-content table, .assistant-content td, .assistant-content th, .assistant-content span, .assistant-content div, .assistant-content a { color: %1 !important; }")
+        ".assistant-content table, .assistant-content td, .assistant-content th, .assistant-content span, .assistant-content div, .assistant-content a { color: %1; }")
         .arg(mainText);
 
     css += QStringLiteral(
@@ -1463,8 +1332,8 @@ QString AiDAChatPanel::buildDocumentCss() const
     css += QStringLiteral(
         ".bubble-user {"
         "  border: 1px solid %1;"
-        "  border-radius: 12px;"
-        "  padding: 6px 10px 4px 10px;"
+        "  border-radius: 8px;"
+        "  padding: 4px 12px 3px 12px;"
         "  background-color: %2;"
         "  color: %3;"
         "}")
@@ -1619,11 +1488,6 @@ QString AiDAChatPanel::buildDocumentCss() const
         "}")
         .arg(darkTheme ? QStringLiteral("rgba(255,255,255,0.05)") : colorToHex(blendColor(t.messageBgAi, t.panelBg, 0.3)));
 
-    if (darkTheme)
-    {
-        css += QStringLiteral("* { color: #FFFFFF !important; }");
-    }
-
     return css;
 }
 
@@ -1654,11 +1518,6 @@ void AiDAChatPanel::setupStyle()
         blendColor(m_theme.textSecondary, m_theme.inputBg, 0.48));
 #endif
     m_inputField->setPalette(inputPal);
-
-    QPalette streamPal = m_streamingDisplay->palette();
-    streamPal.setColor(QPalette::Base, blendColor(m_theme.panelBg, m_theme.inputBg, 0.38));
-    streamPal.setColor(QPalette::Text, m_theme.textPrimary);
-    m_streamingDisplay->setPalette(streamPal);
 }
 
 bool AiDAChatPanel::event(QEvent* ev)
@@ -1667,6 +1526,8 @@ bool AiDAChatPanel::event(QEvent* ev)
     {
         updateThemeColors();
     }
+    if (ev->type() == QEvent::WindowActivate)
+        refreshModelPicker();
     const bool resized = ev->type() == QEvent::Resize;
     const bool shown = ev->type() == QEvent::Show;
     const bool result = QWidget::event(ev);
@@ -1821,6 +1682,68 @@ bool AiDAChatPanel::eventFilter(QObject* obj, QEvent* event)
         }
     }
 
+    if (obj == m_editingField && event->type() == QEvent::KeyPress)
+    {
+        QKeyEvent* ke = static_cast<QKeyEvent*>(event);
+        if (ke->key() == Qt::Key_Escape)
+        {
+            cancelEditMode();
+            return true;
+        }
+        if ((ke->key() == Qt::Key_Return || ke->key() == Qt::Key_Enter)
+            && (ke->modifiers() & Qt::ControlModifier))
+        {
+            int idx = m_editingIndex;
+            if (idx >= 0)
+                commitEdit(idx);
+            return true;
+        }
+    }
+
+    if (obj == m_editingField && event->type() == QEvent::FocusOut)
+    {
+        QTimer::singleShot(200, this, [this]() {
+            if (m_editingIndex >= 0 && m_editingField != nullptr
+                && !m_editingField->hasFocus())
+            {
+                cancelEditMode();
+            }
+        });
+    }
+
+    if (event->type() == QEvent::MouseButtonPress && obj != m_editingField)
+    {
+        QVariant indexProp = obj->property("historyIndex");
+        if (indexProp.isValid() && m_editingIndex < 0 && !m_isWaiting)
+        {
+            enterEditMode(indexProp.toInt());
+            return true;
+        }
+
+        if (m_editingIndex >= 0 && m_editingField != nullptr)
+        {
+            QWidget* target = qobject_cast<QWidget*>(obj);
+            bool insideEdit = false;
+            while (target != nullptr)
+            {
+                if (target == m_editingField
+                    || (target->objectName() == QStringLiteral("chatActionBtn")
+                        && target->parentWidget() != nullptr
+                        && target->parentWidget()->objectName() == QStringLiteral("userBubble")))
+                {
+                    insideEdit = true;
+                    break;
+                }
+                target = target->parentWidget();
+            }
+            if (!insideEdit)
+            {
+                cancelEditMode();
+                return false;
+            }
+        }
+    }
+
     return QWidget::eventFilter(obj, event);
 }
 
@@ -1956,7 +1879,7 @@ void AiDAChatPanel::sendMessage()
         return;
     }
 
-    setThinkingState(true);
+    setThinkingState(true, false);
 
     std::vector<std::pair<std::string, std::string>> apiHistory;
     for (const auto& entry : m_history)
@@ -1976,7 +1899,7 @@ void AiDAChatPanel::sendMessage()
 
 void AiDAChatPanel::onAiResponse(const std::string& response)
 {
-    setThinkingState(false);
+    setThinkingState(false, false);
 
     for (const ThinkingRound& round : m_thinkingRounds)
     {
@@ -1984,6 +1907,10 @@ void AiDAChatPanel::onAiResponse(const std::string& response)
         if (header.isEmpty())
             header = QStringLiteral("Planning (Round %1)").arg(round.round > 0 ? round.round : 1);
         m_history.emplace_back("ThinkingHeader", header.toStdString());
+
+        const QString details = round.details.trimmed();
+        if (!details.isEmpty() && details != header)
+            m_history.emplace_back("Thinking", details.toStdString());
     }
 
     clearThinkingStatus();
@@ -2009,7 +1936,7 @@ void AiDAChatPanel::onAiResponse(const std::string& response)
     saveToDisk();
 }
 
-void AiDAChatPanel::setThinkingState(bool thinking)
+void AiDAChatPanel::setThinkingState(bool thinking, bool rebuildDisplay)
 {
     m_isWaiting = thinking;
     m_sendBtn->setVisible(!thinking);
@@ -2020,53 +1947,27 @@ void AiDAChatPanel::setThinkingState(bool thinking)
     if (thinking)
     {
         refreshModelPicker();
-        m_thinkingContainer->setVisible(false);
-        m_thinkingToggleBtn->setVisible(true);
-        m_userScrolledStreaming = false;
-        m_typingDotCount = 0;
-        m_typingLabel->setText(QStringLiteral("Thinking"));
+        m_typingStatus = QStringLiteral("Thinking");
+        m_currentToolStatus.clear();
         m_thinkingStopwatch.start();
-        m_thinkingElapsedLabel->setText(QStringLiteral("0s"));
-        m_thinkingElapsedLabel->setVisible(true);
         m_thinkingElapsedTimer->start();
-        m_currentToolLabel->clear();
-        m_currentToolLabel->setVisible(false);
-        m_typingTimer->start(500);
-        m_typingPulse->start();
         clearThinkingStatus();
-        setThinkingExpanded(false);
     }
     else
     {
         refreshModelPicker();
-        m_typingTimer->stop();
-        m_typingPulse->stop();
-        m_typingOpacity->setOpacity(1.0);
         m_typewriterTimer->stop();
         m_thinkingElapsedTimer->stop();
 
         if (!m_typewriterQueue.isEmpty())
             m_typewriterQueue.clear();
 
-        {
-            qint64 elapsed = m_thinkingStopwatch.elapsed() / 1000;
-            if (elapsed > 0)
-                m_typingLabel->setText(QStringLiteral("Thought for ") + formatElapsedTime(elapsed));
-            else
-                m_typingLabel->setText(QStringLiteral("Thought"));
-        }
-
-        m_typingWidget->setVisible(false);
-        m_thinkingToggleBtn->setVisible(false);
-        m_thinkingExpanded = false;
-        m_thinkingDetails->setVisible(false);
-        m_currentToolLabel->clear();
-        m_currentToolLabel->setVisible(false);
-        m_thinkingContainer->setVisible(false);
+        m_currentToolStatus.clear();
         m_activeThinkingRound = -1;
     }
 
-    rebuildChatDisplay();
+    if (rebuildDisplay)
+        rebuildChatDisplay();
 }
 
 QString AiDAChatPanel::summarizeThinkingHeader(const QString& reasoning) const
@@ -2085,15 +1986,17 @@ QString AiDAChatPanel::summarizeThinkingHeader(const QString& reasoning) const
         const QChar ch = cleaned[i];
         if (ch == QChar('.') || ch == QChar('!') || ch == QChar('?'))
         {
+            if (ch == QChar('.') && i + 1 < cleaned.size() && cleaned[i + 1].isLetter())
+                continue;
             punct = i;
             break;
         }
     }
-    if (punct > 24)
+    if (punct > 40)
         cleaned = cleaned.left(punct + 1).trimmed();
 
-    if (cleaned.length() > 88)
-        cleaned = cleaned.left(88).trimmed() + QStringLiteral("...");
+    if (cleaned.length() > 200)
+        cleaned = cleaned.left(200).trimmed() + QStringLiteral("...");
 
     if (cleaned.isEmpty())
         return QStringLiteral("Planning");
@@ -2105,6 +2008,8 @@ void AiDAChatPanel::appendThinkingDetail(int round, const QString& line)
 {
     QString normalized = line.trimmed();
     if (normalized.isEmpty())
+        return;
+    if (looksLikeToolStatusNoiseLine(normalized))
         return;
 
     for (ThinkingRound& entry : m_thinkingRounds)
@@ -2149,6 +2054,7 @@ void AiDAChatPanel::beginThinkingRound(int round, const QString& statusMessage)
         entry.header = QStringLiteral("Planning (Round %1)").arg(resolvedRound);
     entry.expanded = true;
     m_thinkingRounds.push_back(std::move(entry));
+    refreshThinkingPanelView();
 }
 
 static bool isRoundProgressStatus(const QString& text)
@@ -2204,54 +2110,37 @@ void AiDAChatPanel::updateThinkingStatus(int round, const QString& reasoning, co
             }
         }
     }
-    else if (!normalizedStatus.isEmpty() && !statusIsRoundMeta)
+    else if (!normalizedStatus.isEmpty() && !statusIsRoundMeta && !looksLikeToolStatusNoiseLine(normalizedStatus))
     {
         appendThinkingDetail(resolvedRound, normalizedStatus);
     }
 
     if (!currentTool.isEmpty())
     {
-        m_currentToolLabel->setText(QString(QChar(0x2699)) + QStringLiteral(" Executing: ") + currentTool);
-        m_currentToolLabel->setVisible(true);
-        m_typingLabel->setText(QStringLiteral("Running ") + currentTool);
-        appendThinkingDetail(resolvedRound, QStringLiteral("Executing: %1").arg(currentTool));
+        m_currentToolStatus = QStringLiteral("Running tool: %1").arg(currentTool);
+        m_typingStatus = QStringLiteral("Thinking");
     }
     else if (!pendingTools.isEmpty())
     {
-        QString toolsText = QStringLiteral("Pending: ") + pendingTools.join(QStringLiteral(", "));
-        if (toolsText.length() > 60)
-            toolsText = toolsText.left(60) + QStringLiteral("...");
-        m_currentToolLabel->setText(toolsText);
-        m_currentToolLabel->setVisible(true);
-        appendThinkingDetail(resolvedRound, toolsText);
+        const qsizetype pendingCount = pendingTools.size();
+        m_currentToolStatus = QStringLiteral("%1 tool%2 queued")
+                .arg(static_cast<qlonglong>(pendingCount))
+                .arg(pendingCount == 1 ? QString() : QStringLiteral("s"));
+        m_typingStatus = QStringLiteral("Thinking");
     }
     else
     {
-        m_currentToolLabel->clear();
-        m_currentToolLabel->setVisible(false);
+        m_currentToolStatus.clear();
         if (!normalizedStatus.isEmpty())
-            m_typingLabel->setText(normalizedStatus);
+            m_typingStatus = normalizedStatus;
         else
-            m_typingLabel->setText(QStringLiteral("Thinking"));
+            m_typingStatus = QStringLiteral("Thinking");
     }
 
-    const bool shouldRebuild = !statusIsRoundMeta
-        || !reasoning.trimmed().isEmpty()
-        || !currentTool.trimmed().isEmpty()
-        || !pendingTools.isEmpty();
-
-    if (!shouldRebuild)
-        return;
-
-    if (property("aida_status_rebuild_pending").toBool())
-        return;
-
-    setProperty("aida_status_rebuild_pending", true);
-    QTimer::singleShot(90, this, [this]() {
-        setProperty("aida_status_rebuild_pending", false);
-        if (m_isWaiting)
-            rebuildChatDisplay();
-    });
+    if (!reasoning.isEmpty())
+        refreshThinkingPanelView();
+    else
+        updateLiveStatusLabel();
 }
 
 void AiDAChatPanel::addToolResult(int round, const QString& toolName, bool success, const QString& message)
@@ -2263,46 +2152,201 @@ void AiDAChatPanel::addToolResult(int round, const QString& toolName, bool succe
     if (resolvedRound <= 0)
         return;
 
-    QString icon = success ? QString(QChar(0x2713)) : QString(QChar(0x2717));
-    QString displayMsg = message;
-    if (displayMsg.length() > 100)
-        displayMsg = displayMsg.left(100) + QStringLiteral("...");
+    QString status;
+    if (!toolName.trimmed().isEmpty())
+    {
+        status = success
+            ? QStringLiteral("Completed tool: %1").arg(toolName)
+            : QStringLiteral("Tool issue: %1").arg(toolName);
+    }
+    else
+    {
+        status = success ? QStringLiteral("Tool completed") : QStringLiteral("Tool failed");
+    }
 
-    QString line = QStringLiteral("%1 %2").arg(icon, toolName);
-    if (!displayMsg.isEmpty())
-        line += QStringLiteral("  ") + displayMsg;
+    if (!message.trimmed().isEmpty() && !looksLikeToolStatusNoiseLine(message))
+        appendThinkingDetail(resolvedRound, message.trimmed());
 
-    appendThinkingDetail(resolvedRound, line);
-
-    if (property("aida_status_rebuild_pending").toBool())
-        return;
-
-    setProperty("aida_status_rebuild_pending", true);
-    QTimer::singleShot(80, this, [this]() {
-        setProperty("aida_status_rebuild_pending", false);
-        if (m_isWaiting)
-            rebuildChatDisplay();
-    });
-}
-
-void AiDAChatPanel::setThinkingExpanded(bool expanded)
-{
-    m_thinkingExpanded = expanded;
-    m_thinkingDetails->setVisible(expanded);
-    m_thinkingToggleBtn->setText(expanded ? QString(QChar(0x25BC)) : QString(QChar(0x25B6)));
+    m_currentToolStatus = status;
+    updateLiveStatusLabel();
 }
 
 void AiDAChatPanel::clearThinkingStatus()
 {
-    m_streamingDisplay->clear();
     m_streamBuffer.clear();
     m_typewriterQueue.clear();
     setProperty("aida_stream_rebuild_pending", false);
     setProperty("aida_status_rebuild_pending", false);
     m_thinkingRounds.clear();
     m_activeThinkingRound = -1;
-    m_currentToolLabel->clear();
-    m_currentToolLabel->setVisible(false);
+    m_liveThinkingBlock = nullptr;
+    m_liveStreamLabel = nullptr;
+    m_liveStatusLabel = nullptr;
+    m_currentToolStatus.clear();
+}
+
+QString AiDAChatPanel::buildLiveThinkingPreview() const
+{
+    QString preview = m_streamBuffer.trimmed();
+    if (preview.isEmpty())
+        return QString();
+
+    preview.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
+    preview.replace(QRegularExpression(QStringLiteral("[\\t ]+")), QStringLiteral(" "));
+    preview.replace(QRegularExpression(QStringLiteral("\\n{3,}")), QStringLiteral("\n\n"));
+    if (preview.length() > 1400)
+        preview = preview.left(1400).trimmed() + QStringLiteral("...");
+    return preview;
+}
+
+void AiDAChatPanel::refreshThinkingPanelView()
+{
+    if (!m_isWaiting)
+        return;
+
+    if (property("aida_status_rebuild_pending").toBool())
+        return;
+
+    setProperty("aida_status_rebuild_pending", true);
+    QTimer::singleShot(120, this, [this]() {
+        setProperty("aida_status_rebuild_pending", false);
+        if (!m_isWaiting)
+            return;
+        if (m_liveThinkingBlock != nullptr)
+            rebuildLiveThinkingBlock();
+        else
+            rebuildChatDisplay();
+    });
+}
+
+void AiDAChatPanel::rebuildLiveThinkingBlock()
+{
+    if (m_liveThinkingBlock == nullptr || !m_isWaiting)
+        return;
+
+    QVBoxLayout* blockLayout = qobject_cast<QVBoxLayout*>(m_liveThinkingBlock->layout());
+    if (blockLayout == nullptr)
+        return;
+
+    m_chatDisplayViewport->setUpdatesEnabled(false);
+
+    QLayoutItem* item = nullptr;
+    while ((item = blockLayout->takeAt(0)) != nullptr)
+    {
+        if (QWidget* w = item->widget())
+            delete w;
+        delete item;
+    }
+    m_liveStreamLabel = nullptr;
+    m_liveStatusLabel = nullptr;
+
+    const int viewportWidth = m_chatDisplay->viewport()->width() > 0
+        ? m_chatDisplay->viewport()->width()
+        : qMax(320, width() - 24);
+    const int maxBubbleWidth = qMax(260, (viewportWidth * 78) / 100);
+
+    auto addEntry = [&](const QString& role, const QString& msg, int index) {
+        if (role == QStringLiteral("ThinkingHeader"))
+        {
+            bool expanded = false;
+            for (const ThinkingRound& entry : m_thinkingRounds)
+            {
+                if (entry.round == index)
+                {
+                    expanded = entry.expanded;
+                    break;
+                }
+            }
+            QPushButton* headerBtn = new QPushButton(m_liveThinkingBlock);
+            headerBtn->setObjectName(QStringLiteral("chatThinkingHeaderBtn"));
+            headerBtn->setFlat(true);
+            headerBtn->setAutoDefault(false);
+            headerBtn->setDefault(false);
+            headerBtn->setCursor(Qt::PointingHandCursor);
+            headerBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+            headerBtn->setText((expanded ? QStringLiteral("v ") : QStringLiteral("> ")) + msg);
+            headerBtn->setToolTip(QStringLiteral("Toggle round thinking details"));
+            headerBtn->setMinimumHeight(14);
+            headerBtn->setMaximumHeight(18);
+            QObject::connect(headerBtn, &QPushButton::clicked, this, [this, index]() {
+                for (ThinkingRound& entry : m_thinkingRounds)
+                {
+                    if (entry.round == index)
+                    {
+                        entry.expanded = !entry.expanded;
+                        break;
+                    }
+                }
+                rebuildLiveThinkingBlock();
+            });
+            blockLayout->addWidget(headerBtn);
+        }
+        else
+        {
+            QLabel* thinkingLabel = new QLabel(msg, m_liveThinkingBlock);
+            thinkingLabel->setObjectName(QStringLiteral("chatThinkingLabel"));
+            thinkingLabel->setTextFormat(Qt::PlainText);
+            thinkingLabel->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+            thinkingLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+            thinkingLabel->setWordWrap(true);
+            thinkingLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+            thinkingLabel->setMaximumWidth(maxBubbleWidth - 12);
+            blockLayout->addWidget(thinkingLabel);
+        }
+    };
+
+    for (const ThinkingRound& round : m_thinkingRounds)
+    {
+        QString header = round.header.trimmed();
+        if (header.isEmpty())
+            header = QStringLiteral("Planning (Round %1)").arg(round.round > 0 ? round.round : 1);
+
+        addEntry(QStringLiteral("ThinkingHeader"), header, round.round);
+
+        if (round.expanded)
+        {
+            const QString details = round.details.trimmed();
+            if (!details.isEmpty())
+                addEntry(QStringLiteral("Thinking"), details, round.round);
+        }
+    }
+
+    m_liveStreamLabel = new QLabel(m_liveThinkingBlock);
+    m_liveStreamLabel->setObjectName(QStringLiteral("chatThinkingLabel"));
+    m_liveStreamLabel->setTextFormat(Qt::PlainText);
+    m_liveStreamLabel->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+    m_liveStreamLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_liveStreamLabel->setWordWrap(true);
+    m_liveStreamLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_liveStreamLabel->setMaximumWidth(maxBubbleWidth - 12);
+    const QString preview = buildLiveThinkingPreview();
+    if (!preview.isEmpty())
+        m_liveStreamLabel->setText(preview);
+    blockLayout->addWidget(m_liveStreamLabel);
+
+    m_liveStatusLabel = new QLabel(m_liveThinkingBlock);
+    m_liveStatusLabel->setObjectName(QStringLiteral("chatLiveStatusLabel"));
+    m_liveStatusLabel->setTextFormat(Qt::PlainText);
+    m_liveStatusLabel->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    m_liveStatusLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_liveStatusLabel->setMinimumHeight(16);
+    updateLiveStatusLabel();
+    blockLayout->addWidget(m_liveStatusLabel);
+
+    m_chatDisplayViewport->setUpdatesEnabled(true);
+    scrollToBottom();
+}
+
+void AiDAChatPanel::updateLiveStatusLabel()
+{
+    if (m_liveStatusLabel == nullptr)
+        return;
+    qint64 elapsed = m_thinkingStopwatch.elapsed() / 1000;
+    QString statusText = m_currentToolStatus.isEmpty()
+        ? m_typingStatus : m_currentToolStatus;
+    if (elapsed > 0)
+        statusText += QStringLiteral("  ") + formatElapsedTime(elapsed);
+    m_liveStatusLabel->setText(statusText);
 }
 
 static QString stripCodeFences(const QString& text)
@@ -2322,26 +2366,20 @@ static QString stripCodeFences(const QString& text)
     return result;
 }
 
-static bool looksLikeJsonNoiseLine(const QString& line)
+static bool looksLikeToolStatusNoiseLine(const QString& line)
 {
     const QString t = line.trimmed();
     if (t.isEmpty())
         return false;
 
-    if (t.contains(QStringLiteral("\"tool_calls\""), Qt::CaseInsensitive)
-        || t.contains(QStringLiteral("\"tool\""), Qt::CaseInsensitive)
-        || t.contains(QStringLiteral("\"params\""), Qt::CaseInsensitive)
-        || t.contains(QStringLiteral("\"reasoning\""), Qt::CaseInsensitive)
-        || t.contains(QStringLiteral("\"pending_tools\""), Qt::CaseInsensitive)
-        || t.contains(QStringLiteral("\"status\""), Qt::CaseInsensitive)
-        || t.contains(QStringLiteral("\"data\""), Qt::CaseInsensitive))
-    {
+    static const QRegularExpression noiseRe(
+        QStringLiteral("^(?:Pending\\s*:|Executing\\s*:|Executing\\b|Running\\s+[A-Za-z0-9_./:-]+|[\\x{2713}\\x{2714}\\x{2717}]\\s*\\S+|OK\\s+\\S+|Failed\\s+\\S+)") ,
+        QRegularExpression::CaseInsensitiveOption | QRegularExpression::UseUnicodePropertiesOption);
+    if (noiseRe.match(t).hasMatch())
         return true;
-    }
 
-    if (t == QStringLiteral("{") || t == QStringLiteral("}")
-        || t == QStringLiteral("[") || t == QStringLiteral("]")
-        || t == QStringLiteral("},") || t == QStringLiteral("],"))
+    if (t.contains(QStringLiteral("listed"), Qt::CaseInsensitive)
+        && t.contains(QStringLiteral("functions"), Qt::CaseInsensitive))
     {
         return true;
     }
@@ -2353,35 +2391,8 @@ static QString sanitizeAssistantDisplayText(const QString& raw)
 {
     QString s = raw;
     s.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
-
-    s.remove(QRegularExpression(
-        QStringLiteral("```json[\\s\\S]*?```"),
-        QRegularExpression::CaseInsensitiveOption));
-
-    const qsizetype actionsPos = s.indexOf(QStringLiteral("**Agent Actions:**"), 0, Qt::CaseInsensitive);
-    if (actionsPos >= 0)
-    {
-        const qsizetype sep = s.indexOf(QStringLiteral("\n---"), actionsPos, Qt::CaseInsensitive);
-        if (sep > actionsPos)
-            s.remove(actionsPos, sep - actionsPos + 4);
-        else
-            s.remove(actionsPos, s.length() - actionsPos);
-    }
-
-    QStringList filtered;
-    const QStringList lines = s.split(QChar('\n'));
-    filtered.reserve(lines.size());
-    for (const QString& line : lines)
-    {
-        if (looksLikeJsonNoiseLine(line))
-            continue;
-        filtered.push_back(line);
-    }
-
-    QString out = filtered.join(QStringLiteral("\n"));
-    out = stripCodeFences(out);
-    out.replace(QRegularExpression(QStringLiteral("\\n{3,}")), QStringLiteral("\n\n"));
-    return out.trimmed();
+    s.replace(QRegularExpression(QStringLiteral("\\n{3,}")), QStringLiteral("\n\n"));
+    return s.trimmed();
 }
 
 void AiDAChatPanel::appendStreamChunk(const QString& chunk)
@@ -2401,15 +2412,12 @@ void AiDAChatPanel::appendStreamChunk(const QString& chunk)
     if (m_activeThinkingRound <= 0)
         beginThinkingRound(1, QStringLiteral("Thinking"));
 
-    if (property("aida_stream_rebuild_pending").toBool())
-        return;
-
-    setProperty("aida_stream_rebuild_pending", true);
-    QTimer::singleShot(70, this, [this]() {
-        setProperty("aida_stream_rebuild_pending", false);
-        if (m_isWaiting)
-            rebuildChatDisplay();
-    });
+    if (m_liveStreamLabel != nullptr)
+    {
+        QString preview = buildLiveThinkingPreview();
+        if (!preview.isEmpty())
+            m_liveStreamLabel->setText(preview);
+    }
 }
 
 void AiDAChatPanel::resetStreamBuffer()
@@ -2424,7 +2432,7 @@ void AiDAChatPanel::cancelRequest()
         return;
 
     m_plugin->ai_client->cancel_current_request();
-    setThinkingState(false);
+    setThinkingState(false, false);
     m_history.emplace_back("System", "Request cancelled.");
     rebuildChatDisplay();
 }
@@ -2441,7 +2449,6 @@ void AiDAChatPanel::clearHistory()
     m_history.clear();
     m_conversationTags.clear();
     clearThinkingStatus();
-    m_thinkingContainer->setVisible(false);
     m_history.emplace_back("System", "Conversation cleared.");
     rebuildChatDisplay();
 }
@@ -2503,10 +2510,68 @@ void AiDAChatPanel::undoToMessage(int index)
     showToast(QStringLiteral("Conversation rewound"));
 }
 
+void AiDAChatPanel::enterEditMode(int index)
+{
+    if (index < 0 || index >= static_cast<int>(m_history.size()))
+        return;
+    if (m_history[index].first != "User")
+        return;
+
+    m_editingIndex = index;
+    m_userScrolledChat = true;
+    rebuildChatDisplay();
+
+    if (m_editingField != nullptr)
+    {
+        m_chatDisplay->ensureWidgetVisible(m_editingField, 50, 50);
+        m_editingField->setFocus();
+        QTextCursor cursor = m_editingField->textCursor();
+        cursor.movePosition(QTextCursor::End);
+        m_editingField->setTextCursor(cursor);
+    }
+}
+
+void AiDAChatPanel::cancelEditMode()
+{
+    if (m_editingIndex < 0)
+        return;
+    m_editingIndex = -1;
+    m_editingField = nullptr;
+    rebuildChatDisplay();
+}
+
+void AiDAChatPanel::commitEdit(int index)
+{
+    if (m_editingField == nullptr || index < 0)
+        return;
+
+    QString newText = m_editingField->toPlainText().trimmed();
+    if (newText.isEmpty())
+    {
+        cancelEditMode();
+        return;
+    }
+
+    m_editingIndex = -1;
+    m_editingField = nullptr;
+
+    m_history.erase(m_history.begin() + index, m_history.end());
+
+    m_inputField->setPlainText(newText);
+    sendMessage();
+}
+
 void AiDAChatPanel::rebuildChatDisplay()
 {
     if (m_chatMessagesLayout == nullptr)
         return;
+
+    m_liveThinkingBlock = nullptr;
+    m_liveStreamLabel = nullptr;
+    m_liveStatusLabel = nullptr;
+    m_editingField = nullptr;
+
+    m_chatDisplayViewport->setUpdatesEnabled(false);
 
     QLayoutItem* item = nullptr;
     while ((item = m_chatMessagesLayout->takeAt(0)) != nullptr)
@@ -2520,45 +2585,7 @@ void AiDAChatPanel::rebuildChatDisplay()
         ? m_chatDisplay->viewport()->width()
         : qMax(320, width() - 24);
     const int maxBubbleWidth = qMax(260, (viewportWidth * 78) / 100);
-    const int userMinBubbleWidth = qMin(maxBubbleWidth, qMax(220, (viewportWidth * 40) / 100));
-
-    auto liveThinkingPreview = [this]() {
-        QString preview = sanitizeAssistantDisplayText(m_streamBuffer).trimmed();
-        if (preview.isEmpty())
-            return QString();
-
-        static const QStringList cutMarkers = {
-            QStringLiteral("\"tool_calls\""),
-            QStringLiteral("[Tool Results]"),
-            QStringLiteral("```json")
-        };
-        for (const QString& marker : cutMarkers)
-        {
-            if (preview.contains(marker, Qt::CaseInsensitive))
-            {
-                const QStringList parts = preview.split(marker, Qt::KeepEmptyParts, Qt::CaseInsensitive);
-                if (!parts.isEmpty())
-                    preview = parts.front().trimmed();
-            }
-        }
-
-        QStringList filtered;
-        const QStringList lines = preview.split(QChar('\n'));
-        filtered.reserve(lines.size());
-        for (const QString& line : lines)
-        {
-            if (looksLikeJsonNoiseLine(line))
-                continue;
-            filtered.push_back(line);
-        }
-        preview = filtered.join(QStringLiteral("\n")).trimmed();
-
-        preview.replace(QRegularExpression(QStringLiteral("[\\t ]+")), QStringLiteral(" "));
-        preview.replace(QRegularExpression(QStringLiteral("\\n{3,}")), QStringLiteral("\n\n"));
-        if (preview.length() > 1400)
-            preview = preview.left(1400).trimmed() + QStringLiteral("...");
-        return preview;
-    };
+    const int userMinBubbleWidth = qMin(maxBubbleWidth, qMax(240, (viewportWidth * 46) / 100));
 
     auto handleNavUrl = [this](const QUrl& url) {
         if (url.scheme() != QStringLiteral("nav"))
@@ -2690,8 +2717,8 @@ void AiDAChatPanel::rebuildChatDisplay()
             thinkingContent->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Maximum);
 
             QVBoxLayout* thinkingLayout = new QVBoxLayout(thinkingContent);
-            thinkingLayout->setContentsMargins(2, 0, 2, 0);
-            thinkingLayout->setSpacing(2);
+            thinkingLayout->setContentsMargins(0, 0, 0, 0);
+            thinkingLayout->setSpacing(1);
 
             if (role == QStringLiteral("ThinkingHeader"))
             {
@@ -2707,11 +2734,15 @@ void AiDAChatPanel::rebuildChatDisplay()
 
                 QPushButton* headerBtn = new QPushButton(thinkingContent);
                 headerBtn->setObjectName(QStringLiteral("chatThinkingHeaderBtn"));
-                headerBtn->setFlat(false);
+                headerBtn->setFlat(true);
+                headerBtn->setAutoDefault(false);
+                headerBtn->setDefault(false);
                 headerBtn->setCursor(Qt::PointingHandCursor);
                 headerBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-                headerBtn->setText((expanded ? QStringLiteral("▼ ") : QStringLiteral("▶ ")) + msg);
+                headerBtn->setText((expanded ? QStringLiteral("v ") : QStringLiteral("> ")) + msg);
                 headerBtn->setToolTip(QStringLiteral("Toggle round thinking details"));
+                headerBtn->setMinimumHeight(14);
+                headerBtn->setMaximumHeight(16);
                 QObject::connect(headerBtn, &QPushButton::clicked, this, [this, index]() {
                     for (ThinkingRound& entry : m_thinkingRounds)
                     {
@@ -2771,9 +2802,6 @@ void AiDAChatPanel::rebuildChatDisplay()
             footerLayout->setContentsMargins(0, 2, 0, 0);
             footerLayout->setSpacing(4);
             footerLayout->addStretch();
-            footerLayout->addWidget(makeActionButton(QStringLiteral("Undo"), chat_action_icon_t::undo, [this, index]() {
-                undoToMessage(index);
-            }, aiContent));
             footerLayout->addWidget(makeActionButton(QStringLiteral("Copy"), chat_action_icon_t::copy, [this, index]() {
                 copyMessageToClipboard(index);
             }, aiContent));
@@ -2795,24 +2823,52 @@ void AiDAChatPanel::rebuildChatDisplay()
             bubble->setMinimumWidth(userMinBubbleWidth);
 
         QVBoxLayout* bubbleLayout = new QVBoxLayout(bubble);
-        bubbleLayout->setContentsMargins(12, 5, 12, 5);
+        bubbleLayout->setContentsMargins(14, 3, 14, 3);
         bubbleLayout->setSpacing(2);
 
-        bubbleLayout->addWidget(makePlainLabel(msg, bubble));
-
-        if (role == QStringLiteral("User"))
+        if (role == QStringLiteral("User") && m_editingIndex == index)
         {
-            QHBoxLayout* footerLayout = new QHBoxLayout();
-            footerLayout->setContentsMargins(0, 2, 0, 0);
-            footerLayout->setSpacing(4);
-            footerLayout->addStretch();
-            footerLayout->addWidget(makeActionButton(QStringLiteral("Undo"), chat_action_icon_t::undo, [this, index]() {
-                undoToMessage(index);
+            m_editingField = new QTextEdit(bubble);
+            m_editingField->setObjectName(QStringLiteral("chatEditField"));
+            m_editingField->setPlainText(msg);
+            m_editingField->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+            m_editingField->setMaximumWidth(maxBubbleWidth - 28);
+            m_editingField->setMinimumHeight(36);
+            m_editingField->setMaximumHeight(200);
+            m_editingField->installEventFilter(this);
+            bubbleLayout->addWidget(m_editingField);
+
+            QHBoxLayout* editFooter = new QHBoxLayout();
+            editFooter->setContentsMargins(0, 4, 0, 0);
+            editFooter->setSpacing(4);
+            editFooter->addStretch();
+            editFooter->addWidget(makeActionButton(QStringLiteral("Send"), chat_action_icon_t::send, [this, index]() {
+                commitEdit(index);
             }, bubble));
-            footerLayout->addWidget(makeActionButton(QStringLiteral("Copy"), chat_action_icon_t::copy, [this, index]() {
-                copyMessageToClipboard(index);
-            }, bubble));
-            bubbleLayout->addLayout(footerLayout);
+            bubbleLayout->addLayout(editFooter);
+        }
+        else
+        {
+            QLabel* label = makePlainLabel(msg, bubble);
+            if (role == QStringLiteral("User"))
+                label->setTextInteractionFlags(Qt::NoTextInteraction);
+            bubbleLayout->addWidget(label);
+
+            if (role == QStringLiteral("User"))
+            {
+                QHBoxLayout* footerLayout = new QHBoxLayout();
+                footerLayout->setContentsMargins(0, 2, 0, 0);
+                footerLayout->setSpacing(4);
+                footerLayout->addStretch();
+                footerLayout->addWidget(makeActionButton(QStringLiteral("Copy"), chat_action_icon_t::copy, [this, index]() {
+                    copyMessageToClipboard(index);
+                }, bubble));
+                bubbleLayout->addLayout(footerLayout);
+
+                bubble->setCursor(Qt::PointingHandCursor);
+                bubble->setProperty("historyIndex", index);
+                bubble->installEventFilter(this);
+            }
         }
 
         if (role == QStringLiteral("User"))
@@ -2860,34 +2916,146 @@ void AiDAChatPanel::rebuildChatDisplay()
     }
     else
     {
-        for (int i = 0; i < static_cast<int>(m_history.size()); ++i)
-            addMessageRow(QString::fromStdString(m_history[i].first), QString::fromStdString(m_history[i].second), i);
+        auto addThinkingEntry = [&](QVBoxLayout* targetLayout, const QString& role, const QString& msg, int index) {
+            QWidget* parent = targetLayout->parentWidget();
+            if (role == QStringLiteral("ThinkingHeader"))
+            {
+                bool expanded = false;
+                for (const ThinkingRound& entry : m_thinkingRounds)
+                {
+                    if (entry.round == index)
+                    {
+                        expanded = entry.expanded;
+                        break;
+                    }
+                }
+                QPushButton* headerBtn = new QPushButton(parent);
+                headerBtn->setObjectName(QStringLiteral("chatThinkingHeaderBtn"));
+                headerBtn->setFlat(true);
+                headerBtn->setAutoDefault(false);
+                headerBtn->setDefault(false);
+                headerBtn->setCursor(Qt::PointingHandCursor);
+                headerBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+                headerBtn->setText((expanded ? QStringLiteral("v ") : QStringLiteral("> ")) + msg);
+                headerBtn->setToolTip(QStringLiteral("Toggle round thinking details"));
+                headerBtn->setMinimumHeight(14);
+                headerBtn->setMaximumHeight(18);
+                QObject::connect(headerBtn, &QPushButton::clicked, this, [this, index]() {
+                    for (ThinkingRound& entry : m_thinkingRounds)
+                    {
+                        if (entry.round == index)
+                        {
+                            entry.expanded = !entry.expanded;
+                            break;
+                        }
+                    }
+                    rebuildChatDisplay();
+                });
+                targetLayout->addWidget(headerBtn);
+            }
+            else
+            {
+                QLabel* thinkingLabel = new QLabel(msg, parent);
+                thinkingLabel->setObjectName(QStringLiteral("chatThinkingLabel"));
+                thinkingLabel->setTextFormat(Qt::PlainText);
+                thinkingLabel->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+                thinkingLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+                thinkingLabel->setWordWrap(true);
+                thinkingLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+                thinkingLabel->setMaximumWidth(maxBubbleWidth - 12);
+                targetLayout->addWidget(thinkingLabel);
+            }
+        };
+
+        auto createThinkingBlock = [&]() -> std::pair<QWidget*, QVBoxLayout*> {
+            QWidget* block = new QWidget(m_chatDisplayViewport);
+            block->setObjectName(QStringLiteral("chatThinkingContent"));
+            block->setAttribute(Qt::WA_StyledBackground, false);
+            block->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Maximum);
+            block->setFixedWidth(maxBubbleWidth);
+            QVBoxLayout* layout = new QVBoxLayout(block);
+            layout->setContentsMargins(0, 0, 0, 0);
+            layout->setSpacing(1);
+            return {block, layout};
+        };
+
+        {
+            int i = 0;
+            while (i < static_cast<int>(m_history.size()))
+            {
+                if (m_history[i].first == "ThinkingHeader" || m_history[i].first == "Thinking")
+                {
+                    auto [block, blockLayout] = createThinkingBlock();
+                    while (i < static_cast<int>(m_history.size())
+                           && (m_history[i].first == "ThinkingHeader" || m_history[i].first == "Thinking"))
+                    {
+                        addThinkingEntry(blockLayout,
+                            QString::fromStdString(m_history[i].first),
+                            QString::fromStdString(m_history[i].second), i);
+                        ++i;
+                    }
+                    m_chatMessagesLayout->addWidget(block, 0, Qt::AlignLeft);
+                }
+                else
+                {
+                    addMessageRow(QString::fromStdString(m_history[i].first),
+                                  QString::fromStdString(m_history[i].second), i);
+                    ++i;
+                }
+            }
+        }
 
         if (m_isWaiting)
         {
+            auto [block, blockLayout] = createThinkingBlock();
+            bool hasContent = false;
+
             for (const ThinkingRound& round : m_thinkingRounds)
             {
                 QString header = round.header.trimmed();
                 if (header.isEmpty())
                     header = QStringLiteral("Planning (Round %1)").arg(round.round > 0 ? round.round : 1);
 
-                addMessageRow(QStringLiteral("ThinkingHeader"), header, round.round);
+                addThinkingEntry(blockLayout, QStringLiteral("ThinkingHeader"), header, round.round);
+                hasContent = true;
 
-                if (round.expanded || round.round == m_activeThinkingRound)
+                if (round.expanded)
                 {
                     const QString details = round.details.trimmed();
                     if (!details.isEmpty())
-                        addMessageRow(QStringLiteral("Thinking"), details, round.round);
-
-                    const QString live = liveThinkingPreview();
-                    if (!live.isEmpty() && live != details)
-                        addMessageRow(QStringLiteral("Thinking"), live, round.round);
+                        addThinkingEntry(blockLayout, QStringLiteral("Thinking"), details, round.round);
                 }
             }
+
+            m_liveStreamLabel = new QLabel(block);
+            m_liveStreamLabel->setObjectName(QStringLiteral("chatThinkingLabel"));
+            m_liveStreamLabel->setTextFormat(Qt::PlainText);
+            m_liveStreamLabel->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+            m_liveStreamLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+            m_liveStreamLabel->setWordWrap(true);
+            m_liveStreamLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+            m_liveStreamLabel->setMaximumWidth(maxBubbleWidth - 12);
+            const QString preview = buildLiveThinkingPreview();
+            if (!preview.isEmpty())
+                m_liveStreamLabel->setText(preview);
+            blockLayout->addWidget(m_liveStreamLabel);
+
+            m_liveStatusLabel = new QLabel(block);
+            m_liveStatusLabel->setObjectName(QStringLiteral("chatLiveStatusLabel"));
+            m_liveStatusLabel->setTextFormat(Qt::PlainText);
+            m_liveStatusLabel->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+            m_liveStatusLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+            m_liveStatusLabel->setMinimumHeight(16);
+            updateLiveStatusLabel();
+            blockLayout->addWidget(m_liveStatusLabel);
+
+            m_liveThinkingBlock = block;
+            m_chatMessagesLayout->addWidget(block, 0, Qt::AlignLeft);
         }
     }
 
     m_chatMessagesLayout->addStretch();
+    m_chatDisplayViewport->setUpdatesEnabled(true);
     scrollToBottom();
 }
 
@@ -2935,7 +3103,7 @@ QString AiDAChatPanel::formatMessageMarkdown(const QString& role, const QString&
     {
         markdown += QStringLiteral("## You\n\n");
         markdown += msg;
-        markdown += QStringLiteral("\n\n[Undo](undo:%1) [Copy](copy:%1)\n\n").arg(index);
+        markdown += QStringLiteral("\n\n[Copy](copy:%1)\n\n").arg(index);
         return markdown;
     }
 
@@ -2943,7 +3111,7 @@ QString AiDAChatPanel::formatMessageMarkdown(const QString& role, const QString&
     {
         markdown += QStringLiteral("## AiDA\n\n");
         markdown += msg;
-        markdown += QStringLiteral("\n\n[Undo](undo:%1) [Copy](copy:%1)\n\n").arg(index);
+        markdown += QStringLiteral("\n\n[Copy](copy:%1)\n\n").arg(index);
         return markdown;
     }
 
@@ -3523,7 +3691,8 @@ void AiDAChatPanel::startNewConversation()
     m_history.clear();
     m_conversationTags.clear();
     clearThinkingStatus();
-    m_thinkingContainer->setVisible(false);
+    m_editingIndex = -1;
+    m_editingField = nullptr;
     m_activeConversationIndex = -1;
     rebuildChatDisplay();
     m_inputField->clear();
@@ -3539,6 +3708,8 @@ void AiDAChatPanel::loadConversation(int index)
     m_activeConversationIndex = index;
     m_history = m_savedConversations[static_cast<size_t>(index)].messages;
     m_conversationTags.clear();
+    m_editingIndex = -1;
+    m_editingField = nullptr;
     rebuildChatDisplay();
 }
 

@@ -10399,6 +10399,448 @@ static bool is_ida_host_process_name(const std::string& process_name)
         || lower.find("idat64.exe") != std::string::npos;
 }
 
+static std::string trim_ascii_copy(const std::string& text)
+{
+    const std::size_t first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return {};
+    const std::size_t last = text.find_last_not_of(" \t\r\n");
+    return text.substr(first, last - first + 1);
+}
+
+static bool parse_u32_id_value(const json& value, std::uint32_t& out)
+{
+    if (value.is_number_unsigned())
+    {
+        const auto v = value.get<std::uint64_t>();
+        if (v == 0 || v > 0xFFFFFFFFULL)
+            return false;
+        out = static_cast<std::uint32_t>(v);
+        return true;
+    }
+
+    if (value.is_number_integer())
+    {
+        const auto v = value.get<std::int64_t>();
+        if (v <= 0 || v > 0xFFFFFFFFLL)
+            return false;
+        out = static_cast<std::uint32_t>(v);
+        return true;
+    }
+
+    if (!value.is_string())
+        return false;
+
+    std::string s = trim_ascii_copy(value.get<std::string>());
+    if (s.empty())
+        return false;
+
+    try
+    {
+        std::size_t idx = 0;
+        std::uint64_t parsed = 0;
+        if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+            parsed = std::stoull(s, &idx, 16);
+        else
+            parsed = std::stoull(s, &idx, 10);
+
+        if (idx != s.size() || parsed == 0 || parsed > 0xFFFFFFFFULL)
+            return false;
+
+        out = static_cast<std::uint32_t>(parsed);
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+static bool parse_single_hex_byte_token(const std::string& raw_token, std::uint8_t& out)
+{
+    std::string token = trim_ascii_copy(raw_token);
+    if (token.empty())
+        return false;
+
+    if (token.size() > 2 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X'))
+        token = token.substr(2);
+
+    if (token.empty())
+        return false;
+
+    const bool all_hex = std::all_of(token.begin(), token.end(),
+        [](unsigned char c) { return std::isxdigit(c) != 0; });
+    const bool has_hex_alpha = std::any_of(token.begin(), token.end(),
+        [](unsigned char c) { return std::isalpha(c) != 0; });
+
+    if (all_hex)
+    {
+        try
+        {
+            std::uint64_t v16 = std::stoull(token, nullptr, 16);
+            if (v16 <= 0xFFULL && (has_hex_alpha || token.size() <= 2))
+            {
+                out = static_cast<std::uint8_t>(v16);
+                return true;
+            }
+        }
+        catch (...) {}
+    }
+
+    const bool all_digits = std::all_of(token.begin(), token.end(),
+        [](unsigned char c) { return std::isdigit(c) != 0; });
+    if (all_digits)
+    {
+        try
+        {
+            std::uint64_t v10 = std::stoull(token, nullptr, 10);
+            if (v10 <= 0xFFULL)
+            {
+                out = static_cast<std::uint8_t>(v10);
+                return true;
+            }
+        }
+        catch (...) {}
+    }
+
+    return false;
+}
+
+static bool parse_byte_sequence(const json& bytes_value, std::vector<std::uint8_t>& out, std::string& error)
+{
+    out.clear();
+
+    if (bytes_value.is_array())
+    {
+        for (std::size_t i = 0; i < bytes_value.size(); ++i)
+        {
+            const auto& item = bytes_value[i];
+            if (item.is_number_integer())
+            {
+                const auto v = item.get<std::int64_t>();
+                if (v < 0 || v > 255)
+                {
+                    error = "Byte array value out of range at index " + std::to_string(i) + " (expected 0..255).";
+                    return false;
+                }
+                out.push_back(static_cast<std::uint8_t>(v));
+                continue;
+            }
+
+            if (item.is_number_unsigned())
+            {
+                const auto v = item.get<std::uint64_t>();
+                if (v > 255)
+                {
+                    error = "Byte array value out of range at index " + std::to_string(i) + " (expected 0..255).";
+                    return false;
+                }
+                out.push_back(static_cast<std::uint8_t>(v));
+                continue;
+            }
+
+            if (item.is_string())
+            {
+                std::uint8_t b = 0;
+                if (!parse_single_hex_byte_token(item.get<std::string>(), b))
+                {
+                    error = "Invalid byte token at index " + std::to_string(i) + ".";
+                    return false;
+                }
+                out.push_back(b);
+                continue;
+            }
+
+            error = "Unsupported bytes array element type at index " + std::to_string(i) + ".";
+            return false;
+        }
+
+        if (out.empty())
+            error = "No bytes were provided.";
+        return !out.empty();
+    }
+
+    if (!bytes_value.is_string())
+    {
+        error = "'bytes' must be either a string or an array.";
+        return false;
+    }
+
+    std::string text = trim_ascii_copy(bytes_value.get<std::string>());
+    if (text.empty())
+    {
+        error = "No bytes were provided.";
+        return false;
+    }
+
+    if (!text.empty() && text.front() == '[')
+    {
+        try
+        {
+            json parsed = json::parse(text);
+            if (!parsed.is_array())
+            {
+                error = "String bytes payload starts with '[' but is not a valid array.";
+                return false;
+            }
+            return parse_byte_sequence(parsed, out, error);
+        }
+        catch (...)
+        {
+            error = "Failed to parse bytes array string.";
+            return false;
+        }
+    }
+
+    std::string tokenized = text;
+    std::replace(tokenized.begin(), tokenized.end(), ',', ' ');
+    if (tokenized.find(' ') != std::string::npos || tokenized.find('\t') != std::string::npos ||
+        tokenized.find('\n') != std::string::npos || tokenized.find('\r') != std::string::npos)
+    {
+        std::istringstream iss(tokenized);
+        std::string token;
+        std::size_t index = 0;
+        while (iss >> token)
+        {
+            std::uint8_t b = 0;
+            if (!parse_single_hex_byte_token(token, b))
+            {
+                error = "Invalid hex byte token '" + token + "' at position " + std::to_string(index) + ".";
+                return false;
+            }
+            out.push_back(b);
+            ++index;
+        }
+        if (out.empty())
+            error = "No bytes were provided.";
+        return !out.empty();
+    }
+
+    if (tokenized.size() > 2 && tokenized[0] == '0' && (tokenized[1] == 'x' || tokenized[1] == 'X'))
+        tokenized = tokenized.substr(2);
+
+    if (tokenized.size() % 2 != 0)
+    {
+        error = "Packed hex string must contain an even number of hex digits.";
+        return false;
+    }
+
+    if (!std::all_of(tokenized.begin(), tokenized.end(),
+        [](unsigned char c) { return std::isxdigit(c) != 0; }))
+    {
+        error = "Packed hex string contains non-hex characters.";
+        return false;
+    }
+
+    for (std::size_t i = 0; i < tokenized.size(); i += 2)
+    {
+        const std::string byte_str = tokenized.substr(i, 2);
+        out.push_back(static_cast<std::uint8_t>(std::stoul(byte_str, nullptr, 16)));
+    }
+
+    if (out.empty())
+        error = "No bytes were provided.";
+
+    return !out.empty();
+}
+
+static bool is_process_alive(std::uint32_t pid)
+{
+    if (pid == 0)
+        return false;
+
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (h == nullptr)
+        return false;
+
+    DWORD exit_code = 0;
+    const bool ok = GetExitCodeProcess(h, &exit_code) != FALSE;
+    CloseHandle(h);
+
+    return ok && exit_code == STILL_ACTIVE;
+}
+
+static std::optional<tool_result_t> ensure_attached_process_context(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+
+    std::uint32_t requested_pid = 0;
+    if (params.contains("process_id"))
+    {
+        if (!parse_u32_id_value(params["process_id"], requested_pid))
+            return tool_result_t::error(OBFSTR("Invalid process_id. Expected a positive decimal PID or 0x-prefixed hex PID."));
+    }
+    else if (params.contains("pid"))
+    {
+        if (!parse_u32_id_value(params["pid"], requested_pid))
+            return tool_result_t::error(OBFSTR("Invalid pid. Expected a positive decimal PID or 0x-prefixed hex PID."));
+    }
+
+    if (requested_pid != 0 && anti_re::is_self_target_pid(requested_pid))
+        return tool_result_t::error(OBFSTR("Refusing to target the current IDA host PID."));
+
+    const std::uint32_t current_pid = device->get_process_id();
+    if (requested_pid != 0 && requested_pid != current_pid)
+    {
+        if (!is_process_alive(requested_pid))
+            return tool_result_t::error(OBFSTR("process_id ") + std::to_string(requested_pid) + OBFSTR(" is not alive."));
+
+        device->clear_process_context();
+        device->set_process_id(requested_pid);
+        (void)device->find_image();
+        device->solve_dtb();
+
+        if (device->get_dtb() == 0)
+        {
+            device->clear_process_context();
+            return tool_result_t::error(OBFSTR("Failed to solve DTB for process_id ") + std::to_string(requested_pid) + OBFSTR(". Reattach by name with driver_attach."));
+        }
+    }
+
+    if (device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Not attached. Call driver_attach first or pass process_id."));
+
+    if (!is_process_alive(device->get_process_id()))
+    {
+        const std::uint32_t dead_pid = device->get_process_id();
+        device->clear_process_context();
+        return tool_result_t::error(OBFSTR("Attached process PID ") + std::to_string(dead_pid) + OBFSTR(" is no longer alive. Call driver_attach again."));
+    }
+
+    if (device->get_dtb() == 0)
+    {
+        device->solve_dtb();
+        if (device->get_dtb() == 0)
+            return tool_result_t::error(OBFSTR("Failed to solve DTB for the attached process."));
+    }
+
+    return std::nullopt;
+}
+
+static std::optional<std::uint32_t> parse_tid_param(const json& params)
+{
+    if (!params.contains("tid"))
+        return std::nullopt;
+
+    std::uint32_t tid = 0;
+    if (!parse_u32_id_value(params["tid"], tid) || tid == 0)
+        return std::nullopt;
+    return tid;
+}
+
+static bool is_probably_kernel_address(std::uint64_t address)
+{
+    return address >= 0xFFFF000000000000ULL;
+}
+
+static std::string read_remote_unicode_ascii(voyager::device_t* dev,
+                                             std::uint64_t ptr,
+                                             std::uint16_t byte_len,
+                                             std::uint16_t max_len)
+{
+    if (dev == nullptr || ptr == 0 || byte_len == 0 || byte_len > max_len)
+        return {};
+
+    std::vector<std::uint8_t> raw(byte_len, 0);
+    if (dev->read_raw(ptr, raw.data(), byte_len) == 0)
+        return {};
+
+    std::string text;
+    text.reserve(byte_len / 2);
+    for (std::size_t i = 0; i + 1 < raw.size(); i += 2)
+    {
+        const std::uint16_t wc = raw[i] | (static_cast<std::uint16_t>(raw[i + 1]) << 8);
+        if (wc == 0)
+            break;
+        text += (wc >= 32 && wc < 128) ? static_cast<char>(wc) : '?';
+    }
+
+    return text;
+}
+
+static bool resolve_loaded_module_base(const std::string& query,
+                                       std::uint64_t& out_base,
+                                       std::string& out_name)
+{
+    out_base = 0;
+    out_name.clear();
+
+    if (!device || !device->is_connected() || device->get_process_id() == 0 || query.empty())
+        return false;
+
+    voyager::device_t::peb_info peb{};
+    if (!device->read_peb(peb) || peb.ldr_address == 0)
+        return false;
+
+    const std::string needle = to_lower_ascii_copy(query);
+    const std::uint64_t list_head = peb.ldr_address + 0x10;
+    std::uint64_t current = device->read<std::uint64_t>(list_head);
+    if (current == 0 || current == list_head)
+        return false;
+
+    auto basename_of_path = [](const std::string& path) {
+        const std::size_t pos = path.find_last_of("\\/");
+        return pos == std::string::npos ? path : path.substr(pos + 1);
+    };
+
+    std::uint64_t partial_base = 0;
+    std::string partial_name;
+    int max_iter = 1024;
+
+    while (current != list_head && current != 0 && max_iter-- > 0)
+    {
+        const std::uint64_t base = device->read<std::uint64_t>(current + 0x30);
+        const std::string module_name = read_remote_unicode_ascii(
+            device.get(),
+            device->read<std::uint64_t>(current + 0x60),
+            device->read<std::uint16_t>(current + 0x58),
+            520);
+        const std::string module_path = read_remote_unicode_ascii(
+            device.get(),
+            device->read<std::uint64_t>(current + 0x50),
+            device->read<std::uint16_t>(current + 0x48),
+            1024);
+
+        const std::string lower_name = to_lower_ascii_copy(module_name);
+        const std::string lower_path = to_lower_ascii_copy(module_path);
+        const std::string lower_file = to_lower_ascii_copy(basename_of_path(module_path));
+
+        const bool exact_match = (lower_name == needle || lower_path == needle || lower_file == needle);
+        const bool partial_match = !exact_match &&
+            (lower_name.find(needle) != std::string::npos ||
+             lower_path.find(needle) != std::string::npos ||
+             lower_file.find(needle) != std::string::npos);
+
+        if (base != 0 && exact_match)
+        {
+            out_base = base;
+            out_name = module_name.empty() ? module_path : module_name;
+            return true;
+        }
+
+        if (base != 0 && partial_match && partial_base == 0)
+        {
+            partial_base = base;
+            partial_name = module_name.empty() ? module_path : module_name;
+        }
+
+        const std::uint64_t next = device->read<std::uint64_t>(current);
+        if (next == current || next == 0)
+            break;
+        current = next;
+    }
+
+    if (partial_base != 0)
+    {
+        out_base = partial_base;
+        out_name = partial_name;
+        return true;
+    }
+
+    return false;
+}
+
 tool_result_t driver_connect(const json& params)
 {
     if (device->is_connected())
@@ -10466,7 +10908,16 @@ tool_result_t driver_attach(const json& params)
             return tool_result_t::error(OBFSTR("Cannot connect to kernel driver. Load the driver first."));
     }
 
-    std::string process_name = params["process"].get<std::string>();
+    std::string process_name;
+    if (params.contains("process") && params["process"].is_string())
+        process_name = trim_ascii_copy(params["process"].get<std::string>());
+    else if (params.contains("process_name") && params["process_name"].is_string())
+        process_name = trim_ascii_copy(params["process_name"].get<std::string>());
+    else if (params.contains("name") && params["name"].is_string())
+        process_name = trim_ascii_copy(params["name"].get<std::string>());
+
+    if (process_name.empty())
+        return tool_result_t::error(OBFSTR("Missing process name. Use process='target.exe'. Aliases supported: process_name, name."));
 
     if (is_ida_host_process_name(process_name))
         return tool_result_t::error(OBFSTR("Refusing to attach kernel driver to IDA host process name."));
@@ -10524,8 +10975,8 @@ tool_result_t driver_unattach(const json&)
 
 tool_result_t driver_read_memory(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
@@ -10573,8 +11024,8 @@ tool_result_t driver_read_memory(const json& params)
 
 tool_result_t driver_write_memory(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
@@ -10582,17 +11033,14 @@ tool_result_t driver_write_memory(const json& params)
 
     anti_re::guard_driver_self_access(device->get_process_id(), *ea_opt, 1);
 
-    std::string hex_bytes = params["bytes"].get<std::string>();
-    hex_bytes.erase(std::remove(hex_bytes.begin(), hex_bytes.end(), ' '), hex_bytes.end());
-
     std::vector<std::uint8_t> bytes;
-    for (std::size_t i = 0; i + 1 < hex_bytes.length(); i += 2)
+    std::string parse_error;
+    if (!parse_byte_sequence(params["bytes"], bytes, parse_error))
     {
-        try { bytes.push_back(static_cast<std::uint8_t>(std::stoul(hex_bytes.substr(i, 2), nullptr, 16))); }
-        catch (...) { return tool_result_t::error(OBFSTR("Invalid hex byte at offset ") + std::to_string(i)); }
+        return tool_result_t::error(
+            OBFSTR("Invalid bytes format. Use one of: 'DE AD BE EF', 'DEADBEEF', [222,173,190,239], ['DE','AD',...]. Detail: ") +
+            parse_error);
     }
-    if (bytes.empty())
-        return tool_result_t::error(OBFSTR("No bytes to write"));
 
     std::size_t written = device->write_raw(*ea_opt, bytes.data(), bytes.size());
     if (written == 0)
@@ -10601,6 +11049,7 @@ tool_result_t driver_write_memory(const json& params)
     json result;
     result["address"]       = helpers::format_address(*ea_opt);
     result["bytes_written"] = written;
+    result["requested"]     = bytes.size();
     return tool_result_t::ok(OBFSTR("Kernel write: ") + std::to_string(written) + " bytes", result);
 }
 
@@ -12334,8 +12783,8 @@ tool_result_t driver_scan_pattern(const json& params)
 
 tool_result_t driver_read_string(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
@@ -12390,12 +12839,18 @@ tool_result_t driver_read_string(const json& params)
 
 tool_result_t driver_read_pointer_chain(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
-    auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
+    std::string base_address;
+    if (params.contains("address") && params["address"].is_string())
+        base_address = params["address"].get<std::string>();
+    else if (params.contains("base_address") && params["base_address"].is_string())
+        base_address = params["base_address"].get<std::string>();
+
+    auto ea_opt = helpers::parse_address(base_address);
     if (!ea_opt)
-        return tool_result_t::error(OBFSTR("Invalid address"));
+        return tool_result_t::error(OBFSTR("Invalid address. Use address='0x...' (alias base_address is supported)."));
 
     std::vector<std::int64_t> offsets;
     if (params.contains("offsets") && params["offsets"].is_array())
@@ -13615,6 +14070,9 @@ tool_result_t driver_read_kernel_memory(const json& params)
         return tool_result_t::error(OBFSTR("Invalid address: ") + addr_str);
 
     std::uint64_t address = static_cast<std::uint64_t>(addr_opt.value());
+    if (!is_probably_kernel_address(address))
+        return tool_result_t::error(OBFSTR("Address is not a canonical kernel virtual address. Use driver_read_memory for user-mode addresses."));
+
     std::size_t size = params.value("size", 256);
     if (size > 65536) size = 65536;
     if (size == 0) size = 256;
@@ -13692,18 +14150,13 @@ tool_result_t driver_write_kernel_memory(const json& params)
 
     std::uint64_t address = static_cast<std::uint64_t>(addr_opt.value());
 
-    std::string hex_bytes = params["bytes"].get<std::string>();
-    std::vector<std::uint8_t> data;
-    std::istringstream iss(hex_bytes);
-    std::string byte_str;
-    while (iss >> byte_str)
-    {
-        unsigned long val = std::strtoul(byte_str.c_str(), nullptr, 16);
-        data.push_back(static_cast<std::uint8_t>(val));
-    }
+    if (!is_probably_kernel_address(address))
+        return tool_result_t::error(OBFSTR("Address is not a canonical kernel virtual address. Use driver_write_memory for user-mode addresses."));
 
-    if (data.empty())
-        return tool_result_t::error(OBFSTR("No valid bytes to write."));
+    std::vector<std::uint8_t> data;
+    std::string parse_error;
+    if (!parse_byte_sequence(params["bytes"], data, parse_error))
+        return tool_result_t::error(OBFSTR("Invalid bytes format. ") + parse_error);
 
     if (data.size() > 4096)
         return tool_result_t::error(OBFSTR("Write size exceeds 4096 byte limit."));
@@ -13728,8 +14181,8 @@ tool_result_t driver_write_kernel_memory(const json& params)
 
 tool_result_t driver_allocate_memory(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
     std::size_t size = 0;
     if (params.contains("size"))
@@ -13761,37 +14214,43 @@ tool_result_t driver_allocate_memory(const json& params)
 
 tool_result_t driver_free_memory(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
     auto addr_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!addr_opt || *addr_opt == 0)
         return tool_result_t::error(OBFSTR("Invalid address."));
 
     std::uint64_t address = static_cast<std::uint64_t>(*addr_opt);
+
+    voyager::device_t::memory_region_info before{};
+    const bool query_before_free = device->query_memory(address, before);
+
     bool ok = device->free_memory(address);
 
     json result;
     result["address"]    = helpers::format_address(*addr_opt);
     result["freed"]      = ok;
     result["process_id"] = device->get_process_id();
+    result["query_before_free"] = query_before_free;
+    if (query_before_free)
+    {
+        result["region_base"] = helpers::format_address(static_cast<ea_t>(before.base));
+        result["region_size"] = helpers::format_address(static_cast<ea_t>(before.size));
+        result["region_protect"] = before.protect;
+    }
+
     if (ok)
         return tool_result_t::ok(OBFSTR("Memory freed at ") + helpers::format_address(*addr_opt), result);
     else
-        return tool_result_t::error(OBFSTR("Failed to free memory at ") + helpers::format_address(*addr_opt));
+        return tool_result_t::error(OBFSTR("Failed to free memory at ") + helpers::format_address(*addr_opt) +
+            OBFSTR(". If the region was modified through kernel-space writes, verify address space consistency and attached PID."));
 }
 
 tool_result_t driver_call_function(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Call driver_connect then driver_attach first."));
-
-    if (device->get_dtb() == 0)
-    {
-        device->solve_dtb();
-        if (device->get_dtb() == 0)
-            return tool_result_t::error(OBFSTR("Failed to solve DTB for target process."));
-    }
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
     auto func_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!func_opt || *func_opt == 0)
@@ -13800,6 +14259,29 @@ tool_result_t driver_call_function(const json& params)
     std::uint64_t func_addr = static_cast<std::uint64_t>(*func_opt);
 
     anti_re::guard_driver_self_access(device->get_process_id(), func_addr, 1);
+
+    const bool dry_run = params.value("dry_run", false);
+    const bool unsafe_confirmed =
+        params.value("confirm_unsafe", false) ||
+        params.value("allow_unsafe", false) ||
+        params.value("unsafe", false);
+
+    if (dry_run)
+    {
+        json preview;
+        preview["function"] = helpers::format_address(static_cast<ea_t>(func_addr));
+        preview["process_id"] = device->get_process_id();
+        preview["note"] = "Dry-run only. No remote execution performed.";
+        return tool_result_t::ok(OBFSTR("driver_call_function dry-run completed."), preview);
+    }
+
+    if (!unsafe_confirmed)
+    {
+        return tool_result_t::error(
+            OBFSTR("driver_call_function is high-risk and may crash the target process. "
+                   "Re-run with confirm_unsafe=true (or allow_unsafe=true) to execute, "
+                   "or dry_run=true to preview only."));
+    }
 
     std::uint64_t args[4] = {0, 0, 0, 0};
     const char* arg_names[] = {"arg1", "arg2", "arg3", "arg4"};
@@ -13820,6 +14302,14 @@ tool_result_t driver_call_function(const json& params)
 
     std::uint64_t ret = device->call_function(func_addr, args[0], args[1], args[2], args[3]);
 
+    if (!is_process_alive(device->get_process_id()))
+    {
+        const std::uint32_t crashed_pid = device->get_process_id();
+        device->clear_process_context();
+        return tool_result_t::error(OBFSTR("Target process PID ") + std::to_string(crashed_pid) +
+            OBFSTR(" terminated during driver_call_function. Process context was detached for safety."));
+    }
+
     json result;
     result["function"]   = helpers::format_address(static_cast<ea_t>(func_addr));
     result["arg1"]       = helpers::format_address(static_cast<ea_t>(args[0]));
@@ -13837,17 +14327,13 @@ tool_result_t driver_call_function(const json& params)
 
 tool_result_t driver_get_thread_context(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
-    std::uint32_t tid = 0;
-    if (params.contains("tid")) {
-        if (params["tid"].is_string())
-            tid = static_cast<std::uint32_t>(helpers::parse_address(params["tid"].get<std::string>()).value_or(0));
-        else
-            tid = params["tid"].get<std::uint32_t>();
-    }
-    if (tid == 0) return tool_result_t::error(OBFSTR("Thread ID (tid) is required"));
+    const auto tid_opt = parse_tid_param(params);
+    if (!tid_opt)
+        return tool_result_t::error(OBFSTR("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
+    const std::uint32_t tid = *tid_opt;
 
     voyager::device_t::thread_context ctx{};
     if (!device->get_thread_context(tid, ctx))
@@ -13885,17 +14371,13 @@ tool_result_t driver_get_thread_context(const json& params)
 
 tool_result_t driver_set_thread_context(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
-    std::uint32_t tid = 0;
-    if (params.contains("tid")) {
-        if (params["tid"].is_string())
-            tid = static_cast<std::uint32_t>(helpers::parse_address(params["tid"].get<std::string>()).value_or(0));
-        else
-            tid = params["tid"].get<std::uint32_t>();
-    }
-    if (tid == 0) return tool_result_t::error(OBFSTR("Thread ID (tid) is required"));
+    const auto tid_opt = parse_tid_param(params);
+    if (!tid_opt)
+        return tool_result_t::error(OBFSTR("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
+    const std::uint32_t tid = *tid_opt;
 
     voyager::device_t::thread_context ctx{};
     std::uint64_t mask = 0;
@@ -13937,8 +14419,8 @@ tool_result_t driver_set_thread_context(const json& params)
 tool_result_t driver_enumerate_threads(const json& params)
 {
     (void)params;
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
     auto threads = device->enumerate_threads();
     if (threads.empty())
@@ -13961,17 +14443,13 @@ tool_result_t driver_enumerate_threads(const json& params)
 
 tool_result_t driver_suspend_thread(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
-    std::uint32_t tid = 0;
-    if (params.contains("tid")) {
-        if (params["tid"].is_string())
-            tid = static_cast<std::uint32_t>(helpers::parse_address(params["tid"].get<std::string>()).value_or(0));
-        else
-            tid = params["tid"].get<std::uint32_t>();
-    }
-    if (tid == 0) return tool_result_t::error(OBFSTR("Thread ID (tid) is required"));
+    const auto tid_opt = parse_tid_param(params);
+    if (!tid_opt)
+        return tool_result_t::error(OBFSTR("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
+    const std::uint32_t tid = *tid_opt;
 
     std::uint32_t prev = 0;
     if (!device->suspend_thread(tid, &prev))
@@ -13985,17 +14463,13 @@ tool_result_t driver_suspend_thread(const json& params)
 
 tool_result_t driver_resume_thread(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
-    std::uint32_t tid = 0;
-    if (params.contains("tid")) {
-        if (params["tid"].is_string())
-            tid = static_cast<std::uint32_t>(helpers::parse_address(params["tid"].get<std::string>()).value_or(0));
-        else
-            tid = params["tid"].get<std::uint32_t>();
-    }
-    if (tid == 0) return tool_result_t::error(OBFSTR("Thread ID (tid) is required"));
+    const auto tid_opt = parse_tid_param(params);
+    if (!tid_opt)
+        return tool_result_t::error(OBFSTR("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
+    const std::uint32_t tid = *tid_opt;
 
     std::uint32_t prev = 0;
     if (!device->resume_thread(tid, &prev))
@@ -14009,8 +14483,8 @@ tool_result_t driver_resume_thread(const json& params)
 
 tool_result_t driver_query_memory(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
     std::uint64_t address = 0;
     if (params.contains("address"))
@@ -14060,8 +14534,8 @@ tool_result_t driver_query_memory(const json& params)
 
 tool_result_t driver_protect_memory(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
     std::uint64_t address = 0;
     if (params.contains("address"))
@@ -14101,8 +14575,8 @@ tool_result_t driver_protect_memory(const json& params)
 
 tool_result_t driver_enumerate_memory_regions(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
     std::uint64_t start = 0;
     if (params.contains("start"))
@@ -14153,8 +14627,8 @@ tool_result_t driver_enumerate_memory_regions(const json& params)
 tool_result_t driver_read_peb(const json& params)
 {
     (void)params;
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
     voyager::device_t::peb_info info{};
     if (!device->read_peb(info))
@@ -14176,8 +14650,8 @@ tool_result_t driver_read_peb(const json& params)
 tool_result_t driver_spoof_debug_flags(const json& params)
 {
     (void)params;
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
     if (anti_re::is_self_target_pid(device->get_process_id()))
         return tool_result_t::error(OBFSTR("Refusing to spoof debug flags on the current IDA host process. Attach a non-IDA target first."));
@@ -14196,17 +14670,13 @@ tool_result_t driver_spoof_debug_flags(const json& params)
 
 tool_result_t driver_set_hw_breakpoint(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
-    std::uint32_t tid = 0;
-    if (params.contains("tid")) {
-        if (params["tid"].is_string())
-            tid = static_cast<std::uint32_t>(helpers::parse_address(params["tid"].get<std::string>()).value_or(0));
-        else
-            tid = params["tid"].get<std::uint32_t>();
-    }
-    if (tid == 0) return tool_result_t::error(OBFSTR("Thread ID (tid) is required"));
+    const auto tid_opt = parse_tid_param(params);
+    if (!tid_opt)
+        return tool_result_t::error(OBFSTR("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
+    const std::uint32_t tid = *tid_opt;
 
     std::uint64_t address = 0;
     if (params.contains("address"))
@@ -14248,17 +14718,13 @@ tool_result_t driver_set_hw_breakpoint(const json& params)
 
 tool_result_t driver_clear_hw_breakpoint(const json& params)
 {
-    if (!device->is_connected() || device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
 
-    std::uint32_t tid = 0;
-    if (params.contains("tid")) {
-        if (params["tid"].is_string())
-            tid = static_cast<std::uint32_t>(helpers::parse_address(params["tid"].get<std::string>()).value_or(0));
-        else
-            tid = params["tid"].get<std::uint32_t>();
-    }
-    if (tid == 0) return tool_result_t::error(OBFSTR("Thread ID (tid) is required"));
+    const auto tid_opt = parse_tid_param(params);
+    if (!tid_opt)
+        return tool_result_t::error(OBFSTR("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
+    const std::uint32_t tid = *tid_opt;
 
     int index = 0;
     if (params.contains("index")) index = params["index"].get<int>();
@@ -14274,32 +14740,76 @@ tool_result_t driver_clear_hw_breakpoint(const json& params)
 
 tool_result_t driver_resolve_export(const json& params)
 {
-    if (!device->is_connected() || device->get_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Driver not connected or DTB not solved"));
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
+
+    std::string export_name;
+    if (params.contains("name") && params["name"].is_string())
+        export_name = trim_ascii_copy(params["name"].get<std::string>());
+    else if (params.contains("export_name") && params["export_name"].is_string())
+        export_name = trim_ascii_copy(params["export_name"].get<std::string>());
+
+    if (export_name.empty())
+        return tool_result_t::error(OBFSTR("Export name is required. Use name='GetTickCount' (alias export_name is supported)."));
 
     std::uint64_t module_base = 0;
-    if (params.contains("module_base"))
+    std::string resolved_module_name;
+    std::string module_query;
+    bool explicit_module_param = false;
+
+    if (params.contains("module_base") && params["module_base"].is_string())
+    {
+        explicit_module_param = true;
         module_base = helpers::parse_address(params["module_base"].get<std::string>()).value_or(0);
+    }
+
+    if (module_base == 0 && params.contains("module"))
+    {
+        explicit_module_param = true;
+        if (params["module"].is_string())
+            module_query = trim_ascii_copy(params["module"].get<std::string>());
+    }
+
+    if (module_base == 0 && module_query.empty() && params.contains("module_name") && params["module_name"].is_string())
+    {
+        explicit_module_param = true;
+        module_query = trim_ascii_copy(params["module_name"].get<std::string>());
+    }
+
+    if (module_base == 0 && !module_query.empty())
+    {
+        if (auto parsed = helpers::parse_address(module_query))
+            module_base = static_cast<std::uint64_t>(*parsed);
+        else if (!resolve_loaded_module_base(module_query, module_base, resolved_module_name))
+            return tool_result_t::error(OBFSTR("Could not resolve module '") + module_query +
+                OBFSTR("'. Provide module_base='0x...' or a loaded module name/path."));
+    }
+
     if (module_base == 0)
         module_base = device->get_base_address();
     if (module_base == 0)
-        return tool_result_t::error(OBFSTR("Module base required"));
-
-    std::string export_name;
-    if (params.contains("name"))
-        export_name = params["name"].get<std::string>();
-    if (export_name.empty())
-        return tool_result_t::error(OBFSTR("Export name required"));
+        return tool_result_t::error(OBFSTR("Module base required. Provide module_base or module/module_name."));
 
     anti_re::guard_driver_self_module(device->get_process_id(), module_base);
 
     std::uint64_t addr = device->resolve_export(module_base, export_name.c_str());
     if (addr == 0)
-        return tool_result_t::error(OBFSTR("Export '") + export_name + OBFSTR("' not found"));
+    {
+        std::string detail = OBFSTR("Export '") + export_name + OBFSTR("' not found in module ") +
+            helpers::format_address(static_cast<ea_t>(module_base));
+        if (!module_query.empty())
+            detail += OBFSTR(" (query: '") + module_query + OBFSTR("')");
+        return tool_result_t::error(detail);
+    }
 
     json result;
     result["export_name"] = export_name;
     result["module_base"] = helpers::format_address(static_cast<ea_t>(module_base));
+    if (!module_query.empty())
+        result["module_query"] = module_query;
+    if (!resolved_module_name.empty())
+        result["resolved_module_name"] = resolved_module_name;
+    result["explicit_module_param"] = explicit_module_param;
     result["resolved_address"] = helpers::format_address(static_cast<ea_t>(addr));
     return tool_result_t::ok(OBFSTR("Export resolved: ") + export_name + OBFSTR(" -> ") + helpers::format_address(static_cast<ea_t>(addr)), result);
 }
@@ -14772,26 +15282,55 @@ static std::string deferred_status_to_string(deferred_status s)
 
 tool_result_t driver_defer_action(const json& params)
 {
+    json normalized = params;
+
+    if (!normalized.contains("actions") && normalized.contains("action"))
+    {
+        json one = json::object();
+        one["tool"] = normalized["action"];
+        one["params"] = normalized.contains("params") ? normalized["params"] : json::object();
+        normalized["actions"] = json::array({one});
+    }
+
+    if (normalized.contains("actions") && normalized["actions"].is_array())
+    {
+        for (auto& act : normalized["actions"])
+        {
+            if (act.is_object() && !act.contains("tool") && act.contains("action"))
+                act["tool"] = act["action"];
+            if (act.is_object() && !act.contains("params"))
+                act["params"] = json::object();
+        }
+    }
+
     std::string wait_for;
-    if (params.contains("wait_for"))
-        wait_for = params["wait_for"].get<std::string>();
+    if (normalized.contains("wait_for"))
+    {
+        if (!normalized["wait_for"].is_string())
+            return tool_result_t::error(OBFSTR("'wait_for' must be a string enum: 'process_start' or 'kernel_module_load'."));
+        wait_for = normalized["wait_for"].get<std::string>();
+    }
     if (wait_for.empty())
-        return tool_result_t::error(OBFSTR("'wait_for' is required: 'kernel_module_load' or 'process_start'"));
+        return tool_result_t::error(OBFSTR("'wait_for' is required: 'kernel_module_load' or 'process_start'."));
 
     if (wait_for != "kernel_module_load" && wait_for != "process_start")
-        return tool_result_t::error(OBFSTR("'wait_for' must be 'kernel_module_load' or 'process_start'"));
+        return tool_result_t::error(OBFSTR("Invalid 'wait_for'. Allowed values: 'kernel_module_load', 'process_start'."));
 
     std::string target;
-    if (params.contains("target"))
-        target = params["target"].get<std::string>();
+    if (normalized.contains("target"))
+    {
+        if (!normalized["target"].is_string())
+            return tool_result_t::error(OBFSTR("'target' must be a string (module or process name)."));
+        target = normalized["target"].get<std::string>();
+    }
     if (target.empty())
         return tool_result_t::error(OBFSTR("'target' is required: module or process name to watch for"));
 
-    int timeout = params.value("timeout", 300);
-    int poll_interval = params.value("poll_interval", 50);
+    int timeout = normalized.value("timeout", 300);
+    int poll_interval = normalized.value("poll_interval", 50);
 
-    if (!params.contains("actions") || !params["actions"].is_array() || params["actions"].empty())
-        return tool_result_t::error(OBFSTR("'actions' array is required with at least one tool call"));
+    if (!normalized.contains("actions") || !normalized["actions"].is_array() || normalized["actions"].empty())
+        return tool_result_t::error(OBFSTR("'actions' array is required with at least one tool call. Format: [{\"tool\":\"driver_read_memory\",\"params\":{...}}]."));
 
     auto action = std::make_unique<deferred_action_t>();
     action->condition_type = wait_for;
@@ -14799,10 +15338,10 @@ tool_result_t driver_defer_action(const json& params)
     action->timeout_seconds = timeout;
     action->poll_interval_ms = poll_interval;
 
-    for (const auto& act : params["actions"])
+    for (const auto& act : normalized["actions"])
     {
         if (!act.contains("tool") || !act["tool"].is_string())
-            return tool_result_t::error(OBFSTR("Each action must have a 'tool' field with the tool name"));
+            return tool_result_t::error(OBFSTR("Each action must have a string 'tool' field (full tool name, e.g. 'driver_read_memory')."));
 
         deferred_action_t::queued_tool_call_t tc;
         tc.tool_name = act["tool"].get<std::string>();
@@ -14834,6 +15373,7 @@ tool_result_t driver_defer_action(const json& params)
             already_met = true;
     }
 
+    const std::size_t queued_actions = action->tool_calls.size();
     int action_id = DeferredActionManager::instance().register_action(std::move(action));
 
     json result;
@@ -14842,7 +15382,7 @@ tool_result_t driver_defer_action(const json& params)
     result["target"] = target;
     result["timeout_seconds"] = timeout;
     result["poll_interval_ms"] = poll_interval;
-    result["num_queued_actions"] = params["actions"].size();
+    result["num_queued_actions"] = queued_actions;
     result["status"] = already_met ? "target_already_loaded_executing_now" : "watching";
     result["note"] = already_met
         ? OBFSTR("Target '") + target + OBFSTR("' is ALREADY loaded! Actions are being executed immediately.")
@@ -15002,7 +15542,11 @@ void register_tools()
                "Finds the process, locates the image base, and solves the DTB for physical memory access. "
                "Bypasses all process isolation and memory protection."),
         {{OBFSTR("process"), OBFSTR("string"),
-          OBFSTR("Target process executable name (e.g. 'target.exe'). Case-insensitive."), true}},
+                    OBFSTR("Target process executable name (e.g. 'target.exe'). Case-insensitive. Aliases: process_name, name."), false},
+                 {OBFSTR("process_name"), OBFSTR("string"),
+                    OBFSTR("Alias of process."), false},
+                 {OBFSTR("name"), OBFSTR("string"),
+                    OBFSTR("Alias of process."), false}},
         driver_attach, false});
 
     registry.register_tool({
@@ -15016,18 +15560,22 @@ void register_tools()
         OBFSTR("driver_read_memory"), OBFSTR("driver"),
         OBFSTR("Read raw bytes from the target process via kernel driver. "
                "Bypasses all memory protection, DEP, guard pages, and anti-read hooks. "
-               "Optionally patches the bytes into the IDA database."),
+             "Optionally patches the bytes into the IDA database. "
+             "Supports optional process_id override to avoid stale attach context."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Virtual address in target process"), true},
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes to read (default 256, max 65536)"), false},
-         {OBFSTR("patch_idb"), OBFSTR("boolean"), OBFSTR("Write read bytes to IDA database (default false)"), false}},
+          {OBFSTR("patch_idb"), OBFSTR("boolean"), OBFSTR("Write read bytes to IDA database (default false)"), false},
+          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override. If different from attached PID, context is switched safely."), false}},
         driver_read_memory, false});
 
     registry.register_tool({
         OBFSTR("driver_write_memory"), OBFSTR("driver"),
         OBFSTR("Write bytes to the target process via kernel driver. "
-               "Bypasses all memory protection including DEP, guard pages, and write protection."),
+             "Bypasses all memory protection including DEP, guard pages, and write protection. "
+             "Accepted bytes formats: 'DE AD BE EF', 'DEADBEEF', [222,173,...], ['DE','AD',...]."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Virtual address in target process"), true},
-         {OBFSTR("bytes"), OBFSTR("string"), OBFSTR("Hex bytes to write (e.g. '90 90 90')"), true}},
+          {OBFSTR("bytes"), OBFSTR("string"), OBFSTR("Bytes payload in hex string or JSON array."), true},
+          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override. If different from attached PID, context is switched safely."), false}},
         driver_write_memory, false});
 
     registry.register_tool({
@@ -15069,17 +15617,20 @@ void register_tools()
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address of the string in target process"), true},
          {OBFSTR("max_length"), OBFSTR("number"), OBFSTR("Maximum string character length (default 512)"), false},
          {OBFSTR("type"), OBFSTR("string"), OBFSTR("String encoding: auto, ascii, wide (default auto)"), false,
-          {OBFSTR("auto"), OBFSTR("ascii"), OBFSTR("wide")}}},
+                    {OBFSTR("auto"), OBFSTR("ascii"), OBFSTR("wide")}},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_read_string, false});
 
     registry.register_tool({
         OBFSTR("driver_read_pointer_chain"), OBFSTR("driver"),
         OBFSTR("Follow a chain of pointer dereferences through target process memory via kernel driver. "
                "Useful for traversing linked lists, object hierarchies, and obfuscated data structures."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Starting virtual address"), true},
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Starting virtual address"), false},
+          {OBFSTR("base_address"), OBFSTR("string"), OBFSTR("Alias for address."), false},
          {OBFSTR("offsets"), OBFSTR("array"),
           OBFSTR("Array of byte offsets to apply after each dereference (e.g. [0, 48, 24])"), false, {},
-          json::object({{"type", "number"}})}},
+           json::object({{"type", "number"}})},
+          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_read_pointer_chain, false});
 
     registry.register_tool({
@@ -15144,11 +15695,11 @@ void register_tools()
         OBFSTR("Write raw bytes to ANY kernel virtual address via physical memory translation. "
                "Requires driver connected. Bypasses all memory protection, write-protection, "
                "PatchGuard, code integrity. WARNING: Writing to kernel memory can cause BSOD "
-               "if done incorrectly. Use with extreme caution."),
+                             "if done incorrectly. Use with extreme caution. User-mode addresses are rejected."),
         {{OBFSTR("address"), OBFSTR("string"),
           OBFSTR("Kernel virtual address to write (e.g. 'FFFFF80012345000')"), true},
          {OBFSTR("bytes"), OBFSTR("string"),
-          OBFSTR("Hex bytes to write separated by spaces (e.g. '90 90 90 C3')"), true}},
+                    OBFSTR("Bytes payload in hex string or JSON array."), true}},
         driver_write_kernel_memory, false});
 
 
@@ -15160,7 +15711,8 @@ void register_tools()
                "for function arguments, or setting up data structures remotely. "
                "Requires driver connected and process attached."),
         {{OBFSTR("size"), OBFSTR("string"),
-          OBFSTR("Number of bytes to allocate (max 16777216 = 16MB)"), true}},
+                    OBFSTR("Number of bytes to allocate (max 16777216 = 16MB)"), true},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_allocate_memory, false});
 
     registry.register_tool({
@@ -15169,7 +15721,8 @@ void register_tools()
                "Uses kernel-level ZwFreeVirtualMemory with MEM_RELEASE. "
                "Requires driver connected and process attached."),
         {{OBFSTR("address"), OBFSTR("string"),
-          OBFSTR("Address of the memory block to free (hex string like '0x...')"), true}},
+                    OBFSTR("Address of the memory block to free (hex string like '0x...')"), true},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_free_memory, false});
 
     registry.register_tool({
@@ -15182,7 +15735,8 @@ void register_tools()
                "Common patterns: call LoadLibraryA to load DLLs, call LdrGetProcedureAddress "
                "to resolve exports, call VirtualProtect to change protections, call any "
                "game/anticheat function to observe behavior. "
-               "Requires driver connected, process attached, DTB solved."),
+                             "Requires driver connected, process attached, DTB solved. "
+                             "For safety, execution requires confirm_unsafe=true unless dry_run=true."),
         {{OBFSTR("address"), OBFSTR("string"),
           OBFSTR("Address of the function to call in the target process (hex)"), true},
          {OBFSTR("arg1"), OBFSTR("string"),
@@ -15192,7 +15746,12 @@ void register_tools()
          {OBFSTR("arg3"), OBFSTR("string"),
           OBFSTR("Third argument (R8). Hex address or integer. Default 0"), false},
          {OBFSTR("arg4"), OBFSTR("string"),
-          OBFSTR("Fourth argument (R9). Hex address or integer. Default 0"), false}},
+                    OBFSTR("Fourth argument (R9). Hex address or integer. Default 0"), false},
+                 {OBFSTR("confirm_unsafe"), OBFSTR("boolean"), OBFSTR("Required for live execution. Must be true unless dry_run=true."), false},
+         {OBFSTR("allow_unsafe"), OBFSTR("boolean"), OBFSTR("Alias of confirm_unsafe."), false},
+         {OBFSTR("unsafe"), OBFSTR("boolean"), OBFSTR("Alias of confirm_unsafe."), false},
+                 {OBFSTR("dry_run"), OBFSTR("boolean"), OBFSTR("Preview call metadata without executing."), false},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_call_function, false});
 
 
@@ -15201,7 +15760,8 @@ void register_tools()
         OBFSTR("Get the full register state of a thread in the attached process via kernel PsGetContextThread. "
                "Returns all general purpose registers (RAX-R15), RIP, RFLAGS, and debug registers (DR0-DR7). "
                "Thread must exist in the attached process. Bypasses all anti-debug since it operates from kernel."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true}},
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID. Decimal string recommended; 0x-prefixed hex supported."), true},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_get_thread_context, true});
 
     registry.register_tool({
@@ -15210,7 +15770,7 @@ void register_tools()
                "Only specified registers are modified; unspecified registers are untouched. "
                "Can set RIP to redirect execution, modify debug registers for HW breakpoints, "
                "change RSP, or any other register. Operates from kernel, bypasses all protection."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID. Decimal string recommended; 0x-prefixed hex supported."), true},
          {OBFSTR("rax"), OBFSTR("string"), OBFSTR("RAX value (hex)"), false},
          {OBFSTR("rbx"), OBFSTR("string"), OBFSTR("RBX value"), false},
          {OBFSTR("rcx"), OBFSTR("string"), OBFSTR("RCX value"), false},
@@ -15234,7 +15794,8 @@ void register_tools()
          {OBFSTR("dr2"), OBFSTR("string"), OBFSTR("DR2 value"), false},
          {OBFSTR("dr3"), OBFSTR("string"), OBFSTR("DR3 value"), false},
          {OBFSTR("dr6"), OBFSTR("string"), OBFSTR("DR6 value"), false},
-         {OBFSTR("dr7"), OBFSTR("string"), OBFSTR("DR7 value"), false}},
+         {OBFSTR("dr7"), OBFSTR("string"), OBFSTR("DR7 value"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_set_thread_context, false});
 
     registry.register_tool({
@@ -15242,20 +15803,22 @@ void register_tools()
         OBFSTR("Enumerate all threads in the attached process via kernel PsGetNextProcessThread. "
                "Returns each thread's TID. Useful for finding threads to suspend, set breakpoints on, "
                "or inspect context of."),
-        {}, driver_enumerate_threads, true});
+        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}}, driver_enumerate_threads, true});
 
     registry.register_tool({
         OBFSTR("driver_suspend_thread"), OBFSTR("driver"),
         OBFSTR("Suspend a thread in the attached process via kernel PsSuspendThread. "
                "Thread execution is paused until resumed. Returns previous suspend count."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID to suspend"), true}},
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID to suspend. Decimal string recommended; 0x-prefixed hex supported."), true},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_suspend_thread, false});
 
     registry.register_tool({
         OBFSTR("driver_resume_thread"), OBFSTR("driver"),
         OBFSTR("Resume a suspended thread in the attached process via kernel PsResumeThread. "
                "Returns previous suspend count. Thread resumes execution."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID to resume"), true}},
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID to resume. Decimal string recommended; 0x-prefixed hex supported."), true},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_resume_thread, false});
 
     registry.register_tool({
@@ -15264,7 +15827,8 @@ void register_tools()
                "Uses kernel ZwQueryVirtualMemory. Returns region base, size, state (commit/reserve/free), "
                "protection (RWX flags), and type (private/mapped/image)."),
         {{OBFSTR("address"), OBFSTR("string"),
-          OBFSTR("Virtual address to query (default: image base)"), false}},
+                    OBFSTR("Virtual address to query (default: image base)"), false},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_query_memory, true});
 
     registry.register_tool({
@@ -15276,7 +15840,8 @@ void register_tools()
          {OBFSTR("size"), OBFSTR("string"), OBFSTR("Region size (default 0x1000)"), false},
          {OBFSTR("protect"), OBFSTR("string"),
           OBFSTR("New protection value: 0x40=PAGE_EXECUTE_READWRITE, 0x20=PAGE_EXECUTE_READ, "
-                 "0x04=PAGE_READWRITE, 0x02=PAGE_READONLY"), false}},
+             "0x04=PAGE_READWRITE, 0x02=PAGE_READONLY"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_protect_memory, false});
 
     registry.register_tool({
@@ -15287,7 +15852,8 @@ void register_tools()
         {{OBFSTR("start"), OBFSTR("string"), OBFSTR("Start address (default 0)"), false},
          {OBFSTR("end"), OBFSTR("string"), OBFSTR("End address (default max user-mode)"), false},
          {OBFSTR("include_all"), OBFSTR("boolean"),
-          OBFSTR("Include free/reserved regions too (default false, only committed)"), false}},
+                    OBFSTR("Include free/reserved regions too (default false, only committed)"), false},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_enumerate_memory_regions, true});
 
     registry.register_tool({
@@ -15295,7 +15861,7 @@ void register_tools()
         OBFSTR("Read the Process Environment Block (PEB) of the attached process via kernel. "
                "Returns PEB address, image base, BeingDebugged flag, NtGlobalFlag, "
                "loader data address, process heap, and heap info."),
-        {}, driver_read_peb, true});
+        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}}, driver_read_peb, true});
 
     registry.register_tool({
         OBFSTR("driver_spoof_debug_flags"), OBFSTR("driver"),
@@ -15303,7 +15869,7 @@ void register_tools()
                "Zeroes EPROCESS.DebugPort, PEB.BeingDebugged, clears PEB.NtGlobalFlag heap debug flags. "
                "Completely invisible to the target process. Call this before the target's anti-debug "
                "checks run to bypass IsDebuggerPresent, NtQueryInformationProcess, etc."),
-        {}, driver_spoof_debug_flags, false});
+        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}}, driver_spoof_debug_flags, false});
 
     registry.register_tool({
         OBFSTR("driver_set_hw_breakpoint"), OBFSTR("driver"),
@@ -15312,7 +15878,7 @@ void register_tools()
                "so it's invisible to usermode anti-debug. Types: execute (break on execution), "
                "write (break on memory write), readwrite (break on read or write). "
                "After setting, the thread will trigger a SINGLE_STEP exception when the breakpoint fires."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID. Decimal string recommended; 0x-prefixed hex supported."), true},
          {OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to break on"), true},
          {OBFSTR("index"), OBFSTR("number"),
           OBFSTR("Debug register index 0-3 (default 0). Each thread supports 4 HW breakpoints."), false},
@@ -15320,16 +15886,18 @@ void register_tools()
           OBFSTR("Breakpoint type: execute (default), write, readwrite"), false,
           {OBFSTR("execute"), OBFSTR("write"), OBFSTR("readwrite")}},
          {OBFSTR("size"), OBFSTR("number"),
-          OBFSTR("Watched region size in bytes: 1 (default), 2, 4, or 8"), false}},
+                    OBFSTR("Watched region size in bytes: 1 (default), 2, 4, or 8"), false},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_set_hw_breakpoint, false});
 
     registry.register_tool({
         OBFSTR("driver_clear_hw_breakpoint"), OBFSTR("driver"),
         OBFSTR("Clear a hardware breakpoint on a thread. Removes the address from the specified "
                "debug register and disables it in DR7."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
+                {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID. Decimal string recommended; 0x-prefixed hex supported."), true},
          {OBFSTR("index"), OBFSTR("number"),
-          OBFSTR("Debug register index 0-3 to clear (default 0)"), false}},
+                    OBFSTR("Debug register index 0-3 to clear (default 0)"), false},
+                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_clear_hw_breakpoint, false});
 
     registry.register_tool({
@@ -15337,9 +15905,13 @@ void register_tools()
         OBFSTR("Resolve an export function address from a PE module in the attached process. "
                "Walks the PE export directory via physical memory reads. Useful for finding API "
                "addresses without relying on import tables (which may be obfuscated by packers)."),
-        {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Export function name to resolve"), true},
+        {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Export function name to resolve. Alias: export_name."), false},
+          {OBFSTR("export_name"), OBFSTR("string"), OBFSTR("Alias for name."), false},
          {OBFSTR("module_base"), OBFSTR("string"),
-          OBFSTR("Module base address (default: attached process image base)"), false}},
+           OBFSTR("Module base address (default: attached process image base)"), false},
+          {OBFSTR("module"), OBFSTR("string"), OBFSTR("Module name/path or base address string. Alias: module_name."), false},
+          {OBFSTR("module_name"), OBFSTR("string"), OBFSTR("Alias for module."), false},
+          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override."), false}},
         driver_resolve_export, true});
 
     registry.register_tool({
@@ -15378,10 +15950,12 @@ void register_tools()
          {OBFSTR("actions"), OBFSTR("array"),
           OBFSTR("Array of tool calls to execute when condition is met. "
                  "Each entry: {\"tool\": \"tool_name\", \"params\": {...}}. "
-                 "Params may use ${module_base}, ${module_size}, ${pid}, ${base_address} templates."), true, {},
+                 "Compatibility aliases accepted: top-level {action, params} and per-entry {action, params}. "
+             "Params may use ${module_base}, ${module_size}, ${pid}, ${base_address} templates."), false, {},
           json::object({{"type", "object"},
                         {"properties", json::object({
                             {"tool", json::object({{"type", "string"}})},
+                            {"action", json::object({{"type", "string"}})},
                             {"params", json::object({{"type", "object"}})}
                         })}
           })},
