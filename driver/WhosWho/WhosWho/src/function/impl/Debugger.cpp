@@ -233,7 +233,6 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
 
 
     if (!_PsLookupProcessByProcessId || !_PsLookupThreadByThreadId ||
-        !_PsGetContextThread || !_PsSetContextThread ||
         !_ObfDereferenceObject) {
         return STATUS_PROCEDURE_NOT_FOUND;
     }
@@ -259,7 +258,9 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     __try {
         PEPROCESS thread_process = IoThreadToProcess(thread);
         if (thread_process != process) {
-        } else {
+            _ObfDereferenceObject(thread);
+            _ObfDereferenceObject(process);
+            return STATUS_INVALID_CID;
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
     }
@@ -306,17 +307,23 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     strong::kmemset(&ctx, 0, sizeof(ctx));
 
 
-    BOOLEAN use_ps_direct = (_PsGetContextThread != nullptr && _PsSetContextThread != nullptr);
-    BOOLEAN use_nt_context = !use_ps_direct && (ctx_thread_handle != nullptr) && ssdt_resolver::resolve_thread_context();
+    BOOLEAN has_ps_get = (_PsGetContextThread != nullptr);
+    BOOLEAN has_ps_set = (_PsSetContextThread != nullptr);
+    BOOLEAN has_nt_context = (ctx_thread_handle != nullptr) && ssdt_resolver::resolve_thread_context();
 
     if (request->should_set == 0) {
 
         ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
-        if (use_ps_direct) {
+        status = STATUS_PROCEDURE_NOT_FOUND;
+        if (has_ps_get) {
             status = _PsGetContextThread(thread, &ctx, KernelMode);
-        } else if (use_nt_context) {
+        }
+
+        if (!NT_SUCCESS(status) && has_nt_context) {
             status = ssdt_resolver::call_NtGetContextThread(ctx_thread_handle, &ctx);
-        } else {
+        }
+
+        if (!NT_SUCCESS(status)) {
             status = STATUS_PROCEDURE_NOT_FOUND;
         }
 
@@ -356,11 +363,16 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     else {
 
         ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
-        if (use_ps_direct) {
+        status = STATUS_PROCEDURE_NOT_FOUND;
+        if (has_ps_get) {
             status = _PsGetContextThread(thread, &ctx, KernelMode);
-        } else if (use_nt_context) {
+        }
+
+        if (!NT_SUCCESS(status) && has_nt_context) {
             status = ssdt_resolver::call_NtGetContextThread(ctx_thread_handle, &ctx);
-        } else {
+        }
+
+        if (!NT_SUCCESS(status)) {
             status = STATUS_PROCEDURE_NOT_FOUND;
         }
 
@@ -393,11 +405,16 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
             if (mask & (1ULL << 23)) ctx.Dr7    = request->dr7;
 
             ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
-            if (use_ps_direct) {
+            status = STATUS_PROCEDURE_NOT_FOUND;
+            if (has_ps_set) {
                 status = _PsSetContextThread(thread, &ctx, KernelMode);
-            } else if (use_nt_context) {
+            }
+
+            if (!NT_SUCCESS(status) && has_nt_context) {
                 status = ssdt_resolver::call_NtSetContextThread(ctx_thread_handle, &ctx);
-            } else {
+            }
+
+            if (!NT_SUCCESS(status)) {
                 status = STATUS_PROCEDURE_NOT_FOUND;
             }
 

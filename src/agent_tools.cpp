@@ -10383,12 +10383,45 @@ void register_tools()
 namespace driver_tools
 {
 
+static std::string to_lower_ascii_copy(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return value;
+}
+
+static bool is_ida_host_process_name(const std::string& process_name)
+{
+    const std::string lower = to_lower_ascii_copy(process_name);
+    return lower.find("ida.exe") != std::string::npos
+        || lower.find("ida64.exe") != std::string::npos
+        || lower.find("idat.exe") != std::string::npos
+        || lower.find("idat64.exe") != std::string::npos;
+}
+
 tool_result_t driver_connect(const json& params)
 {
     if (device->is_connected())
     {
+        bool cleared_self_target = false;
+        if (anti_re::is_self_target_pid(device->get_process_id()))
+        {
+            device->clear_process_context();
+            cleared_self_target = true;
+        }
+
         if (device->get_kernel_dtb() == 0)
             device->solve_kernel_dtb();
+
+        if (cleared_self_target)
+        {
+            json result;
+            result["connected"] = true;
+            result["process_id"] = device->get_process_id();
+            result["kernel_dtb"] = helpers::format_address(device->get_kernel_dtb());
+            return tool_result_t::ok(OBFSTR("Driver connected. Cleared stale IDA host attachment context."), result);
+        }
+
         return tool_result_t::ok(OBFSTR("Driver already connected"));
     }
 
@@ -10414,6 +10447,10 @@ tool_result_t driver_status(const json&)
     result["kernel_dtb"]   = helpers::format_address(device->get_kernel_dtb());
     result["has_process"]  = device->get_process_id() != 0;
     result["has_kernel"]   = device->get_kernel_dtb() != 0;
+    result["is_self_target"] = anti_re::is_self_target_pid(device->get_process_id());
+
+    if (result["is_self_target"].get<bool>())
+        result["warning"] = "Driver target is IDA host process. Call driver_unattach and driver_attach target.exe.";
 
     if (device->is_connected() && device->get_process_id() != 0)
         result["heartbeat"] = device->send_heartbeat() ? "ok" : "failed";
@@ -10431,9 +10468,18 @@ tool_result_t driver_attach(const json& params)
 
     std::string process_name = params["process"].get<std::string>();
 
+    if (is_ida_host_process_name(process_name))
+        return tool_result_t::error(OBFSTR("Refusing to attach kernel driver to IDA host process name."));
+
     std::uint32_t pid = device->find_process(process_name.c_str());
     if (pid == 0)
         return tool_result_t::error(OBFSTR("Process not found: ") + process_name);
+
+    if (anti_re::is_self_target_pid(pid))
+    {
+        device->clear_process_context();
+        return tool_result_t::error(OBFSTR("Refusing to attach kernel driver to current IDA host process PID."));
+    }
 
     std::uint64_t base = device->find_image();
     if (base == 0)
@@ -11502,10 +11548,19 @@ tool_result_t driver_dump_module(const json& params)
     if (params.contains("process"))
     {
         std::string process_name = params["process"].get<std::string>();
+        if (is_ida_host_process_name(process_name))
+            return tool_result_t::error(OBFSTR("Refusing to attach dump context to IDA host process name."));
+
         std::uint32_t pid = device->find_process(process_name.c_str());
         log("find_process", pid != 0, "PID: " + (pid ? std::to_string(pid) : "not found"));
         if (pid == 0)
             return tool_result_t::error(OBFSTR("Process not found: ") + process_name);
+
+        if (anti_re::is_self_target_pid(pid))
+        {
+            device->clear_process_context();
+            return tool_result_t::error(OBFSTR("Refusing to dump from current IDA host process PID."));
+        }
     }
 
     if (device->get_process_id() == 0)
@@ -14124,6 +14179,9 @@ tool_result_t driver_spoof_debug_flags(const json& params)
     if (!device->is_connected() || device->get_process_id() == 0)
         return tool_result_t::error(OBFSTR("Driver not connected or no process attached"));
 
+    if (anti_re::is_self_target_pid(device->get_process_id()))
+        return tool_result_t::error(OBFSTR("Refusing to spoof debug flags on the current IDA host process. Attach a non-IDA target first."));
+
     std::uint32_t flags = 0;
     if (!device->spoof_debug_flags(&flags))
         return tool_result_t::error(OBFSTR("Failed to spoof debug flags"));
@@ -14625,6 +14683,13 @@ void DeferredActionManager::watcher_thread_func(int action_id)
             std::uint32_t pid = 0;
             if (poll_process_start(action->target_name, pid))
             {
+                if (anti_re::is_self_target_pid(pid))
+                {
+                    action->error = "Refusing deferred process_start attach for IDA host PID.";
+                    action->status.store(deferred_status::failed);
+                    return;
+                }
+
                 condition_met = true;
                 trigger_context["pid"] = std::to_string(pid);
 
@@ -14634,7 +14699,8 @@ void DeferredActionManager::watcher_thread_func(int action_id)
 
                 if (device && device->is_connected())
                 {
-                    device->find_process(action->target_name.c_str());
+                    device->clear_process_context();
+                    device->set_process_id(pid);
                     std::uint64_t img_base = device->find_image();
                     device->solve_dtb();
 

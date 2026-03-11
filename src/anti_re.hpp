@@ -643,19 +643,17 @@ inline bool prepare_driver(runtime_state_t& runtime)
 		return false;
 
 	const DWORD current_pid = GetCurrentProcessId();
-	if (runtime.pid != current_pid || device->get_process_id() != current_pid)
-	{
-		device->set_process_id(current_pid);
-		device->set_base_address(reinterpret_cast<std::uint64_t>(runtime.process_image));
-		device->solve_dtb();
-		runtime.pid = current_pid;
-	}
-	else if (device->get_dtb() == 0)
-	{
-		device->solve_dtb();
-	}
+	runtime.pid = current_pid;
 
-	return true;
+	// Never hijack the shared MCP attachment context from anti_re.
+	// If MCP is attached to a non-host target, anti_re falls back to usermode checks.
+	if (device->get_process_id() != current_pid)
+		return false;
+
+	if (device->get_dtb() == 0)
+		device->solve_dtb();
+
+	return device->get_dtb() != 0;
 }
 
 inline bool verify_usermode_debug_state_locked(const runtime_state_t& runtime)
@@ -685,6 +683,9 @@ inline bool verify_usermode_debug_state_locked(const runtime_state_t& runtime)
 inline bool verify_peb_state_locked(const runtime_state_t& runtime)
 {
 	if (device == nullptr || !device->is_connected())
+		return verify_usermode_debug_state_locked(runtime);
+
+	if (runtime.pid == 0 || device->get_process_id() != runtime.pid)
 		return verify_usermode_debug_state_locked(runtime);
 
 	voyager::device_t::peb_info peb{};
@@ -740,6 +741,8 @@ inline kernel_integrity_probe_t probe_code_integrity_kernel(runtime_state_t& run
 {
 	if (!device || !device->is_connected())
 		return kernel_integrity_probe_t::unavailable;
+	if (runtime.pid == 0 || device->get_process_id() != runtime.pid)
+		return kernel_integrity_probe_t::unavailable;
 	if (get_process_state() == DSTATE_NOTASK)
 		return kernel_integrity_probe_t::unavailable;
 	if (runtime.text_base == 0 || runtime.text_size == 0 || runtime.text_hash == 0)
@@ -761,12 +764,7 @@ inline kernel_integrity_probe_t probe_code_integrity_kernel(runtime_state_t& run
 		std::size_t n = device->read_raw(cursor, chunk.data(), to_read);
 		if (n != to_read)
 		{
-			device->set_process_id(runtime.pid != 0 ? runtime.pid : GetCurrentProcessId());
-			device->set_base_address(reinterpret_cast<std::uint64_t>(runtime.process_image));
-			device->solve_dtb();
-			n = device->read_raw(cursor, chunk.data(), to_read);
-			if (n != to_read)
-				return kernel_integrity_probe_t::unavailable;
+			return kernel_integrity_probe_t::unavailable;
 		}
 
 		const auto* ptr = chunk.data();
@@ -928,6 +926,8 @@ inline bool verify_hw_breakpoints_kernel(const runtime_state_t& runtime)
 {
 	if (!device || !device->is_connected())
 		return true;
+	if (runtime.pid == 0 || device->get_process_id() != runtime.pid)
+		return true;
 
 	if (runtime.module == nullptr)
 		return true;
@@ -994,6 +994,8 @@ inline bool enforce_code_protections(runtime_state_t& runtime)
 {
 	if (!device || !device->is_connected())
 		return false;
+	if (runtime.pid == 0 || device->get_process_id() != runtime.pid)
+		return false;
 	if (runtime.text_base == 0 || runtime.text_size == 0)
 		return false;
 
@@ -1017,11 +1019,7 @@ inline bool initialize_locked(runtime_state_t& runtime)
 		return false;
 	}
 
-	if (!prepare_driver(runtime))
-	{
-		reset_state_locked(runtime);
-		return false;
-	}
+	prepare_driver(runtime);
 
 	if (!verify_peb_state_locked(runtime))
 	{
@@ -1050,8 +1048,8 @@ inline bool verify_locked(runtime_state_t& runtime)
 	if (!runtime.initialized && !initialize_locked(runtime))
 		return false;
 
-	if (!prepare_driver(runtime)
-		|| !verify_peb_state_locked(runtime))
+	prepare_driver(runtime);
+	if (!verify_peb_state_locked(runtime))
 	{
 		runtime.trusted = false;
 		runtime.last_verified_ms = 0;
@@ -1247,6 +1245,11 @@ inline void guard_driver_self_access(std::uint64_t target_pid, std::uint64_t add
 	if (!address_overlaps_aida(address, size)) return;
 	arm_destructive_enforcement();
 	enforce_self_analysis_violation();
+}
+
+inline bool is_self_target_pid(std::uint64_t target_pid)
+{
+	return target_pid == static_cast<std::uint64_t>(GetCurrentProcessId());
 }
 
 inline void guard_driver_self_module(std::uint64_t target_pid, std::uint64_t module_base)
@@ -1485,8 +1488,7 @@ inline void start_driver_tamper_monitor()
 				if (!runtime.initialized)
 					continue;
 
-				if (!detail::prepare_driver(runtime))
-					continue;
+				detail::prepare_driver(runtime);
 
 
 				if (!detail::verify_peb_state_locked(runtime))
@@ -1715,6 +1717,7 @@ inline void enforce_self_analysis_violation() {}
 inline void arm_destructive_enforcement() {}
 inline void disarm_destructive_enforcement() {}
 inline void guard_driver_self_access(std::uint64_t, std::uint64_t, std::size_t) {}
+inline bool is_self_target_pid(std::uint64_t) { return false; }
 inline void guard_driver_self_module(std::uint64_t, std::uint64_t) {}
 inline void report_violation_to_server(const char*) {}
 inline void start_pipe_monitor() {}

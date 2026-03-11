@@ -1263,7 +1263,18 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
     fprintf(stderr, "[WhosWho-UM] get_thread_context: sending TCTX ioctl=0x%08X for PID=%u TID=%u\n",
         ioctl_codes::TCTX(), process_id_, tid);
 
-    if (!send_request(ioctl_codes::TCTX(), &req, sizeof(req))) {
+    bool ok = send_request(ioctl_codes::TCTX(), &req, sizeof(req));
+    if (!ok) {
+        std::uint32_t prev_count = 0;
+        bool suspended = suspend_thread(tid, &prev_count);
+        if (suspended) {
+            fprintf(stderr, "[WhosWho-UM] get_thread_context: retrying after suspend TID=%u\n", tid);
+            ok = send_request(ioctl_codes::TCTX(), &req, sizeof(req));
+            std::uint32_t ignored = 0;
+            (void)resume_thread(tid, &ignored);
+        }
+    }
+    if (!ok) {
         fprintf(stderr, "[WhosWho-UM] get_thread_context: send_request FAILED for TID=%u\n", tid);
         return false;
     }
@@ -1310,7 +1321,18 @@ bool voyager::device_t::set_thread_context(std::uint32_t tid, const thread_conte
     req.dr0 = ctx.dr0; req.dr1 = ctx.dr1; req.dr2 = ctx.dr2; req.dr3 = ctx.dr3;
     req.dr6 = ctx.dr6; req.dr7 = ctx.dr7;
 
-    return send_request(ioctl_codes::TCTX(), &req, sizeof(req));
+    bool ok = send_request(ioctl_codes::TCTX(), &req, sizeof(req));
+    if (!ok) {
+        std::uint32_t prev_count = 0;
+        bool suspended = suspend_thread(tid, &prev_count);
+        if (suspended) {
+            fprintf(stderr, "[WhosWho-UM] set_thread_context: retrying after suspend TID=%u\n", tid);
+            ok = send_request(ioctl_codes::TCTX(), &req, sizeof(req));
+            std::uint32_t ignored = 0;
+            (void)resume_thread(tid, &ignored);
+        }
+    }
+    return ok;
 }
 
 std::vector<voyager::device_t::thread_info> voyager::device_t::enumerate_threads() noexcept {

@@ -826,15 +826,12 @@ from your perspective — you call it, you get results.
 ```
 3. The tool waits, triggers, executes, and returns results — all in one call.
 
-**RULE: ALWAYS USE DEFERRED ACTIONS WHEN THE TARGET ISN'T LOADED YET.**
-If any driver tool fails because "not connected", "process not found", "module not found",
-or similar — DO NOT just report the failure. Instead, use `driver_defer_action` to
-pre-schedule the same action. The tool will BLOCK and WAIT for the target to become
-available, execute the actions, and return results. You do NOT need to ask the user to
-"try again later" or "start the game first" — just call `driver_defer_action` and the
-system handles the waiting automatically.
+**RULE: USE DEFERRED ACTIONS ONLY WHEN IT IS NECESSARY.**
+Use `driver_defer_action` for race-sensitive startup captures (module/process not loaded yet,
+or data likely to disappear during initialization). If the target is already available,
+prefer direct driver tools first and only defer when direct execution cannot satisfy the goal.
 
-**RULE: NEVER TELL THE USER TO "COME BACK LATER" OR "RUN A COMMAND MANUALLY".**
+**RULE: NEVER TELL THE USER TO "COME BACK LATER" WHEN A DEFERRED WORKFLOW CAN SOLVE IT.**
 When deferred actions are involved, the system waits for you. Do NOT output messages like:
   - "Ask me to run driver_get_deferred_results when the target loads"
   - "Start the game and then come back"
