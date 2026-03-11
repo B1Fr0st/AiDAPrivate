@@ -319,6 +319,7 @@ private:
         int round = 0;
         QString header;
         QString details;
+        bool expanded = false;
     };
     std::vector<ThinkingRound> m_thinkingRounds;
     int                      m_activeThinkingRound;

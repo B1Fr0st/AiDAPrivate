@@ -10449,6 +10449,33 @@ tool_result_t driver_attach(const json& params)
     return tool_result_t::ok(OBFSTR("Attached to process: ") + process_name, result);
 }
 
+tool_result_t driver_unattach(const json&)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+
+    const std::uint32_t previous_pid = device->get_process_id();
+    const std::uint64_t previous_base = device->get_base_address();
+    const std::uint64_t previous_dtb = device->get_dtb();
+
+    device->clear_process_context();
+
+    json result;
+    result["previous_process_id"] = previous_pid;
+    result["previous_base_address"] = helpers::format_address(static_cast<ea_t>(previous_base));
+    result["previous_dtb"] = helpers::format_address(static_cast<ea_t>(previous_dtb));
+    result["connected"] = device->is_connected();
+    result["process_id"] = device->get_process_id();
+    result["base_address"] = helpers::format_address(device->get_base_address());
+    result["dtb"] = helpers::format_address(device->get_dtb());
+    result["kernel_dtb"] = helpers::format_address(device->get_kernel_dtb());
+
+    if (previous_pid == 0)
+        return tool_result_t::ok(OBFSTR("No process was attached. Driver connection remains active."), result);
+
+    return tool_result_t::ok(OBFSTR("Detached from attached process context. Driver connection remains active."), result);
+}
+
 tool_result_t driver_read_memory(const json& params)
 {
     if (!device->is_connected() || device->get_process_id() == 0)
@@ -14911,6 +14938,13 @@ void register_tools()
         {{OBFSTR("process"), OBFSTR("string"),
           OBFSTR("Target process executable name (e.g. 'target.exe'). Case-insensitive."), true}},
         driver_attach, false});
+
+    registry.register_tool({
+        OBFSTR("driver_unattach"), OBFSTR("driver"),
+        OBFSTR("Clear the currently attached target process context without disconnecting the kernel driver. "
+               "Resets attached PID, image base, process DTB, and temporary remote-call state. "
+               "Use this before attaching to a different process to avoid stale context confusion."),
+        {}, driver_unattach, false});
 
     registry.register_tool({
         OBFSTR("driver_read_memory"), OBFSTR("driver"),

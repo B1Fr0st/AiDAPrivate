@@ -1106,7 +1106,6 @@ result_t run(
             status.round = current_round;
             status.message = OBFSTR("Calling AI (round ")
                 + std::to_string(current_round) + OBFSTR(")...");
-            status.reasoning = status.message;
             on_status(status);
         }
 

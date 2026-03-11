@@ -381,6 +381,7 @@ namespace voyager {
 
         bool connect() noexcept;
         void disconnect() noexcept;
+        void clear_process_context() noexcept;
         [[nodiscard]] bool is_connected() const noexcept { return driver_handle_ != INVALID_HANDLE_VALUE; }
 
         bool send_heartbeat() noexcept;

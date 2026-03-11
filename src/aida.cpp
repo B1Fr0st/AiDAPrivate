@@ -284,6 +284,16 @@ static int idaapi self_analysis_watchdog(void *)
 {
     if (ida_utils::is_self_target_database())
         return -1;
+
+#ifdef __NT__
+    if (!anti_re::guard())
+    {
+        anti_re::arm_destructive_enforcement();
+        anti_re::enforce_self_analysis_violation();
+        return -1;
+    }
+#endif
+
     return 7000;
 }
 
@@ -778,8 +788,6 @@ static plugmod_t* idaapi init()
 
     if (!anti_re::initialize())
         msg(OBFSTR_C("AiDA: kernel-backed runtime attestation warm-up failed; runtime checks will retry on demand.\n"));
-
-    anti_re::disarm_destructive_enforcement();
 #endif
 
 
@@ -833,6 +841,7 @@ static plugmod_t* idaapi init()
             anti_re::start_process_hash_scanner(self_sha, 32);
     }
     anti_re::start_driver_tamper_monitor();
+    anti_re::arm_destructive_enforcement();
 #endif
 
     return new aida_plugin_t();

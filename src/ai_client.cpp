@@ -1101,21 +1101,7 @@ void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t ca
             }
             else
             {
-                std::ostringstream response_ss;
-
-                if (!agentic_result.tool_results.empty())
-                {
-                    response_ss << OBFSTR_C("**Agent Actions:**\n");
-                    for (const auto& tr : agentic_result.tool_results)
-                    {
-                        response_ss << "- `" << tr.tool_name << "`: "
-                                    << (tr.success ? "âœ“" : "âœ—") << " " << tr.message << "\n";
-                    }
-                    response_ss << "\n---\n\n";
-                }
-
-                response_ss << agentic_result.final_response;
-                result = response_ss.str();
+                result = agentic_result.final_response;
             }
         }
         catch (const std::exception& e)
@@ -1261,21 +1247,7 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
             }
             else
             {
-                std::ostringstream response_ss;
-
-                if (!agentic_result.tool_results.empty())
-                {
-                    response_ss << OBFSTR_C("**Agent Actions:**\n");
-                    for (const auto& tr : agentic_result.tool_results)
-                    {
-                        response_ss << "- `" << tr.tool_name << "`: "
-                                    << (tr.success ? "âœ“" : "âœ—") << " " << tr.message << "\n";
-                    }
-                    response_ss << "\n---\n\n";
-                }
-
-                response_ss << agentic_result.final_response;
-                result = response_ss.str();
+                result = agentic_result.final_response;
             }
         }
         catch (const std::exception& e)

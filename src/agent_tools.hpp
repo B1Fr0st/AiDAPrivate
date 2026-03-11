@@ -275,6 +275,7 @@ namespace driver_tools
     tool_result_t driver_connect(const nlohmann::json& params);
     tool_result_t driver_status(const nlohmann::json& params);
     tool_result_t driver_attach(const nlohmann::json& params);
+    tool_result_t driver_unattach(const nlohmann::json& params);
     tool_result_t driver_read_memory(const nlohmann::json& params);
     tool_result_t driver_write_memory(const nlohmann::json& params);
     tool_result_t driver_dump_module(const nlohmann::json& params);

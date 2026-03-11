@@ -172,23 +172,30 @@ bool voyager::device_t::connect() noexcept {
 void voyager::device_t::disconnect() noexcept {
     SPOOF_FUNC;
 
-    if (shellcode_address_ != 0 && process_id_ != 0) {
-        free_memory(shellcode_address_);
-        shellcode_address_ = 0;
-    }
+    clear_process_context();
 
     if (is_connected()) {
         CloseHandle(driver_handle_);
         driver_handle_ = INVALID_HANDLE_VALUE;
     }
 
+    kernel_dtb_ = 0;
+    session_key_ = 0;
+    last_heartbeat_tsc_ = 0;
+}
+
+void voyager::device_t::clear_process_context() noexcept {
+    SPOOF_FUNC;
+
+    if (is_connected() && shellcode_address_ != 0 && process_id_ != 0) {
+        free_memory(shellcode_address_);
+    }
+
+    shellcode_address_ = 0;
     process_id_ = 0;
     base_address_ = 0;
     dtb_ = 0;
-    kernel_dtb_ = 0;
     spoof_gadget_ = 0;
-    session_key_ = 0;
-    last_heartbeat_tsc_ = 0;
 }
 
 std::uint32_t voyager::device_t::find_process(const char* process_name) noexcept {

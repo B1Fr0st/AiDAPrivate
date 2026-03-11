@@ -810,11 +810,13 @@ client.on('interactionCreate', async (interaction) => {
             const target = interaction.options.getString('target').trim();
             let removed = [];
 
-            // Try as HWID
-            const hwidBan = await fbGet(`bans/hwid/${target}`);
-            if (hwidBan) {
-                await fbDelete(`bans/hwid/${target}`);
-                removed.push(`HWID \`${target}\``);
+            // Try as HWID (skip if target contains dots/colons — clearly an IP, not an HWID)
+            if (!/[.:]/.test(target)) {
+                const hwidBan = await fbGet(`bans/hwid/${target}`);
+                if (hwidBan) {
+                    await fbDelete(`bans/hwid/${target}`);
+                    removed.push(`HWID \`${target}\``);
+                }
             }
 
             // Try as IP (both raw and normalized)
@@ -842,8 +844,8 @@ client.on('interactionCreate', async (interaction) => {
         else if (commandName === 'baninfo') {
             const target = interaction.options.getString('target').trim();
 
-            // Check HWID bans
-            const hwidBan = await fbGet(`bans/hwid/${target}`);
+            // Check HWID bans (skip if target contains dots/colons — it's an IP)
+            const hwidBan = /[.:]/.test(target) ? null : await fbGet(`bans/hwid/${target}`);
             // Check IP bans
             const normalizedTarget = target.replace(/[.:]/g, '_');
             const ipBan = await fbGet(`bans/ip/${normalizedTarget}`);

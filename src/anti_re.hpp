@@ -592,6 +592,8 @@ struct runtime_state_t
 
 	bool protections_enforced = false;
 	std::uint32_t verify_counter = 0;
+	std::uint32_t kernel_read_failure_streak = 0;
+	std::uint32_t kernel_hash_mismatch_streak = 0;
 };
 
 inline runtime_state_t& state()
@@ -614,6 +616,8 @@ inline void reset_state_locked(runtime_state_t& runtime)
 	runtime.iat_entries.clear();
 	runtime.protections_enforced = false;
 	runtime.verify_counter = 0;
+	runtime.kernel_read_failure_streak = 0;
+	runtime.kernel_hash_mismatch_streak = 0;
 }
 
 inline bool resolve_current_module(HMODULE& module)
@@ -725,6 +729,73 @@ __forceinline std::uint64_t hash_memory(const void* data, std::size_t size)
 	return (h1 & 0xFFFFFFFF) | ((h2 & 0xFFFFFFFF) << 32);
 }
 
+enum class kernel_integrity_probe_t : std::uint8_t
+{
+	match,
+	mismatch,
+	unavailable,
+};
+
+inline kernel_integrity_probe_t probe_code_integrity_kernel(runtime_state_t& runtime)
+{
+	if (!device || !device->is_connected())
+		return kernel_integrity_probe_t::unavailable;
+	if (get_process_state() == DSTATE_NOTASK)
+		return kernel_integrity_probe_t::unavailable;
+	if (runtime.text_base == 0 || runtime.text_size == 0 || runtime.text_hash == 0)
+		return kernel_integrity_probe_t::unavailable;
+
+	constexpr std::size_t CHUNK_SIZE = 0x4000;
+	std::vector<std::uint8_t> chunk(CHUNK_SIZE);
+
+	std::uint64_t h1 = 0xFFFFFFFFULL;
+	std::uint64_t h2 = 0x85EBCA6BULL;
+
+	std::uint64_t cursor = runtime.text_base;
+	std::size_t remaining = runtime.text_size;
+
+	while (remaining > 0)
+	{
+		const std::size_t to_read = remaining < CHUNK_SIZE ? remaining : CHUNK_SIZE;
+
+		std::size_t n = device->read_raw(cursor, chunk.data(), to_read);
+		if (n != to_read)
+		{
+			device->set_process_id(runtime.pid != 0 ? runtime.pid : GetCurrentProcessId());
+			device->set_base_address(reinterpret_cast<std::uint64_t>(runtime.process_image));
+			device->solve_dtb();
+			n = device->read_raw(cursor, chunk.data(), to_read);
+			if (n != to_read)
+				return kernel_integrity_probe_t::unavailable;
+		}
+
+		const auto* ptr = chunk.data();
+		const std::size_t chunks = to_read / 8;
+		const auto* ptr64 = reinterpret_cast<const std::uint64_t*>(ptr);
+		for (std::size_t i = 0; i < chunks; ++i)
+		{
+			h1 = _mm_crc32_u64(h1, ptr64[i]);
+			h2 = _mm_crc32_u64(h2, ptr64[i] ^ 0xA5A5A5A5A5A5A5A5ULL);
+		}
+
+		const std::size_t tail_len = to_read % 8;
+		const auto* tail = ptr + chunks * 8;
+		for (std::size_t i = 0; i < tail_len; ++i)
+		{
+			h1 = _mm_crc32_u8(static_cast<std::uint32_t>(h1), tail[i]);
+			h2 = _mm_crc32_u8(static_cast<std::uint32_t>(h2), tail[i] ^ 0xA5u);
+		}
+
+		cursor += to_read;
+		remaining -= to_read;
+	}
+
+	const std::uint64_t kernel_hash = (h1 & 0xFFFFFFFFULL) | ((h2 & 0xFFFFFFFFULL) << 32);
+	return kernel_hash == runtime.text_hash
+		? kernel_integrity_probe_t::match
+		: kernel_integrity_probe_t::mismatch;
+}
+
 inline bool find_code_section(HMODULE mod, std::uint64_t& base, std::uint32_t& size)
 {
 	const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mod);
@@ -816,19 +887,30 @@ inline bool verify_code_integrity_usermode(const runtime_state_t& runtime)
 	return current == runtime.text_hash;
 }
 
-inline bool verify_code_integrity_kernel(const runtime_state_t& runtime)
+inline bool verify_code_integrity_kernel(runtime_state_t& runtime)
 {
-	if (!device || !device->is_connected())
-		return true;
-	if (runtime.text_base == 0 || runtime.text_size == 0 || runtime.text_hash == 0)
-		return true;
+	const kernel_integrity_probe_t probe = probe_code_integrity_kernel(runtime);
 
-	std::vector<std::uint8_t> buf(runtime.text_size);
-	const std::size_t n = device->read_raw(runtime.text_base, buf.data(), runtime.text_size);
-	if (n != runtime.text_size)
-		return false;
+	if (probe == kernel_integrity_probe_t::unavailable)
+	{
+		if (runtime.kernel_read_failure_streak != 0xFFFFFFFFu)
+			++runtime.kernel_read_failure_streak;
+		runtime.kernel_hash_mismatch_streak = 0;
+		return true;
+	}
 
-	return hash_memory(buf.data(), runtime.text_size) == runtime.text_hash;
+	runtime.kernel_read_failure_streak = 0;
+
+	if (probe == kernel_integrity_probe_t::match)
+	{
+		runtime.kernel_hash_mismatch_streak = 0;
+		return true;
+	}
+
+	if (runtime.kernel_hash_mismatch_streak != 0xFFFFFFFFu)
+		++runtime.kernel_hash_mismatch_streak;
+
+	return runtime.kernel_hash_mismatch_streak < 2;
 }
 
 inline bool verify_iat_locked(const runtime_state_t& runtime)
@@ -847,14 +929,38 @@ inline bool verify_hw_breakpoints_kernel(const runtime_state_t& runtime)
 	if (!device || !device->is_connected())
 		return true;
 
+	if (runtime.module == nullptr)
+		return true;
+
+	MODULEINFO mi{};
+	if (!GetModuleInformation(GetCurrentProcess(), runtime.module, &mi, sizeof(mi)))
+		return true;
+
+	const std::uint64_t mod_base = reinterpret_cast<std::uint64_t>(runtime.module);
+	const std::uint64_t mod_end  = mod_base + mi.SizeOfImage;
+
 	auto threads = device->enumerate_threads();
 	for (const auto& t : threads)
 	{
 		voyager::device_t::thread_context ctx{};
 		if (device->get_thread_context(t.tid, ctx))
 		{
-			if (ctx.dr0 != 0 || ctx.dr1 != 0 || ctx.dr2 != 0 || ctx.dr3 != 0)
-				return false;
+			const std::uint64_t dr_values[] = { ctx.dr0, ctx.dr1, ctx.dr2, ctx.dr3 };
+			const std::uint64_t dr7 = ctx.dr7;
+
+			for (int i = 0; i < 4; ++i)
+			{
+				if (dr_values[i] == 0)
+					continue;
+
+				const bool enabled_local  = (dr7 >> (i * 2))     & 1;
+				const bool enabled_global = (dr7 >> (i * 2 + 1)) & 1;
+				if (!enabled_local && !enabled_global)
+					continue;
+
+				if (dr_values[i] >= mod_base && dr_values[i] < mod_end)
+					return false;
+			}
 		}
 	}
 	return true;
@@ -1404,25 +1510,10 @@ inline void start_driver_tamper_monitor()
 
 			if (violation)
 			{
-				// Observability-only path: do not enforce from this monitor.
-
-				HANDLE hPipe = CreateFileW(
-					L"\\\\.\\pipe\\AiDA_Guard",
-					GENERIC_WRITE, 0, nullptr,
-					OPEN_EXISTING, 0, nullptr);
-
-				if (hPipe != INVALID_HANDLE_VALUE)
-				{
-					DWORD mode = PIPE_READMODE_MESSAGE;
-					SetNamedPipeHandleState(hPipe, &mode, nullptr, nullptr);
-
-					DWORD written = 0;
-					WriteFile(hPipe, violation,
-						static_cast<DWORD>(strlen(violation)),
-						&written, nullptr);
-					CloseHandle(hPipe);
-				}
-				continue;
+				arm_destructive_enforcement();
+				report_violation_to_server(violation);
+				enforce_self_analysis_violation();
+				return;
 			}
 		}
 	}).detach();

@@ -272,6 +272,7 @@ const std::vector<std::string> settings_t::anthropic_models = {
 };
 
 const std::vector<std::string> settings_t::copilot_models = {
+    OBFSTR("gpt-5.3-codex"),
     OBFSTR("claude-sonnet-4"),
     OBFSTR("claude-3.7-sonnet-thought"),
     OBFSTR("gemini-2.5-pro"),
@@ -569,7 +570,7 @@ settings_t::settings_t() :
     anthropic_model_name(OBFSTR("claude-sonnet-4-5")),
     anthropic_base_url(""),
     copilot_proxy_address(OBFSTR("http://127.0.0.1:4141")),
-    copilot_model_name(OBFSTR("gpt-4.1")),
+    copilot_model_name(OBFSTR("gpt-5.3-codex")),
     local_llm_base_url(OBFSTR("http://localhost:1234")),
     local_llm_model_name(""),
     local_llm_api_key(""),
