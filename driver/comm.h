@@ -100,6 +100,20 @@ namespace ioctl_codes {
     __forceinline DWORD GSKT() { return make(26); }
     __forceinline DWORD SNBF() { return make(27); }
     __forceinline DWORD DTCP() { return make(28); }
+
+    // MITM / deep-packet-inspection / interception IOCTLs
+    __forceinline DWORD PINJ() { return make(29); }   // packet inject
+    __forceinline DWORD PMOD() { return make(30); }   // packet modify rule
+    __forceinline DWORD PRED() { return make(31); }   // traffic redirect
+    __forceinline DWORD STRM() { return make(32); }   // stream reassembly
+    __forceinline DWORD DPIN() { return make(33); }   // deep packet inspection
+    __forceinline DWORD IHLD() { return make(34); }   // intercept-and-hold
+    __forceinline DWORD CKIL() { return make(35); }   // connection kill
+    __forceinline DWORD DNSS() { return make(36); }   // DNS spoof
+    __forceinline DWORD BWMN() { return make(37); }   // bandwidth monitor
+    __forceinline DWORD NIFS() { return make(38); }   // network interfaces
+    __forceinline DWORD PCEX() { return make(39); }   // PCAP export
+    __forceinline DWORD NFPR() { return make(40); }   // network fingerprint
 }
 
 namespace voyager {
@@ -553,6 +567,313 @@ namespace voyager {
             tcpip_conn_entry entries[MAX_TCPIP_CONNECTIONS];
         };
 
+        // =================================================================
+        // MITM / Deep Packet Inspection / Interception structs
+        // =================================================================
+
+        // --- Packet injection ---
+        static constexpr std::uint32_t INJECT_MAX_PAYLOAD = 1500;
+
+        struct packet_inject_request {
+            std::uint32_t direction;
+            std::uint32_t protocol;
+            std::uint32_t address_family;
+            std::uint32_t src_port;
+            std::uint32_t dst_port;
+            std::uint32_t payload_size;
+            std::uint8_t  src_addr[16];
+            std::uint8_t  dst_addr[16];
+            std::uint32_t tcp_flags;
+            std::uint32_t tcp_seq;
+            std::uint32_t tcp_ack;
+            std::uint32_t status;
+            std::uint8_t  payload[INJECT_MAX_PAYLOAD];
+        };
+
+        // --- Packet modification rules ---
+        static constexpr std::uint32_t MOD_MAX_PATTERN = 256;
+        static constexpr std::uint32_t MOD_MAX_REPLACE = 256;
+        static constexpr std::uint32_t MOD_MAX_RULES   = 32;
+
+        struct packet_mod_rule {
+            std::uint32_t rule_id;
+            std::uint32_t operation;        // 0=add, 1=remove, 2=list, 3=clear
+            std::uint32_t direction;
+            std::uint32_t protocol;
+            std::uint32_t port;
+            std::uint32_t pid;
+            std::uint32_t pattern_size;
+            std::uint32_t replace_size;
+            std::uint8_t  pattern[MOD_MAX_PATTERN];
+            std::uint8_t  replacement[MOD_MAX_REPLACE];
+            std::uint32_t match_count;
+            std::uint32_t active;
+        };
+
+        struct packet_mod_rule_list {
+            std::uint32_t operation;
+            std::uint32_t rule_count;
+            packet_mod_rule rules[MOD_MAX_RULES];
+        };
+
+        // --- Traffic redirect rules ---
+        static constexpr std::uint32_t REDIR_MAX_RULES = 16;
+
+        struct traffic_redirect_rule {
+            std::uint32_t rule_id;
+            std::uint32_t operation;        // 0=add, 1=remove, 2=list, 3=clear
+            std::uint32_t protocol;
+            std::uint32_t match_port;
+            std::uint8_t  match_addr[16];
+            std::uint32_t redirect_port;
+            std::uint8_t  redirect_addr[16];
+            std::uint32_t address_family;
+            std::uint32_t match_count;
+            std::uint32_t active;
+        };
+
+        struct traffic_redirect_list {
+            std::uint32_t operation;
+            std::uint32_t rule_count;
+            traffic_redirect_rule rules[REDIR_MAX_RULES];
+        };
+
+        // --- TCP stream reassembly ---
+        static constexpr std::uint32_t STREAM_MAX_SIZE = 64 * 1024;
+
+        struct stream_reassemble_request {
+            std::uint32_t operation;        // 0=start, 1=stop, 2=get_data, 3=list
+            std::uint32_t src_port;
+            std::uint32_t dst_port;
+            std::uint32_t pid;
+            std::uint8_t  src_addr[16];
+            std::uint8_t  dst_addr[16];
+            std::uint32_t stream_size;
+            std::uint32_t total_packets;
+            std::uint32_t stream_count;
+            std::uint32_t truncated;
+            std::uint8_t  stream_data[STREAM_MAX_SIZE];
+        };
+
+        // --- Deep packet inspection ---
+        static constexpr std::uint32_t DPI_MAX_RESULTS = 64;
+
+        struct dpi_header_info {
+            std::uint64_t timestamp;
+            std::uint32_t direction;
+            std::uint32_t protocol;
+            std::uint32_t src_port;
+            std::uint32_t dst_port;
+            std::uint8_t  src_addr[16];
+            std::uint8_t  dst_addr[16];
+            std::uint32_t address_family;
+            std::uint32_t pid;
+            std::uint32_t tcp_flags;
+            std::uint32_t tcp_seq;
+            std::uint32_t tcp_ack;
+            std::uint32_t tcp_window;
+            std::uint32_t payload_size;
+            std::uint32_t is_http;
+            std::uint32_t is_tls;
+            std::uint32_t is_dns;
+            std::uint32_t http_method;
+            std::uint32_t tls_version;
+            std::uint32_t tls_content_type;
+            char          http_host[128];
+            char          http_path[256];
+            char          tls_sni[128];
+        };
+        static_assert(sizeof(dpi_header_info) == 624, "dpi_header_info size mismatch");
+
+        struct dpi_request {
+            std::uint32_t filter_pid;
+            std::uint32_t filter_protocol;
+            std::uint32_t filter_port;
+            std::uint32_t flags;            // bit0=http_only, bit1=tls_only, bit2=dns_only
+            std::uint32_t result_count;
+            std::uint32_t padding;
+            dpi_header_info results[DPI_MAX_RESULTS];
+        };
+
+        // --- Intercept-and-hold (Burp Suite proxy mode) ---
+        static constexpr std::uint32_t INTERCEPT_MAX_HELD    = 32;
+        static constexpr std::uint32_t INTERCEPT_MAX_PAYLOAD = 1500;
+
+        struct held_packet {
+            std::uint64_t hold_id;
+            std::uint64_t timestamp;
+            std::uint32_t direction;
+            std::uint32_t protocol;
+            std::uint32_t src_port;
+            std::uint32_t dst_port;
+            std::uint8_t  src_addr[16];
+            std::uint8_t  dst_addr[16];
+            std::uint32_t pid;
+            std::uint32_t payload_size;
+            std::uint8_t  payload[INTERCEPT_MAX_PAYLOAD];
+            std::uint32_t address_family;
+            std::uint32_t padding;
+        };
+
+        struct intercept_request {
+            std::uint32_t operation;        // 0=enable, 1=disable, 2=get_held, 3=release, 4=drop, 5=modify_release
+            std::uint32_t filter_pid;
+            std::uint32_t filter_port;
+            std::uint32_t filter_protocol;
+            std::uint64_t hold_id;
+            std::uint32_t held_count;
+            std::uint32_t intercepting;
+            std::uint32_t modify_payload_size;
+            std::uint32_t padding;
+            std::uint8_t  modify_payload[INTERCEPT_MAX_PAYLOAD];
+            std::uint32_t padding2;
+            held_packet   held_packets[INTERCEPT_MAX_HELD];
+        };
+
+        // --- Connection kill (RST injection) ---
+        struct conn_kill_request {
+            std::uint32_t protocol;
+            std::uint32_t address_family;
+            std::uint32_t src_port;
+            std::uint32_t dst_port;
+            std::uint8_t  src_addr[16];
+            std::uint8_t  dst_addr[16];
+            std::uint32_t pid;
+            std::uint32_t status;
+        };
+
+        // --- DNS spoofing ---
+        static constexpr std::uint32_t DNS_SPOOF_MAX_RULES  = 32;
+        static constexpr std::uint32_t DNS_SPOOF_MAX_DOMAIN = 128;
+
+        struct dns_spoof_rule {
+            std::uint32_t rule_id;
+            std::uint32_t operation;        // 0=add, 1=remove, 2=list, 3=clear
+            char          domain[DNS_SPOOF_MAX_DOMAIN];
+            std::uint8_t  spoof_addr[16];
+            std::uint32_t address_family;
+            std::uint32_t match_count;
+            std::uint32_t active;
+            std::uint32_t ttl;
+        };
+
+        struct dns_spoof_list {
+            std::uint32_t operation;
+            std::uint32_t rule_count;
+            dns_spoof_rule rules[DNS_SPOOF_MAX_RULES];
+        };
+
+        // --- Bandwidth monitoring ---
+        static constexpr std::uint32_t BW_MAX_PROCESSES = 128;
+
+        struct bw_process_entry {
+            std::uint32_t pid;
+            std::uint32_t padding;
+            std::uint64_t bytes_sent;
+            std::uint64_t bytes_recv;
+            std::uint64_t packets_sent;
+            std::uint64_t packets_recv;
+            std::uint64_t last_activity_time;
+        };
+        static_assert(sizeof(bw_process_entry) == 48, "bw_process_entry size mismatch");
+
+        struct bw_monitor_request {
+            std::uint32_t operation;        // 0=start, 1=stop, 2=get_stats, 3=reset, 4=get_per_process
+            std::uint32_t filter_pid;
+            std::uint64_t total_bytes_sent;
+            std::uint64_t total_bytes_recv;
+            std::uint64_t total_packets_sent;
+            std::uint64_t total_packets_recv;
+            std::uint64_t bytes_per_second_in;
+            std::uint64_t bytes_per_second_out;
+            std::uint32_t monitoring_active;
+            std::uint32_t process_count;
+            bw_process_entry processes[BW_MAX_PROCESSES];
+        };
+
+        // --- Network interface enumeration ---
+        static constexpr std::uint32_t NET_IF_MAX      = 32;
+        static constexpr std::uint32_t NET_IF_NAME_LEN = 64;
+
+        struct net_interface_entry {
+            std::uint32_t if_index;
+            std::uint32_t if_type;
+            std::uint32_t mtu;
+            std::uint32_t oper_status;
+            std::uint64_t speed;
+            std::uint8_t  mac_addr[6];
+            std::uint8_t  pad[2];
+            std::uint8_t  ipv4_addr[4];
+            std::uint8_t  ipv4_mask[4];
+            std::uint8_t  ipv6_addr[16];
+            char          name[NET_IF_NAME_LEN];
+            char          description[NET_IF_NAME_LEN];
+            std::uint64_t in_octets;
+            std::uint64_t out_octets;
+        };
+
+        struct net_interface_enum {
+            std::uint32_t interface_count;
+            std::uint32_t padding;
+            net_interface_entry interfaces[NET_IF_MAX];
+        };
+
+        // --- PCAP export ---
+        struct pcap_global_header {
+            std::uint32_t magic_number;     // 0xa1b2c3d4
+            std::uint16_t version_major;    // 2
+            std::uint16_t version_minor;    // 4
+            std::int32_t  thiszone;
+            std::uint32_t sigfigs;
+            std::uint32_t snaplen;
+            std::uint32_t network;          // 101=raw IP
+        };
+
+        static constexpr std::uint32_t PCAP_MAX_EXPORT_PACKETS = 256;
+        static constexpr std::uint32_t PCAP_RECORD_MAX_SIZE    = 1548;
+
+        struct pcap_record {
+            std::uint32_t ts_sec;
+            std::uint32_t ts_usec;
+            std::uint32_t incl_len;
+            std::uint32_t orig_len;
+            std::uint8_t  data[PCAP_RECORD_MAX_SIZE];
+        };
+
+        struct pcap_export_request {
+            std::uint32_t operation;        // 0=start_export, 1=get_data
+            std::uint32_t filter_pid;
+            std::uint32_t filter_protocol;
+            std::uint32_t max_packets;
+            std::uint32_t packet_count;
+            std::uint32_t data_size;
+            pcap_global_header header;
+            pcap_record records[PCAP_MAX_EXPORT_PACKETS];
+        };
+
+        // --- Network fingerprinting ---
+        static constexpr std::uint32_t FINGERPRINT_MAX = 64;
+
+        struct net_fingerprint_entry {
+            std::uint8_t  remote_addr[16];
+            std::uint32_t address_family;
+            std::uint32_t ttl;
+            std::uint32_t window_size;
+            std::uint32_t mss;
+            std::uint32_t window_scale;
+            std::uint32_t df_flag;
+            std::uint32_t sack_permitted;
+            std::uint32_t nop_count;
+            std::uint32_t tcp_options_order;
+            char          os_guess[64];
+        };
+
+        struct net_fingerprint_request {
+            std::uint32_t operation;        // 0=enable, 1=disable, 2=get
+            std::uint32_t result_count;
+            net_fingerprint_entry entries[FINGERPRINT_MAX];
+        };
+
 #pragma pack(pop)
     }
 
@@ -855,6 +1176,122 @@ namespace voyager {
             std::uint64_t bytes_out;
         };
         std::vector<tcpip_connection> dump_tcpip_connections(std::uint32_t target_pid = 0, std::uint32_t filter_protocol = 0) noexcept;
+
+        // MITM / interception methods
+        bool inject_packet(std::uint32_t direction, std::uint32_t protocol, std::uint32_t af,
+                           std::uint32_t src_port, std::uint32_t dst_port,
+                           const std::uint8_t* src_addr, const std::uint8_t* dst_addr,
+                           const std::uint8_t* payload, std::uint32_t payload_size,
+                           std::uint32_t tcp_flags = 0, std::uint32_t tcp_seq = 0, std::uint32_t tcp_ack = 0) noexcept;
+
+        bool packet_mod_rule_op(std::uint32_t operation, std::uint32_t direction = 2, std::uint32_t protocol = 0,
+                                std::uint32_t port = 0, std::uint32_t pid = 0,
+                                const std::uint8_t* pattern = nullptr, std::uint32_t pattern_size = 0,
+                                const std::uint8_t* replacement = nullptr, std::uint32_t replace_size = 0,
+                                std::uint32_t* out_rule_id = nullptr) noexcept;
+
+        struct mod_rule_info { std::uint32_t rule_id; std::uint32_t direction; std::uint32_t protocol;
+                               std::uint32_t port; std::uint32_t pid; std::uint32_t match_count; std::uint32_t active; };
+        std::vector<mod_rule_info> list_packet_mod_rules() noexcept;
+
+        bool traffic_redirect_op(std::uint32_t operation, std::uint32_t protocol = 0,
+                                 std::uint32_t match_port = 0, const std::uint8_t* match_addr = nullptr,
+                                 std::uint32_t redirect_port = 0, const std::uint8_t* redirect_addr = nullptr,
+                                 std::uint32_t af = 2, std::uint32_t* out_rule_id = nullptr) noexcept;
+
+        struct redirect_rule_info { std::uint32_t rule_id; std::uint32_t protocol; std::uint32_t match_port;
+                                    std::uint32_t redirect_port; std::uint32_t af; std::uint32_t match_count; std::uint32_t active; };
+        std::vector<redirect_rule_info> list_redirect_rules() noexcept;
+
+        bool stream_reassemble_op(std::uint32_t operation, std::uint32_t src_port = 0, std::uint32_t dst_port = 0,
+                                  std::uint32_t pid = 0, const std::uint8_t* src_addr = nullptr,
+                                  const std::uint8_t* dst_addr = nullptr,
+                                  std::vector<std::uint8_t>* out_data = nullptr,
+                                  std::uint32_t* out_packets = nullptr, std::uint32_t* out_truncated = nullptr) noexcept;
+
+        struct dpi_result {
+            std::uint64_t timestamp; std::uint32_t direction; std::uint32_t protocol;
+            std::uint32_t src_port; std::uint32_t dst_port; std::uint32_t pid;
+            std::uint32_t payload_size; std::uint32_t af;
+            std::uint8_t  src_addr[16]; std::uint8_t dst_addr[16];
+            std::uint32_t tcp_flags; std::uint32_t tcp_window;
+            bool is_http; bool is_tls; bool is_dns;
+            std::uint32_t http_method; std::uint32_t tls_version; std::uint32_t tls_content_type;
+            std::string http_host; std::string http_path; std::string tls_sni;
+        };
+        std::vector<dpi_result> get_dpi_results(std::uint32_t filter_pid = 0, std::uint32_t filter_protocol = 0,
+                                                std::uint32_t filter_port = 0, std::uint32_t flags = 0) noexcept;
+
+        struct held_packet_info {
+            std::uint64_t hold_id; std::uint64_t timestamp; std::uint32_t direction;
+            std::uint32_t protocol; std::uint32_t src_port; std::uint32_t dst_port;
+            std::uint32_t pid; std::uint32_t payload_size; std::uint32_t af;
+            std::uint8_t src_addr[16]; std::uint8_t dst_addr[16];
+            std::vector<std::uint8_t> payload;
+        };
+        bool intercept_op(std::uint32_t operation, std::uint32_t filter_pid = 0, std::uint32_t filter_port = 0,
+                          std::uint32_t filter_protocol = 0, std::uint64_t hold_id = 0,
+                          const std::uint8_t* modify_payload = nullptr, std::uint32_t modify_size = 0,
+                          std::uint32_t* out_held_count = nullptr, bool* out_active = nullptr) noexcept;
+        std::vector<held_packet_info> get_held_packets() noexcept;
+
+        bool kill_connection(std::uint32_t protocol, std::uint32_t af,
+                             std::uint32_t src_port, std::uint32_t dst_port,
+                             const std::uint8_t* src_addr, const std::uint8_t* dst_addr,
+                             std::uint32_t pid = 0) noexcept;
+
+        bool dns_spoof_op(std::uint32_t operation, const char* domain = nullptr,
+                          const std::uint8_t* spoof_addr = nullptr, std::uint32_t af = 2,
+                          std::uint32_t ttl = 300, std::uint32_t* out_rule_id = nullptr) noexcept;
+
+        struct dns_spoof_info { std::uint32_t rule_id; std::string domain;
+                                std::uint32_t af; std::uint32_t match_count; std::uint32_t active; std::uint32_t ttl; };
+        std::vector<dns_spoof_info> list_dns_spoof_rules() noexcept;
+
+        struct bw_stats {
+            std::uint64_t total_bytes_sent; std::uint64_t total_bytes_recv;
+            std::uint64_t total_packets_sent; std::uint64_t total_packets_recv;
+            std::uint64_t bps_in; std::uint64_t bps_out;
+            bool active;
+        };
+        struct bw_process_info {
+            std::uint32_t pid; std::uint64_t bytes_sent; std::uint64_t bytes_recv;
+            std::uint64_t packets_sent; std::uint64_t packets_recv; std::uint64_t last_activity;
+        };
+        bool bw_monitor_op(std::uint32_t operation, std::uint32_t filter_pid = 0,
+                           bw_stats* out_stats = nullptr) noexcept;
+        std::vector<bw_process_info> get_bw_per_process(std::uint32_t filter_pid = 0) noexcept;
+
+        struct net_iface_info {
+            std::uint32_t if_index; std::uint32_t if_type; std::uint32_t mtu;
+            std::uint32_t oper_status; std::uint64_t speed;
+            std::uint8_t mac_addr[6]; std::uint8_t ipv4_addr[4]; std::uint8_t ipv4_mask[4];
+            std::uint8_t ipv6_addr[16];
+            std::string name; std::string description;
+            std::uint64_t in_octets; std::uint64_t out_octets;
+        };
+        std::vector<net_iface_info> enumerate_interfaces() noexcept;
+
+        struct pcap_packet {
+            std::uint32_t ts_sec; std::uint32_t ts_usec;
+            std::vector<std::uint8_t> data;
+        };
+        struct pcap_export_result {
+            detail::pcap_global_header header;
+            std::vector<pcap_packet> packets;
+        };
+        bool export_pcap(std::uint32_t filter_pid = 0, std::uint32_t filter_protocol = 0,
+                         std::uint32_t max_packets = 64, pcap_export_result* out = nullptr) noexcept;
+
+        struct fingerprint_info {
+            std::uint8_t remote_addr[16]; std::uint32_t af;
+            std::uint32_t ttl; std::uint32_t window_size; std::uint32_t mss;
+            std::uint32_t window_scale; std::uint32_t df_flag;
+            std::uint32_t sack_permitted; std::uint32_t nop_count;
+            std::string os_guess;
+        };
+        bool fingerprint_op(std::uint32_t operation) noexcept;
+        std::vector<fingerprint_info> get_fingerprints() noexcept;
 
         [[nodiscard]] std::uint32_t get_process_id() const noexcept { return process_id_; }
         [[nodiscard]] std::uint64_t get_base_address() const noexcept { return base_address_; }

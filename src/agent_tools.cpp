@@ -15811,6 +15811,708 @@ tool_result_t driver_dump_tcpip_connections(const json& params)
         std::to_string(udp_count) + OBFSTR(" UDP)"), result);
 }
 
+// =================================================================
+// MITM / Deep Packet Inspection / Interception tool handlers
+// =================================================================
+
+static bool parse_ip_string(const std::string& ip, std::uint8_t* out16, std::uint32_t* af) {
+    std::memset(out16, 0, 16);
+    // Try IPv4 first
+    unsigned a, b, c, d;
+    if (sscanf(ip.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) == 4 && a < 256 && b < 256 && c < 256 && d < 256) {
+        out16[0] = static_cast<std::uint8_t>(a);
+        out16[1] = static_cast<std::uint8_t>(b);
+        out16[2] = static_cast<std::uint8_t>(c);
+        out16[3] = static_cast<std::uint8_t>(d);
+        if (af) *af = 2;
+        return true;
+    }
+    // Simplified IPv6: just store as-is if it has colons
+    if (ip.find(':') != std::string::npos) {
+        if (af) *af = 23;
+        // Best-effort hex parse of colon-separated groups
+        unsigned vals[8] = {};
+        int count = sscanf(ip.c_str(), "%x:%x:%x:%x:%x:%x:%x:%x",
+            &vals[0], &vals[1], &vals[2], &vals[3], &vals[4], &vals[5], &vals[6], &vals[7]);
+        for (int i = 0; i < count && i < 8; i++) {
+            out16[i*2]   = static_cast<std::uint8_t>((vals[i] >> 8) & 0xFF);
+            out16[i*2+1] = static_cast<std::uint8_t>(vals[i] & 0xFF);
+        }
+        return count > 0;
+    }
+    return false;
+}
+
+static std::string format_mac(const std::uint8_t* mac) {
+    char buf[24];
+    qsnprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return buf;
+}
+
+static std::uint32_t proto_from_param(const json& params, const char* key) {
+    if (!params.contains(key)) return 0;
+    auto& v = params[key];
+    if (v.is_number()) return v.get<std::uint32_t>();
+    if (v.is_string()) {
+        std::string s = v.get<std::string>();
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (s == "tcp") return 6;
+        if (s == "udp") return 17;
+    }
+    return 0;
+}
+
+tool_result_t driver_inject_packet(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+
+    std::uint32_t direction = 1; // outbound by default
+    if (params.contains("direction")) {
+        auto& d = params["direction"];
+        if (d.is_number()) direction = d.get<std::uint32_t>();
+        else if (d.is_string()) {
+            std::string s = d.get<std::string>();
+            if (s == "inbound" || s == "in") direction = 0;
+        }
+    }
+
+    std::uint32_t protocol = proto_from_param(params, "protocol");
+    if (protocol == 0) protocol = 6; // default TCP
+
+    std::uint8_t src_addr[16] = {}, dst_addr[16] = {};
+    std::uint32_t af = 2;
+    if (params.contains("src_addr")) parse_ip_string(params["src_addr"].get<std::string>(), src_addr, &af);
+    if (params.contains("dst_addr")) parse_ip_string(params["dst_addr"].get<std::string>(), dst_addr, &af);
+
+    std::uint32_t src_port = params.value("src_port", 0u);
+    std::uint32_t dst_port = params.value("dst_port", 0u);
+    std::uint32_t tcp_flags = params.value("tcp_flags", 0u);
+    std::uint32_t tcp_seq = params.value("tcp_seq", 0u);
+    std::uint32_t tcp_ack = params.value("tcp_ack", 0u);
+
+    // Parse payload from hex string
+    std::vector<std::uint8_t> payload_bytes;
+    if (params.contains("payload")) {
+        std::string error;
+        if (!parse_byte_sequence(params["payload"], payload_bytes, error))
+            return tool_result_t::error(OBFSTR("Invalid payload: ") + error);
+    }
+    if (payload_bytes.empty())
+        return tool_result_t::error(OBFSTR("Payload is required"));
+
+    bool ok = device->inject_packet(direction, protocol, af, src_port, dst_port,
+                                     src_addr, dst_addr, payload_bytes.data(),
+                                     static_cast<std::uint32_t>(payload_bytes.size()),
+                                     tcp_flags, tcp_seq, tcp_ack);
+    if (!ok) return tool_result_t::error(OBFSTR("Packet injection failed"));
+
+    json result;
+    result["direction"] = direction == 0 ? "inbound" : "outbound";
+    result["protocol"] = protocol == 6 ? "TCP" : "UDP";
+    result["payload_size"] = payload_bytes.size();
+    result["dst_port"] = dst_port;
+    return tool_result_t::ok(OBFSTR("Packet injected successfully"), result);
+}
+
+tool_result_t driver_modify_packet_rule(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+
+    std::string operation = params.value("operation", "list");
+    std::transform(operation.begin(), operation.end(), operation.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (operation == "list") {
+        auto rules = device->list_packet_mod_rules();
+        json result;
+        result["rule_count"] = rules.size();
+        json arr = json::array();
+        for (const auto& r : rules) {
+            json e;
+            e["rule_id"] = r.rule_id;
+            e["direction"] = r.direction == 0 ? "in" : r.direction == 1 ? "out" : "both";
+            e["protocol"] = r.protocol == 6 ? "TCP" : r.protocol == 17 ? "UDP" : "any";
+            e["port"] = r.port;
+            e["pid"] = r.pid;
+            e["match_count"] = r.match_count;
+            e["active"] = r.active != 0;
+            arr.push_back(std::move(e));
+        }
+        result["rules"] = std::move(arr);
+        return tool_result_t::ok(OBFSTR("Packet modification rules: ") + std::to_string(rules.size()), result);
+    }
+
+    std::uint32_t op_code = 0;
+    if (operation == "add") op_code = 0;
+    else if (operation == "remove") op_code = 1;
+    else if (operation == "clear") op_code = 3;
+    else return tool_result_t::error(OBFSTR("Unknown operation: ") + operation);
+
+    std::uint32_t dir = 2; // both
+    if (params.contains("direction")) {
+        std::string ds = params["direction"].get<std::string>();
+        if (ds == "in" || ds == "inbound") dir = 0;
+        else if (ds == "out" || ds == "outbound") dir = 1;
+    }
+
+    std::uint32_t proto = proto_from_param(params, "protocol");
+    std::uint32_t port = params.value("port", 0u);
+    std::uint32_t pid = params.value("pid", 0u);
+
+    std::vector<std::uint8_t> pattern_bytes, replace_bytes;
+    if (params.contains("pattern")) {
+        std::string err;
+        if (!parse_byte_sequence(params["pattern"], pattern_bytes, err))
+            return tool_result_t::error(OBFSTR("Invalid pattern: ") + err);
+    }
+    if (params.contains("replacement")) {
+        std::string err;
+        if (!parse_byte_sequence(params["replacement"], replace_bytes, err))
+            return tool_result_t::error(OBFSTR("Invalid replacement: ") + err);
+    }
+
+    std::uint32_t rule_id = 0;
+    if (op_code == 1 && params.contains("rule_id"))
+        rule_id = params["rule_id"].get<std::uint32_t>();
+
+    std::uint32_t out_id = 0;
+    bool ok = device->packet_mod_rule_op(op_code, dir, proto, port, pid,
+                                          pattern_bytes.data(), static_cast<std::uint32_t>(pattern_bytes.size()),
+                                          replace_bytes.data(), static_cast<std::uint32_t>(replace_bytes.size()),
+                                          &out_id);
+    if (!ok) return tool_result_t::error(OBFSTR("Packet mod rule operation failed"));
+
+    json result;
+    result["operation"] = operation;
+    if (op_code == 0) result["rule_id"] = out_id;
+    return tool_result_t::ok(OBFSTR("Packet mod rule ") + operation + OBFSTR(" success"), result);
+}
+
+tool_result_t driver_redirect_traffic(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+
+    std::string operation = params.value("operation", "list");
+    std::transform(operation.begin(), operation.end(), operation.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (operation == "list") {
+        auto rules = device->list_redirect_rules();
+        json result;
+        result["rule_count"] = rules.size();
+        json arr = json::array();
+        for (const auto& r : rules) {
+            json e;
+            e["rule_id"] = r.rule_id;
+            e["protocol"] = r.protocol == 6 ? "TCP" : r.protocol == 17 ? "UDP" : "any";
+            e["match_port"] = r.match_port;
+            e["redirect_port"] = r.redirect_port;
+            e["match_count"] = r.match_count;
+            e["active"] = r.active != 0;
+            arr.push_back(std::move(e));
+        }
+        result["rules"] = std::move(arr);
+        return tool_result_t::ok(OBFSTR("Redirect rules: ") + std::to_string(rules.size()), result);
+    }
+
+    std::uint32_t op_code = 0;
+    if (operation == "add") op_code = 0;
+    else if (operation == "remove") op_code = 1;
+    else if (operation == "clear") op_code = 3;
+    else return tool_result_t::error(OBFSTR("Unknown operation: ") + operation);
+
+    std::uint32_t proto = proto_from_param(params, "protocol");
+    std::uint32_t match_port = params.value("match_port", 0u);
+    std::uint32_t redirect_port = params.value("redirect_port", 0u);
+    std::uint8_t match_addr[16] = {}, redir_addr[16] = {};
+    std::uint32_t af = 2;
+    if (params.contains("match_addr")) parse_ip_string(params["match_addr"].get<std::string>(), match_addr, &af);
+    if (params.contains("redirect_addr")) parse_ip_string(params["redirect_addr"].get<std::string>(), redir_addr, &af);
+
+    std::uint32_t out_id = 0;
+    bool ok = device->traffic_redirect_op(op_code, proto, match_port, match_addr,
+                                           redirect_port, redir_addr, af, &out_id);
+    if (!ok) return tool_result_t::error(OBFSTR("Redirect operation failed"));
+
+    json result;
+    result["operation"] = operation;
+    if (op_code == 0) result["rule_id"] = out_id;
+    return tool_result_t::ok(OBFSTR("Traffic redirect ") + operation + OBFSTR(" success"), result);
+}
+
+tool_result_t driver_reassemble_stream(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+
+    std::string operation = params.value("operation", "list");
+    std::transform(operation.begin(), operation.end(), operation.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    std::uint32_t op_code = 3; // list
+    if (operation == "start") op_code = 0;
+    else if (operation == "stop") op_code = 1;
+    else if (operation == "get" || operation == "get_data") op_code = 2;
+    else if (operation == "list") op_code = 3;
+
+    std::uint32_t src_port = params.value("src_port", 0u);
+    std::uint32_t dst_port = params.value("dst_port", 0u);
+    std::uint32_t pid = params.value("pid", 0u);
+    std::uint8_t src_addr[16] = {}, dst_addr[16] = {};
+    if (params.contains("src_addr")) parse_ip_string(params["src_addr"].get<std::string>(), src_addr, nullptr);
+    if (params.contains("dst_addr")) parse_ip_string(params["dst_addr"].get<std::string>(), dst_addr, nullptr);
+
+    std::vector<std::uint8_t> data;
+    std::uint32_t packets = 0, truncated = 0;
+    bool ok = device->stream_reassemble_op(op_code, src_port, dst_port, pid,
+                                            src_addr, dst_addr, &data, &packets, &truncated);
+    if (!ok) return tool_result_t::error(OBFSTR("Stream operation failed"));
+
+    json result;
+    result["operation"] = operation;
+    result["total_packets"] = packets;
+    if (truncated) result["truncated"] = true;
+    if (!data.empty()) {
+        result["stream_size"] = data.size();
+        // Provide hex preview (first 256 bytes)
+        std::string hex;
+        size_t preview = (data.size() > 256) ? 256 : data.size();
+        for (size_t i = 0; i < preview; i++) {
+            char buf[4];
+            qsnprintf(buf, sizeof(buf), "%02X ", data[i]);
+            hex += buf;
+        }
+        result["hex_preview"] = hex;
+        // Try ASCII
+        std::string ascii;
+        for (size_t i = 0; i < preview; i++)
+            ascii += (data[i] >= 0x20 && data[i] < 0x7f) ? static_cast<char>(data[i]) : '.';
+        result["ascii_preview"] = ascii;
+    }
+
+    return tool_result_t::ok(OBFSTR("Stream reassembly ") + operation + OBFSTR(": ") +
+        std::to_string(data.size()) + OBFSTR(" bytes, ") + std::to_string(packets) + OBFSTR(" packets"), result);
+}
+
+tool_result_t driver_deep_inspect(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+
+    std::uint32_t filter_pid = params.value("filter_pid", 0u);
+    std::uint32_t filter_proto = proto_from_param(params, "filter_protocol");
+    std::uint32_t filter_port = params.value("filter_port", 0u);
+    std::uint32_t flags = 0;
+    if (params.value("http_only", false)) flags |= 1;
+    if (params.value("tls_only", false)) flags |= 2;
+    if (params.value("dns_only", false)) flags |= 4;
+
+    auto results = device->get_dpi_results(filter_pid, filter_proto, filter_port, flags);
+    if (results.empty())
+        return tool_result_t::ok(OBFSTR("No DPI results"), json::object());
+
+    static const char* http_methods[] = {"NONE", "GET", "POST", "PUT", "DELETE", "HEAD", "OTHER"};
+    json j;
+    j["count"] = results.size();
+    json arr = json::array();
+    for (const auto& d : results) {
+        json e;
+        e["direction"] = d.direction == 0 ? "in" : "out";
+        e["protocol"] = d.protocol == 6 ? "TCP" : d.protocol == 17 ? "UDP" : std::to_string(d.protocol);
+        e["pid"] = d.pid;
+        e["src"] = format_recon_ip(d.src_addr, d.af) + ":" + std::to_string(d.src_port);
+        e["dst"] = format_recon_ip(d.dst_addr, d.af) + ":" + std::to_string(d.dst_port);
+        e["payload_size"] = d.payload_size;
+        if (d.is_http) {
+            e["type"] = "HTTP";
+            e["http_method"] = (d.http_method < 7) ? http_methods[d.http_method] : "?";
+            if (!d.http_host.empty()) e["http_host"] = d.http_host;
+            if (!d.http_path.empty()) e["http_path"] = d.http_path;
+        }
+        if (d.is_tls) {
+            e["type"] = "TLS";
+            char ver[16];
+            qsnprintf(ver, sizeof(ver), "0x%04X", d.tls_version);
+            e["tls_version"] = ver;
+            if (!d.tls_sni.empty()) e["tls_sni"] = d.tls_sni;
+            e["tls_content_type"] = d.tls_content_type;
+        }
+        if (d.is_dns) e["type"] = "DNS";
+        if (d.tcp_flags != 0) {
+            std::string fl;
+            if (d.tcp_flags & 0x02) fl += "SYN ";
+            if (d.tcp_flags & 0x10) fl += "ACK ";
+            if (d.tcp_flags & 0x04) fl += "RST ";
+            if (d.tcp_flags & 0x01) fl += "FIN ";
+            if (d.tcp_flags & 0x08) fl += "PSH ";
+            e["tcp_flags"] = fl;
+        }
+        arr.push_back(std::move(e));
+    }
+    j["packets"] = std::move(arr);
+
+    return tool_result_t::ok(OBFSTR("Deep packet inspection: ") + std::to_string(results.size()) + OBFSTR(" packets"), j);
+}
+
+tool_result_t driver_intercept_hold(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+
+    std::string operation = params.value("operation", "status");
+    std::transform(operation.begin(), operation.end(), operation.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (operation == "get" || operation == "get_held") {
+        auto held = device->get_held_packets();
+        json result;
+        result["held_count"] = held.size();
+        json arr = json::array();
+        for (const auto& h : held) {
+            json e;
+            e["hold_id"] = h.hold_id;
+            e["direction"] = h.direction == 0 ? "in" : "out";
+            e["protocol"] = h.protocol == 6 ? "TCP" : "UDP";
+            e["pid"] = h.pid;
+            e["src"] = format_recon_ip(h.src_addr, h.af) + ":" + std::to_string(h.src_port);
+            e["dst"] = format_recon_ip(h.dst_addr, h.af) + ":" + std::to_string(h.dst_port);
+            e["payload_size"] = h.payload_size;
+            if (!h.payload.empty()) {
+                std::string hex;
+                size_t preview = (h.payload.size() > 128) ? 128 : h.payload.size();
+                for (size_t i = 0; i < preview; i++) {
+                    char buf[4];
+                    qsnprintf(buf, sizeof(buf), "%02X ", h.payload[i]);
+                    hex += buf;
+                }
+                e["payload_hex_preview"] = hex;
+            }
+            arr.push_back(std::move(e));
+        }
+        result["packets"] = std::move(arr);
+        return tool_result_t::ok(OBFSTR("Held packets: ") + std::to_string(held.size()), result);
+    }
+
+    std::uint32_t op_code;
+    if (operation == "enable") op_code = 0;
+    else if (operation == "disable") op_code = 1;
+    else if (operation == "release") op_code = 3;
+    else if (operation == "drop") op_code = 4;
+    else if (operation == "modify" || operation == "modify_release") op_code = 5;
+    else if (operation == "status") {
+        std::uint32_t held_count = 0;
+        bool active = false;
+        device->intercept_op(2, 0, 0, 0, 0, nullptr, 0, &held_count, &active);
+        json r;
+        r["intercepting"] = active;
+        r["held_count"] = held_count;
+        return tool_result_t::ok(active ? OBFSTR("Intercept active") : OBFSTR("Intercept inactive"), r);
+    }
+    else return tool_result_t::error(OBFSTR("Unknown operation: ") + operation);
+
+    std::uint32_t filter_pid = params.value("filter_pid", 0u);
+    std::uint32_t filter_port = params.value("filter_port", 0u);
+    std::uint32_t filter_proto = proto_from_param(params, "filter_protocol");
+    std::uint64_t hold_id = params.value("hold_id", std::uint64_t(0));
+
+    std::vector<std::uint8_t> mod_payload;
+    if (op_code == 5 && params.contains("modify_payload")) {
+        std::string err;
+        if (!parse_byte_sequence(params["modify_payload"], mod_payload, err))
+            return tool_result_t::error(OBFSTR("Invalid modify_payload: ") + err);
+    }
+
+    std::uint32_t held_count = 0;
+    bool active = false;
+    bool ok = device->intercept_op(op_code, filter_pid, filter_port, filter_proto, hold_id,
+                                    mod_payload.empty() ? nullptr : mod_payload.data(),
+                                    static_cast<std::uint32_t>(mod_payload.size()),
+                                    &held_count, &active);
+    if (!ok) return tool_result_t::error(OBFSTR("Intercept operation failed"));
+
+    json result;
+    result["operation"] = operation;
+    result["intercepting"] = active;
+    result["held_count"] = held_count;
+    return tool_result_t::ok(OBFSTR("Intercept ") + operation + OBFSTR(" success"), result);
+}
+
+tool_result_t driver_kill_connection(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+
+    std::uint8_t src_addr[16] = {}, dst_addr[16] = {};
+    std::uint32_t af = 2;
+    if (params.contains("src_addr")) parse_ip_string(params["src_addr"].get<std::string>(), src_addr, &af);
+    if (params.contains("dst_addr")) parse_ip_string(params["dst_addr"].get<std::string>(), dst_addr, &af);
+
+    std::uint32_t src_port = params.value("src_port", 0u);
+    std::uint32_t dst_port = params.value("dst_port", 0u);
+    std::uint32_t proto = proto_from_param(params, "protocol");
+    if (proto == 0) proto = 6;
+    std::uint32_t pid = params.value("pid", 0u);
+
+    bool ok = device->kill_connection(proto, af, src_port, dst_port, src_addr, dst_addr, pid);
+    if (!ok) return tool_result_t::error(OBFSTR("Connection kill failed"));
+
+    json result;
+    result["killed"] = true;
+    result["src_port"] = src_port;
+    result["dst_port"] = dst_port;
+    return tool_result_t::ok(OBFSTR("TCP connection killed via RST injection"), result);
+}
+
+tool_result_t driver_spoof_dns(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+
+    std::string operation = params.value("operation", "list");
+    std::transform(operation.begin(), operation.end(), operation.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (operation == "list") {
+        auto rules = device->list_dns_spoof_rules();
+        json result;
+        result["rule_count"] = rules.size();
+        json arr = json::array();
+        for (const auto& r : rules) {
+            json e;
+            e["rule_id"] = r.rule_id;
+            e["domain"] = r.domain;
+            e["address_family"] = r.af == 2 ? "IPv4" : "IPv6";
+            e["match_count"] = r.match_count;
+            e["active"] = r.active != 0;
+            e["ttl"] = r.ttl;
+            arr.push_back(std::move(e));
+        }
+        result["rules"] = std::move(arr);
+        return tool_result_t::ok(OBFSTR("DNS spoof rules: ") + std::to_string(rules.size()), result);
+    }
+
+    std::uint32_t op_code;
+    if (operation == "add") op_code = 0;
+    else if (operation == "remove") op_code = 1;
+    else if (operation == "clear") op_code = 3;
+    else return tool_result_t::error(OBFSTR("Unknown operation: ") + operation);
+
+    std::string domain = params.value("domain", "");
+    std::uint8_t spoof[16] = {};
+    std::uint32_t af = 2;
+    if (params.contains("spoof_addr")) parse_ip_string(params["spoof_addr"].get<std::string>(), spoof, &af);
+    std::uint32_t ttl = params.value("ttl", 300u);
+
+    std::uint32_t out_id = 0;
+    bool ok = device->dns_spoof_op(op_code, domain.c_str(), spoof, af, ttl, &out_id);
+    if (!ok) return tool_result_t::error(OBFSTR("DNS spoof operation failed"));
+
+    json result;
+    result["operation"] = operation;
+    if (op_code == 0) result["rule_id"] = out_id;
+    return tool_result_t::ok(OBFSTR("DNS spoof ") + operation + OBFSTR(" success"), result);
+}
+
+tool_result_t driver_bandwidth_monitor(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+
+    std::string operation = params.value("operation", "status");
+    std::transform(operation.begin(), operation.end(), operation.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    std::uint32_t op_code;
+    if (operation == "start") op_code = 0;
+    else if (operation == "stop") op_code = 1;
+    else if (operation == "status" || operation == "get" || operation == "stats") op_code = 2;
+    else if (operation == "reset") op_code = 3;
+    else if (operation == "per_process") op_code = 4;
+    else return tool_result_t::error(OBFSTR("Unknown operation: ") + operation);
+
+    std::uint32_t filter_pid = params.value("filter_pid", 0u);
+
+    if (op_code == 4) {
+        auto procs = device->get_bw_per_process(filter_pid);
+        json result;
+        result["process_count"] = procs.size();
+        json arr = json::array();
+        for (const auto& p : procs) {
+            json e;
+            e["pid"] = p.pid;
+            e["bytes_sent"] = p.bytes_sent;
+            e["bytes_recv"] = p.bytes_recv;
+            e["packets_sent"] = p.packets_sent;
+            e["packets_recv"] = p.packets_recv;
+            arr.push_back(std::move(e));
+        }
+        result["processes"] = std::move(arr);
+        return tool_result_t::ok(OBFSTR("Per-process bandwidth: ") + std::to_string(procs.size()) + OBFSTR(" processes"), result);
+    }
+
+    voyager::device_t::bw_stats stats{};
+    bool ok = device->bw_monitor_op(op_code, filter_pid, &stats);
+    if (!ok) return tool_result_t::error(OBFSTR("Bandwidth monitor operation failed"));
+
+    json result;
+    result["operation"] = operation;
+    result["monitoring_active"] = stats.active;
+    result["total_bytes_sent"] = stats.total_bytes_sent;
+    result["total_bytes_recv"] = stats.total_bytes_recv;
+    result["total_packets_sent"] = stats.total_packets_sent;
+    result["total_packets_recv"] = stats.total_packets_recv;
+    result["bytes_per_second_in"] = stats.bps_in;
+    result["bytes_per_second_out"] = stats.bps_out;
+    return tool_result_t::ok(OBFSTR("Bandwidth monitor ") + operation, result);
+}
+
+tool_result_t driver_list_interfaces(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+
+    auto ifaces = device->enumerate_interfaces();
+    if (ifaces.empty())
+        return tool_result_t::ok(OBFSTR("No network interfaces found"), json::object());
+
+    json result;
+    result["count"] = ifaces.size();
+    json arr = json::array();
+    for (const auto& iface : ifaces) {
+        json e;
+        e["index"] = iface.if_index;
+        e["type"] = iface.if_type == 6 ? "Ethernet" : iface.if_type == 71 ? "WiFi" :
+                    iface.if_type == 24 ? "Loopback" : std::to_string(iface.if_type);
+        e["mtu"] = iface.mtu;
+        e["status"] = iface.oper_status == 1 ? "Up" : "Down";
+        e["speed_mbps"] = iface.speed / 1000000;
+        e["mac"] = format_mac(iface.mac_addr);
+        char ipv4[20];
+        qsnprintf(ipv4, sizeof(ipv4), "%u.%u.%u.%u", iface.ipv4_addr[0], iface.ipv4_addr[1],
+                  iface.ipv4_addr[2], iface.ipv4_addr[3]);
+        e["ipv4"] = ipv4;
+        if (!iface.name.empty()) e["name"] = iface.name;
+        if (!iface.description.empty()) e["description"] = iface.description;
+        e["in_bytes"] = iface.in_octets;
+        e["out_bytes"] = iface.out_octets;
+        arr.push_back(std::move(e));
+    }
+    result["interfaces"] = std::move(arr);
+
+    return tool_result_t::ok(OBFSTR("Network interfaces: ") + std::to_string(ifaces.size()), result);
+}
+
+tool_result_t driver_export_pcap(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+
+    std::uint32_t filter_pid = params.value("filter_pid", 0u);
+    std::uint32_t filter_proto = proto_from_param(params, "filter_protocol");
+    std::uint32_t max_packets = params.value("max_packets", 64u);
+
+    voyager::device_t::pcap_export_result pcap{};
+    bool ok = device->export_pcap(filter_pid, filter_proto, max_packets, &pcap);
+    if (!ok) return tool_result_t::error(OBFSTR("PCAP export failed"));
+
+    // If output_path specified, write to file
+    if (params.contains("output_path")) {
+        std::string path = params["output_path"].get<std::string>();
+        FILE* fp = qfopen(path.c_str(), "wb");
+        if (fp) {
+            qfwrite(fp, &pcap.header, sizeof(pcap.header));
+            for (const auto& pkt : pcap.packets) {
+                std::uint32_t hdr[4] = { pkt.ts_sec, pkt.ts_usec,
+                    static_cast<std::uint32_t>(pkt.data.size()),
+                    static_cast<std::uint32_t>(pkt.data.size()) };
+                qfwrite(fp, hdr, sizeof(hdr));
+                qfwrite(fp, pkt.data.data(), pkt.data.size());
+            }
+            qfclose(fp);
+        }
+
+        json result;
+        result["output_path"] = path;
+        result["packet_count"] = pcap.packets.size();
+        return tool_result_t::ok(OBFSTR("PCAP saved: ") + std::to_string(pcap.packets.size()) +
+            OBFSTR(" packets -> ") + path, result);
+    }
+
+    json result;
+    result["packet_count"] = pcap.packets.size();
+    result["link_type"] = pcap.header.network;
+    json arr = json::array();
+    for (const auto& pkt : pcap.packets) {
+        json e;
+        e["ts_sec"] = pkt.ts_sec;
+        e["ts_usec"] = pkt.ts_usec;
+        e["size"] = pkt.data.size();
+        if (!pkt.data.empty()) {
+            std::string hex;
+            size_t preview = (pkt.data.size() > 64) ? 64 : pkt.data.size();
+            for (size_t i = 0; i < preview; i++) {
+                char buf[4];
+                qsnprintf(buf, sizeof(buf), "%02X ", pkt.data[i]);
+                hex += buf;
+            }
+            e["hex_preview"] = hex;
+        }
+        arr.push_back(std::move(e));
+    }
+    result["packets"] = std::move(arr);
+
+    return tool_result_t::ok(OBFSTR("PCAP export: ") + std::to_string(pcap.packets.size()) + OBFSTR(" packets"), result);
+}
+
+tool_result_t driver_network_fingerprint(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+
+    std::string operation = params.value("operation", "get");
+    std::transform(operation.begin(), operation.end(), operation.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (operation == "enable") {
+        bool ok = device->fingerprint_op(0);
+        return ok ? tool_result_t::ok(OBFSTR("Fingerprinting enabled"), json::object())
+                  : tool_result_t::error(OBFSTR("Failed to enable fingerprinting"));
+    }
+    if (operation == "disable") {
+        bool ok = device->fingerprint_op(1);
+        return ok ? tool_result_t::ok(OBFSTR("Fingerprinting disabled"), json::object())
+                  : tool_result_t::error(OBFSTR("Failed to disable fingerprinting"));
+    }
+
+    // Default: get results
+    auto fps = device->get_fingerprints();
+    if (fps.empty())
+        return tool_result_t::ok(OBFSTR("No fingerprint results"), json::object());
+
+    json result;
+    result["count"] = fps.size();
+    json arr = json::array();
+    for (const auto& f : fps) {
+        json e;
+        e["remote"] = format_recon_ip(f.remote_addr, f.af);
+        e["ttl"] = f.ttl;
+        e["window_size"] = f.window_size;
+        e["mss"] = f.mss;
+        e["window_scale"] = f.window_scale;
+        e["df_flag"] = f.df_flag != 0;
+        e["sack"] = f.sack_permitted != 0;
+        if (!f.os_guess.empty()) e["os_guess"] = f.os_guess;
+        arr.push_back(std::move(e));
+    }
+    result["fingerprints"] = std::move(arr);
+
+    return tool_result_t::ok(OBFSTR("Network fingerprints: ") + std::to_string(fps.size()) + OBFSTR(" hosts"), result);
+}
+
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
@@ -16351,6 +17053,166 @@ void register_tools()
          {OBFSTR("filter_protocol"), OBFSTR("string"),
           OBFSTR("Optional: 'tcp', 'udp', or protocol number (0 = all)"), false}},
         driver_dump_tcpip_connections, true});
+
+    // ---- MITM / Deep Packet Inspection / Interception tools ----
+
+    registry.register_tool({
+        OBFSTR("driver_inject_packet"), OBFSTR("driver"),
+        OBFSTR("Inject a crafted raw network packet into the network stack via WFP injection APIs. "
+               "Supports both inbound and outbound injection of TCP/UDP packets. "
+               "Can spoof source addresses and ports. Useful for testing firewalls, triggering specific "
+               "protocol handlers, and advanced network analysis."),
+        {{OBFSTR("direction"), OBFSTR("string"), OBFSTR("'inbound'/'in' or 'outbound'/'out' (default out)"), false},
+         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("'tcp' or 'udp' (default tcp)"), false},
+         {OBFSTR("src_addr"), OBFSTR("string"), OBFSTR("Source IP address (e.g. '192.168.1.1')"), false},
+         {OBFSTR("dst_addr"), OBFSTR("string"), OBFSTR("Destination IP address"), false},
+         {OBFSTR("src_port"), OBFSTR("number"), OBFSTR("Source port"), false},
+         {OBFSTR("dst_port"), OBFSTR("number"), OBFSTR("Destination port"), false},
+         {OBFSTR("payload"), OBFSTR("string"), OBFSTR("Hex payload bytes (e.g. '48 45 4C 4C 4F')"), true},
+         {OBFSTR("tcp_flags"), OBFSTR("number"), OBFSTR("TCP flags: SYN=2, ACK=16, RST=4, FIN=1, PSH=8"), false},
+         {OBFSTR("tcp_seq"), OBFSTR("number"), OBFSTR("TCP sequence number"), false},
+         {OBFSTR("tcp_ack"), OBFSTR("number"), OBFSTR("TCP acknowledgment number"), false}},
+        driver_inject_packet, false});
+
+    registry.register_tool({
+        OBFSTR("driver_modify_packet_rule"), OBFSTR("driver"),
+        OBFSTR("Manage kernel-level packet modification rules. Like Fiddler's AutoResponder but at the "
+               "kernel level. Finds byte patterns in live network packets and replaces them in-place. "
+               "Works on both TCP and UDP. Operations: add, remove, list, clear."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'add', 'remove', 'list', 'clear'"), false,
+          {OBFSTR("add"), OBFSTR("remove"), OBFSTR("list"), OBFSTR("clear")}},
+         {OBFSTR("direction"), OBFSTR("string"), OBFSTR("'in', 'out', or 'both' (default both)"), false},
+         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("'tcp', 'udp', or 'any' (default any)"), false},
+         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Filter by port (0=any)"), false},
+         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter by PID (0=any)"), false},
+         {OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Hex bytes to search for in packets"), false},
+         {OBFSTR("replacement"), OBFSTR("string"), OBFSTR("Hex bytes to replace pattern with"), false},
+         {OBFSTR("rule_id"), OBFSTR("number"), OBFSTR("Rule ID for remove operation"), false}},
+        driver_modify_packet_rule, false});
+
+    registry.register_tool({
+        OBFSTR("driver_redirect_traffic"), OBFSTR("driver"),
+        OBFSTR("Manage kernel-level traffic redirection rules. Redirects network connections matching "
+               "protocol/port/address criteria to a different destination. Like mitmproxy's upstream "
+               "proxy but at the kernel WFP layer. Operations: add, remove, list, clear."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'add', 'remove', 'list', 'clear'"), false,
+          {OBFSTR("add"), OBFSTR("remove"), OBFSTR("list"), OBFSTR("clear")}},
+         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("'tcp', 'udp', 'any'"), false},
+         {OBFSTR("match_port"), OBFSTR("number"), OBFSTR("Original destination port to match"), false},
+         {OBFSTR("match_addr"), OBFSTR("string"), OBFSTR("Original destination IP to match"), false},
+         {OBFSTR("redirect_port"), OBFSTR("number"), OBFSTR("New destination port"), false},
+         {OBFSTR("redirect_addr"), OBFSTR("string"), OBFSTR("New destination IP"), false}},
+        driver_redirect_traffic, false});
+
+    registry.register_tool({
+        OBFSTR("driver_reassemble_stream"), OBFSTR("driver"),
+        OBFSTR("TCP stream reassembly engine. Like Wireshark's 'Follow TCP Stream' but from the kernel. "
+               "Tracks TCP connections and reassembles the byte stream in order. Supports up to 8 "
+               "concurrent streams, 64KB each. Operations: start, stop, get_data, list."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'start', 'stop', 'get'/'get_data', 'list'"), false,
+          {OBFSTR("start"), OBFSTR("stop"), OBFSTR("get"), OBFSTR("get_data"), OBFSTR("list")}},
+         {OBFSTR("src_addr"), OBFSTR("string"), OBFSTR("Source IP of the connection to track"), false},
+         {OBFSTR("dst_addr"), OBFSTR("string"), OBFSTR("Destination IP"), false},
+         {OBFSTR("src_port"), OBFSTR("number"), OBFSTR("Source port"), false},
+         {OBFSTR("dst_port"), OBFSTR("number"), OBFSTR("Destination port"), false},
+         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter by PID"), false}},
+        driver_reassemble_stream, false});
+
+    registry.register_tool({
+        OBFSTR("driver_deep_inspect"), OBFSTR("driver"),
+        OBFSTR("Deep Packet Inspection engine. Analyzes live network traffic at the kernel level. "
+               "Automatically detects and parses HTTP (method, host, path), TLS (version, SNI, content type), "
+               "and DNS packets. Shows TCP flags, sequence numbers, and window sizes. "
+               "Like Wireshark's protocol dissectors but running inside the kernel."),
+        {{OBFSTR("filter_pid"), OBFSTR("number"), OBFSTR("Only show packets from this PID (0=all)"), false},
+         {OBFSTR("filter_protocol"), OBFSTR("string"), OBFSTR("'tcp', 'udp', or number (0=all)"), false},
+         {OBFSTR("filter_port"), OBFSTR("number"), OBFSTR("Only show packets on this port (0=all)"), false},
+         {OBFSTR("http_only"), OBFSTR("boolean"), OBFSTR("Only show HTTP packets"), false},
+         {OBFSTR("tls_only"), OBFSTR("boolean"), OBFSTR("Only show TLS packets"), false},
+         {OBFSTR("dns_only"), OBFSTR("boolean"), OBFSTR("Only show DNS packets"), false}},
+        driver_deep_inspect, true});
+
+    registry.register_tool({
+        OBFSTR("driver_intercept_hold"), OBFSTR("driver"),
+        OBFSTR("Burp Suite-style intercept-and-hold at the kernel level. When enabled, matching packets "
+               "are BLOCKED and held in a buffer. You can inspect them, then release (forward), drop, or "
+               "modify-and-release each packet. Up to 32 packets can be held simultaneously. "
+               "Operations: enable, disable, status, get/get_held, release, drop, modify/modify_release."),
+        {{OBFSTR("operation"), OBFSTR("string"),
+          OBFSTR("'enable', 'disable', 'status', 'get'/'get_held', 'release', 'drop', 'modify'/'modify_release'"), false,
+          {OBFSTR("enable"), OBFSTR("disable"), OBFSTR("status"), OBFSTR("get"), OBFSTR("get_held"),
+           OBFSTR("release"), OBFSTR("drop"), OBFSTR("modify"), OBFSTR("modify_release")}},
+         {OBFSTR("filter_pid"), OBFSTR("number"), OBFSTR("PID filter for enable"), false},
+         {OBFSTR("filter_port"), OBFSTR("number"), OBFSTR("Port filter for enable"), false},
+         {OBFSTR("filter_protocol"), OBFSTR("string"), OBFSTR("Protocol filter for enable"), false},
+         {OBFSTR("hold_id"), OBFSTR("number"), OBFSTR("Packet ID for release/drop/modify"), false},
+         {OBFSTR("modify_payload"), OBFSTR("string"), OBFSTR("New hex payload for modify_release"), false}},
+        driver_intercept_hold, false});
+
+    registry.register_tool({
+        OBFSTR("driver_kill_connection"), OBFSTR("driver"),
+        OBFSTR("Kill a TCP connection by injecting a RST packet via the kernel WFP injection API. "
+               "Instantly terminates the connection from the kernel level. Cannot be blocked by "
+               "usermode firewalls or anti-cheat."),
+        {{OBFSTR("src_addr"), OBFSTR("string"), OBFSTR("Source IP of the connection"), true},
+         {OBFSTR("dst_addr"), OBFSTR("string"), OBFSTR("Destination IP"), true},
+         {OBFSTR("src_port"), OBFSTR("number"), OBFSTR("Source port"), true},
+         {OBFSTR("dst_port"), OBFSTR("number"), OBFSTR("Destination port"), true},
+         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("'tcp' (default)"), false},
+         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Optional PID filter"), false}},
+        driver_kill_connection, false});
+
+    registry.register_tool({
+        OBFSTR("driver_spoof_dns"), OBFSTR("driver"),
+        OBFSTR("Manage kernel-level DNS spoofing rules. When a DNS query matches a rule domain, "
+               "a fake response with the configured IP is returned. Supports wildcard domains "
+               "(e.g. '*.example.com'). Operations: add, remove, list, clear."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'add', 'remove', 'list', 'clear'"), false,
+          {OBFSTR("add"), OBFSTR("remove"), OBFSTR("list"), OBFSTR("clear")}},
+         {OBFSTR("domain"), OBFSTR("string"), OBFSTR("Domain to match (e.g. '*.evil.com')"), false},
+         {OBFSTR("spoof_addr"), OBFSTR("string"), OBFSTR("Fake IP to return (e.g. '127.0.0.1')"), false},
+         {OBFSTR("ttl"), OBFSTR("number"), OBFSTR("TTL for spoofed response (default 300)"), false}},
+        driver_spoof_dns, false});
+
+    registry.register_tool({
+        OBFSTR("driver_bandwidth_monitor"), OBFSTR("driver"),
+        OBFSTR("Per-process bandwidth monitoring from the kernel. Tracks bytes/packets sent and received "
+               "for every process on the system with rate calculation. Like NetLimiter/GlassWire but "
+               "from kernel WFP. Operations: start, stop, status/get, reset, per_process."),
+        {{OBFSTR("operation"), OBFSTR("string"),
+          OBFSTR("'start', 'stop', 'status'/'get', 'reset', 'per_process'"), false,
+          {OBFSTR("start"), OBFSTR("stop"), OBFSTR("status"), OBFSTR("get"), OBFSTR("reset"), OBFSTR("per_process")}},
+         {OBFSTR("filter_pid"), OBFSTR("number"), OBFSTR("Filter by PID (0=all)"), false}},
+        driver_bandwidth_monitor, false});
+
+    registry.register_tool({
+        OBFSTR("driver_list_interfaces"), OBFSTR("driver"),
+        OBFSTR("Enumerate all network interfaces from the kernel via GetIfTable2. Returns interface index, "
+               "type (Ethernet/WiFi/Loopback), MTU, operational status, link speed, MAC address, "
+               "IPv4 address, interface name, description, and byte counters."),
+        {},
+        driver_list_interfaces, true});
+
+    registry.register_tool({
+        OBFSTR("driver_export_pcap"), OBFSTR("driver"),
+        OBFSTR("Export captured network packets in standard PCAP format that can be opened in Wireshark. "
+               "Builds proper PCAP file headers (magic 0xa1b2c3d4, v2.4, LINKTYPE_RAW). "
+               "Optionally saves directly to a .pcap file. Requires capture to be active first."),
+        {{OBFSTR("filter_pid"), OBFSTR("number"), OBFSTR("Only export packets from this PID"), false},
+         {OBFSTR("filter_protocol"), OBFSTR("string"), OBFSTR("'tcp', 'udp', or number"), false},
+         {OBFSTR("max_packets"), OBFSTR("number"), OBFSTR("Maximum packets to export (default 64, max 256)"), false},
+         {OBFSTR("output_path"), OBFSTR("string"),
+          OBFSTR("Save to this file path (e.g. 'C:\\\\capture.pcap'). If omitted, returns data inline."), false}},
+        driver_export_pcap, false});
+
+    registry.register_tool({
+        OBFSTR("driver_network_fingerprint"), OBFSTR("driver"),
+        OBFSTR("Passive OS fingerprinting from TCP SYN packets (p0f-style). Analyzes TTL, TCP window size, "
+               "MSS, window scale, SACK, and TCP options ordering to identify the remote operating system. "
+               "Runs entirely in the kernel WFP layer. Operations: enable, disable, get."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'enable', 'disable', 'get' (default get)"), false,
+          {OBFSTR("enable"), OBFSTR("disable"), OBFSTR("get")}}},
+        driver_network_fingerprint, true});
 }
 
 }

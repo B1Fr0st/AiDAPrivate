@@ -530,6 +530,323 @@ typedef struct _TCPIP_CONN_DUMP {
     TCPIP_CONN_ENTRY entries[MAX_TCPIP_CONNECTIONS];
 } tcpip_conn_dump, *p_tcpip_conn_dump;
 
+// =====================================================================
+// MITM / Deep Packet Inspection / Interception structs
+// =====================================================================
+
+// --- Packet injection ---
+#define INJECT_MAX_PAYLOAD 1500
+
+typedef struct _PACKET_INJECT_REQUEST {
+    UINT32 direction;           // 0=inbound, 1=outbound
+    UINT32 protocol;            // 6=TCP, 17=UDP
+    UINT32 address_family;      // 2=AF_INET, 23=AF_INET6
+    UINT32 src_port;
+    UINT32 dst_port;
+    UINT32 payload_size;
+    UINT8  src_addr[16];
+    UINT8  dst_addr[16];
+    UINT32 tcp_flags;           // SYN=0x02, ACK=0x10, RST=0x04, FIN=0x01, PSH=0x08
+    UINT32 tcp_seq;
+    UINT32 tcp_ack;
+    UINT32 status;              // output: 0=success
+    UINT8  payload[INJECT_MAX_PAYLOAD];
+} PACKET_INJECT_REQUEST, *P_PACKET_INJECT_REQUEST,
+  packet_inject_request, *p_packet_inject_request;
+
+// --- Packet modification rules ---
+#define MOD_MAX_PATTERN 256
+#define MOD_MAX_REPLACE 256
+#define MOD_MAX_RULES   32
+
+typedef struct _PACKET_MOD_RULE {
+    UINT32 rule_id;             // output/input depending on op
+    UINT32 operation;           // 0=add, 1=remove, 2=list, 3=clear
+    UINT32 direction;           // 0=in, 1=out, 2=both
+    UINT32 protocol;            // 0=any, 6=TCP, 17=UDP
+    UINT32 port;                // 0=any
+    UINT32 pid;                 // 0=any
+    UINT32 pattern_size;
+    UINT32 replace_size;
+    UINT8  pattern[MOD_MAX_PATTERN];    // find this byte sequence
+    UINT8  replacement[MOD_MAX_REPLACE]; // replace with this
+    UINT32 match_count;         // output: how many times this rule matched
+    UINT32 active;              // output: 1=active
+} PACKET_MOD_RULE, *P_PACKET_MOD_RULE,
+  packet_mod_rule, *p_packet_mod_rule;
+
+typedef struct _PACKET_MOD_RULE_LIST {
+    UINT32 operation;           // 2=list
+    UINT32 rule_count;          // output
+    PACKET_MOD_RULE rules[MOD_MAX_RULES];
+} PACKET_MOD_RULE_LIST, *P_PACKET_MOD_RULE_LIST,
+  packet_mod_rule_list, *p_packet_mod_rule_list;
+
+// --- Traffic redirect rules ---
+#define REDIR_MAX_RULES 16
+
+typedef struct _TRAFFIC_REDIRECT_RULE {
+    UINT32 rule_id;             // output for add, input for remove
+    UINT32 operation;           // 0=add, 1=remove, 2=list, 3=clear
+    UINT32 protocol;            // 0=any, 6=TCP, 17=UDP
+    UINT32 match_port;          // original port (0=any)
+    UINT8  match_addr[16];      // original dest (0=any)
+    UINT32 redirect_port;       // new destination port
+    UINT8  redirect_addr[16];   // new destination address
+    UINT32 address_family;
+    UINT32 match_count;         // output: redirections performed
+    UINT32 active;
+} TRAFFIC_REDIRECT_RULE, *P_TRAFFIC_REDIRECT_RULE,
+  traffic_redirect_rule, *p_traffic_redirect_rule;
+
+typedef struct _TRAFFIC_REDIRECT_LIST {
+    UINT32 operation;
+    UINT32 rule_count;
+    TRAFFIC_REDIRECT_RULE rules[REDIR_MAX_RULES];
+} TRAFFIC_REDIRECT_LIST, *P_TRAFFIC_REDIRECT_LIST,
+  traffic_redirect_list, *p_traffic_redirect_list;
+
+// --- TCP stream reassembly ---
+#define STREAM_MAX_SIZE (64 * 1024)     // 64KB max reassembled stream
+
+typedef struct _STREAM_REASSEMBLE_REQUEST {
+    UINT32 operation;           // 0=start_tracking, 1=stop, 2=get_data, 3=list_streams
+    UINT32 src_port;            // connection identifier
+    UINT32 dst_port;
+    UINT32 pid;
+    UINT8  src_addr[16];
+    UINT8  dst_addr[16];
+    UINT32 stream_size;         // output: bytes reassembled
+    UINT32 total_packets;       // output: packets in stream
+    UINT32 stream_count;        // output: for list op
+    UINT32 truncated;           // output: 1 if exceeded max
+    UINT8  stream_data[STREAM_MAX_SIZE];
+} stream_reassemble_request, *p_stream_reassemble_request;
+
+// --- Deep packet inspection ---
+#define DPI_MAX_RESULTS 64
+
+typedef struct _DPI_HEADER_INFO {
+    UINT64 timestamp;
+    UINT32 direction;
+    UINT32 protocol;
+    UINT32 src_port;
+    UINT32 dst_port;
+    UINT8  src_addr[16];
+    UINT8  dst_addr[16];
+    UINT32 address_family;
+    UINT32 pid;
+    // TCP-specific
+    UINT32 tcp_flags;
+    UINT32 tcp_seq;
+    UINT32 tcp_ack;
+    UINT32 tcp_window;
+    // Payload analysis
+    UINT32 payload_size;
+    UINT32 is_http;             // 1=detected HTTP
+    UINT32 is_tls;              // 1=detected TLS
+    UINT32 is_dns;              // 1=detected DNS
+    UINT32 http_method;         // 0=none, 1=GET, 2=POST, 3=PUT, 4=DELETE, 5=HEAD, 6=other
+    UINT32 tls_version;         // 0x0301=TLS1.0, 0x0303=TLS1.2, 0x0304=TLS1.3
+    UINT32 tls_content_type;    // 20=change_cipher, 21=alert, 22=handshake, 23=app_data
+    char   http_host[128];      // Host header value
+    char   http_path[256];      // Request URI
+    char   tls_sni[128];        // TLS SNI (Server Name Indication)
+} DPI_HEADER_INFO, *PDPI_HEADER_INFO;
+static_assert(sizeof(DPI_HEADER_INFO) == 624, "DPI_HEADER_INFO size check");
+
+typedef struct _DPI_REQUEST {
+    UINT32 filter_pid;          // 0=all
+    UINT32 filter_protocol;     // 0=all
+    UINT32 filter_port;         // 0=all
+    UINT32 flags;               // bit0=http_only, bit1=tls_only, bit2=dns_only
+    UINT32 result_count;        // output
+    UINT32 padding;
+    DPI_HEADER_INFO results[DPI_MAX_RESULTS];
+} dpi_request, *p_dpi_request;
+
+// --- Intercept-and-hold (Burp Suite proxy mode) ---
+#define INTERCEPT_MAX_HELD    32
+#define INTERCEPT_MAX_PAYLOAD 1500
+
+typedef struct _HELD_PACKET {
+    UINT64 hold_id;             // unique ID for this held packet
+    UINT64 timestamp;
+    UINT32 direction;
+    UINT32 protocol;
+    UINT32 src_port;
+    UINT32 dst_port;
+    UINT8  src_addr[16];
+    UINT8  dst_addr[16];
+    UINT32 pid;
+    UINT32 payload_size;
+    UINT8  payload[INTERCEPT_MAX_PAYLOAD];
+    UINT32 address_family;
+    UINT32 padding;
+} HELD_PACKET, *PHELD_PACKET;
+
+typedef struct _INTERCEPT_REQUEST {
+    UINT32 operation;           // 0=enable, 1=disable, 2=get_held, 3=release, 4=drop, 5=modify_release
+    UINT32 filter_pid;          // for enable: PID filter
+    UINT32 filter_port;         // for enable: port filter
+    UINT32 filter_protocol;     // for enable: protocol filter
+    UINT64 hold_id;             // for release/drop/modify: which packet
+    UINT32 held_count;          // output: packets currently held
+    UINT32 intercepting;        // output: 1=active
+    UINT32 modify_payload_size; // for modify_release: new payload size
+    UINT32 padding;
+    UINT8  modify_payload[INTERCEPT_MAX_PAYLOAD]; // for modify_release: new payload
+    UINT32 padding2;
+    HELD_PACKET held_packets[INTERCEPT_MAX_HELD]; // output for get_held
+} intercept_request, *p_intercept_request;
+
+// --- Connection kill (RST injection) ---
+typedef struct _CONN_KILL_REQUEST {
+    UINT32 protocol;            // 6=TCP
+    UINT32 address_family;      // 2=AF_INET
+    UINT32 src_port;
+    UINT32 dst_port;
+    UINT8  src_addr[16];
+    UINT8  dst_addr[16];
+    UINT32 pid;                 // optional: filter by PID
+    UINT32 status;              // output: 0=success
+} conn_kill_request, *p_conn_kill_request;
+
+// --- DNS spoofing ---
+#define DNS_SPOOF_MAX_RULES 32
+#define DNS_SPOOF_MAX_DOMAIN 128
+
+typedef struct _DNS_SPOOF_RULE {
+    UINT32 rule_id;
+    UINT32 operation;           // 0=add, 1=remove, 2=list, 3=clear
+    char   domain[DNS_SPOOF_MAX_DOMAIN];    // domain to match (wildcard: *.example.com)
+    UINT8  spoof_addr[16];      // fake IP to return
+    UINT32 address_family;      // 2=IPv4, 23=IPv6
+    UINT32 match_count;         // output: how many queries spoofed
+    UINT32 active;
+    UINT32 ttl;                 // TTL for spoofed response (default 300)
+} DNS_SPOOF_RULE, *P_DNS_SPOOF_RULE,
+  dns_spoof_rule, *p_dns_spoof_rule;
+
+typedef struct _DNS_SPOOF_LIST {
+    UINT32 operation;
+    UINT32 rule_count;
+    DNS_SPOOF_RULE rules[DNS_SPOOF_MAX_RULES];
+} DNS_SPOOF_LIST, *P_DNS_SPOOF_LIST,
+  dns_spoof_list, *p_dns_spoof_list;
+
+// --- Bandwidth monitoring ---
+#define BW_MAX_PROCESSES 128
+
+typedef struct _BW_PROCESS_ENTRY {
+    UINT32 pid;
+    UINT32 padding;
+    UINT64 bytes_sent;
+    UINT64 bytes_recv;
+    UINT64 packets_sent;
+    UINT64 packets_recv;
+    UINT64 last_activity_time;
+} BW_PROCESS_ENTRY, *PBW_PROCESS_ENTRY;
+static_assert(sizeof(BW_PROCESS_ENTRY) == 48, "BW_PROCESS_ENTRY size check");
+
+typedef struct _BW_MONITOR_REQUEST {
+    UINT32 operation;           // 0=start, 1=stop, 2=get_stats, 3=reset, 4=get_per_process
+    UINT32 filter_pid;          // 0=all
+    UINT64 total_bytes_sent;    // output
+    UINT64 total_bytes_recv;
+    UINT64 total_packets_sent;
+    UINT64 total_packets_recv;
+    UINT64 bytes_per_second_in; // output: recent rate
+    UINT64 bytes_per_second_out;
+    UINT32 monitoring_active;   // output
+    UINT32 process_count;       // output for per-process
+    BW_PROCESS_ENTRY processes[BW_MAX_PROCESSES];
+} bw_monitor_request, *p_bw_monitor_request;
+
+// --- Network interface enumeration ---
+#define NET_IF_MAX 32
+#define NET_IF_NAME_LEN 64
+
+typedef struct _NET_INTERFACE_ENTRY {
+    UINT32 if_index;
+    UINT32 if_type;             // 6=ethernet, 71=wifi, 24=loopback
+    UINT32 mtu;
+    UINT32 oper_status;         // 1=up, 2=down
+    UINT64 speed;               // bits per second
+    UINT8  mac_addr[6];
+    UINT8  pad[2];
+    UINT8  ipv4_addr[4];
+    UINT8  ipv4_mask[4];
+    UINT8  ipv6_addr[16];
+    char   name[NET_IF_NAME_LEN];
+    char   description[NET_IF_NAME_LEN];
+    UINT64 in_octets;
+    UINT64 out_octets;
+} NET_INTERFACE_ENTRY, *PNET_INTERFACE_ENTRY;
+
+typedef struct _NET_INTERFACE_ENUM {
+    UINT32 interface_count;     // output
+    UINT32 padding;
+    NET_INTERFACE_ENTRY interfaces[NET_IF_MAX];
+} net_interface_enum, *p_net_interface_enum;
+
+// --- PCAP export ---
+// PCAP global header (24 bytes)
+typedef struct _PCAP_GLOBAL_HEADER {
+    UINT32 magic_number;        // 0xa1b2c3d4
+    UINT16 version_major;       // 2
+    UINT16 version_minor;       // 4
+    INT32  thiszone;            // GMT offset
+    UINT32 sigfigs;             // timestamp accuracy
+    UINT32 snaplen;             // max captured length
+    UINT32 network;             // data link type (1=ethernet, 101=raw IP)
+} PCAP_GLOBAL_HEADER;
+
+#define PCAP_MAX_EXPORT_PACKETS 256
+#define PCAP_RECORD_MAX_SIZE    1548  // 14 ethernet + 1500 payload + padding
+
+typedef struct _PCAP_RECORD {
+    UINT32 ts_sec;
+    UINT32 ts_usec;
+    UINT32 incl_len;
+    UINT32 orig_len;
+    UINT8  data[PCAP_RECORD_MAX_SIZE];
+} PCAP_RECORD;
+
+typedef struct _PCAP_EXPORT_REQUEST {
+    UINT32 operation;           // 0=start_export, 1=get_data
+    UINT32 filter_pid;
+    UINT32 filter_protocol;
+    UINT32 max_packets;         // input: how many to export (max PCAP_MAX_EXPORT_PACKETS)
+    UINT32 packet_count;        // output: packets exported
+    UINT32 data_size;           // output: total bytes
+    PCAP_GLOBAL_HEADER header;  // output: PCAP file header
+    PCAP_RECORD records[PCAP_MAX_EXPORT_PACKETS];
+} pcap_export_request, *p_pcap_export_request;
+
+// --- Network fingerprinting ---
+typedef struct _NET_FINGERPRINT_ENTRY {
+    UINT8  remote_addr[16];
+    UINT32 address_family;
+    UINT32 ttl;
+    UINT32 window_size;
+    UINT32 mss;
+    UINT32 window_scale;
+    UINT32 df_flag;             // Don't Fragment
+    UINT32 sack_permitted;
+    UINT32 nop_count;
+    UINT32 tcp_options_order;   // encoded option ordering
+    char   os_guess[64];        // best-effort OS fingerprint
+} NET_FINGERPRINT_ENTRY, *PNET_FINGERPRINT_ENTRY;
+
+#define FINGERPRINT_MAX 64
+
+typedef struct _NET_FINGERPRINT_REQUEST {
+    UINT32 operation;           // 0=enable, 1=disable, 2=get_results
+    UINT32 result_count;
+    NET_FINGERPRINT_ENTRY entries[FINGERPRINT_MAX];
+} net_fingerprint_request, *p_net_fingerprint_request;
+
 #pragma pack(pop)
 
 #define DTB_CACHE_SIZE 32

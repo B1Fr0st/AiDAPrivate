@@ -66,8 +66,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     ClearFlag(deviceObject->Flags, DO_DEVICE_INITIALIZING);
 
-    // Initialize network capture subsystem (non-fatal if WFP unavailable)
-    net_capture::initialize(deviceObject);
+    // Initialize network subsystem and fail fast if callout registration is broken.
+    status = net_capture::initialize(deviceObject);
+    if (!NT_SUCCESS(status)) {
+        _IoDeleteSymbolicLink(&symLink);
+        _IoDeleteDevice(deviceObject);
+        return status;
+    }
 
     stealth::ScheduleDelayedHide(DriverObject);
 

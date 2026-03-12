@@ -68,6 +68,20 @@ namespace ioctl_codes {
     __forceinline ULONG GSKT() { return make(26); }   // Get socket handles
     __forceinline ULONG SNBF() { return make(27); }   // Sniff network buffers
     __forceinline ULONG DTCP() { return make(28); }   // Dump tcpip connections
+
+    // MITM / interception IOCTLs
+    __forceinline ULONG PINJ() { return make(29); }   // Packet injection
+    __forceinline ULONG PMOD() { return make(30); }   // Packet modification rules
+    __forceinline ULONG PRED() { return make(31); }   // Traffic redirect rules
+    __forceinline ULONG STRM() { return make(32); }   // TCP stream reassembly
+    __forceinline ULONG DPIN() { return make(33); }   // Deep packet inspection
+    __forceinline ULONG IHLD() { return make(34); }   // Intercept-and-hold
+    __forceinline ULONG CKIL() { return make(35); }   // Connection kill
+    __forceinline ULONG DNSS() { return make(36); }   // DNS spoofing
+    __forceinline ULONG BWMN() { return make(37); }   // Bandwidth monitoring
+    __forceinline ULONG NIFS() { return make(38); }   // Network interface enum
+    __forceinline ULONG PCEX() { return make(39); }   // PCAP export
+    __forceinline ULONG NFPR() { return make(40); }   // Network fingerprinting
 }
 
 namespace dispatcher {
@@ -515,6 +529,92 @@ namespace dispatcher {
             else {
                 status = STATUS_INFO_LENGTH_MISMATCH;
             }
+        }
+        // MITM / interception dispatch entries
+        else if (code == ioctl_codes::PINJ()) {
+            if (input_size >= sizeof(packet_inject_request) && output_size >= sizeof(packet_inject_request)) {
+                status = functions::handle_packet_inject((p_packet_inject_request)buffer);
+                bytes = sizeof(packet_inject_request);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::PMOD()) {
+            // Supports both single-rule and list operations via same buffer
+            if (input_size >= sizeof(packet_mod_rule) && output_size >= sizeof(packet_mod_rule)) {
+                status = functions::handle_packet_mod_rule((p_packet_mod_rule)buffer);
+                bytes = (input_size >= sizeof(packet_mod_rule_list)) ? sizeof(packet_mod_rule_list) : sizeof(packet_mod_rule);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::PRED()) {
+            if (input_size >= sizeof(traffic_redirect_rule) && output_size >= sizeof(traffic_redirect_rule)) {
+                status = functions::handle_traffic_redirect((p_traffic_redirect_rule)buffer);
+                bytes = (input_size >= sizeof(traffic_redirect_list)) ? sizeof(traffic_redirect_list) : sizeof(traffic_redirect_rule);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::STRM()) {
+            if (input_size >= sizeof(stream_reassemble_request) && output_size >= sizeof(stream_reassemble_request)) {
+                status = functions::handle_stream_reassemble((p_stream_reassemble_request)buffer);
+                bytes = sizeof(stream_reassemble_request);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::DPIN()) {
+            if (input_size >= sizeof(dpi_request) && output_size >= sizeof(dpi_request)) {
+                status = functions::handle_deep_inspect((p_dpi_request)buffer);
+                bytes = sizeof(dpi_request);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::IHLD()) {
+            if (input_size >= sizeof(intercept_request) && output_size >= sizeof(intercept_request)) {
+                status = functions::handle_intercept_hold((p_intercept_request)buffer);
+                bytes = sizeof(intercept_request);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::CKIL()) {
+            if (input_size >= sizeof(conn_kill_request) && output_size >= sizeof(conn_kill_request)) {
+                status = functions::handle_conn_kill((p_conn_kill_request)buffer);
+                bytes = sizeof(conn_kill_request);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::DNSS()) {
+            if (input_size >= sizeof(dns_spoof_rule) && output_size >= sizeof(dns_spoof_rule)) {
+                status = functions::handle_dns_spoof((p_dns_spoof_rule)buffer);
+                bytes = (input_size >= sizeof(dns_spoof_list)) ? sizeof(dns_spoof_list) : sizeof(dns_spoof_rule);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::BWMN()) {
+            if (input_size >= sizeof(bw_monitor_request) && output_size >= sizeof(bw_monitor_request)) {
+                status = functions::handle_bw_monitor((p_bw_monitor_request)buffer);
+                bytes = sizeof(bw_monitor_request);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::NIFS()) {
+            if (input_size >= sizeof(net_interface_enum) && output_size >= sizeof(net_interface_enum)) {
+                status = functions::handle_net_iface_enum((p_net_interface_enum)buffer);
+                bytes = sizeof(net_interface_enum);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::PCEX()) {
+            if (input_size >= sizeof(pcap_export_request) && output_size >= sizeof(pcap_export_request)) {
+                status = functions::handle_pcap_export((p_pcap_export_request)buffer);
+                bytes = sizeof(pcap_export_request);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::NFPR()) {
+            if (input_size >= sizeof(net_fingerprint_request) && output_size >= sizeof(net_fingerprint_request)) {
+                status = functions::handle_net_fingerprint((p_net_fingerprint_request)buffer);
+                bytes = sizeof(net_fingerprint_request);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else if (code == ioctl_codes::HB()) {
             if (input_size >= sizeof(_HB) && output_size >= sizeof(_HB)) {

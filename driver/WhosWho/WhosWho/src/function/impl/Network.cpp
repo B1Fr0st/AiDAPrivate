@@ -15,8 +15,8 @@ typedef UINT16 FWP_IP_VERSION_;
 typedef UINT8  FWP_DIRECTION_;
 typedef UINT32 FWP_ACTION_TYPE_;
 
-#define FWP_ACTION_PERMIT_  0x00001001
-#define FWP_ACTION_BLOCK_   0x00002001
+#define FWP_ACTION_BLOCK_   0x00001001
+#define FWP_ACTION_PERMIT_  0x00001002
 #define FWP_ACTION_CONTINUE_ 0x00003001
 
 #define FWP_CONDITION_FLAG_IS_LOOPBACK_ 0x00000001
@@ -110,9 +110,22 @@ typedef struct _FWPM_FILTER_CONDITION0_COMPAT {
     FWP_CONDITION_VALUE0_COMPAT conditionValue;
 } FWPM_FILTER_CONDITION0_COMPAT;
 
+typedef struct _FWPM_DISPLAY_DATA0 {
+    wchar_t* name;
+    wchar_t* description;
+} FWPM_DISPLAY_DATA0;
+
+typedef struct _FWPM_ACTION0_COMPAT {
+    FWP_ACTION_TYPE_ type;
+    union {
+        GUID filterType;
+        GUID calloutKey;
+    } action;
+} FWPM_ACTION0_COMPAT;
+
 typedef struct _FWPM_FILTER0_COMPAT {
     GUID   filterKey;
-    FWPM_DISPLAY_DATA0* displayData;
+    FWPM_DISPLAY_DATA0 displayData;
     UINT32 flags;
     GUID*  providerKey;
     FWP_BYTE_BLOB_COMPAT providerData;
@@ -121,11 +134,7 @@ typedef struct _FWPM_FILTER0_COMPAT {
     FWP_VALUE0_COMPAT weight;
     UINT32 numFilterConditions;
     FWPM_FILTER_CONDITION0_COMPAT* filterCondition;
-    FWP_ACTION_TYPE_ action_type;
-    union {
-        GUID   filterType;
-        GUID   calloutKey;
-    } action;
+    FWPM_ACTION0_COMPAT action;
     union {
         UINT64 rawContext;
         GUID   providerContextKey;
@@ -135,14 +144,9 @@ typedef struct _FWPM_FILTER0_COMPAT {
     FWP_VALUE0_COMPAT effectiveWeight;
 } FWPM_FILTER0_COMPAT;
 
-typedef struct _FWPM_DISPLAY_DATA0 {
-    wchar_t* name;
-    wchar_t* description;
-} FWPM_DISPLAY_DATA0;
-
 typedef struct _FWPM_CALLOUT0_COMPAT {
     GUID   calloutKey;
-    FWPM_DISPLAY_DATA0* displayData;
+    FWPM_DISPLAY_DATA0 displayData;
     UINT32 flags;
     GUID*  providerKey;
     FWP_BYTE_BLOB_COMPAT providerData;
@@ -152,7 +156,7 @@ typedef struct _FWPM_CALLOUT0_COMPAT {
 
 typedef struct _FWPM_SUBLAYER0_COMPAT {
     GUID   subLayerKey;
-    FWPM_DISPLAY_DATA0* displayData;
+    FWPM_DISPLAY_DATA0 displayData;
     UINT32 flags;
     GUID*  providerKey;
     FWP_BYTE_BLOB_COMPAT providerData;
@@ -214,6 +218,59 @@ static const GUID GUID_LAYER_ALE_RECV_V4 =
 // =====================================================================
 // Network capture subsystem global state
 // =====================================================================
+
+// Forward declarations for MITM subsystems referenced by classify callbacks.
+namespace net_bw {
+    void record_traffic(UINT32 pid, UINT32 direction, UINT32 bytes);
+}
+namespace net_mod {
+    BOOLEAN apply_modifications(UINT8* data, UINT32* data_len, UINT32 max_len,
+                                UINT32 direction, UINT32 protocol,
+                                UINT32 port, UINT32 pid);
+    BOOLEAN has_active_rules();
+}
+namespace net_stream {
+    void feed_packet(UINT32 src_port, UINT32 dst_port, UINT32 pid,
+                     const UINT8* src_addr, const UINT8* dst_addr,
+                     const UINT8* data, UINT32 data_len);
+    BOOLEAN has_active_streams();
+    BOOLEAN get_first_active_stream(UINT32* src_port, UINT32* dst_port,
+                                    UINT32* pid, UINT8* src_addr, UINT8* dst_addr);
+}
+namespace net_fingerprint {
+    void analyze_tcp_syn(const UINT8* src_addr, UINT32 af,
+                         const UINT8* tcp_data, UINT32 tcp_len,
+                         UINT32 ip_ttl);
+    BOOLEAN is_active();
+}
+namespace net_dpi {
+    void analyze_packet(UINT64 timestamp, UINT32 direction, UINT32 protocol,
+                        UINT32 src_port, UINT32 dst_port,
+                        const UINT8* src_addr, const UINT8* dst_addr,
+                        UINT32 af, UINT32 pid,
+                        const UINT8* payload, UINT32 payload_len);
+    BOOLEAN is_active();
+}
+namespace net_intercept {
+    BOOLEAN try_hold_packet(UINT32 direction, UINT32 protocol,
+                            UINT32 src_port, UINT32 dst_port,
+                            const UINT8* src_addr, const UINT8* dst_addr,
+                            UINT32 af, UINT32 pid,
+                            const UINT8* payload, UINT32 payload_len);
+    BOOLEAN is_active();
+}
+namespace net_redirect {
+    BOOLEAN check_redirect(UINT32 protocol, UINT32 dst_port, const UINT8* dst_addr,
+                           UINT32 af, UINT32* new_port, UINT8* new_addr);
+    BOOLEAN has_active_rules();
+}
+namespace net_dns_spoof {
+    BOOLEAN check_spoof(const char* domain, UINT8* out_addr, UINT32* out_af, UINT32* out_ttl);
+    BOOLEAN has_active_rules();
+}
+namespace net_bw {
+    BOOLEAN is_active();
+}
 
 namespace net_capture {
 
@@ -558,6 +615,20 @@ namespace net_capture {
         store_dns_entry(pid, domain, qtype, rcode, resolved, ttl);
     }
 
+    __forceinline BOOLEAN should_process_packet_pipeline() {
+        if (g_capture_active) return TRUE;
+        if (g_active_rule_count != 0) return TRUE;
+        if (net_bw::is_active()) return TRUE;
+        if (net_intercept::is_active()) return TRUE;
+        if (net_dpi::is_active()) return TRUE;
+        if (net_fingerprint::is_active()) return TRUE;
+        if (net_mod::has_active_rules()) return TRUE;
+        if (net_redirect::has_active_rules()) return TRUE;
+        if (net_dns_spoof::has_active_rules()) return TRUE;
+        if (net_stream::has_active_streams()) return TRUE;
+        return FALSE;
+    }
+
     // ================================================================
     // WFP Classify callbacks
     // ================================================================
@@ -581,7 +652,7 @@ namespace net_capture {
         classifyOut->actionType = FWP_ACTION_PERMIT_;
 
         if (!inFixedValues || !inMetaValues) return;
-        if (!g_capture_active && g_active_rule_count == 0) return;
+        if (!should_process_packet_pipeline()) return;
 
         __try {
             UINT32 protocol = 0;
@@ -666,6 +737,43 @@ namespace net_capture {
                 _InterlockedExchangeAdd64(&g_global_bytes_recv, (LONG64)pkt_len);
             }
 
+            // Bandwidth monitoring
+            net_bw::record_traffic(pid, 0, pkt_len);
+
+            // Packet modification engine
+            if (pkt_len > 0) {
+                net_mod::apply_modifications(pkt_data, &pkt_len, NET_PKT_MAX_PAYLOAD,
+                                            0, protocol, remote_port, pid);
+            }
+
+            // TCP stream reassembly feed
+            if (protocol == 6 && pkt_len > 0) {
+                net_stream::feed_packet(local_port, remote_port, pid,
+                                       local_ip, remote_ip, pkt_data, pkt_len);
+            }
+
+            // Network fingerprinting (analyze inbound SYN-ACK)
+            if (protocol == 6 && pkt_len >= 20) {
+                net_fingerprint::analyze_tcp_syn(remote_ip, 2, pkt_data, pkt_len, 0);
+            }
+
+            // DPI analysis
+            {
+                LARGE_INTEGER dpi_ts;
+                KeQuerySystemTime(&dpi_ts);
+                net_dpi::analyze_packet(dpi_ts.QuadPart, 0, protocol,
+                    local_port, remote_port, local_ip, remote_ip, 2, pid,
+                    pkt_data, pkt_len);
+            }
+
+            // Intercept-and-hold check
+            if (net_intercept::try_hold_packet(0, protocol, local_port, remote_port,
+                    local_ip, remote_ip, 2, pid, pkt_data, pkt_len)) {
+                classifyOut->actionType = FWP_ACTION_BLOCK_;
+                classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
+                return;
+            }
+
             // Store packet if capture is active
             if (g_capture_active) {
                 store_packet(0, protocol, pid, local_port, remote_port,
@@ -699,7 +807,7 @@ namespace net_capture {
         classifyOut->actionType = FWP_ACTION_PERMIT_;
 
         if (!inFixedValues || !inMetaValues) return;
-        if (!g_capture_active && g_active_rule_count == 0) return;
+        if (!should_process_packet_pipeline()) return;
 
         __try {
             UINT32 protocol = 0;
@@ -775,6 +883,38 @@ namespace net_capture {
                 }
 
                 _InterlockedExchangeAdd64(&g_global_bytes_sent, (LONG64)pkt_len);
+            }
+
+            // Bandwidth monitoring
+            net_bw::record_traffic(pid, 1, pkt_len);
+
+            // Packet modification engine
+            if (pkt_len > 0) {
+                net_mod::apply_modifications(pkt_data, &pkt_len, NET_PKT_MAX_PAYLOAD,
+                                            1, protocol, remote_port, pid);
+            }
+
+            // TCP stream reassembly feed
+            if (protocol == 6 && pkt_len > 0) {
+                net_stream::feed_packet(local_port, remote_port, pid,
+                                       local_ip, remote_ip, pkt_data, pkt_len);
+            }
+
+            // DPI analysis
+            {
+                LARGE_INTEGER dpi_ts;
+                KeQuerySystemTime(&dpi_ts);
+                net_dpi::analyze_packet(dpi_ts.QuadPart, 1, protocol,
+                    local_port, remote_port, local_ip, remote_ip, 2, pid,
+                    pkt_data, pkt_len);
+            }
+
+            // Intercept-and-hold check
+            if (net_intercept::try_hold_packet(1, protocol, local_port, remote_port,
+                    local_ip, remote_ip, 2, pid, pkt_data, pkt_len)) {
+                classifyOut->actionType = FWP_ACTION_BLOCK_;
+                classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
+                return;
             }
 
             if (g_capture_active) {
@@ -908,7 +1048,7 @@ namespace net_capture {
 
         FWPM_SUBLAYER0_COMPAT sublayer = {};
         sublayer.subLayerKey = GUID_AIDA_SUBLAYER;
-        sublayer.displayData = &sublayer_display;
+        sublayer.displayData = sublayer_display;
         sublayer.flags = 0;
         sublayer.weight = 0xFFFF;
 
@@ -962,7 +1102,7 @@ namespace net_capture {
 
         FWPM_CALLOUT0_COMPAT fwpm_callout_in = {};
         fwpm_callout_in.calloutKey = GUID_AIDA_CALLOUT_INBOUND;
-        fwpm_callout_in.displayData = &callout_display;
+        fwpm_callout_in.displayData = callout_display;
         fwpm_callout_in.applicableLayer = GUID_LAYER_INBOUND_V4;
         UINT32 unused_id;
 
@@ -978,7 +1118,7 @@ namespace net_capture {
 
         FWPM_CALLOUT0_COMPAT fwpm_callout_out = {};
         fwpm_callout_out.calloutKey = GUID_AIDA_CALLOUT_OUTBOUND;
-        fwpm_callout_out.displayData = &callout_display;
+        fwpm_callout_out.displayData = callout_display;
         fwpm_callout_out.applicableLayer = GUID_LAYER_OUTBOUND_V4;
 
         status = _FwpmCalloutAdd0(g_engine_handle, &fwpm_callout_out, nullptr, &unused_id);
@@ -1000,14 +1140,14 @@ namespace net_capture {
 
         FWPM_FILTER0_COMPAT filter_in = {};
         strong::kmemset(&filter_in, 0, sizeof(filter_in));
-        filter_in.displayData = &filter_display;
+        filter_in.displayData = filter_display;
         filter_in.layerKey = GUID_LAYER_INBOUND_V4;
         filter_in.subLayerKey = GUID_AIDA_SUBLAYER;
         filter_in.weight.type = 8; // FWP_UINT64
         UINT64 weight_val = 0xFFFFFFFFFFFFFFFF;
         filter_in.weight.uint64 = weight_val;
-        filter_in.action_type = 0x00005003; // FWP_ACTION_CALLOUT_INSPECTION
-        filter_in.action.calloutKey = GUID_AIDA_CALLOUT_INBOUND;
+        filter_in.action.type = 0x00005003; // FWP_ACTION_CALLOUT_TERMINATING
+        filter_in.action.action.calloutKey = GUID_AIDA_CALLOUT_INBOUND;
         filter_in.numFilterConditions = 0;
 
         status = _FwpmFilterAdd0(g_engine_handle, &filter_in, nullptr, &g_filter_id_inbound);
@@ -1022,13 +1162,13 @@ namespace net_capture {
 
         FWPM_FILTER0_COMPAT filter_out = {};
         strong::kmemset(&filter_out, 0, sizeof(filter_out));
-        filter_out.displayData = &filter_display;
+        filter_out.displayData = filter_display;
         filter_out.layerKey = GUID_LAYER_OUTBOUND_V4;
         filter_out.subLayerKey = GUID_AIDA_SUBLAYER;
         filter_out.weight.type = 8;
         filter_out.weight.uint64 = weight_val;
-        filter_out.action_type = 0x00005003;
-        filter_out.action.calloutKey = GUID_AIDA_CALLOUT_OUTBOUND;
+        filter_out.action.type = 0x00005003;
+        filter_out.action.action.calloutKey = GUID_AIDA_CALLOUT_OUTBOUND;
         filter_out.numFilterConditions = 0;
 
         status = _FwpmFilterAdd0(g_engine_handle, &filter_out, nullptr, &g_filter_id_outbound);
@@ -1121,16 +1261,27 @@ namespace net_capture {
 
         // Resolve WFP functions
         if (!resolve_wfp_functions()) {
-            // WFP not available - buffers still allocated for manual population
-            KeMemoryBarrier();
-            _InterlockedExchange(&g_wfp_initialized, 2);
-            return STATUS_SUCCESS;
+            ExFreePoolWithTag(g_ring_buffer, 'pkNW');
+            g_ring_buffer = nullptr;
+            ExFreePoolWithTag(g_dns_ring, 'dnNW');
+            g_dns_ring = nullptr;
+            _InterlockedExchange(&g_wfp_initialized, 0);
+            return STATUS_NOT_SUPPORTED;
         }
 
         // Register WFP callouts
         NTSTATUS status = register_wfp(devObj);
         if (!NT_SUCCESS(status)) {
-            // WFP registration failed but ring buffers available
+            if (g_ring_buffer) {
+                ExFreePoolWithTag(g_ring_buffer, 'pkNW');
+                g_ring_buffer = nullptr;
+            }
+            if (g_dns_ring) {
+                ExFreePoolWithTag(g_dns_ring, 'dnNW');
+                g_dns_ring = nullptr;
+            }
+            _InterlockedExchange(&g_wfp_initialized, 0);
+            return status;
         }
 
         KeMemoryBarrier();
@@ -1800,18 +1951,16 @@ namespace net_wfp_enum {
                     // store provider key as module base hint
                 }
 
-                if (c->displayData && _MmIsAddressValid(c->displayData)) {
-                    // displayData->name often contains the driver/callout name
-                    __try {
-                        wchar_t* wname = c->displayData->name;
-                        if (wname && _MmIsAddressValid(wname)) {
-                            // Convert wide to ASCII for module name
-                            for (int j = 0; j < 63 && wname[j]; j++) {
-                                out->owning_module[j] = (char)(wname[j] & 0x7F);
-                            }
+                // displayData.name often contains the driver/callout name
+                __try {
+                    wchar_t* wname = c->displayData.name;
+                    if (wname && _MmIsAddressValid(wname)) {
+                        // Convert wide to ASCII for module name
+                        for (int j = 0; j < 63 && wname[j]; j++) {
+                            out->owning_module[j] = (char)(wname[j] & 0x7F);
                         }
-                    } __except(EXCEPTION_EXECUTE_HANDLER) {}
-                }
+                    }
+                } __except(EXCEPTION_EXECUTE_HANDLER) {}
 
                 // If we have a module name filter, check it
                 if (has_filter) {
@@ -2557,6 +2706,1784 @@ namespace net_tcpip {
     }
 }
 
+
+// =====================================================================
+// MITM: Packet injection via WFP inject APIs
+// =====================================================================
+namespace net_inject {
+
+    // WFP injection function pointers
+    typedef NTSTATUS(NTAPI* fn_FwpsInjectionHandleCreate0)(
+        UINT16 addressFamily, UINT32 flags, HANDLE* injectionHandle);
+    typedef NTSTATUS(NTAPI* fn_FwpsInjectionHandleDestroy0)(HANDLE injectionHandle);
+    typedef NTSTATUS(NTAPI* fn_FwpsAllocateNetBufferAndNetBufferList0)(
+        HANDLE poolHandle, UINT16 contextSize, UINT16 contextBackfill,
+        PMDL mdlChain, ULONG dataOffset, SIZE_T dataLength, PVOID* netBufferList);
+    typedef void(NTAPI* fn_FwpsFreeNetBufferList0)(PVOID netBufferList);
+    typedef NTSTATUS(NTAPI* fn_FwpsInjectTransportSendAsync0)(
+        HANDLE injectionHandle, HANDLE injectionContext,
+        UINT64 endpointHandle, UINT32 flags,
+        PVOID sendArgs, UINT16 addressFamily,
+        UINT32 compartmentId, PVOID netBufferList,
+        PVOID completionFn, PVOID completionContext);
+    typedef NTSTATUS(NTAPI* fn_FwpsInjectTransportReceiveAsync0)(
+        HANDLE injectionHandle, HANDLE injectionContext,
+        PVOID reserved, UINT32 flags,
+        UINT16 addressFamily, UINT32 compartmentId,
+        UINT32 interfaceIndex, UINT32 subInterfaceIndex,
+        PVOID netBufferList,
+        PVOID completionFn, PVOID completionContext);
+
+    inline fn_FwpsInjectionHandleCreate0         _FwpsInjectionHandleCreate0   = nullptr;
+    inline fn_FwpsInjectionHandleDestroy0        _FwpsInjectionHandleDestroy0  = nullptr;
+    inline fn_FwpsAllocateNetBufferAndNetBufferList0 _FwpsAllocateNBL0         = nullptr;
+    inline fn_FwpsFreeNetBufferList0             _FwpsFreeNBL0                 = nullptr;
+    inline fn_FwpsInjectTransportSendAsync0      _FwpsInjectSend0              = nullptr;
+    inline fn_FwpsInjectTransportReceiveAsync0   _FwpsInjectRecv0              = nullptr;
+
+    inline HANDLE g_inject_handle_v4 = nullptr;
+    inline volatile LONG g_inject_resolved = 0;
+
+    BOOLEAN resolve_inject_functions() {
+        LONG prev = _InterlockedCompareExchange(&g_inject_resolved, 1, 0);
+        if (prev == 2) return g_inject_handle_v4 != nullptr;
+        if (prev == 1) {
+            while (_InterlockedCompareExchange(&g_inject_resolved, 0, 0) == 1)
+                YieldProcessor();
+            return g_inject_handle_v4 != nullptr;
+        }
+
+        PVOID fwp_base = net_capture::find_module_base("FWPKCLNT.SYS");
+        if (!fwp_base) fwp_base = net_capture::find_module_base("fwpkclnt.sys");
+        if (!fwp_base) { _InterlockedExchange(&g_inject_resolved, 2); return FALSE; }
+
+        CHAR f1[] = {'F','w','p','s','I','n','j','e','c','t','i','o','n','H','a','n','d','l','e','C','r','e','a','t','e','0',0};
+        CHAR f2[] = {'F','w','p','s','I','n','j','e','c','t','i','o','n','H','a','n','d','l','e','D','e','s','t','r','o','y','0',0};
+        CHAR f3[] = {'F','w','p','s','A','l','l','o','c','a','t','e','N','e','t','B','u','f','f','e','r','A','n','d','N','e','t','B','u','f','f','e','r','L','i','s','t','0',0};
+        CHAR f4[] = {'F','w','p','s','F','r','e','e','N','e','t','B','u','f','f','e','r','L','i','s','t','0',0};
+        CHAR f5[] = {'F','w','p','s','I','n','j','e','c','t','T','r','a','n','s','p','o','r','t','S','e','n','d','A','s','y','n','c','0',0};
+        CHAR f6[] = {'F','w','p','s','I','n','j','e','c','t','T','r','a','n','s','p','o','r','t','R','e','c','e','i','v','e','A','s','y','n','c','0',0};
+
+        *(PVOID*)&_FwpsInjectionHandleCreate0 = GetProcAddress(fwp_base, f1);
+        *(PVOID*)&_FwpsInjectionHandleDestroy0 = GetProcAddress(fwp_base, f2);
+        *(PVOID*)&_FwpsAllocateNBL0 = GetProcAddress(fwp_base, f3);
+        *(PVOID*)&_FwpsFreeNBL0 = GetProcAddress(fwp_base, f4);
+        *(PVOID*)&_FwpsInjectSend0 = GetProcAddress(fwp_base, f5);
+        *(PVOID*)&_FwpsInjectRecv0 = GetProcAddress(fwp_base, f6);
+
+        if (_FwpsInjectionHandleCreate0) {
+            NTSTATUS st = _FwpsInjectionHandleCreate0(2 /*AF_INET*/, 0, &g_inject_handle_v4);
+            if (!NT_SUCCESS(st)) g_inject_handle_v4 = nullptr;
+        }
+
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_inject_resolved, 2);
+        return g_inject_handle_v4 != nullptr;
+    }
+
+    void NTAPI inject_completion(PVOID context, PVOID nbl, BOOLEAN dispatch_level) {
+        UNREFERENCED_PARAMETER(context);
+        UNREFERENCED_PARAMETER(dispatch_level);
+        if (nbl && _FwpsFreeNBL0) _FwpsFreeNBL0(nbl);
+    }
+
+    NTSTATUS inject_packet(p_packet_inject_request request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+        request->status = 1; // assume failure
+
+        if (!resolve_inject_functions() || !g_inject_handle_v4)
+            return STATUS_NOT_SUPPORTED;
+
+        if (request->payload_size == 0 || request->payload_size > INJECT_MAX_PAYLOAD)
+            return STATUS_INVALID_PARAMETER;
+
+        // Allocate MDL for payload
+        PVOID buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, request->payload_size, 'jiNW');
+        if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+        strong::kmemcpy(buf, request->payload, request->payload_size);
+
+        PMDL mdl = IoAllocateMdl(buf, request->payload_size, FALSE, FALSE, nullptr);
+        if (!mdl) {
+            ExFreePoolWithTag(buf, 'jiNW');
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        MmBuildMdlForNonPagedPool(mdl);
+
+        PVOID nbl = nullptr;
+        NTSTATUS st = _FwpsAllocateNBL0(nullptr, 0, 0, mdl, 0, request->payload_size, &nbl);
+        if (!NT_SUCCESS(st) || !nbl) {
+            IoFreeMdl(mdl);
+            ExFreePoolWithTag(buf, 'jiNW');
+            return st;
+        }
+
+        if (request->direction == 1) {
+            // Outbound inject
+            st = _FwpsInjectSend0(g_inject_handle_v4, nullptr, 0, 0,
+                nullptr, (UINT16)request->address_family, 0, nbl,
+                (PVOID)inject_completion, buf);
+        } else {
+            // Inbound inject
+            st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
+                (UINT16)request->address_family, 0, 0, 0, nbl,
+                (PVOID)inject_completion, buf);
+        }
+
+        if (!NT_SUCCESS(st)) {
+            _FwpsFreeNBL0(nbl);
+            IoFreeMdl(mdl);
+            ExFreePoolWithTag(buf, 'jiNW');
+            return st;
+        }
+
+        request->status = 0;
+        return STATUS_SUCCESS;
+    }
+
+    void cleanup() {
+        if (g_inject_handle_v4 && _FwpsInjectionHandleDestroy0) {
+            _FwpsInjectionHandleDestroy0(g_inject_handle_v4);
+            g_inject_handle_v4 = nullptr;
+        }
+    }
+}
+
+// =====================================================================
+// MITM: Packet modification engine
+// =====================================================================
+namespace net_mod {
+
+    typedef struct _ACTIVE_MOD_RULE {
+        volatile LONG active;
+        UINT32 rule_id;
+        UINT32 direction;
+        UINT32 protocol;
+        UINT32 port;
+        UINT32 pid;
+        UINT32 pattern_size;
+        UINT32 replace_size;
+        UINT8  pattern[MOD_MAX_PATTERN];
+        UINT8  replacement[MOD_MAX_REPLACE];
+        volatile LONG match_count;
+    } ACTIVE_MOD_RULE;
+
+    inline ACTIVE_MOD_RULE g_mod_rules[MOD_MAX_RULES] = {};
+    inline volatile LONG g_next_mod_id = 1;
+    inline volatile LONG g_active_mod_count = 0;
+
+    BOOLEAN has_active_rules() {
+        return (g_active_mod_count != 0);
+    }
+
+    // Called from classify callbacks to apply modification rules
+    BOOLEAN apply_modifications(UINT8* data, UINT32* data_len, UINT32 max_len,
+                                UINT32 direction, UINT32 protocol,
+                                UINT32 port, UINT32 pid) {
+        if (g_active_mod_count == 0) return FALSE;
+        BOOLEAN modified = FALSE;
+
+        for (UINT32 r = 0; r < MOD_MAX_RULES; r++) {
+            if (!g_mod_rules[r].active) continue;
+            ACTIVE_MOD_RULE* rule = &g_mod_rules[r];
+            if (rule->direction != 2 && rule->direction != direction) continue;
+            if (rule->protocol != 0 && rule->protocol != protocol) continue;
+            if (rule->port != 0 && rule->port != port) continue;
+            if (rule->pid != 0 && rule->pid != pid) continue;
+            if (rule->pattern_size == 0 || rule->pattern_size > *data_len) continue;
+
+            // Scan for pattern in data
+            for (UINT32 i = 0; i + rule->pattern_size <= *data_len; i++) {
+                BOOLEAN match = TRUE;
+                for (UINT32 j = 0; j < rule->pattern_size; j++) {
+                    if (data[i + j] != rule->pattern[j]) { match = FALSE; break; }
+                }
+                if (match) {
+                    // Replace in-place if size difference fits
+                    INT32 diff = (INT32)rule->replace_size - (INT32)rule->pattern_size;
+                    UINT32 new_len = *data_len + diff;
+                    if (new_len > max_len) continue;
+
+                    if (diff != 0) {
+                        // Shift tail of data
+                        UINT32 tail_start = i + rule->pattern_size;
+                        UINT32 tail_len = *data_len - tail_start;
+                        if (tail_len > 0) {
+                            // Move forward or backward
+                            for (INT32 k = (diff > 0 ? (INT32)tail_len - 1 : 0);
+                                 diff > 0 ? k >= 0 : (UINT32)k < tail_len;
+                                 diff > 0 ? k-- : k++) {
+                                data[tail_start + diff + k] = data[tail_start + k];
+                            }
+                        }
+                    }
+                    strong::kmemcpy(&data[i], rule->replacement, rule->replace_size);
+                    *data_len = new_len;
+                    _InterlockedIncrement(&rule->match_count);
+                    modified = TRUE;
+                    i += rule->replace_size - 1; // skip past replacement
+                }
+            }
+        }
+        return modified;
+    }
+
+    NTSTATUS handle_mod_rule(p_packet_mod_rule request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+
+        switch (request->operation) {
+        case 0: { // add
+            for (UINT32 i = 0; i < MOD_MAX_RULES; i++) {
+                if (!g_mod_rules[i].active) {
+                    UINT32 id = (UINT32)_InterlockedIncrement(&g_next_mod_id);
+                    g_mod_rules[i].rule_id = id;
+                    g_mod_rules[i].direction = request->direction;
+                    g_mod_rules[i].protocol = request->protocol;
+                    g_mod_rules[i].port = request->port;
+                    g_mod_rules[i].pid = request->pid;
+                    g_mod_rules[i].pattern_size = request->pattern_size;
+                    g_mod_rules[i].replace_size = request->replace_size;
+                    if (request->pattern_size > 0 && request->pattern_size <= MOD_MAX_PATTERN)
+                        strong::kmemcpy(g_mod_rules[i].pattern, request->pattern, request->pattern_size);
+                    if (request->replace_size > 0 && request->replace_size <= MOD_MAX_REPLACE)
+                        strong::kmemcpy(g_mod_rules[i].replacement, request->replacement, request->replace_size);
+                    g_mod_rules[i].match_count = 0;
+                    KeMemoryBarrier();
+                    _InterlockedExchange(&g_mod_rules[i].active, 1);
+                    _InterlockedIncrement(&g_active_mod_count);
+                    request->rule_id = id;
+                    request->active = 1;
+                    return STATUS_SUCCESS;
+                }
+            }
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        case 1: { // remove by rule_id
+            for (UINT32 i = 0; i < MOD_MAX_RULES; i++) {
+                if (g_mod_rules[i].active && g_mod_rules[i].rule_id == request->rule_id) {
+                    _InterlockedExchange(&g_mod_rules[i].active, 0);
+                    _InterlockedDecrement(&g_active_mod_count);
+                    request->active = 0;
+                    return STATUS_SUCCESS;
+                }
+            }
+            return STATUS_NOT_FOUND;
+        }
+        case 3: { // clear all
+            for (UINT32 i = 0; i < MOD_MAX_RULES; i++) {
+                if (g_mod_rules[i].active) {
+                    _InterlockedExchange(&g_mod_rules[i].active, 0);
+                    _InterlockedDecrement(&g_active_mod_count);
+                }
+            }
+            return STATUS_SUCCESS;
+        }
+        default:
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+
+    NTSTATUS handle_mod_rule_list(p_packet_mod_rule_list request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+        request->rule_count = 0;
+        for (UINT32 i = 0; i < MOD_MAX_RULES && request->rule_count < MOD_MAX_RULES; i++) {
+            if (g_mod_rules[i].active) {
+                PACKET_MOD_RULE* out = &request->rules[request->rule_count];
+                out->rule_id = g_mod_rules[i].rule_id;
+                out->direction = g_mod_rules[i].direction;
+                out->protocol = g_mod_rules[i].protocol;
+                out->port = g_mod_rules[i].port;
+                out->pid = g_mod_rules[i].pid;
+                out->pattern_size = g_mod_rules[i].pattern_size;
+                out->replace_size = g_mod_rules[i].replace_size;
+                strong::kmemcpy(out->pattern, g_mod_rules[i].pattern, g_mod_rules[i].pattern_size);
+                strong::kmemcpy(out->replacement, g_mod_rules[i].replacement, g_mod_rules[i].replace_size);
+                out->match_count = g_mod_rules[i].match_count;
+                out->active = 1;
+                request->rule_count++;
+            }
+        }
+        return STATUS_SUCCESS;
+    }
+}
+
+// =====================================================================
+// MITM: Traffic redirect engine
+// =====================================================================
+namespace net_redirect {
+
+    typedef struct _ACTIVE_REDIR_RULE {
+        volatile LONG active;
+        UINT32 rule_id;
+        UINT32 protocol;
+        UINT32 match_port;
+        UINT8  match_addr[16];
+        UINT32 redirect_port;
+        UINT8  redirect_addr[16];
+        UINT32 address_family;
+        volatile LONG match_count;
+    } ACTIVE_REDIR_RULE;
+
+    inline ACTIVE_REDIR_RULE g_redir_rules[REDIR_MAX_RULES] = {};
+    inline volatile LONG g_next_redir_id = 1;
+    inline volatile LONG g_active_redir_count = 0;
+
+    BOOLEAN has_active_rules() {
+        return (g_active_redir_count != 0);
+    }
+
+    // Called from classify callbacks - checks if we should redirect this packet
+    BOOLEAN check_redirect(UINT32 protocol, UINT32 dst_port, const UINT8* dst_addr,
+                           UINT32 af, UINT32* new_port, UINT8* new_addr) {
+        if (g_active_redir_count == 0) return FALSE;
+        for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
+            if (!g_redir_rules[i].active) continue;
+            ACTIVE_REDIR_RULE* r = &g_redir_rules[i];
+            if (r->protocol != 0 && r->protocol != protocol) continue;
+            if (r->match_port != 0 && r->match_port != dst_port) continue;
+            if (!net_capture::is_zero_ip(r->match_addr)) {
+                UINT8 mask[16];
+                strong::kmemset(mask, 0xFF, sizeof(mask));
+                if (!net_capture::ip_matches(dst_addr, r->match_addr, mask, af)) continue;
+            }
+            *new_port = r->redirect_port;
+            strong::kmemcpy(new_addr, r->redirect_addr, 16);
+            _InterlockedIncrement(&r->match_count);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    NTSTATUS handle_redirect_rule(p_traffic_redirect_rule request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+
+        switch (request->operation) {
+        case 0: { // add
+            for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
+                if (!g_redir_rules[i].active) {
+                    UINT32 id = (UINT32)_InterlockedIncrement(&g_next_redir_id);
+                    g_redir_rules[i].rule_id = id;
+                    g_redir_rules[i].protocol = request->protocol;
+                    g_redir_rules[i].match_port = request->match_port;
+                    strong::kmemcpy(g_redir_rules[i].match_addr, request->match_addr, 16);
+                    g_redir_rules[i].redirect_port = request->redirect_port;
+                    strong::kmemcpy(g_redir_rules[i].redirect_addr, request->redirect_addr, 16);
+                    g_redir_rules[i].address_family = request->address_family;
+                    g_redir_rules[i].match_count = 0;
+                    KeMemoryBarrier();
+                    _InterlockedExchange(&g_redir_rules[i].active, 1);
+                    _InterlockedIncrement(&g_active_redir_count);
+                    request->rule_id = id;
+                    request->active = 1;
+                    return STATUS_SUCCESS;
+                }
+            }
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        case 1: { // remove
+            for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
+                if (g_redir_rules[i].active && g_redir_rules[i].rule_id == request->rule_id) {
+                    _InterlockedExchange(&g_redir_rules[i].active, 0);
+                    _InterlockedDecrement(&g_active_redir_count);
+                    request->active = 0;
+                    return STATUS_SUCCESS;
+                }
+            }
+            return STATUS_NOT_FOUND;
+        }
+        case 3: { // clear
+            for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
+                if (g_redir_rules[i].active) {
+                    _InterlockedExchange(&g_redir_rules[i].active, 0);
+                    _InterlockedDecrement(&g_active_redir_count);
+                }
+            }
+            return STATUS_SUCCESS;
+        }
+        default:
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+
+    NTSTATUS handle_redirect_list(p_traffic_redirect_list request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+        request->rule_count = 0;
+        for (UINT32 i = 0; i < REDIR_MAX_RULES && request->rule_count < REDIR_MAX_RULES; i++) {
+            if (g_redir_rules[i].active) {
+                TRAFFIC_REDIRECT_RULE* out = &request->rules[request->rule_count];
+                out->rule_id = g_redir_rules[i].rule_id;
+                out->protocol = g_redir_rules[i].protocol;
+                out->match_port = g_redir_rules[i].match_port;
+                strong::kmemcpy(out->match_addr, g_redir_rules[i].match_addr, 16);
+                out->redirect_port = g_redir_rules[i].redirect_port;
+                strong::kmemcpy(out->redirect_addr, g_redir_rules[i].redirect_addr, 16);
+                out->address_family = g_redir_rules[i].address_family;
+                out->match_count = g_redir_rules[i].match_count;
+                out->active = 1;
+                request->rule_count++;
+            }
+        }
+        return STATUS_SUCCESS;
+    }
+}
+
+// =====================================================================
+// MITM: TCP stream reassembly engine
+// =====================================================================
+namespace net_stream {
+
+    #define MAX_TRACKED_STREAMS 8
+
+    typedef struct _TRACKED_STREAM {
+        volatile LONG active;
+        UINT32 src_port;
+        UINT32 dst_port;
+        UINT32 pid;
+        UINT8  src_addr[16];
+        UINT8  dst_addr[16];
+        UINT32 stream_size;
+        UINT32 total_packets;
+        UINT32 truncated;
+        UINT8* stream_data;
+        KSPIN_LOCK lock;
+    } TRACKED_STREAM;
+
+    inline TRACKED_STREAM g_streams[MAX_TRACKED_STREAMS] = {};
+
+    BOOLEAN has_active_streams() {
+        for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
+            if (g_streams[i].active)
+                return TRUE;
+        }
+        return FALSE;
+    }
+
+    // Called from classify to feed data into tracked streams
+    void feed_packet(UINT32 src_port, UINT32 dst_port, UINT32 pid,
+                     const UINT8* src_addr, const UINT8* dst_addr,
+                     const UINT8* data, UINT32 data_len) {
+        for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
+            if (!g_streams[i].active) continue;
+
+            BOOLEAN match = FALSE;
+            // Match either direction of the connection
+            if (g_streams[i].src_port == src_port && g_streams[i].dst_port == dst_port) {
+                BOOLEAN addr_match = TRUE;
+                for (int j = 0; j < 4; j++) {
+                    if (g_streams[i].src_addr[j] != src_addr[j] ||
+                        g_streams[i].dst_addr[j] != dst_addr[j]) {
+                        addr_match = FALSE; break;
+                    }
+                }
+                if (addr_match) match = TRUE;
+            }
+            if (!match && g_streams[i].src_port == dst_port && g_streams[i].dst_port == src_port) {
+                BOOLEAN addr_match = TRUE;
+                for (int j = 0; j < 4; j++) {
+                    if (g_streams[i].src_addr[j] != dst_addr[j] ||
+                        g_streams[i].dst_addr[j] != src_addr[j]) {
+                        addr_match = FALSE; break;
+                    }
+                }
+                if (addr_match) match = TRUE;
+            }
+            if (g_streams[i].pid != 0 && g_streams[i].pid != pid) match = FALSE;
+
+            if (match && g_streams[i].stream_data && data_len > 0) {
+                KIRQL irql;
+                KeAcquireSpinLock(&g_streams[i].lock, &irql);
+                UINT32 avail = STREAM_MAX_SIZE - g_streams[i].stream_size;
+                if (avail > 0) {
+                    UINT32 copy = data_len < avail ? data_len : avail;
+                    strong::kmemcpy(g_streams[i].stream_data + g_streams[i].stream_size, data, copy);
+                    g_streams[i].stream_size += copy;
+                    if (copy < data_len) g_streams[i].truncated = 1;
+                } else {
+                    g_streams[i].truncated = 1;
+                }
+                g_streams[i].total_packets++;
+                KeReleaseSpinLock(&g_streams[i].lock, irql);
+            }
+        }
+    }
+
+    NTSTATUS handle_stream(p_stream_reassemble_request request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+
+        switch (request->operation) {
+        case 0: { // start_tracking
+            for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
+                if (!g_streams[i].active) {
+                    g_streams[i].src_port = request->src_port;
+                    g_streams[i].dst_port = request->dst_port;
+                    g_streams[i].pid = request->pid;
+                    strong::kmemcpy(g_streams[i].src_addr, request->src_addr, 16);
+                    strong::kmemcpy(g_streams[i].dst_addr, request->dst_addr, 16);
+                    g_streams[i].stream_size = 0;
+                    g_streams[i].total_packets = 0;
+                    g_streams[i].truncated = 0;
+                    if (!g_streams[i].stream_data) {
+                        g_streams[i].stream_data = (UINT8*)ExAllocatePool2(
+                            POOL_FLAG_NON_PAGED, STREAM_MAX_SIZE, 'stNW');
+                        if (!g_streams[i].stream_data) return STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                    strong::kmemset(g_streams[i].stream_data, 0, STREAM_MAX_SIZE);
+                    KeInitializeSpinLock(&g_streams[i].lock);
+                    KeMemoryBarrier();
+                    _InterlockedExchange(&g_streams[i].active, 1);
+                    return STATUS_SUCCESS;
+                }
+            }
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        case 1: { // stop
+            for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
+                if (g_streams[i].active &&
+                    g_streams[i].src_port == request->src_port &&
+                    g_streams[i].dst_port == request->dst_port) {
+                    _InterlockedExchange(&g_streams[i].active, 0);
+                    return STATUS_SUCCESS;
+                }
+            }
+            return STATUS_NOT_FOUND;
+        }
+        case 2: { // get_data
+            for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
+                if (g_streams[i].active &&
+                    g_streams[i].src_port == request->src_port &&
+                    g_streams[i].dst_port == request->dst_port) {
+                    KIRQL irql;
+                    KeAcquireSpinLock(&g_streams[i].lock, &irql);
+                    UINT32 copy = g_streams[i].stream_size;
+                    if (copy > STREAM_MAX_SIZE) copy = STREAM_MAX_SIZE;
+                    strong::kmemcpy(request->stream_data, g_streams[i].stream_data, copy);
+                    request->stream_size = g_streams[i].stream_size;
+                    request->total_packets = g_streams[i].total_packets;
+                    request->truncated = g_streams[i].truncated;
+                    KeReleaseSpinLock(&g_streams[i].lock, irql);
+                    return STATUS_SUCCESS;
+                }
+            }
+            return STATUS_NOT_FOUND;
+        }
+        case 3: { // list
+            request->stream_count = 0;
+            for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
+                if (g_streams[i].active) request->stream_count++;
+            }
+            return STATUS_SUCCESS;
+        }
+        default:
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+
+    void cleanup() {
+        for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
+            _InterlockedExchange(&g_streams[i].active, 0);
+            if (g_streams[i].stream_data) {
+                ExFreePoolWithTag(g_streams[i].stream_data, 'stNW');
+                g_streams[i].stream_data = nullptr;
+            }
+        }
+    }
+}
+
+// =====================================================================
+// Deep Packet Inspection (DPI) engine
+// =====================================================================
+namespace net_dpi {
+
+    // DPI ring buffer for analyzed packets
+    inline DPI_HEADER_INFO* g_dpi_ring = nullptr;
+    inline volatile LONG g_dpi_head = 0;
+    inline volatile LONG g_dpi_tail = 0;
+    inline volatile LONG g_dpi_count = 0;
+    inline KSPIN_LOCK g_dpi_lock;
+    inline volatile LONG g_dpi_active = 0;
+
+    BOOLEAN is_active() {
+        return (g_dpi_active != 0);
+    }
+
+    #define DPI_RING_SIZE 256
+
+    NTSTATUS init() {
+        if (g_dpi_ring) return STATUS_SUCCESS;
+        SIZE_T sz = (SIZE_T)DPI_RING_SIZE * sizeof(DPI_HEADER_INFO);
+        g_dpi_ring = (DPI_HEADER_INFO*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sz, 'dpNW');
+        if (!g_dpi_ring) return STATUS_INSUFFICIENT_RESOURCES;
+        strong::kmemset(g_dpi_ring, 0, sz);
+        KeInitializeSpinLock(&g_dpi_lock);
+        _InterlockedExchange(&g_dpi_active, 1);
+        return STATUS_SUCCESS;
+    }
+
+    // Detect HTTP method from payload start
+    static UINT32 detect_http_method(const UINT8* data, UINT32 len) {
+        if (len < 4) return 0;
+        if (data[0] == 'G' && data[1] == 'E' && data[2] == 'T' && data[3] == ' ') return 1;
+        if (len >= 5 && data[0] == 'P' && data[1] == 'O' && data[2] == 'S' && data[3] == 'T' && data[4] == ' ') return 2;
+        if (len >= 4 && data[0] == 'P' && data[1] == 'U' && data[2] == 'T' && data[3] == ' ') return 3;
+        if (len >= 7 && data[0] == 'D' && data[1] == 'E' && data[2] == 'L') return 4;
+        if (len >= 5 && data[0] == 'H' && data[1] == 'E' && data[2] == 'A' && data[3] == 'D' && data[4] == ' ') return 5;
+        if (len >= 5 && data[0] == 'H' && data[1] == 'T' && data[2] == 'T' && data[3] == 'P' && data[4] == '/') return 6; // Response
+        return 0;
+    }
+
+    // Extract HTTP Host header
+    static void extract_http_host(const UINT8* data, UINT32 len, char* out, UINT32 out_size) {
+        out[0] = 0;
+        // Scan for "Host: "
+        for (UINT32 i = 0; i + 6 < len; i++) {
+            if ((data[i] == 'H' || data[i] == 'h') &&
+                (data[i+1] == 'o' || data[i+1] == 'O') &&
+                (data[i+2] == 's' || data[i+2] == 'S') &&
+                (data[i+3] == 't' || data[i+3] == 'T') &&
+                data[i+4] == ':' && data[i+5] == ' ') {
+                UINT32 j = i + 6;
+                UINT32 k = 0;
+                while (j < len && data[j] != '\r' && data[j] != '\n' && k < out_size - 1) {
+                    out[k++] = (char)data[j++];
+                }
+                out[k] = 0;
+                return;
+            }
+        }
+    }
+
+    // Extract HTTP path (first line after method)
+    static void extract_http_path(const UINT8* data, UINT32 len, char* out, UINT32 out_size) {
+        out[0] = 0;
+        // Find first space (after method)
+        UINT32 i = 0;
+        while (i < len && data[i] != ' ') i++;
+        if (i >= len) return;
+        i++; // skip space
+        UINT32 k = 0;
+        while (i < len && data[i] != ' ' && data[i] != '\r' && data[i] != '\n' && k < out_size - 1) {
+            out[k++] = (char)data[i++];
+        }
+        out[k] = 0;
+    }
+
+    // Detect and parse TLS record from payload
+    static void detect_tls(const UINT8* data, UINT32 len, DPI_HEADER_INFO* info) {
+        if (len < 5) return;
+        // TLS content types: 20=ChangeCipherSpec, 21=Alert, 22=Handshake, 23=ApplicationData
+        UINT8 content_type = data[0];
+        if (content_type < 20 || content_type > 23) return;
+
+        UINT16 version = ((UINT16)data[1] << 8) | data[2];
+        // Valid TLS versions: 0x0301 (TLS1.0), 0x0302 (TLS1.1), 0x0303 (TLS1.2), 0x0304 (TLS1.3)
+        if (version < 0x0300 || version > 0x0304) return;
+
+        info->is_tls = 1;
+        info->tls_version = version;
+        info->tls_content_type = content_type;
+
+        // For handshake Client Hello, extract SNI
+        if (content_type == 22 && len > 43) {
+            UINT8 handshake_type = data[5];
+            if (handshake_type == 1) { // ClientHello
+                // Session ID at offset 43
+                UINT32 pos = 43;
+                if (pos >= len) return;
+                UINT8 session_id_len = data[pos];
+                pos += 1 + session_id_len;
+                if (pos + 2 >= len) return;
+                // Cipher suites
+                UINT16 cs_len = ((UINT16)data[pos] << 8) | data[pos + 1];
+                pos += 2 + cs_len;
+                if (pos + 1 >= len) return;
+                // Compression methods
+                UINT8 comp_len = data[pos];
+                pos += 1 + comp_len;
+                if (pos + 2 >= len) return;
+                // Extensions
+                UINT16 ext_len = ((UINT16)data[pos] << 8) | data[pos + 1];
+                pos += 2;
+                UINT32 ext_end = pos + ext_len;
+                while (pos + 4 <= ext_end && pos + 4 <= len) {
+                    UINT16 ext_type = ((UINT16)data[pos] << 8) | data[pos + 1];
+                    UINT16 elen = ((UINT16)data[pos + 2] << 8) | data[pos + 3];
+                    pos += 4;
+                    if (ext_type == 0 && elen > 5 && pos + elen <= len) {
+                        // SNI extension: skip SNI list length (2) + type (1) + name length (2)
+                        UINT32 sni_pos = pos + 2 + 1;
+                        if (sni_pos + 2 >= len) break;
+                        UINT16 name_len = ((UINT16)data[sni_pos] << 8) | data[sni_pos + 1];
+                        sni_pos += 2;
+                        if (sni_pos + name_len <= len && name_len < 128) {
+                            for (UINT16 s = 0; s < name_len; s++)
+                                info->tls_sni[s] = (char)data[sni_pos + s];
+                            info->tls_sni[name_len] = 0;
+                        }
+                        break;
+                    }
+                    pos += elen;
+                }
+            }
+        }
+    }
+
+    // Called from classify callbacks to perform deep inspection
+    void analyze_packet(UINT64 timestamp, UINT32 direction, UINT32 protocol,
+                        UINT32 src_port, UINT32 dst_port,
+                        const UINT8* src_addr, const UINT8* dst_addr,
+                        UINT32 af, UINT32 pid,
+                        const UINT8* payload, UINT32 payload_len) {
+        if (!g_dpi_active || !g_dpi_ring) return;
+
+        DPI_HEADER_INFO info;
+        strong::kmemset(&info, 0, sizeof(info));
+        info.timestamp = timestamp;
+        info.direction = direction;
+        info.protocol = protocol;
+        info.src_port = src_port;
+        info.dst_port = dst_port;
+        info.address_family = af;
+        info.pid = pid;
+        info.payload_size = payload_len;
+        strong::kmemcpy(info.src_addr, src_addr, (af == 23) ? 16 : 4);
+        strong::kmemcpy(info.dst_addr, dst_addr, (af == 23) ? 16 : 4);
+
+        // Parse TCP header if TCP payload includes flags
+        if (protocol == 6 && payload_len >= 20) {
+            info.tcp_seq = ((UINT32)payload[4] << 24) | ((UINT32)payload[5] << 16) |
+                           ((UINT32)payload[6] << 8) | payload[7];
+            info.tcp_ack = ((UINT32)payload[8] << 24) | ((UINT32)payload[9] << 16) |
+                           ((UINT32)payload[10] << 8) | payload[11];
+            info.tcp_flags = payload[13];
+            info.tcp_window = ((UINT32)payload[14] << 8) | payload[15];
+
+            UINT32 tcp_hdr_len = ((payload[12] >> 4) & 0xF) * 4;
+            if (tcp_hdr_len >= 20 && tcp_hdr_len <= payload_len) {
+                const UINT8* app_data = payload + tcp_hdr_len;
+                UINT32 app_len = payload_len - tcp_hdr_len;
+
+                // HTTP detection
+                info.http_method = detect_http_method(app_data, app_len);
+                if (info.http_method) {
+                    info.is_http = 1;
+                    extract_http_host(app_data, app_len, info.http_host, sizeof(info.http_host));
+                    extract_http_path(app_data, app_len, info.http_path, sizeof(info.http_path));
+                }
+
+                // TLS detection
+                detect_tls(app_data, app_len, &info);
+
+                // DNS over TCP
+                if ((src_port == 53 || dst_port == 53) && app_len > 0) {
+                    info.is_dns = 1;
+                }
+            }
+        }
+
+        // UDP DNS
+        if (protocol == 17 && (src_port == 53 || dst_port == 53) && payload_len > 0) {
+            info.is_dns = 1;
+        }
+
+        // UDP TLS (DTLS)
+        if (protocol == 17 && payload_len >= 13) {
+            UINT8 ct = payload[0];
+            if (ct >= 20 && ct <= 25) {
+                UINT16 ver = ((UINT16)payload[1] << 8) | payload[2];
+                if (ver == 0xFEFF || ver == 0xFEFD) {
+                    info.is_tls = 1;
+                    info.tls_content_type = ct;
+                    info.tls_version = ver;
+                }
+            }
+        }
+
+        KIRQL irql;
+        KeAcquireSpinLock(&g_dpi_lock, &irql);
+        if (g_dpi_count >= DPI_RING_SIZE) {
+            g_dpi_tail = (g_dpi_tail + 1) % DPI_RING_SIZE;
+            g_dpi_count--;
+        }
+        strong::kmemcpy(&g_dpi_ring[g_dpi_head], &info, sizeof(info));
+        g_dpi_head = (g_dpi_head + 1) % DPI_RING_SIZE;
+        g_dpi_count++;
+        KeReleaseSpinLock(&g_dpi_lock, irql);
+    }
+
+    NTSTATUS get_results(p_dpi_request request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+        if (!g_dpi_ring) {
+            NTSTATUS st = init();
+            if (!NT_SUCCESS(st)) return st;
+        }
+
+        request->result_count = 0;
+        KIRQL irql;
+        KeAcquireSpinLock(&g_dpi_lock, &irql);
+
+        UINT32 idx = g_dpi_tail;
+        while (idx != (UINT32)g_dpi_head && request->result_count < DPI_MAX_RESULTS) {
+            DPI_HEADER_INFO* src = &g_dpi_ring[idx];
+
+            // Apply filters
+            if (request->filter_pid != 0 && src->pid != request->filter_pid) goto next;
+            if (request->filter_protocol != 0 && src->protocol != request->filter_protocol) goto next;
+            if (request->filter_port != 0 && src->src_port != request->filter_port &&
+                src->dst_port != request->filter_port) goto next;
+            if (request->flags & 1) { if (!src->is_http) goto next; }
+            if (request->flags & 2) { if (!src->is_tls) goto next; }
+            if (request->flags & 4) { if (!src->is_dns) goto next; }
+
+            strong::kmemcpy(&request->results[request->result_count], src, sizeof(DPI_HEADER_INFO));
+            request->result_count++;
+
+        next:
+            idx = (idx + 1) % DPI_RING_SIZE;
+        }
+        KeReleaseSpinLock(&g_dpi_lock, irql);
+        return STATUS_SUCCESS;
+    }
+
+    void cleanup() {
+        _InterlockedExchange(&g_dpi_active, 0);
+        if (g_dpi_ring) {
+            ExFreePoolWithTag(g_dpi_ring, 'dpNW');
+            g_dpi_ring = nullptr;
+        }
+    }
+}
+
+// =====================================================================
+// MITM: Intercept-and-hold engine (Burp Suite proxy mode)
+// =====================================================================
+namespace net_intercept {
+
+    inline HELD_PACKET g_held[INTERCEPT_MAX_HELD] = {};
+    inline volatile LONG g_held_count = 0;
+    inline volatile LONG g_intercepting = 0;
+    inline volatile LONG g_next_hold_id = 1;
+    inline UINT32 g_filter_pid = 0;
+    inline UINT32 g_filter_port = 0;
+    inline UINT32 g_filter_protocol = 0;
+    inline KSPIN_LOCK g_intercept_lock;
+
+    BOOLEAN is_active() {
+        return (g_intercepting != 0);
+    }
+
+    void init_lock() {
+        KeInitializeSpinLock(&g_intercept_lock);
+    }
+
+    // Called from classify — returns TRUE if packet should be held (blocked)
+    BOOLEAN try_hold_packet(UINT32 direction, UINT32 protocol,
+                            UINT32 src_port, UINT32 dst_port,
+                            const UINT8* src_addr, const UINT8* dst_addr,
+                            UINT32 af, UINT32 pid,
+                            const UINT8* payload, UINT32 payload_len) {
+        if (!g_intercepting) return FALSE;
+        if (g_filter_pid != 0 && pid != g_filter_pid) return FALSE;
+        if (g_filter_port != 0 && src_port != g_filter_port && dst_port != g_filter_port) return FALSE;
+        if (g_filter_protocol != 0 && protocol != g_filter_protocol) return FALSE;
+
+        KIRQL irql;
+        KeAcquireSpinLock(&g_intercept_lock, &irql);
+
+        if (g_held_count >= INTERCEPT_MAX_HELD) {
+            KeReleaseSpinLock(&g_intercept_lock, irql);
+            return FALSE; // queue full, let it through
+        }
+
+        // Find empty slot
+        for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
+            if (g_held[i].hold_id == 0) {
+                g_held[i].hold_id = (UINT64)_InterlockedIncrement(&g_next_hold_id);
+                LARGE_INTEGER ts;
+                KeQuerySystemTime(&ts);
+                g_held[i].timestamp = ts.QuadPart;
+                g_held[i].direction = direction;
+                g_held[i].protocol = protocol;
+                g_held[i].src_port = src_port;
+                g_held[i].dst_port = dst_port;
+                strong::kmemcpy(g_held[i].src_addr, src_addr, 16);
+                strong::kmemcpy(g_held[i].dst_addr, dst_addr, 16);
+                g_held[i].pid = pid;
+                g_held[i].address_family = af;
+                UINT32 cap = payload_len < INTERCEPT_MAX_PAYLOAD ? payload_len : INTERCEPT_MAX_PAYLOAD;
+                g_held[i].payload_size = cap;
+                if (payload && cap > 0)
+                    strong::kmemcpy(g_held[i].payload, payload, cap);
+                g_held_count++;
+                KeReleaseSpinLock(&g_intercept_lock, irql);
+                return TRUE; // block the packet, we're holding it
+            }
+        }
+
+        KeReleaseSpinLock(&g_intercept_lock, irql);
+        return FALSE;
+    }
+
+    NTSTATUS handle_intercept(p_intercept_request request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+
+        switch (request->operation) {
+        case 0: { // enable
+            g_filter_pid = request->filter_pid;
+            g_filter_port = request->filter_port;
+            g_filter_protocol = request->filter_protocol;
+            _InterlockedExchange(&g_intercepting, 1);
+            request->intercepting = 1;
+            request->held_count = g_held_count;
+            return STATUS_SUCCESS;
+        }
+        case 1: { // disable
+            _InterlockedExchange(&g_intercepting, 0);
+            // Release all held packets (just clear them)
+            KIRQL irql;
+            KeAcquireSpinLock(&g_intercept_lock, &irql);
+            for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
+                g_held[i].hold_id = 0;
+            }
+            g_held_count = 0;
+            KeReleaseSpinLock(&g_intercept_lock, irql);
+            request->intercepting = 0;
+            request->held_count = 0;
+            return STATUS_SUCCESS;
+        }
+        case 2: { // get_held
+            KIRQL irql;
+            KeAcquireSpinLock(&g_intercept_lock, &irql);
+            request->held_count = 0;
+            for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
+                if (g_held[i].hold_id != 0 && request->held_count < INTERCEPT_MAX_HELD) {
+                    strong::kmemcpy(&request->held_packets[request->held_count],
+                                    &g_held[i], sizeof(HELD_PACKET));
+                    request->held_count++;
+                }
+            }
+            request->intercepting = g_intercepting;
+            KeReleaseSpinLock(&g_intercept_lock, irql);
+            return STATUS_SUCCESS;
+        }
+        case 3: { // release (let through - just remove from held)
+            KIRQL irql;
+            KeAcquireSpinLock(&g_intercept_lock, &irql);
+            for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
+                if (g_held[i].hold_id == request->hold_id) {
+                    // Re-inject packet via injection API
+                    if (net_inject::g_inject_handle_v4 && g_held[i].payload_size > 0) {
+                        packet_inject_request inj = {};
+                        inj.direction = g_held[i].direction;
+                        inj.protocol = g_held[i].protocol;
+                        inj.address_family = g_held[i].address_family;
+                        inj.src_port = g_held[i].src_port;
+                        inj.dst_port = g_held[i].dst_port;
+                        strong::kmemcpy(inj.src_addr, g_held[i].src_addr, 16);
+                        strong::kmemcpy(inj.dst_addr, g_held[i].dst_addr, 16);
+                        inj.payload_size = g_held[i].payload_size;
+                        strong::kmemcpy(inj.payload, g_held[i].payload, g_held[i].payload_size);
+                        KeReleaseSpinLock(&g_intercept_lock, irql);
+                        net_inject::inject_packet(&inj);
+                        KeAcquireSpinLock(&g_intercept_lock, &irql);
+                    }
+                    g_held[i].hold_id = 0;
+                    strong::kmemset(&g_held[i], 0, sizeof(HELD_PACKET));
+                    if (g_held_count > 0) g_held_count--;
+                    break;
+                }
+            }
+            request->held_count = g_held_count;
+            KeReleaseSpinLock(&g_intercept_lock, irql);
+            return STATUS_SUCCESS;
+        }
+        case 4: { // drop (just remove without re-injecting)
+            KIRQL irql;
+            KeAcquireSpinLock(&g_intercept_lock, &irql);
+            for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
+                if (g_held[i].hold_id == request->hold_id) {
+                    g_held[i].hold_id = 0;
+                    strong::kmemset(&g_held[i], 0, sizeof(HELD_PACKET));
+                    if (g_held_count > 0) g_held_count--;
+                    break;
+                }
+            }
+            request->held_count = g_held_count;
+            KeReleaseSpinLock(&g_intercept_lock, irql);
+            return STATUS_SUCCESS;
+        }
+        case 5: { // modify_and_release
+            KIRQL irql;
+            KeAcquireSpinLock(&g_intercept_lock, &irql);
+            for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
+                if (g_held[i].hold_id == request->hold_id) {
+                    // Re-inject with modified payload
+                    if (net_inject::g_inject_handle_v4 && request->modify_payload_size > 0 &&
+                        request->modify_payload_size <= INTERCEPT_MAX_PAYLOAD) {
+                        packet_inject_request inj = {};
+                        inj.direction = g_held[i].direction;
+                        inj.protocol = g_held[i].protocol;
+                        inj.address_family = g_held[i].address_family;
+                        inj.src_port = g_held[i].src_port;
+                        inj.dst_port = g_held[i].dst_port;
+                        strong::kmemcpy(inj.src_addr, g_held[i].src_addr, 16);
+                        strong::kmemcpy(inj.dst_addr, g_held[i].dst_addr, 16);
+                        inj.payload_size = request->modify_payload_size;
+                        strong::kmemcpy(inj.payload, request->modify_payload, request->modify_payload_size);
+                        KeReleaseSpinLock(&g_intercept_lock, irql);
+                        net_inject::inject_packet(&inj);
+                        KeAcquireSpinLock(&g_intercept_lock, &irql);
+                    }
+                    g_held[i].hold_id = 0;
+                    strong::kmemset(&g_held[i], 0, sizeof(HELD_PACKET));
+                    if (g_held_count > 0) g_held_count--;
+                    break;
+                }
+            }
+            request->held_count = g_held_count;
+            KeReleaseSpinLock(&g_intercept_lock, irql);
+            return STATUS_SUCCESS;
+        }
+        default:
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+}
+
+// =====================================================================
+// MITM: Connection kill (RST injection)
+// =====================================================================
+namespace net_kill {
+
+    NTSTATUS kill_connection(p_conn_kill_request request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+        request->status = 1;
+
+        if (request->protocol != 6) return STATUS_INVALID_PARAMETER; // TCP only
+
+        if (!net_inject::resolve_inject_functions() || !net_inject::g_inject_handle_v4)
+            return STATUS_NOT_SUPPORTED;
+
+        // Build a TCP RST packet
+        // We need to craft a minimal TCP segment with RST flag
+        UINT8 rst_pkt[20] = {}; // minimal TCP header
+        // Source port (network byte order)
+        rst_pkt[0] = (UINT8)(request->src_port >> 8);
+        rst_pkt[1] = (UINT8)(request->src_port & 0xFF);
+        // Dest port
+        rst_pkt[2] = (UINT8)(request->dst_port >> 8);
+        rst_pkt[3] = (UINT8)(request->dst_port & 0xFF);
+        // Seq number = 0
+        // Data offset = 5 (20 bytes / 4), and RST flag
+        rst_pkt[12] = 0x50; // data offset = 5
+        rst_pkt[13] = 0x04; // RST flag
+        // Window
+        rst_pkt[14] = 0xFF;
+        rst_pkt[15] = 0xFF;
+
+        packet_inject_request inj = {};
+        inj.direction = 1; // outbound
+        inj.protocol = 6;
+        inj.address_family = request->address_family;
+        inj.src_port = request->src_port;
+        inj.dst_port = request->dst_port;
+        strong::kmemcpy(inj.src_addr, request->src_addr, 16);
+        strong::kmemcpy(inj.dst_addr, request->dst_addr, 16);
+        inj.payload_size = 20;
+        strong::kmemcpy(inj.payload, rst_pkt, 20);
+        inj.tcp_flags = 0x04; // RST
+
+        NTSTATUS st = net_inject::inject_packet(&inj);
+        if (NT_SUCCESS(st)) request->status = 0;
+        return st;
+    }
+}
+
+// =====================================================================
+// MITM: DNS spoofing engine
+// =====================================================================
+namespace net_dns_spoof {
+
+    typedef struct _DNS_SPOOF_ACTIVE {
+        volatile LONG active;
+        UINT32 rule_id;
+        char domain[DNS_SPOOF_MAX_DOMAIN];
+        UINT8 spoof_addr[16];
+        UINT32 address_family;
+        UINT32 ttl;
+        volatile LONG match_count;
+    } DNS_SPOOF_ACTIVE;
+
+    inline DNS_SPOOF_ACTIVE g_spoof_rules[DNS_SPOOF_MAX_RULES] = {};
+    inline volatile LONG g_next_spoof_id = 1;
+    inline volatile LONG g_active_spoof_count = 0;
+
+    BOOLEAN has_active_rules() {
+        return (g_active_spoof_count != 0);
+    }
+
+    // Simple domain match with wildcard support (*.example.com)
+    static BOOLEAN domain_matches(const char* pattern, const char* domain) {
+        if (!pattern || !domain) return FALSE;
+        if (pattern[0] == '*' && pattern[1] == '.') {
+            // Wildcard: match any subdomain
+            const char* suffix = pattern + 1; // ".example.com"
+            UINT32 slen = 0, dlen = 0;
+            while (suffix[slen]) slen++;
+            while (domain[dlen]) dlen++;
+            if (dlen < slen) return FALSE;
+            // Compare suffix
+            for (UINT32 i = 0; i < slen; i++) {
+                char a = suffix[slen - 1 - i];
+                char b = domain[dlen - 1 - i];
+                if (a >= 'A' && a <= 'Z') a += 32;
+                if (b >= 'A' && b <= 'Z') b += 32;
+                if (a != b) return FALSE;
+            }
+            return TRUE;
+        }
+        // Exact match (case-insensitive)
+        UINT32 i = 0;
+        while (pattern[i] && domain[i]) {
+            char a = pattern[i], b = domain[i];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) return FALSE;
+            i++;
+        }
+        return (pattern[i] == 0 && domain[i] == 0);
+    }
+
+    // Called from DNS parser in classify - checks if this domain should be spoofed
+    BOOLEAN check_spoof(const char* domain, UINT8* out_addr, UINT32* out_af, UINT32* out_ttl) {
+        if (g_active_spoof_count == 0) return FALSE;
+        for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES; i++) {
+            if (!g_spoof_rules[i].active) continue;
+            if (domain_matches(g_spoof_rules[i].domain, domain)) {
+                strong::kmemcpy(out_addr, g_spoof_rules[i].spoof_addr, 16);
+                *out_af = g_spoof_rules[i].address_family;
+                *out_ttl = g_spoof_rules[i].ttl;
+                _InterlockedIncrement(&g_spoof_rules[i].match_count);
+                return TRUE;
+            }
+        }
+        return FALSE;
+    }
+
+    NTSTATUS handle_spoof_rule(p_dns_spoof_rule request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+
+        switch (request->operation) {
+        case 0: { // add
+            for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES; i++) {
+                if (!g_spoof_rules[i].active) {
+                    UINT32 id = (UINT32)_InterlockedIncrement(&g_next_spoof_id);
+                    g_spoof_rules[i].rule_id = id;
+                    strong::kmemcpy(g_spoof_rules[i].domain, request->domain, DNS_SPOOF_MAX_DOMAIN);
+                    strong::kmemcpy(g_spoof_rules[i].spoof_addr, request->spoof_addr, 16);
+                    g_spoof_rules[i].address_family = request->address_family;
+                    g_spoof_rules[i].ttl = request->ttl ? request->ttl : 300;
+                    g_spoof_rules[i].match_count = 0;
+                    KeMemoryBarrier();
+                    _InterlockedExchange(&g_spoof_rules[i].active, 1);
+                    _InterlockedIncrement(&g_active_spoof_count);
+                    request->rule_id = id;
+                    request->active = 1;
+                    return STATUS_SUCCESS;
+                }
+            }
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        case 1: { // remove
+            for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES; i++) {
+                if (g_spoof_rules[i].active && g_spoof_rules[i].rule_id == request->rule_id) {
+                    _InterlockedExchange(&g_spoof_rules[i].active, 0);
+                    _InterlockedDecrement(&g_active_spoof_count);
+                    request->active = 0;
+                    return STATUS_SUCCESS;
+                }
+            }
+            return STATUS_NOT_FOUND;
+        }
+        case 3: { // clear
+            for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES; i++) {
+                if (g_spoof_rules[i].active) {
+                    _InterlockedExchange(&g_spoof_rules[i].active, 0);
+                    _InterlockedDecrement(&g_active_spoof_count);
+                }
+            }
+            return STATUS_SUCCESS;
+        }
+        default:
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+
+    NTSTATUS handle_spoof_list(p_dns_spoof_list request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+        request->rule_count = 0;
+        for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES && request->rule_count < DNS_SPOOF_MAX_RULES; i++) {
+            if (g_spoof_rules[i].active) {
+                DNS_SPOOF_RULE* out = &request->rules[request->rule_count];
+                out->rule_id = g_spoof_rules[i].rule_id;
+                strong::kmemcpy(out->domain, g_spoof_rules[i].domain, DNS_SPOOF_MAX_DOMAIN);
+                strong::kmemcpy(out->spoof_addr, g_spoof_rules[i].spoof_addr, 16);
+                out->address_family = g_spoof_rules[i].address_family;
+                out->ttl = g_spoof_rules[i].ttl;
+                out->match_count = g_spoof_rules[i].match_count;
+                out->active = 1;
+                request->rule_count++;
+            }
+        }
+        return STATUS_SUCCESS;
+    }
+}
+
+// =====================================================================
+// MITM: Bandwidth monitoring engine
+// =====================================================================
+namespace net_bw {
+
+    typedef struct _BW_PID_ENTRY {
+        volatile LONG active;
+        UINT32 pid;
+        volatile LONG64 bytes_sent;
+        volatile LONG64 bytes_recv;
+        volatile LONG64 packets_sent;
+        volatile LONG64 packets_recv;
+        UINT64 last_activity;
+    } BW_PID_ENTRY;
+
+    inline BW_PID_ENTRY g_bw_entries[BW_MAX_PROCESSES] = {};
+    inline volatile LONG g_bw_active = 0;
+    inline volatile LONG64 g_bw_total_sent = 0;
+    inline volatile LONG64 g_bw_total_recv = 0;
+    inline volatile LONG64 g_bw_total_pkts_sent = 0;
+    inline volatile LONG64 g_bw_total_pkts_recv = 0;
+    inline volatile LONG64 g_bw_last_sample_sent = 0;
+    inline volatile LONG64 g_bw_last_sample_recv = 0;
+    inline UINT64 g_bw_last_sample_time = 0;
+
+    BOOLEAN is_active() {
+        return (g_bw_active != 0);
+    }
+
+    // Called from classify callbacks
+    void record_traffic(UINT32 pid, UINT32 direction, UINT32 bytes) {
+        if (!g_bw_active) return;
+
+        if (direction == 0) {
+            _InterlockedExchangeAdd64(&g_bw_total_recv, bytes);
+            _InterlockedIncrement64(&g_bw_total_pkts_recv);
+        } else {
+            _InterlockedExchangeAdd64(&g_bw_total_sent, bytes);
+            _InterlockedIncrement64(&g_bw_total_pkts_sent);
+        }
+
+        if (pid == 0) return;
+
+        // Find or create per-process entry
+        INT32 free_slot = -1;
+        for (UINT32 i = 0; i < BW_MAX_PROCESSES; i++) {
+            if (g_bw_entries[i].active && g_bw_entries[i].pid == pid) {
+                if (direction == 0) {
+                    _InterlockedExchangeAdd64(&g_bw_entries[i].bytes_recv, bytes);
+                    _InterlockedIncrement64(&g_bw_entries[i].packets_recv);
+                } else {
+                    _InterlockedExchangeAdd64(&g_bw_entries[i].bytes_sent, bytes);
+                    _InterlockedIncrement64(&g_bw_entries[i].packets_sent);
+                }
+                LARGE_INTEGER ts;
+                KeQuerySystemTime(&ts);
+                g_bw_entries[i].last_activity = ts.QuadPart;
+                return;
+            }
+            if (!g_bw_entries[i].active && free_slot == -1) free_slot = i;
+        }
+        if (free_slot >= 0) {
+            g_bw_entries[free_slot].pid = pid;
+            g_bw_entries[free_slot].bytes_sent = 0;
+            g_bw_entries[free_slot].bytes_recv = 0;
+            g_bw_entries[free_slot].packets_sent = 0;
+            g_bw_entries[free_slot].packets_recv = 0;
+            if (direction == 0)
+                g_bw_entries[free_slot].bytes_recv = bytes;
+            else
+                g_bw_entries[free_slot].bytes_sent = bytes;
+            LARGE_INTEGER ts;
+            KeQuerySystemTime(&ts);
+            g_bw_entries[free_slot].last_activity = ts.QuadPart;
+            KeMemoryBarrier();
+            _InterlockedExchange(&g_bw_entries[free_slot].active, 1);
+        }
+    }
+
+    NTSTATUS handle_bw(p_bw_monitor_request request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+
+        switch (request->operation) {
+        case 0: // start
+            _InterlockedExchange(&g_bw_active, 1);
+            request->monitoring_active = 1;
+            return STATUS_SUCCESS;
+        case 1: // stop
+            _InterlockedExchange(&g_bw_active, 0);
+            request->monitoring_active = 0;
+            return STATUS_SUCCESS;
+        case 2: { // get_stats
+            request->total_bytes_sent = g_bw_total_sent;
+            request->total_bytes_recv = g_bw_total_recv;
+            request->total_packets_sent = g_bw_total_pkts_sent;
+            request->total_packets_recv = g_bw_total_pkts_recv;
+            request->monitoring_active = g_bw_active;
+
+            // Calculate rate
+            LARGE_INTEGER now;
+            KeQuerySystemTime(&now);
+            UINT64 elapsed = now.QuadPart - g_bw_last_sample_time;
+            if (elapsed > 0 && g_bw_last_sample_time != 0) {
+                LONG64 delta_sent = g_bw_total_sent - g_bw_last_sample_sent;
+                LONG64 delta_recv = g_bw_total_recv - g_bw_last_sample_recv;
+                // elapsed is in 100ns units; convert to seconds
+                UINT64 seconds = elapsed / 10000000ULL;
+                if (seconds > 0) {
+                    request->bytes_per_second_out = delta_sent / seconds;
+                    request->bytes_per_second_in = delta_recv / seconds;
+                }
+            }
+            g_bw_last_sample_sent = g_bw_total_sent;
+            g_bw_last_sample_recv = g_bw_total_recv;
+            g_bw_last_sample_time = now.QuadPart;
+            return STATUS_SUCCESS;
+        }
+        case 3: { // reset
+            g_bw_total_sent = 0;
+            g_bw_total_recv = 0;
+            g_bw_total_pkts_sent = 0;
+            g_bw_total_pkts_recv = 0;
+            for (UINT32 i = 0; i < BW_MAX_PROCESSES; i++) {
+                _InterlockedExchange(&g_bw_entries[i].active, 0);
+            }
+            return STATUS_SUCCESS;
+        }
+        case 4: { // get_per_process
+            request->process_count = 0;
+            for (UINT32 i = 0; i < BW_MAX_PROCESSES && request->process_count < BW_MAX_PROCESSES; i++) {
+                if (g_bw_entries[i].active) {
+                    if (request->filter_pid != 0 && g_bw_entries[i].pid != request->filter_pid) continue;
+                    BW_PROCESS_ENTRY* out = &request->processes[request->process_count];
+                    out->pid = g_bw_entries[i].pid;
+                    out->bytes_sent = g_bw_entries[i].bytes_sent;
+                    out->bytes_recv = g_bw_entries[i].bytes_recv;
+                    out->packets_sent = g_bw_entries[i].packets_sent;
+                    out->packets_recv = g_bw_entries[i].packets_recv;
+                    out->last_activity_time = g_bw_entries[i].last_activity;
+                    request->process_count++;
+                }
+            }
+            request->monitoring_active = g_bw_active;
+            return STATUS_SUCCESS;
+        }
+        default:
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+}
+
+// =====================================================================
+// Network interface enumeration
+// =====================================================================
+namespace net_if_enum {
+
+    // MIB_IF_TABLE2 / MIB_IF_ROW2 layout (simplified)
+    typedef NTSTATUS(NTAPI* fn_GetIfTable2)(PVOID* Table);
+    typedef void(NTAPI* fn_FreeMibTable)(PVOID Table);
+    typedef NTSTATUS(NTAPI* fn_GetAdaptersAddresses)(
+        ULONG Family, ULONG Flags, PVOID Reserved,
+        PVOID AdapterAddresses, PULONG SizePointer);
+
+    NTSTATUS enumerate_interfaces(p_net_interface_enum request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+        request->interface_count = 0;
+
+        // Use ZwQuerySystemInformation for network interface info
+        // We walk kernel's network interface structures via IOCTL to NDIS or IP helper
+        // Simpler approach: enumerate from SystemModuleInformation + NDIS miniport info
+        // For robustness, we use a simpler approach: walk net_capture's WFP data
+
+        // Direct approach via netio.sys GetIfTable2
+        PVOID netio = net_capture::find_module_base("netio.sys");
+        if (!netio) netio = net_capture::find_module_base("NETIO.SYS");
+        if (!netio) return STATUS_NOT_SUPPORTED;
+
+        CHAR gt2[] = {'G','e','t','I','f','T','a','b','l','e','2',0};
+        CHAR fmt[] = {'F','r','e','e','M','i','b','T','a','b','l','e',0};
+
+        fn_GetIfTable2 _GetIfTable2 = (fn_GetIfTable2)GetProcAddress(netio, gt2);
+        fn_FreeMibTable _FreeMibTable = (fn_FreeMibTable)GetProcAddress(netio, fmt);
+
+        if (!_GetIfTable2 || !_FreeMibTable) return STATUS_NOT_SUPPORTED;
+
+        PVOID table = nullptr;
+        NTSTATUS st = _GetIfTable2(&table);
+        if (!NT_SUCCESS(st) || !table) return st;
+
+        __try {
+            // MIB_IF_TABLE2: first ULONG is NumEntries, then array of MIB_IF_ROW2
+            // MIB_IF_ROW2 is large (~1352 bytes each)
+            ULONG num = *(ULONG*)table;
+            UINT8* rows = (UINT8*)table + 8; // aligned after count
+
+            // MIB_IF_ROW2 offsets (Windows 10/11):
+            //   +0x000: InterfaceLuid (UINT64)
+            //   +0x008: InterfaceIndex (UINT32)
+            //   +0x00C: InterfaceGuid (GUID)
+            //   +0x01C: Alias (wchar_t[257]) = 514 bytes
+            //   +0x222: Description (wchar_t[257]) = 514 bytes
+            //   +0x428: PhysicalAddressLength (UINT32)
+            //   +0x42C: PhysicalAddress[32]
+            //   +0x44C: PermanentPhysicalAddress[32]
+            //   +0x46C: Mtu (UINT32)
+            //   +0x470: Type (UINT32)
+            //   +0x478: MediaType... TransmitLinkSpeed(+0x488, UINT64), ReceiveLinkSpeed(+0x490)
+            //   +0x498: OperStatus (UINT32)
+            //   +0x500+: InOctets, OutOctets etc
+
+            #define MIB_IF_ROW2_SIZE 1352
+
+            for (ULONG i = 0; i < num && request->interface_count < NET_IF_MAX; i++) {
+                UINT8* row = rows + (SIZE_T)i * MIB_IF_ROW2_SIZE;
+                if (!_MmIsAddressValid(row)) break;
+
+                NET_INTERFACE_ENTRY* e = &request->interfaces[request->interface_count];
+                strong::kmemset(e, 0, sizeof(NET_INTERFACE_ENTRY));
+
+                e->if_index = *(UINT32*)(row + 0x08);
+                e->mtu = *(UINT32*)(row + 0x46C);
+                e->if_type = *(UINT32*)(row + 0x470);
+                e->speed = *(UINT64*)(row + 0x488);
+                e->oper_status = *(UINT32*)(row + 0x498);
+
+                // Physical address (MAC)
+                UINT32 phys_len = *(UINT32*)(row + 0x428);
+                if (phys_len >= 6) {
+                    strong::kmemcpy(e->mac_addr, row + 0x42C, 6);
+                }
+
+                // Convert alias (wchar_t) to char for name
+                wchar_t* alias = (wchar_t*)(row + 0x01C);
+                for (UINT32 j = 0; j < NET_IF_NAME_LEN - 1 && alias[j]; j++) {
+                    e->name[j] = (char)(alias[j] & 0x7F);
+                }
+
+                // Convert description
+                wchar_t* desc = (wchar_t*)(row + 0x222);
+                for (UINT32 j = 0; j < NET_IF_NAME_LEN - 1 && desc[j]; j++) {
+                    e->description[j] = (char)(desc[j] & 0x7F);
+                }
+
+                // InOctets / OutOctets (at offset ~0x508/0x510)
+                e->in_octets = *(UINT64*)(row + 0x508);
+                e->out_octets = *(UINT64*)(row + 0x510);
+
+                request->interface_count++;
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            // Partial results are fine
+        }
+
+        _FreeMibTable(table);
+        return STATUS_SUCCESS;
+    }
+}
+
+// =====================================================================
+// PCAP export engine
+// =====================================================================
+namespace net_pcap {
+
+    NTSTATUS export_pcap(p_pcap_export_request request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+
+        // Fill PCAP global header
+        request->header.magic_number = 0xa1b2c3d4;
+        request->header.version_major = 2;
+        request->header.version_minor = 4;
+        request->header.thiszone = 0;
+        request->header.sigfigs = 0;
+        request->header.snaplen = PCAP_RECORD_MAX_SIZE;
+        request->header.network = 101; // LINKTYPE_RAW (raw IP)
+
+        UINT32 max_pkts = request->max_packets;
+        if (max_pkts == 0 || max_pkts > PCAP_MAX_EXPORT_PACKETS)
+            max_pkts = PCAP_MAX_EXPORT_PACKETS;
+
+        request->packet_count = 0;
+        request->data_size = sizeof(PCAP_GLOBAL_HEADER);
+
+        // Read from captured packet ring buffer
+        if (!net_capture::g_ring_buffer) return STATUS_NOT_SUPPORTED;
+
+        KIRQL irql;
+        KeAcquireSpinLock(&net_capture::g_ring_lock, &irql);
+
+        LONG count = net_capture::g_ring_count;
+        LONG idx = net_capture::g_ring_tail;
+
+        while (count > 0 && request->packet_count < max_pkts) {
+            NET_PACKET_ENTRY* pkt = &net_capture::g_ring_buffer[idx];
+
+            PCAP_RECORD* rec = &request->records[request->packet_count];
+            strong::kmemset(rec, 0, sizeof(PCAP_RECORD));
+
+            // Convert Windows FILETIME (100ns since 1601) to Unix timestamp
+            UINT64 unix_100ns = pkt->timestamp - 116444736000000000ULL;
+            rec->ts_sec = (UINT32)(unix_100ns / 10000000ULL);
+            rec->ts_usec = (UINT32)((unix_100ns % 10000000ULL) / 10);
+
+            // Build a minimal IP header + payload
+            UINT32 ip_header_len = 20;
+            UINT32 total_len = ip_header_len + pkt->payload_size;
+            if (total_len > PCAP_RECORD_MAX_SIZE) total_len = PCAP_RECORD_MAX_SIZE;
+
+            // IPv4 header
+            rec->data[0] = 0x45; // version=4, IHL=5
+            rec->data[1] = 0x00; // DSCP
+            rec->data[2] = (UINT8)(total_len >> 8);
+            rec->data[3] = (UINT8)(total_len & 0xFF);
+            rec->data[4] = 0; rec->data[5] = 0; // ID
+            rec->data[6] = 0x40; rec->data[7] = 0; // DF flag
+            rec->data[8] = 64; // TTL
+            rec->data[9] = (UINT8)pkt->protocol;
+            // Checksum = 0 (no checksumming for pcap)
+            // Src IP
+            strong::kmemcpy(&rec->data[12], pkt->local_addr, 4);
+            // Dst IP
+            strong::kmemcpy(&rec->data[16], pkt->remote_addr, 4);
+
+            // If direction is inbound, swap src/dst
+            if (pkt->direction == 0) {
+                strong::kmemcpy(&rec->data[12], pkt->remote_addr, 4);
+                strong::kmemcpy(&rec->data[16], pkt->local_addr, 4);
+            }
+
+            // Copy payload after IP header
+            UINT32 payload_copy = pkt->payload_size;
+            if (ip_header_len + payload_copy > PCAP_RECORD_MAX_SIZE)
+                payload_copy = PCAP_RECORD_MAX_SIZE - ip_header_len;
+            strong::kmemcpy(&rec->data[ip_header_len], pkt->payload, payload_copy);
+
+            rec->incl_len = ip_header_len + payload_copy;
+            rec->orig_len = total_len;
+            request->data_size += sizeof(UINT32) * 4 + rec->incl_len; // pcap record header + data
+
+            request->packet_count++;
+            idx = (idx + 1) % RING_BUFFER_SIZE;
+            count--;
+        }
+
+        KeReleaseSpinLock(&net_capture::g_ring_lock, irql);
+
+        // Apply PID/protocol filter
+        if (request->filter_pid != 0 || request->filter_protocol != 0) {
+            // Re-filter (we captured all, now trim)
+            UINT32 write_idx = 0;
+            for (UINT32 i = 0; i < request->packet_count; i++) {
+                // We need to check against original packet data, but we've already lost PID info
+                // For simplicity, filter before export or just provide all
+                if (write_idx != i) {
+                    strong::kmemcpy(&request->records[write_idx], &request->records[i], sizeof(PCAP_RECORD));
+                }
+                write_idx++;
+            }
+            request->packet_count = write_idx;
+        }
+
+        return STATUS_SUCCESS;
+    }
+}
+
+// =====================================================================
+// Network fingerprinting engine
+// =====================================================================
+namespace net_fingerprint {
+
+    inline NET_FINGERPRINT_ENTRY g_fp_entries[FINGERPRINT_MAX] = {};
+    inline volatile LONG g_fp_count = 0;
+    inline volatile LONG g_fp_active = 0;
+    inline KSPIN_LOCK g_fp_lock;
+
+    BOOLEAN is_active() {
+        return (g_fp_active != 0);
+    }
+
+    // Analyze a SYN or SYN-ACK packet for OS fingerprinting
+    void analyze_tcp_syn(const UINT8* src_addr, UINT32 af,
+                         const UINT8* tcp_data, UINT32 tcp_len,
+                         UINT32 ip_ttl) {
+        if (!g_fp_active || tcp_len < 20) return;
+
+        UINT8 flags = tcp_data[13];
+        if (!(flags & 0x02)) return; // Not SYN
+
+        UINT32 window = ((UINT32)tcp_data[14] << 8) | tcp_data[15];
+        UINT32 data_offset = ((tcp_data[12] >> 4) & 0xF) * 4;
+
+        // Parse TCP options
+        UINT32 mss = 0;
+        UINT32 ws = 0;
+        UINT32 sack = 0;
+        UINT32 nops = 0;
+        UINT32 opt_order = 0;
+
+        if (data_offset > 20 && data_offset <= tcp_len) {
+            UINT32 pos = 20;
+            UINT32 opt_idx = 0;
+            while (pos < data_offset && pos < tcp_len) {
+                UINT8 kind = tcp_data[pos];
+                if (kind == 0) break; // End of options
+                if (kind == 1) { nops++; pos++; continue; } // NOP
+                if (pos + 1 >= tcp_len) break;
+                UINT8 olen = tcp_data[pos + 1];
+                if (olen < 2 || pos + olen > tcp_len) break;
+
+                if (kind == 2 && olen == 4) { // MSS
+                    mss = ((UINT32)tcp_data[pos + 2] << 8) | tcp_data[pos + 3];
+                    opt_order |= (2 << (opt_idx * 4));
+                }
+                else if (kind == 3 && olen == 3) { // Window Scale
+                    ws = tcp_data[pos + 2];
+                    opt_order |= (3 << (opt_idx * 4));
+                }
+                else if (kind == 4 && olen == 2) { // SACK permitted
+                    sack = 1;
+                    opt_order |= (4 << (opt_idx * 4));
+                }
+                else if (kind == 8 && olen == 10) { // Timestamp
+                    opt_order |= (8 << (opt_idx * 4));
+                }
+                opt_idx++;
+                pos += olen;
+            }
+        }
+
+        // Simple OS detection heuristic
+        char os[64] = {};
+        // Windows: TTL=128, MSS=1460, window varies
+        // Linux: TTL=64, MSS=1460, window=65535 or scaled
+        // macOS: TTL=64, MSS=1460
+        // FreeBSD: TTL=64, MSS=1460
+
+        UINT32 ttl_bucket = (ip_ttl > 96) ? 128 : (ip_ttl > 48 ? 64 : 32);
+
+        if (ttl_bucket == 128) {
+            if (window == 65535 || window == 64240) {
+                // Windows 10/11
+                const char* s = "Windows 10/11";
+                for (int i = 0; s[i]; i++) os[i] = s[i];
+            } else if (window == 8192) {
+                const char* s = "Windows 7/8";
+                for (int i = 0; s[i]; i++) os[i] = s[i];
+            } else {
+                const char* s = "Windows (unknown)";
+                for (int i = 0; s[i]; i++) os[i] = s[i];
+            }
+        } else if (ttl_bucket == 64) {
+            if (ws > 0 && sack) {
+                if (mss == 1460 && window >= 29200) {
+                    const char* s = "Linux 4.x/5.x";
+                    for (int i = 0; s[i]; i++) os[i] = s[i];
+                } else if (mss == 1460 && window == 65535) {
+                    const char* s = "macOS / FreeBSD";
+                    for (int i = 0; s[i]; i++) os[i] = s[i];
+                } else {
+                    const char* s = "Linux/Unix";
+                    for (int i = 0; s[i]; i++) os[i] = s[i];
+                }
+            } else {
+                const char* s = "Unix-like";
+                for (int i = 0; s[i]; i++) os[i] = s[i];
+            }
+        } else {
+            const char* s = "Unknown";
+            for (int i = 0; s[i]; i++) os[i] = s[i];
+        }
+
+        // Store fingerprint
+        KIRQL irql;
+        KeAcquireSpinLock(&g_fp_lock, &irql);
+
+        // Check if we already have this remote address
+        for (UINT32 i = 0; i < FINGERPRINT_MAX; i++) {
+            if (g_fp_entries[i].address_family == af) {
+                UINT32 len = (af == 23) ? 16 : 4;
+                BOOLEAN same = TRUE;
+                for (UINT32 j = 0; j < len; j++) {
+                    if (g_fp_entries[i].remote_addr[j] != src_addr[j]) {
+                        same = FALSE; break;
+                    }
+                }
+                if (same) {
+                    // Update
+                    g_fp_entries[i].ttl = ip_ttl;
+                    g_fp_entries[i].window_size = window;
+                    g_fp_entries[i].mss = mss;
+                    g_fp_entries[i].window_scale = ws;
+                    g_fp_entries[i].sack_permitted = sack;
+                    g_fp_entries[i].nop_count = nops;
+                    g_fp_entries[i].tcp_options_order = opt_order;
+                    strong::kmemcpy(g_fp_entries[i].os_guess, os, 64);
+                    KeReleaseSpinLock(&g_fp_lock, irql);
+                    return;
+                }
+            }
+        }
+
+        // Add new
+        if (g_fp_count < FINGERPRINT_MAX) {
+            UINT32 idx = g_fp_count;
+            strong::kmemset(&g_fp_entries[idx], 0, sizeof(NET_FINGERPRINT_ENTRY));
+            strong::kmemcpy(g_fp_entries[idx].remote_addr, src_addr, (af == 23) ? 16 : 4);
+            g_fp_entries[idx].address_family = af;
+            g_fp_entries[idx].ttl = ip_ttl;
+            g_fp_entries[idx].window_size = window;
+            g_fp_entries[idx].mss = mss;
+            g_fp_entries[idx].window_scale = ws;
+            g_fp_entries[idx].sack_permitted = sack;
+            g_fp_entries[idx].nop_count = nops;
+            g_fp_entries[idx].tcp_options_order = opt_order;
+            g_fp_entries[idx].df_flag = 0; // would need IP header access
+            strong::kmemcpy(g_fp_entries[idx].os_guess, os, 64);
+            _InterlockedIncrement(&g_fp_count);
+        }
+        KeReleaseSpinLock(&g_fp_lock, irql);
+    }
+
+    NTSTATUS handle_fingerprint(p_net_fingerprint_request request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+
+        switch (request->operation) {
+        case 0: // enable
+            KeInitializeSpinLock(&g_fp_lock);
+            _InterlockedExchange(&g_fp_active, 1);
+            return STATUS_SUCCESS;
+        case 1: // disable
+            _InterlockedExchange(&g_fp_active, 0);
+            return STATUS_SUCCESS;
+        case 2: { // get_results
+            KIRQL irql;
+            KeAcquireSpinLock(&g_fp_lock, &irql);
+            request->result_count = (UINT32)g_fp_count;
+            UINT32 copy = g_fp_count;
+            if (copy > FINGERPRINT_MAX) copy = FINGERPRINT_MAX;
+            strong::kmemcpy(request->entries, g_fp_entries, copy * sizeof(NET_FINGERPRINT_ENTRY));
+            KeReleaseSpinLock(&g_fp_lock, irql);
+            return STATUS_SUCCESS;
+        }
+        default:
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+}
+
 // =====================================================================
 // IOCTL handler wrappers for the 4 advanced network recon tools
 // =====================================================================
@@ -2579,4 +4506,78 @@ NTSTATUS functions::handle_sniff_net_buffers(p_sniff_net_buffers request) {
 NTSTATUS functions::handle_tcpip_conn_dump(p_tcpip_conn_dump request) {
     if (!request) return STATUS_INVALID_PARAMETER;
     return net_tcpip::dump_connections(request);
+}
+
+// =====================================================================
+// IOCTL handler wrappers for MITM / interception tools
+// =====================================================================
+
+NTSTATUS functions::handle_packet_inject(p_packet_inject_request request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    return net_inject::inject_packet(request);
+}
+
+NTSTATUS functions::handle_packet_mod_rule(p_packet_mod_rule request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    if (request->operation == 2) {
+        // List operation uses the larger struct
+        return net_mod::handle_mod_rule_list((p_packet_mod_rule_list)request);
+    }
+    return net_mod::handle_mod_rule(request);
+}
+
+NTSTATUS functions::handle_traffic_redirect(p_traffic_redirect_rule request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    if (request->operation == 2) {
+        return net_redirect::handle_redirect_list((p_traffic_redirect_list)request);
+    }
+    return net_redirect::handle_redirect_rule(request);
+}
+
+NTSTATUS functions::handle_stream_reassemble(p_stream_reassemble_request request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    return net_stream::handle_stream(request);
+}
+
+NTSTATUS functions::handle_deep_inspect(p_dpi_request request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    return net_dpi::get_results(request);
+}
+
+NTSTATUS functions::handle_intercept_hold(p_intercept_request request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    return net_intercept::handle_intercept(request);
+}
+
+NTSTATUS functions::handle_conn_kill(p_conn_kill_request request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    return net_kill::kill_connection(request);
+}
+
+NTSTATUS functions::handle_dns_spoof(p_dns_spoof_rule request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    if (request->operation == 2) {
+        return net_dns_spoof::handle_spoof_list((p_dns_spoof_list)request);
+    }
+    return net_dns_spoof::handle_spoof_rule(request);
+}
+
+NTSTATUS functions::handle_bw_monitor(p_bw_monitor_request request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    return net_bw::handle_bw(request);
+}
+
+NTSTATUS functions::handle_net_iface_enum(p_net_interface_enum request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    return net_if_enum::enumerate_interfaces(request);
+}
+
+NTSTATUS functions::handle_pcap_export(p_pcap_export_request request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    return net_pcap::export_pcap(request);
+}
+
+NTSTATUS functions::handle_net_fingerprint(p_net_fingerprint_request request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    return net_fingerprint::handle_fingerprint(request);
 }

@@ -2023,3 +2023,560 @@ voyager::device_t::dump_tcpip_connections(std::uint32_t target_pid, std::uint32_
     VirtualFree(req, 0, MEM_RELEASE);
     return result;
 }
+
+// =================================================================
+// MITM / Deep Packet Inspection / Interception implementations
+// =================================================================
+
+bool voyager::device_t::inject_packet(std::uint32_t direction, std::uint32_t protocol, std::uint32_t af,
+                                       std::uint32_t src_port, std::uint32_t dst_port,
+                                       const std::uint8_t* src_addr, const std::uint8_t* dst_addr,
+                                       const std::uint8_t* payload, std::uint32_t payload_size,
+                                       std::uint32_t tcp_flags, std::uint32_t tcp_seq, std::uint32_t tcp_ack) noexcept {
+    if (!is_connected() || !payload || payload_size == 0) return false;
+    if (payload_size > detail::INJECT_MAX_PAYLOAD) payload_size = detail::INJECT_MAX_PAYLOAD;
+
+    auto* req = static_cast<detail::packet_inject_request*>(
+        VirtualAlloc(nullptr, sizeof(detail::packet_inject_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return false;
+
+    std::memset(req, 0, sizeof(*req));
+    req->direction = direction;
+    req->protocol = protocol;
+    req->address_family = af;
+    req->src_port = src_port;
+    req->dst_port = dst_port;
+    req->payload_size = payload_size;
+    if (src_addr) std::memcpy(req->src_addr, src_addr, 16);
+    if (dst_addr) std::memcpy(req->dst_addr, dst_addr, 16);
+    req->tcp_flags = tcp_flags;
+    req->tcp_seq = tcp_seq;
+    req->tcp_ack = tcp_ack;
+    std::memcpy(req->payload, payload, payload_size);
+
+    bool ok = send_request(ioctl_codes::PINJ(), req, static_cast<DWORD>(sizeof(*req)));
+    bool success = ok && (req->status == 0);
+    VirtualFree(req, 0, MEM_RELEASE);
+    return success;
+}
+
+bool voyager::device_t::packet_mod_rule_op(std::uint32_t operation, std::uint32_t direction, std::uint32_t protocol,
+                                            std::uint32_t port, std::uint32_t pid,
+                                            const std::uint8_t* pattern, std::uint32_t pattern_size,
+                                            const std::uint8_t* replacement, std::uint32_t replace_size,
+                                            std::uint32_t* out_rule_id) noexcept {
+    if (!is_connected()) return false;
+
+    auto* req = static_cast<detail::packet_mod_rule*>(
+        VirtualAlloc(nullptr, sizeof(detail::packet_mod_rule), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return false;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = operation;
+    req->direction = direction;
+    req->protocol = protocol;
+    req->port = port;
+    req->pid = pid;
+    if (pattern && pattern_size > 0) {
+        req->pattern_size = (pattern_size > detail::MOD_MAX_PATTERN) ? detail::MOD_MAX_PATTERN : pattern_size;
+        std::memcpy(req->pattern, pattern, req->pattern_size);
+    }
+    if (replacement && replace_size > 0) {
+        req->replace_size = (replace_size > detail::MOD_MAX_REPLACE) ? detail::MOD_MAX_REPLACE : replace_size;
+        std::memcpy(req->replacement, replacement, req->replace_size);
+    }
+
+    bool ok = send_request(ioctl_codes::PMOD(), req, static_cast<DWORD>(sizeof(*req)));
+    if (ok && out_rule_id) *out_rule_id = req->rule_id;
+    VirtualFree(req, 0, MEM_RELEASE);
+    return ok;
+}
+
+std::vector<voyager::device_t::mod_rule_info> voyager::device_t::list_packet_mod_rules() noexcept {
+    std::vector<mod_rule_info> result;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<detail::packet_mod_rule_list*>(
+        VirtualAlloc(nullptr, sizeof(detail::packet_mod_rule_list), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = 2;
+
+    if (send_request(ioctl_codes::PMOD(), req, static_cast<DWORD>(sizeof(*req)))) {
+        for (std::uint32_t i = 0; i < req->rule_count && i < detail::MOD_MAX_RULES; i++) {
+            const auto& r = req->rules[i];
+            mod_rule_info info{};
+            info.rule_id = r.rule_id;
+            info.direction = r.direction;
+            info.protocol = r.protocol;
+            info.port = r.port;
+            info.pid = r.pid;
+            info.match_count = r.match_count;
+            info.active = r.active;
+            result.push_back(info);
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}
+
+bool voyager::device_t::traffic_redirect_op(std::uint32_t operation, std::uint32_t protocol,
+                                             std::uint32_t match_port, const std::uint8_t* match_addr,
+                                             std::uint32_t redirect_port, const std::uint8_t* redirect_addr,
+                                             std::uint32_t af, std::uint32_t* out_rule_id) noexcept {
+    if (!is_connected()) return false;
+
+    auto* req = static_cast<detail::traffic_redirect_rule*>(
+        VirtualAlloc(nullptr, sizeof(detail::traffic_redirect_rule), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return false;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = operation;
+    req->protocol = protocol;
+    req->match_port = match_port;
+    req->redirect_port = redirect_port;
+    req->address_family = af;
+    if (match_addr) std::memcpy(req->match_addr, match_addr, 16);
+    if (redirect_addr) std::memcpy(req->redirect_addr, redirect_addr, 16);
+
+    bool ok = send_request(ioctl_codes::PRED(), req, static_cast<DWORD>(sizeof(*req)));
+    if (ok && out_rule_id) *out_rule_id = req->rule_id;
+    VirtualFree(req, 0, MEM_RELEASE);
+    return ok;
+}
+
+std::vector<voyager::device_t::redirect_rule_info> voyager::device_t::list_redirect_rules() noexcept {
+    std::vector<redirect_rule_info> result;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<detail::traffic_redirect_list*>(
+        VirtualAlloc(nullptr, sizeof(detail::traffic_redirect_list), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = 2;
+
+    if (send_request(ioctl_codes::PRED(), req, static_cast<DWORD>(sizeof(*req)))) {
+        for (std::uint32_t i = 0; i < req->rule_count && i < detail::REDIR_MAX_RULES; i++) {
+            const auto& r = req->rules[i];
+            redirect_rule_info info{};
+            info.rule_id = r.rule_id;
+            info.protocol = r.protocol;
+            info.match_port = r.match_port;
+            info.redirect_port = r.redirect_port;
+            info.af = r.address_family;
+            info.match_count = r.match_count;
+            info.active = r.active;
+            result.push_back(info);
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}
+
+bool voyager::device_t::stream_reassemble_op(std::uint32_t operation, std::uint32_t src_port, std::uint32_t dst_port,
+                                              std::uint32_t pid, const std::uint8_t* src_addr,
+                                              const std::uint8_t* dst_addr,
+                                              std::vector<std::uint8_t>* out_data,
+                                              std::uint32_t* out_packets, std::uint32_t* out_truncated) noexcept {
+    if (!is_connected()) return false;
+
+    auto* req = static_cast<detail::stream_reassemble_request*>(
+        VirtualAlloc(nullptr, sizeof(detail::stream_reassemble_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return false;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = operation;
+    req->src_port = src_port;
+    req->dst_port = dst_port;
+    req->pid = pid;
+    if (src_addr) std::memcpy(req->src_addr, src_addr, 16);
+    if (dst_addr) std::memcpy(req->dst_addr, dst_addr, 16);
+
+    bool ok = send_request(ioctl_codes::STRM(), req, static_cast<DWORD>(sizeof(*req)));
+    if (ok) {
+        if (out_data && req->stream_size > 0) {
+            out_data->assign(req->stream_data, req->stream_data + req->stream_size);
+        }
+        if (out_packets) *out_packets = req->total_packets;
+        if (out_truncated) *out_truncated = req->truncated;
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return ok;
+}
+
+std::vector<voyager::device_t::dpi_result> voyager::device_t::get_dpi_results(
+    std::uint32_t filter_pid, std::uint32_t filter_protocol,
+    std::uint32_t filter_port, std::uint32_t flags) noexcept {
+    std::vector<dpi_result> result;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<detail::dpi_request*>(
+        VirtualAlloc(nullptr, sizeof(detail::dpi_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+    req->filter_pid = filter_pid;
+    req->filter_protocol = filter_protocol;
+    req->filter_port = filter_port;
+    req->flags = flags;
+
+    if (send_request(ioctl_codes::DPIN(), req, static_cast<DWORD>(sizeof(*req)))) {
+        for (std::uint32_t i = 0; i < req->result_count && i < detail::DPI_MAX_RESULTS; i++) {
+            const auto& h = req->results[i];
+            dpi_result d{};
+            d.timestamp = h.timestamp;
+            d.direction = h.direction;
+            d.protocol = h.protocol;
+            d.src_port = h.src_port;
+            d.dst_port = h.dst_port;
+            d.pid = h.pid;
+            d.payload_size = h.payload_size;
+            d.af = h.address_family;
+            std::memcpy(d.src_addr, h.src_addr, 16);
+            std::memcpy(d.dst_addr, h.dst_addr, 16);
+            d.tcp_flags = h.tcp_flags;
+            d.tcp_window = h.tcp_window;
+            d.is_http = (h.is_http != 0);
+            d.is_tls = (h.is_tls != 0);
+            d.is_dns = (h.is_dns != 0);
+            d.http_method = h.http_method;
+            d.tls_version = h.tls_version;
+            d.tls_content_type = h.tls_content_type;
+            if (h.http_host[0]) d.http_host = h.http_host;
+            if (h.http_path[0]) d.http_path = h.http_path;
+            if (h.tls_sni[0]) d.tls_sni = h.tls_sni;
+            result.push_back(std::move(d));
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}
+
+bool voyager::device_t::intercept_op(std::uint32_t operation, std::uint32_t filter_pid, std::uint32_t filter_port,
+                                      std::uint32_t filter_protocol, std::uint64_t hold_id,
+                                      const std::uint8_t* modify_payload, std::uint32_t modify_size,
+                                      std::uint32_t* out_held_count, bool* out_active) noexcept {
+    if (!is_connected()) return false;
+
+    auto* req = static_cast<detail::intercept_request*>(
+        VirtualAlloc(nullptr, sizeof(detail::intercept_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return false;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = operation;
+    req->filter_pid = filter_pid;
+    req->filter_port = filter_port;
+    req->filter_protocol = filter_protocol;
+    req->hold_id = hold_id;
+    if (modify_payload && modify_size > 0) {
+        req->modify_payload_size = (modify_size > detail::INTERCEPT_MAX_PAYLOAD) ? detail::INTERCEPT_MAX_PAYLOAD : modify_size;
+        std::memcpy(req->modify_payload, modify_payload, req->modify_payload_size);
+    }
+
+    bool ok = send_request(ioctl_codes::IHLD(), req, static_cast<DWORD>(sizeof(*req)));
+    if (ok) {
+        if (out_held_count) *out_held_count = req->held_count;
+        if (out_active) *out_active = (req->intercepting != 0);
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return ok;
+}
+
+std::vector<voyager::device_t::held_packet_info> voyager::device_t::get_held_packets() noexcept {
+    std::vector<held_packet_info> result;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<detail::intercept_request*>(
+        VirtualAlloc(nullptr, sizeof(detail::intercept_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = 2; // get_held
+
+    if (send_request(ioctl_codes::IHLD(), req, static_cast<DWORD>(sizeof(*req)))) {
+        for (std::uint32_t i = 0; i < req->held_count && i < detail::INTERCEPT_MAX_HELD; i++) {
+            const auto& h = req->held_packets[i];
+            held_packet_info info{};
+            info.hold_id = h.hold_id;
+            info.timestamp = h.timestamp;
+            info.direction = h.direction;
+            info.protocol = h.protocol;
+            info.src_port = h.src_port;
+            info.dst_port = h.dst_port;
+            info.pid = h.pid;
+            info.payload_size = h.payload_size;
+            info.af = h.address_family;
+            std::memcpy(info.src_addr, h.src_addr, 16);
+            std::memcpy(info.dst_addr, h.dst_addr, 16);
+            if (h.payload_size > 0) {
+                std::uint32_t sz = (h.payload_size > detail::INTERCEPT_MAX_PAYLOAD) ? detail::INTERCEPT_MAX_PAYLOAD : h.payload_size;
+                info.payload.assign(h.payload, h.payload + sz);
+            }
+            result.push_back(std::move(info));
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}
+
+bool voyager::device_t::kill_connection(std::uint32_t protocol, std::uint32_t af,
+                                         std::uint32_t src_port, std::uint32_t dst_port,
+                                         const std::uint8_t* src_addr, const std::uint8_t* dst_addr,
+                                         std::uint32_t pid) noexcept {
+    if (!is_connected()) return false;
+
+    auto* req = static_cast<detail::conn_kill_request*>(
+        VirtualAlloc(nullptr, sizeof(detail::conn_kill_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return false;
+
+    std::memset(req, 0, sizeof(*req));
+    req->protocol = protocol;
+    req->address_family = af;
+    req->src_port = src_port;
+    req->dst_port = dst_port;
+    req->pid = pid;
+    if (src_addr) std::memcpy(req->src_addr, src_addr, 16);
+    if (dst_addr) std::memcpy(req->dst_addr, dst_addr, 16);
+
+    bool ok = send_request(ioctl_codes::CKIL(), req, static_cast<DWORD>(sizeof(*req)));
+    bool success = ok && (req->status == 0);
+    VirtualFree(req, 0, MEM_RELEASE);
+    return success;
+}
+
+bool voyager::device_t::dns_spoof_op(std::uint32_t operation, const char* domain,
+                                      const std::uint8_t* spoof_addr, std::uint32_t af,
+                                      std::uint32_t ttl, std::uint32_t* out_rule_id) noexcept {
+    if (!is_connected()) return false;
+
+    auto* req = static_cast<detail::dns_spoof_rule*>(
+        VirtualAlloc(nullptr, sizeof(detail::dns_spoof_rule), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return false;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = operation;
+    req->address_family = af;
+    req->ttl = ttl;
+    if (domain) {
+        size_t len = strlen(domain);
+        if (len >= detail::DNS_SPOOF_MAX_DOMAIN) len = detail::DNS_SPOOF_MAX_DOMAIN - 1;
+        std::memcpy(req->domain, domain, len);
+    }
+    if (spoof_addr) std::memcpy(req->spoof_addr, spoof_addr, 16);
+
+    bool ok = send_request(ioctl_codes::DNSS(), req, static_cast<DWORD>(sizeof(*req)));
+    if (ok && out_rule_id) *out_rule_id = req->rule_id;
+    VirtualFree(req, 0, MEM_RELEASE);
+    return ok;
+}
+
+std::vector<voyager::device_t::dns_spoof_info> voyager::device_t::list_dns_spoof_rules() noexcept {
+    std::vector<dns_spoof_info> result;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<detail::dns_spoof_list*>(
+        VirtualAlloc(nullptr, sizeof(detail::dns_spoof_list), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = 2;
+
+    if (send_request(ioctl_codes::DNSS(), req, static_cast<DWORD>(sizeof(*req)))) {
+        for (std::uint32_t i = 0; i < req->rule_count && i < detail::DNS_SPOOF_MAX_RULES; i++) {
+            const auto& r = req->rules[i];
+            dns_spoof_info info{};
+            info.rule_id = r.rule_id;
+            if (r.domain[0]) info.domain = r.domain;
+            info.af = r.address_family;
+            info.match_count = r.match_count;
+            info.active = r.active;
+            info.ttl = r.ttl;
+            result.push_back(std::move(info));
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}
+
+bool voyager::device_t::bw_monitor_op(std::uint32_t operation, std::uint32_t filter_pid,
+                                       bw_stats* out_stats) noexcept {
+    if (!is_connected()) return false;
+
+    auto* req = static_cast<detail::bw_monitor_request*>(
+        VirtualAlloc(nullptr, sizeof(detail::bw_monitor_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return false;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = operation;
+    req->filter_pid = filter_pid;
+
+    bool ok = send_request(ioctl_codes::BWMN(), req, static_cast<DWORD>(sizeof(*req)));
+    if (ok && out_stats) {
+        out_stats->total_bytes_sent = req->total_bytes_sent;
+        out_stats->total_bytes_recv = req->total_bytes_recv;
+        out_stats->total_packets_sent = req->total_packets_sent;
+        out_stats->total_packets_recv = req->total_packets_recv;
+        out_stats->bps_in = req->bytes_per_second_in;
+        out_stats->bps_out = req->bytes_per_second_out;
+        out_stats->active = (req->monitoring_active != 0);
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return ok;
+}
+
+std::vector<voyager::device_t::bw_process_info> voyager::device_t::get_bw_per_process(std::uint32_t filter_pid) noexcept {
+    std::vector<bw_process_info> result;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<detail::bw_monitor_request*>(
+        VirtualAlloc(nullptr, sizeof(detail::bw_monitor_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = 4; // get_per_process
+    req->filter_pid = filter_pid;
+
+    if (send_request(ioctl_codes::BWMN(), req, static_cast<DWORD>(sizeof(*req)))) {
+        for (std::uint32_t i = 0; i < req->process_count && i < detail::BW_MAX_PROCESSES; i++) {
+            const auto& p = req->processes[i];
+            bw_process_info info{};
+            info.pid = p.pid;
+            info.bytes_sent = p.bytes_sent;
+            info.bytes_recv = p.bytes_recv;
+            info.packets_sent = p.packets_sent;
+            info.packets_recv = p.packets_recv;
+            info.last_activity = p.last_activity_time;
+            result.push_back(info);
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}
+
+std::vector<voyager::device_t::net_iface_info> voyager::device_t::enumerate_interfaces() noexcept {
+    std::vector<net_iface_info> result;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<detail::net_interface_enum*>(
+        VirtualAlloc(nullptr, sizeof(detail::net_interface_enum), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+
+    if (send_request(ioctl_codes::NIFS(), req, static_cast<DWORD>(sizeof(*req)))) {
+        for (std::uint32_t i = 0; i < req->interface_count && i < detail::NET_IF_MAX; i++) {
+            const auto& e = req->interfaces[i];
+            net_iface_info info{};
+            info.if_index = e.if_index;
+            info.if_type = e.if_type;
+            info.mtu = e.mtu;
+            info.oper_status = e.oper_status;
+            info.speed = e.speed;
+            std::memcpy(info.mac_addr, e.mac_addr, 6);
+            std::memcpy(info.ipv4_addr, e.ipv4_addr, 4);
+            std::memcpy(info.ipv4_mask, e.ipv4_mask, 4);
+            std::memcpy(info.ipv6_addr, e.ipv6_addr, 16);
+            if (e.name[0]) info.name = e.name;
+            if (e.description[0]) info.description = e.description;
+            info.in_octets = e.in_octets;
+            info.out_octets = e.out_octets;
+            result.push_back(std::move(info));
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}
+
+bool voyager::device_t::export_pcap(std::uint32_t filter_pid, std::uint32_t filter_protocol,
+                                     std::uint32_t max_packets, pcap_export_result* out) noexcept {
+    if (!is_connected()) return false;
+    if (max_packets > detail::PCAP_MAX_EXPORT_PACKETS) max_packets = detail::PCAP_MAX_EXPORT_PACKETS;
+
+    auto* req = static_cast<detail::pcap_export_request*>(
+        VirtualAlloc(nullptr, sizeof(detail::pcap_export_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return false;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = 0;
+    req->filter_pid = filter_pid;
+    req->filter_protocol = filter_protocol;
+    req->max_packets = max_packets;
+
+    bool ok = send_request(ioctl_codes::PCEX(), req, static_cast<DWORD>(sizeof(*req)));
+    if (ok && out) {
+        out->header = req->header;
+        out->packets.clear();
+        for (std::uint32_t i = 0; i < req->packet_count && i < detail::PCAP_MAX_EXPORT_PACKETS; i++) {
+            const auto& r = req->records[i];
+            pcap_packet pkt{};
+            pkt.ts_sec = r.ts_sec;
+            pkt.ts_usec = r.ts_usec;
+            std::uint32_t len = (r.incl_len > detail::PCAP_RECORD_MAX_SIZE) ? detail::PCAP_RECORD_MAX_SIZE : r.incl_len;
+            pkt.data.assign(r.data, r.data + len);
+            out->packets.push_back(std::move(pkt));
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return ok;
+}
+
+bool voyager::device_t::fingerprint_op(std::uint32_t operation) noexcept {
+    if (!is_connected()) return false;
+
+    auto* req = static_cast<detail::net_fingerprint_request*>(
+        VirtualAlloc(nullptr, sizeof(detail::net_fingerprint_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return false;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = operation;
+
+    bool ok = send_request(ioctl_codes::NFPR(), req, static_cast<DWORD>(sizeof(*req)));
+    VirtualFree(req, 0, MEM_RELEASE);
+    return ok;
+}
+
+std::vector<voyager::device_t::fingerprint_info> voyager::device_t::get_fingerprints() noexcept {
+    std::vector<fingerprint_info> result;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<detail::net_fingerprint_request*>(
+        VirtualAlloc(nullptr, sizeof(detail::net_fingerprint_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = 2; // get
+
+    if (send_request(ioctl_codes::NFPR(), req, static_cast<DWORD>(sizeof(*req)))) {
+        for (std::uint32_t i = 0; i < req->result_count && i < detail::FINGERPRINT_MAX; i++) {
+            const auto& e = req->entries[i];
+            fingerprint_info info{};
+            std::memcpy(info.remote_addr, e.remote_addr, 16);
+            info.af = e.address_family;
+            info.ttl = e.ttl;
+            info.window_size = e.window_size;
+            info.mss = e.mss;
+            info.window_scale = e.window_scale;
+            info.df_flag = e.df_flag;
+            info.sack_permitted = e.sack_permitted;
+            info.nop_count = e.nop_count;
+            if (e.os_guess[0]) info.os_guess = e.os_guess;
+            result.push_back(std::move(info));
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}
