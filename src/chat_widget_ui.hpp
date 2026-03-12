@@ -340,4 +340,6 @@ private:
 
     int                      m_editingIndex;
     QTextEdit*               m_editingField;
+
+    QTimer*                  m_rebuildDebounceTimer;
 };

@@ -282,7 +282,16 @@ ssize_t idaapi dbg_event_listener_t::on_event(ssize_t code, va_list va)
 
 static int idaapi self_analysis_watchdog(void *)
 {
-    if (ida_utils::is_self_target_database())
+    static bool s_self_target_checked = false;
+    static bool s_is_self_target      = false;
+
+    if (!s_self_target_checked)
+    {
+        s_is_self_target      = ida_utils::is_self_target_database();
+        s_self_target_checked = true;
+    }
+
+    if (s_is_self_target)
         return -1;
 
 #ifdef __NT__
@@ -294,7 +303,7 @@ static int idaapi self_analysis_watchdog(void *)
     }
 #endif
 
-    return 7000;
+    return 30000;
 }
 
 aida_plugin_t::aida_plugin_t()
@@ -796,7 +805,7 @@ static plugmod_t* idaapi init()
         return PLUGIN_SKIP;
 
 
-    register_timer(5000, self_analysis_watchdog, nullptr);
+    register_timer(10000, self_analysis_watchdog, nullptr);
 
     auto& license = license_manager_t::instance();
 

@@ -429,6 +429,7 @@ AiDAChatPanel::AiDAChatPanel(QWidget* parent,
     , m_userScrolledChat(false)
     , m_editingIndex(-1)
     , m_editingField(nullptr)
+    , m_rebuildDebounceTimer(nullptr)
 {
     setObjectName(QString::fromStdString(OBFSTR("aidaChatPanel")));
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
@@ -441,6 +442,8 @@ AiDAChatPanel::AiDAChatPanel(QWidget* parent,
 
 AiDAChatPanel::~AiDAChatPanel()
 {
+    if (m_rebuildDebounceTimer != nullptr)
+        m_rebuildDebounceTimer->stop();
     if (m_typewriterTimer != nullptr)
         m_typewriterTimer->stop();
     if (m_thinkingElapsedTimer != nullptr)
@@ -966,7 +969,23 @@ void AiDAChatPanel::updateThemeColors()
     if (m_updatingTheme)
         return;
     m_updatingTheme = true;
-    m_theme = detectThemeColors();
+
+    ThemeColors newTheme = detectThemeColors();
+
+    const bool palette_same =
+        newTheme.panelBg == m_theme.panelBg
+        && newTheme.textPrimary == m_theme.textPrimary
+        && newTheme.inputBg == m_theme.inputBg
+        && newTheme.messageBgAi == m_theme.messageBgAi
+        && newTheme.headerBg == m_theme.headerBg;
+
+    if (palette_same)
+    {
+        m_updatingTheme = false;
+        return;
+    }
+
+    m_theme = newTheme;
     setStyleSheet(buildWidgetStylesheet());
     QPalette chatPal = m_chatDisplay->palette();
     chatPal.setColor(QPalette::Base, m_theme.panelBg);
@@ -1496,11 +1515,6 @@ void AiDAChatPanel::setupStyle()
     m_theme = detectThemeColors();
     setStyleSheet(buildWidgetStylesheet());
     applyResponsiveMetrics();
-    const QFont chatFont = createChatUiFont();
-    setFont(chatFont);
-    const auto widgets = findChildren<QWidget*>();
-    for (QWidget* widget : widgets)
-        widget->setFont(chatFont);
     QPalette chatPal = m_chatDisplay->palette();
     chatPal.setColor(QPalette::Base, m_theme.panelBg);
     chatPal.setColor(QPalette::Window, m_theme.panelBg);
@@ -1524,7 +1538,8 @@ bool AiDAChatPanel::event(QEvent* ev)
 {
     if (ev->type() == QEvent::PaletteChange || ev->type() == QEvent::StyleChange)
     {
-        updateThemeColors();
+        if (!m_updatingTheme)
+            updateThemeColors();
     }
     if (ev->type() == QEvent::WindowActivate)
         refreshModelPicker();
@@ -1536,7 +1551,18 @@ bool AiDAChatPanel::event(QEvent* ev)
         if (shown)
             refreshModelPicker();
         applyResponsiveMetrics();
-        rebuildChatDisplay();
+
+        if (m_rebuildDebounceTimer == nullptr)
+        {
+            m_rebuildDebounceTimer = new QTimer(this);
+            m_rebuildDebounceTimer->setSingleShot(true);
+            m_rebuildDebounceTimer->setInterval(50);
+            QObject::connect(m_rebuildDebounceTimer, &QTimer::timeout, this, [this]() {
+                rebuildChatDisplay();
+            });
+        }
+        if (!m_rebuildDebounceTimer->isActive())
+            m_rebuildDebounceTimer->start();
     }
     return result;
 }

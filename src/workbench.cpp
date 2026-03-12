@@ -33,6 +33,16 @@
 namespace
 {
 
+enum workbench_tab_index_t
+{
+    TAB_EXPLAIN = 0,
+    TAB_QUERY = 1,
+    TAB_ACTIONS = 2,
+    TAB_GRAPH = 3,
+    TAB_RAG = 4,
+    TAB_SETTINGS = 5,
+};
+
 static uint64_t now_ms()
 {
     return static_cast<uint64_t>(
@@ -146,7 +156,6 @@ struct workbench_theme_t
 
 static workbench_theme_t detect_workbench_theme(const QWidget* widget)
 {
-    workbench_theme_t theme;
     const QWidget* palette_source = widget != nullptr && widget->parentWidget() != nullptr
         ? widget->parentWidget()
         : widget;
@@ -154,11 +163,32 @@ static workbench_theme_t detect_workbench_theme(const QWidget* widget)
 
     const QColor window = palette.color(QPalette::Window);
     const QColor base = palette.color(QPalette::Base);
+    const QColor highlight = palette.color(QPalette::Highlight);
+
+    static QColor s_prev_window;
+    static QColor s_prev_base;
+    static QColor s_prev_highlight;
+    static workbench_theme_t s_cached;
+    static bool s_valid = false;
+
+    if (s_valid
+        && window == s_prev_window
+        && base == s_prev_base
+        && highlight == s_prev_highlight)
+    {
+        return s_cached;
+    }
+
+    s_prev_window    = window;
+    s_prev_base      = base;
+    s_prev_highlight = highlight;
+
+    workbench_theme_t theme;
+
     const QColor button = palette.color(QPalette::Button);
     const QColor button_text = palette.color(QPalette::ButtonText);
     const QColor window_text = palette.color(QPalette::WindowText);
     const QColor text = palette.color(QPalette::Text);
-    const QColor highlight = palette.color(QPalette::Highlight);
     const QColor highlighted_text = palette.color(QPalette::HighlightedText);
     const QColor link = palette.color(QPalette::Link);
 
@@ -238,6 +268,8 @@ static workbench_theme_t detect_workbench_theme(const QWidget* widget)
         theme.link = blend_color(theme.accent, QColor(20, 20, 20), 0.12);
     }
 
+    s_cached = theme;
+    s_valid = true;
     return theme;
 }
 
@@ -776,14 +808,19 @@ QSize AiDAWorkbenchPanel::minimumSizeHint() const
 
 void AiDAWorkbenchPanel::set_context_function(ea_t ea, const QString& func_name)
 {
+    const bool context_changed = (m_contextEa != ea) || (m_contextFuncName != func_name);
+
     m_contextEa = ea;
     m_contextFuncName = func_name;
-    m_lineExplainText.clear();
 
     if (m_queryPanel != nullptr)
         m_queryPanel->setContextFunction(ea, func_name);
 
-    refresh_all_tabs();
+    if (!context_changed)
+        return;
+
+    m_lineExplainText.clear();
+    refresh_visible_tab();
 }
 
 void AiDAWorkbenchPanel::build_ui()
@@ -813,6 +850,10 @@ void AiDAWorkbenchPanel::build_ui()
     build_graph_tab();
     build_rag_tab();
     build_settings_tab();
+
+    QObject::connect(m_tabs, &QTabWidget::currentChanged, this, [this](int) {
+        refresh_visible_tab();
+    });
 }
 
 void AiDAWorkbenchPanel::apply_theme()
@@ -1031,19 +1072,22 @@ void AiDAWorkbenchPanel::queue_visual_refresh()
         self->m_visualRefreshQueued = false;
         if (self->m_applyingTheme)
             return;
-        self->refresh_all_tabs();
+        self->refresh_visible_tab();
     });
 }
 
 bool AiDAWorkbenchPanel::event(QEvent* event)
 {
     const QEvent::Type type = event->type();
+
+    if (m_applyingTheme && (type == QEvent::StyleChange || type == QEvent::PaletteChange))
+        return QWidget::event(event);
+
     const bool visual_change =
         type == QEvent::Show
         || type == QEvent::ParentChange
         || type == QEvent::PaletteChange
-        || type == QEvent::ApplicationPaletteChange
-        || type == QEvent::StyleChange;
+        || type == QEvent::ApplicationPaletteChange;
 
     const bool result = QWidget::event(event);
 
@@ -1091,11 +1135,47 @@ std::string AiDAWorkbenchPanel::analysis_type_key(const char* suffix) const
 
 void AiDAWorkbenchPanel::refresh_all_tabs()
 {
-    refresh_explain_tab();
-    refresh_actions_tab();
-    refresh_graph_tab();
-    refresh_rag_tab();
-    refresh_settings_tab();
+    refresh_tab_by_index(TAB_EXPLAIN);
+    refresh_tab_by_index(TAB_ACTIONS);
+    refresh_tab_by_index(TAB_GRAPH);
+    refresh_tab_by_index(TAB_RAG);
+    refresh_tab_by_index(TAB_SETTINGS);
+}
+
+void AiDAWorkbenchPanel::refresh_tab_by_index(int index)
+{
+    switch (index)
+    {
+    case TAB_EXPLAIN:
+        refresh_explain_tab();
+        break;
+    case TAB_QUERY:
+        if (m_queryPanel != nullptr)
+            m_queryPanel->setContextFunction(m_contextEa, m_contextFuncName);
+        break;
+    case TAB_ACTIONS:
+        refresh_actions_tab();
+        break;
+    case TAB_GRAPH:
+        refresh_graph_tab();
+        break;
+    case TAB_RAG:
+        refresh_rag_tab();
+        break;
+    case TAB_SETTINGS:
+        refresh_settings_tab();
+        break;
+    default:
+        break;
+    }
+}
+
+void AiDAWorkbenchPanel::refresh_visible_tab()
+{
+    if (m_tabs == nullptr)
+        return;
+
+    refresh_tab_by_index(m_tabs->currentIndex());
 }
 
 

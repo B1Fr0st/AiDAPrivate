@@ -54,6 +54,8 @@ private:
     void apply_theme();
     void queue_visual_refresh();
     void refresh_all_tabs();
+    void refresh_tab_by_index(int index);
+    void refresh_visible_tab();
 
     void build_explain_tab();
     void build_actions_tab();

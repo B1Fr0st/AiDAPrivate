@@ -41,6 +41,9 @@ static bool g_chat_listener_hooked = false;
 
 static void update_context_for_ea(ea_t ea)
 {
+    const ea_t old_context_ea = g_chat.context_ea;
+    const qstring old_context_name = g_chat.context_func_name;
+
     func_t* pfn = get_func(ea);
     if (pfn != nullptr)
     {
@@ -53,7 +56,10 @@ static void update_context_for_ea(ea_t ea)
         g_chat.context_func_name.clear();
     }
 
-    if (g_chat.workbench != nullptr)
+    const bool context_changed =
+        old_context_ea != g_chat.context_ea || old_context_name != g_chat.context_func_name;
+
+    if (g_chat.workbench != nullptr && context_changed)
     {
         g_chat.workbench->set_context_function(
             g_chat.context_ea,
@@ -86,6 +92,8 @@ ssize_t idaapi chat_event_listener_t::on_event(ssize_t code, va_list va)
     }
     else if (code == ui_screen_ea_changed)
     {
+        if (g_chat.widget == nullptr && g_chat.workbench == nullptr)
+            return 0;
         ea_t ea = va_arg(va, ea_t);
         qnotused(va_arg(va, ea_t));
         update_context_for_ea(ea);
@@ -97,6 +105,12 @@ ssize_t idaapi chat_event_listener_t::on_event(ssize_t code, va_list va)
         {
             g_chat.workbench = nullptr;
             g_chat.widget = nullptr;
+
+            if (g_chat_listener_hooked)
+            {
+                ::unhook_event_listener(HT_UI, &g_chat_evt_listener);
+                g_chat_listener_hooked = false;
+            }
         }
     }
     else if (code == ui_desktop_applied)

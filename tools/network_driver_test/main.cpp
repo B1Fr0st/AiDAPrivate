@@ -17,6 +17,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -44,6 +45,8 @@ struct TestCaseResult {
 
 struct Config {
     std::string pcap_out = "network_driver_test_capture.pcap";
+    std::string target_exe;
+    std::uint32_t target_pid = 0;
     bool strict = true;
 
     bool sniff_enabled = false;
@@ -52,6 +55,81 @@ struct Config {
     std::uint32_t sniff_size_reg = 8;
     std::uint32_t sniff_tid = 0;
     std::uint32_t sniff_bp_index = 0;
+};
+
+class TargetProcessSession {
+public:
+    ~TargetProcessSession() {
+        stop();
+    }
+
+    bool launch(const std::filesystem::path& exe_path) {
+        if (launched_) {
+            return true;
+        }
+
+        if (exe_path.empty() || !std::filesystem::exists(exe_path)) {
+            return false;
+        }
+
+        std::wstring exe = exe_path.wstring();
+        std::wstring cmd = L"\"" + exe + L"\"";
+        std::vector<wchar_t> cmdline(cmd.begin(), cmd.end());
+        cmdline.push_back(L'\0');
+
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+
+        std::wstring work_dir = exe_path.parent_path().wstring();
+        BOOL ok = CreateProcessW(
+            exe.c_str(),
+            cmdline.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_NEW_PROCESS_GROUP,
+            nullptr,
+            work_dir.empty() ? nullptr : work_dir.c_str(),
+            &si,
+            &pi
+        );
+
+        if (!ok) {
+            return false;
+        }
+
+        CloseHandle(pi.hThread);
+        pi_ = pi;
+        launched_ = true;
+        return true;
+    }
+
+    void stop() {
+        if (!launched_) {
+            return;
+        }
+
+        if (pi_.hProcess) {
+            DWORD exit_code = 0;
+            if (GetExitCodeProcess(pi_.hProcess, &exit_code) && exit_code == STILL_ACTIVE) {
+                TerminateProcess(pi_.hProcess, 0);
+                WaitForSingleObject(pi_.hProcess, 3000);
+            }
+            CloseHandle(pi_.hProcess);
+            pi_.hProcess = nullptr;
+        }
+
+        launched_ = false;
+    }
+
+    bool launched() const {
+        return launched_;
+    }
+
+private:
+    PROCESS_INFORMATION pi_{};
+    bool launched_ = false;
 };
 
 struct SocketGuard {
@@ -109,10 +187,62 @@ bool parse_u32(const std::string& s, std::uint32_t& out) {
     return true;
 }
 
+std::filesystem::path find_repo_root() {
+    std::filesystem::path cur = std::filesystem::current_path();
+    while (true) {
+        if (std::filesystem::exists(cur / "CMakeLists.txt") &&
+            std::filesystem::exists(cur / "tools")) {
+            return cur;
+        }
+
+        std::filesystem::path parent = cur.parent_path();
+        if (parent.empty() || parent == cur) {
+            break;
+        }
+        cur = parent;
+    }
+    return {};
+}
+
+std::filesystem::path default_target_exe_path() {
+    std::filesystem::path repo_root = find_repo_root();
+    if (repo_root.empty()) {
+        return {};
+    }
+
+    return repo_root / "tools" / "netlab_target" / "bin" / "Release" / "net8.0" / "win-x64" / "publish" / "NetLabTarget.exe";
+}
+
+bool can_connect_local_tcp(std::uint16_t port) {
+    SocketGuard s;
+    s.s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s.s == INVALID_SOCKET) {
+        return false;
+    }
+
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    InetPtonA(AF_INET, "127.0.0.1", &sa.sin_addr);
+
+    return connect(s.s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0;
+}
+
+bool wait_for_target_ready(std::uint16_t tcp_port, std::chrono::milliseconds timeout) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (can_connect_local_tcp(tcp_port)) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    }
+    return false;
+}
+
 class LocalTrafficHarness {
 public:
-    LocalTrafficHarness(std::uint16_t tcp_port, std::uint16_t udp_port)
-        : tcp_port_(tcp_port), udp_port_(udp_port) {}
+    LocalTrafficHarness(std::uint16_t tcp_port, std::uint16_t udp_port, bool external_target)
+        : tcp_port_(tcp_port), udp_port_(udp_port), external_target_(external_target) {}
 
     ~LocalTrafficHarness() {
         stop();
@@ -120,6 +250,11 @@ public:
 
     bool start() {
         if (running_) {
+            return true;
+        }
+
+        if (external_target_) {
+            running_ = true;
             return true;
         }
 
@@ -134,6 +269,11 @@ public:
 
     void stop() {
         if (!running_) {
+            return;
+        }
+
+        if (external_target_) {
+            running_ = false;
             return;
         }
 
@@ -422,6 +562,7 @@ private:
     std::uint16_t udp_port_;
     std::atomic<bool> stop_flag_{false};
     bool running_ = false;
+    bool external_target_ = false;
     std::thread tcp_thread_;
     std::thread udp_thread_;
 };
@@ -479,6 +620,15 @@ Config parse_args(int argc, char** argv) {
             cfg.pcap_out = argv[++i];
             continue;
         }
+        if (a == "--target-exe" && i + 1 < argc) {
+            cfg.target_exe = argv[++i];
+            continue;
+        }
+        if (a == "--target-pid" && i + 1 < argc) {
+            std::uint32_t v = 0;
+            if (parse_u32(argv[++i], v)) cfg.target_pid = v;
+            continue;
+        }
         if (a == "--non-strict") {
             cfg.strict = false;
             continue;
@@ -526,18 +676,66 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    LocalTrafficHarness harness(7777, 9001);
-    harness.start();
-
     voyager::device_t dev;
     if (!dev.connect()) {
         std::cerr << "Driver connect failed\n";
-        harness.stop();
         WSACleanup();
         return 2;
     }
 
-    dev.set_process_id(GetCurrentProcessId());
+    TargetProcessSession target_process;
+    std::filesystem::path target_exe = cfg.target_exe.empty() ? default_target_exe_path() : std::filesystem::path(cfg.target_exe);
+
+    std::uint32_t target_pid = cfg.target_pid;
+    if (target_pid == 0) {
+        target_pid = dev.find_process("NetLabTarget.exe");
+    }
+
+    if (target_pid == 0) {
+        if (!target_process.launch(target_exe)) {
+            std::error_code ec;
+            std::filesystem::path abs_target = std::filesystem::absolute(target_exe, ec);
+            std::cerr << "Failed to launch NetLabTarget.exe. "
+                << "Use --target-exe <path> or start NetLabTarget.exe manually. "
+                << "Resolved path=" << (ec ? target_exe.string() : abs_target.string()) << "\n";
+            dev.disconnect();
+            WSACleanup();
+            return 4;
+        }
+
+        if (!wait_for_target_ready(7777, std::chrono::seconds(12))) {
+            std::cerr << "NetLabTarget.exe did not become ready on 127.0.0.1:7777\n";
+            dev.disconnect();
+            WSACleanup();
+            return 5;
+        }
+
+        target_pid = dev.find_process("NetLabTarget.exe");
+    }
+
+    if (target_pid == 0) {
+        std::cerr << "Could not resolve target PID for NetLabTarget.exe\n";
+        dev.disconnect();
+        WSACleanup();
+        return 6;
+    }
+
+    if (!wait_for_target_ready(7777, std::chrono::seconds(6))) {
+        std::cerr << "Target process is not accepting TCP traffic on 127.0.0.1:7777\n";
+        dev.disconnect();
+        WSACleanup();
+        return 7;
+    }
+
+    LocalTrafficHarness harness(7777, 9001, true);
+    if (!harness.start()) {
+        std::cerr << "Failed to start traffic harness\n";
+        dev.disconnect();
+        WSACleanup();
+        return 8;
+    }
+
+    dev.set_process_id(target_pid);
 
     std::vector<TestCaseResult> results;
     auto add_result = [&](const std::string& name, Outcome o, const std::string& d) {
@@ -546,13 +744,18 @@ int main(int argc, char** argv) {
     };
 
     std::cout << "Running network driver end-to-end tests...\n";
+    std::cout << "Target process: NetLabTarget.exe pid=" << target_pid;
+    if (target_process.launched()) {
+        std::cout << " launched_at=" << target_exe.string();
+    }
+    std::cout << "\n";
 
     bool generated = harness.generate_all();
     add_result("traffic_baseline", generated ? Outcome::pass : Outcome::fail,
         generated ? "Generated loopback TCP/UDP + DNS + HTTP(S)" : "Traffic generation failed");
 
     {
-        bool start_ok = dev.start_capture(0, 0, 0, nullptr, 1500);
+        bool start_ok = dev.start_capture(target_pid, 0, 0, nullptr, 1500);
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         bool active = false;
         std::uint32_t captured = 0;
@@ -563,10 +766,10 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(400));
 
         auto packets = dev.get_captured_packets(64);
-        auto dns = dev.get_dns_queries(0);
+        auto dns = dev.get_dns_queries(target_pid);
         voyager::device_t::network_stats stats{};
         bool stats_ok = dev.get_network_stats(stats);
-        auto conns = dev.enumerate_connections(0, 0);
+        auto conns = dev.enumerate_connections(target_pid, 0);
 
         bool stop_ok = dev.stop_capture();
 
@@ -593,14 +796,14 @@ int main(int argc, char** argv) {
     }
 
     {
-        auto socks = dev.get_socket_handles(GetCurrentProcessId());
+        auto socks = dev.get_socket_handles(target_pid);
         bool pass = cfg.strict ? !socks.empty() : true;
         add_result("driver_get_socket_handles", pass ? Outcome::pass : Outcome::fail,
             "count=" + std::to_string(socks.size()));
     }
 
     {
-        auto tcps = dev.dump_tcpip_connections(GetCurrentProcessId(), 0);
+        auto tcps = dev.dump_tcpip_connections(target_pid, 0);
         bool pass = cfg.strict ? !tcps.empty() : true;
         add_result("driver_dump_tcpip_connections", pass ? Outcome::pass : Outcome::fail,
             "count=" + std::to_string(tcps.size()));
@@ -608,7 +811,7 @@ int main(int argc, char** argv) {
 
     {
         std::uint32_t rid = 0;
-        bool add_ok = dev.add_filter_rule(1, 2, IPPROTO_TCP, GetCurrentProcessId(), harness.tcp_port(), nullptr, nullptr, &rid);
+        bool add_ok = dev.add_filter_rule(1, 2, IPPROTO_TCP, target_pid, harness.tcp_port(), nullptr, nullptr, &rid);
         bool rm_ok = dev.remove_filter_rule(rid);
         bool clr_ok = dev.clear_filter_rules();
         bool pass = add_ok && rm_ok && clr_ok;
@@ -671,15 +874,15 @@ int main(int argc, char** argv) {
     }
 
     {
-        bool start_ok = dev.stream_reassemble_op(0, 0, harness.tcp_port(), GetCurrentProcessId(), nullptr, nullptr, nullptr, nullptr, nullptr);
+        bool start_ok = dev.stream_reassemble_op(0, 0, harness.tcp_port(), target_pid, nullptr, nullptr, nullptr, nullptr, nullptr);
         harness.generate_tcp(true);
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
         std::vector<std::uint8_t> stream;
         std::uint32_t packets = 0;
         std::uint32_t truncated = 0;
-        bool get_ok = dev.stream_reassemble_op(2, 0, harness.tcp_port(), GetCurrentProcessId(), nullptr, nullptr, &stream, &packets, &truncated);
-        bool stop_ok = dev.stream_reassemble_op(1, 0, harness.tcp_port(), GetCurrentProcessId(), nullptr, nullptr, nullptr, nullptr, nullptr);
+        bool get_ok = dev.stream_reassemble_op(2, 0, harness.tcp_port(), target_pid, nullptr, nullptr, &stream, &packets, &truncated);
+        bool stop_ok = dev.stream_reassemble_op(1, 0, harness.tcp_port(), target_pid, nullptr, nullptr, nullptr, nullptr, nullptr);
 
         bool pass = start_ok && get_ok && stop_ok;
         if (cfg.strict) {
@@ -694,7 +897,7 @@ int main(int argc, char** argv) {
     {
         harness.generate_all();
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        auto dpi = dev.get_dpi_results(0, 0, 0, 0);
+        auto dpi = dev.get_dpi_results(target_pid, 0, 0, 0);
         bool pass = cfg.strict ? !dpi.empty() : true;
 
         std::ostringstream oss;
@@ -709,7 +912,7 @@ int main(int argc, char** argv) {
     }
 
     {
-        bool enable_ok = dev.intercept_op(0, GetCurrentProcessId(), harness.tcp_port(), IPPROTO_TCP, 0, nullptr, 0, nullptr, nullptr);
+        bool enable_ok = dev.intercept_op(0, target_pid, harness.tcp_port(), IPPROTO_TCP, 0, nullptr, 0, nullptr, nullptr);
         harness.generate_tcp();
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
         auto held = dev.get_held_packets();
@@ -736,7 +939,7 @@ int main(int argc, char** argv) {
         if (s != INVALID_SOCKET && local_port != 0) {
             auto loop = ipv4_to_16("127.0.0.1");
             bool kill_ok = dev.kill_connection(IPPROTO_TCP, AF_INET, local_port, harness.tcp_port(),
-                loop.data(), loop.data(), GetCurrentProcessId());
+                loop.data(), loop.data(), 0);
 
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
             char x = 'X';
@@ -780,7 +983,7 @@ int main(int argc, char** argv) {
 
         voyager::device_t::bw_stats stats{};
         bool get_ok = dev.bw_monitor_op(2, 0, &stats);
-        auto procs = dev.get_bw_per_process(GetCurrentProcessId());
+        auto procs = dev.get_bw_per_process(target_pid);
         bool stop_ok = dev.bw_monitor_op(1, 0, nullptr);
         bool reset_ok = dev.bw_monitor_op(3, 0, nullptr);
 
@@ -808,7 +1011,7 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
         voyager::device_t::pcap_export_result out{};
-        bool ok = dev.export_pcap(0, 0, 256, &out);
+        bool ok = dev.export_pcap(target_pid, 0, 256, &out);
         bool write_ok = ok ? write_pcap_file(cfg.pcap_out, out) : false;
 
         bool pass = ok && write_ok;
