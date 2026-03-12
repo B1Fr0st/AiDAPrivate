@@ -26,4 +26,18 @@ namespace functions {
     NTSTATUS handle_spoof_debug_flags(p_spoof_debug request);
     NTSTATUS handle_get_module_export(p_module_export request);
     NTSTATUS handle_virt_to_phys(p_virt_to_phys request);
+
+    // Network capture handlers
+    NTSTATUS handle_net_enum_conn(p_net_enum_conn request);
+    NTSTATUS handle_net_cap_ctrl(p_net_cap_ctrl request);
+    NTSTATUS handle_net_cap_get(p_net_cap_get request);
+    NTSTATUS handle_net_dns_get(p_net_dns_get request);
+    NTSTATUS handle_net_filter_rule(p_net_filter_rule request);
+    NTSTATUS handle_net_stats(p_net_stats request);
+
+    // Advanced network recon handlers
+    NTSTATUS handle_wfp_callout_enum(p_wfp_callout_enum request);
+    NTSTATUS handle_socket_handle_enum(p_socket_handle_enum request);
+    NTSTATUS handle_sniff_net_buffers(p_sniff_net_buffers request);
+    NTSTATUS handle_tcpip_conn_dump(p_tcpip_conn_dump request);
 }

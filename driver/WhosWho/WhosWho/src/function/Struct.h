@@ -296,6 +296,240 @@ typedef struct _V2P {
 } virt_to_phys, * p_virt_to_phys;
 static_assert(sizeof(virt_to_phys) == 24, "virt_to_phys size must be 24 bytes");
 
+
+// ===================== NETWORK INTERCEPTION STRUCTURES =====================
+
+// Network connection entry (IPv4/IPv6 unified)
+typedef struct _NET_CONN_ENTRY {
+    UINT32 pid;
+    UINT32 protocol;          // IPPROTO_TCP=6, IPPROTO_UDP=17
+    UINT32 state;             // TCP state: 0=CLOSED..12=TIME_WAIT
+    UINT32 local_port;
+    UINT32 remote_port;
+    UINT32 address_family;    // AF_INET=2, AF_INET6=23
+    UINT8  local_addr[16];    // IPv4 in first 4 bytes, or full IPv6
+    UINT8  remote_addr[16];
+} NET_CONN_ENTRY, *PNET_CONN_ENTRY;
+static_assert(sizeof(NET_CONN_ENTRY) == 56, "NET_CONN_ENTRY size must be 56 bytes");
+
+// Connection enumeration request
+#define MAX_NET_CONNECTIONS 1024
+
+typedef struct _NET_ENUM_CONN {
+    UINT32 filter_pid;        // 0 = all processes
+    UINT32 filter_protocol;   // 0 = all, 6=TCP, 17=UDP
+    UINT32 connection_count;
+    UINT32 padding;
+    NET_CONN_ENTRY entries[MAX_NET_CONNECTIONS];
+} net_enum_conn, *p_net_enum_conn;
+static_assert(sizeof(net_enum_conn) == 16 + sizeof(NET_CONN_ENTRY) * MAX_NET_CONNECTIONS,
+    "net_enum_conn size check");
+
+// Packet capture control
+typedef struct _NET_CAP_CTRL {
+    UINT32 operation;         // 0=start, 1=stop, 2=query_status
+    UINT32 filter_pid;        // 0 = capture all
+    UINT32 filter_port;       // 0 = all ports
+    UINT32 filter_protocol;   // 0 = all, 6=TCP, 17=UDP
+    UINT8  filter_ip[16];     // 0 = all IPs, otherwise match remote IP
+    UINT32 max_packet_bytes;  // max payload per packet to capture (default 1500)
+    UINT32 capture_active;    // output: 1 if capture is running
+    UINT32 packets_captured;  // output: total packets captured since start
+    UINT32 packets_dropped;   // output: packets dropped (ring buffer full)
+} net_cap_ctrl, *p_net_cap_ctrl;
+static_assert(sizeof(net_cap_ctrl) == 48, "net_cap_ctrl size must be 48 bytes");
+
+// Single captured packet
+#define NET_PKT_MAX_PAYLOAD 1500
+
+typedef struct _NET_PACKET_ENTRY {
+    UINT64 timestamp;         // KeQuerySystemTime value
+    UINT32 pid;
+    UINT32 protocol;          // 6=TCP, 17=UDP
+    UINT32 direction;         // 0=inbound, 1=outbound
+    UINT32 payload_size;      // actual captured payload bytes
+    UINT32 local_port;
+    UINT32 remote_port;
+    UINT32 address_family;    // AF_INET=2, AF_INET6=23
+    UINT32 padding;
+    UINT8  local_addr[16];
+    UINT8  remote_addr[16];
+    UINT8  payload[NET_PKT_MAX_PAYLOAD];
+    UINT8  pad_payload[4];    // alignment padding
+} NET_PACKET_ENTRY, *PNET_PACKET_ENTRY;
+static_assert(sizeof(NET_PACKET_ENTRY) == 1576, "NET_PACKET_ENTRY size must be 1576 bytes");
+
+// Packet retrieval request
+#define NET_CAP_GET_MAX 32
+
+typedef struct _NET_CAP_GET {
+    UINT32 max_packets;       // input: how many to retrieve (max NET_CAP_GET_MAX)
+    UINT32 packet_count;      // output: how many returned
+    NET_PACKET_ENTRY packets[NET_CAP_GET_MAX];
+} net_cap_get, *p_net_cap_get;
+static_assert(sizeof(net_cap_get) == 8 + sizeof(NET_PACKET_ENTRY) * NET_CAP_GET_MAX,
+    "net_cap_get size check");
+
+// DNS query log entry
+typedef struct _NET_DNS_ENTRY {
+    UINT64 timestamp;
+    UINT32 pid;
+    UINT32 query_type;        // A=1, AAAA=28, CNAME=5, MX=15, etc.
+    char   domain[260];       // null-terminated domain name
+    UINT8  resolved_addr[16]; // resolved address (if available)
+    UINT32 ttl;
+    UINT32 response_code;     // 0=NOERROR, 3=NXDOMAIN, etc.
+} NET_DNS_ENTRY, *PNET_DNS_ENTRY;
+static_assert(sizeof(NET_DNS_ENTRY) == 304, "NET_DNS_ENTRY size must be 304 bytes");
+
+#define NET_DNS_GET_MAX 64
+
+typedef struct _NET_DNS_GET {
+    UINT32 filter_pid;        // 0 = all
+    UINT32 entry_count;       // output
+    NET_DNS_ENTRY entries[NET_DNS_GET_MAX];
+} net_dns_get, *p_net_dns_get;
+static_assert(sizeof(net_dns_get) == 8 + sizeof(NET_DNS_ENTRY) * NET_DNS_GET_MAX,
+    "net_dns_get size check");
+
+// Packet filter/firewall rule
+typedef struct _NET_FILTER_RULE {
+    UINT32 rule_id;           // output on add, input on remove
+    UINT32 action;            // 0=allow, 1=block, 2=log_only
+    UINT32 direction;         // 0=inbound, 1=outbound, 2=both
+    UINT32 protocol;          // 0=all, 6=TCP, 17=UDP
+    UINT32 pid;               // 0=all processes
+    UINT32 port;              // 0=all ports
+    UINT8  ip_addr[16];       // 0=all IPs
+    UINT8  ip_mask[16];       // subnet mask (0xFF..FF = exact match)
+    UINT32 operation;         // 0=add, 1=remove, 2=clear_all, 3=list
+    UINT32 rule_count;        // output: number of active rules
+} net_filter_rule, *p_net_filter_rule;
+static_assert(sizeof(net_filter_rule) == 64, "net_filter_rule size must be 64 bytes");
+
+// Network statistics
+typedef struct _NET_STATS {
+    UINT32 filter_pid;        // input: 0 = global stats
+    UINT32 padding;
+    UINT64 bytes_sent;
+    UINT64 bytes_received;
+    UINT64 packets_sent;
+    UINT64 packets_received;
+    UINT32 active_connections;
+    UINT32 capture_active;
+    UINT32 total_captured;
+    UINT32 total_dropped;
+    UINT32 total_dns_logged;
+    UINT32 active_filter_rules;
+} net_stats, *p_net_stats;
+static_assert(sizeof(net_stats) == 64, "net_stats size must be 64 bytes");
+
+// ============================================================
+// Advanced network recon structures (Ring 0 tools)
+// ============================================================
+
+// WFP callout entry — one registered callout in the system
+#define MAX_WFP_CALLOUTS 256
+
+typedef struct _WFP_CALLOUT_ENTRY {
+    UINT64 classify_fn;         // kernel VA of classifyFn callback
+    UINT64 notify_fn;           // kernel VA of notifyFn callback
+    UINT64 flow_delete_fn;      // kernel VA of flowDeleteFn callback
+    UINT64 owning_module_base;  // base of the module that owns this callout
+    UINT32 callout_id;          // FWPS callout ID
+    UINT32 layer_id;            // WFP layer this callout is registered on
+    UINT32 flags;               // callout flags
+    UINT32 padding0;
+    GUID   callout_key;         // GUID of the callout
+    GUID   applicable_layer;    // GUID of the applicable layer
+    char   owning_module[64];   // driver name string (e.g. "EasyAntiCheat_EOS.sys")
+} WFP_CALLOUT_ENTRY, *PWFP_CALLOUT_ENTRY;
+static_assert(sizeof(WFP_CALLOUT_ENTRY) == 144, "WFP_CALLOUT_ENTRY size check");
+
+typedef struct _WFP_CALLOUT_ENUM {
+    char   filter_module[64];   // input: empty = all, or substring match
+    UINT32 callout_count;       // output: entries filled
+    UINT32 padding;
+    WFP_CALLOUT_ENTRY entries[MAX_WFP_CALLOUTS];
+} wfp_callout_enum, *p_wfp_callout_enum;
+
+// Socket handle entry — AFD object from handle table walk
+#define MAX_SOCKET_HANDLES 512
+
+typedef struct _SOCKET_HANDLE_ENTRY {
+    UINT64 handle_value;        // actual handle value
+    UINT64 afd_endpoint_addr;   // kernel VA of AFD_ENDPOINT object
+    UINT32 pid;
+    UINT32 protocol;            // 6=TCP, 17=UDP
+    UINT32 state;               // TCP state
+    UINT32 local_port;
+    UINT32 remote_port;
+    UINT32 address_family;      // AF_INET=2, AF_INET6=23
+    UINT8  local_addr[16];
+    UINT8  remote_addr[16];
+} SOCKET_HANDLE_ENTRY, *PSOCKET_HANDLE_ENTRY;
+static_assert(sizeof(SOCKET_HANDLE_ENTRY) == 72, "SOCKET_HANDLE_ENTRY size check");
+
+typedef struct _SOCKET_HANDLE_ENUM {
+    UINT32 target_pid;          // input: PID to walk (0 = attached process)
+    UINT32 socket_count;        // output: entries filled
+    SOCKET_HANDLE_ENTRY entries[MAX_SOCKET_HANDLES];
+} socket_handle_enum, *p_socket_handle_enum;
+
+// Network buffer sniff request — uses HW breakpoints to capture plaintext
+#define SNIFF_MAX_CAPTURES 16
+#define SNIFF_MAX_BUF_SIZE 2048
+
+typedef struct _SNIFF_CAPTURE {
+    UINT64 timestamp;
+    UINT64 thread_id;
+    UINT32 buffer_size;
+    UINT32 padding;
+    UINT8  buffer[SNIFF_MAX_BUF_SIZE];
+} SNIFF_CAPTURE, *PSNIFF_CAPTURE;
+static_assert(sizeof(SNIFF_CAPTURE) == 2072, "SNIFF_CAPTURE size check");
+
+typedef struct _SNIFF_NET_BUFFERS {
+    UINT64 target_address;      // input: address to breakpoint (send/recv/encrypt)
+    UINT32 buffer_reg_index;    // input: register index containing buffer ptr (0=rax..15=r15)
+    UINT32 size_reg_index;      // input: register index containing size (0=rax..15=r15)
+    UINT32 max_captures;        // input: how many to capture before removing BP
+    UINT32 operation;           // 0=start, 1=stop, 2=get_results
+    UINT32 capture_count;       // output: captures filled
+    UINT32 active;              // output: 1 if sniff is active
+    UINT32 target_tid;          // input: thread ID (0 = first thread of attached process)
+    UINT32 bp_index;            // input: DR index to use (0-3)
+    SNIFF_CAPTURE captures[SNIFF_MAX_CAPTURES];
+} sniff_net_buffers, *p_sniff_net_buffers;
+
+// tcpip.sys direct connection dump
+#define MAX_TCPIP_CONNECTIONS 1024
+
+typedef struct _TCPIP_CONN_ENTRY {
+    UINT64 tcb_address;         // kernel VA of TCP Control Block / UDP endpoint
+    UINT64 owning_module_base;  // base of the owning module (for AF_UNIX etc.)
+    UINT32 pid;
+    UINT32 protocol;            // 6=TCP, 17=UDP, 1=ICMP
+    UINT32 state;               // TCP state
+    UINT32 local_port;
+    UINT32 remote_port;
+    UINT32 address_family;
+    UINT8  local_addr[16];
+    UINT8  remote_addr[16];
+    UINT64 create_time;         // connection creation timestamp
+    UINT64 bytes_in;            // bytes received on this connection
+    UINT64 bytes_out;           // bytes sent on this connection
+} TCPIP_CONN_ENTRY, *PTCPIP_CONN_ENTRY;
+static_assert(sizeof(TCPIP_CONN_ENTRY) == 96, "TCPIP_CONN_ENTRY size check");
+
+typedef struct _TCPIP_CONN_DUMP {
+    UINT32 target_pid;          // input: 0 = all
+    UINT32 filter_protocol;     // input: 0 = all, 6=TCP, 17=UDP
+    UINT32 connection_count;    // output: entries filled
+    UINT32 padding;
+    TCPIP_CONN_ENTRY entries[MAX_TCPIP_CONNECTIONS];
+} tcpip_conn_dump, *p_tcpip_conn_dump;
+
 #pragma pack(pop)
 
 #define DTB_CACHE_SIZE 32

@@ -15520,6 +15520,297 @@ tool_result_t driver_get_deferred_results(const json& params)
         OBFSTR("Deferred action #") + std::to_string(id) + OBFSTR(": ") + status_str, result);
 }
 
+// ============================================================
+// Advanced network recon tool handlers
+// ============================================================
+
+static std::string format_recon_ip(const std::uint8_t* addr, std::uint32_t af) {
+    char buf[64] = {};
+    if (af == 23) {
+        qsnprintf(buf, sizeof(buf), "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
+            addr[8], addr[9], addr[10], addr[11], addr[12], addr[13], addr[14], addr[15]);
+    } else {
+        qsnprintf(buf, sizeof(buf), "%u.%u.%u.%u", addr[0], addr[1], addr[2], addr[3]);
+    }
+    return buf;
+}
+
+static const char* tcp_state_str(std::uint32_t state) {
+    static const char* names[] = {
+        "CLOSED", "LISTEN", "SYN_SENT", "SYN_RCVD", "ESTABLISHED",
+        "FIN_WAIT1", "FIN_WAIT2", "CLOSE_WAIT", "CLOSING", "LAST_ACK",
+        "TIME_WAIT", "DELETE_TCB"
+    };
+    if (state < 12) return names[state];
+    return "UNKNOWN";
+}
+
+static std::string reg_index_to_name(std::uint32_t idx) {
+    static const char* names[] = {
+        "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"
+    };
+    if (idx < 16) return names[idx];
+    return "reg" + std::to_string(idx);
+}
+
+tool_result_t driver_enumerate_wfp_callouts(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+
+    std::string filter;
+    if (params.contains("filter_module"))
+        filter = params["filter_module"].get<std::string>();
+
+    auto callouts = device->enumerate_wfp_callouts(filter);
+    if (callouts.empty())
+        return tool_result_t::ok(OBFSTR("No WFP callouts found"), json::object());
+
+    json result;
+    result["count"] = callouts.size();
+    json arr = json::array();
+    for (const auto& c : callouts) {
+        json entry;
+        entry["callout_id"] = c.callout_id;
+        entry["callout_key"] = c.callout_key_str;
+        entry["applicable_layer"] = c.applicable_layer_str;
+        entry["flags"] = c.flags;
+        entry["owning_module"] = c.owning_module;
+        if (c.classify_fn != 0)
+            entry["classify_fn"] = helpers::format_address(static_cast<ea_t>(c.classify_fn));
+        if (c.notify_fn != 0)
+            entry["notify_fn"] = helpers::format_address(static_cast<ea_t>(c.notify_fn));
+        if (c.flow_delete_fn != 0)
+            entry["flow_delete_fn"] = helpers::format_address(static_cast<ea_t>(c.flow_delete_fn));
+        if (c.owning_module_base != 0)
+            entry["module_base"] = helpers::format_address(static_cast<ea_t>(c.owning_module_base));
+        arr.push_back(std::move(entry));
+    }
+    result["callouts"] = std::move(arr);
+
+    return tool_result_t::ok(
+        OBFSTR("Found ") + std::to_string(callouts.size()) + OBFSTR(" WFP callout(s)"), result);
+}
+
+tool_result_t driver_get_socket_handles(const json& params)
+{
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
+
+    std::uint32_t target_pid = 0;
+    if (params.contains("target_pid"))
+        target_pid = params["target_pid"].get<std::uint32_t>();
+
+    auto sockets = device->get_socket_handles(target_pid);
+    if (sockets.empty())
+        return tool_result_t::ok(OBFSTR("No AFD socket handles found"), json::object());
+
+    json result;
+    result["count"] = sockets.size();
+    json arr = json::array();
+    for (const auto& s : sockets) {
+        json entry;
+        entry["handle"] = helpers::format_address(static_cast<ea_t>(s.handle_value));
+        entry["afd_endpoint"] = helpers::format_address(static_cast<ea_t>(s.afd_endpoint_addr));
+        entry["pid"] = s.pid;
+        entry["protocol"] = (s.protocol == 6) ? "TCP" : (s.protocol == 17) ? "UDP" : std::to_string(s.protocol);
+        entry["state"] = tcp_state_str(s.state);
+        entry["address_family"] = (s.address_family == 2) ? "IPv4" : (s.address_family == 23) ? "IPv6" : "unknown";
+        entry["local"] = format_recon_ip(s.local_addr, s.address_family) + ":" + std::to_string(s.local_port);
+        entry["remote"] = format_recon_ip(s.remote_addr, s.address_family) + ":" + std::to_string(s.remote_port);
+        arr.push_back(std::move(entry));
+    }
+    result["sockets"] = std::move(arr);
+
+    return tool_result_t::ok(
+        OBFSTR("Found ") + std::to_string(sockets.size()) + OBFSTR(" socket handle(s)"), result);
+}
+
+tool_result_t driver_sniff_network_buffers(const json& params)
+{
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
+
+    // Determine operation from parameters
+    if (params.contains("operation")) {
+        std::string op = params["operation"].get<std::string>();
+
+        if (op == "stop") {
+            if (!device->sniff_net_buffers_stop())
+                return tool_result_t::error(OBFSTR("Failed to stop sniff session"));
+            return tool_result_t::ok(OBFSTR("Sniff session stopped"), json::object());
+        }
+        if (op == "get" || op == "results") {
+            bool active = false;
+            auto captures = device->sniff_net_buffers_get(active);
+
+            json result;
+            result["active"] = active;
+            result["capture_count"] = captures.size();
+            json arr = json::array();
+            for (const auto& cap : captures) {
+                json c;
+                c["timestamp"] = cap.timestamp;
+                c["thread_id"] = helpers::format_address(static_cast<ea_t>(cap.thread_id));
+                c["size"] = cap.buffer.size();
+
+                // Hex dump first 256 bytes
+                std::string hex;
+                std::size_t show = (cap.buffer.size() < 256) ? cap.buffer.size() : 256;
+                for (std::size_t i = 0; i < show; i++) {
+                    char hb[4];
+                    qsnprintf(hb, sizeof(hb), "%02X ", cap.buffer[i]);
+                    hex += hb;
+                    if ((i + 1) % 16 == 0) hex += "\n";
+                }
+                if (show < cap.buffer.size())
+                    hex += "... (" + std::to_string(cap.buffer.size() - show) + " more)";
+                c["hex_dump"] = hex;
+
+                // ASCII extraction
+                std::string ascii;
+                for (std::size_t i = 0; i < show; i++) {
+                    char ch = static_cast<char>(cap.buffer[i]);
+                    ascii += (ch >= 0x20 && ch < 0x7F) ? ch : '.';
+                }
+                c["ascii"] = ascii;
+                arr.push_back(std::move(c));
+            }
+            result["captures"] = std::move(arr);
+
+            return tool_result_t::ok(
+                std::to_string(captures.size()) + OBFSTR(" capture(s) retrieved"), result);
+        }
+    }
+
+    // Default: START operation
+    std::uint64_t address = 0;
+    if (params.contains("address"))
+        address = helpers::parse_address(params["address"].get<std::string>()).value_or(0);
+    if (address == 0)
+        return tool_result_t::error(OBFSTR("Address of send/recv/encrypt function required"));
+
+    // Parse register names to indices
+    auto reg_name_to_index = [](const std::string& name) -> std::uint32_t {
+        static const std::pair<const char*, std::uint32_t> regs[] = {
+            {"rax", 0}, {"rcx", 1}, {"rdx", 2}, {"rbx", 3},
+            {"rsp", 4}, {"rbp", 5}, {"rsi", 6}, {"rdi", 7},
+            {"r8", 8}, {"r9", 9}, {"r10", 10}, {"r11", 11},
+            {"r12", 12}, {"r13", 13}, {"r14", 14}, {"r15", 15}
+        };
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        for (const auto& [n, i] : regs)
+            if (lower == n) return i;
+        return 0;
+    };
+
+    std::uint32_t buf_reg = 1;  // default: rcx (first arg in Windows x64)
+    if (params.contains("buffer_register"))
+        buf_reg = reg_name_to_index(params["buffer_register"].get<std::string>());
+
+    std::uint32_t size_reg = 2; // default: rdx
+    if (params.contains("size_register"))
+        size_reg = reg_name_to_index(params["size_register"].get<std::string>());
+
+    std::uint32_t max_packets = params.value("max_packets", 1);
+    if (max_packets > 16) max_packets = 16;
+
+    std::uint32_t tid = 0;
+    if (params.contains("tid"))
+        tid = params["tid"].get<std::uint32_t>();
+
+    std::uint32_t bp_index = params.value("bp_index", 0);
+    if (bp_index > 3) bp_index = 0;
+
+    if (!device->sniff_net_buffers_start(address, buf_reg, size_reg, max_packets, tid, bp_index))
+        return tool_result_t::error(OBFSTR("Failed to start sniff session"));
+
+    json result;
+    result["status"] = "started";
+    result["target_address"] = helpers::format_address(static_cast<ea_t>(address));
+    result["buffer_register"] = reg_index_to_name(buf_reg);
+    result["size_register"] = reg_index_to_name(size_reg);
+    result["max_captures"] = max_packets;
+    result["bp_index"] = bp_index;
+    result["note"] = OBFSTR("Sniff session initialized. The HW breakpoint must be set separately via "
+        "driver_set_hw_breakpoint on the target address. Then poll with operation='get' to retrieve captures. "
+        "After each BP hit, read the buffer from memory using driver_read_memory at the register value, "
+        "then call this tool with operation='store' to record it.");
+
+    return tool_result_t::ok(OBFSTR("Sniff session started"), result);
+}
+
+tool_result_t driver_dump_tcpip_connections(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected"));
+
+    std::uint32_t target_pid = 0;
+    if (params.contains("target_pid"))
+        target_pid = params["target_pid"].get<std::uint32_t>();
+
+    std::uint32_t filter_proto = 0;
+    if (params.contains("filter_protocol")) {
+        auto& fp = params["filter_protocol"];
+        if (fp.is_number()) {
+            filter_proto = fp.get<std::uint32_t>();
+        } else if (fp.is_string()) {
+            std::string s = fp.get<std::string>();
+            std::transform(s.begin(), s.end(), s.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (s == "tcp") filter_proto = 6;
+            else if (s == "udp") filter_proto = 17;
+        }
+    }
+
+    auto connections = device->dump_tcpip_connections(target_pid, filter_proto);
+    if (connections.empty())
+        return tool_result_t::ok(OBFSTR("No connections found"), json::object());
+
+    json result;
+    result["count"] = connections.size();
+    if (target_pid != 0) result["filtered_pid"] = target_pid;
+
+    // Group by protocol
+    std::uint32_t tcp_count = 0, udp_count = 0;
+    json arr = json::array();
+    for (const auto& c : connections) {
+        json entry;
+        entry["pid"] = c.pid;
+        entry["protocol"] = (c.protocol == 6) ? "TCP" : (c.protocol == 17) ? "UDP" : std::to_string(c.protocol);
+        entry["state"] = tcp_state_str(c.state);
+        entry["local"] = format_recon_ip(c.local_addr, c.address_family) + ":" + std::to_string(c.local_port);
+        entry["remote"] = format_recon_ip(c.remote_addr, c.address_family) + ":" + std::to_string(c.remote_port);
+        entry["address_family"] = (c.address_family == 2) ? "IPv4" : "IPv6";
+
+        if (c.create_time != 0)
+            entry["create_time"] = c.create_time;
+        if (c.tcb_address != 0)
+            entry["tcb_address"] = helpers::format_address(static_cast<ea_t>(c.tcb_address));
+        if (c.bytes_in != 0 || c.bytes_out != 0) {
+            entry["bytes_in"] = c.bytes_in;
+            entry["bytes_out"] = c.bytes_out;
+        }
+
+        if (c.protocol == 6) tcp_count++;
+        else if (c.protocol == 17) udp_count++;
+
+        arr.push_back(std::move(entry));
+    }
+    result["connections"] = std::move(arr);
+    result["tcp_count"] = tcp_count;
+    result["udp_count"] = udp_count;
+
+    return tool_result_t::ok(
+        OBFSTR("Kernel netstat: ") + std::to_string(connections.size()) +
+        OBFSTR(" connection(s) (") + std::to_string(tcp_count) + OBFSTR(" TCP, ") +
+        std::to_string(udp_count) + OBFSTR(" UDP)"), result);
+}
+
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
@@ -15991,6 +16282,75 @@ void register_tools()
         {{OBFSTR("action_id"), OBFSTR("number"),
           OBFSTR("The action ID returned by driver_defer_action"), true}},
         driver_get_deferred_results, false});
+
+    // ---- Advanced network recon tools ----
+
+    registry.register_tool({
+        OBFSTR("driver_enumerate_wfp_callouts"), OBFSTR("driver"),
+        OBFSTR("Enumerate Windows Filtering Platform (WFP) callouts directly from kernel memory. "
+               "Anti-cheats (EAC/BE/Vanguard), firewalls, and EDRs use WFP to intercept network traffic. "
+               "Returns the owning driver/module name, the callout ID, the callout GUID, and the applicable "
+               "WFP layer GUID, allowing the AI to immediately identify which drivers are inspecting network "
+               "packets and at what layer. Use this to discover hidden network filters installed by anti-cheat "
+               "or EDR software."),
+        {{OBFSTR("filter_module"), OBFSTR("string"),
+          OBFSTR("Optional: filter by driver/module name substring (e.g., 'EasyAntiCheat', 'vgk', 'BEDaisy')"), false}},
+        driver_enumerate_wfp_callouts, true});
+
+    registry.register_tool({
+        OBFSTR("driver_get_socket_handles"), OBFSTR("driver"),
+        OBFSTR("Walk the EPROCESS handle table of the attached process from kernel space, looking exclusively "
+               "for socket objects (\\Device\\Afd). Extracts the local IP/Port, remote IP/Port, and protocol "
+               "(TCP/UDP) directly from the kernel AFD endpoint structure. Completely bypasses user-mode "
+               "rootkits or anti-cheats that hide their network connections from netstat/TCPView. "
+               "Returns the raw handle value and kernel AFD_ENDPOINT address for further analysis."),
+        {{OBFSTR("target_pid"), OBFSTR("number"),
+          OBFSTR("Optional: PID to examine (default: attached process)"), false}},
+        driver_get_socket_handles, true});
+
+    registry.register_tool({
+        OBFSTR("driver_sniff_network_buffers"), OBFSTR("driver"),
+        OBFSTR("Manage a kernel-level network buffer sniff session that works with hardware breakpoints to "
+               "capture plaintext network buffers in memory BEFORE encryption. Wireshark only sees encrypted "
+               "payloads; this tool captures the data before it reaches ws2_32.dll!send, "
+               "afd.sys!AfdFastIoDeviceControl, or a custom game/malware encryption function.\n\n"
+               "Workflow:\n"
+               "1. Call with address + buffer_register + size_register to START session\n"
+               "2. Set HW breakpoint on the address via driver_set_hw_breakpoint\n"
+               "3. When BP fires, read thread context, read buffer from memory, call with operation='store'\n"
+               "4. Call with operation='get' to retrieve all captured buffers\n"
+               "5. Call with operation='stop' when done\n\n"
+               "This is a composite tool that coordinates with driver_set_hw_breakpoint and driver_read_memory."),
+        {{OBFSTR("address"), OBFSTR("string"),
+          OBFSTR("Address of the send/recv/encrypt function (for 'start' operation)"), false},
+         {OBFSTR("buffer_register"), OBFSTR("string"),
+          OBFSTR("Register containing the buffer pointer (e.g., 'rcx', 'rdx', 'r8')"), false},
+         {OBFSTR("size_register"), OBFSTR("string"),
+          OBFSTR("Register containing the buffer size (e.g., 'rdx', 'r8', 'r9')"), false},
+         {OBFSTR("max_packets"), OBFSTR("number"),
+          OBFSTR("Max captures before auto-stop (default 1, max 16)"), false},
+         {OBFSTR("operation"), OBFSTR("string"),
+          OBFSTR("'start' (default), 'stop', 'get'/'results'"), false, {},
+          {OBFSTR("start"), OBFSTR("stop"), OBFSTR("get"), OBFSTR("results")}},
+         {OBFSTR("tid"), OBFSTR("number"),
+          OBFSTR("Thread ID for breakpoint (default: 0 = first thread)"), false},
+         {OBFSTR("bp_index"), OBFSTR("number"),
+          OBFSTR("Debug register index 0-3 (default: 0)"), false}},
+        driver_sniff_network_buffers, false});
+
+    registry.register_tool({
+        OBFSTR("driver_dump_tcpip_connections"), OBFSTR("driver"),
+        OBFSTR("Read the internal TCP/UDP connection tables directly from tcpip.sys/netio.sys memory via NSI. "
+               "Functions as a 'kernel netstat' that cannot be lied to by user-mode hooks. "
+               "Returns ALL active connections with states, process IDs, creation timestamps, and byte counters. "
+               "Includes both established connections and listeners. "
+               "Unlike the network_enumerate_connections tool, this uses direct kernel NSI enumeration "
+               "(NsiEnumerateObjectsAllParameters) and includes TCP listeners and creation timestamps."),
+        {{OBFSTR("target_pid"), OBFSTR("number"),
+          OBFSTR("Optional: Only return connections for this PID (0 = all)"), false},
+         {OBFSTR("filter_protocol"), OBFSTR("string"),
+          OBFSTR("Optional: 'tcp', 'udp', or protocol number (0 = all)"), false}},
+        driver_dump_tcpip_connections, true});
 }
 
 }
@@ -16574,6 +16934,638 @@ void register_tools()
 
 }
 
+// ============================================================
+// Network capture / interception tools
+// ============================================================
+
+namespace network_tools
+{
+
+using json = nlohmann::json;
+
+static std::string format_ip(const std::uint8_t* addr, std::uint32_t af) {
+    char buf[64] = {};
+    if (af == 23) { // AF_INET6
+        qsnprintf(buf, sizeof(buf), "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
+            addr[8], addr[9], addr[10], addr[11], addr[12], addr[13], addr[14], addr[15]);
+    } else {
+        qsnprintf(buf, sizeof(buf), "%u.%u.%u.%u", addr[0], addr[1], addr[2], addr[3]);
+    }
+    return buf;
+}
+
+static bool parse_ipv4(const std::string& s, std::uint8_t* out) {
+    unsigned a, b, c, d;
+    if (sscanf(s.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return false;
+    if (a > 255 || b > 255 || c > 255 || d > 255) return false;
+    out[0] = (std::uint8_t)a; out[1] = (std::uint8_t)b;
+    out[2] = (std::uint8_t)c; out[3] = (std::uint8_t)d;
+    return true;
+}
+
+static std::string protocol_name(std::uint32_t proto) {
+    switch (proto) {
+        case 6: return "TCP";
+        case 17: return "UDP";
+        case 1: return "ICMP";
+        default: return std::to_string(proto);
+    }
+}
+
+static std::string tcp_state_name(std::uint32_t state) {
+    switch (state) {
+        case 0: return "CLOSED";
+        case 1: return "LISTEN";
+        case 2: return "SYN_SENT";
+        case 3: return "SYN_RCVD";
+        case 4: return "ESTABLISHED";
+        case 5: return "FIN_WAIT1";
+        case 6: return "FIN_WAIT2";
+        case 7: return "CLOSE_WAIT";
+        case 8: return "CLOSING";
+        case 9: return "LAST_ACK";
+        case 10: return "TIME_WAIT";
+        case 11: return "DELETE_TCB";
+        default: return std::to_string(state);
+    }
+}
+
+static std::string direction_name(std::uint32_t dir) {
+    return dir == 0 ? "INBOUND" : "OUTBOUND";
+}
+
+static std::string hex_dump(const std::uint8_t* data, std::size_t len, std::size_t max_bytes = 256) {
+    std::string result;
+    std::size_t show = (len < max_bytes) ? len : max_bytes;
+    for (std::size_t i = 0; i < show; i++) {
+        char hex[4];
+        qsnprintf(hex, sizeof(hex), "%02X ", data[i]);
+        result += hex;
+        if ((i + 1) % 16 == 0) result += "\n";
+    }
+    if (show < len) result += "... (" + std::to_string(len - show) + " more bytes)";
+    return result;
+}
+
+static std::string extract_ascii(const std::uint8_t* data, std::size_t len, std::size_t max_chars = 512) {
+    std::string result;
+    std::size_t show = (len < max_chars) ? len : max_chars;
+    for (std::size_t i = 0; i < show; i++) {
+        result += (data[i] >= 0x20 && data[i] < 0x7F) ? (char)data[i] : '.';
+    }
+    return result;
+}
+
+tool_result_t network_enumerate_connections(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+
+    std::uint32_t filter_pid = 0, filter_protocol = 0;
+    if (params.contains("pid") && params["pid"].is_number())
+        filter_pid = params["pid"].get<std::uint32_t>();
+    if (params.contains("protocol") && params["protocol"].is_string()) {
+        std::string p = params["protocol"].get<std::string>();
+        if (p == "tcp" || p == "TCP") filter_protocol = 6;
+        else if (p == "udp" || p == "UDP") filter_protocol = 17;
+    } else if (params.contains("protocol") && params["protocol"].is_number()) {
+        filter_protocol = params["protocol"].get<std::uint32_t>();
+    }
+
+    auto conns = device->enumerate_connections(filter_pid, filter_protocol);
+
+    json arr = json::array();
+    for (const auto& c : conns) {
+        json entry;
+        entry["pid"] = c.pid;
+        entry["protocol"] = protocol_name(c.protocol);
+        entry["state"] = (c.protocol == 6) ? tcp_state_name(c.state) : "N/A";
+        entry["local_address"] = format_ip(c.local_addr, c.address_family);
+        entry["local_port"] = c.local_port;
+        entry["remote_address"] = format_ip(c.remote_addr, c.address_family);
+        entry["remote_port"] = c.remote_port;
+        arr.push_back(entry);
+    }
+
+    return tool_result_t::ok(
+        std::to_string(conns.size()) + OBFSTR(" active connections found"), arr);
+}
+
+tool_result_t network_start_capture(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+
+    std::uint32_t filter_pid = 0, filter_port = 0, filter_protocol = 0, max_payload = 1500;
+    std::uint8_t filter_ip[16] = {};
+
+    if (params.contains("pid") && params["pid"].is_number())
+        filter_pid = params["pid"].get<std::uint32_t>();
+    if (params.contains("port") && params["port"].is_number())
+        filter_port = params["port"].get<std::uint32_t>();
+    if (params.contains("protocol") && params["protocol"].is_string()) {
+        std::string p = params["protocol"].get<std::string>();
+        if (p == "tcp" || p == "TCP") filter_protocol = 6;
+        else if (p == "udp" || p == "UDP") filter_protocol = 17;
+    } else if (params.contains("protocol") && params["protocol"].is_number()) {
+        filter_protocol = params["protocol"].get<std::uint32_t>();
+    }
+    if (params.contains("ip") && params["ip"].is_string()) {
+        parse_ipv4(params["ip"].get<std::string>(), filter_ip);
+    }
+    if (params.contains("max_payload") && params["max_payload"].is_number())
+        max_payload = params["max_payload"].get<std::uint32_t>();
+
+    bool ok = device->start_capture(filter_pid, filter_port, filter_protocol,
+        filter_ip, max_payload);
+
+    if (!ok)
+        return tool_result_t::error(OBFSTR("Failed to start packet capture. Network subsystem may not be ready."));
+
+    json result;
+    result["capture_active"] = true;
+    if (filter_pid) result["filter_pid"] = filter_pid;
+    if (filter_port) result["filter_port"] = filter_port;
+    if (filter_protocol) result["filter_protocol"] = protocol_name(filter_protocol);
+    if (params.contains("ip")) result["filter_ip"] = params["ip"];
+    result["max_payload"] = max_payload;
+
+    return tool_result_t::ok(OBFSTR("Packet capture started via kernel WFP callouts"), result);
+}
+
+tool_result_t network_stop_capture(const json&)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected."));
+
+    if (!device->stop_capture())
+        return tool_result_t::error(OBFSTR("Failed to stop packet capture."));
+
+    return tool_result_t::ok(OBFSTR("Packet capture stopped"));
+}
+
+tool_result_t network_get_packets(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected."));
+
+    std::uint32_t max_packets = 32;
+    if (params.contains("count") && params["count"].is_number())
+        max_packets = params["count"].get<std::uint32_t>();
+    if (max_packets > 32) max_packets = 32;
+
+    auto packets = device->get_captured_packets(max_packets);
+
+    json arr = json::array();
+    for (const auto& p : packets) {
+        json entry;
+        entry["timestamp"] = p.timestamp;
+        entry["pid"] = p.pid;
+        entry["protocol"] = protocol_name(p.protocol);
+        entry["direction"] = direction_name(p.direction);
+        entry["local_address"] = format_ip(p.local_addr, p.address_family);
+        entry["local_port"] = p.local_port;
+        entry["remote_address"] = format_ip(p.remote_addr, p.address_family);
+        entry["remote_port"] = p.remote_port;
+        entry["payload_size"] = p.payload_size;
+        if (!p.payload.empty()) {
+            entry["hex_dump"] = hex_dump(p.payload.data(), p.payload.size());
+            entry["ascii"] = extract_ascii(p.payload.data(), p.payload.size());
+        }
+        arr.push_back(entry);
+    }
+
+    return tool_result_t::ok(
+        std::to_string(packets.size()) + OBFSTR(" packets retrieved"), arr);
+}
+
+tool_result_t network_analyze_packet(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected."));
+
+    // Get one packet and provide deep analysis
+    auto packets = device->get_captured_packets(1);
+    if (packets.empty())
+        return tool_result_t::error(OBFSTR("No packets available. Start capture first."));
+
+    const auto& p = packets[0];
+    json result;
+    result["timestamp"] = p.timestamp;
+    result["pid"] = p.pid;
+    result["protocol"] = protocol_name(p.protocol);
+    result["direction"] = direction_name(p.direction);
+    result["src"] = format_ip(p.direction == 0 ? p.remote_addr : p.local_addr, p.address_family)
+                    + ":" + std::to_string(p.direction == 0 ? p.remote_port : p.local_port);
+    result["dst"] = format_ip(p.direction == 0 ? p.local_addr : p.remote_addr, p.address_family)
+                    + ":" + std::to_string(p.direction == 0 ? p.local_port : p.remote_port);
+    result["payload_size"] = p.payload_size;
+
+    if (!p.payload.empty()) {
+        result["hex_dump"] = hex_dump(p.payload.data(), p.payload.size(), 512);
+        result["ascii_render"] = extract_ascii(p.payload.data(), p.payload.size());
+
+        // Try to detect protocol
+        if (p.payload.size() >= 4) {
+            std::string first4((const char*)p.payload.data(), std::min(p.payload.size(), (std::size_t)4));
+            if (first4 == "GET " || first4 == "POST" || first4 == "HEAD" || first4 == "PUT " ||
+                first4 == "DELE" || first4 == "HTTP") {
+                result["detected_protocol"] = "HTTP";
+                std::string http_text((const char*)p.payload.data(), p.payload.size());
+                result["http_content"] = http_text;
+            } else if (p.payload.size() >= 5 && p.payload[0] == 0x16 && p.payload[1] == 0x03) {
+                result["detected_protocol"] = "TLS";
+                std::uint8_t tls_ver_major = p.payload[1];
+                std::uint8_t tls_ver_minor = p.payload[2];
+                result["tls_version"] = std::to_string(tls_ver_major) + "." + std::to_string(tls_ver_minor);
+                std::uint8_t content_type = p.payload[0];
+                result["tls_content_type"] = content_type == 0x16 ? "Handshake" :
+                    content_type == 0x17 ? "Application Data" :
+                    content_type == 0x15 ? "Alert" : std::to_string(content_type);
+            } else if (p.remote_port == 53 || p.local_port == 53) {
+                result["detected_protocol"] = "DNS";
+            }
+        }
+    }
+
+    return tool_result_t::ok(OBFSTR("Packet analysis complete"), result);
+}
+
+tool_result_t network_dns_log(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected."));
+
+    std::uint32_t filter_pid = 0;
+    if (params.contains("pid") && params["pid"].is_number())
+        filter_pid = params["pid"].get<std::uint32_t>();
+
+    auto entries = device->get_dns_queries(filter_pid);
+
+    json arr = json::array();
+    for (const auto& e : entries) {
+        json entry;
+        entry["timestamp"] = e.timestamp;
+        entry["pid"] = e.pid;
+        entry["domain"] = e.domain;
+        entry["query_type"] = e.query_type;
+        entry["response_code"] = e.response_code;
+        entry["ttl"] = e.ttl;
+
+        bool has_addr = false;
+        for (int i = 0; i < 16; i++) if (e.resolved_addr[i]) { has_addr = true; break; }
+        if (has_addr) {
+            entry["resolved_address"] = format_ip(e.resolved_addr, (e.query_type == 28) ? 23u : 2u);
+        }
+
+        // DNS query type names
+        switch (e.query_type) {
+            case 1: entry["type_name"] = "A"; break;
+            case 28: entry["type_name"] = "AAAA"; break;
+            case 5: entry["type_name"] = "CNAME"; break;
+            case 15: entry["type_name"] = "MX"; break;
+            case 2: entry["type_name"] = "NS"; break;
+            case 12: entry["type_name"] = "PTR"; break;
+            case 16: entry["type_name"] = "TXT"; break;
+            case 6: entry["type_name"] = "SOA"; break;
+            case 33: entry["type_name"] = "SRV"; break;
+            default: entry["type_name"] = "Type " + std::to_string(e.query_type); break;
+        }
+
+        arr.push_back(entry);
+    }
+
+    return tool_result_t::ok(
+        std::to_string(entries.size()) + OBFSTR(" DNS entries retrieved"), arr);
+}
+
+tool_result_t network_add_filter(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected."));
+
+    std::uint32_t action = 2; // default: log
+    std::uint32_t direction = 2; // default: both
+    std::uint32_t protocol = 0, pid = 0, port = 0;
+    std::uint8_t ip_addr[16] = {}, ip_mask[16] = {};
+
+    if (params.contains("action") && params["action"].is_string()) {
+        std::string a = params["action"].get<std::string>();
+        if (a == "allow") action = 0;
+        else if (a == "block") action = 1;
+        else if (a == "log") action = 2;
+    }
+    if (params.contains("direction") && params["direction"].is_string()) {
+        std::string d = params["direction"].get<std::string>();
+        if (d == "inbound" || d == "in") direction = 0;
+        else if (d == "outbound" || d == "out") direction = 1;
+        else if (d == "both") direction = 2;
+    }
+    if (params.contains("protocol") && params["protocol"].is_string()) {
+        std::string p = params["protocol"].get<std::string>();
+        if (p == "tcp" || p == "TCP") protocol = 6;
+        else if (p == "udp" || p == "UDP") protocol = 17;
+    } else if (params.contains("protocol") && params["protocol"].is_number()) {
+        protocol = params["protocol"].get<std::uint32_t>();
+    }
+    if (params.contains("pid") && params["pid"].is_number())
+        pid = params["pid"].get<std::uint32_t>();
+    if (params.contains("port") && params["port"].is_number())
+        port = params["port"].get<std::uint32_t>();
+    if (params.contains("ip") && params["ip"].is_string()) {
+        parse_ipv4(params["ip"].get<std::string>(), ip_addr);
+        std::memset(ip_mask, 0xFF, 4);
+    }
+
+    std::uint32_t rule_id = 0;
+    bool ok = device->add_filter_rule(action, direction, protocol, pid, port,
+        ip_addr, ip_mask, &rule_id);
+
+    if (!ok)
+        return tool_result_t::error(OBFSTR("Failed to add filter rule. Rule table may be full."));
+
+    json result;
+    result["rule_id"] = rule_id;
+    result["action"] = (action == 0) ? "allow" : (action == 1) ? "block" : "log";
+    result["direction"] = (direction == 0) ? "inbound" : (direction == 1) ? "outbound" : "both";
+    if (protocol) result["protocol"] = protocol_name(protocol);
+    if (pid) result["pid"] = pid;
+    if (port) result["port"] = port;
+    if (params.contains("ip")) result["ip"] = params["ip"];
+
+    return tool_result_t::ok(OBFSTR("Filter rule added (ID: ") + std::to_string(rule_id) + ")", result);
+}
+
+tool_result_t network_remove_filter(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected."));
+
+    if (!params.contains("rule_id") || !params["rule_id"].is_number())
+        return tool_result_t::error(OBFSTR("Missing required parameter: rule_id"));
+
+    std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
+    if (!device->remove_filter_rule(rule_id))
+        return tool_result_t::error(OBFSTR("Failed to remove filter rule ") + std::to_string(rule_id));
+
+    return tool_result_t::ok(OBFSTR("Filter rule ") + std::to_string(rule_id) + OBFSTR(" removed"));
+}
+
+tool_result_t network_clear_filters(const json&)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected."));
+
+    if (!device->clear_filter_rules())
+        return tool_result_t::error(OBFSTR("Failed to clear filter rules."));
+
+    return tool_result_t::ok(OBFSTR("All filter rules cleared"));
+}
+
+tool_result_t network_stats(const json&)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected."));
+
+    voyager::device_t::network_stats stats{};
+    if (!device->get_network_stats(stats))
+        return tool_result_t::error(OBFSTR("Failed to get network stats."));
+
+    json result;
+    result["bytes_sent"] = stats.bytes_sent;
+    result["bytes_received"] = stats.bytes_received;
+    result["packets_sent"] = stats.packets_sent;
+    result["packets_received"] = stats.packets_received;
+    result["capture_active"] = stats.capture_active != 0;
+    result["total_captured"] = stats.total_captured;
+    result["total_dropped"] = stats.total_dropped;
+    result["total_dns_logged"] = stats.total_dns_logged;
+    result["active_filter_rules"] = stats.active_filter_rules;
+
+    return tool_result_t::ok(OBFSTR("Network statistics"), result);
+}
+
+tool_result_t network_capture_status(const json&)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected."));
+
+    bool active = false;
+    std::uint32_t captured = 0, dropped = 0;
+    if (!device->get_capture_status(active, captured, dropped))
+        return tool_result_t::error(OBFSTR("Failed to get capture status."));
+
+    json result;
+    result["capture_active"] = active;
+    result["packets_captured"] = captured;
+    result["packets_dropped"] = dropped;
+
+    return tool_result_t::ok(active ? OBFSTR("Capture is active") : OBFSTR("Capture is stopped"), result);
+}
+
+tool_result_t network_block_ip(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected."));
+
+    if (!params.contains("ip") || !params["ip"].is_string())
+        return tool_result_t::error(OBFSTR("Missing required parameter: ip (e.g. '192.168.1.1')"));
+
+    std::uint8_t ip[16] = {}, mask[16] = {};
+    if (!parse_ipv4(params["ip"].get<std::string>(), ip))
+        return tool_result_t::error(OBFSTR("Invalid IPv4 address"));
+
+    std::memset(mask, 0xFF, 4);
+
+    std::uint32_t direction = 2;
+    if (params.contains("direction") && params["direction"].is_string()) {
+        std::string d = params["direction"].get<std::string>();
+        if (d == "inbound" || d == "in") direction = 0;
+        else if (d == "outbound" || d == "out") direction = 1;
+    }
+
+    std::uint32_t rule_id = 0;
+    if (!device->add_filter_rule(1, direction, 0, 0, 0, ip, mask, &rule_id))
+        return tool_result_t::error(OBFSTR("Failed to add block rule"));
+
+    json result;
+    result["rule_id"] = rule_id;
+    result["blocked_ip"] = params["ip"];
+    result["direction"] = (direction == 0) ? "inbound" : (direction == 1) ? "outbound" : "both";
+    return tool_result_t::ok(OBFSTR("IP blocked: ") + params["ip"].get<std::string>(), result);
+}
+
+tool_result_t network_block_port(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected."));
+
+    if (!params.contains("port") || !params["port"].is_number())
+        return tool_result_t::error(OBFSTR("Missing required parameter: port"));
+
+    std::uint32_t port = params["port"].get<std::uint32_t>();
+    std::uint32_t protocol = 0;
+    if (params.contains("protocol") && params["protocol"].is_string()) {
+        std::string p = params["protocol"].get<std::string>();
+        if (p == "tcp" || p == "TCP") protocol = 6;
+        else if (p == "udp" || p == "UDP") protocol = 17;
+    }
+
+    std::uint32_t rule_id = 0;
+    if (!device->add_filter_rule(1, 2, protocol, 0, port, nullptr, nullptr, &rule_id))
+        return tool_result_t::error(OBFSTR("Failed to add port block rule"));
+
+    json result;
+    result["rule_id"] = rule_id;
+    result["blocked_port"] = port;
+    if (protocol) result["protocol"] = protocol_name(protocol);
+    return tool_result_t::ok(OBFSTR("Port blocked: ") + std::to_string(port), result);
+}
+
+tool_result_t network_block_process(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected."));
+
+    if (!params.contains("pid") || !params["pid"].is_number())
+        return tool_result_t::error(OBFSTR("Missing required parameter: pid"));
+
+    std::uint32_t pid = params["pid"].get<std::uint32_t>();
+
+    std::uint32_t rule_id = 0;
+    if (!device->add_filter_rule(1, 2, 0, pid, 0, nullptr, nullptr, &rule_id))
+        return tool_result_t::error(OBFSTR("Failed to add process block rule"));
+
+    json result;
+    result["rule_id"] = rule_id;
+    result["blocked_pid"] = pid;
+    return tool_result_t::ok(OBFSTR("All network traffic blocked for PID ") + std::to_string(pid), result);
+}
+
+void register_tools()
+{
+    auto& registry = ToolRegistry::instance();
+
+    registry.register_tool({
+        OBFSTR("network_enumerate_connections"), OBFSTR("network"),
+        OBFSTR("Enumerate all active TCP/UDP connections on the system via kernel driver. "
+               "Returns PID, protocol, state, local/remote addresses and ports. "
+               "Like netstat but kernel-level - invisible to usermode hooks. "
+               "Optionally filter by PID or protocol."),
+        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter connections by process ID"), false},
+         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Filter by protocol: 'tcp' or 'udp'"), false}},
+        network_enumerate_connections, true});
+
+    registry.register_tool({
+        OBFSTR("network_start_capture"), OBFSTR("network"),
+        OBFSTR("Start kernel-level packet capture using WFP (Windows Filtering Platform) callouts. "
+               "Captures all network traffic with process attribution. "
+               "Like Wireshark but running in kernel space with PID-level visibility. "
+               "Optionally filter by PID, port, protocol, or IP address."),
+        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Only capture traffic from this process"), false},
+         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Only capture traffic on this port"), false},
+         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Only capture 'tcp' or 'udp'"), false},
+         {OBFSTR("ip"), OBFSTR("string"), OBFSTR("Only capture traffic to/from this IPv4 address"), false},
+         {OBFSTR("max_payload"), OBFSTR("number"), OBFSTR("Max payload bytes per packet (default 1500)"), false}},
+        network_start_capture, false});
+
+    registry.register_tool({
+        OBFSTR("network_stop_capture"), OBFSTR("network"),
+        OBFSTR("Stop the active kernel packet capture session."),
+        {},
+        network_stop_capture, false});
+
+    registry.register_tool({
+        OBFSTR("network_get_packets"), OBFSTR("network"),
+        OBFSTR("Retrieve captured network packets from the kernel ring buffer. "
+               "Returns up to 32 packets per call with full headers, payload hex dump, "
+               "ASCII render, PID, protocol, direction, and endpoint info. "
+               "Packets are consumed (removed from buffer) after retrieval."),
+        {{OBFSTR("count"), OBFSTR("number"), OBFSTR("Max packets to retrieve (1-32, default 32)"), false}},
+        network_get_packets, true});
+
+    registry.register_tool({
+        OBFSTR("network_analyze_packet"), OBFSTR("network"),
+        OBFSTR("Retrieve and deeply analyze a single captured packet. "
+               "Auto-detects application protocol (HTTP, TLS, DNS), extracts headers, "
+               "provides full hex dump and ASCII render. Like Fiddler's packet inspector."),
+        {},
+        network_analyze_packet, true});
+
+    registry.register_tool({
+        OBFSTR("network_dns_log"), OBFSTR("network"),
+        OBFSTR("Retrieve captured DNS queries and responses from the kernel. "
+               "Shows domain names, query types (A/AAAA/CNAME/MX/etc.), resolved IPs, "
+               "TTLs, and owning PIDs. Requires capture to be active. "
+               "Like a DNS sniffer with process attribution."),
+        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter DNS entries by process ID"), false}},
+        network_dns_log, true});
+
+    registry.register_tool({
+        OBFSTR("network_add_filter"), OBFSTR("network"),
+        OBFSTR("Add a kernel-level network filter rule. Can allow, block, or log traffic "
+               "matching specified criteria. Rules are enforced in the WFP classify callback. "
+               "Like a kernel firewall - operates below all usermode network stacks."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("Rule action: 'allow', 'block', or 'log' (default 'log')"), false},
+         {OBFSTR("direction"), OBFSTR("string"), OBFSTR("'inbound', 'outbound', or 'both' (default 'both')"), false},
+         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("'tcp', 'udp', or omit for all"), false},
+         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Match only this process ID"), false},
+         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Match only this port"), false},
+         {OBFSTR("ip"), OBFSTR("string"), OBFSTR("Match only this IPv4 address"), false}},
+        network_add_filter, false});
+
+    registry.register_tool({
+        OBFSTR("network_remove_filter"), OBFSTR("network"),
+        OBFSTR("Remove a previously added network filter rule by its ID."),
+        {{OBFSTR("rule_id"), OBFSTR("number"), OBFSTR("The rule ID returned when the filter was added"), true}},
+        network_remove_filter, false});
+
+    registry.register_tool({
+        OBFSTR("network_clear_filters"), OBFSTR("network"),
+        OBFSTR("Remove all active network filter rules at once."),
+        {},
+        network_clear_filters, false});
+
+    registry.register_tool({
+        OBFSTR("network_stats"), OBFSTR("network"),
+        OBFSTR("Get comprehensive kernel-level network statistics: total bytes/packets sent/received, "
+               "capture status, total captured/dropped, DNS queries logged, and active filter rules."),
+        {},
+        network_stats, true});
+
+    registry.register_tool({
+        OBFSTR("network_capture_status"), OBFSTR("network"),
+        OBFSTR("Check if packet capture is currently active and get capture counters."),
+        {},
+        network_capture_status, true});
+
+    registry.register_tool({
+        OBFSTR("network_block_ip"), OBFSTR("network"),
+        OBFSTR("Quick shortcut to block all traffic to/from a specific IP address. "
+               "Creates a kernel-level WFP block rule. Returns rule_id for later removal."),
+        {{OBFSTR("ip"), OBFSTR("string"), OBFSTR("IPv4 address to block (e.g. '192.168.1.1')"), true},
+         {OBFSTR("direction"), OBFSTR("string"), OBFSTR("'inbound', 'outbound', or 'both' (default 'both')"), false}},
+        network_block_ip, false});
+
+    registry.register_tool({
+        OBFSTR("network_block_port"), OBFSTR("network"),
+        OBFSTR("Quick shortcut to block all traffic on a specific port. "
+               "Creates a kernel-level WFP block rule. Returns rule_id for later removal."),
+        {{OBFSTR("port"), OBFSTR("number"), OBFSTR("Port number to block"), true},
+         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Optional: 'tcp' or 'udp' (default: both)"), false}},
+        network_block_port, false});
+
+    registry.register_tool({
+        OBFSTR("network_block_process"), OBFSTR("network"),
+        OBFSTR("Quick shortcut to block all network traffic for a specific process by PID. "
+               "Creates a kernel-level WFP block rule. Returns rule_id for later removal."),
+        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Process ID to block"), true}},
+        network_block_process, false});
+}
+
+}
+
 void initialize_all_tools()
 {
     function_tools::register_tools();
@@ -16591,6 +17583,7 @@ void initialize_all_tools()
     deobfuscation_tools::register_tools();
     driver_tools::register_tools();
     graphrag_tools::register_tools();
+    network_tools::register_tools();
 
     ToolRegistry::instance().register_tool({
         OBFSTR("list_all_available_tools"), OBFSTR("meta"),

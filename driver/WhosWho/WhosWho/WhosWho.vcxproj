@@ -141,6 +141,7 @@
     <ClCompile Include="src\function\impl\MouseMovement.cpp" />
     <ClCompile Include="src\function\impl\RemoteCall.cpp" />
     <ClCompile Include="src\function\impl\Debugger.cpp" />
+    <ClCompile Include="src\function\impl\Network.cpp" />
   </ItemGroup>
   <!-- 
     ntoskernel_base.asm has been replaced with a safe C++ implementation in Defs.h

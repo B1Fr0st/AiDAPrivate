@@ -54,6 +54,20 @@ namespace ioctl_codes {
     __forceinline ULONG SDF()   { return make(16); }
     __forceinline ULONG MEX()   { return make(17); }
     __forceinline ULONG V2P()   { return make(18); }
+
+    // Network capture IOCTLs
+    __forceinline ULONG NCON() { return make(19); }
+    __forceinline ULONG NCAP() { return make(20); }
+    __forceinline ULONG NCPG() { return make(21); }
+    __forceinline ULONG NDNS() { return make(22); }
+    __forceinline ULONG NFLT() { return make(23); }
+    __forceinline ULONG NSTS() { return make(24); }
+
+    // Advanced network recon IOCTLs
+    __forceinline ULONG EWFP() { return make(25); }   // Enumerate WFP callouts
+    __forceinline ULONG GSKT() { return make(26); }   // Get socket handles
+    __forceinline ULONG SNBF() { return make(27); }   // Sniff network buffers
+    __forceinline ULONG DTCP() { return make(28); }   // Dump tcpip connections
 }
 
 namespace dispatcher {
@@ -407,6 +421,96 @@ namespace dispatcher {
             if (input_size >= sizeof(virt_to_phys) && output_size >= sizeof(virt_to_phys)) {
                 status = functions::handle_virt_to_phys((p_virt_to_phys)buffer);
                 bytes = sizeof(virt_to_phys);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::NCON()) {
+            if (input_size >= sizeof(net_enum_conn) && output_size >= sizeof(net_enum_conn)) {
+                status = functions::handle_net_enum_conn((p_net_enum_conn)buffer);
+                bytes = sizeof(net_enum_conn);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::NCAP()) {
+            if (input_size >= sizeof(net_cap_ctrl) && output_size >= sizeof(net_cap_ctrl)) {
+                status = functions::handle_net_cap_ctrl((p_net_cap_ctrl)buffer);
+                bytes = sizeof(net_cap_ctrl);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::NCPG()) {
+            if (input_size >= sizeof(net_cap_get) && output_size >= sizeof(net_cap_get)) {
+                status = functions::handle_net_cap_get((p_net_cap_get)buffer);
+                bytes = sizeof(net_cap_get);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::NDNS()) {
+            if (input_size >= sizeof(net_dns_get) && output_size >= sizeof(net_dns_get)) {
+                status = functions::handle_net_dns_get((p_net_dns_get)buffer);
+                bytes = sizeof(net_dns_get);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::NFLT()) {
+            if (input_size >= sizeof(net_filter_rule) && output_size >= sizeof(net_filter_rule)) {
+                status = functions::handle_net_filter_rule((p_net_filter_rule)buffer);
+                bytes = sizeof(net_filter_rule);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::NSTS()) {
+            if (input_size >= sizeof(net_stats) && output_size >= sizeof(net_stats)) {
+                status = functions::handle_net_stats((p_net_stats)buffer);
+                bytes = sizeof(net_stats);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::EWFP()) {
+            if (input_size >= sizeof(wfp_callout_enum) && output_size >= sizeof(wfp_callout_enum)) {
+                status = functions::handle_wfp_callout_enum((p_wfp_callout_enum)buffer);
+                bytes = sizeof(wfp_callout_enum);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::GSKT()) {
+            if (input_size >= sizeof(socket_handle_enum) && output_size >= sizeof(socket_handle_enum)) {
+                status = functions::handle_socket_handle_enum((p_socket_handle_enum)buffer);
+                bytes = sizeof(socket_handle_enum);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::SNBF()) {
+            if (input_size >= sizeof(sniff_net_buffers) && output_size >= sizeof(sniff_net_buffers)) {
+                status = functions::handle_sniff_net_buffers((p_sniff_net_buffers)buffer);
+                bytes = sizeof(sniff_net_buffers);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::DTCP()) {
+            if (input_size >= sizeof(tcpip_conn_dump) && output_size >= sizeof(tcpip_conn_dump)) {
+                status = functions::handle_tcpip_conn_dump((p_tcpip_conn_dump)buffer);
+                bytes = sizeof(tcpip_conn_dump);
             }
             else {
                 status = STATUS_INFO_LENGTH_MISMATCH;

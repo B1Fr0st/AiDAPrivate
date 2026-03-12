@@ -408,6 +408,25 @@ namespace graphrag_tools
     void register_tools();
 }
 
+namespace network_tools
+{
+    tool_result_t network_enumerate_connections(const nlohmann::json& params);
+    tool_result_t network_start_capture(const nlohmann::json& params);
+    tool_result_t network_stop_capture(const nlohmann::json& params);
+    tool_result_t network_get_packets(const nlohmann::json& params);
+    tool_result_t network_analyze_packet(const nlohmann::json& params);
+    tool_result_t network_dns_log(const nlohmann::json& params);
+    tool_result_t network_add_filter(const nlohmann::json& params);
+    tool_result_t network_remove_filter(const nlohmann::json& params);
+    tool_result_t network_clear_filters(const nlohmann::json& params);
+    tool_result_t network_stats(const nlohmann::json& params);
+    tool_result_t network_capture_status(const nlohmann::json& params);
+    tool_result_t network_block_ip(const nlohmann::json& params);
+    tool_result_t network_block_port(const nlohmann::json& params);
+    tool_result_t network_block_process(const nlohmann::json& params);
+    void register_tools();
+}
+
 namespace helpers
 {
     std::optional<ea_t> parse_address(const std::string& addr_str);

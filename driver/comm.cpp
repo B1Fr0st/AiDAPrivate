@@ -1600,3 +1600,426 @@ bool voyager::device_t::clear_hardware_breakpoint(std::uint32_t tid, int index) 
 
     return set_thread_context(tid, ctx, mask);
 }
+
+// ============================================================
+// Network capture methods
+// ============================================================
+
+std::vector<voyager::device_t::net_connection_info> voyager::device_t::enumerate_connections(std::uint32_t filter_pid, std::uint32_t filter_protocol) noexcept {
+    std::vector<net_connection_info> result;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<voyager::detail::net_enum_conn_request*>(
+        VirtualAlloc(nullptr, sizeof(voyager::detail::net_enum_conn_request),
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+    req->filter_pid = filter_pid;
+    req->filter_protocol = filter_protocol;
+
+    if (send_request(ioctl_codes::NCON(), req, static_cast<DWORD>(sizeof(*req)))) {
+        result.reserve(req->connection_count);
+        for (std::uint32_t i = 0; i < req->connection_count; i++) {
+            net_connection_info info{};
+            info.pid = req->entries[i].pid;
+            info.protocol = req->entries[i].protocol;
+            info.state = req->entries[i].state;
+            info.local_port = req->entries[i].local_port;
+            info.remote_port = req->entries[i].remote_port;
+            info.address_family = req->entries[i].address_family;
+            std::memcpy(info.local_addr, req->entries[i].local_addr, 16);
+            std::memcpy(info.remote_addr, req->entries[i].remote_addr, 16);
+            result.push_back(info);
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}
+
+bool voyager::device_t::start_capture(std::uint32_t filter_pid, std::uint32_t filter_port,
+    std::uint32_t filter_protocol, const std::uint8_t* filter_ip, std::uint32_t max_payload) noexcept {
+    if (!is_connected()) return false;
+
+    voyager::detail::net_cap_ctrl_request req{};
+    req.operation = 0; // start
+    req.filter_pid = filter_pid;
+    req.filter_port = filter_port;
+    req.filter_protocol = filter_protocol;
+    req.max_packet_bytes = max_payload;
+    if (filter_ip) std::memcpy(req.filter_ip, filter_ip, 16);
+
+    if (!send_request(ioctl_codes::NCAP(), &req, sizeof(req))) return false;
+    return req.capture_active != 0;
+}
+
+bool voyager::device_t::stop_capture() noexcept {
+    if (!is_connected()) return false;
+
+    voyager::detail::net_cap_ctrl_request req{};
+    req.operation = 1; // stop
+
+    return send_request(ioctl_codes::NCAP(), &req, sizeof(req));
+}
+
+bool voyager::device_t::get_capture_status(bool& active, std::uint32_t& captured, std::uint32_t& dropped) noexcept {
+    if (!is_connected()) return false;
+
+    voyager::detail::net_cap_ctrl_request req{};
+    req.operation = 2; // status
+
+    if (!send_request(ioctl_codes::NCAP(), &req, sizeof(req))) return false;
+
+    active = req.capture_active != 0;
+    captured = req.packets_captured;
+    dropped = req.packets_dropped;
+    return true;
+}
+
+std::vector<voyager::device_t::captured_packet> voyager::device_t::get_captured_packets(std::uint32_t max_packets) noexcept {
+    std::vector<captured_packet> result;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<voyager::detail::net_cap_get_request*>(
+        VirtualAlloc(nullptr, sizeof(voyager::detail::net_cap_get_request),
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+    req->max_packets = max_packets;
+
+    if (send_request(ioctl_codes::NCPG(), req, static_cast<DWORD>(sizeof(*req)))) {
+        result.reserve(req->packet_count);
+        for (std::uint32_t i = 0; i < req->packet_count; i++) {
+            captured_packet pkt{};
+            const auto& src = req->packets[i];
+            pkt.timestamp = src.timestamp;
+            pkt.pid = src.pid;
+            pkt.protocol = src.protocol;
+            pkt.direction = src.direction;
+            pkt.payload_size = src.payload_size;
+            pkt.local_port = src.local_port;
+            pkt.remote_port = src.remote_port;
+            pkt.address_family = src.address_family;
+            std::memcpy(pkt.local_addr, src.local_addr, 16);
+            std::memcpy(pkt.remote_addr, src.remote_addr, 16);
+            if (src.payload_size > 0) {
+                std::uint32_t sz = src.payload_size;
+                if (sz > voyager::detail::NET_PKT_MAX_PAYLOAD) sz = static_cast<std::uint32_t>(voyager::detail::NET_PKT_MAX_PAYLOAD);
+                pkt.payload.assign(src.payload, src.payload + sz);
+            }
+            result.push_back(std::move(pkt));
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}
+
+std::vector<voyager::device_t::dns_entry> voyager::device_t::get_dns_queries(std::uint32_t filter_pid) noexcept {
+    std::vector<dns_entry> result;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<voyager::detail::net_dns_get_request*>(
+        VirtualAlloc(nullptr, sizeof(voyager::detail::net_dns_get_request),
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+    req->filter_pid = filter_pid;
+
+    if (send_request(ioctl_codes::NDNS(), req, static_cast<DWORD>(sizeof(*req)))) {
+        result.reserve(req->entry_count);
+        for (std::uint32_t i = 0; i < req->entry_count; i++) {
+            dns_entry entry{};
+            const auto& src = req->entries[i];
+            entry.timestamp = src.timestamp;
+            entry.pid = src.pid;
+            entry.query_type = src.query_type;
+            entry.domain = std::string(src.domain);
+            std::memcpy(entry.resolved_addr, src.resolved_addr, 16);
+            entry.response_code = src.response_code;
+            entry.ttl = src.ttl;
+            result.push_back(std::move(entry));
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}
+
+bool voyager::device_t::add_filter_rule(std::uint32_t action, std::uint32_t direction,
+    std::uint32_t protocol, std::uint32_t pid, std::uint32_t port,
+    const std::uint8_t* ip_addr, const std::uint8_t* ip_mask,
+    std::uint32_t* out_rule_id) noexcept {
+    if (!is_connected()) return false;
+
+    voyager::detail::net_filter_rule_request req{};
+    req.operation = 0; // add
+    req.action = action;
+    req.direction = direction;
+    req.protocol = protocol;
+    req.pid = pid;
+    req.port = port;
+    if (ip_addr) std::memcpy(req.ip_addr, ip_addr, 16);
+    if (ip_mask) std::memcpy(req.ip_mask, ip_mask, 16);
+
+    if (!send_request(ioctl_codes::NFLT(), &req, sizeof(req))) return false;
+    if (out_rule_id) *out_rule_id = req.rule_id;
+    return true;
+}
+
+bool voyager::device_t::remove_filter_rule(std::uint32_t rule_id) noexcept {
+    if (!is_connected()) return false;
+
+    voyager::detail::net_filter_rule_request req{};
+    req.operation = 1; // remove
+    req.rule_id = rule_id;
+
+    return send_request(ioctl_codes::NFLT(), &req, sizeof(req));
+}
+
+bool voyager::device_t::clear_filter_rules() noexcept {
+    if (!is_connected()) return false;
+
+    voyager::detail::net_filter_rule_request req{};
+    req.operation = 2; // clear
+
+    return send_request(ioctl_codes::NFLT(), &req, sizeof(req));
+}
+
+bool voyager::device_t::get_network_stats(network_stats& stats) noexcept {
+    if (!is_connected()) return false;
+
+    voyager::detail::net_stats_request req{};
+
+    if (!send_request(ioctl_codes::NSTS(), &req, sizeof(req))) return false;
+
+    stats.bytes_sent = req.bytes_sent;
+    stats.bytes_received = req.bytes_received;
+    stats.packets_sent = req.packets_sent;
+    stats.packets_received = req.packets_received;
+    stats.active_connections = req.active_connections;
+    stats.capture_active = req.capture_active;
+    stats.total_captured = req.total_captured;
+    stats.total_dropped = req.total_dropped;
+    stats.total_dns_logged = req.total_dns_logged;
+    stats.active_filter_rules = req.active_filter_rules;
+    return true;
+}
+
+// ============================================================
+// Advanced network recon method implementations
+// ============================================================
+
+static std::string guid_to_string(const voyager::detail::GUID_COMPAT& g) {
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+        g.Data1, g.Data2, g.Data3,
+        g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
+        g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+    return buf;
+}
+
+std::vector<voyager::device_t::wfp_callout_info>
+voyager::device_t::enumerate_wfp_callouts(const std::string& filter_module) noexcept {
+    std::vector<wfp_callout_info> result;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<voyager::detail::wfp_callout_enum_request*>(
+        VirtualAlloc(nullptr, sizeof(voyager::detail::wfp_callout_enum_request),
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+    if (!filter_module.empty()) {
+        std::size_t len = filter_module.size();
+        if (len > 63) len = 63;
+        std::memcpy(req->filter_module, filter_module.c_str(), len);
+    }
+
+    if (send_request(ioctl_codes::EWFP(), req, static_cast<DWORD>(sizeof(*req)))) {
+        result.reserve(req->callout_count);
+        for (std::uint32_t i = 0; i < req->callout_count; i++) {
+            const auto& e = req->entries[i];
+            wfp_callout_info info{};
+            info.classify_fn = e.classify_fn;
+            info.notify_fn = e.notify_fn;
+            info.flow_delete_fn = e.flow_delete_fn;
+            info.owning_module_base = e.owning_module_base;
+            info.callout_id = e.callout_id;
+            info.layer_id = e.layer_id;
+            info.flags = e.flags;
+            info.callout_key_str = guid_to_string(e.callout_key);
+            info.applicable_layer_str = guid_to_string(e.applicable_layer);
+            info.owning_module = std::string(e.owning_module,
+                strnlen(e.owning_module, sizeof(e.owning_module)));
+            result.push_back(std::move(info));
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}
+
+std::vector<voyager::device_t::socket_info>
+voyager::device_t::get_socket_handles(std::uint32_t target_pid) noexcept {
+    std::vector<socket_info> result;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<voyager::detail::socket_handle_enum_request*>(
+        VirtualAlloc(nullptr, sizeof(voyager::detail::socket_handle_enum_request),
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+    req->target_pid = (target_pid != 0) ? target_pid : process_id_;
+
+    if (send_request(ioctl_codes::GSKT(), req, static_cast<DWORD>(sizeof(*req)))) {
+        result.reserve(req->socket_count);
+        for (std::uint32_t i = 0; i < req->socket_count; i++) {
+            const auto& e = req->entries[i];
+            socket_info info{};
+            info.handle_value = e.handle_value;
+            info.afd_endpoint_addr = e.afd_endpoint_addr;
+            info.pid = e.pid;
+            info.protocol = e.protocol;
+            info.state = e.state;
+            info.local_port = e.local_port;
+            info.remote_port = e.remote_port;
+            info.address_family = e.address_family;
+            std::memcpy(info.local_addr, e.local_addr, 16);
+            std::memcpy(info.remote_addr, e.remote_addr, 16);
+            result.push_back(info);
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}
+
+bool voyager::device_t::sniff_net_buffers_start(std::uint64_t address, std::uint32_t buf_reg,
+    std::uint32_t size_reg, std::uint32_t max_captures, std::uint32_t tid, std::uint32_t bp_index) noexcept {
+    if (!is_connected()) return false;
+
+    voyager::detail::sniff_net_buffers_request req{};
+    req.target_address = address;
+    req.buffer_reg_index = buf_reg;
+    req.size_reg_index = size_reg;
+    req.max_captures = max_captures;
+    req.operation = 0; // START
+    req.target_tid = tid;
+    req.bp_index = bp_index;
+
+    return send_request(ioctl_codes::SNBF(), &req, sizeof(req));
+}
+
+bool voyager::device_t::sniff_net_buffers_stop() noexcept {
+    if (!is_connected()) return false;
+
+    voyager::detail::sniff_net_buffers_request req{};
+    req.operation = 1; // STOP
+
+    return send_request(ioctl_codes::SNBF(), &req, sizeof(req));
+}
+
+std::vector<voyager::device_t::sniff_result>
+voyager::device_t::sniff_net_buffers_get(bool& active) noexcept {
+    std::vector<sniff_result> result;
+    active = false;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<voyager::detail::sniff_net_buffers_request*>(
+        VirtualAlloc(nullptr, sizeof(voyager::detail::sniff_net_buffers_request),
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = 2; // GET_RESULTS
+
+    if (send_request(ioctl_codes::SNBF(), req, static_cast<DWORD>(sizeof(*req)))) {
+        active = (req->active != 0);
+        result.reserve(req->capture_count);
+        for (std::uint32_t i = 0; i < req->capture_count; i++) {
+            const auto& c = req->captures[i];
+            sniff_result sr;
+            sr.timestamp = c.timestamp;
+            sr.thread_id = c.thread_id;
+            std::uint32_t sz = c.buffer_size;
+            if (sz > voyager::detail::SNIFF_MAX_BUF_SIZE)
+                sz = static_cast<std::uint32_t>(voyager::detail::SNIFF_MAX_BUF_SIZE);
+            sr.buffer.assign(c.buffer, c.buffer + sz);
+            result.push_back(std::move(sr));
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}
+
+bool voyager::device_t::sniff_net_buffers_store(std::uint64_t timestamp, std::uint64_t thread_id,
+    const std::uint8_t* data, std::uint32_t size) noexcept {
+    if (!is_connected() || !data || size == 0) return false;
+
+    auto* req = static_cast<voyager::detail::sniff_net_buffers_request*>(
+        VirtualAlloc(nullptr, sizeof(voyager::detail::sniff_net_buffers_request),
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return false;
+
+    std::memset(req, 0, sizeof(*req));
+    req->operation = 3; // STORE_CAPTURE
+
+    std::uint32_t copy_sz = size;
+    if (copy_sz > static_cast<std::uint32_t>(voyager::detail::SNIFF_MAX_BUF_SIZE))
+        copy_sz = static_cast<std::uint32_t>(voyager::detail::SNIFF_MAX_BUF_SIZE);
+
+    req->captures[0].timestamp = timestamp;
+    req->captures[0].thread_id = thread_id;
+    req->captures[0].buffer_size = copy_sz;
+    std::memcpy(req->captures[0].buffer, data, copy_sz);
+
+    bool ok = send_request(ioctl_codes::SNBF(), req, static_cast<DWORD>(sizeof(*req)));
+    VirtualFree(req, 0, MEM_RELEASE);
+    return ok;
+}
+
+std::vector<voyager::device_t::tcpip_connection>
+voyager::device_t::dump_tcpip_connections(std::uint32_t target_pid, std::uint32_t filter_protocol) noexcept {
+    std::vector<tcpip_connection> result;
+    if (!is_connected()) return result;
+
+    auto* req = static_cast<voyager::detail::tcpip_conn_dump_request*>(
+        VirtualAlloc(nullptr, sizeof(voyager::detail::tcpip_conn_dump_request),
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!req) return result;
+
+    std::memset(req, 0, sizeof(*req));
+    req->target_pid = target_pid;
+    req->filter_protocol = filter_protocol;
+
+    if (send_request(ioctl_codes::DTCP(), req, static_cast<DWORD>(sizeof(*req)))) {
+        result.reserve(req->connection_count);
+        for (std::uint32_t i = 0; i < req->connection_count; i++) {
+            const auto& e = req->entries[i];
+            tcpip_connection conn{};
+            conn.tcb_address = e.tcb_address;
+            conn.owning_module_base = e.owning_module_base;
+            conn.pid = e.pid;
+            conn.protocol = e.protocol;
+            conn.state = e.state;
+            conn.local_port = e.local_port;
+            conn.remote_port = e.remote_port;
+            conn.address_family = e.address_family;
+            std::memcpy(conn.local_addr, e.local_addr, 16);
+            std::memcpy(conn.remote_addr, e.remote_addr, 16);
+            conn.create_time = e.create_time;
+            conn.bytes_in = e.bytes_in;
+            conn.bytes_out = e.bytes_out;
+            result.push_back(conn);
+        }
+    }
+
+    VirtualFree(req, 0, MEM_RELEASE);
+    return result;
+}

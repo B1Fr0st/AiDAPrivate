@@ -86,6 +86,20 @@ namespace ioctl_codes {
     __forceinline DWORD SDF()   { return make(16); }
     __forceinline DWORD MEX()   { return make(17); }
     __forceinline DWORD V2P()   { return make(18); }
+
+    // Network capture IOCTLs
+    __forceinline DWORD NCON() { return make(19); }
+    __forceinline DWORD NCAP() { return make(20); }
+    __forceinline DWORD NCPG() { return make(21); }
+    __forceinline DWORD NDNS() { return make(22); }
+    __forceinline DWORD NFLT() { return make(23); }
+    __forceinline DWORD NSTS() { return make(24); }
+
+    // Advanced network recon IOCTLs
+    __forceinline DWORD EWFP() { return make(25); }
+    __forceinline DWORD GSKT() { return make(26); }
+    __forceinline DWORD SNBF() { return make(27); }
+    __forceinline DWORD DTCP() { return make(28); }
 }
 
 namespace voyager {
@@ -320,6 +334,226 @@ namespace voyager {
             std::uint64_t physical_address;
         };
         static_assert(sizeof(virt_to_phys_request) == 24, "virt_to_phys_request size mismatch");
+
+        // ============================================================
+        // Network capture structures (mirror kernel Struct.h)
+        // ============================================================
+#pragma pack(push, 8)
+
+        static constexpr std::size_t MAX_NET_CONNECTIONS = 1024;
+        static constexpr std::size_t NET_PKT_MAX_PAYLOAD = 1500;
+        static constexpr std::size_t NET_CAP_GET_MAX = 32;
+        static constexpr std::size_t NET_DNS_GET_MAX = 64;
+
+        struct net_conn_entry {
+            std::uint32_t pid;
+            std::uint32_t protocol;
+            std::uint32_t state;
+            std::uint32_t local_port;
+            std::uint32_t remote_port;
+            std::uint32_t address_family;
+            std::uint8_t  local_addr[16];
+            std::uint8_t  remote_addr[16];
+        };
+        static_assert(sizeof(net_conn_entry) == 56, "net_conn_entry size mismatch");
+
+        struct net_enum_conn_request {
+            std::uint32_t filter_pid;
+            std::uint32_t filter_protocol;
+            std::uint32_t connection_count;
+            std::uint32_t padding;
+            net_conn_entry entries[MAX_NET_CONNECTIONS];
+        };
+
+        struct net_cap_ctrl_request {
+            std::uint32_t operation;
+            std::uint32_t filter_pid;
+            std::uint32_t filter_port;
+            std::uint32_t filter_protocol;
+            std::uint8_t  filter_ip[16];
+            std::uint32_t max_packet_bytes;
+            std::uint32_t capture_active;
+            std::uint32_t packets_captured;
+            std::uint32_t packets_dropped;
+        };
+        static_assert(sizeof(net_cap_ctrl_request) == 48, "net_cap_ctrl_request size mismatch");
+
+        struct net_packet_entry {
+            std::uint64_t timestamp;
+            std::uint32_t pid;
+            std::uint32_t protocol;
+            std::uint32_t direction;
+            std::uint32_t payload_size;
+            std::uint32_t local_port;
+            std::uint32_t remote_port;
+            std::uint32_t address_family;
+            std::uint32_t reserved;
+            std::uint8_t  local_addr[16];
+            std::uint8_t  remote_addr[16];
+            std::uint8_t  payload[NET_PKT_MAX_PAYLOAD];
+        };
+        static_assert(sizeof(net_packet_entry) == 1576, "net_packet_entry size mismatch");
+
+        struct net_cap_get_request {
+            std::uint32_t max_packets;
+            std::uint32_t packet_count;
+            net_packet_entry packets[NET_CAP_GET_MAX];
+        };
+
+        struct net_dns_entry {
+            std::uint64_t timestamp;
+            std::uint32_t pid;
+            std::uint32_t query_type;
+            char domain[260];
+            std::uint8_t  resolved_addr[16];
+            std::uint32_t ttl;
+            std::uint32_t response_code;
+        };
+        static_assert(sizeof(net_dns_entry) == 304, "net_dns_entry size mismatch");
+
+        struct net_dns_get_request {
+            std::uint32_t filter_pid;
+            std::uint32_t entry_count;
+            net_dns_entry entries[NET_DNS_GET_MAX];
+        };
+
+        struct net_filter_rule_request {
+            std::uint32_t rule_id;
+            std::uint32_t action;
+            std::uint32_t direction;
+            std::uint32_t protocol;
+            std::uint32_t pid;
+            std::uint32_t port;
+            std::uint8_t  ip_addr[16];
+            std::uint8_t  ip_mask[16];
+            std::uint32_t operation;
+            std::uint32_t rule_count;
+        };
+        static_assert(sizeof(net_filter_rule_request) == 64, "net_filter_rule_request size mismatch");
+
+        struct net_stats_request {
+            std::uint32_t filter_pid;
+            std::uint32_t padding;
+            std::uint64_t bytes_sent;
+            std::uint64_t bytes_received;
+            std::uint64_t packets_sent;
+            std::uint64_t packets_received;
+            std::uint32_t active_connections;
+            std::uint32_t capture_active;
+            std::uint32_t total_captured;
+            std::uint32_t total_dropped;
+            std::uint32_t total_dns_logged;
+            std::uint32_t active_filter_rules;
+        };
+        static_assert(sizeof(net_stats_request) == 64, "net_stats_request size mismatch");
+
+        // ============================================================
+        // Advanced network recon structures
+        // ============================================================
+
+        static constexpr std::size_t MAX_WFP_CALLOUTS = 256;
+        static constexpr std::size_t MAX_SOCKET_HANDLES = 512;
+        static constexpr std::size_t SNIFF_MAX_CAPTURES = 16;
+        static constexpr std::size_t SNIFF_MAX_BUF_SIZE = 2048;
+        static constexpr std::size_t MAX_TCPIP_CONNECTIONS = 1024;
+
+        struct GUID_COMPAT {
+            std::uint32_t Data1;
+            std::uint16_t Data2;
+            std::uint16_t Data3;
+            std::uint8_t  Data4[8];
+        };
+
+        struct wfp_callout_entry {
+            std::uint64_t classify_fn;
+            std::uint64_t notify_fn;
+            std::uint64_t flow_delete_fn;
+            std::uint64_t owning_module_base;
+            std::uint32_t callout_id;
+            std::uint32_t layer_id;
+            std::uint32_t flags;
+            std::uint32_t padding0;
+            GUID_COMPAT   callout_key;
+            GUID_COMPAT   applicable_layer;
+            char          owning_module[64];
+        };
+        static_assert(sizeof(wfp_callout_entry) == 144, "wfp_callout_entry size mismatch");
+
+        struct wfp_callout_enum_request {
+            char          filter_module[64];
+            std::uint32_t callout_count;
+            std::uint32_t padding;
+            wfp_callout_entry entries[MAX_WFP_CALLOUTS];
+        };
+
+        struct socket_handle_entry {
+            std::uint64_t handle_value;
+            std::uint64_t afd_endpoint_addr;
+            std::uint32_t pid;
+            std::uint32_t protocol;
+            std::uint32_t state;
+            std::uint32_t local_port;
+            std::uint32_t remote_port;
+            std::uint32_t address_family;
+            std::uint8_t  local_addr[16];
+            std::uint8_t  remote_addr[16];
+        };
+        static_assert(sizeof(socket_handle_entry) == 72, "socket_handle_entry size mismatch");
+
+        struct socket_handle_enum_request {
+            std::uint32_t target_pid;
+            std::uint32_t socket_count;
+            socket_handle_entry entries[MAX_SOCKET_HANDLES];
+        };
+
+        struct sniff_capture {
+            std::uint64_t timestamp;
+            std::uint64_t thread_id;
+            std::uint32_t buffer_size;
+            std::uint32_t padding;
+            std::uint8_t  buffer[SNIFF_MAX_BUF_SIZE];
+        };
+        static_assert(sizeof(sniff_capture) == 2072, "sniff_capture size mismatch");
+
+        struct sniff_net_buffers_request {
+            std::uint64_t target_address;
+            std::uint32_t buffer_reg_index;
+            std::uint32_t size_reg_index;
+            std::uint32_t max_captures;
+            std::uint32_t operation;
+            std::uint32_t capture_count;
+            std::uint32_t active;
+            std::uint32_t target_tid;
+            std::uint32_t bp_index;
+            sniff_capture captures[SNIFF_MAX_CAPTURES];
+        };
+
+        struct tcpip_conn_entry {
+            std::uint64_t tcb_address;
+            std::uint64_t owning_module_base;
+            std::uint32_t pid;
+            std::uint32_t protocol;
+            std::uint32_t state;
+            std::uint32_t local_port;
+            std::uint32_t remote_port;
+            std::uint32_t address_family;
+            std::uint8_t  local_addr[16];
+            std::uint8_t  remote_addr[16];
+            std::uint64_t create_time;
+            std::uint64_t bytes_in;
+            std::uint64_t bytes_out;
+        };
+        static_assert(sizeof(tcpip_conn_entry) == 96, "tcpip_conn_entry size mismatch");
+
+        struct tcpip_conn_dump_request {
+            std::uint32_t target_pid;
+            std::uint32_t filter_protocol;
+            std::uint32_t connection_count;
+            std::uint32_t padding;
+            tcpip_conn_entry entries[MAX_TCPIP_CONNECTIONS];
+        };
+
+#pragma pack(pop)
     }
 
     namespace device_names_um {
@@ -501,6 +735,126 @@ namespace voyager {
         std::uint64_t virtual_to_physical(std::uint64_t virtual_address) noexcept;
         bool set_hardware_breakpoint(std::uint32_t tid, int index, std::uint64_t address, int type = 0, int size = 0) noexcept;
         bool clear_hardware_breakpoint(std::uint32_t tid, int index) noexcept;
+
+        // Network capture methods
+        struct net_connection_info {
+            std::uint32_t pid;
+            std::uint32_t protocol;
+            std::uint32_t state;
+            std::uint32_t local_port;
+            std::uint32_t remote_port;
+            std::uint32_t address_family;
+            std::uint8_t  local_addr[16];
+            std::uint8_t  remote_addr[16];
+        };
+
+        struct captured_packet {
+            std::uint64_t timestamp;
+            std::uint32_t pid;
+            std::uint32_t protocol;
+            std::uint32_t direction;
+            std::uint32_t payload_size;
+            std::uint32_t local_port;
+            std::uint32_t remote_port;
+            std::uint32_t address_family;
+            std::uint8_t  local_addr[16];
+            std::uint8_t  remote_addr[16];
+            std::vector<std::uint8_t> payload;
+        };
+
+        struct dns_entry {
+            std::uint64_t timestamp;
+            std::uint32_t pid;
+            std::uint32_t query_type;
+            std::string   domain;
+            std::uint8_t  resolved_addr[16];
+            std::uint32_t response_code;
+            std::uint32_t ttl;
+        };
+
+        struct network_stats {
+            std::uint64_t bytes_sent;
+            std::uint64_t bytes_received;
+            std::uint64_t packets_sent;
+            std::uint64_t packets_received;
+            std::uint32_t active_connections;
+            std::uint32_t capture_active;
+            std::uint32_t total_captured;
+            std::uint32_t total_dropped;
+            std::uint32_t total_dns_logged;
+            std::uint32_t active_filter_rules;
+        };
+
+        std::vector<net_connection_info> enumerate_connections(std::uint32_t filter_pid = 0, std::uint32_t filter_protocol = 0) noexcept;
+        bool start_capture(std::uint32_t filter_pid = 0, std::uint32_t filter_port = 0, std::uint32_t filter_protocol = 0, const std::uint8_t* filter_ip = nullptr, std::uint32_t max_payload = 1500) noexcept;
+        bool stop_capture() noexcept;
+        bool get_capture_status(bool& active, std::uint32_t& captured, std::uint32_t& dropped) noexcept;
+        std::vector<captured_packet> get_captured_packets(std::uint32_t max_packets = 32) noexcept;
+        std::vector<dns_entry> get_dns_queries(std::uint32_t filter_pid = 0) noexcept;
+        bool add_filter_rule(std::uint32_t action, std::uint32_t direction, std::uint32_t protocol = 0, std::uint32_t pid = 0, std::uint32_t port = 0, const std::uint8_t* ip_addr = nullptr, const std::uint8_t* ip_mask = nullptr, std::uint32_t* out_rule_id = nullptr) noexcept;
+        bool remove_filter_rule(std::uint32_t rule_id) noexcept;
+        bool clear_filter_rules() noexcept;
+        bool get_network_stats(network_stats& stats) noexcept;
+
+        // Advanced network recon
+        struct wfp_callout_info {
+            std::uint64_t classify_fn;
+            std::uint64_t notify_fn;
+            std::uint64_t flow_delete_fn;
+            std::uint64_t owning_module_base;
+            std::uint32_t callout_id;
+            std::uint32_t layer_id;
+            std::uint32_t flags;
+            std::string   callout_key_str;
+            std::string   applicable_layer_str;
+            std::string   owning_module;
+        };
+        std::vector<wfp_callout_info> enumerate_wfp_callouts(const std::string& filter_module = {}) noexcept;
+
+        struct socket_info {
+            std::uint64_t handle_value;
+            std::uint64_t afd_endpoint_addr;
+            std::uint32_t pid;
+            std::uint32_t protocol;
+            std::uint32_t state;
+            std::uint32_t local_port;
+            std::uint32_t remote_port;
+            std::uint32_t address_family;
+            std::uint8_t  local_addr[16];
+            std::uint8_t  remote_addr[16];
+        };
+        std::vector<socket_info> get_socket_handles(std::uint32_t target_pid = 0) noexcept;
+
+        bool sniff_net_buffers_start(std::uint64_t address, std::uint32_t buf_reg, std::uint32_t size_reg,
+                                     std::uint32_t max_captures = 1, std::uint32_t tid = 0, std::uint32_t bp_index = 0) noexcept;
+        bool sniff_net_buffers_stop() noexcept;
+
+        struct sniff_result {
+            std::uint64_t timestamp;
+            std::uint64_t thread_id;
+            std::vector<std::uint8_t> buffer;
+        };
+        std::vector<sniff_result> sniff_net_buffers_get(bool& active) noexcept;
+
+        bool sniff_net_buffers_store(std::uint64_t timestamp, std::uint64_t thread_id,
+                                     const std::uint8_t* data, std::uint32_t size) noexcept;
+
+        struct tcpip_connection {
+            std::uint64_t tcb_address;
+            std::uint64_t owning_module_base;
+            std::uint32_t pid;
+            std::uint32_t protocol;
+            std::uint32_t state;
+            std::uint32_t local_port;
+            std::uint32_t remote_port;
+            std::uint32_t address_family;
+            std::uint8_t  local_addr[16];
+            std::uint8_t  remote_addr[16];
+            std::uint64_t create_time;
+            std::uint64_t bytes_in;
+            std::uint64_t bytes_out;
+        };
+        std::vector<tcpip_connection> dump_tcpip_connections(std::uint32_t target_pid = 0, std::uint32_t filter_protocol = 0) noexcept;
 
         [[nodiscard]] std::uint32_t get_process_id() const noexcept { return process_id_; }
         [[nodiscard]] std::uint64_t get_base_address() const noexcept { return base_address_; }
