@@ -9,15 +9,10 @@
 #define AIDA_NET_LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[AiDA-Net] " fmt "\n", __VA_ARGS__)
 #endif
 
-// =====================================================================
-// WFP (Windows Filtering Platform) type definitions
-// Defined manually to avoid header dependencies and static imports.
-// All WFP functions are resolved dynamically from fwpkclnt.sys.
-// =====================================================================
 
 #pragma pack(push, 8)
 
-// WFP data types
+
 typedef UINT16 FWP_IP_VERSION_;
 typedef UINT8  FWP_DIRECTION_;
 typedef UINT32 FWP_ACTION_TYPE_;
@@ -31,7 +26,7 @@ typedef UINT32 FWP_ACTION_TYPE_;
 
 #define FWP_CONDITION_FLAG_IS_LOOPBACK_ 0x00000001
 
-// FWP_VALUE0 simplified (we only read uint8/uint16/uint32)
+
 typedef struct _FWP_VALUE0_COMPAT {
     UINT32 type;
     union {
@@ -72,8 +67,8 @@ typedef struct _FWPS_INCOMING_METADATA_VALUES0_COMPAT {
     UINT64 reserved1;
     UINT64 reserved2;
     UINT64 processId;
-    // Additional fields exist but we only need processId
-    // Padding to avoid accessing beyond allocation
+
+
     UINT8 _reserved_padding[256];
 } FWPS_INCOMING_METADATA_VALUES0_COMPAT;
 
@@ -91,7 +86,7 @@ typedef struct _FWPS_CLASSIFY_OUT0_COMPAT {
 #define FWPS_RIGHT_ACTION_WRITE_ 0x00000001
 #define FWPS_CLASSIFY_OUT_FLAG_ABSORB_ 0x00000001
 
-// FWPS_CALLOUT structure for registration
+
 typedef struct _FWPS_CALLOUT2_COMPAT {
     GUID   calloutKey;
     UINT32 flags;
@@ -100,13 +95,13 @@ typedef struct _FWPS_CALLOUT2_COMPAT {
     PVOID  flowDeleteFn;
 } FWPS_CALLOUT2_COMPAT;
 
-// FWP_BYTE_BLOB for match conditions
+
 typedef struct _FWP_BYTE_BLOB_COMPAT {
     UINT32 size;
     UINT8* data;
 } FWP_BYTE_BLOB_COMPAT;
 
-// FWPM_FILTER_CONDITION0
+
 typedef struct _FWP_CONDITION_VALUE0_COMPAT {
     UINT32 type;
     union {
@@ -192,7 +187,7 @@ typedef struct _FWPM_SUBLAYER0_COMPAT {
 
 #pragma pack(pop)
 
-// WFP function pointer types
+
 typedef NTSTATUS(NTAPI* fn_FwpsCalloutRegister2)(
     PVOID deviceObject, const FWPS_CALLOUT2_COMPAT* callout,
     UINT32* calloutId);
@@ -216,39 +211,34 @@ typedef NTSTATUS(NTAPI* fn_FwpmFilterDeleteById0)(HANDLE engineHandle, UINT64 fi
 typedef NTSTATUS(NTAPI* fn_FwpmCalloutDeleteById0)(HANDLE engineHandle, UINT32 calloutId);
 typedef NTSTATUS(NTAPI* fn_FwpmSubLayerDeleteByKey0)(HANDLE engineHandle, const GUID* key);
 
-// WFP Layer GUIDs (transport V4 inbound/outbound)
-// FWPM_LAYER_INBOUND_TRANSPORT_V4
+
 static const GUID GUID_LAYER_INBOUND_V4 =
     { 0xa82acc24, 0x4ee1, 0x4ee1, { 0xb4, 0x65, 0xfd, 0x1d, 0x25, 0xcb, 0x10, 0xa4 } };
-// FWPM_LAYER_OUTBOUND_TRANSPORT_V4
+
 static const GUID GUID_LAYER_OUTBOUND_V4 =
     { 0x09e61aea, 0xd214, 0x46e2, { 0x9b, 0x21, 0xb2, 0x6b, 0x0b, 0x2f, 0x28, 0xc8 } };
-// FWPM_LAYER_ALE_AUTH_CONNECT_V4
+
 static const GUID GUID_LAYER_ALE_CONNECT_V4 =
     { 0xc38d57d1, 0x05a7, 0x4c33, { 0x90, 0x4f, 0x7f, 0xbc, 0xee, 0xe6, 0x0e, 0x82 } };
-// FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4
+
 static const GUID GUID_LAYER_ALE_RECV_V4 =
     { 0xe1cd9fe7, 0xf4b5, 0x4273, { 0x96, 0xc0, 0x59, 0x2e, 0x48, 0x7b, 0x86, 0x50 } };
 
-// Inbound transport V4 field indices
+
 #define FWPS_FIELD_IN_TRANS_V4_LOCAL_ADDR    0
 #define FWPS_FIELD_IN_TRANS_V4_LOCAL_PORT    1
 #define FWPS_FIELD_IN_TRANS_V4_REMOTE_ADDR   2
 #define FWPS_FIELD_IN_TRANS_V4_REMOTE_PORT   3
 #define FWPS_FIELD_IN_TRANS_V4_PROTOCOL      4
 
-// Outbound transport V4 field indices
+
 #define FWPS_FIELD_OUT_TRANS_V4_LOCAL_ADDR   0
 #define FWPS_FIELD_OUT_TRANS_V4_LOCAL_PORT   1
 #define FWPS_FIELD_OUT_TRANS_V4_REMOTE_ADDR  2
 #define FWPS_FIELD_OUT_TRANS_V4_REMOTE_PORT  3
 #define FWPS_FIELD_OUT_TRANS_V4_PROTOCOL     4
 
-// =====================================================================
-// Network capture subsystem global state
-// =====================================================================
 
-// Forward declarations for MITM subsystems referenced by classify callbacks.
 namespace net_bw {
     void record_traffic(UINT32 pid, UINT32 direction, UINT32 bytes);
 }
@@ -303,7 +293,7 @@ namespace net_bw {
 
 namespace net_capture {
 
-    // WFP function pointers (dynamically resolved)
+
     inline fn_FwpsCalloutRegister2       _FwpsCalloutRegister2       = nullptr;
     inline fn_FwpsCalloutUnregisterById0 _FwpsCalloutUnregisterById0 = nullptr;
     inline fn_FwpmEngineOpen0            _FwpmEngineOpen0            = nullptr;
@@ -318,19 +308,19 @@ namespace net_capture {
     inline fn_FwpmCalloutDeleteById0     _FwpmCalloutDeleteById0     = nullptr;
     inline fn_FwpmSubLayerDeleteByKey0   _FwpmSubLayerDeleteByKey0   = nullptr;
 
-    // Capture state
-    inline volatile LONG g_wfp_initialized = 0;     // 0=not init, 1=initializing, 2=ready
+
+    inline volatile LONG g_wfp_initialized = 0;
     inline volatile LONG g_capture_active = 0;
     inline HANDLE g_engine_handle = nullptr;
     inline PDEVICE_OBJECT g_device_object = nullptr;
 
-    // WFP registration IDs
+
     inline UINT32 g_callout_id_inbound = 0;
     inline UINT32 g_callout_id_outbound = 0;
     inline UINT64 g_filter_id_inbound = 0;
     inline UINT64 g_filter_id_outbound = 0;
 
-    // Custom GUIDs for our callout/sublayer
+
     static const GUID GUID_AIDA_CALLOUT_INBOUND =
         { 0x7a8b3c1d, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6 } };
     static const GUID GUID_AIDA_CALLOUT_OUTBOUND =
@@ -338,30 +328,30 @@ namespace net_capture {
     static const GUID GUID_AIDA_SUBLAYER =
         { 0x7a8b3c1f, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf8 } };
 
-    // Capture filter settings
+
     inline UINT32 g_filter_pid = 0;
     inline UINT32 g_filter_port = 0;
     inline UINT32 g_filter_protocol = 0;
     inline UINT8  g_filter_ip[16] = {};
     inline UINT32 g_max_payload = NET_PKT_MAX_PAYLOAD;
 
-    // Ring buffer for captured packets
+
     #define RING_BUFFER_SIZE 2048
     inline NET_PACKET_ENTRY* g_ring_buffer = nullptr;
-    inline volatile LONG g_ring_head = 0;    // write index
-    inline volatile LONG g_ring_tail = 0;    // read index
-    inline volatile LONG g_ring_count = 0;   // current count
+    inline volatile LONG g_ring_head = 0;
+    inline volatile LONG g_ring_tail = 0;
+    inline volatile LONG g_ring_count = 0;
     inline KSPIN_LOCK g_ring_lock;
     inline volatile LONG g_total_captured = 0;
     inline volatile LONG g_total_dropped = 0;
 
-    // Per-process byte/packet counters
+
     inline volatile LONG64 g_global_bytes_sent = 0;
     inline volatile LONG64 g_global_bytes_recv = 0;
     inline volatile LONG64 g_global_pkts_sent = 0;
     inline volatile LONG64 g_global_pkts_recv = 0;
 
-    // DNS log ring buffer
+
     #define DNS_RING_SIZE 256
     inline NET_DNS_ENTRY* g_dns_ring = nullptr;
     inline volatile LONG g_dns_head = 0;
@@ -370,16 +360,16 @@ namespace net_capture {
     inline KSPIN_LOCK g_dns_lock;
     inline volatile LONG g_total_dns = 0;
 
-    // Debug counters for sampled classify logging.
+
     inline volatile LONG g_dbg_inbound_seen = 0;
     inline volatile LONG g_dbg_outbound_seen = 0;
 
-    // Packet filter rules
+
     #define MAX_FILTER_RULES 64
     typedef struct _ACTIVE_FILTER_RULE {
         UINT32 rule_id;
-        UINT32 action;       // 0=allow, 1=block, 2=log
-        UINT32 direction;    // 0=in, 1=out, 2=both
+        UINT32 action;
+        UINT32 direction;
         UINT32 protocol;
         UINT32 pid;
         UINT32 port;
@@ -392,9 +382,6 @@ namespace net_capture {
     inline volatile LONG g_next_rule_id = 1;
     inline volatile LONG g_active_rule_count = 0;
 
-    // ================================================================
-    // Helpers
-    // ================================================================
 
     __forceinline BOOLEAN is_zero_ip(const UINT8* ip) {
         for (int i = 0; i < 16; i++) {
@@ -405,7 +392,7 @@ namespace net_capture {
 
     __forceinline BOOLEAN ip_matches(const UINT8* pkt_ip, const UINT8* rule_ip,
                                       const UINT8* rule_mask, UINT32 af) {
-        UINT32 len = (af == 23) ? 16 : 4;  // AF_INET6=23, AF_INET=2
+        UINT32 len = (af == 23) ? 16 : 4;
         for (UINT32 i = 0; i < len; i++) {
             if ((pkt_ip[i] & rule_mask[i]) != (rule_ip[i] & rule_mask[i]))
                 return FALSE;
@@ -413,7 +400,7 @@ namespace net_capture {
         return TRUE;
     }
 
-    // Parse DNS name from wire format (compressed names are truncated)
+
     __forceinline UINT32 parse_dns_name(const UINT8* dns_data, UINT32 offset,
                                          UINT32 data_len, char* out, UINT32 out_size) {
         UINT32 pos = offset;
@@ -428,7 +415,7 @@ namespace net_capture {
                 pos++;
                 break;
             }
-            // Pointer (compression)
+
             if ((label_len & 0xC0) == 0xC0) {
                 if (pos + 1 >= data_len) break;
                 if (!jumped) return_pos = pos + 2;
@@ -436,10 +423,10 @@ namespace net_capture {
                 pos = ptr_off;
                 jumped = TRUE;
                 jumps++;
-                if (jumps > 64) break; // prevent infinite loops
+                if (jumps > 64) break;
                 continue;
             }
-            if (label_len > 63) break; // invalid label
+            if (label_len > 63) break;
             pos++;
             if (pos + label_len > data_len) break;
             if (out_pos > 0 && out_pos < out_size - 1) {
@@ -454,11 +441,11 @@ namespace net_capture {
         return jumped ? return_pos : pos;
     }
 
-    // Check if a packet matches any block rule
+
     __forceinline UINT32 check_filter_rules(UINT32 direction, UINT32 protocol,
                                              UINT32 pid, UINT32 port,
                                              const UINT8* remote_ip, UINT32 af) {
-        // Returns: 0 = no matching rule (allow), 1 = block, 2 = log_only
+
         for (UINT32 i = 0; i < MAX_FILTER_RULES; i++) {
             if (!g_filter_rules[i].active) continue;
             const ACTIVE_FILTER_RULE* r = &g_filter_rules[i];
@@ -473,17 +460,17 @@ namespace net_capture {
             }
             return r->action;
         }
-        return 0; // default: allow
+        return 0;
     }
 
-    // Store a packet in the ring buffer
+
     __forceinline void store_packet(UINT32 direction, UINT32 protocol,
                                      UINT32 pid, UINT32 local_port, UINT32 remote_port,
                                      UINT32 af, const UINT8* local_ip, const UINT8* remote_ip,
                                      const UINT8* payload_data, UINT32 payload_len) {
         if (!g_ring_buffer) return;
 
-        // Apply capture filter
+
         if (g_filter_pid != 0 && pid != g_filter_pid) return;
         if (g_filter_port != 0 && local_port != g_filter_port && remote_port != g_filter_port) return;
         if (g_filter_protocol != 0 && protocol != g_filter_protocol) return;
@@ -500,7 +487,7 @@ namespace net_capture {
         KeAcquireSpinLock(&g_ring_lock, &old_irql);
 
         if (g_ring_count >= RING_BUFFER_SIZE) {
-            // Drop oldest
+
             g_ring_tail = (g_ring_tail + 1) % RING_BUFFER_SIZE;
             g_ring_count--;
             _InterlockedIncrement(&g_total_dropped);
@@ -539,7 +526,7 @@ namespace net_capture {
         KeReleaseSpinLock(&g_ring_lock, old_irql);
     }
 
-    // Store a DNS query/response
+
     __forceinline void store_dns_entry(UINT32 pid, const char* domain,
                                         UINT32 query_type, UINT32 response_code,
                                         const UINT8* resolved, UINT32 ttl) {
@@ -583,11 +570,11 @@ namespace net_capture {
         KeReleaseSpinLock(&g_dns_lock, old_irql);
     }
 
-    // Try to parse DNS from UDP port 53 traffic
+
     __forceinline void try_parse_dns(UINT32 pid, const UINT8* data, UINT32 data_len,
                                       UINT32 local_port, UINT32 remote_port) {
         if (local_port != 53 && remote_port != 53) return;
-        if (data_len < 12) return; // DNS header is 12 bytes minimum
+        if (data_len < 12) return;
 
         UINT16 flags = ((UINT16)data[2] << 8) | data[3];
         UINT16 qdcount = ((UINT16)data[4] << 8) | data[5];
@@ -600,20 +587,20 @@ namespace net_capture {
         char domain[260] = {};
         UINT32 pos = 12;
 
-        // Parse first question
+
         pos = parse_dns_name(data, pos, data_len, domain, sizeof(domain));
         if (pos == 0 || pos + 4 > data_len) return;
 
         UINT16 qtype = ((UINT16)data[pos] << 8) | data[pos + 1];
-        pos += 4; // skip qtype + qclass
+        pos += 4;
 
         UINT8 resolved[16] = {};
         UINT32 ttl = 0;
 
-        // If response, try to extract first A/AAAA answer
+
         if (is_response && ancount > 0 && pos < data_len) {
             for (UINT16 i = 0; i < ancount && pos < data_len; i++) {
-                // Skip answer name
+
                 if ((data[pos] & 0xC0) == 0xC0) {
                     pos += 2;
                 } else {
@@ -627,7 +614,7 @@ namespace net_capture {
                 if (pos + 10 > data_len) break;
 
                 UINT16 atype = ((UINT16)data[pos] << 8) | data[pos + 1];
-                pos += 4; // type + class
+                pos += 4;
                 ttl = ((UINT32)data[pos] << 24) | ((UINT32)data[pos+1] << 16) |
                       ((UINT32)data[pos+2] << 8) | data[pos+3];
                 pos += 4;
@@ -662,9 +649,6 @@ namespace net_capture {
         return FALSE;
     }
 
-    // ================================================================
-    // WFP Classify callbacks
-    // ================================================================
 
     void NTAPI classify_inbound(
         const FWPS_INCOMING_VALUES0_COMPAT* inFixedValues,
@@ -729,33 +713,32 @@ namespace net_capture {
                     seen, g_capture_active, pid, protocol, local_port, remote_port);
             }
 
-            // Update stats
+
             _InterlockedIncrement64(&g_global_pkts_recv);
 
-            // Check filter rules
+
             UINT32 rule_action = check_filter_rules(0, protocol, pid, remote_port, remote_ip, 2);
-            if (rule_action == 1) { // block
+            if (rule_action == 1) {
                 classifyOut->actionType = FWP_ACTION_BLOCK_;
                 classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
                 return;
             }
 
-            // Extract packet data from NET_BUFFER_LIST if available
+
             UINT8 pkt_data[NET_PKT_MAX_PAYLOAD] = {};
             UINT32 pkt_len = 0;
 
             if (layerData) {
                 __try {
-                    // layerData is a PNET_BUFFER_LIST at transport layer
-                    // NET_BUFFER_LIST->FirstNetBuffer->DataLength / MdlChain
-                    // We access it carefully with SEH protection
+
+
                     PVOID nbl = layerData;
-                    // First field of NET_BUFFER_LIST at offset 0x10 (Next) then FirstNetBuffer
-                    PVOID first_nb = *(PVOID*)((UINT8*)nbl + sizeof(PVOID) * 2); // FirstNetBuffer
+
+                    PVOID first_nb = *(PVOID*)((UINT8*)nbl + sizeof(PVOID) * 2);
                     if (first_nb && _MmIsAddressValid(first_nb)) {
-                        UINT32 data_length = *(UINT32*)((UINT8*)first_nb + 0x18); // DataLength
-                        UINT32 data_offset = *(UINT32*)((UINT8*)first_nb + 0x14); // DataOffset
-                        PMDL mdl_chain = *(PMDL*)((UINT8*)first_nb + 0x08); // MdlChain
+                        UINT32 data_length = *(UINT32*)((UINT8*)first_nb + 0x18);
+                        UINT32 data_offset = *(UINT32*)((UINT8*)first_nb + 0x14);
+                        PMDL mdl_chain = *(PMDL*)((UINT8*)first_nb + 0x08);
 
                         if (mdl_chain && _MmIsAddressValid(mdl_chain) && data_length > 0) {
                             PVOID mapped = _MmMapLockedPagesSpecifyCache(
@@ -776,27 +759,27 @@ namespace net_capture {
                 _InterlockedExchangeAdd64(&g_global_bytes_recv, (LONG64)pkt_len);
             }
 
-            // Bandwidth monitoring
+
             net_bw::record_traffic(pid, 0, pkt_len);
 
-            // Packet modification engine
+
             if (pkt_len > 0) {
                 net_mod::apply_modifications(pkt_data, &pkt_len, NET_PKT_MAX_PAYLOAD,
                                             0, protocol, remote_port, pid);
             }
 
-            // TCP stream reassembly feed
+
             if (protocol == 6 && pkt_len > 0) {
                 net_stream::feed_packet(local_port, remote_port, pid,
                                        local_ip, remote_ip, pkt_data, pkt_len);
             }
 
-            // Network fingerprinting (analyze inbound SYN-ACK)
+
             if (protocol == 6 && pkt_len >= 20) {
                 net_fingerprint::analyze_tcp_syn(remote_ip, 2, pkt_data, pkt_len, 0);
             }
 
-            // DPI analysis
+
             {
                 LARGE_INTEGER dpi_ts;
                 KeQuerySystemTime(&dpi_ts);
@@ -805,7 +788,7 @@ namespace net_capture {
                     pkt_data, pkt_len);
             }
 
-            // Intercept-and-hold check
+
             if (net_intercept::try_hold_packet(0, protocol, local_port, remote_port,
                     local_ip, remote_ip, 2, pid, pkt_data, pkt_len)) {
                 classifyOut->actionType = FWP_ACTION_BLOCK_;
@@ -813,12 +796,12 @@ namespace net_capture {
                 return;
             }
 
-            // Store packet if capture is active
+
             if (g_capture_active) {
                 store_packet(0, protocol, pid, local_port, remote_port,
                     2, local_ip, remote_ip, pkt_data, pkt_len);
 
-                // Try DNS parsing
+
                 if (protocol == 17) {
                     try_parse_dns(pid, pkt_data, pkt_len, local_port, remote_port);
                 }
@@ -930,22 +913,22 @@ namespace net_capture {
                 _InterlockedExchangeAdd64(&g_global_bytes_sent, (LONG64)pkt_len);
             }
 
-            // Bandwidth monitoring
+
             net_bw::record_traffic(pid, 1, pkt_len);
 
-            // Packet modification engine
+
             if (pkt_len > 0) {
                 net_mod::apply_modifications(pkt_data, &pkt_len, NET_PKT_MAX_PAYLOAD,
                                             1, protocol, remote_port, pid);
             }
 
-            // TCP stream reassembly feed
+
             if (protocol == 6 && pkt_len > 0) {
                 net_stream::feed_packet(local_port, remote_port, pid,
                                        local_ip, remote_ip, pkt_data, pkt_len);
             }
 
-            // DPI analysis
+
             {
                 LARGE_INTEGER dpi_ts;
                 KeQuerySystemTime(&dpi_ts);
@@ -954,7 +937,7 @@ namespace net_capture {
                     pkt_data, pkt_len);
             }
 
-            // Intercept-and-hold check
+
             if (net_intercept::try_hold_packet(1, protocol, local_port, remote_port,
                     local_ip, remote_ip, 2, pid, pkt_data, pkt_len)) {
                 classifyOut->actionType = FWP_ACTION_BLOCK_;
@@ -983,9 +966,6 @@ namespace net_capture {
         return STATUS_SUCCESS;
     }
 
-    // ================================================================
-    // Find fwpkclnt.sys module and resolve WFP functions
-    // ================================================================
 
     PVOID find_module_base(const char* module_name) {
         ULONG required = 0;
@@ -1023,7 +1003,7 @@ namespace net_capture {
         AIDA_NET_LOG0("resolve_wfp_functions: begin");
         PVOID fwp_base = find_module_base("FWPKCLNT.SYS");
         if (!fwp_base) {
-            // Try lowercase
+
             fwp_base = find_module_base("fwpkclnt.sys");
         }
         if (!fwp_base) {
@@ -1067,9 +1047,6 @@ namespace net_capture {
         return ok;
     }
 
-    // ================================================================
-    // WFP registration / unregistration
-    // ================================================================
 
     NTSTATUS register_wfp(PDEVICE_OBJECT devObj) {
         if (!devObj) {
@@ -1087,15 +1064,15 @@ namespace net_capture {
 
         NTSTATUS status;
 
-        // Open BFE engine
-        status = _FwpmEngineOpen0(nullptr, 0x0000000A /*RPC_C_AUTHN_WINNT*/,
+
+        status = _FwpmEngineOpen0(nullptr, 0x0000000A ,
             nullptr, nullptr, &g_engine_handle);
         if (!NT_SUCCESS(status)) {
             AIDA_NET_LOG("register_wfp: FwpmEngineOpen0 failed status=0x%08X", (UINT32)status);
             return status;
         }
 
-        // Begin transaction
+
         status = _FwpmTransactionBegin0(g_engine_handle, 0);
         if (!NT_SUCCESS(status)) {
             AIDA_NET_LOG("register_wfp: FwpmTransactionBegin0 failed status=0x%08X", (UINT32)status);
@@ -1104,7 +1081,7 @@ namespace net_capture {
             return status;
         }
 
-        // Add sublayer
+
         FWPM_DISPLAY_DATA0 sublayer_display = {};
         wchar_t sl_name[] = L"AiDANetSublayer";
         wchar_t sl_desc[] = L"AiDA Network Monitor Sublayer";
@@ -1126,7 +1103,7 @@ namespace net_capture {
             return status;
         }
 
-        // Register inbound callout with kernel (FWPS)
+
         FWPS_CALLOUT2_COMPAT callout_in = {};
         callout_in.calloutKey = GUID_AIDA_CALLOUT_INBOUND;
         callout_in.flags = 0;
@@ -1143,7 +1120,7 @@ namespace net_capture {
             return status;
         }
 
-        // Register outbound callout with kernel (FWPS)
+
         FWPS_CALLOUT2_COMPAT callout_out = {};
         callout_out.calloutKey = GUID_AIDA_CALLOUT_OUTBOUND;
         callout_out.flags = 0;
@@ -1161,7 +1138,7 @@ namespace net_capture {
             return status;
         }
 
-        // Add callouts to BFE (FWPM)
+
         FWPM_DISPLAY_DATA0 callout_display = {};
         wchar_t co_name[] = L"AiDANetCallout";
         wchar_t co_desc[] = L"AiDA Network Monitor Callout";
@@ -1201,7 +1178,7 @@ namespace net_capture {
             return status;
         }
 
-        // Add filters
+
         FWPM_DISPLAY_DATA0 filter_display = {};
         wchar_t fi_name[] = L"AiDANetFilter";
         wchar_t fi_desc[] = L"AiDA Network Monitor Filter";
@@ -1213,7 +1190,7 @@ namespace net_capture {
         filter_in.displayData = filter_display;
         filter_in.layerKey = GUID_LAYER_INBOUND_V4;
         filter_in.subLayerKey = GUID_AIDA_SUBLAYER;
-        // FWP_EMPTY lets BFE assign automatic weight and avoids invalid pointer semantics.
+
         filter_in.weight.type = FWP_EMPTY_;
         filter_in.action.type = FWP_ACTION_CALLOUT_TERMINATING_;
         filter_in.action.action.calloutKey = GUID_AIDA_CALLOUT_INBOUND;
@@ -1264,7 +1241,7 @@ namespace net_capture {
             return status;
         }
 
-        // Commit transaction
+
         status = _FwpmTransactionCommit0(g_engine_handle);
         if (!NT_SUCCESS(status)) {
             AIDA_NET_LOG("register_wfp: FwpmTransactionCommit0 failed status=0x%08X", (UINT32)status);
@@ -1309,9 +1286,6 @@ namespace net_capture {
         }
     }
 
-    // ================================================================
-    // Initialization / Cleanup
-    // ================================================================
 
     NTSTATUS initialize(PDEVICE_OBJECT devObj) {
         AIDA_NET_LOG("initialize: begin devObj=%p", devObj);
@@ -1323,11 +1297,11 @@ namespace net_capture {
             return (g_wfp_initialized == 2) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
         }
 
-        // Initialize spin locks
+
         KeInitializeSpinLock(&g_ring_lock);
         KeInitializeSpinLock(&g_dns_lock);
 
-        // Allocate ring buffers
+
         SIZE_T ring_size = (SIZE_T)RING_BUFFER_SIZE * sizeof(NET_PACKET_ENTRY);
         g_ring_buffer = (NET_PACKET_ENTRY*)ExAllocatePool2(
             POOL_FLAG_NON_PAGED, ring_size, 'pkNW');
@@ -1348,7 +1322,7 @@ namespace net_capture {
         }
         strong::kmemset(g_dns_ring, 0, dns_size);
 
-        // Resolve WFP functions
+
         if (!resolve_wfp_functions()) {
             AIDA_NET_LOG0("initialize: resolve_wfp_functions failed");
             ExFreePoolWithTag(g_ring_buffer, 'pkNW');
@@ -1359,7 +1333,7 @@ namespace net_capture {
             return STATUS_NOT_SUPPORTED;
         }
 
-        // Register WFP callouts
+
         NTSTATUS status = register_wfp(devObj);
         if (!NT_SUCCESS(status)) {
             AIDA_NET_LOG("initialize: register_wfp failed status=0x%08X", (UINT32)status);
@@ -1397,16 +1371,12 @@ namespace net_capture {
         AIDA_NET_LOG0("cleanup: complete");
     }
 
-} // namespace net_capture
+}
 
-
-// =====================================================================
-// Connection enumeration using kernel process/handle table walking
-// =====================================================================
 
 namespace net_enum {
 
-    // TCP state constants matching Windows internal values
+
     #define TCP_STATE_CLOSED       0
     #define TCP_STATE_LISTEN       1
     #define TCP_STATE_SYN_SENT     2
@@ -1420,7 +1390,7 @@ namespace net_enum {
     #define TCP_STATE_TIME_WAIT    10
     #define TCP_STATE_DELETE_TCB   11
 
-    // NSI structures for enumerating TCP/UDP endpoints
+
     typedef struct _MIB_TCPROW2 {
         UINT32 dwState;
         UINT32 dwLocalAddr;
@@ -1437,10 +1407,6 @@ namespace net_enum {
         UINT32 dwOwningPid;
     } MIB_UDPROW_OWNER_PID;
 
-    // AllocateAndGetTcpExTableFromStack and similar are not kernel-exported.
-    // We use ZwQuerySystemInformation with undocumented network classes.
-    // Alternative: walk tcpip.sys internal partition table.
-    // For robustness, we use the user-mode helper approach via process attach.
 
     typedef NTSTATUS(NTAPI* fn_NsiEnumerateObjectsAllParameters)(
         UINT64 NsiHandle, UINT32 Nsi0, const PVOID NsiModule,
@@ -1453,17 +1419,15 @@ namespace net_enum {
     inline fn_NsiEnumerateObjectsAllParameters _NsiEnumerate = nullptr;
     inline volatile LONG g_nsi_resolved = 0;
 
-    // NSI module identifiers for TCP and UDP
-    // These are GUID-like structures that identify the NSI module
-    // NPI_MS_TCP_MODULEID: {eb004a03-9b1a-11d4-9123-0050047759bc}
+
     static const UINT8 NPI_MS_TCP_MODULEID[24] = {
-        0x18, 0x00, 0x00, 0x00, // length
-        0x01, 0x00, 0x00, 0x00, // type
+        0x18, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00,
         0x03, 0x4a, 0x00, 0xeb, 0x1a, 0x9b, 0xd4, 0x11,
         0x91, 0x23, 0x00, 0x50, 0x04, 0x77, 0x59, 0xbc
     };
 
-    // NPI_MS_UDP_MODULEID: {eb004a02-9b1a-11d4-9123-0050047759bc}
+
     static const UINT8 NPI_MS_UDP_MODULEID[24] = {
         0x18, 0x00, 0x00, 0x00,
         0x01, 0x00, 0x00, 0x00,
@@ -1471,11 +1435,11 @@ namespace net_enum {
         0x91, 0x23, 0x00, 0x50, 0x04, 0x77, 0x59, 0xbc
     };
 
-    // TCP key structure for NSI enumeration
+
     #pragma pack(push, 1)
     typedef struct _NSI_TCP_KEY {
-        UINT8  local_addr[16]; // IN6_ADDR (IPv4-mapped for v4)
-        UINT32 local_port;     // network byte order
+        UINT8  local_addr[16];
+        UINT32 local_port;
         UINT8  remote_addr[16];
         UINT32 remote_port;
     } NSI_TCP_KEY;
@@ -1509,7 +1473,7 @@ namespace net_enum {
             return _NsiEnumerate != nullptr;
         }
 
-        // Find nsi.sys or netio.sys and resolve NsiEnumerateObjectsAllParameters
+
         PVOID netio = net_capture::find_module_base("netio.sys");
         if (!netio) netio = net_capture::find_module_base("NETIO.SYS");
 
@@ -1530,13 +1494,13 @@ namespace net_enum {
 
         request->connection_count = 0;
 
-        // If NSI is available, use it for native kernel enumeration
+
         if (resolve_nsi() && _NsiEnumerate) {
-            // Enumerate TCP connections
+
             if (request->filter_protocol == 0 || request->filter_protocol == 6) {
                 UINT32 tcp_count = 0;
 
-                // First call to get count
+
                 NTSTATUS status = _NsiEnumerate(
                     0, 0, (PVOID)NPI_MS_TCP_MODULEID, 3,
                     nullptr, sizeof(NSI_TCP_KEY),
@@ -1582,24 +1546,24 @@ namespace net_enum {
                                 e->pid = pid;
                                 e->protocol = 6;
                                 e->state = dyns[i].state;
-                                // Port is in network byte order, swap to host
+
                                 e->local_port = (UINT16)((keys[i].local_port >> 8) |
                                     ((keys[i].local_port & 0xFF) << 8));
                                 e->remote_port = (UINT16)((keys[i].remote_port >> 8) |
                                     ((keys[i].remote_port & 0xFF) << 8));
 
-                                // Check if IPv4-mapped IPv6 (::ffff:x.x.x.x)
+
                                 BOOLEAN is_v4 = TRUE;
                                 for (int j = 0; j < 10; j++) {
                                     if (keys[i].local_addr[j] != 0) { is_v4 = FALSE; break; }
                                 }
                                 if (is_v4 && keys[i].local_addr[10] == 0xFF &&
                                     keys[i].local_addr[11] == 0xFF) {
-                                    e->address_family = 2; // AF_INET
+                                    e->address_family = 2;
                                     strong::kmemcpy(e->local_addr, &keys[i].local_addr[12], 4);
                                     strong::kmemcpy(e->remote_addr, &keys[i].remote_addr[12], 4);
                                 } else {
-                                    e->address_family = 23; // AF_INET6
+                                    e->address_family = 23;
                                     strong::kmemcpy(e->local_addr, keys[i].local_addr, 16);
                                     strong::kmemcpy(e->remote_addr, keys[i].remote_addr, 16);
                                 }
@@ -1615,7 +1579,7 @@ namespace net_enum {
                 }
             }
 
-            // Enumerate UDP bindings
+
             if (request->filter_protocol == 0 || request->filter_protocol == 17) {
                 UINT32 udp_count = 0;
 
@@ -1695,12 +1659,8 @@ namespace net_enum {
         return STATUS_SUCCESS;
     }
 
-} // namespace net_enum
+}
 
-
-// =====================================================================
-// IOCTL handler implementations
-// =====================================================================
 
 NTSTATUS functions::handle_net_enum_conn(p_net_enum_conn request) {
     if (!request) return STATUS_INVALID_PARAMETER;
@@ -1720,7 +1680,7 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
     }
 
     switch (request->operation) {
-        case 0: { // start capture
+        case 0: {
             net_capture::g_filter_pid = request->filter_pid;
             net_capture::g_filter_port = request->filter_port;
             net_capture::g_filter_protocol = request->filter_protocol;
@@ -1730,7 +1690,7 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
             else
                 net_capture::g_max_payload = NET_PKT_MAX_PAYLOAD;
 
-            // Clear ring buffer
+
             KIRQL old_irql;
             KeAcquireSpinLock(&net_capture::g_ring_lock, &old_irql);
             net_capture::g_ring_head = 0;
@@ -1745,12 +1705,12 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
             request->capture_active = 1;
             break;
         }
-        case 1: { // stop capture
+        case 1: {
             _InterlockedExchange(&net_capture::g_capture_active, 0);
             request->capture_active = 0;
             break;
         }
-        case 2: { // query status
+        case 2: {
             break;
         }
         default:
@@ -1815,7 +1775,7 @@ NTSTATUS functions::handle_net_dns_get(p_net_dns_get request) {
     for (UINT32 i = 0; i < to_read; i++) {
         NET_DNS_ENTRY* src = &net_capture::g_dns_ring[net_capture::g_dns_tail];
 
-        // Apply PID filter
+
         if (request->filter_pid == 0 || src->pid == request->filter_pid) {
             strong::kmemcpy(&request->entries[out_idx], src, sizeof(NET_DNS_ENTRY));
             out_idx++;
@@ -1836,7 +1796,7 @@ NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
     if (!request) return STATUS_INVALID_PARAMETER;
 
     switch (request->operation) {
-        case 0: { // add rule
+        case 0: {
             for (UINT32 i = 0; i < MAX_FILTER_RULES; i++) {
                 if (_InterlockedCompareExchange(&net_capture::g_filter_rules[i].active, 1, 0) == 0) {
                     UINT32 id = (UINT32)_InterlockedIncrement(&net_capture::g_next_rule_id);
@@ -1855,9 +1815,9 @@ NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
                     return STATUS_SUCCESS;
                 }
             }
-            return STATUS_INSUFFICIENT_RESOURCES; // rule table full
+            return STATUS_INSUFFICIENT_RESOURCES;
         }
-        case 1: { // remove rule by id
+        case 1: {
             for (UINT32 i = 0; i < MAX_FILTER_RULES; i++) {
                 if (net_capture::g_filter_rules[i].active &&
                     net_capture::g_filter_rules[i].rule_id == request->rule_id) {
@@ -1869,7 +1829,7 @@ NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
             }
             return STATUS_NOT_FOUND;
         }
-        case 2: { // clear all rules
+        case 2: {
             for (UINT32 i = 0; i < MAX_FILTER_RULES; i++) {
                 _InterlockedExchange(&net_capture::g_filter_rules[i].active, 0);
             }
@@ -1877,7 +1837,7 @@ NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
             request->rule_count = 0;
             return STATUS_SUCCESS;
         }
-        case 3: { // list (return count)
+        case 3: {
             request->rule_count = (UINT32)net_capture::g_active_rule_count;
             return STATUS_SUCCESS;
         }
@@ -1893,7 +1853,7 @@ NTSTATUS functions::handle_net_stats(p_net_stats request) {
     request->bytes_received = (UINT64)net_capture::g_global_bytes_recv;
     request->packets_sent = (UINT64)net_capture::g_global_pkts_sent;
     request->packets_received = (UINT64)net_capture::g_global_pkts_recv;
-    request->active_connections = 0; // populated by enumeration
+    request->active_connections = 0;
     request->capture_active = (UINT32)net_capture::g_capture_active;
     request->total_captured = (UINT32)net_capture::g_total_captured;
     request->total_dropped = (UINT32)net_capture::g_total_dropped;
@@ -1903,11 +1863,7 @@ NTSTATUS functions::handle_net_stats(p_net_stats request) {
     return STATUS_SUCCESS;
 }
 
-// =====================================================================
-// Advanced network recon: WFP callout enumeration
-// =====================================================================
 
-// WFP management API function types for callout enumeration
 typedef NTSTATUS(NTAPI* fn_FwpmCalloutCreateEnumHandle0)(
     HANDLE engineHandle, const VOID* enumTemplate, HANDLE* enumHandle);
 typedef NTSTATUS(NTAPI* fn_FwpmCalloutDestroyEnumHandle0)(
@@ -1917,7 +1873,7 @@ typedef NTSTATUS(NTAPI* fn_FwpmCalloutEnum0)(
     FWPM_CALLOUT0_COMPAT*** entries, UINT32* numEntriesReturned);
 typedef VOID(NTAPI* fn_FwpmFreeMemory0)(VOID** p);
 
-// FWPS_CALLOUT0 — the kernel-side registered callout (different from FWPM_CALLOUT0_COMPAT)
+
 typedef struct _FWPS_CALLOUT_ENUM_ENTRY {
     GUID   calloutKey;
     UINT32 calloutId;
@@ -1933,7 +1889,7 @@ typedef NTSTATUS(NTAPI* fn_FwpsCalloutEnum0)(
 
 namespace net_wfp_enum {
 
-    // Resolve a module base address to its name
+
     static void get_module_name_for_address(UINT64 address, char* out_name, SIZE_T max_len) {
         out_name[0] = 0;
         if (address == 0) return;
@@ -1979,13 +1935,13 @@ namespace net_wfp_enum {
 
         request->callout_count = 0;
 
-        // Ensure WFP engine is available
+
         if (!net_capture::_FwpmEngineOpen0 || !net_capture::_FwpmEngineClose0) {
             if (!net_capture::resolve_wfp_functions())
                 return STATUS_NOT_SUPPORTED;
         }
 
-        // Resolve additional WFP enumeration functions from fwpkclnt.sys
+
         PVOID fwp_base = net_capture::find_module_base("FWPKCLNT.SYS");
         if (!fwp_base) fwp_base = net_capture::find_module_base("fwpkclnt.sys");
         if (!fwp_base) return STATUS_NOT_FOUND;
@@ -2003,7 +1959,7 @@ namespace net_wfp_enum {
         if (!_CreateEnum || !_DestroyEnum || !_Enum || !_FreeMem)
             return STATUS_NOT_SUPPORTED;
 
-        // Open a temporary engine handle for enumeration
+
         HANDLE engine = nullptr;
         NTSTATUS status = net_capture::_FwpmEngineOpen0(nullptr, 0, nullptr, nullptr, &engine);
         if (!NT_SUCCESS(status) || !engine)
@@ -2019,7 +1975,7 @@ namespace net_wfp_enum {
         UINT32 total_filled = 0;
         BOOLEAN has_filter = (request->filter_module[0] != 0);
 
-        // Enumerate in batches
+
         while (total_filled < MAX_WFP_CALLOUTS) {
             FWPM_CALLOUT0_COMPAT** entries = nullptr;
             UINT32 returned = 0;
@@ -2039,36 +1995,31 @@ namespace net_wfp_enum {
                 out->applicable_layer = c->applicableLayer;
                 out->flags = c->flags;
 
-                // The FWPM_CALLOUT0 has providerKey but no classify/notify ptrs.
-                // The classify/notify are in FWPS (kernel-side) data.
-                // We resolve the owning module from providerKey or scan for the callout ID.
+
                 out->classify_fn = 0;
                 out->notify_fn = 0;
                 out->flow_delete_fn = 0;
 
-                // Try to find callout function addresses from FWPS callout registration
-                // The FWPS_CALLOUT data is internal to netio.sys/fwpkclnt.sys.
-                // We can look up the provider module name from system module list
-                // by checking the provider data or displayData.
+
                 if (c->providerKey && _MmIsAddressValid(c->providerKey)) {
-                    // store provider key as module base hint
+
                 }
 
-                // displayData.name often contains the driver/callout name
+
                 __try {
                     wchar_t* wname = c->displayData.name;
                     if (wname && _MmIsAddressValid(wname)) {
-                        // Convert wide to ASCII for module name
+
                         for (int j = 0; j < 63 && wname[j]; j++) {
                             out->owning_module[j] = (char)(wname[j] & 0x7F);
                         }
                     }
                 } __except(EXCEPTION_EXECUTE_HANDLER) {}
 
-                // If we have a module name filter, check it
+
                 if (has_filter) {
                     if (out->owning_module[0] == 0) continue;
-                    // Substring search
+
                     BOOLEAN match = FALSE;
                     SIZE_T flen = 0;
                     while (request->filter_module[flen] && flen < 63) flen++;
@@ -2104,33 +2055,30 @@ namespace net_wfp_enum {
     }
 }
 
-// =====================================================================
-// Advanced network recon: Socket handle enumeration via EPROCESS
-// =====================================================================
 
 namespace net_socket_enum {
 
-    // Object type name for AFD endpoints
+
     static BOOLEAN is_afd_device_object(PVOID object) {
         if (!object || !_MmIsAddressValid(object)) return FALSE;
 
         __try {
-            // FILE_OBJECT has DeviceObject at offset 0x08 (Win10+)
+
             PDEVICE_OBJECT devObj = ((PFILE_OBJECT)object)->DeviceObject;
             if (!devObj || !_MmIsAddressValid(devObj)) return FALSE;
 
-            // Check if the device object belongs to AFD driver
+
             PDRIVER_OBJECT drvObj = devObj->DriverObject;
             if (!drvObj || !_MmIsAddressValid(drvObj)) return FALSE;
 
-            // DriverName is at a known offset in DRIVER_OBJECT
+
             PUNICODE_STRING drvName = &drvObj->DriverName;
             if (!drvName->Buffer || !_MmIsAddressValid(drvName->Buffer)) return FALSE;
 
-            // Check for "\\Driver\\AFD" or "\\Device\\Afd"
+
             if (drvName->Length < 8) return FALSE;
             wchar_t* buf = drvName->Buffer;
-            // Look for "AFD" or "Afd" in the driver name
+
             for (USHORT i = 0; i + 2 < drvName->Length / sizeof(wchar_t); i++) {
                 wchar_t c0 = buf[i];
                 wchar_t c1 = buf[i + 1];
@@ -2147,16 +2095,15 @@ namespace net_socket_enum {
         return FALSE;
     }
 
-    // Offsets for Windows 10/11 22H2+ EPROCESS -> ObjectTable
-    // These are version-dependent; we use known Win10 22H2/Win11 24H2 offsets
+
     static constexpr ULONG EPROCESS_OBJECT_TABLE_OFFSET_W10     = 0x570;
     static constexpr ULONG EPROCESS_OBJECT_TABLE_OFFSET_W11     = 0x570;
     static constexpr ULONG EPROCESS_UNIQUE_PROCESS_ID_OFFSET    = 0x440;
 
-    // HANDLE_TABLE_ENTRY layout
+
     typedef struct _HANDLE_TABLE_ENTRY_W10 {
         union {
-            UINT64 ObjectPointerBits;   // bits 1-44 = encoded pointer, bit 0 = lock
+            UINT64 ObjectPointerBits;
             UINT64 Value;
         };
         union {
@@ -2171,74 +2118,59 @@ namespace net_socket_enum {
         UINT16 Spare2;
     } HANDLE_TABLE_ENTRY_W10;
 
-    // Decode Object pointer from handle table entry
-    // The top bits and bottom bits are encoded
+
     static PVOID decode_object_pointer(UINT64 value) {
-        // Strip lock bit and sign extend from bits 1-44
-        // Object header = (value >> 4) & ~0xF shifted to canonical address
+
+
         if (value == 0) return nullptr;
-        // Windows uses: Object = (HandleTableEntry->ObjectPointerBits >> 0x10) & 0xFFFFFFFFFFF0
-        // Simplified: address = ((value >> 16) | 0xFFFF000000000000)
+
+
         UINT64 addr = (value >> 0x10) & 0x0000FFFFFFFFFFFF;
         if (addr == 0) return nullptr;
-        addr |= 0xFFFF000000000000ULL;  // sign extend to kernel space
+        addr |= 0xFFFF000000000000ULL;
         return (PVOID)addr;
     }
 
-    // Try to extract socket info from an AFD endpoint file object
+
     static BOOLEAN extract_socket_info(PVOID file_object, SOCKET_HANDLE_ENTRY* out) {
         if (!file_object || !_MmIsAddressValid(file_object)) return FALSE;
 
         __try {
             PFILE_OBJECT fo = (PFILE_OBJECT)file_object;
-            // AFD stores its endpoint context in FsContext
+
             PVOID afd_endpoint = fo->FsContext;
             if (!afd_endpoint || !_MmIsAddressValid(afd_endpoint)) return FALSE;
 
             out->afd_endpoint_addr = (UINT64)afd_endpoint;
 
-            // AFD_ENDPOINT internal structure (offsets vary by build)
-            // Common layout for Win10/11:
-            //   +0x00: Type (USHORT)
-            //   +0x02: State (USHORT)
-            //   +0x14: AddressFamily (USHORT)
-            //   +0x16: SocketType (USHORT)
-            //   +0x18: Protocol (LONG)
-            //   +0x20: LocalAddress  (TRANSPORT_ADDRESS pointer or inline)
-            //   +0x28: Context / Connection pointer
-            // These offsets are approximate — we read cautiously
 
             UINT8* ep = (UINT8*)afd_endpoint;
 
-            // Read address family
+
             if (_MmIsAddressValid(ep + 0x14)) {
                 out->address_family = *(UINT16*)(ep + 0x14);
             }
-            // Read protocol
+
             if (_MmIsAddressValid(ep + 0x18)) {
                 LONG proto = *(LONG*)(ep + 0x18);
                 out->protocol = (UINT32)(proto > 0 ? proto : 0);
             }
 
-            // For TCP endpoints, try to read the connection state
-            // The AFD_CONNECTION structure at various offsets stores state info
-            // We don't have reliable offsets for all builds, so we report what we can
+
             out->state = 0;
             out->local_port = 0;
             out->remote_port = 0;
             strong::kmemset(out->local_addr, 0, 16);
             strong::kmemset(out->remote_addr, 0, 16);
 
-            // Try to read local address from TransportInfo
-            // AFD stores bound address info at various offsets
-            // For TCP: +0x20 may point to local SOCKADDR
+
             if (_MmIsAddressValid(ep + 0x20)) {
                 PVOID local_info = *(PVOID*)(ep + 0x20);
                 if (local_info && _MmIsAddressValid(local_info)) {
                     UINT8* sa = (UINT8*)local_info;
                     if (_MmIsAddressValid(sa + 8)) {
                         UINT16 sa_family = *(UINT16*)(sa + 0);
-                        if (sa_family == 2) { // AF_INET: port at +2, addr at +4
+                        if (sa_family == 2) {
                             UINT16 port_be = *(UINT16*)(sa + 2);
                             out->local_port = ((port_be >> 8) & 0xFF) | ((port_be & 0xFF) << 8);
                             strong::kmemcpy(out->local_addr, sa + 4, 4);
@@ -2261,14 +2193,14 @@ namespace net_socket_enum {
         UINT32 target_pid = request->target_pid;
         if (target_pid == 0) return STATUS_INVALID_PARAMETER;
 
-        // Look up the target process
+
         PEPROCESS process = nullptr;
         NTSTATUS status = stack_spoof::spoofed_PsLookupProcessByProcessId(
             (HANDLE)(ULONG_PTR)target_pid, &process);
         if (!NT_SUCCESS(status) || !process) return status ? status : STATUS_NOT_FOUND;
 
         __try {
-            // Get the handle table from EPROCESS
+
             UINT64 eprocess_addr = (UINT64)process;
             PVOID handle_table = nullptr;
 
@@ -2281,13 +2213,10 @@ namespace net_socket_enum {
                 return STATUS_NOT_FOUND;
             }
 
-            // HANDLE_TABLE structure:
-            //   +0x00: TableCode (encoded pointer to handle table levels)
-            //   +0x08: QuotaProcess
-            //   ...
+
             UINT64 table_code = *(UINT64*)handle_table;
 
-            // Table level is encoded in bottom 2 bits
+
             UINT32 level = (UINT32)(table_code & 3);
             UINT64 table_base = table_code & ~3ULL;
 
@@ -2298,15 +2227,11 @@ namespace net_socket_enum {
 
             UINT32 filled = 0;
 
-            // Level 0: single table (up to 256 entries typically)
-            // Level 1: array of L0 table pointers
-            // Level 2: array of L1 table pointers
-            // Handle entry size = 16 bytes, each L0 table = 4096 bytes = 256 entries
 
             auto process_table = [&](UINT64 l0_base) {
                 if (!_MmIsAddressValid((PVOID)l0_base)) return;
-                // Each L0 table page holds (PAGE_SIZE / sizeof(HANDLE_TABLE_ENTRY)) entries
-                constexpr UINT32 ENTRIES_PER_PAGE = 256;  // 4096 / 16
+
+                constexpr UINT32 ENTRIES_PER_PAGE = 256;
                 for (UINT32 i = 1; i < ENTRIES_PER_PAGE && filled < MAX_SOCKET_HANDLES; i++) {
                     UINT64 entry_addr = l0_base + (UINT64)i * 16;
                     if (!_MmIsAddressValid((PVOID)entry_addr)) break;
@@ -2317,16 +2242,16 @@ namespace net_socket_enum {
                     PVOID obj_header = decode_object_pointer(entry->Value);
                     if (!obj_header || !_MmIsAddressValid(obj_header)) continue;
 
-                    // Object body is at OBJECT_HEADER + 0x30 (Win10/11)
+
                     PVOID object = (PVOID)((UINT64)obj_header + 0x30);
                     if (!_MmIsAddressValid(object)) continue;
 
-                    // Check if this is an AFD file object
+
                     if (!is_afd_device_object(object)) continue;
 
                     SOCKET_HANDLE_ENTRY* out = &request->entries[filled];
                     strong::kmemset(out, 0, sizeof(SOCKET_HANDLE_ENTRY));
-                    out->handle_value = (UINT64)i * 4;  // handle = index * 4
+                    out->handle_value = (UINT64)i * 4;
                     out->pid = target_pid;
 
                     if (extract_socket_info(object, out)) {
@@ -2339,8 +2264,8 @@ namespace net_socket_enum {
                 process_table(table_base);
             }
             else if (level == 1) {
-                // L1: array of pointers to L0 tables
-                constexpr UINT32 PTRS_PER_PAGE = 512;  // 4096 / 8
+
+                constexpr UINT32 PTRS_PER_PAGE = 512;
                 for (UINT32 j = 0; j < PTRS_PER_PAGE && filled < MAX_SOCKET_HANDLES; j++) {
                     UINT64 ptr_addr = table_base + (UINT64)j * 8;
                     if (!_MmIsAddressValid((PVOID)ptr_addr)) break;
@@ -2377,13 +2302,10 @@ namespace net_socket_enum {
     }
 }
 
-// =====================================================================
-// Advanced network recon: Network buffer sniffing (HW breakpoint based)
-// =====================================================================
 
 namespace net_sniff {
 
-    // Sniff state — one active sniff session at a time
+
     inline volatile LONG g_sniff_active = 0;
     inline KSPIN_LOCK g_sniff_lock;
     inline BOOLEAN g_sniff_lock_initialized = FALSE;
@@ -2394,12 +2316,8 @@ namespace net_sniff {
     inline UINT32 g_sniff_size_reg = 0;
     inline UINT32 g_sniff_max_captures = 1;
     inline volatile LONG g_sniff_capture_count = 0;
-    inline SNIFF_CAPTURE* g_sniff_captures = nullptr;  // allocated on start
+    inline SNIFF_CAPTURE* g_sniff_captures = nullptr;
 
-    // This is implemented as a lightweight controller —
-    // The actual HW breakpoints and context reads are done through
-    // the existing thread context IOCTL infrastructure.
-    // This IOCTL manages the sniff session state.
 
     static NTSTATUS handle_sniff(p_sniff_net_buffers request) {
         if (!request) return STATUS_INVALID_PARAMETER;
@@ -2410,16 +2328,16 @@ namespace net_sniff {
         }
 
         switch (request->operation) {
-        case 0: // START
+        case 0:
         {
             if (_InterlockedCompareExchange(&g_sniff_active, 1, 0) != 0) {
-                // Already active
+
                 request->active = 1;
                 request->capture_count = (UINT32)g_sniff_capture_count;
                 return STATUS_DEVICE_BUSY;
             }
 
-            // Allocate capture buffer
+
             UINT32 max_cap = request->max_captures;
             if (max_cap == 0) max_cap = 1;
             if (max_cap > SNIFF_MAX_CAPTURES) max_cap = SNIFF_MAX_CAPTURES;
@@ -2443,17 +2361,12 @@ namespace net_sniff {
             g_sniff_size_reg = request->size_reg_index;
             KeReleaseSpinLock(&g_sniff_lock, irql);
 
-            // The actual HW breakpoint is set by the usermode side via
-            // the existing driver_set_hw_breakpoint tool (TCTX IOCTL).
-            // This handler manages session state and capture storage.
-            // The usermode orchestrates: set BP → poll thread context →
-            // read buffer at addr from register → store via this IOCTL result.
 
             request->active = 1;
             request->capture_count = 0;
             return STATUS_SUCCESS;
         }
-        case 1: // STOP
+        case 1:
         {
             _InterlockedExchange(&g_sniff_active, 0);
 
@@ -2470,7 +2383,7 @@ namespace net_sniff {
             request->capture_count = 0;
             return STATUS_SUCCESS;
         }
-        case 2: // GET_RESULTS
+        case 2:
         {
             request->active = (UINT32)g_sniff_active;
             UINT32 count = (UINT32)g_sniff_capture_count;
@@ -2487,13 +2400,13 @@ namespace net_sniff {
 
             return STATUS_SUCCESS;
         }
-        case 3: // STORE_CAPTURE (called from usermode after reading buffer via memory read)
+        case 3:
         {
             if (!g_sniff_active) return STATUS_DEVICE_NOT_READY;
 
             UINT32 idx = (UINT32)_InterlockedIncrement(&g_sniff_capture_count) - 1;
             if (idx >= g_sniff_max_captures) {
-                // Reached max — auto-stop
+
                 _InterlockedExchange(&g_sniff_active, 0);
                 request->active = 0;
                 request->capture_count = g_sniff_max_captures;
@@ -2503,7 +2416,7 @@ namespace net_sniff {
             KIRQL irql;
             KeAcquireSpinLock(&g_sniff_lock, &irql);
             if (g_sniff_captures && idx < g_sniff_max_captures) {
-                // Copy the first capture entry from request as the stored capture
+
                 strong::kmemcpy(&g_sniff_captures[idx], &request->captures[0], sizeof(SNIFF_CAPTURE));
             }
             KeReleaseSpinLock(&g_sniff_lock, irql);
@@ -2511,7 +2424,7 @@ namespace net_sniff {
             request->active = (UINT32)g_sniff_active;
             request->capture_count = idx + 1;
 
-            // Auto-stop if we've hit the max
+
             if (idx + 1 >= g_sniff_max_captures) {
                 _InterlockedExchange(&g_sniff_active, 0);
                 request->active = 0;
@@ -2525,21 +2438,10 @@ namespace net_sniff {
     }
 }
 
-// =====================================================================
-// Advanced network recon: tcpip.sys direct connection table dump
-// =====================================================================
 
 namespace net_tcpip {
 
-    // tcpip.sys partition table structures
-    // Windows maintains TCP connections in a hash table called the
-    // "Partition Table" or "TCB Table" inside tcpip.sys.
-    // We use the NSI (Network Store Interface) approach from netio.sys
-    // as a more reliable method than walking raw tcpip structures,
-    // because the internal TCB layout changes between builds.
-    // But we enhance it with extra data only available from kernel.
 
-    // NPI Module IDs
     #pragma pack(push, 1)
     typedef struct _NPI_MODULEID_TCPIP {
         USHORT Length;
@@ -2559,7 +2461,7 @@ namespace net_tcpip {
         { 0xEB004A02, 0x9B1A, 0x11D4, { 0x91, 0x23, 0x00, 0x50, 0x04, 0x77, 0x59, 0xBC } }
     };
 
-    // NSI enumeration function type
+
     typedef NTSTATUS(NTAPI* fn_NsiEnumObjectsAllParams)(
         ULONG Unknown0, ULONG Unknown1, PVOID ModuleId,
         ULONG InfoClass, PVOID KeyData, ULONG KeySize,
@@ -2568,8 +2470,7 @@ namespace net_tcpip {
         PVOID StaticData, ULONG StaticSize,
         PULONG Count);
 
-    // TCP key/rw/dynamic/static structures (NSI table 3 = established)
-    // These match common Windows 10/11 layouts
+
     #pragma pack(push, 1)
     typedef struct _TCP4_KEY {
         UINT8  local_addr[4];
@@ -2589,7 +2490,7 @@ namespace net_tcpip {
 
     typedef struct _TCP4_STATIC {
         UINT64 create_time;
-        UINT64 mod_pid;   // Bits 0-23 = PID, or full at +8 depending on version
+        UINT64 mod_pid;
     } TCP4_STATIC;
 
     typedef struct _UDP4_KEY {
@@ -2627,7 +2528,7 @@ namespace net_tcpip {
         BOOLEAN want_tcp = (request->filter_protocol == 0 || request->filter_protocol == 6);
         BOOLEAN want_udp = (request->filter_protocol == 0 || request->filter_protocol == 17);
 
-        // ---- TCP connections (NSI table class 3 = established) ----
+
         if (want_tcp) {
             ULONG tcp_count = 0;
             NTSTATUS probe = _NsiEnum(
@@ -2680,7 +2581,7 @@ namespace net_tcpip {
                             strong::kmemcpy(e->local_addr, keys[i].local_addr, 4);
                             strong::kmemcpy(e->remote_addr, keys[i].remote_addr, 4);
                             e->create_time = stas[i].create_time;
-                            e->tcb_address = 0;  // Not available via NSI
+                            e->tcb_address = 0;
                             e->owning_module_base = 0;
                             e->bytes_in = 0;
                             e->bytes_out = 0;
@@ -2694,7 +2595,7 @@ namespace net_tcpip {
                 if (stas) ExFreePoolWithTag(stas, 'stNW');
             }
 
-            // Also enumerate TCP listeners (table class 1)
+
             ULONG listen_count = 0;
             _NsiEnum(0, 0, (PVOID)&NPI_TCP_MOD, 1,
                 nullptr, sizeof(TCP4_KEY),
@@ -2734,7 +2635,7 @@ namespace net_tcpip {
                             strong::kmemset(e, 0, sizeof(TCPIP_CONN_ENTRY));
                             e->pid = pid_val;
                             e->protocol = 6;
-                            e->state = 1;  // LISTEN
+                            e->state = 1;
                             e->address_family = 2;
                             e->local_port = ((lkeys[i].local_port_be >> 8) & 0xFF) | ((lkeys[i].local_port_be & 0xFF) << 8);
                             strong::kmemcpy(e->local_addr, lkeys[i].local_addr, 4);
@@ -2749,7 +2650,7 @@ namespace net_tcpip {
             }
         }
 
-        // ---- UDP endpoints ----
+
         if (want_udp) {
             ULONG udp_count = 0;
             _NsiEnum(0, 0, (PVOID)&NPI_UDP_MOD, 1,
@@ -2810,12 +2711,9 @@ namespace net_tcpip {
 }
 
 
-// =====================================================================
-// MITM: Packet injection via WFP inject APIs
-// =====================================================================
 namespace net_inject {
 
-    // WFP injection function pointers
+
     typedef NTSTATUS(NTAPI* fn_FwpsInjectionHandleCreate0)(
         UINT16 addressFamily, UINT32 flags, HANDLE* injectionHandle);
     typedef NTSTATUS(NTAPI* fn_FwpsInjectionHandleDestroy0)(HANDLE injectionHandle);
@@ -2875,7 +2773,7 @@ namespace net_inject {
         *(PVOID*)&_FwpsInjectRecv0 = GetProcAddress(fwp_base, f6);
 
         if (_FwpsInjectionHandleCreate0) {
-            NTSTATUS st = _FwpsInjectionHandleCreate0(2 /*AF_INET*/, 0, &g_inject_handle_v4);
+            NTSTATUS st = _FwpsInjectionHandleCreate0(2 , 0, &g_inject_handle_v4);
             if (!NT_SUCCESS(st)) g_inject_handle_v4 = nullptr;
         }
 
@@ -2892,7 +2790,7 @@ namespace net_inject {
 
     NTSTATUS inject_packet(p_packet_inject_request request) {
         if (!request) return STATUS_INVALID_PARAMETER;
-        request->status = 1; // assume failure
+        request->status = 1;
 
         if (!resolve_inject_functions() || !g_inject_handle_v4)
             return STATUS_NOT_SUPPORTED;
@@ -2900,7 +2798,7 @@ namespace net_inject {
         if (request->payload_size == 0 || request->payload_size > INJECT_MAX_PAYLOAD)
             return STATUS_INVALID_PARAMETER;
 
-        // Allocate MDL for payload
+
         PVOID buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, request->payload_size, 'jiNW');
         if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
         strong::kmemcpy(buf, request->payload, request->payload_size);
@@ -2921,12 +2819,12 @@ namespace net_inject {
         }
 
         if (request->direction == 1) {
-            // Outbound inject
+
             st = _FwpsInjectSend0(g_inject_handle_v4, nullptr, 0, 0,
                 nullptr, (UINT16)request->address_family, 0, nbl,
                 (PVOID)inject_completion, buf);
         } else {
-            // Inbound inject
+
             st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
                 (UINT16)request->address_family, 0, 0, 0, nbl,
                 (PVOID)inject_completion, buf);
@@ -2951,9 +2849,7 @@ namespace net_inject {
     }
 }
 
-// =====================================================================
-// MITM: Packet modification engine
-// =====================================================================
+
 namespace net_mod {
 
     typedef struct _ACTIVE_MOD_RULE {
@@ -2978,7 +2874,7 @@ namespace net_mod {
         return (g_active_mod_count != 0);
     }
 
-    // Called from classify callbacks to apply modification rules
+
     BOOLEAN apply_modifications(UINT8* data, UINT32* data_len, UINT32 max_len,
                                 UINT32 direction, UINT32 protocol,
                                 UINT32 port, UINT32 pid) {
@@ -2994,24 +2890,24 @@ namespace net_mod {
             if (rule->pid != 0 && rule->pid != pid) continue;
             if (rule->pattern_size == 0 || rule->pattern_size > *data_len) continue;
 
-            // Scan for pattern in data
+
             for (UINT32 i = 0; i + rule->pattern_size <= *data_len; i++) {
                 BOOLEAN match = TRUE;
                 for (UINT32 j = 0; j < rule->pattern_size; j++) {
                     if (data[i + j] != rule->pattern[j]) { match = FALSE; break; }
                 }
                 if (match) {
-                    // Replace in-place if size difference fits
+
                     INT32 diff = (INT32)rule->replace_size - (INT32)rule->pattern_size;
                     UINT32 new_len = *data_len + diff;
                     if (new_len > max_len) continue;
 
                     if (diff != 0) {
-                        // Shift tail of data
+
                         UINT32 tail_start = i + rule->pattern_size;
                         UINT32 tail_len = *data_len - tail_start;
                         if (tail_len > 0) {
-                            // Move forward or backward
+
                             for (INT32 k = (diff > 0 ? (INT32)tail_len - 1 : 0);
                                  diff > 0 ? k >= 0 : (UINT32)k < tail_len;
                                  diff > 0 ? k-- : k++) {
@@ -3023,7 +2919,7 @@ namespace net_mod {
                     *data_len = new_len;
                     _InterlockedIncrement(&rule->match_count);
                     modified = TRUE;
-                    i += rule->replace_size - 1; // skip past replacement
+                    i += rule->replace_size - 1;
                 }
             }
         }
@@ -3034,7 +2930,7 @@ namespace net_mod {
         if (!request) return STATUS_INVALID_PARAMETER;
 
         switch (request->operation) {
-        case 0: { // add
+        case 0: {
             for (UINT32 i = 0; i < MOD_MAX_RULES; i++) {
                 if (!g_mod_rules[i].active) {
                     UINT32 id = (UINT32)_InterlockedIncrement(&g_next_mod_id);
@@ -3060,7 +2956,7 @@ namespace net_mod {
             }
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        case 1: { // remove by rule_id
+        case 1: {
             for (UINT32 i = 0; i < MOD_MAX_RULES; i++) {
                 if (g_mod_rules[i].active && g_mod_rules[i].rule_id == request->rule_id) {
                     _InterlockedExchange(&g_mod_rules[i].active, 0);
@@ -3071,7 +2967,7 @@ namespace net_mod {
             }
             return STATUS_NOT_FOUND;
         }
-        case 3: { // clear all
+        case 3: {
             for (UINT32 i = 0; i < MOD_MAX_RULES; i++) {
                 if (g_mod_rules[i].active) {
                     _InterlockedExchange(&g_mod_rules[i].active, 0);
@@ -3109,9 +3005,7 @@ namespace net_mod {
     }
 }
 
-// =====================================================================
-// MITM: Traffic redirect engine
-// =====================================================================
+
 namespace net_redirect {
 
     typedef struct _ACTIVE_REDIR_RULE {
@@ -3134,7 +3028,7 @@ namespace net_redirect {
         return (g_active_redir_count != 0);
     }
 
-    // Called from classify callbacks - checks if we should redirect this packet
+
     BOOLEAN check_redirect(UINT32 protocol, UINT32 dst_port, const UINT8* dst_addr,
                            UINT32 af, UINT32* new_port, UINT8* new_addr) {
         if (g_active_redir_count == 0) return FALSE;
@@ -3160,7 +3054,7 @@ namespace net_redirect {
         if (!request) return STATUS_INVALID_PARAMETER;
 
         switch (request->operation) {
-        case 0: { // add
+        case 0: {
             for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
                 if (!g_redir_rules[i].active) {
                     UINT32 id = (UINT32)_InterlockedIncrement(&g_next_redir_id);
@@ -3182,7 +3076,7 @@ namespace net_redirect {
             }
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        case 1: { // remove
+        case 1: {
             for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
                 if (g_redir_rules[i].active && g_redir_rules[i].rule_id == request->rule_id) {
                     _InterlockedExchange(&g_redir_rules[i].active, 0);
@@ -3193,7 +3087,7 @@ namespace net_redirect {
             }
             return STATUS_NOT_FOUND;
         }
-        case 3: { // clear
+        case 3: {
             for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
                 if (g_redir_rules[i].active) {
                     _InterlockedExchange(&g_redir_rules[i].active, 0);
@@ -3229,9 +3123,7 @@ namespace net_redirect {
     }
 }
 
-// =====================================================================
-// MITM: TCP stream reassembly engine
-// =====================================================================
+
 namespace net_stream {
 
     #define MAX_TRACKED_STREAMS 8
@@ -3260,7 +3152,7 @@ namespace net_stream {
         return FALSE;
     }
 
-    // Called from classify to feed data into tracked streams
+
     void feed_packet(UINT32 src_port, UINT32 dst_port, UINT32 pid,
                      const UINT8* src_addr, const UINT8* dst_addr,
                      const UINT8* data, UINT32 data_len) {
@@ -3268,7 +3160,7 @@ namespace net_stream {
             if (!g_streams[i].active) continue;
 
             BOOLEAN match = FALSE;
-            // Match either direction of the connection
+
             if (g_streams[i].src_port == src_port && g_streams[i].dst_port == dst_port) {
                 BOOLEAN addr_match = TRUE;
                 for (int j = 0; j < 4; j++) {
@@ -3313,7 +3205,7 @@ namespace net_stream {
         if (!request) return STATUS_INVALID_PARAMETER;
 
         switch (request->operation) {
-        case 0: { // start_tracking
+        case 0: {
             for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
                 if (!g_streams[i].active) {
                     g_streams[i].src_port = request->src_port;
@@ -3338,7 +3230,7 @@ namespace net_stream {
             }
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        case 1: { // stop
+        case 1: {
             for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
                 if (g_streams[i].active &&
                     g_streams[i].src_port == request->src_port &&
@@ -3349,7 +3241,7 @@ namespace net_stream {
             }
             return STATUS_NOT_FOUND;
         }
-        case 2: { // get_data
+        case 2: {
             for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
                 if (g_streams[i].active &&
                     g_streams[i].src_port == request->src_port &&
@@ -3368,7 +3260,7 @@ namespace net_stream {
             }
             return STATUS_NOT_FOUND;
         }
-        case 3: { // list
+        case 3: {
             request->stream_count = 0;
             for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
                 if (g_streams[i].active) request->stream_count++;
@@ -3391,12 +3283,10 @@ namespace net_stream {
     }
 }
 
-// =====================================================================
-// Deep Packet Inspection (DPI) engine
-// =====================================================================
+
 namespace net_dpi {
 
-    // DPI ring buffer for analyzed packets
+
     inline DPI_HEADER_INFO* g_dpi_ring = nullptr;
     inline volatile LONG g_dpi_head = 0;
     inline volatile LONG g_dpi_tail = 0;
@@ -3421,7 +3311,7 @@ namespace net_dpi {
         return STATUS_SUCCESS;
     }
 
-    // Detect HTTP method from payload start
+
     static UINT32 detect_http_method(const UINT8* data, UINT32 len) {
         if (len < 4) return 0;
         if (data[0] == 'G' && data[1] == 'E' && data[2] == 'T' && data[3] == ' ') return 1;
@@ -3429,14 +3319,14 @@ namespace net_dpi {
         if (len >= 4 && data[0] == 'P' && data[1] == 'U' && data[2] == 'T' && data[3] == ' ') return 3;
         if (len >= 7 && data[0] == 'D' && data[1] == 'E' && data[2] == 'L') return 4;
         if (len >= 5 && data[0] == 'H' && data[1] == 'E' && data[2] == 'A' && data[3] == 'D' && data[4] == ' ') return 5;
-        if (len >= 5 && data[0] == 'H' && data[1] == 'T' && data[2] == 'T' && data[3] == 'P' && data[4] == '/') return 6; // Response
+        if (len >= 5 && data[0] == 'H' && data[1] == 'T' && data[2] == 'T' && data[3] == 'P' && data[4] == '/') return 6;
         return 0;
     }
 
-    // Extract HTTP Host header
+
     static void extract_http_host(const UINT8* data, UINT32 len, char* out, UINT32 out_size) {
         out[0] = 0;
-        // Scan for "Host: "
+
         for (UINT32 i = 0; i + 6 < len; i++) {
             if ((data[i] == 'H' || data[i] == 'h') &&
                 (data[i+1] == 'o' || data[i+1] == 'O') &&
@@ -3454,14 +3344,14 @@ namespace net_dpi {
         }
     }
 
-    // Extract HTTP path (first line after method)
+
     static void extract_http_path(const UINT8* data, UINT32 len, char* out, UINT32 out_size) {
         out[0] = 0;
-        // Find first space (after method)
+
         UINT32 i = 0;
         while (i < len && data[i] != ' ') i++;
         if (i >= len) return;
-        i++; // skip space
+        i++;
         UINT32 k = 0;
         while (i < len && data[i] != ' ' && data[i] != '\r' && data[i] != '\n' && k < out_size - 1) {
             out[k++] = (char)data[i++];
@@ -3469,40 +3359,40 @@ namespace net_dpi {
         out[k] = 0;
     }
 
-    // Detect and parse TLS record from payload
+
     static void detect_tls(const UINT8* data, UINT32 len, DPI_HEADER_INFO* info) {
         if (len < 5) return;
-        // TLS content types: 20=ChangeCipherSpec, 21=Alert, 22=Handshake, 23=ApplicationData
+
         UINT8 content_type = data[0];
         if (content_type < 20 || content_type > 23) return;
 
         UINT16 version = ((UINT16)data[1] << 8) | data[2];
-        // Valid TLS versions: 0x0301 (TLS1.0), 0x0302 (TLS1.1), 0x0303 (TLS1.2), 0x0304 (TLS1.3)
+
         if (version < 0x0300 || version > 0x0304) return;
 
         info->is_tls = 1;
         info->tls_version = version;
         info->tls_content_type = content_type;
 
-        // For handshake Client Hello, extract SNI
+
         if (content_type == 22 && len > 43) {
             UINT8 handshake_type = data[5];
-            if (handshake_type == 1) { // ClientHello
-                // Session ID at offset 43
+            if (handshake_type == 1) {
+
                 UINT32 pos = 43;
                 if (pos >= len) return;
                 UINT8 session_id_len = data[pos];
                 pos += 1 + session_id_len;
                 if (pos + 2 >= len) return;
-                // Cipher suites
+
                 UINT16 cs_len = ((UINT16)data[pos] << 8) | data[pos + 1];
                 pos += 2 + cs_len;
                 if (pos + 1 >= len) return;
-                // Compression methods
+
                 UINT8 comp_len = data[pos];
                 pos += 1 + comp_len;
                 if (pos + 2 >= len) return;
-                // Extensions
+
                 UINT16 ext_len = ((UINT16)data[pos] << 8) | data[pos + 1];
                 pos += 2;
                 UINT32 ext_end = pos + ext_len;
@@ -3511,7 +3401,7 @@ namespace net_dpi {
                     UINT16 elen = ((UINT16)data[pos + 2] << 8) | data[pos + 3];
                     pos += 4;
                     if (ext_type == 0 && elen > 5 && pos + elen <= len) {
-                        // SNI extension: skip SNI list length (2) + type (1) + name length (2)
+
                         UINT32 sni_pos = pos + 2 + 1;
                         if (sni_pos + 2 >= len) break;
                         UINT16 name_len = ((UINT16)data[sni_pos] << 8) | data[sni_pos + 1];
@@ -3529,7 +3419,7 @@ namespace net_dpi {
         }
     }
 
-    // Called from classify callbacks to perform deep inspection
+
     void analyze_packet(UINT64 timestamp, UINT32 direction, UINT32 protocol,
                         UINT32 src_port, UINT32 dst_port,
                         const UINT8* src_addr, const UINT8* dst_addr,
@@ -3550,7 +3440,7 @@ namespace net_dpi {
         strong::kmemcpy(info.src_addr, src_addr, (af == 23) ? 16 : 4);
         strong::kmemcpy(info.dst_addr, dst_addr, (af == 23) ? 16 : 4);
 
-        // Parse TCP header if TCP payload includes flags
+
         if (protocol == 6 && payload_len >= 20) {
             info.tcp_seq = ((UINT32)payload[4] << 24) | ((UINT32)payload[5] << 16) |
                            ((UINT32)payload[6] << 8) | payload[7];
@@ -3564,7 +3454,7 @@ namespace net_dpi {
                 const UINT8* app_data = payload + tcp_hdr_len;
                 UINT32 app_len = payload_len - tcp_hdr_len;
 
-                // HTTP detection
+
                 info.http_method = detect_http_method(app_data, app_len);
                 if (info.http_method) {
                     info.is_http = 1;
@@ -3572,22 +3462,22 @@ namespace net_dpi {
                     extract_http_path(app_data, app_len, info.http_path, sizeof(info.http_path));
                 }
 
-                // TLS detection
+
                 detect_tls(app_data, app_len, &info);
 
-                // DNS over TCP
+
                 if ((src_port == 53 || dst_port == 53) && app_len > 0) {
                     info.is_dns = 1;
                 }
             }
         }
 
-        // UDP DNS
+
         if (protocol == 17 && (src_port == 53 || dst_port == 53) && payload_len > 0) {
             info.is_dns = 1;
         }
 
-        // UDP TLS (DTLS)
+
         if (protocol == 17 && payload_len >= 13) {
             UINT8 ct = payload[0];
             if (ct >= 20 && ct <= 25) {
@@ -3627,7 +3517,7 @@ namespace net_dpi {
         while (idx != (UINT32)g_dpi_head && request->result_count < DPI_MAX_RESULTS) {
             DPI_HEADER_INFO* src = &g_dpi_ring[idx];
 
-            // Apply filters
+
             if (request->filter_pid != 0 && src->pid != request->filter_pid) goto next;
             if (request->filter_protocol != 0 && src->protocol != request->filter_protocol) goto next;
             if (request->filter_port != 0 && src->src_port != request->filter_port &&
@@ -3655,9 +3545,7 @@ namespace net_dpi {
     }
 }
 
-// =====================================================================
-// MITM: Intercept-and-hold engine (Burp Suite proxy mode)
-// =====================================================================
+
 namespace net_intercept {
 
     inline HELD_PACKET g_held[INTERCEPT_MAX_HELD] = {};
@@ -3677,7 +3565,7 @@ namespace net_intercept {
         KeInitializeSpinLock(&g_intercept_lock);
     }
 
-    // Called from classify — returns TRUE if packet should be held (blocked)
+
     BOOLEAN try_hold_packet(UINT32 direction, UINT32 protocol,
                             UINT32 src_port, UINT32 dst_port,
                             const UINT8* src_addr, const UINT8* dst_addr,
@@ -3693,10 +3581,10 @@ namespace net_intercept {
 
         if (g_held_count >= INTERCEPT_MAX_HELD) {
             KeReleaseSpinLock(&g_intercept_lock, irql);
-            return FALSE; // queue full, let it through
+            return FALSE;
         }
 
-        // Find empty slot
+
         for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
             if (g_held[i].hold_id == 0) {
                 g_held[i].hold_id = (UINT64)_InterlockedIncrement(&g_next_hold_id);
@@ -3717,7 +3605,7 @@ namespace net_intercept {
                     strong::kmemcpy(g_held[i].payload, payload, cap);
                 g_held_count++;
                 KeReleaseSpinLock(&g_intercept_lock, irql);
-                return TRUE; // block the packet, we're holding it
+                return TRUE;
             }
         }
 
@@ -3729,7 +3617,7 @@ namespace net_intercept {
         if (!request) return STATUS_INVALID_PARAMETER;
 
         switch (request->operation) {
-        case 0: { // enable
+        case 0: {
             g_filter_pid = request->filter_pid;
             g_filter_port = request->filter_port;
             g_filter_protocol = request->filter_protocol;
@@ -3738,9 +3626,9 @@ namespace net_intercept {
             request->held_count = g_held_count;
             return STATUS_SUCCESS;
         }
-        case 1: { // disable
+        case 1: {
             _InterlockedExchange(&g_intercepting, 0);
-            // Release all held packets (just clear them)
+
             KIRQL irql;
             KeAcquireSpinLock(&g_intercept_lock, &irql);
             for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
@@ -3752,7 +3640,7 @@ namespace net_intercept {
             request->held_count = 0;
             return STATUS_SUCCESS;
         }
-        case 2: { // get_held
+        case 2: {
             KIRQL irql;
             KeAcquireSpinLock(&g_intercept_lock, &irql);
             request->held_count = 0;
@@ -3767,12 +3655,12 @@ namespace net_intercept {
             KeReleaseSpinLock(&g_intercept_lock, irql);
             return STATUS_SUCCESS;
         }
-        case 3: { // release (let through - just remove from held)
+        case 3: {
             KIRQL irql;
             KeAcquireSpinLock(&g_intercept_lock, &irql);
             for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
                 if (g_held[i].hold_id == request->hold_id) {
-                    // Re-inject packet via injection API
+
                     if (net_inject::g_inject_handle_v4 && g_held[i].payload_size > 0) {
                         packet_inject_request inj = {};
                         inj.direction = g_held[i].direction;
@@ -3798,7 +3686,7 @@ namespace net_intercept {
             KeReleaseSpinLock(&g_intercept_lock, irql);
             return STATUS_SUCCESS;
         }
-        case 4: { // drop (just remove without re-injecting)
+        case 4: {
             KIRQL irql;
             KeAcquireSpinLock(&g_intercept_lock, &irql);
             for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
@@ -3813,12 +3701,12 @@ namespace net_intercept {
             KeReleaseSpinLock(&g_intercept_lock, irql);
             return STATUS_SUCCESS;
         }
-        case 5: { // modify_and_release
+        case 5: {
             KIRQL irql;
             KeAcquireSpinLock(&g_intercept_lock, &irql);
             for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
                 if (g_held[i].hold_id == request->hold_id) {
-                    // Re-inject with modified payload
+
                     if (net_inject::g_inject_handle_v4 && request->modify_payload_size > 0 &&
                         request->modify_payload_size <= INTERCEPT_MAX_PAYLOAD) {
                         packet_inject_request inj = {};
@@ -3851,39 +3739,36 @@ namespace net_intercept {
     }
 }
 
-// =====================================================================
-// MITM: Connection kill (RST injection)
-// =====================================================================
+
 namespace net_kill {
 
     NTSTATUS kill_connection(p_conn_kill_request request) {
         if (!request) return STATUS_INVALID_PARAMETER;
         request->status = 1;
 
-        if (request->protocol != 6) return STATUS_INVALID_PARAMETER; // TCP only
+        if (request->protocol != 6) return STATUS_INVALID_PARAMETER;
 
         if (!net_inject::resolve_inject_functions() || !net_inject::g_inject_handle_v4)
             return STATUS_NOT_SUPPORTED;
 
-        // Build a TCP RST packet
-        // We need to craft a minimal TCP segment with RST flag
-        UINT8 rst_pkt[20] = {}; // minimal TCP header
-        // Source port (network byte order)
+
+        UINT8 rst_pkt[20] = {};
+
         rst_pkt[0] = (UINT8)(request->src_port >> 8);
         rst_pkt[1] = (UINT8)(request->src_port & 0xFF);
-        // Dest port
+
         rst_pkt[2] = (UINT8)(request->dst_port >> 8);
         rst_pkt[3] = (UINT8)(request->dst_port & 0xFF);
-        // Seq number = 0
-        // Data offset = 5 (20 bytes / 4), and RST flag
-        rst_pkt[12] = 0x50; // data offset = 5
-        rst_pkt[13] = 0x04; // RST flag
-        // Window
+
+
+        rst_pkt[12] = 0x50;
+        rst_pkt[13] = 0x04;
+
         rst_pkt[14] = 0xFF;
         rst_pkt[15] = 0xFF;
 
         packet_inject_request inj = {};
-        inj.direction = 1; // outbound
+        inj.direction = 1;
         inj.protocol = 6;
         inj.address_family = request->address_family;
         inj.src_port = request->src_port;
@@ -3892,7 +3777,7 @@ namespace net_kill {
         strong::kmemcpy(inj.dst_addr, request->dst_addr, 16);
         inj.payload_size = 20;
         strong::kmemcpy(inj.payload, rst_pkt, 20);
-        inj.tcp_flags = 0x04; // RST
+        inj.tcp_flags = 0x04;
 
         NTSTATUS st = net_inject::inject_packet(&inj);
         if (NT_SUCCESS(st)) request->status = 0;
@@ -3900,9 +3785,7 @@ namespace net_kill {
     }
 }
 
-// =====================================================================
-// MITM: DNS spoofing engine
-// =====================================================================
+
 namespace net_dns_spoof {
 
     typedef struct _DNS_SPOOF_ACTIVE {
@@ -3923,17 +3806,17 @@ namespace net_dns_spoof {
         return (g_active_spoof_count != 0);
     }
 
-    // Simple domain match with wildcard support (*.example.com)
+
     static BOOLEAN domain_matches(const char* pattern, const char* domain) {
         if (!pattern || !domain) return FALSE;
         if (pattern[0] == '*' && pattern[1] == '.') {
-            // Wildcard: match any subdomain
-            const char* suffix = pattern + 1; // ".example.com"
+
+            const char* suffix = pattern + 1;
             UINT32 slen = 0, dlen = 0;
             while (suffix[slen]) slen++;
             while (domain[dlen]) dlen++;
             if (dlen < slen) return FALSE;
-            // Compare suffix
+
             for (UINT32 i = 0; i < slen; i++) {
                 char a = suffix[slen - 1 - i];
                 char b = domain[dlen - 1 - i];
@@ -3943,7 +3826,7 @@ namespace net_dns_spoof {
             }
             return TRUE;
         }
-        // Exact match (case-insensitive)
+
         UINT32 i = 0;
         while (pattern[i] && domain[i]) {
             char a = pattern[i], b = domain[i];
@@ -3955,7 +3838,7 @@ namespace net_dns_spoof {
         return (pattern[i] == 0 && domain[i] == 0);
     }
 
-    // Called from DNS parser in classify - checks if this domain should be spoofed
+
     BOOLEAN check_spoof(const char* domain, UINT8* out_addr, UINT32* out_af, UINT32* out_ttl) {
         if (g_active_spoof_count == 0) return FALSE;
         for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES; i++) {
@@ -3975,7 +3858,7 @@ namespace net_dns_spoof {
         if (!request) return STATUS_INVALID_PARAMETER;
 
         switch (request->operation) {
-        case 0: { // add
+        case 0: {
             for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES; i++) {
                 if (!g_spoof_rules[i].active) {
                     UINT32 id = (UINT32)_InterlockedIncrement(&g_next_spoof_id);
@@ -3995,7 +3878,7 @@ namespace net_dns_spoof {
             }
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        case 1: { // remove
+        case 1: {
             for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES; i++) {
                 if (g_spoof_rules[i].active && g_spoof_rules[i].rule_id == request->rule_id) {
                     _InterlockedExchange(&g_spoof_rules[i].active, 0);
@@ -4006,7 +3889,7 @@ namespace net_dns_spoof {
             }
             return STATUS_NOT_FOUND;
         }
-        case 3: { // clear
+        case 3: {
             for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES; i++) {
                 if (g_spoof_rules[i].active) {
                     _InterlockedExchange(&g_spoof_rules[i].active, 0);
@@ -4040,9 +3923,7 @@ namespace net_dns_spoof {
     }
 }
 
-// =====================================================================
-// MITM: Bandwidth monitoring engine
-// =====================================================================
+
 namespace net_bw {
 
     typedef struct _BW_PID_ENTRY {
@@ -4069,7 +3950,7 @@ namespace net_bw {
         return (g_bw_active != 0);
     }
 
-    // Called from classify callbacks
+
     void record_traffic(UINT32 pid, UINT32 direction, UINT32 bytes) {
         if (!g_bw_active) return;
 
@@ -4083,7 +3964,7 @@ namespace net_bw {
 
         if (pid == 0) return;
 
-        // Find or create per-process entry
+
         INT32 free_slot = -1;
         for (UINT32 i = 0; i < BW_MAX_PROCESSES; i++) {
             if (g_bw_entries[i].active && g_bw_entries[i].pid == pid) {
@@ -4123,29 +4004,29 @@ namespace net_bw {
         if (!request) return STATUS_INVALID_PARAMETER;
 
         switch (request->operation) {
-        case 0: // start
+        case 0:
             _InterlockedExchange(&g_bw_active, 1);
             request->monitoring_active = 1;
             return STATUS_SUCCESS;
-        case 1: // stop
+        case 1:
             _InterlockedExchange(&g_bw_active, 0);
             request->monitoring_active = 0;
             return STATUS_SUCCESS;
-        case 2: { // get_stats
+        case 2: {
             request->total_bytes_sent = g_bw_total_sent;
             request->total_bytes_recv = g_bw_total_recv;
             request->total_packets_sent = g_bw_total_pkts_sent;
             request->total_packets_recv = g_bw_total_pkts_recv;
             request->monitoring_active = g_bw_active;
 
-            // Calculate rate
+
             LARGE_INTEGER now;
             KeQuerySystemTime(&now);
             UINT64 elapsed = now.QuadPart - g_bw_last_sample_time;
             if (elapsed > 0 && g_bw_last_sample_time != 0) {
                 LONG64 delta_sent = g_bw_total_sent - g_bw_last_sample_sent;
                 LONG64 delta_recv = g_bw_total_recv - g_bw_last_sample_recv;
-                // elapsed is in 100ns units; convert to seconds
+
                 UINT64 seconds = elapsed / 10000000ULL;
                 if (seconds > 0) {
                     request->bytes_per_second_out = delta_sent / seconds;
@@ -4157,7 +4038,7 @@ namespace net_bw {
             g_bw_last_sample_time = now.QuadPart;
             return STATUS_SUCCESS;
         }
-        case 3: { // reset
+        case 3: {
             g_bw_total_sent = 0;
             g_bw_total_recv = 0;
             g_bw_total_pkts_sent = 0;
@@ -4167,7 +4048,7 @@ namespace net_bw {
             }
             return STATUS_SUCCESS;
         }
-        case 4: { // get_per_process
+        case 4: {
             request->process_count = 0;
             for (UINT32 i = 0; i < BW_MAX_PROCESSES && request->process_count < BW_MAX_PROCESSES; i++) {
                 if (g_bw_entries[i].active) {
@@ -4191,12 +4072,10 @@ namespace net_bw {
     }
 }
 
-// =====================================================================
-// Network interface enumeration
-// =====================================================================
+
 namespace net_if_enum {
 
-    // MIB_IF_TABLE2 / MIB_IF_ROW2 layout (simplified)
+
     typedef NTSTATUS(NTAPI* fn_GetIfTable2)(PVOID* Table);
     typedef void(NTAPI* fn_FreeMibTable)(PVOID Table);
     typedef NTSTATUS(NTAPI* fn_GetAdaptersAddresses)(
@@ -4207,12 +4086,7 @@ namespace net_if_enum {
         if (!request) return STATUS_INVALID_PARAMETER;
         request->interface_count = 0;
 
-        // Use ZwQuerySystemInformation for network interface info
-        // We walk kernel's network interface structures via IOCTL to NDIS or IP helper
-        // Simpler approach: enumerate from SystemModuleInformation + NDIS miniport info
-        // For robustness, we use a simpler approach: walk net_capture's WFP data
 
-        // Direct approach via netio.sys GetIfTable2
         PVOID netio = net_capture::find_module_base("netio.sys");
         if (!netio) netio = net_capture::find_module_base("NETIO.SYS");
         if (!netio) return STATUS_NOT_SUPPORTED;
@@ -4230,25 +4104,11 @@ namespace net_if_enum {
         if (!NT_SUCCESS(st) || !table) return st;
 
         __try {
-            // MIB_IF_TABLE2: first ULONG is NumEntries, then array of MIB_IF_ROW2
-            // MIB_IF_ROW2 is large (~1352 bytes each)
-            ULONG num = *(ULONG*)table;
-            UINT8* rows = (UINT8*)table + 8; // aligned after count
 
-            // MIB_IF_ROW2 offsets (Windows 10/11):
-            //   +0x000: InterfaceLuid (UINT64)
-            //   +0x008: InterfaceIndex (UINT32)
-            //   +0x00C: InterfaceGuid (GUID)
-            //   +0x01C: Alias (wchar_t[257]) = 514 bytes
-            //   +0x222: Description (wchar_t[257]) = 514 bytes
-            //   +0x428: PhysicalAddressLength (UINT32)
-            //   +0x42C: PhysicalAddress[32]
-            //   +0x44C: PermanentPhysicalAddress[32]
-            //   +0x46C: Mtu (UINT32)
-            //   +0x470: Type (UINT32)
-            //   +0x478: MediaType... TransmitLinkSpeed(+0x488, UINT64), ReceiveLinkSpeed(+0x490)
-            //   +0x498: OperStatus (UINT32)
-            //   +0x500+: InOctets, OutOctets etc
+
+            ULONG num = *(ULONG*)table;
+            UINT8* rows = (UINT8*)table + 8;
+
 
             #define MIB_IF_ROW2_SIZE 1352
 
@@ -4265,32 +4125,32 @@ namespace net_if_enum {
                 e->speed = *(UINT64*)(row + 0x488);
                 e->oper_status = *(UINT32*)(row + 0x498);
 
-                // Physical address (MAC)
+
                 UINT32 phys_len = *(UINT32*)(row + 0x428);
                 if (phys_len >= 6) {
                     strong::kmemcpy(e->mac_addr, row + 0x42C, 6);
                 }
 
-                // Convert alias (wchar_t) to char for name
+
                 wchar_t* alias = (wchar_t*)(row + 0x01C);
                 for (UINT32 j = 0; j < NET_IF_NAME_LEN - 1 && alias[j]; j++) {
                     e->name[j] = (char)(alias[j] & 0x7F);
                 }
 
-                // Convert description
+
                 wchar_t* desc = (wchar_t*)(row + 0x222);
                 for (UINT32 j = 0; j < NET_IF_NAME_LEN - 1 && desc[j]; j++) {
                     e->description[j] = (char)(desc[j] & 0x7F);
                 }
 
-                // InOctets / OutOctets (at offset ~0x508/0x510)
+
                 e->in_octets = *(UINT64*)(row + 0x508);
                 e->out_octets = *(UINT64*)(row + 0x510);
 
                 request->interface_count++;
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
-            // Partial results are fine
+
         }
 
         _FreeMibTable(table);
@@ -4298,22 +4158,20 @@ namespace net_if_enum {
     }
 }
 
-// =====================================================================
-// PCAP export engine
-// =====================================================================
+
 namespace net_pcap {
 
     NTSTATUS export_pcap(p_pcap_export_request request) {
         if (!request) return STATUS_INVALID_PARAMETER;
 
-        // Fill PCAP global header
+
         request->header.magic_number = 0xa1b2c3d4;
         request->header.version_major = 2;
         request->header.version_minor = 4;
         request->header.thiszone = 0;
         request->header.sigfigs = 0;
         request->header.snaplen = PCAP_RECORD_MAX_SIZE;
-        request->header.network = 101; // LINKTYPE_RAW (raw IP)
+        request->header.network = 101;
 
         UINT32 max_pkts = request->max_packets;
         if (max_pkts == 0 || max_pkts > PCAP_MAX_EXPORT_PACKETS)
@@ -4322,7 +4180,7 @@ namespace net_pcap {
         request->packet_count = 0;
         request->data_size = sizeof(PCAP_GLOBAL_HEADER);
 
-        // Read from captured packet ring buffer
+
         if (!net_capture::g_ring_buffer) return STATUS_NOT_SUPPORTED;
 
         KIRQL irql;
@@ -4337,38 +4195,38 @@ namespace net_pcap {
             PCAP_RECORD* rec = &request->records[request->packet_count];
             strong::kmemset(rec, 0, sizeof(PCAP_RECORD));
 
-            // Convert Windows FILETIME (100ns since 1601) to Unix timestamp
+
             UINT64 unix_100ns = pkt->timestamp - 116444736000000000ULL;
             rec->ts_sec = (UINT32)(unix_100ns / 10000000ULL);
             rec->ts_usec = (UINT32)((unix_100ns % 10000000ULL) / 10);
 
-            // Build a minimal IP header + payload
+
             UINT32 ip_header_len = 20;
             UINT32 total_len = ip_header_len + pkt->payload_size;
             if (total_len > PCAP_RECORD_MAX_SIZE) total_len = PCAP_RECORD_MAX_SIZE;
 
-            // IPv4 header
-            rec->data[0] = 0x45; // version=4, IHL=5
-            rec->data[1] = 0x00; // DSCP
+
+            rec->data[0] = 0x45;
+            rec->data[1] = 0x00;
             rec->data[2] = (UINT8)(total_len >> 8);
             rec->data[3] = (UINT8)(total_len & 0xFF);
-            rec->data[4] = 0; rec->data[5] = 0; // ID
-            rec->data[6] = 0x40; rec->data[7] = 0; // DF flag
-            rec->data[8] = 64; // TTL
+            rec->data[4] = 0; rec->data[5] = 0;
+            rec->data[6] = 0x40; rec->data[7] = 0;
+            rec->data[8] = 64;
             rec->data[9] = (UINT8)pkt->protocol;
-            // Checksum = 0 (no checksumming for pcap)
-            // Src IP
+
+
             strong::kmemcpy(&rec->data[12], pkt->local_addr, 4);
-            // Dst IP
+
             strong::kmemcpy(&rec->data[16], pkt->remote_addr, 4);
 
-            // If direction is inbound, swap src/dst
+
             if (pkt->direction == 0) {
                 strong::kmemcpy(&rec->data[12], pkt->remote_addr, 4);
                 strong::kmemcpy(&rec->data[16], pkt->local_addr, 4);
             }
 
-            // Copy payload after IP header
+
             UINT32 payload_copy = pkt->payload_size;
             if (ip_header_len + payload_copy > PCAP_RECORD_MAX_SIZE)
                 payload_copy = PCAP_RECORD_MAX_SIZE - ip_header_len;
@@ -4376,7 +4234,7 @@ namespace net_pcap {
 
             rec->incl_len = ip_header_len + payload_copy;
             rec->orig_len = total_len;
-            request->data_size += sizeof(UINT32) * 4 + rec->incl_len; // pcap record header + data
+            request->data_size += sizeof(UINT32) * 4 + rec->incl_len;
 
             request->packet_count++;
             idx = (idx + 1) % RING_BUFFER_SIZE;
@@ -4385,13 +4243,13 @@ namespace net_pcap {
 
         KeReleaseSpinLock(&net_capture::g_ring_lock, irql);
 
-        // Apply PID/protocol filter
+
         if (request->filter_pid != 0 || request->filter_protocol != 0) {
-            // Re-filter (we captured all, now trim)
+
             UINT32 write_idx = 0;
             for (UINT32 i = 0; i < request->packet_count; i++) {
-                // We need to check against original packet data, but we've already lost PID info
-                // For simplicity, filter before export or just provide all
+
+
                 if (write_idx != i) {
                     strong::kmemcpy(&request->records[write_idx], &request->records[i], sizeof(PCAP_RECORD));
                 }
@@ -4404,9 +4262,7 @@ namespace net_pcap {
     }
 }
 
-// =====================================================================
-// Network fingerprinting engine
-// =====================================================================
+
 namespace net_fingerprint {
 
     inline NET_FINGERPRINT_ENTRY g_fp_entries[FINGERPRINT_MAX] = {};
@@ -4418,19 +4274,19 @@ namespace net_fingerprint {
         return (g_fp_active != 0);
     }
 
-    // Analyze a SYN or SYN-ACK packet for OS fingerprinting
+
     void analyze_tcp_syn(const UINT8* src_addr, UINT32 af,
                          const UINT8* tcp_data, UINT32 tcp_len,
                          UINT32 ip_ttl) {
         if (!g_fp_active || tcp_len < 20) return;
 
         UINT8 flags = tcp_data[13];
-        if (!(flags & 0x02)) return; // Not SYN
+        if (!(flags & 0x02)) return;
 
         UINT32 window = ((UINT32)tcp_data[14] << 8) | tcp_data[15];
         UINT32 data_offset = ((tcp_data[12] >> 4) & 0xF) * 4;
 
-        // Parse TCP options
+
         UINT32 mss = 0;
         UINT32 ws = 0;
         UINT32 sack = 0;
@@ -4442,25 +4298,25 @@ namespace net_fingerprint {
             UINT32 opt_idx = 0;
             while (pos < data_offset && pos < tcp_len) {
                 UINT8 kind = tcp_data[pos];
-                if (kind == 0) break; // End of options
-                if (kind == 1) { nops++; pos++; continue; } // NOP
+                if (kind == 0) break;
+                if (kind == 1) { nops++; pos++; continue; }
                 if (pos + 1 >= tcp_len) break;
                 UINT8 olen = tcp_data[pos + 1];
                 if (olen < 2 || pos + olen > tcp_len) break;
 
-                if (kind == 2 && olen == 4) { // MSS
+                if (kind == 2 && olen == 4) {
                     mss = ((UINT32)tcp_data[pos + 2] << 8) | tcp_data[pos + 3];
                     opt_order |= (2 << (opt_idx * 4));
                 }
-                else if (kind == 3 && olen == 3) { // Window Scale
+                else if (kind == 3 && olen == 3) {
                     ws = tcp_data[pos + 2];
                     opt_order |= (3 << (opt_idx * 4));
                 }
-                else if (kind == 4 && olen == 2) { // SACK permitted
+                else if (kind == 4 && olen == 2) {
                     sack = 1;
                     opt_order |= (4 << (opt_idx * 4));
                 }
-                else if (kind == 8 && olen == 10) { // Timestamp
+                else if (kind == 8 && olen == 10) {
                     opt_order |= (8 << (opt_idx * 4));
                 }
                 opt_idx++;
@@ -4468,18 +4324,15 @@ namespace net_fingerprint {
             }
         }
 
-        // Simple OS detection heuristic
+
         char os[64] = {};
-        // Windows: TTL=128, MSS=1460, window varies
-        // Linux: TTL=64, MSS=1460, window=65535 or scaled
-        // macOS: TTL=64, MSS=1460
-        // FreeBSD: TTL=64, MSS=1460
+
 
         UINT32 ttl_bucket = (ip_ttl > 96) ? 128 : (ip_ttl > 48 ? 64 : 32);
 
         if (ttl_bucket == 128) {
             if (window == 65535 || window == 64240) {
-                // Windows 10/11
+
                 const char* s = "Windows 10/11";
                 for (int i = 0; s[i]; i++) os[i] = s[i];
             } else if (window == 8192) {
@@ -4510,11 +4363,11 @@ namespace net_fingerprint {
             for (int i = 0; s[i]; i++) os[i] = s[i];
         }
 
-        // Store fingerprint
+
         KIRQL irql;
         KeAcquireSpinLock(&g_fp_lock, &irql);
 
-        // Check if we already have this remote address
+
         for (UINT32 i = 0; i < FINGERPRINT_MAX; i++) {
             if (g_fp_entries[i].address_family == af) {
                 UINT32 len = (af == 23) ? 16 : 4;
@@ -4525,7 +4378,7 @@ namespace net_fingerprint {
                     }
                 }
                 if (same) {
-                    // Update
+
                     g_fp_entries[i].ttl = ip_ttl;
                     g_fp_entries[i].window_size = window;
                     g_fp_entries[i].mss = mss;
@@ -4540,7 +4393,7 @@ namespace net_fingerprint {
             }
         }
 
-        // Add new
+
         if (g_fp_count < FINGERPRINT_MAX) {
             UINT32 idx = g_fp_count;
             strong::kmemset(&g_fp_entries[idx], 0, sizeof(NET_FINGERPRINT_ENTRY));
@@ -4553,7 +4406,7 @@ namespace net_fingerprint {
             g_fp_entries[idx].sack_permitted = sack;
             g_fp_entries[idx].nop_count = nops;
             g_fp_entries[idx].tcp_options_order = opt_order;
-            g_fp_entries[idx].df_flag = 0; // would need IP header access
+            g_fp_entries[idx].df_flag = 0;
             strong::kmemcpy(g_fp_entries[idx].os_guess, os, 64);
             _InterlockedIncrement(&g_fp_count);
         }
@@ -4564,14 +4417,14 @@ namespace net_fingerprint {
         if (!request) return STATUS_INVALID_PARAMETER;
 
         switch (request->operation) {
-        case 0: // enable
+        case 0:
             KeInitializeSpinLock(&g_fp_lock);
             _InterlockedExchange(&g_fp_active, 1);
             return STATUS_SUCCESS;
-        case 1: // disable
+        case 1:
             _InterlockedExchange(&g_fp_active, 0);
             return STATUS_SUCCESS;
-        case 2: { // get_results
+        case 2: {
             KIRQL irql;
             KeAcquireSpinLock(&g_fp_lock, &irql);
             request->result_count = (UINT32)g_fp_count;
@@ -4587,9 +4440,6 @@ namespace net_fingerprint {
     }
 }
 
-// =====================================================================
-// IOCTL handler wrappers for the 4 advanced network recon tools
-// =====================================================================
 
 NTSTATUS functions::handle_wfp_callout_enum(p_wfp_callout_enum request) {
     if (!request) return STATUS_INVALID_PARAMETER;
@@ -4620,9 +4470,6 @@ NTSTATUS functions::handle_tcpip_conn_dump(p_tcpip_conn_dump request) {
     return st;
 }
 
-// =====================================================================
-// IOCTL handler wrappers for MITM / interception tools
-// =====================================================================
 
 NTSTATUS functions::handle_packet_inject(p_packet_inject_request request) {
     if (!request) return STATUS_INVALID_PARAMETER;
@@ -4640,7 +4487,7 @@ NTSTATUS functions::handle_packet_mod_rule(p_packet_mod_rule request) {
         request->operation, request->rule_id, request->protocol, request->port,
         request->pid, request->pattern_size, request->replace_size);
     if (request->operation == 2) {
-        // List operation uses the larger struct
+
         NTSTATUS st = net_mod::handle_mod_rule_list((p_packet_mod_rule_list)request);
         AIDA_NET_LOG("IOCTL PMOD(list) status=0x%08X count=%u", (UINT32)st,
             ((p_packet_mod_rule_list)request)->rule_count);

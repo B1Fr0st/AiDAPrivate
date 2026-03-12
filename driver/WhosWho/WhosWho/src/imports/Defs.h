@@ -294,7 +294,6 @@ namespace ssdt_resolver {
                         continue;
 
 
-
                     for (ULONG j = 0; j < 0x500; j++) {
                         if (!_MmIsAddressValid(&jmp_target[j + 6]))
                             break;
@@ -382,7 +381,6 @@ namespace ssdt_resolver {
                 _InterlockedExchange(&g_funcs_resolved, 2);
                 return FALSE;
             }
-
 
 
             CHAR suspend_name[] = { 'N','t','S','u','s','p','e','n','d','T','h','r','e','a','d',0 };

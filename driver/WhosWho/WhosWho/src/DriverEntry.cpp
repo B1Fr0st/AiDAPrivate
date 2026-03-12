@@ -6,7 +6,7 @@
 #include <function/CoreSecurity.h>
 #include <function/AntiDebug.h>
 
-// Forward declaration for network subsystem init/cleanup
+
 namespace net_capture {
     NTSTATUS initialize(PDEVICE_OBJECT devObj);
     void cleanup();
@@ -49,7 +49,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     UNICODE_STRING symLink = {};
     _RtlInitUnicodeString(&symLink, device_names::get_symlink_name());
 
-    // Remove any stale symlink left by a previous failed load attempt.
+
     _IoDeleteSymbolicLink(&symLink);
 
     status = _IoCreateSymbolicLink(&symLink, &deviceName);
@@ -69,7 +69,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     ClearFlag(deviceObject->Flags, DO_DEVICE_INITIALIZING);
 
-    // Initialize network subsystem and fail fast if callout registration is broken.
+
     status = net_capture::initialize(deviceObject);
     if (!NT_SUCCESS(status)) {
         _IoDeleteSymbolicLink(&symLink);

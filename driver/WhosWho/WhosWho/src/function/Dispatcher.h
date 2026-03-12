@@ -55,7 +55,7 @@ namespace ioctl_codes {
     __forceinline ULONG MEX()   { return make(17); }
     __forceinline ULONG V2P()   { return make(18); }
 
-    // Network capture IOCTLs
+
     __forceinline ULONG NCON() { return make(19); }
     __forceinline ULONG NCAP() { return make(20); }
     __forceinline ULONG NCPG() { return make(21); }
@@ -63,25 +63,25 @@ namespace ioctl_codes {
     __forceinline ULONG NFLT() { return make(23); }
     __forceinline ULONG NSTS() { return make(24); }
 
-    // Advanced network recon IOCTLs
-    __forceinline ULONG EWFP() { return make(25); }   // Enumerate WFP callouts
-    __forceinline ULONG GSKT() { return make(26); }   // Get socket handles
-    __forceinline ULONG SNBF() { return make(27); }   // Sniff network buffers
-    __forceinline ULONG DTCP() { return make(28); }   // Dump tcpip connections
 
-    // MITM / interception IOCTLs
-    __forceinline ULONG PINJ() { return make(29); }   // Packet injection
-    __forceinline ULONG PMOD() { return make(30); }   // Packet modification rules
-    __forceinline ULONG PRED() { return make(31); }   // Traffic redirect rules
-    __forceinline ULONG STRM() { return make(32); }   // TCP stream reassembly
-    __forceinline ULONG DPIN() { return make(33); }   // Deep packet inspection
-    __forceinline ULONG IHLD() { return make(34); }   // Intercept-and-hold
-    __forceinline ULONG CKIL() { return make(35); }   // Connection kill
-    __forceinline ULONG DNSS() { return make(36); }   // DNS spoofing
-    __forceinline ULONG BWMN() { return make(37); }   // Bandwidth monitoring
-    __forceinline ULONG NIFS() { return make(38); }   // Network interface enum
-    __forceinline ULONG PCEX() { return make(39); }   // PCAP export
-    __forceinline ULONG NFPR() { return make(40); }   // Network fingerprinting
+    __forceinline ULONG EWFP() { return make(25); }
+    __forceinline ULONG GSKT() { return make(26); }
+    __forceinline ULONG SNBF() { return make(27); }
+    __forceinline ULONG DTCP() { return make(28); }
+
+
+    __forceinline ULONG PINJ() { return make(29); }
+    __forceinline ULONG PMOD() { return make(30); }
+    __forceinline ULONG PRED() { return make(31); }
+    __forceinline ULONG STRM() { return make(32); }
+    __forceinline ULONG DPIN() { return make(33); }
+    __forceinline ULONG IHLD() { return make(34); }
+    __forceinline ULONG CKIL() { return make(35); }
+    __forceinline ULONG DNSS() { return make(36); }
+    __forceinline ULONG BWMN() { return make(37); }
+    __forceinline ULONG NIFS() { return make(38); }
+    __forceinline ULONG PCEX() { return make(39); }
+    __forceinline ULONG NFPR() { return make(40); }
 }
 
 namespace dispatcher {
@@ -530,7 +530,7 @@ namespace dispatcher {
                 status = STATUS_INFO_LENGTH_MISMATCH;
             }
         }
-        // MITM / interception dispatch entries
+
         else if (code == ioctl_codes::PINJ()) {
             if (input_size >= sizeof(packet_inject_request) && output_size >= sizeof(packet_inject_request)) {
                 status = functions::handle_packet_inject((p_packet_inject_request)buffer);
@@ -539,7 +539,7 @@ namespace dispatcher {
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else if (code == ioctl_codes::PMOD()) {
-            // Supports both single-rule and list operations via same buffer
+
             if (input_size >= sizeof(packet_mod_rule) && output_size >= sizeof(packet_mod_rule)) {
                 status = functions::handle_packet_mod_rule((p_packet_mod_rule)buffer);
                 bytes = (input_size >= sizeof(packet_mod_rule_list)) ? sizeof(packet_mod_rule_list) : sizeof(packet_mod_rule);

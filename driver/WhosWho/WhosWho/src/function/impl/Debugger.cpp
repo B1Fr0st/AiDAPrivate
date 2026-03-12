@@ -231,7 +231,6 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     }
 
 
-
     if (!_PsLookupProcessByProcessId || !_PsLookupThreadByThreadId ||
         !_ObfDereferenceObject) {
         return STATUS_PROCEDURE_NOT_FOUND;
@@ -266,8 +265,6 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     }
 
     dbg_guard::timing_scatter();
-
-
 
 
     HANDLE ctx_thread_handle = nullptr;
