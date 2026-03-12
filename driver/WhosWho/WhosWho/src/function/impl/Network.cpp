@@ -15,6 +15,8 @@
 // All WFP functions are resolved dynamically from fwpkclnt.sys.
 // =====================================================================
 
+#pragma pack(push, 8)
+
 // WFP data types
 typedef UINT16 FWP_IP_VERSION_;
 typedef UINT8  FWP_DIRECTION_;
@@ -23,6 +25,9 @@ typedef UINT32 FWP_ACTION_TYPE_;
 #define FWP_ACTION_BLOCK_   0x00001001
 #define FWP_ACTION_PERMIT_  0x00001002
 #define FWP_ACTION_CONTINUE_ 0x00003001
+#define FWP_ACTION_CALLOUT_TERMINATING_ 0x00005003
+
+#define FWP_EMPTY_ 0
 
 #define FWP_CONDITION_FLAG_IS_LOOPBACK_ 0x00000001
 
@@ -33,17 +38,20 @@ typedef struct _FWP_VALUE0_COMPAT {
         UINT8   uint8;
         UINT16  uint16;
         UINT32  uint32;
-        UINT64  uint64;
+        UINT64* uint64;
         INT8    int8;
         INT16   int16;
         INT32   int32;
-        INT64   int64;
+        INT64*  int64;
         float   float32;
-        double  double64;
+        double* double64;
         PVOID   byteArray16;
         PVOID   byteBlob;
         PVOID   sid;
         PVOID   byteArray6;
+        PVOID   v4AddrMask;
+        PVOID   v6AddrMask;
+        PVOID   rangeValue;
     };
 } FWP_VALUE0_COMPAT;
 
@@ -105,7 +113,21 @@ typedef struct _FWP_CONDITION_VALUE0_COMPAT {
         UINT8  uint8;
         UINT16 uint16;
         UINT32 uint32;
-        UINT64 uint64;
+        UINT64* uint64;
+        INT8 int8;
+        INT16 int16;
+        INT32 int32;
+        INT64* int64;
+        float float32;
+        double* double64;
+        PVOID byteArray16;
+        PVOID byteBlob;
+        PVOID sid;
+        PVOID sd;
+        PVOID tokenInformation;
+        PVOID tokenAccessInformation;
+        PVOID unicodeString;
+        PVOID byteArray6;
     };
 } FWP_CONDITION_VALUE0_COMPAT;
 
@@ -133,7 +155,7 @@ typedef struct _FWPM_FILTER0_COMPAT {
     FWPM_DISPLAY_DATA0 displayData;
     UINT32 flags;
     GUID*  providerKey;
-    FWP_BYTE_BLOB_COMPAT providerData;
+    FWP_BYTE_BLOB_COMPAT* providerData;
     GUID   layerKey;
     GUID   subLayerKey;
     FWP_VALUE0_COMPAT weight;
@@ -154,7 +176,7 @@ typedef struct _FWPM_CALLOUT0_COMPAT {
     FWPM_DISPLAY_DATA0 displayData;
     UINT32 flags;
     GUID*  providerKey;
-    FWP_BYTE_BLOB_COMPAT providerData;
+    FWP_BYTE_BLOB_COMPAT* providerData;
     GUID   applicableLayer;
     UINT32 calloutId;
 } FWPM_CALLOUT0_COMPAT;
@@ -164,9 +186,11 @@ typedef struct _FWPM_SUBLAYER0_COMPAT {
     FWPM_DISPLAY_DATA0 displayData;
     UINT32 flags;
     GUID*  providerKey;
-    FWP_BYTE_BLOB_COMPAT providerData;
+    FWP_BYTE_BLOB_COMPAT* providerData;
     UINT16 weight;
 } FWPM_SUBLAYER0_COMPAT;
+
+#pragma pack(pop)
 
 // WFP function pointer types
 typedef NTSTATUS(NTAPI* fn_FwpsCalloutRegister2)(
@@ -1054,6 +1078,12 @@ namespace net_capture {
         }
         g_device_object = devObj;
         AIDA_NET_LOG("register_wfp: begin devObj=%p", devObj);
+        AIDA_NET_LOG("register_wfp: abi sizes FWP_VALUE0=%Iu FWP_CONDITION_VALUE0=%Iu FWPM_FILTER0=%Iu FWPM_CALLOUT0=%Iu FWPM_SUBLAYER0=%Iu",
+            sizeof(FWP_VALUE0_COMPAT),
+            sizeof(FWP_CONDITION_VALUE0_COMPAT),
+            sizeof(FWPM_FILTER0_COMPAT),
+            sizeof(FWPM_CALLOUT0_COMPAT),
+            sizeof(FWPM_SUBLAYER0_COMPAT));
 
         NTSTATUS status;
 
@@ -1184,10 +1214,16 @@ namespace net_capture {
         filter_in.layerKey = GUID_LAYER_INBOUND_V4;
         filter_in.subLayerKey = GUID_AIDA_SUBLAYER;
         // FWP_EMPTY lets BFE assign automatic weight and avoids invalid pointer semantics.
-        filter_in.weight.type = 0;
-        filter_in.action.type = 0x00005003; // FWP_ACTION_CALLOUT_TERMINATING
+        filter_in.weight.type = FWP_EMPTY_;
+        filter_in.action.type = FWP_ACTION_CALLOUT_TERMINATING_;
         filter_in.action.action.calloutKey = GUID_AIDA_CALLOUT_INBOUND;
         filter_in.numFilterConditions = 0;
+        AIDA_NET_LOG("register_wfp: add inbound filter layer=%p sublayer=%p providerData=%p weightType=%u actionType=0x%08X",
+            &filter_in.layerKey,
+            &filter_in.subLayerKey,
+            filter_in.providerData,
+            filter_in.weight.type,
+            filter_in.action.type);
 
         status = _FwpmFilterAdd0(g_engine_handle, &filter_in, nullptr, &g_filter_id_inbound);
         if (!NT_SUCCESS(status)) {
@@ -1205,10 +1241,16 @@ namespace net_capture {
         filter_out.displayData = filter_display;
         filter_out.layerKey = GUID_LAYER_OUTBOUND_V4;
         filter_out.subLayerKey = GUID_AIDA_SUBLAYER;
-        filter_out.weight.type = 0;
-        filter_out.action.type = 0x00005003;
+        filter_out.weight.type = FWP_EMPTY_;
+        filter_out.action.type = FWP_ACTION_CALLOUT_TERMINATING_;
         filter_out.action.action.calloutKey = GUID_AIDA_CALLOUT_OUTBOUND;
         filter_out.numFilterConditions = 0;
+        AIDA_NET_LOG("register_wfp: add outbound filter layer=%p sublayer=%p providerData=%p weightType=%u actionType=0x%08X",
+            &filter_out.layerKey,
+            &filter_out.subLayerKey,
+            filter_out.providerData,
+            filter_out.weight.type,
+            filter_out.action.type);
 
         status = _FwpmFilterAdd0(g_engine_handle, &filter_out, nullptr, &g_filter_id_outbound);
         if (!NT_SUCCESS(status)) {
