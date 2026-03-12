@@ -1184,7 +1184,8 @@ namespace voyager {
                            const std::uint8_t* payload, std::uint32_t payload_size,
                            std::uint32_t tcp_flags = 0, std::uint32_t tcp_seq = 0, std::uint32_t tcp_ack = 0) noexcept;
 
-        bool packet_mod_rule_op(std::uint32_t operation, std::uint32_t direction = 2, std::uint32_t protocol = 0,
+        bool packet_mod_rule_op(std::uint32_t operation, std::uint32_t rule_id = 0,
+                    std::uint32_t direction = 2, std::uint32_t protocol = 0,
                                 std::uint32_t port = 0, std::uint32_t pid = 0,
                                 const std::uint8_t* pattern = nullptr, std::uint32_t pattern_size = 0,
                                 const std::uint8_t* replacement = nullptr, std::uint32_t replace_size = 0,
@@ -1194,7 +1195,8 @@ namespace voyager {
                                std::uint32_t port; std::uint32_t pid; std::uint32_t match_count; std::uint32_t active; };
         std::vector<mod_rule_info> list_packet_mod_rules() noexcept;
 
-        bool traffic_redirect_op(std::uint32_t operation, std::uint32_t protocol = 0,
+        bool traffic_redirect_op(std::uint32_t operation, std::uint32_t rule_id = 0,
+                     std::uint32_t protocol = 0,
                                  std::uint32_t match_port = 0, const std::uint8_t* match_addr = nullptr,
                                  std::uint32_t redirect_port = 0, const std::uint8_t* redirect_addr = nullptr,
                                  std::uint32_t af = 2, std::uint32_t* out_rule_id = nullptr) noexcept;
@@ -1240,7 +1242,8 @@ namespace voyager {
                              const std::uint8_t* src_addr, const std::uint8_t* dst_addr,
                              std::uint32_t pid = 0) noexcept;
 
-        bool dns_spoof_op(std::uint32_t operation, const char* domain = nullptr,
+        bool dns_spoof_op(std::uint32_t operation, std::uint32_t rule_id = 0,
+                  const char* domain = nullptr,
                           const std::uint8_t* spoof_addr = nullptr, std::uint32_t af = 2,
                           std::uint32_t ttl = 300, std::uint32_t* out_rule_id = nullptr) noexcept;
 

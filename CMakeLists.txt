@@ -22,6 +22,50 @@ if(NOT DEFINED IDASDK_DIR)
     endif()
 endif()
 
+
+if(WIN32)
+    option(BUILD_NETWORK_DRIVER_TEST_TOOL "Build standalone network driver feature test tool" ON)
+
+    if(BUILD_NETWORK_DRIVER_TEST_TOOL)
+        add_executable(NetworkDriverTestTool
+            tools/network_driver_test/main.cpp
+            driver/comm.cpp
+        )
+
+        target_include_directories(NetworkDriverTestTool PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/driver"
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+
+        target_compile_definitions(NetworkDriverTestTool PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+        )
+
+        target_compile_options(NetworkDriverTestTool PRIVATE
+            /W3
+            /EHsc
+            /Zc:__cplusplus
+            /permissive-
+            /Zp8
+            /MD
+        )
+
+        target_link_libraries(NetworkDriverTestTool PRIVATE
+            ws2_32
+            dnsapi
+            winhttp
+            iphlpapi
+            ntdll
+        )
+
+        set_target_properties(NetworkDriverTestTool PROPERTIES
+            OUTPUT_NAME "NetworkDriverTestTool"
+        )
+    endif()
+endif()
+
 if(NOT EXISTS "${IDASDK_DIR}/include/ida.hpp")
     if(EXISTS "${IDASDK_DIR}/src/include/ida.hpp")
         set(IDASDK_DIR "${IDASDK_DIR}/src")

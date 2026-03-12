@@ -2060,7 +2060,8 @@ bool voyager::device_t::inject_packet(std::uint32_t direction, std::uint32_t pro
     return success;
 }
 
-bool voyager::device_t::packet_mod_rule_op(std::uint32_t operation, std::uint32_t direction, std::uint32_t protocol,
+bool voyager::device_t::packet_mod_rule_op(std::uint32_t operation, std::uint32_t rule_id,
+                                            std::uint32_t direction, std::uint32_t protocol,
                                             std::uint32_t port, std::uint32_t pid,
                                             const std::uint8_t* pattern, std::uint32_t pattern_size,
                                             const std::uint8_t* replacement, std::uint32_t replace_size,
@@ -2073,6 +2074,7 @@ bool voyager::device_t::packet_mod_rule_op(std::uint32_t operation, std::uint32_
 
     std::memset(req, 0, sizeof(*req));
     req->operation = operation;
+    req->rule_id = rule_id;
     req->direction = direction;
     req->protocol = protocol;
     req->port = port;
@@ -2122,7 +2124,8 @@ std::vector<voyager::device_t::mod_rule_info> voyager::device_t::list_packet_mod
     return result;
 }
 
-bool voyager::device_t::traffic_redirect_op(std::uint32_t operation, std::uint32_t protocol,
+bool voyager::device_t::traffic_redirect_op(std::uint32_t operation, std::uint32_t rule_id,
+                                             std::uint32_t protocol,
                                              std::uint32_t match_port, const std::uint8_t* match_addr,
                                              std::uint32_t redirect_port, const std::uint8_t* redirect_addr,
                                              std::uint32_t af, std::uint32_t* out_rule_id) noexcept {
@@ -2134,6 +2137,7 @@ bool voyager::device_t::traffic_redirect_op(std::uint32_t operation, std::uint32
 
     std::memset(req, 0, sizeof(*req));
     req->operation = operation;
+    req->rule_id = rule_id;
     req->protocol = protocol;
     req->match_port = match_port;
     req->redirect_port = redirect_port;
@@ -2352,7 +2356,8 @@ bool voyager::device_t::kill_connection(std::uint32_t protocol, std::uint32_t af
     return success;
 }
 
-bool voyager::device_t::dns_spoof_op(std::uint32_t operation, const char* domain,
+bool voyager::device_t::dns_spoof_op(std::uint32_t operation, std::uint32_t rule_id,
+                                      const char* domain,
                                       const std::uint8_t* spoof_addr, std::uint32_t af,
                                       std::uint32_t ttl, std::uint32_t* out_rule_id) noexcept {
     if (!is_connected()) return false;
@@ -2363,6 +2368,7 @@ bool voyager::device_t::dns_spoof_op(std::uint32_t operation, const char* domain
 
     std::memset(req, 0, sizeof(*req));
     req->operation = operation;
+    req->rule_id = rule_id;
     req->address_family = af;
     req->ttl = ttl;
     if (domain) {

@@ -69,7 +69,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     // Initialize network subsystem and fail fast if callout registration is broken.
     status = net_capture::initialize(deviceObject);
     if (!NT_SUCCESS(status)) {
-        _IoDeleteSymbolicLink(&symLink);
         _IoDeleteDevice(deviceObject);
         return status;
     }

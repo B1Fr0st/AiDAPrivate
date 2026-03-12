@@ -15979,7 +15979,7 @@ tool_result_t driver_modify_packet_rule(const json& params)
         rule_id = params["rule_id"].get<std::uint32_t>();
 
     std::uint32_t out_id = 0;
-    bool ok = device->packet_mod_rule_op(op_code, dir, proto, port, pid,
+    bool ok = device->packet_mod_rule_op(op_code, rule_id, dir, proto, port, pid,
                                           pattern_bytes.data(), static_cast<std::uint32_t>(pattern_bytes.size()),
                                           replace_bytes.data(), static_cast<std::uint32_t>(replace_bytes.size()),
                                           &out_id);
@@ -16026,6 +16026,10 @@ tool_result_t driver_redirect_traffic(const json& params)
     else return tool_result_t::error(OBFSTR("Unknown operation: ") + operation);
 
     std::uint32_t proto = proto_from_param(params, "protocol");
+    std::uint32_t rule_id = 0;
+    if (op_code == 1 && params.contains("rule_id")) {
+        rule_id = params["rule_id"].get<std::uint32_t>();
+    }
     std::uint32_t match_port = params.value("match_port", 0u);
     std::uint32_t redirect_port = params.value("redirect_port", 0u);
     std::uint8_t match_addr[16] = {}, redir_addr[16] = {};
@@ -16034,7 +16038,7 @@ tool_result_t driver_redirect_traffic(const json& params)
     if (params.contains("redirect_addr")) parse_ip_string(params["redirect_addr"].get<std::string>(), redir_addr, &af);
 
     std::uint32_t out_id = 0;
-    bool ok = device->traffic_redirect_op(op_code, proto, match_port, match_addr,
+    bool ok = device->traffic_redirect_op(op_code, rule_id, proto, match_port, match_addr,
                                            redirect_port, redir_addr, af, &out_id);
     if (!ok) return tool_result_t::error(OBFSTR("Redirect operation failed"));
 
@@ -16301,6 +16305,11 @@ tool_result_t driver_spoof_dns(const json& params)
     else if (operation == "clear") op_code = 3;
     else return tool_result_t::error(OBFSTR("Unknown operation: ") + operation);
 
+    std::uint32_t rule_id = 0;
+    if (op_code == 1 && params.contains("rule_id")) {
+        rule_id = params["rule_id"].get<std::uint32_t>();
+    }
+
     std::string domain = params.value("domain", "");
     std::uint8_t spoof[16] = {};
     std::uint32_t af = 2;
@@ -16308,7 +16317,7 @@ tool_result_t driver_spoof_dns(const json& params)
     std::uint32_t ttl = params.value("ttl", 300u);
 
     std::uint32_t out_id = 0;
-    bool ok = device->dns_spoof_op(op_code, domain.c_str(), spoof, af, ttl, &out_id);
+    bool ok = device->dns_spoof_op(op_code, rule_id, domain.c_str(), spoof, af, ttl, &out_id);
     if (!ok) return tool_result_t::error(OBFSTR("DNS spoof operation failed"));
 
     json result;
