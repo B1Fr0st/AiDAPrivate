@@ -155,7 +155,7 @@ typedef struct _FWPM_FILTER0_COMPAT {
     FWPM_DISPLAY_DATA0 displayData;
     UINT32 flags;
     GUID*  providerKey;
-    FWP_BYTE_BLOB_COMPAT* providerData;
+    FWP_BYTE_BLOB_COMPAT providerData;
     GUID   layerKey;
     GUID   subLayerKey;
     FWP_VALUE0_COMPAT weight;
@@ -176,7 +176,7 @@ typedef struct _FWPM_CALLOUT0_COMPAT {
     FWPM_DISPLAY_DATA0 displayData;
     UINT32 flags;
     GUID*  providerKey;
-    FWP_BYTE_BLOB_COMPAT* providerData;
+    FWP_BYTE_BLOB_COMPAT providerData;
     GUID   applicableLayer;
     UINT32 calloutId;
 } FWPM_CALLOUT0_COMPAT;
@@ -186,7 +186,7 @@ typedef struct _FWPM_SUBLAYER0_COMPAT {
     FWPM_DISPLAY_DATA0 displayData;
     UINT32 flags;
     GUID*  providerKey;
-    FWP_BYTE_BLOB_COMPAT* providerData;
+    FWP_BYTE_BLOB_COMPAT providerData;
     UINT16 weight;
 } FWPM_SUBLAYER0_COMPAT;
 
@@ -1221,7 +1221,7 @@ namespace net_capture {
         AIDA_NET_LOG("register_wfp: add inbound filter layer=%p sublayer=%p providerData=%p weightType=%u actionType=0x%08X",
             &filter_in.layerKey,
             &filter_in.subLayerKey,
-            filter_in.providerData,
+            filter_in.providerData.data,
             filter_in.weight.type,
             filter_in.action.type);
 
@@ -1248,7 +1248,7 @@ namespace net_capture {
         AIDA_NET_LOG("register_wfp: add outbound filter layer=%p sublayer=%p providerData=%p weightType=%u actionType=0x%08X",
             &filter_out.layerKey,
             &filter_out.subLayerKey,
-            filter_out.providerData,
+            filter_out.providerData.data,
             filter_out.weight.type,
             filter_out.action.type);
 

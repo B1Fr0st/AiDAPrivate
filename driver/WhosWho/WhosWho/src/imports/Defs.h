@@ -190,6 +190,7 @@ inline VOID               (NTAPI* _KeUnstackDetachProcess)         (PKAPC_STATE)
 inline NTSTATUS           (NTAPI* _ZwAllocateVirtualMemory)        (HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
 inline NTSTATUS           (NTAPI* _ZwFreeVirtualMemory)            (HANDLE, PVOID*, PSIZE_T, ULONG);
 inline VOID               (NTAPI* _IoDeleteDevice)                 (PDEVICE_OBJECT);
+inline NTSTATUS           (NTAPI* _IoDeleteSymbolicLink)            (PUNICODE_STRING);
 
 
 inline NTSTATUS           (NTAPI* _PsLookupThreadByThreadId)       (HANDLE, PETHREAD*);
@@ -608,6 +609,7 @@ inline bool SetupFunctions() {
     *(PVOID*)&_ZwAllocateVirtualMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwAllocateVirtualMemory"));
     *(PVOID*)&_ZwFreeVirtualMemory = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwFreeVirtualMemory"));
     *(PVOID*)&_IoDeleteDevice = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoDeleteDevice"));
+    *(PVOID*)&_IoDeleteSymbolicLink = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoDeleteSymbolicLink"));
 
 
     *(PVOID*)&_PsLookupThreadByThreadId = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsLookupThreadByThreadId"));
@@ -641,7 +643,7 @@ inline bool SetupFunctions() {
         !_PsCreateSystemThread || !_KeDelayExecutionThread || !_PsTerminateSystemThread ||
         !_KeStackAttachProcess || !_KeUnstackDetachProcess ||
         !_ZwAllocateVirtualMemory || !_ZwFreeVirtualMemory ||
-        !_IoDeleteDevice) {
+        !_IoDeleteDevice || !_IoDeleteSymbolicLink) {
         return false;
     }
 
