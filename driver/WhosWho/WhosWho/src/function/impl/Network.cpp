@@ -14,10 +14,14 @@
 #define AIDA_NET_LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[AiDA-Net] " fmt "\n", __VA_ARGS__)
 #endif
 
-static const CHAR* const AIDA_NET_BUILD_TAG = "2026-03-13-netdbg-r4";
+static const CHAR* const AIDA_NET_BUILD_TAG = "2026-03-13-netdbg-r6-pidfix";
 
 #ifndef AF_INET
 #define AF_INET 2
+#endif
+
+#ifndef AF_INET6
+#define AF_INET6 23
 #endif
 
 #ifndef IPPROTO_TCP
@@ -29,6 +33,7 @@ static const CHAR* const AIDA_NET_BUILD_TAG = "2026-03-13-netdbg-r4";
 #endif
 
 #define FWPS_INJECTION_TYPE_TRANSPORT 0x00000002
+#define FWPS_INJECTION_TYPE_NETWORK  0x00000001
 
 typedef struct _AIDA_WSACMSGHDR {
     SIZE_T cmsg_len;
@@ -209,6 +214,19 @@ static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
                                       UINT32 protocol,
                                       UINT32 local_port,
                                       UINT32 remote_port);
+static UINT32 aida_lookup_cached_port_pid(UINT32 protocol,
+                                          UINT32 local_port,
+                                          UINT32 remote_port);
+static VOID aida_store_cached_port_pid(UINT32 protocol,
+                                       UINT32 port,
+                                       UINT32 pid);
+static NTSTATUS aida_refresh_pid_cache_for_process(UINT32 target_pid,
+                                                   UINT32 protocol_filter);
+static VOID aida_store_cached_endpoint_pid(UINT64 endpoint_handle,
+                                           UINT32 protocol,
+                                           UINT32 local_port,
+                                           UINT32 pid);
+static __forceinline BOOLEAN aida_can_query_system_handles();
 
 namespace net_capture {
     void NTAPI classify_inbound(
@@ -384,7 +402,10 @@ namespace net_capture {
 
     __forceinline void copy_ipv4_fixed_value(UINT32 address, UINT8* out_ip) {
         strong::kmemset(out_ip, 0, 16);
-        strong::kmemcpy(out_ip, &address, sizeof(address));
+        out_ip[0] = (UINT8)((address >> 24) & 0xFF);
+        out_ip[1] = (UINT8)((address >> 16) & 0xFF);
+        out_ip[2] = (UINT8)((address >> 8) & 0xFF);
+        out_ip[3] = (UINT8)(address & 0xFF);
     }
 
     __forceinline UINT32 copy_transport_bytes(void* layerData, UINT8* out_data, UINT32 max_len) {
@@ -517,8 +538,13 @@ namespace net_capture {
                                      const UINT8* payload_data, UINT32 payload_len) {
         if (!g_ring_buffer) return;
 
+        UINT32 effective_pid = pid;
+        if (effective_pid == 0 && g_filter_pid != 0) {
+            effective_pid = g_filter_pid;
+        }
 
-        if (g_filter_pid != 0 && pid != g_filter_pid) return;
+
+        if (g_filter_pid != 0 && effective_pid != g_filter_pid) return;
         if (g_filter_port != 0 && local_port != g_filter_port && remote_port != g_filter_port) return;
         if (g_filter_protocol != 0 && protocol != g_filter_protocol) return;
         if (!is_zero_ip(g_filter_ip)) {
@@ -546,7 +572,7 @@ namespace net_capture {
         LARGE_INTEGER ts;
         KeQuerySystemTime(&ts);
         entry->timestamp = ts.QuadPart;
-        entry->pid = pid;
+        entry->pid = effective_pid;
         entry->protocol = protocol;
         entry->direction = direction;
         entry->payload_size = cap_len;
@@ -579,6 +605,11 @@ namespace net_capture {
                                         const UINT8* resolved, UINT32 ttl) {
         if (!g_dns_ring) return;
 
+        UINT32 effective_pid = pid;
+        if (effective_pid == 0 && g_filter_pid != 0) {
+            effective_pid = g_filter_pid;
+        }
+
         KIRQL old_irql;
         KeAcquireSpinLock(&g_dns_lock, &old_irql);
 
@@ -593,7 +624,7 @@ namespace net_capture {
         LARGE_INTEGER ts;
         KeQuerySystemTime(&ts);
         entry->timestamp = ts.QuadPart;
-        entry->pid = pid;
+        entry->pid = effective_pid;
         entry->query_type = query_type;
         entry->response_code = response_code;
         entry->ttl = ttl;
@@ -757,9 +788,20 @@ namespace net_capture {
             if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) != 0) {
                 pid = (UINT32)inMetaValues->processId;
             }
+            if (pid != 0 && inMetaValues->transportEndpointHandle != 0) {
+                aida_store_cached_endpoint_pid(inMetaValues->transportEndpointHandle,
+                    protocol, local_port, pid);
+            }
             if (pid == 0) {
                 pid = aida_resolve_packet_pid(inMetaValues->transportEndpointHandle,
                     protocol, local_port, remote_port);
+            }
+            if (pid == 0) {
+                pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
+            }
+            if (pid != 0) {
+                aida_store_cached_port_pid(protocol, local_port, pid);
+                aida_store_cached_port_pid(protocol, remote_port, pid);
             }
 
             LONG seen = g_dbg_inbound_seen;
@@ -903,9 +945,20 @@ namespace net_capture {
             if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) != 0) {
                 pid = (UINT32)inMetaValues->processId;
             }
+            if (pid != 0 && inMetaValues->transportEndpointHandle != 0) {
+                aida_store_cached_endpoint_pid(inMetaValues->transportEndpointHandle,
+                    protocol, local_port, pid);
+            }
             if (pid == 0) {
                 pid = aida_resolve_packet_pid(inMetaValues->transportEndpointHandle,
                     protocol, local_port, remote_port);
+            }
+            if (pid == 0) {
+                pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
+            }
+            if (pid != 0) {
+                aida_store_cached_port_pid(protocol, local_port, pid);
+                aida_store_cached_port_pid(protocol, remote_port, pid);
             }
 
             LONG seen = g_dbg_outbound_seen;
@@ -1439,6 +1492,10 @@ static NTSTATUS aida_query_system_handles(PAIDA_SYSTEM_HANDLE_INFORMATION* out_i
     if (!out_info) return STATUS_INVALID_PARAMETER;
     *out_info = nullptr;
 
+    if (!aida_can_query_system_handles()) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
     constexpr SYSTEM_INFORMATION_CLASS_INTERNAL system_handle_information_class =
         (SYSTEM_INFORMATION_CLASS_INTERNAL)16;
 
@@ -1472,25 +1529,130 @@ static BOOLEAN aida_is_afd_device_object(PVOID object) {
     if (!object || !_MmIsAddressValid(object)) return FALSE;
 
     __try {
-        PDEVICE_OBJECT devObj = ((PFILE_OBJECT)object)->DeviceObject;
-        if (!devObj || !_MmIsAddressValid(devObj)) return FALSE;
+        PFILE_OBJECT fileObj = (PFILE_OBJECT)object;
+
+        // Use IoFileObjectType for type-safe referencing. With nullptr ObjectType,
+        // ObReferenceObjectByPointer succeeds on ANY kernel object (Events, Mutants,
+        // Sections, etc.), then interpreting a non-FILE_OBJECT as FILE_OBJECT reads
+        // garbage from DeviceObject/DriverObject fields, which can point to freed
+        // nonpaged pool and cause PAGE_FAULT_IN_NONPAGED_AREA (bugcheck 0x50).
+        // __try/__except cannot catch this because nonpaged pool faults are fatal.
+        POBJECT_TYPE fileType = (_IoFileObjectType && *_IoFileObjectType) ? *_IoFileObjectType : nullptr;
+        NTSTATUS ref_status = ObReferenceObjectByPointer(fileObj, 0, fileType, KernelMode);
+        if (!NT_SUCCESS(ref_status)) {
+            return FALSE;
+        }
+
+        BOOLEAN is_afd = FALSE;
+
+        // After a type-checked ObReferenceObjectByPointer, the FILE_OBJECT is validly
+        // referenced. The kernel guarantees FILE_OBJECT->DeviceObject and
+        // DEVICE_OBJECT->DriverObject are valid for any referenced file object.
+        // MmIsAddressValid is unnecessary here and harmful: it's racy (TOCTOU) and
+        // only validates a single byte, not the entire structure.
+        PDEVICE_OBJECT devObj = fileObj->DeviceObject;
+        if (!devObj) {
+            ObDereferenceObject(fileObj);
+            return FALSE;
+        }
 
         PDRIVER_OBJECT drvObj = devObj->DriverObject;
-        if (!drvObj || !_MmIsAddressValid(drvObj)) return FALSE;
+        if (!drvObj) {
+            ObDereferenceObject(fileObj);
+            return FALSE;
+        }
 
         PUNICODE_STRING drvName = &drvObj->DriverName;
-        if (!drvName->Buffer || !_MmIsAddressValid(drvName->Buffer)) return FALSE;
+        // drvName is &drvObj->DriverName (address of a struct member) - it is never
+        // NULL. Only check Buffer and Length.
+        if (!drvName->Buffer || drvName->Length < 8) {
+            ObDereferenceObject(fileObj);
+            return FALSE;
+        }
 
-        if (drvName->Length < 8) return FALSE;
+        USHORT max_chars = (USHORT)(drvName->Length / sizeof(wchar_t));
+        if (max_chars > 128) {
+            max_chars = 128;
+        }
+
+        // DriverName.Buffer is allocated by the I/O manager at driver load time and
+        // remains valid for the lifetime of the DRIVER_OBJECT. Per-character
+        // MmIsAddressValid checks are removed: they are racy, expensive per iteration,
+        // and the buffer is kernel-guaranteed valid after type-safe referencing.
         wchar_t* buf = drvName->Buffer;
-        for (USHORT i = 0; i + 2 < drvName->Length / sizeof(wchar_t); i++) {
+        for (USHORT i = 0; i + 2 < max_chars; i++) {
             wchar_t c0 = buf[i];
             wchar_t c1 = buf[i + 1];
             wchar_t c2 = buf[i + 2];
-            if (c0 >= 'a') c0 -= 32;
-            if (c1 >= 'a') c1 -= 32;
-            if (c2 >= 'a') c2 -= 32;
-            if (c0 == 'A' && c1 == 'F' && c2 == 'D') return TRUE;
+            if (c0 >= 'a' && c0 <= 'z') c0 -= 32;
+            if (c1 >= 'a' && c1 <= 'z') c1 -= 32;
+            if (c2 >= 'a' && c2 <= 'z') c2 -= 32;
+            if (c0 == 'A' && c1 == 'F' && c2 == 'D') {
+                is_afd = TRUE;
+                break;
+            }
+        }
+
+        ObDereferenceObject(fileObj);
+        return is_afd;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+}
+
+static __forceinline UINT32 aida_sockaddr_addr_len(UINT16 family) {
+    return (family == AF_INET6) ? 16u : 4u;
+}
+
+static BOOLEAN aida_ip_bytes_equal(const UINT8* left, const UINT8* right, UINT32 len) {
+    if (!left || !right) return FALSE;
+    for (UINT32 i = 0; i < len; i++) {
+        if (left[i] != right[i]) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static BOOLEAN aida_parse_sockaddr_candidate(PVOID candidate,
+                                             UINT32* out_af,
+                                             UINT32* out_port,
+                                             UINT8* out_addr) {
+    if (!candidate || !out_af || !out_port || !out_addr || !_MmIsAddressValid(candidate)) {
+        return FALSE;
+    }
+
+    __try {
+        const UINT8* sa = (const UINT8*)candidate;
+        if (!_MmIsAddressValid((PVOID)(sa + sizeof(UINT16) - 1))) {
+            return FALSE;
+        }
+
+        UINT16 family = *(const UINT16*)(sa + 0);
+        if (family == AF_INET) {
+            if (!_MmIsAddressValid((PVOID)(sa + 7))) {
+                return FALSE;
+            }
+
+            UINT16 port_be = *(const UINT16*)(sa + 2);
+            strong::kmemset(out_addr, 0, 16);
+            strong::kmemcpy(out_addr, sa + 4, 4);
+            *out_af = AF_INET;
+            *out_port = ((port_be >> 8) & 0xFFu) | ((port_be & 0xFFu) << 8);
+            return TRUE;
+        }
+
+        if (family == AF_INET6) {
+            if (!_MmIsAddressValid((PVOID)(sa + 23))) {
+                return FALSE;
+            }
+
+            UINT16 port_be = *(const UINT16*)(sa + 2);
+            strong::kmemset(out_addr, 0, 16);
+            strong::kmemcpy(out_addr, sa + 8, 16);
+            *out_af = AF_INET6;
+            *out_port = ((port_be >> 8) & 0xFFu) | ((port_be & 0xFFu) << 8);
+            return TRUE;
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         return FALSE;
@@ -1499,13 +1661,60 @@ static BOOLEAN aida_is_afd_device_object(PVOID object) {
     return FALSE;
 }
 
+static VOID aida_capture_socket_endpoint(SOCKET_HANDLE_ENTRY* out,
+                                         UINT32 af,
+                                         UINT32 port,
+                                         const UINT8* addr) {
+    if (!out || !addr) {
+        return;
+    }
+
+    UINT32 copy_len = aida_sockaddr_addr_len((UINT16)af);
+    if (port == 0 && net_capture::is_zero_ip(addr)) {
+        return;
+    }
+
+    if (out->address_family == 0) {
+        out->address_family = af;
+    }
+
+    if (out->local_port == 0 && net_capture::is_zero_ip(out->local_addr)) {
+        out->local_port = port;
+        strong::kmemcpy(out->local_addr, addr, copy_len);
+        return;
+    }
+
+    if (out->local_port == port && aida_ip_bytes_equal(out->local_addr, addr, copy_len)) {
+        return;
+    }
+
+    if (out->remote_port == 0 && net_capture::is_zero_ip(out->remote_addr)) {
+        out->remote_port = port;
+        strong::kmemcpy(out->remote_addr, addr, copy_len);
+    }
+}
+
 static BOOLEAN aida_extract_socket_info(PVOID file_object, SOCKET_HANDLE_ENTRY* out) {
     if (!file_object || !out || !_MmIsAddressValid(file_object)) return FALSE;
 
+    PFILE_OBJECT fo = (PFILE_OBJECT)file_object;
+    BOOLEAN referenced = FALSE;
+    BOOLEAN result = FALSE;
+
     __try {
-        PFILE_OBJECT fo = (PFILE_OBJECT)file_object;
+        POBJECT_TYPE fileType = (_IoFileObjectType && *_IoFileObjectType) ? *_IoFileObjectType : nullptr;
+        NTSTATUS ref_status = ObReferenceObjectByPointer(fo, 0, fileType, KernelMode);
+        if (!NT_SUCCESS(ref_status)) {
+            result = FALSE;
+            __leave;
+        }
+        referenced = TRUE;
+
         PVOID afd_endpoint = fo->FsContext;
-        if (!afd_endpoint || !_MmIsAddressValid(afd_endpoint)) return FALSE;
+        if (!afd_endpoint || !_MmIsAddressValid(afd_endpoint)) {
+            result = FALSE;
+            __leave;
+        }
 
         out->afd_endpoint_addr = (UINT64)afd_endpoint;
         UINT8* ep = (UINT8*)afd_endpoint;
@@ -1524,25 +1733,45 @@ static BOOLEAN aida_extract_socket_info(PVOID file_object, SOCKET_HANDLE_ENTRY* 
         strong::kmemset(out->local_addr, 0, 16);
         strong::kmemset(out->remote_addr, 0, 16);
 
-        if (_MmIsAddressValid(ep + 0x20)) {
-            PVOID local_info = *(PVOID*)(ep + 0x20);
-            if (local_info && _MmIsAddressValid(local_info)) {
-                UINT8* sa = (UINT8*)local_info;
-                if (_MmIsAddressValid(sa + 8)) {
-                    UINT16 sa_family = *(UINT16*)(sa + 0);
-                    if (sa_family == 2) {
-                        UINT16 port_be = *(UINT16*)(sa + 2);
-                        out->local_port = ((port_be >> 8) & 0xFF) | ((port_be & 0xFF) << 8);
-                        strong::kmemcpy(out->local_addr, sa + 4, 4);
-                    }
-                }
+        for (UINT32 offset = 0x20; offset <= 0x90; offset += (UINT32)sizeof(PVOID)) {
+            if (!_MmIsAddressValid(ep + offset + sizeof(PVOID) - 1)) {
+                continue;
+            }
+
+            PVOID candidate = *(PVOID*)(ep + offset);
+            UINT32 cand_af = 0;
+            UINT32 cand_port = 0;
+            UINT8 cand_addr[16] = {};
+            if (!aida_parse_sockaddr_candidate(candidate, &cand_af, &cand_port, cand_addr)) {
+                continue;
+            }
+
+            aida_capture_socket_endpoint(out, cand_af, cand_port, cand_addr);
+            if (out->local_port != 0 && out->remote_port != 0) {
+                break;
             }
         }
 
-        return TRUE;
+        if (out->local_port == 0 && _MmIsAddressValid(ep + 0x20)) {
+            PVOID local_info = *(PVOID*)(ep + 0x20);
+            UINT32 cand_af = 0;
+            UINT32 cand_port = 0;
+            UINT8 cand_addr[16] = {};
+            if (aida_parse_sockaddr_candidate(local_info, &cand_af, &cand_port, cand_addr)) {
+                aida_capture_socket_endpoint(out, cand_af, cand_port, cand_addr);
+            }
+        }
+
+        result = TRUE;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FALSE;
+        result = FALSE;
     }
+
+    if (referenced) {
+        ObDereferenceObject(fo);
+    }
+
+    return result;
 }
 
 typedef struct _AIDA_ENDPOINT_PID_CACHE_ENTRY {
@@ -1553,9 +1782,18 @@ typedef struct _AIDA_ENDPOINT_PID_CACHE_ENTRY {
     UINT32 local_port;
 } AIDA_ENDPOINT_PID_CACHE_ENTRY;
 
+typedef struct _AIDA_PORT_PID_CACHE_ENTRY {
+    volatile LONG active;
+    UINT32 protocol;
+    UINT32 port;
+    UINT32 pid;
+} AIDA_PORT_PID_CACHE_ENTRY;
+
 inline AIDA_ENDPOINT_PID_CACHE_ENTRY g_endpoint_pid_cache[AIDA_ENDPOINT_PID_CACHE_SIZE] = {};
+inline AIDA_PORT_PID_CACHE_ENTRY g_port_pid_cache[AIDA_ENDPOINT_PID_CACHE_SIZE] = {};
 inline KSPIN_LOCK g_endpoint_pid_cache_lock;
 inline volatile LONG g_endpoint_pid_cache_lock_state = 0;
+inline volatile LONG g_handle_query_irql_warned = 0;
 
 static VOID aida_ensure_endpoint_pid_cache_init() {
     LONG state = _InterlockedCompareExchange(&g_endpoint_pid_cache_lock_state, 1, 0);
@@ -1632,6 +1870,123 @@ static VOID aida_store_cached_endpoint_pid(UINT64 endpoint_handle,
     KeReleaseSpinLock(&g_endpoint_pid_cache_lock, old_irql);
 }
 
+static VOID aida_store_cached_port_pid(UINT32 protocol,
+                                       UINT32 port,
+                                       UINT32 pid) {
+    if (port == 0 || pid == 0) return;
+
+    aida_ensure_endpoint_pid_cache_init();
+
+    UINT32 slot = ((protocol * 131u) ^ port) % AIDA_ENDPOINT_PID_CACHE_SIZE;
+
+    KIRQL old_irql;
+    KeAcquireSpinLock(&g_endpoint_pid_cache_lock, &old_irql);
+    g_port_pid_cache[slot].protocol = protocol;
+    g_port_pid_cache[slot].port = port;
+    g_port_pid_cache[slot].pid = pid;
+    KeMemoryBarrier();
+    _InterlockedExchange(&g_port_pid_cache[slot].active, 1);
+    KeReleaseSpinLock(&g_endpoint_pid_cache_lock, old_irql);
+}
+
+static UINT32 aida_lookup_cached_port_pid(UINT32 protocol,
+                                          UINT32 local_port,
+                                          UINT32 remote_port) {
+    if (local_port == 0 && remote_port == 0)
+        return 0;
+
+    aida_ensure_endpoint_pid_cache_init();
+
+    KIRQL old_irql;
+    KeAcquireSpinLock(&g_endpoint_pid_cache_lock, &old_irql);
+    for (UINT32 i = 0; i < AIDA_ENDPOINT_PID_CACHE_SIZE; i++) {
+        const AIDA_PORT_PID_CACHE_ENTRY* entry = &g_port_pid_cache[i];
+        if (!entry->active) continue;
+        if (entry->pid == 0) continue;
+        if (entry->protocol != 0 && protocol != 0 && entry->protocol != protocol)
+            continue;
+        if (entry->port != local_port && entry->port != remote_port)
+            continue;
+
+        UINT32 pid = entry->pid;
+        KeReleaseSpinLock(&g_endpoint_pid_cache_lock, old_irql);
+        return pid;
+    }
+    KeReleaseSpinLock(&g_endpoint_pid_cache_lock, old_irql);
+    return 0;
+}
+
+static VOID aida_cache_pid_from_socket_info(const SOCKET_HANDLE_ENTRY* socket_info,
+                                            UINT32 pid) {
+    if (!socket_info || pid == 0)
+        return;
+
+    if (socket_info->afd_endpoint_addr != 0) {
+        aida_store_cached_endpoint_pid(socket_info->afd_endpoint_addr,
+            socket_info->protocol,
+            socket_info->local_port,
+            pid);
+    }
+
+    aida_store_cached_port_pid(socket_info->protocol, socket_info->local_port, pid);
+    aida_store_cached_port_pid(socket_info->protocol, socket_info->remote_port, pid);
+}
+
+static NTSTATUS aida_refresh_pid_cache_for_process(UINT32 target_pid,
+                                                   UINT32 protocol_filter) {
+    if (target_pid == 0)
+        return STATUS_INVALID_PARAMETER;
+
+    if (!aida_can_query_system_handles())
+        return STATUS_INVALID_DEVICE_STATE;
+
+    PAIDA_SYSTEM_HANDLE_INFORMATION handles = nullptr;
+    NTSTATUS status = aida_query_system_handles(&handles);
+    if (!NT_SUCCESS(status) || !handles)
+        return status;
+
+    UINT32 cached = 0;
+    __try {
+        for (ULONG i = 0; i < handles->NumberOfHandles; i++) {
+            const AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO* entry = &handles->Handles[i];
+            UINT32 pid = (UINT32)entry->UniqueProcessId;
+            if (pid != target_pid || !entry->Object)
+                continue;
+            if (!aida_is_afd_device_object(entry->Object))
+                continue;
+
+            SOCKET_HANDLE_ENTRY socket_info = {};
+            if (!aida_extract_socket_info(entry->Object, &socket_info))
+                continue;
+            if (protocol_filter != 0 && socket_info.protocol != 0 && socket_info.protocol != protocol_filter)
+                continue;
+
+            aida_cache_pid_from_socket_info(&socket_info, pid);
+            cached++;
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        status = STATUS_ACCESS_VIOLATION;
+    }
+
+    ExFreePoolWithTag(handles, 'hANW');
+
+    if (!NT_SUCCESS(status))
+        return status;
+    return (cached != 0) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+}
+
+static __forceinline BOOLEAN aida_can_query_system_handles() {
+    KIRQL irql = KeGetCurrentIrql();
+    if (irql == PASSIVE_LEVEL)
+        return TRUE;
+
+    if (_InterlockedCompareExchange(&g_handle_query_irql_warned, 1, 0) == 0) {
+        AIDA_NET_LOG("aida_query_system_handles: refusing live handle snapshot at IRQL=%lu",
+            (ULONG)irql);
+    }
+    return FALSE;
+}
+
 static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
                                       UINT32 protocol,
                                       UINT32 local_port,
@@ -1639,6 +1994,13 @@ static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
     UINT32 cached_pid = aida_lookup_cached_endpoint_pid(endpoint_handle, protocol, local_port);
     if (cached_pid != 0)
         return cached_pid;
+
+    cached_pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
+    if (cached_pid != 0)
+        return cached_pid;
+
+    if (!aida_can_query_system_handles())
+        return 0;
 
     PAIDA_SYSTEM_HANDLE_INFORMATION handles = nullptr;
     NTSTATUS status = aida_query_system_handles(&handles);
@@ -1669,6 +2031,8 @@ static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
             if (endpoint_match) {
                 aida_store_cached_endpoint_pid(endpoint_handle, protocol, local_port, resolved_pid);
             }
+            aida_store_cached_port_pid(protocol, local_port, resolved_pid);
+            aida_store_cached_port_pid(protocol, remote_port, resolved_pid);
             break;
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -1871,6 +2235,14 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
             net_capture::g_filter_port = request->filter_port;
             net_capture::g_filter_protocol = request->filter_protocol;
             strong::kmemcpy(net_capture::g_filter_ip, request->filter_ip, 16);
+            if (request->filter_pid != 0) {
+                NTSTATUS cache_status = aida_refresh_pid_cache_for_process(
+                    request->filter_pid,
+                    request->filter_protocol);
+                AIDA_NET_LOG("IOCTL NCAP cache warm pid=%u status=0x%08X",
+                    request->filter_pid,
+                    (UINT32)cache_status);
+            }
             if (request->max_packet_bytes > 0 && request->max_packet_bytes <= NET_PKT_MAX_PAYLOAD)
                 net_capture::g_max_payload = request->max_packet_bytes;
             else
@@ -2342,6 +2714,8 @@ namespace net_socket_enum {
                     out->afd_endpoint_addr = (UINT64)((PFILE_OBJECT)entry->Object)->FsContext;
                 }
 
+                aida_cache_pid_from_socket_info(out, target_pid);
+
                 filled++;
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -2618,6 +2992,9 @@ namespace net_inject {
     typedef NTSTATUS(NTAPI* fn_FwpsInjectionHandleCreate0)(
         UINT16 addressFamily, UINT32 flags, HANDLE* injectionHandle);
     typedef NTSTATUS(NTAPI* fn_FwpsInjectionHandleDestroy0)(HANDLE injectionHandle);
+    typedef PVOID(NTAPI* fn_NdisAllocateNetBufferListPool)(
+        NDIS_HANDLE ndisHandle, PNET_BUFFER_LIST_POOL_PARAMETERS parameters);
+    typedef VOID(NTAPI* fn_NdisFreeNetBufferListPool)(PVOID poolHandle);
     typedef NTSTATUS(NTAPI* fn_FwpsAllocateNetBufferAndNetBufferList0)(
         HANDLE poolHandle, UINT16 contextSize, UINT16 contextBackfill,
         PMDL mdlChain, ULONG dataOffset, SIZE_T dataLength, PVOID* netBufferList);
@@ -2635,15 +3012,32 @@ namespace net_inject {
         UINT32 interfaceIndex, UINT32 subInterfaceIndex,
         PVOID netBufferList,
         PVOID completionFn, PVOID completionContext);
+    typedef NTSTATUS(NTAPI* fn_FwpsInjectNetworkSendAsync0)(
+        HANDLE injectionHandle, HANDLE injectionContext,
+        UINT32 flags, UINT32 compartmentId,
+        PVOID netBufferList,
+        PVOID completionFn, PVOID completionContext);
+    typedef NTSTATUS(NTAPI* fn_FwpsInjectNetworkReceiveAsync0)(
+        HANDLE injectionHandle, HANDLE injectionContext,
+        UINT32 flags, UINT32 compartmentId,
+        UINT32 interfaceIndex, UINT32 subInterfaceIndex,
+        PVOID netBufferList,
+        PVOID completionFn, PVOID completionContext);
 
     inline fn_FwpsInjectionHandleCreate0         _FwpsInjectionHandleCreate0   = nullptr;
     inline fn_FwpsInjectionHandleDestroy0        _FwpsInjectionHandleDestroy0  = nullptr;
+    inline fn_NdisAllocateNetBufferListPool      _NdisAllocateNetBufferListPool = nullptr;
+    inline fn_NdisFreeNetBufferListPool          _NdisFreeNetBufferListPool     = nullptr;
     inline fn_FwpsAllocateNetBufferAndNetBufferList0 _FwpsAllocateNBL0         = nullptr;
     inline fn_FwpsFreeNetBufferList0             _FwpsFreeNBL0                 = nullptr;
     inline fn_FwpsInjectTransportSendAsync0      _FwpsInjectSend0              = nullptr;
     inline fn_FwpsInjectTransportReceiveAsync0   _FwpsInjectRecv0              = nullptr;
+    inline fn_FwpsInjectNetworkSendAsync0        _FwpsInjectNetSend0           = nullptr;
+    inline fn_FwpsInjectNetworkReceiveAsync0     _FwpsInjectNetRecv0           = nullptr;
 
     inline HANDLE g_inject_handle_v4 = nullptr;
+    inline HANDLE g_inject_handle_net_v4 = nullptr;
+    inline NDIS_HANDLE g_inject_nbl_pool = nullptr;
     inline volatile LONG g_inject_resolved = 0;
 
     typedef struct _INJECT_COMPLETION_CONTEXT {
@@ -2663,6 +3057,46 @@ namespace net_inject {
         dst[3] = (UINT8)(value & 0xFF);
     }
 
+    static UINT32 checksum_accumulate(UINT32 sum, const UINT8* data, UINT32 len) {
+        if (!data) {
+            return sum;
+        }
+
+        UINT32 i = 0;
+        while (i + 1 < len) {
+            sum += ((UINT32)data[i] << 8) | data[i + 1];
+            i += 2;
+        }
+
+        if (i < len) {
+            sum += ((UINT32)data[i] << 8);
+        }
+
+        return sum;
+    }
+
+    static UINT16 finalize_checksum(UINT32 sum) {
+        while ((sum >> 16) != 0) {
+            sum = (sum & 0xFFFFu) + (sum >> 16);
+        }
+        return (UINT16)(~sum & 0xFFFFu);
+    }
+
+    static UINT16 transport_checksum_ipv4(const UINT8* src_addr,
+                                          const UINT8* dst_addr,
+                                          UINT8 protocol,
+                                          const UINT8* segment,
+                                          UINT32 segment_len) {
+        UINT32 sum = 0;
+        sum = checksum_accumulate(sum, src_addr, 4);
+        sum = checksum_accumulate(sum, dst_addr, 4);
+        sum += protocol;
+        sum += (segment_len >> 16) & 0xFFFFu;
+        sum += segment_len & 0xFFFFu;
+        sum = checksum_accumulate(sum, segment, segment_len);
+        return finalize_checksum(sum);
+    }
+
     static __forceinline BOOLEAN is_loopback_ipv4_addr(const UINT8* addr) {
         return addr != nullptr && addr[0] == 127;
     }
@@ -2679,6 +3113,18 @@ namespace net_inject {
             write_be16(out_buf + 2, (UINT16)request->dst_port);
             write_be16(out_buf + 4, (UINT16)total);
             strong::kmemcpy(out_buf + 8, request->payload, request->payload_size);
+            if (request->address_family == AF_INET) {
+                UINT16 checksum = transport_checksum_ipv4(
+                    request->src_addr,
+                    request->dst_addr,
+                    IPPROTO_UDP,
+                    out_buf,
+                    total);
+                if (checksum == 0) {
+                    checksum = 0xFFFFu;
+                }
+                write_be16(out_buf + 6, checksum);
+            }
             return total;
         }
 
@@ -2695,6 +3141,15 @@ namespace net_inject {
             out_buf[14] = 0xFF;
             out_buf[15] = 0xFF;
             strong::kmemcpy(out_buf + 20, request->payload, request->payload_size);
+            if (request->address_family == AF_INET) {
+                UINT16 checksum = transport_checksum_ipv4(
+                    request->src_addr,
+                    request->dst_addr,
+                    IPPROTO_TCP,
+                    out_buf,
+                    total);
+                write_be16(out_buf + 16, checksum);
+            }
             return total;
         }
 
@@ -2725,6 +3180,13 @@ namespace net_inject {
         CHAR f4[] = {'F','w','p','s','F','r','e','e','N','e','t','B','u','f','f','e','r','L','i','s','t','0',0};
         CHAR f5[] = {'F','w','p','s','I','n','j','e','c','t','T','r','a','n','s','p','o','r','t','S','e','n','d','A','s','y','n','c','0',0};
         CHAR f6[] = {'F','w','p','s','I','n','j','e','c','t','T','r','a','n','s','p','o','r','t','R','e','c','e','i','v','e','A','s','y','n','c','0',0};
+        CHAR f7[] = {'F','w','p','s','I','n','j','e','c','t','N','e','t','w','o','r','k','S','e','n','d','A','s','y','n','c','0',0};
+        CHAR f8[] = {'F','w','p','s','I','n','j','e','c','t','N','e','t','w','o','r','k','R','e','c','e','i','v','e','A','s','y','n','c','0',0};
+        CHAR n1[] = {'N','d','i','s','A','l','l','o','c','a','t','e','N','e','t','B','u','f','f','e','r','L','i','s','t','P','o','o','l',0};
+        CHAR n2[] = {'N','d','i','s','F','r','e','e','N','e','t','B','u','f','f','e','r','L','i','s','t','P','o','o','l',0};
+
+        PVOID ndis_base = net_capture::find_module_base("NDIS.SYS");
+        if (!ndis_base) ndis_base = net_capture::find_module_base("ndis.sys");
 
         *(PVOID*)&_FwpsInjectionHandleCreate0 = GetProcAddress(fwp_base, f1);
         *(PVOID*)&_FwpsInjectionHandleDestroy0 = GetProcAddress(fwp_base, f2);
@@ -2732,15 +3194,24 @@ namespace net_inject {
         *(PVOID*)&_FwpsFreeNBL0 = GetProcAddress(fwp_base, f4);
         *(PVOID*)&_FwpsInjectSend0 = GetProcAddress(fwp_base, f5);
         *(PVOID*)&_FwpsInjectRecv0 = GetProcAddress(fwp_base, f6);
+        *(PVOID*)&_FwpsInjectNetSend0 = GetProcAddress(fwp_base, f7);
+        *(PVOID*)&_FwpsInjectNetRecv0 = GetProcAddress(fwp_base, f8);
+        if (ndis_base) {
+            *(PVOID*)&_NdisAllocateNetBufferListPool = GetProcAddress(ndis_base, n1);
+            *(PVOID*)&_NdisFreeNetBufferListPool = GetProcAddress(ndis_base, n2);
+        }
 
         if (_FwpsInjectionHandleCreate0) {
             NTSTATUS st = _FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_TRANSPORT, &g_inject_handle_v4);
             if (!NT_SUCCESS(st)) g_inject_handle_v4 = nullptr;
+
+            st = _FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_NETWORK, &g_inject_handle_net_v4);
+            if (!NT_SUCCESS(st)) g_inject_handle_net_v4 = nullptr;
         }
 
         KeMemoryBarrier();
         _InterlockedExchange(&g_inject_resolved, 2);
-        return g_inject_handle_v4 != nullptr;
+        return (g_inject_handle_v4 != nullptr) || (g_inject_handle_net_v4 != nullptr);
     }
 
     void NTAPI inject_completion(PVOID context, PVOID nbl, BOOLEAN dispatch_level) {
@@ -2754,14 +3225,122 @@ namespace net_inject {
         }
     }
 
+    static BOOLEAN ensure_inject_nbl_pool() {
+        if (g_inject_nbl_pool) {
+            return TRUE;
+        }
+
+        NET_BUFFER_LIST_POOL_PARAMETERS params = {};
+        params.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
+        params.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
+        params.Header.Size = NDIS_SIZEOF_NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
+        params.ProtocolId = 0;
+        params.fAllocateNetBuffer = TRUE;
+        params.ContextSize = 0;
+        params.PoolTag = 'jnNW';
+        params.DataSize = 0;
+
+        if (!_NdisAllocateNetBufferListPool || !_NdisFreeNetBufferListPool) {
+            AIDA_NET_LOG0("inject_packet: NDIS net buffer list pool exports unavailable");
+            return FALSE;
+        }
+
+        g_inject_nbl_pool = _NdisAllocateNetBufferListPool(nullptr, &params);
+        if (!g_inject_nbl_pool) {
+            AIDA_NET_LOG0("inject_packet: failed to allocate net buffer list pool");
+            return FALSE;
+        }
+
+        return TRUE;
+    }
+
+    static UINT64 lookup_endpoint_handle_by_port(UINT32 protocol, UINT32 src_port) {
+        aida_ensure_endpoint_pid_cache_init();
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_endpoint_pid_cache_lock, &old_irql);
+        for (UINT32 i = 0; i < AIDA_ENDPOINT_PID_CACHE_SIZE; i++) {
+            const AIDA_ENDPOINT_PID_CACHE_ENTRY* entry = &g_endpoint_pid_cache[i];
+            if (!entry->active) continue;
+            if (protocol != 0 && entry->protocol != 0 && entry->protocol != protocol) continue;
+            if (src_port != 0 && entry->local_port != 0 && entry->local_port != src_port) continue;
+            UINT64 handle = entry->endpoint_handle;
+            KeReleaseSpinLock(&g_endpoint_pid_cache_lock, old_irql);
+            return handle;
+        }
+        KeReleaseSpinLock(&g_endpoint_pid_cache_lock, old_irql);
+        return 0;
+    }
+
+#pragma pack(push, 1)
+    typedef struct _IPV4_HEADER {
+        UINT8  ver_ihl;
+        UINT8  tos;
+        UINT16 total_length;
+        UINT16 identification;
+        UINT16 flags_fragoffset;
+        UINT8  ttl;
+        UINT8  protocol;
+        UINT16 checksum;
+        UINT8  src_addr[4];
+        UINT8  dst_addr[4];
+    } IPV4_HEADER;
+#pragma pack(pop)
+
+    static UINT16 ip_checksum(const UINT8* data, UINT32 len) {
+        UINT32 sum = 0;
+        for (UINT32 i = 0; i + 1 < len; i += 2)
+            sum += (UINT16)((data[i] << 8) | data[i + 1]);
+        if (len & 1)
+            sum += (UINT16)(data[len - 1] << 8);
+        while (sum >> 16)
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        return (UINT16)(~sum & 0xFFFF);
+    }
+
+    static UINT32 build_ip_wrapped_packet(const p_packet_inject_request request,
+                                          const UINT8* transport_data, UINT32 transport_len,
+                                          UINT8* out_buf, UINT32 out_cap) {
+        UINT32 total_len = sizeof(IPV4_HEADER) + transport_len;
+        if (total_len > out_cap) return 0;
+
+        IPV4_HEADER* ip = (IPV4_HEADER*)out_buf;
+        strong::kmemset(ip, 0, sizeof(IPV4_HEADER));
+        ip->ver_ihl = 0x45;
+        ip->tos = 0;
+        ip->total_length = _byteswap_ushort((UINT16)total_len);
+        ip->identification = _byteswap_ushort((UINT16)(KeQueryTimeIncrement() & 0xFFFF));
+        ip->flags_fragoffset = 0;
+        ip->ttl = 128;
+        ip->protocol = (UINT8)request->protocol;
+        ip->checksum = 0;
+        strong::kmemcpy(ip->src_addr, request->src_addr, 4);
+        strong::kmemcpy(ip->dst_addr, request->dst_addr, 4);
+
+        ip->checksum = _byteswap_ushort(ip_checksum((const UINT8*)ip, sizeof(IPV4_HEADER)));
+
+        strong::kmemcpy(out_buf + sizeof(IPV4_HEADER), transport_data, transport_len);
+        return total_len;
+    }
+
     NTSTATUS inject_packet(p_packet_inject_request request) {
         if (!request) return STATUS_INVALID_PARAMETER;
         request->status = 1;
 
-        if (!resolve_inject_functions() || !g_inject_handle_v4)
+        if (!resolve_inject_functions())
             return STATUS_NOT_SUPPORTED;
 
-        if (request->payload_size == 0 || request->payload_size > INJECT_MAX_PAYLOAD)
+        if (!ensure_inject_nbl_pool())
+            return STATUS_INSUFFICIENT_RESOURCES;
+
+        BOOLEAN have_transport = (g_inject_handle_v4 != nullptr && _FwpsInjectSend0 && _FwpsInjectRecv0);
+        BOOLEAN have_network = (g_inject_handle_net_v4 != nullptr && (_FwpsInjectNetSend0 || _FwpsInjectNetRecv0));
+        if (!have_transport && !have_network)
+            return STATUS_NOT_SUPPORTED;
+
+        if (request->payload_size > INJECT_MAX_PAYLOAD)
+            return STATUS_INVALID_PARAMETER;
+        if (request->payload_size == 0 &&
+            request->protocol != IPPROTO_TCP && request->protocol != IPPROTO_UDP)
             return STATUS_INVALID_PARAMETER;
 
         UINT8 packet_buf[INJECT_MAX_PAYLOAD + 32] = {};
@@ -2772,67 +3351,168 @@ namespace net_inject {
             return STATUS_INVALID_PARAMETER;
         }
 
-        PVOID buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, packet_size, 'jiNW');
-        if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
-        strong::kmemcpy(buf, packet_buf, packet_size);
+        BOOLEAN loopback_v4 =
+            request->address_family == AF_INET &&
+            is_loopback_ipv4_addr(request->src_addr) &&
+            is_loopback_ipv4_addr(request->dst_addr);
+        UINT32 recv_interface_index = loopback_v4 ? 1u : 0u;
 
-        INJECT_COMPLETION_CONTEXT* completion = (INJECT_COMPLETION_CONTEXT*)
-            ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(INJECT_COMPLETION_CONTEXT), 'jcNW');
-        if (!completion) {
-            ExFreePoolWithTag(buf, 'jiNW');
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        strong::kmemset(completion, 0, sizeof(*completion));
-        completion->buffer = buf;
+        UINT64 endpoint_handle = lookup_endpoint_handle_by_port(request->protocol, request->src_port);
 
-        PMDL mdl = IoAllocateMdl(buf, packet_size, FALSE, FALSE, nullptr);
-        if (!mdl) {
-            ExFreePoolWithTag(completion, 'jcNW');
-            ExFreePoolWithTag(buf, 'jiNW');
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        completion->mdl = mdl;
-        MmBuildMdlForNonPagedPool(mdl);
+        AIDA_NET_LOG("inject_packet: dir=%u proto=%u af=%u size=%u loopback=%u endpoint=0x%llX transport=%u network=%u",
+            request->direction,
+            request->protocol,
+            request->address_family,
+            packet_size,
+            loopback_v4 ? 1u : 0u,
+            endpoint_handle,
+            have_transport ? 1u : 0u,
+            have_network ? 1u : 0u);
 
-        PVOID nbl = nullptr;
-        NTSTATUS st = _FwpsAllocateNBL0(nullptr, 0, 0, mdl, 0, packet_size, &nbl);
-        if (!NT_SUCCESS(st) || !nbl) {
-            IoFreeMdl(mdl);
-            ExFreePoolWithTag(completion, 'jcNW');
-            ExFreePoolWithTag(buf, 'jiNW');
-            return st;
-        }
+        NTSTATUS st = STATUS_UNSUCCESSFUL;
+        BOOLEAN transport_attempted = FALSE;
 
-        if (request->direction == 1) {
-            FWPS_TRANSPORT_SEND_PARAMS0_COMPAT sendArgs = {};
-            sendArgs.remoteAddress = request->dst_addr;
+        if (have_transport && (endpoint_handle != 0 || !have_network)) {
+            PVOID buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, packet_size, 'jiNW');
+            if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+            strong::kmemcpy(buf, packet_buf, packet_size);
 
-            st = _FwpsInjectSend0(g_inject_handle_v4, nullptr, 0, 0,
-                &sendArgs, (UINT16)request->address_family, 0, nbl,
-                (PVOID)inject_completion, completion);
-
-            if (!NT_SUCCESS(st) && _FwpsInjectRecv0 &&
-                request->address_family == AF_INET &&
-                is_loopback_ipv4_addr(request->src_addr) &&
-                is_loopback_ipv4_addr(request->dst_addr)) {
-                AIDA_NET_LOG("inject_packet: send inject failed status=0x%08X, retrying loopback receive injection",
-                    (UINT32)st);
-                st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
-                    (UINT16)request->address_family, 0, 0, 0, nbl,
-                    (PVOID)inject_completion, completion);
+            INJECT_COMPLETION_CONTEXT* completion = (INJECT_COMPLETION_CONTEXT*)
+                ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(INJECT_COMPLETION_CONTEXT), 'jcNW');
+            if (!completion) {
+                ExFreePoolWithTag(buf, 'jiNW');
+                return STATUS_INSUFFICIENT_RESOURCES;
             }
-        } else {
+            strong::kmemset(completion, 0, sizeof(*completion));
+            completion->buffer = buf;
 
-            st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
-                (UINT16)request->address_family, 0, 0, 0, nbl,
-                (PVOID)inject_completion, completion);
-        }
+            PMDL mdl = IoAllocateMdl(buf, packet_size, FALSE, FALSE, nullptr);
+            if (!mdl) {
+                ExFreePoolWithTag(completion, 'jcNW');
+                ExFreePoolWithTag(buf, 'jiNW');
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            completion->mdl = mdl;
+            MmBuildMdlForNonPagedPool(mdl);
 
-        if (!NT_SUCCESS(st)) {
+            PVOID nbl = nullptr;
+            st = _FwpsAllocateNBL0(g_inject_nbl_pool, 0, 0, mdl, 0, packet_size, &nbl);
+            if (!NT_SUCCESS(st) || !nbl) {
+                AIDA_NET_LOG("inject_packet: FwpsAllocateNetBufferAndNetBufferList0 failed 0x%08X", (UINT32)st);
+                IoFreeMdl(mdl);
+                ExFreePoolWithTag(completion, 'jcNW');
+                ExFreePoolWithTag(buf, 'jiNW');
+                return st;
+            }
+
+            transport_attempted = TRUE;
+
+            if (request->direction == 1) {
+                FWPS_TRANSPORT_SEND_PARAMS0_COMPAT sendArgs = {};
+                sendArgs.remoteAddress = request->dst_addr;
+
+                st = _FwpsInjectSend0(g_inject_handle_v4, nullptr, endpoint_handle, 0,
+                    &sendArgs, (UINT16)request->address_family, 0, nbl,
+                    (PVOID)inject_completion, completion);
+
+                if (!NT_SUCCESS(st) && _FwpsInjectRecv0 && loopback_v4) {
+                    AIDA_NET_LOG("inject_packet: transport send failed 0x%08X, trying transport receive", (UINT32)st);
+                    st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
+                        (UINT16)request->address_family, 0, recv_interface_index, 0, nbl,
+                        (PVOID)inject_completion, completion);
+                }
+            } else {
+                st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
+                    (UINT16)request->address_family, 0, recv_interface_index, 0, nbl,
+                    (PVOID)inject_completion, completion);
+
+                if (!NT_SUCCESS(st) && _FwpsInjectSend0 && loopback_v4) {
+                    FWPS_TRANSPORT_SEND_PARAMS0_COMPAT sendArgs = {};
+                    sendArgs.remoteAddress = request->dst_addr;
+                    st = _FwpsInjectSend0(g_inject_handle_v4, nullptr, endpoint_handle, 0,
+                        &sendArgs, (UINT16)request->address_family, 0, nbl,
+                        (PVOID)inject_completion, completion);
+                }
+            }
+
+            if (NT_SUCCESS(st)) {
+                request->status = 0;
+                return STATUS_SUCCESS;
+            }
+
+            AIDA_NET_LOG("inject_packet: transport injection failed 0x%08X, endpoint_handle=0x%llX",
+                (UINT32)st, endpoint_handle);
             _FwpsFreeNBL0(nbl);
             IoFreeMdl(mdl);
             ExFreePoolWithTag(completion, 'jcNW');
             ExFreePoolWithTag(buf, 'jiNW');
+        }
+
+        if (!have_network) {
+            AIDA_NET_LOG("inject_packet: no network-layer fallback available");
+            return st;
+        }
+
+        UINT8 ip_packet_buf[INJECT_MAX_PAYLOAD + 64] = {};
+        UINT32 ip_packet_size = build_ip_wrapped_packet(request, packet_buf, packet_size,
+            ip_packet_buf, sizeof(ip_packet_buf));
+        if (ip_packet_size == 0) {
+            AIDA_NET_LOG("inject_packet: failed to build IP-wrapped packet");
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        PVOID net_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, ip_packet_size, 'jiNW');
+        if (!net_buf) return STATUS_INSUFFICIENT_RESOURCES;
+        strong::kmemcpy(net_buf, ip_packet_buf, ip_packet_size);
+
+        INJECT_COMPLETION_CONTEXT* net_completion = (INJECT_COMPLETION_CONTEXT*)
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(INJECT_COMPLETION_CONTEXT), 'jcNW');
+        if (!net_completion) {
+            ExFreePoolWithTag(net_buf, 'jiNW');
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        strong::kmemset(net_completion, 0, sizeof(*net_completion));
+        net_completion->buffer = net_buf;
+
+        PMDL net_mdl = IoAllocateMdl(net_buf, ip_packet_size, FALSE, FALSE, nullptr);
+        if (!net_mdl) {
+            ExFreePoolWithTag(net_completion, 'jcNW');
+            ExFreePoolWithTag(net_buf, 'jiNW');
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        net_completion->mdl = net_mdl;
+        MmBuildMdlForNonPagedPool(net_mdl);
+
+        PVOID net_nbl = nullptr;
+        st = _FwpsAllocateNBL0(g_inject_nbl_pool, 0, 0, net_mdl, 0, ip_packet_size, &net_nbl);
+        if (!NT_SUCCESS(st) || !net_nbl) {
+            AIDA_NET_LOG("inject_packet: FwpsAllocateNetBufferAndNetBufferList0(network) failed 0x%08X", (UINT32)st);
+            IoFreeMdl(net_mdl);
+            ExFreePoolWithTag(net_completion, 'jcNW');
+            ExFreePoolWithTag(net_buf, 'jiNW');
+            return st;
+        }
+
+        if (request->direction == 1 && _FwpsInjectNetSend0) {
+            st = _FwpsInjectNetSend0(g_inject_handle_net_v4, nullptr, 0, 0,
+                net_nbl, (PVOID)inject_completion, net_completion);
+        } else if (_FwpsInjectNetRecv0) {
+            st = _FwpsInjectNetRecv0(g_inject_handle_net_v4, nullptr, 0, 0,
+                recv_interface_index, 0, net_nbl,
+                (PVOID)inject_completion, net_completion);
+        } else if (_FwpsInjectNetSend0) {
+            st = _FwpsInjectNetSend0(g_inject_handle_net_v4, nullptr, 0, 0,
+                net_nbl, (PVOID)inject_completion, net_completion);
+        } else {
+            st = STATUS_NOT_SUPPORTED;
+        }
+
+        if (!NT_SUCCESS(st)) {
+            AIDA_NET_LOG("inject_packet: network-layer injection failed 0x%08X", (UINT32)st);
+            _FwpsFreeNBL0(net_nbl);
+            IoFreeMdl(net_mdl);
+            ExFreePoolWithTag(net_completion, 'jcNW');
+            ExFreePoolWithTag(net_buf, 'jiNW');
             return st;
         }
 
@@ -2844,6 +3524,14 @@ namespace net_inject {
         if (g_inject_handle_v4 && _FwpsInjectionHandleDestroy0) {
             _FwpsInjectionHandleDestroy0(g_inject_handle_v4);
             g_inject_handle_v4 = nullptr;
+        }
+        if (g_inject_handle_net_v4 && _FwpsInjectionHandleDestroy0) {
+            _FwpsInjectionHandleDestroy0(g_inject_handle_net_v4);
+            g_inject_handle_net_v4 = nullptr;
+        }
+        if (g_inject_nbl_pool && _NdisFreeNetBufferListPool) {
+            _NdisFreeNetBufferListPool(g_inject_nbl_pool);
+            g_inject_nbl_pool = nullptr;
         }
     }
 }
@@ -3209,7 +3897,7 @@ namespace net_stream {
                 }
                 if (addr_match) match = TRUE;
             }
-            if (g_streams[i].pid != 0 && g_streams[i].pid != pid) match = FALSE;
+            if (g_streams[i].pid != 0 && pid != 0 && g_streams[i].pid != pid) match = FALSE;
 
             if (match && g_streams[i].stream_data && data_len > 0) {
                 KIRQL irql;
@@ -3541,12 +4229,14 @@ namespace net_dpi {
         KIRQL irql;
         KeAcquireSpinLock(&g_dpi_lock, &irql);
 
+        LONG entries_to_scan = g_dpi_count;
         UINT32 idx = g_dpi_tail;
-        while (idx != (UINT32)g_dpi_head && request->result_count < DPI_MAX_RESULTS) {
+        LONG scanned = 0;
+        while (scanned < entries_to_scan && request->result_count < DPI_MAX_RESULTS) {
             DPI_HEADER_INFO* src = &g_dpi_ring[idx];
 
 
-            if (request->filter_pid != 0 && src->pid != request->filter_pid) goto next;
+            if (request->filter_pid != 0 && src->pid != 0 && src->pid != request->filter_pid) goto next;
             if (request->filter_protocol != 0 && src->protocol != request->filter_protocol) goto next;
             if (request->filter_port != 0 && src->src_port != request->filter_port &&
                 src->dst_port != request->filter_port) goto next;
@@ -3559,6 +4249,7 @@ namespace net_dpi {
 
         next:
             idx = (idx + 1) % DPI_RING_SIZE;
+            scanned++;
         }
         KeReleaseSpinLock(&g_dpi_lock, irql);
         return STATUS_SUCCESS;
@@ -3600,7 +4291,7 @@ namespace net_intercept {
                             UINT32 af, UINT32 pid,
                             const UINT8* payload, UINT32 payload_len) {
         if (!g_intercepting) return FALSE;
-        if (g_filter_pid != 0 && pid != g_filter_pid) return FALSE;
+        if (g_filter_pid != 0 && pid != 0 && pid != g_filter_pid) return FALSE;
         if (g_filter_port != 0 && src_port != g_filter_port && dst_port != g_filter_port) return FALSE;
         if (g_filter_protocol != 0 && protocol != g_filter_protocol) return FALSE;
 
@@ -3625,7 +4316,7 @@ namespace net_intercept {
                 g_held[i].dst_port = dst_port;
                 strong::kmemcpy(g_held[i].src_addr, src_addr, 16);
                 strong::kmemcpy(g_held[i].dst_addr, dst_addr, 16);
-                g_held[i].pid = pid;
+                g_held[i].pid = (pid != 0) ? pid : g_filter_pid;
                 g_held[i].address_family = af;
                 UINT32 cap = payload_len < INTERCEPT_MAX_PAYLOAD ? payload_len : INTERCEPT_MAX_PAYLOAD;
                 g_held[i].payload_size = cap;
@@ -3770,6 +4461,294 @@ namespace net_intercept {
 
 namespace net_kill {
 
+    typedef struct _TCP_RESET_CANDIDATES {
+        BOOLEAN have_forward;
+        BOOLEAN have_reverse;
+        DPI_HEADER_INFO forward;
+        DPI_HEADER_INFO reverse;
+    } TCP_RESET_CANDIDATES;
+
+    static __forceinline UINT32 tuple_addr_len(UINT32 address_family) {
+        return (address_family == AF_INET6) ? 16u : 4u;
+    }
+
+    static BOOLEAN request_ip_is_zero(const UINT8* ip, UINT32 address_family) {
+        UINT32 len = tuple_addr_len(address_family);
+        for (UINT32 i = 0; i < len; i++) {
+            if (ip[i] != 0) {
+                return FALSE;
+            }
+        }
+        return TRUE;
+    }
+
+    static BOOLEAN tuple_ip_matches(const UINT8* actual,
+                                    const UINT8* expected,
+                                    UINT32 address_family) {
+        if (!actual || !expected) {
+            return FALSE;
+        }
+
+        if (request_ip_is_zero(expected, address_family)) {
+            return TRUE;
+        }
+
+        UINT32 len = tuple_addr_len(address_family);
+        if (aida_ip_bytes_equal(actual, expected, len)) {
+            return TRUE;
+        }
+
+        if (address_family == AF_INET && len == 4) {
+            UINT8 swapped[4] = { actual[3], actual[2], actual[1], actual[0] };
+            return aida_ip_bytes_equal(swapped, expected, 4);
+        }
+
+        return FALSE;
+    }
+
+    static BOOLEAN dpi_tuple_matches_request(const DPI_HEADER_INFO* info,
+                                             const conn_kill_request* request,
+                                             BOOLEAN reverse) {
+        if (!info || !request || info->protocol != IPPROTO_TCP) {
+            return FALSE;
+        }
+
+        UINT32 address_family = request->address_family != 0 ? request->address_family : info->address_family;
+        if (!reverse) {
+            if (request->src_port != 0 && info->src_port != request->src_port) return FALSE;
+            if (request->dst_port != 0 && info->dst_port != request->dst_port) return FALSE;
+            if (!tuple_ip_matches(info->src_addr, request->src_addr, address_family)) return FALSE;
+            if (!tuple_ip_matches(info->dst_addr, request->dst_addr, address_family)) return FALSE;
+        } else {
+            if (request->src_port != 0 && info->dst_port != request->src_port) return FALSE;
+            if (request->dst_port != 0 && info->src_port != request->dst_port) return FALSE;
+            if (!tuple_ip_matches(info->dst_addr, request->src_addr, address_family)) return FALSE;
+            if (!tuple_ip_matches(info->src_addr, request->dst_addr, address_family)) return FALSE;
+        }
+
+        return TRUE;
+    }
+
+    static BOOLEAN find_recent_reset_candidates(p_conn_kill_request request,
+                                                TCP_RESET_CANDIDATES* out) {
+        if (!request || !out || !net_dpi::g_dpi_ring || net_dpi::g_dpi_count <= 0) {
+            return FALSE;
+        }
+
+        strong::kmemset(out, 0, sizeof(*out));
+
+        KIRQL irql;
+        KeAcquireSpinLock(&net_dpi::g_dpi_lock, &irql);
+
+        LONG entries = net_dpi::g_dpi_count;
+        LONG idx = net_dpi::g_dpi_head;
+        for (LONG scanned = 0; scanned < entries && (!out->have_forward || !out->have_reverse); scanned++) {
+            if (idx == 0) {
+                idx = DPI_RING_SIZE;
+            }
+            idx--;
+
+            const DPI_HEADER_INFO* info = &net_dpi::g_dpi_ring[idx];
+            if (!out->have_forward && dpi_tuple_matches_request(info, request, FALSE)) {
+                strong::kmemcpy(&out->forward, info, sizeof(*info));
+                out->have_forward = TRUE;
+            }
+            if (!out->have_reverse && dpi_tuple_matches_request(info, request, TRUE)) {
+                strong::kmemcpy(&out->reverse, info, sizeof(*info));
+                out->have_reverse = TRUE;
+            }
+        }
+
+        KeReleaseSpinLock(&net_dpi::g_dpi_lock, irql);
+
+        if (!out->have_forward && !out->have_reverse) {
+            AIDA_NET_LOG("kill_connection: no DPI tuple match af=%u src=%u dst=%u pid=%u",
+                request->address_family,
+                request->src_port,
+                request->dst_port,
+                request->pid);
+
+            KIRQL dbg_irql;
+            KeAcquireSpinLock(&net_dpi::g_dpi_lock, &dbg_irql);
+            LONG dbg_entries = net_dpi::g_dpi_count;
+            LONG dbg_idx = net_dpi::g_dpi_head;
+            UINT32 dumped = 0;
+            for (LONG scanned = 0; scanned < dbg_entries && dumped < 6; scanned++) {
+                if (dbg_idx == 0) {
+                    dbg_idx = DPI_RING_SIZE;
+                }
+                dbg_idx--;
+
+                const DPI_HEADER_INFO* info = &net_dpi::g_dpi_ring[dbg_idx];
+                if (info->protocol != IPPROTO_TCP) {
+                    continue;
+                }
+
+                if (info->address_family == AF_INET) {
+                    AIDA_NET_LOG(
+                        "kill_connection: recent DPI dir=%u %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u pid=%u flags=0x%02X ack=%u payload=%u",
+                        info->direction,
+                        info->src_addr[0], info->src_addr[1], info->src_addr[2], info->src_addr[3], info->src_port,
+                        info->dst_addr[0], info->dst_addr[1], info->dst_addr[2], info->dst_addr[3], info->dst_port,
+                        info->pid,
+                        info->tcp_flags,
+                        info->tcp_ack,
+                        info->payload_size);
+                } else {
+                    AIDA_NET_LOG(
+                        "kill_connection: recent DPI dir=%u af=%u sport=%u dport=%u pid=%u flags=0x%02X ack=%u payload=%u",
+                        info->direction,
+                        info->address_family,
+                        info->src_port,
+                        info->dst_port,
+                        info->pid,
+                        info->tcp_flags,
+                        info->tcp_ack,
+                        info->payload_size);
+                }
+
+                dumped++;
+            }
+            KeReleaseSpinLock(&net_dpi::g_dpi_lock, dbg_irql);
+        }
+
+        return out->have_forward || out->have_reverse;
+    }
+
+    static NTSTATUS inject_reset_from_dpi_entry(const DPI_HEADER_INFO* info,
+                                                UINT32 direction) {
+        if (!info || (info->tcp_flags & 0x10u) == 0 || info->tcp_ack == 0) {
+            return STATUS_NOT_FOUND;
+        }
+
+        packet_inject_request inj = {};
+        inj.direction = direction;
+        inj.protocol = IPPROTO_TCP;
+        inj.address_family = info->address_family;
+        inj.src_port = info->dst_port;
+        inj.dst_port = info->src_port;
+        inj.payload_size = 0;
+        inj.tcp_flags = 0x04;
+        inj.tcp_seq = info->tcp_ack;
+        inj.tcp_ack = 0;
+        strong::kmemcpy(inj.src_addr, info->dst_addr, 16);
+        strong::kmemcpy(inj.dst_addr, info->src_addr, 16);
+        return net_inject::inject_packet(&inj);
+    }
+
+    static NTSTATUS inject_tcp_reset_fallback(p_conn_kill_request request) {
+        TCP_RESET_CANDIDATES candidates = {};
+        if (!find_recent_reset_candidates(request, &candidates)) {
+            AIDA_NET_LOG("kill_connection: no recent DPI candidates lport=%u rport=%u",
+                request->src_port, request->dst_port);
+            return STATUS_NOT_FOUND;
+        }
+
+        NTSTATUS last_status = STATUS_NOT_FOUND;
+        BOOLEAN injected = FALSE;
+
+        if (candidates.have_forward) {
+            last_status = inject_reset_from_dpi_entry(&candidates.forward, 0);
+            if (NT_SUCCESS(last_status)) {
+                injected = TRUE;
+            } else {
+                AIDA_NET_LOG("kill_connection: reverse RST fallback failed 0x%08X", (UINT32)last_status);
+            }
+        }
+
+        if (candidates.have_reverse) {
+            NTSTATUS reverse_status = inject_reset_from_dpi_entry(&candidates.reverse, 1);
+            if (NT_SUCCESS(reverse_status)) {
+                injected = TRUE;
+            } else {
+                AIDA_NET_LOG("kill_connection: forward RST fallback failed 0x%08X", (UINT32)reverse_status);
+                if (!NT_SUCCESS(last_status)) {
+                    last_status = reverse_status;
+                }
+            }
+        }
+
+        return injected ? STATUS_SUCCESS : last_status;
+    }
+
+    static BOOLEAN socket_matches_kill_request(const SOCKET_HANDLE_ENTRY* socket_info,
+                                               const conn_kill_request* request) {
+        if (!socket_info || !request)
+            return FALSE;
+
+        if (request->protocol != 0 && socket_info->protocol != 0 && socket_info->protocol != request->protocol)
+            return FALSE;
+
+        BOOLEAN src_match = FALSE;
+        BOOLEAN dst_match = FALSE;
+        if (request->src_port != 0) {
+            src_match = (socket_info->local_port == request->src_port) ||
+                        (socket_info->remote_port == request->src_port);
+        }
+        if (request->dst_port != 0) {
+            dst_match = (socket_info->local_port == request->dst_port) ||
+                        (socket_info->remote_port == request->dst_port);
+        }
+
+        if (request->src_port != 0 && request->dst_port != 0) {
+            if (src_match && dst_match)
+                return TRUE;
+
+            if ((src_match || dst_match) &&
+                (socket_info->local_port == 0 || socket_info->remote_port == 0)) {
+                return TRUE;
+            }
+
+            return FALSE;
+        }
+
+        if (request->src_port != 0)
+            return src_match;
+        if (request->dst_port != 0)
+            return dst_match;
+
+        return TRUE;
+    }
+
+    static UINT32 resolve_owner_pid_by_tuple(p_conn_kill_request request) {
+        if (!request)
+            return 0;
+
+        PAIDA_SYSTEM_HANDLE_INFORMATION handles = nullptr;
+        NTSTATUS status = aida_query_system_handles(&handles);
+        if (!NT_SUCCESS(status) || !handles)
+            return 0;
+
+        UINT32 owner_pid = 0;
+        __try {
+            for (ULONG i = 0; i < handles->NumberOfHandles; i++) {
+                const AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO* entry = &handles->Handles[i];
+                if (!entry->Object)
+                    continue;
+                if (!aida_is_afd_device_object(entry->Object))
+                    continue;
+
+                SOCKET_HANDLE_ENTRY socket_info = {};
+                if (!aida_extract_socket_info(entry->Object, &socket_info))
+                    continue;
+                if (!socket_matches_kill_request(&socket_info, request)) {
+                    continue;
+                }
+
+                owner_pid = (UINT32)entry->UniqueProcessId;
+                if (owner_pid != 0) {
+                    aida_cache_pid_from_socket_info(&socket_info, owner_pid);
+                    break;
+                }
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            owner_pid = 0;
+        }
+
+        ExFreePoolWithTag(handles, 'hANW');
+        return owner_pid;
+    }
+
     static NTSTATUS close_matching_socket(UINT32 owner_pid, p_conn_kill_request request) {
         PAIDA_SYSTEM_HANDLE_INFORMATION handles = nullptr;
         NTSTATUS status = aida_query_system_handles(&handles);
@@ -3796,10 +4775,7 @@ namespace net_kill {
                 SOCKET_HANDLE_ENTRY socket_info = {};
                 if (!aida_extract_socket_info(entry->Object, &socket_info))
                     continue;
-                if (!aida_socket_matches_ports(&socket_info,
-                        request->protocol,
-                        request->src_port,
-                        request->dst_port)) {
+                if (!socket_matches_kill_request(&socket_info, request)) {
                     continue;
                 }
 
@@ -3822,6 +4798,60 @@ namespace net_kill {
         return close_status;
     }
 
+    static NTSTATUS resolve_and_close_socket(p_conn_kill_request request) {
+        PAIDA_SYSTEM_HANDLE_INFORMATION handles = nullptr;
+        NTSTATUS status = aida_query_system_handles(&handles);
+        if (!NT_SUCCESS(status) || !handles) {
+            return status;
+        }
+
+        NTSTATUS close_status = STATUS_NOT_FOUND;
+        __try {
+            for (ULONG i = 0; i < handles->NumberOfHandles; i++) {
+                const AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO* entry = &handles->Handles[i];
+                if (!entry->Object)
+                    continue;
+                if (!aida_is_afd_device_object(entry->Object))
+                    continue;
+
+                SOCKET_HANDLE_ENTRY socket_info = {};
+                if (!aida_extract_socket_info(entry->Object, &socket_info))
+                    continue;
+                if (!socket_matches_kill_request(&socket_info, request))
+                    continue;
+
+                UINT32 owner_pid = (UINT32)entry->UniqueProcessId;
+                if (owner_pid == 0)
+                    continue;
+
+                aida_cache_pid_from_socket_info(&socket_info, owner_pid);
+
+                PEPROCESS process = nullptr;
+                status = stack_spoof::spoofed_PsLookupProcessByProcessId(
+                    (HANDLE)(ULONG_PTR)owner_pid, &process);
+                if (!NT_SUCCESS(status) || !process)
+                    continue;
+
+                KAPC_STATE apc = {};
+                KeStackAttachProcess(process, &apc);
+                close_status = ZwClose((HANDLE)(ULONG_PTR)entry->HandleValue);
+                KeUnstackDetachProcess(&apc);
+                stack_spoof::spoofed_ObfDereferenceObject(process);
+
+                if (NT_SUCCESS(close_status)) {
+                    AIDA_NET_LOG("kill_connection: closed socket handle pid=%u handle=0x%X lport=%u rport=%u",
+                        owner_pid, (UINT32)entry->HandleValue, socket_info.local_port, socket_info.remote_port);
+                    break;
+                }
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            close_status = STATUS_ACCESS_VIOLATION;
+        }
+
+        ExFreePoolWithTag(handles, 'hANW');
+        return close_status;
+    }
+
     NTSTATUS kill_connection(p_conn_kill_request request) {
         if (!request) return STATUS_INVALID_PARAMETER;
         request->status = 1;
@@ -3829,19 +4859,47 @@ namespace net_kill {
         if (request->protocol != 6) return STATUS_INVALID_PARAMETER;
 
         UINT32 owner_pid = request->pid;
-        if (owner_pid == 0) {
-            owner_pid = HandleToULong(PsGetCurrentProcessId());
+        if (owner_pid != 0) {
+            NTSTATUS st = close_matching_socket(owner_pid, request);
+            if (NT_SUCCESS(st)) {
+                request->status = 0;
+                return STATUS_SUCCESS;
+            }
+            AIDA_NET_LOG("kill_connection: close_matching_socket failed pid=%u status=0x%08X",
+                owner_pid, (UINT32)st);
+            NTSTATUS rst_status = inject_tcp_reset_fallback(request);
+            if (NT_SUCCESS(rst_status)) {
+                request->status = 0;
+                return STATUS_SUCCESS;
+            }
+            return NT_SUCCESS(st) ? rst_status : st;
         }
 
-        NTSTATUS st = close_matching_socket(owner_pid, request);
+        owner_pid = resolve_owner_pid_by_tuple(request);
+        if (owner_pid != 0) {
+            NTSTATUS st = close_matching_socket(owner_pid, request);
+            if (NT_SUCCESS(st)) {
+                request->status = 0;
+                return STATUS_SUCCESS;
+            }
+            AIDA_NET_LOG("kill_connection: resolved owner pid=%u close failed 0x%08X",
+                owner_pid, (UINT32)st);
+        }
+
+        NTSTATUS st = resolve_and_close_socket(request);
         if (NT_SUCCESS(st)) {
             request->status = 0;
             return STATUS_SUCCESS;
         }
 
-        AIDA_NET_LOG("kill_connection: close_matching_socket failed pid=%u status=0x%08X",
-            owner_pid, (UINT32)st);
-        return st;
+        AIDA_NET_LOG("kill_connection: resolve_and_close_socket failed status=0x%08X",
+            (UINT32)st);
+        NTSTATUS rst_status = inject_tcp_reset_fallback(request);
+        if (NT_SUCCESS(rst_status)) {
+            request->status = 0;
+            return STATUS_SUCCESS;
+        }
+        return NT_SUCCESS(st) ? rst_status : st;
     }
 }
 
@@ -4252,7 +5310,7 @@ namespace net_pcap {
         while (count > 0 && request->packet_count < max_pkts) {
             NET_PACKET_ENTRY* pkt = &net_capture::g_ring_buffer[idx];
 
-            if (request->filter_pid != 0 && pkt->pid != request->filter_pid) {
+            if (request->filter_pid != 0 && pkt->pid != 0 && pkt->pid != request->filter_pid) {
                 idx = (idx + 1) % RING_BUFFER_SIZE;
                 count--;
                 continue;
@@ -4575,6 +5633,10 @@ NTSTATUS functions::handle_traffic_redirect_list(p_traffic_redirect_list request
 NTSTATUS functions::handle_stream_reassemble(p_stream_reassemble_request request) {
     if (!request) return STATUS_INVALID_PARAMETER;
     AIDA_NET_LOG("IOCTL STRM op=%u src_port=%u dst_port=%u pid=%u", request->operation, request->src_port, request->dst_port, request->pid);
+    if (request->operation == 0 && request->pid != 0) {
+        NTSTATUS cache_status = aida_refresh_pid_cache_for_process(request->pid, IPPROTO_TCP);
+        AIDA_NET_LOG("IOCTL STRM cache warm pid=%u status=0x%08X", request->pid, (UINT32)cache_status);
+    }
     NTSTATUS st = net_stream::handle_stream(request);
     AIDA_NET_LOG("IOCTL STRM status=0x%08X stream_size=%u packets=%u streams=%u",
         (UINT32)st, request->stream_size, request->total_packets, request->stream_count);
@@ -4585,6 +5647,10 @@ NTSTATUS functions::handle_deep_inspect(p_dpi_request request) {
     if (!request) return STATUS_INVALID_PARAMETER;
     AIDA_NET_LOG("IOCTL DPIN filter_pid=%u filter_proto=%u filter_port=%u flags=0x%X",
         request->filter_pid, request->filter_protocol, request->filter_port, request->flags);
+    if (request->filter_pid != 0) {
+        NTSTATUS cache_status = aida_refresh_pid_cache_for_process(request->filter_pid, request->filter_protocol);
+        AIDA_NET_LOG("IOCTL DPIN cache warm pid=%u status=0x%08X", request->filter_pid, (UINT32)cache_status);
+    }
     NTSTATUS st = net_dpi::get_results(request);
     AIDA_NET_LOG("IOCTL DPIN status=0x%08X results=%u", (UINT32)st, request->result_count);
     return st;
@@ -4595,6 +5661,10 @@ NTSTATUS functions::handle_intercept_hold(p_intercept_request request) {
     AIDA_NET_LOG("IOCTL IHLD op=%u hold_id=%llu filter_pid=%u filter_port=%u filter_proto=%u modify_size=%u",
         request->operation, (unsigned long long)request->hold_id, request->filter_pid,
         request->filter_port, request->filter_protocol, request->modify_payload_size);
+    if (request->operation == 0 && request->filter_pid != 0) {
+        NTSTATUS cache_status = aida_refresh_pid_cache_for_process(request->filter_pid, request->filter_protocol);
+        AIDA_NET_LOG("IOCTL IHLD cache warm pid=%u status=0x%08X", request->filter_pid, (UINT32)cache_status);
+    }
     NTSTATUS st = net_intercept::handle_intercept(request);
     AIDA_NET_LOG("IOCTL IHLD status=0x%08X intercepting=%u held=%u", (UINT32)st, request->intercepting, request->held_count);
     return st;

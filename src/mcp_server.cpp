@@ -241,6 +241,48 @@ static std::string snake_to_title(const std::string& name)
     return title;
 }
 
+static std::string compact_tool_text(const std::string& text, std::size_t max_len)
+{
+    std::string sanitized = sanitize_utf8(text);
+    std::string compact;
+    compact.reserve(sanitized.size());
+
+    bool previous_was_space = false;
+    for (unsigned char ch : sanitized)
+    {
+        if (std::isspace(ch) != 0)
+        {
+            if (!compact.empty() && !previous_was_space)
+            {
+                compact.push_back(' ');
+                previous_was_space = true;
+            }
+            continue;
+        }
+
+        compact.push_back(static_cast<char>(ch));
+        previous_was_space = false;
+    }
+
+    while (!compact.empty() && compact.back() == ' ')
+        compact.pop_back();
+
+    if (compact.size() <= max_len)
+        return compact;
+
+    std::size_t cut = compact.rfind('.', max_len);
+    if (cut == std::string::npos || cut < max_len / 2)
+        cut = compact.rfind(' ', max_len);
+    if (cut == std::string::npos || cut < max_len / 2)
+        cut = max_len;
+
+    compact.erase(cut);
+    while (!compact.empty() && compact.back() == ' ')
+        compact.pop_back();
+    compact += "...";
+    return compact;
+}
+
 static bool is_destructive_tool(const std::string& name)
 {
     return name == "delete_function"
@@ -284,7 +326,7 @@ static json build_mcp_tools_list()
         {
             json p;
             p[OBFSTR_C("type")] = param.type;
-            p[OBFSTR_C("description")] = param.description;
+            p[OBFSTR_C("description")] = compact_tool_text(param.description, 160);
             if (!param.enum_values.empty())
                 p["enum"] = param.enum_values;
             if (param.type == "array" && !param.items_schema.is_null())
@@ -309,7 +351,7 @@ static json build_mcp_tools_list()
 
         json t;
         t[OBFSTR_C("name")]        = tool->name;
-        t[OBFSTR_C("description")] = tool->description;
+        t[OBFSTR_C("description")] = compact_tool_text(tool->description, 320);
         t[OBFSTR_C("inputSchema")] = input_schema;
         t["annotations"] = annotations;
         tools.push_back(t);

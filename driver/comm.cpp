@@ -133,6 +133,41 @@ namespace anti_debug {
     }
 }
 
+namespace {
+    constexpr std::size_t k_staged_physical_chunk_size = 0x1000;
+
+    class virtual_alloc_buffer_t final {
+    public:
+        explicit virtual_alloc_buffer_t(std::size_t size) noexcept : size_(size) {
+            data_ = static_cast<std::uint8_t*>(::VirtualAlloc(
+                nullptr,
+                size_,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE));
+
+            if (data_ != nullptr) {
+                std::memset(data_, 0, size_);
+            }
+        }
+
+        ~virtual_alloc_buffer_t() {
+            if (data_ != nullptr) {
+                ::VirtualFree(data_, 0, MEM_RELEASE);
+            }
+        }
+
+        virtual_alloc_buffer_t(const virtual_alloc_buffer_t&) = delete;
+        virtual_alloc_buffer_t& operator=(const virtual_alloc_buffer_t&) = delete;
+
+        std::uint8_t* data() const noexcept { return data_; }
+        explicit operator bool() const noexcept { return data_ != nullptr; }
+
+    private:
+        std::uint8_t* data_ = nullptr;
+        std::size_t size_ = 0;
+    };
+}
+
 bool voyager::device_t::connect() noexcept {
     SPOOF_FUNC;
 
@@ -338,6 +373,124 @@ void voyager::device_t::solve_kernel_dtb() noexcept {
     }
 }
 
+std::size_t voyager::device_t::transfer_physical_read(
+    std::uint32_t pid,
+    std::uint64_t dtb,
+    std::uint64_t address,
+    void* buffer,
+    std::size_t size) const noexcept {
+    SPOOF_FUNC;
+
+    if (!buffer || size == 0 || !is_connected() || dtb == 0) {
+        return 0;
+    }
+
+    const std::size_t staging_size = (size < k_staged_physical_chunk_size)
+        ? size
+        : k_staged_physical_chunk_size;
+    virtual_alloc_buffer_t staging(staging_size);
+    if (!staging) {
+        return 0;
+    }
+
+    auto* destination = static_cast<std::uint8_t*>(buffer);
+    std::size_t total_read = 0;
+
+    while (total_read < size) {
+        const std::size_t chunk_size = (size - total_read < k_staged_physical_chunk_size)
+            ? (size - total_read)
+            : k_staged_physical_chunk_size;
+
+        std::memset(staging.data(), 0, chunk_size);
+
+        detail::physical_request req{};
+        req.pid = pid;
+        req.dtb = dtb;
+        req.address = reinterpret_cast<void*>(address + total_read);
+        req.buffer = staging.data();
+        req.size = chunk_size;
+        req.ret_size = 0;
+        req.should_write = 0;
+        std::memset(req.padding_2, 0, sizeof(req.padding_2));
+
+        if (!send_request(ioctl_codes::PHYS(), &req, sizeof(req))) {
+            break;
+        }
+
+        const std::size_t bytes_read = (req.ret_size <= chunk_size) ? req.ret_size : chunk_size;
+        if (bytes_read == 0) {
+            break;
+        }
+
+        std::memcpy(destination + total_read, staging.data(), bytes_read);
+        total_read += bytes_read;
+
+        if (bytes_read < chunk_size) {
+            break;
+        }
+    }
+
+    return total_read;
+}
+
+std::size_t voyager::device_t::transfer_physical_write(
+    std::uint32_t pid,
+    std::uint64_t dtb,
+    std::uint64_t address,
+    const void* buffer,
+    std::size_t size) const noexcept {
+    SPOOF_FUNC;
+
+    if (!buffer || size == 0 || !is_connected() || dtb == 0) {
+        return 0;
+    }
+
+    const std::size_t staging_size = (size < k_staged_physical_chunk_size)
+        ? size
+        : k_staged_physical_chunk_size;
+    virtual_alloc_buffer_t staging(staging_size);
+    if (!staging) {
+        return 0;
+    }
+
+    const auto* source = static_cast<const std::uint8_t*>(buffer);
+    std::size_t total_written = 0;
+
+    while (total_written < size) {
+        const std::size_t chunk_size = (size - total_written < k_staged_physical_chunk_size)
+            ? (size - total_written)
+            : k_staged_physical_chunk_size;
+
+        std::memcpy(staging.data(), source + total_written, chunk_size);
+
+        detail::physical_request req{};
+        req.pid = pid;
+        req.dtb = dtb;
+        req.address = reinterpret_cast<void*>(address + total_written);
+        req.buffer = staging.data();
+        req.size = chunk_size;
+        req.ret_size = 0;
+        req.should_write = 1;
+        std::memset(req.padding_2, 0, sizeof(req.padding_2));
+
+        if (!send_request(ioctl_codes::PHYS(), &req, sizeof(req))) {
+            break;
+        }
+
+        const std::size_t bytes_written = (req.ret_size <= chunk_size) ? req.ret_size : chunk_size;
+        if (bytes_written == 0) {
+            break;
+        }
+
+        total_written += bytes_written;
+        if (bytes_written < chunk_size) {
+            break;
+        }
+    }
+
+    return total_written;
+}
+
 std::size_t voyager::device_t::read_kernel_raw(std::uint64_t address, void* buffer, std::size_t size) const noexcept {
     SPOOF_FUNC;
 
@@ -354,21 +507,7 @@ std::size_t voyager::device_t::read_kernel_raw(std::uint64_t address, void* buff
     if (use_dtb == 0) use_dtb = dtb_;
     if (use_dtb == 0) return 0;
 
-    detail::physical_request req{};
-    req.pid = 4;
-    req.dtb = use_dtb;
-    req.address = reinterpret_cast<void*>(address);
-    req.buffer = buffer;
-    req.size = size;
-    req.ret_size = 0;
-    req.should_write = 0;
-    std::memset(req.padding_2, 0, sizeof(req.padding_2));
-
-    if (send_request(ioctl_codes::PHYS(), &req, sizeof(req))) {
-        return req.ret_size;
-    }
-
-    return 0;
+    return transfer_physical_read(4, use_dtb, address, buffer, size);
 }
 
 std::size_t voyager::device_t::write_kernel_raw(std::uint64_t address, const void* buffer, std::size_t size) const noexcept {
@@ -386,20 +525,7 @@ std::size_t voyager::device_t::write_kernel_raw(std::uint64_t address, const voi
     if (use_dtb == 0) use_dtb = dtb_;
     if (use_dtb == 0) return 0;
 
-    detail::physical_request req{};
-    req.pid = 4;
-    req.dtb = use_dtb;
-    req.address = reinterpret_cast<void*>(address);
-    req.buffer = const_cast<void*>(buffer);
-    req.size = size;
-    req.ret_size = 0;
-    req.should_write = 1;
-    std::memset(req.padding_2, 0, sizeof(req.padding_2));
-
-    if (send_request(ioctl_codes::PHYS(), &req, sizeof(req))) {
-        return req.ret_size;
-    }
-    return 0;
+    return transfer_physical_write(4, use_dtb, address, buffer, size);
 }
 
 std::uint64_t voyager::device_t::find_image() noexcept {
@@ -430,21 +556,7 @@ std::size_t voyager::device_t::read_raw(std::uint64_t address, void* buffer, std
         return 0;
     }
 
-    detail::physical_request req{};
-    req.pid = process_id_;
-    req.dtb = dtb_;
-    req.address = reinterpret_cast<void*>(address);
-    req.buffer = buffer;
-    req.size = size;
-    req.ret_size = 0;
-    req.should_write = 0;
-    std::memset(req.padding_2, 0, sizeof(req.padding_2));
-
-    if (send_request(ioctl_codes::PHYS(), &req, sizeof(req))) {
-        return req.ret_size;
-    }
-
-    return 0;
+    return transfer_physical_read(process_id_, dtb_, address, buffer, size);
 }
 
 std::size_t voyager::device_t::write_raw(std::uint64_t address, const void* buffer, std::size_t size) const noexcept {
@@ -458,20 +570,7 @@ std::size_t voyager::device_t::write_raw(std::uint64_t address, const void* buff
         return 0;
     }
 
-    detail::physical_request req{};
-    req.pid = process_id_;
-    req.dtb = dtb_;
-    req.address = reinterpret_cast<void*>(address);
-    req.buffer = const_cast<void*>(buffer);
-    req.size = size;
-    req.ret_size = 0;
-    req.should_write = 1;
-    std::memset(req.padding_2, 0, sizeof(req.padding_2));
-
-    if (send_request(ioctl_codes::PHYS(), &req, sizeof(req))) {
-        return req.ret_size;
-    }
-    return 0;
+    return transfer_physical_write(process_id_, dtb_, address, buffer, size);
 }
 
 void voyager::device_t::move_mouse(std::int32_t input_x, std::int32_t input_y, std::uint32_t mouse_flags) {

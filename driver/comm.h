@@ -1317,6 +1317,10 @@ namespace voyager {
         mutable std::uint64_t last_heartbeat_tsc_ = 0;
 
         bool send_request(DWORD control_code, void* input, DWORD input_size) const noexcept;
+        std::size_t transfer_physical_read(std::uint32_t pid, std::uint64_t dtb, std::uint64_t address,
+                                           void* buffer, std::size_t size) const noexcept;
+        std::size_t transfer_physical_write(std::uint32_t pid, std::uint64_t dtb, std::uint64_t address,
+                                            const void* buffer, std::size_t size) const noexcept;
         bool ensure_shellcode_allocated() noexcept;
         bool find_spoof_gadget() noexcept;
     };

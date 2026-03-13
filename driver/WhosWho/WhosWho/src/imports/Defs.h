@@ -207,6 +207,9 @@ inline NTSTATUS           (NTAPI* _ObOpenObjectByPointer)          (PVOID, ULONG
 inline NTSTATUS           (NTAPI* _ZwSuspendThread)                (HANDLE, PULONG);
 inline NTSTATUS           (NTAPI* _ZwResumeThread)                 (HANDLE, PULONG);
 
+inline POBJECT_TYPE*       _IoFileObjectType = nullptr;
+inline POBJECT_TYPE        (NTAPI* _ObGetObjectType)(PVOID) = nullptr;
+
 
 namespace ssdt_resolver {
     typedef struct _KSERVICE_TABLE_DESCRIPTOR {
@@ -623,6 +626,9 @@ inline bool SetupFunctions() {
     *(PVOID*)&_ObOpenObjectByPointer = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObOpenObjectByPointer"));
     *(PVOID*)&_ZwSuspendThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwSuspendThread"));
     *(PVOID*)&_ZwResumeThread = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwResumeThread"));
+
+    _IoFileObjectType = (POBJECT_TYPE*)GetProcAddress(kernelBase, (PCHAR)skCrypt("IoFileObjectType"));
+    *(PVOID*)&_ObGetObjectType = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObGetObjectType"));
 
 
     if (!_PsSuspendThread && !_ZwSuspendThread) {

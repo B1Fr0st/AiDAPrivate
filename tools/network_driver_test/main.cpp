@@ -127,6 +127,32 @@ public:
         return launched_;
     }
 
+    bool is_running(DWORD* out_exit_code = nullptr) const {
+        if (!launched_ || !pi_.hProcess) {
+            if (out_exit_code) {
+                *out_exit_code = 0;
+            }
+            return false;
+        }
+
+        DWORD exit_code = 0;
+        if (!GetExitCodeProcess(pi_.hProcess, &exit_code)) {
+            if (out_exit_code) {
+                *out_exit_code = 0xFFFFFFFFu;
+            }
+            return false;
+        }
+
+        if (out_exit_code) {
+            *out_exit_code = exit_code;
+        }
+        return exit_code == STILL_ACTIVE;
+    }
+
+    DWORD process_id() const {
+        return pi_.dwProcessId;
+    }
+
 private:
     PROCESS_INFORMATION pi_{};
     bool launched_ = false;
@@ -213,10 +239,17 @@ std::filesystem::path default_target_exe_path() {
     return repo_root / "tools" / "netlab_target" / "bin" / "Release" / "net8.0" / "win-x64" / "publish" / "NetLabTarget.exe";
 }
 
-bool can_connect_local_tcp(std::uint16_t port) {
+bool can_connect_local_tcp(std::uint16_t port, int* out_wsa_error = nullptr) {
+    if (out_wsa_error) {
+        *out_wsa_error = 0;
+    }
+
     SocketGuard s;
     s.s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s.s == INVALID_SOCKET) {
+        if (out_wsa_error) {
+            *out_wsa_error = WSAGetLastError();
+        }
         return false;
     }
 
@@ -225,18 +258,75 @@ bool can_connect_local_tcp(std::uint16_t port) {
     sa.sin_port = htons(port);
     InetPtonA(AF_INET, "127.0.0.1", &sa.sin_addr);
 
-    return connect(s.s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0;
-}
+    if (connect(s.s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0) {
+        return true;
+    }
 
-bool wait_for_target_ready(std::uint16_t tcp_port, std::chrono::milliseconds timeout) {
-    auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (can_connect_local_tcp(tcp_port)) {
-            return true;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    if (out_wsa_error) {
+        *out_wsa_error = WSAGetLastError();
     }
     return false;
+}
+
+bool wait_for_target_ready(std::uint16_t tcp_port,
+                           std::chrono::milliseconds timeout,
+                           const TargetProcessSession* target_process = nullptr,
+                           int* out_last_wsa_error = nullptr,
+                           DWORD* out_target_exit_code = nullptr) {
+    int last_wsa_error = 0;
+
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        int wsa_error = 0;
+        if (can_connect_local_tcp(tcp_port, &wsa_error)) {
+            if (out_last_wsa_error) {
+                *out_last_wsa_error = 0;
+            }
+            if (out_target_exit_code) {
+                *out_target_exit_code = STILL_ACTIVE;
+            }
+            return true;
+        }
+
+        if (wsa_error != 0) {
+            last_wsa_error = wsa_error;
+        }
+
+        if (target_process && target_process->launched()) {
+            DWORD exit_code = STILL_ACTIVE;
+            if (!target_process->is_running(&exit_code)) {
+                if (out_last_wsa_error) {
+                    *out_last_wsa_error = last_wsa_error;
+                }
+                if (out_target_exit_code) {
+                    *out_target_exit_code = exit_code;
+                }
+                return false;
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    }
+
+    if (out_last_wsa_error) {
+        *out_last_wsa_error = last_wsa_error;
+    }
+    if (out_target_exit_code) {
+        *out_target_exit_code = STILL_ACTIVE;
+    }
+    return false;
+}
+
+void reset_driver_network_state(voyager::device_t& dev) {
+    dev.stop_capture();
+    dev.clear_filter_rules();
+    dev.packet_mod_rule_op(3);
+    dev.traffic_redirect_op(3);
+    dev.intercept_op(1, 0, 0, 0, 0, nullptr, 0, nullptr, nullptr);
+    dev.dns_spoof_op(3, 0, nullptr, nullptr, AF_INET, 0, nullptr);
+    dev.bw_monitor_op(1, 0, nullptr);
+    dev.bw_monitor_op(3, 0, nullptr);
+    dev.fingerprint_op(1);
 }
 
 class LocalTrafficHarness {
@@ -683,6 +773,8 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    reset_driver_network_state(dev);
+
     TargetProcessSession target_process;
     std::filesystem::path target_exe = cfg.target_exe.empty() ? default_target_exe_path() : std::filesystem::path(cfg.target_exe);
 
@@ -703,8 +795,16 @@ int main(int argc, char** argv) {
             return 4;
         }
 
-        if (!wait_for_target_ready(7777, std::chrono::seconds(12))) {
-            std::cerr << "NetLabTarget.exe did not become ready on 127.0.0.1:7777\n";
+        int last_wsa_error = 0;
+        DWORD target_exit_code = STILL_ACTIVE;
+        if (!wait_for_target_ready(7777, std::chrono::seconds(12), &target_process, &last_wsa_error, &target_exit_code)) {
+            std::cerr << "NetLabTarget.exe did not become ready on 127.0.0.1:7777"
+                << " (pid=" << target_process.process_id()
+                << ", last_wsa_error=" << last_wsa_error;
+            if (target_exit_code != STILL_ACTIVE) {
+                std::cerr << ", target_exit_code=" << target_exit_code;
+            }
+            std::cerr << ")\n";
             dev.disconnect();
             WSACleanup();
             return 5;
@@ -720,8 +820,10 @@ int main(int argc, char** argv) {
         return 6;
     }
 
-    if (!wait_for_target_ready(7777, std::chrono::seconds(6))) {
-        std::cerr << "Target process is not accepting TCP traffic on 127.0.0.1:7777\n";
+    int last_wsa_error = 0;
+    if (!wait_for_target_ready(7777, std::chrono::seconds(6), nullptr, &last_wsa_error, nullptr)) {
+        std::cerr << "Target process is not accepting TCP traffic on 127.0.0.1:7777"
+            << " (last_wsa_error=" << last_wsa_error << ")\n";
         dev.disconnect();
         WSACleanup();
         return 7;
