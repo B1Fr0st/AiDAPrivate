@@ -539,17 +539,26 @@ namespace dispatcher {
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else if (code == ioctl_codes::PMOD()) {
-
-            if (input_size >= sizeof(packet_mod_rule) && output_size >= sizeof(packet_mod_rule)) {
+            if (input_size >= sizeof(packet_mod_rule_list) && output_size >= sizeof(packet_mod_rule_list) &&
+                ((p_packet_mod_rule_list)buffer)->operation == 2) {
+                status = functions::handle_packet_mod_rule_list((p_packet_mod_rule_list)buffer);
+                bytes = sizeof(packet_mod_rule_list);
+            }
+            else if (input_size >= sizeof(packet_mod_rule) && output_size >= sizeof(packet_mod_rule)) {
                 status = functions::handle_packet_mod_rule((p_packet_mod_rule)buffer);
-                bytes = (input_size >= sizeof(packet_mod_rule_list)) ? sizeof(packet_mod_rule_list) : sizeof(packet_mod_rule);
+                bytes = sizeof(packet_mod_rule);
             }
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else if (code == ioctl_codes::PRED()) {
-            if (input_size >= sizeof(traffic_redirect_rule) && output_size >= sizeof(traffic_redirect_rule)) {
+            if (input_size >= sizeof(traffic_redirect_list) && output_size >= sizeof(traffic_redirect_list) &&
+                ((p_traffic_redirect_list)buffer)->operation == 2) {
+                status = functions::handle_traffic_redirect_list((p_traffic_redirect_list)buffer);
+                bytes = sizeof(traffic_redirect_list);
+            }
+            else if (input_size >= sizeof(traffic_redirect_rule) && output_size >= sizeof(traffic_redirect_rule)) {
                 status = functions::handle_traffic_redirect((p_traffic_redirect_rule)buffer);
-                bytes = (input_size >= sizeof(traffic_redirect_list)) ? sizeof(traffic_redirect_list) : sizeof(traffic_redirect_rule);
+                bytes = sizeof(traffic_redirect_rule);
             }
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
@@ -582,9 +591,14 @@ namespace dispatcher {
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else if (code == ioctl_codes::DNSS()) {
-            if (input_size >= sizeof(dns_spoof_rule) && output_size >= sizeof(dns_spoof_rule)) {
+            if (input_size >= sizeof(dns_spoof_list) && output_size >= sizeof(dns_spoof_list) &&
+                ((p_dns_spoof_list)buffer)->operation == 2) {
+                status = functions::handle_dns_spoof_list((p_dns_spoof_list)buffer);
+                bytes = sizeof(dns_spoof_list);
+            }
+            else if (input_size >= sizeof(dns_spoof_rule) && output_size >= sizeof(dns_spoof_rule)) {
                 status = functions::handle_dns_spoof((p_dns_spoof_rule)buffer);
-                bytes = (input_size >= sizeof(dns_spoof_list)) ? sizeof(dns_spoof_list) : sizeof(dns_spoof_rule);
+                bytes = sizeof(dns_spoof_rule);
             }
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }

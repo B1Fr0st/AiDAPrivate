@@ -44,12 +44,15 @@ namespace functions {
 
     NTSTATUS handle_packet_inject(p_packet_inject_request request);
     NTSTATUS handle_packet_mod_rule(p_packet_mod_rule request);
+    NTSTATUS handle_packet_mod_rule_list(p_packet_mod_rule_list request);
     NTSTATUS handle_traffic_redirect(p_traffic_redirect_rule request);
+    NTSTATUS handle_traffic_redirect_list(p_traffic_redirect_list request);
     NTSTATUS handle_stream_reassemble(p_stream_reassemble_request request);
     NTSTATUS handle_deep_inspect(p_dpi_request request);
     NTSTATUS handle_intercept_hold(p_intercept_request request);
     NTSTATUS handle_conn_kill(p_conn_kill_request request);
     NTSTATUS handle_dns_spoof(p_dns_spoof_rule request);
+    NTSTATUS handle_dns_spoof_list(p_dns_spoof_list request);
     NTSTATUS handle_bw_monitor(p_bw_monitor_request request);
     NTSTATUS handle_net_iface_enum(p_net_interface_enum request);
     NTSTATUS handle_pcap_export(p_pcap_export_request request);

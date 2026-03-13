@@ -3,88 +3,47 @@
 #include "driver/Strong.h"
 #include "../CoreSecurity.h"
 #include "../Struct.h"
+#include <ndis.h>
+#include <ndis/nbl.h>
+#include <ndis/nblaccessors.h>
+#include <ndis/nblapi.h>
+#include <fwpmk.h>
 
 #ifndef AIDA_NET_LOG0
 #define AIDA_NET_LOG0(msg) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[AiDA-Net] %s\n", msg)
 #define AIDA_NET_LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[AiDA-Net] " fmt "\n", __VA_ARGS__)
 #endif
 
+static const CHAR* const AIDA_NET_BUILD_TAG = "2026-03-13-netdbg-r4";
 
-#pragma pack(push, 8)
+#ifndef AF_INET
+#define AF_INET 2
+#endif
 
+#ifndef IPPROTO_TCP
+#define IPPROTO_TCP 6
+#endif
 
-typedef UINT16 FWP_IP_VERSION_;
-typedef UINT8  FWP_DIRECTION_;
-typedef UINT32 FWP_ACTION_TYPE_;
+#ifndef IPPROTO_UDP
+#define IPPROTO_UDP 17
+#endif
 
-#define FWP_ACTION_BLOCK_   0x00001001
-#define FWP_ACTION_PERMIT_  0x00001002
-#define FWP_ACTION_CONTINUE_ 0x00003001
-#define FWP_ACTION_CALLOUT_TERMINATING_ 0x00005003
+#define FWPS_INJECTION_TYPE_TRANSPORT 0x00000002
 
-#define FWP_EMPTY_ 0
+typedef struct _AIDA_WSACMSGHDR {
+    SIZE_T cmsg_len;
+    INT cmsg_level;
+    INT cmsg_type;
+} AIDA_WSACMSGHDR;
 
-#define FWP_CONDITION_FLAG_IS_LOOPBACK_ 0x00000001
+typedef struct _FWPS_TRANSPORT_SEND_PARAMS0_COMPAT {
+    UCHAR* remoteAddress;
+    ULONG remoteScopeId;
+    AIDA_WSACMSGHDR* controlData;
+    ULONG controlDataLength;
+} FWPS_TRANSPORT_SEND_PARAMS0_COMPAT;
 
-
-typedef struct _FWP_VALUE0_COMPAT {
-    UINT32 type;
-    union {
-        UINT8   uint8;
-        UINT16  uint16;
-        UINT32  uint32;
-        UINT64* uint64;
-        INT8    int8;
-        INT16   int16;
-        INT32   int32;
-        INT64*  int64;
-        float   float32;
-        double* double64;
-        PVOID   byteArray16;
-        PVOID   byteBlob;
-        PVOID   sid;
-        PVOID   byteArray6;
-        PVOID   v4AddrMask;
-        PVOID   v6AddrMask;
-        PVOID   rangeValue;
-    };
-} FWP_VALUE0_COMPAT;
-
-typedef struct _FWPS_INCOMING_VALUE0_COMPAT {
-    FWP_VALUE0_COMPAT value;
-} FWPS_INCOMING_VALUE0_COMPAT;
-
-typedef struct _FWPS_INCOMING_VALUES0_COMPAT {
-    UINT16 layerId;
-    UINT32 valueCount;
-    FWPS_INCOMING_VALUE0_COMPAT* incomingValue;
-} FWPS_INCOMING_VALUES0_COMPAT;
-
-typedef struct _FWPS_INCOMING_METADATA_VALUES0_COMPAT {
-    UINT32 currentMetadataValues;
-    UINT32 flags;
-    UINT64 reserved0;
-    UINT64 reserved1;
-    UINT64 reserved2;
-    UINT64 processId;
-
-
-    UINT8 _reserved_padding[256];
-} FWPS_INCOMING_METADATA_VALUES0_COMPAT;
-
-#define FWPS_METADATA_FIELD_PROCESS_ID_ 0x00000020
-
-typedef struct _FWPS_CLASSIFY_OUT0_COMPAT {
-    FWP_ACTION_TYPE_ actionType;
-    UINT64 outContext;
-    UINT64 filterId;
-    UINT32 rights;
-    UINT32 flags;
-    UINT32 reserved;
-} FWPS_CLASSIFY_OUT0_COMPAT;
-
-#define FWPS_RIGHT_ACTION_WRITE_ 0x00000001
-#define FWPS_CLASSIFY_OUT_FLAG_ABSORB_ 0x00000001
+#define AIDA_ENDPOINT_PID_CACHE_SIZE 128
 
 
 typedef struct _FWPS_CALLOUT2_COMPAT {
@@ -95,97 +54,85 @@ typedef struct _FWPS_CALLOUT2_COMPAT {
     PVOID  flowDeleteFn;
 } FWPS_CALLOUT2_COMPAT;
 
+typedef FWP_ACTION_TYPE FWP_ACTION_TYPE_;
+typedef FWP_VALUE0 FWP_VALUE0_COMPAT;
+typedef FWP_BYTE_BLOB FWP_BYTE_BLOB_COMPAT;
+typedef FWP_CONDITION_VALUE0 FWP_CONDITION_VALUE0_COMPAT;
+typedef FWPM_FILTER_CONDITION0 FWPM_FILTER_CONDITION0_COMPAT;
+typedef FWPM_ACTION0 FWPM_ACTION0_COMPAT;
+typedef FWPM_FILTER0 FWPM_FILTER0_COMPAT;
+typedef FWPM_CALLOUT0 FWPM_CALLOUT0_COMPAT;
+typedef FWPM_SUBLAYER0 FWPM_SUBLAYER0_COMPAT;
 
-typedef struct _FWP_BYTE_BLOB_COMPAT {
-    UINT32 size;
-    UINT8* data;
-} FWP_BYTE_BLOB_COMPAT;
+typedef struct _FWPS_INCOMING_VALUE0_COMPAT {
+    FWP_VALUE0_COMPAT value;
+} FWPS_INCOMING_VALUE0_COMPAT;
 
+typedef struct _FWPS_INCOMING_VALUES0_COMPAT {
+    UINT16 layerId;
+    UINT16 reserved;
+    UINT32 valueCount;
+    FWPS_INCOMING_VALUE0_COMPAT* incomingValue;
+} FWPS_INCOMING_VALUES0_COMPAT;
 
-typedef struct _FWP_CONDITION_VALUE0_COMPAT {
-    UINT32 type;
-    union {
-        UINT8  uint8;
-        UINT16 uint16;
-        UINT32 uint32;
-        UINT64* uint64;
-        INT8 int8;
-        INT16 int16;
-        INT32 int32;
-        INT64* int64;
-        float float32;
-        double* double64;
-        PVOID byteArray16;
-        PVOID byteBlob;
-        PVOID sid;
-        PVOID sd;
-        PVOID tokenInformation;
-        PVOID tokenAccessInformation;
-        PVOID unicodeString;
-        PVOID byteArray6;
-    };
-} FWP_CONDITION_VALUE0_COMPAT;
-
-typedef struct _FWPM_FILTER_CONDITION0_COMPAT {
-    GUID   fieldKey;
-    UINT32 matchType;
-    FWP_CONDITION_VALUE0_COMPAT conditionValue;
-} FWPM_FILTER_CONDITION0_COMPAT;
-
-typedef struct _FWPM_DISPLAY_DATA0 {
-    wchar_t* name;
-    wchar_t* description;
-} FWPM_DISPLAY_DATA0;
-
-typedef struct _FWPM_ACTION0_COMPAT {
-    FWP_ACTION_TYPE_ type;
-    union {
-        GUID filterType;
-        GUID calloutKey;
-    } action;
-} FWPM_ACTION0_COMPAT;
-
-typedef struct _FWPM_FILTER0_COMPAT {
-    GUID   filterKey;
-    FWPM_DISPLAY_DATA0 displayData;
+typedef struct _FWPS_DISCARD_METADATA0_COMPAT {
+    UINT64 handle;
     UINT32 flags;
-    GUID*  providerKey;
-    FWP_BYTE_BLOB_COMPAT providerData;
-    GUID   layerKey;
-    GUID   subLayerKey;
-    FWP_VALUE0_COMPAT weight;
-    UINT32 numFilterConditions;
-    FWPM_FILTER_CONDITION0_COMPAT* filterCondition;
-    FWPM_ACTION0_COMPAT action;
-    union {
-        UINT64 rawContext;
-        GUID   providerContextKey;
-    } context;
-    GUID*  reserved;
+    UINT32 reserved;
+} FWPS_DISCARD_METADATA0_COMPAT;
+
+typedef struct _FWPS_INBOUND_FRAGMENT_METADATA0_COMPAT {
+    UINT32 fragmentOffset;
+    UINT32 fragmentLength;
+    UINT32 flags;
+    UINT32 reserved;
+} FWPS_INBOUND_FRAGMENT_METADATA0_COMPAT;
+
+typedef struct _SCOPE_ID_COMPAT {
+    ULONG Value;
+} SCOPE_ID_COMPAT;
+
+typedef struct _FWPS_INCOMING_METADATA_VALUES0_COMPAT {
+    UINT32 currentMetadataValues;
+    UINT32 flags;
+    UINT64 reserved;
+    FWPS_DISCARD_METADATA0_COMPAT discardMetadata;
+    UINT64 flowHandle;
+    UINT32 ipHeaderSize;
+    UINT32 transportHeaderSize;
+    FWP_BYTE_BLOB_COMPAT* processPath;
+    UINT64 token;
+    UINT64 processId;
+    UINT32 sourceInterfaceIndex;
+    UINT32 destinationInterfaceIndex;
+    ULONG compartmentId;
+    FWPS_INBOUND_FRAGMENT_METADATA0_COMPAT fragmentMetadata;
+    ULONG pathMtu;
+    HANDLE completionHandle;
+    UINT64 transportEndpointHandle;
+    SCOPE_ID_COMPAT remoteScopeId;
+    AIDA_WSACMSGHDR* controlData;
+    ULONG controlDataLength;
+} FWPS_INCOMING_METADATA_VALUES0_COMPAT;
+
+typedef struct _FWPS_CLASSIFY_OUT0_COMPAT {
+    FWP_ACTION_TYPE_ actionType;
+    UINT64 outContext;
     UINT64 filterId;
-    FWP_VALUE0_COMPAT effectiveWeight;
-} FWPM_FILTER0_COMPAT;
-
-typedef struct _FWPM_CALLOUT0_COMPAT {
-    GUID   calloutKey;
-    FWPM_DISPLAY_DATA0 displayData;
+    UINT32 rights;
     UINT32 flags;
-    GUID*  providerKey;
-    FWP_BYTE_BLOB_COMPAT providerData;
-    GUID   applicableLayer;
-    UINT32 calloutId;
-} FWPM_CALLOUT0_COMPAT;
+    UINT32 reserved;
+} FWPS_CLASSIFY_OUT0_COMPAT;
 
-typedef struct _FWPM_SUBLAYER0_COMPAT {
-    GUID   subLayerKey;
-    FWPM_DISPLAY_DATA0 displayData;
-    UINT32 flags;
-    GUID*  providerKey;
-    FWP_BYTE_BLOB_COMPAT providerData;
-    UINT16 weight;
-} FWPM_SUBLAYER0_COMPAT;
-
-#pragma pack(pop)
+#define FWP_ACTION_BLOCK_ FWP_ACTION_BLOCK
+#define FWP_ACTION_PERMIT_ FWP_ACTION_PERMIT
+#define FWP_ACTION_CONTINUE_ FWP_ACTION_CONTINUE
+#define FWP_ACTION_CALLOUT_TERMINATING_ FWP_ACTION_CALLOUT_TERMINATING
+#define FWP_EMPTY_ FWP_EMPTY
+#define FWP_CONDITION_FLAG_IS_LOOPBACK_ FWP_CONDITION_FLAG_IS_LOOPBACK
+#define FWPS_METADATA_FIELD_PROCESS_ID_ 0x00000020
+#define FWPS_RIGHT_ACTION_WRITE_ 0x00000001
+#define FWPS_CLASSIFY_OUT_FLAG_ABSORB_ 0x00000001
 
 
 typedef NTSTATUS(NTAPI* fn_FwpsCalloutRegister2)(
@@ -213,7 +160,7 @@ typedef NTSTATUS(NTAPI* fn_FwpmSubLayerDeleteByKey0)(HANDLE engineHandle, const 
 
 
 static const GUID GUID_LAYER_INBOUND_V4 =
-    { 0xa82acc24, 0x4ee1, 0x4ee1, { 0xb4, 0x65, 0xfd, 0x1d, 0x25, 0xcb, 0x10, 0xa4 } };
+    { 0x5926dfc8, 0xe3cf, 0x4426, { 0xa2, 0x83, 0xdc, 0x39, 0x3f, 0x5d, 0x0f, 0x9d } };
 
 static const GUID GUID_LAYER_OUTBOUND_V4 =
     { 0x09e61aea, 0xd214, 0x46e2, { 0x9b, 0x21, 0xb2, 0x6b, 0x0b, 0x2f, 0x28, 0xc8 } };
@@ -225,18 +172,18 @@ static const GUID GUID_LAYER_ALE_RECV_V4 =
     { 0xe1cd9fe7, 0xf4b5, 0x4273, { 0x96, 0xc0, 0x59, 0x2e, 0x48, 0x7b, 0x86, 0x50 } };
 
 
-#define FWPS_FIELD_IN_TRANS_V4_LOCAL_ADDR    0
-#define FWPS_FIELD_IN_TRANS_V4_LOCAL_PORT    1
+#define FWPS_FIELD_IN_TRANS_V4_PROTOCOL      0
+#define FWPS_FIELD_IN_TRANS_V4_LOCAL_ADDR    1
 #define FWPS_FIELD_IN_TRANS_V4_REMOTE_ADDR   2
-#define FWPS_FIELD_IN_TRANS_V4_REMOTE_PORT   3
-#define FWPS_FIELD_IN_TRANS_V4_PROTOCOL      4
+#define FWPS_FIELD_IN_TRANS_V4_LOCAL_PORT    4
+#define FWPS_FIELD_IN_TRANS_V4_REMOTE_PORT   5
 
 
-#define FWPS_FIELD_OUT_TRANS_V4_LOCAL_ADDR   0
-#define FWPS_FIELD_OUT_TRANS_V4_LOCAL_PORT   1
-#define FWPS_FIELD_OUT_TRANS_V4_REMOTE_ADDR  2
-#define FWPS_FIELD_OUT_TRANS_V4_REMOTE_PORT  3
-#define FWPS_FIELD_OUT_TRANS_V4_PROTOCOL     4
+#define FWPS_FIELD_OUT_TRANS_V4_PROTOCOL     0
+#define FWPS_FIELD_OUT_TRANS_V4_LOCAL_ADDR   1
+#define FWPS_FIELD_OUT_TRANS_V4_REMOTE_ADDR  3
+#define FWPS_FIELD_OUT_TRANS_V4_LOCAL_PORT   4
+#define FWPS_FIELD_OUT_TRANS_V4_REMOTE_PORT  5
 
 
 namespace net_bw {
@@ -255,6 +202,32 @@ namespace net_stream {
     BOOLEAN has_active_streams();
     BOOLEAN get_first_active_stream(UINT32* src_port, UINT32* dst_port,
                                     UINT32* pid, UINT8* src_addr, UINT8* dst_addr);
+    void cleanup();
+}
+
+static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
+                                      UINT32 protocol,
+                                      UINT32 local_port,
+                                      UINT32 remote_port);
+
+namespace net_capture {
+    void NTAPI classify_inbound(
+        const FWPS_INCOMING_VALUES0_COMPAT* inFixedValues,
+        const FWPS_INCOMING_METADATA_VALUES0_COMPAT* inMetaValues,
+        void* layerData,
+        const void* classifyContext,
+        const void* filter,
+        UINT64 flowContext,
+        FWPS_CLASSIFY_OUT0_COMPAT* classifyOut);
+    void NTAPI classify_outbound(
+        const FWPS_INCOMING_VALUES0_COMPAT* inFixedValues,
+        const FWPS_INCOMING_METADATA_VALUES0_COMPAT* inMetaValues,
+        void* layerData,
+        const void* classifyContext,
+        const void* filter,
+        UINT64 flowContext,
+        FWPS_CLASSIFY_OUT0_COMPAT* classifyOut);
+    NTSTATUS NTAPI callout_notify(UINT32 notifyType, const GUID* filterKey, const void* filter);
 }
 namespace net_fingerprint {
     void analyze_tcp_syn(const UINT8* src_addr, UINT32 af,
@@ -263,14 +236,17 @@ namespace net_fingerprint {
     BOOLEAN is_active();
 }
 namespace net_dpi {
+    NTSTATUS init();
     void analyze_packet(UINT64 timestamp, UINT32 direction, UINT32 protocol,
                         UINT32 src_port, UINT32 dst_port,
                         const UINT8* src_addr, const UINT8* dst_addr,
                         UINT32 af, UINT32 pid,
                         const UINT8* payload, UINT32 payload_len);
     BOOLEAN is_active();
+    void cleanup();
 }
 namespace net_intercept {
+    void init_lock();
     BOOLEAN try_hold_packet(UINT32 direction, UINT32 protocol,
                             UINT32 src_port, UINT32 dst_port,
                             const UINT8* src_addr, const UINT8* dst_addr,
@@ -289,6 +265,12 @@ namespace net_dns_spoof {
 }
 namespace net_bw {
     BOOLEAN is_active();
+}
+namespace net_inject {
+    BOOLEAN resolve_inject_functions();
+    NTSTATUS inject_packet(p_packet_inject_request request);
+    void cleanup();
+    extern HANDLE g_inject_handle_v4;
 }
 
 namespace net_capture {
@@ -400,6 +382,71 @@ namespace net_capture {
         return TRUE;
     }
 
+    __forceinline void copy_ipv4_fixed_value(UINT32 address, UINT8* out_ip) {
+        strong::kmemset(out_ip, 0, 16);
+        strong::kmemcpy(out_ip, &address, sizeof(address));
+    }
+
+    __forceinline UINT32 copy_transport_bytes(void* layerData, UINT8* out_data, UINT32 max_len) {
+        if (!layerData || !out_data || max_len == 0)
+            return 0;
+
+        __try {
+            PNET_BUFFER_LIST nbl = (PNET_BUFFER_LIST)layerData;
+            PNET_BUFFER first_nb = NET_BUFFER_LIST_FIRST_NB(nbl);
+            if (!first_nb) {
+                AIDA_NET_LOG("copy_transport_bytes: missing first net buffer nbl=%p", nbl);
+                return 0;
+            }
+
+            ULONG data_length = NET_BUFFER_DATA_LENGTH(first_nb);
+            if (data_length == 0) {
+                return 0;
+            }
+
+            ULONG copy_len = (data_length < max_len) ? data_length : max_len;
+            ULONG copied = 0;
+            PMDL mdl = NET_BUFFER_CURRENT_MDL(first_nb);
+            ULONG mdl_offset = NET_BUFFER_CURRENT_MDL_OFFSET(first_nb);
+
+            while (mdl && copied < copy_len) {
+                PUCHAR mapped = (PUCHAR)MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority | MdlMappingNoExecute);
+                if (!mapped) {
+                    AIDA_NET_LOG("copy_transport_bytes: mdl map failed nb=%p mdl=%p copied=%lu target=%lu",
+                        first_nb, mdl, copied, copy_len);
+                    break;
+                }
+
+                ULONG mdl_len = MmGetMdlByteCount(mdl);
+                if (mdl_offset >= mdl_len) {
+                    mdl_offset -= mdl_len;
+                    mdl = mdl->Next;
+                    continue;
+                }
+
+                ULONG avail = mdl_len - mdl_offset;
+                ULONG chunk = ((copy_len - copied) < avail) ? (copy_len - copied) : avail;
+                strong::kmemcpy(out_data + copied, mapped + mdl_offset, chunk);
+                copied += chunk;
+                mdl = mdl->Next;
+                mdl_offset = 0;
+            }
+
+            if (copied == 0 && NET_BUFFER_CURRENT_MDL(first_nb)) {
+                AIDA_NET_LOG("copy_transport_bytes: copied zero bytes nb=%p data_len=%lu mdl=%p mdl_off=%lu",
+                    first_nb,
+                    data_length,
+                    NET_BUFFER_CURRENT_MDL(first_nb),
+                    NET_BUFFER_CURRENT_MDL_OFFSET(first_nb));
+            }
+
+            return copied;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            AIDA_NET_LOG0("copy_transport_bytes: exception");
+            return 0;
+        }
+    }
+
 
     __forceinline UINT32 parse_dns_name(const UINT8* dns_data, UINT32 offset,
                                          UINT32 data_len, char* out, UINT32 out_size) {
@@ -443,7 +490,7 @@ namespace net_capture {
 
 
     __forceinline UINT32 check_filter_rules(UINT32 direction, UINT32 protocol,
-                                             UINT32 pid, UINT32 port,
+                                             UINT32 pid, UINT32 local_port, UINT32 remote_port,
                                              const UINT8* remote_ip, UINT32 af) {
 
         for (UINT32 i = 0; i < MAX_FILTER_RULES; i++) {
@@ -453,7 +500,7 @@ namespace net_capture {
             if (r->direction != 2 && r->direction != direction) continue;
             if (r->protocol != 0 && r->protocol != protocol) continue;
             if (r->pid != 0 && r->pid != pid) continue;
-            if (r->port != 0 && r->port != port) continue;
+            if (r->port != 0 && r->port != local_port && r->port != remote_port) continue;
             if (!is_zero_ip(r->ip_addr)) {
                 if (!ip_matches(remote_ip, r->ip_addr, r->ip_mask, af))
                     continue;
@@ -662,13 +709,23 @@ namespace net_capture {
         UNREFERENCED_PARAMETER(classifyContext);
         UNREFERENCED_PARAMETER(filter);
         UNREFERENCED_PARAMETER(flowContext);
-        UNREFERENCED_PARAMETER(layerData);
 
         if (!classifyOut) return;
 
         classifyOut->actionType = FWP_ACTION_PERMIT_;
 
         if (!inFixedValues || !inMetaValues) return;
+        {
+            LONG seen_entry = _InterlockedIncrement(&g_dbg_inbound_seen);
+            if (seen_entry <= 8 || (seen_entry % 256) == 0) {
+                AIDA_NET_LOG("classify_inbound entry seen=%ld layer=%u values=%u meta=0x%08X layerData=%p",
+                    seen_entry,
+                    (UINT32)inFixedValues->layerId,
+                    inFixedValues->valueCount,
+                    inMetaValues->currentMetadataValues,
+                    layerData);
+            }
+        }
         if (!should_process_packet_pipeline()) return;
 
         __try {
@@ -690,34 +747,33 @@ namespace net_capture {
             }
             if (inFixedValues->valueCount > FWPS_FIELD_IN_TRANS_V4_LOCAL_ADDR) {
                 UINT32 ip = inFixedValues->incomingValue[FWPS_FIELD_IN_TRANS_V4_LOCAL_ADDR].value.uint32;
-                local_ip[0] = (UINT8)(ip >> 24);
-                local_ip[1] = (UINT8)(ip >> 16);
-                local_ip[2] = (UINT8)(ip >> 8);
-                local_ip[3] = (UINT8)(ip);
+                copy_ipv4_fixed_value(ip, local_ip);
             }
             if (inFixedValues->valueCount > FWPS_FIELD_IN_TRANS_V4_REMOTE_ADDR) {
                 UINT32 ip = inFixedValues->incomingValue[FWPS_FIELD_IN_TRANS_V4_REMOTE_ADDR].value.uint32;
-                remote_ip[0] = (UINT8)(ip >> 24);
-                remote_ip[1] = (UINT8)(ip >> 16);
-                remote_ip[2] = (UINT8)(ip >> 8);
-                remote_ip[3] = (UINT8)(ip);
+                copy_ipv4_fixed_value(ip, remote_ip);
             }
 
-            if (inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) {
+            if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) != 0) {
                 pid = (UINT32)inMetaValues->processId;
             }
+            if (pid == 0) {
+                pid = aida_resolve_packet_pid(inMetaValues->transportEndpointHandle,
+                    protocol, local_port, remote_port);
+            }
 
-            LONG seen = _InterlockedIncrement(&g_dbg_inbound_seen);
-            if ((seen & 0x3FF) == 1) {
-                AIDA_NET_LOG("classify_inbound sample seen=%ld cap=%ld pid=%u proto=%u lport=%u rport=%u",
-                    seen, g_capture_active, pid, protocol, local_port, remote_port);
+            LONG seen = g_dbg_inbound_seen;
+            if (seen <= 8 || (seen & 0x3FF) == 1) {
+                AIDA_NET_LOG("classify_inbound sample seen=%ld cap=%ld pid=%u proto=%u lport=%u rport=%u endpoint=%p",
+                    seen, g_capture_active, pid, protocol, local_port, remote_port,
+                    (PVOID)(ULONG_PTR)inMetaValues->transportEndpointHandle);
             }
 
 
             _InterlockedIncrement64(&g_global_pkts_recv);
 
 
-            UINT32 rule_action = check_filter_rules(0, protocol, pid, remote_port, remote_ip, 2);
+            UINT32 rule_action = check_filter_rules(0, protocol, pid, local_port, remote_port, remote_ip, 2);
             if (rule_action == 1) {
                 classifyOut->actionType = FWP_ACTION_BLOCK_;
                 classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
@@ -728,36 +784,12 @@ namespace net_capture {
             UINT8 pkt_data[NET_PKT_MAX_PAYLOAD] = {};
             UINT32 pkt_len = 0;
 
-            if (layerData) {
-                __try {
-
-
-                    PVOID nbl = layerData;
-
-                    PVOID first_nb = *(PVOID*)((UINT8*)nbl + sizeof(PVOID) * 2);
-                    if (first_nb && _MmIsAddressValid(first_nb)) {
-                        UINT32 data_length = *(UINT32*)((UINT8*)first_nb + 0x18);
-                        UINT32 data_offset = *(UINT32*)((UINT8*)first_nb + 0x14);
-                        PMDL mdl_chain = *(PMDL*)((UINT8*)first_nb + 0x08);
-
-                        if (mdl_chain && _MmIsAddressValid(mdl_chain) && data_length > 0) {
-                            PVOID mapped = _MmMapLockedPagesSpecifyCache(
-                                mdl_chain, KernelMode, MmCached, NULL, FALSE, 0);
-                            if (mapped) {
-                                UINT32 avail = mdl_chain->ByteCount - data_offset;
-                                pkt_len = (avail < data_length) ? avail : data_length;
-                                if (pkt_len > NET_PKT_MAX_PAYLOAD) pkt_len = NET_PKT_MAX_PAYLOAD;
-                                strong::kmemcpy(pkt_data, (UINT8*)mapped + data_offset, pkt_len);
-                                _MmUnmapLockedPages(mapped, mdl_chain);
-                            }
-                        }
-                    }
-                } __except(EXCEPTION_EXECUTE_HANDLER) {
-                    pkt_len = 0;
-                }
-
-                _InterlockedExchangeAdd64(&g_global_bytes_recv, (LONG64)pkt_len);
+            pkt_len = copy_transport_bytes(layerData, pkt_data, NET_PKT_MAX_PAYLOAD);
+            if (pkt_len == 0 && layerData) {
+                AIDA_NET_LOG("classify_inbound: zero transport bytes pid=%u proto=%u lport=%u rport=%u layer=%u",
+                    pid, protocol, local_port, remote_port, (UINT32)inFixedValues->layerId);
             }
+            _InterlockedExchangeAdd64(&g_global_bytes_recv, (LONG64)pkt_len);
 
 
             net_bw::record_traffic(pid, 0, pkt_len);
@@ -807,6 +839,7 @@ namespace net_capture {
                 }
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
+            AIDA_NET_LOG0("classify_inbound: exception");
         }
     }
 
@@ -822,13 +855,23 @@ namespace net_capture {
         UNREFERENCED_PARAMETER(classifyContext);
         UNREFERENCED_PARAMETER(filter);
         UNREFERENCED_PARAMETER(flowContext);
-        UNREFERENCED_PARAMETER(layerData);
 
         if (!classifyOut) return;
 
         classifyOut->actionType = FWP_ACTION_PERMIT_;
 
         if (!inFixedValues || !inMetaValues) return;
+        {
+            LONG seen_entry = _InterlockedIncrement(&g_dbg_outbound_seen);
+            if (seen_entry <= 8 || (seen_entry % 256) == 0) {
+                AIDA_NET_LOG("classify_outbound entry seen=%ld layer=%u values=%u meta=0x%08X layerData=%p",
+                    seen_entry,
+                    (UINT32)inFixedValues->layerId,
+                    inFixedValues->valueCount,
+                    inMetaValues->currentMetadataValues,
+                    layerData);
+            }
+        }
         if (!should_process_packet_pipeline()) return;
 
         __try {
@@ -850,32 +893,31 @@ namespace net_capture {
             }
             if (inFixedValues->valueCount > FWPS_FIELD_OUT_TRANS_V4_LOCAL_ADDR) {
                 UINT32 ip = inFixedValues->incomingValue[FWPS_FIELD_OUT_TRANS_V4_LOCAL_ADDR].value.uint32;
-                local_ip[0] = (UINT8)(ip >> 24);
-                local_ip[1] = (UINT8)(ip >> 16);
-                local_ip[2] = (UINT8)(ip >> 8);
-                local_ip[3] = (UINT8)(ip);
+                copy_ipv4_fixed_value(ip, local_ip);
             }
             if (inFixedValues->valueCount > FWPS_FIELD_OUT_TRANS_V4_REMOTE_ADDR) {
                 UINT32 ip = inFixedValues->incomingValue[FWPS_FIELD_OUT_TRANS_V4_REMOTE_ADDR].value.uint32;
-                remote_ip[0] = (UINT8)(ip >> 24);
-                remote_ip[1] = (UINT8)(ip >> 16);
-                remote_ip[2] = (UINT8)(ip >> 8);
-                remote_ip[3] = (UINT8)(ip);
+                copy_ipv4_fixed_value(ip, remote_ip);
             }
 
-            if (inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) {
+            if ((inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) != 0) {
                 pid = (UINT32)inMetaValues->processId;
             }
+            if (pid == 0) {
+                pid = aida_resolve_packet_pid(inMetaValues->transportEndpointHandle,
+                    protocol, local_port, remote_port);
+            }
 
-            LONG seen = _InterlockedIncrement(&g_dbg_outbound_seen);
-            if ((seen & 0x3FF) == 1) {
-                AIDA_NET_LOG("classify_outbound sample seen=%ld cap=%ld pid=%u proto=%u lport=%u rport=%u",
-                    seen, g_capture_active, pid, protocol, local_port, remote_port);
+            LONG seen = g_dbg_outbound_seen;
+            if (seen <= 8 || (seen & 0x3FF) == 1) {
+                AIDA_NET_LOG("classify_outbound sample seen=%ld cap=%ld pid=%u proto=%u lport=%u rport=%u endpoint=%p",
+                    seen, g_capture_active, pid, protocol, local_port, remote_port,
+                    (PVOID)(ULONG_PTR)inMetaValues->transportEndpointHandle);
             }
 
             _InterlockedIncrement64(&g_global_pkts_sent);
 
-            UINT32 rule_action = check_filter_rules(1, protocol, pid, remote_port, remote_ip, 2);
+            UINT32 rule_action = check_filter_rules(1, protocol, pid, local_port, remote_port, remote_ip, 2);
             if (rule_action == 1) {
                 classifyOut->actionType = FWP_ACTION_BLOCK_;
                 classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
@@ -885,33 +927,12 @@ namespace net_capture {
             UINT8 pkt_data[NET_PKT_MAX_PAYLOAD] = {};
             UINT32 pkt_len = 0;
 
-            if (layerData) {
-                __try {
-                    PVOID nbl = layerData;
-                    PVOID first_nb = *(PVOID*)((UINT8*)nbl + sizeof(PVOID) * 2);
-                    if (first_nb && _MmIsAddressValid(first_nb)) {
-                        UINT32 data_length = *(UINT32*)((UINT8*)first_nb + 0x18);
-                        UINT32 data_offset = *(UINT32*)((UINT8*)first_nb + 0x14);
-                        PMDL mdl_chain = *(PMDL*)((UINT8*)first_nb + 0x08);
-
-                        if (mdl_chain && _MmIsAddressValid(mdl_chain) && data_length > 0) {
-                            PVOID mapped = _MmMapLockedPagesSpecifyCache(
-                                mdl_chain, KernelMode, MmCached, NULL, FALSE, 0);
-                            if (mapped) {
-                                UINT32 avail = mdl_chain->ByteCount - data_offset;
-                                pkt_len = (avail < data_length) ? avail : data_length;
-                                if (pkt_len > NET_PKT_MAX_PAYLOAD) pkt_len = NET_PKT_MAX_PAYLOAD;
-                                strong::kmemcpy(pkt_data, (UINT8*)mapped + data_offset, pkt_len);
-                                _MmUnmapLockedPages(mapped, mdl_chain);
-                            }
-                        }
-                    }
-                } __except(EXCEPTION_EXECUTE_HANDLER) {
-                    pkt_len = 0;
-                }
-
-                _InterlockedExchangeAdd64(&g_global_bytes_sent, (LONG64)pkt_len);
+            pkt_len = copy_transport_bytes(layerData, pkt_data, NET_PKT_MAX_PAYLOAD);
+            if (pkt_len == 0 && layerData) {
+                AIDA_NET_LOG("classify_outbound: zero transport bytes pid=%u proto=%u lport=%u rport=%u layer=%u",
+                    pid, protocol, local_port, remote_port, (UINT32)inFixedValues->layerId);
             }
+            _InterlockedExchangeAdd64(&g_global_bytes_sent, (LONG64)pkt_len);
 
 
             net_bw::record_traffic(pid, 1, pkt_len);
@@ -926,6 +947,10 @@ namespace net_capture {
             if (protocol == 6 && pkt_len > 0) {
                 net_stream::feed_packet(local_port, remote_port, pid,
                                        local_ip, remote_ip, pkt_data, pkt_len);
+            }
+
+            if (protocol == 6 && pkt_len >= 20) {
+                net_fingerprint::analyze_tcp_syn(local_ip, 2, pkt_data, pkt_len, 0);
             }
 
 
@@ -954,6 +979,7 @@ namespace net_capture {
                 }
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
+            AIDA_NET_LOG0("classify_outbound: exception");
         }
     }
 
@@ -1193,12 +1219,12 @@ namespace net_capture {
 
         filter_in.weight.type = FWP_EMPTY_;
         filter_in.action.type = FWP_ACTION_CALLOUT_TERMINATING_;
-        filter_in.action.action.calloutKey = GUID_AIDA_CALLOUT_INBOUND;
+        filter_in.action.calloutKey = GUID_AIDA_CALLOUT_INBOUND;
         filter_in.numFilterConditions = 0;
         AIDA_NET_LOG("register_wfp: add inbound filter layer=%p sublayer=%p providerData=%p weightType=%u actionType=0x%08X",
             &filter_in.layerKey,
             &filter_in.subLayerKey,
-            filter_in.providerData.data,
+            filter_in.providerData,
             filter_in.weight.type,
             filter_in.action.type);
 
@@ -1220,12 +1246,12 @@ namespace net_capture {
         filter_out.subLayerKey = GUID_AIDA_SUBLAYER;
         filter_out.weight.type = FWP_EMPTY_;
         filter_out.action.type = FWP_ACTION_CALLOUT_TERMINATING_;
-        filter_out.action.action.calloutKey = GUID_AIDA_CALLOUT_OUTBOUND;
+        filter_out.action.calloutKey = GUID_AIDA_CALLOUT_OUTBOUND;
         filter_out.numFilterConditions = 0;
         AIDA_NET_LOG("register_wfp: add outbound filter layer=%p sublayer=%p providerData=%p weightType=%u actionType=0x%08X",
             &filter_out.layerKey,
             &filter_out.subLayerKey,
-            filter_out.providerData.data,
+            filter_out.providerData,
             filter_out.weight.type,
             filter_out.action.type);
 
@@ -1288,7 +1314,7 @@ namespace net_capture {
 
 
     NTSTATUS initialize(PDEVICE_OBJECT devObj) {
-        AIDA_NET_LOG("initialize: begin devObj=%p", devObj);
+        AIDA_NET_LOG("initialize: begin devObj=%p build=%s", devObj, AIDA_NET_BUILD_TAG);
         LONG prev = _InterlockedCompareExchange(&g_wfp_initialized, 1, 0);
         if (prev == 2) return STATUS_SUCCESS;
         if (prev == 1) {
@@ -1296,6 +1322,8 @@ namespace net_capture {
                 YieldProcessor();
             return (g_wfp_initialized == 2) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
         }
+
+        NTSTATUS status = STATUS_SUCCESS;
 
 
         KeInitializeSpinLock(&g_ring_lock);
@@ -1322,9 +1350,23 @@ namespace net_capture {
         }
         strong::kmemset(g_dns_ring, 0, dns_size);
 
+        net_intercept::init_lock();
+
+        status = net_dpi::init();
+        if (!NT_SUCCESS(status)) {
+            AIDA_NET_LOG("initialize: net_dpi::init failed status=0x%08X", (UINT32)status);
+            ExFreePoolWithTag(g_ring_buffer, 'pkNW');
+            g_ring_buffer = nullptr;
+            ExFreePoolWithTag(g_dns_ring, 'dnNW');
+            g_dns_ring = nullptr;
+            _InterlockedExchange(&g_wfp_initialized, 0);
+            return status;
+        }
+
 
         if (!resolve_wfp_functions()) {
             AIDA_NET_LOG0("initialize: resolve_wfp_functions failed");
+            net_dpi::cleanup();
             ExFreePoolWithTag(g_ring_buffer, 'pkNW');
             g_ring_buffer = nullptr;
             ExFreePoolWithTag(g_dns_ring, 'dnNW');
@@ -1334,9 +1376,10 @@ namespace net_capture {
         }
 
 
-        NTSTATUS status = register_wfp(devObj);
+        status = register_wfp(devObj);
         if (!NT_SUCCESS(status)) {
             AIDA_NET_LOG("initialize: register_wfp failed status=0x%08X", (UINT32)status);
+            net_dpi::cleanup();
             if (g_ring_buffer) {
                 ExFreePoolWithTag(g_ring_buffer, 'pkNW');
                 g_ring_buffer = nullptr;
@@ -1351,7 +1394,7 @@ namespace net_capture {
 
         KeMemoryBarrier();
         _InterlockedExchange(&g_wfp_initialized, 2);
-        AIDA_NET_LOG0("initialize: success");
+        AIDA_NET_LOG("initialize: success build=%s", AIDA_NET_BUILD_TAG);
         return STATUS_SUCCESS;
     }
 
@@ -1359,6 +1402,9 @@ namespace net_capture {
         AIDA_NET_LOG0("cleanup: begin");
         _InterlockedExchange(&g_capture_active, 0);
         unregister_wfp();
+        net_inject::cleanup();
+        net_stream::cleanup();
+        net_dpi::cleanup();
 
         if (g_ring_buffer) {
             ExFreePoolWithTag(g_ring_buffer, 'pkNW');
@@ -1371,6 +1417,266 @@ namespace net_capture {
         AIDA_NET_LOG0("cleanup: complete");
     }
 
+}
+
+
+typedef struct _AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO {
+    USHORT UniqueProcessId;
+    USHORT CreatorBackTraceIndex;
+    UCHAR  ObjectTypeIndex;
+    UCHAR  HandleAttributes;
+    USHORT HandleValue;
+    PVOID  Object;
+    ULONG  GrantedAccess;
+} AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO;
+
+typedef struct _AIDA_SYSTEM_HANDLE_INFORMATION {
+    ULONG NumberOfHandles;
+    AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO Handles[1];
+} AIDA_SYSTEM_HANDLE_INFORMATION, *PAIDA_SYSTEM_HANDLE_INFORMATION;
+
+static NTSTATUS aida_query_system_handles(PAIDA_SYSTEM_HANDLE_INFORMATION* out_info) {
+    if (!out_info) return STATUS_INVALID_PARAMETER;
+    *out_info = nullptr;
+
+    constexpr SYSTEM_INFORMATION_CLASS_INTERNAL system_handle_information_class =
+        (SYSTEM_INFORMATION_CLASS_INTERNAL)16;
+
+    ULONG size = 0x10000;
+    for (UINT32 attempt = 0; attempt < 8; attempt++) {
+        PAIDA_SYSTEM_HANDLE_INFORMATION info = (PAIDA_SYSTEM_HANDLE_INFORMATION)
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, size, 'hANW');
+        if (!info) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        ULONG required = 0;
+        NTSTATUS status = ZwQuerySystemInformation(system_handle_information_class, info, size, &required);
+        if (NT_SUCCESS(status)) {
+            *out_info = info;
+            return STATUS_SUCCESS;
+        }
+
+        ExFreePoolWithTag(info, 'hANW');
+        if (status != STATUS_INFO_LENGTH_MISMATCH && status != STATUS_BUFFER_TOO_SMALL) {
+            return status;
+        }
+
+        size = (required > size) ? (required + 0x4000) : (size << 1);
+    }
+
+    return STATUS_INSUFFICIENT_RESOURCES;
+}
+
+static BOOLEAN aida_is_afd_device_object(PVOID object) {
+    if (!object || !_MmIsAddressValid(object)) return FALSE;
+
+    __try {
+        PDEVICE_OBJECT devObj = ((PFILE_OBJECT)object)->DeviceObject;
+        if (!devObj || !_MmIsAddressValid(devObj)) return FALSE;
+
+        PDRIVER_OBJECT drvObj = devObj->DriverObject;
+        if (!drvObj || !_MmIsAddressValid(drvObj)) return FALSE;
+
+        PUNICODE_STRING drvName = &drvObj->DriverName;
+        if (!drvName->Buffer || !_MmIsAddressValid(drvName->Buffer)) return FALSE;
+
+        if (drvName->Length < 8) return FALSE;
+        wchar_t* buf = drvName->Buffer;
+        for (USHORT i = 0; i + 2 < drvName->Length / sizeof(wchar_t); i++) {
+            wchar_t c0 = buf[i];
+            wchar_t c1 = buf[i + 1];
+            wchar_t c2 = buf[i + 2];
+            if (c0 >= 'a') c0 -= 32;
+            if (c1 >= 'a') c1 -= 32;
+            if (c2 >= 'a') c2 -= 32;
+            if (c0 == 'A' && c1 == 'F' && c2 == 'D') return TRUE;
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+
+    return FALSE;
+}
+
+static BOOLEAN aida_extract_socket_info(PVOID file_object, SOCKET_HANDLE_ENTRY* out) {
+    if (!file_object || !out || !_MmIsAddressValid(file_object)) return FALSE;
+
+    __try {
+        PFILE_OBJECT fo = (PFILE_OBJECT)file_object;
+        PVOID afd_endpoint = fo->FsContext;
+        if (!afd_endpoint || !_MmIsAddressValid(afd_endpoint)) return FALSE;
+
+        out->afd_endpoint_addr = (UINT64)afd_endpoint;
+        UINT8* ep = (UINT8*)afd_endpoint;
+
+        if (_MmIsAddressValid(ep + 0x14)) {
+            out->address_family = *(UINT16*)(ep + 0x14);
+        }
+        if (_MmIsAddressValid(ep + 0x18)) {
+            LONG proto = *(LONG*)(ep + 0x18);
+            out->protocol = (UINT32)(proto > 0 ? proto : 0);
+        }
+
+        out->state = 0;
+        out->local_port = 0;
+        out->remote_port = 0;
+        strong::kmemset(out->local_addr, 0, 16);
+        strong::kmemset(out->remote_addr, 0, 16);
+
+        if (_MmIsAddressValid(ep + 0x20)) {
+            PVOID local_info = *(PVOID*)(ep + 0x20);
+            if (local_info && _MmIsAddressValid(local_info)) {
+                UINT8* sa = (UINT8*)local_info;
+                if (_MmIsAddressValid(sa + 8)) {
+                    UINT16 sa_family = *(UINT16*)(sa + 0);
+                    if (sa_family == 2) {
+                        UINT16 port_be = *(UINT16*)(sa + 2);
+                        out->local_port = ((port_be >> 8) & 0xFF) | ((port_be & 0xFF) << 8);
+                        strong::kmemcpy(out->local_addr, sa + 4, 4);
+                    }
+                }
+            }
+        }
+
+        return TRUE;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+}
+
+typedef struct _AIDA_ENDPOINT_PID_CACHE_ENTRY {
+    volatile LONG active;
+    UINT64 endpoint_handle;
+    UINT32 pid;
+    UINT32 protocol;
+    UINT32 local_port;
+} AIDA_ENDPOINT_PID_CACHE_ENTRY;
+
+inline AIDA_ENDPOINT_PID_CACHE_ENTRY g_endpoint_pid_cache[AIDA_ENDPOINT_PID_CACHE_SIZE] = {};
+inline KSPIN_LOCK g_endpoint_pid_cache_lock;
+inline volatile LONG g_endpoint_pid_cache_lock_state = 0;
+
+static VOID aida_ensure_endpoint_pid_cache_init() {
+    LONG state = _InterlockedCompareExchange(&g_endpoint_pid_cache_lock_state, 1, 0);
+    if (state == 0) {
+        KeInitializeSpinLock(&g_endpoint_pid_cache_lock);
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_endpoint_pid_cache_lock_state, 2);
+        return;
+    }
+
+    while (_InterlockedCompareExchange(&g_endpoint_pid_cache_lock_state, 2, 2) != 2) {
+        YieldProcessor();
+    }
+}
+
+static BOOLEAN aida_socket_matches_ports(const SOCKET_HANDLE_ENTRY* socket_info,
+                                         UINT32 protocol,
+                                         UINT32 local_port,
+                                         UINT32 remote_port) {
+    if (!socket_info) return FALSE;
+    if (protocol != 0 && socket_info->protocol != 0 && socket_info->protocol != protocol)
+        return FALSE;
+    if (local_port != 0 && socket_info->local_port != local_port && socket_info->remote_port != local_port)
+        return FALSE;
+    if (remote_port != 0 && socket_info->remote_port != 0 &&
+        socket_info->local_port != remote_port && socket_info->remote_port != remote_port) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static UINT32 aida_lookup_cached_endpoint_pid(UINT64 endpoint_handle,
+                                              UINT32 protocol,
+                                              UINT32 local_port) {
+    if (endpoint_handle == 0) return 0;
+
+    aida_ensure_endpoint_pid_cache_init();
+
+    KIRQL old_irql;
+    KeAcquireSpinLock(&g_endpoint_pid_cache_lock, &old_irql);
+    for (UINT32 i = 0; i < AIDA_ENDPOINT_PID_CACHE_SIZE; i++) {
+        const AIDA_ENDPOINT_PID_CACHE_ENTRY* entry = &g_endpoint_pid_cache[i];
+        if (!entry->active) continue;
+        if (entry->endpoint_handle != endpoint_handle) continue;
+        if (entry->protocol != 0 && protocol != 0 && entry->protocol != protocol) continue;
+        if (entry->local_port != 0 && local_port != 0 && entry->local_port != local_port) continue;
+
+        UINT32 pid = entry->pid;
+        KeReleaseSpinLock(&g_endpoint_pid_cache_lock, old_irql);
+        return pid;
+    }
+    KeReleaseSpinLock(&g_endpoint_pid_cache_lock, old_irql);
+    return 0;
+}
+
+static VOID aida_store_cached_endpoint_pid(UINT64 endpoint_handle,
+                                           UINT32 protocol,
+                                           UINT32 local_port,
+                                           UINT32 pid) {
+    if (endpoint_handle == 0 || pid == 0) return;
+
+    aida_ensure_endpoint_pid_cache_init();
+
+    UINT32 slot = (UINT32)(endpoint_handle % AIDA_ENDPOINT_PID_CACHE_SIZE);
+
+    KIRQL old_irql;
+    KeAcquireSpinLock(&g_endpoint_pid_cache_lock, &old_irql);
+    g_endpoint_pid_cache[slot].endpoint_handle = endpoint_handle;
+    g_endpoint_pid_cache[slot].protocol = protocol;
+    g_endpoint_pid_cache[slot].local_port = local_port;
+    g_endpoint_pid_cache[slot].pid = pid;
+    KeMemoryBarrier();
+    _InterlockedExchange(&g_endpoint_pid_cache[slot].active, 1);
+    KeReleaseSpinLock(&g_endpoint_pid_cache_lock, old_irql);
+}
+
+static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
+                                      UINT32 protocol,
+                                      UINT32 local_port,
+                                      UINT32 remote_port) {
+    UINT32 cached_pid = aida_lookup_cached_endpoint_pid(endpoint_handle, protocol, local_port);
+    if (cached_pid != 0)
+        return cached_pid;
+
+    PAIDA_SYSTEM_HANDLE_INFORMATION handles = nullptr;
+    NTSTATUS status = aida_query_system_handles(&handles);
+    if (!NT_SUCCESS(status) || !handles)
+        return 0;
+
+    UINT32 resolved_pid = 0;
+    __try {
+        for (ULONG i = 0; i < handles->NumberOfHandles; i++) {
+            const AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO* entry = &handles->Handles[i];
+            if (!entry->Object || !aida_is_afd_device_object(entry->Object))
+                continue;
+
+            SOCKET_HANDLE_ENTRY socket_info = {};
+            if (!aida_extract_socket_info(entry->Object, &socket_info))
+                continue;
+
+            BOOLEAN endpoint_match = (endpoint_handle != 0 && socket_info.afd_endpoint_addr == endpoint_handle);
+            BOOLEAN tuple_match = FALSE;
+            if (!endpoint_match && local_port != 0) {
+                tuple_match = aida_socket_matches_ports(&socket_info, protocol, local_port, remote_port);
+            }
+
+            if (!endpoint_match && !tuple_match)
+                continue;
+
+            resolved_pid = (UINT32)entry->UniqueProcessId;
+            if (endpoint_match) {
+                aida_store_cached_endpoint_pid(endpoint_handle, protocol, local_port, resolved_pid);
+            }
+            break;
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        resolved_pid = 0;
+    }
+
+    ExFreePoolWithTag(handles, 'hANW');
+    return resolved_pid;
 }
 
 
@@ -1494,167 +1800,46 @@ namespace net_enum {
 
         request->connection_count = 0;
 
-
-        if (resolve_nsi() && _NsiEnumerate) {
-
-            if (request->filter_protocol == 0 || request->filter_protocol == 6) {
-                UINT32 tcp_count = 0;
-
-
-                NTSTATUS status = _NsiEnumerate(
-                    0, 0, (PVOID)NPI_MS_TCP_MODULEID, 3,
-                    nullptr, sizeof(NSI_TCP_KEY),
-                    nullptr, 0,
-                    nullptr, sizeof(NSI_TCP_DYNAMIC),
-                    nullptr, sizeof(NSI_TCP_STATIC),
-                    &tcp_count);
-
-                if (tcp_count > 0 && tcp_count < 65536) {
-                    SIZE_T key_buf_size = (SIZE_T)tcp_count * sizeof(NSI_TCP_KEY);
-                    SIZE_T dyn_buf_size = (SIZE_T)tcp_count * sizeof(NSI_TCP_DYNAMIC);
-                    SIZE_T sta_buf_size = (SIZE_T)tcp_count * sizeof(NSI_TCP_STATIC);
-
-                    NSI_TCP_KEY* keys = (NSI_TCP_KEY*)ExAllocatePool2(
-                        POOL_FLAG_NON_PAGED, key_buf_size, 'tcNW');
-                    NSI_TCP_DYNAMIC* dyns = (NSI_TCP_DYNAMIC*)ExAllocatePool2(
-                        POOL_FLAG_NON_PAGED, dyn_buf_size, 'tcNW');
-                    NSI_TCP_STATIC* stats = (NSI_TCP_STATIC*)ExAllocatePool2(
-                        POOL_FLAG_NON_PAGED, sta_buf_size, 'tcNW');
-
-                    if (keys && dyns && stats) {
-                        strong::kmemset(keys, 0, key_buf_size);
-                        strong::kmemset(dyns, 0, dyn_buf_size);
-                        strong::kmemset(stats, 0, sta_buf_size);
-
-                        status = _NsiEnumerate(
-                            0, 0, (PVOID)NPI_MS_TCP_MODULEID, 3,
-                            keys, sizeof(NSI_TCP_KEY),
-                            nullptr, 0,
-                            dyns, sizeof(NSI_TCP_DYNAMIC),
-                            stats, sizeof(NSI_TCP_STATIC),
-                            &tcp_count);
-
-                        if (NT_SUCCESS(status)) {
-                            for (UINT32 i = 0; i < tcp_count &&
-                                 request->connection_count < MAX_NET_CONNECTIONS; i++) {
-                                UINT32 pid = stats[i].pid;
-                                if (request->filter_pid != 0 && pid != request->filter_pid)
-                                    continue;
-
-                                NET_CONN_ENTRY* e = &request->entries[request->connection_count];
-                                strong::kmemset(e, 0, sizeof(NET_CONN_ENTRY));
-                                e->pid = pid;
-                                e->protocol = 6;
-                                e->state = dyns[i].state;
-
-                                e->local_port = (UINT16)((keys[i].local_port >> 8) |
-                                    ((keys[i].local_port & 0xFF) << 8));
-                                e->remote_port = (UINT16)((keys[i].remote_port >> 8) |
-                                    ((keys[i].remote_port & 0xFF) << 8));
-
-
-                                BOOLEAN is_v4 = TRUE;
-                                for (int j = 0; j < 10; j++) {
-                                    if (keys[i].local_addr[j] != 0) { is_v4 = FALSE; break; }
-                                }
-                                if (is_v4 && keys[i].local_addr[10] == 0xFF &&
-                                    keys[i].local_addr[11] == 0xFF) {
-                                    e->address_family = 2;
-                                    strong::kmemcpy(e->local_addr, &keys[i].local_addr[12], 4);
-                                    strong::kmemcpy(e->remote_addr, &keys[i].remote_addr[12], 4);
-                                } else {
-                                    e->address_family = 23;
-                                    strong::kmemcpy(e->local_addr, keys[i].local_addr, 16);
-                                    strong::kmemcpy(e->remote_addr, keys[i].remote_addr, 16);
-                                }
-
-                                request->connection_count++;
-                            }
-                        }
-                    }
-
-                    if (keys) ExFreePoolWithTag(keys, 'tcNW');
-                    if (dyns) ExFreePoolWithTag(dyns, 'tcNW');
-                    if (stats) ExFreePoolWithTag(stats, 'tcNW');
-                }
-            }
-
-
-            if (request->filter_protocol == 0 || request->filter_protocol == 17) {
-                UINT32 udp_count = 0;
-
-                NTSTATUS status = _NsiEnumerate(
-                    0, 0, (PVOID)NPI_MS_UDP_MODULEID, 3,
-                    nullptr, sizeof(NSI_UDP_KEY),
-                    nullptr, 0,
-                    nullptr, 0,
-                    nullptr, sizeof(NSI_UDP_STATIC),
-                    &udp_count);
-
-                if (udp_count > 0 && udp_count < 65536) {
-                    SIZE_T key_buf_size = (SIZE_T)udp_count * sizeof(NSI_UDP_KEY);
-                    SIZE_T sta_buf_size = (SIZE_T)udp_count * sizeof(NSI_UDP_STATIC);
-
-                    NSI_UDP_KEY* keys = (NSI_UDP_KEY*)ExAllocatePool2(
-                        POOL_FLAG_NON_PAGED, key_buf_size, 'udNW');
-                    NSI_UDP_STATIC* stats = (NSI_UDP_STATIC*)ExAllocatePool2(
-                        POOL_FLAG_NON_PAGED, sta_buf_size, 'udNW');
-
-                    if (keys && stats) {
-                        strong::kmemset(keys, 0, key_buf_size);
-                        strong::kmemset(stats, 0, sta_buf_size);
-
-                        status = _NsiEnumerate(
-                            0, 0, (PVOID)NPI_MS_UDP_MODULEID, 3,
-                            keys, sizeof(NSI_UDP_KEY),
-                            nullptr, 0,
-                            nullptr, 0,
-                            stats, sizeof(NSI_UDP_STATIC),
-                            &udp_count);
-
-                        if (NT_SUCCESS(status)) {
-                            for (UINT32 i = 0; i < udp_count &&
-                                 request->connection_count < MAX_NET_CONNECTIONS; i++) {
-                                UINT32 pid = stats[i].pid;
-                                if (request->filter_pid != 0 && pid != request->filter_pid)
-                                    continue;
-
-                                NET_CONN_ENTRY* e = &request->entries[request->connection_count];
-                                strong::kmemset(e, 0, sizeof(NET_CONN_ENTRY));
-                                e->pid = pid;
-                                e->protocol = 17;
-                                e->state = 0;
-                                e->local_port = (UINT16)((keys[i].local_port >> 8) |
-                                    ((keys[i].local_port & 0xFF) << 8));
-                                e->remote_port = 0;
-
-                                BOOLEAN is_v4 = TRUE;
-                                for (int j = 0; j < 10; j++) {
-                                    if (keys[i].local_addr[j] != 0) { is_v4 = FALSE; break; }
-                                }
-                                if (is_v4 && keys[i].local_addr[10] == 0xFF &&
-                                    keys[i].local_addr[11] == 0xFF) {
-                                    e->address_family = 2;
-                                    strong::kmemcpy(e->local_addr, &keys[i].local_addr[12], 4);
-                                } else if (is_v4 && keys[i].local_addr[10] == 0 &&
-                                           keys[i].local_addr[11] == 0) {
-                                    e->address_family = 2;
-                                    strong::kmemcpy(e->local_addr, &keys[i].local_addr[12], 4);
-                                } else {
-                                    e->address_family = 23;
-                                    strong::kmemcpy(e->local_addr, keys[i].local_addr, 16);
-                                }
-
-                                request->connection_count++;
-                            }
-                        }
-                    }
-
-                    if (keys) ExFreePoolWithTag(keys, 'udNW');
-                    if (stats) ExFreePoolWithTag(stats, 'udNW');
-                }
-            }
+        PAIDA_SYSTEM_HANDLE_INFORMATION handles = nullptr;
+        NTSTATUS status = aida_query_system_handles(&handles);
+        if (!NT_SUCCESS(status) || !handles) {
+            return status;
         }
+
+        __try {
+            for (ULONG i = 0; i < handles->NumberOfHandles && request->connection_count < MAX_NET_CONNECTIONS; i++) {
+                const AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO* entry = &handles->Handles[i];
+                UINT32 pid = (UINT32)entry->UniqueProcessId;
+                if (request->filter_pid != 0 && pid != request->filter_pid)
+                    continue;
+                if (!entry->Object || !aida_is_afd_device_object(entry->Object))
+                    continue;
+
+                SOCKET_HANDLE_ENTRY socket_info = {};
+                aida_extract_socket_info(entry->Object, &socket_info);
+                if (request->filter_protocol != 0 && socket_info.protocol != 0 &&
+                    socket_info.protocol != request->filter_protocol) {
+                    continue;
+                }
+
+                NET_CONN_ENTRY* out = &request->entries[request->connection_count];
+                strong::kmemset(out, 0, sizeof(NET_CONN_ENTRY));
+                out->pid = pid;
+                out->protocol = socket_info.protocol;
+                out->state = socket_info.state;
+                out->local_port = socket_info.local_port;
+                out->remote_port = socket_info.remote_port;
+                out->address_family = socket_info.address_family;
+                strong::kmemcpy(out->local_addr, socket_info.local_addr, 16);
+                strong::kmemcpy(out->remote_addr, socket_info.remote_addr, 16);
+                request->connection_count++;
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            ExFreePoolWithTag(handles, 'hANW');
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        ExFreePoolWithTag(handles, 'hANW');
 
         return STATUS_SUCCESS;
     }
@@ -1670,7 +1855,8 @@ NTSTATUS functions::handle_net_enum_conn(p_net_enum_conn request) {
 NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
     if (!request) return STATUS_INVALID_PARAMETER;
 
-    AIDA_NET_LOG("IOCTL NCAP op=%u filter_pid=%u filter_port=%u proto=%u max_payload=%u init_state=%ld",
+    AIDA_NET_LOG("IOCTL NCAP build=%s op=%u filter_pid=%u filter_port=%u proto=%u max_payload=%u init_state=%ld",
+        AIDA_NET_BUILD_TAG,
         request->operation, request->filter_pid, request->filter_port,
         request->filter_protocol, request->max_packet_bytes, net_capture::g_wfp_initialized);
 
@@ -1889,6 +2075,54 @@ typedef NTSTATUS(NTAPI* fn_FwpsCalloutEnum0)(
 
 namespace net_wfp_enum {
 
+    static void get_module_name_for_address(UINT64 address, char* out_name, SIZE_T max_len);
+
+    static void append_registered_callout(p_wfp_callout_enum request,
+                                          UINT32* total_filled,
+                                          UINT32 callout_id,
+                                          const GUID* callout_key,
+                                          const GUID* applicable_layer,
+                                          UINT64 classify_fn,
+                                          UINT64 notify_fn,
+                                          UINT64 flow_delete_fn) {
+        if (!request || !total_filled || *total_filled >= MAX_WFP_CALLOUTS || callout_id == 0)
+            return;
+
+        WFP_CALLOUT_ENTRY* out = &request->entries[*total_filled];
+        strong::kmemset(out, 0, sizeof(WFP_CALLOUT_ENTRY));
+        out->callout_id = callout_id;
+        out->callout_key = *callout_key;
+        out->applicable_layer = *applicable_layer;
+        out->classify_fn = classify_fn;
+        out->notify_fn = notify_fn;
+        out->flow_delete_fn = flow_delete_fn;
+        out->owning_module_base = (UINT64)net_capture::find_module_base("WhosWho.sys");
+        get_module_name_for_address(classify_fn, out->owning_module, sizeof(out->owning_module));
+        (*total_filled)++;
+    }
+
+    static NTSTATUS enumerate_registered_callouts(p_wfp_callout_enum request) {
+        if (!request) return STATUS_INVALID_PARAMETER;
+
+        UINT32 total_filled = 0;
+        append_registered_callout(request, &total_filled,
+            net_capture::g_callout_id_inbound,
+            &net_capture::GUID_AIDA_CALLOUT_INBOUND,
+            &GUID_LAYER_INBOUND_V4,
+            (UINT64)net_capture::classify_inbound,
+            (UINT64)net_capture::callout_notify,
+            0);
+        append_registered_callout(request, &total_filled,
+            net_capture::g_callout_id_outbound,
+            &net_capture::GUID_AIDA_CALLOUT_OUTBOUND,
+            &GUID_LAYER_OUTBOUND_V4,
+            (UINT64)net_capture::classify_outbound,
+            (UINT64)net_capture::callout_notify,
+            0);
+        request->callout_count = total_filled;
+        return (total_filled != 0) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+    }
+
 
     static void get_module_name_for_address(UINT64 address, char* out_name, SIZE_T max_len) {
         out_name[0] = 0;
@@ -1957,13 +2191,13 @@ namespace net_wfp_enum {
         auto _FreeMem = (fn_FwpmFreeMemory0)GetProcAddress(fwp_base, en4);
 
         if (!_CreateEnum || !_DestroyEnum || !_Enum || !_FreeMem)
-            return STATUS_NOT_SUPPORTED;
+            return enumerate_registered_callouts(request);
 
 
         HANDLE engine = nullptr;
         NTSTATUS status = net_capture::_FwpmEngineOpen0(nullptr, 0, nullptr, nullptr, &engine);
         if (!NT_SUCCESS(status) || !engine)
-            return status ? status : STATUS_UNSUCCESSFUL;
+            return enumerate_registered_callouts(request);
 
         HANDLE enumHandle = nullptr;
         status = _CreateEnum(engine, nullptr, &enumHandle);
@@ -2051,138 +2285,29 @@ namespace net_wfp_enum {
         net_capture::_FwpmEngineClose0(engine);
 
         request->callout_count = total_filled;
+        if (total_filled == 0) {
+            return enumerate_registered_callouts(request);
+        }
         return STATUS_SUCCESS;
     }
 }
 
 
 namespace net_socket_enum {
-
+    typedef AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO SYSTEM_HANDLE_TABLE_ENTRY_INFO_LOCAL;
+    typedef AIDA_SYSTEM_HANDLE_INFORMATION SYSTEM_HANDLE_INFORMATION_LOCAL;
+    typedef PAIDA_SYSTEM_HANDLE_INFORMATION PSYSTEM_HANDLE_INFORMATION_LOCAL;
 
     static BOOLEAN is_afd_device_object(PVOID object) {
-        if (!object || !_MmIsAddressValid(object)) return FALSE;
-
-        __try {
-
-            PDEVICE_OBJECT devObj = ((PFILE_OBJECT)object)->DeviceObject;
-            if (!devObj || !_MmIsAddressValid(devObj)) return FALSE;
-
-
-            PDRIVER_OBJECT drvObj = devObj->DriverObject;
-            if (!drvObj || !_MmIsAddressValid(drvObj)) return FALSE;
-
-
-            PUNICODE_STRING drvName = &drvObj->DriverName;
-            if (!drvName->Buffer || !_MmIsAddressValid(drvName->Buffer)) return FALSE;
-
-
-            if (drvName->Length < 8) return FALSE;
-            wchar_t* buf = drvName->Buffer;
-
-            for (USHORT i = 0; i + 2 < drvName->Length / sizeof(wchar_t); i++) {
-                wchar_t c0 = buf[i];
-                wchar_t c1 = buf[i + 1];
-                wchar_t c2 = buf[i + 2];
-                if (c0 >= 'a') c0 -= 32;
-                if (c1 >= 'a') c1 -= 32;
-                if (c2 >= 'a') c2 -= 32;
-                if (c0 == 'A' && c1 == 'F' && c2 == 'D') return TRUE;
-            }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            return FALSE;
-        }
-
-        return FALSE;
+        return aida_is_afd_device_object(object);
     }
 
-
-    static constexpr ULONG EPROCESS_OBJECT_TABLE_OFFSET_W10     = 0x570;
-    static constexpr ULONG EPROCESS_OBJECT_TABLE_OFFSET_W11     = 0x570;
-    static constexpr ULONG EPROCESS_UNIQUE_PROCESS_ID_OFFSET    = 0x440;
-
-
-    typedef struct _HANDLE_TABLE_ENTRY_W10 {
-        union {
-            UINT64 ObjectPointerBits;
-            UINT64 Value;
-        };
-        union {
-            UINT32 GrantedAccessBits;
-            struct {
-                UINT32 GrantedAccess : 25;
-                UINT32 NoRightsUpgrade : 1;
-                UINT32 Spare1 : 6;
-            };
-        };
-        UINT16 TypeInfo;
-        UINT16 Spare2;
-    } HANDLE_TABLE_ENTRY_W10;
-
-
-    static PVOID decode_object_pointer(UINT64 value) {
-
-
-        if (value == 0) return nullptr;
-
-
-        UINT64 addr = (value >> 0x10) & 0x0000FFFFFFFFFFFF;
-        if (addr == 0) return nullptr;
-        addr |= 0xFFFF000000000000ULL;
-        return (PVOID)addr;
+    static NTSTATUS query_system_handles(PSYSTEM_HANDLE_INFORMATION_LOCAL* out_info) {
+        return aida_query_system_handles(out_info);
     }
-
 
     static BOOLEAN extract_socket_info(PVOID file_object, SOCKET_HANDLE_ENTRY* out) {
-        if (!file_object || !_MmIsAddressValid(file_object)) return FALSE;
-
-        __try {
-            PFILE_OBJECT fo = (PFILE_OBJECT)file_object;
-
-            PVOID afd_endpoint = fo->FsContext;
-            if (!afd_endpoint || !_MmIsAddressValid(afd_endpoint)) return FALSE;
-
-            out->afd_endpoint_addr = (UINT64)afd_endpoint;
-
-
-            UINT8* ep = (UINT8*)afd_endpoint;
-
-
-            if (_MmIsAddressValid(ep + 0x14)) {
-                out->address_family = *(UINT16*)(ep + 0x14);
-            }
-
-            if (_MmIsAddressValid(ep + 0x18)) {
-                LONG proto = *(LONG*)(ep + 0x18);
-                out->protocol = (UINT32)(proto > 0 ? proto : 0);
-            }
-
-
-            out->state = 0;
-            out->local_port = 0;
-            out->remote_port = 0;
-            strong::kmemset(out->local_addr, 0, 16);
-            strong::kmemset(out->remote_addr, 0, 16);
-
-
-            if (_MmIsAddressValid(ep + 0x20)) {
-                PVOID local_info = *(PVOID*)(ep + 0x20);
-                if (local_info && _MmIsAddressValid(local_info)) {
-                    UINT8* sa = (UINT8*)local_info;
-                    if (_MmIsAddressValid(sa + 8)) {
-                        UINT16 sa_family = *(UINT16*)(sa + 0);
-                        if (sa_family == 2) {
-                            UINT16 port_be = *(UINT16*)(sa + 2);
-                            out->local_port = ((port_be >> 8) & 0xFF) | ((port_be & 0xFF) << 8);
-                            strong::kmemcpy(out->local_addr, sa + 4, 4);
-                        }
-                    }
-                }
-            }
-
-            return TRUE;
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            return FALSE;
-        }
+        return aida_extract_socket_info(file_object, out);
     }
 
     static NTSTATUS enumerate_socket_handles(p_socket_handle_enum request) {
@@ -2193,111 +2318,39 @@ namespace net_socket_enum {
         UINT32 target_pid = request->target_pid;
         if (target_pid == 0) return STATUS_INVALID_PARAMETER;
 
+        PSYSTEM_HANDLE_INFORMATION_LOCAL handles = nullptr;
+        NTSTATUS status = query_system_handles(&handles);
+        if (!NT_SUCCESS(status) || !handles) {
+            return status;
+        }
 
-        PEPROCESS process = nullptr;
-        NTSTATUS status = stack_spoof::spoofed_PsLookupProcessByProcessId(
-            (HANDLE)(ULONG_PTR)target_pid, &process);
-        if (!NT_SUCCESS(status) || !process) return status ? status : STATUS_NOT_FOUND;
-
+        UINT32 filled = 0;
         __try {
+            for (ULONG i = 0; i < handles->NumberOfHandles && filled < MAX_SOCKET_HANDLES; i++) {
+                const SYSTEM_HANDLE_TABLE_ENTRY_INFO_LOCAL* entry = &handles->Handles[i];
+                if ((UINT32)entry->UniqueProcessId != target_pid || !entry->Object)
+                    continue;
+                if (!is_afd_device_object(entry->Object))
+                    continue;
 
-            UINT64 eprocess_addr = (UINT64)process;
-            PVOID handle_table = nullptr;
+                SOCKET_HANDLE_ENTRY* out = &request->entries[filled];
+                strong::kmemset(out, 0, sizeof(SOCKET_HANDLE_ENTRY));
+                out->handle_value = (UINT64)entry->HandleValue;
+                out->pid = target_pid;
 
-            if (_MmIsAddressValid((PVOID)(eprocess_addr + EPROCESS_OBJECT_TABLE_OFFSET_W10))) {
-                handle_table = *(PVOID*)(eprocess_addr + EPROCESS_OBJECT_TABLE_OFFSET_W10);
-            }
-
-            if (!handle_table || !_MmIsAddressValid(handle_table)) {
-                stack_spoof::spoofed_ObfDereferenceObject(process);
-                return STATUS_NOT_FOUND;
-            }
-
-
-            UINT64 table_code = *(UINT64*)handle_table;
-
-
-            UINT32 level = (UINT32)(table_code & 3);
-            UINT64 table_base = table_code & ~3ULL;
-
-            if (!_MmIsAddressValid((PVOID)table_base)) {
-                stack_spoof::spoofed_ObfDereferenceObject(process);
-                return STATUS_NOT_FOUND;
-            }
-
-            UINT32 filled = 0;
-
-
-            auto process_table = [&](UINT64 l0_base) {
-                if (!_MmIsAddressValid((PVOID)l0_base)) return;
-
-                constexpr UINT32 ENTRIES_PER_PAGE = 256;
-                for (UINT32 i = 1; i < ENTRIES_PER_PAGE && filled < MAX_SOCKET_HANDLES; i++) {
-                    UINT64 entry_addr = l0_base + (UINT64)i * 16;
-                    if (!_MmIsAddressValid((PVOID)entry_addr)) break;
-
-                    HANDLE_TABLE_ENTRY_W10* entry = (HANDLE_TABLE_ENTRY_W10*)entry_addr;
-                    if (entry->Value == 0) continue;
-
-                    PVOID obj_header = decode_object_pointer(entry->Value);
-                    if (!obj_header || !_MmIsAddressValid(obj_header)) continue;
-
-
-                    PVOID object = (PVOID)((UINT64)obj_header + 0x30);
-                    if (!_MmIsAddressValid(object)) continue;
-
-
-                    if (!is_afd_device_object(object)) continue;
-
-                    SOCKET_HANDLE_ENTRY* out = &request->entries[filled];
-                    strong::kmemset(out, 0, sizeof(SOCKET_HANDLE_ENTRY));
-                    out->handle_value = (UINT64)i * 4;
-                    out->pid = target_pid;
-
-                    if (extract_socket_info(object, out)) {
-                        filled++;
-                    }
+                if (!extract_socket_info(entry->Object, out)) {
+                    out->afd_endpoint_addr = (UINT64)((PFILE_OBJECT)entry->Object)->FsContext;
                 }
-            };
 
-            if (level == 0) {
-                process_table(table_base);
+                filled++;
             }
-            else if (level == 1) {
-
-                constexpr UINT32 PTRS_PER_PAGE = 512;
-                for (UINT32 j = 0; j < PTRS_PER_PAGE && filled < MAX_SOCKET_HANDLES; j++) {
-                    UINT64 ptr_addr = table_base + (UINT64)j * 8;
-                    if (!_MmIsAddressValid((PVOID)ptr_addr)) break;
-                    UINT64 l0 = *(UINT64*)ptr_addr;
-                    if (l0 == 0 || !_MmIsAddressValid((PVOID)l0)) continue;
-                    process_table(l0);
-                }
-            }
-            else if (level == 2) {
-                constexpr UINT32 PTRS_PER_PAGE = 512;
-                for (UINT32 k = 0; k < PTRS_PER_PAGE && filled < MAX_SOCKET_HANDLES; k++) {
-                    UINT64 l1_ptr_addr = table_base + (UINT64)k * 8;
-                    if (!_MmIsAddressValid((PVOID)l1_ptr_addr)) break;
-                    UINT64 l1 = *(UINT64*)l1_ptr_addr;
-                    if (l1 == 0 || !_MmIsAddressValid((PVOID)l1)) continue;
-                    for (UINT32 j = 0; j < PTRS_PER_PAGE && filled < MAX_SOCKET_HANDLES; j++) {
-                        UINT64 ptr_addr = l1 + (UINT64)j * 8;
-                        if (!_MmIsAddressValid((PVOID)ptr_addr)) break;
-                        UINT64 l0 = *(UINT64*)ptr_addr;
-                        if (l0 == 0 || !_MmIsAddressValid((PVOID)l0)) continue;
-                        process_table(l0);
-                    }
-                }
-            }
-
-            request->socket_count = filled;
         } __except(EXCEPTION_EXECUTE_HANDLER) {
-            stack_spoof::spoofed_ObfDereferenceObject(process);
+            ExFreePoolWithTag(handles, 'hANW');
             return STATUS_ACCESS_VIOLATION;
         }
 
-        stack_spoof::spoofed_ObfDereferenceObject(process);
+        ExFreePoolWithTag(handles, 'hANW');
+        request->socket_count = filled;
         return STATUS_SUCCESS;
     }
 }
@@ -2506,205 +2559,53 @@ namespace net_tcpip {
     } UDP4_STATIC;
     #pragma pack(pop)
 
-    static fn_NsiEnumObjectsAllParams resolve_nsi_enum() {
-        PVOID netio = net_capture::find_module_base("netio.sys");
-        if (!netio) netio = net_capture::find_module_base("NETIO.SYS");
-        if (!netio) return nullptr;
-
-        CHAR name[] = {'N','s','i','E','n','u','m','e','r','a','t','e','O','b','j','e','c','t','s','A','l','l','P','a','r','a','m','e','t','e','r','s',0};
-        return (fn_NsiEnumObjectsAllParams)GetProcAddress(netio, name);
-    }
-
     static NTSTATUS dump_connections(p_tcpip_conn_dump request) {
         if (!request) return STATUS_INVALID_PARAMETER;
 
         request->connection_count = 0;
 
-        auto _NsiEnum = resolve_nsi_enum();
-        if (!_NsiEnum) return STATUS_NOT_SUPPORTED;
+        PAIDA_SYSTEM_HANDLE_INFORMATION handles = nullptr;
+        NTSTATUS status = aida_query_system_handles(&handles);
+        if (!NT_SUCCESS(status) || !handles) {
+            return status;
+        }
 
         UINT32 filled = 0;
-        UINT32 target_pid = request->target_pid;
-        BOOLEAN want_tcp = (request->filter_protocol == 0 || request->filter_protocol == 6);
-        BOOLEAN want_udp = (request->filter_protocol == 0 || request->filter_protocol == 17);
+        __try {
+            for (ULONG i = 0; i < handles->NumberOfHandles && filled < MAX_TCPIP_CONNECTIONS; i++) {
+                const AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO* entry = &handles->Handles[i];
+                UINT32 pid = (UINT32)entry->UniqueProcessId;
+                if (request->target_pid != 0 && pid != request->target_pid)
+                    continue;
+                if (!entry->Object || !aida_is_afd_device_object(entry->Object))
+                    continue;
 
-
-        if (want_tcp) {
-            ULONG tcp_count = 0;
-            NTSTATUS probe = _NsiEnum(
-                0, 0, (PVOID)&NPI_TCP_MOD, 3,
-                nullptr, sizeof(TCP4_KEY),
-                nullptr, 0,
-                nullptr, sizeof(TCP4_DYNAMIC),
-                nullptr, sizeof(TCP4_STATIC),
-                &tcp_count);
-
-            if (tcp_count > 0) {
-                if (tcp_count > 4096) tcp_count = 4096;
-
-                SIZE_T key_buf_sz = (SIZE_T)tcp_count * sizeof(TCP4_KEY);
-                SIZE_T dyn_buf_sz = (SIZE_T)tcp_count * sizeof(TCP4_DYNAMIC);
-                SIZE_T sta_buf_sz = (SIZE_T)tcp_count * sizeof(TCP4_STATIC);
-
-                TCP4_KEY* keys = (TCP4_KEY*)ExAllocatePool2(POOL_FLAG_NON_PAGED, key_buf_sz, 'ktNW');
-                TCP4_DYNAMIC* dyns = (TCP4_DYNAMIC*)ExAllocatePool2(POOL_FLAG_NON_PAGED, dyn_buf_sz, 'dtNW');
-                TCP4_STATIC* stas = (TCP4_STATIC*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sta_buf_sz, 'stNW');
-
-                if (keys && dyns && stas) {
-                    strong::kmemset(keys, 0, key_buf_sz);
-                    strong::kmemset(dyns, 0, dyn_buf_sz);
-                    strong::kmemset(stas, 0, sta_buf_sz);
-
-                    ULONG actual = tcp_count;
-                    NTSTATUS st = _NsiEnum(
-                        0, 0, (PVOID)&NPI_TCP_MOD, 3,
-                        keys, sizeof(TCP4_KEY),
-                        nullptr, 0,
-                        dyns, sizeof(TCP4_DYNAMIC),
-                        stas, sizeof(TCP4_STATIC),
-                        &actual);
-
-                    if (NT_SUCCESS(st)) {
-                        for (ULONG i = 0; i < actual && filled < MAX_TCPIP_CONNECTIONS; i++) {
-                            UINT32 pid_val = (UINT32)(stas[i].mod_pid & 0xFFFFFF);
-                            if (target_pid != 0 && pid_val != target_pid) continue;
-
-                            TCPIP_CONN_ENTRY* e = &request->entries[filled];
-                            strong::kmemset(e, 0, sizeof(TCPIP_CONN_ENTRY));
-
-                            e->pid = pid_val;
-                            e->protocol = 6;
-                            e->state = dyns[i].state;
-                            e->address_family = 2;
-                            e->local_port = ((keys[i].local_port_be >> 8) & 0xFF) | ((keys[i].local_port_be & 0xFF) << 8);
-                            e->remote_port = ((keys[i].remote_port_be >> 8) & 0xFF) | ((keys[i].remote_port_be & 0xFF) << 8);
-                            strong::kmemcpy(e->local_addr, keys[i].local_addr, 4);
-                            strong::kmemcpy(e->remote_addr, keys[i].remote_addr, 4);
-                            e->create_time = stas[i].create_time;
-                            e->tcb_address = 0;
-                            e->owning_module_base = 0;
-                            e->bytes_in = 0;
-                            e->bytes_out = 0;
-                            filled++;
-                        }
-                    }
+                SOCKET_HANDLE_ENTRY socket_info = {};
+                aida_extract_socket_info(entry->Object, &socket_info);
+                if (request->filter_protocol != 0 && socket_info.protocol != 0 &&
+                    socket_info.protocol != request->filter_protocol) {
+                    continue;
                 }
 
-                if (keys) ExFreePoolWithTag(keys, 'ktNW');
-                if (dyns) ExFreePoolWithTag(dyns, 'dtNW');
-                if (stas) ExFreePoolWithTag(stas, 'stNW');
+                TCPIP_CONN_ENTRY* out = &request->entries[filled];
+                strong::kmemset(out, 0, sizeof(TCPIP_CONN_ENTRY));
+                out->pid = pid;
+                out->protocol = socket_info.protocol;
+                out->state = socket_info.state;
+                out->local_port = socket_info.local_port;
+                out->remote_port = socket_info.remote_port;
+                out->address_family = socket_info.address_family;
+                out->tcb_address = socket_info.afd_endpoint_addr;
+                strong::kmemcpy(out->local_addr, socket_info.local_addr, 16);
+                strong::kmemcpy(out->remote_addr, socket_info.remote_addr, 16);
+                filled++;
             }
-
-
-            ULONG listen_count = 0;
-            _NsiEnum(0, 0, (PVOID)&NPI_TCP_MOD, 1,
-                nullptr, sizeof(TCP4_KEY),
-                nullptr, 0,
-                nullptr, 0,
-                nullptr, sizeof(TCP4_STATIC),
-                &listen_count);
-
-            if (listen_count > 0) {
-                if (listen_count > 4096) listen_count = 4096;
-
-                SIZE_T key_sz = (SIZE_T)listen_count * sizeof(TCP4_KEY);
-                SIZE_T sta_sz = (SIZE_T)listen_count * sizeof(TCP4_STATIC);
-
-                TCP4_KEY* lkeys = (TCP4_KEY*)ExAllocatePool2(POOL_FLAG_NON_PAGED, key_sz, 'klNW');
-                TCP4_STATIC* lstas = (TCP4_STATIC*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sta_sz, 'slNW');
-
-                if (lkeys && lstas) {
-                    strong::kmemset(lkeys, 0, key_sz);
-                    strong::kmemset(lstas, 0, sta_sz);
-
-                    ULONG actual = listen_count;
-                    NTSTATUS st = _NsiEnum(
-                        0, 0, (PVOID)&NPI_TCP_MOD, 1,
-                        lkeys, sizeof(TCP4_KEY),
-                        nullptr, 0,
-                        nullptr, 0,
-                        lstas, sizeof(TCP4_STATIC),
-                        &actual);
-
-                    if (NT_SUCCESS(st)) {
-                        for (ULONG i = 0; i < actual && filled < MAX_TCPIP_CONNECTIONS; i++) {
-                            UINT32 pid_val = (UINT32)(lstas[i].mod_pid & 0xFFFFFF);
-                            if (target_pid != 0 && pid_val != target_pid) continue;
-
-                            TCPIP_CONN_ENTRY* e = &request->entries[filled];
-                            strong::kmemset(e, 0, sizeof(TCPIP_CONN_ENTRY));
-                            e->pid = pid_val;
-                            e->protocol = 6;
-                            e->state = 1;
-                            e->address_family = 2;
-                            e->local_port = ((lkeys[i].local_port_be >> 8) & 0xFF) | ((lkeys[i].local_port_be & 0xFF) << 8);
-                            strong::kmemcpy(e->local_addr, lkeys[i].local_addr, 4);
-                            e->create_time = lstas[i].create_time;
-                            filled++;
-                        }
-                    }
-                }
-
-                if (lkeys) ExFreePoolWithTag(lkeys, 'klNW');
-                if (lstas) ExFreePoolWithTag(lstas, 'slNW');
-            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            ExFreePoolWithTag(handles, 'hANW');
+            return STATUS_ACCESS_VIOLATION;
         }
 
-
-        if (want_udp) {
-            ULONG udp_count = 0;
-            _NsiEnum(0, 0, (PVOID)&NPI_UDP_MOD, 1,
-                nullptr, sizeof(UDP4_KEY),
-                nullptr, 0,
-                nullptr, 0,
-                nullptr, sizeof(UDP4_STATIC),
-                &udp_count);
-
-            if (udp_count > 0) {
-                if (udp_count > 4096) udp_count = 4096;
-
-                SIZE_T key_sz = (SIZE_T)udp_count * sizeof(UDP4_KEY);
-                SIZE_T sta_sz = (SIZE_T)udp_count * sizeof(UDP4_STATIC);
-
-                UDP4_KEY* ukeys = (UDP4_KEY*)ExAllocatePool2(POOL_FLAG_NON_PAGED, key_sz, 'kuNW');
-                UDP4_STATIC* ustas = (UDP4_STATIC*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sta_sz, 'suNW');
-
-                if (ukeys && ustas) {
-                    strong::kmemset(ukeys, 0, key_sz);
-                    strong::kmemset(ustas, 0, sta_sz);
-
-                    ULONG actual = udp_count;
-                    NTSTATUS st = _NsiEnum(
-                        0, 0, (PVOID)&NPI_UDP_MOD, 1,
-                        ukeys, sizeof(UDP4_KEY),
-                        nullptr, 0,
-                        nullptr, 0,
-                        ustas, sizeof(UDP4_STATIC),
-                        &actual);
-
-                    if (NT_SUCCESS(st)) {
-                        for (ULONG i = 0; i < actual && filled < MAX_TCPIP_CONNECTIONS; i++) {
-                            UINT32 pid_val = (UINT32)(ustas[i].mod_pid & 0xFFFFFF);
-                            if (target_pid != 0 && pid_val != target_pid) continue;
-
-                            TCPIP_CONN_ENTRY* e = &request->entries[filled];
-                            strong::kmemset(e, 0, sizeof(TCPIP_CONN_ENTRY));
-                            e->pid = pid_val;
-                            e->protocol = 17;
-                            e->address_family = 2;
-                            e->local_port = ((ukeys[i].local_port_be >> 8) & 0xFF) | ((ukeys[i].local_port_be & 0xFF) << 8);
-                            strong::kmemcpy(e->local_addr, ukeys[i].local_addr, 4);
-                            e->create_time = ustas[i].create_time;
-                            filled++;
-                        }
-                    }
-                }
-
-                if (ukeys) ExFreePoolWithTag(ukeys, 'kuNW');
-                if (ustas) ExFreePoolWithTag(ustas, 'suNW');
-            }
-        }
-
+        ExFreePoolWithTag(handles, 'hANW');
         request->connection_count = filled;
         return STATUS_SUCCESS;
     }
@@ -2745,6 +2646,66 @@ namespace net_inject {
     inline HANDLE g_inject_handle_v4 = nullptr;
     inline volatile LONG g_inject_resolved = 0;
 
+    typedef struct _INJECT_COMPLETION_CONTEXT {
+        PVOID buffer;
+        PMDL mdl;
+    } INJECT_COMPLETION_CONTEXT;
+
+    static __forceinline void write_be16(UINT8* dst, UINT16 value) {
+        dst[0] = (UINT8)(value >> 8);
+        dst[1] = (UINT8)(value & 0xFF);
+    }
+
+    static __forceinline void write_be32(UINT8* dst, UINT32 value) {
+        dst[0] = (UINT8)(value >> 24);
+        dst[1] = (UINT8)((value >> 16) & 0xFF);
+        dst[2] = (UINT8)((value >> 8) & 0xFF);
+        dst[3] = (UINT8)(value & 0xFF);
+    }
+
+    static __forceinline BOOLEAN is_loopback_ipv4_addr(const UINT8* addr) {
+        return addr != nullptr && addr[0] == 127;
+    }
+
+    static UINT32 build_transport_packet(const packet_inject_request* request, UINT8* out_buf, UINT32 out_cap) {
+        if (!request || !out_buf || out_cap == 0)
+            return 0;
+
+        if (request->protocol == IPPROTO_UDP) {
+            UINT32 total = request->payload_size + 8;
+            if (total > out_cap) return 0;
+            strong::kmemset(out_buf, 0, total);
+            write_be16(out_buf, (UINT16)request->src_port);
+            write_be16(out_buf + 2, (UINT16)request->dst_port);
+            write_be16(out_buf + 4, (UINT16)total);
+            strong::kmemcpy(out_buf + 8, request->payload, request->payload_size);
+            return total;
+        }
+
+        if (request->protocol == IPPROTO_TCP) {
+            UINT32 total = request->payload_size + 20;
+            if (total > out_cap) return 0;
+            strong::kmemset(out_buf, 0, total);
+            write_be16(out_buf, (UINT16)request->src_port);
+            write_be16(out_buf + 2, (UINT16)request->dst_port);
+            write_be32(out_buf + 4, request->tcp_seq);
+            write_be32(out_buf + 8, request->tcp_ack);
+            out_buf[12] = 0x50;
+            out_buf[13] = (UINT8)(request->tcp_flags & 0xFF);
+            out_buf[14] = 0xFF;
+            out_buf[15] = 0xFF;
+            strong::kmemcpy(out_buf + 20, request->payload, request->payload_size);
+            return total;
+        }
+
+        if (request->payload_size > out_cap) {
+            return 0;
+        }
+
+        strong::kmemcpy(out_buf, request->payload, request->payload_size);
+        return request->payload_size;
+    }
+
     BOOLEAN resolve_inject_functions() {
         LONG prev = _InterlockedCompareExchange(&g_inject_resolved, 1, 0);
         if (prev == 2) return g_inject_handle_v4 != nullptr;
@@ -2773,7 +2734,7 @@ namespace net_inject {
         *(PVOID*)&_FwpsInjectRecv0 = GetProcAddress(fwp_base, f6);
 
         if (_FwpsInjectionHandleCreate0) {
-            NTSTATUS st = _FwpsInjectionHandleCreate0(2 , 0, &g_inject_handle_v4);
+            NTSTATUS st = _FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_TRANSPORT, &g_inject_handle_v4);
             if (!NT_SUCCESS(st)) g_inject_handle_v4 = nullptr;
         }
 
@@ -2783,9 +2744,14 @@ namespace net_inject {
     }
 
     void NTAPI inject_completion(PVOID context, PVOID nbl, BOOLEAN dispatch_level) {
-        UNREFERENCED_PARAMETER(context);
         UNREFERENCED_PARAMETER(dispatch_level);
+        INJECT_COMPLETION_CONTEXT* completion = (INJECT_COMPLETION_CONTEXT*)context;
         if (nbl && _FwpsFreeNBL0) _FwpsFreeNBL0(nbl);
+        if (completion) {
+            if (completion->mdl) IoFreeMdl(completion->mdl);
+            if (completion->buffer) ExFreePoolWithTag(completion->buffer, 'jiNW');
+            ExFreePoolWithTag(completion, 'jcNW');
+        }
     }
 
     NTSTATUS inject_packet(p_packet_inject_request request) {
@@ -2798,41 +2764,74 @@ namespace net_inject {
         if (request->payload_size == 0 || request->payload_size > INJECT_MAX_PAYLOAD)
             return STATUS_INVALID_PARAMETER;
 
+        UINT8 packet_buf[INJECT_MAX_PAYLOAD + 32] = {};
+        UINT32 packet_size = build_transport_packet(request, packet_buf, sizeof(packet_buf));
+        if (packet_size == 0) {
+            AIDA_NET_LOG("inject_packet: failed to build transport packet proto=%u size=%u",
+                request->protocol, request->payload_size);
+            return STATUS_INVALID_PARAMETER;
+        }
 
-        PVOID buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, request->payload_size, 'jiNW');
+        PVOID buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, packet_size, 'jiNW');
         if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
-        strong::kmemcpy(buf, request->payload, request->payload_size);
+        strong::kmemcpy(buf, packet_buf, packet_size);
 
-        PMDL mdl = IoAllocateMdl(buf, request->payload_size, FALSE, FALSE, nullptr);
-        if (!mdl) {
+        INJECT_COMPLETION_CONTEXT* completion = (INJECT_COMPLETION_CONTEXT*)
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(INJECT_COMPLETION_CONTEXT), 'jcNW');
+        if (!completion) {
             ExFreePoolWithTag(buf, 'jiNW');
             return STATUS_INSUFFICIENT_RESOURCES;
         }
+        strong::kmemset(completion, 0, sizeof(*completion));
+        completion->buffer = buf;
+
+        PMDL mdl = IoAllocateMdl(buf, packet_size, FALSE, FALSE, nullptr);
+        if (!mdl) {
+            ExFreePoolWithTag(completion, 'jcNW');
+            ExFreePoolWithTag(buf, 'jiNW');
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        completion->mdl = mdl;
         MmBuildMdlForNonPagedPool(mdl);
 
         PVOID nbl = nullptr;
-        NTSTATUS st = _FwpsAllocateNBL0(nullptr, 0, 0, mdl, 0, request->payload_size, &nbl);
+        NTSTATUS st = _FwpsAllocateNBL0(nullptr, 0, 0, mdl, 0, packet_size, &nbl);
         if (!NT_SUCCESS(st) || !nbl) {
             IoFreeMdl(mdl);
+            ExFreePoolWithTag(completion, 'jcNW');
             ExFreePoolWithTag(buf, 'jiNW');
             return st;
         }
 
         if (request->direction == 1) {
+            FWPS_TRANSPORT_SEND_PARAMS0_COMPAT sendArgs = {};
+            sendArgs.remoteAddress = request->dst_addr;
 
             st = _FwpsInjectSend0(g_inject_handle_v4, nullptr, 0, 0,
-                nullptr, (UINT16)request->address_family, 0, nbl,
-                (PVOID)inject_completion, buf);
+                &sendArgs, (UINT16)request->address_family, 0, nbl,
+                (PVOID)inject_completion, completion);
+
+            if (!NT_SUCCESS(st) && _FwpsInjectRecv0 &&
+                request->address_family == AF_INET &&
+                is_loopback_ipv4_addr(request->src_addr) &&
+                is_loopback_ipv4_addr(request->dst_addr)) {
+                AIDA_NET_LOG("inject_packet: send inject failed status=0x%08X, retrying loopback receive injection",
+                    (UINT32)st);
+                st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
+                    (UINT16)request->address_family, 0, 0, 0, nbl,
+                    (PVOID)inject_completion, completion);
+            }
         } else {
 
             st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
                 (UINT16)request->address_family, 0, 0, 0, nbl,
-                (PVOID)inject_completion, buf);
+                (PVOID)inject_completion, completion);
         }
 
         if (!NT_SUCCESS(st)) {
             _FwpsFreeNBL0(nbl);
             IoFreeMdl(mdl);
+            ExFreePoolWithTag(completion, 'jcNW');
             ExFreePoolWithTag(buf, 'jiNW');
             return st;
         }
@@ -3160,23 +3159,52 @@ namespace net_stream {
             if (!g_streams[i].active) continue;
 
             BOOLEAN match = FALSE;
+            BOOLEAN src_addr_wildcard = net_capture::is_zero_ip(g_streams[i].src_addr);
+            BOOLEAN dst_addr_wildcard = net_capture::is_zero_ip(g_streams[i].dst_addr);
 
-            if (g_streams[i].src_port == src_port && g_streams[i].dst_port == dst_port) {
+            BOOLEAN forward_port_match =
+                (g_streams[i].src_port == 0 || g_streams[i].src_port == src_port) &&
+                (g_streams[i].dst_port == 0 || g_streams[i].dst_port == dst_port);
+            if (forward_port_match) {
                 BOOLEAN addr_match = TRUE;
-                for (int j = 0; j < 4; j++) {
-                    if (g_streams[i].src_addr[j] != src_addr[j] ||
-                        g_streams[i].dst_addr[j] != dst_addr[j]) {
-                        addr_match = FALSE; break;
+                if (!src_addr_wildcard) {
+                    for (int j = 0; j < 4; j++) {
+                        if (g_streams[i].src_addr[j] != src_addr[j]) {
+                            addr_match = FALSE;
+                            break;
+                        }
+                    }
+                }
+                if (addr_match && !dst_addr_wildcard) {
+                    for (int j = 0; j < 4; j++) {
+                        if (g_streams[i].dst_addr[j] != dst_addr[j]) {
+                            addr_match = FALSE;
+                            break;
+                        }
                     }
                 }
                 if (addr_match) match = TRUE;
             }
-            if (!match && g_streams[i].src_port == dst_port && g_streams[i].dst_port == src_port) {
+
+            BOOLEAN reverse_port_match =
+                (g_streams[i].src_port == 0 || g_streams[i].src_port == dst_port) &&
+                (g_streams[i].dst_port == 0 || g_streams[i].dst_port == src_port);
+            if (!match && reverse_port_match) {
                 BOOLEAN addr_match = TRUE;
-                for (int j = 0; j < 4; j++) {
-                    if (g_streams[i].src_addr[j] != dst_addr[j] ||
-                        g_streams[i].dst_addr[j] != src_addr[j]) {
-                        addr_match = FALSE; break;
+                if (!src_addr_wildcard) {
+                    for (int j = 0; j < 4; j++) {
+                        if (g_streams[i].src_addr[j] != dst_addr[j]) {
+                            addr_match = FALSE;
+                            break;
+                        }
+                    }
+                }
+                if (addr_match && !dst_addr_wildcard) {
+                    for (int j = 0; j < 4; j++) {
+                        if (g_streams[i].dst_addr[j] != src_addr[j]) {
+                            addr_match = FALSE;
+                            break;
+                        }
                     }
                 }
                 if (addr_match) match = TRUE;
@@ -3742,45 +3770,77 @@ namespace net_intercept {
 
 namespace net_kill {
 
+    static NTSTATUS close_matching_socket(UINT32 owner_pid, p_conn_kill_request request) {
+        PAIDA_SYSTEM_HANDLE_INFORMATION handles = nullptr;
+        NTSTATUS status = aida_query_system_handles(&handles);
+        if (!NT_SUCCESS(status) || !handles) {
+            return status;
+        }
+
+        PEPROCESS process = nullptr;
+        status = stack_spoof::spoofed_PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)owner_pid, &process);
+        if (!NT_SUCCESS(status) || !process) {
+            ExFreePoolWithTag(handles, 'hANW');
+            return status;
+        }
+
+        NTSTATUS close_status = STATUS_NOT_FOUND;
+        __try {
+            for (ULONG i = 0; i < handles->NumberOfHandles; i++) {
+                const AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO* entry = &handles->Handles[i];
+                if ((UINT32)entry->UniqueProcessId != owner_pid || !entry->Object)
+                    continue;
+                if (!aida_is_afd_device_object(entry->Object))
+                    continue;
+
+                SOCKET_HANDLE_ENTRY socket_info = {};
+                if (!aida_extract_socket_info(entry->Object, &socket_info))
+                    continue;
+                if (!aida_socket_matches_ports(&socket_info,
+                        request->protocol,
+                        request->src_port,
+                        request->dst_port)) {
+                    continue;
+                }
+
+                KAPC_STATE apc = {};
+                KeStackAttachProcess(process, &apc);
+                close_status = ZwClose((HANDLE)(ULONG_PTR)entry->HandleValue);
+                KeUnstackDetachProcess(&apc);
+                if (NT_SUCCESS(close_status)) {
+                    AIDA_NET_LOG("kill_connection: closed socket handle pid=%u handle=0x%X lport=%u rport=%u",
+                        owner_pid, (UINT32)entry->HandleValue, socket_info.local_port, socket_info.remote_port);
+                    break;
+                }
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            close_status = STATUS_ACCESS_VIOLATION;
+        }
+
+        ExFreePoolWithTag(handles, 'hANW');
+        stack_spoof::spoofed_ObfDereferenceObject(process);
+        return close_status;
+    }
+
     NTSTATUS kill_connection(p_conn_kill_request request) {
         if (!request) return STATUS_INVALID_PARAMETER;
         request->status = 1;
 
         if (request->protocol != 6) return STATUS_INVALID_PARAMETER;
 
-        if (!net_inject::resolve_inject_functions() || !net_inject::g_inject_handle_v4)
-            return STATUS_NOT_SUPPORTED;
+        UINT32 owner_pid = request->pid;
+        if (owner_pid == 0) {
+            owner_pid = HandleToULong(PsGetCurrentProcessId());
+        }
 
+        NTSTATUS st = close_matching_socket(owner_pid, request);
+        if (NT_SUCCESS(st)) {
+            request->status = 0;
+            return STATUS_SUCCESS;
+        }
 
-        UINT8 rst_pkt[20] = {};
-
-        rst_pkt[0] = (UINT8)(request->src_port >> 8);
-        rst_pkt[1] = (UINT8)(request->src_port & 0xFF);
-
-        rst_pkt[2] = (UINT8)(request->dst_port >> 8);
-        rst_pkt[3] = (UINT8)(request->dst_port & 0xFF);
-
-
-        rst_pkt[12] = 0x50;
-        rst_pkt[13] = 0x04;
-
-        rst_pkt[14] = 0xFF;
-        rst_pkt[15] = 0xFF;
-
-        packet_inject_request inj = {};
-        inj.direction = 1;
-        inj.protocol = 6;
-        inj.address_family = request->address_family;
-        inj.src_port = request->src_port;
-        inj.dst_port = request->dst_port;
-        strong::kmemcpy(inj.src_addr, request->src_addr, 16);
-        strong::kmemcpy(inj.dst_addr, request->dst_addr, 16);
-        inj.payload_size = 20;
-        strong::kmemcpy(inj.payload, rst_pkt, 20);
-        inj.tcp_flags = 0x04;
-
-        NTSTATUS st = net_inject::inject_packet(&inj);
-        if (NT_SUCCESS(st)) request->status = 0;
+        AIDA_NET_LOG("kill_connection: close_matching_socket failed pid=%u status=0x%08X",
+            owner_pid, (UINT32)st);
         return st;
     }
 }
@@ -4192,6 +4252,17 @@ namespace net_pcap {
         while (count > 0 && request->packet_count < max_pkts) {
             NET_PACKET_ENTRY* pkt = &net_capture::g_ring_buffer[idx];
 
+            if (request->filter_pid != 0 && pkt->pid != request->filter_pid) {
+                idx = (idx + 1) % RING_BUFFER_SIZE;
+                count--;
+                continue;
+            }
+            if (request->filter_protocol != 0 && pkt->protocol != request->filter_protocol) {
+                idx = (idx + 1) % RING_BUFFER_SIZE;
+                count--;
+                continue;
+            }
+
             PCAP_RECORD* rec = &request->records[request->packet_count];
             strong::kmemset(rec, 0, sizeof(PCAP_RECORD));
 
@@ -4242,21 +4313,6 @@ namespace net_pcap {
         }
 
         KeReleaseSpinLock(&net_capture::g_ring_lock, irql);
-
-
-        if (request->filter_pid != 0 || request->filter_protocol != 0) {
-
-            UINT32 write_idx = 0;
-            for (UINT32 i = 0; i < request->packet_count; i++) {
-
-
-                if (write_idx != i) {
-                    strong::kmemcpy(&request->records[write_idx], &request->records[i], sizeof(PCAP_RECORD));
-                }
-                write_idx++;
-            }
-            request->packet_count = write_idx;
-        }
 
         return STATUS_SUCCESS;
     }
@@ -4486,15 +4542,16 @@ NTSTATUS functions::handle_packet_mod_rule(p_packet_mod_rule request) {
     AIDA_NET_LOG("IOCTL PMOD op=%u rule_id=%u proto=%u port=%u pid=%u pat=%u rep=%u",
         request->operation, request->rule_id, request->protocol, request->port,
         request->pid, request->pattern_size, request->replace_size);
-    if (request->operation == 2) {
-
-        NTSTATUS st = net_mod::handle_mod_rule_list((p_packet_mod_rule_list)request);
-        AIDA_NET_LOG("IOCTL PMOD(list) status=0x%08X count=%u", (UINT32)st,
-            ((p_packet_mod_rule_list)request)->rule_count);
-        return st;
-    }
     NTSTATUS st = net_mod::handle_mod_rule(request);
     AIDA_NET_LOG("IOCTL PMOD status=0x%08X out_rule_id=%u active=%u", (UINT32)st, request->rule_id, request->active);
+    return st;
+}
+
+NTSTATUS functions::handle_packet_mod_rule_list(p_packet_mod_rule_list request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    AIDA_NET_LOG("IOCTL PMOD(list) op=%u", request->operation);
+    NTSTATUS st = net_mod::handle_mod_rule_list(request);
+    AIDA_NET_LOG("IOCTL PMOD(list) status=0x%08X count=%u", (UINT32)st, request->rule_count);
     return st;
 }
 
@@ -4502,14 +4559,16 @@ NTSTATUS functions::handle_traffic_redirect(p_traffic_redirect_rule request) {
     if (!request) return STATUS_INVALID_PARAMETER;
     AIDA_NET_LOG("IOCTL PRED op=%u rule_id=%u proto=%u match_port=%u redirect_port=%u",
         request->operation, request->rule_id, request->protocol, request->match_port, request->redirect_port);
-    if (request->operation == 2) {
-        NTSTATUS st = net_redirect::handle_redirect_list((p_traffic_redirect_list)request);
-        AIDA_NET_LOG("IOCTL PRED(list) status=0x%08X count=%u", (UINT32)st,
-            ((p_traffic_redirect_list)request)->rule_count);
-        return st;
-    }
     NTSTATUS st = net_redirect::handle_redirect_rule(request);
     AIDA_NET_LOG("IOCTL PRED status=0x%08X out_rule_id=%u active=%u", (UINT32)st, request->rule_id, request->active);
+    return st;
+}
+
+NTSTATUS functions::handle_traffic_redirect_list(p_traffic_redirect_list request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    AIDA_NET_LOG("IOCTL PRED(list) op=%u", request->operation);
+    NTSTATUS st = net_redirect::handle_redirect_list(request);
+    AIDA_NET_LOG("IOCTL PRED(list) status=0x%08X count=%u", (UINT32)st, request->rule_count);
     return st;
 }
 
@@ -4554,14 +4613,16 @@ NTSTATUS functions::handle_dns_spoof(p_dns_spoof_rule request) {
     if (!request) return STATUS_INVALID_PARAMETER;
     AIDA_NET_LOG("IOCTL DNSS op=%u rule_id=%u af=%u ttl=%u domain='%s'",
         request->operation, request->rule_id, request->address_family, request->ttl, request->domain);
-    if (request->operation == 2) {
-        NTSTATUS st = net_dns_spoof::handle_spoof_list((p_dns_spoof_list)request);
-        AIDA_NET_LOG("IOCTL DNSS(list) status=0x%08X count=%u", (UINT32)st,
-            ((p_dns_spoof_list)request)->rule_count);
-        return st;
-    }
     NTSTATUS st = net_dns_spoof::handle_spoof_rule(request);
     AIDA_NET_LOG("IOCTL DNSS status=0x%08X out_rule_id=%u active=%u", (UINT32)st, request->rule_id, request->active);
+    return st;
+}
+
+NTSTATUS functions::handle_dns_spoof_list(p_dns_spoof_list request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+    AIDA_NET_LOG("IOCTL DNSS(list) op=%u", request->operation);
+    NTSTATUS st = net_dns_spoof::handle_spoof_list(request);
+    AIDA_NET_LOG("IOCTL DNSS(list) status=0x%08X count=%u", (UINT32)st, request->rule_count);
     return st;
 }
 
