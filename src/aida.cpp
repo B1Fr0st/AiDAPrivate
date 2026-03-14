@@ -4,6 +4,7 @@
 #include "ida_utils.hpp"
 #include "graphrag.hpp"
 #include "analysis_db.hpp"
+#include "subagents.hpp"
 
 #ifdef __NT__
 #include "driver_loader.hpp"
@@ -686,12 +687,14 @@ void aida_plugin_t::start_mcp_server()
     }
 
     mcp_server->write_mcp_client_configs();
+    subagents::register_local_instance(g_settings.mcp_port);
 }
 
 void aida_plugin_t::stop_mcp_server()
 {
     if (mcp_server)
     {
+        subagents::unregister_local_instance(g_settings.mcp_port);
         mcp_server->stop();
         mcp_server.reset();
     }

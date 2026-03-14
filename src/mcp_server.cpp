@@ -309,6 +309,11 @@ static bool is_idempotent_tool(const std::string& name, bool read_only)
         && name != "suspend";
 }
 
+static bool is_mcp_exposed_tool(const agent_tools::tool_definition_t* tool)
+{
+    return tool && tool->category != "session";
+}
+
 static json build_mcp_tools_list()
 {
     json tools = json::array();
@@ -316,6 +321,9 @@ static json build_mcp_tools_list()
 
     for (const auto* tool : all_tools)
     {
+        if (!is_mcp_exposed_tool(tool))
+            continue;
+
         json input_schema = json::object();
         input_schema[OBFSTR_C("type")] = "object";
 
@@ -412,6 +420,10 @@ static json handle_tools_call(const json& id, const json& params)
     json arguments = params.contains(OBFSTR_C("arguments")) && params["arguments"].is_object()
                    ? params["arguments"]
                    : json::object();
+
+    const auto* tool = agent_tools::ToolRegistry::instance().get_tool(tool_name);
+    if (!is_mcp_exposed_tool(tool))
+        return make_jsonrpc_error(id, JSONRPC_INVALID_PARAMS, "Tool is not exposed through MCP");
 
     auto tool_result = execute_tool_in_main_thread(tool_name, arguments);
 
@@ -1189,6 +1201,14 @@ void mcp_server_t::server_thread_func(int port)
         {
             res.status = 400;
             res.set_content(json_dump_safe({{"error", "Missing 'name' field"}}), "application/json");
+            return;
+        }
+
+        const auto* tool = agent_tools::ToolRegistry::instance().get_tool(tool_name);
+        if (!is_mcp_exposed_tool(tool))
+        {
+            res.status = 403;
+            res.set_content(json_dump_safe({{"error", "Tool is not exposed through MCP"}}), "application/json");
             return;
         }
 

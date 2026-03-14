@@ -2,6 +2,8 @@
 #include "context_manager.hpp"
 #include "subagents.hpp"
 
+#include <cctype>
+
 using json = nlohmann::json;
 
 namespace agentic
@@ -10,6 +12,209 @@ namespace agentic
 bool has_tool_calls(const std::string& response)
 {
     return response.find("\"tool_calls\"") != std::string::npos;
+}
+
+static std::string trim_ascii_copy(const std::string& text)
+{
+    size_t first = 0;
+    while (first < text.size() && std::isspace(static_cast<unsigned char>(text[first])) != 0)
+        ++first;
+
+    size_t last = text.size();
+    while (last > first && std::isspace(static_cast<unsigned char>(text[last - 1])) != 0)
+        --last;
+
+    return text.substr(first, last - first);
+}
+
+static bool looks_like_tool_protocol_text(const std::string& text)
+{
+    const std::string trimmed = trim_ascii_copy(text);
+    if (trimmed.empty())
+        return false;
+
+    if (trimmed.rfind("```json", 0) == 0 || trimmed.rfind("```", 0) == 0)
+        return true;
+    if (trimmed[0] == '{' || trimmed[0] == '[')
+        return true;
+    if (trimmed.find("\"tool_calls\"") != std::string::npos)
+        return true;
+    if (trimmed.find("\"reasoning\"") != std::string::npos)
+        return true;
+    if (trimmed.rfind("tool_calls", 0) == 0 || trimmed.rfind("reasoning:", 0) == 0)
+        return true;
+
+    return false;
+}
+
+class round_stream_router_t
+{
+public:
+    explicit round_stream_router_t(std::function<void(const std::string&)> sink)
+        : _sink(std::move(sink))
+    {
+    }
+
+    void on_chunk(const std::string& chunk)
+    {
+        if (!_sink || chunk.empty())
+            return;
+
+        if (_mode == mode_t::streaming)
+        {
+            _sink(chunk);
+            return;
+        }
+
+        if (_mode == mode_t::suppressed)
+            return;
+
+        _buffer += chunk;
+        maybe_switch_mode();
+    }
+
+    void finalize(const std::string& full_response, bool response_contains_tool_calls)
+    {
+        if (!_sink)
+        {
+            _buffer.clear();
+            return;
+        }
+
+        if (_mode == mode_t::undecided)
+        {
+            if (!response_contains_tool_calls && !looks_like_tool_protocol_text(full_response))
+            {
+                if (!_buffer.empty())
+                    _sink(_buffer);
+                else if (!full_response.empty())
+                    _sink(full_response);
+                _mode = mode_t::streaming;
+            }
+            else
+            {
+                _mode = mode_t::suppressed;
+            }
+        }
+
+        _buffer.clear();
+    }
+
+private:
+    enum class mode_t
+    {
+        undecided,
+        streaming,
+        suppressed
+    };
+
+    void maybe_switch_mode()
+    {
+        const std::string trimmed = trim_ascii_copy(_buffer);
+        if (trimmed.empty())
+            return;
+
+        if (looks_like_tool_protocol_text(trimmed))
+        {
+            _mode = mode_t::suppressed;
+            _buffer.clear();
+            return;
+        }
+
+        const bool looks_like_prose = std::isalpha(static_cast<unsigned char>(trimmed.front())) != 0;
+        const bool enough_context = trimmed.size() >= 96 || trimmed.find('\n') != std::string::npos;
+        if (looks_like_prose && enough_context)
+        {
+            _mode = mode_t::streaming;
+            if (!_buffer.empty())
+                _sink(_buffer);
+            _buffer.clear();
+        }
+    }
+
+    std::function<void(const std::string&)> _sink;
+    std::string _buffer;
+    mode_t _mode = mode_t::undecided;
+};
+
+static bool is_reconnaissance_tool_name(const std::string& tool_name)
+{
+    return tool_name.rfind("get_", 0) == 0
+        || tool_name.rfind("list_", 0) == 0
+        || tool_name.rfind("find_", 0) == 0
+        || tool_name.rfind("search_", 0) == 0
+        || tool_name.rfind("analyze_", 0) == 0
+        || tool_name.rfind("detect_", 0) == 0
+        || tool_name.rfind("decompile_", 0) == 0
+        || tool_name.rfind("disassemble_", 0) == 0
+        || tool_name == "build_call_graph"
+        || tool_name == "get_binary_info";
+}
+
+static bool should_auto_spawn_recon_subagent(
+    const json& parsed,
+    int current_round,
+    bool already_auto_spawned)
+{
+    if (already_auto_spawned || current_round != 1)
+        return false;
+    if (!subagents::can_execute_tool("sessions_spawn"))
+        return false;
+    if (subagents::current_depth() != 0)
+        return false;
+    if (subagents::current_active_child_count() > 0)
+        return false;
+    if (!parsed.contains("tool_calls") || !parsed["tool_calls"].is_array())
+        return false;
+
+    size_t total_calls = 0;
+    size_t recon_calls = 0;
+    size_t mutable_calls = 0;
+    std::unordered_set<std::string> unique_tools;
+
+    auto& registry = agent_tools::ToolRegistry::instance();
+    for (const auto& tc : parsed["tool_calls"])
+    {
+        if (!tc.contains("tool") || !tc["tool"].is_string())
+            continue;
+
+        const std::string tool_name = tc["tool"].get<std::string>();
+        if (tool_name == "sessions_spawn")
+            return false;
+
+        ++total_calls;
+        unique_tools.insert(tool_name);
+
+        const auto* tool_def = registry.get_tool(tool_name);
+        if (tool_def && !tool_def->read_only)
+            ++mutable_calls;
+
+        if (is_reconnaissance_tool_name(tool_name))
+            ++recon_calls;
+    }
+
+    return total_calls >= 4
+        && unique_tools.size() >= 3
+        && recon_calls >= 3
+        && mutable_calls == 0;
+}
+
+static subagents::spawn_request_t build_auto_recon_subagent_request(const agentic::config_t& config)
+{
+    subagents::spawn_request_t request;
+    request.label = "parallel-recon";
+    request.thinking = "minimal";
+    request.run_timeout_seconds = 120;
+    request.mode = "run";
+    request.cleanup = "keep";
+    request.sandbox = "inherit";
+    request.task =
+        "Perform an independent reconnaissance pass for the current user request. "
+        "Focus on alternative leads, missing evidence, additional strings/xrefs/call chains, and concrete findings the parent agent may miss. "
+        "Use read-only tools first, keep the scope bounded, and return concise evidence-backed results only.\n\n"
+        "Original user request:\n"
+        + config.user_message;
+    return request;
 }
 
 static std::string extract_json_by_bracket_match(const std::string& text, size_t start)
@@ -326,10 +531,12 @@ struct cached_tool_catalog_t
 
 static std::string current_tool_catalog_profile()
 {
+    const bool subagents_enabled = subagents::enabled();
+
     if (!subagents::has_current_session())
-        return "root";
+        return subagents_enabled ? "root-subagents-on" : "root-subagents-off";
     if (subagents::current_depth() == 0)
-        return "root";
+        return subagents_enabled ? "root-subagents-on" : "root-subagents-off";
     return subagents::can_execute_tool("sessions_spawn") ? "orchestrator" : "leaf";
 }
 
@@ -531,6 +738,13 @@ ROUNDS without ANY user intervention. The system handles everything automaticall
     — you MUST continue here by emitting more tool_calls until your analysis is complete.
   - If you can answer WITHOUT tools, respond with plain text immediately.
 
+**ROOT ORCHESTRATION RULE:**
+If `sessions_spawn` is available and the request requires broad reconnaissance, multiple independent
+searches, or parallel evidence gathering, you SHOULD spawn at least one focused sub-agent early instead
+of doing every exploratory branch serially in the main agent. Good candidates are: alternative string/xref
+hunts, parallel call-chain tracing, separate structure reconstruction, or investigating a second hypothesis.
+The main agent should orchestrate and synthesize; it should not monopolize every independent branch.
+
 You can call AS MANY tools as you want per round — there is NO limit on tool count per round.
 You can execute AS MANY rounds as you need — there is NO limit on rounds (up to 25).
 
@@ -598,20 +812,15 @@ When you need to gather information or perform actions, respond with ONLY a JSON
     {"tool": "EXACT_TOOL_NAME", "params": {"param1": "value1"}},
     {"tool": "EXACT_TOOL_NAME", "params": {}}
   ],
-  "reasoning": "Detailed explanation of your current thinking process (3-5 sentences). Describe: what specific information you are looking for, why you chose these particular tools, what leads or patterns from previous results you are following, and what you expect to find. This text is displayed to the user as a live thinking indicator, so be thorough, specific, and analytical."
+    "reasoning": "One or two short plain-English sentences describing the immediate investigative goal and why these tools were chosen. No JSON, no markdown, no bullet lists, no quoted keys, and no parameter dumps."
 }
 ```
 
-**RULE 11: ALWAYS PROVIDE THOROUGH REASONING.**
-Your `reasoning` field is displayed to the user as a thinking indicator. It MUST contain 3-5 sentences
-of genuine analytical reasoning: what you observed in previous results, what hypothesis you are testing,
-why these specific tools and parameters were chosen, and what you expect to discover. Never write
-generic one-liners like "Continuing analysis" or "Looking at functions". Instead, write specific,
-insightful reasoning that demonstrates your thought process, e.g.: "The NtWriteVirtualMemory syscall
-handler at 0x14001A000 takes a user-supplied buffer length in R8 without an upper bound check before
-passing it to MmCopyVirtualMemory. I need to decompile MmCopyVirtualMemory to verify whether it
-performs its own length validation, and also trace the ProbeForRead call to see if the buffer is
-properly probed before the copy. If neither validates the length, this is a kernel pool overflow."
+**RULE 11: ALWAYS PROVIDE CONCISE HUMAN REASONING.**
+Your `reasoning` field is shown in a compact thinking UI. Keep it to 1-2 short sentences of genuine
+analysis: what lead you are following and why the selected tools answer that question. Do NOT include
+JSON fragments, quoted field names, parameter listings, markdown fences, or multi-paragraph narration.
+Never write generic filler like "Continuing analysis" or "Looking at functions".
 
 **CRITICAL OUTPUT FORMAT RULE — ONE JSON BLOCK PER ROUND, THEN STOP.**
 In each round, your response must contain AT MOST ONE tool_calls JSON block. After emitting
@@ -1188,6 +1397,7 @@ result_t run(
     std::string last_ai_response;
     std::string last_reasoning;
     bool finished = false;
+    bool auto_spawned_recon_child = false;
 
     for (int current_round = 1; current_round <= max_rounds && !finished; ++current_round)
     {
@@ -1242,14 +1452,22 @@ result_t run(
             }
         }
 
+        round_stream_router_t round_stream(on_stream);
         std::string ai_response = client->streaming_blocking_generate(
-            round_prompt, config.temperature, on_stream, stop_predicate);
+            round_prompt,
+            config.temperature,
+            [&round_stream](const std::string& chunk) {
+                round_stream.on_chunk(chunk);
+            },
+            stop_predicate);
 
         if (ai_response.substr(0, 6) == "Error:")
         {
             result.final_response = ai_response;
             break;
         }
+
+        round_stream.finalize(ai_response, has_tool_calls(ai_response));
 
         if (cancelled && cancelled->load())
         {
@@ -1351,6 +1569,28 @@ result_t run(
         }
 
         size_t num_calls = parsed[OBFSTR_C("tool_calls")].size();
+
+        if (should_auto_spawn_recon_subagent(parsed, current_round, auto_spawned_recon_child))
+        {
+            json auto_spawn = subagents::spawn(build_auto_recon_subagent_request(config));
+            if (json_str(auto_spawn, "status") == "accepted")
+            {
+                auto_spawned_recon_child = true;
+                if (config.verbose_logging)
+                {
+                    msg(OBFSTR_C("AiDA Agent: Auto-spawned reconnaissance sub-agent: %s\n"),
+                        json_str(auto_spawn, "childSessionKey", "unknown").c_str());
+                }
+                if (on_status)
+                {
+                    status_update_t status;
+                    status.type = status_type_t::thinking;
+                    status.round = current_round;
+                    status.message = OBFSTR("Spawned parallel reconnaissance sub-agent.");
+                    on_status(status);
+                }
+            }
+        }
 
         if (config.verbose_logging)
         {

@@ -19,6 +19,7 @@
 #include "aida_pro.hpp"
 #include "chat_widget.hpp"
 #include "chat_widget_ui.hpp"
+#include "subagents.hpp"
 
 #include <regex>
 #include <sstream>
@@ -151,7 +152,151 @@ static void set_current_provider_model(const std::string& provider, const std::s
 
 static QString stripCodeFences(const QString& text);
 static bool looksLikeToolStatusNoiseLine(const QString& line);
+static bool looksLikeStructuredProtocolText(const QString& text);
 static QString sanitizeAssistantDisplayText(const QString& raw);
+
+static bool isActiveAgentStatusText(const QString& status)
+{
+    const QString normalized = status.trimmed().toLower();
+    return normalized == QStringLiteral("accepted")
+        || normalized == QStringLiteral("queued")
+        || normalized == QStringLiteral("running");
+}
+
+static QString humanizeAgentStatus(const QString& status)
+{
+    QString normalized = status.trimmed().toLower();
+    if (normalized.isEmpty())
+        return QStringLiteral("idle");
+
+    normalized.replace(QChar('_'), QChar(' '));
+    if (!normalized.isEmpty())
+        normalized[0] = normalized[0].toUpper();
+    return normalized;
+}
+
+static QString formatRuntimeMsForAgent(uint64_t runtimeMs)
+{
+    const qint64 seconds = runtimeMs > 0
+        ? static_cast<qint64>((runtimeMs + 999) / 1000)
+        : 0;
+    return formatElapsedTime(seconds);
+}
+
+static QString jsonStringValue(const nlohmann::json& obj, const char* key)
+{
+    if (!obj.is_object())
+        return QString();
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_string())
+        return QString();
+    return QString::fromUtf8(it->get_ref<const std::string&>().c_str());
+}
+
+static uint64_t jsonUint64Value(const nlohmann::json& obj, const char* key)
+{
+    if (!obj.is_object())
+        return 0;
+    auto it = obj.find(key);
+    if (it == obj.end())
+        return 0;
+    if (it->is_number_unsigned())
+        return it->get<uint64_t>();
+    if (it->is_number_integer())
+        return static_cast<uint64_t>((std::max)(it->get<long long>(), 0LL));
+    return 0;
+}
+
+static bool isActiveAgentSessionSummary(const nlohmann::json& session)
+{
+    const QString sessionId = jsonStringValue(session, "sessionId");
+    if (sessionId == QStringLiteral("main"))
+        return true;
+    return isActiveAgentStatusText(jsonStringValue(session, "status"));
+}
+
+static int activeAgentSortPriority(const nlohmann::json& session)
+{
+    const QString sessionId = jsonStringValue(session, "sessionId");
+    if (sessionId == QStringLiteral("main"))
+        return -1;
+
+    const QString status = jsonStringValue(session, "status").trimmed().toLower();
+    if (status == QStringLiteral("running"))
+        return 0;
+    if (status == QStringLiteral("queued"))
+        return 1;
+    if (status == QStringLiteral("accepted"))
+        return 2;
+    return 3;
+}
+
+static QString targetDisplayNameForSession(const nlohmann::json& session)
+{
+    if (!session.is_object())
+        return QString();
+    auto it = session.find("targetInstance");
+    if (it == session.end() || !it->is_object())
+        return QString();
+
+    QString display = jsonStringValue(*it, "displayName");
+    if (!display.isEmpty())
+        return display;
+    return jsonStringValue(*it, "instanceId");
+}
+
+static QString buildActiveAgentSummaryText(
+    const nlohmann::json& session,
+    bool rootIsWaiting,
+    const QString& currentToolStatus,
+    const QString& typingStatus)
+{
+    const QString sessionId = jsonStringValue(session, "sessionId");
+    const QString label = jsonStringValue(session, "label").isEmpty()
+        ? (sessionId.isEmpty() ? QStringLiteral("agent") : sessionId)
+        : jsonStringValue(session, "label");
+    QString status = humanizeAgentStatus(jsonStringValue(session, "status"));
+    if (sessionId == QStringLiteral("main") && rootIsWaiting)
+        status = QStringLiteral("Running");
+
+    QStringList lines;
+    QString header = QStringLiteral("%1 | %2 | %3")
+        .arg(label, status, formatRuntimeMsForAgent(jsonUint64Value(session, "runtimeMs")));
+    lines.push_back(header);
+
+    if (sessionId == QStringLiteral("main"))
+    {
+        const QString rootDetail = !currentToolStatus.trimmed().isEmpty()
+            ? currentToolStatus.trimmed()
+            : typingStatus.trimmed();
+        if (!rootDetail.isEmpty())
+            lines.push_back(QStringLiteral("Status: %1").arg(rootDetail));
+    }
+    else
+    {
+        const QString taskPreview = jsonStringValue(session, "taskPreview").trimmed();
+        if (!taskPreview.isEmpty())
+            lines.push_back(QStringLiteral("Task: %1").arg(taskPreview));
+    }
+
+    const QString target = targetDisplayNameForSession(session).trimmed();
+    if (!target.isEmpty())
+        lines.push_back(QStringLiteral("Target: %1").arg(target));
+
+    const QString model = jsonStringValue(session, "model").trimmed();
+    const uint64_t totalTokens = jsonUint64Value(session, "totalTokens");
+    if (!model.isEmpty() || totalTokens > 0)
+    {
+        QStringList metrics;
+        if (!model.isEmpty())
+            metrics.push_back(QStringLiteral("Model %1").arg(model));
+        if (totalTokens > 0)
+            metrics.push_back(QStringLiteral("Tokens %1").arg(static_cast<qulonglong>(totalTokens)));
+        lines.push_back(metrics.join(QStringLiteral(" | ")));
+    }
+
+    return lines.join(QChar('\n'));
+}
 
 enum class chat_action_icon_t
 {
@@ -694,13 +839,9 @@ void AiDAChatPanel::setupUI()
     m_thinkingElapsedTimer = new QTimer(this);
     m_thinkingElapsedTimer->setInterval(1000);
     QObject::connect(m_thinkingElapsedTimer, &QTimer::timeout, [this]() {
-        qint64 elapsed = m_thinkingStopwatch.elapsed() / 1000;
-        if (m_liveStatusLabel != nullptr)
-        {
-            QString statusText = m_currentToolStatus.isEmpty()
-                ? m_typingStatus : m_currentToolStatus;
-            m_liveStatusLabel->setText(statusText + QStringLiteral("  ") + formatElapsedTime(elapsed));
-        }
+        if (!m_isWaiting)
+            return;
+        refreshThinkingPanelView();
     });
 
     m_toastLabel = new QLabel(this);
@@ -1999,6 +2140,9 @@ void AiDAChatPanel::setThinkingState(bool thinking, bool rebuildDisplay)
 QString AiDAChatPanel::summarizeThinkingHeader(const QString& reasoning) const
 {
     QString cleaned = stripCodeFences(reasoning);
+    if (looksLikeStructuredProtocolText(cleaned))
+        return QStringLiteral("Planning");
+
     cleaned.replace(QRegularExpression(QStringLiteral("[\\{\\}\\[\\]\"]")), QStringLiteral(" "));
     cleaned.replace(QRegularExpression(QStringLiteral("\\s+")), QStringLiteral(" "));
     cleaned = cleaned.trimmed();
@@ -2115,7 +2259,7 @@ void AiDAChatPanel::updateThinkingStatus(int round, const QString& reasoning, co
     if (!reasoning.isEmpty())
     {
         QString cleanedReasoning = stripCodeFences(reasoning).trimmed();
-        if (!cleanedReasoning.isEmpty())
+        if (!cleanedReasoning.isEmpty() && !looksLikeStructuredProtocolText(cleanedReasoning))
         {
             QString headerText;
             for (ThinkingRound& entry : m_thinkingRounds)
@@ -2215,6 +2359,8 @@ QString AiDAChatPanel::buildLiveThinkingPreview() const
 {
     QString preview = m_streamBuffer.trimmed();
     if (preview.isEmpty())
+        return QString();
+    if (looksLikeStructuredProtocolText(preview))
         return QString();
 
     preview.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
@@ -2337,6 +2483,52 @@ void AiDAChatPanel::rebuildLiveThinkingBlock()
         }
     }
 
+    {
+        nlohmann::json visibleSessions = subagents::list_visible_sessions();
+        std::vector<nlohmann::json> activeSessions;
+        if (visibleSessions.is_array())
+        {
+            activeSessions.reserve(visibleSessions.size());
+            for (const auto& session : visibleSessions)
+            {
+                if (session.is_object() && isActiveAgentSessionSummary(session))
+                    activeSessions.push_back(session);
+            }
+        }
+
+        std::sort(activeSessions.begin(), activeSessions.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
+            const int ap = activeAgentSortPriority(a);
+            const int bp = activeAgentSortPriority(b);
+            if (ap != bp)
+                return ap < bp;
+            return jsonStringValue(a, "label").compare(jsonStringValue(b, "label"), Qt::CaseInsensitive) < 0;
+        });
+
+        if (!activeSessions.empty())
+        {
+            QLabel* agentsHeader = new QLabel(
+                QStringLiteral("Active Agents (%1)").arg(static_cast<qlonglong>(activeSessions.size())),
+                m_liveThinkingBlock);
+            agentsHeader->setObjectName(QStringLiteral("chatThinkingHeaderLabel"));
+            blockLayout->addWidget(agentsHeader);
+
+            for (const auto& session : activeSessions)
+            {
+                QLabel* agentLabel = new QLabel(
+                    buildActiveAgentSummaryText(session, m_isWaiting, m_currentToolStatus, m_typingStatus),
+                    m_liveThinkingBlock);
+                agentLabel->setObjectName(QStringLiteral("chatThinkingLabel"));
+                agentLabel->setTextFormat(Qt::PlainText);
+                agentLabel->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+                agentLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+                agentLabel->setWordWrap(true);
+                agentLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+                agentLabel->setMaximumWidth(maxBubbleWidth - 12);
+                blockLayout->addWidget(agentLabel);
+            }
+        }
+    }
+
     m_liveStreamLabel = new QLabel(m_liveThinkingBlock);
     m_liveStreamLabel->setObjectName(QStringLiteral("chatThinkingLabel"));
     m_liveStreamLabel->setTextFormat(Qt::PlainText);
@@ -2406,6 +2598,36 @@ static bool looksLikeToolStatusNoiseLine(const QString& line)
 
     if (t.contains(QStringLiteral("listed"), Qt::CaseInsensitive)
         && t.contains(QStringLiteral("functions"), Qt::CaseInsensitive))
+    {
+        return true;
+    }
+
+    return false;
+}
+
+static bool looksLikeStructuredProtocolText(const QString& text)
+{
+    const QString t = text.trimmed();
+    if (t.isEmpty())
+        return false;
+
+    if (t.startsWith(QStringLiteral("```json"), Qt::CaseInsensitive)
+        || t.startsWith(QStringLiteral("```")))
+    {
+        return true;
+    }
+
+    if (t.startsWith(QChar('{')) || t.startsWith(QChar('[')))
+        return true;
+
+    if (t.contains(QStringLiteral("\"tool_calls\""), Qt::CaseInsensitive)
+        || t.contains(QStringLiteral("\"reasoning\""), Qt::CaseInsensitive))
+    {
+        return true;
+    }
+
+    if (t.startsWith(QStringLiteral("tool_calls"), Qt::CaseInsensitive)
+        || t.startsWith(QStringLiteral("reasoning:"), Qt::CaseInsensitive))
     {
         return true;
     }

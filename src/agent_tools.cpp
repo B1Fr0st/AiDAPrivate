@@ -14,6 +14,55 @@ using json = nlohmann::json;
 
 namespace agent_tools
 {
+static tool_result_t execute_remote_subagent_tool(
+    const std::string& name,
+    const json& params,
+    const subagents::instance_info_t& target)
+{
+    if (target.base_url.empty())
+        return tool_result_t::error(OBFSTR("Remote sub-agent target is missing a transport URL."));
+
+    httplib::Client client(target.base_url.c_str());
+    client.set_connection_timeout(5);
+    client.set_read_timeout(300);
+    client.set_write_timeout(20);
+    client.set_tcp_nodelay(true);
+    client.set_keep_alive(true);
+    client.set_decompress(true);
+    client.set_compress(true);
+    client.set_follow_location(true);
+
+    json request_body = {
+        {"name", name},
+        {"arguments", params}
+    };
+
+    auto response = client.Post("/api/tools/call", json_dump_safe(request_body), "application/json");
+    if (!response)
+        return tool_result_t::error(OBFSTR("Failed to reach remote AiDA instance: ") + target.display_name);
+    if (response->status < 200 || response->status >= 300)
+        return tool_result_t::error(OBFSTR("Remote AiDA instance returned HTTP ") + std::to_string(response->status));
+
+    json body;
+    try
+    {
+        body = json::parse(response->body);
+    }
+    catch (const std::exception& e)
+    {
+        return tool_result_t::error(OBFSTR("Remote AiDA response parse error: ") + e.what());
+    }
+
+    const bool success = body.value("success", false);
+    const std::string output = body.value("output", success ? std::string() : OBFSTR("Remote tool execution failed."));
+
+    tool_result_t result = success ? tool_result_t::ok(output) : tool_result_t::error(output);
+    if (body.contains("data"))
+        result.data = body["data"];
+    sanitize_json_utf8_inplace(result.data);
+    return result;
+}
+
 tool_result_t tool_result_t::ok(const std::string& msg, const json& data)
 {
     tool_result_t r;
@@ -217,6 +266,9 @@ tool_result_t ToolRegistry::execute_tool(const std::string& name, const json& pa
             }
         }
     }
+
+    if (!subagents::is_session_tool_name(name) && subagents::current_target_is_remote())
+        return execute_remote_subagent_tool(name, sanitized_params, subagents::current_target_instance());
 
     try
     {
@@ -19793,6 +19845,7 @@ void initialize_all_tools()
         {
             {OBFSTR("task"), OBFSTR("string"), OBFSTR("Required task for the child sub-agent."), true},
             {OBFSTR("label"), OBFSTR("string"), OBFSTR("Optional human-readable label for the child session."), false},
+            {OBFSTR("targetInstance"), OBFSTR("string"), OBFSTR("Optional target instance id, input path, or display name. Leave empty to use the current IDA instance."), false},
             {OBFSTR("agentId"), OBFSTR("string"), OBFSTR("Optional agent id override. Defaults to the current AiDA agent."), false},
             {OBFSTR("model"), OBFSTR("string"), OBFSTR("Optional model override for the child run."), false},
             {OBFSTR("thinking"), OBFSTR("string"), OBFSTR("Optional thinking profile override: inherit, none, minimal, low, medium, high."), false},
@@ -19806,6 +19859,7 @@ void initialize_all_tools()
             subagents::spawn_request_t request;
             request.task = params.value("task", "");
             request.label = params.value("label", "");
+            request.target_instance = params.value("targetInstance", "");
             request.agent_id = params.value("agentId", "");
             request.model = params.value("model", "");
             request.thinking = params.value("thinking", "");
@@ -19889,9 +19943,9 @@ void initialize_all_tools()
 
     ToolRegistry::instance().register_tool({
         OBFSTR("subagents"), OBFSTR("session"),
-        OBFSTR("Inspect or control visible sub-agent runs. Operations: list, info, log, kill, send, steer."),
+        OBFSTR("Inspect or control visible sub-agent runs. Operations: list, info, log, kill, send, steer, instances."),
         {
-            {OBFSTR("operation"), OBFSTR("string"), OBFSTR("One of: list, info, log, kill, send, steer."), true},
+            {OBFSTR("operation"), OBFSTR("string"), OBFSTR("One of: list, info, log, kill, send, steer, instances."), true},
             {OBFSTR("id"), OBFSTR("string"), OBFSTR("Target session id/key or 'all' for kill."), false},
             {OBFSTR("message"), OBFSTR("string"), OBFSTR("Message for send/steer operations."), false},
             {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Optional log/history limit for info/log."), false}
@@ -19909,6 +19963,14 @@ void initialize_all_tools()
                 sanitize_json_utf8_inplace(response);
                 return tool_result_t::ok(
                     OBFSTR("Visible sub-agent sessions: ") + std::to_string(response.is_array() ? response.size() : 0),
+                    response);
+            }
+            if (operation == "instances")
+            {
+                response = subagents::list_available_instances();
+                sanitize_json_utf8_inplace(response);
+                return tool_result_t::ok(
+                    OBFSTR("Available AiDA instances: ") + std::to_string(response.is_array() ? response.size() : 0),
                     response);
             }
             if (operation == "info")

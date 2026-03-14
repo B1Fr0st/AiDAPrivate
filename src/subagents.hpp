@@ -29,6 +29,7 @@ struct spawn_request_t
 {
     std::string task;
     std::string label;
+    std::string target_instance;
     std::string agent_id;
     std::string model;
     std::string thinking;
@@ -51,6 +52,22 @@ struct steering_message_t
 {
     uint64_t timestamp_ms = 0;
     std::string message;
+};
+
+struct instance_info_t
+{
+    std::string instance_id;
+    std::string display_name;
+    std::string base_url;
+    std::string input_path;
+    int port = 0;
+    uint64_t updated_at_ms = 0;
+    bool is_local = false;
+
+    bool is_remote() const
+    {
+        return !is_local && !base_url.empty();
+    }
 };
 
 struct session_record_t : public std::enable_shared_from_this<session_record_t>
@@ -89,6 +106,7 @@ struct session_record_t : public std::enable_shared_from_this<session_record_t>
     std::string error_message;
     std::string transcript_path;
     bool archived = false;
+    instance_info_t target_instance;
 
     mutable std::mutex mutex;
     std::vector<std::string> child_session_keys;
@@ -198,6 +216,242 @@ inline std::string current_agent_id()
     return "aida";
 }
 
+inline bool are_subagents_enabled()
+{
+    return true;
+}
+
+inline std::filesystem::path instance_registry_path()
+{
+    return transcript_root_dir() / "instances.json";
+}
+
+inline std::string current_input_path()
+{
+    char input_file[4096] = {};
+    get_input_file_path(input_file, sizeof(input_file));
+    return sanitize_utf8(input_file);
+}
+
+inline std::string display_name_from_input_path(const std::string& input_path, int port)
+{
+    std::string label = input_path;
+    if (!label.empty())
+    {
+        std::error_code ec;
+        const std::filesystem::path p(label);
+        const std::string filename = p.filename().string();
+        if (!filename.empty())
+            label = filename;
+    }
+
+    if (label.empty())
+        label = "Unnamed IDA database";
+
+    if (port > 0)
+        label += " @127.0.0.1:" + std::to_string(port);
+    return sanitize_utf8(label);
+}
+
+inline json instance_to_json(const instance_info_t& info)
+{
+    return json{
+        {"instanceId", info.instance_id},
+        {"displayName", info.display_name},
+        {"baseUrl", info.base_url},
+        {"inputPath", info.input_path},
+        {"port", info.port},
+        {"updatedAtMs", info.updated_at_ms},
+        {"isLocal", info.is_local}
+    };
+}
+
+inline instance_info_t instance_from_json(const json& value)
+{
+    instance_info_t info;
+    info.instance_id = value.value("instanceId", std::string());
+    info.display_name = value.value("displayName", std::string());
+    info.base_url = value.value("baseUrl", std::string());
+    info.input_path = value.value("inputPath", std::string());
+    info.port = value.value("port", 0);
+    info.updated_at_ms = value.value("updatedAtMs", static_cast<uint64_t>(0));
+    info.is_local = value.value("isLocal", false);
+    return info;
+}
+
+inline json read_instance_registry()
+{
+    const std::filesystem::path path = instance_registry_path();
+    if (!std::filesystem::exists(path))
+        return json::array();
+
+    std::ifstream input(path, std::ios::binary);
+    if (!input.good())
+        return json::array();
+
+    std::string content((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    json parsed = json::parse(content, nullptr, false);
+    return parsed.is_array() ? parsed : json::array();
+}
+
+inline void write_instance_registry(const json& registry)
+{
+    const std::filesystem::path path = instance_registry_path();
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output.good())
+        return;
+    output << json_dump_fast(registry, 2);
+}
+
+inline bool probe_instance_endpoint(const instance_info_t& info)
+{
+    if (info.base_url.empty() || info.port <= 0)
+        return false;
+
+    try
+    {
+        httplib::Client cli(info.base_url.c_str());
+        cli.set_connection_timeout(1);
+        cli.set_read_timeout(1);
+        cli.set_write_timeout(1);
+        cli.set_tcp_nodelay(true);
+        auto res = cli.Get("/health");
+        return res && res->status == 200;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+inline std::string local_instance_id_for_port(int port)
+{
+    if (port <= 0)
+        return "local";
+    return std::string("127.0.0.1:") + std::to_string(port);
+}
+
+inline instance_info_t current_local_instance_snapshot(int port_override = 0)
+{
+    instance_info_t info;
+    const int port = port_override > 0 ? port_override : (g_settings.mcp_enabled ? g_settings.mcp_port : 0);
+    info.instance_id = local_instance_id_for_port(port);
+    info.base_url = port > 0 ? (std::string("http://127.0.0.1:") + std::to_string(port)) : std::string();
+    info.input_path = current_input_path();
+    info.display_name = display_name_from_input_path(info.input_path, port);
+    info.port = port;
+    info.updated_at_ms = now_ms();
+    info.is_local = true;
+    return info;
+}
+
+inline void register_local_instance(int port)
+{
+    if (port <= 0)
+        return;
+
+    json registry = read_instance_registry();
+    const instance_info_t local = current_local_instance_snapshot(port);
+    bool updated = false;
+    for (auto& item : registry)
+    {
+        if (item.value("instanceId", std::string()) != local.instance_id)
+            continue;
+        item = instance_to_json(local);
+        updated = true;
+        break;
+    }
+    if (!updated)
+        registry.push_back(instance_to_json(local));
+    write_instance_registry(registry);
+}
+
+inline void unregister_local_instance(int port)
+{
+    if (port <= 0)
+        return;
+
+    json registry = read_instance_registry();
+    json updated = json::array();
+    const std::string instance_id = local_instance_id_for_port(port);
+    for (const auto& item : registry)
+    {
+        if (item.value("instanceId", std::string()) == instance_id)
+            continue;
+        updated.push_back(item);
+    }
+    write_instance_registry(updated);
+}
+
+inline std::vector<instance_info_t> list_registered_instances(bool include_local = true, bool probe = true)
+{
+    json registry = read_instance_registry();
+    std::vector<instance_info_t> instances;
+    instances.reserve(registry.is_array() ? registry.size() + 1 : 1);
+
+    json cleaned = json::array();
+    for (const auto& item : registry)
+    {
+        instance_info_t info = instance_from_json(item);
+        if (info.instance_id.empty() || info.port <= 0 || info.base_url.empty())
+            continue;
+        if (probe && !probe_instance_endpoint(info))
+            continue;
+        cleaned.push_back(instance_to_json(info));
+        instances.push_back(std::move(info));
+    }
+    if (cleaned != registry)
+        write_instance_registry(cleaned);
+
+    if (include_local)
+        instances.insert(instances.begin(), current_local_instance_snapshot());
+
+    std::sort(instances.begin(), instances.end(), [](const instance_info_t& a, const instance_info_t& b) {
+        if (a.is_local != b.is_local)
+            return a.is_local;
+        return a.display_name < b.display_name;
+    });
+    return instances;
+}
+
+inline bool resolve_target_instance(const std::string& token, instance_info_t* out)
+{
+    if (out == nullptr)
+        return false;
+
+    const std::string needle = lower_copy(trim_copy(token));
+    if (needle.empty() || needle == "local" || needle == "current" || needle == "this")
+    {
+        *out = current_local_instance_snapshot();
+        return true;
+    }
+
+    const auto instances = list_registered_instances(true, true);
+    for (const auto& info : instances)
+    {
+        const std::string id = lower_copy(info.instance_id);
+        const std::string name = lower_copy(info.display_name);
+        const std::string path = lower_copy(info.input_path);
+        const std::string port = std::to_string(info.port);
+        if (needle == id || needle == name || needle == info.base_url || needle == port)
+        {
+            *out = info;
+            return true;
+        }
+        if ((!name.empty() && name.find(needle) != std::string::npos)
+            || (!path.empty() && path.find(needle) != std::string::npos)
+            || (!id.empty() && id.find(needle) != std::string::npos))
+        {
+            *out = info;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 class manager_t
 {
 public:
@@ -265,6 +519,8 @@ public:
 
     bool current_session_allows_session_tools() const
     {
+        if (!are_subagents_enabled())
+            return false;
         if (!g_thread_context.session)
             return true;
         return g_thread_context.session->allow_session_tools;
@@ -272,6 +528,8 @@ public:
 
     bool can_execute_tool(const std::string& tool_name) const
     {
+        if (is_session_tool_name(tool_name) && !are_subagents_enabled())
+            return false;
         if (!is_session_tool_name(tool_name))
             return true;
         return current_session_allows_session_tools();
@@ -284,12 +542,16 @@ public:
 
     std::string session_prompt_guidance() const
     {
+        if (!are_subagents_enabled())
+            return std::string();
+
         if (!g_thread_context.session)
         {
             return
                 "Sub-agent tools are available. Use `sessions_spawn` for independent or slow branches that can run in parallel.\n"
                 "`sessions_spawn` is non-blocking: it returns immediately with a run id and child session key.\n"
-                "Child completions are announced back automatically in later rounds. Use `subagents` or `sessions_history` only when you need to inspect, steer, or cancel a child explicitly.\n";
+                "Child completions are announced back automatically in later rounds. Use `subagents` or `sessions_history` only when you need to inspect, steer, or cancel a child explicitly.\n"
+                "If another live AiDA instance is needed, discover targets with `subagents` using operation `instances`, then pass `targetInstance` to `sessions_spawn`.\n";
         }
 
         if (!g_thread_context.session->allow_session_tools)
@@ -303,7 +565,8 @@ public:
         return
             "You are running as an orchestrator-capable sub-agent.\n"
             "You may use `sessions_spawn` to fan out independent branches, but keep the fan-out focused and bounded.\n"
-            "Use `subagents`, `sessions_list`, and `sessions_history` to monitor or synthesize child results.\n";
+            "Use `subagents`, `sessions_list`, and `sessions_history` to monitor or synthesize child results.\n"
+            "Use `subagents` with operation `instances` when you need to target a different live IDA instance.\n";
     }
 
     int current_depth() const
@@ -318,6 +581,20 @@ public:
 
         std::lock_guard<std::mutex> lock(_mutex);
         return active_child_count_locked(g_thread_context.session->session_key);
+    }
+
+    bool current_target_is_remote() const
+    {
+        return g_thread_context.session && g_thread_context.session->target_instance.is_remote();
+    }
+
+    instance_info_t current_target_instance() const
+    {
+        if (!g_thread_context.session)
+            return current_local_instance_snapshot();
+        if (g_thread_context.session->target_instance.instance_id.empty())
+            return current_local_instance_snapshot();
+        return g_thread_context.session->target_instance;
     }
 
     std::vector<std::string> take_runtime_updates_for_current_run()
@@ -379,6 +656,9 @@ public:
 
     json spawn(const spawn_request_t& request)
     {
+        if (!are_subagents_enabled())
+            return json{{"status", "error"}, {"message", "Sub-agents are disabled in settings."}};
+
         if (!g_thread_context.session || g_thread_context.run_id == 0)
         {
             return json{{"status", "error"}, {"message", "sessions_spawn is only available while an agent run is active."}};
@@ -408,6 +688,12 @@ public:
             return json{{"status", "error"}, {"message", "Per-agent active child limit reached."}};
         }
 
+        instance_info_t target_instance;
+        if (!resolve_target_instance(request.target_instance, &target_instance))
+        {
+            return json{{"status", "error"}, {"message", "Unknown or unreachable target IDA instance."}};
+        }
+
         const uint64_t numeric_id = ++_session_counter;
         auto child = std::make_shared<session_record_t>();
         child->session_id = make_session_id(numeric_id);
@@ -429,6 +715,7 @@ public:
         child->mode = normalized_mode;
         child->cleanup = normalized_cleanup == "delete" ? "delete" : "keep";
         child->sandbox = normalized_sandbox;
+        child->target_instance = target_instance;
         child->created_at_ms = now_ms();
         child->assigned_user_message = child->task;
         child->assigned_context_block = build_child_context_locked(parent, *child);
@@ -441,10 +728,10 @@ public:
 
         append_log_locked(parent, "spawn",
             "Spawned sub-agent `" + child->label + "`",
-            json{{"child_session_key", child->session_key}, {"child_session_id", child->session_id}, {"task", truncate_text(child->task, 512)}});
+            json{{"child_session_key", child->session_key}, {"child_session_id", child->session_id}, {"task", truncate_text(child->task, 512)}, {"targetInstance", instance_to_json(child->target_instance)}});
         append_log_locked(child, "spawned",
             "Accepted sub-agent task.",
-            json{{"requester_session_key", child->requester_session_key}, {"requester_run_id", child->requester_run_id}, {"task", truncate_text(child->task, 1024)}});
+            json{{"requester_session_key", child->requester_session_key}, {"requester_run_id", child->requester_run_id}, {"task", truncate_text(child->task, 1024)}, {"targetInstance", instance_to_json(child->target_instance)}});
 
         std::thread([this, child, settings_snapshot = g_settings]() mutable {
             run_subagent_session(child, settings_snapshot);
@@ -456,8 +743,17 @@ public:
             {"childSessionKey", child->session_key},
             {"label", child->label},
             {"depth", child->depth},
-            {"mode", child->mode}
+            {"mode", child->mode},
+            {"targetInstance", instance_to_json(child->target_instance)}
         };
+    }
+
+    json list_available_instances() const
+    {
+        json items = json::array();
+        for (const auto& info : list_registered_instances(true, true))
+            items.push_back(instance_to_json(info));
+        return items;
     }
 
     json list_visible_sessions() const
@@ -586,6 +882,7 @@ private:
         root->depth = 0;
         root->allow_session_tools = true;
         root->allow_spawn_children = true;
+        root->target_instance = current_local_instance_snapshot();
         root->mode = "session";
         root->created_at_ms = now_ms();
         root->transcript_path = make_transcript_path_locked(root->session_id);
@@ -679,6 +976,7 @@ private:
             {"totalTokens", session->total_tokens.load()},
             {"model", session->model.empty() ? json() : json(session->model)},
             {"thinking", session->thinking.empty() ? json() : json(session->thinking)},
+            {"targetInstance", instance_to_json(session->target_instance)},
             {"taskPreview", truncate_text(session->task, 320)}
         };
     }
@@ -720,13 +1018,25 @@ private:
         std::ostringstream ss;
         ss << "**Sub-agent Assignment:**\n" << child.task << "\n\n";
         ss << "**Requester Session:**\n" << parent->session_key << "\n\n";
+        ss << "**Target IDA Instance:**\n"
+           << child.target_instance.display_name << "\n"
+           << "Instance ID: " << child.target_instance.instance_id << "\n"
+           << "Input Path: " << (child.target_instance.input_path.empty() ? std::string("N/A") : child.target_instance.input_path) << "\n"
+           << "Transport: " << (child.target_instance.is_remote() ? child.target_instance.base_url : std::string("local in-process")) << "\n\n";
 
         if (!parent->assigned_user_message.empty())
             ss << "**Original User Request:**\n" << truncate_text(parent->assigned_user_message, 12000) << "\n\n";
-        if (!parent->assigned_context_block.empty())
+        if (!child.target_instance.is_remote() && !parent->assigned_context_block.empty())
             ss << "**Shared Analysis Context:**\n" << truncate_text(parent->assigned_context_block, 32000) << "\n\n";
         if (!parent->assigned_chat_history.empty())
             ss << "**Relevant Conversation History:**\n" << truncate_text(parent->assigned_chat_history, 18000) << "\n\n";
+
+        if (child.target_instance.is_remote())
+        {
+            ss << "**Remote Execution Rule:**\n"
+               << "Your ordinary IDA tools execute against the target instance shown above, not the requester database.\n"
+               << "Treat the requester context only as high-level intent and confirm everything by querying the target instance directly.\n\n";
+        }
 
         ss << "**Execution Contract:**\n"
            << "Focus only on the assigned sub-task. Return findings for the requester agent.\n"
@@ -1153,6 +1463,11 @@ inline bool has_current_session()
     return manager().has_current_session();
 }
 
+inline bool enabled()
+{
+    return are_subagents_enabled();
+}
+
 inline bool can_execute_tool(const std::string& tool_name)
 {
     return manager().can_execute_tool(tool_name);
@@ -1188,6 +1503,16 @@ inline int current_active_child_count()
     return manager().current_active_child_count();
 }
 
+inline bool current_target_is_remote()
+{
+    return manager().current_target_is_remote();
+}
+
+inline instance_info_t current_target_instance()
+{
+    return manager().current_target_instance();
+}
+
 inline uint64_t begin_run_for_current_session(
     const std::string& user_message,
     const std::string& context_block,
@@ -1219,6 +1544,11 @@ inline json spawn(const spawn_request_t& request)
 inline json list_visible_sessions()
 {
     return manager().list_visible_sessions();
+}
+
+inline json list_available_instances()
+{
+    return manager().list_available_instances();
 }
 
 inline json get_session_info(const std::string& id_or_key, size_t log_limit = 0, bool include_log = false)
