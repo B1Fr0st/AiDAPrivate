@@ -821,7 +821,7 @@ bool license_manager_t::validate()
         return true;
     }
 
-    // Validation failed — possible DLL leak (valid key, wrong HWID)
+
     discord_webhook::send_alert_async(
         OBFSTR("\xf0\x9f\x9a\xa8 FAILED ACTIVATION ATTEMPT (Possible DLL Leak)"),
         OBFSTR("**Someone attempted to activate a license on an unauthorized machine.**\n")
@@ -943,7 +943,7 @@ bool license_manager_t::show_activation_dialog()
                       "- This hardware is authorized\n"
                       "- You have an active internet connection"));
 
-    // Validation failed — possible DLL leak (valid key, wrong machine)
+
     discord_webhook::send_alert_async(
         OBFSTR("\xf0\x9f\x9a\xa8 FAILED ACTIVATION ATTEMPT (Possible DLL Leak)"),
         OBFSTR("**Someone attempted to activate a license on an unauthorized machine.**\n")
@@ -1562,9 +1562,6 @@ bool license_manager_t::verify_function_prologues() const
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Ban / leak detection helpers
-// ---------------------------------------------------------------------------
 
 void license_manager_t::handle_ban_response(const nlohmann::json& j)
 {

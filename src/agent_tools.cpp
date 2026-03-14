@@ -15576,9 +15576,6 @@ tool_result_t driver_get_deferred_results(const json& params)
         OBFSTR("Deferred action #") + std::to_string(id) + OBFSTR(": ") + status_str, result);
 }
 
-// ============================================================
-// Advanced network recon tool handlers
-// ============================================================
 
 static std::string format_recon_ip(const std::uint8_t* addr, std::uint32_t af) {
     char buf[64] = {};
@@ -15689,7 +15686,7 @@ tool_result_t driver_sniff_network_buffers(const json& params)
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
-    // Determine operation from parameters
+
     if (params.contains("operation")) {
         std::string op = params["operation"].get<std::string>();
 
@@ -15712,7 +15709,7 @@ tool_result_t driver_sniff_network_buffers(const json& params)
                 c["thread_id"] = helpers::format_address(static_cast<ea_t>(cap.thread_id));
                 c["size"] = cap.buffer.size();
 
-                // Hex dump first 256 bytes
+
                 std::string hex;
                 std::size_t show = (cap.buffer.size() < 256) ? cap.buffer.size() : 256;
                 for (std::size_t i = 0; i < show; i++) {
@@ -15725,7 +15722,7 @@ tool_result_t driver_sniff_network_buffers(const json& params)
                     hex += "... (" + std::to_string(cap.buffer.size() - show) + " more)";
                 c["hex_dump"] = hex;
 
-                // ASCII extraction
+
                 std::string ascii;
                 for (std::size_t i = 0; i < show; i++) {
                     char ch = static_cast<char>(cap.buffer[i]);
@@ -15741,14 +15738,14 @@ tool_result_t driver_sniff_network_buffers(const json& params)
         }
     }
 
-    // Default: START operation
+
     std::uint64_t address = 0;
     if (params.contains("address"))
         address = helpers::parse_address(params["address"].get<std::string>()).value_or(0);
     if (address == 0)
         return tool_result_t::error(OBFSTR("Address of send/recv/encrypt function required"));
 
-    // Parse register names to indices
+
     auto reg_name_to_index = [](const std::string& name) -> std::uint32_t {
         static const std::pair<const char*, std::uint32_t> regs[] = {
             {"rax", 0}, {"rcx", 1}, {"rdx", 2}, {"rbx", 3},
@@ -15764,11 +15761,11 @@ tool_result_t driver_sniff_network_buffers(const json& params)
         return 0;
     };
 
-    std::uint32_t buf_reg = 1;  // default: rcx (first arg in Windows x64)
+    std::uint32_t buf_reg = 1;
     if (params.contains("buffer_register"))
         buf_reg = reg_name_to_index(params["buffer_register"].get<std::string>());
 
-    std::uint32_t size_reg = 2; // default: rdx
+    std::uint32_t size_reg = 2;
     if (params.contains("size_register"))
         size_reg = reg_name_to_index(params["size_register"].get<std::string>());
 
@@ -15831,7 +15828,7 @@ tool_result_t driver_dump_tcpip_connections(const json& params)
     result["count"] = connections.size();
     if (target_pid != 0) result["filtered_pid"] = target_pid;
 
-    // Group by protocol
+
     std::uint32_t tcp_count = 0, udp_count = 0;
     json arr = json::array();
     for (const auto& c : connections) {
@@ -15867,13 +15864,10 @@ tool_result_t driver_dump_tcpip_connections(const json& params)
         std::to_string(udp_count) + OBFSTR(" UDP)"), result);
 }
 
-// =================================================================
-// MITM / Deep Packet Inspection / Interception tool handlers
-// =================================================================
 
 static bool parse_ip_string(const std::string& ip, std::uint8_t* out16, std::uint32_t* af) {
     std::memset(out16, 0, 16);
-    // Try IPv4 first
+
     unsigned a, b, c, d;
     if (sscanf(ip.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) == 4 && a < 256 && b < 256 && c < 256 && d < 256) {
         out16[0] = static_cast<std::uint8_t>(a);
@@ -15883,10 +15877,10 @@ static bool parse_ip_string(const std::string& ip, std::uint8_t* out16, std::uin
         if (af) *af = 2;
         return true;
     }
-    // Simplified IPv6: just store as-is if it has colons
+
     if (ip.find(':') != std::string::npos) {
         if (af) *af = 23;
-        // Best-effort hex parse of colon-separated groups
+
         unsigned vals[8] = {};
         int count = sscanf(ip.c_str(), "%x:%x:%x:%x:%x:%x:%x:%x",
             &vals[0], &vals[1], &vals[2], &vals[3], &vals[4], &vals[5], &vals[6], &vals[7]);
@@ -15924,7 +15918,7 @@ tool_result_t driver_inject_packet(const json& params)
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
-    std::uint32_t direction = 1; // outbound by default
+    std::uint32_t direction = 1;
     if (params.contains("direction")) {
         auto& d = params["direction"];
         if (d.is_number()) direction = d.get<std::uint32_t>();
@@ -15935,7 +15929,7 @@ tool_result_t driver_inject_packet(const json& params)
     }
 
     std::uint32_t protocol = proto_from_param(params, "protocol");
-    if (protocol == 0) protocol = 6; // default TCP
+    if (protocol == 0) protocol = 6;
 
     std::uint8_t src_addr[16] = {}, dst_addr[16] = {};
     std::uint32_t af = 2;
@@ -15948,7 +15942,7 @@ tool_result_t driver_inject_packet(const json& params)
     std::uint32_t tcp_seq = params.value("tcp_seq", 0u);
     std::uint32_t tcp_ack = params.value("tcp_ack", 0u);
 
-    // Parse payload from hex string
+
     std::vector<std::uint8_t> payload_bytes;
     if (params.contains("payload")) {
         std::string error;
@@ -16007,7 +16001,7 @@ tool_result_t driver_modify_packet_rule(const json& params)
     else if (operation == "clear") op_code = 3;
     else return tool_result_t::error(OBFSTR("Unknown operation: ") + operation);
 
-    std::uint32_t dir = 2; // both
+    std::uint32_t dir = 2;
     if (params.contains("direction")) {
         std::string ds = params["direction"].get<std::string>();
         if (ds == "in" || ds == "inbound") dir = 0;
@@ -16113,7 +16107,7 @@ tool_result_t driver_reassemble_stream(const json& params)
     std::transform(operation.begin(), operation.end(), operation.begin(),
         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-    std::uint32_t op_code = 3; // list
+    std::uint32_t op_code = 3;
     if (operation == "start") op_code = 0;
     else if (operation == "stop") op_code = 1;
     else if (operation == "get" || operation == "get_data") op_code = 2;
@@ -16138,7 +16132,7 @@ tool_result_t driver_reassemble_stream(const json& params)
     if (truncated) result["truncated"] = true;
     if (!data.empty()) {
         result["stream_size"] = data.size();
-        // Provide hex preview (first 256 bytes)
+
         std::string hex;
         size_t preview = (data.size() > 256) ? 256 : data.size();
         for (size_t i = 0; i < preview; i++) {
@@ -16147,7 +16141,7 @@ tool_result_t driver_reassemble_stream(const json& params)
             hex += buf;
         }
         result["hex_preview"] = hex;
-        // Try ASCII
+
         std::string ascii;
         for (size_t i = 0; i < preview; i++)
             ascii += (data[i] >= 0x20 && data[i] < 0x7f) ? static_cast<char>(data[i]) : '.';
@@ -16484,7 +16478,7 @@ tool_result_t driver_export_pcap(const json& params)
     bool ok = device->export_pcap(filter_pid, filter_proto, max_packets, &pcap);
     if (!ok) return tool_result_t::error(OBFSTR("PCAP export failed"));
 
-    // If output_path specified, write to file
+
     if (params.contains("output_path")) {
         std::string path = params["output_path"].get<std::string>();
         FILE* fp = qfopen(path.c_str(), "wb");
@@ -16553,7 +16547,7 @@ tool_result_t driver_network_fingerprint(const json& params)
                   : tool_result_t::error(OBFSTR("Failed to disable fingerprinting"));
     }
 
-    // Default: get results
+
     auto fps = device->get_fingerprints();
     if (fps.empty())
         return tool_result_t::ok(OBFSTR("No fingerprint results"), json::object());
@@ -17050,7 +17044,6 @@ void register_tools()
           OBFSTR("The action ID returned by driver_defer_action"), true}},
         driver_get_deferred_results, false});
 
-    // ---- Advanced network recon tools ----
 
     registry.register_tool({
         OBFSTR("driver_enumerate_wfp_callouts"), OBFSTR("driver"),
@@ -17119,7 +17112,6 @@ void register_tools()
           OBFSTR("Optional: 'tcp', 'udp', or protocol number (0 = all)"), false}},
         driver_dump_tcpip_connections, true});
 
-    // ---- MITM / Deep Packet Inspection / Interception tools ----
 
     registry.register_tool({
         OBFSTR("driver_inject_packet"), OBFSTR("driver"),
@@ -17861,9 +17853,6 @@ void register_tools()
 
 }
 
-// ============================================================
-// Network capture / interception tools
-// ============================================================
 
 namespace network_tools
 {
@@ -17872,7 +17861,7 @@ using json = nlohmann::json;
 
 static std::string format_ip(const std::uint8_t* addr, std::uint32_t af) {
     char buf[64] = {};
-    if (af == 23) { // AF_INET6
+    if (af == 23) {
         qsnprintf(buf, sizeof(buf), "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
             addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
             addr[8], addr[9], addr[10], addr[11], addr[12], addr[13], addr[14], addr[15]);
@@ -18072,7 +18061,7 @@ tool_result_t network_analyze_packet(const json& params)
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
-    // Get one packet and provide deep analysis
+
     auto packets = device->get_captured_packets(1);
     if (packets.empty())
         return tool_result_t::error(OBFSTR("No packets available. Start capture first."));
@@ -18093,7 +18082,7 @@ tool_result_t network_analyze_packet(const json& params)
         result["hex_dump"] = hex_dump(p.payload.data(), p.payload.size(), 512);
         result["ascii_render"] = extract_ascii(p.payload.data(), p.payload.size());
 
-        // Try to detect protocol
+
         if (p.payload.size() >= 4) {
             std::string first4((const char*)p.payload.data(), std::min(p.payload.size(), (std::size_t)4));
             if (first4 == "GET " || first4 == "POST" || first4 == "HEAD" || first4 == "PUT " ||
@@ -18146,7 +18135,7 @@ tool_result_t network_dns_log(const json& params)
             entry["resolved_address"] = format_ip(e.resolved_addr, (e.query_type == 28) ? 23u : 2u);
         }
 
-        // DNS query type names
+
         switch (e.query_type) {
             case 1: entry["type_name"] = "A"; break;
             case 28: entry["type_name"] = "AAAA"; break;
@@ -18172,8 +18161,8 @@ tool_result_t network_add_filter(const json& params)
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
-    std::uint32_t action = 2; // default: log
-    std::uint32_t direction = 2; // default: both
+    std::uint32_t action = 2;
+    std::uint32_t direction = 2;
     std::uint32_t protocol = 0, pid = 0, port = 0;
     std::uint8_t ip_addr[16] = {}, ip_mask[16] = {};
 
@@ -18370,9 +18359,6 @@ tool_result_t network_block_process(const json& params)
     return tool_result_t::ok(OBFSTR("All network traffic blocked for PID ") + std::to_string(pid), result);
 }
 
-// ============================================================
-// Protocol analysis helpers (usermode dissection)
-// ============================================================
 
 struct parsed_http_msg_t {
     bool is_request = false;
@@ -18645,9 +18631,6 @@ static std::string format_ipv4_bytes(const std::uint8_t* ip) {
     return buf;
 }
 
-// ============================================================
-// Advanced network agent tools
-// ============================================================
 
 tool_result_t network_deep_inspect(const json& params)
 {
@@ -19206,7 +19189,7 @@ tool_result_t network_release_packet(const json& params)
 
     std::uint64_t hold_id = params["hold_id"].get<std::uint64_t>();
     std::vector<std::uint8_t> modify_payload;
-    std::uint32_t operation = 3; // release
+    std::uint32_t operation = 3;
 
     if (params.contains("action") && params["action"].is_string()) {
         std::string act = params["action"].get<std::string>();
@@ -19820,10 +19803,7 @@ void register_tools()
 
 }
 
-// ============================================================
-// Net Security Tools (TLS key extraction, cert injection,
-// cert pin bypass, QUIC, DTLS, AutoResponder)
-// ============================================================
+
 namespace net_security_tools {
 
 #ifdef __NT__
@@ -19858,11 +19838,10 @@ static std::vector<std::uint8_t> ns_hex_to_bytes(const std::string& hex) {
 }
 
 static std::string ns_get_downloads_folder() {
-    char path[MAX_PATH] = {};
-    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_PROFILE, nullptr, 0, path))) {
-        std::string result = std::string(path) + "\\Downloads";
-        return result;
-    }
+    char buf[MAX_PATH] = {};
+    DWORD len = GetEnvironmentVariableA("USERPROFILE", buf, MAX_PATH);
+    if (len > 0 && len < MAX_PATH)
+        return std::string(buf, len) + "\\Downloads";
     return ".";
 }
 
@@ -20303,7 +20282,7 @@ tool_result_t autoresponder_export_rules(const json&) {
 }
 
 #else
-// Non-Windows stubs
+
 tool_result_t tls_extract_keys(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t tls_start_keylog(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t tls_stop_keylog(const json&) { return tool_result_t::error("Not supported on this platform"); }
@@ -20515,7 +20494,7 @@ void register_tools() {
         autoresponder_export_rules, true});
 }
 
-} // namespace net_security_tools
+}
 
 void initialize_all_tools()
 {
@@ -20558,7 +20537,7 @@ void initialize_all_tools()
             request.task = params.value("task", "");
             request.label = params.value("label", "");
 
-            // Handle targetInstance: AI may pass a string or a JSON object
+
             if (params.contains("targetInstance"))
             {
                 const auto& ti = params["targetInstance"];

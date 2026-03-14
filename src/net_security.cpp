@@ -12,9 +12,6 @@ extern std::unique_ptr<voyager::device_t> device;
 
 using json = nlohmann::json;
 
-// ============================================================
-// Utility Helpers
-// ============================================================
 
 static std::string bytes_to_hex(const std::uint8_t* data, std::size_t len) {
     std::string result;
@@ -77,20 +74,17 @@ static bool all_zero(const std::uint8_t* data, std::size_t len) {
 static bool looks_like_random(const std::uint8_t* data, std::size_t len) {
     if (len < 16) return false;
     if (all_zero(data, len)) return false;
-    // Check entropy: count unique bytes
+
     std::uint32_t histogram[256] = {};
     for (std::size_t i = 0; i < len; i++)
         histogram[data[i]]++;
     std::uint32_t unique_count = 0;
     for (auto& h : histogram)
         if (h > 0) unique_count++;
-    // Random 32-byte data should have >16 unique byte values
+
     return unique_count >= (len / 3);
 }
 
-// ============================================================
-// TLS Key Extractor Implementation
-// ============================================================
 
 namespace net_security {
 
@@ -103,18 +97,18 @@ bool TlsKeyExtractor::find_module_in_process(std::uint32_t pid, const char* modu
                                                std::uint64_t& base, std::uint32_t& size) {
     if (!device || !device->is_connected()) return false;
 
-    // Save current state
+
     std::uint32_t saved_pid = device->get_process_id();
     std::uint64_t saved_base = device->get_base_address();
 
-    // Temporarily attach to target
+
     std::uint32_t actual_pid = (pid == 0) ? saved_pid : pid;
     if (actual_pid == 0) return false;
 
     device->set_process_id(actual_pid);
     device->solve_dtb();
 
-    // Read PEB to find module list
+
     voyager::device_t::peb_info peb{};
     if (!device->read_peb(peb) || peb.ldr_address == 0) {
         device->set_process_id(saved_pid);
@@ -122,9 +116,9 @@ bool TlsKeyExtractor::find_module_in_process(std::uint32_t pid, const char* modu
         return false;
     }
 
-    // Walk InMemoryOrderModuleList: PEB_LDR_DATA->InMemoryOrderModuleList at offset 0x20
+
     std::uint64_t ldr_data = peb.ldr_address;
-    std::uint64_t list_head = ldr_data + 0x20; // InMemoryOrderModuleList
+    std::uint64_t list_head = ldr_data + 0x20;
 
     std::uint8_t flink_buf[8] = {};
     if (device->read_raw(list_head, flink_buf, 8) != 8) {
@@ -138,8 +132,8 @@ bool TlsKeyExtractor::find_module_in_process(std::uint32_t pid, const char* modu
 
     bool found = false;
     for (int i = 0; i < 512 && current != 0 && current != list_head; i++) {
-        // LDR_DATA_TABLE_ENTRY: InMemoryOrderLinks is at offset 0
-        // DllBase at offset 0x30 (from start of entry, which is 0x10 before InMemoryOrderLinks)
+
+
         std::uint64_t entry_start = current - 0x10;
 
         std::uint8_t entry_buf[0x70] = {};
@@ -149,7 +143,7 @@ bool TlsKeyExtractor::find_module_in_process(std::uint32_t pid, const char* modu
         std::uint64_t dll_base = *reinterpret_cast<std::uint64_t*>(entry_buf + 0x30);
         std::uint32_t image_size = *reinterpret_cast<std::uint32_t*>(entry_buf + 0x40);
 
-        // BaseDllName UNICODE_STRING at offset 0x58
+
         std::uint16_t name_len = *reinterpret_cast<std::uint16_t*>(entry_buf + 0x58);
         std::uint64_t name_ptr = *reinterpret_cast<std::uint64_t*>(entry_buf + 0x60);
 
@@ -170,7 +164,7 @@ bool TlsKeyExtractor::find_module_in_process(std::uint32_t pid, const char* modu
             }
         }
 
-        // Follow Flink
+
         std::uint8_t next_buf[8] = {};
         if (device->read_raw(current, next_buf, 8) != 8) break;
         std::uint64_t next = *reinterpret_cast<std::uint64_t*>(next_buf);
@@ -191,7 +185,7 @@ std::vector<std::uint64_t> TlsKeyExtractor::scan_for_pattern(
     std::vector<std::uint64_t> results;
     if (!device || !device->is_connected() || pattern_len == 0 || size == 0) return results;
 
-    constexpr std::size_t CHUNK = 0x10000; // 64KB chunks
+    constexpr std::size_t CHUNK = 0x10000;
     std::vector<std::uint8_t> buffer(CHUNK + pattern_len);
 
     std::uint32_t saved_pid = device->get_process_id();
@@ -212,7 +206,7 @@ std::vector<std::uint64_t> TlsKeyExtractor::scan_for_pattern(
         for (std::size_t i = 0; i <= actual - pattern_len; i++) {
             bool match = true;
             for (std::size_t j = 0; j < pattern_len; j++) {
-                if (mask && mask[j] == 0) continue; // wildcard
+                if (mask && mask[j] == 0) continue;
                 if (buffer[i + j] != pattern[j]) { match = false; break; }
             }
             if (match) {
@@ -252,9 +246,6 @@ bool TlsKeyExtractor::validate_master_secret(const std::uint8_t* data, std::size
     return (len == 48 || len == 32 || len == 64) && looks_like_random(data, len);
 }
 
-// ============================================================
-// SChannel Key Extraction
-// ============================================================
 
 std::vector<tls_session_key_t> TlsKeyExtractor::scan_schannel(std::uint32_t pid) {
     std::vector<tls_session_key_t> keys;
@@ -263,22 +254,16 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_schannel(std::uint32_t pid)
     std::uint64_t schannel_base = 0;
     std::uint32_t schannel_size = 0;
 
-    // SChannel stores TLS state in ncrypt/schannel.dll
+
     if (!find_module_in_process(pid, "schannel.dll", schannel_base, schannel_size))
         return keys;
 
-    // Scan for NCRYPT_SSL_KEY structures
-    // SChannel's internal SSL_SESSION_CACHE stores master secrets alongside client randoms.
-    // The session cache uses a hash table keyed by session ID.
-    // We scan the process heap for the pattern: 32-byte client_random followed by 48-byte master_secret
-    // These appear in contiguous memory in SChannel's SecPkgContext_EapPrfInfo and internal caches.
 
-    // Also scan ncrypt.dll data sections for SslGenerateSessionKeys output
     std::uint64_t ncrypt_base = 0;
     std::uint32_t ncrypt_size = 0;
     find_module_in_process(pid, "ncrypt.dll", ncrypt_base, ncrypt_size);
 
-    // Enumerate memory regions of the process and scan heap regions
+
     std::uint32_t saved_pid = device->get_process_id();
     device->set_process_id(pid);
     device->solve_dtb();
@@ -286,12 +271,12 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_schannel(std::uint32_t pid)
     auto regions = device->enumerate_memory_regions(0, 0x7FFFFFFFFFFF, false);
 
     for (const auto& region : regions) {
-        // Only scan committed, readable, private memory (heap)
-        if (region.state != 0x1000) continue; // MEM_COMMIT
-        if (region.size > 0x1000000) continue; // skip huge regions (>16MB)
-        if (region.size < 80) continue; // need at least client_random + master_secret
 
-        // Read the region in chunks and scan for TLS key material
+        if (region.state != 0x1000) continue;
+        if (region.size > 0x1000000) continue;
+        if (region.size < 80) continue;
+
+
         constexpr std::size_t CHUNK = 0x10000;
         std::vector<std::uint8_t> buf(CHUNK);
 
@@ -304,38 +289,35 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_schannel(std::uint32_t pid)
             std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
             if (actual < 80) continue;
 
-            // Scan for client_random (32 bytes of high-entropy data) followed within
-            // a small window by a 48-byte master secret
+
             for (std::size_t i = 0; i + 80 <= actual; i++) {
                 const std::uint8_t* candidate_cr = buf.data() + i;
                 if (!looks_like_random(candidate_cr, 32)) continue;
 
-                // Check for master secret at various offsets after client_random
-                // SChannel typically stores them at +32 or +40 offset
+
                 for (std::size_t secret_offset : {32ULL, 40ULL, 48ULL}) {
                     if (i + secret_offset + 48 > actual) break;
                     const std::uint8_t* candidate_ms = buf.data() + i + secret_offset;
                     if (!looks_like_random(candidate_ms, 48)) continue;
 
-                    // Verify this isn't just random heap garbage by checking
-                    // surrounding memory for SChannel markers
+
                     tls_session_key_t key;
                     key.label = "CLIENT_RANDOM";
                     key.client_random.assign(candidate_cr, candidate_cr + 32);
                     key.secret.assign(candidate_ms, candidate_ms + 48);
-                    key.tls_version = 0x0303; // assume TLS 1.2 for SChannel
+                    key.tls_version = 0x0303;
                     key.timestamp = get_timestamp_ms();
                     key.pid = pid;
                     key.library = "SChannel";
 
-                    // Dedup
+
                     std::string cr_hex = bytes_to_hex(candidate_cr, 32);
                     if (_seen_keys.find(cr_hex) == _seen_keys.end()) {
                         _seen_keys[cr_hex] = key;
                         keys.push_back(key);
                     }
 
-                    i += secret_offset + 48 - 1; // skip past this match
+                    i += secret_offset + 48 - 1;
                     break;
                 }
 
@@ -349,46 +331,26 @@ schannel_done:
     return keys;
 }
 
-// ============================================================
-// OpenSSL Key Extraction
-// ============================================================
 
 std::vector<tls_session_key_t> TlsKeyExtractor::scan_openssl(std::uint32_t pid) {
     std::vector<tls_session_key_t> keys;
     if (!device || !device->is_connected()) return keys;
 
-    // OpenSSL stores session keys in SSL_SESSION structures:
-    // SSL_SESSION {
-    //   ...
-    //   unsigned char master_key[SSL_MAX_MASTER_KEY_LENGTH]; // 48 bytes, at varying offset
-    //   size_t master_key_length;  // should be 48
-    //   ...
-    //   unsigned char session_id[SSL_MAX_SSL_SESSION_ID_LENGTH]; // 32 bytes
-    //   unsigned int session_id_length;
-    // }
-    //
-    // For TLS 1.3, keys are in SSL->s3->client_random + SSL->session->master_key
-    //
-    // We scan for OpenSSL structures by looking for:
-    // 1. The SSL_SESSION vtable/type marker
-    // 2. Pattern: master_key_length == 48 followed by 48 bytes of high-entropy data
 
     std::uint64_t libssl_base = 0, libcrypto_base = 0;
     std::uint32_t libssl_size = 0, libcrypto_size = 0;
 
-    // OpenSSL can be statically linked or dynamically loaded
+
     bool has_libssl = find_module_in_process(pid, "libssl", libssl_base, libssl_size) ||
                       find_module_in_process(pid, "ssleay32", libssl_base, libssl_size) ||
                       find_module_in_process(pid, "ssl-3", libssl_base, libssl_size);
 
     if (!has_libssl) {
-        // Try common OpenSSL DLL names
+
         has_libssl = find_module_in_process(pid, "libssl-1_1", libssl_base, libssl_size) ||
                      find_module_in_process(pid, "libssl-3", libssl_base, libssl_size);
     }
 
-    // Even without libssl DLL, the application may statically link OpenSSL.
-    // We do heap scanning as a fallback regardless.
 
     std::uint32_t saved_pid = device->get_process_id();
     device->set_process_id(pid);
@@ -396,10 +358,8 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_openssl(std::uint32_t pid) 
 
     auto regions = device->enumerate_memory_regions(0, 0x7FFFFFFFFFFF, false);
 
-    // OpenSSL SSL_SESSION pattern scan:
-    // Look for master_key_length field (value 48 = 0x30) as uint32_t or size_t,
-    // preceded by 48 bytes of master key data
-    const std::uint8_t mk_len_pattern[] = { 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }; // size_t 48
+
+    const std::uint8_t mk_len_pattern[] = { 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
     for (const auto& region : regions) {
         if (region.state != 0x1000) continue;
@@ -418,20 +378,15 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_openssl(std::uint32_t pid) 
             if (actual < 128) continue;
 
             for (std::size_t i = 48; i + 56 <= actual; i++) {
-                // Check for master_key_length = 48 (as size_t, little-endian)
+
                 std::uint64_t val64 = *reinterpret_cast<std::uint64_t*>(buf.data() + i);
                 if (val64 != 48) continue;
 
-                // Master key should be at [i-48..i)
+
                 const std::uint8_t* candidate_ms = buf.data() + i - 48;
                 if (!looks_like_random(candidate_ms, 48)) continue;
 
-                // Now find client_random: in OpenSSL 1.1+, SSL->s3->client_random is
-                // at a fixed offset. We search nearby memory for a 32-byte random value.
-                // The SSL structure has a pointer to SSL_SESSION, and s3->client_random
-                // is typically within the same heap page.
 
-                // Try to find client_random by scanning backward from the master secret
                 bool found_cr = false;
                 for (int cr_offset = -256; cr_offset < 0; cr_offset += 8) {
                     std::int64_t cr_pos = static_cast<std::int64_t>(i) - 48 + cr_offset;
@@ -458,9 +413,9 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_openssl(std::uint32_t pid) 
                 }
 
                 if (!found_cr) {
-                    // Store with empty client_random - user can correlate via packet capture
+
                     tls_session_key_t key;
-                    key.label = "RSA"; // RSA premaster potentially
+                    key.label = "RSA";
                     key.secret.assign(candidate_ms, candidate_ms + 48);
                     key.tls_version = 0x0303;
                     key.timestamp = get_timestamp_ms();
@@ -479,18 +434,11 @@ openssl_done:
     return keys;
 }
 
-// ============================================================
-// NSS (Firefox) Key Extraction
-// ============================================================
 
 std::vector<tls_session_key_t> TlsKeyExtractor::scan_nss(std::uint32_t pid) {
     std::vector<tls_session_key_t> keys;
     if (!device || !device->is_connected()) return keys;
 
-    // NSS stores session secrets in sslSessionID structures within nss3.dll / ssl3.dll
-    // The SSLKEYLOGFILE callback in NSS writes:
-    //   CLIENT_RANDOM <hex_client_random> <hex_master_secret>
-    // NSS also uses NSPR.
 
     std::uint64_t nss_base = 0;
     std::uint32_t nss_size = 0;
@@ -498,12 +446,8 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_nss(std::uint32_t pid) {
     bool has_nss = find_module_in_process(pid, "nss3.dll", nss_base, nss_size) ||
                    find_module_in_process(pid, "ssl3.dll", nss_base, nss_size);
 
-    if (!has_nss) return keys; // NSS not loaded
+    if (!has_nss) return keys;
 
-    // NSS sslSessionID has:
-    //   PRUint8 masterSecret[48]
-    //   PRUint8 clientRandom[32] (from ssl3CipherSpec)
-    // We use the same heap scanning approach
 
     std::uint32_t saved_pid = device->get_process_id();
     device->set_process_id(pid);
@@ -527,7 +471,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_nss(std::uint32_t pid) {
             std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
             if (actual < 80) continue;
 
-            // NSS stores master_secret then client_random in sslSessionID
+
             for (std::size_t i = 0; i + 80 <= actual; i++) {
                 const std::uint8_t* candidate_ms = buf.data() + i;
                 const std::uint8_t* candidate_cr = buf.data() + i + 48;
@@ -551,7 +495,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_nss(std::uint32_t pid) {
                 }
 
                 if (keys.size() >= 64) goto nss_done;
-                i += 79; // skip past match
+                i += 79;
             }
         }
     }
@@ -561,30 +505,11 @@ nss_done:
     return keys;
 }
 
-// ============================================================
-// BoringSSL (Chrome/Edge) Key Extraction
-// ============================================================
 
 std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid) {
     std::vector<tls_session_key_t> keys;
     if (!device || !device->is_connected()) return keys;
 
-    // BoringSSL (used by Chrome/Edge/Chromium) stores TLS secrets in:
-    // SSL3_STATE->client_random (32 bytes)
-    // and derived traffic secrets for TLS 1.3.
-    // Chrome exports SSLKEYLOGFILE keys via its internal callback.
-    //
-    // Structure layout (BoringSSL):
-    // struct SSL3_STATE {
-    //   uint8_t client_random[32];   // at offset 0
-    //   uint8_t server_random[32];   // at offset 32
-    //   bool have_version;           // at offset 64
-    //   uint16_t version;            // at offset 66
-    //   ...
-    // }
-    //
-    // We scan for client_random + server_random pattern (64 bytes of entropy)
-    // followed by a valid TLS version number.
 
     std::uint64_t chrome_base = 0;
     std::uint32_t chrome_size = 0;
@@ -623,21 +548,17 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
                 if (!looks_like_random(candidate_cr, 32)) continue;
                 if (!looks_like_random(candidate_sr, 32)) continue;
 
-                // Check for TLS version after server_random
+
                 std::uint16_t ver = 0;
                 if (i + 66 < actual) {
                     ver = *reinterpret_cast<std::uint16_t*>(buf.data() + i + 66);
-                    // Valid TLS versions: 0x0301, 0x0302, 0x0303, 0x0304
+
                     if (ver < 0x0301 || ver > 0x0304) continue;
                 } else {
                     continue;
                 }
 
-                // Found a candidate SSL3_STATE. Now look for the master secret
-                // in a nearby SSL_SESSION structure. The SSL object has a pointer to session.
-                // In BoringSSL, the master_key is also inline in SSL_SESSION->secret (48 bytes)
 
-                // Search forward from this point for a 48-byte entropy block
                 for (std::size_t ms_off = 128; ms_off < 1024 && i + ms_off + 48 <= actual; ms_off += 8) {
                     const std::uint8_t* candidate_ms = buf.data() + i + ms_off;
                     if (!looks_like_random(candidate_ms, 48)) continue;
@@ -660,7 +581,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
                 }
 
                 if (keys.size() >= 64) goto boringssl_done;
-                i += 67; // skip past version check area
+                i += 67;
             }
         }
     }
@@ -670,9 +591,6 @@ boringssl_done:
     return keys;
 }
 
-// ============================================================
-// Generic Pattern Scanning for TLS 1.3 Secrets
-// ============================================================
 
 std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint32_t pid) {
     std::vector<tls_session_key_t> keys;
@@ -684,18 +602,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
 
     auto regions = device->enumerate_memory_regions(0, 0x7FFFFFFFFFFF, false);
 
-    // TLS 1.3 uses derived secrets:
-    // CLIENT_HANDSHAKE_TRAFFIC_SECRET (32 bytes for SHA-256 or 48 for SHA-384)
-    // SERVER_HANDSHAKE_TRAFFIC_SECRET
-    // CLIENT_TRAFFIC_SECRET_0
-    // SERVER_TRAFFIC_SECRET_0
-    // EXPORTER_SECRET
-    //
-    // These are stored adjacent to client_random in many implementations.
-    // We also look for the SSLKEYLOGFILE format strings in memory.
 
-    // Search for literal SSLKEYLOGFILE format strings already in process memory
-    // (some libraries cache the keylog output)
     const char* keylog_prefix = "CLIENT_RANDOM ";
     const std::uint8_t* pattern = reinterpret_cast<const std::uint8_t*>(keylog_prefix);
     std::size_t pattern_len = 14;
@@ -716,7 +623,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
             std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
             if (actual < 128) continue;
 
-            // Look for "CLIENT_RANDOM " text in memory
+
             for (std::size_t i = 0; i + pattern_len + 64 + 1 + 96 < actual; i++) {
                 bool prefix_match = true;
                 for (std::size_t j = 0; j < pattern_len; j++) {
@@ -724,9 +631,9 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
                 }
                 if (!prefix_match) continue;
 
-                // Parse: CLIENT_RANDOM <64 hex chars> <96 hex chars>\n
+
                 std::size_t pos = i + pattern_len;
-                // Read 64 hex chars (32 bytes = client_random)
+
                 std::string cr_hex_str;
                 while (pos < actual && cr_hex_str.size() < 64) {
                     char c = static_cast<char>(buf[pos]);
@@ -737,10 +644,10 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
                 }
                 if (cr_hex_str.size() != 64) continue;
 
-                // Skip whitespace
+
                 while (pos < actual && (buf[pos] == ' ' || buf[pos] == '\t')) pos++;
 
-                // Read 96 hex chars (48 bytes = master secret)
+
                 std::string ms_hex_str;
                 while (pos < actual && ms_hex_str.size() < 96) {
                     char c = static_cast<char>(buf[pos]);
@@ -749,7 +656,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
                     else break;
                     pos++;
                 }
-                if (ms_hex_str.size() < 64) continue; // at least 32 bytes
+                if (ms_hex_str.size() < 64) continue;
 
                 tls_session_key_t key;
                 key.label = "CLIENT_RANDOM";
@@ -768,7 +675,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
                 if (keys.size() >= 64) goto generic_done;
             }
 
-            // Also look for TLS 1.3 labels in memory
+
             static const char* tls13_labels[] = {
                 "CLIENT_HANDSHAKE_TRAFFIC_SECRET ",
                 "SERVER_HANDSHAKE_TRAFFIC_SECRET ",
@@ -810,11 +717,11 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
                     if (secret_hex_str.size() < 64) continue;
 
                     tls_session_key_t key;
-                    // Trim trailing space from label
+
                     key.label = std::string(label, label_len - 1);
                     key.client_random = hex_to_bytes(cr_hex_str);
                     key.secret = hex_to_bytes(secret_hex_str);
-                    key.tls_version = 0x0304; // TLS 1.3
+                    key.tls_version = 0x0304;
                     key.timestamp = get_timestamp_ms();
                     key.pid = pid;
                     key.library = "KeylogBuffer";
@@ -836,9 +743,6 @@ generic_done:
     return keys;
 }
 
-// ============================================================
-// Main Extract Keys Entry Point
-// ============================================================
 
 std::vector<tls_session_key_t> TlsKeyExtractor::extract_keys(const tls_key_scan_config_t& config) {
     std::lock_guard<std::mutex> lock(_mutex);
@@ -866,22 +770,19 @@ std::vector<tls_session_key_t> TlsKeyExtractor::extract_keys(const tls_key_scan_
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
 
-    // Always scan for generic patterns (cached keylog strings in memory)
+
     if (all_keys.size() < config.max_results) {
         auto keys = scan_generic_patterns(pid);
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
 
-    // Truncate to max
+
     if (all_keys.size() > config.max_results)
         all_keys.resize(config.max_results);
 
     return all_keys;
 }
 
-// ============================================================
-// QUIC Key Extraction
-// ============================================================
 
 std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pid) {
     std::vector<quic_key_info_t> keys;
@@ -890,22 +791,12 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
     if (pid == 0) pid = device->get_process_id();
     if (pid == 0) return keys;
 
-    // QUIC implementations (msquic, Chrome/BoringSSL QUIC, etc.) use TLS 1.3 internally.
-    // The key material is the same TLS 1.3 secrets:
-    //   CLIENT_HANDSHAKE_TRAFFIC_SECRET
-    //   SERVER_HANDSHAKE_TRAFFIC_SECRET
-    //   CLIENT_TRAFFIC_SECRET_0
-    //   SERVER_TRAFFIC_SECRET_0
-    //
-    // Additionally, QUIC has QUIC-specific key derivation from these secrets.
-    // msquic.dll stores connection state in QUIC_CONNECTION structures.
 
-    // Check for msquic.dll (Windows QUIC implementation)
     std::uint64_t msquic_base = 0;
     std::uint32_t msquic_size = 0;
     bool has_msquic = find_module_in_process(pid, "msquic.dll", msquic_base, msquic_size);
 
-    // Scan process memory for QUIC keylog labels
+
     std::uint32_t saved_pid = device->get_process_id();
     device->set_process_id(pid);
     device->solve_dtb();
@@ -990,9 +881,6 @@ quic_done:
     return keys;
 }
 
-// ============================================================
-// DTLS Key Extraction
-// ============================================================
 
 std::vector<dtls_key_info_t> TlsKeyExtractor::extract_dtls_keys(std::uint32_t pid) {
     std::vector<dtls_key_info_t> keys;
@@ -1001,10 +889,6 @@ std::vector<dtls_key_info_t> TlsKeyExtractor::extract_dtls_keys(std::uint32_t pi
     if (pid == 0) pid = device->get_process_id();
     if (pid == 0) return keys;
 
-    // DTLS keys follow the same TLS key derivation but with DTLS-specific structures.
-    // OpenSSL's DTLS uses SSL_SESSION with the same master_key layout.
-    // We look for DTLS version markers (0xFEFF = DTLS 1.0, 0xFEFD = DTLS 1.2)
-    // adjacent to session key material.
 
     std::uint32_t saved_pid = device->get_process_id();
     device->set_process_id(pid);
@@ -1029,11 +913,11 @@ std::vector<dtls_key_info_t> TlsKeyExtractor::extract_dtls_keys(std::uint32_t pi
             if (actual < 128) continue;
 
             for (std::size_t i = 0; i + 128 <= actual; i += 8) {
-                // Look for DTLS version bytes
+
                 std::uint16_t ver = (static_cast<std::uint16_t>(buf[i]) << 8) | buf[i + 1];
                 if (ver != 0xFEFF && ver != 0xFEFD) continue;
 
-                // Search nearby for client_random + master_secret pattern
+
                 for (int search_off = -128; search_off < 128; search_off += 8) {
                     std::int64_t cr_pos = static_cast<std::int64_t>(i) + search_off;
                     if (cr_pos < 0 || cr_pos + 80 > static_cast<std::int64_t>(actual)) continue;
@@ -1065,9 +949,6 @@ dtls_done:
     return keys;
 }
 
-// ============================================================
-// SSLKEYLOGFILE Writer
-// ============================================================
 
 bool TlsKeyExtractor::write_keylog_file(const std::string& path,
                                           const std::vector<tls_session_key_t>& keys, bool append) {
@@ -1080,7 +961,7 @@ bool TlsKeyExtractor::write_keylog_file(const std::string& path,
     for (const auto& key : keys) {
         if (key.client_random.empty() || key.secret.empty()) continue;
 
-        // Format: <label> <hex_client_random> <hex_secret>
+
         file << key.label << " "
              << bytes_to_hex(key.client_random.data(), key.client_random.size()) << " "
              << bytes_to_hex(key.secret.data(), key.secret.size()) << "\n";
@@ -1125,9 +1006,6 @@ bool TlsKeyExtractor::stop_keylog() {
     return true;
 }
 
-// ============================================================
-// Certificate Injector Implementation
-// ============================================================
 
 CertificateInjector& CertificateInjector::instance() {
     static CertificateInjector inst;
@@ -1142,7 +1020,7 @@ cert_injection_result_t CertificateInjector::inject_certificate(const cert_injec
     if (!config.cert_der.empty()) {
         cert_data = config.cert_der;
     } else if (!config.cert_pem.empty()) {
-        // Decode PEM to DER
+
         DWORD der_size = 0;
         if (!CryptStringToBinaryA(config.cert_pem.c_str(), static_cast<DWORD>(config.cert_pem.size()),
                                   CRYPT_STRING_BASE64HEADER, nullptr, &der_size, nullptr, nullptr) || der_size == 0) {
@@ -1161,7 +1039,7 @@ cert_injection_result_t CertificateInjector::inject_certificate(const cert_injec
         return result;
     }
 
-    // Create a certificate context from the DER data
+
     PCCERT_CONTEXT cert_ctx = CertCreateCertificateContext(
         X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
         cert_data.data(), static_cast<DWORD>(cert_data.size()));
@@ -1170,25 +1048,25 @@ cert_injection_result_t CertificateInjector::inject_certificate(const cert_injec
         return result;
     }
 
-    // Compute SHA-1 thumbprint
+
     BYTE thumb[20] = {};
     DWORD thumb_size = 20;
     CryptHashCertificate(0, CALG_SHA1, 0, cert_ctx->pbCertEncoded,
                          cert_ctx->cbCertEncoded, thumb, &thumb_size);
     result.thumbprint = bytes_to_hex_upper(thumb, thumb_size);
 
-    // Get subject CN
+
     char subject_buf[256] = {};
     CertGetNameStringA(cert_ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr,
                        subject_buf, sizeof(subject_buf));
     result.subject_cn = subject_buf;
 
-    // Determine store name
+
     std::string store_name = config.store_name.empty() ? "ROOT" : config.store_name;
     std::wstring store_name_w(store_name.begin(), store_name.end());
     result.store_name = store_name;
 
-    // Open the certificate store
+
     DWORD store_flags = config.system_wide ?
         CERT_SYSTEM_STORE_LOCAL_MACHINE : CERT_SYSTEM_STORE_CURRENT_USER;
 
@@ -1198,7 +1076,7 @@ cert_injection_result_t CertificateInjector::inject_certificate(const cert_injec
         store_name_w.c_str());
 
     if (!hStore) {
-        // Try to create the store
+
         hStore = CertOpenStore(
             CERT_STORE_PROV_SYSTEM_W, 0, 0,
             store_flags, store_name_w.c_str());
@@ -1210,7 +1088,7 @@ cert_injection_result_t CertificateInjector::inject_certificate(const cert_injec
         return result;
     }
 
-    // Add the certificate to the store
+
     if (CertAddCertificateContextToStore(hStore, cert_ctx,
                                          CERT_STORE_ADD_REPLACE_EXISTING, nullptr)) {
         result.success = true;
@@ -1247,7 +1125,7 @@ bool CertificateInjector::remove_certificate(const std::string& thumbprint, cons
     bool removed = false;
     if (found) {
         removed = CertDeleteCertificateFromStore(found) != 0;
-        // Note: CertDeleteCertificateFromStore frees the context
+
     }
 
     CertCloseStore(hStore, 0);
@@ -1268,21 +1146,21 @@ bool CertificateInjector::generate_ca_certificate(const std::string& cn, std::ui
     HCRYPTPROV hProv = 0;
     HCRYPTKEY hKey = 0;
 
-    // Create an in-memory key container
+
     std::string container_name = "AiDA_CA_" + std::to_string(GetTickCount64());
     if (!CryptAcquireContextA(&hProv, container_name.c_str(), nullptr,
                                PROV_RSA_FULL, CRYPT_NEWKEYSET)) {
         return false;
     }
 
-    // Generate 2048-bit RSA key pair
+
     if (!CryptGenKey(hProv, AT_SIGNATURE, (2048u << 16) | CRYPT_EXPORTABLE, &hKey)) {
         CryptReleaseContext(hProv, 0);
         CryptAcquireContextA(&hProv, container_name.c_str(), nullptr, PROV_RSA_FULL, CRYPT_DELETEKEYSET);
         return false;
     }
 
-    // Build subject name
+
     std::string subject = "CN=" + cn;
     DWORD encoded_size = 0;
     CertStrToNameA(X509_ASN_ENCODING, subject.c_str(), CERT_X500_NAME_STR,
@@ -1295,7 +1173,7 @@ bool CertificateInjector::generate_ca_certificate(const std::string& cn, std::ui
     name_blob.cbData = encoded_size;
     name_blob.pbData = encoded_name.data();
 
-    // Set up time validity
+
     SYSTEMTIME now_sys, expiry_sys;
     GetSystemTime(&now_sys);
     FILETIME ft;
@@ -1308,7 +1186,7 @@ bool CertificateInjector::generate_ca_certificate(const std::string& cn, std::ui
     ft.dwHighDateTime = ul.HighPart;
     FileTimeToSystemTime(&ft, &expiry_sys);
 
-    // Create self-signed certificate
+
     CRYPT_KEY_PROV_INFO kpi = {};
     std::wstring container_w(container_name.begin(), container_name.end());
     kpi.pwszContainerName = const_cast<wchar_t*>(container_w.c_str());
@@ -1318,7 +1196,7 @@ bool CertificateInjector::generate_ca_certificate(const std::string& cn, std::ui
     CRYPT_ALGORITHM_IDENTIFIER algo = {};
     algo.pszObjId = const_cast<char*>(szOID_RSA_SHA256RSA);
 
-    // Basic Constraints extension for CA
+
     CERT_BASIC_CONSTRAINTS2_INFO bc = {};
     bc.fCA = TRUE;
     bc.fPathLenConstraint = FALSE;
@@ -1345,7 +1223,7 @@ bool CertificateInjector::generate_ca_certificate(const std::string& cn, std::ui
     if (cert) {
         out_cert_der.assign(cert->pbCertEncoded, cert->pbCertEncoded + cert->cbCertEncoded);
 
-        // Export private key
+
         DWORD key_blob_size = 0;
         if (CryptExportKey(hKey, 0, PRIVATEKEYBLOB, 0, nullptr, &key_blob_size)) {
             out_key_der.resize(key_blob_size);
@@ -1402,7 +1280,7 @@ std::vector<CertificateInjector::cert_info_t> CertificateInjector::list_certific
         std::snprintf(time_buf, sizeof(time_buf), "%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
         info.not_after = time_buf;
 
-        // Check basic constraints for CA
+
         PCERT_EXTENSION bc_ext = CertFindExtension(szOID_BASIC_CONSTRAINTS2,
             ctx->pCertInfo->cExtension, ctx->pCertInfo->rgExtension);
         if (bc_ext) {
@@ -1421,9 +1299,6 @@ std::vector<CertificateInjector::cert_info_t> CertificateInjector::list_certific
     return result;
 }
 
-// ============================================================
-// Certificate Pin Bypass Implementation
-// ============================================================
 
 CertPinBypasser& CertPinBypasser::instance() {
     static CertPinBypasser inst;
@@ -1433,7 +1308,7 @@ CertPinBypasser& CertPinBypasser::instance() {
 bool CertPinBypasser::patch_wintrust(std::uint32_t pid) {
     if (!device || !device->is_connected()) return false;
 
-    // Patch WinVerifyTrust in wintrust.dll to always return S_OK (0)
+
     std::uint64_t wintrust_base = 0;
     std::uint32_t wintrust_size = 0;
 
@@ -1441,7 +1316,7 @@ bool CertPinBypasser::patch_wintrust(std::uint32_t pid) {
     if (!extractor.find_module_in_process(pid, "wintrust.dll", wintrust_base, wintrust_size))
         return false;
 
-    // Resolve WinVerifyTrust export
+
     std::uint32_t saved_pid = device->get_process_id();
     device->set_process_id(pid);
     device->solve_dtb();
@@ -1453,7 +1328,7 @@ bool CertPinBypasser::patch_wintrust(std::uint32_t pid) {
         return false;
     }
 
-    // Read original prologue
+
     std::uint8_t original[16] = {};
     if (device->read_raw(wvt_addr, original, 16) != 16) {
         device->set_process_id(saved_pid);
@@ -1461,12 +1336,11 @@ bool CertPinBypasser::patch_wintrust(std::uint32_t pid) {
         return false;
     }
 
-    // Patch: xor eax, eax; ret (return S_OK = 0)
-    // 31 C0 C3
+
     std::uint8_t patch[] = { 0x31, 0xC0, 0xC3 };
 
-    // Make page writable first
-    device->protect_memory(wvt_addr, 4096, 0x40); // PAGE_EXECUTE_READWRITE
+
+    device->protect_memory(wvt_addr, 4096, 0x40);
 
 
     bool ok = (device->write_raw(wvt_addr, patch, 3) == 3);
@@ -1484,9 +1358,6 @@ bool CertPinBypasser::patch_wintrust(std::uint32_t pid) {
 bool CertPinBypasser::patch_crypt32(std::uint32_t pid) {
     if (!device || !device->is_connected()) return false;
 
-    // Patch CertVerifyCertificateChainPolicy in crypt32.dll
-    // This is the primary Windows API for certificate chain validation.
-    // Making it return TRUE bypasses all chain validation including pinning.
 
     std::uint64_t crypt32_base = 0;
     std::uint32_t crypt32_size = 0;
@@ -1509,8 +1380,7 @@ bool CertPinBypasser::patch_crypt32(std::uint32_t pid) {
     std::uint8_t original[16] = {};
     device->read_raw(func_addr, original, 16);
 
-    // Patch: mov eax, 1; ret (return TRUE, and the chain policy status is not checked)
-    // B8 01 00 00 00 C3
+
     std::uint8_t patch[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
 
     device->protect_memory(func_addr, 4096, 0x40);
@@ -1529,13 +1399,6 @@ bool CertPinBypasser::patch_crypt32(std::uint32_t pid) {
 bool CertPinBypasser::patch_schannel_validation(std::uint32_t pid) {
     if (!device || !device->is_connected()) return false;
 
-    // SChannel performs its own certificate validation via internal functions.
-    // The key function is in sspicli.dll / schannel.dll:
-    //   SslVerifyCertificateChain / SslCreatePolicyInfoStruct
-    //
-    // We patch InitializeSecurityContextW to return SEC_E_OK for cert errors.
-    // More specifically, we patch SChannel's internal _SslHandshake to skip
-    // certificate chain building.
 
     std::uint64_t schannel_base = 0;
     std::uint32_t schannel_size = 0;
@@ -1548,37 +1411,25 @@ bool CertPinBypasser::patch_schannel_validation(std::uint32_t pid) {
     device->set_process_id(pid);
     device->solve_dtb();
 
-    // Look for the SChannel certificate validation pattern:
-    // Pattern: call to CertGetCertificateChain followed by test eax, eax / jz
-    // We search for the "SEC_E_CERT_UNKNOWN" constant (0x80090327) reference
-    // and patch the comparison to always succeed.
 
-    // Simpler approach: patch the ISspiServerCertCheck / SslVerifyCertificate function
-    // which returns HRESULT. Make it return S_OK.
-
-    // Search for SslEmptyCacheA and then find the validation function nearby
-    // Fallback: just make SChannel's cert callback always succeed
     std::uint64_t export_addr = device->resolve_export(schannel_base, "SslEmptyCacheA");
     if (export_addr == 0) {
-        // SChannel doesn't export its validation functions directly.
-        // We'll rely on the WinTrust/Crypt32 patches.
+
+
         device->set_process_id(saved_pid);
         if (saved_pid != 0) device->solve_dtb();
         return false;
     }
 
-    // SChannel callbacks chain through crypt32. Our crypt32 patch should cover this.
+
     device->set_process_id(saved_pid);
     if (saved_pid != 0) device->solve_dtb();
-    return true; // Covered by crypt32 patch
+    return true;
 }
 
 bool CertPinBypasser::patch_chrome_pins(std::uint32_t pid) {
     if (!device || !device->is_connected()) return false;
 
-    // Chrome/Edge implements its own certificate pinning via TransportSecurityState.
-    // The key check is TransportSecurityState::CheckPublicKeyPins() in chrome.dll.
-    // We scan for the certificate pinning error string pattern and patch the function.
 
     std::uint64_t chrome_base = 0;
     std::uint32_t chrome_size = 0;
@@ -1592,44 +1443,22 @@ bool CertPinBypasser::patch_chrome_pins(std::uint32_t pid) {
     device->set_process_id(pid);
     device->solve_dtb();
 
-    // Search for the pinning check function using known string references
-    // Chrome uses "net::ERR_SSL_PINNED_KEY_NOT_IN_CERT_CHAIN" string
-    // We search for cross-references to the "Public-Key-Pins" string
-    // and find the CheckPublicKeyPins function
 
-    // Pattern: Chrome's CheckPublicKeyPins returns a bool. We need to find
-    // the function that references the pin verification error and patch it
-    // to return true.
-
-    // Search for the pattern bytes that correspond to the pin check:
-    // test eax,eax / je (fail path) after calling VerifyPins
-    // Common pattern in Chrome's transport_security_state.cc compiled code
-
-    // Look for "pins" ASCII string in .rdata, then cross-ref to find the checker
     const std::uint8_t pin_error_sig[] = {
-        0x48, 0x8D, 0x0D // lea rcx, [rip + offset] (loading error string)
+        0x48, 0x8D, 0x0D
     };
 
-    // Broader approach: scan for functions that check SCT/Pin policies
-    // and have early-return patterns we can hijack
 
-    // Search executable sections for cert validation patterns
     auto regions = device->enumerate_memory_regions(chrome_base, chrome_base + chrome_size, false);
     bool patched = false;
 
     for (const auto& region : regions) {
         if (region.state != 0x1000) continue;
-        // Only scan executable regions
+
         if (!(region.protect == 0x20 || region.protect == 0x40 || region.protect == 0x10)) continue;
-        if (region.size > 0x10000000) continue; // sanity check
+        if (region.size > 0x10000000) continue;
 
-        // Look for the well-known Chrome pinning bypass pattern:
-        // The function HasStaticPKPState returns bool. Making it return 0 disables static pins.
-        // Pattern for "return false" early in the function:
-        // xor eax, eax / ret pattern preceded by common function prologue
 
-        // We use a signature-based approach: search for the public key pins
-        // check function by scanning for known constants
         constexpr std::size_t CHUNK = 0x40000;
         std::vector<std::uint8_t> buf(CHUNK);
 
@@ -1641,22 +1470,16 @@ bool CertPinBypasser::patch_chrome_pins(std::uint32_t pid) {
             std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
             if (actual < 64) continue;
 
-            // Chrome/Edge pin check signature varies per version.
-            // Universal approach: find the CT (Certificate Transparency) verdict check
-            // which gates pinning. Pattern:
-            //   cmp dword ptr [reg+offset], 0  ; check CT required
-            //   je <skip_pins>
-            // We look for the specific constant 0x80090327 (CERT_E_UNTRUSTEDROOT equivalent)
-            // or the net::ERR_SSL_PINNED_KEY_NOT_IN_CERT_CHAIN (-150) constant = 0xFFFFFF6A
+
             for (std::size_t i = 0; i + 16 <= actual; i++) {
-                // Look for: cmp eax, 0xFFFFFF6A pattern (pinning error code -150)
+
                 if (buf[i] == 0x3D && buf[i+1] == 0x6A && buf[i+2] == 0xFF &&
                     buf[i+3] == 0xFF && buf[i+4] == 0xFF) {
-                    // Found pinning error comparison. Patch the jump after it.
-                    // Following byte should be a conditional jump (je/jne)
+
+
                     if (i + 6 < actual && (buf[i+5] == 0x74 || buf[i+5] == 0x75)) {
                         std::uint64_t patch_addr = region.base + off + i + 5;
-                        // NOP the conditional jump (replace with NOP NOP)
+
                         std::uint8_t orig[2] = {};
                         device->read_raw(patch_addr, orig, 2);
                         device->protect_memory(patch_addr, 4096, 0x40);
@@ -1682,17 +1505,7 @@ bool CertPinBypasser::patch_chrome_pins(std::uint32_t pid) {
 bool CertPinBypasser::patch_dotnet_callback(std::uint32_t pid) {
     if (!device || !device->is_connected()) return false;
 
-    // .NET applications use ServicePointManager.ServerCertificateValidationCallback
-    // or HttpClientHandler.ServerCertificateCustomValidationCallback.
-    // These are managed code callbacks that are harder to patch via memory.
-    //
-    // Instead, we target the CLR's native SSL validation path:
-    // clrjit.dll / coreclr.dll -> System.Net.Security.SslStream
-    //
-    // The actual validation eventually calls into the native
-    // Interop.Crypt32.CertVerifyCertificateChainPolicy, which we already patch.
 
-    // Check if CLR is loaded
     std::uint64_t clr_base = 0;
     std::uint32_t clr_size = 0;
     auto& extractor = TlsKeyExtractor::instance();
@@ -1701,8 +1514,7 @@ bool CertPinBypasser::patch_dotnet_callback(std::uint32_t pid) {
 
     if (!has_clr) return false;
 
-    // .NET cert validation chains through crypt32 CertVerifyCertificateChainPolicy.
-    // Our crypt32 patch already covers this path.
+
     return true;
 }
 
@@ -1784,9 +1596,6 @@ bool CertPinBypasser::is_bypass_active(std::uint32_t pid) const {
     return _active_patches.find(pid) != _active_patches.end();
 }
 
-// ============================================================
-// QUIC Analyzer Implementation
-// ============================================================
 
 QuicAnalyzer& QuicAnalyzer::instance() {
     static QuicAnalyzer inst;
@@ -1799,7 +1608,7 @@ bool QuicAnalyzer::parse_quic_header(const std::uint8_t* data, std::size_t len, 
     out.is_long_header = (data[0] & 0x80) != 0;
 
     if (out.is_long_header) {
-        // Long header: 1 byte flags, 4 bytes version, 1 byte DCID len, DCID, 1 byte SCID len, SCID
+
         if (len < 7) return false;
 
         out.packet_type = (data[0] >> 4) & 0x03;
@@ -1820,9 +1629,9 @@ bool QuicAnalyzer::parse_quic_header(const std::uint8_t* data, std::size_t len, 
         out.scid.assign(data + pos, data + pos + scid_len);
         pos += scid_len;
 
-        // For Initial packets, read token length
+
         if (out.packet_type == 0) {
-            // Variable-length integer encoding
+
             if (pos >= len) return false;
             std::uint8_t first_byte = data[pos++];
             std::uint8_t len_bytes = 1 << (first_byte >> 6);
@@ -1832,7 +1641,7 @@ bool QuicAnalyzer::parse_quic_header(const std::uint8_t* data, std::size_t len, 
             }
             pos += out.token_length;
 
-            // Payload length
+
             if (pos >= len) return false;
             first_byte = data[pos++];
             len_bytes = 1 << (first_byte >> 6);
@@ -1843,12 +1652,12 @@ bool QuicAnalyzer::parse_quic_header(const std::uint8_t* data, std::size_t len, 
         }
         return true;
     } else {
-        // Short header: 1 byte flags + DCID (length known from prior state)
-        // We can't fully parse without connection context
-        out.packet_type = 0xFF; // short header
-        // Read DCID with assumed default length (we don't know the exact length)
+
+
+        out.packet_type = 0xFF;
+
         if (len >= 1) {
-            // Assume max DCID of 20 bytes
+
             std::size_t dcid_len = std::min(len - 1, static_cast<std::size_t>(20));
             out.dcid.assign(data + 1, data + 1 + dcid_len);
         }
@@ -1862,23 +1671,23 @@ std::vector<quic_connection_info_t> QuicAnalyzer::detect_quic_connections(std::u
 
     if (!device || !device->is_connected()) return connections;
 
-    // Get DPI results for UDP traffic on QUIC ports (443, etc.)
-    auto dpi_results = device->get_dpi_results(filter_pid, 17, 0, 0); // UDP only
 
-    // Also get captured UDP packets directly
+    auto dpi_results = device->get_dpi_results(filter_pid, 17, 0, 0);
+
+
     auto packets = device->get_captured_packets(32);
 
     std::map<std::string, quic_connection_info_t> conn_map;
 
     for (const auto& pkt : packets) {
-        if (pkt.protocol != 17) continue; // UDP only
+        if (pkt.protocol != 17) continue;
         if (pkt.payload.size() < 5) continue;
 
         quic_header_t hdr;
         if (!parse_quic_header(pkt.payload.data(), pkt.payload.size(), hdr)) continue;
         if (!hdr.is_long_header && hdr.dcid.empty()) continue;
 
-        // Build connection key
+
         std::string key = bytes_to_hex(pkt.local_addr, 4) + ":" +
                           std::to_string(pkt.local_port) + "-" +
                           bytes_to_hex(pkt.remote_addr, 4) + ":" +
@@ -1898,7 +1707,7 @@ std::vector<quic_connection_info_t> QuicAnalyzer::detect_quic_connections(std::u
             conn.scid = hdr.scid;
         }
 
-        if (pkt.direction == 1) { // outbound
+        if (pkt.direction == 1) {
             conn.packets_sent++;
             conn.bytes_sent += pkt.payload_size;
         } else {
@@ -1907,12 +1716,12 @@ std::vector<quic_connection_info_t> QuicAnalyzer::detect_quic_connections(std::u
         }
 
         if (hdr.version != 0) {
-            conn.tls_version = 0x0304; // QUIC uses TLS 1.3
+            conn.tls_version = 0x0304;
         }
     }
 
     for (auto& [k, conn] : conn_map) {
-        conn.alpn = "h3"; // default QUIC ALPN
+        conn.alpn = "h3";
         connections.push_back(std::move(conn));
     }
 
@@ -1936,7 +1745,7 @@ quic_initial_decrypt_result_t QuicAnalyzer::decrypt_initial_packet(
         return result;
     }
 
-    if (hdr.packet_type != 0) { // Not Initial
+    if (hdr.packet_type != 0) {
         result.success = false;
         return result;
     }
@@ -1946,12 +1755,6 @@ quic_initial_decrypt_result_t QuicAnalyzer::decrypt_initial_packet(
     result.scid = hdr.scid;
     result.packet_type = "Initial";
 
-    // QUIC Initial packets are encrypted with keys derived from the Destination Connection ID.
-    // The derivation uses HKDF-SHA256 with well-known salts per QUIC version.
-    // This is fully deterministic and requires no secret key material.
-
-    // Note: Full AEAD decryption requires OpenSSL HKDF + AES-128-GCM.
-    // Since we have OpenSSL linked (CPPHTTPLIB_OPENSSL_SUPPORT), we can use it.
 
     std::uint8_t client_key[16], client_iv[12], client_hp[16];
     std::uint8_t server_key[16], server_iv[12], server_hp[16];
@@ -1959,8 +1762,8 @@ quic_initial_decrypt_result_t QuicAnalyzer::decrypt_initial_packet(
     if (!derive_initial_keys(hdr.dcid.data(), hdr.dcid.size(), hdr.version,
                               client_key, client_iv, client_hp,
                               server_key, server_iv, server_hp)) {
-        // Key derivation requires OpenSSL; report what we can
-        result.success = true; // partial success - header decoded
+
+        result.success = true;
         result.packet_number = 0;
         return result;
     }
@@ -1973,30 +1776,13 @@ bool QuicAnalyzer::derive_initial_keys(const std::uint8_t* dcid, std::size_t dci
                                          std::uint32_t version,
                                          std::uint8_t* client_key, std::uint8_t* client_iv, std::uint8_t* client_hp,
                                          std::uint8_t* server_key, std::uint8_t* server_iv, std::uint8_t* server_hp) {
-    // QUIC Initial keys are derived using HKDF with version-specific salts.
-    // RFC 9001 Section 5.2:
-    //   initial_salt for QUIC v1 (0x00000001): 38762cf7f55934b34d179ae6a4c80cadccbb7f0a
-    //   initial_salt for QUIC v2 (0x6b3343cf): 0dede3def700a6db819381be6e269dcbf9bd2ed9
 
-    // This requires OpenSSL HKDF functions which are available in the build.
-    // For now, we zero-fill and return false to indicate partial functionality.
-    // The header parsing still succeeds.
-
-    // NOTE: Integration with OpenSSL HKDF for full decryption:
-    // 1. Extract initial_secret = HKDF-Extract(initial_salt, DCID)
-    // 2. client_initial_secret = HKDF-Expand-Label(initial_secret, "client in", "", 32)
-    // 3. server_initial_secret = HKDF-Expand-Label(initial_secret, "server in", "", 32)
-    // 4. key = HKDF-Expand-Label(secret, "quic key", "", 16)
-    // 5. iv = HKDF-Expand-Label(secret, "quic iv", "", 12)
-    // 6. hp = HKDF-Expand-Label(secret, "quic hp", "", 16)
 
     (void)dcid; (void)dcid_len; (void)version;
     (void)client_key; (void)client_iv; (void)client_hp;
     (void)server_key; (void)server_iv; (void)server_hp;
 
-    // Full HKDF-based key derivation using OpenSSL
-    // This requires openssl/kdf.h which may not be universally available.
-    // The partial header parsing already provides significant value.
+
     return false;
 }
 
@@ -2004,9 +1790,6 @@ std::vector<quic_key_info_t> QuicAnalyzer::extract_quic_traffic_keys(std::uint32
     return TlsKeyExtractor::instance().extract_quic_keys(pid);
 }
 
-// ============================================================
-// DTLS Analyzer Implementation
-// ============================================================
 
 DtlsAnalyzer& DtlsAnalyzer::instance() {
     static DtlsAnalyzer inst;
@@ -2014,21 +1797,17 @@ DtlsAnalyzer& DtlsAnalyzer::instance() {
 }
 
 bool DtlsAnalyzer::parse_dtls_record(const std::uint8_t* data, std::size_t len, dtls_record_t& out) {
-    // DTLS record header (13 bytes):
-    //   1 byte content_type
-    //   2 bytes version (major.minor)
-    //   2 bytes epoch
-    //   6 bytes sequence_number
-    //   2 bytes length
+
+
     if (len < 13) return false;
 
     out.content_type = data[0];
     out.version = (static_cast<std::uint16_t>(data[1]) << 8) | data[2];
 
-    // Validate DTLS version
+
     if (out.version != 0xFEFF && out.version != 0xFEFD && out.version != 0x0101) {
-        // 0xFEFF = DTLS 1.0, 0xFEFD = DTLS 1.2
-        // also accept raw version bytes for detection
+
+
         if (data[1] != 0xFE) return false;
     }
 
@@ -2039,7 +1818,7 @@ bool DtlsAnalyzer::parse_dtls_record(const std::uint8_t* data, std::size_t len, 
     }
     out.length = (static_cast<std::uint16_t>(data[11]) << 8) | data[12];
 
-    // Check content type validity
+
     if (out.content_type >= 20 && out.content_type <= 25) {
         out.is_handshake = (out.content_type == 22);
         if (out.is_handshake && len >= 14) {
@@ -2057,11 +1836,11 @@ std::vector<dtls_session_info_t> DtlsAnalyzer::detect_dtls_sessions(std::uint32_
 
     if (!device || !device->is_connected()) return sessions;
 
-    // Get captured UDP packets and check for DTLS records
+
     auto packets = device->get_captured_packets(32);
 
     for (const auto& pkt : packets) {
-        if (pkt.protocol != 17) continue; // UDP only
+        if (pkt.protocol != 17) continue;
         if (pkt.payload.size() < 13) continue;
         if (filter_pid != 0 && pkt.pid != filter_pid) continue;
 
@@ -2101,9 +1880,6 @@ std::vector<dtls_key_info_t> DtlsAnalyzer::extract_dtls_keys(std::uint32_t pid) 
     return TlsKeyExtractor::instance().extract_dtls_keys(pid);
 }
 
-// ============================================================
-// AutoResponder Implementation
-// ============================================================
 
 AutoResponder& AutoResponder::instance() {
     static AutoResponder inst;
@@ -2173,7 +1949,7 @@ bool AutoResponder::match_pattern(const autoresponder_rule_t& rule,
                                    const std::string& body) {
     if (!rule.enabled) return false;
 
-    // Check method filter
+
     if (!rule.match_method.empty() && rule.match_method != method)
         return false;
 
@@ -2238,7 +2014,7 @@ std::string AutoResponder::build_response(const autoresponder_rule_t& rule) {
         body = rule.response_body;
     }
 
-    // Add Content-Length if not already set
+
     bool has_content_length = false;
     for (const auto& [name, value] : rule.response_headers) {
         std::string lower_name = name;
@@ -2262,7 +2038,7 @@ AutoResponder::match_result_t AutoResponder::match_request(
     std::lock_guard<std::mutex> lock(_mutex);
     match_result_t result;
 
-    // Sort rules by priority (lower = higher priority)
+
     std::vector<autoresponder_rule_t*> sorted;
     sorted.reserve(_rules.size());
     for (auto& [id, rule] : _rules)
@@ -2286,13 +2062,13 @@ AutoResponder::match_result_t AutoResponder::match_request(
             }
 
             if (rule->passthrough) {
-                result.matched = false; // let it pass
+                result.matched = false;
                 return result;
             }
 
             std::string full_response = build_response(*rule);
 
-            // Split response into status line + headers vs body
+
             auto header_end = full_response.find("\r\n\r\n");
             if (header_end != std::string::npos) {
                 std::string header_section = full_response.substr(0, header_end);
@@ -2314,9 +2090,6 @@ AutoResponder::match_result_t AutoResponder::match_request(
 bool AutoResponder::start() {
     if (_active.load()) return true;
 
-    // The AutoResponder works by hooking into the existing packet interception system.
-    // When active, it monitors intercepted HTTP requests and applies matching rules.
-    // The actual packet interception is managed by the kernel driver's intercept system.
 
     _active.store(true);
 
@@ -2327,23 +2100,23 @@ bool AutoResponder::start() {
                 continue;
             }
 
-            // Get held packets from the interceptor
+
             auto held = device->get_held_packets();
             for (const auto& pkt : held) {
                 if (pkt.payload.empty()) continue;
 
-                // Try to parse as HTTP
+
                 std::string payload_str(pkt.payload.begin(), pkt.payload.end());
                 std::string method, url;
                 std::map<std::string, std::string> headers;
                 std::string body;
 
-                // Quick HTTP request parsing
+
                 auto first_line_end = payload_str.find("\r\n");
                 if (first_line_end == std::string::npos) continue;
                 std::string first_line = payload_str.substr(0, first_line_end);
 
-                // Parse method and URL
+
                 auto sp1 = first_line.find(' ');
                 if (sp1 == std::string::npos) continue;
                 method = first_line.substr(0, sp1);
@@ -2353,12 +2126,12 @@ bool AutoResponder::start() {
                 else
                     url = first_line.substr(sp1 + 1, sp2 - sp1 - 1);
 
-                // Check if this looks like an HTTP method
+
                 if (method != "GET" && method != "POST" && method != "PUT" &&
                     method != "DELETE" && method != "HEAD" && method != "OPTIONS" &&
                     method != "PATCH" && method != "CONNECT") continue;
 
-                // Parse headers
+
                 std::size_t pos = first_line_end + 2;
                 while (pos < payload_str.size()) {
                     auto next = payload_str.find("\r\n", pos);
@@ -2371,7 +2144,7 @@ bool AutoResponder::start() {
                         while (!value.empty() && value[0] == ' ') value.erase(0, 1);
                         headers[name] = value;
 
-                        // Also extract Host for full URL construction
+
                         if (name == "Host" && url[0] == '/') {
                             url = "http://" + value + url;
                         }
@@ -2382,14 +2155,14 @@ bool AutoResponder::start() {
                 if (body_start != std::string::npos && body_start + 4 < payload_str.size())
                     body = payload_str.substr(body_start + 4);
 
-                // Try to match against rules
+
                 auto match = match_request(method, url, headers, body);
                 if (match.matched) {
                     if (match.response_body.empty() && match.response_status_line.empty()) {
-                        // Drop request
+
                         device->intercept_op(4, 0, 0, 0, pkt.hold_id, nullptr, 0, nullptr, nullptr);
                     } else {
-                        // Send custom response by modifying the packet
+
                         std::string full_resp = match.response_status_line + "\r\n" +
                                                 match.response_headers_str + "\r\n\r\n" +
                                                 match.response_body;
@@ -2399,7 +2172,7 @@ bool AutoResponder::start() {
                             nullptr, nullptr);
                     }
                 } else {
-                    // No match - release the packet
+
                     device->intercept_op(3, 0, 0, 0, pkt.hold_id, nullptr, 0, nullptr, nullptr);
                 }
             }
@@ -2505,6 +2278,6 @@ std::string AutoResponder::export_rules() const {
     return arr.dump(2);
 }
 
-} // namespace net_security
+}
 
-#endif // __NT__
+#endif
