@@ -156,7 +156,8 @@ enum class autoresponder_match_type {
     regex_url,
     method_and_url,
     header_contains,
-    body_contains
+    body_contains,
+    sni_contains
 };
 
 struct autoresponder_rule_t {

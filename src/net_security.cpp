@@ -5,8 +5,10 @@
 #include <nlohmann/json.hpp>
 #include <wincrypt.h>
 #include <shlobj.h>
+#include <bcrypt.h>
 
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 extern std::unique_ptr<voyager::device_t> device;
 
@@ -83,6 +85,148 @@ static bool looks_like_random(const std::uint8_t* data, std::size_t len) {
         if (h > 0) unique_count++;
 
     return unique_count >= (len / 3);
+}
+
+
+static bool hmac_sha256(const std::uint8_t* key, std::size_t key_len,
+                        const std::uint8_t* data, std::size_t data_len,
+                        std::uint8_t out[32]) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    DWORD hash_obj_size = 0, cb_data = 0;
+    bool ok = false;
+
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+        return false;
+
+    if (BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&hash_obj_size),
+                          sizeof(hash_obj_size), &cb_data, 0) != 0) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    std::vector<std::uint8_t> hash_obj(hash_obj_size);
+    if (BCryptCreateHash(hAlg, &hHash, hash_obj.data(), hash_obj_size,
+                         const_cast<PUCHAR>(key), static_cast<ULONG>(key_len), 0) != 0) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    if (BCryptHashData(hHash, const_cast<PUCHAR>(data), static_cast<ULONG>(data_len), 0) == 0) {
+        if (BCryptFinishHash(hHash, out, 32, 0) == 0)
+            ok = true;
+    }
+
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return ok;
+}
+
+static bool hkdf_extract(const std::uint8_t* salt, std::size_t salt_len,
+                          const std::uint8_t* ikm, std::size_t ikm_len,
+                          std::uint8_t prk[32]) {
+    if (salt_len == 0) {
+        std::uint8_t zero_salt[32] = {};
+        return hmac_sha256(zero_salt, 32, ikm, ikm_len, prk);
+    }
+    return hmac_sha256(salt, salt_len, ikm, ikm_len, prk);
+}
+
+static bool hkdf_expand(const std::uint8_t prk[32],
+                         const std::uint8_t* info, std::size_t info_len,
+                         std::uint8_t* okm, std::size_t okm_len) {
+    std::uint8_t t[32] = {};
+    std::size_t t_len = 0;
+    std::uint8_t counter = 1;
+    std::size_t offset = 0;
+
+    while (offset < okm_len) {
+        std::vector<std::uint8_t> input;
+        input.reserve(t_len + info_len + 1);
+        input.insert(input.end(), t, t + t_len);
+        input.insert(input.end(), info, info + info_len);
+        input.push_back(counter);
+
+        if (!hmac_sha256(prk, 32, input.data(), input.size(), t))
+            return false;
+
+        t_len = 32;
+        std::size_t to_copy = std::min(static_cast<std::size_t>(32), okm_len - offset);
+        std::memcpy(okm + offset, t, to_copy);
+        offset += to_copy;
+        counter++;
+
+        if (counter == 0) return false;
+    }
+    return true;
+}
+
+static bool hkdf_expand_label(const std::uint8_t prk[32],
+                               const char* label, std::size_t label_len,
+                               const std::uint8_t* context, std::size_t context_len,
+                               std::uint8_t* okm, std::size_t okm_len) {
+    const char* prefix = "tls13 ";
+    std::size_t prefix_len = 6;
+    std::size_t full_label_len = prefix_len + label_len;
+
+    std::vector<std::uint8_t> hkdf_label;
+    hkdf_label.reserve(2 + 1 + full_label_len + 1 + context_len);
+
+    hkdf_label.push_back(static_cast<std::uint8_t>((okm_len >> 8) & 0xFF));
+    hkdf_label.push_back(static_cast<std::uint8_t>(okm_len & 0xFF));
+
+    hkdf_label.push_back(static_cast<std::uint8_t>(full_label_len));
+    hkdf_label.insert(hkdf_label.end(),
+                       reinterpret_cast<const std::uint8_t*>(prefix),
+                       reinterpret_cast<const std::uint8_t*>(prefix) + prefix_len);
+    hkdf_label.insert(hkdf_label.end(),
+                       reinterpret_cast<const std::uint8_t*>(label),
+                       reinterpret_cast<const std::uint8_t*>(label) + label_len);
+
+    hkdf_label.push_back(static_cast<std::uint8_t>(context_len));
+    if (context_len > 0)
+        hkdf_label.insert(hkdf_label.end(), context, context + context_len);
+
+    return hkdf_expand(prk, hkdf_label.data(), hkdf_label.size(), okm, okm_len);
+}
+
+static bool aes_ecb_encrypt(const std::uint8_t key[16],
+                             const std::uint8_t in[16],
+                             std::uint8_t out[16]) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+    bool ok = false;
+
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0) != 0)
+        return false;
+
+    if (BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+                          reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_ECB)),
+                          static_cast<ULONG>(sizeof(BCRYPT_CHAIN_MODE_ECB)), 0) != 0) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    DWORD key_obj_size = 0, cb_data = 0;
+    BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH,
+                      reinterpret_cast<PUCHAR>(&key_obj_size), sizeof(key_obj_size), &cb_data, 0);
+
+    std::vector<std::uint8_t> key_obj(key_obj_size);
+    if (BCryptGenerateSymmetricKey(hAlg, &hKey, key_obj.data(), key_obj_size,
+                                    const_cast<PUCHAR>(key), 16, 0) != 0) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    ULONG result_len = 0;
+    std::uint8_t input_copy[16];
+    std::memcpy(input_copy, in, 16);
+    if (BCryptEncrypt(hKey, input_copy, 16, nullptr, nullptr, 0, out, 16, &result_len, 0) == 0)
+        ok = (result_len == 16);
+
+    BCryptDestroyKey(hKey);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return ok;
 }
 
 
@@ -744,6 +888,105 @@ generic_done:
 }
 
 
+static std::vector<tls_session_key_t> scan_tls13_secrets_impl(
+    voyager::device_t* dev, std::uint32_t pid,
+    std::map<std::string, tls_session_key_t>& seen_keys) {
+
+    std::vector<tls_session_key_t> keys;
+    if (!dev || !dev->is_connected()) return keys;
+
+    std::uint32_t saved_pid = dev->get_process_id();
+    dev->set_process_id(pid);
+    dev->solve_dtb();
+
+    auto regions = dev->enumerate_memory_regions(0, 0x7FFFFFFFFFFF, false);
+
+
+    for (const auto& region : regions) {
+        if (region.state != 0x1000) continue;
+        if (region.size > 0x2000000 || region.size < 128) continue;
+
+        constexpr std::size_t CHUNK = 0x10000;
+        std::vector<std::uint8_t> buf(CHUNK);
+
+        for (std::uint64_t off = 0; off < region.size; off += CHUNK - 128) {
+            std::size_t to_read = static_cast<std::size_t>(
+                std::min(static_cast<std::uint64_t>(CHUNK), region.size - off));
+            if (to_read < 128) break;
+
+            std::memset(buf.data(), 0, CHUNK);
+            std::size_t actual = dev->read_raw(region.base + off, buf.data(), to_read);
+            if (actual < 128) continue;
+
+
+            for (std::size_t i = 64; i + 2 <= actual; i += 2) {
+                std::uint16_t ver = (static_cast<std::uint16_t>(buf[i]) << 8) | buf[i + 1];
+                if (ver != 0x0304) continue;
+
+
+                for (int cr_off = -128; cr_off < -16; cr_off += 8) {
+                    std::int64_t cr_pos = static_cast<std::int64_t>(i) + cr_off;
+                    if (cr_pos < 0) continue;
+                    if (cr_pos + 32 > static_cast<std::int64_t>(actual)) continue;
+
+                    const std::uint8_t* cr = buf.data() + cr_pos;
+                    if (!looks_like_random(cr, 32)) continue;
+
+
+                    static const char* tls13_labels[] = {
+                        "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+                        "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+                        "CLIENT_TRAFFIC_SECRET_0",
+                        "SERVER_TRAFFIC_SECRET_0",
+                    };
+
+                    int secret_idx = 0;
+                    for (std::size_t sec_off = 32; sec_off <= 128 && secret_idx < 4; sec_off += 32) {
+                        std::int64_t sec_pos = cr_pos + static_cast<std::int64_t>(sec_off);
+                        if (sec_pos < 0 || sec_pos + 32 > static_cast<std::int64_t>(actual)) break;
+
+                        const std::uint8_t* secret = buf.data() + sec_pos;
+                        if (!looks_like_random(secret, 32)) {
+
+                            continue;
+                        }
+
+                        tls_session_key_t key;
+                        key.label = tls13_labels[secret_idx];
+                        key.client_random.assign(cr, cr + 32);
+                        key.secret.assign(secret, secret + 32);
+                        key.tls_version = 0x0304;
+                        key.timestamp = get_timestamp_ms();
+                        key.pid = pid;
+                        key.library = "TLS1.3-Structure";
+
+                        std::string dedup = key.label + ":" +
+                                            bytes_to_hex(cr, 32);
+                        if (seen_keys.find(dedup) == seen_keys.end()) {
+                            seen_keys[dedup] = key;
+                            keys.push_back(key);
+                        }
+                        secret_idx++;
+                    }
+
+                    if (secret_idx > 0) {
+
+                        i += 128;
+                        break;
+                    }
+                }
+
+                if (keys.size() >= 64) goto tls13_done;
+            }
+        }
+    }
+tls13_done:
+    dev->set_process_id(saved_pid);
+    if (saved_pid != 0) dev->solve_dtb();
+    return keys;
+}
+
+
 std::vector<tls_session_key_t> TlsKeyExtractor::extract_keys(const tls_key_scan_config_t& config) {
     std::lock_guard<std::mutex> lock(_mutex);
     std::vector<tls_session_key_t> all_keys;
@@ -776,6 +1019,11 @@ std::vector<tls_session_key_t> TlsKeyExtractor::extract_keys(const tls_key_scan_
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
 
+
+    if (all_keys.size() < config.max_results) {
+        auto keys = scan_tls13_secrets_impl(device.get(), pid, _seen_keys);
+        all_keys.insert(all_keys.end(), keys.begin(), keys.end());
+    }
 
     if (all_keys.size() > config.max_results)
         all_keys.resize(config.max_results);
@@ -1414,17 +1662,94 @@ bool CertPinBypasser::patch_schannel_validation(std::uint32_t pid) {
 
     std::uint64_t export_addr = device->resolve_export(schannel_base, "SslEmptyCacheA");
     if (export_addr == 0) {
-
-
         device->set_process_id(saved_pid);
         if (saved_pid != 0) device->solve_dtb();
         return false;
     }
 
 
+    auto regions = device->enumerate_memory_regions(schannel_base, schannel_base + schannel_size, false);
+    bool patched = false;
+
+
+    const std::uint8_t cert_unknown_cmp[] = { 0x3D, 0x27, 0x03, 0x09, 0x80 };
+    const std::uint8_t cert_expired_cmp[] = { 0x3D, 0x28, 0x03, 0x09, 0x80 };
+
+    for (const auto& region : regions) {
+        if (region.state != 0x1000) continue;
+        if (!(region.protect == 0x20 || region.protect == 0x40 || region.protect == 0x10)) continue;
+        if (region.size > 0x1000000 || region.size < 32) continue;
+
+        constexpr std::size_t CHUNK = 0x20000;
+        std::vector<std::uint8_t> buf(CHUNK);
+
+        for (std::uint64_t off = 0; off < region.size && !patched; off += CHUNK - 16) {
+            std::size_t to_read = static_cast<std::size_t>(
+                std::min(static_cast<std::uint64_t>(CHUNK), region.size - off));
+            if (to_read < 16) break;
+
+            std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
+            if (actual < 16) continue;
+
+            for (std::size_t i = 0; i + 12 <= actual && !patched; i++) {
+                bool is_cert_check = false;
+
+
+                if (std::memcmp(buf.data() + i, cert_unknown_cmp, 5) == 0)
+                    is_cert_check = true;
+
+
+                if (!is_cert_check && std::memcmp(buf.data() + i, cert_expired_cmp, 5) == 0)
+                    is_cert_check = true;
+
+                if (!is_cert_check) continue;
+
+
+                std::size_t jmp_pos = i + 5;
+
+
+                while (jmp_pos < actual && buf[jmp_pos] == 0x90) jmp_pos++;
+
+                if (jmp_pos >= actual) continue;
+
+                std::uint64_t patch_addr = 0;
+                std::size_t patch_size = 0;
+
+                if (buf[jmp_pos] == 0x74) {
+
+                    patch_addr = region.base + off + jmp_pos;
+                    patch_size = 2;
+                } else if (buf[jmp_pos] == 0x0F && jmp_pos + 1 < actual && buf[jmp_pos + 1] == 0x84) {
+
+                    patch_addr = region.base + off + jmp_pos;
+                    patch_size = 6;
+                } else if (buf[jmp_pos] == 0x75) {
+
+                    continue;
+                } else {
+                    continue;
+                }
+
+
+                std::vector<std::uint8_t> original(patch_size);
+                device->read_raw(patch_addr, original.data(), patch_size);
+
+
+                std::vector<std::uint8_t> nops(patch_size, 0x90);
+                device->protect_memory(patch_addr, 4096, 0x40);
+                if (device->write_raw(patch_addr, nops.data(), patch_size) == patch_size) {
+                    std::lock_guard<std::mutex> lock2(_mutex);
+                    _active_patches[pid].push_back({patch_addr, original, "SChannel-CertValidation"});
+                    patched = true;
+                }
+            }
+        }
+        if (patched) break;
+    }
+
     device->set_process_id(saved_pid);
     if (saved_pid != 0) device->solve_dtb();
-    return true;
+    return patched;
 }
 
 bool CertPinBypasser::patch_chrome_pins(std::uint32_t pid) {
@@ -1506,15 +1831,77 @@ bool CertPinBypasser::patch_dotnet_callback(std::uint32_t pid) {
     if (!device || !device->is_connected()) return false;
 
 
+    auto& extractor = TlsKeyExtractor::instance();
+
     std::uint64_t clr_base = 0;
     std::uint32_t clr_size = 0;
-    auto& extractor = TlsKeyExtractor::instance();
     bool has_clr = extractor.find_module_in_process(pid, "coreclr.dll", clr_base, clr_size) ||
                    extractor.find_module_in_process(pid, "clr.dll", clr_base, clr_size);
 
     if (!has_clr) return false;
 
+    std::uint32_t saved_pid = device->get_process_id();
+    device->set_process_id(pid);
+    device->solve_dtb();
 
+
+    std::uint64_t snsec_base = 0;
+    std::uint32_t snsec_size = 0;
+    bool has_snsec = extractor.find_module_in_process(pid, "system.net.security", snsec_base, snsec_size);
+
+    if (has_snsec && snsec_size > 0) {
+
+
+        const std::uint8_t pattern[] = { 0xC7, 0x44, 0x24 };
+        auto regions = device->enumerate_memory_regions(snsec_base, snsec_base + snsec_size, false);
+
+        for (const auto& region : regions) {
+            if (region.state != 0x1000) continue;
+            if (region.size > 0x10000000 || region.size < 32) continue;
+            if (!(region.protect == 0x20 || region.protect == 0x40 || region.protect == 0x10)) continue;
+
+            constexpr std::size_t CHUNK = 0x20000;
+            std::vector<std::uint8_t> buf(CHUNK);
+
+            for (std::uint64_t off = 0; off < region.size; off += CHUNK - 16) {
+                std::size_t to_read = static_cast<std::size_t>(
+                    std::min(static_cast<std::uint64_t>(CHUNK), region.size - off));
+                if (to_read < 16) break;
+
+                std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
+                if (actual < 16) continue;
+
+                for (std::size_t i = 0; i + 8 <= actual; i++) {
+                    if (buf[i] == pattern[0] && buf[i+1] == pattern[1] && buf[i+2] == pattern[2]) {
+
+                        if (buf[i+4] == 0x08 && buf[i+5] == 0x00 &&
+                            buf[i+6] == 0x00 && buf[i+7] == 0x00) {
+
+                            std::uint64_t patch_addr = region.base + off + i + 4;
+                            std::uint8_t original[4];
+                            device->read_raw(patch_addr, original, 4);
+
+
+                            std::uint8_t new_flags[] = { 0x18, 0x18, 0x00, 0x00 };
+                            device->protect_memory(patch_addr, 4096, 0x40);
+                            if (device->write_raw(patch_addr, new_flags, 4) == 4) {
+                                std::lock_guard<std::mutex> lock2(_mutex);
+                                _active_patches[pid].push_back({patch_addr, {original, original + 4}, "DotNet-SCH_CRED-Flags"});
+
+                                device->set_process_id(saved_pid);
+                                if (saved_pid != 0) device->solve_dtb();
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+    device->set_process_id(saved_pid);
+    if (saved_pid != 0) device->solve_dtb();
     return true;
 }
 
@@ -1671,9 +2058,13 @@ std::vector<quic_connection_info_t> QuicAnalyzer::detect_quic_connections(std::u
 
     if (!device || !device->is_connected()) return connections;
 
+    bool cap_active = false;
+    std::uint32_t cap_cnt = 0, cap_drp = 0;
+    device->get_capture_status(cap_active, cap_cnt, cap_drp);
+    if (!cap_active)
+        device->start_capture(filter_pid, 0, 17);
 
     auto dpi_results = device->get_dpi_results(filter_pid, 17, 0, 0);
-
 
     auto packets = device->get_captured_packets(32);
 
@@ -1755,18 +2146,189 @@ quic_initial_decrypt_result_t QuicAnalyzer::decrypt_initial_packet(
     result.scid = hdr.scid;
     result.packet_type = "Initial";
 
-
     std::uint8_t client_key[16], client_iv[12], client_hp[16];
     std::uint8_t server_key[16], server_iv[12], server_hp[16];
 
     if (!derive_initial_keys(hdr.dcid.data(), hdr.dcid.size(), hdr.version,
                               client_key, client_iv, client_hp,
                               server_key, server_iv, server_hp)) {
-
         result.success = true;
         result.packet_number = 0;
         return result;
     }
+
+
+    std::size_t pn_offset = 7 + hdr.dcid.size() + hdr.scid.size();
+
+
+    if (pn_offset < packet_len) {
+        std::size_t tpos = pn_offset;
+        std::uint8_t first = packet_data[tpos];
+        std::uint8_t len_bytes = static_cast<std::uint8_t>(1u << (first >> 6));
+        std::uint64_t token_len = first & 0x3F;
+        tpos++;
+        for (std::uint8_t b = 1; b < len_bytes && tpos < packet_len; b++) {
+            token_len = (token_len << 8) | packet_data[tpos++];
+        }
+        tpos += static_cast<std::size_t>(token_len);
+
+
+        if (tpos < packet_len) {
+            first = packet_data[tpos];
+            len_bytes = static_cast<std::uint8_t>(1u << (first >> 6));
+            tpos++;
+            for (std::uint8_t b = 1; b < len_bytes && tpos < packet_len; b++) {
+                tpos++;
+            }
+        }
+        pn_offset = tpos;
+    }
+
+    if (pn_offset + 4 + 16 > packet_len) {
+        result.success = true;
+        result.packet_number = 0;
+        return result;
+    }
+
+
+    std::uint8_t sample[16];
+    std::memcpy(sample, packet_data + pn_offset + 4, 16);
+
+    std::uint8_t mask[16];
+    if (!aes_ecb_encrypt(client_hp, sample, mask)) {
+        result.success = true;
+        result.packet_number = 0;
+        return result;
+    }
+
+
+    std::vector<std::uint8_t> pkt(packet_data, packet_data + packet_len);
+
+
+    pkt[0] ^= (mask[0] & 0x0F);
+
+    std::uint8_t pn_length = (pkt[0] & 0x03) + 1;
+
+
+    for (std::uint8_t i = 0; i < pn_length && (pn_offset + i) < pkt.size(); i++) {
+        pkt[pn_offset + i] ^= mask[1 + i];
+    }
+
+
+    std::uint64_t pn = 0;
+    for (std::uint8_t i = 0; i < pn_length; i++) {
+        pn = (pn << 8) | pkt[pn_offset + i];
+    }
+    result.packet_number = pn;
+
+
+    std::uint8_t nonce[12];
+    std::memcpy(nonce, client_iv, 12);
+    for (std::uint8_t i = 0; i < 8; i++) {
+        nonce[11 - i] ^= static_cast<std::uint8_t>((pn >> (8 * i)) & 0xFF);
+    }
+
+    std::size_t aad_len = pn_offset + pn_length;
+    std::size_t ciphertext_offset = aad_len;
+    if (ciphertext_offset + 16 > pkt.size()) {
+        result.success = true;
+        return result;
+    }
+    std::size_t ciphertext_len = pkt.size() - ciphertext_offset;
+
+
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0) == 0) {
+        if (BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+                              reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+                              static_cast<ULONG>(sizeof(BCRYPT_CHAIN_MODE_GCM)), 0) == 0) {
+
+            DWORD key_obj_size = 0, cb = 0;
+            BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH,
+                              reinterpret_cast<PUCHAR>(&key_obj_size), sizeof(key_obj_size), &cb, 0);
+            std::vector<std::uint8_t> key_obj(key_obj_size);
+
+            if (BCryptGenerateSymmetricKey(hAlg, &hKey, key_obj.data(), key_obj_size,
+                                            const_cast<PUCHAR>(client_key), 16, 0) == 0) {
+
+
+                std::size_t payload_len = ciphertext_len - 16;
+                std::uint8_t tag[16];
+                std::memcpy(tag, pkt.data() + ciphertext_offset + payload_len, 16);
+
+                BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
+                BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
+                authInfo.pbNonce = nonce;
+                authInfo.cbNonce = 12;
+                authInfo.pbAuthData = pkt.data();
+                authInfo.cbAuthData = static_cast<ULONG>(aad_len);
+                authInfo.pbTag = tag;
+                authInfo.cbTag = 16;
+
+                result.decrypted_payload.resize(payload_len);
+                ULONG decrypted_len = 0;
+
+                NTSTATUS status = BCryptDecrypt(
+                    hKey, pkt.data() + ciphertext_offset, static_cast<ULONG>(payload_len),
+                    &authInfo, nullptr, 0,
+                    result.decrypted_payload.data(), static_cast<ULONG>(payload_len),
+                    &decrypted_len, 0);
+
+                if (status == 0) {
+                    result.decrypted_payload.resize(decrypted_len);
+
+
+                    std::size_t pos = 0;
+                    while (pos < result.decrypted_payload.size()) {
+                        std::uint8_t frame_type = result.decrypted_payload[pos];
+                        if (frame_type == 0x00) { pos++; continue; }
+                        if (frame_type == 0x06) {
+                            pos++;
+
+                            if (pos >= result.decrypted_payload.size()) break;
+                            std::uint8_t fb = result.decrypted_payload[pos];
+                            std::uint8_t vlen = static_cast<std::uint8_t>(1u << (fb >> 6));
+                            pos++;
+                            for (std::uint8_t v = 1; v < vlen && pos < result.decrypted_payload.size(); v++) {
+                                pos++;
+                            }
+
+                            if (pos >= result.decrypted_payload.size()) break;
+                            fb = result.decrypted_payload[pos];
+                            vlen = static_cast<std::uint8_t>(1u << (fb >> 6));
+                            std::uint64_t crypto_len = fb & 0x3F;
+                            pos++;
+                            for (std::uint8_t v = 1; v < vlen && pos < result.decrypted_payload.size(); v++) {
+                                crypto_len = (crypto_len << 8) | result.decrypted_payload[pos++];
+                            }
+
+                            if (pos + crypto_len <= result.decrypted_payload.size()) {
+                                result.crypto_frame_hex = bytes_to_hex(
+                                    result.decrypted_payload.data() + pos,
+                                    static_cast<std::size_t>(crypto_len));
+                            }
+                            break;
+                        }
+                        break;
+                    }
+                } else {
+                    result.decrypted_payload.clear();
+                }
+
+                BCryptDestroyKey(hKey);
+            }
+        }
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+    }
+
+    SecureZeroMemory(client_key, sizeof(client_key));
+    SecureZeroMemory(client_iv, sizeof(client_iv));
+    SecureZeroMemory(client_hp, sizeof(client_hp));
+    SecureZeroMemory(server_key, sizeof(server_key));
+    SecureZeroMemory(server_iv, sizeof(server_iv));
+    SecureZeroMemory(server_hp, sizeof(server_hp));
 
     result.success = true;
     return result;
@@ -1777,13 +2339,58 @@ bool QuicAnalyzer::derive_initial_keys(const std::uint8_t* dcid, std::size_t dci
                                          std::uint8_t* client_key, std::uint8_t* client_iv, std::uint8_t* client_hp,
                                          std::uint8_t* server_key, std::uint8_t* server_iv, std::uint8_t* server_hp) {
 
-
-    (void)dcid; (void)dcid_len; (void)version;
-    (void)client_key; (void)client_iv; (void)client_hp;
-    (void)server_key; (void)server_iv; (void)server_hp;
+    if (!dcid || dcid_len == 0) return false;
 
 
-    return false;
+    const std::uint8_t salt_v1[] = {
+        0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
+        0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a
+    };
+    const std::uint8_t salt_v2[] = {
+        0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93,
+        0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9
+    };
+
+    const std::uint8_t* salt;
+    std::size_t salt_len;
+
+    if (version == 0x6b3343cf) {
+        salt = salt_v2;
+        salt_len = sizeof(salt_v2);
+    } else {
+        salt = salt_v1;
+        salt_len = sizeof(salt_v1);
+    }
+
+    std::uint8_t initial_secret[32];
+    if (!hkdf_extract(salt, salt_len, dcid, dcid_len, initial_secret))
+        return false;
+
+    std::uint8_t client_secret[32];
+    if (!hkdf_expand_label(initial_secret, "client in", 9, nullptr, 0, client_secret, 32))
+        return false;
+
+    std::uint8_t server_secret[32];
+    if (!hkdf_expand_label(initial_secret, "server in", 9, nullptr, 0, server_secret, 32))
+        return false;
+
+    const char* key_label = "quic key";
+    const char* iv_label  = "quic iv";
+    const char* hp_label  = "quic hp";
+
+    if (!hkdf_expand_label(client_secret, key_label, 8, nullptr, 0, client_key, 16)) return false;
+    if (!hkdf_expand_label(client_secret, iv_label,  7, nullptr, 0, client_iv,  12)) return false;
+    if (!hkdf_expand_label(client_secret, hp_label,  7, nullptr, 0, client_hp,  16)) return false;
+
+    if (!hkdf_expand_label(server_secret, key_label, 8, nullptr, 0, server_key, 16)) return false;
+    if (!hkdf_expand_label(server_secret, iv_label,  7, nullptr, 0, server_iv,  12)) return false;
+    if (!hkdf_expand_label(server_secret, hp_label,  7, nullptr, 0, server_hp,  16)) return false;
+
+    SecureZeroMemory(initial_secret, sizeof(initial_secret));
+    SecureZeroMemory(client_secret, sizeof(client_secret));
+    SecureZeroMemory(server_secret, sizeof(server_secret));
+
+    return true;
 }
 
 std::vector<quic_key_info_t> QuicAnalyzer::extract_quic_traffic_keys(std::uint32_t pid) {
@@ -1836,6 +2443,11 @@ std::vector<dtls_session_info_t> DtlsAnalyzer::detect_dtls_sessions(std::uint32_
 
     if (!device || !device->is_connected()) return sessions;
 
+    bool cap_active = false;
+    std::uint32_t cap_cnt = 0, cap_drp = 0;
+    device->get_capture_status(cap_active, cap_cnt, cap_drp);
+    if (!cap_active)
+        device->start_capture(filter_pid, 0, 17);
 
     auto packets = device->get_captured_packets(32);
 
@@ -1878,6 +2490,69 @@ std::vector<dtls_session_info_t> DtlsAnalyzer::detect_dtls_sessions(std::uint32_
 
 std::vector<dtls_key_info_t> DtlsAnalyzer::extract_dtls_keys(std::uint32_t pid) {
     return TlsKeyExtractor::instance().extract_dtls_keys(pid);
+}
+
+
+static std::string extract_tls_sni(const std::uint8_t* data, std::size_t len) {
+    if (len < 44 || data[0] != 0x16) return "";
+
+    std::uint16_t rec_len = (static_cast<std::uint16_t>(data[3]) << 8) | data[4];
+    if (static_cast<std::size_t>(5) + rec_len > len) return "";
+
+    if (data[5] != 0x01) return "";
+
+    std::size_t pos = 9;
+    if (pos + 34 > len) return "";
+    pos += 2;
+    pos += 32;
+
+    if (pos >= len) return "";
+    std::uint8_t sid_len = data[pos++];
+    pos += sid_len;
+
+    if (pos + 2 > len) return "";
+    std::uint16_t cs_len = (static_cast<std::uint16_t>(data[pos]) << 8) | data[pos + 1];
+    pos += 2 + cs_len;
+
+    if (pos >= len) return "";
+    std::uint8_t cm_len = data[pos++];
+    pos += cm_len;
+
+    if (pos + 2 > len) return "";
+    std::uint16_t ext_total = (static_cast<std::uint16_t>(data[pos]) << 8) | data[pos + 1];
+    pos += 2;
+
+    std::size_t ext_end = pos + ext_total;
+    if (ext_end > len) ext_end = len;
+
+    while (pos + 4 <= ext_end) {
+        std::uint16_t ext_type = (static_cast<std::uint16_t>(data[pos]) << 8) | data[pos + 1];
+        std::uint16_t ext_data_len = (static_cast<std::uint16_t>(data[pos + 2]) << 8) | data[pos + 3];
+        pos += 4;
+
+        if (ext_type == 0x0000 && ext_data_len >= 5 && pos + ext_data_len <= ext_end) {
+            std::size_t sni_pos = pos + 2;
+            if (sni_pos < ext_end && data[sni_pos] == 0x00) {
+                sni_pos++;
+                if (sni_pos + 2 <= ext_end) {
+                    std::uint16_t name_len = (static_cast<std::uint16_t>(data[sni_pos]) << 8) | data[sni_pos + 1];
+                    sni_pos += 2;
+                    if (name_len > 0 && name_len < 256 && sni_pos + name_len <= ext_end) {
+                        std::string sni(reinterpret_cast<const char*>(data + sni_pos), name_len);
+                        for (auto& c : sni) {
+                            if (c < 0x20 || c > 0x7E) return "";
+                        }
+                        return sni;
+                    }
+                }
+            }
+            break;
+        }
+
+        pos += ext_data_len;
+    }
+
+    return "";
 }
 
 
@@ -1986,6 +2661,14 @@ bool AutoResponder::match_pattern(const autoresponder_rule_t& rule,
 
         case autoresponder_match_type::body_contains:
             return body.find(rule.match_pattern) != std::string::npos;
+
+        case autoresponder_match_type::sni_contains: {
+            std::string lower_url = url;
+            std::string lower_pat = rule.match_pattern;
+            for (auto& c : lower_url) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (auto& c : lower_pat) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return lower_url.find(lower_pat) != std::string::npos;
+        }
     }
 
     return false;
@@ -2090,6 +2773,15 @@ AutoResponder::match_result_t AutoResponder::match_request(
 bool AutoResponder::start() {
     if (_active.load()) return true;
 
+    if (!device || !device->is_connected()) return false;
+
+    bool cap_active = false;
+    std::uint32_t cap_count = 0, cap_drop = 0;
+    device->get_capture_status(cap_active, cap_count, cap_drop);
+    if (!cap_active)
+        device->start_capture(0, 0, 0);
+
+    device->intercept_op(1, 0, 0, 6);
 
     _active.store(true);
 
@@ -2100,25 +2792,59 @@ bool AutoResponder::start() {
                 continue;
             }
 
-
             auto held = device->get_held_packets();
             for (const auto& pkt : held) {
-                if (pkt.payload.empty()) continue;
+                if (pkt.payload.empty()) {
+                    device->intercept_op(3, 0, 0, 0, pkt.hold_id, nullptr, 0, nullptr, nullptr);
+                    continue;
+                }
 
+                if (pkt.payload.size() > 5 && pkt.payload[0] == 0x16) {
+                    std::string sni = extract_tls_sni(pkt.payload.data(), pkt.payload.size());
+                    if (!sni.empty()) {
+                        std::string https_url = "https://" + sni + "/";
+                        auto tls_match = match_request("CONNECT", https_url, {{"Host", sni}}, "");
+                        if (tls_match.matched) {
+                            std::uint32_t delay = 0;
+                            {
+                                std::lock_guard<std::mutex> rule_lock(_mutex);
+                                auto rule_it = _rules.find(tls_match.rule_id);
+                                if (rule_it != _rules.end())
+                                    delay = rule_it->second.latency_ms;
+                            }
+                            if (delay > 0) {
+                                for (std::uint32_t elapsed = 0;
+                                     elapsed < delay && _active.load();
+                                     elapsed += 10) {
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(
+                                        std::min(10u, delay - elapsed)));
+                                }
+                            }
+                            device->intercept_op(4, 0, 0, 0, pkt.hold_id, nullptr, 0, nullptr, nullptr);
+                            continue;
+                        }
+                    }
+                    device->intercept_op(3, 0, 0, 0, pkt.hold_id, nullptr, 0, nullptr, nullptr);
+                    continue;
+                }
 
                 std::string payload_str(pkt.payload.begin(), pkt.payload.end());
                 std::string method, url;
                 std::map<std::string, std::string> headers;
                 std::string body;
 
-
                 auto first_line_end = payload_str.find("\r\n");
-                if (first_line_end == std::string::npos) continue;
+                if (first_line_end == std::string::npos) {
+                    device->intercept_op(3, 0, 0, 0, pkt.hold_id, nullptr, 0, nullptr, nullptr);
+                    continue;
+                }
                 std::string first_line = payload_str.substr(0, first_line_end);
 
-
                 auto sp1 = first_line.find(' ');
-                if (sp1 == std::string::npos) continue;
+                if (sp1 == std::string::npos) {
+                    device->intercept_op(3, 0, 0, 0, pkt.hold_id, nullptr, 0, nullptr, nullptr);
+                    continue;
+                }
                 method = first_line.substr(0, sp1);
                 auto sp2 = first_line.find(' ', sp1 + 1);
                 if (sp2 == std::string::npos)
@@ -2126,11 +2852,12 @@ bool AutoResponder::start() {
                 else
                     url = first_line.substr(sp1 + 1, sp2 - sp1 - 1);
 
-
                 if (method != "GET" && method != "POST" && method != "PUT" &&
                     method != "DELETE" && method != "HEAD" && method != "OPTIONS" &&
-                    method != "PATCH" && method != "CONNECT") continue;
-
+                    method != "PATCH" && method != "CONNECT") {
+                    device->intercept_op(3, 0, 0, 0, pkt.hold_id, nullptr, 0, nullptr, nullptr);
+                    continue;
+                }
 
                 std::size_t pos = first_line_end + 2;
                 while (pos < payload_str.size()) {
@@ -2144,7 +2871,6 @@ bool AutoResponder::start() {
                         while (!value.empty() && value[0] == ' ') value.erase(0, 1);
                         headers[name] = value;
 
-
                         if (name == "Host" && url[0] == '/') {
                             url = "http://" + value + url;
                         }
@@ -2155,14 +2881,27 @@ bool AutoResponder::start() {
                 if (body_start != std::string::npos && body_start + 4 < payload_str.size())
                     body = payload_str.substr(body_start + 4);
 
-
                 auto match = match_request(method, url, headers, body);
                 if (match.matched) {
-                    if (match.response_body.empty() && match.response_status_line.empty()) {
+                    std::uint32_t delay = 0;
+                    {
+                        std::lock_guard<std::mutex> rule_lock(_mutex);
+                        auto rule_it = _rules.find(match.rule_id);
+                        if (rule_it != _rules.end())
+                            delay = rule_it->second.latency_ms;
+                    }
+                    if (delay > 0) {
+                        for (std::uint32_t elapsed = 0;
+                             elapsed < delay && _active.load();
+                             elapsed += 10) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(
+                                std::min(10u, delay - elapsed)));
+                        }
+                    }
 
+                    if (match.response_body.empty() && match.response_status_line.empty()) {
                         device->intercept_op(4, 0, 0, 0, pkt.hold_id, nullptr, 0, nullptr, nullptr);
                     } else {
-
                         std::string full_resp = match.response_status_line + "\r\n" +
                                                 match.response_headers_str + "\r\n\r\n" +
                                                 match.response_body;
@@ -2172,7 +2911,6 @@ bool AutoResponder::start() {
                             nullptr, nullptr);
                     }
                 } else {
-
                     device->intercept_op(3, 0, 0, 0, pkt.hold_id, nullptr, 0, nullptr, nullptr);
                 }
             }
@@ -2189,6 +2927,10 @@ bool AutoResponder::stop() {
     _active.store(false);
     if (_responder_thread.joinable())
         _responder_thread.join();
+
+    if (device && device->is_connected())
+        device->intercept_op(2, 0, 0, 0);
+
     return true;
 }
 
@@ -2210,6 +2952,7 @@ bool AutoResponder::import_rules(const std::string& json_str) {
             else if (match_type_str == "method_and_url") rule.match_type = autoresponder_match_type::method_and_url;
             else if (match_type_str == "header_contains") rule.match_type = autoresponder_match_type::header_contains;
             else if (match_type_str == "body_contains") rule.match_type = autoresponder_match_type::body_contains;
+            else if (match_type_str == "sni_contains") rule.match_type = autoresponder_match_type::sni_contains;
 
             rule.match_pattern = item.value("match_pattern", "");
             rule.match_method = item.value("match_method", "");
@@ -2254,6 +2997,7 @@ std::string AutoResponder::export_rules() const {
             case autoresponder_match_type::method_and_url: item["match_type"] = "method_and_url"; break;
             case autoresponder_match_type::header_contains: item["match_type"] = "header_contains"; break;
             case autoresponder_match_type::body_contains: item["match_type"] = "body_contains"; break;
+            case autoresponder_match_type::sni_contains: item["match_type"] = "sni_contains"; break;
         }
 
         item["match_pattern"] = rule.match_pattern;

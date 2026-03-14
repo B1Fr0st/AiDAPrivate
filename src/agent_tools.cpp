@@ -20185,6 +20185,7 @@ tool_result_t autoresponder_add_rule(const json& params) {
     else if (mt == "method_and_url") rule.match_type = net_security::autoresponder_match_type::method_and_url;
     else if (mt == "header_contains") rule.match_type = net_security::autoresponder_match_type::header_contains;
     else if (mt == "body_contains") rule.match_type = net_security::autoresponder_match_type::body_contains;
+    else if (mt == "sni_contains") rule.match_type = net_security::autoresponder_match_type::sni_contains;
     else rule.match_type = net_security::autoresponder_match_type::prefix_url;
 
     rule.match_pattern = params.value("match_pattern", "");
@@ -20439,9 +20440,10 @@ void register_tools() {
     r.register_tool({
         OBFSTR("autoresponder_add_rule"), OBFSTR("network_security"),
         OBFSTR("Add an AutoResponder rule (similar to Fiddler's AutoResponder). Rules match intercepted HTTP requests "
-               "by URL pattern, method, headers, or body content, and return custom responses. Supports exact, prefix, "
-               "regex URL matching, custom status codes, headers, response bodies, and file-based responses."),
-        {{OBFSTR("match_type"), OBFSTR("string"), OBFSTR("Match type: exact_url, prefix_url, regex_url, method_and_url, header_contains, body_contains"), false},
+               "by URL pattern, method, headers, or body content, and return custom responses. For HTTPS/TLS traffic, "
+               "use match_type 'sni_contains' to match on the TLS Server Name Indication (domain). "
+               "Supports exact, prefix, regex URL matching, SNI matching, custom status codes, headers, response bodies, and file-based responses."),
+        {{OBFSTR("match_type"), OBFSTR("string"), OBFSTR("Match type: exact_url, prefix_url, regex_url, method_and_url, header_contains, body_contains, sni_contains (for HTTPS)"), false},
          {OBFSTR("match_pattern"), OBFSTR("string"), OBFSTR("Pattern to match against"), true},
          {OBFSTR("match_method"), OBFSTR("string"), OBFSTR("HTTP method filter (e.g., GET, POST)"), false},
          {OBFSTR("status_code"), OBFSTR("number"), OBFSTR("HTTP status code for the response (default: 200)"), false},
@@ -20470,7 +20472,9 @@ void register_tools() {
 
     r.register_tool({
         OBFSTR("autoresponder_start"), OBFSTR("network_security"),
-        OBFSTR("Start the AutoResponder engine. Begins monitoring intercepted HTTP traffic and applying matching rules."),
+        OBFSTR("Start the AutoResponder engine. Automatically enables packet capture and interception. "
+               "Monitors both HTTP (plaintext) and HTTPS (via TLS SNI extraction) traffic. "
+               "Works on any network interface including WiFi. Use sni_contains rules for HTTPS domain blocking."),
         {},
         autoresponder_start, false});
 
