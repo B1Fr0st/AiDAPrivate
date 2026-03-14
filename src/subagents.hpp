@@ -4,6 +4,12 @@
 #include <deque>
 #include <filesystem>
 
+#ifdef __NT__
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 #include "aida_pro.hpp"
 #include "agentic.hpp"
 #include "ai_client.hpp"
@@ -61,6 +67,7 @@ struct instance_info_t
     std::string base_url;
     std::string input_path;
     int port = 0;
+    uint64_t process_id = 0;
     uint64_t updated_at_ms = 0;
     bool is_local = false;
 
@@ -122,6 +129,7 @@ struct thread_context_t
 };
 
 inline thread_local thread_context_t g_thread_context;
+inline std::atomic<int> g_runtime_local_instance_port{0};
 
 template <typename Fn>
 class scope_exit_t
@@ -261,6 +269,7 @@ inline json instance_to_json(const instance_info_t& info)
         {"baseUrl", info.base_url},
         {"inputPath", info.input_path},
         {"port", info.port},
+        {"processId", info.process_id},
         {"updatedAtMs", info.updated_at_ms},
         {"isLocal", info.is_local}
     };
@@ -274,12 +283,91 @@ inline instance_info_t instance_from_json(const json& value)
     info.base_url = value.value("baseUrl", std::string());
     info.input_path = value.value("inputPath", std::string());
     info.port = value.value("port", 0);
+    info.process_id = value.value("processId", static_cast<uint64_t>(0));
     info.updated_at_ms = value.value("updatedAtMs", static_cast<uint64_t>(0));
     info.is_local = value.value("isLocal", false);
     return info;
 }
 
-inline json read_instance_registry()
+class instance_registry_guard_t
+{
+public:
+    instance_registry_guard_t()
+    {
+#ifdef __NT__
+        _handle = CreateMutexW(nullptr, FALSE, L"Local\\AiDA_Subagents_InstanceRegistry_v2");
+        if (_handle != nullptr)
+        {
+            const DWORD wait_result = WaitForSingleObject(_handle, INFINITE);
+            _locked = (wait_result == WAIT_OBJECT_0 || wait_result == WAIT_ABANDONED);
+        }
+#else
+        _lock = std::unique_lock<std::mutex>(mutex());
+#endif
+    }
+
+    ~instance_registry_guard_t()
+    {
+#ifdef __NT__
+        if (_handle != nullptr)
+        {
+            if (_locked)
+                ReleaseMutex(_handle);
+            CloseHandle(_handle);
+        }
+#endif
+    }
+
+    instance_registry_guard_t(const instance_registry_guard_t&) = delete;
+    instance_registry_guard_t& operator=(const instance_registry_guard_t&) = delete;
+
+private:
+#ifndef __NT__
+    static std::mutex& mutex()
+    {
+        static std::mutex s_mutex;
+        return s_mutex;
+    }
+
+    std::unique_lock<std::mutex> _lock;
+#else
+    HANDLE _handle = nullptr;
+    bool _locked = false;
+#endif
+};
+
+inline uint64_t current_process_id()
+{
+#ifdef __NT__
+    return static_cast<uint64_t>(GetCurrentProcessId());
+#else
+    return static_cast<uint64_t>(getpid());
+#endif
+}
+
+inline std::string normalize_instance_token(const std::string& value)
+{
+    return lower_copy(trim_copy(value));
+}
+
+inline std::string local_instance_id_for_process(uint64_t process_id)
+{
+    if (process_id == 0)
+        return "local";
+    return std::string("pid:") + std::to_string(process_id);
+}
+
+inline std::filesystem::file_time_type instance_registry_last_write_time()
+{
+    const std::filesystem::path path = instance_registry_path();
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec))
+        return std::filesystem::file_time_type::min();
+    const auto stamp = std::filesystem::last_write_time(path, ec);
+    return ec ? std::filesystem::file_time_type::min() : stamp;
+}
+
+inline json read_instance_registry_unlocked()
 {
     const std::filesystem::path path = instance_registry_path();
     if (!std::filesystem::exists(path))
@@ -294,7 +382,13 @@ inline json read_instance_registry()
     return parsed.is_array() ? parsed : json::array();
 }
 
-inline void write_instance_registry(const json& registry)
+inline json read_instance_registry()
+{
+    instance_registry_guard_t guard;
+    return read_instance_registry_unlocked();
+}
+
+inline void write_instance_registry_unlocked(const json& registry)
 {
     const std::filesystem::path path = instance_registry_path();
     std::error_code ec;
@@ -305,6 +399,12 @@ inline void write_instance_registry(const json& registry)
     output << json_dump_fast(registry, 2);
 }
 
+inline void write_instance_registry(const json& registry)
+{
+    instance_registry_guard_t guard;
+    write_instance_registry_unlocked(registry);
+}
+
 inline bool probe_instance_endpoint(const instance_info_t& info)
 {
     if (info.base_url.empty() || info.port <= 0)
@@ -313,9 +413,9 @@ inline bool probe_instance_endpoint(const instance_info_t& info)
     try
     {
         httplib::Client cli(info.base_url.c_str());
-        cli.set_connection_timeout(1);
-        cli.set_read_timeout(1);
-        cli.set_write_timeout(1);
+        cli.set_connection_timeout(2);
+        cli.set_read_timeout(2);
+        cli.set_write_timeout(2);
         cli.set_tcp_nodelay(true);
         auto res = cli.Get("/health");
         return res && res->status == 200;
@@ -326,18 +426,24 @@ inline bool probe_instance_endpoint(const instance_info_t& info)
     }
 }
 
-inline std::string local_instance_id_for_port(int port)
+inline int effective_local_instance_port(int port_override = 0)
 {
-    if (port <= 0)
-        return "local";
-    return std::string("127.0.0.1:") + std::to_string(port);
+    if (port_override > 0)
+        return port_override;
+
+    const int runtime_port = g_runtime_local_instance_port.load();
+    if (runtime_port > 0)
+        return runtime_port;
+
+    return 0;
 }
 
 inline instance_info_t current_local_instance_snapshot(int port_override = 0)
 {
     instance_info_t info;
-    const int port = port_override > 0 ? port_override : (g_settings.mcp_enabled ? g_settings.mcp_port : 0);
-    info.instance_id = local_instance_id_for_port(port);
+    const int port = effective_local_instance_port(port_override);
+    info.process_id = current_process_id();
+    info.instance_id = local_instance_id_for_process(info.process_id);
     info.base_url = port > 0 ? (std::string("http://127.0.0.1:") + std::to_string(port)) : std::string();
     info.input_path = current_input_path();
     info.display_name = display_name_from_input_path(info.input_path, port);
@@ -352,61 +458,167 @@ inline void register_local_instance(int port)
     if (port <= 0)
         return;
 
-    json registry = read_instance_registry();
+    g_runtime_local_instance_port.store(port);
+
     const instance_info_t local = current_local_instance_snapshot(port);
-    bool updated = false;
-    for (auto& item : registry)
+    json updated = json::array();
     {
-        if (item.value("instanceId", std::string()) != local.instance_id)
-            continue;
-        item = instance_to_json(local);
-        updated = true;
-        break;
+        instance_registry_guard_t guard;
+        const json registry = read_instance_registry_unlocked();
+        const std::string local_path = normalize_instance_token(local.input_path);
+        for (const auto& item : registry)
+        {
+            const instance_info_t existing = instance_from_json(item);
+            const bool same_process = existing.process_id != 0 && existing.process_id == local.process_id;
+            const bool same_id = existing.instance_id == local.instance_id;
+            const bool same_legacy_slot = existing.port == local.port
+                && normalize_instance_token(existing.input_path) == local_path;
+            if (same_process || same_id || same_legacy_slot)
+                continue;
+            updated.push_back(item);
+        }
+        updated.push_back(instance_to_json(local));
+        write_instance_registry_unlocked(updated);
     }
-    if (!updated)
-        registry.push_back(instance_to_json(local));
-    write_instance_registry(registry);
 }
 
 inline void unregister_local_instance(int port)
 {
-    if (port <= 0)
+    const int effective_port = effective_local_instance_port(port);
+    const uint64_t local_pid = current_process_id();
+    const std::string local_instance_id = local_instance_id_for_process(local_pid);
+    const std::string local_path = normalize_instance_token(current_input_path());
+
+    if (effective_port <= 0 && local_pid == 0)
         return;
 
-    json registry = read_instance_registry();
+    g_runtime_local_instance_port.store(0);
+
     json updated = json::array();
-    const std::string instance_id = local_instance_id_for_port(port);
+    instance_registry_guard_t guard;
+    const json registry = read_instance_registry_unlocked();
     for (const auto& item : registry)
     {
-        if (item.value("instanceId", std::string()) == instance_id)
+        const instance_info_t existing = instance_from_json(item);
+        const bool same_process = existing.process_id != 0 && existing.process_id == local_pid;
+        const bool same_id = existing.instance_id == local_instance_id;
+        const bool same_legacy_slot = effective_port > 0
+            && existing.port == effective_port
+            && normalize_instance_token(existing.input_path) == local_path;
+        if (same_process || same_id || same_legacy_slot)
             continue;
         updated.push_back(item);
     }
-    write_instance_registry(updated);
+    write_instance_registry_unlocked(updated);
 }
 
 inline std::vector<instance_info_t> list_registered_instances(bool include_local = true, bool probe = true)
 {
-    json registry = read_instance_registry();
+    static std::mutex s_probe_cache_mutex;
+    static std::vector<instance_info_t> s_probed_remotes;
+    static uint64_t s_probe_cache_time = 0;
+    static std::filesystem::file_time_type s_probe_cache_registry_mtime = std::filesystem::file_time_type::min();
+    constexpr uint64_t PROBE_CACHE_TTL_MS = 10000;
+
+    const auto registry_mtime = instance_registry_last_write_time();
+
+    if (probe)
+    {
+        std::lock_guard<std::mutex> lock(s_probe_cache_mutex);
+        if (s_probe_cache_time > 0
+            && (now_ms() - s_probe_cache_time) < PROBE_CACHE_TTL_MS
+            && s_probe_cache_registry_mtime == registry_mtime)
+        {
+            std::vector<instance_info_t> result = s_probed_remotes;
+            if (include_local)
+                result.insert(result.begin(), current_local_instance_snapshot());
+            msg("AiDA [instances]: returning %d instance(s) from cache:\n", (int)result.size());
+            for (const auto& inst : result)
+                msg("AiDA [instances]:   [%s] %s local=%d port=%d path=%s\n",
+                    inst.instance_id.c_str(), inst.display_name.c_str(),
+                    (int)inst.is_local, inst.port, inst.input_path.c_str());
+            std::sort(result.begin(), result.end(), [](const instance_info_t& a, const instance_info_t& b) {
+                if (a.is_local != b.is_local)
+                    return a.is_local;
+                return a.display_name < b.display_name;
+            });
+            return result;
+        }
+    }
+
+    json registry;
+    {
+        instance_registry_guard_t guard;
+        registry = read_instance_registry_unlocked();
+    }
+
     std::vector<instance_info_t> instances;
     instances.reserve(registry.is_array() ? registry.size() + 1 : 1);
 
-    json cleaned = json::array();
+    const instance_info_t local = current_local_instance_snapshot();
+    const int local_port = effective_local_instance_port();
+    msg("AiDA [instances]: registry has %d entries, local_port=%d\n",
+        (int)(registry.is_array() ? registry.size() : 0), local_port);
+
+    std::unordered_map<std::string, instance_info_t> deduped;
+
     for (const auto& item : registry)
     {
         instance_info_t info = instance_from_json(item);
         if (info.instance_id.empty() || info.port <= 0 || info.base_url.empty())
+        {
+            msg("AiDA [instances]:   SKIP (invalid) id=%s port=%d url=%s\n",
+                info.instance_id.c_str(), info.port, info.base_url.c_str());
             continue;
+        }
+
+        const bool same_process = info.process_id != 0 && local.process_id != 0 && info.process_id == local.process_id;
+        const bool same_id = !info.instance_id.empty() && info.instance_id == local.instance_id;
+        const bool same_legacy_slot = local_port > 0
+            && info.port == local_port
+            && normalize_instance_token(info.input_path) == normalize_instance_token(local.input_path);
+        if (same_process || same_id || same_legacy_slot)
+        {
+            msg("AiDA [instances]:   SKIP (local-dup) %s port=%d path=%s\n",
+                info.instance_id.c_str(), info.port, info.input_path.c_str());
+            continue;
+        }
         if (probe && !probe_instance_endpoint(info))
+        {
+            msg("AiDA [instances]:   SKIP (probe-fail) %s port=%d url=%s path=%s\n",
+                info.instance_id.c_str(), info.port, info.base_url.c_str(), info.input_path.c_str());
             continue;
-        cleaned.push_back(instance_to_json(info));
-        instances.push_back(std::move(info));
+        }
+        msg("AiDA [instances]:   OK %s port=%d path=%s\n",
+            info.instance_id.c_str(), info.port, info.input_path.c_str());
+
+        const std::string dedupe_key = !info.instance_id.empty()
+            ? info.instance_id
+            : (std::string("legacy:") + std::to_string(info.port) + ":" + normalize_instance_token(info.input_path));
+        auto existing = deduped.find(dedupe_key);
+        if (existing == deduped.end() || existing->second.updated_at_ms <= info.updated_at_ms)
+            deduped[dedupe_key] = std::move(info);
     }
-    if (cleaned != registry)
-        write_instance_registry(cleaned);
+
+    for (auto& [_, info] : deduped)
+        instances.push_back(std::move(info));
+
+    if (probe)
+    {
+        std::lock_guard<std::mutex> lock(s_probe_cache_mutex);
+        s_probed_remotes = instances;
+        s_probe_cache_time = now_ms();
+        s_probe_cache_registry_mtime = registry_mtime;
+    }
 
     if (include_local)
-        instances.insert(instances.begin(), current_local_instance_snapshot());
+        instances.insert(instances.begin(), local);
+
+    msg("AiDA [instances]: returning %d instance(s):\n", (int)instances.size());
+    for (const auto& inst : instances)
+        msg("AiDA [instances]:   [%s] %s local=%d port=%d path=%s\n",
+            inst.instance_id.c_str(), inst.display_name.c_str(),
+            (int)inst.is_local, inst.port, inst.input_path.c_str());
 
     std::sort(instances.begin(), instances.end(), [](const instance_info_t& a, const instance_info_t& b) {
         if (a.is_local != b.is_local)
@@ -434,8 +646,10 @@ inline bool resolve_target_instance(const std::string& token, instance_info_t* o
         const std::string id = lower_copy(info.instance_id);
         const std::string name = lower_copy(info.display_name);
         const std::string path = lower_copy(info.input_path);
+        const std::string base_url = lower_copy(info.base_url);
         const std::string port = std::to_string(info.port);
-        if (needle == id || needle == name || needle == info.base_url || needle == port)
+        const std::string process_id = info.process_id > 0 ? std::to_string(info.process_id) : std::string();
+        if (needle == id || needle == name || needle == path || needle == base_url || needle == port || needle == process_id)
         {
             *out = info;
             return true;
@@ -550,8 +764,10 @@ public:
             return
                 "Sub-agent tools are available. Use `sessions_spawn` for independent or slow branches that can run in parallel.\n"
                 "`sessions_spawn` is non-blocking: it returns immediately with a run id and child session key.\n"
-                "Child completions are announced back automatically in later rounds. Use `subagents` or `sessions_history` only when you need to inspect, steer, or cancel a child explicitly.\n"
-                "If another live AiDA instance is needed, discover targets with `subagents` using operation `instances`, then pass `targetInstance` to `sessions_spawn`.\n";
+                "Child completions are announced back AUTOMATICALLY as Runtime Updates in subsequent rounds.\n"
+                "CRITICAL: Do NOT poll `sessions_history` or `sessions_list` in a loop \u2014 announce-backs arrive passively without any action from you.\n"
+                "Only use `sessions_history` ONCE after a child is confirmed completed if you need its full transcript.\n"
+                "If another live AiDA instance is needed, call `subagents` with operation `instances` ONCE to discover them, then pass `targetInstance` (inputPath, displayName, or instanceId) to `sessions_spawn`.\n";
         }
 
         if (!g_thread_context.session->allow_session_tools)
@@ -559,14 +775,15 @@ public:
             return
                 "You are running as a leaf sub-agent in an isolated session.\n"
                 "Focus only on the assigned task, use the tools you already have, and return concise, evidence-backed findings for the parent agent.\n"
-                "Do not address the end user directly and do not ask for more session control tools.\n";
+                "Do not address the end user directly and do not ask for more session control tools.\n"
+                "Finish your task quickly and return a final plain-text answer.\n";
         }
 
         return
             "You are running as an orchestrator-capable sub-agent.\n"
             "You may use `sessions_spawn` to fan out independent branches, but keep the fan-out focused and bounded.\n"
-            "Use `subagents`, `sessions_list`, and `sessions_history` to monitor or synthesize child results.\n"
-            "Use `subagents` with operation `instances` when you need to target a different live IDA instance.\n";
+            "Child results arrive AUTOMATICALLY as Runtime Updates \u2014 do NOT poll `sessions_history` in a loop.\n"
+            "Use `subagents` with operation `instances` ONCE when you need to discover a different live IDA instance.\n";
     }
 
     int current_depth() const
@@ -593,6 +810,8 @@ public:
         if (!g_thread_context.session)
             return current_local_instance_snapshot();
         if (g_thread_context.session->target_instance.instance_id.empty())
+            return current_local_instance_snapshot();
+        if (g_thread_context.session->target_instance.is_local)
             return current_local_instance_snapshot();
         return g_thread_context.session->target_instance;
     }
@@ -664,9 +883,28 @@ public:
             return json{{"status", "error"}, {"message", "sessions_spawn is only available while an agent run is active."}};
         }
 
-        const std::string normalized_mode = request.mode.empty() ? "run" : lower_copy(request.mode);
+        const std::string normalized_mode = request.mode.empty()
+            ? (request.thread ? "session" : "run")
+            : lower_copy(request.mode);
         const std::string normalized_cleanup = request.cleanup.empty() ? "keep" : lower_copy(request.cleanup);
         const std::string normalized_sandbox = request.sandbox.empty() ? "inherit" : lower_copy(request.sandbox);
+
+        if (normalized_mode != "run" && normalized_mode != "session")
+            return json{{"status", "error"}, {"message", "Invalid sub-agent mode. Expected 'run' or 'session'."}};
+        if (normalized_mode == "session" && !request.thread)
+            return json{{"status", "error"}, {"message", "mode='session' requires thread=true."}};
+        if (normalized_cleanup != "keep" && normalized_cleanup != "delete")
+            return json{{"status", "error"}, {"message", "Invalid cleanup mode. Expected 'keep' or 'delete'."}};
+        if (normalized_sandbox != "inherit" && normalized_sandbox != "require")
+            return json{{"status", "error"}, {"message", "Invalid sandbox mode. Expected 'inherit' or 'require'."}};
+        if (normalized_sandbox == "require")
+            return json{{"status", "error"}, {"message", "sandbox='require' is not supported by the current AiDA runtime."}};
+
+        instance_info_t target_instance;
+        if (!resolve_target_instance(request.target_instance, &target_instance))
+        {
+            return json{{"status", "error"}, {"message", "Unknown or unreachable target IDA instance."}};
+        }
 
         std::lock_guard<std::mutex> lock(_mutex);
         archive_expired_sessions_locked();
@@ -688,12 +926,6 @@ public:
             return json{{"status", "error"}, {"message", "Per-agent active child limit reached."}};
         }
 
-        instance_info_t target_instance;
-        if (!resolve_target_instance(request.target_instance, &target_instance))
-        {
-            return json{{"status", "error"}, {"message", "Unknown or unreachable target IDA instance."}};
-        }
-
         const uint64_t numeric_id = ++_session_counter;
         auto child = std::make_shared<session_record_t>();
         child->session_id = make_session_id(numeric_id);
@@ -704,8 +936,8 @@ public:
         child->requester_session_key = parent->session_key;
         child->requester_run_id = g_thread_context.run_id;
         child->depth = next_depth;
-        child->allow_session_tools = (_max_spawn_depth >= 2 && next_depth == 1);
-        child->allow_spawn_children = (next_depth < _max_spawn_depth);
+        child->allow_session_tools = false;
+        child->allow_spawn_children = false;
         child->model = sanitize_utf8(request.model);
         child->thinking = sanitize_utf8(request.thinking);
         child->run_timeout_seconds = request.run_timeout_seconds > 0
@@ -1334,9 +1566,9 @@ private:
             config.context_block = session->assigned_context_block;
             config.chat_history = session->assigned_chat_history;
             config.max_context_tokens = settings_snapshot.get_active_context_window();
-            config.max_rounds = 24;
-            config.agentic_output_tokens = 8192;
-            config.synthesis_output_tokens = 8192;
+            config.max_rounds = session->allow_session_tools ? 16 : 8;
+            config.agentic_output_tokens = session->allow_session_tools ? 8192 : 4096;
+            config.synthesis_output_tokens = 4096;
             apply_thinking_profile(config, session->thinking);
 
             session->input_tokens = agentic::estimate_tokens(prompt);
@@ -1453,6 +1685,28 @@ private:
     uint64_t _previous_run_id = 0;
 };
 
+class execution_context_scope_t
+{
+public:
+    execution_context_scope_t(std::shared_ptr<session_record_t> session, uint64_t run_id)
+        : _previous_session(g_thread_context.session),
+          _previous_run_id(g_thread_context.run_id)
+    {
+        g_thread_context.session = std::move(session);
+        g_thread_context.run_id = run_id;
+    }
+
+    ~execution_context_scope_t()
+    {
+        g_thread_context.session = _previous_session;
+        g_thread_context.run_id = _previous_run_id;
+    }
+
+private:
+    std::shared_ptr<session_record_t> _previous_session;
+    uint64_t _previous_run_id = 0;
+};
+
 inline manager_t& manager()
 {
     return manager_t::instance();
@@ -1486,6 +1740,11 @@ inline std::string session_prompt_guidance()
 inline std::string current_session_key()
 {
     return manager().current_session_key();
+}
+
+inline std::shared_ptr<session_record_t> current_session_record()
+{
+    return g_thread_context.session;
 }
 
 inline uint64_t current_run_id()

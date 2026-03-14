@@ -24,7 +24,7 @@ struct config_t
     int max_tool_result_chars = 24576;
     int agentic_output_tokens = 16384;
     int synthesis_output_tokens = 16384;
-    int max_rounds = 45;
+    int max_rounds = 25;
     std::string user_message;
     std::string context_block;
     std::string chat_history;

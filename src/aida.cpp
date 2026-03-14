@@ -687,14 +687,14 @@ void aida_plugin_t::start_mcp_server()
     }
 
     mcp_server->write_mcp_client_configs();
-    subagents::register_local_instance(g_settings.mcp_port);
+    subagents::register_local_instance(mcp_server->get_port());
 }
 
 void aida_plugin_t::stop_mcp_server()
 {
     if (mcp_server)
     {
-        subagents::unregister_local_instance(g_settings.mcp_port);
+        subagents::unregister_local_instance(mcp_server->get_port());
         mcp_server->stop();
         mcp_server.reset();
     }

@@ -87,7 +87,7 @@ namespace ioctl_codes {
     __forceinline DWORD MEX()   { return make(17); }
     __forceinline DWORD V2P()   { return make(18); }
 
-    // Network capture IOCTLs
+
     __forceinline DWORD NCON() { return make(19); }
     __forceinline DWORD NCAP() { return make(20); }
     __forceinline DWORD NCPG() { return make(21); }
@@ -95,25 +95,25 @@ namespace ioctl_codes {
     __forceinline DWORD NFLT() { return make(23); }
     __forceinline DWORD NSTS() { return make(24); }
 
-    // Advanced network recon IOCTLs
+
     __forceinline DWORD EWFP() { return make(25); }
     __forceinline DWORD GSKT() { return make(26); }
     __forceinline DWORD SNBF() { return make(27); }
     __forceinline DWORD DTCP() { return make(28); }
 
-    // MITM / deep-packet-inspection / interception IOCTLs
-    __forceinline DWORD PINJ() { return make(29); }   // packet inject
-    __forceinline DWORD PMOD() { return make(30); }   // packet modify rule
-    __forceinline DWORD PRED() { return make(31); }   // traffic redirect
-    __forceinline DWORD STRM() { return make(32); }   // stream reassembly
-    __forceinline DWORD DPIN() { return make(33); }   // deep packet inspection
-    __forceinline DWORD IHLD() { return make(34); }   // intercept-and-hold
-    __forceinline DWORD CKIL() { return make(35); }   // connection kill
-    __forceinline DWORD DNSS() { return make(36); }   // DNS spoof
-    __forceinline DWORD BWMN() { return make(37); }   // bandwidth monitor
-    __forceinline DWORD NIFS() { return make(38); }   // network interfaces
-    __forceinline DWORD PCEX() { return make(39); }   // PCAP export
-    __forceinline DWORD NFPR() { return make(40); }   // network fingerprint
+
+    __forceinline DWORD PINJ() { return make(29); }
+    __forceinline DWORD PMOD() { return make(30); }
+    __forceinline DWORD PRED() { return make(31); }
+    __forceinline DWORD STRM() { return make(32); }
+    __forceinline DWORD DPIN() { return make(33); }
+    __forceinline DWORD IHLD() { return make(34); }
+    __forceinline DWORD CKIL() { return make(35); }
+    __forceinline DWORD DNSS() { return make(36); }
+    __forceinline DWORD BWMN() { return make(37); }
+    __forceinline DWORD NIFS() { return make(38); }
+    __forceinline DWORD PCEX() { return make(39); }
+    __forceinline DWORD NFPR() { return make(40); }
 }
 
 namespace voyager {
@@ -349,9 +349,7 @@ namespace voyager {
         };
         static_assert(sizeof(virt_to_phys_request) == 24, "virt_to_phys_request size mismatch");
 
-        // ============================================================
-        // Network capture structures (mirror kernel Struct.h)
-        // ============================================================
+
 #pragma pack(push, 8)
 
         static constexpr std::size_t MAX_NET_CONNECTIONS = 1024;
@@ -461,9 +459,6 @@ namespace voyager {
         };
         static_assert(sizeof(net_stats_request) == 64, "net_stats_request size mismatch");
 
-        // ============================================================
-        // Advanced network recon structures
-        // ============================================================
 
         static constexpr std::size_t MAX_WFP_CALLOUTS = 256;
         static constexpr std::size_t MAX_SOCKET_HANDLES = 512;
@@ -567,11 +562,7 @@ namespace voyager {
             tcpip_conn_entry entries[MAX_TCPIP_CONNECTIONS];
         };
 
-        // =================================================================
-        // MITM / Deep Packet Inspection / Interception structs
-        // =================================================================
 
-        // --- Packet injection ---
         static constexpr std::uint32_t INJECT_MAX_PAYLOAD = 1500;
 
         struct packet_inject_request {
@@ -590,14 +581,14 @@ namespace voyager {
             std::uint8_t  payload[INJECT_MAX_PAYLOAD];
         };
 
-        // --- Packet modification rules ---
+
         static constexpr std::uint32_t MOD_MAX_PATTERN = 256;
         static constexpr std::uint32_t MOD_MAX_REPLACE = 256;
         static constexpr std::uint32_t MOD_MAX_RULES   = 32;
 
         struct packet_mod_rule {
             std::uint32_t rule_id;
-            std::uint32_t operation;        // 0=add, 1=remove, 2=list, 3=clear
+            std::uint32_t operation;
             std::uint32_t direction;
             std::uint32_t protocol;
             std::uint32_t port;
@@ -616,12 +607,12 @@ namespace voyager {
             packet_mod_rule rules[MOD_MAX_RULES];
         };
 
-        // --- Traffic redirect rules ---
+
         static constexpr std::uint32_t REDIR_MAX_RULES = 16;
 
         struct traffic_redirect_rule {
             std::uint32_t rule_id;
-            std::uint32_t operation;        // 0=add, 1=remove, 2=list, 3=clear
+            std::uint32_t operation;
             std::uint32_t protocol;
             std::uint32_t match_port;
             std::uint8_t  match_addr[16];
@@ -638,11 +629,11 @@ namespace voyager {
             traffic_redirect_rule rules[REDIR_MAX_RULES];
         };
 
-        // --- TCP stream reassembly ---
+
         static constexpr std::uint32_t STREAM_MAX_SIZE = 64 * 1024;
 
         struct stream_reassemble_request {
-            std::uint32_t operation;        // 0=start, 1=stop, 2=get_data, 3=list
+            std::uint32_t operation;
             std::uint32_t src_port;
             std::uint32_t dst_port;
             std::uint32_t pid;
@@ -655,7 +646,7 @@ namespace voyager {
             std::uint8_t  stream_data[STREAM_MAX_SIZE];
         };
 
-        // --- Deep packet inspection ---
+
         static constexpr std::uint32_t DPI_MAX_RESULTS = 64;
 
         struct dpi_header_info {
@@ -689,13 +680,13 @@ namespace voyager {
             std::uint32_t filter_pid;
             std::uint32_t filter_protocol;
             std::uint32_t filter_port;
-            std::uint32_t flags;            // bit0=http_only, bit1=tls_only, bit2=dns_only
+            std::uint32_t flags;
             std::uint32_t result_count;
             std::uint32_t padding;
             dpi_header_info results[DPI_MAX_RESULTS];
         };
 
-        // --- Intercept-and-hold (Burp Suite proxy mode) ---
+
         static constexpr std::uint32_t INTERCEPT_MAX_HELD    = 32;
         static constexpr std::uint32_t INTERCEPT_MAX_PAYLOAD = 1500;
 
@@ -716,7 +707,7 @@ namespace voyager {
         };
 
         struct intercept_request {
-            std::uint32_t operation;        // 0=enable, 1=disable, 2=get_held, 3=release, 4=drop, 5=modify_release
+            std::uint32_t operation;
             std::uint32_t filter_pid;
             std::uint32_t filter_port;
             std::uint32_t filter_protocol;
@@ -730,7 +721,7 @@ namespace voyager {
             held_packet   held_packets[INTERCEPT_MAX_HELD];
         };
 
-        // --- Connection kill (RST injection) ---
+
         struct conn_kill_request {
             std::uint32_t protocol;
             std::uint32_t address_family;
@@ -742,13 +733,13 @@ namespace voyager {
             std::uint32_t status;
         };
 
-        // --- DNS spoofing ---
+
         static constexpr std::uint32_t DNS_SPOOF_MAX_RULES  = 32;
         static constexpr std::uint32_t DNS_SPOOF_MAX_DOMAIN = 128;
 
         struct dns_spoof_rule {
             std::uint32_t rule_id;
-            std::uint32_t operation;        // 0=add, 1=remove, 2=list, 3=clear
+            std::uint32_t operation;
             char          domain[DNS_SPOOF_MAX_DOMAIN];
             std::uint8_t  spoof_addr[16];
             std::uint32_t address_family;
@@ -763,7 +754,7 @@ namespace voyager {
             dns_spoof_rule rules[DNS_SPOOF_MAX_RULES];
         };
 
-        // --- Bandwidth monitoring ---
+
         static constexpr std::uint32_t BW_MAX_PROCESSES = 128;
 
         struct bw_process_entry {
@@ -778,7 +769,7 @@ namespace voyager {
         static_assert(sizeof(bw_process_entry) == 48, "bw_process_entry size mismatch");
 
         struct bw_monitor_request {
-            std::uint32_t operation;        // 0=start, 1=stop, 2=get_stats, 3=reset, 4=get_per_process
+            std::uint32_t operation;
             std::uint32_t filter_pid;
             std::uint64_t total_bytes_sent;
             std::uint64_t total_bytes_recv;
@@ -791,7 +782,7 @@ namespace voyager {
             bw_process_entry processes[BW_MAX_PROCESSES];
         };
 
-        // --- Network interface enumeration ---
+
         static constexpr std::uint32_t NET_IF_MAX      = 32;
         static constexpr std::uint32_t NET_IF_NAME_LEN = 64;
 
@@ -818,15 +809,15 @@ namespace voyager {
             net_interface_entry interfaces[NET_IF_MAX];
         };
 
-        // --- PCAP export ---
+
         struct pcap_global_header {
-            std::uint32_t magic_number;     // 0xa1b2c3d4
-            std::uint16_t version_major;    // 2
-            std::uint16_t version_minor;    // 4
+            std::uint32_t magic_number;
+            std::uint16_t version_major;
+            std::uint16_t version_minor;
             std::int32_t  thiszone;
             std::uint32_t sigfigs;
             std::uint32_t snaplen;
-            std::uint32_t network;          // 101=raw IP
+            std::uint32_t network;
         };
 
         static constexpr std::uint32_t PCAP_MAX_EXPORT_PACKETS = 256;
@@ -841,7 +832,7 @@ namespace voyager {
         };
 
         struct pcap_export_request {
-            std::uint32_t operation;        // 0=start_export, 1=get_data
+            std::uint32_t operation;
             std::uint32_t filter_pid;
             std::uint32_t filter_protocol;
             std::uint32_t max_packets;
@@ -851,7 +842,7 @@ namespace voyager {
             pcap_record records[PCAP_MAX_EXPORT_PACKETS];
         };
 
-        // --- Network fingerprinting ---
+
         static constexpr std::uint32_t FINGERPRINT_MAX = 64;
 
         struct net_fingerprint_entry {
@@ -869,7 +860,7 @@ namespace voyager {
         };
 
         struct net_fingerprint_request {
-            std::uint32_t operation;        // 0=enable, 1=disable, 2=get
+            std::uint32_t operation;
             std::uint32_t result_count;
             net_fingerprint_entry entries[FINGERPRINT_MAX];
         };
@@ -1057,7 +1048,7 @@ namespace voyager {
         bool set_hardware_breakpoint(std::uint32_t tid, int index, std::uint64_t address, int type = 0, int size = 0) noexcept;
         bool clear_hardware_breakpoint(std::uint32_t tid, int index) noexcept;
 
-        // Network capture methods
+
         struct net_connection_info {
             std::uint32_t pid;
             std::uint32_t protocol;
@@ -1117,7 +1108,7 @@ namespace voyager {
         bool clear_filter_rules() noexcept;
         bool get_network_stats(network_stats& stats) noexcept;
 
-        // Advanced network recon
+
         struct wfp_callout_info {
             std::uint64_t classify_fn;
             std::uint64_t notify_fn;
@@ -1177,7 +1168,7 @@ namespace voyager {
         };
         std::vector<tcpip_connection> dump_tcpip_connections(std::uint32_t target_pid = 0, std::uint32_t filter_protocol = 0) noexcept;
 
-        // MITM / interception methods
+
         bool inject_packet(std::uint32_t direction, std::uint32_t protocol, std::uint32_t af,
                            std::uint32_t src_port, std::uint32_t dst_port,
                            const std::uint8_t* src_addr, const std::uint8_t* dst_addr,

@@ -634,8 +634,10 @@ static std::string build_active_subagent_block(int active_children)
     std::ostringstream ss;
     ss << "\n\n## Active Sub-Agent Constraint\n"
        << "You still have " << active_children << " active sub-agent(s).\n"
-       << "Do NOT finalize the task yet. Wait for their announce-back updates, inspect them with `subagents` / `sessions_history`, or continue independent work.\n"
-       << "A final plain-text answer is only valid after all required child results are accounted for or explicitly cancelled.\n";
+       << "Their results will arrive AUTOMATICALLY as Runtime Updates in subsequent rounds.\n"
+       << "Do NOT poll `sessions_history` or `sessions_list` — results are delivered passively.\n"
+       << "You may continue independent work with other tools, or write a brief status note and emit a minimal tool call (e.g. `get_binary_info`) to advance to the next round where the announce-back will appear.\n"
+       << "If children are taking too long, call `subagents` with operation `kill` and id `all` to cancel and finalize now.\n";
     return ss.str();
 }
 
@@ -744,6 +746,14 @@ searches, or parallel evidence gathering, you SHOULD spawn at least one focused 
 of doing every exploratory branch serially in the main agent. Good candidates are: alternative string/xref
 hunts, parallel call-chain tracing, separate structure reconstruction, or investigating a second hypothesis.
 The main agent should orchestrate and synthesize; it should not monopolize every independent branch.
+
+**SUB-AGENT DISCIPLINE:**
+- Before targeting another live IDA instance, call `subagents` with `{"operation":"instances"}` ONCE to discover the exact available targets. Do NOT call it again — the result is stable within a run.
+- Use the exact `targetInstance` field in `sessions_spawn` when aiming work at another IDA instance. Pass the `inputPath`, `displayName`, or `instanceId` from the instances list.
+- Do NOT repeat an identical `sessions_spawn` request after it has already been accepted or failed; inspect the result, then change the target or task if needed.
+- If child sub-agents are active, their results arrive AUTOMATICALLY as Runtime Updates in later rounds. Do NOT poll `sessions_history` or `sessions_list` in a loop — this wastes rounds and returns stale data.
+- Only use `sessions_history` ONCE AFTER a child is confirmed completed (via announce-back) if you need its full transcript.
+- NEVER spawn more than one sub-agent per target IDA instance for the same task.
 
 You can call AS MANY tools as you want per round — there is NO limit on tool count per round.
 You can execute AS MANY rounds as you need — there is NO limit on rounds (up to 25).
@@ -1303,9 +1313,13 @@ struct tool_exec_request_t : public exec_request_t
     std::string tool_name;
     json params;
     tool_execution_t result;
+    std::shared_ptr<subagents::session_record_t> session;
+    uint64_t run_id = 0;
 
     ssize_t idaapi execute() override
     {
+        subagents::execution_context_scope_t scope(session, run_id);
+
         auto& registry = agent_tools::ToolRegistry::instance();
         result.tool_name = tool_name;
         result.params = params;
@@ -1398,6 +1412,7 @@ result_t run(
     std::string last_reasoning;
     bool finished = false;
     bool auto_spawned_recon_child = false;
+    bool withhold_deadline_exhausted = false;
 
     for (int current_round = 1; current_round <= max_rounds && !finished; ++current_round)
     {
@@ -1492,7 +1507,7 @@ result_t run(
         if (!has_tool_calls(ai_response))
         {
             const int active_children = subagents::current_active_child_count();
-            if (active_children > 0)
+            if (active_children > 0 && !withhold_deadline_exhausted)
             {
                 if (config.verbose_logging)
                 {
@@ -1510,7 +1525,37 @@ result_t run(
                     on_status(status);
                 }
 
-                subagents::wait_for_update_for_current_run(1500);
+                constexpr int WITHHOLD_POLL_MS = 3000;
+                constexpr int WITHHOLD_DEADLINE_MS = 30000;
+                auto withhold_start = std::chrono::steady_clock::now();
+
+                while (!(cancelled && cancelled->load()))
+                {
+                    if (subagents::wait_for_update_for_current_run(WITHHOLD_POLL_MS))
+                        break;
+
+                    const int still_active = subagents::current_active_child_count();
+                    if (still_active <= 0)
+                        break;
+
+                    const auto elapsed = std::chrono::steady_clock::now() - withhold_start;
+                    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+                    if (elapsed_ms >= WITHHOLD_DEADLINE_MS)
+                    {
+                        if (config.verbose_logging)
+                            msg(OBFSTR_C("AiDA Agent: withholding deadline reached (%ds), proceeding with available data.\n"),
+                                WITHHOLD_DEADLINE_MS / 1000);
+                        withhold_deadline_exhausted = true;
+                        break;
+                    }
+
+                    if (config.verbose_logging)
+                    {
+                        msg(OBFSTR_C("AiDA Agent: still waiting on %d active sub-agent(s); deferring another AI round until an update arrives.\n"),
+                            still_active);
+                    }
+                }
+
                 current_prompt = build_continuation_prompt(
                     initial_prompt,
                     all_round_results,
@@ -1525,9 +1570,6 @@ result_t run(
             result.final_response = cleaned.empty() ? ai_response : cleaned;
 
             if (config.verbose_logging)
-    if (result.was_cancelled)
-        subagents::kill_all_visible(true);
-
                 msg(OBFSTR_C("AiDA Agent: Round %d — final answer (no tool calls).\n"), current_round);
 
             finished = true;
@@ -1623,7 +1665,8 @@ result_t run(
             const auto* tool_def = registry.get_tool(tool_name);
 
             std::string cache_key = tool_name + "|" + params.dump(-1, ' ', false, json::error_handler_t::replace);
-            if (tool_def && tool_def->read_only)
+            const bool is_session_tool = subagents::is_session_tool_name(tool_name);
+            if (tool_def && tool_def->read_only && !is_session_tool)
             {
                 auto cache_it = tool_cache.find(cache_key);
                 if (cache_it != tool_cache.end())
@@ -1661,12 +1704,20 @@ result_t run(
             tool_exec_request_t exec_req;
             exec_req.tool_name = tool_name;
             exec_req.params = params;
+            exec_req.session = subagents::current_session_record();
+            exec_req.run_id = subagents::current_run_id();
 
-            int mff_flag = (tool_def && tool_def->read_only) ? MFF_READ : MFF_WRITE;
+            if (is_session_tool)
+            {
+                exec_req.execute();
+            }
+            else
+            {
+                int mff_flag = (tool_def && tool_def->read_only) ? MFF_READ : MFF_WRITE;
+                execute_sync(exec_req, mff_flag);
+            }
 
-            execute_sync(exec_req, mff_flag);
-
-            if (tool_def && tool_def->read_only && exec_req.result.success)
+            if (tool_def && tool_def->read_only && !is_session_tool && exec_req.result.success)
                 tool_cache[cache_key] = exec_req.result;
 
             if (on_status)
@@ -1932,6 +1983,9 @@ result_t run(
     {
         result.final_response = OBFSTR("Tool execution complete. See agent actions above for results.");
     }
+
+    if (result.was_cancelled)
+        subagents::kill_all_visible(true);
 
     if (config.verbose_logging)
         msg(OBFSTR_C("AiDA Agent: Agent cycle complete. %d round(s), %zu total tool(s) executed.\n"),

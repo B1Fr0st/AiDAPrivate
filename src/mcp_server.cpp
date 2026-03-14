@@ -1,5 +1,6 @@
 #include "aida_pro.hpp"
 #include "ida_utils.hpp"
+#include "subagents.hpp"
 
 #include <queue>
 
@@ -35,9 +36,12 @@ struct mcp_tool_exec_request_t : public exec_request_t
     std::string tool_name;
     json tool_params;
     agent_tools::tool_result_t result;
+    std::shared_ptr<subagents::session_record_t> session;
+    uint64_t run_id = 0;
 
     ssize_t idaapi execute() override
     {
+        subagents::execution_context_scope_t scope(session, run_id);
         result = agent_tools::ToolRegistry::instance().execute_tool(tool_name, tool_params);
         return 0;
     }
@@ -48,9 +52,12 @@ struct mcp_resource_exec_request_t : public exec_request_t
     std::string tool_name;
     json tool_params;
     agent_tools::tool_result_t result;
+    std::shared_ptr<subagents::session_record_t> session;
+    uint64_t run_id = 0;
 
     ssize_t idaapi execute() override
     {
+        subagents::execution_context_scope_t scope(session, run_id);
         result = agent_tools::ToolRegistry::instance().execute_tool(tool_name, tool_params);
         return 0;
     }
@@ -202,6 +209,8 @@ static agent_tools::tool_result_t execute_tool_in_main_thread(
     mcp_tool_exec_request_t req;
     req.tool_name = name;
     req.tool_params = params;
+    req.session = subagents::current_session_record();
+    req.run_id = subagents::current_run_id();
 
     int mff_flag = tool_def->read_only ? MFF_READ : MFF_WRITE;
     execute_sync(req, mff_flag);
@@ -214,6 +223,8 @@ static agent_tools::tool_result_t execute_resource_read(const mcp_resource_def_t
     mcp_resource_exec_request_t req;
     req.tool_name = rdef.backing_tool;
     req.tool_params = rdef.backing_params;
+    req.session = subagents::current_session_record();
+    req.run_id = subagents::current_run_id();
     execute_sync(req, MFF_READ);
     return req.result;
 }
@@ -1038,7 +1049,7 @@ bool mcp_server_t::start(int port)
     }
 
     _stop_requested = false;
-    _port = port;
+    _port = 0;
 
     try
     {
@@ -1056,10 +1067,12 @@ bool mcp_server_t::start(int port)
     if (_running.load())
     {
         size_t tool_count = agent_tools::ToolRegistry::instance().get_tool_names().size();
-        msg(OBFSTR_C("AiDA MCP: Server started on http://127.0.0.1:%d\n"), port);
+        msg(OBFSTR_C("AiDA MCP: Server started on http://127.0.0.1:%d\n"), _port);
+        if (port > 0 && _port != port)
+            msg(OBFSTR_C("AiDA MCP: Requested port %d was unavailable; using fallback port %d instead.\n"), port, _port);
         msg(OBFSTR_C("AiDA MCP: %zu tools available.\n"), tool_count);
-        msg(OBFSTR_C("AiDA MCP: Streamable HTTP  -> http://127.0.0.1:%d/mcp  (also /sse)\n"), port);
-        msg(OBFSTR_C("AiDA MCP: Legacy SSE       -> http://127.0.0.1:%d/sse\n"), port);
+        msg(OBFSTR_C("AiDA MCP: Streamable HTTP  -> http://127.0.0.1:%d/mcp  (also /sse)\n"), _port);
+        msg(OBFSTR_C("AiDA MCP: Legacy SSE       -> http://127.0.0.1:%d/sse\n"), _port);
         return true;
     }
     else
@@ -1401,12 +1414,31 @@ void mcp_server_t::server_thread_func(int port)
         setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
     });
 
-    _running = true;
+    int bound_port = 0;
+    if (port > 0 && svr.bind_to_port("127.0.0.1", port))
+        bound_port = port;
+    if (bound_port <= 0)
+        bound_port = svr.bind_to_any_port("127.0.0.1");
 
-    if (!svr.listen("127.0.0.1", port))
+    if (bound_port <= 0)
     {
         if (!_stop_requested.load())
-            msg(OBFSTR_C("AiDA MCP: Failed to bind to 127.0.0.1:%d\n"), port);
+            msg(OBFSTR_C("AiDA MCP: Failed to bind to 127.0.0.1:%d and no fallback port was available.\n"), port);
+
+        {
+            std::lock_guard<std::mutex> lock(_server_mutex);
+            _active_server = nullptr;
+        }
+        return;
+    }
+
+    _port = bound_port;
+    _running = true;
+
+    if (!svr.listen_after_bind())
+    {
+        if (!_stop_requested.load())
+            msg(OBFSTR_C("AiDA MCP: Listener terminated on 127.0.0.1:%d\n"), bound_port);
     }
 
     _running = false;

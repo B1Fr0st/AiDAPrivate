@@ -1700,9 +1700,6 @@ bool voyager::device_t::clear_hardware_breakpoint(std::uint32_t tid, int index) 
     return set_thread_context(tid, ctx, mask);
 }
 
-// ============================================================
-// Network capture methods
-// ============================================================
 
 std::vector<voyager::device_t::net_connection_info> voyager::device_t::enumerate_connections(std::uint32_t filter_pid, std::uint32_t filter_protocol) noexcept {
     std::vector<net_connection_info> result;
@@ -1742,7 +1739,7 @@ bool voyager::device_t::start_capture(std::uint32_t filter_pid, std::uint32_t fi
     if (!is_connected()) return false;
 
     voyager::detail::net_cap_ctrl_request req{};
-    req.operation = 0; // start
+    req.operation = 0;
     req.filter_pid = filter_pid;
     req.filter_port = filter_port;
     req.filter_protocol = filter_protocol;
@@ -1757,7 +1754,7 @@ bool voyager::device_t::stop_capture() noexcept {
     if (!is_connected()) return false;
 
     voyager::detail::net_cap_ctrl_request req{};
-    req.operation = 1; // stop
+    req.operation = 1;
 
     return send_request(ioctl_codes::NCAP(), &req, sizeof(req));
 }
@@ -1766,7 +1763,7 @@ bool voyager::device_t::get_capture_status(bool& active, std::uint32_t& captured
     if (!is_connected()) return false;
 
     voyager::detail::net_cap_ctrl_request req{};
-    req.operation = 2; // status
+    req.operation = 2;
 
     if (!send_request(ioctl_codes::NCAP(), &req, sizeof(req))) return false;
 
@@ -1855,7 +1852,7 @@ bool voyager::device_t::add_filter_rule(std::uint32_t action, std::uint32_t dire
     if (!is_connected()) return false;
 
     voyager::detail::net_filter_rule_request req{};
-    req.operation = 0; // add
+    req.operation = 0;
     req.action = action;
     req.direction = direction;
     req.protocol = protocol;
@@ -1873,7 +1870,7 @@ bool voyager::device_t::remove_filter_rule(std::uint32_t rule_id) noexcept {
     if (!is_connected()) return false;
 
     voyager::detail::net_filter_rule_request req{};
-    req.operation = 1; // remove
+    req.operation = 1;
     req.rule_id = rule_id;
 
     return send_request(ioctl_codes::NFLT(), &req, sizeof(req));
@@ -1883,7 +1880,7 @@ bool voyager::device_t::clear_filter_rules() noexcept {
     if (!is_connected()) return false;
 
     voyager::detail::net_filter_rule_request req{};
-    req.operation = 2; // clear
+    req.operation = 2;
 
     return send_request(ioctl_codes::NFLT(), &req, sizeof(req));
 }
@@ -1908,9 +1905,6 @@ bool voyager::device_t::get_network_stats(network_stats& stats) noexcept {
     return true;
 }
 
-// ============================================================
-// Advanced network recon method implementations
-// ============================================================
 
 static std::string guid_to_string(const voyager::detail::GUID_COMPAT& g) {
     char buf[40];
@@ -2007,7 +2001,7 @@ bool voyager::device_t::sniff_net_buffers_start(std::uint64_t address, std::uint
     req.buffer_reg_index = buf_reg;
     req.size_reg_index = size_reg;
     req.max_captures = max_captures;
-    req.operation = 0; // START
+    req.operation = 0;
     req.target_tid = tid;
     req.bp_index = bp_index;
 
@@ -2018,7 +2012,7 @@ bool voyager::device_t::sniff_net_buffers_stop() noexcept {
     if (!is_connected()) return false;
 
     voyager::detail::sniff_net_buffers_request req{};
-    req.operation = 1; // STOP
+    req.operation = 1;
 
     return send_request(ioctl_codes::SNBF(), &req, sizeof(req));
 }
@@ -2035,7 +2029,7 @@ voyager::device_t::sniff_net_buffers_get(bool& active) noexcept {
     if (!req) return result;
 
     std::memset(req, 0, sizeof(*req));
-    req->operation = 2; // GET_RESULTS
+    req->operation = 2;
 
     if (send_request(ioctl_codes::SNBF(), req, static_cast<DWORD>(sizeof(*req)))) {
         active = (req->active != 0);
@@ -2067,7 +2061,7 @@ bool voyager::device_t::sniff_net_buffers_store(std::uint64_t timestamp, std::ui
     if (!req) return false;
 
     std::memset(req, 0, sizeof(*req));
-    req->operation = 3; // STORE_CAPTURE
+    req->operation = 3;
 
     std::uint32_t copy_sz = size;
     if (copy_sz > static_cast<std::uint32_t>(voyager::detail::SNIFF_MAX_BUF_SIZE))
@@ -2123,9 +2117,6 @@ voyager::device_t::dump_tcpip_connections(std::uint32_t target_pid, std::uint32_
     return result;
 }
 
-// =================================================================
-// MITM / Deep Packet Inspection / Interception implementations
-// =================================================================
 
 bool voyager::device_t::inject_packet(std::uint32_t direction, std::uint32_t protocol, std::uint32_t af,
                                        std::uint32_t src_port, std::uint32_t dst_port,
@@ -2401,7 +2392,7 @@ std::vector<voyager::device_t::held_packet_info> voyager::device_t::get_held_pac
     if (!req) return result;
 
     std::memset(req, 0, sizeof(*req));
-    req->operation = 2; // get_held
+    req->operation = 2;
 
     if (send_request(ioctl_codes::IHLD(), req, static_cast<DWORD>(sizeof(*req)))) {
         for (std::uint32_t i = 0; i < req->held_count && i < detail::INTERCEPT_MAX_HELD; i++) {
@@ -2548,7 +2539,7 @@ std::vector<voyager::device_t::bw_process_info> voyager::device_t::get_bw_per_pr
     if (!req) return result;
 
     std::memset(req, 0, sizeof(*req));
-    req->operation = 4; // get_per_process
+    req->operation = 4;
     req->filter_pid = filter_pid;
 
     if (send_request(ioctl_codes::BWMN(), req, static_cast<DWORD>(sizeof(*req)))) {
@@ -2662,7 +2653,7 @@ std::vector<voyager::device_t::fingerprint_info> voyager::device_t::get_fingerpr
     if (!req) return result;
 
     std::memset(req, 0, sizeof(*req));
-    req->operation = 2; // get
+    req->operation = 2;
 
     if (send_request(ioctl_codes::NFPR(), req, static_cast<DWORD>(sizeof(*req)))) {
         for (std::uint32_t i = 0; i < req->result_count && i < detail::FINGERPRINT_MAX; i++) {

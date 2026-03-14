@@ -452,6 +452,34 @@ namespace network_tools
     void register_tools();
 }
 
+namespace net_security_tools
+{
+    tool_result_t tls_extract_keys(const nlohmann::json& params);
+    tool_result_t tls_start_keylog(const nlohmann::json& params);
+    tool_result_t tls_stop_keylog(const nlohmann::json& params);
+    tool_result_t tls_get_extracted_keys(const nlohmann::json& params);
+    tool_result_t cert_inject(const nlohmann::json& params);
+    tool_result_t cert_remove(const nlohmann::json& params);
+    tool_result_t cert_generate_ca(const nlohmann::json& params);
+    tool_result_t cert_list(const nlohmann::json& params);
+    tool_result_t pin_bypass(const nlohmann::json& params);
+    tool_result_t pin_bypass_revert(const nlohmann::json& params);
+    tool_result_t pin_bypass_status(const nlohmann::json& params);
+    tool_result_t quic_detect_connections(const nlohmann::json& params);
+    tool_result_t quic_decrypt_initial(const nlohmann::json& params);
+    tool_result_t quic_extract_keys(const nlohmann::json& params);
+    tool_result_t dtls_detect_sessions(const nlohmann::json& params);
+    tool_result_t dtls_extract_keys(const nlohmann::json& params);
+    tool_result_t autoresponder_add_rule(const nlohmann::json& params);
+    tool_result_t autoresponder_remove_rule(const nlohmann::json& params);
+    tool_result_t autoresponder_list_rules(const nlohmann::json& params);
+    tool_result_t autoresponder_start(const nlohmann::json& params);
+    tool_result_t autoresponder_stop(const nlohmann::json& params);
+    tool_result_t autoresponder_import_rules(const nlohmann::json& params);
+    tool_result_t autoresponder_export_rules(const nlohmann::json& params);
+    void register_tools();
+}
+
 namespace helpers
 {
     std::optional<ea_t> parse_address(const std::string& addr_str);

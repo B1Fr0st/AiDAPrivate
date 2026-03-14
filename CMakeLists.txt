@@ -116,6 +116,7 @@ set(AIDA_SOURCES
     src/ui.cpp
     src/workbench.cpp
     src/driver_loader.cpp
+    src/net_security.cpp
     driver/comm.cpp
 )
 
@@ -146,6 +147,7 @@ set(AIDA_HEADERS
     src/rlhf.hpp
     src/settings.hpp
     src/driver_loader.hpp
+    src/net_security.hpp
     src/ui.hpp
     src/workbench.hpp
 )

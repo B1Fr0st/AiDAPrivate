@@ -1531,12 +1531,7 @@ static BOOLEAN aida_is_afd_device_object(PVOID object) {
     __try {
         PFILE_OBJECT fileObj = (PFILE_OBJECT)object;
 
-        // Use IoFileObjectType for type-safe referencing. With nullptr ObjectType,
-        // ObReferenceObjectByPointer succeeds on ANY kernel object (Events, Mutants,
-        // Sections, etc.), then interpreting a non-FILE_OBJECT as FILE_OBJECT reads
-        // garbage from DeviceObject/DriverObject fields, which can point to freed
-        // nonpaged pool and cause PAGE_FAULT_IN_NONPAGED_AREA (bugcheck 0x50).
-        // __try/__except cannot catch this because nonpaged pool faults are fatal.
+
         POBJECT_TYPE fileType = (_IoFileObjectType && *_IoFileObjectType) ? *_IoFileObjectType : nullptr;
         NTSTATUS ref_status = ObReferenceObjectByPointer(fileObj, 0, fileType, KernelMode);
         if (!NT_SUCCESS(ref_status)) {
@@ -1545,11 +1540,7 @@ static BOOLEAN aida_is_afd_device_object(PVOID object) {
 
         BOOLEAN is_afd = FALSE;
 
-        // After a type-checked ObReferenceObjectByPointer, the FILE_OBJECT is validly
-        // referenced. The kernel guarantees FILE_OBJECT->DeviceObject and
-        // DEVICE_OBJECT->DriverObject are valid for any referenced file object.
-        // MmIsAddressValid is unnecessary here and harmful: it's racy (TOCTOU) and
-        // only validates a single byte, not the entire structure.
+
         PDEVICE_OBJECT devObj = fileObj->DeviceObject;
         if (!devObj) {
             ObDereferenceObject(fileObj);
@@ -1563,8 +1554,8 @@ static BOOLEAN aida_is_afd_device_object(PVOID object) {
         }
 
         PUNICODE_STRING drvName = &drvObj->DriverName;
-        // drvName is &drvObj->DriverName (address of a struct member) - it is never
-        // NULL. Only check Buffer and Length.
+
+
         if (!drvName->Buffer || drvName->Length < 8) {
             ObDereferenceObject(fileObj);
             return FALSE;
@@ -1575,10 +1566,7 @@ static BOOLEAN aida_is_afd_device_object(PVOID object) {
             max_chars = 128;
         }
 
-        // DriverName.Buffer is allocated by the I/O manager at driver load time and
-        // remains valid for the lifetime of the DRIVER_OBJECT. Per-character
-        // MmIsAddressValid checks are removed: they are racy, expensive per iteration,
-        // and the buffer is kernel-guaranteed valid after type-safe referencing.
+
         wchar_t* buf = drvName->Buffer;
         for (USHORT i = 0; i + 2 < max_chars; i++) {
             wchar_t c0 = buf[i];

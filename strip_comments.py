@@ -7,7 +7,7 @@ import re
 import os
 
 WORKSPACES = [
-    r"C:\Users\diskt\AiDA\driver\WhosWho\WhosWho\src",
+    r"C:\Users\diskt\AiDA\driver",
 ]
 
 CPP_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.inl'}

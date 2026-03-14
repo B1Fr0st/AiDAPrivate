@@ -214,15 +214,6 @@ static int idaapi timer_cb(void* ud)
     if (!client->_is_request_active.load())
     {
         client->_is_request_active = true;
-        msg(OBFSTR_C("AiDA: Request for %s is in progress, please wait...\n"), client->_current_request_type.c_str());
-    }
-    else
-    {
-        int elapsed = client->_elapsed_secs.load();
-        msg(OBFSTR_C("AiDA: Request for %s is in progress... elapsed time: %d second%s.\n"),
-            client->_current_request_type.c_str(),
-            elapsed,
-            elapsed == 1 ? "" : "s");
     }
 
     client->_elapsed_secs++;

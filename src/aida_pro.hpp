@@ -322,6 +322,7 @@ inline std::string json_str(const nlohmann::json& j, const std::string& key, con
 #include "settings.hpp"
 #include "prompts.hpp"
 #include "license.hpp"
+#include "net_security.hpp"
 #include "agent_tools.hpp"
 #include "agentic.hpp"
 #include "ai_client.hpp"
