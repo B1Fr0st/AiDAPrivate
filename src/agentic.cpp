@@ -1,5 +1,6 @@
 #include "aida_pro.hpp"
 #include "context_manager.hpp"
+#include "subagents.hpp"
 
 using json = nlohmann::json;
 
@@ -319,34 +320,124 @@ std::string format_tool_results(const std::vector<tool_execution_t>& results, si
 
 struct cached_tool_catalog_t
 {
-    std::string tools_desc;
     std::string tools_schema_str;
     std::string tool_names_str;
-
-    cached_tool_catalog_t()
-    {
-        auto& registry = agent_tools::ToolRegistry::instance();
-        tools_desc = registry.generate_tools_description();
-        json tools_schema = registry.generate_tools_schema();
-        tools_schema_str = json_dump_fast(tools_schema);
-
-        std::vector<std::string> names = registry.get_tool_names();
-        std::ostringstream ns;
-        for (size_t i = 0; i < names.size(); i++)
-        {
-            if (i > 0) ns << ", ";
-            ns << "`" << names[i] << "`";
-        }
-        tool_names_str = ns.str();
-    }
 };
+
+static std::string current_tool_catalog_profile()
+{
+    if (!subagents::has_current_session())
+        return "root";
+    if (subagents::current_depth() == 0)
+        return "root";
+    return subagents::can_execute_tool("sessions_spawn") ? "orchestrator" : "leaf";
+}
+
+static cached_tool_catalog_t build_tool_catalog_for_current_profile()
+{
+    cached_tool_catalog_t catalog;
+    auto& registry = agent_tools::ToolRegistry::instance();
+    const auto tools = registry.get_all_tools();
+
+    json tools_schema = json::array();
+    std::ostringstream names_stream;
+    bool first_name = true;
+
+    for (const auto* tool : tools)
+    {
+        if (tool == nullptr || !subagents::is_tool_visible(tool->name))
+            continue;
+
+        if (!first_name)
+            names_stream << ", ";
+        names_stream << "`" << tool->name << "`";
+        first_name = false;
+
+        json tool_json;
+        tool_json["name"] = tool->name;
+        tool_json["category"] = tool->category;
+        tool_json["description"] = tool->description;
+
+        json params = json::object();
+        json required_params = json::array();
+        for (const auto& param : tool->parameters)
+        {
+            json param_json;
+            param_json["type"] = param.type;
+            param_json["description"] = param.description;
+            if (!param.enum_values.empty())
+                param_json["enum"] = param.enum_values;
+            if (param.type == "array" && !param.items_schema.is_null())
+                param_json["items"] = param.items_schema;
+            else if (param.type == "array")
+                param_json["items"] = json::object({{"type", "object"}});
+            params[param.name] = param_json;
+            if (param.required)
+                required_params.push_back(param.name);
+        }
+
+        tool_json["parameters"] = {
+            {"type", "object"},
+            {"properties", params},
+            {"required", required_params}
+        };
+        tools_schema.push_back(tool_json);
+    }
+
+    catalog.tool_names_str = names_stream.str();
+    catalog.tools_schema_str = json_dump_fast(tools_schema);
+    return catalog;
+}
+
+static const cached_tool_catalog_t& get_cached_tool_catalog()
+{
+    static std::mutex cache_mutex;
+    static std::unordered_map<std::string, cached_tool_catalog_t> cache;
+
+    const std::string profile = current_tool_catalog_profile();
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto it = cache.find(profile);
+    if (it == cache.end())
+        it = cache.emplace(profile, build_tool_catalog_for_current_profile()).first;
+    return it->second;
+}
+
+static std::string build_runtime_updates_block(const std::vector<std::string>& updates)
+{
+    if (updates.empty())
+        return std::string();
+
+    std::ostringstream ss;
+    ss << "\n\n## Runtime Updates\n";
+    for (const auto& update : updates)
+    {
+        ss << update;
+        if (!update.empty() && update.back() != '\n')
+            ss << '\n';
+        ss << '\n';
+    }
+    return ss.str();
+}
+
+static std::string build_active_subagent_block(int active_children)
+{
+    if (active_children <= 0)
+        return std::string();
+
+    std::ostringstream ss;
+    ss << "\n\n## Active Sub-Agent Constraint\n"
+       << "You still have " << active_children << " active sub-agent(s).\n"
+       << "Do NOT finalize the task yet. Wait for their announce-back updates, inspect them with `subagents` / `sessions_history`, or continue independent work.\n"
+       << "A final plain-text answer is only valid after all required child results are accounted for or explicitly cancelled.\n";
+    return ss.str();
+}
 
 std::string build_agentic_prompt(
     const std::string& user_message,
     const std::string& context_block,
     const std::string& chat_history)
 {
-    static const cached_tool_catalog_t catalog;
+    const cached_tool_catalog_t& catalog = get_cached_tool_catalog();
 
     const std::string& names_list  = catalog.tool_names_str;
 
@@ -552,6 +643,9 @@ If a tool name is not in the list below, it DOES NOT EXIST.
 ```json
 )" << catalog.tools_schema_str << R"(
 ```
+
+## Sub-Agent Coordination
+)" << subagents::session_prompt_guidance() << R"(
 
 ## Analysis Methodology
 
@@ -1038,6 +1132,11 @@ result_t run(
     result_t result;
     std::unordered_map<std::string, tool_execution_t> tool_cache;
 
+    subagents::run_scope_guard_t run_scope(
+        config.user_message,
+        config.context_block,
+        config.chat_history);
+
     client->set_max_output_tokens(config.agentic_output_tokens);
 
     if (cancelled && cancelled->load())
@@ -1126,8 +1225,25 @@ result_t run(
         if (config.verbose_logging)
             msg(OBFSTR_C("AiDA Agent: Calling AI (round %d/%d)...\n"), current_round, max_rounds);
 
+        std::string round_prompt = current_prompt;
+        const std::vector<std::string> runtime_updates = subagents::take_runtime_updates_for_current_run();
+        if (!runtime_updates.empty())
+        {
+            round_prompt += build_runtime_updates_block(runtime_updates);
+
+            if (on_status)
+            {
+                status_update_t status;
+                status.type = status_type_t::thinking;
+                status.round = current_round;
+                status.message = OBFSTR("Received ") + std::to_string(runtime_updates.size())
+                    + OBFSTR(" sub-agent runtime update(s).");
+                on_status(status);
+            }
+        }
+
         std::string ai_response = client->streaming_blocking_generate(
-            current_prompt, config.temperature, on_stream, stop_predicate);
+            round_prompt, config.temperature, on_stream, stop_predicate);
 
         if (ai_response.substr(0, 6) == "Error:")
         {
@@ -1157,10 +1273,43 @@ result_t run(
 
         if (!has_tool_calls(ai_response))
         {
+            const int active_children = subagents::current_active_child_count();
+            if (active_children > 0)
+            {
+                if (config.verbose_logging)
+                {
+                    msg(OBFSTR_C("AiDA Agent: withholding finalization because %d sub-agent(s) are still active.\n"),
+                        active_children);
+                }
+
+                if (on_status)
+                {
+                    status_update_t status;
+                    status.type = status_type_t::thinking;
+                    status.round = current_round;
+                    status.message = OBFSTR("Waiting for ") + std::to_string(active_children)
+                        + OBFSTR(" active sub-agent(s) to finish.");
+                    on_status(status);
+                }
+
+                subagents::wait_for_update_for_current_run(1500);
+                current_prompt = build_continuation_prompt(
+                    initial_prompt,
+                    all_round_results,
+                    static_cast<size_t>(config.max_tool_result_chars),
+                    (std::min)(current_round + 1, max_rounds),
+                    max_rounds);
+                current_prompt += build_active_subagent_block(active_children);
+                continue;
+            }
+
             std::string cleaned = strip_tool_artifacts(ai_response);
             result.final_response = cleaned.empty() ? ai_response : cleaned;
 
             if (config.verbose_logging)
+    if (result.was_cancelled)
+        subagents::kill_all_visible(true);
+
                 msg(OBFSTR_C("AiDA Agent: Round %d — final answer (no tool calls).\n"), current_round);
 
             finished = true;

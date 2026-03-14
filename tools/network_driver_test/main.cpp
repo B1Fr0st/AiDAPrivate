@@ -845,12 +845,290 @@ int main(int argc, char** argv) {
         print_case(results.back());
     };
 
-    std::cout << "Running network driver end-to-end tests...\n";
+    std::cout << "Running full driver end-to-end tests...\n";
     std::cout << "Target process: NetLabTarget.exe pid=" << target_pid;
     if (target_process.launched()) {
         std::cout << " launched_at=" << target_exe.string();
     }
     std::cout << "\n";
+
+    // ================================================================
+    // Core driver tests (IOCTLs 0-8): heartbeat, DTB, base, R/W, alloc
+    // ================================================================
+    std::cout << "\n=== Core Driver Tests ===\n";
+
+    {
+        bool ok = dev.send_heartbeat();
+        add_result("heartbeat", ok ? Outcome::pass : Outcome::fail,
+            ok ? "Heartbeat acknowledged" : "Heartbeat failed");
+    }
+
+    {
+        dev.solve_dtb();
+        std::uint64_t dtb = dev.get_dtb();
+        bool ok = (dtb != 0);
+        std::ostringstream oss;
+        oss << "dtb=0x" << std::hex << dtb;
+        add_result("dtb_solve", ok ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    {
+        std::uint64_t base = dev.find_image();
+        bool ok = (base != 0);
+        std::ostringstream oss;
+        oss << "base=0x" << std::hex << base;
+        add_result("find_image", ok ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    {
+        std::uint64_t base = dev.get_base_address();
+        bool ok = false;
+        std::uint16_t mz = 0;
+        if (base != 0) {
+            mz = dev.read<std::uint16_t>(base);
+            ok = (mz == 0x5A4D);
+        }
+        std::ostringstream oss;
+        oss << "magic=0x" << std::hex << mz << " expected=0x5A4D";
+        add_result("physical_read_mz", ok ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    {
+        std::uint64_t addr = dev.allocate_memory(4096);
+        bool alloc_ok = (addr != 0);
+        bool write_ok = false;
+        bool read_ok = false;
+        bool free_ok = false;
+        if (alloc_ok) {
+            const std::uint64_t sentinel = 0xDEAD'BEEF'CAFE'BABEull;
+            dev.write<std::uint64_t>(addr, sentinel);
+            write_ok = true;
+            std::uint64_t readback = dev.read<std::uint64_t>(addr);
+            read_ok = (readback == sentinel);
+            free_ok = dev.free_memory(addr);
+        }
+        std::ostringstream oss;
+        oss << "alloc=0x" << std::hex << addr
+            << " write=" << write_ok
+            << " readback=" << read_ok
+            << " free=" << free_ok;
+        add_result("memory_alloc_rw_free", alloc_ok && write_ok && read_ok && free_ok
+            ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    {
+        std::uint64_t base = dev.get_base_address();
+        bool ok = false;
+        if (base != 0) {
+            std::uint8_t buf[64] = {};
+            std::size_t n = dev.read_raw(base, buf, sizeof(buf));
+            ok = (n == sizeof(buf)) && (buf[0] == 'M') && (buf[1] == 'Z');
+        }
+        add_result("read_raw", ok ? Outcome::pass : Outcome::fail,
+            ok ? "Read 64 bytes from image base, MZ verified" : "read_raw failed or MZ mismatch");
+    }
+
+    // ================================================================
+    // Thread tests (IOCTLs 9-11): enumerate, context, suspend/resume
+    // ================================================================
+    std::cout << "\n=== Thread Tests ===\n";
+
+    {
+        auto threads = dev.enumerate_threads();
+        bool ok = !threads.empty();
+        std::ostringstream oss;
+        oss << "count=" << threads.size();
+        if (!threads.empty()) {
+            oss << " first_tid=" << threads.front().tid
+                << " first_rip=0x" << std::hex << threads.front().rip;
+        }
+        add_result("enumerate_threads", ok ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    std::uint32_t test_tid = 0;
+    {
+        auto threads = dev.enumerate_threads();
+        bool ok = false;
+        std::ostringstream oss;
+        if (!threads.empty()) {
+            test_tid = threads.front().tid;
+            voyager::device_t::thread_context ctx{};
+            ok = dev.get_thread_context(test_tid, ctx);
+            oss << "tid=" << test_tid
+                << " rip=0x" << std::hex << ctx.rip
+                << " rsp=0x" << ctx.rsp
+                << " rflags=0x" << ctx.rflags;
+        } else {
+            oss << "no threads to test";
+        }
+        add_result("get_thread_context", ok ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    {
+        bool ok = false;
+        std::ostringstream oss;
+        if (test_tid != 0) {
+            std::uint32_t prev_suspend = 0;
+            bool suspend_ok = dev.suspend_thread(test_tid, &prev_suspend);
+            std::uint32_t prev_resume = 0;
+            bool resume_ok = dev.resume_thread(test_tid, &prev_resume);
+            ok = suspend_ok && resume_ok;
+            oss << "tid=" << test_tid
+                << " suspend=" << suspend_ok << " prev_suspend=" << prev_suspend
+                << " resume=" << resume_ok << " prev_resume=" << prev_resume;
+        } else {
+            oss << "no thread available";
+        }
+        add_result("suspend_resume_thread", ok ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    // ================================================================
+    // Memory tests (IOCTLs 12-18): query, protect, enum, PEB, debug, export, v2p
+    // ================================================================
+    std::cout << "\n=== Memory Tests ===\n";
+
+    {
+        std::uint64_t base = dev.get_base_address();
+        voyager::device_t::memory_region_info info{};
+        bool ok = (base != 0) && dev.query_memory(base, info);
+        std::ostringstream oss;
+        oss << "base=0x" << std::hex << info.base
+            << " size=0x" << info.size
+            << " state=0x" << info.state
+            << " protect=0x" << info.protect
+            << " type=0x" << info.type;
+        add_result("query_memory", ok ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    {
+        std::uint64_t addr = dev.allocate_memory(4096);
+        bool ok = false;
+        std::ostringstream oss;
+        if (addr != 0) {
+            std::uint32_t old_prot = 0;
+            bool prot_ok = dev.protect_memory(addr, 4096, 0x04 /*PAGE_READWRITE*/, &old_prot);
+            ok = prot_ok;
+            oss << "addr=0x" << std::hex << addr
+                << " protect_ok=" << prot_ok
+                << " old_prot=0x" << old_prot;
+            dev.free_memory(addr);
+        } else {
+            oss << "alloc failed";
+        }
+        add_result("protect_memory", ok ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    {
+        auto regions = dev.enumerate_memory_regions();
+        bool ok = !regions.empty();
+        std::ostringstream oss;
+        oss << "regions=" << regions.size();
+        if (!regions.empty()) {
+            oss << " first_base=0x" << std::hex << regions.front().base
+                << " first_size=0x" << regions.front().size;
+        }
+        add_result("enumerate_memory_regions", ok ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    {
+        voyager::device_t::peb_info peb{};
+        bool ok = dev.read_peb(peb);
+        std::uint64_t base = dev.get_base_address();
+        bool base_match = (peb.image_base == base);
+        std::ostringstream oss;
+        oss << "peb=0x" << std::hex << peb.peb_address
+            << " image_base=0x" << peb.image_base
+            << " ldr=0x" << peb.ldr_address
+            << " heap=0x" << peb.process_heap
+            << " match=" << base_match;
+        add_result("read_peb", (ok && base_match) ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    {
+        std::uint32_t flags = 0;
+        bool ok = dev.spoof_debug_flags(&flags);
+        std::ostringstream oss;
+        oss << "result_flags=0x" << std::hex << flags;
+        add_result("spoof_debug_flags", ok ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    {
+        HMODULE ntdll_local = GetModuleHandleA("ntdll.dll");
+        std::uint64_t ntdll_base = reinterpret_cast<std::uint64_t>(ntdll_local);
+        std::uint64_t resolved = 0;
+        bool ok = false;
+        if (ntdll_base != 0) {
+            resolved = dev.resolve_export(ntdll_base, "RtlInitUnicodeString");
+            ok = (resolved != 0);
+        }
+        std::ostringstream oss;
+        oss << "ntdll=0x" << std::hex << ntdll_base
+            << " resolved=0x" << resolved;
+        add_result("resolve_export", ok ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    {
+        std::uint64_t base = dev.get_base_address();
+        std::uint64_t phys = 0;
+        bool ok = false;
+        if (base != 0) {
+            phys = dev.virtual_to_physical(base);
+            ok = (phys != 0);
+        }
+        std::ostringstream oss;
+        oss << "virt=0x" << std::hex << base
+            << " phys=0x" << phys;
+        add_result("virtual_to_physical", ok ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    // ================================================================
+    // Remote call test (IOCTLs 4-7): call_function via thread hijack
+    // ================================================================
+    std::cout << "\n=== Remote Call Tests ===\n";
+
+    {
+        HMODULE ntdll_local = GetModuleHandleA("ntdll.dll");
+        std::uint64_t ntdll_base = reinterpret_cast<std::uint64_t>(ntdll_local);
+        std::uint64_t fn_addr = 0;
+        bool ok = false;
+        std::ostringstream oss;
+        if (ntdll_base != 0) {
+            fn_addr = dev.resolve_export(ntdll_base, "RtlGetCurrentProcessorNumber");
+            if (fn_addr != 0) {
+                std::uint64_t result = dev.call_function(fn_addr);
+                ok = true;
+                oss << "fn=0x" << std::hex << fn_addr
+                    << " returned=" << std::dec << result;
+            } else {
+                oss << "resolve RtlGetCurrentProcessorNumber failed";
+            }
+        } else {
+            oss << "ntdll not found";
+        }
+        add_result("remote_call_function", ok ? Outcome::pass : Outcome::fail, oss.str());
+    }
+
+    // ================================================================
+    // Input simulation test (IOCTL 3): mouse movement
+    // ================================================================
+    std::cout << "\n=== Input Tests ===\n";
+
+    {
+        bool ok = false;
+        try {
+            dev.move_mouse(0, 0, 0);
+            ok = true;
+        } catch (...) {
+            ok = false;
+        }
+        add_result("mouse_movement", ok ? Outcome::pass : Outcome::fail,
+            ok ? "move_mouse(0,0,0) succeeded (no-op delta)" : "move_mouse threw or failed");
+    }
+
+    // ================================================================
+    // Network tests (IOCTLs 19-40)
+    // ================================================================
+    std::cout << "\n=== Network Tests ===\n";
 
     bool generated = harness.generate_all();
     add_result("traffic_baseline", generated ? Outcome::pass : Outcome::fail,

@@ -424,6 +424,31 @@ namespace network_tools
     tool_result_t network_block_ip(const nlohmann::json& params);
     tool_result_t network_block_port(const nlohmann::json& params);
     tool_result_t network_block_process(const nlohmann::json& params);
+
+    tool_result_t network_deep_inspect(const nlohmann::json& params);
+    tool_result_t network_follow_tcp_stream(const nlohmann::json& params);
+    tool_result_t network_parse_http(const nlohmann::json& params);
+    tool_result_t network_parse_tls(const nlohmann::json& params);
+    tool_result_t network_enumerate_wfp_callouts(const nlohmann::json& params);
+    tool_result_t network_get_socket_handles(const nlohmann::json& params);
+    tool_result_t network_dump_tcpip(const nlohmann::json& params);
+    tool_result_t network_enumerate_interfaces(const nlohmann::json& params);
+    tool_result_t network_inject_packet(const nlohmann::json& params);
+    tool_result_t network_modify_packet_rule(const nlohmann::json& params);
+    tool_result_t network_list_mod_rules(const nlohmann::json& params);
+    tool_result_t network_redirect_traffic(const nlohmann::json& params);
+    tool_result_t network_list_redirect_rules(const nlohmann::json& params);
+    tool_result_t network_intercept(const nlohmann::json& params);
+    tool_result_t network_get_held_packets(const nlohmann::json& params);
+    tool_result_t network_release_packet(const nlohmann::json& params);
+    tool_result_t network_kill_connection(const nlohmann::json& params);
+    tool_result_t network_spoof_dns(const nlohmann::json& params);
+    tool_result_t network_list_dns_spoof_rules(const nlohmann::json& params);
+    tool_result_t network_bandwidth_monitor(const nlohmann::json& params);
+    tool_result_t network_bandwidth_per_process(const nlohmann::json& params);
+    tool_result_t network_os_fingerprint(const nlohmann::json& params);
+    tool_result_t network_export_pcap(const nlohmann::json& params);
+
     void register_tools();
 }
 
