@@ -7024,41 +7024,72 @@ void register_tools()
 namespace segment_tools
 {
 
+static std::string format_segment_permissions(const segment_t& seg)
+{
+    std::string perms;
+    if ((seg.perm & SEGPERM_READ) != 0)  perms += "R";
+    if ((seg.perm & SEGPERM_WRITE) != 0) perms += "W";
+    if ((seg.perm & SEGPERM_EXEC) != 0)  perms += "X";
+    return perms;
+}
+
+static int segment_bitness_bits(const segment_t& seg)
+{
+    switch (seg.bitness)
+    {
+        case 0: return 16;
+        case 1: return 32;
+        default: return 64;
+    }
+}
+
+static qstring get_safe_segment_name(const segment_t* seg)
+{
+    qstring name;
+    if (get_visible_segm_name(&name, seg) <= 0 || name.empty())
+        name = "<unnamed>";
+    return name;
+}
+
+static qstring get_safe_segment_class(const segment_t* seg)
+{
+    qstring sclass;
+    if (get_segm_class(&sclass, seg) <= 0 || sclass.empty())
+        sclass = "unknown";
+    return sclass;
+}
+
+static json build_segment_json(const segment_t* seg)
+{
+    qstring name = get_safe_segment_name(seg);
+    qstring sclass = get_safe_segment_class(seg);
+
+    return {
+        {"index", get_segm_num(seg->start_ea)},
+        {"name", name.c_str()},
+        {"class", sclass.c_str()},
+        {"start", helpers::format_address(seg->start_ea)},
+        {"end", helpers::format_address(seg->end_ea)},
+        {"size", seg->end_ea - seg->start_ea},
+        {"permissions", format_segment_permissions(*seg)},
+        {"bitness", segment_bitness_bits(*seg)},
+        {"type", seg->type}
+    };
+}
+
 tool_result_t list_segments(const json&)
 {
     json segments = json::array();
-    int count = get_segm_qty();
 
-    for (int i = 0; i < count; i++)
+    for (segment_t* seg = get_first_seg(); seg != nullptr; seg = get_next_seg(seg->start_ea))
     {
-        segment_t* seg = getnseg(i);
-        if (!seg)
+        if (seg->end_ea <= seg->start_ea)
             continue;
 
-        qstring name, sclass;
-        get_segm_name(&name, seg);
-        get_segm_class(&sclass, seg);
-
-        const char* perm_str = "";
-        std::string perms;
-        if (seg->perm & SEGPERM_READ)  perms += "R";
-        if (seg->perm & SEGPERM_WRITE) perms += "W";
-        if (seg->perm & SEGPERM_EXEC)  perms += "X";
-
-        segments.push_back({
-            {"index", i},
-            {"name", name.c_str()},
-            {"class", sclass.c_str()},
-            {"start", helpers::format_address(seg->start_ea)},
-            {"end", helpers::format_address(seg->end_ea)},
-            {"size", seg->end_ea - seg->start_ea},
-            {"permissions", perms},
-            {"bitness", seg->bitness == 0 ? 16 : seg->bitness == 1 ? 32 : 64},
-            {"type", seg->type}
-        });
+        segments.push_back(build_segment_json(seg));
     }
 
-    return tool_result_t::ok(OBFSTR("Listed ") + std::to_string(count) + " segments", segments);
+    return tool_result_t::ok(OBFSTR("Listed ") + std::to_string(segments.size()) + " segments", segments);
 }
 
 tool_result_t get_segment(const json& params)
@@ -7083,23 +7114,7 @@ tool_result_t get_segment(const json& params)
     if (!seg)
         return tool_result_t::error(OBFSTR("No segment at address"));
 
-    qstring name, sclass;
-    get_segm_name(&name, seg);
-    get_segm_class(&sclass, seg);
-
-    std::string perms;
-    if (seg->perm & SEGPERM_READ) perms += "R";
-    if (seg->perm & SEGPERM_WRITE) perms += "W";
-    if (seg->perm & SEGPERM_EXEC) perms += "X";
-
-    json result;
-    result["name"] = name.c_str();
-    result["class"] = sclass.c_str();
-    result["start"] = helpers::format_address(seg->start_ea);
-    result["end"] = helpers::format_address(seg->end_ea);
-    result["size"] = seg->end_ea - seg->start_ea;
-    result["permissions"] = perms;
-    result["bitness"] = seg->bitness == 0 ? 16 : seg->bitness == 1 ? 32 : 64;
+    json result = build_segment_json(seg);
     result["alignment"] = seg->align;
     result["type"] = seg->type;
 
@@ -22823,11 +22838,86 @@ namespace emulation_tools
 
 #ifdef __NT__
 
+static bool is_kernel_address(std::uint64_t addr)
+{
+    return addr >= 0xFFFF800000000000ULL;
+}
+
+static constexpr std::uint64_t KERNEL_SYNTH_STACK_BASE = 0xFFFFFAFF00000000ULL;
+static constexpr std::uint64_t USER_SYNTH_STACK_BASE   = 0x7FFD0000ULL;
+static constexpr std::uint64_t SYNTH_STACK_SIZE        = 0x20000ULL;
+
+static tool_result_t check_driver_for_address(std::uint64_t addr)
+{
+    if (!device || !device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+
+    if (!is_kernel_address(addr) && device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Not attached to a process. Call driver_attach first (kernel addresses work without attachment)."));
+
+    return tool_result_t::ok("", {});
+}
+
+static void map_additional_regions(
+    emulation::process_snapshot_t& snapshot,
+    const json& params,
+    std::uint64_t primary_base,
+    std::uint64_t primary_end)
+{
+    if (!params.contains("additional_regions") || !params["additional_regions"].is_array())
+        return;
+
+    for (const auto& region : params["additional_regions"])
+    {
+        auto raddr = helpers::parse_address(region.value("address", std::string()));
+        if (!raddr) continue;
+
+        std::uint32_t rsize = region.value("size", 4096u);
+        if (rsize > 16u * 1024 * 1024) rsize = 16u * 1024 * 1024;
+
+        std::uint64_t rbase_aligned = *raddr & ~0xFFFULL;
+        if (rbase_aligned >= primary_base && rbase_aligned < primary_end)
+            continue;
+
+        auto bytes = emulation::driver_read_bytes(*raddr, rsize);
+        if (bytes.empty()) continue;
+
+        emulation::memory_snapshot_region_t extra;
+        extra.base = rbase_aligned;
+        extra.size = (static_cast<std::uint64_t>(rsize) + 0xFFF + (*raddr & 0xFFF)) & ~0xFFFULL;
+        extra.data.resize(static_cast<std::size_t>(extra.size), 0);
+        std::memcpy(extra.data.data() + (*raddr - extra.base), bytes.data(), bytes.size());
+        snapshot.regions.push_back(std::move(extra));
+    }
+}
+
+static void setup_stack_region(
+    emulation::process_snapshot_t& snapshot,
+    bool kernel_mode,
+    std::uint64_t* out_stack_top = nullptr)
+{
+    std::uint64_t stack_base = kernel_mode ? KERNEL_SYNTH_STACK_BASE : USER_SYNTH_STACK_BASE;
+    std::uint64_t stack_top  = stack_base + SYNTH_STACK_SIZE - 0x1000;
+
+    snapshot.rsp = stack_top;
+
+    emulation::memory_snapshot_region_t stack_region;
+    stack_region.base = stack_base;
+    stack_region.size = SYNTH_STACK_SIZE;
+    stack_region.data.resize(static_cast<std::size_t>(SYNTH_STACK_SIZE), 0);
+    snapshot.regions.push_back(std::move(stack_region));
+
+    if (out_stack_top) *out_stack_top = stack_top;
+}
+
 tool_result_t disassemble_zydis(const json& params)
 {
     auto addr = helpers::parse_address(params.value("address", std::string()));
     if (!addr)
         return tool_result_t::error(OBFSTR("Invalid address"));
+
+    auto chk = check_driver_for_address(*addr);
+    if (!chk.success) return chk;
 
     std::uint32_t size = params.value("size", 256);
     if (size > 65536)
@@ -22836,13 +22926,50 @@ tool_result_t disassemble_zydis(const json& params)
     std::uint32_t max_insns = params.value("max_instructions", 100);
     if (max_insns > 10000) max_insns = 10000;
 
-    auto instructions = emulation::disassemble_idb_range(*addr, size, max_insns);
+    bool follow = params.value("follow_jumps", false);
+    std::uint64_t effective_addr = *addr;
+
+    auto instructions = emulation::driver_disassemble_range(effective_addr, size, max_insns);
     if (instructions.empty())
-        return tool_result_t::error(OBFSTR("No instructions decoded at ") + helpers::format_address(*addr));
+        return tool_result_t::error(OBFSTR("No instructions decoded. The address may be unreadable at ") +
+                                    helpers::format_address(*addr));
 
     json result;
     result["address"] = helpers::format_address(*addr);
-    result["count"]   = instructions.size();
+    int jumps_followed = 0;
+
+    if (follow)
+    {
+        constexpr int MAX_FOLLOW = 16;
+        while (jumps_followed < MAX_FOLLOW && !instructions.empty())
+        {
+            const auto& first = instructions[0];
+            if (first.mnemonic != "jmp" || first.is_ret || first.is_call)
+                break;
+
+            auto target = helpers::parse_address(first.operands_text);
+            if (!target) break;
+
+            auto followed = emulation::driver_disassemble_range(*target, size, max_insns);
+            if (followed.empty()) break;
+
+            result["followed_jump_" + std::to_string(jumps_followed)] =
+                helpers::format_address(static_cast<ea_t>(effective_addr)) +
+                " -> " + helpers::format_address(static_cast<ea_t>(*target));
+
+            effective_addr = *target;
+            instructions = std::move(followed);
+            ++jumps_followed;
+        }
+    }
+
+    if (jumps_followed > 0)
+    {
+        result["jumps_followed"]  = jumps_followed;
+        result["effective_address"] = helpers::format_address(static_cast<ea_t>(effective_addr));
+    }
+
+    result["count"] = instructions.size();
 
     json arr = json::array();
     for (const auto& insn : instructions)
@@ -22862,7 +22989,9 @@ tool_result_t disassemble_zydis(const json& params)
     result["instructions"] = std::move(arr);
 
     return tool_result_t::ok(OBFSTR("Zydis disassembly: ") + std::to_string(instructions.size()) +
-                             OBFSTR(" instructions at ") + helpers::format_address(*addr), result);
+                             OBFSTR(" instructions at ") + helpers::format_address(static_cast<ea_t>(effective_addr)) +
+                             (jumps_followed > 0 ? OBFSTR(" (followed ") + std::to_string(jumps_followed) + OBFSTR(" jumps)") : ""),
+                             result);
 }
 
 tool_result_t driver_snapshot_and_emulate(const json& params)
@@ -23028,7 +23157,12 @@ tool_result_t trace_execution_unicorn(const json& params)
 {
     auto addr = helpers::parse_address(params.value("address", std::string()));
     if (!addr)
-        return tool_result_t::error(OBFSTR("Invalid address. Provide the VM entry point address."));
+        return tool_result_t::error(OBFSTR("Invalid address. Provide the entry point address."));
+
+    auto chk = check_driver_for_address(*addr);
+    if (!chk.success) return chk;
+
+    const bool kernel_mode = is_kernel_address(*addr);
 
     std::uint32_t size = params.value("size", 4096);
     if (size > 1024 * 1024) size = 1024 * 1024;
@@ -23036,33 +23170,27 @@ tool_result_t trace_execution_unicorn(const json& params)
     std::uint32_t max_insns = params.value("max_instructions", 50000);
     if (max_insns > 500000) max_insns = 500000;
 
-
-    std::vector<std::uint8_t> code(size);
-    for (std::uint32_t i = 0; i < size; ++i)
-        code[i] = static_cast<std::uint8_t>(get_byte(static_cast<ea_t>(*addr + i)));
-
+    auto code = emulation::driver_read_bytes(*addr, size);
+    if (code.empty())
+        return tool_result_t::error(OBFSTR("Failed to read code at ") + helpers::format_address(*addr) +
+                                    (kernel_mode ? OBFSTR(" (kernel address — is the page paged out?)") :
+                                                   OBFSTR(" (is the process attached?)")));
 
     emulation::process_snapshot_t snapshot;
     snapshot.success = true;
     snapshot.rip = *addr;
-    snapshot.rsp = 0x7FFE0000;
     snapshot.rflags = 0x202;
-
 
     emulation::memory_snapshot_region_t code_region;
     code_region.base = *addr & ~0xFFFULL;
     code_region.size = (static_cast<std::uint64_t>(size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
     code_region.data.resize(static_cast<std::size_t>(code_region.size), 0);
-    std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), size);
+    std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), code.size());
     snapshot.regions.push_back(std::move(code_region));
 
+    setup_stack_region(snapshot, kernel_mode);
 
-    emulation::memory_snapshot_region_t stack_region;
-    stack_region.base = 0x7FFD0000;
-    stack_region.size = 0x20000;
-    stack_region.data.resize(0x20000, 0);
-    snapshot.regions.push_back(std::move(stack_region));
-
+    map_additional_regions(snapshot, params, code_region.base, code_region.base + code_region.size);
 
     if (params.contains("rax")) { auto v = helpers::parse_address(params.value("rax", std::string())); if (v) snapshot.rax = *v; }
     if (params.contains("rbx")) { auto v = helpers::parse_address(params.value("rbx", std::string())); if (v) snapshot.rbx = *v; }
@@ -23097,6 +23225,7 @@ tool_result_t trace_execution_unicorn(const json& params)
     out["total_instructions"] = result.total_instructions;
     out["junk_instructions"]  = result.junk_instruction_count;
     out["effective_instructions"] = result.total_instructions - result.junk_instruction_count;
+    out["kernel_mode"]        = kernel_mode;
 
     json deltas = json::array();
     for (const auto& d : result.reg_deltas)
@@ -23153,8 +23282,9 @@ tool_result_t trace_execution_unicorn(const json& params)
     out["trace_excerpt"] = std::move(trace_arr);
 
     return tool_result_t::ok(
-        OBFSTR("IDB emulation: ") + std::to_string(result.total_instructions) +
-        OBFSTR(" insns (") + std::to_string(result.junk_instruction_count) + OBFSTR(" junk)"), out);
+        OBFSTR("Emulation complete: ") + std::to_string(result.total_instructions) +
+        OBFSTR(" insns (") + std::to_string(result.junk_instruction_count) + OBFSTR(" junk)") +
+        (kernel_mode ? OBFSTR(" [kernel]") : OBFSTR(" [user]")), out);
 }
 
 tool_result_t analyze_vm_handler(const json& params)
@@ -23163,20 +23293,26 @@ tool_result_t analyze_vm_handler(const json& params)
     if (!addr)
         return tool_result_t::error(OBFSTR("Invalid address. Provide the VM handler entry point."));
 
+    auto chk = check_driver_for_address(*addr);
+    if (!chk.success) return chk;
+
+    const bool kernel_mode = is_kernel_address(*addr);
+
     std::uint32_t handler_size = params.value("size", 8192);
     if (handler_size > 1024 * 1024) handler_size = 1024 * 1024;
 
     std::uint32_t max_insns = params.value("max_instructions", 100000);
     if (max_insns > 500000) max_insns = 500000;
 
+    auto code = emulation::driver_read_bytes(*addr, handler_size);
+    if (code.empty())
+        return tool_result_t::error(OBFSTR("Failed to read handler bytes at ") +
+                                    helpers::format_address(*addr));
 
-    auto disasm = emulation::disassemble_idb_range(*addr, handler_size, 10000);
-
+    auto disasm = emulation::disassemble_range(code.data(), code.size(), *addr, 10000);
 
     std::uint32_t nop_count = 0, branch_count = 0, call_count = 0, privileged_count = 0;
     std::uint32_t total_insns = static_cast<std::uint32_t>(disasm.size());
-    std::set<std::uint64_t> branch_targets;
-    std::uint64_t last_addr = *addr;
 
     for (const auto& insn : disasm)
     {
@@ -23184,20 +23320,12 @@ tool_result_t analyze_vm_handler(const json& params)
         if (insn.is_branch) ++branch_count;
         if (insn.is_call) ++call_count;
         if (insn.is_privileged) ++privileged_count;
-        last_addr = insn.address + insn.length;
     }
-
-
-    std::vector<std::uint8_t> code(handler_size);
-    for (std::uint32_t i = 0; i < handler_size; ++i)
-        code[i] = static_cast<std::uint8_t>(get_byte(static_cast<ea_t>(*addr + i)));
 
     emulation::process_snapshot_t snapshot;
     snapshot.success = true;
     snapshot.rip = *addr;
-    snapshot.rsp = 0x7FFE0000;
     snapshot.rflags = 0x202;
-
 
     if (params.contains("rax")) { auto v = helpers::parse_address(params.value("rax", std::string())); if (v) snapshot.rax = *v; }
     if (params.contains("rbx")) { auto v = helpers::parse_address(params.value("rbx", std::string())); if (v) snapshot.rbx = *v; }
@@ -23210,14 +23338,12 @@ tool_result_t analyze_vm_handler(const json& params)
     code_region.base = *addr & ~0xFFFULL;
     code_region.size = (static_cast<std::uint64_t>(handler_size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
     code_region.data.resize(static_cast<std::size_t>(code_region.size), 0);
-    std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), handler_size);
+    std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), code.size());
     snapshot.regions.push_back(std::move(code_region));
 
-    emulation::memory_snapshot_region_t stack_region;
-    stack_region.base = 0x7FFD0000;
-    stack_region.size = 0x20000;
-    stack_region.data.resize(0x20000, 0);
-    snapshot.regions.push_back(std::move(stack_region));
+    setup_stack_region(snapshot, kernel_mode);
+
+    map_additional_regions(snapshot, params, code_region.base, code_region.base + code_region.size);
 
     emulation::emulation_config_t config;
     config.start_address         = *addr;
@@ -23234,7 +23360,7 @@ tool_result_t analyze_vm_handler(const json& params)
     json out;
     out["handler_address"]   = helpers::format_address(*addr);
     out["handler_size"]      = handler_size;
-
+    out["kernel_mode"]       = kernel_mode;
 
     json static_info;
     static_info["total_decoded"]     = total_insns;
@@ -23245,7 +23371,6 @@ tool_result_t analyze_vm_handler(const json& params)
     static_info["nop_ratio"]         = total_insns > 0
         ? static_cast<double>(nop_count) / total_insns : 0.0;
     out["static_analysis"] = std::move(static_info);
-
 
     if (emu_result.success)
     {
@@ -23293,7 +23418,6 @@ tool_result_t analyze_vm_handler(const json& params)
         out["emulation_error"] = emu_result.error;
     }
 
-
     double junk_ratio = emu_result.success && emu_result.total_instructions > 0
         ? static_cast<double>(emu_result.junk_instruction_count) / emu_result.total_instructions
         : 0.0;
@@ -23312,7 +23436,8 @@ tool_result_t analyze_vm_handler(const json& params)
 
     return tool_result_t::ok(
         OBFSTR("VM handler analysis at ") + helpers::format_address(*addr) +
-        OBFSTR(": ") + classification, out);
+        OBFSTR(": ") + classification +
+        (kernel_mode ? OBFSTR(" [kernel]") : OBFSTR(" [user]")), out);
 }
 
 
@@ -23322,6 +23447,11 @@ tool_result_t emulate_multi_trace(const json& params)
     if (!addr)
         return tool_result_t::error(OBFSTR("Invalid address"));
 
+    auto chk = check_driver_for_address(*addr);
+    if (!chk.success) return chk;
+
+    const bool kernel_mode = is_kernel_address(*addr);
+
     if (!params.contains("inputs") || !params["inputs"].is_array() || params["inputs"].empty())
         return tool_result_t::error(OBFSTR("Provide 'inputs' array of register state objects [{rax:..., rbx:...}, ...]"));
 
@@ -23330,10 +23460,12 @@ tool_result_t emulate_multi_trace(const json& params)
     std::uint32_t max_insns = params.value("max_instructions", 50000);
     if (max_insns > 500000) max_insns = 500000;
 
+    auto code = emulation::driver_read_bytes(*addr, size);
+    if (code.empty())
+        return tool_result_t::error(OBFSTR("Failed to read code at ") + helpers::format_address(*addr));
 
-    std::vector<std::uint8_t> code(size);
-    for (std::uint32_t i = 0; i < size; ++i)
-        code[i] = static_cast<std::uint8_t>(get_byte(static_cast<ea_t>(*addr + i)));
+    std::uint64_t code_base_aligned = *addr & ~0xFFFULL;
+    std::uint64_t code_region_size = (static_cast<std::uint64_t>(size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
 
     json traces = json::array();
     const auto& inputs = params["inputs"];
@@ -23345,9 +23477,7 @@ tool_result_t emulate_multi_trace(const json& params)
         emulation::process_snapshot_t snapshot;
         snapshot.success = true;
         snapshot.rip = *addr;
-        snapshot.rsp = 0x7FFE0000;
         snapshot.rflags = 0x202;
-
 
         auto set_reg = [&](const char* name, std::uint64_t& reg)
         {
@@ -23362,20 +23492,16 @@ tool_result_t emulate_multi_trace(const json& params)
         set_reg("rsi", snapshot.rsi); set_reg("rdi", snapshot.rdi);
         set_reg("r8", snapshot.r8);   set_reg("r9", snapshot.r9);
 
-
         emulation::memory_snapshot_region_t code_region;
-        code_region.base = *addr & ~0xFFFULL;
-        code_region.size = (static_cast<std::uint64_t>(size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
+        code_region.base = code_base_aligned;
+        code_region.size = code_region_size;
         code_region.data.resize(static_cast<std::size_t>(code_region.size), 0);
-        std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), size);
+        std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), code.size());
         snapshot.regions.push_back(std::move(code_region));
 
+        setup_stack_region(snapshot, kernel_mode);
 
-        emulation::memory_snapshot_region_t stack_region;
-        stack_region.base = 0x7FFD0000;
-        stack_region.size = 0x20000;
-        stack_region.data.resize(0x20000, 0);
-        snapshot.regions.push_back(std::move(stack_region));
+        map_additional_regions(snapshot, params, code_base_aligned, code_base_aligned + code_region_size);
 
         emulation::emulation_config_t config;
         config.start_address     = *addr;
@@ -23432,7 +23558,6 @@ tool_result_t emulate_multi_trace(const json& params)
         traces.push_back(std::move(trace));
     }
 
-
     json diff;
     if (traces.size() >= 2)
     {
@@ -23460,11 +23585,13 @@ tool_result_t emulate_multi_trace(const json& params)
     json out;
     out["address"]      = helpers::format_address(*addr);
     out["trace_count"]  = traces.size();
+    out["kernel_mode"]  = kernel_mode;
     out["traces"]       = std::move(traces);
     if (!diff.empty()) out["differential_analysis"] = std::move(diff);
 
     return tool_result_t::ok(OBFSTR("Multi-trace: ") + std::to_string(out["trace_count"].get<std::size_t>()) +
-                             OBFSTR(" traces at ") + helpers::format_address(*addr), out);
+                             OBFSTR(" traces at ") + helpers::format_address(*addr) +
+                             (kernel_mode ? OBFSTR(" [kernel]") : OBFSTR(" [user]")), out);
 }
 
 
@@ -23474,31 +23601,32 @@ tool_result_t emulate_function(const json& params)
     if (!addr)
         return tool_result_t::error(OBFSTR("Invalid address"));
 
-    func_t* fn = get_func(*addr);
-    std::uint32_t fn_size = fn ? static_cast<std::uint32_t>(fn->size()) : params.value("size", 4096);
-    if (fn_size > 1024 * 1024) fn_size = 1024 * 1024;
+    auto chk = check_driver_for_address(*addr);
+    if (!chk.success) return chk;
 
+    const bool kernel_mode = is_kernel_address(*addr);
+
+    std::uint32_t fn_size = params.value("size", 4096);
+    if (fn_size > 1024 * 1024) fn_size = 1024 * 1024;
 
     std::uint32_t map_size = std::max(fn_size * 2, 8192u);
     if (map_size > 1024 * 1024) map_size = 1024 * 1024;
 
-    std::vector<std::uint8_t> code(map_size);
-    for (std::uint32_t i = 0; i < map_size; ++i)
-        code[i] = static_cast<std::uint8_t>(get_byte(static_cast<ea_t>(*addr + i)));
-
+    auto code = emulation::driver_read_bytes(*addr, map_size);
+    if (code.empty())
+        return tool_result_t::error(OBFSTR("Failed to read function bytes at ") +
+                                    helpers::format_address(*addr));
 
     constexpr std::uint64_t SENTINEL_RET = 0xDEAD000000000000ULL;
-    constexpr std::uint64_t STACK_BASE   = 0x7FFD0000;
-    constexpr std::uint64_t STACK_SIZE   = 0x20000;
-    constexpr std::uint64_t STACK_TOP    = STACK_BASE + STACK_SIZE - 0x1000;
+    std::uint64_t stack_base = kernel_mode ? KERNEL_SYNTH_STACK_BASE : USER_SYNTH_STACK_BASE;
+    std::uint64_t stack_top  = stack_base + SYNTH_STACK_SIZE - 0x1000;
 
     emulation::process_snapshot_t snapshot;
     snapshot.success = true;
     snapshot.rip     = *addr;
-    snapshot.rsp     = STACK_TOP;
-    snapshot.rbp     = STACK_TOP + 0x100;
+    snapshot.rsp     = stack_top;
+    snapshot.rbp     = stack_top + 0x100;
     snapshot.rflags  = 0x202;
-
 
     if (params.contains("rax")) { auto v = helpers::parse_address(params.value("rax", std::string())); if (v) snapshot.rax = *v; }
     if (params.contains("rbx")) { auto v = helpers::parse_address(params.value("rbx", std::string())); if (v) snapshot.rbx = *v; }
@@ -23509,30 +23637,29 @@ tool_result_t emulate_function(const json& params)
     if (params.contains("r8"))  { auto v = helpers::parse_address(params.value("r8", std::string()));  if (v) snapshot.r8  = *v; }
     if (params.contains("r9"))  { auto v = helpers::parse_address(params.value("r9", std::string()));  if (v) snapshot.r9  = *v; }
 
-
     emulation::memory_snapshot_region_t code_region;
     code_region.base = *addr & ~0xFFFULL;
     code_region.size = (static_cast<std::uint64_t>(map_size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
     code_region.data.resize(static_cast<std::size_t>(code_region.size), 0);
-    std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), map_size);
+    std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), code.size());
     snapshot.regions.push_back(std::move(code_region));
 
-
     emulation::memory_snapshot_region_t stack_region;
-    stack_region.base = STACK_BASE;
-    stack_region.size = STACK_SIZE;
-    stack_region.data.resize(STACK_SIZE, 0);
+    stack_region.base = stack_base;
+    stack_region.size = SYNTH_STACK_SIZE;
+    stack_region.data.resize(static_cast<std::size_t>(SYNTH_STACK_SIZE), 0);
 
     std::uint64_t sentinel = SENTINEL_RET;
-    std::memcpy(stack_region.data.data() + (STACK_TOP - STACK_BASE), &sentinel, 8);
+    std::memcpy(stack_region.data.data() + (stack_top - stack_base), &sentinel, 8);
     snapshot.regions.push_back(std::move(stack_region));
-
 
     emulation::memory_snapshot_region_t sentinel_region;
     sentinel_region.base = SENTINEL_RET & ~0xFFFULL;
     sentinel_region.size = 0x1000;
     sentinel_region.data.resize(0x1000, 0xCC);
     snapshot.regions.push_back(std::move(sentinel_region));
+
+    map_additional_regions(snapshot, params, code_region.base, code_region.base + code_region.size);
 
     emulation::emulation_config_t config;
     config.start_address     = *addr;
@@ -23552,6 +23679,7 @@ tool_result_t emulate_function(const json& params)
     out["function_address"] = helpers::format_address(*addr);
     out["function_size"]    = fn_size;
     out["mapped_size"]      = map_size;
+    out["kernel_mode"]      = kernel_mode;
     out["success"]          = result.success;
 
     bool returned_normally = result.success &&
@@ -23564,7 +23692,6 @@ tool_result_t emulate_function(const json& params)
         out["junk_instructions"]      = result.junk_instruction_count;
         out["effective_instructions"] = result.total_instructions - result.junk_instruction_count;
         out["end_address"]            = helpers::format_address(static_cast<ea_t>(result.end_address));
-
 
         for (const auto& d : result.reg_deltas)
         {
@@ -23601,7 +23728,6 @@ tool_result_t emulate_function(const json& params)
         }
         out["memory_writes"] = std::move(writes);
 
-
         constexpr std::size_t EX = 30;
         json trace_arr = json::array();
         for (std::size_t i = 0; i < std::min(result.trace.size(), EX); ++i)
@@ -23627,7 +23753,8 @@ tool_result_t emulate_function(const json& params)
 
     return tool_result_t::ok(
         OBFSTR("Function emulation ") + helpers::format_address(*addr) +
-        (returned_normally ? OBFSTR(": returned normally") : OBFSTR(": did not return")), out);
+        (returned_normally ? OBFSTR(": returned normally") : OBFSTR(": did not return")) +
+        (kernel_mode ? OBFSTR(" [kernel]") : OBFSTR(" [user]")), out);
 }
 
 #else
@@ -23670,14 +23797,19 @@ void register_tools()
 
     registry.register_tool({
         OBFSTR("disassemble_zydis"), OBFSTR("emulation"),
-        OBFSTR("Disassemble bytes using the Zydis engine instead of IDA's built-in disassembler. "
-               "Produces richer instruction metadata: branch/call/ret/nop/privileged classification, "
-               "precise mnemonic parsing, and accurate instruction lengths. "
-               "Works on any bytes in the IDB — useful for analyzing packed, encrypted, or "
-               "dynamically-generated code that IDA may have failed to disassemble."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Start address in the IDB"), true},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Number of bytes to disassemble (default 256, max 65536)"), false},
-         {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Maximum instructions to decode (default 100, max 10000)"), false}},
+        OBFSTR("Disassemble raw bytes from LIVE MEMORY using the Zydis engine via the kernel driver. "
+               "Reads memory directly — completely independent of the IDA database. "
+               "Works on both user-mode process addresses (requires driver_attach) and "
+               "kernel-mode addresses (requires only driver_connect). "
+               "Produces rich instruction metadata: branch/call/ret/nop/privileged "
+               "classification, precise mnemonic parsing, and accurate instruction lengths. "
+               "Use follow_jumps=true to automatically follow unconditional JMP trampolines (up to 16 hops) "
+               "to reach the real code — essential for VM-protected binaries where every function "
+               "is a jmp-trampoline into a packed section."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to disassemble (user-mode or kernel-mode)"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Number of bytes to read and disassemble (default 256, max 65536)"), false},
+         {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Maximum instructions to decode (default 100, max 10000)"), false},
+         {OBFSTR("follow_jumps"), OBFSTR("boolean"), OBFSTR("Follow unconditional JMP trampolines to reach actual code (default false)"), false}},
         disassemble_zydis, true});
 
     registry.register_tool({
@@ -23708,17 +23840,22 @@ void register_tools()
 
     registry.register_tool({
         OBFSTR("trace_execution_unicorn"), OBFSTR("emulation"),
-        OBFSTR("Emulate code from the IDB offline using Unicorn — NO debugger or driver required. "
-               "Reads bytes directly from the IDA database, maps them into a Unicorn x86-64 engine "
-               "with a synthetic stack, and traces execution. Produces register deltas, memory writes, "
-               "effective vs junk instruction classification, and an execution trace. "
-               "Ideal for analyzing VM handlers, decryption loops, and obfuscated routines statically. "
+        OBFSTR("Read raw code bytes from LIVE MEMORY via the kernel driver and emulate them "
+               "offline in a Unicorn x86-64 engine with a synthetic stack. Completely independent of "
+               "the IDA database. Works on both user-mode (requires driver_attach) and "
+               "kernel-mode addresses (requires only driver_connect). "
+               "Produces register deltas, memory writes, effective vs junk instruction classification, "
+               "and an execution trace. "
+               "Use additional_regions to map extra memory sections into the emulator (e.g. .be0 packed "
+               "section alongside .text for cross-section jumps). "
                "You can set initial register values (rax, rbx, ...) to simulate specific VM opcodes."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Start address to emulate from"), true},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes of code to map (default 4096, max 1MB)"), false},
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to emulate from (user-mode or kernel-mode)"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes of code to read (default 4096, max 1MB)"), false},
          {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Maximum instructions to emulate (default 50000)"), false},
          {OBFSTR("max_trace_entries"), OBFSTR("number"), OBFSTR("Maximum trace log entries (default 10000)"), false},
          {OBFSTR("stop_address"), OBFSTR("string"), OBFSTR("Address to stop emulation at (optional)"), false},
+         {OBFSTR("additional_regions"), OBFSTR("array"), OBFSTR("Extra memory regions to map: [{address,size},...] for cross-section code"), false,
+          {}, {{"type", "object"}}},
          {OBFSTR("rax"), OBFSTR("string"), OBFSTR("Initial RAX value (hex)"), false},
          {OBFSTR("rbx"), OBFSTR("string"), OBFSTR("Initial RBX value (hex)"), false},
          {OBFSTR("rcx"), OBFSTR("string"), OBFSTR("Initial RCX value (hex)"), false},
@@ -23732,17 +23869,20 @@ void register_tools()
 
     registry.register_tool({
         OBFSTR("analyze_vm_handler"), OBFSTR("emulation"),
-        OBFSTR("Combined static + dynamic analysis of a VM handler or obfuscated code block. "
-               "Step 1: Zydis static disassembly with instruction classification. "
-               "Step 2: Unicorn offline emulation to separate junk from effective operations. "
+        OBFSTR("Combined disassembly + emulation analysis of a VM handler or obfuscated code block "
+               "via the kernel driver. Works on user-mode (requires driver_attach) and "
+               "kernel-mode addresses (requires only driver_connect). "
+               "Step 1: Read raw bytes from live memory and disassemble with Zydis. "
+               "Step 2: Emulate the same bytes offline in Unicorn to separate junk from effective operations. "
                "Produces: static instruction counts (nop/branch/call/privileged ratios), "
                "emulation results (register deltas, memory writes, effective ops), "
                "and an overall classification (heavily_virtualized / moderately_obfuscated / junk_padded / normal). "
-               "Use this as a one-shot tool to understand what a VM handler actually computes, "
-               "cutting through thousands of junk instructions to reveal the true logic."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("VM handler entry point address"), true},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Handler size in bytes (default 8192)"), false},
+               "Use additional_regions to map extra sections for cross-section jumps."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("VM handler entry point address (user-mode or kernel-mode)"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Handler size in bytes to read (default 8192)"), false},
          {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Max instructions for emulation (default 100000)"), false},
+         {OBFSTR("additional_regions"), OBFSTR("array"), OBFSTR("Extra memory regions to map: [{address,size},...] for cross-section code"), false,
+          {}, {{"type", "object"}}},
          {OBFSTR("rax"), OBFSTR("string"), OBFSTR("Initial RAX for emulation (hex)"), false},
          {OBFSTR("rbx"), OBFSTR("string"), OBFSTR("Initial RBX for emulation (hex)"), false},
          {OBFSTR("rcx"), OBFSTR("string"), OBFSTR("Initial RCX for emulation (hex)"), false},
@@ -23754,29 +23894,36 @@ void register_tools()
 
     registry.register_tool({
         OBFSTR("emulate_multi_trace"), OBFSTR("emulation"),
-        OBFSTR("Run multiple emulation traces with different register inputs for differential analysis. "
+        OBFSTR("Read code from LIVE MEMORY via the kernel driver and run multiple Unicorn emulation "
+               "traces with different register inputs for differential analysis. "
+               "Works on user-mode (requires driver_attach) and kernel-mode addresses (requires only driver_connect). "
                "Compare execution paths, register outputs, and memory writes across traces. "
                "Classifies behavior: constant_operation, register_transform_only, input_dependent_behavior, "
-               "memory_behavior_varies. Use to understand VM handler semantics (e.g. verify that a handler "
-               "is 'vm_add' by running with different inputs and confirming output = input_a + input_b)."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Code address to emulate"), true},
+               "memory_behavior_varies. Use additional_regions for cross-section jumps."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Code address to emulate (user-mode or kernel-mode)"), true},
          {OBFSTR("inputs"), OBFSTR("array"), OBFSTR("Array of register state objects, e.g. [{rax:\"0x10\",rbx:\"0x20\"}, {rax:\"0x30\",rbx:\"0x40\"}]"), true},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Code size in bytes (default: 4096)"), false},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Code size in bytes to read (default: 4096)"), false},
          {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Max instructions per trace (default: 50000)"), false},
+         {OBFSTR("additional_regions"), OBFSTR("array"), OBFSTR("Extra memory regions to map: [{address,size},...] for cross-section code"), false,
+          {}, {{"type", "object"}}},
          {OBFSTR("timeout_us"), OBFSTR("number"), OBFSTR("Timeout per trace in microseconds (default: 5s)"), false}},
         emulate_multi_trace, true});
 
     registry.register_tool({
         OBFSTR("emulate_function"), OBFSTR("emulation"),
-        OBFSTR("Emulate a complete function from the IDB offline until it returns (RET). "
+        OBFSTR("Read a function's code from LIVE MEMORY via the kernel driver and emulate it "
+               "offline in Unicorn until it returns (RET). "
+               "Works on user-mode (requires driver_attach) and kernel-mode addresses (requires only driver_connect). "
                "Sets up a synthetic stack with a sentinel return address to detect normal function return. "
                "Reports: return value (RAX), register deltas, memory writes, effective operations, "
                "and whether the function returned normally. "
-               "Use to understand what a function computes without running it in a live process."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function entry point"), true},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Override function size if no IDA function defined"), false},
+               "Use additional_regions to map extra sections for cross-section jumps."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function entry point (user-mode or kernel-mode)"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Function size in bytes to read (required)"), false},
          {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Max instructions (default: 100000)"), false},
          {OBFSTR("max_trace_entries"), OBFSTR("number"), OBFSTR("Max trace entries (default: 10000)"), false},
+         {OBFSTR("additional_regions"), OBFSTR("array"), OBFSTR("Extra memory regions to map: [{address,size},...] for cross-section code"), false,
+          {}, {{"type", "object"}}},
          {OBFSTR("rax"), OBFSTR("string"), OBFSTR("Initial RAX (hex)"), false},
          {OBFSTR("rbx"), OBFSTR("string"), OBFSTR("Initial RBX (hex)"), false},
          {OBFSTR("rcx"), OBFSTR("string"), OBFSTR("Initial RCX (hex)"), false},

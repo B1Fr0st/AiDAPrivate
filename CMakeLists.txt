@@ -97,26 +97,31 @@ if(WIN32)
         )
     endif()
 
-    option(BUILD_CODEINE_ANALYZER "Build standalone Codeine analyzer tool" ON)
+    option(BUILD_BEDAISY_DUMPER "Build standalone BEDaisy kernel module dumper tool" ON)
 
-    if(BUILD_CODEINE_ANALYZER)
-        add_executable(CodeineAnalyzer
-            tools/codeine_analyzer/main.cpp
+    if(BUILD_BEDAISY_DUMPER)
+        add_executable(BEDaisyDumper
+            tools/bedaisy_dumper/main.cpp
             driver/comm.cpp
         )
 
-        target_include_directories(CodeineAnalyzer PRIVATE
+        target_include_directories(BEDaisyDumper PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/driver"
             "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${zydis_SOURCE_DIR}/include"
+            "${zydis_SOURCE_DIR}/dependencies/zycore/include"
+            "${zydis_BINARY_DIR}"
+            "${zydis_BINARY_DIR}/zycore"
+            "${unicorn_SOURCE_DIR}/include"
         )
 
-        target_compile_definitions(CodeineAnalyzer PRIVATE
+        target_compile_definitions(BEDaisyDumper PRIVATE
             _CRT_SECURE_NO_WARNINGS
             NOMINMAX
             WIN32_LEAN_AND_MEAN
         )
 
-        target_compile_options(CodeineAnalyzer PRIVATE
+        target_compile_options(BEDaisyDumper PRIVATE
             /W3
             /EHsc
             /Zc:__cplusplus
@@ -125,12 +130,18 @@ if(WIN32)
             /MD
         )
 
-        target_link_libraries(CodeineAnalyzer PRIVATE
+        target_link_libraries(BEDaisyDumper PRIVATE
+            Zydis
+            unicorn
+            ws2_32
+            dnsapi
+            winhttp
+            iphlpapi
             ntdll
         )
 
-        set_target_properties(CodeineAnalyzer PROPERTIES
-            OUTPUT_NAME "CodeineAnalyzer"
+        set_target_properties(BEDaisyDumper PROPERTIES
+            OUTPUT_NAME "BEDaisyDumper"
         )
     endif()
 

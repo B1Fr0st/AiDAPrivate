@@ -137,7 +137,12 @@ std::vector<decoded_insn_t> disassemble_range(
     std::uint32_t       max_instructions = 1000);
 
 
-std::vector<decoded_insn_t> disassemble_idb_range(
+std::vector<std::uint8_t> driver_read_bytes(
+    std::uint64_t       address,
+    std::size_t         size);
+
+
+std::vector<decoded_insn_t> driver_disassemble_range(
     std::uint64_t       address,
     std::uint32_t       size,
     std::uint32_t       max_instructions = 1000);

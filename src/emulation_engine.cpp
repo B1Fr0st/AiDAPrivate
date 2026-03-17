@@ -8,8 +8,6 @@
 #pragma warning(disable: 4267)
 #include <pro.h>
 #include <kernwin.hpp>
-#include <bytes.hpp>
-#include <segment.hpp>
 #pragma warning(pop)
 
 #include <Zydis/Zydis.h>
@@ -138,19 +136,44 @@ std::vector<decoded_insn_t> disassemble_range(
     return results;
 }
 
-std::vector<decoded_insn_t> disassemble_idb_range(
+std::vector<std::uint8_t> driver_read_bytes(
+    std::uint64_t  address,
+    std::size_t    size)
+{
+    if (!device || !device->is_connected())
+        return {};
+
+    const bool kernel_addr = address >= 0xFFFF800000000000ULL;
+
+    if (!kernel_addr && device->get_process_id() == 0)
+        return {};
+
+    if (size == 0 || size > 64ULL * 1024 * 1024)
+        return {};
+
+    std::vector<std::uint8_t> buffer(size, 0);
+    constexpr std::size_t CHUNK_SIZE = 65536;
+    for (std::size_t offset = 0; offset < size; offset += CHUNK_SIZE)
+    {
+        std::size_t chunk = std::min(CHUNK_SIZE, size - offset);
+        if (kernel_addr)
+            device->read_kernel_raw(address + offset, buffer.data() + offset, chunk);
+        else
+            device->read_raw(address + offset, buffer.data() + offset, chunk);
+    }
+    return buffer;
+}
+
+std::vector<decoded_insn_t> driver_disassemble_range(
     std::uint64_t  address,
     std::uint32_t  size,
     std::uint32_t  max_instructions)
 {
-    if (size == 0 || size > 1024 * 1024)
+    auto bytes = driver_read_bytes(address, size);
+    if (bytes.empty())
         return {};
 
-    std::vector<std::uint8_t> buf(size);
-    for (std::uint32_t i = 0; i < size; ++i)
-        buf[i] = static_cast<std::uint8_t>(get_byte(static_cast<ea_t>(address + i)));
-
-    return disassemble_range(buf.data(), buf.size(), address, max_instructions);
+    return disassemble_range(bytes.data(), bytes.size(), address, max_instructions);
 }
 
 
