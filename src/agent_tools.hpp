@@ -252,6 +252,12 @@ namespace analysis_tools
     tool_result_t find_crypto_constants(const nlohmann::json& params);
     tool_result_t analyze_data_flow(const nlohmann::json& params);
     tool_result_t detect_anti_analysis(const nlohmann::json& params);
+    tool_result_t analyze_pe_headers(const nlohmann::json& params);
+    tool_result_t analyze_entropy(const nlohmann::json& params);
+    tool_result_t detect_hooks(const nlohmann::json& params);
+    tool_result_t detect_direct_syscalls(const nlohmann::json& params);
+    tool_result_t resolve_api_hashes(const nlohmann::json& params);
+    tool_result_t reconstruct_vtable(const nlohmann::json& params);
     void register_tools();
 }
 
@@ -267,6 +273,7 @@ namespace deobfuscation_tools
     tool_result_t reconstruct_imports(const nlohmann::json& params);
     tool_result_t unpack_section(const nlohmann::json& params);
     tool_result_t full_deobfuscation_pass(const nlohmann::json& params);
+    tool_result_t devirtualize_function(const nlohmann::json& params);
     void register_tools();
 }
 
@@ -306,6 +313,8 @@ namespace driver_tools
     tool_result_t driver_clear_hw_breakpoint(const nlohmann::json& params);
     tool_result_t driver_resolve_export(const nlohmann::json& params);
     tool_result_t driver_virtual_to_physical(const nlohmann::json& params);
+    tool_result_t driver_enum_kernel_callbacks(const nlohmann::json& params);
+    tool_result_t driver_detect_integrity_checks(const nlohmann::json& params);
 
     tool_result_t driver_defer_action(const nlohmann::json& params);
     tool_result_t driver_list_deferred_actions(const nlohmann::json& params);
@@ -477,6 +486,17 @@ namespace net_security_tools
     tool_result_t autoresponder_stop(const nlohmann::json& params);
     tool_result_t autoresponder_import_rules(const nlohmann::json& params);
     tool_result_t autoresponder_export_rules(const nlohmann::json& params);
+    void register_tools();
+}
+
+namespace emulation_tools
+{
+    tool_result_t disassemble_zydis(const nlohmann::json& params);
+    tool_result_t driver_snapshot_and_emulate(const nlohmann::json& params);
+    tool_result_t trace_execution_unicorn(const nlohmann::json& params);
+    tool_result_t analyze_vm_handler(const nlohmann::json& params);
+    tool_result_t emulate_multi_trace(const nlohmann::json& params);
+    tool_result_t emulate_function(const nlohmann::json& params);
     void register_tools();
 }
 

@@ -10,6 +10,38 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# --- Zydis disassembler engine (static) ---
+include(FetchContent)
+
+set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
+set(ZYDIS_FEATURE_ENCODER OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    zydis
+    GIT_REPOSITORY https://github.com/zyantific/zydis.git
+    GIT_TAG        v4.1.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(zydis)
+
+# --- Unicorn CPU emulation engine (static) ---
+set(UNICORN_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(UNICORN_ARCH "x86" CACHE STRING "" FORCE)
+set(UNICORN_INSTALL OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS_SAVED "${BUILD_SHARED_LIBS}")
+set(BUILD_SHARED_LIBS OFF)
+
+FetchContent_Declare(
+    unicorn
+    GIT_REPOSITORY https://github.com/unicorn-engine/unicorn.git
+    GIT_TAG        2.1.1
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(unicorn)
+set(BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS_SAVED}")
+
 if(NOT DEFINED IDASDK_DIR)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ida-sdk/src/include/ida.hpp")
         set(IDASDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ida-sdk/src")
@@ -62,6 +94,36 @@ if(WIN32)
 
         set_target_properties(NetworkDriverTestTool PROPERTIES
             OUTPUT_NAME "NetworkDriverTestTool"
+        )
+    endif()
+
+    option(BUILD_NET_SECURITY_TEST "Build offline net_security verification test" ON)
+
+    if(BUILD_NET_SECURITY_TEST)
+        add_executable(NetSecurityTest
+            tools/net_security_test/main.cpp
+        )
+
+        target_compile_definitions(NetSecurityTest PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+        )
+
+        target_compile_options(NetSecurityTest PRIVATE
+            /W3
+            /EHsc
+            /Zc:__cplusplus
+            /permissive-
+            /MD
+        )
+
+        target_link_libraries(NetSecurityTest PRIVATE
+            bcrypt
+        )
+
+        set_target_properties(NetSecurityTest PROPERTIES
+            OUTPUT_NAME "NetSecurityTest"
         )
     endif()
 endif()
@@ -117,6 +179,7 @@ set(AIDA_SOURCES
     src/workbench.cpp
     src/driver_loader.cpp
     src/net_security.cpp
+    src/emulation_engine.cpp
     driver/comm.cpp
 )
 
@@ -148,6 +211,7 @@ set(AIDA_HEADERS
     src/settings.hpp
     src/driver_loader.hpp
     src/net_security.hpp
+    src/emulation_engine.hpp
     src/ui.hpp
     src/workbench.hpp
 )
@@ -237,10 +301,21 @@ endif()
 
 target_link_libraries(AiDA PRIVATE "${IDA_LINK_LIB}")
 
+# --- Zydis + Unicorn emulation engine ---
+target_link_libraries(AiDA PRIVATE Zydis unicorn)
+target_include_directories(AiDA PRIVATE
+    "${zydis_SOURCE_DIR}/include"
+    "${zydis_SOURCE_DIR}/dependencies/zycore/include"
+    "${zydis_BINARY_DIR}"
+    "${zydis_BINARY_DIR}/zycore"
+    "${unicorn_SOURCE_DIR}/include"
+)
+
 if(WIN32)
     target_compile_options(AiDA PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/W3>
         $<$<COMPILE_LANGUAGE:CXX>:/Zi>
+        $<$<COMPILE_LANGUAGE:CXX>:/FS>
         $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
         $<$<COMPILE_LANGUAGE:CXX>:/permissive->
         $<$<COMPILE_LANGUAGE:CXX>:/Zp8>

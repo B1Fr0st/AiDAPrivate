@@ -5,6 +5,7 @@
 #include "anti_re.hpp"
 #include "rlhf.hpp"
 #include "subagents.hpp"
+#include "emulation_engine.hpp"
 #include <allins.hpp>
 #include <iomanip>
 #include <loader.hpp>
@@ -8680,6 +8681,750 @@ tool_result_t detect_anti_analysis(const json& params)
     return tool_result_t::ok(OBFSTR("Anti-analysis detection"), result);
 }
 
+// ─── PE Header Deep Analysis ─────────────────────────────────────────────
+tool_result_t analyze_pe_headers(const json& params)
+{
+    ea_t base = get_imagebase();
+    if (params.contains("address"))
+    {
+        auto a = helpers::parse_address(params.value("address", std::string()));
+        if (a) base = *a;
+    }
+
+    std::uint16_t e_magic = get_word(base);
+    if (e_magic != 0x5A4D)
+        return tool_result_t::error(OBFSTR("Not a valid PE: missing MZ signature at ") + helpers::format_address(base));
+
+    std::uint32_t pe_off = get_dword(base + 0x3C);
+    ea_t pe_hdr = base + pe_off;
+    if (get_dword(pe_hdr) != 0x00004550)
+        return tool_result_t::error(OBFSTR("Invalid PE signature at ") + helpers::format_address(pe_hdr));
+
+    json result;
+    result["image_base"] = helpers::format_address(base);
+
+    // COFF header
+    ea_t coff = pe_hdr + 4;
+    std::uint16_t machine       = get_word(coff);
+    std::uint16_t num_sections  = get_word(coff + 2);
+    std::uint32_t timestamp     = get_dword(coff + 4);
+    std::uint16_t opt_size      = get_word(coff + 16);
+    std::uint16_t characteristics = get_word(coff + 18);
+
+    json coff_j;
+    switch (machine)
+    {
+    case 0x8664: coff_j["machine"] = "AMD64"; break;
+    case 0x14C:  coff_j["machine"] = "i386"; break;
+    case 0xAA64: coff_j["machine"] = "ARM64"; break;
+    default:     coff_j["machine"] = helpers::format_address(machine); break;
+    }
+    coff_j["num_sections"] = num_sections;
+    coff_j["timestamp"]    = timestamp;
+
+    std::vector<std::string> char_flags;
+    if (characteristics & 0x0002) char_flags.push_back("EXECUTABLE_IMAGE");
+    if (characteristics & 0x0020) char_flags.push_back("LARGE_ADDRESS_AWARE");
+    if (characteristics & 0x2000) char_flags.push_back("DLL");
+    coff_j["characteristics_flags"] = char_flags;
+    result["coff_header"] = std::move(coff_j);
+
+    // Optional header
+    ea_t opt = coff + 20;
+    std::uint16_t magic = get_word(opt);
+    bool is64 = (magic == 0x20B);
+    result["pe_format"] = is64 ? "PE32+ (64-bit)" : "PE32 (32-bit)";
+
+    json opt_j;
+    opt_j["linker_version"] = std::to_string(get_byte(opt + 2)) + "." + std::to_string(get_byte(opt + 3));
+    opt_j["entry_point"]    = helpers::format_address(base + get_dword(opt + 16));
+    opt_j["section_alignment"] = get_dword(opt + 32);
+    opt_j["file_alignment"]    = get_dword(opt + 36);
+
+    std::uint64_t img_base_pe = is64
+        ? static_cast<std::uint64_t>(get_qword(opt + 24))
+        : static_cast<std::uint64_t>(get_dword(opt + 28));
+    opt_j["image_base_pe"]    = helpers::format_address(static_cast<ea_t>(img_base_pe));
+    opt_j["size_of_image"]    = get_dword(opt + 56);
+    opt_j["size_of_headers"]  = get_dword(opt + 60);
+    opt_j["checksum"]         = get_dword(opt + 64);
+    opt_j["subsystem"]        = get_word(opt + 68);
+
+    std::uint16_t dll_chars = get_word(opt + 70);
+    std::vector<std::string> dll_flags;
+    if (dll_chars & 0x0040) dll_flags.push_back("DYNAMIC_BASE (ASLR)");
+    if (dll_chars & 0x0080) dll_flags.push_back("FORCE_INTEGRITY");
+    if (dll_chars & 0x0100) dll_flags.push_back("NX_COMPAT (DEP)");
+    if (dll_chars & 0x0400) dll_flags.push_back("NO_SEH");
+    if (dll_chars & 0x4000) dll_flags.push_back("GUARD_CF");
+    opt_j["dll_characteristics_flags"] = dll_flags;
+    result["optional_header"] = std::move(opt_j);
+
+    // Data directories
+    std::uint32_t num_dd;
+    ea_t dd_base;
+    if (is64) { num_dd = get_dword(opt + 108); dd_base = opt + 112; }
+    else      { num_dd = get_dword(opt + 92);  dd_base = opt + 96;  }
+
+    static const char* dd_names[] = {
+        "Export","Import","Resource","Exception","Security",
+        "Relocation","Debug","Architecture","GlobalPtr","TLS",
+        "LoadConfig","BoundImport","IAT","DelayImport","CLR","Reserved"
+    };
+
+    json dirs = json::array();
+    for (std::uint32_t i = 0; i < std::min(num_dd, 16u); ++i)
+    {
+        std::uint32_t rva  = get_dword(dd_base + i * 8);
+        std::uint32_t sz   = get_dword(dd_base + i * 8 + 4);
+        if (rva == 0 && sz == 0) continue;
+
+        json dd;
+        dd["index"] = i;
+        dd["name"]  = dd_names[i];
+        dd["rva"]   = helpers::format_address(static_cast<ea_t>(rva));
+        dd["va"]    = helpers::format_address(base + rva);
+        dd["size"]  = sz;
+
+        // Directory-specific parsing
+        if (i == 0 && rva) // Export
+        {
+            ea_t exp = base + rva;
+            dd["num_functions"] = get_dword(exp + 20);
+            dd["num_names"]     = get_dword(exp + 24);
+        }
+        else if (i == 3 && rva) // Exception
+        {
+            dd["runtime_function_count"] = sz / 12;
+        }
+        else if (i == 5 && rva) // Relocation
+        {
+            ea_t cur = base + rva;
+            ea_t rel_end = cur + sz;
+            int blocks = 0;
+            while (cur < rel_end)
+            {
+                std::uint32_t bsz = get_dword(cur + 4);
+                if (bsz == 0) break;
+                ++blocks;
+                cur += bsz;
+            }
+            dd["relocation_blocks"] = blocks;
+        }
+        else if (i == 9 && rva) // TLS
+        {
+            ea_t tls = base + rva;
+            json tls_j;
+            ea_t cb_va;
+            if (is64)
+            {
+                tls_j["raw_data_start"]    = helpers::format_address(static_cast<ea_t>(get_qword(tls)));
+                tls_j["raw_data_end"]      = helpers::format_address(static_cast<ea_t>(get_qword(tls + 8)));
+                cb_va = static_cast<ea_t>(get_qword(tls + 24));
+            }
+            else
+            {
+                tls_j["raw_data_start"]    = helpers::format_address(get_dword(tls));
+                tls_j["raw_data_end"]      = helpers::format_address(get_dword(tls + 4));
+                cb_va = get_dword(tls + 12);
+            }
+            tls_j["callbacks_address"] = helpers::format_address(cb_va);
+
+            json cbs = json::array();
+            if (cb_va != 0)
+            {
+                for (int ci = 0; ci < 64; ++ci)
+                {
+                    std::uint64_t cb = is64 ? get_qword(cb_va + ci * 8) : get_dword(cb_va + ci * 4);
+                    if (cb == 0) break;
+                    json c;
+                    c["address"] = helpers::format_address(static_cast<ea_t>(cb));
+                    qstring nm;
+                    if (get_name(&nm, static_cast<ea_t>(cb)) && !nm.empty())
+                        c["name"] = nm.c_str();
+                    cbs.push_back(std::move(c));
+                }
+            }
+            tls_j["callbacks"]         = std::move(cbs);
+            tls_j["callback_count"]    = tls_j["callbacks"].size();
+            dd["tls_info"]             = std::move(tls_j);
+        }
+        else if (i == 10 && rva && is64) // Load Config (64-bit)
+        {
+            ea_t lc = base + rva;
+            json lc_j;
+            lc_j["security_cookie"]          = helpers::format_address(static_cast<ea_t>(get_qword(lc + 88)));
+            lc_j["guard_cf_check_function"]  = helpers::format_address(static_cast<ea_t>(get_qword(lc + 112)));
+            lc_j["guard_cf_function_table"]  = helpers::format_address(static_cast<ea_t>(get_qword(lc + 128)));
+            lc_j["guard_cf_function_count"]  = static_cast<std::uint64_t>(get_qword(lc + 136));
+            dd["load_config"] = std::move(lc_j);
+        }
+        dirs.push_back(std::move(dd));
+    }
+    result["data_directories"] = std::move(dirs);
+
+    // Section table with entropy
+    ea_t sec_tbl = opt + opt_size;
+    json secs = json::array();
+    for (int si = 0; si < num_sections; ++si)
+    {
+        ea_t sec = sec_tbl + si * 40;
+        char sname[9] = {};
+        for (int j = 0; j < 8; ++j)
+            sname[j] = static_cast<char>(get_byte(sec + j));
+
+        std::uint32_t vsize   = get_dword(sec + 8);
+        std::uint32_t vrva    = get_dword(sec + 12);
+        std::uint32_t rsize   = get_dword(sec + 16);
+        std::uint32_t rptr    = get_dword(sec + 20);
+        std::uint32_t chars   = get_dword(sec + 36);
+
+        ea_t sec_va = base + vrva;
+        std::uint32_t check_sz = std::min(vsize, 65536u);
+        std::uint32_t freq[256] = {};
+        std::uint32_t cnt = 0;
+        for (std::uint32_t b = 0; b < check_sz; ++b)
+        {
+            if (is_loaded(sec_va + b))
+            {
+                freq[get_byte(sec_va + b)]++;
+                ++cnt;
+            }
+        }
+        double ent = 0.0;
+        if (cnt > 0)
+        {
+            for (int k = 0; k < 256; ++k)
+            {
+                if (freq[k] == 0) continue;
+                double p = static_cast<double>(freq[k]) / cnt;
+                ent -= p * std::log2(p);
+            }
+        }
+
+        json s;
+        s["name"]            = sname;
+        s["virtual_address"] = helpers::format_address(sec_va);
+        s["virtual_size"]    = vsize;
+        s["raw_size"]        = rsize;
+        s["raw_offset"]      = rptr;
+        s["entropy"]         = std::round(ent * 100.0) / 100.0;
+
+        std::vector<std::string> fl;
+        if (chars & 0x00000020) fl.push_back("CODE");
+        if (chars & 0x00000040) fl.push_back("INITIALIZED_DATA");
+        if (chars & 0x00000080) fl.push_back("UNINITIALIZED_DATA");
+        if (chars & 0x02000000) fl.push_back("DISCARDABLE");
+        if (chars & 0x20000000) fl.push_back("EXECUTE");
+        if (chars & 0x40000000) fl.push_back("READ");
+        if (chars & 0x80000000) fl.push_back("WRITE");
+        s["flags"] = fl;
+
+        if (ent > 7.0) s["classification"] = "likely_packed_or_encrypted";
+        else if (ent > 6.5) s["classification"] = "high_entropy_suspicious";
+        else if ((chars & 0x20000000) && (chars & 0x80000000)) s["classification"] = "rwx_suspicious";
+        else s["classification"] = "normal";
+
+        secs.push_back(std::move(s));
+    }
+    result["sections"] = std::move(secs);
+
+    return tool_result_t::ok(OBFSTR("PE header analysis for ") + helpers::format_address(base), result);
+}
+
+// ─── Entropy Analysis ────────────────────────────────────────────────────
+tool_result_t analyze_entropy(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    std::uint32_t size    = params.value("size", 4096);
+    if (size > 1048576) size = 1048576;
+    std::uint32_t window  = params.value("window_size", 256);
+    if (window < 32) window = 32;
+    if (window > size) window = size;
+
+    // Overall entropy
+    std::uint32_t freq[256] = {};
+    std::uint32_t total = 0;
+    for (std::uint32_t i = 0; i < size; ++i)
+    {
+        if (is_loaded(*addr + i)) { freq[get_byte(*addr + i)]++; ++total; }
+    }
+    double overall = 0.0;
+    if (total > 0)
+    {
+        for (int k = 0; k < 256; ++k)
+        {
+            if (freq[k] == 0) continue;
+            double p = static_cast<double>(freq[k]) / total;
+            overall -= p * std::log2(p);
+        }
+    }
+
+    // Sliding window
+    json windows = json::array();
+    std::uint32_t step = std::max(window / 2, 1u);
+    double max_ent = 0.0, min_ent = 8.0;
+    for (std::uint32_t off = 0; off + window <= size; off += step)
+    {
+        std::uint32_t wf[256] = {};
+        std::uint32_t wc = 0;
+        for (std::uint32_t b = 0; b < window; ++b)
+        {
+            if (is_loaded(*addr + off + b)) { wf[get_byte(*addr + off + b)]++; ++wc; }
+        }
+        double ent = 0.0;
+        if (wc > 0)
+        {
+            for (int k = 0; k < 256; ++k)
+            {
+                if (wf[k] == 0) continue;
+                double p = static_cast<double>(wf[k]) / wc;
+                ent -= p * std::log2(p);
+            }
+        }
+        if (ent > max_ent) max_ent = ent;
+        if (ent < min_ent) min_ent = ent;
+
+        json w;
+        w["offset"]  = off;
+        w["address"] = helpers::format_address(*addr + off);
+        w["entropy"] = std::round(ent * 100.0) / 100.0;
+        if (ent > 7.0) w["classification"] = "encrypted_or_compressed";
+        else if (ent > 6.0) w["classification"] = "suspicious";
+        else if (ent < 1.0) w["classification"] = "nearly_empty";
+        else w["classification"] = "normal";
+        windows.push_back(std::move(w));
+    }
+
+    json result;
+    result["address"]             = helpers::format_address(*addr);
+    result["size"]                = size;
+    result["overall_entropy"]     = std::round(overall * 100.0) / 100.0;
+    result["max_window_entropy"]  = std::round(max_ent * 100.0) / 100.0;
+    result["min_window_entropy"]  = std::round(min_ent * 100.0) / 100.0;
+    result["window_size"]         = window;
+    result["windows"]             = std::move(windows);
+
+    std::string verdict;
+    if (overall > 7.5)      verdict = "almost_certainly_encrypted_or_compressed";
+    else if (overall > 7.0) verdict = "likely_packed";
+    else if (overall > 6.0) verdict = "suspicious_high_entropy";
+    else                    verdict = "normal";
+    result["verdict"] = verdict;
+
+    return tool_result_t::ok(OBFSTR("Entropy: ") + std::to_string(overall) + OBFSTR(" bits/byte — ") + verdict, result);
+}
+
+// ─── Hook Detection ──────────────────────────────────────────────────────
+tool_result_t detect_hooks(const json& params)
+{
+    auto addr_opt = helpers::parse_address(params.value("address", std::string()));
+    std::uint32_t max_fn = params.value("max_functions", 500);
+    if (max_fn > 10000) max_fn = 10000;
+
+    segment_t* target_seg = addr_opt ? getseg(*addr_opt) : nullptr;
+    int checked = 0;
+    json hooks = json::array();
+
+    for (std::size_t i = 0; i < get_func_qty() && checked < static_cast<int>(max_fn); ++i)
+    {
+        func_t* fn = getn_func(i);
+        if (!fn) continue;
+        if (target_seg && getseg(fn->start_ea) != target_seg) continue;
+        ++checked;
+
+        ea_t ea = fn->start_ea;
+        std::uint8_t pr[16];
+        for (int b = 0; b < 16; ++b) pr[b] = static_cast<std::uint8_t>(get_byte(ea + b));
+
+        std::string hook_type;
+        ea_t hook_target = BADADDR;
+
+        if (pr[0] == 0xE9)
+        {
+            std::int32_t rel;
+            std::memcpy(&rel, &pr[1], 4);
+            hook_target = ea + 5 + rel;
+            hook_type = "jmp_rel32";
+        }
+        else if (pr[0] == 0xFF && pr[1] == 0x25)
+        {
+            std::int32_t disp;
+            std::memcpy(&disp, &pr[2], 4);
+            ea_t ptr = ea + 6 + disp;
+            hook_target = static_cast<ea_t>(get_qword(ptr));
+            hook_type = "jmp_indirect_rip";
+        }
+        else if (pr[0] == 0x48 && pr[1] == 0xB8 && pr[10] == 0xFF && pr[11] == 0xE0)
+        {
+            std::memcpy(&hook_target, &pr[2], 8);
+            hook_type = "mov_rax_jmp_rax";
+        }
+        else if (pr[0] == 0x68 && pr[5] == 0xC3)
+        {
+            std::uint32_t t;
+            std::memcpy(&t, &pr[1], 4);
+            hook_target = static_cast<ea_t>(t);
+            hook_type = "push_ret";
+        }
+        else if (pr[0] == 0xCC)
+        {
+            hook_type = "int3_breakpoint";
+        }
+
+        if (hook_type.empty()) continue;
+
+        json h;
+        h["address"] = helpers::format_address(ea);
+        qstring nm;
+        if (get_name(&nm, ea) && !nm.empty()) h["name"] = nm.c_str();
+        h["hook_type"] = hook_type;
+        if (hook_target != BADADDR)
+        {
+            h["target"] = helpers::format_address(hook_target);
+            segment_t* ts = getseg(hook_target);
+            if (ts) { qstring sn; if (get_segm_name(&sn, ts) && !sn.empty()) h["target_segment"] = sn.c_str(); }
+            qstring tn;
+            if (get_name(&tn, hook_target) && !tn.empty()) h["target_name"] = tn.c_str();
+        }
+
+        std::ostringstream hex;
+        for (int b = 0; b < 16; ++b)
+        {
+            if (b > 0) hex << " ";
+            hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(pr[b]);
+        }
+        h["prologue_bytes"] = hex.str();
+        hooks.push_back(std::move(h));
+    }
+
+    json result;
+    result["functions_checked"] = checked;
+    result["hooks_found"]       = hooks.size();
+    result["hooks"]             = std::move(hooks);
+    return tool_result_t::ok(OBFSTR("Hook detection: ") + std::to_string(result["hooks_found"].get<std::size_t>()) +
+                             OBFSTR(" hooks in ") + std::to_string(checked) + OBFSTR(" functions"), result);
+}
+
+// ─── Direct Syscall Detection ────────────────────────────────────────────
+tool_result_t detect_direct_syscalls(const json& params)
+{
+    auto addr_opt = helpers::parse_address(params.value("address", std::string()));
+    std::uint32_t scan_size = params.value("size", 0);
+
+    json syscalls = json::array();
+
+    auto scan = [&](ea_t start, ea_t end)
+    {
+        for (ea_t ea = start; ea + 10 < end; ++ea)
+        {
+            if (!is_loaded(ea)) continue;
+
+            // Pattern 1: 4C 8B D1  B8 xx xx xx xx  0F 05  (mov r10,rcx; mov eax,num; syscall)
+            if (get_byte(ea) == 0x4C && get_byte(ea + 1) == 0x8B && get_byte(ea + 2) == 0xD1 &&
+                get_byte(ea + 3) == 0xB8 && get_byte(ea + 8) == 0x0F && get_byte(ea + 9) == 0x05)
+            {
+                std::uint32_t num = get_dword(ea + 4);
+                json sc;
+                sc["address"]        = helpers::format_address(ea);
+                sc["syscall_number"] = num;
+                sc["syscall_hex"]    = helpers::format_address(static_cast<ea_t>(num));
+                sc["pattern"]        = "mov_r10_rcx__mov_eax__syscall";
+
+                func_t* fn = get_func(ea);
+                if (fn) { qstring n; if (get_name(&n, fn->start_ea) && !n.empty()) sc["function"] = n.c_str(); }
+                syscalls.push_back(std::move(sc));
+                ea += 9;
+            }
+            // Pattern 2: B8 xx xx xx xx  0F 05  (mov eax,num; syscall — no r10 setup)
+            else if (get_byte(ea) == 0xB8 && get_byte(ea + 5) == 0x0F && get_byte(ea + 6) == 0x05)
+            {
+                std::uint32_t num = get_dword(ea + 1);
+                if (num > 0x1000) continue;
+                json sc;
+                sc["address"]        = helpers::format_address(ea);
+                sc["syscall_number"] = num;
+                sc["pattern"]        = "mov_eax__syscall";
+
+                func_t* fn = get_func(ea);
+                if (fn) { qstring n; if (get_name(&n, fn->start_ea) && !n.empty()) sc["function"] = n.c_str(); }
+                syscalls.push_back(std::move(sc));
+                ea += 6;
+            }
+            // Pattern 3: CD 2E  (int 2Eh — legacy 32-bit syscall)
+            else if (get_byte(ea) == 0xCD && get_byte(ea + 1) == 0x2E)
+            {
+                if (ea >= start + 5 && get_byte(ea - 5) == 0xB8)
+                {
+                    json sc;
+                    sc["address"]        = helpers::format_address(ea - 5);
+                    sc["syscall_number"] = get_dword(ea - 4);
+                    sc["pattern"]        = "mov_eax__int2e";
+                    syscalls.push_back(std::move(sc));
+                }
+            }
+        }
+    };
+
+    if (addr_opt && scan_size > 0)
+        scan(*addr_opt, *addr_opt + scan_size);
+    else if (addr_opt)
+    {
+        segment_t* seg = getseg(*addr_opt);
+        if (seg) scan(seg->start_ea, seg->end_ea);
+        else     scan(*addr_opt, *addr_opt + 0x10000);
+    }
+    else
+    {
+        for (int i = 0; i < get_segm_qty(); ++i)
+        {
+            segment_t* seg = getnseg(i);
+            if (!seg || seg->type != SEG_CODE) continue;
+            scan(seg->start_ea, seg->end_ea);
+        }
+    }
+
+    json result;
+    result["syscalls_found"] = syscalls.size();
+    result["syscalls"]       = std::move(syscalls);
+    if (!result["syscalls"].empty())
+        result["note"] = OBFSTR("Direct syscalls bypass IAT hooks and usermode API monitoring. "
+                                "Common in anti-cheats, packers, and malware.");
+    return tool_result_t::ok(OBFSTR("Direct syscall scan: ") + std::to_string(result["syscalls_found"].get<std::size_t>()) + OBFSTR(" found"), result);
+}
+
+// ─── API Hash Resolution ─────────────────────────────────────────────────
+tool_result_t resolve_api_hashes(const json& params)
+{
+    std::string algorithm = params.value("algorithm", "ror13");
+
+    // Parse target hashes
+    std::vector<std::uint32_t> targets;
+    if (params.contains("hashes") && params["hashes"].is_array())
+    {
+        for (const auto& h : params["hashes"])
+        {
+            if (h.is_number()) targets.push_back(h.get<std::uint32_t>());
+            else if (h.is_string()) { auto a = helpers::parse_address(h.get<std::string>()); if (a) targets.push_back(static_cast<std::uint32_t>(*a)); }
+        }
+    }
+    else if (params.contains("hash"))
+    {
+        if (params["hash"].is_number()) targets.push_back(params["hash"].get<std::uint32_t>());
+        else { auto a = helpers::parse_address(params.value("hash", std::string())); if (a) targets.push_back(static_cast<std::uint32_t>(*a)); }
+    }
+    if (targets.empty())
+        return tool_result_t::error(OBFSTR("No hash values provided. Use 'hash' or 'hashes' parameter."));
+
+    // Hash algorithms
+    auto h_ror13 = [](const std::string& s) -> std::uint32_t {
+        std::uint32_t h = 0;
+        for (char c : s) h = ((h >> 13) | (h << 19)) + static_cast<std::uint8_t>(c);
+        return h;
+    };
+    auto h_djb2 = [](const std::string& s) -> std::uint32_t {
+        std::uint32_t h = 5381;
+        for (char c : s) h = ((h << 5) + h) + static_cast<std::uint8_t>(c);
+        return h;
+    };
+    auto h_crc32 = [](const std::string& s) -> std::uint32_t {
+        std::uint32_t crc = 0xFFFFFFFF;
+        for (char c : s) { crc ^= static_cast<std::uint8_t>(c); for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ (0xEDB88320 & (~((crc & 1) - 1))); }
+        return ~crc;
+    };
+    auto h_fnv1a = [](const std::string& s) -> std::uint32_t {
+        std::uint32_t h = 0x811C9DC5;
+        for (char c : s) { h ^= static_cast<std::uint8_t>(c); h *= 0x01000193; }
+        return h;
+    };
+    auto h_sdbm = [](const std::string& s) -> std::uint32_t {
+        std::uint32_t h = 0;
+        for (char c : s) h = static_cast<std::uint8_t>(c) + (h << 6) + (h << 16) - h;
+        return h;
+    };
+
+    std::string algo_lc = algorithm;
+    std::transform(algo_lc.begin(), algo_lc.end(), algo_lc.begin(), ::tolower);
+    std::function<std::uint32_t(const std::string&)> hash_fn;
+    if (algo_lc == "ror13")       hash_fn = h_ror13;
+    else if (algo_lc == "djb2")   hash_fn = h_djb2;
+    else if (algo_lc == "crc32")  hash_fn = h_crc32;
+    else if (algo_lc == "fnv1a" || algo_lc == "fnv") hash_fn = h_fnv1a;
+    else if (algo_lc == "sdbm")   hash_fn = h_sdbm;
+    else return tool_result_t::error(OBFSTR("Unknown algorithm: ") + algorithm + OBFSTR(". Supported: ror13, djb2, crc32, fnv1a, sdbm"));
+
+    // Build API name database from IDB imports + well-known APIs
+    std::vector<std::pair<std::string, std::string>> api_names;
+    for (int i = 0; i < get_import_module_qty(); ++i)
+    {
+        qstring mod_name;
+        get_import_module_name(&mod_name, i);
+        std::string dll = mod_name.c_str();
+        struct ctx_t { std::vector<std::pair<std::string, std::string>>* apis; std::string dll; };
+        ctx_t ctx{&api_names, dll};
+        enum_import_names(i, [](ea_t, const char* nm, uval_t, void* ud) -> int {
+            auto* c = static_cast<ctx_t*>(ud);
+            if (nm && nm[0]) c->apis->push_back({c->dll, nm});
+            return 1;
+        }, &ctx);
+    }
+
+    static const char* common[] = {
+        "VirtualAlloc","VirtualAllocEx","VirtualFree","VirtualProtect","VirtualQuery",
+        "ReadProcessMemory","WriteProcessMemory","OpenProcess","CreateRemoteThread",
+        "NtAllocateVirtualMemory","NtReadVirtualMemory","NtWriteVirtualMemory",
+        "NtProtectVirtualMemory","NtOpenProcess","NtQueryInformationProcess",
+        "NtQuerySystemInformation","NtSetInformationThread","NtCreateThreadEx",
+        "NtDeviceIoControlFile","NtClose","NtCreateFile","NtOpenFile",
+        "NtMapViewOfSection","NtUnmapViewOfSection","NtQueryVirtualMemory",
+        "GetProcAddress","LoadLibraryA","LoadLibraryW","LoadLibraryExA","LoadLibraryExW",
+        "GetModuleHandleA","GetModuleHandleW","CreateFileA","CreateFileW",
+        "ReadFile","WriteFile","CreateProcessA","CreateProcessW",
+        "ExitProcess","TerminateProcess","IsDebuggerPresent","CheckRemoteDebuggerPresent",
+        "GetTickCount","QueryPerformanceCounter","Sleep",
+        "CreateThread","ResumeThread","SuspendThread","GetThreadContext","SetThreadContext",
+        "WSAStartup","socket","connect","send","recv","closesocket",
+        "RegOpenKeyExA","RegOpenKeyExW","RegQueryValueExA","RegSetValueExA",
+        "CryptEncrypt","CryptDecrypt","BCryptOpenAlgorithmProvider","BCryptEncrypt","BCryptDecrypt",
+        nullptr
+    };
+    for (int i = 0; common[i]; ++i) api_names.push_back({"common", common[i]});
+
+    std::set<std::uint32_t> target_set(targets.begin(), targets.end());
+    json resolved = json::array();
+    std::set<std::uint32_t> found_set;
+
+    bool try_dll = params.value("include_dll_name", false);
+
+    for (const auto& [dll, api] : api_names)
+    {
+        std::uint32_t h = hash_fn(api);
+        if (target_set.count(h))
+        {
+            json r; r["hash"] = helpers::format_address(static_cast<ea_t>(h)); r["api"] = api; r["dll"] = dll;
+            found_set.insert(h);
+            resolved.push_back(std::move(r));
+        }
+        if (try_dll)
+        {
+            std::string full = dll + "!" + api;
+            h = hash_fn(full);
+            if (target_set.count(h))
+            {
+                json r; r["hash"] = helpers::format_address(static_cast<ea_t>(h)); r["api"] = full; r["dll"] = dll;
+                found_set.insert(h);
+                resolved.push_back(std::move(r));
+            }
+        }
+    }
+
+    json result;
+    result["algorithm"]        = algorithm;
+    result["total_queried"]    = targets.size();
+    result["resolved_count"]   = found_set.size();
+    result["unresolved_count"] = targets.size() - found_set.size();
+    result["resolved"]         = std::move(resolved);
+
+    json unres = json::array();
+    for (auto h : targets) { if (!found_set.count(h)) unres.push_back(helpers::format_address(static_cast<ea_t>(h))); }
+    result["unresolved"] = std::move(unres);
+
+    return tool_result_t::ok(OBFSTR("API hash resolution: ") + std::to_string(found_set.size()) +
+                             "/" + std::to_string(targets.size()) + OBFSTR(" resolved"), result);
+}
+
+// ─── VTABLE Reconstruction ───────────────────────────────────────────────
+tool_result_t reconstruct_vtable(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid VTABLE address"));
+
+    std::uint32_t max_entries = params.value("max_entries", 200);
+    if (max_entries > 1000) max_entries = 1000;
+
+    bool is_64 = inf_is_64bit();
+    std::size_t ptr_sz = is_64 ? 8 : 4;
+
+    json entries = json::array();
+    ea_t vt = *addr;
+
+    // RTTI check (Complete Object Locator one pointer before VTABLE, 64-bit only)
+    json rtti;
+    if (is_64)
+    {
+        ea_t col_ptr = static_cast<ea_t>(get_qword(vt - 8));
+        if (is_loaded(col_ptr))
+        {
+            std::uint32_t sig = get_dword(col_ptr);
+            if (sig == 0 || sig == 1)
+            {
+                rtti["col_address"] = helpers::format_address(col_ptr);
+                rtti["signature"]   = sig;
+                if (sig == 1)
+                {
+                    std::int32_t td_off   = get_dword(col_ptr + 12);
+                    std::int32_t chd_off  = get_dword(col_ptr + 16);
+                    std::int32_t self_off = get_dword(col_ptr + 20);
+                    std::uint64_t img_base = static_cast<std::uint64_t>(col_ptr) - self_off;
+
+                    ea_t td = static_cast<ea_t>(img_base + td_off);
+                    if (is_loaded(td + 16))
+                    {
+                        char tname[256] = {};
+                        for (int i = 0; i < 255; ++i) { char c = static_cast<char>(get_byte(td + 16 + i)); if (!c) break; tname[i] = c; }
+                        rtti["type_descriptor_name"] = tname;
+                        qstring dem;
+                        if (demangle_name(&dem, tname, 0) > 0 && !dem.empty())
+                            rtti["demangled_class"] = dem.c_str();
+                    }
+                    ea_t chd = static_cast<ea_t>(img_base + chd_off);
+                    if (is_loaded(chd)) rtti["num_base_classes"] = get_dword(chd + 8);
+                }
+            }
+        }
+    }
+
+    for (std::uint32_t i = 0; i < max_entries; ++i)
+    {
+        ea_t entry_ea = vt + i * ptr_sz;
+        ea_t fn_addr = is_64 ? static_cast<ea_t>(get_qword(entry_ea)) : get_dword(entry_ea);
+        if (fn_addr == 0 || !is_loaded(fn_addr)) break;
+        segment_t* fs = getseg(fn_addr);
+        if (!fs || fs->type != SEG_CODE) break;
+
+        json e;
+        e["index"]   = i;
+        e["offset"]  = helpers::format_address(static_cast<ea_t>(i * ptr_sz));
+        e["address"] = helpers::format_address(fn_addr);
+
+        func_t* fn = get_func(fn_addr);
+        qstring nm;
+        if (get_name(&nm, fn_addr) && !nm.empty())
+        {
+            e["name"] = nm.c_str();
+            qstring dem;
+            if (demangle_name(&dem, nm.c_str(), 0) > 0 && !dem.empty())
+                e["demangled"] = dem.c_str();
+        }
+        if (fn) e["function_size"] = static_cast<std::uint64_t>(fn->size());
+        entries.push_back(std::move(e));
+    }
+
+    json result;
+    result["vtable_address"] = helpers::format_address(*addr);
+    result["entry_count"]    = entries.size();
+    result["pointer_size"]   = ptr_sz;
+    result["entries"]        = std::move(entries);
+    if (!rtti.empty()) result["rtti"] = std::move(rtti);
+
+    return tool_result_t::ok(OBFSTR("VTABLE: ") + std::to_string(result["entry_count"].get<std::size_t>()) +
+                             OBFSTR(" entries at ") + helpers::format_address(*addr), result);
+}
+
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
@@ -8728,6 +9473,44 @@ void register_tools()
         OBFSTR("Detect anti-debug/anti-VM techniques: API calls, CPUID/RDTSC, INT traps, VM strings."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function or start address"), true}},
         detect_anti_analysis});
+
+    registry.register_tool({OBFSTR("analyze_pe_headers"), OBFSTR("analysis"),
+        OBFSTR("Deep PE header analysis: COFF/Optional headers, all 16 data directories, TLS callbacks, Load Config, sections with entropy/classification. Essential for packed/protected binary analysis."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Override image base address (default: IDB image base)"), false}},
+        analyze_pe_headers, true});
+
+    registry.register_tool({OBFSTR("analyze_entropy"), OBFSTR("analysis"),
+        OBFSTR("Compute Shannon entropy of a memory region using a sliding window. Identifies encrypted, compressed, or packed sections."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Start address to analyze"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Size in bytes (default: 4096)"), false},
+         {OBFSTR("window_size"), OBFSTR("number"), OBFSTR("Sliding window size (default: 256)"), false}},
+        analyze_entropy, true});
+
+    registry.register_tool({OBFSTR("detect_hooks"), OBFSTR("analysis"),
+        OBFSTR("Scan function prologues for inline hooks: jmp rel32, jmp [rip+disp], mov rax/jmp rax, push/ret, int3. Finds anti-cheat and security product hooks."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Limit scan to segment containing this address"), false},
+         {OBFSTR("max_functions"), OBFSTR("number"), OBFSTR("Max functions to check (default: 500)"), false}},
+        detect_hooks, true});
+
+    registry.register_tool({OBFSTR("detect_direct_syscalls"), OBFSTR("analysis"),
+        OBFSTR("Find direct NT syscall stubs (mov r10,rcx; mov eax,N; syscall/int2e). Common in anti-cheats and malware to bypass API hooks."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address or segment to scan"), false},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Scan size in bytes (0 = full segment)"), false}},
+        detect_direct_syscalls, true});
+
+    registry.register_tool({OBFSTR("resolve_api_hashes"), OBFSTR("analysis"),
+        OBFSTR("Resolve hashed API imports using ror13, djb2, crc32, fnv1a, or sdbm. Builds dictionary from IDB imports + common Windows APIs."),
+        {{OBFSTR("hash"), OBFSTR("string"), OBFSTR("Single hash value to resolve"), false},
+         {OBFSTR("hashes"), OBFSTR("array"), OBFSTR("Array of hash values to resolve"), false},
+         {OBFSTR("algorithm"), OBFSTR("string"), OBFSTR("Hash algorithm: ror13, djb2, crc32, fnv1a, sdbm (default: ror13)"), false},
+         {OBFSTR("include_dll_name"), OBFSTR("boolean"), OBFSTR("Also try DLL!API format (default: false)"), false}},
+        resolve_api_hashes, true});
+
+    registry.register_tool({OBFSTR("reconstruct_vtable"), OBFSTR("analysis"),
+        OBFSTR("Reconstruct C++ virtual function table. Reads pointer array, validates code targets, extracts RTTI (COL, type descriptor, class hierarchy). Handles demangling."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("VTABLE start address"), true},
+         {OBFSTR("max_entries"), OBFSTR("number"), OBFSTR("Max entries to read (default: 200)"), false}},
+        reconstruct_vtable, true});
 }
 
 }
@@ -10334,6 +11117,192 @@ tool_result_t full_deobfuscation_pass(const json& params)
                              std::to_string(total_changes) + " changes", result);
 }
 
+// ─── VM Devirtualization ─────────────────────────────────────────────────
+tool_result_t devirtualize_function(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    ea_t ea = *addr;
+    func_t* fn = get_func(ea);
+    if (!fn)
+        return tool_result_t::error(OBFSTR("No function at ") + helpers::format_address(ea));
+
+    std::uint32_t max_handlers = params.value("max_handlers", 256);
+    if (max_handlers > 4096) max_handlers = 4096;
+    bool add_comments = params.value("add_comments", true);
+
+    json result;
+    result["function"] = helpers::format_address(fn->start_ea);
+    result["function_size"] = static_cast<std::uint64_t>(fn->size());
+
+    // Phase 1: Detect VM dispatcher pattern
+    ea_t dispatch_addr = BADADDR;
+    ea_t table_addr = BADADDR;
+    int table_entry_size = 8;
+    int indirect_jumps = 0;
+    int cmp_count = 0;
+    ea_t last_cmp = BADADDR;
+
+    for (ea_t cur = fn->start_ea; cur < fn->end_ea && cur != BADADDR;)
+    {
+        insn_t insn;
+        int len = decode_insn(&insn, cur);
+        if (len <= 0) { cur = next_head(cur, fn->end_ea); if (cur == BADADDR) break; continue; }
+
+        // Track compare chains
+        if (insn.itype == NN_cmp)
+        {
+            if (last_cmp != BADADDR && (cur - last_cmp) < 32) ++cmp_count;
+            last_cmp = cur;
+        }
+
+        // Find indirect jump (dispatcher) — e.g. jmp [rax*8 + table]
+        if (insn.itype == NN_jmpni || insn.itype == NN_jmpfi)
+        {
+            ++indirect_jumps;
+            if (dispatch_addr == BADADDR) dispatch_addr = cur;
+            // Try to extract table base from operand
+            for (int op = 0; op < UA_MAXOP; ++op)
+            {
+                if (insn.ops[op].type == o_displ || insn.ops[op].type == o_phrase)
+                {
+                    if (insn.ops[op].addr != 0) table_addr = insn.ops[op].addr;
+                }
+                if (insn.ops[op].type == o_mem)
+                    table_addr = insn.ops[op].addr;
+            }
+        }
+        cur += len;
+    }
+
+    result["dispatcher_address"]  = dispatch_addr != BADADDR ? helpers::format_address(dispatch_addr) : "not_found";
+    result["indirect_jumps"]      = indirect_jumps;
+    result["cmp_chain_length"]    = cmp_count;
+
+    int score = 0;
+    if (indirect_jumps > 0) score += 25;
+    if (cmp_count >= 3) score += 25;
+    if (cmp_count >= 8) score += 25;
+    if (indirect_jumps > 2) score += 25;
+    result["vm_confidence_pct"] = std::min(score, 100);
+
+    if (score < 25)
+    {
+        result["conclusion"] = OBFSTR("Function does not appear to use VM-based obfuscation.");
+        return tool_result_t::ok(OBFSTR("VM confidence too low: ") + std::to_string(score) + "%", result);
+    }
+
+    // Phase 2: Map handler table if found
+    json handlers = json::array();
+    if (table_addr != BADADDR)
+    {
+        result["handler_table"] = helpers::format_address(table_addr);
+        bool is_64 = inf_is_64bit();
+        table_entry_size = is_64 ? 8 : 4;
+
+        for (std::uint32_t i = 0; i < max_handlers; ++i)
+        {
+            ea_t slot = table_addr + i * table_entry_size;
+            ea_t target = is_64 ? static_cast<ea_t>(get_qword(slot)) : get_dword(slot);
+            if (target == 0 || target == BADADDR || !is_loaded(target)) break;
+            segment_t* ts = getseg(target);
+            if (!ts || ts->type != SEG_CODE) break;
+
+            json h;
+            h["opcode"] = i;
+            h["address"] = helpers::format_address(target);
+
+            qstring nm;
+            if (get_name(&nm, target) && !nm.empty()) h["name"] = nm.c_str();
+
+            // Classify handler by analyzing its instructions
+            func_t* hfn = get_func(target);
+            ea_t hend = hfn ? hfn->end_ea : target + 64;
+            int instr_count = 0;
+            bool has_push = false, has_pop = false, has_add = false, has_sub = false;
+            bool has_xor = false, has_and = false, has_or = false, has_shr = false, has_shl = false;
+            bool has_cmp = false, has_call = false, has_jcc = false;
+            bool reads_mem = false, writes_mem = false;
+
+            for (ea_t ic = target; ic < hend && ic != BADADDR && instr_count < 128;)
+            {
+                insn_t hi;
+                int hl = decode_insn(&hi, ic);
+                if (hl <= 0) break;
+                ++instr_count;
+                if (hi.itype == NN_push || hi.itype == NN_pushf) has_push = true;
+                if (hi.itype == NN_pop || hi.itype == NN_popf)   has_pop = true;
+                if (hi.itype == NN_add || hi.itype == NN_adc)    has_add = true;
+                if (hi.itype == NN_sub || hi.itype == NN_sbb)    has_sub = true;
+                if (hi.itype == NN_xor)   has_xor = true;
+                if (hi.itype == NN_and)    has_and = true;
+                if (hi.itype == NN_or)     has_or = true;
+                if (hi.itype == NN_shr || hi.itype == NN_sar) has_shr = true;
+                if (hi.itype == NN_shl || hi.itype == NN_sal) has_shl = true;
+                if (hi.itype == NN_cmp || hi.itype == NN_test) has_cmp = true;
+                if (hi.itype == NN_call || hi.itype == NN_callni) has_call = true;
+                if (hi.itype >= NN_ja && hi.itype <= NN_jz) has_jcc = true;
+                for (int op = 0; op < UA_MAXOP && hi.ops[op].type != o_void; ++op)
+                {
+                    if (hi.ops[op].type == o_mem || hi.ops[op].type == o_displ || hi.ops[op].type == o_phrase)
+                    {
+                        if (op == 0) writes_mem = true; else reads_mem = true;
+                    }
+                }
+                ic += hl;
+            }
+
+            std::string classification;
+            if (has_push && !has_pop && !has_add && !has_sub && !has_xor) classification = "vm_push";
+            else if (has_pop && !has_push && !has_add && !has_sub)         classification = "vm_pop";
+            else if (has_add && !has_sub)                                   classification = "vm_add";
+            else if (has_sub && !has_add)                                   classification = "vm_sub";
+            else if (has_xor && !has_and && !has_or)                       classification = "vm_xor";
+            else if (has_and)                                               classification = "vm_and";
+            else if (has_or)                                                classification = "vm_or";
+            else if (has_shr)                                               classification = "vm_shr";
+            else if (has_shl)                                               classification = "vm_shl";
+            else if (has_cmp && has_jcc)                                    classification = "vm_cmp_jcc";
+            else if (has_call)                                              classification = "vm_call";
+            else if (reads_mem && !writes_mem)                              classification = "vm_load";
+            else if (writes_mem && !reads_mem)                              classification = "vm_store";
+            else if (instr_count <= 3)                                      classification = "vm_nop";
+            else                                                            classification = "vm_complex";
+
+            h["classification"]  = classification;
+            h["instruction_count"] = instr_count;
+
+            if (add_comments)
+            {
+                std::string cmt = "VM handler " + std::to_string(i) + ": " + classification;
+                set_cmt(target, cmt.c_str(), true);
+            }
+
+            handlers.push_back(std::move(h));
+        }
+    }
+
+    result["handler_count"]           = handlers.size();
+    result["handlers"]                = std::move(handlers);
+    result["handler_table_entry_size"] = table_entry_size;
+
+    // Summary
+    json summary;
+    std::map<std::string, int> class_counts;
+    for (const auto& h : result["handlers"]) class_counts[h["classification"].get<std::string>()]++;
+    summary["handler_classifications"] = class_counts;
+    summary["has_arithmetic"]          = class_counts.count("vm_add") || class_counts.count("vm_sub");
+    summary["has_logic"]               = class_counts.count("vm_xor") || class_counts.count("vm_and") || class_counts.count("vm_or");
+    summary["has_memory"]              = class_counts.count("vm_load") || class_counts.count("vm_store") || class_counts.count("vm_push") || class_counts.count("vm_pop");
+    summary["has_control_flow"]        = class_counts.count("vm_cmp_jcc") || class_counts.count("vm_call");
+    result["summary"] = std::move(summary);
+
+    return tool_result_t::ok(OBFSTR("VM devirtualization: ") + std::to_string(result["handler_count"].get<std::size_t>()) +
+                             OBFSTR(" handlers classified"), result);
+}
+
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
@@ -10432,6 +11401,15 @@ void register_tools()
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true},
          {OBFSTR("dry_run"), OBFSTR("boolean"), OBFSTR("Preview all steps without patching (default false)"), false}},
         full_deobfuscation_pass, false});
+
+    registry.register_tool({OBFSTR("devirtualize_function"), OBFSTR("deobfuscation"),
+        OBFSTR("Analyze a VM-protected function: detect the dispatcher, locate the handler table, "
+               "classify each VM handler (push/pop/add/sub/xor/and/or/shr/shl/cmp/call/load/store/nop). "
+               "Produces a full handler map with semantic labels. Use on VMProtect/Themida virtualized code."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address"), true},
+         {OBFSTR("max_handlers"), OBFSTR("number"), OBFSTR("Max handler table entries (default: 256)"), false},
+         {OBFSTR("add_comments"), OBFSTR("boolean"), OBFSTR("Add VM handler labels as IDA comments (default: true)"), false}},
+        devirtualize_function});
 }
 
 }
@@ -16572,6 +17550,282 @@ tool_result_t driver_network_fingerprint(const json& params)
     return tool_result_t::ok(OBFSTR("Network fingerprints: ") + std::to_string(fps.size()) + OBFSTR(" hosts"), result);
 }
 
+// ─── Kernel Callback Enumeration ─────────────────────────────────────────
+tool_result_t driver_enum_kernel_callbacks(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+    if (device->get_kernel_dtb() == 0)
+        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_connect first."));
+
+    std::vector<std::uint8_t> mod_buf;
+    sys_module_info_t* info = nullptr;
+    std::string err;
+    if (!query_kernel_modules(mod_buf, info, err))
+        return tool_result_t::error(err);
+
+    // Find ntoskrnl base
+    std::uint64_t ntos_base = 0;
+    std::uint64_t ntos_size = 0;
+    for (ULONG i = 0; i < info->NumberOfModules; ++i)
+    {
+        std::string path(reinterpret_cast<const char*>(info->Modules[i].FullPathName));
+        std::string lower = path;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower.find("ntoskrnl") != std::string::npos || lower.find("ntkrnlmp") != std::string::npos ||
+            lower.find("ntkrnlpa") != std::string::npos || lower.find("ntkrpamp") != std::string::npos)
+        {
+            ntos_base = reinterpret_cast<std::uint64_t>(info->Modules[i].ImageBase);
+            ntos_size = info->Modules[i].ImageSize;
+            break;
+        }
+    }
+
+    if (ntos_base == 0)
+        return tool_result_t::error(OBFSTR("Could not locate ntoskrnl.exe base via NtQuerySystemInformation"));
+
+    json result;
+    result["ntoskrnl_base"] = helpers::format_address(static_cast<ea_t>(ntos_base));
+    result["ntoskrnl_size"] = ntos_size;
+
+    // Callback types to enumerate — resolve well-known exports
+    struct cb_type {
+        const char* name;
+        const char* export_name;
+        int max_slots;
+    };
+    cb_type types[] = {
+        {"PsSetCreateProcessNotifyRoutine", "PsSetCreateProcessNotifyRoutine", 64},
+        {"PsSetCreateThreadNotifyRoutine",  "PsSetCreateThreadNotifyRoutine",  64},
+        {"PsSetLoadImageNotifyRoutine",     "PsSetLoadImageNotifyRoutine",     64},
+        {"CmRegisterCallback",              "CmRegisterCallbackEx",            64},
+        {"ObRegisterCallbacks",             "ObRegisterCallbacks",             64},
+    };
+
+    json all_callbacks = json::array();
+    for (const auto& t : types)
+    {
+        std::uint64_t fn_addr = device->resolve_export(ntos_base, t.export_name);
+        if (fn_addr == 0) continue;
+
+        json cb;
+        cb["type"] = t.name;
+        cb["registration_function"] = helpers::format_address(static_cast<ea_t>(fn_addr));
+
+        // Read 128 bytes from the registration function and scan for LEA patterns
+        // that reference the callback array (LEA reg, [rip+disp32])
+        std::uint8_t code[128] = {};
+        device->read_kernel_raw(fn_addr, code, sizeof(code));
+
+        json array_refs = json::array();
+        for (int off = 0; off + 7 <= 128; ++off)
+        {
+            // Pattern: 48 8D 0D xx xx xx xx (LEA rcx, [rip+disp32]) or 4C 8D variants
+            if ((code[off] == 0x48 || code[off] == 0x4C) &&
+                code[off + 1] == 0x8D &&
+                (code[off + 2] & 0xC7) == 0x05) // mod=00, r/m=101 (RIP-relative)
+            {
+                std::int32_t disp;
+                std::memcpy(&disp, &code[off + 3], 4);
+                std::uint64_t target = fn_addr + off + 7 + disp;
+
+                if (is_probably_kernel_address(target))
+                {
+                    json ref;
+                    ref["array_address"] = helpers::format_address(static_cast<ea_t>(target));
+                    ref["instruction_offset"] = off;
+
+                    // Try to read callback entries from the array
+                    json entries = json::array();
+                    for (int slot = 0; slot < t.max_slots; ++slot)
+                    {
+                        std::uint64_t entry = 0;
+                        device->read_kernel_raw(target + slot * 8, &entry, 8);
+                        if (entry == 0) break;
+
+                        // Callback entries often have low 4 bits used as flags. Clear them.
+                        std::uint64_t cb_body = entry & ~0xFULL;
+                        if (!is_probably_kernel_address(cb_body)) continue;
+
+                        // Read the actual routine pointer (first member of the callback block)
+                        std::uint64_t routine = 0;
+                        device->read_kernel_raw(cb_body + 8, &routine, 8); // typically offset 8 in EX_CALLBACK_ROUTINE_BLOCK
+
+                        json e;
+                        e["slot"]    = slot;
+                        e["raw"]     = helpers::format_address(static_cast<ea_t>(entry));
+                        e["block"]   = helpers::format_address(static_cast<ea_t>(cb_body));
+                        e["routine"] = helpers::format_address(static_cast<ea_t>(routine));
+
+                        // Identify which module owns this routine
+                        if (is_probably_kernel_address(routine))
+                        {
+                            for (ULONG mi = 0; mi < info->NumberOfModules; ++mi)
+                            {
+                                std::uint64_t mb = reinterpret_cast<std::uint64_t>(info->Modules[mi].ImageBase);
+                                std::uint64_t me = mb + info->Modules[mi].ImageSize;
+                                if (routine >= mb && routine < me)
+                                {
+                                    std::string fp(reinterpret_cast<const char*>(info->Modules[mi].FullPathName));
+                                    auto slash = fp.find_last_of("\\/");
+                                    e["owner_module"] = (slash != std::string::npos) ? fp.substr(slash + 1) : fp;
+                                    break;
+                                }
+                            }
+                        }
+                        entries.push_back(std::move(e));
+                    }
+                    ref["callbacks"] = std::move(entries);
+                    ref["count"]     = ref["callbacks"].size();
+                    array_refs.push_back(std::move(ref));
+                }
+            }
+        }
+        cb["arrays"] = std::move(array_refs);
+        all_callbacks.push_back(std::move(cb));
+    }
+
+    result["callback_types"] = std::move(all_callbacks);
+    result["note"] = OBFSTR("Kernel callbacks are used by anti-cheats (EAC/BattlEye/Vanguard) to monitor "
+                            "process creation, thread creation, image loading, and registry access.");
+    return tool_result_t::ok(OBFSTR("Kernel callback enumeration complete"), result);
+}
+
+// ─── Kernel Integrity Check Detection ────────────────────────────────────
+tool_result_t driver_detect_integrity_checks(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+    if (device->get_kernel_dtb() == 0)
+        return tool_result_t::error(OBFSTR("Kernel DTB not resolved. Call driver_connect first."));
+
+    std::vector<std::uint8_t> mod_buf;
+    sys_module_info_t* info = nullptr;
+    std::string err;
+    if (!query_kernel_modules(mod_buf, info, err))
+        return tool_result_t::error(err);
+
+    // Find ntoskrnl
+    std::uint64_t ntos_base = 0;
+    for (ULONG i = 0; i < info->NumberOfModules; ++i)
+    {
+        std::string path(reinterpret_cast<const char*>(info->Modules[i].FullPathName));
+        std::string lower = path;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower.find("ntoskrnl") != std::string::npos || lower.find("ntkrnlmp") != std::string::npos)
+        {
+            ntos_base = reinterpret_cast<std::uint64_t>(info->Modules[i].ImageBase);
+            break;
+        }
+    }
+    if (ntos_base == 0)
+        return tool_result_t::error(OBFSTR("Could not locate ntoskrnl.exe base"));
+
+    // Critical exports to check for inline hooks
+    static const char* critical_exports[] = {
+        "NtReadVirtualMemory", "NtWriteVirtualMemory", "NtOpenProcess",
+        "NtAllocateVirtualMemory", "NtProtectVirtualMemory", "NtQueryVirtualMemory",
+        "NtCreateThreadEx", "NtDeviceIoControlFile", "NtQuerySystemInformation",
+        "NtSetInformationThread", "NtClose", "NtDuplicateObject",
+        "MmCopyVirtualMemory", "KeStackAttachProcess", "KeUnstackDetachProcess",
+        "PsLookupProcessByProcessId", "PsLookupThreadByThreadId",
+        "ObOpenObjectByPointer", "MmProbeAndLockPages",
+        nullptr
+    };
+
+    json hooks = json::array();
+    json clean = json::array();
+    int checked = 0;
+
+    for (int fi = 0; critical_exports[fi]; ++fi)
+    {
+        std::uint64_t fn = device->resolve_export(ntos_base, critical_exports[fi]);
+        if (fn == 0) continue;
+        ++checked;
+
+        // Read first 16 bytes of the function
+        std::uint8_t bytes[16] = {};
+        device->read_kernel_raw(fn, bytes, 16);
+
+        std::string hook_type;
+        std::uint64_t hook_target = 0;
+
+        // Check for common inline hook patterns
+        if (bytes[0] == 0xE9) // JMP rel32
+        {
+            std::int32_t rel;
+            std::memcpy(&rel, &bytes[1], 4);
+            hook_target = fn + 5 + rel;
+            hook_type = "jmp_rel32";
+        }
+        else if (bytes[0] == 0xFF && bytes[1] == 0x25) // JMP [rip+disp32]
+        {
+            std::int32_t disp;
+            std::memcpy(&disp, &bytes[2], 4);
+            std::uint64_t ptr = fn + 6 + disp;
+            device->read_kernel_raw(ptr, &hook_target, 8);
+            hook_type = "jmp_indirect_rip";
+        }
+        else if (bytes[0] == 0x48 && bytes[1] == 0xB8 && bytes[10] == 0xFF && bytes[11] == 0xE0)
+        {
+            std::memcpy(&hook_target, &bytes[2], 8);
+            hook_type = "mov_rax_jmp_rax";
+        }
+        else if (bytes[0] == 0xCC)
+        {
+            hook_type = "int3_breakpoint";
+        }
+
+        if (!hook_type.empty())
+        {
+            json h;
+            h["function"] = critical_exports[fi];
+            h["address"]  = helpers::format_address(static_cast<ea_t>(fn));
+            h["hook_type"] = hook_type;
+            if (hook_target != 0)
+            {
+                h["target"] = helpers::format_address(static_cast<ea_t>(hook_target));
+                // Identify owner module
+                for (ULONG mi = 0; mi < info->NumberOfModules; ++mi)
+                {
+                    std::uint64_t mb = reinterpret_cast<std::uint64_t>(info->Modules[mi].ImageBase);
+                    std::uint64_t me = mb + info->Modules[mi].ImageSize;
+                    if (hook_target >= mb && hook_target < me)
+                    {
+                        std::string fp(reinterpret_cast<const char*>(info->Modules[mi].FullPathName));
+                        auto slash = fp.find_last_of("\\/");
+                        h["hook_owner"] = (slash != std::string::npos) ? fp.substr(slash + 1) : fp;
+                        break;
+                    }
+                }
+            }
+            std::ostringstream hex;
+            for (int b = 0; b < 16; ++b) { if (b) hex << " "; hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(bytes[b]); }
+            h["prologue_bytes"] = hex.str();
+            hooks.push_back(std::move(h));
+        }
+        else
+        {
+            json c;
+            c["function"] = critical_exports[fi];
+            c["address"]  = helpers::format_address(static_cast<ea_t>(fn));
+            c["status"]   = "clean";
+            clean.push_back(std::move(c));
+        }
+    }
+
+    json result;
+    result["ntoskrnl_base"]     = helpers::format_address(static_cast<ea_t>(ntos_base));
+    result["functions_checked"] = checked;
+    result["hooks_found"]       = hooks.size();
+    result["hooked_functions"]  = std::move(hooks);
+    result["clean_functions"]   = std::move(clean);
+    result["note"] = OBFSTR("Kernel function hooks indicate anti-cheat monitoring. Hooked functions route through "
+                            "the anti-cheat driver, which can block, log, or alter calls from target processes.");
+    return tool_result_t::ok(OBFSTR("Kernel integrity: ") + std::to_string(result["hooks_found"].get<std::size_t>()) +
+                             OBFSTR(" hooks in ") + std::to_string(checked) + OBFSTR(" functions"), result);
+}
+
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
@@ -17270,6 +18524,24 @@ void register_tools()
         {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'enable', 'disable', 'get' (default get)"), false,
           {OBFSTR("enable"), OBFSTR("disable"), OBFSTR("get")}}},
         driver_network_fingerprint, true});
+
+    registry.register_tool({
+        OBFSTR("driver_enum_kernel_callbacks"), OBFSTR("driver"),
+        OBFSTR("Enumerate kernel notification callbacks: process creation (PsSetCreateProcessNotifyRoutine), "
+               "thread creation (PsSetCreateThreadNotifyRoutine), image load (PsSetLoadImageNotifyRoutine), "
+               "registry (CmRegisterCallbackEx), object (ObRegisterCallbacks). Identifies which driver module "
+               "registered each callback. Essential for understanding anti-cheat monitoring."),
+        {},
+        driver_enum_kernel_callbacks, true});
+
+    registry.register_tool({
+        OBFSTR("driver_detect_integrity_checks"), OBFSTR("driver"),
+        OBFSTR("Check critical ntoskrnl exports for inline hooks (jmp, mov rax + jmp, int3). "
+               "Scans NtReadVirtualMemory, NtWriteVirtualMemory, NtOpenProcess, MmCopyVirtualMemory, "
+               "KeStackAttachProcess, and 14 other critical functions. Identifies hook owner module. "
+               "Reveals which kernel functions anti-cheats are monitoring."),
+        {},
+        driver_detect_integrity_checks, true});
 }
 
 }
@@ -20173,6 +21445,81 @@ tool_result_t dtls_extract_keys(const json& params) {
     return tool_result_t::ok(OBFSTR("Extracted ") + std::to_string(keys.size()) + OBFSTR(" DTLS keys"), result);
 }
 
+tool_result_t network_decrypt_capture(const json& params) {
+    std::string pcap_path = params.value("pcap_path", "");
+    std::string keylog_path = params.value("keylog_path", "");
+    std::string display_filter = params.value("display_filter", "http2");
+
+    if (pcap_path.empty())
+        return tool_result_t::error(OBFSTR("pcap_path is required"));
+
+    // Auto-detect keylog file from environment if not specified
+    if (keylog_path.empty()) {
+        char buf[MAX_PATH] = {};
+        DWORD len = GetEnvironmentVariableA("SSLKEYLOGFILE", buf, MAX_PATH);
+        if (len > 0 && len < MAX_PATH) keylog_path = std::string(buf, len);
+    }
+    if (keylog_path.empty())
+        return tool_result_t::error(OBFSTR("keylog_path is required (or set SSLKEYLOGFILE environment variable)"));
+
+    auto decrypt_result = net_security::TlsKeyExtractor::instance().decrypt_pcap_with_tshark(
+        pcap_path, keylog_path, display_filter);
+
+    json r;
+    r["success"] = decrypt_result.success;
+    r["pcap_file"] = decrypt_result.pcap_file_used;
+    r["keylog_file"] = decrypt_result.keylog_file_used;
+    r["total_packets"] = decrypt_result.total_packets;
+    r["decrypted_packets"] = decrypt_result.decrypted_packets;
+
+    if (!decrypt_result.error_message.empty())
+        r["error"] = decrypt_result.error_message;
+
+    json frames = json::array();
+    for (const auto& f : decrypt_result.http2_frames) {
+        json fj;
+        if (!f.stream_id.empty()) fj["stream_id"] = f.stream_id;
+        if (!f.method.empty()) fj["method"] = f.method;
+        if (!f.url.empty()) fj["url"] = f.url;
+        if (!f.authority.empty()) fj["authority"] = f.authority;
+        if (!f.content_type.empty()) fj["content_type"] = f.content_type;
+        if (f.status_code != 0) fj["status_code"] = f.status_code;
+        if (!f.frame_type.empty()) fj["frame_type"] = f.frame_type;
+        if (!f.headers.empty()) {
+            json hdrs = json::object();
+            for (const auto& [k, v] : f.headers) hdrs[k] = v;
+            fj["headers"] = hdrs;
+        }
+        if (!f.body.empty()) fj["body"] = f.body;
+        frames.push_back(fj);
+    }
+    r["http2_frames"] = frames;
+
+    if (decrypt_result.success)
+        return tool_result_t::ok(
+            OBFSTR("Decrypted ") + std::to_string(decrypt_result.decrypted_packets) +
+            OBFSTR(" packets, found ") + std::to_string(decrypt_result.http2_frames.size()) +
+            OBFSTR(" HTTP/2 frames"), r);
+
+    return tool_result_t::error(decrypt_result.error_message.empty() ?
+        OBFSTR("Decryption failed - no matching packets found") : decrypt_result.error_message);
+}
+
+tool_result_t tls_ensure_keylogfile(const json& params) {
+    std::string path = params.value("path", "");
+    if (net_security::TlsKeyExtractor::instance().ensure_sslkeylogfile_env(path)) {
+        char buf[MAX_PATH] = {};
+        DWORD len = GetEnvironmentVariableA("SSLKEYLOGFILE", buf, MAX_PATH);
+        json r;
+        r["status"] = "configured";
+        r["path"] = (len > 0) ? std::string(buf, len) : path;
+        r["note"] = "SSLKEYLOGFILE set at user level. Newly started processes (browsers, VS Code, etc.) "
+                    "will log TLS session keys to this file. Restart the target application for it to take effect.";
+        return tool_result_t::ok(OBFSTR("SSLKEYLOGFILE configured"), r);
+    }
+    return tool_result_t::error(OBFSTR("Failed to set SSLKEYLOGFILE environment variable"));
+}
+
 tool_result_t autoresponder_add_rule(const json& params) {
     net_security::autoresponder_rule_t rule;
     rule.enabled = params.value("enabled", true);
@@ -20307,6 +21654,8 @@ tool_result_t autoresponder_start(const json&) { return tool_result_t::error("No
 tool_result_t autoresponder_stop(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t autoresponder_import_rules(const json&) { return tool_result_t::error("Not supported on this platform"); }
 tool_result_t autoresponder_export_rules(const json&) { return tool_result_t::error("Not supported on this platform"); }
+tool_result_t network_decrypt_capture(const json&) { return tool_result_t::error("Not supported on this platform"); }
+tool_result_t tls_ensure_keylogfile(const json&) { return tool_result_t::error("Not supported on this platform"); }
 #endif
 
 void register_tools() {
@@ -20496,9 +21845,1009 @@ void register_tools() {
         OBFSTR("Export all AutoResponder rules as a JSON array string. Can be saved and re-imported later."),
         {},
         autoresponder_export_rules, true});
+
+    r.register_tool({
+        OBFSTR("network_decrypt_capture"), OBFSTR("network_security"),
+        OBFSTR("Decrypt a captured PCAP file using TLS session keys and return the decrypted HTTP/2 frames. "
+               "Uses tshark (Wireshark CLI) with an SSLKEYLOGFILE to decrypt TLS traffic. "
+               "Automatically reads the SSLKEYLOGFILE path from the environment if keylog_path is not specified. "
+               "Returns decrypted HTTP/2 request/response headers, methods, URLs, and bodies. "
+               "The target process must have been started with SSLKEYLOGFILE set for key logging to work."),
+        {{OBFSTR("pcap_path"), OBFSTR("string"), OBFSTR("Path to the PCAP file to decrypt"), true},
+         {OBFSTR("keylog_path"), OBFSTR("string"), OBFSTR("Path to the SSLKEYLOGFILE (auto-detected from env if empty)"), false},
+         {OBFSTR("display_filter"), OBFSTR("string"), OBFSTR("Wireshark display filter (default: 'http2')"), false}},
+        network_decrypt_capture, true});
+
+    r.register_tool({
+        OBFSTR("tls_ensure_keylogfile"), OBFSTR("network_security"),
+        OBFSTR("Ensure the SSLKEYLOGFILE environment variable is set at the user level so that all newly launched "
+               "Chromium-based browsers, VS Code, Electron apps, and other BoringSSL/OpenSSL applications "
+               "will log TLS session keys to a file. The target application must be RESTARTED after this is set. "
+               "Once set, use tls_extract_keys or network_decrypt_capture to read the logged keys and decrypt traffic."),
+        {{OBFSTR("path"), OBFSTR("string"), OBFSTR("File path for the keylog file (default: %USERPROFILE%\\sslkeys.log)"), false}},
+        tls_ensure_keylogfile, false});
 }
 
 }
+
+// ===========================================================================
+// Emulation tools — Zydis + Unicorn offline trace engine
+// ===========================================================================
+
+namespace emulation_tools
+{
+
+#ifdef __NT__
+
+tool_result_t disassemble_zydis(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    std::uint32_t size = params.value("size", 256);
+    if (size > 65536)
+        return tool_result_t::error(OBFSTR("Size too large (max 65536)"));
+
+    std::uint32_t max_insns = params.value("max_instructions", 100);
+    if (max_insns > 10000) max_insns = 10000;
+
+    auto instructions = emulation::disassemble_idb_range(*addr, size, max_insns);
+    if (instructions.empty())
+        return tool_result_t::error(OBFSTR("No instructions decoded at ") + helpers::format_address(*addr));
+
+    json result;
+    result["address"] = helpers::format_address(*addr);
+    result["count"]   = instructions.size();
+
+    json arr = json::array();
+    for (const auto& insn : instructions)
+    {
+        json e;
+        e["address"]   = helpers::format_address(static_cast<ea_t>(insn.address));
+        e["length"]    = insn.length;
+        e["mnemonic"]  = insn.mnemonic;
+        e["text"]      = insn.full_text;
+        if (insn.is_branch) e["is_branch"] = true;
+        if (insn.is_call)   e["is_call"]   = true;
+        if (insn.is_ret)    e["is_ret"]    = true;
+        if (insn.is_nop)    e["is_nop"]    = true;
+        if (insn.is_privileged) e["is_privileged"] = true;
+        arr.push_back(std::move(e));
+    }
+    result["instructions"] = std::move(arr);
+
+    return tool_result_t::ok(OBFSTR("Zydis disassembly: ") + std::to_string(instructions.size()) +
+                             OBFSTR(" instructions at ") + helpers::format_address(*addr), result);
+}
+
+tool_result_t driver_snapshot_and_emulate(const json& params)
+{
+    if (!device || !device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+
+    if (device->get_process_id() == 0)
+        return tool_result_t::error(OBFSTR("Not attached to a process. Call driver_attach first."));
+
+    std::uint32_t pid = device->get_process_id();
+    std::uint32_t tid = 0;
+
+    if (params.contains("tid"))
+    {
+        auto tid_val = params["tid"];
+        if (tid_val.is_number())
+            tid = tid_val.get<std::uint32_t>();
+        else if (tid_val.is_string())
+        {
+            std::string s = tid_val.get<std::string>();
+            try { tid = static_cast<std::uint32_t>(std::stoull(s, nullptr, 0)); } catch (...) {}
+        }
+    }
+
+    if (tid == 0)
+    {
+        auto threads = device->enumerate_threads();
+        if (threads.empty())
+            return tool_result_t::error(OBFSTR("No threads found in target process"));
+        tid = threads[0].tid;
+    }
+
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid start address. Provide 'address' for emulation entry point."));
+
+    emulation::emulation_config_t config;
+    config.start_address     = *addr;
+    config.max_instructions  = params.value("max_instructions", 50000);
+    config.max_trace_entries  = params.value("max_trace_entries", 10000);
+    config.record_mem_reads   = params.value("record_mem_reads", true);
+    config.record_mem_writes  = params.value("record_mem_writes", true);
+    config.record_registers   = params.value("record_registers", true);
+    config.analyze_effective_ops = params.value("analyze_effective", true);
+    config.timeout_us         = params.value("timeout_us", 10000000);
+
+    if (config.max_instructions > 500000) config.max_instructions = 500000;
+    if (config.max_trace_entries > 100000) config.max_trace_entries = 100000;
+
+    if (params.contains("stop_address"))
+    {
+        auto stop = helpers::parse_address(params.value("stop_address", std::string()));
+        if (stop) config.stop_address = *stop;
+    }
+
+    if (params.contains("breakpoints") && params["breakpoints"].is_array())
+    {
+        for (const auto& bp : params["breakpoints"])
+        {
+            auto bp_addr = helpers::parse_address(bp.is_string() ? bp.get<std::string>() : std::string());
+            if (bp_addr) config.breakpoint_addresses.insert(*bp_addr);
+        }
+    }
+
+    std::uint64_t snap_base = 0, snap_size = 0;
+    if (params.contains("snapshot_base"))
+    {
+        auto sb = helpers::parse_address(params.value("snapshot_base", std::string()));
+        if (sb) snap_base = *sb;
+    }
+    if (params.contains("snapshot_size"))
+        snap_size = params.value("snapshot_size", 0);
+
+    auto result = emulation::driver_snapshot_and_emulate(pid, tid, config, snap_base, snap_size);
+    if (!result.success)
+        return tool_result_t::error(OBFSTR("Emulation failed: ") + result.error);
+
+    json out;
+    out["start_address"]      = helpers::format_address(static_cast<ea_t>(result.start_address));
+    out["end_address"]        = helpers::format_address(static_cast<ea_t>(result.end_address));
+    out["total_instructions"] = result.total_instructions;
+    out["junk_instructions"]  = result.junk_instruction_count;
+    out["effective_instructions"] = result.total_instructions - result.junk_instruction_count;
+
+    // Register deltas
+    json deltas = json::array();
+    for (const auto& d : result.reg_deltas)
+    {
+        json delta;
+        delta["register"] = d.name;
+        delta["before"]   = helpers::format_address(static_cast<ea_t>(d.before));
+        delta["after"]    = helpers::format_address(static_cast<ea_t>(d.after));
+        deltas.push_back(std::move(delta));
+    }
+    out["register_deltas"] = std::move(deltas);
+
+    // Memory writes summary
+    json writes = json::array();
+    std::size_t write_limit = std::min<std::size_t>(result.mem_writes.size(), 128);
+    for (std::size_t i = 0; i < write_limit; ++i)
+    {
+        const auto& w = result.mem_writes[i];
+        json wr;
+        wr["address"] = helpers::format_address(static_cast<ea_t>(w.address));
+        wr["size"]    = w.size;
+        wr["from_insn"] = helpers::format_address(static_cast<ea_t>(w.insn_address));
+        std::ostringstream hex;
+        for (std::size_t j = 0; j < std::min<std::size_t>(w.data.size(), 16); ++j)
+        {
+            if (j > 0) hex << " ";
+            hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(w.data[j]);
+        }
+        wr["hex"] = hex.str();
+        writes.push_back(std::move(wr));
+    }
+    out["memory_writes"] = std::move(writes);
+    out["total_memory_writes"] = result.mem_writes.size();
+
+    // Effective operations
+    json eff_ops = json::array();
+    for (const auto& op : result.effective_ops)
+        eff_ops.push_back(op);
+    out["effective_operations"] = std::move(eff_ops);
+
+    // Trace excerpt (first/last N entries)
+    constexpr std::size_t TRACE_EXCERPT = 50;
+    json trace_arr = json::array();
+    for (std::size_t i = 0; i < std::min(result.trace.size(), TRACE_EXCERPT); ++i)
+    {
+        const auto& t = result.trace[i];
+        json te;
+        te["address"] = helpers::format_address(static_cast<ea_t>(t.address));
+        te["disasm"]  = t.disasm;
+        trace_arr.push_back(std::move(te));
+    }
+    if (result.trace.size() > TRACE_EXCERPT * 2)
+    {
+        json gap;
+        gap["note"] = "... " + std::to_string(result.trace.size() - TRACE_EXCERPT * 2) + " entries omitted ...";
+        trace_arr.push_back(std::move(gap));
+        for (std::size_t i = result.trace.size() - TRACE_EXCERPT; i < result.trace.size(); ++i)
+        {
+            const auto& t = result.trace[i];
+            json te;
+            te["address"] = helpers::format_address(static_cast<ea_t>(t.address));
+            te["disasm"]  = t.disasm;
+            trace_arr.push_back(std::move(te));
+        }
+    }
+    out["trace_excerpt"] = std::move(trace_arr);
+
+    if (!result.error.empty())
+        out["note"] = result.error;
+
+    return tool_result_t::ok(
+        OBFSTR("Snapshot + emulation complete: ") + std::to_string(result.total_instructions) +
+        OBFSTR(" insns traced (") + std::to_string(result.junk_instruction_count) + OBFSTR(" junk)"),
+        out);
+}
+
+tool_result_t trace_execution_unicorn(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address. Provide the VM entry point address."));
+
+    std::uint32_t size = params.value("size", 4096);
+    if (size > 1024 * 1024) size = 1024 * 1024;
+
+    std::uint32_t max_insns = params.value("max_instructions", 50000);
+    if (max_insns > 500000) max_insns = 500000;
+
+    // Read bytes from IDB into a buffer
+    std::vector<std::uint8_t> code(size);
+    for (std::uint32_t i = 0; i < size; ++i)
+        code[i] = static_cast<std::uint8_t>(get_byte(static_cast<ea_t>(*addr + i)));
+
+    // Build a minimal snapshot from IDB data (no driver required)
+    emulation::process_snapshot_t snapshot;
+    snapshot.success = true;
+    snapshot.rip = *addr;
+    snapshot.rsp = 0x7FFE0000;  // synthetic stack
+    snapshot.rflags = 0x202;     // standard EFLAGS
+
+    // Map code region
+    emulation::memory_snapshot_region_t code_region;
+    code_region.base = *addr & ~0xFFFULL;
+    code_region.size = (static_cast<std::uint64_t>(size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
+    code_region.data.resize(static_cast<std::size_t>(code_region.size), 0);
+    std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), size);
+    snapshot.regions.push_back(std::move(code_region));
+
+    // Map a synthetic stack (64KB)
+    emulation::memory_snapshot_region_t stack_region;
+    stack_region.base = 0x7FFD0000;
+    stack_region.size = 0x20000;
+    stack_region.data.resize(0x20000, 0);
+    snapshot.regions.push_back(std::move(stack_region));
+
+    // Set initial register state from params if provided
+    if (params.contains("rax")) { auto v = helpers::parse_address(params.value("rax", std::string())); if (v) snapshot.rax = *v; }
+    if (params.contains("rbx")) { auto v = helpers::parse_address(params.value("rbx", std::string())); if (v) snapshot.rbx = *v; }
+    if (params.contains("rcx")) { auto v = helpers::parse_address(params.value("rcx", std::string())); if (v) snapshot.rcx = *v; }
+    if (params.contains("rdx")) { auto v = helpers::parse_address(params.value("rdx", std::string())); if (v) snapshot.rdx = *v; }
+    if (params.contains("rsi")) { auto v = helpers::parse_address(params.value("rsi", std::string())); if (v) snapshot.rsi = *v; }
+    if (params.contains("rdi")) { auto v = helpers::parse_address(params.value("rdi", std::string())); if (v) snapshot.rdi = *v; }
+
+    emulation::emulation_config_t config;
+    config.start_address     = *addr;
+    config.max_instructions  = max_insns;
+    config.max_trace_entries  = params.value("max_trace_entries", 10000);
+    config.record_mem_reads   = params.value("record_mem_reads", true);
+    config.record_mem_writes  = params.value("record_mem_writes", true);
+    config.record_registers   = true;
+    config.analyze_effective_ops = true;
+    config.timeout_us         = params.value("timeout_us", 10000000);
+
+    if (params.contains("stop_address"))
+    {
+        auto stop = helpers::parse_address(params.value("stop_address", std::string()));
+        if (stop) config.stop_address = *stop;
+    }
+
+    auto result = emulation::emulate_from_snapshot(snapshot, config);
+    if (!result.success)
+        return tool_result_t::error(OBFSTR("Unicorn emulation failed: ") + result.error);
+
+    json out;
+    out["start_address"]      = helpers::format_address(static_cast<ea_t>(result.start_address));
+    out["end_address"]        = helpers::format_address(static_cast<ea_t>(result.end_address));
+    out["total_instructions"] = result.total_instructions;
+    out["junk_instructions"]  = result.junk_instruction_count;
+    out["effective_instructions"] = result.total_instructions - result.junk_instruction_count;
+
+    json deltas = json::array();
+    for (const auto& d : result.reg_deltas)
+    {
+        json delta;
+        delta["register"] = d.name;
+        delta["before"]   = helpers::format_address(static_cast<ea_t>(d.before));
+        delta["after"]    = helpers::format_address(static_cast<ea_t>(d.after));
+        deltas.push_back(std::move(delta));
+    }
+    out["register_deltas"] = std::move(deltas);
+
+    json eff_ops = json::array();
+    for (const auto& op : result.effective_ops)
+        eff_ops.push_back(op);
+    out["effective_operations"] = std::move(eff_ops);
+
+    json writes = json::array();
+    std::size_t write_limit = std::min<std::size_t>(result.mem_writes.size(), 128);
+    for (std::size_t i = 0; i < write_limit; ++i)
+    {
+        const auto& w = result.mem_writes[i];
+        json wr;
+        wr["address"] = helpers::format_address(static_cast<ea_t>(w.address));
+        wr["size"]    = w.size;
+        writes.push_back(std::move(wr));
+    }
+    out["memory_writes"] = std::move(writes);
+
+    constexpr std::size_t TRACE_EXCERPT = 50;
+    json trace_arr = json::array();
+    for (std::size_t i = 0; i < std::min(result.trace.size(), TRACE_EXCERPT); ++i)
+    {
+        const auto& t = result.trace[i];
+        json te;
+        te["address"] = helpers::format_address(static_cast<ea_t>(t.address));
+        te["disasm"]  = t.disasm;
+        trace_arr.push_back(std::move(te));
+    }
+    if (result.trace.size() > TRACE_EXCERPT * 2)
+    {
+        json gap;
+        gap["note"] = "... " + std::to_string(result.trace.size() - TRACE_EXCERPT * 2) + " entries omitted ...";
+        trace_arr.push_back(std::move(gap));
+        for (std::size_t i = result.trace.size() - TRACE_EXCERPT; i < result.trace.size(); ++i)
+        {
+            const auto& t = result.trace[i];
+            json te;
+            te["address"] = helpers::format_address(static_cast<ea_t>(t.address));
+            te["disasm"]  = t.disasm;
+            trace_arr.push_back(std::move(te));
+        }
+    }
+    out["trace_excerpt"] = std::move(trace_arr);
+
+    return tool_result_t::ok(
+        OBFSTR("IDB emulation: ") + std::to_string(result.total_instructions) +
+        OBFSTR(" insns (") + std::to_string(result.junk_instruction_count) + OBFSTR(" junk)"), out);
+}
+
+tool_result_t analyze_vm_handler(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address. Provide the VM handler entry point."));
+
+    std::uint32_t handler_size = params.value("size", 8192);
+    if (handler_size > 1024 * 1024) handler_size = 1024 * 1024;
+
+    std::uint32_t max_insns = params.value("max_instructions", 100000);
+    if (max_insns > 500000) max_insns = 500000;
+
+    // Step 1: Disassemble the handler with Zydis
+    auto disasm = emulation::disassemble_idb_range(*addr, handler_size, 10000);
+
+    // Step 2: Static analysis — count patterns
+    std::uint32_t nop_count = 0, branch_count = 0, call_count = 0, privileged_count = 0;
+    std::uint32_t total_insns = static_cast<std::uint32_t>(disasm.size());
+    std::set<std::uint64_t> branch_targets;
+    std::uint64_t last_addr = *addr;
+
+    for (const auto& insn : disasm)
+    {
+        if (insn.is_nop) ++nop_count;
+        if (insn.is_branch) ++branch_count;
+        if (insn.is_call) ++call_count;
+        if (insn.is_privileged) ++privileged_count;
+        last_addr = insn.address + insn.length;
+    }
+
+    // Step 3: Emulate offline to get effective ops
+    std::vector<std::uint8_t> code(handler_size);
+    for (std::uint32_t i = 0; i < handler_size; ++i)
+        code[i] = static_cast<std::uint8_t>(get_byte(static_cast<ea_t>(*addr + i)));
+
+    emulation::process_snapshot_t snapshot;
+    snapshot.success = true;
+    snapshot.rip = *addr;
+    snapshot.rsp = 0x7FFE0000;
+    snapshot.rflags = 0x202;
+
+    // Set initial register inputs if provided
+    if (params.contains("rax")) { auto v = helpers::parse_address(params.value("rax", std::string())); if (v) snapshot.rax = *v; }
+    if (params.contains("rbx")) { auto v = helpers::parse_address(params.value("rbx", std::string())); if (v) snapshot.rbx = *v; }
+    if (params.contains("rcx")) { auto v = helpers::parse_address(params.value("rcx", std::string())); if (v) snapshot.rcx = *v; }
+    if (params.contains("rdx")) { auto v = helpers::parse_address(params.value("rdx", std::string())); if (v) snapshot.rdx = *v; }
+    if (params.contains("rsi")) { auto v = helpers::parse_address(params.value("rsi", std::string())); if (v) snapshot.rsi = *v; }
+    if (params.contains("rdi")) { auto v = helpers::parse_address(params.value("rdi", std::string())); if (v) snapshot.rdi = *v; }
+
+    emulation::memory_snapshot_region_t code_region;
+    code_region.base = *addr & ~0xFFFULL;
+    code_region.size = (static_cast<std::uint64_t>(handler_size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
+    code_region.data.resize(static_cast<std::size_t>(code_region.size), 0);
+    std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), handler_size);
+    snapshot.regions.push_back(std::move(code_region));
+
+    emulation::memory_snapshot_region_t stack_region;
+    stack_region.base = 0x7FFD0000;
+    stack_region.size = 0x20000;
+    stack_region.data.resize(0x20000, 0);
+    snapshot.regions.push_back(std::move(stack_region));
+
+    emulation::emulation_config_t config;
+    config.start_address         = *addr;
+    config.max_instructions      = max_insns;
+    config.max_trace_entries     = 50000;
+    config.record_mem_reads      = true;
+    config.record_mem_writes     = true;
+    config.record_registers      = true;
+    config.analyze_effective_ops = true;
+    config.timeout_us            = params.value("timeout_us", 15000000);
+
+    auto emu_result = emulation::emulate_from_snapshot(snapshot, config);
+
+    json out;
+    out["handler_address"]   = helpers::format_address(*addr);
+    out["handler_size"]      = handler_size;
+
+    // Static analysis
+    json static_info;
+    static_info["total_decoded"]     = total_insns;
+    static_info["nop_instructions"]  = nop_count;
+    static_info["branch_count"]      = branch_count;
+    static_info["call_count"]        = call_count;
+    static_info["privileged_count"]  = privileged_count;
+    static_info["nop_ratio"]         = total_insns > 0
+        ? static_cast<double>(nop_count) / total_insns : 0.0;
+    out["static_analysis"] = std::move(static_info);
+
+    // Emulation analysis
+    if (emu_result.success)
+    {
+        auto analysis = emulation::analyze_vm_trace(emu_result);
+
+        json emu_info;
+        emu_info["total_executed"]       = analysis.total_instructions;
+        emu_info["effective_instructions"] = analysis.effective_instructions;
+        emu_info["junk_instructions"]    = analysis.junk_instructions;
+        emu_info["junk_ratio"]           = analysis.total_instructions > 0
+            ? static_cast<double>(analysis.junk_instructions) / analysis.total_instructions : 0.0;
+        emu_info["summary"]              = analysis.summary;
+
+        json deltas = json::array();
+        for (const auto& d : analysis.net_reg_changes)
+        {
+            json delta;
+            delta["register"] = d.name;
+            delta["before"]   = helpers::format_address(static_cast<ea_t>(d.before));
+            delta["after"]    = helpers::format_address(static_cast<ea_t>(d.after));
+            deltas.push_back(std::move(delta));
+        }
+        emu_info["net_register_changes"] = std::move(deltas);
+
+        json writes = json::array();
+        std::size_t wlimit = std::min<std::size_t>(analysis.net_mem_writes.size(), 64);
+        for (std::size_t i = 0; i < wlimit; ++i)
+        {
+            json wr;
+            wr["address"] = helpers::format_address(static_cast<ea_t>(analysis.net_mem_writes[i].address));
+            wr["size"]    = analysis.net_mem_writes[i].size;
+            writes.push_back(std::move(wr));
+        }
+        emu_info["net_memory_writes"] = std::move(writes);
+
+        json eff_ops = json::array();
+        for (const auto& op : analysis.effective_ops)
+            eff_ops.push_back(op);
+        emu_info["effective_operations"] = std::move(eff_ops);
+
+        out["emulation_analysis"] = std::move(emu_info);
+    }
+    else
+    {
+        out["emulation_error"] = emu_result.error;
+    }
+
+    // Classification
+    double junk_ratio = emu_result.success && emu_result.total_instructions > 0
+        ? static_cast<double>(emu_result.junk_instruction_count) / emu_result.total_instructions
+        : 0.0;
+
+    std::string classification;
+    if (junk_ratio > 0.8)
+        classification = "heavily_virtualized";
+    else if (junk_ratio > 0.5)
+        classification = "moderately_obfuscated";
+    else if (nop_count > total_insns / 3)
+        classification = "junk_padded";
+    else
+        classification = "normal";
+
+    out["classification"] = classification;
+
+    return tool_result_t::ok(
+        OBFSTR("VM handler analysis at ") + helpers::format_address(*addr) +
+        OBFSTR(": ") + classification, out);
+}
+
+// ─── Multi-Trace Differential Emulation ──────────────────────────────────
+tool_result_t emulate_multi_trace(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    if (!params.contains("inputs") || !params["inputs"].is_array() || params["inputs"].empty())
+        return tool_result_t::error(OBFSTR("Provide 'inputs' array of register state objects [{rax:..., rbx:...}, ...]"));
+
+    std::uint32_t size = params.value("size", 4096);
+    if (size > 1024 * 1024) size = 1024 * 1024;
+    std::uint32_t max_insns = params.value("max_instructions", 50000);
+    if (max_insns > 500000) max_insns = 500000;
+
+    // Read code from IDB
+    std::vector<std::uint8_t> code(size);
+    for (std::uint32_t i = 0; i < size; ++i)
+        code[i] = static_cast<std::uint8_t>(get_byte(static_cast<ea_t>(*addr + i)));
+
+    json traces = json::array();
+    const auto& inputs = params["inputs"];
+
+    for (std::size_t ti = 0; ti < inputs.size() && ti < 32; ++ti)
+    {
+        const json& inp = inputs[ti];
+
+        emulation::process_snapshot_t snapshot;
+        snapshot.success = true;
+        snapshot.rip = *addr;
+        snapshot.rsp = 0x7FFE0000;
+        snapshot.rflags = 0x202;
+
+        // Set registers from this input
+        auto set_reg = [&](const char* name, std::uint64_t& reg)
+        {
+            if (inp.contains(name))
+            {
+                if (inp[name].is_number()) reg = inp[name].get<std::uint64_t>();
+                else if (inp[name].is_string()) { auto v = helpers::parse_address(inp[name].get<std::string>()); if (v) reg = *v; }
+            }
+        };
+        set_reg("rax", snapshot.rax); set_reg("rbx", snapshot.rbx);
+        set_reg("rcx", snapshot.rcx); set_reg("rdx", snapshot.rdx);
+        set_reg("rsi", snapshot.rsi); set_reg("rdi", snapshot.rdi);
+        set_reg("r8", snapshot.r8);   set_reg("r9", snapshot.r9);
+
+        // Map code
+        emulation::memory_snapshot_region_t code_region;
+        code_region.base = *addr & ~0xFFFULL;
+        code_region.size = (static_cast<std::uint64_t>(size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
+        code_region.data.resize(static_cast<std::size_t>(code_region.size), 0);
+        std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), size);
+        snapshot.regions.push_back(std::move(code_region));
+
+        // Map stack
+        emulation::memory_snapshot_region_t stack_region;
+        stack_region.base = 0x7FFD0000;
+        stack_region.size = 0x20000;
+        stack_region.data.resize(0x20000, 0);
+        snapshot.regions.push_back(std::move(stack_region));
+
+        emulation::emulation_config_t config;
+        config.start_address     = *addr;
+        config.max_instructions  = max_insns;
+        config.max_trace_entries  = 100;
+        config.record_mem_reads   = false;
+        config.record_mem_writes  = true;
+        config.record_registers   = true;
+        config.analyze_effective_ops = true;
+        config.timeout_us         = params.value("timeout_us", 5000000);
+
+        auto result = emulation::emulate_from_snapshot(snapshot, config);
+
+        json trace;
+        trace["input_index"] = ti;
+        trace["input_regs"]  = inp;
+        trace["success"]     = result.success;
+
+        if (result.success)
+        {
+            trace["total_instructions"]     = result.total_instructions;
+            trace["junk_instructions"]      = result.junk_instruction_count;
+            trace["effective_instructions"] = result.total_instructions - result.junk_instruction_count;
+            trace["end_address"]            = helpers::format_address(static_cast<ea_t>(result.end_address));
+
+            json deltas = json::array();
+            for (const auto& d : result.reg_deltas)
+            {
+                json delta;
+                delta["register"] = d.name;
+                delta["before"]   = helpers::format_address(static_cast<ea_t>(d.before));
+                delta["after"]    = helpers::format_address(static_cast<ea_t>(d.after));
+                deltas.push_back(std::move(delta));
+            }
+            trace["register_deltas"] = std::move(deltas);
+
+            json eff = json::array();
+            for (const auto& op : result.effective_ops) eff.push_back(op);
+            trace["effective_operations"] = std::move(eff);
+
+            json wrs = json::array();
+            std::size_t wl = std::min<std::size_t>(result.mem_writes.size(), 32);
+            for (std::size_t w = 0; w < wl; ++w)
+            {
+                json wr; wr["address"] = helpers::format_address(static_cast<ea_t>(result.mem_writes[w].address));
+                wr["size"] = result.mem_writes[w].size; wrs.push_back(std::move(wr));
+            }
+            trace["memory_writes"] = std::move(wrs);
+        }
+        else
+        {
+            trace["error"] = result.error;
+        }
+        traces.push_back(std::move(trace));
+    }
+
+    // Differential analysis: compare traces
+    json diff;
+    if (traces.size() >= 2)
+    {
+        bool same_length = true;
+        bool same_regs   = true;
+        bool same_writes = true;
+        std::uint32_t ref_insns = traces[0].value("total_instructions", 0);
+
+        for (std::size_t i = 1; i < traces.size(); ++i)
+        {
+            if (traces[i].value("total_instructions", 0) != ref_insns) same_length = false;
+            if (traces[i].value("register_deltas", json::array()) != traces[0].value("register_deltas", json::array())) same_regs = false;
+            if (traces[i].value("memory_writes", json::array()) != traces[0].value("memory_writes", json::array())) same_writes = false;
+        }
+        diff["execution_length_consistent"] = same_length;
+        diff["register_outputs_identical"]  = same_regs;
+        diff["memory_writes_identical"]     = same_writes;
+
+        if (same_regs && same_writes && same_length) diff["verdict"] = "constant_operation";
+        else if (!same_regs && !same_writes) diff["verdict"] = "input_dependent_behavior";
+        else if (!same_regs && same_writes)  diff["verdict"] = "register_transform_only";
+        else                                 diff["verdict"] = "memory_behavior_varies";
+    }
+
+    json out;
+    out["address"]      = helpers::format_address(*addr);
+    out["trace_count"]  = traces.size();
+    out["traces"]       = std::move(traces);
+    if (!diff.empty()) out["differential_analysis"] = std::move(diff);
+
+    return tool_result_t::ok(OBFSTR("Multi-trace: ") + std::to_string(out["trace_count"].get<std::size_t>()) +
+                             OBFSTR(" traces at ") + helpers::format_address(*addr), out);
+}
+
+// ─── Complete Function Emulation ─────────────────────────────────────────
+tool_result_t emulate_function(const json& params)
+{
+    auto addr = helpers::parse_address(params.value("address", std::string()));
+    if (!addr)
+        return tool_result_t::error(OBFSTR("Invalid address"));
+
+    func_t* fn = get_func(*addr);
+    std::uint32_t fn_size = fn ? static_cast<std::uint32_t>(fn->size()) : params.value("size", 4096);
+    if (fn_size > 1024 * 1024) fn_size = 1024 * 1024;
+
+    // Map more than just the function — include context for inter-function reads
+    std::uint32_t map_size = std::max(fn_size * 2, 8192u);
+    if (map_size > 1024 * 1024) map_size = 1024 * 1024;
+
+    std::vector<std::uint8_t> code(map_size);
+    for (std::uint32_t i = 0; i < map_size; ++i)
+        code[i] = static_cast<std::uint8_t>(get_byte(static_cast<ea_t>(*addr + i)));
+
+    // Set up synthetic return address as a sentinel
+    constexpr std::uint64_t SENTINEL_RET = 0xDEAD000000000000ULL;
+    constexpr std::uint64_t STACK_BASE   = 0x7FFD0000;
+    constexpr std::uint64_t STACK_SIZE   = 0x20000;
+    constexpr std::uint64_t STACK_TOP    = STACK_BASE + STACK_SIZE - 0x1000;
+
+    emulation::process_snapshot_t snapshot;
+    snapshot.success = true;
+    snapshot.rip     = *addr;
+    snapshot.rsp     = STACK_TOP;
+    snapshot.rbp     = STACK_TOP + 0x100;
+    snapshot.rflags  = 0x202;
+
+    // Set registers from params
+    if (params.contains("rax")) { auto v = helpers::parse_address(params.value("rax", std::string())); if (v) snapshot.rax = *v; }
+    if (params.contains("rbx")) { auto v = helpers::parse_address(params.value("rbx", std::string())); if (v) snapshot.rbx = *v; }
+    if (params.contains("rcx")) { auto v = helpers::parse_address(params.value("rcx", std::string())); if (v) snapshot.rcx = *v; }
+    if (params.contains("rdx")) { auto v = helpers::parse_address(params.value("rdx", std::string())); if (v) snapshot.rdx = *v; }
+    if (params.contains("rsi")) { auto v = helpers::parse_address(params.value("rsi", std::string())); if (v) snapshot.rsi = *v; }
+    if (params.contains("rdi")) { auto v = helpers::parse_address(params.value("rdi", std::string())); if (v) snapshot.rdi = *v; }
+    if (params.contains("r8"))  { auto v = helpers::parse_address(params.value("r8", std::string()));  if (v) snapshot.r8  = *v; }
+    if (params.contains("r9"))  { auto v = helpers::parse_address(params.value("r9", std::string()));  if (v) snapshot.r9  = *v; }
+
+    // Map code region
+    emulation::memory_snapshot_region_t code_region;
+    code_region.base = *addr & ~0xFFFULL;
+    code_region.size = (static_cast<std::uint64_t>(map_size) + 0xFFF + (*addr & 0xFFF)) & ~0xFFFULL;
+    code_region.data.resize(static_cast<std::size_t>(code_region.size), 0);
+    std::memcpy(code_region.data.data() + (*addr - code_region.base), code.data(), map_size);
+    snapshot.regions.push_back(std::move(code_region));
+
+    // Map stack and write sentinel return address
+    emulation::memory_snapshot_region_t stack_region;
+    stack_region.base = STACK_BASE;
+    stack_region.size = STACK_SIZE;
+    stack_region.data.resize(STACK_SIZE, 0);
+    // Write sentinel at RSP (return address on stack)
+    std::uint64_t sentinel = SENTINEL_RET;
+    std::memcpy(stack_region.data.data() + (STACK_TOP - STACK_BASE), &sentinel, 8);
+    snapshot.regions.push_back(std::move(stack_region));
+
+    // Map sentinel page so RET to it + fetch triggers stop
+    emulation::memory_snapshot_region_t sentinel_region;
+    sentinel_region.base = SENTINEL_RET & ~0xFFFULL;
+    sentinel_region.size = 0x1000;
+    sentinel_region.data.resize(0x1000, 0xCC);
+    snapshot.regions.push_back(std::move(sentinel_region));
+
+    emulation::emulation_config_t config;
+    config.start_address     = *addr;
+    config.stop_address      = SENTINEL_RET;
+    config.max_instructions  = params.value("max_instructions", 100000);
+    config.max_trace_entries  = params.value("max_trace_entries", 10000);
+    config.record_mem_reads   = params.value("record_mem_reads", true);
+    config.record_mem_writes  = params.value("record_mem_writes", true);
+    config.record_registers   = true;
+    config.analyze_effective_ops = true;
+    config.timeout_us         = params.value("timeout_us", 15000000);
+    config.breakpoint_addresses.insert(SENTINEL_RET);
+
+    auto result = emulation::emulate_from_snapshot(snapshot, config);
+
+    json out;
+    out["function_address"] = helpers::format_address(*addr);
+    out["function_size"]    = fn_size;
+    out["mapped_size"]      = map_size;
+    out["success"]          = result.success;
+
+    bool returned_normally = result.success &&
+        (result.end_address == SENTINEL_RET || result.end_address == SENTINEL_RET + 1);
+    out["returned_normally"] = returned_normally;
+
+    if (result.success)
+    {
+        out["total_instructions"]     = result.total_instructions;
+        out["junk_instructions"]      = result.junk_instruction_count;
+        out["effective_instructions"] = result.total_instructions - result.junk_instruction_count;
+        out["end_address"]            = helpers::format_address(static_cast<ea_t>(result.end_address));
+
+        // Return value is in RAX
+        for (const auto& d : result.reg_deltas)
+        {
+            if (d.name == "rax")
+            {
+                out["return_value"] = helpers::format_address(static_cast<ea_t>(d.after));
+                break;
+            }
+        }
+
+        json deltas = json::array();
+        for (const auto& d : result.reg_deltas)
+        {
+            json delta;
+            delta["register"] = d.name;
+            delta["before"]   = helpers::format_address(static_cast<ea_t>(d.before));
+            delta["after"]    = helpers::format_address(static_cast<ea_t>(d.after));
+            deltas.push_back(std::move(delta));
+        }
+        out["register_deltas"] = std::move(deltas);
+
+        json eff = json::array();
+        for (const auto& op : result.effective_ops) eff.push_back(op);
+        out["effective_operations"] = std::move(eff);
+
+        json writes = json::array();
+        std::size_t wl = std::min<std::size_t>(result.mem_writes.size(), 128);
+        for (std::size_t w = 0; w < wl; ++w)
+        {
+            json wr;
+            wr["address"] = helpers::format_address(static_cast<ea_t>(result.mem_writes[w].address));
+            wr["size"]    = result.mem_writes[w].size;
+            writes.push_back(std::move(wr));
+        }
+        out["memory_writes"] = std::move(writes);
+
+        // Trace excerpt
+        constexpr std::size_t EX = 30;
+        json trace_arr = json::array();
+        for (std::size_t i = 0; i < std::min(result.trace.size(), EX); ++i)
+        {
+            json te; te["address"] = helpers::format_address(static_cast<ea_t>(result.trace[i].address));
+            te["disasm"] = result.trace[i].disasm; trace_arr.push_back(std::move(te));
+        }
+        if (result.trace.size() > EX * 2)
+        {
+            trace_arr.push_back(json{{"note", "... " + std::to_string(result.trace.size() - EX * 2) + " instructions omitted ..."}});
+            for (std::size_t i = result.trace.size() - EX; i < result.trace.size(); ++i)
+            {
+                json te; te["address"] = helpers::format_address(static_cast<ea_t>(result.trace[i].address));
+                te["disasm"] = result.trace[i].disasm; trace_arr.push_back(std::move(te));
+            }
+        }
+        out["trace_excerpt"] = std::move(trace_arr);
+    }
+    else
+    {
+        out["error"] = result.error;
+    }
+
+    return tool_result_t::ok(
+        OBFSTR("Function emulation ") + helpers::format_address(*addr) +
+        (returned_normally ? OBFSTR(": returned normally") : OBFSTR(": did not return")), out);
+}
+
+#else  // !__NT__
+
+tool_result_t disassemble_zydis(const json&)
+{
+    return tool_result_t::error(OBFSTR("Emulation engine requires Windows (NT kernel driver)."));
+}
+
+tool_result_t driver_snapshot_and_emulate(const json&)
+{
+    return tool_result_t::error(OBFSTR("Emulation engine requires Windows (NT kernel driver)."));
+}
+
+tool_result_t trace_execution_unicorn(const json&)
+{
+    return tool_result_t::error(OBFSTR("Emulation engine requires Windows (NT kernel driver)."));
+}
+
+tool_result_t analyze_vm_handler(const json&)
+{
+    return tool_result_t::error(OBFSTR("Emulation engine requires Windows (NT kernel driver)."));
+}
+
+tool_result_t emulate_multi_trace(const json&)
+{
+    return tool_result_t::error(OBFSTR("Emulation engine requires Windows (NT kernel driver)."));
+}
+
+tool_result_t emulate_function(const json&)
+{
+    return tool_result_t::error(OBFSTR("Emulation engine requires Windows (NT kernel driver)."));
+}
+
+#endif  // __NT__
+
+void register_tools()
+{
+    auto& registry = ToolRegistry::instance();
+
+    registry.register_tool({
+        OBFSTR("disassemble_zydis"), OBFSTR("emulation"),
+        OBFSTR("Disassemble bytes using the Zydis engine instead of IDA's built-in disassembler. "
+               "Produces richer instruction metadata: branch/call/ret/nop/privileged classification, "
+               "precise mnemonic parsing, and accurate instruction lengths. "
+               "Works on any bytes in the IDB — useful for analyzing packed, encrypted, or "
+               "dynamically-generated code that IDA may have failed to disassemble."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Start address in the IDB"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Number of bytes to disassemble (default 256, max 65536)"), false},
+         {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Maximum instructions to decode (default 100, max 10000)"), false}},
+        disassemble_zydis, true});
+
+    registry.register_tool({
+        OBFSTR("driver_snapshot_and_emulate"), OBFSTR("emulation"),
+        OBFSTR("Capture a live process snapshot via the kernel driver and emulate code offline in Unicorn. "
+               "The driver silently reads physical memory pages and thread context without triggering "
+               "any anti-debug or anti-tamper mechanisms. The captured state is loaded into Unicorn "
+               "for offline x86-64 emulation with full instruction tracing. "
+               "Produces: register deltas (before/after), memory writes, effective vs junk instruction "
+               "classification, and an execution trace. "
+               "Use this to analyze VM handlers, unpacking stubs, and obfuscated code in protected "
+               "processes where the debugger would be detected. "
+               "Requires: driver_connect + driver_attach first."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Emulation start address (entry point of VM handler or code to trace)"), true},
+         {OBFSTR("tid"), OBFSTR("number"), OBFSTR("Target thread ID (auto-selects first thread if omitted)"), false},
+         {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Maximum instructions to emulate (default 50000)"), false},
+         {OBFSTR("max_trace_entries"), OBFSTR("number"), OBFSTR("Maximum trace log entries (default 10000)"), false},
+         {OBFSTR("stop_address"), OBFSTR("string"), OBFSTR("Address to stop emulation at (optional)"), false},
+         {OBFSTR("breakpoints"), OBFSTR("array"), OBFSTR("Array of addresses to break at during emulation"), false,
+          {}, {{"type", "string"}}},
+         {OBFSTR("snapshot_base"), OBFSTR("string"), OBFSTR("Override snapshot region base address (auto if omitted)"), false},
+         {OBFSTR("snapshot_size"), OBFSTR("number"), OBFSTR("Override snapshot region size in bytes (auto if omitted)"), false},
+         {OBFSTR("record_mem_reads"), OBFSTR("boolean"), OBFSTR("Log all memory reads (default true)"), false},
+         {OBFSTR("record_mem_writes"), OBFSTR("boolean"), OBFSTR("Log all memory writes (default true)"), false},
+         {OBFSTR("analyze_effective"), OBFSTR("boolean"), OBFSTR("Classify junk vs effective instructions (default true)"), false},
+         {OBFSTR("timeout_us"), OBFSTR("number"), OBFSTR("Emulation timeout in microseconds (default 10000000 = 10s)"), false}},
+        driver_snapshot_and_emulate, false});
+
+    registry.register_tool({
+        OBFSTR("trace_execution_unicorn"), OBFSTR("emulation"),
+        OBFSTR("Emulate code from the IDB offline using Unicorn — NO debugger or driver required. "
+               "Reads bytes directly from the IDA database, maps them into a Unicorn x86-64 engine "
+               "with a synthetic stack, and traces execution. Produces register deltas, memory writes, "
+               "effective vs junk instruction classification, and an execution trace. "
+               "Ideal for analyzing VM handlers, decryption loops, and obfuscated routines statically. "
+               "You can set initial register values (rax, rbx, ...) to simulate specific VM opcodes."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Start address to emulate from"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes of code to map (default 4096, max 1MB)"), false},
+         {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Maximum instructions to emulate (default 50000)"), false},
+         {OBFSTR("max_trace_entries"), OBFSTR("number"), OBFSTR("Maximum trace log entries (default 10000)"), false},
+         {OBFSTR("stop_address"), OBFSTR("string"), OBFSTR("Address to stop emulation at (optional)"), false},
+         {OBFSTR("rax"), OBFSTR("string"), OBFSTR("Initial RAX value (hex)"), false},
+         {OBFSTR("rbx"), OBFSTR("string"), OBFSTR("Initial RBX value (hex)"), false},
+         {OBFSTR("rcx"), OBFSTR("string"), OBFSTR("Initial RCX value (hex)"), false},
+         {OBFSTR("rdx"), OBFSTR("string"), OBFSTR("Initial RDX value (hex)"), false},
+         {OBFSTR("rsi"), OBFSTR("string"), OBFSTR("Initial RSI value (hex)"), false},
+         {OBFSTR("rdi"), OBFSTR("string"), OBFSTR("Initial RDI value (hex)"), false},
+         {OBFSTR("record_mem_reads"), OBFSTR("boolean"), OBFSTR("Log memory reads (default true)"), false},
+         {OBFSTR("record_mem_writes"), OBFSTR("boolean"), OBFSTR("Log memory writes (default true)"), false},
+         {OBFSTR("timeout_us"), OBFSTR("number"), OBFSTR("Emulation timeout in microseconds (default 10s)"), false}},
+        trace_execution_unicorn, true});
+
+    registry.register_tool({
+        OBFSTR("analyze_vm_handler"), OBFSTR("emulation"),
+        OBFSTR("Combined static + dynamic analysis of a VM handler or obfuscated code block. "
+               "Step 1: Zydis static disassembly with instruction classification. "
+               "Step 2: Unicorn offline emulation to separate junk from effective operations. "
+               "Produces: static instruction counts (nop/branch/call/privileged ratios), "
+               "emulation results (register deltas, memory writes, effective ops), "
+               "and an overall classification (heavily_virtualized / moderately_obfuscated / junk_padded / normal). "
+               "Use this as a one-shot tool to understand what a VM handler actually computes, "
+               "cutting through thousands of junk instructions to reveal the true logic."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("VM handler entry point address"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Handler size in bytes (default 8192)"), false},
+         {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Max instructions for emulation (default 100000)"), false},
+         {OBFSTR("rax"), OBFSTR("string"), OBFSTR("Initial RAX for emulation (hex)"), false},
+         {OBFSTR("rbx"), OBFSTR("string"), OBFSTR("Initial RBX for emulation (hex)"), false},
+         {OBFSTR("rcx"), OBFSTR("string"), OBFSTR("Initial RCX for emulation (hex)"), false},
+         {OBFSTR("rdx"), OBFSTR("string"), OBFSTR("Initial RDX for emulation (hex)"), false},
+         {OBFSTR("rsi"), OBFSTR("string"), OBFSTR("Initial RSI for emulation (hex)"), false},
+         {OBFSTR("rdi"), OBFSTR("string"), OBFSTR("Initial RDI for emulation (hex)"), false},
+         {OBFSTR("timeout_us"), OBFSTR("number"), OBFSTR("Emulation timeout in microseconds (default 15s)"), false}},
+        analyze_vm_handler, true});
+
+    registry.register_tool({
+        OBFSTR("emulate_multi_trace"), OBFSTR("emulation"),
+        OBFSTR("Run multiple emulation traces with different register inputs for differential analysis. "
+               "Compare execution paths, register outputs, and memory writes across traces. "
+               "Classifies behavior: constant_operation, register_transform_only, input_dependent_behavior, "
+               "memory_behavior_varies. Use to understand VM handler semantics (e.g. verify that a handler "
+               "is 'vm_add' by running with different inputs and confirming output = input_a + input_b)."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Code address to emulate"), true},
+         {OBFSTR("inputs"), OBFSTR("array"), OBFSTR("Array of register state objects, e.g. [{rax:\"0x10\",rbx:\"0x20\"}, {rax:\"0x30\",rbx:\"0x40\"}]"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Code size in bytes (default: 4096)"), false},
+         {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Max instructions per trace (default: 50000)"), false},
+         {OBFSTR("timeout_us"), OBFSTR("number"), OBFSTR("Timeout per trace in microseconds (default: 5s)"), false}},
+        emulate_multi_trace, true});
+
+    registry.register_tool({
+        OBFSTR("emulate_function"), OBFSTR("emulation"),
+        OBFSTR("Emulate a complete function from the IDB offline until it returns (RET). "
+               "Sets up a synthetic stack with a sentinel return address to detect normal function return. "
+               "Reports: return value (RAX), register deltas, memory writes, effective operations, "
+               "and whether the function returned normally. "
+               "Use to understand what a function computes without running it in a live process."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function entry point"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Override function size if no IDA function defined"), false},
+         {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Max instructions (default: 100000)"), false},
+         {OBFSTR("max_trace_entries"), OBFSTR("number"), OBFSTR("Max trace entries (default: 10000)"), false},
+         {OBFSTR("rax"), OBFSTR("string"), OBFSTR("Initial RAX (hex)"), false},
+         {OBFSTR("rbx"), OBFSTR("string"), OBFSTR("Initial RBX (hex)"), false},
+         {OBFSTR("rcx"), OBFSTR("string"), OBFSTR("Initial RCX (hex)"), false},
+         {OBFSTR("rdx"), OBFSTR("string"), OBFSTR("Initial RDX (hex)"), false},
+         {OBFSTR("rsi"), OBFSTR("string"), OBFSTR("Initial RSI (hex)"), false},
+         {OBFSTR("rdi"), OBFSTR("string"), OBFSTR("Initial RDI (hex)"), false},
+         {OBFSTR("r8"), OBFSTR("string"), OBFSTR("Initial R8 (hex)"), false},
+         {OBFSTR("r9"), OBFSTR("string"), OBFSTR("Initial R9 (hex)"), false},
+         {OBFSTR("record_mem_reads"), OBFSTR("boolean"), OBFSTR("Log memory reads (default: true)"), false},
+         {OBFSTR("record_mem_writes"), OBFSTR("boolean"), OBFSTR("Log memory writes (default: true)"), false},
+         {OBFSTR("timeout_us"), OBFSTR("number"), OBFSTR("Timeout in microseconds (default: 15s)"), false}},
+        emulate_function, true});
+}
+
+}  // namespace emulation_tools
 
 void initialize_all_tools()
 {
@@ -20519,6 +22868,7 @@ void initialize_all_tools()
     graphrag_tools::register_tools();
     network_tools::register_tools();
     net_security_tools::register_tools();
+    emulation_tools::register_tools();
 
     ToolRegistry::instance().register_tool({
         OBFSTR("sessions_spawn"), OBFSTR("session"),

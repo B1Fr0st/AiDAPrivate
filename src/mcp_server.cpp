@@ -1680,7 +1680,7 @@ static const mcp_client_def_t g_mcp_client_defs[] =
 #endif
 };
 
-static const std::string MCP_SERVER_NAME = OBFSTR("aida-ida-pro");
+static const std::string MCP_SERVER_NAME = OBFSTR("aida-pro-mcp");
 
 static std::string mcp_get_home_dir()
 {
@@ -2063,7 +2063,7 @@ static bool mcp_write_codex_toml(const std::string& path, const std::string& url
     if (qfileexist(path.c_str()))
         mcp_read_file_contents(path, content);
 
-    const std::string section_marker = OBFSTR("[mcp_servers.aida-ida-pro]");
+    const std::string section_marker = OBFSTR("[mcp_servers.aida-pro-mcp]");
     size_t section_pos = content.find(section_marker);
 
     if (section_pos != std::string::npos)

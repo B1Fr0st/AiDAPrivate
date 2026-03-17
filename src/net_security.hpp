@@ -150,6 +150,29 @@ struct dtls_key_info_t {
 };
 
 
+struct pcap_decrypt_result_t {
+    bool success = false;
+    std::string error_message;
+    std::string keylog_file_used;
+    std::string pcap_file_used;
+    std::uint32_t total_packets = 0;
+    std::uint32_t decrypted_packets = 0;
+    struct http2_frame_t {
+        std::string stream_id;
+        std::string method;
+        std::string url;
+        std::string authority;
+        std::string content_type;
+        std::map<std::string, std::string> headers;
+        std::string body;
+        std::string frame_type;
+        std::uint32_t status_code = 0;
+    };
+    std::vector<http2_frame_t> http2_frames;
+    std::string raw_output;
+};
+
+
 enum class autoresponder_match_type {
     exact_url,
     prefix_url,
@@ -209,6 +232,20 @@ public:
 
 
     const std::map<std::string, tls_session_key_t>& get_seen_keys() const { return _seen_keys; }
+
+
+    std::vector<tls_session_key_t> read_keylog_file(const std::string& path);
+
+
+    pcap_decrypt_result_t decrypt_pcap_with_tshark(const std::string& pcap_path,
+                                                    const std::string& keylog_path,
+                                                    const std::string& display_filter = "http2");
+
+
+    std::string find_tshark_path();
+
+
+    bool ensure_sslkeylogfile_env(const std::string& path = "");
 
 
     bool find_module_in_process(std::uint32_t pid, const char* module_name,
