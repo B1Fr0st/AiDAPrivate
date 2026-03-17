@@ -87,13 +87,13 @@ static bool looks_like_random(const std::uint8_t* data, std::size_t len) {
         if (h > max_freq) max_freq = h;
     }
 
-    // Require at least half the bytes to be unique values
+
     if (unique_count < (len / 2)) return false;
 
-    // Reject if any single byte value dominates (> 25% of the data)
+
     if (max_freq > len / 4 + 1) return false;
 
-    // Reject sequential runs (e.g. 0x00,0x01,0x02... or 0xFF,0xFE,0xFD...)
+
     std::size_t seq_run = 0;
     for (std::size_t i = 1; i < len; i++) {
         int diff = static_cast<int>(data[i]) - static_cast<int>(data[i - 1]);
@@ -684,11 +684,10 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
 
     if (!has_chrome) return keys;
 
-    // Strategy 1: Read keylog file from SSLKEYLOGFILE environment variable.
-    // BoringSSL (Chromium) logs TLS secrets when SSLKEYLOGFILE is set before process start.
+
     std::vector<std::string> keylog_paths;
 
-    // Check our own environment (user may have set it system-wide)
+
     {
         char buf[MAX_PATH] = {};
         DWORD len = GetEnvironmentVariableA("SSLKEYLOGFILE", buf, MAX_PATH);
@@ -696,7 +695,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
             keylog_paths.emplace_back(buf, len);
     }
 
-    // Check common keylog file locations
+
     {
         char profile[MAX_PATH] = {};
         DWORD plen = GetEnvironmentVariableA("USERPROFILE", profile, MAX_PATH);
@@ -712,7 +711,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
         }
     }
 
-    // Try each candidate path
+
     for (const auto& kpath : keylog_paths) {
         if (GetFileAttributesA(kpath.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
 
@@ -735,8 +734,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
         if (!keys.empty()) return keys;
     }
 
-    // Strategy 2: Read the target process's PEB to find its SSLKEYLOGFILE.
-    // Chromium reads the env var at startup; if the process was started with it, the file exists.
+
     {
         std::uint32_t saved_pid = device->get_process_id();
         device->set_process_id(pid);
@@ -744,17 +742,17 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
 
         voyager::device_t::peb_info peb{};
         if (device->read_peb(peb) && peb.ldr_address != 0) {
-            // PEB.ProcessParameters is at PEB+0x20 (x64)
+
             std::uint64_t peb_base = 0;
-            // ldr_address is at PEB+0x18, so PEB base ≈ ldr_address - 0x18
-            // Read ProcessParameters pointer from PEB+0x20
+
+
             std::uint64_t peb_estimated = peb.ldr_address - 0x18;
             std::uint8_t pp_buf[8] = {};
             if (device->read_raw(peb_estimated + 0x20, pp_buf, 8) == 8) {
                 std::uint64_t proc_params = *reinterpret_cast<std::uint64_t*>(pp_buf);
                 if (is_plausible_pointer(proc_params)) {
-                    // RTL_USER_PROCESS_PARAMETERS.Environment at offset 0x80
-                    // RTL_USER_PROCESS_PARAMETERS.EnvironmentSize at offset 0x3F0
+
+
                     std::uint8_t env_buf[8] = {};
                     std::uint8_t env_size_buf[8] = {};
                     if (device->read_raw(proc_params + 0x80, env_buf, 8) == 8 &&
@@ -762,19 +760,19 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
                         std::uint64_t env_ptr = *reinterpret_cast<std::uint64_t*>(env_buf);
                         std::uint64_t env_size = *reinterpret_cast<std::uint64_t*>(env_size_buf);
                         if (is_plausible_pointer(env_ptr) && env_size > 0 && env_size < 0x100000) {
-                            // Read environment block and search for SSLKEYLOGFILE=
+
                             std::size_t read_size = static_cast<std::size_t>(std::min(env_size, static_cast<std::uint64_t>(0x40000)));
                             std::vector<std::uint8_t> env_data(read_size);
                             std::size_t actual = device->read_raw(env_ptr, env_data.data(), read_size);
                             if (actual >= 32) {
-                                // Environment is wide-char, null-terminated strings, double-null terminated
+
                                 const wchar_t* env_str = reinterpret_cast<const wchar_t*>(env_data.data());
                                 std::size_t env_wchars = actual / 2;
                                 const wchar_t* needle = L"SSLKEYLOGFILE=";
                                 std::size_t needle_len = 14;
                                 for (std::size_t i = 0; i + needle_len < env_wchars; i++) {
                                     if (env_str[i] == 0 && i > 0) {
-                                        // Start of new string
+
                                     }
                                     bool match = true;
                                     for (std::size_t j = 0; j < needle_len; j++) {
@@ -786,7 +784,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
                                     }
                                     if (!match) continue;
 
-                                    // Found it - extract the value
+
                                     std::string target_keylog;
                                     for (std::size_t j = i + needle_len; j < env_wchars && env_str[j] != 0; j++) {
                                         target_keylog += static_cast<char>(env_str[j] & 0xFF);
@@ -824,10 +822,6 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
         if (!keys.empty()) return keys;
     }
 
-    // Strategy 3: Scan process memory for BoringSSL keylog output strings.
-    // If BoringSSL's SSL_CTX_set_keylog_callback was active (e.g. Chromium debug builds,
-    // or SSLKEYLOGFILE was set at startup), the formatted keylog lines may be in the heap.
-    // This is handled by scan_generic_patterns() which is called separately by extract_keys().
 
     return keys;
 }
@@ -1302,12 +1296,10 @@ std::vector<tls_session_key_t> TlsKeyExtractor::read_keylog_file(const std::stri
 
     std::string line;
     while (std::getline(file, line)) {
-        // Skip comments and empty lines
+
         if (line.empty() || line[0] == '#') continue;
 
-        // Format: LABEL hex_client_random hex_secret
-        // e.g.: CLIENT_RANDOM abcdef... 012345...
-        // or: CLIENT_HANDSHAKE_TRAFFIC_SECRET abcdef... 012345...
+
         std::size_t pos1 = line.find(' ');
         if (pos1 == std::string::npos || pos1 == 0) continue;
 
@@ -1323,7 +1315,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::read_keylog_file(const std::stri
         while (pos4 < line.size() && line[pos4] == ' ') pos4++;
 
         std::string secret_hex = line.substr(pos4);
-        // Trim trailing whitespace
+
         while (!secret_hex.empty() && (secret_hex.back() == '\r' || secret_hex.back() == '\n' ||
                secret_hex.back() == ' ' || secret_hex.back() == '\t'))
             secret_hex.pop_back();
@@ -1337,11 +1329,11 @@ std::vector<tls_session_key_t> TlsKeyExtractor::read_keylog_file(const std::stri
         key.timestamp = get_timestamp_ms();
         key.library = "KeylogFile";
 
-        // Determine TLS version from label
+
         if (label == "CLIENT_RANDOM" || label == "RSA")
-            key.tls_version = 0x0303; // TLS 1.2
+            key.tls_version = 0x0303;
         else
-            key.tls_version = 0x0304; // TLS 1.3
+            key.tls_version = 0x0304;
 
         keys.push_back(key);
     }
@@ -1350,7 +1342,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::read_keylog_file(const std::stri
 
 
 std::string TlsKeyExtractor::find_tshark_path() {
-    // Check common Wireshark installation paths
+
     const char* candidates[] = {
         "C:\\Program Files\\Wireshark\\tshark.exe",
         "C:\\Program Files (x86)\\Wireshark\\tshark.exe",
@@ -1360,7 +1352,7 @@ std::string TlsKeyExtractor::find_tshark_path() {
             return path;
     }
 
-    // Check PATH
+
     char buf[MAX_PATH] = {};
     DWORD len = SearchPathA(nullptr, "tshark.exe", nullptr, MAX_PATH, buf, nullptr);
     if (len > 0 && len < MAX_PATH) return std::string(buf, len);
@@ -1380,13 +1372,13 @@ bool TlsKeyExtractor::ensure_sslkeylogfile_env(const std::string& path) {
             return false;
     }
 
-    // Check if already set
+
     char existing[MAX_PATH] = {};
     DWORD elen = GetEnvironmentVariableA("SSLKEYLOGFILE", existing, MAX_PATH);
     if (elen > 0 && std::string(existing, elen) == keylog_path)
         return true;
 
-    // Set at user level via registry so all new processes inherit it
+
     HKEY hKey = nullptr;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Environment", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
         RegSetValueExA(hKey, "SSLKEYLOGFILE", 0, REG_SZ,
@@ -1394,13 +1386,13 @@ bool TlsKeyExtractor::ensure_sslkeylogfile_env(const std::string& path) {
                        static_cast<DWORD>(keylog_path.size() + 1));
         RegCloseKey(hKey);
 
-        // Broadcast WM_SETTINGCHANGE so explorer/new processes pick it up
+
         DWORD_PTR result = 0;
         SendMessageTimeoutA(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
                             reinterpret_cast<LPARAM>("Environment"),
                             SMTO_ABORTIFHUNG, 5000, &result);
 
-        // Also set in our own process for consistency
+
         SetEnvironmentVariableA("SSLKEYLOGFILE", keylog_path.c_str());
         return true;
     }
@@ -1432,8 +1424,7 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
         return result;
     }
 
-    // Build tshark command with proper escaping
-    // tshark -r <pcap> -o tls.keylog_file:<keylog> -Y <filter> -T json -l
+
     std::string cmd = "\"" + tshark + "\"";
     cmd += " -r \"" + pcap_path + "\"";
     cmd += " -o \"tls.keylog_file:" + keylog_path + "\"";
@@ -1441,7 +1432,7 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
         cmd += " -Y \"" + display_filter + "\"";
     cmd += " -T json -l";
 
-    // Run tshark and capture output
+
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
@@ -1473,12 +1464,12 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
 
     CloseHandle(hWritePipe);
 
-    // Read tshark output with a size limit
+
     std::string output;
     output.reserve(1024 * 1024);
     char read_buf[8192];
     DWORD bytes_read = 0;
-    constexpr std::size_t MAX_OUTPUT = 16 * 1024 * 1024; // 16MB limit
+    constexpr std::size_t MAX_OUTPUT = 16 * 1024 * 1024;
 
     while (output.size() < MAX_OUTPUT && ReadFile(hReadPipe, read_buf, sizeof(read_buf), &bytes_read, nullptr) && bytes_read > 0) {
         output.append(read_buf, bytes_read);
@@ -1500,7 +1491,7 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
         return result;
     }
 
-    // Parse tshark JSON output for HTTP/2 frames
+
     try {
         auto json_arr = nlohmann::json::parse(output);
         result.total_packets = static_cast<std::uint32_t>(json_arr.size());
@@ -1509,13 +1500,13 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
             if (!pkt.contains("_source") || !pkt["_source"].contains("layers")) continue;
             const auto& layers = pkt["_source"]["layers"];
 
-            // Look for HTTP/2 layer
+
             if (!layers.contains("http2")) continue;
 
             result.decrypted_packets++;
             const auto& http2 = layers["http2"];
 
-            // http2 can be an object or array of objects
+
             auto process_http2_stream = [&](const nlohmann::json& stream) {
                 pcap_decrypt_result_t::http2_frame_t frame;
 
@@ -1533,7 +1524,7 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
                     frame.stream_id = get_str("http2.streamid");
                     frame.frame_type = get_str("http2.type");
 
-                    // Extract headers
+
                     if (s.contains("http2.header")) {
                         auto& hdrs = s["http2.header"];
                         auto process_hdr = [&](const nlohmann::json& h) {
@@ -1560,7 +1551,7 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
                         }
                     }
 
-                    // Extract body/data
+
                     if (s.contains("http2.data.data") && s["http2.data.data"].is_string())
                         frame.body = s["http2.data.data"].get<std::string>();
                 }
@@ -1576,7 +1567,7 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
             }
         }
     } catch (const std::exception& e) {
-        // JSON parse failed - might be partial output or no matching packets
+
         if (result.raw_output.size() < 10) {
             result.error_message = std::string("No packets matched the filter '") + display_filter +
                                    "'. TLS decryption may have failed - ensure the keylog file has valid keys for this capture.";

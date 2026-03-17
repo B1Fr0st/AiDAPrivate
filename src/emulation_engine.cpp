@@ -26,9 +26,6 @@ extern std::unique_ptr<voyager::device_t> device;
 
 namespace emulation {
 
-// ==========================================================================
-// Zydis disassembler
-// ==========================================================================
 
 static ZydisDecoder     g_decoder;
 static ZydisFormatter   g_formatter;
@@ -81,11 +78,11 @@ decoded_insn_t disassemble_one(
                                     runtime_address, ZYAN_NULL);
     result.full_text = full_buf;
 
-    // Extract operands portion (after mnemonic + space)
+
     const char* space = std::strchr(full_buf, ' ');
     result.operands_text = space ? (space + 1) : "";
 
-    // Classify
+
     switch (instruction.meta.category)
     {
     case ZYDIS_CATEGORY_CALL:
@@ -156,9 +153,6 @@ std::vector<decoded_insn_t> disassemble_idb_range(
     return disassemble_range(buf.data(), buf.size(), address, max_instructions);
 }
 
-// ==========================================================================
-// Driver-assisted snapshot
-// ==========================================================================
 
 process_snapshot_t driver_snapshot(
     std::uint32_t pid,
@@ -176,11 +170,11 @@ process_snapshot_t driver_snapshot(
         return snap;
     }
 
-    // Suspend target thread for consistent state capture
+
     std::uint32_t prev_count = 0;
     bool did_suspend = device->suspend_thread(tid, &prev_count);
 
-    // Read thread context (registers)
+
     voyager::device_t::thread_context ctx{};
     if (!device->get_thread_context(tid, ctx))
     {
@@ -196,41 +190,41 @@ process_snapshot_t driver_snapshot(
     snap.r12 = ctx.r12; snap.r13 = ctx.r13; snap.r14 = ctx.r14; snap.r15 = ctx.r15;
     snap.rip = ctx.rip;  snap.rflags = ctx.rflags;
 
-    // Determine memory regions to snapshot
+
     std::vector<voyager::detail::region_entry> regions;
     if (region_base != 0 && region_size != 0)
     {
-        // User-specified region: enumerate only what overlaps
+
         regions = device->enumerate_memory_regions(region_base, region_base + region_size, false);
     }
     else
     {
-        // Auto-select: snapshot pages around RIP and RSP, plus all committed MEM_IMAGE regions
+
         struct snapshot_range { std::uint64_t base; std::uint64_t size; };
         std::vector<snapshot_range> ranges_to_capture;
 
-        // RIP region: 2MB around current instruction pointer
+
         constexpr std::uint64_t RIP_WINDOW = 0x200000;
         std::uint64_t rip_start = (ctx.rip > RIP_WINDOW) ? (ctx.rip - RIP_WINDOW) : 0x10000;
         ranges_to_capture.push_back({rip_start, RIP_WINDOW * 2});
 
-        // RSP region: 1MB around stack
+
         constexpr std::uint64_t RSP_WINDOW = 0x100000;
         std::uint64_t rsp_start = (ctx.rsp > RSP_WINDOW) ? (ctx.rsp - RSP_WINDOW) : 0x10000;
         ranges_to_capture.push_back({rsp_start, RSP_WINDOW * 2});
 
-        // Enumerate all committed regions and select those within our windows
+
         auto all_regions = device->enumerate_memory_regions(0x10000, 0x7FFFFFFFFFFF, false);
         for (const auto& r : all_regions)
         {
-            // Always include MEM_IMAGE (0x1000000) committed (0x1000) regions
+
             if (r.state == 0x1000 && r.type == 0x1000000)
             {
                 regions.push_back(r);
                 continue;
             }
 
-            // Include committed private/mapped regions that overlap our windows
+
             if (r.state == 0x1000)
             {
                 for (const auto& range : ranges_to_capture)
@@ -247,7 +241,7 @@ process_snapshot_t driver_snapshot(
         }
     }
 
-    // Cap total snapshot size at 256 MB to prevent runaway memory usage
+
     constexpr std::uint64_t MAX_SNAPSHOT_BYTES = 256ULL * 1024 * 1024;
     std::uint64_t total_bytes = 0;
 
@@ -262,7 +256,7 @@ process_snapshot_t driver_snapshot(
         region.protect = r.protect;
         region.data.resize(static_cast<std::size_t>(r.size), 0);
 
-        // Read in 64KB chunks for reliability
+
         constexpr std::size_t CHUNK_SIZE = 65536;
         for (std::uint64_t offset = 0; offset < r.size; offset += CHUNK_SIZE)
         {
@@ -277,7 +271,7 @@ process_snapshot_t driver_snapshot(
 
     snap.total_snapshot_bytes = total_bytes;
 
-    // Resume thread
+
     if (did_suspend)
         device->resume_thread(tid);
 
@@ -285,9 +279,6 @@ process_snapshot_t driver_snapshot(
     return snap;
 }
 
-// ==========================================================================
-// Unicorn emulation engine
-// ==========================================================================
 
 struct uc_trace_ctx_t {
     uc_engine*                  uc          = nullptr;
@@ -332,14 +323,14 @@ static void hook_code_cb(uc_engine* uc, uint64_t address, uint32_t size, void* u
     ctx->current_rip = address;
     ctx->insn_count++;
 
-    // Instruction limit
+
     if (ctx->insn_count > ctx->config->max_instructions)
     {
         uc_emu_stop(uc);
         return;
     }
 
-    // Breakpoint check
+
     if (!ctx->config->breakpoint_addresses.empty() &&
         ctx->config->breakpoint_addresses.count(address))
     {
@@ -348,21 +339,21 @@ static void hook_code_cb(uc_engine* uc, uint64_t address, uint32_t size, void* u
         return;
     }
 
-    // Stop address check
+
     if (ctx->config->stop_address != 0 && address == ctx->config->stop_address)
     {
         uc_emu_stop(uc);
         return;
     }
 
-    // Record trace entry
+
     if (ctx->trace && ctx->trace->size() < ctx->config->max_trace_entries)
     {
         trace_entry_t entry;
         entry.address   = address;
         entry.insn_size = size;
 
-        // Disassemble this instruction using Zydis for accurate output
+
         if (ctx->mapped_code && address >= ctx->mapped_code_base)
         {
             std::uint64_t off = address - ctx->mapped_code_base;
@@ -385,12 +376,12 @@ static void hook_code_cb(uc_engine* uc, uint64_t address, uint32_t size, void* u
         ctx->trace->push_back(std::move(entry));
     }
 
-    // If we hit a RET, stop after recording it
+
     if (ctx->hit_ret)
         uc_emu_stop(uc);
 }
 
-static void hook_mem_write_cb(uc_engine* /*uc*/, uc_mem_type /*type*/,
+static void hook_mem_write_cb(uc_engine* , uc_mem_type ,
                               uint64_t address, int size,
                               int64_t value, void* user_data)
 {
@@ -409,9 +400,9 @@ static void hook_mem_write_cb(uc_engine* /*uc*/, uc_mem_type /*type*/,
 
 static bool hook_mem_invalid_cb(uc_engine* uc, uc_mem_type type,
                                 uint64_t address, int size,
-                                int64_t /*value*/, void* /*user_data*/)
+                                int64_t , void* )
 {
-    // Map a zero page for unmapped reads to keep emulation going
+
     if (type == UC_MEM_READ_UNMAPPED || type == UC_MEM_FETCH_UNMAPPED)
     {
         std::uint64_t aligned = address & ~0xFFFULL;
@@ -432,9 +423,9 @@ static bool hook_mem_invalid_cb(uc_engine* uc, uc_mem_type type,
     return false;
 }
 
-static void hook_mem_read_cb(uc_engine* /*uc*/, uc_mem_type /*type*/,
+static void hook_mem_read_cb(uc_engine* , uc_mem_type ,
                              uint64_t address, int size,
-                             int64_t /*value*/, void* user_data)
+                             int64_t , void* user_data)
 {
     auto* ctx = static_cast<uc_trace_ctx_t*>(user_data);
     if (!ctx->config->record_mem_reads || !ctx->mem_reads)
@@ -460,7 +451,7 @@ emulation_result_t emulate_from_snapshot(
         return result;
     }
 
-    // Initialize Unicorn for x86-64
+
     uc_engine* uc = nullptr;
     uc_err err = uc_open(UC_ARCH_X86, UC_MODE_64, &uc);
     if (err != UC_ERR_OK)
@@ -469,14 +460,13 @@ emulation_result_t emulate_from_snapshot(
         return result;
     }
 
-    // RAII cleanup
+
     struct uc_guard_t {
         uc_engine* engine;
         ~uc_guard_t() { if (engine) uc_close(engine); }
     } uc_guard{uc};
 
-    // Map all snapshot regions into Unicorn.
-    // Merge overlapping/adjacent regions to avoid mapping conflicts.
+
     struct merged_region_t {
         std::uint64_t base;
         std::uint64_t size;
@@ -485,19 +475,19 @@ emulation_result_t emulate_from_snapshot(
 
     for (const auto& region : snapshot.regions)
     {
-        // Align to 4KB page boundaries (Unicorn requirement)
+
         std::uint64_t aligned_base = region.base & ~0xFFFULL;
         std::uint64_t aligned_end  = (region.base + region.size + 0xFFF) & ~0xFFFULL;
         std::uint64_t aligned_size = aligned_end - aligned_base;
 
-        // Check if this region overlaps with an already-planned mapping
+
         bool merged = false;
         for (auto& m : to_map)
         {
             std::uint64_t m_end = m.base + m.size;
             if (aligned_base < m_end && aligned_end > m.base)
             {
-                // Merge
+
                 std::uint64_t new_base = std::min(m.base, aligned_base);
                 std::uint64_t new_end  = std::max(m_end, aligned_end);
                 m.base = new_base;
@@ -510,7 +500,7 @@ emulation_result_t emulate_from_snapshot(
             to_map.push_back({aligned_base, aligned_size});
     }
 
-    // Map regions
+
     for (const auto& m : to_map)
     {
         err = uc_mem_map(uc, m.base, static_cast<size_t>(m.size), UC_PROT_ALL);
@@ -522,7 +512,7 @@ emulation_result_t emulate_from_snapshot(
         }
     }
 
-    // Write snapshot data into Unicorn memory
+
     const std::uint8_t* code_at_rip = nullptr;
     std::size_t          code_at_rip_size = 0;
     std::uint64_t        code_at_rip_base = 0;
@@ -534,7 +524,7 @@ emulation_result_t emulate_from_snapshot(
             uc_mem_write(uc, region.base, region.data.data(), region.data.size());
         }
 
-        // Track which region contains the start address for disassembly
+
         std::uint64_t start = result.start_address;
         if (start >= region.base && start < region.base + region.size)
         {
@@ -544,7 +534,7 @@ emulation_result_t emulate_from_snapshot(
         }
     }
 
-    // Set registers
+
     uc_reg_write(uc, UC_X86_REG_RAX, &snapshot.rax);
     uc_reg_write(uc, UC_X86_REG_RBX, &snapshot.rbx);
     uc_reg_write(uc, UC_X86_REG_RCX, &snapshot.rcx);
@@ -563,10 +553,10 @@ emulation_result_t emulate_from_snapshot(
     uc_reg_write(uc, UC_X86_REG_R15, &snapshot.r15);
     uc_reg_write(uc, UC_X86_REG_EFLAGS, &snapshot.rflags);
 
-    // Override RIP if config specifies a different start
+
     std::uint64_t start_rip = result.start_address;
 
-    // Prepare trace context
+
     uc_trace_ctx_t trace_ctx;
     trace_ctx.uc               = uc;
     trace_ctx.config           = &config;
@@ -583,7 +573,7 @@ emulation_result_t emulate_from_snapshot(
     trace_ctx.mem_writes = &write_log;
     trace_ctx.mem_reads  = &read_log;
 
-    // Record initial register state for delta comparison
+
     trace_entry_t initial_regs;
     initial_regs.rax = snapshot.rax; initial_regs.rbx = snapshot.rbx;
     initial_regs.rcx = snapshot.rcx; initial_regs.rdx = snapshot.rdx;
@@ -595,7 +585,7 @@ emulation_result_t emulate_from_snapshot(
     initial_regs.r14 = snapshot.r14; initial_regs.r15 = snapshot.r15;
     initial_regs.rip = snapshot.rip; initial_regs.rflags = snapshot.rflags;
 
-    // Install hooks
+
     uc_hook h_code, h_mem_write, h_mem_read, h_mem_invalid;
 
     uc_hook_add(uc, &h_code, UC_HOOK_CODE,
@@ -613,16 +603,16 @@ emulation_result_t emulate_from_snapshot(
                     reinterpret_cast<void*>(&hook_mem_read_cb), &trace_ctx, 1, 0);
     }
 
-    // Handle unmapped memory gracefully (map zero pages)
+
     uc_hook_add(uc, &h_mem_invalid,
                 UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_UNMAPPED,
                 reinterpret_cast<void*>(&hook_mem_invalid_cb), &trace_ctx, 1, 0);
 
-    // Execute
+
     err = uc_emu_start(uc, start_rip, config.stop_address ? config.stop_address : 0xFFFFFFFFFFFFFFFFULL,
                        config.timeout_us, config.max_instructions);
 
-    // Read final RIP
+
     std::uint64_t final_rip = 0;
     uc_reg_read(uc, UC_X86_REG_RIP, &final_rip);
 
@@ -632,7 +622,7 @@ emulation_result_t emulate_from_snapshot(
     result.mem_writes         = std::move(write_log);
     result.mem_reads          = std::move(read_log);
 
-    // Compute register deltas
+
     trace_entry_t final_regs;
     uc_read_regs(uc, final_regs);
 
@@ -659,7 +649,7 @@ emulation_result_t emulate_from_snapshot(
     add_delta("R15", initial_regs.r15, final_regs.r15);
     add_delta("RFLAGS", initial_regs.rflags, final_regs.rflags);
 
-    // Analyze effective operations if requested
+
     if (config.analyze_effective_ops)
     {
         auto analysis = analyze_vm_trace(result);
@@ -695,9 +685,6 @@ emulation_result_t driver_snapshot_and_emulate(
     return emulate_from_snapshot(snapshot, config);
 }
 
-// ==========================================================================
-// VM trace analysis — separate junk from effective operations
-// ==========================================================================
 
 vm_analysis_result_t analyze_vm_trace(const emulation_result_t& result)
 {
@@ -710,49 +697,37 @@ vm_analysis_result_t analyze_vm_trace(const emulation_result_t& result)
         return analysis;
     }
 
-    // Track which registers are "live" (actually used later) vs "dead writes"
-    // Strategy: look at net register deltas and net memory writes to determine
-    // which instructions produced observable effects.
 
-    // Build a set of registers that actually changed globally
     std::unordered_set<std::string> globally_changed_regs;
     for (const auto& d : result.reg_deltas)
         globally_changed_regs.insert(d.name);
 
-    // Build set of memory addresses that received net writes
+
     std::unordered_set<std::uint64_t> net_write_addresses;
     for (const auto& w : result.mem_writes)
         net_write_addresses.insert(w.address);
 
-    // Classify each trace entry as effective or junk based on Zydis analysis
+
     ensure_zydis_init();
 
     std::uint32_t junk_count = 0;
     std::uint32_t effective_count = 0;
 
-    // We consider an instruction "junk" if:
-    //   - It's a NOP
-    //   - It's a push/pop pair that cancels out (detected via RSP unchanged)
-    //   - It writes to a register that is immediately overwritten later
-    //     without being read
-    //   - It's a mov reg, reg (same register)
 
-    // For simplicity, we use a heuristic: instructions whose disassembly
-    // contains patterns of known junk patterns are marked as junk
     auto is_junk_pattern = [](const std::string& disasm) -> bool {
         if (disasm.empty()) return false;
 
-        // NOP variants
+
         if (disasm.find("nop") == 0) return true;
 
-        // xchg eax, eax (encoded as 0x90)
+
         if (disasm == "xchg eax, eax") return true;
 
-        // lea reg, [reg+0]  (no-op LEA)
+
         if (disasm.find("lea") == 0 && disasm.find("+0x0]") != std::string::npos)
             return true;
 
-        // mov reg, reg (same source and dest)
+
         if (disasm.find("mov") == 0)
         {
             auto comma = disasm.find(',');
@@ -760,7 +735,7 @@ vm_analysis_result_t analyze_vm_trace(const emulation_result_t& result)
             {
                 std::string dest = disasm.substr(4, comma - 4);
                 std::string src  = disasm.substr(comma + 2);
-                // Trim whitespace
+
                 while (!dest.empty() && dest.back() == ' ') dest.pop_back();
                 while (!src.empty() && src.front() == ' ') src.erase(src.begin());
                 if (dest == src) return true;
@@ -780,7 +755,7 @@ vm_analysis_result_t analyze_vm_trace(const emulation_result_t& result)
         {
             ++effective_count;
 
-            // Only record first N effective ops for summary
+
             if (analysis.effective_ops.size() < 256)
             {
                 std::ostringstream ss;
@@ -795,7 +770,7 @@ vm_analysis_result_t analyze_vm_trace(const emulation_result_t& result)
     analysis.net_reg_changes        = result.reg_deltas;
     analysis.net_mem_writes         = result.mem_writes;
 
-    // Build summary
+
     std::ostringstream summary;
     summary << "Traced " << analysis.total_instructions << " instructions: "
             << analysis.effective_instructions << " effective, "
@@ -828,6 +803,6 @@ vm_analysis_result_t analyze_vm_trace(const emulation_result_t& result)
     return analysis;
 }
 
-}  // namespace emulation
+}
 
-#endif  // __NT__
+#endif

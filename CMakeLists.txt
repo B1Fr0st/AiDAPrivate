@@ -97,6 +97,43 @@ if(WIN32)
         )
     endif()
 
+    option(BUILD_CODEINE_ANALYZER "Build standalone Codeine analyzer tool" ON)
+
+    if(BUILD_CODEINE_ANALYZER)
+        add_executable(CodeineAnalyzer
+            tools/codeine_analyzer/main.cpp
+            driver/comm.cpp
+        )
+
+        target_include_directories(CodeineAnalyzer PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/driver"
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+
+        target_compile_definitions(CodeineAnalyzer PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+        )
+
+        target_compile_options(CodeineAnalyzer PRIVATE
+            /W3
+            /EHsc
+            /Zc:__cplusplus
+            /permissive-
+            /Zp8
+            /MD
+        )
+
+        target_link_libraries(CodeineAnalyzer PRIVATE
+            ntdll
+        )
+
+        set_target_properties(CodeineAnalyzer PROPERTIES
+            OUTPUT_NAME "CodeineAnalyzer"
+        )
+    endif()
+
     option(BUILD_NET_SECURITY_TEST "Build offline net_security verification test" ON)
 
     if(BUILD_NET_SECURITY_TEST)

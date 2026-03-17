@@ -12,9 +12,7 @@
 
 namespace emulation {
 
-// --------------------------------------------------------------------------
-// Zydis disassembly result for a single instruction
-// --------------------------------------------------------------------------
+
 struct decoded_insn_t {
     std::uint64_t address     = 0;
     std::uint32_t length      = 0;
@@ -29,15 +27,13 @@ struct decoded_insn_t {
     bool          is_privileged = false;
 };
 
-// --------------------------------------------------------------------------
-// A single traced instruction recorded during Unicorn emulation
-// --------------------------------------------------------------------------
+
 struct trace_entry_t {
     std::uint64_t address     = 0;
     std::uint32_t insn_size   = 0;
     std::string   disasm;
 
-    // Register snapshot AFTER this instruction
+
     std::uint64_t rax = 0, rbx = 0, rcx = 0, rdx = 0;
     std::uint64_t rsi = 0, rdi = 0, rbp = 0, rsp = 0;
     std::uint64_t r8  = 0, r9  = 0, r10 = 0, r11 = 0;
@@ -45,9 +41,7 @@ struct trace_entry_t {
     std::uint64_t rip = 0, rflags = 0;
 };
 
-// --------------------------------------------------------------------------
-// A memory write recorded during Unicorn emulation
-// --------------------------------------------------------------------------
+
 struct mem_write_t {
     std::uint64_t address = 0;
     std::uint64_t size    = 0;
@@ -55,27 +49,21 @@ struct mem_write_t {
     std::uint64_t insn_address = 0;
 };
 
-// --------------------------------------------------------------------------
-// A memory read recorded during Unicorn emulation
-// --------------------------------------------------------------------------
+
 struct mem_read_t {
     std::uint64_t address = 0;
     std::uint64_t size    = 0;
     std::uint64_t insn_address = 0;
 };
 
-// --------------------------------------------------------------------------
-// Summarized register delta (which regs actually changed)
-// --------------------------------------------------------------------------
+
 struct reg_delta_t {
     std::string   name;
     std::uint64_t before = 0;
     std::uint64_t after  = 0;
 };
 
-// --------------------------------------------------------------------------
-// Emulation result from a trace_execution_unicorn call
-// --------------------------------------------------------------------------
+
 struct emulation_result_t {
     bool          success = false;
     std::string   error;
@@ -89,14 +77,12 @@ struct emulation_result_t {
     std::vector<mem_read_t>    mem_reads;
     std::vector<reg_delta_t>   reg_deltas;
 
-    // Effective operations summary (junk removed)
+
     std::vector<std::string>   effective_ops;
     std::uint32_t              junk_instruction_count = 0;
 };
 
-// --------------------------------------------------------------------------
-// Memory snapshot region for Unicorn mapping
-// --------------------------------------------------------------------------
+
 struct memory_snapshot_region_t {
     std::uint64_t             base = 0;
     std::uint64_t             size = 0;
@@ -104,9 +90,7 @@ struct memory_snapshot_region_t {
     std::vector<std::uint8_t> data;
 };
 
-// --------------------------------------------------------------------------
-// Complete process snapshot (registers + memory) for offline emulation
-// --------------------------------------------------------------------------
+
 struct process_snapshot_t {
     bool success = false;
     std::string error;
@@ -114,7 +98,7 @@ struct process_snapshot_t {
     std::uint32_t pid = 0;
     std::uint32_t tid = 0;
 
-    // x64 register state
+
     std::uint64_t rax = 0, rbx = 0, rcx = 0, rdx = 0;
     std::uint64_t rsi = 0, rdi = 0, rbp = 0, rsp = 0;
     std::uint64_t r8  = 0, r9  = 0, r10 = 0, r11 = 0;
@@ -125,72 +109,52 @@ struct process_snapshot_t {
     std::uint64_t total_snapshot_bytes = 0;
 };
 
-// --------------------------------------------------------------------------
-// Emulation configuration
-// --------------------------------------------------------------------------
+
 struct emulation_config_t {
     std::uint64_t start_address    = 0;
-    std::uint64_t stop_address     = 0;       // 0 = run until RET/max
+    std::uint64_t stop_address     = 0;
     std::uint32_t max_instructions = 50000;
-    std::uint32_t max_trace_entries = 10000;   // capped trace log size
+    std::uint32_t max_trace_entries = 10000;
     bool          record_mem_reads  = true;
     bool          record_mem_writes = true;
     bool          record_registers  = true;
     bool          analyze_effective_ops = true;
-    std::uint64_t timeout_us       = 10000000; // 10 sec default
+    std::uint64_t timeout_us       = 10000000;
     std::set<std::uint64_t> breakpoint_addresses;
 };
 
-// --------------------------------------------------------------------------
-// Zydis-powered disassembler interface
-// --------------------------------------------------------------------------
 
-// Disassemble a single instruction at the given offset within a byte buffer.
-// runtime_address is the virtual address for display purposes.
 decoded_insn_t disassemble_one(
     const std::uint8_t* data,
     std::size_t         data_size,
     std::uint64_t       runtime_address);
 
-// Disassemble a linear range of instructions.
+
 std::vector<decoded_insn_t> disassemble_range(
     const std::uint8_t* data,
     std::size_t         data_size,
     std::uint64_t       runtime_address,
     std::uint32_t       max_instructions = 1000);
 
-// Disassemble bytes already in the IDA database at the given address.
+
 std::vector<decoded_insn_t> disassemble_idb_range(
     std::uint64_t       address,
     std::uint32_t       size,
     std::uint32_t       max_instructions = 1000);
 
-// --------------------------------------------------------------------------
-// Driver-assisted snapshot capture
-// --------------------------------------------------------------------------
 
-// Capture a process snapshot via the kernel driver:
-// suspends the target thread, reads registers and committed memory pages,
-// then resumes the thread. All memory reads are done via physical memory
-// through the driver, completely invisible to usermode anti-debug.
 process_snapshot_t driver_snapshot(
     std::uint32_t pid,
     std::uint32_t tid,
     std::uint64_t region_base = 0,
     std::uint64_t region_size = 0);
 
-// --------------------------------------------------------------------------
-// Unicorn offline emulation
-// --------------------------------------------------------------------------
 
-// Load a snapshot into Unicorn, execute from start_address with the given
-// config, and produce a full trace with register deltas and memory ops.
 emulation_result_t emulate_from_snapshot(
     const process_snapshot_t& snapshot,
     const emulation_config_t& config);
 
-// Convenience: snapshot + emulate in one call.
-// Captures state from the driver, loads into Unicorn, traces execution.
+
 emulation_result_t driver_snapshot_and_emulate(
     std::uint32_t pid,
     std::uint32_t tid,
@@ -198,12 +162,7 @@ emulation_result_t driver_snapshot_and_emulate(
     std::uint64_t snapshot_base = 0,
     std::uint64_t snapshot_size = 0);
 
-// --------------------------------------------------------------------------
-// Higher-level VM analysis helpers
-// --------------------------------------------------------------------------
 
-// Analyze a Unicorn trace to identify effective operations vs junk.
-// Returns a simplified list of "real" state-changing operations.
 struct vm_analysis_result_t {
     std::uint32_t total_instructions = 0;
     std::uint32_t junk_instructions  = 0;
@@ -216,6 +175,6 @@ struct vm_analysis_result_t {
 
 vm_analysis_result_t analyze_vm_trace(const emulation_result_t& result);
 
-}  // namespace emulation
+}
 
-#endif  // __NT__
+#endif

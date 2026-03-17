@@ -258,6 +258,7 @@ namespace analysis_tools
     tool_result_t detect_direct_syscalls(const nlohmann::json& params);
     tool_result_t resolve_api_hashes(const nlohmann::json& params);
     tool_result_t reconstruct_vtable(const nlohmann::json& params);
+    tool_result_t classify_memory_pages(const nlohmann::json& params);
     void register_tools();
 }
 
@@ -315,6 +316,10 @@ namespace driver_tools
     tool_result_t driver_virtual_to_physical(const nlohmann::json& params);
     tool_result_t driver_enum_kernel_callbacks(const nlohmann::json& params);
     tool_result_t driver_detect_integrity_checks(const nlohmann::json& params);
+    tool_result_t driver_detect_ssdt_hooks(const nlohmann::json& params);
+    tool_result_t driver_enum_minifilters(const nlohmann::json& params);
+    tool_result_t driver_detect_etw_monitors(const nlohmann::json& params);
+    tool_result_t driver_detect_hidden_modules(const nlohmann::json& params);
 
     tool_result_t driver_defer_action(const nlohmann::json& params);
     tool_result_t driver_list_deferred_actions(const nlohmann::json& params);
