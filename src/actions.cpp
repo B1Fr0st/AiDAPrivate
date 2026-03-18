@@ -2,6 +2,7 @@
 #include <regex>
 #include "chat_widget.hpp"
 #include "anti_re.hpp"
+#include "ida_utils.hpp"
 
 namespace
 {
@@ -358,12 +359,16 @@ void handle_auto_comment(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
                     if (init_hexrays_plugin())
                     {
                         func_t* pfn_for_decomp = get_func(func_ea);
-                        if (pfn_for_decomp != nullptr)
+                        if (pfn_for_decomp != nullptr && ida_utils::is_safely_decompilable(pfn_for_decomp))
                         {
                             try { cfunc = decompile(pfn_for_decomp); }
                             catch (const vd_failure_t&)
                             {
                                 msg(OBFSTR_C("AiDA: Decompilation failed for 0x%a, comments will only be added to disassembly.\n"), func_ea);
+                            }
+                            catch (...)
+                            {
+                                msg(OBFSTR_C("AiDA: Decompilation crashed for 0x%a, comments will only be added to disassembly.\n"), func_ea);
                             }
                         }
                     }
@@ -619,11 +624,12 @@ void handle_save_database_context(action_activation_ctx_t*, aida_plugin_t*)
         qfprintf(fp, OBFSTR_C("==================================================\n\n"));
 
         qfprintf(fp, OBFSTR_C("--- Decompiled C/C++ Code ---\n"));
-        if (hexrays_available)
+        if (hexrays_available && ida_utils::is_safely_decompilable(pfn))
         {
             try
             {
-                cfuncptr_t cfunc = decompile(pfn);
+                hexrays_failure_t hf;
+                cfuncptr_t cfunc = decompile(pfn, &hf, DECOMP_NO_WAIT);
                 if (cfunc != nullptr)
                 {
                     qstring code_qstr;
@@ -641,10 +647,18 @@ void handle_save_database_context(action_activation_ctx_t*, aida_plugin_t*)
             {
                 qfprintf(fp, OBFSTR_C("// Decompilation failed.\n\n"));
             }
+            catch (...)
+            {
+                qfprintf(fp, OBFSTR_C("// Decompilation crashed (access violation) – skipped.\n\n"));
+            }
+        }
+        else if (!hexrays_available)
+        {
+            qfprintf(fp, OBFSTR_C("// Hex-Rays decompiler not available.\n\n"));
         }
         else
         {
-            qfprintf(fp, OBFSTR_C("// Hex-Rays decompiler not available.\n\n"));
+            qfprintf(fp, OBFSTR_C("// Non-decompilable function (thunk/extern/tail) – skipped.\n\n"));
         }
 
         qfprintf(fp, OBFSTR_C("--- Disassembly ---\n"));

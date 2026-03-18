@@ -45,4 +45,6 @@ namespace ida_utils
 
     void apply_struct_from_cpp_ex(const std::string& cpp_code, ea_t ea, const std::string& target_param = "");
     bool update_existing_struct(const std::string& struct_name, const std::string& new_definition);
+
+    bool is_safely_decompilable(func_t* pfn);
 }

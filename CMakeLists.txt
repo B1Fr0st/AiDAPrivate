@@ -367,7 +367,7 @@ if(WIN32)
         $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
         $<$<COMPILE_LANGUAGE:CXX>:/permissive->
         $<$<COMPILE_LANGUAGE:CXX>:/Zp8>
-        $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+        $<$<COMPILE_LANGUAGE:CXX>:/EHa>
         $<$<COMPILE_LANGUAGE:CXX>:/MD>
         $<$<COMPILE_LANGUAGE:CXX>:/GR>
         $<$<COMPILE_LANGUAGE:CXX>:/GS>

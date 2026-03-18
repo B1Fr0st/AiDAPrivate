@@ -2714,6 +2714,9 @@ std::string get_pseudocode(ea_t ea)
     if (!pfn)
         return "// No function at address";
 
+    if (!ida_utils::is_safely_decompilable(pfn))
+        return "// Non-decompilable function (thunk/extern/tail)";
+
     try
     {
         cfuncptr_t cfunc = decompile(pfn);
@@ -2728,6 +2731,10 @@ std::string get_pseudocode(ea_t ea)
     catch (const vd_failure_t& e)
     {
         return std::string("// Decompilation error: ") + e.desc().c_str();
+    }
+    catch (...)
+    {
+        return "// Decompilation crashed (access violation) - skipped";
     }
 }
 
@@ -2913,6 +2920,12 @@ tool_result_t decompile_function(const json& params)
     {
         result["code"] = "// Hex-Rays decompiler not available";
         return tool_result_t::ok(OBFSTR("Decompilation complete (no Hex-Rays)"), result);
+    }
+
+    if (!ida_utils::is_safely_decompilable(pfn))
+    {
+        result["code"] = "// Non-decompilable function (thunk/extern/tail)";
+        return tool_result_t::ok(OBFSTR("Function is not decompilable"), result);
     }
 
     try
@@ -4202,6 +4215,9 @@ tool_result_t rename_variable(const json& params)
     func_t* pfn = get_func(*ea_opt);
     if (!pfn)
         return tool_result_t::error(OBFSTR("No function at address"));
+
+    if (!ida_utils::is_safely_decompilable(pfn))
+        return tool_result_t::error(OBFSTR("Function is not decompilable (thunk/extern/tail)"));
 
     try
     {
@@ -7502,19 +7518,33 @@ tool_result_t set_decompiler_comment(const json& params)
     if (!fn)
         return tool_result_t::error(OBFSTR("No function at ") + helpers::format_address(*ea_opt));
 
-    hexrays_failure_t hf;
-    cfuncptr_t cfunc = decompile(fn, &hf);
-    if (!cfunc)
-        return tool_result_t::error(OBFSTR("Decompilation failed: ") + std::string(hf.desc().c_str()));
+    if (!ida_utils::is_safely_decompilable(fn))
+        return tool_result_t::error(OBFSTR("Function is not decompilable (thunk/extern/tail)"));
 
-    treeloc_t loc;
-    loc.ea = *ea_opt;
-    loc.itp = ITP_SEMI;
+    try
+    {
+        hexrays_failure_t hf;
+        cfuncptr_t cfunc = decompile(fn, &hf);
+        if (!cfunc)
+            return tool_result_t::error(OBFSTR("Decompilation failed: ") + std::string(hf.desc().c_str()));
 
-    cfunc->set_user_cmt(loc, comment.c_str());
-    cfunc->save_user_cmts();
+        treeloc_t loc;
+        loc.ea = *ea_opt;
+        loc.itp = ITP_SEMI;
 
-    return tool_result_t::ok(OBFSTR("Decompiler comment set at ") + helpers::format_address(*ea_opt));
+        cfunc->set_user_cmt(loc, comment.c_str());
+        cfunc->save_user_cmts();
+
+        return tool_result_t::ok(OBFSTR("Decompiler comment set at ") + helpers::format_address(*ea_opt));
+    }
+    catch (const vd_failure_t& e)
+    {
+        return tool_result_t::error(OBFSTR("Decompilation failed: ") + std::string(e.desc().c_str()));
+    }
+    catch (...)
+    {
+        return tool_result_t::error(OBFSTR("Decompilation crashed for ") + helpers::format_address(*ea_opt));
+    }
 }
 
 tool_result_t batch_rename(const json& params)

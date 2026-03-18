@@ -3,6 +3,7 @@
 #include "aida_pro.hpp"
 #include "graphrag.hpp"
 #include "settings.hpp"
+#include "ida_utils.hpp"
 
 #include <sstream>
 #include <regex>
@@ -1624,27 +1625,33 @@ StructureExtractor::StructureExtractor(GraphStore& store) : m_store(store) {}
 
 std::string StructureExtractor::get_raw_code(ea_t func_ea)
 {
-
     func_t* pfn = get_func(func_ea);
-    if (pfn != nullptr)
+    if (pfn != nullptr
+        && ida_utils::is_safely_decompilable(pfn)
+        && !((pfn->flags & FUNC_LIB) && pfn->size() == 0)
+        && init_hexrays_plugin())
     {
-        hexrays_failure_t hf;
-        cfuncptr_t cfunc = decompile(pfn, &hf, DECOMP_WARNINGS);
-        if (cfunc != nullptr)
+        try
         {
-            const strvec_t& sv = cfunc->get_pseudocode();
-            std::string code;
-            for (size_t i = 0; i < sv.size(); ++i)
+            hexrays_failure_t hf;
+            cfuncptr_t cfunc = decompile(pfn, &hf, DECOMP_NO_WAIT | DECOMP_WARNINGS);
+            if (cfunc != nullptr)
             {
-                qstring buf;
-                tag_remove(&buf, sv[i].line);
-                code += buf.c_str();
-                code += "\n";
+                const strvec_t& sv = cfunc->get_pseudocode();
+                std::string code;
+                for (size_t i = 0; i < sv.size(); ++i)
+                {
+                    qstring buf;
+                    tag_remove(&buf, sv[i].line);
+                    code += buf.c_str();
+                    code += "\n";
+                }
+                return code;
             }
-            return code;
         }
+        catch (const vd_failure_t&) { /* decompiler raised a controlled error */ }
+        catch (...) { /* SEH / unknown crash inside decompiler – skip this function */ }
     }
-
 
     func_t* func = pfn ? pfn : get_func(func_ea);
     if (!func) return {};

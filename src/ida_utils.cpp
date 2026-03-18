@@ -386,7 +386,7 @@ namespace ida_utils
             try
             {
                 func_t* pfn_for_decomp = get_func(ea);
-                if (pfn_for_decomp != nullptr)
+                if (pfn_for_decomp != nullptr && is_safely_decompilable(pfn_for_decomp))
                 {
                     cfuncptr_t cfunc = decompile(pfn_for_decomp);
                     if (cfunc != nullptr)
@@ -639,6 +639,9 @@ namespace ida_utils
         if (pfn == nullptr)
             return "// Struct usage analysis requires a valid function context.";
 
+        if (!is_safely_decompilable(pfn))
+            return "// Struct usage analysis requires a decompilable function.";
+
         cfuncptr_t cfunc(nullptr);
         try
         {
@@ -646,6 +649,10 @@ namespace ida_utils
             cfunc = decompile(mbr);
         }
         catch (const vd_failure_t&)
+        {
+            return "// Struct usage analysis requires a decompilable function.";
+        }
+        catch (...)
         {
             return "// Struct usage analysis requires a decompilable function.";
         }
@@ -771,7 +778,7 @@ namespace ida_utils
         std::string language;
         lvars_t* lvars = nullptr;
 
-        if (init_hexrays_plugin())
+        if (init_hexrays_plugin() && is_safely_decompilable(pfn))
         {
             try
             {
@@ -1104,7 +1111,7 @@ namespace ida_utils
             return;
         }
 
-        if (!init_hexrays_plugin())
+        if (!init_hexrays_plugin() || !is_safely_decompilable(pfn))
         {
             msg(OBFSTR_C("AiDA: Hex-Rays decompiler not available. Cannot automatically apply type to function arguments.\n"));
             return;
@@ -1450,7 +1457,19 @@ namespace ida_utils
             return "";
         }
 
-        cfuncptr_t cfunc = decompile(pfn);
+        if (!is_safely_decompilable(pfn))
+        {
+            warning(OBFSTR_C("AiDA: Function at 0x%llx is not decompilable (thunk/extern/tail)."), func_ea);
+            return "";
+        }
+
+        cfuncptr_t cfunc(nullptr);
+        try
+        {
+            cfunc = decompile(pfn);
+        }
+        catch (const vd_failure_t&) { cfunc = cfuncptr_t(nullptr); }
+        catch (...) { cfunc = cfuncptr_t(nullptr); }
         if (cfunc == nullptr)
         {
             warning(OBFSTR_C("AiDA: Decompilation failed for function at 0x%llx."), func_ea);
@@ -1993,6 +2012,9 @@ namespace ida_utils
         if (pfn == nullptr)
             return "// No function context.";
 
+        if (!is_safely_decompilable(pfn))
+            return "// Function is not decompilable (thunk/extern/tail).";
+
         qstring result;
         std::set<qstring> found_types;
 
@@ -2401,6 +2423,42 @@ namespace ida_utils
 
         msg(OBFSTR_C("AiDA: Type '%s' updated successfully.\n"), struct_name.c_str());
         invalidate_rag_cache();
+        return true;
+    }
+
+    bool is_safely_decompilable(func_t* pfn)
+    {
+        if (pfn == nullptr)
+            return false;
+
+        // Skip tail chunks — FUNC_TAIL (0x8000) marks a function tail, not real entry
+        // SDK funcs.hpp: "#define FUNC_TAIL 0x00008000 ///< This is a function tail."
+        if (pfn->flags & FUNC_TAIL)
+            return false;
+
+        // Skip thunks — FUNC_THUNK (0x80) marks jump-through stubs, decompiling these
+        // can produce NULL cfunc internals in hexx64
+        // SDK funcs.hpp: "#define FUNC_THUNK 0x00000080 ///< Thunk (jump) function"
+        if (pfn->flags & FUNC_THUNK)
+            return false;
+
+        // Skip outlined code — FUNC_OUTLINE (0x20000) marks compiler-outlined fragments
+        // SDK funcs.hpp: "#define FUNC_OUTLINE 0x00020000 ///< Outlined code, not a real function."
+        if (pfn->flags & FUNC_OUTLINE)
+            return false;
+
+        // Skip functions with zero size — no code bytes to decompile
+        if (pfn->size() == 0)
+            return false;
+
+        // Skip functions in extern segments — the decompiler returns MERR_EXTERN for these
+        // but some edge cases can crash before the error code is set.
+        // SDK segment.hpp: "#define SEG_XTRN 1 ///< * segment with 'extern' definitions."
+        // SDK hexrays.hpp: "MERR_EXTERN = -28, ///< special segments cannot be decompiled"
+        segment_t* seg = getseg(pfn->start_ea);
+        if (seg != nullptr && seg->type == SEG_XTRN)
+            return false;
+
         return true;
     }
 }
