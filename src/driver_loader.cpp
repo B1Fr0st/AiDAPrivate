@@ -271,13 +271,117 @@ static BOOL SecureDeleteFile(PCWSTR filePath)
     return DeleteFileW(filePath);
 }
 
-static std::wstring GetTempFilePath(PCWSTR extension)
+static std::wstring s_RandomExtractDir;
+
+static bool CreateRandomExtractDirectory()
 {
-    WCHAR tempPath[MAX_PATH + 1];
-    DWORD len = GetTempPathW(MAX_PATH, tempPath);
-    if (len == 0 || len > MAX_PATH) return L"";
-    std::wstring name = GenerateRandomName(12);
-    return std::wstring(tempPath) + name + extension;
+    WCHAR programData[MAX_PATH + 1] = {};
+    DWORD pdLen = GetEnvironmentVariableW(L"ProgramData", programData, MAX_PATH);
+    if (pdLen == 0 || pdLen > MAX_PATH) {
+        WCHAR sysDrive[8] = {};
+        DWORD sdLen = GetEnvironmentVariableW(L"SystemDrive", sysDrive, _countof(sysDrive));
+        if (sdLen == 0 || sdLen >= _countof(sysDrive)) {
+            sysDrive[0] = L'C'; sysDrive[1] = L':'; sysDrive[2] = L'\0';
+        }
+        wcscpy_s(programData, sysDrive);
+        wcscat_s(programData, L"\\ProgramData");
+    }
+
+    std::wstring dirPath = programData;
+    dirPath += L"\\";
+    dirPath += GenerateRandomName(8);
+    dirPath += L"-";
+    dirPath += GenerateRandomName(4);
+    dirPath += L"-";
+    dirPath += GenerateRandomName(4);
+    dirPath += L"-";
+    dirPath += GenerateRandomName(12);
+
+    if (!CreateDirectoryW(dirPath.c_str(), nullptr)) {
+        if (GetLastError() != ERROR_ALREADY_EXISTS)
+            return false;
+    }
+
+    SetFileAttributesW(dirPath.c_str(),
+        FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
+
+    s_RandomExtractDir = dirPath;
+    return true;
+}
+
+static std::wstring GetRandomFilePath(PCWSTR extension)
+{
+    if (s_RandomExtractDir.empty()) return L"";
+    std::wstring name = GenerateRandomName(16);
+    return s_RandomExtractDir + L"\\" + name + extension;
+}
+
+static void CleanupRandomExtractDirectory()
+{
+    if (s_RandomExtractDir.empty()) return;
+    SetFileAttributesW(s_RandomExtractDir.c_str(), FILE_ATTRIBUTE_NORMAL);
+    RemoveDirectoryW(s_RandomExtractDir.c_str());
+    s_RandomExtractDir.clear();
+}
+
+static BOOL ForceDeleteDriverFile(PCWSTR filePath)
+{
+    if (!filePath) return FALSE;
+    if (GetFileAttributesW(filePath) == INVALID_FILE_ATTRIBUTES) return TRUE;
+
+    bool contentZeroed = false;
+    {
+        DWORD shareCombinations[] = {
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SHARE_DELETE,
+            0
+        };
+        for (int s = 0; s < _countof(shareCombinations) && !contentZeroed; s++) {
+            HANDLE hFile = CreateFileW(filePath, GENERIC_WRITE,
+                shareCombinations[s], nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                LARGE_INTEGER fileSize;
+                if (GetFileSizeEx(hFile, &fileSize) && fileSize.QuadPart > 0) {
+                    BYTE zeroBuffer[4096];
+                    SecureZeroMemory(zeroBuffer, sizeof(zeroBuffer));
+                    SetFilePointer(hFile, 0, nullptr, FILE_BEGIN);
+                    LONGLONG remaining = fileSize.QuadPart;
+                    while (remaining > 0) {
+                        DWORD toWrite = static_cast<DWORD>((std::min)(static_cast<LONGLONG>(4096), remaining));
+                        DWORD written = 0;
+                        if (!WriteFile(hFile, zeroBuffer, toWrite, &written, nullptr) || written == 0) break;
+                        remaining -= written;
+                    }
+                    if (remaining <= 0) contentZeroed = true;
+                    SetFilePointer(hFile, 0, nullptr, FILE_BEGIN);
+                    SetEndOfFile(hFile);
+                    FlushFileBuffers(hFile);
+                }
+                CloseHandle(hFile);
+            }
+        }
+    }
+
+    for (int attempt = 0; attempt < 15; attempt++) {
+        SetFileAttributesW(filePath, FILE_ATTRIBUTE_NORMAL);
+        if (DeleteFileW(filePath)) return TRUE;
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return TRUE;
+        Sleep((attempt < 3) ? (50U << attempt) : 200U);
+    }
+
+    {
+        HANDLE hFile = CreateFileW(filePath, DELETE | SYNCHRONIZE,
+            FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+            OPEN_EXISTING, FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            CloseHandle(hFile);
+            if (GetFileAttributesW(filePath) == INVALID_FILE_ATTRIBUTES) return TRUE;
+        }
+    }
+
+    MoveFileExW(filePath, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+    return FALSE;
 }
 
 
@@ -385,7 +489,7 @@ static const wchar_t* s_AntiCheatServices[] = {
     L"mrac", L"EQU8_HELPER"
 };
 
-static BOOL CheckAntiCheatRunning()
+static std::wstring DetectRunningAntiCheat()
 {
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot != INVALID_HANDLE_VALUE) {
@@ -395,9 +499,9 @@ static BOOL CheckAntiCheatRunning()
             do {
                 for (int i = 0; i < _countof(s_AntiCheatProcesses); i++) {
                     if (_wcsicmp(pe32.szExeFile, s_AntiCheatProcesses[i]) == 0) {
-                        dl_msg("AiDA Driver: Anti-cheat process detected: %ws\n", pe32.szExeFile);
+                        std::wstring detected = pe32.szExeFile;
                         CloseHandle(hSnapshot);
-                        return TRUE;
+                        return detected;
                     }
                 }
             } while (Process32NextW(hSnapshot, &pe32));
@@ -415,8 +519,7 @@ static BOOL CheckAntiCheatRunning()
             if (GetDeviceDriverBaseNameW(driverAddrs[i], driverName, 256)) {
                 for (int j = 0; j < _countof(s_AntiCheatDrivers); j++) {
                     if (_wcsicmp(driverName, s_AntiCheatDrivers[j]) == 0) {
-                        dl_msg("AiDA Driver: Anti-cheat driver loaded: %ws\n", driverName);
-                        return TRUE;
+                        return driverName;
                     }
                 }
             }
@@ -434,10 +537,10 @@ static BOOL CheckAntiCheatRunning()
                     (LPBYTE)&ssp, sizeof(ssp), &needed)) {
                     if (ssp.dwCurrentState == SERVICE_RUNNING ||
                         ssp.dwCurrentState == SERVICE_START_PENDING) {
-                        dl_msg("AiDA Driver: Anti-cheat service running: %ws\n", s_AntiCheatServices[i]);
+                        std::wstring detected = s_AntiCheatServices[i];
                         CloseServiceHandle(hSvc);
                         CloseServiceHandle(hSCM);
-                        return TRUE;
+                        return detected;
                     }
                 }
                 CloseServiceHandle(hSvc);
@@ -445,7 +548,7 @@ static BOOL CheckAntiCheatRunning()
         }
         CloseServiceHandle(hSCM);
     }
-    return FALSE;
+    return L"";
 }
 
 
@@ -1483,9 +1586,22 @@ bool driver_loader::initialize_and_load()
     }
 
 
-    if (CheckAntiCheatRunning()) {
-        dl_msg("AiDA Driver: Anti-cheat detected. Driver loading aborted.\n");
-        return false;
+    {
+        std::wstring acDetected = DetectRunningAntiCheat();
+        if (!acDetected.empty()) {
+            char acNameNarrow[256] = {};
+            WideCharToMultiByte(CP_UTF8, 0, acDetected.c_str(), -1,
+                acNameNarrow, sizeof(acNameNarrow), NULL, NULL);
+            dl_msg("AiDA Driver: Anti-cheat process/driver detected: %s\n", acNameNarrow);
+            int answer = ask_yn(ASKBTN_NO,
+                "AN ANTICHEAT PROCESS/DRIVER IS CURRENTLY RUNNING! (%s)\n\n"
+                "ARE YOU SURE YOU WANT TO LOAD THE AiDA DRIVER?",
+                acNameNarrow);
+            if (answer != ASKBTN_YES) {
+                dl_msg("AiDA Driver: User declined driver loading with anti-cheat present.\n");
+                return false;
+            }
+        }
     }
 
 
@@ -1506,11 +1622,17 @@ bool driver_loader::initialize_and_load()
     }
 
 
-    std::wstring loaderTempPath = GetTempFilePath(L".sys");
-    std::wstring driverTempPath = GetTempFilePath(L".sys");
+    if (!CreateRandomExtractDirectory()) {
+        dl_msg("AiDA Driver: Initialization failed.\n");
+        ReleaseP2CDriver(); ReleaseWhosWhoDriver();
+        return false;
+    }
+    std::wstring loaderTempPath = GetRandomFilePath(L".sys");
+    std::wstring driverTempPath = GetRandomFilePath(L".sys");
     if (loaderTempPath.empty() || driverTempPath.empty()) {
         dl_msg("AiDA Driver: Initialization failed.\n");
         ReleaseP2CDriver(); ReleaseWhosWhoDriver();
+        CleanupRandomExtractDirectory();
         return false;
     }
 
@@ -1521,6 +1643,7 @@ bool driver_loader::initialize_and_load()
         if (hf == INVALID_HANDLE_VALUE) {
             dl_msg("AiDA Driver: Initialization failed.\n");
             ReleaseP2CDriver(); ReleaseWhosWhoDriver();
+            CleanupRandomExtractDirectory();
             return false;
         }
         DWORD written = 0;
@@ -1533,6 +1656,7 @@ bool driver_loader::initialize_and_load()
             dl_msg("AiDA Driver: Initialization failed.\n");
             SecureDeleteFile(loaderTempPath.c_str());
             ReleaseWhosWhoDriver();
+            CleanupRandomExtractDirectory();
             return false;
         }
     }
@@ -1545,6 +1669,7 @@ bool driver_loader::initialize_and_load()
             dl_msg("AiDA Driver: Initialization failed.\n");
             SecureDeleteFile(loaderTempPath.c_str());
             ReleaseWhosWhoDriver();
+            CleanupRandomExtractDirectory();
             return false;
         }
         DWORD written = 0;
@@ -1557,6 +1682,7 @@ bool driver_loader::initialize_and_load()
             dl_msg("AiDA Driver: Initialization failed.\n");
             SecureDeleteFile(loaderTempPath.c_str());
             SecureDeleteFile(driverTempPath.c_str());
+            CleanupRandomExtractDirectory();
             return false;
         }
     }
@@ -1567,12 +1693,9 @@ bool driver_loader::initialize_and_load()
     NTSTATUS status = WindLoadDriver(loaderTempPath.c_str(), driverTempPath.c_str());
 
 
-    for (int i = 0; i < 10; i++) {
-        BOOL a = SecureDeleteFile(loaderTempPath.c_str());
-        BOOL b = SecureDeleteFile(driverTempPath.c_str());
-        if (a && b) break;
-        Sleep(30);
-    }
+    ForceDeleteDriverFile(loaderTempPath.c_str());
+    ForceDeleteDriverFile(driverTempPath.c_str());
+    CleanupRandomExtractDirectory();
 
     CleanupArtifacts();
 

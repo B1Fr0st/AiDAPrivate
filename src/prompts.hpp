@@ -617,14 +617,41 @@ The provided function has decompilation artifacts that make it hard to read and/
 - **Preserve all meaningful variable names** that already exist.
 - **Add comments** explaining what each fixed section does.
 - **If you cannot confidently translate an `__asm` block**, leave it as-is but add a comment explaining the opcodes.
+- Prefer actions that improve Hex-Rays' own understanding of the function over display-only comments. If a bad call signature, missing no-return attribute, or indirect/helper call is the root cause, emit the corresponding decompiler action.
+- Use addresses from the disassembly block when an action targets a specific instruction.
 - Generate the output as a JSON array of tool actions so the plugin can automatically apply fixes.
 
 **Output Format:**
 Return a JSON object with actions to apply. Use these tool types:
 - `set_comment` — to add explanatory comments at specific addresses
 - `rename_variable` — to rename cryptic register variables to meaningful names
+- `rename_global` — to rename auto-generated globals referenced by the function
 - `create_type` — to create any helper types needed
-- `apply_type` — to fix parameter/variable types
+- `apply_type` — to fix a local variable/parameter type or apply a type at an address
+- `apply_function_type` — to apply a better prototype to a function or import by address
+- `apply_callee_type` — to apply a better prototype to a specific call instruction
+- `set_user_call` — to force a user-defined call prototype for an indirect/helper/non-standard call site
+- `clear_user_call` — to remove an incorrect user-defined call prototype
+- `set_noret_call` — to mark a call instruction as non-returning when it terminates control flow
+
+Use these parameter shapes:
+- `rename_variable`: `{ "original_name": "v12", "new_name": "decodedLength" }`
+- `rename_global`: `{ "address": "0x140012340", "new_name": "g_decoderState" }`
+- `create_type`: `{ "definition": "typedef struct ...;" }`
+- `apply_type` for a local variable/argument: `{ "param_name": "a2", "type_name": "PacketHeader *" }`
+- `apply_type` for a typed address: `{ "address": "0x140012340", "type_name": "PacketHeader *" }`
+- `apply_function_type`: `{ "address": "0x140045670", "declaration": "int __fastcall decrypt_block(void *ctx, const void *src, unsigned int len);" }`
+- `apply_callee_type`: `{ "address": "0x140012ABC", "declaration": "int __fastcall decrypt_block(void *ctx, const void *src, unsigned int len);" }`
+- `set_user_call`: `{ "address": "0x140012ABC", "declaration": "int __usercall helper@<eax>(void *ctx@<rcx>, const void *src@<rdx>, unsigned int len@<r8d>);" }`
+- `clear_user_call`: `{ "address": "0x140012ABC" }`
+- `set_noret_call`: `{ "address": "0x140012AF0", "noret": true }`
+
+Decision guidance:
+- If the call is direct and the callee just lacks a correct function prototype, use `apply_function_type`.
+- If one specific call site is decompiled incorrectly because of call argument recovery, use `apply_callee_type`.
+- If the call is indirect, helper-based, `__usercall`, or otherwise non-standard, use `set_user_call`.
+- If bad control flow after a terminating call is causing bogus `goto` or unreachable pseudocode, use `set_noret_call` on the call instruction.
+- Use `set_comment` only when the issue cannot be fixed structurally.
 
 ```json
 {{
@@ -639,6 +666,16 @@ Return a JSON object with actions to apply. Use these tool types:
       "type": "rename_variable",
       "reasoning": "Register variable _FP11 is actually the distance calculation result",
       "params": {{"original_name": "_FP11", "new_name": "distanceResult"}}
+    }},
+    {{
+      "type": "set_user_call",
+      "reasoning": "This helper call uses a non-standard usercall ABI that Hex-Rays cannot infer by itself.",
+      "params": {{"address": "0x140012ABC", "declaration": "int __usercall helper@<eax>(void *ctx@<rcx>, const void *src@<rdx>, unsigned int len@<r8d>);"}}
+    }},
+    {{
+      "type": "set_noret_call",
+      "reasoning": "Control flow ends at this call, so later pseudocode blocks are spurious.",
+      "params": {{"address": "0x140012AF0", "noret": true}}
     }}
   ],
   "cleaned_code": "// The full cleaned C/C++ version of the function (for display only)",
@@ -665,6 +702,11 @@ Return a JSON object with actions to apply. Use these tool types:
 ```cpp
 
 {code}
+```
+
+**Instruction-Level Disassembly With Addresses:**
+```asm
+{disassembly}
 ```
 
 **Local Variables:**

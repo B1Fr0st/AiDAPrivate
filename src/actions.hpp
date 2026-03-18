@@ -53,3 +53,9 @@ namespace tool_executor {
     qstring execute_tool_calls(ea_t func_ea, const std::vector<tool_call_t>& calls);
     std::string format_tool_calls_for_review(const std::vector<tool_call_t>& calls);
 }
+
+namespace analysis_fixer {
+    bool install_hexrays_fixups();
+    void uninstall_hexrays_fixups();
+    void refresh_decompilation(ea_t func_ea);
+}

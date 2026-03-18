@@ -997,6 +997,9 @@ void AIClient::fix_analysis(ea_t ea, callback_t callback)
         return;
     }
 
+    auto disasm_pair = ida_utils::get_function_code(ea, 0, true);
+    context[OBFSTR_C("disassembly")] = disasm_pair.first;
+
     std::string prompt = ida_utils::format_prompt(FIX_ANALYSIS_PROMPT, context);
     _generate(prompt, callback, 0.0, OBFSTR_C("analysis correction"));
 }

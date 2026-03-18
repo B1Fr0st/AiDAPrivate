@@ -3,6 +3,198 @@
 #include "chat_widget.hpp"
 #include "anti_re.hpp"
 
+namespace
+{
+bool parse_address_string(const std::string& addr_str, ea_t* out)
+{
+    if (out == nullptr || addr_str.empty())
+        return false;
+
+    try
+    {
+        size_t idx = 0;
+        ea_t addr = BADADDR;
+        if (addr_str.size() > 2 && addr_str[0] == '0' && (addr_str[1] == 'x' || addr_str[1] == 'X'))
+            addr = static_cast<ea_t>(std::stoull(addr_str, &idx, 16));
+        else if (std::all_of(addr_str.begin(), addr_str.end(),
+                             [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; }))
+            addr = static_cast<ea_t>(std::stoull(addr_str, &idx, 16));
+        else
+            addr = static_cast<ea_t>(std::stoull(addr_str, &idx, 0));
+
+        if (idx == addr_str.size())
+        {
+            *out = addr;
+            return true;
+        }
+    }
+    catch (...) {}
+
+    ea_t named_ea = get_name_ea(BADADDR, addr_str.c_str());
+    if (named_ea == BADADDR)
+        return false;
+
+    *out = named_ea;
+    return true;
+}
+
+bool parse_decl_string(const std::string& decl, tinfo_t* tif, qstring* out_name = nullptr)
+{
+    if (tif == nullptr || decl.empty())
+        return false;
+
+    qstring parsed_name;
+    if (!parse_decl(tif, &parsed_name, nullptr, decl.c_str(), PT_SIL))
+        return false;
+
+    if (out_name != nullptr)
+        *out_name = parsed_name;
+    return true;
+}
+
+std::string preview_text(const std::string& text, size_t max_len = 200)
+{
+    if (text.size() <= max_len)
+        return text;
+    return text.substr(0, max_len) + "...";
+}
+
+bool json_bool_value(const nlohmann::json& params, const char* key, bool default_value)
+{
+    if (!params.is_object())
+        return default_value;
+    auto it = params.find(key);
+    if (it == params.end() || it->is_null())
+        return default_value;
+    if (it->is_boolean())
+        return it->get<bool>();
+    if (it->is_number_integer())
+        return it->get<int>() != 0;
+    if (it->is_string())
+    {
+        qstring lowered = ida_utils::qstring_tolower(it->get<std::string>().c_str());
+        return lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on";
+    }
+    return default_value;
+}
+}
+
+namespace analysis_fixer
+{
+namespace
+{
+class cleanup_optinsn_t final : public optinsn_t
+{
+public:
+    int idaapi func(mblock_t* blk, minsn_t* ins, int) override
+    {
+        if (blk == nullptr || ins == nullptr)
+            return 0;
+
+        int changes = 0;
+
+        if (ins->is_mov() && ins->l.equal_mops(ins->d, EQ_IGNSIZE))
+        {
+            blk->make_nop(ins);
+            ++changes;
+        }
+
+        if (ins->opcode == m_goto && ins->l.is_mblock(blk->serial))
+        {
+            blk->make_nop(ins);
+            ++changes;
+        }
+
+        return changes;
+    }
+};
+
+class cleanup_optblock_t final : public optblock_t
+{
+public:
+    int idaapi func(mblock_t* blk) override
+    {
+        if (blk == nullptr)
+            return 0;
+
+        int changes = blk->optimize_useless_jump();
+        if (blk->tail != nullptr && blk->tail->is_noret_call(NORET_FORBID_ANALYSIS))
+        {
+            if (blk->type != BLT_0WAY)
+            {
+                blk->type = BLT_0WAY;
+                ++changes;
+            }
+            if ((blk->flags & MBL_NORET) == 0)
+            {
+                blk->flags |= MBL_NORET;
+                ++changes;
+            }
+        }
+
+        if (changes > 0)
+        {
+            blk->mark_lists_dirty();
+            if (blk->mba != nullptr)
+                blk->mba->remove_empty_and_unreachable_blocks();
+        }
+
+        return changes;
+    }
+};
+
+cleanup_optinsn_t g_cleanup_optinsn;
+cleanup_optblock_t g_cleanup_optblock;
+int g_fixup_refcount = 0;
+bool g_fixups_installed = false;
+}
+
+bool install_hexrays_fixups()
+{
+    if (g_fixups_installed)
+    {
+        ++g_fixup_refcount;
+        return true;
+    }
+
+    if (!init_hexrays_plugin())
+        return false;
+
+    install_optinsn_handler(&g_cleanup_optinsn);
+    install_optblock_handler(&g_cleanup_optblock);
+    g_fixups_installed = true;
+    g_fixup_refcount = 1;
+    return true;
+}
+
+void uninstall_hexrays_fixups()
+{
+    if (!g_fixups_installed)
+        return;
+
+    if (g_fixup_refcount > 1)
+    {
+        --g_fixup_refcount;
+        return;
+    }
+
+    g_fixup_refcount = 0;
+    if (init_hexrays_plugin())
+    {
+        remove_optinsn_handler(&g_cleanup_optinsn);
+        remove_optblock_handler(&g_cleanup_optblock);
+    }
+    g_fixups_installed = false;
+}
+
+void refresh_decompilation(ea_t func_ea)
+{
+    if (func_ea != BADADDR && init_hexrays_plugin())
+        mark_cfunc_dirty(func_ea, true);
+    mark_builtin_widgets(IWID_DISASM | IWID_PSEUDOCODE);
+}
+}
+
 static bool ensure_licensed_and_ready(aida_plugin_t* plugin)
 {
     if (!anti_re::guard())
@@ -599,13 +791,39 @@ std::string format_tool_calls_for_review(const std::vector<tool_call_t>& calls)
         }
         else if (tc.type == OBFSTR_C("apply_type"))
         {
-            ss << OBFSTR_C("    Param: ") << json_str(tc.params, OBFSTR_C("param_name"), "??") << "\n";
-            ss << OBFSTR_C("    Type: ") << json_str(tc.params, OBFSTR_C("type_name"), "??") << "\n";
+            std::string type_name = json_str(tc.params, OBFSTR_C("type_name"));
+            if (type_name.empty())
+                type_name = json_str(tc.params, OBFSTR_C("type"), "??");
+
+            std::string addr_str = json_str(tc.params, OBFSTR_C("address"));
+            if (!addr_str.empty())
+                ss << OBFSTR_C("    Address: ") << addr_str << "\n";
+            else
+                ss << OBFSTR_C("    Param: ") << json_str(tc.params, OBFSTR_C("param_name"), "??") << "\n";
+
+            ss << OBFSTR_C("    Type: ") << type_name << "\n";
         }
         else if (tc.type == OBFSTR_C("rename_global"))
         {
             ss << OBFSTR_C("    Address: ") << json_str(tc.params, OBFSTR_C("address"), "??") << "\n";
             ss << OBFSTR_C("    New name: ") << json_str(tc.params, OBFSTR_C("new_name"), "??") << "\n";
+        }
+        else if (tc.type == OBFSTR_C("apply_function_type") || tc.type == OBFSTR_C("apply_callee_type")
+                 || tc.type == OBFSTR_C("set_user_call"))
+        {
+            ss << OBFSTR_C("    Address: ") << json_str(tc.params, OBFSTR_C("address"), "??") << "\n";
+            ss << OBFSTR_C("    Declaration: ")
+               << preview_text(json_str(tc.params, OBFSTR_C("declaration"), "??")) << "\n";
+        }
+        else if (tc.type == OBFSTR_C("clear_user_call"))
+        {
+            ss << OBFSTR_C("    Address: ") << json_str(tc.params, OBFSTR_C("address"), "??") << "\n";
+        }
+        else if (tc.type == OBFSTR_C("set_noret_call"))
+        {
+            ss << OBFSTR_C("    Address: ") << json_str(tc.params, OBFSTR_C("address"), "??") << "\n";
+            ss << OBFSTR_C("    No-return: ")
+               << (json_bool_value(tc.params, OBFSTR_C("noret"), true) ? "true" : "false") << "\n";
         }
         ss << "\n";
     }
@@ -617,6 +835,8 @@ qstring execute_tool_calls(ea_t func_ea, const std::vector<tool_call_t>& calls)
     qstring summary;
     int success_count = 0;
     int fail_count = 0;
+
+    analysis_fixer::install_hexrays_fixups();
 
     func_t* pfn = get_func(func_ea);
     cfuncptr_t cfunc(nullptr);
@@ -723,10 +943,31 @@ qstring execute_tool_calls(ea_t func_ea, const std::vector<tool_call_t>& calls)
         }
         else if (tc.type == OBFSTR_C("apply_type"))
         {
+            std::string addr_str = json_str(tc.params, OBFSTR_C("address"));
             std::string param_name = json_str(tc.params, OBFSTR_C("param_name"));
             std::string type_name = json_str(tc.params, OBFSTR_C("type_name"));
+            if (type_name.empty())
+                type_name = json_str(tc.params, OBFSTR_C("type"));
 
-            if (!param_name.empty() && !type_name.empty() && cfunc && pfn)
+            ea_t target_ea = BADADDR;
+            if (!addr_str.empty())
+                parse_address_string(addr_str, &target_ea);
+
+            if (target_ea != BADADDR && !type_name.empty())
+            {
+                tinfo_t tif;
+                if (parse_decl_string(type_name, &tif) && apply_tinfo(target_ea, tif, TINFO_DEFINITE | TINFO_DELAYFUNC))
+                {
+                    summary.cat_sprnt(OBFSTR_C("Applied type '%s' at 0x%llx\n"), type_name.c_str(), target_ea);
+                    success_count++;
+                }
+                else
+                {
+                    summary.cat_sprnt(OBFSTR_C("FAILED: Apply type '%s' at '%s'\n"), type_name.c_str(), addr_str.c_str());
+                    fail_count++;
+                }
+            }
+            else if (!param_name.empty() && !type_name.empty() && cfunc && pfn)
             {
                 lvars_t* lvars = cfunc->get_lvars();
                 bool done = false;
@@ -759,6 +1000,11 @@ qstring execute_tool_calls(ea_t func_ea, const std::vector<tool_call_t>& calls)
                     fail_count++;
                 }
             }
+            else
+            {
+                summary.cat_sprnt(OBFSTR_C("FAILED: Apply type is missing a valid target\n"));
+                fail_count++;
+            }
         }
         else if (tc.type == OBFSTR_C("rename_global"))
         {
@@ -786,6 +1032,151 @@ qstring execute_tool_calls(ea_t func_ea, const std::vector<tool_call_t>& calls)
                 }
             }
         }
+        else if (tc.type == OBFSTR_C("apply_function_type"))
+        {
+            std::string addr_str = json_str(tc.params, OBFSTR_C("address"));
+            std::string declaration = json_str(tc.params, OBFSTR_C("declaration"));
+            ea_t target_ea = BADADDR;
+
+            if (parse_address_string(addr_str, &target_ea) && !declaration.empty())
+            {
+                tinfo_t tif;
+                qstring parsed_name;
+                if (parse_decl_string(declaration, &tif, &parsed_name)
+                    && apply_tinfo(target_ea, tif, TINFO_DEFINITE | TINFO_DELAYFUNC))
+                {
+                    if (!parsed_name.empty() && has_dummy_name(get_flags(target_ea)))
+                        set_name(target_ea, parsed_name.c_str(), SN_FORCE | SN_NODUMMY);
+                    summary.cat_sprnt(OBFSTR_C("Applied function type at 0x%llx\n"), target_ea);
+                    success_count++;
+                }
+                else
+                {
+                    summary.cat_sprnt(OBFSTR_C("FAILED: Apply function type at '%s'\n"), addr_str.c_str());
+                    fail_count++;
+                }
+            }
+            else
+            {
+                summary.cat_sprnt(OBFSTR_C("FAILED: Apply function type is missing a valid target\n"));
+                fail_count++;
+            }
+        }
+        else if (tc.type == OBFSTR_C("apply_callee_type"))
+        {
+            std::string addr_str = json_str(tc.params, OBFSTR_C("address"));
+            std::string declaration = json_str(tc.params, OBFSTR_C("declaration"));
+            ea_t call_ea = BADADDR;
+
+            if (parse_address_string(addr_str, &call_ea) && !declaration.empty())
+            {
+                tinfo_t tif;
+                if (parse_decl_string(declaration, &tif) && apply_callee_tinfo(call_ea, tif))
+                {
+                    summary.cat_sprnt(OBFSTR_C("Applied call-site type at 0x%llx\n"), call_ea);
+                    success_count++;
+                }
+                else
+                {
+                    summary.cat_sprnt(OBFSTR_C("FAILED: Apply call-site type at '%s'\n"), addr_str.c_str());
+                    fail_count++;
+                }
+            }
+            else
+            {
+                summary.cat_sprnt(OBFSTR_C("FAILED: Apply call-site type is missing a valid target\n"));
+                fail_count++;
+            }
+        }
+        else if (tc.type == OBFSTR_C("set_user_call"))
+        {
+            std::string addr_str = json_str(tc.params, OBFSTR_C("address"));
+            std::string declaration = json_str(tc.params, OBFSTR_C("declaration"));
+            ea_t call_ea = BADADDR;
+
+            if (parse_address_string(addr_str, &call_ea) && !declaration.empty())
+            {
+                udcall_t udc;
+                udcall_map_t udcalls;
+                restore_user_defined_calls(&udcalls, func_ea);
+
+                if (parse_user_call(&udc, declaration.c_str(), true))
+                {
+                    udcall_map_iterator_t it = udcall_map_find(&udcalls, call_ea);
+                    if (it != udcall_map_end(&udcalls))
+                        udcall_map_erase(&udcalls, it);
+                    udcall_map_insert(&udcalls, call_ea, udc);
+                    save_user_defined_calls(func_ea, udcalls);
+                    summary.cat_sprnt(OBFSTR_C("Set user-defined call prototype at 0x%llx\n"), call_ea);
+                    success_count++;
+                }
+                else
+                {
+                    summary.cat_sprnt(OBFSTR_C("FAILED: Parse user call declaration for '%s'\n"), addr_str.c_str());
+                    fail_count++;
+                }
+            }
+            else
+            {
+                summary.cat_sprnt(OBFSTR_C("FAILED: Set user call is missing a valid target\n"));
+                fail_count++;
+            }
+        }
+        else if (tc.type == OBFSTR_C("clear_user_call"))
+        {
+            std::string addr_str = json_str(tc.params, OBFSTR_C("address"));
+            ea_t call_ea = BADADDR;
+
+            if (parse_address_string(addr_str, &call_ea))
+            {
+                udcall_map_t udcalls;
+                restore_user_defined_calls(&udcalls, func_ea);
+                udcall_map_iterator_t it = udcall_map_find(&udcalls, call_ea);
+                if (it != udcall_map_end(&udcalls))
+                {
+                    udcall_map_erase(&udcalls, it);
+                    save_user_defined_calls(func_ea, udcalls);
+                    summary.cat_sprnt(OBFSTR_C("Cleared user-defined call prototype at 0x%llx\n"), call_ea);
+                    success_count++;
+                }
+                else
+                {
+                    summary.cat_sprnt(OBFSTR_C("FAILED: No user-defined call exists at '%s'\n"), addr_str.c_str());
+                    fail_count++;
+                }
+            }
+            else
+            {
+                summary.cat_sprnt(OBFSTR_C("FAILED: Clear user call is missing a valid target\n"));
+                fail_count++;
+            }
+        }
+        else if (tc.type == OBFSTR_C("set_noret_call"))
+        {
+            std::string addr_str = json_str(tc.params, OBFSTR_C("address"));
+            ea_t call_ea = BADADDR;
+            bool noret = json_bool_value(tc.params, OBFSTR_C("noret"), true);
+
+            if (parse_address_string(addr_str, &call_ea))
+            {
+                if (set_noret_insn(call_ea, noret))
+                {
+                    summary.cat_sprnt(OBFSTR_C("Marked call at 0x%llx as %sreturning\n"),
+                        call_ea, noret ? "non-" : "");
+                    success_count++;
+                }
+                else
+                {
+                    summary.cat_sprnt(OBFSTR_C("FAILED: Mark no-return at '%s'\n"), addr_str.c_str());
+                    fail_count++;
+                }
+            }
+            else
+            {
+                summary.cat_sprnt(OBFSTR_C("FAILED: Set no-return call is missing a valid target\n"));
+                fail_count++;
+            }
+        }
     }
 
     if (cfunc)
@@ -796,9 +1187,7 @@ qstring execute_tool_calls(ea_t func_ea, const std::vector<tool_call_t>& calls)
 
     if (success_count > 0 || fail_count > 0)
     {
-        if (pfn && init_hexrays_plugin())
-            mark_cfunc_dirty(func_ea, true);
-        mark_builtin_widgets(IWID_DISASM | IWID_PSEUDOCODE);
+        analysis_fixer::refresh_decompilation(func_ea);
     }
 
     summary.cat_sprnt(OBFSTR_C("\n--- Results: %d succeeded, %d failed ---\n"), success_count, fail_count);

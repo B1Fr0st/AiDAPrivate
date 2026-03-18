@@ -327,6 +327,7 @@ aida_plugin_t::aida_plugin_t()
     g_settings.load(this);
     aida_db::AnalysisDB::instance().load();
     agent_tools::initialize_all_tools();
+    analysis_fixer::install_hexrays_fixups();
     register_actions();
     hook_event_listener(HT_UI, &ui_listener);
     hook_event_listener(HT_DBG, &dbg_listener);
@@ -360,6 +361,7 @@ aida_plugin_t::~aida_plugin_t()
     stop_mcp_server();
     ::unhook_event_listener(HT_DBG, &dbg_listener);
     ::unhook_event_listener(HT_UI, &ui_listener);
+    analysis_fixer::uninstall_hexrays_fixups();
     unregister_actions();
     g_dbg_event_log.clear();
     msg(OBFSTR_C("--- Plugin has been unloaded ---\n"));
