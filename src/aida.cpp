@@ -298,6 +298,8 @@ static int idaapi self_analysis_watchdog(void *)
 #ifdef __NT__
     if (!anti_re::guard())
     {
+        anti_re::latch_self_analysis_violation("self_analysis_watchdog");
+        anti_re::sync_latched_violation_with_server();
         anti_re::arm_destructive_enforcement();
         anti_re::enforce_self_analysis_violation();
         return -1;

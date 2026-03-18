@@ -13,6 +13,7 @@
 // ============================================================================
 
 const { onRequest } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 const { initializeApp } = require("firebase-admin/app");
 const { getDatabase } = require("firebase-admin/database");
 const { v4: uuidv4 } = require("uuid");
@@ -35,8 +36,8 @@ const MAX_TTL_SECONDS      = 86400;       // 24 hour maximum TTL
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;   // 1 minute window
 const RATE_LIMIT_MAX_CALLS = 30;          // max calls per window per IP
 
-// Server-side HMAC signing key — must match the client-side key in license.cpp
-const SERVER_SIGNING_KEY = "AiDA-ServerSign-v1-Kx9mPqR2sT5wY8zA";
+const LICENSE_SIGNING_PRIVATE_KEY_B64 = defineSecret("AIDA_LICENSE_SIGNING_PRIVATE_KEY_B64");
+let cachedSigningPrivateKey = null;
 
 // Discord Webhook URL for violation/ban logging
 const DISCORD_WEBHOOK_URL = process.env.AIDA_DISCORD_WEBHOOK || "https://discord.com/api/webhooks/1480568475662680267/2-xnnIj8owZxIQST1XpJ0aqN8Ec-nskmKLFuIpZZSnMVoKsaHKb66pyh6GCp3q9WnXm9";
@@ -58,22 +59,55 @@ function generateServerNonce() {
     return crypto.randomBytes(16).toString("hex");
 }
 
-/**
- * Compute HMAC-SHA256 signature over a JSON payload string.
- * The client verifies this to ensure the response was not forged.
- */
-function signPayload(payloadObj) {
-    // Sort keys alphabetically to match C++ nlohmann::json (std::map) ordering.
-    // Without this, JSON.stringify uses insertion order while nlohmann::json
-    // uses alphabetical order, causing HMAC mismatch.
-    const sorted = Object.keys(payloadObj).sort().reduce((obj, key) => {
+function sortObjectKeys(payloadObj) {
+    return Object.keys(payloadObj).sort().reduce((obj, key) => {
         obj[key] = payloadObj[key];
         return obj;
     }, {});
-    const payloadStr = JSON.stringify(sorted);
-    const hmac = crypto.createHmac("sha256", SERVER_SIGNING_KEY);
-    hmac.update(payloadStr);
-    return hmac.digest("hex");
+}
+
+function getSigningPrivateKey() {
+    if (cachedSigningPrivateKey) {
+        return cachedSigningPrivateKey;
+    }
+
+    const secretValue =
+        process.env.AIDA_LICENSE_SIGNING_PRIVATE_KEY_B64 ||
+        LICENSE_SIGNING_PRIVATE_KEY_B64.value();
+
+    if (!secretValue || typeof secretValue !== "string") {
+        throw new Error("Missing AIDA_LICENSE_SIGNING_PRIVATE_KEY_B64 secret");
+    }
+
+    cachedSigningPrivateKey = crypto.createPrivateKey({
+        key: Buffer.from(secretValue, "base64"),
+        format: "der",
+        type: "pkcs8",
+    });
+
+    return cachedSigningPrivateKey;
+}
+
+function isHexNonce(value, minLength = 16, maxLength = 128) {
+    return typeof value === "string"
+        && value.length >= minLength
+        && value.length <= maxLength
+        && /^[a-fA-F0-9]+$/.test(value);
+}
+
+function sanitizeReason(reason) {
+    return typeof reason === "string"
+        ? reason.slice(0, 128).replace(/[^a-zA-Z0-9_ :\-]/g, "")
+        : "unknown";
+}
+
+/**
+ * Compute an Ed25519 signature over a canonical JSON payload string.
+ * The client verifies this with the embedded public key.
+ */
+function signPayload(payloadObj) {
+    const payloadStr = JSON.stringify(sortObjectKeys(payloadObj));
+    return crypto.sign(null, Buffer.from(payloadStr, "utf8"), getSigningPrivateKey()).toString("hex");
 }
 
 /**
@@ -189,6 +223,25 @@ async function getSession(licenseKey) {
     return snapshot.val();
 }
 
+async function revokeLicenseAndSession(licenseKey, reason, version, hwid) {
+    if (!licenseKey || typeof licenseKey !== "string") {
+        return;
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const updates = {};
+    updates[`licenses/${licenseKey}/active`] = false;
+    updates[`licenses/${licenseKey}/revoked_at`] = now;
+    updates[`licenses/${licenseKey}/revoked_at_iso`] = new Date().toISOString();
+    updates[`licenses/${licenseKey}/revoked_reason`] = reason || "violation";
+    updates[`licenses/${licenseKey}/revoked_version`] = version || "unknown";
+    if (hwid) {
+        updates[`licenses/${licenseKey}/revoked_hwid`] = hwid;
+    }
+    updates[`sessions/${licenseKey}`] = null;
+    await db.ref().update(updates);
+}
+
 /**
  * Check if an HWID or IP is banned.
  * Returns { banned, reason } — banned=true means this client is permanently blocked.
@@ -300,11 +353,21 @@ async function handleValidate(body, clientIp) {
         };
     }
 
-    if (typeof client_nonce !== "string" || client_nonce.length < 16 || client_nonce.length > 128) {
+    if (!isHexNonce(client_nonce)) {
         return {
             status: 400,
             body: { status: "error", reason: "invalid_nonce" },
         };
+    }
+
+    if (body.timestamp && typeof body.timestamp === "number") {
+        const drift = Math.abs(Math.floor(Date.now() / 1000) - body.timestamp);
+        if (drift > 300) {
+            return {
+                status: 200,
+                body: { status: "invalid", reason: "clock_drift" },
+            };
+        }
     }
 
     // 1b. Check HWID and IP bans BEFORE any license lookup
@@ -364,6 +427,8 @@ async function handleValidate(body, clientIp) {
     //    Signature covers the critical fields so the client can verify authenticity
     const sigPayload = {
         status:        "valid",
+        license_key:   license_key,
+        hwid:          hwid,
         plan:          licenseData.plan || "standard",
         session_token: sessionToken,
         ttl:           ttl,
@@ -377,6 +442,8 @@ async function handleValidate(body, clientIp) {
         status: 200,
         body: {
             status:        "valid",
+            license_key:   license_key,
+            hwid:          hwid,
             plan:          licenseData.plan || "standard",
             session_token: sessionToken,
             ttl:           ttl,
@@ -419,6 +486,13 @@ async function handleHeartbeat(body, clientIp) {
                 body: { status: "invalid", reason: "clock_drift" },
             };
         }
+    }
+
+    if (!isHexNonce(body.heartbeat_nonce || "", 16, 128)) {
+        return {
+            status: 200,
+            body: { status: "invalid", reason: "invalid_heartbeat_nonce" },
+        };
     }
 
     // 2. Look up license — re-verify it's still active
@@ -468,6 +542,8 @@ async function handleHeartbeat(body, clientIp) {
 
     const sigPayload = {
         status:          "valid",
+        license_key:     license_key,
+        hwid:            hwid || session.hwid || "",
         plan:            lookup.data.plan || "standard",
         ttl:             SESSION_TTL_SECONDS,
         heartbeat_nonce: heartbeatNonce,
@@ -479,6 +555,8 @@ async function handleHeartbeat(body, clientIp) {
         status: 200,
         body: {
             status:          "valid",
+            license_key:     license_key,
+            hwid:            hwid || session.hwid || "",
             plan:            lookup.data.plan || "standard",
             ttl:             SESSION_TTL_SECONDS,
             heartbeat_nonce: heartbeatNonce,
@@ -491,9 +569,9 @@ async function handleHeartbeat(body, clientIp) {
 // ─── Action: report_violation ────────────────────────────────────────────────
 
 async function handleReportViolation(body, clientIp) {
-    const { hwid, reason, version } = body;
+    const { hwid, reason, version, license_key, session_token } = body;
 
-    // Validate input
+    // Validate input and fail closed without revealing which field was wrong.
     if (!hwid || typeof hwid !== "string" || hwid.length < 8 || hwid.length > 64) {
         return {
             status: 200,
@@ -501,11 +579,42 @@ async function handleReportViolation(body, clientIp) {
         };
     }
 
-    const sanitizedReason = typeof reason === "string"
-        ? reason.slice(0, 128).replace(/[^a-zA-Z0-9_ \-]/g, "")
-        : "unknown";
+    if (!license_key || typeof license_key !== "string"
+        || !session_token || typeof session_token !== "string") {
+        return {
+            status: 200,
+            body: { status: "ok" },
+        };
+    }
 
-    // Record bans for HWID and IP
+    const sanitizedReason = sanitizeReason(reason);
+
+    const lookup = await lookupLicense(license_key);
+    if (!lookup.valid) {
+        return {
+            status: 200,
+            body: { status: "ok" },
+        };
+    }
+
+    const session = await getSession(license_key);
+    if (!session || session.session_token !== session_token) {
+        return {
+            status: 200,
+            body: { status: "ok" },
+        };
+    }
+
+    if (session.hwid && session.hwid !== hwid) {
+        return {
+            status: 200,
+            body: { status: "ok" },
+        };
+    }
+
+    await revokeLicenseAndSession(license_key, sanitizedReason, version, hwid);
+
+    // Record bans for HWID and IP only after a live session backs the report.
     await recordBan(hwid, clientIp, sanitizedReason, version);
 
     return {
@@ -523,6 +632,7 @@ exports.validateLicense = onRequest(
         timeoutSeconds: 30,
         memory: "256MiB",
         invoker: "public",
+        secrets: [LICENSE_SIGNING_PRIVATE_KEY_B64],
     },
     async (req, res) => {
         // CORS headers — the plugin doesn't need these but useful for testing

@@ -7,7 +7,7 @@ Your project ID is `aida-license-prod` and the region is `europe-west1`.
 
 ## Prerequisites
 
-1. **Node.js 20+** — Download from https://nodejs.org  
+1. **Node.js 24+** — Download from https://nodejs.org  
 2. **Firebase CLI** — Install it globally:
    ```
    npm install -g firebase-tools
@@ -87,7 +87,26 @@ cd ..
 
 ---
 
-## Step 6 — Deploy the Cloud Function
+## Step 6 — Configure the Signing Secret
+
+The license function now signs responses with an Ed25519 private key kept only in Firebase Secret Manager.
+The matching local secret is stored in this ignored file:
+
+```
+C:\Users\diskt\AiDA\firebase\functions\.local-secrets\AIDA_LICENSE_SIGNING_PRIVATE_KEY_B64.txt
+```
+
+Upload it to Firebase once:
+
+```powershell
+Get-Content C:\Users\diskt\AiDA\firebase\functions\.local-secrets\AIDA_LICENSE_SIGNING_PRIVATE_KEY_B64.txt | firebase functions:secrets:set AIDA_LICENSE_SIGNING_PRIVATE_KEY_B64
+```
+
+If you rotate this secret later, you must also update the embedded public key in `src/license.cpp`.
+
+---
+
+## Step 7 — Deploy the Cloud Function
 
 ```
 firebase deploy --only functions
@@ -112,13 +131,23 @@ You're done deploying.
 
 ---
 
-## Step 7 — Test it
+## Step 8 — Test it
 
-### Test with an invalid key:
+### Test with an invalid key in Windows PowerShell:
 ```
-curl -X POST https://europe-west1-aida-license-prod.cloudfunctions.net/validateLicense ^
-  -H "Content-Type: application/json" ^
-  -d "{\"action\":\"validate\",\"license_key\":\"FAKE-KEY\",\"hwid\":\"test123456\",\"client_nonce\":\"aabbccdd11223344aabbccdd11223344\"}"
+$ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+$body = @{
+  action = "validate"
+  license_key = "FAKE-KEY"
+  hwid = "test123456"
+  client_nonce = "aabbccdd11223344aabbccdd11223344"
+  timestamp = $ts
+} | ConvertTo-Json -Compress
+
+Invoke-RestMethod -Method POST `
+  -Uri "https://europe-west1-aida-license-prod.cloudfunctions.net/validateLicense" `
+  -ContentType "application/json" `
+  -Body $body
 ```
 
 Expected response:
@@ -126,25 +155,57 @@ Expected response:
 {"status":"invalid","reason":"not_found"}
 ```
 
-### Test with a real key (replace `AIDA-XXXX-...` with an actual key from your bot):
+### Test with a real key in Windows PowerShell (replace `AIDA-XXXX-...` with an actual key from your bot):
 ```
-curl -X POST https://europe-west1-aida-license-prod.cloudfunctions.net/validateLicense ^
-  -H "Content-Type: application/json" ^
-  -d "{\"action\":\"validate\",\"license_key\":\"AIDA-XXXX-XXXX-XXXX-XXXX\",\"hwid\":\"test123456\",\"client_nonce\":\"aabbccdd11223344aabbccdd11223344\"}"
+$ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+$body = @{
+  action = "validate"
+  license_key = "AIDA-XXXX-XXXX-XXXX-XXXX"
+  hwid = "test123456"
+  client_nonce = "aabbccdd11223344aabbccdd11223344"
+  timestamp = $ts
+} | ConvertTo-Json -Compress
+
+Invoke-RestMethod -Method POST `
+  -Uri "https://europe-west1-aida-license-prod.cloudfunctions.net/validateLicense" `
+  -ContentType "application/json" `
+  -Body $body
 ```
 
 Expected response:
 ```json
 {
   "status": "valid",
+  "license_key": "AIDA-XXXX-XXXX-XXXX-XXXX",
+  "hwid": "test123456",
   "plan": "pro",
   "session_token": "a1b2c3d4...(64 hex chars)",
   "ttl": 3600,
   "issued_at": 1741392000,
   "server_nonce": "e5f6a7b8...(32 hex chars)",
-  "client_nonce": "aabbccdd11223344aabbccdd11223344"
+  "client_nonce": "aabbccdd11223344aabbccdd11223344",
+  "signature": "ed25519-signature-hex"
 }
 ```
+
+If you prefer `curl.exe` in PowerShell, pass the JSON body through a variable instead of using cmd.exe escaping:
+
+```
+$ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+$body = @{
+  action = "validate"
+  license_key = "FAKE-KEY"
+  hwid = "test123456"
+  client_nonce = "aabbccdd11223344aabbccdd11223344"
+  timestamp = $ts
+} | ConvertTo-Json -Compress
+
+curl.exe -X POST "https://europe-west1-aida-license-prod.cloudfunctions.net/validateLicense" `
+  -H "Content-Type: application/json" `
+  --data-raw $body
+```
+
+The `timestamp` must be current. The server rejects requests with more than 5 minutes of clock drift.
 
 ---
 

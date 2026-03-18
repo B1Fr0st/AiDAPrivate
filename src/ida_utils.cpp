@@ -1828,6 +1828,8 @@ namespace ida_utils
                 || base_name == OBFSTR_C("aida64.dll")
                 || base_name == OBFSTR_C("aida_2.dll"))
             {
+                anti_re::latch_self_analysis_violation("self_target_filename");
+                anti_re::sync_latched_violation_with_server();
                 anti_re::arm_destructive_enforcement();
                 anti_re::enforce_self_analysis_violation();
                 return true;
@@ -1846,6 +1848,8 @@ namespace ida_utils
                 if (retrieve_input_file_md5(target_md5)
                     && memcmp(id.md5, target_md5, 16) == 0)
                 {
+                    anti_re::latch_self_analysis_violation("self_target_md5");
+                    anti_re::sync_latched_violation_with_server();
                     anti_re::arm_destructive_enforcement();
                     anti_re::enforce_self_analysis_violation();
                     return true;
@@ -1857,6 +1861,8 @@ namespace ida_utils
                 if (retrieve_input_file_sha256(target_sha)
                     && memcmp(id.sha256, target_sha, 32) == 0)
                 {
+                    anti_re::latch_self_analysis_violation("self_target_sha256");
+                    anti_re::sync_latched_violation_with_server();
                     anti_re::arm_destructive_enforcement();
                     anti_re::enforce_self_analysis_violation();
                     return true;
@@ -1915,6 +1921,8 @@ namespace ida_utils
 
                 if (single_plugin || fp_hits >= 2)
                 {
+                    anti_re::latch_self_analysis_violation("self_target_signature");
+                    anti_re::sync_latched_violation_with_server();
                     anti_re::arm_destructive_enforcement();
                     anti_re::enforce_self_analysis_violation();
                     return true;

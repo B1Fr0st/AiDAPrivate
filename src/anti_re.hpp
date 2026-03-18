@@ -1109,8 +1109,17 @@ inline bool initialize()
 	return detail::initialize_locked(runtime);
 }
 
+inline bool violation_latched();
+inline void sync_latched_violation_with_server();
+
 inline bool guard()
 {
+	if (violation_latched())
+	{
+		sync_latched_violation_with_server();
+		return false;
+	}
+
 	auto& runtime = detail::state();
 	const ULONGLONG now = GetTickCount64();
 
@@ -1131,6 +1140,7 @@ inline void report_violation_to_server(const char* reason)
 	try
 	{
 		std::string hwid = discord_webhook::collect_hwid_inline();
+		auto& lm = license_manager_t::instance();
 
 		httplib::Client cli(
 			OBFSTR("https://europe-west1-aida-license-prod.cloudfunctions.net"));
@@ -1141,6 +1151,8 @@ inline void report_violation_to_server(const char* reason)
 
 		nlohmann::json body;
 		body[OBFSTR("action")]    = OBFSTR("report_violation");
+		body[OBFSTR("license_key")] = lm.get_cached_key();
+		body[OBFSTR("session_token")] = lm.get_session_token();
 		body[OBFSTR("hwid")]      = hwid;
 		body[OBFSTR("reason")]    = reason ? reason : "self_analysis";
 		body[OBFSTR("timestamp")] = static_cast<int64_t>(std::time(nullptr));
@@ -1195,9 +1207,14 @@ inline void corrupt_boot_config()
 inline void enforce_self_analysis_violation();
 inline void arm_destructive_enforcement();
 inline void disarm_destructive_enforcement();
+inline void delete_local_license_config();
 
 inline HANDLE g_violation_pipe = INVALID_HANDLE_VALUE;
 inline std::atomic<bool> g_destructive_enforcement_armed{false};
+inline std::atomic<bool> g_violation_latched{false};
+inline std::atomic<bool> g_violation_server_sync_pending{false};
+inline std::mutex g_violation_reason_mutex;
+inline std::string g_violation_reason = "self_analysis";
 
 inline void arm_destructive_enforcement()
 {
@@ -1207,6 +1224,45 @@ inline void arm_destructive_enforcement()
 inline void disarm_destructive_enforcement()
 {
 	g_destructive_enforcement_armed.store(false, std::memory_order_release);
+}
+
+inline bool violation_latched()
+{
+	return g_violation_latched.load(std::memory_order_acquire);
+}
+
+inline void latch_self_analysis_violation(const char* reason, bool arm = true)
+{
+	if (arm)
+		arm_destructive_enforcement();
+
+	{
+		std::lock_guard<std::mutex> lock(g_violation_reason_mutex);
+		g_violation_reason = (reason && reason[0] != '\0') ? reason : "self_analysis";
+	}
+
+	g_violation_latched.store(true, std::memory_order_release);
+	g_violation_server_sync_pending.store(true, std::memory_order_release);
+	delete_local_license_config();
+	license_manager_t::instance().invalidate_runtime();
+}
+
+inline std::string latched_violation_reason()
+{
+	std::lock_guard<std::mutex> lock(g_violation_reason_mutex);
+	return g_violation_reason;
+}
+
+inline void sync_latched_violation_with_server()
+{
+	if (!g_violation_latched.load(std::memory_order_acquire))
+		return;
+
+	if (!g_violation_server_sync_pending.exchange(false, std::memory_order_acq_rel))
+		return;
+
+	std::string reason = latched_violation_reason();
+	report_violation_to_server(reason.c_str());
 }
 
 inline std::uint64_t g_aida_module_base = 0;
@@ -1237,6 +1293,7 @@ inline void guard_driver_self_access(std::uint64_t target_pid, std::uint64_t add
 	if (target_pid != static_cast<std::uint64_t>(GetCurrentProcessId())) return;
 	resolve_aida_module_range();
 	if (!address_overlaps_aida(address, size)) return;
+	latch_self_analysis_violation("driver_self_access");
 	arm_destructive_enforcement();
 	enforce_self_analysis_violation();
 }
@@ -1253,6 +1310,7 @@ inline void guard_driver_self_module(std::uint64_t target_pid, std::uint64_t mod
 	if (g_aida_module_base == 0) return;
 	if (module_base == g_aida_module_base)
 	{
+		latch_self_analysis_violation("driver_self_module");
 		arm_destructive_enforcement();
 		enforce_self_analysis_violation();
 	}
@@ -1284,8 +1342,9 @@ inline void start_pipe_monitor()
 				buf[bytesRead] = '\0';
 				if (strstr(buf, OBFSTR_C("VIOLATION:CONFIRMED:")))
 				{
+					latch_self_analysis_violation(buf);
 					arm_destructive_enforcement();
-					report_violation_to_server(buf);
+					sync_latched_violation_with_server();
 					enforce_self_analysis_violation();
 				}
 			}
@@ -1406,8 +1465,9 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 						{
 							CloseHandle(hProc);
 							CloseHandle(snap);
+							latch_self_analysis_violation("re_tool_loaded_aida");
 							arm_destructive_enforcement();
-							report_violation_to_server("re_tool_loaded_aida");
+							sync_latched_violation_with_server();
 							enforce_self_analysis_violation();
 							return;
 						}
@@ -1506,8 +1566,9 @@ inline void start_driver_tamper_monitor()
 
 			if (violation)
 			{
+				latch_self_analysis_violation(violation);
 				arm_destructive_enforcement();
-				report_violation_to_server(violation);
+				sync_latched_violation_with_server();
 				enforce_self_analysis_violation();
 				return;
 			}
@@ -1597,6 +1658,9 @@ inline void delete_local_license_config()
 
 inline void enforce_self_analysis_violation()
 {
+	latch_self_analysis_violation("self_analysis_bsod", false);
+	sync_latched_violation_with_server();
+
 	if (!g_destructive_enforcement_armed.load(std::memory_order_acquire))
 	{
 		license_manager_t::instance().invalidate_runtime();
@@ -1624,15 +1688,6 @@ inline void enforce_self_analysis_violation()
 			         "\xe2\x9c\x85 Local license config wiped\n"
 			         "\xe2\x9c\x85 System will BSOD"),
 		discord_webhook::COLOR_RED);
-
-
-	revoke_license_on_server(license_key, hwid, OBFSTR("self_analysis_bsod"));
-
-
-	ban_hwid_and_ip_on_server(license_key, hwid, public_ip, mac, OBFSTR("self_analysis_bsod"));
-
-
-	report_violation_to_server("self_analysis_bsod");
 
 
 	delete_local_license_config();
@@ -1696,6 +1751,9 @@ inline void enforce_self_analysis_violation()
 namespace anti_re {
 inline bool initialize() { return true; }
 inline bool guard() { return true; }
+inline bool violation_latched() { return false; }
+inline void latch_self_analysis_violation(const char*, bool = true) {}
+inline void sync_latched_violation_with_server() {}
 inline void enforce_self_analysis_violation() {}
 inline void arm_destructive_enforcement() {}
 inline void disarm_destructive_enforcement() {}

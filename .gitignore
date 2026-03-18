@@ -45,6 +45,12 @@ vcpkg_installed/
 # Models cache
 models.json
 
+# Local signing secrets
+firebase/functions/.local-secrets/
+
+# Local license validation output
+license-validation-response.json
+
 # just in case
 ai_assistant.cfg
 
