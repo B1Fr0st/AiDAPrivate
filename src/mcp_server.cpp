@@ -17,6 +17,21 @@ static const std::string& get_mcp_protocol_version()
     static const std::string v = OBFSTR("2024-11-05");
     return v;
 }
+
+static const std::string& get_mcp_server_instructions()
+{
+    static const std::string instructions =
+        "You are AiDA, an advanced reverse-engineering assistant operating over MCP against a live IDA Pro database. "
+        "Be precise, tool-driven, and evidence-based. Use the MCP tools to inspect the current binary instead of guessing.\n\n"
+        "MANDATORY RULE: For ALL number base conversions (hexadecimal to decimal, decimal to hexadecimal, binary conversions, computing byte representations of integers, interpreting stack-constructed byte sequences as characters, ASCII character value lookups), you MUST use the `convert_number` tool. NEVER interpret hex byte values as ASCII characters manually or convert between number bases in your head.\n\n"
+        "Default to static analysis first, but escalation is mandatory when blocked. Follow this decision tree: Static Analysis -> Deobfuscation -> Driver (live memory) -> Emulation (Zydis+Unicorn). Never stop at 'obfuscated' or 'unreadable' if deeper analysis tools can resolve it.\n\n"
+        "If static analysis is weak, run `detect_obfuscation_patterns`. If obfuscation is present, use `full_deobfuscation_pass` or targeted deobfuscation tools, then re-decompile. If code is still encrypted, packed, or runtime-only, escalate to driver tools: `driver_status`, `driver_connect`, `driver_attach`, `driver_read_memory`, `driver_read_kernel_memory`, and `disassemble_zydis` to inspect real runtime bytes. If logic remains opaque after live-byte recovery, escalate to emulation: `trace_execution_unicorn`, `analyze_vm_handler`, `emulate_multi_trace`, `emulate_function`, or `driver_snapshot_and_emulate`.\n\n"
+        "Treat network analysis as a parallel branch that can be triggered at ANY phase. If you discover network evidence such as imports from ws2_32, winhttp, or wininet; URLs, IPs, domains, HTTP verbs, port numbers, or send/recv/connect style call paths, proactively pivot into network analysis. Use Phase-12 style packet tools for plaintext traffic, Phase-13 style TLS/QUIC/DTLS tooling for encrypted traffic, and `driver_sniff_network_buffers` for proprietary or pre-encryption buffer capture.\n\n"
+        "Use GraphRAG first on indexed binaries: `get_graph_stats` to confirm indexing, then `search_semantic` before slower IDA search tools. For security analysis, prefer `run_security_analysis`, `run_taint_analysis`, and `get_security_overview`.\n\n"
+        "Use the debugger only when you need runtime state and anti-debug is not a concern. If the target likely contains anti-debug or integrity checks, prefer driver plus emulation instead of the debugger. Before any driver operation, call `driver_status`; if not connected, call `driver_connect`. For usermode process targets, attach with `driver_attach` before process-specific driver operations.\n\n"
+        "Batch related read-only tool calls aggressively, avoid duplicate calls with identical parameters, and keep conclusions tied to concrete addresses, imports, strings, traces, or observed runtime behavior.";
+    return instructions;
+}
 #define MCP_PROTOCOL_VERSION get_mcp_protocol_version().c_str()
 
 static std::string generate_session_id()
@@ -59,6 +74,58 @@ struct mcp_resource_exec_request_t : public exec_request_t
     {
         subagents::execution_context_scope_t scope(session, run_id);
         result = agent_tools::ToolRegistry::instance().execute_tool(tool_name, tool_params);
+        return 0;
+    }
+};
+
+struct mcp_batch_exec_request_t : public exec_request_t
+{
+    std::vector<std::pair<std::string, json>> calls;
+    std::vector<agent_tools::tool_result_t> results;
+    std::shared_ptr<subagents::session_record_t> session;
+    uint64_t run_id = 0;
+    bool include_rag = false;
+    std::string rag_addr_str;
+    json rag_result;
+    bool rag_resolved = false;
+
+    ssize_t idaapi execute() override
+    {
+        subagents::execution_context_scope_t scope(session, run_id);
+
+        results.clear();
+        results.reserve(calls.size());
+        for (const auto& call : calls)
+            results.push_back(agent_tools::ToolRegistry::instance().execute_tool(call.first, call.second));
+
+        if (include_rag && !rag_addr_str.empty())
+        {
+            ea_t ea = BADADDR;
+            ea = get_name_ea(BADADDR, rag_addr_str.c_str());
+            if (ea == BADADDR)
+            {
+                try
+                {
+                    std::string clean = rag_addr_str;
+                    if (clean.size() > 2
+                        && clean[0] == '0'
+                        && (clean[1] == 'x' || clean[1] == 'X'))
+                    {
+                        clean = clean.substr(2);
+                    }
+                    ea = static_cast<ea_t>(std::stoull(clean, nullptr, 16));
+                }
+                catch (...) {}
+            }
+
+            if (ea != BADADDR)
+            {
+                rag_result = ida_utils::get_full_cached_context(ea, g_settings);
+                rag_resolved = rag_result.contains("ok") && rag_result["ok"].is_boolean()
+                             && rag_result["ok"].get<bool>();
+            }
+        }
+
         return 0;
     }
 };
@@ -379,6 +446,65 @@ static json build_mcp_tools_list()
     return tools;
 }
 
+static const json& get_cached_mcp_tools_list()
+{
+    static const json tools = build_mcp_tools_list();
+    return tools;
+}
+
+static json build_mcp_resources_list()
+{
+    json resources = json::array();
+    for (const auto& rdef : get_resource_definitions())
+    {
+        json r;
+        r[OBFSTR_C("uri")] = rdef.uri;
+        r[OBFSTR_C("name")] = rdef.name;
+        r[OBFSTR_C("description")] = rdef.description;
+        r["mimeType"] = rdef.mime_type;
+        resources.push_back(r);
+    }
+    return resources;
+}
+
+static const json& get_cached_mcp_resources_list()
+{
+    static const json resources = build_mcp_resources_list();
+    return resources;
+}
+
+static json build_mcp_prompts_catalog()
+{
+    json prompts_arr = json::array();
+    for (const auto& pdef : get_prompt_definitions())
+    {
+        json p;
+        p[OBFSTR_C("name")] = pdef.name;
+        p[OBFSTR_C("description")] = pdef.description;
+        if (!pdef.arguments.empty())
+        {
+            json args = json::array();
+            for (const auto& arg : pdef.arguments)
+            {
+                args.push_back({
+                    {OBFSTR_C("name"), arg.name},
+                    {OBFSTR_C("description"), arg.description},
+                    {"required", arg.required}
+                });
+            }
+            p["arguments"] = args;
+        }
+        prompts_arr.push_back(p);
+    }
+    return prompts_arr;
+}
+
+static const json& get_cached_mcp_prompts_catalog()
+{
+    static const json prompts = build_mcp_prompts_catalog();
+    return prompts;
+}
+
 static json handle_initialize(const json& id, const json& )
 {
     json capabilities;
@@ -395,17 +521,7 @@ static json handle_initialize(const json& id, const json& )
     result[OBFSTR_C("protocolVersion")] = MCP_PROTOCOL_VERSION;
     result[OBFSTR_C("capabilities")] = capabilities;
     result[OBFSTR_C("serverInfo")] = server_info;
-    result["instructions"] =
-        "MANDATORY RULE: For ALL number base conversions (hexadecimal to decimal, decimal to "
-        "hexadecimal, binary conversions, computing byte representations of integers, "
-        "interpreting stack-constructed byte sequences as characters, ASCII character value "
-        "lookups), you MUST use the `convert_number` tool. NEVER interpret hex byte values "
-        "as ASCII characters manually or convert between number bases in your head. When you "
-        "see values like 0x426D416C on the stack, you MUST call `convert_number` to decode "
-        "them. Simple same-base arithmetic (e.g., 108 + 2 = 110) is fine to do mentally, but "
-        "if you then need to know what ASCII character 110 represents, call `convert_number` "
-        "with '110'. The tool accepts single numeric literals only — not arithmetic expressions. "
-        "Violations on base conversions produce incorrect results.";
+    result["instructions"] = get_mcp_server_instructions();
 
     return make_jsonrpc_result(id, result);
 }
@@ -418,7 +534,7 @@ static json handle_ping(const json& id)
 static json handle_tools_list(const json& id)
 {
     json result;
-    result[OBFSTR_C("tools")] = build_mcp_tools_list();
+    result[OBFSTR_C("tools")] = get_cached_mcp_tools_list();
     return make_jsonrpc_result(id, result);
 }
 
@@ -475,19 +591,8 @@ static json handle_tools_call(const json& id, const json& params)
 
 static json handle_resources_list(const json& id)
 {
-    json resources = json::array();
-    for (const auto& rdef : get_resource_definitions())
-    {
-        json r;
-        r[OBFSTR_C("uri")] = rdef.uri;
-        r[OBFSTR_C("name")] = rdef.name;
-        r[OBFSTR_C("description")] = rdef.description;
-        r["mimeType"] = rdef.mime_type;
-        resources.push_back(r);
-    }
-
     json result;
-    result[OBFSTR_C("resources")] = resources;
+    result[OBFSTR_C("resources")] = get_cached_mcp_resources_list();
     return make_jsonrpc_result(id, result);
 }
 
@@ -556,93 +661,27 @@ static json handle_resources_templates_list(const json& id)
 
 static json handle_prompts_list(const json& id)
 {
-    json prompts_arr = json::array();
-    for (const auto& pdef : get_prompt_definitions())
-    {
-        json p;
-        p[OBFSTR_C("name")] = pdef.name;
-        p[OBFSTR_C("description")] = pdef.description;
-        if (!pdef.arguments.empty())
-        {
-            json args = json::array();
-            for (const auto& arg : pdef.arguments)
-            {
-                args.push_back({
-                    {OBFSTR_C("name"), arg.name},
-                    {OBFSTR_C("description"), arg.description},
-                    {"required", arg.required}
-                });
-            }
-            p["arguments"] = args;
-        }
-        prompts_arr.push_back(p);
-    }
-
     json result;
-    result[OBFSTR_C("prompts")] = prompts_arr;
+    result[OBFSTR_C("prompts")] = get_cached_mcp_prompts_catalog();
     return make_jsonrpc_result(id, result);
 }
 
-struct mcp_rag_request_t : public exec_request_t
+static std::string build_rag_section_from_result(const json& rag_result, bool resolved)
 {
-    std::string addr_str;
-    json rag_result;
-    bool resolved = false;
-
-    explicit mcp_rag_request_t(const std::string& addr) : addr_str(addr) {}
-
-    ssize_t idaapi execute() override
-    {
-        ea_t ea = BADADDR;
-        if (!addr_str.empty())
-        {
-            ea = get_name_ea(BADADDR, addr_str.c_str());
-            if (ea == BADADDR)
-            {
-                try
-                {
-                    std::string clean = addr_str;
-                    if (clean.size() > 2
-                        && clean[0] == '0'
-                        && (clean[1] == 'x' || clean[1] == 'X'))
-                    {
-                        clean = clean.substr(2);
-                    }
-                    ea = static_cast<ea_t>(std::stoull(clean, nullptr, 16));
-                }
-                catch (...) {}
-            }
-        }
-
-        if (ea != BADADDR)
-        {
-            rag_result = ida_utils::get_full_cached_context(ea, g_settings);
-            resolved = rag_result.contains("ok") && rag_result["ok"].is_boolean()
-                     && rag_result["ok"].get<bool>();
-        }
-        return 0;
-    }
-};
-
-static std::string build_rag_section(const std::string& addr_str)
-{
-    mcp_rag_request_t req(addr_str);
-    execute_sync(req, MFF_READ);
-
-    if (!req.resolved)
+    if (!resolved)
         return "";
 
     std::string section;
     section.reserve(4096);
 
-    std::string metadata = json_str(req.rag_result, "binary_metadata", "");
-    std::string imports  = json_str(req.rag_result, "imports_context", "");
-    std::string types    = json_str(req.rag_result, "type_context", "");
-    std::string callers  = json_str(req.rag_result, "xrefs_to", "");
-    std::string callees  = json_str(req.rag_result, "xrefs_from", "");
-    std::string locals   = json_str(req.rag_result, "local_vars", "");
-    std::string strings  = json_str(req.rag_result, "string_xrefs", "");
-    std::string structs  = json_str(req.rag_result, "struct_context", "");
+    std::string metadata = json_str(rag_result, "binary_metadata", "");
+    std::string imports  = json_str(rag_result, "imports_context", "");
+    std::string types    = json_str(rag_result, "type_context", "");
+    std::string callers  = json_str(rag_result, "xrefs_to", "");
+    std::string callees  = json_str(rag_result, "xrefs_from", "");
+    std::string locals   = json_str(rag_result, "local_vars", "");
+    std::string strings  = json_str(rag_result, "string_xrefs", "");
+    std::string structs  = json_str(rag_result, "struct_context", "");
 
     if (!metadata.empty())
         section += "\n## Binary Context\n```\n" + metadata + "\n```\n";
@@ -701,7 +740,17 @@ static json handle_prompts_get(const json& id, const json& params)
         if (addr_str.empty())
             return make_jsonrpc_error(id, JSONRPC_INVALID_PARAMS, "Missing required argument: 'address'");
 
-        auto decomp_result = execute_tool_in_main_thread("decompile_function", {{"address", addr_str}});
+        mcp_batch_exec_request_t req;
+        req.calls.push_back({"decompile_function", {{"address", addr_str}}});
+        if (name == "analyze_function")
+            req.calls.push_back({"get_xrefs_to", {{"address", addr_str}}});
+        req.include_rag = true;
+        req.rag_addr_str = addr_str;
+        req.session = subagents::current_session_record();
+        req.run_id = subagents::current_run_id();
+        execute_sync(req, MFF_READ);
+
+        const auto& decomp_result = req.results[0];
         std::string code_context;
         if (decomp_result.success)
             code_context = !decomp_result.data.is_null() ? json_dump_safe(decomp_result.data, 2) : decomp_result.output;
@@ -711,8 +760,8 @@ static json handle_prompts_get(const json& id, const json& params)
         std::string prompt_text;
         if (name == "analyze_function")
         {
-            auto xrefs_result = execute_tool_in_main_thread("get_xrefs_to", {{"address", addr_str}});
             std::string xrefs_text;
+            const auto& xrefs_result = req.results[1];
             if (xrefs_result.success)
                 xrefs_text = !xrefs_result.data.is_null() ? json_dump_safe(xrefs_result.data, 2) : xrefs_result.output;
 
@@ -753,7 +802,7 @@ static json handle_prompts_get(const json& id, const json& params)
                 "## Decompiled Code\n```cpp\n" + code_context + "\n```\n";
         }
 
-        prompt_text += build_rag_section(addr_str);
+            prompt_text += build_rag_section_from_result(req.rag_result, req.rag_resolved);
 
         messages.push_back({
             {"role", "user"},
@@ -762,11 +811,21 @@ static json handle_prompts_get(const json& id, const json& params)
     }
     else if (name == "binary_overview")
     {
-        auto info_result = execute_tool_in_main_thread("get_binary_info", json::object());
-        auto segments_result = execute_tool_in_main_thread("list_segments", json::object());
-        auto imports_result = execute_tool_in_main_thread("list_imports", json::object());
-        auto exports_result = execute_tool_in_main_thread("list_exports", json::object());
-        auto entries_result = execute_tool_in_main_thread("list_exports", json::object());
+        mcp_batch_exec_request_t req;
+        req.calls.push_back({"get_binary_info", json::object()});
+        req.calls.push_back({"list_segments", json::object()});
+        req.calls.push_back({"list_imports", json::object()});
+        req.calls.push_back({"list_exports", json::object()});
+        req.calls.push_back({"list_exports", json::object()});
+        req.session = subagents::current_session_record();
+        req.run_id = subagents::current_run_id();
+        execute_sync(req, MFF_READ);
+
+        const auto& info_result = req.results[0];
+        const auto& segments_result = req.results[1];
+        const auto& imports_result = req.results[2];
+        const auto& exports_result = req.results[3];
+        const auto& entries_result = req.results[4];
 
         std::string overview = "Provide a comprehensive analysis of the following binary loaded in IDA Pro.\n\n";
 
@@ -792,7 +851,15 @@ static json handle_prompts_get(const json& id, const json& params)
         if (addr_str.empty())
             return make_jsonrpc_error(id, JSONRPC_INVALID_PARAMS, "Missing required argument: 'address'");
 
-        auto info_result = execute_tool_in_main_thread("get_address_info", {{"address", addr_str}});
+        mcp_batch_exec_request_t req;
+        req.calls.push_back({"get_address_info", {{"address", addr_str}}});
+        req.include_rag = true;
+        req.rag_addr_str = addr_str;
+        req.session = subagents::current_session_record();
+        req.run_id = subagents::current_run_id();
+        execute_sync(req, MFF_READ);
+
+        const auto& info_result = req.results[0];
 
         std::string text = "Explain what exists at address " + addr_str + " in the loaded binary:\n\n";
         if (info_result.success)
@@ -807,23 +874,13 @@ static json handle_prompts_get(const json& id, const json& params)
             text += "Could not retrieve information: " + info_result.output;
         }
 
-        text += build_rag_section(addr_str);
+        text += build_rag_section_from_result(req.rag_result, req.rag_resolved);
 
         messages.push_back({
             {"role", "user"},
             {OBFSTR_C("content"), {{OBFSTR_C("type"), "text"}, {OBFSTR_C("text"), sanitize_utf8(text)}}}
         });
     }
-
-    static const std::string convert_number_instruction =
-        "MANDATORY RULE: For ALL number base conversions (hex to decimal, decimal to hex, "
-        "binary, byte representations, ASCII lookups, or any cross-base arithmetic), you MUST "
-        "use the `convert_number` tool. NEVER perform number conversions manually.";
-
-    messages.insert(messages.begin(), {
-        {"role", "user"},
-        {OBFSTR_C("content"), {{OBFSTR_C("type"), "text"}, {OBFSTR_C("text"), convert_number_instruction}}}
-    });
 
     json result;
     result[OBFSTR_C("description")] = found->description;
@@ -1194,7 +1251,7 @@ void mcp_server_t::server_thread_func(int port)
     });
 
     svr.Get("/api/tools", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(json_dump_safe(build_mcp_tools_list(), 2), "application/json");
+        res.set_content(json_dump_safe(get_cached_mcp_tools_list(), 2), "application/json");
     });
 
     svr.Post("/api/tools/call", [](const httplib::Request& req, httplib::Response& res) {

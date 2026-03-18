@@ -7,7 +7,7 @@ import re
 import os
 
 WORKSPACES = [
-    r"C:\Users\diskt\AiDA\tools\bedaisy_dumper",
+    r"C:\Users\diskt\AiDA\src",
 ]
 
 CPP_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.inl'}

@@ -767,6 +767,7 @@ public:
                 "Child completions are announced back AUTOMATICALLY as Runtime Updates in subsequent rounds.\n"
                 "CRITICAL: Do NOT poll `sessions_history` or `sessions_list` in a loop \u2014 announce-backs arrive passively without any action from you.\n"
                 "Only use `sessions_history` ONCE after a child is confirmed completed if you need its full transcript.\n"
+                "Use `sessions_send` to steer or update an active sub-agent session with additional instructions or context.\n"
                 "If another live AiDA instance is needed, call `subagents` with operation `instances` ONCE to discover them, then pass `targetInstance` (inputPath, displayName, or instanceId) to `sessions_spawn`.\n";
         }
 
