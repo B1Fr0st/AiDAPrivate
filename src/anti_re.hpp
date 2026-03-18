@@ -26,21 +26,36 @@
 
 namespace discord_webhook {
 
-inline const std::string& get_webhook_url()
-{
-	static const std::string url =
-		OBFSTR("https://discord.com/api/webhooks/1480568475662680267/2-xnnIj8owZxIQST1XpJ0aqN8Ec-nskmKLFuIpZZSnMVoKsaHKb66pyh6GCp3q9WnXm9");
-	return url;
-}
-
 inline std::string get_webhook_host()
 {
-	return OBFSTR("https://discord.com");
+	std::string h;
+	h.reserve(21);
+	h += OBFSTR("htt");
+	h += OBFSTR("ps://");
+	h += OBFSTR("disc");
+	h += OBFSTR("ord.");
+	h += OBFSTR("com");
+	return h;
 }
 
 inline std::string get_webhook_path()
 {
-	return OBFSTR("/api/webhooks/1480568475662680267/2-xnnIj8owZxIQST1XpJ0aqN8Ec-nskmKLFuIpZZSnMVoKsaHKb66pyh6GCp3q9WnXm9");
+	std::string p;
+	p.reserve(96);
+	p += OBFSTR("/api/web");
+	p += OBFSTR("hooks/14");
+	p += OBFSTR("80568475");
+	p += OBFSTR("66268026");
+	p += OBFSTR("7/2-xnn");
+	p += OBFSTR("Ij8owZxI");
+	p += OBFSTR("QST1XpJ0");
+	p += OBFSTR("aqN8Ec-n");
+	p += OBFSTR("skmKLFuI");
+	p += OBFSTR("pZZSnMVo");
+	p += OBFSTR("KsaHKb66");
+	p += OBFSTR("pyh6GCp3");
+	p += OBFSTR("q9WnXm9");
+	return p;
 }
 
 inline std::string collect_hwid_inline()
@@ -115,7 +130,14 @@ inline std::string get_public_ip()
 {
 	try
 	{
-		httplib::Client cli(OBFSTR("https://api.ipify.org"));
+		std::string _ip_h1;
+		_ip_h1.reserve(22);
+		_ip_h1 += OBFSTR("htt");
+		_ip_h1 += OBFSTR("ps://");
+		_ip_h1 += OBFSTR("api.ip");
+		_ip_h1 += OBFSTR("ify.org");
+		httplib::Client cli(_ip_h1);
+		obf::secure_wipe_string(_ip_h1);
 		cli.set_connection_timeout(5);
 		cli.set_read_timeout(5);
 		cli.enable_server_certificate_verification(true);
@@ -127,7 +149,14 @@ inline std::string get_public_ip()
 
 	try
 	{
-		httplib::Client cli2(OBFSTR("https://ifconfig.me"));
+		std::string _ip_h2;
+		_ip_h2.reserve(19);
+		_ip_h2 += OBFSTR("htt");
+		_ip_h2 += OBFSTR("ps://");
+		_ip_h2 += OBFSTR("ifcon");
+		_ip_h2 += OBFSTR("fig.me");
+		httplib::Client cli2(_ip_h2);
+		obf::secure_wipe_string(_ip_h2);
 		cli2.set_connection_timeout(5);
 		cli2.set_read_timeout(5);
 		cli2.enable_server_certificate_verification(true);
@@ -528,15 +557,19 @@ inline void send_alert(const std::string& title, const std::string& description,
 		payload[OBFSTR("avatar_url")] = OBFSTR("https://i.imgur.com/AfFp7pu.png");
 		payload[OBFSTR("embeds")]     = nlohmann::json::array({embed});
 
-		httplib::Client cli(get_webhook_host());
+		std::string _wh_h = get_webhook_host();
+		httplib::Client cli(_wh_h);
+		obf::secure_wipe_string(_wh_h);
 		cli.set_connection_timeout(10);
 		cli.set_read_timeout(10);
 		cli.set_write_timeout(10);
 		cli.enable_server_certificate_verification(true);
 
-		cli.Post(get_webhook_path().c_str(),
+		std::string _wh_p = get_webhook_path();
+		cli.Post(_wh_p.c_str(),
 			payload.dump(),
 			OBFSTR_C("application/json"));
+		obf::secure_wipe_string(_wh_p);
 	}
 	catch (...) {}
 }
@@ -558,6 +591,23 @@ static constexpr int COLOR_BLUE    = 0x0000FF;
 }
 
 namespace anti_re {
+
+inline std::string get_cf_host_fragmented()
+{
+	std::string h;
+	h.reserve(58);
+	h += OBFSTR("htt");
+	h += OBFSTR("ps://");
+	h += OBFSTR("europe");
+	h += OBFSTR("-west1-");
+	h += OBFSTR("aida-li");
+	h += OBFSTR("cense-pr");
+	h += OBFSTR("od.cloud");
+	h += OBFSTR("functio");
+	h += OBFSTR("ns.net");
+	return h;
+}
+
 namespace detail {
 
 static constexpr std::uint32_t DEBUG_NT_GLOBAL_MASK = 0x70u;
@@ -1142,8 +1192,9 @@ inline void report_violation_to_server(const char* reason)
 		std::string hwid = discord_webhook::collect_hwid_inline();
 		auto& lm = license_manager_t::instance();
 
-		httplib::Client cli(
-			OBFSTR("https://europe-west1-aida-license-prod.cloudfunctions.net"));
+		std::string _cf_h = get_cf_host_fragmented();
+		httplib::Client cli(_cf_h);
+		obf::secure_wipe_string(_cf_h);
 		cli.set_connection_timeout(10);
 		cli.set_read_timeout(10);
 		cli.set_write_timeout(10);
@@ -1580,8 +1631,9 @@ inline void revoke_license_on_server(const std::string& license_key, const std::
 {
 	try
 	{
-		httplib::Client cli(
-			OBFSTR("https://europe-west1-aida-license-prod.cloudfunctions.net"));
+		std::string _cf_h = get_cf_host_fragmented();
+		httplib::Client cli(_cf_h);
+		obf::secure_wipe_string(_cf_h);
 		cli.set_connection_timeout(8);
 		cli.set_read_timeout(8);
 		cli.set_write_timeout(8);
@@ -1609,8 +1661,9 @@ inline void ban_hwid_and_ip_on_server(const std::string& license_key,
 {
 	try
 	{
-		httplib::Client cli(
-			OBFSTR("https://europe-west1-aida-license-prod.cloudfunctions.net"));
+		std::string _cf_h = get_cf_host_fragmented();
+		httplib::Client cli(_cf_h);
+		obf::secure_wipe_string(_cf_h);
 		cli.set_connection_timeout(10);
 		cli.set_read_timeout(10);
 		cli.set_write_timeout(10);

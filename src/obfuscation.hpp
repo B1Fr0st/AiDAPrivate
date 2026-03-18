@@ -109,6 +109,18 @@ public:
 #define WOBFSTR_C(s) (WOBFSTR(s).c_str())
 
 namespace obf {
+
+inline void secure_wipe_string(std::string& s)
+{
+    if (!s.empty())
+    {
+        volatile char* p = &s[0];
+        for (size_t i = 0; i < s.size(); ++i)
+            p[i] = 0;
+        s.clear();
+    }
+}
+
 namespace detail {
 
 constexpr uint8_t cipher_secret_byte(uint8_t c, uint8_t key, size_t idx) noexcept

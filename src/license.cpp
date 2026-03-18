@@ -27,17 +27,9 @@
 #include <openssl/rand.h>
 #include <openssl/x509.h>
 
-static const std::string& get_firebase_host()
+static std::string get_hardcoded_firebase_api_key()
 {
-    static const std::string host =
-        OBFSTR("https://aida-license-prod-default-rtdb.europe-west1.firebasedatabase.app");
-    return host;
-}
-
-static const std::string& get_hardcoded_firebase_api_key()
-{
-    static const std::string key = OBFBYTES("bWLmMKBhD3TE7iYMnKizIjOrt4jXd9R1m0CVCj6P");
-    return key;
+    return OBFBYTES("bWLmMKBhD3TE7iYMnKizIjOrt4jXd9R1m0CVCj6P");
 }
 
 static std::string get_effective_firebase_api_key()
@@ -51,11 +43,20 @@ static std::string get_effective_firebase_api_key()
     return key;
 }
 
-static const std::string& get_cloud_function_host()
+static std::string get_cloud_function_host()
 {
-    static const std::string host =
-        OBFSTR("https://europe-west1-aida-license-prod.cloudfunctions.net");
-    return host;
+    std::string h;
+    h.reserve(58);
+    h += OBFSTR("htt");
+    h += OBFSTR("ps://");
+    h += OBFSTR("europe");
+    h += OBFSTR("-west1-");
+    h += OBFSTR("aida-li");
+    h += OBFSTR("cense-pr");
+    h += OBFSTR("od.cloud");
+    h += OBFSTR("functio");
+    h += OBFSTR("ns.net");
+    return h;
 }
 
 static bool is_supported_cloud_function_host(const std::string& host)
@@ -64,27 +65,52 @@ static bool is_supported_cloud_function_host(const std::string& host)
         || host.find(OBFSTR("run.app")) != std::string::npos;
 }
 
-static const std::string& get_firebase_auth_host()
+static std::string get_firebase_auth_host()
 {
-    static const std::string host =
-        OBFSTR("https://identitytoolkit.googleapis.com");
-    return host;
+    std::string h;
+    h.reserve(39);
+    h += OBFSTR("htt");
+    h += OBFSTR("ps://");
+    h += OBFSTR("identi");
+    h += OBFSTR("tytool");
+    h += OBFSTR("kit.go");
+    h += OBFSTR("ogleap");
+    h += OBFSTR("is.com");
+    return h;
 }
 
-static const std::string& get_firebase_token_host()
+static std::string get_firebase_token_host()
 {
-    static const std::string host =
-        OBFSTR("https://securetoken.googleapis.com");
-    return host;
+    std::string h;
+    h.reserve(35);
+    h += OBFSTR("htt");
+    h += OBFSTR("ps://");
+    h += OBFSTR("secur");
+    h += OBFSTR("etoke");
+    h += OBFSTR("n.goo");
+    h += OBFSTR("gleap");
+    h += OBFSTR("is.com");
+    return h;
 }
 
 static constexpr int64_t LICENSE_CACHE_DURATION_SEC = 24 * 3600;
 
-static const std::string& get_server_signing_public_key_der_hex()
+static std::string get_server_signing_public_key_der_hex()
 {
-    static const std::string key =
-        OBFSTR("302a300506032b6570032100049ed74a6f0e19698f759cc063bbe0bca0a9f7f73c818adb814e9be8be03a648");
-    return key;
+    std::string k;
+    k.reserve(88);
+    k += OBFSTR("302a3005");
+    k += OBFSTR("06032b65");
+    k += OBFSTR("70032100");
+    k += OBFSTR("049ed74a");
+    k += OBFSTR("6f0e1969");
+    k += OBFSTR("8f759cc0");
+    k += OBFSTR("63bbe0bc");
+    k += OBFSTR("a0a9f7f7");
+    k += OBFSTR("3c818adb");
+    k += OBFSTR("814e9be8");
+    k += OBFSTR("be03a648");
+    return k;
 }
 
 static bool decode_hex_string(const std::string& text, std::vector<unsigned char>& out)
@@ -714,7 +740,9 @@ bool license_manager_t::firebase_authenticate()
 
     try
     {
-        httplib::Client client(get_firebase_auth_host());
+        std::string _auth_h = get_firebase_auth_host();
+        httplib::Client client(_auth_h);
+        obf::secure_wipe_string(_auth_h);
         client.set_connection_timeout(10);
         client.set_read_timeout(10);
         client.set_write_timeout(10);
@@ -763,7 +791,9 @@ bool license_manager_t::firebase_refresh_token_if_needed()
 
     try
     {
-        httplib::Client client(get_firebase_token_host());
+        std::string _tok_h = get_firebase_token_host();
+        httplib::Client client(_tok_h);
+        obf::secure_wipe_string(_tok_h);
         client.set_connection_timeout(10);
         client.set_read_timeout(10);
         client.set_write_timeout(10);
@@ -841,6 +871,24 @@ bool license_manager_t::validate()
         sig_payload[OBFSTR("client_nonce")]  = m_client_nonce;
         lic[OBFSTR("license_sig_payload")] = sig_payload.dump();
 
+        {
+            nlohmann::json gate2_pl;
+            gate2_pl[OBFSTR("status")]        = OBFSTR("valid");
+            gate2_pl[OBFSTR("license_key")]   = key;
+            gate2_pl[OBFSTR("hwid")]          = current_hwid;
+            gate2_pl[OBFSTR("plan")]          = m_plan;
+            gate2_pl[OBFSTR("session_token")] = m_server_session_token;
+            gate2_pl[OBFSTR("ttl")]           = m_server_ttl;
+            gate2_pl[OBFSTR("issued_at")]     = m_server_issued_at;
+            gate2_pl[OBFSTR("server_nonce")]  = m_session_id;
+            gate2_pl[OBFSTR("client_nonce")]  = m_client_nonce;
+            if (!verify_server_signature(gate2_pl.dump(), m_server_signature))
+            {
+                invalidate_runtime();
+                return false;
+            }
+        }
+
         check_dll_leak(current_hwid);
 
         write_license_config(lic);
@@ -852,7 +900,15 @@ bool license_manager_t::validate()
         m_consecutive_heartbeat_failures.store(0, std::memory_order_release);
         m_bound_hwid = current_hwid;
 
-        compute_session_credentials(key, current_hwid, now, m_server_session_token);
+        compute_session_credentials(key, current_hwid, now, m_server_session_token,
+                                    m_server_signature);
+
+        if (m_sig_binding_tag.load(std::memory_order_acquire) == 0)
+        {
+            invalidate_runtime();
+            return false;
+        }
+
         return true;
     }
 
@@ -875,7 +931,8 @@ bool license_manager_t::is_valid() const
 
     return m_valid.load(std::memory_order_acquire)
         && m_runtime_nonce.load(std::memory_order_acquire) != 0
-        && m_online_validated_this_session.load(std::memory_order_acquire);
+        && m_online_validated_this_session.load(std::memory_order_acquire)
+        && m_sig_binding_tag.load(std::memory_order_acquire) != 0;
 }
 
 void license_manager_t::invalidate_runtime()
@@ -884,6 +941,7 @@ void license_manager_t::invalidate_runtime()
     m_nonce_canary.store(0, std::memory_order_release);
     m_runtime_nonce.store(0, std::memory_order_release);
     m_integrity_seed.store(0, std::memory_order_release);
+    m_sig_binding_tag.store(0, std::memory_order_release);
     m_revalidation_pending.store(false, std::memory_order_release);
     m_online_validated_this_session.store(false, std::memory_order_release);
     m_consecutive_heartbeat_failures.store(0, std::memory_order_release);
@@ -900,6 +958,7 @@ void license_manager_t::invalidate_runtime()
     secure_clear_string(m_refresh_token);
     secure_clear_string(m_client_nonce);
     secure_clear_string(m_server_signature);
+    secure_clear_string(m_verified_signature);
     secure_clear_string(m_heartbeat_nonce);
 }
 
@@ -916,6 +975,14 @@ uint64_t license_manager_t::get_runtime_nonce() const
     uint64_t raw = m_runtime_nonce.load(std::memory_order_acquire);
     uint64_t canary = m_nonce_canary.load(std::memory_order_acquire);
     return raw ^ canary;
+}
+
+uint64_t license_manager_t::get_sig_binding_tag() const
+{
+    if (anti_re::violation_latched())
+        return 0;
+
+    return m_sig_binding_tag.load(std::memory_order_acquire);
 }
 
 bool license_manager_t::show_activation_dialog()
@@ -966,6 +1033,24 @@ bool license_manager_t::show_activation_dialog()
         sig_payload[OBFSTR("client_nonce")]  = m_client_nonce;
         lic[OBFSTR("license_sig_payload")] = sig_payload.dump();
 
+        {
+            nlohmann::json gate2_pl;
+            gate2_pl[OBFSTR("status")]        = OBFSTR("valid");
+            gate2_pl[OBFSTR("license_key")]   = key;
+            gate2_pl[OBFSTR("hwid")]          = current_hwid;
+            gate2_pl[OBFSTR("plan")]          = m_plan;
+            gate2_pl[OBFSTR("session_token")] = m_server_session_token;
+            gate2_pl[OBFSTR("ttl")]           = m_server_ttl;
+            gate2_pl[OBFSTR("issued_at")]     = m_server_issued_at;
+            gate2_pl[OBFSTR("server_nonce")]  = m_session_id;
+            gate2_pl[OBFSTR("client_nonce")]  = m_client_nonce;
+            if (!verify_server_signature(gate2_pl.dump(), m_server_signature))
+            {
+                invalidate_runtime();
+                return false;
+            }
+        }
+
         write_license_config(lic);
 
         m_valid = true;
@@ -975,7 +1060,14 @@ bool license_manager_t::show_activation_dialog()
         m_online_validated_this_session.store(true, std::memory_order_release);
         m_consecutive_heartbeat_failures.store(0, std::memory_order_release);
 
-        compute_session_credentials(key, current_hwid, now, m_server_session_token);
+        compute_session_credentials(key, current_hwid, now, m_server_session_token,
+                                    m_server_signature);
+
+        if (m_sig_binding_tag.load(std::memory_order_acquire) == 0)
+        {
+            invalidate_runtime();
+            return false;
+        }
 
         discord_webhook::send_alert_async(
             OBFSTR("\xe2\x9c\x85 LICENSE ACTIVATED"),
@@ -1050,6 +1142,20 @@ static int idaapi license_revalidation_timer_cb(void* )
         }
     }
 
+    if (!lm.verify_integrity_inline())
+    {
+        lm.invalidate_runtime();
+        lm.terminate_plugin();
+        return -1;
+    }
+
+    if (lm.get_sig_binding_tag() == 0)
+    {
+        lm.invalidate_runtime();
+        lm.terminate_plugin();
+        return -1;
+    }
+
     if (!lm.is_valid())
     {
         lm.terminate_plugin();
@@ -1095,18 +1201,19 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
 
     try
     {
-        httplib::Client client(get_cloud_function_host());
+        std::string _cf_h = get_cloud_function_host();
+        if (!is_supported_cloud_function_host(_cf_h))
+        {
+            obf::secure_wipe_string(_cf_h);
+            return false;
+        }
+        httplib::Client client(_cf_h);
+        obf::secure_wipe_string(_cf_h);
         client.set_connection_timeout(15);
         client.set_read_timeout(20);
         client.set_write_timeout(10);
         client.set_follow_location(true);
         client.enable_server_certificate_verification(true);
-
-        {
-            std::string host = get_cloud_function_host();
-            if (!is_supported_cloud_function_host(host))
-                return false;
-        }
 
         m_client_nonce = generate_session_nonce();
 
@@ -1242,10 +1349,39 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
     }
 }
 
+uint64_t license_manager_t::derive_sig_binding_tag(
+    const std::string& sig, uint64_t nonce) const
+{
+    if (sig.empty() || nonce == 0)
+        return 0;
+
+    uint64_t tag = 14695981039346656037ULL;
+    for (char c : sig)
+    {
+        tag ^= static_cast<uint8_t>(c);
+        tag *= 1099511628211ULL;
+    }
+    for (int i = 0; i < 8; ++i)
+    {
+        tag ^= (nonce >> (i * 8)) & 0xFF;
+        tag *= 1099511628211ULL;
+    }
+    tag ^= 0xC0FFEE42DEADBEEFULL;
+    tag *= 1099511628211ULL;
+
+    if (tag == 0)
+        tag = 0xB3A7C9D1E5F02468ULL;
+    if (tag == nonce)
+        tag ^= 0x1234567890ABCDEFULL;
+
+    return tag;
+}
+
 void license_manager_t::compute_session_credentials(const std::string& key,
                                                       const std::string& hwid,
                                                       int64_t ts,
-                                                      const std::string& server_token)
+                                                      const std::string& server_token,
+                                                      const std::string& server_sig)
 {
     uint64_t nonce = 14695981039346656037ULL;
     for (char c : key)   { nonce ^= static_cast<uint8_t>(c); nonce *= 1099511628211ULL; }
@@ -1275,6 +1411,12 @@ void license_manager_t::compute_session_credentials(const std::string& key,
         nonce *= 1099511628211ULL;
     }
 
+    for (char c : server_sig)
+    {
+        nonce ^= static_cast<uint8_t>(c);
+        nonce *= 1099511628211ULL;
+    }
+
     uint64_t canary = 0;
     {
         unsigned char canary_buf[8];
@@ -1288,6 +1430,11 @@ void license_manager_t::compute_session_credentials(const std::string& key,
 
     uint64_t seed = (nonce ^ 0xA5A5A5A5A5A5A5A5ULL) * 0x5851F42D4C957F2DULL;
     m_integrity_seed.store(seed, std::memory_order_release);
+
+    m_verified_signature = server_sig;
+    m_sig_binding_tag.store(
+        derive_sig_binding_tag(server_sig, nonce),
+        std::memory_order_release);
 }
 
 bool license_manager_t::perform_heartbeat()
@@ -1304,7 +1451,9 @@ bool license_manager_t::perform_heartbeat()
     {
         try
         {
-            httplib::Client client(get_cloud_function_host());
+            std::string _hb_h = get_cloud_function_host();
+            httplib::Client client(_hb_h);
+            obf::secure_wipe_string(_hb_h);
             client.set_connection_timeout(10);
             client.set_read_timeout(15);
             client.set_write_timeout(10);
@@ -1386,6 +1535,19 @@ bool license_manager_t::perform_heartbeat()
                         std::string new_plan = j.value(OBFSTR_C("plan"), std::string(""));
                         if (!new_plan.empty())
                             m_plan = new_plan;
+
+                        {
+                            uint64_t cur_nonce = m_runtime_nonce.load(std::memory_order_acquire)
+                                               ^ m_nonce_canary.load(std::memory_order_acquire);
+                            uint64_t fresh_tag = derive_sig_binding_tag(
+                                m_verified_signature, cur_nonce);
+                            if (fresh_tag == 0
+                                || fresh_tag != m_sig_binding_tag.load(std::memory_order_acquire))
+                            {
+                                invalidate_runtime();
+                                return false;
+                            }
+                        }
 
                         return true;
                     }
@@ -1503,6 +1665,17 @@ bool license_manager_t::verify_integrity_inline() const
     {
         uint64_t expected_relation = (nonce ^ 0xA5A5A5A5A5A5A5A5ULL) * 0x5851F42D4C957F2DULL;
         if (seed != expected_relation)
+            return false;
+    }
+
+    uint64_t sig_tag = m_sig_binding_tag.load(std::memory_order_acquire);
+    if (sig_tag == 0 || sig_tag == nonce)
+        return false;
+
+    if (!m_verified_signature.empty())
+    {
+        uint64_t expected_tag = derive_sig_binding_tag(m_verified_signature, nonce);
+        if (sig_tag != expected_tag)
             return false;
     }
 

@@ -14,6 +14,7 @@ public:
     bool show_activation_dialog();
     std::string get_plan() const;
     uint64_t get_runtime_nonce() const;
+    uint64_t get_sig_binding_tag() const;
     bool verify_integrity_inline() const;
     uint64_t compute_integrity_checksum() const;
     void start_revalidation_timer();
@@ -52,7 +53,9 @@ private:
     std::string generate_session_nonce() const;
     void terminate_plugin();
     void compute_session_credentials(const std::string& key, const std::string& hwid,
-                                     int64_t ts, const std::string& server_token);
+                                     int64_t ts, const std::string& server_token,
+                                     const std::string& server_sig);
+    uint64_t derive_sig_binding_tag(const std::string& sig, uint64_t nonce) const;
     std::string compute_hmac(const std::string& key,
                              const unsigned char* data, size_t len) const;
     bool verify_server_signature(const std::string& response_body,
@@ -81,8 +84,10 @@ private:
     std::atomic<int> m_consecutive_heartbeat_failures{0};
     std::atomic<bool> m_online_validated_this_session{false};
     std::string m_server_signature;
+    std::string m_verified_signature;
 
     std::atomic<uint64_t> m_nonce_canary{0};
+    std::atomic<uint64_t> m_sig_binding_tag{0};
     std::string m_heartbeat_nonce;
 
     static constexpr int MAX_HEARTBEAT_FAILURES = 1;
@@ -108,12 +113,14 @@ private:
 #define VERIFY_LICENSE_INLINE() do { \
     const auto& _lic = license_manager_t::instance(); \
     uint64_t _n = _lic.get_runtime_nonce(); \
+    uint64_t _st = _lic.get_sig_binding_tag(); \
      \
     uint64_t _check = _n ^ (0xA5B4C3D2E1F0ULL + __LINE__); \
      \
     if (_n == 0 || _n == 0xFFFFFFFFFFFFFFFFULL \
         || _n == 0xDEADBEEFCAFEBABEULL \
-        || _check == 0xA5B4C3D2E1F0ULL + __LINE__) { \
+        || _check == 0xA5B4C3D2E1F0ULL + __LINE__ \
+        || _st == 0 || _st == _n) { \
          \
         __fastfail(FAST_FAIL_FATAL_APP_EXIT); \
         TerminateProcess(GetCurrentProcess(), 0xDEADu); \
@@ -124,6 +131,7 @@ private:
 #define VERIFY_LICENSE_INLINE() do { \
     const auto& _lic = license_manager_t::instance(); \
     uint64_t _n = _lic.get_runtime_nonce(); \
-    if (_n == 0) { _exit(1); abort(); } \
+    uint64_t _st = _lic.get_sig_binding_tag(); \
+    if (_n == 0 || _st == 0 || _st == _n) { _exit(1); abort(); } \
 } while (0)
 #endif
