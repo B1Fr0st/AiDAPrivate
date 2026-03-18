@@ -3453,6 +3453,9 @@ tool_result_t read_bytes(const json& params)
     if (size > 4096)
         return tool_result_t::error(OBFSTR("Size too large (max 4096)"));
 
+    if (!is_loaded(*ea_opt))
+        return tool_result_t::error(OBFSTR("Address not mapped in database"));
+
     std::vector<uint8_t> buffer(size);
     ssize_t bytes_read = get_bytes(buffer.data(), size, *ea_opt);
 
@@ -3485,6 +3488,9 @@ tool_result_t read_integer(const json& params)
         return tool_result_t::error(OBFSTR("Invalid address"));
 
     std::string type = params.value("type", "u64");
+
+    if (!is_loaded(*ea_opt))
+        return tool_result_t::error(OBFSTR("Address not mapped in database"));
 
     uint64_t value = 0;
     int64_t signed_value = 0;
@@ -3533,6 +3539,9 @@ tool_result_t read_string(const json& params)
 
     int max_len = params.value("max_length", 1024);
 
+    if (!is_loaded(*ea_opt))
+        return tool_result_t::error(OBFSTR("Address not mapped in database"));
+
     qstring str;
     if (get_strlit_contents(&str, *ea_opt, max_len, STRTYPE_C) <= 0)
         return tool_result_t::error(OBFSTR("No string at address or read failed"));
@@ -3552,6 +3561,9 @@ tool_result_t read_global(const json& params)
     auto ea_opt = helpers::parse_address(name_or_addr);
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address or name"));
+
+    if (!is_loaded(*ea_opt))
+        return tool_result_t::error(OBFSTR("Address not mapped in database"));
 
     asize_t item_size = get_item_size(*ea_opt);
 
@@ -3578,6 +3590,9 @@ tool_result_t patch_bytes(const json& params)
     auto ea_opt = helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
+
+    if (!is_loaded(*ea_opt))
+        return tool_result_t::error(OBFSTR("Address not mapped in database"));
 
     std::string hex_bytes = params["bytes"].get<std::string>();
 
@@ -4697,7 +4712,7 @@ tool_result_t read_struct_field(const json& params)
             result["field_offset"] = udt[i].offset / 8;
             result["field_size"] = field_bytes;
 
-            if (field_bytes <= 8)
+            if (field_bytes <= 8 && is_loaded(field_ea))
             {
                 uval_t val;
                 if (get_data_value(&val, field_ea, field_bytes))
@@ -5113,6 +5128,30 @@ tool_result_t search_strings(const json& params)
     int limit = params.value("limit", 100);
     int offset = params.value("offset", 0);
 
+    // If the binary is indexed, redirect to semantic search for much faster results
+    {
+        std::string hash = aida_db::AnalysisDB::instance().get_binary_hash();
+        if (!hash.empty())
+        {
+            auto& store = graphrag::GraphStore::instance();
+            auto stats = store.get_stats(hash);
+            if (stats.nodes > 0)
+            {
+                graphrag::QueryEngine qe(store);
+                json semantic_results = qe.search_semantic(hash, pattern, limit);
+                if (!semantic_results.empty())
+                {
+                    return tool_result_t::ok(
+                        OBFSTR("Binary is indexed — used semantic search (faster). Found ")
+                        + std::to_string(semantic_results.size())
+                        + OBFSTR(" results. Use search_semantic directly for best performance."),
+                        semantic_results);
+                }
+                // Semantic search returned nothing — fall through to IDA string search
+            }
+        }
+    }
+
     std::regex filter_regex;
     try { filter_regex = std::regex(pattern, std::regex::icase); }
     catch (...) { return tool_result_t::error(OBFSTR("Invalid regex pattern")); }
@@ -5235,6 +5274,30 @@ tool_result_t find_instructions(const json& params)
     std::string pattern = params["pattern"].get<std::string>();
     int limit = params.value("limit", 20);
 
+    // If the binary is indexed, redirect to semantic search for much faster results
+    {
+        std::string hash = aida_db::AnalysisDB::instance().get_binary_hash();
+        if (!hash.empty())
+        {
+            auto& store = graphrag::GraphStore::instance();
+            auto stats = store.get_stats(hash);
+            if (stats.nodes > 0)
+            {
+                graphrag::QueryEngine qe(store);
+                json semantic_results = qe.search_semantic(hash, pattern, limit);
+                if (!semantic_results.empty())
+                {
+                    return tool_result_t::ok(
+                        OBFSTR("Binary is indexed — used semantic search (faster). Found ")
+                        + std::to_string(semantic_results.size())
+                        + OBFSTR(" results. Use search_semantic directly for best performance."),
+                        semantic_results);
+                }
+                // Semantic search returned nothing — fall through to IDA text search
+            }
+        }
+    }
+
     ea_t start_ea = inf_get_min_ea();
     ea_t end_ea = inf_get_max_ea();
 
@@ -5349,7 +5412,8 @@ void register_tools()
     auto& registry = ToolRegistry::instance();
 
     registry.register_tool({OBFSTR("search_strings"), OBFSTR("search"),
-        OBFSTR("Search strings with case-insensitive regex (paginated)."),
+        OBFSTR("Search strings with case-insensitive regex (paginated). "
+               "Auto-redirects to semantic search when binary is indexed for faster results."),
         {{OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Regex pattern to match"), true},
          {OBFSTR("offset"), OBFSTR("number"), OBFSTR("Pagination offset"), false},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 100)"), false}},
@@ -5364,7 +5428,9 @@ void register_tools()
         find_bytes});
 
     registry.register_tool({OBFSTR("find_instructions"), OBFSTR("search"),
-        OBFSTR("Find instruction sequence(s) in code by text match."),
+        OBFSTR("Find instruction sequence(s) in code by text match. "
+               "Auto-redirects to semantic search when binary is indexed for faster results. "
+               "Prefer search_semantic directly for indexed binaries."),
         {{OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Instruction text to search for"), true},
          {OBFSTR("start"), OBFSTR("string"), OBFSTR("Start address (optional)"), false},
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max results (default 20)"), false}},
@@ -6745,6 +6811,7 @@ tool_result_t map_vm_handler_table(const json& params)
         }
         else
         {
+            if (!is_loaded(slot)) continue;
             if (entry_size == 8)
                 target = get_qword(slot);
             else
@@ -8706,13 +8773,13 @@ tool_result_t analyze_pe_headers(const json& params)
         if (a) base = *a;
     }
 
-    std::uint16_t e_magic = get_word(base);
+    std::uint16_t e_magic = is_loaded(base) ? get_word(base) : 0;
     if (e_magic != 0x5A4D)
         return tool_result_t::error(OBFSTR("Not a valid PE: missing MZ signature at ") + helpers::format_address(base));
 
     std::uint32_t pe_off = get_dword(base + 0x3C);
     ea_t pe_hdr = base + pe_off;
-    if (get_dword(pe_hdr) != 0x00004550)
+    if (!is_loaded(pe_hdr) || get_dword(pe_hdr) != 0x00004550)
         return tool_result_t::error(OBFSTR("Invalid PE signature at ") + helpers::format_address(pe_hdr));
 
     json result;
@@ -8790,8 +8857,10 @@ tool_result_t analyze_pe_headers(const json& params)
     json dirs = json::array();
     for (std::uint32_t i = 0; i < std::min(num_dd, 16u); ++i)
     {
-        std::uint32_t rva  = get_dword(dd_base + i * 8);
-        std::uint32_t sz   = get_dword(dd_base + i * 8 + 4);
+        ea_t dd_ea = dd_base + i * 8;
+        if (!is_loaded(dd_ea)) break;
+        std::uint32_t rva  = get_dword(dd_ea);
+        std::uint32_t sz   = get_dword(dd_ea + 4);
         if (rva == 0 && sz == 0) continue;
 
         json dd;
@@ -8805,8 +8874,11 @@ tool_result_t analyze_pe_headers(const json& params)
         if (i == 0 && rva)
         {
             ea_t exp = base + rva;
-            dd["num_functions"] = get_dword(exp + 20);
-            dd["num_names"]     = get_dword(exp + 24);
+            if (is_loaded(exp + 20))
+            {
+                dd["num_functions"] = get_dword(exp + 20);
+                dd["num_names"]     = get_dword(exp + 24);
+            }
         }
         else if (i == 3 && rva)
         {
@@ -8819,6 +8891,7 @@ tool_result_t analyze_pe_headers(const json& params)
             int blocks = 0;
             while (cur < rel_end)
             {
+                if (!is_loaded(cur + 4)) break;
                 std::uint32_t bsz = get_dword(cur + 4);
                 if (bsz == 0) break;
                 ++blocks;
@@ -8831,7 +8904,12 @@ tool_result_t analyze_pe_headers(const json& params)
             ea_t tls = base + rva;
             json tls_j;
             ea_t cb_va;
-            if (is64)
+            if (!is_loaded(tls))
+            {
+                tls_j["error"] = "TLS directory not loaded";
+                cb_va = 0;
+            }
+            else if (is64)
             {
                 tls_j["raw_data_start"]    = helpers::format_address(static_cast<ea_t>(get_qword(tls)));
                 tls_j["raw_data_end"]      = helpers::format_address(static_cast<ea_t>(get_qword(tls + 8)));
@@ -8846,7 +8924,7 @@ tool_result_t analyze_pe_headers(const json& params)
             tls_j["callbacks_address"] = helpers::format_address(cb_va);
 
             json cbs = json::array();
-            if (cb_va != 0)
+            if (cb_va != 0 && is_loaded(cb_va))
             {
                 for (int ci = 0; ci < 64; ++ci)
                 {
@@ -8868,10 +8946,13 @@ tool_result_t analyze_pe_headers(const json& params)
         {
             ea_t lc = base + rva;
             json lc_j;
-            lc_j["security_cookie"]          = helpers::format_address(static_cast<ea_t>(get_qword(lc + 88)));
-            lc_j["guard_cf_check_function"]  = helpers::format_address(static_cast<ea_t>(get_qword(lc + 112)));
-            lc_j["guard_cf_function_table"]  = helpers::format_address(static_cast<ea_t>(get_qword(lc + 128)));
-            lc_j["guard_cf_function_count"]  = static_cast<std::uint64_t>(get_qword(lc + 136));
+            if (is_loaded(lc + 88))
+            {
+                lc_j["security_cookie"]          = helpers::format_address(static_cast<ea_t>(get_qword(lc + 88)));
+                lc_j["guard_cf_check_function"]  = helpers::format_address(static_cast<ea_t>(get_qword(lc + 112)));
+                lc_j["guard_cf_function_table"]  = helpers::format_address(static_cast<ea_t>(get_qword(lc + 128)));
+                lc_j["guard_cf_function_count"]  = static_cast<std::uint64_t>(get_qword(lc + 136));
+            }
             dd["load_config"] = std::move(lc_j);
         }
         dirs.push_back(std::move(dd));
@@ -8884,6 +8965,7 @@ tool_result_t analyze_pe_headers(const json& params)
     for (int si = 0; si < num_sections; ++si)
     {
         ea_t sec = sec_tbl + si * 40;
+        if (!is_loaded(sec)) break;
         char sname[9] = {};
         for (int j = 0; j < 8; ++j)
             sname[j] = static_cast<char>(get_byte(sec + j));
@@ -9052,8 +9134,9 @@ tool_result_t detect_hooks(const json& params)
         ++checked;
 
         ea_t ea = fn->start_ea;
+        if (!is_loaded(ea)) continue;
         std::uint8_t pr[16];
-        for (int b = 0; b < 16; ++b) pr[b] = static_cast<std::uint8_t>(get_byte(ea + b));
+        for (int b = 0; b < 16; ++b) pr[b] = is_loaded(ea + b) ? static_cast<std::uint8_t>(get_byte(ea + b)) : 0;
 
         std::string hook_type;
         ea_t hook_target = BADADDR;
@@ -9070,7 +9153,7 @@ tool_result_t detect_hooks(const json& params)
             std::int32_t disp;
             std::memcpy(&disp, &pr[2], 4);
             ea_t ptr = ea + 6 + disp;
-            hook_target = static_cast<ea_t>(get_qword(ptr));
+            hook_target = is_loaded(ptr) ? static_cast<ea_t>(get_qword(ptr)) : BADADDR;
             hook_type = "jmp_indirect_rip";
         }
         else if (pr[0] == 0x48 && pr[1] == 0xB8 && pr[10] == 0xFF && pr[11] == 0xE0)
@@ -9172,7 +9255,7 @@ tool_result_t detect_direct_syscalls(const json& params)
 
             else if (get_byte(ea) == 0xCD && get_byte(ea + 1) == 0x2E)
             {
-                if (ea >= start + 5 && get_byte(ea - 5) == 0xB8)
+                if (ea >= start + 5 && is_loaded(ea - 5) && get_byte(ea - 5) == 0xB8)
                 {
                     json sc;
                     sc["address"]        = helpers::format_address(ea - 5);
@@ -9369,7 +9452,7 @@ tool_result_t reconstruct_vtable(const json& params)
 
 
     json rtti;
-    if (is_64)
+    if (is_64 && is_loaded(vt - 8))
     {
         ea_t col_ptr = static_cast<ea_t>(get_qword(vt - 8));
         if (is_loaded(col_ptr))
@@ -9406,6 +9489,7 @@ tool_result_t reconstruct_vtable(const json& params)
     for (std::uint32_t i = 0; i < max_entries; ++i)
     {
         ea_t entry_ea = vt + i * ptr_sz;
+        if (!is_loaded(entry_ea)) break;
         ea_t fn_addr = is_64 ? static_cast<ea_t>(get_qword(entry_ea)) : get_dword(entry_ea);
         if (fn_addr == 0 || !is_loaded(fn_addr)) break;
         segment_t* fs = getseg(fn_addr);
@@ -10378,9 +10462,8 @@ tool_result_t rebuild_function(const json& params)
     if (end != BADADDR)
     {
         auto_mark_range(start, end, AU_FINAL);
-        show_wait_box("HIDECANCEL\nAiDA: Re-analyzing function...");
-        responsive_auto_wait(start, end, "Re-analyzing function...");
-        hide_wait_box();
+        plan_range(start, end);
+        auto_wait();
     }
 
     result["function_created"]   = func_created;
@@ -11274,14 +11357,10 @@ tool_result_t full_deobfuscation_pass(const json& params)
                          {"note", dry_run ? "Skipped (dry run)" : "Skipped (no patches applied)"}});
     }
 
-    hide_wait_box();
-
     if (!dry_run && total_changes > 0)
-    {
-        pfn = get_func(ea);
-        if (pfn)
-            reanalyze_function(pfn);
-    }
+        auto_wait();
+
+    hide_wait_box();
 
     if (!dry_run)
     {
@@ -11400,6 +11479,7 @@ tool_result_t devirtualize_function(const json& params)
         for (std::uint32_t i = 0; i < max_handlers; ++i)
         {
             ea_t slot = table_addr + i * table_entry_size;
+            if (!is_loaded(slot)) break;
             ea_t target = is_64 ? static_cast<ea_t>(get_qword(slot)) : get_dword(slot);
             if (target == 0 || target == BADADDR || !is_loaded(target)) break;
             segment_t* ts = getseg(target);
@@ -13936,7 +14016,13 @@ tool_result_t driver_scan_pattern(const json& params)
         }
     }
 
+    constexpr std::uint64_t MAX_SCAN_SIZE = 0x40000000ULL;  // 1 GB hard cap
+    if (scan_size > MAX_SCAN_SIZE)
+        scan_size = MAX_SCAN_SIZE;
+
     ea_t start_addr = static_cast<ea_t>(device->get_base_address());
+    if (start_addr == 0)
+        return tool_result_t::error(OBFSTR("Process base address is 0 — not attached or invalid target"));
     ea_t end_addr   = start_addr + (ea_t)scan_size;
     if (params.contains("start"))
     {
@@ -13948,6 +14034,15 @@ tool_result_t driver_scan_pattern(const json& params)
         auto e = helpers::parse_address(params["end"].get<std::string>());
         if (e) end_addr = *e;
     }
+
+    if (start_addr == 0)
+        return tool_result_t::error(OBFSTR("Scan start address is 0 — provide a valid start address"));
+
+    if (end_addr <= start_addr)
+        return tool_result_t::error(OBFSTR("Scan end must be greater than start"));
+
+    if ((end_addr - start_addr) > MAX_SCAN_SIZE)
+        end_addr = start_addr + MAX_SCAN_SIZE;
 
     anti_re::guard_driver_self_access(device->get_process_id(), start_addr, end_addr - start_addr);
 
@@ -13981,14 +14076,46 @@ tool_result_t driver_scan_pattern(const json& params)
     const std::size_t chunk_sz = 0x10000;
     std::vector<std::uint8_t> chunk(chunk_sz + pat.size());
 
+    constexpr int MAX_CONSEC_FAILURES = 256;    // 256 * 64KB = 16 MB of unreadable space → bail
+    constexpr int SCAN_TIMEOUT_SEC    = 30;
+    int consec_failures = 0;
+    auto scan_start_time = std::chrono::steady_clock::now();
+
     show_wait_box("HIDECANCEL\nAiDA: Kernel pattern scan...");
     for (ea_t addr = start_addr; addr < end_addr && (int)matches.size() < limit; addr += chunk_sz)
     {
+        auto elapsed = std::chrono::steady_clock::now() - scan_start_time;
+        if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= SCAN_TIMEOUT_SEC)
+        {
+            hide_wait_box();
+            json timeout_result;
+            timeout_result["matches"] = matches;
+            timeout_result["scanned_to"] = helpers::format_address(addr);
+            timeout_result["timeout"] = true;
+            return tool_result_t::ok(OBFSTR("Pattern scan timed out after 30s: ") +
+                                     std::to_string(matches.size()) + " matches so far", timeout_result);
+        }
+
         replace_wait_box("HIDECANCEL\nAiDA: Kernel scan 0x%llX (%d found)...",
                          (unsigned long long)addr, (int)matches.size());
         std::size_t to_read = std::min((std::size_t)(end_addr - addr) + pat.size(), chunk_sz + pat.size());
         std::size_t got = device->read_raw(addr, chunk.data(), to_read);
-        if (got < pat.size()) continue;
+        if (got < pat.size())
+        {
+            if (++consec_failures >= MAX_CONSEC_FAILURES)
+            {
+                hide_wait_box();
+                json bail_result;
+                bail_result["matches"] = matches;
+                bail_result["scanned_to"] = helpers::format_address(addr);
+                bail_result["aborted"] = true;
+                bail_result["reason"] = OBFSTR("Too many consecutive unreadable pages (16 MB gap)");
+                return tool_result_t::ok(OBFSTR("Pattern scan aborted (unreadable region): ") +
+                                         std::to_string(matches.size()) + " matches", bail_result);
+            }
+            continue;
+        }
+        consec_failures = 0;
 
         for (std::size_t i = 0; i + pat.size() <= got && (int)matches.size() < limit; i++)
         {

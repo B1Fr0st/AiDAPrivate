@@ -2474,19 +2474,69 @@ void AiDAWorkbenchPanel::reindex_binary()
     if (m_binaryHash.empty())
         return;
 
-    show_wait_box("HIDECANCEL\nIndexing binary for GraphRAG...");
-    graphrag::StructureExtractor extractor(graphrag::GraphStore::instance());
+    auto& store = graphrag::GraphStore::instance();
+
+    // Phase 1: Extract all functions into the knowledge graph
+    show_wait_box("HIDECANCEL\nPhase 1/5: Indexing binary functions...");
+    graphrag::StructureExtractor extractor(store);
     auto result = extractor.extract_all(m_binaryHash, [](int current, int total, const std::string& name) {
         if (current == 1 || (current % 50) == 0 || current == total)
-            replace_wait_box("Indexing %d / %d: %s", current, total, name.c_str());
+            replace_wait_box("Phase 1/5: Indexing %d / %d: %s", current, total, name.c_str());
     });
+    graphrag::save_graph(m_binaryHash);
+
+    // Phase 2: Detect functional communities (clusters)
+    replace_wait_box("Phase 2/5: Detecting functional communities...");
+    graphrag::CommunityDetector detector(store);
+    int community_count = detector.detect(m_binaryHash, 2, 50, true, [](int iteration, int total) {
+        replace_wait_box("Phase 2/5: Community detection iteration %d / %d", iteration, total);
+    });
+    graphrag::save_graph(m_binaryHash);
+
+    // Phase 3: Run security analysis (flag dangerous functions)
+    replace_wait_box("Phase 3/5: Running security analysis...");
+    graphrag::QueryEngine qe(store);
+    nlohmann::json security = qe.get_security_analysis(m_binaryHash, 50);
+    graphrag::save_graph(m_binaryHash);
+
+    // Phase 4: Run taint analysis (source → sink vulnerability paths)
+    replace_wait_box("Phase 4/5: Running taint analysis...");
+    graphrag::TaintAnalyzer taint(store);
+    auto taint_paths = taint.find_taint_paths(m_binaryHash, 100, true);
+    graphrag::save_graph(m_binaryHash);
+
+    // Phase 5: Analyze network data flow patterns
+    replace_wait_box("Phase 5/5: Analyzing network flow...");
+    graphrag::NetworkFlowAnalyzer net_analyzer(store);
+    auto net_result = net_analyzer.analyze(m_binaryHash, [](int current, int total, const std::string& message) {
+        if (current == 1 || (current % 25) == 0 || current == total)
+            replace_wait_box("Phase 5/5: Network flow %d / %d: %s", current, total, message.c_str());
+    });
+    graphrag::save_graph(m_binaryHash);
+
     hide_wait_box();
 
-    graphrag::save_graph(m_binaryHash);
+    // Build summary of all analyses
+    int high_risk_count = 0;
+    if (security.contains("high_risk_functions") && security["high_risk_functions"].is_array())
+        high_risk_count = static_cast<int>(security["high_risk_functions"].size());
+
+    std::string summary =
+        "Extracted " + std::to_string(result.functions_extracted) + " functions. "
+        "Detected " + std::to_string(community_count) + " communities. "
+        "Found " + std::to_string(high_risk_count) + " high-risk functions. "
+        "Found " + std::to_string(taint_paths.size()) + " taint paths. "
+        "Network: " + std::to_string(net_result.send_functions.size()) + " send, "
+        + std::to_string(net_result.recv_functions.size()) + " recv functions.";
+
     append_actions_log(
-        QStringLiteral("Index Binary"),
-        (QStringLiteral("Extracted %1 functions for the active binary graph.").arg(result.functions_extracted)).toStdString(),
-        false);
+        QStringLiteral("Index Binary (Full Pipeline)"),
+        summary, false);
+
+    // Show security overview in the overview browser
+    if (!security.empty())
+        render_text_browser(m_graphOverviewBrowser, json_dump_safe(security, 2), QStringLiteral("Binary Security Overview"));
+
     rebuild_graph_scene();
     refresh_all_tabs();
 }

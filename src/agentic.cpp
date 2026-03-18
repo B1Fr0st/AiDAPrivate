@@ -716,6 +716,13 @@ You are FORBIDDEN from writing phrases like:
 If you find yourself about to write ANY of these, STOP and instead emit tool_calls JSON to
 actually DO the thing you were about to describe. Planning is wasted output. ACTION is required.
 
+**RULE 1.5: INDEXED BINARY SEARCH ROUTING.**
+If the binary is indexed (node count > 0 from `get_graph_stats`), you MUST use `search_semantic`
+for ALL text-based searches. NEVER call `find_instructions` or `search_strings` on an indexed
+binary — they are slow IDA search tools that scan the entire binary linearly.
+`search_semantic` uses vector embeddings and keyword matching across the indexed knowledge graph
+and is orders of magnitude faster. Only fall back to IDA search tools if the binary is NOT indexed.
+
 **RULE 2: ITERATIVE MULTI-ROUND EXECUTION MODEL.**
 You operate in an AUTOMATIC LOOP — you can execute tools and analyze results across MULTIPLE
 ROUNDS without ANY user intervention. The system handles everything automatically:
@@ -929,9 +936,13 @@ Use IDA's debugger ONLY when you need runtime state and anti-debug is NOT a conc
 → Run `get_graph_stats` — if node count > 0, the binary IS indexed.
 → For ANY text search (strings, API names, URLs, IPs, domains, code patterns):
   use `search_semantic` FIRST — it is orders of magnitude faster than IDA search tools.
+→ **NEVER use `find_instructions` or `search_strings` if the binary is indexed.**
+  These tools will auto-redirect to `search_semantic` anyway, but calling `search_semantic`
+  directly is the correct approach for indexed binaries.
 → For security audits: `run_security_analysis`, `run_taint_analysis`.
 → For architecture mapping: `detect_communities`, `get_activity_analysis`.
-→ Fall back to IDA search (`search_strings`, `find_bytes`) ONLY if RAG returns no results.
+→ Fall back to IDA search (`search_strings`, `find_bytes`, `find_instructions`)
+  ONLY if the binary is NOT indexed or if `search_semantic` returns no results.
 
 **WHEN TO USE NETWORK TOOLS (Phases 12-14) — TRIGGERED BY EVIDENCE:**
 Use network tools when static analysis reveals the binary communicates over the network:
@@ -972,9 +983,14 @@ These IDA tools are available at ALL phases — use them whenever needed:
 
 ### Phase 1: Reconnaissance (batch as many calls as needed)
 `get_binary_info`, `decompile_function`, `disassemble_function`, `get_function`,
-`get_xrefs_to`, `get_xrefs_from`, `search_strings`, `find_bytes`, `find_instructions`,
-`find_immediate`, `list_functions`, `list_imports`, `list_exports`, `get_import`.
-If the binary is indexed: use `search_semantic` FIRST — it is much faster than IDA search.
+`get_xrefs_to`, `get_xrefs_from`, `find_bytes`, `find_immediate`,
+`list_functions`, `list_imports`, `list_exports`, `get_import`.
+**IMPORTANT**: Check `get_graph_stats` early. If the binary is indexed (node count > 0):
+→ Use `search_semantic` for ALL text/string/instruction searches. Do NOT use
+  `find_instructions` or `search_strings` — `search_semantic` is faster and more comprehensive.
+→ Use `get_security_overview` for immediate risk assessment.
+→ Use `detect_communities` to map the binary's functional architecture.
+If the binary is NOT indexed: use `search_strings`, `find_instructions` as fallback.
 
 **MANDATORY: Check for network indicators during Phase 1.**
 When you call `list_imports`, scan results for: ws2_32.dll, winhttp.dll, wininet.dll,
@@ -1518,11 +1534,14 @@ Set arguments via `rcx`, `rdx`, `r8`, `r9` (Windows x64 calling convention).
 ### Phase 11: Knowledge Graph & Semantic Analysis (GraphRAG)
 When the binary is indexed (user clicked "Index Binary" in AiDA panel), the knowledge graph
 provides FAST semantic search and structural analysis via vector embeddings.
+The "Index Binary" button automatically runs the FULL analysis pipeline:
+extraction → community detection → security analysis → taint analysis → network flow analysis.
 
-**CRITICAL: Use `search_semantic` BEFORE IDA search tools for indexed binaries.**
-GraphRAG searches across function names, code, strings, URLs, IPs, domains, file paths,
-registry keys, API names, and security flags. It is MUCH FASTER than sequential IDA search.
-Fall back to IDA search tools (`search_strings`, `find_bytes`) only if RAG returns no results.
+**MANDATORY RULE: If the binary is indexed, NEVER use `find_instructions` or `search_strings`.**
+Use `search_semantic` instead — it searches function names, code, strings, URLs, IPs, domains,
+file paths, registry keys, API names, and security flags. It is orders of magnitude faster.
+`find_instructions` and `search_strings` will auto-redirect to `search_semantic` when indexed,
+but you should call `search_semantic` directly. Only use IDA search tools if NOT indexed.
 
 **Check Index Status:**
 `get_graph_stats` — check if binary is indexed (node count > 0) and see graph statistics.
@@ -1550,13 +1569,16 @@ sinks (strcpy, system, CreateProcess). Discovers potential vulnerability chains.
 `get_activity_analysis` — group by behavior: NETWORK_CLIENT, FILE_RW, CRYPTO_CIPHER, etc.
 `analyze_network_flow` — map send/recv data flow paths through the binary.
 
-**GraphRAG Workflow:**
+**GraphRAG Workflow for Vulnerability Hunting:**
 1. `get_graph_stats` → verify binary is indexed
-2. `search_semantic` query="<target>" → fast search (use instead of IDA search)
-3. `get_security_overview` → overall risk profile
-4. `detect_communities` → functional architecture map
-5. `run_taint_analysis` → vulnerability paths
-6. Drill into functions with `get_semantic_analysis` and `get_call_context`
+2. `get_security_overview` → immediate risk profile — shows critical/high-risk functions
+3. `run_taint_analysis` → find source→sink vulnerability chains (recv→strcpy, read→system, etc.)
+4. `detect_communities` → map functional architecture (isolate network/crypto/file modules)
+5. `get_activity_analysis` → find PROCESS_INJECTOR, CRYPTO_CIPHER, NETWORK_CLIENT functions
+6. `search_semantic` query="<target>" → fast search (replaces find_instructions/search_strings)
+7. `analyze_network_flow` → map data flow from recv to processing to send
+8. Drill into high-risk functions with `get_semantic_analysis` and `get_call_context`
+9. For each vulnerability: `get_taint_paths_for_function` → confirm exploitability
 
 )" R"(
 ### Phase 12: Network Analysis & Traffic Interception
@@ -1874,12 +1896,15 @@ struct tool_exec_request_t : public exec_request_t
 result_t run(
     AIClient* client,
     const std::string& initial_prompt,
-    const config_t& config,
+    const config_t& config_in,
     std::atomic<bool>* cancelled,
     progress_fn on_progress,
     status_fn on_status,
     stream_fn on_stream)
 {
+    // Mutable copy for adaptive token/result-size adjustments during execution
+    config_t config = config_in;
+
     result_t result;
     std::unordered_map<std::string, tool_execution_t> tool_cache;
 
@@ -2025,8 +2050,23 @@ result_t run(
             if (trunc_pos != std::string::npos)
             {
                 ai_response = ai_response.substr(0, trunc_pos);
-                if (config.verbose_logging)
-                    msg(OBFSTR_C("AiDA Agent: Response was truncated by API.\n"));
+
+                // Adaptively increase output tokens to prevent future truncation
+                int current_out = config.agentic_output_tokens;
+                int new_out = (std::min)(current_out * 2, 65536);
+                if (new_out > current_out)
+                {
+                    config.agentic_output_tokens = new_out;
+                    client->set_max_output_tokens(new_out);
+                    if (config.verbose_logging)
+                        msg(OBFSTR_C("AiDA Agent: Response truncated — increased output tokens %d -> %d to prevent future truncation.\n"),
+                            current_out, new_out);
+                }
+                else if (config.verbose_logging)
+                {
+                    msg(OBFSTR_C("AiDA Agent: Response was truncated by API (already at max output tokens %d).\n"),
+                        current_out);
+                }
             }
         }
 
@@ -2417,6 +2457,26 @@ result_t run(
 
             size_t prompt_tokens = ctx_mgr.estimate_tokens(current_prompt);
             size_t budget = static_cast<size_t>(ctx_cfg.max_context_tokens - ctx_cfg.output_reserve);
+
+            // Proactively shrink tool result caps when context pressure builds
+            if (budget > 0)
+            {
+                double usage_ratio = static_cast<double>(prompt_tokens) / budget;
+                if (usage_ratio > 0.85)
+                {
+                    // Severely constrained — halve tool result sizes
+                    config.max_tool_result_chars = (std::max)(config.max_tool_result_chars / 2, 4096);
+                    if (config.verbose_logging)
+                        msg(OBFSTR_C("AiDA Agent: High context pressure (%.0f%%), reduced tool result cap to %d chars.\n"),
+                            usage_ratio * 100, config.max_tool_result_chars);
+                }
+                else if (usage_ratio > 0.70)
+                {
+                    // Moderate pressure — reduce by 25%
+                    config.max_tool_result_chars = (std::max)(config.max_tool_result_chars * 3 / 4, 8192);
+                }
+            }
+
             if (prompt_tokens > budget)
             {
                 if (config.verbose_logging)
