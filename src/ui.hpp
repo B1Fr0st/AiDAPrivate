@@ -19,3 +19,4 @@ void handle_manage_prompts(action_activation_ctx_t* ctx, aida_plugin_t* plugin);
 
 void show_text_in_viewer(const char* title, const std::string& text_content);
 void show_prompt_manager_dialog();
+bool show_eula_dialog();

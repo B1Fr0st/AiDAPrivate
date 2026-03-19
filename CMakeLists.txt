@@ -189,7 +189,7 @@ endif()
 message(STATUS "IDA SDK: ${IDASDK_DIR}")
 
 if(WIN32)
-    set(IDA_LIB_DIR "${IDASDK_DIR}/lib/x64_win_vc_64")
+    set(IDA_LIB_DIR "${IDASDK_DIR}/lib/x64_win_64")
     set(IDA_LINK_LIB "${IDA_LIB_DIR}/ida.lib")
 elseif(APPLE)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")

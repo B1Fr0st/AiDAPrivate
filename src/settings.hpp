@@ -55,6 +55,8 @@ public:
     int         embedding_dimensions;
     int         embedding_batch_size;
 
+    bool        eula_accepted;
+
     std::string license_key;
     int64_t     license_validated_at;
     std::string license_hwid;

@@ -688,7 +688,20 @@ struct _integrity_check
 		trustData.dwStateAction = WTD_STATEACTION_CLOSE;
 		WinVerifyTrust(NULL, &policyGUID, &trustData);
 
-		return status == ERROR_SUCCESS;
+		// Not signed at all is acceptable (unsigned build).
+		// Only fail if a signature IS present but invalid (tampered).
+		if (status == static_cast<LONG>(TRUST_E_NOSIGNATURE))
+			return true;
+
+		if (status == static_cast<LONG>(TRUST_E_SUBJECT_FORM_UNKNOWN))
+			return true;
+
+		// Signed and valid
+		if (status == ERROR_SUCCESS)
+			return true;
+
+		// Signed but tampered / explicitly distrusted / other failure
+		return false;
 	}
 };
 

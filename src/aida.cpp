@@ -5,6 +5,7 @@
 #include "graphrag.hpp"
 #include "analysis_db.hpp"
 #include "subagents.hpp"
+#include "ui.hpp"
 
 #ifdef __NT__
 #include "driver_loader.hpp"
@@ -794,6 +795,17 @@ static plugmod_t* idaapi init()
 #endif
 
     g_settings.load_from_file();
+
+    if (!g_settings.eula_accepted)
+    {
+        if (!show_eula_dialog())
+        {
+            msg(OBFSTR_C("AiDA: End User License Agreement was declined. Plugin will not load.\n"));
+            return PLUGIN_SKIP;
+        }
+        g_settings.eula_accepted = true;
+        g_settings.save();
+    }
 
 #ifdef __NT__
     if (!driver_loader::initialize_and_load())
