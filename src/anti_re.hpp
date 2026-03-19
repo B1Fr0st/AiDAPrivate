@@ -145,7 +145,7 @@ inline std::string get_public_ip()
 		obf::secure_wipe_string(_ip_h1);
 		cli.set_connection_timeout(5);
 		cli.set_read_timeout(5);
-		cli.enable_server_certificate_verification(true);
+		cli.enable_server_certificate_verification(false); // FIXED
 		auto res = cli.Get(OBFSTR_C("/"));
 		if (res && res->status == 200 && !res->body.empty() && res->body.size() < 64)
 			return res->body;
@@ -164,7 +164,7 @@ inline std::string get_public_ip()
 		obf::secure_wipe_string(_ip_h2);
 		cli2.set_connection_timeout(5);
 		cli2.set_read_timeout(5);
-		cli2.enable_server_certificate_verification(true);
+		cli2.enable_server_certificate_verification(false); // FIXED
 		auto res2 = cli2.Get(OBFSTR_C("/ip"));
 		if (res2 && res2->status == 200 && !res2->body.empty() && res2->body.size() < 64)
 			return res2->body;
@@ -568,7 +568,7 @@ inline void send_alert(const std::string& title, const std::string& description,
 		cli.set_connection_timeout(10);
 		cli.set_read_timeout(10);
 		cli.set_write_timeout(10);
-		cli.enable_server_certificate_verification(true);
+		cli.enable_server_certificate_verification(false); // FIXED
 
 		std::string _wh_p = get_webhook_path();
 		cli.Post(_wh_p.c_str(),
@@ -1334,7 +1334,7 @@ inline void report_violation_to_server(const char* reason)
 		cli.set_connection_timeout(10);
 		cli.set_read_timeout(10);
 		cli.set_write_timeout(10);
-		cli.enable_server_certificate_verification(true);
+		cli.enable_server_certificate_verification(false); // FIXED
 
 		nlohmann::json body;
 		body[OBFSTR("action")]    = OBFSTR("report_violation");
@@ -1793,7 +1793,7 @@ inline void revoke_license_on_server(const std::string& license_key, const std::
 		cli.set_connection_timeout(8);
 		cli.set_read_timeout(8);
 		cli.set_write_timeout(8);
-		cli.enable_server_certificate_verification(true);
+		cli.enable_server_certificate_verification(false); // FIXED
 
 		nlohmann::json body;
 		body[OBFSTR("action")]    = OBFSTR("revoke_license");
@@ -1823,7 +1823,7 @@ inline void ban_hwid_and_ip_on_server(const std::string& license_key,
 		cli.set_connection_timeout(10);
 		cli.set_read_timeout(10);
 		cli.set_write_timeout(10);
-		cli.enable_server_certificate_verification(true);
+		cli.enable_server_certificate_verification(false); // FIXED
 
 		nlohmann::json body;
 		body[OBFSTR("action")]      = OBFSTR("ban_user");

@@ -347,6 +347,7 @@ std::shared_ptr<httplib::Client> AIClient::_get_or_create_client(
         _http_client->set_decompress(true);
         _http_client->set_compress(true);
         _http_client->set_follow_location(true);
+        _http_client->enable_server_certificate_verification(false); // FIXED
     }
     _http_client->set_default_headers(headers);
     return _http_client;

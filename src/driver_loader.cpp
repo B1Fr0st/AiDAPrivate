@@ -155,7 +155,6 @@ typedef NTSTATUS(NTAPI* pfnNtQuerySystemInformation)(ULONG, PVOID, ULONG, PULONG
 typedef NTSTATUS(NTAPI* pfnNtLoadDriver)(PUNICODE_STRING);
 typedef NTSTATUS(NTAPI* pfnNtUnloadDriver)(PUNICODE_STRING);
 typedef NTSTATUS(NTAPI* pfnRtlAdjustPrivilege)(ULONG, BOOLEAN, BOOLEAN, PBOOLEAN);
-typedef NTSTATUS(NTAPI* pfnRtlGetFullPathName_UEx)(PCWSTR, ULONG, PWSTR, PWSTR*, PULONG);
 typedef NTSTATUS(NTAPI* pfnRtlCreateRegistryKey)(ULONG, PWSTR);
 typedef NTSTATUS(NTAPI* pfnRtlWriteRegistryValue)(ULONG, PCWSTR, PCWSTR, ULONG, PVOID, ULONG);
 typedef NTSTATUS(NTAPI* pfnNtDeviceIoControlFile)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID,
@@ -168,7 +167,6 @@ static pfnNtQuerySystemInformation s_NtQuerySystemInformation = nullptr;
 static pfnNtLoadDriver             s_NtLoadDriver             = nullptr;
 static pfnNtUnloadDriver           s_NtUnloadDriver           = nullptr;
 static pfnRtlAdjustPrivilege       s_RtlAdjustPrivilege       = nullptr;
-static pfnRtlGetFullPathName_UEx   s_RtlGetFullPathName_UEx   = nullptr;
 static pfnRtlCreateRegistryKey     s_RtlCreateRegistryKey     = nullptr;
 static pfnRtlWriteRegistryValue    s_RtlWriteRegistryValue    = nullptr;
 static pfnNtDeviceIoControlFile    s_NtDeviceIoControlFile     = nullptr;
@@ -220,7 +218,6 @@ static BOOL InitializeNtFunctions()
     s_NtLoadDriver       = reinterpret_cast<pfnNtLoadDriver>(GetProcAddress(ntdll, "NtLoadDriver"));
     s_NtUnloadDriver     = reinterpret_cast<pfnNtUnloadDriver>(GetProcAddress(ntdll, "NtUnloadDriver"));
     s_RtlAdjustPrivilege = reinterpret_cast<pfnRtlAdjustPrivilege>(GetProcAddress(ntdll, "RtlAdjustPrivilege"));
-    s_RtlGetFullPathName_UEx = reinterpret_cast<pfnRtlGetFullPathName_UEx>(GetProcAddress(ntdll, "RtlGetFullPathName_UEx"));
     s_RtlCreateRegistryKey   = reinterpret_cast<pfnRtlCreateRegistryKey>(GetProcAddress(ntdll, "RtlCreateRegistryKey"));
     s_RtlWriteRegistryValue  = reinterpret_cast<pfnRtlWriteRegistryValue>(GetProcAddress(ntdll, "RtlWriteRegistryValue"));
     s_NtDeviceIoControlFile  = reinterpret_cast<pfnNtDeviceIoControlFile>(GetProcAddress(ntdll, "NtDeviceIoControlFile"));
@@ -229,7 +226,7 @@ static BOOL InitializeNtFunctions()
     s_NtFlushKey  = reinterpret_cast<pfnNtFlushKey>(GetProcAddress(ntdll, "NtFlushKey"));
 
     return s_NtQuerySystemInformation && s_NtLoadDriver && s_NtUnloadDriver &&
-           s_RtlAdjustPrivilege && s_RtlGetFullPathName_UEx &&
+        s_RtlAdjustPrivilege &&
            s_RtlCreateRegistryKey && s_RtlWriteRegistryValue && s_NtDeviceIoControlFile;
 }
 
@@ -241,7 +238,15 @@ static NTSTATUS AdjustPrivilege(ULONG privilege, BOOLEAN enable)
 
 static NTSTATUS GetFullPath(PCWSTR fileName, PWSTR buffer, ULONG bufferLength)
 {
-    return s_RtlGetFullPathName_UEx(fileName, bufferLength, buffer, nullptr, nullptr);
+    if (!fileName || !buffer || bufferLength == 0)
+        return STATUS_INVALID_PARAMETER;
+
+    DWORD copied = GetFullPathNameW(fileName, bufferLength, buffer, nullptr);
+    if (copied == 0)
+        return HRESULT_FROM_WIN32(GetLastError());
+    if (copied >= bufferLength)
+        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    return STATUS_SUCCESS;
 }
 
 static BOOL SecureDeleteFile(PCWSTR filePath)
@@ -554,6 +559,9 @@ static std::wstring DetectRunningAntiCheat()
 
 static NTSTATUS CreateDriverService(PWSTR servicePath, PCWSTR filePath)
 {
+    if (!servicePath || !filePath || !*filePath)
+        return STATUS_INVALID_PARAMETER;
+
     const WCHAR prefix[] = L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\";
     SIZE_T prefixLen = wcslen(prefix);
     wmemcpy(servicePath, prefix, prefixLen);
@@ -571,13 +579,12 @@ static NTSTATUS CreateDriverService(PWSTR servicePath, PCWSTR filePath)
     NTSTATUS status = s_RtlCreateRegistryKey(0, servicePath);
     if (!NT_SUCCESS(status)) return status;
 
-    WCHAR ntPath[512] = {};
-    wcscpy_s(ntPath, L"\\??\\");
-    wcscat_s(ntPath, _countof(ntPath), filePath);
-    SIZE_T ntPathLen = wcslen(ntPath);
+    std::wstring ntPath = L"\\??\\";
+    ntPath += filePath;
+    SIZE_T ntPathLen = ntPath.length();
 
     status = s_RtlWriteRegistryValue(0, servicePath, L"ImagePath", REG_SZ,
-        ntPath, static_cast<ULONG>((ntPathLen + 1) * sizeof(WCHAR)));
+        const_cast<PWSTR>(ntPath.c_str()), static_cast<ULONG>((ntPathLen + 1) * sizeof(WCHAR)));
     if (!NT_SUCCESS(status)) return status;
 
     DWORD typeValue = 1;
@@ -1485,18 +1492,26 @@ static NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath)
         return status;
     }
 
-    WCHAR loaderFull[520], driverFull[520];
-    status = GetFullPath(loaderPath, loaderFull, sizeof(loaderFull));
-    if (!NT_SUCCESS(status)) return status;
-    status = GetFullPath(driverPath, driverFull, sizeof(driverFull));
-    if (!NT_SUCCESS(status)) return status;
+    WCHAR loaderFull[4096] = {}, driverFull[4096] = {};
+    status = GetFullPath(loaderPath, loaderFull, _countof(loaderFull));
+    if (!NT_SUCCESS(status)) {
+        dl_msg("AiDA Driver: Failed to resolve loader path: 0x%08X\n", status);
+        return status;
+    }
+    status = GetFullPath(driverPath, driverFull, _countof(driverFull));
+    if (!NT_SUCCESS(status)) {
+        dl_msg("AiDA Driver: Failed to resolve target driver path: 0x%08X\n", status);
+        return status;
+    }
 
     status = CreateDriverService(s_DriverServicePath, driverFull);
     if (!NT_SUCCESS(status)) {
+        dl_msg("AiDA Driver: Failed to create target driver service: 0x%08X\n", status);
         return status;
     }
     status = CreateDriverService(s_LoaderServicePath, loaderFull);
     if (!NT_SUCCESS(status)) {
+        dl_msg("AiDA Driver: Failed to create loader service: 0x%08X\n", status);
         return status;
     }
 
@@ -1506,6 +1521,8 @@ static NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath)
     targetFN = targetFN ? targetFN + 1 : driverFull;
 
     status = TriggerExploit(targetFN);
+    if (!NT_SUCCESS(status))
+        dl_msg("AiDA Driver: TriggerExploit failed: 0x%08X\n", status);
     return status;
 }
 

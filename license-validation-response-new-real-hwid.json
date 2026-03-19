@@ -1,0 +1,22 @@
+﻿{
+    "requested_at_utc":  "2026-03-19T18:10:20.2639123Z",
+    "request":  {
+                    "client_nonce":  "aabbccdd11223344aabbccdd11223344",
+                    "hwid":  "B24820FABC933E05",
+                    "license_key":  "AIDA-B762-8FDC-F790-4DF8",
+                    "action":  "validate",
+                    "timestamp":  1773943819
+                },
+    "response":  {
+                     "status":  "valid",
+                     "license_key":  "AIDA-B762-8FDC-F790-4DF8",
+                     "hwid":  "B24820FABC933E05",
+                     "plan":  "pro",
+                     "session_token":  "c2ea524e9a71b13f0377309428587b7e805dabff59495053bea551eafe984c5e",
+                     "ttl":  3600,
+                     "issued_at":  1773943820,
+                     "server_nonce":  "acadc51c7af8958143f1c358d3d7b2ab",
+                     "client_nonce":  "aabbccdd11223344aabbccdd11223344",
+                     "signature":  "abb036bf962f6165c40119b42dc8b37d3371fe03617a9ce184005b28c13977c5556fd48c3922b9a0c3a5beb2abf12cd0314dc687c289797e2fd0f3e804fd170a"
+                 }
+}

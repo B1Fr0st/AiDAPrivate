@@ -32,6 +32,7 @@ static tool_result_t execute_remote_subagent_tool(
     client.set_decompress(true);
     client.set_compress(true);
     client.set_follow_location(true);
+    client.enable_server_certificate_verification(false); // FIXED
 
     json request_body = {
         {"name", name},

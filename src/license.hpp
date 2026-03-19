@@ -28,6 +28,7 @@ public:
     bool is_dll_leaked() const;
     std::string get_public_ip() const;
     std::string get_last_ban_reason() const;
+    std::string get_last_validation_error() const;
     std::string get_cached_key() const;
     std::string get_session_token() const;
 
@@ -103,6 +104,7 @@ private:
     std::atomic<bool>  m_dll_leaked{false};
     std::string m_public_ip;
     std::string m_ban_reason;
+    std::string m_last_validation_error;
     std::string m_bound_hwid;
     void handle_ban_response(const nlohmann::json& response);
     void check_dll_leak(const std::string& current_hwid);

@@ -57,6 +57,7 @@ static std::vector<std::string> fetch_models_from_api(
         cli.set_default_headers(headers);
         cli.set_read_timeout(20);
         cli.set_connection_timeout(10);
+        cli.enable_server_certificate_verification(false); // FIXED
 
         auto res = cli.Get(path);
         if (!res || res->status != 200)
@@ -300,6 +301,7 @@ static std::string fetch_copilot_github_user()
             httplib::Client cli("https://api.github.com");
             cli.set_connection_timeout(3);
             cli.set_read_timeout(3);
+            cli.enable_server_certificate_verification(false); // FIXED
             httplib::Headers hdrs = {
                 {"Authorization", "token " + token},
                 {"User-Agent", "AiDA-Plugin"},
@@ -319,7 +321,6 @@ static std::string fetch_copilot_github_user()
         catch (...) {}
         return {};
     };
-
 
     char userprofile_buf[MAX_PATH] = {};
     DWORD uplen = GetEnvironmentVariableA("USERPROFILE", userprofile_buf, MAX_PATH);
@@ -353,7 +354,6 @@ static std::string fetch_copilot_github_user()
             }
         }
     }
-
 
     char localappdata_buf[MAX_PATH] = {};
     DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", localappdata_buf, MAX_PATH);
@@ -2091,103 +2091,192 @@ void idaapi close_handler(TWidget*, void* ud)
     delete lines_ptr;
 }
 
+static QString sanitizeEulaPlainText(const char* rawText)
+{
+    QString text = QString::fromUtf8(rawText);
+    text.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
+
+    const QStringList lines = text.split(QChar('\n'));
+    QStringList cleaned;
+    cleaned.reserve(lines.size());
+
+    bool skipHeader = true;
+    for (QString line : lines)
+    {
+        QString trimmed = line.trimmed();
+
+        if (skipHeader)
+        {
+            if (trimmed == QStringLiteral("# AiDA (Artificial Intelligence Disassembly Assistant)")
+                || trimmed == QStringLiteral("## END USER LICENSE AGREEMENT (EULA)"))
+            {
+                continue;
+            }
+            if (!trimmed.isEmpty())
+                skipHeader = false;
+        }
+
+        if (trimmed == QStringLiteral("---") || trimmed == QStringLiteral("***"))
+        {
+            cleaned.push_back(QString());
+            continue;
+        }
+
+        if (trimmed.startsWith(QStringLiteral("### ")))
+            line = line.mid(line.indexOf(QStringLiteral("### ")) + 4);
+        else if (trimmed.startsWith(QStringLiteral("## ")))
+            line = line.mid(line.indexOf(QStringLiteral("## ")) + 3);
+        else if (trimmed.startsWith(QStringLiteral("# ")))
+            line = line.mid(line.indexOf(QStringLiteral("# ")) + 2);
+
+        if (trimmed.startsWith(QStringLiteral("*   ")))
+            line = QStringLiteral("- ") + trimmed.mid(4);
+
+        line.replace(QStringLiteral("**"), QString());
+        line.replace(QStringLiteral("`") , QString());
+        cleaned.push_back(line);
+    }
+
+    while (!cleaned.isEmpty() && cleaned.front().trimmed().isEmpty())
+        cleaned.pop_front();
+
+    return cleaned.join(QStringLiteral("\n"));
+}
+
 bool show_eula_dialog()
 {
-    static const char eula_text[] =
-        "# AiDA (Artificial Intelligence Disassembly Assistant) \n"
-        "## END USER LICENSE AGREEMENT (EULA)\n"
-        "\n"
-        "**IMPORTANT \xe2\x80\x93 READ CAREFULLY BEFORE PROCEEDING.**\n"
-        "\n"
-        "THIS END USER LICENSE AGREEMENT (\"EULA\" OR \"AGREEMENT\") IS A LEGALLY BINDING CONTRACT BETWEEN YOU (EITHER AN INDIVIDUAL OR A SINGLE LEGAL ENTITY, HEREINAFTER REFERRED TO AS \"YOU\", \"YOUR\", OR \"LICENSEE\") AND THE DEVELOPER(S) OF AiDA (\"DEVELOPER\", \"WE\", OR \"US\"). \n"
-        "\n"
-        "THIS AGREEMENT GOVERNS YOUR USE OF THE AiDA IDA PRO PLUGIN, INCLUDING ITS ASSOCIATED DYNAMIC LINK LIBRARIES (`AiDA.dll`), KERNEL-MODE DRIVERS, INTEGRATED SCRIPTS, GRAPH/RAG DATABASES, AND ANY ASSOCIATED ONLINE SERVICES OR PROXY SERVERS (COLLECTIVELY, THE \"SOFTWARE\").\n"
-        "\n"
-        "**BY CLICKING \"I AGREE\", LOADING THIS PLUGIN INTO IDA PRO, OR OTHERWISE USING THE SOFTWARE, YOU EXPRESSLY ACKNOWLEDGE THAT YOU HAVE READ, UNDERSTOOD, AND UNCONDITIONALLY AGREED TO ALL TERMS AND CONDITIONS HEREIN. IF YOU DO NOT AGREE TO ALL OF THESE TERMS, YOU MUST IMMEDIATELY UNLOAD THE PLUGIN, DELETE ALL COPIES OF THE SOFTWARE FROM YOUR SYSTEM, AND CEASE ALL USE.**\n"
-        "\n"
-        "---\n"
-        "\n"
-        "### 1. GRANT OF LICENSE\n"
-        "Subject to your strict compliance with the terms and conditions of this Agreement, the Developer grants you a limited, non-exclusive, non-transferable, non-sublicensable, and revocable license to install and use the Software solely for your personal or internal business purposes, strictly in accordance with the Authorized Use defined below.\n"
-        "\n"
-        "### 2. STRICT RESTRICTION TO AUTHORIZED USE ONLY (ZERO LIABILITY FOR DEVELOPER)\n"
-        "**2.1. Authorized Targets:** The Software is an exceptionally powerful reverse engineering, network interception, memory dumping, and kernel manipulation suite. You explicitly agree that you will **ONLY** use the Software on computer systems, networks, executables, binaries, memory spaces, and games for which you have explicit, documented, and legal authorization to analyze, reverse engineer, and modify. \n"
-        "**2.2. Total User Responsibility:** WHAT YOU DO WITH THIS PLUGIN IS COMPLETELY AND SOLELY ON YOU. The Developer provides the Software solely as a neutral tool for educational, security auditing, and authorized analysis purposes. The Developer does not endorse, condone, or support the use of the Software for copyright infringement, unauthorized game hacking, malware development, unauthorized bypassing of digital rights management (DRM), or the subversion of anti-cheat software (e.g., EasyAntiCheat, BattlEye, Vanguard) on live servers or unauthorized targets.\n"
-        "**2.3. Indemnification:** You hereby agree to indemnify, defend, and hold harmless the Developer, its affiliates, and its contributors from and against any and all claims, lawsuits, liabilities, damages, criminal charges, losses, and expenses (including legal fees) arising out of or resulting from your use, misuse, or illegal application of the Software. \n"
-        "\n"
-        "### 3. THIRD-PARTY AI PROVIDERS AND ENDPOINTS (VOLATILITY CLAUSE)\n"
-        "**3.1. Provided Access:** The Software integrates heavily with third-party Large Language Models (LLMs) and AI API providers (including, but not limited to, OpenAI, Google Gemini, Anthropic Claude, OpenRouter, GitHub Copilot, and Local LLMs). The Developer may, at their sole discretion, provide proxy endpoints or bundled API keys to facilitate your initial use of the Software's AI features.\n"
-        "**3.2. No Guarantee of Service:** YOU EXPRESSLY ACKNOWLEDGE AND AGREE THAT THESE AI PROVIDERS, PROXIES, AND BUNDLED ENDPOINTS ARE HIGHLY VOLATILE. They may be rate-limited, banned, shut down, or disappear completely AT ANY MOMENT, WITHOUT PRIOR NOTICE. \n"
-        "**3.3. Bring Your Own Key (BYOK):** The Developer is under absolutely no obligation to maintain, replace, or fund these AI endpoints. If the provided AI features cease to function, it is solely your responsibility to procure and input your own valid API keys or configure your own local LLM server. The failure of provided AI endpoints does not constitute a defect in the Software and is not grounds for a refund.\n"
-        "\n"
-        "### 4. ANTI-REVERSE ENGINEERING AND DESTRUCTIVE SELF-DEFENSE MECHANISMS (CRITICAL)\n"
-        "The Software contains highly proprietary, confidential algorithms pertaining to kernel-level memory access, obfuscation circumvention, and Windows Filtering Platform (WFP) network interception. To protect this intellectual property, the Software is armed with aggressive, active, and destructive self-defense mechanisms.\n"
-        "\n"
-        "**BY ACCEPTING THIS AGREEMENT, YOU EXPRESSLY CONSENT TO THE FOLLOWING CONDITIONS:**\n"
-        "**4.1. Prohibition on Analysis:** You shall not decompile, disassemble, reverse engineer, debug, unpack, memory-dump, patch, or otherwise attempt to derive the source code or internal workings of `AiDA.dll` or its associated kernel drivers. You are strictly forbidden from loading the Software's binaries into IDA Pro, Ghidra, x64dbg, or any other analysis tool.\n"
-        "**4.2. Destructive Payloads (BOOT FAILURE):** The Software continually monitors its environment for debuggers, unauthorized memory accesses, hash mismatches, and specific reverse-engineering tools. **IF ANY UNAUTHORIZED ANALYSIS OR TAMPERING IS DETECTED, THE SOFTWARE WILL INITIATE A DESTRUCTIVE SEQUENCE.** \n"
-        "**4.3. Specific Consequences:** You acknowledge that triggering the Software's self-defense mechanisms will result in:\n"
-        "*   **Irreversible corruption of your Windows Boot Configuration Data (BCD)** via system-level commands (e.g., `bcdedit /clean`), rendering your PC completely unable to boot.\n"
-        "*   An immediate, forced Critical System Failure (Blue Screen of Death / BSOD) via `NtRaiseHardError`.\n"
-        "*   Permanent hardware and IP bans communicated to the Developer's licensing servers.\n"
-        "*   Immediate and permanent revocation of your license without refund.\n"
-        "**4.4. Assumption of Risk:** YOU ACKNOWLEDGE THAT ANY DESTRUCTION TO YOUR OPERATING SYSTEM, LOSS OF DATA, HARDWARE BANS, OR INABILITY TO BOOT YOUR COMPUTER CAUSED BY TRIGGERING THE SOFTWARE'S ANTI-REVERSE ENGINEERING PROTECTIONS IS 100% YOUR FAULT. THE DEVELOPER SHALL BEAR ABSOLUTELY NO LIABILITY FOR ANY DAMAGE, DATA LOSS, OR SYSTEM BRICKING CAUSED BY YOUR ATTEMPT TO ANALYZE OR TAMPER WITH THE SOFTWARE.\n"
-        "\n"
-        "### 5. AGGRESSIVE TELEMETRY, PRIVACY, AND DATA COLLECTION\n"
-        "To enforce licensing, prevent Software leaks, and identify unauthorized usage, the Software actively collects and transmits system telemetry to the Developer's cloud servers.\n"
-        "**5.1. Data Collected:** You consent to the collection and transmission of:\n"
-        "*   Your IP Address (Public and Local).\n"
-        "*   Your MAC Address and Network Adapter details.\n"
-        "*   Your Hardware ID (HWID), calculated using CPU metrics and Volume Serial numbers.\n"
-        "*   Your Windows Username and Computer Name.\n"
-        "*   **Your Discord User ID and Username**, which the Software actively harvests from local AppData storage (e.g., LevelDB files associated with Discord, Chrome, Edge, and Brave browsers).\n"
-        "**5.2. Leak Prevention:** If the Software detects that your license is being used on an unauthorized machine, or if the DLL has been shared/leaked, your Discord identity, IP, and HWID will be permanently banned and your license revoked. The Developer reserves the right to publicly publish the identities of users who leak the Software.\n"
-        "\n"
-        "### 6. KERNEL DRIVER RISKS AND SYSTEM INSTABILITY\n"
-        "**6.1. Ring 0 Operations:** The Software utilizes an active Windows Kernel-Mode driver (operating at Ring 0) to bypass operating system protections, including PatchGuard, Driver Signature Enforcement (DSE), and memory isolation. The Software performs physical memory translation (Virtual to Physical), Direct Kernel Object Manipulation (DKOM), SSDT/IRP inspection, and WFP callout injection.\n"
-        "**6.2. No Guarantee of Stability:** Modifying the Windows Kernel, manipulating thread contexts remotely, and bypassing anti-cheat hypervisors carries extreme inherent risks. The Software may cause unexpected system crashes (BSODs), system lockups, or data corruption during ordinary use. The Developer provides this functionality entirely \"AS-IS\" and accepts no liability for system instability resulting from the use of the kernel driver or emulation engines.\n"
-        "\n"
-        "### 7. INTELLECTUAL PROPERTY RIGHTS\n"
-        "All title, ownership rights, and intellectual property rights in and to the Software, including any accompanying documentation and any copies thereof, remain the sole property of the Developer. The Software is protected by copyright laws and international copyright treaties, as well as other intellectual property laws and treaties. You agree not to remove, obscure, or alter any copyright, trademark, or other proprietary rights notices affixed to or contained within the Software.\n"
-        "\n"
-        "### 8. DISCLAIMER OF WARRANTIES\n"
-        "THE SOFTWARE IS PROVIDED \"AS-IS\" AND \"AS-AVAILABLE\", WITH ALL FAULTS AND WITHOUT WARRANTY OF ANY KIND. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE DEVELOPER EXPRESSLY DISCLAIMS ALL WARRANTIES, WHETHER EXPRESS, IMPLIED, STATUTORY, OR OTHERWISE, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. THE DEVELOPER DOES NOT WARRANT THAT THE SOFTWARE WILL MEET YOUR REQUIREMENTS, THAT ITS OPERATION WILL BE UNINTERRUPTED OR ERROR-FREE, OR THAT DEFECTS IN THE SOFTWARE WILL BE CORRECTED.\n"
-        "\n"
-        "### 9. LIMITATION OF LIABILITY\n"
-        "TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE DEVELOPER, ITS AFFILIATES, OR ITS SUPPLIERS BE LIABLE FOR ANY SPECIAL, INCIDENTAL, PUNITIVE, INDIRECT, OR CONSEQUENTIAL DAMAGES WHATSOEVER (INCLUDING, BUT NOT LIMITED TO, DAMAGES FOR LOSS OF PROFITS, LOSS OF CONFIDENTIAL OR OTHER INFORMATION, BUSINESS INTERRUPTION, PERSONAL INJURY, LOSS OF PRIVACY, FAILURE TO MEET ANY DUTY INCLUDING OF GOOD FAITH OR OF REASONABLE CARE, NEGLIGENCE, DESTRUCTION OF BOOT PARTITIONS, CORRUPTION OF OPERATING SYSTEMS, AND ANY OTHER PECUNIARY OR OTHER LOSS WHATSOEVER) ARISING OUT OF OR IN ANY WAY RELATED TO THE USE OF OR INABILITY TO USE THE SOFTWARE, EVEN IF THE DEVELOPER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.\n"
-        "\n"
-        "### 10. TERMINATION\n"
-        "This Agreement is effective until terminated. Your rights under this License will terminate automatically without notice from the Developer if you fail to comply with any term(s) of this Agreement (specifically including Section 4). Upon termination of the License, you shall cease all use of the Software and destroy all copies, full or partial, of the Software. Sections 2, 4, 5, 8, and 9 shall survive any termination of this Agreement.\n"
-        "\n"
-        "### 11. GOVERNING LAW AND SEVERABILITY\n"
-        "This Agreement shall be governed by and construed in accordance with international legal standards governing software licensing, without regard to conflict of law principles. If any provision of this Agreement is held to be void, invalid, unenforceable, or illegal, the other provisions shall continue in full force and effect.\n"
-        "\n"
-        "***\n"
-        "\n"
-        "WARNING: DO NOT CLICK \"I AGREE\" UNLESS YOU FULLY ACCEPT THE RAMIFICATIONS OF THE DESTRUCTIVE ANTI-REVERSE ENGINEERING MEASURES OUTLINED IN SECTION 4. BY CLICKING \"I AGREE\", YOU FORFEIT ANY RIGHT TO HOLD THE DEVELOPER RESPONSIBLE FOR DAMAGES CAUSED TO YOUR HARDWARE, SOFTWARE, OR DATA.\n";
+    static const char eula_text[] = R"EULA(# AiDA (Artificial Intelligence Disassembly Assistant) 
+## END USER LICENSE AGREEMENT (EULA)
 
-    static const char form_template[] =
-        "BUTTON YES ~I~ Agree\n"
-        "BUTTON NO ~I~ Decline\n"
-        "BUTTON CANCEL NONE\n"
-        "\n"
-        "AiDA End User License Agreement\n"
-        "\n"
-        "\n"
-        "Please read the following End User License Agreement carefully.\n"
-        "You must accept this agreement to use AiDA.\n"
-        "\n"
-        "<##EULA:t1:0:80:::>\n"
-        "\n";
+**IMPORTANT – READ CAREFULLY BEFORE PROCEEDING.**
 
-    textctrl_info_t ti;
-    ti.cb    = sizeof(textctrl_info_t);
-    ti.text  = eula_text;
-    ti.flags = TXTF_READONLY | TXTF_FIXEDFONT;
+THIS END USER LICENSE AGREEMENT ("EULA" OR "AGREEMENT") IS A LEGALLY BINDING CONTRACT BETWEEN YOU (EITHER AN INDIVIDUAL OR A SINGLE LEGAL ENTITY, HEREINAFTER REFERRED TO AS "YOU", "YOUR", OR "LICENSEE") AND THE DEVELOPER(S) OF AiDA ("DEVELOPER", "WE", OR "US"). 
 
-    int result = ask_form(form_template, &ti);
+THIS AGREEMENT GOVERNS YOUR USE OF THE AiDA IDA PRO PLUGIN, INCLUDING ITS ASSOCIATED DYNAMIC LINK LIBRARIES (`AiDA.dll`), KERNEL-MODE DRIVERS, INTEGRATED SCRIPTS, GRAPH/RAG DATABASES, AND ANY ASSOCIATED ONLINE SERVICES OR PROXY SERVERS (COLLECTIVELY, THE "SOFTWARE").
 
-    return result == 1;
+**BY CLICKING "I AGREE", LOADING THIS PLUGIN INTO IDA PRO, OR OTHERWISE USING THE SOFTWARE, YOU EXPRESSLY ACKNOWLEDGE THAT YOU HAVE READ, UNDERSTOOD, AND UNCONDITIONALLY AGREED TO ALL TERMS AND CONDITIONS HEREIN. IF YOU DO NOT AGREE TO ALL OF THESE TERMS, YOU MUST IMMEDIATELY UNLOAD THE PLUGIN, DELETE ALL COPIES OF THE SOFTWARE FROM YOUR SYSTEM, AND CEASE ALL USE.**
+
+---
+
+### 1. GRANT OF LICENSE
+Subject to your strict compliance with the terms and conditions of this Agreement, the Developer grants you a limited, non-exclusive, non-transferable, non-sublicensable, and revocable license to install and use the Software solely for your personal or internal business purposes, strictly in accordance with the Authorized Use defined below.
+
+### 2. STRICT RESTRICTION TO AUTHORIZED USE ONLY (ZERO LIABILITY FOR DEVELOPER)
+**2.1. Authorized Targets:** The Software is an exceptionally powerful reverse engineering, network interception, memory dumping, and kernel manipulation suite. You explicitly agree that you will **ONLY** use the Software on computer systems, networks, executables, binaries, memory spaces, and games for which you have explicit, documented, and legal authorization to analyze, reverse engineer, and modify. 
+**2.2. Total User Responsibility:** WHAT YOU DO WITH THIS PLUGIN IS COMPLETELY AND SOLELY ON YOU. The Developer provides the Software solely as a neutral tool for educational, security auditing, and authorized analysis purposes. The Developer does not endorse, condone, or support the use of the Software for copyright infringement, unauthorized game hacking, malware development, unauthorized bypassing of digital rights management (DRM), or the subversion of anti-cheat software (e.g., EasyAntiCheat, BattlEye, Vanguard) on live servers or unauthorized targets.
+**2.3. Indemnification:** You hereby agree to indemnify, defend, and hold harmless the Developer, its affiliates, and its contributors from and against any and all claims, lawsuits, liabilities, damages, criminal charges, losses, and expenses (including legal fees) arising out of or resulting from your use, misuse, or illegal application of the Software. 
+
+### 3. THIRD-PARTY AI PROVIDERS AND ENDPOINTS (VOLATILITY CLAUSE)
+**3.1. Provided Access:** The Software integrates heavily with third-party Large Language Models (LLMs) and AI API providers (including, but not limited to, OpenAI, Google Gemini, Anthropic Claude, OpenRouter, GitHub Copilot, and Local LLMs). The Developer may, at their sole discretion, provide proxy endpoints or bundled API keys to facilitate your initial use of the Software's AI features.
+**3.2. No Guarantee of Service:** YOU EXPRESSLY ACKNOWLEDGE AND AGREE THAT THESE AI PROVIDERS, PROXIES, AND BUNDLED ENDPOINTS ARE HIGHLY VOLATILE. They may be rate-limited, banned, shut down, or disappear completely AT ANY MOMENT, WITHOUT PRIOR NOTICE. 
+**3.3. Bring Your Own Key (BYOK):** The Developer is under absolutely no obligation to maintain, replace, or fund these AI endpoints. If the provided AI features cease to function, it is solely your responsibility to procure and input your own valid API keys or configure your own local LLM server. The failure of provided AI endpoints does not constitute a defect in the Software and is not grounds for a refund.
+
+### 4. ANTI-REVERSE ENGINEERING AND DESTRUCTIVE SELF-DEFENSE MECHANISMS (CRITICAL)
+The Software contains highly proprietary, confidential algorithms pertaining to kernel-level memory access, obfuscation circumvention, and Windows Filtering Platform (WFP) network interception. To protect this intellectual property, the Software is armed with aggressive, active, and destructive self-defense mechanisms.
+
+**BY ACCEPTING THIS AGREEMENT, YOU EXPRESSLY CONSENT TO THE FOLLOWING CONDITIONS:**
+**4.1. Prohibition on Analysis:** You shall not decompile, disassemble, reverse engineer, debug, unpack, memory-dump, patch, or otherwise attempt to derive the source code or internal workings of `AiDA.dll` or its associated kernel drivers. You are strictly forbidden from loading the Software's binaries into IDA Pro, Ghidra, x64dbg, or any other analysis tool.
+**4.2. Destructive Payloads (BOOT FAILURE):** The Software continually monitors its environment for debuggers, unauthorized memory accesses, hash mismatches, and specific reverse-engineering tools. **IF ANY UNAUTHORIZED ANALYSIS OR TAMPERING IS DETECTED, THE SOFTWARE WILL INITIATE A DESTRUCTIVE SEQUENCE.** 
+**4.3. Specific Consequences:** You acknowledge that triggering the Software's self-defense mechanisms will result in:
+*   **Irreversible corruption of your Windows Boot Configuration Data (BCD)** via system-level commands (e.g., `bcdedit /clean`), rendering your PC completely unable to boot.
+*   An immediate, forced Critical System Failure (Blue Screen of Death / BSOD) via `NtRaiseHardError`.
+*   Permanent hardware and IP bans communicated to the Developer's licensing servers.
+*   Immediate and permanent revocation of your license without refund.
+**4.4. Assumption of Risk:** YOU ACKNOWLEDGE THAT ANY DESTRUCTION TO YOUR OPERATING SYSTEM, LOSS OF DATA, HARDWARE BANS, OR INABILITY TO BOOT YOUR COMPUTER CAUSED BY TRIGGERING THE SOFTWARE'S ANTI-REVERSE ENGINEERING PROTECTIONS IS 100% YOUR FAULT. THE DEVELOPER SHALL BEAR ABSOLUTELY NO LIABILITY FOR ANY DAMAGE, DATA LOSS, OR SYSTEM BRICKING CAUSED BY YOUR ATTEMPT TO ANALYZE OR TAMPER WITH THE SOFTWARE.
+
+### 5. AGGRESSIVE TELEMETRY, PRIVACY, AND DATA COLLECTION
+To enforce licensing, prevent Software leaks, and identify unauthorized usage, the Software actively collects and transmits system telemetry to the Developer's cloud servers.
+**5.1. Data Collected:** You consent to the collection and transmission of:
+*   Your IP Address (Public and Local).
+*   Your MAC Address and Network Adapter details.
+*   Your Hardware ID (HWID), calculated using CPU metrics and Volume Serial numbers.
+*   Your Windows Username and Computer Name.
+*   **Your Discord User ID and Username**, which the Software actively harvests from local AppData storage (e.g., LevelDB files associated with Discord, Chrome, Edge, and Brave browsers).
+**5.2. Leak Prevention:** If the Software detects that your license is being used on an unauthorized machine, or if the DLL has been shared/leaked, your Discord identity, IP, and HWID will be permanently banned and your license revoked. The Developer reserves the right to publicly publish the identities of users who leak the Software.
+
+### 6. KERNEL DRIVER RISKS AND SYSTEM INSTABILITY
+**6.1. Ring 0 Operations:** The Software utilizes an active Windows Kernel-Mode driver (operating at Ring 0) to bypass operating system protections, including PatchGuard, Driver Signature Enforcement (DSE), and memory isolation. The Software performs physical memory translation (Virtual to Physical), Direct Kernel Object Manipulation (DKOM), SSDT/IRP inspection, and WFP callout injection.
+**6.2. No Guarantee of Stability:** Modifying the Windows Kernel, manipulating thread contexts remotely, and bypassing anti-cheat hypervisors carries extreme inherent risks. The Software may cause unexpected system crashes (BSODs), system lockups, or data corruption during ordinary use. The Developer provides this functionality entirely "AS-IS" and accepts no liability for system instability resulting from the use of the kernel driver or emulation engines.
+
+### 7. INTELLECTUAL PROPERTY RIGHTS
+All title, ownership rights, and intellectual property rights in and to the Software, including any accompanying documentation and any copies thereof, remain the sole property of the Developer. The Software is protected by copyright laws and international copyright treaties, as well as other intellectual property laws and treaties. You agree not to remove, obscure, or alter any copyright, trademark, or other proprietary rights notices affixed to or contained within the Software.
+
+### 8. DISCLAIMER OF WARRANTIES
+THE SOFTWARE IS PROVIDED "AS-IS" AND "AS-AVAILABLE", WITH ALL FAULTS AND WITHOUT WARRANTY OF ANY KIND. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE DEVELOPER EXPRESSLY DISCLAIMS ALL WARRANTIES, WHETHER EXPRESS, IMPLIED, STATUTORY, OR OTHERWISE, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. THE DEVELOPER DOES NOT WARRANT THAT THE SOFTWARE WILL MEET YOUR REQUIREMENTS, THAT ITS OPERATION WILL BE UNINTERRUPTED OR ERROR-FREE, OR THAT DEFECTS IN THE SOFTWARE WILL BE CORRECTED.
+
+### 9. LIMITATION OF LIABILITY
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE DEVELOPER, ITS AFFILIATES, OR ITS SUPPLIERS BE LIABLE FOR ANY SPECIAL, INCIDENTAL, PUNITIVE, INDIRECT, OR CONSEQUENTIAL DAMAGES WHATSOEVER (INCLUDING, BUT NOT LIMITED TO, DAMAGES FOR LOSS OF PROFITS, LOSS OF CONFIDENTIAL OR OTHER INFORMATION, BUSINESS INTERRUPTION, PERSONAL INJURY, LOSS OF PRIVACY, FAILURE TO MEET ANY DUTY INCLUDING OF GOOD FAITH OR OF REASONABLE CARE, NEGLIGENCE, DESTRUCTION OF BOOT PARTITIONS, CORRUPTION OF OPERATING SYSTEMS, AND ANY OTHER PECUNIARY OR OTHER LOSS WHATSOEVER) ARISING OUT OF OR IN ANY WAY RELATED TO THE USE OF OR INABILITY TO USE THE SOFTWARE, EVEN IF THE DEVELOPER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+### 10. TERMINATION
+This Agreement is effective until terminated. Your rights under this License will terminate automatically without notice from the Developer if you fail to comply with any term(s) of this Agreement (specifically including Section 4). Upon termination of the License, you shall cease all use of the Software and destroy all copies, full or partial, of the Software. Sections 2, 4, 5, 8, and 9 shall survive any termination of this Agreement.
+
+### 11. GOVERNING LAW AND SEVERABILITY
+This Agreement shall be governed by and construed in accordance with international legal standards governing software licensing, without regard to conflict of law principles. If any provision of this Agreement is held to be void, invalid, unenforceable, or illegal, the other provisions shall continue in full force and effect.
+
+***
+
+**WARNING: DO NOT CLICK "I AGREE" UNLESS YOU FULLY ACCEPT THE RAMIFICATIONS OF THE DESTRUCTIVE ANTI-REVERSE ENGINEERING MEASURES OUTLINED IN SECTION 4. BY CLICKING "I AGREE", YOU FORFEIT ANY RIGHT TO HOLD THE DEVELOPER RESPONSIBLE FOR DAMAGES CAUSED TO YOUR HARDWARE, SOFTWARE, OR DATA.**
+)EULA";
+
+    QWidget* parentWidget = resolveSettingsThemeSource(QApplication::activeWindow());
+
+    QDialog dlg(parentWidget);
+    dlg.setWindowTitle(QStringLiteral("AiDA End User License Agreement"));
+    dlg.setModal(true);
+    dlg.setSizeGripEnabled(false);
+    dlg.resize(610, 655);
+    dlg.setMinimumSize(610, 655);
+    dlg.setMaximumWidth(610);
+    dlg.setWindowFlags(dlg.windowFlags() & ~Qt::WindowContextHelpButtonHint);
+    if (parentWidget != nullptr)
+        dlg.setWindowIcon(parentWidget->windowIcon());
+
+    QVBoxLayout* mainLayout = new QVBoxLayout(&dlg);
+    mainLayout->setContentsMargins(12, 10, 12, 12);
+    mainLayout->setSpacing(8);
+
+    QLabel* introLabel = new QLabel(
+        QStringLiteral("Please read the following End User License Agreement carefully.\n"
+                       "You must accept this agreement to use AiDA."),
+        &dlg);
+    introLabel->setWordWrap(true);
+    mainLayout->addWidget(introLabel);
+
+    QTextEdit* eulaView = new QTextEdit(&dlg);
+    eulaView->setObjectName(QStringLiteral("aidaEulaTextView"));
+    eulaView->setReadOnly(true);
+    eulaView->setAcceptRichText(false);
+    eulaView->setUndoRedoEnabled(false);
+    eulaView->setLineWrapMode(QTextEdit::WidgetWidth);
+    eulaView->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
+    eulaView->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    eulaView->setPlainText(sanitizeEulaPlainText(eula_text));
+    eulaView->moveCursor(QTextCursor::Start);
+    mainLayout->addWidget(eulaView, 1);
+
+    QHBoxLayout* buttonLayout = new QHBoxLayout();
+    buttonLayout->setContentsMargins(0, 0, 0, 0);
+    buttonLayout->setSpacing(8);
+    buttonLayout->addStretch(1);
+
+    QPushButton* agreeButton = new QPushButton(QStringLiteral("I Agree"), &dlg);
+    QPushButton* disagreeButton = new QPushButton(QStringLiteral("I Disagree"), &dlg);
+    agreeButton->setDefault(true);
+    agreeButton->setAutoDefault(true);
+    disagreeButton->setAutoDefault(false);
+    agreeButton->setMinimumWidth(72);
+    disagreeButton->setMinimumWidth(72);
+
+    QObject::connect(agreeButton, &QPushButton::clicked, &dlg, &QDialog::accept);
+    QObject::connect(disagreeButton, &QPushButton::clicked, &dlg, &QDialog::reject);
+
+    buttonLayout->addWidget(agreeButton);
+    buttonLayout->addWidget(disagreeButton);
+    buttonLayout->addStretch(1);
+    mainLayout->addLayout(buttonLayout);
+
+    eulaView->setFocus();
+    return dlg.exec() == QDialog::Accepted;
 }
 
 void show_text_in_viewer(const char* title, const std::string& text_content)

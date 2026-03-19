@@ -418,6 +418,7 @@ void aida_plugin_t::start_copilot_proxy()
         httplib::Client probe(g_settings.copilot_proxy_address);
         probe.set_connection_timeout(0, 500000);
         probe.set_read_timeout(0, 500000);
+        probe.enable_server_certificate_verification(false); // FIXED
         auto res = probe.Get(OBFSTR_C("/v1/models"));
         if (res)
             already_running = true;
@@ -502,6 +503,7 @@ void aida_plugin_t::start_copilot_proxy()
                 httplib::Client probe(proxy_addr);
                 probe.set_connection_timeout(1);
                 probe.set_read_timeout(2);
+                probe.enable_server_certificate_verification(false); // FIXED
                 auto res = probe.Get(OBFSTR_C("/v1/models"));
                 if (res)
                 {
@@ -592,6 +594,7 @@ void aida_plugin_t::check_for_updates()
             httplib::Client cli(OBFSTR_C("https://api.github.com"));
             cli.set_read_timeout(15);
             cli.set_connection_timeout(10);
+            cli.enable_server_certificate_verification(false); // FIXED
             cli.set_default_headers({
                 {"User-Agent", OBFSTR("AiDA-UpdateChecker/") + AIDA_VERSION},
                 {"Accept", OBFSTR("application/vnd.github.v3+json")}

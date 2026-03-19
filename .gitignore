@@ -55,3 +55,4 @@ license-validation-response.json
 ai_assistant.cfg
 
 driver/WhosWho/packages/
+bot/node_modules/

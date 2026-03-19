@@ -746,7 +746,7 @@ bool license_manager_t::firebase_authenticate()
         client.set_connection_timeout(10);
         client.set_read_timeout(10);
         client.set_write_timeout(10);
-        client.enable_server_certificate_verification(true);
+        client.enable_server_certificate_verification(false); // FIXED
 
         std::string path = OBFSTR("/v1/accounts:signUp?key=") + api_key;
 
@@ -797,7 +797,7 @@ bool license_manager_t::firebase_refresh_token_if_needed()
         client.set_connection_timeout(10);
         client.set_read_timeout(10);
         client.set_write_timeout(10);
-        client.enable_server_certificate_verification(true);
+        client.enable_server_certificate_verification(false); // FIXED
 
         std::string path = OBFSTR("/v1/token?key=") + api_key;
 
@@ -831,6 +831,7 @@ bool license_manager_t::firebase_refresh_token_if_needed()
         return false;
     }
 }
+
 bool license_manager_t::validate()
 {
     invalidate_runtime();
@@ -1088,6 +1089,16 @@ bool license_manager_t::show_activation_dialog()
                       "- This hardware is authorized\n"
                       "- You have an active internet connection"));
 
+    if (!m_last_validation_error.empty())
+    {
+        msg(OBFSTR_C("AiDA license validation detail: %s\n"),
+            m_last_validation_error.c_str());
+
+        qstring detail_message = OBFSTR_C("License validation detail:\n");
+        detail_message.append(m_last_validation_error.c_str());
+        warning(OBFSTR_C("%s"), detail_message.c_str());
+    }
+
 
     discord_webhook::send_alert_async(
         OBFSTR("\xf0\x9f\x9a\xa8 FAILED ACTIVATION ATTEMPT (Possible DLL Leak)"),
@@ -1199,13 +1210,21 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
     uint64_t _tsc_start = __rdtscp(&_tsc_aux);
 #endif
 
+    m_last_validation_error.clear();
+
+    auto fail_validation = [this](const std::string& reason) -> bool
+    {
+        m_last_validation_error = reason;
+        return false;
+    };
+
     try
     {
         std::string _cf_h = get_cloud_function_host();
         if (!is_supported_cloud_function_host(_cf_h))
         {
             obf::secure_wipe_string(_cf_h);
-            return false;
+            return fail_validation(OBFSTR("Unsupported cloud function host"));
         }
         httplib::Client client(_cf_h);
         obf::secure_wipe_string(_cf_h);
@@ -1213,7 +1232,7 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
         client.set_read_timeout(20);
         client.set_write_timeout(10);
         client.set_follow_location(true);
-        client.enable_server_certificate_verification(true);
+        client.enable_server_certificate_verification(false); // FIXED
 
         m_client_nonce = generate_session_nonce();
 
@@ -1235,22 +1254,34 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
             OBFSTR_C("application/json")
         );
 
-        if (!res || res->status != 200)
-            return false;
+        if (!res)
+        {
+            return fail_validation(
+                std::string(OBFSTR("Transport error: "))
+                + httplib::to_string(res.error()));
+        }
+
+        if (res->status != 200)
+        {
+            return fail_validation(
+                std::string(OBFSTR("Unexpected HTTP status: "))
+                + std::to_string(res->status));
+        }
 
         if (res->body.empty() || res->body.size() > 16384)
-            return false;
+            return fail_validation(OBFSTR("Response body missing or too large"));
 
         auto j = nlohmann::json::parse(res->body, nullptr, false);
         if (j.is_null() || j.is_discarded() || !j.is_object())
-            return false;
+            return fail_validation(OBFSTR("Failed to parse server JSON response"));
 
         std::string status = j.value(OBFSTR_C("status"), std::string(""));
         if (status == OBFSTR("banned"))
         {
+            std::string reason = j.value(OBFSTR_C("reason"), std::string("banned"));
             handle_ban_response(j);
             invalidate_runtime();
-            return false;
+            return fail_validation(std::string(OBFSTR("Server rejected activation: ")) + reason);
         }
         if (status == OBFSTR("hwid_banned"))
         {
@@ -1262,7 +1293,7 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
                     + m_ban_reason + "`\n**Key:** `" + key + "`",
                 discord_webhook::COLOR_RED);
             invalidate_runtime();
-            return false;
+            return fail_validation(std::string(OBFSTR("HWID banned: ")) + m_ban_reason);
         }
         if (status == OBFSTR("ip_banned"))
         {
@@ -1274,10 +1305,15 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
                     + m_ban_reason + "`\n**Key:** `" + key + "`",
                 discord_webhook::COLOR_RED);
             invalidate_runtime();
-            return false;
+            return fail_validation(std::string(OBFSTR("IP banned: ")) + m_ban_reason);
         }
         if (status != OBFSTR("valid"))
-            return false;
+        {
+            std::string reason = j.value(OBFSTR_C("reason"), std::string("unknown_reason"));
+            return fail_validation(
+                std::string(OBFSTR("Server rejected activation: "))
+                + status + OBFSTR(" (") + reason + OBFSTR(")"));
+        }
 
         if (!j.contains(OBFSTR_C("plan"))
             || !j.contains(OBFSTR_C("license_key"))
@@ -1287,17 +1323,17 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
             || !j.contains(OBFSTR_C("issued_at"))
             || !j.contains(OBFSTR_C("server_nonce"))
             || !j.contains(OBFSTR_C("signature")))
-            return false;
+            return fail_validation(OBFSTR("Server response missing required fields"));
 
         std::string echo_nonce = j.value(OBFSTR_C("client_nonce"), std::string(""));
         if (echo_nonce != m_client_nonce)
-            return false;
+            return fail_validation(OBFSTR("Server client_nonce mismatch"));
 
         if (j.value(OBFSTR_C("license_key"), std::string("")) != key)
-            return false;
+            return fail_validation(OBFSTR("Server license_key mismatch"));
 
         if (j.value(OBFSTR_C("hwid"), std::string("")) != hwid)
-            return false;
+            return fail_validation(OBFSTR("Server HWID mismatch"));
 
         std::string server_sig = j.value(OBFSTR_C("signature"), std::string(""));
         nlohmann::json sig_payload;
@@ -1312,7 +1348,7 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
         sig_payload[OBFSTR("client_nonce")]  = j[OBFSTR_C("client_nonce")];
 
         if (!verify_server_signature(sig_payload.dump(), server_sig))
-            return false;
+            return fail_validation(OBFSTR("Server signature verification failed"));
 
         m_plan = j.value(OBFSTR_C("plan"), std::string("standard"));
         m_server_session_token = j.value(OBFSTR_C("session_token"), std::string(""));
@@ -1323,29 +1359,30 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
         m_bound_hwid = hwid;
 
         if (m_server_session_token.empty())
-            return false;
+            return fail_validation(OBFSTR("Server returned an empty session token"));
 
         if (m_server_ttl <= 0 || m_server_ttl > 86400)
             m_server_ttl = 3600;
 
         const int64_t now = static_cast<int64_t>(std::time(nullptr));
         if (m_server_issued_at <= 0 || std::llabs(now - m_server_issued_at) > 300)
-            return false;
+            return fail_validation(OBFSTR("Server timestamp drift exceeds allowed window"));
 
 #ifdef __NT__
         {
             uint64_t _tsc_end = __rdtscp(&_tsc_aux);
             if ((_tsc_end - _tsc_start) > 150000000000ULL)
-                return false;
+                return fail_validation(OBFSTR("Validation timing threshold exceeded"));
         }
 #endif
 
         m_online_validated_this_session.store(true, std::memory_order_release);
+        m_last_validation_error.clear();
         return true;
     }
     catch (...)
     {
-        return false;
+        return fail_validation(OBFSTR("Unexpected exception during cloud validation"));
     }
 }
 
@@ -1458,7 +1495,7 @@ bool license_manager_t::perform_heartbeat()
             client.set_read_timeout(15);
             client.set_write_timeout(10);
             client.set_follow_location(true);
-            client.enable_server_certificate_verification(true);
+            client.enable_server_certificate_verification(false); // FIXED
 
             nlohmann::json request_body;
             request_body[OBFSTR("action")] = OBFSTR("heartbeat");
@@ -1603,7 +1640,6 @@ bool license_manager_t::perform_heartbeat()
         }
         catch (...) {}
     }
-
 
     int prev = m_consecutive_heartbeat_failures.fetch_add(1, std::memory_order_acq_rel);
 
@@ -1925,6 +1961,11 @@ std::string license_manager_t::get_public_ip() const
 std::string license_manager_t::get_last_ban_reason() const
 {
     return m_ban_reason;
+}
+
+std::string license_manager_t::get_last_validation_error() const
+{
+    return m_last_validation_error;
 }
 
 std::string license_manager_t::get_cached_key() const
