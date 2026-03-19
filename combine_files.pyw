@@ -47,7 +47,7 @@ class Config:
     max_file_size_mb: float = 10.0
     skip_dirs: Set[str] = field(default_factory=lambda: {
         ".git", ".vscode", "node_modules", "bin", "obj", "build", "dist",
-        "__pycache__", ".svn", ".hg", "venv", "ida-sdk", "firebase", "driver", "build", "tools", "mapper", "libs", "bot"
+        "__pycache__", ".svn", ".hg"
     })
     exclude_patterns: Set[str] = field(default_factory=lambda: {
         "*.log", "*.tmp", "*.bak", "*.pyc", "*.swp", "*.DS_Store", "whoswho_encrypted.h", "WhosWho.c", "WindMapper.c"

@@ -16,7 +16,7 @@ from datetime import datetime
 from collections import Counter
 
 # ─── HARDCODED DIRECTORY TO SCAN ───
-SCAN_DIR = r"C:\Users\diskt\Downloads\softmain remake"
+SCAN_DIR = r"C:\Users\ruar\Downloads\cpp-auth"
 # ────────────────────────────────────
 
 # ─── VISUAL STUDIO TOOLCHAIN PATHS ───
