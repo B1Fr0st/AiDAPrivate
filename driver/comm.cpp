@@ -2676,3 +2676,63 @@ std::vector<voyager::device_t::fingerprint_info> voyager::device_t::get_fingerpr
     VirtualFree(req, 0, MEM_RELEASE);
     return result;
 }
+
+// ── DLL Protection API ──────────────────────────────────────────────────
+// WHY: The driver's kernel-resident DPC timer computes a CRC hash of the
+// DLL's .text section via physical memory reads every N milliseconds.
+// If the hash ever mismatches the registered value, the driver issues
+// KeBugCheckEx from ring-0 — there is no user-mode code path that can
+// intercept or NOP this. An attacker would need to patch the driver
+// *in kernel memory* (PatchGuard territory) to circumvent it.
+
+bool voyager::device_t::register_dll_protection(
+    std::uint64_t module_base, std::uint64_t text_va,
+    std::uint32_t text_size, std::uint64_t expected_hash,
+    std::uint32_t check_interval_ms) noexcept
+{
+    if (!is_connected() || process_id_ == 0)
+        return false;
+
+    detail::dll_protect_request req{};
+    req.operation = detail::DPRT_OP_REGISTER;
+    req.pid = process_id_;
+    req.module_base = module_base;
+    req.text_section_va = text_va;
+    req.text_section_size = text_size;
+    req.expected_hash = expected_hash;
+    req.check_interval = check_interval_ms;
+
+    if (!send_request(ioctl_codes::DPRT(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    return req.status == detail::DPRT_STATUS_ACTIVE;
+}
+
+bool voyager::device_t::query_dll_protection(dll_protect_status& out) noexcept
+{
+    if (!is_connected())
+        return false;
+
+    detail::dll_protect_request req{};
+    req.operation = detail::DPRT_OP_QUERY;
+
+    if (!send_request(ioctl_codes::DPRT(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    out.status = req.status;
+    out.current_hash = req.current_hash;
+    out.expected_hash = req.expected_hash;
+    out.last_check_tsc = req.last_check_tsc;
+    return true;
+}
+
+bool voyager::device_t::unregister_dll_protection() noexcept
+{
+    if (!is_connected())
+        return false;
+
+    detail::dll_protect_request req{};
+    req.operation = detail::DPRT_OP_UNREGISTER;
+
+    return send_request(ioctl_codes::DPRT(), &req, static_cast<DWORD>(sizeof(req)));
+}

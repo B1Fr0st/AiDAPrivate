@@ -32,6 +32,20 @@ public:
     std::string get_cached_key() const;
     std::string get_session_token() const;
 
+    // ── Server-gated AI feature access ──
+    // WHY: These methods provide data that is ONLY available from a real
+    // server interaction. The ai_session_key is an HMAC-SHA256 derived from
+    // the server's session_token + signature + hwid. Without a legitimate
+    // server response, this key is empty and cannot be forged. The AI client
+    // uses this to gate feature execution — not with a bool check that can
+    // be NOP'd, but as a cryptographic input that produces invalid results
+    // when missing. The feature_epoch is a monotonic counter incremented on
+    // each heartbeat, ensuring session freshness.
+    std::string get_ai_session_key() const;
+    uint64_t get_feature_epoch() const;
+    bool has_server_features() const;
+    uint64_t compute_ai_feature_proof(const std::string& context) const;
+
     friend int idaapi license_revalidation_timer_cb(void*);
 
 private:
@@ -90,6 +104,16 @@ private:
     std::atomic<uint64_t> m_nonce_canary{0};
     std::atomic<uint64_t> m_sig_binding_tag{0};
     std::string m_heartbeat_nonce;
+
+    // ── Server-gated AI session state ──
+    // WHY: m_ai_session_key is the HMAC key derived from server-provided
+    // credentials (session_token, signature, hwid). It gates all AI features.
+    // m_feature_epoch increments on every successful heartbeat, preventing
+    // replay and ensuring freshness. m_server_feature_blob is reserved for
+    // future server-side encrypted prompt delivery.
+    std::string m_ai_session_key;
+    std::atomic<uint64_t> m_feature_epoch{0};
+    std::string m_server_feature_blob;
 
     static constexpr int MAX_HEARTBEAT_FAILURES = 1;
     static constexpr int REVALIDATION_INTERVAL_MS = 1800000;

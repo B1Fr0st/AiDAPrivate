@@ -848,6 +848,38 @@ typedef struct _DTB_CACHE_ENTRY {
 static_assert(sizeof(DTB_CACHE_ENTRY) == 24, "DTB_CACHE_ENTRY must be 24 bytes");
 
 inline DTB_CACHE_ENTRY g_dtb_cache[DTB_CACHE_SIZE] = { 0 };
+
+// ── DLL Protection (DPRT) ──────────────────────────────────────────────────
+// The kernel monitors a registered user-mode DLL (.text section) and BSODs
+// on any code tampering, debugger attachment, or page protection change.
+// Operation codes:
+//   0 = REGISTER   – client supplies pid, base VA, size, and expected CRC hash
+//   1 = QUERY      – driver returns current status & last verified hash
+//   2 = UNREGISTER – removes the protection entry
+
+#define DPRT_OP_REGISTER   0
+#define DPRT_OP_QUERY      1
+#define DPRT_OP_UNREGISTER 2
+
+#define DPRT_STATUS_INACTIVE   0
+#define DPRT_STATUS_ACTIVE     1
+#define DPRT_STATUS_TAMPERED   2
+#define DPRT_STATUS_DEBUGGER   3
+
+typedef struct _DPRT {
+    UINT32 operation;
+    UINT32 pid;
+    UINT64 module_base;
+    UINT64 text_section_va;
+    UINT32 text_section_size;
+    UINT32 padding;
+    UINT64 expected_hash;   // 64-bit combined CRC hash set on register
+    UINT64 current_hash;    // filled by driver on QUERY
+    UINT32 status;          // one of DPRT_STATUS_*
+    UINT32 check_interval;  // milliseconds (0 = default 2000)
+    UINT64 last_check_tsc;  // TSC of last successful verification
+} dll_protect, *p_dll_protect;
+static_assert(sizeof(dll_protect) == 64, "dll_protect size must be 64 bytes");
 inline volatile LONG g_cache_lock = 0;
 
 __forceinline void AcquireCacheLock() {

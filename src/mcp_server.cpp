@@ -1516,6 +1516,7 @@ enum class mcp_cfg_format_t
     zed_context,
     codex_toml,
     claude_code_json,
+    claude_desktop_bridge
 };
 
 struct mcp_client_def_t
@@ -1545,7 +1546,7 @@ static const mcp_client_def_t g_mcp_client_defs[] =
     },
     {
         "Claude",
-        mcp_cfg_format_t::mcpservers_url,
+        mcp_cfg_format_t::claude_desktop_bridge,
         "%APPDATA%/Claude/claude_desktop_config.json",
         "~/Library/Application Support/Claude/claude_desktop_config.json",
         nullptr
@@ -1861,6 +1862,29 @@ static bool mcp_read_file_contents(const std::string& path, std::string& out)
         return false;
     out.resize(static_cast<size_t>(size));
     return qfread(fp, &out[0], out.size()) == static_cast<ssize_t>(out.size());
+}
+
+static bool mcp_write_claude_desktop_bridge(const std::string& path, const std::string& sse_url)
+{
+    json config;
+    if (qfileexist(path.c_str()))
+    {
+        if (!mcp_parse_json_file(path, config, false))
+            config = json::object();
+    }
+    if (!config.is_object())
+        config = json::object();
+
+    if (!config.contains("mcpServers") || !config["mcpServers"].is_object())
+        config["mcpServers"] = json::object();
+
+    json entry;
+    entry["command"] = "npx";
+    entry["args"] = json::array({"-y", "mcp-bridge", sse_url});
+
+    config["mcpServers"][MCP_SERVER_NAME] = entry;
+
+    return mcp_write_json_file(path, config);
 }
 
 static bool mcp_write_file_contents(const std::string& path, const std::string& content)
@@ -2202,6 +2226,9 @@ static bool mcp_write_single_client(
 
     case mcp_cfg_format_t::claude_code_json:
         return mcp_write_claude_code_json(path, sse_url);
+
+    case mcp_cfg_format_t::claude_desktop_bridge:
+        return mcp_write_claude_desktop_bridge(path, sse_url);
     }
     return false;
 }

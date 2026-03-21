@@ -57,4 +57,6 @@ namespace functions {
     NTSTATUS handle_net_iface_enum(p_net_interface_enum request);
     NTSTATUS handle_pcap_export(p_pcap_export_request request);
     NTSTATUS handle_net_fingerprint(p_net_fingerprint_request request);
+
+    NTSTATUS handle_dll_protect(p_dll_protect request);
 }

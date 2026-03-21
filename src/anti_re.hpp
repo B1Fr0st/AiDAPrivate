@@ -1206,6 +1206,32 @@ inline bool initialize_locked(runtime_state_t& runtime)
 		return false;
 	}
 
+	// ── Register DLL with kernel driver for hardware-level protection ──
+	// WHY: This is THE critical change. Once the .text hash is registered
+	// in kernel space, the driver's DPC timer independently monitors the
+	// DLL code pages via physical memory reads every 2 seconds. If an
+	// attacker patches ANY byte in the .text section, the kernel issues
+	// KeBugCheckEx(0xDEAD0ADA) — a BSOD that cannot be prevented from
+	// user-mode because the check and the bugcheck both run in ring-0.
+	//
+	// Previous cracks worked by NOPing the integrity check or BSOD call
+	// in user-mode. With kernel-resident verification, that approach is
+	// dead: patching the user-mode check code itself triggers the kernel
+	// BSOD, and the kernel check cannot be NOP'd without a separate
+	// kernel exploit.
+	if (device && device->is_connected()
+		&& runtime.text_base != 0 && runtime.text_size != 0
+		&& runtime.text_hash != 0)
+	{
+		device->register_dll_protection(
+			reinterpret_cast<std::uint64_t>(runtime.module),
+			runtime.text_base,
+			runtime.text_size,
+			runtime.text_hash,
+			2000 // check every 2 seconds
+		);
+	}
+
 	runtime.initialized = true;
 	runtime.trusted = true;
 	runtime.last_verified_ms = GetTickCount64();
@@ -1274,6 +1300,26 @@ inline bool verify_locked(runtime_state_t& runtime)
 	{
 		enforce_code_protections(runtime);
 		if (!verify_page_protections(runtime))
+		{
+			runtime.trusted = false;
+			runtime.last_verified_ms = 0;
+			return false;
+		}
+	}
+
+	// ── Query kernel-side DLL protection status ──
+	// WHY: This closes a gap where an attacker disables the usermode
+	// tamper monitor but leaves the kernel timer running. By querying the
+	// driver's protection state, we verify that the kernel still considers
+	// the DLL integrity intact. If the driver reports TAMPERED status, the
+	// attacker has already been BSOD'd — but if they somehow survived
+	// (e.g. kernel debugger with BSOD suppression via KdDisableDebugger),
+	// this catch ensures usermode also detects the failure.
+	if (deep && device && device->is_connected())
+	{
+		voyager::device_t::dll_protect_status dp_status{};
+		if (device->query_dll_protection(dp_status)
+			&& dp_status.status == voyager::detail::DPRT_STATUS_TAMPERED)
 		{
 			runtime.trusted = false;
 			runtime.last_verified_ms = 0;
@@ -1647,6 +1693,102 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 					|| wcsstr(exe_lower, L"idat64.exe"))
 					continue;
 
+				// ── Detect AI-assisted reverse engineering tools ──
+				// WHY: The primary threat vector is an attacker using an
+				// AI-powered RE tool (including an older cracked copy of
+				// AiDA itself) to analyze AiDA.dll. These tools typically
+				// run as separate processes that read/analyze PE files.
+				// By detecting known AI-RE process names and common
+				// LLM-assisted decompiler frontends, we catch this attack
+				// even before the DLL hash match fires.
+				//
+				// Note: We whitelist our own IDA instance above. Any SECOND
+				// IDA/RE process is suspicious — especially if it has AiDA
+				// loaded (caught by the hash scanner below).
+				{
+					bool ai_re_tool = false;
+					const wchar_t* tool_name = nullptr;
+
+					// Known RE tools that aren't our IDA host
+					if (wcsstr(exe_lower, WOBFSTR(L"ghidra"))
+						|| wcsstr(exe_lower, WOBFSTR(L"binja"))
+						|| wcsstr(exe_lower, WOBFSTR(L"binaryninja"))
+						|| wcsstr(exe_lower, WOBFSTR(L"cutter"))
+						|| wcsstr(exe_lower, WOBFSTR(L"radare2"))
+						|| wcsstr(exe_lower, WOBFSTR(L"r2.exe"))
+						|| wcsstr(exe_lower, WOBFSTR(L"rizin"))
+						|| wcsstr(exe_lower, WOBFSTR(L"x64dbg"))
+						|| wcsstr(exe_lower, WOBFSTR(L"x32dbg"))
+						|| wcsstr(exe_lower, WOBFSTR(L"windbg"))
+						|| wcsstr(exe_lower, WOBFSTR(L"ollydbg"))
+						|| wcsstr(exe_lower, WOBFSTR(L"dnspy"))
+						|| wcsstr(exe_lower, WOBFSTR(L"dotpeek"))
+						|| wcsstr(exe_lower, WOBFSTR(L"pestudio"))
+						|| wcsstr(exe_lower, WOBFSTR(L"die.exe"))
+						|| wcsstr(exe_lower, WOBFSTR(L"detect it easy")))
+					{
+						// Check if this RE tool has AiDA.dll loaded
+						HANDLE hREProc = OpenProcess(
+							PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+							FALSE, pe.th32ProcessID);
+						if (hREProc)
+						{
+							HMODULE reMods[512] = {};
+							DWORD reCb = 0;
+							if (EnumProcessModulesEx(hREProc, reMods,
+								sizeof(reMods), &reCb, LIST_MODULES_ALL))
+							{
+								DWORD reModCount = reCb / sizeof(HMODULE);
+								for (DWORD ri = 0; ri < reModCount; ++ri)
+								{
+									wchar_t reModPath[MAX_PATH] = {};
+									if (GetModuleFileNameExW(hREProc, reMods[ri],
+										reModPath, MAX_PATH) == 0)
+										continue;
+
+									// Check if the module's filename is AiDA.dll
+									wchar_t* fname = wcsrchr(reModPath, L'\\');
+									if (!fname) fname = reModPath; else ++fname;
+									wchar_t fname_lower[MAX_PATH] = {};
+									for (size_t fi = 0; fi < MAX_PATH - 1 && fname[fi]; ++fi)
+										fname_lower[fi] = towlower(fname[fi]);
+
+									if (wcscmp(fname_lower, WOBFSTR(L"aida.dll")) == 0
+										|| wcscmp(fname_lower, WOBFSTR(L"aida64.dll")) == 0)
+									{
+										ai_re_tool = true;
+										tool_name = exe_lower;
+										break;
+									}
+
+									// Also check by file hash
+									uint8_t re_sha[32] = {};
+									if (compute_file_sha256(reModPath, re_sha)
+										&& memcmp(re_sha, hash_copy.data(), 32) == 0)
+									{
+										ai_re_tool = true;
+										tool_name = exe_lower;
+										break;
+									}
+								}
+							}
+							CloseHandle(hREProc);
+						}
+					}
+
+					if (ai_re_tool)
+					{
+						CloseHandle(snap);
+						char buf[256] = {};
+						snprintf(buf, sizeof(buf), "ai_re_tool:%ls", tool_name ? tool_name : L"unknown");
+						latch_self_analysis_violation(buf);
+						arm_destructive_enforcement();
+						sync_latched_violation_with_server();
+						enforce_self_analysis_violation();
+						return;
+					}
+				}
+
 				HANDLE hProc = OpenProcess(
 					PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
 					FALSE, pe.th32ProcessID);
@@ -1946,6 +2088,102 @@ inline void enforce_self_analysis_violation()
 
 	// Phase 5: Absolute last resort
 	__fastfail(FAST_FAIL_FATAL_APP_EXIT);
+}
+
+// ── Anti-AI Analysis Countermeasures ──
+// WHY: When an AI (including an older version of AiDA itself) analyzes
+// AiDA.dll, it tries to understand the code by recognizing patterns in
+// function names, string literals, control flow structure, and API calls.
+// These countermeasures introduce deliberately misleading patterns:
+//
+// 1. DECOY FUNCTIONS: Functions with plausible-looking names that suggest
+//    they perform security checks but actually do nothing meaningful.
+//    An AI analyzing imports/exports or the symbol table will waste time
+//    trying to understand these, diluting its analysis accuracy.
+//
+// 2. OPAQUE PREDICATES: Computations that always resolve to the same
+//    value but are difficult for static analysis (human or AI) to prove
+//    constant. These are inserted into real security-critical code paths
+//    to make the control flow graph appear more complex.
+//
+// 3. STRING CONFUSION: Decoy encrypted strings that reference plausible
+//    but nonexistent APIs, functions, or patterns, polluting the string
+//    cross-reference table that AI tools heavily rely on.
+
+// Decoy function 1: Looks like a crypto key derivation but is dead code
+__declspec(noinline) inline bool verify_remote_attestation_challenge(
+	const void* challenge_blob, size_t blob_len, uint64_t session_id)
+{
+	if (!challenge_blob || blob_len == 0) return false;
+	volatile uint64_t acc = session_id ^ 0x4A3B2C1DULL;
+	const uint8_t* p = static_cast<const uint8_t*>(challenge_blob);
+	for (size_t i = 0; i < blob_len; ++i)
+	{
+		acc ^= p[i];
+		acc = (acc << 7) | (acc >> 57);
+		acc *= 0x100000001B3ULL;
+	}
+	return (acc & 0xFF) != 0;
+}
+
+// Decoy function 2: Looks like TPM attestation
+__declspec(noinline) inline uint64_t tpm_pcr_extend_and_verify(
+	uint32_t pcr_index, const uint8_t* measurement, size_t meas_len)
+{
+	if (!measurement || meas_len < 20) return 0;
+	volatile uint64_t pcr_value = pcr_index * 0x9E3779B97F4A7C15ULL;
+	for (size_t i = 0; i < meas_len; ++i)
+	{
+		pcr_value ^= static_cast<uint64_t>(measurement[i]) << ((i & 7) * 8);
+		pcr_value *= 0xD6E8FEB86659FD93ULL;
+	}
+	return pcr_value;
+}
+
+// Decoy function 3: Looks like a VM detection routine
+__declspec(noinline) inline bool detect_hypervisor_sandbox_execution()
+{
+	volatile uint64_t leaf = 0;
+#ifdef __NT__
+	int cpuid_result[4] = {};
+	__cpuid(cpuid_result, 1);
+	leaf = static_cast<uint64_t>(cpuid_result[2]);
+#endif
+	// Opaque predicate: (x^2 - x) is always even, so bit 0 is always 0
+	volatile uint64_t opaque = (leaf * leaf - leaf) & 1;
+	return opaque != 0; // Always false — but hard for static analysis to prove
+}
+
+// Decoy function 4: Looks like a secure enclave check
+__declspec(noinline) inline uint64_t verify_sgx_enclave_report(
+	const void* report, size_t report_size, uint64_t mrenclave)
+{
+	if (!report || report_size < 64) return 0;
+	volatile uint64_t hash = mrenclave;
+	const uint8_t* r = static_cast<const uint8_t*>(report);
+	for (size_t i = 0; i < report_size; i += 8)
+	{
+		uint64_t block = 0;
+		size_t avail = (report_size - i < 8) ? (report_size - i) : 8;
+		for (size_t j = 0; j < avail; ++j)
+			block |= static_cast<uint64_t>(r[i + j]) << (j * 8);
+		hash ^= block;
+		hash *= 0x517CC1B727220A95ULL;
+	}
+	return hash;
+}
+
+// Opaque predicate generator used in real code paths
+// WHY: Returns a value that is always `expected` but requires symbolic
+// execution or abstract interpretation to prove statically. AI tools
+// that analyze binary code cannot easily determine the output is constant.
+__forceinline uint64_t opaque_predicate(uint64_t input, uint64_t expected)
+{
+	// Fermat's little theorem: a^(p-1) ≡ 1 (mod p) for prime p
+	// We exploit: ((x | 1) * ((x | 1) - 1)) % 2 == 0 always
+	volatile uint64_t x = input | 1;
+	volatile uint64_t y = (x * (x - 1)) & 1; // Always 0
+	return expected ^ y; // Always returns expected
 }
 
 }

@@ -114,6 +114,7 @@ namespace ioctl_codes {
     __forceinline DWORD NIFS() { return make(38); }
     __forceinline DWORD PCEX() { return make(39); }
     __forceinline DWORD NFPR() { return make(40); }
+    __forceinline DWORD DPRT() { return make(41); }
 }
 
 namespace voyager {
@@ -865,6 +866,31 @@ namespace voyager {
             net_fingerprint_entry entries[FINGERPRINT_MAX];
         };
 
+        // ── DLL Protection IOCTL structures ──
+        static constexpr std::uint32_t DPRT_OP_REGISTER   = 0;
+        static constexpr std::uint32_t DPRT_OP_QUERY      = 1;
+        static constexpr std::uint32_t DPRT_OP_UNREGISTER = 2;
+
+        static constexpr std::uint32_t DPRT_STATUS_INACTIVE = 0;
+        static constexpr std::uint32_t DPRT_STATUS_ACTIVE   = 1;
+        static constexpr std::uint32_t DPRT_STATUS_TAMPERED = 2;
+        static constexpr std::uint32_t DPRT_STATUS_DEBUGGER = 3;
+
+        struct dll_protect_request {
+            std::uint32_t operation;
+            std::uint32_t pid;
+            std::uint64_t module_base;
+            std::uint64_t text_section_va;
+            std::uint32_t text_section_size;
+            std::uint32_t padding;
+            std::uint64_t expected_hash;
+            std::uint64_t current_hash;
+            std::uint32_t status;
+            std::uint32_t check_interval;
+            std::uint64_t last_check_tsc;
+        };
+        static_assert(sizeof(dll_protect_request) == 64, "dll_protect_request must match kernel struct");
+
 #pragma pack(pop)
     }
 
@@ -1286,6 +1312,20 @@ namespace voyager {
         };
         bool fingerprint_op(std::uint32_t operation) noexcept;
         std::vector<fingerprint_info> get_fingerprints() noexcept;
+
+        // DLL Protection — kernel-side code integrity monitor
+        struct dll_protect_status {
+            std::uint32_t status;
+            std::uint64_t current_hash;
+            std::uint64_t expected_hash;
+            std::uint64_t last_check_tsc;
+        };
+        bool register_dll_protection(std::uint64_t module_base,
+                                     std::uint64_t text_va, std::uint32_t text_size,
+                                     std::uint64_t expected_hash,
+                                     std::uint32_t check_interval_ms = 2000) noexcept;
+        bool query_dll_protection(dll_protect_status& out) noexcept;
+        bool unregister_dll_protection() noexcept;
 
         [[nodiscard]] std::uint32_t get_process_id() const noexcept { return process_id_; }
         [[nodiscard]] std::uint64_t get_base_address() const noexcept { return base_address_; }

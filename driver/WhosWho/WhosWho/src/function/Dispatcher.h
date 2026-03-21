@@ -82,6 +82,7 @@ namespace ioctl_codes {
     __forceinline ULONG NIFS() { return make(38); }
     __forceinline ULONG PCEX() { return make(39); }
     __forceinline ULONG NFPR() { return make(40); }
+    __forceinline ULONG DPRT() { return make(41); }
 }
 
 namespace dispatcher {
@@ -627,6 +628,13 @@ namespace dispatcher {
             if (input_size >= sizeof(net_fingerprint_request) && output_size >= sizeof(net_fingerprint_request)) {
                 status = functions::handle_net_fingerprint((p_net_fingerprint_request)buffer);
                 bytes = sizeof(net_fingerprint_request);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::DPRT()) {
+            if (input_size >= sizeof(dll_protect) && output_size >= sizeof(dll_protect)) {
+                status = functions::handle_dll_protect((p_dll_protect)buffer);
+                bytes = sizeof(dll_protect);
             }
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }

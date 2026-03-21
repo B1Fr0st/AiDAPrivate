@@ -16,7 +16,7 @@ from datetime import datetime
 from collections import Counter
 
 # ─── HARDCODED DIRECTORY TO SCAN ───
-SCAN_DIR = r"C:\Users\ruar\Downloads\cpp-auth"
+SCAN_DIR = r"C:\Users\ruar\Downloads\FairGame Permanent Spoofer"
 # ────────────────────────────────────
 
 # ─── VISUAL STUDIO TOOLCHAIN PATHS ───
