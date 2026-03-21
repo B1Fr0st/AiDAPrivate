@@ -1710,22 +1710,22 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 					const wchar_t* tool_name = nullptr;
 
 					// Known RE tools that aren't our IDA host
-					if (wcsstr(exe_lower, WOBFSTR(L"ghidra"))
-						|| wcsstr(exe_lower, WOBFSTR(L"binja"))
-						|| wcsstr(exe_lower, WOBFSTR(L"binaryninja"))
-						|| wcsstr(exe_lower, WOBFSTR(L"cutter"))
-						|| wcsstr(exe_lower, WOBFSTR(L"radare2"))
-						|| wcsstr(exe_lower, WOBFSTR(L"r2.exe"))
-						|| wcsstr(exe_lower, WOBFSTR(L"rizin"))
-						|| wcsstr(exe_lower, WOBFSTR(L"x64dbg"))
-						|| wcsstr(exe_lower, WOBFSTR(L"x32dbg"))
-						|| wcsstr(exe_lower, WOBFSTR(L"windbg"))
-						|| wcsstr(exe_lower, WOBFSTR(L"ollydbg"))
-						|| wcsstr(exe_lower, WOBFSTR(L"dnspy"))
-						|| wcsstr(exe_lower, WOBFSTR(L"dotpeek"))
-						|| wcsstr(exe_lower, WOBFSTR(L"pestudio"))
-						|| wcsstr(exe_lower, WOBFSTR(L"die.exe"))
-						|| wcsstr(exe_lower, WOBFSTR(L"detect it easy")))
+					if (wcsstr(exe_lower, WOBFSTR(L"ghidra").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"binja").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"binaryninja").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"cutter").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"radare2").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"r2.exe").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"rizin").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"x64dbg").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"x32dbg").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"windbg").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"ollydbg").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"dnspy").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"dotpeek").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"pestudio").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"die.exe").c_str())
+						|| wcsstr(exe_lower, WOBFSTR(L"detect it easy").c_str()))
 					{
 						// Check if this RE tool has AiDA.dll loaded
 						HANDLE hREProc = OpenProcess(
@@ -1753,8 +1753,8 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 									for (size_t fi = 0; fi < MAX_PATH - 1 && fname[fi]; ++fi)
 										fname_lower[fi] = towlower(fname[fi]);
 
-									if (wcscmp(fname_lower, WOBFSTR(L"aida.dll")) == 0
-										|| wcscmp(fname_lower, WOBFSTR(L"aida64.dll")) == 0)
+									if (wcscmp(fname_lower, WOBFSTR(L"aida.dll").c_str()) == 0
+										|| wcscmp(fname_lower, WOBFSTR(L"aida64.dll").c_str()) == 0)
 									{
 										ai_re_tool = true;
 										tool_name = exe_lower;
@@ -1780,7 +1780,7 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 					{
 						CloseHandle(snap);
 						char buf[256] = {};
-						snprintf(buf, sizeof(buf), "ai_re_tool:%ls", tool_name ? tool_name : L"unknown");
+						::qsnprintf(buf, sizeof(buf), "ai_re_tool:%ls", tool_name ? tool_name : L"unknown");
 						latch_self_analysis_violation(buf);
 						arm_destructive_enforcement();
 						sync_latched_violation_with_server();

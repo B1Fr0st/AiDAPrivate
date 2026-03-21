@@ -1864,6 +1864,9 @@ static bool mcp_read_file_contents(const std::string& path, std::string& out)
     return qfread(fp, &out[0], out.size()) == static_cast<ssize_t>(out.size());
 }
 
+static bool mcp_parse_json_file(const std::string& path, json& out, bool allow_jsonc);
+static bool mcp_write_json_file(const std::string& path, const json& data);
+
 static bool mcp_write_claude_desktop_bridge(const std::string& path, const std::string& sse_url)
 {
     json config;
@@ -1981,7 +1984,7 @@ static std::string mcp_strip_jsonc(const std::string& input)
     return result;
 }
 
-static bool mcp_parse_json_file(const std::string& path, json& out, bool allow_jsonc = false)
+static bool mcp_parse_json_file(const std::string& path, json& out, bool allow_jsonc)
 {
     std::string raw;
     if (!mcp_read_file_contents(path, raw))

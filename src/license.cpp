@@ -1530,6 +1530,8 @@ void license_manager_t::compute_session_credentials(const std::string& key,
 
     m_feature_epoch.store(1, std::memory_order_release);
 }
+
+bool license_manager_t::perform_heartbeat()
 {
     if (m_cached_key.empty())
         return false;

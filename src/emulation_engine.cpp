@@ -5,6 +5,7 @@
 
 #pragma warning(push)
 #pragma warning(disable: 4005)
+#pragma warning(disable: 4018)
 #pragma warning(disable: 4267)
 #include <pro.h>
 #include <kernwin.hpp>

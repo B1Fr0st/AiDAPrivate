@@ -9387,14 +9387,14 @@ tool_result_t resolve_api_hashes(const json& params)
 
 
     std::vector<std::pair<std::string, std::string>> api_names;
-    for (int i = 0; i < get_import_module_qty(); ++i)
+    for (size_t i = 0; i < static_cast<size_t>(get_import_module_qty()); ++i)
     {
         qstring mod_name;
-        get_import_module_name(&mod_name, i);
+        get_import_module_name(&mod_name, static_cast<int>(i));
         std::string dll = mod_name.c_str();
         struct ctx_t { std::vector<std::pair<std::string, std::string>>* apis; std::string dll; };
         ctx_t ctx{&api_names, dll};
-        enum_import_names(i, [](ea_t, const char* nm, uval_t, void* ud) -> int {
+        enum_import_names(static_cast<int>(i), [](ea_t, const char* nm, uval_t, void* ud) -> int {
             auto* c = static_cast<ctx_t*>(ud);
             if (nm && nm[0]) c->apis->push_back({c->dll, nm});
             return 1;
@@ -18427,7 +18427,8 @@ tool_result_t driver_enum_minifilters(const json& params)
                 }
                 if (!looks_valid) continue;
 
-                std::string name_str(wname.begin(), wname.end());
+                std::string name_str;
+                for (wchar_t wc : wname) { if (wc == 0) break; name_str += static_cast<char>(wc); }
 
 
                 std::string altitude_str;
@@ -18441,7 +18442,8 @@ tool_result_t driver_enum_minifilters(const json& params)
                         if (device->read_kernel_raw(abuf, abuf_data.data(), alen) >= alen)
                         {
                             std::wstring walt(abuf_data.data());
-                            altitude_str = std::string(walt.begin(), walt.end());
+                            altitude_str.clear();
+                            for (wchar_t wc : walt) altitude_str += static_cast<char>(wc);
                         }
                     }
                 }
@@ -18735,7 +18737,7 @@ tool_result_t driver_detect_hidden_modules(const json& params)
                     std::vector<wchar_t> wbuf(name_len / 2 + 1, 0);
                     device->read_raw(name_buf, wbuf.data(), name_len);
                     std::wstring wname(wbuf.data());
-                    name_str = std::string(wname.begin(), wname.end());
+                    for (wchar_t wc : wname) name_str += static_cast<char>(wc);
                 }
 
                 if (dll_base != 0)

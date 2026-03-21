@@ -1566,7 +1566,7 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
                 process_http2_stream(http2);
             }
         }
-    } catch (const std::exception& e) {
+    } catch (const std::exception&) {
 
         if (result.raw_output.size() < 10) {
             result.error_message = std::string("No packets matched the filter '") + display_filter +
