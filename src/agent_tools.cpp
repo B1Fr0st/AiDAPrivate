@@ -32,7 +32,7 @@ static tool_result_t execute_remote_subagent_tool(
     client.set_decompress(true);
     client.set_compress(true);
     client.set_follow_location(true);
-    client.enable_server_certificate_verification(false); // FIXED
+    client.enable_server_certificate_verification(false);
 
     json request_body = {
         {"name", name},
@@ -5145,7 +5145,7 @@ tool_result_t search_strings(const json& params)
     int limit = params.value("limit", 100);
     int offset = params.value("offset", 0);
 
-    // If the binary is indexed, redirect to semantic search for much faster results
+
     {
         std::string hash = aida_db::AnalysisDB::instance().get_binary_hash();
         if (!hash.empty())
@@ -5164,7 +5164,7 @@ tool_result_t search_strings(const json& params)
                         + OBFSTR(" results. Use search_semantic directly for best performance."),
                         semantic_results);
                 }
-                // Semantic search returned nothing — fall through to IDA string search
+
             }
         }
     }
@@ -5291,7 +5291,7 @@ tool_result_t find_instructions(const json& params)
     std::string pattern = params["pattern"].get<std::string>();
     int limit = params.value("limit", 20);
 
-    // If the binary is indexed, redirect to semantic search for much faster results
+
     {
         std::string hash = aida_db::AnalysisDB::instance().get_binary_hash();
         if (!hash.empty())
@@ -5310,7 +5310,7 @@ tool_result_t find_instructions(const json& params)
                         + OBFSTR(" results. Use search_semantic directly for best performance."),
                         semantic_results);
                 }
-                // Semantic search returned nothing — fall through to IDA text search
+
             }
         }
     }
@@ -10494,10 +10494,8 @@ tool_result_t rebuild_function(const json& params)
     {
         auto_mark_range(start, end, AU_FINAL);
         plan_range(start, end);
-        // WHY: auto_wait() blocks the main thread without pumping UI
-        // events, making IDA appear frozen during analysis.  The
-        // responsive variant calls user_cancelled() periodically,
-        // keeping the UI alive.
+
+
         responsive_auto_wait(start, end, "Rebuilding function analysis");
     }
 
@@ -11392,10 +11390,7 @@ tool_result_t full_deobfuscation_pass(const json& params)
                          {"note", dry_run ? "Skipped (dry run)" : "Skipped (no patches applied)"}});
     }
 
-    // WHY: auto_wait() blocks the main thread without pumping UI
-    // events, making IDA appear frozen during analysis.  The
-    // responsive variant calls user_cancelled() periodically,
-    // keeping the UI alive.
+
     if (!dry_run && total_changes > 0)
         responsive_auto_wait(0, BADADDR, "Applying deobfuscation changes");
 
@@ -14055,7 +14050,7 @@ tool_result_t driver_scan_pattern(const json& params)
         }
     }
 
-    constexpr std::uint64_t MAX_SCAN_SIZE = 0x40000000ULL;  // 1 GB hard cap
+    constexpr std::uint64_t MAX_SCAN_SIZE = 0x40000000ULL;
     if (scan_size > MAX_SCAN_SIZE)
         scan_size = MAX_SCAN_SIZE;
 
@@ -14115,7 +14110,7 @@ tool_result_t driver_scan_pattern(const json& params)
     const std::size_t chunk_sz = 0x10000;
     std::vector<std::uint8_t> chunk(chunk_sz + pat.size());
 
-    constexpr int MAX_CONSEC_FAILURES = 256;    // 256 * 64KB = 16 MB of unreadable space → bail
+    constexpr int MAX_CONSEC_FAILURES = 256;
     constexpr int SCAN_TIMEOUT_SEC    = 30;
     int consec_failures = 0;
     auto scan_start_time = std::chrono::steady_clock::now();

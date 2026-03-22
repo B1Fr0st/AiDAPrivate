@@ -263,10 +263,7 @@ void AIClient::_generate(const std::string& prompt_text, callback_t callback, do
     }
     VERIFY_LICENSE_INLINE();
 
-    // ── Server-gated feature check at async entry point ──
-    // WHY: This catches attempts to use AI features before the server
-    // has been contacted. An attacker who patches the driver check and
-    // the license boolean still cannot produce a valid session key.
+
     if (!license_manager_t::instance().has_server_features())
     {
         if (callback)
@@ -358,7 +355,7 @@ std::shared_ptr<httplib::Client> AIClient::_get_or_create_client(
         _http_client->set_decompress(true);
         _http_client->set_compress(true);
         _http_client->set_follow_location(true);
-        _http_client->enable_server_certificate_verification(false); // FIXED
+        _http_client->enable_server_certificate_verification(false);
     }
     _http_client->set_default_headers(headers);
     return _http_client;
@@ -496,23 +493,7 @@ std::string AIClient::_blocking_generate(const std::string& prompt_text, double 
     if (!license_manager_t::instance().is_valid())
         return OBFSTR("Error: License expired or revoked.");
 
-    // ── Server-gated AI execution check ──
-    // WHY: This is the core anti-crack measure for the AI pipeline.
-    // Unlike the boolean is_valid() check above (which CAN be NOP'd),
-    // this computes a cryptographic proof using the server-derived
-    // ai_session_key. The key is a 32-byte HMAC that only exists after
-    // a real server interaction. A cracked binary with a patched
-    // is_valid() will still have an empty session key, producing a
-    // proof of 0, which fails the non-triviality check below.
-    //
-    // To bypass this, an attacker would need to either:
-    //   (a) Forge the server response (impossible without ECDSA privkey)
-    //   (b) Capture and replay a valid response (mitigated by nonces/TTL)
-    //   (c) Hardcode a valid 32-byte key (expires on next heartbeat cycle)
-    //   (d) NOP the proof check AND all downstream uses of the proof
-    //
-    // Option (d) is made difficult by embedding the proof value into the
-    // request metadata, so removing it corrupts the API call.
+
     {
         auto& lic = license_manager_t::instance();
         std::string session_key = lic.get_ai_session_key();
@@ -597,11 +578,7 @@ std::string AIClient::_streaming_blocking_generate(const std::string& prompt_tex
     if (!is_available())
         return OBFSTR("Error: AI client is not initialized. Check API key.");
 
-    // ── Server-gated streaming execution ──
-    // WHY: Same rationale as _blocking_generate. Streaming is an alternate
-    // code path that must also be gated on the server-derived session key.
-    // Without this check, an attacker could route all requests through the
-    // streaming path to bypass the non-streaming gate.
+
     {
         auto& lic = license_manager_t::instance();
         if (!lic.has_server_features())

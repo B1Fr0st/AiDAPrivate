@@ -1893,13 +1893,7 @@ struct tool_exec_request_t : public exec_request_t
     }
 };
 
-// ── Batched tool execution ────────────────────────────────────────────
-// WHY: Replaces N separate execute_sync round-trips with a single one.
-// Each execute_sync has overhead: queue insertion, blocking wait for the
-// main thread's event loop to dequeue, context switch, and signal back.
-// Batching pays that cost once.  Between tools, replace_wait_box pumps
-// IDA's UI event queue so the application stays responsive instead of
-// appearing frozen.
+
 struct batch_tool_exec_request_t : public exec_request_t
 {
     struct call_entry_t
@@ -1945,8 +1939,7 @@ struct batch_tool_exec_request_t : public exec_request_t
                 break;
             }
 
-            // replace_wait_box / user_cancelled pump IDA's UI event queue,
-            // preventing the "frozen application" appearance between tools.
+
             if (multi)
                 replace_wait_box("HIDECANCEL\nAiDA: [%zu/%zu] %s",
                     i + 1, calls.size(), calls[i].tool_name.c_str());
@@ -2013,7 +2006,7 @@ result_t run(
     status_fn on_status,
     stream_fn on_stream)
 {
-    // Mutable copy for adaptive token/result-size adjustments during execution
+
     config_t config = config_in;
 
     result_t result;
@@ -2162,7 +2155,7 @@ result_t run(
             {
                 ai_response = ai_response.substr(0, trunc_pos);
 
-                // Adaptively increase output tokens to prevent future truncation
+
                 int current_out = config.agentic_output_tokens;
                 int new_out = (std::min)(current_out * 2, 65536);
                 if (new_out > current_out)
@@ -2327,10 +2320,7 @@ result_t run(
 
         std::vector<tool_execution_t> round_tool_results;
 
-        // ── Phase 1: Partition tool calls ──────────────────────────────
-        // Resolve cache hits immediately on the worker thread.
-        // Execute session tools directly on the worker thread.
-        // Collect remaining IDA tools for a single batched execute_sync.
+
         struct pending_ida_tool_t
         {
             std::string tool_name;
@@ -2361,7 +2351,7 @@ result_t run(
             std::string cache_key = tool_name + "|" + params.dump(-1, ' ', false, json::error_handler_t::replace);
             const bool is_session_tool = subagents::is_session_tool_name(tool_name);
 
-            // ── Cache hit: return immediately, no main-thread work ────
+
             if (tool_def && tool_def->read_only && !is_session_tool)
             {
                 auto cache_it = tool_cache.find(cache_key);
@@ -2386,7 +2376,7 @@ result_t run(
                 }
             }
 
-            // ── Session tools run on the worker thread (no IDA API) ───
+
             if (is_session_tool)
             {
                 if (on_status)
@@ -2425,7 +2415,7 @@ result_t run(
                 continue;
             }
 
-            // ── IDA tools: collect for batched main-thread dispatch ───
+
             pending_ida_tool_t pt;
             pt.tool_name = tool_name;
             pt.params = params;
@@ -2435,13 +2425,7 @@ result_t run(
             ida_tool_calls.push_back(std::move(pt));
         }
 
-        // ── Phase 2: Batch-execute IDA tools in ONE execute_sync ──────
-        // WHY: A single execute_sync replaces N separate round-trips to
-        // IDA's main thread.  Each round-trip has overhead of queue
-        // insertion, thread context switch, and waiting for the main
-        // thread's event loop to pick up the request.  By batching,
-        // that overhead is paid once.  Within the batch, replace_wait_box
-        // pumps UI events between tool handlers, keeping IDA responsive.
+
         if (!ida_tool_calls.empty() && !(cancelled && cancelled->load()))
         {
             batch_tool_exec_request_t batch;
@@ -2621,13 +2605,13 @@ result_t run(
             size_t prompt_tokens = ctx_mgr.estimate_tokens(current_prompt);
             size_t budget = static_cast<size_t>(ctx_cfg.max_context_tokens - ctx_cfg.output_reserve);
 
-            // Proactively shrink tool result caps when context pressure builds
+
             if (budget > 0)
             {
                 double usage_ratio = static_cast<double>(prompt_tokens) / budget;
                 if (usage_ratio > 0.85)
                 {
-                    // Severely constrained — halve tool result sizes
+
                     config.max_tool_result_chars = (std::max)(config.max_tool_result_chars / 2, 4096);
                     if (config.verbose_logging)
                         msg(OBFSTR_C("AiDA Agent: High context pressure (%.0f%%), reduced tool result cap to %d chars.\n"),
@@ -2635,7 +2619,7 @@ result_t run(
                 }
                 else if (usage_ratio > 0.70)
                 {
-                    // Moderate pressure — reduce by 25%
+
                     config.max_tool_result_chars = (std::max)(config.max_tool_result_chars * 3 / 4, 8192);
                 }
             }

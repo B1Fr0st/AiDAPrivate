@@ -2431,30 +2431,23 @@ namespace ida_utils
         if (pfn == nullptr)
             return false;
 
-        // Skip tail chunks — FUNC_TAIL (0x8000) marks a function tail, not real entry
-        // SDK funcs.hpp: "#define FUNC_TAIL 0x00008000 ///< This is a function tail."
+
         if (pfn->flags & FUNC_TAIL)
             return false;
 
-        // Skip thunks — FUNC_THUNK (0x80) marks jump-through stubs, decompiling these
-        // can produce NULL cfunc internals in hexx64
-        // SDK funcs.hpp: "#define FUNC_THUNK 0x00000080 ///< Thunk (jump) function"
+
         if (pfn->flags & FUNC_THUNK)
             return false;
 
-        // Skip outlined code — FUNC_OUTLINE (0x20000) marks compiler-outlined fragments
-        // SDK funcs.hpp: "#define FUNC_OUTLINE 0x00020000 ///< Outlined code, not a real function."
+
         if (pfn->flags & FUNC_OUTLINE)
             return false;
 
-        // Skip functions with zero size — no code bytes to decompile
+
         if (pfn->size() == 0)
             return false;
 
-        // Skip functions in extern segments — the decompiler returns MERR_EXTERN for these
-        // but some edge cases can crash before the error code is set.
-        // SDK segment.hpp: "#define SEG_XTRN 1 ///< * segment with 'extern' definitions."
-        // SDK hexrays.hpp: "MERR_EXTERN = -28, ///< special segments cannot be decompiled"
+
         segment_t* seg = getseg(pfn->start_ea);
         if (seg != nullptr && seg->type == SEG_XTRN)
             return false;

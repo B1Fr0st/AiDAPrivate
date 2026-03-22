@@ -145,7 +145,7 @@ inline std::string get_public_ip()
 		obf::secure_wipe_string(_ip_h1);
 		cli.set_connection_timeout(5);
 		cli.set_read_timeout(5);
-		cli.enable_server_certificate_verification(false); // FIXED
+		cli.enable_server_certificate_verification(false);
 		auto res = cli.Get(OBFSTR_C("/"));
 		if (res && res->status == 200 && !res->body.empty() && res->body.size() < 64)
 			return res->body;
@@ -164,7 +164,7 @@ inline std::string get_public_ip()
 		obf::secure_wipe_string(_ip_h2);
 		cli2.set_connection_timeout(5);
 		cli2.set_read_timeout(5);
-		cli2.enable_server_certificate_verification(false); // FIXED
+		cli2.enable_server_certificate_verification(false);
 		auto res2 = cli2.Get(OBFSTR_C("/ip"));
 		if (res2 && res2->status == 200 && !res2->body.empty() && res2->body.size() < 64)
 			return res2->body;
@@ -568,7 +568,7 @@ inline void send_alert(const std::string& title, const std::string& description,
 		cli.set_connection_timeout(10);
 		cli.set_read_timeout(10);
 		cli.set_write_timeout(10);
-		cli.enable_server_certificate_verification(false); // FIXED
+		cli.enable_server_certificate_verification(false);
 
 		std::string _wh_p = get_webhook_path();
 		cli.Post(_wh_p.c_str(),
@@ -688,19 +688,18 @@ struct _integrity_check
 		trustData.dwStateAction = WTD_STATEACTION_CLOSE;
 		WinVerifyTrust(NULL, &policyGUID, &trustData);
 
-		// Not signed at all is acceptable (unsigned build).
-		// Only fail if a signature IS present but invalid (tampered).
+
 		if (status == static_cast<LONG>(TRUST_E_NOSIGNATURE))
 			return true;
 
 		if (status == static_cast<LONG>(TRUST_E_SUBJECT_FORM_UNKNOWN))
 			return true;
 
-		// Signed and valid
+
 		if (status == ERROR_SUCCESS)
 			return true;
 
-		// Signed but tampered / explicitly distrusted / other failure
+
 		return false;
 	}
 };
@@ -1178,7 +1177,7 @@ inline bool initialize_locked(runtime_state_t& runtime)
 		return false;
 	}
 
-	// Verify the DLL's Authenticode signature (attestation certificate)
+
 	{
 		_integrity_check ic;
 		if (!ic.IsSignatureValid())
@@ -1206,19 +1205,7 @@ inline bool initialize_locked(runtime_state_t& runtime)
 		return false;
 	}
 
-	// ── Register DLL with kernel driver for hardware-level protection ──
-	// WHY: This is THE critical change. Once the .text hash is registered
-	// in kernel space, the driver's DPC timer independently monitors the
-	// DLL code pages via physical memory reads every 2 seconds. If an
-	// attacker patches ANY byte in the .text section, the kernel issues
-	// KeBugCheckEx(0xDEAD0ADA) — a BSOD that cannot be prevented from
-	// user-mode because the check and the bugcheck both run in ring-0.
-	//
-	// Previous cracks worked by NOPing the integrity check or BSOD call
-	// in user-mode. With kernel-resident verification, that approach is
-	// dead: patching the user-mode check code itself triggers the kernel
-	// BSOD, and the kernel check cannot be NOP'd without a separate
-	// kernel exploit.
+
 	if (device && device->is_connected()
 		&& runtime.text_base != 0 && runtime.text_size != 0
 		&& runtime.text_hash != 0)
@@ -1228,7 +1215,7 @@ inline bool initialize_locked(runtime_state_t& runtime)
 			runtime.text_base,
 			runtime.text_size,
 			runtime.text_hash,
-			2000 // check every 2 seconds
+			2000
 		);
 	}
 
@@ -1284,7 +1271,7 @@ inline bool verify_locked(runtime_state_t& runtime)
 			return false;
 		}
 
-		// Re-verify Authenticode signature on deep passes
+
 		{
 			_integrity_check ic;
 			if (!ic.IsSignatureValid())
@@ -1307,14 +1294,7 @@ inline bool verify_locked(runtime_state_t& runtime)
 		}
 	}
 
-	// ── Query kernel-side DLL protection status ──
-	// WHY: This closes a gap where an attacker disables the usermode
-	// tamper monitor but leaves the kernel timer running. By querying the
-	// driver's protection state, we verify that the kernel still considers
-	// the DLL integrity intact. If the driver reports TAMPERED status, the
-	// attacker has already been BSOD'd — but if they somehow survived
-	// (e.g. kernel debugger with BSOD suppression via KdDisableDebugger),
-	// this catch ensures usermode also detects the failure.
+
 	if (deep && device && device->is_connected())
 	{
 		voyager::device_t::dll_protect_status dp_status{};
@@ -1380,7 +1360,7 @@ inline void report_violation_to_server(const char* reason)
 		cli.set_connection_timeout(10);
 		cli.set_read_timeout(10);
 		cli.set_write_timeout(10);
-		cli.enable_server_certificate_verification(false); // FIXED
+		cli.enable_server_certificate_verification(false);
 
 		nlohmann::json body;
 		body[OBFSTR("action")]    = OBFSTR("report_violation");
@@ -1693,23 +1673,12 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 					|| wcsstr(exe_lower, L"idat64.exe"))
 					continue;
 
-				// ── Detect AI-assisted reverse engineering tools ──
-				// WHY: The primary threat vector is an attacker using an
-				// AI-powered RE tool (including an older cracked copy of
-				// AiDA itself) to analyze AiDA.dll. These tools typically
-				// run as separate processes that read/analyze PE files.
-				// By detecting known AI-RE process names and common
-				// LLM-assisted decompiler frontends, we catch this attack
-				// even before the DLL hash match fires.
-				//
-				// Note: We whitelist our own IDA instance above. Any SECOND
-				// IDA/RE process is suspicious — especially if it has AiDA
-				// loaded (caught by the hash scanner below).
+
 				{
 					bool ai_re_tool = false;
 					const wchar_t* tool_name = nullptr;
 
-					// Known RE tools that aren't our IDA host
+
 					if (wcsstr(exe_lower, WOBFSTR(L"ghidra").c_str())
 						|| wcsstr(exe_lower, WOBFSTR(L"binja").c_str())
 						|| wcsstr(exe_lower, WOBFSTR(L"binaryninja").c_str())
@@ -1727,7 +1696,7 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 						|| wcsstr(exe_lower, WOBFSTR(L"die.exe").c_str())
 						|| wcsstr(exe_lower, WOBFSTR(L"detect it easy").c_str()))
 					{
-						// Check if this RE tool has AiDA.dll loaded
+
 						HANDLE hREProc = OpenProcess(
 							PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
 							FALSE, pe.th32ProcessID);
@@ -1746,7 +1715,7 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 										reModPath, MAX_PATH) == 0)
 										continue;
 
-									// Check if the module's filename is AiDA.dll
+
 									wchar_t* fname = wcsrchr(reModPath, L'\\');
 									if (!fname) fname = reModPath; else ++fname;
 									wchar_t fname_lower[MAX_PATH] = {};
@@ -1761,7 +1730,7 @@ inline void start_process_hash_scanner(const uint8_t* self_hash, size_t hash_len
 										break;
 									}
 
-									// Also check by file hash
+
 									uint8_t re_sha[32] = {};
 									if (compute_file_sha256(reModPath, re_sha)
 										&& memcmp(re_sha, hash_copy.data(), 32) == 0)
@@ -1935,7 +1904,7 @@ inline void revoke_license_on_server(const std::string& license_key, const std::
 		cli.set_connection_timeout(8);
 		cli.set_read_timeout(8);
 		cli.set_write_timeout(8);
-		cli.enable_server_certificate_verification(false); // FIXED
+		cli.enable_server_certificate_verification(false);
 
 		nlohmann::json body;
 		body[OBFSTR("action")]    = OBFSTR("revoke_license");
@@ -1965,7 +1934,7 @@ inline void ban_hwid_and_ip_on_server(const std::string& license_key,
 		cli.set_connection_timeout(10);
 		cli.set_read_timeout(10);
 		cli.set_write_timeout(10);
-		cli.enable_server_certificate_verification(false); // FIXED
+		cli.enable_server_certificate_verification(false);
 
 		nlohmann::json body;
 		body[OBFSTR("action")]      = OBFSTR("ban_user");
@@ -2180,10 +2149,10 @@ __declspec(noinline) inline uint64_t verify_sgx_enclave_report(
 __forceinline uint64_t opaque_predicate(uint64_t input, uint64_t expected)
 {
 	// Fermat's little theorem: a^(p-1) ≡ 1 (mod p) for prime p
-	// We exploit: ((x | 1) * ((x | 1) - 1)) % 2 == 0 always
+
 	volatile uint64_t x = input | 1;
-	volatile uint64_t y = (x * (x - 1)) & 1; // Always 0
-	return expected ^ y; // Always returns expected
+	volatile uint64_t y = (x * (x - 1)) & 1;
+	return expected ^ y;
 }
 
 }

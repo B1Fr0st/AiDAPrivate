@@ -1649,8 +1649,8 @@ std::string StructureExtractor::get_raw_code(ea_t func_ea)
                 return code;
             }
         }
-        catch (const vd_failure_t&) { /* decompiler raised a controlled error */ }
-        catch (...) { /* SEH / unknown crash inside decompiler – skip this function */ }
+        catch (const vd_failure_t&) {  }
+        catch (...) {  }
     }
 
     func_t* func = pfn ? pfn : get_func(func_ea);

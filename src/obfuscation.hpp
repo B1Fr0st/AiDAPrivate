@@ -128,9 +128,9 @@ bool runtime_tamper_check() noexcept
 #if defined(_M_X64) && defined(_MSC_VER)
     const auto peb = __readgsqword(0x60);
     if (*reinterpret_cast<const uint8_t*>(peb + 2) != 0)
-        return false;   // PEB.BeingDebugged
+        return false;
     if (*reinterpret_cast<const uint32_t*>(peb + 0xBC) & 0x70u)
-        return false;   // NtGlobalFlag: heap debug flags
+        return false;
 #elif defined(_M_IX86) && defined(_MSC_VER)
     const auto peb = static_cast<uintptr_t>(__readfsdword(0x30));
     if (*reinterpret_cast<const uint8_t*>(peb + 2) != 0)
@@ -262,8 +262,8 @@ public:
     }
 };
 
-} // namespace detail
-} // namespace obf
+}
+}
 
 #define _OBF_SEED(salt) (::obf::detail::site_seed(                         \
     ::obf::detail::fnv1a(__FILE__),                                         \
@@ -301,7 +301,7 @@ inline void secure_wipe_string(std::string& s)
     }
 }
 
-} // namespace obf
+}
 
 #define OBFBYTES(s) ([]() -> std::string {                                  \
     constexpr uint32_t _seed = _OBF_SEED(0xE5A3u);                         \

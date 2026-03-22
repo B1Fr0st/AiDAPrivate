@@ -417,7 +417,7 @@ inline bool probe_instance_endpoint(const instance_info_t& info)
         cli.set_read_timeout(2);
         cli.set_write_timeout(2);
         cli.set_tcp_nodelay(true);
-        cli.enable_server_certificate_verification(false); // FIXED
+        cli.enable_server_certificate_verification(false);
         auto res = cli.Get("/health");
         return res && res->status == 200;
     }

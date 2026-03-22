@@ -746,7 +746,7 @@ bool license_manager_t::firebase_authenticate()
         client.set_connection_timeout(10);
         client.set_read_timeout(10);
         client.set_write_timeout(10);
-        client.enable_server_certificate_verification(false); // FIXED
+        client.enable_server_certificate_verification(false);
 
         std::string path = OBFSTR("/v1/accounts:signUp?key=") + api_key;
 
@@ -797,7 +797,7 @@ bool license_manager_t::firebase_refresh_token_if_needed()
         client.set_connection_timeout(10);
         client.set_read_timeout(10);
         client.set_write_timeout(10);
-        client.enable_server_certificate_verification(false); // FIXED
+        client.enable_server_certificate_verification(false);
 
         std::string path = OBFSTR("/v1/token?key=") + api_key;
 
@@ -1235,7 +1235,7 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
         client.set_read_timeout(20);
         client.set_write_timeout(10);
         client.set_follow_location(true);
-        client.enable_server_certificate_verification(false); // FIXED
+        client.enable_server_certificate_verification(false);
 
         m_client_nonce = generate_session_nonce();
 
@@ -1367,7 +1367,7 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
         if (m_server_ttl <= 0 || m_server_ttl > 86400)
             m_server_ttl = 3600;
 
-        // Parse server feature blob if present (future server enhancement)
+
         if (j.contains(OBFSTR_C("feature_blob")))
         {
             std::string fb = j.value(OBFSTR_C("feature_blob"), std::string(""));
@@ -1484,21 +1484,7 @@ void license_manager_t::compute_session_credentials(const std::string& key,
         derive_sig_binding_tag(server_sig, nonce),
         std::memory_order_release);
 
-    // ── Derive AI session key from server-provided credentials ──
-    // WHY: This is the cryptographic bridge between server validation and
-    // AI feature access. The key is an HMAC-SHA256 of the server session
-    // token using the concatenation of (server_sig | hwid | nonce_hex) as
-    // the message. Because the session_token changes every session and the
-    // signature is ECDSA-signed by the server's private key, an attacker
-    // cannot forge this without either:
-    //   (a) Compromising the server's ECDSA private key, or
-    //   (b) Replaying a captured server response (mitigated by nonce + TTL)
-    //
-    // The AI client requires this key to be non-empty before making API
-    // calls. Unlike a boolean check, this is a 32-byte cryptographic value
-    // that feeds into session proof computations — patching the check
-    // doesn't help because the subsequent HMAC computations produce
-    // incorrect values, causing cascading verification failures.
+
     {
         std::string nonce_hex;
         {
@@ -1513,7 +1499,7 @@ void license_manager_t::compute_session_credentials(const std::string& key,
             reinterpret_cast<const unsigned char*>(hmac_message.data()),
             hmac_message.size());
 
-        // Convert hex string to raw 32 bytes
+
         m_ai_session_key.clear();
         m_ai_session_key.reserve(32);
         for (size_t i = 0; i + 1 < hmac_hex.size() && m_ai_session_key.size() < 32; i += 2)
@@ -1552,7 +1538,7 @@ bool license_manager_t::perform_heartbeat()
             client.set_read_timeout(15);
             client.set_write_timeout(10);
             client.set_follow_location(true);
-            client.enable_server_certificate_verification(false); // FIXED
+            client.enable_server_certificate_verification(false);
 
             nlohmann::json request_body;
             request_body[OBFSTR("action")] = OBFSTR("heartbeat");
@@ -1643,21 +1629,10 @@ bool license_manager_t::perform_heartbeat()
                             }
                         }
 
-                        // ── Advance feature epoch on successful heartbeat ──
-                        // WHY: The feature epoch is a monotonic counter that
-                        // ensures AI session proofs are bound to the current
-                        // heartbeat cycle. Each successful heartbeat proves
-                        // the license is still valid and advances the epoch.
-                        // Stale proofs from previous epochs are rejected,
-                        // preventing replay of captured session data.
+
                         m_feature_epoch.fetch_add(1, std::memory_order_acq_rel);
 
-                        // Parse server feature blob if present
-                        // WHY: Future server enhancement — the server can
-                        // deliver encrypted prompt fragments or configuration
-                        // that only valid sessions can decrypt. This field is
-                        // parsed and stored now so no client update is needed
-                        // when the server starts sending it.
+
                         if (j.contains(OBFSTR_C("feature_blob")))
                         {
                             std::string fb = j.value(OBFSTR_C("feature_blob"), std::string(""));
@@ -2057,21 +2032,6 @@ std::string license_manager_t::get_session_token() const
     return m_server_session_token;
 }
 
-// ── Server-gated AI feature access implementations ──
-// WHY: These methods expose server-derived cryptographic state to the AI
-// client. The ai_session_key is a 32-byte HMAC derived from the server's
-// session_token (which the server generates fresh each validation), the
-// ECDSA signature, and the HWID. Without a real server interaction, these
-// return empty/zero, and the AI pipeline detects this via the
-// compute_ai_feature_proof() function which produces a recognizably
-// invalid result.
-//
-// compute_ai_feature_proof() is the key anti-crack function: it takes a
-// context string (e.g. prompt hash or model name) and returns an FNV-1a
-// hash mixed with the ai_session_key and feature_epoch. The AI client
-// checks that the proof is non-trivial; since the proof depends on 32
-// bytes of server-derived entropy, patching the check doesn't help —
-// the attacker would need to forge compute_session_credentials() output.
 
 std::string license_manager_t::get_ai_session_key() const
 {
@@ -2099,51 +2059,38 @@ bool license_manager_t::has_server_features() const
 
 uint64_t license_manager_t::compute_ai_feature_proof(const std::string& context) const
 {
-    // WHY: This function is the cryptographic gate. It produces a 64-bit
-    // proof value that depends on:
-    //   1. The 32-byte ai_session_key (server-derived, unforgeable)
-    //   2. The feature_epoch (advances each heartbeat)
-    //   3. The context string (request-specific, prevents cross-request replay)
-    //
-    // The proof uses FNV-1a mixing which is fast and produces well-
-    // distributed output. The AI client verifies the proof is not one of
-    // the known-bad patterns (0, basis value, trivial XOR of inputs).
-    //
-    // An attacker who patches the boolean check still gets proof=0 from
-    // an empty session key, which fails the non-triviality check deeper
-    // in the pipeline. To produce a valid proof they'd need the actual
-    // 32-byte HMAC, which requires the server's session_token.
+
 
     if (m_ai_session_key.empty() || m_ai_session_key.size() < 32)
         return 0;
 
     uint64_t epoch = m_feature_epoch.load(std::memory_order_acquire);
 
-    uint64_t proof = 14695981039346656037ULL; // FNV-1a basis
+    uint64_t proof = 14695981039346656037ULL;
 
-    // Mix in the full 32-byte session key
+
     for (size_t i = 0; i < m_ai_session_key.size(); ++i)
     {
         proof ^= static_cast<uint8_t>(m_ai_session_key[i]);
         proof *= 1099511628211ULL;
     }
 
-    // Mix in the epoch
+
     proof ^= epoch;
     proof *= 1099511628211ULL;
 
-    // Mix in the context
+
     for (char c : context)
     {
         proof ^= static_cast<uint8_t>(c);
         proof *= 1099511628211ULL;
     }
 
-    // Final mixing
+
     proof ^= 0xC0FFEE42DEADBEEFULL;
     proof *= 1099511628211ULL;
 
-    // Ensure non-trivial
+
     if (proof == 0)
         proof = 0xA3B1C9D7E5F02468ULL;
     if (proof == 14695981039346656037ULL)

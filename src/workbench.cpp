@@ -2476,7 +2476,7 @@ void AiDAWorkbenchPanel::reindex_binary()
 
     auto& store = graphrag::GraphStore::instance();
 
-    // Phase 1: Extract all functions into the knowledge graph
+
     show_wait_box("HIDECANCEL\nPhase 1/5: Indexing binary functions...");
     graphrag::StructureExtractor extractor(store);
     auto result = extractor.extract_all(m_binaryHash, [](int current, int total, const std::string& name) {
@@ -2485,7 +2485,7 @@ void AiDAWorkbenchPanel::reindex_binary()
     });
     graphrag::save_graph(m_binaryHash);
 
-    // Phase 2: Detect functional communities (clusters)
+
     replace_wait_box("Phase 2/5: Detecting functional communities...");
     graphrag::CommunityDetector detector(store);
     int community_count = detector.detect(m_binaryHash, 2, 50, true, [](int iteration, int total) {
@@ -2493,19 +2493,19 @@ void AiDAWorkbenchPanel::reindex_binary()
     });
     graphrag::save_graph(m_binaryHash);
 
-    // Phase 3: Run security analysis (flag dangerous functions)
+
     replace_wait_box("Phase 3/5: Running security analysis...");
     graphrag::QueryEngine qe(store);
     nlohmann::json security = qe.get_security_analysis(m_binaryHash, 50);
     graphrag::save_graph(m_binaryHash);
 
-    // Phase 4: Run taint analysis (source → sink vulnerability paths)
+
     replace_wait_box("Phase 4/5: Running taint analysis...");
     graphrag::TaintAnalyzer taint(store);
     auto taint_paths = taint.find_taint_paths(m_binaryHash, 100, true);
     graphrag::save_graph(m_binaryHash);
 
-    // Phase 5: Analyze network data flow patterns
+
     replace_wait_box("Phase 5/5: Analyzing network flow...");
     graphrag::NetworkFlowAnalyzer net_analyzer(store);
     auto net_result = net_analyzer.analyze(m_binaryHash, [](int current, int total, const std::string& message) {
@@ -2516,7 +2516,7 @@ void AiDAWorkbenchPanel::reindex_binary()
 
     hide_wait_box();
 
-    // Build summary of all analyses
+
     int high_risk_count = 0;
     if (security.contains("high_risk_functions") && security["high_risk_functions"].is_array())
         high_risk_count = static_cast<int>(security["high_risk_functions"].size());
@@ -2533,7 +2533,7 @@ void AiDAWorkbenchPanel::reindex_binary()
         QStringLiteral("Index Binary (Full Pipeline)"),
         summary, false);
 
-    // Show security overview in the overview browser
+
     if (!security.empty())
         render_text_browser(m_graphOverviewBrowser, json_dump_safe(security, 2), QStringLiteral("Binary Security Overview"));
 

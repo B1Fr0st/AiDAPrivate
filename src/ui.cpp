@@ -57,7 +57,7 @@ static std::vector<std::string> fetch_models_from_api(
         cli.set_default_headers(headers);
         cli.set_read_timeout(20);
         cli.set_connection_timeout(10);
-        cli.enable_server_certificate_verification(false); // FIXED
+        cli.enable_server_certificate_verification(false);
 
         auto res = cli.Get(path);
         if (!res || res->status != 200)
@@ -301,7 +301,7 @@ static std::string fetch_copilot_github_user()
             httplib::Client cli("https://api.github.com");
             cli.set_connection_timeout(3);
             cli.set_read_timeout(3);
-            cli.enable_server_certificate_verification(false); // FIXED
+            cli.enable_server_certificate_verification(false);
             httplib::Headers hdrs = {
                 {"Authorization", "token " + token},
                 {"User-Agent", "AiDA-Plugin"},
@@ -2145,12 +2145,12 @@ static QString sanitizeEulaPlainText(const char* rawText)
 
 bool show_eula_dialog()
 {
-    static const char eula_text[] = R"EULA(# AiDA (Artificial Intelligence Disassembly Assistant) 
+    static const char eula_text[] = R"EULA(# AiDA (Artificial Intelligence Disassembly Assistant)
 ## END USER LICENSE AGREEMENT (EULA)
 
 **IMPORTANT – READ CAREFULLY BEFORE PROCEEDING.**
 
-THIS END USER LICENSE AGREEMENT ("EULA" OR "AGREEMENT") IS A LEGALLY BINDING CONTRACT BETWEEN YOU (EITHER AN INDIVIDUAL OR A SINGLE LEGAL ENTITY, HEREINAFTER REFERRED TO AS "YOU", "YOUR", OR "LICENSEE") AND THE DEVELOPER(S) OF AiDA ("DEVELOPER", "WE", OR "US"). 
+THIS END USER LICENSE AGREEMENT ("EULA" OR "AGREEMENT") IS A LEGALLY BINDING CONTRACT BETWEEN YOU (EITHER AN INDIVIDUAL OR A SINGLE LEGAL ENTITY, HEREINAFTER REFERRED TO AS "YOU", "YOUR", OR "LICENSEE") AND THE DEVELOPER(S) OF AiDA ("DEVELOPER", "WE", OR "US").
 
 THIS AGREEMENT GOVERNS YOUR USE OF THE AiDA IDA PRO PLUGIN, INCLUDING ITS ASSOCIATED DYNAMIC LINK LIBRARIES (`AiDA.dll`), KERNEL-MODE DRIVERS, INTEGRATED SCRIPTS, GRAPH/RAG DATABASES, AND ANY ASSOCIATED ONLINE SERVICES OR PROXY SERVERS (COLLECTIVELY, THE "SOFTWARE").
 
@@ -2162,13 +2162,13 @@ THIS AGREEMENT GOVERNS YOUR USE OF THE AiDA IDA PRO PLUGIN, INCLUDING ITS ASSOCI
 Subject to your strict compliance with the terms and conditions of this Agreement, the Developer grants you a limited, non-exclusive, non-transferable, non-sublicensable, and revocable license to install and use the Software solely for your personal or internal business purposes, strictly in accordance with the Authorized Use defined below.
 
 ### 2. STRICT RESTRICTION TO AUTHORIZED USE ONLY (ZERO LIABILITY FOR DEVELOPER)
-**2.1. Authorized Targets:** The Software is an exceptionally powerful reverse engineering, network interception, memory dumping, and kernel manipulation suite. You explicitly agree that you will **ONLY** use the Software on computer systems, networks, executables, binaries, memory spaces, and games for which you have explicit, documented, and legal authorization to analyze, reverse engineer, and modify. 
+**2.1. Authorized Targets:** The Software is an exceptionally powerful reverse engineering, network interception, memory dumping, and kernel manipulation suite. You explicitly agree that you will **ONLY** use the Software on computer systems, networks, executables, binaries, memory spaces, and games for which you have explicit, documented, and legal authorization to analyze, reverse engineer, and modify.
 **2.2. Total User Responsibility:** WHAT YOU DO WITH THIS PLUGIN IS COMPLETELY AND SOLELY ON YOU. The Developer provides the Software solely as a neutral tool for educational, security auditing, and authorized analysis purposes. The Developer does not endorse, condone, or support the use of the Software for copyright infringement, unauthorized game hacking, malware development, unauthorized bypassing of digital rights management (DRM), or the subversion of anti-cheat software (e.g., EasyAntiCheat, BattlEye, Vanguard) on live servers or unauthorized targets.
-**2.3. Indemnification:** You hereby agree to indemnify, defend, and hold harmless the Developer, its affiliates, and its contributors from and against any and all claims, lawsuits, liabilities, damages, criminal charges, losses, and expenses (including legal fees) arising out of or resulting from your use, misuse, or illegal application of the Software. 
+**2.3. Indemnification:** You hereby agree to indemnify, defend, and hold harmless the Developer, its affiliates, and its contributors from and against any and all claims, lawsuits, liabilities, damages, criminal charges, losses, and expenses (including legal fees) arising out of or resulting from your use, misuse, or illegal application of the Software.
 
 ### 3. THIRD-PARTY AI PROVIDERS AND ENDPOINTS (VOLATILITY CLAUSE)
 **3.1. Provided Access:** The Software integrates heavily with third-party Large Language Models (LLMs) and AI API providers (including, but not limited to, OpenAI, Google Gemini, Anthropic Claude, OpenRouter, GitHub Copilot, and Local LLMs). The Developer may, at their sole discretion, provide proxy endpoints or bundled API keys to facilitate your initial use of the Software's AI features.
-**3.2. No Guarantee of Service:** YOU EXPRESSLY ACKNOWLEDGE AND AGREE THAT THESE AI PROVIDERS, PROXIES, AND BUNDLED ENDPOINTS ARE HIGHLY VOLATILE. They may be rate-limited, banned, shut down, or disappear completely AT ANY MOMENT, WITHOUT PRIOR NOTICE. 
+**3.2. No Guarantee of Service:** YOU EXPRESSLY ACKNOWLEDGE AND AGREE THAT THESE AI PROVIDERS, PROXIES, AND BUNDLED ENDPOINTS ARE HIGHLY VOLATILE. They may be rate-limited, banned, shut down, or disappear completely AT ANY MOMENT, WITHOUT PRIOR NOTICE.
 **3.3. Bring Your Own Key (BYOK):** The Developer is under absolutely no obligation to maintain, replace, or fund these AI endpoints. If the provided AI features cease to function, it is solely your responsibility to procure and input your own valid API keys or configure your own local LLM server. The failure of provided AI endpoints does not constitute a defect in the Software and is not grounds for a refund.
 
 ### 4. ANTI-REVERSE ENGINEERING AND DESTRUCTIVE SELF-DEFENSE MECHANISMS (CRITICAL)
@@ -2176,7 +2176,7 @@ The Software contains highly proprietary, confidential algorithms pertaining to 
 
 **BY ACCEPTING THIS AGREEMENT, YOU EXPRESSLY CONSENT TO THE FOLLOWING CONDITIONS:**
 **4.1. Prohibition on Analysis:** You shall not decompile, disassemble, reverse engineer, debug, unpack, memory-dump, patch, or otherwise attempt to derive the source code or internal workings of `AiDA.dll` or its associated kernel drivers. You are strictly forbidden from loading the Software's binaries into IDA Pro, Ghidra, x64dbg, or any other analysis tool.
-**4.2. Destructive Payloads (BOOT FAILURE):** The Software continually monitors its environment for debuggers, unauthorized memory accesses, hash mismatches, and specific reverse-engineering tools. **IF ANY UNAUTHORIZED ANALYSIS OR TAMPERING IS DETECTED, THE SOFTWARE WILL INITIATE A DESTRUCTIVE SEQUENCE.** 
+**4.2. Destructive Payloads (BOOT FAILURE):** The Software continually monitors its environment for debuggers, unauthorized memory accesses, hash mismatches, and specific reverse-engineering tools. **IF ANY UNAUTHORIZED ANALYSIS OR TAMPERING IS DETECTED, THE SOFTWARE WILL INITIATE A DESTRUCTIVE SEQUENCE.**
 **4.3. Specific Consequences:** You acknowledge that triggering the Software's self-defense mechanisms will result in:
 *   **Irreversible corruption of your Windows Boot Configuration Data (BCD)** via system-level commands (e.g., `bcdedit /clean`), rendering your PC completely unable to boot.
 *   An immediate, forced Critical System Failure (Blue Screen of Death / BSOD) via `NtRaiseHardError`.
