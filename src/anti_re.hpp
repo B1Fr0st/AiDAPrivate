@@ -133,6 +133,25 @@ inline std::string get_windows_username()
 
 inline std::string get_public_ip()
 {
+	// Cache the public IP for 10 minutes.  Each uncached call issues up to two
+	// synchronous HTTPS requests (api.ipify.org + ifconfig.me) with 5-second
+	// timeouts each, which blocks the calling thread for up to 20 seconds in
+	// the worst case.  When this helper is called from a timer callback on
+	// the UI thread, that 20-second stall freezes the entire IDA window.
+	static std::mutex ip_cache_mutex;
+	static std::string cached_ip;
+	static ULONGLONG cached_at_ms = 0;
+	static constexpr ULONGLONG IP_CACHE_TTL_MS = 600000u; // 10 minutes
+
+	{
+		std::lock_guard<std::mutex> lk(ip_cache_mutex);
+		ULONGLONG now = GetTickCount64();
+		if (!cached_ip.empty() && now >= cached_at_ms && (now - cached_at_ms) < IP_CACHE_TTL_MS)
+			return cached_ip;
+	}
+
+	std::string result;
+
 	try
 	{
 		std::string _ip_h1;
@@ -143,35 +162,47 @@ inline std::string get_public_ip()
 		_ip_h1 += OBFSTR("ify.org");
 		httplib::Client cli(_ip_h1);
 		obf::secure_wipe_string(_ip_h1);
-		cli.set_connection_timeout(5);
-		cli.set_read_timeout(5);
+		cli.set_connection_timeout(3);
+		cli.set_read_timeout(3);
 		cli.enable_server_certificate_verification(false);
 		auto res = cli.Get(OBFSTR_C("/"));
 		if (res && res->status == 200 && !res->body.empty() && res->body.size() < 64)
-			return res->body;
+			result = res->body;
 	}
 	catch (...) {}
 
-	try
+	if (result.empty())
 	{
-		std::string _ip_h2;
-		_ip_h2.reserve(19);
-		_ip_h2 += OBFSTR("htt");
-		_ip_h2 += OBFSTR("ps://");
-		_ip_h2 += OBFSTR("ifcon");
-		_ip_h2 += OBFSTR("fig.me");
-		httplib::Client cli2(_ip_h2);
-		obf::secure_wipe_string(_ip_h2);
-		cli2.set_connection_timeout(5);
-		cli2.set_read_timeout(5);
-		cli2.enable_server_certificate_verification(false);
-		auto res2 = cli2.Get(OBFSTR_C("/ip"));
-		if (res2 && res2->status == 200 && !res2->body.empty() && res2->body.size() < 64)
-			return res2->body;
+		try
+		{
+			std::string _ip_h2;
+			_ip_h2.reserve(19);
+			_ip_h2 += OBFSTR("htt");
+			_ip_h2 += OBFSTR("ps://");
+			_ip_h2 += OBFSTR("ifcon");
+			_ip_h2 += OBFSTR("fig.me");
+			httplib::Client cli2(_ip_h2);
+			obf::secure_wipe_string(_ip_h2);
+			cli2.set_connection_timeout(3);
+			cli2.set_read_timeout(3);
+			cli2.enable_server_certificate_verification(false);
+			auto res2 = cli2.Get(OBFSTR_C("/ip"));
+			if (res2 && res2->status == 200 && !res2->body.empty() && res2->body.size() < 64)
+				result = res2->body;
+		}
+		catch (...) {}
 	}
-	catch (...) {}
 
-	return OBFSTR("unknown");
+	if (result.empty())
+		result = OBFSTR("unknown");
+
+	{
+		std::lock_guard<std::mutex> lk(ip_cache_mutex);
+		cached_ip = result;
+		cached_at_ms = GetTickCount64();
+	}
+
+	return result;
 }
 
 inline std::string get_local_ip()

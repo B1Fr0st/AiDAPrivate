@@ -25,8 +25,8 @@ static tool_result_t execute_remote_subagent_tool(
 
     httplib::Client client(target.base_url.c_str());
     client.set_connection_timeout(5);
-    client.set_read_timeout(300);
-    client.set_write_timeout(20);
+    client.set_read_timeout(120);
+    client.set_write_timeout(10);
     client.set_tcp_nodelay(true);
     client.set_keep_alive(true);
     client.set_decompress(true);

@@ -1145,16 +1145,31 @@ static int idaapi license_revalidation_timer_cb(void* )
         return -1;
     }
 
-    if (!lm.perform_heartbeat())
-    {
-        int failures = lm.m_consecutive_heartbeat_failures.load(std::memory_order_acquire);
-        if (failures >= license_manager_t::MAX_HEARTBEAT_FAILURES)
+    // Heartbeat involves synchronous HTTPS calls (get_public_ip + cloud function POST)
+    // which can block for 20-45 seconds in the worst case.  Run it on a detached
+    // background thread so the IDA UI thread is never stalled by network latency.
+    std::thread([]() {
+        auto& bg_lm = license_manager_t::instance();
+        if (!bg_lm.perform_heartbeat())
         {
-            lm.invalidate_runtime();
-            lm.terminate_plugin();
-            return -1;
+            int failures = bg_lm.m_consecutive_heartbeat_failures.load(std::memory_order_acquire);
+            if (failures >= license_manager_t::MAX_HEARTBEAT_FAILURES)
+            {
+                struct invalidate_req_t : public exec_request_t
+                {
+                    ssize_t idaapi execute() override
+                    {
+                        auto& ui_lm = license_manager_t::instance();
+                        ui_lm.invalidate_runtime();
+                        ui_lm.terminate_plugin();
+                        delete this;
+                        return 0;
+                    }
+                };
+                execute_sync(*(new invalidate_req_t()), MFF_NOWAIT);
+            }
         }
-    }
+    }).detach();
 
     if (!lm.verify_integrity_inline())
     {
@@ -1534,9 +1549,9 @@ bool license_manager_t::perform_heartbeat()
             std::string _hb_h = get_cloud_function_host();
             httplib::Client client(_hb_h);
             obf::secure_wipe_string(_hb_h);
-            client.set_connection_timeout(10);
-            client.set_read_timeout(15);
-            client.set_write_timeout(10);
+            client.set_connection_timeout(5);
+            client.set_read_timeout(10);
+            client.set_write_timeout(5);
             client.set_follow_location(true);
             client.enable_server_certificate_verification(false);
 

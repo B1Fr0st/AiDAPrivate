@@ -339,10 +339,16 @@ aida_plugin_t::aida_plugin_t()
     reinit_ai_client();
     msg(OBFSTR_C("--- Plugin Loaded Successfully ---\n"));
 
-
+    // Load the GraphRAG knowledge-graph + vector store on a background thread.
+    // For large binaries this involves substantial file I/O (graph JSON + vector
+    // index) that previously blocked the UI thread for seconds during startup.
     std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
     if (!bin_hash.empty())
-        graphrag::load_graph(bin_hash);
+    {
+        std::thread([bin_hash]() {
+            graphrag::load_graph(bin_hash);
+        }).detach();
+    }
 
     if (g_settings.check_for_updates)
     {
@@ -412,89 +418,152 @@ void aida_plugin_t::start_copilot_proxy()
         g_settings.save();
     }
 
-    bool already_running = false;
-    try
-    {
-        httplib::Client probe(g_settings.copilot_proxy_address);
-        probe.set_connection_timeout(0, 500000);
-        probe.set_read_timeout(0, 500000);
-        probe.enable_server_certificate_verification(false);
-        auto res = probe.Get(OBFSTR_C("/v1/models"));
-        if (res)
-            already_running = true;
-    }
-    catch (...) {}
-
-    if (already_running)
-    {
-        msg(OBFSTR_C("Copilot API proxy is already running at %s\n"),
-            g_settings.copilot_proxy_address.c_str());
-        return;
-    }
-
-    m_copilot_job = CreateJobObject(nullptr, nullptr);
-    if (m_copilot_job != nullptr)
-    {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION info = {};
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(m_copilot_job,
-            JobObjectExtendedLimitInformation, &info, sizeof(info));
-    }
-
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi = {};
-
-    wchar_t cmdline[256] = {};
-    wcscpy_s(cmdline, _countof(cmdline),
-             WOBFSTR_C(L"cmd.exe /c npx copilot-api@latest start"));
-
-    DWORD flags = CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP;
-    if (!CreateProcessW(nullptr, cmdline, nullptr, nullptr, FALSE,
-        flags, nullptr, nullptr, &si, &pi))
-    {
-        DWORD err = GetLastError();
-        msg(OBFSTR_C("Failed to launch copilot-api (error %lu). "
-            "Ensure Node.js and npx are installed and in your PATH.\n"),
-            static_cast<unsigned long>(err));
-        if (m_copilot_job != nullptr)
-        {
-            CloseHandle(m_copilot_job);
-            m_copilot_job = nullptr;
-        }
-        return;
-    }
-
-    CloseHandle(pi.hThread);
-    m_copilot_process = pi.hProcess;
-
-    if (m_copilot_job != nullptr)
-        AssignProcessToJobObject(m_copilot_job, pi.hProcess);
-
-    if (WaitForSingleObject(m_copilot_process, 1500) == WAIT_OBJECT_0)
-    {
-        DWORD exit_code = 0;
-        GetExitCodeProcess(m_copilot_process, &exit_code);
-        CloseHandle(m_copilot_process);
-        m_copilot_process = nullptr;
-        if (m_copilot_job != nullptr)
-        {
-            CloseHandle(m_copilot_job);
-            m_copilot_job = nullptr;
-        }
-        msg(OBFSTR_C("copilot-api exited immediately (code %lu). "
-            "Is Node.js/npx installed and in your PATH?\n"),
-            static_cast<unsigned long>(exit_code));
-        return;
-    }
-
-    msg(OBFSTR_C("Copilot API proxy starting (pid %lu), please wait...\n"),
-        static_cast<unsigned long>(pi.dwProcessId));
-
+    // Move the entire probe + launch + wait logic to a background thread so the
+    // UI thread is never blocked by the synchronous HTTP probe (up to 0.5 s),
+    // CreateProcess(), or the old 1.5-second WaitForSingleObject.
     std::string proxy_addr = g_settings.copilot_proxy_address;
-    std::thread([proxy_addr]() {
+    std::thread([this, proxy_addr]() {
+        // Quick check: is the proxy already running?
+        bool already_running = false;
+        try
+        {
+            httplib::Client probe(proxy_addr);
+            probe.set_connection_timeout(0, 500000);
+            probe.set_read_timeout(0, 500000);
+            probe.enable_server_certificate_verification(false);
+            auto res = probe.Get(OBFSTR_C("/v1/models"));
+            if (res)
+                already_running = true;
+        }
+        catch (...) {}
+
+        if (already_running)
+        {
+            struct already_running_t : public exec_request_t
+            {
+                std::string addr;
+                ssize_t idaapi execute() override
+                {
+                    msg(OBFSTR_C("Copilot API proxy is already running at %s\n"),
+                        addr.c_str());
+                    delete this;
+                    return 0;
+                }
+            };
+            auto* n = new already_running_t();
+            n->addr = proxy_addr;
+            execute_sync(*n, MFF_NOWAIT);
+            return;
+        }
+
+        // Launch the copilot proxy process from this background thread.
+        // CreateProcessW and WaitForSingleObject are safe to call from any thread.
+        HANDLE copilot_job = CreateJobObject(nullptr, nullptr);
+        if (copilot_job != nullptr)
+        {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION info = {};
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(copilot_job,
+                JobObjectExtendedLimitInformation, &info, sizeof(info));
+        }
+
+        STARTUPINFOW si = {};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi = {};
+
+        wchar_t cmdline[256] = {};
+        wcscpy_s(cmdline, _countof(cmdline),
+                 WOBFSTR_C(L"cmd.exe /c npx copilot-api@latest start"));
+
+        DWORD flags = CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP;
+        if (!CreateProcessW(nullptr, cmdline, nullptr, nullptr, FALSE,
+            flags, nullptr, nullptr, &si, &pi))
+        {
+            DWORD err = GetLastError();
+            if (copilot_job != nullptr)
+                CloseHandle(copilot_job);
+
+            struct launch_fail_t : public exec_request_t
+            {
+                DWORD error;
+                ssize_t idaapi execute() override
+                {
+                    msg(OBFSTR_C("Failed to launch copilot-api (error %lu). "
+                        "Ensure Node.js and npx are installed and in your PATH.\n"),
+                        static_cast<unsigned long>(error));
+                    delete this;
+                    return 0;
+                }
+            };
+            auto* n = new launch_fail_t();
+            n->error = err;
+            execute_sync(*n, MFF_NOWAIT);
+            return;
+        }
+
+        CloseHandle(pi.hThread);
+        HANDLE copilot_process = pi.hProcess;
+
+        if (copilot_job != nullptr)
+            AssignProcessToJobObject(copilot_job, copilot_process);
+
+        // Brief non-blocking check (100 ms instead of the old 1500 ms) to catch
+        // immediate exit (e.g. npx not found).  The rest of the readiness polling
+        // happens below anyway, so we do not need a long wait here.
+        if (WaitForSingleObject(copilot_process, 100) == WAIT_OBJECT_0)
+        {
+            DWORD exit_code = 0;
+            GetExitCodeProcess(copilot_process, &exit_code);
+            CloseHandle(copilot_process);
+            if (copilot_job != nullptr)
+                CloseHandle(copilot_job);
+
+            struct exited_notify_t : public exec_request_t
+            {
+                DWORD code;
+                ssize_t idaapi execute() override
+                {
+                    msg(OBFSTR_C("copilot-api exited immediately (code %lu). "
+                        "Is Node.js/npx installed and in your PATH?\n"),
+                        static_cast<unsigned long>(code));
+                    delete this;
+                    return 0;
+                }
+            };
+            auto* n = new exited_notify_t();
+            n->code = exit_code;
+            execute_sync(*n, MFF_NOWAIT);
+            return;
+        }
+
+        // Store the handles on the plugin object via the main thread so there
+        // are no data-race issues with stop_copilot_proxy().
+        struct store_handles_t : public exec_request_t
+        {
+            aida_plugin_t* plugin;
+            HANDLE process;
+            HANDLE job;
+            DWORD pid;
+            ssize_t idaapi execute() override
+            {
+                plugin->m_copilot_process = process;
+                plugin->m_copilot_job = job;
+                msg(OBFSTR_C("Copilot API proxy starting (pid %lu), please wait...\n"),
+                    static_cast<unsigned long>(pid));
+                delete this;
+                return 0;
+            }
+        };
+        auto* sh = new store_handles_t();
+        sh->plugin = this;
+        sh->process = copilot_process;
+        sh->job = copilot_job;
+        sh->pid = pi.dwProcessId;
+        execute_sync(*sh, MFF_NOWAIT);
+
+        // Poll until the proxy is ready (reuses existing polling logic).
         for (int attempt = 0; attempt < 120; ++attempt)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));

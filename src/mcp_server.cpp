@@ -1142,8 +1142,13 @@ bool mcp_server_t::start(int port)
         return false;
     }
 
-    for (int i = 0; i < 50 && !_running.load() && !_stop_requested.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // Wait a very short time for the server thread to signal readiness.
+    // The old code slept for up to 1 second (50 × 20 ms) on the calling thread
+    // which is the IDA UI thread during plugin init — freezing the window.
+    // We now do a brief spin (100 ms max) to catch fast starts, then return and
+    // let the server thread log its status asynchronously via execute_sync.
+    for (int i = 0; i < 10 && !_running.load() && !_stop_requested.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     if (_running.load())
     {
@@ -1156,12 +1161,20 @@ bool mcp_server_t::start(int port)
         msg(OBFSTR_C("AiDA MCP: Legacy SSE       -> http://127.0.0.1:%d/sse\n"), _port);
         return true;
     }
-    else
+    else if (_stop_requested.load())
     {
         msg(OBFSTR_C("AiDA MCP: Server failed to start on port %d (port may be in use).\n"), port);
         if (_server_thread.joinable())
             _server_thread.join();
         return false;
+    }
+    else
+    {
+        // Server thread is still spinning up — optimistically assume success.
+        // It will log its own status once ready.  This lets the plugin
+        // constructor return without blocking the UI thread.
+        msg(OBFSTR_C("AiDA MCP: Server starting on port %d (async)...\n"), port);
+        return true;
     }
 }
 

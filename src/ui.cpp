@@ -55,8 +55,8 @@ static std::vector<std::string> fetch_models_from_api(
     {
         httplib::Client cli(host);
         cli.set_default_headers(headers);
-        cli.set_read_timeout(20);
-        cli.set_connection_timeout(10);
+        cli.set_read_timeout(8);
+        cli.set_connection_timeout(5);
         cli.enable_server_certificate_verification(false);
 
         auto res = cli.Get(path);
@@ -1412,41 +1412,13 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
         return static_cast<int>(std::distance(models.begin(), it));
     };
 
-    std::vector<std::string> gemini_models_vec;
-    if (provider_idx == 0)
-        gemini_models_vec = fetch_gemini_models_via_api(g_settings.gemini_api_key.c_str(), g_settings.gemini_base_url.c_str());
-    if (gemini_models_vec.empty())
-        gemini_models_vec = settings_t::gemini_models;
-
-    std::vector<std::string> openai_models_vec;
-    if (provider_idx == 1)
-        openai_models_vec = fetch_openai_models_via_api(g_settings.openai_api_key.c_str(), g_settings.openai_base_url.c_str());
-    if (openai_models_vec.empty())
-        openai_models_vec = settings_t::openai_models;
-
-    std::vector<std::string> openrouter_models_vec;
-    if (provider_idx == 2)
-        openrouter_models_vec = fetch_openrouter_models_via_api(g_settings.openrouter_api_key.c_str());
-    if (openrouter_models_vec.empty())
-        openrouter_models_vec = settings_t::openrouter_models;
-
-    std::vector<std::string> anthropic_models_vec;
-    if (provider_idx == 3)
-        anthropic_models_vec = fetch_anthropic_models_via_api(g_settings.anthropic_api_key.c_str(), g_settings.anthropic_base_url.c_str());
-    if (anthropic_models_vec.empty())
-        anthropic_models_vec = settings_t::anthropic_models;
-
-    std::vector<std::string> copilot_models_vec;
-    if (provider_idx == 4)
-        copilot_models_vec = fetch_copilot_models_via_api(g_settings.copilot_proxy_address.c_str());
-    if (copilot_models_vec.empty())
-        copilot_models_vec = settings_t::copilot_models;
-
-    std::vector<std::string> local_llm_models_vec;
-    if (provider_idx == 5)
-        local_llm_models_vec = fetch_local_llm_models_via_api(g_settings.local_llm_base_url.c_str());
-    if (local_llm_models_vec.empty())
-        local_llm_models_vec = settings_t::local_llm_models;
+    // Use static fallback models immediately — fetch asynchronously after dialog is shown.
+    std::vector<std::string> gemini_models_vec = settings_t::gemini_models;
+    std::vector<std::string> openai_models_vec = settings_t::openai_models;
+    std::vector<std::string> openrouter_models_vec = settings_t::openrouter_models;
+    std::vector<std::string> anthropic_models_vec = settings_t::anthropic_models;
+    std::vector<std::string> copilot_models_vec = settings_t::copilot_models;
+    std::vector<std::string> local_llm_models_vec = settings_t::local_llm_models;
 
     ProviderTabData geminiTab, openaiTab, openrouterTab, anthropicTab, copilotTab, localLlmTab;
 
@@ -1770,64 +1742,106 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
 
     QObject::connect(geminiTab.refreshBtn, &QPushButton::clicked,
         [&geminiTab, repopulateModels]() {
-            qstring key(geminiTab.keyEdit->text().toUtf8().constData());
-            qstring url(geminiTab.urlEdit ? geminiTab.urlEdit->text().trimmed().toUtf8().constData() : "");
-            auto models = fetch_gemini_models_via_api(key, url);
-            if (models.empty())
-                models = settings_t::gemini_models;
-            repopulateModels(geminiTab.modelCombo, models);
+            std::string key = geminiTab.keyEdit->text().toUtf8().constData();
+            std::string url = geminiTab.urlEdit ? geminiTab.urlEdit->text().trimmed().toUtf8().constData() : "";
+            QPointer<QComboBox> sc = geminiTab.modelCombo;
+            QPointer<QPushButton> sb = geminiTab.refreshBtn;
+            if (sb) sb->setEnabled(false);
+            std::thread([sc, sb, key = std::move(key), url = std::move(url), repopulateModels]() {
+                auto models = fetch_gemini_models_via_api(key.c_str(), url.c_str());
+                if (models.empty()) models = settings_t::gemini_models;
+                QMetaObject::invokeMethod(qApp, [sc, sb, models = std::move(models), repopulateModels]() {
+                    if (sb) sb->setEnabled(true);
+                    if (sc) repopulateModels(sc, models);
+                });
+            }).detach();
         });
 
 
     QObject::connect(openaiTab.refreshBtn, &QPushButton::clicked,
         [&openaiTab, repopulateModels]() {
-            qstring key(openaiTab.keyEdit->text().toUtf8().constData());
-            qstring url(openaiTab.urlEdit ? openaiTab.urlEdit->text().trimmed().toUtf8().constData() : "");
-            auto models = fetch_openai_models_via_api(key, url);
-            if (models.empty())
-                models = settings_t::openai_models;
-            repopulateModels(openaiTab.modelCombo, models);
+            std::string key = openaiTab.keyEdit->text().toUtf8().constData();
+            std::string url = openaiTab.urlEdit ? openaiTab.urlEdit->text().trimmed().toUtf8().constData() : "";
+            QPointer<QComboBox> sc = openaiTab.modelCombo;
+            QPointer<QPushButton> sb = openaiTab.refreshBtn;
+            if (sb) sb->setEnabled(false);
+            std::thread([sc, sb, key = std::move(key), url = std::move(url), repopulateModels]() {
+                auto models = fetch_openai_models_via_api(key.c_str(), url.c_str());
+                if (models.empty()) models = settings_t::openai_models;
+                QMetaObject::invokeMethod(qApp, [sc, sb, models = std::move(models), repopulateModels]() {
+                    if (sb) sb->setEnabled(true);
+                    if (sc) repopulateModels(sc, models);
+                });
+            }).detach();
         });
 
 
     QObject::connect(openrouterTab.refreshBtn, &QPushButton::clicked,
         [&openrouterTab, repopulateModels]() {
-            qstring key(openrouterTab.keyEdit->text().toUtf8().constData());
-            auto models = fetch_openrouter_models_via_api(key);
-            if (models.empty())
-                models = settings_t::openrouter_models;
-            repopulateModels(openrouterTab.modelCombo, models);
+            std::string key = openrouterTab.keyEdit->text().toUtf8().constData();
+            QPointer<QComboBox> sc = openrouterTab.modelCombo;
+            QPointer<QPushButton> sb = openrouterTab.refreshBtn;
+            if (sb) sb->setEnabled(false);
+            std::thread([sc, sb, key = std::move(key), repopulateModels]() {
+                auto models = fetch_openrouter_models_via_api(key.c_str());
+                if (models.empty()) models = settings_t::openrouter_models;
+                QMetaObject::invokeMethod(qApp, [sc, sb, models = std::move(models), repopulateModels]() {
+                    if (sb) sb->setEnabled(true);
+                    if (sc) repopulateModels(sc, models);
+                });
+            }).detach();
         });
 
 
     QObject::connect(anthropicTab.refreshBtn, &QPushButton::clicked,
         [&anthropicTab, repopulateModels]() {
-            qstring key(anthropicTab.keyEdit->text().toUtf8().constData());
-            qstring url(anthropicTab.urlEdit ? anthropicTab.urlEdit->text().trimmed().toUtf8().constData() : "");
-            auto models = fetch_anthropic_models_via_api(key, url);
-            if (models.empty())
-                models = settings_t::anthropic_models;
-            repopulateModels(anthropicTab.modelCombo, models);
+            std::string key = anthropicTab.keyEdit->text().toUtf8().constData();
+            std::string url = anthropicTab.urlEdit ? anthropicTab.urlEdit->text().trimmed().toUtf8().constData() : "";
+            QPointer<QComboBox> sc = anthropicTab.modelCombo;
+            QPointer<QPushButton> sb = anthropicTab.refreshBtn;
+            if (sb) sb->setEnabled(false);
+            std::thread([sc, sb, key = std::move(key), url = std::move(url), repopulateModels]() {
+                auto models = fetch_anthropic_models_via_api(key.c_str(), url.c_str());
+                if (models.empty()) models = settings_t::anthropic_models;
+                QMetaObject::invokeMethod(qApp, [sc, sb, models = std::move(models), repopulateModels]() {
+                    if (sb) sb->setEnabled(true);
+                    if (sc) repopulateModels(sc, models);
+                });
+            }).detach();
         });
 
 
     QObject::connect(copilotTab.refreshBtn, &QPushButton::clicked,
         [&copilotTab, repopulateModels]() {
-            qstring url(copilotTab.urlEdit->text().trimmed().toUtf8().constData());
-            auto models = fetch_copilot_models_via_api(url);
-            if (models.empty())
-                models = settings_t::copilot_models;
-            repopulateModels(copilotTab.modelCombo, models);
+            std::string url = copilotTab.urlEdit->text().trimmed().toUtf8().constData();
+            QPointer<QComboBox> sc = copilotTab.modelCombo;
+            QPointer<QPushButton> sb = copilotTab.refreshBtn;
+            if (sb) sb->setEnabled(false);
+            std::thread([sc, sb, url = std::move(url), repopulateModels]() {
+                auto models = fetch_copilot_models_via_api(url.c_str());
+                if (models.empty()) models = settings_t::copilot_models;
+                QMetaObject::invokeMethod(qApp, [sc, sb, models = std::move(models), repopulateModels]() {
+                    if (sb) sb->setEnabled(true);
+                    if (sc) repopulateModels(sc, models);
+                });
+            }).detach();
         });
 
 
     QObject::connect(localLlmTab.refreshBtn, &QPushButton::clicked,
         [&localLlmTab, repopulateModels]() {
-            qstring url(localLlmTab.urlEdit->text().trimmed().toUtf8().constData());
-            auto models = fetch_local_llm_models_via_api(url);
-            if (models.empty())
-                models = settings_t::local_llm_models;
-            repopulateModels(localLlmTab.modelCombo, models);
+            std::string url = localLlmTab.urlEdit->text().trimmed().toUtf8().constData();
+            QPointer<QComboBox> sc = localLlmTab.modelCombo;
+            QPointer<QPushButton> sb = localLlmTab.refreshBtn;
+            if (sb) sb->setEnabled(false);
+            std::thread([sc, sb, url = std::move(url), repopulateModels]() {
+                auto models = fetch_local_llm_models_via_api(url.c_str());
+                if (models.empty()) models = settings_t::local_llm_models;
+                QMetaObject::invokeMethod(qApp, [sc, sb, models = std::move(models), repopulateModels]() {
+                    if (sb) sb->setEnabled(true);
+                    if (sc) repopulateModels(sc, models);
+                });
+            }).detach();
         });
 
     mainLayout->addWidget(tabs, 0);
@@ -2000,6 +2014,63 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
         initialSize.setHeight(qMin(initialSize.height(), maxHeight));
     }
     dlg.resize(initialSize);
+
+    // Asynchronously fetch models for the active provider after dialog is shown.
+    {
+        QPointer<QComboBox> asyncCombo;
+        std::string fetchP1, fetchP2;
+        switch (provider_idx)
+        {
+        case 0: asyncCombo = geminiTab.modelCombo;     fetchP1 = g_settings.gemini_api_key;     fetchP2 = g_settings.gemini_base_url; break;
+        case 1: asyncCombo = openaiTab.modelCombo;     fetchP1 = g_settings.openai_api_key;     fetchP2 = g_settings.openai_base_url; break;
+        case 2: asyncCombo = openrouterTab.modelCombo; fetchP1 = g_settings.openrouter_api_key;  break;
+        case 3: asyncCombo = anthropicTab.modelCombo;  fetchP1 = g_settings.anthropic_api_key;  fetchP2 = g_settings.anthropic_base_url; break;
+        case 4: asyncCombo = copilotTab.modelCombo;    fetchP1 = g_settings.copilot_proxy_address; break;
+        case 5: asyncCombo = localLlmTab.modelCombo;   fetchP1 = g_settings.local_llm_base_url; break;
+        }
+        if (asyncCombo)
+        {
+            std::thread([asyncCombo, provider_idx,
+                         p1 = std::move(fetchP1), p2 = std::move(fetchP2)]()
+            {
+                std::vector<std::string> models;
+                switch (provider_idx)
+                {
+                case 0: models = fetch_gemini_models_via_api(p1.c_str(), p2.c_str()); break;
+                case 1: models = fetch_openai_models_via_api(p1.c_str(), p2.c_str()); break;
+                case 2: models = fetch_openrouter_models_via_api(p1.c_str()); break;
+                case 3: models = fetch_anthropic_models_via_api(p1.c_str(), p2.c_str()); break;
+                case 4: models = fetch_copilot_models_via_api(p1.c_str()); break;
+                case 5: models = fetch_local_llm_models_via_api(p1.c_str()); break;
+                }
+                if (models.empty()) return;
+                QMetaObject::invokeMethod(qApp, [asyncCombo, models = std::move(models)]() {
+                    if (!asyncCombo) return;
+                    QString prev = asyncCombo->currentText();
+                    asyncCombo->clear();
+                    int selIdx = 0;
+                    for (size_t i = 0; i < models.size(); ++i)
+                    {
+                        asyncCombo->addItem(QString::fromStdString(models[i]));
+                        if (QString::fromStdString(models[i]) == prev)
+                            selIdx = static_cast<int>(i);
+                    }
+                    if (!prev.isEmpty())
+                    {
+                        bool found = false;
+                        for (int i = 0; i < asyncCombo->count(); ++i)
+                            if (asyncCombo->itemText(i) == prev) { found = true; break; }
+                        if (!found)
+                        {
+                            asyncCombo->addItem(prev);
+                            selIdx = asyncCombo->count() - 1;
+                        }
+                    }
+                    asyncCombo->setCurrentIndex(selIdx);
+                });
+            }).detach();
+        }
+    }
 
     QTimer::singleShot(0, &dlg, [&dlg, idaMainWindow]() {
         applySettingsDialogTheme(&dlg, idaMainWindow);
