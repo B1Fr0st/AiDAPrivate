@@ -10494,7 +10494,11 @@ tool_result_t rebuild_function(const json& params)
     {
         auto_mark_range(start, end, AU_FINAL);
         plan_range(start, end);
-        auto_wait();
+        // WHY: auto_wait() blocks the main thread without pumping UI
+        // events, making IDA appear frozen during analysis.  The
+        // responsive variant calls user_cancelled() periodically,
+        // keeping the UI alive.
+        responsive_auto_wait(start, end, "Rebuilding function analysis");
     }
 
     result["function_created"]   = func_created;
@@ -11388,8 +11392,12 @@ tool_result_t full_deobfuscation_pass(const json& params)
                          {"note", dry_run ? "Skipped (dry run)" : "Skipped (no patches applied)"}});
     }
 
+    // WHY: auto_wait() blocks the main thread without pumping UI
+    // events, making IDA appear frozen during analysis.  The
+    // responsive variant calls user_cancelled() periodically,
+    // keeping the UI alive.
     if (!dry_run && total_changes > 0)
-        auto_wait();
+        responsive_auto_wait(0, BADADDR, "Applying deobfuscation changes");
 
     hide_wait_box();
 

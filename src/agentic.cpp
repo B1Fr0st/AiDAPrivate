@@ -1893,6 +1893,117 @@ struct tool_exec_request_t : public exec_request_t
     }
 };
 
+// ── Batched tool execution ────────────────────────────────────────────
+// WHY: Replaces N separate execute_sync round-trips with a single one.
+// Each execute_sync has overhead: queue insertion, blocking wait for the
+// main thread's event loop to dequeue, context switch, and signal back.
+// Batching pays that cost once.  Between tools, replace_wait_box pumps
+// IDA's UI event queue so the application stays responsive instead of
+// appearing frozen.
+struct batch_tool_exec_request_t : public exec_request_t
+{
+    struct call_entry_t
+    {
+        std::string tool_name;
+        json params;
+    };
+
+    std::vector<call_entry_t> calls;
+    std::vector<tool_execution_t> results;
+    std::shared_ptr<subagents::session_record_t> session;
+    uint64_t run_id = 0;
+    std::atomic<bool>* cancelled = nullptr;
+    status_fn on_status;
+    int round = 0;
+    std::vector<std::string> pending_tool_names;
+
+    ssize_t idaapi execute() override
+    {
+        subagents::execution_context_scope_t scope(session, run_id);
+        auto& registry = agent_tools::ToolRegistry::instance();
+
+        results.clear();
+        results.reserve(calls.size());
+
+        const bool multi = calls.size() > 1;
+        if (multi)
+            show_wait_box("HIDECANCEL\nAiDA: Executing %zu tool(s)...", calls.size());
+
+        for (size_t i = 0; i < calls.size(); ++i)
+        {
+            if (cancelled && cancelled->load())
+            {
+                for (size_t j = i; j < calls.size(); ++j)
+                {
+                    tool_execution_t r;
+                    r.tool_name = calls[j].tool_name;
+                    r.params = calls[j].params;
+                    r.success = false;
+                    r.message = OBFSTR("Cancelled");
+                    results.push_back(std::move(r));
+                }
+                break;
+            }
+
+            // replace_wait_box / user_cancelled pump IDA's UI event queue,
+            // preventing the "frozen application" appearance between tools.
+            if (multi)
+                replace_wait_box("HIDECANCEL\nAiDA: [%zu/%zu] %s",
+                    i + 1, calls.size(), calls[i].tool_name.c_str());
+            else
+                user_cancelled();
+
+            if (on_status)
+            {
+                status_update_t status;
+                status.type = status_type_t::executing_tool;
+                status.round = round;
+                status.tool_name = calls[i].tool_name;
+                status.message = OBFSTR("Executing: ") + calls[i].tool_name;
+                status.pending_tools = pending_tool_names;
+                on_status(status);
+            }
+
+            tool_execution_t result;
+            result.tool_name = calls[i].tool_name;
+            result.params = calls[i].params;
+
+            try
+            {
+                auto tool_result = registry.execute_tool(calls[i].tool_name, calls[i].params);
+                result.success = tool_result.success;
+                result.message = sanitize_utf8(tool_result.output);
+                result.data = tool_result.data;
+                sanitize_json_utf8_inplace(result.data);
+            }
+            catch (const std::exception& e)
+            {
+                result.success = false;
+                result.message = sanitize_utf8(std::string("Exception: ") + e.what());
+                result.data = json::object();
+            }
+
+            if (on_status)
+            {
+                status_update_t status;
+                status.type = status_type_t::tool_complete;
+                status.round = round;
+                status.tool_name = result.tool_name;
+                status.tool_success = result.success;
+                status.message = result.message;
+                on_status(status);
+            }
+
+            results.push_back(std::move(result));
+        }
+
+        if (multi)
+            hide_wait_box();
+
+        return 0;
+    }
+};
+
 result_t run(
     AIClient* client,
     const std::string& initial_prompt,
@@ -2216,6 +2327,21 @@ result_t run(
 
         std::vector<tool_execution_t> round_tool_results;
 
+        // ── Phase 1: Partition tool calls ──────────────────────────────
+        // Resolve cache hits immediately on the worker thread.
+        // Execute session tools directly on the worker thread.
+        // Collect remaining IDA tools for a single batched execute_sync.
+        struct pending_ida_tool_t
+        {
+            std::string tool_name;
+            json params;
+            bool read_only;
+            std::string cache_key;
+        };
+
+        std::vector<pending_ida_tool_t> ida_tool_calls;
+        bool batch_needs_write = false;
+
         for (size_t tool_idx = 0; tool_idx < num_calls; ++tool_idx)
         {
             if (cancelled && cancelled->load())
@@ -2234,6 +2360,8 @@ result_t run(
 
             std::string cache_key = tool_name + "|" + params.dump(-1, ' ', false, json::error_handler_t::replace);
             const bool is_session_tool = subagents::is_session_tool_name(tool_name);
+
+            // ── Cache hit: return immediately, no main-thread work ────
             if (tool_def && tool_def->read_only && !is_session_tool)
             {
                 auto cache_it = tool_cache.find(cache_key);
@@ -2258,48 +2386,83 @@ result_t run(
                 }
             }
 
-            if (on_status)
-            {
-                status_update_t status;
-                status.type = status_type_t::executing_tool;
-                status.round = current_round;
-                status.tool_name = tool_name;
-                status.message = OBFSTR("Executing: ") + tool_name;
-                status.pending_tools = pending_tool_names;
-                on_status(status);
-            }
-
-            tool_exec_request_t exec_req;
-            exec_req.tool_name = tool_name;
-            exec_req.params = params;
-            exec_req.session = subagents::current_session_record();
-            exec_req.run_id = subagents::current_run_id();
-
+            // ── Session tools run on the worker thread (no IDA API) ───
             if (is_session_tool)
             {
+                if (on_status)
+                {
+                    status_update_t status;
+                    status.type = status_type_t::executing_tool;
+                    status.round = current_round;
+                    status.tool_name = tool_name;
+                    status.message = OBFSTR("Executing: ") + tool_name;
+                    status.pending_tools = pending_tool_names;
+                    on_status(status);
+                }
+
+                tool_exec_request_t exec_req;
+                exec_req.tool_name = tool_name;
+                exec_req.params = params;
+                exec_req.session = subagents::current_session_record();
+                exec_req.run_id = subagents::current_run_id();
                 exec_req.execute();
+
+                if (tool_def && tool_def->read_only && exec_req.result.success)
+                    tool_cache[cache_key] = exec_req.result;
+
+                if (on_status)
+                {
+                    status_update_t status;
+                    status.type = status_type_t::tool_complete;
+                    status.round = current_round;
+                    status.tool_name = exec_req.result.tool_name;
+                    status.tool_success = exec_req.result.success;
+                    status.message = exec_req.result.message;
+                    on_status(status);
+                }
+
+                round_tool_results.push_back(std::move(exec_req.result));
+                continue;
             }
-            else
+
+            // ── IDA tools: collect for batched main-thread dispatch ───
+            pending_ida_tool_t pt;
+            pt.tool_name = tool_name;
+            pt.params = params;
+            pt.read_only = tool_def ? tool_def->read_only : true;
+            pt.cache_key = (tool_def && tool_def->read_only) ? cache_key : "";
+            if (!pt.read_only) batch_needs_write = true;
+            ida_tool_calls.push_back(std::move(pt));
+        }
+
+        // ── Phase 2: Batch-execute IDA tools in ONE execute_sync ──────
+        // WHY: A single execute_sync replaces N separate round-trips to
+        // IDA's main thread.  Each round-trip has overhead of queue
+        // insertion, thread context switch, and waiting for the main
+        // thread's event loop to pick up the request.  By batching,
+        // that overhead is paid once.  Within the batch, replace_wait_box
+        // pumps UI events between tool handlers, keeping IDA responsive.
+        if (!ida_tool_calls.empty() && !(cancelled && cancelled->load()))
+        {
+            batch_tool_exec_request_t batch;
+            for (const auto& t : ida_tool_calls)
+                batch.calls.push_back({t.tool_name, t.params});
+            batch.session = subagents::current_session_record();
+            batch.run_id = subagents::current_run_id();
+            batch.cancelled = cancelled;
+            batch.on_status = on_status;
+            batch.round = current_round;
+            batch.pending_tool_names = pending_tool_names;
+
+            execute_sync(batch, batch_needs_write ? MFF_WRITE : MFF_READ);
+
+            for (size_t i = 0; i < ida_tool_calls.size() && i < batch.results.size(); ++i)
             {
-                int mff_flag = (tool_def && tool_def->read_only) ? MFF_READ : MFF_WRITE;
-                execute_sync(exec_req, mff_flag);
+                auto& r = batch.results[i];
+                if (!ida_tool_calls[i].cache_key.empty() && r.success)
+                    tool_cache[ida_tool_calls[i].cache_key] = r;
+                round_tool_results.push_back(std::move(r));
             }
-
-            if (tool_def && tool_def->read_only && !is_session_tool && exec_req.result.success)
-                tool_cache[cache_key] = exec_req.result;
-
-            if (on_status)
-            {
-                status_update_t status;
-                status.type = status_type_t::tool_complete;
-                status.round = current_round;
-                status.tool_name = exec_req.result.tool_name;
-                status.tool_success = exec_req.result.success;
-                status.message = exec_req.result.message;
-                on_status(status);
-            }
-
-            round_tool_results.push_back(std::move(exec_req.result));
         }
 
         for (auto& tr : round_tool_results)

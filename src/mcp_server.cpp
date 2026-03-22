@@ -57,7 +57,15 @@ struct mcp_tool_exec_request_t : public exec_request_t
     ssize_t idaapi execute() override
     {
         subagents::execution_context_scope_t scope(session, run_id);
+
+        // WHY: show_wait_box / hide_wait_box each pump IDA's UI event
+        // queue (repaints, input, timers).  Without this, every MCP tool
+        // call blocks the main thread for its full duration, making IDA
+        // appear completely frozen to the user.
+        show_wait_box("HIDECANCEL\nAiDA MCP: %s", tool_name.c_str());
         result = agent_tools::ToolRegistry::instance().execute_tool(tool_name, tool_params);
+        hide_wait_box();
+
         return 0;
     }
 };
@@ -95,8 +103,27 @@ struct mcp_batch_exec_request_t : public exec_request_t
 
         results.clear();
         results.reserve(calls.size());
-        for (const auto& call : calls)
-            results.push_back(agent_tools::ToolRegistry::instance().execute_tool(call.first, call.second));
+
+        const bool multi = calls.size() > 1;
+        if (multi)
+            show_wait_box("HIDECANCEL\nAiDA MCP: Executing %zu tool(s)...", calls.size());
+
+        for (size_t ci = 0; ci < calls.size(); ++ci)
+        {
+            // WHY: replace_wait_box pumps IDA's UI event queue between
+            // tool executions so the application remains responsive.
+            if (multi)
+                replace_wait_box("HIDECANCEL\nAiDA MCP: [%zu/%zu] %s",
+                    ci + 1, calls.size(), calls[ci].first.c_str());
+            else
+                user_cancelled();
+
+            results.push_back(agent_tools::ToolRegistry::instance().execute_tool(
+                calls[ci].first, calls[ci].second));
+        }
+
+        if (multi)
+            hide_wait_box();
 
         if (include_rag && !rag_addr_str.empty())
         {
