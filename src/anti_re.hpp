@@ -133,15 +133,12 @@ inline std::string get_windows_username()
 
 inline std::string get_public_ip()
 {
-	// Cache the public IP for 10 minutes.  Each uncached call issues up to two
-	// synchronous HTTPS requests (api.ipify.org + ifconfig.me) with 5-second
-	// timeouts each, which blocks the calling thread for up to 20 seconds in
-	// the worst case.  When this helper is called from a timer callback on
-	// the UI thread, that 20-second stall freezes the entire IDA window.
+
+
 	static std::mutex ip_cache_mutex;
 	static std::string cached_ip;
 	static ULONGLONG cached_at_ms = 0;
-	static constexpr ULONGLONG IP_CACHE_TTL_MS = 600000u; // 10 minutes
+	static constexpr ULONGLONG IP_CACHE_TTL_MS = 600000u;
 
 	{
 		std::lock_guard<std::mutex> lk(ip_cache_mutex);
@@ -756,7 +753,7 @@ inline std::string get_cf_host_fragmented()
 namespace detail {
 
 static constexpr std::uint32_t DEBUG_NT_GLOBAL_MASK = 0x70u;
-static constexpr ULONGLONG VERIFY_INTERVAL_MS = 1500u;
+static constexpr ULONGLONG VERIFY_INTERVAL_MS = 10000u;
 
 struct iat_entry_t
 {
@@ -767,8 +764,9 @@ struct iat_entry_t
 struct runtime_state_t
 {
 	std::mutex mutex;
-	bool initialized = false;
-	bool trusted = false;
+	std::atomic<bool> initialized{false};
+	std::atomic<bool> trusted{false};
+	std::atomic<bool> verify_inflight{false};
 	HMODULE module = nullptr;
 	HMODULE process_image = nullptr;
 	DWORD pid = 0;
@@ -794,8 +792,9 @@ inline runtime_state_t& state()
 
 inline void reset_state_locked(runtime_state_t& runtime)
 {
-	runtime.initialized = false;
-	runtime.trusted = false;
+	runtime.initialized.store(false, std::memory_order_release);
+	runtime.trusted.store(false, std::memory_order_release);
+	runtime.verify_inflight.store(false, std::memory_order_release);
 	runtime.module = nullptr;
 	runtime.process_image = nullptr;
 	runtime.pid = 0;
@@ -1250,35 +1249,59 @@ inline bool initialize_locked(runtime_state_t& runtime)
 		);
 	}
 
-	runtime.initialized = true;
-	runtime.trusted = true;
+	runtime.initialized.store(true, std::memory_order_release);
+	runtime.trusted.store(true, std::memory_order_release);
+	runtime.verify_inflight.store(false, std::memory_order_release);
 	runtime.last_verified_ms = GetTickCount64();
 	return true;
 }
 
+inline bool verify_locked(runtime_state_t& runtime);
+
+inline void schedule_verify_async(runtime_state_t& runtime)
+{
+	if (runtime.verify_inflight.load(std::memory_order_acquire))
+		return;
+
+	runtime.verify_inflight.store(true, std::memory_order_release);
+	std::thread([]()
+	{
+		ULONGLONG t0 = GetTickCount64();
+		auto& async_runtime = state();
+		std::lock_guard<std::mutex> async_lock(async_runtime.mutex);
+		bool ok = verify_locked(async_runtime);
+		async_runtime.verify_inflight.store(false, std::memory_order_release);
+		ULONGLONG dt = GetTickCount64() - t0;
+		msg(OBFSTR_C("AiDA PERF: anti_re async verify dt=%llums ok=%d trusted=%d\n"),
+			static_cast<unsigned long long>(dt),
+			ok ? 1 : 0,
+			async_runtime.trusted.load(std::memory_order_acquire) ? 1 : 0);
+	}).detach();
+}
+
 inline bool verify_locked(runtime_state_t& runtime)
 {
-	if (!runtime.initialized && !initialize_locked(runtime))
+	if (!runtime.initialized.load(std::memory_order_acquire) && !initialize_locked(runtime))
 		return false;
 
 	prepare_driver(runtime);
 	if (!verify_peb_state_locked(runtime))
 	{
-		runtime.trusted = false;
+		runtime.trusted.store(false, std::memory_order_release);
 		runtime.last_verified_ms = 0;
 		return false;
 	}
 
 	if (!verify_code_integrity_usermode(runtime))
 	{
-		runtime.trusted = false;
+		runtime.trusted.store(false, std::memory_order_release);
 		runtime.last_verified_ms = 0;
 		return false;
 	}
 
 	if (!verify_iat_locked(runtime))
 	{
-		runtime.trusted = false;
+		runtime.trusted.store(false, std::memory_order_release);
 		runtime.last_verified_ms = 0;
 		return false;
 	}
@@ -1290,14 +1313,14 @@ inline bool verify_locked(runtime_state_t& runtime)
 	{
 		if (!verify_code_integrity_kernel(runtime))
 		{
-			runtime.trusted = false;
+			runtime.trusted.store(false, std::memory_order_release);
 			runtime.last_verified_ms = 0;
 			return false;
 		}
 
 		if (!verify_hw_breakpoints_kernel(runtime))
 		{
-			runtime.trusted = false;
+			runtime.trusted.store(false, std::memory_order_release);
 			runtime.last_verified_ms = 0;
 			return false;
 		}
@@ -1307,7 +1330,7 @@ inline bool verify_locked(runtime_state_t& runtime)
 			_integrity_check ic;
 			if (!ic.IsSignatureValid())
 			{
-				runtime.trusted = false;
+				runtime.trusted.store(false, std::memory_order_release);
 				runtime.last_verified_ms = 0;
 				return false;
 			}
@@ -1319,7 +1342,7 @@ inline bool verify_locked(runtime_state_t& runtime)
 		enforce_code_protections(runtime);
 		if (!verify_page_protections(runtime))
 		{
-			runtime.trusted = false;
+			runtime.trusted.store(false, std::memory_order_release);
 			runtime.last_verified_ms = 0;
 			return false;
 		}
@@ -1332,13 +1355,13 @@ inline bool verify_locked(runtime_state_t& runtime)
 		if (device->query_dll_protection(dp_status)
 			&& dp_status.status == voyager::detail::DPRT_STATUS_TAMPERED)
 		{
-			runtime.trusted = false;
+			runtime.trusted.store(false, std::memory_order_release);
 			runtime.last_verified_ms = 0;
 			return false;
 		}
 	}
 
-	runtime.trusted = true;
+	runtime.trusted.store(true, std::memory_order_release);
 	runtime.last_verified_ms = GetTickCount64();
 	return true;
 }
@@ -1357,6 +1380,7 @@ inline void sync_latched_violation_with_server();
 
 inline bool guard()
 {
+	ULONGLONG guard_t0 = GetTickCount64();
 	if (violation_latched())
 	{
 		sync_latched_violation_with_server();
@@ -1366,16 +1390,60 @@ inline bool guard()
 	auto& runtime = detail::state();
 	const ULONGLONG now = GetTickCount64();
 
-	std::lock_guard<std::mutex> lock(runtime.mutex);
-	if (runtime.trusted
-		&& runtime.initialized
-		&& now >= runtime.last_verified_ms
-		&& (now - runtime.last_verified_ms) < detail::VERIFY_INTERVAL_MS)
+	if (runtime.verify_inflight.load(std::memory_order_acquire))
 	{
-		return true;
+		bool trusted = runtime.trusted.load(std::memory_order_acquire);
+		ULONGLONG dt = GetTickCount64() - guard_t0;
+		if (dt >= 10)
+		{
+			msg(OBFSTR_C("AiDA PERF: anti_re guard fast-return inflight dt=%llums trusted=%d\n"),
+				static_cast<unsigned long long>(dt), trusted ? 1 : 0);
+		}
+		return trusted;
 	}
 
-	return detail::verify_locked(runtime);
+	std::unique_lock<std::mutex> lock(runtime.mutex, std::try_to_lock);
+	if (!lock.owns_lock())
+	{
+		bool trusted = runtime.trusted.load(std::memory_order_acquire);
+		ULONGLONG dt = GetTickCount64() - guard_t0;
+		if (dt >= 10)
+		{
+			msg(OBFSTR_C("AiDA PERF: anti_re guard try-lock miss dt=%llums trusted=%d\n"),
+				static_cast<unsigned long long>(dt), trusted ? 1 : 0);
+		}
+		return trusted;
+	}
+
+	if (!runtime.initialized.load(std::memory_order_acquire))
+	{
+		bool ok = detail::initialize_locked(runtime);
+		ULONGLONG dt = GetTickCount64() - guard_t0;
+		msg(OBFSTR_C("AiDA PERF: anti_re guard init dt=%llums ok=%d\n"),
+			static_cast<unsigned long long>(dt), ok ? 1 : 0);
+		return ok;
+	}
+
+	if (!runtime.trusted.load(std::memory_order_acquire))
+		return false;
+
+	if (now >= runtime.last_verified_ms
+		&& (now - runtime.last_verified_ms) >= detail::VERIFY_INTERVAL_MS)
+	{
+		detail::schedule_verify_async(runtime);
+	}
+
+	bool trusted = runtime.trusted.load(std::memory_order_acquire);
+	ULONGLONG dt = GetTickCount64() - guard_t0;
+	if (dt >= 10)
+	{
+		msg(OBFSTR_C("AiDA PERF: anti_re guard dt=%llums trusted=%d inflight=%d\n"),
+			static_cast<unsigned long long>(dt),
+			trusted ? 1 : 0,
+			runtime.verify_inflight.load(std::memory_order_acquire) ? 1 : 0);
+	}
+
+	return trusted;
 }
 
 inline void report_violation_to_server(const char* reason)
@@ -1526,7 +1594,10 @@ inline void sync_latched_violation_with_server()
 		return;
 
 	std::string reason = latched_violation_reason();
-	report_violation_to_server(reason.c_str());
+
+	std::thread([reason]() {
+		report_violation_to_server(reason.c_str());
+	}).detach();
 }
 
 inline std::uint64_t g_aida_module_base = 0;
@@ -1888,7 +1959,7 @@ inline void start_driver_tamper_monitor()
 			{
 				std::lock_guard<std::mutex> lock(runtime.mutex);
 
-				if (!runtime.initialized)
+				if (!runtime.initialized.load(std::memory_order_acquire))
 					continue;
 
 				detail::prepare_driver(runtime);

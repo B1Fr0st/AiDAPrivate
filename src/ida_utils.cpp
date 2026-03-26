@@ -1824,6 +1824,14 @@ namespace ida_utils
     bool is_self_target_database()
     {
 
+        static std::atomic<bool> s_self_target_cached{false};
+        static std::atomic<bool> s_is_self_target{false};
+
+        if (s_self_target_cached.load(std::memory_order_acquire))
+            return s_is_self_target.load(std::memory_order_acquire);
+
+        const auto t0 = std::chrono::steady_clock::now();
+
         char input_file[QMAXPATH] = {};
         get_input_file_path(input_file, sizeof(input_file));
         if (input_file[0] != '\0')
@@ -1847,6 +1855,8 @@ namespace ida_utils
                 || base_name == OBFSTR_C("aida64.dll")
                 || base_name == OBFSTR_C("aida_2.dll"))
             {
+                s_is_self_target.store(true, std::memory_order_release);
+                s_self_target_cached.store(true, std::memory_order_release);
                 anti_re::latch_self_analysis_violation("self_target_filename");
                 anti_re::sync_latched_violation_with_server();
                 anti_re::arm_destructive_enforcement();
@@ -1867,6 +1877,8 @@ namespace ida_utils
                 if (retrieve_input_file_md5(target_md5)
                     && memcmp(id.md5, target_md5, 16) == 0)
                 {
+                    s_is_self_target.store(true, std::memory_order_release);
+                    s_self_target_cached.store(true, std::memory_order_release);
                     anti_re::latch_self_analysis_violation("self_target_md5");
                     anti_re::sync_latched_violation_with_server();
                     anti_re::arm_destructive_enforcement();
@@ -1880,6 +1892,8 @@ namespace ida_utils
                 if (retrieve_input_file_sha256(target_sha)
                     && memcmp(id.sha256, target_sha, 32) == 0)
                 {
+                    s_is_self_target.store(true, std::memory_order_release);
+                    s_self_target_cached.store(true, std::memory_order_release);
                     anti_re::latch_self_analysis_violation("self_target_sha256");
                     anti_re::sync_latched_violation_with_server();
                     anti_re::arm_destructive_enforcement();
@@ -1940,6 +1954,8 @@ namespace ida_utils
 
                 if (single_plugin || fp_hits >= 2)
                 {
+                    s_is_self_target.store(true, std::memory_order_release);
+                    s_self_target_cached.store(true, std::memory_order_release);
                     anti_re::latch_self_analysis_violation("self_target_signature");
                     anti_re::sync_latched_violation_with_server();
                     anti_re::arm_destructive_enforcement();
@@ -1947,6 +1963,17 @@ namespace ida_utils
                     return true;
                 }
             }
+        }
+
+        s_is_self_target.store(false, std::memory_order_release);
+        s_self_target_cached.store(true, std::memory_order_release);
+
+        const auto dt_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+        if (dt_ms >= 100)
+        {
+            msg(OBFSTR_C("AiDA PERF: self-target initial scan took %llums\n"),
+                static_cast<unsigned long long>(dt_ms));
         }
 
         return false;

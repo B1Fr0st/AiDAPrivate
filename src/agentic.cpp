@@ -1865,9 +1865,11 @@ struct tool_exec_request_t : public exec_request_t
     tool_execution_t result;
     std::shared_ptr<subagents::session_record_t> session;
     uint64_t run_id = 0;
+    uint64_t exec_ms = 0;
 
     ssize_t idaapi execute() override
     {
+        auto t0 = std::chrono::steady_clock::now();
         subagents::execution_context_scope_t scope(session, run_id);
 
         auto& registry = agent_tools::ToolRegistry::instance();
@@ -1889,113 +1891,13 @@ struct tool_exec_request_t : public exec_request_t
             result.data = json::object();
         }
 
-        return 0;
-    }
-};
-
-
-struct batch_tool_exec_request_t : public exec_request_t
-{
-    struct call_entry_t
-    {
-        std::string tool_name;
-        json params;
-    };
-
-    std::vector<call_entry_t> calls;
-    std::vector<tool_execution_t> results;
-    std::shared_ptr<subagents::session_record_t> session;
-    uint64_t run_id = 0;
-    std::atomic<bool>* cancelled = nullptr;
-    status_fn on_status;
-    int round = 0;
-    std::vector<std::string> pending_tool_names;
-
-    ssize_t idaapi execute() override
-    {
-        subagents::execution_context_scope_t scope(session, run_id);
-        auto& registry = agent_tools::ToolRegistry::instance();
-
-        results.clear();
-        results.reserve(calls.size());
-
-        const bool multi = calls.size() > 1;
-        if (multi)
-            show_wait_box("HIDECANCEL\nAiDA: Executing %zu tool(s)...", calls.size());
-
-        for (size_t i = 0; i < calls.size(); ++i)
-        {
-            if (cancelled && cancelled->load())
-            {
-                for (size_t j = i; j < calls.size(); ++j)
-                {
-                    tool_execution_t r;
-                    r.tool_name = calls[j].tool_name;
-                    r.params = calls[j].params;
-                    r.success = false;
-                    r.message = OBFSTR("Cancelled");
-                    results.push_back(std::move(r));
-                }
-                break;
-            }
-
-
-            if (multi)
-                replace_wait_box("HIDECANCEL\nAiDA: [%zu/%zu] %s",
-                    i + 1, calls.size(), calls[i].tool_name.c_str());
-            else
-                user_cancelled();
-
-            if (on_status)
-            {
-                status_update_t status;
-                status.type = status_type_t::executing_tool;
-                status.round = round;
-                status.tool_name = calls[i].tool_name;
-                status.message = OBFSTR("Executing: ") + calls[i].tool_name;
-                status.pending_tools = pending_tool_names;
-                on_status(status);
-            }
-
-            tool_execution_t result;
-            result.tool_name = calls[i].tool_name;
-            result.params = calls[i].params;
-
-            try
-            {
-                auto tool_result = registry.execute_tool(calls[i].tool_name, calls[i].params);
-                result.success = tool_result.success;
-                result.message = sanitize_utf8(tool_result.output);
-                result.data = tool_result.data;
-                sanitize_json_utf8_inplace(result.data);
-            }
-            catch (const std::exception& e)
-            {
-                result.success = false;
-                result.message = sanitize_utf8(std::string("Exception: ") + e.what());
-                result.data = json::object();
-            }
-
-            if (on_status)
-            {
-                status_update_t status;
-                status.type = status_type_t::tool_complete;
-                status.round = round;
-                status.tool_name = result.tool_name;
-                status.tool_success = result.success;
-                status.message = result.message;
-                on_status(status);
-            }
-
-            results.push_back(std::move(result));
-        }
-
-        if (multi)
-            hide_wait_box();
+        exec_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count());
 
         return 0;
     }
 };
+
 
 result_t run(
     AIClient* client,
@@ -2428,24 +2330,117 @@ result_t run(
 
         if (!ida_tool_calls.empty() && !(cancelled && cancelled->load()))
         {
-            batch_tool_exec_request_t batch;
-            for (const auto& t : ida_tool_calls)
-                batch.calls.push_back({t.tool_name, t.params});
-            batch.session = subagents::current_session_record();
-            batch.run_id = subagents::current_run_id();
-            batch.cancelled = cancelled;
-            batch.on_status = on_status;
-            batch.round = current_round;
-            batch.pending_tool_names = pending_tool_names;
-
-            execute_sync(batch, batch_needs_write ? MFF_WRITE : MFF_READ);
-
-            for (size_t i = 0; i < ida_tool_calls.size() && i < batch.results.size(); ++i)
+            for (auto& t : ida_tool_calls)
             {
-                auto& r = batch.results[i];
-                if (!ida_tool_calls[i].cache_key.empty() && r.success)
-                    tool_cache[ida_tool_calls[i].cache_key] = r;
-                round_tool_results.push_back(std::move(r));
+                if (cancelled && cancelled->load())
+                    break;
+
+                if (on_status)
+                {
+                    status_update_t status;
+                    status.type = status_type_t::executing_tool;
+                    status.round = current_round;
+                    status.tool_name = t.tool_name;
+                    status.message = OBFSTR("Executing: ") + t.tool_name;
+                    status.pending_tools = pending_tool_names;
+                    on_status(status);
+                }
+
+                agent_tools::tool_result_t t_res;
+
+                bool is_session = subagents::is_session_tool_name(t.tool_name);
+                bool is_remote = false;
+                {
+                    subagents::execution_context_scope_t scope(
+                        subagents::current_session_record(),
+                        subagents::current_run_id());
+                    is_remote = subagents::current_target_is_remote();
+                }
+
+                if (is_session || is_remote)
+                {
+
+                    subagents::execution_context_scope_t scope(subagents::current_session_record(), subagents::current_run_id());
+                    msg(OBFSTR_C("AiDA PERF: routing tool=%s via worker (session=%d remote=%d)\n"),
+                        t.tool_name.c_str(), is_session ? 1 : 0, is_remote ? 1 : 0);
+                    t_res = agent_tools::ToolRegistry::instance().execute_tool(t.tool_name, t.params);
+                }
+                else
+                {
+                    msg(OBFSTR_C("AiDA PERF: routing tool=%s via execute_sync (session=%d remote=%d)\n"),
+                        t.tool_name.c_str(), is_session ? 1 : 0, is_remote ? 1 : 0);
+
+
+                    struct single_tool_req_t : public exec_request_t
+                    {
+                        std::string name;
+                        json params;
+                        agent_tools::tool_result_t res;
+                        std::shared_ptr<subagents::session_record_t> session;
+                        uint64_t run_id;
+                        uint64_t exec_ms = 0;
+
+                        ssize_t idaapi execute() override
+                        {
+                            auto t0 = std::chrono::steady_clock::now();
+                            subagents::execution_context_scope_t scope(session, run_id);
+                            res = agent_tools::ToolRegistry::instance().execute_tool(name, params);
+                            exec_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - t0).count());
+                            return 0;
+                        }
+                    };
+
+                    single_tool_req_t req;
+                    req.name = t.tool_name;
+                    req.params = t.params;
+                    req.session = subagents::current_session_record();
+                    req.run_id = subagents::current_run_id();
+
+                    int mff_flag = t.read_only ? MFF_READ : MFF_WRITE;
+                    auto sync_t0 = std::chrono::steady_clock::now();
+                    execute_sync(req, mff_flag);
+                    const auto sync_total_ms = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - sync_t0).count());
+
+                    const uint64_t queue_wait_ms = (sync_total_ms > req.exec_ms)
+                        ? (sync_total_ms - req.exec_ms)
+                        : 0;
+
+                    msg(OBFSTR_C("AiDA PERF: tool=%s mff=%s total=%llums exec=%llums queue=%llums\n"),
+                        t.tool_name.c_str(),
+                        mff_flag == MFF_READ ? OBFSTR_C("READ") : OBFSTR_C("WRITE"),
+                        static_cast<unsigned long long>(sync_total_ms),
+                        static_cast<unsigned long long>(req.exec_ms),
+                        static_cast<unsigned long long>(queue_wait_ms));
+                    t_res = std::move(req.res);
+                }
+
+
+                tool_execution_t t_exec;
+                t_exec.tool_name = t.tool_name;
+                t_exec.params = t.params;
+                t_exec.success = t_res.success;
+                t_exec.message = sanitize_utf8(t_res.output);
+                t_exec.data = t_res.data;
+                sanitize_json_utf8_inplace(t_exec.data);
+
+                if (!t.cache_key.empty() && t_exec.success)
+                    tool_cache[t.cache_key] = t_exec;
+
+                if (on_status)
+                {
+                    status_update_t status;
+                    status.type = status_type_t::tool_complete;
+                    status.round = current_round;
+                    status.tool_name = t.tool_name;
+                    status.tool_success = t_exec.success;
+                    status.message = t_exec.message;
+                    on_status(status);
+                }
+
+                round_tool_results.push_back(std::move(t_exec));
             }
         }
 

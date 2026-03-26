@@ -326,6 +326,21 @@ namespace driver_tools
     tool_result_t driver_cancel_deferred_action(const nlohmann::json& params);
     tool_result_t driver_get_deferred_results(const nlohmann::json& params);
 
+    tool_result_t driver_walk_heap(const nlohmann::json& params);
+    tool_result_t driver_enumerate_handles(const nlohmann::json& params);
+    tool_result_t driver_walk_seh_chain(const nlohmann::json& params);
+    tool_result_t driver_find_code_caves(const nlohmann::json& params);
+    tool_result_t driver_scan_memory_value(const nlohmann::json& params);
+    tool_result_t driver_pointer_scan(const nlohmann::json& params);
+    tool_result_t driver_enumerate_windows(const nlohmann::json& params);
+    tool_result_t driver_walk_stack(const nlohmann::json& params);
+    tool_result_t driver_assemble(const nlohmann::json& params);
+    tool_result_t driver_compare_memory_snapshot(const nlohmann::json& params);
+    tool_result_t driver_find_references(const nlohmann::json& params);
+    tool_result_t driver_read_teb(const nlohmann::json& params);
+    tool_result_t driver_map_peb_modules(const nlohmann::json& params);
+    tool_result_t driver_set_page_guard(const nlohmann::json& params);
+
     void register_tools();
 
 

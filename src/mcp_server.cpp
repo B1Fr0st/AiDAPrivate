@@ -3,6 +3,7 @@
 #include "subagents.hpp"
 
 #include <queue>
+#include <chrono>
 
 using json = nlohmann::json;
 
@@ -53,15 +54,17 @@ struct mcp_tool_exec_request_t : public exec_request_t
     agent_tools::tool_result_t result;
     std::shared_ptr<subagents::session_record_t> session;
     uint64_t run_id = 0;
+    uint64_t exec_ms = 0;
 
     ssize_t idaapi execute() override
     {
+        auto t0 = std::chrono::steady_clock::now();
         subagents::execution_context_scope_t scope(session, run_id);
 
-
-        show_wait_box("HIDECANCEL\nAiDA MCP: %s", tool_name.c_str());
         result = agent_tools::ToolRegistry::instance().execute_tool(tool_name, tool_params);
-        hide_wait_box();
+
+        exec_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count());
 
         return 0;
     }
@@ -297,6 +300,25 @@ static agent_tools::tool_result_t execute_tool_in_main_thread(
     if (!tool_def)
         return agent_tools::tool_result_t::error("Unknown tool: " + name);
 
+    bool is_session = subagents::is_session_tool_name(name);
+    bool is_remote = false;
+    {
+        subagents::execution_context_scope_t scope(subagents::current_session_record(), subagents::current_run_id());
+        is_remote = subagents::current_target_is_remote();
+    }
+
+
+    if (is_session || is_remote)
+    {
+        subagents::execution_context_scope_t scope(subagents::current_session_record(), subagents::current_run_id());
+        msg(OBFSTR_C("AiDA PERF: mcp routing tool=%s via worker (session=%d remote=%d)\n"),
+            name.c_str(), is_session ? 1 : 0, is_remote ? 1 : 0);
+        return agent_tools::ToolRegistry::instance().execute_tool(name, params);
+    }
+
+    msg(OBFSTR_C("AiDA PERF: mcp routing tool=%s via execute_sync (session=%d remote=%d)\n"),
+        name.c_str(), is_session ? 1 : 0, is_remote ? 1 : 0);
+
     mcp_tool_exec_request_t req;
     req.tool_name = name;
     req.tool_params = params;
@@ -304,7 +326,22 @@ static agent_tools::tool_result_t execute_tool_in_main_thread(
     req.run_id = subagents::current_run_id();
 
     int mff_flag = tool_def->read_only ? MFF_READ : MFF_WRITE;
+    auto sync_t0 = std::chrono::steady_clock::now();
     execute_sync(req, mff_flag);
+    const auto sync_total_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - sync_t0).count());
+
+    const uint64_t queue_wait_ms = (sync_total_ms > req.exec_ms)
+        ? (sync_total_ms - req.exec_ms)
+        : 0;
+
+    msg(OBFSTR_C("AiDA PERF: mcp tool=%s mff=%s total=%llums exec=%llums queue=%llums\n"),
+        name.c_str(),
+        mff_flag == MFF_READ ? OBFSTR_C("READ") : OBFSTR_C("WRITE"),
+        static_cast<unsigned long long>(sync_total_ms),
+        static_cast<unsigned long long>(req.exec_ms),
+        static_cast<unsigned long long>(queue_wait_ms));
 
     return req.result;
 }
@@ -1142,11 +1179,7 @@ bool mcp_server_t::start(int port)
         return false;
     }
 
-    // Wait a very short time for the server thread to signal readiness.
-    // The old code slept for up to 1 second (50 × 20 ms) on the calling thread
-    // which is the IDA UI thread during plugin init — freezing the window.
-    // We now do a brief spin (100 ms max) to catch fast starts, then return and
-    // let the server thread log its status asynchronously via execute_sync.
+
     for (int i = 0; i < 10 && !_running.load() && !_stop_requested.load(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
@@ -1170,9 +1203,8 @@ bool mcp_server_t::start(int port)
     }
     else
     {
-        // Server thread is still spinning up — optimistically assume success.
-        // It will log its own status once ready.  This lets the plugin
-        // constructor return without blocking the UI thread.
+
+
         msg(OBFSTR_C("AiDA MCP: Server starting on port %d (async)...\n"), port);
         return true;
     }

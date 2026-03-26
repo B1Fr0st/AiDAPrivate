@@ -839,18 +839,87 @@ bool license_manager_t::validate()
 #ifdef __NT__
     if (!driver_loader::is_driver_loaded())
         return false;
-
 #endif
 
     auto config = read_license_config();
-
     std::string key = config.value(OBFSTR_C("license_key"), std::string(""));
     if (key.empty())
         return false;
 
     std::string current_hwid = generate_hwid();
 
-    if (validate_with_cloud_function(key, current_hwid))
+
+    std::string sig_payload_str = config.value(OBFSTR_C("license_sig_payload"), std::string(""));
+    std::string server_sig = config.value(OBFSTR_C("license_server_sig"), std::string(""));
+
+    bool local_valid = false;
+    if (!sig_payload_str.empty() && !server_sig.empty())
+    {
+        if (verify_server_signature(sig_payload_str, server_sig))
+        {
+            try
+            {
+                auto payload = nlohmann::json::parse(sig_payload_str);
+                std::string p_key = payload.value(OBFSTR_C("license_key"), std::string(""));
+                std::string p_hwid = payload.value(OBFSTR_C("hwid"), std::string(""));
+                int64_t p_issued = payload.value(OBFSTR_C("issued_at"), static_cast<int64_t>(0));
+
+                int64_t now = static_cast<int64_t>(std::time(nullptr));
+
+
+                if (p_key == key && p_hwid == current_hwid && std::abs(now - p_issued) < (7 * 24 * 3600))
+                {
+                    m_plan = payload.value(OBFSTR_C("plan"), std::string("standard"));
+                    m_server_session_token = payload.value(OBFSTR_C("session_token"), std::string(""));
+                    m_server_ttl = payload.value(OBFSTR_C("ttl"), static_cast<int64_t>(3600));
+                    m_server_issued_at = p_issued;
+                    m_session_id = payload.value(OBFSTR_C("server_nonce"), std::string(""));
+                    m_client_nonce = payload.value(OBFSTR_C("client_nonce"), std::string(""));
+                    m_server_signature = server_sig;
+
+                    m_valid = true;
+                    m_cached_key = key;
+                    m_last_known_time.store(now, std::memory_order_release);
+
+
+                    m_online_validated_this_session.store(true, std::memory_order_release);
+                    m_consecutive_heartbeat_failures.store(0, std::memory_order_release);
+                    m_bound_hwid = current_hwid;
+
+                    compute_session_credentials(key, current_hwid, now, m_server_session_token, m_server_signature);
+                    if (m_sig_binding_tag.load(std::memory_order_acquire) != 0)
+                    {
+                        local_valid = true;
+                    }
+                }
+            }
+            catch (...) {}
+        }
+    }
+
+    if (local_valid)
+    {
+        return true;
+    }
+
+
+    std::atomic<bool> fallback_done{false};
+    bool fallback_ok = false;
+    std::thread fallback_worker([this, &key, &current_hwid, &fallback_ok, &fallback_done]() {
+        fallback_ok = validate_with_cloud_function(key, current_hwid);
+        fallback_done.store(true, std::memory_order_release);
+    });
+
+    show_wait_box("HIDECANCEL\nAiDA: Validating license...");
+    while (!fallback_done.load(std::memory_order_acquire))
+    {
+        user_cancelled();
+        Sleep(30);
+    }
+    fallback_worker.join();
+    hide_wait_box();
+
+    if (fallback_ok)
     {
         int64_t now = static_cast<int64_t>(std::time(nullptr));
         nlohmann::json lic;
@@ -872,26 +941,6 @@ bool license_manager_t::validate()
         sig_payload[OBFSTR("client_nonce")]  = m_client_nonce;
         lic[OBFSTR("license_sig_payload")] = sig_payload.dump();
 
-        {
-            nlohmann::json gate2_pl;
-            gate2_pl[OBFSTR("status")]        = OBFSTR("valid");
-            gate2_pl[OBFSTR("license_key")]   = key;
-            gate2_pl[OBFSTR("hwid")]          = current_hwid;
-            gate2_pl[OBFSTR("plan")]          = m_plan;
-            gate2_pl[OBFSTR("session_token")] = m_server_session_token;
-            gate2_pl[OBFSTR("ttl")]           = m_server_ttl;
-            gate2_pl[OBFSTR("issued_at")]     = m_server_issued_at;
-            gate2_pl[OBFSTR("server_nonce")]  = m_session_id;
-            gate2_pl[OBFSTR("client_nonce")]  = m_client_nonce;
-            if (!verify_server_signature(gate2_pl.dump(), m_server_signature))
-            {
-                invalidate_runtime();
-                return false;
-            }
-        }
-
-        check_dll_leak(current_hwid);
-
         write_license_config(lic);
 
         m_valid = true;
@@ -901,8 +950,7 @@ bool license_manager_t::validate()
         m_consecutive_heartbeat_failures.store(0, std::memory_order_release);
         m_bound_hwid = current_hwid;
 
-        compute_session_credentials(key, current_hwid, now, m_server_session_token,
-                                    m_server_signature);
+        compute_session_credentials(key, current_hwid, now, m_server_session_token, m_server_signature);
 
         if (m_sig_binding_tag.load(std::memory_order_acquire) == 0)
         {
@@ -913,14 +961,12 @@ bool license_manager_t::validate()
         return true;
     }
 
-
     discord_webhook::send_alert_async(
         OBFSTR("\xf0\x9f\x9a\xa8 FAILED ACTIVATION ATTEMPT (Possible DLL Leak)"),
         OBFSTR("**Someone attempted to activate a license on an unauthorized machine.**\n")
             + OBFSTR("**Attempted Key:** `") + key
             + OBFSTR("`\n**HWID:** `") + current_hwid + "`",
         discord_webhook::COLOR_RED);
-
 
     return false;
 }
@@ -1013,7 +1059,22 @@ bool license_manager_t::show_activation_dialog()
 
     msg(OBFSTR_C("Validating license key with server, please wait...\n"));
 
-    bool valid = validate_with_cloud_function(key, current_hwid);
+
+    std::atomic<bool> validation_done{false};
+    bool valid = false;
+    std::thread validation_worker([this, &key, &current_hwid, &valid, &validation_done]() {
+        valid = validate_with_cloud_function(key, current_hwid);
+        validation_done.store(true, std::memory_order_release);
+    });
+
+    show_wait_box("HIDECANCEL\nAiDA: Validating license key...");
+    while (!validation_done.load(std::memory_order_acquire))
+    {
+        user_cancelled();
+        Sleep(30);
+    }
+    validation_worker.join();
+    hide_wait_box();
 
     if (valid)
     {
@@ -1145,9 +1206,7 @@ static int idaapi license_revalidation_timer_cb(void* )
         return -1;
     }
 
-    // Heartbeat involves synchronous HTTPS calls (get_public_ip + cloud function POST)
-    // which can block for 20-45 seconds in the worst case.  Run it on a detached
-    // background thread so the IDA UI thread is never stalled by network latency.
+
     std::thread([]() {
         auto& bg_lm = license_manager_t::instance();
         if (!bg_lm.perform_heartbeat())
@@ -1938,10 +1997,11 @@ void license_manager_t::handle_ban_response(const nlohmann::json& j)
     std::string reason = j.value(OBFSTR_C("reason"), std::string("No reason provided"));
     m_ban_reason = reason;
 
+
     if (status == OBFSTR("hwid_banned"))
     {
         m_hwid_banned.store(true, std::memory_order_release);
-        discord_webhook::send_alert(
+        discord_webhook::send_alert_async(
             OBFSTR("\xf0\x9f\x94\xa8 HWID BAN ENFORCED"),
             OBFSTR("**Status:** `hwid_banned`\n**Reason:** `") + reason
                 + OBFSTR("`\n**License:** `") + m_cached_key + "`",
@@ -1950,7 +2010,7 @@ void license_manager_t::handle_ban_response(const nlohmann::json& j)
     else if (status == OBFSTR("ip_banned"))
     {
         m_ip_banned.store(true, std::memory_order_release);
-        discord_webhook::send_alert(
+        discord_webhook::send_alert_async(
             OBFSTR("\xf0\x9f\x8c\x90 IP BAN ENFORCED"),
             OBFSTR("**Status:** `ip_banned`\n**Reason:** `") + reason
                 + OBFSTR("`\n**License:** `") + m_cached_key + "`",
@@ -1959,7 +2019,7 @@ void license_manager_t::handle_ban_response(const nlohmann::json& j)
     else if (status == OBFSTR("banned"))
     {
         m_hwid_banned.store(true, std::memory_order_release);
-        discord_webhook::send_alert(
+        discord_webhook::send_alert_async(
             OBFSTR("\xf0\x9f\x9a\xab BAN ENFORCED"),
             OBFSTR("**Status:** `banned`\n**Reason:** `") + reason
                 + OBFSTR("`\n**License:** `") + m_cached_key + "`",
@@ -1968,7 +2028,7 @@ void license_manager_t::handle_ban_response(const nlohmann::json& j)
     else if (status == OBFSTR("leaked"))
     {
         m_dll_leaked.store(true, std::memory_order_release);
-        discord_webhook::send_alert(
+        discord_webhook::send_alert_async(
             OBFSTR("\xf0\x9f\x92\xa7 DLL LEAK CONFIRMED"),
             OBFSTR("**Status:** `leaked`\n**Detail:** `") + reason
                 + OBFSTR("`\n**License:** `") + m_cached_key + "`",
@@ -1997,7 +2057,8 @@ void license_manager_t::check_dll_leak(const std::string& current_hwid)
 
         std::string key = config.value(OBFSTR_C("license_key"), std::string("unknown"));
 
-        discord_webhook::send_alert(
+
+        discord_webhook::send_alert_async(
             OBFSTR("\xf0\x9f\x92\xa7 DLL LEAK DETECTED (HWID Mismatch)"),
             OBFSTR("**The DLL is running on a different machine than originally activated.**\n")
                 + OBFSTR("**Original HWID:** `") + stored_hwid

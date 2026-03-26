@@ -308,15 +308,24 @@ static bool responsive_auto_wait(ea_t ea1, ea_t ea2, const char* step_label = nu
 {
     int step_count = 0;
     int idle_spins = 0;
-    constexpr int UI_PUMP_INTERVAL = 2048;
-    constexpr int MAX_IDLE_SPINS   = 128;
+    constexpr int UI_PUMP_INTERVAL = 64;
+    constexpr int MAX_IDLE_SPINS   = 64;
+    constexpr int MAX_TOTAL_MS     = 30000;
+
+    auto wall_start = std::chrono::steady_clock::now();
+    auto last_pump  = wall_start;
 
     while (!auto_is_ok())
     {
+        auto now = std::chrono::steady_clock::now();
+        int elapsed_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - wall_start).count());
+        if (elapsed_ms >= MAX_TOTAL_MS)
+            break;
+
         bool did_work = auto_make_step(ea1, ea2);
         if (!did_work)
         {
-
             did_work = auto_make_step(0, BADADDR);
             if (!did_work)
             {
@@ -328,10 +337,15 @@ static bool responsive_auto_wait(ea_t ea1, ea_t ea2, const char* step_label = nu
             }
         }
         idle_spins = 0;
+        ++step_count;
 
-        if (++step_count % UI_PUMP_INTERVAL == 0)
+        now = std::chrono::steady_clock::now();
+        int ms_since_pump = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_pump).count());
+
+        if (step_count % UI_PUMP_INTERVAL == 0 || ms_since_pump >= 100)
         {
-
+            last_pump = now;
             if (step_label)
                 replace_wait_box("HIDECANCEL\nAiDA: %s (%dk steps...)",
                                  step_label, step_count / 1000);
@@ -18917,6 +18931,1914 @@ tool_result_t driver_detect_hidden_modules(const json& params)
                              OBFSTR(" found"), result);
 }
 
+// =========================================================================
+// New tools inspired by Cheat Engine and x64dbg capabilities
+// =========================================================================
+
+tool_result_t driver_walk_heap(const json& params)
+{
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
+
+    const std::uint32_t pid = device->get_process_id();
+    const int max_entries = std::min(params.value("limit", 500), 5000);
+    const std::uint64_t filter_min = params.contains("min_size") ? params["min_size"].get<std::uint64_t>() : 0;
+    const std::uint64_t filter_max = params.contains("max_size") ? params["max_size"].get<std::uint64_t>() : 0;
+    const bool free_only = params.value("free_only", false);
+
+    voyager::device_t::peb_info peb{};
+    if (!device->read_peb(peb))
+        return tool_result_t::error(OBFSTR("Failed to read PEB"));
+
+    const std::uint64_t peb_addr = peb.peb_address;
+    if (peb_addr == 0)
+        return tool_result_t::error(OBFSTR("PEB address is null"));
+
+    // PEB.ProcessHeaps at offset 0xF0 (x64), PEB.NumberOfHeaps at 0xE8
+    const std::uint32_t num_heaps = device->read<std::uint32_t>(peb_addr + 0xE8);
+    const std::uint64_t heaps_ptr = device->read<std::uint64_t>(peb_addr + 0xF0);
+
+    if (num_heaps == 0 || num_heaps > 256 || heaps_ptr == 0)
+        return tool_result_t::error(OBFSTR("No heaps found or invalid PEB heap data"));
+
+    json heaps_arr = json::array();
+    int total_entries = 0;
+
+    for (std::uint32_t h = 0; h < num_heaps && total_entries < max_entries; ++h)
+    {
+        const std::uint64_t heap_base = device->read<std::uint64_t>(heaps_ptr + h * 8);
+        if (heap_base == 0) continue;
+
+        // _HEAP structure: Signature at offset 0x0 should be 0xFFEEFFEE or read encoding
+        // _HEAP.TotalFreeSize at 0x40, _HEAP.NumberOfPages at 0x38
+        // _HEAP.Segments at 0x0 for segment-based heap walking
+        // Walk segments via _HEAP_SEGMENT entries
+
+        // Read NTDLL segment heap signature to detect segment vs NT heap
+        const std::uint32_t signature = device->read<std::uint32_t>(heap_base);
+        const std::uint64_t total_free = device->read<std::uint64_t>(heap_base + 0x40);
+        const std::uint64_t num_pages = device->read<std::uint64_t>(heap_base + 0x38);
+
+        json heap_info;
+        heap_info["heap_index"] = h;
+        heap_info["heap_base"] = helpers::format_address(static_cast<ea_t>(heap_base));
+        heap_info["signature"] = helpers::format_address(static_cast<ea_t>(signature));
+        heap_info["total_free_size"] = total_free;
+        heap_info["committed_pages"] = num_pages;
+
+        // Walk _HEAP_SEGMENT list via _HEAP.SegmentList (ListEntry at offset 0x120)
+        const std::uint64_t seg_list_head = heap_base + 0x120;
+        std::uint64_t seg_flink = device->read<std::uint64_t>(seg_list_head);
+
+        json segments_arr = json::array();
+        int seg_iter = 0;
+        constexpr int MAX_SEGS = 64;
+
+        while (seg_flink != 0 && seg_flink != seg_list_head && seg_iter++ < MAX_SEGS && total_entries < max_entries)
+        {
+            // _HEAP_SEGMENT.SegmentListEntry is at seg_flink, so segment base = seg_flink - 0x18
+            const std::uint64_t segment_base = seg_flink - 0x18;
+            const std::uint64_t seg_base_addr = device->read<std::uint64_t>(segment_base + 0x0);
+            const std::uint32_t seg_num_pages = device->read<std::uint32_t>(segment_base + 0x10);
+            const std::uint64_t first_entry = device->read<std::uint64_t>(segment_base + 0x28);
+            const std::uint64_t last_entry = device->read<std::uint64_t>(segment_base + 0x48);
+
+            // Walk HEAP_ENTRY chain in this segment
+            std::uint64_t entry_addr = first_entry;
+            int entry_iter = 0;
+            constexpr int MAX_ENTRIES_PER_SEG = 2048;
+            json entries_arr = json::array();
+
+            while (entry_addr != 0 && entry_addr < last_entry && entry_iter++ < MAX_ENTRIES_PER_SEG && total_entries < max_entries)
+            {
+                // _HEAP_ENTRY: Size at offset 0x0 (encoded), Flags at 0x2, UnusedBytes at 0x7
+                // In NT heap, encoded size = (actual_size * 8) XOR encoding key
+                std::uint16_t raw_size = device->read<std::uint16_t>(entry_addr);
+                std::uint8_t flags = device->read<std::uint8_t>(entry_addr + 0x2);
+                std::uint8_t unused_bytes = device->read<std::uint8_t>(entry_addr + 0x7);
+
+                std::uint64_t block_size = static_cast<std::uint64_t>(raw_size) * 16;
+                if (block_size == 0) break;
+
+                bool is_busy = (flags & 0x01) != 0;
+                bool is_extra = (flags & 0x02) != 0;
+                bool is_fill = (flags & 0x04) != 0;
+                bool is_virtual = (flags & 0x08) != 0;
+                bool is_last = (flags & 0x10) != 0;
+
+                bool include = true;
+                if (free_only && is_busy) include = false;
+                if (filter_min > 0 && block_size < filter_min) include = false;
+                if (filter_max > 0 && block_size > filter_max) include = false;
+
+                if (include)
+                {
+                    json entry;
+                    entry["address"] = helpers::format_address(static_cast<ea_t>(entry_addr));
+                    entry["user_address"] = helpers::format_address(static_cast<ea_t>(entry_addr + 0x10));
+                    entry["block_size"] = block_size;
+                    entry["user_size"] = block_size > unused_bytes ? block_size - unused_bytes - 0x10 : 0;
+                    entry["flags"] = {
+                        {"busy", is_busy}, {"extra", is_extra}, {"fill", is_fill},
+                        {"virtual_alloc", is_virtual}, {"last_entry", is_last}
+                    };
+                    entries_arr.push_back(std::move(entry));
+                    ++total_entries;
+                }
+
+                entry_addr += block_size;
+                if (is_last) break;
+            }
+
+            json seg;
+            seg["segment_base"] = helpers::format_address(static_cast<ea_t>(segment_base));
+            seg["pages"] = seg_num_pages;
+            seg["entries"] = std::move(entries_arr);
+            segments_arr.push_back(std::move(seg));
+
+            seg_flink = device->read<std::uint64_t>(seg_flink);
+        }
+
+        heap_info["segments"] = std::move(segments_arr);
+        heaps_arr.push_back(std::move(heap_info));
+    }
+
+    json result;
+    result["process_id"] = pid;
+    result["heap_count"] = num_heaps;
+    result["entries_returned"] = total_entries;
+    result["heaps"] = std::move(heaps_arr);
+    return tool_result_t::ok(OBFSTR("Walked ") + std::to_string(num_heaps) + OBFSTR(" heaps, ") +
+                             std::to_string(total_entries) + OBFSTR(" entries"), result);
+}
+
+tool_result_t driver_enumerate_handles(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+
+    const std::uint32_t filter_pid = params.value("pid", 0u);
+    const std::string filter_type = params.value("type_filter", "");
+    const int limit = std::min(params.value("limit", 500), 10000);
+
+    // Use NtQuerySystemInformation(SystemHandleInformation = 16) from usermode
+    // This doesn't need the driver for the query itself, but we use the driver
+    // to resolve handle names in the target process context
+    typedef struct {
+        ULONG NumberOfHandles;
+    } SYSTEM_HANDLE_INFORMATION_HEAD;
+
+    typedef struct {
+        USHORT UniqueProcessId;
+        USHORT CreatorBackTraceIndex;
+        UCHAR ObjectTypeIndex;
+        UCHAR HandleAttributes;
+        USHORT HandleValue;
+        PVOID Object;
+        ULONG GrantedAccess;
+    } SYSTEM_HANDLE_TABLE_ENTRY_INFO;
+
+    // Known object type indices (Windows 10+, approximate)
+    auto type_name_from_index = [](std::uint8_t idx) -> std::string {
+        switch (idx) {
+            case 7:  return "Process";
+            case 8:  return "Thread";
+            case 5:  return "Token";
+            case 37: return "Section";
+            case 39: return "Key";
+            case 36: return "File";
+            case 28: return "Event";
+            case 30: return "Mutant";
+            case 31: return "Semaphore";
+            case 32: return "Timer";
+            case 44: return "Directory";
+            case 45: return "SymbolicLink";
+            default: return "Type_" + std::to_string(idx);
+        }
+    };
+
+    ULONG bufsize = 1 << 22; // 4 MB initial
+    std::vector<std::uint8_t> buffer(bufsize);
+    NTSTATUS status;
+    using NtQuerySystemInformationFn = NTSTATUS(WINAPI*)(ULONG, PVOID, ULONG, PULONG);
+    auto NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformationFn>(
+        GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQuerySystemInformation"));
+
+    if (!NtQuerySystemInformation)
+        return tool_result_t::error(OBFSTR("Failed to resolve NtQuerySystemInformation"));
+
+    ULONG returned_length = 0;
+    for (int attempt = 0; attempt < 5; ++attempt)
+    {
+        status = NtQuerySystemInformation(16 /*SystemHandleInformation*/, buffer.data(),
+                                          static_cast<ULONG>(buffer.size()), &returned_length);
+        if (status == 0) break; // STATUS_SUCCESS
+        if (status == 0xC0000004 /*STATUS_INFO_LENGTH_MISMATCH*/)
+        {
+            bufsize = returned_length + (1 << 20);
+            if (bufsize > (1u << 28)) // 256MB cap
+                return tool_result_t::error(OBFSTR("Handle table too large"));
+            buffer.resize(bufsize);
+            continue;
+        }
+        return tool_result_t::error(OBFSTR("NtQuerySystemInformation failed: 0x") +
+                                    helpers::format_address(static_cast<ea_t>(status)));
+    }
+
+    const auto* head = reinterpret_cast<const SYSTEM_HANDLE_INFORMATION_HEAD*>(buffer.data());
+    const auto* entries = reinterpret_cast<const SYSTEM_HANDLE_TABLE_ENTRY_INFO*>(buffer.data() + sizeof(ULONG));
+    const ULONG count = head->NumberOfHandles;
+
+    const std::string filter_type_lower = to_lower_ascii_copy(filter_type);
+    json handles_arr = json::array();
+    int matched = 0;
+
+    for (ULONG i = 0; i < count && matched < limit; ++i)
+    {
+        const auto& e = entries[i];
+        if (filter_pid != 0 && e.UniqueProcessId != static_cast<USHORT>(filter_pid))
+            continue;
+
+        std::string type_name = type_name_from_index(e.ObjectTypeIndex);
+        if (!filter_type_lower.empty())
+        {
+            std::string lower_type = to_lower_ascii_copy(type_name);
+            if (lower_type.find(filter_type_lower) == std::string::npos)
+                continue;
+        }
+
+        json h;
+        h["pid"] = static_cast<std::uint32_t>(e.UniqueProcessId);
+        h["handle"] = static_cast<std::uint32_t>(e.HandleValue);
+        h["type"] = type_name;
+        h["type_index"] = e.ObjectTypeIndex;
+        h["object_address"] = helpers::format_address(static_cast<ea_t>(reinterpret_cast<std::uintptr_t>(e.Object)));
+        h["access"] = helpers::format_address(static_cast<ea_t>(e.GrantedAccess));
+        h["attributes"] = e.HandleAttributes;
+        handles_arr.push_back(std::move(h));
+        ++matched;
+    }
+
+    json result;
+    result["total_system_handles"] = count;
+    result["returned"] = matched;
+    if (filter_pid != 0) result["filter_pid"] = filter_pid;
+    if (!filter_type.empty()) result["filter_type"] = filter_type;
+    result["handles"] = std::move(handles_arr);
+    return tool_result_t::ok(std::to_string(matched) + OBFSTR(" handles returned (") +
+                             std::to_string(count) + OBFSTR(" total system-wide)"), result);
+}
+
+tool_result_t driver_walk_seh_chain(const json& params)
+{
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
+
+    auto tid_opt = parse_tid_param(params);
+    if (!tid_opt)
+        return tool_result_t::error(OBFSTR("Missing or invalid tid parameter. Provide the thread ID."));
+
+    const std::uint32_t tid = *tid_opt;
+
+    // Get thread context to read GS base (TEB)
+    voyager::device_t::thread_context ctx{};
+    if (!device->get_thread_context(tid, ctx))
+        return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
+
+    // Read TEB.NtTib.ExceptionList (offset 0 in TEB for x64, which is at GS:[0])
+    // In x64 Windows, SEH uses RtlAddFunctionTable / .pdata, but the legacy
+    // exception list is still at TEB offset 0x0
+    // We also read the vectored handler list from ntdll!LdrpVectorHandlerList
+
+    // TEB address is at kernel_gs_base from context
+    const std::uint64_t teb_addr = ctx.kernel_gs_base;
+    if (teb_addr == 0)
+        return tool_result_t::error(OBFSTR("TEB address is null (kernel_gs_base=0)"));
+
+    // x64 SEH: Read TEB.ExceptionList head (offset 0x0 in NT_TIB)
+    std::uint64_t seh_head = device->read<std::uint64_t>(teb_addr);
+
+    json seh_chain = json::array();
+    int max_walk = 256;
+    std::uint64_t current = seh_head;
+
+    while (current != 0 && current != 0xFFFFFFFFFFFFFFFF && max_walk-- > 0)
+    {
+        // _EXCEPTION_REGISTRATION_RECORD: Next (8 bytes) + Handler (8 bytes)
+        std::uint64_t next = device->read<std::uint64_t>(current);
+        std::uint64_t handler = device->read<std::uint64_t>(current + 8);
+
+        json entry;
+        entry["record_address"] = helpers::format_address(static_cast<ea_t>(current));
+        entry["handler_address"] = helpers::format_address(static_cast<ea_t>(handler));
+        entry["next"] = (next == 0xFFFFFFFFFFFFFFFF) ? "END" : helpers::format_address(static_cast<ea_t>(next));
+
+        // Try to identify which module the handler belongs to
+        std::uint64_t mod_base = 0;
+        std::string mod_name;
+        if (handler != 0 && resolve_loaded_module_base("", mod_base, mod_name))
+        {
+            // Walk all modules to find which one contains the handler
+            voyager::device_t::peb_info peb{};
+            if (device->read_peb(peb) && peb.ldr_address != 0)
+            {
+                const std::uint64_t list_head = peb.ldr_address + 0x10;
+                std::uint64_t ldr_current = device->read<std::uint64_t>(list_head);
+                int ldr_iter = 1024;
+                while (ldr_current != list_head && ldr_current != 0 && ldr_iter-- > 0)
+                {
+                    const std::uint64_t base = device->read<std::uint64_t>(ldr_current + 0x30);
+                    const std::uint32_t size = device->read<std::uint32_t>(ldr_current + 0x40);
+                    if (handler >= base && handler < base + size)
+                    {
+                        entry["module"] = read_remote_unicode_ascii(device.get(),
+                            device->read<std::uint64_t>(ldr_current + 0x60),
+                            device->read<std::uint16_t>(ldr_current + 0x58), 520);
+                        entry["handler_offset"] = helpers::format_address(static_cast<ea_t>(handler - base));
+                        break;
+                    }
+                    std::uint64_t n = device->read<std::uint64_t>(ldr_current);
+                    if (n == ldr_current) break;
+                    ldr_current = n;
+                }
+            }
+        }
+
+        seh_chain.push_back(std::move(entry));
+
+        if (next == 0xFFFFFFFFFFFFFFFF || next == current)
+            break;
+        current = next;
+    }
+
+    // Now try to enumerate Vectored Exception Handlers (VEH)
+    // VEH list head is at ntdll!LdrpVectorHandlerList
+    json veh_chain = json::array();
+    std::uint64_t ntdll_base = 0;
+    std::string ntdll_name;
+    if (resolve_loaded_module_base("ntdll.dll", ntdll_base, ntdll_name) && ntdll_base != 0)
+    {
+        // LdrpVectorHandlerList is an internal symbol - we can try to find it
+        // by scanning for the pattern used in RtlAddVectoredExceptionHandler
+        // The list is a LIST_ENTRY, each node has: Flink, Blink, RefCount(4), Handler(8)
+        // For now, report that VEH enumeration requires symbol resolution
+        json veh_note;
+        veh_note["note"] = "VEH list requires ntdll symbol resolution. Use driver_scan_pattern "
+                           "to find LdrpVectorHandlerList in ntdll.";
+        veh_note["ntdll_base"] = helpers::format_address(static_cast<ea_t>(ntdll_base));
+        veh_chain.push_back(std::move(veh_note));
+    }
+
+    json result;
+    result["thread_id"] = tid;
+    result["teb_address"] = helpers::format_address(static_cast<ea_t>(teb_addr));
+    result["seh_entries"] = seh_chain.size();
+    result["seh_chain"] = std::move(seh_chain);
+    result["veh_info"] = std::move(veh_chain);
+    result["rip"] = helpers::format_address(static_cast<ea_t>(ctx.rip));
+    return tool_result_t::ok(OBFSTR("SEH chain: ") + std::to_string(result["seh_entries"].get<int>()) +
+                             OBFSTR(" handlers for TID ") + std::to_string(tid), result);
+}
+
+tool_result_t driver_find_code_caves(const json& params)
+{
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
+
+    const std::size_t min_size = params.value("min_size", 64);
+    const int limit = std::min(params.value("limit", 50), 500);
+    const std::uint8_t fill_byte = static_cast<std::uint8_t>(params.value("fill_byte", 0x00));
+    const bool executable_only = params.value("executable_only", true);
+
+    // Enumerate all memory regions and scan for gaps filled with the target byte
+    auto regions = enumerate_all_memory_regions_paginated(
+        device.get(), 0x10000, 0x7FFFFFFFFFFF, false);
+
+    if (regions.empty())
+        return tool_result_t::error(OBFSTR("No memory regions found."));
+
+    json caves = json::array();
+    int found = 0;
+
+    for (const auto& region : regions)
+    {
+        if (found >= limit) break;
+        if (region.size == 0 || region.size > 0x10000000) continue;
+
+        // Check if the region is executable
+        bool is_exec = (region.protect & 0x10) ||  // PAGE_EXECUTE
+                       (region.protect & 0x20) ||  // PAGE_EXECUTE_READ
+                       (region.protect & 0x40) ||  // PAGE_EXECUTE_READWRITE
+                       (region.protect & 0x80);    // PAGE_EXECUTE_WRITECOPY
+
+        if (executable_only && !is_exec)
+            continue;
+
+        // State must be committed (0x1000)
+        if ((region.state & 0x1000) == 0)
+            continue;
+
+        // Read region in chunks
+        constexpr std::size_t CHUNK = 0x10000; // 64KB chunks
+        for (std::uint64_t offset = 0; offset < region.size && found < limit; offset += CHUNK)
+        {
+            const std::size_t to_read = std::min<std::size_t>(CHUNK, region.size - offset);
+            std::vector<std::uint8_t> buf(to_read);
+            if (device->read_raw(region.base + offset, buf.data(), to_read) == 0)
+                continue;
+
+            // Scan for runs of fill_byte
+            std::size_t run_start = 0;
+            bool in_run = false;
+
+            for (std::size_t i = 0; i <= to_read; ++i)
+            {
+                bool is_fill = (i < to_read) && (buf[i] == fill_byte);
+
+                if (is_fill && !in_run)
+                {
+                    run_start = i;
+                    in_run = true;
+                }
+                else if (!is_fill && in_run)
+                {
+                    std::size_t run_len = i - run_start;
+                    if (run_len >= min_size)
+                    {
+                        json cave;
+                        cave["address"] = helpers::format_address(
+                            static_cast<ea_t>(region.base + offset + run_start));
+                        cave["size"] = run_len;
+                        cave["fill_byte"] = helpers::format_address(static_cast<ea_t>(fill_byte));
+                        cave["executable"] = is_exec;
+                        cave["protection"] = helpers::format_address(static_cast<ea_t>(region.protect));
+                        cave["region_base"] = helpers::format_address(static_cast<ea_t>(region.base));
+                        caves.push_back(std::move(cave));
+                        ++found;
+                        if (found >= limit) break;
+                    }
+                    in_run = false;
+                }
+            }
+        }
+    }
+
+    json result;
+    result["caves_found"] = found;
+    result["min_size_filter"] = min_size;
+    result["executable_only"] = executable_only;
+    result["fill_byte"] = helpers::format_address(static_cast<ea_t>(fill_byte));
+    result["caves"] = std::move(caves);
+    return tool_result_t::ok(std::to_string(found) + OBFSTR(" code caves found (>= ") +
+                             std::to_string(min_size) + OBFSTR(" bytes)"), result);
+}
+
+tool_result_t driver_scan_memory_value(const json& params)
+{
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
+
+    // Value type: byte, int16, int32, int64, float, double, string, aob
+    const std::string value_type = params.value("value_type", "int32");
+    const std::string scan_mode = params.value("scan_mode", "exact"); // exact, range, changed, unchanged, increased, decreased
+    const int limit = std::min(params.value("limit", 100), 10000);
+
+    // Get scan range
+    std::uint64_t scan_start = 0x10000;
+    std::uint64_t scan_end = 0x7FFFFFFFFFFF;
+    if (params.contains("start"))
+    {
+        auto s = helpers::parse_address(params["start"].get<std::string>());
+        if (s) scan_start = *s;
+    }
+    if (params.contains("end"))
+    {
+        auto e = helpers::parse_address(params["end"].get<std::string>());
+        if (e) scan_end = *e;
+    }
+
+    // Determine value size and parse the target value
+    std::size_t value_size = 4;
+    std::vector<std::uint8_t> search_bytes;
+    std::vector<std::uint8_t> search_bytes_max; // for range mode
+
+    if (value_type == "byte")
+    {
+        value_size = 1;
+        std::uint8_t v = static_cast<std::uint8_t>(params.value("value", 0));
+        search_bytes.assign(reinterpret_cast<const std::uint8_t*>(&v),
+                           reinterpret_cast<const std::uint8_t*>(&v) + 1);
+    }
+    else if (value_type == "int16")
+    {
+        value_size = 2;
+        std::int16_t v = static_cast<std::int16_t>(params.value("value", 0));
+        search_bytes.assign(reinterpret_cast<const std::uint8_t*>(&v),
+                           reinterpret_cast<const std::uint8_t*>(&v) + 2);
+    }
+    else if (value_type == "int32")
+    {
+        value_size = 4;
+        std::int32_t v = static_cast<std::int32_t>(params.value("value", 0));
+        search_bytes.assign(reinterpret_cast<const std::uint8_t*>(&v),
+                           reinterpret_cast<const std::uint8_t*>(&v) + 4);
+    }
+    else if (value_type == "int64")
+    {
+        value_size = 8;
+        std::int64_t v = static_cast<std::int64_t>(params.value("value", 0));
+        search_bytes.assign(reinterpret_cast<const std::uint8_t*>(&v),
+                           reinterpret_cast<const std::uint8_t*>(&v) + 8);
+    }
+    else if (value_type == "float")
+    {
+        value_size = 4;
+        float v = params.value("value", 0.0f);
+        search_bytes.assign(reinterpret_cast<const std::uint8_t*>(&v),
+                           reinterpret_cast<const std::uint8_t*>(&v) + 4);
+    }
+    else if (value_type == "double")
+    {
+        value_size = 8;
+        double v = params.value("value", 0.0);
+        search_bytes.assign(reinterpret_cast<const std::uint8_t*>(&v),
+                           reinterpret_cast<const std::uint8_t*>(&v) + 8);
+    }
+    else if (value_type == "string")
+    {
+        const std::string str_val = params.value("value_string", "");
+        if (str_val.empty()) return tool_result_t::error(OBFSTR("value_string required for string type"));
+        search_bytes.assign(str_val.begin(), str_val.end());
+        value_size = search_bytes.size();
+    }
+    else if (value_type == "aob")
+    {
+        // Array of bytes pattern with wildcards - already handled by driver_scan_pattern
+        return tool_result_t::error(OBFSTR("Use driver_scan_pattern for AOB/wildcard scans"));
+    }
+    else
+    {
+        return tool_result_t::error(OBFSTR("Invalid value_type. Use: byte, int16, int32, int64, float, double, string"));
+    }
+
+    if (scan_mode == "range")
+    {
+        // Parse max value for range mode
+        if (value_type == "int32")
+        {
+            std::int32_t v = static_cast<std::int32_t>(params.value("value_max", 0));
+            search_bytes_max.assign(reinterpret_cast<const std::uint8_t*>(&v),
+                                   reinterpret_cast<const std::uint8_t*>(&v) + 4);
+        }
+        else if (value_type == "float")
+        {
+            float v = params.value("value_max", 0.0f);
+            search_bytes_max.assign(reinterpret_cast<const std::uint8_t*>(&v),
+                                   reinterpret_cast<const std::uint8_t*>(&v) + 4);
+        }
+        // Add other types as needed...
+    }
+
+    // Enumerate committed readable regions in the scan range
+    auto regions = enumerate_all_memory_regions_paginated(
+        device.get(), scan_start, scan_end, false);
+
+    json matches = json::array();
+    int found = 0;
+
+    for (const auto& region : regions)
+    {
+        if (found >= limit) break;
+        if (region.size == 0 || region.size > 0x10000000) continue;
+        if ((region.state & 0x1000) == 0) continue; // committed only
+        if (region.base < scan_start || region.base >= scan_end) continue;
+
+        // Skip guard/noaccess pages
+        if ((region.protect & 0x01) || // PAGE_NOACCESS
+            (region.protect & 0x100))   // PAGE_GUARD
+            continue;
+
+        constexpr std::size_t CHUNK = 0x10000;
+        for (std::uint64_t offset = 0; offset < region.size && found < limit; offset += CHUNK)
+        {
+            const std::size_t to_read = std::min<std::size_t>(CHUNK, region.size - offset);
+            if (to_read < value_size) continue;
+
+            std::vector<std::uint8_t> buf(to_read);
+            if (device->read_raw(region.base + offset, buf.data(), to_read) == 0)
+                continue;
+
+            // Scan buffer for exact match
+            if (scan_mode == "exact" && !search_bytes.empty())
+            {
+                for (std::size_t i = 0; i + value_size <= to_read && found < limit; ++i)
+                {
+                    if (std::memcmp(&buf[i], search_bytes.data(), value_size) == 0)
+                    {
+                        json m;
+                        m["address"] = helpers::format_address(static_cast<ea_t>(region.base + offset + i));
+
+                        // Format the found value for display
+                        if (value_type == "float")
+                        {
+                            float fv;
+                            std::memcpy(&fv, &buf[i], 4);
+                            m["value"] = fv;
+                        }
+                        else if (value_type == "double")
+                        {
+                            double dv;
+                            std::memcpy(&dv, &buf[i], 8);
+                            m["value"] = dv;
+                        }
+                        else if (value_type == "string")
+                        {
+                            m["value"] = std::string(buf.begin() + i, buf.begin() + i + value_size);
+                        }
+                        else
+                        {
+                            std::int64_t iv = 0;
+                            std::memcpy(&iv, &buf[i], std::min<std::size_t>(value_size, 8));
+                            m["value"] = iv;
+                        }
+                        m["region_protect"] = helpers::format_address(static_cast<ea_t>(region.protect));
+                        matches.push_back(std::move(m));
+                        ++found;
+                    }
+                }
+            }
+            else if (scan_mode == "range" && !search_bytes.empty() && !search_bytes_max.empty())
+            {
+                // Range scan for numeric types
+                for (std::size_t i = 0; i + value_size <= to_read && found < limit; i += value_size)
+                {
+                    bool in_range = false;
+                    if (value_type == "int32")
+                    {
+                        std::int32_t current_val, min_val, max_val;
+                        std::memcpy(&current_val, &buf[i], 4);
+                        std::memcpy(&min_val, search_bytes.data(), 4);
+                        std::memcpy(&max_val, search_bytes_max.data(), 4);
+                        in_range = (current_val >= min_val && current_val <= max_val);
+                        if (in_range)
+                        {
+                            json m;
+                            m["address"] = helpers::format_address(static_cast<ea_t>(region.base + offset + i));
+                            m["value"] = current_val;
+                            matches.push_back(std::move(m));
+                            ++found;
+                        }
+                    }
+                    else if (value_type == "float")
+                    {
+                        float current_val, min_val, max_val;
+                        std::memcpy(&current_val, &buf[i], 4);
+                        std::memcpy(&min_val, search_bytes.data(), 4);
+                        std::memcpy(&max_val, search_bytes_max.data(), 4);
+                        in_range = (current_val >= min_val && current_val <= max_val);
+                        if (in_range)
+                        {
+                            json m;
+                            m["address"] = helpers::format_address(static_cast<ea_t>(region.base + offset + i));
+                            m["value"] = current_val;
+                            matches.push_back(std::move(m));
+                            ++found;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    json result;
+    result["value_type"] = value_type;
+    result["scan_mode"] = scan_mode;
+    result["matches_found"] = found;
+    result["matches"] = std::move(matches);
+    return tool_result_t::ok(std::to_string(found) + OBFSTR(" matches found"), result);
+}
+
+tool_result_t driver_pointer_scan(const json& params)
+{
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
+
+    const std::string target_addr_str = params.value("target_address", "");
+    if (target_addr_str.empty())
+        return tool_result_t::error(OBFSTR("Missing required parameter: target_address"));
+
+    auto target_opt = helpers::parse_address(target_addr_str);
+    if (!target_opt)
+        return tool_result_t::error(OBFSTR("Invalid target_address"));
+
+    const std::uint64_t target = *target_opt;
+    const int max_depth = std::min(params.value("max_depth", 3), 7);
+    const std::uint64_t max_offset = params.value("max_offset", 0x1000);
+    const int limit = std::min(params.value("limit", 50), 500);
+
+    // Get module base for static pointer base reference
+    const std::uint64_t image_base = device->get_base_address();
+
+    // Enumerate all readable regions
+    auto regions = enumerate_all_memory_regions_paginated(
+        device.get(), 0x10000, 0x7FFFFFFFFFFF, false);
+
+    // Build a list of all pointer-aligned values in memory that point to target +/- max_offset
+    struct ptr_hit_t {
+        std::uint64_t address;      // where the pointer was found
+        std::uint64_t value;        // pointer value
+        std::int64_t offset;        // value - target
+        bool is_static;             // in a module's .data/.rdata section
+        std::string module_name;
+    };
+
+    auto find_pointers_to_range = [&](std::uint64_t range_start, std::uint64_t range_end,
+                                      int current_limit) -> std::vector<ptr_hit_t>
+    {
+        std::vector<ptr_hit_t> hits;
+        for (const auto& region : regions)
+        {
+            if (static_cast<int>(hits.size()) >= current_limit) break;
+            if (region.size == 0 || region.size > 0x10000000) continue;
+            if ((region.state & 0x1000) == 0) continue;
+            if ((region.protect & 0x01) || (region.protect & 0x100)) continue;
+
+            constexpr std::size_t CHUNK = 0x10000;
+            for (std::uint64_t off2 = 0; off2 < region.size && static_cast<int>(hits.size()) < current_limit; off2 += CHUNK)
+            {
+                const std::size_t to_read = std::min<std::size_t>(CHUNK, region.size - off2);
+                if (to_read < 8) continue;
+
+                std::vector<std::uint8_t> buf(to_read);
+                if (device->read_raw(region.base + off2, buf.data(), to_read) == 0)
+                    continue;
+
+                for (std::size_t i = 0; i + 8 <= to_read && static_cast<int>(hits.size()) < current_limit; i += 8)
+                {
+                    std::uint64_t val;
+                    std::memcpy(&val, &buf[i], 8);
+                    if (val >= range_start && val <= range_end)
+                    {
+                        ptr_hit_t hit;
+                        hit.address = region.base + off2 + i;
+                        hit.value = val;
+                        hit.offset = static_cast<std::int64_t>(val) - static_cast<std::int64_t>(range_start + max_offset);
+                        hit.is_static = false;
+                        hits.push_back(std::move(hit));
+                    }
+                }
+            }
+        }
+        return hits;
+    };
+
+    // Level 0: Find pointers to [target - max_offset, target + max_offset]
+    std::uint64_t range_lo = target > max_offset ? target - max_offset : 0;
+    std::uint64_t range_hi = target + max_offset;
+    auto level0 = find_pointers_to_range(range_lo, range_hi, limit * 10);
+
+    json chains = json::array();
+    int chain_count = 0;
+
+    // For each level-0 hit, try to identify if it's relative to a module base (static pointer)
+    for (auto& hit : level0)
+    {
+        if (chain_count >= limit) break;
+
+        json chain;
+        chain["depth"] = 1;
+        chain["base_address"] = helpers::format_address(static_cast<ea_t>(hit.address));
+        chain["pointer_value"] = helpers::format_address(static_cast<ea_t>(hit.value));
+        chain["final_offset"] = static_cast<std::int64_t>(hit.value - target);
+
+        // Check if the address is in a known module (= static pointer)
+        bool is_static = false;
+        voyager::device_t::peb_info peb{};
+        if (device->read_peb(peb) && peb.ldr_address != 0)
+        {
+            const std::uint64_t list_head = peb.ldr_address + 0x10;
+            std::uint64_t ldr_curr = device->read<std::uint64_t>(list_head);
+            int ldr_iter = 512;
+            while (ldr_curr != list_head && ldr_curr != 0 && ldr_iter-- > 0)
+            {
+                const std::uint64_t base = device->read<std::uint64_t>(ldr_curr + 0x30);
+                const std::uint32_t size = device->read<std::uint32_t>(ldr_curr + 0x40);
+                if (hit.address >= base && hit.address < base + size)
+                {
+                    is_static = true;
+                    chain["module"] = read_remote_unicode_ascii(device.get(),
+                        device->read<std::uint64_t>(ldr_curr + 0x60),
+                        device->read<std::uint16_t>(ldr_curr + 0x58), 520);
+                    chain["module_offset"] = helpers::format_address(static_cast<ea_t>(hit.address - base));
+                    break;
+                }
+                std::uint64_t n = device->read<std::uint64_t>(ldr_curr);
+                if (n == ldr_curr) break;
+                ldr_curr = n;
+            }
+        }
+
+        chain["is_static"] = is_static;
+        chains.push_back(std::move(chain));
+        ++chain_count;
+    }
+
+    json result;
+    result["target_address"] = helpers::format_address(static_cast<ea_t>(target));
+    result["max_depth"] = max_depth;
+    result["max_offset"] = max_offset;
+    result["chains_found"] = chain_count;
+    result["chains"] = std::move(chains);
+    result["note"] = OBFSTR("Static pointers (is_static=true) with module+offset are stable across "
+                            "restarts. Use module base + module_offset + final_offset to reach target.");
+    return tool_result_t::ok(std::to_string(chain_count) + OBFSTR(" pointer chains found"), result);
+}
+
+tool_result_t driver_enumerate_windows(const json& params)
+{
+    if (!device->is_connected())
+        return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
+
+    const std::uint32_t filter_pid = params.value("pid", device->get_process_id());
+    const bool include_children = params.value("include_children", true);
+    const int limit = std::min(params.value("limit", 200), 2000);
+
+    if (filter_pid == 0)
+        return tool_result_t::error(OBFSTR("No process attached and no pid specified."));
+
+    if (anti_re::is_self_target_pid(filter_pid))
+        return tool_result_t::error(OBFSTR("Refusing to enumerate windows of IDA host process."));
+
+    struct window_info_t {
+        HWND hwnd;
+        HWND parent;
+        DWORD pid;
+        DWORD tid;
+        char class_name[256];
+        char title[512];
+        RECT rect;
+        bool visible;
+        LONG style;
+        LONG ex_style;
+    };
+
+    std::vector<window_info_t> windows;
+
+    struct enum_ctx_t {
+        std::vector<window_info_t>* windows;
+        DWORD target_pid;
+        int limit;
+        bool include_children;
+    };
+
+    enum_ctx_t ctx_data;
+    ctx_data.windows = &windows;
+    ctx_data.target_pid = filter_pid;
+    ctx_data.limit = limit;
+    ctx_data.include_children = include_children;
+
+    auto enum_proc = [](HWND hwnd, LPARAM lparam) -> BOOL {
+        auto* ctx2 = reinterpret_cast<enum_ctx_t*>(lparam);
+        if (static_cast<int>(ctx2->windows->size()) >= ctx2->limit)
+            return FALSE;
+
+        DWORD wnd_pid = 0;
+        DWORD wnd_tid = GetWindowThreadProcessId(hwnd, &wnd_pid);
+        if (wnd_pid != ctx2->target_pid)
+            return TRUE;
+
+        window_info_t info{};
+        info.hwnd = hwnd;
+        info.parent = GetParent(hwnd);
+        info.pid = wnd_pid;
+        info.tid = wnd_tid;
+        GetClassNameA(hwnd, info.class_name, sizeof(info.class_name));
+        GetWindowTextA(hwnd, info.title, sizeof(info.title));
+        GetWindowRect(hwnd, &info.rect);
+        info.visible = IsWindowVisible(hwnd) != FALSE;
+        info.style = GetWindowLongA(hwnd, GWL_STYLE);
+        info.ex_style = GetWindowLongA(hwnd, GWL_EXSTYLE);
+        ctx2->windows->push_back(info);
+        return TRUE;
+    };
+
+    EnumWindows(enum_proc, reinterpret_cast<LPARAM>(&ctx_data));
+
+    json windows_arr = json::array();
+    for (const auto& w : windows)
+    {
+        json wj;
+        wj["hwnd"] = helpers::format_address(static_cast<ea_t>(reinterpret_cast<std::uintptr_t>(w.hwnd)));
+        wj["parent"] = helpers::format_address(static_cast<ea_t>(reinterpret_cast<std::uintptr_t>(w.parent)));
+        wj["tid"] = w.tid;
+        wj["class_name"] = w.class_name;
+        wj["title"] = w.title;
+        wj["visible"] = w.visible;
+        wj["rect"] = { {"left", w.rect.left}, {"top", w.rect.top},
+                       {"right", w.rect.right}, {"bottom", w.rect.bottom} };
+        wj["style"] = helpers::format_address(static_cast<ea_t>(w.style));
+        wj["ex_style"] = helpers::format_address(static_cast<ea_t>(w.ex_style));
+        windows_arr.push_back(std::move(wj));
+    }
+
+    json result;
+    result["pid"] = filter_pid;
+    result["window_count"] = windows.size();
+    result["windows"] = std::move(windows_arr);
+    return tool_result_t::ok(std::to_string(windows.size()) + OBFSTR(" windows found for PID ") +
+                             std::to_string(filter_pid), result);
+}
+
+tool_result_t driver_walk_stack(const json& params)
+{
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
+
+    auto tid_opt = parse_tid_param(params);
+    if (!tid_opt)
+        return tool_result_t::error(OBFSTR("Missing or invalid tid parameter."));
+
+    const std::uint32_t tid = *tid_opt;
+    const int max_frames = std::min(params.value("max_frames", 64), 256);
+
+    voyager::device_t::thread_context ctx{};
+    if (!device->get_thread_context(tid, ctx))
+        return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
+
+    // x64 stack walk: follow RBP chain and also use return addresses
+    // RSP points to current stack position, RBP is frame pointer (when used)
+    const std::uint64_t rsp = ctx.rsp;
+    const std::uint64_t rbp = ctx.rbp;
+    const std::uint64_t rip = ctx.rip;
+
+    // Build module list for symbol resolution
+    struct mod_info_t {
+        std::uint64_t base;
+        std::uint32_t size;
+        std::string name;
+    };
+    std::vector<mod_info_t> modules;
+
+    voyager::device_t::peb_info peb{};
+    if (device->read_peb(peb) && peb.ldr_address != 0)
+    {
+        const std::uint64_t list_head = peb.ldr_address + 0x10;
+        std::uint64_t ldr_curr = device->read<std::uint64_t>(list_head);
+        int ldr_iter = 1024;
+        while (ldr_curr != list_head && ldr_curr != 0 && ldr_iter-- > 0)
+        {
+            mod_info_t mi;
+            mi.base = device->read<std::uint64_t>(ldr_curr + 0x30);
+            mi.size = device->read<std::uint32_t>(ldr_curr + 0x40);
+            mi.name = read_remote_unicode_ascii(device.get(),
+                device->read<std::uint64_t>(ldr_curr + 0x60),
+                device->read<std::uint16_t>(ldr_curr + 0x58), 520);
+            if (mi.base != 0 && mi.size != 0)
+                modules.push_back(std::move(mi));
+            std::uint64_t n = device->read<std::uint64_t>(ldr_curr);
+            if (n == ldr_curr) break;
+            ldr_curr = n;
+        }
+    }
+
+    auto resolve_module = [&](std::uint64_t addr) -> std::pair<std::string, std::uint64_t> {
+        for (const auto& m : modules)
+        {
+            if (addr >= m.base && addr < m.base + m.size)
+                return {m.name, addr - m.base};
+        }
+        return {"", 0};
+    };
+
+    json frames = json::array();
+
+    // Frame 0: current RIP
+    {
+        json f;
+        f["frame"] = 0;
+        f["rip"] = helpers::format_address(static_cast<ea_t>(rip));
+        f["rsp"] = helpers::format_address(static_cast<ea_t>(rsp));
+        f["rbp"] = helpers::format_address(static_cast<ea_t>(rbp));
+        auto [mod, off] = resolve_module(rip);
+        if (!mod.empty()) { f["module"] = mod; f["offset"] = helpers::format_address(static_cast<ea_t>(off)); }
+        frames.push_back(std::move(f));
+    }
+
+    // Heuristic stack walk: scan RSP upward for return addresses
+    // In x64, return addresses are on the stack; we check if each QWORD
+    // points into a known executable module
+    constexpr std::size_t STACK_READ_SIZE = 0x2000; // 8KB of stack
+    std::vector<std::uint8_t> stack_buf(STACK_READ_SIZE);
+    const std::size_t stack_read = device->read_raw(rsp, stack_buf.data(), STACK_READ_SIZE);
+
+    int frame_idx = 1;
+    std::set<std::uint64_t> seen_addresses; // avoid duplicates
+
+    for (std::size_t i = 0; i + 8 <= stack_read && frame_idx < max_frames; i += 8)
+    {
+        std::uint64_t candidate;
+        std::memcpy(&candidate, &stack_buf[i], 8);
+
+        // Check if this looks like a valid code address in a module
+        if (candidate < 0x10000 || candidate > 0x7FFFFFFFFFFF)
+            continue;
+
+        auto [mod, off] = resolve_module(candidate);
+        if (mod.empty()) continue;
+        if (seen_addresses.count(candidate)) continue;
+        seen_addresses.insert(candidate);
+
+        // Verify it's preceded by a CALL instruction (heuristic)
+        // Read a few bytes before the candidate address to check for call opcodes
+        std::uint8_t pre_bytes[8] = {};
+        device->read_raw(candidate - 8, pre_bytes, 8);
+
+        // Common call patterns: E8 xx xx xx xx (near call at -5)
+        // FF 15 (indirect call at -6), FF D0-FF (register call at -2)
+        bool looks_like_ret_addr = false;
+        if (pre_bytes[3] == 0xE8) looks_like_ret_addr = true;       // call rel32
+        if (pre_bytes[2] == 0xFF && (pre_bytes[3] & 0x38) == 0x10)  // call [mem]
+            looks_like_ret_addr = true;
+        if (pre_bytes[6] == 0xFF && pre_bytes[7] >= 0xD0 && pre_bytes[7] <= 0xD7)
+            looks_like_ret_addr = true; // call reg
+
+        if (!looks_like_ret_addr) continue;
+
+        json f;
+        f["frame"] = frame_idx;
+        f["return_address"] = helpers::format_address(static_cast<ea_t>(candidate));
+        f["stack_offset"] = helpers::format_address(static_cast<ea_t>(rsp + i));
+        f["module"] = mod;
+        f["offset"] = helpers::format_address(static_cast<ea_t>(off));
+        frames.push_back(std::move(f));
+        ++frame_idx;
+    }
+
+    json result;
+    result["thread_id"] = tid;
+    result["rip"] = helpers::format_address(static_cast<ea_t>(rip));
+    result["rsp"] = helpers::format_address(static_cast<ea_t>(rsp));
+    result["rbp"] = helpers::format_address(static_cast<ea_t>(rbp));
+    result["frame_count"] = frames.size();
+    result["frames"] = std::move(frames);
+    result["method"] = OBFSTR("heuristic_stack_scan");
+    return tool_result_t::ok(std::to_string(result["frame_count"].get<int>()) +
+                             OBFSTR(" stack frames for TID ") + std::to_string(tid), result);
+}
+
+tool_result_t driver_assemble(const json& params)
+{
+    const std::string assembly_text = params.value("assembly", "");
+    if (assembly_text.empty())
+        return tool_result_t::error(OBFSTR("Missing required parameter: assembly"));
+
+    const std::uint64_t address = [&]() -> std::uint64_t {
+        if (params.contains("address"))
+        {
+            auto a = helpers::parse_address(params["address"].get<std::string>());
+            return a ? *a : 0x140000000ULL;
+        }
+        return 0x140000000ULL;
+    }();
+
+    // Simple x86-64 assembler for the most common instructions
+    // Supports: NOP, RET, INT3, PUSH reg, POP reg, MOV reg/imm, JMP rel, CALL rel,
+    // XOR reg,reg, SUB RSP, ADD RSP
+    std::vector<std::uint8_t> output;
+    std::string error_msg;
+
+    auto trim = [](const std::string& s) -> std::string {
+        const auto start = s.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos) return "";
+        return s.substr(start, s.find_last_not_of(" \t\r\n") - start + 1);
+    };
+
+    auto to_upper = [](std::string s) -> std::string {
+        std::transform(s.begin(), s.end(), s.begin(), ::toupper);
+        return s;
+    };
+
+    auto reg_to_idx = [](const std::string& reg) -> int {
+        if (reg == "RAX" || reg == "EAX" || reg == "AX" || reg == "AL") return 0;
+        if (reg == "RCX" || reg == "ECX" || reg == "CX" || reg == "CL") return 1;
+        if (reg == "RDX" || reg == "EDX" || reg == "DX" || reg == "DL") return 2;
+        if (reg == "RBX" || reg == "EBX" || reg == "BX" || reg == "BL") return 3;
+        if (reg == "RSP" || reg == "ESP" || reg == "SP") return 4;
+        if (reg == "RBP" || reg == "EBP" || reg == "BP") return 5;
+        if (reg == "RSI" || reg == "ESI" || reg == "SI") return 6;
+        if (reg == "RDI" || reg == "EDI" || reg == "DI") return 7;
+        if (reg == "R8" || reg == "R8D" || reg == "R8W" || reg == "R8B") return 8;
+        if (reg == "R9" || reg == "R9D") return 9;
+        if (reg == "R10" || reg == "R10D") return 10;
+        if (reg == "R11" || reg == "R11D") return 11;
+        if (reg == "R12" || reg == "R12D") return 12;
+        if (reg == "R13" || reg == "R13D") return 13;
+        if (reg == "R14" || reg == "R14D") return 14;
+        if (reg == "R15" || reg == "R15D") return 15;
+        return -1;
+    };
+
+    auto is_reg64 = [](const std::string& reg) -> bool {
+        return reg.size() >= 2 && (reg[0] == 'R' || (reg[0] == 'R' && std::isdigit(reg[1])));
+    };
+
+    // Split input into lines
+    std::istringstream stream(assembly_text);
+    std::string line;
+    int line_num = 0;
+    std::uint64_t current_addr = address;
+
+    while (std::getline(stream, line))
+    {
+        ++line_num;
+        line = trim(line);
+        if (line.empty() || line[0] == ';') continue;
+
+        // Remove inline comments
+        auto semi_pos = line.find(';');
+        if (semi_pos != std::string::npos)
+            line = trim(line.substr(0, semi_pos));
+
+        std::string upper = to_upper(line);
+
+        if (upper == "NOP")
+        {
+            output.push_back(0x90);
+        }
+        else if (upper == "RET" || upper == "RETN")
+        {
+            output.push_back(0xC3);
+        }
+        else if (upper == "INT3" || upper == "INT 3")
+        {
+            output.push_back(0xCC);
+        }
+        else if (upper.substr(0, 4) == "PUSH")
+        {
+            std::string operand = trim(upper.substr(4));
+            int idx = reg_to_idx(operand);
+            if (idx < 0) { error_msg = "Unknown register in PUSH at line " + std::to_string(line_num); break; }
+            if (idx >= 8) { output.push_back(0x41); idx -= 8; }
+            output.push_back(static_cast<std::uint8_t>(0x50 + idx));
+        }
+        else if (upper.substr(0, 3) == "POP")
+        {
+            std::string operand = trim(upper.substr(3));
+            int idx = reg_to_idx(operand);
+            if (idx < 0) { error_msg = "Unknown register in POP at line " + std::to_string(line_num); break; }
+            if (idx >= 8) { output.push_back(0x41); idx -= 8; }
+            output.push_back(static_cast<std::uint8_t>(0x58 + idx));
+        }
+        else if (upper.substr(0, 3) == "XOR")
+        {
+            // XOR REG, REG (zeroing idiom)
+            auto comma = upper.find(',');
+            if (comma == std::string::npos) { error_msg = "Invalid XOR at line " + std::to_string(line_num); break; }
+            std::string op1 = trim(upper.substr(3, comma - 3));
+            std::string op2 = trim(upper.substr(comma + 1));
+            int r1 = reg_to_idx(op1), r2 = reg_to_idx(op2);
+            if (r1 < 0 || r2 < 0) { error_msg = "Unknown register in XOR at line " + std::to_string(line_num); break; }
+
+            if (is_reg64(op1))
+            {
+                std::uint8_t rex = 0x48;
+                if (r1 >= 8) { rex |= 0x04; r1 -= 8; }
+                if (r2 >= 8) { rex |= 0x01; r2 -= 8; }
+                output.push_back(rex);
+            }
+            else
+            {
+                if (r1 >= 8 || r2 >= 8)
+                {
+                    std::uint8_t rex = 0x40;
+                    if (r1 >= 8) { rex |= 0x04; r1 -= 8; }
+                    if (r2 >= 8) { rex |= 0x01; r2 -= 8; }
+                    output.push_back(rex);
+                }
+            }
+            output.push_back(0x31);
+            output.push_back(static_cast<std::uint8_t>(0xC0 | (r1 << 3) | r2));
+        }
+        else if (upper.substr(0, 3) == "MOV")
+        {
+            // MOV REG, IMM64
+            auto comma = upper.find(',');
+            if (comma == std::string::npos) { error_msg = "Invalid MOV at line " + std::to_string(line_num); break; }
+            std::string dest = trim(upper.substr(3, comma - 3));
+            std::string src = trim(upper.substr(comma + 1));
+            int rd = reg_to_idx(dest);
+            if (rd < 0) { error_msg = "Unknown register in MOV at line " + std::to_string(line_num); break; }
+
+            // Try to parse src as immediate
+            std::uint64_t imm = 0;
+            try {
+                if (src.size() > 2 && src[0] == '0' && (src[1] == 'X' || src[1] == 'x'))
+                    imm = std::stoull(src.substr(2), nullptr, 16);
+                else
+                    imm = std::stoull(src, nullptr, 0);
+            } catch (...) {
+                error_msg = "Invalid immediate in MOV at line " + std::to_string(line_num);
+                break;
+            }
+
+            if (is_reg64(dest))
+            {
+                // REX.W + B8+rd io
+                std::uint8_t rex = 0x48;
+                int r = rd;
+                if (r >= 8) { rex |= 0x01; r -= 8; }
+                output.push_back(rex);
+                output.push_back(static_cast<std::uint8_t>(0xB8 + r));
+                for (int b = 0; b < 8; ++b)
+                    output.push_back(static_cast<std::uint8_t>((imm >> (b * 8)) & 0xFF));
+            }
+            else
+            {
+                // B8+rd id (32-bit)
+                int r = rd;
+                if (r >= 8) { output.push_back(0x41); r -= 8; }
+                output.push_back(static_cast<std::uint8_t>(0xB8 + r));
+                for (int b = 0; b < 4; ++b)
+                    output.push_back(static_cast<std::uint8_t>((imm >> (b * 8)) & 0xFF));
+            }
+        }
+        else if (upper.substr(0, 3) == "JMP" || upper.substr(0, 4) == "CALL")
+        {
+            bool is_call = upper[0] == 'C';
+            std::string operand = trim(upper.substr(is_call ? 4 : 3));
+
+            // Try as register
+            int reg = reg_to_idx(operand);
+            if (reg >= 0)
+            {
+                if (reg >= 8)
+                {
+                    output.push_back(0x41);
+                    reg -= 8;
+                }
+                output.push_back(0xFF);
+                output.push_back(static_cast<std::uint8_t>((is_call ? 0xD0 : 0xE0) + reg));
+            }
+            else
+            {
+                // Try as absolute address -> encode as relative
+                std::uint64_t target_addr = 0;
+                try {
+                    if (operand.size() > 2 && operand[0] == '0' && (operand[1] == 'X' || operand[1] == 'x'))
+                        target_addr = std::stoull(operand.substr(2), nullptr, 16);
+                    else
+                        target_addr = std::stoull(operand, nullptr, 0);
+                } catch (...) {
+                    error_msg = std::string(is_call ? "CALL" : "JMP") + " invalid operand at line " + std::to_string(line_num);
+                    break;
+                }
+
+                std::uint64_t next_rip = current_addr + output.size() + 5; // 5 = opcode(1) + rel32(4)
+                std::int64_t rel = static_cast<std::int64_t>(target_addr) - static_cast<std::int64_t>(next_rip);
+                if (rel < INT32_MIN || rel > INT32_MAX)
+                {
+                    error_msg = "Relative offset too large for " + std::string(is_call ? "CALL" : "JMP") +
+                                " at line " + std::to_string(line_num);
+                    break;
+                }
+
+                output.push_back(is_call ? 0xE8 : 0xE9);
+                std::int32_t rel32 = static_cast<std::int32_t>(rel);
+                for (int b = 0; b < 4; ++b)
+                    output.push_back(static_cast<std::uint8_t>((rel32 >> (b * 8)) & 0xFF));
+            }
+        }
+        else if (upper.substr(0, 7) == "SUB RSP")
+        {
+            std::string operand = trim(upper.substr(8));
+            std::uint32_t imm = 0;
+            try {
+                if (operand.size() > 2 && operand[0] == '0' && (operand[1] == 'X' || operand[1] == 'x'))
+                    imm = static_cast<std::uint32_t>(std::stoul(operand.substr(2), nullptr, 16));
+                else
+                    imm = static_cast<std::uint32_t>(std::stoul(operand, nullptr, 0));
+            } catch (...) { error_msg = "Invalid immediate in SUB RSP at line " + std::to_string(line_num); break; }
+
+            output.push_back(0x48);
+            if (imm <= 0x7F) {
+                output.push_back(0x83);
+                output.push_back(0xEC);
+                output.push_back(static_cast<std::uint8_t>(imm));
+            } else {
+                output.push_back(0x81);
+                output.push_back(0xEC);
+                for (int b = 0; b < 4; ++b)
+                    output.push_back(static_cast<std::uint8_t>((imm >> (b * 8)) & 0xFF));
+            }
+        }
+        else if (upper.substr(0, 7) == "ADD RSP")
+        {
+            std::string operand = trim(upper.substr(8));
+            std::uint32_t imm = 0;
+            try {
+                if (operand.size() > 2 && operand[0] == '0' && (operand[1] == 'X' || operand[1] == 'x'))
+                    imm = static_cast<std::uint32_t>(std::stoul(operand.substr(2), nullptr, 16));
+                else
+                    imm = static_cast<std::uint32_t>(std::stoul(operand, nullptr, 0));
+            } catch (...) { error_msg = "Invalid immediate in ADD RSP at line " + std::to_string(line_num); break; }
+
+            output.push_back(0x48);
+            if (imm <= 0x7F) {
+                output.push_back(0x83);
+                output.push_back(0xC4);
+                output.push_back(static_cast<std::uint8_t>(imm));
+            } else {
+                output.push_back(0x81);
+                output.push_back(0xC4);
+                for (int b = 0; b < 4; ++b)
+                    output.push_back(static_cast<std::uint8_t>((imm >> (b * 8)) & 0xFF));
+            }
+        }
+        else
+        {
+            error_msg = "Unsupported instruction at line " + std::to_string(line_num) + ": " + line +
+                        ". Supported: NOP, RET, INT3, PUSH, POP, XOR, MOV, JMP, CALL, SUB RSP, ADD RSP.";
+            break;
+        }
+    }
+
+    if (!error_msg.empty())
+        return tool_result_t::error(error_msg);
+
+    if (output.empty())
+        return tool_result_t::error(OBFSTR("No instructions assembled"));
+
+    // Format output hex
+    std::ostringstream hex_ss;
+    for (std::size_t i = 0; i < output.size(); ++i)
+    {
+        if (i > 0) hex_ss << " ";
+        hex_ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(output[i]);
+    }
+
+    json result;
+    result["address"] = helpers::format_address(static_cast<ea_t>(address));
+    result["size"] = output.size();
+    result["hex"] = hex_ss.str();
+    result["bytes"] = json::array();
+    for (auto b : output) result["bytes"].push_back(b);
+
+    // If write_to param is specified, write the assembled bytes to target process memory
+    if (params.contains("write_to"))
+    {
+        auto write_addr = helpers::parse_address(params["write_to"].get<std::string>());
+        if (write_addr && device->is_connected() && device->get_process_id() != 0)
+        {
+            anti_re::guard_driver_self_access(device->get_process_id(), *write_addr, output.size());
+            std::size_t written = device->write_raw(*write_addr, output.data(), output.size());
+            result["written_to"] = helpers::format_address(static_cast<ea_t>(*write_addr));
+            result["bytes_written"] = written;
+        }
+    }
+
+    return tool_result_t::ok(std::to_string(output.size()) + OBFSTR(" bytes assembled"), result);
+}
+
+// Memory snapshot storage for differential comparison
+static std::map<std::string, std::vector<std::uint8_t>> s_memory_snapshots;
+static std::mutex s_snapshot_mutex;
+
+tool_result_t driver_compare_memory_snapshot(const json& params)
+{
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
+
+    const std::string operation = params.value("operation", "take");
+    const std::string snapshot_name = params.value("name", "default");
+
+    if (operation == "take")
+    {
+        if (!params.contains("address"))
+            return tool_result_t::error(OBFSTR("Missing required parameter: address"));
+
+        auto addr_opt = helpers::parse_address(params["address"].get<std::string>());
+        if (!addr_opt) return tool_result_t::error(OBFSTR("Invalid address"));
+
+        std::size_t size = params.value("size", 4096);
+        if (size > 0x100000) return tool_result_t::error(OBFSTR("Size too large (max 1MB)"));
+
+        std::vector<std::uint8_t> buffer(size);
+        std::size_t read = device->read_raw(*addr_opt, buffer.data(), size);
+        if (read == 0) return tool_result_t::error(OBFSTR("Failed to read memory for snapshot"));
+        buffer.resize(read);
+
+        std::string key = snapshot_name + "|" + helpers::format_address(*addr_opt) + "|" + std::to_string(read);
+        {
+            std::lock_guard<std::mutex> lock(s_snapshot_mutex);
+            s_memory_snapshots[key] = std::move(buffer);
+        }
+
+        json result;
+        result["operation"] = "take";
+        result["name"] = snapshot_name;
+        result["address"] = helpers::format_address(*addr_opt);
+        result["size"] = read;
+        result["snapshot_key"] = key;
+        return tool_result_t::ok(OBFSTR("Snapshot taken: ") + key, result);
+    }
+    else if (operation == "compare")
+    {
+        if (!params.contains("address"))
+            return tool_result_t::error(OBFSTR("Missing required parameter: address"));
+
+        auto addr_opt = helpers::parse_address(params["address"].get<std::string>());
+        if (!addr_opt) return tool_result_t::error(OBFSTR("Invalid address"));
+
+        // Find the matching snapshot
+        std::vector<std::uint8_t> old_snapshot;
+        std::string found_key;
+        {
+            std::lock_guard<std::mutex> lock(s_snapshot_mutex);
+            for (const auto& [k, v] : s_memory_snapshots)
+            {
+                if (k.find(snapshot_name + "|") == 0 && k.find(helpers::format_address(*addr_opt)) != std::string::npos)
+                {
+                    old_snapshot = v;
+                    found_key = k;
+                    break;
+                }
+            }
+        }
+
+        if (old_snapshot.empty())
+            return tool_result_t::error(OBFSTR("No snapshot found with name '") + snapshot_name +
+                                        OBFSTR("' at address ") + helpers::format_address(*addr_opt));
+
+        const std::size_t size = old_snapshot.size();
+        std::vector<std::uint8_t> current(size);
+        std::size_t read = device->read_raw(*addr_opt, current.data(), size);
+        if (read == 0) return tool_result_t::error(OBFSTR("Failed to read current memory for comparison"));
+
+        // Find differences
+        json diffs = json::array();
+        int diff_count = 0;
+        const int max_diffs = std::min(params.value("max_diffs", 200), 5000);
+
+        for (std::size_t i = 0; i < std::min(old_snapshot.size(), static_cast<std::size_t>(read)); ++i)
+        {
+            if (old_snapshot[i] != current[i])
+            {
+                if (diff_count < max_diffs)
+                {
+                    json d;
+                    d["offset"] = i;
+                    d["address"] = helpers::format_address(static_cast<ea_t>(*addr_opt + i));
+                    d["old_value"] = old_snapshot[i];
+                    d["new_value"] = current[i];
+                    diffs.push_back(std::move(d));
+                }
+                ++diff_count;
+            }
+        }
+
+        json result;
+        result["operation"] = "compare";
+        result["name"] = snapshot_name;
+        result["address"] = helpers::format_address(*addr_opt);
+        result["snapshot_size"] = old_snapshot.size();
+        result["current_read"] = read;
+        result["total_diffs"] = diff_count;
+        result["identical"] = diff_count == 0;
+        result["diffs"] = std::move(diffs);
+        return tool_result_t::ok(diff_count == 0
+            ? OBFSTR("Memory identical to snapshot")
+            : std::to_string(diff_count) + OBFSTR(" bytes changed since snapshot"), result);
+    }
+    else if (operation == "list")
+    {
+        std::lock_guard<std::mutex> lock(s_snapshot_mutex);
+        json snapshots = json::array();
+        for (const auto& [k, v] : s_memory_snapshots)
+        {
+            json s;
+            s["key"] = k;
+            s["size"] = v.size();
+            snapshots.push_back(std::move(s));
+        }
+        json result;
+        result["snapshots"] = std::move(snapshots);
+        return tool_result_t::ok(std::to_string(s_memory_snapshots.size()) + OBFSTR(" snapshots stored"), result);
+    }
+    else if (operation == "clear")
+    {
+        std::lock_guard<std::mutex> lock(s_snapshot_mutex);
+        int count = static_cast<int>(s_memory_snapshots.size());
+        s_memory_snapshots.clear();
+        return tool_result_t::ok(std::to_string(count) + OBFSTR(" snapshots cleared"));
+    }
+    return tool_result_t::error(OBFSTR("Invalid operation. Use 'take', 'compare', 'list', or 'clear'."));
+}
+
+tool_result_t driver_find_references(const json& params)
+{
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
+
+    const std::string target_str = params.value("target_address", "");
+    if (target_str.empty())
+        return tool_result_t::error(OBFSTR("Missing required parameter: target_address"));
+
+    auto target_opt = helpers::parse_address(target_str);
+    if (!target_opt) return tool_result_t::error(OBFSTR("Invalid target_address"));
+
+    const std::uint64_t target = *target_opt;
+    const int limit = std::min(params.value("limit", 100), 5000);
+    const bool scan_code = params.value("scan_code", true);
+    const bool scan_data = params.value("scan_data", true);
+
+    // Prepare the target as bytes for scanning
+    std::uint8_t target_bytes[8];
+    std::memcpy(target_bytes, &target, 8);
+
+    auto regions = enumerate_all_memory_regions_paginated(
+        device.get(), 0x10000, 0x7FFFFFFFFFFF, false);
+
+    json refs = json::array();
+    int found = 0;
+
+    for (const auto& region : regions)
+    {
+        if (found >= limit) break;
+        if (region.size == 0 || region.size > 0x10000000) continue;
+        if ((region.state & 0x1000) == 0) continue;
+        if ((region.protect & 0x01) || (region.protect & 0x100)) continue;
+
+        bool is_exec = (region.protect & 0x10) || (region.protect & 0x20) ||
+                       (region.protect & 0x40) || (region.protect & 0x80);
+
+        if (is_exec && !scan_code) continue;
+        if (!is_exec && !scan_data) continue;
+
+        constexpr std::size_t CHUNK = 0x10000;
+        for (std::uint64_t off3 = 0; off3 < region.size && found < limit; off3 += CHUNK)
+        {
+            const std::size_t to_read = std::min<std::size_t>(CHUNK, region.size - off3);
+            if (to_read < 8) continue;
+
+            std::vector<std::uint8_t> buf(to_read);
+            if (device->read_raw(region.base + off3, buf.data(), to_read) == 0)
+                continue;
+
+            // Scan for 8-byte pointer matches
+            for (std::size_t i = 0; i + 8 <= to_read && found < limit; ++i)
+            {
+                if (std::memcmp(&buf[i], target_bytes, 8) == 0)
+                {
+                    json ref;
+                    ref["address"] = helpers::format_address(static_cast<ea_t>(region.base + off3 + i));
+                    ref["type"] = is_exec ? "code" : "data";
+                    ref["region_base"] = helpers::format_address(static_cast<ea_t>(region.base));
+                    ref["protection"] = helpers::format_address(static_cast<ea_t>(region.protect));
+                    refs.push_back(std::move(ref));
+                    ++found;
+                }
+            }
+
+            // Also scan for 4-byte RIP-relative references in code sections
+            if (is_exec && scan_code)
+            {
+                for (std::size_t i = 0; i + 4 <= to_read && found < limit; ++i)
+                {
+                    std::int32_t rel32;
+                    std::memcpy(&rel32, &buf[i], 4);
+                    std::uint64_t effective = region.base + off3 + i + 4 + rel32;
+                    if (effective == target)
+                    {
+                        // Check if preceded by a RIP-relative opcode (LEA, MOV, CALL, etc.)
+                        if (i >= 1)
+                        {
+                            std::uint8_t prev = buf[i - 1];
+                            // Common: 0x8D (LEA), 0x8B (MOV), 0xE8/0xE9 handled above
+                            if (prev == 0x8D || prev == 0x8B || prev == 0x05 || prev == 0x0D ||
+                                prev == 0x15 || prev == 0x1D || prev == 0x25 || prev == 0x2D ||
+                                prev == 0x35 || prev == 0x3D)
+                            {
+                                json ref;
+                                ref["address"] = helpers::format_address(
+                                    static_cast<ea_t>(region.base + off3 + i - 1));
+                                ref["type"] = "rip_relative";
+                                ref["displacement"] = rel32;
+                                refs.push_back(std::move(ref));
+                                ++found;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    json result;
+    result["target_address"] = helpers::format_address(static_cast<ea_t>(target));
+    result["references_found"] = found;
+    result["references"] = std::move(refs);
+    return tool_result_t::ok(std::to_string(found) + OBFSTR(" references to ") +
+                             helpers::format_address(static_cast<ea_t>(target)), result);
+}
+
+tool_result_t driver_read_teb(const json& params)
+{
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
+
+    auto tid_opt = parse_tid_param(params);
+    if (!tid_opt)
+        return tool_result_t::error(OBFSTR("Missing or invalid tid parameter."));
+
+    const std::uint32_t tid = *tid_opt;
+
+    voyager::device_t::thread_context ctx{};
+    if (!device->get_thread_context(tid, ctx))
+        return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
+
+    const std::uint64_t teb_addr = ctx.kernel_gs_base;
+    if (teb_addr == 0)
+        return tool_result_t::error(OBFSTR("TEB address is null"));
+
+    // Read key TEB fields (Windows x64 layout)
+    json teb;
+    teb["teb_address"] = helpers::format_address(static_cast<ea_t>(teb_addr));
+    teb["thread_id"] = tid;
+
+    // NT_TIB (offset 0x00)
+    teb["exception_list"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x00)));
+    teb["stack_base"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x08)));
+    teb["stack_limit"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x10)));
+    teb["sub_system_tib"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x18)));
+    teb["fiber_data"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x20)));
+    teb["arbitrary_user_pointer"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x28)));
+    teb["self"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x30)));
+
+    // Key TEB fields
+    teb["environment_pointer"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x38)));
+    teb["client_id_process"] = device->read<std::uint64_t>(teb_addr + 0x40);
+    teb["client_id_thread"] = device->read<std::uint64_t>(teb_addr + 0x48);
+    teb["active_rpc_handle"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x50)));
+    teb["tls_pointer"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x58)));
+    teb["peb_address"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x60)));
+    teb["last_error_value"] = device->read<std::uint32_t>(teb_addr + 0x68);
+    teb["count_of_owned_critical_sections"] = device->read<std::uint32_t>(teb_addr + 0x6C);
+
+    // TLS slots (offset 0x1480 for TlsSlots, 0x1780 for TlsExpansionSlots)
+    json tls_slots = json::array();
+    for (int i = 0; i < 64; ++i)
+    {
+        std::uint64_t slot_val = device->read<std::uint64_t>(teb_addr + 0x1480 + i * 8);
+        if (slot_val != 0)
+        {
+            json slot;
+            slot["index"] = i;
+            slot["value"] = helpers::format_address(static_cast<ea_t>(slot_val));
+            tls_slots.push_back(std::move(slot));
+        }
+    }
+    teb["active_tls_slots"] = std::move(tls_slots);
+
+    // Stack committed/reserved
+    std::uint64_t dealloc_stack = device->read<std::uint64_t>(teb_addr + 0x1478);
+    teb["deallocation_stack"] = helpers::format_address(static_cast<ea_t>(dealloc_stack));
+
+    // Compute stack usage
+    std::uint64_t stack_base_val = device->read<std::uint64_t>(teb_addr + 0x08);
+    std::uint64_t stack_limit_val = device->read<std::uint64_t>(teb_addr + 0x10);
+    if (stack_base_val > stack_limit_val)
+        teb["stack_size"] = stack_base_val - stack_limit_val;
+
+    json result;
+    result["teb"] = std::move(teb);
+    return tool_result_t::ok(OBFSTR("TEB read for TID ") + std::to_string(tid), result);
+}
+
+tool_result_t driver_map_peb_modules(const json& params)
+{
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
+
+    const std::string order = params.value("order", "all"); // load, memory, init, all
+    const std::string filter = to_lower_ascii_copy(params.value("filter", ""));
+
+    voyager::device_t::peb_info peb{};
+    if (!device->read_peb(peb) || peb.ldr_address == 0)
+        return tool_result_t::error(OBFSTR("Failed to read PEB or LDR address is null"));
+
+    // PEB_LDR_DATA offsets:
+    // +0x10 InLoadOrderModuleList
+    // +0x20 InMemoryOrderModuleList
+    // +0x30 InInitializationOrderModuleList
+
+    struct ldr_entry_offsets_t {
+        std::uint64_t list_head_offset;
+        std::uint64_t base_dll_field_offset;  // Offset from Flink to DllBase within LDR_DATA_TABLE_ENTRY
+        std::string name;
+    };
+
+    std::vector<ldr_entry_offsets_t> lists_to_walk;
+
+    if (order == "load" || order == "all")
+        lists_to_walk.push_back({0x10, 0x30, "InLoadOrder"});
+    if (order == "memory" || order == "all")
+        lists_to_walk.push_back({0x20, 0x20, "InMemoryOrder"}); // base at -0x10 from entry
+    if (order == "init" || order == "all")
+        lists_to_walk.push_back({0x30, 0x10, "InInitializationOrder"}); // base at -0x20 from entry
+
+    json all_lists;
+
+    for (const auto& list_info : lists_to_walk)
+    {
+        const std::uint64_t list_head = peb.ldr_address + list_info.list_head_offset;
+        std::uint64_t current = device->read<std::uint64_t>(list_head);
+
+        json modules_arr = json::array();
+        int iter = 0;
+        constexpr int MAX_ITER = 1024;
+
+        while (current != 0 && current != list_head && iter++ < MAX_ITER)
+        {
+            // Compute the LDR_DATA_TABLE_ENTRY base from the list entry
+            // InLoadOrder: entry IS the LDR_DATA_TABLE_ENTRY
+            // InMemoryOrder: entry is at offset +0x10 in the LDR_DATA_TABLE_ENTRY
+            // InInitOrder: entry is at offset +0x20 in the LDR_DATA_TABLE_ENTRY
+            std::uint64_t ldr_entry;
+            if (list_info.list_head_offset == 0x10)
+                ldr_entry = current;
+            else if (list_info.list_head_offset == 0x20)
+                ldr_entry = current - 0x10;
+            else
+                ldr_entry = current - 0x20;
+
+            const std::uint64_t base = device->read<std::uint64_t>(ldr_entry + 0x30);
+            const std::uint64_t entry_point = device->read<std::uint64_t>(ldr_entry + 0x38);
+            const std::uint32_t size = device->read<std::uint32_t>(ldr_entry + 0x40);
+
+            const std::string name = read_remote_unicode_ascii(device.get(),
+                device->read<std::uint64_t>(ldr_entry + 0x60),
+                device->read<std::uint16_t>(ldr_entry + 0x58), 520);
+
+            const std::string path = read_remote_unicode_ascii(device.get(),
+                device->read<std::uint64_t>(ldr_entry + 0x50),
+                device->read<std::uint16_t>(ldr_entry + 0x48), 1024);
+
+            const std::uint32_t flags = device->read<std::uint32_t>(ldr_entry + 0x68);
+            const std::uint16_t load_count = device->read<std::uint16_t>(ldr_entry + 0x70);
+            const std::uint16_t tls_index = device->read<std::uint16_t>(ldr_entry + 0x72);
+
+            if (base == 0 && name.empty())
+            {
+                std::uint64_t next = device->read<std::uint64_t>(current);
+                if (next == current) break;
+                current = next;
+                continue;
+            }
+
+            if (!filter.empty())
+            {
+                std::string lower_name = to_lower_ascii_copy(name);
+                std::string lower_path = to_lower_ascii_copy(path);
+                if (lower_name.find(filter) == std::string::npos &&
+                    lower_path.find(filter) == std::string::npos)
+                {
+                    std::uint64_t next = device->read<std::uint64_t>(current);
+                    if (next == current) break;
+                    current = next;
+                    continue;
+                }
+            }
+
+            json mod;
+            mod["order_index"] = iter - 1;
+            mod["base_address"] = helpers::format_address(static_cast<ea_t>(base));
+            mod["entry_point"] = helpers::format_address(static_cast<ea_t>(entry_point));
+            mod["size"] = size;
+            mod["name"] = name;
+            mod["full_path"] = path;
+            mod["flags"] = helpers::format_address(static_cast<ea_t>(flags));
+            mod["load_count"] = load_count;
+            mod["tls_index"] = tls_index;
+
+            // Decode common flags
+            json flag_details;
+            flag_details["packed_redirected"] = (flags & 0x00000002) != 0;
+            flag_details["static_import"] = (flags & 0x00000020) != 0;
+            flag_details["image_dll"] = (flags & 0x00000004) != 0;
+            flag_details["load_in_progress"] = (flags & 0x00001000) != 0;
+            flag_details["entry_processed"] = (flags & 0x00004000) != 0;
+            flag_details["dont_call_for_threads"] = (flags & 0x00040000) != 0;
+            flag_details["process_attach_called"] = (flags & 0x00080000) != 0;
+            mod["flag_details"] = std::move(flag_details);
+
+            modules_arr.push_back(std::move(mod));
+
+            std::uint64_t next = device->read<std::uint64_t>(current);
+            if (next == current) break;
+            current = next;
+        }
+
+        all_lists[list_info.name] = std::move(modules_arr);
+    }
+
+    json result;
+    result["peb_address"] = helpers::format_address(static_cast<ea_t>(peb.peb_address));
+    result["ldr_address"] = helpers::format_address(static_cast<ea_t>(peb.ldr_address));
+    result["image_base"] = helpers::format_address(static_cast<ea_t>(peb.image_base));
+    result["lists"] = std::move(all_lists);
+    if (!filter.empty()) result["filter"] = filter;
+    return tool_result_t::ok(OBFSTR("PEB LDR module lists enumerated"), result);
+}
+
+tool_result_t driver_set_page_guard(const json& params)
+{
+    if (auto ctx_err = ensure_attached_process_context(params))
+        return *ctx_err;
+
+    const std::string operation = params.value("operation", "set");
+
+    if (!params.contains("address"))
+        return tool_result_t::error(OBFSTR("Missing required parameter: address"));
+
+    auto addr_opt = helpers::parse_address(params["address"].get<std::string>());
+    if (!addr_opt) return tool_result_t::error(OBFSTR("Invalid address"));
+
+    const std::uint64_t target_addr = *addr_opt;
+    const std::size_t size = params.value("size", 4096);
+
+    anti_re::guard_driver_self_access(device->get_process_id(), target_addr, size);
+
+    if (operation == "set")
+    {
+        // Query current protection first
+        voyager::detail::region_entry region{};
+        if (!device->query_memory(target_addr, region))
+            return tool_result_t::error(OBFSTR("Failed to query memory at ") +
+                                        helpers::format_address(static_cast<ea_t>(target_addr)));
+
+        std::uint32_t current_protect = region.protect;
+        std::uint32_t new_protect = current_protect | 0x100; // PAGE_GUARD flag
+
+        std::uint32_t old_protect = 0;
+        if (!device->protect_memory(target_addr, size, new_protect, old_protect))
+            return tool_result_t::error(OBFSTR("Failed to set PAGE_GUARD at ") +
+                                        helpers::format_address(static_cast<ea_t>(target_addr)));
+
+        json result;
+        result["operation"] = "set";
+        result["address"] = helpers::format_address(static_cast<ea_t>(target_addr));
+        result["size"] = size;
+        result["old_protection"] = helpers::format_address(static_cast<ea_t>(old_protect));
+        result["new_protection"] = helpers::format_address(static_cast<ea_t>(new_protect));
+        result["note"] = OBFSTR("PAGE_GUARD set. Next access triggers STATUS_GUARD_PAGE_VIOLATION (0x80000001). "
+                                "Guard is automatically cleared after first hit. Re-apply as needed.");
+        return tool_result_t::ok(OBFSTR("PAGE_GUARD set at ") +
+                                 helpers::format_address(static_cast<ea_t>(target_addr)), result);
+    }
+    else if (operation == "remove")
+    {
+        voyager::detail::region_entry region{};
+        if (!device->query_memory(target_addr, region))
+            return tool_result_t::error(OBFSTR("Failed to query memory"));
+
+        std::uint32_t new_protect = region.protect & ~0x100u; // Clear PAGE_GUARD
+        std::uint32_t old_protect = 0;
+        if (!device->protect_memory(target_addr, size, new_protect, old_protect))
+            return tool_result_t::error(OBFSTR("Failed to remove PAGE_GUARD"));
+
+        json result;
+        result["operation"] = "remove";
+        result["address"] = helpers::format_address(static_cast<ea_t>(target_addr));
+        result["old_protection"] = helpers::format_address(static_cast<ea_t>(old_protect));
+        result["new_protection"] = helpers::format_address(static_cast<ea_t>(new_protect));
+        return tool_result_t::ok(OBFSTR("PAGE_GUARD removed at ") +
+                                 helpers::format_address(static_cast<ea_t>(target_addr)), result);
+    }
+    else if (operation == "query")
+    {
+        voyager::detail::region_entry region{};
+        if (!device->query_memory(target_addr, region))
+            return tool_result_t::error(OBFSTR("Failed to query memory"));
+
+        json result;
+        result["address"] = helpers::format_address(static_cast<ea_t>(target_addr));
+        result["base_address"] = helpers::format_address(static_cast<ea_t>(region.base));
+        result["region_size"] = region.size;
+        result["protection"] = helpers::format_address(static_cast<ea_t>(region.protect));
+        result["has_guard"] = (region.protect & 0x100) != 0;
+        result["state"] = helpers::format_address(static_cast<ea_t>(region.state));
+        return tool_result_t::ok(
+            (region.protect & 0x100) ? OBFSTR("PAGE_GUARD is active") : OBFSTR("PAGE_GUARD is not set"),
+            result);
+    }
+
+    return tool_result_t::error(OBFSTR("Invalid operation. Use 'set', 'remove', or 'query'."));
+}
+
+// =========================================================================
+// End of new CE/x64dbg-inspired tools
+// =========================================================================
+
 void register_tools()
 {
     auto& registry = ToolRegistry::instance();
@@ -19667,6 +21589,188 @@ void register_tools()
                "Returns hidden module addresses, sizes, and export names when available."),
         {{OBFSTR("kernel"), OBFSTR("boolean"), OBFSTR("Scan kernel space instead of attached process (default: false)"), false}},
         driver_detect_hidden_modules, true});
+
+    // ---- New CE / x64dbg-inspired tools ----
+
+    registry.register_tool({
+        OBFSTR("driver_walk_heap"), OBFSTR("driver"),
+        OBFSTR("Walk the NT heap structures of the attached process via kernel memory reads. "
+               "Enumerates all process heaps from PEB.ProcessHeaps, walks segment chains, and lists "
+               "heap entries with their addresses, sizes, and busy/free flags. Equivalent to Cheat Engine's "
+               "dissect data/structures and x64dbg's heap view. Filter by min/max block size or free-only."),
+        {{OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max heap entries to return (default 500, max 5000)"), false},
+         {OBFSTR("min_size"), OBFSTR("number"), OBFSTR("Only return entries >= this size in bytes"), false},
+         {OBFSTR("max_size"), OBFSTR("number"), OBFSTR("Only return entries <= this size in bytes"), false},
+         {OBFSTR("free_only"), OBFSTR("boolean"), OBFSTR("Only return free (non-busy) blocks (default false)"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        driver_walk_heap, true});
+
+    registry.register_tool({
+        OBFSTR("driver_enumerate_handles"), OBFSTR("driver"),
+        OBFSTR("Enumerate kernel object handles system-wide or for a specific process via NtQuerySystemInformation. "
+               "Returns handle values, types (Process, Thread, File, Section, Key, Event, Mutant, etc.), "
+               "kernel object addresses, and granted access masks. Equivalent to x64dbg's Handles tab "
+               "and Process Hacker's handle list. Filter by PID or object type name."),
+        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter by process ID (0 = all processes)"), false},
+         {OBFSTR("type_filter"), OBFSTR("string"), OBFSTR("Filter by type name substring (e.g. 'Process', 'File')"), false},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max handles to return (default 500, max 10000)"), false}},
+        driver_enumerate_handles, true});
+
+    registry.register_tool({
+        OBFSTR("driver_walk_seh_chain"), OBFSTR("driver"),
+        OBFSTR("Walk the SEH (Structured Exception Handler) chain for a thread by reading the TEB exception list. "
+               "For each handler, returns the record address, handler function address, and resolves which module "
+               "owns the handler. Also provides VEH (Vectored Exception Handler) enumeration hints. "
+               "Equivalent to x64dbg's SEH tab. Requires TID and attached process."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID to walk SEH chain for"), true},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        driver_walk_seh_chain, true});
+
+    registry.register_tool({
+        OBFSTR("driver_find_code_caves"), OBFSTR("driver"),
+        OBFSTR("Scan the attached process memory for code caves - contiguous regions of a fill byte "
+               "(default 0x00) large enough to hold injected code. Scans executable regions by default. "
+               "Equivalent to x64dbg's 'Find Code Caves' plugin. Returns address, size, and protection "
+               "for each cave. Use for shellcode injection, detour trampolines, or hook stubs."),
+        {{OBFSTR("min_size"), OBFSTR("number"), OBFSTR("Minimum cave size in bytes (default 64)"), false},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max caves to return (default 50, max 500)"), false},
+         {OBFSTR("fill_byte"), OBFSTR("number"), OBFSTR("Byte value to treat as empty (default 0x00, use 0xCC for INT3 padding)"), false},
+         {OBFSTR("executable_only"), OBFSTR("boolean"), OBFSTR("Only scan executable regions (default true)"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        driver_find_code_caves, true});
+
+    registry.register_tool({
+        OBFSTR("driver_scan_memory_value"), OBFSTR("driver"),
+        OBFSTR("Cheat Engine-style value scanner. Scan the target process memory for a specific value "
+               "with type awareness: byte, int16, int32, int64, float, double, string. "
+               "Supports exact match and range scan modes. For differential scans (changed/unchanged/"
+               "increased/decreased), use driver_compare_memory_snapshot. "
+               "Equivalent to Cheat Engine's First Scan. Filter by address range."),
+        {{OBFSTR("value"), OBFSTR("number"), OBFSTR("Numeric value to search for"), false},
+         {OBFSTR("value_string"), OBFSTR("string"), OBFSTR("String value (for value_type='string')"), false},
+         {OBFSTR("value_max"), OBFSTR("number"), OBFSTR("Upper bound for range scan"), false},
+         {OBFSTR("value_type"), OBFSTR("string"), OBFSTR("Data type: byte, int16, int32, int64, float, double, string (default int32)"), false,
+          {OBFSTR("byte"), OBFSTR("int16"), OBFSTR("int32"), OBFSTR("int64"), OBFSTR("float"), OBFSTR("double"), OBFSTR("string")}},
+         {OBFSTR("scan_mode"), OBFSTR("string"), OBFSTR("Scan mode: exact, range (default exact)"), false,
+          {OBFSTR("exact"), OBFSTR("range")}},
+         {OBFSTR("start"), OBFSTR("string"), OBFSTR("Scan start address (default 0x10000)"), false},
+         {OBFSTR("end"), OBFSTR("string"), OBFSTR("Scan end address (default 0x7FFFFFFFFFFF)"), false},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max matches (default 100, max 10000)"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        driver_scan_memory_value, true});
+
+    registry.register_tool({
+        OBFSTR("driver_pointer_scan"), OBFSTR("driver"),
+        OBFSTR("Cheat Engine-style pointer scanner. Find all pointers in the target process that point "
+               "to or near a target address (within max_offset). Identifies static pointers (in module .data sections) "
+               "that can survive process restarts. Returns pointer address, value, offset from target, "
+               "owning module, and module+offset for static references. "
+               "Equivalent to CE's Pointer Scan with configurable depth and offset bounds."),
+        {{OBFSTR("target_address"), OBFSTR("string"), OBFSTR("Address to find pointers to (hex)"), true},
+         {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Max pointer chain depth (default 3, max 7)"), false},
+         {OBFSTR("max_offset"), OBFSTR("number"), OBFSTR("Max +/- offset from target (default 0x1000)"), false},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max chains to return (default 50, max 500)"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        driver_pointer_scan, true});
+
+    registry.register_tool({
+        OBFSTR("driver_enumerate_windows"), OBFSTR("driver"),
+        OBFSTR("List all windows (HWND) owned by a process. Returns window handle, parent, class name, "
+               "title text, visibility, position/size rect, and style flags. Equivalent to x64dbg's "
+               "Window tab and Spy++ functionality. Useful for finding game overlay windows, "
+               "anti-cheat UI, hidden dialogs, and message-only windows."),
+        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID (default: attached PID)"), false},
+         {OBFSTR("include_children"), OBFSTR("boolean"), OBFSTR("Include child windows (default true)"), false},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max windows (default 200, max 2000)"), false}},
+        driver_enumerate_windows, true});
+
+    registry.register_tool({
+        OBFSTR("driver_walk_stack"), OBFSTR("driver"),
+        OBFSTR("Full stack walk for any thread via kernel driver. Gets thread context, reads RSP stack memory, "
+               "and identifies return addresses by cross-referencing with loaded modules and verifying "
+               "call instruction patterns. Resolves each frame to module+offset. "
+               "Equivalent to x64dbg's Call Stack panel. Uses heuristic stack scanning for x64 code."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID to walk stack for"), true},
+         {OBFSTR("max_frames"), OBFSTR("number"), OBFSTR("Max stack frames (default 64, max 256)"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        driver_walk_stack, true});
+
+    registry.register_tool({
+        OBFSTR("driver_assemble"), OBFSTR("driver"),
+        OBFSTR("Assemble x86-64 instructions to machine code bytes. Supports common instructions: "
+               "NOP, RET, INT3, PUSH/POP reg, MOV reg/imm64, XOR reg/reg, JMP/CALL (reg or address), "
+               "SUB RSP/imm, ADD RSP/imm. Multi-line input (one instruction per line). "
+               "Optionally writes assembled bytes to target process memory. "
+               "Equivalent to x64dbg's built-in assembler and Cheat Engine's auto-assembler."),
+        {{OBFSTR("assembly"), OBFSTR("string"), OBFSTR("Assembly text (one instruction per line)"), true},
+         {OBFSTR("address"), OBFSTR("string"), OBFSTR("Base address for relative calculations (default 0x140000000)"), false},
+         {OBFSTR("write_to"), OBFSTR("string"), OBFSTR("If specified, write assembled bytes to this address in the attached process"), false}},
+        driver_assemble, false});
+
+    registry.register_tool({
+        OBFSTR("driver_compare_memory_snapshot"), OBFSTR("driver"),
+        OBFSTR("Take and compare memory snapshots for differential analysis. Operations: "
+               "'take' captures a snapshot, 'compare' diffs current memory against a saved snapshot, "
+               "'list' shows all snapshots, 'clear' removes all. Enables Cheat Engine-style "
+               "changed/unchanged/increased/decreased value scanning by comparing snapshots over time."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'take', 'compare', 'list', or 'clear'"), true,
+          {OBFSTR("take"), OBFSTR("compare"), OBFSTR("list"), OBFSTR("clear")}},
+         {OBFSTR("address"), OBFSTR("string"), OBFSTR("Memory address for take/compare"), false},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes to snapshot (default 4096, max 1MB)"), false},
+         {OBFSTR("name"), OBFSTR("string"), OBFSTR("Snapshot name (default 'default')"), false},
+         {OBFSTR("max_diffs"), OBFSTR("number"), OBFSTR("Max diffs to report on compare (default 200)"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        driver_compare_memory_snapshot, false});
+
+    registry.register_tool({
+        OBFSTR("driver_find_references"), OBFSTR("driver"),
+        OBFSTR("Find all memory locations that reference a target address. Scans for both direct "
+               "64-bit pointer matches and RIP-relative (rel32) references in code sections. "
+               "Equivalent to x64dbg's 'Find References' and IDA's xrefs but in live runtime memory. "
+               "Useful for finding vtable entries, function pointer tables, and cross-references "
+               "that only exist at runtime."),
+        {{OBFSTR("target_address"), OBFSTR("string"), OBFSTR("Address to find references to (hex)"), true},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max references (default 100, max 5000)"), false},
+         {OBFSTR("scan_code"), OBFSTR("boolean"), OBFSTR("Scan executable regions (default true)"), false},
+         {OBFSTR("scan_data"), OBFSTR("boolean"), OBFSTR("Scan data regions (default true)"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        driver_find_references, true});
+
+    registry.register_tool({
+        OBFSTR("driver_read_teb"), OBFSTR("driver"),
+        OBFSTR("Read the Thread Environment Block (TEB) for a thread via kernel driver. "
+               "Extracts: NT_TIB (exception list, stack base/limit), TLS slots with values, "
+               "PEB address, client ID, last error, critical section count, stack size. "
+               "Equivalent to x64dbg's TEB view. Requires tid of the target thread."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        driver_read_teb, true});
+
+    registry.register_tool({
+        OBFSTR("driver_map_peb_modules"), OBFSTR("driver"),
+        OBFSTR("Walk ALL three PEB LDR linked lists: InLoadOrder, InMemoryOrder, InInitializationOrder. "
+               "Returns complete module details: base, entry point, size, name, full path, flags "
+               "(static import, entry processed, process attach called, etc.), load count, TLS index. "
+               "Order differences reveal manually mapped modules and load-order anomalies. "
+               "More detailed than driver_enumerate_modules - shows all three orderings and decoded flags."),
+        {{OBFSTR("order"), OBFSTR("string"), OBFSTR("Which list: load, memory, init, or all (default all)"), false,
+          {OBFSTR("load"), OBFSTR("memory"), OBFSTR("init"), OBFSTR("all")}},
+         {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Module name/path substring filter (case-insensitive)"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        driver_map_peb_modules, true});
+
+    registry.register_tool({
+        OBFSTR("driver_set_page_guard"), OBFSTR("driver"),
+        OBFSTR("Set, remove, or query PAGE_GUARD protection on memory in the attached process. "
+               "PAGE_GUARD triggers STATUS_GUARD_PAGE_VIOLATION exception on first access - "
+               "equivalent to Cheat Engine's memory breakpoint / 'Break on Access'. "
+               "The guard auto-clears after first hit. Operations: set, remove, query."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'set', 'remove', or 'query'"), true,
+          {OBFSTR("set"), OBFSTR("remove"), OBFSTR("query")}},
+         {OBFSTR("address"), OBFSTR("string"), OBFSTR("Target memory address (hex)"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Size of the guarded region in bytes (default 4096)"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        driver_set_page_guard, false});
 }
 
 }

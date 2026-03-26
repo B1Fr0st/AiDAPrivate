@@ -1412,7 +1412,7 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
         return static_cast<int>(std::distance(models.begin(), it));
     };
 
-    // Use static fallback models immediately — fetch asynchronously after dialog is shown.
+
     std::vector<std::string> gemini_models_vec = settings_t::gemini_models;
     std::vector<std::string> openai_models_vec = settings_t::openai_models;
     std::vector<std::string> openrouter_models_vec = settings_t::openrouter_models;
@@ -2015,7 +2015,7 @@ void SettingsForm::show_and_apply(aida_plugin_t* plugin_instance)
     }
     dlg.resize(initialSize);
 
-    // Asynchronously fetch models for the active provider after dialog is shown.
+
     {
         QPointer<QComboBox> asyncCombo;
         std::string fetchP1, fetchP2;

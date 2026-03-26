@@ -1110,9 +1110,27 @@ void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t ca
                 execute_sync(*sreq, MFF_NOWAIT);
             };
 
-            auto on_stream = [](const std::string& chunk) {
-                auto* creq = new stream_chunk_request_t(chunk);
+
+            std::string stream_buf;
+            auto stream_last_flush = std::chrono::steady_clock::now();
+
+            auto flush_stream = [&stream_buf, &stream_last_flush]() {
+                if (stream_buf.empty())
+                    return;
+                auto* creq = new stream_chunk_request_t(stream_buf);
                 execute_sync(*creq, MFF_NOWAIT);
+                stream_buf.clear();
+                stream_last_flush = std::chrono::steady_clock::now();
+            };
+
+            auto on_stream = [&stream_buf, &stream_last_flush, &flush_stream](const std::string& chunk) {
+                stream_buf += chunk;
+                auto now = std::chrono::steady_clock::now();
+                int elapsed_ms = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - stream_last_flush).count());
+                if (stream_buf.size() >= 32 || elapsed_ms >= 50)
+                    flush_stream();
             };
 
             auto agentic_result = agentic::run(
@@ -1122,6 +1140,9 @@ void AIClient::agentic_query(ea_t ea, const std::string& question, callback_t ca
                 },
                 on_status,
                 on_stream);
+
+
+            flush_stream();
 
             if (agentic_result.was_cancelled)
             {
@@ -1256,9 +1277,27 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
                 execute_sync(*sreq, MFF_NOWAIT);
             };
 
-            auto on_stream = [](const std::string& chunk) {
-                auto* creq = new stream_chunk_request_t(chunk);
+
+            std::string stream_buf;
+            auto stream_last_flush = std::chrono::steady_clock::now();
+
+            auto flush_stream = [&stream_buf, &stream_last_flush]() {
+                if (stream_buf.empty())
+                    return;
+                auto* creq = new stream_chunk_request_t(stream_buf);
                 execute_sync(*creq, MFF_NOWAIT);
+                stream_buf.clear();
+                stream_last_flush = std::chrono::steady_clock::now();
+            };
+
+            auto on_stream = [&stream_buf, &stream_last_flush, &flush_stream](const std::string& chunk) {
+                stream_buf += chunk;
+                auto now = std::chrono::steady_clock::now();
+                int elapsed_ms = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - stream_last_flush).count());
+                if (stream_buf.size() >= 32 || elapsed_ms >= 50)
+                    flush_stream();
             };
 
             auto agentic_result = agentic::run(
@@ -1268,6 +1307,9 @@ void AIClient::agentic_chat(ea_t ea, const std::string& message,
                 },
                 on_status,
                 on_stream);
+
+
+            flush_stream();
 
             if (agentic_result.was_cancelled)
             {
