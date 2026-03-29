@@ -172,12 +172,14 @@
     <ClCompile Include="core\mcp_standalone_tools.cpp" />
     <ClCompile Include="core\standalone_driver.cpp" />
     <ClCompile Include="core\standalone_ai_client.cpp" />
+    <ClCompile Include="core\standalone_chat.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="assets\icons.h" />
     <ClInclude Include="core\mcp_standalone.hpp" />
     <ClInclude Include="core\standalone_driver.hpp" />
     <ClInclude Include="core\standalone_ai_client.hpp" />
+    <ClInclude Include="core\standalone_chat.hpp" />
     <ClInclude Include="core\standalone_settings.hpp" />
     <ClInclude Include="core\sandbox.hpp" />
     <ClInclude Include="core\zydis_disasm.hpp" />

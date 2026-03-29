@@ -12,9 +12,9 @@ struct ChatMessage {
 	bool streaming = false;
 };
 
-static bool  g_dummy_triggered = false;
-static float g_think_timer = 0.f;
-static bool  g_think_done = false;
+inline bool  g_dummy_triggered = false;
+inline float g_think_timer = 0.f;
+inline bool  g_think_done = false;
 
 inline std::vector<ChatMessage> g_chat_messages;
 inline char                     g_chat_buf[4096] = {};
@@ -23,78 +23,11 @@ inline float g_chat_demo_timer = 0.f;
 inline int   g_chat_demo_stage = 0;
 
 
-static void tick_dummy_ai()
-{
-    if (g_chat_messages.empty()) return;
-    auto& last = g_chat_messages.back();
-    if (!last.is_user || g_dummy_triggered) return;
-
-    g_dummy_triggered = true;
-    g_think_timer = 0.f;
-    g_think_done = false;
-
-    ChatMessage ai_msg;
-    ai_msg.is_user = false;
-    ai_msg.has_thinking = true;
-    ai_msg.streaming = false;
-    ai_msg.thinking_text = "The user sent a message. Let me think about this... "
-        "sub_140001000 sets up a stack frame, loads a vtable pointer at +0x28, "
-        "calls a resolver, then does a guarded virtual dispatch at slot +0x10. "
-        "I'll explain this clearly.";
-    ai_msg.text = "";
-    g_chat_messages.push_back(ai_msg);
-    g_chat_scroll_to_bottom = true;
-}
-
-static void stream_dummy_ai()
-{
-    if (g_chat_messages.empty()) return;
-    auto& last = g_chat_messages.back();
-    if (last.is_user) return;
-
-    float dt = ImGui::GetIO().DeltaTime;
-
-
-    if (!g_think_done)
-    {
-        g_think_timer += dt;
-        if (g_think_timer >= 2.5f)
-            g_think_done = true;
-        return;
-    }
-
-
-    if (!last.streaming && last.text.empty())
-        last.streaming = true;
-
-    if (!last.streaming) return;
-
-    static float accum = 0.f;
-    static int   char_idx = 0;
-
-    const char* full =
-        "This is a guarded virtual dispatch. It loads a pointer 0x28 bytes into "
-        "the passed object - likely a vtable - validates it with sub_140001050, "
-        "then calls the method at vtable slot +0x10. "
-        "The 0x20 byte stack frame is standard x64 shadow space. "
-        "If the pointer is null the je at 0x140001018 skips the call entirely.";
-
-    accum += dt;
-    if (accum < 0.018f) return;
-    accum = 0.f;
-
-    if (char_idx < (int)strlen(full))
-    {
-        last.text += full[char_idx++];
-        g_chat_scroll_to_bottom = true;
-    }
-    else
-    {
-        last.streaming = false;
-        char_idx = 0;
-        g_dummy_triggered = false;
-    }
-}
+// Real AI chat integration  (see core/standalone_chat.hpp)
+void tick_ai_chat();
+void poll_ai_chat();
+void render_settings_popup();
+extern bool g_settings_open;
 
 namespace globals
 {

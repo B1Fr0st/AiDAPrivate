@@ -66,6 +66,7 @@ namespace mcp_standalone
         int  get_port() const { return _port; }
         void register_tool(tool_def_t tool);
         void write_client_configs() const;
+        const std::vector<tool_def_t>& get_tools() const { return _tools; }
 
     private:
         friend std::string handle_body(server_t*, const std::string&);

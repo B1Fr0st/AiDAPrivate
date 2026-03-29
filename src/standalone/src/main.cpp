@@ -9,6 +9,7 @@
 #include "helpers/blur.h"
 #include <dwmapi.h>
 #include "helpers/globals.h"
+#include "core/standalone_chat.hpp"
 
 #pragma comment(lib, "dwmapi.lib")
 
@@ -124,6 +125,7 @@ int main(int, char**)
     g_pd3dDevice->CreateBlendState(&blend_desc, &blend_state);
     g_pd3dDeviceContext->OMSetBlendState(blend_state, nullptr, 0xffffffff);
     Blur::Init(g_pd3dDevice, g_pd3dDeviceContext, 100, 130);
+    init_standalone_chat();
 
 
     bool show_demo_window = true;
@@ -208,6 +210,7 @@ int main(int, char**)
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
     }
 
+    shutdown_standalone_chat();
     Blur::Shutdown();
     ImGui_ImplDX11_Shutdown();
 

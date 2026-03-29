@@ -9,6 +9,7 @@
 #include "blur.h"
 #include "../assets/icons.h"
 #include "../core/zydis_disasm.hpp"
+#include "../core/standalone_chat.hpp"
 
 static ID3D11ShaderResourceView* g_send_icon_srv    = nullptr;
 static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
@@ -984,7 +985,24 @@ void helpers::render_title()
 		float bot_pad    = 4.f;
 		float input_y    = ch - input_h - bot_pad;
 		float sep_y      = input_y - 6.f;
-		float msg_area_h = sep_y;
+		float msg_area_h = sep_y - 24.f; // reserve space for settings bar
+
+		// ---- settings gear button row ----
+		{
+			float gear_sz = 18.f;
+			ImVec2 btn_pos(cw - gear_sz - 8.f, 3.f);
+			ImGui::SetCursorPos(btn_pos);
+			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
+			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.08f));
+			ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.12f));
+			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.55f,0.60f,1.f));
+			if (ImGui::Button("\xe2\x9a\x99##chat_settings", ImVec2(gear_sz, gear_sz)))
+				g_settings_open = true;
+			ImGui::PopStyleColor(4);
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("AI Settings");
+			ImGui::SetCursorPosY(24.f);
+		}
 
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
 		ImGui::BeginChild("##chat_msgs", ImVec2(cw, msg_area_h), false,
@@ -1453,9 +1471,9 @@ void helpers::render_title()
 	}
 	end_child();
 
-	tick_dummy_ai();
-
-	stream_dummy_ai();
+	tick_ai_chat();
+	poll_ai_chat();
+	render_settings_popup();
 	ImGui::PopStyleVar();
 	ImGui::End();
 }
