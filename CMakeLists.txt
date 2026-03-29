@@ -56,46 +56,15 @@ endif()
 
 
 if(WIN32)
-    option(BUILD_NETWORK_DRIVER_TEST_TOOL "Build standalone network driver feature test tool" ON)
 
-    if(BUILD_NETWORK_DRIVER_TEST_TOOL)
-        add_executable(NetworkDriverTestTool
-            tools/network_driver_test/main.cpp
-            driver/comm.cpp
-        )
-
-        target_include_directories(NetworkDriverTestTool PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/driver"
-            "${CMAKE_CURRENT_SOURCE_DIR}"
-        )
-
-        target_compile_definitions(NetworkDriverTestTool PRIVATE
-            _CRT_SECURE_NO_WARNINGS
-            NOMINMAX
-            WIN32_LEAN_AND_MEAN
-        )
-
-        target_compile_options(NetworkDriverTestTool PRIVATE
-            /W3
-            /EHsc
-            /Zc:__cplusplus
-            /permissive-
-            /Zp8
-            /MD
-        )
-
-        target_link_libraries(NetworkDriverTestTool PRIVATE
-            ws2_32
-            dnsapi
-            winhttp
-            iphlpapi
-            ntdll
-        )
-
-        set_target_properties(NetworkDriverTestTool PROPERTIES
-            OUTPUT_NAME "NetworkDriverTestTool"
-        )
-    endif()
+    # --- Dear ImGui (for standalone app) ---
+    FetchContent_Declare(
+        imgui
+        GIT_REPOSITORY https://github.com/ocornut/imgui.git
+        GIT_TAG        v1.91.8-docking
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(imgui)
 
     option(BUILD_BEDAISY_DUMPER "Build standalone BEDaisy kernel module dumper tool" ON)
 
@@ -145,35 +114,179 @@ if(WIN32)
         )
     endif()
 
-    option(BUILD_NET_SECURITY_TEST "Build offline net_security verification test" ON)
+    # =========================================================================
+    # AiDA Standalone App  (ImGui + DX11 + MCP + driver + emulation)
+    # =========================================================================
+    option(BUILD_AIDA_STANDALONE "Build AiDA standalone application" ON)
 
-    if(BUILD_NET_SECURITY_TEST)
-        add_executable(NetSecurityTest
-            tools/net_security_test/main.cpp
+    if(BUILD_AIDA_STANDALONE)
+        set(STANDALONE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src")
+
+        # -- Create imgui/ directory layout expected by standalone sources ---------
+        # The standalone code does #include "imgui/imgui.h", "imgui/imgui_impl_dx11.h",
+        # "imgui/imgui_internal.h", "imgui/freetype/freetype.h" etc.
+        # We create a mirror directory under the build tree that maps to the FetchContent sources.
+        set(IMGUI_WRAPPER_DIR "${CMAKE_BINARY_DIR}/_imgui_wrapper/imgui")
+        file(MAKE_DIRECTORY "${IMGUI_WRAPPER_DIR}")
+        file(MAKE_DIRECTORY "${IMGUI_WRAPPER_DIR}/freetype")
+
+        # Create thin redirect headers so #pragma once in the real imgui headers
+        # de-duplicates correctly (copies would be seen as separate files by MSVC).
+        file(GLOB _imgui_core_headers "${imgui_SOURCE_DIR}/*.h")
+        foreach(_h ${_imgui_core_headers})
+            get_filename_component(_name "${_h}" NAME)
+            file(WRITE "${IMGUI_WRAPPER_DIR}/${_name}" "#pragma once\n#include \"${_h}\"\n")
+        endforeach()
+
+        file(GLOB _imgui_backend_headers "${imgui_SOURCE_DIR}/backends/*.h")
+        foreach(_h ${_imgui_backend_headers})
+            get_filename_component(_name "${_h}" NAME)
+            file(WRITE "${IMGUI_WRAPPER_DIR}/${_name}" "#pragma once\n#include \"${_h}\"\n")
+        endforeach()
+
+        if(EXISTS "${imgui_SOURCE_DIR}/misc/freetype/imgui_freetype.h")
+            file(WRITE "${IMGUI_WRAPPER_DIR}/freetype/freetype.h"
+                 "#pragma once\n#include \"${imgui_SOURCE_DIR}/misc/freetype/imgui_freetype.h\"\n")
+        endif()
+
+        # -- Create stub IDA headers so driver_loader.cpp compiles standalone -----
+        set(IDA_STUBS_DIR "${CMAKE_BINARY_DIR}/_ida_stubs")
+        file(MAKE_DIRECTORY "${IDA_STUBS_DIR}")
+        file(WRITE "${IDA_STUBS_DIR}/pro.h"
+             "#ifndef _PRO_H\n#define _PRO_H\n/* stub for standalone build */\n#endif\n")
+        file(WRITE "${IDA_STUBS_DIR}/kernwin.hpp"
+             "#ifndef __KERNWIN_HPP\n#define __KERNWIN_HPP\n/* stub for standalone build */\n#endif\n")
+
+        # -- Standalone sources ---------------------------------------------------
+        set(STANDALONE_SOURCES
+            "${STANDALONE_ROOT}/main.cpp"
+            "${STANDALONE_ROOT}/helpers/helpers.cpp"
+            "${STANDALONE_ROOT}/helpers/blur.cpp"
+            "${STANDALONE_ROOT}/helpers/icon_loodr.cpp"
+            "${STANDALONE_ROOT}/core/mcp_standalone.cpp"
+            "${STANDALONE_ROOT}/core/mcp_standalone_tools.cpp"
+            "${STANDALONE_ROOT}/core/standalone_driver.cpp"
+            "${STANDALONE_ROOT}/core/standalone_ai_client.cpp"
+            driver/comm.cpp
+            src/net_security.cpp
+            src/emulation_engine.cpp
         )
 
-        target_compile_definitions(NetSecurityTest PRIVATE
+        # -- ImGui sources from FetchContent --------------------------------------
+        set(IMGUI_SOURCES
+            "${imgui_SOURCE_DIR}/imgui.cpp"
+            "${imgui_SOURCE_DIR}/imgui_demo.cpp"
+            "${imgui_SOURCE_DIR}/imgui_draw.cpp"
+            "${imgui_SOURCE_DIR}/imgui_tables.cpp"
+            "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
+            "${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp"
+            "${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp"
+            "${imgui_SOURCE_DIR}/misc/freetype/imgui_freetype.cpp"
+        )
+
+        # -- Syscall ASM stub -----------------------------------------------------
+        set(STANDALONE_ASM driver/syscall.asm)
+        set_source_files_properties(${STANDALONE_ASM} PROPERTIES LANGUAGE ASM_MASM)
+        add_library(AiDAStandalone_asm OBJECT ${STANDALONE_ASM})
+
+        add_executable(AiDAStandalone WIN32
+            ${STANDALONE_SOURCES}
+            ${IMGUI_SOURCES}
+            $<TARGET_OBJECTS:AiDAStandalone_asm>
+        )
+
+        # -- Include directories --------------------------------------------------
+        target_include_directories(AiDAStandalone PRIVATE
+            "${STANDALONE_ROOT}"
+            "${STANDALONE_ROOT}/core"
+            "${CMAKE_BINARY_DIR}/_imgui_wrapper"
+            "${imgui_SOURCE_DIR}"
+            "${imgui_SOURCE_DIR}/backends"
+            "${STANDALONE_ROOT}/freetype/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/cpp-httplib"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/driver"
+            "${zydis_SOURCE_DIR}/include"
+            "${zydis_SOURCE_DIR}/dependencies/zycore/include"
+            "${zydis_BINARY_DIR}"
+            "${zydis_BINARY_DIR}/zycore"
+            "${unicorn_SOURCE_DIR}/include"
+            "${IDA_STUBS_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/mapper/src"
+        )
+
+        # -- Compile definitions --------------------------------------------------
+        target_compile_definitions(AiDAStandalone PRIVATE
+            __NT__
             _CRT_SECURE_NO_WARNINGS
             NOMINMAX
             WIN32_LEAN_AND_MEAN
+            IMGUI_ENABLE_FREETYPE
+            UNICODE
+            _UNICODE
         )
 
-        target_compile_options(NetSecurityTest PRIVATE
+        # -- Compiler flags -------------------------------------------------------
+        target_compile_options(AiDAStandalone PRIVATE
             /W3
             /EHsc
+            /Zi
+            /FS
             /Zc:__cplusplus
             /permissive-
+            /Zp8
             /MD
         )
 
-        target_link_libraries(NetSecurityTest PRIVATE
-            bcrypt
+        # -- Link libraries -------------------------------------------------------
+        target_link_directories(AiDAStandalone PRIVATE
+            "${STANDALONE_ROOT}/freetype/lib/x64"
         )
 
-        set_target_properties(NetSecurityTest PROPERTIES
-            OUTPUT_NAME "NetSecurityTest"
+        target_link_libraries(AiDAStandalone PRIVATE
+            Zydis
+            unicorn
+            freetype
+            OpenSSL::SSL
+            OpenSSL::Crypto
+            d3d11
+            d3dcompiler
+            dxgi
+            dwmapi
+            ws2_32
+            dnsapi
+            winhttp
+            iphlpapi
+            ntdll
+            crypt32
+            Shlwapi
+        )
+
+        # -- Link flags (PDB) ----------------------------------------------------
+        target_link_options(AiDAStandalone PRIVATE
+            /DEBUG:FULL
+            /ENTRY:mainCRTStartup
+        )
+
+        # -- Output properties + PDB ---------------------------------------------
+        set_target_properties(AiDAStandalone PROPERTIES
+            OUTPUT_NAME "AiDAStandalone"
+            PDB_NAME_DEBUG "AiDAStandalone"
+            PDB_NAME_RELEASE "AiDAStandalone"
+            PDB_NAME_RELWITHDEBINFO "AiDAStandalone"
+            COMPILE_PDB_NAME_DEBUG "AiDAStandalone"
+            COMPILE_PDB_NAME_RELEASE "AiDAStandalone"
+            COMPILE_PDB_NAME_RELWITHDEBINFO "AiDAStandalone"
+            PDB_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
+            PDB_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
+            PDB_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
+            COMPILE_PDB_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
+            COMPILE_PDB_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
+            COMPILE_PDB_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
         )
     endif()
+
 endif()
 
 if(NOT EXISTS "${IDASDK_DIR}/include/ida.hpp")

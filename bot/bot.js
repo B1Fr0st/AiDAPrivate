@@ -44,8 +44,8 @@ const { v4: uuidv4 } = require('uuid');
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
-const BOT_TOKEN       = process.env.AIDA_BOT_TOKEN       || 'MTQ2NzU4MjM4NzQ0ODk3MTI4NQ.Gug6jm.ycGFOlwxRMlK2kY5n069yZ41CmaxR0g023jGqE';
-const OWNER_ID        = process.env.AIDA_OWNER_ID        || '924624884968079370';
+const BOT_TOKEN       = process.env.AIDA_BOT_TOKEN       || 'MTQ4NzUzNzkyOTM4NjcyNTUyMQ.G1FQRX.HfLlZeo680ebtL1ToqfMcGHFiOF2EAsCdnetCE';
+const OWNER_ID        = process.env.AIDA_OWNER_ID        || '937382022056407160';
 const FIREBASE_DB_URL = process.env.AIDA_FIREBASE_DB_URL || 'https://aida-license-prod-default-rtdb.europe-west1.firebasedatabase.app';
 // Firebase Database Secret — grants admin bypass of all security rules.
 const FIREBASE_SECRET = process.env.AIDA_FIREBASE_SECRET || 'bWLmMKBhD3TE7iYMnKizIjOrt4jXd9R1m0CVCj6P';

@@ -1389,6 +1389,7 @@ bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ct
     ctx.cs = req.cs;   ctx.ss = req.ss;
     ctx.dr0 = req.dr0; ctx.dr1 = req.dr1; ctx.dr2 = req.dr2; ctx.dr3 = req.dr3;
     ctx.dr6 = req.dr6; ctx.dr7 = req.dr7;
+    ctx.kernel_gs_base = 0;
 
     return true;
 }

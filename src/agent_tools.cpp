@@ -18931,9 +18931,6 @@ tool_result_t driver_detect_hidden_modules(const json& params)
                              OBFSTR(" found"), result);
 }
 
-// =========================================================================
-// New tools inspired by Cheat Engine and x64dbg capabilities
-// =========================================================================
 
 tool_result_t driver_walk_heap(const json& params)
 {
@@ -18954,7 +18951,7 @@ tool_result_t driver_walk_heap(const json& params)
     if (peb_addr == 0)
         return tool_result_t::error(OBFSTR("PEB address is null"));
 
-    // PEB.ProcessHeaps at offset 0xF0 (x64), PEB.NumberOfHeaps at 0xE8
+
     const std::uint32_t num_heaps = device->read<std::uint32_t>(peb_addr + 0xE8);
     const std::uint64_t heaps_ptr = device->read<std::uint64_t>(peb_addr + 0xF0);
 
@@ -18969,12 +18966,7 @@ tool_result_t driver_walk_heap(const json& params)
         const std::uint64_t heap_base = device->read<std::uint64_t>(heaps_ptr + h * 8);
         if (heap_base == 0) continue;
 
-        // _HEAP structure: Signature at offset 0x0 should be 0xFFEEFFEE or read encoding
-        // _HEAP.TotalFreeSize at 0x40, _HEAP.NumberOfPages at 0x38
-        // _HEAP.Segments at 0x0 for segment-based heap walking
-        // Walk segments via _HEAP_SEGMENT entries
 
-        // Read NTDLL segment heap signature to detect segment vs NT heap
         const std::uint32_t signature = device->read<std::uint32_t>(heap_base);
         const std::uint64_t total_free = device->read<std::uint64_t>(heap_base + 0x40);
         const std::uint64_t num_pages = device->read<std::uint64_t>(heap_base + 0x38);
@@ -18986,7 +18978,7 @@ tool_result_t driver_walk_heap(const json& params)
         heap_info["total_free_size"] = total_free;
         heap_info["committed_pages"] = num_pages;
 
-        // Walk _HEAP_SEGMENT list via _HEAP.SegmentList (ListEntry at offset 0x120)
+
         const std::uint64_t seg_list_head = heap_base + 0x120;
         std::uint64_t seg_flink = device->read<std::uint64_t>(seg_list_head);
 
@@ -18996,14 +18988,14 @@ tool_result_t driver_walk_heap(const json& params)
 
         while (seg_flink != 0 && seg_flink != seg_list_head && seg_iter++ < MAX_SEGS && total_entries < max_entries)
         {
-            // _HEAP_SEGMENT.SegmentListEntry is at seg_flink, so segment base = seg_flink - 0x18
+
             const std::uint64_t segment_base = seg_flink - 0x18;
             const std::uint64_t seg_base_addr = device->read<std::uint64_t>(segment_base + 0x0);
             const std::uint32_t seg_num_pages = device->read<std::uint32_t>(segment_base + 0x10);
             const std::uint64_t first_entry = device->read<std::uint64_t>(segment_base + 0x28);
             const std::uint64_t last_entry = device->read<std::uint64_t>(segment_base + 0x48);
 
-            // Walk HEAP_ENTRY chain in this segment
+
             std::uint64_t entry_addr = first_entry;
             int entry_iter = 0;
             constexpr int MAX_ENTRIES_PER_SEG = 2048;
@@ -19011,8 +19003,8 @@ tool_result_t driver_walk_heap(const json& params)
 
             while (entry_addr != 0 && entry_addr < last_entry && entry_iter++ < MAX_ENTRIES_PER_SEG && total_entries < max_entries)
             {
-                // _HEAP_ENTRY: Size at offset 0x0 (encoded), Flags at 0x2, UnusedBytes at 0x7
-                // In NT heap, encoded size = (actual_size * 8) XOR encoding key
+
+
                 std::uint16_t raw_size = device->read<std::uint16_t>(entry_addr);
                 std::uint8_t flags = device->read<std::uint8_t>(entry_addr + 0x2);
                 std::uint8_t unused_bytes = device->read<std::uint8_t>(entry_addr + 0x7);
@@ -19081,9 +19073,7 @@ tool_result_t driver_enumerate_handles(const json& params)
     const std::string filter_type = params.value("type_filter", "");
     const int limit = std::min(params.value("limit", 500), 10000);
 
-    // Use NtQuerySystemInformation(SystemHandleInformation = 16) from usermode
-    // This doesn't need the driver for the query itself, but we use the driver
-    // to resolve handle names in the target process context
+
     typedef struct {
         ULONG NumberOfHandles;
     } SYSTEM_HANDLE_INFORMATION_HEAD;
@@ -19098,7 +19088,7 @@ tool_result_t driver_enumerate_handles(const json& params)
         ULONG GrantedAccess;
     } SYSTEM_HANDLE_TABLE_ENTRY_INFO;
 
-    // Known object type indices (Windows 10+, approximate)
+
     auto type_name_from_index = [](std::uint8_t idx) -> std::string {
         switch (idx) {
             case 7:  return "Process";
@@ -19117,7 +19107,7 @@ tool_result_t driver_enumerate_handles(const json& params)
         }
     };
 
-    ULONG bufsize = 1 << 22; // 4 MB initial
+    ULONG bufsize = 1 << 22;
     std::vector<std::uint8_t> buffer(bufsize);
     NTSTATUS status;
     using NtQuerySystemInformationFn = NTSTATUS(WINAPI*)(ULONG, PVOID, ULONG, PULONG);
@@ -19130,13 +19120,13 @@ tool_result_t driver_enumerate_handles(const json& params)
     ULONG returned_length = 0;
     for (int attempt = 0; attempt < 5; ++attempt)
     {
-        status = NtQuerySystemInformation(16 /*SystemHandleInformation*/, buffer.data(),
+        status = NtQuerySystemInformation(16 , buffer.data(),
                                           static_cast<ULONG>(buffer.size()), &returned_length);
-        if (status == 0) break; // STATUS_SUCCESS
-        if (status == 0xC0000004 /*STATUS_INFO_LENGTH_MISMATCH*/)
+        if (status == 0) break;
+        if (status == 0xC0000004 )
         {
             bufsize = returned_length + (1 << 20);
-            if (bufsize > (1u << 28)) // 256MB cap
+            if (bufsize > (1u << 28))
                 return tool_result_t::error(OBFSTR("Handle table too large"));
             buffer.resize(bufsize);
             continue;
@@ -19200,22 +19190,17 @@ tool_result_t driver_walk_seh_chain(const json& params)
 
     const std::uint32_t tid = *tid_opt;
 
-    // Get thread context to read GS base (TEB)
+
     voyager::device_t::thread_context ctx{};
     if (!device->get_thread_context(tid, ctx))
         return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
 
-    // Read TEB.NtTib.ExceptionList (offset 0 in TEB for x64, which is at GS:[0])
-    // In x64 Windows, SEH uses RtlAddFunctionTable / .pdata, but the legacy
-    // exception list is still at TEB offset 0x0
-    // We also read the vectored handler list from ntdll!LdrpVectorHandlerList
 
-    // TEB address is at kernel_gs_base from context
     const std::uint64_t teb_addr = ctx.kernel_gs_base;
     if (teb_addr == 0)
         return tool_result_t::error(OBFSTR("TEB address is null (kernel_gs_base=0)"));
 
-    // x64 SEH: Read TEB.ExceptionList head (offset 0x0 in NT_TIB)
+
     std::uint64_t seh_head = device->read<std::uint64_t>(teb_addr);
 
     json seh_chain = json::array();
@@ -19224,7 +19209,7 @@ tool_result_t driver_walk_seh_chain(const json& params)
 
     while (current != 0 && current != 0xFFFFFFFFFFFFFFFF && max_walk-- > 0)
     {
-        // _EXCEPTION_REGISTRATION_RECORD: Next (8 bytes) + Handler (8 bytes)
+
         std::uint64_t next = device->read<std::uint64_t>(current);
         std::uint64_t handler = device->read<std::uint64_t>(current + 8);
 
@@ -19233,12 +19218,12 @@ tool_result_t driver_walk_seh_chain(const json& params)
         entry["handler_address"] = helpers::format_address(static_cast<ea_t>(handler));
         entry["next"] = (next == 0xFFFFFFFFFFFFFFFF) ? "END" : helpers::format_address(static_cast<ea_t>(next));
 
-        // Try to identify which module the handler belongs to
+
         std::uint64_t mod_base = 0;
         std::string mod_name;
         if (handler != 0 && resolve_loaded_module_base("", mod_base, mod_name))
         {
-            // Walk all modules to find which one contains the handler
+
             voyager::device_t::peb_info peb{};
             if (device->read_peb(peb) && peb.ldr_address != 0)
             {
@@ -19271,17 +19256,14 @@ tool_result_t driver_walk_seh_chain(const json& params)
         current = next;
     }
 
-    // Now try to enumerate Vectored Exception Handlers (VEH)
-    // VEH list head is at ntdll!LdrpVectorHandlerList
+
     json veh_chain = json::array();
     std::uint64_t ntdll_base = 0;
     std::string ntdll_name;
     if (resolve_loaded_module_base("ntdll.dll", ntdll_base, ntdll_name) && ntdll_base != 0)
     {
-        // LdrpVectorHandlerList is an internal symbol - we can try to find it
-        // by scanning for the pattern used in RtlAddVectoredExceptionHandler
-        // The list is a LIST_ENTRY, each node has: Flink, Blink, RefCount(4), Handler(8)
-        // For now, report that VEH enumeration requires symbol resolution
+
+
         json veh_note;
         veh_note["note"] = "VEH list requires ntdll symbol resolution. Use driver_scan_pattern "
                            "to find LdrpVectorHandlerList in ntdll.";
@@ -19310,7 +19292,7 @@ tool_result_t driver_find_code_caves(const json& params)
     const std::uint8_t fill_byte = static_cast<std::uint8_t>(params.value("fill_byte", 0x00));
     const bool executable_only = params.value("executable_only", true);
 
-    // Enumerate all memory regions and scan for gaps filled with the target byte
+
     auto regions = enumerate_all_memory_regions_paginated(
         device.get(), 0x10000, 0x7FFFFFFFFFFF, false);
 
@@ -19325,21 +19307,21 @@ tool_result_t driver_find_code_caves(const json& params)
         if (found >= limit) break;
         if (region.size == 0 || region.size > 0x10000000) continue;
 
-        // Check if the region is executable
-        bool is_exec = (region.protect & 0x10) ||  // PAGE_EXECUTE
-                       (region.protect & 0x20) ||  // PAGE_EXECUTE_READ
-                       (region.protect & 0x40) ||  // PAGE_EXECUTE_READWRITE
-                       (region.protect & 0x80);    // PAGE_EXECUTE_WRITECOPY
+
+        bool is_exec = (region.protect & 0x10) ||
+                       (region.protect & 0x20) ||
+                       (region.protect & 0x40) ||
+                       (region.protect & 0x80);
 
         if (executable_only && !is_exec)
             continue;
 
-        // State must be committed (0x1000)
+
         if ((region.state & 0x1000) == 0)
             continue;
 
-        // Read region in chunks
-        constexpr std::size_t CHUNK = 0x10000; // 64KB chunks
+
+        constexpr std::size_t CHUNK = 0x10000;
         for (std::uint64_t offset = 0; offset < region.size && found < limit; offset += CHUNK)
         {
             const std::size_t to_read = std::min<std::size_t>(CHUNK, region.size - offset);
@@ -19347,7 +19329,7 @@ tool_result_t driver_find_code_caves(const json& params)
             if (device->read_raw(region.base + offset, buf.data(), to_read) == 0)
                 continue;
 
-            // Scan for runs of fill_byte
+
             std::size_t run_start = 0;
             bool in_run = false;
 
@@ -19398,12 +19380,12 @@ tool_result_t driver_scan_memory_value(const json& params)
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
-    // Value type: byte, int16, int32, int64, float, double, string, aob
+
     const std::string value_type = params.value("value_type", "int32");
-    const std::string scan_mode = params.value("scan_mode", "exact"); // exact, range, changed, unchanged, increased, decreased
+    const std::string scan_mode = params.value("scan_mode", "exact");
     const int limit = std::min(params.value("limit", 100), 10000);
 
-    // Get scan range
+
     std::uint64_t scan_start = 0x10000;
     std::uint64_t scan_end = 0x7FFFFFFFFFFF;
     if (params.contains("start"))
@@ -19417,10 +19399,10 @@ tool_result_t driver_scan_memory_value(const json& params)
         if (e) scan_end = *e;
     }
 
-    // Determine value size and parse the target value
+
     std::size_t value_size = 4;
     std::vector<std::uint8_t> search_bytes;
-    std::vector<std::uint8_t> search_bytes_max; // for range mode
+    std::vector<std::uint8_t> search_bytes_max;
 
     if (value_type == "byte")
     {
@@ -19473,7 +19455,7 @@ tool_result_t driver_scan_memory_value(const json& params)
     }
     else if (value_type == "aob")
     {
-        // Array of bytes pattern with wildcards - already handled by driver_scan_pattern
+
         return tool_result_t::error(OBFSTR("Use driver_scan_pattern for AOB/wildcard scans"));
     }
     else
@@ -19483,7 +19465,7 @@ tool_result_t driver_scan_memory_value(const json& params)
 
     if (scan_mode == "range")
     {
-        // Parse max value for range mode
+
         if (value_type == "int32")
         {
             std::int32_t v = static_cast<std::int32_t>(params.value("value_max", 0));
@@ -19496,10 +19478,10 @@ tool_result_t driver_scan_memory_value(const json& params)
             search_bytes_max.assign(reinterpret_cast<const std::uint8_t*>(&v),
                                    reinterpret_cast<const std::uint8_t*>(&v) + 4);
         }
-        // Add other types as needed...
+
     }
 
-    // Enumerate committed readable regions in the scan range
+
     auto regions = enumerate_all_memory_regions_paginated(
         device.get(), scan_start, scan_end, false);
 
@@ -19510,12 +19492,12 @@ tool_result_t driver_scan_memory_value(const json& params)
     {
         if (found >= limit) break;
         if (region.size == 0 || region.size > 0x10000000) continue;
-        if ((region.state & 0x1000) == 0) continue; // committed only
+        if ((region.state & 0x1000) == 0) continue;
         if (region.base < scan_start || region.base >= scan_end) continue;
 
-        // Skip guard/noaccess pages
-        if ((region.protect & 0x01) || // PAGE_NOACCESS
-            (region.protect & 0x100))   // PAGE_GUARD
+
+        if ((region.protect & 0x01) ||
+            (region.protect & 0x100))
             continue;
 
         constexpr std::size_t CHUNK = 0x10000;
@@ -19528,7 +19510,7 @@ tool_result_t driver_scan_memory_value(const json& params)
             if (device->read_raw(region.base + offset, buf.data(), to_read) == 0)
                 continue;
 
-            // Scan buffer for exact match
+
             if (scan_mode == "exact" && !search_bytes.empty())
             {
                 for (std::size_t i = 0; i + value_size <= to_read && found < limit; ++i)
@@ -19538,7 +19520,7 @@ tool_result_t driver_scan_memory_value(const json& params)
                         json m;
                         m["address"] = helpers::format_address(static_cast<ea_t>(region.base + offset + i));
 
-                        // Format the found value for display
+
                         if (value_type == "float")
                         {
                             float fv;
@@ -19569,7 +19551,7 @@ tool_result_t driver_scan_memory_value(const json& params)
             }
             else if (scan_mode == "range" && !search_bytes.empty() && !search_bytes_max.empty())
             {
-                // Range scan for numeric types
+
                 for (std::size_t i = 0; i + value_size <= to_read && found < limit; i += value_size)
                 {
                     bool in_range = false;
@@ -19636,19 +19618,19 @@ tool_result_t driver_pointer_scan(const json& params)
     const std::uint64_t max_offset = params.value("max_offset", 0x1000);
     const int limit = std::min(params.value("limit", 50), 500);
 
-    // Get module base for static pointer base reference
+
     const std::uint64_t image_base = device->get_base_address();
 
-    // Enumerate all readable regions
+
     auto regions = enumerate_all_memory_regions_paginated(
         device.get(), 0x10000, 0x7FFFFFFFFFFF, false);
 
-    // Build a list of all pointer-aligned values in memory that point to target +/- max_offset
+
     struct ptr_hit_t {
-        std::uint64_t address;      // where the pointer was found
-        std::uint64_t value;        // pointer value
-        std::int64_t offset;        // value - target
-        bool is_static;             // in a module's .data/.rdata section
+        std::uint64_t address;
+        std::uint64_t value;
+        std::int64_t offset;
+        bool is_static;
         std::string module_name;
     };
 
@@ -19692,7 +19674,7 @@ tool_result_t driver_pointer_scan(const json& params)
         return hits;
     };
 
-    // Level 0: Find pointers to [target - max_offset, target + max_offset]
+
     std::uint64_t range_lo = target > max_offset ? target - max_offset : 0;
     std::uint64_t range_hi = target + max_offset;
     auto level0 = find_pointers_to_range(range_lo, range_hi, limit * 10);
@@ -19700,7 +19682,7 @@ tool_result_t driver_pointer_scan(const json& params)
     json chains = json::array();
     int chain_count = 0;
 
-    // For each level-0 hit, try to identify if it's relative to a module base (static pointer)
+
     for (auto& hit : level0)
     {
         if (chain_count >= limit) break;
@@ -19711,7 +19693,7 @@ tool_result_t driver_pointer_scan(const json& params)
         chain["pointer_value"] = helpers::format_address(static_cast<ea_t>(hit.value));
         chain["final_offset"] = static_cast<std::int64_t>(hit.value - target);
 
-        // Check if the address is in a known module (= static pointer)
+
         bool is_static = false;
         voyager::device_t::peb_info peb{};
         if (device->read_peb(peb) && peb.ldr_address != 0)
@@ -19865,13 +19847,12 @@ tool_result_t driver_walk_stack(const json& params)
     if (!device->get_thread_context(tid, ctx))
         return tool_result_t::error(OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
 
-    // x64 stack walk: follow RBP chain and also use return addresses
-    // RSP points to current stack position, RBP is frame pointer (when used)
+
     const std::uint64_t rsp = ctx.rsp;
     const std::uint64_t rbp = ctx.rbp;
     const std::uint64_t rip = ctx.rip;
 
-    // Build module list for symbol resolution
+
     struct mod_info_t {
         std::uint64_t base;
         std::uint32_t size;
@@ -19912,7 +19893,7 @@ tool_result_t driver_walk_stack(const json& params)
 
     json frames = json::array();
 
-    // Frame 0: current RIP
+
     {
         json f;
         f["frame"] = 0;
@@ -19924,22 +19905,20 @@ tool_result_t driver_walk_stack(const json& params)
         frames.push_back(std::move(f));
     }
 
-    // Heuristic stack walk: scan RSP upward for return addresses
-    // In x64, return addresses are on the stack; we check if each QWORD
-    // points into a known executable module
-    constexpr std::size_t STACK_READ_SIZE = 0x2000; // 8KB of stack
+
+    constexpr std::size_t STACK_READ_SIZE = 0x2000;
     std::vector<std::uint8_t> stack_buf(STACK_READ_SIZE);
     const std::size_t stack_read = device->read_raw(rsp, stack_buf.data(), STACK_READ_SIZE);
 
     int frame_idx = 1;
-    std::set<std::uint64_t> seen_addresses; // avoid duplicates
+    std::set<std::uint64_t> seen_addresses;
 
     for (std::size_t i = 0; i + 8 <= stack_read && frame_idx < max_frames; i += 8)
     {
         std::uint64_t candidate;
         std::memcpy(&candidate, &stack_buf[i], 8);
 
-        // Check if this looks like a valid code address in a module
+
         if (candidate < 0x10000 || candidate > 0x7FFFFFFFFFFF)
             continue;
 
@@ -19948,19 +19927,17 @@ tool_result_t driver_walk_stack(const json& params)
         if (seen_addresses.count(candidate)) continue;
         seen_addresses.insert(candidate);
 
-        // Verify it's preceded by a CALL instruction (heuristic)
-        // Read a few bytes before the candidate address to check for call opcodes
+
         std::uint8_t pre_bytes[8] = {};
         device->read_raw(candidate - 8, pre_bytes, 8);
 
-        // Common call patterns: E8 xx xx xx xx (near call at -5)
-        // FF 15 (indirect call at -6), FF D0-FF (register call at -2)
+
         bool looks_like_ret_addr = false;
-        if (pre_bytes[3] == 0xE8) looks_like_ret_addr = true;       // call rel32
-        if (pre_bytes[2] == 0xFF && (pre_bytes[3] & 0x38) == 0x10)  // call [mem]
+        if (pre_bytes[3] == 0xE8) looks_like_ret_addr = true;
+        if (pre_bytes[2] == 0xFF && (pre_bytes[3] & 0x38) == 0x10)
             looks_like_ret_addr = true;
         if (pre_bytes[6] == 0xFF && pre_bytes[7] >= 0xD0 && pre_bytes[7] <= 0xD7)
-            looks_like_ret_addr = true; // call reg
+            looks_like_ret_addr = true;
 
         if (!looks_like_ret_addr) continue;
 
@@ -20001,9 +19978,7 @@ tool_result_t driver_assemble(const json& params)
         return 0x140000000ULL;
     }();
 
-    // Simple x86-64 assembler for the most common instructions
-    // Supports: NOP, RET, INT3, PUSH reg, POP reg, MOV reg/imm, JMP rel, CALL rel,
-    // XOR reg,reg, SUB RSP, ADD RSP
+
     std::vector<std::uint8_t> output;
     std::string error_msg;
 
@@ -20042,7 +20017,7 @@ tool_result_t driver_assemble(const json& params)
         return reg.size() >= 2 && (reg[0] == 'R' || (reg[0] == 'R' && std::isdigit(reg[1])));
     };
 
-    // Split input into lines
+
     std::istringstream stream(assembly_text);
     std::string line;
     int line_num = 0;
@@ -20054,7 +20029,7 @@ tool_result_t driver_assemble(const json& params)
         line = trim(line);
         if (line.empty() || line[0] == ';') continue;
 
-        // Remove inline comments
+
         auto semi_pos = line.find(';');
         if (semi_pos != std::string::npos)
             line = trim(line.substr(0, semi_pos));
@@ -20091,7 +20066,7 @@ tool_result_t driver_assemble(const json& params)
         }
         else if (upper.substr(0, 3) == "XOR")
         {
-            // XOR REG, REG (zeroing idiom)
+
             auto comma = upper.find(',');
             if (comma == std::string::npos) { error_msg = "Invalid XOR at line " + std::to_string(line_num); break; }
             std::string op1 = trim(upper.substr(3, comma - 3));
@@ -20121,7 +20096,7 @@ tool_result_t driver_assemble(const json& params)
         }
         else if (upper.substr(0, 3) == "MOV")
         {
-            // MOV REG, IMM64
+
             auto comma = upper.find(',');
             if (comma == std::string::npos) { error_msg = "Invalid MOV at line " + std::to_string(line_num); break; }
             std::string dest = trim(upper.substr(3, comma - 3));
@@ -20129,7 +20104,7 @@ tool_result_t driver_assemble(const json& params)
             int rd = reg_to_idx(dest);
             if (rd < 0) { error_msg = "Unknown register in MOV at line " + std::to_string(line_num); break; }
 
-            // Try to parse src as immediate
+
             std::uint64_t imm = 0;
             try {
                 if (src.size() > 2 && src[0] == '0' && (src[1] == 'X' || src[1] == 'x'))
@@ -20143,7 +20118,7 @@ tool_result_t driver_assemble(const json& params)
 
             if (is_reg64(dest))
             {
-                // REX.W + B8+rd io
+
                 std::uint8_t rex = 0x48;
                 int r = rd;
                 if (r >= 8) { rex |= 0x01; r -= 8; }
@@ -20154,7 +20129,7 @@ tool_result_t driver_assemble(const json& params)
             }
             else
             {
-                // B8+rd id (32-bit)
+
                 int r = rd;
                 if (r >= 8) { output.push_back(0x41); r -= 8; }
                 output.push_back(static_cast<std::uint8_t>(0xB8 + r));
@@ -20167,7 +20142,7 @@ tool_result_t driver_assemble(const json& params)
             bool is_call = upper[0] == 'C';
             std::string operand = trim(upper.substr(is_call ? 4 : 3));
 
-            // Try as register
+
             int reg = reg_to_idx(operand);
             if (reg >= 0)
             {
@@ -20181,7 +20156,7 @@ tool_result_t driver_assemble(const json& params)
             }
             else
             {
-                // Try as absolute address -> encode as relative
+
                 std::uint64_t target_addr = 0;
                 try {
                     if (operand.size() > 2 && operand[0] == '0' && (operand[1] == 'X' || operand[1] == 'x'))
@@ -20193,7 +20168,7 @@ tool_result_t driver_assemble(const json& params)
                     break;
                 }
 
-                std::uint64_t next_rip = current_addr + output.size() + 5; // 5 = opcode(1) + rel32(4)
+                std::uint64_t next_rip = current_addr + output.size() + 5;
                 std::int64_t rel = static_cast<std::int64_t>(target_addr) - static_cast<std::int64_t>(next_rip);
                 if (rel < INT32_MIN || rel > INT32_MAX)
                 {
@@ -20268,7 +20243,7 @@ tool_result_t driver_assemble(const json& params)
     if (output.empty())
         return tool_result_t::error(OBFSTR("No instructions assembled"));
 
-    // Format output hex
+
     std::ostringstream hex_ss;
     for (std::size_t i = 0; i < output.size(); ++i)
     {
@@ -20283,7 +20258,7 @@ tool_result_t driver_assemble(const json& params)
     result["bytes"] = json::array();
     for (auto b : output) result["bytes"].push_back(b);
 
-    // If write_to param is specified, write the assembled bytes to target process memory
+
     if (params.contains("write_to"))
     {
         auto write_addr = helpers::parse_address(params["write_to"].get<std::string>());
@@ -20299,7 +20274,7 @@ tool_result_t driver_assemble(const json& params)
     return tool_result_t::ok(std::to_string(output.size()) + OBFSTR(" bytes assembled"), result);
 }
 
-// Memory snapshot storage for differential comparison
+
 static std::map<std::string, std::vector<std::uint8_t>> s_memory_snapshots;
 static std::mutex s_snapshot_mutex;
 
@@ -20349,7 +20324,7 @@ tool_result_t driver_compare_memory_snapshot(const json& params)
         auto addr_opt = helpers::parse_address(params["address"].get<std::string>());
         if (!addr_opt) return tool_result_t::error(OBFSTR("Invalid address"));
 
-        // Find the matching snapshot
+
         std::vector<std::uint8_t> old_snapshot;
         std::string found_key;
         {
@@ -20374,7 +20349,7 @@ tool_result_t driver_compare_memory_snapshot(const json& params)
         std::size_t read = device->read_raw(*addr_opt, current.data(), size);
         if (read == 0) return tool_result_t::error(OBFSTR("Failed to read current memory for comparison"));
 
-        // Find differences
+
         json diffs = json::array();
         int diff_count = 0;
         const int max_diffs = std::min(params.value("max_diffs", 200), 5000);
@@ -20451,7 +20426,7 @@ tool_result_t driver_find_references(const json& params)
     const bool scan_code = params.value("scan_code", true);
     const bool scan_data = params.value("scan_data", true);
 
-    // Prepare the target as bytes for scanning
+
     std::uint8_t target_bytes[8];
     std::memcpy(target_bytes, &target, 8);
 
@@ -20484,7 +20459,7 @@ tool_result_t driver_find_references(const json& params)
             if (device->read_raw(region.base + off3, buf.data(), to_read) == 0)
                 continue;
 
-            // Scan for 8-byte pointer matches
+
             for (std::size_t i = 0; i + 8 <= to_read && found < limit; ++i)
             {
                 if (std::memcmp(&buf[i], target_bytes, 8) == 0)
@@ -20499,7 +20474,7 @@ tool_result_t driver_find_references(const json& params)
                 }
             }
 
-            // Also scan for 4-byte RIP-relative references in code sections
+
             if (is_exec && scan_code)
             {
                 for (std::size_t i = 0; i + 4 <= to_read && found < limit; ++i)
@@ -20509,11 +20484,11 @@ tool_result_t driver_find_references(const json& params)
                     std::uint64_t effective = region.base + off3 + i + 4 + rel32;
                     if (effective == target)
                     {
-                        // Check if preceded by a RIP-relative opcode (LEA, MOV, CALL, etc.)
+
                         if (i >= 1)
                         {
                             std::uint8_t prev = buf[i - 1];
-                            // Common: 0x8D (LEA), 0x8B (MOV), 0xE8/0xE9 handled above
+
                             if (prev == 0x8D || prev == 0x8B || prev == 0x05 || prev == 0x0D ||
                                 prev == 0x15 || prev == 0x1D || prev == 0x25 || prev == 0x2D ||
                                 prev == 0x35 || prev == 0x3D)
@@ -20560,12 +20535,12 @@ tool_result_t driver_read_teb(const json& params)
     if (teb_addr == 0)
         return tool_result_t::error(OBFSTR("TEB address is null"));
 
-    // Read key TEB fields (Windows x64 layout)
+
     json teb;
     teb["teb_address"] = helpers::format_address(static_cast<ea_t>(teb_addr));
     teb["thread_id"] = tid;
 
-    // NT_TIB (offset 0x00)
+
     teb["exception_list"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x00)));
     teb["stack_base"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x08)));
     teb["stack_limit"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x10)));
@@ -20574,7 +20549,7 @@ tool_result_t driver_read_teb(const json& params)
     teb["arbitrary_user_pointer"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x28)));
     teb["self"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x30)));
 
-    // Key TEB fields
+
     teb["environment_pointer"] = helpers::format_address(static_cast<ea_t>(device->read<std::uint64_t>(teb_addr + 0x38)));
     teb["client_id_process"] = device->read<std::uint64_t>(teb_addr + 0x40);
     teb["client_id_thread"] = device->read<std::uint64_t>(teb_addr + 0x48);
@@ -20584,7 +20559,7 @@ tool_result_t driver_read_teb(const json& params)
     teb["last_error_value"] = device->read<std::uint32_t>(teb_addr + 0x68);
     teb["count_of_owned_critical_sections"] = device->read<std::uint32_t>(teb_addr + 0x6C);
 
-    // TLS slots (offset 0x1480 for TlsSlots, 0x1780 for TlsExpansionSlots)
+
     json tls_slots = json::array();
     for (int i = 0; i < 64; ++i)
     {
@@ -20599,11 +20574,11 @@ tool_result_t driver_read_teb(const json& params)
     }
     teb["active_tls_slots"] = std::move(tls_slots);
 
-    // Stack committed/reserved
+
     std::uint64_t dealloc_stack = device->read<std::uint64_t>(teb_addr + 0x1478);
     teb["deallocation_stack"] = helpers::format_address(static_cast<ea_t>(dealloc_stack));
 
-    // Compute stack usage
+
     std::uint64_t stack_base_val = device->read<std::uint64_t>(teb_addr + 0x08);
     std::uint64_t stack_limit_val = device->read<std::uint64_t>(teb_addr + 0x10);
     if (stack_base_val > stack_limit_val)
@@ -20619,21 +20594,17 @@ tool_result_t driver_map_peb_modules(const json& params)
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
-    const std::string order = params.value("order", "all"); // load, memory, init, all
+    const std::string order = params.value("order", "all");
     const std::string filter = to_lower_ascii_copy(params.value("filter", ""));
 
     voyager::device_t::peb_info peb{};
     if (!device->read_peb(peb) || peb.ldr_address == 0)
         return tool_result_t::error(OBFSTR("Failed to read PEB or LDR address is null"));
 
-    // PEB_LDR_DATA offsets:
-    // +0x10 InLoadOrderModuleList
-    // +0x20 InMemoryOrderModuleList
-    // +0x30 InInitializationOrderModuleList
 
     struct ldr_entry_offsets_t {
         std::uint64_t list_head_offset;
-        std::uint64_t base_dll_field_offset;  // Offset from Flink to DllBase within LDR_DATA_TABLE_ENTRY
+        std::uint64_t base_dll_field_offset;
         std::string name;
     };
 
@@ -20642,9 +20613,9 @@ tool_result_t driver_map_peb_modules(const json& params)
     if (order == "load" || order == "all")
         lists_to_walk.push_back({0x10, 0x30, "InLoadOrder"});
     if (order == "memory" || order == "all")
-        lists_to_walk.push_back({0x20, 0x20, "InMemoryOrder"}); // base at -0x10 from entry
+        lists_to_walk.push_back({0x20, 0x20, "InMemoryOrder"});
     if (order == "init" || order == "all")
-        lists_to_walk.push_back({0x30, 0x10, "InInitializationOrder"}); // base at -0x20 from entry
+        lists_to_walk.push_back({0x30, 0x10, "InInitializationOrder"});
 
     json all_lists;
 
@@ -20659,10 +20630,8 @@ tool_result_t driver_map_peb_modules(const json& params)
 
         while (current != 0 && current != list_head && iter++ < MAX_ITER)
         {
-            // Compute the LDR_DATA_TABLE_ENTRY base from the list entry
-            // InLoadOrder: entry IS the LDR_DATA_TABLE_ENTRY
-            // InMemoryOrder: entry is at offset +0x10 in the LDR_DATA_TABLE_ENTRY
-            // InInitOrder: entry is at offset +0x20 in the LDR_DATA_TABLE_ENTRY
+
+
             std::uint64_t ldr_entry;
             if (list_info.list_head_offset == 0x10)
                 ldr_entry = current;
@@ -20720,7 +20689,7 @@ tool_result_t driver_map_peb_modules(const json& params)
             mod["load_count"] = load_count;
             mod["tls_index"] = tls_index;
 
-            // Decode common flags
+
             json flag_details;
             flag_details["packed_redirected"] = (flags & 0x00000002) != 0;
             flag_details["static_import"] = (flags & 0x00000020) != 0;
@@ -20770,17 +20739,17 @@ tool_result_t driver_set_page_guard(const json& params)
 
     if (operation == "set")
     {
-        // Query current protection first
-        voyager::detail::region_entry region{};
+
+        voyager::device_t::memory_region_info region{};
         if (!device->query_memory(target_addr, region))
             return tool_result_t::error(OBFSTR("Failed to query memory at ") +
                                         helpers::format_address(static_cast<ea_t>(target_addr)));
 
         std::uint32_t current_protect = region.protect;
-        std::uint32_t new_protect = current_protect | 0x100; // PAGE_GUARD flag
+        std::uint32_t new_protect = current_protect | 0x100;
 
         std::uint32_t old_protect = 0;
-        if (!device->protect_memory(target_addr, size, new_protect, old_protect))
+        if (!device->protect_memory(target_addr, size, new_protect, &old_protect))
             return tool_result_t::error(OBFSTR("Failed to set PAGE_GUARD at ") +
                                         helpers::format_address(static_cast<ea_t>(target_addr)));
 
@@ -20797,13 +20766,13 @@ tool_result_t driver_set_page_guard(const json& params)
     }
     else if (operation == "remove")
     {
-        voyager::detail::region_entry region{};
+        voyager::device_t::memory_region_info region{};
         if (!device->query_memory(target_addr, region))
             return tool_result_t::error(OBFSTR("Failed to query memory"));
 
-        std::uint32_t new_protect = region.protect & ~0x100u; // Clear PAGE_GUARD
+        std::uint32_t new_protect = region.protect & ~0x100u;
         std::uint32_t old_protect = 0;
-        if (!device->protect_memory(target_addr, size, new_protect, old_protect))
+        if (!device->protect_memory(target_addr, size, new_protect, &old_protect))
             return tool_result_t::error(OBFSTR("Failed to remove PAGE_GUARD"));
 
         json result;
@@ -20816,7 +20785,7 @@ tool_result_t driver_set_page_guard(const json& params)
     }
     else if (operation == "query")
     {
-        voyager::detail::region_entry region{};
+        voyager::device_t::memory_region_info region{};
         if (!device->query_memory(target_addr, region))
             return tool_result_t::error(OBFSTR("Failed to query memory"));
 
@@ -20835,9 +20804,6 @@ tool_result_t driver_set_page_guard(const json& params)
     return tool_result_t::error(OBFSTR("Invalid operation. Use 'set', 'remove', or 'query'."));
 }
 
-// =========================================================================
-// End of new CE/x64dbg-inspired tools
-// =========================================================================
 
 void register_tools()
 {
@@ -21590,7 +21556,6 @@ void register_tools()
         {{OBFSTR("kernel"), OBFSTR("boolean"), OBFSTR("Scan kernel space instead of attached process (default: false)"), false}},
         driver_detect_hidden_modules, true});
 
-    // ---- New CE / x64dbg-inspired tools ----
 
     registry.register_tool({
         OBFSTR("driver_walk_heap"), OBFSTR("driver"),

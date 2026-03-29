@@ -40,7 +40,7 @@ const LICENSE_SIGNING_PRIVATE_KEY_B64 = defineSecret("AIDA_LICENSE_SIGNING_PRIVA
 let cachedSigningPrivateKey = null;
 
 // Discord Webhook URL for violation/ban logging
-const DISCORD_WEBHOOK_URL = process.env.AIDA_DISCORD_WEBHOOK || "https://discord.com/api/webhooks/1480568475662680267/2-xnnIj8owZxIQST1XpJ0aqN8Ec-nskmKLFuIpZZSnMVoKsaHKb66pyh6GCp3q9WnXm9";
+const DISCORD_WEBHOOK_URL = process.env.AIDA_DISCORD_WEBHOOK || "https://discord.com/api/webhooks/1487822472207138869/nXIS-mL2ExeO_mRKEHOGUGyw-N8gtLRsKrNSn2zxTtsFQysVVC0CekF238oDbx7WmRGA";
 
 // In-memory rate limiter (per Cloud Function instance)
 const rateLimitMap = new Map();

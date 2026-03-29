@@ -1029,6 +1029,7 @@ namespace voyager {
             std::uint64_t rip, rflags;
             std::uint64_t cs, ss;
             std::uint64_t dr0, dr1, dr2, dr3, dr6, dr7;
+            std::uint64_t kernel_gs_base;
         };
 
         struct thread_info {
