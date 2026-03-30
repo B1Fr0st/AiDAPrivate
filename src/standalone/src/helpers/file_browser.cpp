@@ -1,13 +1,4 @@
-/*
- * file_browser.cpp
- *
- * Implements the file browser panel for the standalone AiDA IDE layout.
- * Provides filesystem tree navigation (expand/collapse directories) and
- * opens PE files into the Zydis disassembler when clicked.
- */
 
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shlobj.h>
 
@@ -26,14 +17,12 @@ namespace fs = std::filesystem;
 extern HWND g_hwnd;
 extern DisasmState g_disasm;
 
-// ============================================================================
-//  file_browser::refresh
-// ============================================================================
+
 void file_browser::refresh(const std::string& dir)
 {
     std::string root = dir;
 
-    // Default to current working directory on first call
+
     if (root.empty() && current_dir.empty()) {
         char buf[MAX_PATH] = {};
         GetCurrentDirectoryA(MAX_PATH, buf);
@@ -45,11 +34,10 @@ void file_browser::refresh(const std::string& dir)
 
     if (current_dir.empty()) return;
 
-    // Copy path to editable buffer
+
     strncpy_s(path_buf, sizeof(path_buf), current_dir.c_str(), _TRUNCATE);
 
-    // Build a flat list from the directory tree, preserving expanded state
-    // First, collect which paths were previously expanded
+
     std::vector<std::string> expanded_paths;
     for (auto& e : entries)
         if (e.is_dir && e.expanded)
@@ -58,7 +46,7 @@ void file_browser::refresh(const std::string& dir)
     entries.clear();
     needs_refresh = false;
 
-    // Recursive helper to populate entries
+
     struct local {
         static void scan(const std::string& path, int depth,
                          const std::vector<std::string>& expanded_set,
@@ -74,12 +62,12 @@ void file_browser::refresh(const std::string& dir)
                 e.name      = it.path().filename().string();
                 e.depth     = depth;
 
-                // Skip hidden/system files
+
                 if (!e.name.empty() && e.name[0] == '.') continue;
 
                 if (it.is_directory(ec) && !ec) {
                     e.is_dir = true;
-                    // Restore expanded state
+
                     for (auto& ep : expanded_set)
                         if (ep == e.full_path) { e.expanded = true; break; }
                     dirs.push_back(std::move(e));
@@ -89,7 +77,7 @@ void file_browser::refresh(const std::string& dir)
                 }
             }
 
-            // Sort: directories first, then files, alphabetical within each
+
             std::sort(dirs.begin(), dirs.end(),
                 [](const FileBrowserEntry& a, const FileBrowserEntry& b)
                 { return _stricmp(a.name.c_str(), b.name.c_str()) < 0; });
@@ -111,9 +99,7 @@ void file_browser::refresh(const std::string& dir)
     local::scan(current_dir, 0, expanded_paths, entries);
 }
 
-// ============================================================================
-//  file_browser::toggle_dir
-// ============================================================================
+
 void file_browser::toggle_dir(int idx)
 {
     if (idx < 0 || idx >= (int)entries.size()) return;
@@ -124,23 +110,21 @@ void file_browser::toggle_dir(int idx)
     needs_refresh = true;
 }
 
-// ============================================================================
-//  file_browser::open_file
-// ============================================================================
+
 void file_browser::open_file(int idx)
 {
     if (idx < 0 || idx >= (int)entries.size()) return;
     auto& ent = entries[idx];
     if (ent.is_dir) return;
 
-    // Determine extension
+
     std::string ext;
     auto dot = ent.name.rfind('.');
     if (dot != std::string::npos)
         ext = ent.name.substr(dot);
     for (auto& c : ext) c = (char)tolower((unsigned char)c);
 
-    // Text/source file extensions
+
     static const char* text_exts[] = {
         ".cpp", ".c", ".h", ".hpp", ".hxx", ".cxx", ".cc",
         ".py", ".js", ".ts", ".json", ".xml", ".yaml", ".yml",
@@ -156,17 +140,17 @@ void file_browser::open_file(int idx)
     }
 
     if (is_text) {
-        // Load as text file into the code editor
+
         std::ifstream ifs(ent.full_path, std::ios::in);
         if (ifs.is_open()) {
             std::ostringstream ss;
             ss << ifs.rdbuf();
-            code_editor::load(ss.str(), ent.name, ent.full_path);
-            // Deactivate disasm view
+            file_tabs::open_or_focus(ent.full_path, ent.name, ss.str());
+
             g_disasm.file = DisasmFile{};
         }
     } else {
-        // Try loading as PE binary
+
         code_editor::active = false;
         code_editor::buffer.clear();
         code_editor::filename.clear();

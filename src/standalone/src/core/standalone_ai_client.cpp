@@ -32,11 +32,13 @@ standalone_ai_client_t::~standalone_ai_client_t()
 
 bool standalone_ai_client_t::is_available() const
 {
-    const auto& key = _settings.get_active_api_key();
     const auto& model = _settings.get_active_model();
-    if (_settings.api_provider == "local_llm")
-        return !_settings.local_llm_base_url.empty();
-    return !key.empty() && !model.empty();
+    const auto kind = _settings.get_active_profile_kind();
+    if (kind == "local")
+        return !_settings.get_active_base_url().empty() && !model.empty();
+    if (kind == "gemini" || kind == "anthropic" || kind == "openrouter")
+        return !_settings.get_active_api_key().empty() && !model.empty();
+    return !_settings.get_active_base_url().empty() && !model.empty();
 }
 
 
@@ -174,13 +176,13 @@ std::string standalone_ai_client_t::do_generate(
     ai_stream_chunk_t on_chunk,
     ai_stop_predicate_t stop_check)
 {
-    const auto& provider = _settings.api_provider;
+    const auto provider = _settings.get_active_profile_kind();
     if (provider == "gemini")      return generate_gemini(prompt, temperature, on_chunk, stop_check);
-    if (provider == "openai")      return generate_openai(prompt, temperature, on_chunk, stop_check);
+    if (provider == "openai_compatible") return generate_openai(prompt, temperature, on_chunk, stop_check);
     if (provider == "anthropic")   return generate_anthropic(prompt, temperature, on_chunk, stop_check);
     if (provider == "openrouter")  return generate_openrouter(prompt, temperature, on_chunk, stop_check);
-    if (provider == "local_llm")   return generate_local(prompt, temperature, on_chunk, stop_check);
-    return "Error: Unknown API provider: " + provider;
+    if (provider == "local")       return generate_local(prompt, temperature, on_chunk, stop_check);
+    return "Error: Unknown provider kind: " + provider;
 }
 
 
@@ -325,11 +327,9 @@ std::string standalone_ai_client_t::generate_gemini(
     const std::string& prompt, double temperature,
     ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
 {
-    std::string base_url = _settings.gemini_base_url.empty()
-        ? "https://generativelanguage.googleapis.com" : _settings.gemini_base_url;
-
-    std::string model = _settings.gemini_model_name;
-    std::string api_key = _settings.gemini_api_key;
+    std::string base_url = _settings.get_active_base_url();
+    std::string model = _settings.get_active_model();
+    std::string api_key = _settings.get_active_api_key();
 
     json body = {
         {"contents", json::array({
@@ -365,10 +365,8 @@ std::string standalone_ai_client_t::generate_openai(
     const std::string& prompt, double temperature,
     ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
 {
-    std::string base_url = _settings.openai_base_url.empty()
-        ? "https://api.openai.com" : _settings.openai_base_url;
-
-    std::string model = _settings.openai_model_name;
+    std::string base_url = _settings.get_active_base_url();
+    std::string model = _settings.get_active_model();
 
     json body = {
         {"model", model},
@@ -381,10 +379,10 @@ std::string standalone_ai_client_t::generate_openai(
         {"stream", on_chunk != nullptr}
     };
 
-    std::map<std::string, std::string> headers = {
-        {"Authorization", "Bearer " + _settings.openai_api_key},
-        {"Content-Type", "application/json"}
-    };
+    std::map<std::string, std::string> headers = _settings.get_active_headers();
+    if (!_settings.get_active_api_key().empty())
+        headers["Authorization"] = "Bearer " + _settings.get_active_api_key();
+    headers["Content-Type"] = "application/json";
 
     if (on_chunk) {
         return streaming_post(base_url, "/v1/chat/completions", headers, body.dump(),
@@ -413,10 +411,8 @@ std::string standalone_ai_client_t::generate_anthropic(
     const std::string& prompt, double temperature,
     ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
 {
-    std::string base_url = _settings.anthropic_base_url.empty()
-        ? "https://api.anthropic.com" : _settings.anthropic_base_url;
-
-    std::string model = _settings.anthropic_model_name;
+    std::string base_url = _settings.get_active_base_url();
+    std::string model = _settings.get_active_model();
 
     std::string clean_model = model;
     for (const char* suffix : {" (Max Effort)", " (High Effort)", " (Medium Effort)",
@@ -439,11 +435,10 @@ std::string standalone_ai_client_t::generate_anthropic(
     if (clean_model.find("thought") == std::string::npos)
         body["temperature"] = temperature;
 
-    std::map<std::string, std::string> headers = {
-        {"x-api-key", _settings.anthropic_api_key},
-        {"anthropic-version", "2023-06-01"},
-        {"Content-Type", "application/json"}
-    };
+    std::map<std::string, std::string> headers = _settings.get_active_headers();
+    headers["x-api-key"] = _settings.get_active_api_key();
+    headers["anthropic-version"] = "2023-06-01";
+    headers["Content-Type"] = "application/json";
 
     if (on_chunk) {
         return streaming_post(base_url, "/v1/messages", headers, body.dump(),
@@ -478,7 +473,8 @@ std::string standalone_ai_client_t::generate_openrouter(
     const std::string& prompt, double temperature,
     ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
 {
-    std::string model = _settings.openrouter_model_name;
+    std::string model = _settings.get_active_model();
+    std::string base_url = _settings.get_active_base_url();
 
     json body = {
         {"model", model},
@@ -489,14 +485,13 @@ std::string standalone_ai_client_t::generate_openrouter(
         {"stream", on_chunk != nullptr}
     };
 
-    std::map<std::string, std::string> headers = {
-        {"Authorization", "Bearer " + _settings.openrouter_api_key},
-        {"X-Title", "AiDA Standalone"},
-        {"Content-Type", "application/json"}
-    };
+    std::map<std::string, std::string> headers = _settings.get_active_headers();
+    headers["Authorization"] = "Bearer " + _settings.get_active_api_key();
+    headers["X-Title"] = "AiDA Standalone";
+    headers["Content-Type"] = "application/json";
 
     if (on_chunk) {
-        return streaming_post("https://openrouter.ai", "/api/v1/chat/completions",
+        return streaming_post(base_url, "/api/v1/chat/completions",
             headers, body.dump(),
             [](const std::string& sse_data) -> std::string {
                 auto j = json::parse(sse_data, nullptr, false);
@@ -510,7 +505,7 @@ std::string standalone_ai_client_t::generate_openrouter(
             }, on_chunk, stop_check);
     }
 
-    return simple_post("https://openrouter.ai", "/api/v1/chat/completions",
+    return simple_post(base_url, "/api/v1/chat/completions",
         headers, body.dump(),
         [](const json& j) -> std::string {
             return j["choices"][0]["message"]["content"].get<std::string>();
@@ -522,10 +517,10 @@ std::string standalone_ai_client_t::generate_local(
     const std::string& prompt, double temperature,
     ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
 {
-    std::string base_url = _settings.local_llm_base_url;
+    std::string base_url = _settings.get_active_base_url();
     if (base_url.empty()) return "Error: Local LLM base URL not configured.";
 
-    std::string model = _settings.local_llm_model_name;
+    std::string model = _settings.get_active_model();
     if (model.empty()) model = "llama3:latest";
 
     json body = {
@@ -537,9 +532,10 @@ std::string standalone_ai_client_t::generate_local(
         {"stream", on_chunk != nullptr}
     };
 
-    std::map<std::string, std::string> headers = {{"Content-Type", "application/json"}};
-    if (!_settings.local_llm_api_key.empty())
-        headers["Authorization"] = "Bearer " + _settings.local_llm_api_key;
+    std::map<std::string, std::string> headers = _settings.get_active_headers();
+    headers["Content-Type"] = "application/json";
+    if (!_settings.get_active_api_key().empty())
+        headers["Authorization"] = "Bearer " + _settings.get_active_api_key();
 
     if (on_chunk) {
         return streaming_post(base_url, "/v1/chat/completions", headers, body.dump(),

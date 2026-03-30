@@ -1,8 +1,5 @@
 
-
 #pragma once
-
-#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commdlg.h>
 
@@ -107,8 +104,9 @@ inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va)
         return ins;
     }
 
-    ins.len = instruction.length;
-    memcpy(ins.raw, code, std::min((int)instruction.length, 16));
+    ins.len = static_cast<int>(instruction.length);
+    const int copy_len = (ins.len < 16) ? ins.len : 16;
+    memcpy(ins.raw, code, static_cast<size_t>(copy_len));
 
 
     char full[256] = {};
@@ -231,7 +229,8 @@ namespace disasm
     {
         file.instrs.clear();
         if (file.sections.empty()) return;
-        file.instrs.reserve(std::min((int)file.sections[0].bytes.size() / 3, MAX_INSTRS));
+        const int reserve_count = static_cast<int>(file.sections[0].bytes.size() / 3);
+        file.instrs.reserve(static_cast<size_t>((reserve_count < MAX_INSTRS) ? reserve_count : MAX_INSTRS));
 
         for (auto& section : file.sections) {
             const uint8_t* data = section.bytes.data();
@@ -250,9 +249,11 @@ namespace disasm
                     return;
                 }
 
-                int avail = std::min(sz - off, 15);
+                const int remaining = sz - off;
+                const int avail = (remaining < 15) ? remaining : 15;
                 AsmInstr ins = zydis_decode_one(data + off, avail, va + off);
-                memcpy(ins.raw, data + off, std::min(ins.len, 15));
+                const int raw_len = (ins.len < 15) ? ins.len : 15;
+                memcpy(ins.raw, data + off, static_cast<size_t>(raw_len));
                 file.instrs.push_back(ins);
                 off += ins.len;
             }

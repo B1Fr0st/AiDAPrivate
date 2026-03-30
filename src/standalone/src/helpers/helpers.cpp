@@ -1,5 +1,3 @@
-#define NOMINMAX
-
 #include "helpers.h"
 #include "globals.h"
 #include <commdlg.h>
@@ -15,6 +13,7 @@
 #include "../assets/icons.h"
 #include "../core/zydis_disasm.hpp"
 #include "../core/standalone_chat.hpp"
+#include "../core/standalone_license.hpp"
 #include "../core/standalone_settings.hpp"
 
 static ID3D11ShaderResourceView* g_send_icon_srv    = nullptr;
@@ -35,7 +34,7 @@ ID3D11ShaderResourceView* helpers::theme_mio = nullptr;
 ID3D11ShaderResourceView* helpers::theme_kaneki = nullptr;
 bool helpers::themes_loaded = false;
 
-// Background art and app logo (compiled in embedded_assets.cpp)
+
 extern unsigned char background[];
 extern unsigned char aidalogo[];
 static ID3D11ShaderResourceView* g_bg_art_srv = nullptr;
@@ -43,6 +42,10 @@ static int g_bg_art_w = 0, g_bg_art_h = 0;
 static bool g_bg_art_loaded = false;
 
 static int g_theme_icon_w[4] = {}, g_theme_icon_h[4] = {};
+static ID3D11ShaderResourceView* g_custom_theme_icon_srv = nullptr;
+static int g_custom_theme_icon_w = 0;
+static int g_custom_theme_icon_h = 0;
+static std::string g_custom_theme_icon_path;
 
 int helpers::active_tab = 0;
 int helpers::active_subsection = 0;
@@ -152,10 +155,6 @@ void helpers::begin_child(const char* str_id, ImVec2 pos, ImVec2 size, float alp
 
 	ImVec2 r_min = ImVec2(std::round(wp.x + pos.x), std::round(wp.y + pos.y));
 	ImVec2 r_max = ImVec2(std::round(r_min.x + size.x), std::round(r_min.y + size.y));
-
-	float ax = globals::ui::accent.x * 255.f;
-	float ay = globals::ui::accent.y * 255.f;
-	float az = globals::ui::accent.z * 255.f;
 
 	dl->AddRectFilled(r_min, r_max, IM_COL32(22, 22, 28, (int)(210 * alpha)), 8.f);
 
@@ -299,6 +298,7 @@ int helpers::subsection(const char** labels, int count, ImVec2 pos, int& state)
 
 void helpers::add_key(const char* label, CKeybind* keybind)
 {
+	(void)label;
 	ImDrawList* dl = ImGui::GetForegroundDrawList();
 	ImVec2 wp = ImGui::GetWindowPos();
 	ImU32 accent_col = IM_COL32(globals::ui::accent.x * 255, globals::ui::accent.y * 255, globals::ui::accent.z * 255, 255);
@@ -378,7 +378,6 @@ void helpers::add_key(const char* label, CKeybind* keybind)
 	if (key_op > 0.01f)
 	{
 		ImU32 tc = keybind->waiting_for_input ? accent_col : IM_COL32(255, 255, 255, (int)(255 * key_op));
-		ImU32 sc = IM_COL32(0, 0, 0, (int)(255 * key_op));
 		ImVec2 tp = ImVec2(std::round(btn_min.x + (cur_w - key_ts.x) * 0.5f), std::round(btn_min.y + (closed_h - key_ts.y) * 0.5f - 1.0f));
 
 		dl->AddText(tp, tc, key_name.c_str());
@@ -408,7 +407,6 @@ void helpers::add_key(const char* label, CKeybind* keybind)
 			ImU32 oc = sel ?
 				IM_COL32((int)(globals::ui::accent.x * 255), (int)(globals::ui::accent.y * 255), (int)(globals::ui::accent.z * 255), (int)(255 * op)) :
 				IM_COL32(255, 255, 255, (int)(255 * op));
-			ImU32 os = IM_COL32(0, 0, 0, (int)(255 * op));
 
 			if (otp.y + ots.y <= btn_max.y - 2.0f)
 			{
@@ -426,7 +424,7 @@ void helpers::render_title()
 	float dt = ImGui::GetIO().DeltaTime;
 	globals::ui::load_timer += dt;
 
-	// Resolve active theme (built-in or custom)
+
 	if (custom_themes::active_custom >= 0 &&
 	    custom_themes::active_custom < (int)custom_themes::list.size()) {
 		auto& ct = custom_themes::list[custom_themes::active_custom];
@@ -446,7 +444,7 @@ void helpers::render_title()
 	}
 	globals::ui::accent = themes::resolved.accent;
 
-	// Load theme icon textures (once)
+
 	if (!helpers::themes_loaded && g_pd3dDevice) {
 		icon_loader::load(kaneki, sizeof(kaneki), &helpers::theme_kaneki,
 			&g_theme_icon_w[0], &g_theme_icon_h[0], false);
@@ -459,15 +457,50 @@ void helpers::render_title()
 		helpers::themes_loaded = true;
 	}
 
-	// Load background art (once)
+
 	if (!g_bg_art_loaded && g_pd3dDevice) {
 		icon_loader::load(background, 8640831, &g_bg_art_srv,
 			&g_bg_art_w, &g_bg_art_h, false);
 		g_bg_art_loaded = true;
 	}
 
-	// Get the active theme icon SRV
+	std::string active_custom_icon_path;
+	if (custom_themes::active_custom >= 0 &&
+	    custom_themes::active_custom < (int)custom_themes::list.size()) {
+		active_custom_icon_path = custom_themes::list[custom_themes::active_custom].icon_file_path;
+	} else if (!g_sa_settings.custom_icon_path.empty()) {
+		active_custom_icon_path = g_sa_settings.custom_icon_path;
+	}
+
+	if (!active_custom_icon_path.empty() &&
+	    active_custom_icon_path != g_custom_theme_icon_path &&
+	    g_pd3dDevice) {
+		if (g_custom_theme_icon_srv) {
+			g_custom_theme_icon_srv->Release();
+			g_custom_theme_icon_srv = nullptr;
+		}
+		g_custom_theme_icon_w = g_custom_theme_icon_h = 0;
+		if (icon_loader::load_file(active_custom_icon_path.c_str(), &g_custom_theme_icon_srv,
+			&g_custom_theme_icon_w, &g_custom_theme_icon_h, false))
+			g_custom_theme_icon_path = active_custom_icon_path;
+		else
+			g_custom_theme_icon_path.clear();
+	}
+	if (active_custom_icon_path.empty() && g_custom_theme_icon_srv) {
+		g_custom_theme_icon_srv->Release();
+		g_custom_theme_icon_srv = nullptr;
+		g_custom_theme_icon_w = g_custom_theme_icon_h = 0;
+		g_custom_theme_icon_path.clear();
+	}
+
+
 	auto get_active_theme_icon = []() -> ID3D11ShaderResourceView* {
+		if (custom_themes::active_custom >= 0 &&
+		    custom_themes::active_custom < (int)custom_themes::list.size()) {
+			auto& ct = custom_themes::list[custom_themes::active_custom];
+			if (ct.icon_index < 0 && g_custom_theme_icon_srv)
+				return g_custom_theme_icon_srv;
+		}
 		int idx = g_sa_settings.theme_icon_index;
 		if (custom_themes::active_custom >= 0 &&
 		    custom_themes::active_custom < (int)custom_themes::list.size())
@@ -492,15 +525,15 @@ void helpers::render_title()
 		} else {
 			tw = (float)GetSystemMetrics(SM_CXSCREEN) * 0.75f; th = (float)GetSystemMetrics(SM_CYSCREEN) * 0.75f;
 		}
-		// Only animate during state transitions, not once the IDE is fully open
-		// (so user resize via border grips isn't overridden)
+
+
 		static bool initial_grow_done = false;
 		if (globals::ui::welcome_done && license::validated && globals::ui::window_w >= 1000.f) {
 			initial_grow_done = true;
 		}
 		if (!initial_grow_done) {
-			// For the main IDE state, snap immediately to avoid shaking from
-			// panel layout overflow during the grow animation
+
+
 			if (globals::ui::welcome_done && license::validated) {
 				globals::ui::window_w = tw;
 				globals::ui::window_h = th;
@@ -562,8 +595,7 @@ void helpers::render_title()
 		float cy  = wp.y + globals::ui::window_h * 0.5f - 10.f;
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 
-		// Draw background art covering entire loading window at 70% transparency (30% opaque)
-		// Background stays visible (doesn't fade with the dots)
+
 		if (g_bg_art_srv && g_bg_art_w > 0 && g_bg_art_h > 0) {
 			float ww_l = globals::ui::window_w;
 			float wh_l = globals::ui::window_h;
@@ -598,7 +630,7 @@ void helpers::render_title()
 		static bool  dragging  = false;
 		static bool  last_lmb  = false;
 
-		// Manual window drag during loading/welcome
+
 		bool lmb = GetAsyncKeyState(VK_LBUTTON) & 0x8000;
 		if (lmb && !last_lmb) {
 			POINT cp; GetCursorPos(&cp);
@@ -636,8 +668,7 @@ void helpers::render_title()
 		float       cx  = wp.x + ww * 0.5f;
 		float       cy  = wp.y + wh * 0.5f;
 
-		// Draw background art covering entire welcome window at 70% transparency (30% opaque)
-		// Constant opacity — no fade in/out (matches loading screen behavior)
+
 		if (g_bg_art_srv && g_bg_art_w > 0 && g_bg_art_h > 0) {
 			float scale_bg = std::max(ww / (float)g_bg_art_w, wh / (float)g_bg_art_h);
 			float dw_bg = g_bg_art_w * scale_bg;
@@ -714,7 +745,7 @@ void helpers::render_title()
 		return;
 	}
 
-	// ===== LICENSE VALIDATION GATE =====
+
 	if (!license::validated)
 	{
 		static float license_alpha = 0.f;
@@ -732,19 +763,19 @@ void helpers::render_title()
 		float az = globals::ui::accent.z * 255.f;
 		float la  = license_alpha;
 
-		// Title
+
 		const char* title = "Enter License Key";
 		ImVec2 title_ts = ImGui::CalcTextSize(title);
 		dl->AddText(ImVec2(cx - title_ts.x * 0.5f, cy - 70.f),
 			IM_COL32(230, 228, 255, (int)(240 * la)), title);
 
-		// Accent underline
+
 		float rule_hw = title_ts.x * 0.4f;
 		dl->AddLine(ImVec2(cx - rule_hw, cy - 70.f + title_ts.y + 4.f),
 			ImVec2(cx + rule_hw, cy - 70.f + title_ts.y + 4.f),
 			IM_COL32((int)ax, (int)ay, (int)az, (int)(180 * la)), 1.f);
 
-		// Input box
+
 		float input_w = 280.f;
 		float input_h = 28.f;
 		float input_x = (ww - input_w) * 0.5f;
@@ -768,14 +799,14 @@ void helpers::render_title()
 		ImGui::PopStyleVar(2);
 		ImGui::PopStyleColor(3);
 
-		// Placeholder text
+
 		if (license::key_buf[0] == '\0' && !ImGui::IsItemActive()) {
 			ImVec2 ip = ImGui::GetItemRectMin();
 			dl->AddText(ImVec2(ip.x + 10.f, ip.y + 6.f),
 				IM_COL32(110, 105, 145, (int)(140 * la)), "XXXX-XXXX-XXXX-XXXX");
 		}
 
-		// Activate button
+
 		float btn_w = 120.f;
 		float btn_h = 28.f;
 		float btn_x = (ww - btn_w) * 0.5f;
@@ -812,27 +843,21 @@ void helpers::render_title()
 
 			std::string key_copy(license::key_buf);
 			std::thread([key_copy]() {
-				// Validate key - accept any non-empty key for now (server validation would go here)
-				// In production, this does an HTTPS POST to the license server.
-				std::this_thread::sleep_for(std::chrono::milliseconds(800));
-
-				if (key_copy.size() >= 8) {
+				std::string error_text;
+				if (standalone_license::activate(g_sa_settings, key_copy, error_text)) {
 					license::saved_key  = key_copy;
 					license::validated  = true;
 					license::checking   = false;
-
-					// Persist the key to settings
-					g_sa_settings.license_key = key_copy;
-					g_sa_settings.save();
+					license::error_msg.clear();
 				} else {
-					license::error_msg   = "Invalid license key. Must be at least 8 characters.";
+					license::error_msg   = error_text.empty() ? "License validation failed." : error_text;
 					license::check_failed = true;
 					license::checking    = false;
 				}
 			}).detach();
 		}
 
-		// Error message
+
 		if (license::check_failed && !license::error_msg.empty())
 		{
 			ImVec2 err_ts = ImGui::CalcTextSize(license::error_msg.c_str());
@@ -840,7 +865,7 @@ void helpers::render_title()
 				IM_COL32(220, 80, 80, (int)(220 * la)), license::error_msg.c_str());
 		}
 
-		// Manual window drag during license gate
+
 		{
 			static POINT lic_drag_wnd = {};
 			static POINT lic_drag_mouse = {};
@@ -850,7 +875,7 @@ void helpers::render_title()
 			if (lmb && !lic_last_lmb) {
 				POINT cp; GetCursorPos(&cp);
 				RECT wr; GetWindowRect(g_hwnd, &wr);
-				// Allow drag from top half only (not over input/button area)
+
 				int local_y = cp.y - wr.top;
 				if (cp.x >= wr.left && cp.x <= wr.right && cp.y >= wr.top && cp.y <= wr.bottom && local_y < (wr.bottom - wr.top) / 2) {
 					lic_dragging = true;
@@ -875,14 +900,14 @@ void helpers::render_title()
 
 	float a = globals::ui::ui_alpha;
 
-	// ===== THREE-PANEL IDE LAYOUT =====
+
 	const float pad      = 6.f;
 	const float gap      = 4.f;
-	const float title_h  = 28.f;  // title bar height
+	const float title_h  = 28.f;
 	float ww = globals::ui::window_w;
 	float wh = globals::ui::window_h;
 
-	// Clamp panel widths — proportionally fit to available space
+
 	float usable = ww - pad * 2.f - gap * 2.f;
 	float min_panel = 80.f;
 	float max_left  = usable * 0.3f;
@@ -891,7 +916,7 @@ void helpers::render_title()
 	float right_w  = globals::ui::panel_right_w;
 	float center_w = usable - left_w - right_w;
 	if (center_w < 200.f) {
-		// Shrink panels proportionally to make room
+
 		float excess = 200.f - center_w;
 		float total_panels = left_w + right_w;
 		if (total_panels > 0.f) {
@@ -910,7 +935,7 @@ void helpers::render_title()
 
 	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, a);
 
-	// ===== TITLE BAR (draggable) =====
+
 	{
 		ImVec2 wp   = ImGui::GetWindowPos();
 		ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -918,21 +943,21 @@ void helpers::render_title()
 		float ay = globals::ui::accent.y * 255.f;
 		float az = globals::ui::accent.z * 255.f;
 
-		// Title bar background (theme-aware)
+
 		auto& th_tb = themes::resolved;
 		dl->AddRectFilled(ImVec2(wp.x, wp.y), ImVec2(wp.x + ww, wp.y + title_h),
 			th_tb.title_bar, 8.f, ImDrawFlags_RoundCornersTop);
 		dl->AddLine(ImVec2(wp.x, wp.y + title_h), ImVec2(wp.x + ww, wp.y + title_h),
 			IM_COL32(255, 255, 255, (int)(8 * a)));
 
-		// App name
-		const char* app_name = "AiDA Pro";
+
+		const char* app_name = "AiDA Standalone";
 		ImVec2 name_ts = ImGui::CalcTextSize(app_name);
 		dl->AddText(ImVec2(wp.x + 12.f, wp.y + (title_h - name_ts.y) * 0.5f),
 			IM_COL32((int)(ax * 0.6f + 100), (int)(ay * 0.6f + 100), (int)(az * 0.6f + 100), (int)(220 * a)),
 			app_name);
 
-		// Close button
+
 		float close_sz = 14.f;
 		ImVec2 close_pos(wp.x + ww - close_sz - 10.f, wp.y + (title_h - close_sz) * 0.5f);
 		ImVec2 close_max(close_pos.x + close_sz, close_pos.y + close_sz);
@@ -949,7 +974,7 @@ void helpers::render_title()
 		dl->AddLine(ImVec2(xc.x + xr, xc.y - xr), ImVec2(xc.x - xr, xc.y + xr),
 			IM_COL32(200, 200, 210, (int)(180 * a)), 1.5f);
 
-		// Maximize / Restore button
+
 		ImVec2 max_pos(close_pos.x - close_sz - 8.f, close_pos.y);
 		ImVec2 max_max(max_pos.x + close_sz, max_pos.y + close_sz);
 		bool max_hov = ImGui::IsMouseHoveringRect(max_pos, max_max);
@@ -957,7 +982,7 @@ void helpers::render_title()
 			dl->AddRectFilled(max_pos, max_max, IM_COL32(255, 255, 255, (int)(30 * a)), 3.f);
 			if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 				if (globals::ui::maximized) {
-					// Restore
+
 					globals::ui::maximized = false;
 					globals::ui::window_w = globals::ui::pre_max_w;
 					globals::ui::window_h = globals::ui::pre_max_h;
@@ -966,7 +991,7 @@ void helpers::render_title()
 						(int)globals::ui::pre_max_w, (int)globals::ui::pre_max_h,
 						SWP_NOZORDER);
 				} else {
-					// Maximize
+
 					RECT wr; GetWindowRect(g_hwnd, &wr);
 					globals::ui::pre_max_x = (float)wr.left;
 					globals::ui::pre_max_y = (float)wr.top;
@@ -986,7 +1011,7 @@ void helpers::render_title()
 			}
 		}
 		if (globals::ui::maximized) {
-			// Draw restore icon (two overlapping rectangles)
+
 			float ir = 3.5f;
 			ImVec2 mc(max_pos.x + close_sz * 0.5f, max_pos.y + close_sz * 0.5f);
 			dl->AddRect(ImVec2(mc.x - ir, mc.y - ir + 1.5f), ImVec2(mc.x + ir - 1.5f, mc.y + ir),
@@ -994,14 +1019,14 @@ void helpers::render_title()
 			dl->AddRect(ImVec2(mc.x - ir + 1.5f, mc.y - ir), ImVec2(mc.x + ir, mc.y + ir - 1.5f),
 				IM_COL32(200, 200, 210, (int)(180 * a)), 0.f, 0, 1.2f);
 		} else {
-			// Draw maximize icon (single rectangle)
+
 			float ir = 3.5f;
 			ImVec2 mc(max_pos.x + close_sz * 0.5f, max_pos.y + close_sz * 0.5f);
 			dl->AddRect(ImVec2(mc.x - ir, mc.y - ir), ImVec2(mc.x + ir, mc.y + ir),
 				IM_COL32(200, 200, 210, (int)(180 * a)), 0.f, 0, 1.2f);
 		}
 
-		// Minimize button
+
 		ImVec2 min_pos(max_pos.x - close_sz - 8.f, max_pos.y);
 		ImVec2 min_max(min_pos.x + close_sz, min_pos.y + close_sz);
 		bool min_hov = ImGui::IsMouseHoveringRect(min_pos, min_max);
@@ -1014,7 +1039,7 @@ void helpers::render_title()
 			ImVec2(min_max.x - 3.f, min_pos.y + close_sz * 0.5f),
 			IM_COL32(200, 200, 210, (int)(180 * a)), 1.5f);
 
-		// Theme selector button (palette icon)
+
 		{
 			static bool theme_popup_open = false;
 			float theme_btn_sz = close_sz;
@@ -1026,7 +1051,7 @@ void helpers::render_title()
 				if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 					theme_popup_open = !theme_popup_open;
 			}
-			// Draw palette icon (3 small colored dots)
+
 			float dot_r = 2.5f;
 			float dot_cx = th_pos.x + theme_btn_sz * 0.5f;
 			float dot_cy = th_pos.y + theme_btn_sz * 0.5f;
@@ -1053,7 +1078,7 @@ void helpers::render_title()
 					float item_w = 200.f;
 					float item_h = 22.f;
 
-					// ---- Built-in Themes ----
+
 					ImGui::TextColored(ImVec4(0.6f, 0.58f, 0.75f, 1.f), "Built-in Themes");
 					ImGui::Spacing();
 					for (int ti = 0; ti < themes::count; ti++) {
@@ -1090,7 +1115,7 @@ void helpers::render_title()
 						}
 					}
 
-					// ---- Custom Themes ----
+
 					if (!custom_themes::list.empty()) {
 						ImGui::Dummy(ImVec2(0, 4));
 						ImGui::Separator();
@@ -1120,7 +1145,7 @@ void helpers::render_title()
 							pdl->AddText(ImVec2(cp.x + 24.f, cp.y + (item_h - ImGui::GetFontSize()) * 0.5f),
 								nc, ct.name.c_str());
 
-							// Edit button at the right
+
 							float edit_w = ImGui::CalcTextSize("Edit").x + 8.f;
 							ImVec2 emin(cp.x + item_w - edit_w - 4.f, cp.y + 2.f);
 							ImVec2 emax(emin.x + edit_w, cp.y + item_h - 2.f);
@@ -1144,12 +1169,12 @@ void helpers::render_title()
 						}
 					}
 
-					// ---- Action Buttons ----
+
 					ImGui::Dummy(ImVec2(0, 4));
 					ImGui::Separator();
 					ImGui::Dummy(ImVec2(0, 2));
 
-					// Create New Theme
+
 					{
 						ImVec2 cp = ImGui::GetCursorScreenPos();
 						ImVec2 rmin = cp;
@@ -1167,7 +1192,7 @@ void helpers::render_title()
 						}
 					}
 
-					// Import Theme
+
 					{
 						ImVec2 cp = ImGui::GetCursorScreenPos();
 						ImVec2 rmin = cp;
@@ -1209,6 +1234,7 @@ void helpers::render_title()
 										ct.text_dim      = j.value("text_dim", (uint32_t)ct.text_dim);
 										ct.acrylic_color = j.value("acrylic_color", (DWORD)ct.acrylic_color);
 										ct.icon_index    = j.value("icon_index", ct.icon_index);
+										ct.icon_file_path= j.value("icon_file_path", std::string{});
 										custom_themes::list.push_back(std::move(ct));
 									} catch (...) {}
 								}
@@ -1224,7 +1250,7 @@ void helpers::render_title()
 					theme_popup_open = false;
 			}
 
-			// ---- Theme Editor Popup ----
+
 			if (custom_themes::editor_open) {
 				float ew = 380.f, eh = 520.f;
 				ImGui::SetNextWindowPos(ImVec2((ww - ew) * 0.5f, (globals::ui::window_h - eh) * 0.5f), ImGuiCond_Appearing);
@@ -1249,7 +1275,7 @@ void helpers::render_title()
 						custom_themes::editing_idx < 0 ? "Create Theme" : "Edit Theme");
 					ImGui::Dummy(ImVec2(0, 4));
 
-					// Name
+
 					static char name_buf[128] = {};
 					static bool name_init = false;
 					if (!name_init || custom_themes::editing_idx != custom_themes::editing_idx) {
@@ -1261,12 +1287,12 @@ void helpers::render_title()
 					if (ImGui::InputText("##te_name", name_buf, sizeof(name_buf)))
 						ed.name = name_buf;
 
-					// Accent color
+
 					ImGui::Text("Accent Color");
 					ImGui::SetNextItemWidth(iw2);
 					ImGui::ColorEdit3("##te_accent", ed.accent, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
 
-					// Background colors (as hex ABGR -> display as RGBA float)
+
 					auto u32_edit = [&](const char* label, const char* id, ImU32& col) {
 						ImGui::Text("%s", label);
 						float c[4];
@@ -1283,7 +1309,7 @@ void helpers::render_title()
 					u32_edit("Panel Header", "##te_phdr", ed.panel_header);
 					u32_edit("Title Bar", "##te_tb", ed.title_bar);
 
-					// Icon chooser
+
 					ImGui::Text("Theme Icon");
 					ImGui::SetNextItemWidth(iw2);
 					const char* icon_names[] = {"Kaneki", "Rias", "Nagi", "Mio Akiyama", "Custom File..."};
@@ -1314,7 +1340,7 @@ void helpers::render_title()
 
 					ImGui::Dummy(ImVec2(0, 8));
 
-					// Save / Export / Delete / Cancel
+
 					float btn_w2 = 70.f;
 					if (ImGui::Button("Save", ImVec2(btn_w2, 26))) {
 						ed.name = name_buf;
@@ -1330,7 +1356,7 @@ void helpers::render_title()
 						custom_themes::editor_open = false;
 						name_init = false;
 
-						// Persist custom themes
+
 						nlohmann::json arr = nlohmann::json::array();
 						for (auto& ct2 : custom_themes::list) {
 							nlohmann::json jt;
@@ -1354,7 +1380,7 @@ void helpers::render_title()
 					}
 					ImGui::SameLine();
 
-					// Export button
+
 					if (ImGui::Button("Export", ImVec2(btn_w2, 26))) {
 						char export_buf[MAX_PATH] = {};
 						snprintf(export_buf, sizeof(export_buf), "%s.json", name_buf);
@@ -1385,7 +1411,7 @@ void helpers::render_title()
 					}
 					ImGui::SameLine();
 
-					// Delete button (only for existing themes)
+
 					if (custom_themes::editing_idx >= 0) {
 						ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.1f, 0.1f, 0.7f));
 						ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.15f, 0.15f, 0.9f));
@@ -1414,7 +1440,7 @@ void helpers::render_title()
 				ImGui::PopStyleVar(4);
 			}
 		}
-		// Manual window drag from title bar
+
 		{
 			static POINT tb_drag_wnd = {};
 			static POINT tb_drag_mouse = {};
@@ -1426,7 +1452,7 @@ void helpers::render_title()
 				RECT wr; GetWindowRect(g_hwnd, &wr);
 				int local_y = cp.y - wr.top;
 				int local_x = cp.x - wr.left;
-				// Only drag from title bar (top 28px), not over buttons (right 140px)
+
 				if (local_y >= 0 && local_y < (int)title_h && local_x >= 0 && local_x < (int)(ww - 140.f)
 					&& !globals::ui::dragging_left_splitter && !globals::ui::dragging_right_splitter) {
 					tb_dragging = true;
@@ -1445,12 +1471,12 @@ void helpers::render_title()
 		}
 	}
 
-	// ===== SPLITTER INTERACTION =====
+
 	{
 		ImVec2 wp = ImGui::GetWindowPos();
 		float  sp_w = 5.f;
 
-		// Left splitter (between file browser and center)
+
 		float ls_x = wp.x + pad + left_w;
 		ImVec2 ls_min(ls_x - sp_w * 0.5f, wp.y + title_h + pad);
 		ImVec2 ls_max(ls_x + sp_w * 0.5f + gap, wp.y + title_h + pad + total_h);
@@ -1468,7 +1494,7 @@ void helpers::render_title()
 		}
 		if (ls_hov) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
-		// Right splitter (between center and chat)
+
 		float rs_x = wp.x + ww - pad - right_w;
 		ImVec2 rs_min(rs_x - sp_w * 0.5f - gap, wp.y + title_h + pad);
 		ImVec2 rs_max(rs_x + sp_w * 0.5f, wp.y + title_h + pad + total_h);
@@ -1486,7 +1512,7 @@ void helpers::render_title()
 		}
 		if (rs_hov) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
-		// Recalculate after potential drag
+
 		left_w   = globals::ui::panel_left_w;
 		right_w  = globals::ui::panel_right_w;
 		center_w = ww - left_w - right_w - pad * 2.f - gap * 2.f;
@@ -1497,7 +1523,7 @@ void helpers::render_title()
 	ImU32 ac_full = IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(255*a));
 	ImU32 ac_dim  = IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(35*a));
 
-	// Disasm header metrics (shared by center panel)
+
 	const float hdr_pad  = 10.f;
 	const float row_h    = 22.f;
 	const float row_gap  = 1.f;
@@ -1507,7 +1533,7 @@ void helpers::render_title()
 	ImDrawList* wdl  = ImGui::GetWindowDrawList();
 	ImVec2      wp_m = ImGui::GetWindowPos();
 
-	// ===== FILE BROWSER (left panel) =====
+
 	float fb_x = pad;
 	float fb_y = pad + title_h;
 	ImGui::SetCursorPos(ImVec2(fb_x, fb_y));
@@ -1518,7 +1544,7 @@ void helpers::render_title()
 		float fw = ImGui::GetWindowWidth();
 		float fh = ImGui::GetWindowHeight();
 
-		// Panel header
+
 		const char* explorer_lbl = "EXPLORER";
 		ImVec2 elbl_ts = ImGui::CalcTextSize(explorer_lbl);
 		fdl->AddText(ImVec2(fwp.x + 10.f, fwp.y + 8.f),
@@ -1546,7 +1572,7 @@ void helpers::render_title()
 				if (sel) fdl->AddRectFilled(rmin, rmax, IM_COL32((int)(ax3*60), (int)(ay3*60), (int)(az3*60), (int)(80*a)));
 				else if (hov) fdl->AddRectFilled(rmin, rmax, IM_COL32(255, 255, 255, (int)(12*a)));
 
-				// Folder/file icon
+
 				const char* icon = ent.is_dir ? (ent.expanded ? "v " : "> ") : "  ";
 				ImU32 icon_col = ent.is_dir
 					? IM_COL32((int)(ax3*180+60), (int)(ay3*180+60), (int)(az3*180+60), (int)(200*a))
@@ -1573,7 +1599,7 @@ void helpers::render_title()
 	}
 	end_child();
 
-	// ===== CONTENT / DISASM PANEL (center) =====
+
 	float hx0 = wp_m.x + pad + left_w + gap, hy0 = wp_m.y + pad + title_h;
 	float hx1  = hx0 + center_w;
 	float hy1  = hy0 + hdr_h;
@@ -1734,28 +1760,28 @@ void helpers::render_title()
 		false, ImGuiWindowFlags_NoBackground);
 	{
 
-	// ===== CODE EDITOR MODE =====
+
 	if (code_editor::active && !code_editor::buffer.empty())
 	{
 		float tw = center_w - di_pad * 2.f;
 		float th = disasm_child_h - di_pad * 2.f;
 
-		// Ctrl+S save
+
 		if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
 			code_editor::save();
 		}
 
-		// Line number gutter
+
 		const float gutter_w = 48.f;
 		ImDrawList* tdl = ImGui::GetWindowDrawList();
 		ImVec2 torig = ImGui::GetWindowPos();
 
-		// Draw the InputTextMultiline for editing
+
 		float editor_x = gutter_w + 4.f;
 		float editor_w = tw - gutter_w - 8.f;
 		ImGui::SetCursorPos(ImVec2(editor_x, 0.f));
 
-		// ---- Auto-completion pre-processing ----
+
 		bool ac_active = editor_config::auto_complete && autocomplete::enabled;
 		if (ac_active && autocomplete::popup_visible) {
 			if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
@@ -1788,7 +1814,7 @@ void helpers::render_title()
 			ImVec2(editor_w, th),
 			ed_flags,
 			[](ImGuiInputTextCallbackData* data) -> int {
-				// Tab completion
+
 				if (data->EventFlag == ImGuiInputTextFlags_CallbackCompletion) {
 					if (!autocomplete::matches.empty() &&
 						autocomplete::selected < (int)autocomplete::matches.size()) {
@@ -1803,7 +1829,7 @@ void helpers::render_title()
 					autocomplete::matches.clear();
 					return 1;
 				}
-				// Track cursor and update completions
+
 				if (data->EventFlag == ImGuiInputTextFlags_CallbackAlways) {
 					autocomplete::cursor_byte = data->CursorPos;
 					int cursor = data->CursorPos;
@@ -1837,12 +1863,12 @@ void helpers::render_title()
 		ImGui::PopStyleVar(2);
 		ImGui::PopStyleColor(3);
 
-		// Draw line numbers over the gutter area
+
 		float line_h = ImGui::GetFontSize() + 2.f;
 		float scroll_y = ImGui::GetScrollY();
 		float vis_h = th;
 
-		// ---- Render auto-completion popup ----
+
 		if (ac_active && autocomplete::popup_visible && !autocomplete::matches.empty()) {
 			float popup_w = 220.f;
 			float ac_item_h = 22.f;
@@ -1851,7 +1877,7 @@ void helpers::render_title()
 			float sx = torig.x + editor_x + 4.f + char_w * autocomplete::cursor_col;
 			float sy = torig.y + line_h * (autocomplete::cursor_line + 1) - scroll_y + 4.f;
 
-			// Clamp to window bounds
+
 			if (sx + popup_w > torig.x + tw) sx = torig.x + tw - popup_w - 4.f;
 			if (sy + popup_h > torig.y + th) sy = torig.y + line_h * autocomplete::cursor_line - scroll_y - popup_h;
 
@@ -1883,13 +1909,13 @@ void helpers::render_title()
 			}
 		}
 
-		// Count lines
+
 		const char* txt = code_editor::buffer.data();
 		int n_lines = 1;
 		for (const char* p = txt; *p; p++)
 			if (*p == '\n') n_lines++;
 
-		// Gutter separator
+
 		tdl->AddLine(ImVec2(torig.x + gutter_w, torig.y),
 			ImVec2(torig.x + gutter_w, torig.y + vis_h),
 			IM_COL32(255, 255, 255, (int)(10 * a)), 1.f);
@@ -1899,18 +1925,48 @@ void helpers::render_title()
 
 		for (int i = first_row; i <= last_row; i++) {
 			float y = torig.y + i * line_h - scroll_y + 2.f;
-			// Alternating row tint
+
 			if (i & 1)
 				tdl->AddRectFilled(ImVec2(torig.x, y), ImVec2(torig.x + gutter_w, y + line_h - 1.f),
 					IM_COL32(255, 255, 255, (int)(3.f * a)));
-			// Line number
+
 			char ln_buf[8];
 			snprintf(ln_buf, sizeof(ln_buf), "%4d", i + 1);
 			tdl->AddText(ImVec2(torig.x + 4.f, y + 1.f),
 				IM_COL32(75, 85, 120, (int)(140 * a)), ln_buf);
 		}
+
+		if (ID3D11ShaderResourceView* icon_srv = get_active_theme_icon()) {
+			float src_w = 0.f;
+			float src_h = 0.f;
+			int icon_idx = g_sa_settings.theme_icon_index;
+			if (custom_themes::active_custom >= 0 &&
+			    custom_themes::active_custom < (int)custom_themes::list.size())
+				icon_idx = custom_themes::list[custom_themes::active_custom].icon_index;
+			if (icon_idx < 0 && g_custom_theme_icon_w > 0 && g_custom_theme_icon_h > 0) {
+				src_w = (float)g_custom_theme_icon_w;
+				src_h = (float)g_custom_theme_icon_h;
+			} else if (icon_idx >= 0 && icon_idx < 4) {
+				src_w = (float)g_theme_icon_w[icon_idx];
+				src_h = (float)g_theme_icon_h[icon_idx];
+			}
+
+			if (src_w > 0.f && src_h > 0.f) {
+				const float max_h = th * 0.38f;
+				const float max_w = editor_w * 0.28f;
+				const float scale = std::min(max_w / src_w, max_h / src_h);
+				const float draw_w = src_w * scale;
+				const float draw_h = src_h * scale;
+				const float icon_pad = 18.f;
+				const ImVec2 img_min(torig.x + gutter_w + 4.f + editor_w - draw_w - icon_pad,
+				                     torig.y + th - draw_h - icon_pad);
+				const ImVec2 img_max(img_min.x + draw_w, img_min.y + draw_h);
+				tdl->AddImage((ImTextureID)icon_srv, img_min, img_max,
+					ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, (int)(172 * a)));
+			}
+		}
 	}
-	// ===== DISASM MODE =====
+
 	else
 	{
 		ImDrawList* cdl  = ImGui::GetWindowDrawList();
@@ -1931,25 +1987,32 @@ void helpers::render_title()
 		const bool has_instrs = !g_disasm.file.instrs.empty();
 		if (!has_instrs)
 		{
-			// Draw theme icon (anime girl) in center
+
 			ID3D11ShaderResourceView* icon_srv = get_active_theme_icon();
 			if (icon_srv) {
 				int icon_idx = g_sa_settings.theme_icon_index;
 				if (custom_themes::active_custom >= 0 &&
 				    custom_themes::active_custom < (int)custom_themes::list.size())
 					icon_idx = custom_themes::list[custom_themes::active_custom].icon_index;
-				if (icon_idx < 0) icon_idx = 3;
-				float src_w = (float)g_theme_icon_w[icon_idx];
-				float src_h = (float)g_theme_icon_h[icon_idx];
+				float src_w = 0.f;
+				float src_h = 0.f;
+				if (icon_idx < 0 && g_custom_theme_icon_w > 0 && g_custom_theme_icon_h > 0) {
+					src_w = (float)g_custom_theme_icon_w;
+					src_h = (float)g_custom_theme_icon_h;
+				} else {
+					if (icon_idx < 0) icon_idx = 3;
+					src_w = (float)g_theme_icon_w[icon_idx];
+					src_h = (float)g_theme_icon_h[icon_idx];
+				}
 				if (src_w > 0 && src_h > 0) {
-					float wh = ImGui::GetWindowHeight();
-					float max_h = wh * 0.75f;
+					float window_h = ImGui::GetWindowHeight();
+					float max_h = window_h * 0.75f;
 					float max_w = iw * 0.6f;
 					float scale = std::min(max_w / src_w, max_h / src_h);
 					float dw = src_w * scale;
 					float dh = src_h * scale;
 					float ix = orig.x + iw * 0.5f - dw * 0.5f;
-					float iy = orig.y + wh * 0.5f - dh * 0.5f - 20.f;
+					float iy = orig.y + window_h * 0.5f - dh * 0.5f - 20.f;
 					cdl->AddImage((ImTextureID)icon_srv,
 						ImVec2(ix, iy), ImVec2(ix + dw, iy + dh),
 						ImVec2(0, 0), ImVec2(1, 1),
@@ -1961,8 +2024,8 @@ void helpers::render_title()
 				             : !g_disasm.file.loaded           ? "Choose a file to begin"
 				             :                                   "Click 'Index Binary' to disassemble";
 			ImVec2 ht2 = ImGui::CalcTextSize(hint);
-			float  wh  = ImGui::GetWindowHeight();
-			cdl->AddText(ImVec2(orig.x + iw*0.5f - ht2.x*0.5f, orig.y + wh * 0.85f - ht2.y*0.5f),
+			float  window_h  = ImGui::GetWindowHeight();
+			cdl->AddText(ImVec2(orig.x + iw*0.5f - ht2.x*0.5f, orig.y + window_h * 0.85f - ht2.y*0.5f),
 				IM_COL32(100,100,120,(int)(120*a)), hint);
 		}
 		else
@@ -1983,7 +2046,7 @@ void helpers::render_title()
 				float y = orig.y + i * lh - scroll_y;
 				const AsmInstr& ins = instrs[i];
 
-				// alternating row tint
+
 				if (i & 1)
 					cdl->AddRectFilled(ImVec2(orig.x, y), ImVec2(orig.x + iw, y + lh - 1.f),
 						IM_COL32(255,255,255,(int)(3.f * a)));
@@ -2127,9 +2190,9 @@ void helpers::render_title()
 
 			ImGui::PopStyleColor(5);
 			ImGui::PopStyleVar(4);
-		} // end inner else (has instrs)
-	} // end else (disasm mode)
-	} // end BeginChild content block
+		}
+	}
+	}
 	ImGui::EndChild();
 	ImGui::PopStyleVar();
 
@@ -2144,15 +2207,15 @@ void helpers::render_title()
 		float ch = ImGui::GetWindowHeight();
 		float frame_h    = ImGui::GetFrameHeight();
 
-		// --- dynamic input height based on text ---
+
 		float line_h     = ImGui::GetFontSize();
-		float input_pad  = 8.f; // vertical padding inside input
+		float input_pad  = 8.f;
 		int   num_lines  = 1;
-		{ // count newlines in buffer
+		{
 			for (const char* p = g_chat_buf; *p; ++p)
 				if (*p == '\n') ++num_lines;
-			// also account for line wrapping (rough estimate)
-			float text_w = cw - frame_h - 4.f - 16.f; // available text width
+
+			float text_w = cw - frame_h - 4.f - 16.f;
 			if (text_w > 0.f) {
 				ImVec2 ts = ImGui::CalcTextSize(g_chat_buf, nullptr, false, text_w);
 				int wrapped_lines = (int)(ts.y / line_h);
@@ -2164,10 +2227,10 @@ void helpers::render_title()
 		float input_h    = vis_lines * line_h + input_pad * 2.f;
 		float bot_pad    = 4.f;
 		float input_y    = ch - input_h - bot_pad;
-		float sep_y      = input_y - 6.f;
-		float msg_area_h = sep_y - 24.f; // reserve space for settings bar
+		float chat_sep_y = input_y - 6.f;
+		float msg_area_h = chat_sep_y - 24.f;
 
-		// ---- settings gear button row ----
+
 		{
 			float gear_sz = 18.f;
 			ImVec2 btn_pos(cw - gear_sz - 8.f, 3.f);
@@ -2436,8 +2499,8 @@ void helpers::render_title()
 						if (msg.has_thinking && tdur_val > 0.f)
 						{
 							char extra[20];
-							snprintf(extra, sizeof(extra), "  ·  %.1fs", tdur_val);
-							strncat(ts_buf, extra, sizeof(ts_buf) - strlen(ts_buf) - 1);
+							snprintf(extra, sizeof(extra), "  |  %.1fs", tdur_val);
+							strncat_s(ts_buf, extra, _TRUNCATE);
 						}
 
 						ImGuiID hov_id = ImGui::GetID(("mha_" + std::to_string(mi)).c_str());
@@ -2473,7 +2536,6 @@ void helpers::render_title()
 		}
 
 		float chat_scroll_y   = ImGui::GetScrollY();
-		float chat_max_scroll = ImGui::GetScrollMaxY();
 		ImVec2 msgs_screen_pos = ImGui::GetWindowPos();
 
 		ImGui::EndChild();
@@ -2554,21 +2616,16 @@ void helpers::render_title()
 			float btn_sz = frame_h;
 			float igap   = 4.f;
 
-			// ---- Model chooser pill ----
+
 			{
 				static bool model_open = false;
-				std::string provider = g_sa_settings.api_provider;
-				std::string model    = "No model";
-				if (provider == "gemini")         model = g_sa_settings.gemini_model_name;
-				else if (provider == "openai")    model = g_sa_settings.openai_model_name;
-				else if (provider == "anthropic") model = g_sa_settings.anthropic_model_name;
-				else if (provider == "openrouter") model = g_sa_settings.openrouter_model_name;
-				else if (provider == "copilot")   model = g_sa_settings.copilot_model_name;
-				else if (provider == "local")     model = g_sa_settings.local_llm_model_name;
+				auto* active_profile = g_sa_settings.get_active_profile();
+				std::string provider = active_profile ? active_profile->display_name : "No profile";
+				std::string model    = active_profile ? active_profile->model : "No model";
 
 				if (model.empty()) model = "Select model";
 				std::string pill_text = provider + " / " + model;
-				// Truncate if too long
+
 				float max_pill_w = cw * 0.7f;
 				ImVec2 pill_ts = ImGui::CalcTextSize(pill_text.c_str());
 				if (pill_ts.x > max_pill_w && pill_text.size() > 20) {
@@ -2603,7 +2660,7 @@ void helpers::render_title()
 				if (ImGui::IsItemHovered())
 					ImGui::SetTooltip("Click to change model");
 
-				// Model selection popup
+
 				if (model_open) {
 					ImGui::SetNextWindowPos(ImVec2(pmin.x, pmin.y - 6.f), ImGuiCond_Always, ImVec2(0.f, 1.f));
 					ImGui::SetNextWindowBgAlpha(0.96f);
@@ -2616,13 +2673,12 @@ void helpers::render_title()
 						ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
 						ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
 					{
-						// Provider chooser
-						const char* providers[] = {"gemini", "openai", "anthropic", "openrouter", "copilot", "local"};
-						for (int pi = 0; pi < 6; pi++) {
-							bool is_active = (g_sa_settings.api_provider == providers[pi]);
+						for (auto& profile : g_sa_settings.provider_profiles) {
+							bool is_active = (profile.id == g_sa_settings.active_provider_profile_id);
 							if (is_active) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ax3, ay3, az3, 1.f));
-							if (ImGui::Selectable(providers[pi], is_active, 0, ImVec2(120.f, 0.f))) {
-								g_sa_settings.api_provider = providers[pi];
+							if (ImGui::Selectable(profile.display_name.c_str(), is_active, 0, ImVec2(180.f, 0.f))) {
+								g_sa_settings.active_provider_profile_id = profile.id;
+								g_sa_settings.sync_legacy_fields_from_active_profile();
 								g_sa_settings.save();
 							}
 							if (is_active) ImGui::PopStyleColor();
@@ -2630,19 +2686,14 @@ void helpers::render_title()
 
 						ImGui::Separator();
 
-						// Model list for current provider
-						const std::vector<std::string>* model_list = nullptr;
-						std::string* current_model = nullptr;
-						if (provider == "gemini")      { model_list = &g_sa_settings.gemini_models();   current_model = &g_sa_settings.gemini_model_name; }
-						else if (provider == "openai") { model_list = &g_sa_settings.openai_models();   current_model = &g_sa_settings.openai_model_name; }
-						else if (provider == "anthropic") { model_list = &g_sa_settings.anthropic_models(); current_model = &g_sa_settings.anthropic_model_name; }
-
-						if (model_list && current_model) {
-							for (auto& m : *model_list) {
-								bool is_sel = (*current_model == m);
+						if (auto* current_profile = g_sa_settings.get_active_profile()) {
+							const auto& model_list = settings_sa_t::models_for_kind(current_profile->kind);
+							for (const auto& m : model_list) {
+								bool is_sel = (current_profile->model == m);
 								if (is_sel) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ax3, ay3, az3, 1.f));
 								if (ImGui::Selectable(m.c_str(), is_sel, 0, ImVec2(200.f, 0.f))) {
-									*current_model = m;
+									current_profile->model = m;
+									g_sa_settings.sync_legacy_fields_from_active_profile();
 									g_sa_settings.save();
 									model_open = false;
 								}
@@ -2654,7 +2705,7 @@ void helpers::render_title()
 					ImGui::PopStyleColor(2);
 					ImGui::PopStyleVar(2);
 
-					// Close on click outside
+
 					if (!ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 						model_open = false;
 				}
@@ -2668,7 +2719,7 @@ void helpers::render_title()
 			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, input_pad));
 			ImU32 input_bg_col = ImGui::GetColorU32(ImGuiCol_FrameBg);
 
-			// --- Enter sends, Shift+Enter inserts newline ---
+
 			static bool s_enter_pressed = false;
 			auto input_callback = [](ImGuiInputTextCallbackData* data) -> int {
 				if (data->EventFlag == ImGuiInputTextFlags_CallbackAlways) {
@@ -2698,13 +2749,12 @@ void helpers::render_title()
 
 			if (!input_active && g_chat_buf[0] == '\0')
 			{
-				float fh2 = ImGui::GetFontSize();
 				float ph_y = input_min.y + input_pad;
 				dl->AddText(ImVec2(input_min.x + 8.f, ph_y),
 					IM_COL32(110, 105, 145, (int)(140 * a)), "Ask anything...");
 			}
 
-			// Send button aligned to bottom-right of input area
+
 			float btn_y = input_y + input_h - btn_sz;
 			ImGui::SetCursorPos(ImVec2(input_w + igap, btn_y));
 			ImVec2 btn_min = ImGui::GetCursorScreenPos();
@@ -2712,7 +2762,6 @@ void helpers::render_title()
 			ImVec2 btn_ctr = ImVec2((btn_min.x + btn_max.x) * 0.5f, (btn_min.y + btn_max.y) * 0.5f);
 
 			bool btn_hovered = ImGui::IsMouseHoveringRect(btn_min, btn_max);
-			bool btn_held    = btn_hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left);
 			ImGui::InvisibleButton("##sendbtn", ImVec2(btn_sz, btn_sz));
 			bool btn_clicked = ImGui::IsItemClicked();
 
@@ -2743,7 +2792,7 @@ void helpers::render_title()
 
 			if ((enter_pressed || btn_clicked) && strlen(g_chat_buf) > 0)
 			{
-				// trim trailing newlines from Enter key
+
 				size_t len = strlen(g_chat_buf);
 				while (len > 0 && (g_chat_buf[len-1] == '\n' || g_chat_buf[len-1] == '\r'))
 					g_chat_buf[--len] = '\0';

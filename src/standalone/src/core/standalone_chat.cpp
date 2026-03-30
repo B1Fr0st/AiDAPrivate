@@ -1,23 +1,12 @@
-/*
- * standalone_chat.cpp
- *
- * Replaces the hardcoded dummy AI in globals.h with real AI integration.
- * Implements:
- *   - Agentic tool-calling loop (text-based, works with ALL providers)
- *   - Thread-safe UI updates from the AI worker thread
- *   - Settings configuration popup (ImGui)
- *   - Initialization / shutdown of AI client, MCP server, kernel driver
- */
 
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
-#define CPPHTTPLIB_OPENSSL_SUPPORT
 #include <windows.h>
 
 #include "mcp_standalone.hpp"
 #include "standalone_ai_client.hpp"
+#include "standalone_license.hpp"
 #include "standalone_settings.hpp"
 #include "standalone_driver.hpp"
+#include "zydis_disasm.hpp"
 
 #include "../helpers/globals.h"
 
@@ -25,6 +14,8 @@
 #include <mutex>
 #include <atomic>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -36,9 +27,9 @@
 
 using json = nlohmann::json;
 
-// ============================================================================
-//  Thread-safe update queue  (worker thread -> main/render thread)
-// ============================================================================
+extern DisasmState g_disasm;
+
+
 namespace {
 
 struct ai_update_t
@@ -56,24 +47,18 @@ void post_update(ai_update_t::type_t type, const std::string& text = {})
     s_updates.push_back({type, text});
 }
 
-// ============================================================================
-//  Background AI worker state
-// ============================================================================
+
 std::thread       s_ai_thread;
 std::mutex        s_ai_thread_mtx;
 std::atomic<bool> s_ai_running{false};
 std::atomic<bool> s_cancel{false};
 
-// ============================================================================
-//  MCP server instance (for tool execution)
-// ============================================================================
+
 mcp_standalone::server_t s_mcp_server;
 bool                     s_server_started = false;
 bool                     s_initialized    = false;
 
-// ============================================================================
-//  Tool-call parsing helpers
-// ============================================================================
+
 struct parsed_tool_call_t
 {
     std::string name;
@@ -95,7 +80,7 @@ std::vector<parsed_tool_call_t> parse_tool_calls(const std::string& text)
         if (end == std::string::npos) break;
 
         std::string payload = text.substr(body_start, end - body_start);
-        /* Trim whitespace */
+
         while (!payload.empty() && (payload.front() == ' ' || payload.front() == '\n' ||
                payload.front() == '\r' || payload.front() == '\t'))
             payload.erase(0, 1);
@@ -127,7 +112,7 @@ std::string strip_tool_blocks(const std::string& text)
 
     size_t pos = 0;
     while (pos < text.size()) {
-        /* Skip <tool_call>...</tool_call> */
+
         size_t tc_start = text.find(open_tag, pos);
         size_t tr_start = text.find(open_res, pos);
         size_t next_tag = (std::min)(tc_start, tr_start);
@@ -148,7 +133,7 @@ std::string strip_tool_blocks(const std::string& text)
         }
     }
 
-    /* Trim leading/trailing whitespace and runs of blank lines */
+
     while (!result.empty() && (result.front() == '\n' || result.front() == '\r'))
         result.erase(0, 1);
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
@@ -156,9 +141,7 @@ std::string strip_tool_blocks(const std::string& text)
     return result;
 }
 
-// ============================================================================
-//  System prompt builder (includes tool descriptions)
-// ============================================================================
+
 std::string build_system_prompt()
 {
     std::string prompt;
@@ -166,17 +149,17 @@ std::string build_system_prompt()
 
     prompt +=
         "You are AiDA, a state-of-the-art reverse engineering, binary analysis, "
-        "and debugging assistant. You operate through a kernel driver for live "
-        "process memory analysis, Zydis for x64 disassembly, and a Windows "
-        "AppContainer sandbox for safe malware execution.\n\n"
+        "and debugging assistant. You operate through a user-mode live process "
+        "inspection bridge, Zydis for x64 disassembly, and Windows Sandbox for "
+        "safe sample execution.\n\n"
         "## Rules\n"
         "- Be precise, technical, and concise.\n"
         "- When asked to analyze, disassemble, or inspect something, USE YOUR TOOLS.\n"
-        "- Always call `driver_status` before attempting memory operations.\n"
-        "- Call `driver_attach` with a process name before reading process memory.\n"
+        "- Always call `driver_status` before attempting live-memory operations.\n"
+        "- Call `driver_attach` with a process name or PID before reading process memory.\n"
         "- Use `disassemble_file` to load and disassemble PE files from disk.\n"
         "- Use `disassemble_address` for live memory disassembly.\n"
-        "- Use `sandbox_execute` for running untrusted binaries safely.\n"
+        "- Use `sandbox_execute` for running untrusted binaries in Windows Sandbox.\n"
         "- For number conversions, ALWAYS use `convert_number`.\n"
         "- Do NOT fabricate tool results. If you need data, call a tool.\n\n";
 
@@ -211,9 +194,7 @@ std::string build_system_prompt()
     return prompt;
 }
 
-// ============================================================================
-//  Tool execution (calls MCP server handlers directly, no HTTP round-trip)
-// ============================================================================
+
 std::string execute_tool(const std::string& name, const json& arguments)
 {
     auto& tools = s_mcp_server.get_tools();
@@ -242,15 +223,13 @@ std::string execute_tool(const std::string& name, const json& arguments)
     return "Error: Unknown tool '" + name + "'. Use the tools/list to see available tools.";
 }
 
-// ============================================================================
-//  Agentic loop  (runs entirely in background thread)
-// ============================================================================
+
 void run_agentic(std::string user_message,
                  std::vector<std::pair<std::string, std::string>> history)
 {
     post_update(ai_update_t::THINKING);
 
-    /* ---- build the full prompt ---- */
+
     std::string system_prompt = build_system_prompt();
 
     std::string conversation;
@@ -272,11 +251,11 @@ void run_agentic(std::string user_message,
             return;
         }
 
-        /* Post a thinking status for tool turns after the first */
+
         if (turn > 0)
             post_update(ai_update_t::THINKING, "Processing tool results...");
 
-        /* ---- call the AI (blocking, no streaming) ---- */
+
         std::string response;
         try {
             response = g_sa_ai_client->chat_blocking(full_prompt, {}, nullptr, nullptr);
@@ -290,21 +269,21 @@ void run_agentic(std::string user_message,
             return;
         }
 
-        /* ---- check for errors ---- */
+
         if (response.size() >= 6 && response.substr(0, 6) == "Error:") {
             post_update(ai_update_t::ERR, response);
             return;
         }
 
-        /* ---- parse tool calls ---- */
+
         auto calls = parse_tool_calls(response);
 
         if (calls.empty()) {
-            /* No tool calls -> this is the final response. */
-            std::string clean = strip_tool_blocks(response);
-            if (clean.empty()) clean = response; /* fallback */
 
-            /* Simulate streaming output for a smooth UI experience */
+            std::string clean = strip_tool_blocks(response);
+            if (clean.empty()) clean = response;
+
+
             constexpr size_t CHARS_PER_CHUNK = 24;
             for (size_t i = 0; i < clean.size() && !s_cancel.load(); ) {
                 size_t n = (std::min)(CHARS_PER_CHUNK, clean.size() - i);
@@ -316,7 +295,7 @@ void run_agentic(std::string user_message,
             return;
         }
 
-        /* ---- execute each tool call ---- */
+
         std::string tool_results;
         for (auto& tc : calls) {
             if (s_cancel.load()) {
@@ -331,7 +310,7 @@ void run_agentic(std::string user_message,
                           + "\n</tool_result>\n";
         }
 
-        /* ---- append assistant response + tool results for the next turn ---- */
+
         full_prompt += " " + response + "\n"
                      + tool_results
                      + "\nContinue your analysis using the tool results above. "
@@ -342,28 +321,85 @@ void run_agentic(std::string user_message,
     post_update(ai_update_t::ERR, "Reached maximum tool-calling rounds (15). Stopping.");
 }
 
-} // anonymous namespace
+void restore_workspace_state()
+{
+    if (!g_sa_settings.workspace.root_path.empty())
+        file_browser::refresh(g_sa_settings.workspace.root_path);
+    else
+        file_browser::refresh();
 
-// ============================================================================
-//  Settings popup state  (visible to helpers.cpp via extern in globals.h)
-// ============================================================================
+    globals::ui::panel_left_w = g_sa_settings.workspace.left_width;
+    globals::ui::panel_right_w = g_sa_settings.workspace.right_width;
+
+    if (!g_sa_settings.workspace.open_tabs_json.empty()) {
+        try {
+            auto tabs = json::parse(g_sa_settings.workspace.open_tabs_json);
+            if (tabs.is_array()) {
+                for (const auto& item : tabs) {
+                    if (!item.is_string())
+                        continue;
+                    const std::string path = item.get<std::string>();
+                    std::ifstream ifs(path, std::ios::binary);
+                    if (!ifs.is_open())
+                        continue;
+                    std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+                    const auto filename = std::filesystem::path(path).filename().string();
+                    file_tabs::open_or_focus(path, filename, content);
+                }
+                if (g_sa_settings.workspace.active_tab >= 0 &&
+                    g_sa_settings.workspace.active_tab < static_cast<int>(file_tabs::tabs.size()))
+                    file_tabs::active_tab = g_sa_settings.workspace.active_tab;
+            }
+        } catch (...) {
+        }
+    }
+
+    if (!g_sa_settings.workspace.last_active_path.empty() &&
+        g_sa_settings.workspace.active_view == "disasm") {
+        g_disasm.file = DisasmFile{};
+        if (disasm::load_pe(g_sa_settings.workspace.last_active_path, g_disasm.file))
+            disasm::decode_section(g_disasm.file);
+    }
+}
+
+void persist_workspace_state()
+{
+    g_sa_settings.workspace.root_path = file_browser::current_dir;
+    g_sa_settings.workspace.left_width = globals::ui::panel_left_w;
+    g_sa_settings.workspace.right_width = globals::ui::panel_right_w;
+    g_sa_settings.workspace.active_tab = file_tabs::active_tab;
+
+    json tabs = json::array();
+    for (const auto& tab : file_tabs::tabs)
+        tabs.push_back(tab.filepath);
+    g_sa_settings.workspace.open_tabs_json = tabs.dump();
+
+    if (code_editor::active && !code_editor::filepath.empty()) {
+        g_sa_settings.workspace.last_active_path = code_editor::filepath;
+        g_sa_settings.workspace.active_view = "editor";
+    } else if (g_disasm.file.loaded && !g_disasm.file.path.empty()) {
+        g_sa_settings.workspace.last_active_path = g_disasm.file.path;
+        g_sa_settings.workspace.active_view = "disasm";
+    }
+}
+
+}
+
+
 bool g_settings_open = false;
 
-// ============================================================================
-//  PUBLIC API  -  called from helpers.cpp / main.cpp
-// ============================================================================
 
 void init_standalone_chat()
 {
     if (s_initialized) return;
 
-    /* Load persisted settings (api keys, model, provider, etc.) */
+
     g_sa_settings.load();
 
-    /* Restore theme and editor preferences */
+
     themes::active = std::clamp(g_sa_settings.active_theme_idx, 0, themes::count - 1);
 
-    // Restore custom themes from JSON
+
     if (!g_sa_settings.custom_themes_json.empty()) {
         try {
             auto arr = nlohmann::json::parse(g_sa_settings.custom_themes_json);
@@ -396,27 +432,28 @@ void init_standalone_chat()
     if (custom_themes::active_custom >= (int)custom_themes::list.size())
         custom_themes::active_custom = -1;
 
-    // Restore editor config
+
     editor_config::tab_size               = g_sa_settings.editor_tab_size;
     editor_config::font_size              = g_sa_settings.editor_font_size;
     editor_config::auto_complete          = g_sa_settings.editor_auto_complete;
     editor_config::show_line_numbers      = g_sa_settings.editor_line_numbers;
     editor_config::highlight_current_line = g_sa_settings.editor_highlight_line;
 
-    themes::changed = true; // trigger initial theme application
+    themes::changed = true;
 
-    /* Restore license state if previously saved */
-    if (!g_sa_settings.license_key.empty()) {
-        license::saved_key = g_sa_settings.license_key;
-        license::validated = true;
-        strncpy_s(license::key_buf, sizeof(license::key_buf),
-                  g_sa_settings.license_key.c_str(), _TRUNCATE);
-    }
 
-    /* Create the AI HTTP client */
+    license::validated = standalone_license::initialize(g_sa_settings);
+    license::saved_key = g_sa_settings.license_key;
+    strncpy_s(license::key_buf, sizeof(license::key_buf),
+              g_sa_settings.license_key.c_str(), _TRUNCATE);
+    if (!license::validated && !standalone_license::last_error().empty())
+        license::error_msg = standalone_license::last_error();
+    license::check_failed = !license::validated && !license::error_msg.empty();
+
+
     g_sa_ai_client = std::make_unique<standalone_ai_client_t>(g_sa_settings);
 
-    /* Register all tools and start the MCP server */
+
     mcp_standalone::register_standalone_tools(s_mcp_server);
     if (g_sa_settings.mcp_enabled) {
         if (s_mcp_server.start(g_sa_settings.mcp_port)) {
@@ -425,8 +462,9 @@ void init_standalone_chat()
         }
     }
 
-    /* Attempt to load the kernel driver (non-fatal if it fails) */
+
     driver_bridge::initialize();
+    restore_workspace_state();
 
     s_initialized = true;
 }
@@ -441,15 +479,14 @@ void shutdown_standalone_chat()
     }
     if (s_server_started)
         s_mcp_server.stop();
+    persist_workspace_state();
+    g_sa_settings.save();
+    standalone_license::shutdown();
     g_sa_ai_client.reset();
     s_initialized = false;
 }
 
-/*
- * tick_ai_chat() - called every frame from the render thread.
- * Detects when the user has posted a new message and kicks off
- * the agentic AI loop in a background thread.
- */
+
 void tick_ai_chat()
 {
     if (!s_initialized) return;
@@ -458,11 +495,11 @@ void tick_ai_chat()
     auto& last = g_chat_messages.back();
     if (!last.is_user || g_dummy_triggered) return;
 
-    /* ----- User sent a new message ----- */
+
     std::string user_text = last.text;
     g_dummy_triggered = true;
 
-    /* Check availability */
+
     if (!g_sa_ai_client || !g_sa_ai_client->is_available()) {
         ChatMessage ai;
         ai.is_user       = false;
@@ -475,11 +512,11 @@ void tick_ai_chat()
         return;
     }
 
-    /* Reset thinking state */
+
     g_think_done  = false;
     g_think_timer = 0.f;
 
-    /* Push an empty AI message placeholder */
+
     ChatMessage ai;
     ai.is_user       = false;
     ai.has_thinking   = true;
@@ -489,7 +526,7 @@ void tick_ai_chat()
     g_chat_messages.push_back(ai);
     g_chat_scroll_to_bottom = true;
 
-    /* Collect conversation history (skip the placeholder we just pushed) */
+
     std::vector<std::pair<std::string, std::string>> history;
     for (int i = 0; i < (int)g_chat_messages.size() - 2; ++i) {
         auto& m = g_chat_messages[i];
@@ -497,7 +534,7 @@ void tick_ai_chat()
             history.emplace_back(m.is_user ? "User" : "Assistant", m.text);
     }
 
-    /* Cancel any existing run */
+
     {
         std::lock_guard<std::mutex> lk(s_ai_thread_mtx);
         if (s_ai_running.load()) {
@@ -514,14 +551,16 @@ void tick_ai_chat()
     }
 }
 
-/*
- * poll_ai_chat() - called every frame from the render thread.
- * Drains the update queue posted by the background AI worker
- * and applies changes to the live ChatMessage objects.
- */
+
 void poll_ai_chat()
 {
     if (!s_initialized) return;
+
+    if (license::validated && !standalone_license::is_valid()) {
+        license::validated = false;
+        license::check_failed = true;
+        license::error_msg = standalone_license::last_error();
+    }
 
     std::deque<ai_update_t> local;
     {
@@ -569,9 +608,7 @@ void poll_ai_chat()
     }
 }
 
-// ============================================================================
-//  Settings popup  (rendered within the main ImGui window)
-// ============================================================================
+
 void render_settings_popup()
 {
     if (!g_settings_open) return;
@@ -580,11 +617,10 @@ void render_settings_popup()
 
     float ww = globals::ui::window_w;
     float wh = globals::ui::window_h;
-    float pw = 440.f, ph = 480.f;
+    float pw = 760.f, ph = 620.f;
     ImGui::SetNextWindowPos(ImVec2((ww - pw) * 0.5f, (wh - ph) * 0.5f), ImGuiCond_Appearing);
     ImGui::SetNextWindowSize(ImVec2(pw, ph), ImGuiCond_Always);
 
-    float a = globals::ui::ui_alpha;
     float ax = globals::ui::accent.x, ay = globals::ui::accent.y, az = globals::ui::accent.z;
 
     ImGui::PushStyleColor(ImGuiCol_PopupBg,        ImVec4(0.075f, 0.075f, 0.10f, 0.97f));
@@ -614,108 +650,63 @@ void render_settings_popup()
     if (ImGui::BeginPopupModal("##sa_settings_modal", &still_open,
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove))
     {
-        /* ---- static buffers, initialized from g_sa_settings once ---- */
-        static int         s_provider = 0;
-        static char        s_api_key[512]   = {};
-        static char        s_base_url[512]  = {};
-        static int         s_model_idx = 0;
-        static char        s_custom_model[256] = {};
-        static float       s_temperature = 0.7f;
-        static int         s_mcp_port = 29117;
-        static bool        s_mcp_enabled = true;
-        static char        s_local_url[512] = {};
+        static int   s_selected_profile = 0;
+        static char  s_name[128] = {};
+        static char  s_base_url[512] = {};
+        static char  s_api_key[512] = {};
+        static char  s_model[256] = {};
+        static char  s_headers[1024] = "{}";
+        static bool  s_enabled = true;
+        static int   s_kind = 0;
+        static float s_temperature = 0.7f;
+        static int   s_mcp_port = 29117;
+        static bool  s_mcp_enabled = true;
+        static int   s_sandbox_timeout = 30000;
+        static int   s_sandbox_memory = 256;
+        static int   s_sandbox_network = 0;
 
-        auto find_provider_idx = [](const std::string& id) -> int {
-            if (id == "gemini")      return 0;
-            if (id == "openai")      return 1;
-            if (id == "anthropic")   return 2;
-            if (id == "openrouter")  return 3;
-            if (id == "local_llm")   return 4;
-            return 0;
-        };
+        auto refresh_profile_buffers = [&]() {
+            g_sa_settings.ensure_default_profiles();
+            if (s_selected_profile < 0 || s_selected_profile >= (int)g_sa_settings.provider_profiles.size())
+                s_selected_profile = 0;
+            auto& profile = g_sa_settings.provider_profiles[s_selected_profile];
+            snprintf(s_name, sizeof(s_name), "%s", profile.display_name.c_str());
+            snprintf(s_base_url, sizeof(s_base_url), "%s", profile.base_url.c_str());
+            snprintf(s_api_key, sizeof(s_api_key), "%s", profile.api_key.c_str());
+            snprintf(s_model, sizeof(s_model), "%s", profile.model.c_str());
+            snprintf(s_headers, sizeof(s_headers), "%s",
+                     (profile.headers_json.empty() ? std::string("{}") : profile.headers_json).c_str());
+            s_enabled = profile.enabled;
 
-        auto provider_id = [](int idx) -> const char* {
-            switch (idx) {
-            case 0: return "gemini";
-            case 1: return "openai";
-            case 2: return "anthropic";
-            case 3: return "openrouter";
-            case 4: return "local_llm";
-            default: return "gemini";
+            const auto& kinds = settings_sa_t::provider_kinds();
+            s_kind = 0;
+            for (int i = 0; i < (int)kinds.size(); ++i) {
+                if (kinds[i] == sa_settings_detail::normalize_provider_kind(profile.kind)) {
+                    s_kind = i;
+                    break;
+                }
             }
         };
 
-        auto get_api_key = [](int idx) -> std::string {
-            switch (idx) {
-            case 0: return g_sa_settings.gemini_api_key;
-            case 1: return g_sa_settings.openai_api_key;
-            case 2: return g_sa_settings.anthropic_api_key;
-            case 3: return g_sa_settings.openrouter_api_key;
-            case 4: return g_sa_settings.local_llm_api_key;
-            default: return {};
-            }
-        };
-
-        auto get_base_url = [](int idx) -> std::string {
-            switch (idx) {
-            case 0: return g_sa_settings.gemini_base_url;
-            case 1: return g_sa_settings.openai_base_url;
-            case 2: return g_sa_settings.anthropic_base_url;
-            case 4: return g_sa_settings.local_llm_base_url;
-            default: return {};
-            }
-        };
-
-        auto get_model_list = [](int idx) -> const std::vector<std::string>& {
-            switch (idx) {
-            case 0: return settings_sa_t::gemini_models();
-            case 1: return settings_sa_t::openai_models();
-            case 2: return settings_sa_t::anthropic_models();
-            case 3: return settings_sa_t::openrouter_models();
-            case 4: return settings_sa_t::local_llm_models();
-            default: { static std::vector<std::string> e; return e; }
-            }
-        };
-
-        auto get_model_name = [](int idx) -> std::string {
-            switch (idx) {
-            case 0: return g_sa_settings.gemini_model_name;
-            case 1: return g_sa_settings.openai_model_name;
-            case 2: return g_sa_settings.anthropic_model_name;
-            case 3: return g_sa_settings.openrouter_model_name;
-            case 4: return g_sa_settings.local_llm_model_name;
-            default: return {};
-            }
-        };
-
-        /* Populate buffers from settings on first open */
         if (s_first) {
-            s_first       = false;
-            s_provider    = find_provider_idx(g_sa_settings.api_provider);
-            s_temperature = static_cast<float>(g_sa_settings.temperature);
-            s_mcp_port    = g_sa_settings.mcp_port;
-            s_mcp_enabled = g_sa_settings.mcp_enabled;
-
-            auto key = get_api_key(s_provider);
-            snprintf(s_api_key, sizeof(s_api_key), "%s", key.c_str());
-
-            auto url = get_base_url(s_provider);
-            snprintf(s_base_url, sizeof(s_base_url), "%s", url.c_str());
-
-            snprintf(s_local_url, sizeof(s_local_url), "%s",
-                     g_sa_settings.local_llm_base_url.c_str());
-
-            auto model = get_model_name(s_provider);
-            snprintf(s_custom_model, sizeof(s_custom_model), "%s", model.c_str());
-
-            auto& models = get_model_list(s_provider);
-            s_model_idx = 0;
-            for (int i = 0; i < (int)models.size(); ++i) {
-                if (models[i] == model) { s_model_idx = i; break; }
+            s_first = false;
+            g_sa_settings.ensure_default_profiles();
+            for (int i = 0; i < (int)g_sa_settings.provider_profiles.size(); ++i) {
+                if (g_sa_settings.provider_profiles[i].id == g_sa_settings.active_provider_profile_id) {
+                    s_selected_profile = i;
+                    break;
+                }
             }
+            refresh_profile_buffers();
+            s_temperature = static_cast<float>(g_sa_settings.temperature);
+            s_mcp_port = g_sa_settings.mcp_port;
+            s_mcp_enabled = g_sa_settings.mcp_enabled;
+            s_sandbox_timeout = g_sa_settings.sandbox.timeout_ms;
+            s_sandbox_memory = g_sa_settings.sandbox.memory_limit_mb;
+            s_sandbox_network = g_sa_settings.sandbox.network_mode == "default" ? 1 : 0;
         }
 
-        /* ---- Title ---- */
+
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 wp = ImGui::GetWindowPos();
         {
@@ -726,147 +717,144 @@ void render_settings_popup()
             ImGui::Dummy(ImVec2(0, tts.y + 6));
         }
 
-        float iw = pw - 36.f;
-
-        /* ---- Provider ---- */
-        {
-            ImGui::Text("Provider");
-            const char* providers[] = {"Gemini", "OpenAI", "Anthropic", "OpenRouter", "Local LLM"};
-            int prev = s_provider;
-            ImGui::SetNextItemWidth(iw);
-            ImGui::Combo("##provider", &s_provider, providers, IM_ARRAYSIZE(providers));
-            if (s_provider != prev) {
-                /* Reload fields for the new provider */
-                auto key = get_api_key(s_provider);
-                snprintf(s_api_key, sizeof(s_api_key), "%s", key.c_str());
-                auto url = get_base_url(s_provider);
-                snprintf(s_base_url, sizeof(s_base_url), "%s", url.c_str());
-                auto model = get_model_name(s_provider);
-                snprintf(s_custom_model, sizeof(s_custom_model), "%s", model.c_str());
-                auto& models = get_model_list(s_provider);
-                s_model_idx = 0;
-                for (int i = 0; i < (int)models.size(); ++i)
-                    if (models[i] == model) { s_model_idx = i; break; }
+        const float list_w = 150.f;
+        ImGui::BeginChild("##profiles", ImVec2(list_w, ph - 120.f), true);
+        for (int i = 0; i < (int)g_sa_settings.provider_profiles.size(); ++i) {
+            const bool selected = (i == s_selected_profile);
+            if (ImGui::Selectable(g_sa_settings.provider_profiles[i].display_name.c_str(), selected)) {
+                s_selected_profile = i;
+                refresh_profile_buffers();
             }
         }
-
-        /* ---- API Key ---- */
-        if (s_provider != 4 || !std::string(s_api_key).empty()) {
-            ImGui::Text("API Key");
-            ImGui::SetNextItemWidth(iw);
-            ImGui::InputText("##apikey", s_api_key, sizeof(s_api_key),
-                             ImGuiInputTextFlags_Password);
+        if (ImGui::Button("+ Add", ImVec2((list_w - 10.f) * 0.48f, 24.f))) {
+            provider_profile_t profile;
+            profile.display_name = "New Profile";
+            profile.id = sa_settings_detail::make_profile_id(profile.display_name, g_sa_settings.provider_profiles.size() + 1);
+            profile.kind = "openai_compatible";
+            profile.base_url = "https://api.openai.com";
+            profile.model = "gpt-4.1-mini";
+            profile.headers_json = "{}";
+            g_sa_settings.provider_profiles.push_back(profile);
+            s_selected_profile = (int)g_sa_settings.provider_profiles.size() - 1;
+            refresh_profile_buffers();
         }
+        ImGui::SameLine();
+        if (ImGui::Button("- Remove", ImVec2((list_w - 10.f) * 0.48f, 24.f)) &&
+            g_sa_settings.provider_profiles.size() > 1) {
+            g_sa_settings.provider_profiles.erase(g_sa_settings.provider_profiles.begin() + s_selected_profile);
+            s_selected_profile = (s_selected_profile > 0) ? (s_selected_profile - 1) : 0;
+            refresh_profile_buffers();
+        }
+        ImGui::EndChild();
 
-        /* ---- Model ---- */
-        {
-            ImGui::Text("Model");
-            auto& models = get_model_list(s_provider);
-            if (!models.empty()) {
-                if (s_model_idx >= (int)models.size()) s_model_idx = 0;
-                ImGui::SetNextItemWidth(iw);
-                if (ImGui::BeginCombo("##model", models[s_model_idx].c_str())) {
-                    for (int i = 0; i < (int)models.size(); ++i) {
-                        bool selected = (i == s_model_idx);
-                        if (ImGui::Selectable(models[i].c_str(), selected))
-                            s_model_idx = i;
-                        if (selected)
-                            ImGui::SetItemDefaultFocus();
-                    }
-                    ImGui::EndCombo();
+        ImGui::SameLine();
+        ImGui::BeginChild("##profile_editor", ImVec2(0.f, ph - 120.f), false);
+
+        ImGui::Text("Profile Name");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##profile_name", s_name, sizeof(s_name));
+
+        ImGui::Text("Provider Kind");
+        ImGui::SetNextItemWidth(-1);
+        auto& kinds = settings_sa_t::provider_kinds();
+        std::vector<const char*> kind_items;
+        kind_items.reserve(kinds.size());
+        for (auto& kind : kinds)
+            kind_items.push_back(kind.c_str());
+        ImGui::Combo("##provider_kind", &s_kind, kind_items.data(), (int)kind_items.size());
+
+        ImGui::Text("Model");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##profile_model", s_model, sizeof(s_model));
+        const auto& presets = settings_sa_t::models_for_kind(kinds[s_kind]);
+        if (ImGui::BeginCombo("##model_presets", "Quick Presets")) {
+            for (const auto& preset : presets) {
+                if (ImGui::Selectable(preset.c_str())) {
+                    snprintf(s_model, sizeof(s_model), "%s", preset.c_str());
                 }
             }
-            ImGui::Text("Custom Model (overrides dropdown)");
-            ImGui::SetNextItemWidth(iw);
-            ImGui::InputText("##custom_model", s_custom_model, sizeof(s_custom_model));
+            ImGui::EndCombo();
         }
 
-        /* ---- Base URL (optional) ---- */
-        {
-            const char* label = s_provider == 4 ? "Base URL (required)" : "Base URL (optional, for proxies)";
-            ImGui::Text("%s", label);
-            ImGui::SetNextItemWidth(iw);
-            if (s_provider == 4) {
-                ImGui::InputText("##baseurl_local", s_local_url, sizeof(s_local_url));
-            } else {
-                ImGui::InputText("##baseurl", s_base_url, sizeof(s_base_url));
-            }
+        ImGui::Text("Base URL");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##profile_base_url", s_base_url, sizeof(s_base_url));
+
+        ImGui::Text("API Key");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##profile_api_key", s_api_key, sizeof(s_api_key), ImGuiInputTextFlags_Password);
+
+        ImGui::Text("Custom Headers (JSON)");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextMultiline("##profile_headers", s_headers, sizeof(s_headers), ImVec2(-1.f, 90.f));
+
+        ImGui::Checkbox("Profile Enabled", &s_enabled);
+        ImGui::Checkbox("Enable MCP Server", &s_mcp_enabled);
+        if (s_mcp_enabled) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(90.f);
+            ImGui::InputInt("Port", &s_mcp_port, 0, 0);
         }
 
-        /* ---- Temperature ---- */
-        {
-            ImGui::Text("Temperature");
-            ImGui::SetNextItemWidth(iw);
-            ImGui::SliderFloat("##temp", &s_temperature, 0.0f, 2.0f, "%.2f");
-        }
+        ImGui::Text("Temperature");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##temp", &s_temperature, 0.0f, 2.0f, "%.2f");
 
-        /* ---- MCP Server ---- */
-        {
-            ImGui::Checkbox("Enable MCP Server", &s_mcp_enabled);
-            if (s_mcp_enabled) {
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(80.f);
-                ImGui::InputInt("Port", &s_mcp_port, 0, 0);
-                if (s_mcp_port < 1) s_mcp_port = 1;
-                if (s_mcp_port > 65535) s_mcp_port = 65535;
-            }
-        }
+        ImGui::Text("Sandbox Timeout (ms)");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputInt("##sandbox_timeout", &s_sandbox_timeout, 0, 0);
+        ImGui::Text("Sandbox Memory Budget (MB)");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputInt("##sandbox_memory", &s_sandbox_memory, 0, 0);
+        const char* network_modes[] = {"Off", "Default"};
+        ImGui::Combo("Sandbox Network", &s_sandbox_network, network_modes, IM_ARRAYSIZE(network_modes));
+
+        ImGui::EndChild();
 
         ImGui::Dummy(ImVec2(0, 6));
 
-        /* ---- Save / Cancel buttons ---- */
+
         float btn_w = 100.f;
         float btn_spacing = 12.f;
         float total_btn_w = btn_w * 2 + btn_spacing;
         ImGui::SetCursorPosX((pw - total_btn_w) * 0.5f - 9.f);
 
         if (ImGui::Button("Save", ImVec2(btn_w, 30))) {
-            /* Copy buffers back to settings */
-            g_sa_settings.api_provider = provider_id(s_provider);
+            if (s_selected_profile < 0 || s_selected_profile >= (int)g_sa_settings.provider_profiles.size())
+                s_selected_profile = 0;
+            auto& profile = g_sa_settings.provider_profiles[s_selected_profile];
+            profile.display_name = s_name[0] ? s_name : "Profile";
+            profile.kind = kinds[s_kind];
+            profile.base_url = s_base_url;
+            profile.api_key = s_api_key;
+            profile.model = s_model;
+            profile.headers_json = s_headers;
+            profile.enabled = s_enabled;
+            g_sa_settings.active_provider_profile_id = profile.id;
+
             g_sa_settings.temperature  = static_cast<double>(s_temperature);
-            g_sa_settings.mcp_port     = s_mcp_port;
+            g_sa_settings.mcp_port     = (std::min)((std::max)(s_mcp_port, 1), 65535);
             g_sa_settings.mcp_enabled  = s_mcp_enabled;
-
-            std::string key_str    = s_api_key;
-            std::string model_str  = s_custom_model[0] ? std::string(s_custom_model)
-                                   : (!get_model_list(s_provider).empty()
-                                       ? get_model_list(s_provider)[s_model_idx] : "");
-            std::string url_str    = (s_provider == 4) ? std::string(s_local_url)
-                                                       : std::string(s_base_url);
-
-            switch (s_provider) {
-            case 0:
-                g_sa_settings.gemini_api_key    = key_str;
-                g_sa_settings.gemini_model_name = model_str;
-                g_sa_settings.gemini_base_url   = url_str;
-                break;
-            case 1:
-                g_sa_settings.openai_api_key    = key_str;
-                g_sa_settings.openai_model_name = model_str;
-                g_sa_settings.openai_base_url   = url_str;
-                break;
-            case 2:
-                g_sa_settings.anthropic_api_key    = key_str;
-                g_sa_settings.anthropic_model_name = model_str;
-                g_sa_settings.anthropic_base_url   = url_str;
-                break;
-            case 3:
-                g_sa_settings.openrouter_api_key    = key_str;
-                g_sa_settings.openrouter_model_name = model_str;
-                break;
-            case 4:
-                g_sa_settings.local_llm_api_key    = key_str;
-                g_sa_settings.local_llm_model_name = model_str;
-                g_sa_settings.local_llm_base_url   = std::string(s_local_url);
-                break;
-            }
+            g_sa_settings.sandbox.timeout_ms = (std::max)(s_sandbox_timeout, 1000);
+            g_sa_settings.sandbox.memory_limit_mb = (std::max)(s_sandbox_memory, 64);
+            g_sa_settings.sandbox.network_mode = s_sandbox_network == 1 ? "default" : "off";
+            g_sa_settings.apply_legacy_fields_to_active_profile();
+            g_sa_settings.sync_legacy_fields_from_active_profile();
 
             g_sa_settings.save();
 
-            /* Recreate the AI client so it picks up the new host/key immediately */
+
             if (g_sa_ai_client)
                 g_sa_ai_client.reset();
             g_sa_ai_client = std::make_unique<standalone_ai_client_t>(g_sa_settings);
+
+            if (s_server_started)
+                s_mcp_server.stop();
+            s_server_started = false;
+            if (g_sa_settings.mcp_enabled && s_mcp_server.start(g_sa_settings.mcp_port)) {
+                s_server_started = true;
+                s_mcp_server.write_client_configs();
+            }
 
             g_settings_open = false;
             ImGui::CloseCurrentPopup();
@@ -878,7 +866,7 @@ void render_settings_popup()
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.30f, 0.30f, 0.38f, 0.9f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.36f, 0.36f, 0.44f, 1.f));
         if (ImGui::Button("Cancel", ImVec2(btn_w, 30))) {
-            s_first = true; /* re-read settings on next open */
+            s_first = true;
             g_settings_open = false;
             ImGui::CloseCurrentPopup();
         }

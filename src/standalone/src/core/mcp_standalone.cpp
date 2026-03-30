@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 
 namespace mcp_standalone
 {
@@ -37,6 +38,17 @@ static std::string generate_session_id()
              static_cast<unsigned long long>(rng()),
              static_cast<unsigned long long>(counter.load()));
     return buf;
+}
+
+static std::string read_env_var(const char* name)
+{
+    char* value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, name) != 0 || !value)
+        return {};
+    std::string result(value);
+    free(value);
+    return result;
 }
 
 static std::string sanitize_utf8(const std::string& input)
@@ -170,7 +182,7 @@ json server_t::tool_schema(const tool_def_t& tool) const
     json annotations;
     annotations["title"]           = snake_to_title(tool.name);
     annotations["readOnlyHint"]    = tool.read_only;
-    annotations["destructiveHint"] = (tool.name == "write_memory" || tool.name == "sandbox_execute");
+    annotations["destructiveHint"] = (!tool.read_only);
     annotations["idempotentHint"]  = tool.read_only;
     annotations["openWorldHint"]   = (tool.name == "sandbox_execute");
 
@@ -196,17 +208,17 @@ json server_t::handle_initialize(const json& id, const json&)
 
     static const char* instructions =
         "You are connected to AiDA Standalone â€” a reverse-engineering assistant "
-        "that operates through a kernel driver for live process memory analysis, "
-        "Zydis for disassembly, and a Windows sandbox for safe malware execution.\n\n"
+        "that operates through a user-mode live inspection bridge, "
+        "Zydis for disassembly, and Windows Sandbox for safe sample execution.\n\n"
         "## Capabilities\n"
-        "- Read/write live process memory via kernel driver\n"
+        "- Read live process memory from an attached process\n"
         "- Disassemble x64 code at any address or from PE files\n"
         "- Attach to / detach from running processes\n"
-        "- Execute untrusted binaries in a sandboxed environment\n"
+        "- Execute untrusted binaries in Windows Sandbox\n"
         "- Convert numbers between bases (hex, decimal, binary, ASCII)\n\n"
         "## Tool usage guidelines\n"
-        "- Always call `driver_status` first to check if the driver is loaded\n"
-        "- Call `driver_attach` with a PID before memory operations\n"
+        "- Always call `driver_status` first to check live-inspection state\n"
+        "- Call `driver_attach` with a PID or process name before memory operations\n"
         "- Use `disassemble_address` for live memory; `disassemble_file` for PE files\n"
         "- Use `sandbox_execute` for running untrusted binaries safely\n"
         "- For number conversions, ALWAYS use `convert_number` â€” never convert manually\n";
@@ -318,7 +330,7 @@ json server_t::handle_resources_read(const json& id, const json& params)
 
     if (uri == "standalone://driver-status") {
         json status;
-        status["loaded"]      = driver_bridge::is_loaded();
+        status["ready"]       = driver_bridge::is_loaded();
         status["attached_pid"]= driver_bridge::attached_pid();
         status["status"]      = driver_bridge::status();
         text_content = status;
@@ -366,7 +378,7 @@ json server_t::handle_prompts_list(const json& id, const json&)
 
     prompts.push_back({
         {"name",        "sandbox_analysis"},
-        {"description", "Run a binary in a sandboxed environment and analyze its output"},
+        {"description", "Run a binary in Windows Sandbox and analyze its output"},
         {"arguments",   json::array({
             {{"name", "path"}, {"description", "Path to the executable to analyze"}, {"required", true}}
         })}
@@ -429,7 +441,7 @@ json server_t::handle_prompts_get(const json& id, const json& params)
             return make_error(id, JSONRPC_INVALID_PARAMS, "Missing required argument: 'path'");
 
         std::string prompt =
-            "Execute the binary at '" + path + "' in a sandboxed environment.\n"
+            "Execute the binary at '" + path + "' in Windows Sandbox.\n"
             "Use the sandbox_execute tool, then:\n"
             "1. Examine the stdout/stderr output\n"
             "2. Check if the process timed out or was killed\n"
@@ -775,9 +787,7 @@ static std::string get_home_dir()
     char buf[MAX_PATH] = {};
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_PROFILE, nullptr, 0, buf)))
         return buf;
-    const char* up = getenv("USERPROFILE");
-    if (up) return up;
-    return "";
+    return read_env_var("USERPROFILE");
 }
 
 static std::string get_appdata_dir()
@@ -785,9 +795,7 @@ static std::string get_appdata_dir()
     char buf[MAX_PATH] = {};
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, buf)))
         return buf;
-    const char* ad = getenv("APPDATA");
-    if (ad) return ad;
-    return "";
+    return read_env_var("APPDATA");
 }
 
 static std::string expand_path(const char* tmpl)
@@ -1058,6 +1066,5 @@ void server_t::write_client_configs() const
     }
 }
 
-// Tool registrations moved to mcp_standalone_tools.cpp
 
-} // namespace mcp_standalone
+}

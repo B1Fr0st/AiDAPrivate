@@ -44,8 +44,8 @@ void set_acrylic_color(HWND hwnd)
         GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
     if (!SetWindowCompositionAttribute) return;
 
-    // Use ACCENT_ENABLE_BLURBEHIND (3) - lighter than ACRYLICBLURBEHIND (4)
-    DWORD color = (5 << 0) | (12 << 8) | (65 << 16) | (0xC0 << 24);
+
+    DWORD color = (DWORD(5) << 0) | (DWORD(12) << 8) | (DWORD(65) << 16) | (DWORD(0xC0) << 24);
     ACCENT_POLICY accent = { 3, 2, color, 0 };
 
     WINCOMPATTRDATA data = { 19, &accent, sizeof(accent) };
@@ -54,20 +54,20 @@ void set_acrylic_color(HWND hwnd)
 
 int main(int, char**)
 {
-    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"oh my god", nullptr };
+    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"AiDAStandaloneWindow", nullptr };
     ::RegisterClassExW(&wc);
     int screen_w = GetSystemMetrics(SM_CXSCREEN);
     int screen_h = GetSystemMetrics(SM_CYSCREEN);
-    HWND hwnd = ::CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED, wc.lpszClassName, L"oh my god", WS_POPUP, (screen_w - 200) / 2, (screen_h - 250) / 2, 200, 250, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND hwnd = ::CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED, wc.lpszClassName, L"AiDA Standalone", WS_POPUP, (screen_w - 200) / 2, (screen_h - 250) / 2, 200, 250, nullptr, nullptr, wc.hInstance, nullptr);
     g_hwnd = hwnd;
 
-    // Set window icon from embedded aidalogo PNG
+
     {
         extern unsigned char aidalogo[];
         int iw2 = 0, ih2 = 0, ic = 0;
         unsigned char* px = stbi_load_from_memory(aidalogo, 1273853, &iw2, &ih2, &ic, 4);
         if (px && iw2 > 0 && ih2 > 0) {
-            // Convert RGBA to BGRA for CreateBitmap/CreateIconIndirect
+
             for (int i = 0; i < iw2 * ih2 * 4; i += 4)
                 std::swap(px[i], px[i + 2]);
             HBITMAP hbm_color = CreateBitmap(iw2, ih2, 1, 32, px);
@@ -96,8 +96,6 @@ int main(int, char**)
     ::ShowWindow(hwnd, SW_SHOWDEFAULT);
     const MARGINS margin = { -1 };
     DwmExtendFrameIntoClientArea(hwnd, &margin);
-    HRGN region = CreateRoundRectRgn(0, 0, 250, 200, 16, 16);
-
     DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_ROUND;
     DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
 
@@ -158,25 +156,23 @@ int main(int, char**)
     init_standalone_chat();
 
 
-    bool show_demo_window = true;
-    bool show_another_window = false;
     ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
 
 
     bool done = false;
-    static int prev_state = -1; // track state transitions for centering
+    static int prev_state = -1;
     while (!done)
     {
 
-        // Apply theme changes (acrylic + accent)
+
         if (themes::changed)
         {
             themes::changed = false;
-            // Use resolved theme (supports both built-in and custom themes)
+
             auto& t = themes::resolved;
             globals::ui::accent = t.accent;
 
-            // Apply theme's acrylic color
+
             struct ACCENT_POLICY_T { DWORD AccentState; DWORD AccentFlags; DWORD GradientColor; DWORD AnimationId; };
             struct WINCOMPATTRDATA_T { DWORD Attribute; PVOID pData; ULONG DataSize; };
             auto SetWCA = (BOOL(WINAPI*)(HWND, void*))
@@ -212,7 +208,7 @@ int main(int, char**)
         {
             CleanupRenderTarget();
             g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
-            // Sync globals and window region on user resize
+
             if (ide_resize_applied) {
                 globals::ui::window_w = (float)g_ResizeWidth;
                 globals::ui::window_h = (float)g_ResizeHeight;
@@ -231,22 +227,20 @@ int main(int, char**)
         int iw = (int)globals::ui::window_w;
         int ih = (int)globals::ui::window_h;
 
-        // Determine current UI state for centering decisions
-        int cur_state = 0; // loading
-        if (globals::ui::load_timer >= 1.5f) cur_state = 1; // welcome
-        if (globals::ui::welcome_done && !license::validated) cur_state = 2; // license
-        if (globals::ui::welcome_done && license::validated) cur_state = 3; // main
+
+        int cur_state = 0;
+        if (globals::ui::load_timer >= 1.5f) cur_state = 1;
+        if (globals::ui::welcome_done && !license::validated) cur_state = 2;
+        if (globals::ui::welcome_done && license::validated) cur_state = 3;
         bool state_changed = (cur_state != prev_state);
         if (state_changed) prev_state = cur_state;
 
-        // In main IDE state, sync globals from actual window size (user may resize)
-        // But skip until the initial programmatic resize has been applied,
-        // otherwise the sync reads the old small HWND size and overrides the snap.
+
         if (cur_state == 3 && ide_resize_applied) {
             RECT wr; GetWindowRect(hwnd, &wr);
             int actual_w = wr.right - wr.left;
             int actual_h = wr.bottom - wr.top;
-            // Only update if the OS window size differs (user resized via border grips)
+
             if (actual_w > 200 && actual_h > 200) {
                 if (abs(actual_w - iw) > 2 || abs(actual_h - ih) > 2) {
                     globals::ui::window_w = (float)actual_w;
@@ -261,23 +255,23 @@ int main(int, char**)
         {
             if (!globals::ui::maximized) {
                 if (cur_state < 3) {
-                    // During loading/welcome/license, always keep centered (zoom effect)
+
                     int cx = (screen_w - iw) / 2;
                     int cy = (screen_h - ih) / 2;
                     SetWindowPos(hwnd, nullptr, cx, cy, iw, ih, SWP_NOZORDER);
                 } else if (state_changed) {
-                    // Center window on state transition to IDE
+
                     int cx = (screen_w - iw) / 2;
                     int cy = (screen_h - ih) / 2;
                     SetWindowPos(hwnd, nullptr, cx, cy, iw, ih, SWP_NOZORDER);
                 } else {
-                    // Resize in place - don't override user drag position
+
                     SetWindowPos(hwnd, nullptr, 0, 0, iw, ih, SWP_NOZORDER | SWP_NOMOVE);
                 }
             }
             if (cur_state == 3 && iw >= 1000 && ih >= 600)
                 ide_resize_applied = true;
-            // Flat corners when maximized, rounded otherwise
+
             if (globals::ui::maximized) {
                 HRGN rgn = CreateRectRgn(0, 0, iw, ih);
                 SetWindowRgn(hwnd, rgn, TRUE);
@@ -393,7 +387,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
     case WM_NCHITTEST:
     {
-        // Resize borders on edges, drag handled manually in ImGui
+
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         RECT rc; GetWindowRect(hWnd, &rc);
         const int border = 6;
@@ -402,7 +396,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         bool top    = pt.y < rc.top    + border;
         bool bottom = pt.y > rc.bottom - border;
 
-        // Only enable resize after the main IDE layout is visible
+
         if (globals::ui::welcome_done && license::validated) {
             if (top    && left)  return HTTOPLEFT;
             if (top    && right) return HTTOPRIGHT;
@@ -423,7 +417,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return 0;
     case WM_GETMINMAXINFO:
     {
-        // Constrain maximized window to the work area (exclude taskbar)
+
         HMONITOR hm = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi = { sizeof(mi) };
         if (GetMonitorInfoW(hm, &mi)) {

@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <map>
 #include <thread>
 #include <mutex>
 #include <atomic>

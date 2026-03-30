@@ -1,5 +1,4 @@
-/* C:\Users\ruar\Downloads\aidalogo (1).png (3/30/2026 4:18:06 AM)
-   StartOffset(h): 00000000, EndOffset(h): 00136FFC, Length(h): 00136FFD */
+
 
 unsigned char aidalogo[1273853] = {
 	0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,

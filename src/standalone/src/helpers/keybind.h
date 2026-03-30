@@ -178,7 +178,7 @@ const char* const key_names[] = { "Unknown",
 class CKeybind
 {
 public:
-    static enum c_keybind_type : int {
+    enum c_keybind_type : int {
         TOGGLE,
         HOLD,
         ALWAYS
@@ -220,7 +220,9 @@ public:
             return "none";
 
         std::string tmp = key_names[key];
-        std::transform(tmp.begin(), tmp.end(), tmp.begin(), [](unsigned char c) { return std::tolower(c); });
+        std::transform(tmp.begin(), tmp.end(), tmp.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
         return tmp;
     }
 

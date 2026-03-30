@@ -33,6 +33,8 @@ set(UNICORN_INSTALL OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS_SAVED "${BUILD_SHARED_LIBS}")
 set(BUILD_SHARED_LIBS OFF)
 
+option(BUILD_AIDA_PLUGIN "Build the AiDA IDA plugin" ON)
+
 FetchContent_Declare(
     unicorn
     GIT_REPOSITORY https://github.com/unicorn-engine/unicorn.git
@@ -42,15 +44,17 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(unicorn)
 set(BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS_SAVED}")
 
-if(NOT DEFINED IDASDK_DIR)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ida-sdk/src/include/ida.hpp")
-        set(IDASDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ida-sdk/src")
-    elseif(DEFINED ENV{IDASDK})
-        set(IDASDK_DIR "$ENV{IDASDK}")
-    else()
-        message(FATAL_ERROR
-            "IDA SDK not found. Set -DIDASDK_DIR=<path> or the IDASDK environment variable.\n"
-            "The path must point to the SDK 'src' directory that contains 'include/' and 'lib/'.")
+if(BUILD_AIDA_PLUGIN)
+    if(NOT DEFINED IDASDK_DIR)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ida-sdk/src/include/ida.hpp")
+            set(IDASDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ida-sdk/src")
+        elseif(DEFINED ENV{IDASDK})
+            set(IDASDK_DIR "$ENV{IDASDK}")
+        else()
+            message(FATAL_ERROR
+                "IDA SDK not found. Set -DIDASDK_DIR=<path> or the IDASDK environment variable.\n"
+                "The path must point to the SDK 'src' directory that contains 'include/' and 'lib/'.")
+        endif()
     endif()
 endif()
 
@@ -121,6 +125,9 @@ if(WIN32)
 
     if(BUILD_AIDA_STANDALONE)
         set(STANDALONE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src")
+        set(OPENSSL_USE_STATIC_LIBS TRUE)
+        set(OPENSSL_MSVC_STATIC_RT OFF)
+        find_package(OpenSSL REQUIRED)
 
         # -- Create imgui/ directory layout expected by standalone sources ---------
         # The standalone code does #include "imgui/imgui.h", "imgui/imgui_impl_dx11.h",
@@ -170,6 +177,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/standalone_driver.cpp"
             "${STANDALONE_ROOT}/core/standalone_ai_client.cpp"
             "${STANDALONE_ROOT}/core/standalone_chat.cpp"
+            "${STANDALONE_ROOT}/core/standalone_license.cpp"
             driver/comm.cpp
             src/net_security.cpp
             src/emulation_engine.cpp
@@ -223,6 +231,7 @@ if(WIN32)
         target_compile_definitions(AiDAStandalone PRIVATE
             __NT__
             _CRT_SECURE_NO_WARNINGS
+            CPPHTTPLIB_OPENSSL_SUPPORT
             NOMINMAX
             WIN32_LEAN_AND_MEAN
             IMGUI_ENABLE_FREETYPE
@@ -233,6 +242,7 @@ if(WIN32)
         # -- Compiler flags -------------------------------------------------------
         target_compile_options(AiDAStandalone PRIVATE
             /W3
+            /wd4005
             /EHsc
             /Zi
             /FS
@@ -270,6 +280,8 @@ if(WIN32)
         target_link_options(AiDAStandalone PRIVATE
             /DEBUG:FULL
             /ENTRY:mainCRTStartup
+            /NODEFAULTLIB:LIBCMT
+            /IGNORE:4099
         )
 
         # -- Output properties + PDB ---------------------------------------------
@@ -288,9 +300,12 @@ if(WIN32)
             COMPILE_PDB_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
             COMPILE_PDB_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
         )
+
     endif()
 
 endif()
+
+if(BUILD_AIDA_PLUGIN)
 
 if(NOT EXISTS "${IDASDK_DIR}/include/ida.hpp")
     if(EXISTS "${IDASDK_DIR}/src/include/ida.hpp")
@@ -699,6 +714,8 @@ elseif(UNIX)
         endif()
     endif()
     
+endif()
+
 endif()
 
 

@@ -40,6 +40,7 @@ struct helpers
 namespace icon_loader
 {
 	bool load(const unsigned char* data, int size, ID3D11ShaderResourceView** out_srv, int* out_w, int* out_h, bool force_white = true);
+	bool load_file(const char* path, ID3D11ShaderResourceView** out_srv, int* out_w, int* out_h, bool force_white = false);
 }
 
 extern HWND g_hwnd;

@@ -26,24 +26,23 @@ inline float g_chat_demo_timer = 0.f;
 inline int   g_chat_demo_stage = 0;
 
 
-// Real AI chat integration  (see core/standalone_chat.hpp)
 void tick_ai_chat();
 void poll_ai_chat();
 void render_settings_popup();
 extern bool g_settings_open;
 
-// ----- License validation state -----
+
 namespace license
 {
-	inline bool  validated       = false;   // true once server confirms key
-	inline bool  checking        = false;   // true while HTTP request in-flight
-	inline bool  check_failed    = false;   // true if last attempt failed
-	inline char  key_buf[128]    = {};      // user-typed key
-	inline std::string error_msg;           // displayed below input on failure
-	inline std::string saved_key;           // persisted to disk after success
+	inline bool  validated       = false;
+	inline bool  checking        = false;
+	inline bool  check_failed    = false;
+	inline char  key_buf[128]    = {};
+	inline std::string error_msg;
+	inline std::string saved_key;
 }
 
-// ----- File browser state -----
+
 struct FileBrowserEntry {
 	std::string name;
 	std::string full_path;
@@ -65,19 +64,19 @@ namespace file_browser
 	void open_file(int idx);
 }
 
-// ----- Code editor state -----
+
 namespace code_editor
 {
-	inline std::vector<char> buffer;        // editable text buffer
-	inline std::string filename;            // currently open file name
-	inline std::string filepath;            // full path on disk
-	inline bool        active = false;      // editor is showing
-	inline bool        dirty  = false;      // has unsaved changes
+	inline std::vector<char> buffer;
+	inline std::string filename;
+	inline std::string filepath;
+	inline bool        active = false;
+	inline bool        dirty  = false;
 	inline float       scroll_y = 0.f;
 
-	// Initialize buffer from string content
+
 	inline void load(const std::string& content, const std::string& fname, const std::string& fpath) {
-		buffer.resize(content.size() + 1024 * 64); // 64KB extra room for editing
+		buffer.resize(content.size() + 1024 * 64);
 		memcpy(buffer.data(), content.c_str(), content.size());
 		buffer[content.size()] = '\0';
 		filename = fname;
@@ -87,13 +86,13 @@ namespace code_editor
 		scroll_y = 0.f;
 	}
 
-	// Get content as string
+
 	inline std::string get_content() {
 		if (buffer.empty()) return {};
 		return std::string(buffer.data());
 	}
 
-	// Save buffer to file
+
 	inline bool save() {
 		if (filepath.empty() || buffer.empty()) return false;
 		FILE* f = nullptr;
@@ -107,14 +106,14 @@ namespace code_editor
 	}
 }
 
-// ----- Theme system -----
+
 struct ThemePreset {
 	const char* name;
 	ImVec4      accent;
-	ImU32       bg_base;      // main window tint
-	ImU32       panel_bg;     // child panels
-	ImU32       panel_header; // panel header bar
-	ImU32       title_bar;    // top title bar
+	ImU32       bg_base;
+	ImU32       panel_bg;
+	ImU32       panel_header;
+	ImU32       title_bar;
 	ImU32       text_primary;
 	ImU32       text_secondary;
 	ImU32       text_dim;
@@ -124,7 +123,7 @@ struct ThemePreset {
 namespace themes
 {
 	inline const ThemePreset presets[] = {
-		// 0 - Midnight (default)
+
 		{ "Midnight",
 		  ImVec4(134.f/255.f, 135.f/255.f, 254.f/255.f, 1.f),
 		  IM_COL32(4, 8, 30, 235),
@@ -136,7 +135,7 @@ namespace themes
 		  IM_COL32(110, 105, 145, 140),
 		  (DWORD)((5) | (12 << 8) | (65 << 16) | (0x70 << 24))
 		},
-		// 1 - Cyberpunk
+
 		{ "Cyberpunk",
 		  ImVec4(1.0f, 0.2f, 0.6f, 1.f),
 		  IM_COL32(10, 2, 15, 235),
@@ -148,7 +147,7 @@ namespace themes
 		  IM_COL32(140, 80, 120, 140),
 		  (DWORD)((15) | (2 << 8) | (30 << 16) | (0x70 << 24))
 		},
-		// 2 - Nord
+
 		{ "Nord",
 		  ImVec4(136.f/255.f, 192.f/255.f, 208.f/255.f, 1.f),
 		  IM_COL32(6, 12, 18, 235),
@@ -160,7 +159,7 @@ namespace themes
 		  IM_COL32(100, 120, 145, 140),
 		  (DWORD)((8) | (18 << 8) | (35 << 16) | (0x70 << 24))
 		},
-		// 3 - Monokai
+
 		{ "Monokai",
 		  ImVec4(166.f/255.f, 226.f/255.f, 46.f/255.f, 1.f),
 		  IM_COL32(12, 10, 6, 235),
@@ -172,7 +171,7 @@ namespace themes
 		  IM_COL32(117, 113, 94, 140),
 		  (DWORD)((10) | (8 << 8) | (4 << 16) | (0x70 << 24))
 		},
-		// 4 - Dracula
+
 		{ "Dracula",
 		  ImVec4(189.f/255.f, 147.f/255.f, 249.f/255.f, 1.f),
 		  IM_COL32(10, 6, 18, 235),
@@ -184,7 +183,7 @@ namespace themes
 		  IM_COL32(130, 120, 160, 140),
 		  (DWORD)((12) | (6 << 8) | (28 << 16) | (0x70 << 24))
 		},
-		// 5 - Solarized
+
 		{ "Solarized",
 		  ImVec4(38.f/255.f, 139.f/255.f, 210.f/255.f, 1.f),
 		  IM_COL32(0, 12, 16, 235),
@@ -196,7 +195,7 @@ namespace themes
 		  IM_COL32(88, 110, 117, 140),
 		  (DWORD)((0) | (14 << 8) | (22 << 16) | (0x70 << 24))
 		},
-		// 6 - Blood
+
 		{ "Blood",
 		  ImVec4(0.85f, 0.12f, 0.12f, 1.f),
 		  IM_COL32(18, 4, 4, 235),
@@ -211,7 +210,7 @@ namespace themes
 	};
 	inline constexpr int count = sizeof(presets) / sizeof(presets[0]);
 	inline int active = 0;
-	inline bool changed = true; // trigger initial application
+	inline bool changed = true;
 	inline ThemePreset resolved = {};
 	inline char resolved_name_buf[128] = {};
 }
@@ -234,12 +233,11 @@ namespace globals
 
 		inline float test2 = 0.0f;
 
-		// Three-panel widths (pixels)
-		inline float panel_left_w  = 220.f;   // file browser
-		inline float panel_right_w = 350.f;   // chat
-		// center panel = window_w - panel_left_w - panel_right_w - gaps
 
-		// Splitter drag state
+		inline float panel_left_w  = 220.f;
+		inline float panel_right_w = 350.f;
+
+
 		inline bool  dragging_left_splitter  = false;
 		inline bool  dragging_right_splitter = false;
 
@@ -253,7 +251,7 @@ namespace globals
 		inline float welcome_text_y_offset = 30.f;
 		inline bool welcome_done = false;
 
-		// Maximize state
+
 		inline bool  maximized = false;
 		inline float pre_max_x = 0.f;
 		inline float pre_max_y = 0.f;
@@ -264,9 +262,7 @@ namespace globals
 
 }
 
-// ============================================================================
-//  Custom theme system (user-created, editable, shareable via JSON)
-// ============================================================================
+
 struct CustomThemeData {
 	std::string name = "Custom Theme";
 	float accent[3] = { 0.53f, 0.53f, 1.0f };
@@ -278,26 +274,24 @@ struct CustomThemeData {
 	ImU32 text_secondary = IM_COL32(170, 175, 190, 200);
 	ImU32 text_dim       = IM_COL32(110, 105, 145, 140);
 	DWORD acrylic_color  = (DWORD)((5) | (12 << 8) | (65 << 16) | (0x70 << 24));
-	int   icon_index     = 3;   // 0=kaneki 1=rias 2=nagi 3=mio, -1=custom file
+	int   icon_index     = 3;
 	std::string icon_file_path;
 };
 
 namespace custom_themes {
 	inline std::vector<CustomThemeData> list;
-	inline int  active_custom = -1;  // -1 = using built-in preset
+	inline int  active_custom = -1;
 	inline bool editor_open   = false;
 	inline int  editing_idx   = -1;
 	inline CustomThemeData editing_copy;
 }
 
-// ============================================================================
-//  Auto-completion engine (C/C++ keyword & API completion)
-// ============================================================================
+
 namespace autocomplete {
 	inline bool enabled       = true;
 	inline bool popup_visible = false;
 	inline int  selected      = 0;
-	inline int  cursor_byte   = 0;      // byte offset in buffer
+	inline int  cursor_byte   = 0;
 	inline int  cursor_line   = 0;
 	inline int  cursor_col    = 0;
 	inline std::string partial;
@@ -316,24 +310,24 @@ namespace autocomplete {
 			"template","this","thread_local","throw","true","try","typedef",
 			"typeid","typename","union","unsigned","using","virtual","void",
 			"volatile","wchar_t","while",
-			// Standard types
+
 			"int8_t","int16_t","int32_t","int64_t","uint8_t","uint16_t",
 			"uint32_t","uint64_t","size_t","uintptr_t","intptr_t","ptrdiff_t",
 			"string","vector","map","unordered_map","set","unordered_set",
 			"array","deque","list","pair","tuple","shared_ptr","unique_ptr",
 			"optional","variant","any","function","thread","mutex","atomic",
-			// Common functions
+
 			"printf","sprintf","snprintf","fprintf","memcpy","memset","memmove",
 			"strlen","strcmp","strncmp","strcpy","strncpy","malloc","calloc",
 			"realloc","free",
-			// Windows API
+
 			"DWORD","HANDLE","HMODULE","LPVOID","LPCSTR","LPCWSTR","BOOL",
 			"INVALID_HANDLE_VALUE","CreateFile","ReadFile","WriteFile",
 			"CloseHandle","GetLastError","VirtualAlloc","VirtualFree",
 			"VirtualProtect","LoadLibrary","GetProcAddress","FreeLibrary",
 			"CreateThread","WaitForSingleObject","TerminateProcess",
 			"CreateProcess","OpenProcess","ReadProcessMemory","WriteProcessMemory",
-			// IDA-style RE keywords
+
 			"IMAGE_DOS_HEADER","IMAGE_NT_HEADERS","IMAGE_SECTION_HEADER",
 			"IMAGE_IMPORT_DESCRIPTOR","IMAGE_EXPORT_DIRECTORY",
 			"PIMAGE_DOS_HEADER","PIMAGE_NT_HEADERS",
@@ -360,9 +354,7 @@ namespace autocomplete {
 	}
 }
 
-// ============================================================================
-//  Editor configuration
-// ============================================================================
+
 namespace editor_config {
 	inline int   tab_size               = 4;
 	inline bool  show_line_numbers      = true;
@@ -371,9 +363,7 @@ namespace editor_config {
 	inline bool  highlight_current_line = true;
 }
 
-// ============================================================================
-//  Open file tabs
-// ============================================================================
+
 struct OpenTab {
 	std::string filename;
 	std::string filepath;
