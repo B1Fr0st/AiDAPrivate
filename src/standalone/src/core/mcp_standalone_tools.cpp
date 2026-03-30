@@ -2971,6 +2971,348 @@ tool_result_t handle_driver_dump_kernel_module(const json& params) {
     return tool_result_t::ok("Kernel module " + kname + " dumped to " + out_path, r);
 }
 
+// =============================================================================
+//  FILE MANIPULATION TOOLS (for AI agent code editing)
+// =============================================================================
+
+tool_result_t handle_read_file(const json& params) {
+    if (!params.contains("path") || !params["path"].is_string())
+        return tool_result_t::error("Missing required parameter: path");
+
+    std::string path = params["path"].get<std::string>();
+    FILE* f = nullptr;
+    fopen_s(&f, path.c_str(), "rb");
+    if (!f) return tool_result_t::error("Cannot open file: " + path);
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (sz > 2 * 1024 * 1024) { fclose(f); return tool_result_t::error("File too large (>2MB)"); }
+
+    std::string content(sz, '\0');
+    fread(&content[0], 1, sz, f);
+    fclose(f);
+
+    // Optional line range
+    int start_line = params.contains("start_line") && params["start_line"].is_number() ? params["start_line"].get<int>() : 0;
+    int end_line   = params.contains("end_line")   && params["end_line"].is_number()   ? params["end_line"].get<int>()   : 0;
+
+    if (start_line > 0 || end_line > 0) {
+        std::vector<std::string> lines;
+        std::istringstream iss(content);
+        std::string line;
+        while (std::getline(iss, line)) lines.push_back(line);
+
+        if (start_line < 1) start_line = 1;
+        if (end_line < 1 || end_line > (int)lines.size()) end_line = (int)lines.size();
+        if (start_line > end_line) return tool_result_t::error("start_line > end_line");
+
+        std::string result;
+        for (int i = start_line - 1; i < end_line; i++)
+            result += lines[i] + "\n";
+        json r;
+        r["path"] = path;
+        r["start_line"] = start_line;
+        r["end_line"] = end_line;
+        r["total_lines"] = (int)lines.size();
+        r["content"] = result;
+        return tool_result_t::ok(result, r);
+    }
+
+    json r;
+    r["path"] = path;
+    r["size"] = sz;
+    r["content"] = content;
+    return tool_result_t::ok(content, r);
+}
+
+tool_result_t handle_write_file(const json& params) {
+    if (!params.contains("path") || !params["path"].is_string())
+        return tool_result_t::error("Missing required parameter: path");
+    if (!params.contains("content") || !params["content"].is_string())
+        return tool_result_t::error("Missing required parameter: content");
+
+    std::string path    = params["path"].get<std::string>();
+    std::string content = params["content"].get<std::string>();
+
+    FILE* f = nullptr;
+    fopen_s(&f, path.c_str(), "wb");
+    if (!f) return tool_result_t::error("Cannot write file: " + path);
+    fwrite(content.data(), 1, content.size(), f);
+    fclose(f);
+
+    json r;
+    r["path"] = path;
+    r["bytes_written"] = content.size();
+    return tool_result_t::ok("Wrote " + std::to_string(content.size()) + " bytes to " + path, r);
+}
+
+tool_result_t handle_edit_file(const json& params) {
+    if (!params.contains("path") || !params["path"].is_string())
+        return tool_result_t::error("Missing required parameter: path");
+    if (!params.contains("old_text") || !params["old_text"].is_string())
+        return tool_result_t::error("Missing required parameter: old_text");
+    if (!params.contains("new_text") || !params["new_text"].is_string())
+        return tool_result_t::error("Missing required parameter: new_text");
+
+    std::string path     = params["path"].get<std::string>();
+    std::string old_text = params["old_text"].get<std::string>();
+    std::string new_text = params["new_text"].get<std::string>();
+
+    // Read file
+    FILE* f = nullptr;
+    fopen_s(&f, path.c_str(), "rb");
+    if (!f) return tool_result_t::error("Cannot open file: " + path);
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::string content(sz, '\0');
+    fread(&content[0], 1, sz, f);
+    fclose(f);
+
+    // Find and replace
+    size_t pos = content.find(old_text);
+    if (pos == std::string::npos)
+        return tool_result_t::error("old_text not found in file");
+
+    // Check uniqueness
+    size_t pos2 = content.find(old_text, pos + 1);
+    if (pos2 != std::string::npos)
+        return tool_result_t::error("old_text matches multiple locations. Add more context to make it unique.");
+
+    content.replace(pos, old_text.size(), new_text);
+
+    // Write back
+    fopen_s(&f, path.c_str(), "wb");
+    if (!f) return tool_result_t::error("Cannot write file: " + path);
+    fwrite(content.data(), 1, content.size(), f);
+    fclose(f);
+
+    json r;
+    r["path"] = path;
+    r["replaced_at_offset"] = (int)pos;
+    return tool_result_t::ok("Edit applied to " + path, r);
+}
+
+tool_result_t handle_delete_file(const json& params) {
+    if (!params.contains("path") || !params["path"].is_string())
+        return tool_result_t::error("Missing required parameter: path");
+
+    std::string path = params["path"].get<std::string>();
+    if (!DeleteFileA(path.c_str()))
+        return tool_result_t::error("Cannot delete file: " + path + " (error " + std::to_string(GetLastError()) + ")");
+
+    json r;
+    r["path"] = path;
+    return tool_result_t::ok("Deleted " + path, r);
+}
+
+tool_result_t handle_create_directory(const json& params) {
+    if (!params.contains("path") || !params["path"].is_string())
+        return tool_result_t::error("Missing required parameter: path");
+
+    std::string path = params["path"].get<std::string>();
+
+    // Recursive directory creation
+    int ret = SHCreateDirectoryExA(nullptr, path.c_str(), nullptr);
+    if (ret != ERROR_SUCCESS && ret != ERROR_ALREADY_EXISTS)
+        return tool_result_t::error("Cannot create directory: " + path + " (error " + std::to_string(ret) + ")");
+
+    json r;
+    r["path"] = path;
+    r["already_existed"] = (ret == ERROR_ALREADY_EXISTS);
+    return tool_result_t::ok("Directory created: " + path, r);
+}
+
+tool_result_t handle_list_directory(const json& params) {
+    if (!params.contains("path") || !params["path"].is_string())
+        return tool_result_t::error("Missing required parameter: path");
+
+    std::string dir = params["path"].get<std::string>();
+    bool recursive = params.contains("recursive") && params["recursive"].is_boolean() && params["recursive"].get<bool>();
+    int max_depth = params.contains("max_depth") && params["max_depth"].is_number() ? params["max_depth"].get<int>() : 1;
+    if (recursive && max_depth <= 1) max_depth = 3;
+
+    json entries = json::array();
+    WIN32_FIND_DATAA fd;
+    std::string search = dir;
+    if (!search.empty() && search.back() != '\\' && search.back() != '/') search += "\\";
+    search += "*";
+
+    HANDLE h = FindFirstFileA(search.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return tool_result_t::error("Cannot list directory: " + dir);
+
+    do {
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        json e;
+        e["name"] = fd.cFileName;
+        e["is_dir"] = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            e["size"] = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        entries.push_back(e);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+
+    json r;
+    r["path"] = dir;
+    r["entries"] = entries;
+    r["count"] = entries.size();
+    return tool_result_t::ok("Listed " + std::to_string(entries.size()) + " entries in " + dir, r);
+}
+
+tool_result_t handle_search_files(const json& params) {
+    if (!params.contains("path") || !params["path"].is_string())
+        return tool_result_t::error("Missing required parameter: path");
+    if (!params.contains("pattern") || !params["pattern"].is_string())
+        return tool_result_t::error("Missing required parameter: pattern");
+
+    std::string dir = params["path"].get<std::string>();
+    std::string pattern = params["pattern"].get<std::string>();
+    // Convert pattern to lowercase for case-insensitive search
+    std::string pattern_lower = pattern;
+    for (auto& c : pattern_lower) c = (char)tolower((unsigned char)c);
+
+    int max_results = params.contains("max_results") && params["max_results"].is_number()
+        ? params["max_results"].get<int>() : 50;
+
+    json matches = json::array();
+
+    // Recursive file search
+    std::function<void(const std::string&, int)> search_dir;
+    search_dir = [&](const std::string& path, int depth) {
+        if (depth > 8 || (int)matches.size() >= max_results) return;
+        WIN32_FIND_DATAA fd;
+        std::string sp = path + "\\*";
+        HANDLE h = FindFirstFileA(sp.c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+            std::string full = path + "\\" + fd.cFileName;
+            std::string name_lower = fd.cFileName;
+            for (auto& c : name_lower) c = (char)tolower((unsigned char)c);
+
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (name_lower.find(pattern_lower) != std::string::npos) {
+                    json e; e["path"] = full; e["is_dir"] = true;
+                    matches.push_back(e);
+                }
+                search_dir(full, depth + 1);
+            } else {
+                if (name_lower.find(pattern_lower) != std::string::npos) {
+                    json e; e["path"] = full; e["is_dir"] = false;
+                    e["size"] = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+                    matches.push_back(e);
+                }
+            }
+        } while (FindNextFileA(h, &fd) && (int)matches.size() < max_results);
+        FindClose(h);
+    };
+    search_dir(dir, 0);
+
+    json r;
+    r["matches"] = matches;
+    r["count"] = matches.size();
+    return tool_result_t::ok("Found " + std::to_string(matches.size()) + " matches", r);
+}
+
+tool_result_t handle_grep_in_files(const json& params) {
+    if (!params.contains("path") || !params["path"].is_string())
+        return tool_result_t::error("Missing required parameter: path");
+    if (!params.contains("query") || !params["query"].is_string())
+        return tool_result_t::error("Missing required parameter: query");
+
+    std::string dir   = params["path"].get<std::string>();
+    std::string query = params["query"].get<std::string>();
+    int max_results = params.contains("max_results") && params["max_results"].is_number()
+        ? params["max_results"].get<int>() : 100;
+
+    std::string query_lower = query;
+    for (auto& c : query_lower) c = (char)tolower((unsigned char)c);
+
+    json matches = json::array();
+
+    std::function<void(const std::string&, int)> search_dir;
+    search_dir = [&](const std::string& path, int depth) {
+        if (depth > 6 || (int)matches.size() >= max_results) return;
+        WIN32_FIND_DATAA fd;
+        std::string sp = path + "\\*";
+        HANDLE h = FindFirstFileA(sp.c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+            std::string full = path + "\\" + fd.cFileName;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                search_dir(full, depth + 1);
+            } else {
+                // Only search text-like files
+                uint64_t fsz = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+                if (fsz > 1024 * 1024) continue; // skip >1MB files
+                std::string ext;
+                const char* dot = strrchr(fd.cFileName, '.');
+                if (dot) { ext = dot; for (auto& c : ext) c = (char)tolower((unsigned char)c); }
+                static const char* text_exts[] = {
+                    ".cpp",".c",".h",".hpp",".py",".js",".ts",".json",".xml",".yaml",".yml",
+                    ".md",".txt",".log",".cfg",".ini",".toml",".java",".cs",".rs",".go",".rb",
+                    ".html",".css",".lua",".sh",".bat",".ps1",".cmake",".asm",".def",".rules",
+                };
+                bool is_text = false;
+                for (auto& te : text_exts) if (ext == te) { is_text = true; break; }
+                if (!is_text) continue;
+
+                FILE* ff = nullptr;
+                fopen_s(&ff, full.c_str(), "rb");
+                if (!ff) continue;
+                std::string content((size_t)fsz, '\0');
+                fread(&content[0], 1, fsz, ff);
+                fclose(ff);
+
+                std::string content_lower = content;
+                for (auto& c : content_lower) c = (char)tolower((unsigned char)c);
+
+                size_t pos = 0;
+                int line_num = 1;
+                size_t line_start = 0;
+                while (pos < content_lower.size() && (int)matches.size() < max_results) {
+                    // Track line numbers
+                    while (line_start < pos) {
+                        if (content[line_start] == '\n') line_num++;
+                        line_start++;
+                    }
+                    size_t found = content_lower.find(query_lower, pos);
+                    if (found == std::string::npos) break;
+                    // Count lines up to found
+                    while (line_start < found) {
+                        if (content[line_start] == '\n') line_num++;
+                        line_start++;
+                    }
+                    // Extract the line
+                    size_t ls = content.rfind('\n', found);
+                    size_t le = content.find('\n', found);
+                    if (ls == std::string::npos) ls = 0; else ls++;
+                    if (le == std::string::npos) le = content.size();
+                    std::string line_text = content.substr(ls, std::min(le - ls, (size_t)200));
+
+                    json m;
+                    m["file"] = full;
+                    m["line"] = line_num;
+                    m["text"] = line_text;
+                    matches.push_back(m);
+                    pos = found + query.size();
+                }
+            }
+        } while (FindNextFileA(h, &fd) && (int)matches.size() < max_results);
+        FindClose(h);
+    };
+    search_dir(dir, 0);
+
+    json r;
+    r["matches"] = matches;
+    r["count"] = matches.size();
+    return tool_result_t::ok("Found " + std::to_string(matches.size()) + " matches for '" + query + "'", r);
+}
+
 } // anonymous namespace
 
 // =============================================================================
@@ -3600,4 +3942,56 @@ void mcp_standalone::register_standalone_tools(mcp_standalone::server_t& srv)
         {{"name", "string", "Kernel module name (e.g. 'ntoskrnl.exe')", true},
          {"output", "string", "Output file path", false}},
         false, handle_driver_dump_kernel_module});
+
+    // ---- File Manipulation Tools (IDE) ----
+    srv.register_tool({"read_file",
+        "Read a file from disk. Optionally specify line range.",
+        {{"path", "string", "Absolute file path to read", true},
+         {"start_line", "number", "Start line (1-based)", false},
+         {"end_line", "number", "End line (inclusive)", false}},
+        true, handle_read_file});
+
+    srv.register_tool({"write_file",
+        "Write content to a file (creates or overwrites).",
+        {{"path", "string", "Absolute file path to write", true},
+         {"content", "string", "Full file content to write", true}},
+        false, handle_write_file});
+
+    srv.register_tool({"edit_file",
+        "Edit a file by replacing exact text. old_text must match exactly once in the file.",
+        {{"path", "string", "Absolute file path to edit", true},
+         {"old_text", "string", "Exact text to find and replace (must be unique)", true},
+         {"new_text", "string", "Replacement text", true}},
+        false, handle_edit_file});
+
+    srv.register_tool({"delete_file",
+        "Delete a file from disk.",
+        {{"path", "string", "Absolute file path to delete", true}},
+        false, handle_delete_file});
+
+    srv.register_tool({"create_directory",
+        "Create a directory (recursive, creates parent dirs as needed).",
+        {{"path", "string", "Absolute directory path to create", true}},
+        false, handle_create_directory});
+
+    srv.register_tool({"list_directory",
+        "List files and subdirectories in a directory.",
+        {{"path", "string", "Absolute directory path to list", true},
+         {"recursive", "boolean", "List recursively", false},
+         {"max_depth", "number", "Max recursion depth (default 1)", false}},
+        true, handle_list_directory});
+
+    srv.register_tool({"search_files",
+        "Search for files by name pattern in a directory tree.",
+        {{"path", "string", "Root directory to search", true},
+         {"pattern", "string", "File name pattern to search for (case-insensitive substring)", true},
+         {"max_results", "number", "Max results (default 50)", false}},
+        true, handle_search_files});
+
+    srv.register_tool({"grep_in_files",
+        "Search for text content across files in a directory (case-insensitive).",
+        {{"path", "string", "Root directory to search", true},
+         {"query", "string", "Text to search for in file contents", true},
+         {"max_results", "number", "Max results (default 100)", false}},
+        true, handle_grep_in_files});
 }

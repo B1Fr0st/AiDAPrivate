@@ -163,10 +163,13 @@ if(WIN32)
             "${STANDALONE_ROOT}/helpers/helpers.cpp"
             "${STANDALONE_ROOT}/helpers/blur.cpp"
             "${STANDALONE_ROOT}/helpers/icon_loodr.cpp"
+            "${STANDALONE_ROOT}/helpers/file_browser.cpp"
+            "${STANDALONE_ROOT}/helpers/embedded_assets.cpp"
             "${STANDALONE_ROOT}/core/mcp_standalone.cpp"
             "${STANDALONE_ROOT}/core/mcp_standalone_tools.cpp"
             "${STANDALONE_ROOT}/core/standalone_driver.cpp"
             "${STANDALONE_ROOT}/core/standalone_ai_client.cpp"
+            "${STANDALONE_ROOT}/core/standalone_chat.cpp"
             driver/comm.cpp
             src/net_security.cpp
             src/emulation_engine.cpp

@@ -360,6 +360,59 @@ void init_standalone_chat()
     /* Load persisted settings (api keys, model, provider, etc.) */
     g_sa_settings.load();
 
+    /* Restore theme and editor preferences */
+    themes::active = std::clamp(g_sa_settings.active_theme_idx, 0, themes::count - 1);
+
+    // Restore custom themes from JSON
+    if (!g_sa_settings.custom_themes_json.empty()) {
+        try {
+            auto arr = nlohmann::json::parse(g_sa_settings.custom_themes_json);
+            if (arr.is_array()) {
+                custom_themes::list.clear();
+                for (auto& jt : arr) {
+                    CustomThemeData ct;
+                    ct.name = jt.value("name", "Custom");
+                    if (jt.contains("accent") && jt["accent"].is_array() && jt["accent"].size() >= 3) {
+                        ct.accent[0] = jt["accent"][0].get<float>();
+                        ct.accent[1] = jt["accent"][1].get<float>();
+                        ct.accent[2] = jt["accent"][2].get<float>();
+                    }
+                    ct.bg_base       = jt.value("bg_base",       (uint32_t)ct.bg_base);
+                    ct.panel_bg      = jt.value("panel_bg",      (uint32_t)ct.panel_bg);
+                    ct.panel_header  = jt.value("panel_header",  (uint32_t)ct.panel_header);
+                    ct.title_bar     = jt.value("title_bar",     (uint32_t)ct.title_bar);
+                    ct.text_primary  = jt.value("text_primary",  (uint32_t)ct.text_primary);
+                    ct.text_secondary= jt.value("text_secondary",(uint32_t)ct.text_secondary);
+                    ct.text_dim      = jt.value("text_dim",      (uint32_t)ct.text_dim);
+                    ct.acrylic_color = jt.value("acrylic_color", (DWORD)ct.acrylic_color);
+                    ct.icon_index    = jt.value("icon_index",    ct.icon_index);
+                    ct.icon_file_path= jt.value("icon_file_path", std::string{});
+                    custom_themes::list.push_back(std::move(ct));
+                }
+            }
+        } catch (...) {}
+    }
+    custom_themes::active_custom = g_sa_settings.active_custom_theme_idx;
+    if (custom_themes::active_custom >= (int)custom_themes::list.size())
+        custom_themes::active_custom = -1;
+
+    // Restore editor config
+    editor_config::tab_size               = g_sa_settings.editor_tab_size;
+    editor_config::font_size              = g_sa_settings.editor_font_size;
+    editor_config::auto_complete          = g_sa_settings.editor_auto_complete;
+    editor_config::show_line_numbers      = g_sa_settings.editor_line_numbers;
+    editor_config::highlight_current_line = g_sa_settings.editor_highlight_line;
+
+    themes::changed = true; // trigger initial theme application
+
+    /* Restore license state if previously saved */
+    if (!g_sa_settings.license_key.empty()) {
+        license::saved_key = g_sa_settings.license_key;
+        license::validated = true;
+        strncpy_s(license::key_buf, sizeof(license::key_buf),
+                  g_sa_settings.license_key.c_str(), _TRUNCATE);
+    }
+
     /* Create the AI HTTP client */
     g_sa_ai_client = std::make_unique<standalone_ai_client_t>(g_sa_settings);
 
@@ -557,11 +610,11 @@ void render_settings_popup()
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,    ImVec2(8.f, 8.f));
 
     bool still_open = true;
+    static bool s_first = true;
     if (ImGui::BeginPopupModal("##sa_settings_modal", &still_open,
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove))
     {
         /* ---- static buffers, initialized from g_sa_settings once ---- */
-        static bool        s_first = true;
         static int         s_provider = 0;
         static char        s_api_key[512]   = {};
         static char        s_base_url[512]  = {};

@@ -5,11 +5,14 @@
 #include "verdana.h"
 #include <d3d11.h>
 #include <tchar.h>
+#include <windowsx.h>
+#include <algorithm>
 #include "helpers/helpers.h"
 #include "helpers/blur.h"
 #include <dwmapi.h>
 #include "helpers/globals.h"
 #include "core/standalone_chat.hpp"
+#include "helpers/stb_image.h"
 
 #pragma comment(lib, "dwmapi.lib")
 
@@ -37,13 +40,13 @@ void set_acrylic_color(HWND hwnd)
     struct ACCENT_POLICY { DWORD AccentState; DWORD AccentFlags; DWORD GradientColor; DWORD AnimationId; };
     struct WINCOMPATTRDATA { DWORD Attribute; PVOID pData; ULONG DataSize; };
 
-
     auto SetWindowCompositionAttribute = (BOOL(WINAPI*)(HWND, void*))
         GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
     if (!SetWindowCompositionAttribute) return;
 
-    DWORD color = (5 << 0) | (12 << 8) | (65 << 16) | (0x70 << 24);
-    ACCENT_POLICY accent = { 4, 2, color, 0 };
+    // Use ACCENT_ENABLE_BLURBEHIND (3) - lighter than ACRYLICBLURBEHIND (4)
+    DWORD color = (5 << 0) | (12 << 8) | (65 << 16) | (0xC0 << 24);
+    ACCENT_POLICY accent = { 3, 2, color, 0 };
 
     WINCOMPATTRDATA data = { 19, &accent, sizeof(accent) };
     SetWindowCompositionAttribute(hwnd, &data);
@@ -56,6 +59,33 @@ int main(int, char**)
     int screen_w = GetSystemMetrics(SM_CXSCREEN);
     int screen_h = GetSystemMetrics(SM_CYSCREEN);
     HWND hwnd = ::CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED, wc.lpszClassName, L"oh my god", WS_POPUP, (screen_w - 200) / 2, (screen_h - 250) / 2, 200, 250, nullptr, nullptr, wc.hInstance, nullptr);
+    g_hwnd = hwnd;
+
+    // Set window icon from embedded aidalogo PNG
+    {
+        extern unsigned char aidalogo[];
+        int iw2 = 0, ih2 = 0, ic = 0;
+        unsigned char* px = stbi_load_from_memory(aidalogo, 1273853, &iw2, &ih2, &ic, 4);
+        if (px && iw2 > 0 && ih2 > 0) {
+            // Convert RGBA to BGRA for CreateBitmap/CreateIconIndirect
+            for (int i = 0; i < iw2 * ih2 * 4; i += 4)
+                std::swap(px[i], px[i + 2]);
+            HBITMAP hbm_color = CreateBitmap(iw2, ih2, 1, 32, px);
+            HBITMAP hbm_mask  = CreateBitmap(iw2, ih2, 1, 1, nullptr);
+            ICONINFO ii = {};
+            ii.fIcon    = TRUE;
+            ii.hbmColor = hbm_color;
+            ii.hbmMask  = hbm_mask;
+            HICON hIcon = CreateIconIndirect(&ii);
+            if (hIcon) {
+                SendMessageW(hwnd, WM_SETICON, ICON_BIG,   (LPARAM)hIcon);
+                SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+            }
+            DeleteObject(hbm_color);
+            DeleteObject(hbm_mask);
+            stbi_image_free(px);
+        }
+    }
     if (!CreateDeviceD3D(hwnd))
     {
         CleanupDeviceD3D();
@@ -134,14 +164,28 @@ int main(int, char**)
 
 
     bool done = false;
+    static int prev_state = -1; // track state transitions for centering
     while (!done)
     {
 
-        static int last_theme = -1;
-        if (globals::ui::theme != last_theme)
+        // Apply theme changes (acrylic + accent)
+        if (themes::changed)
         {
-            set_acrylic_color(hwnd);
-            last_theme = globals::ui::theme;
+            themes::changed = false;
+            // Use resolved theme (supports both built-in and custom themes)
+            auto& t = themes::resolved;
+            globals::ui::accent = t.accent;
+
+            // Apply theme's acrylic color
+            struct ACCENT_POLICY_T { DWORD AccentState; DWORD AccentFlags; DWORD GradientColor; DWORD AnimationId; };
+            struct WINCOMPATTRDATA_T { DWORD Attribute; PVOID pData; ULONG DataSize; };
+            auto SetWCA = (BOOL(WINAPI*)(HWND, void*))
+                GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
+            if (SetWCA) {
+                ACCENT_POLICY_T ap = { 3, 2, t.acrylic_color, 0 };
+                WINCOMPATTRDATA_T wd = { 19, &ap, sizeof(ap) };
+                SetWCA(hwnd, &wd);
+            }
         }
 
 
@@ -173,13 +217,52 @@ int main(int, char**)
 
         int iw = (int)globals::ui::window_w;
         int ih = (int)globals::ui::window_h;
+
+        // Determine current UI state for centering decisions
+        int cur_state = 0; // loading
+        if (globals::ui::load_timer >= 1.5f) cur_state = 1; // welcome
+        if (globals::ui::welcome_done && !license::validated) cur_state = 2; // license
+        if (globals::ui::welcome_done && license::validated) cur_state = 3; // main
+        bool state_changed = (cur_state != prev_state);
+        if (state_changed) prev_state = cur_state;
+
+        // In main IDE state, sync globals from actual window size (user may resize)
+        if (cur_state == 3) {
+            RECT wr; GetWindowRect(hwnd, &wr);
+            int actual_w = wr.right - wr.left;
+            int actual_h = wr.bottom - wr.top;
+            // Only update if the OS window size differs (user resized via border grips)
+            if (actual_w > 200 && actual_h > 200) {
+                if (abs(actual_w - iw) > 2 || abs(actual_h - ih) > 2) {
+                    globals::ui::window_w = (float)actual_w;
+                    globals::ui::window_h = (float)actual_h;
+                    iw = actual_w;
+                    ih = actual_h;
+                }
+            }
+        }
+
         if (iw != prev_w || ih != prev_h)
         {
-            int cx = (screen_w - iw) / 2;
-            int cy = (screen_h - ih) / 2;
-            SetWindowPos(hwnd, nullptr, cx, cy, iw, ih, SWP_NOZORDER);
-            HRGN rgn = CreateRoundRectRgn(0, 0, iw, ih, 16, 16);
-            SetWindowRgn(hwnd, rgn, TRUE);
+            if (!globals::ui::maximized) {
+                if (state_changed) {
+                    // Center window on major state transitions
+                    int cx = (screen_w - iw) / 2;
+                    int cy = (screen_h - ih) / 2;
+                    SetWindowPos(hwnd, nullptr, cx, cy, iw, ih, SWP_NOZORDER);
+                } else {
+                    // Resize in place - don't override user drag position
+                    SetWindowPos(hwnd, nullptr, 0, 0, iw, ih, SWP_NOZORDER | SWP_NOMOVE);
+                }
+            }
+            // Flat corners when maximized, rounded otherwise
+            if (globals::ui::maximized) {
+                HRGN rgn = CreateRectRgn(0, 0, iw, ih);
+                SetWindowRgn(hwnd, rgn, TRUE);
+            } else {
+                HRGN rgn = CreateRoundRectRgn(0, 0, iw, ih, 16, 16);
+                SetWindowRgn(hwnd, rgn, TRUE);
+            }
             CleanupRenderTarget();
             g_pSwapChain->ResizeBuffers(0, iw, ih, DXGI_FORMAT_UNKNOWN, 0);
             CreateRenderTarget();
@@ -288,15 +371,26 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
     case WM_NCHITTEST:
     {
-        POINT pt = { LOWORD(lParam), HIWORD(lParam) };
-        RECT wr; GetWindowRect(hWnd, &wr);
-        bool ui_ready = globals::ui::window_w >= 700 && globals::ui::window_h >= 449 && globals::ui::welcome_done;
-        if (!ui_ready) return HTCLIENT;
+        // Resize borders on edges, drag handled manually in ImGui
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        RECT rc; GetWindowRect(hWnd, &rc);
+        const int border = 6;
+        bool left   = pt.x < rc.left   + border;
+        bool right  = pt.x > rc.right  - border;
+        bool top    = pt.y < rc.top    + border;
+        bool bottom = pt.y > rc.bottom - border;
 
-        int local_y = pt.y - wr.top;
-        if (local_y < 28)
-            return HTCAPTION;
-
+        // Only enable resize after the main IDE layout is visible
+        if (globals::ui::welcome_done && license::validated) {
+            if (top    && left)  return HTTOPLEFT;
+            if (top    && right) return HTTOPRIGHT;
+            if (bottom && left)  return HTBOTTOMLEFT;
+            if (bottom && right) return HTBOTTOMRIGHT;
+            if (left)            return HTLEFT;
+            if (right)           return HTRIGHT;
+            if (top)             return HTTOP;
+            if (bottom)          return HTBOTTOM;
+        }
         return HTCLIENT;
     }
     case WM_SIZE:
@@ -305,6 +399,20 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         g_ResizeWidth = (UINT)LOWORD(lParam);
         g_ResizeHeight = (UINT)HIWORD(lParam);
         return 0;
+    case WM_GETMINMAXINFO:
+    {
+        // Constrain maximized window to the work area (exclude taskbar)
+        HMONITOR hm = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = { sizeof(mi) };
+        if (GetMonitorInfoW(hm, &mi)) {
+            auto* mm = reinterpret_cast<MINMAXINFO*>(lParam);
+            mm->ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left;
+            mm->ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top;
+            mm->ptMaxSize.x = mi.rcWork.right - mi.rcWork.left;
+            mm->ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top;
+        }
+        return 0;
+    }
     case WM_SYSCOMMAND:
         if ((wParam & 0xfff0) == SC_KEYMENU)
             return 0;

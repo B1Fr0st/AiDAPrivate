@@ -171,6 +171,18 @@ struct settings_sa_t
     std::string license_key;
     std::string firebase_api_key;
 
+    // UI / Editor preferences
+    int         active_theme_idx        = 0;
+    int         active_custom_theme_idx = -1;  // -1 = built-in preset
+    int         editor_tab_size         = 4;
+    float       editor_font_size        = 14.0f;
+    bool        editor_auto_complete    = true;
+    bool        editor_line_numbers     = true;
+    bool        editor_highlight_line   = true;
+    int         theme_icon_index        = 3;   // 0=kaneki,1=rias,2=nagi,3=mio
+    std::string custom_icon_path;
+    std::string custom_themes_json;            // serialized custom themes array
+
 
     static const std::vector<std::string>& gemini_models();
     static const std::vector<std::string>& openai_models();
@@ -276,6 +288,20 @@ struct settings_sa_t
         num_int("mcp_port",          mcp_port);
         boolean("mcp_enabled",       mcp_enabled);
         key("firebase_api_key",      firebase_api_key);
+        key("license_key",           license_key);
+
+        // UI / Editor preferences
+        num_int("active_theme_idx",        active_theme_idx);
+        num_int("active_custom_theme_idx", active_custom_theme_idx);
+        num_int("editor_tab_size",         editor_tab_size);
+        boolean("editor_auto_complete",    editor_auto_complete);
+        boolean("editor_line_numbers",     editor_line_numbers);
+        boolean("editor_highlight_line",   editor_highlight_line);
+        num_int("theme_icon_index",        theme_icon_index);
+        str("custom_icon_path",            custom_icon_path);
+        str("custom_themes_json",          custom_themes_json);
+        if (j.contains("editor_font_size") && j["editor_font_size"].is_number())
+            editor_font_size = j["editor_font_size"].get<float>();
 
         return true;
     }
@@ -316,6 +342,19 @@ struct settings_sa_t
         merged["temperature"]           = temperature;
         merged["mcp_port"]              = mcp_port;
         merged["mcp_enabled"]           = mcp_enabled;
+        merged["license_key"]           = sa_settings_detail::obfuscate_key(license_key);
+
+        // UI / Editor preferences
+        merged["active_theme_idx"]        = active_theme_idx;
+        merged["active_custom_theme_idx"] = active_custom_theme_idx;
+        merged["editor_tab_size"]         = editor_tab_size;
+        merged["editor_font_size"]        = editor_font_size;
+        merged["editor_auto_complete"]    = editor_auto_complete;
+        merged["editor_line_numbers"]     = editor_line_numbers;
+        merged["editor_highlight_line"]   = editor_highlight_line;
+        merged["theme_icon_index"]        = theme_icon_index;
+        merged["custom_icon_path"]        = custom_icon_path;
+        merged["custom_themes_json"]      = custom_themes_json;
 
         std::ofstream ofs(path, std::ios::trunc);
         if (!ofs.is_open()) return false;
