@@ -227,7 +227,10 @@ int main(int, char**)
         if (state_changed) prev_state = cur_state;
 
         // In main IDE state, sync globals from actual window size (user may resize)
-        if (cur_state == 3) {
+        // But skip until the initial programmatic resize to 1920x1080 has been applied,
+        // otherwise the sync reads the old small HWND size and overrides the snap.
+        static bool ide_resize_applied = false;
+        if (cur_state == 3 && ide_resize_applied) {
             RECT wr; GetWindowRect(hwnd, &wr);
             int actual_w = wr.right - wr.left;
             int actual_h = wr.bottom - wr.top;
@@ -245,8 +248,13 @@ int main(int, char**)
         if (iw != prev_w || ih != prev_h)
         {
             if (!globals::ui::maximized) {
-                if (state_changed) {
-                    // Center window on major state transitions
+                if (cur_state < 3) {
+                    // During loading/welcome/license, always keep centered (zoom effect)
+                    int cx = (screen_w - iw) / 2;
+                    int cy = (screen_h - ih) / 2;
+                    SetWindowPos(hwnd, nullptr, cx, cy, iw, ih, SWP_NOZORDER);
+                } else if (state_changed) {
+                    // Center window on state transition to IDE
                     int cx = (screen_w - iw) / 2;
                     int cy = (screen_h - ih) / 2;
                     SetWindowPos(hwnd, nullptr, cx, cy, iw, ih, SWP_NOZORDER);
@@ -255,6 +263,8 @@ int main(int, char**)
                     SetWindowPos(hwnd, nullptr, 0, 0, iw, ih, SWP_NOZORDER | SWP_NOMOVE);
                 }
             }
+            if (cur_state == 3 && iw >= 1000 && ih >= 600)
+                ide_resize_applied = true;
             // Flat corners when maximized, rounded otherwise
             if (globals::ui::maximized) {
                 HRGN rgn = CreateRectRgn(0, 0, iw, ih);

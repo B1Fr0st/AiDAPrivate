@@ -490,12 +490,12 @@ void helpers::render_title()
 		} else if (!license::validated) {
 			tw = 480.f; th = 320.f;
 		} else {
-			tw = 1200.f; th = 700.f;
+			tw = (float)GetSystemMetrics(SM_CXSCREEN) * 0.5f; th = (float)GetSystemMetrics(SM_CYSCREEN) * 0.5f;
 		}
 		// Only animate during state transitions, not once the IDE is fully open
 		// (so user resize via border grips isn't overridden)
 		static bool initial_grow_done = false;
-		if (globals::ui::welcome_done && license::validated && globals::ui::window_w >= 1150.f) {
+		if (globals::ui::welcome_done && license::validated && globals::ui::window_w >= 1000.f) {
 			initial_grow_done = true;
 		}
 		if (!initial_grow_done) {
@@ -512,7 +512,7 @@ void helpers::render_title()
 	}
 
 	bool welcome_ready = !loading && globals::ui::window_w >= 499.f && globals::ui::window_h >= 299.f;
-	bool ui_ready      = globals::ui::window_w >= 1150.f && globals::ui::window_h >= 650.f;
+	bool ui_ready      = globals::ui::window_w >= 1000.f && globals::ui::window_h >= 600.f;
 
 	if (ui_ready && globals::ui::welcome_done && license::validated)
 	{
@@ -562,7 +562,8 @@ void helpers::render_title()
 		float cy  = wp.y + globals::ui::window_h * 0.5f - 10.f;
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 
-		// Draw background art covering entire loading window at 70% opacity
+		// Draw background art covering entire loading window at 70% transparency (30% opaque)
+		// Background stays visible (doesn't fade with the dots)
 		if (g_bg_art_srv && g_bg_art_w > 0 && g_bg_art_h > 0) {
 			float ww_l = globals::ui::window_w;
 			float wh_l = globals::ui::window_h;
@@ -574,7 +575,7 @@ void helpers::render_title()
 			dl->AddImage((ImTextureID)g_bg_art_srv,
 				ImVec2(ox, oy), ImVec2(ox + draw_w, oy + draw_h),
 				ImVec2(0, 0), ImVec2(1, 1),
-				IM_COL32(255, 255, 255, (int)(255 * 0.70f * vis)));
+				IM_COL32(255, 255, 255, (int)(255 * 0.30f)));
 		}
 
 
@@ -635,6 +636,20 @@ void helpers::render_title()
 		float       cx  = wp.x + ww * 0.5f;
 		float       cy  = wp.y + wh * 0.5f;
 
+		// Draw background art covering entire welcome window at 70% transparency (30% opaque)
+		if (g_bg_art_srv && g_bg_art_w > 0 && g_bg_art_h > 0) {
+			float fade_bg = std::min(t / 0.4f, 1.f) * (t > 1.4f ? std::max(0.f, 1.f - (t - 1.4f) / 0.6f) : 1.f);
+			float scale_bg = std::max(ww / (float)g_bg_art_w, wh / (float)g_bg_art_h);
+			float dw_bg = g_bg_art_w * scale_bg;
+			float dh_bg = g_bg_art_h * scale_bg;
+			float ox_bg = wp.x + (ww - dw_bg) * 0.5f;
+			float oy_bg = wp.y + (wh - dh_bg) * 0.5f;
+			dl->AddImage((ImTextureID)g_bg_art_srv,
+				ImVec2(ox_bg, oy_bg), ImVec2(ox_bg + dw_bg, oy_bg + dh_bg),
+				ImVec2(0, 0), ImVec2(1, 1),
+				IM_COL32(255, 255, 255, (int)(255 * 0.30f * fade_bg)));
+		}
+
 		float ax = globals::ui::accent.x * 255.f;
 		float ay = globals::ui::accent.y * 255.f;
 		float az = globals::ui::accent.z * 255.f;
@@ -680,7 +695,7 @@ void helpers::render_title()
 		float sub_a = std::min(std::max(t - 0.45f, 0.f) / 0.45f, 1.f) * fade_out;
 		if (sub_a > 0.01f)
 		{
-			const char* subtitle = "Advanced Intelligence & Debugging Assistant";
+			const char* subtitle = "Artificial Intelligence Disassembly Assistant";
 			ImVec2 sub_ts = ImGui::CalcTextSize(subtitle);
 			dl->AddText(ImVec2(cx - sub_ts.x * 0.5f, rule_y + 8.f),
 				IM_COL32(148, 143, 188, (int)(180 * sub_a)), subtitle);
@@ -867,10 +882,11 @@ void helpers::render_title()
 	float ww = globals::ui::window_w;
 	float wh = globals::ui::window_h;
 
-	// Clamp panel widths
-	float min_panel = 160.f;
-	float max_left  = ww * 0.3f;
-	float max_right = ww * 0.4f;
+	// Clamp panel widths — scale to fit available space
+	float min_panel = 120.f;
+	float available  = ww - pad * 2.f - gap * 2.f - 200.f; // reserve 200 for center
+	float max_left  = std::min(ww * 0.25f, std::max(min_panel, available * 0.35f));
+	float max_right = std::min(ww * 0.35f, std::max(min_panel, available * 0.50f));
 	globals::ui::panel_left_w  = std::clamp(globals::ui::panel_left_w,  min_panel, max_left);
 	globals::ui::panel_right_w = std::clamp(globals::ui::panel_right_w, min_panel, max_right);
 
