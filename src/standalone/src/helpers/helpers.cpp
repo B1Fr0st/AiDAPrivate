@@ -490,7 +490,7 @@ void helpers::render_title()
 		} else if (!license::validated) {
 			tw = 480.f; th = 320.f;
 		} else {
-			tw = (float)GetSystemMetrics(SM_CXSCREEN) * 0.5f; th = (float)GetSystemMetrics(SM_CYSCREEN) * 0.5f;
+			tw = (float)GetSystemMetrics(SM_CXSCREEN) * 0.75f; th = (float)GetSystemMetrics(SM_CYSCREEN) * 0.75f;
 		}
 		// Only animate during state transitions, not once the IDE is fully open
 		// (so user resize via border grips isn't overridden)
@@ -637,8 +637,8 @@ void helpers::render_title()
 		float       cy  = wp.y + wh * 0.5f;
 
 		// Draw background art covering entire welcome window at 70% transparency (30% opaque)
+		// Constant opacity — no fade in/out (matches loading screen behavior)
 		if (g_bg_art_srv && g_bg_art_w > 0 && g_bg_art_h > 0) {
-			float fade_bg = std::min(t / 0.4f, 1.f) * (t > 1.4f ? std::max(0.f, 1.f - (t - 1.4f) / 0.6f) : 1.f);
 			float scale_bg = std::max(ww / (float)g_bg_art_w, wh / (float)g_bg_art_h);
 			float dw_bg = g_bg_art_w * scale_bg;
 			float dh_bg = g_bg_art_h * scale_bg;
@@ -647,7 +647,7 @@ void helpers::render_title()
 			dl->AddImage((ImTextureID)g_bg_art_srv,
 				ImVec2(ox_bg, oy_bg), ImVec2(ox_bg + dw_bg, oy_bg + dh_bg),
 				ImVec2(0, 0), ImVec2(1, 1),
-				IM_COL32(255, 255, 255, (int)(255 * 0.30f * fade_bg)));
+				IM_COL32(255, 255, 255, (int)(255 * 0.30f)));
 		}
 
 		float ax = globals::ui::accent.x * 255.f;
@@ -882,18 +882,30 @@ void helpers::render_title()
 	float ww = globals::ui::window_w;
 	float wh = globals::ui::window_h;
 
-	// Clamp panel widths — scale to fit available space
-	float min_panel = 120.f;
-	float available  = ww - pad * 2.f - gap * 2.f - 200.f; // reserve 200 for center
-	float max_left  = std::min(ww * 0.25f, std::max(min_panel, available * 0.35f));
-	float max_right = std::min(ww * 0.35f, std::max(min_panel, available * 0.50f));
-	globals::ui::panel_left_w  = std::clamp(globals::ui::panel_left_w,  min_panel, max_left);
-	globals::ui::panel_right_w = std::clamp(globals::ui::panel_right_w, min_panel, max_right);
-
+	// Clamp panel widths — proportionally fit to available space
+	float usable = ww - pad * 2.f - gap * 2.f;
+	float min_panel = 80.f;
+	float max_left  = usable * 0.3f;
+	float max_right = usable * 0.4f;
 	float left_w   = globals::ui::panel_left_w;
 	float right_w  = globals::ui::panel_right_w;
-	float center_w = ww - left_w - right_w - pad * 2.f - gap * 2.f;
-	if (center_w < 200.f) center_w = 200.f;
+	float center_w = usable - left_w - right_w;
+	if (center_w < 200.f) {
+		// Shrink panels proportionally to make room
+		float excess = 200.f - center_w;
+		float total_panels = left_w + right_w;
+		if (total_panels > 0.f) {
+			left_w  -= excess * (left_w / total_panels);
+			right_w -= excess * (right_w / total_panels);
+		}
+		center_w = 200.f;
+	}
+	if (left_w  < min_panel) left_w  = min_panel;
+	if (right_w < min_panel) right_w = min_panel;
+	globals::ui::panel_left_w  = left_w;
+	globals::ui::panel_right_w = right_w;
+	center_w = usable - left_w - right_w;
+	if (center_w < 100.f) center_w = 100.f;
 	float total_h  = wh - pad * 2.f - title_h;
 
 	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, a);

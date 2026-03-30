@@ -207,10 +207,23 @@ int main(int, char**)
         }
         g_SwapChainOccluded = false;
 
+        static bool ide_resize_applied = false;
         if (g_ResizeWidth != 0 && g_ResizeHeight != 0)
         {
             CleanupRenderTarget();
             g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
+            // Sync globals and window region on user resize
+            if (ide_resize_applied) {
+                globals::ui::window_w = (float)g_ResizeWidth;
+                globals::ui::window_h = (float)g_ResizeHeight;
+            }
+            if (globals::ui::maximized) {
+                HRGN rgn = CreateRectRgn(0, 0, g_ResizeWidth, g_ResizeHeight);
+                SetWindowRgn(hwnd, rgn, TRUE);
+            } else {
+                HRGN rgn = CreateRoundRectRgn(0, 0, g_ResizeWidth, g_ResizeHeight, 16, 16);
+                SetWindowRgn(hwnd, rgn, TRUE);
+            }
             g_ResizeWidth = g_ResizeHeight = 0;
             CreateRenderTarget();
         }
@@ -227,9 +240,8 @@ int main(int, char**)
         if (state_changed) prev_state = cur_state;
 
         // In main IDE state, sync globals from actual window size (user may resize)
-        // But skip until the initial programmatic resize to 1920x1080 has been applied,
+        // But skip until the initial programmatic resize has been applied,
         // otherwise the sync reads the old small HWND size and overrides the snap.
-        static bool ide_resize_applied = false;
         if (cur_state == 3 && ide_resize_applied) {
             RECT wr; GetWindowRect(hwnd, &wr);
             int actual_w = wr.right - wr.left;
