@@ -1400,6 +1400,53 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
 }
 
 bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD input_size) const noexcept {
+    // IOCTL name lookup for debug logging — maps dynamic codes to human-readable names
+    const char* ioctl_name = "UNKNOWN";
+    if      (control_code == ioctl_codes::DTB())  ioctl_name = "DTB(DtbSolve)";
+    else if (control_code == ioctl_codes::PHYS()) ioctl_name = "PHYS(PhysRW)";
+    else if (control_code == ioctl_codes::BASE()) ioctl_name = "BASE(BaseAddr)";
+    else if (control_code == ioctl_codes::MM())   ioctl_name = "MM(Mouse)";
+    else if (control_code == ioctl_codes::RC())   ioctl_name = "RC(RemoteCall)";
+    else if (control_code == ioctl_codes::CR())   ioctl_name = "CR(CallResult)";
+    else if (control_code == ioctl_codes::AM())   ioctl_name = "AM(AllocMem)";
+    else if (control_code == ioctl_codes::FM())   ioctl_name = "FM(FreeMem)";
+    else if (control_code == ioctl_codes::HB())   ioctl_name = "HB(Heartbeat)";
+    else if (control_code == ioctl_codes::TCTX()) ioctl_name = "TCTX(ThreadCtx)";
+    else if (control_code == ioctl_codes::TENUM()) ioctl_name = "TENUM(ThreadEnum)";
+    else if (control_code == ioctl_codes::TSR())  ioctl_name = "TSR(SuspResume)";
+    else if (control_code == ioctl_codes::QM())   ioctl_name = "QM(QueryMem)";
+    else if (control_code == ioctl_codes::PM())   ioctl_name = "PM(ProtectMem)";
+    else if (control_code == ioctl_codes::ER())   ioctl_name = "ER(EnumRegions)";
+    else if (control_code == ioctl_codes::RPEB()) ioctl_name = "RPEB(ReadPEB)";
+    else if (control_code == ioctl_codes::SDF())  ioctl_name = "SDF(SpoofDebug)";
+    else if (control_code == ioctl_codes::MEX())  ioctl_name = "MEX(ModExport)";
+    else if (control_code == ioctl_codes::V2P())  ioctl_name = "V2P(Virt2Phys)";
+    else if (control_code == ioctl_codes::NCON()) ioctl_name = "NCON(NetConn)";
+    else if (control_code == ioctl_codes::NCAP()) ioctl_name = "NCAP(NetCapCtrl)";
+    else if (control_code == ioctl_codes::NCPG()) ioctl_name = "NCPG(NetCapGet)";
+    else if (control_code == ioctl_codes::NDNS()) ioctl_name = "NDNS(NetDNS)";
+    else if (control_code == ioctl_codes::NFLT()) ioctl_name = "NFLT(NetFilter)";
+    else if (control_code == ioctl_codes::NSTS()) ioctl_name = "NSTS(NetStats)";
+    else if (control_code == ioctl_codes::EWFP()) ioctl_name = "EWFP(WfpEnum)";
+    else if (control_code == ioctl_codes::GSKT()) ioctl_name = "GSKT(SockEnum)";
+    else if (control_code == ioctl_codes::SNBF()) ioctl_name = "SNBF(SniffBuf)";
+    else if (control_code == ioctl_codes::DTCP()) ioctl_name = "DTCP(TcpDump)";
+    else if (control_code == ioctl_codes::PINJ()) ioctl_name = "PINJ(PktInject)";
+    else if (control_code == ioctl_codes::PMOD()) ioctl_name = "PMOD(PktMod)";
+    else if (control_code == ioctl_codes::PRED()) ioctl_name = "PRED(TrafRedir)";
+    else if (control_code == ioctl_codes::STRM()) ioctl_name = "STRM(StreamReasm)";
+    else if (control_code == ioctl_codes::DPIN()) ioctl_name = "DPIN(DeepInsp)";
+    else if (control_code == ioctl_codes::IHLD()) ioctl_name = "IHLD(Intercept)";
+    else if (control_code == ioctl_codes::CKIL()) ioctl_name = "CKIL(ConnKill)";
+    else if (control_code == ioctl_codes::DNSS()) ioctl_name = "DNSS(DnsSpoof)";
+    else if (control_code == ioctl_codes::BWMN()) ioctl_name = "BWMN(BwMon)";
+    else if (control_code == ioctl_codes::NIFS()) ioctl_name = "NIFS(NetIface)";
+    else if (control_code == ioctl_codes::PCEX()) ioctl_name = "PCEX(PcapExport)";
+    else if (control_code == ioctl_codes::NFPR()) ioctl_name = "NFPR(NetFinger)";
+    else if (control_code == ioctl_codes::DPRT()) ioctl_name = "DPRT(DllProtect)";
+
+    fprintf(stderr, "[WhosWho-UM] send_request: %s (0x%08X) size=%u\n", ioctl_name, control_code, input_size);
+
     if (!is_connected() || !input || input_size == 0) {
         fprintf(stderr, "[WhosWho-UM] send_request: precondition fail connected=%d input=%p size=%u\n",
             is_connected(), input, input_size);
@@ -1460,8 +1507,10 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
 
     if (!result) {
         DWORD err = GetLastError();
-        fprintf(stderr, "[WhosWho-UM] send_request: DeviceIoControl FAILED ioctl=0x%08X err=%u(0x%X) bytes_returned=%u\n",
-            control_code, err, err, bytes_returned);
+        fprintf(stderr, "[WhosWho-UM] send_request: DeviceIoControl FAILED %s ioctl=0x%08X err=%u(0x%X) bytes_returned=%u\n",
+            ioctl_name, control_code, err, err, bytes_returned);
+    } else {
+        fprintf(stderr, "[WhosWho-UM] send_request: %s OK bytes_returned=%u\n", ioctl_name, bytes_returned);
     }
 
     return result != FALSE;

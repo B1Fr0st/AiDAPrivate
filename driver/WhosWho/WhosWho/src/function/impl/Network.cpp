@@ -10,8 +10,8 @@
 #include <fwpmk.h>
 
 #ifndef AIDA_NET_LOG0
-#define AIDA_NET_LOG0(msg) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[AiDA-Net] %s\n", msg)
-#define AIDA_NET_LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[AiDA-Net] " fmt "\n", __VA_ARGS__)
+#define AIDA_NET_LOG0(msg) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[AiDA-Net] %s\n", msg)
+#define AIDA_NET_LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[AiDA-Net] " fmt "\n", __VA_ARGS__)
 #endif
 
 static const CHAR* const AIDA_NET_BUILD_TAG = "2026-03-13-netdbg-r6-pidfix";

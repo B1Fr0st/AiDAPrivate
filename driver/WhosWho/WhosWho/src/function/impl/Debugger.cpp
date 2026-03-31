@@ -4,6 +4,11 @@
 #include "../CoreSecurity.h"
 #include "../Struct.h"
 
+#ifndef WW_LOG
+#define WW_LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] " fmt "\n", __VA_ARGS__)
+#define WW_LOG0(msg) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] %s\n", msg)
+#endif
+
 typedef struct _SYSTEM_PROCESS_INFORMATION_LOCAL {
     ULONG NextEntryOffset;
     ULONG NumberOfThreads;
@@ -227,8 +232,13 @@ namespace trapframe_ctx {
 
 NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     if (!request || request->pid == 0 || request->tid == 0) {
+        WW_LOG("handle_thread_ctx: bad params (pid=%u tid=%u)",
+            request ? request->pid : 0, request ? request->tid : 0);
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle_thread_ctx: pid=%u tid=%u set=%u mask=0x%llX",
+        request->pid, request->tid, request->should_set, request->register_mask);
 
 
     if (!_PsLookupProcessByProcessId || !_PsLookupThreadByThreadId ||
@@ -448,6 +458,8 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     _ObfDereferenceObject(thread);
     _ObfDereferenceObject(process);
 
+    WW_LOG("handle_thread_ctx: DONE status=0x%08X (rip=0x%llX rsp=0x%llX)",
+        status, request->rip, request->rsp);
 
     return status;
 }
@@ -455,8 +467,11 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
 
 NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
     if (!request || request->pid == 0) {
+        WW_LOG("handle_thread_enum: bad params (pid=%u)", request ? request->pid : 0);
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle_thread_enum: pid=%u", request->pid);
 
     if (!_PsLookupProcessByProcessId || !_ObfDereferenceObject) {
         return STATUS_PROCEDURE_NOT_FOUND;
@@ -550,9 +565,11 @@ NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
     request->thread_count = count;
 
     if (!process_found) {
+        WW_LOG("handle_thread_enum: process pid=%u NOT FOUND in system info", request->pid);
         return STATUS_NOT_FOUND;
     }
 
+    WW_LOG("handle_thread_enum: SUCCESS pid=%u count=%u", request->pid, count);
 
     return STATUS_SUCCESS;
 }
@@ -560,8 +577,11 @@ NTSTATUS functions::handle_thread_enum(p_thread_enum request) {
 
 NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request) {
     if (!request || request->tid == 0) {
+        WW_LOG("handle_suspend_resume: bad params (tid=%u)", request ? request->tid : 0);
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle_suspend_resume: tid=%u resume=%u", request->tid, request->should_resume);
 
 
     BOOLEAN use_ps = (_PsSuspendThread != nullptr && _PsResumeThread != nullptr);
@@ -640,6 +660,7 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
     request->previous_count = prev_count;
     _ObfDereferenceObject(thread);
 
+    WW_LOG("handle_suspend_resume: DONE status=0x%08X prev_count=%u", status, prev_count);
 
     return status;
 }
@@ -647,8 +668,11 @@ NTSTATUS functions::handle_suspend_resume_thread(p_suspend_resume_thread request
 
 NTSTATUS functions::handle_query_memory(p_query_memory request) {
     if (!request || request->pid == 0) {
+        WW_LOG("handle_query_memory: bad params");
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle_query_memory: pid=%u addr=0x%llX", request->pid, request->address);
 
     if (!_PsLookupProcessByProcessId || !_KeStackAttachProcess ||
         !_KeUnstackDetachProcess || !_ZwQueryVirtualMemory || !_ObfDereferenceObject) {
@@ -692,6 +716,8 @@ NTSTATUS functions::handle_query_memory(p_query_memory request) {
     _KeUnstackDetachProcess(&apc_state);
     _ObfDereferenceObject(process);
 
+    WW_LOG("handle_query_memory: status=0x%08X state=0x%X protect=0x%X size=0x%llX",
+        status, request->state, request->protect, request->region_size);
 
     return status;
 }
@@ -699,8 +725,12 @@ NTSTATUS functions::handle_query_memory(p_query_memory request) {
 
 NTSTATUS functions::handle_protect_memory(p_protect_memory request) {
     if (!request || request->pid == 0 || request->size == 0) {
+        WW_LOG0("handle_protect_memory: bad params");
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle_protect_memory: pid=%u addr=0x%llX size=0x%llX new_prot=0x%X",
+        request->pid, request->address, request->size, request->new_protect);
 
     if (!_PsLookupProcessByProcessId || !_KeStackAttachProcess ||
         !_KeUnstackDetachProcess || !_ZwProtectVirtualMemory || !_ObfDereferenceObject) {
@@ -743,8 +773,12 @@ NTSTATUS functions::handle_protect_memory(p_protect_memory request) {
 
 NTSTATUS functions::handle_enum_regions(p_enum_regions request) {
     if (!request || request->pid == 0) {
+        WW_LOG0("handle_enum_regions: bad params");
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle_enum_regions: pid=%u start=0x%llX max=0x%llX",
+        request->pid, request->start_address, request->max_address);
 
     if (!_PsLookupProcessByProcessId || !_KeStackAttachProcess ||
         !_KeUnstackDetachProcess || !_ZwQueryVirtualMemory || !_ObfDereferenceObject) {
@@ -807,6 +841,7 @@ NTSTATUS functions::handle_enum_regions(p_enum_regions request) {
 
     request->region_count = count;
 
+    WW_LOG("handle_enum_regions: DONE pid=%u count=%u", request->pid, count);
 
     return STATUS_SUCCESS;
 }
@@ -814,8 +849,11 @@ NTSTATUS functions::handle_enum_regions(p_enum_regions request) {
 
 NTSTATUS functions::handle_read_peb(p_read_peb request) {
     if (!request || request->pid == 0) {
+        WW_LOG0("handle_read_peb: bad params");
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle_read_peb: pid=%u", request->pid);
 
     if (!_PsLookupProcessByProcessId || !_PsGetProcessPeb ||
         !_KeStackAttachProcess || !_KeUnstackDetachProcess || !_ObfDereferenceObject) {
@@ -870,8 +908,11 @@ NTSTATUS functions::handle_read_peb(p_read_peb request) {
 
 NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
     if (!request || request->pid == 0) {
+        WW_LOG0("handle_spoof_debug: bad params");
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle_spoof_debug: pid=%u", request->pid);
 
     if (!_PsLookupProcessByProcessId || !_PsGetProcessPeb ||
         !_KeStackAttachProcess || !_KeUnstackDetachProcess || !_ObfDereferenceObject) {
@@ -949,6 +990,7 @@ NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
 
     request->result_flags = cleared;
 
+    WW_LOG("handle_spoof_debug: DONE pid=%u cleared=0x%X", request->pid, cleared);
 
     return STATUS_SUCCESS;
 }
@@ -956,11 +998,16 @@ NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
 
 NTSTATUS functions::handle_get_module_export(p_module_export request) {
     if (!request || request->module_base == 0) {
+        WW_LOG0("handle_get_module_export: bad params");
         return STATUS_INVALID_PARAMETER;
     }
     if (request->dtb == 0) {
+        WW_LOG0("handle_get_module_export: dtb=0");
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle_get_module_export: base=0x%llX dtb=0x%llX name=%.32s",
+        request->module_base, request->dtb, request->export_name);
 
 
     dbg_guard::timing_scatter();
@@ -1070,12 +1117,16 @@ NTSTATUS functions::handle_get_module_export(p_module_export request) {
 
 NTSTATUS functions::handle_virt_to_phys(p_virt_to_phys request) {
     if (!request || request->dtb == 0 || request->virtual_address == 0) {
+        WW_LOG0("handle_virt_to_phys: bad params");
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle_virt_to_phys: dtb=0x%llX vaddr=0x%llX", request->dtb, request->virtual_address);
 
     UINT64 physical = strong::translate_virtual_address(request->dtb, request->virtual_address);
     request->physical_address = physical;
 
+    WW_LOG("handle_virt_to_phys: phys=0x%llX %s", physical, physical ? "SUCCESS" : "FAIL");
 
     return (physical != 0) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }

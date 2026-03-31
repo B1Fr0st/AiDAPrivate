@@ -5,6 +5,11 @@
 #include <stddef.h>
 #include <intrin.h>
 
+#ifndef WW_LOG
+#define WW_LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] " fmt "\n", __VA_ARGS__)
+#define WW_LOG0(msg) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] %s\n", msg)
+#endif
+
 #pragma intrinsic(_mm_mfence)
 
 namespace call_guard {
@@ -445,8 +450,12 @@ namespace shellcode_builder {
 
 NTSTATUS functions::handle7781(p_remote_call request) {
     if (!request) {
+        WW_LOG0("handle7781: null request");
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle7781: target=0x%llX dtb=0x%llX shellcode=0x%llX spoof=0x%llX",
+        request->target_function, request->dtb, request->shellcode_address, request->spoof_return);
 
 
     if (!call_guard::is_valid_code_ptr(request->target_function)) {
@@ -591,14 +600,19 @@ NTSTATUS functions::handle7781(p_remote_call request) {
     request->result = 0;
     request->completed = 0;
 
+    WW_LOG("handle7781: SUCCESS shellcode at 0x%llX, sc_size=%llu ep_size=%llu",
+        code_addr, (UINT64)sc_size, (UINT64)ep_size);
 
     return STATUS_SUCCESS;
 }
 
 NTSTATUS functions::handle7782(p_call_result request) {
     if (!request) {
+        WW_LOG0("handle7782: null request");
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle7782: dtb=0x%llX result_addr=0x%llX", request->dtb, request->result_address);
 
     if (!call_guard::is_valid_dtb(request->dtb)) {
         return STATUS_INVALID_PARAMETER;
@@ -644,6 +658,9 @@ NTSTATUS functions::handle7782(p_call_result request) {
     if (done_flag != 0) {
         request->result = ctx.ret_value;
         request->completed = 1;
+        WW_LOG("handle7782: DONE result=0x%llX", ctx.ret_value);
+    } else {
+        WW_LOG0("handle7782: not yet completed");
     }
 
     return STATUS_SUCCESS;
@@ -651,8 +668,10 @@ NTSTATUS functions::handle7782(p_call_result request) {
 
 NTSTATUS functions::handle7782_legacy(p_call_result request) {
     if (!request) {
+        WW_LOG0("handle7782_legacy: null request");
         return STATUS_INVALID_PARAMETER;
     }
+    WW_LOG("handle7782_legacy: dtb=0x%llX result_addr=0x%llX", request->dtb, request->result_address);
 
     if (!call_guard::is_valid_dtb(request->dtb)) {
         return STATUS_INVALID_PARAMETER;
@@ -708,8 +727,11 @@ namespace alloc_internal {
 
 NTSTATUS functions::handle7783(p_alloc_mem request) {
     if (!request) {
+        WW_LOG0("handle7783: null request");
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle7783: pid=%u size=0x%llX", request->pid, (UINT64)request->size);
 
     if (request->pid == 0 || request->pid <= 4) {
         return STATUS_INVALID_PARAMETER;
@@ -767,7 +789,10 @@ NTSTATUS functions::handle7783(p_alloc_mem request) {
     if (NT_SUCCESS(status) && base_addr) {
         request->allocated_address = (UINT64)base_addr;
         request->actual_size = region_size;
+        WW_LOG("handle7783: SUCCESS addr=0x%llX actual=0x%llX",
+            (UINT64)base_addr, (UINT64)region_size);
     } else {
+        WW_LOG("handle7783: FAILED status=0x%08X", status);
         request->allocated_address = 0;
         request->actual_size = 0;
     }
@@ -777,8 +802,11 @@ NTSTATUS functions::handle7783(p_alloc_mem request) {
 
 NTSTATUS functions::handle7784(p_free_mem request) {
     if (!request) {
+        WW_LOG0("handle7784: null request");
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle7784: pid=%u addr=0x%llX", request->pid, request->address);
 
     if (request->pid == 0 || request->pid <= 4) {
         return STATUS_INVALID_PARAMETER;

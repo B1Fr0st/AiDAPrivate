@@ -11,7 +11,7 @@
 //   /search        query                         — Search by note/plan/creator
 //   /stats                                       — Aggregate statistics
 //   /reset_hwid    key                           — Clear HWID binding
-//   /extend        key days                      — Extend expiry by N days
+//   /extend        key [days] [hours]            — Extend expiry by days or hours
 //   /setnote       key note                      — Update note/label
 //   /transfer      key new_hwid                  — Transfer license to new HWID
 //   /set_plan      key plan                      — Change subscription plan
@@ -131,14 +131,45 @@ function addDays(base, days) {
     return d.toISOString().slice(0, 10);
 }
 
+function isDateOnly(value) {
+    return /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function parseExpiry(value) {
+    if (!value) return null;
+    if (isDateOnly(value)) return new Date(`${value}T23:59:59.999Z`);
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function isExpired(value) {
+    const d = parseExpiry(value);
+    return d ? d.getTime() < Date.now() : false;
+}
+
 function formatExpiry(dateStr) {
     if (!dateStr) return '♾️ Perpetual';
-    return dateStr < todayStr() ? `~~${dateStr}~~ *(expired)*` : dateStr;
+    const d = parseExpiry(dateStr);
+    if (!d) return dateStr;
+    const expired = d.getTime() < Date.now();
+    const label = isDateOnly(dateStr)
+        ? dateStr
+        : `${d.toISOString().slice(0, 10)} ${d.toISOString().slice(11, 16)} UTC`;
+    return expired ? `~~${label}~~ *(expired)*` : label;
+}
+
+function addDuration(base, days, hours) {
+    const baseDate = parseExpiry(base) || new Date();
+    const d = new Date(baseDate.getTime());
+    if (days) d.setUTCDate(d.getUTCDate() + days);
+    if (hours) d.setUTCHours(d.getUTCHours() + hours);
+    const includeTime = hours || (base && !isDateOnly(base));
+    return includeTime ? d.toISOString() : d.toISOString().slice(0, 10);
 }
 
 /** Returns { label, color } based on live state of the license record. */
 function licenseStatus(data) {
-    if (data.expires && data.expires < todayStr())
+    if (isExpired(data.expires))
         return { label: '⚠️ Expired',  color: 0xFF8800 };
     return     { label: '✅ Active',   color: 0x00FF88 };
 }
@@ -265,15 +296,20 @@ const commands = [
     // /extend
     new SlashCommandBuilder()
         .setName('extend')
-        .setDescription('📅 Extend a license expiry by N days')
+        .setDescription('📅 Extend a license expiry by days or hours')
         .addStringOption(opt =>
             opt.setName('key')
                .setDescription('License key to extend')
                .setRequired(true))
         .addIntegerOption(opt =>
             opt.setName('days')
-               .setDescription('Number of days to add')
-               .setRequired(true)
+               .setDescription('Number of days to add (optional)')
+               .setRequired(false)
+               .setMinValue(1))
+        .addIntegerOption(opt =>
+            opt.setName('hours')
+               .setDescription('Number of hours to add (optional)')
+               .setRequired(false)
                .setMinValue(1)),
 
     // /setnote
@@ -579,11 +615,10 @@ client.on('interactionCreate', async (interaction) => {
             if (!licenses || !Object.keys(licenses).length)
                 return interaction.editReply('📭 No licenses found.');
 
-            const today = todayStr();
             let entries = Object.entries(licenses);
 
-            if (filter === 'active')  entries = entries.filter(([, d]) =>  d.active && !(d.expires && d.expires < today));
-            if (filter === 'expired') entries = entries.filter(([, d]) =>  d.expires && d.expires < today);
+            if (filter === 'active')  entries = entries.filter(([, d]) =>  d.active && !isExpired(d.expires));
+            if (filter === 'expired') entries = entries.filter(([, d]) =>  isExpired(d.expires));
             if (filter === 'unbound') entries = entries.filter(([, d]) => !d.hwid);
 
             if (!entries.length)
@@ -656,11 +691,9 @@ client.on('interactionCreate', async (interaction) => {
         else if (commandName === 'stats') {
             const licenses = await fbGet('licenses');
             const all      = Object.values(licenses || {});
-            const today    = todayStr();
-
             const total   = all.length;
-            const active  = all.filter(d =>  d.active && !(d.expires && d.expires < today)).length;
-            const expired = all.filter(d =>  d.expires && d.expires < today).length;
+            const active  = all.filter(d =>  d.active && !isExpired(d.expires)).length;
+            const expired = all.filter(d =>  isExpired(d.expires)).length;
             const bound   = all.filter(d =>  d.hwid).length;
             const unbound = total - bound;
 
@@ -711,10 +744,17 @@ client.on('interactionCreate', async (interaction) => {
         else if (commandName === 'extend') {
             const key  = interaction.options.getString('key').toUpperCase().trim();
             const days = interaction.options.getInteger('days');
+            const hours = interaction.options.getInteger('hours');
             const data = await fbGet(`licenses/${key}`);
             if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
 
-            const newExpiry = addDays(data.expires || todayStr(), days);
+            if (!days && !hours)
+                return interaction.editReply('Error: provide days or hours to extend.');
+            if (days && hours)
+                return interaction.editReply('Error: provide either days or hours, not both.');
+            const base = data.expires || (hours ? new Date().toISOString() : todayStr());
+            const newExpiry = addDuration(base, days || 0, hours || 0);
+            const addedText = hours ? String(hours) + ' hour(s)' : String(days) + ' day(s)';
             await fbPatch(`licenses/${key}`, { expires: newExpiry, active: true });
 
             await interaction.editReply({ embeds: [
@@ -724,8 +764,8 @@ client.on('interactionCreate', async (interaction) => {
                     .setDescription(`\`${key}\``)
                     .addFields(
                         { name: '📅 Old Expiry', value: formatExpiry(data.expires), inline: true },
-                        { name: '📅 New Expiry', value: newExpiry,                  inline: true },
-                        { name: '➕ Days Added', value: `${days} day(s)`,          inline: true },
+                        { name: '📅 New Expiry', value: formatExpiry(newExpiry),                  inline: true },
+                        { name: '➕ Added', value: addedText,          inline: true },
                     )
                     .setTimestamp(),
             ]});
@@ -1057,9 +1097,8 @@ client.on('interactionCreate', async (interaction) => {
             const licenses = await fbGet('licenses');
             if (!licenses) return interaction.editReply('📭 No licenses found.');
 
-            const today   = todayStr();
             const expired = Object.entries(licenses)
-                .filter(([, d]) => d.expires && d.expires < today);
+                .filter(([, d]) => isExpired(d.expires));
 
             if (!expired.length)
                 return interaction.editReply('✅ No expired licenses to purge.');
@@ -1176,12 +1215,11 @@ client.on('interactionCreate', async (interaction) => {
             ]);
 
             const all   = Object.values(licenses);
-            const today = todayStr();
             const now   = Math.floor(Date.now() / 1000);
 
             const total   = all.length;
-            const active  = all.filter(d =>  d.active && !(d.expires && d.expires < today)).length;
-            const expired = all.filter(d =>  d.active && d.expires && d.expires < today).length;
+            const active  = all.filter(d =>  d.active && !isExpired(d.expires)).length;
+            const expired = all.filter(d =>  d.active && isExpired(d.expires)).length;
             const bound   = all.filter(d =>  d.hwid).length;
 
             // Recent activity — keys created in the last 7 days
@@ -1251,3 +1289,6 @@ client.login(BOT_TOKEN).catch(err => {
     console.error('❌ Failed to login:', err.message);
     process.exit(1);
 });
+
+
+

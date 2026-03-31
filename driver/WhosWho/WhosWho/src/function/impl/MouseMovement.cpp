@@ -2,6 +2,11 @@
 #include "../../imports/Defs.h"
 #include <ntddmou.h>
 
+#ifndef WW_LOG
+#define WW_LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] " fmt "\n", __VA_ARGS__)
+#define WW_LOG0(msg) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] %s\n", msg)
+#endif
+
 #ifndef MOUSE_MOVE_NOCOALESCE
 #define MOUSE_MOVE_NOCOALESCE    0x08
 #endif
@@ -272,8 +277,11 @@ namespace mouse_guard {
 
 NTSTATUS functions::handle7780(p_mouse_move req) {
     if (!req) {
+        WW_LOG0("handle7780: null request");
         return STATUS_INVALID_PARAMETER;
     }
+
+    WW_LOG("handle7780: x=%d y=%d flags=0x%X", req->inputX, req->inputY, req->buttonFlags);
 
 
     mouse_guard::scatter();
@@ -287,6 +295,7 @@ NTSTATUS functions::handle7780(p_mouse_move req) {
 
     NTSTATUS status = EnsureMouseInitialized(&callback, &device);
     if (!NT_SUCCESS(status)) {
+        WW_LOG("handle7780: EnsureMouseInitialized FAILED status=0x%08X", status);
         return status;
     }
 
@@ -351,7 +360,9 @@ NTSTATUS functions::handle7780(p_mouse_move req) {
     __try {
         ((MouseClassServiceCallback)callback)((PDEVICE_OBJECT)device, &input, (&input) + 1, &consumed);
         result = (consumed > 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+        WW_LOG("handle7780: callback consumed=%u result=0x%08X", consumed, result);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        WW_LOG0("handle7780: EXCEPTION in mouse callback");
         result = STATUS_UNSUCCESSFUL;
     }
 

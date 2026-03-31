@@ -5,6 +5,11 @@
 #include "../CoreSecurity.h"
 #include "../../imports/Defs.h"
 
+#ifndef WW_LOG
+#define WW_LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] " fmt "\n", __VA_ARGS__)
+#define WW_LOG0(msg) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] %s\n", msg)
+#endif
+
 // WHY: PsGetProcessPeb is an undocumented ntoskrnl.exe export. Older WDK
 // toolsets do not prototype it in <ntifs.h>, so we declare it explicitly.
 // The function has been stable and exported since Windows XP.
@@ -433,6 +438,9 @@ namespace dll_protection {
 NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
     if (!request)
         return STATUS_INVALID_PARAMETER;
+
+    WW_LOG("handle_dll_protect: op=%u pid=%u module_base=0x%llX",
+        request->operation, request->pid, request->module_base);
 
     __try {
         switch (request->operation) {
