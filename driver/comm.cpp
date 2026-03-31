@@ -171,11 +171,15 @@ namespace {
 bool voyager::device_t::connect() noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] connect: attempting connection...\n");
+
     if (is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] connect: already connected, handle=%p\n", driver_handle_);
         return true;
     }
 
     std::wstring device_path = device_names_um::get_device_path();
+    fprintf(stderr, "[WhosWho-UM] connect: device_path=\"%ls\"\n", device_path.c_str());
 
     driver_handle_ = CreateFileW(
         device_path.c_str(),
@@ -188,41 +192,54 @@ bool voyager::device_t::connect() noexcept {
     );
 
     if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] connect: CreateFileW FAILED err=%lu\n", GetLastError());
         return false;
     }
+    fprintf(stderr, "[WhosWho-UM] connect: handle=%p opened OK\n", driver_handle_);
 
     session_key_ = static_cast<std::uint32_t>(__rdtsc() ^ 0xDEADC0DEu);
     if (session_key_ == 0) session_key_ = 0x12345678u;
+    fprintf(stderr, "[WhosWho-UM] connect: session_key=0x%08X\n", session_key_);
 
     if (!send_heartbeat()) {
+        fprintf(stderr, "[WhosWho-UM] connect: initial heartbeat FAILED, closing handle\n");
         CloseHandle(driver_handle_);
         driver_handle_ = INVALID_HANDLE_VALUE;
         session_key_ = 0;
         return false;
     }
 
+    fprintf(stderr, "[WhosWho-UM] connect: SUCCESS, driver connected\n");
     return true;
 }
 
 void voyager::device_t::disconnect() noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] disconnect: disconnecting (handle=%p pid=%u)\n", driver_handle_, process_id_);
+
     clear_process_context();
 
     if (is_connected()) {
         CloseHandle(driver_handle_);
         driver_handle_ = INVALID_HANDLE_VALUE;
+        fprintf(stderr, "[WhosWho-UM] disconnect: handle closed\n");
     }
 
     kernel_dtb_ = 0;
     session_key_ = 0;
     last_heartbeat_tsc_ = 0;
+    fprintf(stderr, "[WhosWho-UM] disconnect: done\n");
 }
 
 void voyager::device_t::clear_process_context() noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] clear_process_context: pid=%u shellcode=0x%llX base=0x%llX dtb=0x%llX\n",
+        process_id_, shellcode_address_, base_address_, dtb_);
+
     if (is_connected() && shellcode_address_ != 0 && process_id_ != 0) {
+        fprintf(stderr, "[WhosWho-UM] clear_process_context: freeing shellcode at 0x%llX\n", shellcode_address_);
         free_memory(shellcode_address_);
     }
 
@@ -231,17 +248,22 @@ void voyager::device_t::clear_process_context() noexcept {
     base_address_ = 0;
     dtb_ = 0;
     spoof_gadget_ = 0;
+    fprintf(stderr, "[WhosWho-UM] clear_process_context: context cleared\n");
 }
 
 std::uint32_t voyager::device_t::find_process(const char* process_name) noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] find_process: searching for \"%s\"\n", process_name ? process_name : "(null)");
+
     if (!process_name || std::strlen(process_name) == 0 || std::strlen(process_name) >= MAX_PATH) {
+        fprintf(stderr, "[WhosWho-UM] find_process: invalid process_name\n");
         return 0;
     }
 
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "[WhosWho-UM] find_process: CreateToolhelp32Snapshot FAILED err=%lu\n", GetLastError());
         return 0;
     }
 
@@ -276,7 +298,10 @@ std::uint32_t voyager::device_t::find_process(const char* process_name) noexcept
     CloseHandle(snapshot);
 
     if (found_pid != 0) {
+        fprintf(stderr, "[WhosWho-UM] find_process: FOUND pid=%u\n", found_pid);
         if (shellcode_address_ != 0 && process_id_ != 0 && process_id_ != found_pid) {
+            fprintf(stderr, "[WhosWho-UM] find_process: switching from old pid=%u, freeing shellcode 0x%llX\n",
+                process_id_, shellcode_address_);
             free_memory(shellcode_address_);
             shellcode_address_ = 0;
         }
@@ -284,6 +309,8 @@ std::uint32_t voyager::device_t::find_process(const char* process_name) noexcept
         dtb_ = 0;
         base_address_ = 0;
         spoof_gadget_ = 0;
+    } else {
+        fprintf(stderr, "[WhosWho-UM] find_process: NOT FOUND\n");
     }
 
     return found_pid;
@@ -292,7 +319,10 @@ std::uint32_t voyager::device_t::find_process(const char* process_name) noexcept
 bool voyager::device_t::send_heartbeat() noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] send_heartbeat: connected=%d session_key=0x%08X\n", is_connected(), session_key_);
+
     if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] send_heartbeat: not connected\n");
         return false;
     }
 
@@ -303,6 +333,7 @@ bool voyager::device_t::send_heartbeat() noexcept {
     hb.response = 0;
 
     DWORD ioctlCode = ioctl_codes::HB();
+    fprintf(stderr, "[WhosWho-UM] send_heartbeat: magic=0x%08X ioctl=0x%08X\n", hb.magic, ioctlCode);
 
     DWORD bytes_returned = 0;
     BOOL result = DeviceIoControl(
@@ -318,15 +349,21 @@ bool voyager::device_t::send_heartbeat() noexcept {
 
     if (result && bytes_returned >= sizeof(hb) && hb.response != 0) {
         last_heartbeat_tsc_ = __rdtsc();
+        fprintf(stderr, "[WhosWho-UM] send_heartbeat: OK response=0x%016llX bytes=%u\n", hb.response, bytes_returned);
         return true;
     }
 
+    fprintf(stderr, "[WhosWho-UM] send_heartbeat: FAILED result=%d bytes=%u response=0x%016llX err=%lu\n",
+        result, bytes_returned, hb.response, GetLastError());
     return false;
 }
 
 bool voyager::device_t::refresh_heartbeat() noexcept {
     std::uint64_t current_tsc = __rdtsc();
-    if (last_heartbeat_tsc_ == 0 || (current_tsc - last_heartbeat_tsc_) > detail::HEARTBEAT_REFRESH_INTERVAL) {
+    std::uint64_t elapsed = (last_heartbeat_tsc_ == 0) ? 0 : (current_tsc - last_heartbeat_tsc_);
+    if (last_heartbeat_tsc_ == 0 || elapsed > detail::HEARTBEAT_REFRESH_INTERVAL) {
+        fprintf(stderr, "[WhosWho-UM] refresh_heartbeat: refreshing (elapsed=0x%llX threshold=0x%llX)\n",
+            elapsed, detail::HEARTBEAT_REFRESH_INTERVAL);
         return send_heartbeat();
     }
     return true;
@@ -335,7 +372,10 @@ bool voyager::device_t::refresh_heartbeat() noexcept {
 void voyager::device_t::solve_dtb() noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] solve_dtb: pid=%u\n", process_id_);
+
     if (process_id_ == 0) {
+        fprintf(stderr, "[WhosWho-UM] solve_dtb: no pid set\n");
         dtb_ = 0;
         return;
     }
@@ -347,14 +387,17 @@ void voyager::device_t::solve_dtb() noexcept {
 
     if (send_request(ioctl_codes::DTB(), &req, sizeof(req)) && req.dtb != 0) {
         dtb_ = req.dtb;
+        fprintf(stderr, "[WhosWho-UM] solve_dtb: OK dtb=0x%llX\n", dtb_);
     } else {
         dtb_ = 0;
+        fprintf(stderr, "[WhosWho-UM] solve_dtb: FAILED (req.dtb=0x%llX)\n", req.dtb);
     }
 }
 
 void voyager::device_t::solve_kernel_dtb() noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] solve_kernel_dtb: resolving System (pid=4) DTB\n");
 
     detail::dtb_solve req{};
     req.pid = 4;
@@ -363,8 +406,9 @@ void voyager::device_t::solve_kernel_dtb() noexcept {
 
     if (send_request(ioctl_codes::DTB(), &req, sizeof(req)) && req.dtb != 0) {
         kernel_dtb_ = req.dtb;
+        fprintf(stderr, "[WhosWho-UM] solve_kernel_dtb: OK kernel_dtb=0x%llX\n", kernel_dtb_);
     } else {
-
+        fprintf(stderr, "[WhosWho-UM] solve_kernel_dtb: IOCTL failed, fallback to dtb_=0x%llX\n", dtb_);
         if (dtb_ != 0) {
             kernel_dtb_ = dtb_;
         } else {
@@ -381,7 +425,12 @@ std::size_t voyager::device_t::transfer_physical_read(
     std::size_t size) const noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] transfer_physical_read: pid=%u dtb=0x%llX addr=0x%llX size=0x%zX\n",
+        pid, dtb, address, size);
+
     if (!buffer || size == 0 || !is_connected() || dtb == 0) {
+        fprintf(stderr, "[WhosWho-UM] transfer_physical_read: precondition fail buf=%p size=0x%zX connected=%d dtb=0x%llX\n",
+            buffer, size, is_connected(), dtb);
         return 0;
     }
 
@@ -414,11 +463,13 @@ std::size_t voyager::device_t::transfer_physical_read(
         std::memset(req.padding_2, 0, sizeof(req.padding_2));
 
         if (!send_request(ioctl_codes::PHYS(), &req, sizeof(req))) {
+            fprintf(stderr, "[WhosWho-UM] transfer_physical_read: PHYS IOCTL failed at offset=0x%zX\n", total_read);
             break;
         }
 
         const std::size_t bytes_read = (req.ret_size <= chunk_size) ? req.ret_size : chunk_size;
         if (bytes_read == 0) {
+            fprintf(stderr, "[WhosWho-UM] transfer_physical_read: 0 bytes returned at offset=0x%zX\n", total_read);
             break;
         }
 
@@ -430,6 +481,7 @@ std::size_t voyager::device_t::transfer_physical_read(
         }
     }
 
+    fprintf(stderr, "[WhosWho-UM] transfer_physical_read: total_read=0x%zX / 0x%zX\n", total_read, size);
     return total_read;
 }
 
@@ -441,7 +493,12 @@ std::size_t voyager::device_t::transfer_physical_write(
     std::size_t size) const noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] transfer_physical_write: pid=%u dtb=0x%llX addr=0x%llX size=0x%zX\n",
+        pid, dtb, address, size);
+
     if (!buffer || size == 0 || !is_connected() || dtb == 0) {
+        fprintf(stderr, "[WhosWho-UM] transfer_physical_write: precondition fail buf=%p size=0x%zX connected=%d dtb=0x%llX\n",
+            buffer, size, is_connected(), dtb);
         return 0;
     }
 
@@ -474,11 +531,13 @@ std::size_t voyager::device_t::transfer_physical_write(
         std::memset(req.padding_2, 0, sizeof(req.padding_2));
 
         if (!send_request(ioctl_codes::PHYS(), &req, sizeof(req))) {
+            fprintf(stderr, "[WhosWho-UM] transfer_physical_write: PHYS IOCTL failed at offset=0x%zX\n", total_written);
             break;
         }
 
         const std::size_t bytes_written = (req.ret_size <= chunk_size) ? req.ret_size : chunk_size;
         if (bytes_written == 0) {
+            fprintf(stderr, "[WhosWho-UM] transfer_physical_write: 0 bytes written at offset=0x%zX\n", total_written);
             break;
         }
 
@@ -488,48 +547,70 @@ std::size_t voyager::device_t::transfer_physical_write(
         }
     }
 
+    fprintf(stderr, "[WhosWho-UM] transfer_physical_write: total_written=0x%zX / 0x%zX\n", total_written, size);
     return total_written;
 }
 
 std::size_t voyager::device_t::read_kernel_raw(std::uint64_t address, void* buffer, std::size_t size) const noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] read_kernel_raw: addr=0x%llX size=0x%zX\n", address, size);
+
     if (!buffer || size == 0 || !is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] read_kernel_raw: precondition fail\n");
         return 0;
     }
 
     if (size > 0x10000000) {
+        fprintf(stderr, "[WhosWho-UM] read_kernel_raw: size too large (0x%zX)\n", size);
         return 0;
     }
 
 
     std::uint64_t use_dtb = kernel_dtb_;
     if (use_dtb == 0) use_dtb = dtb_;
-    if (use_dtb == 0) return 0;
+    if (use_dtb == 0) {
+        fprintf(stderr, "[WhosWho-UM] read_kernel_raw: no DTB available (kernel_dtb_=0, dtb_=0)\n");
+        return 0;
+    }
+    fprintf(stderr, "[WhosWho-UM] read_kernel_raw: using dtb=0x%llX\n", use_dtb);
 
-    return transfer_physical_read(4, use_dtb, address, buffer, size);
+    std::size_t result = transfer_physical_read(4, use_dtb, address, buffer, size);
+    fprintf(stderr, "[WhosWho-UM] read_kernel_raw: read 0x%zX / 0x%zX bytes\n", result, size);
+    return result;
 }
 
 std::size_t voyager::device_t::write_kernel_raw(std::uint64_t address, const void* buffer, std::size_t size) const noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] write_kernel_raw: addr=0x%llX size=0x%zX\n", address, size);
+
     if (!buffer || size == 0 || !is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] write_kernel_raw: precondition fail\n");
         return 0;
     }
 
     if (size > 0x10000000) {
+        fprintf(stderr, "[WhosWho-UM] write_kernel_raw: size too large (0x%zX)\n", size);
         return 0;
     }
 
     std::uint64_t use_dtb = kernel_dtb_;
     if (use_dtb == 0) use_dtb = dtb_;
-    if (use_dtb == 0) return 0;
+    if (use_dtb == 0) {
+        fprintf(stderr, "[WhosWho-UM] write_kernel_raw: no DTB available\n");
+        return 0;
+    }
 
-    return transfer_physical_write(4, use_dtb, address, buffer, size);
+    std::size_t result = transfer_physical_write(4, use_dtb, address, buffer, size);
+    fprintf(stderr, "[WhosWho-UM] write_kernel_raw: wrote 0x%zX / 0x%zX bytes\n", result, size);
+    return result;
 }
 
 std::uint64_t voyager::device_t::find_image() noexcept {
     SPOOF_FUNC;
+
+    fprintf(stderr, "[WhosWho-UM] find_image: pid=%u\n", process_id_);
 
     std::uint64_t image_address = 0;
 
@@ -540,6 +621,9 @@ std::uint64_t voyager::device_t::find_image() noexcept {
 
     if (send_request(ioctl_codes::BASE(), &req, sizeof(req))) {
         base_address_ = image_address;
+        fprintf(stderr, "[WhosWho-UM] find_image: OK base=0x%llX\n", base_address_);
+    } else {
+        fprintf(stderr, "[WhosWho-UM] find_image: BASE IOCTL failed\n");
     }
 
     return image_address;
@@ -549,10 +633,13 @@ std::size_t voyager::device_t::read_raw(std::uint64_t address, void* buffer, std
     SPOOF_FUNC;
 
     if (!buffer || size == 0 || !is_connected() || dtb_ == 0) {
+        fprintf(stderr, "[WhosWho-UM] read_raw: precondition fail buf=%p size=0x%zX connected=%d dtb=0x%llX\n",
+            buffer, size, is_connected(), dtb_);
         return 0;
     }
 
     if (size > 0x10000000) {
+        fprintf(stderr, "[WhosWho-UM] read_raw: size too large (0x%zX)\n", size);
         return 0;
     }
 
@@ -563,10 +650,13 @@ std::size_t voyager::device_t::write_raw(std::uint64_t address, const void* buff
     SPOOF_FUNC;
 
     if (!buffer || size == 0 || !is_connected() || dtb_ == 0) {
+        fprintf(stderr, "[WhosWho-UM] write_raw: precondition fail buf=%p size=0x%zX connected=%d dtb=0x%llX\n",
+            buffer, size, is_connected(), dtb_);
         return 0;
     }
 
     if (size > 0x10000000) {
+        fprintf(stderr, "[WhosWho-UM] write_raw: size too large (0x%zX)\n", size);
         return 0;
     }
 
@@ -576,7 +666,10 @@ std::size_t voyager::device_t::write_raw(std::uint64_t address, const void* buff
 void voyager::device_t::move_mouse(std::int32_t input_x, std::int32_t input_y, std::uint32_t mouse_flags) {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] move_mouse: x=%d y=%d flags=0x%X\n", input_x, input_y, mouse_flags);
+
     if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] move_mouse: not connected\n");
         return;
     }
 
@@ -591,7 +684,10 @@ void voyager::device_t::move_mouse(std::int32_t input_x, std::int32_t input_y, s
 void voyager::device_t::send_key(unsigned short button) {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] send_key: button=0x%X\n", button);
+
     if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] send_key: not connected\n");
         return;
     }
 
@@ -606,7 +702,10 @@ void voyager::device_t::send_key(unsigned short button) {
 std::uint64_t voyager::device_t::allocate_memory(std::size_t size) noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] allocate_memory: pid=%u size=0x%zX\n", process_id_, size);
+
     if (!is_connected() || process_id_ == 0 || size == 0) {
+        fprintf(stderr, "[WhosWho-UM] allocate_memory: precondition fail\n");
         return 0;
     }
 
@@ -618,16 +717,22 @@ std::uint64_t voyager::device_t::allocate_memory(std::size_t size) noexcept {
     req.actual_size = 0;
 
     if (send_request(ioctl_codes::AM(), &req, sizeof(req)) && req.allocated_address != 0) {
+        fprintf(stderr, "[WhosWho-UM] allocate_memory: OK addr=0x%llX actual_size=0x%llX\n",
+            req.allocated_address, req.actual_size);
         return req.allocated_address;
     }
 
+    fprintf(stderr, "[WhosWho-UM] allocate_memory: FAILED\n");
     return 0;
 }
 
 bool voyager::device_t::free_memory(std::uint64_t address) noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] free_memory: pid=%u addr=0x%llX\n", process_id_, address);
+
     if (!is_connected() || process_id_ == 0 || address == 0) {
+        fprintf(stderr, "[WhosWho-UM] free_memory: precondition fail\n");
         return false;
     }
 
@@ -636,28 +741,37 @@ bool voyager::device_t::free_memory(std::uint64_t address) noexcept {
     req.padding = 0;
     req.address = address;
 
-    return send_request(ioctl_codes::FM(), &req, sizeof(req));
+    bool ok = send_request(ioctl_codes::FM(), &req, sizeof(req));
+    fprintf(stderr, "[WhosWho-UM] free_memory: %s\n", ok ? "OK" : "FAILED");
+    return ok;
 }
 
 bool voyager::device_t::ensure_shellcode_allocated() noexcept {
     SPOOF_FUNC;
 
     if (shellcode_address_ != 0) {
+        fprintf(stderr, "[WhosWho-UM] ensure_shellcode_allocated: already at 0x%llX\n", shellcode_address_);
         return true;
     }
 
     shellcode_address_ = allocate_memory(detail::SHELLCODE_ALLOC_SIZE);
+    fprintf(stderr, "[WhosWho-UM] ensure_shellcode_allocated: result=0x%llX %s\n",
+        shellcode_address_, shellcode_address_ ? "OK" : "FAILED");
     return shellcode_address_ != 0;
 }
 
 bool voyager::device_t::find_spoof_gadget() noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] find_spoof_gadget: base=0x%llX dtb=0x%llX\n", base_address_, dtb_);
+
     if (spoof_gadget_ != 0) {
+        fprintf(stderr, "[WhosWho-UM] find_spoof_gadget: already cached at 0x%llX\n", spoof_gadget_);
         return true;
     }
 
     if (base_address_ == 0 || dtb_ == 0) {
+        fprintf(stderr, "[WhosWho-UM] find_spoof_gadget: no base/dtb\n");
         return false;
     }
 
@@ -712,18 +826,23 @@ bool voyager::device_t::find_spoof_gadget() noexcept {
         for (std::size_t i = 0; i < to_read - 2; ++i) {
             if (buffer[i] == 0xFF && buffer[i + 1] == 0xE3) {
                 spoof_gadget_ = code_start + offset + i;
+                fprintf(stderr, "[WhosWho-UM] find_spoof_gadget: FOUND at 0x%llX\n", spoof_gadget_);
                 return true;
             }
         }
     }
 
+    fprintf(stderr, "[WhosWho-UM] find_spoof_gadget: not found, using fallback\n");
     return true;
 }
 
 std::uint64_t voyager::device_t::find_gadget(const char* pattern, std::size_t pattern_size) noexcept {
     SPOOF_FUNC;
 
+    fprintf(stderr, "[WhosWho-UM] find_gadget: pattern_size=%zu base=0x%llX\n", pattern_size, base_address_);
+
     if (!pattern || pattern_size == 0 || base_address_ == 0 || dtb_ == 0) {
+        fprintf(stderr, "[WhosWho-UM] find_gadget: precondition fail\n");
         return 0;
     }
 
@@ -766,11 +885,14 @@ std::uint64_t voyager::device_t::find_gadget(const char* pattern, std::size_t pa
                 }
             }
             if (found) {
-                return code_start + offset + i;
+                std::uint64_t gadget_addr = code_start + offset + i;
+                fprintf(stderr, "[WhosWho-UM] find_gadget: FOUND at 0x%llX\n", gadget_addr);
+                return gadget_addr;
             }
         }
     }
 
+    fprintf(stderr, "[WhosWho-UM] find_gadget: pattern not found\n");
     return 0;
 }
 
@@ -1449,6 +1571,7 @@ std::vector<voyager::device_t::thread_info> voyager::device_t::enumerate_threads
     req->thread_count = 0;
 
     if (send_request(ioctl_codes::TENUM(), req, sizeof(*req))) {
+        fprintf(stderr, "[WhosWho-UM] enumerate_threads: found %u threads\n", req->thread_count);
         result.reserve(req->thread_count);
         for (std::uint32_t i = 0; i < req->thread_count && i < voyager::detail::MAX_ENUM_THREADS; i++) {
             thread_info ti;
@@ -1457,6 +1580,8 @@ std::vector<voyager::device_t::thread_info> voyager::device_t::enumerate_threads
             ti.rip = req->entries[i].rip;
             result.push_back(ti);
         }
+    } else {
+        fprintf(stderr, "[WhosWho-UM] enumerate_threads: IOCTL failed\n");
     }
 
     delete req;
@@ -1464,37 +1589,54 @@ std::vector<voyager::device_t::thread_info> voyager::device_t::enumerate_threads
 }
 
 bool voyager::device_t::suspend_thread(std::uint32_t tid, std::uint32_t* prev_count) noexcept {
-    if (!is_connected() || tid == 0) return false;
+    fprintf(stderr, "[WhosWho-UM] suspend_thread: tid=%u\n", tid);
+    if (!is_connected() || tid == 0) {
+        fprintf(stderr, "[WhosWho-UM] suspend_thread: precondition fail\n");
+        return false;
+    }
 
     voyager::detail::suspend_resume_request req{};
     req.tid = tid;
     req.should_resume = 0;
 
     bool ok = send_request(ioctl_codes::TSR(), &req, sizeof(req));
+    fprintf(stderr, "[WhosWho-UM] suspend_thread: %s prev_count=%u\n", ok ? "OK" : "FAILED", req.previous_count);
     if (ok && prev_count) *prev_count = req.previous_count;
     return ok;
 }
 
 bool voyager::device_t::resume_thread(std::uint32_t tid, std::uint32_t* prev_count) noexcept {
-    if (!is_connected() || tid == 0) return false;
+    fprintf(stderr, "[WhosWho-UM] resume_thread: tid=%u\n", tid);
+    if (!is_connected() || tid == 0) {
+        fprintf(stderr, "[WhosWho-UM] resume_thread: precondition fail\n");
+        return false;
+    }
 
     voyager::detail::suspend_resume_request req{};
     req.tid = tid;
     req.should_resume = 1;
 
     bool ok = send_request(ioctl_codes::TSR(), &req, sizeof(req));
+    fprintf(stderr, "[WhosWho-UM] resume_thread: %s prev_count=%u\n", ok ? "OK" : "FAILED", req.previous_count);
     if (ok && prev_count) *prev_count = req.previous_count;
     return ok;
 }
 
 bool voyager::device_t::query_memory(std::uint64_t address, memory_region_info& info) noexcept {
-    if (!is_connected() || process_id_ == 0) return false;
+    fprintf(stderr, "[WhosWho-UM] query_memory: pid=%u addr=0x%llX\n", process_id_, address);
+    if (!is_connected() || process_id_ == 0) {
+        fprintf(stderr, "[WhosWho-UM] query_memory: precondition fail\n");
+        return false;
+    }
 
     voyager::detail::query_memory_request req{};
     req.pid = process_id_;
     req.address = address;
 
-    if (!send_request(ioctl_codes::QM(), &req, sizeof(req))) return false;
+    if (!send_request(ioctl_codes::QM(), &req, sizeof(req))) {
+        fprintf(stderr, "[WhosWho-UM] query_memory: IOCTL failed\n");
+        return false;
+    }
 
     info.base = req.region_base;
     info.size = req.region_size;
@@ -1504,11 +1646,18 @@ bool voyager::device_t::query_memory(std::uint64_t address, memory_region_info& 
     info.allocation_protect = req.allocation_protect;
     info.allocation_base = req.allocation_base;
 
+    fprintf(stderr, "[WhosWho-UM] query_memory: OK base=0x%llX size=0x%llX state=0x%X protect=0x%X\n",
+        info.base, info.size, info.state, info.protect);
     return true;
 }
 
 bool voyager::device_t::protect_memory(std::uint64_t address, std::uint64_t size, std::uint32_t new_protect, std::uint32_t* old_protect) noexcept {
-    if (!is_connected() || process_id_ == 0 || size == 0) return false;
+    fprintf(stderr, "[WhosWho-UM] protect_memory: pid=%u addr=0x%llX size=0x%llX new_protect=0x%X\n",
+        process_id_, address, size, new_protect);
+    if (!is_connected() || process_id_ == 0 || size == 0) {
+        fprintf(stderr, "[WhosWho-UM] protect_memory: precondition fail\n");
+        return false;
+    }
 
     voyager::detail::protect_memory_request req{};
     req.pid = process_id_;
@@ -1517,13 +1666,19 @@ bool voyager::device_t::protect_memory(std::uint64_t address, std::uint64_t size
     req.new_protect = new_protect;
 
     bool ok = send_request(ioctl_codes::PM(), &req, sizeof(req));
+    fprintf(stderr, "[WhosWho-UM] protect_memory: %s old_protect=0x%X\n", ok ? "OK" : "FAILED", req.old_protect);
     if (ok && old_protect) *old_protect = req.old_protect;
     return ok;
 }
 
 std::vector<voyager::detail::region_entry> voyager::device_t::enumerate_memory_regions(std::uint64_t start, std::uint64_t end_addr, bool include_all) noexcept {
     std::vector<voyager::detail::region_entry> result;
-    if (!is_connected() || process_id_ == 0) return result;
+    fprintf(stderr, "[WhosWho-UM] enumerate_memory_regions: pid=%u start=0x%llX end=0x%llX include_all=%d\n",
+        process_id_, start, end_addr, include_all);
+    if (!is_connected() || process_id_ == 0) {
+        fprintf(stderr, "[WhosWho-UM] enumerate_memory_regions: precondition fail\n");
+        return result;
+    }
 
     auto* req = new (std::nothrow) voyager::detail::enum_regions_request{};
     if (!req) return result;
@@ -1535,10 +1690,13 @@ std::vector<voyager::detail::region_entry> voyager::device_t::enumerate_memory_r
     req->region_count = 0;
 
     if (send_request(ioctl_codes::ER(), req, sizeof(*req))) {
+        fprintf(stderr, "[WhosWho-UM] enumerate_memory_regions: found %u regions\n", req->region_count);
         result.reserve(req->region_count);
         for (std::uint32_t i = 0; i < req->region_count && i < voyager::detail::MAX_ENUM_REGIONS; i++) {
             result.push_back(req->entries[i]);
         }
+    } else {
+        fprintf(stderr, "[WhosWho-UM] enumerate_memory_regions: IOCTL failed\n");
     }
 
     delete req;
@@ -1546,12 +1704,19 @@ std::vector<voyager::detail::region_entry> voyager::device_t::enumerate_memory_r
 }
 
 bool voyager::device_t::read_peb(peb_info& info) noexcept {
-    if (!is_connected() || process_id_ == 0) return false;
+    fprintf(stderr, "[WhosWho-UM] read_peb: pid=%u\n", process_id_);
+    if (!is_connected() || process_id_ == 0) {
+        fprintf(stderr, "[WhosWho-UM] read_peb: precondition fail\n");
+        return false;
+    }
 
     voyager::detail::read_peb_request req{};
     req.pid = process_id_;
 
-    if (!send_request(ioctl_codes::RPEB(), &req, sizeof(req))) return false;
+    if (!send_request(ioctl_codes::RPEB(), &req, sizeof(req))) {
+        fprintf(stderr, "[WhosWho-UM] read_peb: IOCTL failed\n");
+        return false;
+    }
 
     info.peb_address = req.peb_address;
     info.image_base = req.image_base;
@@ -1563,22 +1728,33 @@ bool voyager::device_t::read_peb(peb_info& info) noexcept {
     info.max_heaps = req.max_heaps;
     info.process_heaps = req.process_heaps;
 
+    fprintf(stderr, "[WhosWho-UM] read_peb: OK peb=0x%llX image_base=0x%llX debugged=%u\n",
+        info.peb_address, info.image_base, info.being_debugged);
     return true;
 }
 
 bool voyager::device_t::spoof_debug_flags(std::uint32_t* result_flags) noexcept {
-    if (!is_connected() || process_id_ == 0) return false;
+    fprintf(stderr, "[WhosWho-UM] spoof_debug_flags: pid=%u\n", process_id_);
+    if (!is_connected() || process_id_ == 0) {
+        fprintf(stderr, "[WhosWho-UM] spoof_debug_flags: precondition fail\n");
+        return false;
+    }
 
     voyager::detail::spoof_debug_request req{};
     req.pid = process_id_;
 
     bool ok = send_request(ioctl_codes::SDF(), &req, sizeof(req));
+    fprintf(stderr, "[WhosWho-UM] spoof_debug_flags: %s flags=0x%X\n", ok ? "OK" : "FAILED", req.result_flags);
     if (ok && result_flags) *result_flags = req.result_flags;
     return ok;
 }
 
 std::uint64_t voyager::device_t::resolve_export(std::uint64_t module_base, const char* export_name) noexcept {
-    if (!is_connected() || dtb_ == 0 || module_base == 0 || !export_name) return 0;
+    fprintf(stderr, "[WhosWho-UM] resolve_export: module=0x%llX name=%s\n", module_base, export_name ? export_name : "(null)");
+    if (!is_connected() || dtb_ == 0 || module_base == 0 || !export_name) {
+        fprintf(stderr, "[WhosWho-UM] resolve_export: precondition fail\n");
+        return 0;
+    }
 
     voyager::detail::module_export_request req{};
     req.dtb = dtb_;
@@ -1588,18 +1764,30 @@ std::uint64_t voyager::device_t::resolve_export(std::uint64_t module_base, const
         req.export_name[i] = export_name[i];
     }
 
-    if (!send_request(ioctl_codes::MEX(), &req, sizeof(req))) return 0;
+    if (!send_request(ioctl_codes::MEX(), &req, sizeof(req))) {
+        fprintf(stderr, "[WhosWho-UM] resolve_export: IOCTL failed\n");
+        return 0;
+    }
+    fprintf(stderr, "[WhosWho-UM] resolve_export: resolved=0x%llX\n", req.resolved_address);
     return req.resolved_address;
 }
 
 std::uint64_t voyager::device_t::virtual_to_physical(std::uint64_t virtual_address) noexcept {
-    if (!is_connected() || dtb_ == 0 || virtual_address == 0) return 0;
+    fprintf(stderr, "[WhosWho-UM] virtual_to_physical: virt=0x%llX dtb=0x%llX\n", virtual_address, dtb_);
+    if (!is_connected() || dtb_ == 0 || virtual_address == 0) {
+        fprintf(stderr, "[WhosWho-UM] virtual_to_physical: precondition fail\n");
+        return 0;
+    }
 
     voyager::detail::virt_to_phys_request req{};
     req.dtb = dtb_;
     req.virtual_address = virtual_address;
 
-    if (!send_request(ioctl_codes::V2P(), &req, sizeof(req))) return 0;
+    if (!send_request(ioctl_codes::V2P(), &req, sizeof(req))) {
+        fprintf(stderr, "[WhosWho-UM] virtual_to_physical: IOCTL failed\n");
+        return 0;
+    }
+    fprintf(stderr, "[WhosWho-UM] virtual_to_physical: phys=0x%llX\n", req.physical_address);
     return req.physical_address;
 }
 
@@ -1704,7 +1892,11 @@ bool voyager::device_t::clear_hardware_breakpoint(std::uint32_t tid, int index) 
 
 std::vector<voyager::device_t::net_connection_info> voyager::device_t::enumerate_connections(std::uint32_t filter_pid, std::uint32_t filter_protocol) noexcept {
     std::vector<net_connection_info> result;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] enumerate_connections: filter_pid=%u filter_proto=%u\n", filter_pid, filter_protocol);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] enumerate_connections: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<voyager::detail::net_enum_conn_request*>(
         VirtualAlloc(nullptr, sizeof(voyager::detail::net_enum_conn_request),
@@ -1716,6 +1908,7 @@ std::vector<voyager::device_t::net_connection_info> voyager::device_t::enumerate
     req->filter_protocol = filter_protocol;
 
     if (send_request(ioctl_codes::NCON(), req, static_cast<DWORD>(sizeof(*req)))) {
+        fprintf(stderr, "[WhosWho-UM] enumerate_connections: found %u connections\n", req->connection_count);
         result.reserve(req->connection_count);
         for (std::uint32_t i = 0; i < req->connection_count; i++) {
             net_connection_info info{};
@@ -1737,7 +1930,12 @@ std::vector<voyager::device_t::net_connection_info> voyager::device_t::enumerate
 
 bool voyager::device_t::start_capture(std::uint32_t filter_pid, std::uint32_t filter_port,
     std::uint32_t filter_protocol, const std::uint8_t* filter_ip, std::uint32_t max_payload) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] start_capture: pid=%u port=%u proto=%u max_payload=%u\n",
+        filter_pid, filter_port, filter_protocol, max_payload);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] start_capture: not connected\n");
+        return false;
+    }
 
     voyager::detail::net_cap_ctrl_request req{};
     req.operation = 0;
@@ -1747,36 +1945,58 @@ bool voyager::device_t::start_capture(std::uint32_t filter_pid, std::uint32_t fi
     req.max_packet_bytes = max_payload;
     if (filter_ip) std::memcpy(req.filter_ip, filter_ip, 16);
 
-    if (!send_request(ioctl_codes::NCAP(), &req, sizeof(req))) return false;
+    if (!send_request(ioctl_codes::NCAP(), &req, sizeof(req))) {
+        fprintf(stderr, "[WhosWho-UM] start_capture: IOCTL failed\n");
+        return false;
+    }
+    fprintf(stderr, "[WhosWho-UM] start_capture: active=%u\n", req.capture_active);
     return req.capture_active != 0;
 }
 
 bool voyager::device_t::stop_capture() noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] stop_capture\n");
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] stop_capture: not connected\n");
+        return false;
+    }
 
     voyager::detail::net_cap_ctrl_request req{};
     req.operation = 1;
 
-    return send_request(ioctl_codes::NCAP(), &req, sizeof(req));
+    bool ok = send_request(ioctl_codes::NCAP(), &req, sizeof(req));
+    fprintf(stderr, "[WhosWho-UM] stop_capture: %s\n", ok ? "OK" : "FAILED");
+    return ok;
 }
 
 bool voyager::device_t::get_capture_status(bool& active, std::uint32_t& captured, std::uint32_t& dropped) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] get_capture_status\n");
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] get_capture_status: not connected\n");
+        return false;
+    }
 
     voyager::detail::net_cap_ctrl_request req{};
     req.operation = 2;
 
-    if (!send_request(ioctl_codes::NCAP(), &req, sizeof(req))) return false;
+    if (!send_request(ioctl_codes::NCAP(), &req, sizeof(req))) {
+        fprintf(stderr, "[WhosWho-UM] get_capture_status: IOCTL failed\n");
+        return false;
+    }
 
     active = req.capture_active != 0;
     captured = req.packets_captured;
     dropped = req.packets_dropped;
+    fprintf(stderr, "[WhosWho-UM] get_capture_status: active=%d captured=%u dropped=%u\n", active, captured, dropped);
     return true;
 }
 
 std::vector<voyager::device_t::captured_packet> voyager::device_t::get_captured_packets(std::uint32_t max_packets) noexcept {
     std::vector<captured_packet> result;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] get_captured_packets: max=%u\n", max_packets);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] get_captured_packets: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<voyager::detail::net_cap_get_request*>(
         VirtualAlloc(nullptr, sizeof(voyager::detail::net_cap_get_request),
@@ -1787,6 +2007,7 @@ std::vector<voyager::device_t::captured_packet> voyager::device_t::get_captured_
     req->max_packets = max_packets;
 
     if (send_request(ioctl_codes::NCPG(), req, static_cast<DWORD>(sizeof(*req)))) {
+        fprintf(stderr, "[WhosWho-UM] get_captured_packets: got %u packets\n", req->packet_count);
         result.reserve(req->packet_count);
         for (std::uint32_t i = 0; i < req->packet_count; i++) {
             captured_packet pkt{};
@@ -1816,7 +2037,11 @@ std::vector<voyager::device_t::captured_packet> voyager::device_t::get_captured_
 
 std::vector<voyager::device_t::dns_entry> voyager::device_t::get_dns_queries(std::uint32_t filter_pid) noexcept {
     std::vector<dns_entry> result;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] get_dns_queries: filter_pid=%u\n", filter_pid);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] get_dns_queries: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<voyager::detail::net_dns_get_request*>(
         VirtualAlloc(nullptr, sizeof(voyager::detail::net_dns_get_request),
@@ -1827,6 +2052,7 @@ std::vector<voyager::device_t::dns_entry> voyager::device_t::get_dns_queries(std
     req->filter_pid = filter_pid;
 
     if (send_request(ioctl_codes::NDNS(), req, static_cast<DWORD>(sizeof(*req)))) {
+        fprintf(stderr, "[WhosWho-UM] get_dns_queries: got %u entries\n", req->entry_count);
         result.reserve(req->entry_count);
         for (std::uint32_t i = 0; i < req->entry_count; i++) {
             dns_entry entry{};
@@ -1850,7 +2076,12 @@ bool voyager::device_t::add_filter_rule(std::uint32_t action, std::uint32_t dire
     std::uint32_t protocol, std::uint32_t pid, std::uint32_t port,
     const std::uint8_t* ip_addr, const std::uint8_t* ip_mask,
     std::uint32_t* out_rule_id) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] add_filter_rule: action=%u dir=%u proto=%u pid=%u port=%u\n",
+        action, direction, protocol, pid, port);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] add_filter_rule: not connected\n");
+        return false;
+    }
 
     voyager::detail::net_filter_rule_request req{};
     req.operation = 0;
@@ -1862,36 +2093,59 @@ bool voyager::device_t::add_filter_rule(std::uint32_t action, std::uint32_t dire
     if (ip_addr) std::memcpy(req.ip_addr, ip_addr, 16);
     if (ip_mask) std::memcpy(req.ip_mask, ip_mask, 16);
 
-    if (!send_request(ioctl_codes::NFLT(), &req, sizeof(req))) return false;
+    if (!send_request(ioctl_codes::NFLT(), &req, sizeof(req))) {
+        fprintf(stderr, "[WhosWho-UM] add_filter_rule: IOCTL failed\n");
+        return false;
+    }
+    fprintf(stderr, "[WhosWho-UM] add_filter_rule: OK rule_id=%u\n", req.rule_id);
     if (out_rule_id) *out_rule_id = req.rule_id;
     return true;
 }
 
 bool voyager::device_t::remove_filter_rule(std::uint32_t rule_id) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] remove_filter_rule: rule_id=%u\n", rule_id);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] remove_filter_rule: not connected\n");
+        return false;
+    }
 
     voyager::detail::net_filter_rule_request req{};
     req.operation = 1;
     req.rule_id = rule_id;
 
-    return send_request(ioctl_codes::NFLT(), &req, sizeof(req));
+    bool ok = send_request(ioctl_codes::NFLT(), &req, sizeof(req));
+    fprintf(stderr, "[WhosWho-UM] remove_filter_rule: %s\n", ok ? "OK" : "FAILED");
+    return ok;
 }
 
 bool voyager::device_t::clear_filter_rules() noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] clear_filter_rules\n");
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] clear_filter_rules: not connected\n");
+        return false;
+    }
 
     voyager::detail::net_filter_rule_request req{};
     req.operation = 2;
 
-    return send_request(ioctl_codes::NFLT(), &req, sizeof(req));
+    bool ok = send_request(ioctl_codes::NFLT(), &req, sizeof(req));
+    fprintf(stderr, "[WhosWho-UM] clear_filter_rules: %s\n", ok ? "OK" : "FAILED");
+    return ok;
 }
 
 bool voyager::device_t::get_network_stats(network_stats& stats) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] get_network_stats\n");
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] get_network_stats: not connected\n");
+        return false;
+    }
 
     voyager::detail::net_stats_request req{};
 
-    if (!send_request(ioctl_codes::NSTS(), &req, sizeof(req))) return false;
+    if (!send_request(ioctl_codes::NSTS(), &req, sizeof(req))) {
+        fprintf(stderr, "[WhosWho-UM] get_network_stats: IOCTL failed\n");
+        return false;
+    }
 
     stats.bytes_sent = req.bytes_sent;
     stats.bytes_received = req.bytes_received;
@@ -1903,6 +2157,8 @@ bool voyager::device_t::get_network_stats(network_stats& stats) noexcept {
     stats.total_dropped = req.total_dropped;
     stats.total_dns_logged = req.total_dns_logged;
     stats.active_filter_rules = req.active_filter_rules;
+    fprintf(stderr, "[WhosWho-UM] get_network_stats: sent=%llu recv=%llu active_conn=%u\n",
+        stats.bytes_sent, stats.bytes_received, stats.active_connections);
     return true;
 }
 
@@ -1919,7 +2175,11 @@ static std::string guid_to_string(const voyager::detail::GUID_COMPAT& g) {
 std::vector<voyager::device_t::wfp_callout_info>
 voyager::device_t::enumerate_wfp_callouts(const std::string& filter_module) noexcept {
     std::vector<wfp_callout_info> result;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] enumerate_wfp_callouts: filter='%s'\n", filter_module.c_str());
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] enumerate_wfp_callouts: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<voyager::detail::wfp_callout_enum_request*>(
         VirtualAlloc(nullptr, sizeof(voyager::detail::wfp_callout_enum_request),
@@ -1934,6 +2194,7 @@ voyager::device_t::enumerate_wfp_callouts(const std::string& filter_module) noex
     }
 
     if (send_request(ioctl_codes::EWFP(), req, static_cast<DWORD>(sizeof(*req)))) {
+        fprintf(stderr, "[WhosWho-UM] enumerate_wfp_callouts: found %u callouts\n", req->callout_count);
         result.reserve(req->callout_count);
         for (std::uint32_t i = 0; i < req->callout_count; i++) {
             const auto& e = req->entries[i];
@@ -1960,7 +2221,11 @@ voyager::device_t::enumerate_wfp_callouts(const std::string& filter_module) noex
 std::vector<voyager::device_t::socket_info>
 voyager::device_t::get_socket_handles(std::uint32_t target_pid) noexcept {
     std::vector<socket_info> result;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] get_socket_handles: target_pid=%u\n", target_pid);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] get_socket_handles: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<voyager::detail::socket_handle_enum_request*>(
         VirtualAlloc(nullptr, sizeof(voyager::detail::socket_handle_enum_request),
@@ -1971,6 +2236,7 @@ voyager::device_t::get_socket_handles(std::uint32_t target_pid) noexcept {
     req->target_pid = (target_pid != 0) ? target_pid : process_id_;
 
     if (send_request(ioctl_codes::GSKT(), req, static_cast<DWORD>(sizeof(*req)))) {
+        fprintf(stderr, "[WhosWho-UM] get_socket_handles: found %u sockets\n", req->socket_count);
         result.reserve(req->socket_count);
         for (std::uint32_t i = 0; i < req->socket_count; i++) {
             const auto& e = req->entries[i];
@@ -1995,7 +2261,12 @@ voyager::device_t::get_socket_handles(std::uint32_t target_pid) noexcept {
 
 bool voyager::device_t::sniff_net_buffers_start(std::uint64_t address, std::uint32_t buf_reg,
     std::uint32_t size_reg, std::uint32_t max_captures, std::uint32_t tid, std::uint32_t bp_index) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] sniff_net_buffers_start: addr=0x%llX buf_reg=%u size_reg=%u max=%u tid=%u bp=%u\n",
+        address, buf_reg, size_reg, max_captures, tid, bp_index);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] sniff_net_buffers_start: not connected\n");
+        return false;
+    }
 
     voyager::detail::sniff_net_buffers_request req{};
     req.target_address = address;
@@ -2006,23 +2277,35 @@ bool voyager::device_t::sniff_net_buffers_start(std::uint64_t address, std::uint
     req.target_tid = tid;
     req.bp_index = bp_index;
 
-    return send_request(ioctl_codes::SNBF(), &req, sizeof(req));
+    bool ok_sniff = send_request(ioctl_codes::SNBF(), &req, sizeof(req));
+    fprintf(stderr, "[WhosWho-UM] sniff_net_buffers_start: %s\n", ok_sniff ? "OK" : "FAILED");
+    return ok_sniff;
 }
 
 bool voyager::device_t::sniff_net_buffers_stop() noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] sniff_net_buffers_stop\n");
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] sniff_net_buffers_stop: not connected\n");
+        return false;
+    }
 
     voyager::detail::sniff_net_buffers_request req{};
     req.operation = 1;
 
-    return send_request(ioctl_codes::SNBF(), &req, sizeof(req));
+    bool ok = send_request(ioctl_codes::SNBF(), &req, sizeof(req));
+    fprintf(stderr, "[WhosWho-UM] sniff_net_buffers_stop: %s\n", ok ? "OK" : "FAILED");
+    return ok;
 }
 
 std::vector<voyager::device_t::sniff_result>
 voyager::device_t::sniff_net_buffers_get(bool& active) noexcept {
     std::vector<sniff_result> result;
     active = false;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] sniff_net_buffers_get\n");
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] sniff_net_buffers_get: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<voyager::detail::sniff_net_buffers_request*>(
         VirtualAlloc(nullptr, sizeof(voyager::detail::sniff_net_buffers_request),
@@ -2034,6 +2317,7 @@ voyager::device_t::sniff_net_buffers_get(bool& active) noexcept {
 
     if (send_request(ioctl_codes::SNBF(), req, static_cast<DWORD>(sizeof(*req)))) {
         active = (req->active != 0);
+        fprintf(stderr, "[WhosWho-UM] sniff_net_buffers_get: active=%d captures=%u\n", active, req->capture_count);
         result.reserve(req->capture_count);
         for (std::uint32_t i = 0; i < req->capture_count; i++) {
             const auto& c = req->captures[i];
@@ -2054,7 +2338,11 @@ voyager::device_t::sniff_net_buffers_get(bool& active) noexcept {
 
 bool voyager::device_t::sniff_net_buffers_store(std::uint64_t timestamp, std::uint64_t thread_id,
     const std::uint8_t* data, std::uint32_t size) noexcept {
-    if (!is_connected() || !data || size == 0) return false;
+    fprintf(stderr, "[WhosWho-UM] sniff_net_buffers_store: ts=%llu tid=%llu size=%u\n", timestamp, thread_id, size);
+    if (!is_connected() || !data || size == 0) {
+        fprintf(stderr, "[WhosWho-UM] sniff_net_buffers_store: precondition fail\n");
+        return false;
+    }
 
     auto* req = static_cast<voyager::detail::sniff_net_buffers_request*>(
         VirtualAlloc(nullptr, sizeof(voyager::detail::sniff_net_buffers_request),
@@ -2074,6 +2362,7 @@ bool voyager::device_t::sniff_net_buffers_store(std::uint64_t timestamp, std::ui
     std::memcpy(req->captures[0].buffer, data, copy_sz);
 
     bool ok = send_request(ioctl_codes::SNBF(), req, static_cast<DWORD>(sizeof(*req)));
+    fprintf(stderr, "[WhosWho-UM] sniff_net_buffers_store: %s\n", ok ? "OK" : "FAILED");
     VirtualFree(req, 0, MEM_RELEASE);
     return ok;
 }
@@ -2081,7 +2370,11 @@ bool voyager::device_t::sniff_net_buffers_store(std::uint64_t timestamp, std::ui
 std::vector<voyager::device_t::tcpip_connection>
 voyager::device_t::dump_tcpip_connections(std::uint32_t target_pid, std::uint32_t filter_protocol) noexcept {
     std::vector<tcpip_connection> result;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] dump_tcpip_connections: pid=%u proto=%u\n", target_pid, filter_protocol);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] dump_tcpip_connections: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<voyager::detail::tcpip_conn_dump_request*>(
         VirtualAlloc(nullptr, sizeof(voyager::detail::tcpip_conn_dump_request),
@@ -2093,6 +2386,7 @@ voyager::device_t::dump_tcpip_connections(std::uint32_t target_pid, std::uint32_
     req->filter_protocol = filter_protocol;
 
     if (send_request(ioctl_codes::DTCP(), req, static_cast<DWORD>(sizeof(*req)))) {
+        fprintf(stderr, "[WhosWho-UM] dump_tcpip_connections: found %u connections\n", req->connection_count);
         result.reserve(req->connection_count);
         for (std::uint32_t i = 0; i < req->connection_count; i++) {
             const auto& e = req->entries[i];
@@ -2124,7 +2418,12 @@ bool voyager::device_t::inject_packet(std::uint32_t direction, std::uint32_t pro
                                        const std::uint8_t* src_addr, const std::uint8_t* dst_addr,
                                        const std::uint8_t* payload, std::uint32_t payload_size,
                                        std::uint32_t tcp_flags, std::uint32_t tcp_seq, std::uint32_t tcp_ack) noexcept {
-    if (!is_connected() || !payload || payload_size == 0) return false;
+    fprintf(stderr, "[WhosWho-UM] inject_packet: dir=%u proto=%u af=%u sport=%u dport=%u size=%u\n",
+        direction, protocol, af, src_port, dst_port, payload_size);
+    if (!is_connected() || !payload || payload_size == 0) {
+        fprintf(stderr, "[WhosWho-UM] inject_packet: precondition fail\n");
+        return false;
+    }
     if (payload_size > detail::INJECT_MAX_PAYLOAD) payload_size = detail::INJECT_MAX_PAYLOAD;
 
     auto* req = static_cast<detail::packet_inject_request*>(
@@ -2147,6 +2446,7 @@ bool voyager::device_t::inject_packet(std::uint32_t direction, std::uint32_t pro
 
     bool ok = send_request(ioctl_codes::PINJ(), req, static_cast<DWORD>(sizeof(*req)));
     bool success = ok && (req->status == 0);
+    fprintf(stderr, "[WhosWho-UM] inject_packet: ioctl=%s status=%u\n", ok ? "OK" : "FAILED", ok ? req->status : 0);
     VirtualFree(req, 0, MEM_RELEASE);
     return success;
 }
@@ -2157,7 +2457,12 @@ bool voyager::device_t::packet_mod_rule_op(std::uint32_t operation, std::uint32_
                                             const std::uint8_t* pattern, std::uint32_t pattern_size,
                                             const std::uint8_t* replacement, std::uint32_t replace_size,
                                             std::uint32_t* out_rule_id) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] packet_mod_rule_op: op=%u rule=%u dir=%u proto=%u port=%u pid=%u pat_sz=%u rep_sz=%u\n",
+        operation, rule_id, direction, protocol, port, pid, pattern_size, replace_size);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] packet_mod_rule_op: not connected\n");
+        return false;
+    }
 
     auto* req = static_cast<detail::packet_mod_rule*>(
         VirtualAlloc(nullptr, sizeof(detail::packet_mod_rule), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2180,6 +2485,7 @@ bool voyager::device_t::packet_mod_rule_op(std::uint32_t operation, std::uint32_
     }
 
     bool ok = send_request(ioctl_codes::PMOD(), req, static_cast<DWORD>(sizeof(*req)));
+    fprintf(stderr, "[WhosWho-UM] packet_mod_rule_op: %s out_rule=%u\n", ok ? "OK" : "FAILED", ok ? req->rule_id : 0);
     if (ok && out_rule_id) *out_rule_id = req->rule_id;
     VirtualFree(req, 0, MEM_RELEASE);
     return ok;
@@ -2187,7 +2493,11 @@ bool voyager::device_t::packet_mod_rule_op(std::uint32_t operation, std::uint32_
 
 std::vector<voyager::device_t::mod_rule_info> voyager::device_t::list_packet_mod_rules() noexcept {
     std::vector<mod_rule_info> result;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] list_packet_mod_rules\n");
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] list_packet_mod_rules: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<detail::packet_mod_rule_list*>(
         VirtualAlloc(nullptr, sizeof(detail::packet_mod_rule_list), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2197,6 +2507,7 @@ std::vector<voyager::device_t::mod_rule_info> voyager::device_t::list_packet_mod
     req->operation = 2;
 
     if (send_request(ioctl_codes::PMOD(), req, static_cast<DWORD>(sizeof(*req)))) {
+        fprintf(stderr, "[WhosWho-UM] list_packet_mod_rules: found %u rules\n", req->rule_count);
         for (std::uint32_t i = 0; i < req->rule_count && i < detail::MOD_MAX_RULES; i++) {
             const auto& r = req->rules[i];
             mod_rule_info info{};
@@ -2220,7 +2531,12 @@ bool voyager::device_t::traffic_redirect_op(std::uint32_t operation, std::uint32
                                              std::uint32_t match_port, const std::uint8_t* match_addr,
                                              std::uint32_t redirect_port, const std::uint8_t* redirect_addr,
                                              std::uint32_t af, std::uint32_t* out_rule_id) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] traffic_redirect_op: op=%u rule=%u proto=%u match_port=%u redir_port=%u af=%u\n",
+        operation, rule_id, protocol, match_port, redirect_port, af);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] traffic_redirect_op: not connected\n");
+        return false;
+    }
 
     auto* req = static_cast<detail::traffic_redirect_rule*>(
         VirtualAlloc(nullptr, sizeof(detail::traffic_redirect_rule), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2237,6 +2553,7 @@ bool voyager::device_t::traffic_redirect_op(std::uint32_t operation, std::uint32
     if (redirect_addr) std::memcpy(req->redirect_addr, redirect_addr, 16);
 
     bool ok = send_request(ioctl_codes::PRED(), req, static_cast<DWORD>(sizeof(*req)));
+    fprintf(stderr, "[WhosWho-UM] traffic_redirect_op: %s out_rule=%u\n", ok ? "OK" : "FAILED", ok ? req->rule_id : 0);
     if (ok && out_rule_id) *out_rule_id = req->rule_id;
     VirtualFree(req, 0, MEM_RELEASE);
     return ok;
@@ -2244,7 +2561,11 @@ bool voyager::device_t::traffic_redirect_op(std::uint32_t operation, std::uint32
 
 std::vector<voyager::device_t::redirect_rule_info> voyager::device_t::list_redirect_rules() noexcept {
     std::vector<redirect_rule_info> result;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] list_redirect_rules\n");
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] list_redirect_rules: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<detail::traffic_redirect_list*>(
         VirtualAlloc(nullptr, sizeof(detail::traffic_redirect_list), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2254,6 +2575,7 @@ std::vector<voyager::device_t::redirect_rule_info> voyager::device_t::list_redir
     req->operation = 2;
 
     if (send_request(ioctl_codes::PRED(), req, static_cast<DWORD>(sizeof(*req)))) {
+        fprintf(stderr, "[WhosWho-UM] list_redirect_rules: found %u rules\n", req->rule_count);
         for (std::uint32_t i = 0; i < req->rule_count && i < detail::REDIR_MAX_RULES; i++) {
             const auto& r = req->rules[i];
             redirect_rule_info info{};
@@ -2277,7 +2599,12 @@ bool voyager::device_t::stream_reassemble_op(std::uint32_t operation, std::uint3
                                               const std::uint8_t* dst_addr,
                                               std::vector<std::uint8_t>* out_data,
                                               std::uint32_t* out_packets, std::uint32_t* out_truncated) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] stream_reassemble_op: op=%u sport=%u dport=%u pid=%u\n",
+        operation, src_port, dst_port, pid);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] stream_reassemble_op: not connected\n");
+        return false;
+    }
 
     auto* req = static_cast<detail::stream_reassemble_request*>(
         VirtualAlloc(nullptr, sizeof(detail::stream_reassemble_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2292,6 +2619,8 @@ bool voyager::device_t::stream_reassemble_op(std::uint32_t operation, std::uint3
     if (dst_addr) std::memcpy(req->dst_addr, dst_addr, 16);
 
     bool ok = send_request(ioctl_codes::STRM(), req, static_cast<DWORD>(sizeof(*req)));
+    fprintf(stderr, "[WhosWho-UM] stream_reassemble_op: %s total_pkts=%u truncated=%u\n",
+        ok ? "OK" : "FAILED", ok ? req->total_packets : 0, ok ? req->truncated : 0);
     if (ok) {
         if (out_data && req->stream_size > 0) {
             out_data->assign(req->stream_data, req->stream_data + req->stream_size);
@@ -2308,7 +2637,12 @@ std::vector<voyager::device_t::dpi_result> voyager::device_t::get_dpi_results(
     std::uint32_t filter_pid, std::uint32_t filter_protocol,
     std::uint32_t filter_port, std::uint32_t flags) noexcept {
     std::vector<dpi_result> result;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] get_dpi_results: pid=%u proto=%u port=%u flags=0x%X\n",
+        filter_pid, filter_protocol, filter_port, flags);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] get_dpi_results: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<detail::dpi_request*>(
         VirtualAlloc(nullptr, sizeof(detail::dpi_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2321,6 +2655,7 @@ std::vector<voyager::device_t::dpi_result> voyager::device_t::get_dpi_results(
     req->flags = flags;
 
     if (send_request(ioctl_codes::DPIN(), req, static_cast<DWORD>(sizeof(*req)))) {
+        fprintf(stderr, "[WhosWho-UM] get_dpi_results: found %u results\n", req->result_count);
         for (std::uint32_t i = 0; i < req->result_count && i < detail::DPI_MAX_RESULTS; i++) {
             const auto& h = req->results[i];
             dpi_result d{};
@@ -2357,7 +2692,12 @@ bool voyager::device_t::intercept_op(std::uint32_t operation, std::uint32_t filt
                                       std::uint32_t filter_protocol, std::uint64_t hold_id,
                                       const std::uint8_t* modify_payload, std::uint32_t modify_size,
                                       std::uint32_t* out_held_count, bool* out_active) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] intercept_op: op=%u pid=%u port=%u proto=%u hold_id=%llu mod_sz=%u\n",
+        operation, filter_pid, filter_port, filter_protocol, hold_id, modify_size);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] intercept_op: not connected\n");
+        return false;
+    }
 
     auto* req = static_cast<detail::intercept_request*>(
         VirtualAlloc(nullptr, sizeof(detail::intercept_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2375,6 +2715,8 @@ bool voyager::device_t::intercept_op(std::uint32_t operation, std::uint32_t filt
     }
 
     bool ok = send_request(ioctl_codes::IHLD(), req, static_cast<DWORD>(sizeof(*req)));
+    fprintf(stderr, "[WhosWho-UM] intercept_op: %s held=%u active=%d\n",
+        ok ? "OK" : "FAILED", ok ? req->held_count : 0, ok ? req->intercepting : 0);
     if (ok) {
         if (out_held_count) *out_held_count = req->held_count;
         if (out_active) *out_active = (req->intercepting != 0);
@@ -2386,7 +2728,11 @@ bool voyager::device_t::intercept_op(std::uint32_t operation, std::uint32_t filt
 
 std::vector<voyager::device_t::held_packet_info> voyager::device_t::get_held_packets() noexcept {
     std::vector<held_packet_info> result;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] get_held_packets\n");
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] get_held_packets: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<detail::intercept_request*>(
         VirtualAlloc(nullptr, sizeof(detail::intercept_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2396,6 +2742,7 @@ std::vector<voyager::device_t::held_packet_info> voyager::device_t::get_held_pac
     req->operation = 2;
 
     if (send_request(ioctl_codes::IHLD(), req, static_cast<DWORD>(sizeof(*req)))) {
+        fprintf(stderr, "[WhosWho-UM] get_held_packets: found %u held packets\n", req->held_count);
         for (std::uint32_t i = 0; i < req->held_count && i < detail::INTERCEPT_MAX_HELD; i++) {
             const auto& h = req->held_packets[i];
             held_packet_info info{};
@@ -2426,7 +2773,12 @@ bool voyager::device_t::kill_connection(std::uint32_t protocol, std::uint32_t af
                                          std::uint32_t src_port, std::uint32_t dst_port,
                                          const std::uint8_t* src_addr, const std::uint8_t* dst_addr,
                                          std::uint32_t pid) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] kill_connection: proto=%u af=%u sport=%u dport=%u pid=%u\n",
+        protocol, af, src_port, dst_port, pid);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] kill_connection: not connected\n");
+        return false;
+    }
 
     auto* req = static_cast<detail::conn_kill_request*>(
         VirtualAlloc(nullptr, sizeof(detail::conn_kill_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2443,6 +2795,7 @@ bool voyager::device_t::kill_connection(std::uint32_t protocol, std::uint32_t af
 
     bool ok = send_request(ioctl_codes::CKIL(), req, static_cast<DWORD>(sizeof(*req)));
     bool success = ok && (req->status == 0);
+    fprintf(stderr, "[WhosWho-UM] kill_connection: ioctl=%s status=%u\n", ok ? "OK" : "FAILED", ok ? req->status : 0);
     VirtualFree(req, 0, MEM_RELEASE);
     return success;
 }
@@ -2451,7 +2804,12 @@ bool voyager::device_t::dns_spoof_op(std::uint32_t operation, std::uint32_t rule
                                       const char* domain,
                                       const std::uint8_t* spoof_addr, std::uint32_t af,
                                       std::uint32_t ttl, std::uint32_t* out_rule_id) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] dns_spoof_op: op=%u rule=%u domain='%s' af=%u ttl=%u\n",
+        operation, rule_id, domain ? domain : "(null)", af, ttl);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] dns_spoof_op: not connected\n");
+        return false;
+    }
 
     auto* req = static_cast<detail::dns_spoof_rule*>(
         VirtualAlloc(nullptr, sizeof(detail::dns_spoof_rule), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2470,6 +2828,7 @@ bool voyager::device_t::dns_spoof_op(std::uint32_t operation, std::uint32_t rule
     if (spoof_addr) std::memcpy(req->spoof_addr, spoof_addr, 16);
 
     bool ok = send_request(ioctl_codes::DNSS(), req, static_cast<DWORD>(sizeof(*req)));
+    fprintf(stderr, "[WhosWho-UM] dns_spoof_op: %s out_rule=%u\n", ok ? "OK" : "FAILED", ok ? req->rule_id : 0);
     if (ok && out_rule_id) *out_rule_id = req->rule_id;
     VirtualFree(req, 0, MEM_RELEASE);
     return ok;
@@ -2477,7 +2836,11 @@ bool voyager::device_t::dns_spoof_op(std::uint32_t operation, std::uint32_t rule
 
 std::vector<voyager::device_t::dns_spoof_info> voyager::device_t::list_dns_spoof_rules() noexcept {
     std::vector<dns_spoof_info> result;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] list_dns_spoof_rules\n");
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] list_dns_spoof_rules: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<detail::dns_spoof_list*>(
         VirtualAlloc(nullptr, sizeof(detail::dns_spoof_list), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2487,6 +2850,7 @@ std::vector<voyager::device_t::dns_spoof_info> voyager::device_t::list_dns_spoof
     req->operation = 2;
 
     if (send_request(ioctl_codes::DNSS(), req, static_cast<DWORD>(sizeof(*req)))) {
+        fprintf(stderr, "[WhosWho-UM] list_dns_spoof_rules: found %u rules\n", req->rule_count);
         for (std::uint32_t i = 0; i < req->rule_count && i < detail::DNS_SPOOF_MAX_RULES; i++) {
             const auto& r = req->rules[i];
             dns_spoof_info info{};
@@ -2506,7 +2870,11 @@ std::vector<voyager::device_t::dns_spoof_info> voyager::device_t::list_dns_spoof
 
 bool voyager::device_t::bw_monitor_op(std::uint32_t operation, std::uint32_t filter_pid,
                                        bw_stats* out_stats) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] bw_monitor_op: op=%u pid=%u\n", operation, filter_pid);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] bw_monitor_op: not connected\n");
+        return false;
+    }
 
     auto* req = static_cast<detail::bw_monitor_request*>(
         VirtualAlloc(nullptr, sizeof(detail::bw_monitor_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2517,6 +2885,8 @@ bool voyager::device_t::bw_monitor_op(std::uint32_t operation, std::uint32_t fil
     req->filter_pid = filter_pid;
 
     bool ok = send_request(ioctl_codes::BWMN(), req, static_cast<DWORD>(sizeof(*req)));
+    fprintf(stderr, "[WhosWho-UM] bw_monitor_op: %s active=%d\n", ok ? "OK" : "FAILED",
+        ok ? req->monitoring_active : 0);
     if (ok && out_stats) {
         out_stats->total_bytes_sent = req->total_bytes_sent;
         out_stats->total_bytes_recv = req->total_bytes_recv;
@@ -2533,7 +2903,11 @@ bool voyager::device_t::bw_monitor_op(std::uint32_t operation, std::uint32_t fil
 
 std::vector<voyager::device_t::bw_process_info> voyager::device_t::get_bw_per_process(std::uint32_t filter_pid) noexcept {
     std::vector<bw_process_info> result;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] get_bw_per_process: pid=%u\n", filter_pid);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] get_bw_per_process: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<detail::bw_monitor_request*>(
         VirtualAlloc(nullptr, sizeof(detail::bw_monitor_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2544,6 +2918,7 @@ std::vector<voyager::device_t::bw_process_info> voyager::device_t::get_bw_per_pr
     req->filter_pid = filter_pid;
 
     if (send_request(ioctl_codes::BWMN(), req, static_cast<DWORD>(sizeof(*req)))) {
+        fprintf(stderr, "[WhosWho-UM] get_bw_per_process: found %u processes\n", req->process_count);
         for (std::uint32_t i = 0; i < req->process_count && i < detail::BW_MAX_PROCESSES; i++) {
             const auto& p = req->processes[i];
             bw_process_info info{};
@@ -2563,7 +2938,11 @@ std::vector<voyager::device_t::bw_process_info> voyager::device_t::get_bw_per_pr
 
 std::vector<voyager::device_t::net_iface_info> voyager::device_t::enumerate_interfaces() noexcept {
     std::vector<net_iface_info> result;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] enumerate_interfaces\n");
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] enumerate_interfaces: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<detail::net_interface_enum*>(
         VirtualAlloc(nullptr, sizeof(detail::net_interface_enum), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2572,6 +2951,7 @@ std::vector<voyager::device_t::net_iface_info> voyager::device_t::enumerate_inte
     std::memset(req, 0, sizeof(*req));
 
     if (send_request(ioctl_codes::NIFS(), req, static_cast<DWORD>(sizeof(*req)))) {
+        fprintf(stderr, "[WhosWho-UM] enumerate_interfaces: found %u interfaces\n", req->interface_count);
         for (std::uint32_t i = 0; i < req->interface_count && i < detail::NET_IF_MAX; i++) {
             const auto& e = req->interfaces[i];
             net_iface_info info{};
@@ -2598,7 +2978,11 @@ std::vector<voyager::device_t::net_iface_info> voyager::device_t::enumerate_inte
 
 bool voyager::device_t::export_pcap(std::uint32_t filter_pid, std::uint32_t filter_protocol,
                                      std::uint32_t max_packets, pcap_export_result* out) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] export_pcap: pid=%u proto=%u max=%u\n", filter_pid, filter_protocol, max_packets);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] export_pcap: not connected\n");
+        return false;
+    }
     if (max_packets > detail::PCAP_MAX_EXPORT_PACKETS) max_packets = detail::PCAP_MAX_EXPORT_PACKETS;
 
     auto* req = static_cast<detail::pcap_export_request*>(
@@ -2612,6 +2996,8 @@ bool voyager::device_t::export_pcap(std::uint32_t filter_pid, std::uint32_t filt
     req->max_packets = max_packets;
 
     bool ok = send_request(ioctl_codes::PCEX(), req, static_cast<DWORD>(sizeof(*req)));
+    fprintf(stderr, "[WhosWho-UM] export_pcap: %s packets=%u\n", ok ? "OK" : "FAILED",
+        ok ? req->packet_count : 0);
     if (ok && out) {
         out->header = req->header;
         out->packets.clear();
@@ -2631,7 +3017,11 @@ bool voyager::device_t::export_pcap(std::uint32_t filter_pid, std::uint32_t filt
 }
 
 bool voyager::device_t::fingerprint_op(std::uint32_t operation) noexcept {
-    if (!is_connected()) return false;
+    fprintf(stderr, "[WhosWho-UM] fingerprint_op: op=%u\n", operation);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] fingerprint_op: not connected\n");
+        return false;
+    }
 
     auto* req = static_cast<detail::net_fingerprint_request*>(
         VirtualAlloc(nullptr, sizeof(detail::net_fingerprint_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2641,13 +3031,18 @@ bool voyager::device_t::fingerprint_op(std::uint32_t operation) noexcept {
     req->operation = operation;
 
     bool ok = send_request(ioctl_codes::NFPR(), req, static_cast<DWORD>(sizeof(*req)));
+    fprintf(stderr, "[WhosWho-UM] fingerprint_op: %s\n", ok ? "OK" : "FAILED");
     VirtualFree(req, 0, MEM_RELEASE);
     return ok;
 }
 
 std::vector<voyager::device_t::fingerprint_info> voyager::device_t::get_fingerprints() noexcept {
     std::vector<fingerprint_info> result;
-    if (!is_connected()) return result;
+    fprintf(stderr, "[WhosWho-UM] get_fingerprints\n");
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] get_fingerprints: not connected\n");
+        return result;
+    }
 
     auto* req = static_cast<detail::net_fingerprint_request*>(
         VirtualAlloc(nullptr, sizeof(detail::net_fingerprint_request), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -2657,6 +3052,7 @@ std::vector<voyager::device_t::fingerprint_info> voyager::device_t::get_fingerpr
     req->operation = 2;
 
     if (send_request(ioctl_codes::NFPR(), req, static_cast<DWORD>(sizeof(*req)))) {
+        fprintf(stderr, "[WhosWho-UM] get_fingerprints: found %u entries\n", req->result_count);
         for (std::uint32_t i = 0; i < req->result_count && i < detail::FINGERPRINT_MAX; i++) {
             const auto& e = req->entries[i];
             fingerprint_info info{};
@@ -2691,8 +3087,13 @@ bool voyager::device_t::register_dll_protection(
     std::uint32_t text_size, std::uint64_t expected_hash,
     std::uint32_t check_interval_ms) noexcept
 {
-    if (!is_connected() || process_id_ == 0)
+    fprintf(stderr, "[WhosWho-UM] register_dll_protection: base=0x%llX text_va=0x%llX size=%u hash=0x%llX interval=%u\n",
+        module_base, text_va, text_size, expected_hash, check_interval_ms);
+    if (!is_connected() || process_id_ == 0) {
+        fprintf(stderr, "[WhosWho-UM] register_dll_protection: precondition fail (connected=%d pid=%u)\n",
+            is_connected(), process_id_);
         return false;
+    }
 
     detail::dll_protect_request req{};
     req.operation = detail::DPRT_OP_REGISTER;
@@ -2703,37 +3104,54 @@ bool voyager::device_t::register_dll_protection(
     req.expected_hash = expected_hash;
     req.check_interval = check_interval_ms;
 
-    if (!send_request(ioctl_codes::DPRT(), &req, static_cast<DWORD>(sizeof(req))))
+    if (!send_request(ioctl_codes::DPRT(), &req, static_cast<DWORD>(sizeof(req)))) {
+        fprintf(stderr, "[WhosWho-UM] register_dll_protection: IOCTL failed\n");
         return false;
+    }
 
+    fprintf(stderr, "[WhosWho-UM] register_dll_protection: status=%u\n", req.status);
     return req.status == detail::DPRT_STATUS_ACTIVE;
 }
 
 bool voyager::device_t::query_dll_protection(dll_protect_status& out) noexcept
 {
-    if (!is_connected())
+    fprintf(stderr, "[WhosWho-UM] query_dll_protection: pid=%u\n", process_id_);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] query_dll_protection: not connected\n");
         return false;
+    }
 
     detail::dll_protect_request req{};
     req.operation = detail::DPRT_OP_QUERY;
+    req.pid = process_id_;
 
-    if (!send_request(ioctl_codes::DPRT(), &req, static_cast<DWORD>(sizeof(req))))
+    if (!send_request(ioctl_codes::DPRT(), &req, static_cast<DWORD>(sizeof(req)))) {
+        fprintf(stderr, "[WhosWho-UM] query_dll_protection: IOCTL failed\n");
         return false;
+    }
 
     out.status = req.status;
     out.current_hash = req.current_hash;
     out.expected_hash = req.expected_hash;
     out.last_check_tsc = req.last_check_tsc;
+    fprintf(stderr, "[WhosWho-UM] query_dll_protection: status=%u cur_hash=0x%llX exp_hash=0x%llX\n",
+        out.status, out.current_hash, out.expected_hash);
     return true;
 }
 
 bool voyager::device_t::unregister_dll_protection() noexcept
 {
-    if (!is_connected())
+    fprintf(stderr, "[WhosWho-UM] unregister_dll_protection: pid=%u\n", process_id_);
+    if (!is_connected()) {
+        fprintf(stderr, "[WhosWho-UM] unregister_dll_protection: not connected\n");
         return false;
+    }
 
     detail::dll_protect_request req{};
     req.operation = detail::DPRT_OP_UNREGISTER;
+    req.pid = process_id_;
 
-    return send_request(ioctl_codes::DPRT(), &req, static_cast<DWORD>(sizeof(req)));
+    bool ok = send_request(ioctl_codes::DPRT(), &req, static_cast<DWORD>(sizeof(req)));
+    fprintf(stderr, "[WhosWho-UM] unregister_dll_protection: %s\n", ok ? "OK" : "FAILED");
+    return ok;
 }

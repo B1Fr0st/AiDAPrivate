@@ -1,5 +1,6 @@
 
 #include <windows.h>
+#include <intrin.h>
 
 #include "mcp_standalone.hpp"
 #include "standalone_ai_client.hpp"
@@ -9,6 +10,8 @@
 #include "zydis_disasm.hpp"
 
 #include "../helpers/globals.h"
+
+#include "../../../../driver/comm.h"
 
 #include <thread>
 #include <mutex>
@@ -385,6 +388,113 @@ void persist_workspace_state()
 
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Standalone self-protection via WhosWho kernel driver.
+//
+// WHY: The DLL plugin (AiDA.dll loaded in IDA) already registers its .text
+// section for kernel-side integrity monitoring. The standalone EXE had NO
+// equivalent protection — an attacker could patch its code in memory
+// without any kernel-level response. By registering the standalone's .text
+// section with the same driver mechanism, both products are equally guarded
+// against runtime code modification and debugger attachment.
+// ──────────────────────────────────────────────────────────────────────────
+namespace {
+
+// Locate the first code section (.text) in the given PE module.
+// Returns false if the module header is invalid or has no code section.
+bool find_exe_code_section(HMODULE mod, std::uint64_t& out_base, std::uint32_t& out_size) {
+    const auto* base_ptr = reinterpret_cast<const std::uint8_t*>(mod);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base_ptr);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base_ptr + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return false;
+
+    const auto* section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if ((section[i].Characteristics & IMAGE_SCN_CNT_CODE) != 0
+            && section[i].Misc.VirtualSize > 0) {
+            out_base = reinterpret_cast<std::uint64_t>(mod) + section[i].VirtualAddress;
+            out_size = section[i].Misc.VirtualSize;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Compute the CRC-based integrity hash of in-memory code.
+// Uses the same algorithm as anti_re.hpp::hash_memory() and the kernel's
+// compute_code_hash_physical(), so the hashes are directly comparable.
+std::uint64_t hash_code_section(const void* data, std::size_t size) {
+    const auto* ptr = static_cast<const std::uint8_t*>(data);
+    std::uint64_t h1 = 0xFFFFFFFFULL;
+    std::uint64_t h2 = 0x85EBCA6BULL;
+
+    const std::size_t chunks = size / 8;
+    const auto* ptr64 = reinterpret_cast<const std::uint64_t*>(ptr);
+    for (std::size_t i = 0; i < chunks; ++i) {
+        h1 = _mm_crc32_u64(h1, ptr64[i]);
+        h2 = _mm_crc32_u64(h2, ptr64[i] ^ 0xA5A5A5A5A5A5A5A5ULL);
+    }
+
+    const std::size_t remaining = size % 8;
+    const auto* tail = ptr + chunks * 8;
+    for (std::size_t i = 0; i < remaining; ++i) {
+        h1 = _mm_crc32_u8(static_cast<std::uint32_t>(h1), tail[i]);
+        h2 = _mm_crc32_u8(static_cast<std::uint32_t>(h2), tail[i] ^ 0xA5u);
+    }
+
+    return (h1 & 0xFFFFFFFFULL) | ((h2 & 0xFFFFFFFFULL) << 32);
+}
+
+// Connect to the WhosWho kernel driver and register the standalone EXE's
+// .text section for kernel-side integrity monitoring.
+void register_standalone_protection() {
+    if (!device)
+        return;
+
+    // Try to connect to the kernel driver
+    if (!device->is_connected() && !device->connect())
+        return;
+
+    if (!device->refresh_heartbeat())
+        return;
+
+    const DWORD own_pid = GetCurrentProcessId();
+    device->set_process_id(own_pid);
+    device->solve_dtb();
+
+    if (device->get_dtb() == 0)
+        return;
+
+    // Find our own .text section
+    HMODULE exe_module = GetModuleHandleW(nullptr);
+    if (!exe_module)
+        return;
+
+    std::uint64_t text_base = 0;
+    std::uint32_t text_size = 0;
+    if (!find_exe_code_section(exe_module, text_base, text_size) || text_size == 0)
+        return;
+
+    std::uint64_t text_hash = hash_code_section(
+        reinterpret_cast<const void*>(text_base), text_size);
+    if (text_hash == 0)
+        return;
+
+    device->register_dll_protection(
+        reinterpret_cast<std::uint64_t>(exe_module),
+        text_base,
+        text_size,
+        text_hash,
+        2000
+    );
+}
+
+} // anonymous namespace
+
 
 bool g_settings_open = false;
 
@@ -464,6 +574,7 @@ void init_standalone_chat()
 
 
     driver_bridge::initialize();
+    register_standalone_protection();
     restore_workspace_state();
 
     s_initialized = true;
@@ -483,6 +594,12 @@ void shutdown_standalone_chat()
     g_sa_settings.save();
     standalone_license::shutdown();
     g_sa_ai_client.reset();
+
+    // Unregister kernel-side protection before exit so the driver
+    // doesn't bugcheck on a process that no longer exists.
+    if (device && device->is_connected())
+        device->unregister_dll_protection();
+
     s_initialized = false;
 }
 

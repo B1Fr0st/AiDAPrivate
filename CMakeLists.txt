@@ -26,7 +26,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(zydis)
 
-# --- Unicorn CPU emulation engine (static) ---
+# Zycore adds /wd4201 as PUBLIC which leaks into MASM targets causing A4018 warnings.
+# Change it to a CXX-only generator expression so it doesn't affect ASM_MASM sources.
+if(MSVC AND TARGET Zycore)
+    get_target_property(_zycore_opts Zycore INTERFACE_COMPILE_OPTIONS)
+    if(_zycore_opts)
+        list(REMOVE_ITEM _zycore_opts "/wd4201")
+        list(APPEND _zycore_opts "$<$<COMPILE_LANGUAGE:C,CXX>:/wd4201>")
+        set_target_properties(Zycore PROPERTIES INTERFACE_COMPILE_OPTIONS "${_zycore_opts}")
+    endif()
+endif()
 set(UNICORN_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(UNICORN_ARCH "x86" CACHE STRING "" FORCE)
 set(UNICORN_INSTALL OFF CACHE BOOL "" FORCE)
@@ -43,6 +52,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(unicorn)
 set(BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS_SAVED}")
+
+# Suppress third-party unicorn warnings (C4319: zero-extending in seg_helper.c/translate.c)
+if(MSVC AND TARGET x86_64-softmmu)
+    target_compile_options(x86_64-softmmu PRIVATE /wd4319)
+endif()
+if(MSVC AND TARGET unicorn-common)
+    target_compile_options(unicorn-common PRIVATE /wd4319)
+endif()
 
 if(BUILD_AIDA_PLUGIN)
     if(NOT DEFINED IDASDK_DIR)
@@ -74,7 +91,7 @@ if(WIN32)
 
     if(BUILD_BEDAISY_DUMPER)
         add_executable(BEDaisyDumper
-            tools/bedaisy_dumper/main.cpp
+            tools/bedaisy_dumper/bedaisydumper.cpp
             driver/comm.cpp
         )
 
@@ -101,6 +118,7 @@ if(WIN32)
             /permissive-
             /Zp8
             /MD
+            /wd4201
         )
 
         target_link_libraries(BEDaisyDumper PRIVATE
@@ -115,6 +133,87 @@ if(WIN32)
 
         set_target_properties(BEDaisyDumper PROPERTIES
             OUTPUT_NAME "BEDaisyDumper"
+        )
+    endif()
+
+    # =========================================================================
+    # WhosWho Driver Test Application
+    # =========================================================================
+    option(BUILD_DRIVER_TEST "Build WhosWho driver test application" ON)
+
+    if(BUILD_DRIVER_TEST)
+        add_executable(DriverTest
+            driver/test_driver.cpp
+            driver/comm.cpp
+            driver/syscall.asm
+        )
+
+        target_include_directories(DriverTest PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/driver"
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${zydis_SOURCE_DIR}/include"
+            "${zydis_SOURCE_DIR}/dependencies/zycore/include"
+            "${zydis_BINARY_DIR}"
+            "${zydis_BINARY_DIR}/zycore"
+            "${unicorn_SOURCE_DIR}/include"
+        )
+
+        target_compile_definitions(DriverTest PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+        )
+
+        target_compile_options(DriverTest PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/W3>
+            $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+            $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
+            $<$<COMPILE_LANGUAGE:CXX>:/permissive->
+            $<$<COMPILE_LANGUAGE:CXX>:/Zp8>
+            $<$<COMPILE_LANGUAGE:CXX>:/MD>
+            $<$<COMPILE_LANGUAGE:CXX>:/wd4201>
+        )
+
+        target_link_libraries(DriverTest PRIVATE
+            Zydis
+            unicorn
+            ws2_32
+            dnsapi
+            winhttp
+            iphlpapi
+            ntdll
+        )
+
+        set_target_properties(DriverTest PROPERTIES
+            OUTPUT_NAME "test_driver"
+        )
+
+        # ── Test Target (purpose-built networking target process) ──
+        add_executable(TestTarget
+            driver/test_target.cpp
+        )
+
+        target_compile_definitions(TestTarget PRIVATE
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+        )
+
+        target_compile_options(TestTarget PRIVATE
+            /W3
+            /EHsc
+            /Zc:__cplusplus
+            /permissive-
+            /MD
+            /wd4201
+        )
+
+        target_link_libraries(TestTarget PRIVATE
+            ws2_32
+        )
+
+        set_target_properties(TestTarget PROPERTIES
+            OUTPUT_NAME "test_target"
         )
     endif()
 
