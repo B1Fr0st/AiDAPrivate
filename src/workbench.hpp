@@ -28,7 +28,6 @@
 #include <vector>
 
 class aida_plugin_t;
-class AiDAChatPanel;
 
 class AiDAWorkbenchPanel : public QWidget
 {
@@ -40,7 +39,6 @@ public:
         const QString& context_func_name);
     ~AiDAWorkbenchPanel() override = default;
 
-    AiDAChatPanel* query_panel() const;
     void set_context_function(ea_t ea, const QString& func_name);
 
     QSize sizeHint() const override;
@@ -119,8 +117,6 @@ private:
     QString        m_appliedStyleSheet;
 
     QTabWidget*    m_tabs;
-
-    AiDAChatPanel* m_queryPanel;
 
     QLabel*        m_explainContextLabel;
     QTextBrowser*  m_explainBrowser;

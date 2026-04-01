@@ -4,7 +4,6 @@
 #include "ida_utils.hpp"
 #include "graphrag.hpp"
 #include "analysis_db.hpp"
-#include "subagents.hpp"
 #include "ui.hpp"
 
 #ifdef __NT__
@@ -756,14 +755,12 @@ void aida_plugin_t::start_mcp_server()
     }
 
     mcp_server->write_mcp_client_configs();
-    subagents::register_local_instance(mcp_server->get_port());
 }
 
 void aida_plugin_t::stop_mcp_server()
 {
     if (mcp_server)
     {
-        subagents::unregister_local_instance(mcp_server->get_port());
         mcp_server->stop();
         mcp_server.reset();
     }
@@ -804,14 +801,10 @@ void aida_plugin_t::register_actions()
         {OBFSTR("ai_assistant:rename_all"), OBFSTR("Rename variables/functions..."), handle_rename_all, "Ctrl+Alt+R"},
         {OBFSTR("ai_assistant:scan_for_offsets"), OBFSTR("Scan for Engine Pointers (Coming Soon!)"), handle_scan_for_offsets, ""},
         {OBFSTR("ai_assistant:save_database_context"), OBFSTR("Save database context to file..."), handle_save_database_context, ""},
-        {OBFSTR("ai_assistant:open_chat"), OBFSTR("Open AiDA Workbench..."), handle_open_chat, "Ctrl+Alt+I"},
         {OBFSTR("ai_assistant:fix_analysis"), OBFSTR("Fix Analysis (Clean Decompilation)"), handle_fix_analysis, "Ctrl+Alt+F"},
         {OBFSTR("ai_assistant:cancel"), OBFSTR("Cancel AI Request"), handle_cancel_request, "Ctrl+Alt+Z"},
         {OBFSTR("ai_assistant:check_for_updates"), OBFSTR("Check for updates..."), handle_check_for_updates, ""},
         {OBFSTR("ai_assistant:toggle_mcp"), OBFSTR("Start MCP Server"), handle_toggle_mcp, ""},
-        {OBFSTR("ai_assistant:debug_analyze"), OBFSTR("AI Debugger Analysis"), handle_debug_analyze, "Ctrl+Alt+D"},
-        {OBFSTR("ai_assistant:debug_devirtualize"), OBFSTR("Devirtualize Function (AI)"), handle_debug_devirtualize, "Ctrl+Alt+V"},
-        {OBFSTR("ai_assistant:debug_trace_dispatch"), OBFSTR("Trace Virtual Dispatch (AI)"), handle_debug_trace_dispatch, "Ctrl+Alt+T"},
         {OBFSTR("ai_assistant:settings"), OBFSTR("Settings..."), handle_show_settings, "Ctrl+Alt+O"},
     };
 

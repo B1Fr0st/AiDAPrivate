@@ -1,6 +1,5 @@
 #include "aida_pro.hpp"
 #include <regex>
-#include "chat_widget.hpp"
 #include "anti_re.hpp"
 #include "ida_utils.hpp"
 
@@ -307,7 +306,7 @@ action_state_t idaapi action_handler::update(action_update_ctx_t* ctx)
     }
 
     if (action_func == handle_show_settings || action_func == handle_scan_for_offsets
-        || action_func == handle_check_for_updates || action_func == handle_open_chat
+        || action_func == handle_check_for_updates
         || action_func == handle_cancel_request || action_func == handle_save_database_context)
         return AST_ENABLE_ALWAYS;
 
@@ -1219,11 +1218,6 @@ void handle_check_for_updates(action_activation_ctx_t*, aida_plugin_t* plugin)
     }
 }
 
-void handle_open_chat(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
-{
-    chat_widget::open_chat(ctx, plugin);
-}
-
 void handle_fix_analysis(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
 {
     if (!can_use_ai(plugin)) return;
@@ -1310,134 +1304,4 @@ void handle_toggle_mcp(action_activation_ctx_t*, aida_plugin_t* plugin)
     if (!plugin)
         return;
     plugin->toggle_mcp_server();
-}
-
-void handle_debug_analyze(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
-{
-    if (!ensure_licensed_and_ready(plugin) || !can_use_ai(plugin))
-    {
-        return;
-    }
-
-    ea_t ea = ctx->cur_ea;
-    if (ea == BADADDR)
-    {
-        warning(OBFSTR_C("Place cursor on an address to analyze in debugger context."));
-        return;
-    }
-
-    std::string addr_str = agent_tools::helpers::format_address(ea);
-
-    std::string prompt =
-        OBFSTR("I need you to perform a deep AI-assisted debugger analysis at address ") + addr_str + OBFSTR(".\n\n")
-        + OBFSTR("Follow this workflow:\n")
-        + OBFSTR("1. Use `analyze_breakpoint_context` with address ") + addr_str + OBFSTR(" to gather the full execution context.\n")
-        + OBFSTR("2. Use `get_debugger_event_log` to check recent debugger events for relevant context.\n")
-        + OBFSTR("3. Use `decompile_function` on the function containing this address.\n")
-        + OBFSTR("4. Use `get_call_stack` to understand the execution path that led here.\n")
-        + OBFSTR("5. Use `get_registers` with mode 'all_current' to see the full register state.\n")
-        + OBFSTR("6. Analyze all gathered data and provide:\n")
-        + OBFSTR("   - What the code is doing at this exact point\n")
-        + OBFSTR("   - The values of key variables based on register/stack state\n")
-        + OBFSTR("   - Any suspicious patterns (anti-debug, VM handlers, obfuscation)\n")
-        + OBFSTR("   - Recommended next debugging steps (breakpoints to set, memory to watch)\n")
-        + OBFSTR("   - If virtualized code is detected, identify the VM dispatcher and handler table\n");
-
-    plugin->ai_client->agentic_chat(
-        ea,
-        prompt,
-        {},
-        [](const std::string& result) {
-            action_helpers::handle_ai_response(result,
-                "Debugger Analysis",
-                [](const std::string&) {});
-        });
-}
-
-void handle_debug_devirtualize(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
-{
-    if (!ensure_licensed_and_ready(plugin) || !can_use_ai(plugin))
-    {
-        return;
-    }
-
-    ea_t ea = ctx->cur_ea;
-    if (ea == BADADDR)
-    {
-        warning(OBFSTR_C("Place cursor on a virtualized function or VM entry point."));
-        return;
-    }
-
-    std::string addr_str = agent_tools::helpers::format_address(ea);
-
-    std::string prompt =
-        OBFSTR("I need you to devirtualize the code at address ") + addr_str + OBFSTR(".\n\n")
-        + OBFSTR("Follow this systematic devirtualization workflow:\n\n")
-        + OBFSTR("**Phase 1: VM Detection**\n")
-        + OBFSTR("1. Use `detect_vm_handler_pattern` at ") + addr_str + OBFSTR(" with scan_size=8192 to identify VM patterns.\n")
-        + OBFSTR("2. Use `decompile_function` to see the high-level structure.\n")
-        + OBFSTR("3. Use `get_basic_blocks` to understand the control flow.\n\n")
-        + OBFSTR("**Phase 2: Handler Table Discovery**\n")
-        + OBFSTR("4. If an indirect jump table is found, use `map_vm_handler_table` to enumerate all handlers.\n")
-        + OBFSTR("5. For each unique handler, use `decompile_function` to understand its operation.\n\n")
-        + OBFSTR("**Phase 3: Dynamic Analysis (if debugger is active)**\n")
-        + OBFSTR("6. Use `get_debugger_state` to check if debugger is running.\n")
-        + OBFSTR("7. If active, use `snapshot_execution_state` with label 'vm_entry' at the VM entry.\n")
-        + OBFSTR("8. Use `trace_virtual_dispatch` on the dispatch instruction to capture runtime targets.\n")
-        + OBFSTR("9. Use `snapshot_execution_state` with label 'vm_exit' after the VM exits.\n")
-        + OBFSTR("10. Use `compare_execution_states` to understand what the VM bytecode accomplished.\n\n")
-        + OBFSTR("**Phase 4: Reconstruction**\n")
-        + OBFSTR("11. Based on all gathered data, reconstruct the original logic:\n")
-        + OBFSTR("    - Map each VM opcode to its semantic operation\n")
-        + OBFSTR("    - Identify the virtual registers and their mappings to real registers\n")
-        + OBFSTR("    - Reconstruct the control flow (branches, loops, calls)\n")
-        + OBFSTR("    - Produce equivalent C pseudocode for the devirtualized function\n")
-        + OBFSTR("12. Add comments to the IDB using `set_comment` and `set_function_comment` to document findings.\n")
-        + OBFSTR("13. Rename the VM handlers using `rename_function` with descriptive names (e.g., vm_add, vm_push, vm_jmp).\n");
-
-    plugin->ai_client->agentic_chat(
-        ea,
-        prompt,
-        {},
-        [](const std::string& result) {
-            action_helpers::handle_ai_response(result,
-                "Devirtualization",
-                [](const std::string&) {});
-        });
-}
-
-void handle_debug_trace_dispatch(action_activation_ctx_t* ctx, aida_plugin_t* plugin)
-{
-    if (!ensure_licensed_and_ready(plugin) || !can_use_ai(plugin))
-    {
-        return;
-    }
-
-    ea_t ea = ctx->cur_ea;
-    if (ea == BADADDR)
-    {
-        warning(OBFSTR_C("Place cursor on an indirect call/jump instruction."));
-        return;
-    }
-
-    std::string addr_str = agent_tools::helpers::format_address(ea);
-
-    std::string prompt =
-        OBFSTR("Trace the virtual/indirect dispatch at address ") + addr_str + OBFSTR(".\n\n")
-        + OBFSTR("1. Use `trace_virtual_dispatch` at ") + addr_str + OBFSTR(" with depth=8 to discover runtime targets.\n")
-        + OBFSTR("2. For each discovered target, use `decompile_function` to understand what it does.\n")
-        + OBFSTR("3. Use `get_xrefs_to` on each target to find other callers.\n")
-        + OBFSTR("4. Summarize the dispatch table: which targets are called, what each does, and the likely vtable/interface being used.\n")
-        + OBFSTR("5. If this looks like a VM dispatcher, use `detect_vm_handler_pattern` to confirm.\n")
-        + OBFSTR("6. Add comments documenting the dispatch targets using `set_comment`.\n");
-
-    plugin->ai_client->agentic_chat(
-        ea,
-        prompt,
-        {},
-        [](const std::string& result) {
-            action_helpers::handle_ai_response(result,
-                "Dispatch Trace",
-                [](const std::string&) {});
-        });
 }

@@ -158,56 +158,9 @@ namespace search_tools
     void register_tools();
 }
 
-namespace debugger_tools
-{
-    tool_result_t get_debugger_state(const nlohmann::json& params);
-    tool_result_t start_process(const nlohmann::json& params);
-    tool_result_t exit_process(const nlohmann::json& params);
-    tool_result_t attach_process(const nlohmann::json& params);
-    tool_result_t detach_process(const nlohmann::json& params);
-    tool_result_t get_processes(const nlohmann::json& params);
-    tool_result_t continue_execution(const nlohmann::json& params);
-    tool_result_t run_to_address(const nlohmann::json& params);
-    tool_result_t step_into(const nlohmann::json& params);
-    tool_result_t step_over(const nlohmann::json& params);
-    tool_result_t step_out(const nlohmann::json& params);
-    tool_result_t suspend(const nlohmann::json& params);
-    tool_result_t wait_for_event(const nlohmann::json& params);
-    tool_result_t list_breakpoints(const nlohmann::json& params);
-    tool_result_t add_breakpoint(const nlohmann::json& params);
-    tool_result_t delete_breakpoint(const nlohmann::json& params);
-    tool_result_t toggle_breakpoint(const nlohmann::json& params);
-    tool_result_t set_breakpoint_condition(const nlohmann::json& params);
-    tool_result_t add_hardware_breakpoint(const nlohmann::json& params);
-    tool_result_t get_registers(const nlohmann::json& params);
-    tool_result_t set_register(const nlohmann::json& params);
-    tool_result_t get_call_stack(const nlohmann::json& params);
-    tool_result_t read_memory(const nlohmann::json& params);
-    tool_result_t write_memory(const nlohmann::json& params);
-    tool_result_t get_memory_map(const nlohmann::json& params);
-    tool_result_t get_threads(const nlohmann::json& params);
-    tool_result_t select_thread(const nlohmann::json& params);
-    tool_result_t suspend_thread(const nlohmann::json& params);
-    tool_result_t resume_thread(const nlohmann::json& params);
-    tool_result_t get_modules(const nlohmann::json& params);
-    tool_result_t enable_tracing(const nlohmann::json& params);
-    tool_result_t get_trace_events(const nlohmann::json& params);
-    tool_result_t get_trace_status(const nlohmann::json& params);
-    tool_result_t clear_trace_events(const nlohmann::json& params);
-    tool_result_t set_trace_size_tool(const nlohmann::json& params);
-    tool_result_t get_exceptions(const nlohmann::json& params);
-    tool_result_t set_debugger_options_tool(const nlohmann::json& params);
-    tool_result_t get_debugger_event_log(const nlohmann::json& params);
-    tool_result_t clear_debugger_event_log(const nlohmann::json& params);
-    tool_result_t analyze_breakpoint_context(const nlohmann::json& params);
-    tool_result_t trace_virtual_dispatch(const nlohmann::json& params);
-    tool_result_t snapshot_execution_state(const nlohmann::json& params);
-    tool_result_t compare_execution_states(const nlohmann::json& params);
-    tool_result_t detect_vm_handler_pattern(const nlohmann::json& params);
-    tool_result_t map_vm_handler_table(const nlohmann::json& params);
-
-    void register_tools();
-}
+// debugger_tools namespace REMOVED — all runtime debugging tools now live
+// exclusively in the standalone executable (debugger_tools_standalone.cpp).
+// The DLL plugin provides only static analysis capabilities.
 
 namespace segment_tools
 {
@@ -259,6 +212,8 @@ namespace analysis_tools
     tool_result_t resolve_api_hashes(const nlohmann::json& params);
     tool_result_t reconstruct_vtable(const nlohmann::json& params);
     tool_result_t classify_memory_pages(const nlohmann::json& params);
+    tool_result_t detect_vm_handler_pattern(const nlohmann::json& params);
+    tool_result_t map_vm_handler_table(const nlohmann::json& params);
     void register_tools();
 }
 
@@ -278,146 +233,6 @@ namespace deobfuscation_tools
     void register_tools();
 }
 
-namespace driver_tools
-{
-    tool_result_t driver_connect(const nlohmann::json& params);
-    tool_result_t driver_status(const nlohmann::json& params);
-    tool_result_t driver_attach(const nlohmann::json& params);
-    tool_result_t driver_unattach(const nlohmann::json& params);
-    tool_result_t driver_read_memory(const nlohmann::json& params);
-    tool_result_t driver_write_memory(const nlohmann::json& params);
-    tool_result_t driver_dump_module(const nlohmann::json& params);
-    tool_result_t driver_scan_pattern(const nlohmann::json& params);
-    tool_result_t driver_read_string(const nlohmann::json& params);
-    tool_result_t driver_read_pointer_chain(const nlohmann::json& params);
-    tool_result_t driver_enumerate_modules(const nlohmann::json& params);
-    tool_result_t driver_enumerate_kernel_modules(const nlohmann::json& params);
-    tool_result_t driver_dump_kernel_module(const nlohmann::json& params);
-    tool_result_t driver_read_kernel_memory(const nlohmann::json& params);
-    tool_result_t driver_write_kernel_memory(const nlohmann::json& params);
-    tool_result_t driver_allocate_memory(const nlohmann::json& params);
-    tool_result_t driver_free_memory(const nlohmann::json& params);
-    tool_result_t driver_call_function(const nlohmann::json& params);
-
-
-    tool_result_t driver_get_thread_context(const nlohmann::json& params);
-    tool_result_t driver_set_thread_context(const nlohmann::json& params);
-    tool_result_t driver_enumerate_threads(const nlohmann::json& params);
-    tool_result_t driver_suspend_thread(const nlohmann::json& params);
-    tool_result_t driver_resume_thread(const nlohmann::json& params);
-    tool_result_t driver_query_memory(const nlohmann::json& params);
-    tool_result_t driver_protect_memory(const nlohmann::json& params);
-    tool_result_t driver_enumerate_memory_regions(const nlohmann::json& params);
-    tool_result_t driver_read_peb(const nlohmann::json& params);
-    tool_result_t driver_spoof_debug_flags(const nlohmann::json& params);
-    tool_result_t driver_set_hw_breakpoint(const nlohmann::json& params);
-    tool_result_t driver_clear_hw_breakpoint(const nlohmann::json& params);
-    tool_result_t driver_resolve_export(const nlohmann::json& params);
-    tool_result_t driver_virtual_to_physical(const nlohmann::json& params);
-    tool_result_t driver_enum_kernel_callbacks(const nlohmann::json& params);
-    tool_result_t driver_detect_integrity_checks(const nlohmann::json& params);
-    tool_result_t driver_detect_ssdt_hooks(const nlohmann::json& params);
-    tool_result_t driver_enum_minifilters(const nlohmann::json& params);
-    tool_result_t driver_detect_etw_monitors(const nlohmann::json& params);
-    tool_result_t driver_detect_hidden_modules(const nlohmann::json& params);
-
-    tool_result_t driver_defer_action(const nlohmann::json& params);
-    tool_result_t driver_list_deferred_actions(const nlohmann::json& params);
-    tool_result_t driver_cancel_deferred_action(const nlohmann::json& params);
-    tool_result_t driver_get_deferred_results(const nlohmann::json& params);
-
-    tool_result_t driver_walk_heap(const nlohmann::json& params);
-    tool_result_t driver_enumerate_handles(const nlohmann::json& params);
-    tool_result_t driver_walk_seh_chain(const nlohmann::json& params);
-    tool_result_t driver_find_code_caves(const nlohmann::json& params);
-    tool_result_t driver_scan_memory_value(const nlohmann::json& params);
-    tool_result_t driver_pointer_scan(const nlohmann::json& params);
-    tool_result_t driver_enumerate_windows(const nlohmann::json& params);
-    tool_result_t driver_walk_stack(const nlohmann::json& params);
-    tool_result_t driver_assemble(const nlohmann::json& params);
-    tool_result_t driver_compare_memory_snapshot(const nlohmann::json& params);
-    tool_result_t driver_find_references(const nlohmann::json& params);
-    tool_result_t driver_read_teb(const nlohmann::json& params);
-    tool_result_t driver_map_peb_modules(const nlohmann::json& params);
-    tool_result_t driver_set_page_guard(const nlohmann::json& params);
-
-    void register_tools();
-
-
-    struct deferred_action_result_t
-    {
-        std::string action_type;
-        bool success = false;
-        std::string message;
-        nlohmann::json data;
-    };
-
-    enum class deferred_status
-    {
-        pending,
-        watching,
-        triggered,
-        completed,
-        failed,
-        cancelled,
-        timed_out
-    };
-
-    struct deferred_action_t
-    {
-        int id = 0;
-        std::string condition_type;
-        std::string target_name;
-
-        struct queued_tool_call_t
-        {
-            std::string tool_name;
-            nlohmann::json params;
-        };
-        std::vector<queued_tool_call_t> tool_calls;
-
-        int timeout_seconds = 300;
-        int poll_interval_ms = 50;
-
-        std::atomic<deferred_status> status{deferred_status::pending};
-        std::string trigger_info;
-        std::vector<deferred_action_result_t> results;
-        std::string error;
-        std::chrono::steady_clock::time_point created;
-        std::chrono::steady_clock::time_point triggered_at;
-    };
-
-    class DeferredActionManager
-    {
-    public:
-        static DeferredActionManager& instance();
-
-        int register_action(std::unique_ptr<deferred_action_t> action);
-        bool cancel_action(int id);
-        const deferred_action_t* get_action(int id) const;
-        std::vector<const deferred_action_t*> get_all_actions() const;
-        void shutdown();
-
-        bool poll_kernel_module_load(const std::string& target, std::uint64_t& out_base, std::uint32_t& out_size, std::string& out_name, std::string& out_path);
-        bool poll_process_start(const std::string& target, std::uint32_t& out_pid);
-
-    private:
-        DeferredActionManager() = default;
-        ~DeferredActionManager();
-
-        void watcher_thread_func(int action_id);
-        std::string resolve_template(const std::string& value, const nlohmann::json& context);
-        nlohmann::json resolve_params(const nlohmann::json& params, const nlohmann::json& context);
-        void execute_deferred_tools(deferred_action_t& action, const nlohmann::json& context);
-
-        mutable std::mutex _mutex;
-        std::map<int, std::unique_ptr<deferred_action_t>> _actions;
-        std::map<int, std::thread> _watchers;
-        int _next_id = 1;
-        std::atomic<bool> _shutdown{false};
-    };
-}
-
 namespace graphrag_tools
 {
     tool_result_t get_semantic_analysis(const nlohmann::json& params);
@@ -434,89 +249,6 @@ namespace graphrag_tools
     tool_result_t get_security_overview(const nlohmann::json& params);
     tool_result_t get_activity_analysis(const nlohmann::json& params);
     tool_result_t get_all_communities(const nlohmann::json& params);
-    void register_tools();
-}
-
-namespace network_tools
-{
-    tool_result_t network_enumerate_connections(const nlohmann::json& params);
-    tool_result_t network_start_capture(const nlohmann::json& params);
-    tool_result_t network_stop_capture(const nlohmann::json& params);
-    tool_result_t network_get_packets(const nlohmann::json& params);
-    tool_result_t network_analyze_packet(const nlohmann::json& params);
-    tool_result_t network_dns_log(const nlohmann::json& params);
-    tool_result_t network_add_filter(const nlohmann::json& params);
-    tool_result_t network_remove_filter(const nlohmann::json& params);
-    tool_result_t network_clear_filters(const nlohmann::json& params);
-    tool_result_t network_stats(const nlohmann::json& params);
-    tool_result_t network_capture_status(const nlohmann::json& params);
-    tool_result_t network_block_ip(const nlohmann::json& params);
-    tool_result_t network_block_port(const nlohmann::json& params);
-    tool_result_t network_block_process(const nlohmann::json& params);
-
-    tool_result_t network_deep_inspect(const nlohmann::json& params);
-    tool_result_t network_follow_tcp_stream(const nlohmann::json& params);
-    tool_result_t network_parse_http(const nlohmann::json& params);
-    tool_result_t network_parse_tls(const nlohmann::json& params);
-    tool_result_t network_enumerate_wfp_callouts(const nlohmann::json& params);
-    tool_result_t network_get_socket_handles(const nlohmann::json& params);
-    tool_result_t network_dump_tcpip(const nlohmann::json& params);
-    tool_result_t network_enumerate_interfaces(const nlohmann::json& params);
-    tool_result_t network_inject_packet(const nlohmann::json& params);
-    tool_result_t network_modify_packet_rule(const nlohmann::json& params);
-    tool_result_t network_list_mod_rules(const nlohmann::json& params);
-    tool_result_t network_redirect_traffic(const nlohmann::json& params);
-    tool_result_t network_list_redirect_rules(const nlohmann::json& params);
-    tool_result_t network_intercept(const nlohmann::json& params);
-    tool_result_t network_get_held_packets(const nlohmann::json& params);
-    tool_result_t network_release_packet(const nlohmann::json& params);
-    tool_result_t network_kill_connection(const nlohmann::json& params);
-    tool_result_t network_spoof_dns(const nlohmann::json& params);
-    tool_result_t network_list_dns_spoof_rules(const nlohmann::json& params);
-    tool_result_t network_bandwidth_monitor(const nlohmann::json& params);
-    tool_result_t network_bandwidth_per_process(const nlohmann::json& params);
-    tool_result_t network_os_fingerprint(const nlohmann::json& params);
-    tool_result_t network_export_pcap(const nlohmann::json& params);
-
-    void register_tools();
-}
-
-namespace net_security_tools
-{
-    tool_result_t tls_extract_keys(const nlohmann::json& params);
-    tool_result_t tls_start_keylog(const nlohmann::json& params);
-    tool_result_t tls_stop_keylog(const nlohmann::json& params);
-    tool_result_t tls_get_extracted_keys(const nlohmann::json& params);
-    tool_result_t cert_inject(const nlohmann::json& params);
-    tool_result_t cert_remove(const nlohmann::json& params);
-    tool_result_t cert_generate_ca(const nlohmann::json& params);
-    tool_result_t cert_list(const nlohmann::json& params);
-    tool_result_t pin_bypass(const nlohmann::json& params);
-    tool_result_t pin_bypass_revert(const nlohmann::json& params);
-    tool_result_t pin_bypass_status(const nlohmann::json& params);
-    tool_result_t quic_detect_connections(const nlohmann::json& params);
-    tool_result_t quic_decrypt_initial(const nlohmann::json& params);
-    tool_result_t quic_extract_keys(const nlohmann::json& params);
-    tool_result_t dtls_detect_sessions(const nlohmann::json& params);
-    tool_result_t dtls_extract_keys(const nlohmann::json& params);
-    tool_result_t autoresponder_add_rule(const nlohmann::json& params);
-    tool_result_t autoresponder_remove_rule(const nlohmann::json& params);
-    tool_result_t autoresponder_list_rules(const nlohmann::json& params);
-    tool_result_t autoresponder_start(const nlohmann::json& params);
-    tool_result_t autoresponder_stop(const nlohmann::json& params);
-    tool_result_t autoresponder_import_rules(const nlohmann::json& params);
-    tool_result_t autoresponder_export_rules(const nlohmann::json& params);
-    void register_tools();
-}
-
-namespace emulation_tools
-{
-    tool_result_t disassemble_zydis(const nlohmann::json& params);
-    tool_result_t driver_snapshot_and_emulate(const nlohmann::json& params);
-    tool_result_t trace_execution_unicorn(const nlohmann::json& params);
-    tool_result_t analyze_vm_handler(const nlohmann::json& params);
-    tool_result_t emulate_multi_trace(const nlohmann::json& params);
-    tool_result_t emulate_function(const nlohmann::json& params);
     void register_tools();
 }
 

@@ -1,6 +1,5 @@
 #include "aida_pro.hpp"
 #include "ida_utils.hpp"
-#include "subagents.hpp"
 
 #include <queue>
 #include <chrono>
@@ -52,14 +51,11 @@ struct mcp_tool_exec_request_t : public exec_request_t
     std::string tool_name;
     json tool_params;
     agent_tools::tool_result_t result;
-    std::shared_ptr<subagents::session_record_t> session;
-    uint64_t run_id = 0;
     uint64_t exec_ms = 0;
 
     ssize_t idaapi execute() override
     {
         auto t0 = std::chrono::steady_clock::now();
-        subagents::execution_context_scope_t scope(session, run_id);
 
         result = agent_tools::ToolRegistry::instance().execute_tool(tool_name, tool_params);
 
@@ -75,12 +71,9 @@ struct mcp_resource_exec_request_t : public exec_request_t
     std::string tool_name;
     json tool_params;
     agent_tools::tool_result_t result;
-    std::shared_ptr<subagents::session_record_t> session;
-    uint64_t run_id = 0;
 
     ssize_t idaapi execute() override
     {
-        subagents::execution_context_scope_t scope(session, run_id);
         result = agent_tools::ToolRegistry::instance().execute_tool(tool_name, tool_params);
         return 0;
     }
@@ -90,8 +83,6 @@ struct mcp_batch_exec_request_t : public exec_request_t
 {
     std::vector<std::pair<std::string, json>> calls;
     std::vector<agent_tools::tool_result_t> results;
-    std::shared_ptr<subagents::session_record_t> session;
-    uint64_t run_id = 0;
     bool include_rag = false;
     std::string rag_addr_str;
     json rag_result;
@@ -99,7 +90,6 @@ struct mcp_batch_exec_request_t : public exec_request_t
 
     ssize_t idaapi execute() override
     {
-        subagents::execution_context_scope_t scope(session, run_id);
 
         results.clear();
         results.reserve(calls.size());
@@ -300,30 +290,9 @@ static agent_tools::tool_result_t execute_tool_in_main_thread(
     if (!tool_def)
         return agent_tools::tool_result_t::error("Unknown tool: " + name);
 
-    bool is_session = subagents::is_session_tool_name(name);
-    bool is_remote = false;
-    {
-        subagents::execution_context_scope_t scope(subagents::current_session_record(), subagents::current_run_id());
-        is_remote = subagents::current_target_is_remote();
-    }
-
-
-    if (is_session || is_remote)
-    {
-        subagents::execution_context_scope_t scope(subagents::current_session_record(), subagents::current_run_id());
-        msg(OBFSTR_C("AiDA PERF: mcp routing tool=%s via worker (session=%d remote=%d)\n"),
-            name.c_str(), is_session ? 1 : 0, is_remote ? 1 : 0);
-        return agent_tools::ToolRegistry::instance().execute_tool(name, params);
-    }
-
-    msg(OBFSTR_C("AiDA PERF: mcp routing tool=%s via execute_sync (session=%d remote=%d)\n"),
-        name.c_str(), is_session ? 1 : 0, is_remote ? 1 : 0);
-
     mcp_tool_exec_request_t req;
     req.tool_name = name;
     req.tool_params = params;
-    req.session = subagents::current_session_record();
-    req.run_id = subagents::current_run_id();
 
     int mff_flag = tool_def->read_only ? MFF_READ : MFF_WRITE;
     auto sync_t0 = std::chrono::steady_clock::now();
@@ -351,8 +320,6 @@ static agent_tools::tool_result_t execute_resource_read(const mcp_resource_def_t
     mcp_resource_exec_request_t req;
     req.tool_name = rdef.backing_tool;
     req.tool_params = rdef.backing_params;
-    req.session = subagents::current_session_record();
-    req.run_id = subagents::current_run_id();
     execute_sync(req, MFF_READ);
     return req.result;
 }
@@ -807,8 +774,6 @@ static json handle_prompts_get(const json& id, const json& params)
             req.calls.push_back({"get_xrefs_to", {{"address", addr_str}}});
         req.include_rag = true;
         req.rag_addr_str = addr_str;
-        req.session = subagents::current_session_record();
-        req.run_id = subagents::current_run_id();
         execute_sync(req, MFF_READ);
 
         const auto& decomp_result = req.results[0];
@@ -878,8 +843,6 @@ static json handle_prompts_get(const json& id, const json& params)
         req.calls.push_back({"list_imports", json::object()});
         req.calls.push_back({"list_exports", json::object()});
         req.calls.push_back({"list_exports", json::object()});
-        req.session = subagents::current_session_record();
-        req.run_id = subagents::current_run_id();
         execute_sync(req, MFF_READ);
 
         const auto& info_result = req.results[0];
@@ -916,8 +879,6 @@ static json handle_prompts_get(const json& id, const json& params)
         req.calls.push_back({"get_address_info", {{"address", addr_str}}});
         req.include_rag = true;
         req.rag_addr_str = addr_str;
-        req.session = subagents::current_session_record();
-        req.run_id = subagents::current_run_id();
         execute_sync(req, MFF_READ);
 
         const auto& info_result = req.results[0];

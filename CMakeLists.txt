@@ -315,6 +315,15 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/standalone_ai_client.cpp"
             "${STANDALONE_ROOT}/core/standalone_chat.cpp"
             "${STANDALONE_ROOT}/core/standalone_license.cpp"
+            "${STANDALONE_ROOT}/core/driver_tools_standalone.cpp"
+            "${STANDALONE_ROOT}/core/network_tools_standalone.cpp"
+            "${STANDALONE_ROOT}/core/net_security_tools_standalone.cpp"
+            "${STANDALONE_ROOT}/core/emulation_tools_standalone.cpp"
+            "${STANDALONE_ROOT}/core/code_editor.cpp"
+            "${STANDALONE_ROOT}/core/disasm_view.cpp"
+            "${STANDALONE_ROOT}/core/chat_render.cpp"
+            "${STANDALONE_ROOT}/core/mcp_client.cpp"
+            "${STANDALONE_ROOT}/core/debugger_tools_standalone.cpp"
             src/driver_loader.cpp
             driver/comm.cpp
             src/net_security.cpp
@@ -486,11 +495,8 @@ endif()
 set(AIDA_SOURCES
     src/actions.cpp
     src/agent_tools.cpp
-    src/agentic.cpp
     src/aida.cpp
     src/ai_client.cpp
-    src/chat_widget.cpp
-    src/chat_widget_ui.cpp
     src/context_manager.cpp
     src/graphrag.cpp
     src/ida_utils.cpp
@@ -514,14 +520,11 @@ endif()
 set(AIDA_HEADERS
     src/actions.hpp
     src/agent_tools.hpp
-    src/agentic.hpp
     src/aida.hpp
     src/aida_pro.hpp
     src/ai_client.hpp
     src/analysis_db.hpp
     src/anti_re.hpp
-    src/chat_widget.hpp
-    src/chat_widget_ui.hpp
     src/context_manager.hpp
     src/graphrag.hpp
     src/ida_utils.hpp

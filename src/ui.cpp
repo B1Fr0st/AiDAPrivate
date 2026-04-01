@@ -2425,7 +2425,6 @@ static int idaapi finish_populating_widget_popup(TWidget* widget, TPopupMenu* po
         { "ai_assistant:gen_hook",     "Generate/" },
         { nullptr,                     nullptr },
         { "ai_assistant:scan_for_offsets", "" },
-        { "ai_assistant:open_chat",      "" },
         { "ai_assistant:fix_analysis",   "Analyze/" },
         { "ai_assistant:cancel",           "" },
         { "ai_assistant:copy_context", "" },

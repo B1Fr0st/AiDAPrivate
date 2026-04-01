@@ -26,7 +26,6 @@
 
 #include "analysis_db.hpp"
 #include "actions.hpp"
-#include "chat_widget_ui.hpp"
 #include "graphrag.hpp"
 #include "ui.hpp"
 
@@ -36,11 +35,10 @@ namespace
 enum workbench_tab_index_t
 {
     TAB_EXPLAIN = 0,
-    TAB_QUERY = 1,
-    TAB_ACTIONS = 2,
-    TAB_GRAPH = 3,
-    TAB_RAG = 4,
-    TAB_SETTINGS = 5,
+    TAB_ACTIONS = 1,
+    TAB_GRAPH = 2,
+    TAB_RAG = 3,
+    TAB_SETTINGS = 4,
 };
 
 static uint64_t now_ms()
@@ -734,7 +732,6 @@ AiDAWorkbenchPanel::AiDAWorkbenchPanel(
     , m_visualRefreshQueued(false)
     , m_appliedStyleSheet()
     , m_tabs(nullptr)
-    , m_queryPanel(nullptr)
     , m_explainContextLabel(nullptr)
     , m_explainBrowser(nullptr)
     , m_explainDetailsBrowser(nullptr)
@@ -791,11 +788,6 @@ AiDAWorkbenchPanel::AiDAWorkbenchPanel(
     refresh_all_tabs();
 }
 
-AiDAChatPanel* AiDAWorkbenchPanel::query_panel() const
-{
-    return m_queryPanel;
-}
-
 QSize AiDAWorkbenchPanel::sizeHint() const
 {
     return QSize(380, 600);
@@ -812,9 +804,6 @@ void AiDAWorkbenchPanel::set_context_function(ea_t ea, const QString& func_name)
 
     m_contextEa = ea;
     m_contextFuncName = func_name;
-
-    if (m_queryPanel != nullptr)
-        m_queryPanel->setContextFunction(ea, func_name);
 
     if (!context_changed)
         return;
@@ -837,14 +826,6 @@ void AiDAWorkbenchPanel::build_ui()
     root->addWidget(m_tabs, 1);
 
     build_explain_tab();
-
-    QWidget* queryTab = new QWidget(m_tabs);
-    QVBoxLayout* queryLayout = new QVBoxLayout(queryTab);
-    queryLayout->setContentsMargins(2, 2, 2, 2);
-    queryLayout->setSpacing(2);
-    m_queryPanel = new AiDAChatPanel(queryTab, m_plugin, m_contextEa, m_contextFuncName);
-    queryLayout->addWidget(m_queryPanel);
-    m_tabs->addTab(queryTab, QStringLiteral("Query"));
 
     build_actions_tab();
     build_graph_tab();
@@ -1148,10 +1129,6 @@ void AiDAWorkbenchPanel::refresh_tab_by_index(int index)
     {
     case TAB_EXPLAIN:
         refresh_explain_tab();
-        break;
-    case TAB_QUERY:
-        if (m_queryPanel != nullptr)
-            m_queryPanel->setContextFunction(m_contextEa, m_contextFuncName);
         break;
     case TAB_ACTIONS:
         refresh_actions_tab();

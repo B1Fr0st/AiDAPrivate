@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include "mcp_standalone.hpp"
+#include "standalone_tools_fwd.hpp"
 #include "sandbox.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
@@ -720,5 +721,12 @@ namespace mcp_standalone
         srv.register_tool({"web_search", "Search the web using DuckDuckGo Instant Answer API.",
             {{"query", "string", "Search query text", true}, {"max_results", "number", "Maximum results to return (default 5)", false}},
             true, handle_web_search});
+
+        // Ported advanced tools from the DLL plugin:
+        driver_tools::register_driver_tools(srv);
+        network_tools::register_network_tools(srv);
+        net_security_tools::register_net_security_tools(srv);
+        emulation_tools::register_emulation_tools(srv);
+        debugger_tools::register_debugger_tools(srv);
     }
 }

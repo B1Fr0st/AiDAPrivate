@@ -1344,7 +1344,7 @@ int main() {
     strcat_s(exe_path, "test_target.exe");
 
     bool launched = false;
-    std::uint32_t target_pid = find_test_target_pid();
+    std::uint32_t target_pid = find_target_pid();
 
     if (target_pid != 0) {
         printf("[INFO] test_target.exe already running (pid=%u)\n", target_pid);
