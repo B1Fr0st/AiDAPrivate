@@ -61,4 +61,10 @@ void on_text_changed();
 
 void get_caret(int& line, int& col);
 
+
+void trigger_undo();
+void trigger_redo();
+void open_find();
+void open_replace();
+
 }

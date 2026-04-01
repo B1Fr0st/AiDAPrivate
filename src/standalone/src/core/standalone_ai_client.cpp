@@ -4,6 +4,7 @@
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
+#include "../helpers/globals.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -421,49 +422,161 @@ std::string standalone_ai_client_t::generate_anthropic(
         if (pos != std::string::npos) { clean_model.erase(pos); break; }
     }
 
+    // Build system prompt block with optional prompt caching
+    json system_block = {
+        {"type", "text"},
+        {"text", "You are AiDA, an advanced reverse engineering assistant. Be precise and technical."}
+    };
+    if (_settings.prompt_caching) {
+        system_block["cache_control"] = {{"type", "ephemeral"}};
+    }
+
     json body = {
         {"model", clean_model},
         {"max_tokens", 16384},
         {"messages", json::array({
             {{"role", "user"}, {"content", prompt}}
         })},
-        {"system", "You are AiDA, an advanced reverse engineering assistant. Be precise and technical."},
+        {"system", json::array({system_block})},
         {"stream", on_chunk != nullptr}
     };
 
-
-    if (clean_model.find("thought") == std::string::npos)
+    // Extended thinking support
+    if (_settings.thinking_enabled) {
+        json thinking_cfg = {
+            {"type", "enabled"},
+            {"budget_tokens", (std::max)(_settings.thinking_budget, 1024)}
+        };
+        body["thinking"] = thinking_cfg;
+        // When thinking is enabled, temperature must not be set (API requirement)
+    } else if (clean_model.find("thought") == std::string::npos) {
         body["temperature"] = temperature;
+    }
 
     std::map<std::string, std::string> headers = _settings.get_active_headers();
     headers["x-api-key"] = _settings.get_active_api_key();
     headers["anthropic-version"] = "2023-06-01";
     headers["Content-Type"] = "application/json";
 
+    // Build anthropic-beta header with all enabled features
+    std::string beta_features;
+    auto add_beta = [&](const char* feature) {
+        if (!beta_features.empty()) beta_features += ",";
+        beta_features += feature;
+    };
+
+    if (_settings.thinking_enabled)
+        add_beta("interleaved-thinking-2025-05-14");
+    if (_settings.prompt_caching)
+        add_beta("prompt-caching-scope-2026-01-05");
+    if (_settings.web_search_enabled)
+        add_beta("web-search-2025-03-05");
+    if (_settings.task_budget_tokens > 0)
+        add_beta("task-budgets-2026-03-13");
+
+    // Effort control beta + body field
+    if (_settings.effort_level >= 0 && _settings.effort_level <= 3) {
+        add_beta("effort-2025-11-24");
+        static const char* effort_names[] = {"low", "medium", "high", "max"};
+        body["effort"] = {{"level", effort_names[_settings.effort_level]}};
+    }
+
+    // Token-efficient tool schemas
+    add_beta("token-efficient-tools-2026-03-28");
+
+    if (!beta_features.empty())
+        headers["anthropic-beta"] = beta_features;
+
+    // Task budget in body
+    if (_settings.task_budget_tokens > 0) {
+        body["task_budget"] = {{"total", _settings.task_budget_tokens}};
+    }
+
     if (on_chunk) {
-        return streaming_post(base_url, "/v1/messages", headers, body.dump(),
-            [](const std::string& sse_data) -> std::string {
+        // Streaming: parse thinking blocks + text blocks + usage
+        std::string thinking_text;
+        int64_t in_tokens = 0, out_tokens = 0, cache_read = 0, cache_write = 0;
+
+        auto result = streaming_post(base_url, "/v1/messages", headers, body.dump(),
+            [&](const std::string& sse_data) -> std::string {
                 auto j = json::parse(sse_data, nullptr, false);
                 if (j.is_discarded()) return "";
                 try {
                     std::string type = j.value("type", "");
+
+                    // Track usage from message_start and message_delta events
+                    if (type == "message_start" && j.contains("message")) {
+                        auto& usage = j["message"]["usage"];
+                        if (usage.is_object()) {
+                            in_tokens = usage.value("input_tokens", (int64_t)0);
+                            cache_read = usage.value("cache_read_input_tokens", (int64_t)0);
+                            cache_write = usage.value("cache_creation_input_tokens", (int64_t)0);
+                        }
+                    }
+                    if (type == "message_delta" && j.contains("usage")) {
+                        out_tokens = j["usage"].value("output_tokens", (int64_t)0);
+                    }
+
                     if (type == "content_block_delta") {
                         auto& delta = j["delta"];
-                        if (delta.value("type", "") == "text_delta")
+                        std::string delta_type = delta.value("type", "");
+                        if (delta_type == "text_delta")
                             return delta["text"].get<std::string>();
+                        if (delta_type == "thinking_delta") {
+                            thinking_text += delta["thinking"].get<std::string>();
+                            // Emit thinking as a special marker for the chat UI
+                            return "\x01THINK:" + delta["thinking"].get<std::string>();
+                        }
                     }
                 } catch (...) {}
                 return "";
             }, on_chunk, stop_check);
+
+        // Accumulate cost tracking
+        cost_tracking::session_input_tokens += in_tokens;
+        cost_tracking::session_output_tokens += out_tokens;
+        cost_tracking::session_cache_read += cache_read;
+        cost_tracking::session_cache_write += cache_write;
+        cost_tracking::session_request_count++;
+        cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
+            clean_model, in_tokens, out_tokens, cache_read, cache_write);
+
+        return result;
     }
 
+    // Non-streaming: parse complete response
     return simple_post(base_url, "/v1/messages", headers, body.dump(),
-        [](const json& j) -> std::string {
+        [&](const json& j) -> std::string {
             std::string text;
+            std::string thinking;
+
             for (auto& block : j["content"]) {
-                if (block.value("type", "") == "text")
+                std::string btype = block.value("type", "");
+                if (btype == "text")
                     text += block["text"].get<std::string>();
+                else if (btype == "thinking")
+                    thinking += block["thinking"].get<std::string>();
             }
+
+            // Track usage
+            if (j.contains("usage") && j["usage"].is_object()) {
+                auto& usage = j["usage"];
+                int64_t in_t = usage.value("input_tokens", (int64_t)0);
+                int64_t out_t = usage.value("output_tokens", (int64_t)0);
+                int64_t cr = usage.value("cache_read_input_tokens", (int64_t)0);
+                int64_t cw = usage.value("cache_creation_input_tokens", (int64_t)0);
+                cost_tracking::session_input_tokens += in_t;
+                cost_tracking::session_output_tokens += out_t;
+                cost_tracking::session_cache_read += cr;
+                cost_tracking::session_cache_write += cw;
+                cost_tracking::session_request_count++;
+                cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
+                    clean_model, in_t, out_t, cr, cw);
+            }
+
+            // If thinking content, prepend as special marker
+            if (!thinking.empty())
+                return "\x01THINK:" + thinking + "\x01ENDTHINK\n" + text;
             return text;
         });
 }

@@ -53,6 +53,11 @@ struct ChatMessage {
 	bool is_user = false;
 	bool has_thinking = false;
 	bool streaming = false;
+	int64_t timestamp = 0;     // time_t epoch
+	int input_tokens = 0;
+	int output_tokens = 0;
+	int cache_read_tokens = 0;
+	int cache_write_tokens = 0;
 };
 
 inline bool  g_dummy_triggered = false;
@@ -64,6 +69,26 @@ inline char                     g_chat_buf[4096] = {};
 inline bool                     g_chat_scroll_to_bottom = false;
 inline float g_chat_demo_timer = 0.f;
 inline int   g_chat_demo_stage = 0;
+
+struct ConversationSummary {
+	std::string id;        // filename stem (timestamp-based)
+	std::string title;     // first user message preview
+	int64_t     created = 0;
+	int         msg_count = 0;
+};
+
+namespace conversations {
+	inline std::vector<ConversationSummary> history;
+	inline std::string current_id;
+	inline bool browser_open = false;
+
+	std::string get_storage_dir();
+	void save_current();
+	void load_conversation(const std::string& id);
+	void new_chat();
+	void refresh_history();
+	void delete_conversation(const std::string& id);
+}
 
 
 void tick_ai_chat();
@@ -295,6 +320,34 @@ namespace globals
 		inline bool command_palette_open = false;
 		inline char command_palette_buf[128] = {};
 
+		// Process attach dialog
+		inline bool process_attach_open = false;
+		inline char process_filter_buf[128] = {};
+
+		// Driver status dialog
+		inline bool driver_status_open = false;
+
+		// Keyboard shortcuts dialog
+		inline bool shortcuts_dialog_open = false;
+
+		// Find bar state
+		inline bool find_bar_open = false;
+		inline char find_buf[256] = {};
+		inline char replace_buf[256] = {};
+		inline bool find_case_sensitive = false;
+		inline bool find_whole_word = false;
+		inline bool find_regex = false;
+		inline bool find_show_replace = false;
+		inline int  find_match_count = 0;
+		inline int  find_current_match = -1;
+		inline std::vector<int> find_match_positions;
+
+		// MCP servers dialog (separate from settings popup)
+		inline bool mcp_servers_dialog_open = false;
+
+		// About dialog
+		inline bool about_dialog_open = false;
+
 
 		inline std::string status_file_info;
 		inline std::string status_driver_info;
@@ -420,6 +473,57 @@ namespace editor_config {
 	inline float font_size              = 14.0f;
 	inline bool  auto_complete          = true;
 	inline bool  highlight_current_line = true;
+	inline bool  word_wrap              = false;
+	inline bool  minimap                = false;
+	inline bool  bracket_match          = true;
+}
+
+
+namespace cost_tracking {
+	inline int64_t session_input_tokens   = 0;
+	inline int64_t session_output_tokens  = 0;
+	inline int64_t session_cache_read     = 0;
+	inline int64_t session_cache_write    = 0;
+	inline int64_t session_thinking_tokens = 0;
+	inline double  session_cost_usd       = 0.0;
+	inline int     session_request_count  = 0;
+
+	inline void reset() {
+		session_input_tokens = session_output_tokens = 0;
+		session_cache_read = session_cache_write = 0;
+		session_thinking_tokens = 0;
+		session_cost_usd = 0.0;
+		session_request_count = 0;
+	}
+
+	inline double estimate_cost(const std::string& model, int64_t in_tok, int64_t out_tok,
+	                            int64_t cache_read = 0, int64_t cache_write = 0) {
+		// prices per 1M tokens (USD) — approximate
+		double in_price = 3.0, out_price = 15.0;
+		double cache_read_price = 0.30, cache_write_price = 3.75;
+		if (model.find("opus") != std::string::npos || model.find("gpt-5") != std::string::npos) {
+			in_price = 15.0; out_price = 75.0; cache_read_price = 1.50; cache_write_price = 18.75;
+		} else if (model.find("sonnet-4") != std::string::npos || model.find("gpt-4.1") != std::string::npos ||
+		           model.find("4o") != std::string::npos) {
+			in_price = 3.0; out_price = 15.0; cache_read_price = 0.30; cache_write_price = 3.75;
+		} else if (model.find("mini") != std::string::npos || model.find("flash") != std::string::npos ||
+		           model.find("nano") != std::string::npos || model.find("haiku") != std::string::npos) {
+			in_price = 0.25; out_price = 1.25; cache_read_price = 0.025; cache_write_price = 0.30;
+		} else if (model.find("gemini") != std::string::npos && model.find("pro") != std::string::npos) {
+			in_price = 1.25; out_price = 10.0; cache_read_price = 0.315; cache_write_price = 4.50;
+		} else if (model.find("local") != std::string::npos || model.find("llama") != std::string::npos ||
+		           model.find("ollama") != std::string::npos || model.find("127.0.0.1") != std::string::npos) {
+			return 0.0;
+		}
+		return (in_tok * in_price + out_tok * out_price +
+		        cache_read * cache_read_price + cache_write * cache_write_price) / 1000000.0;
+	}
+
+	inline std::string format_tokens(int64_t count) {
+		if (count >= 1000000) return std::to_string(count / 1000000) + "." + std::to_string((count % 1000000) / 100000) + "M";
+		if (count >= 1000) return std::to_string(count / 1000) + "." + std::to_string((count % 1000) / 100) + "K";
+		return std::to_string(count);
+	}
 }
 
 

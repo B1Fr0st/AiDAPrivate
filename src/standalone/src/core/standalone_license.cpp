@@ -82,8 +82,33 @@ namespace
             std::vector<unsigned char> buffer(len);
             auto* info = reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data());
             if (GetAdaptersInfo(info, &len) == NO_ERROR && info) {
-                for (UINT i = 0; i < info->AddressLength; ++i)
-                    mix(info->Address[i]);
+                // Collect all physical adapter MACs, sort for stability
+                std::vector<std::string> macs;
+                for (auto* a = info; a; a = a->Next) {
+                    if (a->AddressLength == 0 || a->Type == MIB_IF_TYPE_LOOPBACK)
+                        continue;
+                    // Skip common virtual adapters
+                    std::string desc(a->Description);
+                    bool is_virtual = false;
+                    const char* virt_keywords[] = { "Virtual", "VPN", "Hyper-V", "VMware", "VirtualBox", "TAP-", "Tunnel" };
+                    for (const char* kw : virt_keywords) {
+                        if (desc.find(kw) != std::string::npos) { is_virtual = true; break; }
+                    }
+                    if (is_virtual) continue;
+                    std::string mac_str;
+                    for (UINT i = 0; i < a->AddressLength; ++i) {
+                        char hex[4];
+                        snprintf(hex, sizeof(hex), "%02X", a->Address[i]);
+                        mac_str += hex;
+                    }
+                    macs.push_back(mac_str);
+                }
+                std::sort(macs.begin(), macs.end());
+                // Mix the first physical adapter MAC (deterministic after sort)
+                if (!macs.empty()) {
+                    for (char c : macs.front())
+                        mix(static_cast<uint64_t>(c));
+                }
             }
         }
 
@@ -240,9 +265,22 @@ namespace
         }
 
         if (payload.value("status", "") != "valid" ||
-            payload.value("license_key", "") != settings.license_key ||
-            payload.value("hwid", "") != hwid) {
-            error_out = "Cached license is bound to a different device or key.";
+            payload.value("license_key", "") != settings.license_key) {
+            error_out = "Cached license is bound to a different key.";
+            return false;
+        }
+
+        // HWID mismatch: try online revalidation before failing
+        if (payload.value("hwid", "") != hwid) {
+            const std::string nonce = generate_nonce();
+            json response;
+            std::string revalidate_err;
+            if (call_validation_endpoint(settings, "validate", settings.license_key,
+                                         hwid, {}, nonce, revalidate_err, response)) {
+                apply_valid_response(settings, settings.license_key, hwid, response);
+                return true;
+            }
+            error_out = "HWID changed; online revalidation failed: " + revalidate_err;
             return false;
         }
 

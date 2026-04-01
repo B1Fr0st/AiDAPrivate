@@ -20,6 +20,9 @@
 #include "../core/disasm_view.hpp"
 #include "../core/hex_view.hpp"
 #include "../core/chat_render.hpp"
+#include "../core/standalone_driver.hpp"
+#include "../core/mcp_client.hpp"
+#include "../core/sandbox.hpp"
 
 static ID3D11ShaderResourceView* g_send_icon_srv    = nullptr;
 static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
@@ -422,6 +425,135 @@ void helpers::add_key(const char* label, CKeybind* keybind)
 
 	if (menu_open[keybind] && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !hovered)
 		menu_open[keybind] = false;
+}
+
+// --- Conversation persistence ---
+#include <filesystem>
+#include <shlobj.h>
+
+std::string conversations::get_storage_dir()
+{
+	wchar_t* appdata = nullptr;
+	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata))) {
+		auto p = std::filesystem::path(appdata) / L"AiDA" / L"Standalone" / L"conversations";
+		CoTaskMemFree(appdata);
+		std::filesystem::create_directories(p);
+		return p.string();
+	}
+	return {};
+}
+
+void conversations::save_current()
+{
+	if (g_chat_messages.empty()) return;
+	std::string dir = get_storage_dir();
+	if (dir.empty()) return;
+
+	if (current_id.empty()) {
+		auto now = std::chrono::system_clock::now().time_since_epoch();
+		current_id = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+	}
+
+	nlohmann::json j;
+	j["id"] = current_id;
+	std::string title;
+	for (auto& m : g_chat_messages) {
+		if (m.is_user && !m.text.empty()) {
+			title = m.text.substr(0, 80);
+			break;
+		}
+	}
+	j["title"] = title;
+	j["created"] = g_chat_messages.front().timestamp;
+	nlohmann::json msgs = nlohmann::json::array();
+	for (auto& m : g_chat_messages) {
+		nlohmann::json mj;
+		mj["text"] = m.text;
+		mj["thinking_text"] = m.thinking_text;
+		mj["is_user"] = m.is_user;
+		mj["has_thinking"] = m.has_thinking;
+		mj["timestamp"] = m.timestamp;
+		mj["input_tokens"] = m.input_tokens;
+		mj["output_tokens"] = m.output_tokens;
+		mj["cache_read_tokens"] = m.cache_read_tokens;
+		mj["cache_write_tokens"] = m.cache_write_tokens;
+		msgs.push_back(mj);
+	}
+	j["messages"] = msgs;
+
+	std::string path = dir + "\\" + current_id + ".json";
+	std::ofstream ofs(path, std::ios::trunc);
+	if (ofs.is_open()) ofs << j.dump(2);
+}
+
+void conversations::load_conversation(const std::string& id)
+{
+	std::string dir = get_storage_dir();
+	if (dir.empty()) return;
+	std::string path = dir + "\\" + id + ".json";
+	std::ifstream ifs(path);
+	if (!ifs.is_open()) return;
+	auto j = nlohmann::json::parse(ifs, nullptr, false);
+	if (j.is_discarded() || !j.is_object()) return;
+
+	g_chat_messages.clear();
+	current_id = j.value("id", id);
+	for (auto& mj : j.value("messages", nlohmann::json::array())) {
+		ChatMessage m;
+		m.text = mj.value("text", "");
+		m.thinking_text = mj.value("thinking_text", "");
+		m.is_user = mj.value("is_user", false);
+		m.has_thinking = mj.value("has_thinking", false);
+		m.streaming = false;
+		m.timestamp = mj.value("timestamp", (int64_t)0);
+		m.input_tokens = mj.value("input_tokens", 0);
+		m.output_tokens = mj.value("output_tokens", 0);
+		m.cache_read_tokens = mj.value("cache_read_tokens", 0);
+		m.cache_write_tokens = mj.value("cache_write_tokens", 0);
+		g_chat_messages.push_back(m);
+	}
+	g_chat_scroll_to_bottom = true;
+}
+
+void conversations::new_chat()
+{
+	save_current();
+	g_chat_messages.clear();
+	g_chat_buf[0] = '\0';
+	current_id.clear();
+	g_chat_scroll_to_bottom = true;
+	refresh_history();
+}
+
+void conversations::refresh_history()
+{
+	history.clear();
+	std::string dir = get_storage_dir();
+	if (dir.empty()) return;
+	for (auto& entry : std::filesystem::directory_iterator(dir)) {
+		if (!entry.is_regular_file()) continue;
+		if (entry.path().extension() != ".json") continue;
+		std::ifstream ifs(entry.path());
+		auto j = nlohmann::json::parse(ifs, nullptr, false);
+		if (j.is_discarded() || !j.is_object()) continue;
+		ConversationSummary s;
+		s.id = j.value("id", entry.path().stem().string());
+		s.title = j.value("title", "Untitled");
+		s.created = j.value("created", (int64_t)0);
+		auto msgs = j.value("messages", nlohmann::json::array());
+		s.msg_count = (int)msgs.size();
+		history.push_back(s);
+	}
+	std::sort(history.begin(), history.end(), [](auto& a, auto& b) { return a.created > b.created; });
+}
+
+void conversations::delete_conversation(const std::string& id)
+{
+	std::string dir = get_storage_dir();
+	if (dir.empty()) return;
+	std::string path = dir + "\\" + id + ".json";
+	std::filesystem::remove(path);
+	refresh_history();
 }
 
 void helpers::render_title()
@@ -1730,15 +1862,23 @@ void helpers::render_title()
 					}
 					case 1:
 					{
-						menu_item("Undo",    "Ctrl+Z", false);
-						menu_item("Redo",    "Ctrl+Y", false);
+						if (menu_item("Undo",    "Ctrl+Z", code_editor::active)) {
+							code_editor_widget::trigger_undo();
+						}
+						if (menu_item("Redo",    "Ctrl+Y", code_editor::active)) {
+							code_editor_widget::trigger_redo();
+						}
 						menu_sep();
 						menu_item("Cut",     "Ctrl+X", false);
 						menu_item("Copy",    "Ctrl+C", false);
 						menu_item("Paste",   "Ctrl+V", false);
 						menu_sep();
-						menu_item("Find",    "Ctrl+F", false);
-						menu_item("Replace", "Ctrl+H", false);
+						if (menu_item("Find",    "Ctrl+F", code_editor::active)) {
+							code_editor_widget::open_find();
+						}
+						if (menu_item("Replace", "Ctrl+H", code_editor::active)) {
+							code_editor_widget::open_replace();
+						}
 						break;
 					}
 					case 2:
@@ -1773,31 +1913,36 @@ void helpers::render_title()
 								if (g_disasm.file.loaded) disasm::decode_section(g_disasm.file);
 							}
 						}
-						menu_item("Attach to Process...", "", false);
+						if (menu_item("Attach to Process...", "")) {
+							globals::ui::process_attach_open = true;
+						}
 						menu_sep();
 						if (menu_item("MCP Servers", "")) {
 							g_settings_open = true;
 						}
-						menu_item("Driver Status", "", false);
+						if (menu_item("Driver Status", "")) {
+							globals::ui::driver_status_open = true;
+						}
 						break;
 					}
 					case 4:
 					{
 						if (menu_item("New Chat", "Ctrl+L")) {
-							g_chat_messages.clear();
+							conversations::new_chat();
 						}
 						if (menu_item("Model Settings", "")) {
 							g_settings_open = true;
-						}
-						if (menu_item("Clear History", "")) {
-							g_chat_messages.clear();
 						}
 						break;
 					}
 					case 5:
 					{
-						menu_item("About", "");
-						menu_item("Keyboard Shortcuts", "Ctrl+K Ctrl+S", false);
+						if (menu_item("About", "")) {
+							globals::ui::about_dialog_open = true;
+						}
+						if (menu_item("Keyboard Shortcuts", "Ctrl+K Ctrl+S")) {
+							globals::ui::shortcuts_dialog_open = true;
+						}
 						break;
 					}
 					}
@@ -1838,7 +1983,11 @@ void helpers::render_title()
 				g_sa_settings.workspace.bottom_visible = globals::ui::panel_bottom_visible;
 			}
 			if (ImGui::IsKeyPressed(ImGuiKey_L)) {
-				g_chat_messages.clear();
+				conversations::new_chat();
+			}
+			if (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_P)) {
+				globals::ui::command_palette_open = !globals::ui::command_palette_open;
+				globals::ui::command_palette_buf[0] = '\0';
 			}
 		}
 	}
@@ -2134,15 +2283,74 @@ void helpers::render_title()
 
 	{
 
-		ImVec2 ib_ts = ImGui::CalcTextSize("Index Binary");
-		float  ib_ty = r2_cy - ib_ts.y * 0.5f;
-		wdl->AddText(ImVec2(hx0 + hdr_pad, ib_ty),
-			IM_COL32(255,255,255,(int)(0.35f*a*255)), "Index Binary");
+		// Show active file/view description
+		const char* desc_text = code_editor::active ? "Code Editor" : (g_disasm.file.loaded ? "Disassembly" : "");
+		if (desc_text[0]) {
+			ImVec2 dt_ts = ImGui::CalcTextSize(desc_text);
+			float  dt_ty = r2_cy - dt_ts.y * 0.5f;
+			wdl->AddText(ImVec2(hx0 + hdr_pad, dt_ty),
+				IM_COL32(255,255,255,(int)(0.35f*a*255)), desc_text);
+		}
 
-		bool run_clicked = ghost_btn("Run",
+		static bool s_sandbox_running = false;
+		bool run_clicked = ghost_btn(s_sandbox_running ? "Running..." : "Run",
 			ImGui::GetID("##drhv"), ImGui::GetID("##drfl"),
 			rbtn_x0, r2_cy, rbtn_w);
-		(void)run_clicked;
+
+		if (run_clicked && !s_sandbox_running) {
+			// Determine what to run
+			std::string exe_path;
+			std::string work_dir;
+
+			if (g_disasm.file.loaded && !g_disasm.file.path.empty()) {
+				exe_path = g_disasm.file.path;
+			} else if (code_editor::active && !file_tabs::tabs.empty() && file_tabs::active_tab < (int)file_tabs::tabs.size()) {
+				// For code files, try to find compiled output or run as script
+				auto& tab = file_tabs::tabs[file_tabs::active_tab];
+				exe_path = tab.filepath;
+			}
+
+			if (!exe_path.empty()) {
+				s_sandbox_running = true;
+				output_log::push(bottom_tab_t::sandbox_log, "[Sandbox] Starting: " + exe_path);
+
+				std::thread([exe_path, work_dir]() {
+					// Convert narrow strings to wide for sandbox API
+					auto to_wide = [](const std::string& s) -> std::wstring {
+						if (s.empty()) return {};
+						int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+						std::wstring ws(len - 1, 0);
+						MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, ws.data(), len);
+						return ws;
+					};
+					sandbox::config cfg;
+					cfg.exe_path = to_wide(exe_path);
+					cfg.working_dir = to_wide(work_dir);
+					cfg.timeout_ms = 30000;
+					cfg.capture_stdout = true;
+					cfg.capture_stderr = true;
+					cfg.allow_network = false;
+
+					auto result = sandbox::execute(cfg);
+
+					if (!result.error.empty()) {
+						output_log::push(bottom_tab_t::sandbox_log, "[Sandbox] Error: " + result.error);
+					} else {
+						char line[256];
+						snprintf(line, sizeof(line), "[Sandbox] Exit code: %u, Elapsed: %u ms",
+						         result.exit_code, result.elapsed_ms);
+						output_log::push(bottom_tab_t::sandbox_log, line);
+						if (!result.stdout_data.empty())
+							output_log::push(bottom_tab_t::sandbox_log, "[stdout] " + result.stdout_data);
+						if (!result.stderr_data.empty())
+							output_log::push(bottom_tab_t::sandbox_log, "[stderr] " + result.stderr_data);
+					}
+					s_sandbox_running = false;
+				}).detach();
+			} else {
+				output_log::push(bottom_tab_t::sandbox_log, "[Sandbox] No file to run. Open a PE or file first.");
+			}
+		}
 	}
 
 
@@ -2243,7 +2451,7 @@ void helpers::render_title()
 
 			const char* hint = !g_disasm.file.err.empty()     ? g_disasm.file.err.c_str()
 				             : !g_disasm.file.loaded           ? "Choose a file to begin"
-				             :                                   "Click 'Index Binary' to disassemble";
+				             :                                   "Click 'Run' to execute in sandbox";
 			ImDrawList* cdl2 = ImGui::GetWindowDrawList();
 			ImVec2      orig2 = ImGui::GetWindowPos();
 			ImVec2 ht2 = ImGui::CalcTextSize(hint);
@@ -2299,19 +2507,34 @@ void helpers::render_title()
 		{
 			float gear_sz = 18.f;
 
+			// History browser button
+			ImVec2 hist_pos(cw - gear_sz * 3.f - 20.f, 3.f);
+			ImGui::SetCursorPos(hist_pos);
+			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
+			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.08f));
+			ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.12f));
+			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.55f,0.60f,1.f));
+			if (ImGui::Button("\xf0\x9f\x93\x8b##chat_history", ImVec2(gear_sz, gear_sz))) {
+				conversations::refresh_history();
+				conversations::browser_open = !conversations::browser_open;
+			}
+			ImGui::PopStyleColor(4);
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("Conversation history");
+
+			// New chat button
 			ImVec2 clr_pos(cw - gear_sz * 2.f - 14.f, 3.f);
 			ImGui::SetCursorPos(clr_pos);
 			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
 			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.08f));
 			ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.12f));
 			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.55f,0.60f,1.f));
-			if (ImGui::Button("\xf0\x9f\x97\x91##clear_chat", ImVec2(gear_sz, gear_sz))) {
-				g_chat_messages.clear();
-				g_chat_scroll_to_bottom = true;
+			if (ImGui::Button("+##new_chat", ImVec2(gear_sz, gear_sz))) {
+				conversations::new_chat();
 			}
 			ImGui::PopStyleColor(4);
 			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("Clear chat history");
+				ImGui::SetTooltip("New chat");
 
 
 			ImVec2 btn_pos(cw - gear_sz - 8.f, 3.f);
@@ -2326,6 +2549,71 @@ void helpers::render_title()
 			if (ImGui::IsItemHovered())
 				ImGui::SetTooltip("AI Settings");
 			ImGui::SetCursorPosY(24.f);
+		}
+
+		// Conversation history browser
+		if (conversations::browser_open) {
+			float hist_w = std::min(cw - 8.f, 320.f);
+			float hist_h = std::min(ch * 0.6f, 400.f);
+			ImGui::SetNextWindowPos(ImVec2(ImGui::GetWindowPos().x + cw - hist_w - 4.f,
+			                               ImGui::GetWindowPos().y + 22.f));
+			ImGui::SetNextWindowSize(ImVec2(hist_w, hist_h));
+			ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.08f, 0.12f, 0.95f));
+			ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1,1,1,0.1f));
+			ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
+			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 8.f));
+			if (ImGui::Begin("##conv_history", &conversations::browser_open,
+			                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+			                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings)) {
+				ImGui::TextColored(ImVec4(0.7f,0.7f,0.8f,1.f), "Conversations");
+				ImGui::Separator();
+				ImGui::BeginChild("##conv_list", ImVec2(0, 0), false);
+				for (int i = 0; i < (int)conversations::history.size(); i++) {
+					auto& c = conversations::history[i];
+					bool is_current = (c.id == conversations::current_id);
+					std::string label = c.title.empty() ? "Untitled" : c.title;
+					if (label.size() > 50) label = label.substr(0, 47) + "...";
+					char count_str[32];
+					snprintf(count_str, sizeof(count_str), " (%d msgs)", c.msg_count);
+					label += count_str;
+
+					if (is_current) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ax/255.f, ay/255.f, az/255.f, 1.f));
+					if (ImGui::Selectable(("##conv_" + c.id).c_str(), is_current, 0, ImVec2(hist_w - 40.f, 0))) {
+						if (!is_current) {
+							conversations::save_current();
+							conversations::load_conversation(c.id);
+							conversations::browser_open = false;
+						}
+					}
+					ImGui::SameLine(0, 0);
+					ImGui::SetCursorPosX(0);
+					ImGui::Text("%s", label.c_str());
+					if (is_current) ImGui::PopStyleColor();
+
+					ImGui::SameLine(hist_w - 32.f);
+					ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
+					ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f,0.3f,0.3f,0.8f));
+					char del_id[32];
+					snprintf(del_id, sizeof(del_id), "x##del_%d", i);
+					if (ImGui::SmallButton(del_id)) {
+						conversations::delete_conversation(c.id);
+						if (is_current) {
+							g_chat_messages.clear();
+							conversations::current_id.clear();
+						}
+					}
+					ImGui::PopStyleColor(2);
+				}
+				if (conversations::history.empty())
+					ImGui::TextColored(ImVec4(0.5f,0.5f,0.55f,1.f), "No saved conversations");
+				ImGui::EndChild();
+			}
+			ImGui::End();
+			ImGui::PopStyleVar(2);
+			ImGui::PopStyleColor(2);
+
+			if (!ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+				conversations::browser_open = false;
 		}
 
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
@@ -3131,10 +3419,85 @@ void helpers::render_title()
 
 
 		{
-			const char* driver_str = "Driver: Detached";
-			ImVec2 dts = ImGui::CalcTextSize(driver_str);
+			std::string driver_str;
+			if (driver_bridge::attached_pid() != 0) {
+				driver_str = "Driver: " + driver_bridge::attached_process_name() +
+				             " (PID " + std::to_string(driver_bridge::attached_pid()) + ")";
+			} else {
+				driver_str = "Driver: Detached";
+			}
+
+			ImU32 driver_col;
+			if (driver_bridge::attached_pid() != 0)
+				driver_col = IM_COL32(100, 200, 100, (int)(200 * a));
+			else
+				driver_col = IM_COL32(120, 120, 140, (int)(160 * a));
+
+			ImVec2 dts = ImGui::CalcTextSize(driver_str.c_str());
 			float dcx = (sx0 + sx1) * 0.5f - dts.x * 0.5f;
-			dl->AddText(ImVec2(dcx, text_y), IM_COL32(120, 120, 140, (int)(160 * a)), driver_str);
+			dl->AddText(ImVec2(dcx, text_y), driver_col, driver_str.c_str());
+		}
+
+
+		{
+			auto& mgr = get_mcp_client_manager();
+			auto statuses = mgr.get_status();
+			int connected = 0, total = (int)statuses.size();
+			for (auto& s : statuses)
+				if (s.state == mcp_client::connection_state_t::connected) connected++;
+
+			if (total > 0) {
+				char mcp_buf[64];
+				snprintf(mcp_buf, sizeof(mcp_buf), "MCP %d/%d", connected, total);
+				ImVec2 mts2 = ImGui::CalcTextSize(mcp_buf);
+				float mx = sx1 - mts2.x - 12.f;
+
+				auto* prof = g_sa_settings.get_active_profile();
+				if (prof) {
+					std::string model_str2 = prof->display_name + " / " + prof->model;
+					ImVec2 model_ts = ImGui::CalcTextSize(model_str2.c_str());
+					mx = sx1 - model_ts.x - mts2.x - 28.f;
+				}
+
+				ImU32 mcp_col = (connected == total)
+					? IM_COL32(100, 200, 100, (int)(200 * a))
+					: (connected > 0)
+						? IM_COL32(220, 180, 60, (int)(200 * a))
+						: IM_COL32(200, 100, 100, (int)(200 * a));
+
+				float dot_r = 3.f;
+				dl->AddCircleFilled(ImVec2(mx - dot_r - 4.f, text_y + ImGui::GetFontSize() * 0.5f), dot_r, mcp_col);
+				dl->AddText(ImVec2(mx, text_y), IM_COL32(150, 150, 170, (int)(180 * a)), mcp_buf);
+			}
+		}
+
+
+		{
+			if (cost_tracking::session_input_tokens > 0 || cost_tracking::session_output_tokens > 0) {
+				std::string tok_str = cost_tracking::format_tokens(cost_tracking::session_input_tokens) + " in / " +
+				                      cost_tracking::format_tokens(cost_tracking::session_output_tokens) + " out";
+				float cost = (float)cost_tracking::session_cost_usd;
+				if (cost > 0.001f) {
+					char cost_buf[32];
+					snprintf(cost_buf, sizeof(cost_buf), "  ~$%.2f", cost);
+					tok_str += cost_buf;
+				}
+				ImVec2 tts = ImGui::CalcTextSize(tok_str.c_str());
+
+				float file_info_w = 0.f;
+				{
+					std::string info2;
+					if (code_editor::active && !code_editor::filename.empty()) {
+						info2 = code_editor::filename;
+						if (code_editor::dirty) info2 += " [modified]";
+						info2 += "  Ln " + std::to_string(autocomplete::cursor_line + 1) +
+						          ", Col " + std::to_string(autocomplete::cursor_col + 1);
+					}
+					file_info_w = ImGui::CalcTextSize(info2.c_str()).x;
+				}
+				float tx = sx0 + file_info_w + 30.f;
+				dl->AddText(ImVec2(tx, text_y), IM_COL32(130, 130, 155, (int)(160 * a)), tok_str.c_str());
+			}
 		}
 	}
 
@@ -3158,7 +3521,7 @@ void helpers::render_title()
 			{ "Next Tab",                    "Ctrl+Tab",       7  },
 			{ "Previous Tab",               "Ctrl+Shift+Tab",  8  },
 			{ "Open Settings",               "Ctrl+,",         9  },
-			{ "Clear Chat History",          "",                10 },
+			{ "New Chat",                    "Ctrl+L",         10 },
 			{ "Open File for Disassembly",   "",                11 },
 			{ "Toggle Fullscreen",           "F11",             12 },
 			{ "Change Theme",                "",                13 },
@@ -3166,6 +3529,14 @@ void helpers::render_title()
 			{ "Show Output Tab",             "",                15 },
 			{ "Show MCP Log Tab",            "",                16 },
 			{ "Show Driver Log Tab",         "",                17 },
+			{ "Attach to Process",           "",                18 },
+			{ "Driver Status",               "",                19 },
+			{ "About",                       "",                20 },
+			{ "Keyboard Shortcuts",          "Ctrl+K Ctrl+S",   21 },
+			{ "Find",                        "Ctrl+F",          22 },
+			{ "Replace",                     "Ctrl+H",          23 },
+			{ "Undo",                        "Ctrl+Z",          24 },
+			{ "Redo",                        "Ctrl+Y",          25 },
 		};
 		static const int cmd_count = sizeof(all_cmds) / sizeof(all_cmds[0]);
 		static int palette_sel = 0;
@@ -3218,7 +3589,7 @@ void helpers::render_title()
 					code_editor::load(c8, t8.filename, t8.filepath);
 				} break;
 			case 9: g_settings_open = true; break;
-			case 10: g_chat_messages.clear(); break;
+			case 10: conversations::new_chat(); break;
 			case 11: {
 				std::string fpath = disasm::open_file_dialog(g_hwnd);
 				if (!fpath.empty()) {
@@ -3254,6 +3625,14 @@ void helpers::render_title()
 			case 15: globals::ui::panel_bottom_visible = true; globals::ui::active_bottom_tab = bottom_tab_t::output; break;
 			case 16: globals::ui::panel_bottom_visible = true; globals::ui::active_bottom_tab = bottom_tab_t::mcp_log; break;
 			case 17: globals::ui::panel_bottom_visible = true; globals::ui::active_bottom_tab = bottom_tab_t::driver_log; break;
+			case 18: globals::ui::process_attach_open = true; break;
+			case 19: globals::ui::driver_status_open = true; break;
+			case 20: globals::ui::about_dialog_open = true; break;
+			case 21: globals::ui::shortcuts_dialog_open = true; break;
+			case 22: if (code_editor::active) code_editor_widget::open_find(); break;
+			case 23: if (code_editor::active) code_editor_widget::open_replace(); break;
+			case 24: if (code_editor::active) code_editor_widget::trigger_undo(); break;
+			case 25: if (code_editor::active) code_editor_widget::trigger_redo(); break;
 			}
 			globals::ui::command_palette_open = false;
 			globals::ui::command_palette_buf[0] = '\0';
@@ -3375,6 +3754,274 @@ void helpers::render_title()
 			globals::ui::command_palette_buf[0] = '\0';
 			palette_sel = 0;
 		}
+	}
+
+
+	if (globals::ui::process_attach_open) {
+		ImDrawList* fdl = ImGui::GetForegroundDrawList();
+		ImVec2 vp = ImGui::GetIO().DisplaySize;
+		fdl->AddRectFilled(ImVec2(0, 0), vp, IM_COL32(0, 0, 0, 120));
+
+		float pw = 480.f, ph = 420.f;
+		float px = (vp.x - pw) * 0.5f, py = (vp.y - ph) * 0.5f;
+
+		ImGui::SetNextWindowPos(ImVec2(px, py));
+		ImGui::SetNextWindowSize(ImVec2(pw, ph));
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(28, 28, 36, 245));
+		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(70, 70, 90, 200));
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 12));
+
+		if (ImGui::Begin("Attach to Process##pa_dlg", &globals::ui::process_attach_open,
+				ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+				ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+
+			ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+			ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.06f, 0.06f, 0.09f, 1.f));
+			ImGui::SetNextItemWidth(-1);
+			ImGui::InputTextWithHint("##proc_filter", "Filter processes...",
+				globals::ui::process_filter_buf, sizeof(globals::ui::process_filter_buf));
+			ImGui::PopStyleColor();
+			ImGui::PopStyleVar();
+			ImGui::Spacing();
+
+			static std::vector<driver_bridge::process_info_t> proc_list;
+			static float refresh_timer = 0.f;
+			static int selected_proc = -1;
+			refresh_timer -= ImGui::GetIO().DeltaTime;
+			if (refresh_timer <= 0.f) {
+				proc_list = driver_bridge::enumerate_processes();
+				refresh_timer = 2.f;
+			}
+
+			std::string filt(globals::ui::process_filter_buf);
+			for (auto& c : filt) c = (char)tolower((unsigned char)c);
+
+			ImGui::BeginChild("##proc_list", ImVec2(-1, ph - 110.f), true);
+			for (int i = 0; i < (int)proc_list.size(); i++) {
+				auto& p = proc_list[i];
+				if (!filt.empty()) {
+					std::string name_lower = p.name;
+					for (auto& c : name_lower) c = (char)tolower((unsigned char)c);
+					std::string pid_str = std::to_string(p.pid);
+					if (name_lower.find(filt) == std::string::npos &&
+						pid_str.find(filt) == std::string::npos)
+						continue;
+				}
+				char label[256];
+				snprintf(label, sizeof(label), "%-6u  %s", (unsigned)p.pid, p.name.c_str());
+				if (ImGui::Selectable(label, selected_proc == i))
+					selected_proc = i;
+			}
+			ImGui::EndChild();
+			ImGui::Spacing();
+
+			float btn_w = 80.f;
+			bool can_attach = selected_proc >= 0 && selected_proc < (int)proc_list.size();
+			if (!can_attach) ImGui::BeginDisabled();
+			if (ImGui::Button("Attach", ImVec2(btn_w, 26))) {
+				auto& p = proc_list[selected_proc];
+				driver_bridge::attach(p.pid);
+				globals::ui::process_attach_open = false;
+				selected_proc = -1;
+				globals::ui::process_filter_buf[0] = '\0';
+			}
+			if (!can_attach) ImGui::EndDisabled();
+			ImGui::SameLine();
+			if (ImGui::Button("Cancel", ImVec2(btn_w, 26))) {
+				globals::ui::process_attach_open = false;
+				selected_proc = -1;
+				globals::ui::process_filter_buf[0] = '\0';
+			}
+		}
+		ImGui::End();
+		ImGui::PopStyleVar(2);
+		ImGui::PopStyleColor(2);
+	}
+
+
+	if (globals::ui::driver_status_open) {
+		ImDrawList* fdl = ImGui::GetForegroundDrawList();
+		ImVec2 vp = ImGui::GetIO().DisplaySize;
+		fdl->AddRectFilled(ImVec2(0, 0), vp, IM_COL32(0, 0, 0, 120));
+
+		float pw = 500.f, ph = 380.f;
+		float px = (vp.x - pw) * 0.5f, py = (vp.y - ph) * 0.5f;
+
+		ImGui::SetNextWindowPos(ImVec2(px, py));
+		ImGui::SetNextWindowSize(ImVec2(pw, ph));
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(28, 28, 36, 245));
+		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(70, 70, 90, 200));
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 12));
+
+		if (ImGui::Begin("Driver Status##drv_dlg", &globals::ui::driver_status_open,
+				ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+				ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+
+			bool is_attached = driver_bridge::attached_pid() != 0;
+			ImGui::TextColored(is_attached ? ImVec4(0.4f, 0.8f, 0.4f, 1.f) : ImVec4(0.6f, 0.6f, 0.7f, 1.f),
+				is_attached ? "Status: Attached" : "Status: Detached");
+
+			if (is_attached) {
+				ImGui::Text("Process: %s", driver_bridge::attached_process_name().c_str());
+				ImGui::Text("PID: %u", (unsigned)driver_bridge::attached_pid());
+				ImGui::Separator();
+
+				static int drv_tab = 0;
+				if (ImGui::BeginTabBar("##drv_tabs")) {
+					if (ImGui::BeginTabItem("Modules")) {
+						drv_tab = 0;
+						auto mods = driver_bridge::enumerate_modules();
+						ImGui::BeginChild("##mod_list", ImVec2(-1, ph - 180.f));
+						for (auto& m : mods) {
+							ImGui::Text("0x%llX  %s", (unsigned long long)m.base, m.name.c_str());
+						}
+						ImGui::EndChild();
+						ImGui::EndTabItem();
+					}
+					if (ImGui::BeginTabItem("Threads")) {
+						drv_tab = 1;
+						auto threads = driver_bridge::enumerate_threads();
+						ImGui::BeginChild("##thr_list", ImVec2(-1, ph - 180.f));
+						for (auto& t : threads) {
+							ImGui::Text("TID %u  Priority %d", (unsigned)t.tid, t.priority);
+						}
+						ImGui::EndChild();
+						ImGui::EndTabItem();
+					}
+					ImGui::EndTabBar();
+				}
+			}
+
+			ImGui::Spacing();
+			float btn_w = 80.f;
+			if (is_attached) {
+				if (ImGui::Button("Detach", ImVec2(btn_w, 26))) {
+					driver_bridge::detach();
+				}
+				ImGui::SameLine();
+			}
+			if (ImGui::Button("Close", ImVec2(btn_w, 26))) {
+				globals::ui::driver_status_open = false;
+			}
+		}
+		ImGui::End();
+		ImGui::PopStyleVar(2);
+		ImGui::PopStyleColor(2);
+	}
+
+
+	if (globals::ui::about_dialog_open) {
+		ImDrawList* fdl = ImGui::GetForegroundDrawList();
+		ImVec2 vp = ImGui::GetIO().DisplaySize;
+		fdl->AddRectFilled(ImVec2(0, 0), vp, IM_COL32(0, 0, 0, 120));
+
+		float pw = 360.f, ph = 220.f;
+		float px = (vp.x - pw) * 0.5f, py = (vp.y - ph) * 0.5f;
+
+		ImGui::SetNextWindowPos(ImVec2(px, py));
+		ImGui::SetNextWindowSize(ImVec2(pw, ph));
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(28, 28, 36, 245));
+		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(70, 70, 90, 200));
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20, 16));
+
+		if (ImGui::Begin("About AiDA##about_dlg", &globals::ui::about_dialog_open,
+				ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+				ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+
+			ImVec4 ac = globals::ui::accent;
+			ImGui::TextColored(ac, "AiDA Standalone IDE");
+			ImGui::Spacing();
+			ImGui::Text("Version 1.0.0");
+			ImGui::Text("AI-Powered Disassembly & Analysis");
+			ImGui::Spacing();
+			ImGui::Separator();
+			ImGui::Spacing();
+			ImGui::TextWrapped("Built with ImGui, Zydis, Unicorn, and MCP protocol support.");
+			ImGui::TextWrapped("Multi-provider AI: Anthropic, OpenAI, Google, OpenRouter, Local.");
+			ImGui::Spacing();
+			if (ImGui::Button("OK", ImVec2(80, 26))) {
+				globals::ui::about_dialog_open = false;
+			}
+		}
+		ImGui::End();
+		ImGui::PopStyleVar(2);
+		ImGui::PopStyleColor(2);
+	}
+
+
+	if (globals::ui::shortcuts_dialog_open) {
+		ImDrawList* fdl = ImGui::GetForegroundDrawList();
+		ImVec2 vp = ImGui::GetIO().DisplaySize;
+		fdl->AddRectFilled(ImVec2(0, 0), vp, IM_COL32(0, 0, 0, 120));
+
+		float pw = 500.f, ph = 440.f;
+		float px = (vp.x - pw) * 0.5f, py = (vp.y - ph) * 0.5f;
+
+		ImGui::SetNextWindowPos(ImVec2(px, py));
+		ImGui::SetNextWindowSize(ImVec2(pw, ph));
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(28, 28, 36, 245));
+		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(70, 70, 90, 200));
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 12));
+
+		if (ImGui::Begin("Keyboard Shortcuts##kb_dlg", &globals::ui::shortcuts_dialog_open,
+				ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+				ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+
+			struct ShortcutEntry { const char* keys; const char* desc; };
+			static const ShortcutEntry general[] = {
+				{ "Ctrl+Shift+P", "Command Palette" },
+				{ "Ctrl+N",       "New File" },
+				{ "Ctrl+O",       "Open File" },
+				{ "Ctrl+S",       "Save File" },
+				{ "Ctrl+K",       "Open Folder" },
+				{ "F11",          "Toggle Fullscreen" },
+			};
+			static const ShortcutEntry editor[] = {
+				{ "Ctrl+Z",       "Undo" },
+				{ "Ctrl+Y",       "Redo" },
+				{ "Ctrl+F",       "Find" },
+				{ "Ctrl+H",       "Find & Replace" },
+				{ "Ctrl+G",       "Go to Line" },
+				{ "Ctrl+A",       "Select All" },
+				{ "Ctrl+C",       "Copy" },
+				{ "Ctrl+X",       "Cut" },
+				{ "Ctrl+V",       "Paste" },
+			};
+			static const ShortcutEntry panels[] = {
+				{ "Ctrl+B",       "Toggle Explorer" },
+				{ "Ctrl+J",       "Toggle Chat" },
+				{ "Ctrl+`",       "Toggle Output" },
+				{ "Ctrl+L",       "New Chat" },
+				{ "Ctrl+Tab",     "Next Tab" },
+			};
+
+			auto render_section = [](const char* title, const ShortcutEntry* entries, int count) {
+				ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.f), "%s", title);
+				ImGui::Separator();
+				for (int i = 0; i < count; i++) {
+					ImGui::Text("%-18s %s", entries[i].keys, entries[i].desc);
+				}
+				ImGui::Spacing();
+			};
+
+			ImGui::BeginChild("##kb_scroll", ImVec2(-1, ph - 80.f));
+			render_section("General", general, 6);
+			render_section("Editor", editor, 9);
+			render_section("Panels", panels, 5);
+			ImGui::EndChild();
+
+			ImGui::Spacing();
+			if (ImGui::Button("Close", ImVec2(80, 26))) {
+				globals::ui::shortcuts_dialog_open = false;
+			}
+		}
+		ImGui::End();
+		ImGui::PopStyleVar(2);
+		ImGui::PopStyleColor(2);
 	}
 
 	render_settings_popup();

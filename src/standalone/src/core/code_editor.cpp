@@ -54,6 +54,11 @@ bool s_lang_set = false;
 bool s_has_focus = false;
 ImGuiID s_widget_id = 0;
 
+bool s_request_undo = false;
+bool s_request_redo = false;
+bool s_request_find = false;
+bool s_request_replace = false;
+
 
 void rebuild_lines() {
     s_cache.lines.clear();
@@ -469,12 +474,22 @@ void code_editor_widget::get_caret(int& line, int& col) {
     col  = s_sel.caret_col;
 }
 
+void code_editor_widget::trigger_undo()   { s_request_undo = true; }
+void code_editor_widget::trigger_redo()   { s_request_redo = true; }
+void code_editor_widget::open_find()      { s_request_find = true; }
+void code_editor_widget::open_replace()   { s_request_replace = true; }
+
 
 void code_editor_widget::render(float pos_x, float pos_y, float width, float height,
                                  float alpha, float accent_r, float accent_g, float accent_b)
 {
     if (!code_editor::active || code_editor::buffer.empty())
         return;
+
+    if (s_request_undo)   { do_undo();   s_request_undo = false; }
+    if (s_request_redo)   { do_redo();   s_request_redo = false; }
+    if (s_request_find)   { s_find.visible = true; s_find.replace_mode = false; s_request_find = false; }
+    if (s_request_replace){ s_find.visible = true; s_find.replace_mode = true;  s_request_replace = false; }
 
     if (!s_lang_set && !code_editor::filename.empty()) {
         s_lang = syntax::detect_language(code_editor::filename);
@@ -738,6 +753,12 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         auto& io = ImGui::GetIO();
         bool ctrl  = io.KeyCtrl;
         bool shift = io.KeyShift;
+
+        // Claim Enter/Tab ownership so ImGui nav doesn't consume them
+        ImGui::SetKeyOwner(ImGuiKey_Enter, id);
+        ImGui::SetKeyOwner(ImGuiKey_KeypadEnter, id);
+        ImGui::SetKeyOwner(ImGuiKey_Tab, id);
+        ImGui::SetKeyOwner(ImGuiKey_Escape, id);
 
 
         if (ctrl && ImGui::IsKeyPressed(ImGuiKey_A, false)) {

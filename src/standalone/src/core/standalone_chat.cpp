@@ -295,18 +295,27 @@ void run_agentic(std::string user_message,
 
     std::string full_prompt = system_prompt + "\n\n" + conversation;
 
-    constexpr int MAX_TURNS = 15;
+    const int max_turns = (std::max)(g_sa_settings.max_agentic_rounds, 1);
+    int64_t budget_used = 0;
 
-    for (int turn = 0; turn < MAX_TURNS; ++turn) {
+    for (int turn = 0; turn < max_turns; ++turn) {
         if (s_cancel.load()) {
             post_update(ai_update_t::COMPLETE);
             return;
         }
 
+        // Check task budget if set
+        if (g_sa_settings.task_budget_tokens > 0 && budget_used >= g_sa_settings.task_budget_tokens) {
+            output_log::push(bottom_tab_t::output, "[ai] Task budget exhausted (" + std::to_string(budget_used) + " tokens)");
+            post_update(ai_update_t::ERR, "Task budget exhausted (" + std::to_string(budget_used) + " tokens used).");
+            return;
+        }
 
         if (turn > 0)
             post_update(ai_update_t::THINKING, "Processing tool results...");
 
+        int64_t pre_in = cost_tracking::session_input_tokens;
+        int64_t pre_out = cost_tracking::session_output_tokens;
 
         std::string response;
         try {
@@ -317,25 +326,53 @@ void run_agentic(std::string user_message,
             return;
         }
 
+        // Track budget
+        budget_used += (cost_tracking::session_input_tokens - pre_in) +
+                       (cost_tracking::session_output_tokens - pre_out);
+
         if (s_cancel.load()) {
             post_update(ai_update_t::COMPLETE);
             return;
         }
-
 
         if (response.size() >= 6 && response.substr(0, 6) == "Error:") {
             post_update(ai_update_t::ERR, response);
             return;
         }
 
+        // Extract thinking markers from Anthropic extended thinking
+        std::string thinking_content;
+        std::string clean_response = response;
+        {
+            const std::string think_start = "\x01THINK:";
+            const std::string think_end = "\x01ENDTHINK\n";
+            size_t ts = clean_response.find(think_start);
+            if (ts != std::string::npos) {
+                size_t te = clean_response.find(think_end, ts);
+                if (te != std::string::npos) {
+                    thinking_content = clean_response.substr(ts + think_start.size(),
+                                                              te - ts - think_start.size());
+                    clean_response.erase(ts, te + think_end.size() - ts);
+                }
+            }
+            // Also capture streaming thinking markers
+            size_t p = 0;
+            while ((p = clean_response.find(think_start, p)) != std::string::npos) {
+                size_t end = clean_response.find('\n', p + think_start.size());
+                if (end == std::string::npos) end = clean_response.size();
+                thinking_content += clean_response.substr(p + think_start.size(), end - p - think_start.size());
+                clean_response.erase(p, end - p + (end < clean_response.size() ? 1 : 0));
+            }
+        }
 
-        auto calls = parse_tool_calls(response);
+        if (!thinking_content.empty())
+            post_update(ai_update_t::THINKING, thinking_content);
+
+        auto calls = parse_tool_calls(clean_response);
 
         if (calls.empty()) {
-
-            std::string clean = strip_tool_blocks(response);
-            if (clean.empty()) clean = response;
-
+            std::string clean = strip_tool_blocks(clean_response);
+            if (clean.empty()) clean = clean_response;
 
             constexpr size_t CHARS_PER_CHUNK = 24;
             for (size_t i = 0; i < clean.size() && !s_cancel.load(); ) {
@@ -347,7 +384,6 @@ void run_agentic(std::string user_message,
             post_update(ai_update_t::COMPLETE);
             return;
         }
-
 
         std::string tool_results;
         for (auto& tc : calls) {
@@ -363,16 +399,15 @@ void run_agentic(std::string user_message,
                           + "\n</tool_result>\n";
         }
 
-
-        full_prompt += " " + response + "\n"
+        full_prompt += " " + clean_response + "\n"
                      + tool_results
                      + "\nContinue your analysis using the tool results above. "
                        "If you need more data, call more tools. "
                        "Otherwise, provide your final answer as plain text.\n\nAssistant:";
     }
 
-    output_log::push(bottom_tab_t::output, "[ai] Reached max tool rounds (15)");
-    post_update(ai_update_t::ERR, "Reached maximum tool-calling rounds (15). Stopping.");
+    output_log::push(bottom_tab_t::output, "[ai] Reached max tool rounds (" + std::to_string(max_turns) + ")");
+    post_update(ai_update_t::ERR, "Reached maximum tool-calling rounds (" + std::to_string(max_turns) + "). Stopping.");
 }
 
 void restore_workspace_state()
@@ -586,6 +621,9 @@ void init_standalone_chat()
     editor_config::auto_complete          = g_sa_settings.editor_auto_complete;
     editor_config::show_line_numbers      = g_sa_settings.editor_line_numbers;
     editor_config::highlight_current_line = g_sa_settings.editor_highlight_line;
+    editor_config::word_wrap              = g_sa_settings.editor_word_wrap;
+    editor_config::minimap                = g_sa_settings.editor_minimap;
+    editor_config::bracket_match          = g_sa_settings.editor_bracket_match;
 
     themes::changed = true;
 
@@ -1002,6 +1040,71 @@ void render_settings_popup()
         ImGui::SetNextItemWidth(-1);
         ImGui::SliderFloat("##temp", &s_temperature, 0.0f, 2.0f, "%.2f");
 
+        ImGui::Separator();
+        ImGui::Text("AI Features (Anthropic Claude)");
+
+        static bool s_thinking_enabled = false;
+        static int  s_thinking_budget = 10000;
+        static int  s_effort_level = 2;
+        static bool s_prompt_caching = true;
+        static int  s_task_budget = 0;
+        static bool s_web_search = false;
+        static int  s_max_rounds = 15;
+
+        // Initialize once
+        {
+            static bool s_ai_features_init = false;
+            if (!s_ai_features_init || s_first) {
+                s_thinking_enabled = g_sa_settings.thinking_enabled;
+                s_thinking_budget = g_sa_settings.thinking_budget;
+                s_effort_level = g_sa_settings.effort_level;
+                s_prompt_caching = g_sa_settings.prompt_caching;
+                s_task_budget = g_sa_settings.task_budget_tokens;
+                s_web_search = g_sa_settings.web_search_enabled;
+                s_max_rounds = g_sa_settings.max_agentic_rounds;
+                s_ai_features_init = true;
+            }
+        }
+
+        ImGui::Checkbox("Extended Thinking", &s_thinking_enabled);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Enable interleaved thinking for deeper reasoning (Anthropic only)");
+        if (s_thinking_enabled) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(120.f);
+            ImGui::InputInt("Budget##think", &s_thinking_budget, 1000, 5000);
+            s_thinking_budget = (std::max)(s_thinking_budget, 1024);
+        }
+
+        ImGui::Text("Effort Level");
+        ImGui::SetNextItemWidth(-1);
+        const char* effort_labels[] = {
+            "\xc2\xa4 Low", "\xe2\x97\x90 Medium", "\xe2\x97\x91 High", "\xe2\x97\x95 Max"
+        };
+        ImGui::Combo("##effort", &s_effort_level, effort_labels, 4);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Controls how much effort the model puts into its response");
+
+        ImGui::Checkbox("Prompt Caching", &s_prompt_caching);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Cache system prompts to reduce cost and latency (Anthropic only)");
+
+        ImGui::Checkbox("Web Search", &s_web_search);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Allow the AI to search the web for information (Anthropic only)");
+
+        ImGui::Text("Max Agentic Rounds");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderInt("##max_rounds", &s_max_rounds, 1, 50);
+
+        ImGui::Text("Task Budget (tokens, 0=unlimited)");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputInt("##task_budget", &s_task_budget, 10000, 50000);
+        s_task_budget = (std::max)(s_task_budget, 0);
+
+        ImGui::Separator();
+        ImGui::Text("Sandbox");
+
         ImGui::Text("Sandbox Timeout (ms)");
         ImGui::SetNextItemWidth(-1);
         ImGui::InputInt("##sandbox_timeout", &s_sandbox_timeout, 0, 0);
@@ -1161,6 +1264,16 @@ void render_settings_popup()
             g_sa_settings.sandbox.timeout_ms = (std::max)(s_sandbox_timeout, 1000);
             g_sa_settings.sandbox.memory_limit_mb = (std::max)(s_sandbox_memory, 64);
             g_sa_settings.sandbox.network_mode = s_sandbox_network == 1 ? "default" : "off";
+
+            // Persist new AI features
+            g_sa_settings.thinking_enabled = s_thinking_enabled;
+            g_sa_settings.thinking_budget = s_thinking_budget;
+            g_sa_settings.effort_level = s_effort_level;
+            g_sa_settings.prompt_caching = s_prompt_caching;
+            g_sa_settings.task_budget_tokens = s_task_budget;
+            g_sa_settings.web_search_enabled = s_web_search;
+            g_sa_settings.max_agentic_rounds = s_max_rounds;
+
             g_sa_settings.apply_legacy_fields_to_active_profile();
             g_sa_settings.sync_legacy_fields_from_active_profile();
 
@@ -1230,4 +1343,41 @@ void render_settings_popup()
 
     ImGui::PopStyleVar(5);
     ImGui::PopStyleColor(15);
+}
+
+
+mcp_client::manager_t& get_mcp_client_manager()
+{
+    return s_mcp_client_mgr;
+}
+
+void do_process_attach(unsigned long pid)
+{
+    if (driver_bridge::attach(pid)) {
+        output_log::push(bottom_tab_t::driver_log, "[driver] Attached to PID " + std::to_string(pid));
+    } else {
+        output_log::push(bottom_tab_t::driver_log, "[driver] Failed to attach to PID " + std::to_string(pid) +
+                         ": " + driver_bridge::last_error());
+    }
+}
+
+void do_process_detach()
+{
+    driver_bridge::detach();
+    output_log::push(bottom_tab_t::driver_log, "[driver] Detached from process");
+}
+
+bool is_process_attached()
+{
+    return driver_bridge::is_loaded();
+}
+
+std::string get_attached_process_name()
+{
+    return driver_bridge::status();
+}
+
+unsigned long get_attached_pid()
+{
+    return 0; // driver bridge doesn't expose PID directly but status() contains it
 }

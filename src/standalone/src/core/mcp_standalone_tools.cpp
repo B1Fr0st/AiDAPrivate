@@ -1,4 +1,5 @@
 #define WIN32_LEAN_AND_MEAN
+#define CPPHTTPLIB_OPENSSL_SUPPORT
 #include <windows.h>
 
 #include "mcp_standalone.hpp"
@@ -6,6 +7,8 @@
 #include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
 #include "zydis_disasm.hpp"
+
+#include <httplib.h>
 
 #include <algorithm>
 #include <cctype>
@@ -572,6 +575,84 @@ namespace
 
         return tool_result_t::ok("Searched file contents.", json{{"matches", matches}});
     }
+
+    tool_result_t handle_web_search(const json& params)
+    {
+        if (!params.contains("query") || !params["query"].is_string())
+            return error("Provide a search query.");
+
+        const std::string query = params["query"].get<std::string>();
+        const int max_results = params.value("max_results", 5);
+
+        // Use DuckDuckGo Instant Answer API (no API key required, privacy-friendly)
+        // Returns structured results without tracking
+        std::string encoded_query;
+        for (unsigned char c : query) {
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                encoded_query += static_cast<char>(c);
+            } else if (c == ' ') {
+                encoded_query += '+';
+            } else {
+                char hex[4];
+                snprintf(hex, sizeof(hex), "%%%02X", c);
+                encoded_query += hex;
+            }
+        }
+
+        json results = json::array();
+
+        // Attempt DuckDuckGo API
+        try {
+            httplib::SSLClient client("api.duckduckgo.com");
+            client.set_connection_timeout(10);
+            client.set_read_timeout(15);
+            client.enable_server_certificate_verification(false);
+
+            std::string path = "/?q=" + encoded_query + "&format=json&no_redirect=1&no_html=1";
+            auto res = client.Get(path.c_str());
+
+            if (res && res->status == 200) {
+                auto j = json::parse(res->body, nullptr, false);
+                if (!j.is_discarded() && j.is_object()) {
+                    // Abstract (main answer)
+                    if (j.contains("Abstract") && !j["Abstract"].get<std::string>().empty()) {
+                        results.push_back({
+                            {"title", j.value("Heading", "Answer")},
+                            {"snippet", j["Abstract"].get<std::string>()},
+                            {"url", j.value("AbstractURL", "")}
+                        });
+                    }
+
+                    // Related topics
+                    if (j.contains("RelatedTopics") && j["RelatedTopics"].is_array()) {
+                        for (auto& topic : j["RelatedTopics"]) {
+                            if ((int)results.size() >= max_results) break;
+                            if (topic.contains("Text") && topic["Text"].is_string()) {
+                                results.push_back({
+                                    {"title", topic.value("Text", "").substr(0, 120)},
+                                    {"snippet", topic.value("Text", "")},
+                                    {"url", topic.value("FirstURL", "")}
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (...) {
+            // Fallback: return a message that web search is unavailable
+        }
+
+        if (results.empty()) {
+            return tool_result_t::ok(
+                "Web search returned no results for: " + query +
+                "\nNote: Web search uses the DuckDuckGo Instant Answer API.",
+                json{{"results", results}});
+        }
+
+        return tool_result_t::ok(
+            "Found " + std::to_string(results.size()) + " results for: " + query,
+            json{{"results", results}});
+    }
 }
 
 namespace mcp_standalone
@@ -627,5 +708,8 @@ namespace mcp_standalone
         srv.register_tool({"grep_in_files", "Search file contents with a regular expression.",
             {{"root", "string", "Root directory", true}, {"pattern", "string", "Regex pattern", true}, {"limit", "number", "Maximum matches", false}},
             true, handle_grep_in_files});
+        srv.register_tool({"web_search", "Search the web using DuckDuckGo Instant Answer API.",
+            {{"query", "string", "Search query text", true}, {"max_results", "number", "Maximum results to return (default 5)", false}},
+            true, handle_web_search});
     }
 }

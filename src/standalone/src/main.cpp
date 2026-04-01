@@ -58,7 +58,7 @@ int main(int, char**)
     ::RegisterClassExW(&wc);
     int screen_w = GetSystemMetrics(SM_CXSCREEN);
     int screen_h = GetSystemMetrics(SM_CYSCREEN);
-    HWND hwnd = ::CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED, wc.lpszClassName, L"AiDA Standalone", WS_POPUP, (screen_w - 200) / 2, (screen_h - 250) / 2, 200, 250, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND hwnd = ::CreateWindowExW(WS_EX_LAYERED, wc.lpszClassName, L"AiDA Standalone", WS_POPUP, (screen_w - 200) / 2, (screen_h - 250) / 2, 200, 250, nullptr, nullptr, wc.hInstance, nullptr);
     g_hwnd = hwnd;
 
 

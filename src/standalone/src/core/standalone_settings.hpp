@@ -292,6 +292,34 @@ struct settings_sa_t
     std::string custom_icon_path;
     std::string custom_themes_json;
 
+    // --- Extended AI features (Claude Code inspired) ---
+    bool        thinking_enabled  = false;
+    int         thinking_budget   = 10000;       // max thinking tokens
+    int         effort_level      = 2;           // 0=low 1=medium 2=high 3=max
+    bool        prompt_caching    = true;
+    int         task_budget_tokens = 0;           // 0 = unlimited
+    bool        web_search_enabled = false;
+    int         max_agentic_rounds = 15;
+
+    // --- Editor extras ---
+    bool        editor_word_wrap    = false;
+    bool        editor_minimap      = false;
+    bool        editor_bracket_match = true;
+    float       chat_font_size      = 13.0f;
+    int         chat_density        = 1;         // 0=compact 1=normal 2=relaxed
+    bool        chat_show_timestamps = true;
+    bool        chat_show_tokens     = true;
+    bool        ghost_text_enabled   = false;
+    std::string ghost_text_model;
+    std::string ghost_text_provider_id;
+
+    // --- Window geometry persistence ---
+    int         window_x = -1;
+    int         window_y = -1;
+    int         window_w = 1400;
+    int         window_h = 850;
+    bool        window_maximized = false;
+
     workspace_state_t workspace;
     sandbox_settings_t sandbox;
     std::vector<mcp_client_server_t> mcp_client_servers;
@@ -701,6 +729,32 @@ struct settings_sa_t
         str("custom_themes_json", custom_themes_json);
         if (root.contains("editor_font_size") && root["editor_font_size"].is_number())
             editor_font_size = root["editor_font_size"].get<float>();
+        if (root.contains("chat_font_size") && root["chat_font_size"].is_number())
+            chat_font_size = root["chat_font_size"].get<float>();
+
+        boolean("thinking_enabled", thinking_enabled);
+        integer("thinking_budget", thinking_budget);
+        integer("effort_level", effort_level);
+        boolean("prompt_caching", prompt_caching);
+        integer("task_budget_tokens", task_budget_tokens);
+        boolean("web_search_enabled", web_search_enabled);
+        integer("max_agentic_rounds", max_agentic_rounds);
+
+        boolean("editor_word_wrap", editor_word_wrap);
+        boolean("editor_minimap", editor_minimap);
+        boolean("editor_bracket_match", editor_bracket_match);
+        integer("chat_density", chat_density);
+        boolean("chat_show_timestamps", chat_show_timestamps);
+        boolean("chat_show_tokens", chat_show_tokens);
+        boolean("ghost_text_enabled", ghost_text_enabled);
+        str("ghost_text_model", ghost_text_model);
+        str("ghost_text_provider_id", ghost_text_provider_id);
+
+        integer("window_x", window_x);
+        integer("window_y", window_y);
+        integer("window_w", window_w);
+        integer("window_h", window_h);
+        boolean("window_maximized", window_maximized);
 
         if (root.contains("provider_profiles") && root["provider_profiles"].is_array()) {
             provider_profiles.clear();
@@ -830,6 +884,29 @@ struct settings_sa_t
         root["theme_icon_index"] = theme_icon_index;
         root["custom_icon_path"] = custom_icon_path;
         root["custom_themes_json"] = custom_themes_json;
+
+        root["thinking_enabled"] = thinking_enabled;
+        root["thinking_budget"] = thinking_budget;
+        root["effort_level"] = effort_level;
+        root["prompt_caching"] = prompt_caching;
+        root["task_budget_tokens"] = task_budget_tokens;
+        root["web_search_enabled"] = web_search_enabled;
+        root["max_agentic_rounds"] = max_agentic_rounds;
+        root["chat_font_size"] = chat_font_size;
+        root["editor_word_wrap"] = editor_word_wrap;
+        root["editor_minimap"] = editor_minimap;
+        root["editor_bracket_match"] = editor_bracket_match;
+        root["chat_density"] = chat_density;
+        root["chat_show_timestamps"] = chat_show_timestamps;
+        root["chat_show_tokens"] = chat_show_tokens;
+        root["ghost_text_enabled"] = ghost_text_enabled;
+        root["ghost_text_model"] = ghost_text_model;
+        root["ghost_text_provider_id"] = ghost_text_provider_id;
+        root["window_x"] = window_x;
+        root["window_y"] = window_y;
+        root["window_w"] = window_w;
+        root["window_h"] = window_h;
+        root["window_maximized"] = window_maximized;
 
         nlohmann::json profiles = nlohmann::json::array();
         for (const auto& profile : provider_profiles) {
