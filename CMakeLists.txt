@@ -259,9 +259,47 @@ if(WIN32)
         set(IDA_STUBS_DIR "${CMAKE_BINARY_DIR}/_ida_stubs")
         file(MAKE_DIRECTORY "${IDA_STUBS_DIR}")
         file(WRITE "${IDA_STUBS_DIR}/pro.h"
-             "#ifndef _PRO_H\n#define _PRO_H\n/* stub for standalone build */\n#endif\n")
+               "#ifndef _PRO_H\n"
+               "#define _PRO_H\n"
+               "#include <cstdarg>\n"
+               "#include <cstdio>\n"
+               "#include <windows.h>\n"
+               "inline int qvsnprintf(char* buf, size_t n, const char* fmt, va_list ap) {\n"
+               "    return vsnprintf_s(buf, n, _TRUNCATE, fmt, ap);\n"
+               "}\n"
+               "inline void msg(const char* fmt, ...) {\n"
+               "    char tmp[2048] = {};\n"
+               "    va_list ap;\n"
+               "    va_start(ap, fmt);\n"
+               "    vsnprintf_s(tmp, sizeof(tmp), _TRUNCATE, fmt, ap);\n"
+               "    va_end(ap);\n"
+               "    OutputDebugStringA(tmp);\n"
+               "}\n"
+               "#endif\n")
         file(WRITE "${IDA_STUBS_DIR}/kernwin.hpp"
-             "#ifndef __KERNWIN_HPP\n#define __KERNWIN_HPP\n/* stub for standalone build */\n#endif\n")
+               "#ifndef __KERNWIN_HPP\n"
+               "#define __KERNWIN_HPP\n"
+               "#include <cstdarg>\n"
+               "#include <cstdio>\n"
+               "#include <windows.h>\n"
+               "#ifndef ASKBTN_NO\n"
+               "#define ASKBTN_NO 0\n"
+               "#endif\n"
+               "#ifndef ASKBTN_YES\n"
+               "#define ASKBTN_YES 1\n"
+               "#endif\n"
+               "inline int ask_yn(int deflt, const char* fmt, ...) {\n"
+               "    char tmp[2048] = {};\n"
+               "    va_list ap;\n"
+               "    va_start(ap, fmt);\n"
+               "    vsnprintf_s(tmp, sizeof(tmp), _TRUNCATE, fmt, ap);\n"
+               "    va_end(ap);\n"
+               "    const int r = MessageBoxA(nullptr, tmp, \"AiDAStandalone\", MB_YESNO | MB_ICONWARNING | MB_SYSTEMMODAL);\n"
+               "    if (r == IDYES) return ASKBTN_YES;\n"
+               "    if (r == IDNO) return ASKBTN_NO;\n"
+               "    return deflt;\n"
+               "}\n"
+               "#endif\n")
 
         # -- Standalone sources ---------------------------------------------------
         set(STANDALONE_SOURCES
@@ -277,6 +315,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/standalone_ai_client.cpp"
             "${STANDALONE_ROOT}/core/standalone_chat.cpp"
             "${STANDALONE_ROOT}/core/standalone_license.cpp"
+            src/driver_loader.cpp
             driver/comm.cpp
             src/net_security.cpp
             src/emulation_engine.cpp
@@ -373,6 +412,11 @@ if(WIN32)
             ntdll
             crypt32
             Shlwapi
+            advapi32
+            wintrust
+            setupapi
+            cfgmgr32
+            Psapi
         )
 
         # -- Link flags (PDB) ----------------------------------------------------

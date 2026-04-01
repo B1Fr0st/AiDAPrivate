@@ -115,12 +115,20 @@ namespace
     {
         json out;
         out["ready"] = driver_bridge::is_loaded();
+        out["kernel_backend"] = driver_bridge::using_kernel_driver();
         out["attached_pid"] = driver_bridge::attached_pid();
         out["attached_process"] = driver_bridge::attached_process_name();
         out["status"] = driver_bridge::status();
         if (!driver_bridge::last_error().empty())
             out["last_error"] = driver_bridge::last_error();
         return tool_result_t::ok(driver_bridge::status(), out);
+    }
+
+    tool_result_t handle_driver_load(const json&)
+    {
+        if (!driver_bridge::load_kernel_driver())
+            return error(driver_bridge::last_error().empty() ? "Failed to load kernel driver." : driver_bridge::last_error());
+        return handle_driver_status({});
     }
 
     tool_result_t handle_list_processes(const json& params)
@@ -659,7 +667,8 @@ namespace mcp_standalone
 {
     void register_standalone_tools(server_t& srv)
     {
-        srv.register_tool({"driver_status", "Show the state of the user-mode live inspection bridge.", {}, true, handle_driver_status});
+        srv.register_tool({"driver_status", "Show the state of the live inspection bridge and active backend.", {}, true, handle_driver_status});
+        srv.register_tool({"driver_load", "Load and connect the kernel driver backend for deep runtime analysis.", {}, false, handle_driver_load});
         srv.register_tool({"driver_attach", "Attach read-only live inspection to a process by pid or name.",
             {{"pid", "number", "Target process id", false}, {"process", "string", "Executable name such as notepad.exe", false}},
             false, handle_driver_attach});

@@ -1,5 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include "standalone_driver.hpp"
+#include "driver_loader.hpp"
+#include "comm.h"
 
 #include <windows.h>
 #include <psapi.h>
@@ -29,6 +31,7 @@ namespace
     std::string     g_process_name;
     std::string     g_last_error;
     bool            g_initialized = false;
+    bool            g_kernel_mode = false;
 
     struct handle_closer
     {
@@ -93,6 +96,33 @@ namespace
         return false;
     }
 
+    std::string process_name_from_pid(uint32_t pid)
+    {
+        auto snapshot = make_handle(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+        if (!snapshot)
+            return {};
+
+        PROCESSENTRY32W pe = {};
+        pe.dwSize = sizeof(pe);
+        if (!Process32FirstW(snapshot.get(), &pe))
+            return {};
+
+        do {
+            if (pe.th32ProcessID == pid)
+                return utf8_from_wide(pe.szExeFile);
+        } while (Process32NextW(snapshot.get(), &pe));
+
+        return {};
+    }
+
+    void close_process_handle_locked()
+    {
+        if (g_process) {
+            CloseHandle(g_process);
+            g_process = nullptr;
+        }
+    }
+
     std::string to_lower_copy(std::string text)
     {
         std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
@@ -119,9 +149,43 @@ namespace driver_bridge
     bool initialize()
     {
         std::lock_guard<std::mutex> lk(g_state_mtx);
+        if (g_initialized)
+            return true;
+
+        g_kernel_mode = false;
+        set_last_error_locked({});
+
+        if (driver_loader::initialize_and_load() && device && device->connect()) {
+            g_kernel_mode = true;
+            g_initialized = true;
+            logf("AiDA Standalone: Live inspection bridge initialized with kernel driver backend.\n");
+            return true;
+        }
+
+        g_initialized = true;
+        logf("AiDA Standalone: Kernel driver unavailable, using user-mode fallback bridge.\n");
+        return true;
+    }
+
+    bool load_kernel_driver()
+    {
+        std::lock_guard<std::mutex> lk(g_state_mtx);
+        if (g_kernel_mode && device && device->is_connected())
+            return true;
+
+        if (!driver_loader::initialize_and_load()) {
+            set_last_error_locked("Failed to load the kernel driver.");
+            return false;
+        }
+        if (!device || !device->connect()) {
+            set_last_error_locked("Kernel driver loaded, but user-mode bridge failed to connect to device.");
+            return false;
+        }
+
+        g_kernel_mode = true;
         g_initialized = true;
         set_last_error_locked({});
-        logf("AiDA Standalone: Live inspection bridge initialized in user mode.\n");
+        logf("AiDA Standalone: Kernel driver backend is active.\n");
         return true;
     }
 
@@ -131,21 +195,39 @@ namespace driver_bridge
         return g_initialized;
     }
 
+    bool using_kernel_driver()
+    {
+        std::lock_guard<std::mutex> lk(g_state_mtx);
+        return g_kernel_mode && device && device->is_connected();
+    }
+
     bool attach(uint32_t pid)
     {
+        std::lock_guard<std::mutex> lk(g_state_mtx);
+        if (g_kernel_mode && device && device->is_connected()) {
+            device->set_process_id(pid);
+            device->solve_dtb();
+            if (device->get_dtb() == 0) {
+                set_last_error_locked("Kernel bridge failed to resolve target DTB.");
+                return false;
+            }
+            const auto image_base = device->find_image();
+            if (image_base != 0)
+                device->set_base_address(image_base);
+        }
+
         unique_handle process(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
-        if (!process) {
-            std::lock_guard<std::mutex> lk(g_state_mtx);
+        close_process_handle_locked();
+        g_process = process.release();
+        g_pid = pid;
+        if (!refresh_process_name_locked())
+            g_process_name = process_name_from_pid(pid);
+
+        if (!g_kernel_mode && !g_process) {
             set_last_error_locked("Failed to open the target process for read-only inspection.");
             return false;
         }
 
-        std::lock_guard<std::mutex> lk(g_state_mtx);
-        if (g_process)
-            CloseHandle(g_process);
-        g_process = process.release();
-        g_pid = pid;
-        refresh_process_name_locked();
         set_last_error_locked({});
         logf("AiDA Standalone: Attached to PID %u (%s).\n",
              g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str());
@@ -154,6 +236,16 @@ namespace driver_bridge
 
     bool attach_by_name(const std::string& process_name)
     {
+        uint32_t kernel_pid = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            if (g_kernel_mode && device && device->is_connected()) {
+                kernel_pid = device->find_process(process_name.c_str());
+            }
+        }
+        if (kernel_pid != 0)
+            return attach(kernel_pid);
+
         auto lowered = to_lower_copy(process_name);
         for (const auto& proc : enumerate_processes()) {
             if (to_lower_copy(proc.name) == lowered)
@@ -168,12 +260,11 @@ namespace driver_bridge
     void detach()
     {
         std::lock_guard<std::mutex> lk(g_state_mtx);
-        if (g_process) {
-            CloseHandle(g_process);
-            g_process = nullptr;
-        }
+        close_process_handle_locked();
         g_pid = 0;
         g_process_name.clear();
+        if (g_kernel_mode && device && device->is_connected())
+            device->clear_process_context();
         set_last_error_locked({});
     }
 
@@ -182,11 +273,16 @@ namespace driver_bridge
         std::lock_guard<std::mutex> lk(g_state_mtx);
         if (!g_initialized)
             return "Live inspection bridge: not initialized";
-        if (!g_process || g_pid == 0)
-            return "Live inspection bridge: ready (no process attached)";
+        const bool kernel_active = g_kernel_mode && device && device->is_connected();
+        if (g_pid == 0) {
+            return kernel_active
+                ? "Live inspection bridge: kernel backend ready (no process attached)"
+                : "Live inspection bridge: user-mode backend ready (no process attached)";
+        }
 
         char buf[256];
-        snprintf(buf, sizeof(buf), "Live inspection bridge: attached to PID %u (%s)",
+        snprintf(buf, sizeof(buf), "Live inspection bridge: %s attached to PID %u (%s)",
+                 kernel_active ? "kernel backend" : "user-mode backend",
                  g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str());
         return buf;
     }
@@ -302,10 +398,29 @@ namespace driver_bridge
     {
         std::vector<memory_region_t> result;
         HANDLE process = nullptr;
+        bool kernel_mode = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             process = g_process;
+            kernel_mode = g_kernel_mode && device && device->is_connected();
         }
+
+        if (kernel_mode) {
+            const auto regions = device->enumerate_memory_regions(0, 0, false);
+            for (const auto& src : regions) {
+                memory_region_t region;
+                region.base = src.base;
+                region.size = src.size;
+                region.state = src.state;
+                region.protect = src.protect;
+                region.type = src.type;
+                result.push_back(region);
+                if (result.size() >= max_regions)
+                    break;
+            }
+            return result;
+        }
+
         if (!process)
             return result;
 
@@ -333,10 +448,26 @@ namespace driver_bridge
     bool query_memory(uint64_t address, memory_region_t& region)
     {
         HANDLE process = nullptr;
+        bool kernel_mode = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             process = g_process;
+            kernel_mode = g_kernel_mode && device && device->is_connected();
         }
+
+        if (kernel_mode) {
+            voyager::device_t::memory_region_info info = {};
+            if (!device->query_memory(address, info))
+                return false;
+
+            region.base = info.base;
+            region.size = info.size;
+            region.state = info.state;
+            region.protect = info.protect;
+            region.type = info.type;
+            return true;
+        }
+
         if (!process)
             return false;
 
@@ -356,11 +487,27 @@ namespace driver_bridge
     {
         out.clear();
         HANDLE process = nullptr;
+        bool kernel_mode = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             process = g_process;
+            kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!process || size == 0)
+        if (size == 0)
+            return false;
+
+        if (kernel_mode) {
+            out.resize(size);
+            const auto bytes_read = device->read_raw(address, out.data(), size);
+            if (bytes_read == 0) {
+                out.clear();
+                return false;
+            }
+            out.resize(bytes_read);
+            return true;
+        }
+
+        if (!process)
             return false;
 
         out.resize(size);

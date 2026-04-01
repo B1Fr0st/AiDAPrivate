@@ -41,7 +41,9 @@ namespace driver_bridge
     void set_confirm_callback(confirm_fn_t fn);
 
     bool initialize();
+    bool load_kernel_driver();
     bool is_loaded();
+    bool using_kernel_driver();
     bool attach(uint32_t pid);
     bool attach_by_name(const std::string& process_name);
     void detach();
