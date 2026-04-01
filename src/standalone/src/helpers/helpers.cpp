@@ -1,6 +1,7 @@
 #include "helpers.h"
 #include "globals.h"
 #include <commdlg.h>
+#include <shlobj.h>
 #include <fstream>
 #include <map>
 #include <algorithm>
@@ -15,6 +16,10 @@
 #include "../core/standalone_chat.hpp"
 #include "../core/standalone_license.hpp"
 #include "../core/standalone_settings.hpp"
+#include "../core/code_editor.hpp"
+#include "../core/disasm_view.hpp"
+#include "../core/hex_view.hpp"
+#include "../core/chat_render.hpp"
 
 static ID3D11ShaderResourceView* g_send_icon_srv    = nullptr;
 static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
@@ -444,6 +449,70 @@ void helpers::render_title()
 	}
 	globals::ui::accent = themes::resolved.accent;
 
+
+	if (!ImGui::GetIO().WantTextInput) {
+		bool ctrl  = ImGui::GetIO().KeyCtrl;
+		bool shift = ImGui::GetIO().KeyShift;
+
+
+		if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_B, false)) {
+			globals::ui::panel_left_visible = !globals::ui::panel_left_visible;
+			g_sa_settings.workspace.left_visible = globals::ui::panel_left_visible;
+			g_sa_settings.save();
+		}
+
+		if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_J, false)) {
+			globals::ui::panel_right_visible = !globals::ui::panel_right_visible;
+			g_sa_settings.workspace.right_visible = globals::ui::panel_right_visible;
+			g_sa_settings.save();
+		}
+
+		if (ctrl && ImGui::IsKeyPressed(ImGuiKey_GraveAccent, false)) {
+			globals::ui::panel_bottom_visible = !globals::ui::panel_bottom_visible;
+			g_sa_settings.workspace.bottom_visible = globals::ui::panel_bottom_visible;
+			g_sa_settings.save();
+		}
+
+		if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_S, false) && code_editor::active) {
+			code_editor::save();
+		}
+
+		if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
+			file_tabs::open_or_focus("", "untitled", "");
+		}
+
+		if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_W, false)) {
+			file_tabs::close_tab(file_tabs::active_tab);
+		}
+
+		if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_Tab, false)) {
+			if (!file_tabs::tabs.empty()) {
+				file_tabs::active_tab = (file_tabs::active_tab + 1) % (int)file_tabs::tabs.size();
+				auto& t = file_tabs::tabs[file_tabs::active_tab];
+				std::string c; FILE* ff = nullptr; fopen_s(&ff, t.filepath.c_str(), "rb");
+				if (ff) { fseek(ff,0,SEEK_END); long sz=ftell(ff); fseek(ff,0,SEEK_SET); c.resize(sz); fread(&c[0],1,sz,ff); fclose(ff); }
+				code_editor::load(c, t.filename, t.filepath);
+			}
+		}
+
+		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_Tab, false)) {
+			if (!file_tabs::tabs.empty()) {
+				file_tabs::active_tab = (file_tabs::active_tab - 1 + (int)file_tabs::tabs.size()) % (int)file_tabs::tabs.size();
+				auto& t = file_tabs::tabs[file_tabs::active_tab];
+				std::string c; FILE* ff = nullptr; fopen_s(&ff, t.filepath.c_str(), "rb");
+				if (ff) { fseek(ff,0,SEEK_END); long sz=ftell(ff); fseek(ff,0,SEEK_SET); c.resize(sz); fread(&c[0],1,sz,ff); fclose(ff); }
+				code_editor::load(c, t.filename, t.filepath);
+			}
+		}
+
+		if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Comma, false)) {
+			g_settings_open = true;
+		}
+
+		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_P, false)) {
+			globals::ui::command_palette_open = !globals::ui::command_palette_open;
+		}
+	}
 
 	if (!helpers::themes_loaded && g_pd3dDevice) {
 		icon_loader::load(kaneki, sizeof(kaneki), &helpers::theme_kaneki,
@@ -904,16 +973,31 @@ void helpers::render_title()
 	const float pad      = 6.f;
 	const float gap      = 4.f;
 	const float title_h  = 28.f;
+	const float menu_h   = 22.f;
+	const float status_h = 24.f;
 	float ww = globals::ui::window_w;
 	float wh = globals::ui::window_h;
 
+
+	{
+		static bool s_layout_synced = false;
+		if (!s_layout_synced) {
+			globals::ui::panel_left_w  = g_sa_settings.workspace.left_width;
+			globals::ui::panel_right_w = g_sa_settings.workspace.right_width;
+			globals::ui::panel_bottom_h = g_sa_settings.workspace.bottom_height;
+			globals::ui::panel_left_visible  = g_sa_settings.workspace.left_visible;
+			globals::ui::panel_right_visible = g_sa_settings.workspace.right_visible;
+			globals::ui::panel_bottom_visible = g_sa_settings.workspace.bottom_visible;
+			s_layout_synced = true;
+		}
+	}
 
 	float usable = ww - pad * 2.f - gap * 2.f;
 	float min_panel = 80.f;
 	float max_left  = usable * 0.3f;
 	float max_right = usable * 0.4f;
-	float left_w   = globals::ui::panel_left_w;
-	float right_w  = globals::ui::panel_right_w;
+	float left_w   = globals::ui::panel_left_visible ? globals::ui::panel_left_w : 0.f;
+	float right_w  = globals::ui::panel_right_visible ? globals::ui::panel_right_w : 0.f;
 	float center_w = usable - left_w - right_w;
 	if (center_w < 200.f) {
 
@@ -925,13 +1009,17 @@ void helpers::render_title()
 		}
 		center_w = 200.f;
 	}
-	if (left_w  < min_panel) left_w  = min_panel;
-	if (right_w < min_panel) right_w = min_panel;
-	globals::ui::panel_left_w  = left_w;
-	globals::ui::panel_right_w = right_w;
+	if (globals::ui::panel_left_visible && left_w < min_panel) left_w = min_panel;
+	if (globals::ui::panel_right_visible && right_w < min_panel) right_w = min_panel;
+	if (globals::ui::panel_left_visible) globals::ui::panel_left_w = left_w;
+	if (globals::ui::panel_right_visible) globals::ui::panel_right_w = right_w;
 	center_w = usable - left_w - right_w;
 	if (center_w < 100.f) center_w = 100.f;
-	float total_h  = wh - pad * 2.f - title_h;
+
+	float bottom_h = globals::ui::panel_bottom_visible ? globals::ui::panel_bottom_h : 0.f;
+	float chrome_h = title_h + menu_h + status_h;
+	float total_h  = wh - pad * 2.f - chrome_h - (globals::ui::panel_bottom_visible ? (bottom_h + gap) : 0.f);
+	float content_top = pad + title_h + menu_h;
 
 	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, a);
 
@@ -1474,12 +1562,296 @@ void helpers::render_title()
 
 	{
 		ImVec2 wp = ImGui::GetWindowPos();
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		float ax = globals::ui::accent.x * 255.f;
+		float ay = globals::ui::accent.y * 255.f;
+		float az = globals::ui::accent.z * 255.f;
+		float my0 = wp.y + title_h;
+		float my1 = my0 + menu_h;
+
+
+		dl->AddRectFilled(ImVec2(wp.x, my0), ImVec2(wp.x + ww, my1),
+			IM_COL32(18, 18, 24, (int)(230 * a)));
+		dl->AddLine(ImVec2(wp.x, my1), ImVec2(wp.x + ww, my1),
+			IM_COL32(255, 255, 255, (int)(6 * a)));
+
+		struct MenuItem {
+			const char* label;
+			int         id;
+		};
+		static const MenuItem menus[] = {
+			{"File", 0}, {"Edit", 1}, {"View", 2}, {"Tools", 3}, {"AI", 4}, {"Help", 5}
+		};
+
+		float mx_cursor = wp.x + 12.f;
+		for (int i = 0; i < 6; i++) {
+			ImVec2 ts = ImGui::CalcTextSize(menus[i].label);
+			float btn_w = ts.x + 16.f;
+			ImVec2 bmin(mx_cursor, my0 + 1.f);
+			ImVec2 bmax(mx_cursor + btn_w, my1 - 1.f);
+			bool hov = ImGui::IsMouseHoveringRect(bmin, bmax);
+			bool is_open = (menu_bar::open_menu == i);
+
+			if (hov || is_open)
+				dl->AddRectFilled(bmin, bmax, IM_COL32(255, 255, 255, is_open ? (int)(18 * a) : (int)(10 * a)), 3.f);
+
+			dl->AddText(ImVec2(mx_cursor + 8.f, my0 + (menu_h - ts.y) * 0.5f),
+				IM_COL32(200, 200, 215, (int)((hov || is_open ? 255 : 180) * a)), menus[i].label);
+
+			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+				menu_bar::open_menu = is_open ? -1 : i;
+				menu_bar::any_open = (menu_bar::open_menu >= 0);
+			}
+			if (hov && menu_bar::any_open && !is_open) {
+				menu_bar::open_menu = i;
+			}
+
+
+			if (is_open) {
+				ImGui::SetNextWindowPos(ImVec2(bmin.x, my1 + 1.f));
+				ImGui::SetNextWindowBgAlpha(0.97f);
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.f);
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.f, 6.f));
+				ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
+				ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.09f, 0.09f, 0.13f, 1.f));
+				ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1, 1, 1, 0.06f));
+
+				char popup_id[32];
+				snprintf(popup_id, sizeof(popup_id), "##menu_%d", i);
+				ImGui::OpenPopup(popup_id);
+
+				if (ImGui::BeginPopup(popup_id)) {
+					float mw = 210.f;
+					float ih = 24.f;
+
+					auto menu_item = [&](const char* label, const char* shortcut, bool enabled = true) -> bool {
+						ImVec2 cp = ImGui::GetCursorScreenPos();
+						ImVec2 rmin = cp;
+						ImVec2 rmax(cp.x + mw, cp.y + ih);
+						bool mhov = enabled && ImGui::IsMouseHoveringRect(rmin, rmax);
+						if (mhov) ImGui::GetWindowDrawList()->AddRectFilled(rmin, rmax, IM_COL32(255, 255, 255, 14), 3.f);
+						ImU32 tc = enabled ? IM_COL32(210, 210, 220, 230) : IM_COL32(100, 100, 110, 120);
+						ImGui::GetWindowDrawList()->AddText(ImVec2(cp.x + 12.f, cp.y + (ih - ImGui::GetFontSize()) * 0.5f), tc, label);
+						if (shortcut && shortcut[0]) {
+							ImVec2 sts = ImGui::CalcTextSize(shortcut);
+							ImGui::GetWindowDrawList()->AddText(ImVec2(cp.x + mw - sts.x - 12.f, cp.y + (ih - ImGui::GetFontSize()) * 0.5f),
+								IM_COL32(100, 100, 120, 150), shortcut);
+						}
+						ImGui::Dummy(ImVec2(mw, ih));
+						bool clicked = mhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+						if (clicked) { menu_bar::open_menu = -1; menu_bar::any_open = false; ImGui::CloseCurrentPopup(); }
+						return clicked;
+					};
+
+					auto menu_sep = [&]() {
+						ImVec2 cp = ImGui::GetCursorScreenPos();
+						ImGui::GetWindowDrawList()->AddLine(ImVec2(cp.x + 8.f, cp.y + 3.f), ImVec2(cp.x + mw - 8.f, cp.y + 3.f),
+							IM_COL32(255, 255, 255, 14));
+						ImGui::Dummy(ImVec2(mw, 7.f));
+					};
+
+					switch (i) {
+					case 0:
+					{
+						if (menu_item("New File", "Ctrl+N")) {
+							code_editor::load("", "untitled", "");
+							file_tabs::open_or_focus("", "untitled", "");
+						}
+						if (menu_item("Open File...", "Ctrl+O")) {
+							char buf[MAX_PATH] = {};
+							OPENFILENAMEA ofn = {};
+							ofn.lStructSize = sizeof(ofn);
+							ofn.hwndOwner = g_hwnd;
+							ofn.lpstrFile = buf;
+							ofn.nMaxFile = MAX_PATH;
+							ofn.lpstrFilter = "All Files\0*.*\0C/C++\0*.c;*.cpp;*.h;*.hpp\0";
+							ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+							if (GetOpenFileNameA(&ofn)) {
+								std::string content;
+								FILE* f = nullptr;
+								fopen_s(&f, buf, "rb");
+								if (f) {
+									fseek(f, 0, SEEK_END);
+									long sz = ftell(f);
+									fseek(f, 0, SEEK_SET);
+									content.resize(sz);
+									fread(&content[0], 1, sz, f);
+									fclose(f);
+								}
+								std::string fname = buf;
+								auto pos = fname.find_last_of("\\/");
+								if (pos != std::string::npos) fname = fname.substr(pos + 1);
+								file_tabs::open_or_focus(buf, fname, content);
+							}
+						}
+						if (menu_item("Open Folder...", "Ctrl+K")) {
+							char folder[MAX_PATH] = {};
+							BROWSEINFOA bi = {};
+							bi.lpszTitle = "Open Workspace Folder";
+							bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+							PIDLIST_ABSOLUTE pid = SHBrowseForFolderA(&bi);
+							if (pid) {
+								SHGetPathFromIDListA(pid, folder);
+								CoTaskMemFree(pid);
+								file_browser::refresh(folder);
+								g_sa_settings.workspace.root_path = folder;
+								g_sa_settings.save();
+							}
+						}
+						menu_sep();
+						if (menu_item("Save", "Ctrl+S", code_editor::active)) {
+							code_editor::save();
+						}
+						if (menu_item("Save As...", "Ctrl+Shift+S", code_editor::active)) {
+							char buf[MAX_PATH] = {};
+							if (!code_editor::filename.empty())
+								strncpy_s(buf, code_editor::filename.c_str(), _TRUNCATE);
+							OPENFILENAMEA sfn = {};
+							sfn.lStructSize = sizeof(sfn);
+							sfn.hwndOwner = g_hwnd;
+							sfn.lpstrFile = buf;
+							sfn.nMaxFile = MAX_PATH;
+							sfn.lpstrFilter = "All Files\0*.*\0";
+							sfn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+							if (GetSaveFileNameA(&sfn)) {
+								code_editor::filepath = buf;
+								std::string fn = buf;
+								auto p = fn.find_last_of("\\/");
+								if (p != std::string::npos) fn = fn.substr(p + 1);
+								code_editor::filename = fn;
+								code_editor::save();
+							}
+						}
+						menu_sep();
+						if (menu_item("Exit", "Alt+F4")) {
+							DestroyWindow(g_hwnd);
+						}
+						break;
+					}
+					case 1:
+					{
+						menu_item("Undo",    "Ctrl+Z", false);
+						menu_item("Redo",    "Ctrl+Y", false);
+						menu_sep();
+						menu_item("Cut",     "Ctrl+X", false);
+						menu_item("Copy",    "Ctrl+C", false);
+						menu_item("Paste",   "Ctrl+V", false);
+						menu_sep();
+						menu_item("Find",    "Ctrl+F", false);
+						menu_item("Replace", "Ctrl+H", false);
+						break;
+					}
+					case 2:
+					{
+						if (menu_item(globals::ui::panel_left_visible ? "Hide Explorer" : "Show Explorer", "Ctrl+B")) {
+							globals::ui::panel_left_visible = !globals::ui::panel_left_visible;
+							g_sa_settings.workspace.left_visible = globals::ui::panel_left_visible;
+							g_sa_settings.save();
+						}
+						if (menu_item(globals::ui::panel_right_visible ? "Hide Chat" : "Show Chat", "Ctrl+J")) {
+							globals::ui::panel_right_visible = !globals::ui::panel_right_visible;
+							g_sa_settings.workspace.right_visible = globals::ui::panel_right_visible;
+							g_sa_settings.save();
+						}
+						if (menu_item(globals::ui::panel_bottom_visible ? "Hide Output" : "Show Output", "Ctrl+`")) {
+							globals::ui::panel_bottom_visible = !globals::ui::panel_bottom_visible;
+							g_sa_settings.workspace.bottom_visible = globals::ui::panel_bottom_visible;
+							g_sa_settings.save();
+						}
+						menu_sep();
+						menu_item("Zoom In",  "Ctrl+=", false);
+						menu_item("Zoom Out", "Ctrl+-", false);
+						break;
+					}
+					case 3:
+					{
+						if (menu_item("Load PE File...", "")) {
+							std::string fpath = disasm::open_file_dialog(g_hwnd);
+							if (!fpath.empty()) {
+								g_disasm.file = DisasmFile{};
+								disasm::load_pe(fpath, g_disasm.file);
+								if (g_disasm.file.loaded) disasm::decode_section(g_disasm.file);
+							}
+						}
+						menu_item("Attach to Process...", "", false);
+						menu_sep();
+						if (menu_item("MCP Servers", "")) {
+							g_settings_open = true;
+						}
+						menu_item("Driver Status", "", false);
+						break;
+					}
+					case 4:
+					{
+						if (menu_item("New Chat", "Ctrl+L")) {
+							g_chat_messages.clear();
+						}
+						if (menu_item("Model Settings", "")) {
+							g_settings_open = true;
+						}
+						if (menu_item("Clear History", "")) {
+							g_chat_messages.clear();
+						}
+						break;
+					}
+					case 5:
+					{
+						menu_item("About", "");
+						menu_item("Keyboard Shortcuts", "Ctrl+K Ctrl+S", false);
+						break;
+					}
+					}
+					ImGui::EndPopup();
+				} else {
+					menu_bar::open_menu = -1;
+					menu_bar::any_open = false;
+				}
+				ImGui::PopStyleColor(2);
+				ImGui::PopStyleVar(3);
+			}
+
+			mx_cursor += btn_w;
+		}
+
+
+		if (menu_bar::any_open && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+			!ImGui::IsMouseHoveringRect(ImVec2(wp.x, my0), ImVec2(wp.x + ww, my1)) &&
+			!ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+			menu_bar::open_menu = -1;
+			menu_bar::any_open = false;
+		}
+
+
+		if (ImGui::GetIO().KeyCtrl) {
+			if (ImGui::IsKeyPressed(ImGuiKey_S) && code_editor::active)
+				code_editor::save();
+			if (ImGui::IsKeyPressed(ImGuiKey_B)) {
+				globals::ui::panel_left_visible = !globals::ui::panel_left_visible;
+				g_sa_settings.workspace.left_visible = globals::ui::panel_left_visible;
+			}
+			if (ImGui::IsKeyPressed(ImGuiKey_J)) {
+				globals::ui::panel_right_visible = !globals::ui::panel_right_visible;
+				g_sa_settings.workspace.right_visible = globals::ui::panel_right_visible;
+			}
+			if (ImGui::IsKeyPressed(ImGuiKey_GraveAccent)) {
+				globals::ui::panel_bottom_visible = !globals::ui::panel_bottom_visible;
+				g_sa_settings.workspace.bottom_visible = globals::ui::panel_bottom_visible;
+			}
+			if (ImGui::IsKeyPressed(ImGuiKey_L)) {
+				g_chat_messages.clear();
+			}
+		}
+	}
+
+
+	{
+		ImVec2 wp = ImGui::GetWindowPos();
 		float  sp_w = 5.f;
 
 
 		float ls_x = wp.x + pad + left_w;
-		ImVec2 ls_min(ls_x - sp_w * 0.5f, wp.y + title_h + pad);
-		ImVec2 ls_max(ls_x + sp_w * 0.5f + gap, wp.y + title_h + pad + total_h);
+		ImVec2 ls_min(ls_x - sp_w * 0.5f, wp.y + content_top);
+		ImVec2 ls_max(ls_x + sp_w * 0.5f + gap, wp.y + content_top + total_h);
 
 		bool ls_hov = ImGui::IsMouseHoveringRect(ls_min, ls_max);
 		if (ls_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -1496,10 +1868,10 @@ void helpers::render_title()
 
 
 		float rs_x = wp.x + ww - pad - right_w;
-		ImVec2 rs_min(rs_x - sp_w * 0.5f - gap, wp.y + title_h + pad);
-		ImVec2 rs_max(rs_x + sp_w * 0.5f, wp.y + title_h + pad + total_h);
+		ImVec2 rs_min(rs_x - sp_w * 0.5f - gap, wp.y + content_top);
+		ImVec2 rs_max(rs_x + sp_w * 0.5f, wp.y + content_top + total_h);
 
-		bool rs_hov = ImGui::IsMouseHoveringRect(rs_min, rs_max);
+		bool rs_hov = globals::ui::panel_right_visible && ImGui::IsMouseHoveringRect(rs_min, rs_max);
 		if (rs_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			globals::ui::dragging_right_splitter = true;
 		if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
@@ -1513,10 +1885,31 @@ void helpers::render_title()
 		if (rs_hov) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
 
-		left_w   = globals::ui::panel_left_w;
-		right_w  = globals::ui::panel_right_w;
+		if (globals::ui::panel_bottom_visible) {
+			float bs_y = wp.y + content_top + total_h;
+			ImVec2 bs_min(wp.x + pad, bs_y - sp_w * 0.5f);
+			ImVec2 bs_max(wp.x + ww - pad, bs_y + sp_w * 0.5f + gap);
+			bool bs_hov = ImGui::IsMouseHoveringRect(bs_min, bs_max);
+			if (bs_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+				globals::ui::dragging_bottom_splitter = true;
+			if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+				globals::ui::dragging_bottom_splitter = false;
+			if (globals::ui::dragging_bottom_splitter) {
+				float my = wp.y + wh - pad - status_h - ImGui::GetIO().MousePos.y;
+				globals::ui::panel_bottom_h = std::clamp(my, 80.f, wh * 0.5f);
+
+			}
+			if (bs_hov || globals::ui::dragging_bottom_splitter)
+				ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+		}
+
+		left_w   = globals::ui::panel_left_visible ? globals::ui::panel_left_w : 0.f;
+		right_w  = globals::ui::panel_right_visible ? globals::ui::panel_right_w : 0.f;
 		center_w = ww - left_w - right_w - pad * 2.f - gap * 2.f;
 		if (center_w < 200.f) center_w = 200.f;
+
+		bottom_h = globals::ui::panel_bottom_visible ? globals::ui::panel_bottom_h : 0.f;
+		total_h = wh - pad * 2.f - chrome_h - (globals::ui::panel_bottom_visible ? (bottom_h + gap) : 0.f);
 	}
 
 	float ax3 = globals::ui::accent.x, ay3 = globals::ui::accent.y, az3 = globals::ui::accent.z;
@@ -1535,7 +1928,8 @@ void helpers::render_title()
 
 
 	float fb_x = pad;
-	float fb_y = pad + title_h;
+	float fb_y = content_top;
+	if (globals::ui::panel_left_visible) {
 	ImGui::SetCursorPos(ImVec2(fb_x, fb_y));
 	begin_child("##filebrowser", ImVec2(fb_x, fb_y), ImVec2(left_w, total_h), a);
 	{
@@ -1598,12 +1992,14 @@ void helpers::render_title()
 		ImGui::PopStyleVar();
 	}
 	end_child();
+	}
 
-
-	float hx0 = wp_m.x + pad + left_w + gap, hy0 = wp_m.y + pad + title_h;
+	float left_gap = globals::ui::panel_left_visible ? (left_w + gap) : 0.f;
+	float right_gap_w = globals::ui::panel_right_visible ? (right_w + gap) : 0.f;
+	float hx0 = wp_m.x + pad + left_gap, hy0 = wp_m.y + content_top;
 	float hx1  = hx0 + center_w;
 	float hy1  = hy0 + hdr_h;
-	float dc_y1 = wp_m.y + pad + title_h + total_h;
+	float dc_y1 = wp_m.y + content_top + total_h;
 
 	auto& th_cp = themes::resolved;
 
@@ -1750,10 +2146,10 @@ void helpers::render_title()
 	}
 
 
-	float disasm_child_y = pad + title_h + hdr_h + 1.f;
+	float disasm_child_y = content_top + hdr_h + 1.f;
 	float disasm_child_h = total_h - hdr_h - 1.f;
 	const float di_pad   = 6.f;
-	ImGui::SetCursorPos(ImVec2(pad + left_w + gap + di_pad, disasm_child_y + di_pad));
+	ImGui::SetCursorPos(ImVec2(pad + left_gap + di_pad, disasm_child_y + di_pad));
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f,0.f));
 	ImGui::BeginChild("##center_content_scroll",
 		ImVec2(center_w - di_pad*2.f, disasm_child_h - di_pad*2.f),
@@ -1767,178 +2163,14 @@ void helpers::render_title()
 		float th = disasm_child_h - di_pad * 2.f;
 
 
-		if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
-			code_editor::save();
-		}
+		ImGui::SetCursorPos(ImVec2(0.f, 0.f));
+		code_editor_widget::render(0.f, 0.f, tw, th, a, ax3, ay3, az3);
 
-
-		const float gutter_w = 48.f;
-		ImDrawList* tdl = ImGui::GetWindowDrawList();
-		ImVec2 torig = ImGui::GetWindowPos();
-
-
-		float editor_x = gutter_w + 4.f;
-		float editor_w = tw - gutter_w - 8.f;
-		ImGui::SetCursorPos(ImVec2(editor_x, 0.f));
-
-
-		bool ac_active = editor_config::auto_complete && autocomplete::enabled;
-		if (ac_active && autocomplete::popup_visible) {
-			if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-				autocomplete::popup_visible = false;
-				autocomplete::matches.clear();
-			}
-			if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true) && !autocomplete::matches.empty()) {
-				autocomplete::selected = (autocomplete::selected - 1 + (int)autocomplete::matches.size())
-					% (int)autocomplete::matches.size();
-			}
-			if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true) && !autocomplete::matches.empty()) {
-				autocomplete::selected = (autocomplete::selected + 1) % (int)autocomplete::matches.size();
-			}
-		}
-
-		ImGuiInputTextFlags ed_flags = ImGuiInputTextFlags_CallbackAlways;
-		if (ac_active && autocomplete::popup_visible)
-			ed_flags |= ImGuiInputTextFlags_CallbackCompletion;
-		else
-			ed_flags |= ImGuiInputTextFlags_AllowTabInput;
-
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.f, 0.f, 0.f, 0.f));
-		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.82f, 0.92f, a));
-		ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, ImVec4(0.f, 0.f, 0.f, 0.f));
-		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, 2.f));
-		ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.f);
-
-		if (ImGui::InputTextMultiline("##code_editor",
-			code_editor::buffer.data(), code_editor::buffer.size(),
-			ImVec2(editor_w, th),
-			ed_flags,
-			[](ImGuiInputTextCallbackData* data) -> int {
-
-				if (data->EventFlag == ImGuiInputTextFlags_CallbackCompletion) {
-					if (!autocomplete::matches.empty() &&
-						autocomplete::selected < (int)autocomplete::matches.size()) {
-						int cursor = data->CursorPos;
-						int ws = cursor;
-						while (ws > 0 && (isalnum((unsigned char)data->Buf[ws-1]) || data->Buf[ws-1] == '_'))
-							ws--;
-						data->DeleteChars(ws, cursor - ws);
-						data->InsertChars(ws, autocomplete::matches[autocomplete::selected].c_str());
-					}
-					autocomplete::popup_visible = false;
-					autocomplete::matches.clear();
-					return 1;
-				}
-
-				if (data->EventFlag == ImGuiInputTextFlags_CallbackAlways) {
-					autocomplete::cursor_byte = data->CursorPos;
-					int cursor = data->CursorPos;
-					int ws = cursor;
-					while (ws > 0 && (isalnum((unsigned char)data->Buf[ws-1]) || data->Buf[ws-1] == '_'))
-						ws--;
-					if (cursor > ws) {
-						autocomplete::partial = std::string(data->Buf + ws, cursor - ws);
-						autocomplete::find_matches(autocomplete::partial);
-						autocomplete::popup_visible = !autocomplete::matches.empty();
-					} else {
-						autocomplete::partial.clear();
-						autocomplete::popup_visible = false;
-						autocomplete::matches.clear();
-					}
-					int line = 0, col = 0;
-					for (int i = 0; i < data->CursorPos && i < data->BufTextLen; i++) {
-						if (data->Buf[i] == '\n') { line++; col = 0; }
-						else col++;
-					}
-					autocomplete::cursor_line = line;
-					autocomplete::cursor_col = col;
-				}
-				code_editor::dirty = true;
-				return 0;
-			}))
-		{
-			code_editor::dirty = true;
-		}
-
-		ImGui::PopStyleVar(2);
-		ImGui::PopStyleColor(3);
-
-
-		float line_h = ImGui::GetFontSize() + 2.f;
-		float scroll_y = ImGui::GetScrollY();
-		float vis_h = th;
-
-
-		if (ac_active && autocomplete::popup_visible && !autocomplete::matches.empty()) {
-			float popup_w = 220.f;
-			float ac_item_h = 22.f;
-			float popup_h = std::min((float)autocomplete::matches.size(), 8.f) * ac_item_h + 8.f;
-			float char_w  = ImGui::CalcTextSize("A").x;
-			float sx = torig.x + editor_x + 4.f + char_w * autocomplete::cursor_col;
-			float sy = torig.y + line_h * (autocomplete::cursor_line + 1) - scroll_y + 4.f;
-
-
-			if (sx + popup_w > torig.x + tw) sx = torig.x + tw - popup_w - 4.f;
-			if (sy + popup_h > torig.y + th) sy = torig.y + line_h * autocomplete::cursor_line - scroll_y - popup_h;
-
-			ImDrawList* acdl = ImGui::GetForegroundDrawList();
-			acdl->AddRectFilled(ImVec2(sx, sy), ImVec2(sx + popup_w, sy + popup_h),
-				IM_COL32(20, 20, 30, 240), 6.f);
-			acdl->AddRect(ImVec2(sx, sy), ImVec2(sx + popup_w, sy + popup_h),
-				IM_COL32(80, 80, 130, 100), 6.f);
-
-			for (int mi = 0; mi < (int)autocomplete::matches.size() && mi < 8; mi++) {
-				float iy = sy + 4.f + mi * ac_item_h;
-				if (mi == autocomplete::selected) {
-					acdl->AddRectFilled(ImVec2(sx + 2.f, iy), ImVec2(sx + popup_w - 2.f, iy + ac_item_h),
-						IM_COL32((int)(ax3*255), (int)(ay3*255), (int)(az3*255), 50), 4.f);
-				}
-				auto& match = autocomplete::matches[mi];
-				size_t plen = autocomplete::partial.size();
-				if (plen > 0 && plen <= match.size()) {
-					acdl->AddText(ImVec2(sx + 8.f, iy + 2.f),
-						IM_COL32((int)(ax3*255), (int)(ay3*255), (int)(az3*255), 255),
-						match.c_str(), match.c_str() + plen);
-					float prefix_w = ImGui::CalcTextSize(match.c_str(), match.c_str() + plen).x;
-					acdl->AddText(ImVec2(sx + 8.f + prefix_w, iy + 2.f),
-						IM_COL32(200, 200, 220, 220), match.c_str() + plen);
-				} else {
-					acdl->AddText(ImVec2(sx + 8.f, iy + 2.f),
-						IM_COL32(200, 200, 220, 220), match.c_str());
-				}
-			}
-		}
-
-
-		const char* txt = code_editor::buffer.data();
-		int n_lines = 1;
-		for (const char* p = txt; *p; p++)
-			if (*p == '\n') n_lines++;
-
-
-		tdl->AddLine(ImVec2(torig.x + gutter_w, torig.y),
-			ImVec2(torig.x + gutter_w, torig.y + vis_h),
-			IM_COL32(255, 255, 255, (int)(10 * a)), 1.f);
-
-		int first_row = std::max(0, (int)(scroll_y / line_h) - 1);
-		int last_row = std::min(n_lines - 1, (int)((scroll_y + vis_h) / line_h) + 1);
-
-		for (int i = first_row; i <= last_row; i++) {
-			float y = torig.y + i * line_h - scroll_y + 2.f;
-
-			if (i & 1)
-				tdl->AddRectFilled(ImVec2(torig.x, y), ImVec2(torig.x + gutter_w, y + line_h - 1.f),
-					IM_COL32(255, 255, 255, (int)(3.f * a)));
-
-			char ln_buf[8];
-			snprintf(ln_buf, sizeof(ln_buf), "%4d", i + 1);
-			tdl->AddText(ImVec2(torig.x + 4.f, y + 1.f),
-				IM_COL32(75, 85, 120, (int)(140 * a)), ln_buf);
-		}
 
 		if (ID3D11ShaderResourceView* icon_srv = get_active_theme_icon()) {
-			float src_w = 0.f;
-			float src_h = 0.f;
+			ImDrawList* tdl = ImGui::GetWindowDrawList();
+			ImVec2 torig = ImGui::GetWindowPos();
+			float src_w = 0.f, src_h = 0.f;
 			int icon_idx = g_sa_settings.theme_icon_index;
 			if (custom_themes::active_custom >= 0 &&
 			    custom_themes::active_custom < (int)custom_themes::list.size())
@@ -1950,15 +2182,14 @@ void helpers::render_title()
 				src_w = (float)g_theme_icon_w[icon_idx];
 				src_h = (float)g_theme_icon_h[icon_idx];
 			}
-
 			if (src_w > 0.f && src_h > 0.f) {
 				const float max_h = th * 0.38f;
-				const float max_w = editor_w * 0.28f;
+				const float max_w = tw * 0.28f;
 				const float scale = std::min(max_w / src_w, max_h / src_h);
 				const float draw_w = src_w * scale;
 				const float draw_h = src_h * scale;
 				const float icon_pad = 18.f;
-				const ImVec2 img_min(torig.x + gutter_w + 4.f + editor_w - draw_w - icon_pad,
+				const ImVec2 img_min(torig.x + tw - draw_w - icon_pad,
 				                     torig.y + th - draw_h - icon_pad);
 				const ImVec2 img_max(img_min.x + draw_w, img_min.y + draw_h);
 				tdl->AddImage((ImTextureID)icon_srv, img_min, img_max,
@@ -1969,24 +2200,15 @@ void helpers::render_title()
 
 	else
 	{
-		ImDrawList* cdl  = ImGui::GetWindowDrawList();
-		ImVec2      orig = ImGui::GetWindowPos();
-		float       iw   = center_w - di_pad*2.f;
-
-
-		static float addr_col_w = 0.f;
-		if (addr_col_w == 0.f)
-			addr_col_w = ImGui::CalcTextSize("0000000140001000").x + 6.f;
-
-		const float lh     = 18.f;
-		const float x_addr = orig.x + 4.f;
-		const float x_vsep = x_addr + addr_col_w;
-		const float x_mnem = x_vsep + 10.f;
-		const float x_ops  = x_mnem + 72.f;
+		float iw = center_w - di_pad * 2.f;
+		float ih = disasm_child_h - di_pad * 2.f;
 
 		const bool has_instrs = !g_disasm.file.instrs.empty();
 		if (!has_instrs)
 		{
+
+			ImDrawList* cdl  = ImGui::GetWindowDrawList();
+			ImVec2      orig = ImGui::GetWindowPos();
 
 			ID3D11ShaderResourceView* icon_srv = get_active_theme_icon();
 			if (icon_srv) {
@@ -1994,8 +2216,7 @@ void helpers::render_title()
 				if (custom_themes::active_custom >= 0 &&
 				    custom_themes::active_custom < (int)custom_themes::list.size())
 					icon_idx = custom_themes::list[custom_themes::active_custom].icon_index;
-				float src_w = 0.f;
-				float src_h = 0.f;
+				float src_w = 0.f, src_h = 0.f;
 				if (icon_idx < 0 && g_custom_theme_icon_w > 0 && g_custom_theme_icon_h > 0) {
 					src_w = (float)g_custom_theme_icon_w;
 					src_h = (float)g_custom_theme_icon_h;
@@ -2023,181 +2244,25 @@ void helpers::render_title()
 			const char* hint = !g_disasm.file.err.empty()     ? g_disasm.file.err.c_str()
 				             : !g_disasm.file.loaded           ? "Choose a file to begin"
 				             :                                   "Click 'Index Binary' to disassemble";
+			ImDrawList* cdl2 = ImGui::GetWindowDrawList();
+			ImVec2      orig2 = ImGui::GetWindowPos();
 			ImVec2 ht2 = ImGui::CalcTextSize(hint);
-			float  window_h  = ImGui::GetWindowHeight();
-			cdl->AddText(ImVec2(orig.x + iw*0.5f - ht2.x*0.5f, orig.y + window_h * 0.85f - ht2.y*0.5f),
+			float  window_h = ImGui::GetWindowHeight();
+			cdl2->AddText(ImVec2(orig2.x + iw*0.5f - ht2.x*0.5f, orig2.y + window_h * 0.85f - ht2.y*0.5f),
 				IM_COL32(100,100,120,(int)(120*a)), hint);
 		}
 		else
 		{
-			auto& instrs   = g_disasm.file.instrs;
-			int   n        = (int)instrs.size();
-			float scroll_y = ImGui::GetScrollY();
-			float vis_h    = ImGui::GetWindowHeight();
 
-			cdl->AddLine(ImVec2(x_vsep, orig.y), ImVec2(x_vsep, orig.y + vis_h),
-				IM_COL32(255,255,255,(int)(10*a)), 1.f);
-
-			int first_row = std::max(0,   (int)(scroll_y / lh) - 1);
-			int last_row  = std::min(n-1, (int)((scroll_y + vis_h) / lh) + 1);
-
-			for (int i = first_row; i <= last_row; i++)
-			{
-				float y = orig.y + i * lh - scroll_y;
-				const AsmInstr& ins = instrs[i];
-
-
-				if (i & 1)
-					cdl->AddRectFilled(ImVec2(orig.x, y), ImVec2(orig.x + iw, y + lh - 1.f),
-						IM_COL32(255,255,255,(int)(3.f * a)));
-
-				ImGuiID rhid = ImGui::GetID((void*)(intptr_t)(0xD000 + i));
-				float   rh   = ImGui::GetStateStorage()->GetFloat(rhid, 0.f);
-				bool    rhv  = ImGui::IsMouseHoveringRect(
-					ImVec2(orig.x, y), ImVec2(orig.x + iw, y + lh - 1.f), false);
-				rh += ((rhv?1.f:0.f)-rh)*std::min(12.f*dt,1.f);
-				ImGui::GetStateStorage()->SetFloat(rhid, rh);
-
-				if (rh > 0.002f)
-					cdl->AddRectFilled(ImVec2(orig.x, y), ImVec2(orig.x + iw, y + lh - 1.f),
-						IM_COL32(255,255,255,(int)(rh * 12.f * a)));
-				if (ins.is_branch || ins.is_call)
-					cdl->AddRectFilled(ImVec2(orig.x, y), ImVec2(orig.x + iw, y + lh - 1.f), ac_dim);
-
-
-				char addr_buf[20];
-				snprintf(addr_buf, sizeof(addr_buf), "%016llX", (unsigned long long)ins.addr);
-				cdl->AddText(ImVec2(x_addr, y+1.f), IM_COL32(75,95,155,(int)(170*a)), addr_buf);
-
-
-				ImU32 mc = (ins.is_branch||ins.is_call) ? ac_full
-					: ins.is_ret   ? IM_COL32(220,150,150,(int)(230*a))
-					: ins.is_nop   ? IM_COL32(100,100,110,(int)(140*a))
-					: ins.is_priv  ? IM_COL32(220,180,100,(int)(230*a))
-					: IM_COL32(200,200,240,(int)(235*a));
-				cdl->AddText(ImVec2(x_mnem, y+1.f), mc, ins.mnem);
-
-				if (ins.ops[0]) {
-					ImU32 oc = (ins.is_branch||ins.is_call)
-						? IM_COL32(210,215,255,(int)(160*a))
-						: ins.is_nop  ? IM_COL32(80,80,90,(int)(120*a))
-						: ins.is_priv ? IM_COL32(200,170,95,(int)(180*a))
-						: IM_COL32(165,170,190,(int)(210*a));
-					cdl->AddText(ImVec2(x_ops, y+1.f), oc, ins.ops);
-				}
-
-				if (rhv && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-					g_disasm.ctx_row = i;
-					ImGui::OpenPopup("##disasm_ctx");
-				}
-			}
-
-			ImGui::SetCursorPos(ImVec2(0.f, n * lh));
-			ImGui::Dummy(ImVec2(1.f, 1.f));
-
-			static float ctx_t       = 0.f;
-			static bool  ctx_closing = false;
-			static bool  ctx_prev    = false;
-
-			bool ctx_now = ImGui::IsPopupOpen("##disasm_ctx");
-			if (ctx_now && !ctx_prev) { ctx_t = 0.f; ctx_closing = false; }
-			if (!ctx_now) ctx_closing = false;
-			ctx_prev = ctx_now;
-			ctx_t += ((ctx_closing ? 0.f : 1.f) - ctx_t) * std::min(24.f * dt, 1.f);
-			float ctx_a = std::max(0.001f, ctx_t);
-
-			ImGui::SetNextWindowBgAlpha(ctx_a);
-			ImGui::SetNextWindowSizeConstraints(ImVec2(190.f, 0.f), ImVec2(320.f, 400.f));
-			ImGui::PushStyleVar(ImGuiStyleVar_Alpha,          ctx_a * a);
-			ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 7.f);
-			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,  ImVec2(0.f, 6.f));
-			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,    ImVec2(0.f, 0.f));
-			ImGui::PushStyleColor(ImGuiCol_PopupBg,       ImVec4(0.11f, 0.11f, 0.15f, 1.f));
-			ImGui::PushStyleColor(ImGuiCol_Border,        ImVec4(1.f, 1.f, 1.f, 0.08f));
-			ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(1.f, 1.f, 1.f, 0.07f));
-			ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(1.f, 1.f, 1.f, 0.05f));
-			ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.86f, 0.86f, 0.90f, 1.f));
-
-			if (ImGui::BeginPopup("##disasm_ctx"))
-			{
-				if (ctx_closing && ctx_t < 0.05f) ImGui::CloseCurrentPopup();
-
-				if (g_disasm.ctx_row >= 0 && g_disasm.ctx_row < n)
-				{
-					const AsmInstr& ci = instrs[g_disasm.ctx_row];
-
-					char buf_addr[20], buf_line[128], buf_bytes[64] = {};
-					snprintf(buf_addr, sizeof(buf_addr), "%016llX", (unsigned long long)ci.addr);
-					if (ci.ops[0])
-						snprintf(buf_line, sizeof(buf_line), "%016llX  %-8s %s",
-							(unsigned long long)ci.addr, ci.mnem, ci.ops);
-					else
-						snprintf(buf_line, sizeof(buf_line), "%016llX  %s",
-							(unsigned long long)ci.addr, ci.mnem);
-					int boff = 0;
-					for (int b = 0; b < ci.len && boff + 3 < 64; b++)
-						boff += snprintf(buf_bytes + boff, 64 - boff, b ? " %02X" : "%02X", ci.raw[b]);
-
-					ImDrawList* pdl = ImGui::GetWindowDrawList();
-					float pw = ImGui::GetWindowWidth();
-
-
-					ImGui::Dummy(ImVec2(0.f, 2.f));
-					{
-						ImVec2 cp = ImGui::GetCursorScreenPos();
-						char addr_short[22];
-						snprintf(addr_short, sizeof(addr_short), "0x%llX", (unsigned long long)ci.addr);
-						float tw = ImGui::CalcTextSize(addr_short).x;
-						float lh2 = ImGui::GetTextLineHeight();
-						pdl->AddText(ImVec2(cp.x + (pw - tw) * 0.5f, cp.y),
-							IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*ctx_a)), addr_short);
-						ImGui::Dummy(ImVec2(pw, lh2 + 5.f));
-					}
-
-
-					{
-						ImVec2 cp = ImGui::GetCursorScreenPos();
-						pdl->AddLine(ImVec2(cp.x + 8.f, cp.y), ImVec2(cp.x + pw - 8.f, cp.y),
-							IM_COL32(255,255,255,18), 1.f);
-						ImGui::Dummy(ImVec2(0.f, 5.f));
-					}
-
-
-					float item_h = ImGui::GetTextLineHeight() + 10.f;
-					auto ctx_item = [&](const char* label, const char* copy_text) {
-						ImVec2 cp  = ImGui::GetCursorScreenPos();
-						ImVec2 rmin = cp;
-						ImVec2 rmax = ImVec2(cp.x + pw, cp.y + item_h);
-						bool   hov = ImGui::IsMouseHoveringRect(rmin, rmax);
-						bool   clk = hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-						if (hov) pdl->AddRectFilled(rmin, rmax, IM_COL32(255,255,255,14));
-						if (clk) pdl->AddRectFilled(rmin, rmax, IM_COL32(255,255,255,8));
-						float ty = cp.y + (item_h - ImGui::GetTextLineHeight()) * 0.5f;
-						pdl->AddText(ImVec2(cp.x + 14.f, ty),
-							IM_COL32(210, 212, 220, (int)(220 * ctx_a)), label);
-						ImGui::Dummy(ImVec2(pw, item_h));
-						if (clk) { ImGui::SetClipboardText(copy_text); ctx_closing = true; }
-					};
-
-					ctx_item("Copy address", buf_addr);
-					ctx_item("Copy line",    buf_line);
-					ctx_item("Copy bytes",   buf_bytes);
-
-					ImGui::Dummy(ImVec2(0.f, 2.f));
-				}
-				ImGui::EndPopup();
-			}
-
-			ImGui::PopStyleColor(5);
-			ImGui::PopStyleVar(4);
+			disasm_view::render(0.f, 0.f, iw, ih, a, ax3, ay3, az3, g_disasm, dt);
 		}
 	}
 	}
 	ImGui::EndChild();
 	ImGui::PopStyleVar();
 
-
-	begin_child("##chat", ImVec2(pad + left_w + gap + center_w + gap, pad + title_h), ImVec2(right_w, total_h), a);
+	if (globals::ui::panel_right_visible) {
+	begin_child("##chat", ImVec2(pad + left_gap + center_w + gap, content_top), ImVec2(right_w, total_h), a);
 	{
 		float ax = globals::ui::accent.x * 255.f;
 		float ay = globals::ui::accent.y * 255.f;
@@ -2233,6 +2298,22 @@ void helpers::render_title()
 
 		{
 			float gear_sz = 18.f;
+
+			ImVec2 clr_pos(cw - gear_sz * 2.f - 14.f, 3.f);
+			ImGui::SetCursorPos(clr_pos);
+			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
+			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.08f));
+			ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.12f));
+			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.55f,0.60f,1.f));
+			if (ImGui::Button("\xf0\x9f\x97\x91##clear_chat", ImVec2(gear_sz, gear_sz))) {
+				g_chat_messages.clear();
+				g_chat_scroll_to_bottom = true;
+			}
+			ImGui::PopStyleColor(4);
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("Clear chat history");
+
+
 			ImVec2 btn_pos(cw - gear_sz - 8.f, 3.f);
 			ImGui::SetCursorPos(btn_pos);
 			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
@@ -2442,22 +2523,8 @@ void helpers::render_title()
 
 				if (!msg.text.empty() || msg.streaming)
 				{
-					ImVec2 ts = msg.text.empty()
-						? ImVec2(0.f, ImGui::GetFontSize())
-						: ImGui::CalcTextSize(msg.text.c_str(), nullptr, false, wrap_w * 0.82f);
 
-					float target_bw = ts.x + 16.f;
-					float target_bh = ts.y + 10.f;
-
-
-					ImGuiID bwa = ImGui::GetID(("bw_" + std::to_string(mi)).c_str());
-					ImGuiID bha = ImGui::GetID(("bh_" + std::to_string(mi)).c_str());
-					float   bw = s->GetFloat(bwa, 10.f);
-					float   bh = s->GetFloat(bha, target_bh);
-					bw += (target_bw - bw) * std::min(12.f * ImGui::GetIO().DeltaTime, 1.f);
-					bh += (target_bh - bh) * std::min(12.f * ImGui::GetIO().DeltaTime, 1.f);
-					s->SetFloat(bwa, bw);
-					s->SetFloat(bha, bh);
+					float rich_max_w = wrap_w * 0.86f;
 
 
 					ImGuiID fda = ImGui::GetID(("fda_" + std::to_string(mi)).c_str());
@@ -2468,20 +2535,76 @@ void helpers::render_title()
 					float bx = 6.f;
 					float by = cursor_y;
 
-					ImVec2 bmin = ImVec2(wp2.x + bx, wp2.y + by);
-					ImVec2 bmax = ImVec2(bmin.x + bw, bmin.y + bh);
 
+					auto spans = chat_render::parse_markdown(msg.text);
+					bool has_code_blocks = false;
+					for (auto& sp : spans)
+						if (sp.type == chat_render::span_type::code_block) { has_code_blocks = true; break; }
+
+
+					ImVec2 plain_ts = msg.text.empty()
+						? ImVec2(0.f, ImGui::GetFontSize())
+						: ImGui::CalcTextSize(msg.text.c_str(), nullptr, false, rich_max_w);
+
+
+					float est_h = plain_ts.y + 10.f;
+					if (has_code_blocks) est_h *= 1.5f;
+
+
+					ImGuiID bwa = ImGui::GetID(("bw_" + std::to_string(mi)).c_str());
+					ImGuiID bha = ImGui::GetID(("bh_" + std::to_string(mi)).c_str());
+					float   bw = s->GetFloat(bwa, 10.f);
+					float   anim_bh = s->GetFloat(bha, est_h);
+					float target_bw = rich_max_w + 16.f;
+					bw += (target_bw - bw) * std::min(12.f * ImGui::GetIO().DeltaTime, 1.f);
+					s->SetFloat(bwa, bw);
+
+					ImVec2 bmin = ImVec2(wp2.x + bx, wp2.y + by);
+
+
+					auto rr = chat_render::render_rich_message(
+						dl, bmin, bw, msg.text,
+						falpha * a, ax, ay, az,
+						mi, ImGui::GetIO().DeltaTime, !msg.streaming);
+
+					float real_h = std::max(rr.height, ImGui::GetFontSize() + 10.f);
+
+
+					anim_bh += (real_h - anim_bh) * std::min(12.f * ImGui::GetIO().DeltaTime, 1.f);
+					s->SetFloat(bha, anim_bh);
+
+
+					ImVec2 bmax = ImVec2(bmin.x + bw, bmin.y + anim_bh);
 					dl->AddRectFilled(bmin, bmax,
 						IM_COL32(34, 32, 52, (int)(210 * falpha * a)), 8.f);
 
-					if (!msg.text.empty())
-					{
-						dl->PushClipRect(bmin, bmax, true);
-						dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
-							ImVec2(bmin.x + 8.f, bmin.y + 5.f),
-							IM_COL32(220, 218, 240, (int)(230 * falpha * a)),
-							msg.text.c_str(), nullptr, wrap_w * 0.82f);
-						dl->PopClipRect();
+
+					chat_render::render_rich_message(
+						dl, bmin, bw, msg.text,
+						falpha * a, ax, ay, az,
+						mi, ImGui::GetIO().DeltaTime, !msg.streaming);
+
+
+					if (rr.action == chat_render::action_t::retry && mi > 0) {
+
+						for (int ri = mi - 1; ri >= 0; ri--) {
+							if (g_chat_messages[ri].is_user) {
+								strncpy_s(g_chat_buf, g_chat_messages[ri].text.c_str(), _TRUNCATE);
+								g_chat_messages.push_back({ g_chat_buf, "", true, false, false });
+								g_chat_scroll_to_bottom = true;
+								g_chat_buf[0] = '\0';
+								break;
+							}
+						}
+					} else if (rr.action == chat_render::action_t::delete_msg) {
+						if (mi >= 0 && mi < (int)g_chat_messages.size()) {
+							g_chat_messages.erase(g_chat_messages.begin() + mi);
+							mi--;
+							continue;
+						}
+					} else if (rr.action == chat_render::action_t::edit_msg) {
+
+						ImGui::SetClipboardText(msg.text.c_str());
 					}
 
 
@@ -2513,12 +2636,12 @@ void helpers::render_title()
 						{
 							ImVec2 tts2 = ImGui::CalcTextSize(ts_buf);
 							dl->AddText(
-								ImVec2(bmax.x + 6.f, bmin.y + (bh - tts2.y) * 0.5f),
+								ImVec2(bmax.x + 6.f, bmin.y + (anim_bh - tts2.y) * 0.5f),
 								IM_COL32(120, 115, 155, (int)(170 * hov_a * falpha * a)), ts_buf);
 						}
 					}
 
-					cursor_y += bh + 8.f;
+					cursor_y += anim_bh + 8.f;
 				}
 			}
 
@@ -2664,6 +2787,7 @@ void helpers::render_title()
 				if (model_open) {
 					ImGui::SetNextWindowPos(ImVec2(pmin.x, pmin.y - 6.f), ImGuiCond_Always, ImVec2(0.f, 1.f));
 					ImGui::SetNextWindowBgAlpha(0.96f);
+					ImGui::SetNextWindowSizeConstraints(ImVec2(220.f, 60.f), ImVec2(320.f, 400.f));
 					ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
 					ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.f, 6.f));
 					ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.09f, 0.09f, 0.13f, 1.f));
@@ -2673,10 +2797,35 @@ void helpers::render_title()
 						ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
 						ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
 					{
+
+						static char model_filter[64] = {};
+						ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+						ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
+						ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.06f, 0.06f, 0.09f, 1.f));
+						ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+						ImGui::InputTextWithHint("##model_search", "Search models...", model_filter, sizeof(model_filter));
+						ImGui::PopStyleColor();
+						ImGui::PopStyleVar(2);
+
+						ImGui::Spacing();
+						std::string filter_lower;
+						for (const char* p = model_filter; *p; p++)
+							filter_lower += (char)tolower(*p);
+
+
+						ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.f), "Providers");
+						ImGui::Separator();
 						for (auto& profile : g_sa_settings.provider_profiles) {
+							if (!filter_lower.empty()) {
+								std::string pname_lower;
+								for (char ch : profile.display_name)
+									pname_lower += (char)tolower(ch);
+								if (pname_lower.find(filter_lower) == std::string::npos)
+									continue;
+							}
 							bool is_active = (profile.id == g_sa_settings.active_provider_profile_id);
 							if (is_active) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ax3, ay3, az3, 1.f));
-							if (ImGui::Selectable(profile.display_name.c_str(), is_active, 0, ImVec2(180.f, 0.f))) {
+							if (ImGui::Selectable(profile.display_name.c_str(), is_active, 0, ImVec2(200.f, 0.f))) {
 								g_sa_settings.active_provider_profile_id = profile.id;
 								g_sa_settings.sync_legacy_fields_from_active_profile();
 								g_sa_settings.save();
@@ -2684,14 +2833,23 @@ void helpers::render_title()
 							if (is_active) ImGui::PopStyleColor();
 						}
 
+						ImGui::Spacing();
+						ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.f), "Models");
 						ImGui::Separator();
 
 						if (auto* current_profile = g_sa_settings.get_active_profile()) {
 							const auto& model_list = settings_sa_t::models_for_kind(current_profile->kind);
 							for (const auto& m : model_list) {
+								if (!filter_lower.empty()) {
+									std::string m_lower;
+									for (char ch : m)
+										m_lower += (char)tolower(ch);
+									if (m_lower.find(filter_lower) == std::string::npos)
+										continue;
+								}
 								bool is_sel = (current_profile->model == m);
 								if (is_sel) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ax3, ay3, az3, 1.f));
-								if (ImGui::Selectable(m.c_str(), is_sel, 0, ImVec2(200.f, 0.f))) {
+								if (ImGui::Selectable(m.c_str(), is_sel, 0, ImVec2(220.f, 0.f))) {
 									current_profile->model = m;
 									g_sa_settings.sync_legacy_fields_from_active_profile();
 									g_sa_settings.save();
@@ -2805,9 +2963,420 @@ void helpers::render_title()
 		}
 	}
 	end_child();
+	}
+
+
+	if (globals::ui::panel_bottom_visible && bottom_h > 20.f) {
+		float bp_x = pad;
+		float bp_y = content_top + total_h + gap;
+		float bp_w = ww - pad * 2.f;
+
+		ImGui::SetCursorPos(ImVec2(bp_x, bp_y));
+		begin_child("##bottom_panel", ImVec2(bp_x, bp_y), ImVec2(bp_w, bottom_h), a);
+		{
+			ImDrawList* bdl = ImGui::GetWindowDrawList();
+			ImVec2 bwp = ImGui::GetWindowPos();
+			float bfw = ImGui::GetWindowWidth();
+			float bfh = ImGui::GetWindowHeight();
+
+			float bax = globals::ui::accent.x * 255.f;
+			float bay = globals::ui::accent.y * 255.f;
+			float baz = globals::ui::accent.z * 255.f;
+
+
+			const char* btab_names[] = { "Output", "MCP Log", "Driver", "Sandbox" };
+			float btab_x = 8.f;
+			float btab_h = 24.f;
+			for (int bt = 0; bt < (int)bottom_tab_t::COUNT; bt++) {
+				ImVec2 bts = ImGui::CalcTextSize(btab_names[bt]);
+				float btw = bts.x + 16.f;
+				ImVec2 btmin(bwp.x + btab_x, bwp.y + 2.f);
+				ImVec2 btmax(btmin.x + btw, btmin.y + btab_h - 2.f);
+				bool bthov = ImGui::IsMouseHoveringRect(btmin, btmax);
+				bool btact = (static_cast<int>(globals::ui::active_bottom_tab) == bt);
+
+				if (btact)
+					bdl->AddRectFilled(btmin, btmax, IM_COL32(255, 255, 255, (int)(14 * a)), 3.f);
+				else if (bthov)
+					bdl->AddRectFilled(btmin, btmax, IM_COL32(255, 255, 255, (int)(8 * a)), 3.f);
+
+				if (btact) {
+					bdl->AddLine(ImVec2(btmin.x + 4.f, btmax.y), ImVec2(btmax.x - 4.f, btmax.y),
+						IM_COL32((int)bax, (int)bay, (int)baz, (int)(180 * a)), 1.5f);
+				}
+
+				ImU32 btc = btact ? IM_COL32(220, 220, 235, (int)(240 * a))
+				                  : IM_COL32(140, 140, 160, (int)(180 * a));
+				bdl->AddText(ImVec2(btmin.x + 8.f, btmin.y + (btab_h - 2.f - bts.y) * 0.5f), btc, btab_names[bt]);
+
+				if (bthov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+					globals::ui::active_bottom_tab = static_cast<bottom_tab_t>(bt);
+
+				btab_x += btw + 2.f;
+			}
+
+
+			{
+				const char* clr = "Clear";
+				ImVec2 cts = ImGui::CalcTextSize(clr);
+				ImVec2 cmin(bwp.x + bfw - cts.x - 16.f, bwp.y + 4.f);
+				ImVec2 cmax(cmin.x + cts.x + 8.f, cmin.y + btab_h - 6.f);
+				bool chov = ImGui::IsMouseHoveringRect(cmin, cmax);
+				if (chov) bdl->AddRectFilled(cmin, cmax, IM_COL32(255, 255, 255, (int)(12 * a)), 3.f);
+				bdl->AddText(ImVec2(cmin.x + 4.f, cmin.y + 1.f), IM_COL32(160, 160, 175, (int)((chov ? 220 : 140) * a)), clr);
+				if (chov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+					output_log::clear(globals::ui::active_bottom_tab);
+			}
+
+
+			bdl->AddLine(ImVec2(bwp.x, bwp.y + btab_h), ImVec2(bwp.x + bfw, bwp.y + btab_h),
+				IM_COL32(255, 255, 255, (int)(8 * a)));
+
+
+			float log_y = btab_h + 4.f;
+			ImGui::SetCursorPos(ImVec2(0.f, log_y));
+			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+			ImGui::BeginChild("##bottom_scroll", ImVec2(bfw, bfh - log_y), false, ImGuiWindowFlags_NoBackground);
+			{
+				int tab_idx = static_cast<int>(globals::ui::active_bottom_tab);
+				auto& log_lines = output_log::lines[tab_idx];
+				float line_h = ImGui::GetFontSize() + 2.f;
+				ImDrawList* ldl = ImGui::GetWindowDrawList();
+				ImVec2 lorig = ImGui::GetWindowPos();
+				float scroll_y = ImGui::GetScrollY();
+				float vis_h = ImGui::GetWindowHeight();
+
+				int first = std::max(0, (int)(scroll_y / line_h) - 1);
+				int last = std::min((int)log_lines.size() - 1, (int)((scroll_y + vis_h) / line_h) + 1);
+
+				for (int li = first; li <= last; li++) {
+					float ly = lorig.y + li * line_h - scroll_y;
+					if (li & 1) ldl->AddRectFilled(ImVec2(lorig.x, ly), ImVec2(lorig.x + bfw, ly + line_h),
+						IM_COL32(255, 255, 255, (int)(2 * a)));
+
+
+					const auto& ln = log_lines[li];
+					ImU32 lc = IM_COL32(180, 180, 195, (int)(200 * a));
+					if (ln.find("Error") != std::string::npos || ln.find("ERR") != std::string::npos)
+						lc = IM_COL32(220, 100, 100, (int)(230 * a));
+					else if (ln.find("[init]") != std::string::npos)
+						lc = IM_COL32(100, 180, 100, (int)(210 * a));
+					else if (ln.find("[tool]") != std::string::npos || ln.find("[mcp") != std::string::npos)
+						lc = IM_COL32((int)(bax*0.6f+100), (int)(bay*0.6f+100), (int)(baz*0.6f+100), (int)(210 * a));
+					else if (ln.find("[ai]") != std::string::npos)
+						lc = IM_COL32(150, 160, 220, (int)(220 * a));
+					else if (ln.find("[driver]") != std::string::npos)
+						lc = IM_COL32(200, 170, 100, (int)(210 * a));
+
+					ldl->AddText(ImVec2(lorig.x + 8.f, ly + 1.f), lc, ln.c_str());
+				}
+
+				ImGui::SetCursorPosY((float)log_lines.size() * line_h);
+				ImGui::Dummy(ImVec2(1.f, 1.f));
+
+				if (output_log::auto_scroll[tab_idx] && !log_lines.empty())
+					ImGui::SetScrollHereY(1.f);
+			}
+			ImGui::EndChild();
+			ImGui::PopStyleVar();
+		}
+		end_child();
+	}
+
+
+	{
+		ImVec2 wp = ImGui::GetWindowPos();
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		float sx0 = wp.x;
+		float sy0 = wp.y + wh - status_h;
+		float sx1 = wp.x + ww;
+		float sy1 = wp.y + wh;
+
+		float sax = globals::ui::accent.x * 255.f;
+		float say = globals::ui::accent.y * 255.f;
+		float saz = globals::ui::accent.z * 255.f;
+
+		dl->AddRectFilled(ImVec2(sx0, sy0), ImVec2(sx1, sy1),
+			IM_COL32(14, 14, 20, (int)(235 * a)), 8.f, ImDrawFlags_RoundCornersBottom);
+		dl->AddLine(ImVec2(sx0, sy0), ImVec2(sx1, sy0),
+			IM_COL32(255, 255, 255, (int)(6 * a)));
+
+		float text_y = sy0 + (status_h - ImGui::GetFontSize()) * 0.5f;
+
+
+		{
+			std::string info;
+			if (code_editor::active && !code_editor::filename.empty()) {
+				info = code_editor::filename;
+				if (code_editor::dirty) info += " [modified]";
+				info += "  Ln " + std::to_string(autocomplete::cursor_line + 1) +
+				        ", Col " + std::to_string(autocomplete::cursor_col + 1);
+			} else if (g_disasm.file.loaded) {
+				info = g_disasm.file.filename + "  (" + std::to_string(g_disasm.file.instrs.size()) + " instructions)";
+			} else {
+				info = "No file open";
+			}
+			dl->AddText(ImVec2(sx0 + 12.f, text_y), IM_COL32(150, 150, 170, (int)(200 * a)), info.c_str());
+		}
+
+
+		{
+			auto* prof = g_sa_settings.get_active_profile();
+			std::string model_str = prof ? (prof->display_name + " / " + prof->model) : "No model";
+			ImVec2 mts = ImGui::CalcTextSize(model_str.c_str());
+			dl->AddText(ImVec2(sx1 - mts.x - 12.f, text_y),
+				IM_COL32((int)(sax * 0.6f + 60), (int)(say * 0.6f + 60), (int)(saz * 0.6f + 60), (int)(180 * a)),
+				model_str.c_str());
+		}
+
+
+		{
+			const char* driver_str = "Driver: Detached";
+			ImVec2 dts = ImGui::CalcTextSize(driver_str);
+			float dcx = (sx0 + sx1) * 0.5f - dts.x * 0.5f;
+			dl->AddText(ImVec2(dcx, text_y), IM_COL32(120, 120, 140, (int)(160 * a)), driver_str);
+		}
+	}
 
 	tick_ai_chat();
 	poll_ai_chat();
+
+
+	if (globals::ui::command_palette_open) {
+		struct PaletteCmd {
+			const char* label;
+			const char* shortcut;
+			int id;
+		};
+		static const PaletteCmd all_cmds[] = {
+			{ "Toggle Explorer Panel",      "Ctrl+B",         1  },
+			{ "Toggle Chat Panel",           "Ctrl+J",         2  },
+			{ "Toggle Output Panel",         "Ctrl+`",         3  },
+			{ "Save File",                   "Ctrl+S",         4  },
+			{ "New File",                    "Ctrl+N",         5  },
+			{ "Close Tab",                   "Ctrl+W",         6  },
+			{ "Next Tab",                    "Ctrl+Tab",       7  },
+			{ "Previous Tab",               "Ctrl+Shift+Tab",  8  },
+			{ "Open Settings",               "Ctrl+,",         9  },
+			{ "Clear Chat History",          "",                10 },
+			{ "Open File for Disassembly",   "",                11 },
+			{ "Toggle Fullscreen",           "F11",             12 },
+			{ "Change Theme",                "",                13 },
+			{ "Focus Chat Input",            "",                14 },
+			{ "Show Output Tab",             "",                15 },
+			{ "Show MCP Log Tab",            "",                16 },
+			{ "Show Driver Log Tab",         "",                17 },
+		};
+		static const int cmd_count = sizeof(all_cmds) / sizeof(all_cmds[0]);
+		static int palette_sel = 0;
+
+
+		std::string filter_str(globals::ui::command_palette_buf);
+		std::vector<int> filtered;
+		filtered.reserve(cmd_count);
+		if (filter_str.empty()) {
+			for (int i = 0; i < cmd_count; i++) filtered.push_back(i);
+		} else {
+
+			std::string flo = filter_str;
+			for (auto& c : flo) c = (char)std::tolower((unsigned char)c);
+			for (int i = 0; i < cmd_count; i++) {
+				std::string lbl(all_cmds[i].label);
+				for (auto& c : lbl) c = (char)std::tolower((unsigned char)c);
+				if (lbl.find(flo) != std::string::npos)
+					filtered.push_back(i);
+			}
+		}
+		if (palette_sel >= (int)filtered.size()) palette_sel = (int)filtered.size() - 1;
+		if (palette_sel < 0) palette_sel = 0;
+
+		auto execute_cmd = [&](int cmd_id) {
+			switch (cmd_id) {
+			case 1: globals::ui::panel_left_visible = !globals::ui::panel_left_visible;
+				g_sa_settings.workspace.left_visible = globals::ui::panel_left_visible; g_sa_settings.save(); break;
+			case 2: globals::ui::panel_right_visible = !globals::ui::panel_right_visible;
+				g_sa_settings.workspace.right_visible = globals::ui::panel_right_visible; g_sa_settings.save(); break;
+			case 3: globals::ui::panel_bottom_visible = !globals::ui::panel_bottom_visible;
+				g_sa_settings.workspace.bottom_visible = globals::ui::panel_bottom_visible; g_sa_settings.save(); break;
+			case 4: if (code_editor::active) code_editor::save(); break;
+			case 5: file_tabs::open_or_focus("", "untitled", ""); break;
+			case 6: file_tabs::close_tab(file_tabs::active_tab); break;
+			case 7:
+				if (!file_tabs::tabs.empty()) {
+					file_tabs::active_tab = (file_tabs::active_tab + 1) % (int)file_tabs::tabs.size();
+					auto& t7 = file_tabs::tabs[file_tabs::active_tab];
+					std::string c7; FILE* f7 = nullptr; fopen_s(&f7, t7.filepath.c_str(), "rb");
+					if (f7) { fseek(f7,0,SEEK_END); long sz=ftell(f7); fseek(f7,0,SEEK_SET); c7.resize(sz); fread(&c7[0],1,sz,f7); fclose(f7); }
+					code_editor::load(c7, t7.filename, t7.filepath);
+				} break;
+			case 8:
+				if (!file_tabs::tabs.empty()) {
+					file_tabs::active_tab = (file_tabs::active_tab - 1 + (int)file_tabs::tabs.size()) % (int)file_tabs::tabs.size();
+					auto& t8 = file_tabs::tabs[file_tabs::active_tab];
+					std::string c8; FILE* f8 = nullptr; fopen_s(&f8, t8.filepath.c_str(), "rb");
+					if (f8) { fseek(f8,0,SEEK_END); long sz=ftell(f8); fseek(f8,0,SEEK_SET); c8.resize(sz); fread(&c8[0],1,sz,f8); fclose(f8); }
+					code_editor::load(c8, t8.filename, t8.filepath);
+				} break;
+			case 9: g_settings_open = true; break;
+			case 10: g_chat_messages.clear(); break;
+			case 11: {
+				std::string fpath = disasm::open_file_dialog(g_hwnd);
+				if (!fpath.empty()) {
+					g_disasm.file = DisasmFile{};
+					disasm::load_pe(fpath, g_disasm.file);
+					if (g_disasm.file.loaded)
+						disasm::decode_section(g_disasm.file);
+				}
+			} break;
+			case 12: {
+				globals::ui::maximized = !globals::ui::maximized;
+				if (globals::ui::maximized) {
+					RECT r; GetWindowRect(g_hwnd, &r);
+					globals::ui::pre_max_x = (float)r.left;
+					globals::ui::pre_max_y = (float)r.top;
+					globals::ui::pre_max_w = (float)(r.right - r.left);
+					globals::ui::pre_max_h = (float)(r.bottom - r.top);
+					HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+					MONITORINFO mi = { sizeof(mi) };
+					GetMonitorInfo(mon, &mi);
+					SetWindowPos(g_hwnd, nullptr, mi.rcWork.left, mi.rcWork.top,
+						mi.rcWork.right - mi.rcWork.left, mi.rcWork.bottom - mi.rcWork.top,
+						SWP_NOZORDER | SWP_NOACTIVATE);
+				} else {
+					SetWindowPos(g_hwnd, nullptr,
+						(int)globals::ui::pre_max_x, (int)globals::ui::pre_max_y,
+						(int)globals::ui::pre_max_w, (int)globals::ui::pre_max_h,
+						SWP_NOZORDER | SWP_NOACTIVATE);
+				}
+			} break;
+			case 13: g_settings_open = true; break;
+			case 14:  break;
+			case 15: globals::ui::panel_bottom_visible = true; globals::ui::active_bottom_tab = bottom_tab_t::output; break;
+			case 16: globals::ui::panel_bottom_visible = true; globals::ui::active_bottom_tab = bottom_tab_t::mcp_log; break;
+			case 17: globals::ui::panel_bottom_visible = true; globals::ui::active_bottom_tab = bottom_tab_t::driver_log; break;
+			}
+			globals::ui::command_palette_open = false;
+			globals::ui::command_palette_buf[0] = '\0';
+			palette_sel = 0;
+		};
+
+
+		ImDrawList* fdl = ImGui::GetForegroundDrawList();
+		ImVec2 vp = ImGui::GetIO().DisplaySize;
+		fdl->AddRectFilled(ImVec2(0, 0), vp, IM_COL32(0, 0, 0, 120));
+
+
+		float pw = 520.f;
+		float max_h = 400.f;
+		float px = (vp.x - pw) * 0.5f;
+		float py = 80.f;
+
+		ImGui::SetNextWindowPos(ImVec2(px, py));
+		ImGui::SetNextWindowSize(ImVec2(pw, 0));
+		ImGui::SetNextWindowSizeConstraints(ImVec2(pw, 0), ImVec2(pw, max_h));
+
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(30, 30, 38, 245));
+		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(70, 70, 90, 200));
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(40, 40, 52, 255));
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 10));
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+
+		if (ImGui::Begin("##CommandPalette", nullptr,
+				ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+				ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+				ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+
+
+			ImGui::PushItemWidth(-1);
+			if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+			bool enter = ImGui::InputText("##palette_input", globals::ui::command_palette_buf,
+				sizeof(globals::ui::command_palette_buf),
+				ImGuiInputTextFlags_EnterReturnsTrue);
+			ImGui::PopItemWidth();
+
+
+			if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true) && palette_sel < (int)filtered.size() - 1) palette_sel++;
+			if (ImGui::IsKeyPressed(ImGuiKey_UpArrow,   true) && palette_sel > 0) palette_sel--;
+			if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+				globals::ui::command_palette_open = false;
+				globals::ui::command_palette_buf[0] = '\0';
+				palette_sel = 0;
+			}
+			if (enter && !filtered.empty()) {
+				execute_cmd(all_cmds[filtered[palette_sel]].id);
+			}
+
+
+			ImGui::Separator();
+			float item_h = ImGui::GetTextLineHeightWithSpacing() + 4.f;
+			float list_h = std::min((float)filtered.size() * item_h, max_h - 60.f);
+			if (list_h < item_h) list_h = item_h;
+
+			ImGui::BeginChild("##palette_list", ImVec2(-1, list_h), false);
+			ImVec4 acc = themes::resolved.accent;
+			ImU32 acc_col = IM_COL32((int)(acc.x * 255), (int)(acc.y * 255), (int)(acc.z * 255), 255);
+			for (int i = 0; i < (int)filtered.size(); i++) {
+				int ci = filtered[i];
+				bool selected = (i == palette_sel);
+				ImVec2 cp = ImGui::GetCursorScreenPos();
+				float w = ImGui::GetContentRegionAvail().x;
+
+				if (selected) {
+					ImGui::GetWindowDrawList()->AddRectFilled(cp, ImVec2(cp.x + w, cp.y + item_h),
+						IM_COL32((int)(acc.x * 60), (int)(acc.y * 60), (int)(acc.z * 60), 100), 4.f);
+				}
+
+
+				if (ImGui::IsMouseHoveringRect(cp, ImVec2(cp.x + w, cp.y + item_h))) {
+					if (!selected)
+						ImGui::GetWindowDrawList()->AddRectFilled(cp, ImVec2(cp.x + w, cp.y + item_h),
+							IM_COL32(60, 60, 80, 80), 4.f);
+					if (ImGui::IsMouseClicked(0)) {
+						execute_cmd(all_cmds[ci].id);
+					}
+					palette_sel = i;
+				}
+
+
+				ImGui::SetCursorScreenPos(ImVec2(cp.x + 8, cp.y + 2));
+				ImGui::TextColored(selected ? ImVec4(1, 1, 1, 1) : ImVec4(0.8f, 0.8f, 0.85f, 1.f),
+					"%s", all_cmds[ci].label);
+
+
+				if (all_cmds[ci].shortcut[0]) {
+					std::string sc(all_cmds[ci].shortcut);
+					ImVec2 sts = ImGui::CalcTextSize(sc.c_str());
+					ImGui::SameLine();
+					ImGui::SetCursorScreenPos(ImVec2(cp.x + w - sts.x - 12, cp.y + 2));
+					ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(130, 130, 160, 200));
+					ImGui::TextUnformatted(sc.c_str());
+					ImGui::PopStyleColor();
+				}
+
+				ImGui::SetCursorScreenPos(ImVec2(cp.x, cp.y + item_h));
+			}
+
+			if (palette_sel >= 0 && palette_sel < (int)filtered.size()) {
+				float target_y = palette_sel * item_h;
+				float scroll_y = ImGui::GetScrollY();
+				if (target_y < scroll_y) ImGui::SetScrollY(target_y);
+				if (target_y + item_h > scroll_y + list_h) ImGui::SetScrollY(target_y + item_h - list_h);
+			}
+			ImGui::EndChild();
+		}
+		ImGui::End();
+		ImGui::PopStyleVar(3);
+		ImGui::PopStyleColor(3);
+
+
+		if (ImGui::IsMouseClicked(0) && !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)) {
+			globals::ui::command_palette_open = false;
+			globals::ui::command_palette_buf[0] = '\0';
+			palette_sel = 0;
+		}
+	}
+
 	render_settings_popup();
 	ImGui::PopStyleVar();
 	ImGui::End();

@@ -3,6 +3,7 @@
 #include <intrin.h>
 
 #include "mcp_standalone.hpp"
+#include "mcp_client.hpp"
 #include "standalone_ai_client.hpp"
 #include "standalone_license.hpp"
 #include "standalone_settings.hpp"
@@ -60,6 +61,10 @@ std::atomic<bool> s_cancel{false};
 mcp_standalone::server_t s_mcp_server;
 bool                     s_server_started = false;
 bool                     s_initialized    = false;
+
+
+mcp_client::manager_t s_mcp_client_mgr;
+bool                  s_mcp_clients_connected = false;
 
 
 struct parsed_tool_call_t
@@ -168,6 +173,7 @@ std::string build_system_prompt()
 
     prompt += "## Available Tools\n\n";
 
+
     auto& tools = s_mcp_server.get_tools();
     for (const auto& t : tools) {
         prompt += "### " + t.name + "\n";
@@ -181,6 +187,26 @@ std::string build_system_prompt()
             }
         }
         prompt += "\n";
+    }
+
+
+    auto remote_tools = s_mcp_client_mgr.get_all_tools();
+    if (!remote_tools.empty()) {
+        prompt += "## External MCP Tools\n\n";
+        for (const auto& rt : remote_tools) {
+            prompt += "### mcp::" + rt.name + " (from " + rt.server_name + ")\n";
+            prompt += rt.description + "\n";
+            if (rt.input_schema.contains("properties") && rt.input_schema["properties"].is_object()) {
+                prompt += "Parameters:\n";
+                for (auto it = rt.input_schema["properties"].begin();
+                     it != rt.input_schema["properties"].end(); ++it) {
+                    prompt += "- `" + it.key() + "` (";
+                    prompt += it.value().value("type", "string");
+                    prompt += "): " + it.value().value("description", "") + "\n";
+                }
+            }
+            prompt += "\n";
+        }
     }
 
     prompt +=
@@ -200,6 +226,29 @@ std::string build_system_prompt()
 
 std::string execute_tool(const std::string& name, const json& arguments)
 {
+    output_log::push(bottom_tab_t::mcp_log, "[tool] Executing: " + name);
+
+
+    if (name.size() > 5 && name.substr(0, 5) == "mcp::") {
+        std::string remote_name = name.substr(5);
+        output_log::push(bottom_tab_t::mcp_log, "[mcp-client] -> " + remote_name);
+        auto result = s_mcp_client_mgr.call_tool(remote_name, arguments);
+        output_log::push(bottom_tab_t::mcp_log, std::string("[mcp-client] <- ") + (result.success ? "OK" : "ERR: " + result.text.substr(0, 120)));
+        std::string output = result.text;
+        if (!result.data.is_null() && !result.data.empty()) {
+            if (!output.empty()) output += "\n";
+            try { output += result.data.dump(2); } catch (...) {}
+        }
+        if (output.size() > 12000) {
+            output.resize(12000);
+            output += "\n... (output truncated to 12000 chars)";
+        }
+        if (!result.success && output.empty())
+            output = "Error: MCP tool call failed.";
+        return output;
+    }
+
+
     auto& tools = s_mcp_server.get_tools();
     for (const auto& t : tools) {
         if (t.name == name) {
@@ -231,7 +280,7 @@ void run_agentic(std::string user_message,
                  std::vector<std::pair<std::string, std::string>> history)
 {
     post_update(ai_update_t::THINKING);
-
+    output_log::push(bottom_tab_t::output, "[ai] New request: " + user_message.substr(0, 120) + (user_message.size() > 120 ? "..." : ""));
 
     std::string system_prompt = build_system_prompt();
 
@@ -263,6 +312,7 @@ void run_agentic(std::string user_message,
         try {
             response = g_sa_ai_client->chat_blocking(full_prompt, {}, nullptr, nullptr);
         } catch (const std::exception& e) {
+            output_log::push(bottom_tab_t::output, std::string("[ai] Exception: ") + e.what());
             post_update(ai_update_t::ERR, std::string("Exception: ") + e.what());
             return;
         }
@@ -321,6 +371,7 @@ void run_agentic(std::string user_message,
                        "Otherwise, provide your final answer as plain text.\n\nAssistant:";
     }
 
+    output_log::push(bottom_tab_t::output, "[ai] Reached max tool rounds (15)");
     post_update(ai_update_t::ERR, "Reached maximum tool-calling rounds (15). Stopping.");
 }
 
@@ -388,20 +439,10 @@ void persist_workspace_state()
 
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// Standalone self-protection via WhosWho kernel driver.
-//
-// WHY: The DLL plugin (AiDA.dll loaded in IDA) already registers its .text
-// section for kernel-side integrity monitoring. The standalone EXE had NO
-// equivalent protection — an attacker could patch its code in memory
-// without any kernel-level response. By registering the standalone's .text
-// section with the same driver mechanism, both products are equally guarded
-// against runtime code modification and debugger attachment.
-// ──────────────────────────────────────────────────────────────────────────
+
 namespace {
 
-// Locate the first code section (.text) in the given PE module.
-// Returns false if the module header is invalid or has no code section.
+
 bool find_exe_code_section(HMODULE mod, std::uint64_t& out_base, std::uint32_t& out_size) {
     const auto* base_ptr = reinterpret_cast<const std::uint8_t*>(mod);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base_ptr);
@@ -424,9 +465,7 @@ bool find_exe_code_section(HMODULE mod, std::uint64_t& out_base, std::uint32_t& 
     return false;
 }
 
-// Compute the CRC-based integrity hash of in-memory code.
-// Uses the same algorithm as anti_re.hpp::hash_memory() and the kernel's
-// compute_code_hash_physical(), so the hashes are directly comparable.
+
 std::uint64_t hash_code_section(const void* data, std::size_t size) {
     const auto* ptr = static_cast<const std::uint8_t*>(data);
     std::uint64_t h1 = 0xFFFFFFFFULL;
@@ -449,13 +488,12 @@ std::uint64_t hash_code_section(const void* data, std::size_t size) {
     return (h1 & 0xFFFFFFFFULL) | ((h2 & 0xFFFFFFFFULL) << 32);
 }
 
-// Connect to the WhosWho kernel driver and register the standalone EXE's
-// .text section for kernel-side integrity monitoring.
+
 void register_standalone_protection() {
     if (!device)
         return;
 
-    // Try to connect to the kernel driver
+
     if (!device->is_connected() && !device->connect())
         return;
 
@@ -469,7 +507,7 @@ void register_standalone_protection() {
     if (device->get_dtb() == 0)
         return;
 
-    // Find our own .text section
+
     HMODULE exe_module = GetModuleHandleW(nullptr);
     if (!exe_module)
         return;
@@ -493,7 +531,7 @@ void register_standalone_protection() {
     );
 }
 
-} // anonymous namespace
+}
 
 
 bool g_settings_open = false;
@@ -573,9 +611,40 @@ void init_standalone_chat()
     }
 
 
+    for (const auto& srv : g_sa_settings.mcp_client_servers) {
+        mcp_client::server_config_t cfg;
+        cfg.name         = srv.name;
+        cfg.url          = srv.url;
+        cfg.api_key      = srv.api_key;
+        cfg.enabled      = srv.enabled;
+        cfg.auto_connect = srv.auto_connect;
+        if (srv.transport == "stdio") {
+            cfg.transport = mcp_client::transport_type_t::stdio;
+            cfg.command   = srv.command;
+
+            if (!srv.args.empty()) {
+                std::istringstream iss(srv.args);
+                std::string arg;
+                while (iss >> arg)
+                    cfg.args.push_back(arg);
+            }
+        } else {
+            cfg.transport = mcp_client::transport_type_t::http_sse;
+        }
+        s_mcp_client_mgr.add_server(cfg);
+    }
+    s_mcp_client_mgr.connect_all();
+    s_mcp_clients_connected = true;
+
     driver_bridge::initialize();
     register_standalone_protection();
     restore_workspace_state();
+
+    output_log::push(bottom_tab_t::output, "[init] AiDA Standalone initialized");
+    output_log::push(bottom_tab_t::output, "[init] License: " + std::string(license::validated ? "valid" : "not validated"));
+    if (s_server_started)
+        output_log::push(bottom_tab_t::mcp_log, "[mcp-server] Started on port " + std::to_string(g_sa_settings.mcp_port));
+    output_log::push(bottom_tab_t::driver_log, "[driver] Bridge initialized");
 
     s_initialized = true;
 }
@@ -590,13 +659,19 @@ void shutdown_standalone_chat()
     }
     if (s_server_started)
         s_mcp_server.stop();
+
+
+    if (s_mcp_clients_connected) {
+        s_mcp_client_mgr.disconnect_all();
+        s_mcp_clients_connected = false;
+    }
+
     persist_workspace_state();
     g_sa_settings.save();
     standalone_license::shutdown();
     g_sa_ai_client.reset();
 
-    // Unregister kernel-side protection before exit so the driver
-    // doesn't bugcheck on a process that no longer exists.
+
     if (device && device->is_connected())
         device->unregister_dll_protection();
 
@@ -677,6 +752,16 @@ void poll_ai_chat()
         license::validated = false;
         license::check_failed = true;
         license::error_msg = standalone_license::last_error();
+    }
+
+
+    {
+        static auto s_last_poll = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - s_last_poll).count() >= 5) {
+            s_mcp_client_mgr.poll();
+            s_last_poll = now;
+        }
     }
 
     std::deque<ai_update_t> local;
@@ -926,6 +1011,127 @@ void render_settings_popup()
         const char* network_modes[] = {"Off", "Default"};
         ImGui::Combo("Sandbox Network", &s_sandbox_network, network_modes, IM_ARRAYSIZE(network_modes));
 
+
+        ImGui::Separator();
+        ImGui::Text("External MCP Servers");
+        {
+            static int s_mcp_client_sel = 0;
+            static char s_mcp_cl_name[128] = {};
+            static char s_mcp_cl_url[512] = {};
+            static char s_mcp_cl_key[512] = {};
+            static char s_mcp_cl_cmd[512] = {};
+            static char s_mcp_cl_args[512] = {};
+            static int  s_mcp_cl_transport = 0;
+            static bool s_mcp_cl_enabled = true;
+            static bool s_mcp_cl_auto = true;
+
+            auto refresh_mcp_cl = [&]() {
+                if (s_mcp_client_sel >= 0 && s_mcp_client_sel < (int)g_sa_settings.mcp_client_servers.size()) {
+                    auto& srv = g_sa_settings.mcp_client_servers[s_mcp_client_sel];
+                    snprintf(s_mcp_cl_name, sizeof(s_mcp_cl_name), "%s", srv.name.c_str());
+                    snprintf(s_mcp_cl_url,  sizeof(s_mcp_cl_url),  "%s", srv.url.c_str());
+                    snprintf(s_mcp_cl_key,  sizeof(s_mcp_cl_key),  "%s", srv.api_key.c_str());
+                    snprintf(s_mcp_cl_cmd,  sizeof(s_mcp_cl_cmd),  "%s", srv.command.c_str());
+                    snprintf(s_mcp_cl_args, sizeof(s_mcp_cl_args), "%s", srv.args.c_str());
+                    s_mcp_cl_transport = (srv.transport == "stdio") ? 1 : 0;
+                    s_mcp_cl_enabled = srv.enabled;
+                    s_mcp_cl_auto = srv.auto_connect;
+                } else {
+                    memset(s_mcp_cl_name, 0, sizeof(s_mcp_cl_name));
+                    memset(s_mcp_cl_url,  0, sizeof(s_mcp_cl_url));
+                    memset(s_mcp_cl_key,  0, sizeof(s_mcp_cl_key));
+                    memset(s_mcp_cl_cmd,  0, sizeof(s_mcp_cl_cmd));
+                    memset(s_mcp_cl_args, 0, sizeof(s_mcp_cl_args));
+                    s_mcp_cl_transport = 0;
+                    s_mcp_cl_enabled = true;
+                    s_mcp_cl_auto = true;
+                }
+            };
+
+
+            auto statuses = s_mcp_client_mgr.get_status();
+            for (int i = 0; i < (int)g_sa_settings.mcp_client_servers.size(); ++i) {
+                ImVec4 indicator = ImVec4(0.5f, 0.5f, 0.5f, 1.f);
+                for (const auto& st : statuses) {
+                    if (st.name == g_sa_settings.mcp_client_servers[i].name) {
+                        switch (st.state) {
+                        case mcp_client::connection_state_t::connected:    indicator = ImVec4(0.2f, 0.9f, 0.3f, 1.f); break;
+                        case mcp_client::connection_state_t::connecting:
+                        case mcp_client::connection_state_t::reconnecting: indicator = ImVec4(0.9f, 0.8f, 0.2f, 1.f); break;
+                        case mcp_client::connection_state_t::error:        indicator = ImVec4(0.9f, 0.2f, 0.2f, 1.f); break;
+                        default: break;
+                        }
+                        break;
+                    }
+                }
+                ImGui::PushStyleColor(ImGuiCol_Text, indicator);
+                ImGui::Bullet();
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+                if (ImGui::Selectable(g_sa_settings.mcp_client_servers[i].name.c_str(),
+                                      i == s_mcp_client_sel)) {
+                    s_mcp_client_sel = i;
+                    refresh_mcp_cl();
+                }
+            }
+
+
+            if (ImGui::SmallButton("+ Add Server")) {
+                mcp_client_server_t srv;
+                srv.name = "New Server";
+                srv.url = "http://localhost:3001";
+                g_sa_settings.mcp_client_servers.push_back(srv);
+                s_mcp_client_sel = (int)g_sa_settings.mcp_client_servers.size() - 1;
+                refresh_mcp_cl();
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("- Remove") &&
+                s_mcp_client_sel >= 0 && s_mcp_client_sel < (int)g_sa_settings.mcp_client_servers.size())
+            {
+                g_sa_settings.mcp_client_servers.erase(
+                    g_sa_settings.mcp_client_servers.begin() + s_mcp_client_sel);
+                if (s_mcp_client_sel > 0) --s_mcp_client_sel;
+                refresh_mcp_cl();
+            }
+
+
+            if (s_mcp_client_sel >= 0 && s_mcp_client_sel < (int)g_sa_settings.mcp_client_servers.size()) {
+                ImGui::Text("Server Name"); ImGui::SetNextItemWidth(-1);
+                ImGui::InputText("##mcp_cl_name", s_mcp_cl_name, sizeof(s_mcp_cl_name));
+
+                const char* transports[] = {"HTTP/SSE", "Stdio"};
+                ImGui::Text("Transport"); ImGui::SetNextItemWidth(-1);
+                ImGui::Combo("##mcp_cl_transport", &s_mcp_cl_transport, transports, 2);
+
+                if (s_mcp_cl_transport == 0) {
+                    ImGui::Text("URL"); ImGui::SetNextItemWidth(-1);
+                    ImGui::InputText("##mcp_cl_url", s_mcp_cl_url, sizeof(s_mcp_cl_url));
+                    ImGui::Text("API Key"); ImGui::SetNextItemWidth(-1);
+                    ImGui::InputText("##mcp_cl_key", s_mcp_cl_key, sizeof(s_mcp_cl_key), ImGuiInputTextFlags_Password);
+                } else {
+                    ImGui::Text("Command"); ImGui::SetNextItemWidth(-1);
+                    ImGui::InputText("##mcp_cl_cmd", s_mcp_cl_cmd, sizeof(s_mcp_cl_cmd));
+                    ImGui::Text("Arguments"); ImGui::SetNextItemWidth(-1);
+                    ImGui::InputText("##mcp_cl_args", s_mcp_cl_args, sizeof(s_mcp_cl_args));
+                }
+
+                ImGui::Checkbox("Enabled##mcp_cl", &s_mcp_cl_enabled);
+                ImGui::SameLine();
+                ImGui::Checkbox("Auto-Connect", &s_mcp_cl_auto);
+
+
+                auto& srv = g_sa_settings.mcp_client_servers[s_mcp_client_sel];
+                srv.name         = s_mcp_cl_name;
+                srv.url          = s_mcp_cl_url;
+                srv.api_key      = s_mcp_cl_key;
+                srv.command      = s_mcp_cl_cmd;
+                srv.args         = s_mcp_cl_args;
+                srv.transport    = (s_mcp_cl_transport == 1) ? "stdio" : "http_sse";
+                srv.enabled      = s_mcp_cl_enabled;
+                srv.auto_connect = s_mcp_cl_auto;
+            }
+        }
+
         ImGui::EndChild();
 
         ImGui::Dummy(ImVec2(0, 6));
@@ -972,6 +1178,31 @@ void render_settings_popup()
                 s_server_started = true;
                 s_mcp_server.write_client_configs();
             }
+
+
+            s_mcp_client_mgr.disconnect_all();
+            for (const auto& srv : g_sa_settings.mcp_client_servers) {
+                mcp_client::server_config_t cfg;
+                cfg.name         = srv.name;
+                cfg.url          = srv.url;
+                cfg.api_key      = srv.api_key;
+                cfg.enabled      = srv.enabled;
+                cfg.auto_connect = srv.auto_connect;
+                if (srv.transport == "stdio") {
+                    cfg.transport = mcp_client::transport_type_t::stdio;
+                    cfg.command   = srv.command;
+                    if (!srv.args.empty()) {
+                        std::istringstream iss(srv.args);
+                        std::string arg;
+                        while (iss >> arg)
+                            cfg.args.push_back(arg);
+                    }
+                } else {
+                    cfg.transport = mcp_client::transport_type_t::http_sse;
+                }
+                s_mcp_client_mgr.add_server(cfg);
+            }
+            s_mcp_client_mgr.connect_all();
 
             g_settings_open = false;
             ImGui::CloseCurrentPopup();

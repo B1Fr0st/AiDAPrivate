@@ -232,6 +232,10 @@ struct workspace_state_t
     std::string active_view = "editor";
     float       left_width = 220.0f;
     float       right_width = 350.0f;
+    float       bottom_height = 180.0f;
+    bool        left_visible = true;
+    bool        right_visible = true;
+    bool        bottom_visible = false;
 };
 
 struct sandbox_settings_t
@@ -241,6 +245,19 @@ struct sandbox_settings_t
     int         memory_limit_mb = 256;
     std::string network_mode = "off";
     std::string shared_folder_root;
+};
+
+
+struct mcp_client_server_t
+{
+    std::string name;
+    std::string url;
+    std::string transport = "http_sse";
+    std::string command;
+    std::string args;
+    std::string api_key;
+    bool        enabled = true;
+    bool        auto_connect = true;
 };
 
 struct settings_sa_t
@@ -277,9 +294,9 @@ struct settings_sa_t
 
     workspace_state_t workspace;
     sandbox_settings_t sandbox;
+    std::vector<mcp_client_server_t> mcp_client_servers;
 
-    // Legacy compatibility fields kept so the existing UI/editor code can
-    // continue working while the standalone migrates to profile-driven config.
+
     std::string api_provider = "openai_compatible";
     std::string gemini_api_key;
     std::string gemini_model_name = "gemini-2.5-flash";
@@ -717,6 +734,11 @@ struct settings_sa_t
                 workspace.left_width = ws["left_width"].get<float>();
             if (ws.contains("right_width") && ws["right_width"].is_number())
                 workspace.right_width = ws["right_width"].get<float>();
+            if (ws.contains("bottom_height") && ws["bottom_height"].is_number())
+                workspace.bottom_height = ws["bottom_height"].get<float>();
+            workspace.left_visible   = ws.value("left_visible", true);
+            workspace.right_visible  = ws.value("right_visible", true);
+            workspace.bottom_visible = ws.value("bottom_visible", false);
         }
 
         if (root.contains("sandbox") && root["sandbox"].is_object()) {
@@ -726,6 +748,27 @@ struct settings_sa_t
             sandbox.memory_limit_mb = sb.value("memory_limit_mb", 256);
             sandbox.network_mode = sb.value("network_mode", "off");
             sandbox.shared_folder_root = sb.value("shared_folder_root", "");
+        }
+
+
+        if (root.contains("mcp_client_servers") && root["mcp_client_servers"].is_array()) {
+            mcp_client_servers.clear();
+            for (const auto& item : root["mcp_client_servers"]) {
+                if (!item.is_object()) continue;
+                mcp_client_server_t srv;
+                srv.name         = item.value("name", "");
+                srv.url          = item.value("url", "");
+                srv.transport    = item.value("transport", "http_sse");
+                srv.command      = item.value("command", "");
+                srv.args         = item.value("args", "");
+                if (item.contains("api_key") && item["api_key"].is_string())
+                    srv.api_key = sa_settings_detail::deobfuscate_key(
+                        sa_settings_detail::trim(item["api_key"].get<std::string>()));
+                srv.enabled      = item.value("enabled", true);
+                srv.auto_connect = item.value("auto_connect", true);
+                if (!srv.name.empty())
+                    mcp_client_servers.push_back(std::move(srv));
+            }
         }
 
         migrate_legacy_fields_into_profiles();
@@ -811,7 +854,11 @@ struct settings_sa_t
             {"last_active_path", workspace.last_active_path},
             {"active_view", workspace.active_view},
             {"left_width", workspace.left_width},
-            {"right_width", workspace.right_width}
+            {"right_width", workspace.right_width},
+            {"bottom_height", workspace.bottom_height},
+            {"left_visible", workspace.left_visible},
+            {"right_visible", workspace.right_visible},
+            {"bottom_visible", workspace.bottom_visible}
         };
 
         root["sandbox"] = {
@@ -821,6 +868,22 @@ struct settings_sa_t
             {"network_mode", sandbox.network_mode},
             {"shared_folder_root", sandbox.shared_folder_root}
         };
+
+
+        nlohmann::json mcp_clients = nlohmann::json::array();
+        for (const auto& srv : mcp_client_servers) {
+            mcp_clients.push_back({
+                {"name",         srv.name},
+                {"url",          srv.url},
+                {"transport",    srv.transport},
+                {"command",      srv.command},
+                {"args",         srv.args},
+                {"api_key",      sa_settings_detail::obfuscate_key(srv.api_key)},
+                {"enabled",      srv.enabled},
+                {"auto_connect", srv.auto_connect}
+            });
+        }
+        root["mcp_client_servers"] = mcp_clients;
 
         std::ofstream ofs(path, std::ios::trunc);
         if (!ofs.is_open())

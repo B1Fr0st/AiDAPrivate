@@ -130,7 +130,7 @@ namespace
         }
     }
 
-    bool call_validation_endpoint(settings_sa_t& /*settings*/,
+    bool call_validation_endpoint(settings_sa_t& ,
                                   const std::string& action,
                                   const std::string& key,
                                   const std::string& hwid,

@@ -4,7 +4,47 @@
 #include <d3d11.h>
 #include <string>
 #include <vector>
+#include <deque>
 #include <cstdint>
+
+
+enum class center_view_t : int {
+	code_editor = 0,
+	disassembly,
+	hex_view,
+	welcome
+};
+
+
+enum class bottom_tab_t : int {
+	output = 0,
+	mcp_log,
+	driver_log,
+	sandbox_log,
+	COUNT
+};
+
+
+namespace output_log {
+	inline std::deque<std::string> lines[static_cast<int>(bottom_tab_t::COUNT)];
+	inline constexpr size_t MAX_LINES = 4096;
+	inline bool auto_scroll[static_cast<int>(bottom_tab_t::COUNT)] = { true, true, true, true };
+
+	inline void push(bottom_tab_t tab, const std::string& line) {
+		auto& q = lines[static_cast<int>(tab)];
+		q.push_back(line);
+		if (q.size() > MAX_LINES) q.pop_front();
+	}
+	inline void clear(bottom_tab_t tab) {
+		lines[static_cast<int>(tab)].clear();
+	}
+}
+
+
+namespace menu_bar {
+	inline int  open_menu = -1;
+	inline bool any_open  = false;
+}
 
 
 struct ChatMessage {
@@ -65,6 +105,8 @@ namespace file_browser
 }
 
 
+namespace code_editor_widget { void on_text_changed(); }
+
 namespace code_editor
 {
 	inline std::vector<char> buffer;
@@ -84,6 +126,7 @@ namespace code_editor
 		active = true;
 		dirty = false;
 		scroll_y = 0.f;
+		code_editor_widget::on_text_changed();
 	}
 
 
@@ -236,10 +279,26 @@ namespace globals
 
 		inline float panel_left_w  = 220.f;
 		inline float panel_right_w = 350.f;
+		inline float panel_bottom_h = 180.f;
 
+		inline bool  panel_left_visible   = true;
+		inline bool  panel_right_visible  = true;
+		inline bool  panel_bottom_visible = false;
 
 		inline bool  dragging_left_splitter  = false;
 		inline bool  dragging_right_splitter = false;
+		inline bool  dragging_bottom_splitter = false;
+
+		inline bottom_tab_t active_bottom_tab = bottom_tab_t::output;
+
+
+		inline bool command_palette_open = false;
+		inline char command_palette_buf[128] = {};
+
+
+		inline std::string status_file_info;
+		inline std::string status_driver_info;
+		inline std::string status_model_info;
 
 		inline int theme = 0;
 
