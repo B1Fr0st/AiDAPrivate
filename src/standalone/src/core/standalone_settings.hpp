@@ -210,6 +210,35 @@ struct provider_profile_t
     std::string model;
     std::string headers_json;
     bool        enabled = true;
+
+
+    std::string aws_access_key;
+    std::string aws_secret_key;
+    std::string aws_session_token;
+    std::string aws_region = "us-east-1";
+    bool        aws_use_cross_region = false;
+
+
+    std::string vertex_project_id;
+    std::string vertex_region = "us-east5";
+    std::string vertex_key_file;
+
+
+    int         ollama_num_ctx = 0;
+
+
+    std::string reasoning_effort;
+
+
+    bool        lmstudio_speculative_decoding = false;
+    std::string lmstudio_draft_model;
+
+
+    std::string mistral_codestral_url;
+
+
+    std::string azure_deployment;
+    std::string azure_api_version = "2024-10-21";
 };
 
 struct theme_pack_t
@@ -391,16 +420,60 @@ struct settings_sa_t
     static const std::vector<std::string>& provider_kinds()
     {
         static const std::vector<std::string> v = {
-            "openai_compatible", "gemini", "anthropic", "openrouter", "local"
+            "anthropic", "openai_compatible", "openai_native", "openai_codex",
+            "gemini", "openrouter", "deepseek", "mistral", "xai",
+            "sambanova", "fireworks", "moonshot", "minimax", "qwen_code",
+            "baseten", "zai", "ollama", "lmstudio", "bedrock", "vertex",
+            "requesty", "unbound", "vercel_ai", "litellm", "local"
         };
         return v;
     }
 
+    static const std::string& provider_display_name(const std::string& kind)
+    {
+        static const std::map<std::string, std::string> names = {
+            {"anthropic",        "Anthropic"},
+            {"openai_compatible","OpenAI Compatible"},
+            {"openai_native",    "OpenAI"},
+            {"openai_codex",     "OpenAI Codex"},
+            {"gemini",           "Google Gemini"},
+            {"openrouter",       "OpenRouter"},
+            {"deepseek",         "DeepSeek"},
+            {"mistral",          "Mistral AI"},
+            {"xai",              "xAI (Grok)"},
+            {"sambanova",        "SambaNova"},
+            {"fireworks",        "Fireworks AI"},
+            {"moonshot",         "Moonshot (Kimi)"},
+            {"minimax",          "MiniMax"},
+            {"qwen_code",        "Qwen Code"},
+            {"baseten",          "Baseten"},
+            {"zai",              "ZAI (GLM)"},
+            {"ollama",           "Ollama"},
+            {"lmstudio",         "LM Studio"},
+            {"bedrock",          "AWS Bedrock"},
+            {"vertex",           "GCP Vertex AI"},
+            {"requesty",         "Requesty"},
+            {"unbound",          "Unbound"},
+            {"vercel_ai",        "Vercel AI Gateway"},
+            {"litellm",          "LiteLLM"},
+            {"local",            "Local (Custom)"},
+        };
+        static const std::string fallback = "Unknown";
+        auto it = names.find(kind);
+        return it != names.end() ? it->second : fallback;
+    }
+
+
     static const std::vector<std::string>& gemini_models()
     {
         static const std::vector<std::string> v = {
-            "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite",
-            "gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"
+            "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools",
+            "gemini-3-pro-preview", "gemini-3-flash-preview",
+            "gemini-2.5-pro", "gemini-2.5-pro-preview-06-05",
+            "gemini-2.5-pro-preview-05-06", "gemini-2.5-pro-preview-03-25",
+            "gemini-flash-latest", "gemini-2.5-flash-preview-09-2025",
+            "gemini-2.5-flash", "gemini-flash-lite-latest",
+            "gemini-2.5-flash-lite-preview-09-2025"
         };
         return v;
     }
@@ -408,8 +481,31 @@ struct settings_sa_t
     static const std::vector<std::string>& openai_models()
     {
         static const std::vector<std::string> v = {
-            "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini",
-            "gpt-4o", "gpt-4o-mini", "o4-mini", "o3-mini"
+            "gpt-5.1-codex-max",
+            "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
+            "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex",
+            "gpt-5.2-chat-latest", "gpt-5.3-chat-latest",
+            "gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-mini",
+            "gpt-5", "gpt-5-mini", "gpt-5-codex", "gpt-5-nano", "gpt-5-chat-latest",
+            "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
+            "o3", "o3-high", "o3-low",
+            "o4-mini", "o4-mini-high", "o4-mini-low",
+            "o3-mini", "o3-mini-high", "o3-mini-low",
+            "o1", "o1-preview", "o1-mini",
+            "gpt-4o", "gpt-4o-mini",
+            "codex-mini-latest",
+            "gpt-5-2025-08-07", "gpt-5-mini-2025-08-07", "gpt-5-nano-2025-08-07"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& openai_codex_models()
+    {
+        static const std::vector<std::string> v = {
+            "gpt-5.1-codex-max", "gpt-5.1-codex", "gpt-5.3-codex",
+            "gpt-5.3-codex-spark", "gpt-5.2-codex",
+            "gpt-5.1", "gpt-5", "gpt-5-codex", "gpt-5-codex-mini",
+            "gpt-5.1-codex-mini", "gpt-5.4", "gpt-5.4-mini", "gpt-5.2"
         };
         return v;
     }
@@ -417,7 +513,13 @@ struct settings_sa_t
     static const std::vector<std::string>& anthropic_models()
     {
         static const std::vector<std::string> v = {
-            "claude-opus-4-1", "claude-sonnet-4", "claude-3-7-sonnet", "claude-3.5-sonnet"
+            "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4-20250514",
+            "claude-opus-4-6", "claude-opus-4-5-20251101",
+            "claude-opus-4-1-20250805", "claude-opus-4-20250514",
+            "claude-3-7-sonnet-20250219:thinking", "claude-3-7-sonnet-20250219",
+            "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022",
+            "claude-3-opus-20240229", "claude-3-haiku-20240307",
+            "claude-haiku-4-5-20251001"
         };
         return v;
     }
@@ -425,7 +527,234 @@ struct settings_sa_t
     static const std::vector<std::string>& openrouter_models()
     {
         static const std::vector<std::string> v = {
-            "openai/gpt-oss-20b:free", "moonshotai/kimi-k2:free", "google/gemini-2.5-flash"
+            "anthropic/claude-sonnet-4.5", "anthropic/claude-sonnet-4",
+            "anthropic/claude-opus-4-1", "anthropic/claude-opus-4",
+            "openai/gpt-5.1-codex-max", "openai/gpt-5.4", "openai/gpt-4.1",
+            "openai/o3", "openai/o4-mini",
+            "google/gemini-2.5-pro", "google/gemini-2.5-flash",
+            "deepseek/deepseek-chat-v3-0324", "deepseek/deepseek-r1",
+            "x-ai/grok-4.20-beta-0309-reasoning",
+            "meta-llama/llama-3.3-70b-instruct",
+            "mistralai/mistral-large-latest",
+            "openai/gpt-oss-20b:free", "moonshotai/kimi-k2:free"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& deepseek_models()
+    {
+        static const std::vector<std::string> v = {
+            "deepseek-chat", "deepseek-reasoner"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& mistral_models()
+    {
+        static const std::vector<std::string> v = {
+            "magistral-medium-latest", "devstral-medium-latest",
+            "mistral-medium-latest", "codestral-latest",
+            "mistral-large-latest", "ministral-8b-latest",
+            "ministral-3b-latest", "mistral-small-latest",
+            "pixtral-large-latest"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& xai_models()
+    {
+        static const std::vector<std::string> v = {
+            "grok-4.20-beta-0309-reasoning", "grok-4.20-beta-0309-non-reasoning",
+            "grok-code-fast-1",
+            "grok-4-1-fast-reasoning", "grok-4-1-fast-non-reasoning",
+            "grok-4-fast-reasoning", "grok-4-fast-non-reasoning",
+            "grok-4-0709", "grok-3-mini", "grok-3"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& sambanova_models()
+    {
+        static const std::vector<std::string> v = {
+            "Meta-Llama-3.1-8B-Instruct", "Meta-Llama-3.3-70B-Instruct",
+            "DeepSeek-R1", "DeepSeek-V3-0324", "DeepSeek-V3.1",
+            "Llama-4-Maverick-17B-128E-Instruct", "Qwen3-32B",
+            "gpt-oss-120b"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& fireworks_models()
+    {
+        static const std::vector<std::string> v = {
+            "accounts/fireworks/models/kimi-k2-instruct",
+            "accounts/fireworks/models/kimi-k2-instruct-0905",
+            "accounts/fireworks/models/kimi-k2-thinking",
+            "accounts/fireworks/models/kimi-k2p5",
+            "accounts/fireworks/models/minimax-m2",
+            "accounts/fireworks/models/minimax-m2p1",
+            "accounts/fireworks/models/qwen3-235b-a22b-instruct-2507",
+            "accounts/fireworks/models/qwen3-coder-480b-a35b-instruct",
+            "accounts/fireworks/models/deepseek-r1-0528",
+            "accounts/fireworks/models/deepseek-v3",
+            "accounts/fireworks/models/deepseek-v3p1",
+            "accounts/fireworks/models/deepseek-v3p2",
+            "accounts/fireworks/models/glm-4p5",
+            "accounts/fireworks/models/glm-4p5-air",
+            "accounts/fireworks/models/glm-4p6",
+            "accounts/fireworks/models/glm-4p7",
+            "accounts/fireworks/models/gpt-oss-20b",
+            "accounts/fireworks/models/gpt-oss-120b",
+            "accounts/fireworks/models/llama-v3p3-70b-instruct",
+            "accounts/fireworks/models/llama4-maverick-instruct-basic",
+            "accounts/fireworks/models/llama4-scout-instruct-basic"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& moonshot_models()
+    {
+        static const std::vector<std::string> v = {
+            "kimi-k2-0711-preview", "kimi-k2-0905-preview",
+            "kimi-k2-turbo-preview", "kimi-k2-thinking", "kimi-k2.5"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& minimax_models()
+    {
+        static const std::vector<std::string> v = {
+            "MiniMax-M2.5", "MiniMax-M2", "MiniMax-M2-Stable", "MiniMax-M2.1"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& qwen_code_models()
+    {
+        static const std::vector<std::string> v = {
+            "qwen3-coder-plus", "qwen3-coder-flash"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& baseten_models()
+    {
+        static const std::vector<std::string> v = {
+            "moonshotai/Kimi-K2-Thinking", "zai-org/GLM-4.6",
+            "deepseek-ai/DeepSeek-R1", "deepseek-ai/DeepSeek-R1-0528",
+            "deepseek-ai/DeepSeek-V3-0324", "deepseek-ai/DeepSeek-V3.1",
+            "deepseek-ai/DeepSeek-V3.2", "openai/gpt-oss-120b",
+            "Qwen/Qwen3-235B-A22B-Instruct-2507",
+            "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+            "moonshotai/Kimi-K2-Instruct-0905"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& zai_models()
+    {
+        static const std::vector<std::string> v = {
+            "glm-4.5", "glm-4.5-air", "glm-4.5-x", "glm-4.5-airx", "glm-4.5-flash",
+            "glm-4.5v", "glm-4.6v", "glm-4.6",
+            "glm-4.7", "glm-5",
+            "glm-4.7-flash", "glm-4.7-flashx",
+            "glm-4.6v-flash", "glm-4.6v-flashx",
+            "glm-4-32b-0414-128k"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& bedrock_models()
+    {
+        static const std::vector<std::string> v = {
+            "anthropic.claude-sonnet-4-5-20250929-v1:0", "anthropic.claude-sonnet-4-6",
+            "amazon.nova-pro-v1:0", "amazon.nova-pro-latency-optimized-v1:0",
+            "amazon.nova-lite-v1:0", "amazon.nova-2-lite-v1:0", "amazon.nova-micro-v1:0",
+            "anthropic.claude-sonnet-4-20250514-v1:0",
+            "anthropic.claude-opus-4-1-20250805-v1:0",
+            "anthropic.claude-opus-4-6-v1",
+            "anthropic.claude-opus-4-5-20251101-v1:0",
+            "anthropic.claude-opus-4-20250514-v1:0",
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "anthropic.claude-3-5-haiku-20241022-v1:0",
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+            "anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "anthropic.claude-3-opus-20240229-v1:0",
+            "anthropic.claude-3-sonnet-20240229-v1:0",
+            "anthropic.claude-3-haiku-20240307-v1:0",
+            "deepseek.r1-v1:0",
+            "openai.gpt-oss-20b-1:0", "openai.gpt-oss-120b-1:0",
+            "meta.llama3-3-70b-instruct-v1:0",
+            "meta.llama3-2-90b-instruct-v1:0", "meta.llama3-2-11b-instruct-v1:0",
+            "meta.llama3-2-3b-instruct-v1:0", "meta.llama3-2-1b-instruct-v1:0",
+            "meta.llama3-1-405b-instruct-v1:0",
+            "meta.llama3-1-70b-instruct-v1:0",
+            "meta.llama3-1-70b-instruct-latency-optimized-v1:0",
+            "meta.llama3-1-8b-instruct-v1:0",
+            "meta.llama3-70b-instruct-v1:0", "meta.llama3-8b-instruct-v1:0",
+            "amazon.titan-text-lite-v1:0", "amazon.titan-text-express-v1:0",
+            "moonshot.kimi-k2-thinking", "minimax.minimax-m2",
+            "qwen.qwen3-next-80b-a3b", "qwen.qwen3-coder-480b-a35b-v1:0"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& vertex_models()
+    {
+        static const std::vector<std::string> v = {
+            "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools",
+            "gemini-3-pro-preview", "gemini-3-flash-preview",
+            "gemini-2.5-flash-preview-05-20:thinking", "gemini-2.5-flash-preview-05-20",
+            "gemini-2.5-flash", "gemini-2.5-flash-preview-04-17:thinking",
+            "gemini-2.5-flash-preview-04-17",
+            "gemini-2.5-pro-preview-03-25", "gemini-2.5-pro-preview-05-06",
+            "gemini-2.5-pro-preview-06-05", "gemini-2.5-pro",
+            "gemini-2.5-pro-exp-03-25",
+            "gemini-2.0-pro-exp-02-05", "gemini-2.0-flash-001",
+            "gemini-2.0-flash-lite-001", "gemini-2.0-flash-thinking-exp-01-21",
+            "gemini-1.5-flash-002", "gemini-1.5-pro-002",
+            "claude-sonnet-4@20250514", "claude-sonnet-4-5@20250929",
+            "claude-sonnet-4-6", "claude-haiku-4-5@20251001",
+            "claude-opus-4-6", "claude-opus-4-5@20251101",
+            "claude-opus-4-1@20250805", "claude-opus-4@20250514",
+            "claude-3-7-sonnet@20250219:thinking", "claude-3-7-sonnet@20250219",
+            "claude-3-5-sonnet-v2@20241022", "claude-3-5-sonnet@20240620",
+            "claude-3-5-haiku@20241022",
+            "claude-3-opus@20240229", "claude-3-haiku@20240307",
+            "gemini-2.5-flash-lite-preview-06-17",
+            "llama-4-maverick-17b-128e-instruct-maas",
+            "deepseek-r1-0528-maas", "deepseek-v3.1-maas",
+            "gpt-oss-120b-maas", "gpt-oss-20b-maas",
+            "qwen3-coder-480b-a35b-instruct-maas",
+            "qwen3-235b-a22b-instruct-2507-maas",
+            "moonshotai/kimi-k2-thinking-maas"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& ollama_models()
+    {
+
+        static const std::vector<std::string> v = {
+            "devstral:24b", "llama3.3:latest", "llama3.1:latest",
+            "qwen2.5-coder:latest", "qwen2.5:latest",
+            "deepseek-r1:latest", "deepseek-v3:latest",
+            "mistral:latest", "mixtral:latest",
+            "gemma2:latest", "phi3:latest",
+            "codellama:latest", "starcoder2:latest"
+        };
+        return v;
+    }
+
+    static const std::vector<std::string>& lmstudio_models()
+    {
+
+        static const std::vector<std::string> v = {
+            "mistralai/devstral-small-2505",
+            "lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF",
+            "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+            "TheBloke/CodeLlama-13B-Instruct-GGUF"
         };
         return v;
     }
@@ -433,7 +762,8 @@ struct settings_sa_t
     static const std::vector<std::string>& local_llm_models()
     {
         static const std::vector<std::string> v = {
-            "llama3.3:latest", "qwen2.5-coder:latest", "deepseek-r1:latest", "mistral:latest"
+            "llama3.3:latest", "qwen2.5-coder:latest",
+            "deepseek-r1:latest", "mistral:latest"
         };
         return v;
     }
@@ -441,14 +771,26 @@ struct settings_sa_t
     static const std::vector<std::string>& models_for_kind(const std::string& kind)
     {
         const std::string normalized = sa_settings_detail::normalize_provider_kind(kind);
-        if (normalized == "gemini")
-            return gemini_models();
-        if (normalized == "anthropic")
-            return anthropic_models();
-        if (normalized == "openrouter")
-            return openrouter_models();
-        if (normalized == "local")
-            return local_llm_models();
+        if (normalized == "gemini")           return gemini_models();
+        if (normalized == "anthropic")        return anthropic_models();
+        if (normalized == "openrouter")       return openrouter_models();
+        if (normalized == "deepseek")         return deepseek_models();
+        if (normalized == "mistral")          return mistral_models();
+        if (normalized == "xai")              return xai_models();
+        if (normalized == "sambanova")        return sambanova_models();
+        if (normalized == "fireworks")        return fireworks_models();
+        if (normalized == "moonshot")         return moonshot_models();
+        if (normalized == "minimax")          return minimax_models();
+        if (normalized == "qwen_code")        return qwen_code_models();
+        if (normalized == "baseten")          return baseten_models();
+        if (normalized == "zai")              return zai_models();
+        if (normalized == "openai_codex")     return openai_codex_models();
+        if (normalized == "bedrock")          return bedrock_models();
+        if (normalized == "vertex")           return vertex_models();
+        if (normalized == "ollama")           return ollama_models();
+        if (normalized == "lmstudio")         return lmstudio_models();
+        if (normalized == "local")            return local_llm_models();
+        if (normalized == "openai_native")    return openai_models();
         return openai_models();
     }
 
@@ -504,14 +846,28 @@ struct settings_sa_t
             return profile->base_url;
 
         const std::string kind = sa_settings_detail::normalize_provider_kind(profile->kind);
-        if (kind == "gemini")
-            return "https://generativelanguage.googleapis.com";
-        if (kind == "anthropic")
-            return "https://api.anthropic.com";
-        if (kind == "openrouter")
-            return "https://openrouter.ai";
-        if (kind == "local")
-            return "http://127.0.0.1:11434";
+        if (kind == "gemini")           return "https://generativelanguage.googleapis.com";
+        if (kind == "anthropic")        return "https://api.anthropic.com";
+        if (kind == "openrouter")       return "https://openrouter.ai";
+        if (kind == "deepseek")         return "https://api.deepseek.com";
+        if (kind == "mistral")          return "https://api.mistral.ai";
+        if (kind == "xai")              return "https://api.x.ai";
+        if (kind == "sambanova")        return "https://api.sambanova.ai";
+        if (kind == "fireworks")        return "https://api.fireworks.ai";
+        if (kind == "moonshot")         return "https://api.moonshot.cn";
+        if (kind == "minimax")          return "https://api.minimaxi.chat";
+        if (kind == "qwen_code")        return "https://chat.qwen.ai";
+        if (kind == "baseten")          return "https://bridge.baseten.co";
+        if (kind == "zai")              return "https://open.bigmodel.cn";
+        if (kind == "openai_codex")     return "https://api.openai.com";
+        if (kind == "ollama")           return "http://127.0.0.1:11434";
+        if (kind == "lmstudio")         return "http://127.0.0.1:1234";
+        if (kind == "requesty")         return "https://router.requesty.ai";
+        if (kind == "unbound")          return "https://api.getunbound.ai";
+        if (kind == "vercel_ai")        return "https://sdk.vercel.ai";
+        if (kind == "litellm")          return "http://127.0.0.1:4000";
+        if (kind == "local")            return "http://127.0.0.1:11434";
+        if (kind == "openai_native")    return "https://api.openai.com";
         return "https://api.openai.com";
     }
 
@@ -543,12 +899,38 @@ struct settings_sa_t
             return;
         }
 
+        auto make_profile = [](const char* pid, const char* name, const char* pkind,
+                               const char* url, const char* mdl) -> provider_profile_t {
+            provider_profile_t p;
+            p.id = pid; p.display_name = name; p.kind = pkind;
+            p.base_url = url; p.model = mdl; p.headers_json = "{}";
+            return p;
+        };
         provider_profiles = {
-            {"openai-default", "OpenAI Compatible", "openai_compatible", "https://api.openai.com", {}, "gpt-4.1-mini", "{}", true},
-            {"gemini-default", "Gemini", "gemini", "https://generativelanguage.googleapis.com", {}, "gemini-2.5-flash", "{}", true},
-            {"anthropic-default", "Anthropic", "anthropic", "https://api.anthropic.com", {}, "claude-sonnet-4", "{}", true},
-            {"openrouter-default", "OpenRouter", "openrouter", "https://openrouter.ai", {}, "openai/gpt-oss-20b:free", "{}", true},
-            {"local-default", "Local LLM", "local", "http://127.0.0.1:11434", {}, "llama3.3:latest", "{}", true},
+            make_profile("anthropic-default",  "Anthropic",           "anthropic",        "https://api.anthropic.com",                   "claude-sonnet-4-5"),
+            make_profile("openai-default",     "OpenAI",              "openai_native",     "https://api.openai.com",                      "gpt-5.1-codex-max"),
+            make_profile("openai-codex-def",   "OpenAI Codex",        "openai_codex",      "https://api.openai.com",                      "gpt-5.3-codex"),
+            make_profile("gemini-default",     "Gemini",              "gemini",            "https://generativelanguage.googleapis.com",    "gemini-3.1-pro-preview"),
+            make_profile("openrouter-default", "OpenRouter",          "openrouter",        "https://openrouter.ai",                       "anthropic/claude-sonnet-4.5"),
+            make_profile("deepseek-default",   "DeepSeek",            "deepseek",          "https://api.deepseek.com",                    "deepseek-chat"),
+            make_profile("mistral-default",    "Mistral",             "mistral",           "https://api.mistral.ai",                      "codestral-latest"),
+            make_profile("xai-default",        "xAI (Grok)",          "xai",               "https://api.x.ai",                            "grok-4.20-beta-0309-reasoning"),
+            make_profile("sambanova-default",  "SambaNova",           "sambanova",         "https://api.sambanova.ai",                    "Meta-Llama-3.3-70B-Instruct"),
+            make_profile("fireworks-default",  "Fireworks AI",        "fireworks",         "https://api.fireworks.ai",                    "accounts/fireworks/models/kimi-k2-instruct-0905"),
+            make_profile("moonshot-default",   "Moonshot (Kimi)",     "moonshot",          "https://api.moonshot.cn",                     "kimi-k2-0905-preview"),
+            make_profile("minimax-default",    "MiniMax",             "minimax",           "https://api.minimaxi.chat",                   "MiniMax-M2.5"),
+            make_profile("qwen-code-default",  "Qwen Code",           "qwen_code",         "https://chat.qwen.ai",                        "qwen3-coder-plus"),
+            make_profile("baseten-default",    "Baseten",             "baseten",           "https://bridge.baseten.co",                   "zai-org/GLM-4.6"),
+            make_profile("zai-default",        "ZAI (GLM)",           "zai",               "https://open.bigmodel.cn",                    "glm-4.6"),
+            make_profile("ollama-default",     "Ollama",              "ollama",            "http://127.0.0.1:11434",                      "devstral:24b"),
+            make_profile("lmstudio-default",   "LM Studio",           "lmstudio",          "http://127.0.0.1:1234",                       "mistralai/devstral-small-2505"),
+            make_profile("bedrock-default",    "AWS Bedrock",         "bedrock",           "",                                            "anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            make_profile("vertex-default",     "GCP Vertex AI",       "vertex",            "",                                            "claude-sonnet-4-5@20250929"),
+            make_profile("requesty-default",   "Requesty",            "requesty",          "https://router.requesty.ai",                  "coding/claude-4-sonnet"),
+            make_profile("unbound-default",    "Unbound",             "unbound",           "https://api.getunbound.ai",                   "anthropic/claude-sonnet-4-5"),
+            make_profile("vercel-ai-default",  "Vercel AI Gateway",   "vercel_ai",         "https://sdk.vercel.ai",                       "anthropic/claude-sonnet-4"),
+            make_profile("litellm-default",    "LiteLLM",             "litellm",           "http://127.0.0.1:4000",                       "claude-3-7-sonnet-20250219"),
+            make_profile("local-default",      "Local (Custom)",      "local",             "http://127.0.0.1:11434",                      "llama3.3:latest"),
         };
         active_provider_profile_id = provider_profiles.front().id;
         sync_legacy_fields_from_active_profile();
@@ -623,43 +1005,39 @@ struct settings_sa_t
         if (!provider_profiles.empty())
             return;
 
+        auto push = [&](const char* pid, const char* name, const char* pkind,
+                        const std::string& url, const std::string& key, const std::string& mdl) {
+            provider_profile_t p;
+            p.id = pid; p.display_name = name; p.kind = pkind;
+            p.base_url = url; p.api_key = key; p.model = mdl; p.headers_json = "{}";
+            provider_profiles.push_back(std::move(p));
+        };
+
         if (!openai_model_name.empty() || !openai_api_key.empty() || !openai_base_url.empty()) {
-            provider_profiles.push_back({
-                "openai-default", "OpenAI Compatible", "openai_compatible",
+            push("openai-default", "OpenAI Compatible", "openai_compatible",
                 openai_base_url.empty() ? "https://api.openai.com" : openai_base_url,
-                openai_api_key, openai_model_name.empty() ? "gpt-4.1-mini" : openai_model_name, "{}", true
-            });
+                openai_api_key, openai_model_name.empty() ? "gpt-4.1-mini" : openai_model_name);
         }
         if (!gemini_model_name.empty() || !gemini_api_key.empty()) {
-            provider_profiles.push_back({
-                "gemini-default", "Gemini", "gemini",
+            push("gemini-default", "Gemini", "gemini",
                 gemini_base_url.empty() ? "https://generativelanguage.googleapis.com" : gemini_base_url,
-                gemini_api_key, gemini_model_name.empty() ? "gemini-2.5-flash" : gemini_model_name, "{}", true
-            });
+                gemini_api_key, gemini_model_name.empty() ? "gemini-2.5-flash" : gemini_model_name);
         }
         if (!anthropic_model_name.empty() || !anthropic_api_key.empty()) {
-            provider_profiles.push_back({
-                "anthropic-default", "Anthropic", "anthropic",
+            push("anthropic-default", "Anthropic", "anthropic",
                 anthropic_base_url.empty() ? "https://api.anthropic.com" : anthropic_base_url,
-                anthropic_api_key, anthropic_model_name.empty() ? "claude-sonnet-4" : anthropic_model_name, "{}", true
-            });
+                anthropic_api_key, anthropic_model_name.empty() ? "claude-sonnet-4" : anthropic_model_name);
         }
         if (!openrouter_model_name.empty() || !openrouter_api_key.empty()) {
-            provider_profiles.push_back({
-                "openrouter-default", "OpenRouter", "openrouter",
+            push("openrouter-default", "OpenRouter", "openrouter",
                 "https://openrouter.ai", openrouter_api_key,
-                openrouter_model_name.empty() ? "openai/gpt-oss-20b:free" : openrouter_model_name,
-                "{}", true
-            });
+                openrouter_model_name.empty() ? "openai/gpt-oss-20b:free" : openrouter_model_name);
         }
         if (!local_llm_model_name.empty() || !local_llm_base_url.empty()) {
-            provider_profiles.push_back({
-                "local-default", "Local LLM", "local",
+            push("local-default", "Local LLM", "local",
                 local_llm_base_url.empty() ? "http://127.0.0.1:11434" : local_llm_base_url,
                 local_llm_api_key,
-                local_llm_model_name.empty() ? "llama3.3:latest" : local_llm_model_name,
-                "{}", true
-            });
+                local_llm_model_name.empty() ? "llama3.3:latest" : local_llm_model_name);
         }
 
         ensure_default_profiles();
@@ -811,6 +1189,39 @@ struct settings_sa_t
                 profile.model = item.value("model", "");
                 profile.headers_json = item.value("headers_json", "{}");
                 profile.enabled = item.value("enabled", true);
+
+
+                if (item.contains("aws_access_key") && item["aws_access_key"].is_string())
+                    profile.aws_access_key = sa_settings_detail::deobfuscate_key(sa_settings_detail::trim(item["aws_access_key"].get<std::string>()));
+                if (item.contains("aws_secret_key") && item["aws_secret_key"].is_string())
+                    profile.aws_secret_key = sa_settings_detail::deobfuscate_key(sa_settings_detail::trim(item["aws_secret_key"].get<std::string>()));
+                if (item.contains("aws_session_token") && item["aws_session_token"].is_string())
+                    profile.aws_session_token = sa_settings_detail::deobfuscate_key(sa_settings_detail::trim(item["aws_session_token"].get<std::string>()));
+                profile.aws_region = item.value("aws_region", "us-east-1");
+                profile.aws_use_cross_region = item.value("aws_use_cross_region", false);
+
+
+                profile.vertex_project_id = item.value("vertex_project_id", "");
+                profile.vertex_region = item.value("vertex_region", "us-east5");
+                profile.vertex_key_file = item.value("vertex_key_file", "");
+
+
+                profile.ollama_num_ctx = item.value("ollama_num_ctx", 0);
+
+
+                profile.reasoning_effort = item.value("reasoning_effort", "");
+
+
+                profile.lmstudio_speculative_decoding = item.value("lmstudio_speculative_decoding", false);
+                profile.lmstudio_draft_model = item.value("lmstudio_draft_model", "");
+
+
+                profile.mistral_codestral_url = item.value("mistral_codestral_url", "");
+
+
+                profile.azure_deployment = item.value("azure_deployment", "");
+                profile.azure_api_version = item.value("azure_api_version", "2024-10-21");
+
                 provider_profiles.push_back(std::move(profile));
             }
         }
@@ -966,7 +1377,7 @@ struct settings_sa_t
 
         nlohmann::json profiles = nlohmann::json::array();
         for (const auto& profile : provider_profiles) {
-            profiles.push_back({
+            nlohmann::json pj = {
                 {"id", profile.id},
                 {"display_name", profile.display_name},
                 {"kind", sa_settings_detail::normalize_provider_kind(profile.kind)},
@@ -975,7 +1386,53 @@ struct settings_sa_t
                 {"model", profile.model},
                 {"headers_json", profile.headers_json.empty() ? std::string("{}") : profile.headers_json},
                 {"enabled", profile.enabled}
-            });
+            };
+
+
+            if (!profile.aws_access_key.empty())
+                pj["aws_access_key"] = sa_settings_detail::obfuscate_key(profile.aws_access_key);
+            if (!profile.aws_secret_key.empty())
+                pj["aws_secret_key"] = sa_settings_detail::obfuscate_key(profile.aws_secret_key);
+            if (!profile.aws_session_token.empty())
+                pj["aws_session_token"] = sa_settings_detail::obfuscate_key(profile.aws_session_token);
+            if (profile.aws_region != "us-east-1")
+                pj["aws_region"] = profile.aws_region;
+            if (profile.aws_use_cross_region)
+                pj["aws_use_cross_region"] = true;
+
+
+            if (!profile.vertex_project_id.empty())
+                pj["vertex_project_id"] = profile.vertex_project_id;
+            if (profile.vertex_region != "us-east5")
+                pj["vertex_region"] = profile.vertex_region;
+            if (!profile.vertex_key_file.empty())
+                pj["vertex_key_file"] = profile.vertex_key_file;
+
+
+            if (profile.ollama_num_ctx > 0)
+                pj["ollama_num_ctx"] = profile.ollama_num_ctx;
+
+
+            if (!profile.reasoning_effort.empty())
+                pj["reasoning_effort"] = profile.reasoning_effort;
+
+
+            if (profile.lmstudio_speculative_decoding)
+                pj["lmstudio_speculative_decoding"] = true;
+            if (!profile.lmstudio_draft_model.empty())
+                pj["lmstudio_draft_model"] = profile.lmstudio_draft_model;
+
+
+            if (!profile.mistral_codestral_url.empty())
+                pj["mistral_codestral_url"] = profile.mistral_codestral_url;
+
+
+            if (!profile.azure_deployment.empty())
+                pj["azure_deployment"] = profile.azure_deployment;
+            if (profile.azure_api_version != "2024-10-21")
+                pj["azure_api_version"] = profile.azure_api_version;
+
+            profiles.push_back(std::move(pj));
         }
         root["provider_profiles"] = profiles;
         root["active_provider_profile_id"] = active_provider_profile_id;

@@ -142,7 +142,6 @@ private:
     std::string generate_openai(const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check);
     std::string generate_anthropic(const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check);
     std::string generate_openrouter(const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check);
-    std::string generate_local(const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check);
 
 
     std::string streaming_post(

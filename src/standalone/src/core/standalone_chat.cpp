@@ -1217,41 +1217,60 @@ void render_settings_popup()
 
     ImGui::OpenPopup("##sa_settings_modal");
 
-    float ww = globals::ui::window_w;
-    float wh = globals::ui::window_h;
-    float pw = 760.f, ph = 620.f;
+    const float ww = globals::ui::window_w;
+    const float wh = globals::ui::window_h;
+    const float pw = 940.f, ph = 680.f;
     ImGui::SetNextWindowPos(ImVec2((ww - pw) * 0.5f, (wh - ph) * 0.5f), ImGuiCond_Appearing);
     ImGui::SetNextWindowSize(ImVec2(pw, ph), ImGuiCond_Always);
 
-    float ax = globals::ui::accent.x, ay = globals::ui::accent.y, az = globals::ui::accent.z;
+    const float ax = globals::ui::accent.x, ay = globals::ui::accent.y, az = globals::ui::accent.z;
+    const ImU32 accent_col   = IM_COL32(static_cast<int>(ax*255), static_cast<int>(ay*255), static_cast<int>(az*255), 255);
+    const ImU32 accent_dim   = IM_COL32(static_cast<int>(ax*255), static_cast<int>(ay*255), static_cast<int>(az*255), 80);
+    const ImU32 accent_glow  = IM_COL32(static_cast<int>(ax*255), static_cast<int>(ay*255), static_cast<int>(az*255), 40);
+    const ImU32 card_bg      = IM_COL32(22, 22, 30, 240);
+    const ImU32 card_border  = IM_COL32(255, 255, 255, 18);
+    const ImU32 surface_bg   = IM_COL32(16, 16, 22, 250);
+    const ImU32 text_primary = IM_COL32(225, 222, 240, 255);
+    const ImU32 text_dim     = IM_COL32(160, 158, 175, 200);
 
-    ImGui::PushStyleColor(ImGuiCol_PopupBg,        ImVec4(0.075f, 0.075f, 0.10f, 0.97f));
-    ImGui::PushStyleColor(ImGuiCol_Border,          ImVec4(1.f, 1.f, 1.f, 0.08f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg,         ImVec4(0.12f, 0.12f, 0.16f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,  ImVec4(0.16f, 0.16f, 0.22f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,   ImVec4(0.18f, 0.18f, 0.25f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_Button,          ImVec4(ax * 0.4f, ay * 0.4f, az * 0.4f, 0.7f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,   ImVec4(ax * 0.55f, ay * 0.55f, az * 0.55f, 0.85f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,    ImVec4(ax * 0.65f, ay * 0.65f, az * 0.65f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_Header,          ImVec4(ax * 0.3f, ay * 0.3f, az * 0.3f, 0.4f));
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered,   ImVec4(ax * 0.4f, ay * 0.4f, az * 0.4f, 0.6f));
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive,    ImVec4(ax * 0.5f, ay * 0.5f, az * 0.5f, 0.8f));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg,        ImVec4(0.055f, 0.055f, 0.075f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_Border,          ImVec4(1.f, 1.f, 1.f, 0.06f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,         ImVec4(0.10f, 0.10f, 0.14f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,  ImVec4(0.14f, 0.14f, 0.19f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,   ImVec4(0.16f, 0.16f, 0.22f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_Button,          ImVec4(ax * 0.35f, ay * 0.35f, az * 0.35f, 0.6f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,   ImVec4(ax * 0.5f, ay * 0.5f, az * 0.5f, 0.8f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,    ImVec4(ax * 0.6f, ay * 0.6f, az * 0.6f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_Header,          ImVec4(ax * 0.25f, ay * 0.25f, az * 0.25f, 0.35f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered,   ImVec4(ax * 0.35f, ay * 0.35f, az * 0.35f, 0.55f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive,    ImVec4(ax * 0.45f, ay * 0.45f, az * 0.45f, 0.75f));
     ImGui::PushStyleColor(ImGuiCol_Text,            ImVec4(0.88f, 0.87f, 0.94f, 1.f));
     ImGui::PushStyleColor(ImGuiCol_SliderGrab,      ImVec4(ax, ay, az, 0.8f));
     ImGui::PushStyleColor(ImGuiCol_SliderGrabActive,ImVec4(ax, ay, az, 1.f));
     ImGui::PushStyleColor(ImGuiCol_CheckMark,       ImVec4(ax, ay, az, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_Tab,             ImVec4(0.f, 0.f, 0.f, 0.f));
+    ImGui::PushStyleColor(ImGuiCol_TabHovered,      ImVec4(ax * 0.3f, ay * 0.3f, az * 0.3f, 0.4f));
+    ImGui::PushStyleColor(ImGuiCol_TabSelected,     ImVec4(ax * 0.2f, ay * 0.2f, az * 0.2f, 0.6f));
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,  ImVec2(18.f, 14.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,  ImVec2(0.f, 0.f));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding,  6.f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,   ImVec2(8.f, 5.f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,    ImVec2(8.f, 8.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,   ImVec2(10.f, 6.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,    ImVec2(8.f, 7.f));
 
     bool still_open = true;
     static bool s_first = true;
+
     if (ImGui::BeginPopupModal("##sa_settings_modal", &still_open,
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove))
     {
+
+        static float s_tab_anim = 0.f;
+        static int   s_active_tab = 0;
+        static float s_profile_sel_anim = 0.f;
+        static int   s_profile_sel_target = 0;
+
+
         static int   s_selected_profile = 0;
         static char  s_name[128] = {};
         static char  s_base_url[512] = {};
@@ -1267,9 +1286,52 @@ void render_settings_popup()
         static int   s_sandbox_memory = 256;
         static int   s_sandbox_network = 0;
 
+
+        static char  s_aws_access[256] = {};
+        static char  s_aws_secret[256] = {};
+        static char  s_aws_session[256] = {};
+        static char  s_aws_region[64] = "us-east-1";
+        static bool  s_aws_cross_region = false;
+        static char  s_vertex_project[256] = {};
+        static char  s_vertex_region[64] = "us-east5";
+        static char  s_vertex_keyfile[512] = {};
+        static int   s_ollama_num_ctx = 0;
+        static int   s_reasoning_effort_idx = -1;
+        static bool  s_lmstudio_spec = false;
+        static char  s_lmstudio_draft[256] = {};
+        static char  s_mistral_codestral[512] = {};
+        static char  s_azure_deployment[256] = {};
+        static char  s_azure_api_ver[64] = "2024-10-21";
+
+
+        static bool s_thinking_enabled = false;
+        static int  s_thinking_budget = 10000;
+        static int  s_effort_level = 2;
+        static bool s_prompt_caching = true;
+        static int  s_task_budget = 0;
+        static bool s_web_search = false;
+        static int  s_max_rounds = 15;
+        static bool s_fast_mode = false;
+        static bool s_redact_thinking = false;
+        static bool s_ai_features_init = false;
+
+
+        static int   s_ed_tab_size = 4;
+        static float s_ed_font_size = 14.0f;
+        static bool  s_ed_line_numbers = true;
+        static bool  s_ed_word_wrap = false;
+        static bool  s_ed_minimap = false;
+        static bool  s_ed_bracket_match = true;
+        static bool  s_ed_highlight_line = true;
+        static bool  s_ed_autocomplete = true;
+        static bool  s_ed_ghost_text = false;
+        static bool  s_ed_init = false;
+
+        const float dt = ImGui::GetIO().DeltaTime;
+
         auto refresh_profile_buffers = [&]() {
             g_sa_settings.ensure_default_profiles();
-            if (s_selected_profile < 0 || s_selected_profile >= (int)g_sa_settings.provider_profiles.size())
+            if (s_selected_profile < 0 || s_selected_profile >= static_cast<int>(g_sa_settings.provider_profiles.size()))
                 s_selected_profile = 0;
             auto& profile = g_sa_settings.provider_profiles[s_selected_profile];
             snprintf(s_name, sizeof(s_name), "%s", profile.display_name.c_str());
@@ -1282,18 +1344,40 @@ void render_settings_popup()
 
             const auto& kinds = settings_sa_t::provider_kinds();
             s_kind = 0;
-            for (int i = 0; i < (int)kinds.size(); ++i) {
+            for (int i = 0; i < static_cast<int>(kinds.size()); ++i) {
                 if (kinds[i] == sa_settings_detail::normalize_provider_kind(profile.kind)) {
                     s_kind = i;
                     break;
                 }
             }
+
+
+            snprintf(s_aws_access,  sizeof(s_aws_access),  "%s", profile.aws_access_key.c_str());
+            snprintf(s_aws_secret,  sizeof(s_aws_secret),  "%s", profile.aws_secret_key.c_str());
+            snprintf(s_aws_session, sizeof(s_aws_session), "%s", profile.aws_session_token.c_str());
+            snprintf(s_aws_region,  sizeof(s_aws_region),  "%s", profile.aws_region.c_str());
+            s_aws_cross_region = profile.aws_use_cross_region;
+            snprintf(s_vertex_project, sizeof(s_vertex_project), "%s", profile.vertex_project_id.c_str());
+            snprintf(s_vertex_region,  sizeof(s_vertex_region),  "%s", profile.vertex_region.c_str());
+            snprintf(s_vertex_keyfile, sizeof(s_vertex_keyfile), "%s", profile.vertex_key_file.c_str());
+            s_ollama_num_ctx = profile.ollama_num_ctx;
+            s_reasoning_effort_idx = -1;
+            if (profile.reasoning_effort == "low")    s_reasoning_effort_idx = 0;
+            if (profile.reasoning_effort == "medium") s_reasoning_effort_idx = 1;
+            if (profile.reasoning_effort == "high")   s_reasoning_effort_idx = 2;
+            s_lmstudio_spec = profile.lmstudio_speculative_decoding;
+            snprintf(s_lmstudio_draft,     sizeof(s_lmstudio_draft),     "%s", profile.lmstudio_draft_model.c_str());
+            snprintf(s_mistral_codestral,  sizeof(s_mistral_codestral),  "%s", profile.mistral_codestral_url.c_str());
+            snprintf(s_azure_deployment,   sizeof(s_azure_deployment),   "%s", profile.azure_deployment.c_str());
+            snprintf(s_azure_api_ver,      sizeof(s_azure_api_ver),      "%s", profile.azure_api_version.c_str());
+
+            s_profile_sel_target = s_selected_profile;
         };
 
         if (s_first) {
             s_first = false;
             g_sa_settings.ensure_default_profiles();
-            for (int i = 0; i < (int)g_sa_settings.provider_profiles.size(); ++i) {
+            for (int i = 0; i < static_cast<int>(g_sa_settings.provider_profiles.size()); ++i) {
                 if (g_sa_settings.provider_profiles[i].id == g_sa_settings.active_provider_profile_id) {
                     s_selected_profile = i;
                     break;
@@ -1306,470 +1390,899 @@ void render_settings_popup()
             s_sandbox_timeout = g_sa_settings.sandbox.timeout_ms;
             s_sandbox_memory = g_sa_settings.sandbox.memory_limit_mb;
             s_sandbox_network = g_sa_settings.sandbox.network_mode == "default" ? 1 : 0;
+            s_tab_anim = 0.f;
+            s_profile_sel_anim = static_cast<float>(s_selected_profile);
+
+
+            s_thinking_enabled = g_sa_settings.thinking_enabled;
+            s_thinking_budget = g_sa_settings.thinking_budget;
+            s_effort_level = g_sa_settings.effort_level;
+            s_prompt_caching = g_sa_settings.prompt_caching;
+            s_task_budget = g_sa_settings.task_budget_tokens;
+            s_web_search = g_sa_settings.web_search_enabled;
+            s_max_rounds = g_sa_settings.max_agentic_rounds;
+            s_fast_mode = g_sa_settings.fast_mode;
+            s_redact_thinking = g_sa_settings.redact_thinking;
+            s_ai_features_init = true;
+
+
+            s_ed_tab_size = editor_config::tab_size;
+            s_ed_font_size = editor_config::font_size;
+            s_ed_line_numbers = editor_config::show_line_numbers;
+            s_ed_word_wrap = editor_config::word_wrap;
+            s_ed_minimap = editor_config::minimap;
+            s_ed_bracket_match = editor_config::bracket_match;
+            s_ed_highlight_line = editor_config::highlight_current_line;
+            s_ed_autocomplete = editor_config::auto_complete;
+            s_ed_ghost_text = g_sa_settings.ghost_text_enabled;
+            s_ed_init = true;
         }
 
+
+        s_tab_anim += (static_cast<float>(s_active_tab) - s_tab_anim) * (std::min)(dt * 12.f, 1.f);
+        s_profile_sel_anim += (static_cast<float>(s_profile_sel_target) - s_profile_sel_anim) * (std::min)(dt * 14.f, 1.f);
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 wp = ImGui::GetWindowPos();
+        ImVec2 ws = ImGui::GetWindowSize();
+
+
         {
-            const char* title = "AI Configuration";
+            dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + 48.f),
+                IM_COL32(18, 18, 26, 255), 12.f, ImDrawFlags_RoundCornersTop);
+            dl->AddLine(ImVec2(wp.x, wp.y + 48.f), ImVec2(wp.x + ws.x, wp.y + 48.f),
+                IM_COL32(255, 255, 255, 12));
+
+            const char* title = "Settings";
             ImVec2 tts = ImGui::CalcTextSize(title);
-            dl->AddText(ImVec2(wp.x + 18, wp.y + 14),
-                IM_COL32((int)(ax*255), (int)(ay*255), (int)(az*255), 220), title);
-            ImGui::Dummy(ImVec2(0, tts.y + 6));
+            dl->AddText(ImVec2(wp.x + 20.f, wp.y + (48.f - tts.y) * 0.5f), accent_col, title);
+
+
+            ImVec2 close_pos(wp.x + ws.x - 36.f, wp.y + 14.f);
+            ImGui::SetCursorScreenPos(close_pos);
+            ImGui::PushID("##settings_close");
+            if (ImGui::InvisibleButton("##close", ImVec2(20.f, 20.f))) {
+                s_first = true;
+                g_settings_open = false;
+                ImGui::CloseCurrentPopup();
+            }
+            bool close_hovered = ImGui::IsItemHovered();
+            dl->AddText(ImVec2(close_pos.x + 3.f, close_pos.y + 1.f),
+                close_hovered ? IM_COL32(255, 100, 100, 255) : text_dim, "X");
+            ImGui::PopID();
         }
 
-        const float list_w = 150.f;
-        ImGui::BeginChild("##profiles", ImVec2(list_w, ph - 120.f), true);
-        for (int i = 0; i < (int)g_sa_settings.provider_profiles.size(); ++i) {
-            const bool selected = (i == s_selected_profile);
-            if (ImGui::Selectable(g_sa_settings.provider_profiles[i].display_name.c_str(), selected)) {
-                s_selected_profile = i;
+        ImGui::SetCursorPos(ImVec2(0.f, 50.f));
+
+
+        const float sidebar_w = 180.f;
+        const float content_h = ph - 50.f - 52.f;
+
+        ImGui::SetCursorPos(ImVec2(0.f, 50.f));
+        ImGui::BeginChild("##sidebar", ImVec2(sidebar_w, content_h), false,
+            ImGuiWindowFlags_NoScrollbar);
+        {
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 8.f));
+            ImGui::Dummy(ImVec2(0, 4));
+
+
+            float item_h = 30.f;
+            float sel_y = 4.f + s_profile_sel_anim * (item_h + 2.f);
+            ImVec2 sp = ImGui::GetWindowPos();
+            dl->AddRectFilled(
+                ImVec2(sp.x + 6.f, sp.y + sel_y),
+                ImVec2(sp.x + sidebar_w - 6.f, sp.y + sel_y + item_h),
+                accent_glow, 6.f);
+            dl->AddRect(
+                ImVec2(sp.x + 6.f, sp.y + sel_y),
+                ImVec2(sp.x + sidebar_w - 6.f, sp.y + sel_y + item_h),
+                accent_dim, 6.f);
+
+            for (int i = 0; i < static_cast<int>(g_sa_settings.provider_profiles.size()); ++i) {
+                ImGui::PushID(i);
+                const bool selected = (i == s_selected_profile);
+                auto& prof = g_sa_settings.provider_profiles[i];
+
+                ImGui::SetCursorPosX(10.f);
+                ImVec2 cpos = ImGui::GetCursorScreenPos();
+
+
+                ImU32 dot_col = prof.enabled ?
+                    IM_COL32(80, 220, 120, 255) : IM_COL32(100, 100, 100, 120);
+                dl->AddCircleFilled(ImVec2(cpos.x + 4.f, cpos.y + item_h * 0.5f), 3.f, dot_col);
+
+                ImGui::SetCursorPosX(20.f);
+                if (ImGui::Selectable(prof.display_name.c_str(), selected,
+                        ImGuiSelectableFlags_None, ImVec2(sidebar_w - 28.f, item_h - 4.f))) {
+                    s_selected_profile = i;
+                    refresh_profile_buffers();
+                }
+                ImGui::PopID();
+            }
+
+            ImGui::Dummy(ImVec2(0, 6));
+            ImGui::SetCursorPosX(8.f);
+            if (ImGui::Button("+  Add", ImVec2(sidebar_w * 0.44f - 8.f, 26.f))) {
+                provider_profile_t profile;
+                profile.display_name = "New Profile";
+                profile.id = sa_settings_detail::make_profile_id(profile.display_name, g_sa_settings.provider_profiles.size() + 1);
+                profile.kind = "openai_compatible";
+                profile.base_url = "https://api.openai.com";
+                profile.model = "gpt-4.1-mini";
+                g_sa_settings.provider_profiles.push_back(std::move(profile));
+                s_selected_profile = static_cast<int>(g_sa_settings.provider_profiles.size()) - 1;
                 refresh_profile_buffers();
             }
-        }
-        if (ImGui::Button("+ Add", ImVec2((list_w - 10.f) * 0.48f, 24.f))) {
-            provider_profile_t profile;
-            profile.display_name = "New Profile";
-            profile.id = sa_settings_detail::make_profile_id(profile.display_name, g_sa_settings.provider_profiles.size() + 1);
-            profile.kind = "openai_compatible";
-            profile.base_url = "https://api.openai.com";
-            profile.model = "gpt-4.1-mini";
-            profile.headers_json = "{}";
-            g_sa_settings.provider_profiles.push_back(profile);
-            s_selected_profile = (int)g_sa_settings.provider_profiles.size() - 1;
-            refresh_profile_buffers();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("- Remove", ImVec2((list_w - 10.f) * 0.48f, 24.f)) &&
-            g_sa_settings.provider_profiles.size() > 1) {
-            g_sa_settings.provider_profiles.erase(g_sa_settings.provider_profiles.begin() + s_selected_profile);
-            s_selected_profile = (s_selected_profile > 0) ? (s_selected_profile - 1) : 0;
-            refresh_profile_buffers();
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.12f, 0.12f, 0.6f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.5f, 0.15f, 0.15f, 0.8f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.6f, 0.2f, 0.2f, 1.f));
+            if (ImGui::Button("-  Remove", ImVec2(sidebar_w * 0.44f - 8.f, 26.f)) &&
+                g_sa_settings.provider_profiles.size() > 1) {
+                g_sa_settings.provider_profiles.erase(g_sa_settings.provider_profiles.begin() + s_selected_profile);
+                s_selected_profile = (s_selected_profile > 0) ? (s_selected_profile - 1) : 0;
+                refresh_profile_buffers();
+            }
+            ImGui::PopStyleColor(3);
+
+            ImGui::PopStyleVar();
         }
         ImGui::EndChild();
 
-        ImGui::SameLine();
-        ImGui::BeginChild("##profile_editor", ImVec2(0.f, ph - 120.f), false);
 
-        ImGui::Text("Profile Name");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputText("##profile_name", s_name, sizeof(s_name));
+        dl->AddLine(
+            ImVec2(wp.x + sidebar_w, wp.y + 50.f),
+            ImVec2(wp.x + sidebar_w, wp.y + 50.f + content_h),
+            IM_COL32(255, 255, 255, 12));
 
-        ImGui::Text("Provider Kind");
-        ImGui::SetNextItemWidth(-1);
-        auto& kinds = settings_sa_t::provider_kinds();
-        std::vector<const char*> kind_items;
-        kind_items.reserve(kinds.size());
-        for (auto& kind : kinds)
-            kind_items.push_back(kind.c_str());
-        ImGui::Combo("##provider_kind", &s_kind, kind_items.data(), (int)kind_items.size());
 
-        ImGui::Text("Model");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputText("##profile_model", s_model, sizeof(s_model));
-        const auto& presets = settings_sa_t::models_for_kind(kinds[s_kind]);
-        if (ImGui::BeginCombo("##model_presets", "Quick Presets")) {
-            for (const auto& preset : presets) {
-                if (ImGui::Selectable(preset.c_str())) {
-                    snprintf(s_model, sizeof(s_model), "%s", preset.c_str());
+        ImGui::SetCursorPos(ImVec2(sidebar_w + 1.f, 50.f));
+        ImGui::BeginChild("##right_area", ImVec2(pw - sidebar_w - 1.f, content_h), false);
+        {
+            const float right_w = pw - sidebar_w - 1.f;
+
+
+            const char* tab_labels[] = {"Provider", "AI Features", "Editor", "MCP Servers", "Sandbox"};
+            constexpr int tab_count = 5;
+            float tab_positions[tab_count] = {};
+            float tab_widths[tab_count] = {};
+
+            ImGui::Dummy(ImVec2(0, 6));
+            float tab_start_x = 16.f;
+            ImVec2 tab_origin = ImGui::GetCursorScreenPos();
+            tab_origin.x += tab_start_x;
+
+            for (int t = 0; t < tab_count; ++t) {
+                tab_positions[t] = tab_start_x;
+                ImVec2 tsz = ImGui::CalcTextSize(tab_labels[t]);
+                tab_widths[t] = tsz.x + 20.f;
+
+                ImGui::SetCursorPosX(tab_positions[t]);
+                ImGui::PushID(t + 100);
+                bool is_active_tab = (t == s_active_tab);
+                ImU32 tab_text_col = is_active_tab ? accent_col : text_dim;
+
+                ImVec2 tp = ImGui::GetCursorScreenPos();
+                if (ImGui::InvisibleButton("##tab", ImVec2(tab_widths[t], 28.f))) {
+                    s_active_tab = t;
                 }
+                bool tab_hovered = ImGui::IsItemHovered();
+                if (tab_hovered && !is_active_tab)
+                    tab_text_col = text_primary;
+
+                dl->AddText(ImVec2(tp.x + 10.f, tp.y + 5.f), tab_text_col, tab_labels[t]);
+                ImGui::PopID();
+
+                tab_start_x += tab_widths[t] + 4.f;
+                if (t < tab_count - 1)
+                    ImGui::SameLine(0, 4.f);
             }
-            ImGui::EndCombo();
-        }
-
-        ImGui::Text("Base URL");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputText("##profile_base_url", s_base_url, sizeof(s_base_url));
-
-        ImGui::Text("API Key");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputText("##profile_api_key", s_api_key, sizeof(s_api_key), ImGuiInputTextFlags_Password);
-
-        ImGui::Text("Custom Headers (JSON)");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextMultiline("##profile_headers", s_headers, sizeof(s_headers), ImVec2(-1.f, 90.f));
-
-        ImGui::Checkbox("Profile Enabled", &s_enabled);
-        ImGui::Checkbox("Enable MCP Server", &s_mcp_enabled);
-        if (s_mcp_enabled) {
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(90.f);
-            ImGui::InputInt("Port", &s_mcp_port, 0, 0);
-        }
-
-        ImGui::Text("Temperature");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::SliderFloat("##temp", &s_temperature, 0.0f, 2.0f, "%.2f");
-
-        ImGui::Separator();
-        ImGui::Text("AI Features (Anthropic Claude)");
-
-        static bool s_thinking_enabled = false;
-        static int  s_thinking_budget = 10000;
-        static int  s_effort_level = 2;
-        static bool s_prompt_caching = true;
-        static int  s_task_budget = 0;
-        static bool s_web_search = false;
-        static int  s_max_rounds = 15;
-        static bool s_fast_mode = false;
-        static bool s_redact_thinking = false;
 
 
-        {
-            static bool s_ai_features_init = false;
-            if (!s_ai_features_init || s_first) {
-                s_thinking_enabled = g_sa_settings.thinking_enabled;
-                s_thinking_budget = g_sa_settings.thinking_budget;
-                s_effort_level = g_sa_settings.effort_level;
-                s_prompt_caching = g_sa_settings.prompt_caching;
-                s_task_budget = g_sa_settings.task_budget_tokens;
-                s_web_search = g_sa_settings.web_search_enabled;
-                s_max_rounds = g_sa_settings.max_agentic_rounds;
-                s_fast_mode = g_sa_settings.fast_mode;
-                s_redact_thinking = g_sa_settings.redact_thinking;
-                s_ai_features_init = true;
+            float ul_x = 0.f, ul_w = 0.f;
+            {
+                int from_tab = static_cast<int>(s_tab_anim);
+                int to_tab = from_tab + 1;
+                float frac = s_tab_anim - static_cast<float>(from_tab);
+                if (from_tab < 0) from_tab = 0;
+                if (to_tab >= tab_count) to_tab = tab_count - 1;
+                if (from_tab >= tab_count) from_tab = tab_count - 1;
+
+                float x0 = tab_positions[from_tab] + 10.f;
+                float w0 = tab_widths[from_tab] - 20.f;
+                float x1 = tab_positions[to_tab] + 10.f;
+                float w1 = tab_widths[to_tab] - 20.f;
+                ul_x = x0 + (x1 - x0) * frac;
+                ul_w = w0 + (w1 - w0) * frac;
             }
-        }
+            ImVec2 rp = ImGui::GetWindowPos();
+            float underline_y = tab_origin.y + 28.f;
+            dl->AddRectFilled(
+                ImVec2(rp.x + ul_x, underline_y),
+                ImVec2(rp.x + ul_x + ul_w, underline_y + 2.5f),
+                accent_col, 1.5f);
 
-        ImGui::Checkbox("Extended Thinking", &s_thinking_enabled);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Enable interleaved thinking for deeper reasoning (Anthropic only)");
-        if (s_thinking_enabled) {
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(120.f);
-            ImGui::InputInt("Budget##think", &s_thinking_budget, 1000, 5000);
-            s_thinking_budget = (std::max)(s_thinking_budget, 1024);
-        }
-
-        ImGui::Text("Effort Level");
-        ImGui::SetNextItemWidth(-1);
-        const char* effort_labels[] = {
-            "\xc2\xa4 Low", "\xe2\x97\x90 Medium", "\xe2\x97\x91 High", "\xe2\x97\x95 Max"
-        };
-        ImGui::Combo("##effort", &s_effort_level, effort_labels, 4);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Controls how much effort the model puts into its response");
-
-        ImGui::Checkbox("Prompt Caching", &s_prompt_caching);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Cache system prompts to reduce cost and latency (Anthropic only)");
-
-        ImGui::Checkbox("Web Search", &s_web_search);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Allow the AI to search the web for information (Anthropic only)");
-
-        ImGui::Checkbox("Fast Mode", &s_fast_mode);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Enable fast-mode for lower latency responses (Anthropic only)");
-
-        ImGui::Checkbox("Redact Thinking", &s_redact_thinking);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Redact thinking blocks from the response for privacy (Anthropic only)");
-
-        ImGui::Text("Max Agentic Rounds");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::SliderInt("##max_rounds", &s_max_rounds, 1, 50);
-
-        ImGui::Text("Task Budget (tokens, 0=unlimited)");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputInt("##task_budget", &s_task_budget, 10000, 50000);
-        s_task_budget = (std::max)(s_task_budget, 0);
-
-        ImGui::Separator();
-        ImGui::Text("Sandbox");
-
-        ImGui::Text("Sandbox Timeout (ms)");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputInt("##sandbox_timeout", &s_sandbox_timeout, 0, 0);
-        ImGui::Text("Sandbox Memory Budget (MB)");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputInt("##sandbox_memory", &s_sandbox_memory, 0, 0);
-        const char* network_modes[] = {"Off", "Default"};
-        ImGui::Combo("Sandbox Network", &s_sandbox_network, network_modes, IM_ARRAYSIZE(network_modes));
+            dl->AddRectFilled(
+                ImVec2(rp.x + ul_x - 4.f, underline_y + 2.f),
+                ImVec2(rp.x + ul_x + ul_w + 4.f, underline_y + 8.f),
+                accent_glow, 4.f);
 
 
-        ImGui::Separator();
-        ImGui::Text("Editor");
+            ImGui::Dummy(ImVec2(0, 4));
+            dl->AddLine(
+                ImVec2(rp.x, underline_y + 10.f),
+                ImVec2(rp.x + right_w, underline_y + 10.f),
+                IM_COL32(255, 255, 255, 8));
 
-        static int   s_ed_tab_size = 4;
-        static float s_ed_font_size = 14.0f;
-        static bool  s_ed_line_numbers = true;
-        static bool  s_ed_word_wrap = false;
-        static bool  s_ed_minimap = false;
-        static bool  s_ed_bracket_match = true;
-        static bool  s_ed_highlight_line = true;
-        static bool  s_ed_autocomplete = true;
-        static bool  s_ed_ghost_text = false;
-        {
-            static bool s_ed_init = false;
-            if (!s_ed_init) {
-                s_ed_tab_size = editor_config::tab_size;
-                s_ed_font_size = editor_config::font_size;
-                s_ed_line_numbers = editor_config::show_line_numbers;
-                s_ed_word_wrap = editor_config::word_wrap;
-                s_ed_minimap = editor_config::minimap;
-                s_ed_bracket_match = editor_config::bracket_match;
-                s_ed_highlight_line = editor_config::highlight_current_line;
-                s_ed_autocomplete = editor_config::auto_complete;
-                s_ed_ghost_text = g_sa_settings.ghost_text_enabled;
-                s_ed_init = true;
-            }
-        }
-
-        ImGui::Text("Tab Size");
-        ImGui::SetNextItemWidth(120.f);
-        ImGui::SliderInt("##ed_tab_size", &s_ed_tab_size, 1, 8);
-
-        ImGui::Text("Font Size");
-        ImGui::SetNextItemWidth(120.f);
-        ImGui::SliderFloat("##ed_font_size", &s_ed_font_size, 8.0f, 32.0f, "%.0f");
-
-        ImGui::Checkbox("Show Line Numbers", &s_ed_line_numbers);
-        ImGui::Checkbox("Word Wrap", &s_ed_word_wrap);
-        ImGui::Checkbox("Highlight Current Line", &s_ed_highlight_line);
-        ImGui::Checkbox("Bracket Matching", &s_ed_bracket_match);
-        ImGui::Checkbox("Minimap", &s_ed_minimap);
-        ImGui::Checkbox("Auto-Complete", &s_ed_autocomplete);
-        ImGui::Checkbox("Ghost Text (AI Suggestions)", &s_ed_ghost_text);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Show AI-generated completion suggestions as translucent text (Tab to accept)");
+            ImGui::Dummy(ImVec2(0, 8));
 
 
-        ImGui::Separator();
-        ImGui::Text("External MCP Servers");
-        {
-            static int s_mcp_client_sel = 0;
-            static char s_mcp_cl_name[128] = {};
-            static char s_mcp_cl_url[512] = {};
-            static char s_mcp_cl_key[512] = {};
-            static char s_mcp_cl_cmd[512] = {};
-            static char s_mcp_cl_args[512] = {};
-            static int  s_mcp_cl_transport = 0;
-            static bool s_mcp_cl_enabled = true;
-            static bool s_mcp_cl_auto = true;
-
-            auto refresh_mcp_cl = [&]() {
-                if (s_mcp_client_sel >= 0 && s_mcp_client_sel < (int)g_sa_settings.mcp_client_servers.size()) {
-                    auto& srv = g_sa_settings.mcp_client_servers[s_mcp_client_sel];
-                    snprintf(s_mcp_cl_name, sizeof(s_mcp_cl_name), "%s", srv.name.c_str());
-                    snprintf(s_mcp_cl_url,  sizeof(s_mcp_cl_url),  "%s", srv.url.c_str());
-                    snprintf(s_mcp_cl_key,  sizeof(s_mcp_cl_key),  "%s", srv.api_key.c_str());
-                    snprintf(s_mcp_cl_cmd,  sizeof(s_mcp_cl_cmd),  "%s", srv.command.c_str());
-                    snprintf(s_mcp_cl_args, sizeof(s_mcp_cl_args), "%s", srv.args.c_str());
-                    s_mcp_cl_transport = (srv.transport == "stdio") ? 1 : 0;
-                    s_mcp_cl_enabled = srv.enabled;
-                    s_mcp_cl_auto = srv.auto_connect;
-                } else {
-                    memset(s_mcp_cl_name, 0, sizeof(s_mcp_cl_name));
-                    memset(s_mcp_cl_url,  0, sizeof(s_mcp_cl_url));
-                    memset(s_mcp_cl_key,  0, sizeof(s_mcp_cl_key));
-                    memset(s_mcp_cl_cmd,  0, sizeof(s_mcp_cl_cmd));
-                    memset(s_mcp_cl_args, 0, sizeof(s_mcp_cl_args));
-                    s_mcp_cl_transport = 0;
-                    s_mcp_cl_enabled = true;
-                    s_mcp_cl_auto = true;
-                }
+            auto begin_card = [&](const char* label, float width = -1.f) {
+                ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.f);
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.07f, 0.10f, 0.8f));
+                ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.f, 1.f, 1.f, 0.04f));
+                ImGui::BeginChild(label, ImVec2(width, 0.f), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
+                ImGui::Dummy(ImVec2(0, 4));
+                ImGui::Indent(12.f);
+            };
+            auto end_card = [&]() {
+                ImGui::Unindent(12.f);
+                ImGui::Dummy(ImVec2(0, 4));
+                ImGui::EndChild();
+                ImGui::PopStyleColor(2);
+                ImGui::PopStyleVar();
             };
 
+            ImGui::BeginChild("##tab_content", ImVec2(0, 0), false);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.f, 8.f));
 
-            auto statuses = s_mcp_client_mgr.get_status();
-            for (int i = 0; i < (int)g_sa_settings.mcp_client_servers.size(); ++i) {
-                ImVec4 indicator = ImVec4(0.5f, 0.5f, 0.5f, 1.f);
-                for (const auto& st : statuses) {
-                    if (st.name == g_sa_settings.mcp_client_servers[i].name) {
-                        switch (st.state) {
-                        case mcp_client::connection_state_t::connected:    indicator = ImVec4(0.2f, 0.9f, 0.3f, 1.f); break;
-                        case mcp_client::connection_state_t::connecting:
-                        case mcp_client::connection_state_t::reconnecting: indicator = ImVec4(0.9f, 0.8f, 0.2f, 1.f); break;
-                        case mcp_client::connection_state_t::error:        indicator = ImVec4(0.9f, 0.2f, 0.2f, 1.f); break;
-                        default: break;
+            const auto& kinds = settings_sa_t::provider_kinds();
+            const std::string current_kind = kinds[s_kind];
+
+
+            if (s_active_tab == 0)
+            {
+                begin_card("##profile_card");
+                {
+                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Profile");
+                    ImGui::Dummy(ImVec2(0, 18));
+
+                    ImGui::Text("Name");
+                    ImGui::SetNextItemWidth(-14.f);
+                    ImGui::InputText("##profile_name", s_name, sizeof(s_name));
+
+                    ImGui::Text("Provider");
+                    ImGui::SetNextItemWidth(-14.f);
+                    {
+
+                        const std::string preview = settings_sa_t::provider_display_name(kinds[s_kind]);
+                        if (ImGui::BeginCombo("##provider_kind", preview.c_str())) {
+                            for (int i = 0; i < static_cast<int>(kinds.size()); ++i) {
+                                const bool sel = (i == s_kind);
+                                const std::string& disp = settings_sa_t::provider_display_name(kinds[i]);
+                                if (ImGui::Selectable(disp.c_str(), sel)) {
+                                    s_kind = i;
+
+                                    const auto& new_kind = kinds[s_kind];
+                                    provider_profile_t tmp;
+                                    tmp.kind = new_kind;
+                                    const auto& default_models = settings_sa_t::models_for_kind(new_kind);
+                                    if (!default_models.empty())
+                                        snprintf(s_model, sizeof(s_model), "%s", default_models[0].c_str());
+
+                                    s_base_url[0] = '\0';
+                                }
+                                if (sel) ImGui::SetItemDefaultFocus();
+                            }
+                            ImGui::EndCombo();
                         }
-                        break;
+                    }
+
+                    ImGui::Checkbox("Enabled", &s_enabled);
+                }
+                end_card();
+
+                ImGui::Dummy(ImVec2(0, 4));
+
+                begin_card("##model_card");
+                {
+                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Model Configuration");
+                    ImGui::Dummy(ImVec2(0, 18));
+
+                    ImGui::Text("Model");
+                    ImGui::SetNextItemWidth(-14.f);
+                    ImGui::InputText("##profile_model", s_model, sizeof(s_model));
+
+                    const auto& presets = settings_sa_t::models_for_kind(current_kind);
+                    if (!presets.empty()) {
+                        ImGui::SetNextItemWidth(-14.f);
+                        if (ImGui::BeginCombo("##model_presets", "Select from presets...")) {
+                            for (const auto& preset : presets) {
+                                bool is_current = (std::string(s_model) == preset);
+                                if (ImGui::Selectable(preset.c_str(), is_current)) {
+                                    snprintf(s_model, sizeof(s_model), "%s", preset.c_str());
+                                }
+                                if (is_current) ImGui::SetItemDefaultFocus();
+                            }
+                            ImGui::EndCombo();
+                        }
+                    }
+
+                    ImGui::Text("Temperature");
+                    ImGui::SetNextItemWidth(-14.f);
+                    ImGui::SliderFloat("##temp", &s_temperature, 0.0f, 2.0f, "%.2f");
+                }
+                end_card();
+
+                ImGui::Dummy(ImVec2(0, 4));
+
+                begin_card("##auth_card");
+                {
+                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Authentication");
+                    ImGui::Dummy(ImVec2(0, 18));
+
+                    if (current_kind == "bedrock") {
+                        ImGui::Text("AWS Access Key");
+                        ImGui::SetNextItemWidth(-14.f);
+                        ImGui::InputText("##aws_access", s_aws_access, sizeof(s_aws_access), ImGuiInputTextFlags_Password);
+                        ImGui::Text("AWS Secret Key");
+                        ImGui::SetNextItemWidth(-14.f);
+                        ImGui::InputText("##aws_secret", s_aws_secret, sizeof(s_aws_secret), ImGuiInputTextFlags_Password);
+                        ImGui::Text("Session Token (optional)");
+                        ImGui::SetNextItemWidth(-14.f);
+                        ImGui::InputText("##aws_session", s_aws_session, sizeof(s_aws_session), ImGuiInputTextFlags_Password);
+                        ImGui::Text("Region");
+                        ImGui::SetNextItemWidth(-14.f);
+                        ImGui::InputText("##aws_region", s_aws_region, sizeof(s_aws_region));
+                        ImGui::Checkbox("Cross-Region Inference", &s_aws_cross_region);
+                    } else if (current_kind == "vertex") {
+                        ImGui::Text("Project ID");
+                        ImGui::SetNextItemWidth(-14.f);
+                        ImGui::InputText("##vertex_project", s_vertex_project, sizeof(s_vertex_project));
+                        ImGui::Text("Region");
+                        ImGui::SetNextItemWidth(-14.f);
+                        ImGui::InputText("##vertex_region", s_vertex_region, sizeof(s_vertex_region));
+                        ImGui::Text("Service Account Key File");
+                        ImGui::SetNextItemWidth(-14.f);
+                        ImGui::InputText("##vertex_keyfile", s_vertex_keyfile, sizeof(s_vertex_keyfile));
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Path to GCP service account JSON key file");
+                    } else if (current_kind == "ollama" || current_kind == "lmstudio"
+                               || current_kind == "local" || current_kind == "qwen_code") {
+                        ImGui::TextColored(ImVec4(0.6f, 0.8f, 0.6f, 0.9f),
+                            "Local/free provider - no API key required");
+                        ImGui::Text("API Key (optional)");
+                        ImGui::SetNextItemWidth(-14.f);
+                        ImGui::InputText("##profile_api_key", s_api_key, sizeof(s_api_key), ImGuiInputTextFlags_Password);
+                    } else {
+                        ImGui::Text("API Key");
+                        ImGui::SetNextItemWidth(-14.f);
+                        ImGui::InputText("##profile_api_key", s_api_key, sizeof(s_api_key), ImGuiInputTextFlags_Password);
                     }
                 }
-                ImGui::PushStyleColor(ImGuiCol_Text, indicator);
-                ImGui::Bullet();
-                ImGui::PopStyleColor();
-                ImGui::SameLine();
-                if (ImGui::Selectable(g_sa_settings.mcp_client_servers[i].name.c_str(),
-                                      i == s_mcp_client_sel)) {
-                    s_mcp_client_sel = i;
-                    refresh_mcp_cl();
+                end_card();
+
+                ImGui::Dummy(ImVec2(0, 4));
+
+                begin_card("##endpoint_card");
+                {
+                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Endpoint");
+                    ImGui::Dummy(ImVec2(0, 18));
+
+                    ImGui::Text("Base URL (leave empty for default)");
+                    ImGui::SetNextItemWidth(-14.f);
+                    ImGui::InputText("##profile_base_url", s_base_url, sizeof(s_base_url));
+                    if (ImGui::IsItemHovered()) {
+                        provider_profile_t tmp;
+                        tmp.kind = current_kind;
+                        std::string def_url;
+                        if (current_kind == "gemini")           def_url = "https://generativelanguage.googleapis.com";
+                        else if (current_kind == "anthropic")   def_url = "https://api.anthropic.com";
+                        else if (current_kind == "openrouter")  def_url = "https://openrouter.ai";
+                        else if (current_kind == "deepseek")    def_url = "https://api.deepseek.com";
+                        else if (current_kind == "mistral")     def_url = "https://api.mistral.ai";
+                        else if (current_kind == "xai")         def_url = "https://api.x.ai";
+                        else if (current_kind == "sambanova")   def_url = "https://api.sambanova.ai";
+                        else if (current_kind == "fireworks")   def_url = "https://api.fireworks.ai";
+                        else if (current_kind == "moonshot")    def_url = "https://api.moonshot.cn";
+                        else if (current_kind == "minimax")     def_url = "https://api.minimaxi.chat";
+                        else if (current_kind == "qwen_code")   def_url = "https://chat.qwen.ai";
+                        else if (current_kind == "baseten")     def_url = "https://bridge.baseten.co";
+                        else if (current_kind == "zai")         def_url = "https://open.bigmodel.cn";
+                        else if (current_kind == "openai_codex") def_url = "https://api.openai.com";
+                        else if (current_kind == "ollama")      def_url = "http://127.0.0.1:11434";
+                        else if (current_kind == "lmstudio")    def_url = "http://127.0.0.1:1234";
+                        else if (current_kind == "requesty")    def_url = "https://router.requesty.ai";
+                        else if (current_kind == "unbound")     def_url = "https://api.getunbound.ai";
+                        else if (current_kind == "vercel_ai")   def_url = "https://sdk.vercel.ai";
+                        else if (current_kind == "litellm")     def_url = "http://127.0.0.1:4000";
+                        else                                    def_url = "https://api.openai.com";
+                        ImGui::SetTooltip("Default: %s", def_url.c_str());
+                    }
+
+                    ImGui::Text("Custom Headers (JSON)");
+                    ImGui::SetNextItemWidth(-14.f);
+                    ImGui::InputTextMultiline("##profile_headers", s_headers, sizeof(s_headers), ImVec2(-14.f, 70.f));
+
+
+                    if (current_kind == "ollama") {
+                        ImGui::Text("Context Window (0 = default)");
+                        ImGui::SetNextItemWidth(140.f);
+                        ImGui::InputInt("##ollama_ctx", &s_ollama_num_ctx, 1024, 4096);
+                        s_ollama_num_ctx = (std::max)(s_ollama_num_ctx, 0);
+                    }
+                    if (current_kind == "openai_native" || current_kind == "openai_compatible"
+                        || current_kind == "openai_codex") {
+                        ImGui::Text("Reasoning Effort (o-series models)");
+                        ImGui::SetNextItemWidth(-14.f);
+                        const char* r_labels[] = {"(none)", "Low", "Medium", "High"};
+                        ImGui::Combo("##reasoning_effort", &s_reasoning_effort_idx, r_labels, 4);
+                    }
+                    if (current_kind == "lmstudio") {
+                        ImGui::Checkbox("Speculative Decoding", &s_lmstudio_spec);
+                        if (s_lmstudio_spec) {
+                            ImGui::Text("Draft Model");
+                            ImGui::SetNextItemWidth(-14.f);
+                            ImGui::InputText("##lmstudio_draft", s_lmstudio_draft, sizeof(s_lmstudio_draft));
+                        }
+                    }
+                    if (current_kind == "mistral") {
+                        ImGui::Text("Codestral URL (optional)");
+                        ImGui::SetNextItemWidth(-14.f);
+                        ImGui::InputText("##mistral_codestral", s_mistral_codestral, sizeof(s_mistral_codestral));
+                    }
                 }
+                end_card();
             }
 
 
-            if (ImGui::SmallButton("+ Add Server")) {
-                mcp_client_server_t srv;
-                srv.name = "New Server";
-                srv.url = "http://localhost:3001";
-                g_sa_settings.mcp_client_servers.push_back(srv);
-                s_mcp_client_sel = (int)g_sa_settings.mcp_client_servers.size() - 1;
-                refresh_mcp_cl();
-            }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("- Remove") &&
-                s_mcp_client_sel >= 0 && s_mcp_client_sel < (int)g_sa_settings.mcp_client_servers.size())
+            else if (s_active_tab == 1)
             {
-                g_sa_settings.mcp_client_servers.erase(
-                    g_sa_settings.mcp_client_servers.begin() + s_mcp_client_sel);
-                if (s_mcp_client_sel > 0) --s_mcp_client_sel;
-                refresh_mcp_cl();
-            }
-
-
-            if (s_mcp_client_sel >= 0 && s_mcp_client_sel < (int)g_sa_settings.mcp_client_servers.size()) {
-                ImGui::Text("Server Name"); ImGui::SetNextItemWidth(-1);
-                ImGui::InputText("##mcp_cl_name", s_mcp_cl_name, sizeof(s_mcp_cl_name));
-
-                const char* transports[] = {"HTTP/SSE", "Stdio"};
-                ImGui::Text("Transport"); ImGui::SetNextItemWidth(-1);
-                ImGui::Combo("##mcp_cl_transport", &s_mcp_cl_transport, transports, 2);
-
-                if (s_mcp_cl_transport == 0) {
-                    ImGui::Text("URL"); ImGui::SetNextItemWidth(-1);
-                    ImGui::InputText("##mcp_cl_url", s_mcp_cl_url, sizeof(s_mcp_cl_url));
-                    ImGui::Text("API Key"); ImGui::SetNextItemWidth(-1);
-                    ImGui::InputText("##mcp_cl_key", s_mcp_cl_key, sizeof(s_mcp_cl_key), ImGuiInputTextFlags_Password);
-                } else {
-                    ImGui::Text("Command"); ImGui::SetNextItemWidth(-1);
-                    ImGui::InputText("##mcp_cl_cmd", s_mcp_cl_cmd, sizeof(s_mcp_cl_cmd));
-                    ImGui::Text("Arguments"); ImGui::SetNextItemWidth(-1);
-                    ImGui::InputText("##mcp_cl_args", s_mcp_cl_args, sizeof(s_mcp_cl_args));
+                if (!s_ai_features_init) {
+                    s_thinking_enabled = g_sa_settings.thinking_enabled;
+                    s_thinking_budget = g_sa_settings.thinking_budget;
+                    s_effort_level = g_sa_settings.effort_level;
+                    s_prompt_caching = g_sa_settings.prompt_caching;
+                    s_task_budget = g_sa_settings.task_budget_tokens;
+                    s_web_search = g_sa_settings.web_search_enabled;
+                    s_max_rounds = g_sa_settings.max_agentic_rounds;
+                    s_fast_mode = g_sa_settings.fast_mode;
+                    s_redact_thinking = g_sa_settings.redact_thinking;
+                    s_ai_features_init = true;
                 }
 
-                ImGui::Checkbox("Enabled##mcp_cl", &s_mcp_cl_enabled);
-                ImGui::SameLine();
-                ImGui::Checkbox("Auto-Connect", &s_mcp_cl_auto);
+                begin_card("##thinking_card");
+                {
+                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Reasoning & Thinking");
+                    ImGui::Dummy(ImVec2(0, 18));
 
+                    ImGui::Checkbox("Extended Thinking", &s_thinking_enabled);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Enable interleaved thinking for deeper reasoning (Anthropic)");
+                    if (s_thinking_enabled) {
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(140.f);
+                        ImGui::InputInt("Budget##think", &s_thinking_budget, 1000, 5000);
+                        s_thinking_budget = (std::max)(s_thinking_budget, 1024);
+                    }
 
-                auto& srv = g_sa_settings.mcp_client_servers[s_mcp_client_sel];
-                srv.name         = s_mcp_cl_name;
-                srv.url          = s_mcp_cl_url;
-                srv.api_key      = s_mcp_cl_key;
-                srv.command      = s_mcp_cl_cmd;
-                srv.args         = s_mcp_cl_args;
-                srv.transport    = (s_mcp_cl_transport == 1) ? "stdio" : "http_sse";
-                srv.enabled      = s_mcp_cl_enabled;
-                srv.auto_connect = s_mcp_cl_auto;
+                    ImGui::Text("Effort Level");
+                    ImGui::SetNextItemWidth(200.f);
+                    const char* effort_labels[] = {
+                        "\xc2\xa4 Low", "\xe2\x97\x90 Medium", "\xe2\x97\x91 High", "\xe2\x97\x95 Max"
+                    };
+                    ImGui::Combo("##effort", &s_effort_level, effort_labels, 4);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Controls how much effort the model puts into its response");
+
+                    ImGui::Checkbox("Fast Mode", &s_fast_mode);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Enable fast-mode for lower latency (Anthropic)");
+
+                    ImGui::Checkbox("Redact Thinking", &s_redact_thinking);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Redact thinking blocks for privacy (Anthropic)");
+                }
+                end_card();
+
+                ImGui::Dummy(ImVec2(0, 4));
+
+                begin_card("##caching_card");
+                {
+                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Caching & Budgets");
+                    ImGui::Dummy(ImVec2(0, 18));
+
+                    ImGui::Checkbox("Prompt Caching", &s_prompt_caching);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Cache system prompts to reduce cost and latency");
+
+                    ImGui::Text("Task Budget (tokens, 0 = unlimited)");
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::InputInt("##task_budget", &s_task_budget, 10000, 50000);
+                    s_task_budget = (std::max)(s_task_budget, 0);
+                }
+                end_card();
+
+                ImGui::Dummy(ImVec2(0, 4));
+
+                begin_card("##features_card");
+                {
+                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Features & Agentic");
+                    ImGui::Dummy(ImVec2(0, 18));
+
+                    ImGui::Checkbox("Web Search", &s_web_search);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Allow AI to search the web (Anthropic)");
+
+                    ImGui::Text("Max Agentic Rounds");
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SliderInt("##max_rounds", &s_max_rounds, 1, 50);
+                }
+                end_card();
             }
-        }
 
+
+            else if (s_active_tab == 2)
+            {
+                if (!s_ed_init) {
+                    s_ed_tab_size = editor_config::tab_size;
+                    s_ed_font_size = editor_config::font_size;
+                    s_ed_line_numbers = editor_config::show_line_numbers;
+                    s_ed_word_wrap = editor_config::word_wrap;
+                    s_ed_minimap = editor_config::minimap;
+                    s_ed_bracket_match = editor_config::bracket_match;
+                    s_ed_highlight_line = editor_config::highlight_current_line;
+                    s_ed_autocomplete = editor_config::auto_complete;
+                    s_ed_ghost_text = g_sa_settings.ghost_text_enabled;
+                    s_ed_init = true;
+                }
+
+                begin_card("##editor_layout_card");
+                {
+                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Layout");
+                    ImGui::Dummy(ImVec2(0, 18));
+
+                    ImGui::Text("Tab Size");
+                    ImGui::SetNextItemWidth(140.f);
+                    ImGui::SliderInt("##ed_tab_size", &s_ed_tab_size, 1, 8);
+
+                    ImGui::Text("Font Size");
+                    ImGui::SetNextItemWidth(140.f);
+                    ImGui::SliderFloat("##ed_font_size", &s_ed_font_size, 8.0f, 32.0f, "%.0f");
+
+                    ImGui::Checkbox("Show Line Numbers", &s_ed_line_numbers);
+                    ImGui::Checkbox("Word Wrap", &s_ed_word_wrap);
+                    ImGui::Checkbox("Minimap", &s_ed_minimap);
+                }
+                end_card();
+
+                ImGui::Dummy(ImVec2(0, 4));
+
+                begin_card("##editor_features_card");
+                {
+                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Features");
+                    ImGui::Dummy(ImVec2(0, 18));
+
+                    ImGui::Checkbox("Highlight Current Line", &s_ed_highlight_line);
+                    ImGui::Checkbox("Bracket Matching", &s_ed_bracket_match);
+                    ImGui::Checkbox("Auto-Complete", &s_ed_autocomplete);
+                    ImGui::Checkbox("Ghost Text (AI Suggestions)", &s_ed_ghost_text);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("AI-generated completions as translucent text (Tab to accept)");
+                }
+                end_card();
+            }
+
+
+            else if (s_active_tab == 3)
+            {
+                begin_card("##mcp_server_card");
+                {
+                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Built-in MCP Server");
+                    ImGui::Dummy(ImVec2(0, 18));
+
+                    ImGui::Checkbox("Enable MCP Server", &s_mcp_enabled);
+                    if (s_mcp_enabled) {
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(90.f);
+                        ImGui::InputInt("Port", &s_mcp_port, 0, 0);
+                    }
+                }
+                end_card();
+
+                ImGui::Dummy(ImVec2(0, 4));
+
+                begin_card("##mcp_clients_card");
+                {
+                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "External MCP Servers");
+                    ImGui::Dummy(ImVec2(0, 18));
+
+                    static int s_mcp_client_sel = 0;
+                    static char s_mcp_cl_name[128] = {};
+                    static char s_mcp_cl_url[512] = {};
+                    static char s_mcp_cl_key[512] = {};
+                    static char s_mcp_cl_cmd[512] = {};
+                    static char s_mcp_cl_args[512] = {};
+                    static int  s_mcp_cl_transport = 0;
+                    static bool s_mcp_cl_enabled = true;
+                    static bool s_mcp_cl_auto = true;
+
+                    auto refresh_mcp_cl = [&]() {
+                        if (s_mcp_client_sel >= 0 && s_mcp_client_sel < static_cast<int>(g_sa_settings.mcp_client_servers.size())) {
+                            auto& srv = g_sa_settings.mcp_client_servers[s_mcp_client_sel];
+                            snprintf(s_mcp_cl_name, sizeof(s_mcp_cl_name), "%s", srv.name.c_str());
+                            snprintf(s_mcp_cl_url,  sizeof(s_mcp_cl_url),  "%s", srv.url.c_str());
+                            snprintf(s_mcp_cl_key,  sizeof(s_mcp_cl_key),  "%s", srv.api_key.c_str());
+                            snprintf(s_mcp_cl_cmd,  sizeof(s_mcp_cl_cmd),  "%s", srv.command.c_str());
+                            snprintf(s_mcp_cl_args, sizeof(s_mcp_cl_args), "%s", srv.args.c_str());
+                            s_mcp_cl_transport = (srv.transport == "stdio") ? 1 : 0;
+                            s_mcp_cl_enabled = srv.enabled;
+                            s_mcp_cl_auto = srv.auto_connect;
+                        } else {
+                            memset(s_mcp_cl_name, 0, sizeof(s_mcp_cl_name));
+                            memset(s_mcp_cl_url,  0, sizeof(s_mcp_cl_url));
+                            memset(s_mcp_cl_key,  0, sizeof(s_mcp_cl_key));
+                            memset(s_mcp_cl_cmd,  0, sizeof(s_mcp_cl_cmd));
+                            memset(s_mcp_cl_args, 0, sizeof(s_mcp_cl_args));
+                            s_mcp_cl_transport = 0;
+                            s_mcp_cl_enabled = true;
+                            s_mcp_cl_auto = true;
+                        }
+                    };
+
+                    auto statuses = s_mcp_client_mgr.get_status();
+                    for (int i = 0; i < static_cast<int>(g_sa_settings.mcp_client_servers.size()); ++i) {
+                        ImVec4 indicator = ImVec4(0.5f, 0.5f, 0.5f, 1.f);
+                        for (const auto& st : statuses) {
+                            if (st.name == g_sa_settings.mcp_client_servers[i].name) {
+                                switch (st.state) {
+                                case mcp_client::connection_state_t::connected:    indicator = ImVec4(0.2f, 0.9f, 0.3f, 1.f); break;
+                                case mcp_client::connection_state_t::connecting:
+                                case mcp_client::connection_state_t::reconnecting: indicator = ImVec4(0.9f, 0.8f, 0.2f, 1.f); break;
+                                case mcp_client::connection_state_t::error:        indicator = ImVec4(0.9f, 0.2f, 0.2f, 1.f); break;
+                                default: break;
+                                }
+                                break;
+                            }
+                        }
+                        ImGui::PushStyleColor(ImGuiCol_Text, indicator);
+                        ImGui::Bullet();
+                        ImGui::PopStyleColor();
+                        ImGui::SameLine();
+                        if (ImGui::Selectable(g_sa_settings.mcp_client_servers[i].name.c_str(),
+                                              i == s_mcp_client_sel)) {
+                            s_mcp_client_sel = i;
+                            refresh_mcp_cl();
+                        }
+                    }
+
+                    ImGui::Dummy(ImVec2(0, 4));
+                    if (ImGui::SmallButton("+ Add Server")) {
+                        mcp_client_server_t srv;
+                        srv.name = "New Server";
+                        srv.url = "http://localhost:3001";
+                        g_sa_settings.mcp_client_servers.push_back(srv);
+                        s_mcp_client_sel = static_cast<int>(g_sa_settings.mcp_client_servers.size()) - 1;
+                        refresh_mcp_cl();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("- Remove") &&
+                        s_mcp_client_sel >= 0 && s_mcp_client_sel < static_cast<int>(g_sa_settings.mcp_client_servers.size()))
+                    {
+                        g_sa_settings.mcp_client_servers.erase(
+                            g_sa_settings.mcp_client_servers.begin() + s_mcp_client_sel);
+                        if (s_mcp_client_sel > 0) --s_mcp_client_sel;
+                        refresh_mcp_cl();
+                    }
+
+                    if (s_mcp_client_sel >= 0 && s_mcp_client_sel < static_cast<int>(g_sa_settings.mcp_client_servers.size())) {
+                        ImGui::Separator();
+                        ImGui::Text("Server Name"); ImGui::SetNextItemWidth(-14.f);
+                        ImGui::InputText("##mcp_cl_name", s_mcp_cl_name, sizeof(s_mcp_cl_name));
+
+                        const char* transports[] = {"HTTP/SSE", "Stdio"};
+                        ImGui::Text("Transport"); ImGui::SetNextItemWidth(-14.f);
+                        ImGui::Combo("##mcp_cl_transport", &s_mcp_cl_transport, transports, 2);
+
+                        if (s_mcp_cl_transport == 0) {
+                            ImGui::Text("URL"); ImGui::SetNextItemWidth(-14.f);
+                            ImGui::InputText("##mcp_cl_url", s_mcp_cl_url, sizeof(s_mcp_cl_url));
+                            ImGui::Text("API Key"); ImGui::SetNextItemWidth(-14.f);
+                            ImGui::InputText("##mcp_cl_key", s_mcp_cl_key, sizeof(s_mcp_cl_key), ImGuiInputTextFlags_Password);
+                        } else {
+                            ImGui::Text("Command"); ImGui::SetNextItemWidth(-14.f);
+                            ImGui::InputText("##mcp_cl_cmd", s_mcp_cl_cmd, sizeof(s_mcp_cl_cmd));
+                            ImGui::Text("Arguments"); ImGui::SetNextItemWidth(-14.f);
+                            ImGui::InputText("##mcp_cl_args", s_mcp_cl_args, sizeof(s_mcp_cl_args));
+                        }
+
+                        ImGui::Checkbox("Enabled##mcp_cl", &s_mcp_cl_enabled);
+                        ImGui::SameLine();
+                        ImGui::Checkbox("Auto-Connect", &s_mcp_cl_auto);
+
+                        auto& srv = g_sa_settings.mcp_client_servers[s_mcp_client_sel];
+                        srv.name         = s_mcp_cl_name;
+                        srv.url          = s_mcp_cl_url;
+                        srv.api_key      = s_mcp_cl_key;
+                        srv.command      = s_mcp_cl_cmd;
+                        srv.args         = s_mcp_cl_args;
+                        srv.transport    = (s_mcp_cl_transport == 1) ? "stdio" : "http_sse";
+                        srv.enabled      = s_mcp_cl_enabled;
+                        srv.auto_connect = s_mcp_cl_auto;
+                    }
+                }
+                end_card();
+            }
+
+
+            else if (s_active_tab == 4)
+            {
+                begin_card("##sandbox_card");
+                {
+                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Sandbox Configuration");
+                    ImGui::Dummy(ImVec2(0, 18));
+
+                    ImGui::Text("Timeout (ms)");
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::InputInt("##sandbox_timeout", &s_sandbox_timeout, 0, 0);
+
+                    ImGui::Text("Memory Budget (MB)");
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::InputInt("##sandbox_memory", &s_sandbox_memory, 0, 0);
+
+                    const char* network_modes[] = {"Off", "Default"};
+                    ImGui::Text("Network Access");
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::Combo("##sandbox_net", &s_sandbox_network, network_modes, IM_ARRAYSIZE(network_modes));
+                }
+                end_card();
+            }
+
+            ImGui::PopStyleVar();
+            ImGui::EndChild();
+        }
         ImGui::EndChild();
 
-        ImGui::Dummy(ImVec2(0, 6));
+
+        {
+            float bar_y = ph - 52.f;
+            ImVec2 bar_pos(wp.x, wp.y + bar_y);
+            dl->AddRectFilled(bar_pos, ImVec2(wp.x + pw, wp.y + ph),
+                IM_COL32(18, 18, 26, 255), 12.f, ImDrawFlags_RoundCornersBottom);
+            dl->AddLine(ImVec2(wp.x, wp.y + bar_y), ImVec2(wp.x + pw, wp.y + bar_y),
+                IM_COL32(255, 255, 255, 12));
+
+            ImGui::SetCursorPos(ImVec2(0.f, bar_y));
+            ImGui::Dummy(ImVec2(0, 10));
+
+            float btn_w = 110.f;
+            float btn_spacing = 12.f;
+            float total_btn_w = btn_w * 2 + btn_spacing;
+            ImGui::SetCursorPosX((pw - total_btn_w) * 0.5f);
+
+            if (ImGui::Button("Save", ImVec2(btn_w, 32))) {
+                if (s_selected_profile < 0 || s_selected_profile >= static_cast<int>(g_sa_settings.provider_profiles.size()))
+                    s_selected_profile = 0;
+                auto& profile = g_sa_settings.provider_profiles[s_selected_profile];
+                profile.display_name = s_name[0] ? s_name : "Profile";
+                const auto& kinds = settings_sa_t::provider_kinds();
+                profile.kind = kinds[s_kind];
+                profile.base_url = s_base_url;
+                profile.api_key = s_api_key;
+                profile.model = s_model;
+                profile.headers_json = s_headers;
+                profile.enabled = s_enabled;
+                g_sa_settings.active_provider_profile_id = profile.id;
 
 
-        float btn_w = 100.f;
-        float btn_spacing = 12.f;
-        float total_btn_w = btn_w * 2 + btn_spacing;
-        ImGui::SetCursorPosX((pw - total_btn_w) * 0.5f - 9.f);
+                profile.aws_access_key = s_aws_access;
+                profile.aws_secret_key = s_aws_secret;
+                profile.aws_session_token = s_aws_session;
+                profile.aws_region = s_aws_region;
+                profile.aws_use_cross_region = s_aws_cross_region;
+                profile.vertex_project_id = s_vertex_project;
+                profile.vertex_region = s_vertex_region;
+                profile.vertex_key_file = s_vertex_keyfile;
+                profile.ollama_num_ctx = s_ollama_num_ctx;
+                static const char* re_vals[] = {"", "low", "medium", "high"};
+                profile.reasoning_effort = (s_reasoning_effort_idx >= 0 && s_reasoning_effort_idx <= 3) ?
+                    re_vals[s_reasoning_effort_idx] : "";
+                profile.lmstudio_speculative_decoding = s_lmstudio_spec;
+                profile.lmstudio_draft_model = s_lmstudio_draft;
+                profile.mistral_codestral_url = s_mistral_codestral;
+                profile.azure_deployment = s_azure_deployment;
+                profile.azure_api_version = s_azure_api_ver;
 
-        if (ImGui::Button("Save", ImVec2(btn_w, 30))) {
-            if (s_selected_profile < 0 || s_selected_profile >= (int)g_sa_settings.provider_profiles.size())
-                s_selected_profile = 0;
-            auto& profile = g_sa_settings.provider_profiles[s_selected_profile];
-            profile.display_name = s_name[0] ? s_name : "Profile";
-            profile.kind = kinds[s_kind];
-            profile.base_url = s_base_url;
-            profile.api_key = s_api_key;
-            profile.model = s_model;
-            profile.headers_json = s_headers;
-            profile.enabled = s_enabled;
-            g_sa_settings.active_provider_profile_id = profile.id;
-
-            g_sa_settings.temperature  = static_cast<double>(s_temperature);
-            g_sa_settings.mcp_port     = (std::min)((std::max)(s_mcp_port, 1), 65535);
-            g_sa_settings.mcp_enabled  = s_mcp_enabled;
-            g_sa_settings.sandbox.timeout_ms = (std::max)(s_sandbox_timeout, 1000);
-            g_sa_settings.sandbox.memory_limit_mb = (std::max)(s_sandbox_memory, 64);
-            g_sa_settings.sandbox.network_mode = s_sandbox_network == 1 ? "default" : "off";
-
-
-            g_sa_settings.thinking_enabled = s_thinking_enabled;
-            g_sa_settings.thinking_budget = s_thinking_budget;
-            g_sa_settings.effort_level = s_effort_level;
-            g_sa_settings.prompt_caching = s_prompt_caching;
-            g_sa_settings.task_budget_tokens = s_task_budget;
-            g_sa_settings.web_search_enabled = s_web_search;
-            g_sa_settings.max_agentic_rounds = s_max_rounds;
-            g_sa_settings.fast_mode = s_fast_mode;
-            g_sa_settings.redact_thinking = s_redact_thinking;
+                g_sa_settings.temperature  = static_cast<double>(s_temperature);
+                g_sa_settings.mcp_port     = (std::min)((std::max)(s_mcp_port, 1), 65535);
+                g_sa_settings.mcp_enabled  = s_mcp_enabled;
+                g_sa_settings.sandbox.timeout_ms = (std::max)(s_sandbox_timeout, 1000);
+                g_sa_settings.sandbox.memory_limit_mb = (std::max)(s_sandbox_memory, 64);
+                g_sa_settings.sandbox.network_mode = s_sandbox_network == 1 ? "default" : "off";
 
 
-            editor_config::tab_size = (std::max)(s_ed_tab_size, 1);
-            editor_config::font_size = s_ed_font_size;
-            editor_config::show_line_numbers = s_ed_line_numbers;
-            editor_config::word_wrap = s_ed_word_wrap;
-            editor_config::minimap = s_ed_minimap;
-            editor_config::bracket_match = s_ed_bracket_match;
-            editor_config::highlight_current_line = s_ed_highlight_line;
-            editor_config::auto_complete = s_ed_autocomplete;
-            g_sa_settings.ghost_text_enabled = s_ed_ghost_text;
-            g_sa_settings.editor_tab_size = s_ed_tab_size;
-            g_sa_settings.editor_font_size = s_ed_font_size;
-            g_sa_settings.editor_line_numbers = s_ed_line_numbers;
-            g_sa_settings.editor_word_wrap = s_ed_word_wrap;
-
-            g_sa_settings.apply_legacy_fields_to_active_profile();
-            g_sa_settings.sync_legacy_fields_from_active_profile();
-
-            g_sa_settings.save();
+                g_sa_settings.thinking_enabled = s_thinking_enabled;
+                g_sa_settings.thinking_budget = s_thinking_budget;
+                g_sa_settings.effort_level = s_effort_level;
+                g_sa_settings.prompt_caching = s_prompt_caching;
+                g_sa_settings.task_budget_tokens = s_task_budget;
+                g_sa_settings.web_search_enabled = s_web_search;
+                g_sa_settings.max_agentic_rounds = s_max_rounds;
+                g_sa_settings.fast_mode = s_fast_mode;
+                g_sa_settings.redact_thinking = s_redact_thinking;
 
 
-            if (g_sa_ai_client)
-                g_sa_ai_client.reset();
-            g_sa_ai_client = std::make_unique<standalone_ai_client_t>(g_sa_settings);
+                editor_config::tab_size = (std::max)(s_ed_tab_size, 1);
+                editor_config::font_size = s_ed_font_size;
+                editor_config::show_line_numbers = s_ed_line_numbers;
+                editor_config::word_wrap = s_ed_word_wrap;
+                editor_config::minimap = s_ed_minimap;
+                editor_config::bracket_match = s_ed_bracket_match;
+                editor_config::highlight_current_line = s_ed_highlight_line;
+                editor_config::auto_complete = s_ed_autocomplete;
+                g_sa_settings.ghost_text_enabled = s_ed_ghost_text;
+                g_sa_settings.editor_tab_size = s_ed_tab_size;
+                g_sa_settings.editor_font_size = s_ed_font_size;
+                g_sa_settings.editor_line_numbers = s_ed_line_numbers;
+                g_sa_settings.editor_word_wrap = s_ed_word_wrap;
 
-            if (s_server_started)
-                s_mcp_server.stop();
-            s_server_started = false;
-            if (g_sa_settings.mcp_enabled && s_mcp_server.start(g_sa_settings.mcp_port)) {
-                s_server_started = true;
-                s_mcp_server.write_client_configs();
-            }
+                g_sa_settings.apply_legacy_fields_to_active_profile();
+                g_sa_settings.sync_legacy_fields_from_active_profile();
 
+                g_sa_settings.save();
 
-            s_mcp_client_mgr.disconnect_all();
-            for (const auto& srv : g_sa_settings.mcp_client_servers) {
-                mcp_client::server_config_t cfg;
-                cfg.name         = srv.name;
-                cfg.url          = srv.url;
-                cfg.api_key      = srv.api_key;
-                cfg.enabled      = srv.enabled;
-                cfg.auto_connect = srv.auto_connect;
-                if (srv.transport == "stdio") {
-                    cfg.transport = mcp_client::transport_type_t::stdio;
-                    cfg.command   = srv.command;
-                    if (!srv.args.empty()) {
-                        std::istringstream iss(srv.args);
-                        std::string arg;
-                        while (iss >> arg)
-                            cfg.args.push_back(arg);
-                    }
-                } else {
-                    cfg.transport = mcp_client::transport_type_t::http_sse;
+                if (g_sa_ai_client)
+                    g_sa_ai_client.reset();
+                g_sa_ai_client = std::make_unique<standalone_ai_client_t>(g_sa_settings);
+
+                if (s_server_started)
+                    s_mcp_server.stop();
+                s_server_started = false;
+                if (g_sa_settings.mcp_enabled && s_mcp_server.start(g_sa_settings.mcp_port)) {
+                    s_server_started = true;
+                    s_mcp_server.write_client_configs();
                 }
-                s_mcp_client_mgr.add_server(cfg);
+
+                s_mcp_client_mgr.disconnect_all();
+                for (const auto& srv : g_sa_settings.mcp_client_servers) {
+                    mcp_client::server_config_t cfg;
+                    cfg.name         = srv.name;
+                    cfg.url          = srv.url;
+                    cfg.api_key      = srv.api_key;
+                    cfg.enabled      = srv.enabled;
+                    cfg.auto_connect = srv.auto_connect;
+                    if (srv.transport == "stdio") {
+                        cfg.transport = mcp_client::transport_type_t::stdio;
+                        cfg.command   = srv.command;
+                        if (!srv.args.empty()) {
+                            std::istringstream iss(srv.args);
+                            std::string arg;
+                            while (iss >> arg)
+                                cfg.args.push_back(arg);
+                        }
+                    } else {
+                        cfg.transport = mcp_client::transport_type_t::http_sse;
+                    }
+                    s_mcp_client_mgr.add_server(cfg);
+                }
+                s_mcp_client_mgr.connect_all();
+
+                g_settings_open = false;
+                ImGui::CloseCurrentPopup();
             }
-            s_mcp_client_mgr.connect_all();
 
-            g_settings_open = false;
-            ImGui::CloseCurrentPopup();
+            ImGui::SameLine(0, btn_spacing);
+
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.20f, 0.20f, 0.26f, 0.7f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.28f, 0.28f, 0.36f, 0.85f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.34f, 0.34f, 0.42f, 1.f));
+            if (ImGui::Button("Cancel", ImVec2(btn_w, 32))) {
+                s_first = true;
+                g_settings_open = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopStyleColor(3);
         }
-
-        ImGui::SameLine(0, btn_spacing);
-
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.22f, 0.22f, 0.28f, 0.8f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.30f, 0.30f, 0.38f, 0.9f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.36f, 0.36f, 0.44f, 1.f));
-        if (ImGui::Button("Cancel", ImVec2(btn_w, 30))) {
-            s_first = true;
-            g_settings_open = false;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::PopStyleColor(3);
 
         ImGui::EndPopup();
     }
@@ -1780,7 +2293,7 @@ void render_settings_popup()
     }
 
     ImGui::PopStyleVar(5);
-    ImGui::PopStyleColor(15);
+    ImGui::PopStyleColor(18);
 }
 
 

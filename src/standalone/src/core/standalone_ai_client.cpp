@@ -226,11 +226,11 @@ std::string standalone_ai_client_t::do_generate(
 
     const auto provider = _settings.get_active_profile_kind();
     if (provider == "gemini")      return generate_gemini(prompt, temperature, on_chunk, stop_check);
-    if (provider == "openai_compatible") return generate_openai(prompt, temperature, on_chunk, stop_check);
     if (provider == "anthropic")   return generate_anthropic(prompt, temperature, on_chunk, stop_check);
     if (provider == "openrouter")  return generate_openrouter(prompt, temperature, on_chunk, stop_check);
-    if (provider == "local")       return generate_local(prompt, temperature, on_chunk, stop_check);
-    return "Error: Unknown provider kind: " + provider;
+
+
+    return generate_openai(prompt, temperature, on_chunk, stop_check);
 }
 
 
@@ -700,51 +700,6 @@ std::string standalone_ai_client_t::generate_openrouter(
 
     return simple_post(base_url, "/api/v1/chat/completions",
         headers, body.dump(),
-        [](const json& j) -> std::string {
-            return j["choices"][0]["message"]["content"].get<std::string>();
-        });
-}
-
-
-std::string standalone_ai_client_t::generate_local(
-    const std::string& prompt, double temperature,
-    ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
-{
-    std::string base_url = _settings.get_active_base_url();
-    if (base_url.empty()) return "Error: Local LLM base URL not configured.";
-
-    std::string model = _settings.get_active_model();
-    if (model.empty()) model = "llama3:latest";
-
-    json body = {
-        {"model", model},
-        {"messages", json::array({
-            {{"role", "user"}, {"content", prompt}}
-        })},
-        {"temperature", temperature},
-        {"stream", on_chunk != nullptr}
-    };
-
-    std::map<std::string, std::string> headers = _settings.get_active_headers();
-    headers["Content-Type"] = "application/json";
-    if (!_settings.get_active_api_key().empty())
-        headers["Authorization"] = "Bearer " + _settings.get_active_api_key();
-
-    if (on_chunk) {
-        return streaming_post(base_url, "/v1/chat/completions", headers, body.dump(),
-            [](const std::string& sse_data) -> std::string {
-                auto j = json::parse(sse_data, nullptr, false);
-                if (j.is_discarded()) return "";
-                try {
-                    auto& choices = j["choices"];
-                    if (!choices.empty() && choices[0].contains("delta"))
-                        return choices[0]["delta"].value("content", "");
-                } catch (...) {}
-                return "";
-            }, on_chunk, stop_check);
-    }
-
-    return simple_post(base_url, "/v1/chat/completions", headers, body.dump(),
         [](const json& j) -> std::string {
             return j["choices"][0]["message"]["content"].get<std::string>();
         });
