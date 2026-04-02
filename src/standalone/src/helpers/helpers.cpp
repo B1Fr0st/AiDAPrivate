@@ -168,7 +168,9 @@ void helpers::begin_child(const char* str_id, ImVec2 pos, ImVec2 size, float alp
 	ImVec2 r_min = ImVec2(std::round(wp.x + pos.x), std::round(wp.y + pos.y));
 	ImVec2 r_max = ImVec2(std::round(r_min.x + size.x), std::round(r_min.y + size.y));
 
-	dl->AddRectFilled(r_min, r_max, IM_COL32(22, 22, 28, (int)(210 * alpha)), 8.f);
+	ImU32 pbg = themes::resolved.panel_bg;
+	int pr = (pbg >> 0) & 0xFF, pg = (pbg >> 8) & 0xFF, pb = (pbg >> 16) & 0xFF, pa = (pbg >> 24) & 0xFF;
+	dl->AddRectFilled(r_min, r_max, IM_COL32(pr, pg, pb, (int)(pa * alpha)), 8.f);
 
 	bool has_label = str_id && str_id[0] != '\0';
 	std::string uid = has_label ? str_id : std::string("##child_") + std::to_string((uintptr_t)&pos);
@@ -736,7 +738,7 @@ void helpers::render_title()
 		}
 	};
 
-	bool loading = globals::ui::load_timer < 1.5f;
+	bool loading = globals::ui::load_timer < 3.0f;
 
 	if (!loading)
 	{
@@ -767,7 +769,7 @@ void helpers::render_title()
 		}
 	}
 
-	bool welcome_ready = !loading && globals::ui::window_w >= 499.f && globals::ui::window_h >= 299.f;
+	bool welcome_ready = !loading && globals::ui::window_w >= 490.f && globals::ui::window_h >= 290.f;
 	bool ui_ready      = globals::ui::window_w >= 1000.f && globals::ui::window_h >= 600.f;
 
 	if (ui_ready && globals::ui::welcome_done && license::validated)
@@ -881,7 +883,7 @@ void helpers::render_title()
 	if (!globals::ui::welcome_done)
 	{
 		globals::ui::welcome_timer += dt;
-		if (globals::ui::welcome_timer >= 2.0f) { globals::ui::welcome_done = true; globals::ui::ui_alpha = 0.f; }
+		if (globals::ui::welcome_timer >= 3.5f) { globals::ui::welcome_done = true; globals::ui::ui_alpha = 0.f; }
 
 		ImVec2      wp  = ImGui::GetWindowPos();
 		ImDrawList* dl  = ImGui::GetWindowDrawList();
@@ -909,8 +911,8 @@ void helpers::render_title()
 		float az = globals::ui::accent.z * 255.f;
 
 		float fh       = ImGui::GetFontSize();
-		float fade_in  = std::min(t / 0.4f, 1.f);
-		float fade_out = t > 1.4f ? std::max(0.f, 1.f - (t - 1.4f) / 0.6f) : 1.f;
+		float fade_in  = std::min(t / 0.6f, 1.f);
+		float fade_out = t > 2.6f ? std::max(0.f, 1.f - (t - 2.6f) / 0.9f) : 1.f;
 		float base_a   = fade_in * fade_out;
 
 		const char* letters[4]  = { "A", "I", "D", "A" };
@@ -946,7 +948,7 @@ void helpers::render_title()
 				IM_COL32((int)ax, (int)ay, (int)az, (int)(220 * base_a)), 1.f);
 
 
-		float sub_a = std::min(std::max(t - 0.45f, 0.f) / 0.45f, 1.f) * fade_out;
+		float sub_a = std::min(std::max(t - 0.7f, 0.f) / 0.5f, 1.f) * fade_out;
 		if (sub_a > 0.01f)
 		{
 			const char* subtitle = "Artificial Intelligence Disassembly Assistant";
@@ -954,7 +956,7 @@ void helpers::render_title()
 			dl->AddText(ImVec2(cx - sub_ts.x * 0.5f, rule_y + 8.f),
 				IM_COL32(148, 143, 188, (int)(180 * sub_a)), subtitle);
 
-			float msg_a = std::min(std::max(t - 0.9f, 0.f) / 0.4f, 1.f) * fade_out;
+			float msg_a = std::min(std::max(t - 1.4f, 0.f) / 0.5f, 1.f) * fade_out;
 			if (msg_a > 0.01f)
 			{
 				const char* msg = "Your session is ready.";
@@ -1150,8 +1152,24 @@ void helpers::render_title()
 	float min_panel = 80.f;
 	float max_left  = usable * 0.3f;
 	float max_right = usable * 0.4f;
-	float left_w   = globals::ui::panel_left_visible ? globals::ui::panel_left_w : 0.f;
-	float right_w  = globals::ui::panel_right_visible ? globals::ui::panel_right_w : 0.f;
+
+	static float s_anim_left_w  = 0.f;
+	static float s_anim_right_w = 0.f;
+	static float s_anim_bottom_h = 0.f;
+	{
+		float target_left  = globals::ui::panel_left_visible  ? globals::ui::panel_left_w  : 0.f;
+		float target_right = globals::ui::panel_right_visible ? globals::ui::panel_right_w : 0.f;
+		float target_bot   = globals::ui::panel_bottom_visible ? globals::ui::panel_bottom_h : 0.f;
+		float anim_speed = std::min(14.f * dt, 1.f);
+		s_anim_left_w  += (target_left  - s_anim_left_w)  * anim_speed;
+		s_anim_right_w += (target_right - s_anim_right_w) * anim_speed;
+		s_anim_bottom_h += (target_bot  - s_anim_bottom_h) * anim_speed;
+		if (std::abs(s_anim_left_w  - target_left)  < 1.f) s_anim_left_w  = target_left;
+		if (std::abs(s_anim_right_w - target_right) < 1.f) s_anim_right_w = target_right;
+		if (std::abs(s_anim_bottom_h - target_bot)  < 1.f) s_anim_bottom_h = target_bot;
+	}
+	float left_w   = s_anim_left_w;
+	float right_w  = s_anim_right_w;
 	float center_w = usable - left_w - right_w;
 	if (center_w < 200.f) {
 
@@ -1163,16 +1181,19 @@ void helpers::render_title()
 		}
 		center_w = 200.f;
 	}
-	if (globals::ui::panel_left_visible && left_w < min_panel) left_w = min_panel;
-	if (globals::ui::panel_right_visible && right_w < min_panel) right_w = min_panel;
-	if (globals::ui::panel_left_visible) globals::ui::panel_left_w = left_w;
-	if (globals::ui::panel_right_visible) globals::ui::panel_right_w = right_w;
+	if (globals::ui::panel_left_visible && s_anim_left_w >= globals::ui::panel_left_w - 1.f && left_w < min_panel) left_w = min_panel;
+	if (globals::ui::panel_right_visible && s_anim_right_w >= globals::ui::panel_right_w - 1.f && right_w < min_panel) right_w = min_panel;
+	if (globals::ui::panel_left_visible && s_anim_left_w >= globals::ui::panel_left_w - 1.f)
+		globals::ui::panel_left_w = left_w;
+	if (globals::ui::panel_right_visible && s_anim_right_w >= globals::ui::panel_right_w - 1.f)
+		globals::ui::panel_right_w = right_w;
 	center_w = usable - left_w - right_w;
 	if (center_w < 100.f) center_w = 100.f;
 
-	float bottom_h = globals::ui::panel_bottom_visible ? globals::ui::panel_bottom_h : 0.f;
+	float bottom_h = s_anim_bottom_h;
 	float chrome_h = title_h + menu_h + status_h;
-	float total_h  = wh - pad * 2.f - chrome_h - (globals::ui::panel_bottom_visible ? (bottom_h + gap) : 0.f);
+	float total_h  = wh - pad * 2.f - chrome_h - (bottom_h > 1.f ? (bottom_h + gap) : 0.f);
+	float right_total_h = wh - pad * 2.f - chrome_h;
 	float content_top = pad + title_h + menu_h;
 
 	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, a);
@@ -1983,7 +2004,7 @@ void helpers::render_title()
 
 		if (menu_bar::any_open && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
 			!ImGui::IsMouseHoveringRect(ImVec2(wp.x, my0), ImVec2(wp.x + ww, my1)) &&
-			!ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+			!ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)) {
 			menu_bar::open_menu = -1;
 			menu_bar::any_open = false;
 		}
@@ -2020,29 +2041,30 @@ void helpers::render_title()
 		float  sp_w = 5.f;
 
 
-		float ls_x = wp.x + pad + left_w;
+		float ab_offset = g_sa_settings.activity_bar_visible ? globals::ui::activity_bar_w : 0.f;
+		float ls_x = wp.x + pad + ab_offset + left_w;
 		ImVec2 ls_min(ls_x - sp_w * 0.5f, wp.y + content_top);
 		ImVec2 ls_max(ls_x + sp_w * 0.5f + gap, wp.y + content_top + total_h);
 
-		bool ls_hov = ImGui::IsMouseHoveringRect(ls_min, ls_max);
+		bool ls_hov = globals::ui::panel_left_visible && ImGui::IsMouseHoveringRect(ls_min, ls_max);
 		if (ls_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			globals::ui::dragging_left_splitter = true;
 		if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
 			globals::ui::dragging_left_splitter = false;
 		if (globals::ui::dragging_left_splitter) {
-			float mx = ImGui::GetIO().MousePos.x - wp.x - pad;
+			float mx = ImGui::GetIO().MousePos.x - wp.x - pad - ab_offset;
 			globals::ui::panel_left_w = std::clamp(mx, min_panel, max_left);
-			if (ls_hov || globals::ui::dragging_left_splitter)
-				ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+			g_sa_settings.workspace.left_width = globals::ui::panel_left_w;
 		}
-		if (ls_hov) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+		if (ls_hov || globals::ui::dragging_left_splitter)
+			ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
 
 		float rs_x = wp.x + ww - pad - right_w;
-		ImVec2 rs_min(rs_x - sp_w * 0.5f - gap, wp.y + content_top);
-		ImVec2 rs_max(rs_x + sp_w * 0.5f, wp.y + content_top + total_h);
+		ImVec2 rs_min(rs_x - 6.f, wp.y + content_top);
+		ImVec2 rs_max(rs_x + 6.f, wp.y + content_top + right_total_h);
 
-		bool rs_hov = globals::ui::panel_right_visible && ImGui::IsMouseHoveringRect(rs_min, rs_max);
+		bool rs_hov = globals::ui::panel_right_visible && ImGui::IsMouseHoveringRect(rs_min, rs_max, false);
 		if (rs_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			globals::ui::dragging_right_splitter = true;
 		if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
@@ -2050,16 +2072,17 @@ void helpers::render_title()
 		if (globals::ui::dragging_right_splitter) {
 			float mx = wp.x + ww - ImGui::GetIO().MousePos.x - pad;
 			globals::ui::panel_right_w = std::clamp(mx, min_panel, max_right);
-			if (rs_hov || globals::ui::dragging_right_splitter)
-				ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+			g_sa_settings.workspace.right_width = globals::ui::panel_right_w;
 		}
-		if (rs_hov) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+		if (rs_hov || globals::ui::dragging_right_splitter)
+			ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
 
-		if (globals::ui::panel_bottom_visible) {
+		if (bottom_h > 1.f) {
+			float right_gap_bs = (right_w > 1.f) ? (right_w + gap) : 0.f;
 			float bs_y = wp.y + content_top + total_h;
 			ImVec2 bs_min(wp.x + pad, bs_y - sp_w * 0.5f);
-			ImVec2 bs_max(wp.x + ww - pad, bs_y + sp_w * 0.5f + gap);
+			ImVec2 bs_max(wp.x + ww - pad - right_gap_bs, bs_y + sp_w * 0.5f + gap);
 			bool bs_hov = ImGui::IsMouseHoveringRect(bs_min, bs_max);
 			if (bs_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 				globals::ui::dragging_bottom_splitter = true;
@@ -2081,6 +2104,7 @@ void helpers::render_title()
 
 		bottom_h = globals::ui::panel_bottom_visible ? globals::ui::panel_bottom_h : 0.f;
 		total_h = wh - pad * 2.f - chrome_h - (globals::ui::panel_bottom_visible ? (bottom_h + gap) : 0.f);
+		right_total_h = wh - pad * 2.f - chrome_h;
 	}
 
 	float ax3 = globals::ui::accent.x, ay3 = globals::ui::accent.y, az3 = globals::ui::accent.z;
@@ -2169,7 +2193,7 @@ void helpers::render_title()
 		fb_x = pad + ab_w;
 	}
 
-	if (globals::ui::panel_left_visible) {
+	if (left_w > 1.f) {
 	ImGui::SetCursorPos(ImVec2(fb_x, fb_y));
 	begin_child("##filebrowser", ImVec2(fb_x, fb_y), ImVec2(left_w, total_h), a);
 	{
@@ -2197,19 +2221,61 @@ void helpers::render_title()
 				workspace_search::start_search(file_browser::current_dir);
 			}
 
+			ImGui::PopItemWidth();
+			ImGui::PopStyleColor(2);
+			ImGui::PopStyleVar();
+
 			sy += 28.f;
-			ImGui::SetCursorPos(ImVec2(6.f, sy));
 
+			{
+				auto toggle_btn = [&](const char* label, const char* tooltip, bool& state, const char* id) {
+					ImVec2 cp = ImGui::GetCursorScreenPos();
+					ImVec2 lts = ImGui::CalcTextSize(label);
+					float btn_w = lts.x + 10.f;
+					float btn_h = 20.f;
+					ImVec2 bmin = cp;
+					ImVec2 bmax(cp.x + btn_w, cp.y + btn_h);
+					bool hov = ImGui::IsMouseHoveringRect(bmin, bmax, false);
 
-			bool case_changed = ImGui::Checkbox("Aa", &workspace_search::g_search.case_sensitive);
-			ImGui::SameLine();
-			bool word_changed = ImGui::Checkbox("W", &workspace_search::g_search.whole_word);
-			ImGui::SameLine();
-			bool regex_changed = ImGui::Checkbox(".*", &workspace_search::g_search.use_regex);
-			(void)case_changed; (void)word_changed; (void)regex_changed;
+					ImU32 bg_col;
+					if (state) {
+						bg_col = IM_COL32((int)(ax3*180+40), (int)(ay3*180+40), (int)(az3*180+40), (int)(80*a));
+					} else if (hov) {
+						bg_col = IM_COL32(255, 255, 255, (int)(12*a));
+					} else {
+						bg_col = IM_COL32(0, 0, 0, 0);
+					}
+
+					if (state || hov)
+						fdl->AddRectFilled(bmin, bmax, bg_col, 3.f);
+					if (state)
+						fdl->AddRect(bmin, bmax, IM_COL32((int)(ax3*200+55), (int)(ay3*200+55), (int)(az3*200+55), (int)(140*a)), 3.f);
+
+					ImU32 txt_col = state
+						? IM_COL32((int)(ax3*200+55), (int)(ay3*200+55), (int)(az3*200+55), (int)(240*a))
+						: IM_COL32(160, 160, 180, (int)((hov ? 220.f : 160.f)*a));
+					fdl->AddText(ImVec2(bmin.x + 5.f, bmin.y + (btn_h - lts.y) * 0.5f), txt_col, label);
+
+					ImGui::SetCursorScreenPos(cp);
+					if (ImGui::InvisibleButton(id, ImVec2(btn_w, btn_h)))
+						state = !state;
+					if (ImGui::IsItemHovered())
+						ImGui::SetTooltip("%s", tooltip);
+					ImGui::SameLine(0.f, 4.f);
+				};
+
+				ImGui::SetCursorPos(ImVec2(6.f, sy));
+				toggle_btn("Aa", "Match Case", workspace_search::g_search.case_sensitive, "##ws_case");
+				toggle_btn("W",  "Match Whole Word", workspace_search::g_search.whole_word, "##ws_word");
+				toggle_btn(".*", "Use Regular Expression", workspace_search::g_search.use_regex, "##ws_regex");
+			}
 
 			sy += 24.f;
 			ImGui::SetCursorPos(ImVec2(6.f, sy));
+			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
+			ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 42, (int)(200 * a)));
+			ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 200, 215, (int)(230 * a)));
+			ImGui::PushItemWidth(fw - 12.f);
 			ImGui::InputText("##ws_include", workspace_search::g_search.include_buf, sizeof(workspace_search::g_search.include_buf));
 			sy += 24.f;
 			ImGui::SetCursorPos(ImVec2(6.f, sy));
@@ -2282,7 +2348,7 @@ void helpers::render_title()
 		} else if (globals::ui::active_activity == activity_item_t::extensions) {
 
 
-			const char* mkt_lbl = "EXTENSIONS";
+			const char* mkt_lbl = "MCP MARKETPLACE";
 			fdl->AddText(ImVec2(fwp.x + 10.f, fwp.y + 8.f),
 				IM_COL32(130, 128, 155, static_cast<int>(180 * a)), mkt_lbl);
 
@@ -2592,7 +2658,7 @@ void helpers::render_title()
 	}
 
 	float ab_extra = g_sa_settings.activity_bar_visible ? globals::ui::activity_bar_w : 0.f;
-	float left_gap = globals::ui::panel_left_visible ? (left_w + gap + ab_extra) : ab_extra;
+	float left_gap = (left_w > 1.f) ? (left_w + gap + ab_extra) : ab_extra;
 	float right_gap_w = globals::ui::panel_right_visible ? (right_w + gap) : 0.f;
 	float hx0 = wp_m.x + pad + left_gap, hy0 = wp_m.y + content_top;
 	float hx1  = hx0 + center_w;
@@ -2796,6 +2862,57 @@ void helpers::render_title()
 		}
 
 
+		if (g_disasm.file.loaded && !g_disasm.file.filename.empty()) {
+			bool disasm_is_active = (!code_editor::active || code_editor::buffer.empty()) &&
+			                        g_disasm.file.loaded && !g_disasm.file.instrs.empty();
+			std::string disasm_label = g_disasm.file.filename;
+			ImVec2 dts = ImGui::CalcTextSize(disasm_label.c_str());
+			float dtw = 10.f * 2.f + dts.x + 10.f + 6.f;
+			float tab_h2 = row_h - 2.f;
+
+			float dtx0, dtx1;
+			if (!file_tabs::tabs.empty()) {
+				float last_tab_end = hx0 + hdr_pad;
+				for (int ti = 0; ti < (int)file_tabs::tabs.size(); ti++) {
+					auto& tab = file_tabs::tabs[ti];
+					std::string label = tab.filename;
+					if (tab.dirty) label += " *";
+					ImVec2 lts = ImGui::CalcTextSize(label.c_str());
+					float tw = 10.f * 2.f + lts.x + 10.f + 6.f;
+					last_tab_end += tw + 2.f;
+				}
+				dtx0 = last_tab_end + 4.f;
+			} else {
+				dtx0 = hx0 + hdr_pad;
+			}
+			if (dtx0 + dtw < rbtn_x0 - 8.f) {
+				float dty0 = r1_cy - tab_h2 * 0.5f;
+				dtx1 = dtx0 + dtw;
+				float dty1 = dty0 + tab_h2;
+
+				bool dtab_hov = ImGui::IsMouseHoveringRect(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1), false);
+
+				if (disasm_is_active) {
+					wdl->AddRectFilled(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1),
+						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
+					wdl->AddLine(ImVec2(dtx0 + 2.f, dty1), ImVec2(dtx1 - 2.f, dty1),
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+				} else if (dtab_hov) {
+					wdl->AddRectFilled(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1),
+						IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
+				}
+
+				ImU32 dtab_col = disasm_is_active ? ac_full
+				               : IM_COL32(170, 175, 190, (int)((dtab_hov ? 220.f : 160.f)*a));
+				wdl->AddText(ImVec2(dtx0 + 10.f, dty0 + (tab_h2 - dts.y) * 0.5f),
+					dtab_col, disasm_label.c_str());
+
+				if (dtab_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+					globals::ui::active_center_view = center_view_t::disassembly;
+				}
+			}
+		}
+
 		bool cf_clicked = ghost_btn("Choose File",
 			ImGui::GetID("##cfhv"), ImGui::GetID("##cffl"),
 			rbtn_x0, r1_cy, rbtn_w);
@@ -2945,7 +3062,7 @@ void helpers::render_title()
 				const float scale = std::min(max_w / src_w, max_h / src_h);
 				const float draw_w = src_w * scale;
 				const float draw_h = src_h * scale;
-				const float icon_pad = 18.f;
+					const float icon_pad = 2.f;
 				const ImVec2 img_min(torig.x + vw - draw_w - icon_pad,
 				                     torig.y + vh - draw_h - icon_pad);
 				const ImVec2 img_max(img_min.x + draw_w, img_min.y + draw_h);
@@ -3016,9 +3133,11 @@ void helpers::render_title()
 	ImGui::EndChild();
 	ImGui::PopStyleVar();
 
-	if (globals::ui::panel_right_visible) {
-	begin_child("##chat", ImVec2(pad + left_gap + center_w + gap, content_top), ImVec2(right_w, total_h), a);
-	{
+	if (right_w > 1.f) {
+	begin_child("##chat", ImVec2(pad + left_gap + center_w + gap, content_top), ImVec2(right_w, right_total_h), a);
+	if (g_settings_open) {
+		render_settings_inline(right_w, right_total_h);
+	} else {
 		float ax = globals::ui::accent.x * 255.f;
 		float ay = globals::ui::accent.y * 255.f;
 		float az = globals::ui::accent.z * 255.f;
@@ -3061,7 +3180,7 @@ void helpers::render_title()
 			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.08f));
 			ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.12f));
 			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.55f,0.60f,1.f));
-			if (ImGui::Button("\xf0\x9f\x93\x8b##chat_history", ImVec2(gear_sz, gear_sz))) {
+			if (ImGui::Button("H##chat_history", ImVec2(gear_sz, gear_sz))) {
 				conversations::refresh_history();
 				conversations::browser_open = !conversations::browser_open;
 			}
@@ -3090,7 +3209,7 @@ void helpers::render_title()
 			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.08f));
 			ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.12f));
 			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.55f,0.60f,1.f));
-			if (ImGui::Button("\xe2\x9a\x99##chat_settings", ImVec2(gear_sz, gear_sz)))
+			if (ImGui::Button("*##chat_settings", ImVec2(gear_sz, gear_sz)))
 				g_settings_open = true;
 			ImGui::PopStyleColor(4);
 			if (ImGui::IsItemHovered())
@@ -3533,7 +3652,7 @@ void helpers::render_title()
 
 		{
 			ImVec2 wp3  = ImGui::GetWindowPos();
-			float  sy   = wp3.y + sep_y;
+			float  sy   = wp3.y + chat_sep_y;
 			float  lx0  = wp3.x - 6.f;
 			float  lx1  = wp3.x + cw + 6.f;
 
@@ -3801,10 +3920,11 @@ void helpers::render_title()
 	}
 
 
-	if (globals::ui::panel_bottom_visible && bottom_h > 20.f) {
+	if (bottom_h > 5.f) {
+		float right_gap_bp = (right_w > 1.f) ? (right_w + gap) : 0.f;
 		float bp_x = pad;
 		float bp_y = content_top + total_h + gap;
-		float bp_w = ww - pad * 2.f;
+		float bp_w = ww - pad * 2.f - right_gap_bp;
 
 		ImGui::SetCursorPos(ImVec2(bp_x, bp_y));
 		begin_child("##bottom_panel", ImVec2(bp_x, bp_y), ImVec2(bp_w, bottom_h), a);
@@ -4688,7 +4808,6 @@ void helpers::render_title()
 		ImGui::PopStyleColor(2);
 	}
 
-	render_settings_popup();
 	render_tool_approval_dialog();
 	ImGui::PopStyleVar();
 	ImGui::End();

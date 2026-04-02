@@ -233,7 +233,7 @@ int main(int, char**)
 
 
         int cur_state = 0;
-        if (globals::ui::load_timer >= 1.5f) cur_state = 1;
+        if (globals::ui::load_timer >= 3.0f) cur_state = 1;
         if (globals::ui::welcome_done && !license::validated) cur_state = 2;
         if (globals::ui::welcome_done && license::validated) cur_state = 3;
         bool state_changed = (cur_state != prev_state);

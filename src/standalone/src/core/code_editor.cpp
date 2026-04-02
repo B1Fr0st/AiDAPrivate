@@ -573,6 +573,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
 
     if (hovered) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
         float wheel = ImGui::GetIO().MouseWheel;
         if (wheel != 0.f)
             s_target_scroll_y -= wheel * line_h * 3.f;
@@ -1146,6 +1147,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
         for (int mi = 0; mi < (int)autocomplete::matches.size() && mi < 8; mi++) {
             float iy = sy + 4.f + mi * ac_item_h;
+            float text_y = iy + (ac_item_h - ImGui::GetFontSize()) * 0.5f;
             if (mi == autocomplete::selected)
                 fdl->AddRectFilled(ImVec2(sx + 2.f, iy), ImVec2(sx + popup_w - 2.f, iy + ac_item_h),
                     IM_COL32((int)(accent_r*255), (int)(accent_g*255), (int)(accent_b*255), 50), 4.f);
@@ -1153,14 +1155,14 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             auto& match = autocomplete::matches[mi];
             size_t plen = autocomplete::partial.size();
             if (plen > 0 && plen <= match.size()) {
-                fdl->AddText(ImVec2(sx + 8.f, iy + 2.f),
+                fdl->AddText(ImVec2(sx + 10.f, text_y),
                     IM_COL32((int)(accent_r*255), (int)(accent_g*255), (int)(accent_b*255), 255),
                     match.c_str(), match.c_str() + plen);
                 float prefix_w = ImGui::CalcTextSize(match.c_str(), match.c_str() + plen).x;
-                fdl->AddText(ImVec2(sx + 8.f + prefix_w, iy + 2.f),
+                fdl->AddText(ImVec2(sx + 10.f + prefix_w, text_y),
                     IM_COL32(200, 200, 220, 220), match.c_str() + plen);
             } else {
-                fdl->AddText(ImVec2(sx + 8.f, iy + 2.f),
+                fdl->AddText(ImVec2(sx + 10.f, text_y),
                     IM_COL32(200, 200, 220, 220), match.c_str());
             }
         }

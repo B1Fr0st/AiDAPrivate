@@ -109,7 +109,7 @@ namespace conversations {
 
 void tick_ai_chat();
 void poll_ai_chat();
-void render_settings_popup();
+void render_settings_inline(float panel_w, float panel_h);
 extern bool g_settings_open;
 
 

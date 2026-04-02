@@ -1211,30 +1211,17 @@ void render_tool_approval_dialog()
 }
 
 
-void render_settings_popup()
+void render_settings_inline(float panel_w, float panel_h)
 {
     if (!g_settings_open) return;
-
-    ImGui::OpenPopup("##sa_settings_modal");
-
-    const float ww = globals::ui::window_w;
-    const float wh = globals::ui::window_h;
-    const float pw = 940.f, ph = 680.f;
-    ImGui::SetNextWindowPos(ImVec2((ww - pw) * 0.5f, (wh - ph) * 0.5f), ImGuiCond_Appearing);
-    ImGui::SetNextWindowSize(ImVec2(pw, ph), ImGuiCond_Always);
 
     const float ax = globals::ui::accent.x, ay = globals::ui::accent.y, az = globals::ui::accent.z;
     const ImU32 accent_col   = IM_COL32(static_cast<int>(ax*255), static_cast<int>(ay*255), static_cast<int>(az*255), 255);
     const ImU32 accent_dim   = IM_COL32(static_cast<int>(ax*255), static_cast<int>(ay*255), static_cast<int>(az*255), 80);
     const ImU32 accent_glow  = IM_COL32(static_cast<int>(ax*255), static_cast<int>(ay*255), static_cast<int>(az*255), 40);
-    const ImU32 card_bg      = IM_COL32(22, 22, 30, 240);
-    const ImU32 card_border  = IM_COL32(255, 255, 255, 18);
-    const ImU32 surface_bg   = IM_COL32(16, 16, 22, 250);
     const ImU32 text_primary = IM_COL32(225, 222, 240, 255);
     const ImU32 text_dim     = IM_COL32(160, 158, 175, 200);
 
-    ImGui::PushStyleColor(ImGuiCol_PopupBg,        ImVec4(0.055f, 0.055f, 0.075f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_Border,          ImVec4(1.f, 1.f, 1.f, 0.06f));
     ImGui::PushStyleColor(ImGuiCol_FrameBg,         ImVec4(0.10f, 0.10f, 0.14f, 1.f));
     ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,  ImVec4(0.14f, 0.14f, 0.19f, 1.f));
     ImGui::PushStyleColor(ImGuiCol_FrameBgActive,   ImVec4(0.16f, 0.16f, 0.22f, 1.f));
@@ -1244,7 +1231,6 @@ void render_settings_popup()
     ImGui::PushStyleColor(ImGuiCol_Header,          ImVec4(ax * 0.25f, ay * 0.25f, az * 0.25f, 0.35f));
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered,   ImVec4(ax * 0.35f, ay * 0.35f, az * 0.35f, 0.55f));
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,    ImVec4(ax * 0.45f, ay * 0.45f, az * 0.45f, 0.75f));
-    ImGui::PushStyleColor(ImGuiCol_Text,            ImVec4(0.88f, 0.87f, 0.94f, 1.f));
     ImGui::PushStyleColor(ImGuiCol_SliderGrab,      ImVec4(ax, ay, az, 0.8f));
     ImGui::PushStyleColor(ImGuiCol_SliderGrabActive,ImVec4(ax, ay, az, 1.f));
     ImGui::PushStyleColor(ImGuiCol_CheckMark,       ImVec4(ax, ay, az, 1.f));
@@ -1252,19 +1238,13 @@ void render_settings_popup()
     ImGui::PushStyleColor(ImGuiCol_TabHovered,      ImVec4(ax * 0.3f, ay * 0.3f, az * 0.3f, 0.4f));
     ImGui::PushStyleColor(ImGuiCol_TabSelected,     ImVec4(ax * 0.2f, ay * 0.2f, az * 0.2f, 0.6f));
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,  ImVec2(0.f, 0.f));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding,  6.f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,   ImVec2(10.f, 6.f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,    ImVec2(8.f, 7.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,   ImVec2(8.f, 5.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,    ImVec2(6.f, 5.f));
 
-    bool still_open = true;
-    static bool s_first = true;
-
-    if (ImGui::BeginPopupModal("##sa_settings_modal", &still_open,
-            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove))
     {
 
+        static bool  s_first = true;
         static float s_tab_anim = 0.f;
         static int   s_active_tab = 0;
         static float s_profile_sel_anim = 0.f;
@@ -1428,81 +1408,62 @@ void render_settings_popup()
 
 
         {
-            dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + 48.f),
-                IM_COL32(18, 18, 26, 255), 12.f, ImDrawFlags_RoundCornersTop);
-            dl->AddLine(ImVec2(wp.x, wp.y + 48.f), ImVec2(wp.x + ws.x, wp.y + 48.f),
-                IM_COL32(255, 255, 255, 12));
-
-            const char* title = "Settings";
-            ImVec2 tts = ImGui::CalcTextSize(title);
-            dl->AddText(ImVec2(wp.x + 20.f, wp.y + (48.f - tts.y) * 0.5f), accent_col, title);
+            dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + 38.f),
+                IM_COL32(14, 14, 20, 255));
+            dl->AddLine(ImVec2(wp.x, wp.y + 38.f), ImVec2(wp.x + ws.x, wp.y + 38.f),
+                IM_COL32(255, 255, 255, 15));
 
 
-            ImVec2 close_pos(wp.x + ws.x - 36.f, wp.y + 14.f);
-            ImGui::SetCursorScreenPos(close_pos);
-            ImGui::PushID("##settings_close");
-            if (ImGui::InvisibleButton("##close", ImVec2(20.f, 20.f))) {
+            ImGui::SetCursorPos(ImVec2(8.f, 7.f));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(ax, ay, az, 0.15f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(ax, ay, az, 0.25f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ax, ay, az, 0.9f));
+            if (ImGui::Button("<##settings_back", ImVec2(24.f, 24.f))) {
                 s_first = true;
                 g_settings_open = false;
-                ImGui::CloseCurrentPopup();
             }
-            bool close_hovered = ImGui::IsItemHovered();
-            dl->AddText(ImVec2(close_pos.x + 3.f, close_pos.y + 1.f),
-                close_hovered ? IM_COL32(255, 100, 100, 255) : text_dim, "X");
-            ImGui::PopID();
+            ImGui::PopStyleColor(4);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Back to chat");
+
+            ImGui::SameLine();
+            const char* title = "Settings";
+            ImVec2 tts = ImGui::CalcTextSize(title);
+            ImGui::SetCursorPosY((38.f - tts.y) * 0.5f);
+            dl->AddText(ImGui::GetCursorScreenPos(), text_primary, title);
         }
 
-        ImGui::SetCursorPos(ImVec2(0.f, 50.f));
+        ImGui::SetCursorPos(ImVec2(6.f, 42.f));
 
 
-        const float sidebar_w = 180.f;
-        const float content_h = ph - 50.f - 52.f;
-
-        ImGui::SetCursorPos(ImVec2(0.f, 50.f));
-        ImGui::BeginChild("##sidebar", ImVec2(sidebar_w, content_h), false,
-            ImGuiWindowFlags_NoScrollbar);
         {
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 8.f));
-            ImGui::Dummy(ImVec2(0, 4));
-
-
-            float item_h = 30.f;
-            float sel_y = 4.f + s_profile_sel_anim * (item_h + 2.f);
-            ImVec2 sp = ImGui::GetWindowPos();
-            dl->AddRectFilled(
-                ImVec2(sp.x + 6.f, sp.y + sel_y),
-                ImVec2(sp.x + sidebar_w - 6.f, sp.y + sel_y + item_h),
-                accent_glow, 6.f);
-            dl->AddRect(
-                ImVec2(sp.x + 6.f, sp.y + sel_y),
-                ImVec2(sp.x + sidebar_w - 6.f, sp.y + sel_y + item_h),
-                accent_dim, 6.f);
-
-            for (int i = 0; i < static_cast<int>(g_sa_settings.provider_profiles.size()); ++i) {
-                ImGui::PushID(i);
-                const bool selected = (i == s_selected_profile);
-                auto& prof = g_sa_settings.provider_profiles[i];
-
-                ImGui::SetCursorPosX(10.f);
-                ImVec2 cpos = ImGui::GetCursorScreenPos();
-
-
-                ImU32 dot_col = prof.enabled ?
-                    IM_COL32(80, 220, 120, 255) : IM_COL32(100, 100, 100, 120);
-                dl->AddCircleFilled(ImVec2(cpos.x + 4.f, cpos.y + item_h * 0.5f), 3.f, dot_col);
-
-                ImGui::SetCursorPosX(20.f);
-                if (ImGui::Selectable(prof.display_name.c_str(), selected,
-                        ImGuiSelectableFlags_None, ImVec2(sidebar_w - 28.f, item_h - 4.f))) {
-                    s_selected_profile = i;
-                    refresh_profile_buffers();
+            ImGui::SetNextItemWidth(ws.x - 12.f);
+            g_sa_settings.ensure_default_profiles();
+            if (s_selected_profile < 0 || s_selected_profile >= static_cast<int>(g_sa_settings.provider_profiles.size()))
+                s_selected_profile = 0;
+            const std::string& preview_name = g_sa_settings.provider_profiles[s_selected_profile].display_name;
+            if (ImGui::BeginCombo("##profile_select", preview_name.c_str())) {
+                for (int i = 0; i < static_cast<int>(g_sa_settings.provider_profiles.size()); ++i) {
+                    ImGui::PushID(i);
+                    auto& prof = g_sa_settings.provider_profiles[i];
+                    ImU32 dot_col = prof.enabled ?
+                        IM_COL32(80, 220, 120, 255) : IM_COL32(100, 100, 100, 120);
+                    ImVec2 cpos = ImGui::GetCursorScreenPos();
+                    dl->AddCircleFilled(ImVec2(cpos.x + 6.f, cpos.y + ImGui::GetFrameHeight() * 0.5f), 3.f, dot_col);
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14.f);
+                    if (ImGui::Selectable(prof.display_name.c_str(), i == s_selected_profile)) {
+                        s_selected_profile = i;
+                        refresh_profile_buffers();
+                    }
+                    ImGui::PopID();
                 }
-                ImGui::PopID();
+                ImGui::EndCombo();
             }
 
-            ImGui::Dummy(ImVec2(0, 6));
-            ImGui::SetCursorPosX(8.f);
-            if (ImGui::Button("+  Add", ImVec2(sidebar_w * 0.44f - 8.f, 26.f))) {
+            float half_w = (ws.x - 18.f) * 0.5f;
+            ImGui::SetCursorPosX(6.f);
+            if (ImGui::Button("+ Add##prof_add", ImVec2(half_w, 26.f))) {
                 provider_profile_t profile;
                 profile.display_name = "New Profile";
                 profile.id = sa_settings_detail::make_profile_id(profile.display_name, g_sa_settings.provider_profiles.size() + 1);
@@ -1513,49 +1474,43 @@ void render_settings_popup()
                 s_selected_profile = static_cast<int>(g_sa_settings.provider_profiles.size()) - 1;
                 refresh_profile_buffers();
             }
-            ImGui::SameLine();
+            ImGui::SameLine(0, 6.f);
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.12f, 0.12f, 0.6f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.5f, 0.15f, 0.15f, 0.8f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.6f, 0.2f, 0.2f, 1.f));
-            if (ImGui::Button("-  Remove", ImVec2(sidebar_w * 0.44f - 8.f, 26.f)) &&
+            if (ImGui::Button("- Remove##prof_rm", ImVec2(half_w, 26.f)) &&
                 g_sa_settings.provider_profiles.size() > 1) {
                 g_sa_settings.provider_profiles.erase(g_sa_settings.provider_profiles.begin() + s_selected_profile);
                 s_selected_profile = (s_selected_profile > 0) ? (s_selected_profile - 1) : 0;
                 refresh_profile_buffers();
             }
             ImGui::PopStyleColor(3);
-
-            ImGui::PopStyleVar();
         }
-        ImGui::EndChild();
+
+        ImGui::Dummy(ImVec2(0, 2));
+
+        const float content_h = panel_h - ImGui::GetCursorPosY() - 44.f;
 
 
-        dl->AddLine(
-            ImVec2(wp.x + sidebar_w, wp.y + 50.f),
-            ImVec2(wp.x + sidebar_w, wp.y + 50.f + content_h),
-            IM_COL32(255, 255, 255, 12));
-
-
-        ImGui::SetCursorPos(ImVec2(sidebar_w + 1.f, 50.f));
-        ImGui::BeginChild("##right_area", ImVec2(pw - sidebar_w - 1.f, content_h), false);
+        ImGui::BeginChild("##settings_right_area", ImVec2(ws.x - 4.f, content_h), false);
         {
-            const float right_w = pw - sidebar_w - 1.f;
+            const float right_w = ws.x;
 
 
-            const char* tab_labels[] = {"Provider", "AI Features", "Editor", "MCP Servers", "Sandbox"};
+            const char* tab_labels[] = {"Provider", "AI", "Editor", "MCP", "Sandbox"};
             constexpr int tab_count = 5;
             float tab_positions[tab_count] = {};
             float tab_widths[tab_count] = {};
 
-            ImGui::Dummy(ImVec2(0, 6));
-            float tab_start_x = 16.f;
+            ImGui::Dummy(ImVec2(0, 4));
+            float tab_start_x = 4.f;
             ImVec2 tab_origin = ImGui::GetCursorScreenPos();
             tab_origin.x += tab_start_x;
 
             for (int t = 0; t < tab_count; ++t) {
                 tab_positions[t] = tab_start_x;
                 ImVec2 tsz = ImGui::CalcTextSize(tab_labels[t]);
-                tab_widths[t] = tsz.x + 20.f;
+                tab_widths[t] = tsz.x + 14.f;
 
                 ImGui::SetCursorPosX(tab_positions[t]);
                 ImGui::PushID(t + 100);
@@ -1563,19 +1518,19 @@ void render_settings_popup()
                 ImU32 tab_text_col = is_active_tab ? accent_col : text_dim;
 
                 ImVec2 tp = ImGui::GetCursorScreenPos();
-                if (ImGui::InvisibleButton("##tab", ImVec2(tab_widths[t], 28.f))) {
+                if (ImGui::InvisibleButton("##tab", ImVec2(tab_widths[t], 26.f))) {
                     s_active_tab = t;
                 }
                 bool tab_hovered = ImGui::IsItemHovered();
                 if (tab_hovered && !is_active_tab)
                     tab_text_col = text_primary;
 
-                dl->AddText(ImVec2(tp.x + 10.f, tp.y + 5.f), tab_text_col, tab_labels[t]);
+                dl->AddText(ImVec2(tp.x + 7.f, tp.y + 4.f), tab_text_col, tab_labels[t]);
                 ImGui::PopID();
 
-                tab_start_x += tab_widths[t] + 4.f;
+                tab_start_x += tab_widths[t] + 2.f;
                 if (t < tab_count - 1)
-                    ImGui::SameLine(0, 4.f);
+                    ImGui::SameLine(0, 2.f);
             }
 
 
@@ -1588,15 +1543,15 @@ void render_settings_popup()
                 if (to_tab >= tab_count) to_tab = tab_count - 1;
                 if (from_tab >= tab_count) from_tab = tab_count - 1;
 
-                float x0 = tab_positions[from_tab] + 10.f;
-                float w0 = tab_widths[from_tab] - 20.f;
-                float x1 = tab_positions[to_tab] + 10.f;
-                float w1 = tab_widths[to_tab] - 20.f;
+                float x0 = tab_positions[from_tab] + 7.f;
+                float w0 = tab_widths[from_tab] - 14.f;
+                float x1 = tab_positions[to_tab] + 7.f;
+                float w1 = tab_widths[to_tab] - 14.f;
                 ul_x = x0 + (x1 - x0) * frac;
                 ul_w = w0 + (w1 - w0) * frac;
             }
             ImVec2 rp = ImGui::GetWindowPos();
-            float underline_y = tab_origin.y + 28.f;
+            float underline_y = tab_origin.y + 26.f;
             dl->AddRectFilled(
                 ImVec2(rp.x + ul_x, underline_y),
                 ImVec2(rp.x + ul_x + ul_w, underline_y + 2.5f),
@@ -1619,22 +1574,35 @@ void render_settings_popup()
 
             auto begin_card = [&](const char* label, float width = -1.f) {
                 ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.f);
-                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.07f, 0.10f, 0.8f));
-                ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.f, 1.f, 1.f, 0.04f));
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.08f, 0.11f, 0.95f));
+                ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.f, 1.f, 1.f, 0.06f));
                 ImGui::BeginChild(label, ImVec2(width, 0.f), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
-                ImGui::Dummy(ImVec2(0, 4));
-                ImGui::Indent(12.f);
+                ImGui::Dummy(ImVec2(0, 6));
+                ImGui::Indent(6.f);
             };
             auto end_card = [&]() {
-                ImGui::Unindent(12.f);
-                ImGui::Dummy(ImVec2(0, 4));
+                ImGui::Unindent(6.f);
+                ImGui::Dummy(ImVec2(0, 6));
                 ImGui::EndChild();
                 ImGui::PopStyleColor(2);
                 ImGui::PopStyleVar();
             };
 
             ImGui::BeginChild("##tab_content", ImVec2(0, 0), false);
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.f, 8.f));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.f, 4.f));
+            ImGui::Indent(2.f);
+
+
+            auto section_header = [&](const char* text) {
+                ImVec4 acc_vec(ax, ay, az, 1.f);
+                ImGui::TextColored(acc_vec, "%s", text);
+                ImVec2 p = ImGui::GetCursorScreenPos();
+                ImVec2 tsz = ImGui::CalcTextSize(text);
+                ImDrawList* wdl = ImGui::GetWindowDrawList();
+                wdl->AddLine(ImVec2(p.x, p.y - 2.f), ImVec2(p.x + tsz.x, p.y - 2.f),
+                             accent_dim, 2.f);
+                ImGui::Dummy(ImVec2(0, 2.f));
+            };
 
             const auto& kinds = settings_sa_t::provider_kinds();
             const std::string current_kind = kinds[s_kind];
@@ -1644,8 +1612,7 @@ void render_settings_popup()
             {
                 begin_card("##profile_card");
                 {
-                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Profile");
-                    ImGui::Dummy(ImVec2(0, 18));
+                    section_header("Profile");
 
                     ImGui::Text("Name");
                     ImGui::SetNextItemWidth(-14.f);
@@ -1686,8 +1653,7 @@ void render_settings_popup()
 
                 begin_card("##model_card");
                 {
-                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Model Configuration");
-                    ImGui::Dummy(ImVec2(0, 18));
+                    section_header("Model Configuration");
 
                     ImGui::Text("Model");
                     ImGui::SetNextItemWidth(-14.f);
@@ -1718,8 +1684,7 @@ void render_settings_popup()
 
                 begin_card("##auth_card");
                 {
-                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Authentication");
-                    ImGui::Dummy(ImVec2(0, 18));
+                    section_header("Authentication");
 
                     if (current_kind == "bedrock") {
                         ImGui::Text("AWS Access Key");
@@ -1766,8 +1731,7 @@ void render_settings_popup()
 
                 begin_card("##endpoint_card");
                 {
-                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Endpoint");
-                    ImGui::Dummy(ImVec2(0, 18));
+                    section_header("Endpoint");
 
                     ImGui::Text("Base URL (leave empty for default)");
                     ImGui::SetNextItemWidth(-14.f);
@@ -1807,7 +1771,7 @@ void render_settings_popup()
 
                     if (current_kind == "ollama") {
                         ImGui::Text("Context Window (0 = default)");
-                        ImGui::SetNextItemWidth(140.f);
+                        ImGui::SetNextItemWidth(-14.f);
                         ImGui::InputInt("##ollama_ctx", &s_ollama_num_ctx, 1024, 4096);
                         s_ollama_num_ctx = (std::max)(s_ollama_num_ctx, 0);
                     }
@@ -1853,23 +1817,22 @@ void render_settings_popup()
 
                 begin_card("##thinking_card");
                 {
-                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Reasoning & Thinking");
-                    ImGui::Dummy(ImVec2(0, 18));
+                    section_header("Reasoning & Thinking");
 
                     ImGui::Checkbox("Extended Thinking", &s_thinking_enabled);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Enable interleaved thinking for deeper reasoning (Anthropic)");
                     if (s_thinking_enabled) {
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(140.f);
-                        ImGui::InputInt("Budget##think", &s_thinking_budget, 1000, 5000);
+                        ImGui::Text("Budget (tokens)");
+                        ImGui::SetNextItemWidth(-14.f);
+                        ImGui::InputInt("##think_budget", &s_thinking_budget, 1000, 5000);
                         s_thinking_budget = (std::max)(s_thinking_budget, 1024);
                     }
 
                     ImGui::Text("Effort Level");
-                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SetNextItemWidth(-14.f);
                     const char* effort_labels[] = {
-                        "\xc2\xa4 Low", "\xe2\x97\x90 Medium", "\xe2\x97\x91 High", "\xe2\x97\x95 Max"
+                        "Low", "Medium", "High", "Max"
                     };
                     ImGui::Combo("##effort", &s_effort_level, effort_labels, 4);
                     if (ImGui::IsItemHovered())
@@ -1889,15 +1852,14 @@ void render_settings_popup()
 
                 begin_card("##caching_card");
                 {
-                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Caching & Budgets");
-                    ImGui::Dummy(ImVec2(0, 18));
+                    section_header("Caching & Budgets");
 
                     ImGui::Checkbox("Prompt Caching", &s_prompt_caching);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Cache system prompts to reduce cost and latency");
 
                     ImGui::Text("Task Budget (tokens, 0 = unlimited)");
-                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SetNextItemWidth(-14.f);
                     ImGui::InputInt("##task_budget", &s_task_budget, 10000, 50000);
                     s_task_budget = (std::max)(s_task_budget, 0);
                 }
@@ -1907,15 +1869,14 @@ void render_settings_popup()
 
                 begin_card("##features_card");
                 {
-                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Features & Agentic");
-                    ImGui::Dummy(ImVec2(0, 18));
+                    section_header("Features & Agentic");
 
                     ImGui::Checkbox("Web Search", &s_web_search);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Allow AI to search the web (Anthropic)");
 
                     ImGui::Text("Max Agentic Rounds");
-                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SetNextItemWidth(-14.f);
                     ImGui::SliderInt("##max_rounds", &s_max_rounds, 1, 50);
                 }
                 end_card();
@@ -1939,15 +1900,14 @@ void render_settings_popup()
 
                 begin_card("##editor_layout_card");
                 {
-                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Layout");
-                    ImGui::Dummy(ImVec2(0, 18));
+                    section_header("Layout");
 
                     ImGui::Text("Tab Size");
-                    ImGui::SetNextItemWidth(140.f);
+                    ImGui::SetNextItemWidth(-14.f);
                     ImGui::SliderInt("##ed_tab_size", &s_ed_tab_size, 1, 8);
 
                     ImGui::Text("Font Size");
-                    ImGui::SetNextItemWidth(140.f);
+                    ImGui::SetNextItemWidth(-14.f);
                     ImGui::SliderFloat("##ed_font_size", &s_ed_font_size, 8.0f, 32.0f, "%.0f");
 
                     ImGui::Checkbox("Show Line Numbers", &s_ed_line_numbers);
@@ -1960,8 +1920,7 @@ void render_settings_popup()
 
                 begin_card("##editor_features_card");
                 {
-                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Features");
-                    ImGui::Dummy(ImVec2(0, 18));
+                    section_header("Features");
 
                     ImGui::Checkbox("Highlight Current Line", &s_ed_highlight_line);
                     ImGui::Checkbox("Bracket Matching", &s_ed_bracket_match);
@@ -1978,8 +1937,7 @@ void render_settings_popup()
             {
                 begin_card("##mcp_server_card");
                 {
-                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Built-in MCP Server");
-                    ImGui::Dummy(ImVec2(0, 18));
+                    section_header("Built-in MCP Server");
 
                     ImGui::Checkbox("Enable MCP Server", &s_mcp_enabled);
                     if (s_mcp_enabled) {
@@ -1994,8 +1952,7 @@ void render_settings_popup()
 
                 begin_card("##mcp_clients_card");
                 {
-                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "External MCP Servers");
-                    ImGui::Dummy(ImVec2(0, 18));
+                    section_header("External MCP Servers");
 
                     static int s_mcp_client_sel = 0;
                     static char s_mcp_cl_name[128] = {};
@@ -2119,25 +2076,25 @@ void render_settings_popup()
             {
                 begin_card("##sandbox_card");
                 {
-                    dl->AddText(ImGui::GetCursorScreenPos(), accent_col, "Sandbox Configuration");
-                    ImGui::Dummy(ImVec2(0, 18));
+                    section_header("Sandbox Configuration");
 
                     ImGui::Text("Timeout (ms)");
-                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SetNextItemWidth(-14.f);
                     ImGui::InputInt("##sandbox_timeout", &s_sandbox_timeout, 0, 0);
 
                     ImGui::Text("Memory Budget (MB)");
-                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SetNextItemWidth(-14.f);
                     ImGui::InputInt("##sandbox_memory", &s_sandbox_memory, 0, 0);
 
                     const char* network_modes[] = {"Off", "Default"};
                     ImGui::Text("Network Access");
-                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SetNextItemWidth(-14.f);
                     ImGui::Combo("##sandbox_net", &s_sandbox_network, network_modes, IM_ARRAYSIZE(network_modes));
                 }
                 end_card();
             }
 
+            ImGui::Unindent(2.f);
             ImGui::PopStyleVar();
             ImGui::EndChild();
         }
@@ -2145,35 +2102,28 @@ void render_settings_popup()
 
 
         {
-            float bar_y = ph - 52.f;
-            ImVec2 bar_pos(wp.x, wp.y + bar_y);
-            dl->AddRectFilled(bar_pos, ImVec2(wp.x + pw, wp.y + ph),
-                IM_COL32(18, 18, 26, 255), 12.f, ImDrawFlags_RoundCornersBottom);
-            dl->AddLine(ImVec2(wp.x, wp.y + bar_y), ImVec2(wp.x + pw, wp.y + bar_y),
-                IM_COL32(255, 255, 255, 12));
+            float bar_y = panel_h - 42.f;
+            dl->AddRectFilled(ImVec2(wp.x, wp.y + bar_y), ImVec2(wp.x + ws.x, wp.y + panel_h),
+                IM_COL32(14, 14, 20, 255));
+            dl->AddLine(ImVec2(wp.x, wp.y + bar_y), ImVec2(wp.x + ws.x, wp.y + bar_y),
+                IM_COL32(255, 255, 255, 15));
 
-            ImGui::SetCursorPos(ImVec2(0.f, bar_y));
-            ImGui::Dummy(ImVec2(0, 10));
+            float btn_w = (ws.x - 18.f) * 0.5f;
+            ImGui::SetCursorPos(ImVec2(6.f, bar_y + 7.f));
 
-            float btn_w = 110.f;
-            float btn_spacing = 12.f;
-            float total_btn_w = btn_w * 2 + btn_spacing;
-            ImGui::SetCursorPosX((pw - total_btn_w) * 0.5f);
-
-            if (ImGui::Button("Save", ImVec2(btn_w, 32))) {
+            if (ImGui::Button("Save", ImVec2(btn_w, 28.f))) {
                 if (s_selected_profile < 0 || s_selected_profile >= static_cast<int>(g_sa_settings.provider_profiles.size()))
                     s_selected_profile = 0;
                 auto& profile = g_sa_settings.provider_profiles[s_selected_profile];
                 profile.display_name = s_name[0] ? s_name : "Profile";
-                const auto& kinds = settings_sa_t::provider_kinds();
-                profile.kind = kinds[s_kind];
+                const auto& ks = settings_sa_t::provider_kinds();
+                profile.kind = ks[s_kind];
                 profile.base_url = s_base_url;
                 profile.api_key = s_api_key;
                 profile.model = s_model;
                 profile.headers_json = s_headers;
                 profile.enabled = s_enabled;
                 g_sa_settings.active_provider_profile_id = profile.id;
-
 
                 profile.aws_access_key = s_aws_access;
                 profile.aws_secret_key = s_aws_secret;
@@ -2200,7 +2150,6 @@ void render_settings_popup()
                 g_sa_settings.sandbox.memory_limit_mb = (std::max)(s_sandbox_memory, 64);
                 g_sa_settings.sandbox.network_mode = s_sandbox_network == 1 ? "default" : "off";
 
-
                 g_sa_settings.thinking_enabled = s_thinking_enabled;
                 g_sa_settings.thinking_budget = s_thinking_budget;
                 g_sa_settings.effort_level = s_effort_level;
@@ -2210,7 +2159,6 @@ void render_settings_popup()
                 g_sa_settings.max_agentic_rounds = s_max_rounds;
                 g_sa_settings.fast_mode = s_fast_mode;
                 g_sa_settings.redact_thinking = s_redact_thinking;
-
 
                 editor_config::tab_size = (std::max)(s_ed_tab_size, 1);
                 editor_config::font_size = s_ed_font_size;
@@ -2268,32 +2216,23 @@ void render_settings_popup()
                 s_mcp_client_mgr.connect_all();
 
                 g_settings_open = false;
-                ImGui::CloseCurrentPopup();
             }
 
-            ImGui::SameLine(0, btn_spacing);
+            ImGui::SameLine(0, 6.f);
 
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.20f, 0.20f, 0.26f, 0.7f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.28f, 0.28f, 0.36f, 0.85f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.34f, 0.34f, 0.42f, 1.f));
-            if (ImGui::Button("Cancel", ImVec2(btn_w, 32))) {
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.15f, 0.15f, 0.20f, 0.8f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.22f, 0.22f, 0.28f, 0.9f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.28f, 0.28f, 0.34f, 1.f));
+            if (ImGui::Button("Cancel", ImVec2(btn_w, 28.f))) {
                 s_first = true;
                 g_settings_open = false;
-                ImGui::CloseCurrentPopup();
             }
             ImGui::PopStyleColor(3);
         }
-
-        ImGui::EndPopup();
     }
 
-    if (!still_open) {
-        s_first = true;
-        g_settings_open = false;
-    }
-
-    ImGui::PopStyleVar(5);
-    ImGui::PopStyleColor(18);
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(15);
 }
 
 

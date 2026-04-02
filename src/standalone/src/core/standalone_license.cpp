@@ -204,9 +204,12 @@ namespace
 
         wchar_t computer_name[MAX_COMPUTERNAME_LENGTH + 1] = {};
         DWORD name_size = MAX_COMPUTERNAME_LENGTH + 1;
-        GetComputerNameW(computer_name, &name_size);
-        for (DWORD i = 0; i < name_size; ++i)
-            mix(static_cast<uint64_t>(computer_name[i]));
+        if (GetComputerNameW(computer_name, &name_size)) {
+            for (DWORD i = 0; i < name_size; ++i)
+                mix(static_cast<uint64_t>(computer_name[i]));
+        } else {
+            mix(0xDEADBEEF00000001ULL);
+        }
 
         int cpu_info[4] = {};
         __cpuid(cpu_info, 1);
@@ -214,43 +217,33 @@ namespace
         mix((static_cast<uint64_t>(cpu_info[2]) << 32) | static_cast<unsigned>(cpu_info[3]));
 
         DWORD volume_serial = 0;
-        GetVolumeInformationW(L"C:\\", nullptr, 0, &volume_serial, nullptr, nullptr, nullptr, 0);
-        mix(volume_serial);
+        if (GetVolumeInformationW(L"C:\\", nullptr, 0, &volume_serial, nullptr, nullptr, nullptr, 0)
+            && volume_serial != 0) {
+            mix(volume_serial);
+        } else {
+            mix(0xDEADBEEF00000002ULL);
+        }
 
-        ULONG len = 0;
-        GetAdaptersInfo(nullptr, &len);
-        if (len > 0) {
-            std::vector<unsigned char> buffer(len);
-            auto* info = reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data());
-            if (GetAdaptersInfo(info, &len) == NO_ERROR && info) {
 
-                std::vector<std::string> macs;
-                for (auto* a = info; a; a = a->Next) {
-                    if (a->AddressLength == 0 || a->Type == MIB_IF_TYPE_LOOPBACK)
-                        continue;
-
-                    std::string desc(a->Description);
-                    bool is_virtual = false;
-                    const char* virt_keywords[] = { "Virtual", "VPN", "Hyper-V", "VMware", "VirtualBox", "TAP-", "Tunnel" };
-                    for (const char* kw : virt_keywords) {
-                        if (desc.find(kw) != std::string::npos) { is_virtual = true; break; }
-                    }
-                    if (is_virtual) continue;
-                    std::string mac_str;
-                    for (UINT i = 0; i < a->AddressLength; ++i) {
-                        char hex[4];
-                        snprintf(hex, sizeof(hex), "%02X", a->Address[i]);
-                        mac_str += hex;
-                    }
-                    macs.push_back(mac_str);
-                }
-                std::sort(macs.begin(), macs.end());
-
-                if (!macs.empty()) {
-                    for (char c : macs.front())
-                        mix(static_cast<uint64_t>(c));
-                }
+        bool got_guid = false;
+        HKEY hKey = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                L"SOFTWARE\\Microsoft\\Cryptography",
+                0, KEY_READ | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
+            wchar_t guid[128] = {};
+            DWORD size = sizeof(guid);
+            DWORD type = 0;
+            if (RegQueryValueExW(hKey, L"MachineGuid", nullptr, &type,
+                    reinterpret_cast<BYTE*>(guid), &size) == ERROR_SUCCESS
+                && type == REG_SZ && guid[0] != L'\0') {
+                for (size_t i = 0; guid[i] != L'\0'; ++i)
+                    mix(static_cast<uint64_t>(guid[i]));
+                got_guid = true;
             }
+            RegCloseKey(hKey);
+        }
+        if (!got_guid) {
+            mix(0xDEADBEEF00000003ULL);
         }
 
         char out[17];
@@ -377,7 +370,13 @@ namespace
     {
         settings.license_key = key;
         settings.license_plan = response.value("plan", "standard");
-        settings.license_sig_payload = response.dump();
+
+
+        json cached_payload = response;
+        cached_payload["hwid"] = hwid;
+        cached_payload["license_key"] = key;
+        settings.license_sig_payload = cached_payload.dump();
+
         settings.license_server_sig = response.value("signature", "");
         settings.license_session_token = response.value("session_token", "");
         settings.license_server_nonce = response.value("server_nonce", "");
@@ -435,7 +434,13 @@ namespace
                 apply_valid_response(settings, settings.license_key, hwid, response);
                 return true;
             }
-            error_out = "HWID changed; online revalidation failed: " + revalidate_err;
+
+
+            settings.license_sig_payload.clear();
+            settings.license_session_token.clear();
+            settings.license_hwid.clear();
+            settings.save();
+
             return false;
         }
 
@@ -497,7 +502,7 @@ namespace
             std::string error;
             json response;
             if (!call_validation_endpoint(*settings, "heartbeat", settings->license_key,
-                                          generate_hwid(), settings->license_session_token,
+                                          s_cached_hwid, settings->license_session_token,
                                           nonce, error, response)) {
                 consecutive_failures++;
 
@@ -511,7 +516,7 @@ namespace
             }
 
             consecutive_failures = 0;
-            apply_valid_response(*settings, settings->license_key, generate_hwid(), response);
+            apply_valid_response(*settings, settings->license_key, s_cached_hwid, response);
         }
     }
 
@@ -654,14 +659,9 @@ namespace standalone_license
     bool inline_proof_check_c()
     {
 
-        if (s_cached_hwid.empty()) return false;
-        std::string current = generate_hwid();
-        if (current != s_cached_hwid) {
 
-            set_obfuscated_valid(false);
-            return false;
-        }
-        return true;
+        if (s_cached_hwid.empty()) return false;
+        return check_obfuscated_valid();
     }
 
     bool inline_proof_check_d()
@@ -795,25 +795,10 @@ namespace standalone_license
         if (!check_obfuscated_valid()) return false;
 
         int64_t now = static_cast<int64_t>(GetTickCount64());
-        int stale_count = 0;
-
-        for (int i = 0; i < GATE_SLOT_COUNT; ++i) {
-            int64_t ts = s_gate_timestamps[i].load(std::memory_order_acquire);
 
 
-            if (ts == 0) {
-                if (now > s_sweep_start_time + 120000)
-                    stale_count++;
-                continue;
-            }
-
-            if ((now - ts) > 30000) {
-                stale_count++;
-            }
-        }
-
-
-        if (stale_count >= 3) {
+        int64_t render_ts = s_gate_timestamps[gate_ui_render_loop].load(std::memory_order_acquire);
+        if (render_ts > 0 && (now - render_ts) > 120000) {
             set_obfuscated_valid(false);
             std::lock_guard<std::mutex> lk(s_state_mtx);
             s_error = decode_status_string_impl(str_gate_stale);

@@ -5,6 +5,7 @@
 #include "globals.h"
 #include "../core/zydis_disasm.hpp"
 #include "../core/standalone_license.hpp"
+#include "../core/hex_view.hpp"
 
 #include <filesystem>
 #include <algorithm>
@@ -160,13 +161,37 @@ void file_browser::open_file(int idx)
         }
     } else {
 
-        code_editor::active = false;
-        code_editor::buffer.clear();
-        code_editor::filename.clear();
-        code_editor::filepath.clear();
-        g_disasm.file = DisasmFile{};
-        disasm::load_pe(ent.full_path, g_disasm.file);
-        if (g_disasm.file.loaded)
-            disasm::decode_section(g_disasm.file);
+        static const char* archive_exts[] = {
+            ".rar", ".zip", ".7z", ".tar", ".gz", ".bz2", ".xz",
+            ".cab", ".iso", ".img",
+        };
+        bool is_archive = false;
+        for (auto& ae : archive_exts) {
+            if (ext == ae) { is_archive = true; break; }
+        }
+
+        if (is_archive) {
+            code_editor::active = false;
+            code_editor::buffer.clear();
+            code_editor::filename.clear();
+            code_editor::filepath.clear();
+            g_disasm.file = DisasmFile{};
+            hex_view::load_from_file(ent.full_path, 0, 0);
+            globals::ui::active_center_view = center_view_t::hex_view;
+        } else {
+            code_editor::active = false;
+            code_editor::buffer.clear();
+            code_editor::filename.clear();
+            code_editor::filepath.clear();
+            g_disasm.file = DisasmFile{};
+            disasm::load_pe(ent.full_path, g_disasm.file);
+            if (g_disasm.file.loaded) {
+                disasm::decode_section(g_disasm.file);
+                globals::ui::active_center_view = center_view_t::disassembly;
+            } else {
+                hex_view::load_from_file(ent.full_path, 0, 0);
+                globals::ui::active_center_view = center_view_t::hex_view;
+            }
+        }
     }
 }
