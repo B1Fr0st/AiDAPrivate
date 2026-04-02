@@ -35,6 +35,7 @@ using json = nlohmann::json;
 
 extern DisasmState g_disasm;
 
+mcp_client::manager_t s_mcp_client_mgr;
 
 namespace {
 
@@ -65,7 +66,6 @@ bool                     s_server_started = false;
 bool                     s_initialized    = false;
 
 
-mcp_client::manager_t s_mcp_client_mgr;
 bool                  s_mcp_clients_connected = false;
 
 

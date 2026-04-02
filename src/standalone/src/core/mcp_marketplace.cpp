@@ -14,6 +14,8 @@
 #include <sstream>
 #include <algorithm>
 
+extern mcp_client::manager_t s_mcp_client_mgr;
+
 namespace mcp_marketplace
 {
 
@@ -501,9 +503,6 @@ std::vector<installed_server_t> get_installed()
 
 void activate_server(const installed_server_t& srv)
 {
-
-    extern mcp_client::manager_t s_mcp_client_mgr;
-
     mcp_client::server_config_t cfg;
     cfg.name = srv.package_name;
     cfg.transport = (srv.transport == "stdio")
@@ -515,8 +514,8 @@ void activate_server(const installed_server_t& srv)
     cfg.enabled = srv.enabled;
     cfg.auto_connect = srv.auto_connect;
 
-    s_mcp_client_mgr.add_server(cfg);
-    s_mcp_client_mgr.connect_server(cfg.name);
+    ::s_mcp_client_mgr.add_server(cfg);
+    ::s_mcp_client_mgr.connect_server(cfg.name);
 
     output_log::push(bottom_tab_t::mcp_log,
         "[marketplace] Activated server: " + srv.package_name);
@@ -524,9 +523,8 @@ void activate_server(const installed_server_t& srv)
 
 void deactivate_server(const std::string& package_name)
 {
-    extern mcp_client::manager_t s_mcp_client_mgr;
-    s_mcp_client_mgr.disconnect_server(package_name);
-    s_mcp_client_mgr.remove_server(package_name);
+    ::s_mcp_client_mgr.disconnect_server(package_name);
+    ::s_mcp_client_mgr.remove_server(package_name);
 
     output_log::push(bottom_tab_t::mcp_log,
         "[marketplace] Deactivated server: " + package_name);
