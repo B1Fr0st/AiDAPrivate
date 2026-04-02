@@ -22,11 +22,34 @@
 namespace httplib { class Client; }
 
 struct settings_sa_t;
+namespace mcp_standalone { struct tool_def_t; }
 
 
 using ai_callback_t        = std::function<void(const std::string& result)>;
 using ai_stream_chunk_t    = std::function<void(const std::string& chunk)>;
 using ai_stop_predicate_t  = std::function<bool(const std::string& accumulated)>;
+
+
+struct ai_tool_call_t
+{
+    std::string id;
+    std::string name;
+    nlohmann::json arguments;
+};
+
+
+struct ai_generation_result_t
+{
+    std::string text;
+    std::string thinking;
+    std::vector<ai_tool_call_t> tool_calls;
+    std::string stop_reason;
+    int64_t input_tokens  = 0;
+    int64_t output_tokens = 0;
+    int64_t cache_read    = 0;
+    int64_t cache_write   = 0;
+    bool    is_error      = false;
+};
 
 
 class standalone_ai_client_t
@@ -55,6 +78,23 @@ public:
         const std::vector<std::pair<std::string, std::string>>& history,
         ai_stream_chunk_t on_chunk = nullptr,
         ai_stop_predicate_t stop_check = nullptr);
+
+
+    ai_generation_result_t generate_with_tools(
+        const nlohmann::json& messages,
+        const std::string& system_prompt,
+        const std::vector<mcp_standalone::tool_def_t>& tools,
+        ai_stream_chunk_t on_chunk = nullptr);
+
+
+    static nlohmann::json build_anthropic_tools(
+        const std::vector<mcp_standalone::tool_def_t>& tools);
+
+
+    static nlohmann::json make_tool_result_block(
+        const std::string& tool_use_id,
+        const std::string& content,
+        bool is_error = false);
 
 
     bool poll();

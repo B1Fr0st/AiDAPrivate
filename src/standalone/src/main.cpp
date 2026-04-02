@@ -12,6 +12,7 @@
 #include <dwmapi.h>
 #include "helpers/globals.h"
 #include "core/standalone_chat.hpp"
+#include "core/standalone_license.hpp"
 #include "helpers/stb_image.h"
 
 #pragma comment(lib, "dwmapi.lib")
@@ -154,6 +155,9 @@ int main(int, char**)
     g_pd3dDeviceContext->OMSetBlendState(blend_state, nullptr, 0xffffffff);
     Blur::Init(g_pd3dDevice, g_pd3dDeviceContext, 100, 130);
     init_standalone_chat();
+
+
+    standalone_license::snapshot_code_hashes();
 
 
     ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -308,6 +312,9 @@ int main(int, char**)
 
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
     }
+
+
+    globals::terminal_mgr.shutdown();
 
     shutdown_standalone_chat();
     Blur::Shutdown();

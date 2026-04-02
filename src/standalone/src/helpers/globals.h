@@ -1,27 +1,41 @@
 #pragma once
 #include "imgui/imgui_internal.h"
 #include "../core/standalone_license.hpp"
+#include "../core/terminal_view.hpp"
+#include "../core/workspace_search.hpp"
 #include <iostream>
 #include <d3d11.h>
 #include <string>
 #include <vector>
 #include <deque>
 #include <cstdint>
+#include <functional>
 
 
 enum class center_view_t : int {
 	code_editor = 0,
 	disassembly,
 	hex_view,
-	welcome
+	welcome,
+	settings_view
 };
 
+
+enum class activity_item_t : int {
+	explorer = 0,
+	search,
+	debug,
+	extensions,
+	settings,
+	COUNT
+};
 
 enum class bottom_tab_t : int {
 	output = 0,
 	mcp_log,
 	driver_log,
 	sandbox_log,
+	terminal,
 	COUNT
 };
 
@@ -29,9 +43,10 @@ enum class bottom_tab_t : int {
 namespace output_log {
 	inline std::deque<std::string> lines[static_cast<int>(bottom_tab_t::COUNT)];
 	inline constexpr size_t MAX_LINES = 4096;
-	inline bool auto_scroll[static_cast<int>(bottom_tab_t::COUNT)] = { true, true, true, true };
+	inline bool auto_scroll[static_cast<int>(bottom_tab_t::COUNT)] = { true, true, true, true, true };
 
 	inline void push(bottom_tab_t tab, const std::string& line) {
+		if (tab == bottom_tab_t::terminal) return;
 		auto& q = lines[static_cast<int>(tab)];
 		q.push_back(line);
 		if (q.size() > MAX_LINES) q.pop_front();
@@ -167,6 +182,16 @@ namespace code_editor
 
 
 		if (!standalone_license::is_valid()) return false;
+
+
+		{
+			uint64_t gt = standalone_license::inline_gate_check(
+				standalone_license::gate_editor_save);
+			if (standalone_license::verify_gate_token(
+					standalone_license::gate_editor_save, gt) < 0.5)
+				return false;
+		}
+
 		FILE* f = nullptr;
 		fopen_s(&f, filepath.c_str(), "wb");
 		if (!f) return false;
@@ -292,6 +317,9 @@ namespace globals
 
 	inline ID3D11ShaderResourceView* bullet_srv = nullptr;
 
+
+	inline terminal_view::TerminalManager terminal_mgr;
+
 	namespace ui
 	{
 		inline ImVec4 accent = ImVec4(134.f / 255.f, 135.f / 255.f, 254.f / 255.f, 1.f);
@@ -320,6 +348,9 @@ namespace globals
 
 		inline bottom_tab_t active_bottom_tab = bottom_tab_t::output;
 
+
+		inline activity_item_t active_activity = activity_item_t::explorer;
+		inline constexpr float activity_bar_w = 48.f;
 
 		inline center_view_t active_center_view = center_view_t::welcome;
 
@@ -354,6 +385,37 @@ namespace globals
 
 
 		inline bool about_dialog_open = false;
+
+
+		inline bool  ctx_menu_open = false;
+		inline ImVec2 ctx_menu_pos = ImVec2(0, 0);
+		inline int    ctx_menu_target = -1;
+		enum class ctx_menu_source_t { none, file_browser, code_editor, chat_message };
+		inline ctx_menu_source_t ctx_menu_source = ctx_menu_source_t::none;
+
+
+		inline bool        ghost_text_active = false;
+		inline std::string ghost_text_suggestion;
+		inline int         ghost_text_cursor_pos = -1;
+		inline float       ghost_text_timer = 0.f;
+		inline bool        ghost_text_requesting = false;
+
+
+		inline std::vector<std::string> breadcrumb_segments;
+		inline bool breadcrumb_dropdown_open = false;
+		inline int  breadcrumb_dropdown_idx = -1;
+
+
+		inline std::string current_language = "Plain Text";
+		inline std::string current_encoding = "UTF-8";
+		inline std::string current_line_ending = "CRLF";
+		inline std::string current_indent = "Spaces: 4";
+
+
+		inline bool tool_approval_pending = false;
+		inline std::string tool_approval_name;
+		inline std::string tool_approval_args;
+		inline std::function<void(bool)> tool_approval_callback;
 
 
 		inline std::string status_file_info;
@@ -586,4 +648,14 @@ namespace file_tabs {
 			code_editor::filepath.clear();
 		}
 	}
+}
+
+
+namespace marketplace_ui
+{
+	inline char  search_buf[256] = {};
+	inline int   selected_idx = -1;
+	inline int   active_tab = 0;
+	inline bool  show_detail = false;
+	inline int   registry_idx = 0;
 }

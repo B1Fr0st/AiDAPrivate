@@ -300,6 +300,9 @@ struct settings_sa_t
     int         task_budget_tokens = 0;
     bool        web_search_enabled = false;
     int         max_agentic_rounds = 15;
+    bool        fast_mode          = false;
+    bool        redact_thinking    = false;
+    bool        first_run_completed = false;
 
 
     bool        editor_word_wrap    = false;
@@ -312,6 +315,26 @@ struct settings_sa_t
     bool        ghost_text_enabled   = false;
     std::string ghost_text_model;
     std::string ghost_text_provider_id;
+    int         ghost_text_debounce_ms = 500;
+
+
+    bool        auto_save_enabled  = false;
+    int         auto_save_interval_s = 30;
+
+
+    std::string terminal_shell = "powershell.exe";
+    int         terminal_scrollback = 10000;
+
+
+    bool        tool_auto_approve    = false;
+    std::string tool_always_allow;
+    std::string tool_always_deny;
+
+
+    std::string recent_workspaces_json;
+
+
+    bool        activity_bar_visible = true;
 
 
     int         window_x = -1;
@@ -323,6 +346,8 @@ struct settings_sa_t
     workspace_state_t workspace;
     sandbox_settings_t sandbox;
     std::vector<mcp_client_server_t> mcp_client_servers;
+
+    std::string marketplace_installed_json;
 
 
     std::string api_provider = "openai_compatible";
@@ -739,6 +764,9 @@ struct settings_sa_t
         integer("task_budget_tokens", task_budget_tokens);
         boolean("web_search_enabled", web_search_enabled);
         integer("max_agentic_rounds", max_agentic_rounds);
+        boolean("fast_mode", fast_mode);
+        boolean("redact_thinking", redact_thinking);
+        boolean("first_run_completed", first_run_completed);
 
         boolean("editor_word_wrap", editor_word_wrap);
         boolean("editor_minimap", editor_minimap);
@@ -749,6 +777,17 @@ struct settings_sa_t
         boolean("ghost_text_enabled", ghost_text_enabled);
         str("ghost_text_model", ghost_text_model);
         str("ghost_text_provider_id", ghost_text_provider_id);
+        integer("ghost_text_debounce_ms", ghost_text_debounce_ms);
+
+        boolean("auto_save_enabled", auto_save_enabled);
+        integer("auto_save_interval_s", auto_save_interval_s);
+        str("terminal_shell", terminal_shell);
+        integer("terminal_scrollback", terminal_scrollback);
+        boolean("tool_auto_approve", tool_auto_approve);
+        str("tool_always_allow", tool_always_allow);
+        str("tool_always_deny", tool_always_deny);
+        str("recent_workspaces_json", recent_workspaces_json);
+        boolean("activity_bar_visible", activity_bar_visible);
 
         integer("window_x", window_x);
         integer("window_y", window_y);
@@ -825,6 +864,8 @@ struct settings_sa_t
             }
         }
 
+        marketplace_installed_json = root.value("marketplace_installed_json", "");
+
         migrate_legacy_fields_into_profiles();
         sync_legacy_fields_from_active_profile();
 
@@ -892,6 +933,9 @@ struct settings_sa_t
         root["task_budget_tokens"] = task_budget_tokens;
         root["web_search_enabled"] = web_search_enabled;
         root["max_agentic_rounds"] = max_agentic_rounds;
+        root["fast_mode"] = fast_mode;
+        root["redact_thinking"] = redact_thinking;
+        root["first_run_completed"] = first_run_completed;
         root["chat_font_size"] = chat_font_size;
         root["editor_word_wrap"] = editor_word_wrap;
         root["editor_minimap"] = editor_minimap;
@@ -902,6 +946,18 @@ struct settings_sa_t
         root["ghost_text_enabled"] = ghost_text_enabled;
         root["ghost_text_model"] = ghost_text_model;
         root["ghost_text_provider_id"] = ghost_text_provider_id;
+        root["ghost_text_debounce_ms"] = ghost_text_debounce_ms;
+
+        root["auto_save_enabled"] = auto_save_enabled;
+        root["auto_save_interval_s"] = auto_save_interval_s;
+        root["terminal_shell"] = terminal_shell;
+        root["terminal_scrollback"] = terminal_scrollback;
+        root["tool_auto_approve"] = tool_auto_approve;
+        root["tool_always_allow"] = tool_always_allow;
+        root["tool_always_deny"] = tool_always_deny;
+        root["recent_workspaces_json"] = recent_workspaces_json;
+        root["activity_bar_visible"] = activity_bar_visible;
+
         root["window_x"] = window_x;
         root["window_y"] = window_y;
         root["window_w"] = window_w;
@@ -961,6 +1017,7 @@ struct settings_sa_t
             });
         }
         root["mcp_client_servers"] = mcp_clients;
+        root["marketplace_installed_json"] = marketplace_installed_json;
 
         std::ofstream ofs(path, std::ios::trunc);
         if (!ofs.is_open())

@@ -2,6 +2,7 @@
 #include "syntax_highlight.hpp"
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
+#include "standalone_license.hpp"
 #include "../helpers/globals.h"
 
 #include "imgui/imgui.h"
@@ -750,6 +751,13 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 }
 
                 if (!context.empty() && g_sa_ai_client) {
+
+                    uint64_t gt = standalone_license::inline_gate_check(
+                        standalone_license::gate_editor_ghost);
+                    if (standalone_license::verify_gate_token(
+                            standalone_license::gate_editor_ghost, gt) < 0.5) {
+                        s_ghost_debounce = 0.f;
+                    } else {
                     s_ghost_requesting = true;
                     if (s_ghost_worker.joinable()) s_ghost_worker.join();
                     s_ghost_worker = std::thread([context]() {
@@ -774,6 +782,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                         s_ghost_pending = std::move(result);
                         s_ghost_has_pending = true;
                     });
+                    }
                 }
             }
         }

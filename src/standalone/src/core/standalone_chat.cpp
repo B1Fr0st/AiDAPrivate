@@ -4,6 +4,7 @@
 
 #include "mcp_standalone.hpp"
 #include "mcp_client.hpp"
+#include "mcp_marketplace.hpp"
 #include "standalone_ai_client.hpp"
 #include "standalone_license.hpp"
 #include "standalone_settings.hpp"
@@ -16,6 +17,7 @@
 
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <deque>
 #include <filesystem>
@@ -65,6 +67,63 @@ bool                     s_initialized    = false;
 
 mcp_client::manager_t s_mcp_client_mgr;
 bool                  s_mcp_clients_connected = false;
+
+
+struct tool_approval_t {
+    std::mutex          mtx;
+    std::condition_variable cv;
+    bool                pending   = false;
+    bool                approved  = false;
+    bool                answered  = false;
+    std::string         tool_name;
+    std::string         tool_args_preview;
+};
+tool_approval_t s_tool_approval;
+
+bool request_tool_approval(const std::string& name, const json& arguments)
+{
+    if (g_sa_settings.tool_auto_approve)
+        return true;
+
+
+    if (!g_sa_settings.tool_always_allow.empty()) {
+        std::istringstream ss(g_sa_settings.tool_always_allow);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
+            while (!tok.empty() && tok.back() == ' ') tok.pop_back();
+            if (tok == name) return true;
+        }
+    }
+
+
+    if (!g_sa_settings.tool_always_deny.empty()) {
+        std::istringstream ss(g_sa_settings.tool_always_deny);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
+            while (!tok.empty() && tok.back() == ' ') tok.pop_back();
+            if (tok == name) return false;
+        }
+    }
+
+
+    {
+        std::lock_guard<std::mutex> lk(s_tool_approval.mtx);
+        s_tool_approval.tool_name = name;
+        try { s_tool_approval.tool_args_preview = arguments.dump(2).substr(0, 500); }
+        catch (...) { s_tool_approval.tool_args_preview = "(unable to display)"; }
+        s_tool_approval.pending = true;
+        s_tool_approval.answered = false;
+        s_tool_approval.approved = false;
+    }
+
+    std::unique_lock<std::mutex> lk(s_tool_approval.mtx);
+    s_tool_approval.cv.wait(lk, [] { return s_tool_approval.answered || s_cancel.load(); });
+    s_tool_approval.pending = false;
+    if (s_cancel.load()) return false;
+    return s_tool_approval.approved;
+}
 
 
 struct parsed_tool_call_t
@@ -150,7 +209,7 @@ std::string strip_tool_blocks(const std::string& text)
 }
 
 
-std::string build_system_prompt()
+std::string build_system_prompt(bool native_tool_use = false)
 {
     std::string prompt;
     prompt.reserve(8192);
@@ -172,22 +231,24 @@ std::string build_system_prompt()
         "- For number conversions, ALWAYS use `convert_number`.\n"
         "- Do NOT fabricate tool results. If you need data, call a tool.\n\n";
 
-    prompt += "## Available Tools\n\n";
 
+    if (!native_tool_use) {
+        prompt += "## Available Tools\n\n";
 
-    auto& tools = s_mcp_server.get_tools();
-    for (const auto& t : tools) {
-        prompt += "### " + t.name + "\n";
-        prompt += t.description + "\n";
-        if (!t.params.empty()) {
-            prompt += "Parameters:\n";
-            for (const auto& p : t.params) {
-                prompt += "- `" + p.name + "` (" + p.type;
-                if (p.required) prompt += ", required";
-                prompt += "): " + p.description + "\n";
+        auto& tools = s_mcp_server.get_tools();
+        for (const auto& t : tools) {
+            prompt += "### " + t.name + "\n";
+            prompt += t.description + "\n";
+            if (!t.params.empty()) {
+                prompt += "Parameters:\n";
+                for (const auto& p : t.params) {
+                    prompt += "- `" + p.name + "` (" + p.type;
+                    if (p.required) prompt += ", required";
+                    prompt += "): " + p.description + "\n";
+                }
             }
+            prompt += "\n";
         }
-        prompt += "\n";
     }
 
 
@@ -210,16 +271,18 @@ std::string build_system_prompt()
         }
     }
 
-    prompt +=
-        "## How to call a tool\n\n"
-        "When you need to call a tool, output EXACTLY this format (one call per block):\n\n"
-        "<tool_call>\n"
-        "{\"name\": \"TOOL_NAME\", \"arguments\": {\"PARAM\": \"VALUE\"}}\n"
-        "</tool_call>\n\n"
-        "After each tool call you will receive its result inside <tool_result> tags.\n"
-        "You may make multiple tool calls in sequence across turns.\n"
-        "When you are done using tools, provide your final analysis as plain text "
-        "WITHOUT any <tool_call> tags.\n";
+    if (!native_tool_use) {
+        prompt +=
+            "## How to call a tool\n\n"
+            "When you need to call a tool, output EXACTLY this format (one call per block):\n\n"
+            "<tool_call>\n"
+            "{\"name\": \"TOOL_NAME\", \"arguments\": {\"PARAM\": \"VALUE\"}}\n"
+            "</tool_call>\n\n"
+            "After each tool call you will receive its result inside <tool_result> tags.\n"
+            "You may make multiple tool calls in sequence across turns.\n"
+            "When you are done using tools, provide your final analysis as plain text "
+            "WITHOUT any <tool_call> tags.\n";
+    }
 
     return prompt;
 }
@@ -285,6 +348,17 @@ void run_agentic(std::string user_message,
                  std::vector<std::pair<std::string, std::string>> history)
 {
 
+    {
+        uint64_t gate = standalone_license::inline_gate_check(
+            standalone_license::gate_chat_pre_agentic);
+        if (standalone_license::verify_gate_token(
+                standalone_license::gate_chat_pre_agentic, gate) < 0.5) {
+            post_update(ai_update_t::ERR,
+                standalone_license::decode_status_string(
+                    standalone_license::str_session_revoked));
+            return;
+        }
+    }
 
     if (!standalone_license::is_valid()) {
         post_update(ai_update_t::ERR, "Session expired. Please restart.");
@@ -294,7 +368,144 @@ void run_agentic(std::string user_message,
     post_update(ai_update_t::THINKING);
     output_log::push(bottom_tab_t::output, "[ai] New request: " + user_message.substr(0, 120) + (user_message.size() > 120 ? "..." : ""));
 
-    std::string system_prompt = build_system_prompt();
+    const bool use_native = (g_sa_settings.get_active_profile_kind() == "anthropic");
+    std::string system_prompt = build_system_prompt(use_native);
+    const int max_turns = (std::max)(g_sa_settings.max_agentic_rounds, 1);
+    int64_t budget_used = 0;
+
+
+    if (use_native) {
+
+        json messages = json::array();
+        for (auto& [role, text] : history) {
+            std::string r = (role == "assistant" || role == "Assistant") ? "assistant" : "user";
+            messages.push_back({{"role", r}, {"content", text}});
+        }
+        messages.push_back({{"role", "user"}, {"content", user_message}});
+
+
+        auto& local_tools = s_mcp_server.get_tools();
+
+        for (int turn = 0; turn < max_turns; ++turn) {
+            if (s_cancel.load()) { post_update(ai_update_t::COMPLETE); return; }
+
+            if (standalone_license::inline_proof_check_a() < 0.5) {
+                post_update(ai_update_t::ERR, "Service degraded. Please restart the application.");
+                return;
+            }
+
+            if (g_sa_settings.task_budget_tokens > 0 && budget_used >= g_sa_settings.task_budget_tokens) {
+                output_log::push(bottom_tab_t::output, "[ai] Task budget exhausted (" + std::to_string(budget_used) + " tokens)");
+                post_update(ai_update_t::ERR, "Task budget exhausted (" + std::to_string(budget_used) + " tokens used).");
+                return;
+            }
+
+            if (turn > 0)
+                post_update(ai_update_t::THINKING, "Processing tool results...");
+
+            ai_generation_result_t gen;
+            try {
+                gen = g_sa_ai_client->generate_with_tools(messages, system_prompt, local_tools,
+                    [](const std::string& chunk) {
+
+                        if (!chunk.empty() && chunk[0] != '\x01')
+                            post_update(ai_update_t::CHUNK, chunk);
+                    });
+            } catch (const std::exception& e) {
+                output_log::push(bottom_tab_t::output, std::string("[ai] Exception: ") + e.what());
+                post_update(ai_update_t::ERR, std::string("Exception: ") + e.what());
+                return;
+            }
+
+            budget_used += gen.input_tokens + gen.output_tokens;
+
+            if (s_cancel.load()) { post_update(ai_update_t::COMPLETE); return; }
+            if (gen.is_error) { post_update(ai_update_t::ERR, gen.text); return; }
+
+
+            {
+                uint64_t gate = standalone_license::inline_gate_check(
+                    standalone_license::gate_chat_post_response);
+                if (standalone_license::verify_gate_token(
+                        standalone_license::gate_chat_post_response, gate) < 0.5) {
+                    post_update(ai_update_t::ERR,
+                        standalone_license::decode_status_string(
+                            standalone_license::str_session_revoked));
+                    return;
+                }
+            }
+
+            if (!gen.thinking.empty())
+                post_update(ai_update_t::THINKING, gen.thinking);
+
+
+            if (gen.tool_calls.empty() || gen.stop_reason != "tool_use") {
+
+                if (gen.text.empty() && !gen.thinking.empty())
+                    post_update(ai_update_t::CHUNK, "(thinking only — no text output)");
+                post_update(ai_update_t::COMPLETE);
+                return;
+            }
+
+
+            json assistant_content = json::array();
+            if (!gen.text.empty())
+                assistant_content.push_back({{"type", "text"}, {"text", gen.text}});
+            for (auto& tc : gen.tool_calls) {
+                assistant_content.push_back({
+                    {"type", "tool_use"},
+                    {"id", tc.id},
+                    {"name", tc.name},
+                    {"input", tc.arguments}
+                });
+            }
+            messages.push_back({{"role", "assistant"}, {"content", assistant_content}});
+
+
+            json tool_result_content = json::array();
+            for (auto& tc : gen.tool_calls) {
+                if (s_cancel.load()) { post_update(ai_update_t::COMPLETE); return; }
+                post_update(ai_update_t::THINKING, "Calling " + tc.name + "...");
+
+
+                {
+                    uint64_t gate = standalone_license::inline_gate_check(
+                        standalone_license::gate_chat_tool_exec);
+                    if (standalone_license::verify_gate_token(
+                            standalone_license::gate_chat_tool_exec, gate) < 0.5) {
+                        tool_result_content.push_back(
+                            standalone_ai_client_t::make_tool_result_block(tc.id, "Service unavailable.", true));
+                        continue;
+                    }
+                }
+
+                if (!standalone_license::inline_proof_check_d()) {
+                    tool_result_content.push_back(
+                        standalone_ai_client_t::make_tool_result_block(tc.id, "Error: Tool execution timed out.", true));
+                    continue;
+                }
+
+                if (!request_tool_approval(tc.name, tc.arguments)) {
+                    tool_result_content.push_back(
+                        standalone_ai_client_t::make_tool_result_block(tc.id, "Tool execution denied by user.", true));
+                    continue;
+                }
+
+                std::string result = execute_tool(tc.name, tc.arguments);
+                bool is_err = (result.size() >= 6 && result.substr(0, 6) == "Error:");
+                tool_result_content.push_back(
+                    standalone_ai_client_t::make_tool_result_block(tc.id, result, is_err));
+            }
+
+
+            messages.push_back({{"role", "user"}, {"content", tool_result_content}});
+        }
+
+        output_log::push(bottom_tab_t::output, "[ai] Reached max tool rounds (" + std::to_string(max_turns) + ") [native]");
+        post_update(ai_update_t::ERR, "Reached maximum tool-calling rounds (" + std::to_string(max_turns) + "). Stopping.");
+        return;
+    }
+
 
     std::string conversation;
     conversation.reserve(4096);
@@ -307,15 +518,17 @@ void run_agentic(std::string user_message,
 
     std::string full_prompt = system_prompt + "\n\n" + conversation;
 
-    const int max_turns = (std::max)(g_sa_settings.max_agentic_rounds, 1);
-    int64_t budget_used = 0;
-
     for (int turn = 0; turn < max_turns; ++turn) {
         if (s_cancel.load()) {
             post_update(ai_update_t::COMPLETE);
             return;
         }
 
+
+        if (standalone_license::inline_proof_check_a() < 0.5) {
+            post_update(ai_update_t::ERR, "Service degraded. Please restart the application.");
+            return;
+        }
 
         if (g_sa_settings.task_budget_tokens > 0 && budget_used >= g_sa_settings.task_budget_tokens) {
             output_log::push(bottom_tab_t::output, "[ai] Task budget exhausted (" + std::to_string(budget_used) + " tokens)");
@@ -352,6 +565,18 @@ void run_agentic(std::string user_message,
             return;
         }
 
+
+        {
+            uint64_t gate = standalone_license::inline_gate_check(
+                standalone_license::gate_chat_post_response);
+            if (standalone_license::verify_gate_token(
+                    standalone_license::gate_chat_post_response, gate) < 0.5) {
+                post_update(ai_update_t::ERR,
+                    standalone_license::decode_status_string(
+                        standalone_license::str_session_revoked));
+                return;
+            }
+        }
 
         std::string thinking_content;
         std::string clean_response = response;
@@ -404,6 +629,27 @@ void run_agentic(std::string user_message,
                 return;
             }
             post_update(ai_update_t::THINKING, "Calling " + tc.name + "...");
+
+
+            {
+                uint64_t gate = standalone_license::inline_gate_check(
+                    standalone_license::gate_chat_tool_exec);
+                if (standalone_license::verify_gate_token(
+                        standalone_license::gate_chat_tool_exec, gate) < 0.5) {
+                    tool_results += "\n<tool_result name=\"" + tc.name + "\">\nService unavailable.\n</tool_result>\n";
+                    continue;
+                }
+            }
+
+            if (!standalone_license::inline_proof_check_d()) {
+                tool_results += "\n<tool_result name=\"" + tc.name + "\">\nError: Tool execution timed out.\n</tool_result>\n";
+                continue;
+            }
+
+            if (!request_tool_approval(tc.name, tc.arguments)) {
+                tool_results += "\n<tool_result name=\"" + tc.name + "\">\nTool execution denied by user.\n</tool_result>\n";
+                continue;
+            }
 
             std::string result = execute_tool(tc.name, tc.arguments);
             tool_results += "\n<tool_result name=\"" + tc.name + "\">\n"
@@ -686,6 +932,16 @@ void init_standalone_chat()
     s_mcp_client_mgr.connect_all();
     s_mcp_clients_connected = true;
 
+
+    mcp_marketplace::load_installed(g_sa_settings.marketplace_installed_json);
+    {
+        auto installed = mcp_marketplace::get_installed();
+        for (auto& srv : installed) {
+            if (srv.enabled && srv.auto_connect)
+                mcp_marketplace::activate_server(srv);
+        }
+    }
+
     driver_bridge::initialize();
     register_standalone_protection();
     restore_workspace_state();
@@ -715,6 +971,10 @@ void shutdown_standalone_chat()
         s_mcp_client_mgr.disconnect_all();
         s_mcp_clients_connected = false;
     }
+
+
+    g_sa_settings.marketplace_installed_json = mcp_marketplace::save_installed();
+    mcp_marketplace::shutdown();
 
     persist_workspace_state();
     g_sa_settings.save();
@@ -858,6 +1118,96 @@ void poll_ai_chat()
             break;
         }
     }
+}
+
+
+void render_tool_approval_dialog()
+{
+    bool show = false;
+    std::string name, args_preview;
+    {
+        std::lock_guard<std::mutex> lk(s_tool_approval.mtx);
+        if (s_tool_approval.pending && !s_tool_approval.answered) {
+            show = true;
+            name = s_tool_approval.tool_name;
+            args_preview = s_tool_approval.tool_args_preview;
+        }
+    }
+    if (!show) return;
+
+    ImGui::OpenPopup("##tool_approval");
+
+    float ww = globals::ui::window_w;
+    float wh = globals::ui::window_h;
+    float pw = 440.f, ph = 280.f;
+    ImGui::SetNextWindowPos(ImVec2((ww - pw) * 0.5f, (wh - ph) * 0.5f), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(pw, ph), ImGuiCond_Always);
+
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, IM_COL32(28, 28, 36, 245));
+    ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(70, 70, 100, 180));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 12));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
+
+    if (ImGui::BeginPopupModal("##tool_approval", nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
+
+        float ax = globals::ui::accent.x;
+        float ay = globals::ui::accent.y;
+        float az = globals::ui::accent.z;
+
+        ImGui::PushFont(nullptr);
+        ImGui::TextColored(ImVec4(ax, ay, az, 1.f), "Tool Approval Required");
+        ImGui::PopFont();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::Text("The AI wants to execute:");
+        ImGui::TextColored(ImVec4(1.f, 0.9f, 0.6f, 1.f), "  %s", name.c_str());
+        ImGui::Spacing();
+
+        if (!args_preview.empty()) {
+            ImGui::Text("Arguments:");
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(18, 18, 24, 200));
+            ImGui::BeginChild("##tool_args", ImVec2(-1, 100.f), ImGuiChildFlags_Borders);
+            ImGui::TextWrapped("%s", args_preview.c_str());
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::Spacing();
+        ImGui::Spacing();
+
+        float btn_w = 100.f;
+        float total = btn_w * 2 + 12.f;
+        ImGui::SetCursorPosX((pw - total) * 0.5f);
+
+        ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(
+            static_cast<int>(ax * 200), static_cast<int>(ay * 200), static_cast<int>(az * 200), 200));
+        if (ImGui::Button("Allow", ImVec2(btn_w, 28))) {
+            std::lock_guard<std::mutex> lk(s_tool_approval.mtx);
+            s_tool_approval.approved = true;
+            s_tool_approval.answered = true;
+            s_tool_approval.cv.notify_one();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopStyleColor();
+
+        ImGui::SameLine(0, 12.f);
+
+        ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(120, 40, 40, 200));
+        if (ImGui::Button("Deny", ImVec2(btn_w, 28))) {
+            std::lock_guard<std::mutex> lk(s_tool_approval.mtx);
+            s_tool_approval.approved = false;
+            s_tool_approval.answered = true;
+            s_tool_approval.cv.notify_one();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopStyleColor();
+
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
 }
 
 
@@ -1062,6 +1412,8 @@ void render_settings_popup()
         static int  s_task_budget = 0;
         static bool s_web_search = false;
         static int  s_max_rounds = 15;
+        static bool s_fast_mode = false;
+        static bool s_redact_thinking = false;
 
 
         {
@@ -1074,6 +1426,8 @@ void render_settings_popup()
                 s_task_budget = g_sa_settings.task_budget_tokens;
                 s_web_search = g_sa_settings.web_search_enabled;
                 s_max_rounds = g_sa_settings.max_agentic_rounds;
+                s_fast_mode = g_sa_settings.fast_mode;
+                s_redact_thinking = g_sa_settings.redact_thinking;
                 s_ai_features_init = true;
             }
         }
@@ -1104,6 +1458,14 @@ void render_settings_popup()
         ImGui::Checkbox("Web Search", &s_web_search);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Allow the AI to search the web for information (Anthropic only)");
+
+        ImGui::Checkbox("Fast Mode", &s_fast_mode);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Enable fast-mode for lower latency responses (Anthropic only)");
+
+        ImGui::Checkbox("Redact Thinking", &s_redact_thinking);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Redact thinking blocks from the response for privacy (Anthropic only)");
 
         ImGui::Text("Max Agentic Rounds");
         ImGui::SetNextItemWidth(-1);
@@ -1332,6 +1694,8 @@ void render_settings_popup()
             g_sa_settings.task_budget_tokens = s_task_budget;
             g_sa_settings.web_search_enabled = s_web_search;
             g_sa_settings.max_agentic_rounds = s_max_rounds;
+            g_sa_settings.fast_mode = s_fast_mode;
+            g_sa_settings.redact_thinking = s_redact_thinking;
 
 
             editor_config::tab_size = (std::max)(s_ed_tab_size, 1);

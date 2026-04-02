@@ -8,6 +8,8 @@
 #include <windows.h>
 #include <iphlpapi.h>
 #include <intrin.h>
+#include <psapi.h>
+#include <dbghelp.h>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -26,17 +28,155 @@
 #include <vector>
 
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "Psapi.lib")
 
 using json = nlohmann::json;
 
 namespace
 {
+
+
+    constexpr uint64_t S_MAGIC_INIT = 0xA1DA'C0DE'DEAD'BEEFull;
+    std::atomic<uint64_t> s_state_a{0};
+    std::atomic<uint64_t> s_state_b{0};
+    std::atomic<uint64_t> s_state_c{0};
+    std::atomic<uint64_t> s_magic{S_MAGIC_INIT};
+
+    /* Legacy atomic kept for backward-compat with existing checks */
     std::atomic<bool> s_valid{false};
     std::atomic<bool> s_stop{false};
     std::thread       s_heartbeat_thread;
     std::mutex        s_state_mtx;
     std::string       s_plan;
     std::string       s_error;
+
+    /* Heartbeat freshness tracking */
+    std::atomic<int64_t> s_last_heartbeat_time{0};
+
+    /* Cached HWID for inline re-derivation check */
+    std::string s_cached_hwid;
+
+    /* Proof hash: FNV-1a of (session_token + hwid) */
+    std::atomic<uint64_t> s_proof_hash{0};
+
+    /* Code integrity hashes (populated at startup) */
+    struct code_section_hash_t {
+        uintptr_t base;
+        size_t    size;
+        uint64_t  hash;
+    };
+    std::vector<code_section_hash_t> s_code_hashes;
+    std::mutex s_code_hash_mtx;
+
+    /* ── Phase-2 hardening state ─────────────────────────── */
+
+    /* Additional obfuscated state pair: d + e == magic_2 */
+    constexpr uint64_t S_MAGIC2_INIT = 0xCAFE'BABE'1337'C0DEull;
+    std::atomic<uint64_t> s_state_d{0};
+    std::atomic<uint64_t> s_state_e{0};
+    std::atomic<uint64_t> s_magic_2{S_MAGIC2_INIT};
+
+
+    std::atomic<int64_t> s_gate_timestamps[standalone_license::GATE_SLOT_COUNT] = {};
+    std::atomic<uint64_t> s_gate_tokens[standalone_license::GATE_SLOT_COUNT] = {};
+    int64_t s_sweep_start_time = 0;
+
+
+    static const uint8_t S_STR_KEY = 0x5A;
+    std::string decode_status_string_impl(standalone_license::status_string_id id)
+    {
+
+
+        static const uint8_t strs[][40] = {
+             {0x09,0x3f,0x29,0x29,0x33,0x35,0x34,0x7a,0x28,0x3f,0x2c,0x35,0x31,0x3f,0x3e,0x00},
+             {0x13,0x34,0x2e,0x3f,0x3d,0x28,0x33,0x2e,0x23,0x7a,0x3c,0x3b,0x2f,0x36,0x2e,0x00},
+             {0x1d,0x3b,0x2e,0x3f,0x7a,0x39,0x32,0x3f,0x39,0x31,0x7a,0x29,0x2e,0x3b,0x36,0x3f,0x00},
+             {0x0a,0x28,0x35,0x35,0x3c,0x7a,0x37,0x33,0x29,0x37,0x3b,0x2e,0x39,0x32,0x00},
+             {0x12,0x0d,0x13,0x1e,0x7a,0x3e,0x28,0x33,0x3c,0x2e,0x00},
+             {0x12,0x3f,0x3b,0x28,0x2e,0x38,0x3f,0x3b,0x2e,0x7a,0x3f,0x22,0x2a,0x33,0x28,0x3f,0x3e,0x00},
+        };
+        if (id < 0 || id > 5) return "Error";
+        std::string result;
+        const uint8_t* p = strs[id];
+        while (*p) {
+            result += static_cast<char>(*p ^ S_STR_KEY);
+            ++p;
+        }
+        return result;
+    }
+
+
+    void set_obfuscated_valid(bool valid, uint64_t nonce_seed = 0)
+    {
+        if (valid) {
+
+            std::mt19937_64 rng(nonce_seed ? nonce_seed :
+                static_cast<uint64_t>(GetTickCount64()));
+            uint64_t a = rng();
+            uint64_t b = rng();
+            uint64_t magic = s_magic.load(std::memory_order_acquire);
+            uint64_t c = a ^ b ^ magic;
+            s_state_a.store(a, std::memory_order_release);
+            s_state_b.store(b, std::memory_order_release);
+            s_state_c.store(c, std::memory_order_release);
+            s_valid.store(true, std::memory_order_release);
+
+
+            uint64_t d = rng();
+            uint64_t magic2 = S_MAGIC2_INIT ^ nonce_seed;
+            s_magic_2.store(magic2, std::memory_order_release);
+            s_state_d.store(d, std::memory_order_release);
+            s_state_e.store(magic2 - d, std::memory_order_release);
+
+
+            if (s_sweep_start_time == 0)
+                s_sweep_start_time = static_cast<int64_t>(GetTickCount64());
+        } else {
+            s_state_a.store(0, std::memory_order_release);
+            s_state_b.store(0, std::memory_order_release);
+            s_state_c.store(0, std::memory_order_release);
+            s_valid.store(false, std::memory_order_release);
+
+
+            s_state_d.store(0, std::memory_order_release);
+            s_state_e.store(0, std::memory_order_release);
+        }
+    }
+
+
+    bool check_obfuscated_valid()
+    {
+        uint64_t a = s_state_a.load(std::memory_order_acquire);
+        uint64_t b = s_state_b.load(std::memory_order_acquire);
+        uint64_t c = s_state_c.load(std::memory_order_acquire);
+        uint64_t magic = s_magic.load(std::memory_order_acquire);
+        return (a ^ b ^ c) == magic;
+    }
+
+
+    uint64_t fnv1a(const void* data, size_t len)
+    {
+        uint64_t h = 14695981039346656037ULL;
+        const auto* p = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < len; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    uint64_t fnv1a_str(const std::string& s)
+    {
+        return fnv1a(s.data(), s.size());
+    }
+
+
+    void update_proof_hash(const std::string& session_token,
+                           const std::string& hwid)
+    {
+        std::string combined = session_token + "|" + hwid;
+        s_proof_hash.store(fnv1a_str(combined), std::memory_order_release);
+    }
 
     std::string get_cloud_function_host()
     {
@@ -247,10 +387,24 @@ namespace
         settings.license_ttl = response.value("ttl", static_cast<int64_t>(3600));
         settings.save();
 
+
+        uint64_t nonce_seed = fnv1a_str(settings.license_server_nonce);
+
+        s_magic.store(S_MAGIC_INIT ^ nonce_seed, std::memory_order_release);
+
+
+        s_cached_hwid = hwid;
+        update_proof_hash(settings.license_session_token, hwid);
+
+
+        s_last_heartbeat_time.store(
+            static_cast<int64_t>(std::chrono::steady_clock::now().time_since_epoch().count() / 1000000),
+            std::memory_order_release);
+
         std::lock_guard<std::mutex> lk(s_state_mtx);
         s_plan = settings.license_plan;
         s_error.clear();
-        s_valid.store(true, std::memory_order_release);
+        set_obfuscated_valid(true, nonce_seed);
     }
 
     bool try_validate_cached(settings_sa_t& settings, std::string& error_out)
@@ -300,33 +454,43 @@ namespace
         settings.license_issued_at = issued_at;
         settings.license_ttl = payload.value("ttl", settings.license_ttl);
 
+
+        s_cached_hwid = hwid;
+        update_proof_hash(settings.license_session_token, hwid);
+        uint64_t nonce_seed = fnv1a_str(settings.license_server_nonce);
+        s_magic.store(S_MAGIC_INIT ^ nonce_seed, std::memory_order_release);
+        s_last_heartbeat_time.store(
+            static_cast<int64_t>(std::chrono::steady_clock::now().time_since_epoch().count() / 1000000),
+            std::memory_order_release);
+
         std::lock_guard<std::mutex> lk(s_state_mtx);
         s_plan = settings.license_plan;
         s_error.clear();
-        s_valid.store(true, std::memory_order_release);
+        set_obfuscated_valid(true, nonce_seed);
         return true;
     }
 
     void heartbeat_worker(settings_sa_t* settings)
     {
-
-
         std::mt19937 rng(static_cast<unsigned>(
             std::chrono::steady_clock::now().time_since_epoch().count() ^
             GetCurrentProcessId()));
 
+        int consecutive_failures = 0;
+
         while (!s_stop.load(std::memory_order_acquire)) {
-            const int heartbeat_base_s = 25;
+
+            const int heartbeat_base_s = 15;
             const int heartbeat_jitter_s = 10;
             const int wait_s = heartbeat_base_s + static_cast<int>(rng() % (heartbeat_jitter_s + 1));
 
-            for (int waited = 0; waited < wait_s && !s_stop.load(std::memory_order_acquire); waited += 2)
-                std::this_thread::sleep_for(std::chrono::seconds(2));
+            for (int waited = 0; waited < wait_s && !s_stop.load(std::memory_order_acquire); waited += 1)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
 
             if (s_stop.load(std::memory_order_acquire))
                 break;
 
-            if (!s_valid.load(std::memory_order_acquire) || settings->license_key.empty() || settings->license_session_token.empty())
+            if (!check_obfuscated_valid() || settings->license_key.empty() || settings->license_session_token.empty())
                 continue;
 
             const std::string nonce = generate_nonce();
@@ -335,12 +499,18 @@ namespace
             if (!call_validation_endpoint(*settings, "heartbeat", settings->license_key,
                                           generate_hwid(), settings->license_session_token,
                                           nonce, error, response)) {
-                std::lock_guard<std::mutex> lk(s_state_mtx);
-                s_error = error;
-                s_valid.store(false, std::memory_order_release);
-                break;
+                consecutive_failures++;
+
+                if (consecutive_failures >= 2) {
+                    std::lock_guard<std::mutex> lk(s_state_mtx);
+                    s_error = error;
+                    set_obfuscated_valid(false);
+                    break;
+                }
+                continue;
             }
 
+            consecutive_failures = 0;
             apply_valid_response(*settings, settings->license_key, generate_hwid(), response);
         }
     }
@@ -364,10 +534,11 @@ namespace standalone_license
         if (!try_validate_cached(settings, error)) {
             std::lock_guard<std::mutex> lk(s_state_mtx);
             s_error = error;
-            s_valid.store(false, std::memory_order_release);
+            set_obfuscated_valid(false);
             return false;
         }
 
+        snapshot_code_hashes();
         restart_heartbeat(settings);
         return true;
     }
@@ -381,18 +552,20 @@ namespace standalone_license
         if (!call_validation_endpoint(settings, "validate", key, hwid, {}, nonce, error_out, response)) {
             std::lock_guard<std::mutex> lk(s_state_mtx);
             s_error = error_out;
-            s_valid.store(false, std::memory_order_release);
+            set_obfuscated_valid(false);
             return false;
         }
 
         apply_valid_response(settings, key, hwid, response);
+        snapshot_code_hashes();
         restart_heartbeat(settings);
         return true;
     }
 
     bool is_valid()
     {
-        return s_valid.load(std::memory_order_acquire);
+
+        return check_obfuscated_valid();
     }
 
     std::string plan()
@@ -418,22 +591,262 @@ namespace standalone_license
     bool check_subscription_tier()
     {
 
-
-        volatile bool v = s_valid.load(std::memory_order_acquire);
+        volatile bool v = check_obfuscated_valid();
         return v;
     }
 
     bool verify_entitlement_state()
     {
 
-
-        volatile bool v = s_valid.load(std::memory_order_acquire);
+        if (s_proof_hash.load(std::memory_order_acquire) == 0)
+            return false;
+        volatile bool v = check_obfuscated_valid();
         return v;
     }
 
     bool confirm_session_integrity()
     {
 
-        return s_valid.load(std::memory_order_acquire);
+        if (!s_valid.load(std::memory_order_acquire))
+            return false;
+
+        auto now_ms = std::chrono::steady_clock::now().time_since_epoch().count() / 1000000;
+        auto last = s_last_heartbeat_time.load(std::memory_order_acquire);
+        if (last > 0 && (now_ms - last) > 90000)
+            return false;
+        return check_obfuscated_valid();
+    }
+
+
+    double inline_proof_check_a()
+    {
+
+        uint64_t expected = s_proof_hash.load(std::memory_order_acquire);
+        if (expected == 0) return 0.0;
+
+
+        if (!check_obfuscated_valid()) return 0.0;
+
+        return 1.0;
+    }
+
+    bool inline_proof_check_b()
+    {
+
+        uint64_t a = s_state_a.load(std::memory_order_acquire);
+        uint64_t b = s_state_b.load(std::memory_order_acquire);
+        uint64_t c = s_state_c.load(std::memory_order_acquire);
+        uint64_t magic = s_magic.load(std::memory_order_acquire);
+
+
+        LARGE_INTEGER t0, t1, freq;
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&t0);
+        volatile uint64_t result = a ^ b ^ c;
+        QueryPerformanceCounter(&t1);
+
+        double elapsed_us = 1000000.0 * (t1.QuadPart - t0.QuadPart) / freq.QuadPart;
+        if (elapsed_us > 5000.0) return false;
+
+        return result == magic;
+    }
+
+    bool inline_proof_check_c()
+    {
+
+        if (s_cached_hwid.empty()) return false;
+        std::string current = generate_hwid();
+        if (current != s_cached_hwid) {
+
+            set_obfuscated_valid(false);
+            return false;
+        }
+        return true;
+    }
+
+    bool inline_proof_check_d()
+    {
+
+        int64_t last = s_last_heartbeat_time.load(std::memory_order_acquire);
+        if (last == 0) return false;
+
+        auto now_ms = static_cast<int64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count() / 1000000);
+        int64_t delta = now_ms - last;
+        return delta >= 0 && delta < 90000;
+    }
+
+    double compute_degradation_factor()
+    {
+        double factor = 1.0;
+
+
+        double a = inline_proof_check_a();
+        if (a < 0.5) factor *= 0.1;
+        else factor *= a;
+
+
+        if (!inline_proof_check_b()) factor *= 0.05;
+
+
+        if (!inline_proof_check_c()) factor *= 0.0;
+
+
+        if (!inline_proof_check_d()) factor *= 0.3;
+
+        return factor;
+    }
+
+
+    void snapshot_code_hashes()
+    {
+        std::lock_guard<std::mutex> lk(s_code_hash_mtx);
+        s_code_hashes.clear();
+
+        HMODULE hMod = GetModuleHandleW(nullptr);
+        if (!hMod) return;
+
+        auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(hMod);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+
+        auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+            reinterpret_cast<const uint8_t*>(hMod) + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+        const auto* sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+
+            if ((sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
+                (sec[i].Characteristics & IMAGE_SCN_MEM_READ &&
+                 !(sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)))
+            {
+                auto base = reinterpret_cast<uintptr_t>(hMod) + sec[i].VirtualAddress;
+                size_t size = sec[i].Misc.VirtualSize;
+                if (size > 0 && size < 100 * 1024 * 1024) {
+                    uint64_t h = fnv1a(reinterpret_cast<const void*>(base), size);
+                    s_code_hashes.push_back({base, size, h});
+                }
+            }
+        }
+    }
+
+    bool verify_code_hashes()
+    {
+        std::lock_guard<std::mutex> lk(s_code_hash_mtx);
+        if (s_code_hashes.empty()) return true;
+
+        for (const auto& entry : s_code_hashes) {
+            uint64_t current = fnv1a(reinterpret_cast<const void*>(entry.base), entry.size);
+            if (current != entry.hash) {
+
+                set_obfuscated_valid(false);
+                return false;
+            }
+        }
+        return true;
+    }
+
+
+    uint64_t inline_gate_check(gate_slot_t slot)
+    {
+
+
+        if (!check_obfuscated_valid()) return 0;
+
+        uint64_t proof = s_proof_hash.load(std::memory_order_acquire);
+        if (proof == 0) return 0;
+
+
+        uint64_t tick = static_cast<uint64_t>(GetTickCount64());
+        uint64_t a = s_state_a.load(std::memory_order_acquire);
+        uint64_t raw = a ^ static_cast<uint64_t>(slot) ^ proof ^ tick;
+        uint64_t token = fnv1a(&raw, sizeof(raw));
+
+
+        s_gate_timestamps[slot].store(
+            static_cast<int64_t>(tick), std::memory_order_release);
+        s_gate_tokens[slot].store(token, std::memory_order_release);
+
+        return token;
+    }
+
+    double verify_gate_token(gate_slot_t slot, uint64_t token)
+    {
+        if (token == 0) return 0.0;
+
+
+        int64_t last_ts = s_gate_timestamps[slot].load(std::memory_order_acquire);
+        int64_t now = static_cast<int64_t>(GetTickCount64());
+
+
+        if (last_ts == 0 || (now - last_ts) > 10000) return 0.0;
+
+
+        if (!check_obfuscated_valid()) return 0.0;
+
+        return 1.0;
+    }
+
+    bool cross_validation_sweep(int frame_counter)
+    {
+
+        if ((frame_counter % 300) != 0) return true;
+
+        if (!check_obfuscated_valid()) return false;
+
+        int64_t now = static_cast<int64_t>(GetTickCount64());
+        int stale_count = 0;
+
+        for (int i = 0; i < GATE_SLOT_COUNT; ++i) {
+            int64_t ts = s_gate_timestamps[i].load(std::memory_order_acquire);
+
+
+            if (ts == 0) {
+                if (now > s_sweep_start_time + 120000)
+                    stale_count++;
+                continue;
+            }
+
+            if ((now - ts) > 30000) {
+                stale_count++;
+            }
+        }
+
+
+        if (stale_count >= 3) {
+            set_obfuscated_valid(false);
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_error = decode_status_string_impl(str_gate_stale);
+            return false;
+        }
+
+
+        {
+            uint64_t d = s_state_d.load(std::memory_order_acquire);
+            uint64_t e = s_state_e.load(std::memory_order_acquire);
+            uint64_t m2 = s_magic_2.load(std::memory_order_acquire);
+            if ((d + e) != m2) {
+                set_obfuscated_valid(false);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    uint64_t compute_integrity_token(int frame_counter, int function_id)
+    {
+        uint64_t proof = s_proof_hash.load(std::memory_order_acquire);
+        uint64_t buf[3] = {
+            proof,
+            static_cast<uint64_t>(frame_counter),
+            static_cast<uint64_t>(function_id)
+        };
+        return fnv1a(buf, sizeof(buf));
+    }
+
+    std::string decode_status_string(int string_id)
+    {
+        return decode_status_string_impl(static_cast<status_string_id>(string_id));
     }
 }

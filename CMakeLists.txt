@@ -321,8 +321,11 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/emulation_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/code_editor.cpp"
             "${STANDALONE_ROOT}/core/disasm_view.cpp"
+            "${STANDALONE_ROOT}/core/hex_view.cpp"
             "${STANDALONE_ROOT}/core/chat_render.cpp"
             "${STANDALONE_ROOT}/core/mcp_client.cpp"
+            "${STANDALONE_ROOT}/core/mcp_marketplace.cpp"
+            "${STANDALONE_ROOT}/core/coding_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/debugger_tools_standalone.cpp"
             src/driver_loader.cpp
             driver/comm.cpp

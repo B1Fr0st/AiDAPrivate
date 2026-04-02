@@ -5,6 +5,7 @@
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
 #include "standalone_license.hpp"
+#include "mcp_standalone.hpp"
 #include "../helpers/globals.h"
 
 #include <httplib.h>
@@ -14,6 +15,8 @@
 #include <sstream>
 #include <cstdio>
 #include <cstring>
+#include <thread>
+#include <chrono>
 
 using json = nlohmann::json;
 
@@ -63,6 +66,19 @@ void standalone_ai_client_t::chat_async(
         return;
     }
 
+
+    {
+        uint64_t gt = standalone_license::inline_gate_check(
+            standalone_license::gate_ai_chat_async);
+        if (standalone_license::verify_gate_token(
+                standalone_license::gate_ai_chat_async, gt) < 0.5) {
+            if (on_complete)
+                on_complete(standalone_license::decode_status_string(
+                    standalone_license::str_internal_error));
+            return;
+        }
+    }
+
     std::lock_guard<std::mutex> lk(_worker_mtx);
     if (_worker.joinable())
         _worker.join();
@@ -109,6 +125,24 @@ std::string standalone_ai_client_t::chat_blocking(
 {
     if (!is_available())
         return "Error: AI client not configured.";
+
+
+    if (standalone_license::inline_proof_check_b() == 0) {
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(800 + (GetTickCount64() % 400)));
+        return "Error: Internal model routing failure. Please retry.";
+    }
+
+
+    {
+        uint64_t gt = standalone_license::inline_gate_check(
+            standalone_license::gate_ai_stream_cb);
+        if (standalone_license::verify_gate_token(
+                standalone_license::gate_ai_stream_cb, gt) < 0.5) {
+            return standalone_license::decode_status_string(
+                standalone_license::str_model_routing);
+        }
+    }
 
     auto prompt = build_chat_prompt(user_message, history);
     return do_generate(prompt, _settings.temperature, on_chunk, stop_check);
@@ -185,6 +219,11 @@ std::string standalone_ai_client_t::do_generate(
     ai_stream_chunk_t on_chunk,
     ai_stop_predicate_t stop_check)
 {
+
+    if (!standalone_license::inline_proof_check_c()) {
+        return "Error: API endpoint unreachable. Check your network connection.";
+    }
+
     const auto provider = _settings.get_active_profile_kind();
     if (provider == "gemini")      return generate_gemini(prompt, temperature, on_chunk, stop_check);
     if (provider == "openai_compatible") return generate_openai(prompt, temperature, on_chunk, stop_check);
@@ -420,6 +459,17 @@ std::string standalone_ai_client_t::generate_anthropic(
     const std::string& prompt, double temperature,
     ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
 {
+
+    {
+        uint64_t gt = standalone_license::inline_gate_check(
+            standalone_license::gate_ai_generate);
+        if (standalone_license::verify_gate_token(
+                standalone_license::gate_ai_generate, gt) < 0.5) {
+            return standalone_license::decode_status_string(
+                standalone_license::str_model_routing);
+        }
+    }
+
     std::string base_url = _settings.get_active_base_url();
     std::string model = _settings.get_active_model();
 
@@ -507,6 +557,12 @@ std::string standalone_ai_client_t::generate_anthropic(
 
 
     add_beta("structured-outputs-2025-12-15");
+
+    if (_settings.fast_mode)
+        add_beta("fast-mode-2025-09-01");
+
+    if (_settings.redact_thinking)
+        add_beta("redact-thinking-2025-09-01");
 
     if (!beta_features.empty())
         headers["anthropic-beta"] = beta_features;
@@ -710,4 +766,309 @@ std::string standalone_ai_client_t::build_chat_prompt(
     }
     prompt += "\nCurrent message:\n" + user_message;
     return prompt;
+}
+
+
+nlohmann::json standalone_ai_client_t::build_anthropic_tools(
+    const std::vector<mcp_standalone::tool_def_t>& tools)
+{
+    using json = nlohmann::json;
+    json arr = json::array();
+    for (auto& t : tools) {
+        json props = json::object();
+        json req   = json::array();
+        for (auto& p : t.params) {
+            json prop = {{"type", p.type}, {"description", p.description}};
+            props[p.name] = prop;
+            if (p.required) req.push_back(p.name);
+        }
+        json schema = {
+            {"type", "object"},
+            {"properties", props}
+        };
+        if (!req.empty()) schema["required"] = req;
+
+        json tool_obj = {
+            {"name", t.name},
+            {"description", t.description},
+            {"input_schema", schema}
+        };
+        arr.push_back(std::move(tool_obj));
+    }
+    return arr;
+}
+
+
+nlohmann::json standalone_ai_client_t::make_tool_result_block(
+    const std::string& tool_use_id,
+    const std::string& content,
+    bool is_error)
+{
+    using json = nlohmann::json;
+    json block = {
+        {"type", "tool_result"},
+        {"tool_use_id", tool_use_id},
+        {"content", content}
+    };
+    if (is_error) block["is_error"] = true;
+    return block;
+}
+
+
+ai_generation_result_t standalone_ai_client_t::generate_with_tools(
+    const nlohmann::json& messages,
+    const std::string& system_prompt,
+    const std::vector<mcp_standalone::tool_def_t>& tools,
+    ai_stream_chunk_t on_chunk)
+{
+    using json = nlohmann::json;
+    ai_generation_result_t result;
+
+
+    {
+        uint64_t gt = standalone_license::inline_gate_check(
+            standalone_license::gate_native_tool_use);
+        if (gt == 0) {
+            result.is_error = true;
+            result.text = "Error: License gate blocked native tool use.";
+            return result;
+        }
+    }
+
+    std::string base_url = _settings.get_active_base_url();
+    std::string model    = _settings.get_active_model();
+
+
+    std::string clean_model = model;
+    for (const char* suffix : {" (Max Effort)", " (High Effort)", " (Medium Effort)",
+                               " (Low Effort)", " (Standard)"}) {
+        auto pos = clean_model.find(suffix);
+        if (pos != std::string::npos) { clean_model.erase(pos); break; }
+    }
+
+
+    json system_block = {
+        {"type", "text"},
+        {"text", system_prompt}
+    };
+    if (_settings.prompt_caching)
+        system_block["cache_control"] = {{"type", "ephemeral"}};
+
+
+    json body = {
+        {"model", clean_model},
+        {"max_tokens", 16384},
+        {"messages", messages},
+        {"system", json::array({system_block})},
+        {"stream", true}
+    };
+
+
+    if (!tools.empty())
+        body["tools"] = build_anthropic_tools(tools);
+
+
+    if (_settings.thinking_enabled) {
+        body["thinking"] = {
+            {"type", "enabled"},
+            {"budget_tokens", (std::max)(_settings.thinking_budget, 1024)}
+        };
+    } else if (clean_model.find("thought") == std::string::npos) {
+        body["temperature"] = 0.0;
+    }
+
+
+    std::map<std::string, std::string> headers = _settings.get_active_headers();
+    headers["x-api-key"]          = _settings.get_active_api_key();
+    headers["anthropic-version"]  = "2023-06-01";
+    headers["Content-Type"]       = "application/json";
+
+
+    std::string beta_features;
+    auto add_beta = [&](const char* feature) {
+        if (!beta_features.empty()) beta_features += ",";
+        beta_features += feature;
+    };
+
+    add_beta("context-1m-2025-08-07");
+    if (_settings.thinking_enabled)
+        add_beta("interleaved-thinking-2025-05-14");
+    if (_settings.prompt_caching)
+        add_beta("prompt-caching-scope-2026-01-05");
+    if (_settings.web_search_enabled)
+        add_beta("web-search-2025-03-05");
+    if (_settings.task_budget_tokens > 0)
+        add_beta("task-budgets-2026-03-13");
+    if (_settings.effort_level >= 0 && _settings.effort_level <= 3) {
+        add_beta("effort-2025-11-24");
+        static const char* effort_names[] = {"low", "medium", "high", "max"};
+        body["effort"] = {{"level", effort_names[_settings.effort_level]}};
+    }
+    add_beta("advanced-tool-use-2025-11-20");
+    add_beta("token-efficient-tools-2026-03-28");
+    add_beta("structured-outputs-2025-12-15");
+    if (_settings.fast_mode)
+        add_beta("fast-mode-2025-09-01");
+    if (_settings.redact_thinking)
+        add_beta("redact-thinking-2025-09-01");
+    if (!beta_features.empty())
+        headers["anthropic-beta"] = beta_features;
+    if (_settings.task_budget_tokens > 0)
+        body["task_budget"] = {{"total", _settings.task_budget_tokens}};
+
+
+    auto client = get_or_create_client(base_url);
+    httplib::Headers h;
+    for (auto& [k, v] : headers) h.emplace(k, v);
+
+
+    struct block_state_t {
+        int    index = -1;
+        std::string type;
+        std::string id;
+        std::string name;
+        std::string json_accum;
+    };
+    std::map<int, block_state_t> blocks;
+
+    std::string sse_buffer;
+
+    httplib::Request req;
+    req.method = "POST";
+    req.path   = "/v1/messages";
+    req.headers = h;
+    req.headers.emplace("Content-Type", "application/json");
+    req.body = body.dump();
+    req.content_receiver = [&](const char* data, size_t len, uint64_t, uint64_t) -> bool {
+        if (_cancelled) return false;
+        sse_buffer.append(data, len);
+
+        size_t pos = 0;
+        while (pos < sse_buffer.size()) {
+            auto nl = sse_buffer.find('\n', pos);
+            if (nl == std::string::npos) break;
+            std::string line = sse_buffer.substr(pos, nl - pos);
+            pos = nl + 1;
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+
+            if (line == "data: [DONE]" || line == "data:[DONE]") continue;
+
+            std::string payload;
+            if (line.size() > 6 && line.substr(0, 6) == "data: ")
+                payload = line.substr(6);
+            else if (line.size() > 5 && line.substr(0, 5) == "data:")
+                payload = line.substr(5);
+            else
+                continue;
+
+            if (payload.empty()) continue;
+            auto j = json::parse(payload, nullptr, false);
+            if (j.is_discarded()) continue;
+
+            std::string event_type = j.value("type", "");
+
+
+            if (event_type == "message_start" && j.contains("message")) {
+                auto& u = j["message"]["usage"];
+                if (u.is_object()) {
+                    result.input_tokens = u.value("input_tokens", (int64_t)0);
+                    result.cache_read   = u.value("cache_read_input_tokens", (int64_t)0);
+                    result.cache_write  = u.value("cache_creation_input_tokens", (int64_t)0);
+                }
+            }
+
+
+            if (event_type == "content_block_start" && j.contains("content_block")) {
+                int idx = j.value("index", -1);
+                auto& cb = j["content_block"];
+                block_state_t bs;
+                bs.index = idx;
+                bs.type  = cb.value("type", "");
+                if (bs.type == "tool_use") {
+                    bs.id   = cb.value("id", "");
+                    bs.name = cb.value("name", "");
+                }
+                blocks[idx] = std::move(bs);
+            }
+
+
+            if (event_type == "content_block_delta" && j.contains("delta")) {
+                int idx = j.value("index", -1);
+                auto& delta = j["delta"];
+                std::string delta_type = delta.value("type", "");
+
+                if (delta_type == "text_delta") {
+                    std::string txt = delta.value("text", "");
+                    result.text += txt;
+                    if (on_chunk) on_chunk(txt);
+                }
+                else if (delta_type == "thinking_delta") {
+                    std::string th = delta.value("thinking", "");
+                    result.thinking += th;
+                    if (on_chunk) on_chunk("\x01THINK:" + th);
+                }
+                else if (delta_type == "input_json_delta") {
+                    auto it = blocks.find(idx);
+                    if (it != blocks.end())
+                        it->second.json_accum += delta.value("partial_json", "");
+                }
+            }
+
+
+            if (event_type == "content_block_stop") {
+                int idx = j.value("index", -1);
+                auto it = blocks.find(idx);
+                if (it != blocks.end() && it->second.type == "tool_use") {
+                    ai_tool_call_t tc;
+                    tc.id   = it->second.id;
+                    tc.name = it->second.name;
+                    tc.arguments = json::parse(it->second.json_accum, nullptr, false);
+                    if (tc.arguments.is_discarded())
+                        tc.arguments = json::object();
+                    result.tool_calls.push_back(std::move(tc));
+                }
+            }
+
+
+            if (event_type == "message_delta") {
+                if (j.contains("delta"))
+                    result.stop_reason = j["delta"].value("stop_reason", "");
+                if (j.contains("usage"))
+                    result.output_tokens = j["usage"].value("output_tokens", (int64_t)0);
+            }
+        }
+        sse_buffer.erase(0, pos);
+        return true;
+    };
+
+    auto res = client->send(req);
+
+    if (_cancelled) {
+        result.is_error = true;
+        result.text = "Error: Operation cancelled.";
+        return result;
+    }
+    if (!res) {
+        result.is_error = true;
+        result.text = "Error: Request failed: " + httplib::to_string(res.error());
+        return result;
+    }
+    if (res->status != 200) {
+        result.is_error = true;
+        result.text = "Error: API returned status " + std::to_string(res->status) +
+                      ": " + res->body.substr(0, 800);
+        return result;
+    }
+
+
+    cost_tracking::session_input_tokens  += result.input_tokens;
+    cost_tracking::session_output_tokens += result.output_tokens;
+    cost_tracking::session_cache_read    += result.cache_read;
+    cost_tracking::session_cache_write   += result.cache_write;
+    cost_tracking::session_request_count++;
+    cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
+        clean_model, result.input_tokens, result.output_tokens,
+        result.cache_read, result.cache_write);
+
+    return result;
 }

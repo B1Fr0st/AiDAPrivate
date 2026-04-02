@@ -727,5 +727,6 @@ namespace mcp_standalone
         net_security_tools::register_net_security_tools(srv);
         emulation_tools::register_emulation_tools(srv);
         debugger_tools::register_debugger_tools(srv);
+        coding_tools::register_coding_tools(srv);
     }
 }

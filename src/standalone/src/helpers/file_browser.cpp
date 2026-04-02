@@ -4,6 +4,7 @@
 
 #include "globals.h"
 #include "../core/zydis_disasm.hpp"
+#include "../core/standalone_license.hpp"
 
 #include <filesystem>
 #include <algorithm>
@@ -117,6 +118,14 @@ void file_browser::open_file(int idx)
     auto& ent = entries[idx];
     if (ent.is_dir) return;
 
+
+    {
+        uint64_t gt = standalone_license::inline_gate_check(
+            standalone_license::gate_file_browser_open);
+        if (standalone_license::verify_gate_token(
+                standalone_license::gate_file_browser_open, gt) < 0.5)
+            return;
+    }
 
     std::string ext;
     auto dot = ent.name.rfind('.');

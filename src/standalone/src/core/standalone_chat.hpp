@@ -11,6 +11,7 @@ void shutdown_standalone_chat();
 void tick_ai_chat();
 void poll_ai_chat();
 void render_settings_popup();
+void render_tool_approval_dialog();
 
 
 namespace mcp_client { class manager_t; }

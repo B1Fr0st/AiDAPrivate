@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include "standalone_driver.hpp"
+#include "standalone_license.hpp"
 #include "driver_loader.hpp"
 #include "comm.h"
 
@@ -203,6 +204,16 @@ namespace driver_bridge
 
     bool attach(uint32_t pid)
     {
+
+        {
+            uint64_t gt = standalone_license::inline_gate_check(
+                standalone_license::gate_driver_attach);
+            if (standalone_license::verify_gate_token(
+                    standalone_license::gate_driver_attach, gt) < 0.5) {
+                return false;
+            }
+        }
+
         std::lock_guard<std::mutex> lk(g_state_mtx);
         if (g_kernel_mode && device && device->is_connected()) {
             device->set_process_id(pid);
@@ -485,6 +496,17 @@ namespace driver_bridge
 
     bool read_memory(uint64_t address, size_t size, std::vector<uint8_t>& out)
     {
+
+        {
+            uint64_t gt = standalone_license::inline_gate_check(
+                standalone_license::gate_driver_read_mem);
+            if (standalone_license::verify_gate_token(
+                    standalone_license::gate_driver_read_mem, gt) < 0.5) {
+                out.clear();
+                return false;
+            }
+        }
+
         out.clear();
         HANDLE process = nullptr;
         bool kernel_mode = false;

@@ -6,6 +6,7 @@
 #pragma comment(lib, "shell32.lib")
 #include "mcp_standalone.hpp"
 #include "standalone_driver.hpp"
+#include "standalone_license.hpp"
 #include "zydis_disasm.hpp"
 #include "sandbox.hpp"
 #include <httplib.h>
@@ -252,6 +253,18 @@ json server_t::handle_tools_list(const json& id, const json&)
 
 json server_t::handle_tools_call(const json& id, const json& params)
 {
+
+    {
+        uint64_t gt = standalone_license::inline_gate_check(
+            standalone_license::gate_mcp_tool_exec);
+        if (standalone_license::verify_gate_token(
+                standalone_license::gate_mcp_tool_exec, gt) < 0.5) {
+            return make_error(id, -32000,
+                standalone_license::decode_status_string(
+                    standalone_license::str_session_revoked));
+        }
+    }
+
     if (!params.contains("name") || !params["name"].is_string())
         return make_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'name'");
 
