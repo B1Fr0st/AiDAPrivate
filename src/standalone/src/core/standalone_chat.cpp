@@ -227,6 +227,10 @@ std::string build_system_prompt()
 
 std::string execute_tool(const std::string& name, const json& arguments)
 {
+
+
+    (void)standalone_license::verify_entitlement_state();
+
     output_log::push(bottom_tab_t::mcp_log, "[tool] Executing: " + name);
 
 
@@ -280,6 +284,13 @@ std::string execute_tool(const std::string& name, const json& arguments)
 void run_agentic(std::string user_message,
                  std::vector<std::pair<std::string, std::string>> history)
 {
+
+
+    if (!standalone_license::is_valid()) {
+        post_update(ai_update_t::ERR, "Session expired. Please restart.");
+        return;
+    }
+
     post_update(ai_update_t::THINKING);
     output_log::push(bottom_tab_t::output, "[ai] New request: " + user_message.substr(0, 120) + (user_message.size() > 120 ? "..." : ""));
 
@@ -305,7 +316,7 @@ void run_agentic(std::string user_message,
             return;
         }
 
-        // Check task budget if set
+
         if (g_sa_settings.task_budget_tokens > 0 && budget_used >= g_sa_settings.task_budget_tokens) {
             output_log::push(bottom_tab_t::output, "[ai] Task budget exhausted (" + std::to_string(budget_used) + " tokens)");
             post_update(ai_update_t::ERR, "Task budget exhausted (" + std::to_string(budget_used) + " tokens used).");
@@ -327,7 +338,7 @@ void run_agentic(std::string user_message,
             return;
         }
 
-        // Track budget
+
         budget_used += (cost_tracking::session_input_tokens - pre_in) +
                        (cost_tracking::session_output_tokens - pre_out);
 
@@ -341,7 +352,7 @@ void run_agentic(std::string user_message,
             return;
         }
 
-        // Extract thinking markers from Anthropic extended thinking
+
         std::string thinking_content;
         std::string clean_response = response;
         {
@@ -356,7 +367,7 @@ void run_agentic(std::string user_message,
                     clean_response.erase(ts, te + think_end.size() - ts);
                 }
             }
-            // Also capture streaming thinking markers
+
             size_t p = 0;
             while ((p = clean_response.find(think_start, p)) != std::string::npos) {
                 size_t end = clean_response.find('\n', p + think_start.size());
@@ -1052,7 +1063,7 @@ void render_settings_popup()
         static bool s_web_search = false;
         static int  s_max_rounds = 15;
 
-        // Initialize once
+
         {
             static bool s_ai_features_init = false;
             if (!s_ai_features_init || s_first) {
@@ -1114,6 +1125,53 @@ void render_settings_popup()
         ImGui::InputInt("##sandbox_memory", &s_sandbox_memory, 0, 0);
         const char* network_modes[] = {"Off", "Default"};
         ImGui::Combo("Sandbox Network", &s_sandbox_network, network_modes, IM_ARRAYSIZE(network_modes));
+
+
+        ImGui::Separator();
+        ImGui::Text("Editor");
+
+        static int   s_ed_tab_size = 4;
+        static float s_ed_font_size = 14.0f;
+        static bool  s_ed_line_numbers = true;
+        static bool  s_ed_word_wrap = false;
+        static bool  s_ed_minimap = false;
+        static bool  s_ed_bracket_match = true;
+        static bool  s_ed_highlight_line = true;
+        static bool  s_ed_autocomplete = true;
+        static bool  s_ed_ghost_text = false;
+        {
+            static bool s_ed_init = false;
+            if (!s_ed_init) {
+                s_ed_tab_size = editor_config::tab_size;
+                s_ed_font_size = editor_config::font_size;
+                s_ed_line_numbers = editor_config::show_line_numbers;
+                s_ed_word_wrap = editor_config::word_wrap;
+                s_ed_minimap = editor_config::minimap;
+                s_ed_bracket_match = editor_config::bracket_match;
+                s_ed_highlight_line = editor_config::highlight_current_line;
+                s_ed_autocomplete = editor_config::auto_complete;
+                s_ed_ghost_text = g_sa_settings.ghost_text_enabled;
+                s_ed_init = true;
+            }
+        }
+
+        ImGui::Text("Tab Size");
+        ImGui::SetNextItemWidth(120.f);
+        ImGui::SliderInt("##ed_tab_size", &s_ed_tab_size, 1, 8);
+
+        ImGui::Text("Font Size");
+        ImGui::SetNextItemWidth(120.f);
+        ImGui::SliderFloat("##ed_font_size", &s_ed_font_size, 8.0f, 32.0f, "%.0f");
+
+        ImGui::Checkbox("Show Line Numbers", &s_ed_line_numbers);
+        ImGui::Checkbox("Word Wrap", &s_ed_word_wrap);
+        ImGui::Checkbox("Highlight Current Line", &s_ed_highlight_line);
+        ImGui::Checkbox("Bracket Matching", &s_ed_bracket_match);
+        ImGui::Checkbox("Minimap", &s_ed_minimap);
+        ImGui::Checkbox("Auto-Complete", &s_ed_autocomplete);
+        ImGui::Checkbox("Ghost Text (AI Suggestions)", &s_ed_ghost_text);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Show AI-generated completion suggestions as translucent text (Tab to accept)");
 
 
         ImGui::Separator();
@@ -1266,7 +1324,7 @@ void render_settings_popup()
             g_sa_settings.sandbox.memory_limit_mb = (std::max)(s_sandbox_memory, 64);
             g_sa_settings.sandbox.network_mode = s_sandbox_network == 1 ? "default" : "off";
 
-            // Persist new AI features
+
             g_sa_settings.thinking_enabled = s_thinking_enabled;
             g_sa_settings.thinking_budget = s_thinking_budget;
             g_sa_settings.effort_level = s_effort_level;
@@ -1274,6 +1332,21 @@ void render_settings_popup()
             g_sa_settings.task_budget_tokens = s_task_budget;
             g_sa_settings.web_search_enabled = s_web_search;
             g_sa_settings.max_agentic_rounds = s_max_rounds;
+
+
+            editor_config::tab_size = (std::max)(s_ed_tab_size, 1);
+            editor_config::font_size = s_ed_font_size;
+            editor_config::show_line_numbers = s_ed_line_numbers;
+            editor_config::word_wrap = s_ed_word_wrap;
+            editor_config::minimap = s_ed_minimap;
+            editor_config::bracket_match = s_ed_bracket_match;
+            editor_config::highlight_current_line = s_ed_highlight_line;
+            editor_config::auto_complete = s_ed_autocomplete;
+            g_sa_settings.ghost_text_enabled = s_ed_ghost_text;
+            g_sa_settings.editor_tab_size = s_ed_tab_size;
+            g_sa_settings.editor_font_size = s_ed_font_size;
+            g_sa_settings.editor_line_numbers = s_ed_line_numbers;
+            g_sa_settings.editor_word_wrap = s_ed_word_wrap;
 
             g_sa_settings.apply_legacy_fields_to_active_profile();
             g_sa_settings.sync_legacy_fields_from_active_profile();
@@ -1380,5 +1453,5 @@ std::string get_attached_process_name()
 
 unsigned long get_attached_pid()
 {
-    return 0; // driver bridge doesn't expose PID directly but status() contains it
+    return 0;
 }

@@ -1,7 +1,4 @@
-// standalone_compat.hpp — Compatibility layer for porting DLL agent-tools
-// to the standalone application.  Bridges the type/API differences between
-// the IDA plugin (agent_tools.hpp) and the standalone MCP server
-// (mcp_standalone.hpp).  Included by all *_standalone.cpp files.
+
 
 #pragma once
 
@@ -17,20 +14,15 @@
 #include <string>
 #include <vector>
 
-// IDA type alias
+
 using uchar = unsigned char;
 
-// IDA UI stubs — show_wait_box / hide_wait_box are progress dialogs
-// that only exist inside IDA.  In standalone they are no-ops.
+
 inline void show_wait_box(const char*, ...) {}
 inline void hide_wait_box() {}
 inline void replace_wait_box(const char*, ...) {}
 
-// IDA segment / patching stubs — these APIs manipulate the IDA database (IDB).
-// In standalone there is no IDB, so patch_idb code paths are effectively dead.
-// We provide minimal stubs so the code compiles; the runtime path never reaches
-// them because standalone callers don't set patch_idb=true, and even if they
-// did, getseg always returns nullptr so the block is skipped.
+
 #ifndef SEGPERM_READ
 #define SEGPERM_READ   1
 #define SEGPERM_WRITE  2
@@ -58,7 +50,7 @@ struct segment_t {
     int bitness        = 0;
     int align          = 0;
     int comb           = 0;
-    // alias used in the source
+
     uint64_t& startEA = start_ea;
     void update() {}
 };
@@ -69,8 +61,7 @@ inline void put_bytes(uint64_t, const void*, size_t) {}
 inline void patch_byte(uint64_t, unsigned char) {}
 inline bool is_mapped(uint64_t) { return false; }
 
-// IDA stubs provide qvsnprintf (pro.h) but NOT qsnprintf.
-// Many ported tool functions use qsnprintf, so we define it here.
+
 #ifndef qsnprintf_defined
 #define qsnprintf_defined
 inline int qsnprintf(char* buf, size_t n, const char* fmt, ...)
@@ -83,25 +74,20 @@ inline int qsnprintf(char* buf, size_t n, const char* fmt, ...)
 }
 #endif
 
-// ---------------------------------------------------------------------------
-// Address helpers — standalone replacements for IDA's helpers::parse_address
-// and helpers::format_address.  The IDA versions also resolve symbol names;
-// the standalone versions handle numeric hex/dec only (no symbol database).
-// ---------------------------------------------------------------------------
 
 inline bool sa_parse_address(const std::string& text, uint64_t& out)
 {
     if (text.empty()) return false;
     try {
         size_t idx = 0;
-        out = std::stoull(text, &idx, 0);   // handles 0x prefix and plain decimal
+        out = std::stoull(text, &idx, 0);
         return idx == text.size();
     } catch (...) {
         return false;
     }
 }
 
-// 1-arg overload matching the DLL's helpers::parse_address() that returns optional<ea_t>.
+
 inline std::optional<uint64_t> sa_parse_address(const std::string& text)
 {
     uint64_t val = 0;
@@ -117,13 +103,6 @@ inline std::string sa_format_address(uint64_t addr)
     return os.str();
 }
 
-// ---------------------------------------------------------------------------
-// Compatibility parameter struct — mirrors the DLL's tool_param_t aggregate
-// initialization which has 6 fields (name, type, desc, required,
-// enum_values, items_schema).  The standalone tool_param_t only has 4 fields.
-// This struct accepts the extra fields and silently discards them so that
-// the existing aggregate initializers compile unchanged.
-// ---------------------------------------------------------------------------
 
 struct compat_param_t
 {
@@ -131,39 +110,28 @@ struct compat_param_t
     std::string type;
     std::string description;
     bool        required = false;
-    // These two exist in the DLL but are ignored in standalone:
+
     std::vector<std::string>  enum_values   = {};
     nlohmann::json            items_schema  = {};
 
-    // Implicit conversion to standalone tool_param_t (drops extra fields).
+
     operator mcp_standalone::tool_param_t() const
     {
         return {name, type, description, required};
     }
 };
 
-// ---------------------------------------------------------------------------
-// Tool‐definition compatibility struct — mirrors the DLL's tool_definition_t
-// aggregate { name, category, description, params, handler, read_only }
-// but adapts to standalone's tool_def_t { name, description, params,
-// read_only, handler }.  Field order and extra fields differ.
-// ---------------------------------------------------------------------------
 
 struct compat_tool_def_t
 {
     std::string name;
-    std::string category;      // dropped — standalone has no category
+    std::string category;
     std::string description;
     std::vector<compat_param_t> params;
     std::function<mcp_standalone::tool_result_t(const nlohmann::json&)> handler;
     bool read_only = true;
 };
 
-// ---------------------------------------------------------------------------
-// register_compat — register a tool on the standalone MCP server using the
-// DLL's field order (name, category, desc, params, handler, read_only).
-// Converts compat_param_t → tool_param_t and reorders fields.
-// ---------------------------------------------------------------------------
 
 inline void register_compat(mcp_standalone::server_t& srv,
                             compat_tool_def_t          def)
@@ -182,9 +150,6 @@ inline void register_compat(mcp_standalone::server_t& srv,
     });
 }
 
-// ---------------------------------------------------------------------------
-// Shared utility functions — used by multiple standalone tool files.
-// ---------------------------------------------------------------------------
 
 inline std::string get_downloads_folder()
 {

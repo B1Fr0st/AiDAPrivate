@@ -1,5 +1,4 @@
-// standalone_tools_fwd.hpp — Forward declarations for ported tool registration
-// functions.  Called from register_standalone_tools() in mcp_standalone_tools.cpp.
+
 
 #pragma once
 

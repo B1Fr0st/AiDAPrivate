@@ -1,7 +1,5 @@
-﻿// net_security_tools_standalone.cpp — TLS/certificate/QUIC tools for AiDA Standalone.
-// Ported from agent_tools.cpp (DLL) net_security_tools namespace.
-// Uses net_security.hpp for TLS key extraction and certificate management,
-// and comm.h for kernel-level process memory scanning.
+﻿
+
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -612,7 +610,7 @@ tool_result_t tls_ensure_keylogfile(const json&) { return tool_result_t::error("
 #endif
 
 void register_net_security_tools(mcp_standalone::server_t& srv) {
-    
+
 
     register_compat(srv, {
         OBFSTR("tls_extract_keys"), OBFSTR("network_security"),
@@ -822,4 +820,3 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
 }
 
 }
-

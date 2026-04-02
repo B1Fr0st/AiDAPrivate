@@ -158,9 +158,6 @@ namespace search_tools
     void register_tools();
 }
 
-// debugger_tools namespace REMOVED — all runtime debugging tools now live
-// exclusively in the standalone executable (debugger_tools_standalone.cpp).
-// The DLL plugin provides only static analysis capabilities.
 
 namespace segment_tools
 {

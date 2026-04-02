@@ -1,6 +1,5 @@
-﻿// network_tools_standalone.cpp — Network analysis tools for AiDA Standalone.
-// Ported from agent_tools.cpp (DLL) network_tools namespace.
-// These tools use the kernel driver (comm.h) for live network inspection.
+﻿
+
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -1967,4 +1966,3 @@ void register_network_tools(mcp_standalone::server_t& srv) {
 }
 
 }
-

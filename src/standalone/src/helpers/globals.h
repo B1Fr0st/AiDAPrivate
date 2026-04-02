@@ -1,5 +1,6 @@
 #pragma once
 #include "imgui/imgui_internal.h"
+#include "../core/standalone_license.hpp"
 #include <iostream>
 #include <d3d11.h>
 #include <string>
@@ -53,7 +54,7 @@ struct ChatMessage {
 	bool is_user = false;
 	bool has_thinking = false;
 	bool streaming = false;
-	int64_t timestamp = 0;     // time_t epoch
+	int64_t timestamp = 0;
 	int input_tokens = 0;
 	int output_tokens = 0;
 	int cache_read_tokens = 0;
@@ -71,8 +72,8 @@ inline float g_chat_demo_timer = 0.f;
 inline int   g_chat_demo_stage = 0;
 
 struct ConversationSummary {
-	std::string id;        // filename stem (timestamp-based)
-	std::string title;     // first user message preview
+	std::string id;
+	std::string title;
 	int64_t     created = 0;
 	int         msg_count = 0;
 };
@@ -163,6 +164,9 @@ namespace code_editor
 
 	inline bool save() {
 		if (filepath.empty() || buffer.empty()) return false;
+
+
+		if (!standalone_license::is_valid()) return false;
 		FILE* f = nullptr;
 		fopen_s(&f, filepath.c_str(), "wb");
 		if (!f) return false;
@@ -317,20 +321,23 @@ namespace globals
 		inline bottom_tab_t active_bottom_tab = bottom_tab_t::output;
 
 
+		inline center_view_t active_center_view = center_view_t::welcome;
+
+
 		inline bool command_palette_open = false;
 		inline char command_palette_buf[128] = {};
 
-		// Process attach dialog
+
 		inline bool process_attach_open = false;
 		inline char process_filter_buf[128] = {};
 
-		// Driver status dialog
+
 		inline bool driver_status_open = false;
 
-		// Keyboard shortcuts dialog
+
 		inline bool shortcuts_dialog_open = false;
 
-		// Find bar state
+
 		inline bool find_bar_open = false;
 		inline char find_buf[256] = {};
 		inline char replace_buf[256] = {};
@@ -342,10 +349,10 @@ namespace globals
 		inline int  find_current_match = -1;
 		inline std::vector<int> find_match_positions;
 
-		// MCP servers dialog (separate from settings popup)
+
 		inline bool mcp_servers_dialog_open = false;
 
-		// About dialog
+
 		inline bool about_dialog_open = false;
 
 
@@ -498,7 +505,7 @@ namespace cost_tracking {
 
 	inline double estimate_cost(const std::string& model, int64_t in_tok, int64_t out_tok,
 	                            int64_t cache_read = 0, int64_t cache_write = 0) {
-		// prices per 1M tokens (USD) — approximate
+
 		double in_price = 3.0, out_price = 15.0;
 		double cache_read_price = 0.30, cache_write_price = 3.75;
 		if (model.find("opus") != std::string::npos || model.find("gpt-5") != std::string::npos) {

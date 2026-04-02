@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -82,12 +83,12 @@ namespace
             std::vector<unsigned char> buffer(len);
             auto* info = reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data());
             if (GetAdaptersInfo(info, &len) == NO_ERROR && info) {
-                // Collect all physical adapter MACs, sort for stability
+
                 std::vector<std::string> macs;
                 for (auto* a = info; a; a = a->Next) {
                     if (a->AddressLength == 0 || a->Type == MIB_IF_TYPE_LOOPBACK)
                         continue;
-                    // Skip common virtual adapters
+
                     std::string desc(a->Description);
                     bool is_virtual = false;
                     const char* virt_keywords[] = { "Virtual", "VPN", "Hyper-V", "VMware", "VirtualBox", "TAP-", "Tunnel" };
@@ -104,7 +105,7 @@ namespace
                     macs.push_back(mac_str);
                 }
                 std::sort(macs.begin(), macs.end());
-                // Mix the first physical adapter MAC (deterministic after sort)
+
                 if (!macs.empty()) {
                     for (char c : macs.front())
                         mix(static_cast<uint64_t>(c));
@@ -270,7 +271,7 @@ namespace
             return false;
         }
 
-        // HWID mismatch: try online revalidation before failing
+
         if (payload.value("hwid", "") != hwid) {
             const std::string nonce = generate_nonce();
             json response;
@@ -308,10 +309,19 @@ namespace
 
     void heartbeat_worker(settings_sa_t* settings)
     {
+
+
+        std::mt19937 rng(static_cast<unsigned>(
+            std::chrono::steady_clock::now().time_since_epoch().count() ^
+            GetCurrentProcessId()));
+
         while (!s_stop.load(std::memory_order_acquire)) {
-            const int64_t ttl = (std::max<int64_t>)(settings->license_ttl, 1800);
-            for (int64_t waited = 0; waited < ttl && !s_stop.load(std::memory_order_acquire); waited += 5)
-                std::this_thread::sleep_for(std::chrono::seconds(5));
+            const int heartbeat_base_s = 25;
+            const int heartbeat_jitter_s = 10;
+            const int wait_s = heartbeat_base_s + static_cast<int>(rng() % (heartbeat_jitter_s + 1));
+
+            for (int waited = 0; waited < wait_s && !s_stop.load(std::memory_order_acquire); waited += 2)
+                std::this_thread::sleep_for(std::chrono::seconds(2));
 
             if (s_stop.load(std::memory_order_acquire))
                 break;
@@ -402,5 +412,28 @@ namespace standalone_license
         s_stop.store(true, std::memory_order_release);
         if (s_heartbeat_thread.joinable())
             s_heartbeat_thread.join();
+    }
+
+
+    bool check_subscription_tier()
+    {
+
+
+        volatile bool v = s_valid.load(std::memory_order_acquire);
+        return v;
+    }
+
+    bool verify_entitlement_state()
+    {
+
+
+        volatile bool v = s_valid.load(std::memory_order_acquire);
+        return v;
+    }
+
+    bool confirm_session_integrity()
+    {
+
+        return s_valid.load(std::memory_order_acquire);
     }
 }

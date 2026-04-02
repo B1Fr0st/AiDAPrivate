@@ -1,13 +1,9 @@
-﻿// driver_tools_standalone.cpp — Kernel driver interaction tools for AiDA Standalone.
-// Ported from agent_tools.cpp (DLL) driver_tools namespace (~50 tools).
-// These tools use comm.h for kernel-level process inspection, memory R/W,
-// module dumping, pattern scanning, network enumeration, page guard, etc.
-// IDB patching (patch_idb) is stubbed: getseg()/put_bytes()/etc. are no-ops
-// in standalone since there is no IDA database.
+﻿
+
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <winsock2.h>   // network tools in driver_tools use sockaddr structs
+#include <winsock2.h>
 #include <ws2tcpip.h>
 
 #include "standalone_compat.hpp"
@@ -644,7 +640,7 @@ tool_result_t driver_read_memory(const json& params)
     std::size_t size = params.value("size", 256);
     if (size > 65536)
         return tool_result_t::error(OBFSTR("Size too large (max 65536)"));
-    /* standalone: anti-RE check removed */
+
 
     std::vector<std::uint8_t> buffer(size);
     std::size_t bytes_read = device->read_raw(*ea_opt, buffer.data(), size);
@@ -688,7 +684,7 @@ tool_result_t driver_write_memory(const json& params)
     auto ea_opt = sa_parse_address(params["address"].get<std::string>());
     if (!ea_opt)
         return tool_result_t::error(OBFSTR("Invalid address"));
-    /* standalone: anti-RE check removed */
+
 
     std::vector<std::uint8_t> bytes;
     std::string parse_error;
@@ -941,10 +937,6 @@ static void cleanup_exception_directory(
         msg(OBFSTR_C("AiDA: Cleaned %d invalid runtime function entries from exception directory\n"), cleaned);
 }
 
-// ---------------------------------------------------------------------------
-// Utility functions ported from DLL agent_tools.cpp file-scope area.
-// These were used by driver_tools namespace tools but are not IDA-dependent.
-// ---------------------------------------------------------------------------
 
 struct pe_fix_result_t
 {
@@ -3121,10 +3113,6 @@ static iat_rebuild_result_t full_iat_scan_and_rebuild(
     return result;
 }
 
-// ---------------------------------------------------------------------------
-// End of utility functions ported from DLL
-// ---------------------------------------------------------------------------
-
 
 static std::string get_ldr_module_file_path(
     voyager::device_t* dev,
@@ -4040,7 +4028,7 @@ tool_result_t driver_dump_module(const json& params)
     }
     if (base == 0 || base == 0xFFFFFFFFFFFFFFFFULL)
         return tool_result_t::error(OBFSTR("Invalid module base. Provide 'address' or attach to a process first."));
-    /* standalone: anti-RE check removed */
+
 
     if (!have_resolved_module)
         have_resolved_module = find_ldr_module_by_base(static_cast<std::uint64_t>(base), &resolved_module);
@@ -4574,7 +4562,7 @@ tool_result_t driver_scan_pattern(const json& params)
 
     if ((end_addr - start_addr) > MAX_SCAN_SIZE)
         end_addr = start_addr + MAX_SCAN_SIZE;
-    /* standalone: anti-RE check removed */
+
 
     std::vector<std::uint8_t> pat;
     std::vector<bool> mask;
@@ -4678,7 +4666,7 @@ tool_result_t driver_read_string(const json& params)
 
     std::size_t max_len = params.value("max_length", 512);
     std::string type    = params.value("type", "auto");
-    /* standalone: anti-RE check removed */
+
 
     std::vector<std::uint8_t> buf(max_len * 2 + 4, 0);
     std::size_t got = device->read_raw(*ea_opt, buf.data(), buf.size());
@@ -4751,7 +4739,7 @@ tool_result_t driver_read_pointer_chain(const json& params)
             }
         }
     }
-    /* standalone: anti-RE check removed */
+
 
     json chain = json::array();
     std::uint64_t current = *ea_opt;
@@ -4759,7 +4747,7 @@ tool_result_t driver_read_pointer_chain(const json& params)
 
     for (std::size_t i = 0; i < offsets.size(); i++)
     {
-    /* standalone: anti-RE check removed */
+
         std::uint64_t ptr = device->read<std::uint64_t>(current);
         if (ptr == 0)
         {
@@ -6141,7 +6129,7 @@ tool_result_t driver_call_function(const json& params)
         return tool_result_t::error(OBFSTR("Invalid function address."));
 
     std::uint64_t func_addr = static_cast<std::uint64_t>(*func_opt);
-    /* standalone: anti-RE check removed */
+
 
     const bool dry_run = params.value("dry_run", false);
     const bool unsafe_confirmed =
@@ -6374,7 +6362,7 @@ tool_result_t driver_query_memory(const json& params)
         address = sa_parse_address(params["address"].get<std::string>()).value_or(0);
     if (address == 0)
         address = device->get_base_address();
-    /* standalone: anti-RE check removed */
+
 
     voyager::device_t::memory_region_info info{};
     if (!device->query_memory(address, info))
@@ -6432,7 +6420,7 @@ tool_result_t driver_protect_memory(const json& params)
         else
             size = params["size"].get<std::uint64_t>();
     }
-    /* standalone: anti-RE check removed */
+
 
     std::uint32_t new_protect = 0x40;
     if (params.contains("protect")) {
@@ -6563,7 +6551,7 @@ tool_result_t driver_set_hw_breakpoint(const json& params)
     if (params.contains("address"))
         address = sa_parse_address(params["address"].get<std::string>()).value_or(0);
     if (address == 0) return tool_result_t::error(OBFSTR("Address is required"));
-    /* standalone: anti-RE check removed */
+
 
     int index = 0;
     if (params.contains("index")) index = params["index"].get<int>();
@@ -6669,7 +6657,7 @@ tool_result_t driver_resolve_export(const json& params)
         module_base = device->get_base_address();
     if (module_base == 0)
         return tool_result_t::error(OBFSTR("Module base required. Provide module_base or module/module_name."));
-    /* standalone: anti-RE check removed */
+
 
     std::uint64_t addr = device->resolve_export(module_base, export_name.c_str());
     if (addr == 0)
@@ -6702,7 +6690,7 @@ tool_result_t driver_virtual_to_physical(const json& params)
     if (params.contains("address"))
         vaddr = sa_parse_address(params["address"].get<std::string>()).value_or(0);
     if (vaddr == 0) return tool_result_t::error(OBFSTR("Address is required"));
-    /* standalone: anti-RE check removed */
+
 
     std::uint64_t paddr = device->virtual_to_physical(vaddr);
     if (paddr == 0)
@@ -6714,14 +6702,7 @@ tool_result_t driver_virtual_to_physical(const json& params)
     return tool_result_t::ok(OBFSTR("Virtual -> Physical translation"), result);
 }
 
-// ---------------------------------------------------------------------------
-// DeferredActionManager – standalone declaration
-// ---------------------------------------------------------------------------
-// In IDA, deferred tool execution goes through exec_request_t / execute_sync
-// to marshal calls onto the main thread. Standalone has no such constraint;
-// exec_request_t::execute() is invoked directly.
 
-// Minimal IDA-compat stubs so the existing execute_deferred_tools code compiles.
 #ifndef idaapi
 #define idaapi
 #endif
@@ -6740,9 +6721,9 @@ struct exec_request_t
 };
 static constexpr int MFF_READ  = 0;
 static constexpr int MFF_WRITE = 1;
-inline int execute_sync(exec_request_t& req, int /*mff_flag*/)
+inline int execute_sync(exec_request_t& req, int )
 {
-    // Standalone: just run directly – no IDA main-thread marshalling needed.
+
     return static_cast<int>(req.execute());
 }
 
@@ -6820,9 +6801,7 @@ private:
     std::atomic<bool>                                 _shutdown{false};
 };
 
-// Bridge: look up a tool by name in the standalone MCP server registry.
-// In the DLL this used ToolRegistry; here we keep a pointer to the server's
-// tool vector that is set during register_driver_tools().
+
 static const std::vector<mcp_standalone::tool_def_t>* s_deferred_tool_list = nullptr;
 
 static const mcp_standalone::tool_def_t* get_deferred_tool_def(const std::string& name)
@@ -6841,7 +6820,6 @@ static tool_result_t execute_deferred_tool(const std::string& name, const json& 
     return def->handler(params);
 }
 
-// ---------------------------------------------------------------------------
 
 DeferredActionManager& DeferredActionManager::instance()
 {
@@ -10866,7 +10844,7 @@ tool_result_t driver_assemble(const json& params)
         auto write_addr = sa_parse_address(params["write_to"].get<std::string>());
         if (write_addr && device->is_connected() && device->get_process_id() != 0)
         {
-    /* standalone: anti-RE check removed */
+
             std::size_t written = device->write_raw(*write_addr, output.data(), output.size());
             result["written_to"] = sa_format_address(static_cast<uint64_t>(*write_addr));
             result["bytes_written"] = written;
@@ -11336,7 +11314,7 @@ tool_result_t driver_set_page_guard(const json& params)
 
     const std::uint64_t target_addr = *addr_opt;
     const std::size_t size = params.value("size", 4096);
-    /* standalone: anti-RE check removed */
+
 
     if (operation == "set")
     {
@@ -11408,7 +11386,7 @@ tool_result_t driver_set_page_guard(const json& params)
 
 void register_driver_tools(mcp_standalone::server_t& srv)
 {
-    // Let DeferredActionManager look up tools by name from the MCP server.
+
     s_deferred_tool_list = &srv.get_tools();
 
         register_compat(srv, {

@@ -427,7 +427,7 @@ void helpers::add_key(const char* label, CKeybind* keybind)
 		menu_open[keybind] = false;
 }
 
-// --- Conversation persistence ---
+
 #include <filesystem>
 #include <shlobj.h>
 
@@ -2235,34 +2235,116 @@ void helpers::render_title()
 
 	{
 
-		std::string fn_disp = "No file";
-		bool has_file = false;
-		if (code_editor::active && !code_editor::filename.empty()) {
-			fn_disp = code_editor::filename;
-			if (code_editor::dirty) fn_disp += " *";
-			has_file = true;
-		} else if (g_disasm.file.loaded && !g_disasm.file.filename.empty()) {
-			fn_disp = g_disasm.file.filename;
-			has_file = true;
-		}
-		if (has_file) {
-			float avail_w = rbtn_x0 - hx0 - hdr_pad * 2.f - 4.f;
-			ImVec2 full_ts = ImGui::CalcTextSize(fn_disp.c_str());
-			if (full_ts.x > avail_w && fn_disp.size() > 12) {
-				while (fn_disp.size() > 6) {
-					fn_disp.pop_back();
-					std::string test = fn_disp + "...";
-					if (ImGui::CalcTextSize(test.c_str()).x <= avail_w) { fn_disp = test; break; }
+
+		if (!file_tabs::tabs.empty()) {
+			const float tab_pad_x = 10.f;
+			const float tab_gap   = 2.f;
+			const float close_sz  = 10.f;
+			const float tab_h     = row_h - 2.f;
+			float tab_x = hx0 + hdr_pad;
+			float tab_y = r1_cy - tab_h * 0.5f;
+			float max_tab_x = rbtn_x0 - 8.f;
+
+			int close_idx = -1;
+			int click_idx = -1;
+
+			for (int ti = 0; ti < (int)file_tabs::tabs.size(); ti++) {
+				auto& tab = file_tabs::tabs[ti];
+				bool is_active = (ti == file_tabs::active_tab);
+
+
+				std::string label = tab.filename;
+				if (tab.dirty) label += " *";
+
+				ImVec2 lts = ImGui::CalcTextSize(label.c_str());
+				float tw = tab_pad_x * 2.f + lts.x + close_sz + 6.f;
+
+
+				if (tab_x + tw > max_tab_x) break;
+
+				float tx0 = tab_x, ty0 = tab_y;
+				float tx1 = tab_x + tw, ty1 = tab_y + tab_h;
+
+				bool tab_hov = ImGui::IsMouseHoveringRect(ImVec2(tx0, ty0), ImVec2(tx1, ty1), false);
+
+
+				if (is_active) {
+					wdl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
+						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
+
+					wdl->AddLine(ImVec2(tx0 + 2.f, ty1), ImVec2(tx1 - 2.f, ty1),
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+				} else if (tab_hov) {
+					wdl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
+						IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
 				}
+
+
+				ImU32 tab_col = is_active ? ac_full
+				              : IM_COL32(170, 175, 190, (int)((tab_hov ? 220.f : 160.f)*a));
+				wdl->AddText(ImVec2(tx0 + tab_pad_x, ty0 + (tab_h - lts.y) * 0.5f),
+					tab_col, label.c_str());
+
+
+				float cx0 = tx1 - tab_pad_x - close_sz;
+				float cy0 = ty0 + (tab_h - close_sz) * 0.5f;
+				float cx1 = cx0 + close_sz, cy1 = cy0 + close_sz;
+				bool close_hov = ImGui::IsMouseHoveringRect(ImVec2(cx0, cy0), ImVec2(cx1, cy1), false);
+				if (close_hov) {
+					wdl->AddRectFilled(ImVec2(cx0 - 1, cy0 - 1), ImVec2(cx1 + 1, cy1 + 1),
+						IM_COL32(255,80,80,(int)(40*a)), 3.f);
+				}
+				ImU32 close_col = close_hov
+					? IM_COL32(255,100,100,(int)(220*a))
+					: IM_COL32(150,150,160,(int)((is_active ? 140.f : 80.f)*a));
+				float cmx = (cx0 + cx1) * 0.5f, cmy = (cy0 + cy1) * 0.5f;
+				float cr = 3.f;
+				wdl->AddLine(ImVec2(cmx - cr, cmy - cr), ImVec2(cmx + cr, cmy + cr), close_col, 1.2f);
+				wdl->AddLine(ImVec2(cmx + cr, cmy - cr), ImVec2(cmx - cr, cmy + cr), close_col, 1.2f);
+
+
+				if (close_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+					close_idx = ti;
+				else if (tab_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+					click_idx = ti;
+
+
+				if (ti < (int)file_tabs::tabs.size() - 1) {
+					wdl->AddLine(ImVec2(tx1, ty0 + 3.f), ImVec2(tx1, ty1 - 3.f),
+						IM_COL32(255,255,255,(int)(8*a)), 1.f);
+				}
+
+				tab_x = tx1 + tab_gap;
 			}
+
+
+			if (close_idx >= 0)
+				file_tabs::close_tab(close_idx);
+			else if (click_idx >= 0 && click_idx != file_tabs::active_tab) {
+				file_tabs::active_tab = click_idx;
+				auto& t = file_tabs::tabs[click_idx];
+				std::string content;
+				FILE* f = nullptr;
+				fopen_s(&f, t.filepath.c_str(), "rb");
+				if (f) {
+					fseek(f, 0, SEEK_END);
+					long sz = ftell(f);
+					fseek(f, 0, SEEK_SET);
+					content.resize(sz);
+					fread(&content[0], 1, sz, f);
+					fclose(f);
+				}
+				code_editor::load(content, t.filename, t.filepath);
+			}
+
+		} else {
+
+			const char* fn_disp = "No file";
+			ImVec2 fn_ts = ImGui::CalcTextSize(fn_disp);
+			float  fn_y  = r1_cy - fn_ts.y * 0.5f;
+			wdl->AddText(ImVec2(hx0 + hdr_pad, fn_y),
+				IM_COL32(120,120,140,(int)(140*a)), fn_disp);
 		}
-		ImVec2 fn_ts = ImGui::CalcTextSize(fn_disp.c_str());
-		float  fn_y  = r1_cy - fn_ts.y * 0.5f;
-		wdl->AddText(ImVec2(hx0 + hdr_pad, fn_y),
-			has_file
-				? ac_full
-				: IM_COL32(120,120,140,(int)(140*a)),
-			fn_disp.c_str());
 
 
 		bool cf_clicked = ghost_btn("Choose File",
@@ -2278,13 +2360,20 @@ void helpers::render_title()
 					disasm::decode_section(g_disasm.file);
 			}
 		}
+
+
+		if (file_tabs::active_tab >= 0 && file_tabs::active_tab < (int)file_tabs::tabs.size())
+			file_tabs::tabs[file_tabs::active_tab].dirty = code_editor::dirty;
 	}
 
 
 	{
 
-		// Show active file/view description
-		const char* desc_text = code_editor::active ? "Code Editor" : (g_disasm.file.loaded ? "Disassembly" : "");
+
+		const char* desc_text = "";
+		if (code_editor::active) desc_text = "Code Editor";
+		else if (hex_view::g_state.active) desc_text = "Hex View";
+		else if (g_disasm.file.loaded) desc_text = "Disassembly";
 		if (desc_text[0]) {
 			ImVec2 dt_ts = ImGui::CalcTextSize(desc_text);
 			float  dt_ty = r2_cy - dt_ts.y * 0.5f;
@@ -2298,14 +2387,14 @@ void helpers::render_title()
 			rbtn_x0, r2_cy, rbtn_w);
 
 		if (run_clicked && !s_sandbox_running) {
-			// Determine what to run
+
 			std::string exe_path;
 			std::string work_dir;
 
 			if (g_disasm.file.loaded && !g_disasm.file.path.empty()) {
 				exe_path = g_disasm.file.path;
 			} else if (code_editor::active && !file_tabs::tabs.empty() && file_tabs::active_tab < (int)file_tabs::tabs.size()) {
-				// For code files, try to find compiled output or run as script
+
 				auto& tab = file_tabs::tabs[file_tabs::active_tab];
 				exe_path = tab.filepath;
 			}
@@ -2315,7 +2404,7 @@ void helpers::render_title()
 				output_log::push(bottom_tab_t::sandbox_log, "[Sandbox] Starting: " + exe_path);
 
 				std::thread([exe_path, work_dir]() {
-					// Convert narrow strings to wide for sandbox API
+
 					auto to_wide = [](const std::string& s) -> std::wstring {
 						if (s.empty()) return {};
 						int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
@@ -2365,14 +2454,25 @@ void helpers::render_title()
 	{
 
 
-	if (code_editor::active && !code_editor::buffer.empty())
+	auto cv = globals::ui::active_center_view;
+
+
+	if (cv == center_view_t::welcome) {
+		if (code_editor::active && !code_editor::buffer.empty())
+			cv = center_view_t::code_editor;
+		else if (g_disasm.file.loaded && !g_disasm.file.instrs.empty())
+			cv = center_view_t::disassembly;
+		else if (hex_view::g_state.active)
+			cv = center_view_t::hex_view;
+	}
+
+	float vw = center_w - di_pad * 2.f;
+	float vh = disasm_child_h - di_pad * 2.f;
+
+	if (cv == center_view_t::code_editor && code_editor::active && !code_editor::buffer.empty())
 	{
-		float tw = center_w - di_pad * 2.f;
-		float th = disasm_child_h - di_pad * 2.f;
-
-
 		ImGui::SetCursorPos(ImVec2(0.f, 0.f));
-		code_editor_widget::render(0.f, 0.f, tw, th, a, ax3, ay3, az3);
+		code_editor_widget::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
 
 
 		if (ID3D11ShaderResourceView* icon_srv = get_active_theme_icon()) {
@@ -2391,14 +2491,14 @@ void helpers::render_title()
 				src_h = (float)g_theme_icon_h[icon_idx];
 			}
 			if (src_w > 0.f && src_h > 0.f) {
-				const float max_h = th * 0.38f;
-				const float max_w = tw * 0.28f;
+				const float max_h = vh * 0.38f;
+				const float max_w = vw * 0.28f;
 				const float scale = std::min(max_w / src_w, max_h / src_h);
 				const float draw_w = src_w * scale;
 				const float draw_h = src_h * scale;
 				const float icon_pad = 18.f;
-				const ImVec2 img_min(torig.x + tw - draw_w - icon_pad,
-				                     torig.y + th - draw_h - icon_pad);
+				const ImVec2 img_min(torig.x + vw - draw_w - icon_pad,
+				                     torig.y + vh - draw_h - icon_pad);
 				const ImVec2 img_max(img_min.x + draw_w, img_min.y + draw_h);
 				tdl->AddImage((ImTextureID)icon_srv, img_min, img_max,
 					ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, (int)(172 * a)));
@@ -2406,65 +2506,63 @@ void helpers::render_title()
 		}
 	}
 
+
+	else if (cv == center_view_t::hex_view && hex_view::g_state.active)
+	{
+		hex_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::disassembly && g_disasm.file.loaded && !g_disasm.file.instrs.empty())
+	{
+		disasm_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3, g_disasm, dt);
+	}
+
 	else
 	{
-		float iw = center_w - di_pad * 2.f;
-		float ih = disasm_child_h - di_pad * 2.f;
 
-		const bool has_instrs = !g_disasm.file.instrs.empty();
-		if (!has_instrs)
-		{
+		ImDrawList* cdl  = ImGui::GetWindowDrawList();
+		ImVec2      orig = ImGui::GetWindowPos();
 
-			ImDrawList* cdl  = ImGui::GetWindowDrawList();
-			ImVec2      orig = ImGui::GetWindowPos();
-
-			ID3D11ShaderResourceView* icon_srv = get_active_theme_icon();
-			if (icon_srv) {
-				int icon_idx = g_sa_settings.theme_icon_index;
-				if (custom_themes::active_custom >= 0 &&
-				    custom_themes::active_custom < (int)custom_themes::list.size())
-					icon_idx = custom_themes::list[custom_themes::active_custom].icon_index;
-				float src_w = 0.f, src_h = 0.f;
-				if (icon_idx < 0 && g_custom_theme_icon_w > 0 && g_custom_theme_icon_h > 0) {
-					src_w = (float)g_custom_theme_icon_w;
-					src_h = (float)g_custom_theme_icon_h;
-				} else {
-					if (icon_idx < 0) icon_idx = 3;
-					src_w = (float)g_theme_icon_w[icon_idx];
-					src_h = (float)g_theme_icon_h[icon_idx];
-				}
-				if (src_w > 0 && src_h > 0) {
-					float window_h = ImGui::GetWindowHeight();
-					float max_h = window_h * 0.75f;
-					float max_w = iw * 0.6f;
-					float scale = std::min(max_w / src_w, max_h / src_h);
-					float dw = src_w * scale;
-					float dh = src_h * scale;
-					float ix = orig.x + iw * 0.5f - dw * 0.5f;
-					float iy = orig.y + window_h * 0.5f - dh * 0.5f - 20.f;
-					cdl->AddImage((ImTextureID)icon_srv,
-						ImVec2(ix, iy), ImVec2(ix + dw, iy + dh),
-						ImVec2(0, 0), ImVec2(1, 1),
-						IM_COL32(255, 255, 255, (int)(200 * a)));
-				}
+		ID3D11ShaderResourceView* icon_srv = get_active_theme_icon();
+		if (icon_srv) {
+			int icon_idx = g_sa_settings.theme_icon_index;
+			if (custom_themes::active_custom >= 0 &&
+			    custom_themes::active_custom < (int)custom_themes::list.size())
+				icon_idx = custom_themes::list[custom_themes::active_custom].icon_index;
+			float src_w = 0.f, src_h = 0.f;
+			if (icon_idx < 0 && g_custom_theme_icon_w > 0 && g_custom_theme_icon_h > 0) {
+				src_w = (float)g_custom_theme_icon_w;
+				src_h = (float)g_custom_theme_icon_h;
+			} else {
+				if (icon_idx < 0) icon_idx = 3;
+				src_w = (float)g_theme_icon_w[icon_idx];
+				src_h = (float)g_theme_icon_h[icon_idx];
 			}
-
-			const char* hint = !g_disasm.file.err.empty()     ? g_disasm.file.err.c_str()
-				             : !g_disasm.file.loaded           ? "Choose a file to begin"
-				             :                                   "Click 'Run' to execute in sandbox";
-			ImDrawList* cdl2 = ImGui::GetWindowDrawList();
-			ImVec2      orig2 = ImGui::GetWindowPos();
-			ImVec2 ht2 = ImGui::CalcTextSize(hint);
-			float  window_h = ImGui::GetWindowHeight();
-			cdl2->AddText(ImVec2(orig2.x + iw*0.5f - ht2.x*0.5f, orig2.y + window_h * 0.85f - ht2.y*0.5f),
-				IM_COL32(100,100,120,(int)(120*a)), hint);
+			if (src_w > 0 && src_h > 0) {
+				float window_h = ImGui::GetWindowHeight();
+				float max_h = window_h * 0.75f;
+				float max_w = vw * 0.6f;
+				float scale = std::min(max_w / src_w, max_h / src_h);
+				float dw = src_w * scale;
+				float dh = src_h * scale;
+				float ix = orig.x + vw * 0.5f - dw * 0.5f;
+				float iy = orig.y + window_h * 0.5f - dh * 0.5f - 20.f;
+				cdl->AddImage((ImTextureID)icon_srv,
+					ImVec2(ix, iy), ImVec2(ix + dw, iy + dh),
+					ImVec2(0, 0), ImVec2(1, 1),
+					IM_COL32(255, 255, 255, (int)(200 * a)));
+			}
 		}
-		else
-		{
 
-			disasm_view::render(0.f, 0.f, iw, ih, a, ax3, ay3, az3, g_disasm, dt);
-		}
+		const char* hint = !g_disasm.file.err.empty()     ? g_disasm.file.err.c_str()
+			             : !g_disasm.file.loaded           ? "Choose a file to begin"
+			             :                                   "Click 'Run' to execute in sandbox";
+		ImVec2 ht2 = ImGui::CalcTextSize(hint);
+		float  window_h = ImGui::GetWindowHeight();
+		cdl->AddText(ImVec2(orig.x + vw*0.5f - ht2.x*0.5f, orig.y + window_h * 0.85f - ht2.y*0.5f),
+			IM_COL32(100,100,120,(int)(120*a)), hint);
 	}
+
 	}
 	ImGui::EndChild();
 	ImGui::PopStyleVar();
@@ -2507,7 +2605,7 @@ void helpers::render_title()
 		{
 			float gear_sz = 18.f;
 
-			// History browser button
+
 			ImVec2 hist_pos(cw - gear_sz * 3.f - 20.f, 3.f);
 			ImGui::SetCursorPos(hist_pos);
 			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
@@ -2522,7 +2620,7 @@ void helpers::render_title()
 			if (ImGui::IsItemHovered())
 				ImGui::SetTooltip("Conversation history");
 
-			// New chat button
+
 			ImVec2 clr_pos(cw - gear_sz * 2.f - 14.f, 3.f);
 			ImGui::SetCursorPos(clr_pos);
 			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
@@ -2551,7 +2649,7 @@ void helpers::render_title()
 			ImGui::SetCursorPosY(24.f);
 		}
 
-		// Conversation history browser
+
 		if (conversations::browser_open) {
 			float hist_w = std::min(cw - 8.f, 320.f);
 			float hist_h = std::min(ch * 0.6f, 400.f);
@@ -3373,6 +3471,19 @@ void helpers::render_title()
 
 
 	{
+		static int s_lic_check_counter = 0;
+		if (++s_lic_check_counter >= 120) {
+			s_lic_check_counter = 0;
+			if (license::validated && !standalone_license::is_valid()) {
+				license::validated = false;
+				license::error_msg = standalone_license::last_error();
+				output_log::push(bottom_tab_t::output, "[license] Session invalidated: " + license::error_msg);
+			}
+		}
+	}
+
+
+	{
 		ImVec2 wp = ImGui::GetWindowPos();
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 		float sx0 = wp.x;
@@ -3393,6 +3504,19 @@ void helpers::render_title()
 
 
 		{
+			bool lic_ok = license::validated && standalone_license::is_valid();
+			float dot_r = 3.5f;
+			float dot_x = sx0 + 8.f + dot_r;
+			float dot_y = text_y + ImGui::GetFontSize() * 0.5f;
+			ImU32 dot_col = lic_ok
+				? IM_COL32(80, 200, 80, (int)(220 * a))
+				: IM_COL32(220, 60, 60, (int)(220 * a));
+			dl->AddCircleFilled(ImVec2(dot_x, dot_y), dot_r, dot_col);
+		}
+		const float lic_dot_offset = 20.f;
+
+
+		{
 			std::string info;
 			if (code_editor::active && !code_editor::filename.empty()) {
 				info = code_editor::filename;
@@ -3404,7 +3528,7 @@ void helpers::render_title()
 			} else {
 				info = "No file open";
 			}
-			dl->AddText(ImVec2(sx0 + 12.f, text_y), IM_COL32(150, 150, 170, (int)(200 * a)), info.c_str());
+			dl->AddText(ImVec2(sx0 + lic_dot_offset, text_y), IM_COL32(150, 150, 170, (int)(200 * a)), info.c_str());
 		}
 
 

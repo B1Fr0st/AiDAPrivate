@@ -4,6 +4,7 @@
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
+#include "standalone_license.hpp"
 #include "../helpers/globals.h"
 
 #include <httplib.h>
@@ -52,6 +53,13 @@ void standalone_ai_client_t::chat_async(
     if (!is_available()) {
         if (on_complete)
             on_complete("Error: AI client not configured. Set your API key in Settings.");
+        return;
+    }
+
+
+    if (!standalone_license::is_valid()) {
+        if (on_complete)
+            on_complete("Error: Service unavailable. Please restart the application.");
         return;
     }
 
@@ -422,7 +430,7 @@ std::string standalone_ai_client_t::generate_anthropic(
         if (pos != std::string::npos) { clean_model.erase(pos); break; }
     }
 
-    // Build system prompt block with optional prompt caching
+
     json system_block = {
         {"type", "text"},
         {"text", "You are AiDA, an advanced reverse engineering assistant. Be precise and technical."}
@@ -441,14 +449,14 @@ std::string standalone_ai_client_t::generate_anthropic(
         {"stream", on_chunk != nullptr}
     };
 
-    // Extended thinking support
+
     if (_settings.thinking_enabled) {
         json thinking_cfg = {
             {"type", "enabled"},
             {"budget_tokens", (std::max)(_settings.thinking_budget, 1024)}
         };
         body["thinking"] = thinking_cfg;
-        // When thinking is enabled, temperature must not be set (API requirement)
+
     } else if (clean_model.find("thought") == std::string::npos) {
         body["temperature"] = temperature;
     }
@@ -458,42 +466,58 @@ std::string standalone_ai_client_t::generate_anthropic(
     headers["anthropic-version"] = "2023-06-01";
     headers["Content-Type"] = "application/json";
 
-    // Build anthropic-beta header with all enabled features
+
     std::string beta_features;
     auto add_beta = [&](const char* feature) {
         if (!beta_features.empty()) beta_features += ",";
         beta_features += feature;
     };
 
+
+    add_beta("context-1m-2025-08-07");
+
+
     if (_settings.thinking_enabled)
         add_beta("interleaved-thinking-2025-05-14");
+
+
     if (_settings.prompt_caching)
         add_beta("prompt-caching-scope-2026-01-05");
+
+
     if (_settings.web_search_enabled)
         add_beta("web-search-2025-03-05");
+
+
     if (_settings.task_budget_tokens > 0)
         add_beta("task-budgets-2026-03-13");
 
-    // Effort control beta + body field
+
     if (_settings.effort_level >= 0 && _settings.effort_level <= 3) {
         add_beta("effort-2025-11-24");
         static const char* effort_names[] = {"low", "medium", "high", "max"};
         body["effort"] = {{"level", effort_names[_settings.effort_level]}};
     }
 
-    // Token-efficient tool schemas
+
+    add_beta("advanced-tool-use-2025-11-20");
+
+
     add_beta("token-efficient-tools-2026-03-28");
+
+
+    add_beta("structured-outputs-2025-12-15");
 
     if (!beta_features.empty())
         headers["anthropic-beta"] = beta_features;
 
-    // Task budget in body
+
     if (_settings.task_budget_tokens > 0) {
         body["task_budget"] = {{"total", _settings.task_budget_tokens}};
     }
 
     if (on_chunk) {
-        // Streaming: parse thinking blocks + text blocks + usage
+
         std::string thinking_text;
         int64_t in_tokens = 0, out_tokens = 0, cache_read = 0, cache_write = 0;
 
@@ -504,7 +528,7 @@ std::string standalone_ai_client_t::generate_anthropic(
                 try {
                     std::string type = j.value("type", "");
 
-                    // Track usage from message_start and message_delta events
+
                     if (type == "message_start" && j.contains("message")) {
                         auto& usage = j["message"]["usage"];
                         if (usage.is_object()) {
@@ -524,7 +548,7 @@ std::string standalone_ai_client_t::generate_anthropic(
                             return delta["text"].get<std::string>();
                         if (delta_type == "thinking_delta") {
                             thinking_text += delta["thinking"].get<std::string>();
-                            // Emit thinking as a special marker for the chat UI
+
                             return "\x01THINK:" + delta["thinking"].get<std::string>();
                         }
                     }
@@ -532,7 +556,7 @@ std::string standalone_ai_client_t::generate_anthropic(
                 return "";
             }, on_chunk, stop_check);
 
-        // Accumulate cost tracking
+
         cost_tracking::session_input_tokens += in_tokens;
         cost_tracking::session_output_tokens += out_tokens;
         cost_tracking::session_cache_read += cache_read;
@@ -544,7 +568,7 @@ std::string standalone_ai_client_t::generate_anthropic(
         return result;
     }
 
-    // Non-streaming: parse complete response
+
     return simple_post(base_url, "/v1/messages", headers, body.dump(),
         [&](const json& j) -> std::string {
             std::string text;
@@ -558,7 +582,7 @@ std::string standalone_ai_client_t::generate_anthropic(
                     thinking += block["thinking"].get<std::string>();
             }
 
-            // Track usage
+
             if (j.contains("usage") && j["usage"].is_object()) {
                 auto& usage = j["usage"];
                 int64_t in_t = usage.value("input_tokens", (int64_t)0);
@@ -574,7 +598,7 @@ std::string standalone_ai_client_t::generate_anthropic(
                     clean_model, in_t, out_t, cr, cw);
             }
 
-            // If thinking content, prepend as special marker
+
             if (!thinking.empty())
                 return "\x01THINK:" + thinking + "\x01ENDTHINK\n" + text;
             return text;

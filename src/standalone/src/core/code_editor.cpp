@@ -1,5 +1,7 @@
 #include "code_editor.hpp"
 #include "syntax_highlight.hpp"
+#include "standalone_ai_client.hpp"
+#include "standalone_settings.hpp"
 #include "../helpers/globals.h"
 
 #include "imgui/imgui.h"
@@ -8,7 +10,9 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 
@@ -53,6 +57,17 @@ bool s_lang_set = false;
 
 bool s_has_focus = false;
 ImGuiID s_widget_id = 0;
+
+
+std::string    s_ghost_text;
+std::mutex     s_ghost_mtx;
+std::string    s_ghost_pending;
+bool           s_ghost_has_pending = false;
+float          s_ghost_debounce = 0.f;
+int            s_ghost_trigger_line = -1;
+int            s_ghost_trigger_col  = -1;
+bool           s_ghost_requesting = false;
+std::thread    s_ghost_worker;
 
 bool s_request_undo = false;
 bool s_request_redo = false;
@@ -695,6 +710,97 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     }
 
 
+    if (g_sa_settings.ghost_text_enabled && s_has_focus) {
+
+        {
+            std::lock_guard<std::mutex> lk(s_ghost_mtx);
+            if (s_ghost_has_pending) {
+                s_ghost_text = std::move(s_ghost_pending);
+                s_ghost_pending.clear();
+                s_ghost_has_pending = false;
+                s_ghost_requesting = false;
+            }
+        }
+
+
+        if (s_sel.caret_line != s_ghost_trigger_line || s_sel.caret_col != s_ghost_trigger_col) {
+            s_ghost_debounce = 0.f;
+            s_ghost_trigger_line = s_sel.caret_line;
+            s_ghost_trigger_col  = s_sel.caret_col;
+            s_ghost_text.clear();
+        }
+
+
+        if (s_ghost_text.empty() && !s_ghost_requesting && s_ghost_debounce < 0.5f) {
+            s_ghost_debounce += dt;
+            if (s_ghost_debounce >= 0.5f && n_lines > 0) {
+
+                int ctx_start = (std::max)(0, s_sel.caret_line - 20);
+                std::string context;
+                context.reserve(2048);
+                for (int i = ctx_start; i < n_lines && i <= s_sel.caret_line; i++) {
+                    const std::string& ln = line_at(i);
+                    if (i == s_sel.caret_line) {
+                        int col = (std::min)(s_sel.caret_col, (int)ln.size());
+                        context.append(ln, 0, col);
+                    } else {
+                        context += ln;
+                        context += '\n';
+                    }
+                }
+
+                if (!context.empty() && g_sa_ai_client) {
+                    s_ghost_requesting = true;
+                    if (s_ghost_worker.joinable()) s_ghost_worker.join();
+                    s_ghost_worker = std::thread([context]() {
+                        std::string prompt = "Complete the following code. Output ONLY the completion text (the part that comes after the cursor), nothing else. No explanation, no markdown. If there's nothing meaningful to suggest, output nothing.\n\n```\n" + context + "```";
+                        std::vector<std::pair<std::string, std::string>> empty_history;
+                        std::string result = g_sa_ai_client->chat_blocking(prompt, empty_history);
+
+                        if (result.size() > 6 && result.substr(0, 3) == "```") {
+                            auto nl = result.find('\n');
+                            if (nl != std::string::npos) result = result.substr(nl + 1);
+                            if (result.size() >= 3 && result.substr(result.size()-3) == "```")
+                                result.resize(result.size()-3);
+                        }
+
+                        auto nl = result.find('\n');
+                        if (nl != std::string::npos) result.resize(nl);
+
+                        while (!result.empty() && (result.back() == ' ' || result.back() == '\t' || result.back() == '\r'))
+                            result.pop_back();
+
+                        std::lock_guard<std::mutex> lk(s_ghost_mtx);
+                        s_ghost_pending = std::move(result);
+                        s_ghost_has_pending = true;
+                    });
+                }
+            }
+        }
+
+
+        if (!s_ghost_text.empty()) {
+            float gx = ox + text_x0 + s_sel.caret_col * char_w - s_scroll_x;
+            float gy = oy + s_sel.caret_line * line_h - s_scroll_y;
+            if (gy >= oy - line_h && gy <= oy + editor_h) {
+                dl->AddText(ImVec2(gx, gy + 1.f),
+                    IM_COL32(150, 160, 200, (int)(90 * a)),
+                    s_ghost_text.c_str());
+            }
+
+
+            if (ImGui::IsKeyPressed(ImGuiKey_Tab, false)) {
+                insert_text_at_caret(s_ghost_text);
+                s_ghost_text.clear();
+            }
+
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+                s_ghost_text.clear();
+            }
+        }
+    }
+
+
     if (s_has_focus || hovered) {
         ImVec2 mp = ImGui::GetIO().MousePos;
         bool in_text = mp.x >= ox + text_x0 && mp.y >= oy && mp.y <= oy + editor_h;
@@ -754,7 +860,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         bool ctrl  = io.KeyCtrl;
         bool shift = io.KeyShift;
 
-        // Claim Enter/Tab ownership so ImGui nav doesn't consume them
+
         ImGui::SetKeyOwner(ImGuiKey_Enter, id);
         ImGui::SetKeyOwner(ImGuiKey_KeypadEnter, id);
         ImGui::SetKeyOwner(ImGuiKey_Tab, id);

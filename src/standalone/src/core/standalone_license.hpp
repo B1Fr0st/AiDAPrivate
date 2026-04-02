@@ -13,4 +13,9 @@ namespace standalone_license
     std::string plan();
     std::string last_error();
     void shutdown();
+
+
+    bool check_subscription_tier();
+    bool verify_entitlement_state();
+    bool confirm_session_integrity();
 }

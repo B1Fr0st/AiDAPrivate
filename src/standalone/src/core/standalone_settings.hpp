@@ -292,28 +292,28 @@ struct settings_sa_t
     std::string custom_icon_path;
     std::string custom_themes_json;
 
-    // --- Extended AI features (Claude Code inspired) ---
+
     bool        thinking_enabled  = false;
-    int         thinking_budget   = 10000;       // max thinking tokens
-    int         effort_level      = 2;           // 0=low 1=medium 2=high 3=max
+    int         thinking_budget   = 10000;
+    int         effort_level      = 2;
     bool        prompt_caching    = true;
-    int         task_budget_tokens = 0;           // 0 = unlimited
+    int         task_budget_tokens = 0;
     bool        web_search_enabled = false;
     int         max_agentic_rounds = 15;
 
-    // --- Editor extras ---
+
     bool        editor_word_wrap    = false;
     bool        editor_minimap      = false;
     bool        editor_bracket_match = true;
     float       chat_font_size      = 13.0f;
-    int         chat_density        = 1;         // 0=compact 1=normal 2=relaxed
+    int         chat_density        = 1;
     bool        chat_show_timestamps = true;
     bool        chat_show_tokens     = true;
     bool        ghost_text_enabled   = false;
     std::string ghost_text_model;
     std::string ghost_text_provider_id;
 
-    // --- Window geometry persistence ---
+
     int         window_x = -1;
     int         window_y = -1;
     int         window_w = 1400;

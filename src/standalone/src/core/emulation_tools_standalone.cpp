@@ -1,6 +1,5 @@
-﻿// emulation_tools_standalone.cpp — CPU emulation (Zydis/Unicorn) tools for AiDA Standalone.
-// Ported from agent_tools.cpp (DLL) emulation_tools namespace.
-// Uses emulation_engine.hpp for Unicorn-based CPU emulation and Zydis disassembly.
+﻿
+
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

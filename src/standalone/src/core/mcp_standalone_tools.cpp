@@ -593,8 +593,7 @@ namespace
         const std::string query = params["query"].get<std::string>();
         const int max_results = params.value("max_results", 5);
 
-        // Use DuckDuckGo Instant Answer API (no API key required, privacy-friendly)
-        // Returns structured results without tracking
+
         std::string encoded_query;
         for (unsigned char c : query) {
             if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
@@ -610,7 +609,7 @@ namespace
 
         json results = json::array();
 
-        // Attempt DuckDuckGo API
+
         try {
             httplib::SSLClient client("api.duckduckgo.com");
             client.set_connection_timeout(10);
@@ -623,7 +622,7 @@ namespace
             if (res && res->status == 200) {
                 auto j = json::parse(res->body, nullptr, false);
                 if (!j.is_discarded() && j.is_object()) {
-                    // Abstract (main answer)
+
                     if (j.contains("Abstract") && !j["Abstract"].get<std::string>().empty()) {
                         results.push_back({
                             {"title", j.value("Heading", "Answer")},
@@ -632,7 +631,7 @@ namespace
                         });
                     }
 
-                    // Related topics
+
                     if (j.contains("RelatedTopics") && j["RelatedTopics"].is_array()) {
                         for (auto& topic : j["RelatedTopics"]) {
                             if ((int)results.size() >= max_results) break;
@@ -648,7 +647,7 @@ namespace
                 }
             }
         } catch (...) {
-            // Fallback: return a message that web search is unavailable
+
         }
 
         if (results.empty()) {
@@ -722,7 +721,7 @@ namespace mcp_standalone
             {{"query", "string", "Search query text", true}, {"max_results", "number", "Maximum results to return (default 5)", false}},
             true, handle_web_search});
 
-        // Ported advanced tools from the DLL plugin:
+
         driver_tools::register_driver_tools(srv);
         network_tools::register_network_tools(srv);
         net_security_tools::register_net_security_tools(srv);

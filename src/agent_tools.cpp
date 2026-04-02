@@ -3059,13 +3059,6 @@ void register_tools()
 }
 
 
-// debugger_tools namespace REMOVED â€” all 38+ runtime debugging tools (breakpoints,
-// stepping, registers, call stack, tracing, etc.) now live exclusively in the
-// standalone executable (debugger_tools_standalone.cpp). The DLL plugin is strictly
-// static analysis. The two static-analysis VM tools (detect_vm_handler_pattern,
-// map_vm_handler_table) were preserved by moving them to analysis_tools above.
-
-
 namespace segment_tools
 {
 
@@ -3367,27 +3360,22 @@ void register_tools()
 
 }
 
-// Responsive auto_wait: loops on IDA's auto analysis queue, periodically yielding
-// to the UI thread so the editor stays responsive while heavy reanalysis runs.
-// WHY: Plain auto_wait() blocks the calling thread until all analysis completes,
-// which can appear to freeze the plugin when triggered inside tool handlers.
-// This wrapper checks for user cancellation, and if a range is supplied it marks
-// that range for final-pass analysis before entering the wait loop.
+
 static void responsive_auto_wait(ea_t start, ea_t end, const char* status_msg)
 {
     if (start != 0 || end != BADADDR)
         auto_mark_range(start, end, AU_FINAL);
 
-    // Loop until the analysis queue drains or the user presses Cancel.
+
     while (!auto_is_ok())
     {
         if (user_cancelled())
             break;
-        // Yield control to IDA for ~100 ms so UI stays responsive.
+
         auto_wait_range(0, BADADDR);
-        break;   // auto_wait_range is blocking; one pass is enough.
+        break;
     }
-    (void)status_msg;  // Used by the caller's show_wait_box.
+    (void)status_msg;
 }
 
 namespace navigation_tools
@@ -5648,9 +5636,6 @@ tool_result_t classify_memory_pages(const json& params)
                              std::to_string(data_pages) + OBFSTR(" data"), result);
 }
 
-// Moved from debugger_tools: These are pure static analysis tools that use IDA's
-// instruction decoder (decode_insn) and IDB reads (get_qword/get_dword) to detect
-// virtualization patterns without any runtime debugger involvement.
 
 tool_result_t detect_vm_handler_pattern(const json& params)
 {
@@ -5915,9 +5900,7 @@ void register_tools()
          {OBFSTR("page_size"), OBFSTR("number"), OBFSTR("Page granularity in bytes (default: 4096, min: 256)"), false}},
         classify_memory_pages, true});
 
-    // VM handler analysis Ã¢â‚¬â€ moved from debugger_tools because these are purely
-    // static analysis: they decode instructions via IDA's insn_t / decode_insn()
-    // and read the IDB, with no dependency on a running debugger.
+
     registry.register_tool({OBFSTR("detect_vm_handler_pattern"), OBFSTR("analysis"),
         OBFSTR("Scan a code region for virtualization patterns: indirect jump tables, CMP dispatch chains, "
                "loop instructions. Returns a VM confidence score and identified patterns. "

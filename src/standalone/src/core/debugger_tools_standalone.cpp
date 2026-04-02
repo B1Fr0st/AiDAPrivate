@@ -1,11 +1,4 @@
-// debugger_tools_standalone.cpp — High-level debugger analysis tools for AiDA Standalone.
-// Provides managed software breakpoints, call stack unwinding, execution state
-// snapshots, and VM handler analysis using the kernel driver bridge + Zydis.
-//
-// These tools complement the low-level driver_tools (which provide raw register
-// access, HW breakpoints, memory R/W, thread control) with higher-level
-// debugger workflows that the old DLL debugger_tools namespace provided via
-// IDA's debugging APIs.
+
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -31,9 +24,6 @@ using tool_result_t = mcp_standalone::tool_result_t;
 namespace debugger_tools
 {
 
-// ---------------------------------------------------------------------------
-// Helpers — lightweight versions of driver_tools helpers, scoped to this TU.
-// ---------------------------------------------------------------------------
 
 static bool is_process_alive(std::uint32_t pid)
 {
@@ -128,11 +118,6 @@ static std::optional<std::uint32_t> parse_tid(const json& params)
     return (tid != 0) ? std::optional<std::uint32_t>{tid} : std::nullopt;
 }
 
-// ---------------------------------------------------------------------------
-// Software breakpoint management — INT3 (0xCC) patches with original byte
-// tracking.  Uses the kernel driver for memory R/W so all writes bypass
-// page protection and anti-tamper checks.
-// ---------------------------------------------------------------------------
 
 struct sw_breakpoint
 {
@@ -159,7 +144,7 @@ static tool_result_t dbg_set_breakpoint(const json& params)
 
     std::lock_guard<std::mutex> lock(s_bp_mutex);
 
-    // Check if breakpoint already exists at this address.
+
     for (const auto& bp : s_breakpoints)
     {
         if (bp.address == addr && bp.enabled)
@@ -167,19 +152,19 @@ static tool_result_t dbg_set_breakpoint(const json& params)
                 OBFSTR("Breakpoint already set at ") + sa_format_address(addr));
     }
 
-    // Read original byte.
+
     std::uint8_t original = device->read<std::uint8_t>(addr);
 
-    // Already an INT3?
+
     if (original == 0xCC)
         return tool_result_t::error(
             OBFSTR("Byte at ") + sa_format_address(addr) +
             OBFSTR(" is already 0xCC (INT3). Possible existing breakpoint."));
 
-    // Write INT3.
+
     device->write<std::uint8_t>(addr, 0xCC);
 
-    // Verify write.
+
     std::uint8_t verify = device->read<std::uint8_t>(addr);
     if (verify != 0xCC)
         return tool_result_t::error(
@@ -187,7 +172,7 @@ static tool_result_t dbg_set_breakpoint(const json& params)
             OBFSTR(". Read-back: 0x") +
             sa_format_address(static_cast<uint64_t>(verify)));
 
-    // Track the breakpoint.
+
     sw_breakpoint bp;
     bp.address       = addr;
     bp.original_byte = original;
@@ -221,7 +206,7 @@ static tool_result_t dbg_remove_breakpoint(const json& params)
     {
         if (it->address == addr && it->enabled)
         {
-            // Restore original byte.
+
             device->write<std::uint8_t>(addr, it->original_byte);
 
             std::uint8_t verify = device->read<std::uint8_t>(addr);
@@ -273,12 +258,6 @@ static tool_result_t dbg_list_breakpoints(const json& params)
         std::to_string(active_count) + OBFSTR(" active software breakpoint(s)"), result);
 }
 
-// ---------------------------------------------------------------------------
-// Call stack unwinding — reads the RBP chain from a target thread's register
-// state, following frame pointers through the target's memory.  Each frame
-// also captures the return address and attempts a Zydis disassembly of the
-// first instruction at the return address for context.
-// ---------------------------------------------------------------------------
 
 static tool_result_t dbg_get_callstack(const json& params)
 {
@@ -295,7 +274,7 @@ static tool_result_t dbg_get_callstack(const json& params)
     if (params.contains("max_depth") && params["max_depth"].is_number())
         max_depth = std::clamp(params["max_depth"].get<int>(), 1, 256);
 
-    // Suspend the thread so the stack doesn't change under us.
+
     std::uint32_t prev_count = 0;
     const bool did_suspend = device->suspend_thread(tid, &prev_count);
 
@@ -309,7 +288,7 @@ static tool_result_t dbg_get_callstack(const json& params)
 
     json frames = json::array();
 
-    // Frame 0: current RIP.
+
     {
         json f;
         f["depth"]   = 0;
@@ -317,7 +296,7 @@ static tool_result_t dbg_get_callstack(const json& params)
         f["rsp"]     = sa_format_address(static_cast<uint64_t>(ctx.rsp));
         f["rbp"]     = sa_format_address(static_cast<uint64_t>(ctx.rbp));
 
-        // Disassemble instruction at RIP for context.
+
         uint8_t code[16] = {};
         if (device->read_raw(ctx.rip, code, sizeof(code)) >= 1)
         {
@@ -327,26 +306,25 @@ static tool_result_t dbg_get_callstack(const json& params)
         frames.push_back(f);
     }
 
-    // Walk the RBP chain.  Frame layout: [RBP] = saved_rbp, [RBP+8] = return_addr.
+
     std::uint64_t rbp = ctx.rbp;
     std::uint64_t rsp = ctx.rsp;
 
-    // Heuristic: if RBP looks invalid (e.g. leaf function with no frame pointer),
-    // fall back to scanning RSP for return addresses.
+
     const bool rbp_looks_valid =
         rbp > 0x10000 && rbp < 0x7FFFFFFFFFFF0000ULL &&
-        rbp > rsp && (rbp - rsp) < 0x100000;  // within 1MB of RSP
+        rbp > rsp && (rbp - rsp) < 0x100000;
 
     if (rbp_looks_valid)
     {
-        // Standard RBP chain walk.
+
         for (int depth = 1; depth < max_depth; ++depth)
         {
-            // Validate RBP range.
+
             if (rbp == 0 || rbp < 0x10000 || rbp > 0x7FFFFFFFFFFF0000ULL)
                 break;
 
-            // Read saved RBP and return address.
+
             std::uint64_t saved_rbp = 0;
             std::uint64_t ret_addr  = 0;
             if (device->read_raw(rbp, &saved_rbp, 8) < 8)
@@ -354,7 +332,7 @@ static tool_result_t dbg_get_callstack(const json& params)
             if (device->read_raw(rbp + 8, &ret_addr, 8) < 8)
                 break;
 
-            // Validate return address.
+
             if (ret_addr == 0 || ret_addr < 0x10000)
                 break;
 
@@ -364,7 +342,7 @@ static tool_result_t dbg_get_callstack(const json& params)
             f["rbp"]        = sa_format_address(saved_rbp);
             f["frame_addr"] = sa_format_address(rbp);
 
-            // Disassemble at return address.
+
             uint8_t code[16] = {};
             if (device->read_raw(ret_addr, code, sizeof(code)) >= 1)
             {
@@ -374,7 +352,7 @@ static tool_result_t dbg_get_callstack(const json& params)
 
             frames.push_back(f);
 
-            // Detect loops.
+
             if (saved_rbp == rbp || saved_rbp <= rbp)
                 break;
             rbp = saved_rbp;
@@ -382,9 +360,9 @@ static tool_result_t dbg_get_callstack(const json& params)
     }
     else
     {
-        // Fallback: scan the stack for return addresses.
-        // Read a chunk of the stack and look for values that point to executable memory.
-        constexpr std::size_t SCAN_SIZE = 0x800;  // 2KB
+
+
+        constexpr std::size_t SCAN_SIZE = 0x800;
         std::vector<std::uint8_t> stack_data(SCAN_SIZE);
         std::size_t read = device->read_raw(rsp, stack_data.data(), SCAN_SIZE);
         int depth = 1;
@@ -394,25 +372,25 @@ static tool_result_t dbg_get_callstack(const json& params)
             std::uint64_t candidate = 0;
             std::memcpy(&candidate, stack_data.data() + off, 8);
 
-            // Basic heuristic: user-mode code address.
+
             if (candidate < 0x10000 || candidate > 0x7FFFFFFFFFFF0000ULL)
                 continue;
 
-            // Check if the memory at candidate is executable (committed + execute).
+
             voyager::device_t::memory_region_info region{};
             if (!device->query_memory(candidate, region))
                 continue;
-            if (region.state != 0x1000)  // MEM_COMMIT
+            if (region.state != 0x1000)
                 continue;
-            if (!(region.protect & 0xF0))  // No execute bit
+            if (!(region.protect & 0xF0))
                 continue;
 
-            // Read instruction at candidate to verify it's valid code.
+
             uint8_t code[16] = {};
             if (device->read_raw(candidate, code, sizeof(code)) < 1)
                 continue;
             AsmInstr ins = zydis_decode_one(code, 16, candidate);
-            // Skip clearly invalid entries.
+
             if (ins.len <= 0)
                 continue;
 
@@ -427,7 +405,7 @@ static tool_result_t dbg_get_callstack(const json& params)
         }
     }
 
-    // Resume the thread.
+
     if (did_suspend)
         device->resume_thread(tid);
 
@@ -442,11 +420,6 @@ static tool_result_t dbg_get_callstack(const json& params)
         result);
 }
 
-// ---------------------------------------------------------------------------
-// Execution state snapshots — capture the full register state + configurable
-// memory ranges of a thread into a named snapshot.  Two snapshots can then
-// be compared ("diffed") to see exactly what changed.
-// ---------------------------------------------------------------------------
 
 struct memory_snapshot_region
 {
@@ -482,7 +455,7 @@ static tool_result_t dbg_snapshot_state(const json& params)
     if (snap_name.empty())
         return tool_result_t::error(OBFSTR("Snapshot name cannot be empty."));
 
-    // Suspend to get a consistent view.
+
     std::uint32_t prev_count = 0;
     const bool did_suspend = device->suspend_thread(tid, &prev_count);
 
@@ -500,7 +473,7 @@ static tool_result_t dbg_snapshot_state(const json& params)
     snap.ctx       = ctx;
     snap.timestamp = std::chrono::steady_clock::now();
 
-    // Optional: capture memory regions.
+
     if (params.contains("memory_regions") && params["memory_regions"].is_array())
     {
         for (const auto& region : params["memory_regions"])
@@ -528,7 +501,7 @@ static tool_result_t dbg_snapshot_state(const json& params)
     if (did_suspend)
         device->resume_thread(tid);
 
-    // Build result.
+
     json result;
     result["name"]           = snap_name;
     result["tid"]            = tid;
@@ -536,7 +509,7 @@ static tool_result_t dbg_snapshot_state(const json& params)
     result["rsp"]            = sa_format_address(static_cast<uint64_t>(ctx.rsp));
     result["memory_regions"] = static_cast<int>(snap.memory.size());
 
-    // Store.
+
     {
         std::lock_guard<std::mutex> lock(s_snap_mutex);
         s_snapshots[snap_name] = std::move(snap);
@@ -568,7 +541,7 @@ static tool_result_t dbg_compare_snapshots(const json& params)
     const auto& a = it_a->second;
     const auto& b = it_b->second;
 
-    // Compare registers.
+
     json reg_diffs = json::array();
     auto cmp_reg = [&](const char* name, std::uint64_t va, std::uint64_t vb) {
         if (va != vb)
@@ -606,7 +579,7 @@ static tool_result_t dbg_compare_snapshots(const json& params)
     cmp_reg("dr6", a.ctx.dr6, b.ctx.dr6);
     cmp_reg("dr7", a.ctx.dr7, b.ctx.dr7);
 
-    // Compare memory regions (only regions at matching addresses).
+
     json mem_diffs = json::array();
     for (const auto& mem_a : a.memory)
     {
@@ -632,7 +605,7 @@ static tool_result_t dbg_compare_snapshots(const json& params)
                         static_cast<uint64_t>(mem_b.data[i]));
                     byte_diffs.push_back(bd);
                     if (byte_diffs.size() >= 256)
-                        break;  // Cap diff output.
+                        break;
                 }
             }
 
@@ -674,11 +647,6 @@ static tool_result_t dbg_compare_snapshots(const json& params)
         result);
 }
 
-// ---------------------------------------------------------------------------
-// VM handler detection — Zydis-based analysis of obfuscated code to detect
-// virtual machine dispatcher patterns and map handler tables.  Reads code
-// from the target process via driver and disassembles locally.
-// ---------------------------------------------------------------------------
 
 static tool_result_t dbg_detect_vm_handler(const json& params)
 {
@@ -697,7 +665,7 @@ static tool_result_t dbg_detect_vm_handler(const json& params)
     if (params.contains("size") && params["size"].is_number())
         scan_size = std::clamp(params["size"].get<int>(), 64, 16384);
 
-    // Read code bytes from target process.
+
     std::vector<uint8_t> code(static_cast<std::size_t>(scan_size));
     std::size_t read = device->read_raw(addr, code.data(), code.size());
     if (read < 16)
@@ -707,11 +675,6 @@ static tool_result_t dbg_detect_vm_handler(const json& params)
 
     zydis_detail::ensure_init();
 
-    // VM dispatcher pattern detection heuristics:
-    // 1. Indirect jump through register or memory (jmp [reg+disp])
-    // 2. Switch-like table dispatch (jmp [rax*8+table])
-    // 3. Opcode fetch + handler lookup loops
-    // 4. Register use as bytecode pointer (repeated [reg] reads + inc/add)
 
     json indicators = json::array();
     int indirect_jumps      = 0;
@@ -742,7 +705,7 @@ static tool_result_t dbg_detect_vm_handler(const json& params)
 
         ++instr_count;
 
-        // Detect indirect jumps (jmp reg, jmp [reg], jmp [reg+disp], jmp [reg*scale+disp]).
+
         if (instr.mnemonic == ZYDIS_MNEMONIC_JMP)
         {
             for (int i = 0; i < static_cast<int>(instr.operand_count_visible); ++i)
@@ -802,7 +765,7 @@ static tool_result_t dbg_detect_vm_handler(const json& params)
             }
         }
 
-        // Detect movzx/movsx patterns (bytecode fetch).
+
         if (instr.mnemonic == ZYDIS_MNEMONIC_MOVZX ||
             instr.mnemonic == ZYDIS_MNEMONIC_MOVSX)
         {
@@ -820,7 +783,7 @@ static tool_result_t dbg_detect_vm_handler(const json& params)
         va     += instr.length;
     }
 
-    // Score the likelihood of this being a VM dispatcher.
+
     double score = 0.0;
     if (indirect_jumps > 0)  score += 20.0;
     if (scaled_jumps > 0)    score += 40.0;
@@ -880,7 +843,7 @@ static tool_result_t dbg_map_vm_handlers(const json& params)
         preview_instructions = std::clamp(
             params["preview_instructions"].get<int>(), 0, 32);
 
-    // Check if handler addresses are relative or absolute.
+
     bool relative = false;
     if (params.contains("relative") && params["relative"].is_boolean())
         relative = params["relative"].get<bool>();
@@ -899,7 +862,7 @@ static tool_result_t dbg_map_vm_handlers(const json& params)
 
     zydis_detail::ensure_init();
 
-    // Read the table.
+
     const std::size_t table_byte_size =
         static_cast<std::size_t>(entry_count) * static_cast<std::size_t>(entry_size);
     std::vector<uint8_t> table_data(table_byte_size);
@@ -924,12 +887,12 @@ static tool_result_t dbg_map_vm_handlers(const json& params)
                      table_data.data() + static_cast<std::size_t>(i) * static_cast<std::size_t>(entry_size),
                      static_cast<std::size_t>(entry_size));
 
-        // Sign-extend if 4-byte entries.
+
         if (entry_size == 4)
             raw_value = static_cast<std::uint64_t>(
                 static_cast<std::int32_t>(raw_value & 0xFFFFFFFF));
 
-        // Compute handler address.
+
         std::uint64_t handler_addr = raw_value;
         if (relative)
             handler_addr = image_base + raw_value;
@@ -947,10 +910,10 @@ static tool_result_t dbg_map_vm_handlers(const json& params)
         entry["raw_value"]    = sa_format_address(raw_value);
         entry["handler_addr"] = sa_format_address(handler_addr);
 
-        // Preview-disassemble the handler.
+
         if (preview_instructions > 0)
         {
-            const int preview_bytes = preview_instructions * 15;  // max x86 insn = 15
+            const int preview_bytes = preview_instructions * 15;
             std::vector<uint8_t> code(static_cast<std::size_t>(preview_bytes));
             std::size_t code_read = device->read_raw(
                 handler_addr, code.data(), code.size());
@@ -1004,13 +967,10 @@ static tool_result_t dbg_map_vm_handlers(const json& params)
         result);
 }
 
-// ---------------------------------------------------------------------------
-// Registration
-// ---------------------------------------------------------------------------
 
 void register_debugger_tools(mcp_standalone::server_t& srv)
 {
-    // --- Software breakpoints ---
+
 
     register_compat(srv, {
         OBFSTR("dbg_set_breakpoint"), OBFSTR("debugger"),
@@ -1039,7 +999,6 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         dbg_list_breakpoints, true});
 
-    // --- Call stack ---
 
     register_compat(srv, {
         OBFSTR("dbg_get_callstack"), OBFSTR("debugger"),
@@ -1053,7 +1012,6 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
         dbg_get_callstack, true});
 
-    // --- Execution state snapshots ---
 
     register_compat(srv, {
         OBFSTR("dbg_snapshot_state"), OBFSTR("debugger"),
@@ -1083,7 +1041,6 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {OBFSTR("snapshot_b"), OBFSTR("string"), OBFSTR("Name of the 'after' snapshot"), true}},
         dbg_compare_snapshots, true});
 
-    // --- VM handler analysis ---
 
     register_compat(srv, {
         OBFSTR("dbg_detect_vm_handler"), OBFSTR("debugger"),
@@ -1114,4 +1071,4 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         dbg_map_vm_handlers, true});
 }
 
-} // namespace debugger_tools
+}
