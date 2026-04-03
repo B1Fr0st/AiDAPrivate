@@ -1,5 +1,6 @@
 #include "disasm_view.hpp"
 #include "zydis_disasm.hpp"
+#include "standalone_driver.hpp"
 #include "../helpers/globals.h"
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -63,6 +64,41 @@ void render(float pos_x, float pos_y, float width, float height,
             DisasmState& disasm, float dt) {
 
     auto& st    = g_state;
+
+    // Live disassembly: periodic refresh
+    if (disasm.live_mode && !disasm.live_paused) {
+        disasm.live_refresh_timer += dt;
+        if (disasm.live_refresh_timer >= disasm.live_refresh_interval || disasm.live_needs_refresh) {
+            disasm.live_refresh_timer = 0.f;
+            disasm.live_needs_refresh = false;
+
+            // Check if process is still attached
+            if (driver_bridge::attached_pid() != disasm.live_pid) {
+                disasm::stop_live(disasm);
+            } else {
+                // Preserve scroll position across refresh
+                uint64_t scroll_addr = 0;
+                if (st.selected_row >= 0 && st.selected_row < static_cast<int>(disasm.file.instrs.size()))
+                    scroll_addr = disasm.file.instrs[st.selected_row].addr;
+
+                disasm::decode_live(disasm);
+
+                // Restore selected row to same address via binary search
+                if (scroll_addr != 0 && !disasm.file.instrs.empty()) {
+                    int lo = 0, hi = static_cast<int>(disasm.file.instrs.size()) - 1;
+                    int best = 0;
+                    while (lo <= hi) {
+                        int mid = (lo + hi) / 2;
+                        if (disasm.file.instrs[mid].addr == scroll_addr) { best = mid; break; }
+                        if (disasm.file.instrs[mid].addr < scroll_addr) { best = mid; lo = mid + 1; }
+                        else hi = mid - 1;
+                    }
+                    st.selected_row = best;
+                }
+            }
+        }
+    }
+
     auto& file  = disasm.file;
     auto& instrs = file.instrs;
     const float a = alpha;
@@ -261,10 +297,6 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
 
-    ImGui::SetCursorPos(ImVec2(pos_x, pos_y + n * line_h));
-    ImGui::Dummy(ImVec2(1.f, 1.f));
-
-
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 7.f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 6.f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
@@ -432,20 +464,181 @@ void render(float pos_x, float pos_y, float width, float height,
         float bm_y = oy + height - 22.f;
         dl->AddRectFilled(ImVec2(ox, bm_y), ImVec2(ox + width, bm_y + 20.f),
                           IM_COL32(20, 20, 30, (int)(200 * a)));
-        float bm_x = ox + 6.f;
+
+        // Calculate total bookmark width
+        float total_bm_w = 6.f;
+        for (auto& bm : st.bookmarks) {
+            ImVec2 ts = ImGui::CalcTextSize(bm.label.c_str());
+            total_bm_w += ts.x + 12.f + 4.f;
+        }
+        float max_scroll = std::max(0.f, total_bm_w - width + 6.f);
+
+        // Scroll on mouse wheel when hovering bookmark bar
+        bool bm_bar_hov = ImGui::IsMouseHoveringRect(
+            ImVec2(ox, bm_y), ImVec2(ox + width, bm_y + 20.f));
+        if (bm_bar_hov && max_scroll > 0.f) {
+            float wheel = ImGui::GetIO().MouseWheel;
+            if (wheel != 0.f)
+                st.bm_scroll_x = std::max(0.f, std::min(max_scroll, st.bm_scroll_x - wheel * 40.f));
+        }
+        if (st.bm_scroll_x > max_scroll) st.bm_scroll_x = max_scroll;
+
+        float bm_x = ox + 6.f - st.bm_scroll_x;
         for (auto& bm : st.bookmarks) {
             ImVec2 ts = ImGui::CalcTextSize(bm.label.c_str());
             float btn_w = ts.x + 12.f;
-            bool bm_hv = ImGui::IsMouseHoveringRect(
-                ImVec2(bm_x, bm_y + 1.f), ImVec2(bm_x + btn_w, bm_y + 19.f));
-            if (bm_hv)
-                dl->AddRectFilled(ImVec2(bm_x, bm_y + 1.f), ImVec2(bm_x + btn_w, bm_y + 19.f),
-                                  IM_COL32(255, 255, 255, (int)(15 * a)), 3.f);
-            dl->AddText(ImVec2(bm_x + 6.f, bm_y + 3.f),
-                        IM_COL32(220, 180, 100, (int)(200 * a)), bm.label.c_str());
-            if (bm_hv && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-                goto_address(bm.addr, disasm);
+            // Skip rendering if fully outside visible area
+            if (bm_x + btn_w >= ox && bm_x <= ox + width) {
+                bool bm_hv = ImGui::IsMouseHoveringRect(
+                    ImVec2(std::max(bm_x, ox), bm_y + 1.f),
+                    ImVec2(std::min(bm_x + btn_w, ox + width), bm_y + 19.f));
+                if (bm_hv)
+                    dl->AddRectFilled(ImVec2(bm_x, bm_y + 1.f), ImVec2(bm_x + btn_w, bm_y + 19.f),
+                                      IM_COL32(255, 255, 255, (int)(15 * a)), 3.f);
+                dl->AddText(ImVec2(bm_x + 6.f, bm_y + 3.f),
+                            IM_COL32(220, 180, 100, (int)(200 * a)), bm.label.c_str());
+                if (bm_hv && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                    goto_address(bm.addr, disasm);
+            }
             bm_x += btn_w + 4.f;
+        }
+
+        // Fade gradients at edges when scrolled
+        if (st.bm_scroll_x > 0.f) {
+            for (int gi = 0; gi < 20; gi++) {
+                float ga = (1.f - gi / 20.f) * a;
+                dl->AddLine(ImVec2(ox + static_cast<float>(gi), bm_y),
+                            ImVec2(ox + static_cast<float>(gi), bm_y + 20.f),
+                            IM_COL32(20, 20, 30, (int)(200 * ga)));
+            }
+        }
+        if (st.bm_scroll_x < max_scroll) {
+            for (int gi = 0; gi < 20; gi++) {
+                float ga = (1.f - gi / 20.f) * a;
+                dl->AddLine(ImVec2(ox + width - 1.f - static_cast<float>(gi), bm_y),
+                            ImVec2(ox + width - 1.f - static_cast<float>(gi), bm_y + 20.f),
+                            IM_COL32(20, 20, 30, (int)(200 * ga)));
+            }
+        }
+    }
+
+
+    // Live disassembly indicator and controls
+    if (disasm.live_mode) {
+        float ind_w = 280.f, ind_h = 26.f;
+        float ix = ox + width - ind_w - 14.f;
+        float iy = oy + 6.f;
+
+        // Background pill
+        dl->AddRectFilled(ImVec2(ix, iy), ImVec2(ix + ind_w, iy + ind_h),
+            IM_COL32(15, 15, 22, (int)(220 * a)), 13.f);
+        dl->AddRect(ImVec2(ix, iy), ImVec2(ix + ind_w, iy + ind_h),
+            IM_COL32(80, 80, 120, (int)(40 * a)), 13.f);
+
+        // Pulsing live dot
+        static float pulse = 0.f;
+        pulse += dt * 3.f;
+        if (pulse > 6.283f) pulse -= 6.283f;
+        float pulse_a = 0.6f + 0.4f * sinf(pulse);
+        if (disasm.live_paused) pulse_a = 0.3f;
+
+        ImU32 dot_col = disasm.live_paused
+            ? IM_COL32(200, 180, 60, (int)(180 * pulse_a * a))
+            : IM_COL32(60, 220, 80, (int)(255 * pulse_a * a));
+        float dot_x = ix + 14.f, dot_y = iy + ind_h * 0.5f;
+        dl->AddCircleFilled(ImVec2(dot_x, dot_y), 4.f, dot_col);
+
+        // Label
+        const char* status_txt = disasm.live_paused ? "PAUSED" : "LIVE";
+        dl->AddText(ImVec2(dot_x + 10.f, iy + (ind_h - ImGui::GetFontSize()) * 0.5f),
+            disasm.live_paused
+                ? IM_COL32(200, 180, 60, (int)(200 * a))
+                : IM_COL32(60, 220, 80, (int)(220 * a)),
+            status_txt);
+
+        // Module name
+        float label_x = dot_x + 10.f + ImGui::CalcTextSize(status_txt).x + 8.f;
+        std::string mod_short = disasm.live_module;
+        if (mod_short.size() > 18) mod_short = mod_short.substr(0, 15) + "...";
+        dl->AddText(ImVec2(label_x, iy + (ind_h - ImGui::GetFontSize()) * 0.5f),
+            IM_COL32(160, 160, 180, (int)(180 * a)), mod_short.c_str());
+
+        // Pause/Resume button
+        float btn_x = ix + ind_w - 56.f;
+        float btn_y = iy + 3.f;
+        float btn_w2 = 48.f, btn_h2 = ind_h - 6.f;
+        bool btn_hov = ImGui::IsMouseHoveringRect(
+            ImVec2(btn_x, btn_y), ImVec2(btn_x + btn_w2, btn_y + btn_h2));
+        dl->AddRectFilled(ImVec2(btn_x, btn_y), ImVec2(btn_x + btn_w2, btn_y + btn_h2),
+            btn_hov ? IM_COL32(255, 255, 255, (int)(25 * a))
+                    : IM_COL32(255, 255, 255, (int)(10 * a)), 6.f);
+        const char* btn_lbl = disasm.live_paused ? "Play" : "Pause";
+        ImVec2 bts = ImGui::CalcTextSize(btn_lbl);
+        dl->AddText(ImVec2(btn_x + (btn_w2 - bts.x) * 0.5f, btn_y + (btn_h2 - bts.y) * 0.5f),
+            IM_COL32(200, 200, 220, (int)(200 * a)), btn_lbl);
+        if (btn_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            disasm.live_paused = !disasm.live_paused;
+            if (!disasm.live_paused)
+                disasm.live_needs_refresh = true;
+        }
+    }
+
+
+    {
+        float total_content = n * line_h;
+        if (total_content > height) {
+            const float sb_w = 10.f;
+            const float sb_pad = 2.f;
+            float track_x = ox + width - sb_w - sb_pad;
+            float track_y0 = oy + sb_pad;
+            float track_h  = height - sb_pad * 2.f;
+
+            float ratio = height / total_content;
+            float thumb_h = std::max(20.f, track_h * ratio);
+            float scroll_range = total_content - height;
+            float thumb_y = track_y0 + (scroll_range > 0.f ? (st.scroll_y / scroll_range) * (track_h - thumb_h) : 0.f);
+
+            bool sb_hov = ImGui::IsMouseHoveringRect(
+                ImVec2(track_x - 4.f, track_y0), ImVec2(track_x + sb_w + 4.f, track_y0 + track_h));
+
+            ImGuiID sb_hov_id = ImGui::GetID("##disasm_sb_hov");
+            float sb_a = ImGui::GetStateStorage()->GetFloat(sb_hov_id, 0.f);
+            sb_a += ((sb_hov || st.sb_dragging ? 1.f : 0.f) - sb_a) * std::min(14.f * dt, 1.f);
+            ImGui::GetStateStorage()->SetFloat(sb_hov_id, sb_a);
+
+            if (sb_a > 0.01f) {
+                dl->AddRectFilled(ImVec2(track_x, track_y0), ImVec2(track_x + sb_w, track_y0 + track_h),
+                    IM_COL32(255, 255, 255, (int)(8.f * sb_a * a)), 3.f);
+
+                bool thumb_hov = ImGui::IsMouseHoveringRect(
+                    ImVec2(track_x - 2.f, thumb_y), ImVec2(track_x + sb_w + 2.f, thumb_y + thumb_h));
+                int thumb_alpha = thumb_hov || st.sb_dragging ? (int)(120.f * sb_a * a) : (int)(60.f * sb_a * a);
+                dl->AddRectFilled(ImVec2(track_x, thumb_y), ImVec2(track_x + sb_w, thumb_y + thumb_h),
+                    IM_COL32(200, 200, 220, thumb_alpha), 3.f);
+            }
+
+            if (sb_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                float my = ImGui::GetIO().MousePos.y;
+                if (my < thumb_y || my > thumb_y + thumb_h) {
+                    float click_ratio = (my - track_y0 - thumb_h * 0.5f) / (track_h - thumb_h);
+                    click_ratio = std::max(0.f, std::min(1.f, click_ratio));
+                    st.target_scroll_y = click_ratio * scroll_range;
+                }
+                st.sb_dragging = true;
+                st.sb_drag_offset = ImGui::GetIO().MousePos.y - thumb_y;
+            }
+
+            if (st.sb_dragging) {
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    float my = ImGui::GetIO().MousePos.y - st.sb_drag_offset;
+                    float drag_ratio = (my - track_y0) / (track_h - thumb_h);
+                    drag_ratio = std::max(0.f, std::min(1.f, drag_ratio));
+                    st.target_scroll_y = drag_ratio * scroll_range;
+                    st.scroll_y = st.target_scroll_y;
+                } else {
+                    st.sb_dragging = false;
+                }
+            }
         }
     }
 }

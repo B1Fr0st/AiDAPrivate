@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <mutex>
 
+#include "standalone_driver.hpp"
+
 
 struct AsmInstr
 {
@@ -55,6 +57,17 @@ struct DisasmState
     DisasmFile file;
     int  ctx_row   = -1;
     bool show_ctx  = false;
+
+    // Live disassembly state
+    bool     live_mode       = false;
+    uint32_t live_pid        = 0;
+    uint64_t live_base       = 0;
+    uint64_t live_size       = 0;
+    std::string live_module;
+    float    live_refresh_timer = 0.f;
+    float    live_refresh_interval = 1.0f;   // seconds between refreshes
+    bool     live_paused     = false;
+    bool     live_needs_refresh = false;
 };
 
 
@@ -222,15 +235,11 @@ namespace disasm
     }
 
 
-    static constexpr int MAX_INSTRS = 250000;
-
-
     inline void decode_section(DisasmFile& file)
     {
         file.instrs.clear();
         if (file.sections.empty()) return;
-        const int reserve_count = static_cast<int>(file.sections[0].bytes.size() / 3);
-        file.instrs.reserve(static_cast<size_t>((reserve_count < MAX_INSTRS) ? reserve_count : MAX_INSTRS));
+        file.instrs.reserve(file.sections[0].bytes.size() / 3);
 
         for (auto& section : file.sections) {
             const uint8_t* data = section.bytes.data();
@@ -239,15 +248,6 @@ namespace disasm
             uint64_t        va   = section.va;
 
             while (off < sz) {
-                if ((int)file.instrs.size() >= MAX_INSTRS) {
-                    AsmInstr cap{};
-                    cap.addr = va + off;
-                    snprintf(cap.mnem, sizeof(cap.mnem), "...");
-                    snprintf(cap.ops,  sizeof(cap.ops),
-                             "output capped at %d instructions", MAX_INSTRS);
-                    file.instrs.push_back(cap);
-                    return;
-                }
 
                 const int remaining = sz - off;
                 const int avail = (remaining < 15) ? remaining : 15;
@@ -258,5 +258,70 @@ namespace disasm
                 off += ins.len;
             }
         }
+    }
+
+
+    inline bool decode_live(DisasmState& state)
+    {
+        if (!state.live_mode || state.live_base == 0 || state.live_size == 0)
+            return false;
+
+        if (driver_bridge::attached_pid() != state.live_pid)
+            return false;
+
+        std::vector<uint8_t> mem;
+        if (!driver_bridge::read_memory(state.live_base, static_cast<size_t>(state.live_size), mem))
+            return false;
+
+        if (mem.empty()) return false;
+
+        state.file.sections.clear();
+        PESection sec;
+        sec.va    = state.live_base;
+        sec.bytes = std::move(mem);
+        state.file.sections.push_back(std::move(sec));
+
+        state.file.image_base = state.live_base;
+        state.file.text_va    = state.live_base;
+        state.file.loaded     = true;
+        state.file.err.clear();
+
+        decode_section(state.file);
+
+        return true;
+    }
+
+
+    inline bool start_live(DisasmState& state, uint32_t pid,
+                           uint64_t base, uint64_t size,
+                           const std::string& module_name)
+    {
+        state.live_mode   = true;
+        state.live_pid    = pid;
+        state.live_base   = base;
+        state.live_size   = size;
+        state.live_module = module_name;
+        state.live_paused = false;
+        state.live_refresh_timer = 0.f;
+        state.live_needs_refresh = true;
+
+        state.file = DisasmFile{};
+        state.file.filename = module_name + " [LIVE]";
+        state.file.path     = "live://" + std::to_string(pid) + "/" + module_name;
+        state.file.image_base = base;
+        state.file.text_va    = base;
+
+        return decode_live(state);
+    }
+
+
+    inline void stop_live(DisasmState& state)
+    {
+        state.live_mode   = false;
+        state.live_pid    = 0;
+        state.live_base   = 0;
+        state.live_size   = 0;
+        state.live_module.clear();
+        state.live_paused = false;
     }
 }

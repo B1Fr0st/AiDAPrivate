@@ -1,31 +1,4 @@
-// ============================================================================
-// WhosWho Driver - Comprehensive Feature Test Application
-// Target: test_target.exe (custom-built networking + export target)
-// Tests EVERY SINGLE feature exposed by the voyager::device_t API
-// ============================================================================
-//
-// WHY test_target.exe?
-//   test_target.exe is our purpose-built target process that:
-//     - Exports functions (TestAddNumbers, TestGetTickCount, TestReturnMagic,
-//       TestNoOp) so resolve_export and call_function can be validated with
-//       known argument/return-value signatures
-//     - Generates REAL network traffic: TCP HTTP to example.com, UDP DNS to
-//       8.8.8.8, TLS to dns.google:443, TCP listener on loopback, local TCP
-//       connections — this exercises EVERY networking IOCTL with actual data
-//     - Spawns 9 threads (4 workers + 5 network) so enumerate_threads,
-//       get/set_thread_context, suspend/resume all operate on a rich thread set
-//     - Allocates diverse memory regions (VirtualAlloc with varying sizes) so
-//       enumerate_memory_regions returns a non-trivial result
-//     - Stays alive until signaled via "Global\WhosWhoTestDone" or Enter key
-//
-// INSTRUCTIONS:
-//   1. Build both test_target.exe and test_driver.exe (CMake ALL_BUILD)
-//   2. Load the WhosWho driver
-//   3. Run test_target.exe FIRST (it will generate traffic and wait)
-//   4. Run test_driver.exe (as Administrator) in another terminal
-//   5. Observe results; test_target.exe will be signaled to shut down when done
-//
-// ============================================================================
+
 
 #include "comm.h"
 #include <cstdio>
@@ -38,7 +11,6 @@
 #include <windows.h>
 #include <tlhelp32.h>
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -70,7 +42,7 @@ static void print_ip4(const std::uint8_t* addr) {
 }
 
 static void print_ip(const std::uint8_t* addr, std::uint32_t af) {
-    if (af == 2) { // AF_INET
+    if (af == 2) {
         print_ip4(addr);
     } else {
         for (int i = 0; i < 16; i += 2) {
@@ -80,12 +52,7 @@ static void print_ip(const std::uint8_t* addr, std::uint32_t af) {
     }
 }
 
-// ── Target process detection ────────────────────────────────────────────────
 
-// Find a running test_target.exe via the Windows toolhelp snapshot API.
-// WHY: test_target.exe is our custom-built target with exported functions and
-// active networking threads. Unlike notepad.exe, it generates real TCP/UDP/TLS
-// traffic so every network IOCTL can be validated with actual packet data.
 static std::uint32_t find_target_pid() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
@@ -104,7 +71,6 @@ static std::uint32_t find_target_pid() {
     return pid;
 }
 
-// ── Test Functions ──────────────────────────────────────────────────────────
 
 static bool test_connect() {
     section("CORE: Connect / Disconnect");
@@ -129,9 +95,7 @@ static void test_heartbeat() {
 static std::uint32_t test_find_process() {
     section("CORE: Find Process");
 
-    // WHY "test_target.exe": The driver's find_process walks the EPROCESS linked list
-    // in kernel memory to find a process by name. test_target.exe is our custom target
-    // with exported functions and active network traffic for comprehensive testing.
+
     std::uint32_t pid = device->find_process("test_target.exe");
     char detail[128];
     snprintf(detail, sizeof(detail), "pid=%u", pid);
@@ -174,24 +138,19 @@ static void test_read_write(std::uint64_t base) {
         return;
     }
 
-    // Read DOS header magic 'MZ' (0x5A4D)
-    // WHY: The MZ magic is at offset 0 of every PE image. If we can read it,
-    // the entire phys-read pipeline (DTB lookup → VA→PA translation → MmMapIoSpace)
-    // is working correctly.
+
     std::uint16_t mz = device->read<std::uint16_t>(base);
     char detail[128];
     snprintf(detail, sizeof(detail), "value=0x%04X (expect 0x5A4D)", mz);
     report("read<uint16_t>(MZ magic)", mz == 0x5A4D, detail);
 
-    // read_raw: read 64 bytes of DOS header
+
     std::uint8_t dos_header[64]{};
     std::size_t got = device->read_raw(base, dos_header, sizeof(dos_header));
     snprintf(detail, sizeof(detail), "read %llu bytes", (unsigned long long)got);
     report("read_raw(64 bytes)", got == 64, detail);
 
-    // Read-modify-read in allocated memory (safe writable area)
-    // WHY: We allocate fresh RW memory in the target so write tests can't corrupt
-    // anything important. This validates the full write→read round-trip.
+
     std::uint64_t test_alloc = device->allocate_memory(0x1000);
     if (test_alloc != 0) {
         std::uint64_t test_val = 0xDEADBEEFCAFEBABEULL;
@@ -201,7 +160,7 @@ static void test_read_write(std::uint64_t base) {
                  (unsigned long long)test_val, (unsigned long long)readback);
         report("write<uint64_t> / read<uint64_t> roundtrip", readback == test_val, detail);
 
-        // write_raw / read_raw roundtrip with a 16-byte pattern
+
         std::uint8_t pattern[16];
         for (int i = 0; i < 16; i++) pattern[i] = static_cast<std::uint8_t>(i * 17);
         std::size_t written = device->write_raw(test_alloc + 0x100, pattern, sizeof(pattern));
@@ -221,9 +180,7 @@ static void test_read_write(std::uint64_t base) {
 static void test_kernel_read() {
     section("MEMORY: Kernel Read");
 
-    // WHY KUSER_SHARED_DATA: It's always mapped at KUSER_SHARED_DATA_VA (0xFFFFF78000000000).
-    // The Cookie field at offset 0x330 is a nonzero random value set at boot, so reading it
-    // verifies both kernel DTB resolution and physical read from kernel address space.
+
     std::uint32_t cookie = 0;
     std::size_t got = device->read_kernel_raw(0xFFFFF78000000000ULL + 0x330, &cookie, sizeof(cookie));
     char detail[128];
@@ -234,8 +191,7 @@ static void test_kernel_read() {
 static void test_allocate_free() {
     section("MEMORY: Allocate / Free");
 
-    // WHY 0x2000: Tests multi-page allocation (2 pages) to verify the
-    // ZwAllocateVirtualMemory path in the target's context.
+
     std::uint64_t addr = device->allocate_memory(0x2000);
     char detail[128];
     snprintf(detail, sizeof(detail), "addr=0x%llX", (unsigned long long)addr);
@@ -252,10 +208,7 @@ static void test_allocate_free() {
 static void test_thread_operations() {
     section("THREAD: Enumerate / Context / Suspend / Resume");
 
-    // WHY: test_target.exe spawns 9 threads (4 workers + 5 network threads).
-    // Enumerating them validates the TENUM IOCTL and the kernel-side
-    // ZwQuerySystemInformation(SystemProcessInformation) thread walk.
-    // With 9+ threads we get a much richer result than notepad's 2-3 threads.
+
     auto threads = device->enumerate_threads();
     char detail[256];
     snprintf(detail, sizeof(detail), "count=%llu", (unsigned long long)threads.size());
@@ -268,11 +221,7 @@ static void test_thread_operations() {
         return;
     }
 
-    // Use one of the sleeping worker threads (not the main thread) so that
-    // suspending it doesn't freeze the target's network traffic.
-    // WHY state==5: State 5 = Wait. test_target.exe has dedicated sleep/wait
-    // threads, picking one avoids disrupting the active networking threads.
-    // Pick a thread that's in Wait state (state=5) if available, else first thread.
+
     std::uint32_t tid = threads[0].tid;
     for (auto& t : threads) {
         if (t.state == 5 && t.tid != threads[0].tid) {
@@ -284,16 +233,14 @@ static void test_thread_operations() {
     snprintf(detail, sizeof(detail), "tid=%u", tid);
     printf("  [INFO] Using thread: %s\n", detail);
 
-    // Get context
+
     voyager::device_t::thread_context ctx{};
     bool ok = device->get_thread_context(tid, ctx);
     snprintf(detail, sizeof(detail), "rip=0x%llX rsp=0x%llX",
              (unsigned long long)ctx.rip, (unsigned long long)ctx.rsp);
     report("get_thread_context()", ok, detail);
 
-    // Suspend and resume immediately
-    // WHY: We suspend and immediately resume to verify the IOCTL round-trip
-    // without leaving the thread permanently frozen.
+
     std::uint32_t prev = 0;
     ok = device->suspend_thread(tid, &prev);
     snprintf(detail, sizeof(detail), "prev_count=%u", prev);
@@ -319,7 +266,7 @@ static void test_hw_breakpoints() {
         return;
     }
 
-    // Pick a sleeping thread for safety
+
     std::uint32_t tid = threads[0].tid;
     for (auto& t : threads) {
         if (t.state == 5) { tid = t.tid; break; }
@@ -332,10 +279,7 @@ static void test_hw_breakpoints() {
         return;
     }
 
-    // WHY DR0: We set an execution breakpoint on the module base (which the thread
-    // won't hit during the brief test), and immediately clear it.  This validates
-    // the DR register read/write path through the TCTX IOCTL without triggering
-    // any actual break.
+
     bool ok = device->set_hardware_breakpoint(tid, 0, base, 0, 0);
     report("set_hardware_breakpoint(idx=0)", ok);
 
@@ -353,8 +297,7 @@ static void test_memory_queries(std::uint64_t base) {
         return;
     }
 
-    // WHY image base: It's guaranteed to be mapped, committed, and IMAGE type.
-    // This validates the ZwQueryVirtualMemory path.
+
     voyager::device_t::memory_region_info info{};
     bool ok = device->query_memory(base, info);
     char detail[256];
@@ -363,9 +306,7 @@ static void test_memory_queries(std::uint64_t base) {
              info.state, info.protect, info.type);
     report("query_memory(image base)", ok, detail);
 
-    // Allocate a fresh page, change protection RW→RO→RW, then free it.
-    // WHY fresh page: Changing protection on the image or existing pages
-    // could destabilize the target. A fresh allocation is safe.
+
     std::uint64_t test_page = device->allocate_memory(0x1000);
     if (test_page != 0) {
         std::uint32_t old_prot = 0;
@@ -381,10 +322,7 @@ static void test_memory_queries(std::uint64_t base) {
         skip("protect_memory()", "allocate failed");
     }
 
-    // WHY enumerate: test_target.exe has a rich set of memory regions: the PE
-    // image, stack, heap, loaded DLLs (ntdll, kernel32, ws2_32, etc.), plus 8
-    // explicit VirtualAlloc regions (0x10000..0x80000 bytes each) that it
-    // allocates at startup.  This validates the full VAD walk IOCTL path.
+
     auto regions = device->enumerate_memory_regions(0, 0x7FFFFFFFFFFF, false);
     snprintf(detail, sizeof(detail), "count=%llu", (unsigned long long)regions.size());
     report("enumerate_memory_regions()", !regions.empty(), detail);
@@ -399,10 +337,7 @@ static void test_memory_queries(std::uint64_t base) {
 static void test_process_info(std::uint64_t base) {
     section("PROCESS: PEB / Debug Flags / Resolve Export / V2P");
 
-    // Read PEB
-    // WHY: test_target.exe has a rich PEB with loaded DLLs (ntdll, kernel32,
-    // ws2_32, etc.), heap allocations, proper LDR structures, and Winsock
-    // initialization. More DLLs loaded than notepad due to networking.
+
     voyager::device_t::peb_info peb{};
     bool ok = device->read_peb(peb);
     char detail[256];
@@ -411,18 +346,15 @@ static void test_process_info(std::uint64_t base) {
              peb.being_debugged, (unsigned long long)peb.ldr_address);
     report("read_peb()", ok, detail);
 
-    // Spoof debug flags
+
     std::uint32_t flags = 0;
     ok = device->spoof_debug_flags(&flags);
     snprintf(detail, sizeof(detail), "result_flags=0x%X", flags);
     report("spoof_debug_flags()", ok, detail);
 
-    // Resolve exports from test_target.exe itself
-    // WHY: test_target.exe exports TestAddNumbers, TestGetTickCount,
-    // TestReturnMagic, and TestNoOp. Unlike notepad.exe which has NO named
-    // exports, our custom binary has known exports we can validate directly.
+
     if (base != 0) {
-        // Test resolving our custom exports from the target's own module
+
         std::uint64_t add_nums = device->resolve_export(base, "TestAddNumbers");
         snprintf(detail, sizeof(detail), "addr=0x%llX", (unsigned long long)add_nums);
         report("resolve_export(test_target, \"TestAddNumbers\")", add_nums != 0, detail);
@@ -439,23 +371,21 @@ static void test_process_info(std::uint64_t base) {
         snprintf(detail, sizeof(detail), "addr=0x%llX", (unsigned long long)no_op);
         report("resolve_export(test_target, \"TestNoOp\")", no_op != 0, detail);
 
-        // Also resolve well-known system DLL exports to exercise the LDR walk
-        // WHY: Validates that the driver can walk the PEB→LDR linked list and
-        // parse PE export directories of system DLLs loaded in the target.
+
         std::uint64_t ntdll_base = 0;
         std::uint64_t kernel32_base = 0;
         if (peb.ldr_address != 0) {
-            // PEB_LDR_DATA->InLoadOrderModuleList.Flink is at ldr + 0x10
+
             std::uint64_t first_entry = device->read<std::uint64_t>(peb.ldr_address + 0x10);
             if (first_entry != 0) {
-                // entry[0] = the exe itself, entry[1] = ntdll
+
                 std::uint64_t ntdll_entry = device->read<std::uint64_t>(first_entry);
                 if (ntdll_entry != 0) {
                     ntdll_base = device->read<std::uint64_t>(ntdll_entry + 0x30);
                     printf("  [INFO] ntdll.dll base via LDR walk: 0x%llX\n",
                            (unsigned long long)ntdll_base);
 
-                    // entry[2] = kernel32
+
                     std::uint64_t k32_entry = device->read<std::uint64_t>(ntdll_entry);
                     if (k32_entry != 0) {
                         kernel32_base = device->read<std::uint64_t>(k32_entry + 0x30);
@@ -485,9 +415,7 @@ static void test_process_info(std::uint64_t base) {
         skip("resolve_export()", "no base address");
     }
 
-    // virtual_to_physical
-    // WHY image base: The image base page is always resident (committed + mapped
-    // PE header + .text), so V2P translation must succeed.
+
     if (base != 0) {
         std::uint64_t phys = device->virtual_to_physical(base);
         snprintf(detail, sizeof(detail), "virt=0x%llX phys=0x%llX",
@@ -501,14 +429,11 @@ static void test_process_info(std::uint64_t base) {
 static void test_input() {
     section("INPUT: Mouse / Keyboard");
 
-    // WHY (0,0,0): A zero-delta relative mouse move is a no-op — the cursor
-    // doesn't move — but it still exercises the full MouClass callback injection
-    // path in the driver.
+
     device->move_mouse(0, 0, 0);
     report("move_mouse(0, 0, 0)", true, "no-op move sent");
 
-    // WHY VK_F13 (0x7C): F13 is a nearly-unused key that won't trigger any
-    // application action, but exercises the keyboard code path.
+
     device->send_key(0x7C);
     report("send_key(VK_F13)", true, "harmless key sent");
 }
@@ -524,30 +449,19 @@ static void test_remote_call(std::uint64_t base, std::uint32_t target_pid) {
 
     char detail[256];
 
-    // Find a RET gadget in test_target's address space
-    // WHY: The driver's call_function uses a return gadget for stack-spoofed calls.
+
     const char ret_pattern[] = "\xC3";
     std::uint64_t ret_gadget = device->find_gadget(ret_pattern, 1);
     snprintf(detail, sizeof(detail), "addr=0x%llX", (unsigned long long)ret_gadget);
     report("find_gadget(RET)", ret_gadget != 0, detail);
 
-    // ── Call test_target.exe's own exported functions ──
-    // WHY: Unlike notepad.exe which has NO exports, test_target.exe exports
-    // TestAddNumbers, TestGetTickCount, TestReturnMagic, and TestNoOp.
-    // This lets us verify:
-    //   1. Argument passing (TestAddNumbers: a+b should equal expected sum)
-    //   2. Return value retrieval (TestReturnMagic: known constant 0xDEADC0DE12345678)
-    //   3. Thread hijack stability (multiple sequential calls should all succeed)
-    //   4. Zero-arg calls (TestNoOp: verifies the trampoline with no useful work)
 
-    // Resolve TestAddNumbers from test_target.exe's own export table
     std::uint64_t add_addr = device->resolve_export(base, "TestAddNumbers");
     if (add_addr != 0) {
         printf("  [INFO] TestAddNumbers at 0x%llX, calling with args (100, 200)...\n",
                (unsigned long long)add_addr);
-        // WHY 100+200=300: A simple addition with known operands and known result.
-        // The __stdcall convention passes args via stack/register per x64 ABI.
-        // arg1=100, arg2=200, arg3=0(unused), arg4=0(unused) → return 300.
+
+
         std::uint64_t result = device->call_function(add_addr, 100, 200, 0, 0);
         snprintf(detail, sizeof(detail), "result=%llu (expected 300)",
                  (unsigned long long)result);
@@ -556,14 +470,13 @@ static void test_remote_call(std::uint64_t base, std::uint32_t target_pid) {
         skip("call_function(TestAddNumbers)", "resolve_export failed");
     }
 
-    // Resolve TestReturnMagic from test_target.exe
+
     std::uint64_t magic_addr = device->resolve_export(base, "TestReturnMagic");
     if (magic_addr != 0) {
         printf("  [INFO] TestReturnMagic at 0x%llX, calling...\n",
                (unsigned long long)magic_addr);
-        // WHY 0xDEADC0DE12345678: This is the known constant baked into the function.
-        // If we get it back correctly, it proves the full 64-bit return value path
-        // from RAX through the shell code → call_result poll is intact.
+
+
         std::uint64_t result = device->call_function(magic_addr, 0, 0, 0, 0);
         snprintf(detail, sizeof(detail), "result=0x%llX (expected 0xDEADC0DE12345678)",
                  (unsigned long long)result);
@@ -573,14 +486,13 @@ static void test_remote_call(std::uint64_t base, std::uint32_t target_pid) {
         skip("call_function(TestReturnMagic)", "resolve_export failed");
     }
 
-    // Resolve TestGetTickCount from test_target.exe
+
     std::uint64_t tick_addr = device->resolve_export(base, "TestGetTickCount");
     if (tick_addr != 0) {
         printf("  [INFO] TestGetTickCount at 0x%llX, calling...\n",
                (unsigned long long)tick_addr);
-        // WHY nonzero: GetTickCount64 always returns >0 on a running system.
-        // A third sequential remote call proves the first two didn't corrupt
-        // the target's thread state (context was properly saved/restored).
+
+
         std::uint64_t result = device->call_function(tick_addr, 0, 0, 0, 0);
         snprintf(detail, sizeof(detail), "tick=%llu", (unsigned long long)result);
         report("call_function(TestGetTickCount)", result != 0, detail);
@@ -588,12 +500,11 @@ static void test_remote_call(std::uint64_t base, std::uint32_t target_pid) {
         skip("call_function(TestGetTickCount)", "resolve_export failed");
     }
 
-    // Resolve TestNoOp from test_target.exe
+
     std::uint64_t noop_addr = device->resolve_export(base, "TestNoOp");
     if (noop_addr != 0) {
-        // WHY return==0: TestNoOp returns 0 unconditionally. This validates
-        // that a zero return value is correctly propagated (not confused with
-        // a failure sentinel).
+
+
         std::uint64_t result = device->call_function(noop_addr, 0, 0, 0, 0);
         snprintf(detail, sizeof(detail), "result=%llu (expected 0)",
                  (unsigned long long)result);
@@ -602,9 +513,7 @@ static void test_remote_call(std::uint64_t base, std::uint32_t target_pid) {
         skip("call_function(TestNoOp)", "resolve_export failed");
     }
 
-    // Also call GetCurrentProcessId via kernel32 as a cross-check
-    // WHY: Verifies the PID matches what find_process returned, confirming
-    // we're operating in the correct process context.
+
     voyager::device_t::peb_info peb{};
     device->read_peb(peb);
     std::uint64_t kernel32_base = 0;
@@ -639,20 +548,11 @@ static void test_remote_call(std::uint64_t base, std::uint32_t target_pid) {
     }
 }
 
-// ── Network Test Functions ──────────────────────────────────────────────────
-// WHY we use test_target.exe for network tests:
-// test_target.exe generates REAL network traffic — TCP HTTP to example.com,
-// UDP DNS to 8.8.8.8, TLS to dns.google:443, a TCP listener on loopback, and
-// local TCP connections. This means PID-filtered queries will return ACTUAL
-// connections, packets, and DNS entries from our target process.
-// Every network IOCTL is exercised with real data, not empty results.
 
 static void test_network_connections(std::uint32_t target_pid) {
     section("NETWORK: Enumerate Connections");
 
-    // WHY target_pid filter: test_target.exe has active TCP/UDP connections
-    // (HTTP to example.com, DNS to 8.8.8.8, TLS to dns.google, listener on
-    // loopback). PID-filtered results should show these live connections.
+
     auto conns = device->enumerate_connections(target_pid, 0);
     char detail[256];
     snprintf(detail, sizeof(detail), "count=%llu (test_target has active connections)",
@@ -671,7 +571,7 @@ static void test_network_connections(std::uint32_t target_pid) {
         shown++;
     }
 
-    // System-wide: other processes (svchost, browsers, etc.) have connections
+
     auto all_conns = device->enumerate_connections(0, 0);
     snprintf(detail, sizeof(detail), "all_pids count=%llu",
              (unsigned long long)all_conns.size());
@@ -693,8 +593,7 @@ static void test_network_connections(std::uint32_t target_pid) {
 static void test_capture(std::uint32_t target_pid) {
     section("NETWORK: Packet Capture");
 
-    // WHY target_pid capture: test_target.exe generates real HTTP, DNS, and TLS
-    // traffic, so capturing its PID should yield actual packets.
+
     bool ok = device->start_capture(target_pid, 0, 0, nullptr, 1500);
     report("start_capture(target_pid)", ok);
 
@@ -705,12 +604,11 @@ static void test_capture(std::uint32_t target_pid) {
         return;
     }
 
-    // WHY 3 seconds: test_target.exe has periodic HTTP/DNS/TLS traffic that
-    // should produce packets within a few seconds.
+
     printf("  [INFO] Capturing test_target traffic for 3 seconds...\n");
     Sleep(3000);
 
-    // Check status
+
     bool active = false;
     std::uint32_t captured = 0, dropped = 0;
     ok = device->get_capture_status(active, captured, dropped);
@@ -719,11 +617,11 @@ static void test_capture(std::uint32_t target_pid) {
              active, captured, dropped);
     report("get_capture_status()", ok, detail);
 
-    // Get packets
+
     auto pkts = device->get_captured_packets(64);
     snprintf(detail, sizeof(detail), "count=%llu", (unsigned long long)pkts.size());
-    // NOTE: On an isolated VM with no internet, this may be 0 — that's OK.
-    // The IOCTL path is still fully exercised.
+
+
     report("get_captured_packets(64)", true, detail);
 
     int shown = 0;
@@ -742,8 +640,7 @@ static void test_capture(std::uint32_t target_pid) {
 static void test_dns_queries(std::uint32_t target_pid) {
     section("NETWORK: DNS Queries");
 
-    // WHY target_pid: test_target.exe resolves example.com, 8.8.8.8 (UDP DNS),
-    // and dns.google (TLS). PID-filtered DNS queries should return these.
+
     auto dns = device->get_dns_queries(target_pid);
     char detail[128];
     snprintf(detail, sizeof(detail), "count=%llu (test_target resolves multiple domains)",
@@ -758,7 +655,7 @@ static void test_dns_queries(std::uint32_t target_pid) {
         shown++;
     }
 
-    // System-wide: svchost (DNS client), browsers, and other services
+
     auto all_dns = device->get_dns_queries(0);
     snprintf(detail, sizeof(detail), "all_pids count=%llu",
              (unsigned long long)all_dns.size());
@@ -773,8 +670,7 @@ static void test_dns_queries(std::uint32_t target_pid) {
 static void test_filter_rules() {
     section("NETWORK: Filter Rules");
 
-    // WHY port 59999: This is an unused port.  Adding and removing a block rule
-    // for it tests the WFP filter rule CRUD without affecting real traffic.
+
     std::uint32_t rule_id = 0;
     bool ok = device->add_filter_rule(1, 1, 6, 0, 59999, nullptr, nullptr, &rule_id);
     char detail[128];
@@ -795,8 +691,7 @@ static void test_filter_rules() {
 static void test_network_stats() {
     section("NETWORK: Stats");
 
-    // WHY: System-wide network stats should show nonzero counters.
-    // test_target.exe also contributes real traffic to the counters.
+
     voyager::device_t::network_stats stats{};
     bool ok = device->get_network_stats(stats);
     char detail[256];
@@ -811,9 +706,7 @@ static void test_network_stats() {
 static void test_wfp_callouts() {
     section("NETWORK: WFP Callouts");
 
-    // WHY: The WhosWho driver itself registers WFP callouts for packet capture.
-    // Plus there are typically system-level WFP callouts (Windows Firewall, etc).
-    // Enumerating them validates the EWFP IOCTL path.
+
     auto callouts = device->enumerate_wfp_callouts("");
     char detail[128];
     snprintf(detail, sizeof(detail), "count=%llu", (unsigned long long)callouts.size());
@@ -830,9 +723,7 @@ static void test_wfp_callouts() {
 static void test_socket_handles(std::uint32_t target_pid) {
     section("NETWORK: Socket Handles");
 
-    // WHY target_pid: test_target.exe has multiple open sockets (TCP HTTP,
-    // UDP DNS, TLS, TCP listener, local TCP). PID-filtered results should
-    // return these active socket handles.
+
     auto sockets = device->get_socket_handles(target_pid);
     char detail[128];
     snprintf(detail, sizeof(detail), "count=%llu (test_target has multiple sockets)",
@@ -848,7 +739,7 @@ static void test_socket_handles(std::uint32_t target_pid) {
         shown++;
     }
 
-    // System-wide: other processes have many open sockets
+
     auto all_sockets = device->get_socket_handles(0);
     snprintf(detail, sizeof(detail), "all_pids count=%llu",
              (unsigned long long)all_sockets.size());
@@ -867,8 +758,7 @@ static void test_socket_handles(std::uint32_t target_pid) {
 static void test_sniff_net_buffers() {
     section("NETWORK: Sniff Net Buffers");
 
-    // WHY address=0: We're testing the IOCTL path, not trying to sniff a
-    // specific function. address=0 will test the start/get/store/stop lifecycle.
+
     bool ok = device->sniff_net_buffers_start(0, 0, 1, 1, 0, 0);
     report("sniff_net_buffers_start(dummy)", ok);
 
@@ -896,8 +786,7 @@ static void test_sniff_net_buffers() {
 static void test_tcpip_dump(std::uint32_t target_pid) {
     section("NETWORK: TCPIP Connection Dump");
 
-    // WHY target_pid: test_target.exe has HTTP, TLS, and local TCP connections.
-    // PID-filtered TCPIP dump should return these active connections.
+
     auto conns = device->dump_tcpip_connections(target_pid, 0);
     char detail[128];
     snprintf(detail, sizeof(detail), "count=%llu (test_target has active TCP conns)",
@@ -919,21 +808,20 @@ static void test_tcpip_dump(std::uint32_t target_pid) {
 static void test_packet_injection() {
     section("NETWORK: Packet Injection");
 
-    // WHY loopback UDP: Injecting a UDP packet to localhost:65534 is harmless
-    // (nothing is listening) but exercises the full WFP injection path.
+
     std::uint8_t src_addr[16] = {127, 0, 0, 1};
     std::uint8_t dst_addr[16] = {127, 0, 0, 1};
     std::uint8_t payload[] = "WhosWho-Test-Packet";
 
     bool ok = device->inject_packet(
-        1,      // outbound
-        17,     // UDP
-        2,      // AF_INET
-        60000,  // src port
-        65534,  // dst port
+        1,
+        17,
+        2,
+        60000,
+        65534,
         src_addr, dst_addr,
         payload, sizeof(payload),
-        0, 0, 0 // no TCP flags
+        0, 0, 0
     );
     report("inject_packet(UDP localhost:65534)", ok);
 }
@@ -941,9 +829,7 @@ static void test_packet_injection() {
 static void test_packet_mod_rules() {
     section("NETWORK: Packet Modification Rules");
 
-    // WHY safe patterns: The match pattern 0xDEAD is unlikely to appear in
-    // real traffic, so the rule won't actually modify anything.  But the
-    // add/list/remove lifecycle exercises the full IOCTL path.
+
     std::uint8_t pattern[] = {0xDE, 0xAD};
     std::uint8_t replacement[] = {0xBE, 0xEF};
     std::uint32_t rule_id = 0;
@@ -973,9 +859,7 @@ static void test_packet_mod_rules() {
 static void test_traffic_redirect() {
     section("NETWORK: Traffic Redirect Rules");
 
-    // WHY 10.0.0.1:9999: This is an RFC 1918 address that doesn't exist on most
-    // networks. The redirect rule targets traffic that will never appear, so it's
-    // completely safe. But the CRUD operations exercise the driver's redirect table.
+
     std::uint8_t match_addr[16] = {10, 0, 0, 1};
     std::uint8_t redir_addr[16] = {127, 0, 0, 1};
     std::uint32_t rule_id = 0;
@@ -1002,9 +886,7 @@ static void test_traffic_redirect() {
 static void test_stream_reassembly() {
     section("NETWORK: Stream Reassembly");
 
-    // WHY port 80: We test the start/stop lifecycle with port 80, which
-    // test_target.exe's HTTP thread uses to connect to example.com.
-    // Stream reassembly should capture HTTP request/response data.
+
     std::vector<std::uint8_t> stream_data;
     std::uint32_t total_packets = 0, truncated = 0;
 
@@ -1019,7 +901,7 @@ static void test_stream_reassembly() {
     report("stream_reassemble_op(start, port=80)", ok, detail);
 
     if (!stream_data.empty()) {
-        // Show first 64 bytes of reassembled data
+
         printf("  [INFO] Stream preview (first %llu bytes): ",
                (unsigned long long)(stream_data.size() < 64 ? stream_data.size() : 64));
         for (std::size_t i = 0; i < stream_data.size() && i < 64; i++) {
@@ -1038,8 +920,7 @@ static void test_stream_reassembly() {
 static void test_dpi(std::uint32_t target_pid) {
     section("NETWORK: Deep Packet Inspection");
 
-    // WHY: test_target.exe generates HTTP, TLS, and DNS traffic, so PID-filtered
-    // DPI results should detect real protocol signatures from our target process.
+
     auto results = device->get_dpi_results(target_pid, 0, 0, 0);
     char detail[128];
     snprintf(detail, sizeof(detail), "count=%llu (test_target generates HTTP/TLS/DNS)",
@@ -1071,9 +952,7 @@ static void test_dpi(std::uint32_t target_pid) {
 static void test_intercept() {
     section("NETWORK: Packet Interception");
 
-    // WHY: Start intercepting, briefly hold packets, then release. System
-    // background traffic may or may not produce held packets, but the
-    // start/stop lifecycle is validated either way.
+
     std::uint32_t held_count = 0;
     bool active = false;
 
@@ -1084,7 +963,7 @@ static void test_intercept() {
     snprintf(detail, sizeof(detail), "held=%u active=%d", held_count, active);
     report("intercept_op(start)", ok, detail);
 
-    // Brief pause to let some packets accumulate
+
     Sleep(500);
 
     auto held = device->get_held_packets();
@@ -1097,7 +976,7 @@ static void test_intercept() {
                held[0].src_port, held[0].dst_port);
     }
 
-    // Stop and release all held packets
+
     ok = device->intercept_op(1);
     report("intercept_op(stop)", ok);
 }
@@ -1105,9 +984,7 @@ static void test_intercept() {
 static void test_kill_connection() {
     section("NETWORK: Kill Connection");
 
-    // WHY non-existent: We try to kill a connection to 10.255.255.254 which
-    // doesn't exist. The driver should return false (no matching connection)
-    // without side effects. This verifies the CKIL IOCTL path.
+
     std::uint8_t src_addr[16] = {127, 0, 0, 1};
     std::uint8_t dst_addr[16] = {10, 255, 255, 254};
 
@@ -1122,8 +999,7 @@ static void test_kill_connection() {
 static void test_dns_spoofing() {
     section("NETWORK: DNS Spoofing");
 
-    // WHY .invalid TLD: RFC 6761 reserves .invalid for testing. No real DNS
-    // resolution will ever match this domain, so the spoof rule is harmless.
+
     std::uint8_t spoof_addr[16] = {127, 0, 0, 1};
     std::uint32_t rule_id = 0;
 
@@ -1149,8 +1025,7 @@ static void test_dns_spoofing() {
 static void test_bandwidth_monitor(std::uint32_t target_pid) {
     section("NETWORK: Bandwidth Monitor");
 
-    // WHY: System-wide bandwidth monitoring should show nonzero counters.
-    // test_target.exe generates real traffic so its per-process BW should be nonzero.
+
     voyager::device_t::bw_stats stats{};
     bool ok = device->bw_monitor_op(0, 0, &stats);
     char detail[256];
@@ -1163,13 +1038,13 @@ static void test_bandwidth_monitor(std::uint32_t target_pid) {
              (unsigned long long)stats.bps_out);
     report("bw_monitor_op(start)", ok, detail);
 
-    // Per-process BW for test_target (should be nonzero — real traffic)
+
     auto procs = device->get_bw_per_process(target_pid);
     snprintf(detail, sizeof(detail), "count=%llu (test_target has active traffic)",
              (unsigned long long)procs.size());
     report("get_bw_per_process(target_pid)", true, detail);
 
-    // System-wide per-process
+
     auto all_procs = device->get_bw_per_process(0);
     snprintf(detail, sizeof(detail), "all_pids count=%llu",
              (unsigned long long)all_procs.size());
@@ -1189,8 +1064,7 @@ static void test_bandwidth_monitor(std::uint32_t target_pid) {
 static void test_enumerate_interfaces() {
     section("NETWORK: Enumerate Interfaces");
 
-    // WHY: Every machine has at least one network interface (loopback + physical
-    // adapter). This validates the NIFS IOCTL and the kernel-side interface walk.
+
     auto ifaces = device->enumerate_interfaces();
     char detail[128];
     snprintf(detail, sizeof(detail), "count=%llu", (unsigned long long)ifaces.size());
@@ -1214,8 +1088,7 @@ static void test_enumerate_interfaces() {
 static void test_pcap_export(std::uint32_t target_pid) {
     section("NETWORK: PCAP Export");
 
-    // WHY target_pid: test_target.exe generates real packets (HTTP, DNS, TLS).
-    // PID-filtered PCAP export should contain actual captured packets.
+
     voyager::device_t::pcap_export_result pcap_result{};
     bool ok = device->export_pcap(target_pid, 0, 128, &pcap_result);
     char detail[256];
@@ -1224,7 +1097,7 @@ static void test_pcap_export(std::uint32_t target_pid) {
              pcap_result.header.magic_number);
     report("export_pcap(target_pid)", ok, detail);
 
-    // System-wide
+
     voyager::device_t::pcap_export_result pcap_all{};
     ok = device->export_pcap(0, 0, 64, &pcap_all);
     snprintf(detail, sizeof(detail), "all_pids packets=%llu",
@@ -1242,14 +1115,11 @@ static void test_pcap_export(std::uint32_t target_pid) {
 static void test_fingerprinting() {
     section("NETWORK: OS Fingerprinting");
 
-    // WHY: test_target.exe makes multiple TCP connections (HTTP, TLS, local),
-    // so SYN/SYN-ACK exchanges from its connections can be fingerprinted.
-    // System-wide, other processes may also trigger TCP handshakes.
+
     bool ok = device->fingerprint_op(0);
     report("fingerprint_op(start)", ok);
 
-    // WHY 2 seconds: Wait for at least one TCP handshake to complete so
-    // the fingerprint collector has SYN-ACK data to analyze.
+
     printf("  [INFO] Collecting fingerprints for 2 seconds...\n");
     Sleep(2000);
 
@@ -1283,8 +1153,7 @@ static void test_dll_protection() {
         return;
     }
 
-    // WHY we parse PE headers: We need the .text section VA and size to register
-    // for integrity monitoring.  test_target.exe has a standard PE layout.
+
     std::uint32_t e_lfanew = device->read<std::uint32_t>(base + 0x3C);
     std::uint64_t nt_hdr = base + e_lfanew;
 
@@ -1300,10 +1169,7 @@ static void test_dll_protection() {
              (unsigned long long)text_va, text_vsize);
     printf("  [INFO] PE sections: %s\n", detail);
 
-    // WHY dummy hash: We register with a known-wrong hash so the driver's
-    // periodic CRC check will detect a "mismatch" — but we query and
-    // unregister before the first check fires (interval=60000ms).
-    // This validates the register/query/unregister IOCTL lifecycle.
+
     bool ok = device->register_dll_protection(base, text_va, text_vsize,
                                                0x12345678AABBCCDDULL, 60000);
     report("register_dll_protection()", ok);
@@ -1319,7 +1185,6 @@ static void test_dll_protection() {
     report("unregister_dll_protection()", ok);
 }
 
-// ── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
     printf("================================================================\n");
@@ -1327,16 +1192,12 @@ int main() {
     printf("  Target: test_target.exe (custom traffic-generating test app)\n");
     printf("================================================================\n\n");
 
-    // ── Launch test_target.exe automatically ──
-    // WHY auto-launch: test_target.exe needs to be running with its 9 threads
-    // (4 worker + 5 network) fully initialized before we start testing.
-    // We launch it ourselves, wait for its network threads to spin up, then
-    // signal shutdown via "Global\WhosWhoTestDone" when tests complete.
+
     STARTUPINFOA si{};
     PROCESS_INFORMATION pi{};
     si.cb = sizeof(si);
 
-    // Try to find test_target.exe in the same directory as the test runner
+
     char exe_path[MAX_PATH];
     GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
     char* last_slash = strrchr(exe_path, '\\');
@@ -1358,9 +1219,7 @@ int main() {
             CloseHandle(pi.hProcess);
             printf("[INFO] Launched test_target.exe (pid=%u)\n", target_pid);
 
-            // WHY 3-second wait: test_target.exe spawns 5 network threads that
-            // need time to establish TCP/UDP/TLS connections. 3 seconds is
-            // conservative enough for DNS resolution + TCP handshakes + TLS setup.
+
             printf("[INFO] Waiting 3 seconds for network threads to initialize...\n");
             Sleep(3000);
         } else {
@@ -1372,7 +1231,7 @@ int main() {
 
     printf("[INFO] Target: test_target.exe (pid=%u)\n\n", target_pid);
 
-    // ── Phase 1: Core Connection ──
+
     if (!test_connect()) {
         printf("\n[FATAL] Cannot connect to driver. Aborting.\n");
         printf("\nResults: PASS=%d FAIL=%d SKIP=%d\n", g_pass, g_fail, g_skip);
@@ -1381,7 +1240,7 @@ int main() {
 
     test_heartbeat();
 
-    // ── Phase 2: Process Discovery ──
+
     std::uint32_t found_pid = test_find_process();
     if (found_pid == 0) {
         printf("\n[FATAL] Cannot find test_target.exe via driver. Aborting.\n");
@@ -1392,38 +1251,31 @@ int main() {
 
     std::uint64_t base = test_find_image();
 
-    // ── Phase 3: DTB ──
+
     test_dtb();
 
-    // ── Phase 4: Memory R/W ──
+
     test_read_write(base);
     test_kernel_read();
     test_allocate_free();
 
-    // ── Phase 5: Threads ──
+
     test_thread_operations();
     test_hw_breakpoints();
 
-    // ── Phase 6: Memory Queries ──
+
     test_memory_queries(base);
 
-    // ── Phase 7: Process Info (PEB, exports, V2P) ──
+
     test_process_info(base);
 
-    // ── Phase 8: Input ──
+
     test_input();
 
-    // ── Phase 9: Remote Call ──
-    // WHY this is placed after DTB + base: call_function needs a valid DTB,
-    // base address, and shellcode allocation to work. We call test_target.exe's
-    // exported functions (TestAddNumbers, TestReturnMagic, GetCurrentProcessId)
-    // which provide deterministic, verifiable return values.
+
     test_remote_call(base, found_pid);
 
-    // ── Phase 10: Network Core ──
-    // WHY test_target.exe for network tests: It generates REAL traffic —
-    // HTTP (TCP 80), UDP DNS (8.8.8.8:53), TLS (dns.google:443), TCP listener,
-    // and local TCP (127.0.0.1:445). PID-filtered queries return actual data.
+
     printf("\n  [INFO] === Beginning network tests ===\n");
     printf("  [INFO] test_target.exe generates HTTP, DNS, TLS, and local TCP traffic\n");
     printf("  [INFO] PID-filtered queries should return real connections and packets\n");
@@ -1434,13 +1286,13 @@ int main() {
     test_filter_rules();
     test_network_stats();
 
-    // ── Phase 11: Network Extended ──
+
     test_wfp_callouts();
     test_socket_handles(target_pid);
     test_sniff_net_buffers();
     test_tcpip_dump(target_pid);
 
-    // ── Phase 12: Packet Operations ──
+
     test_packet_injection();
     test_packet_mod_rules();
     test_traffic_redirect();
@@ -1449,27 +1301,24 @@ int main() {
     test_intercept();
     test_kill_connection();
 
-    // ── Phase 13: DNS / Bandwidth / Interfaces ──
+
     test_dns_spoofing();
     test_bandwidth_monitor(target_pid);
     test_enumerate_interfaces();
 
-    // ── Phase 14: PCAP / Fingerprinting ──
+
     test_pcap_export(target_pid);
     test_fingerprinting();
 
-    // ── Phase 15: DLL Protection ──
+
     test_dll_protection();
 
-    // ── Cleanup ──
+
     section("CLEANUP");
     device->disconnect();
     report("disconnect()", !device->is_connected());
 
-    // ── Signal test_target.exe to shut down ──
-    // WHY named event: test_target.exe waits on "Global\WhosWhoTestDone".
-    // Setting this event causes it to exit cleanly, releasing all sockets
-    // and threads. Only signal if WE launched it (don't kill a user-started instance).
+
     if (launched) {
         HANDLE done_event = OpenEventA(EVENT_MODIFY_STATE, FALSE, "Global\\WhosWhoTestDone");
         if (done_event) {
@@ -1483,7 +1332,7 @@ int main() {
         printf("  [INFO] test_target.exe was already running; not signaling shutdown\n");
     }
 
-    // ── Summary ──
+
     printf("\n================================================================\n");
     printf("  TEST SUMMARY\n");
     printf("================================================================\n");

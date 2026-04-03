@@ -232,44 +232,24 @@ std::string build_system_prompt(bool native_tool_use = false)
         "- Do NOT fabricate tool results. If you need data, call a tool.\n\n";
 
 
-    if (!native_tool_use) {
-        prompt += "## Available Tools\n\n";
+    prompt +=
+        "## Available Tools\n"
+        "Below is the list of all tool names you can call. To learn a tool's parameters "
+        "and description before using it, call `get_tool_descriptions` with the tool names you need.\n\n";
 
+    {
         auto& tools = s_mcp_server.get_tools();
-        for (const auto& t : tools) {
-            prompt += "### " + t.name + "\n";
-            prompt += t.description + "\n";
-            if (!t.params.empty()) {
-                prompt += "Parameters:\n";
-                for (const auto& p : t.params) {
-                    prompt += "- `" + p.name + "` (" + p.type;
-                    if (p.required) prompt += ", required";
-                    prompt += "): " + p.description + "\n";
-                }
-            }
-            prompt += "\n";
-        }
+        for (const auto& t : tools)
+            prompt += "- " + t.name + "\n";
     }
-
 
     auto remote_tools = s_mcp_client_mgr.get_all_tools();
     if (!remote_tools.empty()) {
-        prompt += "## External MCP Tools\n\n";
-        for (const auto& rt : remote_tools) {
-            prompt += "### mcp::" + rt.name + " (from " + rt.server_name + ")\n";
-            prompt += rt.description + "\n";
-            if (rt.input_schema.contains("properties") && rt.input_schema["properties"].is_object()) {
-                prompt += "Parameters:\n";
-                for (auto it = rt.input_schema["properties"].begin();
-                     it != rt.input_schema["properties"].end(); ++it) {
-                    prompt += "- `" + it.key() + "` (";
-                    prompt += it.value().value("type", "string");
-                    prompt += "): " + it.value().value("description", "") + "\n";
-                }
-            }
-            prompt += "\n";
-        }
+        prompt += "\n**External MCP Tools:**\n";
+        for (const auto& rt : remote_tools)
+            prompt += "- mcp::" + rt.name + " (from " + rt.server_name + ")\n";
     }
+    prompt += "\n";
 
     if (!native_tool_use) {
         prompt +=
@@ -295,6 +275,72 @@ std::string execute_tool(const std::string& name, const json& arguments)
     (void)standalone_license::verify_entitlement_state();
 
     output_log::push(bottom_tab_t::mcp_log, "[tool] Executing: " + name);
+
+
+    // Meta-tool: return full descriptions for requested tools
+    if (name == "get_tool_descriptions") {
+        std::string result;
+        json names_arr;
+        if (arguments.contains("names") && arguments["names"].is_array())
+            names_arr = arguments["names"];
+        else if (arguments.contains("names") && arguments["names"].is_string()) {
+            names_arr = json::array();
+            names_arr.push_back(arguments["names"].get<std::string>());
+        }
+
+        auto& tools = s_mcp_server.get_tools();
+        auto remote_tools = s_mcp_client_mgr.get_all_tools();
+
+        for (const auto& req_name : names_arr) {
+            std::string n = req_name.get<std::string>();
+            bool found = false;
+
+            // Check local tools
+            for (const auto& t : tools) {
+                if (t.name == n) {
+                    result += "### " + t.name + "\n" + t.description + "\n";
+                    if (!t.params.empty()) {
+                        result += "Parameters:\n";
+                        for (const auto& p : t.params) {
+                            result += "- `" + p.name + "` (" + p.type;
+                            if (p.required) result += ", required";
+                            result += "): " + p.description + "\n";
+                        }
+                    }
+                    result += "\n";
+                    found = true;
+                    break;
+                }
+            }
+
+            // Check remote MCP tools
+            if (!found) {
+                for (const auto& rt : remote_tools) {
+                    if (("mcp::" + rt.name) == n || rt.name == n) {
+                        result += "### mcp::" + rt.name + " (from " + rt.server_name + ")\n";
+                        result += rt.description + "\n";
+                        if (rt.input_schema.contains("properties") && rt.input_schema["properties"].is_object()) {
+                            result += "Parameters:\n";
+                            for (auto it = rt.input_schema["properties"].begin();
+                                 it != rt.input_schema["properties"].end(); ++it) {
+                                result += "- `" + it.key() + "` (";
+                                result += it.value().value("type", "string");
+                                result += "): " + it.value().value("description", "") + "\n";
+                            }
+                        }
+                        result += "\n";
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!found)
+                result += "### " + n + "\nError: Unknown tool.\n\n";
+        }
+        if (result.empty()) result = "No tool names provided. Pass {\"names\": [\"tool1\", \"tool2\"]}.";
+        return result;
+    }
 
 
     if (name.size() > 5 && name.substr(0, 5) == "mcp::") {
@@ -1042,9 +1088,9 @@ void tick_ai_chat()
         if (s_ai_running.load()) {
             s_cancel = true;
             if (g_sa_ai_client) g_sa_ai_client->cancel();
-            if (s_ai_thread.joinable())
-                s_ai_thread.join();
         }
+        if (s_ai_thread.joinable())
+            s_ai_thread.join();
         s_cancel      = false;
         s_ai_running  = true;
         s_ai_thread   = std::thread(run_agentic,
@@ -2174,7 +2220,6 @@ void render_settings_inline(float panel_w, float panel_h)
                 g_sa_settings.editor_line_numbers = s_ed_line_numbers;
                 g_sa_settings.editor_word_wrap = s_ed_word_wrap;
 
-                g_sa_settings.apply_legacy_fields_to_active_profile();
                 g_sa_settings.sync_legacy_fields_from_active_profile();
 
                 g_sa_settings.save();

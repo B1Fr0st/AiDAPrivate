@@ -798,27 +798,16 @@ namespace disasm
         return true;
     }
 
-    static constexpr int MAX_INSTRS = 250000;
-
     inline void decode_section(DisasmFile& file)
     {
         file.instrs.clear();
-        file.instrs.reserve(std::min((int)file.sections[0].bytes.size() / 3, MAX_INSTRS));
+        file.instrs.reserve(file.sections[0].bytes.size() / 3);
         for (auto& section : file.sections) {
             const uint8_t* data = section.bytes.data();
             int             sz   = (int)section.bytes.size();
             int             off  = 0;
             uint64_t        va   = section.va;
             while (off < sz) {
-                if ((int)file.instrs.size() >= MAX_INSTRS) {
-
-                    AsmInstr cap{};
-                    cap.addr = va + off;
-                    snprintf(cap.mnem, sizeof(cap.mnem), "...");
-                    snprintf(cap.ops,  sizeof(cap.ops),  "output capped at %d instructions", MAX_INSTRS);
-                    file.instrs.push_back(cap);
-                    return;
-                }
                 AsmInstr ins;
                 ins.addr = va + off;
                 char mn[24]={}, op[64]={};

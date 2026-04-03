@@ -22,6 +22,9 @@ struct state_t {
     float scroll_y    = 0.f;
     float target_scroll_y = 0.f;
 
+    bool  sb_dragging = false;
+    float sb_drag_offset = 0.f;
+
 
     bool  goto_visible = false;
     char  goto_buf[20] = {};

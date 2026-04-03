@@ -1400,7 +1400,7 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
 }
 
 bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD input_size) const noexcept {
-    // IOCTL name lookup for debug logging — maps dynamic codes to human-readable names
+
     const char* ioctl_name = "UNKNOWN";
     if      (control_code == ioctl_codes::DTB())  ioctl_name = "DTB(DtbSolve)";
     else if (control_code == ioctl_codes::PHYS()) ioctl_name = "PHYS(PhysRW)";
@@ -3123,13 +3123,6 @@ std::vector<voyager::device_t::fingerprint_info> voyager::device_t::get_fingerpr
     return result;
 }
 
-// ── DLL Protection API ──────────────────────────────────────────────────
-// WHY: The driver's kernel-resident DPC timer computes a CRC hash of the
-// DLL's .text section via physical memory reads every N milliseconds.
-// If the hash ever mismatches the registered value, the driver issues
-// KeBugCheckEx from ring-0 — there is no user-mode code path that can
-// intercept or NOP this. An attacker would need to patch the driver
-// *in kernel memory* (PatchGuard territory) to circumvent it.
 
 bool voyager::device_t::register_dll_protection(
     std::uint64_t module_base, std::uint64_t text_va,

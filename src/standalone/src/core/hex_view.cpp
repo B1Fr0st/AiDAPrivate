@@ -200,93 +200,150 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
 
-    ImGui::SetCursorPos(ImVec2(pos_x, pos_y + total_rows * line_h));
-    ImGui::Dummy(ImVec2(1.f, 1.f));
-
-
     if (sel_lo >= 0 && sel_lo < (int)st.data.size()) {
-        float insp_w = 200.f;
-        float insp_h = 200.f;
+        float insp_w = 260.f;
+        float insp_h = 0.f; // computed below
         float insp_x = ox + width - insp_w - 8.f;
         float insp_y = oy + 8.f;
 
         ImDrawList* fdl = ImGui::GetForegroundDrawList();
-        fdl->AddRectFilled(ImVec2(insp_x, insp_y),
-                           ImVec2(insp_x + insp_w, insp_y + insp_h),
-                           IM_COL32(20, 20, 30, (int)(230 * a)), 6.f);
-        fdl->AddRect(ImVec2(insp_x, insp_y),
-                     ImVec2(insp_x + insp_w, insp_y + insp_h),
-                     IM_COL32(80, 80, 120, (int)(80 * a)), 6.f);
-
-        fdl->AddText(ImVec2(insp_x + 6.f, insp_y + 4.f),
-                     IM_COL32((int)(accent_r*255), (int)(accent_g*255),
-                              (int)(accent_b*255), (int)(220*a)),
-                     "Data Inspector");
-
-        float iy = insp_y + 22.f;
-        float label_x = insp_x + 8.f;
-        float val_x   = insp_x + 80.f;
-        ImU32 label_c = IM_COL32(120, 120, 150, (int)(180 * a));
-        ImU32 val_c   = IM_COL32(200, 200, 230, (int)(230 * a));
         int remaining = (int)st.data.size() - sel_lo;
         const uint8_t* p = st.data.data() + sel_lo;
         char vbuf[64];
 
-        auto add_row = [&](const char* label, const char* val) {
-            fdl->AddText(ImVec2(label_x, iy), label_c, label);
-            fdl->AddText(ImVec2(val_x, iy), val_c, val);
-            iy += 18.f;
-        };
-
+        // Precompute rows to determine height
+        struct InspRow { const char* label; std::string value; };
+        std::vector<InspRow> rows;
 
         if (remaining >= 1) {
-            snprintf(vbuf, sizeof(vbuf), "%d (0x%02X)", (int8_t)p[0], p[0]);
-            add_row("int8", vbuf);
+            snprintf(vbuf, sizeof(vbuf), "%d", (int8_t)p[0]);
+            rows.push_back({"int8", vbuf});
+            snprintf(vbuf, sizeof(vbuf), "%u (0x%02X)", p[0], p[0]);
+            rows.push_back({"uint8", vbuf});
         }
-
         if (remaining >= 2) {
             int16_t v; memcpy(&v, p, 2);
-            snprintf(vbuf, sizeof(vbuf), "%d (0x%04X)", v, (uint16_t)v);
-            add_row("int16", vbuf);
+            uint16_t uv; memcpy(&uv, p, 2);
+            snprintf(vbuf, sizeof(vbuf), "%d", v);
+            rows.push_back({"int16", vbuf});
+            snprintf(vbuf, sizeof(vbuf), "%u (0x%04X)", uv, uv);
+            rows.push_back({"uint16", vbuf});
         }
-
         if (remaining >= 4) {
             int32_t v; memcpy(&v, p, 4);
-            snprintf(vbuf, sizeof(vbuf), "%d (0x%08X)", v, (uint32_t)v);
-            add_row("int32", vbuf);
+            uint32_t uv; memcpy(&uv, p, 4);
+            snprintf(vbuf, sizeof(vbuf), "%d (0x%08X)", v, uv);
+            rows.push_back({"int32", vbuf});
+            snprintf(vbuf, sizeof(vbuf), "%u", uv);
+            rows.push_back({"uint32", vbuf});
         }
-
         if (remaining >= 8) {
             int64_t v; memcpy(&v, p, 8);
+            uint64_t uv; memcpy(&uv, p, 8);
             snprintf(vbuf, sizeof(vbuf), "%lld", (long long)v);
-            add_row("int64", vbuf);
+            rows.push_back({"int64", vbuf});
+            snprintf(vbuf, sizeof(vbuf), "%llu", (unsigned long long)uv);
+            rows.push_back({"uint64", vbuf});
         }
-
         if (remaining >= 4) {
             float v; memcpy(&v, p, 4);
             snprintf(vbuf, sizeof(vbuf), "%.6g", v);
-            add_row("float", vbuf);
+            rows.push_back({"float", vbuf});
         }
-
         if (remaining >= 8) {
             double v; memcpy(&v, p, 8);
             snprintf(vbuf, sizeof(vbuf), "%.10g", v);
-            add_row("double", vbuf);
+            rows.push_back({"double", vbuf});
         }
-
         if (remaining >= 8) {
             uint64_t v; memcpy(&v, p, 8);
             snprintf(vbuf, sizeof(vbuf), "0x%016llX", (unsigned long long)v);
-            add_row("ptr64", vbuf);
+            rows.push_back({"ptr64", vbuf});
         }
-
         {
             std::string s;
-            for (int i = 0; i < std::min(remaining, 20); i++) {
+            for (int i = 0; i < std::min(remaining, 32); i++) {
                 if (p[i] >= 0x20 && p[i] <= 0x7E) s += (char)p[i];
                 else break;
             }
-            if (!s.empty()) add_row("ASCII", s.c_str());
+            if (!s.empty()) rows.push_back({"ASCII", std::move(s)});
+        }
+
+        const float row_h = 18.f;
+        const float header_h = 28.f;
+        const float pad = 8.f;
+        insp_h = header_h + static_cast<float>(rows.size()) * row_h + pad;
+
+        // Drop shadow
+        fdl->AddRectFilled(ImVec2(insp_x + 3.f, insp_y + 3.f),
+                           ImVec2(insp_x + insp_w + 3.f, insp_y + insp_h + 3.f),
+                           IM_COL32(0, 0, 0, (int)(80 * a)), 8.f);
+        // Background
+        fdl->AddRectFilled(ImVec2(insp_x, insp_y),
+                           ImVec2(insp_x + insp_w, insp_y + insp_h),
+                           IM_COL32(18, 18, 28, (int)(240 * a)), 8.f);
+        // Border
+        fdl->AddRect(ImVec2(insp_x, insp_y),
+                     ImVec2(insp_x + insp_w, insp_y + insp_h),
+                     IM_COL32(80, 80, 130, (int)(60 * a)), 8.f);
+
+        // Header bar
+        fdl->AddRectFilled(ImVec2(insp_x, insp_y),
+                           ImVec2(insp_x + insp_w, insp_y + header_h),
+                           IM_COL32(30, 28, 45, (int)(255 * a)), 8.f, ImDrawFlags_RoundCornersTop);
+        // Header accent line
+        fdl->AddLine(ImVec2(insp_x, insp_y + header_h),
+                     ImVec2(insp_x + insp_w, insp_y + header_h),
+                     IM_COL32((int)(accent_r*255), (int)(accent_g*255),
+                              (int)(accent_b*255), (int)(80*a)));
+        // Header text
+        fdl->AddText(ImVec2(insp_x + pad, insp_y + (header_h - ImGui::GetFontSize()) * 0.5f),
+                     IM_COL32((int)(accent_r*200), (int)(accent_g*200),
+                              (int)(accent_b*200), (int)(240*a)),
+                     "Data Inspector");
+        // Offset pill
+        snprintf(vbuf, sizeof(vbuf), "@ 0x%X", sel_lo);
+        ImVec2 offs_ts = ImGui::CalcTextSize(vbuf);
+        fdl->AddRectFilled(
+            ImVec2(insp_x + insp_w - offs_ts.x - 16.f, insp_y + 4.f),
+            ImVec2(insp_x + insp_w - 6.f, insp_y + header_h - 4.f),
+            IM_COL32(50, 48, 70, (int)(200 * a)), 4.f);
+        fdl->AddText(
+            ImVec2(insp_x + insp_w - offs_ts.x - 11.f, insp_y + (header_h - ImGui::GetFontSize()) * 0.5f),
+            IM_COL32(160, 158, 190, (int)(200 * a)), vbuf);
+
+        // Data rows
+        float iy = insp_y + header_h + 2.f;
+        float label_x = insp_x + pad;
+        float val_x   = insp_x + 80.f;
+        ImU32 label_c = IM_COL32(100, 100, 135, (int)(180 * a));
+        ImU32 val_c   = IM_COL32(210, 210, 240, (int)(240 * a));
+
+        for (int ri = 0; ri < (int)rows.size(); ri++) {
+            ImVec2 rmin(insp_x + 2.f, iy);
+            ImVec2 rmax(insp_x + insp_w - 2.f, iy + row_h);
+            bool row_hov = ImGui::IsMouseHoveringRect(rmin, rmax);
+            if (row_hov) {
+                fdl->AddRectFilled(rmin, rmax, IM_COL32(255, 255, 255, (int)(12 * a)), 3.f);
+            }
+            fdl->AddText(ImVec2(label_x, iy + 1.f), label_c, rows[ri].label);
+            fdl->AddText(ImVec2(val_x, iy + 1.f), val_c, rows[ri].value.c_str());
+
+            // Click to copy value
+            if (row_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                if (OpenClipboard(nullptr)) {
+                    EmptyClipboard();
+                    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, rows[ri].value.size() + 1);
+                    if (hg) {
+                        memcpy(GlobalLock(hg), rows[ri].value.c_str(), rows[ri].value.size() + 1);
+                        GlobalUnlock(hg);
+                        SetClipboardData(CF_TEXT, hg);
+                    }
+                    CloseClipboard();
+                }
+            }
+
+            iy += row_h;
         }
     }
 
@@ -353,6 +410,65 @@ void render(float pos_x, float pos_y, float width, float height,
                     st.target_scroll_y = row * line_h;
                     st.sel_start = st.sel_end = off;
                     st.goto_visible = false;
+                }
+            }
+        }
+    }
+
+
+    {
+        float total_content = total_rows * line_h;
+        if (total_content > height) {
+            const float sb_w = 10.f;
+            const float sb_pad = 2.f;
+            float track_x = ox + width - sb_w - sb_pad;
+            float track_y0 = oy + sb_pad;
+            float track_h  = height - sb_pad * 2.f;
+
+            float ratio = height / total_content;
+            float thumb_h = std::max(20.f, track_h * ratio);
+            float scroll_range = total_content - height;
+            float thumb_y = track_y0 + (scroll_range > 0.f ? (st.scroll_y / scroll_range) * (track_h - thumb_h) : 0.f);
+
+            bool sb_hov = ImGui::IsMouseHoveringRect(
+                ImVec2(track_x - 4.f, track_y0), ImVec2(track_x + sb_w + 4.f, track_y0 + track_h));
+
+            ImGuiID sb_hov_id = ImGui::GetID("##hex_sb_hov");
+            float sb_a = ImGui::GetStateStorage()->GetFloat(sb_hov_id, 0.f);
+            sb_a += ((sb_hov || st.sb_dragging ? 1.f : 0.f) - sb_a) * std::min(14.f * dt, 1.f);
+            ImGui::GetStateStorage()->SetFloat(sb_hov_id, sb_a);
+
+            if (sb_a > 0.01f) {
+                dl->AddRectFilled(ImVec2(track_x, track_y0), ImVec2(track_x + sb_w, track_y0 + track_h),
+                    IM_COL32(255, 255, 255, (int)(8.f * sb_a * a)), 3.f);
+
+                bool thumb_hov = ImGui::IsMouseHoveringRect(
+                    ImVec2(track_x - 2.f, thumb_y), ImVec2(track_x + sb_w + 2.f, thumb_y + thumb_h));
+                int thumb_alpha = thumb_hov || st.sb_dragging ? (int)(120.f * sb_a * a) : (int)(60.f * sb_a * a);
+                dl->AddRectFilled(ImVec2(track_x, thumb_y), ImVec2(track_x + sb_w, thumb_y + thumb_h),
+                    IM_COL32(200, 200, 220, thumb_alpha), 3.f);
+            }
+
+            if (sb_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                float my = ImGui::GetIO().MousePos.y;
+                if (my < thumb_y || my > thumb_y + thumb_h) {
+                    float click_ratio = (my - track_y0 - thumb_h * 0.5f) / (track_h - thumb_h);
+                    click_ratio = std::max(0.f, std::min(1.f, click_ratio));
+                    st.target_scroll_y = click_ratio * scroll_range;
+                }
+                st.sb_dragging = true;
+                st.sb_drag_offset = ImGui::GetIO().MousePos.y - thumb_y;
+            }
+
+            if (st.sb_dragging) {
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    float my = ImGui::GetIO().MousePos.y - st.sb_drag_offset;
+                    float drag_ratio = (my - track_y0) / (track_h - thumb_h);
+                    drag_ratio = std::max(0.f, std::min(1.f, drag_ratio));
+                    st.target_scroll_y = drag_ratio * scroll_range;
+                    st.scroll_y = st.target_scroll_y;
+                } else {
+                    st.sb_dragging = false;
                 }
             }
         }

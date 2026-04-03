@@ -396,7 +396,7 @@ void install_async(const package_info_t& pkg)
 
         if (p.registry == registry_t::npm) {
 
-            std::string cmd = "npm install --prefix \"" + pkg_dir + "\" " + p.name + "@" + p.version;
+            std::string cmd = "cmd.exe /c npm install --prefix \"" + pkg_dir + "\" " + p.name + "@" + p.version;
             output = run_process_capture(cmd, pkg_dir, 120000);
 
             srv.package_name = p.name;
@@ -404,8 +404,8 @@ void install_async(const package_info_t& pkg)
             srv.registry = registry_t::npm;
             srv.install_path = pkg_dir;
             srv.transport = "stdio";
-            srv.command = "npx";
-            srv.args = {"-y", p.name};
+            srv.command = "cmd.exe";
+            srv.args = {"/c", "npx", "-y", p.name};
         } else {
 
             std::string venv_dir = pkg_dir + "\\venv";

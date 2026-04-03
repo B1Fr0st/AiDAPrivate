@@ -2247,26 +2247,32 @@ The Software contains highly proprietary, confidential algorithms pertaining to 
 
 **BY ACCEPTING THIS AGREEMENT, YOU EXPRESSLY CONSENT TO THE FOLLOWING CONDITIONS:**
 **4.1. Prohibition on Analysis:** You shall not decompile, disassemble, reverse engineer, debug, unpack, memory-dump, patch, or otherwise attempt to derive the source code or internal workings of `AiDA.dll` or its associated kernel drivers. You are strictly forbidden from loading the Software's binaries into IDA Pro, Ghidra, x64dbg, or any other analysis tool.
+
 **4.2. Destructive Payloads (BOOT FAILURE):** The Software continually monitors its environment for debuggers, unauthorized memory accesses, hash mismatches, and specific reverse-engineering tools. **IF ANY UNAUTHORIZED ANALYSIS OR TAMPERING IS DETECTED, THE SOFTWARE WILL INITIATE A DESTRUCTIVE SEQUENCE.**
+
 **4.3. Specific Consequences:** You acknowledge that triggering the Software's self-defense mechanisms will result in:
 *   **Irreversible corruption of your Windows Boot Configuration Data (BCD)** via system-level commands (e.g., `bcdedit /clean`), rendering your PC completely unable to boot.
 *   An immediate, forced Critical System Failure (Blue Screen of Death / BSOD) via `NtRaiseHardError`.
 *   Permanent hardware and IP bans communicated to the Developer's licensing servers.
 *   Immediate and permanent revocation of your license without refund.
+
 **4.4. Assumption of Risk:** YOU ACKNOWLEDGE THAT ANY DESTRUCTION TO YOUR OPERATING SYSTEM, LOSS OF DATA, HARDWARE BANS, OR INABILITY TO BOOT YOUR COMPUTER CAUSED BY TRIGGERING THE SOFTWARE'S ANTI-REVERSE ENGINEERING PROTECTIONS IS 100% YOUR FAULT. THE DEVELOPER SHALL BEAR ABSOLUTELY NO LIABILITY FOR ANY DAMAGE, DATA LOSS, OR SYSTEM BRICKING CAUSED BY YOUR ATTEMPT TO ANALYZE OR TAMPER WITH THE SOFTWARE.
 
 ### 5. AGGRESSIVE TELEMETRY, PRIVACY, AND DATA COLLECTION
 To enforce licensing, prevent Software leaks, and identify unauthorized usage, the Software actively collects and transmits system telemetry to the Developer's cloud servers.
+
 **5.1. Data Collected:** You consent to the collection and transmission of:
 *   Your IP Address (Public and Local).
 *   Your MAC Address and Network Adapter details.
 *   Your Hardware ID (HWID), calculated using CPU metrics and Volume Serial numbers.
 *   Your Windows Username and Computer Name.
 *   **Your Discord User ID and Username**, which the Software actively harvests from local AppData storage (e.g., LevelDB files associated with Discord, Chrome, Edge, and Brave browsers).
+
 **5.2. Leak Prevention:** If the Software detects that your license is being used on an unauthorized machine, or if the DLL has been shared/leaked, your Discord identity, IP, and HWID will be permanently banned and your license revoked. The Developer reserves the right to publicly publish the identities of users who leak the Software.
 
 ### 6. KERNEL DRIVER RISKS AND SYSTEM INSTABILITY
 **6.1. Ring 0 Operations:** The Software utilizes an active Windows Kernel-Mode driver (operating at Ring 0) to bypass operating system protections, including PatchGuard, Driver Signature Enforcement (DSE), and memory isolation. The Software performs physical memory translation (Virtual to Physical), Direct Kernel Object Manipulation (DKOM), SSDT/IRP inspection, and WFP callout injection.
+
 **6.2. No Guarantee of Stability:** Modifying the Windows Kernel, manipulating thread contexts remotely, and bypassing anti-cheat hypervisors carries extreme inherent risks. The Software may cause unexpected system crashes (BSODs), system lockups, or data corruption during ordinary use. The Developer provides this functionality entirely "AS-IS" and accepts no liability for system instability resulting from the use of the kernel driver or emulation engines.
 
 ### 7. INTELLECTUAL PROPERTY RIGHTS

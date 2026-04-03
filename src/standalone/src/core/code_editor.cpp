@@ -502,6 +502,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     if (!code_editor::active || code_editor::buffer.empty())
         return;
 
+    if (g_code_font) ImGui::PushFont(g_code_font);
+
     if (s_request_undo)   { do_undo();   s_request_undo = false; }
     if (s_request_redo)   { do_redo();   s_request_redo = false; }
     if (s_request_find)   { s_find.visible = true; s_find.replace_mode = false; s_request_find = false; }
@@ -563,6 +565,11 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
 
     bool hovered = ImGui::IsMouseHoveringRect(bb.Min, bb.Max);
+
+    // Block all input when save-confirmation overlay is active
+    bool input_blocked = (file_tabs::pending_close_idx >= 0);
+    if (input_blocked) hovered = false;
+
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         ImGui::SetActiveID(id, ImGui::GetCurrentWindow());
         ImGui::SetFocusID(id, ImGui::GetCurrentWindow());
@@ -811,7 +818,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     }
 
 
-    if (s_has_focus || hovered) {
+    if ((s_has_focus || hovered) && !input_blocked) {
         ImVec2 mp = ImGui::GetIO().MousePos;
         bool in_text = mp.x >= ox + text_x0 && mp.y >= oy && mp.y <= oy + editor_h;
 
@@ -865,7 +872,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     }
 
 
-    if (s_has_focus) {
+    if (s_has_focus && !input_blocked) {
         auto& io = ImGui::GetIO();
         bool ctrl  = io.KeyCtrl;
         bool shift = io.KeyShift;
@@ -1002,6 +1009,42 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 }
             }
             insert_text_at_caret("\n" + indent);
+            ensure_caret_visible(editor_h, line_h);
+        }
+        else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Backspace, true)) {
+            if (s_sel.has_selection()) {
+                delete_selection();
+            } else if (s_sel.caret_col > 0) {
+                push_undo();
+                auto& ln = s_cache.lines[s_sel.caret_line];
+                int col = s_sel.caret_col;
+                int start = col;
+                // skip whitespace backwards
+                while (start > 0 && (ln[start - 1] == ' ' || ln[start - 1] == '\t'))
+                    start--;
+                // if we only skipped whitespace and hit a word char, delete the word
+                if (start > 0) {
+                    // delete word characters (alphanumeric + underscore)
+                    while (start > 0 && (isalnum((unsigned char)ln[start - 1]) || ln[start - 1] == '_'))
+                        start--;
+                }
+                // if nothing was skipped (e.g. punctuation), delete at least one char
+                if (start == col)
+                    start = col - 1;
+                ln.erase(start, col - start);
+                s_sel.caret_col = s_sel.anchor_col = start;
+                rebuild_buffer_from_lines();
+            } else if (s_sel.caret_line > 0) {
+                push_undo();
+                int prev = s_sel.caret_line - 1;
+                int prev_len = (int)s_cache.lines[prev].size();
+                s_cache.lines[prev] += s_cache.lines[s_sel.caret_line];
+                s_cache.lines.erase(s_cache.lines.begin() + s_sel.caret_line);
+                s_cache.tokens.erase(s_cache.tokens.begin() + s_sel.caret_line);
+                s_sel.caret_line = s_sel.anchor_line = prev;
+                s_sel.caret_col  = s_sel.anchor_col  = prev_len;
+                rebuild_buffer_from_lines();
+            }
             ensure_caret_visible(editor_h, line_h);
         }
         else if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_Backspace, true)) {
@@ -1251,4 +1294,6 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             }
         }
     }
+
+    if (g_code_font) ImGui::PopFont();
 }

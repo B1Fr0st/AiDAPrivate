@@ -140,6 +140,17 @@ int main(int, char**)
     io.Fonts->AddFontFromMemoryTTF(
         (void*)verdana, sizeof(verdana), 14, &cfg);
 
+    {
+        char win_dir[MAX_PATH];
+        GetWindowsDirectoryA(win_dir, MAX_PATH);
+        std::string consolas_path = std::string(win_dir) + "\\Fonts\\consola.ttf";
+        ImFontConfig mono_cfg{};
+        mono_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_ForceAutoHint | ImGuiFreeTypeBuilderFlags_LightHinting;
+        mono_cfg.PixelSnapH = true;
+        mono_cfg.RasterizerMultiply = 1.0f;
+        g_code_font = io.Fonts->AddFontFromFileTTF(consolas_path.c_str(), 14.0f, &mono_cfg);
+    }
+
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
     D3D11_BLEND_DESC blend_desc = {};
@@ -263,7 +274,7 @@ int main(int, char**)
                     int cx = (screen_w - iw) / 2;
                     int cy = (screen_h - ih) / 2;
                     SetWindowPos(hwnd, nullptr, cx, cy, iw, ih, SWP_NOZORDER);
-                } else if (state_changed) {
+                } else if (!ide_resize_applied) {
 
                     int cx = (screen_w - iw) / 2;
                     int cy = (screen_h - ih) / 2;

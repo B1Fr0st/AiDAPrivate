@@ -866,7 +866,7 @@ namespace voyager {
             net_fingerprint_entry entries[FINGERPRINT_MAX];
         };
 
-        // ── DLL Protection IOCTL structures ──
+
         static constexpr std::uint32_t DPRT_OP_REGISTER   = 0;
         static constexpr std::uint32_t DPRT_OP_QUERY      = 1;
         static constexpr std::uint32_t DPRT_OP_UNREGISTER = 2;
@@ -1314,7 +1314,7 @@ namespace voyager {
         bool fingerprint_op(std::uint32_t operation) noexcept;
         std::vector<fingerprint_info> get_fingerprints() noexcept;
 
-        // DLL Protection — kernel-side code integrity monitor
+
         struct dll_protect_status {
             std::uint32_t status;
             std::uint64_t current_hash;

@@ -86,6 +86,13 @@ inline bool                     g_chat_scroll_to_bottom = false;
 inline float g_chat_demo_timer = 0.f;
 inline int   g_chat_demo_stage = 0;
 
+
+namespace chat_edit {
+	inline bool  active = false;
+	inline int   msg_idx = -1;
+	inline char  buf[4096] = {};
+}
+
 struct ConversationSummary {
 	std::string id;
 	std::string title;
@@ -111,6 +118,8 @@ void tick_ai_chat();
 void poll_ai_chat();
 void render_settings_inline(float panel_w, float panel_h);
 extern bool g_settings_open;
+
+inline ImFont* g_code_font = nullptr;
 
 
 namespace license
@@ -605,6 +614,10 @@ struct OpenTab {
 namespace file_tabs {
 	inline std::vector<OpenTab> tabs;
 	inline int active_tab = -1;
+	inline int  pending_close_idx = -1;
+	inline bool show_close_confirm = false;
+	inline float close_confirm_anim = 0.f;
+	inline int   close_confirm_hovered = -1;
 
 	inline void open_or_focus(const std::string& fpath, const std::string& fname,
 	                          const std::string& content) {

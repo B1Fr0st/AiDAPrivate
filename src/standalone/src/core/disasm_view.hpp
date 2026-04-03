@@ -43,6 +43,10 @@ struct state_t {
     float scroll_y = 0.f;
     float target_scroll_y = 0.f;
 
+    bool  sb_dragging = false;
+    float sb_drag_offset = 0.f;
+    float bm_scroll_x = 0.f;
+
 
     int selected_row = -1;
 

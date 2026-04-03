@@ -729,6 +729,42 @@ nlohmann::json standalone_ai_client_t::build_anthropic_tools(
 {
     using json = nlohmann::json;
     json arr = json::array();
+
+    // The get_tool_descriptions meta-tool — always sent with full definition
+    arr.push_back({
+        {"name", "get_tool_descriptions"},
+        {"description", "Returns the full description and parameter schema for one or more tools. "
+                        "Call this FIRST when you need to use a tool and are unsure of its parameters."},
+        {"input_schema", {
+            {"type", "object"},
+            {"properties", {
+                {"names", {
+                    {"type", "array"},
+                    {"items", {{"type", "string"}}},
+                    {"description", "Array of tool names to look up (e.g. [\"read_memory\", \"disassemble_file\"])"}
+                }}
+            }},
+            {"required", json::array({"names"})}
+        }}
+    });
+
+    // All other tools — compact stubs (name only, minimal description, no params)
+    for (auto& t : tools) {
+        if (t.name == "get_tool_descriptions") continue;
+        arr.push_back({
+            {"name", t.name},
+            {"description", t.description.substr(0, std::min(t.description.size(), static_cast<size_t>(60)))},
+            {"input_schema", {{"type", "object"}, {"properties", json::object()}}}
+        });
+    }
+    return arr;
+}
+
+nlohmann::json standalone_ai_client_t::build_full_tools(
+    const std::vector<mcp_standalone::tool_def_t>& tools)
+{
+    using json = nlohmann::json;
+    json arr = json::array();
     for (auto& t : tools) {
         json props = json::object();
         json req   = json::array();

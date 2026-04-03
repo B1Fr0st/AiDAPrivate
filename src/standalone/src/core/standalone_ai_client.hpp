@@ -90,6 +90,9 @@ public:
     static nlohmann::json build_anthropic_tools(
         const std::vector<mcp_standalone::tool_def_t>& tools);
 
+    static nlohmann::json build_full_tools(
+        const std::vector<mcp_standalone::tool_def_t>& tools);
+
 
     static nlohmann::json make_tool_result_block(
         const std::string& tool_use_id,
