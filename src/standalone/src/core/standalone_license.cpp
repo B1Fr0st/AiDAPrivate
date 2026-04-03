@@ -371,9 +371,7 @@ namespace
         settings.license_key = key;
         settings.license_plan = response.value("plan", "standard");
 
-        /* Build cached payload by merging response into existing payload.
-           Heartbeat responses lack issued_at / session_token / client_nonce,
-           so we must preserve those from the previous full validation. */
+
         json cached_payload = json::object();
         if (!settings.license_sig_payload.empty()) {
             auto existing = json::parse(settings.license_sig_payload, nullptr, false);
@@ -452,8 +450,8 @@ namespace
 
             settings.license_sig_payload.clear();
             settings.license_session_token.clear();
-            /* Preserve license_hwid so re-activation uses the same HWID
-               that was originally bound on the server. */
+
+
             settings.save();
 
             return false;
@@ -462,7 +460,7 @@ namespace
         const int64_t issued_at = payload.value("issued_at", static_cast<int64_t>(0));
         const int64_t now = static_cast<int64_t>(std::time(nullptr));
         if (issued_at <= 0 || std::llabs(now - issued_at) > (7 * 24 * 3600)) {
-            /* Session expired or issued_at missing — attempt online revalidation. */
+
             const std::string nonce = generate_nonce();
             json response;
             std::string reval_err;

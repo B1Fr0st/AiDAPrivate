@@ -615,6 +615,32 @@ void helpers::render_title()
 		bool ctrl  = ImGui::GetIO().KeyCtrl;
 		bool shift = ImGui::GetIO().KeyShift;
 
+		if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) {
+			globals::ui::maximized = !globals::ui::maximized;
+			if (globals::ui::maximized) {
+				RECT r; GetWindowRect(g_hwnd, &r);
+				globals::ui::pre_max_x = (float)r.left;
+				globals::ui::pre_max_y = (float)r.top;
+				globals::ui::pre_max_w = (float)(r.right - r.left);
+				globals::ui::pre_max_h = (float)(r.bottom - r.top);
+				MONITORINFO mi = { sizeof(mi) };
+				GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+				float mw = (float)(mi.rcWork.right - mi.rcWork.left);
+				float mh = (float)(mi.rcWork.bottom - mi.rcWork.top);
+				globals::ui::window_w = mw;
+				globals::ui::window_h = mh;
+				SetWindowPos(g_hwnd, nullptr,
+					mi.rcWork.left, mi.rcWork.top, (int)mw, (int)mh,
+					SWP_NOZORDER);
+			} else {
+				globals::ui::window_w = globals::ui::pre_max_w;
+				globals::ui::window_h = globals::ui::pre_max_h;
+				SetWindowPos(g_hwnd, nullptr,
+					(int)globals::ui::pre_max_x, (int)globals::ui::pre_max_y,
+					(int)globals::ui::pre_max_w, (int)globals::ui::pre_max_h,
+					SWP_NOZORDER);
+			}
+		}
 
 		if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_B, false)) {
 			globals::ui::panel_left_visible = !globals::ui::panel_left_visible;
@@ -1158,10 +1184,11 @@ void helpers::render_title()
 		}
 	}
 
-	float usable = ww - pad * 2.f - gap * 2.f;
+	float ab_for_layout = g_sa_settings.activity_bar_visible ? globals::ui::activity_bar_w : 0.f;
+	float usable = ww - pad * 2.f - gap * 2.f - ab_for_layout;
 	float min_panel = 80.f;
 	float max_left  = usable * 0.3f;
-	float max_right = usable * 0.4f;
+	float max_right = usable * 0.5f;
 
 	static float s_anim_left_w  = 0.f;
 	static float s_anim_right_w = 0.f;
@@ -2071,21 +2098,28 @@ void helpers::render_title()
 
 
 		float rs_x = wp.x + ww - pad - right_w;
-		ImVec2 rs_min(rs_x - 6.f, wp.y + content_top);
-		ImVec2 rs_max(rs_x + 6.f, wp.y + content_top + right_total_h);
+		{
 
-		bool rs_hov = globals::ui::panel_right_visible && ImGui::IsMouseHoveringRect(rs_min, rs_max, false);
-		if (rs_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			globals::ui::dragging_right_splitter = true;
-		if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
-			globals::ui::dragging_right_splitter = false;
-		if (globals::ui::dragging_right_splitter) {
-			float mx = wp.x + ww - ImGui::GetIO().MousePos.x - pad;
-			globals::ui::panel_right_w = std::clamp(mx, min_panel, max_right);
-			g_sa_settings.workspace.right_width = globals::ui::panel_right_w;
+
+			ImVec2 mpos = ImGui::GetIO().MousePos;
+			float rs_y0 = wp.y + content_top;
+			float rs_y1 = wp.y + content_top + right_total_h;
+			bool rs_in_rect = mpos.x >= (rs_x - 8.f) && mpos.x <= (rs_x + 8.f)
+			               && mpos.y >= rs_y0 && mpos.y <= rs_y1;
+			bool rs_hov = globals::ui::panel_right_visible && rs_in_rect
+			           && !globals::ui::dragging_left_splitter && !globals::ui::dragging_bottom_splitter;
+			if (rs_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+				globals::ui::dragging_right_splitter = true;
+			if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+				globals::ui::dragging_right_splitter = false;
+			if (globals::ui::dragging_right_splitter) {
+				float mx = wp.x + ww - mpos.x - pad;
+				globals::ui::panel_right_w = std::clamp(mx, min_panel, max_right);
+				g_sa_settings.workspace.right_width = globals::ui::panel_right_w;
+			}
+			if (rs_hov || globals::ui::dragging_right_splitter)
+				ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 		}
-		if (rs_hov || globals::ui::dragging_right_splitter)
-			ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
 
 		if (bottom_h > 1.f) {
@@ -2113,7 +2147,7 @@ void helpers::render_title()
 		if (globals::ui::dragging_left_splitter)   s_anim_left_w  = left_w;
 		if (globals::ui::dragging_right_splitter)  s_anim_right_w = right_w;
 		if (globals::ui::dragging_bottom_splitter) s_anim_bottom_h = bottom_h;
-		center_w = ww - left_w - right_w - pad * 2.f - gap * 2.f;
+		center_w = ww - left_w - right_w - pad * 2.f - gap * 2.f - ab_for_layout;
 		if (center_w < 200.f) {
 			float excess = 200.f - center_w;
 			float tp = left_w + right_w;
@@ -4447,10 +4481,14 @@ void helpers::render_title()
 					HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
 					MONITORINFO mi = { sizeof(mi) };
 					GetMonitorInfo(mon, &mi);
+					globals::ui::window_w = (float)(mi.rcWork.right - mi.rcWork.left);
+					globals::ui::window_h = (float)(mi.rcWork.bottom - mi.rcWork.top);
 					SetWindowPos(g_hwnd, nullptr, mi.rcWork.left, mi.rcWork.top,
 						mi.rcWork.right - mi.rcWork.left, mi.rcWork.bottom - mi.rcWork.top,
 						SWP_NOZORDER | SWP_NOACTIVATE);
 				} else {
+					globals::ui::window_w = globals::ui::pre_max_w;
+					globals::ui::window_h = globals::ui::pre_max_h;
 					SetWindowPos(g_hwnd, nullptr,
 						(int)globals::ui::pre_max_x, (int)globals::ui::pre_max_y,
 						(int)globals::ui::pre_max_w, (int)globals::ui::pre_max_h,
