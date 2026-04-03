@@ -600,6 +600,16 @@ void helpers::render_title()
 	}
 	globals::ui::accent = themes::resolved.accent;
 
+	const int th_ph_r = (themes::resolved.panel_header >>  0) & 0xFF;
+	const int th_ph_g = (themes::resolved.panel_header >>  8) & 0xFF;
+	const int th_ph_b = (themes::resolved.panel_header >> 16) & 0xFF;
+	const int th_pb_r = (themes::resolved.panel_bg >>  0) & 0xFF;
+	const int th_pb_g = (themes::resolved.panel_bg >>  8) & 0xFF;
+	const int th_pb_b = (themes::resolved.panel_bg >> 16) & 0xFF;
+	const int th_bb_r = (themes::resolved.bg_base >>  0) & 0xFF;
+	const int th_bb_g = (themes::resolved.bg_base >>  8) & 0xFF;
+	const int th_bb_b = (themes::resolved.bg_base >> 16) & 0xFF;
+
 
 	if (!ImGui::GetIO().WantTextInput) {
 		bool ctrl  = ImGui::GetIO().KeyCtrl;
@@ -1007,7 +1017,7 @@ void helpers::render_title()
 		float input_y_rel = wh * 0.5f - 30.f;
 
 		ImGui::SetCursorPos(ImVec2(input_x, input_y_rel));
-		ImGui::PushStyleColor(ImGuiCol_FrameBg,   ImVec4(0.08f, 0.08f, 0.12f, 0.9f * la));
+		ImGui::PushStyleColor(ImGuiCol_FrameBg,   ImVec4(th_pb_r/255.f, th_pb_g/255.f, th_pb_b/255.f, 0.9f * la));
 		ImGui::PushStyleColor(ImGuiCol_Border,     ImVec4(1, 1, 1, 0.1f * la));
 		ImGui::PushStyleColor(ImGuiCol_Text,       ImVec4(0.92f, 0.91f, 1.f, la));
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
@@ -1788,7 +1798,7 @@ void helpers::render_title()
 				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.f);
 				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.f, 6.f));
 				ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
-				ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.09f, 0.09f, 0.13f, 1.f));
+				ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(th_ph_r/255.f, th_ph_g/255.f, th_ph_b/255.f, 1.f));
 				ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1, 1, 1, 0.06f));
 
 				char popup_id[32];
@@ -2097,13 +2107,20 @@ void helpers::render_title()
 				ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
 		}
 
-		left_w   = globals::ui::panel_left_visible ? globals::ui::panel_left_w : 0.f;
-		right_w  = globals::ui::panel_right_visible ? globals::ui::panel_right_w : 0.f;
+		left_w   = globals::ui::dragging_left_splitter ? (globals::ui::panel_left_visible ? globals::ui::panel_left_w : 0.f) : s_anim_left_w;
+		right_w  = globals::ui::dragging_right_splitter ? (globals::ui::panel_right_visible ? globals::ui::panel_right_w : 0.f) : s_anim_right_w;
+		bottom_h = globals::ui::dragging_bottom_splitter ? (globals::ui::panel_bottom_visible ? globals::ui::panel_bottom_h : 0.f) : s_anim_bottom_h;
+		if (globals::ui::dragging_left_splitter)   s_anim_left_w  = left_w;
+		if (globals::ui::dragging_right_splitter)  s_anim_right_w = right_w;
+		if (globals::ui::dragging_bottom_splitter) s_anim_bottom_h = bottom_h;
 		center_w = ww - left_w - right_w - pad * 2.f - gap * 2.f;
-		if (center_w < 200.f) center_w = 200.f;
-
-		bottom_h = globals::ui::panel_bottom_visible ? globals::ui::panel_bottom_h : 0.f;
-		total_h = wh - pad * 2.f - chrome_h - (globals::ui::panel_bottom_visible ? (bottom_h + gap) : 0.f);
+		if (center_w < 200.f) {
+			float excess = 200.f - center_w;
+			float tp = left_w + right_w;
+			if (tp > 0.f) { left_w -= excess * (left_w / tp); right_w -= excess * (right_w / tp); }
+			center_w = 200.f;
+		}
+		total_h = wh - pad * 2.f - chrome_h - (bottom_h > 1.f ? (bottom_h + gap) : 0.f);
 		right_total_h = wh - pad * 2.f - chrome_h;
 	}
 
@@ -2211,7 +2228,7 @@ void helpers::render_title()
 			float sy = 28.f;
 			ImGui::SetCursorPos(ImVec2(6.f, sy));
 			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
-			ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 42, (int)(200 * a)));
+			ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(th_ph_r, th_ph_g, th_ph_b, (int)(200 * a)));
 			ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 200, 215, (int)(230 * a)));
 			ImGui::PushItemWidth(fw - 12.f);
 
@@ -2273,7 +2290,7 @@ void helpers::render_title()
 			sy += 24.f;
 			ImGui::SetCursorPos(ImVec2(6.f, sy));
 			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
-			ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 42, (int)(200 * a)));
+			ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(th_ph_r, th_ph_g, th_ph_b, (int)(200 * a)));
 			ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 200, 215, (int)(230 * a)));
 			ImGui::PushItemWidth(fw - 12.f);
 			ImGui::InputText("##ws_include", workspace_search::g_search.include_buf, sizeof(workspace_search::g_search.include_buf));
@@ -2394,7 +2411,7 @@ void helpers::render_title()
 
 				ImGui::SetCursorPos(ImVec2(6.f, sy));
 				ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
-				ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 42, static_cast<int>(200 * a)));
+				ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(th_ph_r, th_ph_g, th_ph_b, static_cast<int>(200 * a)));
 				ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 200, 215, static_cast<int>(230 * a)));
 				ImGui::PushItemWidth(fw - 12.f);
 
@@ -2415,7 +2432,7 @@ void helpers::render_title()
 
 				ImGui::SetCursorPos(ImVec2(6.f, sy));
 				ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, 2.f));
-				ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 42, static_cast<int>(180 * a)));
+				ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(th_ph_r, th_ph_g, th_ph_b, static_cast<int>(180 * a)));
 				ImGui::PushItemWidth(80.f);
 				const char* reg_items[] = { "npm", "PyPI" };
 				ImGui::Combo("##mkt_reg", &marketplace_ui::registry_idx, reg_items, 2);
@@ -2913,6 +2930,74 @@ void helpers::render_title()
 			}
 		}
 
+		if (hex_view::g_state.active) {
+			bool hex_is_active = (globals::ui::active_center_view == center_view_t::hex_view);
+			const char* hex_label = "Hex View";
+			ImVec2 hts = ImGui::CalcTextSize(hex_label);
+			float htw = 10.f * 2.f + hts.x + 10.f + 6.f;
+			float tab_h3 = row_h - 2.f;
+
+			float htx0;
+			if (g_disasm.file.loaded && !g_disasm.file.instrs.empty()) {
+				std::string dl2 = g_disasm.file.filename;
+				ImVec2 dl2s = ImGui::CalcTextSize(dl2.c_str());
+				float dlw = 10.f * 2.f + dl2s.x + 10.f + 6.f;
+				float dtx0_base;
+				if (!file_tabs::tabs.empty()) {
+					float last = hx0 + hdr_pad;
+					for (int ti = 0; ti < (int)file_tabs::tabs.size(); ti++) {
+						auto& tab = file_tabs::tabs[ti];
+						std::string lb = tab.filename;
+						if (tab.dirty) lb += " *";
+						ImVec2 ls = ImGui::CalcTextSize(lb.c_str());
+						last += 10.f * 2.f + ls.x + 10.f + 6.f + 2.f;
+					}
+					dtx0_base = last + 4.f;
+				} else {
+					dtx0_base = hx0 + hdr_pad;
+				}
+				htx0 = dtx0_base + dlw + 6.f;
+			} else if (!file_tabs::tabs.empty()) {
+				float last = hx0 + hdr_pad;
+				for (int ti = 0; ti < (int)file_tabs::tabs.size(); ti++) {
+					auto& tab = file_tabs::tabs[ti];
+					std::string lb = tab.filename;
+					if (tab.dirty) lb += " *";
+					ImVec2 ls = ImGui::CalcTextSize(lb.c_str());
+					last += 10.f * 2.f + ls.x + 10.f + 6.f + 2.f;
+				}
+				htx0 = last + 4.f;
+			} else {
+				htx0 = hx0 + hdr_pad;
+			}
+
+			float htx1 = htx0 + htw;
+			if (htx1 < rbtn_x0 - 8.f) {
+				float hty0 = r1_cy - tab_h3 * 0.5f;
+				float hty1 = hty0 + tab_h3;
+				bool htab_hov = ImGui::IsMouseHoveringRect(ImVec2(htx0, hty0), ImVec2(htx1, hty1), false);
+
+				if (hex_is_active) {
+					wdl->AddRectFilled(ImVec2(htx0, hty0), ImVec2(htx1, hty1),
+						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
+					wdl->AddLine(ImVec2(htx0 + 2.f, hty1), ImVec2(htx1 - 2.f, hty1),
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+				} else if (htab_hov) {
+					wdl->AddRectFilled(ImVec2(htx0, hty0), ImVec2(htx1, hty1),
+						IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
+				}
+
+				ImU32 htab_col = hex_is_active ? ac_full
+				               : IM_COL32(170, 175, 190, (int)((htab_hov ? 220.f : 160.f)*a));
+				wdl->AddText(ImVec2(htx0 + 10.f, hty0 + (tab_h3 - hts.y) * 0.5f),
+					htab_col, hex_label);
+
+				if (htab_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+					globals::ui::active_center_view = center_view_t::hex_view;
+				}
+			}
+		}
+
 		bool cf_clicked = ghost_btn("Choose File",
 			ImGui::GetID("##cfhv"), ImGui::GetID("##cffl"),
 			rbtn_x0, r1_cy, rbtn_w);
@@ -3039,37 +3124,6 @@ void helpers::render_title()
 	{
 		ImGui::SetCursorPos(ImVec2(0.f, 0.f));
 		code_editor_widget::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-
-
-		if (ID3D11ShaderResourceView* icon_srv = get_active_theme_icon()) {
-			ImDrawList* tdl = ImGui::GetWindowDrawList();
-			ImVec2 torig = ImGui::GetWindowPos();
-			float src_w = 0.f, src_h = 0.f;
-			int icon_idx = g_sa_settings.theme_icon_index;
-			if (custom_themes::active_custom >= 0 &&
-			    custom_themes::active_custom < (int)custom_themes::list.size())
-				icon_idx = custom_themes::list[custom_themes::active_custom].icon_index;
-			if (icon_idx < 0 && g_custom_theme_icon_w > 0 && g_custom_theme_icon_h > 0) {
-				src_w = (float)g_custom_theme_icon_w;
-				src_h = (float)g_custom_theme_icon_h;
-			} else if (icon_idx >= 0 && icon_idx < 4) {
-				src_w = (float)g_theme_icon_w[icon_idx];
-				src_h = (float)g_theme_icon_h[icon_idx];
-			}
-			if (src_w > 0.f && src_h > 0.f) {
-				const float max_h = vh * 0.38f;
-				const float max_w = vw * 0.28f;
-				const float scale = std::min(max_w / src_w, max_h / src_h);
-				const float draw_w = src_w * scale;
-				const float draw_h = src_h * scale;
-					const float icon_pad = 2.f;
-				const ImVec2 img_min(torig.x + vw - draw_w - icon_pad,
-				                     torig.y + vh - draw_h - icon_pad);
-				const ImVec2 img_max(img_min.x + draw_w, img_min.y + draw_h);
-				tdl->AddImage((ImTextureID)icon_srv, img_min, img_max,
-					ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, (int)(172 * a)));
-			}
-		}
 	}
 
 
@@ -3171,11 +3225,14 @@ void helpers::render_title()
 
 
 		{
-			float gear_sz = 18.f;
+			float gear_sz = 20.f;
+			float btn_gap = 2.f;
+			float btn_area = gear_sz * 3.f + btn_gap * 2.f + 8.f;
+			float bx = cw - btn_area;
+			if (bx < 4.f) bx = 4.f;
 
 
-			ImVec2 hist_pos(cw - gear_sz * 3.f - 20.f, 3.f);
-			ImGui::SetCursorPos(hist_pos);
+			ImGui::SetCursorPos(ImVec2(bx, 3.f));
 			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
 			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.08f));
 			ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.12f));
@@ -3188,9 +3245,8 @@ void helpers::render_title()
 			if (ImGui::IsItemHovered())
 				ImGui::SetTooltip("Conversation history");
 
-
-			ImVec2 clr_pos(cw - gear_sz * 2.f - 14.f, 3.f);
-			ImGui::SetCursorPos(clr_pos);
+			bx += gear_sz + btn_gap;
+			ImGui::SetCursorPos(ImVec2(bx, 3.f));
 			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
 			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.08f));
 			ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.12f));
@@ -3202,9 +3258,8 @@ void helpers::render_title()
 			if (ImGui::IsItemHovered())
 				ImGui::SetTooltip("New chat");
 
-
-			ImVec2 btn_pos(cw - gear_sz - 8.f, 3.f);
-			ImGui::SetCursorPos(btn_pos);
+			bx += gear_sz + btn_gap;
+			ImGui::SetCursorPos(ImVec2(bx, 3.f));
 			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
 			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.08f));
 			ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.12f));
@@ -3224,7 +3279,7 @@ void helpers::render_title()
 			ImGui::SetNextWindowPos(ImVec2(ImGui::GetWindowPos().x + cw - hist_w - 4.f,
 			                               ImGui::GetWindowPos().y + 22.f));
 			ImGui::SetNextWindowSize(ImVec2(hist_w, hist_h));
-			ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.08f, 0.12f, 0.95f));
+			ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(th_pb_r/255.f, th_pb_g/255.f, th_pb_b/255.f, 0.95f));
 			ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1,1,1,0.1f));
 			ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
 			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 8.f));
@@ -3530,7 +3585,7 @@ void helpers::render_title()
 
 					ImVec2 bmax = ImVec2(bmin.x + bw, bmin.y + anim_bh);
 					dl->AddRectFilled(bmin, bmax,
-						IM_COL32(34, 32, 52, (int)(210 * falpha * a)), 8.f);
+						IM_COL32(th_ph_r, th_ph_g, th_ph_b, (int)(210 * falpha * a)), 8.f);
 
 
 					chat_render::render_rich_message(
@@ -3633,19 +3688,19 @@ void helpers::render_title()
 				dl->AddRectFilledMultiColor(
 					ImVec2(fade_x0, msgs_screen_pos.y),
 					ImVec2(fade_x1, msgs_screen_pos.y + fade_h),
-					IM_COL32(10, 8, 22, (int)(200 * top_a * a)),
-					IM_COL32(10, 8, 22, (int)(200 * top_a * a)),
-					IM_COL32(10, 8, 22, 0),
-					IM_COL32(10, 8, 22, 0));
+					IM_COL32(th_bb_r, th_bb_g, th_bb_b, (int)(200 * top_a * a)),
+					IM_COL32(th_bb_r, th_bb_g, th_bb_b, (int)(200 * top_a * a)),
+					IM_COL32(th_bb_r, th_bb_g, th_bb_b, 0),
+					IM_COL32(th_bb_r, th_bb_g, th_bb_b, 0));
 			}
 
 			float bot_y = msgs_screen_pos.y + msg_area_h;
 			dl->AddRectFilledMultiColor(
 				ImVec2(fade_x0, bot_y - fade_h),
 				ImVec2(fade_x1, bot_y),
-				IM_COL32(10, 8, 22, 0), IM_COL32(10, 8, 22, 0),
-				IM_COL32(10, 8, 22, (int)(200 * a)),
-				IM_COL32(10, 8, 22, (int)(200 * a)));
+				IM_COL32(th_bb_r, th_bb_g, th_bb_b, 0), IM_COL32(th_bb_r, th_bb_g, th_bb_b, 0),
+				IM_COL32(th_bb_r, th_bb_g, th_bb_b, (int)(200 * a)),
+				IM_COL32(th_bb_r, th_bb_g, th_bb_b, (int)(200 * a)));
 
 			dl->PopClipRect();
 		}
@@ -3744,7 +3799,7 @@ void helpers::render_title()
 					ImGui::SetNextWindowSizeConstraints(ImVec2(220.f, 60.f), ImVec2(320.f, 400.f));
 					ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
 					ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.f, 6.f));
-					ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.09f, 0.09f, 0.13f, 1.f));
+					ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(th_ph_r/255.f, th_ph_g/255.f, th_ph_b/255.f, 1.f));
 					ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1, 1, 1, 0.08f));
 
 					if (ImGui::Begin("##model_popup", &model_open,
@@ -3824,7 +3879,7 @@ void helpers::render_title()
 			}
 
 			ImGui::SetCursorPos(ImVec2(0.f, input_y));
-			ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.08f, 0.08f, 0.12f, 0.85f * a));
+			ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(th_pb_r/255.f, th_pb_g/255.f, th_pb_b/255.f, 0.85f * a));
 			ImGui::PushStyleColor(ImGuiCol_Border,  ImVec4(1, 1, 1, 0.08f * a));
 			ImGui::PushStyleColor(ImGuiCol_Text,    ImVec4(0.92f, 0.91f, 1.f, a));
 			ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);

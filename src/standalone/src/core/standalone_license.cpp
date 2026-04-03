@@ -371,18 +371,32 @@ namespace
         settings.license_key = key;
         settings.license_plan = response.value("plan", "standard");
 
-
-        json cached_payload = response;
+        /* Build cached payload by merging response into existing payload.
+           Heartbeat responses lack issued_at / session_token / client_nonce,
+           so we must preserve those from the previous full validation. */
+        json cached_payload = json::object();
+        if (!settings.license_sig_payload.empty()) {
+            auto existing = json::parse(settings.license_sig_payload, nullptr, false);
+            if (existing.is_object())
+                cached_payload = std::move(existing);
+        }
+        for (auto it = response.begin(); it != response.end(); ++it)
+            cached_payload[it.key()] = it.value();
         cached_payload["hwid"] = hwid;
         cached_payload["license_key"] = key;
+        if (!cached_payload.contains("issued_at") || !cached_payload["issued_at"].is_number())
+            cached_payload["issued_at"] = static_cast<int64_t>(std::time(nullptr));
         settings.license_sig_payload = cached_payload.dump();
 
         settings.license_server_sig = response.value("signature", "");
-        settings.license_session_token = response.value("session_token", "");
+        settings.license_session_token = response.contains("session_token")
+            ? response["session_token"].get<std::string>() : settings.license_session_token;
         settings.license_server_nonce = response.value("server_nonce", "");
-        settings.license_client_nonce = response.value("client_nonce", "");
+        settings.license_client_nonce = response.contains("client_nonce")
+            ? response["client_nonce"].get<std::string>() : settings.license_client_nonce;
         settings.license_hwid = hwid;
-        settings.license_issued_at = response.value("issued_at", static_cast<int64_t>(std::time(nullptr)));
+        settings.license_issued_at = response.contains("issued_at")
+            ? response["issued_at"].get<int64_t>() : (settings.license_issued_at > 0 ? settings.license_issued_at : static_cast<int64_t>(std::time(nullptr)));
         settings.license_ttl = response.value("ttl", static_cast<int64_t>(3600));
         settings.save();
 
@@ -411,7 +425,7 @@ namespace
         if (settings.license_key.empty() || settings.license_sig_payload.empty())
             return false;
 
-        const auto hwid = generate_hwid();
+        const auto hwid = settings.license_hwid.empty() ? generate_hwid() : settings.license_hwid;
         auto payload = json::parse(settings.license_sig_payload, nullptr, false);
         if (payload.is_discarded() || !payload.is_object()) {
             error_out = "Cached license payload is invalid.";
@@ -438,7 +452,8 @@ namespace
 
             settings.license_sig_payload.clear();
             settings.license_session_token.clear();
-            settings.license_hwid.clear();
+            /* Preserve license_hwid so re-activation uses the same HWID
+               that was originally bound on the server. */
             settings.save();
 
             return false;
@@ -447,6 +462,15 @@ namespace
         const int64_t issued_at = payload.value("issued_at", static_cast<int64_t>(0));
         const int64_t now = static_cast<int64_t>(std::time(nullptr));
         if (issued_at <= 0 || std::llabs(now - issued_at) > (7 * 24 * 3600)) {
+            /* Session expired or issued_at missing — attempt online revalidation. */
+            const std::string nonce = generate_nonce();
+            json response;
+            std::string reval_err;
+            if (call_validation_endpoint(settings, "validate", settings.license_key,
+                                         hwid, {}, nonce, reval_err, response)) {
+                apply_valid_response(settings, settings.license_key, hwid, response);
+                return true;
+            }
             error_out = "Cached license session expired; revalidation required.";
             return false;
         }
@@ -550,7 +574,7 @@ namespace standalone_license
 
     bool activate(settings_sa_t& settings, const std::string& key, std::string& error_out)
     {
-        const std::string hwid = generate_hwid();
+        const std::string hwid = settings.license_hwid.empty() ? generate_hwid() : settings.license_hwid;
         const std::string nonce = generate_nonce();
         json response;
 
