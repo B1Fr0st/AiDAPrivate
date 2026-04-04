@@ -7,10 +7,7 @@
 #include <function/CoreSecurity.h>
 #include <function/AntiDebug.h>
 
-// WHY DPFLTR_ERROR_LEVEL: The default Kd_IHVDRIVER_Mask only passes ERROR level (0).
-// INFO level (3) requires manually setting the mask via "ed nt!Kd_IHVDRIVER_Mask 0xF"
-// in WinDbg.  Using ERROR level ensures messages ALWAYS appear on the serial port
-// without any mask configuration — critical for debugging driver issues on real hardware.
+
 #ifndef WW_LOG
 #define WW_LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] " fmt "\n", __VA_ARGS__)
 #define WW_LOG0(msg) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] %s\n", msg)

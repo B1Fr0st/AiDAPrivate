@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <thread>
 #include <algorithm>
 #include <mutex>
 
@@ -48,6 +50,7 @@ struct DisasmFile
     std::vector<PESection> sections;
     std::vector<AsmInstr>  instrs;
     bool                   loaded = false;
+    bool                   decoding = false;
     std::string            err;
 };
 
@@ -58,16 +61,22 @@ struct DisasmState
     int  ctx_row   = -1;
     bool show_ctx  = false;
 
-    // Live disassembly state
+
     bool     live_mode       = false;
     uint32_t live_pid        = 0;
     uint64_t live_base       = 0;
     uint64_t live_size       = 0;
+    uint64_t live_view_addr  = 0;
+    uint64_t live_window     = 0x10000;
     std::string live_module;
     float    live_refresh_timer = 0.f;
-    float    live_refresh_interval = 1.0f;   // seconds between refreshes
+    float    live_refresh_interval = 2.0f;
     bool     live_paused     = false;
     bool     live_needs_refresh = false;
+    bool     live_decoding   = false;
+    std::vector<AsmInstr> live_pending_instrs;
+    uint64_t live_pending_va = 0;
+    std::atomic<bool> live_pending_ready{false};
 };
 
 
@@ -239,16 +248,18 @@ namespace disasm
     {
         file.instrs.clear();
         if (file.sections.empty()) return;
-        file.instrs.reserve(file.sections[0].bytes.size() / 3);
+
+        size_t total_bytes = 0;
+        for (auto& s : file.sections) total_bytes += s.bytes.size();
+        file.instrs.reserve(total_bytes / 4);
 
         for (auto& section : file.sections) {
             const uint8_t* data = section.bytes.data();
-            int             sz   = (int)section.bytes.size();
+            int             sz   = static_cast<int>(section.bytes.size());
             int             off  = 0;
             uint64_t        va   = section.va;
 
             while (off < sz) {
-
                 const int remaining = sz - off;
                 const int avail = (remaining < 15) ? remaining : 15;
                 AsmInstr ins = zydis_decode_one(data + off, avail, va + off);
@@ -258,37 +269,91 @@ namespace disasm
                 off += ins.len;
             }
         }
+
+
+        if (file.instrs.size() > 4) {
+            int last_real = static_cast<int>(file.instrs.size()) - 1;
+            while (last_real > 0 && (file.instrs[last_real].is_nop ||
+                   (file.instrs[last_real].is_priv &&
+                    file.instrs[last_real].raw[0] == 0xCC &&
+                    file.instrs[last_real].len == 1))) {
+                --last_real;
+            }
+            const int keep = last_real + 1 + 3;
+            if (keep < static_cast<int>(file.instrs.size()))
+                file.instrs.resize(keep);
+        }
+
+        file.instrs.shrink_to_fit();
+
+
+        file.sections.clear();
+        file.sections.shrink_to_fit();
     }
 
 
-    inline bool decode_live(DisasmState& state)
+    inline void decode_section_async(DisasmFile& file)
     {
+        if (file.decoding) return;
+        file.decoding = true;
+        std::thread([&file]() {
+            decode_section(file);
+            file.decoding = false;
+        }).detach();
+    }
+
+
+    inline void request_live_decode(DisasmState& state)
+    {
+        if (state.live_decoding) return;
         if (!state.live_mode || state.live_base == 0 || state.live_size == 0)
-            return false;
+            return;
 
-        if (driver_bridge::attached_pid() != state.live_pid)
-            return false;
 
-        std::vector<uint8_t> mem;
-        if (!driver_bridge::read_memory(state.live_base, static_cast<size_t>(state.live_size), mem))
-            return false;
+        uint64_t half = state.live_window / 2;
+        uint64_t win_start = state.live_view_addr;
+        if (win_start > half && (win_start - half) >= state.live_base)
+            win_start -= half;
+        else
+            win_start = state.live_base;
 
-        if (mem.empty()) return false;
+        uint64_t mod_end = state.live_base + state.live_size;
+        uint64_t win_end = win_start + state.live_window;
+        if (win_end > mod_end) win_end = mod_end;
+        uint64_t read_sz = win_end - win_start;
+        if (read_sz == 0) return;
 
-        state.file.sections.clear();
-        PESection sec;
-        sec.va    = state.live_base;
-        sec.bytes = std::move(mem);
-        state.file.sections.push_back(std::move(sec));
+        state.live_decoding = true;
+        uint32_t pid = state.live_pid;
 
-        state.file.image_base = state.live_base;
-        state.file.text_va    = state.live_base;
-        state.file.loaded     = true;
-        state.file.err.clear();
+        std::thread([&state, win_start, read_sz, pid]() {
+            std::vector<uint8_t> mem;
+            if (driver_bridge::attached_pid() == pid) {
+                driver_bridge::read_memory(win_start, static_cast<size_t>(read_sz), mem);
+            }
 
-        decode_section(state.file);
+            std::vector<AsmInstr> instrs;
+            if (!mem.empty()) {
+                instrs.reserve(mem.size() / 4);
+                const uint8_t* data = mem.data();
+                int sz = static_cast<int>(mem.size());
+                int off = 0;
+                while (off < sz) {
+                    int remaining = sz - off;
+                    int avail = (remaining < 15) ? remaining : 15;
+                    AsmInstr ins = zydis_decode_one(data + off, avail, win_start + off);
+                    int raw_len = (ins.len < 15) ? ins.len : 15;
+                    memcpy(ins.raw, data + off, static_cast<size_t>(raw_len));
+                    instrs.push_back(ins);
+                    off += ins.len;
+                }
+            }
 
-        return true;
+            state.live_pending_instrs = std::move(instrs);
+            state.live_pending_va = win_start;
+            state.live_pending_ready.store(true, std::memory_order_release);
+            state.live_decoding = false;
+        }).detach();
     }
 
 
@@ -300,8 +365,11 @@ namespace disasm
         state.live_pid    = pid;
         state.live_base   = base;
         state.live_size   = size;
+        state.live_view_addr = base;
         state.live_module = module_name;
         state.live_paused = false;
+        state.live_decoding = false;
+        state.live_pending_ready.store(false);
         state.live_refresh_timer = 0.f;
         state.live_needs_refresh = true;
 
@@ -310,8 +378,11 @@ namespace disasm
         state.file.path     = "live://" + std::to_string(pid) + "/" + module_name;
         state.file.image_base = base;
         state.file.text_va    = base;
+        state.file.loaded     = true;
 
-        return decode_live(state);
+
+        request_live_decode(state);
+        return true;
     }
 
 
@@ -321,7 +392,11 @@ namespace disasm
         state.live_pid    = 0;
         state.live_base   = 0;
         state.live_size   = 0;
+        state.live_view_addr = 0;
         state.live_module.clear();
         state.live_paused = false;
+        state.live_decoding = false;
+        state.live_pending_ready.store(false);
+        state.live_pending_instrs.clear();
     }
 }

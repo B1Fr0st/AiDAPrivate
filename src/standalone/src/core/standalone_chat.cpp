@@ -9,7 +9,13 @@
 #include "standalone_license.hpp"
 #include "standalone_settings.hpp"
 #include "standalone_driver.hpp"
+#include "standalone_modes.hpp"
+#include "tool_repetition.hpp"
+#include "cost_calculator.hpp"
 #include "zydis_disasm.hpp"
+#include "auto_approval.hpp"
+#include "file_context_tracker.hpp"
+#include "standalone_context.hpp"
 
 #include "../helpers/globals.h"
 
@@ -36,6 +42,12 @@ using json = nlohmann::json;
 extern DisasmState g_disasm;
 
 mcp_client::manager_t s_mcp_client_mgr;
+
+// File context tracker (Roo-Code parity: tracks which files the AI has seen/edited)
+static file_context::tracker_t s_file_tracker;
+
+// Auto-approval task counters (Roo-Code parity: per-task request/cost budgets)
+static auto_approval::task_counters_t s_approval_counters;
 
 namespace {
 
@@ -82,6 +94,7 @@ tool_approval_t s_tool_approval;
 
 bool request_tool_approval(const std::string& name, const json& arguments)
 {
+    // Legacy global auto-approve (kept for backward compatibility)
     if (g_sa_settings.tool_auto_approve)
         return true;
 
@@ -105,6 +118,43 @@ bool request_tool_approval(const std::string& name, const json& arguments)
             while (!tok.empty() && tok.back() == ' ') tok.pop_back();
             if (tok == name) return false;
         }
+    }
+
+    // Granular auto-approval (Roo-Code parity)
+    // WHY: Roo-Code has per-category approval. Check if this tool's category is auto-approved.
+    {
+        auto_approval::settings_t aa_settings;
+        aa_settings.always_allow_read_only  = g_sa_settings.auto_approve_read;
+        aa_settings.always_allow_write      = g_sa_settings.auto_approve_write;
+        aa_settings.always_allow_execute    = g_sa_settings.auto_approve_execute;
+        aa_settings.always_allow_mcp        = g_sa_settings.auto_approve_mcp;
+        aa_settings.always_allow_mode_switch = g_sa_settings.auto_approve_mode_switch;
+        aa_settings.always_allow_subtasks   = g_sa_settings.auto_approve_subtask;
+        aa_settings.max_requests            = g_sa_settings.auto_approve_max_requests;
+        aa_settings.max_cost_usd            = g_sa_settings.auto_approve_max_cost;
+
+        // Build allowed commands list from settings
+        aa_settings.allowed_commands = g_sa_settings.auto_approve_allowed_commands;
+
+        // Check file-level blocking via .aidaignore
+        if (arguments.contains("path")) {
+            std::string path = arguments["path"].get<std::string>();
+            auto ignore_patterns = auto_approval::load_aidaignore(g_sa_settings.aidaignore_path);
+            if (auto_approval::matches_aidaignore(path, ignore_patterns))
+                return false;
+        }
+
+        // Determine command for execute_command tools
+        std::string command;
+        if (name == "execute_command" && arguments.contains("command"))
+            command = arguments["command"].get<std::string>();
+
+        auto decision = auto_approval::should_auto_approve(
+                name, aa_settings, s_approval_counters, command);
+        if (decision == auto_approval::approval_decision_t::approve)
+            return true;
+        if (decision == auto_approval::approval_decision_t::deny)
+            return false;
     }
 
 
@@ -209,16 +259,18 @@ std::string strip_tool_blocks(const std::string& text)
 }
 
 
-std::string build_system_prompt(bool native_tool_use = false)
+std::string build_system_prompt(bool force_xml_fallback = false)
 {
     std::string prompt;
     prompt.reserve(8192);
 
+    // WHY: Roo-Code injects the active mode's role_definition into the system prompt.
+    // This makes the AI behave differently per mode (agent vs code vs architect etc.)
+    const auto& mode = aida_modes::get_active_mode();
+
+    prompt += mode.role_definition + "\n\n";
+
     prompt +=
-        "You are AiDA, a state-of-the-art reverse engineering, binary analysis, "
-        "and debugging assistant. You operate through a kernel-backed live process "
-        "inspection bridge (with user-mode fallback), Zydis for x64 disassembly, and Windows Sandbox for "
-        "safe sample execution.\n\n"
         "## Rules\n"
         "- Be precise, technical, and concise.\n"
         "- When asked to analyze, disassemble, or inspect something, USE YOUR TOOLS.\n"
@@ -231,6 +283,27 @@ std::string build_system_prompt(bool native_tool_use = false)
         "- For number conversions, ALWAYS use `convert_number`.\n"
         "- Do NOT fabricate tool results. If you need data, call a tool.\n\n";
 
+    // WHY: Roo-Code injects environment details (OS, shell, workspace, cwd) into system prompt
+    // so the AI knows the execution context without having to ask.
+    {
+        std::vector<std::string> tool_groups;
+        for (auto g : mode.groups)
+            tool_groups.push_back(aida_modes::tool_group_name(g));
+
+        bool attached = driver_bridge::attached_pid() != 0;
+        std::string env_details = file_context::build_environment_details(
+            g_sa_settings.workspace.root_path,
+            mode.display_name,
+            attached,
+            attached ? driver_bridge::attached_process_name() : "",
+            attached ? driver_bridge::attached_pid() : 0,
+            tool_groups);
+        prompt += env_details + "\n";
+    }
+
+    // Mode-specific custom instructions
+    if (!mode.custom_instructions.empty())
+        prompt += "## Custom Instructions\n" + mode.custom_instructions + "\n\n";
 
     prompt +=
         "## Available Tools\n"
@@ -251,7 +324,7 @@ std::string build_system_prompt(bool native_tool_use = false)
     }
     prompt += "\n";
 
-    if (!native_tool_use) {
+    if (force_xml_fallback) {
         prompt +=
             "## How to call a tool\n\n"
             "When you need to call a tool, output EXACTLY this format (one call per block):\n\n"
@@ -268,16 +341,52 @@ std::string build_system_prompt(bool native_tool_use = false)
 }
 
 
-std::string execute_tool(const std::string& name, const json& arguments)
+std::string execute_tool(const std::string& raw_name, const json& arguments)
 {
-
+    std::string name = aida_modes::resolve_tool_alias(raw_name);
 
     (void)standalone_license::verify_entitlement_state();
 
     output_log::push(bottom_tab_t::mcp_log, "[tool] Executing: " + name);
 
+    // Increment auto-approval request counter (Roo-Code parity: per-task budget tracking)
+    s_approval_counters.auto_approved_requests++;
 
-    // Meta-tool: return full descriptions for requested tools
+    // File context tracking (Roo-Code parity: track which files the AI touches)
+    // WHY: Roo-Code tracks every file read/edit so the AI and UI know what's in context.
+    if (arguments.contains("path") && arguments["path"].is_string()) {
+        std::string path = arguments["path"].get<std::string>();
+        auto group = aida_modes::classify_tool(name);
+        if (group == aida_modes::tool_group_t::edit) {
+            s_file_tracker.record_ai_edit(path);
+        } else if (group == aida_modes::tool_group_t::read || name == "read_file" ||
+                   name == "read_file_content") {
+            s_file_tracker.record_read(path);
+        }
+    }
+
+    {
+        auto group = aida_modes::classify_tool(name);
+        if (group == aida_modes::tool_group_t::edit ||
+            group == aida_modes::tool_group_t::command) {
+            const auto& mode = aida_modes::get_active_mode();
+            if (!mode.file_restrictions.empty() && arguments.contains("path")) {
+                std::string path = arguments["path"].get<std::string>();
+                if (!aida_modes::check_file_restriction(mode, path)) {
+                    return "Error: " + mode.display_name + " mode restricts file edits to: " +
+                           [&]() {
+                               std::string s;
+                               for (size_t i = 0; i < mode.file_restrictions.size(); ++i) {
+                                   if (i > 0) s += ", ";
+                                   s += mode.file_restrictions[i];
+                               }
+                               return s;
+                           }() + ". File '" + path + "' does not match.";
+                }
+            }
+        }
+    }
+
     if (name == "get_tool_descriptions") {
         std::string result;
         json names_arr;
@@ -295,7 +404,7 @@ std::string execute_tool(const std::string& name, const json& arguments)
             std::string n = req_name.get<std::string>();
             bool found = false;
 
-            // Check local tools
+
             for (const auto& t : tools) {
                 if (t.name == n) {
                     result += "### " + t.name + "\n" + t.description + "\n";
@@ -313,7 +422,7 @@ std::string execute_tool(const std::string& name, const json& arguments)
                 }
             }
 
-            // Check remote MCP tools
+
             if (!found) {
                 for (const auto& rt : remote_tools) {
                     if (("mcp::" + rt.name) == n || rt.name == n) {
@@ -393,6 +502,8 @@ std::string execute_tool(const std::string& name, const json& arguments)
 void run_agentic(std::string user_message,
                  std::vector<std::pair<std::string, std::string>> history)
 {
+    // Reset per-task counters (Roo-Code parity: each new task resets approval budgets)
+    s_approval_counters = auto_approval::task_counters_t{};
 
     {
         uint64_t gate = standalone_license::inline_gate_check(
@@ -414,59 +525,65 @@ void run_agentic(std::string user_message,
     post_update(ai_update_t::THINKING);
     output_log::push(bottom_tab_t::output, "[ai] New request: " + user_message.substr(0, 120) + (user_message.size() > 120 ? "..." : ""));
 
-    const bool use_native = (g_sa_settings.get_active_profile_kind() == "anthropic");
-    std::string system_prompt = build_system_prompt(use_native);
+    const bool force_xml = g_sa_settings.force_xml_tools;
+    std::string system_prompt = build_system_prompt(force_xml);
     const int max_turns = (std::max)(g_sa_settings.max_agentic_rounds, 1);
     int64_t budget_used = 0;
 
 
-    if (use_native) {
+    if (force_xml) {
 
-        json messages = json::array();
-        for (auto& [role, text] : history) {
-            std::string r = (role == "assistant" || role == "Assistant") ? "assistant" : "user";
-            messages.push_back({{"role", r}, {"content", text}});
+        std::string conversation;
+        conversation.reserve(4096);
+        if (!history.empty()) {
+            conversation += "## Previous conversation\n\n";
+            for (auto& [role, text] : history)
+                conversation += role + ": " + text + "\n\n";
         }
-        messages.push_back({{"role", "user"}, {"content", user_message}});
+        conversation += "User: " + user_message + "\n\nAssistant:";
 
-
-        auto& local_tools = s_mcp_server.get_tools();
+        std::string full_prompt = system_prompt + "\n\n" + conversation;
 
         for (int turn = 0; turn < max_turns; ++turn) {
-            if (s_cancel.load()) { post_update(ai_update_t::COMPLETE); return; }
+            if (s_cancel.load()) {
+                post_update(ai_update_t::COMPLETE);
+                return;
+            }
+
 
             if (standalone_license::inline_proof_check_a() < 0.5) {
                 post_update(ai_update_t::ERR, "Service degraded. Please restart the application.");
                 return;
             }
 
-            if (g_sa_settings.task_budget_tokens > 0 && budget_used >= g_sa_settings.task_budget_tokens) {
-                output_log::push(bottom_tab_t::output, "[ai] Task budget exhausted (" + std::to_string(budget_used) + " tokens)");
-                post_update(ai_update_t::ERR, "Task budget exhausted (" + std::to_string(budget_used) + " tokens used).");
-                return;
-            }
-
             if (turn > 0)
                 post_update(ai_update_t::THINKING, "Processing tool results...");
 
-            ai_generation_result_t gen;
-            try {
-                gen = g_sa_ai_client->generate_with_tools(messages, system_prompt, local_tools,
-                    [](const std::string& chunk) {
+            int64_t pre_in = cost_tracking::session_input_tokens;
+            int64_t pre_out = cost_tracking::session_output_tokens;
 
-                        if (!chunk.empty() && chunk[0] != '\x01')
-                            post_update(ai_update_t::CHUNK, chunk);
-                    });
+            std::string response;
+            try {
+                response = g_sa_ai_client->chat_blocking(full_prompt, {}, nullptr, nullptr);
             } catch (const std::exception& e) {
                 output_log::push(bottom_tab_t::output, std::string("[ai] Exception: ") + e.what());
                 post_update(ai_update_t::ERR, std::string("Exception: ") + e.what());
                 return;
             }
 
-            budget_used += gen.input_tokens + gen.output_tokens;
 
-            if (s_cancel.load()) { post_update(ai_update_t::COMPLETE); return; }
-            if (gen.is_error) { post_update(ai_update_t::ERR, gen.text); return; }
+            budget_used += (cost_tracking::session_input_tokens - pre_in) +
+                           (cost_tracking::session_output_tokens - pre_out);
+
+            if (s_cancel.load()) {
+                post_update(ai_update_t::COMPLETE);
+                return;
+            }
+
+            if (response.size() >= 6 && response.substr(0, 6) == "Error:") {
+                post_update(ai_update_t::ERR, response);
+                return;
+            }
 
 
             {
@@ -481,135 +598,213 @@ void run_agentic(std::string user_message,
                 }
             }
 
-            if (!gen.thinking.empty())
-                post_update(ai_update_t::THINKING, gen.thinking);
+            std::string thinking_content;
+            std::string clean_response = response;
+            {
+                const std::string think_start = "\x01THINK:";
+                const std::string think_end = "\x01ENDTHINK\n";
+                size_t ts = clean_response.find(think_start);
+                if (ts != std::string::npos) {
+                    size_t te = clean_response.find(think_end, ts);
+                    if (te != std::string::npos) {
+                        thinking_content = clean_response.substr(ts + think_start.size(),
+                                                                  te - ts - think_start.size());
+                        clean_response.erase(ts, te + think_end.size() - ts);
+                    }
+                }
 
+                size_t p = 0;
+                while ((p = clean_response.find(think_start, p)) != std::string::npos) {
+                    size_t end = clean_response.find('\n', p + think_start.size());
+                    if (end == std::string::npos) end = clean_response.size();
+                    thinking_content += clean_response.substr(p + think_start.size(), end - p - think_start.size());
+                    clean_response.erase(p, end - p + (end < clean_response.size() ? 1 : 0));
+                }
+            }
 
-            if (gen.tool_calls.empty() || gen.stop_reason != "tool_use") {
+            if (!thinking_content.empty())
+                post_update(ai_update_t::THINKING, thinking_content);
 
-                if (gen.text.empty() && !gen.thinking.empty())
-                    post_update(ai_update_t::CHUNK, "(thinking only — no text output)");
+            auto calls = parse_tool_calls(clean_response);
+
+            if (calls.empty()) {
+                std::string clean = strip_tool_blocks(clean_response);
+                if (clean.empty()) clean = clean_response;
+
+                constexpr size_t CHARS_PER_CHUNK = 24;
+                for (size_t i = 0; i < clean.size() && !s_cancel.load(); ) {
+                    size_t n = (std::min)(CHARS_PER_CHUNK, clean.size() - i);
+                    post_update(ai_update_t::CHUNK, clean.substr(i, n));
+                    i += n;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(12));
+                }
                 post_update(ai_update_t::COMPLETE);
                 return;
             }
 
-
-            json assistant_content = json::array();
-            if (!gen.text.empty())
-                assistant_content.push_back({{"type", "text"}, {"text", gen.text}});
-            for (auto& tc : gen.tool_calls) {
-                assistant_content.push_back({
-                    {"type", "tool_use"},
-                    {"id", tc.id},
-                    {"name", tc.name},
-                    {"input", tc.arguments}
-                });
-            }
-            messages.push_back({{"role", "assistant"}, {"content", assistant_content}});
-
-
-            json tool_result_content = json::array();
-            for (auto& tc : gen.tool_calls) {
-                if (s_cancel.load()) { post_update(ai_update_t::COMPLETE); return; }
+            std::string tool_results;
+            for (auto& tc : calls) {
+                if (s_cancel.load()) {
+                    post_update(ai_update_t::COMPLETE);
+                    return;
+                }
                 post_update(ai_update_t::THINKING, "Calling " + tc.name + "...");
-
 
                 {
                     uint64_t gate = standalone_license::inline_gate_check(
                         standalone_license::gate_chat_tool_exec);
                     if (standalone_license::verify_gate_token(
                             standalone_license::gate_chat_tool_exec, gate) < 0.5) {
-                        tool_result_content.push_back(
-                            standalone_ai_client_t::make_tool_result_block(tc.id, "Service unavailable.", true));
+                        tool_results += "\n<tool_result name=\"" + tc.name + "\">\nService unavailable.\n</tool_result>\n";
                         continue;
                     }
                 }
 
                 if (!standalone_license::inline_proof_check_d()) {
-                    tool_result_content.push_back(
-                        standalone_ai_client_t::make_tool_result_block(tc.id, "Error: Tool execution timed out.", true));
+                    tool_results += "\n<tool_result name=\"" + tc.name + "\">\nError: Tool execution timed out.\n</tool_result>\n";
                     continue;
                 }
 
                 if (!request_tool_approval(tc.name, tc.arguments)) {
-                    tool_result_content.push_back(
-                        standalone_ai_client_t::make_tool_result_block(tc.id, "Tool execution denied by user.", true));
+                    tool_results += "\n<tool_result name=\"" + tc.name + "\">\nTool execution denied by user.\n</tool_result>\n";
                     continue;
                 }
 
                 std::string result = execute_tool(tc.name, tc.arguments);
-                bool is_err = (result.size() >= 6 && result.substr(0, 6) == "Error:");
-                tool_result_content.push_back(
-                    standalone_ai_client_t::make_tool_result_block(tc.id, result, is_err));
+                tool_results += "\n<tool_result name=\"" + tc.name + "\">\n"
+                              + result
+                              + "\n</tool_result>\n";
             }
 
-
-            messages.push_back({{"role", "user"}, {"content", tool_result_content}});
+            full_prompt += " " + clean_response + "\n"
+                         + tool_results
+                         + "\nContinue your analysis using the tool results above. "
+                           "If you need more data, call more tools. "
+                           "Otherwise, provide your final answer as plain text.\n\nAssistant:";
         }
 
-        output_log::push(bottom_tab_t::output, "[ai] Reached max tool rounds (" + std::to_string(max_turns) + ") [native]");
+        output_log::push(bottom_tab_t::output, "[ai] Reached max tool rounds (" + std::to_string(max_turns) + ") [xml]");
         post_update(ai_update_t::ERR, "Reached maximum tool-calling rounds (" + std::to_string(max_turns) + "). Stopping.");
         return;
     }
 
 
-    std::string conversation;
-    conversation.reserve(4096);
-    if (!history.empty()) {
-        conversation += "## Previous conversation\n\n";
-        for (auto& [role, text] : history)
-            conversation += role + ": " + text + "\n\n";
-    }
-    conversation += "User: " + user_message + "\n\nAssistant:";
 
-    std::string full_prompt = system_prompt + "\n\n" + conversation;
+    json messages = json::array();
+    for (auto& [role, text] : history) {
+        std::string r = (role == "assistant" || role == "Assistant") ? "assistant" : "user";
+        messages.push_back({{"role", r}, {"content", text}});
+    }
+    messages.push_back({{"role", "user"}, {"content", user_message}});
+
+
+    auto& local_tools = s_mcp_server.get_tools();
 
     for (int turn = 0; turn < max_turns; ++turn) {
-        if (s_cancel.load()) {
-            post_update(ai_update_t::COMPLETE);
-            return;
-        }
-
+        if (s_cancel.load()) { post_update(ai_update_t::COMPLETE); return; }
 
         if (standalone_license::inline_proof_check_a() < 0.5) {
             post_update(ai_update_t::ERR, "Service degraded. Please restart the application.");
             return;
         }
 
-        if (g_sa_settings.task_budget_tokens > 0 && budget_used >= g_sa_settings.task_budget_tokens) {
-            output_log::push(bottom_tab_t::output, "[ai] Task budget exhausted (" + std::to_string(budget_used) + " tokens)");
-            post_update(ai_update_t::ERR, "Task budget exhausted (" + std::to_string(budget_used) + " tokens used).");
-            return;
+        // Context condensation check (Roo-Code parity)
+        // WHY: Before each API call, check if the conversation has grown too large
+        // for the model's context window. If so, condense old messages into a summary
+        // instead of losing them entirely.
+        {
+            std::string active_model = g_sa_settings.get_active_model();
+            auto& model_info = context_mgmt::get_model_info(active_model);
+            int ctx_window = model_info.context_window;
+
+            int estimated_tokens = 0;
+            for (auto& m : messages) {
+                std::string content_str;
+                if (m.contains("content")) {
+                    if (m["content"].is_string())
+                        content_str = m["content"].get<std::string>();
+                    else if (m["content"].is_array())
+                        content_str = m["content"].dump();
+                }
+                estimated_tokens += static_cast<int>(context_mgmt::estimate_token_count(content_str));
+            }
+            estimated_tokens += static_cast<int>(context_mgmt::estimate_token_count(system_prompt));
+
+            double usage_fraction = static_cast<double>(estimated_tokens) / static_cast<double>(ctx_window);
+            if (usage_fraction > g_sa_settings.condense_threshold && messages.size() > 4) {
+                output_log::push(bottom_tab_t::output,
+                    "[ai] Context at " + std::to_string(static_cast<int>(usage_fraction * 100)) +
+                    "% — condensing conversation...");
+
+                // Build condensation summary request
+                std::vector<std::pair<std::string, std::string>> old_msgs;
+                for (size_t i = 0; i < messages.size() - 2; ++i) {
+                    std::string role = messages[i].value("role", "user");
+                    std::string content;
+                    if (messages[i].contains("content")) {
+                        if (messages[i]["content"].is_string())
+                            content = messages[i]["content"].get<std::string>();
+                        else if (messages[i]["content"].is_array())
+                            content = messages[i]["content"].dump();
+                    }
+                    old_msgs.push_back({role, content});
+                }
+                std::string condense_prompt = context_mgmt::build_condensation_prompt(
+                    old_msgs, user_message);
+
+                std::string summary;
+                try {
+                    summary = g_sa_ai_client->chat_blocking(condense_prompt, {}, nullptr, nullptr);
+                } catch (...) {
+                    summary = "";
+                }
+
+                if (!summary.empty() && summary.substr(0, 6) != "Error:") {
+                    // Replace all messages except the last 2 with the summary
+                    json condensed = json::array();
+                    condensed.push_back({
+                        {"role", "user"},
+                        {"content", "[Previous conversation summary]\n" + summary}
+                    });
+                    condensed.push_back({
+                        {"role", "assistant"},
+                        {"content", "I understand the context from the summary. I'll continue from here."}
+                    });
+
+                    // Keep last 2 messages (most recent exchange)
+                    size_t keep_from = messages.size() > 2 ? messages.size() - 2 : 0;
+                    for (size_t i = keep_from; i < messages.size(); ++i)
+                        condensed.push_back(messages[i]);
+
+                    messages = condensed;
+
+                    output_log::push(bottom_tab_t::output, "[ai] Conversation condensed to " +
+                        std::to_string(messages.size()) + " messages");
+                }
+            }
         }
 
         if (turn > 0)
             post_update(ai_update_t::THINKING, "Processing tool results...");
 
-        int64_t pre_in = cost_tracking::session_input_tokens;
-        int64_t pre_out = cost_tracking::session_output_tokens;
-
-        std::string response;
+        ai_generation_result_t gen;
         try {
-            response = g_sa_ai_client->chat_blocking(full_prompt, {}, nullptr, nullptr);
+            gen = g_sa_ai_client->generate_with_tools(messages, system_prompt, local_tools,
+                [](const std::string& chunk) {
+
+                    if (!chunk.empty() && chunk[0] != '\x01')
+                        post_update(ai_update_t::CHUNK, chunk);
+                });
         } catch (const std::exception& e) {
             output_log::push(bottom_tab_t::output, std::string("[ai] Exception: ") + e.what());
             post_update(ai_update_t::ERR, std::string("Exception: ") + e.what());
             return;
         }
 
+        budget_used += gen.input_tokens + gen.output_tokens;
 
-        budget_used += (cost_tracking::session_input_tokens - pre_in) +
-                       (cost_tracking::session_output_tokens - pre_out);
-
-        if (s_cancel.load()) {
-            post_update(ai_update_t::COMPLETE);
-            return;
-        }
-
-        if (response.size() >= 6 && response.substr(0, 6) == "Error:") {
-            post_update(ai_update_t::ERR, response);
-            return;
-        }
+        if (s_cancel.load()) { post_update(ai_update_t::COMPLETE); return; }
+        if (gen.is_error) { post_update(ai_update_t::ERR, gen.text); return; }
 
 
         {
@@ -624,56 +819,36 @@ void run_agentic(std::string user_message,
             }
         }
 
-        std::string thinking_content;
-        std::string clean_response = response;
-        {
-            const std::string think_start = "\x01THINK:";
-            const std::string think_end = "\x01ENDTHINK\n";
-            size_t ts = clean_response.find(think_start);
-            if (ts != std::string::npos) {
-                size_t te = clean_response.find(think_end, ts);
-                if (te != std::string::npos) {
-                    thinking_content = clean_response.substr(ts + think_start.size(),
-                                                              te - ts - think_start.size());
-                    clean_response.erase(ts, te + think_end.size() - ts);
-                }
-            }
+        if (!gen.thinking.empty())
+            post_update(ai_update_t::THINKING, gen.thinking);
 
-            size_t p = 0;
-            while ((p = clean_response.find(think_start, p)) != std::string::npos) {
-                size_t end = clean_response.find('\n', p + think_start.size());
-                if (end == std::string::npos) end = clean_response.size();
-                thinking_content += clean_response.substr(p + think_start.size(), end - p - think_start.size());
-                clean_response.erase(p, end - p + (end < clean_response.size() ? 1 : 0));
-            }
-        }
 
-        if (!thinking_content.empty())
-            post_update(ai_update_t::THINKING, thinking_content);
+        if (gen.tool_calls.empty()) {
 
-        auto calls = parse_tool_calls(clean_response);
-
-        if (calls.empty()) {
-            std::string clean = strip_tool_blocks(clean_response);
-            if (clean.empty()) clean = clean_response;
-
-            constexpr size_t CHARS_PER_CHUNK = 24;
-            for (size_t i = 0; i < clean.size() && !s_cancel.load(); ) {
-                size_t n = (std::min)(CHARS_PER_CHUNK, clean.size() - i);
-                post_update(ai_update_t::CHUNK, clean.substr(i, n));
-                i += n;
-                std::this_thread::sleep_for(std::chrono::milliseconds(12));
-            }
+            if (gen.text.empty() && !gen.thinking.empty())
+                post_update(ai_update_t::CHUNK, "(thinking only — no text output)");
             post_update(ai_update_t::COMPLETE);
             return;
         }
 
-        std::string tool_results;
-        for (auto& tc : calls) {
-            if (s_cancel.load()) {
-                post_update(ai_update_t::COMPLETE);
-                return;
-            }
+
+        json assistant_content = json::array();
+        if (!gen.text.empty())
+            assistant_content.push_back({{"type", "text"}, {"text", gen.text}});
+        for (auto& tc : gen.tool_calls) {
+            assistant_content.push_back({
+                {"type", "tool_use"},
+                {"id", tc.id},
+                {"name", tc.name},
+                {"input", tc.arguments}
+            });
+        }
+        messages.push_back({{"role", "assistant"}, {"content", assistant_content}});
+
+
+        json tool_result_content = json::array();
+        for (auto& tc : gen.tool_calls) {
+            if (s_cancel.load()) { post_update(ai_update_t::COMPLETE); return; }
             post_update(ai_update_t::THINKING, "Calling " + tc.name + "...");
 
 
@@ -682,32 +857,32 @@ void run_agentic(std::string user_message,
                     standalone_license::gate_chat_tool_exec);
                 if (standalone_license::verify_gate_token(
                         standalone_license::gate_chat_tool_exec, gate) < 0.5) {
-                    tool_results += "\n<tool_result name=\"" + tc.name + "\">\nService unavailable.\n</tool_result>\n";
+                    tool_result_content.push_back(
+                        standalone_ai_client_t::make_tool_result_block(tc.id, "Service unavailable.", true));
                     continue;
                 }
             }
 
             if (!standalone_license::inline_proof_check_d()) {
-                tool_results += "\n<tool_result name=\"" + tc.name + "\">\nError: Tool execution timed out.\n</tool_result>\n";
+                tool_result_content.push_back(
+                    standalone_ai_client_t::make_tool_result_block(tc.id, "Error: Tool execution timed out.", true));
                 continue;
             }
 
             if (!request_tool_approval(tc.name, tc.arguments)) {
-                tool_results += "\n<tool_result name=\"" + tc.name + "\">\nTool execution denied by user.\n</tool_result>\n";
+                tool_result_content.push_back(
+                    standalone_ai_client_t::make_tool_result_block(tc.id, "Tool execution denied by user.", true));
                 continue;
             }
 
             std::string result = execute_tool(tc.name, tc.arguments);
-            tool_results += "\n<tool_result name=\"" + tc.name + "\">\n"
-                          + result
-                          + "\n</tool_result>\n";
+            bool is_err = (result.size() >= 6 && result.substr(0, 6) == "Error:");
+            tool_result_content.push_back(
+                standalone_ai_client_t::make_tool_result_block(tc.id, result, is_err));
         }
 
-        full_prompt += " " + clean_response + "\n"
-                     + tool_results
-                     + "\nContinue your analysis using the tool results above. "
-                       "If you need more data, call more tools. "
-                       "Otherwise, provide your final answer as plain text.\n\nAssistant:";
+
+        messages.push_back({{"role", "user"}, {"content", tool_result_content}});
     }
 
     output_log::push(bottom_tab_t::output, "[ai] Reached max tool rounds (" + std::to_string(max_turns) + ")");
@@ -1041,11 +1216,10 @@ void tick_ai_chat()
     if (g_chat_messages.empty()) return;
 
     auto& last = g_chat_messages.back();
-    if (!last.is_user || g_dummy_triggered) return;
+    if (!last.is_user || s_ai_running.load()) return;
 
 
     std::string user_text = last.text;
-    g_dummy_triggered = true;
 
 
     if (!g_sa_ai_client || !g_sa_ai_client->is_available()) {
@@ -1056,13 +1230,11 @@ void tick_ai_chat()
         ai.text           = "AI not configured. Click \"Settings\" in the chat header to set your API key and model.";
         g_chat_messages.push_back(ai);
         g_chat_scroll_to_bottom = true;
-        g_dummy_triggered = false;
         return;
     }
 
 
-    g_think_done  = false;
-    g_think_timer = 0.f;
+    g_ai_thinking_active = false;
 
 
     ChatMessage ai;
@@ -1141,29 +1313,33 @@ void poll_ai_chat()
             break;
 
         case ai_update_t::CHUNK:
-            if (!g_think_done) g_think_done = true;
+            if (!g_ai_thinking_active) g_ai_thinking_active = true;
             last.text += u.text;
             g_chat_scroll_to_bottom = true;
             break;
 
         case ai_update_t::COMPLETE:
             last.streaming = false;
-            g_think_done         = true;
-            g_dummy_triggered    = false;
+            g_ai_thinking_active = true;
             s_ai_running         = false;
             g_chat_scroll_to_bottom = true;
             break;
 
         case ai_update_t::ERR:
-            g_think_done         = true;
+            g_ai_thinking_active = true;
             if (!u.text.empty()) last.text = u.text;
             last.streaming       = false;
-            g_dummy_triggered    = false;
             s_ai_running         = false;
             g_chat_scroll_to_bottom = true;
             break;
         }
     }
+}
+
+
+bool is_ai_busy()
+{
+    return s_ai_running.load();
 }
 
 
@@ -1330,15 +1506,11 @@ void render_settings_inline(float panel_w, float panel_h)
         static char  s_azure_api_ver[64] = "2024-10-21";
 
 
-        static bool s_thinking_enabled = false;
-        static int  s_thinking_budget = 10000;
-        static int  s_effort_level = 2;
+        static bool s_enable_reasoning = false;
+        static int  s_reasoning_budget = 10000;
+        static char s_reasoning_effort[32] = "medium";
         static bool s_prompt_caching = true;
-        static int  s_task_budget = 0;
-        static bool s_web_search = false;
         static int  s_max_rounds = 15;
-        static bool s_fast_mode = false;
-        static bool s_redact_thinking = false;
         static bool s_ai_features_init = false;
 
 
@@ -1420,15 +1592,11 @@ void render_settings_inline(float panel_w, float panel_h)
             s_profile_sel_anim = static_cast<float>(s_selected_profile);
 
 
-            s_thinking_enabled = g_sa_settings.thinking_enabled;
-            s_thinking_budget = g_sa_settings.thinking_budget;
-            s_effort_level = g_sa_settings.effort_level;
+            s_enable_reasoning = g_sa_settings.enable_reasoning;
+            s_reasoning_budget = g_sa_settings.reasoning_budget;
+            snprintf(s_reasoning_effort, sizeof(s_reasoning_effort), "%s", g_sa_settings.reasoning_effort.c_str());
             s_prompt_caching = g_sa_settings.prompt_caching;
-            s_task_budget = g_sa_settings.task_budget_tokens;
-            s_web_search = g_sa_settings.web_search_enabled;
             s_max_rounds = g_sa_settings.max_agentic_rounds;
-            s_fast_mode = g_sa_settings.fast_mode;
-            s_redact_thinking = g_sa_settings.redact_thinking;
             s_ai_features_init = true;
 
 
@@ -1849,48 +2017,42 @@ void render_settings_inline(float panel_w, float panel_h)
             else if (s_active_tab == 1)
             {
                 if (!s_ai_features_init) {
-                    s_thinking_enabled = g_sa_settings.thinking_enabled;
-                    s_thinking_budget = g_sa_settings.thinking_budget;
-                    s_effort_level = g_sa_settings.effort_level;
+                    s_enable_reasoning = g_sa_settings.enable_reasoning;
+                    s_reasoning_budget = g_sa_settings.reasoning_budget;
+                    snprintf(s_reasoning_effort, sizeof(s_reasoning_effort), "%s", g_sa_settings.reasoning_effort.c_str());
                     s_prompt_caching = g_sa_settings.prompt_caching;
-                    s_task_budget = g_sa_settings.task_budget_tokens;
-                    s_web_search = g_sa_settings.web_search_enabled;
                     s_max_rounds = g_sa_settings.max_agentic_rounds;
-                    s_fast_mode = g_sa_settings.fast_mode;
-                    s_redact_thinking = g_sa_settings.redact_thinking;
                     s_ai_features_init = true;
                 }
 
-                begin_card("##thinking_card");
+                begin_card("##reasoning_card");
                 {
-                    section_header("Reasoning & Thinking");
+                    section_header("Reasoning");
 
-                    ImGui::Checkbox("Extended Thinking", &s_thinking_enabled);
+                    ImGui::Checkbox("Enable Reasoning", &s_enable_reasoning);
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Enable interleaved thinking for deeper reasoning (Anthropic)");
-                    if (s_thinking_enabled) {
-                        ImGui::Text("Budget (tokens)");
+                        ImGui::SetTooltip("Enable extended reasoning / thinking for models that support it");
+                    if (s_enable_reasoning) {
+                        ImGui::Text("Reasoning Budget (tokens)");
                         ImGui::SetNextItemWidth(-14.f);
-                        ImGui::InputInt("##think_budget", &s_thinking_budget, 1000, 5000);
-                        s_thinking_budget = (std::max)(s_thinking_budget, 1024);
+                        ImGui::InputInt("##reasoning_budget", &s_reasoning_budget, 1000, 5000);
+                        s_reasoning_budget = (std::max)(s_reasoning_budget, 1024);
                     }
 
-                    ImGui::Text("Effort Level");
+                    ImGui::Text("Reasoning Effort");
                     ImGui::SetNextItemWidth(-14.f);
-                    const char* effort_labels[] = {
-                        "Low", "Medium", "High", "Max"
+                    static const char* effort_labels[] = {
+                        "minimal", "low", "medium", "high", "xhigh"
                     };
-                    ImGui::Combo("##effort", &s_effort_level, effort_labels, 4);
+                    int effort_idx = 2;
+                    for (int i = 0; i < 5; ++i) {
+                        if (std::string(effort_labels[i]) == s_reasoning_effort) { effort_idx = i; break; }
+                    }
+                    if (ImGui::Combo("##reasoning_effort", &effort_idx, effort_labels, 5)) {
+                        snprintf(s_reasoning_effort, sizeof(s_reasoning_effort), "%s", effort_labels[effort_idx]);
+                    }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Controls how much effort the model puts into its response");
-
-                    ImGui::Checkbox("Fast Mode", &s_fast_mode);
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Enable fast-mode for lower latency (Anthropic)");
-
-                    ImGui::Checkbox("Redact Thinking", &s_redact_thinking);
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Redact thinking blocks for privacy (Anthropic)");
+                        ImGui::SetTooltip("Controls how much effort the model puts into reasoning (provider-agnostic)");
                 }
                 end_card();
 
@@ -1898,32 +2060,141 @@ void render_settings_inline(float panel_w, float panel_h)
 
                 begin_card("##caching_card");
                 {
-                    section_header("Caching & Budgets");
+                    section_header("Caching");
 
                     ImGui::Checkbox("Prompt Caching", &s_prompt_caching);
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Cache system prompts to reduce cost and latency");
-
-                    ImGui::Text("Task Budget (tokens, 0 = unlimited)");
-                    ImGui::SetNextItemWidth(-14.f);
-                    ImGui::InputInt("##task_budget", &s_task_budget, 10000, 50000);
-                    s_task_budget = (std::max)(s_task_budget, 0);
+                        ImGui::SetTooltip("Cache system prompts to reduce cost and latency (when supported)");
                 }
                 end_card();
 
                 ImGui::Dummy(ImVec2(0, 4));
 
-                begin_card("##features_card");
+                begin_card("##agentic_card");
                 {
-                    section_header("Features & Agentic");
-
-                    ImGui::Checkbox("Web Search", &s_web_search);
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Allow AI to search the web (Anthropic)");
+                    section_header("Agentic");
 
                     ImGui::Text("Max Agentic Rounds");
                     ImGui::SetNextItemWidth(-14.f);
                     ImGui::SliderInt("##max_rounds", &s_max_rounds, 1, 50);
+                }
+                end_card();
+
+                ImGui::Dummy(ImVec2(0, 4));
+
+                // Granular auto-approval UI (Roo-Code parity)
+                // WHY: Roo-Code lets users independently approve different tool categories.
+                // Users want to auto-approve reads but confirm writes, or auto-approve
+                // safe commands but block dangerous ones.
+                begin_card("##auto_approval_card");
+                {
+                    section_header("Auto-Approval");
+
+                    static bool s_aa_read = false, s_aa_write = false, s_aa_exec = false;
+                    static bool s_aa_mcp = false, s_aa_mode = false, s_aa_subtask = false;
+                    static int  s_aa_max_req = 0;
+                    static float s_aa_max_cost = 0.0f;
+                    static char s_aa_cmds[512] = {};
+                    static bool s_aa_init = false;
+
+                    if (!s_aa_init) {
+                        s_aa_read    = g_sa_settings.auto_approve_read;
+                        s_aa_write   = g_sa_settings.auto_approve_write;
+                        s_aa_exec    = g_sa_settings.auto_approve_execute;
+                        s_aa_mcp     = g_sa_settings.auto_approve_mcp;
+                        s_aa_mode    = g_sa_settings.auto_approve_mode_switch;
+                        s_aa_subtask = g_sa_settings.auto_approve_subtask;
+                        s_aa_max_req = g_sa_settings.auto_approve_max_requests;
+                        s_aa_max_cost = static_cast<float>(g_sa_settings.auto_approve_max_cost);
+                        snprintf(s_aa_cmds, sizeof(s_aa_cmds), "%s",
+                                 g_sa_settings.auto_approve_allowed_commands.c_str());
+                        s_aa_init = true;
+                    }
+
+                    ImGui::Checkbox("Read Operations", &s_aa_read);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Auto-approve: read_file, list_directory, search_files, etc.");
+
+                    ImGui::Checkbox("Write Operations", &s_aa_write);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Auto-approve: write_file, edit_file, create_file, etc.");
+
+                    ImGui::Checkbox("Command Execution", &s_aa_exec);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Auto-approve: execute_command (respects allowed commands list)");
+
+                    ImGui::Checkbox("MCP Tools", &s_aa_mcp);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Auto-approve: remote MCP server tool calls");
+
+                    ImGui::Checkbox("Mode Switching", &s_aa_mode);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Auto-approve: switch_mode, new_task");
+
+                    ImGui::Checkbox("Subtask Spawning", &s_aa_subtask);
+
+                    ImGui::Spacing();
+                    ImGui::Text("Max Requests per Task");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("0 = unlimited");
+                    ImGui::SetNextItemWidth(-14.f);
+                    ImGui::SliderInt("##aa_max_req", &s_aa_max_req, 0, 200);
+
+                    ImGui::Text("Max Cost per Task ($)");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("0 = unlimited");
+                    ImGui::SetNextItemWidth(-14.f);
+                    ImGui::SliderFloat("##aa_max_cost", &s_aa_max_cost, 0.0f, 50.0f, "$%.2f");
+
+                    ImGui::Text("Allowed Command Prefixes");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Comma-separated prefixes for execute_command auto-approval\ne.g.: npm test, cargo build, python");
+                    ImGui::SetNextItemWidth(-14.f);
+                    ImGui::InputText("##aa_cmds", s_aa_cmds, sizeof(s_aa_cmds));
+
+                    // Sync to settings on change
+                    g_sa_settings.auto_approve_read    = s_aa_read;
+                    g_sa_settings.auto_approve_write   = s_aa_write;
+                    g_sa_settings.auto_approve_execute  = s_aa_exec;
+                    g_sa_settings.auto_approve_mcp     = s_aa_mcp;
+                    g_sa_settings.auto_approve_mode_switch = s_aa_mode;
+                    g_sa_settings.auto_approve_subtask = s_aa_subtask;
+                    g_sa_settings.auto_approve_max_requests = s_aa_max_req;
+                    g_sa_settings.auto_approve_max_cost = static_cast<double>(s_aa_max_cost);
+                    g_sa_settings.auto_approve_allowed_commands = s_aa_cmds;
+                }
+                end_card();
+
+                ImGui::Dummy(ImVec2(0, 4));
+
+                // Context condensation settings UI (Roo-Code parity)
+                begin_card("##condensation_card");
+                {
+                    section_header("Context Management");
+
+                    static float s_condense_thresh = 0.80f;
+                    static float s_condense_buffer = 0.10f;
+                    static bool  s_cond_init = false;
+                    if (!s_cond_init) {
+                        s_condense_thresh = static_cast<float>(g_sa_settings.condense_threshold);
+                        s_condense_buffer = static_cast<float>(g_sa_settings.condense_buffer);
+                        s_cond_init = true;
+                    }
+
+                    ImGui::Text("Condense Threshold");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Fraction of context window used before auto-condensing (0.0-1.0)");
+                    ImGui::SetNextItemWidth(-14.f);
+                    ImGui::SliderFloat("##condense_thresh", &s_condense_thresh, 0.5f, 0.95f, "%.0f%%");
+
+                    ImGui::Text("Response Buffer");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Fraction reserved for model response tokens");
+                    ImGui::SetNextItemWidth(-14.f);
+                    ImGui::SliderFloat("##condense_buffer", &s_condense_buffer, 0.05f, 0.30f, "%.0f%%");
+
+                    g_sa_settings.condense_threshold = static_cast<double>(s_condense_thresh);
+                    g_sa_settings.condense_buffer = static_cast<double>(s_condense_buffer);
                 }
                 end_card();
             }
@@ -2196,15 +2467,11 @@ void render_settings_inline(float panel_w, float panel_h)
                 g_sa_settings.sandbox.memory_limit_mb = (std::max)(s_sandbox_memory, 64);
                 g_sa_settings.sandbox.network_mode = s_sandbox_network == 1 ? "default" : "off";
 
-                g_sa_settings.thinking_enabled = s_thinking_enabled;
-                g_sa_settings.thinking_budget = s_thinking_budget;
-                g_sa_settings.effort_level = s_effort_level;
+                g_sa_settings.enable_reasoning = s_enable_reasoning;
+                g_sa_settings.reasoning_budget = s_reasoning_budget;
+                g_sa_settings.reasoning_effort = s_reasoning_effort;
                 g_sa_settings.prompt_caching = s_prompt_caching;
-                g_sa_settings.task_budget_tokens = s_task_budget;
-                g_sa_settings.web_search_enabled = s_web_search;
                 g_sa_settings.max_agentic_rounds = s_max_rounds;
-                g_sa_settings.fast_mode = s_fast_mode;
-                g_sa_settings.redact_thinking = s_redact_thinking;
 
                 editor_config::tab_size = (std::max)(s_ed_tab_size, 1);
                 editor_config::font_size = s_ed_font_size;
@@ -2284,6 +2551,11 @@ void render_settings_inline(float panel_w, float panel_h)
 mcp_client::manager_t& get_mcp_client_manager()
 {
     return s_mcp_client_mgr;
+}
+
+file_context::tracker_t& get_file_tracker()
+{
+    return s_file_tracker;
 }
 
 void do_process_attach(unsigned long pid)

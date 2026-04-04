@@ -566,7 +566,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
     bool hovered = ImGui::IsMouseHoveringRect(bb.Min, bb.Max);
 
-    // Block all input when save-confirmation overlay is active
+
     bool input_blocked = (file_tabs::pending_close_idx >= 0);
     if (input_blocked) hovered = false;
 
@@ -1019,16 +1019,16 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 auto& ln = s_cache.lines[s_sel.caret_line];
                 int col = s_sel.caret_col;
                 int start = col;
-                // skip whitespace backwards
+
                 while (start > 0 && (ln[start - 1] == ' ' || ln[start - 1] == '\t'))
                     start--;
-                // if we only skipped whitespace and hit a word char, delete the word
+
                 if (start > 0) {
-                    // delete word characters (alphanumeric + underscore)
+
                     while (start > 0 && (isalnum((unsigned char)ln[start - 1]) || ln[start - 1] == '_'))
                         start--;
                 }
-                // if nothing was skipped (e.g. punctuation), delete at least one char
+
                 if (start == col)
                     start = col - 1;
                 ln.erase(start, col - start);

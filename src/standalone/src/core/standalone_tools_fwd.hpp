@@ -10,3 +10,4 @@ namespace net_security_tools { void register_net_security_tools(mcp_standalone::
 namespace emulation_tools    { void register_emulation_tools(mcp_standalone::server_t& srv); }
 namespace debugger_tools     { void register_debugger_tools(mcp_standalone::server_t& srv); }
 namespace coding_tools       { void register_coding_tools(mcp_standalone::server_t& srv); }
+namespace workflow_tools     { void register_workflow_tools(mcp_standalone::server_t& srv); }

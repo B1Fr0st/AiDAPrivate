@@ -1,0 +1,316 @@
+#pragma once
+
+#include <string>
+#include <vector>
+#include <sstream>
+#include <algorithm>
+#include <map>
+#include <filesystem>
+
+
+namespace apply_patch {
+
+
+enum class file_action_t
+{
+    add_file,
+    delete_file,
+    update_file,
+    move_file
+};
+
+
+struct file_hunk_t
+{
+    std::vector<std::string> context_before;
+    std::vector<std::string> removals;
+    std::vector<std::string> additions;
+};
+
+
+struct file_patch_t
+{
+    file_action_t action     = file_action_t::update_file;
+    std::string   path;
+    std::string   move_to;
+    std::vector<file_hunk_t> hunks;
+};
+
+
+struct patch_result_t
+{
+    bool success = false;
+    std::string error;
+    std::map<std::string, std::string> modified_files;
+    std::vector<std::string> deleted_files;
+    std::map<std::string, std::string> moved_files;
+};
+
+
+inline std::vector<std::string> split_lines(const std::string& text)
+{
+    std::vector<std::string> lines;
+    std::istringstream stream(text);
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        lines.push_back(line);
+    }
+    return lines;
+}
+
+
+inline std::string join_lines(const std::vector<std::string>& lines)
+{
+    std::string result;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (i > 0) result += "\n";
+        result += lines[i];
+    }
+    return result;
+}
+
+
+inline std::vector<file_patch_t> parse(const std::string& patch_text)
+{
+    std::vector<file_patch_t> patches;
+    auto lines = split_lines(patch_text);
+
+    bool in_patch = false;
+    file_patch_t current;
+    file_hunk_t current_hunk;
+    bool in_hunk = false;
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const auto& line = lines[i];
+
+        if (line == "*** Begin Patch") {
+            in_patch = true;
+            continue;
+        }
+        if (line == "*** End Patch") {
+            if (in_hunk && (!current_hunk.context_before.empty() || !current_hunk.removals.empty() || !current_hunk.additions.empty())) {
+                current.hunks.push_back(current_hunk);
+            }
+            if (!current.path.empty()) {
+                patches.push_back(current);
+            }
+            break;
+        }
+
+        if (!in_patch) continue;
+
+        if (line.substr(0, 15) == "*** Add File: ") {
+            if (in_hunk && (!current_hunk.context_before.empty() || !current_hunk.removals.empty() || !current_hunk.additions.empty())) {
+                current.hunks.push_back(current_hunk);
+            }
+            if (!current.path.empty()) {
+                patches.push_back(current);
+            }
+            current = file_patch_t{};
+            current_hunk = file_hunk_t{};
+            in_hunk = true;
+            current.action = file_action_t::add_file;
+            current.path = line.substr(15);
+            continue;
+        }
+
+        if (line.substr(0, 18) == "*** Delete File: ") {
+            if (in_hunk && (!current_hunk.context_before.empty() || !current_hunk.removals.empty() || !current_hunk.additions.empty())) {
+                current.hunks.push_back(current_hunk);
+            }
+            if (!current.path.empty()) {
+                patches.push_back(current);
+            }
+            current = file_patch_t{};
+            current_hunk = file_hunk_t{};
+            in_hunk = false;
+            current.action = file_action_t::delete_file;
+            current.path = line.substr(18);
+            continue;
+        }
+
+        if (line.substr(0, 18) == "*** Update File: ") {
+            if (in_hunk && (!current_hunk.context_before.empty() || !current_hunk.removals.empty() || !current_hunk.additions.empty())) {
+                current.hunks.push_back(current_hunk);
+            }
+            if (!current.path.empty()) {
+                patches.push_back(current);
+            }
+            current = file_patch_t{};
+            current_hunk = file_hunk_t{};
+            in_hunk = true;
+            current.action = file_action_t::update_file;
+            current.path = line.substr(18);
+            continue;
+        }
+
+        if (line.substr(0, 13) == "*** Move to: ") {
+            current.action = file_action_t::move_file;
+            current.move_to = line.substr(13);
+            continue;
+        }
+
+        if (line == "***") {
+            if (in_hunk && (!current_hunk.context_before.empty() || !current_hunk.removals.empty() || !current_hunk.additions.empty())) {
+                current.hunks.push_back(current_hunk);
+                current_hunk = file_hunk_t{};
+            }
+            continue;
+        }
+
+        if (!in_hunk) continue;
+
+        if (line.empty()) {
+            current_hunk.context_before.push_back("");
+            continue;
+        }
+
+        char prefix = line[0];
+        std::string content = line.substr(1);
+
+        if (prefix == ' ') {
+            current_hunk.context_before.push_back(content);
+        } else if (prefix == '-') {
+            current_hunk.removals.push_back(content);
+        } else if (prefix == '+') {
+            current_hunk.additions.push_back(content);
+        }
+    }
+
+    return patches;
+}
+
+
+inline int find_context_match(
+    const std::vector<std::string>& file_lines,
+    const std::vector<std::string>& context,
+    int start_from = 0)
+{
+    if (context.empty()) return start_from;
+
+    for (int i = start_from; i <= static_cast<int>(file_lines.size()) - static_cast<int>(context.size()); ++i) {
+        bool match = true;
+        for (size_t j = 0; j < context.size(); ++j) {
+            if (file_lines[i + j] != context[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return i;
+    }
+    return -1;
+}
+
+
+inline patch_result_t apply(
+    const std::string& patch_text,
+    std::function<std::string(const std::string&)> read_file,
+    std::function<bool(const std::string&, const std::string&)> write_file,
+    std::function<bool(const std::string&)> delete_file_fn,
+    std::function<bool(const std::string&, const std::string&)> move_file_fn)
+{
+    patch_result_t result;
+
+    auto patches = parse(patch_text);
+    if (patches.empty()) {
+        result.error = "No valid file patches found";
+        return result;
+    }
+
+    for (const auto& patch : patches) {
+        switch (patch.action) {
+        case file_action_t::add_file: {
+            std::vector<std::string> new_lines;
+            for (const auto& hunk : patch.hunks) {
+                for (const auto& line : hunk.additions)
+                    new_lines.push_back(line);
+            }
+            std::string content = join_lines(new_lines);
+            if (!write_file(patch.path, content)) {
+                result.error = "Failed to write new file: " + patch.path;
+                return result;
+            }
+            result.modified_files[patch.path] = content;
+            break;
+        }
+
+        case file_action_t::delete_file: {
+            if (delete_file_fn && !delete_file_fn(patch.path)) {
+                result.error = "Failed to delete file: " + patch.path;
+                return result;
+            }
+            result.deleted_files.push_back(patch.path);
+            break;
+        }
+
+        case file_action_t::move_file: {
+            std::string content = read_file(patch.path);
+            auto file_lines = split_lines(content);
+
+            for (auto it = patch.hunks.rbegin(); it != patch.hunks.rend(); ++it) {
+                int pos = find_context_match(file_lines, it->context_before);
+                if (pos < 0) {
+                    result.error = "Context not found in " + patch.path;
+                    return result;
+                }
+
+                int ctx_end = pos + static_cast<int>(it->context_before.size());
+                int remove_start = ctx_end;
+                int remove_end = remove_start + static_cast<int>(it->removals.size());
+                if (remove_end > static_cast<int>(file_lines.size()))
+                    remove_end = static_cast<int>(file_lines.size());
+
+                file_lines.erase(file_lines.begin() + remove_start, file_lines.begin() + remove_end);
+                for (int j = static_cast<int>(it->additions.size()) - 1; j >= 0; --j)
+                    file_lines.insert(file_lines.begin() + remove_start, it->additions[j]);
+            }
+
+            std::string new_content = join_lines(file_lines);
+            if (move_file_fn) move_file_fn(patch.path, patch.move_to);
+            write_file(patch.move_to, new_content);
+            result.moved_files[patch.path] = patch.move_to;
+            result.modified_files[patch.move_to] = new_content;
+            break;
+        }
+
+        case file_action_t::update_file: {
+            std::string content = read_file(patch.path);
+            auto file_lines = split_lines(content);
+
+            for (auto it = patch.hunks.rbegin(); it != patch.hunks.rend(); ++it) {
+                int pos = find_context_match(file_lines, it->context_before);
+                if (pos < 0) {
+                    result.error = "Context not found in " + patch.path + " for hunk";
+                    return result;
+                }
+
+                int ctx_end = pos + static_cast<int>(it->context_before.size());
+                int remove_start = ctx_end;
+                int remove_end = remove_start + static_cast<int>(it->removals.size());
+                if (remove_end > static_cast<int>(file_lines.size()))
+                    remove_end = static_cast<int>(file_lines.size());
+
+                file_lines.erase(file_lines.begin() + remove_start, file_lines.begin() + remove_end);
+                for (int j = static_cast<int>(it->additions.size()) - 1; j >= 0; --j)
+                    file_lines.insert(file_lines.begin() + remove_start, it->additions[j]);
+            }
+
+            std::string new_content = join_lines(file_lines);
+            if (!write_file(patch.path, new_content)) {
+                result.error = "Failed to write updated file: " + patch.path;
+                return result;
+            }
+            result.modified_files[patch.path] = new_content;
+            break;
+        }
+        }
+    }
+
+    result.success = true;
+    return result;
+}
+
+
+}

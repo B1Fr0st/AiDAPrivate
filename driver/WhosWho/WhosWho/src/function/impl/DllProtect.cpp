@@ -10,50 +10,13 @@
 #define WW_LOG0(msg) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] %s\n", msg)
 #endif
 
-// WHY: PsGetProcessPeb is an undocumented ntoskrnl.exe export. Older WDK
-// toolsets do not prototype it in <ntifs.h>, so we declare it explicitly.
-// The function has been stable and exported since Windows XP.
+
 extern "C" PPEB PsGetProcessPeb(PEPROCESS Process);
 
-// ──────────────────────────────────────────────────────────────────────────
-// Module Protection — kernel-resident integrity monitor for AiDA modules
-//
-// WHY this exists:
-//   Every prior crack followed the same pattern:
-//     1. Patch out integrity checks in .text
-//     2. NOP the BSOD enforcement
-//     3. Bypass the license watchdog
-//   All of those patches happen in user-mode, meaning a reverse engineer
-//   only needs to modify memory in their own process. The user-mode code
-//   *cannot protect itself* because it can always be patched before it runs.
-//
-//   By moving the hash verification and BSOD trigger into the kernel driver,
-//   the attacker must *also* patch the driver — which requires loading their
-//   own kernel code, bypassing PatchGuard, or disabling DSE. This raises the
-//   bar from "five minutes in x64dbg" to a full kernel exploit.
-//
-// WHY multi-slot:
-//   AiDA ships as both a DLL plugin (loaded in IDA) and a standalone EXE.
-//   Both can run on the same machine simultaneously and both need kernel-
-//   side integrity monitoring. The old single-slot design forced a choice:
-//   protect the DLL *or* the EXE. With multiple slots, every registered
-//   module is verified independently by the same DPC timer.
-//
-// HOW it works:
-//   1. User-mode registers a module's .text section (PID + base VA + size + hash).
-//   2. A single kernel DPC timer fires periodically and iterates all active
-//      protection slots, reading each section via the process' DTB (physical
-//      page walk) and computing a CRC hash.
-//   3. If any hash mismatches the registered value → immediate bugcheck.
-//   4. The timer also checks for debugger attachment via PEB.BeingDebugged
-//      and NtGlobalFlag, read through physical memory (immune to PEB spoofs
-//      done via NtSetInformationProcess in the target process).
-// ──────────────────────────────────────────────────────────────────────────
 
 namespace dll_protection {
 
-    // Up to 4 independent protection slots — one for AiDA.dll and standalone
-    // EXE, with two spare for future modules (e.g. helper DLLs).
+
     static constexpr UINT32 MAX_PROTECT_SLOTS = 4;
 
     struct protection_entry_t {
@@ -75,14 +38,10 @@ namespace dll_protection {
     static volatile LONG g_timer_initialized = 0;
     static volatile LONG g_timer_running = 0;
 
-    // Forward declarations
+
     static UINT64 compute_code_hash_physical(UINT32 pid, UINT64 va, UINT32 size);
     static BOOLEAN check_peb_debugger_physical(UINT32 pid);
 
-    // ── Hash computation via physical memory read ──
-    // WHY physical: Reading through the process VA via MmCopyVirtualMemory can
-    // be intercepted/redirected by user-mode hooks. Physical reads bypass
-    // any usermode shenanigans.
 
     __forceinline UINT64 crc_combine(UINT64 h1, UINT64 h2, const UINT8* data, SIZE_T len) {
         for (SIZE_T i = 0; i < len; ++i) {
@@ -96,7 +55,7 @@ namespace dll_protection {
         if (pid == 0 || va == 0 || size == 0)
             return 0;
 
-        // Look up DTB from cache (same mechanism used by existing read_raw)
+
         UINT64 dtb = 0;
         for (int i = 0; i < DTB_CACHE_SIZE; i++) {
             if (g_dtb_cache[i].valid && g_dtb_cache[i].pid == pid) {
@@ -120,7 +79,7 @@ namespace dll_protection {
             if (to_read > remaining)
                 to_read = remaining;
 
-            // Translate virtual to physical via 4-level page walk
+
             UINT64 phys = 0;
             {
                 UINT64 pml4e_addr = (dtb & ~0xFFFULL) | (((cursor >> 39) & 0x1FF) << 3);
@@ -140,7 +99,7 @@ namespace dll_protection {
                 UINT64 pdpte = *(volatile UINT64*)mapped;
                 MmUnmapIoSpace(mapped, sizeof(UINT64));
                 if (!(pdpte & 1)) return 0;
-                if (pdpte & 0x80) { // 1GB page
+                if (pdpte & 0x80) {
                     phys = (pdpte & 0xFFFFFFC0000000ULL) | (cursor & 0x3FFFFFFFULL);
                 } else {
                     UINT64 pde_addr = (pdpte & ~0xFFFULL) | (((cursor >> 21) & 0x1FF) << 3);
@@ -150,7 +109,7 @@ namespace dll_protection {
                     UINT64 pde = *(volatile UINT64*)mapped;
                     MmUnmapIoSpace(mapped, sizeof(UINT64));
                     if (!(pde & 1)) return 0;
-                    if (pde & 0x80) { // 2MB page
+                    if (pde & 0x80) {
                         phys = (pde & 0xFFFFFFFE00000ULL) | (cursor & 0x1FFFFFULL);
                     } else {
                         UINT64 pte_addr = (pde & ~0xFFFULL) | (((cursor >> 12) & 0x1FF) << 3);
@@ -165,7 +124,7 @@ namespace dll_protection {
                 }
             }
 
-            // Read the physical page
+
             PHYSICAL_ADDRESS read_pa;
             read_pa.QuadPart = (LONGLONG)phys;
             PVOID mapped = MmMapIoSpace(read_pa, to_read, MmNonCached);
@@ -174,7 +133,7 @@ namespace dll_protection {
             RtlCopyMemory(page_buf, mapped, to_read);
             MmUnmapIoSpace(mapped, to_read);
 
-            // Accumulate hash
+
             for (UINT32 i = 0; i < to_read; i++) {
                 h1 = _mm_crc32_u8((UINT32)h1, page_buf[i]);
                 h2 = _mm_crc32_u8((UINT32)h2, page_buf[i] ^ 0xA5u);
@@ -187,9 +146,7 @@ namespace dll_protection {
         return (h1 & 0xFFFFFFFFULL) | ((h2 & 0xFFFFFFFFULL) << 32);
     }
 
-    // ── Debugger check via physical PEB read ──
-    // WHY: User-mode anti-debug can be spoofed by NtSetInformationProcess.
-    // Reading the PEB through physical memory bypasses that entirely.
+
     static BOOLEAN check_peb_debugger_physical(UINT32 pid) {
         if (pid == 0)
             return FALSE;
@@ -204,8 +161,7 @@ namespace dll_protection {
         if (dtb == 0)
             return FALSE;
 
-        // PEB is at gs:[0x60] on x64 — we need the process' PEB address.
-        // We'll use the EPROCESS to get PEB address via kernel APIs.
+
         PEPROCESS process = nullptr;
         NTSTATUS st = PsLookupProcessByProcessId((HANDLE)(UINT_PTR)pid, &process);
         if (!NT_SUCCESS(st) || !process)
@@ -217,12 +173,11 @@ namespace dll_protection {
         if (peb_addr == 0)
             return FALSE;
 
-        // Read BeingDebugged byte (offset 0x02) and NtGlobalFlag (offset 0xBC)
-        // via physical memory
+
         UINT8 being_debugged = 0;
         UINT32 nt_global_flag = 0;
 
-        // Translate PEB + 0x02
+
         auto read_byte_physical = [&](UINT64 va) -> UINT8 {
             UINT64 phys = 0;
             UINT64 pml4e_addr = (dtb & ~0xFFFULL) | (((va >> 39) & 0x1FF) << 3);
@@ -275,7 +230,7 @@ namespace dll_protection {
 
         being_debugged = read_byte_physical(peb_addr + 0x02);
 
-        // NtGlobalFlag at PEB + 0xBC (4 bytes), read byte by byte
+
         UINT8 ngf_bytes[4];
         for (int b = 0; b < 4; b++)
             ngf_bytes[b] = read_byte_physical(peb_addr + 0xBC + b);
@@ -289,9 +244,7 @@ namespace dll_protection {
         return FALSE;
     }
 
-    // ── Slot lookup helpers ──
 
-    // Find slot matching pid + module_base (exact match for REGISTER updates).
     static int find_slot(UINT32 pid, UINT64 module_base) {
         for (int i = 0; i < (int)MAX_PROTECT_SLOTS; i++) {
             if (_InterlockedCompareExchange(&g_slots[i].active, 1, 1) == 1 &&
@@ -302,7 +255,7 @@ namespace dll_protection {
         return -1;
     }
 
-    // Find first slot matching pid (for QUERY/UNREGISTER when module_base is 0).
+
     static int find_slot_by_pid(UINT32 pid) {
         for (int i = 0; i < (int)MAX_PROTECT_SLOTS; i++) {
             if (_InterlockedCompareExchange(&g_slots[i].active, 1, 1) == 1 &&
@@ -312,7 +265,7 @@ namespace dll_protection {
         return -1;
     }
 
-    // Find first free (inactive) slot.
+
     static int find_free_slot() {
         for (int i = 0; i < (int)MAX_PROTECT_SLOTS; i++) {
             if (_InterlockedCompareExchange(&g_slots[i].active, 0, 0) == 0)
@@ -321,7 +274,7 @@ namespace dll_protection {
         return -1;
     }
 
-    // Returns TRUE if any slot is active.
+
     static BOOLEAN any_active() {
         for (int i = 0; i < (int)MAX_PROTECT_SLOTS; i++) {
             if (_InterlockedCompareExchange(&g_slots[i].active, 1, 1) == 1)
@@ -330,7 +283,7 @@ namespace dll_protection {
         return FALSE;
     }
 
-    // Compute the minimum check interval across all active slots.
+
     static UINT32 compute_min_interval() {
         UINT32 min_iv = 0xFFFFFFFFu;
         for (int i = 0; i < (int)MAX_PROTECT_SLOTS; i++) {
@@ -342,10 +295,6 @@ namespace dll_protection {
         return (min_iv == 0xFFFFFFFFu) ? 0 : min_iv;
     }
 
-    // ── Timer management ──
-    // A single DPC timer covers all slots. Its period is the minimum
-    // check_interval across all active entries, so every slot is verified
-    // at least as frequently as it requested.
 
     static void stop_timer() {
         if (_InterlockedCompareExchange(&g_timer_running, 0, 1) == 1)
@@ -354,12 +303,10 @@ namespace dll_protection {
 
     static void start_or_restart_timer();
 
-    // ── DPC timer callback ──
-    // Runs at DISPATCH_LEVEL periodically to verify ALL active module slots.
-    // On any mismatch or debugger detection → KeBugCheckEx (0xDEAD0ADA).
+
     static VOID NTAPI protection_timer_dpc(
-        PKDPC /*Dpc*/, PVOID /*DeferredContext*/,
-        PVOID /*SystemArgument1*/, PVOID /*SystemArgument2*/)
+        PKDPC , PVOID ,
+        PVOID , PVOID )
     {
         for (int i = 0; i < (int)MAX_PROTECT_SLOTS; i++) {
             if (_InterlockedCompareExchange(&g_slots[i].active, 1, 1) != 1)
@@ -367,23 +314,23 @@ namespace dll_protection {
 
             auto& slot = g_slots[i];
 
-            // Check for debugger via physical PEB
+
             if (check_peb_debugger_physical(slot.pid)) {
                 slot.status = DPRT_STATUS_DEBUGGER;
                 _InterlockedExchange(&slot.active, 0);
-                // 0xDEAD0ADA = "DEAD AiDA" — custom bugcheck code
-                // Param4 = slot index so post-mortem analysis knows which slot triggered
+
+
                 KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)slot.pid,
                              (ULONG_PTR)slot.text_va, 0xDB6u, (ULONG_PTR)i);
-                return; // never reached
+                return;
             }
 
-            // Compute current hash of the .text section
+
             UINT64 hash = compute_code_hash_physical(slot.pid, slot.text_va, slot.text_size);
             slot.last_check_tsc = __rdtsc();
 
             if (hash == 0) {
-                // Process may have exited — deactivate this slot silently
+
                 slot.status = DPRT_STATUS_INACTIVE;
                 _InterlockedExchange(&slot.active, 0);
                 continue;
@@ -394,18 +341,18 @@ namespace dll_protection {
             if (hash != slot.expected_hash) {
                 slot.status = DPRT_STATUS_TAMPERED;
                 _InterlockedExchange(&slot.active, 0);
-                // Immediate BSOD — code was modified
+
                 KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)slot.pid,
                              (ULONG_PTR)slot.text_va,
                              (ULONG_PTR)(slot.expected_hash >> 32),
                              (ULONG_PTR)(hash >> 32));
-                return; // never reached
+                return;
             }
 
             slot.status = DPRT_STATUS_ACTIVE;
         }
 
-        // If every slot was deactivated (all processes exited), stop the timer
+
         if (!any_active())
             stop_timer();
     }
@@ -423,18 +370,14 @@ namespace dll_protection {
         }
 
         LARGE_INTEGER due_time;
-        due_time.QuadPart = -((LONGLONG)min_iv * 10000LL); // relative time in 100ns units
+        due_time.QuadPart = -((LONGLONG)min_iv * 10000LL);
         KeSetTimerEx(&g_timer, due_time, (LONG)min_iv, &g_timer_dpc);
         _InterlockedExchange(&g_timer_running, 1);
     }
 
-} // namespace dll_protection
+}
 
 
-// ── IOCTL handler ──
-// Supports multiple simultaneous protection registrations identified by
-// (pid, module_base). This lets the DLL and standalone EXE each register
-// their own .text section independently.
 NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
     if (!request)
         return STATUS_INVALID_PARAMETER;
@@ -450,13 +393,12 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
                 request->text_section_size == 0 || request->expected_hash == 0)
                 return STATUS_INVALID_PARAMETER;
 
-            // Try to find an existing slot for this (pid, module_base) pair,
-            // otherwise allocate a free one.
+
             int idx = dll_protection::find_slot(request->pid, request->module_base);
             if (idx < 0)
                 idx = dll_protection::find_free_slot();
             if (idx < 0)
-                return STATUS_INSUFFICIENT_RESOURCES; // all slots occupied
+                return STATUS_INSUFFICIENT_RESOURCES;
 
             auto& slot = dll_protection::g_slots[idx];
             slot.pid = request->pid;
@@ -483,17 +425,15 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
 
         case DPRT_OP_QUERY:
         {
-            // Find the slot to query:
-            //  - If pid and module_base are both set → exact match
-            //  - If only pid is set → first slot for that pid
-            //  - If pid is 0 → first active slot (backward compat)
+
+
             int idx = -1;
             if (request->pid != 0 && request->module_base != 0)
                 idx = dll_protection::find_slot(request->pid, request->module_base);
             else if (request->pid != 0)
                 idx = dll_protection::find_slot_by_pid(request->pid);
             else {
-                // Legacy: return the first active slot
+
                 for (int i = 0; i < (int)dll_protection::MAX_PROTECT_SLOTS; i++) {
                     if (_InterlockedCompareExchange(&dll_protection::g_slots[i].active, 1, 1) == 1) {
                         idx = i;
@@ -503,7 +443,7 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
             }
 
             if (idx < 0) {
-                // No matching slot found — return inactive status
+
                 request->pid = 0;
                 request->module_base = 0;
                 request->text_section_va = 0;
@@ -531,10 +471,8 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
 
         case DPRT_OP_UNREGISTER:
         {
-            // Find slot(s) to unregister:
-            //  - If pid and module_base are both set → unregister exact slot
-            //  - If only pid is set → unregister all slots for that pid
-            //  - If pid is 0 → unregister all slots (backward compat)
+
+
             if (request->pid != 0 && request->module_base != 0) {
                 int idx = dll_protection::find_slot(request->pid, request->module_base);
                 if (idx >= 0) {
@@ -562,7 +500,7 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
                     }
                 }
             } else {
-                // Legacy: unregister everything
+
                 for (int i = 0; i < (int)dll_protection::MAX_PROTECT_SLOTS; i++) {
                     _InterlockedExchange(&dll_protection::g_slots[i].active, 0);
                     dll_protection::g_slots[i].status = DPRT_STATUS_INACTIVE;
@@ -575,7 +513,7 @@ NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
                 }
             }
 
-            // Stop or restart timer depending on remaining active slots
+
             if (dll_protection::any_active())
                 dll_protection::start_or_restart_timer();
             else

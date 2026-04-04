@@ -500,7 +500,7 @@ chat_render::render_result_t chat_render::render_rich_message(
         ImVec2 msg_min = origin;
         ImVec2 msg_max(origin.x + max_w, origin.y + msg_h);
 
-        // Extended hover rect includes the action button row below the message
+
         float btn_h = 20.f;
         ImVec2 hover_max(msg_max.x, msg_max.y + btn_h + 4.f);
         bool msg_hov = ImGui::IsMouseHoveringRect(msg_min, hover_max);
@@ -510,7 +510,7 @@ chat_render::render_result_t chat_render::render_rich_message(
         act_a += ((msg_hov ? 1.f : 0.f) - act_a) * std::min(10.f * dt, 1.f);
         ImGui::GetStateStorage()->SetFloat(act_id, act_a);
 
-        // Subtle highlight glow on message when hovered
+
         if (act_a > 0.01f) {
             dl->AddRectFilled(msg_min, msg_max,
                 IM_COL32((int)(accent_r * 40), (int)(accent_g * 40), (int)(accent_b * 40),
@@ -531,7 +531,7 @@ chat_render::render_result_t chat_render::render_rich_message(
                 ImVec2 bmax(bx + bw, btn_y + btn_h);
                 bool bhov = ImGui::IsMouseHoveringRect(bmin, bmax);
 
-                // Animated button hover
+
                 ImGuiID btn_id = ImGui::GetID(("msg_btn_" + std::to_string(msg_idx) + "_" + std::to_string(bi)).c_str());
                 float btn_anim = ImGui::GetStateStorage()->GetFloat(btn_id, 0.f);
                 btn_anim += ((bhov ? 1.f : 0.f) - btn_anim) * std::min(12.f * dt, 1.f);
@@ -558,7 +558,7 @@ chat_render::render_result_t chat_render::render_rich_message(
             result.height += btn_h + 4.f;
         }
 
-        // Right-click context menu for Copy on any message
+
         if (ImGui::IsMouseHoveringRect(msg_min, msg_max) &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
             ImGui::OpenPopup(("##msg_ctx_" + std::to_string(msg_idx)).c_str());

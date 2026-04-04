@@ -507,9 +507,15 @@ namespace
 
         while (!s_stop.load(std::memory_order_acquire)) {
 
-            const int heartbeat_base_s = 15;
-            const int heartbeat_jitter_s = 10;
-            const int wait_s = heartbeat_base_s + static_cast<int>(rng() % (heartbeat_jitter_s + 1));
+
+            int wait_s;
+            if (consecutive_failures == 0) {
+                const int heartbeat_base_s = 15;
+                const int heartbeat_jitter_s = 10;
+                wait_s = heartbeat_base_s + static_cast<int>(rng() % (heartbeat_jitter_s + 1));
+            } else {
+                wait_s = (std::min)(30 * (1 << (consecutive_failures - 1)), 300);
+            }
 
             for (int waited = 0; waited < wait_s && !s_stop.load(std::memory_order_acquire); waited += 1)
                 std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -528,7 +534,20 @@ namespace
                                           nonce, error, response)) {
                 consecutive_failures++;
 
-                if (consecutive_failures >= 2) {
+
+                if (consecutive_failures >= 5) {
+                    const std::string reval_nonce = generate_nonce();
+                    std::string reval_error;
+                    json reval_response;
+                    if (call_validation_endpoint(*settings, "validate", settings->license_key,
+                                                 s_cached_hwid, {}, reval_nonce,
+                                                 reval_error, reval_response)) {
+                        apply_valid_response(*settings, settings->license_key,
+                                             s_cached_hwid, reval_response);
+                        consecutive_failures = 0;
+                        continue;
+                    }
+
                     std::lock_guard<std::mutex> lk(s_state_mtx);
                     s_error = error;
                     set_obfuscated_valid(false);

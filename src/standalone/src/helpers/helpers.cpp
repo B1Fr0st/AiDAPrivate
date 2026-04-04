@@ -801,13 +801,21 @@ void helpers::render_title()
 		}
 		if (!initial_grow_done) {
 
-			float spd = (globals::ui::welcome_done && license::validated) ? 4.f : 6.f;
+
+			float spd = (globals::ui::welcome_done && license::validated) ? 5.f : 12.f;
 			globals::ui::window_w += (tw - globals::ui::window_w) * std::min(spd * dt, 1.f);
 			globals::ui::window_h += (th - globals::ui::window_h) * std::min(spd * dt, 1.f);
+
+
+			if (globals::ui::load_timer > 5.0f && !globals::ui::welcome_done) {
+				globals::ui::window_w = tw;
+				globals::ui::window_h = th;
+			}
 		}
 	}
 
-	bool welcome_ready = !loading && globals::ui::window_w >= 490.f && globals::ui::window_h >= 290.f;
+
+	bool welcome_ready = !loading && globals::ui::window_w >= 470.f && globals::ui::window_h >= 270.f;
 	bool ui_ready      = globals::ui::window_w >= 1000.f && globals::ui::window_h >= 600.f;
 
 	if (ui_ready && globals::ui::welcome_done && license::validated)
@@ -1994,7 +2002,7 @@ void helpers::render_title()
 							if (!fpath.empty()) {
 								g_disasm.file = DisasmFile{};
 								disasm::load_pe(fpath, g_disasm.file);
-								if (g_disasm.file.loaded) disasm::decode_section(g_disasm.file);
+								if (g_disasm.file.loaded) disasm::decode_section_async(g_disasm.file);
 							}
 						}
 						if (menu_item("Attach to Process...", "")) {
@@ -3008,7 +3016,7 @@ void helpers::render_title()
 
 		if (g_disasm.file.loaded && !g_disasm.file.filename.empty()) {
 			bool disasm_is_active = (!code_editor::active || code_editor::buffer.empty()) &&
-			                        g_disasm.file.loaded && !g_disasm.file.instrs.empty();
+			                        g_disasm.file.loaded && (g_disasm.live_mode || !g_disasm.file.instrs.empty());
 			std::string disasm_label = g_disasm.file.filename;
 			ImVec2 dts = ImGui::CalcTextSize(disasm_label.c_str());
 			const float close_sz = 10.f;
@@ -3052,7 +3060,7 @@ void helpers::render_title()
 				wdl->AddText(ImVec2(dtx0 + 10.f, dty0 + (tab_h2 - dts.y) * 0.5f),
 					dtab_col, disasm_label.c_str());
 
-				// Close (X) button on disasm tab
+
 				float cx0 = dtx1 - close_sz - 6.f;
 				float cy0 = dty0 + (tab_h2 - close_sz) * 0.5f;
 				float cx1 = cx0 + close_sz;
@@ -3089,7 +3097,8 @@ void helpers::render_title()
 				: hex_view::g_state.source_name + " (Hex)";
 			const char* hex_label = hex_label_str.c_str();
 			ImVec2 hts = ImGui::CalcTextSize(hex_label);
-			float htw = 10.f * 2.f + hts.x + 10.f + 6.f;
+			const float hex_close_sz = 10.f;
+			float htw = 10.f * 2.f + hts.x + hex_close_sz + 12.f;
 			float tab_h3 = row_h - 2.f;
 
 			float htx0;
@@ -3147,7 +3156,31 @@ void helpers::render_title()
 				wdl->AddText(ImVec2(htx0 + 10.f, hty0 + (tab_h3 - hts.y) * 0.5f),
 					htab_col, hex_label);
 
-				if (htab_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+
+				float hcx0 = htx1 - hex_close_sz - 6.f;
+				float hcy0 = hty0 + (tab_h3 - hex_close_sz) * 0.5f;
+				float hcx1 = hcx0 + hex_close_sz;
+				float hcy1 = hcy0 + hex_close_sz;
+				bool hclose_hov = ImGui::IsMouseHoveringRect(ImVec2(hcx0 - 2, hcy0 - 2), ImVec2(hcx1 + 2, hcy1 + 2), false);
+				if (hclose_hov) {
+					wdl->AddRectFilled(ImVec2(hcx0 - 1, hcy0 - 1), ImVec2(hcx1 + 1, hcy1 + 1),
+						IM_COL32(255,80,80,(int)(40*a)), 3.f);
+				}
+				ImU32 hclose_col = hclose_hov
+					? IM_COL32(255,100,100,(int)(220*a))
+					: IM_COL32(150,150,160,(int)((hex_is_active ? 140.f : 80.f)*a));
+				float hcmx = (hcx0 + hcx1) * 0.5f, hcmy = (hcy0 + hcy1) * 0.5f;
+				float hcr = 3.f;
+				wdl->AddLine(ImVec2(hcmx - hcr, hcmy - hcr), ImVec2(hcmx + hcr, hcmy + hcr), hclose_col, 1.2f);
+				wdl->AddLine(ImVec2(hcmx + hcr, hcmy - hcr), ImVec2(hcmx - hcr, hcmy + hcr), hclose_col, 1.2f);
+
+				if (hclose_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+					hex_view::g_state.active = false;
+					hex_view::g_state.data.clear();
+					hex_view::g_state.source_name.clear();
+					if (globals::ui::active_center_view == center_view_t::hex_view)
+						globals::ui::active_center_view = center_view_t::code_editor;
+				} else if (htab_hov && !hclose_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 					globals::ui::active_center_view = center_view_t::hex_view;
 				}
 			}
@@ -3160,10 +3193,10 @@ void helpers::render_title()
 		if (cf_clicked) {
 			std::string fpath = disasm::open_file_dialog(g_hwnd);
 			if (!fpath.empty()) {
-				g_disasm.file = DisasmFile{};
+			g_disasm.file = DisasmFile{};
 				disasm::load_pe(fpath, g_disasm.file);
 				if (g_disasm.file.loaded)
-					disasm::decode_section(g_disasm.file);
+					disasm::decode_section_async(g_disasm.file);
 			}
 		}
 
@@ -3185,6 +3218,27 @@ void helpers::render_title()
 			float  dt_ty = r2_cy - dt_ts.y * 0.5f;
 			wdl->AddText(ImVec2(hx0 + hdr_pad, dt_ty),
 				IM_COL32(255,255,255,(int)(0.35f*a*255)), desc_text);
+		}
+
+		if (g_disasm.file.loaded) {
+			bool is_hex_view = (globals::ui::active_center_view == center_view_t::hex_view);
+			const char* vt_label = is_hex_view ? "View Disassembly" : "View Hex";
+			float vtbtn_w = ImGui::CalcTextSize(vt_label).x + 22.f;
+			float vtbtn_x = rbtn_x0 - vtbtn_w - 8.f;
+
+			bool vt_clicked = ghost_btn(vt_label,
+				ImGui::GetID("##vthv2"), ImGui::GetID("##vtfl2"),
+				vtbtn_x, r2_cy, vtbtn_w);
+
+			if (vt_clicked) {
+				if (is_hex_view) {
+					globals::ui::active_center_view = center_view_t::disassembly;
+				} else {
+					if (!hex_view::g_state.active || hex_view::g_state.data.empty())
+						hex_view::load_from_file(g_disasm.file.path);
+					globals::ui::active_center_view = center_view_t::hex_view;
+				}
+			}
 		}
 
 		static bool s_sandbox_running = false;
@@ -3266,7 +3320,7 @@ void helpers::render_title()
 	if (cv == center_view_t::welcome) {
 		if (code_editor::active && !code_editor::buffer.empty())
 			cv = center_view_t::code_editor;
-		else if (g_disasm.file.loaded && !g_disasm.file.instrs.empty())
+		else if (g_disasm.file.loaded && (g_disasm.live_mode || g_disasm.file.decoding || !g_disasm.file.instrs.empty()))
 			cv = center_view_t::disassembly;
 		else if (hex_view::g_state.active)
 			cv = center_view_t::hex_view;
@@ -3287,7 +3341,7 @@ void helpers::render_title()
 		hex_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
 	}
 
-	else if (cv == center_view_t::disassembly && g_disasm.file.loaded && !g_disasm.file.instrs.empty())
+	else if (cv == center_view_t::disassembly && g_disasm.file.loaded && (g_disasm.live_mode || g_disasm.file.decoding || !g_disasm.file.instrs.empty()))
 	{
 		disasm_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3, g_disasm, dt);
 	}
@@ -3342,11 +3396,11 @@ void helpers::render_title()
 	ImGui::EndChild();
 	ImGui::PopStyleVar();
 
-	// Save confirmation overlay for dirty file tabs
+
 	{
 		bool popup_active = (file_tabs::pending_close_idx >= 0);
 
-		// Animate in/out
+
 		float target = popup_active ? 1.f : 0.f;
 		float speed = popup_active ? 12.f : 8.f;
 		file_tabs::close_confirm_anim += (target - file_tabs::close_confirm_anim) *
@@ -3360,11 +3414,11 @@ void helpers::render_title()
 			ImDrawList* fdl = ImGui::GetForegroundDrawList();
 			ImVec2 display = ImGui::GetIO().DisplaySize;
 
-			// Dim background
+
 			fdl->AddRectFilled(ImVec2(0, 0), display,
 				IM_COL32(0, 0, 0, (int)(120 * anim)));
 
-			// Popup dimensions
+
 			float pw = 380.f, ph = 150.f;
 			float scale = 0.92f + 0.08f * anim;
 			float sw = pw * scale, sh = ph * scale;
@@ -3372,7 +3426,7 @@ void helpers::render_title()
 			float py = display.y * 0.5f - sh * 0.5f - 20.f * (1.f - anim);
 			float popup_alpha = anim;
 
-			// Drop shadow
+
 			for (int s = 0; s < 4; s++) {
 				float off = 4.f + s * 3.f;
 				fdl->AddRectFilled(
@@ -3381,7 +3435,7 @@ void helpers::render_title()
 					IM_COL32(0, 0, 0, (int)(30 * popup_alpha * (4 - s) / 4.f)), 12.f);
 			}
 
-			// Panel background
+
 			float ax3 = globals::ui::accent.x;
 			float ay3 = globals::ui::accent.y;
 			float az3 = globals::ui::accent.z;
@@ -3390,12 +3444,12 @@ void helpers::render_title()
 			fdl->AddRect(ImVec2(px, py), ImVec2(px + sw, py + sh),
 				IM_COL32(80, 80, 120, (int)(60 * popup_alpha)), 12.f);
 
-			// Accent line at top
+
 			fdl->AddRectFilled(ImVec2(px + 1.f, py + 1.f), ImVec2(px + sw - 1.f, py + 3.f),
 				IM_COL32((int)(ax3 * 255), (int)(ay3 * 255), (int)(az3 * 255),
 				         (int)(180 * popup_alpha)), 2.f);
 
-			// Title
+
 			int ci = file_tabs::pending_close_idx;
 			std::string fname = (ci >= 0 && ci < (int)file_tabs::tabs.size())
 				? file_tabs::tabs[ci].filename : "this file";
@@ -3410,11 +3464,11 @@ void helpers::render_title()
 			fdl->AddText(ImVec2(px + sw * 0.5f - mts.x * 0.5f, py + 46.f),
 				IM_COL32(160, 160, 180, (int)(200 * popup_alpha)), msg.c_str());
 
-			// Separator
+
 			fdl->AddLine(ImVec2(px + 20.f, py + 76.f), ImVec2(px + sw - 20.f, py + 76.f),
 				IM_COL32(255, 255, 255, (int)(15 * popup_alpha)));
 
-			// Buttons
+
 			ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
 
 			struct btn_t { const char* label; float w; ImU32 bg; ImU32 bg_hov; };
@@ -3465,23 +3519,23 @@ void helpers::render_title()
 				bx = bx1 + 8.f;
 			}
 
-			if (action == 0) { // Save
+			if (action == 0) {
 				if (ci >= 0 && ci < (int)file_tabs::tabs.size()) {
 					if (ci == file_tabs::active_tab)
 						code_editor::save();
 				}
 				file_tabs::close_tab(ci);
 				file_tabs::pending_close_idx = -1;
-			} else if (action == 1) { // Don't Save
+			} else if (action == 1) {
 				file_tabs::close_tab(ci);
 				file_tabs::pending_close_idx = -1;
-			} else if (action == 2) { // Cancel
+			} else if (action == 2) {
 				file_tabs::pending_close_idx = -1;
 			}
 
-			// Block interaction with everything below
+
 			if (popup_active && clicked && action == -1) {
-				// Clicked outside buttons but inside overlay — do nothing (consume click)
+
 			}
 		}
 	}
@@ -3661,13 +3715,13 @@ void helpers::render_title()
 
 			if (msg.is_user)
 			{
-				// Edit mode: show editable input with model picker and send button
+
 				if (chat_edit::active && chat_edit::msg_idx == mi) {
 					float edit_w = wrap_w - 8.f;
 					float edit_pad = 8.f;
 					float by = cursor_y;
 
-					// Calculate text height for multi-line
+
 					ImVec2 edit_ts = ImGui::CalcTextSize(chat_edit::buf, nullptr, false, edit_w - 24.f);
 					float text_h = std::max(edit_ts.y + 8.f, ImGui::GetFontSize() * 2.f + 8.f);
 					float model_row_h = 22.f;
@@ -3676,7 +3730,7 @@ void helpers::render_title()
 					ImVec2 bmin = ImVec2(wp2.x + 4.f, wp2.y + by);
 					ImVec2 bmax = ImVec2(bmin.x + edit_w, bmin.y + total_edit_h);
 
-					// Background with accent border
+
 					dl->AddRectFilled(bmin, bmax,
 						IM_COL32((int)(ax * 0.15f + 20), (int)(ay * 0.15f + 15), (int)(az * 0.15f + 30),
 							(int)(240 * appear * a)), 8.f);
@@ -3684,9 +3738,9 @@ void helpers::render_title()
 						IM_COL32((int)(ax * 0.7f), (int)(ay * 0.7f), (int)(az * 0.7f),
 							(int)(120 * appear * a)), 8.f, 0, 1.f);
 
-					// Input text area
+
 					ImGui::SetCursorPos(ImVec2(4.f + edit_pad, by + edit_pad - ImGui::GetScrollY() + ImGui::GetWindowPos().y - wp2.y - ImGui::GetWindowPos().y));
-					// Use screen-relative positioning for the input
+
 					float input_y_screen = bmin.y + edit_pad;
 					ImGui::SetCursorScreenPos(ImVec2(bmin.x + edit_pad, input_y_screen));
 					ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, 4.f));
@@ -3704,11 +3758,11 @@ void helpers::render_title()
 					ImGui::PopStyleColor(2);
 					ImGui::PopStyleVar(2);
 
-					// Model info + Send button row
+
 					float row_y = bmin.y + edit_pad + text_h + 4.f;
 					float row_x = bmin.x + edit_pad;
 
-					// Model name pill
+
 					const char* model_name = g_sa_settings.active_provider_profile_id.empty()
 						? "No Model" : nullptr;
 					std::string model_display;
@@ -3729,7 +3783,7 @@ void helpers::render_title()
 					dl->AddText(ImVec2(row_x + 6.f, row_y + 2.f),
 						IM_COL32(150, 148, 180, (int)(200 * a)), model_display.c_str());
 
-					// Send button (right-aligned)
+
 					const char* send_label = "Send";
 					ImVec2 sts2 = ImGui::CalcTextSize(send_label);
 					float send_w = sts2.x + 16.f;
@@ -3751,35 +3805,34 @@ void helpers::render_title()
 					dl->AddText(ImVec2(smin.x + 8.f, smin.y + 2.f),
 						IM_COL32(230, 230, 255, (int)(240 * a)), send_label);
 
-					// Handle send click or Ctrl+Enter
+
 					if ((send_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) || send_edit) {
-						// Update the message and re-send
+
 						std::string new_text(chat_edit::buf);
 						if (!new_text.empty()) {
-							// Remove all messages from this index onward
+
 							g_chat_messages.erase(g_chat_messages.begin() + mi, g_chat_messages.end());
-							// Re-add as new user message to trigger AI
+
 							ChatMessage um;
 							um.text = new_text;
 							um.is_user = true;
 							um.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
 								std::chrono::system_clock::now().time_since_epoch()).count();
 							g_chat_messages.push_back(um);
-							g_dummy_triggered = false;
 							g_chat_scroll_to_bottom = true;
 						}
 						chat_edit::active = false;
 						chat_edit::msg_idx = -1;
 					}
 
-					// Cancel on click outside the edit area
+
 					if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
 						!ImGui::IsMouseHoveringRect(bmin, bmax) && !send_hov) {
 						chat_edit::active = false;
 						chat_edit::msg_idx = -1;
 					}
 
-					// Cancel on Escape
+
 					if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
 						chat_edit::active = false;
 						chat_edit::msg_idx = -1;
@@ -3789,7 +3842,7 @@ void helpers::render_title()
 				}
 				else
 				{
-				// Normal user message display
+
 
 				ImVec2 ts = ImGui::CalcTextSize(msg.text.c_str(), nullptr, false, wrap_w * 0.78f);
 				float  bw = ts.x + 16.f;
@@ -3804,7 +3857,7 @@ void helpers::render_title()
 				ImVec2 bmin = ImVec2(wp2.x + bx, wp2.y + by);
 				ImVec2 bmax = ImVec2(bmin.x + bw, bmin.y + bh);
 
-				// Hover glow animation
+
 				ImGuiID uhov_id = ImGui::GetID(("uhov_" + std::to_string(mi)).c_str());
 				float uhov_a = s->GetFloat(uhov_id, 0.f);
 				bool user_msg_hov = ImGui::IsMouseHoveringRect(bmin, bmax);
@@ -3815,7 +3868,7 @@ void helpers::render_title()
 					IM_COL32((int)(ax * 0.22f + 18), (int)(ay * 0.22f + 12), (int)(az * 0.22f + 28),
 						(int)((220 + uhov_a * 25.f) * appear * a)), 8.f);
 
-				// Subtle glow border on hover
+
 				if (uhov_a > 0.01f) {
 					dl->AddRect(bmin, bmax,
 						IM_COL32((int)(ax * 0.6f), (int)(ay * 0.6f), (int)(az * 0.6f),
@@ -3827,14 +3880,14 @@ void helpers::render_title()
 					IM_COL32(230, 228, 255, (int)(240 * appear * a)),
 					msg.text.c_str(), nullptr, wrap_w * 0.78f);
 
-				// Click to edit
+
 				if (user_msg_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 					chat_edit::active = true;
 					chat_edit::msg_idx = mi;
 					strncpy_s(chat_edit::buf, msg.text.c_str(), _TRUNCATE);
 				}
 
-				// Right-click context menu
+
 				if (user_msg_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
 					ImGui::OpenPopup(("##user_msg_ctx_" + std::to_string(mi)).c_str());
 				}
@@ -3889,7 +3942,7 @@ void helpers::render_title()
 			{
 				if (msg.has_thinking)
 				{
-					bool still_thinking = !g_think_done && mi == (int)g_chat_messages.size() - 1;
+					bool still_thinking = !g_ai_thinking_active && mi == (int)g_chat_messages.size() - 1;
 
 					ImGuiID tid = ImGui::GetID(("think_open_" + std::to_string(mi)).c_str());
 					bool    open = s->GetBool(tid, false);
@@ -4935,7 +4988,7 @@ void helpers::render_title()
 					g_disasm.file = DisasmFile{};
 					disasm::load_pe(fpath, g_disasm.file);
 					if (g_disasm.file.loaded)
-						disasm::decode_section(g_disasm.file);
+						disasm::decode_section_async(g_disasm.file);
 				}
 			} break;
 			case 12: {
@@ -5166,10 +5219,10 @@ void helpers::render_title()
 				auto& p = proc_list[selected_proc];
 				driver_bridge::attach(p.pid);
 
-				// Auto-start live disassembly on the main module
+
 				auto modules = driver_bridge::enumerate_modules();
 				if (!modules.empty()) {
-					// Find the module matching the process name, or fall back to first
+
 					const auto* target_mod = &modules[0];
 					for (const auto& m : modules) {
 						std::string mn = m.name;
@@ -5178,13 +5231,12 @@ void helpers::render_title()
 						for (auto& c : pn) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
 						if (mn == pn) { target_mod = &m; break; }
 					}
-					uint64_t read_size = target_mod->size;
-					if (read_size == 0) read_size = 0x100000; // 1MB default
-					if (read_size > 64 * 1024 * 1024) read_size = 64 * 1024 * 1024; // cap at 64MB
-					disasm::start_live(g_disasm, p.pid, target_mod->base, read_size, target_mod->name);
+					uint64_t mod_size = target_mod->size;
+					if (mod_size == 0) mod_size = 0x100000;
+					disasm::start_live(g_disasm, p.pid, target_mod->base, mod_size, target_mod->name);
 					globals::ui::active_center_view = center_view_t::disassembly;
 				} else {
-					// Module enumeration failed — still clear old static disasm and notify
+
 					g_disasm.file = DisasmFile{};
 					output_log::push(bottom_tab_t::output,
 						"[Driver] Attached to PID " + std::to_string(p.pid) + " but could not enumerate modules.\n");

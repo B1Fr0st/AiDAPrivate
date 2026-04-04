@@ -5,6 +5,7 @@
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
 #include "standalone_license.hpp"
+#include "standalone_context.hpp"
 #include "mcp_standalone.hpp"
 #include "../helpers/globals.h"
 
@@ -379,26 +380,73 @@ std::string standalone_ai_client_t::generate_gemini(
     std::string model = _settings.get_active_model();
     std::string api_key = _settings.get_active_api_key();
 
+    // WHY: Gemini 2.5+ models support thinkingConfig for reasoning.
+    // Making reasoning provider-agnostic so it works for Gemini too, not just Anthropic.
+    bool is_thinking_model = (model.find("2.5") != std::string::npos ||
+                              model.find("thinking") != std::string::npos);
+
+    json gen_config = {
+        {"temperature", temperature},
+        {"maxOutputTokens", 16384}
+    };
+
     json body = {
         {"contents", json::array({
             {{"role", "user"}, {"parts", json::array({{{"text", prompt}}})} }
         })},
-        {"generationConfig", {
-            {"temperature", temperature},
-            {"maxOutputTokens", 16384}
-        }}
+        {"generationConfig", gen_config}
     };
 
+    // Add thinking config for Gemini 2.5+ when reasoning is enabled
+    if (is_thinking_model && _settings.enable_reasoning) {
+        body["generationConfig"]["thinkingConfig"] = {
+            {"thinkingBudget", (std::max)(_settings.reasoning_budget, 1024)}
+        };
+    }
+
     if (on_chunk) {
+        std::string thinking_text;
+        int64_t in_tokens = 0, out_tokens = 0;
+
         std::string path = "/v1beta/models/" + model + ":streamGenerateContent?alt=sse&key=" + api_key;
-        return streaming_post(base_url, path, {}, body.dump(),
-            [](const std::string& sse_data) -> std::string {
+        auto result = streaming_post(base_url, path, {}, body.dump(),
+            [&](const std::string& sse_data) -> std::string {
                 auto j = json::parse(sse_data, nullptr, false);
                 if (j.is_discarded()) return "";
                 try {
-                    return j["candidates"][0]["content"]["parts"][0]["text"].get<std::string>();
+                    // Extract usage metadata from Gemini responses
+                    if (j.contains("usageMetadata") && j["usageMetadata"].is_object()) {
+                        auto& u = j["usageMetadata"];
+                        in_tokens = u.value("promptTokenCount", (int64_t)0);
+                        out_tokens = u.value("candidatesTokenCount", (int64_t)0);
+                    }
+
+                    auto& parts = j["candidates"][0]["content"]["parts"];
+                    std::string accumulated_text;
+                    for (auto& part : parts) {
+                        if (part.contains("thought") && part["thought"].get<bool>()) {
+                            // WHY: Gemini 2.5 returns thinking in parts with "thought": true
+                            std::string thought = part.value("text", "");
+                            if (!thought.empty()) {
+                                thinking_text += thought;
+                                accumulated_text += "\x01THINK:" + thought;
+                            }
+                        } else if (part.contains("text")) {
+                            accumulated_text += part["text"].get<std::string>();
+                        }
+                    }
+                    return accumulated_text;
                 } catch (...) { return ""; }
             }, on_chunk, stop_check);
+
+        // Cost tracking for Gemini (was missing before — only Anthropic tracked costs)
+        cost_tracking::session_input_tokens += in_tokens;
+        cost_tracking::session_output_tokens += out_tokens;
+        cost_tracking::session_request_count++;
+        cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
+            model, in_tokens, out_tokens, 0, 0);
+
+        return result;
     }
 
     std::string path = "/v1beta/models/" + model + ":generateContent?key=" + api_key;
@@ -416,16 +464,32 @@ std::string standalone_ai_client_t::generate_openai(
     std::string base_url = _settings.get_active_base_url();
     std::string model = _settings.get_active_model();
 
+    // WHY: O-series models (o1, o3, o4-mini) use reasoning_effort instead of temperature,
+    // and use max_completion_tokens instead of max_tokens. Making this provider-agnostic
+    // so reasoning works for ALL providers, not just Anthropic.
+    bool is_o_series = (model.find("o1") != std::string::npos ||
+                        model.find("o3") != std::string::npos ||
+                        model.find("o4") != std::string::npos);
+
     json body = {
         {"model", model},
         {"messages", json::array({
             {{"role", "system"}, {"content", "You are AiDA, an advanced reverse engineering assistant. Be precise and technical."}},
             {{"role", "user"}, {"content", prompt}}
         })},
-        {"temperature", temperature},
-        {"max_tokens", 16384},
         {"stream", on_chunk != nullptr}
     };
+
+    if (is_o_series) {
+        // O-series: use reasoning_effort and max_completion_tokens
+        body["max_completion_tokens"] = 16384;
+        if (_settings.enable_reasoning && !_settings.reasoning_effort.empty()) {
+            body["reasoning_effort"] = _settings.reasoning_effort;
+        }
+    } else {
+        body["temperature"] = temperature;
+        body["max_tokens"] = 16384;
+    }
 
     std::map<std::string, std::string> headers = _settings.get_active_headers();
     if (!_settings.get_active_api_key().empty())
@@ -433,19 +497,54 @@ std::string standalone_ai_client_t::generate_openai(
     headers["Content-Type"] = "application/json";
 
     if (on_chunk) {
-        return streaming_post(base_url, "/v1/chat/completions", headers, body.dump(),
-            [](const std::string& sse_data) -> std::string {
+        std::string thinking_text;
+        int64_t in_tokens = 0, out_tokens = 0, cache_read = 0, cache_write = 0;
+
+        auto result = streaming_post(base_url, "/v1/chat/completions", headers, body.dump(),
+            [&](const std::string& sse_data) -> std::string {
                 auto j = json::parse(sse_data, nullptr, false);
                 if (j.is_discarded()) return "";
                 try {
+                    // Extract usage from streaming chunks (OpenAI includes usage in final chunk)
+                    if (j.contains("usage") && j["usage"].is_object()) {
+                        auto& u = j["usage"];
+                        in_tokens = u.value("prompt_tokens", (int64_t)0);
+                        out_tokens = u.value("completion_tokens", (int64_t)0);
+                        // OpenAI uses prompt_tokens_details.cached_tokens for cache reads
+                        if (u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object()) {
+                            cache_read = u["prompt_tokens_details"].value("cached_tokens", (int64_t)0);
+                        }
+                    }
+
                     auto& choices = j["choices"];
                     if (choices.empty()) return "";
                     auto& delta = choices[0]["delta"];
-                    if (delta.contains("content"))
+
+                    // WHY: O-series models stream reasoning tokens via "reasoning" field in delta.
+                    // This makes thinking/reasoning visible for OpenAI too, not just Anthropic.
+                    if (delta.contains("reasoning") && !delta["reasoning"].is_null()) {
+                        std::string reasoning = delta["reasoning"].get<std::string>();
+                        if (!reasoning.empty()) {
+                            thinking_text += reasoning;
+                            return "\x01THINK:" + reasoning;
+                        }
+                    }
+
+                    if (delta.contains("content") && !delta["content"].is_null())
                         return delta["content"].get<std::string>();
                 } catch (...) {}
                 return "";
             }, on_chunk, stop_check);
+
+        // WHY: Cost tracking was Anthropic-only before. Now every provider tracks costs.
+        cost_tracking::session_input_tokens += in_tokens;
+        cost_tracking::session_output_tokens += out_tokens;
+        cost_tracking::session_cache_read += cache_read;
+        cost_tracking::session_request_count++;
+        cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
+            model, in_tokens, out_tokens, cache_read, 0);
+
+        return result;
     }
 
     return simple_post(base_url, "/v1/chat/completions", headers, body.dump(),
@@ -500,10 +599,10 @@ std::string standalone_ai_client_t::generate_anthropic(
     };
 
 
-    if (_settings.thinking_enabled) {
+    if (_settings.enable_reasoning) {
         json thinking_cfg = {
             {"type", "enabled"},
-            {"budget_tokens", (std::max)(_settings.thinking_budget, 1024)}
+            {"budget_tokens", (std::max)(_settings.reasoning_budget, 1024)}
         };
         body["thinking"] = thinking_cfg;
 
@@ -515,62 +614,6 @@ std::string standalone_ai_client_t::generate_anthropic(
     headers["x-api-key"] = _settings.get_active_api_key();
     headers["anthropic-version"] = "2023-06-01";
     headers["Content-Type"] = "application/json";
-
-
-    std::string beta_features;
-    auto add_beta = [&](const char* feature) {
-        if (!beta_features.empty()) beta_features += ",";
-        beta_features += feature;
-    };
-
-
-    add_beta("context-1m-2025-08-07");
-
-
-    if (_settings.thinking_enabled)
-        add_beta("interleaved-thinking-2025-05-14");
-
-
-    if (_settings.prompt_caching)
-        add_beta("prompt-caching-scope-2026-01-05");
-
-
-    if (_settings.web_search_enabled)
-        add_beta("web-search-2025-03-05");
-
-
-    if (_settings.task_budget_tokens > 0)
-        add_beta("task-budgets-2026-03-13");
-
-
-    if (_settings.effort_level >= 0 && _settings.effort_level <= 3) {
-        add_beta("effort-2025-11-24");
-        static const char* effort_names[] = {"low", "medium", "high", "max"};
-        body["effort"] = {{"level", effort_names[_settings.effort_level]}};
-    }
-
-
-    add_beta("advanced-tool-use-2025-11-20");
-
-
-    add_beta("token-efficient-tools-2026-03-28");
-
-
-    add_beta("structured-outputs-2025-12-15");
-
-    if (_settings.fast_mode)
-        add_beta("fast-mode-2025-09-01");
-
-    if (_settings.redact_thinking)
-        add_beta("redact-thinking-2025-09-01");
-
-    if (!beta_features.empty())
-        headers["anthropic-beta"] = beta_features;
-
-
-    if (_settings.task_budget_tokens > 0) {
-        body["task_budget"] = {{"total", _settings.task_budget_tokens}};
-    }
 
     if (on_chunk) {
 
@@ -684,24 +727,70 @@ std::string standalone_ai_client_t::generate_openrouter(
     headers["Content-Type"] = "application/json";
 
     if (on_chunk) {
-        return streaming_post(base_url, "/api/v1/chat/completions",
+        // WHY: OpenRouter proxies many providers (DeepSeek, OpenAI, etc.) and reasoning
+        // tokens arrive via "reasoning_content" (DeepSeek-R1) or "reasoning" (O-series).
+        // Without handling these, DeepSeek-R1 streams nothing to the UI because ALL its
+        // initial output is reasoning — so on_chunk never fires, and the response vanishes.
+        int64_t in_tokens = 0, out_tokens = 0;
+
+        auto result = streaming_post(base_url, "/api/v1/chat/completions",
             headers, body.dump(),
-            [](const std::string& sse_data) -> std::string {
+            [&](const std::string& sse_data) -> std::string {
                 auto j = json::parse(sse_data, nullptr, false);
                 if (j.is_discarded()) return "";
                 try {
+                    // Extract usage from final streaming chunk
+                    if (j.contains("usage") && j["usage"].is_object()) {
+                        auto& u = j["usage"];
+                        in_tokens = u.value("prompt_tokens", (int64_t)0);
+                        out_tokens = u.value("completion_tokens", (int64_t)0);
+                    }
+
                     auto& choices = j["choices"];
-                    if (!choices.empty() && choices[0].contains("delta"))
-                        return choices[0]["delta"].value("content", "");
+                    if (choices.empty()) return "";
+                    if (!choices[0].contains("delta")) return "";
+                    auto& delta = choices[0]["delta"];
+
+                    // DeepSeek-R1 reasoning tokens (field: "reasoning_content")
+                    if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
+                        std::string th = delta["reasoning_content"].get<std::string>();
+                        if (!th.empty())
+                            return "\x01THINK:" + th;
+                    }
+
+                    // O-series reasoning tokens (field: "reasoning")
+                    if (delta.contains("reasoning") && !delta["reasoning"].is_null()) {
+                        std::string reasoning = delta["reasoning"].get<std::string>();
+                        if (!reasoning.empty())
+                            return "\x01THINK:" + reasoning;
+                    }
+
+                    // Regular content tokens
+                    if (delta.contains("content") && !delta["content"].is_null())
+                        return delta["content"].get<std::string>();
                 } catch (...) {}
                 return "";
             }, on_chunk, stop_check);
+
+        // Cost tracking for OpenRouter (was missing entirely before)
+        cost_tracking::session_input_tokens += in_tokens;
+        cost_tracking::session_output_tokens += out_tokens;
+        cost_tracking::session_request_count++;
+        cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
+            model, in_tokens, out_tokens, 0, 0);
+
+        return result;
     }
 
     return simple_post(base_url, "/api/v1/chat/completions",
         headers, body.dump(),
         [](const json& j) -> std::string {
-            return j["choices"][0]["message"]["content"].get<std::string>();
+            // Non-streaming: handle reasoning_content in response too
+            auto& msg = j["choices"][0]["message"];
+            std::string text = msg.value("content", "");
+            if (text.empty() && msg.contains("reasoning_content") && msg["reasoning_content"].is_string())
+                text = msg["reasoning_content"].get<std::string>();
+            return text;
         });
 }
 
@@ -730,7 +819,7 @@ nlohmann::json standalone_ai_client_t::build_anthropic_tools(
     using json = nlohmann::json;
     json arr = json::array();
 
-    // The get_tool_descriptions meta-tool — always sent with full definition
+
     arr.push_back({
         {"name", "get_tool_descriptions"},
         {"description", "Returns the full description and parameter schema for one or more tools. "
@@ -748,7 +837,7 @@ nlohmann::json standalone_ai_client_t::build_anthropic_tools(
         }}
     });
 
-    // All other tools — compact stubs (name only, minimal description, no params)
+
     for (auto& t : tools) {
         if (t.name == "get_tool_descriptions") continue;
         arr.push_back({
@@ -806,7 +895,372 @@ nlohmann::json standalone_ai_client_t::make_tool_result_block(
 }
 
 
+nlohmann::json standalone_ai_client_t::make_openai_tool_result(
+    const std::string& tool_call_id,
+    const std::string& content)
+{
+    return {
+        {"role", "tool"},
+        {"tool_call_id", tool_call_id},
+        {"content", content}
+    };
+}
+
+
+nlohmann::json standalone_ai_client_t::make_gemini_tool_result(
+    const std::string& function_name,
+    const nlohmann::json& result_data)
+{
+    return {
+        {"role", "user"},
+        {"parts", json::array({
+            {{"functionResponse", {
+                {"name", function_name},
+                {"response", result_data}
+            }}}
+        })}
+    };
+}
+
+
+std::string standalone_ai_client_t::clean_model_name(const std::string& model)
+{
+    std::string clean = model;
+    for (const char* suffix : {" (Max Effort)", " (High Effort)", " (Medium Effort)",
+                               " (Low Effort)", " (Standard)"}) {
+        auto pos = clean.find(suffix);
+        if (pos != std::string::npos) { clean.erase(pos); break; }
+    }
+    return clean;
+}
+
+
+nlohmann::json standalone_ai_client_t::build_openai_tools(
+    const std::vector<mcp_standalone::tool_def_t>& tools)
+{
+    json arr = json::array();
+
+
+    {
+        json params = {
+            {"type", "object"},
+            {"properties", {
+                {"names", {
+                    {"type", "array"},
+                    {"items", {{"type", "string"}}},
+                    {"description", "Array of tool names to look up"}
+                }}
+            }},
+            {"required", json::array({"names"})},
+            {"additionalProperties", false}
+        };
+        arr.push_back({
+            {"type", "function"},
+            {"function", {
+                {"name", "get_tool_descriptions"},
+                {"description", "Returns the full description and parameter schema for one or more tools. "
+                                "Call this FIRST when you need to use a tool and are unsure of its parameters."},
+                {"parameters", params},
+                {"strict", true}
+            }}
+        });
+    }
+
+    for (auto& t : tools) {
+        if (t.name == "get_tool_descriptions") continue;
+        json props = json::object();
+        json req   = json::array();
+        for (auto& p : t.params) {
+            json prop = {{"type", p.type}, {"description", p.description}};
+            props[p.name] = prop;
+            if (p.required) req.push_back(p.name);
+        }
+        json schema = {
+            {"type", "object"},
+            {"properties", props},
+            {"additionalProperties", false}
+        };
+        if (!req.empty()) schema["required"] = req;
+
+        arr.push_back({
+            {"type", "function"},
+            {"function", {
+                {"name", t.name},
+                {"description", t.description.substr(0, (std::min)(t.description.size(), static_cast<size_t>(200)))},
+                {"parameters", schema}
+            }}
+        });
+    }
+    return arr;
+}
+
+
+nlohmann::json standalone_ai_client_t::build_gemini_tools(
+    const std::vector<mcp_standalone::tool_def_t>& tools)
+{
+    json decls = json::array();
+
+
+    {
+        json params = {
+            {"type", "object"},
+            {"properties", {
+                {"names", {
+                    {"type", "array"},
+                    {"items", {{"type", "string"}}},
+                    {"description", "Array of tool names to look up"}
+                }}
+            }},
+            {"required", json::array({"names"})}
+        };
+        decls.push_back({
+            {"name", "get_tool_descriptions"},
+            {"description", "Returns the full description and parameter schema for one or more tools."},
+            {"parametersJsonSchema", params}
+        });
+    }
+
+    for (auto& t : tools) {
+        if (t.name == "get_tool_descriptions") continue;
+        json props = json::object();
+        json req   = json::array();
+        for (auto& p : t.params) {
+            json prop = {{"type", p.type}, {"description", p.description}};
+            props[p.name] = prop;
+            if (p.required) req.push_back(p.name);
+        }
+        json schema = {
+            {"type", "object"},
+            {"properties", props}
+        };
+        if (!req.empty()) schema["required"] = req;
+
+        decls.push_back({
+            {"name", t.name},
+            {"description", t.description.substr(0, (std::min)(t.description.size(), static_cast<size_t>(200)))},
+            {"parametersJsonSchema", schema}
+        });
+    }
+    return json::array({{{"functionDeclarations", decls}}});
+}
+
+
+nlohmann::json standalone_ai_client_t::convert_messages_for_openai(
+    const nlohmann::json& anthropic_messages,
+    const std::string& system_prompt)
+{
+    json messages = json::array();
+
+
+    if (!system_prompt.empty()) {
+        messages.push_back({{"role", "system"}, {"content", system_prompt}});
+    }
+
+    for (auto& msg : anthropic_messages) {
+        std::string role = msg.value("role", "user");
+
+        if (msg["content"].is_string()) {
+            messages.push_back({{"role", role}, {"content", msg["content"].get<std::string>()}});
+            continue;
+        }
+
+        if (!msg["content"].is_array()) continue;
+
+
+        if (role == "assistant") {
+            std::string text_content;
+            json tool_calls = json::array();
+            int tc_idx = 0;
+
+            for (auto& block : msg["content"]) {
+                std::string btype = block.value("type", "");
+                if (btype == "text") {
+                    text_content += block.value("text", "");
+                } else if (btype == "tool_use") {
+                    json tc = {
+                        {"id", block.value("id", "tc_" + std::to_string(tc_idx))},
+                        {"type", "function"},
+                        {"function", {
+                            {"name", block.value("name", "")},
+                            {"arguments", block.value("input", json::object()).dump()}
+                        }}
+                    };
+                    tool_calls.push_back(std::move(tc));
+                    ++tc_idx;
+                }
+            }
+
+            json oai_msg = {{"role", "assistant"}};
+            if (!text_content.empty())
+                oai_msg["content"] = text_content;
+            else
+                oai_msg["content"] = nullptr;
+
+            if (!tool_calls.empty())
+                oai_msg["tool_calls"] = tool_calls;
+
+            messages.push_back(std::move(oai_msg));
+        }
+        else if (role == "user") {
+
+            bool has_tool_results = false;
+            for (auto& block : msg["content"]) {
+                if (block.value("type", "") == "tool_result") {
+                    has_tool_results = true;
+                    break;
+                }
+            }
+
+            if (has_tool_results) {
+                for (auto& block : msg["content"]) {
+                    if (block.value("type", "") == "tool_result") {
+                        messages.push_back(make_openai_tool_result(
+                            block.value("tool_use_id", ""),
+                            block.value("content", "")));
+                    }
+                }
+            } else {
+                std::string text_content;
+                for (auto& block : msg["content"]) {
+                    if (block.value("type", "") == "text")
+                        text_content += block.value("text", "");
+                }
+                if (!text_content.empty())
+                    messages.push_back({{"role", "user"}, {"content", text_content}});
+            }
+        }
+    }
+    return messages;
+}
+
+
+nlohmann::json standalone_ai_client_t::convert_messages_for_gemini(
+    const nlohmann::json& anthropic_messages)
+{
+    json contents = json::array();
+
+    for (auto& msg : anthropic_messages) {
+        std::string role = msg.value("role", "user");
+        std::string gemini_role = (role == "assistant") ? "model" : "user";
+
+        if (msg["content"].is_string()) {
+            contents.push_back({
+                {"role", gemini_role},
+                {"parts", json::array({{{"text", msg["content"].get<std::string>()}}})}
+            });
+            continue;
+        }
+
+        if (!msg["content"].is_array()) continue;
+
+        json parts = json::array();
+        bool has_tool_results = false;
+
+        for (auto& block : msg["content"]) {
+            std::string btype = block.value("type", "");
+
+            if (btype == "text") {
+                std::string t = block.value("text", "");
+                if (!t.empty())
+                    parts.push_back({{"text", t}});
+            }
+            else if (btype == "tool_use") {
+                parts.push_back({
+                    {"functionCall", {
+                        {"name", block.value("name", "")},
+                        {"args", block.value("input", json::object())}
+                    }}
+                });
+            }
+            else if (btype == "tool_result") {
+                has_tool_results = true;
+                json response_data;
+                std::string content_str = block.value("content", "");
+                if (!content_str.empty()) {
+                    response_data = {{"result", content_str}};
+                } else {
+                    response_data = {{"result", "OK"}};
+                }
+                if (block.value("is_error", false))
+                    response_data["error"] = true;
+
+                parts.push_back({
+                    {"functionResponse", {
+                        {"name", block.value("tool_use_id", "unknown")},
+                        {"response", response_data}
+                    }}
+                });
+            }
+        }
+
+        if (!parts.empty()) {
+            contents.push_back({
+                {"role", has_tool_results ? "user" : gemini_role},
+                {"parts", parts}
+            });
+        }
+    }
+    return contents;
+}
+
+
+nlohmann::json standalone_ai_client_t::merge_consecutive_roles(
+    const nlohmann::json& messages)
+{
+    if (messages.empty()) return messages;
+
+    json merged = json::array();
+    for (auto& msg : messages) {
+        if (!merged.empty() &&
+            merged.back().value("role", "") == msg.value("role", "")) {
+
+            std::string prev = merged.back().value("content", "");
+            std::string curr = msg.value("content", "");
+            merged.back()["content"] = prev + "\n\n" + curr;
+        } else {
+            merged.push_back(msg);
+        }
+    }
+    return merged;
+}
+
+
 ai_generation_result_t standalone_ai_client_t::generate_with_tools(
+    const nlohmann::json& messages,
+    const std::string& system_prompt,
+    const std::vector<mcp_standalone::tool_def_t>& tools,
+    ai_stream_chunk_t on_chunk)
+{
+    ai_generation_result_t result;
+
+    {
+        uint64_t gt = standalone_license::inline_gate_check(
+            standalone_license::gate_native_tool_use);
+        if (gt == 0) {
+            result.is_error = true;
+            result.text = "Error: License gate blocked native tool use.";
+            return result;
+        }
+    }
+
+    const auto provider = _settings.get_active_profile_kind();
+
+
+    if (provider == "anthropic")
+        return generate_with_tools_anthropic(messages, system_prompt, tools, on_chunk);
+
+    if (provider == "gemini" || provider == "vertex")
+        return generate_with_tools_gemini(messages, system_prompt, tools, on_chunk);
+
+    if (provider == "openai_native" || provider == "openai_codex")
+        return generate_with_tools_openai(messages, system_prompt, tools, on_chunk);
+
+
+    return generate_with_tools_generic_openai(messages, system_prompt, tools, on_chunk);
+}
+
+
+ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
     const nlohmann::json& messages,
     const std::string& system_prompt,
     const std::vector<mcp_standalone::tool_def_t>& tools,
@@ -859,10 +1313,10 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools(
         body["tools"] = build_anthropic_tools(tools);
 
 
-    if (_settings.thinking_enabled) {
+    if (_settings.enable_reasoning) {
         body["thinking"] = {
             {"type", "enabled"},
-            {"budget_tokens", (std::max)(_settings.thinking_budget, 1024)}
+            {"budget_tokens", (std::max)(_settings.reasoning_budget, 1024)}
         };
     } else if (clean_model.find("thought") == std::string::npos) {
         body["temperature"] = 0.0;
@@ -873,39 +1327,6 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools(
     headers["x-api-key"]          = _settings.get_active_api_key();
     headers["anthropic-version"]  = "2023-06-01";
     headers["Content-Type"]       = "application/json";
-
-
-    std::string beta_features;
-    auto add_beta = [&](const char* feature) {
-        if (!beta_features.empty()) beta_features += ",";
-        beta_features += feature;
-    };
-
-    add_beta("context-1m-2025-08-07");
-    if (_settings.thinking_enabled)
-        add_beta("interleaved-thinking-2025-05-14");
-    if (_settings.prompt_caching)
-        add_beta("prompt-caching-scope-2026-01-05");
-    if (_settings.web_search_enabled)
-        add_beta("web-search-2025-03-05");
-    if (_settings.task_budget_tokens > 0)
-        add_beta("task-budgets-2026-03-13");
-    if (_settings.effort_level >= 0 && _settings.effort_level <= 3) {
-        add_beta("effort-2025-11-24");
-        static const char* effort_names[] = {"low", "medium", "high", "max"};
-        body["effort"] = {{"level", effort_names[_settings.effort_level]}};
-    }
-    add_beta("advanced-tool-use-2025-11-20");
-    add_beta("token-efficient-tools-2026-03-28");
-    add_beta("structured-outputs-2025-12-15");
-    if (_settings.fast_mode)
-        add_beta("fast-mode-2025-09-01");
-    if (_settings.redact_thinking)
-        add_beta("redact-thinking-2025-09-01");
-    if (!beta_features.empty())
-        headers["anthropic-beta"] = beta_features;
-    if (_settings.task_budget_tokens > 0)
-        body["task_budget"] = {{"total", _settings.task_budget_tokens}};
 
 
     auto client = get_or_create_client(base_url);
@@ -1060,6 +1481,581 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools(
     cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
         clean_model, result.input_tokens, result.output_tokens,
         result.cache_read, result.cache_write);
+
+    return result;
+}
+
+
+
+ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
+    const nlohmann::json& messages,
+    const std::string& system_prompt,
+    const std::vector<mcp_standalone::tool_def_t>& tools,
+    ai_stream_chunk_t on_chunk)
+{
+    using json = nlohmann::json;
+    ai_generation_result_t result;
+
+    std::string base_url = _settings.get_active_base_url();
+    std::string model    = clean_model_name(_settings.get_active_model());
+
+    json oai_messages = convert_messages_for_openai(messages, system_prompt);
+    json oai_tools    = build_openai_tools(tools);
+
+    json body = {
+        {"model", model},
+        {"messages", oai_messages},
+        {"stream", true},
+        {"stream_options", {{"include_usage", true}}}
+    };
+
+    if (!oai_tools.empty()) {
+        body["tools"] = oai_tools;
+        body["tool_choice"] = "auto";
+    }
+
+
+    bool is_o_series = (model.find("o1") != std::string::npos ||
+                        model.find("o3") != std::string::npos ||
+                        model.find("o4") != std::string::npos);
+    if (is_o_series) {
+        body.erase("stream");
+        body.erase("stream_options");
+        if (_settings.enable_reasoning) {
+            std::string effort = _settings.reasoning_effort;
+            if (effort.empty() || effort == "xhigh") effort = "high";
+            if (effort == "minimal") effort = "low";
+            body["reasoning"] = {{"effort", effort}};
+        }
+    } else {
+        body["temperature"] = 0.0;
+    }
+
+    auto client = get_or_create_client(base_url);
+    httplib::Headers hdrs;
+    hdrs.emplace("Content-Type", "application/json");
+    hdrs.emplace("Authorization", "Bearer " + _settings.get_active_api_key());
+
+    for (auto& [k, v] : _settings.get_active_headers()) hdrs.emplace(k, v);
+
+
+    struct oai_tc_state_t {
+        std::string id;
+        std::string name;
+        std::string arguments_accum;
+    };
+    std::map<int, oai_tc_state_t> tc_map;
+
+    std::string sse_buffer;
+    bool is_streaming = body.contains("stream") && body["stream"].get<bool>();
+
+    if (is_streaming) {
+        httplib::Request req;
+        req.method  = "POST";
+        req.path    = "/v1/chat/completions";
+        req.headers = hdrs;
+        req.body    = body.dump();
+
+        req.content_receiver = [&](const char* data, size_t len, uint64_t, uint64_t) -> bool {
+            if (_cancelled) return false;
+            sse_buffer.append(data, len);
+
+            size_t pos = 0;
+            while (pos < sse_buffer.size()) {
+                auto nl = sse_buffer.find('\n', pos);
+                if (nl == std::string::npos) break;
+                std::string line = sse_buffer.substr(pos, nl - pos);
+                pos = nl + 1;
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+
+                if (line == "data: [DONE]" || line == "data:[DONE]") continue;
+
+                std::string payload;
+                if (line.size() > 6 && line.substr(0, 6) == "data: ")
+                    payload = line.substr(6);
+                else if (line.size() > 5 && line.substr(0, 5) == "data:")
+                    payload = line.substr(5);
+                else continue;
+
+                if (payload.empty()) continue;
+                auto j = json::parse(payload, nullptr, false);
+                if (j.is_discarded()) continue;
+
+
+                if (j.contains("usage") && j["usage"].is_object()) {
+                    auto& u = j["usage"];
+                    result.input_tokens  = u.value("prompt_tokens", (int64_t)0);
+                    result.output_tokens = u.value("completion_tokens", (int64_t)0);
+                    if (u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object())
+                        result.cache_read = u["prompt_tokens_details"].value("cached_tokens", (int64_t)0);
+                }
+
+                if (!j.contains("choices") || j["choices"].empty()) continue;
+                auto& choice = j["choices"][0];
+                auto& delta = choice["delta"];
+
+                if (delta.contains("content") && delta["content"].is_string()) {
+                    std::string txt = delta["content"].get<std::string>();
+                    result.text += txt;
+                    if (on_chunk) on_chunk(txt);
+                }
+
+
+                if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
+                    std::string th = delta["reasoning_content"].get<std::string>();
+                    result.thinking += th;
+                    if (on_chunk) on_chunk("\x01THINK:" + th);
+                }
+
+                // O-series reasoning tokens use "reasoning" field
+                if (delta.contains("reasoning") && !delta["reasoning"].is_null()) {
+                    std::string th = delta["reasoning"].get<std::string>();
+                    if (!th.empty()) {
+                        result.thinking += th;
+                        if (on_chunk) on_chunk("\x01THINK:" + th);
+                    }
+                }
+
+                if (delta.contains("tool_calls") && delta["tool_calls"].is_array()) {
+                    for (auto& tc_delta : delta["tool_calls"]) {
+                        int idx = tc_delta.value("index", 0);
+                        if (tc_delta.contains("id"))
+                            tc_map[idx].id = tc_delta["id"].get<std::string>();
+                        if (tc_delta.contains("function")) {
+                            auto& fn = tc_delta["function"];
+                            if (fn.contains("name"))
+                                tc_map[idx].name = fn["name"].get<std::string>();
+                            if (fn.contains("arguments"))
+                                tc_map[idx].arguments_accum += fn["arguments"].get<std::string>();
+                        }
+                    }
+                }
+
+                if (choice.contains("finish_reason") && choice["finish_reason"].is_string())
+                    result.stop_reason = choice["finish_reason"].get<std::string>();
+            }
+            sse_buffer.erase(0, pos);
+            return true;
+        };
+
+        auto res = client->send(req);
+
+        if (_cancelled) { result.is_error = true; result.text = "Error: Operation cancelled."; return result; }
+        if (!res) { result.is_error = true; result.text = "Error: Request failed: " + httplib::to_string(res.error()); return result; }
+        if (res->status != 200) {
+            result.is_error = true;
+            result.text = "Error: API returned status " + std::to_string(res->status) + ": " + res->body.substr(0, 800);
+            return result;
+        }
+    } else {
+
+        httplib::Headers h2 = hdrs;
+        auto res = client->Post("/v1/chat/completions", h2, body.dump(), "application/json");
+        if (_cancelled) { result.is_error = true; result.text = "Error: Operation cancelled."; return result; }
+        if (!res) { result.is_error = true; result.text = "Error: Request failed: " + httplib::to_string(res.error()); return result; }
+        if (res->status != 200) {
+            result.is_error = true;
+            result.text = "Error: API returned status " + std::to_string(res->status) + ": " + res->body.substr(0, 800);
+            return result;
+        }
+
+        auto resp = json::parse(res->body, nullptr, false);
+        if (resp.is_discarded()) { result.is_error = true; result.text = "Error: Failed to parse response."; return result; }
+
+        if (resp.contains("usage") && resp["usage"].is_object()) {
+            auto& u = resp["usage"];
+            result.input_tokens  = u.value("prompt_tokens", (int64_t)0);
+            result.output_tokens = u.value("completion_tokens", (int64_t)0);
+        }
+
+        if (resp.contains("choices") && !resp["choices"].empty()) {
+            auto& msg = resp["choices"][0]["message"];
+            result.text = msg.value("content", "");
+            result.stop_reason = resp["choices"][0].value("finish_reason", "");
+
+            if (msg.contains("reasoning_content") && msg["reasoning_content"].is_string()) {
+                result.thinking = msg["reasoning_content"].get<std::string>();
+            }
+
+            if (msg.contains("tool_calls") && msg["tool_calls"].is_array()) {
+                for (auto& tc : msg["tool_calls"]) {
+                    if (tc.value("type", "") != "function") continue;
+                    auto& fn = tc["function"];
+                    int idx = static_cast<int>(tc_map.size());
+                    tc_map[idx].id   = tc.value("id", "tc_" + std::to_string(idx));
+                    tc_map[idx].name = fn.value("name", "");
+                    tc_map[idx].arguments_accum = fn.value("arguments", "{}");
+                }
+            }
+
+            if (on_chunk && !result.text.empty()) on_chunk(result.text);
+        }
+    }
+
+
+    for (auto& [idx, tcs] : tc_map) {
+        ai_tool_call_t tc;
+        tc.id   = tcs.id;
+        tc.name = tcs.name;
+        tc.arguments = json::parse(tcs.arguments_accum, nullptr, false);
+        if (tc.arguments.is_discarded()) tc.arguments = json::object();
+        result.tool_calls.push_back(std::move(tc));
+    }
+
+
+    cost_tracking::session_input_tokens  += result.input_tokens;
+    cost_tracking::session_output_tokens += result.output_tokens;
+    cost_tracking::session_cache_read    += result.cache_read;
+    cost_tracking::session_request_count++;
+    cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
+        model, result.input_tokens, result.output_tokens,
+        result.cache_read, 0);
+
+    return result;
+}
+
+
+
+ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
+    const nlohmann::json& messages,
+    const std::string& system_prompt,
+    const std::vector<mcp_standalone::tool_def_t>& tools,
+    ai_stream_chunk_t on_chunk)
+{
+    using json = nlohmann::json;
+    ai_generation_result_t result;
+
+    std::string base_url = _settings.get_active_base_url();
+    std::string model    = clean_model_name(_settings.get_active_model());
+    std::string api_key  = _settings.get_active_api_key();
+
+
+    json contents  = convert_messages_for_gemini(messages);
+    json gem_tools = build_gemini_tools(tools);
+
+    json body = {
+        {"contents", contents}
+    };
+
+    if (!system_prompt.empty()) {
+        body["systemInstruction"] = {
+            {"parts", json::array({{{"text", system_prompt}}})}
+        };
+    }
+
+    if (!gem_tools.empty())
+        body["tools"] = gem_tools;
+
+
+    json gen_config = {{"maxOutputTokens", 16384}};
+
+    if (_settings.enable_reasoning) {
+        gen_config["thinkingConfig"] = {
+            {"thinkingBudget", (std::max)(_settings.reasoning_budget, 1024)}
+        };
+    } else {
+        gen_config["temperature"] = 0.0;
+    }
+
+    body["generationConfig"] = gen_config;
+
+
+    std::string path = "/v1beta/models/" + model + ":streamGenerateContent?alt=sse&key=" + api_key;
+
+    auto client = get_or_create_client(base_url);
+    httplib::Headers hdrs;
+    hdrs.emplace("Content-Type", "application/json");
+    for (auto& [k, v] : _settings.get_active_headers()) hdrs.emplace(k, v);
+
+    std::string sse_buffer;
+
+    httplib::Request req;
+    req.method  = "POST";
+    req.path    = path;
+    req.headers = hdrs;
+    req.body    = body.dump();
+
+    req.content_receiver = [&](const char* data, size_t len, uint64_t, uint64_t) -> bool {
+        if (_cancelled) return false;
+        sse_buffer.append(data, len);
+
+        size_t pos = 0;
+        while (pos < sse_buffer.size()) {
+            auto nl = sse_buffer.find('\n', pos);
+            if (nl == std::string::npos) break;
+            std::string line = sse_buffer.substr(pos, nl - pos);
+            pos = nl + 1;
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+
+            std::string payload;
+            if (line.size() > 6 && line.substr(0, 6) == "data: ")
+                payload = line.substr(6);
+            else if (line.size() > 5 && line.substr(0, 5) == "data:")
+                payload = line.substr(5);
+            else continue;
+
+            if (payload.empty()) continue;
+            auto j = json::parse(payload, nullptr, false);
+            if (j.is_discarded()) continue;
+
+
+            if (j.contains("usageMetadata") && j["usageMetadata"].is_object()) {
+                auto& u = j["usageMetadata"];
+                result.input_tokens  = u.value("promptTokenCount", (int64_t)0);
+                result.output_tokens = u.value("candidatesTokenCount", (int64_t)0);
+                if (u.contains("cachedContentTokenCount"))
+                    result.cache_read = u.value("cachedContentTokenCount", (int64_t)0);
+            }
+
+            if (!j.contains("candidates") || j["candidates"].empty()) continue;
+            auto& cand = j["candidates"][0];
+
+            if (cand.contains("finishReason") && cand["finishReason"].is_string())
+                result.stop_reason = cand["finishReason"].get<std::string>();
+
+            if (!cand.contains("content") || !cand["content"].contains("parts")) continue;
+
+            for (auto& part : cand["content"]["parts"]) {
+                if (part.contains("text") && part["text"].is_string()) {
+                    std::string txt = part["text"].get<std::string>();
+                    result.text += txt;
+                    if (on_chunk) on_chunk(txt);
+                }
+                else if (part.contains("thought") && part["thought"].is_string()) {
+                    std::string th = part["thought"].get<std::string>();
+                    result.thinking += th;
+                    if (on_chunk) on_chunk("\x01THINK:" + th);
+                }
+                else if (part.contains("functionCall")) {
+                    auto& fc = part["functionCall"];
+                    ai_tool_call_t tc;
+                    tc.name = fc.value("name", "");
+                    tc.id   = "gemini_tc_" + std::to_string(result.tool_calls.size());
+                    tc.arguments = fc.value("args", json::object());
+                    result.tool_calls.push_back(std::move(tc));
+                }
+            }
+        }
+        sse_buffer.erase(0, pos);
+        return true;
+    };
+
+    auto res = client->send(req);
+
+    if (_cancelled) { result.is_error = true; result.text = "Error: Operation cancelled."; return result; }
+    if (!res) { result.is_error = true; result.text = "Error: Request failed: " + httplib::to_string(res.error()); return result; }
+    if (res->status != 200) {
+        result.is_error = true;
+        result.text = "Error: API returned status " + std::to_string(res->status) + ": " + res->body.substr(0, 800);
+        return result;
+    }
+
+
+    cost_tracking::session_input_tokens  += result.input_tokens;
+    cost_tracking::session_output_tokens += result.output_tokens;
+    cost_tracking::session_cache_read    += result.cache_read;
+    cost_tracking::session_request_count++;
+    cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
+        model, result.input_tokens, result.output_tokens,
+        result.cache_read, 0);
+
+    return result;
+}
+
+
+
+ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_openai(
+    const nlohmann::json& messages,
+    const std::string& system_prompt,
+    const std::vector<mcp_standalone::tool_def_t>& tools,
+    ai_stream_chunk_t on_chunk)
+{
+    using json = nlohmann::json;
+    ai_generation_result_t result;
+
+    std::string base_url = _settings.get_active_base_url();
+    std::string model    = clean_model_name(_settings.get_active_model());
+    std::string api_key  = _settings.get_active_api_key();
+    std::string provider = _settings.get_active_profile_kind();
+
+    json oai_messages = convert_messages_for_openai(messages, system_prompt);
+    json oai_tools    = build_openai_tools(tools);
+
+    json body = {
+        {"model", model},
+        {"messages", oai_messages},
+        {"stream", true}
+    };
+
+    if (!oai_tools.empty()) {
+        body["tools"] = oai_tools;
+        body["tool_choice"] = "auto";
+    }
+
+    body["temperature"] = 0.0;
+
+
+    if (provider == "deepseek" || provider == "deepseek_r1") {
+        body["stream_options"] = {{"include_usage", true}};
+    }
+    else if (provider == "openrouter") {
+        body["stream_options"] = {{"include_usage", true}};
+    }
+    else if (provider == "mistral" || provider == "codestral") {
+        body["stream_options"] = {{"include_usage", true}};
+    }
+    else if (provider == "xai") {
+        body["stream_options"] = {{"include_usage", true}};
+    }
+    else {
+        body["stream_options"] = {{"include_usage", true}};
+    }
+
+
+    auto client = get_or_create_client(base_url);
+    httplib::Headers hdrs;
+    hdrs.emplace("Content-Type", "application/json");
+
+    if (provider == "openrouter") {
+        hdrs.emplace("Authorization", "Bearer " + api_key);
+        hdrs.emplace("HTTP-Referer", "https://aida.dev");
+        hdrs.emplace("X-Title", "AiDA");
+    } else {
+        hdrs.emplace("Authorization", "Bearer " + api_key);
+    }
+
+    for (auto& [k, v] : _settings.get_active_headers()) hdrs.emplace(k, v);
+
+
+    struct oai_tc_state_t {
+        std::string id;
+        std::string name;
+        std::string arguments_accum;
+    };
+    std::map<int, oai_tc_state_t> tc_map;
+
+    std::string sse_buffer;
+    std::string chat_path = "/v1/chat/completions";
+
+
+    if (provider == "mistral" || provider == "codestral")
+        chat_path = "/v1/chat/completions";
+    else if (provider == "ollama")
+        chat_path = "/api/chat";
+
+    httplib::Request req;
+    req.method  = "POST";
+    req.path    = chat_path;
+    req.headers = hdrs;
+    req.body    = body.dump();
+
+    req.content_receiver = [&](const char* data, size_t len, uint64_t, uint64_t) -> bool {
+        if (_cancelled) return false;
+        sse_buffer.append(data, len);
+
+        size_t pos = 0;
+        while (pos < sse_buffer.size()) {
+            auto nl = sse_buffer.find('\n', pos);
+            if (nl == std::string::npos) break;
+            std::string line = sse_buffer.substr(pos, nl - pos);
+            pos = nl + 1;
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+
+            if (line == "data: [DONE]" || line == "data:[DONE]") continue;
+
+            std::string payload;
+            if (line.size() > 6 && line.substr(0, 6) == "data: ")
+                payload = line.substr(6);
+            else if (line.size() > 5 && line.substr(0, 5) == "data:")
+                payload = line.substr(5);
+            else continue;
+
+            if (payload.empty()) continue;
+            auto j = json::parse(payload, nullptr, false);
+            if (j.is_discarded()) continue;
+
+            if (j.contains("usage") && j["usage"].is_object()) {
+                auto& u = j["usage"];
+                result.input_tokens  = u.value("prompt_tokens", (int64_t)0);
+                result.output_tokens = u.value("completion_tokens", (int64_t)0);
+            }
+
+            if (!j.contains("choices") || j["choices"].empty()) continue;
+            auto& choice = j["choices"][0];
+            auto& delta  = choice["delta"];
+
+            if (delta.contains("content") && delta["content"].is_string()) {
+                std::string txt = delta["content"].get<std::string>();
+                result.text += txt;
+                if (on_chunk) on_chunk(txt);
+            }
+
+
+            if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
+                std::string th = delta["reasoning_content"].get<std::string>();
+                result.thinking += th;
+                if (on_chunk) on_chunk("\x01THINK:" + th);
+            }
+
+            // WHY: OpenRouter proxies many models — O-series use "reasoning" field,
+            // DeepSeek-R1 uses "reasoning_content". Without BOTH checks, reasoning-heavy
+            // models (like R1) stream nothing to the UI and the response vanishes.
+            if (delta.contains("reasoning") && !delta["reasoning"].is_null()) {
+                std::string th = delta["reasoning"].get<std::string>();
+                if (!th.empty()) {
+                    result.thinking += th;
+                    if (on_chunk) on_chunk("\x01THINK:" + th);
+                }
+            }
+
+            if (delta.contains("tool_calls") && delta["tool_calls"].is_array()) {
+                for (auto& tc_delta : delta["tool_calls"]) {
+                    int idx = tc_delta.value("index", 0);
+                    if (tc_delta.contains("id"))
+                        tc_map[idx].id = tc_delta["id"].get<std::string>();
+                    if (tc_delta.contains("function")) {
+                        auto& fn = tc_delta["function"];
+                        if (fn.contains("name"))
+                            tc_map[idx].name = fn["name"].get<std::string>();
+                        if (fn.contains("arguments"))
+                            tc_map[idx].arguments_accum += fn["arguments"].get<std::string>();
+                    }
+                }
+            }
+
+            if (choice.contains("finish_reason") && choice["finish_reason"].is_string())
+                result.stop_reason = choice["finish_reason"].get<std::string>();
+        }
+        sse_buffer.erase(0, pos);
+        return true;
+    };
+
+    auto res = client->send(req);
+
+    if (_cancelled) { result.is_error = true; result.text = "Error: Operation cancelled."; return result; }
+    if (!res) { result.is_error = true; result.text = "Error: Request failed: " + httplib::to_string(res.error()); return result; }
+    if (res->status != 200) {
+        result.is_error = true;
+        result.text = "Error: API returned status " + std::to_string(res->status) + ": " + res->body.substr(0, 800);
+        return result;
+    }
+
+
+    for (auto& [idx, tcs] : tc_map) {
+        ai_tool_call_t tc;
+        tc.id   = tcs.id;
+        tc.name = tcs.name;
+        tc.arguments = json::parse(tcs.arguments_accum, nullptr, false);
+        if (tc.arguments.is_discarded()) tc.arguments = json::object();
+        result.tool_calls.push_back(std::move(tc));
+    }
+
+
+    cost_tracking::session_input_tokens  += result.input_tokens;
+    cost_tracking::session_output_tokens += result.output_tokens;
+    cost_tracking::session_request_count++;
+    cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
+        model, result.input_tokens, result.output_tokens, 0, 0);
 
     return result;
 }

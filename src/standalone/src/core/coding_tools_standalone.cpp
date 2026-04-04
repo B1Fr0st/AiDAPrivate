@@ -8,6 +8,7 @@
 #include "standalone_tools_fwd.hpp"
 #include "standalone_license.hpp"
 #include "standalone_settings.hpp"
+#include "auto_approval.hpp"
 #include "../helpers/globals.h"
 
 #include <algorithm>
@@ -569,6 +570,14 @@ static tool_result_t tool_run_command(const json& params)
     std::string command = params["command"].get<std::string>();
     if (command.empty())
         return tool_result_t::error("Command cannot be empty.");
+
+    // Dangerous command detection (Roo-Code parity)
+    // WHY: Roo-Code warns when AI tries to run commands that could cause data loss,
+    // system damage, or security issues. We detect and log these for transparency.
+    if (auto_approval::is_dangerous_command(command)) {
+        output_log::push(bottom_tab_t::sandbox_log,
+            "[run_command] WARNING: Potentially dangerous command detected: " + command);
+    }
 
     int timeout_ms = 30000;
     if (params.contains("timeout_ms") && params["timeout_ms"].is_number_integer())

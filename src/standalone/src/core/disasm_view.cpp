@@ -65,36 +65,43 @@ void render(float pos_x, float pos_y, float width, float height,
 
     auto& st    = g_state;
 
-    // Live disassembly: periodic refresh
+
+    if (disasm.live_mode && disasm.live_pending_ready.load(std::memory_order_acquire)) {
+
+        uint64_t scroll_addr = 0;
+        if (st.selected_row >= 0 && st.selected_row < static_cast<int>(disasm.file.instrs.size()))
+            scroll_addr = disasm.file.instrs[st.selected_row].addr;
+
+        disasm.file.instrs = std::move(disasm.live_pending_instrs);
+        disasm.file.image_base = disasm.live_pending_va;
+        disasm.file.text_va    = disasm.live_pending_va;
+        disasm.live_pending_ready.store(false, std::memory_order_release);
+
+
+        if (scroll_addr != 0 && !disasm.file.instrs.empty()) {
+            int lo = 0, hi = static_cast<int>(disasm.file.instrs.size()) - 1;
+            int best = 0;
+            while (lo <= hi) {
+                int mid = (lo + hi) / 2;
+                if (disasm.file.instrs[mid].addr == scroll_addr) { best = mid; break; }
+                if (disasm.file.instrs[mid].addr < scroll_addr) { best = mid; lo = mid + 1; }
+                else hi = mid - 1;
+            }
+            st.selected_row = best;
+        }
+    }
+
+
     if (disasm.live_mode && !disasm.live_paused) {
         disasm.live_refresh_timer += dt;
         if (disasm.live_refresh_timer >= disasm.live_refresh_interval || disasm.live_needs_refresh) {
             disasm.live_refresh_timer = 0.f;
             disasm.live_needs_refresh = false;
 
-            // Check if process is still attached
             if (driver_bridge::attached_pid() != disasm.live_pid) {
                 disasm::stop_live(disasm);
             } else {
-                // Preserve scroll position across refresh
-                uint64_t scroll_addr = 0;
-                if (st.selected_row >= 0 && st.selected_row < static_cast<int>(disasm.file.instrs.size()))
-                    scroll_addr = disasm.file.instrs[st.selected_row].addr;
-
-                disasm::decode_live(disasm);
-
-                // Restore selected row to same address via binary search
-                if (scroll_addr != 0 && !disasm.file.instrs.empty()) {
-                    int lo = 0, hi = static_cast<int>(disasm.file.instrs.size()) - 1;
-                    int best = 0;
-                    while (lo <= hi) {
-                        int mid = (lo + hi) / 2;
-                        if (disasm.file.instrs[mid].addr == scroll_addr) { best = mid; break; }
-                        if (disasm.file.instrs[mid].addr < scroll_addr) { best = mid; lo = mid + 1; }
-                        else hi = mid - 1;
-                    }
-                    st.selected_row = best;
-                }
+                disasm::request_live_decode(disasm);
             }
         }
     }
@@ -104,7 +111,50 @@ void render(float pos_x, float pos_y, float width, float height,
     const float a = alpha;
     const int n = (int)instrs.size();
 
-    if (n == 0) return;
+    if (n == 0) {
+
+
+        if (disasm.live_mode || disasm.file.decoding) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImVec2 wpos = ImGui::GetWindowPos();
+            float ox = wpos.x + pos_x;
+            float oy = wpos.y + pos_y;
+            float cx = ox + width * 0.5f;
+            float cy = oy + height * 0.5f;
+
+            static float spin = 0.f;
+            spin += dt * 4.f;
+            if (spin > 6.283185f) spin -= 6.283185f;
+
+
+            for (int i = 0; i < 3; i++) {
+                float phase = spin + i * (6.283185f / 3.f);
+                float dot_a = (sinf(phase) * 0.5f + 0.5f) * 0.7f + 0.3f;
+                float bounce = sinf(phase) * 6.f;
+                dl->AddCircleFilled(
+                    ImVec2(cx + (i - 1) * 18.f, cy - 14.f + bounce), 4.f,
+                    IM_COL32((int)(accent_r*200), (int)(accent_g*200),
+                             (int)(accent_b*200), (int)(255 * dot_a * a)));
+            }
+
+            const char* msg = disasm.live_mode
+                ? "Loading live disassembly..."
+                : "Decoding instructions...";
+            ImVec2 ts = ImGui::CalcTextSize(msg);
+            dl->AddText(ImVec2(cx - ts.x * 0.5f, cy + 6.f),
+                IM_COL32(160, 160, 180, (int)(180 * a)), msg);
+
+
+            const std::string& label = disasm.live_mode
+                ? disasm.live_module : disasm.file.filename;
+            if (!label.empty()) {
+                ImVec2 ms = ImGui::CalcTextSize(label.c_str());
+                dl->AddText(ImVec2(cx - ms.x * 0.5f, cy + 6.f + ts.y + 6.f),
+                    IM_COL32(120, 120, 140, (int)(140 * a)), label.c_str());
+            }
+        }
+        return;
+    }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 wpos = ImGui::GetWindowPos();
@@ -157,6 +207,13 @@ void render(float pos_x, float pos_y, float width, float height,
 
     int first_row = std::max(0, (int)(st.scroll_y / line_h) - 1);
     int last_row  = std::min(n - 1, (int)((st.scroll_y + height) / line_h) + 1);
+
+
+    if (disasm.live_mode && n > 0) {
+        int mid_row = (first_row + last_row) / 2;
+        if (mid_row >= 0 && mid_row < n)
+            disasm.live_view_addr = instrs[mid_row].addr;
+    }
 
     for (int i = first_row; i <= last_row; i++) {
         float y = oy + i * line_h - st.scroll_y;
@@ -465,7 +522,7 @@ void render(float pos_x, float pos_y, float width, float height,
         dl->AddRectFilled(ImVec2(ox, bm_y), ImVec2(ox + width, bm_y + 20.f),
                           IM_COL32(20, 20, 30, (int)(200 * a)));
 
-        // Calculate total bookmark width
+
         float total_bm_w = 6.f;
         for (auto& bm : st.bookmarks) {
             ImVec2 ts = ImGui::CalcTextSize(bm.label.c_str());
@@ -473,7 +530,7 @@ void render(float pos_x, float pos_y, float width, float height,
         }
         float max_scroll = std::max(0.f, total_bm_w - width + 6.f);
 
-        // Scroll on mouse wheel when hovering bookmark bar
+
         bool bm_bar_hov = ImGui::IsMouseHoveringRect(
             ImVec2(ox, bm_y), ImVec2(ox + width, bm_y + 20.f));
         if (bm_bar_hov && max_scroll > 0.f) {
@@ -487,7 +544,7 @@ void render(float pos_x, float pos_y, float width, float height,
         for (auto& bm : st.bookmarks) {
             ImVec2 ts = ImGui::CalcTextSize(bm.label.c_str());
             float btn_w = ts.x + 12.f;
-            // Skip rendering if fully outside visible area
+
             if (bm_x + btn_w >= ox && bm_x <= ox + width) {
                 bool bm_hv = ImGui::IsMouseHoveringRect(
                     ImVec2(std::max(bm_x, ox), bm_y + 1.f),
@@ -503,7 +560,7 @@ void render(float pos_x, float pos_y, float width, float height,
             bm_x += btn_w + 4.f;
         }
 
-        // Fade gradients at edges when scrolled
+
         if (st.bm_scroll_x > 0.f) {
             for (int gi = 0; gi < 20; gi++) {
                 float ga = (1.f - gi / 20.f) * a;
@@ -523,19 +580,18 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
 
-    // Live disassembly indicator and controls
     if (disasm.live_mode) {
         float ind_w = 280.f, ind_h = 26.f;
         float ix = ox + width - ind_w - 14.f;
         float iy = oy + 6.f;
 
-        // Background pill
+
         dl->AddRectFilled(ImVec2(ix, iy), ImVec2(ix + ind_w, iy + ind_h),
             IM_COL32(15, 15, 22, (int)(220 * a)), 13.f);
         dl->AddRect(ImVec2(ix, iy), ImVec2(ix + ind_w, iy + ind_h),
             IM_COL32(80, 80, 120, (int)(40 * a)), 13.f);
 
-        // Pulsing live dot
+
         static float pulse = 0.f;
         pulse += dt * 3.f;
         if (pulse > 6.283f) pulse -= 6.283f;
@@ -548,7 +604,7 @@ void render(float pos_x, float pos_y, float width, float height,
         float dot_x = ix + 14.f, dot_y = iy + ind_h * 0.5f;
         dl->AddCircleFilled(ImVec2(dot_x, dot_y), 4.f, dot_col);
 
-        // Label
+
         const char* status_txt = disasm.live_paused ? "PAUSED" : "LIVE";
         dl->AddText(ImVec2(dot_x + 10.f, iy + (ind_h - ImGui::GetFontSize()) * 0.5f),
             disasm.live_paused
@@ -556,14 +612,14 @@ void render(float pos_x, float pos_y, float width, float height,
                 : IM_COL32(60, 220, 80, (int)(220 * a)),
             status_txt);
 
-        // Module name
+
         float label_x = dot_x + 10.f + ImGui::CalcTextSize(status_txt).x + 8.f;
         std::string mod_short = disasm.live_module;
         if (mod_short.size() > 18) mod_short = mod_short.substr(0, 15) + "...";
         dl->AddText(ImVec2(label_x, iy + (ind_h - ImGui::GetFontSize()) * 0.5f),
             IM_COL32(160, 160, 180, (int)(180 * a)), mod_short.c_str());
 
-        // Pause/Resume button
+
         float btn_x = ix + ind_w - 56.f;
         float btn_y = iy + 3.f;
         float btn_w2 = 48.f, btn_h2 = ind_h - 6.f;

@@ -322,15 +322,11 @@ struct settings_sa_t
     std::string custom_themes_json;
 
 
-    bool        thinking_enabled  = false;
-    int         thinking_budget   = 10000;
-    int         effort_level      = 2;
-    bool        prompt_caching    = true;
-    int         task_budget_tokens = 0;
-    bool        web_search_enabled = false;
-    int         max_agentic_rounds = 15;
-    bool        fast_mode          = false;
-    bool        redact_thinking    = false;
+    bool        enable_reasoning    = false;
+    int         reasoning_budget    = 10000;
+    std::string reasoning_effort    = "medium";
+    bool        prompt_caching      = true;
+    int         max_agentic_rounds  = 15;
     bool        first_run_completed = false;
 
 
@@ -358,6 +354,27 @@ struct settings_sa_t
     bool        tool_auto_approve    = false;
     std::string tool_always_allow;
     std::string tool_always_deny;
+    bool        force_xml_tools      = false;
+
+    // Granular auto-approval settings (Roo-Code parity)
+    // WHY: Roo-Code lets users approve different tool categories independently.
+    // E.g., auto-approve reads but require confirmation for file writes and commands.
+    bool        auto_approve_read       = false;  // read_file, list_directory, search_files, etc.
+    bool        auto_approve_write      = false;  // write_file, edit_file, create_file, etc.
+    bool        auto_approve_execute    = false;  // execute_command, sandbox_execute
+    bool        auto_approve_mcp        = false;  // MCP remote tool calls
+    bool        auto_approve_mode_switch = false; // switch_mode, new_task
+    bool        auto_approve_subtask    = false;  // subtask spawning
+    int         auto_approve_max_requests = 0;    // 0 = unlimited (per-task request budget)
+    double      auto_approve_max_cost    = 0.0;   // 0.0 = unlimited (per-task cost budget)
+    std::string auto_approve_allowed_commands;     // comma-separated command prefixes for execute_command
+    std::string aidaignore_path;                   // path to .aidaignore file for file-level blocking
+
+    // Context condensation settings (Roo-Code parity)
+    // WHY: When context window fills up, we condense old messages into summaries
+    // instead of dropping them. These thresholds control when condensation triggers.
+    double      condense_threshold       = 0.80;  // fraction of context used before condensing
+    double      condense_buffer          = 0.10;  // reserved fraction for response tokens
 
 
     std::string recent_workspaces_json;
@@ -1135,15 +1152,11 @@ struct settings_sa_t
         if (root.contains("chat_font_size") && root["chat_font_size"].is_number())
             chat_font_size = root["chat_font_size"].get<float>();
 
-        boolean("thinking_enabled", thinking_enabled);
-        integer("thinking_budget", thinking_budget);
-        integer("effort_level", effort_level);
+        boolean("enable_reasoning", enable_reasoning);
+        integer("reasoning_budget", reasoning_budget);
+        str("reasoning_effort", reasoning_effort);
         boolean("prompt_caching", prompt_caching);
-        integer("task_budget_tokens", task_budget_tokens);
-        boolean("web_search_enabled", web_search_enabled);
         integer("max_agentic_rounds", max_agentic_rounds);
-        boolean("fast_mode", fast_mode);
-        boolean("redact_thinking", redact_thinking);
         boolean("first_run_completed", first_run_completed);
 
         boolean("editor_word_wrap", editor_word_wrap);
@@ -1164,6 +1177,23 @@ struct settings_sa_t
         boolean("tool_auto_approve", tool_auto_approve);
         str("tool_always_allow", tool_always_allow);
         str("tool_always_deny", tool_always_deny);
+        boolean("force_xml_tools", force_xml_tools);
+
+        boolean("auto_approve_read", auto_approve_read);
+        boolean("auto_approve_write", auto_approve_write);
+        boolean("auto_approve_execute", auto_approve_execute);
+        boolean("auto_approve_mcp", auto_approve_mcp);
+        boolean("auto_approve_mode_switch", auto_approve_mode_switch);
+        boolean("auto_approve_subtask", auto_approve_subtask);
+        integer("auto_approve_max_requests", auto_approve_max_requests);
+        if (root.contains("auto_approve_max_cost") && root["auto_approve_max_cost"].is_number())
+            auto_approve_max_cost = root["auto_approve_max_cost"].get<double>();
+        str("auto_approve_allowed_commands", auto_approve_allowed_commands);
+        str("aidaignore_path", aidaignore_path);
+        if (root.contains("condense_threshold") && root["condense_threshold"].is_number())
+            condense_threshold = root["condense_threshold"].get<double>();
+        if (root.contains("condense_buffer") && root["condense_buffer"].is_number())
+            condense_buffer = root["condense_buffer"].get<double>();
         str("recent_workspaces_json", recent_workspaces_json);
         boolean("activity_bar_visible", activity_bar_visible);
 
@@ -1337,15 +1367,11 @@ struct settings_sa_t
         root["custom_icon_path"] = custom_icon_path;
         root["custom_themes_json"] = custom_themes_json;
 
-        root["thinking_enabled"] = thinking_enabled;
-        root["thinking_budget"] = thinking_budget;
-        root["effort_level"] = effort_level;
+        root["enable_reasoning"] = enable_reasoning;
+        root["reasoning_budget"] = reasoning_budget;
+        root["reasoning_effort"] = reasoning_effort;
         root["prompt_caching"] = prompt_caching;
-        root["task_budget_tokens"] = task_budget_tokens;
-        root["web_search_enabled"] = web_search_enabled;
         root["max_agentic_rounds"] = max_agentic_rounds;
-        root["fast_mode"] = fast_mode;
-        root["redact_thinking"] = redact_thinking;
         root["first_run_completed"] = first_run_completed;
         root["chat_font_size"] = chat_font_size;
         root["editor_word_wrap"] = editor_word_wrap;
@@ -1366,6 +1392,20 @@ struct settings_sa_t
         root["tool_auto_approve"] = tool_auto_approve;
         root["tool_always_allow"] = tool_always_allow;
         root["tool_always_deny"] = tool_always_deny;
+        root["force_xml_tools"] = force_xml_tools;
+
+        root["auto_approve_read"] = auto_approve_read;
+        root["auto_approve_write"] = auto_approve_write;
+        root["auto_approve_execute"] = auto_approve_execute;
+        root["auto_approve_mcp"] = auto_approve_mcp;
+        root["auto_approve_mode_switch"] = auto_approve_mode_switch;
+        root["auto_approve_subtask"] = auto_approve_subtask;
+        root["auto_approve_max_requests"] = auto_approve_max_requests;
+        root["auto_approve_max_cost"] = auto_approve_max_cost;
+        root["auto_approve_allowed_commands"] = auto_approve_allowed_commands;
+        root["aidaignore_path"] = aidaignore_path;
+        root["condense_threshold"] = condense_threshold;
+        root["condense_buffer"] = condense_buffer;
         root["recent_workspaces_json"] = recent_workspaces_json;
         root["activity_bar_visible"] = activity_bar_visible;
 

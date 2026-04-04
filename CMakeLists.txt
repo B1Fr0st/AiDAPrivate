@@ -327,6 +327,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/mcp_marketplace.cpp"
             "${STANDALONE_ROOT}/core/coding_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/debugger_tools_standalone.cpp"
+            "${STANDALONE_ROOT}/core/workflow_tools_standalone.cpp"
             src/driver_loader.cpp
             driver/comm.cpp
             src/net_security.cpp
@@ -437,6 +438,7 @@ if(WIN32)
             /ENTRY:mainCRTStartup
             /NODEFAULTLIB:LIBCMT
             /IGNORE:4099
+            "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
         )
 
         # -- Output properties + PDB ---------------------------------------------

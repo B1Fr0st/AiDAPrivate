@@ -74,17 +74,47 @@ struct ChatMessage {
 	int output_tokens = 0;
 	int cache_read_tokens = 0;
 	int cache_write_tokens = 0;
+
+	// Context condensation (Roo-Code parity: non-destructive message management)
+	// WHY: Instead of deleting old messages, we mark them as condensed summaries
+	// or truncation markers so UI can show them differently and API calls can
+	// filter them efficiently.
+	bool is_summary = false;            // true if this message IS a condensation summary
+	std::string condense_id;            // unique ID if this is a summary (links to condensed group)
+	std::string condense_parent;        // ID of the summary that replaced this message
+	bool is_truncation_marker = false;  // true if this is a "[messages truncated]" marker
+	std::string truncation_id;          // unique ID for truncation group
+	std::string truncation_parent;      // links truncated messages to their marker
+
+	// Cost tracking per message (Roo-Code parity: per-message cost attribution)
+	double cost = 0.0;
+
+	// Tool use metadata for message grouping
+	std::string tool_name;              // if this message contains a tool result
+	bool is_tool_result = false;
 };
 
-inline bool  g_dummy_triggered = false;
-inline float g_think_timer = 0.f;
-inline bool  g_think_done = false;
+inline bool  g_ai_thinking_active = false;
 
 inline std::vector<ChatMessage> g_chat_messages;
 inline char                     g_chat_buf[4096] = {};
 inline bool                     g_chat_scroll_to_bottom = false;
-inline float g_chat_demo_timer = 0.f;
-inline int   g_chat_demo_stage = 0;
+
+// Get the effective message history for API calls.
+// WHY: Filters out condensed/truncated messages so the LLM only sees
+// the current effective context window (summaries + recent messages).
+inline std::vector<const ChatMessage*> get_effective_api_history()
+{
+	std::vector<const ChatMessage*> result;
+	for (const auto& msg : g_chat_messages) {
+		// Skip messages that have been replaced by a condensation summary
+		if (!msg.condense_parent.empty()) continue;
+		// Skip messages that have been truncated
+		if (!msg.truncation_parent.empty()) continue;
+		result.push_back(&msg);
+	}
+	return result;
+}
 
 
 namespace chat_edit {
@@ -565,6 +595,7 @@ namespace cost_tracking {
 	inline int64_t session_thinking_tokens = 0;
 	inline double  session_cost_usd       = 0.0;
 	inline int     session_request_count  = 0;
+	inline std::string session_provider;
 
 	inline void reset() {
 		session_input_tokens = session_output_tokens = 0;
@@ -572,6 +603,7 @@ namespace cost_tracking {
 		session_thinking_tokens = 0;
 		session_cost_usd = 0.0;
 		session_request_count = 0;
+		session_provider.clear();
 	}
 
 	inline double estimate_cost(const std::string& model, int64_t in_tok, int64_t out_tok,
@@ -597,10 +629,27 @@ namespace cost_tracking {
 		        cache_read * cache_read_price + cache_write * cache_write_price) / 1000000.0;
 	}
 
+	inline void accumulate(const std::string& model, int64_t in_tok, int64_t out_tok,
+	                        int64_t cache_read = 0, int64_t cache_write = 0, int64_t thinking = 0) {
+		session_input_tokens += in_tok;
+		session_output_tokens += out_tok;
+		session_cache_read += cache_read;
+		session_cache_write += cache_write;
+		session_thinking_tokens += thinking;
+		session_cost_usd += estimate_cost(model, in_tok, out_tok, cache_read, cache_write);
+		++session_request_count;
+	}
+
 	inline std::string format_tokens(int64_t count) {
 		if (count >= 1000000) return std::to_string(count / 1000000) + "." + std::to_string((count % 1000000) / 100000) + "M";
 		if (count >= 1000) return std::to_string(count / 1000) + "." + std::to_string((count % 1000) / 100) + "K";
 		return std::to_string(count);
+	}
+
+	inline std::string format_cost() {
+		char buf[32];
+		snprintf(buf, sizeof(buf), "$%.4f", session_cost_usd);
+		return buf;
 	}
 }
 

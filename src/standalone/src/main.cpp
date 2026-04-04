@@ -415,7 +415,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         bool bottom = pt.y > rc.bottom - border;
 
 
-        if (globals::ui::welcome_done && license::validated) {
+        if (globals::ui::welcome_done && license::validated && !globals::ui::maximized) {
             if (top    && left)  return HTTOPLEFT;
             if (top    && right) return HTTOPRIGHT;
             if (bottom && left)  return HTBOTTOMLEFT;

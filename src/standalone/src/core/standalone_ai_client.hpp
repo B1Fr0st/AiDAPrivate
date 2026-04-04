@@ -90,6 +90,12 @@ public:
     static nlohmann::json build_anthropic_tools(
         const std::vector<mcp_standalone::tool_def_t>& tools);
 
+    static nlohmann::json build_openai_tools(
+        const std::vector<mcp_standalone::tool_def_t>& tools);
+
+    static nlohmann::json build_gemini_tools(
+        const std::vector<mcp_standalone::tool_def_t>& tools);
+
     static nlohmann::json build_full_tools(
         const std::vector<mcp_standalone::tool_def_t>& tools);
 
@@ -98,6 +104,27 @@ public:
         const std::string& tool_use_id,
         const std::string& content,
         bool is_error = false);
+
+    static nlohmann::json make_openai_tool_result(
+        const std::string& tool_call_id,
+        const std::string& content);
+
+    static nlohmann::json make_gemini_tool_result(
+        const std::string& function_name,
+        const nlohmann::json& result_data);
+
+
+    static nlohmann::json convert_messages_for_openai(
+        const nlohmann::json& anthropic_messages,
+        const std::string& system_prompt);
+
+    static nlohmann::json convert_messages_for_gemini(
+        const nlohmann::json& anthropic_messages);
+
+    static nlohmann::json merge_consecutive_roles(
+        const nlohmann::json& messages);
+
+    static std::string clean_model_name(const std::string& model);
 
 
     bool poll();
@@ -145,6 +172,23 @@ private:
     std::string generate_openai(const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check);
     std::string generate_anthropic(const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check);
     std::string generate_openrouter(const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check);
+
+
+    ai_generation_result_t generate_with_tools_anthropic(
+        const nlohmann::json& messages, const std::string& system_prompt,
+        const std::vector<mcp_standalone::tool_def_t>& tools, ai_stream_chunk_t on_chunk);
+
+    ai_generation_result_t generate_with_tools_openai(
+        const nlohmann::json& messages, const std::string& system_prompt,
+        const std::vector<mcp_standalone::tool_def_t>& tools, ai_stream_chunk_t on_chunk);
+
+    ai_generation_result_t generate_with_tools_gemini(
+        const nlohmann::json& messages, const std::string& system_prompt,
+        const std::vector<mcp_standalone::tool_def_t>& tools, ai_stream_chunk_t on_chunk);
+
+    ai_generation_result_t generate_with_tools_generic_openai(
+        const nlohmann::json& messages, const std::string& system_prompt,
+        const std::vector<mcp_standalone::tool_def_t>& tools, ai_stream_chunk_t on_chunk);
 
 
     std::string streaming_post(

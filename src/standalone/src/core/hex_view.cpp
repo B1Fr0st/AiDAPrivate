@@ -202,7 +202,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
     if (sel_lo >= 0 && sel_lo < (int)st.data.size()) {
         float insp_w = 260.f;
-        float insp_h = 0.f; // computed below
+        float insp_h = 0.f;
         float insp_x = ox + width - insp_w - 8.f;
         float insp_y = oy + 8.f;
 
@@ -211,7 +211,7 @@ void render(float pos_x, float pos_y, float width, float height,
         const uint8_t* p = st.data.data() + sel_lo;
         char vbuf[64];
 
-        // Precompute rows to determine height
+
         struct InspRow { const char* label; std::string value; };
         std::vector<InspRow> rows;
 
@@ -274,34 +274,34 @@ void render(float pos_x, float pos_y, float width, float height,
         const float pad = 8.f;
         insp_h = header_h + static_cast<float>(rows.size()) * row_h + pad;
 
-        // Drop shadow
+
         fdl->AddRectFilled(ImVec2(insp_x + 3.f, insp_y + 3.f),
                            ImVec2(insp_x + insp_w + 3.f, insp_y + insp_h + 3.f),
                            IM_COL32(0, 0, 0, (int)(80 * a)), 8.f);
-        // Background
+
         fdl->AddRectFilled(ImVec2(insp_x, insp_y),
                            ImVec2(insp_x + insp_w, insp_y + insp_h),
                            IM_COL32(18, 18, 28, (int)(240 * a)), 8.f);
-        // Border
+
         fdl->AddRect(ImVec2(insp_x, insp_y),
                      ImVec2(insp_x + insp_w, insp_y + insp_h),
                      IM_COL32(80, 80, 130, (int)(60 * a)), 8.f);
 
-        // Header bar
+
         fdl->AddRectFilled(ImVec2(insp_x, insp_y),
                            ImVec2(insp_x + insp_w, insp_y + header_h),
                            IM_COL32(30, 28, 45, (int)(255 * a)), 8.f, ImDrawFlags_RoundCornersTop);
-        // Header accent line
+
         fdl->AddLine(ImVec2(insp_x, insp_y + header_h),
                      ImVec2(insp_x + insp_w, insp_y + header_h),
                      IM_COL32((int)(accent_r*255), (int)(accent_g*255),
                               (int)(accent_b*255), (int)(80*a)));
-        // Header text
+
         fdl->AddText(ImVec2(insp_x + pad, insp_y + (header_h - ImGui::GetFontSize()) * 0.5f),
                      IM_COL32((int)(accent_r*200), (int)(accent_g*200),
                               (int)(accent_b*200), (int)(240*a)),
                      "Data Inspector");
-        // Offset pill
+
         snprintf(vbuf, sizeof(vbuf), "@ 0x%X", sel_lo);
         ImVec2 offs_ts = ImGui::CalcTextSize(vbuf);
         fdl->AddRectFilled(
@@ -312,7 +312,7 @@ void render(float pos_x, float pos_y, float width, float height,
             ImVec2(insp_x + insp_w - offs_ts.x - 11.f, insp_y + (header_h - ImGui::GetFontSize()) * 0.5f),
             IM_COL32(160, 158, 190, (int)(200 * a)), vbuf);
 
-        // Data rows
+
         float iy = insp_y + header_h + 2.f;
         float label_x = insp_x + pad;
         float val_x   = insp_x + 80.f;
@@ -329,7 +329,7 @@ void render(float pos_x, float pos_y, float width, float height,
             fdl->AddText(ImVec2(label_x, iy + 1.f), label_c, rows[ri].label);
             fdl->AddText(ImVec2(val_x, iy + 1.f), val_c, rows[ri].value.c_str());
 
-            // Click to copy value
+
             if (row_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 if (OpenClipboard(nullptr)) {
                     EmptyClipboard();
