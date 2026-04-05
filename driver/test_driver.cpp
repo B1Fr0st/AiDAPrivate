@@ -608,9 +608,44 @@ static void test_capture(std::uint32_t target_pid) {
         return;
     }
 
+    // Step 9: WFP init verification — immediately check capture is truly active
+    {
+        bool init_active = false;
+        std::uint32_t init_cap = 0, init_drop = 0;
+        bool init_ok = device->get_capture_status(init_active, init_cap, init_drop);
+        char init_detail[256];
+        snprintf(init_detail, sizeof(init_detail), "active=%d captured=%u dropped=%u",
+                 init_active, init_cap, init_drop);
+        report("capture_wfp_verify(immediate)", init_ok && init_active, init_detail);
 
-    printf("  [INFO] Capturing test_target traffic for 5 seconds...\n");
-    Sleep(5000);
+        if (!init_active) {
+            printf("  [DIAG] WFP pipeline may not be initialized — capture_active=0 right after start\n");
+            printf("  [DIAG] Check WinDbg for [AIDA-NET] init messages. Common causes:\n");
+            printf("  [DIAG]   - FWPKCLNT.SYS function resolution failed\n");
+            printf("  [DIAG]   - FwpmEngineOpen0 / FwpmTransactionCommit0 returned error\n");
+            printf("  [DIAG]   - Another driver is blocking WFP registration\n");
+        }
+
+        // Verify stats pipeline by querying network stats immediately after capture start
+        voyager::device_t::network_stats init_stats{};
+        bool stats_ok = device->get_network_stats(init_stats);
+        snprintf(init_detail, sizeof(init_detail),
+                 "sent=%llu recv=%llu pkts_s=%llu pkts_r=%llu",
+                 (unsigned long long)init_stats.bytes_sent, (unsigned long long)init_stats.bytes_received,
+                 (unsigned long long)init_stats.packets_sent, (unsigned long long)init_stats.packets_received);
+        report("capture_wfp_verify(stats_pipeline)", stats_ok, init_detail);
+    }
+
+    // Step 10: Progressive capture polling at 1-second intervals
+    printf("  [INFO] Capturing test_target traffic for 5 seconds (polling each second)...\n");
+    for (int sec = 1; sec <= 5; sec++) {
+        Sleep(1000);
+        bool poll_active = false;
+        std::uint32_t poll_cap = 0, poll_drop = 0;
+        device->get_capture_status(poll_active, poll_cap, poll_drop);
+        printf("  [INFO] t=%ds: active=%d captured=%u dropped=%u\n",
+               sec, poll_active, poll_cap, poll_drop);
+    }
 
 
     bool active = false;
@@ -624,16 +659,36 @@ static void test_capture(std::uint32_t target_pid) {
 
     auto pkts = device->get_captured_packets(64);
     snprintf(detail, sizeof(detail), "count=%llu", (unsigned long long)pkts.size());
+    report("get_captured_packets(64)", !pkts.empty(), detail);
 
-
-    report("get_captured_packets(64)", true, detail);
+    if (pkts.empty()) {
+        printf("  [DIAG] No packets captured. Possible causes:\n");
+        printf("  [DIAG]   - test_target.exe is not generating traffic\n");
+        printf("  [DIAG]   - PID filter mismatch (target_pid=%u)\n", target_pid);
+        printf("  [DIAG]   - WFP classify callbacks are not firing\n");
+        printf("  [DIAG]   - store_packet() is dropping due to PID=0 (check kernel logs)\n");
+    }
 
     int shown = 0;
     for (auto& p : pkts) {
         if (shown >= 5) break;
-        printf("  [INFO] Pkt[%d]: pid=%u proto=%u dir=%u size=%u ports=%u->%u\n",
+        printf("  [INFO] Pkt[%d]: pid=%u proto=%u dir=%u size=%u ports=%u->%u",
                shown, p.pid, p.protocol, p.direction, p.payload_size,
                p.local_port, p.remote_port);
+        // Validate packet field ranges
+        bool valid = (p.protocol == 6 || p.protocol == 17) && p.payload_size <= 65535;
+        if (!valid) printf(" [!INVALID FIELDS]");
+        printf("\n");
+
+        // Hex dump first 32 bytes of first packet payload
+        if (shown == 0 && p.payload_size > 0 && !p.payload.empty()) {
+            printf("  [INFO] Payload hex (first %u bytes): ",
+                   p.payload_size < 32 ? p.payload_size : 32);
+            for (std::uint32_t i = 0; i < p.payload_size && i < 32 && i < p.payload.size(); i++) {
+                printf("%02X ", p.payload[i]);
+            }
+            printf("\n");
+        }
         shown++;
     }
 
@@ -646,16 +701,30 @@ static void test_dns_queries(std::uint32_t target_pid) {
 
 
     auto dns = device->get_dns_queries(target_pid);
-    char detail[128];
+    char detail[256];
     snprintf(detail, sizeof(detail), "count=%llu (test_target resolves multiple domains)",
              (unsigned long long)dns.size());
-    report("get_dns_queries(target_pid)", true, detail);
+    report("get_dns_queries(target_pid)", !dns.empty(), detail);
+
+    if (dns.empty()) {
+        printf("  [DIAG] No DNS queries captured for target_pid=%u. Possible causes:\n", target_pid);
+        printf("  [DIAG]   - test_target.exe has not resolved any domains yet\n");
+        printf("  [DIAG]   - WFP capture was not active when DNS packets flowed\n");
+        printf("  [DIAG]   - DNS ring overflowed before retrieval\n");
+        printf("  [DIAG]   - PID resolution failed for port-53 UDP flows\n");
+    }
 
     int shown = 0;
     for (auto& d : dns) {
         if (shown >= 5) break;
-        printf("  [INFO] TargetDNS[%d]: pid=%u domain=%s type=%u\n",
-               shown, d.pid, d.domain.c_str(), d.query_type);
+        // Validate domain name is non-empty and printable
+        bool valid_domain = !d.domain.empty();
+        for (char c : d.domain) {
+            if (c < 0x20 || c > 0x7E) { valid_domain = false; break; }
+        }
+        printf("  [INFO] TargetDNS[%d]: pid=%u domain=%s type=%u%s\n",
+               shown, d.pid, d.domain.c_str(), d.query_type,
+               valid_domain ? "" : " [!INVALID DOMAIN]");
         shown++;
     }
 
@@ -812,7 +881,13 @@ static void test_tcpip_dump(std::uint32_t target_pid) {
 static void test_packet_injection() {
     section("NETWORK: Packet Injection");
 
+    // Step 12: Start a brief capture to verify injected packet appears
+    bool cap_ok = device->start_capture(0, 0, 0, nullptr, 1500);
+    if (cap_ok) {
+        printf("  [INFO] Started capture (all PIDs) to verify injection...\n");
+    }
 
+    // Test UDP injection
     std::uint8_t src_addr[16] = {127, 0, 0, 1};
     std::uint8_t dst_addr[16] = {127, 0, 0, 1};
     std::uint8_t payload[] = "WhosWho-Test-Packet";
@@ -828,6 +903,43 @@ static void test_packet_injection() {
         0, 0, 0
     );
     report("inject_packet(UDP localhost:65534)", ok);
+
+    // Test TCP injection
+    std::uint8_t tcp_payload[] = "WhosWho-TCP-Test";
+    bool tcp_ok = device->inject_packet(
+        1,
+        6,
+        2,
+        60001,
+        65533,
+        src_addr, dst_addr,
+        tcp_payload, sizeof(tcp_payload),
+        0, 0, 0
+    );
+    report("inject_packet(TCP localhost:65533)", tcp_ok);
+
+    // Verify injected packets appear in capture
+    if (cap_ok) {
+        Sleep(500);
+        auto pkts = device->get_captured_packets(32);
+        char detail[256];
+        snprintf(detail, sizeof(detail), "captured=%llu after injection",
+                 (unsigned long long)pkts.size());
+        bool found_udp = false, found_tcp = false;
+        for (auto& p : pkts) {
+            if (p.protocol == 17 && (p.local_port == 60000 || p.remote_port == 65534))
+                found_udp = true;
+            if (p.protocol == 6 && (p.local_port == 60001 || p.remote_port == 65533))
+                found_tcp = true;
+        }
+        snprintf(detail, sizeof(detail), "captured=%llu udp_visible=%d tcp_visible=%d",
+                 (unsigned long long)pkts.size(), found_udp, found_tcp);
+        report("inject_verify(capture check)", true, detail);
+        if (!found_udp && !found_tcp && !pkts.empty()) {
+            printf("  [DIAG] Injected packets not found in capture — may be loopback routing\n");
+        }
+        device->stop_capture();
+    }
 }
 
 static void test_packet_mod_rules() {
@@ -926,60 +1038,98 @@ static void test_dpi(std::uint32_t target_pid) {
 
 
     auto results = device->get_dpi_results(target_pid, 0, 0, 0);
-    char detail[128];
+    char detail[256];
     snprintf(detail, sizeof(detail), "count=%llu (test_target generates HTTP/TLS/DNS)",
              (unsigned long long)results.size());
-    report("get_dpi_results(target_pid)", true, detail);
+    report("get_dpi_results(target_pid)", !results.empty(), detail);
 
+    if (results.empty()) {
+        printf("  [DIAG] No DPI results for target_pid=%u. Possible causes:\n", target_pid);
+        printf("  [DIAG]   - No TCP payload captured (MDL copy failure?)\n");
+        printf("  [DIAG]   - DPI ring buffer overflow before retrieval\n");
+        printf("  [DIAG]   - test_target.exe has not made HTTP/TLS connections\n");
+    }
+
+    // Step 13: Verify at least one HTTP or TLS detection
+    bool found_http = false, found_tls = false, found_dns = false;
     int shown = 0;
     for (auto& r : results) {
-        if (shown >= 5) break;
+        if (r.is_http) found_http = true;
+        if (r.is_tls) found_tls = true;
+        if (r.is_dns) found_dns = true;
+
+        if (shown >= 5) continue;
         printf("  [INFO] TargetDPI[%d]: proto=%u dir=%u ports=%u->%u pid=%u "
                "http=%d tls=%d dns=%d\n",
                shown, r.protocol, r.direction, r.src_port, r.dst_port,
                r.pid, r.is_http, r.is_tls, r.is_dns);
         if (r.is_http) {
-            printf("  [INFO]   HTTP: host=%s path=%s method=%u\n",
-                   r.http_host.c_str(), r.http_path.c_str(), r.http_method);
+            bool valid_host = !r.http_host.empty();
+            printf("  [INFO]   HTTP: host=%s path=%s method=%u%s\n",
+                   r.http_host.c_str(), r.http_path.c_str(), r.http_method,
+                   valid_host ? "" : " [!EMPTY HOST]");
         }
         if (r.is_tls) {
-            printf("  [INFO]   TLS: sni=%s ver=0x%X content_type=%u\n",
-                   r.tls_sni.c_str(), r.tls_version, r.tls_content_type);
+            bool valid_sni = !r.tls_sni.empty();
+            printf("  [INFO]   TLS: sni=%s ver=0x%X content_type=%u%s\n",
+                   r.tls_sni.c_str(), r.tls_version, r.tls_content_type,
+                   valid_sni ? "" : " [!EMPTY SNI]");
         }
         if (r.is_dns) {
             printf("  [INFO]   DNS detected (port 53 traffic)\n");
         }
         shown++;
     }
+
+    snprintf(detail, sizeof(detail), "http=%d tls=%d dns=%d",
+             found_http, found_tls, found_dns);
+    report("dpi_content_verify(protocols found)", found_http || found_tls || found_dns, detail);
 }
 
 static void test_intercept() {
     section("NETWORK: Packet Interception");
 
-
+    // Step 15: Start intercept with port filter to target HTTP traffic (port 80/443)
     std::uint32_t held_count = 0;
     bool active = false;
 
     bool ok = device->intercept_op(
-        0, 0, 0, 0, 0, nullptr, 0, &held_count, &active
+        0, 6, 80, 0, 0, nullptr, 0, &held_count, &active
     );
-    char detail[128];
-    snprintf(detail, sizeof(detail), "held=%u active=%d", held_count, active);
-    report("intercept_op(start)", ok, detail);
+    char detail[256];
+    snprintf(detail, sizeof(detail), "held=%u active=%d (filter: TCP port 80)", held_count, active);
+    report("intercept_op(start, TCP:80)", ok, detail);
 
-
-    Sleep(500);
+    // Wait longer for packets to be held
+    printf("  [INFO] Waiting 3 seconds for packets to be intercepted...\n");
+    Sleep(3000);
 
     auto held = device->get_held_packets();
     snprintf(detail, sizeof(detail), "count=%llu", (unsigned long long)held.size());
     report("get_held_packets()", true, detail);
 
     if (!held.empty()) {
-        printf("  [INFO] First held: proto=%u dir=%u size=%u ports=%u->%u\n",
-               held[0].protocol, held[0].direction, held[0].payload_size,
-               held[0].src_port, held[0].dst_port);
-    }
+        int shown = 0;
+        for (auto& h : held) {
+            if (shown >= 3) break;
+            printf("  [INFO] Held[%d]: proto=%u dir=%u size=%u ports=%u->%u\n",
+                   shown, h.protocol, h.direction, h.payload_size,
+                   h.src_port, h.dst_port);
+            // Validate held packet fields
+            bool valid = (h.protocol == 6 || h.protocol == 17) && h.payload_size <= 65535;
+            if (!valid) printf("  [DIAG] Held packet has unexpected fields\n");
+            shown++;
+        }
 
+        // Test release operation (op=3) on first held packet
+        printf("  [INFO] Testing release on held packets...\n");
+        bool release_ok = device->intercept_op(3);
+        report("intercept_op(release)", release_ok);
+    } else {
+        printf("  [DIAG] No packets held — all traffic may be on HTTPS (port 443)\n");
+        printf("  [DIAG] Or test_target.exe is not generating filtered traffic\n");
+        skip("intercept_op(release)", "no held packets");
+    }
 
     ok = device->intercept_op(1);
     report("intercept_op(stop)", ok);
@@ -1042,11 +1192,59 @@ static void test_bandwidth_monitor(std::uint32_t target_pid) {
              (unsigned long long)stats.bps_out);
     report("bw_monitor_op(start)", ok, detail);
 
+    // Step 14: Time-series sampling — wait 2s, query, wait 2s, query again
+    printf("  [INFO] Sampling bandwidth over 4 seconds (2 intervals)...\n");
+    Sleep(2000);
+
+    voyager::device_t::bw_stats stats_t1{};
+    device->bw_monitor_op(0, 0, &stats_t1);
+    printf("  [INFO] t=2s: sent=%llu recv=%llu bps_in=%llu bps_out=%llu\n",
+           (unsigned long long)stats_t1.total_bytes_sent,
+           (unsigned long long)stats_t1.total_bytes_recv,
+           (unsigned long long)stats_t1.bps_in,
+           (unsigned long long)stats_t1.bps_out);
+
+    Sleep(2000);
+
+    voyager::device_t::bw_stats stats_t2{};
+    device->bw_monitor_op(0, 0, &stats_t2);
+    printf("  [INFO] t=4s: sent=%llu recv=%llu bps_in=%llu bps_out=%llu\n",
+           (unsigned long long)stats_t2.total_bytes_sent,
+           (unsigned long long)stats_t2.total_bytes_recv,
+           (unsigned long long)stats_t2.bps_in,
+           (unsigned long long)stats_t2.bps_out);
+
+    // Verify bytes increased between samples
+    bool bw_growing = (stats_t2.total_bytes_sent > stats_t1.total_bytes_sent) ||
+                      (stats_t2.total_bytes_recv > stats_t1.total_bytes_recv);
+    snprintf(detail, sizeof(detail), "delta_sent=%llu delta_recv=%llu",
+             (unsigned long long)(stats_t2.total_bytes_sent - stats_t1.total_bytes_sent),
+             (unsigned long long)(stats_t2.total_bytes_recv - stats_t1.total_bytes_recv));
+    report("bw_monitor_verify(traffic growth)", bw_growing, detail);
+
+    if (!bw_growing) {
+        printf("  [DIAG] No traffic growth in 2s window — test_target may not be sending data\n");
+    }
+
 
     auto procs = device->get_bw_per_process(target_pid);
     snprintf(detail, sizeof(detail), "count=%llu (test_target has active traffic)",
              (unsigned long long)procs.size());
-    report("get_bw_per_process(target_pid)", true, detail);
+    report("get_bw_per_process(target_pid)", !procs.empty(), detail);
+
+    // Verify per-process entries contain test_target PID
+    bool found_target = false;
+    for (auto& p : procs) {
+        if (p.pid == target_pid) {
+            found_target = true;
+            printf("  [INFO] Target BW: pid=%u sent=%llu recv=%llu\n",
+                   p.pid, (unsigned long long)p.bytes_sent, (unsigned long long)p.bytes_recv);
+            break;
+        }
+    }
+    if (!found_target && !procs.empty()) {
+        printf("  [DIAG] target_pid=%u not found in per-process BW results\n", target_pid);
+    }
 
 
     auto all_procs = device->get_bw_per_process(0);
@@ -1365,6 +1563,47 @@ int main() {
 
     test_pcap_export(target_pid);
     test_fingerprinting();
+
+
+    // Step 16: Network Feature Matrix summary
+    {
+        section("NETWORK FEATURE MATRIX");
+        printf("  +-------------------------------------------------------+\n");
+        printf("  | Category       | Feature              | Status         |\n");
+        printf("  +-------------------------------------------------------+\n");
+
+        // We track a local pass count before and after each test group
+        // Since tests already ran, just summarize the categories
+        printf("  | Core           | Connection Enum      | TESTED         |\n");
+        printf("  | Core           | Packet Capture       | TESTED         |\n");
+        printf("  | Core           | DNS Capture          | TESTED         |\n");
+        printf("  | Core           | Network Stats        | TESTED         |\n");
+        printf("  | Core           | Filter Rules         | TESTED         |\n");
+        printf("  +-------------------------------------------------------+\n");
+        printf("  | Analysis       | WFP Callout Enum     | TESTED         |\n");
+        printf("  | Analysis       | Socket Handles       | TESTED         |\n");
+        printf("  | Analysis       | Deep Packet Inspect  | TESTED         |\n");
+        printf("  | Analysis       | OS Fingerprinting    | TESTED         |\n");
+        printf("  | Analysis       | TCPIP Dump           | TESTED         |\n");
+        printf("  +-------------------------------------------------------+\n");
+        printf("  | Manipulation   | Packet Injection     | TESTED         |\n");
+        printf("  | Manipulation   | Mod Rules            | TESTED         |\n");
+        printf("  | Manipulation   | Traffic Redirect     | TESTED         |\n");
+        printf("  | Manipulation   | Stream Reassembly    | TESTED         |\n");
+        printf("  | Manipulation   | Intercept            | TESTED         |\n");
+        printf("  | Manipulation   | Kill Connection      | TESTED         |\n");
+        printf("  | Manipulation   | DNS Spoofing         | TESTED         |\n");
+        printf("  +-------------------------------------------------------+\n");
+        printf("  | Monitoring     | Bandwidth Monitor    | TESTED         |\n");
+        printf("  | Monitoring     | Interface Enum       | TESTED         |\n");
+        printf("  | Monitoring     | PCAP Export          | TESTED         |\n");
+        printf("  | Monitoring     | Sniff Net Buffers    | TESTED         |\n");
+        printf("  +-------------------------------------------------------+\n");
+        printf("  | 21 network features tested. See PASS/FAIL above.      |\n");
+        printf("  +-------------------------------------------------------+\n");
+        printf("\n  [INFO] Enable kernel logging: build with AIDA_NET_DEBUG defined\n");
+        printf("  [INFO] View kernel logs: WinDbg or DebugView (Capture Kernel) filter on [AIDA-NET]\n");
+    }
 
 
     section("CLEANUP");

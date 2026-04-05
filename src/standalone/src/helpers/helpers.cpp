@@ -30,6 +30,7 @@
 #include "../core/workspace_search.hpp"
 #include "../core/terminal_view.hpp"
 #include "../core/mcp_marketplace.hpp"
+#include "../core/network_view.hpp"
 
 static ID3D11ShaderResourceView* g_send_icon_srv    = nullptr;
 static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
@@ -3417,6 +3418,11 @@ void helpers::render_title()
 	else if (cv == center_view_t::disassembly && g_disasm.file.loaded && (g_disasm.live_mode || g_disasm.file.decoding || !g_disasm.file.instrs.empty()))
 	{
 		disasm_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3, g_disasm, dt);
+	}
+
+	else if (cv == center_view_t::network_view)
+	{
+		network_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
 	}
 
 	else

@@ -47,6 +47,48 @@ typedef struct _FWPS_TRANSPORT_SEND_PARAMS0_COMPAT {
 #define AIDA_ENDPOINT_PID_CACHE_SIZE 128
 
 
+// ============================================================
+// Debug logging infrastructure (enabled by AIDA_NET_DEBUG define)
+// Visible in WinDbg or DebugView with kernel capture enabled.
+// Filter on "[AIDA-NET]" prefix.
+// ============================================================
+#ifdef AIDA_NET_DEBUG
+#define NET_DBG(fmt, ...) \
+    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL, \
+               "[AIDA-NET] " fmt "\n", ##__VA_ARGS__)
+#define NET_ERR(fmt, ...) \
+    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL, \
+               "[AIDA-NET][ERR] " fmt "\n", ##__VA_ARGS__)
+#else
+#define NET_DBG(fmt, ...) ((void)0)
+#define NET_ERR(fmt, ...) ((void)0)
+#endif
+
+// Rate-limited logging for high-frequency classify callbacks.
+// Logs every Nth packet to avoid DbgPrint flood at DISPATCH_LEVEL.
+#ifdef AIDA_NET_DEBUG
+static volatile LONG g_net_dbg_inbound_counter = 0;
+static volatile LONG g_net_dbg_outbound_counter = 0;
+#define NET_DBG_RATE_IN(interval, fmt, ...) \
+    do { \
+        LONG _c = _InterlockedIncrement(&g_net_dbg_inbound_counter); \
+        if ((_c % (interval)) == 0) \
+            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL, \
+                       "[AIDA-NET][IN #%ld] " fmt "\n", _c, ##__VA_ARGS__); \
+    } while(0)
+#define NET_DBG_RATE_OUT(interval, fmt, ...) \
+    do { \
+        LONG _c = _InterlockedIncrement(&g_net_dbg_outbound_counter); \
+        if ((_c % (interval)) == 0) \
+            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL, \
+                       "[AIDA-NET][OUT #%ld] " fmt "\n", _c, ##__VA_ARGS__); \
+    } while(0)
+#else
+#define NET_DBG_RATE_IN(interval, fmt, ...) ((void)0)
+#define NET_DBG_RATE_OUT(interval, fmt, ...) ((void)0)
+#endif
+
+
 typedef struct _FWPS_CALLOUT2_COMPAT {
     GUID   calloutKey;
     UINT32 flags;
@@ -554,11 +596,15 @@ namespace net_capture {
 
         UINT32 effective_pid = pid;
         if (effective_pid == 0 && g_filter_pid != 0) {
+            NET_DBG("store_packet: dropped pkt (unknown PID, filter_pid=%u)", g_filter_pid);
             return; // Cannot determine packet owner; drop rather than misattribute
         }
 
 
-        if (g_filter_pid != 0 && effective_pid != g_filter_pid) return;
+        if (g_filter_pid != 0 && effective_pid != g_filter_pid) {
+            NET_DBG("store_packet: dropped pkt (pid=%u != filter_pid=%u)", effective_pid, g_filter_pid);
+            return;
+        }
         if (g_filter_port != 0 && local_port != g_filter_port && remote_port != g_filter_port) return;
         if (g_filter_protocol != 0 && protocol != g_filter_protocol) return;
         if (!is_zero_ip(g_filter_ip)) {
@@ -574,7 +620,7 @@ namespace net_capture {
         KeAcquireSpinLock(&g_ring_lock, &old_irql);
 
         if (g_ring_count >= RING_BUFFER_SIZE) {
-
+            NET_DBG("store_packet: ring overflow, dropping oldest (total_dropped=%ld)", g_total_dropped + 1);
             g_ring_tail = (g_ring_tail + 1) % RING_BUFFER_SIZE;
             g_ring_count--;
             _InterlockedIncrement(&g_total_dropped);
@@ -621,6 +667,7 @@ namespace net_capture {
 
         UINT32 effective_pid = pid;
         if (effective_pid == 0 && g_filter_pid != 0) {
+            NET_DBG("store_dns_entry: dropped DNS (unknown PID, filter_pid=%u)", g_filter_pid);
             return; // Cannot determine DNS entry owner; drop rather than misattribute
         }
 
@@ -628,6 +675,7 @@ namespace net_capture {
         KeAcquireSpinLock(&g_dns_lock, &old_irql);
 
         if (g_dns_count >= DNS_RING_SIZE) {
+            NET_DBG("store_dns_entry: DNS ring overflow, dropping oldest");
             g_dns_tail = (g_dns_tail + 1) % DNS_RING_SIZE;
             g_dns_count--;
         }
@@ -760,7 +808,10 @@ namespace net_capture {
         classifyOut->actionType = FWP_ACTION_PERMIT_;
 
         if (!inFixedValues || !inMetaValues) return;
-        if (!should_process_packet_pipeline()) return;
+        if (!should_process_packet_pipeline()) {
+            NET_DBG_RATE_IN(500, "classify_inbound: pipeline bypassed (capture inactive or shutting down)");
+            return;
+        }
 
         __try {
             UINT32 protocol = 0;
@@ -809,9 +860,14 @@ namespace net_capture {
 
             _InterlockedIncrement64(&g_global_pkts_recv);
 
+            NET_DBG_RATE_IN(100, "classify_inbound: proto=%u pid=%u %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
+                    protocol, pid,
+                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
+                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port);
 
             UINT32 rule_action = check_filter_rules(0, protocol, pid, local_port, remote_port, remote_ip, 2);
             if (rule_action == 1) {
+                NET_DBG("classify_inbound: BLOCKED by filter rule proto=%u pid=%u port=%u", protocol, pid, remote_port);
                 classifyOut->actionType = FWP_ACTION_BLOCK_;
                 classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
                 return;
@@ -858,6 +914,7 @@ namespace net_capture {
 
             if (net_intercept::try_hold_packet(0, protocol, local_port, remote_port,
                     local_ip, remote_ip, 2, pid, pkt_data, pkt_len)) {
+                NET_DBG("classify_inbound: HELD by intercept proto=%u pid=%u port=%u", protocol, pid, remote_port);
                 classifyOut->actionType = FWP_ACTION_BLOCK_;
                 classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
                 return;
@@ -895,7 +952,10 @@ namespace net_capture {
         classifyOut->actionType = FWP_ACTION_PERMIT_;
 
         if (!inFixedValues || !inMetaValues) return;
-        if (!should_process_packet_pipeline()) return;
+        if (!should_process_packet_pipeline()) {
+            NET_DBG_RATE_OUT(500, "classify_outbound: pipeline bypassed");
+            return;
+        }
 
         __try {
             UINT32 protocol = 0;
@@ -944,8 +1004,14 @@ namespace net_capture {
 
             _InterlockedIncrement64(&g_global_pkts_sent);
 
+            NET_DBG_RATE_OUT(100, "classify_outbound: proto=%u pid=%u %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
+                    protocol, pid,
+                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
+                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port);
+
             UINT32 rule_action = check_filter_rules(1, protocol, pid, local_port, remote_port, remote_ip, 2);
             if (rule_action == 1) {
+                NET_DBG("classify_outbound: BLOCKED by filter rule proto=%u pid=%u port=%u", protocol, pid, remote_port);
                 classifyOut->actionType = FWP_ACTION_BLOCK_;
                 classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
                 return;
@@ -990,6 +1056,7 @@ namespace net_capture {
 
             if (net_intercept::try_hold_packet(1, protocol, local_port, remote_port,
                     local_ip, remote_ip, 2, pid, pkt_data, pkt_len)) {
+                NET_DBG("classify_outbound: HELD by intercept proto=%u pid=%u port=%u", protocol, pid, remote_port);
                 classifyOut->actionType = FWP_ACTION_BLOCK_;
                 classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
                 return;
@@ -1055,6 +1122,8 @@ namespace net_capture {
             aida_store_cached_port_pid(protocol, local_port, pid);
             if (remote_port != 0)
                 aida_store_cached_port_pid(protocol, remote_port, pid);
+            NET_DBG("classify_ale_connect: pid=%u proto=%u local_port=%u remote_port=%u ep_handle=0x%llx",
+                    pid, protocol, local_port, remote_port, endpoint_handle);
         } __except(EXCEPTION_EXECUTE_HANDLER) {
         }
     }
@@ -1106,6 +1175,8 @@ namespace net_capture {
             aida_store_cached_port_pid(protocol, local_port, pid);
             if (remote_port != 0)
                 aida_store_cached_port_pid(protocol, remote_port, pid);
+            NET_DBG("classify_ale_recv: pid=%u proto=%u local_port=%u remote_port=%u ep_handle=0x%llx",
+                    pid, protocol, local_port, remote_port, endpoint_handle);
         } __except(EXCEPTION_EXECUTE_HANDLER) {
         }
     }
@@ -1153,14 +1224,17 @@ namespace net_capture {
     }
 
     BOOLEAN resolve_wfp_functions() {
+        NET_DBG("resolve_wfp_functions: locating FWPKCLNT.SYS");
         PVOID fwp_base = find_module_base("FWPKCLNT.SYS");
         if (!fwp_base) {
-
+            NET_DBG("resolve_wfp_functions: trying lowercase fwpkclnt.sys");
             fwp_base = find_module_base("fwpkclnt.sys");
         }
         if (!fwp_base) {
+            NET_ERR("resolve_wfp_functions: FWPKCLNT.SYS not found");
             return FALSE;
         }
+        NET_DBG("resolve_wfp_functions: FWPKCLNT.SYS base=%p", fwp_base);
 
         CHAR n1[] = {'F','w','p','s','C','a','l','l','o','u','t','R','e','g','i','s','t','e','r','2',0};
         CHAR n2[] = {'F','w','p','s','C','a','l','l','o','u','t','U','n','r','e','g','i','s','t','e','r','B','y','I','d','0',0};
@@ -1194,12 +1268,25 @@ namespace net_capture {
                 _FwpmEngineOpen0 && _FwpmEngineClose0 &&
                 _FwpmTransactionBegin0 && _FwpmTransactionCommit0 &&
                 _FwpmCalloutAdd0 && _FwpmSubLayerAdd0 && _FwpmFilterAdd0);
+        NET_DBG("resolve_wfp_functions: Register2=%p UnregById=%p EngOpen=%p EngClose=%p",
+                _FwpsCalloutRegister2, _FwpsCalloutUnregisterById0,
+                _FwpmEngineOpen0, _FwpmEngineClose0);
+        NET_DBG("resolve_wfp_functions: TxnBegin=%p TxnCommit=%p CalloutAdd=%p SubLayerAdd=%p FilterAdd=%p",
+                _FwpmTransactionBegin0, _FwpmTransactionCommit0,
+                _FwpmCalloutAdd0, _FwpmSubLayerAdd0, _FwpmFilterAdd0);
+        if (!ok) {
+            NET_ERR("resolve_wfp_functions: one or more critical functions not resolved");
+        } else {
+            NET_DBG("resolve_wfp_functions: all critical functions resolved OK");
+        }
         return ok;
     }
 
 
     NTSTATUS register_wfp(PDEVICE_OBJECT devObj) {
+        NET_DBG("register_wfp: devObj=%p", devObj);
         if (!devObj) {
+            NET_ERR("register_wfp: devObj is NULL");
             return STATUS_INVALID_PARAMETER;
         }
         g_device_object = devObj;
@@ -1209,13 +1296,17 @@ namespace net_capture {
 
         status = _FwpmEngineOpen0(nullptr, 0x0000000A ,
             nullptr, nullptr, &g_engine_handle);
+        NET_DBG("register_wfp: FwpmEngineOpen0 status=0x%08x handle=%p", status, g_engine_handle);
         if (!NT_SUCCESS(status)) {
+            NET_ERR("register_wfp: FwpmEngineOpen0 FAILED 0x%08x", status);
             return status;
         }
 
 
         status = _FwpmTransactionBegin0(g_engine_handle, 0);
+        NET_DBG("register_wfp: FwpmTransactionBegin0 status=0x%08x", status);
         if (!NT_SUCCESS(status)) {
+            NET_ERR("register_wfp: FwpmTransactionBegin0 FAILED 0x%08x", status);
             _FwpmEngineClose0(g_engine_handle);
             g_engine_handle = nullptr;
             return status;
@@ -1235,7 +1326,9 @@ namespace net_capture {
         sublayer.weight = 0xFFFF;
 
         status = _FwpmSubLayerAdd0(g_engine_handle, &sublayer, nullptr);
+        NET_DBG("register_wfp: FwpmSubLayerAdd0 status=0x%08x", status);
         if (!NT_SUCCESS(status)) {
+            NET_ERR("register_wfp: FwpmSubLayerAdd0 FAILED 0x%08x", status);
             _FwpmTransactionAbort0(g_engine_handle);
             _FwpmEngineClose0(g_engine_handle);
             g_engine_handle = nullptr;
@@ -1251,7 +1344,9 @@ namespace net_capture {
         callout_in.flowDeleteFn = nullptr;
 
         status = _FwpsCalloutRegister2(devObj, &callout_in, &g_callout_id_inbound);
+        NET_DBG("register_wfp: inbound callout register status=0x%08x id=%u", status, g_callout_id_inbound);
         if (!NT_SUCCESS(status)) {
+            NET_ERR("register_wfp: inbound callout register FAILED 0x%08x", status);
             _FwpmTransactionAbort0(g_engine_handle);
             _FwpmEngineClose0(g_engine_handle);
             g_engine_handle = nullptr;
@@ -1267,7 +1362,9 @@ namespace net_capture {
         callout_out.flowDeleteFn = nullptr;
 
         status = _FwpsCalloutRegister2(devObj, &callout_out, &g_callout_id_outbound);
+        NET_DBG("register_wfp: outbound callout register status=0x%08x id=%u", status, g_callout_id_outbound);
         if (!NT_SUCCESS(status)) {
+            NET_ERR("register_wfp: outbound callout register FAILED 0x%08x", status);
             _FwpsCalloutUnregisterById0(g_callout_id_inbound);
             _FwpmTransactionAbort0(g_engine_handle);
             _FwpmEngineClose0(g_engine_handle);
@@ -1371,6 +1468,7 @@ namespace net_capture {
         status = _FwpsCalloutRegister2(devObj, &callout_ale_conn, &g_callout_id_ale_connect);
         if (!NT_SUCCESS(status)) {
             g_callout_id_ale_connect = 0;
+            NET_ERR("register_wfp: ALE connect callout register FAILED 0x%08x", status);
         } else {
             FWPS_CALLOUT2_COMPAT callout_ale_recv_co = {};
             callout_ale_recv_co.calloutKey = GUID_AIDA_CALLOUT_ALE_RECV;
@@ -1380,7 +1478,9 @@ namespace net_capture {
             callout_ale_recv_co.flowDeleteFn = nullptr;
 
             status = _FwpsCalloutRegister2(devObj, &callout_ale_recv_co, &g_callout_id_ale_recv);
+            NET_DBG("register_wfp: ALE recv callout register status=0x%08x id=%u", status, g_callout_id_ale_recv);
             if (!NT_SUCCESS(status)) {
+                NET_ERR("register_wfp: ALE recv callout register FAILED 0x%08x", status);
                 g_callout_id_ale_recv = 0;
             }
 
@@ -1403,7 +1503,9 @@ namespace net_capture {
                 filter_ale_conn.numFilterConditions = 0;
 
                 status = _FwpmFilterAdd0(g_engine_handle, &filter_ale_conn, nullptr, &g_filter_id_ale_connect);
+                NET_DBG("register_wfp: ALE connect filter add status=0x%08x filter_id=%llu", status, g_filter_id_ale_connect);
                 if (!NT_SUCCESS(status)) {
+                    NET_ERR("register_wfp: ALE connect filter add FAILED 0x%08x", status);
                     g_filter_id_ale_connect = 0;
                 }
             }
@@ -1427,7 +1529,9 @@ namespace net_capture {
                 filter_ale_recv.numFilterConditions = 0;
 
                 status = _FwpmFilterAdd0(g_engine_handle, &filter_ale_recv, nullptr, &g_filter_id_ale_recv);
+                NET_DBG("register_wfp: ALE recv filter add status=0x%08x filter_id=%llu", status, g_filter_id_ale_recv);
                 if (!NT_SUCCESS(status)) {
+                    NET_ERR("register_wfp: ALE recv filter add FAILED 0x%08x", status);
                     g_filter_id_ale_recv = 0;
                 }
             }
@@ -1439,7 +1543,9 @@ namespace net_capture {
 
 
         status = _FwpmTransactionCommit0(g_engine_handle);
+        NET_DBG("register_wfp: FwpmTransactionCommit0 status=0x%08x", status);
         if (!NT_SUCCESS(status)) {
+            NET_ERR("register_wfp: FwpmTransactionCommit0 FAILED 0x%08x", status);
             _FwpsCalloutUnregisterById0(g_callout_id_inbound);
             _FwpsCalloutUnregisterById0(g_callout_id_outbound);
             _FwpmEngineClose0(g_engine_handle);
@@ -1447,7 +1553,9 @@ namespace net_capture {
             return status;
         }
 
-
+        NET_DBG("register_wfp: SUCCESS — inbound_id=%u outbound_id=%u ale_conn_id=%u ale_recv_id=%u",
+                g_callout_id_inbound, g_callout_id_outbound,
+                g_callout_id_ale_connect, g_callout_id_ale_recv);
         return STATUS_SUCCESS;
     }
 
@@ -1495,9 +1603,14 @@ namespace net_capture {
 
 
     NTSTATUS initialize(PDEVICE_OBJECT devObj) {
+        NET_DBG("initialize: starting WFP init, devObj=%p", devObj);
         LONG prev = _InterlockedCompareExchange(&g_wfp_initialized, 1, 0);
-        if (prev == 2) return STATUS_SUCCESS;
+        if (prev == 2) {
+            NET_DBG("initialize: already initialized (state=2)");
+            return STATUS_SUCCESS;
+        }
         if (prev == 1) {
+            NET_DBG("initialize: concurrent init detected, waiting...");
             while (_InterlockedCompareExchange(&g_wfp_initialized, 0, 0) == 1)
                 YieldProcessor();
             return (g_wfp_initialized == 2) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
@@ -1514,26 +1627,34 @@ namespace net_capture {
         g_ring_buffer = (NET_PACKET_ENTRY*)ExAllocatePool2(
             POOL_FLAG_NON_PAGED, ring_size, 'pkNW');
         if (!g_ring_buffer) {
+            NET_ERR("initialize: packet ring alloc FAILED (size=%llu)", (ULONGLONG)ring_size);
             _InterlockedExchange(&g_wfp_initialized, 0);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
+        NET_DBG("initialize: packet ring allocated at %p (size=%llu, entries=%u)",
+                g_ring_buffer, (ULONGLONG)ring_size, RING_BUFFER_SIZE);
         strong::kmemset(g_ring_buffer, 0, ring_size);
 
         SIZE_T dns_size = (SIZE_T)DNS_RING_SIZE * sizeof(NET_DNS_ENTRY);
         g_dns_ring = (NET_DNS_ENTRY*)ExAllocatePool2(
             POOL_FLAG_NON_PAGED, dns_size, 'dnNW');
         if (!g_dns_ring) {
+            NET_ERR("initialize: DNS ring alloc FAILED (size=%llu)", (ULONGLONG)dns_size);
             ExFreePoolWithTag(g_ring_buffer, 'pkNW');
             g_ring_buffer = nullptr;
             _InterlockedExchange(&g_wfp_initialized, 0);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
+        NET_DBG("initialize: DNS ring allocated at %p (size=%llu, entries=%u)",
+                g_dns_ring, (ULONGLONG)dns_size, DNS_RING_SIZE);
         strong::kmemset(g_dns_ring, 0, dns_size);
 
         net_intercept::init_lock();
 
         status = net_dpi::init();
+        NET_DBG("initialize: net_dpi::init status=0x%08x", status);
         if (!NT_SUCCESS(status)) {
+            NET_ERR("initialize: DPI init FAILED 0x%08x", status);
             ExFreePoolWithTag(g_ring_buffer, 'pkNW');
             g_ring_buffer = nullptr;
             ExFreePoolWithTag(g_dns_ring, 'dnNW');
@@ -1544,6 +1665,7 @@ namespace net_capture {
 
 
         if (!resolve_wfp_functions()) {
+            NET_ERR("initialize: resolve_wfp_functions FAILED");
             net_dpi::cleanup();
             ExFreePoolWithTag(g_ring_buffer, 'pkNW');
             g_ring_buffer = nullptr;
@@ -1555,7 +1677,9 @@ namespace net_capture {
 
 
         status = register_wfp(devObj);
+        NET_DBG("initialize: register_wfp status=0x%08x", status);
         if (!NT_SUCCESS(status)) {
+            NET_ERR("initialize: register_wfp FAILED 0x%08x", status);
             net_dpi::cleanup();
             if (g_ring_buffer) {
                 ExFreePoolWithTag(g_ring_buffer, 'pkNW');
@@ -1571,6 +1695,7 @@ namespace net_capture {
 
         KeMemoryBarrier();
         _InterlockedExchange(&g_wfp_initialized, 2);
+        NET_DBG("initialize: WFP fully initialized (state=2)");
         return STATUS_SUCCESS;
     }
 
@@ -2090,6 +2215,7 @@ static __forceinline BOOLEAN aida_can_query_system_handles() {
         return TRUE;
 
     if (_InterlockedCompareExchange(&g_handle_query_irql_warned, 1, 0) == 0) {
+        NET_ERR("aida_can_query_system_handles: blocked at IRQL=%u (need PASSIVE_LEVEL), future warnings suppressed", (UINT32)irql);
     }
     return FALSE;
 }
@@ -2099,15 +2225,21 @@ static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
                                       UINT32 local_port,
                                       UINT32 remote_port) {
     UINT32 cached_pid = aida_lookup_cached_endpoint_pid(endpoint_handle, protocol, local_port);
-    if (cached_pid != 0)
+    if (cached_pid != 0) {
+        NET_DBG("aida_resolve_packet_pid: endpoint cache HIT pid=%u ep=0x%llx", cached_pid, endpoint_handle);
         return cached_pid;
+    }
 
     cached_pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
-    if (cached_pid != 0)
+    if (cached_pid != 0) {
+        NET_DBG("aida_resolve_packet_pid: port cache HIT pid=%u proto=%u lport=%u rport=%u", cached_pid, protocol, local_port, remote_port);
         return cached_pid;
+    }
 
-    if (!aida_can_query_system_handles())
+    if (!aida_can_query_system_handles()) {
+        NET_DBG("aida_resolve_packet_pid: cannot query handles (IRQL too high), returning 0");
         return 0;
+    }
 
     PAIDA_SYSTEM_HANDLE_INFORMATION handles = nullptr;
     NTSTATUS status = aida_query_system_handles(&handles);
@@ -2242,8 +2374,12 @@ namespace net_enum {
     #pragma pack(pop)
 
     BOOLEAN resolve_nsi() {
+        NET_DBG("resolve_nsi: enter");
         LONG prev = _InterlockedCompareExchange(&g_nsi_resolved, 1, 0);
-        if (prev == 2) return _NsiEnumerate != nullptr;
+        if (prev == 2) {
+            NET_DBG("resolve_nsi: already resolved, NsiEnumerate=%p", _NsiEnumerate);
+            return _NsiEnumerate != nullptr;
+        }
         if (prev == 1) {
             while (_InterlockedCompareExchange(&g_nsi_resolved, 0, 0) == 1)
                 YieldProcessor();
@@ -2263,17 +2399,22 @@ namespace net_enum {
 
         KeMemoryBarrier();
         _InterlockedExchange(&g_nsi_resolved, 2);
+        NET_DBG("resolve_nsi: NsiEnumerate=%p", _NsiEnumerate);
         return _NsiEnumerate != nullptr;
     }
 
     NTSTATUS enumerate_connections(p_net_enum_conn request) {
+        NET_DBG("enumerate_connections: enter filter_pid=%u filter_proto=%u",
+                request ? request->filter_pid : 0, request ? request->filter_protocol : 0);
         if (!request) return STATUS_INVALID_PARAMETER;
 
         request->connection_count = 0;
 
         PAIDA_SYSTEM_HANDLE_INFORMATION handles = nullptr;
         NTSTATUS status = aida_query_system_handles(&handles);
+        NET_DBG("enumerate_connections: aida_query_system_handles status=0x%08x handles=%p", status, handles);
         if (!NT_SUCCESS(status) || !handles) {
+            NET_ERR("enumerate_connections: system handle query FAILED 0x%08x", status);
             return status;
         }
 
@@ -2312,6 +2453,7 @@ namespace net_enum {
 
         ExFreePoolWithTag(handles, 'hANW');
 
+        NET_DBG("enumerate_connections: exit found=%u connections", request->connection_count);
         return STATUS_SUCCESS;
     }
 
@@ -2319,14 +2461,19 @@ namespace net_enum {
 
 
 NTSTATUS functions::handle_net_enum_conn(p_net_enum_conn request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
-    return net_enum::enumerate_connections(request);
+    NET_DBG("handle_net_enum_conn: enter");
+    if (!request) { NET_ERR("handle_net_enum_conn: NULL request"); return STATUS_INVALID_PARAMETER; }
+    NTSTATUS st = net_enum::enumerate_connections(request);
+    NET_DBG("handle_net_enum_conn: exit status=0x%08x", st);
+    return st;
 }
 
 NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_net_cap_ctrl: enter op=%u filter_pid=%u", request ? request->operation : 0, request ? request->filter_pid : 0);
+    if (!request) { NET_ERR("handle_net_cap_ctrl: NULL request"); return STATUS_INVALID_PARAMETER; }
 
     if (net_capture::g_wfp_initialized != 2) {
+        NET_ERR("handle_net_cap_ctrl: WFP not initialized (state=%d)", (int)net_capture::g_wfp_initialized);
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -2358,11 +2505,14 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
             _InterlockedExchange(&net_capture::g_total_dropped, 0);
             _InterlockedExchange(&net_capture::g_capture_active, 1);
 
+            NET_DBG("handle_net_cap_ctrl: capture STARTED pid=%u port=%u proto=%u max_bytes=%u",
+                    request->filter_pid, request->filter_port, request->filter_protocol, net_capture::g_max_payload);
             request->capture_active = 1;
             break;
         }
         case 1: {
             _InterlockedExchange(&net_capture::g_capture_active, 0);
+            NET_DBG("handle_net_cap_ctrl: capture STOPPED");
             request->capture_active = 0;
             break;
         }
@@ -2377,12 +2527,18 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
     request->packets_captured = (UINT32)net_capture::g_total_captured;
     request->packets_dropped = (UINT32)net_capture::g_total_dropped;
 
+    NET_DBG("handle_net_cap_ctrl: exit active=%u captured=%u dropped=%u",
+            request->capture_active, request->packets_captured, request->packets_dropped);
     return STATUS_SUCCESS;
 }
 
 NTSTATUS functions::handle_net_cap_get(p_net_cap_get request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
-    if (!net_capture::g_ring_buffer) return STATUS_DEVICE_NOT_READY;
+    NET_DBG("handle_net_cap_get: enter max_packets=%u", request ? request->max_packets : 0);
+    if (!request) { NET_ERR("handle_net_cap_get: NULL request"); return STATUS_INVALID_PARAMETER; }
+    if (!net_capture::g_ring_buffer) {
+        NET_ERR("handle_net_cap_get: ring buffer not allocated");
+        return STATUS_DEVICE_NOT_READY;
+    }
 
     UINT32 max_packets = request->max_packets;
     if (max_packets > NET_CAP_GET_MAX) max_packets = NET_CAP_GET_MAX;
@@ -2408,12 +2564,17 @@ NTSTATUS functions::handle_net_cap_get(p_net_cap_get request) {
 
     KeReleaseSpinLock(&net_capture::g_ring_lock, old_irql);
 
+    NET_DBG("handle_net_cap_get: exit returned=%u packets", to_read);
     return STATUS_SUCCESS;
 }
 
 NTSTATUS functions::handle_net_dns_get(p_net_dns_get request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
-    if (!net_capture::g_dns_ring) return STATUS_DEVICE_NOT_READY;
+    NET_DBG("handle_net_dns_get: enter filter_pid=%u", request ? request->filter_pid : 0);
+    if (!request) { NET_ERR("handle_net_dns_get: NULL request"); return STATUS_INVALID_PARAMETER; }
+    if (!net_capture::g_dns_ring) {
+        NET_ERR("handle_net_dns_get: DNS ring not allocated");
+        return STATUS_DEVICE_NOT_READY;
+    }
 
     request->entry_count = 0;
 
@@ -2441,11 +2602,13 @@ NTSTATUS functions::handle_net_dns_get(p_net_dns_get request) {
 
     KeReleaseSpinLock(&net_capture::g_dns_lock, old_irql);
 
+    NET_DBG("handle_net_dns_get: exit returned=%u entries", out_idx);
     return STATUS_SUCCESS;
 }
 
 NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_net_filter_rule: enter op=%u", request ? request->operation : 0);
+    if (!request) { NET_ERR("handle_net_filter_rule: NULL request"); return STATUS_INVALID_PARAMETER; }
 
     switch (request->operation) {
         case 0: {
@@ -2499,7 +2662,8 @@ NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
 }
 
 NTSTATUS functions::handle_net_stats(p_net_stats request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_net_stats: enter");
+    if (!request) { NET_ERR("handle_net_stats: NULL request"); return STATUS_INVALID_PARAMETER; }
 
     request->bytes_sent = (UINT64)net_capture::g_global_bytes_sent;
     request->bytes_received = (UINT64)net_capture::g_global_bytes_recv;
@@ -2512,6 +2676,9 @@ NTSTATUS functions::handle_net_stats(p_net_stats request) {
     request->total_dns_logged = (UINT32)net_capture::g_total_dns;
     request->active_filter_rules = (UINT32)net_capture::g_active_rule_count;
 
+    NET_DBG("handle_net_stats: exit tx_pkts=%llu rx_pkts=%llu captured=%u dropped=%u",
+            request->packets_sent, request->packets_received,
+            request->total_captured, request->total_dropped);
     return STATUS_SUCCESS;
 }
 
@@ -3256,8 +3423,13 @@ namespace net_inject {
     }
 
     BOOLEAN resolve_inject_functions() {
+        NET_DBG("resolve_inject_functions: enter");
         LONG prev = _InterlockedCompareExchange(&g_inject_resolved, 1, 0);
-        if (prev == 2) return g_inject_handle_v4 != nullptr;
+        if (prev == 2) {
+            NET_DBG("resolve_inject_functions: already resolved, handle_v4=%p handle_net_v4=%p",
+                    g_inject_handle_v4, g_inject_handle_net_v4);
+            return g_inject_handle_v4 != nullptr;
+        }
         if (prev == 1) {
             while (_InterlockedCompareExchange(&g_inject_resolved, 0, 0) == 1)
                 YieldProcessor();
@@ -3266,7 +3438,12 @@ namespace net_inject {
 
         PVOID fwp_base = net_capture::find_module_base("FWPKCLNT.SYS");
         if (!fwp_base) fwp_base = net_capture::find_module_base("fwpkclnt.sys");
-        if (!fwp_base) { _InterlockedExchange(&g_inject_resolved, 2); return FALSE; }
+        if (!fwp_base) {
+            NET_ERR("resolve_inject_functions: FWPKCLNT.SYS not found");
+            _InterlockedExchange(&g_inject_resolved, 2);
+            return FALSE;
+        }
+        NET_DBG("resolve_inject_functions: FWPKCLNT.SYS base=%p", fwp_base);
 
         CHAR f1[] = {'F','w','p','s','I','n','j','e','c','t','i','o','n','H','a','n','d','l','e','C','r','e','a','t','e','0',0};
         CHAR f2[] = {'F','w','p','s','I','n','j','e','c','t','i','o','n','H','a','n','d','l','e','D','e','s','t','r','o','y','0',0};
@@ -3297,13 +3474,19 @@ namespace net_inject {
 
         if (_FwpsInjectionHandleCreate0) {
             NTSTATUS st = _FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_TRANSPORT, &g_inject_handle_v4);
+            NET_DBG("resolve_inject_functions: transport inject handle create st=0x%08x handle=%p", st, g_inject_handle_v4);
             if (!NT_SUCCESS(st)) g_inject_handle_v4 = nullptr;
 
             st = _FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_NETWORK, &g_inject_handle_net_v4);
+            NET_DBG("resolve_inject_functions: network inject handle create st=0x%08x handle=%p", st, g_inject_handle_net_v4);
             if (!NT_SUCCESS(st)) g_inject_handle_net_v4 = nullptr;
         } else {
+            NET_ERR("resolve_inject_functions: FwpsInjectionHandleCreate0 not found");
         }
 
+        NET_DBG("resolve_inject_functions: InjectSend=%p InjectRecv=%p NetSend=%p NetRecv=%p NBLPool=%p",
+                _FwpsInjectSend0, _FwpsInjectRecv0, _FwpsInjectNetSend0, _FwpsInjectNetRecv0,
+                _NdisAllocateNetBufferListPool);
         KeMemoryBarrier();
         _InterlockedExchange(&g_inject_resolved, 2);
         return (g_inject_handle_v4 != nullptr) || (g_inject_handle_net_v4 != nullptr);
@@ -5590,124 +5773,166 @@ namespace net_fingerprint {
 
 
 NTSTATUS functions::handle_wfp_callout_enum(p_wfp_callout_enum request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_wfp_callout_enum: enter");
+    if (!request) { NET_ERR("handle_wfp_callout_enum: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_wfp_enum::enumerate_wfp_callouts(request);
+    NET_DBG("handle_wfp_callout_enum: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_socket_handle_enum(p_socket_handle_enum request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_socket_handle_enum: enter");
+    if (!request) { NET_ERR("handle_socket_handle_enum: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_socket_enum::enumerate_socket_handles(request);
+    NET_DBG("handle_socket_handle_enum: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_sniff_net_buffers(p_sniff_net_buffers request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
-    return net_sniff::handle_sniff(request);
+    NET_DBG("handle_sniff_net_buffers: enter");
+    if (!request) { NET_ERR("handle_sniff_net_buffers: NULL request"); return STATUS_INVALID_PARAMETER; }
+    NTSTATUS st = net_sniff::handle_sniff(request);
+    NET_DBG("handle_sniff_net_buffers: exit status=0x%08x", st);
+    return st;
 }
 
 NTSTATUS functions::handle_tcpip_conn_dump(p_tcpip_conn_dump request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_tcpip_conn_dump: enter");
+    if (!request) { NET_ERR("handle_tcpip_conn_dump: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_tcpip::dump_connections(request);
+    NET_DBG("handle_tcpip_conn_dump: exit status=0x%08x", st);
     return st;
 }
 
 
 NTSTATUS functions::handle_packet_inject(p_packet_inject_request request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_packet_inject: enter");
+    if (!request) { NET_ERR("handle_packet_inject: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_inject::inject_packet(request);
+    NET_DBG("handle_packet_inject: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_packet_mod_rule(p_packet_mod_rule request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_packet_mod_rule: enter");
+    if (!request) { NET_ERR("handle_packet_mod_rule: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_mod::handle_mod_rule(request);
+    NET_DBG("handle_packet_mod_rule: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_packet_mod_rule_list(p_packet_mod_rule_list request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_packet_mod_rule_list: enter");
+    if (!request) { NET_ERR("handle_packet_mod_rule_list: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_mod::handle_mod_rule_list(request);
+    NET_DBG("handle_packet_mod_rule_list: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_traffic_redirect(p_traffic_redirect_rule request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_traffic_redirect: enter");
+    if (!request) { NET_ERR("handle_traffic_redirect: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_redirect::handle_redirect_rule(request);
+    NET_DBG("handle_traffic_redirect: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_traffic_redirect_list(p_traffic_redirect_list request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_traffic_redirect_list: enter");
+    if (!request) { NET_ERR("handle_traffic_redirect_list: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_redirect::handle_redirect_list(request);
+    NET_DBG("handle_traffic_redirect_list: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_stream_reassemble(p_stream_reassemble_request request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_stream_reassemble: enter op=%u pid=%u", request ? request->operation : 0, request ? request->pid : 0);
+    if (!request) { NET_ERR("handle_stream_reassemble: NULL request"); return STATUS_INVALID_PARAMETER; }
     if (request->operation == 0 && request->pid != 0) {
         NTSTATUS cache_status = aida_refresh_pid_cache_for_process(request->pid, IPPROTO_TCP);
+        NET_DBG("handle_stream_reassemble: PID cache refresh status=0x%08x", cache_status);
     }
     NTSTATUS st = net_stream::handle_stream(request);
+    NET_DBG("handle_stream_reassemble: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_deep_inspect(p_dpi_request request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_deep_inspect: enter filter_pid=%u filter_proto=%u", request ? request->filter_pid : 0, request ? request->filter_protocol : 0);
+    if (!request) { NET_ERR("handle_deep_inspect: NULL request"); return STATUS_INVALID_PARAMETER; }
     if (request->filter_pid != 0) {
         NTSTATUS cache_status = aida_refresh_pid_cache_for_process(request->filter_pid, request->filter_protocol);
+        NET_DBG("handle_deep_inspect: PID cache refresh status=0x%08x", cache_status);
     }
     NTSTATUS st = net_dpi::get_results(request);
+    NET_DBG("handle_deep_inspect: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_intercept_hold(p_intercept_request request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_intercept_hold: enter op=%u filter_pid=%u", request ? request->operation : 0, request ? request->filter_pid : 0);
+    if (!request) { NET_ERR("handle_intercept_hold: NULL request"); return STATUS_INVALID_PARAMETER; }
     if (request->operation == 0 && request->filter_pid != 0) {
         NTSTATUS cache_status = aida_refresh_pid_cache_for_process(request->filter_pid, request->filter_protocol);
+        NET_DBG("handle_intercept_hold: PID cache refresh status=0x%08x", cache_status);
     }
     NTSTATUS st = net_intercept::handle_intercept(request);
+    NET_DBG("handle_intercept_hold: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_conn_kill(p_conn_kill_request request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_conn_kill: enter");
+    if (!request) { NET_ERR("handle_conn_kill: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_kill::kill_connection(request);
+    NET_DBG("handle_conn_kill: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_dns_spoof(p_dns_spoof_rule request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_dns_spoof: enter");
+    if (!request) { NET_ERR("handle_dns_spoof: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_dns_spoof::handle_spoof_rule(request);
+    NET_DBG("handle_dns_spoof: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_dns_spoof_list(p_dns_spoof_list request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_dns_spoof_list: enter");
+    if (!request) { NET_ERR("handle_dns_spoof_list: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_dns_spoof::handle_spoof_list(request);
+    NET_DBG("handle_dns_spoof_list: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_bw_monitor(p_bw_monitor_request request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_bw_monitor: enter");
+    if (!request) { NET_ERR("handle_bw_monitor: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_bw::handle_bw(request);
+    NET_DBG("handle_bw_monitor: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_net_iface_enum(p_net_interface_enum request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_net_iface_enum: enter");
+    if (!request) { NET_ERR("handle_net_iface_enum: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_if_enum::enumerate_interfaces(request);
+    NET_DBG("handle_net_iface_enum: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_pcap_export(p_pcap_export_request request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_pcap_export: enter");
+    if (!request) { NET_ERR("handle_pcap_export: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_pcap::export_pcap(request);
+    NET_DBG("handle_pcap_export: exit status=0x%08x", st);
     return st;
 }
 
 NTSTATUS functions::handle_net_fingerprint(p_net_fingerprint_request request) {
-    if (!request) return STATUS_INVALID_PARAMETER;
+    NET_DBG("handle_net_fingerprint: enter");
+    if (!request) { NET_ERR("handle_net_fingerprint: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_fingerprint::handle_fingerprint(request);
+    NET_DBG("handle_net_fingerprint: exit status=0x%08x", st);
     return st;
 }
