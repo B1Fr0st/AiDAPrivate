@@ -3,6 +3,7 @@
 #include "imgui/imgui_impl_dx11.h"
 #include "imgui/freetype/freetype.h"
 #include "verdana.h"
+#include "ide_icons.h"
 #include <d3d11.h>
 #include <tchar.h>
 #include <windowsx.h>
@@ -10,12 +11,14 @@
 #include "helpers/helpers.h"
 #include "helpers/blur.h"
 #include <dwmapi.h>
+#include <shellscalingapi.h>
 #include "helpers/globals.h"
 #include "core/standalone_chat.hpp"
 #include "core/standalone_license.hpp"
 #include "helpers/stb_image.h"
 
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "Shcore.lib")
 
 ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
@@ -36,6 +39,47 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 inline int prev_w = 0;
 inline int prev_h = 0;
 
+static void rebuild_fonts(float dpi_scale)
+{
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->Clear();
+
+    float font_size = 14.0f * dpi_scale;
+
+    ImFontConfig cfg{};
+    cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_ForceAutoHint | ImGuiFreeTypeBuilderFlags_LightHinting;
+    cfg.PixelSnapH = false;
+    cfg.RasterizerMultiply = 1.0f;
+    io.Fonts->AddFontFromMemoryTTF(
+        (void*)verdana, sizeof(verdana), font_size, &cfg);
+
+    {
+        static const ImWchar icon_ranges[] = { ICON_MIN_IDE, ICON_MAX_IDE, 0 };
+        ImFontConfig icon_cfg{};
+        icon_cfg.MergeMode = true;
+        icon_cfg.PixelSnapH = true;
+        icon_cfg.GlyphMinAdvanceX = font_size;
+        icon_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_ForceAutoHint | ImGuiFreeTypeBuilderFlags_LightHinting;
+        void* icon_data_copy = IM_ALLOC(ide_icon_font_size);
+        memcpy(icon_data_copy, ide_icon_font_data, ide_icon_font_size);
+        io.Fonts->AddFontFromMemoryTTF(icon_data_copy, ide_icon_font_size, font_size, &icon_cfg, icon_ranges);
+    }
+
+    {
+        char win_dir[MAX_PATH];
+        GetWindowsDirectoryA(win_dir, MAX_PATH);
+        std::string consolas_path = std::string(win_dir) + "\\Fonts\\consola.ttf";
+        ImFontConfig mono_cfg{};
+        mono_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_ForceAutoHint | ImGuiFreeTypeBuilderFlags_LightHinting;
+        mono_cfg.PixelSnapH = true;
+        mono_cfg.RasterizerMultiply = 1.0f;
+        g_code_font = io.Fonts->AddFontFromFileTTF(consolas_path.c_str(), font_size, &mono_cfg);
+    }
+
+    io.Fonts->Build();
+    ImGui_ImplDX11_InvalidateDeviceObjects();
+}
+
 void set_acrylic_color(HWND hwnd)
 {
     struct ACCENT_POLICY { DWORD AccentState; DWORD AccentFlags; DWORD GradientColor; DWORD AnimationId; };
@@ -55,6 +99,8 @@ void set_acrylic_color(HWND hwnd)
 
 int main(int, char**)
 {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"AiDAStandaloneWindow", nullptr };
     ::RegisterClassExW(&wc);
     int screen_w = GetSystemMetrics(SM_CXSCREEN);
@@ -131,6 +177,12 @@ int main(int, char**)
     style.GrabRounding = 4.0f;
     style.TabRounding = 4.0f;
     style.ScrollbarSize = 4.f;
+    {
+        UINT dpi = GetDpiForWindow(hwnd);
+        globals::ui::dpi_scale = (dpi > 0) ? (static_cast<float>(dpi) / 96.0f) : 1.0f;
+    }
+
+    float font_size = 14.0f * globals::ui::dpi_scale;
     ImFontConfig cfg{};
     cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_ForceAutoHint | ImGuiFreeTypeBuilderFlags_LightHinting;
     cfg.PixelSnapH = false;
@@ -138,7 +190,20 @@ int main(int, char**)
 
 
     io.Fonts->AddFontFromMemoryTTF(
-        (void*)verdana, sizeof(verdana), 14, &cfg);
+        (void*)verdana, sizeof(verdana), font_size, &cfg);
+
+    // Merge icon font (IcoMoon) into the default font
+    {
+        static const ImWchar icon_ranges[] = { ICON_MIN_IDE, ICON_MAX_IDE, 0 };
+        ImFontConfig icon_cfg{};
+        icon_cfg.MergeMode = true;
+        icon_cfg.PixelSnapH = true;
+        icon_cfg.GlyphMinAdvanceX = font_size;
+        icon_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_ForceAutoHint | ImGuiFreeTypeBuilderFlags_LightHinting;
+        void* icon_data_copy = IM_ALLOC(ide_icon_font_size);
+        memcpy(icon_data_copy, ide_icon_font_data, ide_icon_font_size);
+        io.Fonts->AddFontFromMemoryTTF(icon_data_copy, ide_icon_font_size, font_size, &icon_cfg, icon_ranges);
+    }
 
     {
         char win_dir[MAX_PATH];
@@ -148,7 +213,7 @@ int main(int, char**)
         mono_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_ForceAutoHint | ImGuiFreeTypeBuilderFlags_LightHinting;
         mono_cfg.PixelSnapH = true;
         mono_cfg.RasterizerMultiply = 1.0f;
-        g_code_font = io.Fonts->AddFontFromFileTTF(consolas_path.c_str(), 14.0f, &mono_cfg);
+        g_code_font = io.Fonts->AddFontFromFileTTF(consolas_path.c_str(), font_size, &mono_cfg);
     }
 
     ImGui_ImplWin32_Init(hwnd);
@@ -229,8 +294,7 @@ int main(int, char**)
                 globals::ui::window_h = (float)g_ResizeHeight;
             }
             if (globals::ui::maximized) {
-                HRGN rgn = CreateRectRgn(0, 0, g_ResizeWidth, g_ResizeHeight);
-                SetWindowRgn(hwnd, rgn, TRUE);
+                SetWindowRgn(hwnd, nullptr, TRUE);
             } else {
                 HRGN rgn = CreateRoundRectRgn(0, 0, g_ResizeWidth, g_ResizeHeight, 16, 16);
                 SetWindowRgn(hwnd, rgn, TRUE);
@@ -288,11 +352,14 @@ int main(int, char**)
                 ide_resize_applied = true;
 
             if (globals::ui::maximized) {
-                HRGN rgn = CreateRectRgn(0, 0, iw, ih);
-                SetWindowRgn(hwnd, rgn, TRUE);
+                SetWindowRgn(hwnd, nullptr, TRUE);
+                DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_DONOTROUND;
+                DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
             } else {
                 HRGN rgn = CreateRoundRectRgn(0, 0, iw, ih, 16, 16);
                 SetWindowRgn(hwnd, rgn, TRUE);
+                DWM_WINDOW_CORNER_PREFERENCE cp = DWMWCP_ROUND;
+                DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
             }
             CleanupRenderTarget();
             g_pSwapChain->ResizeBuffers(0, iw, ih, DXGI_FORMAT_UNKNOWN, 0);
@@ -408,7 +475,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         RECT rc; GetWindowRect(hWnd, &rc);
-        const int border = 6;
+        const int border = static_cast<int>(6 * globals::ui::dpi_scale);
         bool left   = pt.x < rc.left   + border;
         bool right  = pt.x > rc.right  - border;
         bool top    = pt.y < rc.top    + border;
@@ -452,19 +519,30 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
         break;
     case WM_ACTIVATEAPP:
-
-
-        if (wParam == FALSE) {
-
-        } else {
-
+        if (wParam == TRUE) {
+            g_SwapChainOccluded = false;
             if (::IsWindow(hWnd) && !::IsIconic(hWnd)) {
                 ::SetWindowPos(hWnd, HWND_TOP, 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                ::ShowWindow(hWnd, SW_SHOWNA);
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                ::ShowWindow(hWnd, SW_SHOW);
+                set_acrylic_color(hWnd);
+                ::InvalidateRect(hWnd, nullptr, TRUE);
             }
         }
         return 0;
+    case WM_DPICHANGED:
+    {
+        UINT dpi = HIWORD(wParam);
+        globals::ui::dpi_scale = (dpi > 0) ? (static_cast<float>(dpi) / 96.0f) : 1.0f;
+        RECT* suggested = reinterpret_cast<RECT*>(lParam);
+        SetWindowPos(hWnd, nullptr,
+            suggested->left, suggested->top,
+            suggested->right - suggested->left,
+            suggested->bottom - suggested->top,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        rebuild_fonts(globals::ui::dpi_scale);
+        return 0;
+    }
     case WM_DESTROY:
         ::PostQuitMessage(0);
         return 0;

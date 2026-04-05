@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <set>
 #include <sstream>
 #include <cstdio>
 #include <cstring>
@@ -194,9 +195,9 @@ std::shared_ptr<httplib::Client> standalone_ai_client_t::get_or_create_client(
         _http = std::make_shared<httplib::Client>(host.c_str());
         _last_host = host;
 
-        _http->set_connection_timeout(5);
+        _http->set_connection_timeout(15);
         _http->set_read_timeout(300);
-        _http->set_write_timeout(10);
+        _http->set_write_timeout(30);
         _http->set_tcp_nodelay(true);
         _http->set_keep_alive(true);
         _http->set_decompress(true);
@@ -363,10 +364,43 @@ std::string standalone_ai_client_t::streaming_post(
 
     auto res = client->send(req);
 
+    // Retry once on connection failure with fresh client
+    if (!res && res.error() == httplib::Error::Connection) {
+        reset_client();
+        client = get_or_create_client(host);
+        sse_buffer.clear();
+        accumulated.clear();
+        res = client->send(req);
+    }
+
     if (_cancelled) return "Error: Operation cancelled.";
-    if (!res) return "Error: Streaming request failed: " + httplib::to_string(res.error());
-    if (res->status != 200)
-        return "Error: API returned status " + std::to_string(res->status);
+    if (!res) {
+        std::string err = "Error: Streaming request failed: " + httplib::to_string(res.error())
+                        + "\nHost: " + host;
+        reset_client();
+        return err;
+    }
+    if (res->status != 200) {
+        // WHY: When content_receiver is set, res->body is empty because cpp-httplib
+        // routes all data through the receiver. sse_buffer captured the raw error
+        // response body, so we parse it for a human-readable error message.
+        // Gemini wraps errors in [{"error":{...}}] arrays, OpenAI uses {"error":{...}}.
+        std::string err_detail;
+        if (!sse_buffer.empty()) {
+            auto ej = json::parse(sse_buffer, nullptr, false);
+            if (!ej.is_discarded()) {
+                if (ej.is_array() && !ej.empty()) ej = ej[0];
+                if (ej.contains("error") && ej["error"].is_object())
+                    err_detail = ej["error"].value("message", sse_buffer.substr(0, 400));
+                else
+                    err_detail = sse_buffer.substr(0, 400);
+            } else {
+                err_detail = sse_buffer.substr(0, 400);
+            }
+        }
+        return "Error: API returned status " + std::to_string(res->status)
+             + (err_detail.empty() ? "" : ": " + err_detail);
+    }
 
     return accumulated;
 }
@@ -377,7 +411,7 @@ std::string standalone_ai_client_t::generate_gemini(
     ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
 {
     std::string base_url = _settings.get_active_base_url();
-    std::string model = _settings.get_active_model();
+    std::string model = clean_model_name(_settings.get_active_model());
     std::string api_key = _settings.get_active_api_key();
 
     // WHY: Gemini 2.5+ models support thinkingConfig for reasoning.
@@ -939,7 +973,7 @@ nlohmann::json standalone_ai_client_t::build_openai_tools(
     const std::vector<mcp_standalone::tool_def_t>& tools)
 {
     json arr = json::array();
-
+    std::set<std::string> seen_names;  // deduplicate
 
     {
         json params = {
@@ -964,10 +998,12 @@ nlohmann::json standalone_ai_client_t::build_openai_tools(
                 {"strict", true}
             }}
         });
+        seen_names.insert("get_tool_descriptions");
     }
 
     for (auto& t : tools) {
         if (t.name == "get_tool_descriptions") continue;
+        if (!seen_names.insert(t.name).second) continue;  // skip duplicates
         json props = json::object();
         json req   = json::array();
         for (auto& p : t.params) {
@@ -999,7 +1035,7 @@ nlohmann::json standalone_ai_client_t::build_gemini_tools(
     const std::vector<mcp_standalone::tool_def_t>& tools)
 {
     json decls = json::array();
-
+    std::set<std::string> seen_names;  // deduplicate — Gemini rejects duplicate function names
 
     {
         json params = {
@@ -1016,12 +1052,18 @@ nlohmann::json standalone_ai_client_t::build_gemini_tools(
         decls.push_back({
             {"name", "get_tool_descriptions"},
             {"description", "Returns the full description and parameter schema for one or more tools."},
+            // WHY: The Google GenAI SDK sends "parametersJsonSchema" on the wire
+            // (confirmed from SDK source: functionDeclarationToVertex). The v1beta
+            // REST API accepts this field for raw JSON Schema. "parameters" is the
+            // Google Schema type field. Must match what the SDK sends exactly.
             {"parametersJsonSchema", params}
         });
+        seen_names.insert("get_tool_descriptions");
     }
 
     for (auto& t : tools) {
         if (t.name == "get_tool_descriptions") continue;
+        if (!seen_names.insert(t.name).second) continue;  // skip duplicates
         json props = json::object();
         json req   = json::array();
         for (auto& p : t.params) {
@@ -1644,7 +1686,17 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
         if (!res) { result.is_error = true; result.text = "Error: Request failed: " + httplib::to_string(res.error()); return result; }
         if (res->status != 200) {
             result.is_error = true;
-            result.text = "Error: API returned status " + std::to_string(res->status) + ": " + res->body.substr(0, 800);
+            // WHY: With content_receiver set, res->body is empty. sse_buffer has the raw error.
+            std::string err_body;
+            if (!sse_buffer.empty()) {
+                auto ej = json::parse(sse_buffer, nullptr, false);
+                if (!ej.is_discarded() && ej.contains("error") && ej["error"].is_object())
+                    err_body = ej["error"].value("message", sse_buffer.substr(0, 600));
+                else
+                    err_body = sse_buffer.substr(0, 600);
+            }
+            result.text = "Error: API returned status " + std::to_string(res->status)
+                        + (err_body.empty() ? "" : ": " + err_body);
             return result;
         }
     } else {
@@ -1743,17 +1795,36 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
         };
     }
 
-    if (!gem_tools.empty())
+    if (!gem_tools.empty()) {
         body["tools"] = gem_tools;
+        // WHY: Roo-Code always sends toolConfig with functionCallingConfig mode.
+        // Without this, some models may not call functions correctly.
+        body["toolConfig"] = {
+            {"functionCallingConfig", {
+                {"mode", "AUTO"}
+            }}
+        };
+    }
 
 
     json gen_config = {{"maxOutputTokens", 16384}};
 
-    if (_settings.enable_reasoning) {
+    // WHY: thinkingConfig is only valid for Gemini 2.5+ and thinking-capable models.
+    // Sending it to non-thinking models (like gemini-flash-latest) causes a 400 error.
+    // Match Roo-Code's approach: only enable for models that advertise support.
+    bool is_thinking_model = (model.find("2.5") != std::string::npos ||
+                              model.find("thinking") != std::string::npos ||
+                              model.find("3.1") != std::string::npos ||
+                              model.find("3-pro") != std::string::npos ||
+                              model.find("3-flash") != std::string::npos);
+
+    if (is_thinking_model && _settings.enable_reasoning) {
         gen_config["thinkingConfig"] = {
             {"thinkingBudget", (std::max)(_settings.reasoning_budget, 1024)}
         };
-    } else {
+    }
+
+    if (!is_thinking_model || !_settings.enable_reasoning) {
         gen_config["temperature"] = 0.0;
     }
 
@@ -1768,6 +1839,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
     for (auto& [k, v] : _settings.get_active_headers()) hdrs.emplace(k, v);
 
     std::string sse_buffer;
+    std::string raw_response;  // keeps ALL received bytes — never erased by SSE parser
 
     httplib::Request req;
     req.method  = "POST";
@@ -1775,9 +1847,14 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
     req.headers = hdrs;
     req.body    = body.dump();
 
+    output_log::push(bottom_tab_t::output, "[ai] Gemini POST model=" + model
+        + " tools=" + std::to_string(gem_tools.empty() ? 0 : gem_tools[0].value("functionDeclarations", json::array()).size())
+        + " body=" + std::to_string(req.body.size()) + "B");
+
     req.content_receiver = [&](const char* data, size_t len, uint64_t, uint64_t) -> bool {
         if (_cancelled) return false;
         sse_buffer.append(data, len);
+        raw_response.append(data, len);
 
         size_t pos = 0;
         while (pos < sse_buffer.size()) {
@@ -1816,15 +1893,23 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
             if (!cand.contains("content") || !cand["content"].contains("parts")) continue;
 
             for (auto& part : cand["content"]["parts"]) {
-                if (part.contains("text") && part["text"].is_string()) {
+                // WHY: Gemini returns thinking parts as {"thought": true, "text": "..."}
+                // The "thought" field is a BOOLEAN, not a string. The text is in the
+                // "text" field. Previously this checked part["thought"].is_string()
+                // which never matched, so thinking parts fell through to the regular
+                // text handler — mixing reasoning into the visible response.
+                if (part.contains("thought") && part["thought"].is_boolean() &&
+                    part["thought"].get<bool>()) {
+                    std::string th = part.value("text", "");
+                    if (!th.empty()) {
+                        result.thinking += th;
+                        if (on_chunk) on_chunk("\x01THINK:" + th);
+                    }
+                }
+                else if (part.contains("text") && part["text"].is_string()) {
                     std::string txt = part["text"].get<std::string>();
                     result.text += txt;
                     if (on_chunk) on_chunk(txt);
-                }
-                else if (part.contains("thought") && part["thought"].is_string()) {
-                    std::string th = part["thought"].get<std::string>();
-                    result.thinking += th;
-                    if (on_chunk) on_chunk("\x01THINK:" + th);
                 }
                 else if (part.contains("functionCall")) {
                     auto& fc = part["functionCall"];
@@ -1842,11 +1927,55 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
 
     auto res = client->send(req);
 
+    // WHY: httplib returns Error::Connection on transient DNS/TLS failures.
+    // Retry once with a fresh client to handle stale keep-alive or DNS cache.
+    if (!res && res.error() == httplib::Error::Connection) {
+        output_log::push(bottom_tab_t::output, "[ai] Gemini connection failed, retrying with fresh client...");
+        reset_client();
+        client = get_or_create_client(base_url);
+        sse_buffer.clear();
+        raw_response.clear();
+        result.text.clear();
+        result.thinking.clear();
+        result.tool_calls.clear();
+        res = client->send(req);
+    }
+
     if (_cancelled) { result.is_error = true; result.text = "Error: Operation cancelled."; return result; }
-    if (!res) { result.is_error = true; result.text = "Error: Request failed: " + httplib::to_string(res.error()); return result; }
+    if (!res) {
+        result.is_error = true;
+        result.text = "Error: Request failed: " + httplib::to_string(res.error())
+                    + "\nHost: " + base_url + "\nCheck your internet connection and API key.";
+        output_log::push(bottom_tab_t::output, "[ai] Gemini connection error: "
+            + httplib::to_string(res.error()) + " host=" + base_url);
+        reset_client();
+        return result;
+    }
     if (res->status != 200) {
         result.is_error = true;
-        result.text = "Error: API returned status " + std::to_string(res->status) + ": " + res->body.substr(0, 800);
+        std::string raw_err;
+        if (!raw_response.empty())
+            raw_err = raw_response;
+        else if (!res->body.empty())
+            raw_err = res->body;
+
+        std::string err_body;
+        if (!raw_err.empty()) {
+            auto ej = json::parse(raw_err, nullptr, false);
+            if (!ej.is_discarded()) {
+                if (ej.is_array() && !ej.empty()) ej = ej[0];
+                if (ej.contains("error") && ej["error"].is_object())
+                    err_body = ej["error"].value("message", raw_err.substr(0, 600));
+                else
+                    err_body = raw_err.substr(0, 600);
+            } else {
+                err_body = raw_err.substr(0, 600);
+            }
+        }
+        result.text = "Error: API returned status " + std::to_string(res->status)
+                    + (err_body.empty() ? "" : ": " + err_body);
+        output_log::push(bottom_tab_t::output, "[ai] Gemini error " + std::to_string(res->status)
+            + ": " + (err_body.empty() ? "(no error body)" : err_body));
         return result;
     }
 
@@ -1937,8 +2066,13 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
     std::string sse_buffer;
     std::string chat_path = "/v1/chat/completions";
 
-
-    if (provider == "mistral" || provider == "codestral")
+    // WHY: OpenRouter's API lives at /api/v1/... not /v1/...
+    // The non-tool generate_openrouter() already uses /api/v1/chat/completions.
+    // Without this, requests hit https://openrouter.ai/v1/chat/completions which
+    // returns 404 or redirects (POST→GET on 301), causing an empty/failed stream.
+    if (provider == "openrouter")
+        chat_path = "/api/v1/chat/completions";
+    else if (provider == "mistral" || provider == "codestral")
         chat_path = "/v1/chat/completions";
     else if (provider == "ollama")
         chat_path = "/api/chat";
@@ -1973,6 +2107,20 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
             if (payload.empty()) continue;
             auto j = json::parse(payload, nullptr, false);
             if (j.is_discarded()) continue;
+
+            // WHY: OpenRouter (and other providers) can embed error objects in the
+            // SSE stream instead of returning an HTTP error status. Without this
+            // check, errors like "model doesn't support tools" or auth failures
+            // are silently ignored, leaving gen.text empty and the message vanishing.
+            if (j.contains("error") && j["error"].is_object()) {
+                std::string err_msg = j["error"].value("message", "Unknown API error");
+                int err_code = j["error"].value("code", 0);
+                result.is_error = true;
+                result.text = "Error: " + err_msg;
+                if (err_code != 0)
+                    result.text += " (code " + std::to_string(err_code) + ")";
+                return false;
+            }
 
             if (j.contains("usage") && j["usage"].is_object()) {
                 auto& u = j["usage"];
@@ -2036,7 +2184,17 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
     if (!res) { result.is_error = true; result.text = "Error: Request failed: " + httplib::to_string(res.error()); return result; }
     if (res->status != 200) {
         result.is_error = true;
-        result.text = "Error: API returned status " + std::to_string(res->status) + ": " + res->body.substr(0, 800);
+        // WHY: With content_receiver set, res->body is empty. sse_buffer has the raw error.
+        std::string err_body;
+        if (!sse_buffer.empty()) {
+            auto ej = json::parse(sse_buffer, nullptr, false);
+            if (!ej.is_discarded() && ej.contains("error") && ej["error"].is_object())
+                err_body = ej["error"].value("message", sse_buffer.substr(0, 600));
+            else
+                err_body = sse_buffer.substr(0, 600);
+        }
+        result.text = "Error: API returned status " + std::to_string(res->status)
+                    + (err_body.empty() ? "" : ": " + err_body);
         return result;
     }
 

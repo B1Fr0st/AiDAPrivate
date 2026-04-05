@@ -37,6 +37,7 @@ struct find_state_t {
     char replace_buf[256] = {};
     bool case_sensitive   = false;
     bool whole_word       = false;
+    bool use_regex        = false;
     int  current_match    = -1;
     int  total_matches    = 0;
     std::vector<std::pair<int,int>> match_positions;

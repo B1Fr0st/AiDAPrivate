@@ -44,6 +44,7 @@ namespace output_log {
 	inline std::deque<std::string> lines[static_cast<int>(bottom_tab_t::COUNT)];
 	inline constexpr size_t MAX_LINES = 4096;
 	inline bool auto_scroll[static_cast<int>(bottom_tab_t::COUNT)] = { true, true, true, true, true };
+	inline bool select_all[static_cast<int>(bottom_tab_t::COUNT)] = { false, false, false, false, false };
 
 	inline void push(bottom_tab_t tab, const std::string& line) {
 		if (tab == bottom_tab_t::terminal) return;
@@ -53,6 +54,7 @@ namespace output_log {
 	}
 	inline void clear(bottom_tab_t tab) {
 		lines[static_cast<int>(tab)].clear();
+		select_all[static_cast<int>(tab)] = false;
 	}
 }
 
@@ -92,6 +94,9 @@ struct ChatMessage {
 	// Tool use metadata for message grouping
 	std::string tool_name;              // if this message contains a tool result
 	bool is_tool_result = false;
+
+	// Which model generated this response
+	std::string model_id;
 };
 
 inline bool  g_ai_thinking_active = false;
@@ -389,7 +394,7 @@ namespace globals
 
 
 		inline activity_item_t active_activity = activity_item_t::explorer;
-		inline constexpr float activity_bar_w = 48.f;
+		inline constexpr float activity_bar_w = 56.f;
 
 		inline center_view_t active_center_view = center_view_t::welcome;
 
@@ -471,6 +476,8 @@ namespace globals
 		inline float welcome_text_y_offset = 30.f;
 		inline bool welcome_done = false;
 
+
+		inline float dpi_scale = 1.0f;
 
 		inline bool  maximized = false;
 		inline float pre_max_x = 0.f;

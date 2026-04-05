@@ -23,10 +23,14 @@ namespace sandbox
         std::wstring working_dir;
         uint32_t     timeout_ms = 30000;
         uint64_t     max_memory = 512ULL * 1024 * 1024;
+        uint32_t     max_memory_mb = 512;
         bool         capture_stdout = true;
         bool         capture_stderr = true;
         bool         use_appcontainer = true;
         bool         allow_network = false;
+        bool         allow_clipboard = false;
+        bool         allow_gpu = false;
+        bool         cleanup_session = true;
     };
 
     struct result
@@ -187,19 +191,51 @@ namespace sandbox
 
         inline void write_wsb(const std::filesystem::path& wsb_path,
                               const std::filesystem::path& session_dir,
-                              bool allow_network)
+                              const config& cfg)
         {
             std::wofstream ofs(wsb_path, std::ios::trunc);
             const std::wstring host = session_dir.wstring();
+            const std::wstring host_input = (session_dir / L"input").wstring();
             const std::wstring guest_root = L"C:\\Users\\WDAGUtilityAccount\\Desktop\\AiDAWorkspace";
+            const std::wstring guest_input = guest_root + L"\\input";
             ofs << L"<Configuration>\n";
-            ofs << L"  <Networking>" << (allow_network ? L"Default" : L"Disable") << L"</Networking>\n";
+
+            // Network: disabled by default to prevent data exfiltration
+            ofs << L"  <Networking>" << (cfg.allow_network ? L"Default" : L"Disable") << L"</Networking>\n";
+
+            // Clipboard: disabled by default to prevent clipboard-based data theft
+            ofs << L"  <ClipboardRedirection>" << (cfg.allow_clipboard ? L"Default" : L"Disable") << L"</ClipboardRedirection>\n";
+
+            // Printer: always disabled to prevent data exfiltration via print jobs
+            ofs << L"  <PrinterRedirection>Disable</PrinterRedirection>\n";
+
+            // Audio/Video input: always disabled to prevent recording from host devices
+            ofs << L"  <AudioInput>Disable</AudioInput>\n";
+            ofs << L"  <VideoInput>Disable</VideoInput>\n";
+
+            // GPU: disabled by default to prevent GPU-based side-channel attacks
+            ofs << L"  <vGPU>" << (cfg.allow_gpu ? L"Default" : L"Disable") << L"</vGPU>\n";
+
+            // Memory limit: constrain sandbox memory usage
+            if (cfg.max_memory_mb > 0)
+                ofs << L"  <MemoryInMB>" << cfg.max_memory_mb << L"</MemoryInMB>\n";
+
             ofs << L"  <MappedFolders>\n";
+
+            // Input folder: read-only so malware cannot modify host workspace files
+            ofs << L"    <MappedFolder>\n";
+            ofs << L"      <HostFolder>" << host_input << L"</HostFolder>\n";
+            ofs << L"      <SandboxFolder>" << guest_input << L"</SandboxFolder>\n";
+            ofs << L"      <ReadOnly>true</ReadOnly>\n";
+            ofs << L"    </MappedFolder>\n";
+
+            // Session root: writable for metadata, stdout, stderr output
             ofs << L"    <MappedFolder>\n";
             ofs << L"      <HostFolder>" << host << L"</HostFolder>\n";
             ofs << L"      <SandboxFolder>" << guest_root << L"</SandboxFolder>\n";
             ofs << L"      <ReadOnly>false</ReadOnly>\n";
             ofs << L"    </MappedFolder>\n";
+
             ofs << L"  </MappedFolders>\n";
             ofs << L"  <LogonCommand>\n";
             ofs << L"    <Command>powershell.exe -ExecutionPolicy Bypass -File "
@@ -220,6 +256,17 @@ namespace sandbox
 
         if (cfg.exe_path.empty()) {
             res.error = "No executable path specified.";
+            return res;
+        }
+
+        // Validate exe_path: must be an absolute path, no null bytes or suspicious shell metacharacters
+        if (cfg.exe_path.find(L'\0') != std::wstring::npos ||
+            cfg.exe_path.find(L'`')  != std::wstring::npos ||
+            cfg.exe_path.find(L'$')  != std::wstring::npos ||
+            cfg.exe_path.find(L';')  != std::wstring::npos ||
+            cfg.exe_path.find(L'|')  != std::wstring::npos ||
+            cfg.exe_path.find(L'&')  != std::wstring::npos) {
+            res.error = "Executable path contains forbidden characters.";
             return res;
         }
 
@@ -253,7 +300,7 @@ namespace sandbox
         const std::wstring guest_exe = guest_root + L"\\input\\" + exe_path.filename().wstring();
         detail::write_runner_script(host_script, guest_root, guest_exe, cfg.arguments,
                                     cfg.timeout_ms, cfg.capture_stdout, cfg.capture_stderr);
-        detail::write_wsb(host_wsb, session_dir, cfg.allow_network);
+        detail::write_wsb(host_wsb, session_dir, cfg);
 
         STARTUPINFOW si{};
         si.cb = sizeof(si);
@@ -308,6 +355,13 @@ namespace sandbox
         res.stderr_data = cfg.capture_stderr ? detail::read_utf8_file(host_stderr) : std::string();
         res.session_dir = detail::narrow(session_dir.wstring());
         res.wsb_path = detail::narrow(host_wsb.wstring());
+
+        // Clean up session directory to remove host-side residual artifacts
+        if (cfg.cleanup_session) {
+            std::error_code ec;
+            std::filesystem::remove_all(session_dir, ec);
+        }
+
         return res;
     }
 }

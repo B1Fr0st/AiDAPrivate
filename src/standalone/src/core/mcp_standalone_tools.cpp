@@ -185,7 +185,7 @@ namespace
         const auto size = static_cast<size_t>(params.value("size", 256));
         std::vector<uint8_t> bytes;
         if (!driver_bridge::read_memory(*address, size, bytes))
-            return error("ReadProcessMemory failed.");
+            return error("Memory read failed. Ensure the kernel driver is loaded and attached.");
 
         std::string hex;
         for (uint8_t b : bytes) {
@@ -236,7 +236,7 @@ namespace
 
         driver_bridge::memory_region_t region;
         if (!driver_bridge::query_memory(*address, region))
-            return error("VirtualQueryEx failed.");
+            return error("Memory query failed. Ensure the kernel driver is loaded and attached.");
 
         json out;
         out["base"] = hex_addr(region.base);
@@ -372,6 +372,7 @@ namespace
         }
         cfg.timeout_ms = static_cast<uint32_t>(params.value("timeout_ms", g_sa_settings.sandbox.timeout_ms));
         cfg.max_memory = static_cast<uint64_t>(g_sa_settings.sandbox.memory_limit_mb) * 1024ULL * 1024ULL;
+        cfg.max_memory_mb = static_cast<uint32_t>(g_sa_settings.sandbox.memory_limit_mb);
         cfg.capture_stdout = params.value("capture_stdout", true);
         cfg.capture_stderr = params.value("capture_stderr", true);
         cfg.allow_network = g_sa_settings.sandbox.network_mode == "default";
@@ -667,11 +668,9 @@ namespace mcp_standalone
 {
     void register_standalone_tools(server_t& srv)
     {
-        srv.register_tool({"driver_status", "Show the state of the live inspection bridge and active backend.", {}, true, handle_driver_status});
+        // driver_status and driver_attach are registered by driver_tools::register_driver_tools().
+        // Only register driver_load and driver_detach here (not duplicated in driver_tools).
         srv.register_tool({"driver_load", "Load and connect the kernel driver backend for deep runtime analysis.", {}, false, handle_driver_load});
-        srv.register_tool({"driver_attach", "Attach read-only live inspection to a process by pid or name.",
-            {{"pid", "number", "Target process id", false}, {"process", "string", "Executable name such as notepad.exe", false}},
-            false, handle_driver_attach});
         srv.register_tool({"driver_detach", "Detach from the current live process.", {}, false, handle_driver_detach});
         srv.register_tool({"list_processes", "Enumerate currently running processes.",
             {{"filter", "string", "Optional substring filter", false}}, true, handle_list_processes});

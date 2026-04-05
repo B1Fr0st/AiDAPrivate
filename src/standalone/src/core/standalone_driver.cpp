@@ -227,7 +227,9 @@ namespace driver_bridge
                 device->set_base_address(image_base);
         }
 
-        unique_handle process(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
+        // Only open with QUERY rights for process name resolution.
+        // All memory R/W goes through the kernel driver exclusively.
+        unique_handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
         close_process_handle_locked();
         g_process = process.release();
         g_pid = pid;
@@ -316,6 +318,33 @@ namespace driver_bridge
         return g_process_name;
     }
 
+    struct enum_main_window_ctx {
+        DWORD pid;
+        HWND  result;
+    };
+
+    static BOOL CALLBACK find_main_window_cb(HWND hwnd, LPARAM lParam)
+    {
+        auto* ctx = reinterpret_cast<enum_main_window_ctx*>(lParam);
+        DWORD wnd_pid = 0;
+        GetWindowThreadProcessId(hwnd, &wnd_pid);
+        if (wnd_pid != ctx->pid) return TRUE;
+        if (GetWindow(hwnd, GW_OWNER)) return TRUE;
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        ctx->result = hwnd;
+        return FALSE;
+    }
+
+    static std::string get_window_title(DWORD pid)
+    {
+        enum_main_window_ctx ctx{pid, nullptr};
+        EnumWindows(find_main_window_cb, reinterpret_cast<LPARAM>(&ctx));
+        if (!ctx.result) return {};
+        wchar_t buf[256] = {};
+        if (!GetWindowTextW(ctx.result, buf, 256)) return {};
+        return utf8_from_wide(buf);
+    }
+
     std::vector<process_info_t> enumerate_processes()
     {
         std::vector<process_info_t> result;
@@ -329,14 +358,34 @@ namespace driver_bridge
         if (!Process32FirstW(snapshot.get(), &pe))
             return result;
 
+        DWORD self_pid = GetCurrentProcessId();
+
         do {
+            if (pe.th32ProcessID == 0 || pe.th32ProcessID == 4)
+                continue;
+            if (pe.th32ProcessID == self_pid)
+                continue;
+
             process_info_t proc;
-            proc.pid = pe.th32ProcessID;
+            proc.pid  = pe.th32ProcessID;
             proc.name = utf8_from_wide(pe.szExeFile);
+
+            auto hProc = make_handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID));
+            if (hProc) {
+                wchar_t path_buf[MAX_PATH] = {};
+                DWORD path_len = static_cast<DWORD>(std::size(path_buf));
+                if (QueryFullProcessImageNameW(hProc.get(), 0, path_buf, &path_len) && path_len > 0)
+                    proc.path = utf8_from_wide(path_buf);
+            }
+
+            proc.window_title = get_window_title(pe.th32ProcessID);
+
             result.push_back(std::move(proc));
         } while (Process32NextW(snapshot.get(), &pe));
 
         std::sort(result.begin(), result.end(), [](const process_info_t& a, const process_info_t& b) {
+            if (!a.window_title.empty() && b.window_title.empty()) return true;
+            if (a.window_title.empty() && !b.window_title.empty()) return false;
             return a.pid < b.pid;
         });
         return result;
@@ -432,27 +481,7 @@ namespace driver_bridge
             return result;
         }
 
-        if (!process)
-            return result;
-
-        uint64_t address = 0;
-        MEMORY_BASIC_INFORMATION mbi = {};
-        while (result.size() < max_regions &&
-               VirtualQueryEx(process, reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi)) {
-            memory_region_t region;
-            region.base = reinterpret_cast<uint64_t>(mbi.BaseAddress);
-            region.size = mbi.RegionSize;
-            region.state = mbi.State;
-            region.protect = mbi.Protect;
-            region.type = mbi.Type;
-            result.push_back(region);
-
-            const uint64_t next = region.base + region.size;
-            if (next <= address)
-                break;
-            address = next;
-        }
-
+        // No usermode fallback — kernel driver is required for memory enumeration.
         return result;
     }
 
@@ -479,19 +508,8 @@ namespace driver_bridge
             return true;
         }
 
-        if (!process)
-            return false;
-
-        MEMORY_BASIC_INFORMATION mbi = {};
-        if (VirtualQueryEx(process, reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) != sizeof(mbi))
-            return false;
-
-        region.base = reinterpret_cast<uint64_t>(mbi.BaseAddress);
-        region.size = mbi.RegionSize;
-        region.state = mbi.State;
-        region.protect = mbi.Protect;
-        region.type = mbi.Type;
-        return true;
+        // No usermode fallback — kernel driver is required for memory queries.
+        return false;
     }
 
     bool read_memory(uint64_t address, size_t size, std::vector<uint8_t>& out)
@@ -529,17 +547,8 @@ namespace driver_bridge
             return true;
         }
 
-        if (!process)
-            return false;
-
-        out.resize(size);
-        SIZE_T bytes_read = 0;
-        if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address), out.data(), size, &bytes_read) || bytes_read == 0) {
-            out.clear();
-            return false;
-        }
-        out.resize(static_cast<size_t>(bytes_read));
-        return true;
+        // No usermode fallback — kernel driver is required for memory reads.
+        return false;
     }
 
     bool read_string(uint64_t address, size_t max_length, std::string& out)

@@ -14,6 +14,8 @@ namespace driver_bridge
     struct process_info_t {
         uint32_t    pid = 0;
         std::string name;
+        std::string path;
+        std::string window_title;
     };
 
     struct module_info_t {

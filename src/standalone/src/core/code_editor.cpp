@@ -12,6 +12,7 @@
 #include <cstring>
 #include <cstdio>
 #include <mutex>
+#include <regex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -46,10 +47,17 @@ float s_target_scroll_y = 0.f;
 float s_blink_timer = 0.f;
 bool  s_blink_on    = true;
 
+bool  s_focus_find_input = false;
+bool  s_find_has_focus   = false;
+char  s_find_last_buf[256] = {};
+
 
 bool  s_mouse_selecting = false;
 float s_last_click_time = 0.f;
 int   s_click_count     = 0;
+
+bool  s_sb_dragging     = false;
+float s_sb_drag_offset  = 0.f;
 
 
 syntax::language_def_t s_lang;
@@ -91,12 +99,14 @@ void rebuild_lines() {
     const char* line_start = txt;
     while (*p) {
         if (*p == '\n') {
-            s_cache.lines.emplace_back(line_start, p);
+            const char* line_end = (p > line_start && *(p - 1) == '\r') ? p - 1 : p;
+            s_cache.lines.emplace_back(line_start, line_end);
             line_start = p + 1;
         }
         p++;
     }
-    s_cache.lines.emplace_back(line_start, p);
+    const char* line_end = (p > line_start && *(p - 1) == '\r') ? p - 1 : p;
+    s_cache.lines.emplace_back(line_start, line_end);
 
 
     s_cache.tokens.resize(s_cache.lines.size());
@@ -387,21 +397,47 @@ void find_all_matches() {
     if (s_find.find_buf[0] == '\0') return;
 
     std::string needle = s_find.find_buf;
-    if (!s_find.case_sensitive) {
-        for (auto& c : needle) c = (char)tolower((unsigned char)c);
-    }
-    int needle_len = (int)needle.size();
-    if (needle_len == 0) return;
+    if (needle.empty()) return;
 
-    for (int i = 0; i < (int)s_cache.lines.size(); i++) {
-        std::string haystack = s_cache.lines[i];
-        if (!s_find.case_sensitive) {
-            for (auto& c : haystack) c = (char)tolower((unsigned char)c);
+    if (s_find.use_regex) {
+        try {
+            auto flags = std::regex_constants::ECMAScript;
+            if (!s_find.case_sensitive)
+                flags |= std::regex_constants::icase;
+            std::regex re(needle, flags);
+            for (int i = 0; i < (int)s_cache.lines.size(); i++) {
+                const std::string& line = s_cache.lines[i];
+                auto it  = std::sregex_iterator(line.begin(), line.end(), re);
+                auto end = std::sregex_iterator();
+                for (; it != end; ++it) {
+                    if (it->length() == 0) break;
+                    s_find.match_positions.push_back({ i, (int)it->position() });
+                }
+            }
+        } catch (...) {
+            // invalid regex — no matches
         }
-        size_t pos = 0;
-        while ((pos = haystack.find(needle, pos)) != std::string::npos) {
-            s_find.match_positions.push_back({ i, (int)pos });
-            pos += needle_len;
+    } else {
+        if (!s_find.case_sensitive) {
+            for (auto& c : needle) c = (char)tolower((unsigned char)c);
+        }
+        int needle_len = (int)needle.size();
+
+        for (int i = 0; i < (int)s_cache.lines.size(); i++) {
+            std::string haystack = s_cache.lines[i];
+            if (!s_find.case_sensitive) {
+                for (auto& c : haystack) c = (char)tolower((unsigned char)c);
+            }
+            size_t pos = 0;
+            while ((pos = haystack.find(needle, pos)) != std::string::npos) {
+                if (s_find.whole_word) {
+                    bool left_ok  = (pos == 0) || !isalnum((unsigned char)haystack[pos - 1]) && haystack[pos - 1] != '_';
+                    bool right_ok = (pos + needle_len >= haystack.size()) || !isalnum((unsigned char)haystack[pos + needle_len]) && haystack[pos + needle_len] != '_';
+                    if (!left_ok || !right_ok) { pos += 1; continue; }
+                }
+                s_find.match_positions.push_back({ i, (int)pos });
+                pos += needle_len;
+            }
         }
     }
     s_find.total_matches = (int)s_find.match_positions.size();
@@ -506,8 +542,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
     if (s_request_undo)   { do_undo();   s_request_undo = false; }
     if (s_request_redo)   { do_redo();   s_request_redo = false; }
-    if (s_request_find)   { s_find.visible = true; s_find.replace_mode = false; s_request_find = false; }
-    if (s_request_replace){ s_find.visible = true; s_find.replace_mode = true;  s_request_replace = false; }
+    if (s_request_find)   { s_find.visible = true; s_find.replace_mode = false; s_request_find = false; s_focus_find_input = true; }
+    if (s_request_replace){ s_find.visible = true; s_find.replace_mode = true;  s_request_replace = false; s_focus_find_input = true; }
 
     if (!s_lang_set && !code_editor::filename.empty()) {
         s_lang = syntax::detect_language(code_editor::filename);
@@ -532,9 +568,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     syntax::get_token_colors(tok_colors, accent_r * 255.f, accent_g * 255.f, accent_b * 255.f, a);
 
 
-    const float find_bar_h = s_find.visible ? (s_find.replace_mode ? 60.f : 32.f) : 0.f;
     const float goto_bar_h = s_goto.visible ? 32.f : 0.f;
-    const float overlay_h = find_bar_h + goto_bar_h;
+    const float overlay_h = goto_bar_h;  // find bar floats over content
     const float editor_y0 = pos_y + overlay_h;
     const float editor_h  = height - overlay_h;
 
@@ -563,11 +598,28 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     ImGui::ItemSize(ImVec2(width, height));
     if (!ImGui::ItemAdd(bb, id)) return;
 
+    // Pre-compute find bar rect so we can block editor clicks over it
+    bool mouse_over_find_bar = false;
+    if (s_find.visible) {
+        const float fb_w = 340.f;
+        const float fb_h = s_find.replace_mode ? (28.f * 2 + 5.f * 3) : (28.f + 5.f * 2);
+        const float fb_x = ox + width - fb_w - 20.f;
+        const float fb_y = wpos.y + pos_y + 2.f;
+        ImVec2 mp = ImGui::GetIO().MousePos;
+        mouse_over_find_bar = (mp.x >= fb_x && mp.x <= fb_x + fb_w && mp.y >= fb_y && mp.y <= fb_y + fb_h);
+    }
 
     bool hovered = ImGui::IsMouseHoveringRect(bb.Min, bb.Max);
+    if (mouse_over_find_bar) hovered = false;
 
 
-    bool input_blocked = (file_tabs::pending_close_idx >= 0);
+    bool input_blocked = (file_tabs::pending_close_idx >= 0)
+        || globals::ui::process_attach_open
+        || globals::ui::driver_status_open
+        || globals::ui::shortcuts_dialog_open
+        || globals::ui::about_dialog_open
+        || globals::ui::mcp_servers_dialog_open
+        || globals::ui::command_palette_open;
     if (input_blocked) hovered = false;
 
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -575,8 +627,11 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         ImGui::SetFocusID(id, ImGui::GetCurrentWindow());
         s_has_focus = true;
     }
-    if (ImGui::GetActiveID() != id && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+    if (s_has_focus && !hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         s_has_focus = false;
+        if (ImGui::GetActiveID() == id)
+            ImGui::ClearActiveID();
+    }
 
 
     if (hovered) {
@@ -786,6 +841,12 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                         while (!result.empty() && (result.back() == ' ' || result.back() == '\t' || result.back() == '\r'))
                             result.pop_back();
 
+                        if (result.find("Error:") == 0 || result.find("error") == 0 ||
+                            result.find("{\"error\"") != std::string::npos ||
+                            result.find("API returned status") != std::string::npos) {
+                            result.clear();
+                        }
+
                         std::lock_guard<std::mutex> lk(s_ghost_mtx);
                         s_ghost_pending = std::move(result);
                         s_ghost_has_pending = true;
@@ -820,7 +881,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
     if ((s_has_focus || hovered) && !input_blocked) {
         ImVec2 mp = ImGui::GetIO().MousePos;
-        bool in_text = mp.x >= ox + text_x0 && mp.y >= oy && mp.y <= oy + editor_h;
+        bool in_text = mp.x >= ox + text_x0 && mp.x < ox + width - 14.f && mp.y >= oy && mp.y <= oy + editor_h;
+        if (mouse_over_find_bar) in_text = false;
 
         if (in_text && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             int ml, mc;
@@ -859,7 +921,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             s_blink_timer = 0.f; s_blink_on = true;
         }
 
-        if (s_mouse_selecting && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        if (s_mouse_selecting && !s_sb_dragging && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
             int ml, mc;
             screen_to_linecol(mp.x, mp.y, ox, oy, gutter_w, line_h, char_w, ml, mc);
             s_sel.caret_line = ml;
@@ -872,7 +934,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     }
 
 
-    if (s_has_focus && !input_blocked) {
+    if (s_has_focus && !input_blocked && !s_find_has_focus) {
         auto& io = ImGui::GetIO();
         bool ctrl  = io.KeyCtrl;
         bool shift = io.KeyShift;
@@ -903,15 +965,16 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             std::string txt = clipboard_paste();
             if (!txt.empty()) insert_text_at_caret(txt);
         }
-        else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+        else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Z, true)) {
             do_undo();
         }
-        else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Y, false)) {
+        else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Y, true)) {
             do_redo();
         }
         else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
             s_find.visible = true;
             s_find.replace_mode = false;
+            s_focus_find_input = true;
 
             if (s_sel.has_selection()) {
                 std::string sel = get_selected_text();
@@ -923,6 +986,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_H, false)) {
             s_find.visible = true;
             s_find.replace_mode = true;
+            s_focus_find_input = true;
             if (s_sel.has_selection()) {
                 std::string sel = get_selected_text();
                 if (sel.find('\n') == std::string::npos)
@@ -1213,66 +1277,226 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
 
     if (s_find.visible) {
-        float fy = wpos.y + pos_y;
-        float fw = width - 20.f;
-        ImDrawList* fdl = ImGui::GetForegroundDrawList();
-        fdl->AddRectFilled(ImVec2(ox + 10.f, fy), ImVec2(ox + 10.f + fw, fy + find_bar_h),
-            IM_COL32(30, 30, 40, (int)(240 * a)), 6.f);
-        fdl->AddRect(ImVec2(ox + 10.f, fy), ImVec2(ox + 10.f + fw, fy + find_bar_h),
-            IM_COL32(80, 80, 120, (int)(80 * a)), 6.f);
+        // ── Find bar — themed, top-right overlay ──
+        const auto& theme = themes::resolved;
+        ImVec4 accent_col(accent_r, accent_g, accent_b, 1.f);
+        ImVec4 bg     = ImGui::ColorConvertU32ToFloat4(theme.panel_header);
+        ImVec4 bg_inp = ImGui::ColorConvertU32ToFloat4(theme.bg_base);
+        ImVec4 txt1   = ImGui::ColorConvertU32ToFloat4(theme.text_primary);
+        ImVec4 txt2   = ImGui::ColorConvertU32ToFloat4(theme.text_secondary);
+        ImVec4 txt_d  = ImGui::ColorConvertU32ToFloat4(theme.text_dim);
 
-        ImGui::SetCursorPos(ImVec2(pos_x + 18.f, pos_y + 4.f));
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.1f, 0.1f, 0.14f, 0.9f));
-        ImGui::PushItemWidth(fw * 0.45f);
-        bool find_changed = ImGui::InputText("##find_input", s_find.find_buf,
-            sizeof(s_find.find_buf), ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::PopItemWidth();
+        const float row_h       = 28.f;
+        const float bar_pad_x   = 8.f;
+        const float bar_pad_y   = 5.f;
+        const float input_w     = 200.f;
+        const float btn_sz      = 26.f;
+        const float bar_w       = 340.f;
+        const float total_bar_h = s_find.replace_mode ? (row_h * 2 + bar_pad_y * 3) : (row_h + bar_pad_y * 2);
+        const float bar_x       = ox + width - bar_w - 20.f;
+        const float bar_y       = wpos.y + pos_y + 2.f;
 
-        if (find_changed || ImGui::IsItemDeactivatedAfterEdit())
-            find_all_matches();
+        ImGui::SetNextWindowPos(ImVec2(bar_x, bar_y), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(bar_w, total_bar_h), ImGuiCond_Always);
 
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Prev")) find_prev();
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Next")) find_next();
-        ImGui::SameLine();
-        if (ImGui::Checkbox("Case", &s_find.case_sensitive)) find_all_matches();
-        ImGui::SameLine();
-        char match_buf[32];
-        snprintf(match_buf, sizeof(match_buf), "%d/%d",
-                 s_find.current_match + 1, s_find.total_matches);
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.7f, a), "%s", match_buf);
-        ImGui::SameLine();
-        if (ImGui::SmallButton("X##close_find")) s_find.visible = false;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(bar_pad_x, bar_pad_y));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.f);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3.f, 3.f));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, bg);
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(accent_col.x, accent_col.y, accent_col.z, 0.35f));
 
-        if (s_find.replace_mode) {
-            ImGui::SetCursorPos(ImVec2(pos_x + 18.f, pos_y + 30.f));
-            ImGui::PushItemWidth(fw * 0.45f);
-            ImGui::InputText("##replace_input", s_find.replace_buf, sizeof(s_find.replace_buf));
-            ImGui::PopItemWidth();
+        ImGuiWindowFlags find_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_AlwaysAutoResize;
+
+        bool find_open = true;
+        ImGui::Begin("##find_bar", &find_open, find_flags);
+        s_find_has_focus = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+
+        // Helper: toggle button (highlighted when active)
+        auto toggle_button = [&](const char* label, bool& state, const char* id_suffix, const char* tooltip) -> bool {
+            ImGui::PushID(id_suffix);
+            ImVec2 sz(btn_sz, row_h);
+            bool was = state;
+            if (state) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(accent_col.x, accent_col.y, accent_col.z, 0.25f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(accent_col.x, accent_col.y, accent_col.z, 0.35f));
+                ImGui::PushStyleColor(ImGuiCol_Text, accent_col);
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.f, 0.f, 0.f, 0.f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(txt2.x, txt2.y, txt2.z, 0.4f));
+                ImGui::PushStyleColor(ImGuiCol_Text, txt2);
+            }
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+            if (ImGui::Button(label, sz)) state = !state;
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(3);
+            if (tooltip) ImGui::SetItemTooltip("%s", tooltip);
+            ImGui::PopID();
+            return state != was;
+        };
+
+        // Helper: icon-style button
+        auto icon_button = [&](const char* label, const char* id_suffix, const char* tooltip, float w = 26.f) -> bool {
+            ImGui::PushID(id_suffix);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.f, 0.f, 0.f, 0.f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(txt_d.x, txt_d.y, txt_d.z, 0.3f));
+            ImGui::PushStyleColor(ImGuiCol_Text, txt2);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+            bool clicked = ImGui::Button(label, ImVec2(w, row_h));
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(3);
+            if (tooltip) ImGui::SetItemTooltip("%s", tooltip);
+            ImGui::PopID();
+            return clicked;
+        };
+
+        // ── ROW 1: Chevron | FindInput | Aa | results | × ──
+        {
+            const char* chev = s_find.replace_mode ? "v" : ">";
+            if (icon_button(chev, "chevron", "Toggle Replace", 20.f))
+                s_find.replace_mode = !s_find.replace_mode;
             ImGui::SameLine();
-            if (ImGui::SmallButton("Replace")) replace_current();
-            ImGui::SameLine();
-            if (ImGui::SmallButton("All")) replace_all();
         }
 
-        ImGui::PopStyleColor();
-        ImGui::PopStyleVar();
+        // Find input
+        {
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, (row_h - ImGui::GetFontSize()) * 0.5f - 1.f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, bg_inp);
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(bg_inp.x + 0.03f, bg_inp.y + 0.03f, bg_inp.z + 0.03f, bg_inp.w));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(bg_inp.x + 0.05f, bg_inp.y + 0.05f, bg_inp.z + 0.05f, bg_inp.w));
+            ImGui::PushStyleColor(ImGuiCol_Text, txt1);
+            ImGui::PushItemWidth(input_w);
+            if (s_focus_find_input) {
+                ImGui::SetKeyboardFocusHere();
+                s_focus_find_input = false;
+            }
+            bool enter_pressed = ImGui::InputText("##find_input", s_find.find_buf,
+                sizeof(s_find.find_buf), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+            bool edited = ImGui::IsItemEdited();
+            ImGui::PopItemWidth();
+            ImGui::PopStyleColor(4);
+            ImGui::PopStyleVar(2);
 
+            // Live search as you type — auto-navigate to first match
+            if (edited && strcmp(s_find.find_buf, s_find_last_buf) != 0) {
+                memcpy(s_find_last_buf, s_find.find_buf, sizeof(s_find.find_buf));
+                find_all_matches();
+                if (!s_find.match_positions.empty()) {
+                    s_find.current_match = -1;
+                    find_next();
+                    ensure_caret_visible(editor_h, line_h);
+                }
+            }
 
-        if (find_changed) find_next();
+            // Enter = next, Shift+Enter = prev
+            if (enter_pressed) {
+                if (ImGui::GetIO().KeyShift)
+                    find_prev();
+                else
+                    find_next();
+                ensure_caret_visible(editor_h, line_h);
+                s_focus_find_input = true;  // re-focus input after Enter
+            }
+            ImGui::SameLine();
+        }
+
+        // Case sensitive toggle
+        if (toggle_button("Aa", s_find.case_sensitive, "case", "Match Case")) {
+            find_all_matches();
+            if (!s_find.match_positions.empty()) {
+                s_find.current_match = -1;
+                find_next();
+                ensure_caret_visible(editor_h, line_h);
+            }
+        }
+        ImGui::SameLine();
+
+        // Results count
+        {
+            char match_buf[32];
+            if (s_find.find_buf[0] == '\0') {
+                match_buf[0] = '\0';
+            } else if (s_find.total_matches == 0) {
+                snprintf(match_buf, sizeof(match_buf), "No results");
+            } else {
+                snprintf(match_buf, sizeof(match_buf), "%d of %d",
+                         s_find.current_match >= 0 ? s_find.current_match + 1 : 0, s_find.total_matches);
+            }
+            if (match_buf[0]) {
+                bool no_match = (s_find.total_matches == 0 && s_find.find_buf[0] != '\0');
+                ImVec4 mc = no_match ? ImVec4(0.9f, 0.3f, 0.3f, 0.9f) : txt2;
+                ImGui::PushStyleColor(ImGuiCol_Text, mc);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (row_h - ImGui::GetFontSize()) * 0.5f);
+                ImGui::TextUnformatted(match_buf);
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+            }
+        }
+
+        // Close
+        if (icon_button("\xc3\x97", "close", "Close (Esc)")) {
+            s_find.visible = false;
+            s_find_has_focus = false;
+            s_has_focus = true;
+        }
+
+        // ── ROW 2: Replace ──
+        if (s_find.replace_mode) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 22.f);
+
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, (row_h - ImGui::GetFontSize()) * 0.5f - 1.f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, bg_inp);
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(bg_inp.x + 0.03f, bg_inp.y + 0.03f, bg_inp.z + 0.03f, bg_inp.w));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(bg_inp.x + 0.05f, bg_inp.y + 0.05f, bg_inp.z + 0.05f, bg_inp.w));
+            ImGui::PushStyleColor(ImGuiCol_Text, txt1);
+            ImGui::PushItemWidth(input_w);
+            ImGui::InputText("##replace_input", s_find.replace_buf, sizeof(s_find.replace_buf));
+            ImGui::PopItemWidth();
+            ImGui::PopStyleColor(4);
+            ImGui::PopStyleVar(2);
+            ImGui::SameLine();
+
+            if (icon_button("R1", "repl_one", "Replace"))    replace_current();
+            ImGui::SameLine();
+            if (icon_button("R*", "repl_all", "Replace All")) replace_all();
+        }
+
+        // Escape closes
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            s_find.visible = false;
+            s_find_has_focus = false;
+            s_has_focus = true;
+        }
+
+        ImGui::End();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(4);
+
+        // Subtle shadow below
+        ImDrawList* fdl = ImGui::GetForegroundDrawList();
+        fdl->AddRectFilledMultiColor(
+            ImVec2(bar_x + 4.f, bar_y + total_bar_h),
+            ImVec2(bar_x + bar_w - 4.f, bar_y + total_bar_h + 6.f),
+            IM_COL32(0, 0, 0, (int)(40 * a)), IM_COL32(0, 0, 0, (int)(40 * a)),
+            IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
+    } else {
+        s_find_has_focus = false;
     }
 
 
     if (s_goto.visible) {
-        float gy = wpos.y + pos_y + find_bar_h;
+        float gy = wpos.y + pos_y;
         float gw = 200.f;
         ImDrawList* fdl = ImGui::GetForegroundDrawList();
         fdl->AddRectFilled(ImVec2(ox + 10.f, gy), ImVec2(ox + 10.f + gw, gy + 30.f),
             IM_COL32(30, 30, 40, (int)(240 * a)), 6.f);
 
-        ImGui::SetCursorPos(ImVec2(pos_x + 18.f, pos_y + find_bar_h + 4.f));
+        ImGui::SetCursorPos(ImVec2(pos_x + 18.f, pos_y + 4.f));
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
         ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.1f, 0.1f, 0.14f, 0.9f));
         ImGui::PushItemWidth(120.f);
@@ -1291,6 +1515,73 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 s_sel.active = false;
                 ensure_caret_visible(editor_h, line_h);
                 s_goto.visible = false;
+            }
+        }
+    }
+
+    // ── Vertical scrollbar (matches disasm_view / hex_view style) ──
+    {
+        float total_content = n_lines * line_h;
+        if (total_content > editor_h) {
+            const float sb_w   = 10.f;
+            const float sb_pad = 2.f;
+            float track_x  = ox + width - sb_w - sb_pad;
+            float track_y0 = oy + sb_pad;
+            float track_h  = editor_h - sb_pad * 2.f;
+
+            float ratio       = editor_h / total_content;
+            float thumb_h     = std::max(20.f, track_h * ratio);
+            float scroll_range = total_content - editor_h;
+            float thumb_y     = track_y0 + (scroll_range > 0.f
+                ? (s_scroll_y / scroll_range) * (track_h - thumb_h) : 0.f);
+
+            bool sb_hov = ImGui::IsMouseHoveringRect(
+                ImVec2(track_x - 4.f, track_y0),
+                ImVec2(track_x + sb_w + 4.f, track_y0 + track_h));
+
+            ImGuiID sb_hov_id = ImGui::GetID("##code_sb_hov");
+            float sb_a = ImGui::GetStateStorage()->GetFloat(sb_hov_id, 0.f);
+            sb_a += ((sb_hov || s_sb_dragging ? 1.f : 0.f) - sb_a) * std::min(14.f * dt, 1.f);
+            ImGui::GetStateStorage()->SetFloat(sb_hov_id, sb_a);
+
+            if (sb_a > 0.01f) {
+                // Track background
+                dl->AddRectFilled(ImVec2(track_x, track_y0),
+                    ImVec2(track_x + sb_w, track_y0 + track_h),
+                    IM_COL32(255, 255, 255, (int)(8.f * sb_a * a)), 3.f);
+
+                // Thumb
+                bool thumb_hov = ImGui::IsMouseHoveringRect(
+                    ImVec2(track_x - 2.f, thumb_y),
+                    ImVec2(track_x + sb_w + 2.f, thumb_y + thumb_h));
+                int thumb_alpha = thumb_hov || s_sb_dragging
+                    ? (int)(120.f * sb_a * a) : (int)(60.f * sb_a * a);
+                dl->AddRectFilled(ImVec2(track_x, thumb_y),
+                    ImVec2(track_x + sb_w, thumb_y + thumb_h),
+                    IM_COL32(200, 200, 220, thumb_alpha), 3.f);
+            }
+
+            if (sb_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                float my = ImGui::GetIO().MousePos.y;
+                if (my < thumb_y || my > thumb_y + thumb_h) {
+                    float click_ratio = (my - track_y0 - thumb_h * 0.5f) / (track_h - thumb_h);
+                    click_ratio = std::max(0.f, std::min(1.f, click_ratio));
+                    s_target_scroll_y = click_ratio * scroll_range;
+                }
+                s_sb_dragging = true;
+                s_sb_drag_offset = ImGui::GetIO().MousePos.y - thumb_y;
+            }
+
+            if (s_sb_dragging) {
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    float my = ImGui::GetIO().MousePos.y - s_sb_drag_offset;
+                    float drag_ratio = (my - track_y0) / (track_h - thumb_h);
+                    drag_ratio = std::max(0.f, std::min(1.f, drag_ratio));
+                    s_target_scroll_y = drag_ratio * scroll_range;
+                    s_scroll_y = s_target_scroll_y;
+                } else {
+                    s_sb_dragging = false;
+                }
             }
         }
     }

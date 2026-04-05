@@ -791,9 +791,18 @@ void run_agentic(std::string user_message,
         try {
             gen = g_sa_ai_client->generate_with_tools(messages, system_prompt, local_tools,
                 [](const std::string& chunk) {
-
-                    if (!chunk.empty() && chunk[0] != '\x01')
+                    if (chunk.empty()) return;
+                    // WHY: DeepSeek-R1 via OpenRouter streams ALL initial output as
+                    // reasoning_content tokens, prefixed with \x01THINK: by the AI
+                    // client. Previously these were silently discarded here, so the
+                    // user saw "Thinking..." with no text for 10-30s, then nothing.
+                    // Now we forward them as THINKING updates for real-time display.
+                    if (chunk.size() > 7 && chunk[0] == '\x01' &&
+                        chunk.compare(0, 7, "\x01THINK:") == 0) {
+                        post_update(ai_update_t::THINKING, chunk.substr(7));
+                    } else if (chunk[0] != '\x01') {
                         post_update(ai_update_t::CHUNK, chunk);
+                    }
                 });
         } catch (const std::exception& e) {
             output_log::push(bottom_tab_t::output, std::string("[ai] Exception: ") + e.what());
@@ -824,8 +833,14 @@ void run_agentic(std::string user_message,
 
 
         if (gen.tool_calls.empty()) {
-
-            if (gen.text.empty() && !gen.thinking.empty())
+            // WHY: When both text and thinking are empty (e.g. wrong API path
+            // caused an empty stream, or model returned nothing), posting only
+            // COMPLETE leaves msg.text empty and msg.streaming=false. The UI
+            // condition (!msg.text.empty() || msg.streaming) then hides the
+            // message entirely — it "vanishes". This ensures something is shown.
+            if (gen.text.empty() && gen.thinking.empty())
+                post_update(ai_update_t::CHUNK, "No response received from the model. Check your API key, model name, and network connection.");
+            else if (gen.text.empty() && !gen.thinking.empty())
                 post_update(ai_update_t::CHUNK, "(thinking only — no text output)");
             post_update(ai_update_t::COMPLETE);
             return;
@@ -1243,6 +1258,13 @@ void tick_ai_chat()
     ai.streaming      = true;
     ai.thinking_text  = "";
     ai.text           = "";
+    {
+        auto* prof = g_sa_settings.get_active_profile();
+        if (prof)
+            ai.model_id = prof->display_name + " / " + prof->model;
+        else
+            ai.model_id = g_sa_settings.get_active_model();
+    }
     g_chat_messages.push_back(ai);
     g_chat_scroll_to_bottom = true;
 
@@ -1435,7 +1457,8 @@ void render_tool_approval_dialog()
 
 void render_settings_inline(float panel_w, float panel_h)
 {
-    if (!g_settings_open) return;
+    // Note: caller manages visibility (handles slide animation),
+    // so we no longer early-return based on g_settings_open alone.
 
     const float ax = globals::ui::accent.x, ay = globals::ui::accent.y, az = globals::ui::accent.z;
     const ImU32 accent_col   = IM_COL32(static_cast<int>(ax*255), static_cast<int>(ay*255), static_cast<int>(az*255), 255);

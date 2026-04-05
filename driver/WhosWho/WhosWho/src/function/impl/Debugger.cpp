@@ -73,6 +73,9 @@ namespace dbg_guard {
 namespace trapframe_ctx {
 
     constexpr ULONG KTHREAD_TRAPFRAME_OFFSET = 0x90;
+    constexpr ULONG KTHREAD_DEBUG_ACTIVE     = 0x03;
+    constexpr ULONG DR7_USER_MASK            = 0xFFFF0355;
+    constexpr ULONG DR7_ACTIVE_BITS          = 0x0355;
 
 
     constexpr ULONG TF_RAX    = 0x30;
@@ -103,12 +106,17 @@ namespace trapframe_ctx {
             PUCHAR kthread = (PUCHAR)thread;
             PUCHAR tf = *(PUCHAR*)(kthread + KTHREAD_TRAPFRAME_OFFSET);
 
+            WW_LOG("trapframe_ctx::get_context: KTHREAD=0x%p TrapFrame=0x%p", kthread, tf);
+
             if (!tf || !_MmIsAddressValid(tf) || !_MmIsAddressValid(tf + TF_SEGSS + 7)) {
+                WW_LOG("trapframe_ctx::get_context: TrapFrame invalid (ptr=0x%p valid=%u)",
+                    tf, tf ? (_MmIsAddressValid(tf) ? 1u : 0u) : 0u);
                 return STATUS_UNSUCCESSFUL;
             }
 
 
             UINT16 cs_check = *(UINT16*)(tf + TF_SEGCS);
+            WW_LOG("trapframe_ctx::get_context: CS=0x%X (need 0x33 for user-mode)", cs_check);
             if (cs_check != 0x33) {
                 PUCHAR user_tf = nullptr;
 
@@ -148,12 +156,21 @@ namespace trapframe_ctx {
             request->rflags = (UINT64)*(UINT32*)(tf + TF_EFLAGS);
             request->cs  = (UINT64)*(UINT16*)(tf + TF_SEGCS);
             request->ss  = (UINT64)*(UINT16*)(tf + TF_SEGSS);
-            request->dr0 = *(UINT64*)(tf + TF_DR0);
-            request->dr1 = *(UINT64*)(tf + TF_DR1);
-            request->dr2 = *(UINT64*)(tf + TF_DR2);
-            request->dr3 = *(UINT64*)(tf + TF_DR3);
-            request->dr6 = *(UINT64*)(tf + TF_DR6);
-            request->dr7 = *(UINT64*)(tf + TF_DR7);
+
+            UINT8 debug_active = *(volatile UINT8*)(kthread + KTHREAD_DEBUG_ACTIVE);
+            if (debug_active & 0x01) {
+                request->dr0 = *(UINT64*)(tf + TF_DR0);
+                request->dr1 = *(UINT64*)(tf + TF_DR1);
+                request->dr2 = *(UINT64*)(tf + TF_DR2);
+                request->dr3 = *(UINT64*)(tf + TF_DR3);
+                request->dr6 = *(UINT64*)(tf + TF_DR6);
+                request->dr7 = *(UINT64*)(tf + TF_DR7);
+            } else {
+                request->dr0 = 0; request->dr1 = 0;
+                request->dr2 = 0; request->dr3 = 0;
+                request->dr6 = 0; request->dr7 = 0;
+                WW_LOG("trapframe_ctx::get_context: DebugActive=0x%02X, DR values not saved by kernel", debug_active);
+            }
 
 
             request->rbx = *(UINT64*)(tf + TF_RBX);
@@ -219,8 +236,22 @@ namespace trapframe_ctx {
             if (mask & (1ULL << 20)) *(UINT64*)(tf + TF_DR2) = request->dr2;
             if (mask & (1ULL << 21)) *(UINT64*)(tf + TF_DR3) = request->dr3;
             if (mask & (1ULL << 22)) *(UINT64*)(tf + TF_DR6) = request->dr6;
-            if (mask & (1ULL << 23)) *(UINT64*)(tf + TF_DR7) = request->dr7;
+            if (mask & (1ULL << 23)) {
+                UINT64 sanitized = request->dr7 & DR7_USER_MASK;
+                *(UINT64*)(tf + TF_DR7) = sanitized;
+            }
 
+            constexpr UINT64 DR_MASK = (1ULL<<18)|(1ULL<<19)|(1ULL<<20)|(1ULL<<21)|(1ULL<<22)|(1ULL<<23);
+            if (mask & DR_MASK) {
+                UINT64 dr7_val = *(UINT64*)(tf + TF_DR7);
+                volatile LONG* header = reinterpret_cast<volatile LONG*>(kthread);
+                if (dr7_val & DR7_ACTIVE_BITS)
+                    _interlockedbittestandset(header, 24);
+                else
+                    _interlockedbittestandreset(header, 24);
+                WW_LOG("trapframe_ctx::set_context: DR7=0x%llX DebugActive %s",
+                    dr7_val, (dr7_val & DR7_ACTIVE_BITS) ? "SET" : "CLEAR");
+            }
 
             return STATUS_SUCCESS;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -296,17 +327,24 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
 
             if (_PsSuspendThread) {
                 suspend_status = _PsSuspendThread(thread, &prev_count);
+                WW_LOG("handle_thread_ctx: suspend via PsSuspendThread status=0x%08X prev=%u", suspend_status, prev_count);
             } else if (_ZwSuspendThread) {
                 suspend_status = _ZwSuspendThread(ctx_thread_handle, &prev_count);
+                WW_LOG("handle_thread_ctx: suspend via ZwSuspendThread status=0x%08X prev=%u", suspend_status, prev_count);
             } else if (ssdt_resolver::resolve_suspend_resume()) {
                 suspend_status = ssdt_resolver::call_NtSuspendThread(ctx_thread_handle, &prev_count);
+                WW_LOG("handle_thread_ctx: suspend via SSDT NtSuspendThread status=0x%08X prev=%u", suspend_status, prev_count);
+            } else {
+                WW_LOG0("handle_thread_ctx: NO suspension method available");
             }
 
             if (NT_SUCCESS(suspend_status)) {
                 ctx_thread_suspended = TRUE;
             } else {
+                WW_LOG("handle_thread_ctx: suspension FAILED status=0x%08X", suspend_status);
             }
         } else {
+            WW_LOG("handle_thread_ctx: ObOpenObjectByPointer failed status=0x%08X", open_status);
         }
     }
 
@@ -318,122 +356,117 @@ NTSTATUS functions::handle_thread_ctx(p_thread_ctx request) {
     BOOLEAN has_ps_set = (_PsSetContextThread != nullptr);
     BOOLEAN has_nt_context = (ctx_thread_handle != nullptr) && ssdt_resolver::resolve_thread_context();
 
+    WW_LOG("handle_thread_ctx: capabilities: ps_get=%u ps_set=%u nt_ctx=%u suspended=%u handle=0x%p",
+        has_ps_get, has_ps_set, has_nt_context, ctx_thread_suspended, ctx_thread_handle);
+
     if (request->should_set == 0) {
 
-        ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
-        status = STATUS_PROCEDURE_NOT_FOUND;
-        if (has_ps_get) {
-            status = _PsGetContextThread(thread, &ctx, KernelMode);
-        }
-
-        if (!NT_SUCCESS(status) && has_nt_context) {
-            status = ssdt_resolver::call_NtGetContextThread(ctx_thread_handle, &ctx);
-        }
+        WW_LOG0("handle_thread_ctx: GET — trying KTRAP_FRAME first");
+        status = trapframe_ctx::get_context(thread, request);
 
         if (!NT_SUCCESS(status)) {
+            WW_LOG("handle_thread_ctx: trapframe GET failed 0x%08X, trying APC fallback", status);
+            ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
             status = STATUS_PROCEDURE_NOT_FOUND;
-        }
+            if (has_ps_get) {
+                status = _PsGetContextThread(thread, &ctx, KernelMode);
+                WW_LOG("handle_thread_ctx: PsGetContextThread status=0x%08X rip=0x%llX",
+                    status, NT_SUCCESS(status) ? ctx.Rip : 0ULL);
+            }
 
-        if (NT_SUCCESS(status)) {
-            request->rax = ctx.Rax;
-            request->rbx = ctx.Rbx;
-            request->rcx = ctx.Rcx;
-            request->rdx = ctx.Rdx;
-            request->rsi = ctx.Rsi;
-            request->rdi = ctx.Rdi;
-            request->rbp = ctx.Rbp;
-            request->rsp = ctx.Rsp;
-            request->r8  = ctx.R8;
-            request->r9  = ctx.R9;
-            request->r10 = ctx.R10;
-            request->r11 = ctx.R11;
-            request->r12 = ctx.R12;
-            request->r13 = ctx.R13;
-            request->r14 = ctx.R14;
-            request->r15 = ctx.R15;
-            request->rip = ctx.Rip;
-            request->rflags = ctx.EFlags;
-            request->cs  = ctx.SegCs;
-            request->ss  = ctx.SegSs;
-            request->dr0 = ctx.Dr0;
-            request->dr1 = ctx.Dr1;
-            request->dr2 = ctx.Dr2;
-            request->dr3 = ctx.Dr3;
-            request->dr6 = ctx.Dr6;
-            request->dr7 = ctx.Dr7;
+            if (!NT_SUCCESS(status) && has_nt_context) {
+                status = ssdt_resolver::call_NtGetContextThread(ctx_thread_handle, &ctx);
+                WW_LOG("handle_thread_ctx: SSDT NtGetContextThread status=0x%08X rip=0x%llX",
+                    status, NT_SUCCESS(status) ? ctx.Rip : 0ULL);
+            }
+
+            if (NT_SUCCESS(status)) {
+                request->rax = ctx.Rax;
+                request->rbx = ctx.Rbx;
+                request->rcx = ctx.Rcx;
+                request->rdx = ctx.Rdx;
+                request->rsi = ctx.Rsi;
+                request->rdi = ctx.Rdi;
+                request->rbp = ctx.Rbp;
+                request->rsp = ctx.Rsp;
+                request->r8  = ctx.R8;
+                request->r9  = ctx.R9;
+                request->r10 = ctx.R10;
+                request->r11 = ctx.R11;
+                request->r12 = ctx.R12;
+                request->r13 = ctx.R13;
+                request->r14 = ctx.R14;
+                request->r15 = ctx.R15;
+                request->rip = ctx.Rip;
+                request->rflags = ctx.EFlags;
+                request->cs  = ctx.SegCs;
+                request->ss  = ctx.SegSs;
+                request->dr0 = ctx.Dr0;
+                request->dr1 = ctx.Dr1;
+                request->dr2 = ctx.Dr2;
+                request->dr3 = ctx.Dr3;
+                request->dr6 = ctx.Dr6;
+                request->dr7 = ctx.Dr7;
+            }
         } else {
-
-
-            status = trapframe_ctx::get_context(thread, request);
+            WW_LOG("handle_thread_ctx: trapframe GET OK rip=0x%llX rsp=0x%llX", request->rip, request->rsp);
         }
     }
     else {
 
-        ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
-        status = STATUS_PROCEDURE_NOT_FOUND;
-        if (has_ps_get) {
-            status = _PsGetContextThread(thread, &ctx, KernelMode);
-        }
-
-        if (!NT_SUCCESS(status) && has_nt_context) {
-            status = ssdt_resolver::call_NtGetContextThread(ctx_thread_handle, &ctx);
-        }
+        WW_LOG0("handle_thread_ctx: SET — trying KTRAP_FRAME first");
+        status = trapframe_ctx::set_context(thread, request);
 
         if (!NT_SUCCESS(status)) {
-            status = STATUS_PROCEDURE_NOT_FOUND;
-        }
-
-        if (NT_SUCCESS(status)) {
-
-            UINT64 mask = request->register_mask;
-            if (mask & (1ULL << 0))  ctx.Rax    = request->rax;
-            if (mask & (1ULL << 1))  ctx.Rbx    = request->rbx;
-            if (mask & (1ULL << 2))  ctx.Rcx    = request->rcx;
-            if (mask & (1ULL << 3))  ctx.Rdx    = request->rdx;
-            if (mask & (1ULL << 4))  ctx.Rsi    = request->rsi;
-            if (mask & (1ULL << 5))  ctx.Rdi    = request->rdi;
-            if (mask & (1ULL << 6))  ctx.Rbp    = request->rbp;
-            if (mask & (1ULL << 7))  ctx.Rsp    = request->rsp;
-            if (mask & (1ULL << 8))  ctx.R8     = request->r8;
-            if (mask & (1ULL << 9))  ctx.R9     = request->r9;
-            if (mask & (1ULL << 10)) ctx.R10    = request->r10;
-            if (mask & (1ULL << 11)) ctx.R11    = request->r11;
-            if (mask & (1ULL << 12)) ctx.R12    = request->r12;
-            if (mask & (1ULL << 13)) ctx.R13    = request->r13;
-            if (mask & (1ULL << 14)) ctx.R14    = request->r14;
-            if (mask & (1ULL << 15)) ctx.R15    = request->r15;
-            if (mask & (1ULL << 16)) ctx.Rip    = request->rip;
-            if (mask & (1ULL << 17)) ctx.EFlags = (ULONG)request->rflags;
-            if (mask & (1ULL << 18)) ctx.Dr0    = request->dr0;
-            if (mask & (1ULL << 19)) ctx.Dr1    = request->dr1;
-            if (mask & (1ULL << 20)) ctx.Dr2    = request->dr2;
-            if (mask & (1ULL << 21)) ctx.Dr3    = request->dr3;
-            if (mask & (1ULL << 22)) ctx.Dr6    = request->dr6;
-            if (mask & (1ULL << 23)) ctx.Dr7    = request->dr7;
+            WW_LOG("handle_thread_ctx: trapframe SET failed 0x%08X, trying APC fallback", status);
 
             ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
-            status = STATUS_PROCEDURE_NOT_FOUND;
-            if (has_ps_set) {
-                status = _PsSetContextThread(thread, &ctx, KernelMode);
+            NTSTATUS get_status = STATUS_PROCEDURE_NOT_FOUND;
+            if (has_ps_get) {
+                get_status = _PsGetContextThread(thread, &ctx, KernelMode);
+            }
+            if (!NT_SUCCESS(get_status) && has_nt_context) {
+                get_status = ssdt_resolver::call_NtGetContextThread(ctx_thread_handle, &ctx);
             }
 
-            if (!NT_SUCCESS(status) && has_nt_context) {
-                status = ssdt_resolver::call_NtSetContextThread(ctx_thread_handle, &ctx);
-            }
+            if (NT_SUCCESS(get_status)) {
+                UINT64 mask = request->register_mask;
+                if (mask & (1ULL << 0))  ctx.Rax    = request->rax;
+                if (mask & (1ULL << 1))  ctx.Rbx    = request->rbx;
+                if (mask & (1ULL << 2))  ctx.Rcx    = request->rcx;
+                if (mask & (1ULL << 3))  ctx.Rdx    = request->rdx;
+                if (mask & (1ULL << 4))  ctx.Rsi    = request->rsi;
+                if (mask & (1ULL << 5))  ctx.Rdi    = request->rdi;
+                if (mask & (1ULL << 6))  ctx.Rbp    = request->rbp;
+                if (mask & (1ULL << 7))  ctx.Rsp    = request->rsp;
+                if (mask & (1ULL << 8))  ctx.R8     = request->r8;
+                if (mask & (1ULL << 9))  ctx.R9     = request->r9;
+                if (mask & (1ULL << 10)) ctx.R10    = request->r10;
+                if (mask & (1ULL << 11)) ctx.R11    = request->r11;
+                if (mask & (1ULL << 12)) ctx.R12    = request->r12;
+                if (mask & (1ULL << 13)) ctx.R13    = request->r13;
+                if (mask & (1ULL << 14)) ctx.R14    = request->r14;
+                if (mask & (1ULL << 15)) ctx.R15    = request->r15;
+                if (mask & (1ULL << 16)) ctx.Rip    = request->rip;
+                if (mask & (1ULL << 17)) ctx.EFlags = (ULONG)request->rflags;
+                if (mask & (1ULL << 18)) ctx.Dr0    = request->dr0;
+                if (mask & (1ULL << 19)) ctx.Dr1    = request->dr1;
+                if (mask & (1ULL << 20)) ctx.Dr2    = request->dr2;
+                if (mask & (1ULL << 21)) ctx.Dr3    = request->dr3;
+                if (mask & (1ULL << 22)) ctx.Dr6    = request->dr6;
+                if (mask & (1ULL << 23)) ctx.Dr7    = request->dr7;
 
-            if (!NT_SUCCESS(status)) {
+                ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
                 status = STATUS_PROCEDURE_NOT_FOUND;
+                if (has_ps_set) {
+                    status = _PsSetContextThread(thread, &ctx, KernelMode);
+                }
+                if (!NT_SUCCESS(status) && has_nt_context) {
+                    status = ssdt_resolver::call_NtSetContextThread(ctx_thread_handle, &ctx);
+                }
             }
-
-
-            if (!NT_SUCCESS(status)) {
-                status = trapframe_ctx::set_context(thread, request);
-            }
-
         } else {
-
-
-            status = trapframe_ctx::set_context(thread, request);
+            WW_LOG0("handle_thread_ctx: trapframe SET OK");
         }
     }
 

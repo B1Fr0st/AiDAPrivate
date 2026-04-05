@@ -32,8 +32,10 @@ static const CHAR* const AIDA_NET_BUILD_TAG = "2026-03-13-netdbg-r6-pidfix";
 #define IPPROTO_UDP 17
 #endif
 
+#define FWPS_INJECTION_TYPE_STREAM    0x00000001
 #define FWPS_INJECTION_TYPE_TRANSPORT 0x00000002
-#define FWPS_INJECTION_TYPE_NETWORK  0x00000001
+#define FWPS_INJECTION_TYPE_NETWORK   0x00000004
+#define FWPS_INJECTION_TYPE_FORWARD   0x00000008
 
 typedef struct _AIDA_WSACMSGHDR {
     SIZE_T cmsg_len;
@@ -3191,10 +3193,16 @@ namespace net_inject {
 
         if (_FwpsInjectionHandleCreate0) {
             NTSTATUS st = _FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_TRANSPORT, &g_inject_handle_v4);
+            AIDA_NET_LOG("inject: FwpsInjectionHandleCreate0(TRANSPORT) status=0x%08X handle=0x%p",
+                (UINT32)st, g_inject_handle_v4);
             if (!NT_SUCCESS(st)) g_inject_handle_v4 = nullptr;
 
             st = _FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_NETWORK, &g_inject_handle_net_v4);
+            AIDA_NET_LOG("inject: FwpsInjectionHandleCreate0(NETWORK) status=0x%08X handle=0x%p",
+                (UINT32)st, g_inject_handle_net_v4);
             if (!NT_SUCCESS(st)) g_inject_handle_net_v4 = nullptr;
+        } else {
+            AIDA_NET_LOG("inject: FwpsInjectionHandleCreate0 not resolved (fwp_base=0x%p)", fwp_base);
         }
 
         KeMemoryBarrier();

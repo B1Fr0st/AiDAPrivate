@@ -849,7 +849,7 @@ static void test_packet_mod_rules() {
     report("list_packet_mod_rules()", true, detail);
 
     if (ok && rule_id != 0) {
-        ok = device->packet_mod_rule_op(2, rule_id);
+        ok = device->packet_mod_rule_op(1, rule_id);
         report("packet_mod_rule_op(remove)", ok);
     } else {
         skip("packet_mod_rule_op(remove)", "add failed or no rule_id");
@@ -876,7 +876,7 @@ static void test_traffic_redirect() {
     report("list_redirect_rules()", true, detail);
 
     if (ok && rule_id != 0) {
-        ok = device->traffic_redirect_op(2, rule_id);
+        ok = device->traffic_redirect_op(1, rule_id);
         report("traffic_redirect_op(remove)", ok);
     } else {
         skip("traffic_redirect_op(remove)", "add failed");
@@ -913,7 +913,7 @@ static void test_stream_reassembly() {
         printf("\n");
     }
 
-    ok = device->stream_reassemble_op(1);
+    ok = device->stream_reassemble_op(1, 80, 0);
     report("stream_reassemble_op(stop)", ok);
 }
 
@@ -1015,7 +1015,7 @@ static void test_dns_spoofing() {
     report("list_dns_spoof_rules()", true, detail);
 
     if (ok && rule_id != 0) {
-        ok = device->dns_spoof_op(2, rule_id);
+        ok = device->dns_spoof_op(1, rule_id);
         report("dns_spoof_op(remove)", ok);
     } else {
         skip("dns_spoof_op(remove)", "add failed");
@@ -1157,17 +1157,48 @@ static void test_dll_protection() {
     std::uint32_t e_lfanew = device->read<std::uint32_t>(base + 0x3C);
     std::uint64_t nt_hdr = base + e_lfanew;
 
+    std::uint16_t num_sections = device->read<std::uint16_t>(nt_hdr + 4 + 2);
     std::uint16_t opt_hdr_size = device->read<std::uint16_t>(nt_hdr + 4 + 16);
     std::uint64_t first_section = nt_hdr + 4 + 20 + opt_hdr_size;
 
-    std::uint32_t text_vsize = device->read<std::uint32_t>(first_section + 8);
-    std::uint32_t text_rva = device->read<std::uint32_t>(first_section + 12);
+    std::uint32_t text_vsize = 0;
+    std::uint32_t text_rva = 0;
+
+    for (std::uint16_t s = 0; s < num_sections && s < 64; s++) {
+        std::uint64_t sec = first_section + static_cast<std::uint64_t>(s) * 40;
+        char sec_name[9] = {};
+        for (int c = 0; c < 8; c++)
+            sec_name[c] = static_cast<char>(device->read<std::uint8_t>(sec + c));
+
+        std::uint32_t vsize = device->read<std::uint32_t>(sec + 8);
+        std::uint32_t rva   = device->read<std::uint32_t>(sec + 12);
+        std::uint32_t chars = device->read<std::uint32_t>(sec + 36);
+
+        printf("  [INFO] Section[%u]: name=%.8s vsize=0x%X rva=0x%X chars=0x%X\n",
+               s, sec_name, vsize, rva, chars);
+
+        if (std::strcmp(sec_name, ".text") == 0 ||
+            (text_vsize == 0 && (chars & 0x20))) {
+            text_vsize = vsize;
+            text_rva = rva;
+            if (text_vsize == 0)
+                text_vsize = device->read<std::uint32_t>(sec + 16);
+        }
+    }
+
     std::uint64_t text_va = base + text_rva;
 
     char detail[256];
     snprintf(detail, sizeof(detail), "text_va=0x%llX text_size=0x%X",
              (unsigned long long)text_va, text_vsize);
     printf("  [INFO] PE sections: %s\n", detail);
+
+    if (text_vsize == 0) {
+        skip("register_dll_protection()", "could not find .text section (vsize=0)");
+        skip("query_dll_protection()", "no registration");
+        skip("unregister_dll_protection()", "no registration");
+        return;
+    }
 
 
     bool ok = device->register_dll_protection(base, text_va, text_vsize,
@@ -1270,10 +1301,10 @@ int main() {
     test_process_info(base);
 
 
-    test_input();
-
-
     test_remote_call(base, found_pid);
+
+
+    test_input();
 
 
     printf("\n  [INFO] === Beginning network tests ===\n");

@@ -1,4 +1,5 @@
 #include "chat_render.hpp"
+#include "../ide_icons.h"
 
 #include <algorithm>
 #include <cmath>
@@ -208,7 +209,7 @@ float chat_render::render_code_block(
         IM_COL32(140, 140, 170, (int)(180 * alpha)), lang_label.c_str());
 
 
-    const char* copy_label = "Copy";
+    const char* copy_label = ICON_COPY;
     ImVec2 cts = ImGui::CalcTextSize(copy_label);
     ImVec2 cmin(hmax.x - cts.x - 16.f, hmin.y + 1.f);
     ImVec2 cmax(hmax.x - 4.f, hmin.y + header_h - 1.f);
@@ -322,48 +323,68 @@ chat_render::render_result_t chat_render::render_rich_message(
     float cursor_y = cy + 5.f;
     float base_x   = cx + 8.f;
 
+    // WHY: Word-by-word inline renderer. All inline spans (text, bold, italic,
+    // inline_code) share cursor_x/cursor_y so they flow together on the same line.
+    // The old code rendered each text span as a full-width paragraph which broke
+    // around inline code pills (e.g. "variable `has_kernel` is false" would put
+    // "has_kernel" on its own line instead of flowing inline).
+    auto render_inline_words = [&](const std::string& txt, ImU32 color) {
+        const char* p   = txt.c_str();
+        const char* end = p + txt.size();
+        float space_w   = ImGui::CalcTextSize(" ").x;
+
+        while (p < end) {
+            if (*p == '\n') {
+                cursor_y += line_h;
+                cursor_x = base_x;
+                p++;
+                continue;
+            }
+            if (*p == '\r') { p++; continue; }
+
+            if (*p == ' ') {
+                // Only add space if we've already rendered something on this line
+                if (cursor_x > base_x)
+                    cursor_x += space_w;
+                p++;
+                continue;
+            }
+
+            const char* word_start = p;
+            while (p < end && *p != ' ' && *p != '\n' && *p != '\r')
+                p++;
+
+            ImVec2 ws = ImGui::CalcTextSize(word_start, p);
+            float remaining = (base_x + wrap_w) - cursor_x;
+            if (ws.x > remaining && cursor_x > base_x) {
+                cursor_y += line_h;
+                cursor_x = base_x;
+            }
+
+            dl->AddText(ImVec2(cursor_x, cursor_y), color, word_start, p);
+            cursor_x += ws.x;
+        }
+    };
+
     for (const auto& span : spans) {
         switch (span.type) {
         case span_type::text: {
-
-            ImVec2 ts = ImGui::CalcTextSize(span.text.c_str(), nullptr, false, wrap_w);
-            dl->AddText(ImGui::GetFont(), font_size,
-                ImVec2(cursor_x, cursor_y), text_col,
-                span.text.c_str(), nullptr, wrap_w);
-            cursor_y += ts.y;
-            cursor_x = base_x;
+            render_inline_words(span.text, text_col);
             break;
         }
 
         case span_type::bold: {
-
-            ImVec2 ts = ImGui::CalcTextSize(span.text.c_str(), nullptr, false, wrap_w);
-            dl->AddText(ImGui::GetFont(), font_size,
-                ImVec2(cursor_x, cursor_y), bold_col,
-                span.text.c_str(), nullptr, wrap_w);
-            cursor_y += ts.y;
-            cursor_x = base_x;
+            render_inline_words(span.text, bold_col);
             break;
         }
 
         case span_type::italic: {
-
-            ImVec2 ts = ImGui::CalcTextSize(span.text.c_str(), nullptr, false, wrap_w);
-            dl->AddText(ImGui::GetFont(), font_size,
-                ImVec2(cursor_x + 1.f, cursor_y), italic_col,
-                span.text.c_str(), nullptr, wrap_w);
-            cursor_y += ts.y;
-            cursor_x = base_x;
+            render_inline_words(span.text, italic_col);
             break;
         }
 
         case span_type::bold_italic: {
-            ImVec2 ts = ImGui::CalcTextSize(span.text.c_str(), nullptr, false, wrap_w);
-            dl->AddText(ImGui::GetFont(), font_size,
-                ImVec2(cursor_x, cursor_y), bold_col,
-                span.text.c_str(), nullptr, wrap_w);
-            cursor_y += ts.y;
-            cursor_x = base_x;
+            render_inline_words(span.text, bold_col);
             break;
         }
 
@@ -373,10 +394,9 @@ chat_render::render_result_t chat_render::render_rich_message(
             float pill_w = ts.x + 8.f;
             float pill_h = ts.y + 4.f;
 
-
-            float remaining = max_w - (cursor_x - cx) - 8.f;
+            float remaining = (base_x + wrap_w) - cursor_x;
             if (pill_w > remaining && cursor_x > base_x) {
-                cursor_y += font_size + 2.f;
+                cursor_y += line_h;
                 cursor_x = base_x;
             }
 
@@ -500,63 +520,56 @@ chat_render::render_result_t chat_render::render_rich_message(
         ImVec2 msg_min = origin;
         ImVec2 msg_max(origin.x + max_w, origin.y + msg_h);
 
-
         float btn_h = 20.f;
-        ImVec2 hover_max(msg_max.x, msg_max.y + btn_h + 4.f);
-        bool msg_hov = ImGui::IsMouseHoveringRect(msg_min, hover_max);
+        float btn_y = msg_max.y + 12.f;
 
-        ImGuiID act_id = ImGui::GetID(("msg_act_" + std::to_string(msg_idx)).c_str());
-        float   act_a  = ImGui::GetStateStorage()->GetFloat(act_id, 0.f);
-        act_a += ((msg_hov ? 1.f : 0.f) - act_a) * std::min(10.f * dt, 1.f);
-        ImGui::GetStateStorage()->SetFloat(act_id, act_a);
+        // Always show Copy and Retry buttons at the bottom-right
+        const char* labels[] = { ICON_COPY, ICON_SPINNER };
+        action_t actions[] = { action_t::copy, action_t::retry };
 
-
-        if (act_a > 0.01f) {
-            dl->AddRectFilled(msg_min, msg_max,
-                IM_COL32((int)(accent_r * 40), (int)(accent_g * 40), (int)(accent_b * 40),
-                         (int)(act_a * 12.f * alpha)), 4.f);
+        // Calculate total width of buttons first for right-alignment
+        float btn_gap = 12.f;
+        float total_btn_w = 0.f;
+        float btn_widths[2];
+        for (int bi = 0; bi < 2; bi++) {
+            ImVec2 lts = ImGui::CalcTextSize(labels[bi]);
+            btn_widths[bi] = lts.x + 10.f;
+            total_btn_w += btn_widths[bi];
         }
+        total_btn_w += btn_gap; // gap between buttons
 
-        if (act_a > 0.02f) {
-            float btn_y = msg_max.y + 2.f;
+        float bx = msg_max.x - total_btn_w - 8.f;
 
-            const char* labels[] = { "Copy", "Retry", "Edit", "Del" };
-            action_t actions[] = { action_t::copy, action_t::retry, action_t::edit_msg, action_t::delete_msg };
-            float bx = origin.x + 8.f;
+        for (int bi = 0; bi < 2; bi++) {
+            float bw = btn_widths[bi];
+            ImVec2 bmin(bx, btn_y);
+            ImVec2 bmax(bx + bw, btn_y + btn_h);
+            bool bhov = ImGui::IsMouseHoveringRect(bmin, bmax);
 
-            for (int bi = 0; bi < 2; bi++) {
-                ImVec2 lts = ImGui::CalcTextSize(labels[bi]);
-                float bw = lts.x + 10.f;
-                ImVec2 bmin(bx, btn_y);
-                ImVec2 bmax(bx + bw, btn_y + btn_h);
-                bool bhov = ImGui::IsMouseHoveringRect(bmin, bmax);
+            ImGuiID btn_id = ImGui::GetID(("msg_btn_" + std::to_string(msg_idx) + "_" + std::to_string(bi)).c_str());
+            float btn_anim = ImGui::GetStateStorage()->GetFloat(btn_id, 0.f);
+            btn_anim += ((bhov ? 1.f : 0.f) - btn_anim) * std::min(12.f * dt, 1.f);
+            ImGui::GetStateStorage()->SetFloat(btn_id, btn_anim);
 
+            float bg_alpha = (100.f + btn_anim * 80.f) * alpha;
+            dl->AddRectFilled(bmin, bmax,
+                IM_COL32(40, 38, 60, (int)bg_alpha), 4.f);
 
-                ImGuiID btn_id = ImGui::GetID(("msg_btn_" + std::to_string(msg_idx) + "_" + std::to_string(bi)).c_str());
-                float btn_anim = ImGui::GetStateStorage()->GetFloat(btn_id, 0.f);
-                btn_anim += ((bhov ? 1.f : 0.f) - btn_anim) * std::min(12.f * dt, 1.f);
-                ImGui::GetStateStorage()->SetFloat(btn_id, btn_anim);
+            float text_alpha = (140.f + btn_anim * 80.f) * alpha;
+            dl->AddText(ImVec2(bmin.x + 5.f, bmin.y + 2.f),
+                IM_COL32(160, 158, 190, (int)text_alpha),
+                labels[bi]);
 
-                float bg_alpha = (120.f + btn_anim * 80.f) * act_a * alpha;
-                dl->AddRectFilled(bmin, bmax,
-                    IM_COL32(40, 38, 60, (int)bg_alpha), 4.f);
-
-                float text_alpha = (160.f + btn_anim * 80.f) * act_a * alpha;
-                dl->AddText(ImVec2(bmin.x + 5.f, bmin.y + 2.f),
-                    IM_COL32(160, 158, 190, (int)text_alpha),
-                    labels[bi]);
-
-                if (bhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                    result.action = actions[bi];
-                    if (result.action == action_t::copy)
-                        ImGui::SetClipboardText(text.c_str());
-                }
-
-                bx += bw + 4.f;
+            if (bhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                result.action = actions[bi];
+                if (result.action == action_t::copy)
+                    ImGui::SetClipboardText(text.c_str());
             }
 
-            result.height += btn_h + 4.f;
+            bx += bw + btn_gap;
         }
+
+        result.height += btn_h + 14.f;
 
 
         if (ImGui::IsMouseHoveringRect(msg_min, msg_max) &&
