@@ -3,7 +3,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
@@ -88,7 +87,6 @@ static DWORD WINAPI net_thread_tcp_http(LPVOID ) {
 
         int rc = getaddrinfo("example.com", "80", &hints, &result);
         if (rc != 0 || !result) {
-            fprintf(stderr, "[target] DNS resolve failed for example.com: %d\n", rc);
             Sleep(5000);
             continue;
         }
@@ -128,10 +126,6 @@ static DWORD WINAPI net_thread_tcp_http(LPVOID ) {
             total += n;
         }
         buf[total] = '\0';
-
-        if (total > 0) {
-            fprintf(stderr, "[target] TCP HTTP received %d bytes from example.com\n", total);
-        }
 
         closesocket(sock);
 
@@ -184,10 +178,7 @@ static DWORD WINAPI net_thread_udp(LPVOID ) {
 
         if (select(0, &readfds, nullptr, nullptr, &tv) > 0) {
             char resp[512];
-            int n = recvfrom(sock, resp, sizeof(resp), 0, nullptr, nullptr);
-            if (n > 0) {
-                fprintf(stderr, "[target] UDP DNS response: %d bytes from 8.8.8.8\n", n);
-            }
+            recvfrom(sock, resp, sizeof(resp), 0, nullptr, nullptr);
         }
 
         closesocket(sock);
@@ -216,7 +207,6 @@ static DWORD WINAPI net_thread_tcp_listener(LPVOID ) {
 
     int addrlen = sizeof(addr);
     getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addrlen);
-    fprintf(stderr, "[target] TCP listener on port %u\n", ntohs(addr.sin_port));
 
     listen(listener, 5);
 
@@ -351,10 +341,7 @@ static DWORD WINAPI net_thread_tls(LPVOID ) {
         FD_SET(sock, &readfds);
         timeval tv{2, 0};
         if (select(0, &readfds, nullptr, nullptr, &tv) > 0) {
-            int n = recv(sock, buf, sizeof(buf), 0);
-            if (n > 0) {
-                fprintf(stderr, "[target] TLS response: %d bytes from dns.google:443\n", n);
-            }
+            recv(sock, buf, sizeof(buf), 0);
         }
 
         closesocket(sock);
@@ -368,29 +355,18 @@ static DWORD WINAPI net_thread_tls(LPVOID ) {
 
 
 int main() {
-    fprintf(stderr, "=== WhosWho Test Target Process ===\n");
-    fprintf(stderr, "PID: %lu\n", GetCurrentProcessId());
-    fprintf(stderr, "Image Base: 0x%p\n", GetModuleHandleW(nullptr));
-    fprintf(stderr, "Generating network traffic for driver testing...\n");
-    fprintf(stderr, "Signal Global\\WhosWhoTestDone or wait for timeout to exit.\n\n");
-
-
     WSADATA wsa_data{};
     int wsa_rc = WSAStartup(MAKEWORD(2, 2), &wsa_data);
     if (wsa_rc != 0) {
-        fprintf(stderr, "[FATAL] WSAStartup failed: %d\n", wsa_rc);
         return 1;
     }
 
 
     g_done_event = CreateEventW(nullptr, TRUE, FALSE, L"Global\\WhosWhoTestDone");
     if (!g_done_event) {
-        DWORD err = GetLastError();
-        fprintf(stderr, "[target] CreateEvent Global\\ failed err=%lu, trying Local\\\n", err);
         g_done_event = CreateEventW(nullptr, TRUE, FALSE, L"Local\\WhosWhoTestDone");
     }
     if (!g_done_event) {
-        fprintf(stderr, "[target] CreateEvent Local\\ also failed, using unnamed event\n");
         g_done_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     }
 
@@ -425,17 +401,7 @@ int main() {
     threads.push_back(CreateThread(nullptr, 0, net_thread_tcp_local, nullptr, 0, nullptr));
     threads.push_back(CreateThread(nullptr, 0, net_thread_tls, nullptr, 0, nullptr));
 
-    fprintf(stderr, "[target] %llu threads launched (4 workers + 5 network)\n",
-            static_cast<unsigned long long>(threads.size()));
-
-
     DWORD wait_result = WaitForSingleObject(g_done_event, 10 * 60 * 1000);
-
-    if (wait_result == WAIT_OBJECT_0) {
-        fprintf(stderr, "\n[target] Shutdown signaled via event.\n");
-    } else {
-        fprintf(stderr, "\n[target] Timeout reached, shutting down.\n");
-    }
 
 
     g_shutdown.store(true, std::memory_order_release);
@@ -461,6 +427,5 @@ int main() {
 
     WSACleanup();
 
-    fprintf(stderr, "[target] Clean shutdown complete.\n");
     return 0;
 }

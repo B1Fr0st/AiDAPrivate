@@ -2,11 +2,6 @@
 #include "driver/Strong.h"
 #include <imports/Defs.h>
 
-#ifndef WW_LOG
-#define WW_LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] " fmt "\n", __VA_ARGS__)
-#define WW_LOG0(msg) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] %s\n", msg)
-#endif
-
 namespace mem_guard {
     inline volatile ULONG g_mem_entropy = 0xC0DEBEEFu;
 
@@ -31,15 +26,11 @@ namespace mem_guard {
 
 NTSTATUS functions::handle777e(p_physical_rw request) {
     if (!request) {
-        WW_LOG0("handle777e: null request");
         return STATUS_INVALID_PARAMETER;
     }
 
     mem_guard::timing_scatter();
 
-    WW_LOG("handle777e: dtb=0x%llX addr=%p size=%llu write=%u buffer=%p",
-        request->dtb, request->address, (UINT64)request->size,
-        (UINT32)request->shouldWrite, request->buffer);
 
     if (!request->buffer || request->size == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -120,9 +111,6 @@ NTSTATUS functions::handle777e(p_physical_rw request) {
 
     request->retSize = total_bytes_transferred;
 
-    WW_LOG("handle777e: transferred=%llu/%llu status=%s",
-        (UINT64)total_bytes_transferred, (UINT64)request->size,
-        (total_bytes_transferred > 0) ? "SUCCESS" : "FAIL");
 
     return (total_bytes_transferred > 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }

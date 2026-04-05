@@ -9,12 +9,6 @@
 #include <ndis/nblapi.h>
 #include <fwpmk.h>
 
-#ifndef AIDA_NET_LOG0
-#define AIDA_NET_LOG0(msg) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[AiDA-Net] %s\n", msg)
-#define AIDA_NET_LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[AiDA-Net] " fmt "\n", __VA_ARGS__)
-#endif
-
-static const CHAR* const AIDA_NET_BUILD_TAG = "2026-03-13-netdbg-r6-pidfix";
 
 #ifndef AF_INET
 #define AF_INET 2
@@ -394,10 +388,6 @@ namespace net_capture {
     inline volatile LONG g_total_dns = 0;
 
 
-    inline volatile LONG g_dbg_inbound_seen = 0;
-    inline volatile LONG g_dbg_outbound_seen = 0;
-
-
     #define MAX_FILTER_RULES 64
     typedef struct _ACTIVE_FILTER_RULE {
         UINT32 rule_id;
@@ -449,7 +439,6 @@ namespace net_capture {
             PNET_BUFFER_LIST nbl = (PNET_BUFFER_LIST)layerData;
             PNET_BUFFER first_nb = NET_BUFFER_LIST_FIRST_NB(nbl);
             if (!first_nb) {
-                AIDA_NET_LOG("copy_transport_bytes: missing first net buffer nbl=%p", nbl);
                 return 0;
             }
 
@@ -466,8 +455,6 @@ namespace net_capture {
             while (mdl && copied < copy_len) {
                 PUCHAR mapped = (PUCHAR)MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority | MdlMappingNoExecute);
                 if (!mapped) {
-                    AIDA_NET_LOG("copy_transport_bytes: mdl map failed nb=%p mdl=%p copied=%lu target=%lu",
-                        first_nb, mdl, copied, copy_len);
                     break;
                 }
 
@@ -487,16 +474,10 @@ namespace net_capture {
             }
 
             if (copied == 0 && NET_BUFFER_CURRENT_MDL(first_nb)) {
-                AIDA_NET_LOG("copy_transport_bytes: copied zero bytes nb=%p data_len=%lu mdl=%p mdl_off=%lu",
-                    first_nb,
-                    data_length,
-                    NET_BUFFER_CURRENT_MDL(first_nb),
-                    NET_BUFFER_CURRENT_MDL_OFFSET(first_nb));
             }
 
             return copied;
         } __except(EXCEPTION_EXECUTE_HANDLER) {
-            AIDA_NET_LOG0("copy_transport_bytes: exception");
             return 0;
         }
     }
@@ -573,7 +554,7 @@ namespace net_capture {
 
         UINT32 effective_pid = pid;
         if (effective_pid == 0 && g_filter_pid != 0) {
-            effective_pid = g_filter_pid;
+            return; // Cannot determine packet owner; drop rather than misattribute
         }
 
 
@@ -640,7 +621,7 @@ namespace net_capture {
 
         UINT32 effective_pid = pid;
         if (effective_pid == 0 && g_filter_pid != 0) {
-            effective_pid = g_filter_pid;
+            return; // Cannot determine DNS entry owner; drop rather than misattribute
         }
 
         KIRQL old_irql;
@@ -779,17 +760,6 @@ namespace net_capture {
         classifyOut->actionType = FWP_ACTION_PERMIT_;
 
         if (!inFixedValues || !inMetaValues) return;
-        {
-            LONG seen_entry = _InterlockedIncrement(&g_dbg_inbound_seen);
-            if (seen_entry <= 8 || (seen_entry % 256) == 0) {
-                AIDA_NET_LOG("classify_inbound entry seen=%ld layer=%u values=%u meta=0x%08X layerData=%p",
-                    seen_entry,
-                    (UINT32)inFixedValues->layerId,
-                    inFixedValues->valueCount,
-                    inMetaValues->currentMetadataValues,
-                    layerData);
-            }
-        }
         if (!should_process_packet_pipeline()) return;
 
         __try {
@@ -837,14 +807,6 @@ namespace net_capture {
                 aida_store_cached_port_pid(protocol, remote_port, pid);
             }
 
-            LONG seen = g_dbg_inbound_seen;
-            if (seen <= 8 || (seen & 0x3FF) == 1) {
-                AIDA_NET_LOG("classify_inbound sample seen=%ld cap=%ld pid=%u proto=%u lport=%u rport=%u endpoint=%p",
-                    seen, g_capture_active, pid, protocol, local_port, remote_port,
-                    (PVOID)(ULONG_PTR)inMetaValues->transportEndpointHandle);
-            }
-
-
             _InterlockedIncrement64(&g_global_pkts_recv);
 
 
@@ -861,8 +823,6 @@ namespace net_capture {
 
             pkt_len = copy_transport_bytes(layerData, pkt_data, NET_PKT_MAX_PAYLOAD);
             if (pkt_len == 0 && layerData) {
-                AIDA_NET_LOG("classify_inbound: zero transport bytes pid=%u proto=%u lport=%u rport=%u layer=%u",
-                    pid, protocol, local_port, remote_port, (UINT32)inFixedValues->layerId);
             }
             _InterlockedExchangeAdd64(&g_global_bytes_recv, (LONG64)pkt_len);
 
@@ -914,7 +874,6 @@ namespace net_capture {
                 }
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
-            AIDA_NET_LOG0("classify_inbound: exception");
         }
     }
 
@@ -936,17 +895,6 @@ namespace net_capture {
         classifyOut->actionType = FWP_ACTION_PERMIT_;
 
         if (!inFixedValues || !inMetaValues) return;
-        {
-            LONG seen_entry = _InterlockedIncrement(&g_dbg_outbound_seen);
-            if (seen_entry <= 8 || (seen_entry % 256) == 0) {
-                AIDA_NET_LOG("classify_outbound entry seen=%ld layer=%u values=%u meta=0x%08X layerData=%p",
-                    seen_entry,
-                    (UINT32)inFixedValues->layerId,
-                    inFixedValues->valueCount,
-                    inMetaValues->currentMetadataValues,
-                    layerData);
-            }
-        }
         if (!should_process_packet_pipeline()) return;
 
         __try {
@@ -994,13 +942,6 @@ namespace net_capture {
                 aida_store_cached_port_pid(protocol, remote_port, pid);
             }
 
-            LONG seen = g_dbg_outbound_seen;
-            if (seen <= 8 || (seen & 0x3FF) == 1) {
-                AIDA_NET_LOG("classify_outbound sample seen=%ld cap=%ld pid=%u proto=%u lport=%u rport=%u endpoint=%p",
-                    seen, g_capture_active, pid, protocol, local_port, remote_port,
-                    (PVOID)(ULONG_PTR)inMetaValues->transportEndpointHandle);
-            }
-
             _InterlockedIncrement64(&g_global_pkts_sent);
 
             UINT32 rule_action = check_filter_rules(1, protocol, pid, local_port, remote_port, remote_ip, 2);
@@ -1015,8 +956,6 @@ namespace net_capture {
 
             pkt_len = copy_transport_bytes(layerData, pkt_data, NET_PKT_MAX_PAYLOAD);
             if (pkt_len == 0 && layerData) {
-                AIDA_NET_LOG("classify_outbound: zero transport bytes pid=%u proto=%u lport=%u rport=%u layer=%u",
-                    pid, protocol, local_port, remote_port, (UINT32)inFixedValues->layerId);
             }
             _InterlockedExchangeAdd64(&g_global_bytes_sent, (LONG64)pkt_len);
 
@@ -1065,7 +1004,6 @@ namespace net_capture {
                 }
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
-            AIDA_NET_LOG0("classify_outbound: exception");
         }
     }
 
@@ -1215,14 +1153,12 @@ namespace net_capture {
     }
 
     BOOLEAN resolve_wfp_functions() {
-        AIDA_NET_LOG0("resolve_wfp_functions: begin");
         PVOID fwp_base = find_module_base("FWPKCLNT.SYS");
         if (!fwp_base) {
 
             fwp_base = find_module_base("fwpkclnt.sys");
         }
         if (!fwp_base) {
-            AIDA_NET_LOG0("resolve_wfp_functions: fwpkclnt.sys not found");
             return FALSE;
         }
 
@@ -1258,24 +1194,15 @@ namespace net_capture {
                 _FwpmEngineOpen0 && _FwpmEngineClose0 &&
                 _FwpmTransactionBegin0 && _FwpmTransactionCommit0 &&
                 _FwpmCalloutAdd0 && _FwpmSubLayerAdd0 && _FwpmFilterAdd0);
-        AIDA_NET_LOG("resolve_wfp_functions: done ok=%u base=%p", ok ? 1u : 0u, fwp_base);
         return ok;
     }
 
 
     NTSTATUS register_wfp(PDEVICE_OBJECT devObj) {
         if (!devObj) {
-            AIDA_NET_LOG0("register_wfp: invalid device object");
             return STATUS_INVALID_PARAMETER;
         }
         g_device_object = devObj;
-        AIDA_NET_LOG("register_wfp: begin devObj=%p", devObj);
-        AIDA_NET_LOG("register_wfp: abi sizes FWP_VALUE0=%Iu FWP_CONDITION_VALUE0=%Iu FWPM_FILTER0=%Iu FWPM_CALLOUT0=%Iu FWPM_SUBLAYER0=%Iu",
-            sizeof(FWP_VALUE0_COMPAT),
-            sizeof(FWP_CONDITION_VALUE0_COMPAT),
-            sizeof(FWPM_FILTER0_COMPAT),
-            sizeof(FWPM_CALLOUT0_COMPAT),
-            sizeof(FWPM_SUBLAYER0_COMPAT));
 
         NTSTATUS status;
 
@@ -1283,14 +1210,12 @@ namespace net_capture {
         status = _FwpmEngineOpen0(nullptr, 0x0000000A ,
             nullptr, nullptr, &g_engine_handle);
         if (!NT_SUCCESS(status)) {
-            AIDA_NET_LOG("register_wfp: FwpmEngineOpen0 failed status=0x%08X", (UINT32)status);
             return status;
         }
 
 
         status = _FwpmTransactionBegin0(g_engine_handle, 0);
         if (!NT_SUCCESS(status)) {
-            AIDA_NET_LOG("register_wfp: FwpmTransactionBegin0 failed status=0x%08X", (UINT32)status);
             _FwpmEngineClose0(g_engine_handle);
             g_engine_handle = nullptr;
             return status;
@@ -1311,7 +1236,6 @@ namespace net_capture {
 
         status = _FwpmSubLayerAdd0(g_engine_handle, &sublayer, nullptr);
         if (!NT_SUCCESS(status)) {
-            AIDA_NET_LOG("register_wfp: FwpmSubLayerAdd0 failed status=0x%08X", (UINT32)status);
             _FwpmTransactionAbort0(g_engine_handle);
             _FwpmEngineClose0(g_engine_handle);
             g_engine_handle = nullptr;
@@ -1328,7 +1252,6 @@ namespace net_capture {
 
         status = _FwpsCalloutRegister2(devObj, &callout_in, &g_callout_id_inbound);
         if (!NT_SUCCESS(status)) {
-            AIDA_NET_LOG("register_wfp: inbound FwpsCalloutRegister2 failed status=0x%08X", (UINT32)status);
             _FwpmTransactionAbort0(g_engine_handle);
             _FwpmEngineClose0(g_engine_handle);
             g_engine_handle = nullptr;
@@ -1345,7 +1268,6 @@ namespace net_capture {
 
         status = _FwpsCalloutRegister2(devObj, &callout_out, &g_callout_id_outbound);
         if (!NT_SUCCESS(status)) {
-            AIDA_NET_LOG("register_wfp: outbound FwpsCalloutRegister2 failed status=0x%08X", (UINT32)status);
             _FwpsCalloutUnregisterById0(g_callout_id_inbound);
             _FwpmTransactionAbort0(g_engine_handle);
             _FwpmEngineClose0(g_engine_handle);
@@ -1368,7 +1290,6 @@ namespace net_capture {
 
         status = _FwpmCalloutAdd0(g_engine_handle, &fwpm_callout_in, nullptr, &unused_id);
         if (!NT_SUCCESS(status)) {
-            AIDA_NET_LOG("register_wfp: inbound FwpmCalloutAdd0 failed status=0x%08X", (UINT32)status);
             _FwpsCalloutUnregisterById0(g_callout_id_inbound);
             _FwpsCalloutUnregisterById0(g_callout_id_outbound);
             _FwpmTransactionAbort0(g_engine_handle);
@@ -1384,7 +1305,6 @@ namespace net_capture {
 
         status = _FwpmCalloutAdd0(g_engine_handle, &fwpm_callout_out, nullptr, &unused_id);
         if (!NT_SUCCESS(status)) {
-            AIDA_NET_LOG("register_wfp: outbound FwpmCalloutAdd0 failed status=0x%08X", (UINT32)status);
             _FwpsCalloutUnregisterById0(g_callout_id_inbound);
             _FwpsCalloutUnregisterById0(g_callout_id_outbound);
             _FwpmTransactionAbort0(g_engine_handle);
@@ -1410,16 +1330,8 @@ namespace net_capture {
         filter_in.action.type = FWP_ACTION_CALLOUT_TERMINATING_;
         filter_in.action.calloutKey = GUID_AIDA_CALLOUT_INBOUND;
         filter_in.numFilterConditions = 0;
-        AIDA_NET_LOG("register_wfp: add inbound filter layer=%p sublayer=%p providerData=%p weightType=%u actionType=0x%08X",
-            &filter_in.layerKey,
-            &filter_in.subLayerKey,
-            filter_in.providerData,
-            filter_in.weight.type,
-            filter_in.action.type);
-
         status = _FwpmFilterAdd0(g_engine_handle, &filter_in, nullptr, &g_filter_id_inbound);
         if (!NT_SUCCESS(status)) {
-            AIDA_NET_LOG("register_wfp: inbound FwpmFilterAdd0 failed status=0x%08X", (UINT32)status);
             _FwpsCalloutUnregisterById0(g_callout_id_inbound);
             _FwpsCalloutUnregisterById0(g_callout_id_outbound);
             _FwpmTransactionAbort0(g_engine_handle);
@@ -1437,16 +1349,8 @@ namespace net_capture {
         filter_out.action.type = FWP_ACTION_CALLOUT_TERMINATING_;
         filter_out.action.calloutKey = GUID_AIDA_CALLOUT_OUTBOUND;
         filter_out.numFilterConditions = 0;
-        AIDA_NET_LOG("register_wfp: add outbound filter layer=%p sublayer=%p providerData=%p weightType=%u actionType=0x%08X",
-            &filter_out.layerKey,
-            &filter_out.subLayerKey,
-            filter_out.providerData,
-            filter_out.weight.type,
-            filter_out.action.type);
-
         status = _FwpmFilterAdd0(g_engine_handle, &filter_out, nullptr, &g_filter_id_outbound);
         if (!NT_SUCCESS(status)) {
-            AIDA_NET_LOG("register_wfp: outbound FwpmFilterAdd0 failed status=0x%08X", (UINT32)status);
             _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_inbound);
             _FwpsCalloutUnregisterById0(g_callout_id_inbound);
             _FwpsCalloutUnregisterById0(g_callout_id_outbound);
@@ -1466,7 +1370,6 @@ namespace net_capture {
 
         status = _FwpsCalloutRegister2(devObj, &callout_ale_conn, &g_callout_id_ale_connect);
         if (!NT_SUCCESS(status)) {
-            AIDA_NET_LOG("register_wfp: ALE connect FwpsCalloutRegister2 failed status=0x%08X (non-fatal)", (UINT32)status);
             g_callout_id_ale_connect = 0;
         } else {
             FWPS_CALLOUT2_COMPAT callout_ale_recv_co = {};
@@ -1478,7 +1381,6 @@ namespace net_capture {
 
             status = _FwpsCalloutRegister2(devObj, &callout_ale_recv_co, &g_callout_id_ale_recv);
             if (!NT_SUCCESS(status)) {
-                AIDA_NET_LOG("register_wfp: ALE recv FwpsCalloutRegister2 failed status=0x%08X (non-fatal)", (UINT32)status);
                 g_callout_id_ale_recv = 0;
             }
 
@@ -1502,7 +1404,6 @@ namespace net_capture {
 
                 status = _FwpmFilterAdd0(g_engine_handle, &filter_ale_conn, nullptr, &g_filter_id_ale_connect);
                 if (!NT_SUCCESS(status)) {
-                    AIDA_NET_LOG("register_wfp: ALE connect filter failed status=0x%08X (non-fatal)", (UINT32)status);
                     g_filter_id_ale_connect = 0;
                 }
             }
@@ -1527,13 +1428,10 @@ namespace net_capture {
 
                 status = _FwpmFilterAdd0(g_engine_handle, &filter_ale_recv, nullptr, &g_filter_id_ale_recv);
                 if (!NT_SUCCESS(status)) {
-                    AIDA_NET_LOG("register_wfp: ALE recv filter failed status=0x%08X (non-fatal)", (UINT32)status);
                     g_filter_id_ale_recv = 0;
                 }
             }
 
-            AIDA_NET_LOG("register_wfp: ALE callouts ale_connect=%u ale_recv=%u",
-                g_callout_id_ale_connect, g_callout_id_ale_recv);
         }
 
 
@@ -1542,7 +1440,6 @@ namespace net_capture {
 
         status = _FwpmTransactionCommit0(g_engine_handle);
         if (!NT_SUCCESS(status)) {
-            AIDA_NET_LOG("register_wfp: FwpmTransactionCommit0 failed status=0x%08X", (UINT32)status);
             _FwpsCalloutUnregisterById0(g_callout_id_inbound);
             _FwpsCalloutUnregisterById0(g_callout_id_outbound);
             _FwpmEngineClose0(g_engine_handle);
@@ -1550,10 +1447,6 @@ namespace net_capture {
             return status;
         }
 
-        AIDA_NET_LOG("register_wfp: success inCallout=%u outCallout=%u inFilter=%llu outFilter=%llu",
-            g_callout_id_inbound, g_callout_id_outbound,
-            (unsigned long long)g_filter_id_inbound,
-            (unsigned long long)g_filter_id_outbound);
 
         return STATUS_SUCCESS;
     }
@@ -1602,7 +1495,6 @@ namespace net_capture {
 
 
     NTSTATUS initialize(PDEVICE_OBJECT devObj) {
-        AIDA_NET_LOG("initialize: begin devObj=%p build=%s", devObj, AIDA_NET_BUILD_TAG);
         LONG prev = _InterlockedCompareExchange(&g_wfp_initialized, 1, 0);
         if (prev == 2) return STATUS_SUCCESS;
         if (prev == 1) {
@@ -1642,7 +1534,6 @@ namespace net_capture {
 
         status = net_dpi::init();
         if (!NT_SUCCESS(status)) {
-            AIDA_NET_LOG("initialize: net_dpi::init failed status=0x%08X", (UINT32)status);
             ExFreePoolWithTag(g_ring_buffer, 'pkNW');
             g_ring_buffer = nullptr;
             ExFreePoolWithTag(g_dns_ring, 'dnNW');
@@ -1653,7 +1544,6 @@ namespace net_capture {
 
 
         if (!resolve_wfp_functions()) {
-            AIDA_NET_LOG0("initialize: resolve_wfp_functions failed");
             net_dpi::cleanup();
             ExFreePoolWithTag(g_ring_buffer, 'pkNW');
             g_ring_buffer = nullptr;
@@ -1666,7 +1556,6 @@ namespace net_capture {
 
         status = register_wfp(devObj);
         if (!NT_SUCCESS(status)) {
-            AIDA_NET_LOG("initialize: register_wfp failed status=0x%08X", (UINT32)status);
             net_dpi::cleanup();
             if (g_ring_buffer) {
                 ExFreePoolWithTag(g_ring_buffer, 'pkNW');
@@ -1682,12 +1571,10 @@ namespace net_capture {
 
         KeMemoryBarrier();
         _InterlockedExchange(&g_wfp_initialized, 2);
-        AIDA_NET_LOG("initialize: success build=%s", AIDA_NET_BUILD_TAG);
         return STATUS_SUCCESS;
     }
 
     void cleanup() {
-        AIDA_NET_LOG0("cleanup: begin");
         _InterlockedExchange(&g_capture_active, 0);
         unregister_wfp();
         net_inject::cleanup();
@@ -1702,7 +1589,6 @@ namespace net_capture {
             ExFreePoolWithTag(g_dns_ring, 'dnNW');
             g_dns_ring = nullptr;
         }
-        AIDA_NET_LOG0("cleanup: complete");
     }
 
 }
@@ -2204,8 +2090,6 @@ static __forceinline BOOLEAN aida_can_query_system_handles() {
         return TRUE;
 
     if (_InterlockedCompareExchange(&g_handle_query_irql_warned, 1, 0) == 0) {
-        AIDA_NET_LOG("aida_query_system_handles: refusing live handle snapshot at IRQL=%lu",
-            (ULONG)irql);
     }
     return FALSE;
 }
@@ -2442,13 +2326,7 @@ NTSTATUS functions::handle_net_enum_conn(p_net_enum_conn request) {
 NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
     if (!request) return STATUS_INVALID_PARAMETER;
 
-    AIDA_NET_LOG("IOCTL NCAP build=%s op=%u filter_pid=%u filter_port=%u proto=%u max_payload=%u init_state=%ld",
-        AIDA_NET_BUILD_TAG,
-        request->operation, request->filter_pid, request->filter_port,
-        request->filter_protocol, request->max_packet_bytes, net_capture::g_wfp_initialized);
-
     if (net_capture::g_wfp_initialized != 2) {
-        AIDA_NET_LOG0("IOCTL NCAP rejected: WFP not initialized");
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -2462,9 +2340,6 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
                 NTSTATUS cache_status = aida_refresh_pid_cache_for_process(
                     request->filter_pid,
                     request->filter_protocol);
-                AIDA_NET_LOG("IOCTL NCAP cache warm pid=%u status=0x%08X",
-                    request->filter_pid,
-                    (UINT32)cache_status);
             }
             if (request->max_packet_bytes > 0 && request->max_packet_bytes <= NET_PKT_MAX_PAYLOAD)
                 net_capture::g_max_payload = request->max_packet_bytes;
@@ -2501,10 +2376,6 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
     request->capture_active = (UINT32)net_capture::g_capture_active;
     request->packets_captured = (UINT32)net_capture::g_total_captured;
     request->packets_dropped = (UINT32)net_capture::g_total_dropped;
-
-    AIDA_NET_LOG("IOCTL NCAP done op=%u active=%u captured=%u dropped=%u",
-        request->operation, request->capture_active,
-        request->packets_captured, request->packets_dropped);
 
     return STATUS_SUCCESS;
 }
@@ -3426,16 +3297,11 @@ namespace net_inject {
 
         if (_FwpsInjectionHandleCreate0) {
             NTSTATUS st = _FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_TRANSPORT, &g_inject_handle_v4);
-            AIDA_NET_LOG("inject: FwpsInjectionHandleCreate0(TRANSPORT) status=0x%08X handle=0x%p",
-                (UINT32)st, g_inject_handle_v4);
             if (!NT_SUCCESS(st)) g_inject_handle_v4 = nullptr;
 
             st = _FwpsInjectionHandleCreate0(AF_INET, FWPS_INJECTION_TYPE_NETWORK, &g_inject_handle_net_v4);
-            AIDA_NET_LOG("inject: FwpsInjectionHandleCreate0(NETWORK) status=0x%08X handle=0x%p",
-                (UINT32)st, g_inject_handle_net_v4);
             if (!NT_SUCCESS(st)) g_inject_handle_net_v4 = nullptr;
         } else {
-            AIDA_NET_LOG("inject: FwpsInjectionHandleCreate0 not resolved (fwp_base=0x%p)", fwp_base);
         }
 
         KeMemoryBarrier();
@@ -3470,13 +3336,11 @@ namespace net_inject {
         params.DataSize = 0;
 
         if (!_NdisAllocateNetBufferListPool || !_NdisFreeNetBufferListPool) {
-            AIDA_NET_LOG0("inject_packet: NDIS net buffer list pool exports unavailable");
             return FALSE;
         }
 
         g_inject_nbl_pool = _NdisAllocateNetBufferListPool(nullptr, &params);
         if (!g_inject_nbl_pool) {
-            AIDA_NET_LOG0("inject_packet: failed to allocate net buffer list pool");
             return FALSE;
         }
 
@@ -3575,8 +3439,6 @@ namespace net_inject {
         UINT8 packet_buf[INJECT_MAX_PAYLOAD + 32] = {};
         UINT32 packet_size = build_transport_packet(request, packet_buf, sizeof(packet_buf));
         if (packet_size == 0) {
-            AIDA_NET_LOG("inject_packet: failed to build transport packet proto=%u size=%u",
-                request->protocol, request->payload_size);
             return STATUS_INVALID_PARAMETER;
         }
 
@@ -3587,16 +3449,6 @@ namespace net_inject {
         UINT32 recv_interface_index = loopback_v4 ? 1u : 0u;
 
         UINT64 endpoint_handle = lookup_endpoint_handle_by_port(request->protocol, request->src_port);
-
-        AIDA_NET_LOG("inject_packet: dir=%u proto=%u af=%u size=%u loopback=%u endpoint=0x%llX transport=%u network=%u",
-            request->direction,
-            request->protocol,
-            request->address_family,
-            packet_size,
-            loopback_v4 ? 1u : 0u,
-            endpoint_handle,
-            have_transport ? 1u : 0u,
-            have_network ? 1u : 0u);
 
         NTSTATUS st = STATUS_UNSUCCESSFUL;
         BOOLEAN transport_attempted = FALSE;
@@ -3627,7 +3479,6 @@ namespace net_inject {
             PVOID nbl = nullptr;
             st = _FwpsAllocateNBL0(g_inject_nbl_pool, 0, 0, mdl, 0, packet_size, &nbl);
             if (!NT_SUCCESS(st) || !nbl) {
-                AIDA_NET_LOG("inject_packet: FwpsAllocateNetBufferAndNetBufferList0 failed 0x%08X", (UINT32)st);
                 IoFreeMdl(mdl);
                 ExFreePoolWithTag(completion, 'jcNW');
                 ExFreePoolWithTag(buf, 'jiNW');
@@ -3645,7 +3496,6 @@ namespace net_inject {
                     (PVOID)inject_completion, completion);
 
                 if (!NT_SUCCESS(st) && _FwpsInjectRecv0 && loopback_v4) {
-                    AIDA_NET_LOG("inject_packet: transport send failed 0x%08X, trying transport receive", (UINT32)st);
                     st = _FwpsInjectRecv0(g_inject_handle_v4, nullptr, nullptr, 0,
                         (UINT16)request->address_family, 0, recv_interface_index, 0, nbl,
                         (PVOID)inject_completion, completion);
@@ -3669,8 +3519,6 @@ namespace net_inject {
                 return STATUS_SUCCESS;
             }
 
-            AIDA_NET_LOG("inject_packet: transport injection failed 0x%08X, endpoint_handle=0x%llX",
-                (UINT32)st, endpoint_handle);
             _FwpsFreeNBL0(nbl);
             IoFreeMdl(mdl);
             ExFreePoolWithTag(completion, 'jcNW');
@@ -3678,7 +3526,6 @@ namespace net_inject {
         }
 
         if (!have_network) {
-            AIDA_NET_LOG("inject_packet: no network-layer fallback available");
             return st;
         }
 
@@ -3686,7 +3533,6 @@ namespace net_inject {
         UINT32 ip_packet_size = build_ip_wrapped_packet(request, packet_buf, packet_size,
             ip_packet_buf, sizeof(ip_packet_buf));
         if (ip_packet_size == 0) {
-            AIDA_NET_LOG("inject_packet: failed to build IP-wrapped packet");
             return STATUS_INVALID_PARAMETER;
         }
 
@@ -3715,7 +3561,6 @@ namespace net_inject {
         PVOID net_nbl = nullptr;
         st = _FwpsAllocateNBL0(g_inject_nbl_pool, 0, 0, net_mdl, 0, ip_packet_size, &net_nbl);
         if (!NT_SUCCESS(st) || !net_nbl) {
-            AIDA_NET_LOG("inject_packet: FwpsAllocateNetBufferAndNetBufferList0(network) failed 0x%08X", (UINT32)st);
             IoFreeMdl(net_mdl);
             ExFreePoolWithTag(net_completion, 'jcNW');
             ExFreePoolWithTag(net_buf, 'jiNW');
@@ -3737,7 +3582,6 @@ namespace net_inject {
         }
 
         if (!NT_SUCCESS(st)) {
-            AIDA_NET_LOG("inject_packet: network-layer injection failed 0x%08X", (UINT32)st);
             _FwpsFreeNBL0(net_nbl);
             IoFreeMdl(net_mdl);
             ExFreePoolWithTag(net_completion, 'jcNW');
@@ -4545,7 +4389,7 @@ namespace net_intercept {
                 g_held[i].dst_port = dst_port;
                 strong::kmemcpy(g_held[i].src_addr, src_addr, 16);
                 strong::kmemcpy(g_held[i].dst_addr, dst_addr, 16);
-                g_held[i].pid = (pid != 0) ? pid : g_filter_pid;
+                g_held[i].pid = pid;
                 g_held[i].address_family = af;
                 UINT32 cap = payload_len < INTERCEPT_MAX_PAYLOAD ? payload_len : INTERCEPT_MAX_PAYLOAD;
                 g_held[i].payload_size = cap;
@@ -4791,12 +4635,6 @@ namespace net_kill {
         KeReleaseSpinLock(&net_dpi::g_dpi_lock, irql);
 
         if (!out->have_forward && !out->have_reverse) {
-            AIDA_NET_LOG("kill_connection: no DPI tuple match af=%u src=%u dst=%u pid=%u",
-                request->address_family,
-                request->src_port,
-                request->dst_port,
-                request->pid);
-
             KIRQL dbg_irql;
             KeAcquireSpinLock(&net_dpi::g_dpi_lock, &dbg_irql);
             LONG dbg_entries = net_dpi::g_dpi_count;
@@ -4814,26 +4652,7 @@ namespace net_kill {
                 }
 
                 if (info->address_family == AF_INET) {
-                    AIDA_NET_LOG(
-                        "kill_connection: recent DPI dir=%u %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u pid=%u flags=0x%02X ack=%u payload=%u",
-                        info->direction,
-                        info->src_addr[0], info->src_addr[1], info->src_addr[2], info->src_addr[3], info->src_port,
-                        info->dst_addr[0], info->dst_addr[1], info->dst_addr[2], info->dst_addr[3], info->dst_port,
-                        info->pid,
-                        info->tcp_flags,
-                        info->tcp_ack,
-                        info->payload_size);
                 } else {
-                    AIDA_NET_LOG(
-                        "kill_connection: recent DPI dir=%u af=%u sport=%u dport=%u pid=%u flags=0x%02X ack=%u payload=%u",
-                        info->direction,
-                        info->address_family,
-                        info->src_port,
-                        info->dst_port,
-                        info->pid,
-                        info->tcp_flags,
-                        info->tcp_ack,
-                        info->payload_size);
                 }
 
                 dumped++;
@@ -4868,8 +4687,6 @@ namespace net_kill {
     static NTSTATUS inject_tcp_reset_fallback(p_conn_kill_request request) {
         TCP_RESET_CANDIDATES candidates = {};
         if (!find_recent_reset_candidates(request, &candidates)) {
-            AIDA_NET_LOG("kill_connection: no recent DPI candidates lport=%u rport=%u",
-                request->src_port, request->dst_port);
             return STATUS_NOT_FOUND;
         }
 
@@ -4881,7 +4698,6 @@ namespace net_kill {
             if (NT_SUCCESS(last_status)) {
                 injected = TRUE;
             } else {
-                AIDA_NET_LOG("kill_connection: reverse RST fallback failed 0x%08X", (UINT32)last_status);
             }
         }
 
@@ -4890,7 +4706,6 @@ namespace net_kill {
             if (NT_SUCCESS(reverse_status)) {
                 injected = TRUE;
             } else {
-                AIDA_NET_LOG("kill_connection: forward RST fallback failed 0x%08X", (UINT32)reverse_status);
                 if (!NT_SUCCESS(last_status)) {
                     last_status = reverse_status;
                 }
@@ -5013,8 +4828,6 @@ namespace net_kill {
                 close_status = ZwClose((HANDLE)(ULONG_PTR)entry->HandleValue);
                 KeUnstackDetachProcess(&apc);
                 if (NT_SUCCESS(close_status)) {
-                    AIDA_NET_LOG("kill_connection: closed socket handle pid=%u handle=0x%X lport=%u rport=%u",
-                        owner_pid, (UINT32)entry->HandleValue, socket_info.local_port, socket_info.remote_port);
                     break;
                 }
             }
@@ -5068,8 +4881,6 @@ namespace net_kill {
                 stack_spoof::spoofed_ObfDereferenceObject(process);
 
                 if (NT_SUCCESS(close_status)) {
-                    AIDA_NET_LOG("kill_connection: closed socket handle pid=%u handle=0x%X lport=%u rport=%u",
-                        owner_pid, (UINT32)entry->HandleValue, socket_info.local_port, socket_info.remote_port);
                     break;
                 }
             }
@@ -5094,8 +4905,6 @@ namespace net_kill {
                 request->status = 0;
                 return STATUS_SUCCESS;
             }
-            AIDA_NET_LOG("kill_connection: close_matching_socket failed pid=%u status=0x%08X",
-                owner_pid, (UINT32)st);
             NTSTATUS rst_status = inject_tcp_reset_fallback(request);
             if (NT_SUCCESS(rst_status)) {
                 request->status = 0;
@@ -5111,8 +4920,6 @@ namespace net_kill {
                 request->status = 0;
                 return STATUS_SUCCESS;
             }
-            AIDA_NET_LOG("kill_connection: resolved owner pid=%u close failed 0x%08X",
-                owner_pid, (UINT32)st);
         }
 
         NTSTATUS st = resolve_and_close_socket(request);
@@ -5121,8 +4928,6 @@ namespace net_kill {
             return STATUS_SUCCESS;
         }
 
-        AIDA_NET_LOG("kill_connection: resolve_and_close_socket failed status=0x%08X",
-            (UINT32)st);
         NTSTATUS rst_status = inject_tcp_reset_fallback(request);
         if (NT_SUCCESS(rst_status)) {
             request->status = 0;
@@ -5786,17 +5591,13 @@ namespace net_fingerprint {
 
 NTSTATUS functions::handle_wfp_callout_enum(p_wfp_callout_enum request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL EWFP filter='%s'", request->filter_module);
     NTSTATUS st = net_wfp_enum::enumerate_wfp_callouts(request);
-    AIDA_NET_LOG("IOCTL EWFP status=0x%08X count=%u", (UINT32)st, request->callout_count);
     return st;
 }
 
 NTSTATUS functions::handle_socket_handle_enum(p_socket_handle_enum request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL GSKT pid=%u", request->target_pid);
     NTSTATUS st = net_socket_enum::enumerate_socket_handles(request);
-    AIDA_NET_LOG("IOCTL GSKT status=0x%08X count=%u", (UINT32)st, request->socket_count);
     return st;
 }
 
@@ -5807,157 +5608,106 @@ NTSTATUS functions::handle_sniff_net_buffers(p_sniff_net_buffers request) {
 
 NTSTATUS functions::handle_tcpip_conn_dump(p_tcpip_conn_dump request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL DTCP pid=%u proto=%u", request->target_pid, request->filter_protocol);
     NTSTATUS st = net_tcpip::dump_connections(request);
-    AIDA_NET_LOG("IOCTL DTCP status=0x%08X count=%u", (UINT32)st, request->connection_count);
     return st;
 }
 
 
 NTSTATUS functions::handle_packet_inject(p_packet_inject_request request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL PINJ dir=%u proto=%u af=%u src_port=%u dst_port=%u size=%u",
-        request->direction, request->protocol, request->address_family,
-        request->src_port, request->dst_port, request->payload_size);
     NTSTATUS st = net_inject::inject_packet(request);
-    AIDA_NET_LOG("IOCTL PINJ status=0x%08X req_status=%u", (UINT32)st, request->status);
     return st;
 }
 
 NTSTATUS functions::handle_packet_mod_rule(p_packet_mod_rule request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL PMOD op=%u rule_id=%u proto=%u port=%u pid=%u pat=%u rep=%u",
-        request->operation, request->rule_id, request->protocol, request->port,
-        request->pid, request->pattern_size, request->replace_size);
     NTSTATUS st = net_mod::handle_mod_rule(request);
-    AIDA_NET_LOG("IOCTL PMOD status=0x%08X out_rule_id=%u active=%u", (UINT32)st, request->rule_id, request->active);
     return st;
 }
 
 NTSTATUS functions::handle_packet_mod_rule_list(p_packet_mod_rule_list request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL PMOD(list) op=%u", request->operation);
     NTSTATUS st = net_mod::handle_mod_rule_list(request);
-    AIDA_NET_LOG("IOCTL PMOD(list) status=0x%08X count=%u", (UINT32)st, request->rule_count);
     return st;
 }
 
 NTSTATUS functions::handle_traffic_redirect(p_traffic_redirect_rule request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL PRED op=%u rule_id=%u proto=%u match_port=%u redirect_port=%u",
-        request->operation, request->rule_id, request->protocol, request->match_port, request->redirect_port);
     NTSTATUS st = net_redirect::handle_redirect_rule(request);
-    AIDA_NET_LOG("IOCTL PRED status=0x%08X out_rule_id=%u active=%u", (UINT32)st, request->rule_id, request->active);
     return st;
 }
 
 NTSTATUS functions::handle_traffic_redirect_list(p_traffic_redirect_list request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL PRED(list) op=%u", request->operation);
     NTSTATUS st = net_redirect::handle_redirect_list(request);
-    AIDA_NET_LOG("IOCTL PRED(list) status=0x%08X count=%u", (UINT32)st, request->rule_count);
     return st;
 }
 
 NTSTATUS functions::handle_stream_reassemble(p_stream_reassemble_request request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL STRM op=%u src_port=%u dst_port=%u pid=%u", request->operation, request->src_port, request->dst_port, request->pid);
     if (request->operation == 0 && request->pid != 0) {
         NTSTATUS cache_status = aida_refresh_pid_cache_for_process(request->pid, IPPROTO_TCP);
-        AIDA_NET_LOG("IOCTL STRM cache warm pid=%u status=0x%08X", request->pid, (UINT32)cache_status);
     }
     NTSTATUS st = net_stream::handle_stream(request);
-    AIDA_NET_LOG("IOCTL STRM status=0x%08X stream_size=%u packets=%u streams=%u",
-        (UINT32)st, request->stream_size, request->total_packets, request->stream_count);
     return st;
 }
 
 NTSTATUS functions::handle_deep_inspect(p_dpi_request request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL DPIN filter_pid=%u filter_proto=%u filter_port=%u flags=0x%X",
-        request->filter_pid, request->filter_protocol, request->filter_port, request->flags);
     if (request->filter_pid != 0) {
         NTSTATUS cache_status = aida_refresh_pid_cache_for_process(request->filter_pid, request->filter_protocol);
-        AIDA_NET_LOG("IOCTL DPIN cache warm pid=%u status=0x%08X", request->filter_pid, (UINT32)cache_status);
     }
     NTSTATUS st = net_dpi::get_results(request);
-    AIDA_NET_LOG("IOCTL DPIN status=0x%08X results=%u", (UINT32)st, request->result_count);
     return st;
 }
 
 NTSTATUS functions::handle_intercept_hold(p_intercept_request request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL IHLD op=%u hold_id=%llu filter_pid=%u filter_port=%u filter_proto=%u modify_size=%u",
-        request->operation, (unsigned long long)request->hold_id, request->filter_pid,
-        request->filter_port, request->filter_protocol, request->modify_payload_size);
     if (request->operation == 0 && request->filter_pid != 0) {
         NTSTATUS cache_status = aida_refresh_pid_cache_for_process(request->filter_pid, request->filter_protocol);
-        AIDA_NET_LOG("IOCTL IHLD cache warm pid=%u status=0x%08X", request->filter_pid, (UINT32)cache_status);
     }
     NTSTATUS st = net_intercept::handle_intercept(request);
-    AIDA_NET_LOG("IOCTL IHLD status=0x%08X intercepting=%u held=%u", (UINT32)st, request->intercepting, request->held_count);
     return st;
 }
 
 NTSTATUS functions::handle_conn_kill(p_conn_kill_request request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL CKIL proto=%u af=%u src_port=%u dst_port=%u pid=%u",
-        request->protocol, request->address_family, request->src_port, request->dst_port, request->pid);
     NTSTATUS st = net_kill::kill_connection(request);
-    AIDA_NET_LOG("IOCTL CKIL status=0x%08X req_status=%u", (UINT32)st, request->status);
     return st;
 }
 
 NTSTATUS functions::handle_dns_spoof(p_dns_spoof_rule request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL DNSS op=%u rule_id=%u af=%u ttl=%u domain='%s'",
-        request->operation, request->rule_id, request->address_family, request->ttl, request->domain);
     NTSTATUS st = net_dns_spoof::handle_spoof_rule(request);
-    AIDA_NET_LOG("IOCTL DNSS status=0x%08X out_rule_id=%u active=%u", (UINT32)st, request->rule_id, request->active);
     return st;
 }
 
 NTSTATUS functions::handle_dns_spoof_list(p_dns_spoof_list request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL DNSS(list) op=%u", request->operation);
     NTSTATUS st = net_dns_spoof::handle_spoof_list(request);
-    AIDA_NET_LOG("IOCTL DNSS(list) status=0x%08X count=%u", (UINT32)st, request->rule_count);
     return st;
 }
 
 NTSTATUS functions::handle_bw_monitor(p_bw_monitor_request request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL BWMN op=%u filter_pid=%u", request->operation, request->filter_pid);
     NTSTATUS st = net_bw::handle_bw(request);
-    AIDA_NET_LOG("IOCTL BWMN status=0x%08X active=%u total_sent=%llu total_recv=%llu proc_count=%u",
-        (UINT32)st, request->monitoring_active,
-        (unsigned long long)request->total_bytes_sent,
-        (unsigned long long)request->total_bytes_recv,
-        request->process_count);
     return st;
 }
 
 NTSTATUS functions::handle_net_iface_enum(p_net_interface_enum request) {
     if (!request) return STATUS_INVALID_PARAMETER;
     NTSTATUS st = net_if_enum::enumerate_interfaces(request);
-    AIDA_NET_LOG("IOCTL NIFS status=0x%08X count=%u", (UINT32)st, request->interface_count);
     return st;
 }
 
 NTSTATUS functions::handle_pcap_export(p_pcap_export_request request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL PCEX op=%u filter_pid=%u filter_proto=%u max_packets=%u",
-        request->operation, request->filter_pid, request->filter_protocol, request->max_packets);
     NTSTATUS st = net_pcap::export_pcap(request);
-    AIDA_NET_LOG("IOCTL PCEX status=0x%08X packet_count=%u data_size=%u",
-        (UINT32)st, request->packet_count, request->data_size);
     return st;
 }
 
 NTSTATUS functions::handle_net_fingerprint(p_net_fingerprint_request request) {
     if (!request) return STATUS_INVALID_PARAMETER;
-    AIDA_NET_LOG("IOCTL NFPR op=%u", request->operation);
     NTSTATUS st = net_fingerprint::handle_fingerprint(request);
-    AIDA_NET_LOG("IOCTL NFPR status=0x%08X result_count=%u", (UINT32)st, request->result_count);
     return st;
 }

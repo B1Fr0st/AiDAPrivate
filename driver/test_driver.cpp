@@ -1399,9 +1399,7 @@ int main() {
     printf("================================================================\n");
 
     if (g_fail > 0) {
-        printf("\n  [!] %d test(s) FAILED. Check debug log output above for details.\n", g_fail);
-        printf("  [!] The debug logging in comm.cpp will show exactly which IOCTL\n");
-        printf("  [!] failed and why (bad params, driver not responding, etc).\n");
+        printf("\n  [!] %d test(s) FAILED.\n", g_fail);
     } else {
         printf("\n  All tests passed!\n");
     }
