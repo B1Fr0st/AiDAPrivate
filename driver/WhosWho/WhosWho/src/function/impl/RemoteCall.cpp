@@ -489,7 +489,7 @@ NTSTATUS functions::handle7781(p_remote_call request) {
     ctx.param4 = request->arg4;
     ctx.ret_value = 0;
     ctx.saved_rsp = 0;
-    ctx.original_rip = 0;
+    ctx.original_rip = request->original_rip;
     ctx.rbx_backup = 0;
     ctx.exec_done = 0;
     ctx.trampoline_addr = epilogue_addr;

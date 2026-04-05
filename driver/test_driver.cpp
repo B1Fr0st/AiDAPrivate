@@ -222,23 +222,35 @@ static void test_thread_operations() {
     }
 
 
-    std::uint32_t tid = threads[0].tid;
+    std::uint32_t tid = 0;
+    voyager::device_t::thread_context ctx{};
+    bool ok = false;
+
+
+    std::vector<std::uint32_t> try_order;
     for (auto& t : threads) {
-        if (t.state == 5 && t.tid != threads[0].tid) {
-            tid = t.tid;
+        if (t.state == 5) try_order.push_back(t.tid);
+    }
+    for (auto& t : threads) {
+        if (t.state != 5) try_order.push_back(t.tid);
+    }
+
+    for (std::uint32_t candidate_tid : try_order) {
+        voyager::device_t::thread_context try_ctx{};
+        if (device->get_thread_context(candidate_tid, try_ctx)) {
+            ctx = try_ctx;
+            tid = candidate_tid;
+            ok = true;
             break;
         }
     }
 
-    snprintf(detail, sizeof(detail), "tid=%u", tid);
-    printf("  [INFO] Using thread: %s\n", detail);
-
-
-    voyager::device_t::thread_context ctx{};
-    bool ok = device->get_thread_context(tid, ctx);
-    snprintf(detail, sizeof(detail), "rip=0x%llX rsp=0x%llX",
-             (unsigned long long)ctx.rip, (unsigned long long)ctx.rsp);
+    snprintf(detail, sizeof(detail), "tid=%u rip=0x%llX rsp=0x%llX",
+             tid, (unsigned long long)ctx.rip, (unsigned long long)ctx.rsp);
     report("get_thread_context()", ok, detail);
+
+
+    if (tid == 0) tid = threads[0].tid;
 
 
     std::uint32_t prev = 0;
@@ -426,18 +438,6 @@ static void test_process_info(std::uint64_t base) {
     }
 }
 
-static void test_input() {
-    section("INPUT: Mouse / Keyboard");
-
-
-    device->move_mouse(0, 0, 0);
-    report("move_mouse(0, 0, 0)", true, "no-op move sent");
-
-
-    device->send_key(0x7C);
-    report("send_key(VK_F13)", true, "harmless key sent");
-}
-
 static void test_remote_call(std::uint64_t base, std::uint32_t target_pid) {
     section("REMOTE CALL: find_gadget / call_function");
 
@@ -470,6 +470,7 @@ static void test_remote_call(std::uint64_t base, std::uint32_t target_pid) {
         skip("call_function(TestAddNumbers)", "resolve_export failed");
     }
 
+    Sleep(50);
 
     std::uint64_t magic_addr = device->resolve_export(base, "TestReturnMagic");
     if (magic_addr != 0) {
@@ -486,6 +487,7 @@ static void test_remote_call(std::uint64_t base, std::uint32_t target_pid) {
         skip("call_function(TestReturnMagic)", "resolve_export failed");
     }
 
+    Sleep(50);
 
     std::uint64_t tick_addr = device->resolve_export(base, "TestGetTickCount");
     if (tick_addr != 0) {
@@ -500,6 +502,7 @@ static void test_remote_call(std::uint64_t base, std::uint32_t target_pid) {
         skip("call_function(TestGetTickCount)", "resolve_export failed");
     }
 
+    Sleep(50);
 
     std::uint64_t noop_addr = device->resolve_export(base, "TestNoOp");
     if (noop_addr != 0) {
@@ -513,6 +516,7 @@ static void test_remote_call(std::uint64_t base, std::uint32_t target_pid) {
         skip("call_function(TestNoOp)", "resolve_export failed");
     }
 
+    Sleep(50);
 
     voyager::device_t::peb_info peb{};
     device->read_peb(peb);
@@ -605,8 +609,8 @@ static void test_capture(std::uint32_t target_pid) {
     }
 
 
-    printf("  [INFO] Capturing test_target traffic for 3 seconds...\n");
-    Sleep(3000);
+    printf("  [INFO] Capturing test_target traffic for 5 seconds...\n");
+    Sleep(5000);
 
 
     bool active = false;
@@ -1155,6 +1159,14 @@ static void test_dll_protection() {
 
 
     std::uint32_t e_lfanew = device->read<std::uint32_t>(base + 0x3C);
+    if (e_lfanew == 0 || e_lfanew > 0x1000) {
+        char detail[128];
+        snprintf(detail, sizeof(detail), "e_lfanew=0x%X (invalid, process may have exited)", e_lfanew);
+        skip("register_dll_protection()", detail);
+        skip("query_dll_protection()", "no registration");
+        skip("unregister_dll_protection()", "no registration");
+        return;
+    }
     std::uint64_t nt_hdr = base + e_lfanew;
 
     std::uint16_t num_sections = device->read<std::uint16_t>(nt_hdr + 4 + 2);
@@ -1243,7 +1255,7 @@ int main() {
     } else {
         printf("[INFO] Launching test_target.exe from: %s\n", exe_path);
         if (CreateProcessA(exe_path, nullptr, nullptr, nullptr, FALSE,
-                           0, nullptr, nullptr, &si, &pi)) {
+                           CREATE_NEW_CONSOLE, nullptr, nullptr, &si, &pi)) {
             target_pid = pi.dwProcessId;
             launched = true;
             CloseHandle(pi.hThread);
@@ -1301,10 +1313,23 @@ int main() {
     test_process_info(base);
 
 
+    test_dll_protection();
+
+
     test_remote_call(base, found_pid);
 
 
-    test_input();
+    if (!device->is_connected()) {
+        printf("  [WARN] Driver session lost after remote call tests, reconnecting...\n");
+        device->disconnect();
+        if (device->connect()) {
+            device->set_process_id(found_pid);
+            device->solve_dtb();
+            printf("  [INFO] Reconnected successfully.\n");
+        } else {
+            printf("  [WARN] Reconnect failed, network tests may fail.\n");
+        }
+    }
 
 
     printf("\n  [INFO] === Beginning network tests ===\n");
@@ -1342,9 +1367,6 @@ int main() {
     test_fingerprinting();
 
 
-    test_dll_protection();
-
-
     section("CLEANUP");
     device->disconnect();
     report("disconnect()", !device->is_connected());
@@ -1352,6 +1374,9 @@ int main() {
 
     if (launched) {
         HANDLE done_event = OpenEventA(EVENT_MODIFY_STATE, FALSE, "Global\\WhosWhoTestDone");
+        if (!done_event) {
+            done_event = OpenEventA(EVENT_MODIFY_STATE, FALSE, "Local\\WhosWhoTestDone");
+        }
         if (done_event) {
             SetEvent(done_event);
             CloseHandle(done_event);

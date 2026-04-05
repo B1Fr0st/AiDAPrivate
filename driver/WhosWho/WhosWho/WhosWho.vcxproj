@@ -138,7 +138,6 @@
     <ClCompile Include="src\function\impl\BaseAddress.cpp" />
     <ClCompile Include="src\function\impl\DTB.cpp" />
     <ClCompile Include="src\function\impl\Memory.cpp" />
-    <ClCompile Include="src\function\impl\MouseMovement.cpp" />
     <ClCompile Include="src\function\impl\RemoteCall.cpp" />
     <ClCompile Include="src\function\impl\Debugger.cpp" />
     <ClCompile Include="src\function\impl\DllProtect.cpp" />

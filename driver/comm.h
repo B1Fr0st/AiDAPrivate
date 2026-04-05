@@ -68,7 +68,6 @@ namespace ioctl_codes {
     __forceinline DWORD DTB()  { return make(0); }
     __forceinline DWORD PHYS() { return make(1); }
     __forceinline DWORD BASE() { return make(2); }
-    __forceinline DWORD MM()   { return make(3); }
     __forceinline DWORD RC()   { return make(4); }
     __forceinline DWORD CR()   { return make(5); }
     __forceinline DWORD AM()   { return make(6); }
@@ -159,13 +158,6 @@ namespace voyager {
             std::uint64_t* out_address;
         };
         static_assert(sizeof(base_address_request) == 16, "base_address_request size mismatch with kernel driver");
-
-        struct mouse_request {
-            std::int32_t inputX;
-            std::int32_t inputY;
-            std::uint32_t buttonFlags;
-        };
-        static_assert(sizeof(mouse_request) == 12, "mouse_request size mismatch with kernel driver");
 
         struct remote_call_request {
             std::uint64_t dtb;
@@ -977,9 +969,6 @@ namespace voyager {
         std::size_t read_kernel_raw(std::uint64_t address, void* buffer, std::size_t size) const noexcept;
         std::size_t write_kernel_raw(std::uint64_t address, const void* buffer, std::size_t size) const noexcept;
 
-        void move_mouse(std::int32_t input_x, std::int32_t input_y, std::uint32_t mouse_flags);
-        void send_key(unsigned short button);
-
         std::uint64_t allocate_memory(std::size_t size) noexcept;
         bool free_memory(std::uint64_t address) noexcept;
 
@@ -1347,6 +1336,8 @@ namespace voyager {
         std::uint64_t spoof_gadget_ = 0;
         std::uint32_t session_key_ = 0;
         mutable std::uint64_t last_heartbeat_tsc_ = 0;
+        DWORD last_failed_tid_ = 0;
+        DWORD last_hijacked_tid_ = 0;
 
         bool send_request(DWORD control_code, void* input, DWORD input_size) const noexcept;
         std::size_t transfer_physical_read(std::uint32_t pid, std::uint64_t dtb, std::uint64_t address,

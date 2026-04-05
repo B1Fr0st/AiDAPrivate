@@ -1,25 +1,6 @@
 #pragma once
 #include <ntifs.h>
-#include <ntddmou.h>
 #include <stddef.h>
-
-typedef VOID
-(*MouseClassServiceCallback)(
-    PDEVICE_OBJECT DeviceObject,
-    PMOUSE_INPUT_DATA InputDataStart,
-    PMOUSE_INPUT_DATA InputDataEnd,
-    PULONG InputDataConsumed
-);
-
-typedef struct _MOUSE_OBJECT
-{
-    PDEVICE_OBJECT mouse_device;
-    MouseClassServiceCallback service_callback;
-} MOUSE_OBJECT, * PMOUSE_OBJECT;
-
-inline PDEVICE_OBJECT g_mouse_device = nullptr;
-inline MouseClassServiceCallback g_mouse_callback = nullptr;
-inline volatile LONG g_mouse_init_lock = 0;
 
 extern "C" {
     extern POBJECT_TYPE* IoDriverObjectType;
@@ -53,13 +34,6 @@ typedef struct _BA {
     ULONGLONG* outAddress;
 } base_address, * p_base_address;
 static_assert(sizeof(base_address) == 16, "base_address size must be 16 bytes");
-
-typedef struct _MM {
-    INT32 inputX;
-    INT32 inputY;
-    UINT32 buttonFlags;
-} mouse_move, * p_mouse_move;
-static_assert(sizeof(mouse_move) == 12, "mouse_move size must be 12 bytes");
 
 typedef struct _RC {
     UINT64 dtb;

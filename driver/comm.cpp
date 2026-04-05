@@ -248,6 +248,7 @@ void voyager::device_t::clear_process_context() noexcept {
     base_address_ = 0;
     dtb_ = 0;
     spoof_gadget_ = 0;
+    last_failed_tid_ = 0;
     fprintf(stderr, "[WhosWho-UM] clear_process_context: context cleared\n");
 }
 
@@ -661,42 +662,6 @@ std::size_t voyager::device_t::write_raw(std::uint64_t address, const void* buff
     }
 
     return transfer_physical_write(process_id_, dtb_, address, buffer, size);
-}
-
-void voyager::device_t::move_mouse(std::int32_t input_x, std::int32_t input_y, std::uint32_t mouse_flags) {
-    SPOOF_FUNC;
-
-    fprintf(stderr, "[WhosWho-UM] move_mouse: x=%d y=%d flags=0x%X\n", input_x, input_y, mouse_flags);
-
-    if (!is_connected()) {
-        fprintf(stderr, "[WhosWho-UM] move_mouse: not connected\n");
-        return;
-    }
-
-    detail::mouse_request req{};
-    req.inputX = input_x;
-    req.inputY = input_y;
-    req.buttonFlags = mouse_flags;
-
-    send_request(ioctl_codes::MM(), &req, sizeof(req));
-}
-
-void voyager::device_t::send_key(unsigned short button) {
-    SPOOF_FUNC;
-
-    fprintf(stderr, "[WhosWho-UM] send_key: button=0x%X\n", button);
-
-    if (!is_connected()) {
-        fprintf(stderr, "[WhosWho-UM] send_key: not connected\n");
-        return;
-    }
-
-    detail::mouse_request req{};
-    req.inputX = 0;
-    req.inputY = 0;
-    req.buttonFlags = static_cast<std::uint32_t>(button);
-
-    send_request(ioctl_codes::MM(), &req, sizeof(req));
 }
 
 std::uint64_t voyager::device_t::allocate_memory(std::size_t size) noexcept {
@@ -1142,29 +1107,6 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
 
     std::uint64_t context_base = shellcode_address_;
 
-    detail::remote_call_request req{};
-    req.dtb = dtb_;
-    req.target_function = function_address;
-    req.shellcode_address = context_base;
-    req.spoof_return = spoof_gadget_;
-    req.arg1 = arg1;
-    req.arg2 = arg2;
-    req.arg3 = arg3;
-    req.arg4 = arg4;
-    req.result = 0;
-    req.completed = 0;
-    req.original_rip = 0;
-    req.trampoline_addr = 0;
-
-    thread_hijack::scatter_timing();
-
-    if (!send_request(ioctl_codes::RC(), &req, sizeof(req))) {
-        fprintf(stderr, "[WhosWho-UM] call_function: RC ioctl FAILED\n");
-        return 0;
-    }
-
-    std::uint64_t code_entry = req.shellcode_address;
-    fprintf(stderr, "[WhosWho-UM] call_function: RC ioctl OK, code_entry=0x%llX\n", code_entry);
 
     thread_hijack::scatter_timing();
 
@@ -1194,6 +1136,16 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
             if (thread_scan_count >= MAX_TARGET_THREAD_SCANS) break;
 
             if (te.th32OwnerProcessID == process_id_ && te.th32ThreadID != current_tid) {
+
+                if (last_failed_tid_ != 0 && te.th32ThreadID == last_failed_tid_) {
+                    continue;
+                }
+
+
+                if (last_hijacked_tid_ != 0 && te.th32ThreadID == last_hijacked_tid_) {
+                    continue;
+                }
+
                 thread_scan_count++;
                 thread_hijack::scatter_timing();
 
@@ -1230,9 +1182,15 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
                                 (ctx.Rsp & 0x7) == 0) {
                                 std::int32_t priority = static_cast<std::int32_t>(te.tpBasePri);
 
+
                                 bool is_waiting = (ctx.Rip >= 0x00007FF000000000ULL);
                                 if (is_waiting) {
-                                    priority += 10;
+                                    priority -= 10;
+                                }
+
+
+                                if (prev_count == 0) {
+                                    priority += 5;
                                 }
 
                                 if (priority > best_priority) {
@@ -1277,7 +1235,35 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
 
     CONTEXT original_ctx = best_ctx;
 
-    write_raw(context_base + detail::CTX_ORIGINAL_RIP, &original_ctx.Rip, sizeof(std::uint64_t));
+
+    constexpr std::uint64_t EXEC_DONE_OFFSET = 0x50;
+    write<std::uint64_t>(context_base + EXEC_DONE_OFFSET, 0);
+
+    detail::remote_call_request req{};
+    req.dtb = dtb_;
+    req.target_function = function_address;
+    req.shellcode_address = context_base;
+    req.spoof_return = spoof_gadget_;
+    req.arg1 = arg1;
+    req.arg2 = arg2;
+    req.arg3 = arg3;
+    req.arg4 = arg4;
+    req.result = 0;
+    req.completed = 0;
+    req.original_rip = original_ctx.Rip;
+    req.trampoline_addr = 0;
+
+    thread_hijack::scatter_timing();
+
+    if (!send_request(ioctl_codes::RC(), &req, sizeof(req))) {
+        fprintf(stderr, "[WhosWho-UM] call_function: RC ioctl FAILED\n");
+        thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
+        thread_hijack::indirect_NtClose(target_thread);
+        return 0;
+    }
+
+    std::uint64_t code_entry = req.shellcode_address;
+    fprintf(stderr, "[WhosWho-UM] call_function: RC ioctl OK, code_entry=0x%llX\n", code_entry);
 
     CONTEXT hijack_ctx = original_ctx;
     hijack_ctx.Rip = code_entry;
@@ -1298,6 +1284,9 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
         return 0;
     }
     fprintf(stderr, "[WhosWho-UM] call_function: NtSetContextThread OK, resuming thread\n");
+
+
+    last_hijacked_tid_ = target_tid;
 
     thread_hijack::collect_entropy();
 
@@ -1376,6 +1365,9 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
             thread_hijack::scatter_timing();
             thread_hijack::collect_entropy();
             spoofer::scatter_execution();
+
+
+            refresh_heartbeat();
         }
     }
 
@@ -1389,8 +1381,13 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
     if (!completed) {
         fprintf(stderr, "[WhosWho-UM] call_function: TIMED OUT after polling, restoring original context\n");
         thread_hijack::indirect_NtSetContextThread(target_thread, &original_ctx);
+        last_failed_tid_ = target_tid;
+
+
+        shellcode_address_ = 0;
     } else {
         fprintf(stderr, "[WhosWho-UM] call_function: completed, result=0x%llX\n", result);
+        last_failed_tid_ = 0;
     }
 
     thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
@@ -1405,7 +1402,6 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
     if      (control_code == ioctl_codes::DTB())  ioctl_name = "DTB(DtbSolve)";
     else if (control_code == ioctl_codes::PHYS()) ioctl_name = "PHYS(PhysRW)";
     else if (control_code == ioctl_codes::BASE()) ioctl_name = "BASE(BaseAddr)";
-    else if (control_code == ioctl_codes::MM())   ioctl_name = "MM(Mouse)";
     else if (control_code == ioctl_codes::RC())   ioctl_name = "RC(RemoteCall)";
     else if (control_code == ioctl_codes::CR())   ioctl_name = "CR(CallResult)";
     else if (control_code == ioctl_codes::AM())   ioctl_name = "AM(AllocMem)";

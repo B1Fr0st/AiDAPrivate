@@ -42,7 +42,6 @@ namespace ioctl_codes {
     __forceinline ULONG DB()  { return make(0); }
     __forceinline ULONG PRW() { return make(1); }
     __forceinline ULONG BA()  { return make(2); }
-    __forceinline ULONG MM()  { return make(3); }
     __forceinline ULONG RC()  { return make(4); }
     __forceinline ULONG CR()  { return make(5); }
     __forceinline ULONG AM()  { return make(6); }
@@ -311,20 +310,6 @@ namespace dispatcher {
             }
             else {
                 WW_LOG("Controller: <- BA SIZE MISMATCH input=%u need=%u", input_size, (ULONG)sizeof(_BA));
-                status = STATUS_INFO_LENGTH_MISMATCH;
-            }
-        }
-        else if (code == ioctl_codes::MM()) {
-            WW_LOG("Controller: -> MM (Mouse) x=%d y=%d flags=0x%X",
-                ((p_mouse_move)buffer)->inputX, ((p_mouse_move)buffer)->inputY,
-                ((p_mouse_move)buffer)->buttonFlags);
-            if (input_size >= sizeof(_MM)) {
-                status = functions::handle7780((p_mouse_move)buffer);
-                WW_LOG("Controller: <- MM status=0x%08X", status);
-                bytes = sizeof(_MM);
-            }
-            else {
-                WW_LOG("Controller: <- MM SIZE MISMATCH input=%u need=%u", input_size, (ULONG)sizeof(_MM));
                 status = STATUS_INFO_LENGTH_MISMATCH;
             }
         }

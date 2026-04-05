@@ -193,6 +193,13 @@ static const GUID GUID_LAYER_ALE_RECV_V4 =
 #define FWPS_FIELD_OUT_TRANS_V4_REMOTE_PORT  5
 
 
+#define FWPS_FIELD_ALE_V4_IP_LOCAL_ADDR     1
+#define FWPS_FIELD_ALE_V4_IP_LOCAL_PORT     3
+#define FWPS_FIELD_ALE_V4_IP_PROTOCOL       4
+#define FWPS_FIELD_ALE_V4_IP_REMOTE_ADDR    5
+#define FWPS_FIELD_ALE_V4_IP_REMOTE_PORT    6
+
+
 namespace net_bw {
     void record_traffic(UINT32 pid, UINT32 direction, UINT32 bytes);
 }
@@ -240,6 +247,22 @@ namespace net_capture {
         UINT64 flowContext,
         FWPS_CLASSIFY_OUT0_COMPAT* classifyOut);
     void NTAPI classify_outbound(
+        const FWPS_INCOMING_VALUES0_COMPAT* inFixedValues,
+        const FWPS_INCOMING_METADATA_VALUES0_COMPAT* inMetaValues,
+        void* layerData,
+        const void* classifyContext,
+        const void* filter,
+        UINT64 flowContext,
+        FWPS_CLASSIFY_OUT0_COMPAT* classifyOut);
+    void NTAPI classify_ale_connect(
+        const FWPS_INCOMING_VALUES0_COMPAT* inFixedValues,
+        const FWPS_INCOMING_METADATA_VALUES0_COMPAT* inMetaValues,
+        void* layerData,
+        const void* classifyContext,
+        const void* filter,
+        UINT64 flowContext,
+        FWPS_CLASSIFY_OUT0_COMPAT* classifyOut);
+    void NTAPI classify_ale_recv(
         const FWPS_INCOMING_VALUES0_COMPAT* inFixedValues,
         const FWPS_INCOMING_METADATA_VALUES0_COMPAT* inMetaValues,
         void* layerData,
@@ -319,14 +342,22 @@ namespace net_capture {
 
     inline UINT32 g_callout_id_inbound = 0;
     inline UINT32 g_callout_id_outbound = 0;
+    inline UINT32 g_callout_id_ale_connect = 0;
+    inline UINT32 g_callout_id_ale_recv = 0;
     inline UINT64 g_filter_id_inbound = 0;
     inline UINT64 g_filter_id_outbound = 0;
+    inline UINT64 g_filter_id_ale_connect = 0;
+    inline UINT64 g_filter_id_ale_recv = 0;
 
 
     static const GUID GUID_AIDA_CALLOUT_INBOUND =
         { 0x7a8b3c1d, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6 } };
     static const GUID GUID_AIDA_CALLOUT_OUTBOUND =
         { 0x7a8b3c1e, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf7 } };
+    static const GUID GUID_AIDA_CALLOUT_ALE_CONNECT =
+        { 0x7a8b3c20, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf9 } };
+    static const GUID GUID_AIDA_CALLOUT_ALE_RECV =
+        { 0x7a8b3c21, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xfa } };
     static const GUID GUID_AIDA_SUBLAYER =
         { 0x7a8b3c1f, 0x2e4f, 0x5a6b, { 0x8c, 0x9d, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf8 } };
 
@@ -1038,6 +1069,109 @@ namespace net_capture {
         }
     }
 
+
+    void NTAPI classify_ale_connect(
+        const FWPS_INCOMING_VALUES0_COMPAT* inFixedValues,
+        const FWPS_INCOMING_METADATA_VALUES0_COMPAT* inMetaValues,
+        void* layerData,
+        const void* classifyContext,
+        const void* filter,
+        UINT64 flowContext,
+        FWPS_CLASSIFY_OUT0_COMPAT* classifyOut)
+    {
+        UNREFERENCED_PARAMETER(layerData);
+        UNREFERENCED_PARAMETER(classifyContext);
+        UNREFERENCED_PARAMETER(filter);
+        UNREFERENCED_PARAMETER(flowContext);
+
+        if (!classifyOut) return;
+        classifyOut->actionType = FWP_ACTION_PERMIT_;
+
+        if (!inFixedValues || !inMetaValues) return;
+
+        __try {
+            UINT32 pid = 0;
+            if (inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) {
+                pid = (UINT32)inMetaValues->processId;
+            }
+            if (pid == 0) return;
+
+            UINT32 protocol = 0;
+            UINT32 local_port = 0;
+            UINT32 remote_port = 0;
+
+            if (inFixedValues->valueCount > FWPS_FIELD_ALE_V4_IP_PROTOCOL)
+                protocol = inFixedValues->incomingValue[FWPS_FIELD_ALE_V4_IP_PROTOCOL].value.uint8;
+            if (inFixedValues->valueCount > FWPS_FIELD_ALE_V4_IP_LOCAL_PORT)
+                local_port = inFixedValues->incomingValue[FWPS_FIELD_ALE_V4_IP_LOCAL_PORT].value.uint16;
+            if (inFixedValues->valueCount > FWPS_FIELD_ALE_V4_IP_REMOTE_PORT)
+                remote_port = inFixedValues->incomingValue[FWPS_FIELD_ALE_V4_IP_REMOTE_PORT].value.uint16;
+
+            UINT64 endpoint_handle = 0;
+            if (inMetaValues->transportEndpointHandle != 0)
+                endpoint_handle = inMetaValues->transportEndpointHandle;
+
+            if (endpoint_handle != 0) {
+                aida_store_cached_endpoint_pid(endpoint_handle, protocol, local_port, pid);
+            }
+            aida_store_cached_port_pid(protocol, local_port, pid);
+            if (remote_port != 0)
+                aida_store_cached_port_pid(protocol, remote_port, pid);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+
+    void NTAPI classify_ale_recv(
+        const FWPS_INCOMING_VALUES0_COMPAT* inFixedValues,
+        const FWPS_INCOMING_METADATA_VALUES0_COMPAT* inMetaValues,
+        void* layerData,
+        const void* classifyContext,
+        const void* filter,
+        UINT64 flowContext,
+        FWPS_CLASSIFY_OUT0_COMPAT* classifyOut)
+    {
+        UNREFERENCED_PARAMETER(layerData);
+        UNREFERENCED_PARAMETER(classifyContext);
+        UNREFERENCED_PARAMETER(filter);
+        UNREFERENCED_PARAMETER(flowContext);
+
+        if (!classifyOut) return;
+        classifyOut->actionType = FWP_ACTION_PERMIT_;
+
+        if (!inFixedValues || !inMetaValues) return;
+
+        __try {
+            UINT32 pid = 0;
+            if (inMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID_) {
+                pid = (UINT32)inMetaValues->processId;
+            }
+            if (pid == 0) return;
+
+            UINT32 protocol = 0;
+            UINT32 local_port = 0;
+            UINT32 remote_port = 0;
+
+            if (inFixedValues->valueCount > FWPS_FIELD_ALE_V4_IP_PROTOCOL)
+                protocol = inFixedValues->incomingValue[FWPS_FIELD_ALE_V4_IP_PROTOCOL].value.uint8;
+            if (inFixedValues->valueCount > FWPS_FIELD_ALE_V4_IP_LOCAL_PORT)
+                local_port = inFixedValues->incomingValue[FWPS_FIELD_ALE_V4_IP_LOCAL_PORT].value.uint16;
+            if (inFixedValues->valueCount > FWPS_FIELD_ALE_V4_IP_REMOTE_PORT)
+                remote_port = inFixedValues->incomingValue[FWPS_FIELD_ALE_V4_IP_REMOTE_PORT].value.uint16;
+
+            UINT64 endpoint_handle = 0;
+            if (inMetaValues->transportEndpointHandle != 0)
+                endpoint_handle = inMetaValues->transportEndpointHandle;
+
+            if (endpoint_handle != 0) {
+                aida_store_cached_endpoint_pid(endpoint_handle, protocol, local_port, pid);
+            }
+            aida_store_cached_port_pid(protocol, local_port, pid);
+            if (remote_port != 0)
+                aida_store_cached_port_pid(protocol, remote_port, pid);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+
     NTSTATUS NTAPI callout_notify(
         UINT32 notifyType, const GUID* filterKey, const void* filter)
     {
@@ -1323,6 +1457,89 @@ namespace net_capture {
         }
 
 
+        FWPS_CALLOUT2_COMPAT callout_ale_conn = {};
+        callout_ale_conn.calloutKey = GUID_AIDA_CALLOUT_ALE_CONNECT;
+        callout_ale_conn.flags = 0;
+        callout_ale_conn.classifyFn = (PVOID)classify_ale_connect;
+        callout_ale_conn.notifyFn = (PVOID)callout_notify;
+        callout_ale_conn.flowDeleteFn = nullptr;
+
+        status = _FwpsCalloutRegister2(devObj, &callout_ale_conn, &g_callout_id_ale_connect);
+        if (!NT_SUCCESS(status)) {
+            AIDA_NET_LOG("register_wfp: ALE connect FwpsCalloutRegister2 failed status=0x%08X (non-fatal)", (UINT32)status);
+            g_callout_id_ale_connect = 0;
+        } else {
+            FWPS_CALLOUT2_COMPAT callout_ale_recv_co = {};
+            callout_ale_recv_co.calloutKey = GUID_AIDA_CALLOUT_ALE_RECV;
+            callout_ale_recv_co.flags = 0;
+            callout_ale_recv_co.classifyFn = (PVOID)classify_ale_recv;
+            callout_ale_recv_co.notifyFn = (PVOID)callout_notify;
+            callout_ale_recv_co.flowDeleteFn = nullptr;
+
+            status = _FwpsCalloutRegister2(devObj, &callout_ale_recv_co, &g_callout_id_ale_recv);
+            if (!NT_SUCCESS(status)) {
+                AIDA_NET_LOG("register_wfp: ALE recv FwpsCalloutRegister2 failed status=0x%08X (non-fatal)", (UINT32)status);
+                g_callout_id_ale_recv = 0;
+            }
+
+
+            if (g_callout_id_ale_connect) {
+                FWPM_CALLOUT0_COMPAT fwpm_ale_conn = {};
+                fwpm_ale_conn.calloutKey = GUID_AIDA_CALLOUT_ALE_CONNECT;
+                fwpm_ale_conn.displayData = callout_display;
+                fwpm_ale_conn.applicableLayer = GUID_LAYER_ALE_CONNECT_V4;
+                _FwpmCalloutAdd0(g_engine_handle, &fwpm_ale_conn, nullptr, &unused_id);
+
+                FWPM_FILTER0_COMPAT filter_ale_conn = {};
+                strong::kmemset(&filter_ale_conn, 0, sizeof(filter_ale_conn));
+                filter_ale_conn.displayData = filter_display;
+                filter_ale_conn.layerKey = GUID_LAYER_ALE_CONNECT_V4;
+                filter_ale_conn.subLayerKey = GUID_AIDA_SUBLAYER;
+                filter_ale_conn.weight.type = FWP_EMPTY_;
+                filter_ale_conn.action.type = FWP_ACTION_CALLOUT_TERMINATING_;
+                filter_ale_conn.action.calloutKey = GUID_AIDA_CALLOUT_ALE_CONNECT;
+                filter_ale_conn.numFilterConditions = 0;
+
+                status = _FwpmFilterAdd0(g_engine_handle, &filter_ale_conn, nullptr, &g_filter_id_ale_connect);
+                if (!NT_SUCCESS(status)) {
+                    AIDA_NET_LOG("register_wfp: ALE connect filter failed status=0x%08X (non-fatal)", (UINT32)status);
+                    g_filter_id_ale_connect = 0;
+                }
+            }
+
+
+            if (g_callout_id_ale_recv) {
+                FWPM_CALLOUT0_COMPAT fwpm_ale_recv = {};
+                fwpm_ale_recv.calloutKey = GUID_AIDA_CALLOUT_ALE_RECV;
+                fwpm_ale_recv.displayData = callout_display;
+                fwpm_ale_recv.applicableLayer = GUID_LAYER_ALE_RECV_V4;
+                _FwpmCalloutAdd0(g_engine_handle, &fwpm_ale_recv, nullptr, &unused_id);
+
+                FWPM_FILTER0_COMPAT filter_ale_recv = {};
+                strong::kmemset(&filter_ale_recv, 0, sizeof(filter_ale_recv));
+                filter_ale_recv.displayData = filter_display;
+                filter_ale_recv.layerKey = GUID_LAYER_ALE_RECV_V4;
+                filter_ale_recv.subLayerKey = GUID_AIDA_SUBLAYER;
+                filter_ale_recv.weight.type = FWP_EMPTY_;
+                filter_ale_recv.action.type = FWP_ACTION_CALLOUT_TERMINATING_;
+                filter_ale_recv.action.calloutKey = GUID_AIDA_CALLOUT_ALE_RECV;
+                filter_ale_recv.numFilterConditions = 0;
+
+                status = _FwpmFilterAdd0(g_engine_handle, &filter_ale_recv, nullptr, &g_filter_id_ale_recv);
+                if (!NT_SUCCESS(status)) {
+                    AIDA_NET_LOG("register_wfp: ALE recv filter failed status=0x%08X (non-fatal)", (UINT32)status);
+                    g_filter_id_ale_recv = 0;
+                }
+            }
+
+            AIDA_NET_LOG("register_wfp: ALE callouts ale_connect=%u ale_recv=%u",
+                g_callout_id_ale_connect, g_callout_id_ale_recv);
+        }
+
+
+        status = STATUS_SUCCESS;
+
+
         status = _FwpmTransactionCommit0(g_engine_handle);
         if (!NT_SUCCESS(status)) {
             AIDA_NET_LOG("register_wfp: FwpmTransactionCommit0 failed status=0x%08X", (UINT32)status);
@@ -1343,6 +1560,14 @@ namespace net_capture {
 
     void unregister_wfp() {
         if (g_engine_handle) {
+            if (g_filter_id_ale_recv) {
+                _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_ale_recv);
+                g_filter_id_ale_recv = 0;
+            }
+            if (g_filter_id_ale_connect) {
+                _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_ale_connect);
+                g_filter_id_ale_connect = 0;
+            }
             if (g_filter_id_inbound) {
                 _FwpmFilterDeleteById0(g_engine_handle, g_filter_id_inbound);
                 g_filter_id_inbound = 0;
@@ -1356,6 +1581,14 @@ namespace net_capture {
             }
             _FwpmEngineClose0(g_engine_handle);
             g_engine_handle = nullptr;
+        }
+        if (g_callout_id_ale_recv) {
+            _FwpsCalloutUnregisterById0(g_callout_id_ale_recv);
+            g_callout_id_ale_recv = 0;
+        }
+        if (g_callout_id_ale_connect) {
+            _FwpsCalloutUnregisterById0(g_callout_id_ale_connect);
+            g_callout_id_ale_connect = 0;
         }
         if (g_callout_id_inbound) {
             _FwpsCalloutUnregisterById0(g_callout_id_inbound);

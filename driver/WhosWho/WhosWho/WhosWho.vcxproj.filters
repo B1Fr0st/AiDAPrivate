@@ -28,9 +28,6 @@
     <ClCompile Include="src\function\impl\BaseAddress.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\function\impl\MouseMovement.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="src\function\impl\DTB.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

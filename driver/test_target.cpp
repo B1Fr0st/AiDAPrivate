@@ -372,7 +372,7 @@ int main() {
     fprintf(stderr, "PID: %lu\n", GetCurrentProcessId());
     fprintf(stderr, "Image Base: 0x%p\n", GetModuleHandleW(nullptr));
     fprintf(stderr, "Generating network traffic for driver testing...\n");
-    fprintf(stderr, "Press Enter or signal Global\\WhosWhoTestDone to exit.\n\n");
+    fprintf(stderr, "Signal Global\\WhosWhoTestDone or wait for timeout to exit.\n\n");
 
 
     WSADATA wsa_data{};
@@ -385,7 +385,12 @@ int main() {
 
     g_done_event = CreateEventW(nullptr, TRUE, FALSE, L"Global\\WhosWhoTestDone");
     if (!g_done_event) {
-
+        DWORD err = GetLastError();
+        fprintf(stderr, "[target] CreateEvent Global\\ failed err=%lu, trying Local\\\n", err);
+        g_done_event = CreateEventW(nullptr, TRUE, FALSE, L"Local\\WhosWhoTestDone");
+    }
+    if (!g_done_event) {
+        fprintf(stderr, "[target] CreateEvent Local\\ also failed, using unnamed event\n");
         g_done_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     }
 
@@ -424,17 +429,10 @@ int main() {
             static_cast<unsigned long long>(threads.size()));
 
 
-    HANDLE stdin_handle = GetStdHandle(STD_INPUT_HANDLE);
-    HANDLE wait_handles[2] = { g_done_event, stdin_handle };
-
-    DWORD wait_result = WaitForMultipleObjects(2, wait_handles, FALSE, 10 * 60 * 1000);
+    DWORD wait_result = WaitForSingleObject(g_done_event, 10 * 60 * 1000);
 
     if (wait_result == WAIT_OBJECT_0) {
         fprintf(stderr, "\n[target] Shutdown signaled via event.\n");
-    } else if (wait_result == WAIT_OBJECT_0 + 1) {
-
-        FlushConsoleInputBuffer(stdin_handle);
-        fprintf(stderr, "\n[target] Shutdown via console input.\n");
     } else {
         fprintf(stderr, "\n[target] Timeout reached, shutting down.\n");
     }
