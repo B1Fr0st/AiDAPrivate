@@ -80,6 +80,8 @@ struct hook_request_data {
 struct hook_response_data {
     int         status_code = 0;
     std::string reason;
+    std::string host;
+    uint16_t    port = 0;
     std::map<std::string, std::string> headers;
     std::vector<uint8_t> body;
     uint64_t    latency_ms = 0;
@@ -91,8 +93,11 @@ struct hook_response_data {
 struct hook_ws_frame_data {
     std::string opcode;
     bool        from_server = false;
+    bool        is_outbound = false;
+    bool        is_text = false;
     std::vector<uint8_t> payload;
     std::string host;
+    uint16_t    port = 0;
 
     bool        modified = false;
     bool        dropped  = false;
@@ -133,6 +138,10 @@ struct hook_connection_data {
     bool        is_tls = false;
 
     bool        blocked = false;
+};
+
+struct protobuf_message_t {
+    std::vector<decoder_pipeline::protobuf_field> fields;
 };
 
 

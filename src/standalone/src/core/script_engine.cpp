@@ -162,10 +162,10 @@ static sol::table lua_regex_find(const std::string& text, const std::string& pat
     try {
 
         auto gmatch = lua["string"]["gmatch"];
-        auto iter = gmatch(text, pattern);
+        sol::protected_function iter = gmatch(text, pattern);
         int idx = 1;
         while (true) {
-            auto match_result = iter();
+            sol::protected_function_result match_result = iter();
             if (!match_result.valid() || match_result.get_type() == sol::type::lua_nil) break;
             results[idx++] = match_result.get<std::string>();
         }
@@ -184,7 +184,21 @@ static void register_usertypes(sol::state& lua) {
         "host",     &hook_request_data::host,
         "port",     &hook_request_data::port,
         "is_tls",   &hook_request_data::is_tls,
-        "headers",  &hook_request_data::headers,
+        "headers",  sol::property(
+            [](hook_request_data& self, sol::this_state s) -> sol::table {
+                sol::state_view lua(s);
+                sol::table t = lua.create_table();
+                for (const auto& kv : self.headers) t[kv.first] = kv.second;
+                return t;
+            },
+            [](hook_request_data& self, sol::table t) {
+                self.headers.clear();
+                for (const auto& kv : t) {
+                    if (kv.first.get_type() == sol::type::string && kv.second.get_type() == sol::type::string)
+                        self.headers[kv.first.as<std::string>()] = kv.second.as<std::string>();
+                }
+            }
+        ),
         "body",     &hook_request_data::body,
         "modified", &hook_request_data::modified,
         "dropped",  &hook_request_data::dropped,
@@ -214,7 +228,21 @@ static void register_usertypes(sol::state& lua) {
     lua.new_usertype<hook_response_data>("Response",
         "status_code", &hook_response_data::status_code,
         "reason",      &hook_response_data::reason,
-        "headers",     &hook_response_data::headers,
+        "headers",     sol::property(
+            [](hook_response_data& self, sol::this_state s) -> sol::table {
+                sol::state_view lua(s);
+                sol::table t = lua.create_table();
+                for (const auto& kv : self.headers) t[kv.first] = kv.second;
+                return t;
+            },
+            [](hook_response_data& self, sol::table t) {
+                self.headers.clear();
+                for (const auto& kv : t) {
+                    if (kv.first.get_type() == sol::type::string && kv.second.get_type() == sol::type::string)
+                        self.headers[kv.first.as<std::string>()] = kv.second.as<std::string>();
+                }
+            }
+        ),
         "body",        &hook_response_data::body,
         "latency_ms",  &hook_response_data::latency_ms,
         "modified",    &hook_response_data::modified,
@@ -300,6 +328,97 @@ static void register_usertypes(sol::state& lua) {
         "blocked",      &hook_connection_data::blocked,
         "block", [](hook_connection_data& self) { self.blocked = true; }
     );
+
+    lua.new_usertype<protobuf_message_t>("ProtobufMessage",
+        // fields_count(): number of decoded fields
+        "fields_count", [](const protobuf_message_t& self) -> int {
+            return static_cast<int>(self.fields.size());
+        },
+        // field_at(i): table {field_number, wire_type, value} — 1-based
+        "field_at", [](const protobuf_message_t& self, int i) -> sol::optional<sol::table> {
+            if (!g_lua) return sol::nullopt;
+            if (i < 1 || i > static_cast<int>(self.fields.size())) return sol::nullopt;
+            auto& f = self.fields[static_cast<size_t>(i - 1)];
+            sol::table t = g_lua->create_table();
+            t["field_number"] = f.field_number;
+            t["wire_type"]    = f.wire_type;
+            switch (f.wire_type) {
+                case 0: t["value"] = std::to_string(f.varint_value); break;
+                case 1: t["value"] = std::to_string(f.varint_value); break;
+                case 2: t["value"] = std::string(f.bytes_value.begin(), f.bytes_value.end()); break;
+                case 5: t["value"] = std::to_string(static_cast<uint32_t>(f.varint_value & 0xFFFFFFFF)); break;
+                default: t["value"] = std::string(); break;
+            }
+            return t;
+        },
+        // get(field_number): first matching field value as string, or nil
+        "get", [](const protobuf_message_t& self, uint32_t field_num) -> sol::optional<std::string> {
+            for (auto& f : self.fields) {
+                if (f.field_number != field_num) continue;
+                switch (f.wire_type) {
+                    case 0: return std::to_string(f.varint_value);
+                    case 1: return std::to_string(f.varint_value);
+                    case 2: return std::string(f.bytes_value.begin(), f.bytes_value.end());
+                    case 5: return std::to_string(static_cast<uint32_t>(f.varint_value & 0xFFFFFFFF));
+                    default: return std::string();
+                }
+            }
+            return sol::nullopt;
+        },
+        // set(field_number, value_string): update first matching field, or add wire_type=2 field
+        "set", [](protobuf_message_t& self, uint32_t field_num, const std::string& val) {
+            for (auto& f : self.fields) {
+                if (f.field_number != field_num) continue;
+                switch (f.wire_type) {
+                    case 0: case 1: case 5:
+                        try { f.varint_value = std::stoull(val); } catch(...) {}
+                        return;
+                    case 2:
+                        f.bytes_value.assign(val.begin(), val.end());
+                        return;
+                    default:
+                        return;
+                }
+            }
+            // Not found — append a length-delimited field
+            decoder_pipeline::protobuf_field nf;
+            nf.field_number = field_num;
+            nf.wire_type    = 2;
+            nf.bytes_value.assign(val.begin(), val.end());
+            self.fields.push_back(std::move(nf));
+        },
+        // add_varint(field_number, value): append a varint field
+        "add_varint", [](protobuf_message_t& self, uint32_t field_num, uint64_t val) {
+            decoder_pipeline::protobuf_field f;
+            f.field_number  = field_num;
+            f.wire_type     = 0;
+            f.varint_value  = val;
+            self.fields.push_back(std::move(f));
+        },
+        // add_bytes(field_number, data_string): append a length-delimited field
+        "add_bytes", [](protobuf_message_t& self, uint32_t field_num, const std::string& val) {
+            decoder_pipeline::protobuf_field f;
+            f.field_number = field_num;
+            f.wire_type    = 2;
+            f.bytes_value.assign(val.begin(), val.end());
+            self.fields.push_back(std::move(f));
+        },
+        // encode(): serialize fields back to protobuf wire format (returns raw byte string)
+        "encode", [](const protobuf_message_t& self) -> std::string {
+            auto bytes = decoder_pipeline::protobuf_encode(self.fields);
+            return std::string(bytes.begin(), bytes.end());
+        },
+        // grpc_frame(): encode and wrap in a 5-byte gRPC length-prefix frame
+        "grpc_frame", [](const protobuf_message_t& self) -> std::string {
+            auto proto = decoder_pipeline::protobuf_encode(self.fields);
+            auto framed = decoder_pipeline::grpc_encode(proto);
+            return std::string(framed.begin(), framed.end());
+        },
+        // text(): human-readable field dump
+        "text", [](const protobuf_message_t& self) -> std::string {
+            return decoder_pipeline::protobuf_to_text(self.fields);
+        }
+    );
 }
 
 
@@ -370,6 +489,47 @@ static void register_api(sol::state& lua) {
 
 
     lua.set_function("time_ms", now_ms);
+
+
+    // Protobuf / gRPC helpers
+    //
+    // proto_parse(data_string) -> ProtobufMessage
+    //   Parse raw protobuf wire bytes.  The argument may be a Lua string containing
+    //   binary data (e.g. request.body converted with bytes_to_string).
+    lua.set_function("proto_parse", [](const std::string& data) -> protobuf_message_t {
+        protobuf_message_t msg;
+        msg.fields = decoder_pipeline::decode_protobuf_wire(
+            reinterpret_cast<const uint8_t*>(data.data()), data.size());
+        return msg;
+    });
+
+    // proto_build() -> ProtobufMessage  (empty, ready to add_varint / add_bytes)
+    lua.set_function("proto_build", []() -> protobuf_message_t {
+        return protobuf_message_t{};
+    });
+
+    // grpc_parse(data_string) -> ProtobufMessage
+    //   Strip the 5-byte gRPC frame header, then parse the protobuf payload.
+    lua.set_function("grpc_parse", [](const std::string& data) -> protobuf_message_t {
+        protobuf_message_t msg;
+        // Minimum valid gRPC frame: 5 bytes header
+        if (data.size() < 5) return msg;
+        // Byte 0: compression flag (0 = not compressed, skip compressed frames)
+        if (static_cast<uint8_t>(data[0]) != 0x00) return msg;
+        uint32_t len = (static_cast<uint8_t>(data[1]) << 24) |
+                       (static_cast<uint8_t>(data[2]) << 16) |
+                       (static_cast<uint8_t>(data[3]) <<  8) |
+                        static_cast<uint8_t>(data[4]);
+        if (data.size() < 5 + len) return msg;
+        msg.fields = decoder_pipeline::decode_protobuf_wire(
+            reinterpret_cast<const uint8_t*>(data.data() + 5), len);
+        return msg;
+    });
+
+    // grpc_build() -> ProtobufMessage  (empty, ready to populate then call grpc_frame())
+    lua.set_function("grpc_build", []() -> protobuf_message_t {
+        return protobuf_message_t{};
+    });
 
 
     lua["_hooks"] = lua.create_table();

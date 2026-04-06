@@ -19,6 +19,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <regex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1914,84 +1916,177 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
 static void run_fuzzer_thread(state_t& state) {
     auto& cfg = state.fuzz_config;
 
-
-    std::vector<std::string> payloads;
-    if (cfg.payload_type == 0) {
-
-        std::ifstream wf(cfg.payload_source);
-        if (wf.is_open()) {
+    // Load entries from a single payload_set_t (file or inline text).
+    auto load_set = [](const payload_set_t& ps) -> std::vector<std::string> {
+        std::vector<std::string> lines;
+        auto push_line = [&](std::istream& is) {
             std::string line;
-            while (std::getline(wf, line)) {
+            while (std::getline(is, line)) {
                 if (!line.empty() && line.back() == '\r') line.pop_back();
-                if (!line.empty()) payloads.push_back(std::move(line));
+                if (!line.empty()) lines.push_back(std::move(line));
             }
+        };
+        if (ps.type == 0) { // wordlist file
+            std::ifstream f(ps.source);
+            if (f.is_open()) push_line(f);
+        } else { // inline newline-separated list
+            std::istringstream ss(ps.source);
+            push_line(ss);
         }
-    } else if (cfg.payload_type == 1) {
-
-        int start_n = 0, end_n = 100;
-        if (sscanf(cfg.payload_source.c_str(), "%d-%d", &start_n, &end_n) >= 1) {
-            for (int n = start_n; n <= end_n; n++)
-                payloads.push_back(std::to_string(n));
-        }
-    } else if (cfg.payload_type == 2) {
-
-        std::string charset = cfg.payload_source.empty() ? "abcdefghijklmnopqrstuvwxyz0123456789" : cfg.payload_source;
-
-        for (char c : charset)
-            payloads.push_back(std::string(1, c));
-
-        for (char c1 : charset)
-            for (char c2 : charset)
-                payloads.push_back(std::string(1, c1) + c2);
-    }
-
-    if (payloads.empty()) {
-        state.fuzz_running.store(false);
-        return;
-    }
-
-    state.fuzz_total.store(static_cast<int>(payloads.size()));
-    state.fuzz_progress.store(0);
-
-
-    const std::string marker_start = "\xc2\xa7";
-    const std::string marker_end = "\xc2\xa7";
-
-    auto make_request = [&](const std::string& payload) -> std::string {
-        std::string req = cfg.base_request;
-
-        size_t pos = 0;
-        while (true) {
-            size_t s = req.find(marker_start, pos);
-            if (s == std::string::npos) break;
-            size_t e = req.find(marker_end, s + marker_start.size());
-            if (e == std::string::npos) break;
-            req.replace(s, e - s + marker_end.size(), payload);
-            pos = s + payload.size();
-        }
-
-        pos = 0;
-        while (true) {
-            size_t s = req.find("FUZZ", pos);
-            if (s == std::string::npos) break;
-            req.replace(s, 4, payload);
-            pos = s + payload.size();
-        }
-        return req;
+        return lines;
     };
 
-    auto check_match = [&](int status_code, const std::string& body, size_t resp_len) -> bool {
-        if (cfg.match_status > 0 && status_code != cfg.match_status) return false;
+    // Legacy single-set loader using cfg.payload_source / cfg.payload_type.
+    auto load_legacy_set = [&]() -> std::vector<std::string> {
+        payload_set_t tmp;
+        tmp.type   = cfg.payload_type;
+        tmp.source = cfg.payload_source;
+        if (cfg.payload_type == 1) { // sequential numbers range
+            std::vector<std::string> nums;
+            int start_n = 0, end_n = 100;
+            if (sscanf(cfg.payload_source.c_str(), "%d-%d", &start_n, &end_n) >= 1)
+                for (int n = start_n; n <= end_n; n++)
+                    nums.push_back(std::to_string(n));
+            return nums;
+        } else if (cfg.payload_type == 2) { // charset brute (1-2 chars)
+            std::string charset = cfg.payload_source.empty()
+                ? "abcdefghijklmnopqrstuvwxyz0123456789" : cfg.payload_source;
+            std::vector<std::string> v;
+            for (char c : charset) v.push_back(std::string(1, c));
+            for (char a : charset)
+                for (char b : charset)
+                    v.push_back(std::string(1, a) + b);
+            return v;
+        }
+        return load_set(tmp);
+    };
+
+    // Replace §...§ markers in tmpl sequentially with entries from payloads.
+    // Also replaces bare FUZZ tokens with the first payload (backward compat).
+    auto make_request_multi = [](const std::string& tmpl,
+                                  const std::vector<std::string>& payloads) -> std::string {
+        const std::string marker = "\xc2\xa7"; // UTF-8 §
+        std::string result;
+        result.reserve(tmpl.size() + 512);
+        size_t pos = 0;
+        size_t pi  = 0;
+        while (pos < tmpl.size()) {
+            size_t s = tmpl.find(marker, pos);
+            if (s == std::string::npos) { result.append(tmpl, pos, std::string::npos); break; }
+            size_t e = tmpl.find(marker, s + marker.size());
+            if (e == std::string::npos) { result.append(tmpl, pos, std::string::npos); break; }
+            result.append(tmpl, pos, s - pos);
+            if (pi < payloads.size()) result.append(payloads[pi]);
+            pi++;
+            pos = e + marker.size();
+        }
+        // Legacy: also replace bare FUZZ with the first payload.
+        if (!payloads.empty()) {
+            size_t fp = 0;
+            const std::string fuzz_tok = "FUZZ";
+            while ((fp = result.find(fuzz_tok, fp)) != std::string::npos) {
+                result.replace(fp, fuzz_tok.size(), payloads[0]);
+                fp += payloads[0].size();
+            }
+        }
+        return result;
+    };
+
+    // Run a regex against body and return the requested group as a string.
+    auto do_grep_extract = [](const std::string& body,
+                               const char* re_str,
+                               const char* grp_str) -> std::string {
+        if (!re_str || re_str[0] == '\0') return {};
+        try {
+            std::regex re(re_str);
+            std::smatch m;
+            if (std::regex_search(body, m, re)) {
+                int grp = 1;
+                try { grp = std::stoi(grp_str); } catch (...) {}
+                if (grp >= 0 && grp < static_cast<int>(m.size()))
+                    return m[static_cast<size_t>(grp)].str();
+            }
+        } catch (...) {}
+        return {};
+    };
+
+    // Check whether a response matches the configured match rules.
+    auto check_match = [&](int sc, const std::string& body, size_t len) -> bool {
+        if (cfg.match_status > 0 && sc != cfg.match_status) return false;
         if (!cfg.match_body.empty() && body.find(cfg.match_body) == std::string::npos) return false;
-        if (cfg.match_size_op == 1 && static_cast<int>(resp_len) != cfg.match_size) return false;
-        if (cfg.match_size_op == 2 && static_cast<int>(resp_len) <= cfg.match_size) return false;
-        if (cfg.match_size_op == 3 && static_cast<int>(resp_len) >= cfg.match_size) return false;
+        if (cfg.match_size_op == 1 && static_cast<int>(len) != cfg.match_size) return false;
+        if (cfg.match_size_op == 2 && static_cast<int>(len) <= cfg.match_size) return false;
+        if (cfg.match_size_op == 3 && static_cast<int>(len) >= cfg.match_size) return false;
         return true;
     };
 
+    // ---------- Build the flat combo list (one entry per request to send) ----------
+    using combo_t = std::vector<std::string>; // per-position payload values
+    std::vector<combo_t> combos;
+
+    switch (cfg.attack_mode) {
+
+        case fuzzer_attack_mode_t::sniper: {
+            std::vector<std::string> payloads = cfg.payload_sets.empty()
+                ? load_legacy_set()
+                : load_set(cfg.payload_sets[0]);
+            combos.reserve(payloads.size());
+            for (auto& p : payloads) combos.push_back({ p });
+            break;
+        }
+
+        case fuzzer_attack_mode_t::pitchfork: {
+            if (cfg.payload_sets.empty()) { state.fuzz_running.store(false); return; }
+            std::vector<std::vector<std::string>> sets;
+            sets.reserve(cfg.payload_sets.size());
+            for (auto& ps : cfg.payload_sets) {
+                sets.push_back(load_set(ps));
+                if (sets.back().empty()) { state.fuzz_running.store(false); return; }
+            }
+            size_t min_len = sets[0].size();
+            for (auto& s : sets) min_len = std::min(min_len, s.size());
+            combos.reserve(min_len);
+            for (size_t i = 0; i < min_len; i++) {
+                combo_t c;
+                c.reserve(sets.size());
+                for (auto& s : sets) c.push_back(s[i]);
+                combos.push_back(std::move(c));
+            }
+            break;
+        }
+
+        case fuzzer_attack_mode_t::clusterbomb: {
+            if (cfg.payload_sets.empty()) { state.fuzz_running.store(false); return; }
+            std::vector<std::vector<std::string>> sets;
+            sets.reserve(cfg.payload_sets.size());
+            for (auto& ps : cfg.payload_sets) {
+                sets.push_back(load_set(ps));
+                if (sets.back().empty()) { state.fuzz_running.store(false); return; }
+            }
+            // Iterative cartesian product (row-major).
+            combos.push_back(combo_t{});
+            for (auto& s : sets) {
+                std::vector<combo_t> next;
+                next.reserve(combos.size() * s.size());
+                for (auto& base : combos)
+                    for (auto& val : s) {
+                        combo_t nc = base;
+                        nc.push_back(val);
+                        next.push_back(std::move(nc));
+                    }
+                combos = std::move(next);
+            }
+            break;
+        }
+    }
+
+    if (combos.empty()) { state.fuzz_running.store(false); return; }
+
+    state.fuzz_total.store(static_cast<int>(combos.size()));
+    state.fuzz_progress.store(0);
 
     std::atomic<int> next_index{0};
-    int total = static_cast<int>(payloads.size());
+    int total   = static_cast<int>(combos.size());
     int threads = std::min(cfg.thread_count, 32);
 
     auto worker = [&]() {
@@ -1999,30 +2094,38 @@ static void run_fuzzer_thread(state_t& state) {
             int idx = next_index.fetch_add(1);
             if (idx >= total) break;
 
-            auto& payload = payloads[static_cast<size_t>(idx)];
-            std::string req_str = make_request(payload);
+            auto& combo       = combos[static_cast<size_t>(idx)];
+            std::string req_s = make_request_multi(cfg.base_request, combo);
+            std::vector<uint8_t> raw_req(req_s.begin(), req_s.end());
 
-            std::vector<uint8_t> raw_req(req_str.begin(), req_str.end());
-
-            auto start = GetTickCount64();
-            auto result = mitm_proxy::repeat_request(cfg.host, cfg.port, cfg.use_tls, raw_req);
-            auto elapsed = GetTickCount64() - start;
+            auto t0 = GetTickCount64();
+            auto res = mitm_proxy::repeat_request(cfg.host, cfg.port, cfg.use_tls, raw_req);
+            auto elapsed = GetTickCount64() - t0;
 
             state_t::fuzzer_result fr;
-            fr.index = idx;
-            fr.payload = payload;
+            fr.index     = idx;
+            fr.payloads  = combo;
+            fr.payload   = combo.empty() ? std::string() : combo[0]; // legacy compat
             fr.latency_ms = elapsed;
 
-            if (result.success) {
-                fr.status_code = result.exchange.response.status_code;
-                fr.response_len = result.exchange.raw_response.size();
-                std::string body_str(result.exchange.raw_response.begin(), result.exchange.raw_response.end());
-                fr.response_preview = body_str.substr(0, std::min<size_t>(200, body_str.size()));
-                fr.match = check_match(fr.status_code, body_str, fr.response_len);
+            if (res.success) {
+                fr.status_code  = res.exchange.response.status_code;
+                fr.response_len = res.exchange.raw_response.size();
+                std::string body(res.exchange.raw_response.begin(),
+                                 res.exchange.raw_response.end());
+                fr.response_preview = body.substr(0, std::min<size_t>(200, body.size()));
+                fr.match = check_match(fr.status_code, body, fr.response_len);
+
+                // Grep-extract: use regex from the first payload_set (or the only set).
+                if (!cfg.payload_sets.empty()) {
+                    fr.extracted_value = do_grep_extract(body,
+                        cfg.payload_sets[0].grep_regex,
+                        cfg.payload_sets[0].grep_group);
+                }
             }
 
             {
-                std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+                std::lock_guard<std::mutex> lk(state.fuzz_mutex);
                 state.fuzz_results.push_back(std::move(fr));
             }
             state.fuzz_progress.fetch_add(1);
@@ -2031,20 +2134,14 @@ static void run_fuzzer_thread(state_t& state) {
                 state.fuzz_running.store(false);
                 break;
             }
-
-            if (cfg.delay_ms > 0)
-                Sleep(static_cast<DWORD>(cfg.delay_ms));
+            if (cfg.delay_ms > 0) Sleep(static_cast<DWORD>(cfg.delay_ms));
         }
     };
 
     std::vector<std::thread> pool;
     pool.reserve(static_cast<size_t>(threads));
-    for (int t = 0; t < threads; t++)
-        pool.emplace_back(worker);
-
-    for (auto& th : pool) {
-        if (th.joinable()) th.join();
-    }
+    for (int t = 0; t < threads; t++) pool.emplace_back(worker);
+    for (auto& th : pool) if (th.joinable()) th.join();
 
     state.fuzz_running.store(false);
 }
@@ -2061,7 +2158,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
 
     auto& cfg = state.fuzz_config;
 
-
+    // ---- Target ----
     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Host:");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(200.f);
@@ -2073,31 +2170,145 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     ImGui::SameLine();
     ImGui::SetNextItemWidth(60.f);
     int fp = cfg.port;
-    if (ImGui::InputInt("##fuzz_port", &fp, 0, 0)) cfg.port = static_cast<uint16_t>(std::max(1, std::min(65535, fp)));
+    if (ImGui::InputInt("##fuzz_port", &fp, 0, 0))
+        cfg.port = static_cast<uint16_t>(std::max(1, std::min(65535, fp)));
     ImGui::SameLine();
     ImGui::Checkbox("TLS##fuzz", &cfg.use_tls);
 
     ImGui::Spacing();
 
-
-    const char* payload_types[] = { "Wordlist File", "Sequential Numbers", "Charset Brute" };
-    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Payload Type:");
+    // ---- Attack Mode ----
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Attack Mode:");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(160.f);
-    ImGui::Combo("##fuzz_pt", &cfg.payload_type, payload_types, 3);
-
-    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Payload Source:");
+    int am = static_cast<int>(cfg.attack_mode);
+    if (ImGui::RadioButton("Sniper##fuzz",      &am, 0)) cfg.attack_mode = fuzzer_attack_mode_t::sniper;
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(300.f);
-    static char pl_src[512] = {};
-    if (cfg.payload_source.size() < sizeof(pl_src)) { memcpy(pl_src, cfg.payload_source.c_str(), cfg.payload_source.size() + 1); }
-    if (ImGui::InputText("##fuzz_src", pl_src, sizeof(pl_src))) cfg.payload_source = pl_src;
+    if (ImGui::RadioButton("Pitchfork##fuzz",   &am, 1)) cfg.attack_mode = fuzzer_attack_mode_t::pitchfork;
     ImGui::SameLine();
-    if (cfg.payload_type == 0) ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha), "(path to wordlist)");
-    else if (cfg.payload_type == 1) ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha), "(start-end, e.g. 1-1000)");
-    else ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha), "(charset, e.g. abc123)");
+    if (ImGui::RadioButton("Clusterbomb##fuzz", &am, 2)) cfg.attack_mode = fuzzer_attack_mode_t::clusterbomb;
 
+    ImGui::Spacing();
 
+    // ---- Payload Sets panel ----
+    if (cfg.attack_mode == fuzzer_attack_mode_t::sniper) {
+        // Legacy single-source UI
+        const char* payload_types[] = { "Wordlist File", "Sequential Numbers", "Charset Brute" };
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Payload Type:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(160.f);
+        ImGui::Combo("##fuzz_pt", &cfg.payload_type, payload_types, 3);
+
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Payload Source:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(300.f);
+        static char pl_src[512] = {};
+        if (cfg.payload_source.size() < sizeof(pl_src)) {
+            memcpy(pl_src, cfg.payload_source.c_str(), cfg.payload_source.size() + 1);
+        }
+        if (ImGui::InputText("##fuzz_src", pl_src, sizeof(pl_src))) cfg.payload_source = pl_src;
+        ImGui::SameLine();
+        if (cfg.payload_type == 0) ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha), "(path to wordlist)");
+        else if (cfg.payload_type == 1) ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha), "(start-end)");
+        else ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha), "(charset)");
+
+        // Grep-extract for sniper (uses payload_sets[0] or creates it)
+        if (cfg.payload_sets.empty()) cfg.payload_sets.emplace_back();
+        auto& ps0 = cfg.payload_sets[0];
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Grep Extract:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(250.f);
+        ImGui::InputTextWithHint("##fuzz_grep0", "regex (leave empty to skip)",
+                                 ps0.grep_regex, sizeof(ps0.grep_regex));
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha), "Group:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(40.f);
+        ImGui::InputText("##fuzz_grp0", ps0.grep_group, sizeof(ps0.grep_group));
+
+    } else {
+        // Multi-set panel (pitchfork / clusterbomb)
+        ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "Payload Sets");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha), "(one set per injection position §...§)");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("+##fuzz_addset")) cfg.payload_sets.emplace_back();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("-##fuzz_remset") && !cfg.payload_sets.empty())
+            cfg.payload_sets.pop_back();
+
+        float sets_h = std::min(h * 0.35f, 200.f);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(20, 20, 30, static_cast<int>(160 * alpha)));
+        ImGui::BeginChild("##fuzz_sets_panel", ImVec2(w - 8.f, sets_h), true,
+                          ImGuiWindowFlags_NoBackground);
+
+        static int  set_sel = 0;
+        const char* set_type_items[] = { "Wordlist File", "Inline List" };
+
+        for (int si = 0; si < static_cast<int>(cfg.payload_sets.size()); si++) {
+            auto& ps = cfg.payload_sets[static_cast<size_t>(si)];
+            ImGui::PushID(si);
+
+            // Set header row: index + name + type + source
+            char set_label[32];
+            snprintf(set_label, sizeof(set_label), "Set %d", si + 1);
+            if (ImGui::CollapsingHeader(set_label)) {
+                ImGui::Indent(12.f);
+
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Name:");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(160.f);
+                char name_buf[128] = {};
+                if (ps.name.size() < sizeof(name_buf))
+                    memcpy(name_buf, ps.name.c_str(), ps.name.size() + 1);
+                if (ImGui::InputText("##ps_name", name_buf, sizeof(name_buf)))
+                    ps.name = name_buf;
+
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Type:");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(120.f);
+                ImGui::Combo("##ps_type", &ps.type, set_type_items, 2);
+
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Source:");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(w - 160.f);
+                char src_buf[512] = {};
+                if (ps.source.size() < sizeof(src_buf))
+                    memcpy(src_buf, ps.source.c_str(), ps.source.size() + 1);
+                if (ps.type == 0) {
+                    if (ImGui::InputText("##ps_src", src_buf, sizeof(src_buf)))
+                        ps.source = src_buf;
+                } else {
+                    if (ImGui::InputTextMultiline("##ps_src_ml", src_buf, sizeof(src_buf),
+                                                  ImVec2(w - 170.f, 60.f)))
+                        ps.source = src_buf;
+                }
+
+                // Grep-extract config
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Grep Extract:");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(240.f);
+                ImGui::InputTextWithHint("##ps_grep", "regex (leave empty to skip)",
+                                         ps.grep_regex, sizeof(ps.grep_regex));
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha), "Group:");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(40.f);
+                ImGui::InputText("##ps_grp", ps.grep_group, sizeof(ps.grep_group));
+
+                ImGui::Unindent(12.f);
+            }
+
+            ImGui::PopID();
+        }
+
+        ImGui::EndChild();
+        ImGui::PopStyleColor(); // ChildBg
+    }
+
+    ImGui::Spacing();
+
+    // ---- Thread / Delay controls ----
     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Threads:");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(60.f);
@@ -2110,7 +2321,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     ImGui::InputInt("##fuzz_delay", &cfg.delay_ms, 0, 0);
     cfg.delay_ms = std::max(0, cfg.delay_ms);
 
-
+    // ---- Match rules ----
     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Match Status:");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(60.f);
@@ -2122,9 +2333,10 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
 
     ImGui::Spacing();
 
-
+    // ---- Request template editor ----
     ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "Request Template");
-    ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha), "Mark injection points with FUZZ keyword");
+    ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha),
+                       "Mark injection points with §value§  (FUZZ also accepted)");
     ImGui::Spacing();
 
     static char tmpl_buf[65536] = {};
@@ -2133,20 +2345,20 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
         tmpl_buf[cfg.base_request.size()] = '\0';
     }
 
-    float tmpl_h = std::min(h * 0.25f, 200.f);
+    float tmpl_h = std::min(h * 0.22f, 180.f);
     ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(20, 20, 30, static_cast<int>(200 * alpha)));
-    if (ImGui::InputTextMultiline("##fuzz_tmpl", tmpl_buf, sizeof(tmpl_buf), ImVec2(w - 8.f, tmpl_h))) {
+    if (ImGui::InputTextMultiline("##fuzz_tmpl", tmpl_buf, sizeof(tmpl_buf),
+                                   ImVec2(w - 8.f, tmpl_h)))
         cfg.base_request = tmpl_buf;
-    }
     ImGui::PopStyleColor();
 
     ImGui::Spacing();
 
-
+    // ---- Start / Stop controls ----
     if (!state.fuzz_running.load()) {
         if (ImGui::Button("Start Fuzzer")) {
             {
-                std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+                std::lock_guard<std::mutex> lk(state.fuzz_mutex);
                 state.fuzz_results.clear();
             }
             state.fuzz_progress.store(0);
@@ -2157,68 +2369,92 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
         }
         ImGui::SameLine();
         if (ImGui::Button("Clear Results##fuzz")) {
-            std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+            std::lock_guard<std::mutex> lk(state.fuzz_mutex);
             state.fuzz_results.clear();
         }
     } else {
         int prog = state.fuzz_progress.load();
-        int tot = state.fuzz_total.load();
+        int tot  = state.fuzz_total.load();
         ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "Running: %d / %d", prog, tot);
-
-
         float frac = tot > 0 ? static_cast<float>(prog) / static_cast<float>(tot) : 0.f;
         ImGui::ProgressBar(frac, ImVec2(300.f, 0.f));
-
         ImGui::SameLine();
-        if (ImGui::SmallButton("Stop")) {
-            state.fuzz_running.store(false);
-        }
+        if (ImGui::SmallButton("Stop")) state.fuzz_running.store(false);
     }
 
     ImGui::Spacing();
 
-
+    // ---- Results table ----
     std::vector<state_t::fuzzer_result> results_copy;
     {
-        std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+        std::lock_guard<std::mutex> lk(state.fuzz_mutex);
         results_copy = state.fuzz_results;
     }
+
+    // Determine how many payload columns to show.
+    size_t max_cols = 1;
+    for (auto& fr : results_copy)
+        max_cols = std::max(max_cols, fr.payloads.size());
+    bool show_extract = false;
+    for (auto& fr : results_copy)
+        if (!fr.extracted_value.empty()) { show_extract = true; break; }
 
     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Results: %zu", results_copy.size());
 
     float results_h = h - ImGui::GetCursorPosY() + y - 8.f;
-    ImGui::BeginChild("##fuzz_results", ImVec2(w - 4.f, results_h), false, ImGuiWindowFlags_NoBackground);
+    ImGui::BeginChild("##fuzz_results", ImVec2(w - 4.f, results_h), false,
+                      ImGuiWindowFlags_NoBackground);
 
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 list_org = ImGui::GetWindowPos();
-    float row_h = 18.f;
+    ImDrawList* dl   = ImGui::GetWindowDrawList();
+    ImVec2 list_org  = ImGui::GetWindowPos();
+    float row_h      = 18.f;
 
+    // Column widths
+    float c_idx     = 50.f;
+    float c_payload = std::min(180.f, (w - 50.f - 60.f - 80.f - 80.f - 50.f
+                                       - (show_extract ? 120.f : 0.f))
+                                      / static_cast<float>(std::max<size_t>(1, max_cols)));
+    float c_status  = 60.f;
+    float c_len     = 80.f;
+    float c_time    = 80.f;
+    float c_match   = 50.f;
+    float c_extract = show_extract ? 120.f : 0.f;
 
-    float cx = list_org.x + 4.f;
-    float cy = list_org.y + ImGui::GetCursorPosY();
+    float cy  = list_org.y + ImGui::GetCursorPosY();
+    float cx0 = list_org.x + 4.f;
     ImU32 hdr_col = IM_COL32(180, 180, 200, static_cast<int>(0.6f * alpha * 255));
-    float c_idx = 50.f, c_payload = 200.f, c_status = 60.f, c_len = 80.f, c_time = 80.f, c_match = 50.f;
 
-    dl->AddText(ImVec2(cx, cy), hdr_col, "#"); cx += c_idx;
-    dl->AddText(ImVec2(cx, cy), hdr_col, "Payload"); cx += c_payload;
-    dl->AddText(ImVec2(cx, cy), hdr_col, "Status"); cx += c_status;
-    dl->AddText(ImVec2(cx, cy), hdr_col, "Length"); cx += c_len;
-    dl->AddText(ImVec2(cx, cy), hdr_col, "Time"); cx += c_time;
-    dl->AddText(ImVec2(cx, cy), hdr_col, "Match");
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + row_h + 2.f);
+    { // Header row
+        float cx = cx0;
+        char hbuf[32];
+        dl->AddText(ImVec2(cx, cy), hdr_col, "#"); cx += c_idx;
+        for (size_t pi = 0; pi < max_cols; pi++) {
+            snprintf(hbuf, sizeof(hbuf), "Payload %zu", pi + 1);
+            dl->AddText(ImVec2(cx, cy), hdr_col, hbuf); cx += c_payload;
+        }
+        dl->AddText(ImVec2(cx, cy), hdr_col, "Status");  cx += c_status;
+        dl->AddText(ImVec2(cx, cy), hdr_col, "Length");  cx += c_len;
+        dl->AddText(ImVec2(cx, cy), hdr_col, "Time");    cx += c_time;
+        dl->AddText(ImVec2(cx, cy), hdr_col, "Match");   cx += c_match;
+        if (show_extract) dl->AddText(ImVec2(cx, cy), hdr_col, "Extracted");
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + row_h + 2.f);
+    }
 
     for (auto& fr : results_copy) {
-        float ry = ImGui::GetCursorPosY();
+        float ry     = ImGui::GetCursorPosY();
         float abs_ry = list_org.y + ry;
-        bool is_sel = (state.fuzz_selected == fr.index);
+        bool  is_sel = (state.fuzz_selected == fr.index);
 
         if (fr.match) {
-            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w - 4.f, abs_ry + row_h),
-                IM_COL32(40, 100, 40, static_cast<int>(0.3f * alpha * 255)));
+            dl->AddRectFilled(ImVec2(list_org.x, abs_ry),
+                              ImVec2(list_org.x + w - 4.f, abs_ry + row_h),
+                              IM_COL32(40, 100, 40, static_cast<int>(0.3f * alpha * 255)));
         } else if (is_sel) {
-            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w - 4.f, abs_ry + row_h),
-                IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
-                         static_cast<int>(ab * 255), static_cast<int>(0.15f * alpha * 255)));
+            dl->AddRectFilled(ImVec2(list_org.x, abs_ry),
+                              ImVec2(list_org.x + w - 4.f, abs_ry + row_h),
+                              IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+                                       static_cast<int>(ab * 255),
+                                       static_cast<int>(0.15f * alpha * 255)));
         }
 
         ImVec2 mouse = ImGui::GetMousePos();
@@ -2227,18 +2463,26 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
             state.fuzz_selected = fr.index;
 
         ImU32 txt_col = IM_COL32(220, 220, 230, static_cast<int>(0.8f * alpha * 255));
-        cx = list_org.x + 4.f;
+        float cx = cx0;
+        char buf[64];
 
-        char buf[32];
         snprintf(buf, sizeof(buf), "%d", fr.index);
         dl->AddText(ImVec2(cx, abs_ry), txt_col, buf); cx += c_idx;
 
-        std::string pl = fr.payload.size() > 30 ? fr.payload.substr(0, 30) + "..." : fr.payload;
-        dl->AddText(ImVec2(cx, abs_ry), txt_col, pl.c_str()); cx += c_payload;
+        // Per-position payload columns
+        for (size_t pi = 0; pi < max_cols; pi++) {
+            std::string pl;
+            if (pi < fr.payloads.size()) {
+                pl = fr.payloads[pi].size() > 28
+                    ? fr.payloads[pi].substr(0, 28) + ".." : fr.payloads[pi];
+            }
+            dl->AddText(ImVec2(cx, abs_ry), txt_col, pl.c_str()); cx += c_payload;
+        }
 
-        ImU32 sc_col = fr.status_code >= 200 && fr.status_code < 300
+        // Status
+        ImU32 sc_col = (fr.status_code >= 200 && fr.status_code < 300)
             ? IM_COL32(100, 255, 100, static_cast<int>(0.9f * alpha * 255))
-            : fr.status_code >= 400
+            : (fr.status_code >= 400)
             ? IM_COL32(255, 100, 100, static_cast<int>(0.9f * alpha * 255))
             : txt_col;
         snprintf(buf, sizeof(buf), "%d", fr.status_code);
@@ -2247,11 +2491,22 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
         snprintf(buf, sizeof(buf), "%zu", fr.response_len);
         dl->AddText(ImVec2(cx, abs_ry), txt_col, buf); cx += c_len;
 
-        snprintf(buf, sizeof(buf), "%llums", static_cast<unsigned long long>(fr.latency_ms));
+        snprintf(buf, sizeof(buf), "%llums",
+                 static_cast<unsigned long long>(fr.latency_ms));
         dl->AddText(ImVec2(cx, abs_ry), txt_col, buf); cx += c_time;
 
         if (fr.match)
-            dl->AddText(ImVec2(cx, abs_ry), IM_COL32(100, 255, 100, static_cast<int>(0.9f * alpha * 255)), "YES");
+            dl->AddText(ImVec2(cx, abs_ry),
+                        IM_COL32(100, 255, 100, static_cast<int>(0.9f * alpha * 255)), "YES");
+        cx += c_match;
+
+        if (show_extract && !fr.extracted_value.empty()) {
+            std::string ev = fr.extracted_value.size() > 20
+                ? fr.extracted_value.substr(0, 20) + ".." : fr.extracted_value;
+            dl->AddText(ImVec2(cx, abs_ry),
+                        IM_COL32(255, 220, 80, static_cast<int>(0.9f * alpha * 255)),
+                        ev.c_str());
+        }
 
         ImGui::SetCursorPosY(ry + row_h);
     }
@@ -2261,7 +2516,6 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     ImGui::PopStyleColor();
     ImGui::EndChild();
 }
-
 
 static void render_websocket(state_t& state, float x, float y, float w, float h,
                               float alpha, float ar, float ag, float ab) {

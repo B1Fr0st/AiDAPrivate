@@ -106,6 +106,24 @@ struct repeater_entry {
     bool        in_progress = false;
 };
 
+enum class fuzzer_attack_mode_t : int {
+    sniper      = 0,   // single payload set, one position at a time
+    pitchfork   = 1,   // N payload sets zipped across N positions simultaneously
+    clusterbomb = 2,   // cartesian product of all payload sets across all positions
+};
+
+// One payload set used by pitchfork / clusterbomb attack modes.
+// Each occurrence of the corresponding §marker§ in the base_request is replaced
+// by the current entry from this set.
+struct payload_set_t {
+    std::string              name;
+    std::string              source;     // file path or inline newline-separated list
+    int                      type = 0;   // 0=file,1=inline
+    std::vector<std::string> entries;
+    char                     grep_regex[256]  = {};  // regex to apply to response body
+    char                     grep_group[32]   = "1"; // capture group index (as string)
+};
+
 
 struct state_t {
     bool active = false;
@@ -210,6 +228,8 @@ struct state_t {
         int         match_size_op = 0;
         int         match_size = 0;
         bool        stop_on_match = false;
+        fuzzer_attack_mode_t    attack_mode = fuzzer_attack_mode_t::sniper;
+        std::vector<payload_set_t> payload_sets; // per-position sets for pitchfork/clusterbomb
     };
 
     struct fuzzer_result {
@@ -220,6 +240,8 @@ struct state_t {
         uint64_t    latency_ms = 0;
         bool        match = false;
         std::string response_preview;
+        std::vector<std::string> payloads;       // one entry per position (pitchfork/clusterbomb)
+        std::string extracted_value;             // grep-extract result (first non-empty group)
     };
 
     fuzzer_entry                  fuzz_config;

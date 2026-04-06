@@ -530,18 +530,15 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
     h2_session::session target_session(h2_session::session::role::client);
 
 
-    client_session.set_send_callback([&](const uint8_t* data, size_t len) {
-        SSL_write(client_ssl, data, static_cast<int>(len));
+    bool init_ok = client_session.initialize([&](const uint8_t* data, size_t len) -> ssize_t {
+        return static_cast<ssize_t>(SSL_write(client_ssl, data, static_cast<int>(len)));
+    }) && target_session.initialize([&](const uint8_t* data, size_t len) -> ssize_t {
+        return static_cast<ssize_t>(SSL_write(target_ssl, data, static_cast<int>(len)));
     });
-    target_session.set_send_callback([&](const uint8_t* data, size_t len) {
-        SSL_write(target_ssl, data, static_cast<int>(len));
-    });
-
-    bool init_ok = client_session.initialize() && target_session.initialize();
     if (!init_ok) return;
 
 
-    client_session.set_on_request([&](int32_t stream_id, const h2_session::stream_data& sd) {
+    client_session.set_on_request([&](const h2_session::stream_data& sd) {
 
         http_exchange exchange;
         exchange.id = state.next_id++;
@@ -554,29 +551,29 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
         exchange.tls_sni = target_host;
         exchange.alpn_protocol = "h2";
         exchange.is_h2 = true;
-        exchange.h2_stream_id = stream_id;
+        exchange.h2_stream_id = sd.stream_id;
         exchange.request_time = GetTickCount64();
         exchange.request.valid = true;
-        exchange.request.method = sd.request.method;
-        exchange.request.path = sd.request.path;
+        exchange.request.method = sd.method;
+        exchange.request.uri = sd.path;
         exchange.request.version = "HTTP/2";
-        for (const auto& h : sd.request.headers) {
-            exchange.request.headers.push_back({h.first, h.second});
+        for (const auto& h : sd.request_headers) {
+            exchange.request.headers.push_back({h.name, h.value});
         }
-        exchange.request_size = sd.request.body.size();
-        exchange.raw_request = sd.request.body;
+        exchange.request_size = sd.request_body.size();
+        exchange.raw_request = sd.request_body;
 
 
         if (script_engine::is_initialized()) {
             script_engine::hook_request_data hook_data;
-            hook_data.method = sd.request.method;
-            hook_data.url = sd.request.path;
+            hook_data.method = sd.method;
+            hook_data.uri = sd.path;
             hook_data.host = target_host;
             hook_data.port = target_port;
             hook_data.is_tls = true;
-            for (const auto& h : sd.request.headers)
-                hook_data.headers.push_back({h.first, h.second});
-            hook_data.body = sd.request.body;
+            for (const auto& h : sd.request_headers)
+                hook_data.headers[h.name] = h.value;
+            hook_data.body = sd.request_body;
             script_engine::invoke_hook(script_engine::hook_type::on_request, hook_data);
             if (hook_data.dropped) {
                 exchange.state = http_exchange::state_t::dropped;
@@ -587,12 +584,11 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
         }
 
         state.total_requests.fetch_add(1);
-        state.total_bytes_in.fetch_add(sd.request.body.size());
+        state.total_bytes_in.fetch_add(sd.request_body.size());
         exchange.state = http_exchange::state_t::forwarding;
 
 
-        std::vector<std::pair<std::string, std::string>> fwd_headers = sd.request.headers;
-        target_session.submit_request(sd.request.method, sd.request.path, fwd_headers, sd.request.body);
+        target_session.submit_request(sd.method, sd.path, sd.authority, sd.scheme, sd.request_headers, sd.request_body);
 
 
         std::lock_guard<std::mutex> lock(state.history_mutex);
@@ -602,36 +598,35 @@ static void handle_h2_session(SSL* client_ssl, SSL* target_ssl,
     });
 
 
-    target_session.set_on_response([&](int32_t stream_id, const h2_session::stream_data& sd) {
+    target_session.set_on_response([&](const h2_session::stream_data& sd) {
 
         if (script_engine::is_initialized()) {
             script_engine::hook_response_data hook_data;
-            hook_data.status_code = sd.response.status_code;
+            hook_data.status_code = sd.status_code;
             hook_data.host = target_host;
             hook_data.port = target_port;
-            for (const auto& h : sd.response.headers)
-                hook_data.headers.push_back({h.first, h.second});
-            hook_data.body = sd.response.body;
+            for (const auto& h : sd.response_headers)
+                hook_data.headers[h.name] = h.value;
+            hook_data.body = sd.response_body;
             script_engine::invoke_hook(script_engine::hook_type::on_response, hook_data);
             if (hook_data.dropped) return;
         }
 
-        state.total_bytes_out.fetch_add(sd.response.body.size());
+        state.total_bytes_out.fetch_add(sd.response_body.size());
 
 
-        std::vector<std::pair<std::string, std::string>> resp_headers = sd.response.headers;
-        client_session.submit_response(stream_id, sd.response.status_code, resp_headers, sd.response.body);
+        client_session.submit_response(sd.stream_id, sd.status_code, sd.response_headers, sd.response_body);
 
 
         std::lock_guard<std::mutex> lock(state.history_mutex);
         for (auto it = state.history.rbegin(); it != state.history.rend(); ++it) {
             if (it->is_h2 && it->target_host == target_host) {
                 it->response.valid = true;
-                it->response.status_code = sd.response.status_code;
-                for (const auto& h : sd.response.headers)
-                    it->response.headers.push_back({h.first, h.second});
-                it->raw_response = sd.response.body;
-                it->response_size = sd.response.body.size();
+                it->response.status_code = sd.status_code;
+                for (const auto& h : sd.response_headers)
+                    it->response.headers.push_back({h.name, h.value});
+                it->raw_response = sd.response_body;
+                it->response_size = sd.response_body.size();
                 it->response_time = GetTickCount64();
                 it->latency_ms = it->response_time - it->request_time;
                 it->state = http_exchange::state_t::complete;
@@ -818,12 +813,12 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
             if (script_engine::is_initialized()) {
                 script_engine::hook_request_data hook_data;
                 hook_data.method = exchange.request.method;
-                hook_data.url = exchange.request.path;
+                hook_data.uri = exchange.request.uri;
                 hook_data.host = target_host;
                 hook_data.port = target_port;
                 hook_data.is_tls = true;
                 for (const auto& h : exchange.request.headers)
-                    hook_data.headers.push_back({h.name, h.value});
+                    hook_data.headers[h.name] = h.value;
                 hook_data.body = request_data;
                 script_engine::invoke_hook(script_engine::hook_type::on_request, hook_data);
                 if (hook_data.dropped) {
@@ -875,7 +870,7 @@ static void handle_tls_connection(SOCKET client_sock, const std::string& target_
                             hook_data.host = target_host;
                             hook_data.port = target_port;
                             for (const auto& h : exchange.response.headers)
-                                hook_data.headers.push_back({h.name, h.value});
+                                hook_data.headers[h.name] = h.value;
                             hook_data.body = response_data;
                             script_engine::invoke_hook(script_engine::hook_type::on_response, hook_data);
                             if (hook_data.dropped) {
@@ -992,12 +987,12 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
     if (script_engine::is_initialized()) {
         script_engine::hook_request_data hook_data;
         hook_data.method = req.method;
-        hook_data.url = req.path;
+        hook_data.uri = req.uri;
         hook_data.host = target_host;
         hook_data.port = target_port;
         hook_data.is_tls = false;
         for (const auto& h : req.headers)
-            hook_data.headers.push_back({h.name, h.value});
+            hook_data.headers[h.name] = h.value;
         hook_data.body = request_data;
         script_engine::invoke_hook(script_engine::hook_type::on_request, hook_data);
         if (hook_data.dropped) {
@@ -1050,7 +1045,7 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
                         hook_data.host = target_host;
                         hook_data.port = target_port;
                         for (const auto& h : exchange.response.headers)
-                            hook_data.headers.push_back({h.name, h.value});
+                            hook_data.headers[h.name] = h.value;
                         hook_data.body = response_data;
                         script_engine::invoke_hook(script_engine::hook_type::on_response, hook_data);
                         if (hook_data.dropped) {

@@ -10,6 +10,8 @@
 #include "pro.h"
 #include "decoder_pipeline.hpp"
 #include "script_engine.hpp"
+#include "tcp_stream_tracker.hpp"
+#include "page_guard_engine.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -863,7 +865,7 @@ tool_result_t network_follow_tcp_stream(const json& params)
 
     if (op == "start") {
         bool ok = device->stream_reassemble_op(0, src_port, dst_port, pid, nullptr, nullptr, nullptr, nullptr, nullptr);
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to start stream reassembly. Max 8 concurrent streams."));
+        if (!ok) return tool_result_t::error(OBFSTR("Failed to start stream reassembly. Max 1024 concurrent streams."));
         json r; r["status"] = "started"; r["src_port"] = src_port; r["dst_port"] = dst_port;
         return tool_result_t::ok(OBFSTR("TCP stream reassembly started"), r);
     } else if (op == "stop") {
@@ -1756,7 +1758,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         OBFSTR("network_follow_tcp_stream"), OBFSTR("network"),
         OBFSTR("TCP stream reassembly Ã¢â‚¬â€ equivalent to Wireshark 'Follow TCP Stream'. Reassembles TCP segments into "
                "complete application-layer data. Operations: 'start' begins tracking a flow, 'get' returns reassembled "
-               "bytes (hex + ASCII), 'stop' ends tracking. Identify flows via src_port/dst_port. Max 8 concurrent streams."),
+               "bytes (hex + ASCII), 'stop' ends tracking. Identify flows via src_port/dst_port. Max 1024 concurrent streams."),
         {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'start', 'stop', or 'get'"), true},
          {OBFSTR("src_port"), OBFSTR("number"), OBFSTR("Source (client) port of the TCP flow"), false},
          {OBFSTR("dst_port"), OBFSTR("number"), OBFSTR("Destination (server) port of the TCP flow"), false},
@@ -2159,6 +2161,254 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             r["api"] = arr;
             return tool_result_t::ok(text, r);
         }, true});
+
+    // -----------------------------------------------------------------------
+    // network_stream_track
+    // -----------------------------------------------------------------------
+    register_compat(srv, {
+        OBFSTR("network_stream_track"), OBFSTR("network"),
+        OBFSTR("Dynamic TCP stream tracker backed by the kernel driver. Operations: "
+               "'start' begins tracking (optional pid filter), 'stop' halts tracking, "
+               "'get_all' returns all reassembled streams with hex+ASCII payloads, "
+               "'get_stream' fetches a single stream by src_ip/src_port/dst_ip/dst_port, "
+               "'clear' evicts all cached streams."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("start|stop|get_all|get_stream|clear"), true},
+         {OBFSTR("pid"),       OBFSTR("number"), OBFSTR("Process ID filter for 'start' (0 = all)"), false},
+         {OBFSTR("src_ip"),    OBFSTR("string"), OBFSTR("Source IPv4 (dotted-quad) for get_stream"), false},
+         {OBFSTR("src_port"),  OBFSTR("number"), OBFSTR("Source port for get_stream"), false},
+         {OBFSTR("dst_ip"),    OBFSTR("string"), OBFSTR("Destination IPv4 (dotted-quad) for get_stream"), false},
+         {OBFSTR("dst_port"),  OBFSTR("number"), OBFSTR("Destination port for get_stream"), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string op = params.value("operation", "");
+
+            if (op == "start") {
+                uint32_t pid = params.value("pid", 0u);
+                network_view::g_stream_tracker.start(pid);
+                json r;
+                r["status"] = "started";
+                r["pid"]    = pid;
+                return tool_result_t::ok("TCP stream tracker started (pid=" +
+                                         std::to_string(pid) + ")", r);
+            }
+
+            if (op == "stop") {
+                network_view::g_stream_tracker.stop();
+                return tool_result_t::ok("TCP stream tracker stopped");
+            }
+
+            if (op == "clear") {
+                network_view::g_stream_tracker.clear();
+                return tool_result_t::ok("TCP stream tracker cleared");
+            }
+
+            // Helper: format raw bytes as "XX XX XX ..." + printable ASCII side-by-side
+            auto format_payload = [](const std::vector<uint8_t>& data) -> std::string {
+                std::ostringstream hex_oss, asc_oss;
+                for (size_t i = 0; i < data.size() && i < 4096; ++i) {
+                    hex_oss << std::hex << std::setw(2) << std::setfill('0')
+                            << static_cast<int>(data[i]) << ' ';
+                    asc_oss << (data[i] >= 0x20 && data[i] < 0x7f
+                                ? static_cast<char>(data[i]) : '.');
+                }
+                return hex_oss.str() + " | " + asc_oss.str();
+            };
+
+            // Helper: build JSON object from a snapshot
+            auto snap_to_json = [&](const network_view::stream_snapshot_t& s) -> json {
+                char src_buf[32] = {}, dst_buf[32] = {};
+                uint32_t sip = s.key.src_ip4, dip = s.key.dst_ip4;
+                snprintf(src_buf, sizeof(src_buf), "%u.%u.%u.%u",
+                         sip & 0xFF, (sip >> 8) & 0xFF,
+                         (sip >> 16) & 0xFF, (sip >> 24) & 0xFF);
+                snprintf(dst_buf, sizeof(dst_buf), "%u.%u.%u.%u",
+                         dip & 0xFF, (dip >> 8) & 0xFF,
+                         (dip >> 16) & 0xFF, (dip >> 24) & 0xFF);
+                json o;
+                o["src_ip"]        = src_buf;
+                o["src_port"]      = s.key.src_port;
+                o["dst_ip"]        = dst_buf;
+                o["dst_port"]      = s.key.dst_port;
+                o["proto"]         = s.key.proto;
+                o["total_bytes"]   = s.total_bytes;
+                o["total_packets"] = s.total_packets;
+                o["syn_seen"]      = s.syn_seen;
+                o["fin_seen"]      = s.fin_seen;
+                o["payload"]       = format_payload(s.assembled);
+                return o;
+            };
+
+            if (op == "get_all") {
+                auto snaps = network_view::g_stream_tracker.get_all();
+                json arr = json::array();
+                for (auto& s : snaps)
+                    arr.push_back(snap_to_json(s));
+                json r;
+                r["streams"] = arr;
+                r["count"]   = static_cast<int>(snaps.size());
+                return tool_result_t::ok(std::to_string(snaps.size()) + " stream(s) tracked", r);
+            }
+
+            if (op == "get_stream") {
+                std::string src_ip = params.value("src_ip", "");
+                std::string dst_ip = params.value("dst_ip", "");
+                uint16_t src_port  = static_cast<uint16_t>(params.value("src_port", 0));
+                uint16_t dst_port  = static_cast<uint16_t>(params.value("dst_port", 0));
+
+                // Parse dotted-quad IPv4 into uint32_t (little-endian byte order)
+                auto parse_ip4 = [](const std::string& s) -> uint32_t {
+                    uint32_t a = 0, b = 0, c = 0, d = 0;
+                    sscanf(s.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d);
+                    return a | (b << 8) | (c << 16) | (d << 24);
+                };
+
+                network_view::stream_key_t key{};
+                key.src_ip4  = parse_ip4(src_ip);
+                key.dst_ip4  = parse_ip4(dst_ip);
+                key.src_port = src_port;
+                key.dst_port = dst_port;
+                key.proto    = 6;
+
+                auto snap = network_view::g_stream_tracker.get_stream(key);
+                if (!snap)
+                    return tool_result_t::error("Stream not found");
+
+                json r;
+                r["stream"] = snap_to_json(*snap);
+                return tool_result_t::ok("Stream found", r);
+            }
+
+            return tool_result_t::error("Unknown operation '" + op +
+                                        "'. Use start|stop|get_all|get_stream|clear");
+        }, false});
+
+    // -----------------------------------------------------------------------
+    // network_pg_sniff
+    // -----------------------------------------------------------------------
+    register_compat(srv, {
+        OBFSTR("network_pg_sniff"), OBFSTR("network"),
+        OBFSTR("Pre-encryption page guard sniffer. Installs a VEH-based PAGE_GUARD trap on a "
+               "target memory region in another process to capture all reads/writes before "
+               "encryption occurs. Uses page-fault + single-step re-arm (no HW breakpoint limit). "
+               "Operations: 'install' (pid, address, size) returns session_id; "
+               "'get_captures' (session_id) drains pending captures; "
+               "'uninstall' (session_id) removes the guard and restores protection; "
+               "'list_sessions' lists all active sessions."),
+        {{OBFSTR("operation"),  OBFSTR("string"), OBFSTR("install|get_captures|uninstall|list_sessions"), true},
+         {OBFSTR("pid"),        OBFSTR("number"), OBFSTR("Target process ID (install)"), false},
+         {OBFSTR("address"),    OBFSTR("string"), OBFSTR("Target memory address as hex string, e.g. '0x7FFE0000' (install)"), false},
+         {OBFSTR("size"),       OBFSTR("number"), OBFSTR("Region size in bytes (install, default 0x1000)"), false},
+         {OBFSTR("session_id"), OBFSTR("number"), OBFSTR("Session ID returned by install (get_captures/uninstall)"), false}},
+        [](const json& params) -> tool_result_t {
+            const std::string op = params.value("operation", "");
+
+            if (op == "install") {
+                uint32_t pid = params.value("pid", 0u);
+                if (pid == 0)
+                    return tool_result_t::error("'pid' is required for install");
+
+                // Accept address as hex string or plain number
+                uint64_t addr = 0;
+                if (params.contains("address")) {
+                    auto& av = params["address"];
+                    if (av.is_string()) {
+                        addr = std::stoull(av.get<std::string>(), nullptr, 0);
+                    } else if (av.is_number()) {
+                        addr = av.get<uint64_t>();
+                    }
+                }
+                if (addr == 0)
+                    return tool_result_t::error("'address' is required for install");
+
+                uint64_t size = params.value("size", static_cast<uint64_t>(0x1000));
+
+                uint32_t sid = page_guard_engine::g_pg_engine.install(pid, addr, size);
+                if (sid == 0)
+                    return tool_result_t::error("Failed to install page guard. "
+                                                "Ensure the driver is connected and the "
+                                                "target address is valid.");
+                json r;
+                r["session_id"] = sid;
+                r["pid"]        = pid;
+                char buf[32];
+                snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(addr));
+                r["address"]    = buf;
+                r["size"]       = size;
+                return tool_result_t::ok("Page guard installed, session_id=" +
+                                         std::to_string(sid), r);
+            }
+
+            if (op == "get_captures") {
+                uint32_t sid = params.value("session_id", 0u);
+                if (sid == 0)
+                    return tool_result_t::error("'session_id' is required");
+
+                auto caps = page_guard_engine::g_pg_engine.get_captures(sid);
+                json arr  = json::array();
+                for (auto& c : caps) {
+                    json o;
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "0x%llX",
+                             static_cast<unsigned long long>(c.fault_addr));
+                    o["fault_addr"]     = buf;
+                    snprintf(buf, sizeof(buf), "0x%llX",
+                             static_cast<unsigned long long>(c.rip));
+                    o["rip"]            = buf;
+                    snprintf(buf, sizeof(buf), "0x%llX",
+                             static_cast<unsigned long long>(c.ctx_rax));
+                    o["rax"]            = buf;
+                    snprintf(buf, sizeof(buf), "0x%llX",
+                             static_cast<unsigned long long>(c.ctx_rcx));
+                    o["rcx"]            = buf;
+                    snprintf(buf, sizeof(buf), "0x%llX",
+                             static_cast<unsigned long long>(c.ctx_rdx));
+                    o["rdx"]            = buf;
+                    o["timestamp"]      = c.timestamp;
+                    o["exception_code"] = c.exception_code;
+                    o["access_type"]    = c.access_type == 0 ? "read" : "write";
+                    arr.push_back(o);
+                }
+                json r;
+                r["session_id"] = sid;
+                r["captures"]   = arr;
+                r["count"]      = static_cast<int>(caps.size());
+                return tool_result_t::ok(std::to_string(caps.size()) + " capture(s)", r);
+            }
+
+            if (op == "uninstall") {
+                uint32_t sid = params.value("session_id", 0u);
+                if (sid == 0)
+                    return tool_result_t::error("'session_id' is required");
+
+                bool ok = page_guard_engine::g_pg_engine.uninstall(sid);
+                if (!ok)
+                    return tool_result_t::error("Session " + std::to_string(sid) + " not found");
+                return tool_result_t::ok("Session " + std::to_string(sid) + " uninstalled");
+            }
+
+            if (op == "list_sessions") {
+                auto sessions = page_guard_engine::g_pg_engine.list_sessions();
+                json arr = json::array();
+                for (auto& s : sessions) {
+                    json o;
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "0x%llX",
+                             static_cast<unsigned long long>(s.target_addr));
+                    o["session_id"]       = s.session_id;
+                    o["pid"]              = s.pid;
+                    o["target_addr"]      = buf;
+                    o["region_size"]      = s.region_size;
+                    o["pending_captures"] = static_cast<int>(s.pending_captures);
+                    arr.push_back(o);
+                }
+                json r;
+                r["sessions"] = arr;
+                r["count"]    = static_cast<int>(sessions.size());
+                return tool_result_t::ok(std::to_string(sessions.size()) + " session(s) active", r);
+            }
+
+            return tool_result_t::error("Unknown operation '" + op +
+                                        "'. Use install|get_captures|uninstall|list_sessions");
+        }, false});
 }
 
 }

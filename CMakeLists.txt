@@ -100,6 +100,7 @@ file(GLOB LUA_CORE_SOURCES "${lua_src_SOURCE_DIR}/*.c")
 list(REMOVE_ITEM LUA_CORE_SOURCES
     "${lua_src_SOURCE_DIR}/lua.c"           # standalone interpreter
     "${lua_src_SOURCE_DIR}/luac.c"          # standalone compiler
+    "${lua_src_SOURCE_DIR}/onelua.c"        # single-file build; all sources already included individually
 )
 add_library(lua54_static STATIC ${LUA_CORE_SOURCES})
 target_include_directories(lua54_static PUBLIC "${lua_src_SOURCE_DIR}")
@@ -457,6 +458,7 @@ if(WIN32)
             freetype
             zlibstatic
             brotlidec
+            brotlienc
             brotlicommon
             llhttp_static
             nghttp2_static

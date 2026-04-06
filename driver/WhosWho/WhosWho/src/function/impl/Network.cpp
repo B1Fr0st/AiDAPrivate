@@ -4804,7 +4804,12 @@ namespace net_redirect {
 
 namespace net_stream {
 
-    #define MAX_TRACKED_STREAMS 8
+    // Increased from 8 to 1024: idle slots are pure 64-byte metadata (no pool allocation
+    // until active==1), so the static array costs ~64KB in the driver image BSS section.
+    // Pool memory (64KB per stream, via ExAllocatePool2) is consumed only for live streams.
+    // This removes the hard ceiling that caused STATUS_INSUFFICIENT_RESOURCES and dropped
+    // all stream tracking beyond 8 simultaneous connections.
+    #define MAX_TRACKED_STREAMS 1024
 
     typedef struct _TRACKED_STREAM {
         volatile LONG active;
