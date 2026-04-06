@@ -1,5 +1,4 @@
-/* C:\Users\ruar\Downloads\1233\fonts\icomoon.ttf (4/4/2026 11:04:04 PM)
-   StartOffset(h): 00000000, EndOffset(h): 00000953, Length(h): 00000954 */
+
 
 unsigned char ide_icon_font_data[2388] = {
 	0x00, 0x01, 0x00, 0x00, 0x00, 0x0B, 0x00, 0x80, 0x00, 0x03, 0x00, 0x30,

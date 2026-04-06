@@ -359,8 +359,10 @@ namespace voyager {
             std::uint32_t address_family;
             std::uint8_t  local_addr[16];
             std::uint8_t  remote_addr[16];
+            char          process_path[260];
+            std::uint32_t padding_pp;
         };
-        static_assert(sizeof(net_conn_entry) == 56, "net_conn_entry size mismatch");
+        static_assert(sizeof(net_conn_entry) == 320, "net_conn_entry size mismatch");
 
         struct net_enum_conn_request {
             std::uint32_t filter_pid;
@@ -1074,6 +1076,7 @@ namespace voyager {
             std::uint32_t address_family;
             std::uint8_t  local_addr[16];
             std::uint8_t  remote_addr[16];
+            char          process_path[260];
         };
 
         struct captured_packet {

@@ -121,7 +121,7 @@ namespace shellcode_builder {
 
         buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x5E; buf[i++] = 0x48;
 
-        // mov [rsi+0x100], rsp -- save exact post-GPR-push RSP to reserved[0]
+
         buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0xA6; buf[i++] = 0x00; buf[i++] = 0x01; buf[i++] = 0x00; buf[i++] = 0x00;
 
         buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0xE4; buf[i++] = 0xF0;
@@ -159,10 +159,9 @@ namespace shellcode_builder {
 
         buf[i++] = 0x0F; buf[i++] = 0xAE; buf[i++] = 0xF0;
 
-        // Spin-wait: usermode will suspend this thread and restore original context via NtSetContextThread
-        // pause
+
         buf[i++] = 0xF3; buf[i++] = 0x90;
-        // jmp -4 (back to pause)
+
         buf[i++] = 0xEB; buf[i++] = 0xFC;
 
         return i;
@@ -203,7 +202,7 @@ namespace shellcode_builder {
 
         buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x5E; buf[i++] = 0x48;
 
-        // mov [rsi+0x100], rsp -- save exact post-GPR-push RSP to reserved[0]
+
         buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0xA6; buf[i++] = 0x00; buf[i++] = 0x01; buf[i++] = 0x00; buf[i++] = 0x00;
 
         buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0xE4; buf[i++] = 0xF0;
@@ -265,10 +264,9 @@ namespace shellcode_builder {
 
         buf[i++] = 0x0F; buf[i++] = 0xAE; buf[i++] = 0xF0;
 
-        // Spin-wait: usermode will suspend this thread and restore original context via NtSetContextThread
-        // pause
+
         buf[i++] = 0xF3; buf[i++] = 0x90;
-        // jmp -4 (back to pause)
+
         buf[i++] = 0xEB; buf[i++] = 0xFC;
 
         return i;
@@ -310,7 +308,7 @@ namespace shellcode_builder {
 
         buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0x5E; buf[i++] = 0x48;
 
-        // mov [rsi+0x100], rsp -- save exact post-GPR-push RSP to reserved[0]
+
         buf[i++] = 0x48; buf[i++] = 0x89; buf[i++] = 0xA6; buf[i++] = 0x00; buf[i++] = 0x01; buf[i++] = 0x00; buf[i++] = 0x00;
 
         buf[i++] = 0x48; buf[i++] = 0x83; buf[i++] = 0xE4; buf[i++] = 0xF0;
@@ -348,10 +346,9 @@ namespace shellcode_builder {
 
         buf[i++] = 0x0F; buf[i++] = 0xAE; buf[i++] = 0xF0;
 
-        // Spin-wait: usermode will suspend this thread and restore original context via NtSetContextThread
-        // pause
+
         buf[i++] = 0xF3; buf[i++] = 0x90;
-        // jmp -4 (back to pause)
+
         buf[i++] = 0xEB; buf[i++] = 0xFC;
 
         return i;

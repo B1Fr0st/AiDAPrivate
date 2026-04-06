@@ -47,11 +47,6 @@ typedef struct _FWPS_TRANSPORT_SEND_PARAMS0_COMPAT {
 #define AIDA_ENDPOINT_PID_CACHE_SIZE 128
 
 
-// ============================================================
-// Debug logging infrastructure (enabled by AIDA_NET_DEBUG define)
-// Visible in WinDbg or DebugView with kernel capture enabled.
-// Filter on "[AIDA-NET]" prefix.
-// ============================================================
 #ifdef AIDA_NET_DEBUG
 #define NET_DBG(fmt, ...) \
     DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL, \
@@ -64,8 +59,7 @@ typedef struct _FWPS_TRANSPORT_SEND_PARAMS0_COMPAT {
 #define NET_ERR(fmt, ...) ((void)0)
 #endif
 
-// Rate-limited logging for high-frequency classify callbacks.
-// Logs every Nth packet to avoid DbgPrint flood at DISPATCH_LEVEL.
+
 #ifdef AIDA_NET_DEBUG
 static volatile LONG g_net_dbg_inbound_counter = 0;
 static volatile LONG g_net_dbg_outbound_counter = 0;
@@ -351,6 +345,30 @@ namespace net_inject {
     void cleanup();
     extern HANDLE g_inject_handle_v4;
 }
+namespace net_checksum {
+    UINT16 ip_checksum(const UINT8* ip_header, UINT32 header_len);
+    UINT16 tcp_checksum_ipv4(UINT32 src_ip, UINT32 dst_ip, const UINT8* tcp_data, UINT32 tcp_len);
+    UINT16 udp_checksum_ipv4(UINT32 src_ip, UINT32 dst_ip, const UINT8* udp_data, UINT32 udp_len);
+    void recalculate_transport_checksums(UINT8* ip_header, UINT32 total_len);
+}
+namespace net_seq_delta {
+    SEQ_DELTA_ENTRY* find_or_create(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port);
+    void apply_delta(UINT8* tcp_header, UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port, BOOLEAN is_outbound);
+    void record_size_change(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port, BOOLEAN is_outbound, LONG32 delta);
+    void cleanup_expired();
+    void handle_fin_rst(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port);
+}
+namespace net_fragment {
+    UINT8* process_fragment(const UINT8* ip_header, UINT32 total_packet_len, UINT32* out_reassembled_len);
+    void init();
+    void cleanup();
+    void cleanup_expired();
+}
+namespace net_udp_cache {
+    UINT32 lookup(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port);
+    void store(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port, UINT32 pid);
+    void cleanup_expired();
+}
 
 namespace net_capture {
 
@@ -446,6 +464,30 @@ namespace net_capture {
     inline ACTIVE_FILTER_RULE g_filter_rules[MAX_FILTER_RULES] = {};
     inline volatile LONG g_next_rule_id = 1;
     inline volatile LONG g_active_rule_count = 0;
+
+
+    inline SEQ_DELTA_ENTRY g_seq_delta[MAX_SEQ_DELTA_ENTRIES] = {};
+    inline KSPIN_LOCK g_seq_delta_lock;
+
+
+    inline FRAGMENT_ENTRY* g_fragment_entries = nullptr;
+    inline KSPIN_LOCK g_fragment_lock;
+
+
+    inline UDP_FLOW_ENTRY g_udp_flow[MAX_UDP_FLOW_ENTRIES] = {};
+    inline KSPIN_LOCK g_udp_flow_lock;
+
+
+    #define PID_PATH_CACHE_SIZE 64
+    typedef struct _PID_PATH_CACHE_ENTRY {
+        UINT32 pid;
+        UINT32 padding;
+        UINT64 timestamp;
+        char path[260];
+        UINT32 padding2;
+    } PID_PATH_CACHE_ENTRY;
+    inline PID_PATH_CACHE_ENTRY g_pid_path_cache[PID_PATH_CACHE_SIZE] = {};
+    inline KSPIN_LOCK g_pid_path_lock;
 
 
     __forceinline BOOLEAN is_zero_ip(const UINT8* ip) {
@@ -597,7 +639,7 @@ namespace net_capture {
         UINT32 effective_pid = pid;
         if (effective_pid == 0 && g_filter_pid != 0) {
             NET_DBG("store_packet: dropped pkt (unknown PID, filter_pid=%u)", g_filter_pid);
-            return; // Cannot determine packet owner; drop rather than misattribute
+            return;
         }
 
 
@@ -668,7 +710,7 @@ namespace net_capture {
         UINT32 effective_pid = pid;
         if (effective_pid == 0 && g_filter_pid != 0) {
             NET_DBG("store_dns_entry: dropped DNS (unknown PID, filter_pid=%u)", g_filter_pid);
-            return; // Cannot determine DNS entry owner; drop rather than misattribute
+            return;
         }
 
         KIRQL old_irql;
@@ -853,9 +895,23 @@ namespace net_capture {
             if (pid == 0) {
                 pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
             }
+            if (pid == 0 && protocol == 17) {
+                UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
+                             ((UINT32)local_ip[2] << 8) | local_ip[3];
+                UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
+                             ((UINT32)remote_ip[2] << 8) | remote_ip[3];
+                pid = net_udp_cache::lookup(rip, lip, (UINT16)remote_port, (UINT16)local_port);
+            }
             if (pid != 0) {
                 aida_store_cached_port_pid(protocol, local_port, pid);
                 aida_store_cached_port_pid(protocol, remote_port, pid);
+                if (protocol == 17) {
+                    UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
+                                 ((UINT32)local_ip[2] << 8) | local_ip[3];
+                    UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
+                                 ((UINT32)remote_ip[2] << 8) | remote_ip[3];
+                    net_udp_cache::store(rip, lip, (UINT16)remote_port, (UINT16)local_port, pid);
+                }
             }
 
             _InterlockedIncrement64(&g_global_pkts_recv);
@@ -887,8 +943,32 @@ namespace net_capture {
 
 
             if (pkt_len > 0) {
-                net_mod::apply_modifications(pkt_data, &pkt_len, NET_PKT_MAX_PAYLOAD,
+                UINT32 orig_len = pkt_len;
+                BOOLEAN was_modified = net_mod::apply_modifications(pkt_data, &pkt_len, NET_PKT_MAX_PAYLOAD,
                                             0, protocol, remote_port, pid);
+                if (was_modified && protocol == 6 && pkt_len != orig_len) {
+                    UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
+                                 ((UINT32)local_ip[2] << 8) | local_ip[3];
+                    UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
+                                 ((UINT32)remote_ip[2] << 8) | remote_ip[3];
+                    LONG32 delta = (LONG32)pkt_len - (LONG32)orig_len;
+                    net_seq_delta::record_size_change(rip, lip, (UINT16)remote_port, (UINT16)local_port, FALSE, delta);
+                }
+            }
+
+
+            if (protocol == 6 && pkt_len >= 20) {
+                UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
+                             ((UINT32)local_ip[2] << 8) | local_ip[3];
+                UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
+                             ((UINT32)remote_ip[2] << 8) | remote_ip[3];
+                net_seq_delta::apply_delta(pkt_data, rip, lip, (UINT16)remote_port, (UINT16)local_port, FALSE);
+
+
+                UINT8 tcp_flags = pkt_data[13];
+                if (tcp_flags & 0x05) {
+                    net_seq_delta::handle_fin_rst(rip, lip, (UINT16)remote_port, (UINT16)local_port);
+                }
             }
 
 
@@ -997,9 +1077,23 @@ namespace net_capture {
             if (pid == 0) {
                 pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
             }
+            if (pid == 0 && protocol == 17) {
+                UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
+                             ((UINT32)local_ip[2] << 8) | local_ip[3];
+                UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
+                             ((UINT32)remote_ip[2] << 8) | remote_ip[3];
+                pid = net_udp_cache::lookup(lip, rip, (UINT16)local_port, (UINT16)remote_port);
+            }
             if (pid != 0) {
                 aida_store_cached_port_pid(protocol, local_port, pid);
                 aida_store_cached_port_pid(protocol, remote_port, pid);
+                if (protocol == 17) {
+                    UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
+                                 ((UINT32)local_ip[2] << 8) | local_ip[3];
+                    UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
+                                 ((UINT32)remote_ip[2] << 8) | remote_ip[3];
+                    net_udp_cache::store(lip, rip, (UINT16)local_port, (UINT16)remote_port, pid);
+                }
             }
 
             _InterlockedIncrement64(&g_global_pkts_sent);
@@ -1030,8 +1124,32 @@ namespace net_capture {
 
 
             if (pkt_len > 0) {
-                net_mod::apply_modifications(pkt_data, &pkt_len, NET_PKT_MAX_PAYLOAD,
+                UINT32 orig_len = pkt_len;
+                BOOLEAN was_modified = net_mod::apply_modifications(pkt_data, &pkt_len, NET_PKT_MAX_PAYLOAD,
                                             1, protocol, remote_port, pid);
+                if (was_modified && protocol == 6 && pkt_len != orig_len) {
+                    UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
+                                 ((UINT32)local_ip[2] << 8) | local_ip[3];
+                    UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
+                                 ((UINT32)remote_ip[2] << 8) | remote_ip[3];
+                    LONG32 delta = (LONG32)pkt_len - (LONG32)orig_len;
+                    net_seq_delta::record_size_change(lip, rip, (UINT16)local_port, (UINT16)remote_port, TRUE, delta);
+                }
+            }
+
+
+            if (protocol == 6 && pkt_len >= 20) {
+                UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
+                             ((UINT32)local_ip[2] << 8) | local_ip[3];
+                UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
+                             ((UINT32)remote_ip[2] << 8) | remote_ip[3];
+                net_seq_delta::apply_delta(pkt_data, lip, rip, (UINT16)local_port, (UINT16)remote_port, TRUE);
+
+
+                UINT8 tcp_flags = pkt_data[13];
+                if (tcp_flags & 0x05) {
+                    net_seq_delta::handle_fin_rst(lip, rip, (UINT16)local_port, (UINT16)remote_port);
+                }
             }
 
 
@@ -1621,6 +1739,11 @@ namespace net_capture {
 
         KeInitializeSpinLock(&g_ring_lock);
         KeInitializeSpinLock(&g_dns_lock);
+        KeInitializeSpinLock(&g_seq_delta_lock);
+        KeInitializeSpinLock(&g_udp_flow_lock);
+        KeInitializeSpinLock(&g_pid_path_lock);
+
+        net_fragment::init();
 
 
         SIZE_T ring_size = (SIZE_T)RING_BUFFER_SIZE * sizeof(NET_PACKET_ENTRY);
@@ -1705,6 +1828,7 @@ namespace net_capture {
         net_inject::cleanup();
         net_stream::cleanup();
         net_dpi::cleanup();
+        net_fragment::cleanup();
 
         if (g_ring_buffer) {
             ExFreePoolWithTag(g_ring_buffer, 'pkNW');
@@ -2444,6 +2568,77 @@ namespace net_enum {
                 out->address_family = socket_info.address_family;
                 strong::kmemcpy(out->local_addr, socket_info.local_addr, 16);
                 strong::kmemcpy(out->remote_addr, socket_info.remote_addr, 16);
+
+
+                out->process_path[0] = '\0';
+                {
+                    BOOLEAN found_in_cache = FALSE;
+                    KIRQL old_irql;
+                    KeAcquireSpinLock(&net_capture::g_pid_path_lock, &old_irql);
+                    for (UINT32 c = 0; c < PID_PATH_CACHE_SIZE; c++) {
+                        if (net_capture::g_pid_path_cache[c].pid == pid && net_capture::g_pid_path_cache[c].path[0] != '\0') {
+                            UINT32 plen = 0;
+                            while (plen < 259 && net_capture::g_pid_path_cache[c].path[plen] != '\0') {
+                                out->process_path[plen] = net_capture::g_pid_path_cache[c].path[plen];
+                                plen++;
+                            }
+                            out->process_path[plen] = '\0';
+                            found_in_cache = TRUE;
+                            break;
+                        }
+                    }
+                    KeReleaseSpinLock(&net_capture::g_pid_path_lock, old_irql);
+
+                    if (!found_in_cache && pid != 0 && pid != 4) {
+                        PEPROCESS process = nullptr;
+                        NTSTATUS lookup_st = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+                        if (NT_SUCCESS(lookup_st) && process) {
+                            PUNICODE_STRING image_name = nullptr;
+                            lookup_st = SeLocateProcessImageName(process, &image_name);
+                            if (NT_SUCCESS(lookup_st) && image_name && image_name->Buffer && image_name->Length > 0) {
+
+                                UINT32 char_count = image_name->Length / sizeof(WCHAR);
+                                if (char_count > 259) char_count = 259;
+                                for (UINT32 ci = 0; ci < char_count; ci++) {
+                                    WCHAR wc = image_name->Buffer[ci];
+                                    out->process_path[ci] = (wc < 128) ? (char)wc : '?';
+                                }
+                                out->process_path[char_count] = '\0';
+                                ExFreePool(image_name);
+
+
+                                KeAcquireSpinLock(&net_capture::g_pid_path_lock, &old_irql);
+                                UINT32 cache_idx = PID_PATH_CACHE_SIZE;
+                                UINT64 oldest_ts = ~0ULL;
+                                for (UINT32 c = 0; c < PID_PATH_CACHE_SIZE; c++) {
+                                    if (net_capture::g_pid_path_cache[c].pid == 0) {
+                                        cache_idx = c;
+                                        break;
+                                    }
+                                    if (net_capture::g_pid_path_cache[c].timestamp < oldest_ts) {
+                                        oldest_ts = net_capture::g_pid_path_cache[c].timestamp;
+                                        cache_idx = c;
+                                    }
+                                }
+                                if (cache_idx < PID_PATH_CACHE_SIZE) {
+                                    net_capture::g_pid_path_cache[cache_idx].pid = pid;
+                                    LARGE_INTEGER now;
+                                    now = KeQueryPerformanceCounter(nullptr);
+                                    net_capture::g_pid_path_cache[cache_idx].timestamp = now.QuadPart;
+                                    UINT32 plen = 0;
+                                    while (plen < 259 && out->process_path[plen] != '\0') {
+                                        net_capture::g_pid_path_cache[cache_idx].path[plen] = out->process_path[plen];
+                                        plen++;
+                                    }
+                                    net_capture::g_pid_path_cache[cache_idx].path[plen] = '\0';
+                                }
+                                KeReleaseSpinLock(&net_capture::g_pid_path_lock, old_irql);
+                            }
+                            ObDereferenceObject(process);
+                        }
+                    }
+                }
+
                 request->connection_count++;
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -3789,6 +3984,546 @@ namespace net_inject {
             _NdisFreeNetBufferListPool(g_inject_nbl_pool);
             g_inject_nbl_pool = nullptr;
         }
+    }
+}
+
+
+namespace net_checksum {
+
+    static UINT32 accumulate(UINT32 sum, const UINT8* data, UINT32 len) {
+        if (!data) return sum;
+        UINT32 i = 0;
+        while (i + 1 < len) {
+            sum += ((UINT32)data[i] << 8) | data[i + 1];
+            i += 2;
+        }
+        if (i < len) {
+            sum += ((UINT32)data[i] << 8);
+        }
+        return sum;
+    }
+
+    static UINT16 finalize(UINT32 sum) {
+        while ((sum >> 16) != 0)
+            sum = (sum & 0xFFFFu) + (sum >> 16);
+        return (UINT16)(~sum & 0xFFFFu);
+    }
+
+    UINT16 ip_checksum(const UINT8* ip_header, UINT32 header_len) {
+        if (!ip_header || header_len < 20) return 0;
+        return finalize(accumulate(0, ip_header, header_len));
+    }
+
+    UINT16 tcp_checksum_ipv4(UINT32 src_ip, UINT32 dst_ip, const UINT8* tcp_data, UINT32 tcp_len) {
+        if (!tcp_data || tcp_len < 20) return 0;
+        UINT32 sum = 0;
+
+        UINT8 pseudo[12];
+        pseudo[0] = (UINT8)(src_ip >> 24); pseudo[1] = (UINT8)(src_ip >> 16);
+        pseudo[2] = (UINT8)(src_ip >> 8);  pseudo[3] = (UINT8)(src_ip);
+        pseudo[4] = (UINT8)(dst_ip >> 24); pseudo[5] = (UINT8)(dst_ip >> 16);
+        pseudo[6] = (UINT8)(dst_ip >> 8);  pseudo[7] = (UINT8)(dst_ip);
+        pseudo[8] = 0; pseudo[9] = IPPROTO_TCP;
+        pseudo[10] = (UINT8)(tcp_len >> 8); pseudo[11] = (UINT8)(tcp_len);
+        sum = accumulate(sum, pseudo, 12);
+        sum = accumulate(sum, tcp_data, tcp_len);
+        return finalize(sum);
+    }
+
+    UINT16 udp_checksum_ipv4(UINT32 src_ip, UINT32 dst_ip, const UINT8* udp_data, UINT32 udp_len) {
+        if (!udp_data || udp_len < 8) return 0;
+        UINT32 sum = 0;
+        UINT8 pseudo[12];
+        pseudo[0] = (UINT8)(src_ip >> 24); pseudo[1] = (UINT8)(src_ip >> 16);
+        pseudo[2] = (UINT8)(src_ip >> 8);  pseudo[3] = (UINT8)(src_ip);
+        pseudo[4] = (UINT8)(dst_ip >> 24); pseudo[5] = (UINT8)(dst_ip >> 16);
+        pseudo[6] = (UINT8)(dst_ip >> 8);  pseudo[7] = (UINT8)(dst_ip);
+        pseudo[8] = 0; pseudo[9] = IPPROTO_UDP;
+        pseudo[10] = (UINT8)(udp_len >> 8); pseudo[11] = (UINT8)(udp_len);
+        sum = accumulate(sum, pseudo, 12);
+        sum = accumulate(sum, udp_data, udp_len);
+        UINT16 result = finalize(sum);
+        if (result == 0) result = 0xFFFFu;
+        return result;
+    }
+
+    void recalculate_transport_checksums(UINT8* ip_header, UINT32 total_len) {
+        if (!ip_header || total_len < 20) return;
+
+        UINT8 ver_ihl = ip_header[0];
+        if ((ver_ihl >> 4) != 4) return;
+
+        UINT32 ihl = (ver_ihl & 0x0F) * 4;
+        if (ihl < 20 || ihl > total_len) return;
+
+        UINT8 protocol = ip_header[9];
+        UINT32 src_ip = ((UINT32)ip_header[12] << 24) | ((UINT32)ip_header[13] << 16) |
+                        ((UINT32)ip_header[14] << 8) | ip_header[15];
+        UINT32 dst_ip = ((UINT32)ip_header[16] << 24) | ((UINT32)ip_header[17] << 16) |
+                        ((UINT32)ip_header[18] << 8) | ip_header[19];
+
+
+        ip_header[10] = 0;
+        ip_header[11] = 0;
+        UINT16 ip_cksum = ip_checksum(ip_header, ihl);
+        ip_header[10] = (UINT8)(ip_cksum >> 8);
+        ip_header[11] = (UINT8)(ip_cksum);
+
+        UINT8* transport = ip_header + ihl;
+        UINT32 transport_len = total_len - ihl;
+
+        if (protocol == IPPROTO_TCP && transport_len >= 20) {
+
+            transport[16] = 0;
+            transport[17] = 0;
+            UINT16 cksum = tcp_checksum_ipv4(src_ip, dst_ip, transport, transport_len);
+            transport[16] = (UINT8)(cksum >> 8);
+            transport[17] = (UINT8)(cksum);
+        } else if (protocol == IPPROTO_UDP && transport_len >= 8) {
+
+            transport[6] = 0;
+            transport[7] = 0;
+            UINT16 cksum = udp_checksum_ipv4(src_ip, dst_ip, transport, transport_len);
+            transport[6] = (UINT8)(cksum >> 8);
+            transport[7] = (UINT8)(cksum);
+        }
+    }
+}
+
+
+namespace net_seq_delta {
+
+    static __forceinline UINT32 hash_5tuple(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port) {
+        UINT32 h = src_ip ^ dst_ip ^ ((UINT32)src_port << 16) ^ dst_port;
+        h = (h ^ (h >> 16)) * 0x45d9f3b;
+        h = (h ^ (h >> 16));
+        return h % MAX_SEQ_DELTA_ENTRIES;
+    }
+
+    SEQ_DELTA_ENTRY* find_or_create(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port) {
+        KIRQL old_irql;
+        KeAcquireSpinLock(&net_capture::g_seq_delta_lock, &old_irql);
+
+
+        for (UINT32 i = 0; i < MAX_SEQ_DELTA_ENTRIES; i++) {
+            SEQ_DELTA_ENTRY* e = &net_capture::g_seq_delta[i];
+            if (!e->active) continue;
+            if (e->src_ip == src_ip && e->dst_ip == dst_ip &&
+                e->src_port == src_port && e->dst_port == dst_port) {
+                LARGE_INTEGER now;
+                now = KeQueryPerformanceCounter(nullptr);
+                e->last_activity = now.QuadPart;
+                KeReleaseSpinLock(&net_capture::g_seq_delta_lock, old_irql);
+                return e;
+            }
+
+            if (e->src_ip == dst_ip && e->dst_ip == src_ip &&
+                e->src_port == dst_port && e->dst_port == src_port) {
+                LARGE_INTEGER now;
+                now = KeQueryPerformanceCounter(nullptr);
+                e->last_activity = now.QuadPart;
+                KeReleaseSpinLock(&net_capture::g_seq_delta_lock, old_irql);
+                return e;
+            }
+        }
+
+
+        UINT32 start = hash_5tuple(src_ip, dst_ip, src_port, dst_port);
+        for (UINT32 i = 0; i < MAX_SEQ_DELTA_ENTRIES; i++) {
+            UINT32 idx = (start + i) % MAX_SEQ_DELTA_ENTRIES;
+            SEQ_DELTA_ENTRY* e = &net_capture::g_seq_delta[idx];
+            if (!e->active) {
+                e->src_ip = src_ip;
+                e->dst_ip = dst_ip;
+                e->src_port = src_port;
+                e->dst_port = dst_port;
+                e->outbound_delta = 0;
+                e->inbound_delta = 0;
+                LARGE_INTEGER now;
+                now = KeQueryPerformanceCounter(nullptr);
+                e->last_activity = now.QuadPart;
+                KeMemoryBarrier();
+                _InterlockedExchange(&e->active, 1);
+                KeReleaseSpinLock(&net_capture::g_seq_delta_lock, old_irql);
+                return e;
+            }
+        }
+
+        KeReleaseSpinLock(&net_capture::g_seq_delta_lock, old_irql);
+        return nullptr;
+    }
+
+    void apply_delta(UINT8* tcp_header, UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port, BOOLEAN is_outbound) {
+        if (!tcp_header) return;
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&net_capture::g_seq_delta_lock, &old_irql);
+
+        SEQ_DELTA_ENTRY* entry = nullptr;
+        for (UINT32 i = 0; i < MAX_SEQ_DELTA_ENTRIES; i++) {
+            SEQ_DELTA_ENTRY* e = &net_capture::g_seq_delta[i];
+            if (!e->active) continue;
+            if ((e->src_ip == src_ip && e->dst_ip == dst_ip &&
+                 e->src_port == src_port && e->dst_port == dst_port) ||
+                (e->src_ip == dst_ip && e->dst_ip == src_ip &&
+                 e->src_port == dst_port && e->dst_port == src_port)) {
+                entry = e;
+                break;
+            }
+        }
+
+        if (!entry || (entry->outbound_delta == 0 && entry->inbound_delta == 0)) {
+            KeReleaseSpinLock(&net_capture::g_seq_delta_lock, old_irql);
+            return;
+        }
+
+
+        LONG32 seq_adjust = is_outbound ? entry->outbound_delta : entry->inbound_delta;
+        if (seq_adjust != 0) {
+            UINT32 seq = ((UINT32)tcp_header[4] << 24) | ((UINT32)tcp_header[5] << 16) |
+                         ((UINT32)tcp_header[6] << 8) | tcp_header[7];
+            seq = (UINT32)((INT64)seq + seq_adjust);
+            tcp_header[4] = (UINT8)(seq >> 24);
+            tcp_header[5] = (UINT8)(seq >> 16);
+            tcp_header[6] = (UINT8)(seq >> 8);
+            tcp_header[7] = (UINT8)(seq);
+        }
+
+
+        LONG32 ack_adjust = is_outbound ? entry->inbound_delta : entry->outbound_delta;
+        if (ack_adjust != 0) {
+            UINT32 ack = ((UINT32)tcp_header[8] << 24) | ((UINT32)tcp_header[9] << 16) |
+                         ((UINT32)tcp_header[10] << 8) | tcp_header[11];
+            ack = (UINT32)((INT64)ack + ack_adjust);
+            tcp_header[8] = (UINT8)(ack >> 24);
+            tcp_header[9] = (UINT8)(ack >> 16);
+            tcp_header[10] = (UINT8)(ack >> 8);
+            tcp_header[11] = (UINT8)(ack);
+        }
+
+        KeReleaseSpinLock(&net_capture::g_seq_delta_lock, old_irql);
+    }
+
+    void record_size_change(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port, BOOLEAN is_outbound, LONG32 delta) {
+        if (delta == 0) return;
+        SEQ_DELTA_ENTRY* entry = find_or_create(src_ip, dst_ip, src_port, dst_port);
+        if (!entry) return;
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&net_capture::g_seq_delta_lock, &old_irql);
+        if (is_outbound) {
+            entry->outbound_delta += delta;
+        } else {
+            entry->inbound_delta += delta;
+        }
+        KeReleaseSpinLock(&net_capture::g_seq_delta_lock, old_irql);
+    }
+
+    void cleanup_expired() {
+        LARGE_INTEGER now;
+        LARGE_INTEGER freq;
+        now = KeQueryPerformanceCounter(&freq);
+        UINT64 threshold = (UINT64)freq.QuadPart * 120;
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&net_capture::g_seq_delta_lock, &old_irql);
+        for (UINT32 i = 0; i < MAX_SEQ_DELTA_ENTRIES; i++) {
+            SEQ_DELTA_ENTRY* e = &net_capture::g_seq_delta[i];
+            if (!e->active) continue;
+            if ((now.QuadPart - e->last_activity) > threshold) {
+                _InterlockedExchange(&e->active, 0);
+            }
+        }
+        KeReleaseSpinLock(&net_capture::g_seq_delta_lock, old_irql);
+    }
+
+    void handle_fin_rst(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port) {
+        KIRQL old_irql;
+        KeAcquireSpinLock(&net_capture::g_seq_delta_lock, &old_irql);
+        for (UINT32 i = 0; i < MAX_SEQ_DELTA_ENTRIES; i++) {
+            SEQ_DELTA_ENTRY* e = &net_capture::g_seq_delta[i];
+            if (!e->active) continue;
+            if ((e->src_ip == src_ip && e->dst_ip == dst_ip &&
+                 e->src_port == src_port && e->dst_port == dst_port) ||
+                (e->src_ip == dst_ip && e->dst_ip == src_ip &&
+                 e->src_port == dst_port && e->dst_port == src_port)) {
+                _InterlockedExchange(&e->active, 0);
+                break;
+            }
+        }
+        KeReleaseSpinLock(&net_capture::g_seq_delta_lock, old_irql);
+    }
+}
+
+
+namespace net_fragment {
+
+    void init() {
+        KeInitializeSpinLock(&net_capture::g_fragment_lock);
+        SIZE_T alloc_size = (SIZE_T)MAX_FRAGMENT_ENTRIES * sizeof(FRAGMENT_ENTRY);
+        net_capture::g_fragment_entries = (FRAGMENT_ENTRY*)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, alloc_size, 'frNW');
+        if (net_capture::g_fragment_entries) {
+            strong::kmemset(net_capture::g_fragment_entries, 0, alloc_size);
+        }
+        NET_DBG("net_fragment::init: allocated %p (%llu bytes)", net_capture::g_fragment_entries, (ULONGLONG)alloc_size);
+    }
+
+    void cleanup() {
+        if (net_capture::g_fragment_entries) {
+            ExFreePoolWithTag(net_capture::g_fragment_entries, 'frNW');
+            net_capture::g_fragment_entries = nullptr;
+        }
+    }
+
+    void cleanup_expired() {
+        if (!net_capture::g_fragment_entries) return;
+        LARGE_INTEGER now;
+        LARGE_INTEGER freq;
+        now = KeQueryPerformanceCounter(&freq);
+        UINT64 threshold = (UINT64)freq.QuadPart * 30;
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&net_capture::g_fragment_lock, &old_irql);
+        for (UINT32 i = 0; i < MAX_FRAGMENT_ENTRIES; i++) {
+            FRAGMENT_ENTRY* e = &net_capture::g_fragment_entries[i];
+            if (!e->active) continue;
+            if ((now.QuadPart - e->first_seen) > threshold) {
+                _InterlockedExchange(&e->active, 0);
+            }
+        }
+        KeReleaseSpinLock(&net_capture::g_fragment_lock, old_irql);
+    }
+
+    UINT8* process_fragment(const UINT8* ip_header, UINT32 total_packet_len, UINT32* out_reassembled_len) {
+        if (!ip_header || total_packet_len < 20 || !out_reassembled_len) return nullptr;
+        if (!net_capture::g_fragment_entries) return nullptr;
+
+        *out_reassembled_len = 0;
+
+        UINT8 ver_ihl = ip_header[0];
+        if ((ver_ihl >> 4) != 4) return nullptr;
+        UINT32 ihl = (ver_ihl & 0x0F) * 4;
+        if (ihl < 20 || ihl > total_packet_len) return nullptr;
+
+        UINT16 total_length = ((UINT16)ip_header[2] << 8) | ip_header[3];
+        UINT16 ip_id = ((UINT16)ip_header[4] << 8) | ip_header[5];
+        UINT16 flags_frag = ((UINT16)ip_header[6] << 8) | ip_header[7];
+        UINT16 frag_offset = (flags_frag & 0x1FFF) * 8;
+        BOOLEAN more_fragments = (flags_frag & 0x2000) != 0;
+        UINT8 protocol = ip_header[9];
+        UINT32 src_ip = ((UINT32)ip_header[12] << 24) | ((UINT32)ip_header[13] << 16) |
+                        ((UINT32)ip_header[14] << 8) | ip_header[15];
+        UINT32 dst_ip = ((UINT32)ip_header[16] << 24) | ((UINT32)ip_header[17] << 16) |
+                        ((UINT32)ip_header[18] << 8) | ip_header[19];
+
+        UINT32 payload_len = total_length - ihl;
+        if (payload_len == 0) return nullptr;
+        if (frag_offset + payload_len > FRAGMENT_MAX_SIZE) return nullptr;
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&net_capture::g_fragment_lock, &old_irql);
+
+
+        FRAGMENT_ENTRY* entry = nullptr;
+        UINT32 free_idx = MAX_FRAGMENT_ENTRIES;
+        for (UINT32 i = 0; i < MAX_FRAGMENT_ENTRIES; i++) {
+            FRAGMENT_ENTRY* e = &net_capture::g_fragment_entries[i];
+            if (e->active && e->ip_id == ip_id && e->src_ip == src_ip &&
+                e->dst_ip == dst_ip && e->protocol == protocol) {
+                entry = e;
+                break;
+            }
+            if (!e->active && free_idx == MAX_FRAGMENT_ENTRIES) {
+                free_idx = i;
+            }
+        }
+
+        if (!entry) {
+            if (free_idx >= MAX_FRAGMENT_ENTRIES) {
+                KeReleaseSpinLock(&net_capture::g_fragment_lock, old_irql);
+                return nullptr;
+            }
+            entry = &net_capture::g_fragment_entries[free_idx];
+            strong::kmemset(entry, 0, sizeof(FRAGMENT_ENTRY));
+            entry->ip_id = ip_id;
+            entry->protocol = protocol;
+            entry->src_ip = src_ip;
+            entry->dst_ip = dst_ip;
+            LARGE_INTEGER now;
+            now = KeQueryPerformanceCounter(nullptr);
+            entry->first_seen = now.QuadPart;
+            _InterlockedExchange(&entry->active, 1);
+        }
+
+
+        strong::kmemcpy(entry->data + frag_offset, ip_header + ihl, payload_len);
+
+
+        for (UINT32 b = frag_offset; b < frag_offset + payload_len; b++) {
+            entry->received_map[b / 8] |= (1 << (b % 8));
+        }
+
+        UINT32 end_offset = frag_offset + payload_len;
+        if (end_offset > entry->highest_offset)
+            entry->highest_offset = end_offset;
+        entry->total_received += payload_len;
+
+        if (!more_fragments) {
+            entry->last_fragment_seen = TRUE;
+        }
+
+
+        BOOLEAN complete = FALSE;
+        if (entry->last_fragment_seen && entry->highest_offset > 0) {
+            complete = TRUE;
+            for (UINT32 b = 0; b < entry->highest_offset; b++) {
+                if (!(entry->received_map[b / 8] & (1 << (b % 8)))) {
+                    complete = FALSE;
+                    break;
+                }
+            }
+        }
+
+        if (complete) {
+            UINT32 reassembled_len = entry->highest_offset;
+            UINT8* result = (UINT8*)ExAllocatePool2(POOL_FLAG_NON_PAGED, reassembled_len, 'rfNW');
+            if (result) {
+                strong::kmemcpy(result, entry->data, reassembled_len);
+                *out_reassembled_len = reassembled_len;
+            }
+            _InterlockedExchange(&entry->active, 0);
+            KeReleaseSpinLock(&net_capture::g_fragment_lock, old_irql);
+            return result;
+        }
+
+        KeReleaseSpinLock(&net_capture::g_fragment_lock, old_irql);
+        return nullptr;
+    }
+}
+
+
+namespace net_udp_cache {
+
+    static __forceinline UINT32 hash_flow(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port) {
+        UINT32 h = src_ip ^ dst_ip ^ ((UINT32)src_port << 16) ^ dst_port;
+        h = (h ^ (h >> 16)) * 0x45d9f3b;
+        return (h ^ (h >> 16)) % MAX_UDP_FLOW_ENTRIES;
+    }
+
+    UINT32 lookup(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port) {
+        KIRQL old_irql;
+        KeAcquireSpinLock(&net_capture::g_udp_flow_lock, &old_irql);
+        for (UINT32 i = 0; i < MAX_UDP_FLOW_ENTRIES; i++) {
+            UDP_FLOW_ENTRY* e = &net_capture::g_udp_flow[i];
+            if (!e->active) continue;
+            if (e->src_ip == src_ip && e->dst_ip == dst_ip &&
+                e->src_port == src_port && e->dst_port == dst_port) {
+                UINT32 pid = e->pid;
+                LARGE_INTEGER now;
+                now = KeQueryPerformanceCounter(nullptr);
+                e->last_activity = now.QuadPart;
+                KeReleaseSpinLock(&net_capture::g_udp_flow_lock, old_irql);
+                return pid;
+            }
+
+            if (e->src_ip == dst_ip && e->dst_ip == src_ip &&
+                e->src_port == dst_port && e->dst_port == src_port) {
+                UINT32 pid = e->pid;
+                LARGE_INTEGER now;
+                now = KeQueryPerformanceCounter(nullptr);
+                e->last_activity = now.QuadPart;
+                KeReleaseSpinLock(&net_capture::g_udp_flow_lock, old_irql);
+                return pid;
+            }
+        }
+        KeReleaseSpinLock(&net_capture::g_udp_flow_lock, old_irql);
+        return 0;
+    }
+
+    void store(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port, UINT32 pid) {
+        if (pid == 0) return;
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&net_capture::g_udp_flow_lock, &old_irql);
+
+
+        for (UINT32 i = 0; i < MAX_UDP_FLOW_ENTRIES; i++) {
+            UDP_FLOW_ENTRY* e = &net_capture::g_udp_flow[i];
+            if (!e->active) continue;
+            if ((e->src_ip == src_ip && e->dst_ip == dst_ip &&
+                 e->src_port == src_port && e->dst_port == dst_port) ||
+                (e->src_ip == dst_ip && e->dst_ip == src_ip &&
+                 e->src_port == dst_port && e->dst_port == src_port)) {
+                e->pid = pid;
+                LARGE_INTEGER now;
+                now = KeQueryPerformanceCounter(nullptr);
+                e->last_activity = now.QuadPart;
+                KeReleaseSpinLock(&net_capture::g_udp_flow_lock, old_irql);
+                return;
+            }
+        }
+
+
+        UINT32 start = hash_flow(src_ip, dst_ip, src_port, dst_port);
+        for (UINT32 i = 0; i < MAX_UDP_FLOW_ENTRIES; i++) {
+            UINT32 idx = (start + i) % MAX_UDP_FLOW_ENTRIES;
+            UDP_FLOW_ENTRY* e = &net_capture::g_udp_flow[idx];
+            if (!e->active) {
+                e->src_ip = src_ip;
+                e->dst_ip = dst_ip;
+                e->src_port = src_port;
+                e->dst_port = dst_port;
+                e->pid = pid;
+                LARGE_INTEGER now;
+                now = KeQueryPerformanceCounter(nullptr);
+                e->last_activity = now.QuadPart;
+                KeMemoryBarrier();
+                _InterlockedExchange(&e->active, 1);
+                KeReleaseSpinLock(&net_capture::g_udp_flow_lock, old_irql);
+                return;
+            }
+        }
+
+
+        UINT64 oldest_time = ~0ULL;
+        UINT32 oldest_idx = 0;
+        for (UINT32 i = 0; i < MAX_UDP_FLOW_ENTRIES; i++) {
+            if (net_capture::g_udp_flow[i].last_activity < oldest_time) {
+                oldest_time = net_capture::g_udp_flow[i].last_activity;
+                oldest_idx = i;
+            }
+        }
+        UDP_FLOW_ENTRY* e = &net_capture::g_udp_flow[oldest_idx];
+        e->src_ip = src_ip;
+        e->dst_ip = dst_ip;
+        e->src_port = src_port;
+        e->dst_port = dst_port;
+        e->pid = pid;
+        LARGE_INTEGER now;
+        now = KeQueryPerformanceCounter(nullptr);
+        e->last_activity = now.QuadPart;
+        KeMemoryBarrier();
+        _InterlockedExchange(&e->active, 1);
+        KeReleaseSpinLock(&net_capture::g_udp_flow_lock, old_irql);
+    }
+
+    void cleanup_expired() {
+        LARGE_INTEGER now;
+        LARGE_INTEGER freq;
+        now = KeQueryPerformanceCounter(&freq);
+        UINT64 threshold = (UINT64)freq.QuadPart * 60;
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&net_capture::g_udp_flow_lock, &old_irql);
+        for (UINT32 i = 0; i < MAX_UDP_FLOW_ENTRIES; i++) {
+            UDP_FLOW_ENTRY* e = &net_capture::g_udp_flow[i];
+            if (!e->active) continue;
+            if ((now.QuadPart - e->last_activity) > threshold) {
+                _InterlockedExchange(&e->active, 0);
+            }
+        }
+        KeReleaseSpinLock(&net_capture::g_udp_flow_lock, old_irql);
     }
 }
 

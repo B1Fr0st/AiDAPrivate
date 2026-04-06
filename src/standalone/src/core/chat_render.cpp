@@ -323,11 +323,7 @@ chat_render::render_result_t chat_render::render_rich_message(
     float cursor_y = cy + 5.f;
     float base_x   = cx + 8.f;
 
-    // WHY: Word-by-word inline renderer. All inline spans (text, bold, italic,
-    // inline_code) share cursor_x/cursor_y so they flow together on the same line.
-    // The old code rendered each text span as a full-width paragraph which broke
-    // around inline code pills (e.g. "variable `has_kernel` is false" would put
-    // "has_kernel" on its own line instead of flowing inline).
+
     auto render_inline_words = [&](const std::string& txt, ImU32 color) {
         const char* p   = txt.c_str();
         const char* end = p + txt.size();
@@ -343,7 +339,7 @@ chat_render::render_result_t chat_render::render_rich_message(
             if (*p == '\r') { p++; continue; }
 
             if (*p == ' ') {
-                // Only add space if we've already rendered something on this line
+
                 if (cursor_x > base_x)
                     cursor_x += space_w;
                 p++;
@@ -523,11 +519,11 @@ chat_render::render_result_t chat_render::render_rich_message(
         float btn_h = 20.f;
         float btn_y = msg_max.y + 12.f;
 
-        // Always show Copy and Retry buttons at the bottom-right
+
         const char* labels[] = { ICON_COPY, ICON_SPINNER };
         action_t actions[] = { action_t::copy, action_t::retry };
 
-        // Calculate total width of buttons first for right-alignment
+
         float btn_gap = 12.f;
         float total_btn_w = 0.f;
         float btn_widths[2];
@@ -536,7 +532,7 @@ chat_render::render_result_t chat_render::render_rich_message(
             btn_widths[bi] = lts.x + 10.f;
             total_btn_w += btn_widths[bi];
         }
-        total_btn_w += btn_gap; // gap between buttons
+        total_btn_w += btn_gap;
 
         float bx = msg_max.x - total_btn_w - 8.f;
 

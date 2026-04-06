@@ -184,12 +184,33 @@ inline language_def_t lang_json() {
     return d;
 }
 
+inline language_def_t lang_lua() {
+    language_def_t d{};
+    d.name = "Lua";
+    d.keywords = {
+        "and","break","do","else","elseif","end","false","for","function","goto",
+        "if","in","local","nil","not","or","repeat","return","then","true","until","while"
+    };
+    d.types = {
+        "string","table","math","io","os","coroutine","debug","package","utf8",
+        "number","boolean","thread","userdata"
+    };
+    d.line_comment = "--";
+    d.block_start  = "--[[";
+    d.block_end    = "]]";
+    d.preproc_char = 0;
+    d.has_decorators = false;
+    d.is_json = false;
+    return d;
+}
+
 
 inline const language_def_t& detect_language(const std::string& filename) {
     static auto s_cpp    = lang_cpp();
     static auto s_asm    = lang_asm();
     static auto s_python = lang_python();
     static auto s_json   = lang_json();
+    static auto s_lua    = lang_lua();
 
     auto ext_pos = filename.rfind('.');
     if (ext_pos == std::string::npos) return s_cpp;
@@ -205,6 +226,8 @@ inline const language_def_t& detect_language(const std::string& filename) {
         return s_python;
     if (ext == ".json" || ext == ".jsonl")
         return s_json;
+    if (ext == ".lua" || ext == ".luac")
+        return s_lua;
 
     return s_cpp;
 }

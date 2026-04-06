@@ -415,7 +415,7 @@ void find_all_matches() {
                 }
             }
         } catch (...) {
-            // invalid regex — no matches
+
         }
     } else {
         if (!s_find.case_sensitive) {
@@ -569,7 +569,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
 
     const float goto_bar_h = s_goto.visible ? 32.f : 0.f;
-    const float overlay_h = goto_bar_h;  // find bar floats over content
+    const float overlay_h = goto_bar_h;
     const float editor_y0 = pos_y + overlay_h;
     const float editor_h  = height - overlay_h;
 
@@ -598,7 +598,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     ImGui::ItemSize(ImVec2(width, height));
     if (!ImGui::ItemAdd(bb, id)) return;
 
-    // Pre-compute find bar rect so we can block editor clicks over it
+
     bool mouse_over_find_bar = false;
     if (s_find.visible) {
         const float fb_w = 340.f;
@@ -1277,7 +1277,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
 
     if (s_find.visible) {
-        // ── Find bar — themed, top-right overlay ──
+
         const auto& theme = themes::resolved;
         ImVec4 accent_col(accent_r, accent_g, accent_b, 1.f);
         ImVec4 bg     = ImGui::ColorConvertU32ToFloat4(theme.panel_header);
@@ -1315,7 +1315,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         ImGui::Begin("##find_bar", &find_open, find_flags);
         s_find_has_focus = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
 
-        // Helper: toggle button (highlighted when active)
+
         auto toggle_button = [&](const char* label, bool& state, const char* id_suffix, const char* tooltip) -> bool {
             ImGui::PushID(id_suffix);
             ImVec2 sz(btn_sz, row_h);
@@ -1338,7 +1338,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             return state != was;
         };
 
-        // Helper: icon-style button
+
         auto icon_button = [&](const char* label, const char* id_suffix, const char* tooltip, float w = 26.f) -> bool {
             ImGui::PushID(id_suffix);
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.f, 0.f, 0.f, 0.f));
@@ -1353,7 +1353,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             return clicked;
         };
 
-        // ── ROW 1: Chevron | FindInput | Aa | results | × ──
+
         {
             const char* chev = s_find.replace_mode ? "v" : ">";
             if (icon_button(chev, "chevron", "Toggle Replace", 20.f))
@@ -1361,7 +1361,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             ImGui::SameLine();
         }
 
-        // Find input
+
         {
             ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, (row_h - ImGui::GetFontSize()) * 0.5f - 1.f));
@@ -1381,7 +1381,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             ImGui::PopStyleColor(4);
             ImGui::PopStyleVar(2);
 
-            // Live search as you type — auto-navigate to first match
+
             if (edited && strcmp(s_find.find_buf, s_find_last_buf) != 0) {
                 memcpy(s_find_last_buf, s_find.find_buf, sizeof(s_find.find_buf));
                 find_all_matches();
@@ -1392,19 +1392,19 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 }
             }
 
-            // Enter = next, Shift+Enter = prev
+
             if (enter_pressed) {
                 if (ImGui::GetIO().KeyShift)
                     find_prev();
                 else
                     find_next();
                 ensure_caret_visible(editor_h, line_h);
-                s_focus_find_input = true;  // re-focus input after Enter
+                s_focus_find_input = true;
             }
             ImGui::SameLine();
         }
 
-        // Case sensitive toggle
+
         if (toggle_button("Aa", s_find.case_sensitive, "case", "Match Case")) {
             find_all_matches();
             if (!s_find.match_positions.empty()) {
@@ -1415,7 +1415,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         }
         ImGui::SameLine();
 
-        // Results count
+
         {
             char match_buf[32];
             if (s_find.find_buf[0] == '\0') {
@@ -1437,14 +1437,14 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             }
         }
 
-        // Close
+
         if (icon_button("\xc3\x97", "close", "Close (Esc)")) {
             s_find.visible = false;
             s_find_has_focus = false;
             s_has_focus = true;
         }
 
-        // ── ROW 2: Replace ──
+
         if (s_find.replace_mode) {
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 22.f);
 
@@ -1466,7 +1466,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             if (icon_button("R*", "repl_all", "Replace All")) replace_all();
         }
 
-        // Escape closes
+
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
             s_find.visible = false;
             s_find_has_focus = false;
@@ -1477,7 +1477,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         ImGui::PopStyleColor(2);
         ImGui::PopStyleVar(4);
 
-        // Subtle shadow below
+
         ImDrawList* fdl = ImGui::GetForegroundDrawList();
         fdl->AddRectFilledMultiColor(
             ImVec2(bar_x + 4.f, bar_y + total_bar_h),
@@ -1519,7 +1519,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         }
     }
 
-    // ── Vertical scrollbar (matches disasm_view / hex_view style) ──
+
     {
         float total_content = n_lines * line_h;
         if (total_content > editor_h) {
@@ -1545,12 +1545,12 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             ImGui::GetStateStorage()->SetFloat(sb_hov_id, sb_a);
 
             if (sb_a > 0.01f) {
-                // Track background
+
                 dl->AddRectFilled(ImVec2(track_x, track_y0),
                     ImVec2(track_x + sb_w, track_y0 + track_h),
                     IM_COL32(255, 255, 255, (int)(8.f * sb_a * a)), 3.f);
 
-                // Thumb
+
                 bool thumb_hov = ImGui::IsMouseHoveringRect(
                     ImVec2(track_x - 2.f, thumb_y),
                     ImVec2(track_x + sb_w + 2.f, thumb_y + thumb_h));

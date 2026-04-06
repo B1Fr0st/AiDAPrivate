@@ -78,25 +78,22 @@ struct ChatMessage {
 	int cache_read_tokens = 0;
 	int cache_write_tokens = 0;
 
-	// Context condensation (Roo-Code parity: non-destructive message management)
-	// WHY: Instead of deleting old messages, we mark them as condensed summaries
-	// or truncation markers so UI can show them differently and API calls can
-	// filter them efficiently.
-	bool is_summary = false;            // true if this message IS a condensation summary
-	std::string condense_id;            // unique ID if this is a summary (links to condensed group)
-	std::string condense_parent;        // ID of the summary that replaced this message
-	bool is_truncation_marker = false;  // true if this is a "[messages truncated]" marker
-	std::string truncation_id;          // unique ID for truncation group
-	std::string truncation_parent;      // links truncated messages to their marker
 
-	// Cost tracking per message (Roo-Code parity: per-message cost attribution)
+	bool is_summary = false;
+	std::string condense_id;
+	std::string condense_parent;
+	bool is_truncation_marker = false;
+	std::string truncation_id;
+	std::string truncation_parent;
+
+
 	double cost = 0.0;
 
-	// Tool use metadata for message grouping
-	std::string tool_name;              // if this message contains a tool result
+
+	std::string tool_name;
 	bool is_tool_result = false;
 
-	// Which model generated this response
+
 	std::string model_id;
 };
 
@@ -106,16 +103,14 @@ inline std::vector<ChatMessage> g_chat_messages;
 inline char                     g_chat_buf[4096] = {};
 inline bool                     g_chat_scroll_to_bottom = false;
 
-// Get the effective message history for API calls.
-// WHY: Filters out condensed/truncated messages so the LLM only sees
-// the current effective context window (summaries + recent messages).
+
 inline std::vector<const ChatMessage*> get_effective_api_history()
 {
 	std::vector<const ChatMessage*> result;
 	for (const auto& msg : g_chat_messages) {
-		// Skip messages that have been replaced by a condensation summary
+
 		if (!msg.condense_parent.empty()) continue;
-		// Skip messages that have been truncated
+
 		if (!msg.truncation_parent.empty()) continue;
 		result.push_back(&msg);
 	}

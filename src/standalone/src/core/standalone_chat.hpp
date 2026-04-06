@@ -19,7 +19,7 @@ bool is_ai_busy();
 namespace mcp_client { class manager_t; }
 mcp_client::manager_t& get_mcp_client_manager();
 
-// File context tracker access (Roo-Code parity: lets UI show tracked files)
+
 file_context::tracker_t& get_file_tracker();
 
 void do_process_attach(unsigned long pid);

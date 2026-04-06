@@ -608,7 +608,7 @@ static void test_capture(std::uint32_t target_pid) {
         return;
     }
 
-    // Step 9: WFP init verification — immediately check capture is truly active
+
     {
         bool init_active = false;
         std::uint32_t init_cap = 0, init_drop = 0;
@@ -626,7 +626,7 @@ static void test_capture(std::uint32_t target_pid) {
             printf("  [DIAG]   - Another driver is blocking WFP registration\n");
         }
 
-        // Verify stats pipeline by querying network stats immediately after capture start
+
         voyager::device_t::network_stats init_stats{};
         bool stats_ok = device->get_network_stats(init_stats);
         snprintf(init_detail, sizeof(init_detail),
@@ -636,7 +636,7 @@ static void test_capture(std::uint32_t target_pid) {
         report("capture_wfp_verify(stats_pipeline)", stats_ok, init_detail);
     }
 
-    // Step 10: Progressive capture polling at 1-second intervals
+
     printf("  [INFO] Capturing test_target traffic for 5 seconds (polling each second)...\n");
     for (int sec = 1; sec <= 5; sec++) {
         Sleep(1000);
@@ -675,12 +675,12 @@ static void test_capture(std::uint32_t target_pid) {
         printf("  [INFO] Pkt[%d]: pid=%u proto=%u dir=%u size=%u ports=%u->%u",
                shown, p.pid, p.protocol, p.direction, p.payload_size,
                p.local_port, p.remote_port);
-        // Validate packet field ranges
+
         bool valid = (p.protocol == 6 || p.protocol == 17) && p.payload_size <= 65535;
         if (!valid) printf(" [!INVALID FIELDS]");
         printf("\n");
 
-        // Hex dump first 32 bytes of first packet payload
+
         if (shown == 0 && p.payload_size > 0 && !p.payload.empty()) {
             printf("  [INFO] Payload hex (first %u bytes): ",
                    p.payload_size < 32 ? p.payload_size : 32);
@@ -717,7 +717,7 @@ static void test_dns_queries(std::uint32_t target_pid) {
     int shown = 0;
     for (auto& d : dns) {
         if (shown >= 5) break;
-        // Validate domain name is non-empty and printable
+
         bool valid_domain = !d.domain.empty();
         for (char c : d.domain) {
             if (c < 0x20 || c > 0x7E) { valid_domain = false; break; }
@@ -881,13 +881,13 @@ static void test_tcpip_dump(std::uint32_t target_pid) {
 static void test_packet_injection() {
     section("NETWORK: Packet Injection");
 
-    // Step 12: Start a brief capture to verify injected packet appears
+
     bool cap_ok = device->start_capture(0, 0, 0, nullptr, 1500);
     if (cap_ok) {
         printf("  [INFO] Started capture (all PIDs) to verify injection...\n");
     }
 
-    // Test UDP injection
+
     std::uint8_t src_addr[16] = {127, 0, 0, 1};
     std::uint8_t dst_addr[16] = {127, 0, 0, 1};
     std::uint8_t payload[] = "WhosWho-Test-Packet";
@@ -904,7 +904,7 @@ static void test_packet_injection() {
     );
     report("inject_packet(UDP localhost:65534)", ok);
 
-    // Test TCP injection
+
     std::uint8_t tcp_payload[] = "WhosWho-TCP-Test";
     bool tcp_ok = device->inject_packet(
         1,
@@ -918,7 +918,7 @@ static void test_packet_injection() {
     );
     report("inject_packet(TCP localhost:65533)", tcp_ok);
 
-    // Verify injected packets appear in capture
+
     if (cap_ok) {
         Sleep(500);
         auto pkts = device->get_captured_packets(32);
@@ -1050,7 +1050,7 @@ static void test_dpi(std::uint32_t target_pid) {
         printf("  [DIAG]   - test_target.exe has not made HTTP/TLS connections\n");
     }
 
-    // Step 13: Verify at least one HTTP or TLS detection
+
     bool found_http = false, found_tls = false, found_dns = false;
     int shown = 0;
     for (auto& r : results) {
@@ -1089,7 +1089,7 @@ static void test_dpi(std::uint32_t target_pid) {
 static void test_intercept() {
     section("NETWORK: Packet Interception");
 
-    // Step 15: Start intercept with port filter to target HTTP traffic (port 80/443)
+
     std::uint32_t held_count = 0;
     bool active = false;
 
@@ -1100,7 +1100,7 @@ static void test_intercept() {
     snprintf(detail, sizeof(detail), "held=%u active=%d (filter: TCP port 80)", held_count, active);
     report("intercept_op(start, TCP:80)", ok, detail);
 
-    // Wait longer for packets to be held
+
     printf("  [INFO] Waiting 3 seconds for packets to be intercepted...\n");
     Sleep(3000);
 
@@ -1115,13 +1115,13 @@ static void test_intercept() {
             printf("  [INFO] Held[%d]: proto=%u dir=%u size=%u ports=%u->%u\n",
                    shown, h.protocol, h.direction, h.payload_size,
                    h.src_port, h.dst_port);
-            // Validate held packet fields
+
             bool valid = (h.protocol == 6 || h.protocol == 17) && h.payload_size <= 65535;
             if (!valid) printf("  [DIAG] Held packet has unexpected fields\n");
             shown++;
         }
 
-        // Test release operation (op=3) on first held packet
+
         printf("  [INFO] Testing release on held packets...\n");
         bool release_ok = device->intercept_op(3);
         report("intercept_op(release)", release_ok);
@@ -1192,7 +1192,7 @@ static void test_bandwidth_monitor(std::uint32_t target_pid) {
              (unsigned long long)stats.bps_out);
     report("bw_monitor_op(start)", ok, detail);
 
-    // Step 14: Time-series sampling — wait 2s, query, wait 2s, query again
+
     printf("  [INFO] Sampling bandwidth over 4 seconds (2 intervals)...\n");
     Sleep(2000);
 
@@ -1214,7 +1214,7 @@ static void test_bandwidth_monitor(std::uint32_t target_pid) {
            (unsigned long long)stats_t2.bps_in,
            (unsigned long long)stats_t2.bps_out);
 
-    // Verify bytes increased between samples
+
     bool bw_growing = (stats_t2.total_bytes_sent > stats_t1.total_bytes_sent) ||
                       (stats_t2.total_bytes_recv > stats_t1.total_bytes_recv);
     snprintf(detail, sizeof(detail), "delta_sent=%llu delta_recv=%llu",
@@ -1232,7 +1232,7 @@ static void test_bandwidth_monitor(std::uint32_t target_pid) {
              (unsigned long long)procs.size());
     report("get_bw_per_process(target_pid)", !procs.empty(), detail);
 
-    // Verify per-process entries contain test_target PID
+
     bool found_target = false;
     for (auto& p : procs) {
         if (p.pid == target_pid) {
@@ -1565,15 +1565,13 @@ int main() {
     test_fingerprinting();
 
 
-    // Step 16: Network Feature Matrix summary
     {
         section("NETWORK FEATURE MATRIX");
         printf("  +-------------------------------------------------------+\n");
         printf("  | Category       | Feature              | Status         |\n");
         printf("  +-------------------------------------------------------+\n");
 
-        // We track a local pass count before and after each test group
-        // Since tests already ran, just summarize the categories
+
         printf("  | Core           | Connection Enum      | TESTED         |\n");
         printf("  | Core           | Packet Capture       | TESTED         |\n");
         printf("  | Core           | DNS Capture          | TESTED         |\n");

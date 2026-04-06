@@ -1,18 +1,18 @@
 #pragma once
 
-// Icon codepoints (IcoMoon custom set)
+
 #define ICON_MIN_IDE  0xE925
 #define ICON_MAX_IDE  0xE9B7
 
-#define ICON_FILES_EMPTY   "\xEE\xA4\xA5"  // U+E925 - Explorer
-#define ICON_COPY          "\xEE\xA4\xAC"  // U+E92C - Copy
-#define ICON_HISTORY       "\xEE\xA5\x8D"  // U+E94D - History
-#define ICON_SPINNER       "\xEE\xA6\x84"  // U+E984 - Restart / Spinner
-#define ICON_SEARCH        "\xEE\xA6\x86"  // U+E986 - Search
-#define ICON_COG           "\xEE\xA6\x94"  // U+E994 - Settings
-#define ICON_POWER_CORD    "\xEE\xA6\xB7"  // U+E9B7 - MCP Marketplace
+#define ICON_FILES_EMPTY   "\xEE\xA4\xA5"
+#define ICON_COPY          "\xEE\xA4\xAC"
+#define ICON_HISTORY       "\xEE\xA5\x8D"
+#define ICON_SPINNER       "\xEE\xA6\x84"
+#define ICON_SEARCH        "\xEE\xA6\x86"
+#define ICON_COG           "\xEE\xA6\x94"
+#define ICON_POWER_CORD    "\xEE\xA6\xB7"
 
-// Font data from IDE_Icons.c (IcoMoon TTF)
+
 static const unsigned char ide_icon_font_data[2388] = {
 	0x00, 0x01, 0x00, 0x00, 0x00, 0x0B, 0x00, 0x80, 0x00, 0x03, 0x00, 0x30,
 	0x4F, 0x53, 0x2F, 0x32, 0x0F, 0x12, 0x06, 0xA9, 0x00, 0x00, 0x00, 0xBC,

@@ -396,7 +396,7 @@ tool_result_t handle_restore_checkpoint(const json& params)
 }
 
 
-tool_result_t handle_list_checkpoints(const json& /*params*/)
+tool_result_t handle_list_checkpoints(const json& )
 {
     std::lock_guard<std::mutex> lk(g_checkpoint_mtx);
     if (!g_checkpoint_svc)

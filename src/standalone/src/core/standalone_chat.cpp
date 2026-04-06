@@ -43,10 +43,10 @@ extern DisasmState g_disasm;
 
 mcp_client::manager_t s_mcp_client_mgr;
 
-// File context tracker (Roo-Code parity: tracks which files the AI has seen/edited)
+
 static file_context::tracker_t s_file_tracker;
 
-// Auto-approval task counters (Roo-Code parity: per-task request/cost budgets)
+
 static auto_approval::task_counters_t s_approval_counters;
 
 namespace {
@@ -94,7 +94,7 @@ tool_approval_t s_tool_approval;
 
 bool request_tool_approval(const std::string& name, const json& arguments)
 {
-    // Legacy global auto-approve (kept for backward compatibility)
+
     if (g_sa_settings.tool_auto_approve)
         return true;
 
@@ -120,8 +120,7 @@ bool request_tool_approval(const std::string& name, const json& arguments)
         }
     }
 
-    // Granular auto-approval (Roo-Code parity)
-    // WHY: Roo-Code has per-category approval. Check if this tool's category is auto-approved.
+
     {
         auto_approval::settings_t aa_settings;
         aa_settings.always_allow_read_only  = g_sa_settings.auto_approve_read;
@@ -133,10 +132,10 @@ bool request_tool_approval(const std::string& name, const json& arguments)
         aa_settings.max_requests            = g_sa_settings.auto_approve_max_requests;
         aa_settings.max_cost_usd            = g_sa_settings.auto_approve_max_cost;
 
-        // Build allowed commands list from settings
+
         aa_settings.allowed_commands = g_sa_settings.auto_approve_allowed_commands;
 
-        // Check file-level blocking via .aidaignore
+
         if (arguments.contains("path")) {
             std::string path = arguments["path"].get<std::string>();
             auto ignore_patterns = auto_approval::load_aidaignore(g_sa_settings.aidaignore_path);
@@ -144,7 +143,7 @@ bool request_tool_approval(const std::string& name, const json& arguments)
                 return false;
         }
 
-        // Determine command for execute_command tools
+
         std::string command;
         if (name == "execute_command" && arguments.contains("command"))
             command = arguments["command"].get<std::string>();
@@ -264,8 +263,7 @@ std::string build_system_prompt(bool force_xml_fallback = false)
     std::string prompt;
     prompt.reserve(8192);
 
-    // WHY: Roo-Code injects the active mode's role_definition into the system prompt.
-    // This makes the AI behave differently per mode (agent vs code vs architect etc.)
+
     const auto& mode = aida_modes::get_active_mode();
 
     prompt += mode.role_definition + "\n\n";
@@ -283,8 +281,7 @@ std::string build_system_prompt(bool force_xml_fallback = false)
         "- For number conversions, ALWAYS use `convert_number`.\n"
         "- Do NOT fabricate tool results. If you need data, call a tool.\n\n";
 
-    // WHY: Roo-Code injects environment details (OS, shell, workspace, cwd) into system prompt
-    // so the AI knows the execution context without having to ask.
+
     {
         std::vector<std::string> tool_groups;
         for (auto g : mode.groups)
@@ -301,7 +298,7 @@ std::string build_system_prompt(bool force_xml_fallback = false)
         prompt += env_details + "\n";
     }
 
-    // Mode-specific custom instructions
+
     if (!mode.custom_instructions.empty())
         prompt += "## Custom Instructions\n" + mode.custom_instructions + "\n\n";
 
@@ -349,11 +346,10 @@ std::string execute_tool(const std::string& raw_name, const json& arguments)
 
     output_log::push(bottom_tab_t::mcp_log, "[tool] Executing: " + name);
 
-    // Increment auto-approval request counter (Roo-Code parity: per-task budget tracking)
+
     s_approval_counters.auto_approved_requests++;
 
-    // File context tracking (Roo-Code parity: track which files the AI touches)
-    // WHY: Roo-Code tracks every file read/edit so the AI and UI know what's in context.
+
     if (arguments.contains("path") && arguments["path"].is_string()) {
         std::string path = arguments["path"].get<std::string>();
         auto group = aida_modes::classify_tool(name);
@@ -502,7 +498,7 @@ std::string execute_tool(const std::string& raw_name, const json& arguments)
 void run_agentic(std::string user_message,
                  std::vector<std::pair<std::string, std::string>> history)
 {
-    // Reset per-task counters (Roo-Code parity: each new task resets approval budgets)
+
     s_approval_counters = auto_approval::task_counters_t{};
 
     {
@@ -689,7 +685,6 @@ void run_agentic(std::string user_message,
     }
 
 
-
     json messages = json::array();
     for (auto& [role, text] : history) {
         std::string r = (role == "assistant" || role == "Assistant") ? "assistant" : "user";
@@ -708,10 +703,7 @@ void run_agentic(std::string user_message,
             return;
         }
 
-        // Context condensation check (Roo-Code parity)
-        // WHY: Before each API call, check if the conversation has grown too large
-        // for the model's context window. If so, condense old messages into a summary
-        // instead of losing them entirely.
+
         {
             std::string active_model = g_sa_settings.get_active_model();
             auto& model_info = context_mgmt::get_model_info(active_model);
@@ -736,7 +728,7 @@ void run_agentic(std::string user_message,
                     "[ai] Context at " + std::to_string(static_cast<int>(usage_fraction * 100)) +
                     "% — condensing conversation...");
 
-                // Build condensation summary request
+
                 std::vector<std::pair<std::string, std::string>> old_msgs;
                 for (size_t i = 0; i < messages.size() - 2; ++i) {
                     std::string role = messages[i].value("role", "user");
@@ -760,7 +752,7 @@ void run_agentic(std::string user_message,
                 }
 
                 if (!summary.empty() && summary.substr(0, 6) != "Error:") {
-                    // Replace all messages except the last 2 with the summary
+
                     json condensed = json::array();
                     condensed.push_back({
                         {"role", "user"},
@@ -771,7 +763,7 @@ void run_agentic(std::string user_message,
                         {"content", "I understand the context from the summary. I'll continue from here."}
                     });
 
-                    // Keep last 2 messages (most recent exchange)
+
                     size_t keep_from = messages.size() > 2 ? messages.size() - 2 : 0;
                     for (size_t i = keep_from; i < messages.size(); ++i)
                         condensed.push_back(messages[i]);
@@ -792,11 +784,8 @@ void run_agentic(std::string user_message,
             gen = g_sa_ai_client->generate_with_tools(messages, system_prompt, local_tools,
                 [](const std::string& chunk) {
                     if (chunk.empty()) return;
-                    // WHY: DeepSeek-R1 via OpenRouter streams ALL initial output as
-                    // reasoning_content tokens, prefixed with \x01THINK: by the AI
-                    // client. Previously these were silently discarded here, so the
-                    // user saw "Thinking..." with no text for 10-30s, then nothing.
-                    // Now we forward them as THINKING updates for real-time display.
+
+
                     if (chunk.size() > 7 && chunk[0] == '\x01' &&
                         chunk.compare(0, 7, "\x01THINK:") == 0) {
                         post_update(ai_update_t::THINKING, chunk.substr(7));
@@ -833,11 +822,8 @@ void run_agentic(std::string user_message,
 
 
         if (gen.tool_calls.empty()) {
-            // WHY: When both text and thinking are empty (e.g. wrong API path
-            // caused an empty stream, or model returned nothing), posting only
-            // COMPLETE leaves msg.text empty and msg.streaming=false. The UI
-            // condition (!msg.text.empty() || msg.streaming) then hides the
-            // message entirely — it "vanishes". This ensures something is shown.
+
+
             if (gen.text.empty() && gen.thinking.empty())
                 post_update(ai_update_t::CHUNK, "No response received from the model. Check your API key, model name, and network connection.");
             else if (gen.text.empty() && !gen.thinking.empty())
@@ -1457,8 +1443,7 @@ void render_tool_approval_dialog()
 
 void render_settings_inline(float panel_w, float panel_h)
 {
-    // Note: caller manages visibility (handles slide animation),
-    // so we no longer early-return based on g_settings_open alone.
+
 
     const float ax = globals::ui::accent.x, ay = globals::ui::accent.y, az = globals::ui::accent.z;
     const ImU32 accent_col   = IM_COL32(static_cast<int>(ax*255), static_cast<int>(ay*255), static_cast<int>(az*255), 255);
@@ -2105,10 +2090,7 @@ void render_settings_inline(float panel_w, float panel_h)
 
                 ImGui::Dummy(ImVec2(0, 4));
 
-                // Granular auto-approval UI (Roo-Code parity)
-                // WHY: Roo-Code lets users independently approve different tool categories.
-                // Users want to auto-approve reads but confirm writes, or auto-approve
-                // safe commands but block dangerous ones.
+
                 begin_card("##auto_approval_card");
                 {
                     section_header("Auto-Approval");
@@ -2175,7 +2157,7 @@ void render_settings_inline(float panel_w, float panel_h)
                     ImGui::SetNextItemWidth(-14.f);
                     ImGui::InputText("##aa_cmds", s_aa_cmds, sizeof(s_aa_cmds));
 
-                    // Sync to settings on change
+
                     g_sa_settings.auto_approve_read    = s_aa_read;
                     g_sa_settings.auto_approve_write   = s_aa_write;
                     g_sa_settings.auto_approve_execute  = s_aa_exec;
@@ -2190,7 +2172,7 @@ void render_settings_inline(float panel_w, float panel_h)
 
                 ImGui::Dummy(ImVec2(0, 4));
 
-                // Context condensation settings UI (Roo-Code parity)
+
                 begin_card("##condensation_card");
                 {
                     section_header("Context Management");

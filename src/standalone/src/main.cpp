@@ -15,6 +15,8 @@
 #include "helpers/globals.h"
 #include "core/standalone_chat.hpp"
 #include "core/standalone_license.hpp"
+#include "core/network_view.hpp"
+#include "core/script_engine.hpp"
 #include "helpers/stb_image.h"
 
 #pragma comment(lib, "dwmapi.lib")
@@ -192,7 +194,7 @@ int main(int, char**)
     io.Fonts->AddFontFromMemoryTTF(
         (void*)verdana, sizeof(verdana), font_size, &cfg);
 
-    // Merge icon font (IcoMoon) into the default font
+
     {
         static const ImWchar icon_ranges[] = { ICON_MIN_IDE, ICON_MAX_IDE, 0 };
         ImFontConfig icon_cfg{};
@@ -231,6 +233,8 @@ int main(int, char**)
     g_pd3dDeviceContext->OMSetBlendState(blend_state, nullptr, 0xffffffff);
     Blur::Init(g_pd3dDevice, g_pd3dDeviceContext, 100, 130);
     init_standalone_chat();
+    network_view::initialize();
+    script_engine::initialize();
 
 
     standalone_license::snapshot_code_hashes();
@@ -394,6 +398,8 @@ int main(int, char**)
 
     globals::terminal_mgr.shutdown();
 
+    network_view::shutdown();
+    script_engine::shutdown();
     shutdown_standalone_chat();
     Blur::Shutdown();
     ImGui_ImplDX11_Shutdown();

@@ -217,9 +217,8 @@ inline const std::vector<mode_config_t>& builtin_modes()
              tool_group_t::emulation, tool_group_t::network, tool_group_t::always_available},
             "", {}, false
         },
-        // Orchestrator mode (Roo-Code parity)
-        // WHY: Roo-Code has an orchestrator mode that coordinates work across other modes.
-        // It can only switch modes and spawn new tasks - it plans and delegates, not execute.
+
+
         {
             "orchestrator",
             "Orchestrator",

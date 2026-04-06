@@ -10,24 +10,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# --- Zydis disassembler engine (static) ---
-include(FetchContent)
+set(DEPS_DIR "${CMAKE_SOURCE_DIR}/.deps")
 
 set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
 set(ZYDIS_FEATURE_ENCODER OFF CACHE BOOL "" FORCE)
 
-FetchContent_Declare(
-    zydis
-    GIT_REPOSITORY https://github.com/zyantific/zydis.git
-    GIT_TAG        v4.1.0
-    GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(zydis)
+set(zydis_SOURCE_DIR "${DEPS_DIR}/zydis")
+set(zydis_BINARY_DIR "${CMAKE_BINARY_DIR}/.deps/zydis")
+add_subdirectory("${zydis_SOURCE_DIR}" "${zydis_BINARY_DIR}")
 
-# Zycore adds /wd4201 as PUBLIC which leaks into MASM targets causing A4018 warnings.
-# Change it to a CXX-only generator expression so it doesn't affect ASM_MASM sources.
 if(MSVC AND TARGET Zycore)
     get_target_property(_zycore_opts Zycore INTERFACE_COMPILE_OPTIONS)
     if(_zycore_opts)
@@ -44,16 +37,84 @@ set(BUILD_SHARED_LIBS OFF)
 
 option(BUILD_AIDA_PLUGIN "Build the AiDA IDA plugin" ON)
 
-FetchContent_Declare(
-    unicorn
-    GIT_REPOSITORY https://github.com/unicorn-engine/unicorn.git
-    GIT_TAG        2.1.1
-    GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(unicorn)
+set(unicorn_SOURCE_DIR "${DEPS_DIR}/unicorn")
+add_subdirectory("${unicorn_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/.deps/unicorn")
 set(BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS_SAVED}")
 
-# Suppress third-party unicorn warnings (C4319: zero-extending in seg_helper.c/translate.c)
+set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
+set(zlib_SOURCE_DIR "${DEPS_DIR}/zlib")
+set(zlib_BINARY_DIR "${CMAKE_BINARY_DIR}/.deps/zlib")
+add_subdirectory("${zlib_SOURCE_DIR}" "${zlib_BINARY_DIR}")
+
+# zlib manages its own include dirs; expose them for our consumers via a convenience variable
+# but do NOT set PUBLIC includes on zlibstatic (causes CMP0070 errors with newer CMake)
+
+set(BROTLI_DISABLE_TESTS ON CACHE BOOL "" FORCE)
+set(BROTLI_BUNDLED_MODE ON CACHE BOOL "" FORCE)
+set(brotli_SOURCE_DIR "${DEPS_DIR}/brotli")
+add_subdirectory("${brotli_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/.deps/brotli")
+
+if(TARGET brotlidec)
+    target_include_directories(brotlidec PUBLIC
+        "${brotli_SOURCE_DIR}/c/include"
+    )
+endif()
+
+set(LLHTTP_BUILD_SHARED_LIBS OFF CACHE INTERNAL "")
+set(LLHTTP_BUILD_STATIC_LIBS ON CACHE INTERNAL "")
+# The llhttp git repo uses "_RELEASE_" as a version placeholder (substituted by npm during release).
+# Patch it to a real semver string so CMake's project() call doesn't reject it.
+file(READ "${DEPS_DIR}/llhttp/CMakeLists.txt" _llhttp_cmake)
+if("${_llhttp_cmake}" MATCHES "VERSION _RELEASE_")
+    string(REPLACE "VERSION _RELEASE_" "VERSION 9.3.0" _llhttp_cmake "${_llhttp_cmake}")
+    file(WRITE "${DEPS_DIR}/llhttp/CMakeLists.txt" "${_llhttp_cmake}")
+endif()
+add_subdirectory("${DEPS_DIR}/llhttp" "${CMAKE_BINARY_DIR}/.deps/llhttp")
+
+set(BUILD_SHARED_LIBS_SAVED_NH2 "${BUILD_SHARED_LIBS}")
+set(BUILD_STATIC_LIBS   ON)
+set(BUILD_SHARED_LIBS  OFF)
+set(ENABLE_LIB_ONLY     ON)
+set(ENABLE_DOC          OFF)
+set(ENABLE_APP          OFF)
+set(ENABLE_EXAMPLES     OFF)
+set(ENABLE_FAILMALLOC  OFF)
+set(ENABLE_HPACK_TOOLS OFF)
+set(WITH_LIBXML2       OFF)
+set(WITH_JEMALLOC      OFF)
+set(WITH_SPDYLAY       OFF)
+add_subdirectory("${DEPS_DIR}/nghttp2" "${CMAKE_BINARY_DIR}/.deps/nghttp2")
+set(BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS_SAVED_NH2}")
+unset(BUILD_STATIC_LIBS)
+
+if(TARGET nghttp2_static)
+    if(MSVC)
+        target_compile_options(nghttp2_static PRIVATE /wd4100 /wd4244 /wd4267)
+    endif()
+endif()
+
+set(lua_src_SOURCE_DIR "${DEPS_DIR}/lua-lua-a5522f0")
+
+file(GLOB LUA_CORE_SOURCES "${lua_src_SOURCE_DIR}/*.c")
+list(REMOVE_ITEM LUA_CORE_SOURCES
+    "${lua_src_SOURCE_DIR}/lua.c"           # standalone interpreter
+    "${lua_src_SOURCE_DIR}/luac.c"          # standalone compiler
+)
+add_library(lua54_static STATIC ${LUA_CORE_SOURCES})
+target_include_directories(lua54_static PUBLIC "${lua_src_SOURCE_DIR}")
+set_target_properties(lua54_static PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+)
+if(MSVC)
+    target_compile_options(lua54_static PRIVATE /W3 /wd4244 /wd4702 /wd4334)
+    target_compile_definitions(lua54_static PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+set(sol2_SOURCE_DIR "${DEPS_DIR}/sol2")
+add_subdirectory("${sol2_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/.deps/sol2")
+
 if(MSVC AND TARGET x86_64-softmmu)
     target_compile_options(x86_64-softmmu PRIVATE /wd4319)
 endif()
@@ -78,14 +139,7 @@ endif()
 
 if(WIN32)
 
-    # --- Dear ImGui (for standalone app) ---
-    FetchContent_Declare(
-        imgui
-        GIT_REPOSITORY https://github.com/ocornut/imgui.git
-        GIT_TAG        v1.91.8-docking
-        GIT_SHALLOW    TRUE
-    )
-    FetchContent_MakeAvailable(imgui)
+    set(imgui_SOURCE_DIR "${DEPS_DIR}/imgui-src")
 
     option(BUILD_BEDAISY_DUMPER "Build standalone BEDaisy kernel module dumper tool" ON)
 
@@ -136,9 +190,6 @@ if(WIN32)
         )
     endif()
 
-    # =========================================================================
-    # WhosWho Driver Test Application
-    # =========================================================================
     option(BUILD_DRIVER_TEST "Build WhosWho driver test application" ON)
 
     if(BUILD_DRIVER_TEST)
@@ -188,7 +239,6 @@ if(WIN32)
             OUTPUT_NAME "test_driver"
         )
 
-        # ── Test Target (purpose-built networking target process) ──
         add_executable(TestTarget
             driver/test_target.cpp
         )
@@ -217,9 +267,6 @@ if(WIN32)
         )
     endif()
 
-    # =========================================================================
-    # AiDA Standalone App  (ImGui + DX11 + MCP + driver + emulation)
-    # =========================================================================
     option(BUILD_AIDA_STANDALONE "Build AiDA standalone application" ON)
 
     if(BUILD_AIDA_STANDALONE)
@@ -228,16 +275,10 @@ if(WIN32)
         set(OPENSSL_MSVC_STATIC_RT OFF)
         find_package(OpenSSL REQUIRED)
 
-        # -- Create imgui/ directory layout expected by standalone sources ---------
-        # The standalone code does #include "imgui/imgui.h", "imgui/imgui_impl_dx11.h",
-        # "imgui/imgui_internal.h", "imgui/freetype/freetype.h" etc.
-        # We create a mirror directory under the build tree that maps to the FetchContent sources.
         set(IMGUI_WRAPPER_DIR "${CMAKE_BINARY_DIR}/_imgui_wrapper/imgui")
         file(MAKE_DIRECTORY "${IMGUI_WRAPPER_DIR}")
         file(MAKE_DIRECTORY "${IMGUI_WRAPPER_DIR}/freetype")
 
-        # Create thin redirect headers so #pragma once in the real imgui headers
-        # de-duplicates correctly (copies would be seen as separate files by MSVC).
         file(GLOB _imgui_core_headers "${imgui_SOURCE_DIR}/*.h")
         foreach(_h ${_imgui_core_headers})
             get_filename_component(_name "${_h}" NAME)
@@ -255,7 +296,6 @@ if(WIN32)
                  "#pragma once\n#include \"${imgui_SOURCE_DIR}/misc/freetype/imgui_freetype.h\"\n")
         endif()
 
-        # -- Create stub IDA headers so driver_loader.cpp compiles standalone -----
         set(IDA_STUBS_DIR "${CMAKE_BINARY_DIR}/_ida_stubs")
         file(MAKE_DIRECTORY "${IDA_STUBS_DIR}")
         file(WRITE "${IDA_STUBS_DIR}/pro.h"
@@ -301,7 +341,6 @@ if(WIN32)
                "}\n"
                "#endif\n")
 
-        # -- Standalone sources ---------------------------------------------------
         set(STANDALONE_SOURCES
             "${STANDALONE_ROOT}/main.cpp"
             "${STANDALONE_ROOT}/helpers/helpers.cpp"
@@ -332,13 +371,13 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/coding_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/debugger_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/workflow_tools_standalone.cpp"
+            "${STANDALONE_ROOT}/core/script_engine.cpp"
             src/driver_loader.cpp
             driver/comm.cpp
             src/net_security.cpp
             src/emulation_engine.cpp
         )
 
-        # -- ImGui sources from FetchContent --------------------------------------
         set(IMGUI_SOURCES
             "${imgui_SOURCE_DIR}/imgui.cpp"
             "${imgui_SOURCE_DIR}/imgui_demo.cpp"
@@ -350,7 +389,6 @@ if(WIN32)
             "${imgui_SOURCE_DIR}/misc/freetype/imgui_freetype.cpp"
         )
 
-        # -- Syscall ASM stub -----------------------------------------------------
         set(STANDALONE_ASM driver/syscall.asm)
         set_source_files_properties(${STANDALONE_ASM} PROPERTIES LANGUAGE ASM_MASM)
         add_library(AiDAStandalone_asm OBJECT ${STANDALONE_ASM})
@@ -361,13 +399,14 @@ if(WIN32)
             $<TARGET_OBJECTS:AiDAStandalone_asm>
         )
 
-        # -- Include directories --------------------------------------------------
         target_include_directories(AiDAStandalone PRIVATE
             "${STANDALONE_ROOT}"
             "${STANDALONE_ROOT}/core"
             "${CMAKE_BINARY_DIR}/_imgui_wrapper"
             "${imgui_SOURCE_DIR}"
             "${imgui_SOURCE_DIR}/backends"
+            "${lua_src_SOURCE_DIR}"
+            "${sol2_SOURCE_DIR}/include"
             "${STANDALONE_ROOT}/freetype/include"
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/cpp-httplib"
             "${CMAKE_CURRENT_SOURCE_DIR}/libs"
@@ -378,11 +417,12 @@ if(WIN32)
             "${zydis_BINARY_DIR}"
             "${zydis_BINARY_DIR}/zycore"
             "${unicorn_SOURCE_DIR}/include"
+            "${zlib_SOURCE_DIR}"
+            "${zlib_BINARY_DIR}"
             "${IDA_STUBS_DIR}"
             "${CMAKE_CURRENT_SOURCE_DIR}/mapper/src"
         )
 
-        # -- Compile definitions --------------------------------------------------
         target_compile_definitions(AiDAStandalone PRIVATE
             __NT__
             _CRT_SECURE_NO_WARNINGS
@@ -392,9 +432,9 @@ if(WIN32)
             IMGUI_ENABLE_FREETYPE
             UNICODE
             _UNICODE
+            SOL_ALL_SAFETIES_ON=1
         )
 
-        # -- Compiler flags -------------------------------------------------------
         target_compile_options(AiDAStandalone PRIVATE
             /W3
             /wd4005
@@ -407,7 +447,6 @@ if(WIN32)
             /MD
         )
 
-        # -- Link libraries -------------------------------------------------------
         target_link_directories(AiDAStandalone PRIVATE
             "${STANDALONE_ROOT}/freetype/lib/x64"
         )
@@ -416,6 +455,12 @@ if(WIN32)
             Zydis
             unicorn
             freetype
+            zlibstatic
+            brotlidec
+            brotlicommon
+            llhttp_static
+            nghttp2_static
+            lua54_static
             OpenSSL::SSL
             OpenSSL::Crypto
             d3d11
@@ -436,7 +481,6 @@ if(WIN32)
             Psapi
         )
 
-        # -- Link flags (PDB) ----------------------------------------------------
         target_link_options(AiDAStandalone PRIVATE
             /DEBUG:FULL
             /ENTRY:mainCRTStartup
@@ -445,7 +489,6 @@ if(WIN32)
             "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
         )
 
-        # -- Output properties + PDB ---------------------------------------------
         set_target_properties(AiDAStandalone PROPERTIES
             OUTPUT_NAME "AiDAStandalone"
             PDB_NAME_DEBUG "AiDAStandalone"
@@ -520,7 +563,6 @@ set(AIDA_SOURCES
     driver/comm.cpp
 )
 
-# --- x64 indirect syscall stub (MASM) ---
 if(WIN32)
     set(AIDA_ASM_SOURCES driver/syscall.asm)
     set_source_files_properties(${AIDA_ASM_SOURCES} PROPERTIES LANGUAGE ASM_MASM)
@@ -552,10 +594,6 @@ set(AIDA_HEADERS
 
 add_library(AiDA SHARED ${AIDA_SOURCES} ${AIDA_HEADERS} ${AIDA_ASM_SOURCES})
 
-# --- Export control: only export the PLUGIN symbol required by IDA ---
-# Reference: IDA SDK loader.hpp line 643:
-#   idaman ida_module_data plugin_t PLUGIN;
-# IDA's plugin loader searches for "PLUGIN" by name. All other exports are hidden.
 if(WIN32)
     target_sources(AiDA PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/AiDA.def")
 endif()
@@ -635,7 +673,6 @@ endif()
 
 target_link_libraries(AiDA PRIVATE "${IDA_LINK_LIB}")
 
-# --- Zydis + Unicorn emulation engine ---
 target_link_libraries(AiDA PRIVATE Zydis unicorn)
 target_include_directories(AiDA PRIVATE
     "${zydis_SOURCE_DIR}/include"
@@ -671,25 +708,6 @@ if(WIN32)
         $<$<COMPILE_LANGUAGE:CXX>:/wd5240>
     )
 
-    # --- Anti-RE linker hardening ---
-    # /OPT:REF,ICF removes unreferenced code and folds identical COMDATs.
-    # /PDBALTPATH strips the real PDB path from the binary.
-    # /RELEASE sets the checksum in the PE header.
-    # /LTCG enables link-time code generation for whole-program optimization,
-    #   which merges and inlines across translation units, reducing visible functions.
-    #
-    # NOTE: /MERGE:.pdata=.text is NOT used because .pdata contains x64 SEH
-    # unwind data. The Windows loader resolves the Exception Directory
-    # (IMAGE_DIRECTORY_ENTRY_EXCEPTION, data directory index 3) to locate
-    # .pdata for stack unwinding. Merging it into .text changes the section
-    # characteristics from IMAGE_SCN_MEM_READ to IMAGE_SCN_MEM_EXECUTE|READ,
-    # which corrupts unwind resolution and crashes during LoadLibrary.
-    #
-    # NOTE: /MERGE:.rdata=.text is NOT used because merging read-only data
-    # into an executable section changes memory protection attributes.
-    # The loader sets .text pages to PAGE_EXECUTE_READ but .rdata expects
-    # PAGE_READONLY. This can trigger DEP violations or corrupt relocations
-    # during DLL initialization, causing crashes at LoadLibrary time.
     target_link_options(AiDA PRIVATE
         /DEBUG:FULL
         /OPT:REF,ICF

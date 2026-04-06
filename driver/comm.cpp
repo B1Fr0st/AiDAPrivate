@@ -1686,6 +1686,8 @@ std::vector<voyager::device_t::net_connection_info> voyager::device_t::enumerate
             info.address_family = req->entries[i].address_family;
             std::memcpy(info.local_addr, req->entries[i].local_addr, 16);
             std::memcpy(info.remote_addr, req->entries[i].remote_addr, 16);
+            std::memcpy(info.process_path, req->entries[i].process_path, 260);
+            info.process_path[259] = '\0';
             result.push_back(info);
         }
     }

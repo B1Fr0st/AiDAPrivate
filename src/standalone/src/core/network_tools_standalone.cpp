@@ -8,6 +8,8 @@
 #include "comm.h"
 #include "obfuscation.hpp"
 #include "pro.h"
+#include "decoder_pipeline.hpp"
+#include "script_engine.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -1963,6 +1965,200 @@ void register_network_tools(mcp_standalone::server_t& srv) {
          {OBFSTR("max_packets"), OBFSTR("number"), OBFSTR("Max packets to export (default 256, max 256)"), false},
          {OBFSTR("filename"), OBFSTR("string"), OBFSTR("Output filename (default: 'aida_capture.pcap')"), false}},
         network_export_pcap, false});
+
+
+    register_compat(srv, {
+        OBFSTR("network_decode_data"), OBFSTR("network"),
+        OBFSTR("Apply a sequence of data transformations to input data (CyberChef-style). "
+               "Supports: base64_encode, base64_decode, hex_encode, hex_decode, url_encode, url_decode, "
+               "html_entities_encode, html_entities_decode, gzip_compress, gzip_decompress, brotli_decompress, "
+               "deflate_decompress, xor (needs 'key' param), aes_encrypt, aes_decrypt (needs 'key','iv','mode' params), "
+               "md5, sha1, sha256, sha512, hmac (needs 'key','algorithm' params), json_beautify, json_minify, "
+               "hex_dump, protobuf_decode, grpc_decode, upper, lower, reverse, byte_count, entropy. "
+               "Input as text or hex. Pipeline steps applied in order."),
+        {{OBFSTR("input"), OBFSTR("string"), OBFSTR("Input data (text)"), false},
+         {OBFSTR("input_hex"), OBFSTR("string"), OBFSTR("Input data (hex encoded) — use instead of 'input' for binary"), false},
+         {OBFSTR("pipeline"), OBFSTR("array"), OBFSTR("Array of transform step objects: [{\"name\":\"base64_decode\"}, {\"name\":\"xor\",\"params\":{\"key\":\"41\"}}]"), true}},
+        [](const json& args) -> tool_result_t {
+            std::vector<uint8_t> data;
+            if (args.contains("input_hex") && args["input_hex"].is_string()) {
+                std::string hex = args["input_hex"].get<std::string>();
+                for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                    data.push_back(static_cast<uint8_t>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+                }
+            } else if (args.contains("input") && args["input"].is_string()) {
+                std::string input = args["input"].get<std::string>();
+                data.assign(input.begin(), input.end());
+            } else {
+                return tool_result_t::error("Either 'input' or 'input_hex' required");
+            }
+
+            if (!args.contains("pipeline") || !args["pipeline"].is_array())
+                return tool_result_t::error("'pipeline' array required");
+
+            auto& reg = decoder_pipeline::registry::instance();
+            for (const auto& step : args["pipeline"]) {
+                std::string name = step.value("name", "");
+                if (name.empty()) return tool_result_t::error("Each pipeline step needs 'name'");
+
+                std::map<std::string, std::string> params;
+                if (step.contains("params") && step["params"].is_object()) {
+                    for (auto& [k, v] : step["params"].items())
+                        params[k] = v.is_string() ? v.get<std::string>() : v.dump();
+                }
+
+                auto result = decoder_pipeline::apply_single(name, data, params);
+                if (!result.success)
+                    return tool_result_t::error("Transform '" + name + "' failed: " + result.error);
+                data = std::move(result.data);
+            }
+
+
+            bool printable = true;
+            for (uint8_t b : data) {
+                if (b != '\n' && b != '\r' && b != '\t' && (b < 32 || b > 126)) {
+                    printable = false;
+                    break;
+                }
+            }
+
+            json r;
+            if (printable) {
+                std::string text(data.begin(), data.end());
+                r["output"] = text;
+                r["output_hex"] = false;
+                return tool_result_t::ok(text, r);
+            } else {
+                std::string hex;
+                hex.reserve(data.size() * 2);
+                for (uint8_t b : data) {
+                    char h[3];
+                    snprintf(h, sizeof(h), "%02x", b);
+                    hex += h;
+                }
+                r["output"] = hex;
+                r["output_hex"] = true;
+                r["output_size"] = data.size();
+                return tool_result_t::ok("Binary output (" + std::to_string(data.size()) + " bytes): " + hex.substr(0, 200), r);
+            }
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("network_list_transforms"), OBFSTR("network"),
+        OBFSTR("List all available decoder pipeline transforms with categories and descriptions. "
+               "Use to discover available transforms for network_decode_data pipeline."),
+        {},
+        [](const json&) -> tool_result_t {
+            auto& reg = decoder_pipeline::registry::instance();
+            auto transforms = reg.all();
+            json arr = json::array();
+            for (const auto* t : transforms) {
+                json obj;
+                obj["id"] = t->id;
+                obj["name"] = t->name;
+                obj["category"] = t->category;
+                arr.push_back(obj);
+            }
+            json r;
+            r["transforms"] = arr;
+            r["count"] = transforms.size();
+            return tool_result_t::ok(std::to_string(transforms.size()) + " transforms available", r);
+        }, true});
+
+
+    register_compat(srv, {
+        OBFSTR("network_script_load"), OBFSTR("network"),
+        OBFSTR("Load a Lua script into the proxy scripting engine. Script can register hooks for "
+               "on_request, on_response, on_websocket_frame, on_packet, on_dns, on_connection events. "
+               "Provide either a file path or inline source code."),
+        {{OBFSTR("path"), OBFSTR("string"), OBFSTR("Path to .lua script file"), false},
+         {OBFSTR("source"), OBFSTR("string"), OBFSTR("Inline Lua source code"), false},
+         {OBFSTR("name"), OBFSTR("string"), OBFSTR("Script name (default: derived from path)"), false}},
+        [](const json& args) -> tool_result_t {
+            std::string name = args.value("name", "");
+            bool ok = false;
+            if (args.contains("source") && args["source"].is_string()) {
+                std::string src = args["source"].get<std::string>();
+                if (name.empty()) name = "_inline_";
+                ok = script_engine::load_script_source(name, src);
+            } else if (args.contains("path") && args["path"].is_string()) {
+                std::string path = args["path"].get<std::string>();
+                if (name.empty()) {
+                    auto pos = path.find_last_of("\\/");
+                    name = (pos != std::string::npos) ? path.substr(pos + 1) : path;
+                }
+                ok = script_engine::load_script(path);
+            } else {
+                return tool_result_t::error("Either 'path' or 'source' required");
+            }
+            return ok ? tool_result_t::ok("Script '" + name + "' loaded") : tool_result_t::error("Failed to load script");
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("network_script_unload"), OBFSTR("network"),
+        OBFSTR("Unload a previously loaded Lua script by name."),
+        {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Script name to unload"), true}},
+        [](const json& args) -> tool_result_t {
+            std::string name = args.value("name", "");
+            script_engine::unload_script(name);
+            return tool_result_t::ok("Script '" + name + "' unloaded");
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("network_script_execute"), OBFSTR("network"),
+        OBFSTR("Execute Lua code in the script engine console. Returns the output/result. "
+               "Useful for querying state, testing hooks, or running one-off transformations."),
+        {{OBFSTR("code"), OBFSTR("string"), OBFSTR("Lua code to execute"), true}},
+        [](const json& args) -> tool_result_t {
+            std::string code = args.value("code", "");
+            std::string result = script_engine::execute(code);
+            json r;
+            r["output"] = result;
+            return tool_result_t::ok(result.empty() ? "(no output)" : result, r);
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("network_script_list"), OBFSTR("network"),
+        OBFSTR("List all loaded Lua scripts with their enabled/disabled status."),
+        {},
+        [](const json&) -> tool_result_t {
+            auto scripts = script_engine::get_scripts();
+            json arr = json::array();
+            for (const auto& s : scripts) {
+                json obj;
+                obj["name"] = s.name;
+                obj["enabled"] = s.enabled;
+                obj["loaded"] = s.loaded;
+                obj["path"] = s.path;
+                arr.push_back(obj);
+            }
+            json r;
+            r["scripts"] = arr;
+            r["count"] = scripts.size();
+            return tool_result_t::ok(std::to_string(scripts.size()) + " scripts loaded", r);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("network_script_api"), OBFSTR("network"),
+        OBFSTR("Get the complete Lua API reference for the AiDA scripting engine. Lists all available "
+               "functions, hook types, and data structures."),
+        {},
+        [](const json&) -> tool_result_t {
+            auto funcs = script_engine::get_api_listing();
+            json arr = json::array();
+            std::string text;
+            for (const auto& f : funcs) {
+                json obj;
+                obj["name"] = f.name;
+                obj["signature"] = f.signature;
+                obj["description"] = f.description;
+                arr.push_back(obj);
+                text += f.signature + "  -- " + f.description + "\n";
+            }
+            json r;
+            r["api"] = arr;
+            return tool_result_t::ok(text, r);
+        }, true});
 }
 
 }

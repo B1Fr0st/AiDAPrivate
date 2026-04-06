@@ -7,7 +7,6 @@
 
 namespace protocol_parser {
 
-// ─── HTTP/1.1 ──────────────────────────────────────────────────────
 
 struct http_header {
     std::string name;
@@ -46,7 +45,6 @@ enum class content_type_t { unknown, json, xml, html, text, form_urlencoded, mul
 content_type_t detect_content_type(const std::vector<http_header>& headers);
 std::string content_type_name(content_type_t ct);
 
-// ─── HTTP/2 ────────────────────────────────────────────────────────
 
 enum class h2_frame_type : uint8_t {
     DATA          = 0x0,
@@ -79,7 +77,7 @@ struct h2_parsed_headers {
     bool valid = false;
 };
 
-// HPACK dynamic table
+
 struct hpack_context {
     std::vector<h2_header_field> dynamic_table;
     size_t dynamic_table_size = 0;
@@ -90,7 +88,6 @@ std::vector<h2_frame> parse_h2_frames(const uint8_t* data, size_t len);
 h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& ctx);
 std::string h2_frame_type_name(h2_frame_type t);
 
-// ─── WebSocket ─────────────────────────────────────────────────────
 
 enum class ws_opcode : uint8_t {
     continuation = 0x0,
@@ -118,7 +115,6 @@ ws_frame parse_ws_frame(const uint8_t* data, size_t len);
 std::vector<uint8_t> unmask_payload(const ws_frame& frame);
 std::string ws_opcode_name(ws_opcode op);
 
-// ─── QUIC/HTTP/3 ──────────────────────────────────────────────────
 
 struct quic_header {
     bool     is_long_header = false;
@@ -135,7 +131,6 @@ bool is_quic_packet(const uint8_t* data, size_t len, uint16_t dst_port);
 quic_header parse_quic_header(const uint8_t* data, size_t len);
 std::string quic_version_name(uint32_t version);
 
-// ─── Protocol Detection ────────────────────────────────────────────
 
 enum class detected_protocol_t {
     unknown,
@@ -158,7 +153,6 @@ detection_result detect_protocol(const uint8_t* data, size_t len,
                                  uint16_t src_port, uint16_t dst_port,
                                  uint32_t ip_protocol);
 
-// ─── TLS Record Parsing ───────────────────────────────────────────
 
 struct tls_record {
     uint8_t  content_type = 0;
@@ -182,4 +176,4 @@ tls_client_hello parse_client_hello(const uint8_t* data, size_t len);
 std::string tls_content_type_name(uint8_t ct);
 std::string tls_version_name(uint16_t ver);
 
-} // namespace protocol_parser
+}

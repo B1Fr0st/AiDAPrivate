@@ -364,7 +364,7 @@ std::string standalone_ai_client_t::streaming_post(
 
     auto res = client->send(req);
 
-    // Retry once on connection failure with fresh client
+
     if (!res && res.error() == httplib::Error::Connection) {
         reset_client();
         client = get_or_create_client(host);
@@ -381,10 +381,8 @@ std::string standalone_ai_client_t::streaming_post(
         return err;
     }
     if (res->status != 200) {
-        // WHY: When content_receiver is set, res->body is empty because cpp-httplib
-        // routes all data through the receiver. sse_buffer captured the raw error
-        // response body, so we parse it for a human-readable error message.
-        // Gemini wraps errors in [{"error":{...}}] arrays, OpenAI uses {"error":{...}}.
+
+
         std::string err_detail;
         if (!sse_buffer.empty()) {
             auto ej = json::parse(sse_buffer, nullptr, false);
@@ -414,8 +412,7 @@ std::string standalone_ai_client_t::generate_gemini(
     std::string model = clean_model_name(_settings.get_active_model());
     std::string api_key = _settings.get_active_api_key();
 
-    // WHY: Gemini 2.5+ models support thinkingConfig for reasoning.
-    // Making reasoning provider-agnostic so it works for Gemini too, not just Anthropic.
+
     bool is_thinking_model = (model.find("2.5") != std::string::npos ||
                               model.find("thinking") != std::string::npos);
 
@@ -431,7 +428,7 @@ std::string standalone_ai_client_t::generate_gemini(
         {"generationConfig", gen_config}
     };
 
-    // Add thinking config for Gemini 2.5+ when reasoning is enabled
+
     if (is_thinking_model && _settings.enable_reasoning) {
         body["generationConfig"]["thinkingConfig"] = {
             {"thinkingBudget", (std::max)(_settings.reasoning_budget, 1024)}
@@ -448,7 +445,7 @@ std::string standalone_ai_client_t::generate_gemini(
                 auto j = json::parse(sse_data, nullptr, false);
                 if (j.is_discarded()) return "";
                 try {
-                    // Extract usage metadata from Gemini responses
+
                     if (j.contains("usageMetadata") && j["usageMetadata"].is_object()) {
                         auto& u = j["usageMetadata"];
                         in_tokens = u.value("promptTokenCount", (int64_t)0);
@@ -459,7 +456,7 @@ std::string standalone_ai_client_t::generate_gemini(
                     std::string accumulated_text;
                     for (auto& part : parts) {
                         if (part.contains("thought") && part["thought"].get<bool>()) {
-                            // WHY: Gemini 2.5 returns thinking in parts with "thought": true
+
                             std::string thought = part.value("text", "");
                             if (!thought.empty()) {
                                 thinking_text += thought;
@@ -473,7 +470,7 @@ std::string standalone_ai_client_t::generate_gemini(
                 } catch (...) { return ""; }
             }, on_chunk, stop_check);
 
-        // Cost tracking for Gemini (was missing before — only Anthropic tracked costs)
+
         cost_tracking::session_input_tokens += in_tokens;
         cost_tracking::session_output_tokens += out_tokens;
         cost_tracking::session_request_count++;
@@ -498,9 +495,7 @@ std::string standalone_ai_client_t::generate_openai(
     std::string base_url = _settings.get_active_base_url();
     std::string model = _settings.get_active_model();
 
-    // WHY: O-series models (o1, o3, o4-mini) use reasoning_effort instead of temperature,
-    // and use max_completion_tokens instead of max_tokens. Making this provider-agnostic
-    // so reasoning works for ALL providers, not just Anthropic.
+
     bool is_o_series = (model.find("o1") != std::string::npos ||
                         model.find("o3") != std::string::npos ||
                         model.find("o4") != std::string::npos);
@@ -515,7 +510,7 @@ std::string standalone_ai_client_t::generate_openai(
     };
 
     if (is_o_series) {
-        // O-series: use reasoning_effort and max_completion_tokens
+
         body["max_completion_tokens"] = 16384;
         if (_settings.enable_reasoning && !_settings.reasoning_effort.empty()) {
             body["reasoning_effort"] = _settings.reasoning_effort;
@@ -539,12 +534,12 @@ std::string standalone_ai_client_t::generate_openai(
                 auto j = json::parse(sse_data, nullptr, false);
                 if (j.is_discarded()) return "";
                 try {
-                    // Extract usage from streaming chunks (OpenAI includes usage in final chunk)
+
                     if (j.contains("usage") && j["usage"].is_object()) {
                         auto& u = j["usage"];
                         in_tokens = u.value("prompt_tokens", (int64_t)0);
                         out_tokens = u.value("completion_tokens", (int64_t)0);
-                        // OpenAI uses prompt_tokens_details.cached_tokens for cache reads
+
                         if (u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object()) {
                             cache_read = u["prompt_tokens_details"].value("cached_tokens", (int64_t)0);
                         }
@@ -554,8 +549,7 @@ std::string standalone_ai_client_t::generate_openai(
                     if (choices.empty()) return "";
                     auto& delta = choices[0]["delta"];
 
-                    // WHY: O-series models stream reasoning tokens via "reasoning" field in delta.
-                    // This makes thinking/reasoning visible for OpenAI too, not just Anthropic.
+
                     if (delta.contains("reasoning") && !delta["reasoning"].is_null()) {
                         std::string reasoning = delta["reasoning"].get<std::string>();
                         if (!reasoning.empty()) {
@@ -570,7 +564,7 @@ std::string standalone_ai_client_t::generate_openai(
                 return "";
             }, on_chunk, stop_check);
 
-        // WHY: Cost tracking was Anthropic-only before. Now every provider tracks costs.
+
         cost_tracking::session_input_tokens += in_tokens;
         cost_tracking::session_output_tokens += out_tokens;
         cost_tracking::session_cache_read += cache_read;
@@ -761,10 +755,8 @@ std::string standalone_ai_client_t::generate_openrouter(
     headers["Content-Type"] = "application/json";
 
     if (on_chunk) {
-        // WHY: OpenRouter proxies many providers (DeepSeek, OpenAI, etc.) and reasoning
-        // tokens arrive via "reasoning_content" (DeepSeek-R1) or "reasoning" (O-series).
-        // Without handling these, DeepSeek-R1 streams nothing to the UI because ALL its
-        // initial output is reasoning — so on_chunk never fires, and the response vanishes.
+
+
         int64_t in_tokens = 0, out_tokens = 0;
 
         auto result = streaming_post(base_url, "/api/v1/chat/completions",
@@ -773,7 +765,7 @@ std::string standalone_ai_client_t::generate_openrouter(
                 auto j = json::parse(sse_data, nullptr, false);
                 if (j.is_discarded()) return "";
                 try {
-                    // Extract usage from final streaming chunk
+
                     if (j.contains("usage") && j["usage"].is_object()) {
                         auto& u = j["usage"];
                         in_tokens = u.value("prompt_tokens", (int64_t)0);
@@ -785,28 +777,28 @@ std::string standalone_ai_client_t::generate_openrouter(
                     if (!choices[0].contains("delta")) return "";
                     auto& delta = choices[0]["delta"];
 
-                    // DeepSeek-R1 reasoning tokens (field: "reasoning_content")
+
                     if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
                         std::string th = delta["reasoning_content"].get<std::string>();
                         if (!th.empty())
                             return "\x01THINK:" + th;
                     }
 
-                    // O-series reasoning tokens (field: "reasoning")
+
                     if (delta.contains("reasoning") && !delta["reasoning"].is_null()) {
                         std::string reasoning = delta["reasoning"].get<std::string>();
                         if (!reasoning.empty())
                             return "\x01THINK:" + reasoning;
                     }
 
-                    // Regular content tokens
+
                     if (delta.contains("content") && !delta["content"].is_null())
                         return delta["content"].get<std::string>();
                 } catch (...) {}
                 return "";
             }, on_chunk, stop_check);
 
-        // Cost tracking for OpenRouter (was missing entirely before)
+
         cost_tracking::session_input_tokens += in_tokens;
         cost_tracking::session_output_tokens += out_tokens;
         cost_tracking::session_request_count++;
@@ -819,7 +811,7 @@ std::string standalone_ai_client_t::generate_openrouter(
     return simple_post(base_url, "/api/v1/chat/completions",
         headers, body.dump(),
         [](const json& j) -> std::string {
-            // Non-streaming: handle reasoning_content in response too
+
             auto& msg = j["choices"][0]["message"];
             std::string text = msg.value("content", "");
             if (text.empty() && msg.contains("reasoning_content") && msg["reasoning_content"].is_string())
@@ -973,7 +965,7 @@ nlohmann::json standalone_ai_client_t::build_openai_tools(
     const std::vector<mcp_standalone::tool_def_t>& tools)
 {
     json arr = json::array();
-    std::set<std::string> seen_names;  // deduplicate
+    std::set<std::string> seen_names;
 
     {
         json params = {
@@ -1003,7 +995,7 @@ nlohmann::json standalone_ai_client_t::build_openai_tools(
 
     for (auto& t : tools) {
         if (t.name == "get_tool_descriptions") continue;
-        if (!seen_names.insert(t.name).second) continue;  // skip duplicates
+        if (!seen_names.insert(t.name).second) continue;
         json props = json::object();
         json req   = json::array();
         for (auto& p : t.params) {
@@ -1035,7 +1027,7 @@ nlohmann::json standalone_ai_client_t::build_gemini_tools(
     const std::vector<mcp_standalone::tool_def_t>& tools)
 {
     json decls = json::array();
-    std::set<std::string> seen_names;  // deduplicate — Gemini rejects duplicate function names
+    std::set<std::string> seen_names;
 
     {
         json params = {
@@ -1052,10 +1044,8 @@ nlohmann::json standalone_ai_client_t::build_gemini_tools(
         decls.push_back({
             {"name", "get_tool_descriptions"},
             {"description", "Returns the full description and parameter schema for one or more tools."},
-            // WHY: The Google GenAI SDK sends "parametersJsonSchema" on the wire
-            // (confirmed from SDK source: functionDeclarationToVertex). The v1beta
-            // REST API accepts this field for raw JSON Schema. "parameters" is the
-            // Google Schema type field. Must match what the SDK sends exactly.
+
+
             {"parametersJsonSchema", params}
         });
         seen_names.insert("get_tool_descriptions");
@@ -1063,7 +1053,7 @@ nlohmann::json standalone_ai_client_t::build_gemini_tools(
 
     for (auto& t : tools) {
         if (t.name == "get_tool_descriptions") continue;
-        if (!seen_names.insert(t.name).second) continue;  // skip duplicates
+        if (!seen_names.insert(t.name).second) continue;
         json props = json::object();
         json req   = json::array();
         for (auto& p : t.params) {
@@ -1528,7 +1518,6 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
 }
 
 
-
 ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
     const nlohmann::json& messages,
     const std::string& system_prompt,
@@ -1649,7 +1638,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
                     if (on_chunk) on_chunk("\x01THINK:" + th);
                 }
 
-                // O-series reasoning tokens use "reasoning" field
+
                 if (delta.contains("reasoning") && !delta["reasoning"].is_null()) {
                     std::string th = delta["reasoning"].get<std::string>();
                     if (!th.empty()) {
@@ -1686,7 +1675,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
         if (!res) { result.is_error = true; result.text = "Error: Request failed: " + httplib::to_string(res.error()); return result; }
         if (res->status != 200) {
             result.is_error = true;
-            // WHY: With content_receiver set, res->body is empty. sse_buffer has the raw error.
+
             std::string err_body;
             if (!sse_buffer.empty()) {
                 auto ej = json::parse(sse_buffer, nullptr, false);
@@ -1767,7 +1756,6 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
 }
 
 
-
 ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
     const nlohmann::json& messages,
     const std::string& system_prompt,
@@ -1797,8 +1785,8 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
 
     if (!gem_tools.empty()) {
         body["tools"] = gem_tools;
-        // WHY: Roo-Code always sends toolConfig with functionCallingConfig mode.
-        // Without this, some models may not call functions correctly.
+
+
         body["toolConfig"] = {
             {"functionCallingConfig", {
                 {"mode", "AUTO"}
@@ -1809,9 +1797,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
 
     json gen_config = {{"maxOutputTokens", 16384}};
 
-    // WHY: thinkingConfig is only valid for Gemini 2.5+ and thinking-capable models.
-    // Sending it to non-thinking models (like gemini-flash-latest) causes a 400 error.
-    // Match Roo-Code's approach: only enable for models that advertise support.
+
     bool is_thinking_model = (model.find("2.5") != std::string::npos ||
                               model.find("thinking") != std::string::npos ||
                               model.find("3.1") != std::string::npos ||
@@ -1839,7 +1825,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
     for (auto& [k, v] : _settings.get_active_headers()) hdrs.emplace(k, v);
 
     std::string sse_buffer;
-    std::string raw_response;  // keeps ALL received bytes — never erased by SSE parser
+    std::string raw_response;
 
     httplib::Request req;
     req.method  = "POST";
@@ -1893,11 +1879,8 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
             if (!cand.contains("content") || !cand["content"].contains("parts")) continue;
 
             for (auto& part : cand["content"]["parts"]) {
-                // WHY: Gemini returns thinking parts as {"thought": true, "text": "..."}
-                // The "thought" field is a BOOLEAN, not a string. The text is in the
-                // "text" field. Previously this checked part["thought"].is_string()
-                // which never matched, so thinking parts fell through to the regular
-                // text handler — mixing reasoning into the visible response.
+
+
                 if (part.contains("thought") && part["thought"].is_boolean() &&
                     part["thought"].get<bool>()) {
                     std::string th = part.value("text", "");
@@ -1927,8 +1910,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
 
     auto res = client->send(req);
 
-    // WHY: httplib returns Error::Connection on transient DNS/TLS failures.
-    // Retry once with a fresh client to handle stale keep-alive or DNS cache.
+
     if (!res && res.error() == httplib::Error::Connection) {
         output_log::push(bottom_tab_t::output, "[ai] Gemini connection failed, retrying with fresh client...");
         reset_client();
@@ -1990,7 +1972,6 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
 
     return result;
 }
-
 
 
 ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_openai(
@@ -2066,10 +2047,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
     std::string sse_buffer;
     std::string chat_path = "/v1/chat/completions";
 
-    // WHY: OpenRouter's API lives at /api/v1/... not /v1/...
-    // The non-tool generate_openrouter() already uses /api/v1/chat/completions.
-    // Without this, requests hit https://openrouter.ai/v1/chat/completions which
-    // returns 404 or redirects (POST→GET on 301), causing an empty/failed stream.
+
     if (provider == "openrouter")
         chat_path = "/api/v1/chat/completions";
     else if (provider == "mistral" || provider == "codestral")
@@ -2108,10 +2086,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
             auto j = json::parse(payload, nullptr, false);
             if (j.is_discarded()) continue;
 
-            // WHY: OpenRouter (and other providers) can embed error objects in the
-            // SSE stream instead of returning an HTTP error status. Without this
-            // check, errors like "model doesn't support tools" or auth failures
-            // are silently ignored, leaving gen.text empty and the message vanishing.
+
             if (j.contains("error") && j["error"].is_object()) {
                 std::string err_msg = j["error"].value("message", "Unknown API error");
                 int err_code = j["error"].value("code", 0);
@@ -2145,9 +2120,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
                 if (on_chunk) on_chunk("\x01THINK:" + th);
             }
 
-            // WHY: OpenRouter proxies many models — O-series use "reasoning" field,
-            // DeepSeek-R1 uses "reasoning_content". Without BOTH checks, reasoning-heavy
-            // models (like R1) stream nothing to the UI and the response vanishes.
+
             if (delta.contains("reasoning") && !delta["reasoning"].is_null()) {
                 std::string th = delta["reasoning"].get<std::string>();
                 if (!th.empty()) {
@@ -2184,7 +2157,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
     if (!res) { result.is_error = true; result.text = "Error: Request failed: " + httplib::to_string(res.error()); return result; }
     if (res->status != 200) {
         result.is_error = true;
-        // WHY: With content_receiver set, res->body is empty. sse_buffer has the raw error.
+
         std::string err_body;
         if (!sse_buffer.empty()) {
             auto ej = json::parse(sse_buffer, nullptr, false);

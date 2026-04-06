@@ -3,6 +3,9 @@
 
 #include "protocol_parser.hpp"
 
+#include <zlib.h>
+#include <brotli/decode.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -10,7 +13,6 @@
 
 namespace protocol_parser {
 
-// ─── Utilities ─────────────────────────────────────────────────────
 
 static std::string to_lower(const std::string& s) {
     std::string r = s;
@@ -39,7 +41,6 @@ static std::string make_string(const uint8_t* data, size_t len) {
     return std::string(reinterpret_cast<const char*>(data), len);
 }
 
-// ─── HTTP/1.1 Parser ──────────────────────────────────────────────
 
 static bool parse_headers(const uint8_t* data, size_t len, size_t& pos,
                            std::vector<http_header>& headers) {
@@ -220,47 +221,69 @@ std::vector<uint8_t> decompress_body(const std::vector<uint8_t>& body, const std
     std::string enc = to_lower(encoding);
 
     if (enc == "gzip" || enc == "deflate" || enc == "x-gzip") {
-        // zlib decompression - inflate
-        // Try raw deflate first, then gzip wrapper
+        if (body.empty()) return body;
+
+        z_stream strm = {};
+        strm.next_in = const_cast<Bytef*>(body.data());
+        strm.avail_in = static_cast<uInt>(body.size());
+
+
+        int window_bits = 15 + 32;
+        if (inflateInit2(&strm, window_bits) != Z_OK)
+            return body;
+
         std::vector<uint8_t> result;
         result.reserve(body.size() * 4);
 
-        // Manual inflate without zlib dependency:
-        // We use Windows built-in RtlDecompressBuffer (available since Vista)
-        // COMPRESSION_FORMAT_LZNT1 won't work for gzip, so we fall back to
-        // returning the raw body if decompression is not possible without zlib.
-        // The zlib dependency will be added in CMakeLists.txt for full support.
-
-        // For now, try the Windows Compression API (Cabinet.dll)
-        HMODULE cab = LoadLibraryA("Cabinet.dll");
-        if (cab) {
-            using CreateDecompressorFn = BOOL(WINAPI*)(DWORD, void*, void**);
-            using DecompressFn = BOOL(WINAPI*)(void*, const void*, SIZE_T, void*, SIZE_T, SIZE_T*);
-            using CloseDecompressorFn = BOOL(WINAPI*)(void*);
-
-            auto pCreate = reinterpret_cast<CreateDecompressorFn>(
-                GetProcAddress(cab, "CreateDecompressor"));
-            auto pDecompress = reinterpret_cast<DecompressFn>(
-                GetProcAddress(cab, "Decompress"));
-            auto pClose = reinterpret_cast<CloseDecompressorFn>(
-                GetProcAddress(cab, "CloseDecompressor"));
-
-            if (pCreate && pDecompress && pClose) {
-                // COMPRESS_ALGORITHM_MSZIP = 2, COMPRESS_ALGORITHM_XPRESS = 3
-                // For gzip/deflate we use MSZIP (closest match without zlib)
-                // Actually Windows Compression API doesn't support gzip directly.
-                // We'll use a manual approach for deflate raw streams.
+        uint8_t out_buf[16384];
+        int ret;
+        do {
+            strm.next_out = out_buf;
+            strm.avail_out = sizeof(out_buf);
+            ret = inflate(&strm, Z_NO_FLUSH);
+            if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
+                inflateEnd(&strm);
+                return body;
             }
-            FreeLibrary(cab);
-        }
+            size_t have = sizeof(out_buf) - strm.avail_out;
+            result.insert(result.end(), out_buf, out_buf + have);
+        } while (ret != Z_STREAM_END);
 
-        // Fallback: return raw body (zlib will be linked later for proper decompression)
-        return body;
+        inflateEnd(&strm);
+        return result;
     }
 
     if (enc == "br") {
-        // Brotli decompression - requires brotli library
-        // Will be implemented when brotli is added to CMakeLists.txt
+        size_t decoded_size = body.size() * 4;
+        std::vector<uint8_t> result;
+        result.resize(decoded_size);
+
+        BrotliDecoderState* bs = BrotliDecoderCreateInstance(nullptr, nullptr, nullptr);
+        if (!bs) return body;
+
+        const uint8_t* next_in = body.data();
+        size_t avail_in = body.size();
+        uint8_t* next_out = result.data();
+        size_t avail_out = decoded_size;
+        size_t total_out = 0;
+
+        BrotliDecoderResult br_res = BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT;
+        while (br_res == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
+            br_res = BrotliDecoderDecompressStream(bs, &avail_in, &next_in, &avail_out, &next_out, &total_out);
+            if (br_res == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
+                size_t off = next_out - result.data();
+                result.resize(result.size() * 2);
+                next_out = result.data() + off;
+                avail_out = result.size() - off;
+            }
+        }
+
+        BrotliDecoderDestroyInstance(bs);
+
+        if (br_res == BROTLI_DECODER_RESULT_SUCCESS) {
+            result.resize(total_out);
+            return result;
+        }
         return body;
     }
 
@@ -294,7 +317,6 @@ std::string content_type_name(content_type_t ct) {
     }
 }
 
-// ─── HTTP/2 Frame Parser ──────────────────────────────────────────
 
 static uint32_t read_u24(const uint8_t* p) {
     return (static_cast<uint32_t>(p[0]) << 16) |
@@ -316,7 +338,7 @@ static uint16_t read_u16(const uint8_t* p) {
 std::vector<h2_frame> parse_h2_frames(const uint8_t* data, size_t len) {
     std::vector<h2_frame> frames;
 
-    // Skip connection preface if present
+
     static const char h2_preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     size_t preface_len = 24;
     size_t offset = 0;
@@ -332,7 +354,7 @@ std::vector<h2_frame> parse_h2_frames(const uint8_t* data, size_t len) {
         f.stream_id = read_u32(data + offset + 5) & 0x7FFFFFFF;
         offset += 9;
 
-        if (f.length > 16384 * 4) break; // sanity limit
+        if (f.length > 16384 * 4) break;
         if (offset + f.length > len) break;
 
         f.payload.assign(data + offset, data + offset + f.length);
@@ -358,9 +380,7 @@ std::string h2_frame_type_name(h2_frame_type t) {
     }
 }
 
-// ─── HPACK Decoder ────────────────────────────────────────────────
 
-// RFC 7541 - Static table (61 entries)
 static const h2_header_field hpack_static_table[] = {
     { ":authority", "" },
     { ":method", "GET" },
@@ -440,7 +460,7 @@ static uint32_t hpack_decode_integer(const uint8_t* data, size_t len, size_t& po
         value += static_cast<uint32_t>(b & 0x7F) << m;
         m += 7;
         if ((b & 0x80) == 0) break;
-        if (m > 28) break; // overflow protection
+        if (m > 28) break;
     }
     return value;
 }
@@ -457,13 +477,7 @@ static std::string hpack_decode_string(const uint8_t* data, size_t len, size_t& 
         return s;
     }
 
-    // Huffman decoding (RFC 7541 Appendix B)
-    // Simplified: decode the Huffman-encoded string
-    // For production use, this is a full Huffman tree walk.
-    // We implement a table-based decoder.
 
-    // Huffman decode table (RFC 7541 Appendix B) - symbol to code mapping
-    // For efficiency, we use a flat decode approach
     struct huff_entry { uint32_t code; uint8_t bits; uint8_t sym; };
     static const huff_entry huff_table[] = {
         {0x1ff8, 13, 0}, {0x7fffd8, 23, 1}, {0xfffffe2, 28, 2}, {0xfffffe3, 28, 3},
@@ -530,11 +544,11 @@ static std::string hpack_decode_string(const uint8_t* data, size_t len, size_t& 
         {0x7ffffe7, 27, 244}, {0x7ffffe8, 27, 245}, {0x7ffffe9, 27, 246}, {0x7ffffea, 27, 247},
         {0x7ffffeb, 27, 248}, {0xffffffe, 28, 249}, {0x7ffffec, 27, 250}, {0x7ffffed, 27, 251},
         {0x7ffffee, 27, 252}, {0x7ffffef, 27, 253}, {0x7fffff0, 27, 254}, {0x3ffffee, 26, 255},
-        {0x3fffffff, 30, 256} // EOS
+        {0x3fffffff, 30, 256}
     };
     static const size_t HUFF_TABLE_SIZE = sizeof(huff_table) / sizeof(huff_table[0]);
 
-    // Build bit-stream decoder
+
     std::string result;
     uint64_t accum = 0;
     uint32_t bits = 0;
@@ -599,13 +613,13 @@ h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& c
         uint8_t b = data[pos];
 
         if (b & 0x80) {
-            // Indexed header field
+
             uint32_t index = hpack_decode_integer(data, len, pos, 7);
             auto field = hpack_get_indexed(index, ctx);
             if (!field.name.empty()) result.fields.push_back(field);
         }
         else if (b & 0x40) {
-            // Literal header field with incremental indexing
+
             uint32_t index = hpack_decode_integer(data, len, pos, 6);
             h2_header_field field;
             if (index > 0) {
@@ -619,7 +633,7 @@ h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& c
             result.fields.push_back(field);
         }
         else if (b & 0x20) {
-            // Dynamic table size update
+
             uint32_t new_size = hpack_decode_integer(data, len, pos, 5);
             ctx.max_dynamic_table_size = new_size;
             while (ctx.dynamic_table_size > ctx.max_dynamic_table_size && !ctx.dynamic_table.empty()) {
@@ -629,7 +643,7 @@ h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& c
             }
         }
         else {
-            // Literal header field without indexing / never indexed
+
             bool never_index = (b & 0x10) != 0;
             (void)never_index;
             uint32_t index = hpack_decode_integer(data, len, pos, 4);
@@ -648,7 +662,6 @@ h2_parsed_headers decode_hpack(const uint8_t* data, size_t len, hpack_context& c
     return result;
 }
 
-// ─── WebSocket Parser ─────────────────────────────────────────────
 
 bool is_websocket_upgrade(const http_request& req) {
     if (!req.valid) return false;
@@ -724,24 +737,23 @@ std::string ws_opcode_name(ws_opcode op) {
     }
 }
 
-// ─── QUIC Parser ──────────────────────────────────────────────────
 
 bool is_quic_packet(const uint8_t* data, size_t len, uint16_t dst_port) {
     if (len < 5) return false;
-    // QUIC uses UDP, typically port 443
-    // Long header has bit 0x80 set on first byte, and fixed bit 0x40
+
+
     if ((data[0] & 0x80) != 0) {
-        // Long header — check for known QUIC versions
+
         if (len < 5) return false;
         uint32_t ver = read_u32(data + 1);
-        // QUIC v1, v2, draft versions
+
         if (ver == 0x00000001 || ver == 0x6b3343cf || ver == 0xff000000 ||
             (ver & 0xffffff00) == 0xff000000 || ver == 0) {
             return true;
         }
     }
-    // Short header — harder to detect without connection context
-    // Heuristic: UDP port 443 + fixed bit set
+
+
     if (dst_port == 443 && (data[0] & 0x40) != 0) return true;
     return false;
 }
@@ -767,7 +779,7 @@ quic_header parse_quic_header(const uint8_t* data, size_t len) {
         if (len < scid_off + 1 + scid_len) return h;
         h.scid.assign(data + scid_off + 1, data + scid_off + 1 + scid_len);
 
-        // Determine packet type from first byte
+
         uint8_t ptype = (data[0] & 0x30) >> 4;
         switch (ptype) {
             case 0: h.packet_type = "Initial"; break;
@@ -777,9 +789,9 @@ quic_header parse_quic_header(const uint8_t* data, size_t len) {
         }
         h.valid = true;
     } else {
-        // Short header — DCID present (length determined by connection context)
+
         h.packet_type = "1-RTT (Short)";
-        // Can't fully parse without connection context
+
         h.valid = true;
     }
     return h;
@@ -801,7 +813,6 @@ std::string quic_version_name(uint32_t version) {
     }
 }
 
-// ─── TLS Parser ───────────────────────────────────────────────────
 
 tls_record parse_tls_record(const uint8_t* data, size_t len) {
     tls_record rec;
@@ -811,12 +822,12 @@ tls_record parse_tls_record(const uint8_t* data, size_t len) {
     rec.version = read_u16(data + 1);
     rec.length = read_u16(data + 3);
 
-    // Validate: content type should be 20-25 or 255
+
     if (rec.content_type < 20 || (rec.content_type > 25 && rec.content_type != 255))
         return rec;
-    // Version should be TLS (0x0300+)
+
     if ((rec.version & 0xFF00) != 0x0300) return rec;
-    // Length sanity
+
     if (rec.length > 16384 + 2048) return rec;
 
     if (5 + rec.length <= len) {
@@ -829,16 +840,16 @@ tls_record parse_tls_record(const uint8_t* data, size_t len) {
 tls_client_hello parse_client_hello(const uint8_t* data, size_t len) {
     tls_client_hello hello;
 
-    // Parse TLS record first
+
     auto rec = parse_tls_record(data, len);
-    if (!rec.valid || rec.content_type != 22) return hello; // 22 = Handshake
+    if (!rec.valid || rec.content_type != 22) return hello;
 
     const uint8_t* hs = rec.fragment.data();
     size_t hs_len = rec.fragment.size();
     if (hs_len < 4) return hello;
 
     uint8_t hs_type = hs[0];
-    if (hs_type != 1) return hello; // 1 = ClientHello
+    if (hs_type != 1) return hello;
 
     uint32_t hs_length = read_u24(hs + 1);
     if (hs_length + 4 > hs_len) return hello;
@@ -849,14 +860,14 @@ tls_client_hello parse_client_hello(const uint8_t* data, size_t len) {
 
     if (ch_len < 2 + 32) return hello;
     hello.version = read_u16(ch);
-    pos = 2 + 32; // skip client_random
+    pos = 2 + 32;
 
-    // Session ID
+
     if (pos >= ch_len) return hello;
     uint8_t sid_len = ch[pos]; pos++;
     pos += sid_len;
 
-    // Cipher suites
+
     if (pos + 2 > ch_len) return hello;
     uint16_t cs_len = read_u16(ch + pos); pos += 2;
     if (pos + cs_len > ch_len) return hello;
@@ -865,12 +876,12 @@ tls_client_hello parse_client_hello(const uint8_t* data, size_t len) {
     }
     pos += cs_len;
 
-    // Compression methods
+
     if (pos >= ch_len) return hello;
     uint8_t cm_len = ch[pos]; pos++;
     pos += cm_len;
 
-    // Extensions
+
     if (pos + 2 > ch_len) { hello.valid = true; return hello; }
     uint16_t ext_len = read_u16(ch + pos); pos += 2;
     size_t ext_end = pos + ext_len;
@@ -883,7 +894,7 @@ tls_client_hello parse_client_hello(const uint8_t* data, size_t len) {
         if (pos + ext_data_len > ext_end) break;
 
         if (ext_type == 0x0000 && ext_data_len >= 2) {
-            // SNI extension
+
             uint16_t sni_list_len = read_u16(ch + pos);
             size_t sni_pos = pos + 2;
             size_t sni_end = pos + sni_list_len + 2;
@@ -899,7 +910,7 @@ tls_client_hello parse_client_hello(const uint8_t* data, size_t len) {
             }
         }
         else if (ext_type == 0x0010 && ext_data_len >= 2) {
-            // ALPN extension
+
             uint16_t alpn_list_len = read_u16(ch + pos);
             size_t alpn_pos = pos + 2;
             size_t alpn_end = pos + 2 + alpn_list_len;
@@ -946,7 +957,6 @@ std::string tls_version_name(uint16_t ver) {
     }
 }
 
-// ─── Protocol Detection ───────────────────────────────────────────
 
 detection_result detect_protocol(const uint8_t* data, size_t len,
                                  uint16_t src_port, uint16_t dst_port,
@@ -954,7 +964,7 @@ detection_result detect_protocol(const uint8_t* data, size_t len,
     detection_result r;
     if (!data || len == 0) return r;
 
-    // DNS (UDP port 53)
+
     if (ip_protocol == 17 && (src_port == 53 || dst_port == 53) && len >= 12) {
         r.protocol = detected_protocol_t::dns;
         r.label = "DNS";
@@ -962,7 +972,7 @@ detection_result detect_protocol(const uint8_t* data, size_t len,
         return r;
     }
 
-    // QUIC (UDP typically port 443)
+
     if (ip_protocol == 17 && is_quic_packet(data, len, dst_port)) {
         auto qh = parse_quic_header(data, len);
         r.protocol = detected_protocol_t::quic;
@@ -971,7 +981,7 @@ detection_result detect_protocol(const uint8_t* data, size_t len,
         return r;
     }
 
-    // TLS record (typically TCP)
+
     if (len >= 5 && data[0] >= 20 && data[0] <= 25 &&
         data[1] == 0x03 && data[2] <= 0x04) {
         auto rec = parse_tls_record(data, len);
@@ -988,7 +998,7 @@ detection_result detect_protocol(const uint8_t* data, size_t len,
         }
     }
 
-    // HTTP/2 connection preface
+
     if (len >= 24 && memcmp(data, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24) == 0) {
         r.protocol = detected_protocol_t::http2;
         r.label = "HTTP/2";
@@ -996,7 +1006,7 @@ detection_result detect_protocol(const uint8_t* data, size_t len,
         return r;
     }
 
-    // HTTP request
+
     static const char* http_methods[] = { "GET ", "POST ", "PUT ", "DELETE ",
                                            "PATCH ", "HEAD ", "OPTIONS ", "CONNECT ", "TRACE " };
     for (auto m : http_methods) {
@@ -1012,7 +1022,7 @@ detection_result detect_protocol(const uint8_t* data, size_t len,
         }
     }
 
-    // HTTP response
+
     if (len >= 12 && memcmp(data, "HTTP/", 5) == 0) {
         auto resp = parse_http_response(data, len);
         if (resp.valid) {
@@ -1028,4 +1038,4 @@ detection_result detect_protocol(const uint8_t* data, size_t len,
     return r;
 }
 
-} // namespace protocol_parser
+}

@@ -227,8 +227,7 @@ namespace driver_bridge
                 device->set_base_address(image_base);
         }
 
-        // Only open with QUERY rights for process name resolution.
-        // All memory R/W goes through the kernel driver exclusively.
+
         unique_handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
         close_process_handle_locked();
         g_process = process.release();
@@ -481,7 +480,7 @@ namespace driver_bridge
             return result;
         }
 
-        // No usermode fallback — kernel driver is required for memory enumeration.
+
         return result;
     }
 
@@ -508,7 +507,7 @@ namespace driver_bridge
             return true;
         }
 
-        // No usermode fallback — kernel driver is required for memory queries.
+
         return false;
     }
 
@@ -547,7 +546,7 @@ namespace driver_bridge
             return true;
         }
 
-        // No usermode fallback — kernel driver is required for memory reads.
+
         return false;
     }
 

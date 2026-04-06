@@ -668,8 +668,8 @@ namespace mcp_standalone
 {
     void register_standalone_tools(server_t& srv)
     {
-        // driver_status and driver_attach are registered by driver_tools::register_driver_tools().
-        // Only register driver_load and driver_detach here (not duplicated in driver_tools).
+
+
         srv.register_tool({"driver_load", "Load and connect the kernel driver backend for deep runtime analysis.", {}, false, handle_driver_load});
         srv.register_tool({"driver_detach", "Detach from the current live process.", {}, false, handle_driver_detach});
         srv.register_tool({"list_processes", "Enumerate currently running processes.",

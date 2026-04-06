@@ -3,12 +3,17 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <openssl/evp.h>
+#include <openssl/kdf.h>
+#include <openssl/ssl.h>
+
 #include <atomic>
 #include <cstdint>
 #include <deque>
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -16,18 +21,15 @@
 
 namespace ssl_keylog {
 
-// NSS Key Log Format entry
-// Format: <label> <client_random_hex> <secret_hex>
-// Labels: CLIENT_RANDOM, CLIENT_EARLY_TRAFFIC_SECRET, CLIENT_HANDSHAKE_TRAFFIC_SECRET,
-//         SERVER_HANDSHAKE_TRAFFIC_SECRET, CLIENT_TRAFFIC_SECRET_0, SERVER_TRAFFIC_SECRET_0, etc.
+
 struct keylog_entry {
     std::string label;
-    std::string client_random_hex; // 64 hex chars (32 bytes)
+    std::string client_random_hex;
     std::string secret_hex;
-    uint64_t    timestamp = 0;    // when this entry was read
+    uint64_t    timestamp = 0;
 };
 
-// State for the SSLKEYLOGFILE watcher
+
 struct state_t {
     std::string                keylog_path;
     std::atomic<bool>          watching{false};
@@ -37,16 +39,14 @@ struct state_t {
     std::deque<keylog_entry>   entries;
     size_t                     max_entries = 8192;
 
-    // Map: client_random_hex -> vector of secrets (for TLS 1.2: single CLIENT_RANDOM entry;
-    // for TLS 1.3: multiple per-stage secrets)
+
     std::unordered_map<std::string, std::vector<keylog_entry>> by_client_random;
 
-    size_t                     file_pos = 0;  // current read position in log file
+    size_t                     file_pos = 0;
 };
 
 inline state_t g_state;
 
-// ─── Launch Process with SSLKEYLOGFILE ────────────────────────────
 
 struct launch_result {
     bool     success = false;
@@ -60,7 +60,7 @@ inline launch_result launch_with_keylog(const std::string& exe_path,
                                          const std::string& keylog_path = {}) {
     launch_result result;
 
-    // Determine keylog file path
+
     std::string kpath = keylog_path;
     if (kpath.empty()) {
         char temp[MAX_PATH] = {};
@@ -69,51 +69,18 @@ inline launch_result launch_with_keylog(const std::string& exe_path,
     }
     result.keylog_path = kpath;
 
-    // Build command line
+
     std::string cmdline = "\"" + exe_path + "\"";
     if (!args.empty()) cmdline += " " + args;
 
-    // Build environment block with SSLKEYLOGFILE added
-    // Get current environment
-    LPCH env_block = GetEnvironmentStringsA();
-    if (!env_block) {
-        result.error = "Failed to get environment strings";
-        return result;
-    }
 
-    // Calculate current env block size and build new block
-    std::vector<char> new_env;
-    const char* p = env_block;
-    bool found_keylog = false;
+    char old_keylog[4096] = {};
+    DWORD had_old = GetEnvironmentVariableA("SSLKEYLOGFILE", old_keylog, sizeof(old_keylog));
 
-    while (*p) {
-        std::string var(p);
-        size_t len = var.size();
 
-        // Check if this is SSLKEYLOGFILE - replace it
-        if (var.size() > 14 && _strnicmp(var.c_str(), "SSLKEYLOGFILE=", 14) == 0) {
-            std::string new_var = "SSLKEYLOGFILE=" + kpath;
-            new_env.insert(new_env.end(), new_var.begin(), new_var.end());
-            new_env.push_back('\0');
-            found_keylog = true;
-        } else {
-            new_env.insert(new_env.end(), var.begin(), var.end());
-            new_env.push_back('\0');
-        }
-        p += len + 1;
-    }
+    SetEnvironmentVariableA("SSLKEYLOGFILE", kpath.c_str());
 
-    // Add SSLKEYLOGFILE if not already present
-    if (!found_keylog) {
-        std::string new_var = "SSLKEYLOGFILE=" + kpath;
-        new_env.insert(new_env.end(), new_var.begin(), new_var.end());
-        new_env.push_back('\0');
-    }
-    new_env.push_back('\0'); // double null terminator
 
-    FreeEnvironmentStringsA(env_block);
-
-    // Create process
     STARTUPINFOA si = {};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
@@ -126,9 +93,15 @@ inline launch_result launch_with_keylog(const std::string& exe_path,
         cmd_buf.data(),
         nullptr, nullptr, FALSE,
         CREATE_NEW_PROCESS_GROUP,
-        new_env.data(),
+        nullptr,
         nullptr,
         &si, &pi);
+
+
+    if (had_old > 0)
+        SetEnvironmentVariableA("SSLKEYLOGFILE", old_keylog);
+    else
+        SetEnvironmentVariableA("SSLKEYLOGFILE", nullptr);
 
     if (!ok) {
         result.error = "CreateProcess failed: " + std::to_string(GetLastError());
@@ -142,13 +115,12 @@ inline launch_result launch_with_keylog(const std::string& exe_path,
     return result;
 }
 
-// ─── Keylog File Parser ───────────────────────────────────────────
 
 inline bool parse_keylog_line(const std::string& line, keylog_entry& entry) {
-    // Skip empty lines and comments
+
     if (line.empty() || line[0] == '#') return false;
 
-    // Format: <label> <client_random_hex> <secret_hex>
+
     size_t sp1 = line.find(' ');
     if (sp1 == std::string::npos) return false;
     size_t sp2 = line.find(' ', sp1 + 1);
@@ -158,7 +130,7 @@ inline bool parse_keylog_line(const std::string& line, keylog_entry& entry) {
     entry.client_random_hex = line.substr(sp1 + 1, sp2 - sp1 - 1);
     entry.secret_hex = line.substr(sp2 + 1);
 
-    // Basic validation
+
     if (entry.client_random_hex.size() != 64) return false;
     if (entry.secret_hex.size() < 32) return false;
 
@@ -172,7 +144,7 @@ inline void process_new_lines(state_t& state, const std::string& content) {
 
     std::lock_guard<std::mutex> lock(state.entries_mutex);
     while (std::getline(iss, line)) {
-        // Strip \r if present
+
         if (!line.empty() && line.back() == '\r') line.pop_back();
 
         keylog_entry entry;
@@ -188,7 +160,8 @@ inline void process_new_lines(state_t& state, const std::string& content) {
     }
 }
 
-// ─── File Watcher ─────────────────────────────────────────────────
+
+inline void stop_watching();
 
 inline void start_watching(const std::string& keylog_path) {
     stop_watching();
@@ -219,7 +192,7 @@ inline void start_watching(const std::string& keylog_path) {
                 }
                 file.close();
             }
-            // Poll every 200ms
+
             for (int i = 0; i < 20 && state.watching.load(); i++)
                 Sleep(10);
         }
@@ -232,7 +205,6 @@ inline void stop_watching() {
         g_state.watcher_thread.join();
 }
 
-// ─── Query API ────────────────────────────────────────────────────
 
 inline std::vector<keylog_entry> get_entries(size_t max_count = 0) {
     std::lock_guard<std::mutex> lock(g_state.entries_mutex);
@@ -268,4 +240,178 @@ inline bool is_watching() {
     return g_state.watching.load();
 }
 
-} // namespace ssl_keylog
+
+struct decrypt_result {
+    bool success = false;
+    std::vector<uint8_t> plaintext;
+    std::string error;
+    uint8_t content_type = 0;
+};
+
+
+inline std::vector<uint8_t> hex_decode(const std::string& hex) {
+    std::vector<uint8_t> result;
+    result.reserve(hex.size() / 2);
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+        unsigned int byte = 0;
+        if (sscanf(hex.c_str() + i, "%02x", &byte) == 1)
+            result.push_back(static_cast<uint8_t>(byte));
+    }
+    return result;
+}
+
+
+inline std::vector<uint8_t> hkdf_expand_label(const std::vector<uint8_t>& secret,
+                                                const std::string& label,
+                                                const std::vector<uint8_t>& context,
+                                                size_t length) {
+
+    std::string full_label = "tls13 " + label;
+    std::vector<uint8_t> hkdf_label;
+    hkdf_label.push_back(static_cast<uint8_t>((length >> 8) & 0xff));
+    hkdf_label.push_back(static_cast<uint8_t>(length & 0xff));
+    hkdf_label.push_back(static_cast<uint8_t>(full_label.size()));
+    hkdf_label.insert(hkdf_label.end(), full_label.begin(), full_label.end());
+    hkdf_label.push_back(static_cast<uint8_t>(context.size()));
+    hkdf_label.insert(hkdf_label.end(), context.begin(), context.end());
+
+    std::vector<uint8_t> out(length, 0);
+
+    EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
+    if (!pctx) return {};
+
+    size_t outlen = length;
+    if (EVP_PKEY_derive_init(pctx) <= 0 ||
+        EVP_PKEY_CTX_hkdf_mode(pctx, EVP_PKEY_HKDEF_MODE_EXPAND_ONLY) <= 0 ||
+        EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_sha256()) <= 0 ||
+        EVP_PKEY_CTX_set1_hkdf_key(pctx, secret.data(), static_cast<int>(secret.size())) <= 0 ||
+        EVP_PKEY_CTX_add1_hkdf_info(pctx, hkdf_label.data(), static_cast<int>(hkdf_label.size())) <= 0 ||
+        EVP_PKEY_derive(pctx, out.data(), &outlen) <= 0) {
+        EVP_PKEY_CTX_free(pctx);
+        return {};
+    }
+
+    EVP_PKEY_CTX_free(pctx);
+    out.resize(outlen);
+    return out;
+}
+
+
+inline decrypt_result decrypt_tls13_record(const uint8_t* record_data, size_t record_len,
+                                            const std::string& client_random_hex,
+                                            bool is_from_server,
+                                            uint64_t seq_num,
+                                            size_t key_size = 16) {
+    decrypt_result result;
+
+
+    std::string target_label = is_from_server ? "SERVER_TRAFFIC_SECRET_0" : "CLIENT_TRAFFIC_SECRET_0";
+    std::vector<keylog_entry> entries;
+    {
+        std::lock_guard<std::mutex> lock(g_state.entries_mutex);
+        auto it = g_state.by_client_random.find(client_random_hex);
+        if (it == g_state.by_client_random.end()) {
+            result.error = "no keylog entries for client_random";
+            return result;
+        }
+        entries = it->second;
+    }
+
+
+    std::string secret_hex;
+    for (auto& e : entries) {
+        if (e.label == target_label) {
+            secret_hex = e.secret_hex;
+            break;
+        }
+    }
+    if (secret_hex.empty()) {
+        result.error = "no " + target_label + " found in keylog";
+        return result;
+    }
+
+    auto secret = hex_decode(secret_hex);
+    if (secret.empty()) {
+        result.error = "failed to decode secret hex";
+        return result;
+    }
+
+
+    auto key = hkdf_expand_label(secret, "key", {}, key_size);
+    auto iv = hkdf_expand_label(secret, "iv", {}, 12);
+
+    if (key.size() != key_size || iv.size() != 12) {
+        result.error = "HKDF key/IV derivation failed";
+        return result;
+    }
+
+
+    for (int i = 0; i < 8; i++) {
+        iv[static_cast<size_t>(11 - i)] ^= static_cast<uint8_t>((seq_num >> (i * 8)) & 0xff);
+    }
+
+
+    if (record_len < 16) {
+        result.error = "record too short for GCM tag";
+        return result;
+    }
+
+    size_t ciphertext_len = record_len - 16;
+    const uint8_t* ciphertext = record_data;
+    const uint8_t* tag = record_data + ciphertext_len;
+
+
+    uint8_t aad[5] = { 0x17, 0x03, 0x03,
+                        static_cast<uint8_t>((record_len >> 8) & 0xff),
+                        static_cast<uint8_t>(record_len & 0xff) };
+
+    const EVP_CIPHER* cipher = (key_size == 32) ? EVP_aes_256_gcm() : EVP_aes_128_gcm();
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        result.error = "EVP_CIPHER_CTX_new failed";
+        return result;
+    }
+
+    result.plaintext.resize(ciphertext_len);
+    int out_len = 0;
+
+    bool ok = true;
+    if (EVP_DecryptInit_ex(ctx, cipher, nullptr, nullptr, nullptr) != 1) ok = false;
+    if (ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) != 1) ok = false;
+    if (ok && EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), iv.data()) != 1) ok = false;
+    if (ok && EVP_DecryptUpdate(ctx, nullptr, &out_len, aad, sizeof(aad)) != 1) ok = false;
+    if (ok && EVP_DecryptUpdate(ctx, result.plaintext.data(), &out_len,
+                                 ciphertext, static_cast<int>(ciphertext_len)) != 1) ok = false;
+
+    int pt_len = out_len;
+    if (ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16,
+                                   const_cast<uint8_t*>(tag)) != 1) ok = false;
+    if (ok && EVP_DecryptFinal_ex(ctx, result.plaintext.data() + pt_len, &out_len) != 1) ok = false;
+    pt_len += out_len;
+
+    EVP_CIPHER_CTX_free(ctx);
+
+    if (!ok) {
+        result.error = "AES-GCM decryption failed (bad key or corrupted data)";
+        result.plaintext.clear();
+        return result;
+    }
+
+    result.plaintext.resize(static_cast<size_t>(pt_len));
+
+
+    if (!result.plaintext.empty()) {
+
+        size_t end = result.plaintext.size();
+        while (end > 0 && result.plaintext[end - 1] == 0) end--;
+        if (end > 0) {
+            result.content_type = result.plaintext[end - 1];
+            result.plaintext.resize(end - 1);
+        }
+    }
+
+    result.success = true;
+    return result;
+}
+
+}

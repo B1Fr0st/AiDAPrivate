@@ -723,6 +723,10 @@ void helpers::render_title()
 			globals::ui::active_activity = activity_item_t::search;
 			globals::ui::panel_left_visible = true;
 		}
+
+		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
+			globals::ui::active_center_view = center_view_t::network_view;
+		}
 	}
 
 	if (!helpers::themes_loaded && g_pd3dDevice) {
@@ -838,7 +842,7 @@ void helpers::render_title()
 				globals::ui::window_w += dw * std::min(spd * dt, 1.f);
 				globals::ui::window_h += dh * std::min(spd * dt, 1.f);
 
-				// Snap to target when close to prevent sub-pixel jitter
+
 				if (std::abs(dw) < 2.f) globals::ui::window_w = tw;
 				if (std::abs(dh) < 2.f) globals::ui::window_h = th;
 
@@ -2823,7 +2827,7 @@ void helpers::render_title()
 		ImGui::PopStyleVar();
 		}
 
-		// Theme icon — bottom-center of explorer panel
+
 		{
 			ID3D11ShaderResourceView* icon_srv = get_active_theme_icon();
 			if (icon_srv) {
@@ -3260,6 +3264,42 @@ void helpers::render_title()
 			}
 		}
 
+
+		{
+			bool net_is_active = (globals::ui::active_center_view == center_view_t::network_view);
+			const char* net_label = "Network";
+			ImVec2 nts = ImGui::CalcTextSize(net_label);
+			float ntw = 10.f * 2.f + nts.x;
+			float ntx0 = rbtn_x0 - ntw - 8.f;
+			float ntx1 = ntx0 + ntw;
+			float tab_h4 = row_h - 2.f;
+			float nty0 = r1_cy - tab_h4 * 0.5f;
+			float nty1 = nty0 + tab_h4;
+
+			if (ntx0 > hx0 + hdr_pad + 40.f) {
+				bool ntab_hov = ImGui::IsMouseHoveringRect(ImVec2(ntx0, nty0), ImVec2(ntx1, nty1), false);
+
+				if (net_is_active) {
+					wdl->AddRectFilled(ImVec2(ntx0, nty0), ImVec2(ntx1, nty1),
+						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
+					wdl->AddLine(ImVec2(ntx0 + 2.f, nty1), ImVec2(ntx1 - 2.f, nty1),
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+				} else if (ntab_hov) {
+					wdl->AddRectFilled(ImVec2(ntx0, nty0), ImVec2(ntx1, nty1),
+						IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
+				}
+
+				ImU32 ntab_col = net_is_active ? ac_full
+				               : IM_COL32(170, 175, 190, (int)((ntab_hov ? 220.f : 160.f)*a));
+				wdl->AddText(ImVec2(ntx0 + 10.f, nty0 + (tab_h4 - nts.y) * 0.5f),
+					ntab_col, net_label);
+
+				if (ntab_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+					globals::ui::active_center_view = center_view_t::network_view;
+				}
+			}
+		}
+
 		bool cf_clicked = ghost_btn("Choose File",
 			ImGui::GetID("##cfhv"), ImGui::GetID("##cffl"),
 			rbtn_x0, r1_cy, rbtn_w);
@@ -3591,7 +3631,7 @@ void helpers::render_title()
 	if (right_w > 1.f) {
 	begin_child("##chat", ImVec2(pad + left_gap + center_w + gap, content_top), ImVec2(right_w, right_total_h), a);
 
-	// Settings slide animation (right-to-left open, left-to-right close)
+
 	static float s_settings_slide = 0.f;
 	{
 		float dt_s = ImGui::GetIO().DeltaTime;
@@ -3601,7 +3641,7 @@ void helpers::render_title()
 	}
 	bool settings_visible = g_settings_open || s_settings_slide > 0.005f;
 
-	// Always render chat underneath
+
 	{
 		float ax = globals::ui::accent.x * 255.f;
 		float ay = globals::ui::accent.y * 255.f;
@@ -4387,7 +4427,7 @@ void helpers::render_title()
 
 			dl->PopClipRect();
 		}
-		} // end else (chat messages visible)
+		}
 
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 
@@ -4680,7 +4720,7 @@ void helpers::render_title()
 		}
 	}
 
-	// Settings overlay (slides over chat)
+
 	if (settings_visible) {
 		ImVec2 parent_sz = ImGui::GetWindowSize();
 		float offset_x = (1.f - s_settings_slide) * parent_sz.x;
@@ -4688,7 +4728,7 @@ void helpers::render_title()
 		ImGui::BeginChild("##settings_slide_wrap", parent_sz, false,
 			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
 
-		// Draw opaque background so chat text doesn't bleed through
+
 		ImDrawList* sdl = ImGui::GetWindowDrawList();
 		ImVec2 swp = ImGui::GetWindowPos();
 		ImVec2 sws = ImGui::GetWindowSize();
@@ -4819,11 +4859,11 @@ void helpers::render_title()
 					if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows)) {
 						auto& io = ImGui::GetIO();
 
-						// Ctrl+A selects all terminal text
+
 						if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
 							s_term_select_all = true;
 						}
-						// Ctrl+C with selection copies text; otherwise sends ^C to pty
+
 						if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
 							if (s_term_select_all) {
 								std::string all_text;
@@ -4832,7 +4872,7 @@ void helpers::render_title()
 									for (auto& row : ts->lines) {
 										for (auto& cell : row)
 											all_text += cell.ch;
-										// Trim trailing spaces per line
+
 										while (!all_text.empty() && all_text.back() == ' ')
 											all_text.pop_back();
 										all_text += '\n';
@@ -4861,7 +4901,7 @@ void helpers::render_title()
 								terminal_view::send_input(*ts, "\x1b", 1);
 						}
 
-						// Any non-modifier key or mouse click clears selection
+
 						if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
 						    (!io.KeyCtrl && io.InputQueueCharacters.Size > 0))
 							s_term_select_all = false;
@@ -4869,7 +4909,7 @@ void helpers::render_title()
 						s_term_select_all = false;
 					}
 
-					// Draw selection overlay
+
 					if (s_term_select_all) {
 						ImVec2 wp2 = ImGui::GetWindowPos();
 						ImGui::GetWindowDrawList()->AddRectFilled(
@@ -4887,7 +4927,7 @@ void helpers::render_title()
 				float scroll_y = ImGui::GetScrollY();
 				float vis_h = ImGui::GetWindowHeight();
 
-				// Handle Ctrl+A / Ctrl+C for log panels
+
 				bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
 				if (focused) {
 					auto& io = ImGui::GetIO();
@@ -4903,7 +4943,7 @@ void helpers::render_title()
 						if (!all_text.empty())
 							ImGui::SetClipboardText(all_text.c_str());
 					}
-					// Click clears selection
+
 					if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 						output_log::select_all[tab_idx] = false;
 				} else {
@@ -4916,7 +4956,7 @@ void helpers::render_title()
 				for (int li = first; li <= last; li++) {
 					float ly = lorig.y + li * line_h - scroll_y;
 
-					// Selection highlight
+
 					if (output_log::select_all[tab_idx])
 						ldl->AddRectFilled(ImVec2(lorig.x, ly), ImVec2(lorig.x + bfw, ly + line_h),
 							IM_COL32((int)(bax * 0.3f), (int)(bay * 0.3f), (int)(baz * 0.3f), (int)(50 * a)));
@@ -5436,7 +5476,6 @@ void helpers::render_title()
 	}
 
 
-	// ── Attach to Process (modern animated panel) ──
 	static int pa_open_frame = -1;
 	static float pa_anim = 0.f;
 	static bool pa_closing = false;
@@ -5469,17 +5508,17 @@ void helpers::render_title()
 
 		ImVec2 vp = ImGui::GetIO().DisplaySize;
 
-		// Animated overlay on ForegroundDrawList
+
 		ImGui::GetForegroundDrawList()->AddRectFilled({0, 0}, vp,
 			IM_COL32(0, 0, 0, static_cast<int>(140.f * pa_anim)));
 
-		// Popup sizing with scale animation
+
 		float pw = 620.f, ph = 490.f;
 		float pa_scale = 0.96f + 0.04f * pa_anim;
 		float sw = pw * pa_scale, sh = ph * pa_scale;
 		float px = (vp.x - sw) * 0.5f, py = (vp.y - sh) * 0.5f;
 
-		// Click outside to dismiss
+
 		if (ImGui::GetFrameCount() > pa_open_frame + 1 && !pa_closing &&
 			ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			ImVec2 mp = ImGui::GetIO().MousePos;
@@ -5487,7 +5526,7 @@ void helpers::render_title()
 				pa_closing = true;
 		}
 
-		// Single ImGui window for the entire popup
+
 		ImGui::SetNextWindowPos({px, py});
 		ImGui::SetNextWindowSize({sw, sh});
 		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(20, 20, 28, static_cast<int>(252.f * pa_anim)));
@@ -5504,7 +5543,7 @@ void helpers::render_title()
 			ImVec2 wp = ImGui::GetWindowPos();
 			ImVec2 ws = ImGui::GetWindowSize();
 
-			// Shadow (behind window — draw on background drawlist)
+
 			ImDrawList* bgdl = ImGui::GetBackgroundDrawList();
 			for (int si = 4; si >= 0; --si) {
 				float e = static_cast<float>(si) * 5.f;
@@ -5513,7 +5552,7 @@ void helpers::render_title()
 					IM_COL32(0, 0, 0, sa), 12.f + e);
 			}
 
-			// Header bar
+
 			float hdr_h = 44.f;
 			dl->AddRectFilled({wp.x + 1, wp.y + 1}, {wp.x + ws.x - 1, wp.y + hdr_h},
 				IM_COL32(static_cast<int>(ax_pa * 30), static_cast<int>(ay_pa * 30),
@@ -5522,11 +5561,11 @@ void helpers::render_title()
 			dl->AddLine({wp.x, wp.y + hdr_h}, {wp.x + ws.x, wp.y + hdr_h},
 				IM_COL32(255, 255, 255, static_cast<int>(15.f * pa_anim)));
 
-			// Title
+
 			dl->AddText(ImVec2(wp.x + 18.f, wp.y + (hdr_h - ImGui::GetFontSize()) * 0.5f),
 				IM_COL32(225, 222, 240, ca), "Attach to Process");
 
-			// Close X button
+
 			{
 				float xsz = 18.f;
 				float xx = wp.x + ws.x - xsz - 14.f, xy = wp.y + (hdr_h - xsz) * 0.5f;
@@ -5541,13 +5580,13 @@ void helpers::render_title()
 				if (x_hov && ImGui::IsMouseClicked(0) && !pa_closing) pa_closing = true;
 			}
 
-			// Content area as child inside the same window
+
 			ImGui::SetCursorPos(ImVec2(1.f, hdr_h + 1.f));
 			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14, 10));
 			ImGui::BeginChild("##pa_inner", ImVec2(ws.x - 2.f, ws.y - hdr_h - 2.f), false,
 				ImGuiWindowFlags_NoBackground);
 			{
-				// Search input
+
 				ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 				ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10, 7));
 				ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.04f, 0.04f, 0.07f, 1.f));
@@ -5560,18 +5599,18 @@ void helpers::render_title()
 				ImGui::PopStyleVar(2);
 				ImGui::Spacing();
 
-				// Refresh process list
+
 				pa_refresh_timer -= ImGui::GetIO().DeltaTime;
 				if (pa_refresh_timer <= 0.f || pa_proc_list.empty()) {
 					pa_proc_list = driver_bridge::enumerate_processes();
 					pa_refresh_timer = 2.f;
 				}
 
-				// Filter
+
 				std::string filt(globals::ui::process_filter_buf);
 				for (auto& c : filt) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
 
-				// Process table
+
 				float list_h = ws.y - hdr_h - 108.f;
 
 				ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, ImVec4(0.05f, 0.05f, 0.09f, 1.f));
@@ -5655,7 +5694,7 @@ void helpers::render_title()
 
 				ImGui::Spacing();
 
-				// Buttons (centered)
+
 				bool can_attach = pa_selected >= 0 && pa_selected < static_cast<int>(pa_proc_list.size());
 				float btn_w = 100.f, btn_h = 30.f;
 				float total_btn_w = btn_w * 2.f + 12.f;
@@ -5682,7 +5721,7 @@ void helpers::render_title()
 				ImGui::PopStyleColor(3);
 				ImGui::PopStyleVar();
 
-				// Attach action
+
 				if (do_attach && can_attach) {
 					auto& p = pa_proc_list[pa_selected];
 					driver_bridge::attach(p.pid);
@@ -5711,7 +5750,7 @@ void helpers::render_title()
 				}
 			}
 			ImGui::EndChild();
-			ImGui::PopStyleVar(); // WindowPadding for child
+			ImGui::PopStyleVar();
 		}
 		ImGui::End();
 		ImGui::PopStyleVar(2);

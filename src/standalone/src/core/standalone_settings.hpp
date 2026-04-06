@@ -356,25 +356,21 @@ struct settings_sa_t
     std::string tool_always_deny;
     bool        force_xml_tools      = false;
 
-    // Granular auto-approval settings (Roo-Code parity)
-    // WHY: Roo-Code lets users approve different tool categories independently.
-    // E.g., auto-approve reads but require confirmation for file writes and commands.
-    bool        auto_approve_read       = false;  // read_file, list_directory, search_files, etc.
-    bool        auto_approve_write      = false;  // write_file, edit_file, create_file, etc.
-    bool        auto_approve_execute    = false;  // execute_command, sandbox_execute
-    bool        auto_approve_mcp        = false;  // MCP remote tool calls
-    bool        auto_approve_mode_switch = false; // switch_mode, new_task
-    bool        auto_approve_subtask    = false;  // subtask spawning
-    int         auto_approve_max_requests = 0;    // 0 = unlimited (per-task request budget)
-    double      auto_approve_max_cost    = 0.0;   // 0.0 = unlimited (per-task cost budget)
-    std::string auto_approve_allowed_commands;     // comma-separated command prefixes for execute_command
-    std::string aidaignore_path;                   // path to .aidaignore file for file-level blocking
 
-    // Context condensation settings (Roo-Code parity)
-    // WHY: When context window fills up, we condense old messages into summaries
-    // instead of dropping them. These thresholds control when condensation triggers.
-    double      condense_threshold       = 0.80;  // fraction of context used before condensing
-    double      condense_buffer          = 0.10;  // reserved fraction for response tokens
+    bool        auto_approve_read       = false;
+    bool        auto_approve_write      = false;
+    bool        auto_approve_execute    = false;
+    bool        auto_approve_mcp        = false;
+    bool        auto_approve_mode_switch = false;
+    bool        auto_approve_subtask    = false;
+    int         auto_approve_max_requests = 0;
+    double      auto_approve_max_cost    = 0.0;
+    std::string auto_approve_allowed_commands;
+    std::string aidaignore_path;
+
+
+    double      condense_threshold       = 0.80;
+    double      condense_buffer          = 0.10;
 
 
     std::string recent_workspaces_json;

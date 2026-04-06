@@ -200,36 +200,36 @@ namespace sandbox
             const std::wstring guest_input = guest_root + L"\\input";
             ofs << L"<Configuration>\n";
 
-            // Network: disabled by default to prevent data exfiltration
+
             ofs << L"  <Networking>" << (cfg.allow_network ? L"Default" : L"Disable") << L"</Networking>\n";
 
-            // Clipboard: disabled by default to prevent clipboard-based data theft
+
             ofs << L"  <ClipboardRedirection>" << (cfg.allow_clipboard ? L"Default" : L"Disable") << L"</ClipboardRedirection>\n";
 
-            // Printer: always disabled to prevent data exfiltration via print jobs
+
             ofs << L"  <PrinterRedirection>Disable</PrinterRedirection>\n";
 
-            // Audio/Video input: always disabled to prevent recording from host devices
+
             ofs << L"  <AudioInput>Disable</AudioInput>\n";
             ofs << L"  <VideoInput>Disable</VideoInput>\n";
 
-            // GPU: disabled by default to prevent GPU-based side-channel attacks
+
             ofs << L"  <vGPU>" << (cfg.allow_gpu ? L"Default" : L"Disable") << L"</vGPU>\n";
 
-            // Memory limit: constrain sandbox memory usage
+
             if (cfg.max_memory_mb > 0)
                 ofs << L"  <MemoryInMB>" << cfg.max_memory_mb << L"</MemoryInMB>\n";
 
             ofs << L"  <MappedFolders>\n";
 
-            // Input folder: read-only so malware cannot modify host workspace files
+
             ofs << L"    <MappedFolder>\n";
             ofs << L"      <HostFolder>" << host_input << L"</HostFolder>\n";
             ofs << L"      <SandboxFolder>" << guest_input << L"</SandboxFolder>\n";
             ofs << L"      <ReadOnly>true</ReadOnly>\n";
             ofs << L"    </MappedFolder>\n";
 
-            // Session root: writable for metadata, stdout, stderr output
+
             ofs << L"    <MappedFolder>\n";
             ofs << L"      <HostFolder>" << host << L"</HostFolder>\n";
             ofs << L"      <SandboxFolder>" << guest_root << L"</SandboxFolder>\n";
@@ -259,7 +259,7 @@ namespace sandbox
             return res;
         }
 
-        // Validate exe_path: must be an absolute path, no null bytes or suspicious shell metacharacters
+
         if (cfg.exe_path.find(L'\0') != std::wstring::npos ||
             cfg.exe_path.find(L'`')  != std::wstring::npos ||
             cfg.exe_path.find(L'$')  != std::wstring::npos ||
@@ -356,7 +356,7 @@ namespace sandbox
         res.session_dir = detail::narrow(session_dir.wstring());
         res.wsb_path = detail::narrow(host_wsb.wstring());
 
-        // Clean up session directory to remove host-side residual artifacts
+
         if (cfg.cleanup_session) {
             std::error_code ec;
             std::filesystem::remove_all(session_dir, ec);

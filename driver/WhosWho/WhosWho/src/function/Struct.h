@@ -280,8 +280,10 @@ typedef struct _NET_CONN_ENTRY {
     UINT32 address_family;
     UINT8  local_addr[16];
     UINT8  remote_addr[16];
+    char   process_path[260];
+    UINT32 padding_pp;
 } NET_CONN_ENTRY, *PNET_CONN_ENTRY;
-static_assert(sizeof(NET_CONN_ENTRY) == 56, "NET_CONN_ENTRY size must be 56 bytes");
+static_assert(sizeof(NET_CONN_ENTRY) == 320, "NET_CONN_ENTRY size must be 320 bytes");
 
 
 #define MAX_NET_CONNECTIONS 1024
@@ -808,6 +810,51 @@ typedef struct _NET_FINGERPRINT_REQUEST {
     UINT32 result_count;
     NET_FINGERPRINT_ENTRY entries[FINGERPRINT_MAX];
 } net_fingerprint_request, *p_net_fingerprint_request;
+
+
+#define MAX_SEQ_DELTA_ENTRIES 256
+typedef struct _SEQ_DELTA_ENTRY {
+    volatile LONG active;
+    UINT32 src_ip;
+    UINT32 dst_ip;
+    UINT16 src_port;
+    UINT16 dst_port;
+    LONG32 outbound_delta;
+    LONG32 inbound_delta;
+    UINT64 last_activity;
+} SEQ_DELTA_ENTRY, *PSEQ_DELTA_ENTRY;
+
+
+#define MAX_FRAGMENT_ENTRIES 32
+#define FRAGMENT_MAX_SIZE (64 * 1024)
+typedef struct _FRAGMENT_ENTRY {
+    volatile LONG active;
+    UINT16 ip_id;
+    UINT8  protocol;
+    UINT8  padding1;
+    UINT32 src_ip;
+    UINT32 dst_ip;
+    UINT32 total_received;
+    UINT32 highest_offset;
+    BOOLEAN last_fragment_seen;
+    UINT8  padding2[3];
+    UINT64 first_seen;
+    UINT8  data[FRAGMENT_MAX_SIZE];
+    UINT8  received_map[8192];
+} FRAGMENT_ENTRY, *PFRAGMENT_ENTRY;
+
+
+#define MAX_UDP_FLOW_ENTRIES 128
+typedef struct _UDP_FLOW_ENTRY {
+    volatile LONG active;
+    UINT32 src_ip;
+    UINT32 dst_ip;
+    UINT16 src_port;
+    UINT16 dst_port;
+    UINT32 pid;
+    UINT64 last_activity;
+} UDP_FLOW_ENTRY, *PUDP_FLOW_ENTRY;
+
 
 #pragma pack(pop)
 
