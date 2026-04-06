@@ -13,14 +13,14 @@ namespace func_obfuscate {
         while (*t) { h = h * 31 + *t++; }
         return h ^ 0x5A5A5A5A5A5A5A5AULL;
     }
-    
+
     constexpr std::uintptr_t KEY = compute_key();
-    
+
     template<typename T>
     __forceinline T decode(T encoded) {
         return (T)((std::uintptr_t)encoded ^ KEY);
     }
-    
+
     template<typename T>
     __forceinline T encode(T raw) {
         return (T)((std::uintptr_t)raw ^ KEY);
@@ -96,11 +96,11 @@ inline NTSTATUS           (NTAPI* _ZwClose)                        (HANDLE);
 
 inline bool SetupFunctions() {
     PVOID kernelBase = (PVOID)get_nt_base();
-    
+
     if (!kernelBase) {
         return false;
     }
-    
+
     *(PVOID*)&_RtlInitUnicodeString = GetProcAddress(kernelBase, (PCHAR)skCrypt("RtlInitUnicodeString"));
     *(PVOID*)&_IoCreateDriver = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoCreateDriver"));
     *(PVOID*)&_IoCreateDevice = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoCreateDevice"));

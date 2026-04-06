@@ -19,7 +19,7 @@
 00000001C004D210  C7 EB 2E 41 8B 4D 10 8B  C1 48 03 F1 48 89 74 24  ...A.M.........$
 00000001C004D220  40 44 2B F1 44 89 B4 24  A0 00 00 00 FF C7 89 7C  @D+....$.....ǉ |
 00000001C004D230  24 34 4C 8B 6C 24 48 E9  73 FF FF FF 8B C6 41 2B  $4L.l$H........+
-00000001C004D240  C7 85 C0 78 4F 8B F3 89  5C 24 38 3B F7 73 45 8B  ǅ ..O.....8;....
+00000001C004D240  C7 85 C0 78 4F 8B F3 89  5C 24 38 3B F7 73 45 8B  ǅ ..O.....8
 00000001C004D250  C6 48 8D 0C 80 48 03 C9  49 8B 04 24 0F 10 44 C8  .....H.....$..D.
 00000001C004D260  10 0F 11 44 24 48 66 0F  7E C0 83 F8 32 75 1D 44  ...D$Hf.~...2u.D
 00000001C004D270  8B C0 48 8B 54 24 50 48  8D 0D 62 13 FE FF E8 2D  ....T$PH..b.....
@@ -59,8 +59,8 @@
 00000001C004D490  10 48 8D 57 50 E8 BE 25  02 00 85 C0 79 0E BB 28  .H.WP..........(
 00000001C004D4A0  04 00 C0 89 5C 24 50 E9  9B 00 00 00 83 BF 80 00  ....\$P.........
 00000001C004D4B0  00 00 0E 75 69 48 8B 8F  88 00 00 00 48 8B 05 AD  ...uiH......H...
-00000001C004D4C0  11 FE FF 48 3B 01 75 56  8B 05 AA 11 FE FF 3B 41  ...H;.uV......;A
-00000001C004D4D0  08 75 4B 0F B7 05 A2 11  FE FF 66 3B 41 0C 75 3E  .uK.......f;A.u>
+00000001C004D4C0  11 FE FF 48 3B 01 75 56  8B 05 AA 11 FE FF 3B 41  ...H
+00000001C004D4D0  08 75 4B 0F B7 05 A2 11  FE FF 66 3B 41 0C 75 3E  .uK.......f
 00000001C004D4E0  48 8D 8F B0 00 00 00 48  8B 94 24 A0 00 00 00 E8  H......H..$.....
 00000001C004D4F0  E4 14 02 00 84 C0 75 0B  BB 28 04 00 C0 89 5C 24  .........(....\$
 00000001C004D500  50 EB 44 48 8D 8F F0 00  00 00 4D 8B C4 E8 46 E5  P.........M...F.
@@ -76,7 +76,7 @@
 00000001C004D5A0  41 54 41 55 41 56 41 57  48 83 EC 50 41 8B F0 4C  ATAUAVAWH.......
 00000001C004D5B0  8B E2 48 8B F9 0F 57 C0  33 ED BA D0 0E 00 00 41  ......W........A
 00000001C004D5C0  B8 43 49 63 72 41 8B D9  0F 11 40 C8 45 33 FF 8D  .CIcrA....@..3..
-00000001C004D5D0  4D 01 48 FF 15 4F 3B FF  FF 0F 1F 44 00 00 4C 8B  M.H..O;....D..L.
+00000001C004D5D0  4D 01 48 FF 15 4F 3B FF  FF 0F 1F 44 00 00 4C 8B  M.H..O
 00000001C004D5E0  F0 48 85 C0 75 0A BE 17  00 00 C0 E9 37 01 00 00  ....u.......7...
 00000001C004D5F0  48 05 D0 0A 00 00 49 89  06 48 05 20 03 00 00 49  H.....I..H. ...I
 00000001C004D600  89 46 08 48 83 C0 40 49  89 46 18 48 83 C0 40 49  .F.H...I.F.H...I
@@ -90,19 +90,19 @@
 00000001C004D680  89 54 24 30 41 F7 D8 48  8B 97 C0 00 00 00 4C 8D  .T$0A.........L.
 00000001C004D690  44 24 40 48 1B C9 48 23  C8 48 89 4C 24 28 49 8B  D$@H...#...L$(I.
 00000001C004D6A0  CE 4C 89 7C 24 20 E8 91  EE FF FF 8B F0 41 03 C5  ...|$ ..........
-00000001C004D6B0  41 85 C5 75 05 41 3B F4  75 59 33 F6 F6 C3 30 74  A....A;........t
+00000001C004D6B0  41 85 C5 75 05 41 3B F4  75 59 33 F6 F6 C3 30 74  A....A
 00000001C004D6C0  49 48 8D 47 18 44 8B CB  48 89 44 24 38 48 8D 4F  IH.G.D....D$8H.O
 00000001C004D6D0  10 48 89 4C 24 30 48 8D  57 08 48 89 54 24 28 4C  .H.L$0H.W.H.T$(L
 00000001C004D6E0  8D 44 24 40 48 8B 97 C0  00 00 00 49 8B CE 48 89  .D$@H......I....
 00000001C004D6F0  7C 24 20 E8 AC F1 FF FF  42 8D 0C 28 41 85 CD 75  |$ .....B..(A...
-00000001C004D700  09 41 3B C4 74 04 8B F0  EB 09 83 E3 7C C1 E3 08  .A;.............
+00000001C004D700  09 41 3B C4 74 04 8B F0  EB 09 83 E3 7C C1 E3 08  .A
 00000001C004D710  09 5F 50 BA 43 49 63 72  49 8B CE 48 FF 15 2E 3A  ._P.CIcrI......:
 00000001C004D720  FF FF 0F 1F 44 00 00 4C  8D 5C 24 50 8B C6 49 8B  ....D..L.\$P....
 00000001C004D730  5B 30 49 8B 6B 38 49 8B  73 40 49 8B E3 41 5F 41  [0I.k8I.s@I....A
 00000001C004D740  5E 41 5D 41 5C 5F C3 CC  CC CC CC CC CC CC CC CC  ^A]A\_..........
 00000001C004D750  8B 01 44 8B DA 33 D2 49  83 C3 04 49 F7 F3 33 D2  ..D........I....
 00000001C004D760  85 C0 44 8D 50 FF 44 0F  44 D0 43 8D 04 52 C1 E0  ....P.D.D....R..
-00000001C004D770  03 4D 85 C0 74 34 44 3B  C8 73 07 BA 23 00 00 C0  .M...4D;....#...
+00000001C004D770  03 4D 85 C0 74 34 44 3B  C8 73 07 BA 23 00 00 C0  .M...4D
 00000001C004D780  EB 28 48 8B 49 08 45 85  D2 74 1F 0F 10 01 41 0F  ....I.E.......A.
 00000001C004D790  11 00 4D 8D 40 18 F2 0F  10 49 10 49 03 CB F2 41  ..M.@......I...A
 00000001C004D7A0  0F 11 48 F8 41 83 C2 FF  75 E1 48 8B 4C 24 28 89  ..H.A...u...L$(.
@@ -110,12 +110,12 @@
 00000001C004D7C0  89 58 08 48 89 68 10 48  89 70 18 48 89 78 20 41  .X.H.h.H.p.H.x A
 00000001C004D7D0  56 48 83 EC 20 E8 86 62  FB FF 48 8B E8 48 FF 15  VH.....b..H.....
 00000001C004D7E0  34 3E FF FF 0F 1F 44 00  00 B2 01 48 8D 4D 18 48  4>....D....H.M.H
-00000001C004D7F0  FF 15 0A 3B FF FF 0F 1F  44 00 00 33 C9 33 C0 F0  ...;....D..3....
+00000001C004D7F0  FF 15 0A 3B FF FF 0F 1F  44 00 00 33 C9 33 C0 F0  ...
 00000001C004D800  0F B1 0D 41 AF FE FF 75  4D 48 8D 75 08 48 8B 0E  ...A...uMH.u.H..
-00000001C004D810  48 3B CE 74 41 48 8B 79  08 48 8D 99 38 FF FF FF  H;..AH.y.H..8...
+00000001C004D810  48 3B CE 74 41 48 8B 79  08 48 8D 99 38 FF FF FF  H
 00000001C004D820  48 8B CB 48 8B D5 E8 B5  02 00 00 48 8B CB E8 95  H..........H....
 00000001C004D830  DD FF FF BA 43 49 63 72  48 8B CB 48 FF 15 0E 39  ....CIcrH......9
-00000001C004D840  FF FF 0F 1F 44 00 00 48  8B 0F 48 3B CE 75 C6 F0  ....D..H..H;....
+00000001C004D840  FF FF 0F 1F 44 00 00 48  8B 0F 48 3B CE 75 C6 F0  ....D..H..H
 00000001C004D850  FF 05 EE AE FE FF 48 8D  4D 18 48 FF 15 E7 3A FF  ......H.M.H.....
 00000001C004D860  FF 0F 1F 44 00 00 48 FF  15 53 39 FF FF 0F 1F 44  ...D..H..S9....D
 00000001C004D870  00 00 48 8B 5C 24 30 48  8B 6C 24 38 48 8B 74 24  ..H.\$0H.l$8H.t$
@@ -252,7 +252,7 @@
 00000001C004E0A0  2D 04 80 00 00 74 21 83  F8 08 74 14 BB BB 00 00  -....t!...t.....
 00000001C004E0B0  C0 C7 06 02 00 00 00 44  89 76 04 E9 1B 02 00 00  .......D.v......
 00000001C004E0C0  41 BE 01 00 00 00 EB 03  45 33 F6 44 89 74 24 40  A........3....$@
-00000001C004E0D0  48 8B D6 48 8D 4C 24 60  E8 37 FD FF FF 8B D8 85  H....L$`......؅ 
+00000001C004E0D0  48 8B D6 48 8D 4C 24 60  E8 37 FD FF FF 8B D8 85  H....L$`......؅
 00000001C004E0E0  C0 0F 88 F4 01 00 00 BA  58 00 00 00 48 8D 8C 24  ........X...H..$
 00000001C004E0F0  B0 00 00 00 48 FF 15 75  2F FF FF 0F 1F 44 00 00  ....H..u/....D..
 00000001C004E100  8B D8 85 C0 74 13 C7 06  05 00 00 00 89 46 04 BB  .؅ ..........F..
@@ -356,7 +356,7 @@
 00000001C004E720  4C 8D 45 D0 48 83 65 D8  00 48 8D 4B 10 48 83 65  L.E...e..H.K.H.e
 00000001C004E730  E0 00 45 33 C9 48 89 44  24 30 0F 57 C0 C7 44 24  ...3...D$0.W..D$
 00000001C004E740  28 00 00 00 08 C7 45 D0  30 00 00 00 41 8D 51 04  (...........A.Q.
-00000001C004E750  C7 45 E8 40 02 00 00 F3  0F 7F 45 F0 C7 44 24 20  ............... 
+00000001C004E750  C7 45 E8 40 02 00 00 F3  0F 7F 45 F0 C7 44 24 20  ...............
 00000001C004E760  02 00 00 00 48 FF 15 8D  2B FF FF 0F 1F 44 00 00  ....H...+....D..
 00000001C004E770  8B F8 85 C0 78 60 48 8B  05 43 2C FF FF 45 33 C9  .....`H..C,..E3.
 00000001C004E780  48 8B 4B 10 48 83 64 24  28 00 48 83 65 40 00 4C  H.K.H.d$(.H.e@.L
@@ -444,13 +444,13 @@
 00000001C004ECA0  4C 8B DC 49 89 5B 08 49  89 73 10 57 48 83 EC 60  L....[.I.s.WH...
 00000001C004ECB0  0F 57 C0 48 8D 35 EE 98  FE FF 33 C0 48 8B DA 0F  .W...5....3.....
 00000001C004ECC0  11 44 24 20 48 8B F9 0F  11 44 24 30 0F 11 44 24  .D$ H....D$0..D$
-00000001C004ECD0  40 49 89 43 E8 48 8B 05  CC 98 FE FF 48 3B C6 0F  @I.C........H;..
+00000001C004ECD0  40 49 89 43 E8 48 8B 05  CC 98 FE FF 48 3B C6 0F  @I.C........H
 00000001C004ECE0  84 87 00 00 00 49 8D 53  D8 48 8B CB E8 B3 75 FF  .....I.S......u.
 00000001C004ECF0  FF 85 C0 78 77 48 8B CB  48 FF 15 41 25 FF FF 0F  ....wH.....A%...
 00000001C004ED00  1F 44 00 00 48 8D 0D B5  98 FE FF 48 89 7C 24 30  .D..H......H.|$0
 00000001C004ED10  88 44 24 38 48 FF 15 CD  26 FF FF 0F 1F 44 00 00  .D$8H........D..
 00000001C004ED20  48 8B 1D 81 98 FE FF EB  14 48 8B CB 48 8D 54 24  H.............T$
-00000001C004ED30  20 48 8B 1B E8 0B FF FF  FF 84 C0 74 05 48 3B DE   H...........H;.
+00000001C004ED30  20 48 8B 1B E8 0B FF FF  FF 84 C0 74 05 48 3B DE   H...........H
 00000001C004ED40  75 E7 48 8D 0D 77 98 FE  FF 48 FF 15 A0 26 FF FF  u....w...H...&..
 00000001C004ED50  0F 1F 44 00 00 48 8D 4C  24 40 48 FF 15 A7 26 FF  ..D..H.L$@H...&.
 00000001C004ED60  FF 0F 1F 44 00 00 8A 44  24 50 EB 02 32 C0 48 8B  ...D...D$P......
@@ -481,7 +481,7 @@
 00000001C004EEF0  48 89 44 24 30 4C 8D 05  44 FA FD FF 48 8D 44 24  H.D$0L..D...H.D$
 00000001C004EF00  40 48 8D 15 98 F9 FD FF  48 89 44 24 20 48 8D 0D  @H......H.D$ H..
 00000001C004EF10  F4 FA FD FF E8 53 4B 01  00 8B D8 85 C0 78 07 83  ..........؅ ....
-00000001C004EF20  7C 24 40 01 74 3B 48 8D  44 24 44 48 89 44 24 30  |$@.t;H.D$DH.D$0
+00000001C004EF20  7C 24 40 01 74 3B 48 8D  44 24 44 48 89 44 24 30  |$@.t
 00000001C004EF30  4C 8D 05 09 FA FD FF 48  8D 44 24 40 48 8D 15 4D  L......H.D$@H..M
 00000001C004EF40  FA FD FF 48 89 44 24 20  48 8D 0D 99 FB FD FF E8  ...H.D$ H.......
 00000001C004EF50  18 4B 01 00 8B D8 85 C0  78 0A 83 7C 24 40 01 75  .K...؅ ....|$@.u
@@ -564,8 +564,8 @@
 00000001C004F420  24 20 7C 1A 48 3B DE 77  15 48 2B DF 8B C2 48 3B  $ |.H;...H+ߋ ..;
 00000001C004F430  D8 76 16 B9 7B 00 00 C0  89 4C 24 20 EB 35 B9 7B  ....{....L$ ...{
 00000001C004F440  00 00 C0 89 4C 24 20 EB  2A 4D 89 04 24 4D 85 F6  ....L$ .....$M..
-00000001C004F450  74 03 41 89 16 EB 1C B9  7B 00 00 C0 89 4C 24 20  t.A.....{....L$ 
-00000001C004F460  EB 11 B9 7B 00 00 C0 89  4C 24 20 EB 06 8B C8 89  ...{....L$ ...ȉ 
+00000001C004F450  74 03 41 89 16 EB 1C B9  7B 00 00 C0 89 4C 24 20  t.A.....{....L$
+00000001C004F460  EB 11 B9 7B 00 00 C0 89  4C 24 20 EB 06 8B C8 89  ...{....L$ ...ȉ
 00000001C004F470  44 24 20 8B C1 48 8B 5C  24 68 48 8B 74 24 70 48  D$ ....\$hH.t$pH
 00000001C004F480  83 C4 30 41 5F 41 5E 41  5D 41 5C 5F C3 CC CC CC  ...A_A^A]A\_....
 00000001C004F490  CC CC CC CC 48 89 5C 24  08 48 89 6C 24 10 48 89  ....H.\$.H.l$.H.
@@ -600,12 +600,6 @@
 00000001C004F660  FF 74 1B BA 43 49 73 63  48 8B CF 48 FF 15 DE 1A  .t..CIscH.......
 00000001C004F670  FF FF 0F 1F 44 00 00 EB  05 BB 95 00 00 C0 4C 8D  ....D...........
 00000001C004F680  5C 24 50 8B C3 49 8B 5B  30 49 8B 6B 38 49 8B 73  \$P....[0I.k8I.s
-
-
-
-
-
-
 
 
 00000001C004EC20  8B 4D E0 E8 8C C7 FB FF  48 8B 5C 24 70 8B C7 48  .M......H.\$p...
@@ -718,44 +712,44 @@
 00000001C004F2D0  41 56 41 57 48 83 EC 30  4D 8B F1 4D 8B E0 44 8B  AVAWH.........D.
 00000001C004F2E0  FA 48 8B F9 45 33 ED 4D  89 6B 08 44 8B C2 49 8D  .H..E3...k.D....
 00000001C004F2F0  04 0F 48 83 CB FF 48 8B  F3 48 3B C1 48 0F 43 F0  ..H...H.....H.C.
-00000001C004F300  1B C9 81 E1 95 00 00 C0  48 3B C7 0F 82 62 01 00  .Ɂ ......;...b..
+00000001C004F300  1B C9 81 E1 95 00 00 C0  48 3B C7 0F 82 62 01 00  .Ɂ ......
 00000001C004F310  00 4D 8D 4B 08 48 8B D7  33 C9 48 FF 15 07 21 FF  .M.K.H........!.
 00000001C004F320  FF 0F 1F 44 00 00 8B C8  89 44 24 20 85 C0 0F 88  ...D...ȉ D$ ....
 00000001C004F330  3F 01 00 00 4C 8B 44 24  60 45 0F B7 48 14 49 8D  ?...L.D$`E..H.I.
-00000001C004F340  50 18 4A 8D 04 0A 4C 8B  DB 48 3B C2 4C 0F 43 D8  P.J...L...;...C.
+00000001C004F340  50 18 4A 8D 04 0A 4C 8B  DB 48 3B C2 4C 0F 43 D8  P.J...L...
 00000001C004F350  1B C9 81 E1 95 00 00 C0  89 4C 24 20 0F 8C 00 01  .Ɂ ......L$ ....
-00000001C004F360  00 00 4C 3B DE 0F 87 F7  00 00 00 41 83 F9 1A 0F  ..L;.......A....
-00000001C004F370  82 ED 00 00 00 0F B7 02  BA 0B 02 00 00 66 3B C2  .............f;.
-00000001C004F380  75 19 B8 B0 00 00 00 66  44 3B C8 73 33 B9 7B 00  u......fD;..3.{.
+00000001C004F360  00 00 4C 3B DE 0F 87 F7  00 00 00 41 83 F9 1A 0F  ..L
+00000001C004F370  82 ED 00 00 00 0F B7 02  BA 0B 02 00 00 66 3B C2  .............f
+00000001C004F380  75 19 B8 B0 00 00 00 66  44 3B C8 73 33 B9 7B 00  u......fD
 00000001C004F390  00 C0 89 4C 24 20 E9 D8  00 00 00 BA 0B 01 00 00  ...L$ ..........
-00000001C004F3A0  66 3B C2 0F 85 AE 00 00  00 8D 42 95 66 44 3B C8  f;........B.fD;.
+00000001C004F3A0  66 3B C2 0F 85 AE 00 00  00 8D 42 95 66 44 3B C8  f
 00000001C004F3B0  73 0E B9 7B 00 00 C0 89  4C 24 20 E9 B3 00 00 00  s..{....L$ .....
-00000001C004F3C0  41 8B 50 54 41 3B D7 76  0E B9 06 02 00 C0 89 4C  A.PTA;.........L
+00000001C004F3C0  41 8B 50 54 41 3B D7 76  0E B9 06 02 00 C0 89 4C  A.PTA
 00000001C004F3D0  24 20 E9 9C 00 00 00 41  0F B7 40 06 66 85 C0 74  $ .....A..@.f...
-00000001C004F3E0  68 4D 8D 50 18 4D 03 D1  4D 3B D3 73 0B B9 7B 00  hM.P.M...;....{.
+00000001C004F3E0  68 4D 8D 50 18 4D 03 D1  4D 3B D3 73 0B B9 7B 00  hM.P.M...
 00000001C004F3F0  00 C0 89 4C 24 20 EB 7B  48 8D 0C 80 48 C1 E1 03  ...L$ ......H...
 00000001C004F400  48 89 4C 24 28 44 89 6C  24 20 8B C9 49 03 CA 49  H.L$(D.l$ ......
-00000001C004F410  3B CA 48 0F 43 D9 1B C9  81 E1 95 00 00 C0 89 4C  ;...C..Ɂ ......L
-00000001C004F420  24 20 7C 1A 48 3B DE 77  15 48 2B DF 8B C2 48 3B  $ |.H;...H+ߋ ..;
+00000001C004F410  3B CA 48 0F 43 D9 1B C9  81 E1 95 00 00 C0 89 4C
+00000001C004F420  24 20 7C 1A 48 3B DE 77  15 48 2B DF 8B C2 48 3B  $ |.H
 00000001C004F430  D8 76 16 B9 7B 00 00 C0  89 4C 24 20 EB 35 B9 7B  ....{....L$ ...{
 00000001C004F440  00 00 C0 89 4C 24 20 EB  2A 4D 89 04 24 4D 85 F6  ....L$ .....$M..
-00000001C004F450  74 03 41 89 16 EB 1C B9  7B 00 00 C0 89 4C 24 20  t.A.....{....L$ 
-00000001C004F460  EB 11 B9 7B 00 00 C0 89  4C 24 20 EB 06 8B C8 89  ...{....L$ ...ȉ 
+00000001C004F450  74 03 41 89 16 EB 1C B9  7B 00 00 C0 89 4C 24 20  t.A.....{....L$
+00000001C004F460  EB 11 B9 7B 00 00 C0 89  4C 24 20 EB 06 8B C8 89  ...{....L$ ...ȉ
 00000001C004F470  44 24 20 8B C1 48 8B 5C  24 68 48 8B 74 24 70 48  D$ ....\$hH.t$pH
 00000001C004F480  83 C4 30 41 5F 41 5E 41  5D 41 5C 5F C3 CC CC CC  ...A_A^A]A\_....
 00000001C004F490  CC CC CC CC 48 89 5C 24  08 48 89 6C 24 10 48 89  ....H.\$.H.l$.H.
 00000001C004F4A0  74 24 18 57 41 54 41 55  41 56 41 57 48 83 EC 50  t$.WATAUAVAWH...
 00000001C004F4B0  45 8B F9 4D 8B E8 8B DA  41 F7 C1 FF 0F 00 00 74  E..M....A......t
-00000001C004F4C0  0A BB 7B 00 00 C0 E9 B3  01 00 00 41 3B DF 77 F1  ..{........A;...
+00000001C004F4C0  0A BB 7B 00 00 C0 E9 B3  01 00 00 41 3B DF 77 F1  ..{........A
 00000001C004F4D0  8D AA FF 0F 00 00 41 BA  00 F0 FF FF 41 23 EA 3B  ......A......#..
 00000001C004F4E0  EB 0F 82 92 01 00 00 44  0F B7 49 06 45 33 C0 0F  .......D..I.E3..
 00000001C004F4F0  B7 41 14 8B F5 C1 EE 0C  45 8D 70 01 45 85 C9 74  .A......E.p.E...
 00000001C004F500  36 48 8D 51 28 48 03 D0  8B 02 8D 88 FF 0F 00 00  6H.Q(H.Ћ .......
 00000001C004F510  41 23 CA 3B C8 0F 82 5E  01 00 00 C1 E9 0C 8D 04  A#.....^........
-00000001C004F520  31 3B C6 0F 82 50 01 00  00 45 03 C6 48 83 C2 28  1;...P...E......
+00000001C004F520  31 3B C6 0F 82 50 01 00  00 45 03 C6 48 83 C2 28  1
 00000001C004F530  8B F0 45 3B C1 72 D1 8B  C6 48 8D 0C C0 B8 FF FF  .....rы ........
-00000001C004F540  FF FF 48 C1 E1 02 48 3B  C8 0F 87 2A 01 00 00 8D  ..H...H;...*....
-00000001C004F550  41 68 3B C1 0F 82 1F 01  00 00 8B D0 41 B8 43 49  Ah;...........CI
+00000001C004F540  FF FF 48 C1 E1 02 48 3B  C8 0F 87 2A 01 00 00 8D  ..H...H
+00000001C004F550  41 68 3B C1 0F 82 1F 01  00 00 8B D0 41 B8 43 49  Ah
 00000001C004F560  73 63 41 8B CE 48 FF 15  BC 1B FF FF 0F 1F 44 00  scA...........D.
 00000001C004F570  00 48 8B F8 48 85 C0 75  0A BB 17 00 00 C0 E9 FB  .H..H...........
 00000001C004F580  00 00 00 33 D2 48 8B CF  44 8D 42 68 E8 EF B7 FD  ...3......Bh....
@@ -781,8 +775,8 @@
 00000001C004F6C0  41 55 41 56 41 57 48 83  EC 30 44 8B 94 24 90 00  AUAVAWH......$..
 00000001C004F6D0  00 00 33 DB 41 8B 30 4C  8B C1 8B FB 41 F7 C2 FF  ..3...0L....A...
 00000001C004F6E0  0F 00 00 74 0A BB 7B 00  00 C0 E9 DE 01 00 00 41  ...t..{........A
-00000001C004F6F0  C1 EA 0C 41 8D 2C 32 3B  EE 0F 82 C9 01 00 00 3B  ...A.,2;.......;
-00000001C004F700  EA 77 E2 83 FD 01 0F 87  A5 00 00 00 3B F5 73 55  ............;...
+00000001C004F6F0  C1 EA 0C 41 8D 2C 32 3B  EE 0F 82 C9 01 00 00 3B  ...A.,2
+00000001C004F700  EA 77 E2 83 FD 01 0F 87  A5 00 00 00 3B F5 73 55  ............
 00000001C004F710  44 8B BC 24 98 00 00 00  48 8D 0C F6 4D 8D 34 88  D..$....H.......
 00000001C004F720  45 8B EA 49 8D 6E 04 41  03 F2 41 BC 00 10 00 00  E....n.A........
 00000001C004F730  4C 8B C5 49 8B D4 49 8B  C9 E8 EE 5D FB FF 4C 8B  L.............L.
@@ -791,15 +785,15 @@
 00000001C004F760  83 ED 01 75 CB 48 8B 84  24 80 00 00 00 89 30 48  ........$.....0H
 00000001C004F770  85 FF 0F 84 55 01 00 00  48 2B 3D E9 8F FE FF 48  ....U...H+=....H
 00000001C004F780  B8 D1 47 45 B2 63 96 12  36 48 F7 EF 48 C1 FA 0A  ...E.c..6H......
-00000001C004F790  48 8B C2 48 C1 E8 3F 48  03 D0 F0 0F AB 15 CE 8F  H.....?H......Ώ 
+00000001C004F790  48 8B C2 48 C1 E8 3F 48  03 D0 F0 0F AB 15 CE 8F  H.....?H......Ώ
 00000001C004F7A0  FE FF E9 26 01 00 00 F0  0F B3 0D C1 8F FE FF 72  ...............r
 00000001C004F7B0  14 8B 05 B9 8F FE FF 0F  BC C8 89 8C 24 90 00 00  .........ȉ .$...
 00000001C004F7C0  00 75 E4 EB 15 8B 84 24  90 00 00 00 48 69 F8 F0  .u.....$....Hi..
 00000001C004F7D0  12 00 00 48 03 3D 8E 8F  FE FF 48 85 FF 0F 84 29  ...H.=....H....)
-00000001C004F7E0  FF FF FF 3B F5 0F 83 7A  FF FF FF 44 8B AC 24 98  ...;.......D..$.
+00000001C004F7E0  FF FF FF 3B F5 0F 83 7A  FF FF FF 44 8B AC 24 98  ...
 00000001C004F7F0  00 00 00 4C 8D 97 80 07  00 00 4C 8D 9F 00 05 00  ...L......L.....
 00000001C004F800  00 41 BC 00 10 00 00 41  BE 08 00 00 00 8B C5 2B  .A.....A........
-00000001C004F810  C6 8B D3 41 3B C6 44 0F  42 F0 45 85 F6 74 2F 8D  Ƌ ..;...B....t/.
+00000001C004F810  C6 8B D3 41 3B C6 44 0F  42 F0 45 85 F6 74 2F 8D  Ƌ ..
 00000001C004F820  04 12 48 8D 04 80 4C 89  8C C7 10 05 00 00 8D 04  ..H...L.........
 00000001C004F830  16 48 8D 04 C0 4D 03 CC  45 89 2C 80 FF C2 45 03  .H........,.....
 00000001C004F840  EC 41 3B D6 72 D9 4C 89  8C 24 88 00 00 00 47 8D  .........$....G.
@@ -809,40 +803,40 @@
 00000001C004F880  8B D7 0F 10 02 48 8D 0C  F6 FF C6 48 8D 52 20 41  .....H.......R A
 00000001C004F890  0F 11 44 88 04 0F 10 4A  F0 41 0F 11 4C 88 14 49  ..D....J....L..I
 00000001C004F8A0  83 EF 01 75 DD 4C 8B 8C  24 88 00 00 00 4C 8D 97  ........$....L..
-00000001C004F8B0  80 07 00 00 4C 8D 9F 00  05 00 00 3B F5 0F 82 44  ....L......;....
+00000001C004F8B0  80 07 00 00 4C 8D 9F 00  05 00 00 3B F5 0F 82 44  ....L......
 00000001C004F8C0  FF FF FF E9 9D FE FF FF  BB 95 00 00 C0 8B C3 48  ................
 00000001C004F8D0  8B 5C 24 78 48 83 C4 30  41 5F 41 5E 41 5D 41 5C  .\$xH...A_A^A]A\
 00000001C004F8E0  5F 5E 5D C3 CC CC CC CC  CC CC CC CC 48 8B C4 48  _^].............
 00000001C004F8F0  89 58 08 48 89 68 10 48  89 70 18 48 89 78 20 41  .X.H.h.H.p.H.x A
 00000001C004F900  54 41 56 41 57 48 83 EC  20 33 DB 44 8B FA 48 8B  TAVAWH........H.
 00000001C004F910  E9 4D 8B E0 44 8B CB 8B  CB 85 D2 74 1E 48 8D 45  ......ˋ ˅ ...H.E
-00000001C004F920  14 39 58 FC 74 0A 8B 10  41 3B D1 72 33 44 8B CA  .9X.t...A;..3D..
-00000001C004F930  FF C1 48 83 C0 28 41 3B  CF 72 E6 49 89 18 48 8B  ......A;......H.
+00000001C004F920  14 39 58 FC 74 0A 8B 10  41 3B D1 72 33 44 8B CA  .9X.t...A
+00000001C004F930  FF C1 48 83 C0 28 41 3B  CF 72 E6 49 89 18 48 8B  ......A
 00000001C004F940  6C 24 48 8B C3 48 8B 5C  24 40 48 8B 74 24 50 48  l$H....\$@H.t$PH
 00000001C004F950  8B 7C 24 58 48 83 C4 20  41 5F 41 5E 41 5C C3 CC  .|$XH...A_A^A\..
 00000001C004F960  4B 8D 14 BF B9 01 00 00  00 48 C1 E2 03 41 B8 43  K........H...A.C
 00000001C004F970  49 73 63 48 FF 15 AE 17  FF FF 0F 1F 44 00 00 48  IscH........D..H
 00000001C004F980  8B F0 48 85 C0 75 07 BB  17 00 00 C0 EB B0 8B FB  .....u..........
 00000001C004F990  44 8B CF 85 FF 74 50 8B  55 14 45 8B C1 41 FF C9  D.υ .tP.U.E.....
-00000001C004F9A0  4B 8D 0C 89 8B 44 CE 14  3B C2 72 07 45 85 C9 75  K....D..;...E...
-00000001C004F9B0  E9 3B C2 45 0F 42 C8 44  3B CF 74 2B 8B C7 45 8B  ...E.B..;..+....
+00000001C004F9A0  4B 8D 0C 89 8B 44 CE 14  3B C2 72 07 45 85 C9 75  K....D..
+00000001C004F9B0  E9 3B C2 45 0F 42 C8 44  3B CF 74 2B 8B C7 45 8B  ...E.B..
 00000001C004F9C0  F1 41 2B C1 4C 8D 04 80  4B 8D 04 89 49 C1 E0 03  ....L...K...I...
 00000001C004F9D0  48 8D 14 C6 41 8D 41 01  48 8D 04 80 48 8D 0C C6  H.....A.H...H...
 00000001C004F9E0  E8 DB B0 FD FF EB 03 45  8B F1 0F 10 45 00 4B 8D  ..............K.
 00000001C004F9F0  04 B6 FF C7 0F 11 04 C6  0F 10 4D 10 0F 11 4C C6  ..........M...L.
 00000001C004FA00  10 F2 0F 10 45 20 48 83  C5 28 F2 0F 11 44 C6 20  ..... H.........
-00000001C004FA10  41 3B FF 0F 82 77 FF FF  FF 49 89 34 24 E9 1C FF  A;...w...I.4$...
+00000001C004FA10  41 3B FF 0F 82 77 FF FF  FF 49 89 34 24 E9 1C FF  A
 00000001C004FA20  FF FF CC CC CC CC CC CC  48 89 5C 24 08 48 89 74  ........H.\$.H.t
 00000001C004FA30  24 10 57 48 83 EC 40 49  8B C1 49 8B F8 48 8B F2  $.WH.........H..
 00000001C004FA40  48 8B D9 4D 85 C0 0F 84  FD 00 00 00 49 F7 C0 FF  H...........I...
 00000001C004FA50  0F 00 00 0F 85 F0 00 00  00 48 85 C0 75 67 E8 59  .........H...g..
 00000001C004FA60  03 00 00 85 C0 74 0A B8  28 04 00 C0 E9 DD 00 00  ........(.......
-00000001C004FA70  00 B9 00 10 00 00 48 3B  F9 0F 86 CF 00 00 00 44  ......H;.......D
+00000001C004FA70  00 B9 00 10 00 00 48 3B  F9 0F 86 CF 00 00 00 44  ......H
 00000001C004FA80  8B 4B 58 48 03 F1 48 2B  F9 4C 03 4B 60 44 8B 43  .KXH.....L.K`D.C
 00000001C004FA90  58 49 8B C1 48 2B 43 60  33 D2 8B 4B 5C 49 83 C1  XI...+C`3ҋ K\I..
 00000001C004FAA0  04 49 F7 F0 44 89 44 24  30 48 8B D7 44 8B 43 50  .I....D$0H....CP
 00000001C004FAB0  48 2B C8 48 89 4C 24 20  48 8B CE E8 A8 00 00 00  H+...L$ H.......
-00000001C004FAC0  E9 89 00 00 00 B9 FF FF  FF FF 48 3B C1 77 98 44  ..........H;...D
+00000001C004FAC0  E9 89 00 00 00 B9 FF FF  FF FF 48 3B C1 77 98 44  ..........H
 00000001C004FAD0  8B 4B 58 44 8B 43 5C 48  8B 53 60 8B C8 48 8D 05  .KXD.C\H.S`.....
 00000001C004FAE0  8C 05 00 00 48 89 44 24  20 48 FF 15 68 18 FF FF  ....H.D$ H..h...
 00000001C004FAF0  0F 1F 44 00 00 4C 8B C8  48 85 C0 75 90 8B 05 CD  ..D..L..........
@@ -856,7 +850,7 @@
 00000001C004FB70  41 56 41 57 48 81 EC 90  00 00 00 48 8B 05 0E 86  AVAWH......H....
 00000001C004FB80  FE FF 48 33 C4 48 89 84  24 80 00 00 00 48 8B F2  ..H3....$....H..
 00000001C004FB90  33 DB 48 C1 EE 0C 49 8B  E9 45 8B F8 4C 8B F1 48  3.....I.....L...
-00000001C004FBA0  3B B4 24 E0 00 00 00 76  45 8B 05 21 96 FE FF A8  ;.$....vE..!....
+00000001C004FBA0  3B B4 24 E0 00 00 00 76  45 8B 05 21 96 FE FF A8
 00000001C004FBB0  01 74 30 48 8B 05 B6 1A  FF FF 38 18 74 25 48 8B  .t0H......8.t%H.
 00000001C004FBC0  05 63 1A FF FF 80 38 01  74 19 BA FF 05 00 00 48  .c....8.t......H
 00000001C004FBD0  8D 0D 7A EF FD FF 48 FF  15 53 18 FF FF 0F 1F 44  ..z...H..S.....D
@@ -866,18 +860,18 @@
 00000001C004FC10  BC C8 89 4C 24 30 75 E7  EB 12 8B 44 24 30 48 69  .ȉ L$0u....D$0Hi
 00000001C004FC20  D8 F0 12 00 00 48 03 1D  3C 8B FE FF 48 85 F6 0F  .....H..<...H...
 00000001C004FC30  84 23 01 00 00 48 85 DB  74 6C 48 83 FE 01 76 66  .#...H...lH...vf
-00000001C004FC40  BF 08 00 00 00 48 3B F7  0F 42 FE 45 33 C0 85 FF  .....H;....E3...
+00000001C004FC40  BF 08 00 00 00 48 3B F7  0F 42 FE 45 33 C0 85 FF  .....H
 00000001C004FC50  74 21 41 8B D0 43 8D 04  00 C1 E2 0C 48 8D 04 80  t!A.........H...
-00000001C004FC60  49 03 D6 41 FF C0 48 89  94 C3 10 05 00 00 44 3B  I.............D;
+00000001C004FC60  49 03 D6 41 FF C0 48 89  94 C3 10 05 00 00 44 3B  I.............D
 00000001C004FC70  C7 72 DF 4C 8D 93 80 07  00 00 8B D7 44 8D 0C 3F  ...............?
 00000001C004FC80  48 C7 44 24 28 6E 0B 00  00 4C 8D 83 00 05 00 00  H..$(n...L......
 00000001C004FC90  4C 89 54 24 20 48 8D 8B  00 01 00 00 E8 F3 40 FB  L.T$ H..........
 00000001C004FCA0  FF 48 8B CB EB 28 41 B9  00 10 00 00 48 8D 44 24  .H...(A.....H.D$
-00000001C004FCB0  40 45 8B C1 48 89 44 24  20 49 8B D6 41 8B CF BF  @E....D$ I....Ͽ 
+00000001C004FCB0  40 45 8B C1 48 89 44 24  20 49 8B D6 41 8B CF BF  @E....D$ I....Ͽ
 00000001C004FCC0  01 00 00 00 E8 BB 9A 01  00 48 8D 4C 24 40 33 D2  ....軚  ..H.L$@3.
-00000001C004FCD0  85 FF 74 2F 48 8B 01 48  3B 45 00 75 38 48 8B 41  ..t/H..H;E.u8H.A
-00000001C004FCE0  08 48 3B 45 08 75 2E 8B  41 10 3B 45 10 75 26 8B  .H;E.u..A.;E.u&.
-00000001C004FCF0  84 24 F0 00 00 00 48 83  C1 20 48 03 E8 FF C2 3B  .$....H...H....;
+00000001C004FCD0  85 FF 74 2F 48 8B 01 48  3B 45 00 75 38 48 8B 41  ..t/H..H
+00000001C004FCE0  08 48 3B 45 08 75 2E 8B  41 10 3B 45 10 75 26 8B  .H
+00000001C004FCF0  84 24 F0 00 00 00 48 83  C1 20 48 03 E8 FF C2 3B  .$....H...H....
 00000001C004FD00  D7 72 D1 8B C7 C1 E7 0C  48 2B F0 8B C7 4C 03 F0  ..ы .....+......
 00000001C004FD10  E9 17 FF FF FF 8B 05 B5  94 FE FF A8 01 74 31 48  .............t1H
 00000001C004FD20  8B 05 4A 19 FF FF 80 38  00 74 25 48 8B 05 F6 18  ..J....8.t%H....
@@ -895,14 +889,14 @@
 00000001C004FDE0  05 AB 83 FE FF 48 33 C4  48 89 85 A0 00 00 00 48  .....H3........H
 00000001C004FDF0  8B 71 60 41 BD 00 10 00  00 44 8B 79 58 4C 8B E2  .q`A.....D.yXL..
 00000001C004FE00  48 8B D9 45 8B 34 37 44  2B 36 44 89 74 24 60 45  H....47D+6D.t$`E
-00000001C004FE10  3B F5 76 38 8B 05 B6 93  FE FF A8 01 0F 84 07 02  ;...............
+00000001C004FE10  3B F5 76 38 8B 05 B6 93  FE FF A8 01 0F 84 07 02
 00000001C004FE20  00 00 48 8B 05 47 18 FF  FF 80 38 00 0F 84 F7 01  ..H..G....8.....
 00000001C004FE30  00 00 48 8B 05 EF 17 FF  FF 80 38 01 0F 84 E7 01  ..H.......8.....
 00000001C004FE40  00 00 BA 93 06 00 00 E9  C9 01 00 00 44 39 29 0F  ............D9).
 00000001C004FE50  87 D9 00 00 00 48 83 64  24 58 00 48 8D 44 24 60  .....H.d$X.H.D$`
 00000001C004FE60  48 83 64 24 50 00 45 8B  CD 44 8B 41 04 8B 49 50  H.d$P.E....A..IP
 00000001C004FE70  48 89 44 24 40 48 8D 45  60 48 83 64 24 38 00 48  H.D$@H.E`H.d$8.H
-00000001C004FE80  83 64 24 30 00 48 83 64  24 28 00 48 89 44 24 20  .d$0.H.d$(.H.D$ 
+00000001C004FE80  83 64 24 30 00 48 83 64  24 28 00 48 89 44 24 20  .d$0.H.d$(.H.D$
 00000001C004FE90  E8 9B A1 01 00 8B D8 85  C0 79 4D 8B 0D 2F 93 FE  蛡  ...؅ ..M../..
 00000001C004FEA0  FF F6 C1 01 0F 84 84 01  00 00 48 8B 0D BF 17 FF  ..........H.....
 00000001C004FEB0  FF 80 39 00 0F 84 74 01  00 00 48 8B 0D 67 17 FF  ..9...t...H..g..
@@ -920,11 +914,11 @@
 00000001C004FF70  41 B8 EC 00 00 00 E8 05  AE FD FF 8B 43 50 48 8D  A...........CPH.
 00000001C004FF80  4C 24 70 33 D2 89 44 24  70 E8 A6 98 01 00 85 C0  L$p3..D$p覘  ....
 00000001C004FF90  78 3C 4D 8B CC 44 89 74  24 20 45 8B C7 48 8D 55  x<M....t$ E....U
-00000001C004FFA0  60 48 8D 4C 24 70 E8 25  9B 01 00 45 3B F5 74 10  `H.L$p.....E;...
+00000001C004FFA0  60 48 8D 4C 24 70 E8 25  9B 01 00 45 3B F5 74 10  `H.L$p.....E
 00000001C004FFB0  45 8B C5 48 8D 4C 24 70  41 8B D6 E8 00 9A 01 00  E....L$pA.......
 00000001C004FFC0  48 8D 55 60 48 8D 4C 24  70 E8 86 99 01 00 48 8B  H.U`H.L$p膙  ..H.
-00000001C004FFD0  45 60 48 3B 46 04 75 16  48 8B 45 68 48 3B 46 0C  E`H;F.u.H.EhH;F.
-00000001C004FFE0  75 0C 8B 45 70 3B 46 14  75 04 33 DB EB 40 8B 05  u..Ep;F.u.3..@..
+00000001C004FFD0  45 60 48 3B 46 04 75 16  48 8B 45 68 48 3B 46 0C  E`H
+00000001C004FFE0  75 0C 8B 45 70 3B 46 14  75 04 33 DB EB 40 8B 05  u..Ep
 00000001C004FFF0  DC 91 FE FF A8 01 74 31  48 8B 05 71 16 FF FF 80  ......t1H..q....
 00000001C0050000  38 00 74 25 48 8B 05 1D  16 FF FF 80 38 01 74 19  8.t%H.......8.t.
 00000001C0050010  BA F4 06 00 00 48 8D 0D  34 EB FD FF 48 FF 15 0D  .....H..4...H...
@@ -948,7 +942,7 @@
 00000001C0050130  CC CC CC CC CC CC CC CC  48 89 5C 24 08 48 89 6C  ........H.\$.H.l
 00000001C0050140  24 10 48 89 74 24 18 57  48 83 EC 20 B9 FF FF 00  $.H.t$.WH.......
 00000001C0050150  00 48 FF 15 E0 12 FF FF  0F 1F 44 00 00 C1 E8 03  .H........D.....
-00000001C0050160  BE 20 00 00 00 83 C0 04  B9 01 00 00 00 3B C6 41  . ...........;..
+00000001C0050160  BE 20 00 00 00 83 C0 04  B9 01 00 00 00 3B C6 41  . ...........
 00000001C0050170  B8 43 49 73 63 0F 42 F0  8B EE 48 69 D5 F0 12 00  .CIsc.B....i....
 00000001C0050180  00 48 FF 15 A0 0F FF FF  0F 1F 44 00 00 33 FF 48  .H........D..3.H
 00000001C0050190  89 05 D2 85 FE FF 48 8B  D8 48 85 C0 75 0A BF 17  ......H.........
@@ -960,7 +954,7 @@
 00000001C00501F0  18 05 00 00 00 10 00 00  8D 42 01 8B C8 48 8D 04  .........B......
 00000001C0050200  80 4C 89 8C C3 00 05 00  00 49 FF C1 48 8D 04 89  .L.......I......
 00000001C0050210  4C 89 94 C3 10 05 00 00  49 83 C2 20 C7 84 C3 08  L.......I...Ǆ ..
-00000001C0050220  05 00 00 02 00 00 00 48  C7 84 C3 18 05 00 00 20  .......HǄ ..... 
+00000001C0050220  05 00 00 02 00 00 00 48  C7 84 C3 18 05 00 00 20  .......HǄ .....
 00000001C0050230  00 00 00 41 83 F8 08 72  91 48 81 C3 F0 12 00 00  ...A...r.H......
 00000001C0050240  48 83 ED 01 0F 85 66 FF  FF FF 8B CE BA 01 00 00  H.....f....κ ...
 00000001C0050250  00 D3 E2 FF CA 89 15 15  85 FE FF 48 8B 5C 24 30  ....ʉ .....H.\$0
@@ -1005,7 +999,7 @@
 00000001C00504C0  00 C0 74 2B 4D 85 FF 74  09 41 83 0F 08 E9 BC 0B  ...+M..t.A......
 00000001C00504D0  00 00 81 FF 23 00 00 C0  0F 85 B0 0B 00 00 41 C7  ....#.........A.
 00000001C00504E0  45 00 02 00 00 00 E9 A3  0B 00 00 48 8B 5D A0 48  E..........H.].H
-00000001C00504F0  8D 45 CC 48 8B CB 4C 8D  4C 24 74 48 89 44 24 20  .E......L$tH.D$ 
+00000001C00504F0  8D 45 CC 48 8B CB 4C 8D  4C 24 74 48 89 44 24 20  .E......L$tH.D$
 00000001C0050500  4C 8D 85 C0 00 00 00 48  8D 55 D0 E8 BC 1D 00 00  L......H.U......
 00000001C0050510  8B F8 85 C0 0F 88 CE 0B  00 00 BB 02 00 00 00 44  ...............D
 00000001C0050520  8B B5 C0 00 00 00 C6 45  89 04 40 38 74 24 74 74  ..........@8t$tt
@@ -1049,7 +1043,7 @@
 00000001C0050780  D4 83 E2 0F 44 0F B6 C0  41 83 E0 0F 88 44 24 75  ԃ ...........D$u
 00000001C0050790  8B 14 91 44 0F A3 C2 73  1F 48 8B 4D 90 BB 02 00  ...D.....H.M....
 00000001C00507A0  00 00 4C 8B 6D 80 88 01  48 8B 45 B8 89 18 33 FF  ..L.m...H.E...3.
-00000001C00507B0  40 8A CF E9 AE 06 00 00  44 8B E3 B9 05 00 00 20  @.......D...... 
+00000001C00507B0  40 8A CF E9 AE 06 00 00  44 8B E3 B9 05 00 00 20  @.......D......
 00000001C00507C0  41 81 E4 00 01 00 00 75  5D F6 C3 04 75 07 41 8D  A......u].....A.
 00000001C00507D0  44 24 02 EB 6B 41 0F BA  E6 1C 72 31 41 0F BA E6  D$.........1A...
 00000001C00507E0  1E 72 23 41 F6 C6 05 74  0C F7 05 DD 89 FE FF 00  .r#A............
@@ -1077,143 +1071,143 @@ __int64 __fastcall CiValidateImageHeader(
         _QWORD *a15,
         _DWORD *a16)
 {
-  _BYTE *v17; // rbx
-  _DWORD *v18; // r15
-  __int64 v19; // rsi
-  char v20; // r12
-  int fixed; // edi
-  char v22; // r12
-  int v23; // ebx
-  int v24; // ebx
-  __int64 v25; // r9
-  unsigned int v26; // r14d
-  struct _FILE_OBJECT *v27; // r13
-  char v28; // cl
-  char v29; // di
-  int ActionsForImage; // ebx
-  int v31; // ecx
-  int v32; // r8d
-  int v33; // ecx
-  int v34; // r15d
-  char v35; // al
-  int v36; // edx
-  int v37; // r12d
-  int v38; // eax
-  int ValidationContext; // eax
-  int v40; // eax
-  int v41; // edx
-  PVOID v42; // rcx
-  bool v43; // zf
-  int v44; // eax
-  int v45; // eax
-  int v46; // eax
-  int v47; // r15d
-  int v48; // r13d
-  __int64 v49; // r8
-  int v50; // ecx
-  __int64 v51; // r12
-  int v52; // ecx
-  int v53; // ebx
-  int v54; // eax
-  int v55; // edx
-  __int64 v56; // r8
-  __int64 v57; // rbx
-  int v58; // r9d
-  __int64 v59; // rax
-  __int64 v60; // rax
-  int v61; // eax
-  int v62; // ecx
-  _DWORD *v63; // rax
-  volatile signed __int32 **v64; // rbx
-  __int64 (__fastcall *v65)(volatile signed __int32 *); // rax
-  int EventDescriptorb; // [rsp+20h] [rbp-E0h]
-  PCEVENT_DESCRIPTOR EventDescriptor; // [rsp+20h] [rbp-E0h]
-  int EventDescriptora; // [rsp+20h] [rbp-E0h]
-  int BaseAddress; // [rsp+28h] [rbp-D8h]
-  int BaseAddressa; // [rsp+28h] [rbp-D8h]
-  ULONGLONG v72; // [rsp+30h] [rbp-D0h]
-  ULONGLONG v73; // [rsp+30h] [rbp-D0h]
-  int v74; // [rsp+38h] [rbp-C8h]
-  int v75; // [rsp+38h] [rbp-C8h]
-  int v76; // [rsp+40h] [rbp-C0h]
-  int v77; // [rsp+40h] [rbp-C0h]
-  int v78; // [rsp+48h] [rbp-B8h]
-  __int64 v79; // [rsp+50h] [rbp-B0h]
-  char v80; // [rsp+60h] [rbp-A0h]
-  char v81; // [rsp+70h] [rbp-90h]
-  char v82; // [rsp+74h] [rbp-8Ch] BYREF
-  char v83[3]; // [rsp+75h] [rbp-8Bh] BYREF
-  int v84; // [rsp+78h] [rbp-88h]
-  PFILE_OBJECT FileObject; // [rsp+80h] [rbp-80h]
-  char v86; // [rsp+88h] [rbp-78h] BYREF
-  char v87; // [rsp+89h] [rbp-77h]
-  _DWORD Size[3]; // [rsp+8Ch] [rbp-74h]
-  __int64 v89; // [rsp+98h] [rbp-68h]
-  PVOID v90; // [rsp+A0h] [rbp-60h]
-  int v91; // [rsp+A8h] [rbp-58h]
-  _DWORD v92[3]; // [rsp+ACh] [rbp-54h] BYREF
-  _DWORD *v93; // [rsp+B8h] [rbp-48h]
-  int v94[2]; // [rsp+C0h] [rbp-40h]
-  __int64 v95; // [rsp+C8h] [rbp-38h] BYREF
-  int v96; // [rsp+D0h] [rbp-30h] BYREF
-  __int64 v97; // [rsp+D8h] [rbp-28h]
-  _DWORD *v98; // [rsp+E0h] [rbp-20h]
-  LARGE_INTEGER v99; // [rsp+E8h] [rbp-18h] BYREF
-  _QWORD *v100; // [rsp+F0h] [rbp-10h]
-  LARGE_INTEGER PerformanceCounter; // [rsp+F8h] [rbp-8h] BYREF
-  _DWORD *v102; // [rsp+100h] [rbp+0h]
-  __int64 v103; // [rsp+108h] [rbp+8h]
-  GUID ActivityId; // [rsp+110h] [rbp+10h] BYREF
-  __int128 v105; // [rsp+120h] [rbp+20h] BYREF
+  _BYTE *v17
+  _DWORD *v18
+  __int64 v19
+  char v20
+  int fixed
+  char v22
+  int v23
+  int v24
+  __int64 v25
+  unsigned int v26
+  struct _FILE_OBJECT *v27
+  char v28
+  char v29
+  int ActionsForImage
+  int v31
+  int v32
+  int v33
+  int v34
+  char v35
+  int v36
+  int v37
+  int v38
+  int ValidationContext
+  int v40
+  int v41
+  PVOID v42
+  bool v43
+  int v44
+  int v45
+  int v46
+  int v47
+  int v48
+  __int64 v49
+  int v50
+  __int64 v51
+  int v52
+  int v53
+  int v54
+  int v55
+  __int64 v56
+  __int64 v57
+  int v58
+  __int64 v59
+  __int64 v60
+  int v61
+  int v62
+  _DWORD *v63
+  volatile signed __int32 **v64
+  __int64 (__fastcall *v65)(volatile signed __int32 *)
+  int EventDescriptorb
+  PCEVENT_DESCRIPTOR EventDescriptor
+  int EventDescriptora
+  int BaseAddress
+  int BaseAddressa
+  ULONGLONG v72
+  ULONGLONG v73
+  int v74
+  int v75
+  int v76
+  int v77
+  int v78
+  __int64 v79
+  char v80
+  char v81
+  char v82
+  char v83[3]
+  int v84
+  PFILE_OBJECT FileObject
+  char v86
+  char v87
+  _DWORD Size[3]
+  __int64 v89
+  PVOID v90
+  int v91
+  _DWORD v92[3]
+  _DWORD *v93
+  int v94[2]
+  __int64 v95
+  int v96
+  __int64 v97
+  _DWORD *v98
+  LARGE_INTEGER v99
+  _QWORD *v100
+  LARGE_INTEGER PerformanceCounter
+  _DWORD *v102
+  __int64 v103
+  GUID ActivityId
+  __int128 v105
 
-  v17 = a13;
-  v97 = a8;
-  v93 = a14;
-  v100 = a15;
-  FileObject = a1;
-  v98 = a16;
-  v90 = a2;
-  *(_QWORD *)v94 = a10;
-  v102 = (_DWORD *)*a10;
-  v18 = v102;
-  v99 = a4;
-  Size[0] = a3;
-  v19 = 0;
-  *(_QWORD *)&Size[1] = a13;
-  v20 = 0;
-  LOBYTE(v91) = 0;
-  v96 = 0;
-  v82 = 0;
-  v105 = 0;
-  v89 = 0;
-  v84 = -1073740760;
-  memset(v92, 0, sizeof(v92));
-  ActivityId = 0;
-  v95 = 0;
-  v80 = 0;
-  EtwActivityIdControl(3u, &ActivityId);
-  v103 = IoSetActivityIdThread(&ActivityId);
-  KeEnterCriticalRegion();
-  ExAcquirePushLockSharedEx(&g_CipPolicyLock, 0);
-  PerformanceCounter = KeQueryPerformanceCounter(0);
-  *v17 = 1;
-  fixed = CiInitializePhase2();
+  v17 = a13
+  v97 = a8
+  v93 = a14
+  v100 = a15
+  FileObject = a1
+  v98 = a16
+  v90 = a2
+  *(_QWORD *)v94 = a10
+  v102 = (_DWORD *)*a10
+  v18 = v102
+  v99 = a4
+  Size[0] = a3
+  v19 = 0
+  *(_QWORD *)&Size[1] = a13
+  v20 = 0
+  LOBYTE(v91) = 0
+  v96 = 0
+  v82 = 0
+  v105 = 0
+  v89 = 0
+  v84 = -1073740760
+  memset(v92, 0, sizeof(v92))
+  ActivityId = 0
+  v95 = 0
+  v80 = 0
+  EtwActivityIdControl(3u, &ActivityId)
+  v103 = IoSetActivityIdThread(&ActivityId)
+  KeEnterCriticalRegion()
+  ExAcquirePushLockSharedEx(&g_CipPolicyLock, 0)
+  PerformanceCounter = KeQueryPerformanceCounter(0)
+  *v17 = 1
+  fixed = CiInitializePhase2()
   if ( fixed < 0 )
-    goto LABEL_198;
-  v22 = a11;
-  v23 = a9;
-  v81 = a11;
-  CiLogFileRequestedValidationEvent((_DWORD)a1 + 88, &CiValidateImageHeaderStart);
+    goto LABEL_198
+  v22 = a11
+  v23 = a9
+  v81 = a11
+  CiLogFileRequestedValidationEvent((_DWORD)a1 + 88, &CiValidateImageHeaderStart)
   if ( v18 && (*v18 & 8) == 0 )
   {
-    v24 = (int)v90;
+    v24 = (int)v90
   }
   else
   {
-    ExReleasePushLockSharedEx(&g_CipPolicyLock, 0);
-    KeLeaveCriticalRegion();
-    EventDescriptorb = v23;
-    v24 = (int)v90;
+    ExReleasePushLockSharedEx(&g_CipPolicyLock, 0)
+    KeLeaveCriticalRegion()
+    EventDescriptorb = v23
+    v24 = (int)v90
     fixed = XciValidateImageHeader(
               a1,
               v90,
@@ -1225,53 +1219,53 @@ __int64 __fastcall CiValidateImageHeader(
               *(_QWORD *)&Size[1],
               v93,
               v100,
-              v98);
-    KeEnterCriticalRegion();
-    ExAcquirePushLockSharedEx(&g_CipPolicyLock, 0);
+              v98)
+    KeEnterCriticalRegion()
+    ExAcquirePushLockSharedEx(&g_CipPolicyLock, 0)
     if ( v18 )
-      goto LABEL_191;
-    v18 = **(_DWORD ***)v94;
+      goto LABEL_191
+    v18 = **(_DWORD ***)v94
     if ( fixed != -1073700607 && fixed != -1073741637 )
     {
       if ( v18 )
       {
-        *v18 |= 8u;
+        *v18 |= 8u
       }
       else if ( fixed == -1073741789 )
       {
-        *a6 = 2;
+        *a6 = 2
       }
-      goto LABEL_191;
+      goto LABEL_191
     }
   }
-  fixed = CipFixImageType(v24, (unsigned int)&v96, (unsigned int)&a9, (unsigned int)&v82, (__int64)&v95 + 4);
+  fixed = CipFixImageType(v24, (unsigned int)&v96, (unsigned int)&a9, (unsigned int)&v82, (__int64)&v95 + 4)
   if ( fixed < 0 )
   {
 LABEL_197:
-    v20 = 1;
-    goto LABEL_198;
+    v20 = 1
+    goto LABEL_198
   }
-  v26 = a9;
-  v87 = 4;
+  v26 = a9
+  v87 = 4
   if ( v82 && ((a9 & 8) != 0 || (a9 & 0xE5DFFF97) == 0 && (PsGetProcessProtection(a7) & 7) == 1) )
   {
-    LODWORD(v27) = (_DWORD)FileObject;
-    v28 = 1;
-    v80 = 1;
+    LODWORD(v27) = (_DWORD)FileObject
+    v28 = 1
+    v80 = 1
 LABEL_153:
-    v34 = a7;
-    goto LABEL_154;
+    v34 = a7
+    goto LABEL_154
   }
-  v29 = v22;
+  v29 = v22
   if ( (v26 & 0xE5DFFF87) == 0 && !v22 )
   {
-    v29 = 0;
+    v29 = 0
     if ( (*((unsigned __int8 (**)(void))&xmmword_1C0039390 + 1))() == 2 )
-      v29 = 2;
-    v81 = v29;
+      v29 = 2
+    v81 = v29
   }
-  LOBYTE(v25) = v29;
-  ActionsForImage = CiGetActionsForImage(a7, FileObject, v26, v25);
+  LOBYTE(v25) = v29
+  ActionsForImage = CiGetActionsForImage(a7, FileObject, v26, v25)
   if ( (ActionsForImage & 1) != 0 )
   {
     fixed = CipValidateFileInCache(
@@ -1283,7 +1277,7 @@ LABEL_153:
               (__int64)&v92[1],
               (__int64)&v95,
               *(__int64 *)&Size[1],
-              (__int64)v92);
+              (__int64)v92)
     if ( fixed >= 0 )
     {
       if ( (ActionsForImage & 0x10) == 0
@@ -1297,55 +1291,55 @@ LABEL_153:
             || (unsigned int)PsIsProtectedProcess(a7)
             && (v33 = *((_DWORD *)g_CipWhichLevelComparisons + 12), !_bittest(&v33, **(_BYTE **)&Size[1] & 0xF)) )
           {
-            v27 = FileObject;
-            v22 = v81;
-            *v93 = 2;
+            v27 = FileObject
+            v22 = v81
+            *v93 = 2
             if ( (g_CiDeveloperMode & 0x20000) != 0 )
             {
-              LODWORD(v72) = Size[0];
-              LOBYTE(v32) = v81;
-              v34 = a7;
-              CiAuditImageForHvci(0, v26, v32, a7, v27, v90, v72);
-              v28 = 0;
-              v19 = *(_QWORD *)&v92[1];
+              LODWORD(v72) = Size[0]
+              LOBYTE(v32) = v81
+              v34 = a7
+              CiAuditImageForHvci(0, v26, v32, a7, v27, v90, v72)
+              v28 = 0
+              v19 = *(_QWORD *)&v92[1]
 LABEL_154:
               if ( v82 )
               {
                 if ( ((fixed + 1073741793) & 0xFFFFFFFB) != 0 )
                 {
-                  CipReportSharedSectionFailure(v34, (_DWORD)v27, v26, fixed, v28);
+                  CipReportSharedSectionFailure(v34, (_DWORD)v27, v26, fixed, v28)
                   if ( v80 )
                   {
-                    fixed = -1073741701;
-                    goto LABEL_197;
+                    fixed = -1073741701
+                    goto LABEL_197
                   }
                 }
               }
               if ( !v19 )
-                goto LABEL_191;
+                goto LABEL_191
               if ( (v26 & 0xE5DFFF87) != 0 && (v26 & 0x20000000) == 0 )
               {
                 if ( fixed >= 0 )
-                  goto LABEL_184;
+                  goto LABEL_184
                 if ( fixed == -1073740760
                   || fixed == -1073740285
                   || fixed == -1058471934
                   || fixed == -1073740283
                   || fixed == -1058340861 )
                 {
-                  fixed = CipReportAndReprieveDriverAndProtectedImageFailure(v19, v34, (_DWORD)v27, v26, v22, fixed);
+                  fixed = CipReportAndReprieveDriverAndProtectedImageFailure(v19, v34, (_DWORD)v27, v26, v22, fixed)
                   if ( fixed >= 0 )
                   {
 LABEL_181:
-                    *v93 = 0;
-                    goto LABEL_182;
+                    *v93 = 0
+                    goto LABEL_182
                   }
-                  goto LABEL_183;
+                  goto LABEL_183
                 }
 LABEL_182:
                 if ( fixed >= 0 )
-                  goto LABEL_184;
-                goto LABEL_183;
+                  goto LABEL_184
+                goto LABEL_183
               }
               if ( fixed < 0 )
               {
@@ -1356,20 +1350,20 @@ LABEL_182:
                   && fixed != -1058340861
                   && fixed != -1073741701 )
                 {
-                  goto LABEL_182;
+                  goto LABEL_182
                 }
               }
               else
               {
-                v62 = *((_DWORD *)g_CipWhichLevelComparisons + (v22 & 0xF));
+                v62 = *((_DWORD *)g_CipWhichLevelComparisons + (v22 & 0xF))
                 if ( _bittest(&v62, **(_BYTE **)&Size[1] & 0xF) )
                 {
 LABEL_184:
                   if ( (*(_DWORD *)(v19 + 1504) & 2) != 0 )
                   {
-                    v99 = KeQueryPerformanceCounter(0);
+                    v99 = KeQueryPerformanceCounter(0)
                     if ( (unsigned __int8)v22 >= 2u || *(_DWORD *)(v19 + 1480) )
-                      v87 = v22;
+                      v87 = v22
                     CipProcessSIPolicyLogs(
                       v19,
                       (_DWORD)v27,
@@ -1379,20 +1373,20 @@ LABEL_184:
                       v87,
                       **(_BYTE **)&Size[1],
                       (__int64)v90,
-                      Size[0]);
+                      Size[0])
                     if ( (*(_DWORD *)(v19 + 1504) & 1) == 0
                       && *(__int64 (__fastcall ***)())(v19 + 1800) != &off_1C002B000 )
                     {
-                      CiInstrumentVbsPolicyFailure(v19);
+                      CiInstrumentVbsPolicyFailure(v19)
                     }
                   }
-                  goto LABEL_191;
+                  goto LABEL_191
                 }
               }
-              v83[0] = 1;
-              v86 = 0;
-              LOBYTE(v72) = **(_BYTE **)&Size[1];
-              LOBYTE(BaseAddress) = v22;
+              v83[0] = 1
+              v86 = 0
+              LOBYTE(v72) = **(_BYTE **)&Size[1]
+              LOBYTE(BaseAddress) = v22
               fixed = CipReportAndReprieveUMCIFailure(
                         v19,
                         v34,
@@ -1403,29 +1397,29 @@ LABEL_184:
                         v72,
                         fixed,
                         (__int64)&v86,
-                        (__int64)v83);
+                        (__int64)v83)
               if ( fixed >= 0 )
               {
                 if ( !v86 )
-                  goto LABEL_182;
-                **(_BYTE **)&Size[1] = v83[0];
-                goto LABEL_181;
+                  goto LABEL_182
+                **(_BYTE **)&Size[1] = v83[0]
+                goto LABEL_181
               }
 LABEL_183:
-              CiBlackboxValidateImageHeaderFailure(v19, v34, (_DWORD)v27, v26, v22, fixed);
-              goto LABEL_184;
+              CiBlackboxValidateImageHeaderFailure(v19, v34, (_DWORD)v27, v26, v22, fixed)
+              goto LABEL_184
             }
-            v19 = *(_QWORD *)&v92[1];
-            goto LABEL_152;
+            v19 = *(_QWORD *)&v92[1]
+            goto LABEL_152
           }
         }
       }
     }
-    v19 = *(_QWORD *)&v92[1];
+    v19 = *(_QWORD *)&v92[1]
     if ( *(_QWORD *)&v92[1] && fixed == -1073741267 )
       ActionsForImage ^= ((unsigned __int16)ActionsForImage
                         ^ (unsigned __int16)*(_DWORD *)(*(_QWORD *)&v92[1] + 1816LL))
-                       & 0x100;
+                       & 0x100
   }
   if ( (ActionsForImage & 0x40) != 0 )
   {
@@ -1436,23 +1430,23 @@ LABEL_183:
         && (g_CiPolicyState & 0x40) == 0
         && (g_CiPolicyState & 0x80u) == 0 )
       {
-        v35 = ((__int64 (__fastcall *)(PFILE_OBJECT))xmmword_1C0039390)(FileObject);
-        v22 = v81;
-        v83[0] = v35;
-        v36 = *((_DWORD *)g_CipWhichLevelComparisons + (v81 & 0xF));
+        v35 = ((__int64 (__fastcall *)(PFILE_OBJECT))xmmword_1C0039390)(FileObject)
+        v22 = v81
+        v83[0] = v35
+        v36 = *((_DWORD *)g_CipWhichLevelComparisons + (v81 & 0xF))
         if ( _bittest(&v36, v35 & 0xF) )
         {
-          LODWORD(v27) = (_DWORD)FileObject;
-          **(_BYTE **)&Size[1] = v35;
-          *v93 = 2;
-          goto LABEL_47;
+          LODWORD(v27) = (_DWORD)FileObject
+          **(_BYTE **)&Size[1] = v35
+          *v93 = 2
+          goto LABEL_47
         }
       }
     }
   }
-  v37 = ActionsForImage & 0x100;
+  v37 = ActionsForImage & 0x100
   if ( (ActionsForImage & 0x100) != 0 )
-    goto LABEL_61;
+    goto LABEL_61
   if ( (ActionsForImage & 4) != 0 )
   {
     if ( (v26 & 0x10000000) == 0
@@ -1460,35 +1454,35 @@ LABEL_183:
        || (v26 & 5) != 0 && (g_CiOptions & 0x8000) != 0
        || (g_CiOptions & 0x4000) != 0 && (v26 & 0x20000005) == 0) )
     {
-      v38 = 1;
-      goto LABEL_65;
+      v38 = 1
+      goto LABEL_65
     }
     if ( (v26 & 5) != 0 && (g_CiPolicyState & 1) != 0 )
     {
 LABEL_60:
-      v38 = 1;
-      goto LABEL_65;
+      v38 = 1
+      goto LABEL_65
     }
 LABEL_61:
     if ( (v26 & 0x20000005) != 0 || (g_CiPolicyState & 2) == 0 && (ActionsForImage & 0x40) == 0 )
     {
-      v38 = 0;
-      goto LABEL_65;
+      v38 = 0
+      goto LABEL_65
     }
-    goto LABEL_60;
+    goto LABEL_60
   }
-  v38 = v37 + 2;
+  v38 = v37 + 2
 LABEL_65:
   if ( v38 > *a6 )
   {
-    *a6 = v38;
+    *a6 = v38
 LABEL_67:
-    fixed = -1073741789;
-    goto LABEL_197;
+    fixed = -1073741789
+    goto LABEL_197
   }
   if ( !v19 )
   {
-    LODWORD(EventDescriptor) = Size[0];
+    LODWORD(EventDescriptor) = Size[0]
     ValidationContext = CipAllocateValidationContext(
                           v26,
                           ActionsForImage,
@@ -1498,98 +1492,98 @@ LABEL_67:
                           v97,
                           (__int64)v18,
                           a7,
-                          (__int64)&v92[1]);
-    v19 = *(_QWORD *)&v92[1];
-    fixed = ValidationContext;
+                          (__int64)&v92[1])
+    v19 = *(_QWORD *)&v92[1]
+    fixed = ValidationContext
     if ( ValidationContext < 0 )
-      goto LABEL_197;
+      goto LABEL_197
   }
-  v40 = HIDWORD(v95);
-  v41 = Size[0];
-  *(_DWORD *)(v19 + 1816) = ActionsForImage;
-  *(_DWORD *)(v19 + 2088) = v40;
-  *(_DWORD *)(v19 + 2092) = v95;
-  v42 = v90;
+  v40 = HIDWORD(v95)
+  v41 = Size[0]
+  *(_DWORD *)(v19 + 1816) = ActionsForImage
+  *(_DWORD *)(v19 + 2088) = v40
+  *(_DWORD *)(v19 + 2092) = v95
+  v42 = v90
   if ( *a6 >= 1 )
   {
     if ( *a6 == 2 )
     {
-      *(_QWORD *)(v19 + 2096) = v90;
-      *(_DWORD *)(v19 + 2104) = v41;
+      *(_QWORD *)(v19 + 2096) = v90
+      *(_DWORD *)(v19 + 2104) = v41
     }
     else
     {
-      *(LARGE_INTEGER *)(v19 + 2096) = v99;
-      *(_DWORD *)(v19 + 2104) = a5;
+      *(LARGE_INTEGER *)(v19 + 2096) = v99
+      *(_DWORD *)(v19 + 2104) = a5
     }
   }
-  v43 = v37 == 0;
-  v22 = v81;
+  v43 = v37 == 0
+  v22 = v81
   if ( !v43 )
   {
-    v78 = v94[0];
-    LOBYTE(v76) = a12;
-    LOBYTE(v74) = v81;
-    v84 = CipValidateImageHash(&CipValidateFileHash, v19, FileObject, a7, v42, v41, v26, v74, v76);
-    fixed = v84;
+    v78 = v94[0]
+    LOBYTE(v76) = a12
+    LOBYTE(v74) = v81
+    v84 = CipValidateImageHash(&CipValidateFileHash, v19, FileObject, a7, v42, v41, v26, v74, v76)
+    fixed = v84
     if ( v84 >= 0 )
     {
-      LOBYTE(v91) = 1;
-      goto LABEL_93;
+      LOBYTE(v91) = 1
+      goto LABEL_93
     }
     if ( !*(_QWORD *)(v19 + 1800) )
     {
 LABEL_78:
-      *(_QWORD *)(v19 + 1800) = &off_1C002B000;
-      goto LABEL_191;
+      *(_QWORD *)(v19 + 1800) = &off_1C002B000
+      goto LABEL_191
     }
-    ActionsForImage &= ~0x100u;
-    *(_DWORD *)(v19 + 1816) = ActionsForImage;
+    ActionsForImage &= ~0x100u
+    *(_DWORD *)(v19 + 1816) = ActionsForImage
   }
   if ( (ActionsForImage & 4) == 0 )
-    goto LABEL_85;
-  v78 = v94[0];
-  LOBYTE(v76) = a12;
-  LOBYTE(v74) = v81;
-  v44 = CipValidateImageHash(&CipValidatePageHash, v19, FileObject, a7, v90, Size[0], v26, v74, v76);
-  v43 = *(_QWORD *)(v19 + 1800) == 0;
-  fixed = v44;
-  v84 = v44;
+    goto LABEL_85
+  v78 = v94[0]
+  LOBYTE(v76) = a12
+  LOBYTE(v74) = v81
+  v44 = CipValidateImageHash(&CipValidatePageHash, v19, FileObject, a7, v90, Size[0], v26, v74, v76)
+  v43 = *(_QWORD *)(v19 + 1800) == 0
+  fixed = v44
+  v84 = v44
   if ( v43 )
-    goto LABEL_78;
+    goto LABEL_78
   if ( v44 >= 0 )
-    goto LABEL_93;
+    goto LABEL_93
   if ( (ActionsForImage & 8) != 0 )
   {
-    *(_DWORD *)(v19 + 1816) &= ~4u;
+    *(_DWORD *)(v19 + 1816) &= ~4u
 LABEL_85:
     if ( *a6 < 2 )
     {
-      *a6 = 2;
-      goto LABEL_67;
+      *a6 = 2
+      goto LABEL_67
     }
-    v78 = v94[0];
-    LOBYTE(v76) = a12;
-    LOBYTE(v74) = v81;
-    v45 = CipValidateImageHash(&CipValidateFileHash, v19, FileObject, a7, v90, Size[0], v26, v74, v76);
-    v43 = *(_QWORD *)(v19 + 1800) == 0;
-    fixed = v45;
-    v84 = v45;
+    v78 = v94[0]
+    LOBYTE(v76) = a12
+    LOBYTE(v74) = v81
+    v45 = CipValidateImageHash(&CipValidateFileHash, v19, FileObject, a7, v90, Size[0], v26, v74, v76)
+    v43 = *(_QWORD *)(v19 + 1800) == 0
+    fixed = v45
+    v84 = v45
     if ( v43 )
-      goto LABEL_78;
-    v46 = (unsigned __int8)v91;
+      goto LABEL_78
+    v46 = (unsigned __int8)v91
     if ( fixed >= 0 )
-      v46 = 1;
-    v91 = v46;
+      v46 = 1
+    v91 = v46
 LABEL_93:
-    v47 = fixed;
-    v48 = ActionsForImage & 0x40;
+    v47 = fixed
+    v48 = ActionsForImage & 0x40
     if ( (ActionsForImage & 0x40) != 0 )
     {
       if ( fixed < 0 )
-        goto LABEL_129;
-      v49 = v89;
-      v50 = *((_DWORD *)g_CipWhichLevelComparisons + 12);
+        goto LABEL_129
+      v49 = v89
+      v50 = *((_DWORD *)g_CipWhichLevelComparisons + 12)
       if ( !_bittest(&v50, *(_BYTE *)(v89 + 52) & 0xF) )
       {
 LABEL_100:
@@ -1597,88 +1591,88 @@ LABEL_100:
         {
           if ( (g_CiDeveloperMode & 0x20000) != 0 || (v26 & 5) != 0 && (g_CiDeveloperMode & 0x100) != 0 )
           {
-            LOBYTE(v49) = v81;
-            LODWORD(v72) = Size[0];
-            CiAuditImageForHvci(v19, v26, v49, a7, FileObject, v90, v72);
-            v49 = v89;
+            LOBYTE(v49) = v81
+            LODWORD(v72) = Size[0]
+            CiAuditImageForHvci(v19, v26, v49, a7, FileObject, v90, v72)
+            v49 = v89
           }
-          **(_BYTE **)&Size[1] = *(_BYTE *)(v49 + 52);
-          *v93 = *(_DWORD *)(v49 + 48);
-          *(_DWORD *)(v19 + 1504) ^= (*(_DWORD *)(v19 + 1504) ^ ~(*(_DWORD *)(v49 + 60) >> 2)) & 1;
+          **(_BYTE **)&Size[1] = *(_BYTE *)(v49 + 52)
+          *v93 = *(_DWORD *)(v49 + 48)
+          *(_DWORD *)(v19 + 1504) ^= (*(_DWORD *)(v19 + 1504) ^ ~(*(_DWORD *)(v49 + 60) >> 2)) & 1
           if ( g_NumberOfSiPolicies )
-            memmove(*(void **)(v19 + 1488), *(const void **)(v89 + 64), 4LL * (unsigned int)g_NumberOfSiPolicies);
+            memmove(*(void **)(v19 + 1488), *(const void **)(v89 + 64), 4LL * (unsigned int)g_NumberOfSiPolicies)
           if ( (v26 & 5) != 0 )
-            CiAuditDriverAllow(FileObject, v26, v89, v19);
+            CiAuditDriverAllow(FileObject, v26, v89, v19)
           if ( (_BYTE)v91 )
           {
-            v51 = v81 & 0xF;
-            v52 = *((_DWORD *)g_CipWhichLevelComparisons + v51);
+            v51 = v81 & 0xF
+            v52 = *((_DWORD *)g_CipWhichLevelComparisons + v51)
             if ( _bittest(&v52, **(_BYTE **)&Size[1] & 0xF) )
             {
               if ( (ActionsForImage & 2) != 0 && (*(_DWORD *)(v89 + 60) & 4) == 0 && (v92[0] & 0x10) == 0 )
               {
-                v53 = ActionsForImage & 0x100;
+                v53 = ActionsForImage & 0x100
                 if ( !v53
                   || (_DWORD)v95 != 33
                   || !(unsigned __int8)CiDoesFilenameHavePerAppPolicyRules((PCUNICODE_STRING)(v19 + 704)) )
                 {
-                  CipImageValidityPeriod(v19 + 24, &v105);
-                  v54 = 2;
-                  v55 = 2;
+                  CipImageValidityPeriod(v19 + 24, &v105)
+                  v54 = 2
+                  v55 = 2
                   if ( v48 )
                   {
-                    v55 = 66;
-                    v54 = 66;
+                    v55 = 66
+                    v54 = 66
                   }
                   if ( v53 )
-                    v55 = v54 | 0x400;
-                  v56 = *(_QWORD *)(v89 + 16);
+                    v55 = v54 | 0x400
+                  v56 = *(_QWORD *)(v89 + 16)
                   if ( v56 && *(_DWORD *)(v56 + 48) )
                   {
-                    v56 = *(_QWORD *)(v56 + 40);
-                    v57 = a7;
-                    v27 = FileObject;
-                    v79 = a7;
-                    v77 = *(_DWORD *)(v19 + 1728);
-                    v75 = *(_DWORD *)(v19 + 1732);
-                    v73 = v19 + 1736;
-                    BaseAddressa = *(_DWORD *)v56;
-                    EventDescriptora = *(_DWORD *)(v56 + 4);
+                    v56 = *(_QWORD *)(v56 + 40)
+                    v57 = a7
+                    v27 = FileObject
+                    v79 = a7
+                    v77 = *(_DWORD *)(v19 + 1728)
+                    v75 = *(_DWORD *)(v19 + 1732)
+                    v73 = v19 + 1736
+                    BaseAddressa = *(_DWORD *)v56
+                    EventDescriptora = *(_DWORD *)(v56 + 4)
                   }
                   else
                   {
-                    v57 = a7;
-                    v27 = FileObject;
+                    v57 = a7
+                    v27 = FileObject
                     if ( (*((_DWORD *)g_CipWhichLevelComparisons + v51) & 4) == 0 )
-                      goto LABEL_125;
-                    v79 = a7;
-                    v77 = 0;
-                    v75 = 0;
-                    v73 = 0;
-                    BaseAddressa = 0;
-                    EventDescriptora = 0;
+                      goto LABEL_125
+                    v79 = a7
+                    v77 = 0
+                    v75 = 0
+                    v73 = 0
+                    BaseAddressa = 0
+                    EventDescriptora = 0
                   }
-                  LOBYTE(v56) = **(_BYTE **)&Size[1];
-                  CipSetFileCache(v27, v55, v56, EventDescriptora, BaseAddressa, v73, v75, v77, v78, v79);
+                  LOBYTE(v56) = **(_BYTE **)&Size[1]
+                  CipSetFileCache(v27, v55, v56, EventDescriptora, BaseAddressa, v73, v75, v77, v78, v79)
 LABEL_125:
-                  v22 = v81;
+                  v22 = v81
 LABEL_130:
                   if ( !(unsigned __int8)XciSupported() )
                   {
                     if ( fixed < 0 )
                     {
-                      v60 = *(unsigned int *)(v19 + 28);
+                      v60 = *(unsigned int *)(v19 + 28)
                       if ( (_DWORD)v60 )
-                        v60 = ((_BYTE)v60 - 1) & 3;
-                      v59 = 152 * v60 + v19 + 32;
+                        v60 = ((_BYTE)v60 - 1) & 3
+                      v59 = 152 * v60 + v19 + 32
                     }
                     else
                     {
-                      v59 = v89;
+                      v59 = v89
                     }
-                    fixed = CipCallPeauth((unsigned int)fixed, v19 + 4, v57, v26, v59, v27);
+                    fixed = CipCallPeauth((unsigned int)fixed, v19 + 4, v57, v26, v59, v27)
                   }
-                  v84 = v47;
+                  v84 = v47
                   if ( (v26 & 0x2000000) != 0 )
                   {
 LABEL_191:
@@ -1695,45 +1689,45 @@ LABEL_191:
                                     *(_DWORD *)(v19 + 1728),
                                     v89,
                                     (__int64)v100,
-                                    (__int64)v98);
+                                    (__int64)v98)
                         }
                         else
                         {
-                          v63 = v98;
-                          *v100 = 0;
-                          *v63 = 0;
+                          v63 = v98
+                          *v100 = 0
+                          *v63 = 0
                         }
                       }
                       if ( fixed >= 0 )
                       {
-                        v64 = *(volatile signed __int32 ***)v94;
-                        v20 = 1;
+                        v64 = *(volatile signed __int32 ***)v94
+                        v20 = 1
 LABEL_204:
                         if ( v84 >= 0 )
                         {
-                          v65 = *(__int64 (__fastcall **)(volatile signed __int32 *))(*(_QWORD *)(v19 + 1800) + 8LL);
+                          v65 = *(__int64 (__fastcall **)(volatile signed __int32 *))(*(_QWORD *)(v19 + 1800) + 8LL)
                           if ( v65 )
-                            fixed = v65(*v64);
+                            fixed = v65(*v64)
                         }
-                        goto LABEL_207;
+                        goto LABEL_207
                       }
                     }
-                    goto LABEL_197;
+                    goto LABEL_197
                   }
-                  v84 = v47;
+                  v84 = v47
                   if ( fixed >= 0 )
-                    goto LABEL_152;
-                  v84 = v47;
+                    goto LABEL_152
+                  v84 = v47
                   if ( fixed == -1073740285 )
-                    goto LABEL_152;
-                  v84 = v47;
+                    goto LABEL_152
+                  v84 = v47
                   if ( fixed == -1073740283 )
-                    goto LABEL_152;
+                    goto LABEL_152
                   if ( (g_CiOptions & 4) != 0 )
                   {
-                    v84 = v47;
+                    v84 = v47
                     if ( (v26 & 0x80000000) != 0 )
-                      goto LABEL_152;
+                      goto LABEL_152
                   }
                   if ( (g_CiOptions & 2) != 0 && (v84 = v47, (v26 & 1) != 0)
                     || (v84 = v47, (v26 & 0x40000006) != 0)
@@ -1744,179 +1738,179 @@ LABEL_204:
                     || (v84 = v47, (v26 & 0x80000001) == 0) )
                   {
 LABEL_152:
-                    v28 = 0;
-                    goto LABEL_153;
+                    v28 = 0
+                    goto LABEL_153
                   }
-                  LOBYTE(v58) = v22;
-                  CipReportSystemOptionsReprieve((_DWORD)v27, a7, v26, v58, fixed);
-                  v84 = v47;
-                  *v93 = 0;
+                  LOBYTE(v58) = v22
+                  CipReportSystemOptionsReprieve((_DWORD)v27, a7, v26, v58, fixed)
+                  v84 = v47
+                  *v93 = 0
 LABEL_47:
-                  fixed = 0;
-                  v28 = 0;
-                  goto LABEL_153;
+                  fixed = 0
+                  v28 = 0
+                  goto LABEL_153
                 }
               }
             }
-            v22 = v81;
+            v22 = v81
           }
         }
 LABEL_129:
-        v27 = FileObject;
-        v57 = a7;
-        goto LABEL_130;
+        v27 = FileObject
+        v57 = a7
+        goto LABEL_130
       }
       fixed = CipMitigatePPLBypassThroughInterpreters(
                 (_DWORD)FileObject,
                 *(_QWORD *)(v19 + 2096),
                 *(_DWORD *)(v19 + 2104),
                 0,
-                1);
+                1)
       if ( fixed < 0 )
-        goto LABEL_129;
+        goto LABEL_129
       if ( **(_QWORD **)v94 )
       {
-        _InterlockedOr(**(volatile signed __int32 ***)v94, 0x10u);
-        v26 = a9;
-        v19 = *(_QWORD *)&v92[1];
+        _InterlockedOr(**(volatile signed __int32 ***)v94, 0x10u)
+        v26 = a9
+        v19 = *(_QWORD *)&v92[1]
       }
     }
-    v49 = v89;
-    goto LABEL_100;
+    v49 = v89
+    goto LABEL_100
   }
   if ( *a6 != 1 )
-    goto LABEL_93;
-  *a6 = 2;
-  fixed = -1073741789;
-  v20 = 1;
+    goto LABEL_93
+  *a6 = 2
+  fixed = -1073741789
+  v20 = 1
 LABEL_198:
-  v64 = *(volatile signed __int32 ***)v94;
+  v64 = *(volatile signed __int32 ***)v94
   if ( **(_QWORD **)v94 && !v102 )
   {
-    CiReleaseContext();
-    *v64 = 0;
+    CiReleaseContext()
+    *v64 = 0
   }
   if ( fixed >= 0 )
-    goto LABEL_204;
+    goto LABEL_204
 LABEL_207:
   if ( v19 )
-    CiFreeValidationContext((PSLIST_ENTRY)v19);
+    CiFreeValidationContext((PSLIST_ENTRY)v19)
   if ( v20 )
-    CiLogStatusEventWithCorrelationId((unsigned int)fixed, &CiValidateImageHeaderComplete, 0);
-  ExReleasePushLockSharedEx(&g_CipPolicyLock, 0);
-  KeLeaveCriticalRegion();
-  IoClearActivityIdThread(v103);
-  return (unsigned int)fixed;
+    CiLogStatusEventWithCorrelationId((unsigned int)fixed, &CiValidateImageHeaderComplete, 0)
+  ExReleasePushLockSharedEx(&g_CipPolicyLock, 0)
+  KeLeaveCriticalRegion()
+  IoClearActivityIdThread(v103)
+  return (unsigned int)fixed
 }
 
 
 --- Local Variables ---
-// void * a2; // location: dx, size: 8
-// struct _FILE_OBJECT * a1; // location: cx, size: 8
-// int a3; // location: r8, size: 4
-// LARGE_INTEGER a4; // location: r9, size: 8
-// int a5; // location: ^1A0, size: 4
-// int * a6; // location: ^1A8, size: 8
-// __int64 a7; // location: ^1B0, size: 8
-// __int64 a8; // location: ^1B8, size: 8
-// int a9; // location: ^1C0, size: 4
-// _QWORD * a10; // location: ^1C8, size: 8
-// char a11; // location: ^1D0, size: 1
-// char a12; // location: ^1D8, size: 1
-// _BYTE * a13; // location: ^1E0, size: 8
-// _DWORD * a14; // location: ^1E8, size: 8
-// _QWORD * a15; // location: ^1F0, size: 8
-// _DWORD * a16; // location: ^1F8, size: 8
-// __int64 ; // location: r14, size: 8
-// _BYTE * v17; // location: bx, size: 8
-// _DWORD * v18; // location: r15, size: 8
-// __int64 v19; // location: si, size: 8
-// char v20; // location: r12, size: 1
-// int fixed; // location: di, size: 4
-// char v22; // location: r12, size: 1
-// int v23; // location: bx, size: 4
-// int v24; // location: bx, size: 4
-// __int64 v25; // location: r9, size: 8
-// unsigned int v26; // location: r14, size: 4
-// struct _FILE_OBJECT * v27; // location: r13, size: 8
-// char v28; // location: cx, size: 1
-// char v29; // location: di, size: 1
-// int ActionsForImage; // location: bx, size: 4
-// int v31; // location: cx, size: 4
-// int v32; // location: r8, size: 4
-// int v33; // location: cx, size: 4
-// int v34; // location: r15, size: 4
-// char v35; // location: ax, size: 1
-// int v36; // location: dx, size: 4
-// int v37; // location: r12, size: 4
-// int v38; // location: ax, size: 4
-// int ValidationContext; // location: ax, size: 4
-// int v40; // location: ax, size: 4
-// int v41; // location: dx, size: 4
-// PVOID v42; // location: cx, size: 8
-// bool v43; // location: zf, size: 1
-// int v44; // location: ax, size: 4
-// int v45; // location: ax, size: 4
-// int v46; // location: ax, size: 4
-// int v47; // location: r15, size: 4
-// int v48; // location: r13, size: 4
-// __int64 v49; // location: r8, size: 8
-// int v50; // location: cx, size: 4
-// __int64 v51; // location: r12, size: 8
-// int v52; // location: cx, size: 4
-// int v53; // location: bx, size: 4
-// int v54; // location: ax, size: 4
-// int v55; // location: dx, size: 4
-// __int64 v56; // location: r8, size: 8
-// __int64 v57; // location: bx, size: 8
-// int v58; // location: r9, size: 4
-// __int64 v59; // location: ax, size: 8
-// __int64 v60; // location: ax, size: 8
-// int v61; // location: ax, size: 4
-// int v62; // location: cx, size: 4
-// _DWORD * v63; // location: ax, size: 8
-// volatile signed __int32 ** v64; // location: bx, size: 8
-// __int64 (__fastcall *)(volatile signed __int32 *) v65; // location: ax, size: 8
-// __int64 ; // location: ax, size: 8
-// int EventDescriptorb; // location: ^20, size: 4
-// PCEVENT_DESCRIPTOR EventDescriptor; // location: ^20, size: 8
-// int EventDescriptora; // location: ^20, size: 4
-// int BaseAddress; // location: ^28, size: 4
-// int BaseAddressa; // location: ^28, size: 4
-// ULONGLONG v72; // location: ^30, size: 8
-// ULONGLONG v73; // location: ^30, size: 8
-// int v74; // location: ^38, size: 4
-// int v75; // location: ^38, size: 4
-// int v76; // location: ^40, size: 4
-// int v77; // location: ^40, size: 4
-// int v78; // location: ^48, size: 4
-// __int64 v79; // location: ^50, size: 8
-// char v80; // location: ^60, size: 1
-// char v81; // location: ^70, size: 1
-// char v82; // location: ^74, size: 1
-// char[3] v83; // location: ^75, size: 3
-// int v84; // location: ^78, size: 4
-// PFILE_OBJECT FileObject; // location: ^80, size: 8
-// char v86; // location: ^88, size: 1
-// char v87; // location: ^89, size: 1
-// _DWORD[3] Size; // location: ^8C, size: 12
-// __int64 v89; // location: ^98, size: 8
-// PVOID v90; // location: ^A0, size: 8
-// int v91; // location: ^A8, size: 4
-// _DWORD[3] v92; // location: ^AC, size: 12
-// _DWORD * v93; // location: ^B8, size: 8
-// int[2] v94; // location: ^C0, size: 8
-// __int64 v95; // location: ^C8, size: 8
-// int v96; // location: ^D0, size: 4
-// __int64 v97; // location: ^D8, size: 8
-// _DWORD * v98; // location: ^E0, size: 8
-// LARGE_INTEGER v99; // location: ^E8, size: 8
-// _QWORD * v100; // location: ^F0, size: 8
-// LARGE_INTEGER PerformanceCounter; // location: ^F8, size: 8
-// _DWORD * v102; // location: ^100, size: 8
-// __int64 v103; // location: ^108, size: 8
-// GUID ActivityId; // location: ^110, size: 16
-// __int128 v105; // location: ^120, size: 16
+// void * a2
+// struct _FILE_OBJECT * a1
+// int a3
+// LARGE_INTEGER a4
+// int a5
+// int * a6
+// __int64 a7
+// __int64 a8
+// int a9
+// _QWORD * a10
+// char a11
+// char a12
+// _BYTE * a13
+// _DWORD * a14
+// _QWORD * a15
+// _DWORD * a16
+// __int64
+// _BYTE * v17
+// _DWORD * v18
+// __int64 v19
+// char v20
+// int fixed
+// char v22
+// int v23
+// int v24
+// __int64 v25
+// unsigned int v26
+// struct _FILE_OBJECT * v27
+// char v28
+// char v29
+// int ActionsForImage
+// int v31
+// int v32
+// int v33
+// int v34
+// char v35
+// int v36
+// int v37
+// int v38
+// int ValidationContext
+// int v40
+// int v41
+// PVOID v42
+// bool v43
+// int v44
+// int v45
+// int v46
+// int v47
+// int v48
+// __int64 v49
+// int v50
+// __int64 v51
+// int v52
+// int v53
+// int v54
+// int v55
+// __int64 v56
+// __int64 v57
+// int v58
+// __int64 v59
+// __int64 v60
+// int v61
+// int v62
+// _DWORD * v63
+// volatile signed __int32 ** v64
+// __int64 (__fastcall *)(volatile signed __int32 *) v65
+// __int64
+// int EventDescriptorb
+// PCEVENT_DESCRIPTOR EventDescriptor
+// int EventDescriptora
+// int BaseAddress
+// int BaseAddressa
+// ULONGLONG v72
+// ULONGLONG v73
+// int v74
+// int v75
+// int v76
+// int v77
+// int v78
+// __int64 v79
+// char v80
+// char v81
+// char v82
+// char[3] v83
+// int v84
+// PFILE_OBJECT FileObject
+// char v86
+// char v87
+// _DWORD[3] Size
+// __int64 v89
+// PVOID v90
+// int v91
+// _DWORD[3] v92
+// _DWORD * v93
+// int[2] v94
+// __int64 v95
+// int v96
+// __int64 v97
+// _DWORD * v98
+// LARGE_INTEGER v99
+// _QWORD * v100
+// LARGE_INTEGER PerformanceCounter
+// _DWORD * v102
+// __int64 v103
+// GUID ActivityId
+// __int128 v105
 
 
 --- String Literals Referenced ---
@@ -1945,143 +1939,143 @@ __int64 __fastcall CiValidateImageHeader(
         _QWORD *a15,
         _DWORD *a16)
 {
-  _BYTE *v17; // rbx
-  _DWORD *v18; // r15
-  __int64 v19; // rsi
-  char v20; // r12
-  int fixed; // edi
-  char v22; // r12
-  int v23; // ebx
-  int v24; // ebx
-  __int64 v25; // r9
-  unsigned int v26; // r14d
-  struct _FILE_OBJECT *v27; // r13
-  char v28; // cl
-  char v29; // di
-  int ActionsForImage; // ebx
-  int v31; // ecx
-  int v32; // r8d
-  int v33; // ecx
-  int v34; // r15d
-  char v35; // al
-  int v36; // edx
-  int v37; // r12d
-  int v38; // eax
-  int ValidationContext; // eax
-  int v40; // eax
-  int v41; // edx
-  PVOID v42; // rcx
-  bool v43; // zf
-  int v44; // eax
-  int v45; // eax
-  int v46; // eax
-  int v47; // r15d
-  int v48; // r13d
-  __int64 v49; // r8
-  int v50; // ecx
-  __int64 v51; // r12
-  int v52; // ecx
-  int v53; // ebx
-  int v54; // eax
-  int v55; // edx
-  __int64 v56; // r8
-  __int64 v57; // rbx
-  int v58; // r9d
-  __int64 v59; // rax
-  __int64 v60; // rax
-  int v61; // eax
-  int v62; // ecx
-  _DWORD *v63; // rax
-  volatile signed __int32 **v64; // rbx
-  __int64 (__fastcall *v65)(volatile signed __int32 *); // rax
-  int EventDescriptorb; // [rsp+20h] [rbp-E0h]
-  PCEVENT_DESCRIPTOR EventDescriptor; // [rsp+20h] [rbp-E0h]
-  int EventDescriptora; // [rsp+20h] [rbp-E0h]
-  int BaseAddress; // [rsp+28h] [rbp-D8h]
-  int BaseAddressa; // [rsp+28h] [rbp-D8h]
-  ULONGLONG v72; // [rsp+30h] [rbp-D0h]
-  ULONGLONG v73; // [rsp+30h] [rbp-D0h]
-  int v74; // [rsp+38h] [rbp-C8h]
-  int v75; // [rsp+38h] [rbp-C8h]
-  int v76; // [rsp+40h] [rbp-C0h]
-  int v77; // [rsp+40h] [rbp-C0h]
-  int v78; // [rsp+48h] [rbp-B8h]
-  __int64 v79; // [rsp+50h] [rbp-B0h]
-  char v80; // [rsp+60h] [rbp-A0h]
-  char v81; // [rsp+70h] [rbp-90h]
-  char v82; // [rsp+74h] [rbp-8Ch] BYREF
-  char v83[3]; // [rsp+75h] [rbp-8Bh] BYREF
-  int v84; // [rsp+78h] [rbp-88h]
-  PFILE_OBJECT FileObject; // [rsp+80h] [rbp-80h]
-  char v86; // [rsp+88h] [rbp-78h] BYREF
-  char v87; // [rsp+89h] [rbp-77h]
-  _DWORD Size[3]; // [rsp+8Ch] [rbp-74h]
-  __int64 v89; // [rsp+98h] [rbp-68h]
-  PVOID v90; // [rsp+A0h] [rbp-60h]
-  int v91; // [rsp+A8h] [rbp-58h]
-  _DWORD v92[3]; // [rsp+ACh] [rbp-54h] BYREF
-  _DWORD *v93; // [rsp+B8h] [rbp-48h]
-  int v94[2]; // [rsp+C0h] [rbp-40h]
-  __int64 v95; // [rsp+C8h] [rbp-38h] BYREF
-  int v96; // [rsp+D0h] [rbp-30h] BYREF
-  __int64 v97; // [rsp+D8h] [rbp-28h]
-  _DWORD *v98; // [rsp+E0h] [rbp-20h]
-  LARGE_INTEGER v99; // [rsp+E8h] [rbp-18h] BYREF
-  _QWORD *v100; // [rsp+F0h] [rbp-10h]
-  LARGE_INTEGER PerformanceCounter; // [rsp+F8h] [rbp-8h] BYREF
-  _DWORD *v102; // [rsp+100h] [rbp+0h]
-  __int64 v103; // [rsp+108h] [rbp+8h]
-  GUID ActivityId; // [rsp+110h] [rbp+10h] BYREF
-  __int128 v105; // [rsp+120h] [rbp+20h] BYREF
+  _BYTE *v17
+  _DWORD *v18
+  __int64 v19
+  char v20
+  int fixed
+  char v22
+  int v23
+  int v24
+  __int64 v25
+  unsigned int v26
+  struct _FILE_OBJECT *v27
+  char v28
+  char v29
+  int ActionsForImage
+  int v31
+  int v32
+  int v33
+  int v34
+  char v35
+  int v36
+  int v37
+  int v38
+  int ValidationContext
+  int v40
+  int v41
+  PVOID v42
+  bool v43
+  int v44
+  int v45
+  int v46
+  int v47
+  int v48
+  __int64 v49
+  int v50
+  __int64 v51
+  int v52
+  int v53
+  int v54
+  int v55
+  __int64 v56
+  __int64 v57
+  int v58
+  __int64 v59
+  __int64 v60
+  int v61
+  int v62
+  _DWORD *v63
+  volatile signed __int32 **v64
+  __int64 (__fastcall *v65)(volatile signed __int32 *)
+  int EventDescriptorb
+  PCEVENT_DESCRIPTOR EventDescriptor
+  int EventDescriptora
+  int BaseAddress
+  int BaseAddressa
+  ULONGLONG v72
+  ULONGLONG v73
+  int v74
+  int v75
+  int v76
+  int v77
+  int v78
+  __int64 v79
+  char v80
+  char v81
+  char v82
+  char v83[3]
+  int v84
+  PFILE_OBJECT FileObject
+  char v86
+  char v87
+  _DWORD Size[3]
+  __int64 v89
+  PVOID v90
+  int v91
+  _DWORD v92[3]
+  _DWORD *v93
+  int v94[2]
+  __int64 v95
+  int v96
+  __int64 v97
+  _DWORD *v98
+  LARGE_INTEGER v99
+  _QWORD *v100
+  LARGE_INTEGER PerformanceCounter
+  _DWORD *v102
+  __int64 v103
+  GUID ActivityId
+  __int128 v105
 
-  v17 = a13;
-  v97 = a8;
-  v93 = a14;
-  v100 = a15;
-  FileObject = a1;
-  v98 = a16;
-  v90 = a2;
-  *(_QWORD *)v94 = a10;
-  v102 = (_DWORD *)*a10;
-  v18 = v102;
-  v99 = a4;
-  Size[0] = a3;
-  v19 = 0;
-  *(_QWORD *)&Size[1] = a13;
-  v20 = 0;
-  LOBYTE(v91) = 0;
-  v96 = 0;
-  v82 = 0;
-  v105 = 0;
-  v89 = 0;
-  v84 = -1073740760;
-  memset(v92, 0, sizeof(v92));
-  ActivityId = 0;
-  v95 = 0;
-  v80 = 0;
-  EtwActivityIdControl(3u, &ActivityId);
-  v103 = IoSetActivityIdThread(&ActivityId);
-  KeEnterCriticalRegion();
-  ExAcquirePushLockSharedEx(&g_CipPolicyLock, 0);
-  PerformanceCounter = KeQueryPerformanceCounter(0);
-  *v17 = 1;
-  fixed = CiInitializePhase2();
+  v17 = a13
+  v97 = a8
+  v93 = a14
+  v100 = a15
+  FileObject = a1
+  v98 = a16
+  v90 = a2
+  *(_QWORD *)v94 = a10
+  v102 = (_DWORD *)*a10
+  v18 = v102
+  v99 = a4
+  Size[0] = a3
+  v19 = 0
+  *(_QWORD *)&Size[1] = a13
+  v20 = 0
+  LOBYTE(v91) = 0
+  v96 = 0
+  v82 = 0
+  v105 = 0
+  v89 = 0
+  v84 = -1073740760
+  memset(v92, 0, sizeof(v92))
+  ActivityId = 0
+  v95 = 0
+  v80 = 0
+  EtwActivityIdControl(3u, &ActivityId)
+  v103 = IoSetActivityIdThread(&ActivityId)
+  KeEnterCriticalRegion()
+  ExAcquirePushLockSharedEx(&g_CipPolicyLock, 0)
+  PerformanceCounter = KeQueryPerformanceCounter(0)
+  *v17 = 1
+  fixed = CiInitializePhase2()
   if ( fixed < 0 )
-    goto LABEL_198;
-  v22 = a11;
-  v23 = a9;
-  v81 = a11;
-  CiLogFileRequestedValidationEvent((_DWORD)a1 + 88, &CiValidateImageHeaderStart);
+    goto LABEL_198
+  v22 = a11
+  v23 = a9
+  v81 = a11
+  CiLogFileRequestedValidationEvent((_DWORD)a1 + 88, &CiValidateImageHeaderStart)
   if ( v18 && (*v18 & 8) == 0 )
   {
-    v24 = (int)v90;
+    v24 = (int)v90
   }
   else
   {
-    ExReleasePushLockSharedEx(&g_CipPolicyLock, 0);
-    KeLeaveCriticalRegion();
-    EventDescriptorb = v23;
-    v24 = (int)v90;
+    ExReleasePushLockSharedEx(&g_CipPolicyLock, 0)
+    KeLeaveCriticalRegion()
+    EventDescriptorb = v23
+    v24 = (int)v90
     fixed = XciValidateImageHeader(
               a1,
               v90,
@@ -2093,53 +2087,53 @@ __int64 __fastcall CiValidateImageHeader(
               *(_QWORD *)&Size[1],
               v93,
               v100,
-              v98);
-    KeEnterCriticalRegion();
-    ExAcquirePushLockSharedEx(&g_CipPolicyLock, 0);
+              v98)
+    KeEnterCriticalRegion()
+    ExAcquirePushLockSharedEx(&g_CipPolicyLock, 0)
     if ( v18 )
-      goto LABEL_191;
-    v18 = **(_DWORD ***)v94;
+      goto LABEL_191
+    v18 = **(_DWORD ***)v94
     if ( fixed != -1073700607 && fixed != -1073741637 )
     {
       if ( v18 )
       {
-        *v18 |= 8u;
+        *v18 |= 8u
       }
       else if ( fixed == -1073741789 )
       {
-        *a6 = 2;
+        *a6 = 2
       }
-      goto LABEL_191;
+      goto LABEL_191
     }
   }
-  fixed = CipFixImageType(v24, (unsigned int)&v96, (unsigned int)&a9, (unsigned int)&v82, (__int64)&v95 + 4);
+  fixed = CipFixImageType(v24, (unsigned int)&v96, (unsigned int)&a9, (unsigned int)&v82, (__int64)&v95 + 4)
   if ( fixed < 0 )
   {
 LABEL_197:
-    v20 = 1;
-    goto LABEL_198;
+    v20 = 1
+    goto LABEL_198
   }
-  v26 = a9;
-  v87 = 4;
+  v26 = a9
+  v87 = 4
   if ( v82 && ((a9 & 8) != 0 || (a9 & 0xE5DFFF97) == 0 && (PsGetProcessProtection(a7) & 7) == 1) )
   {
-    LODWORD(v27) = (_DWORD)FileObject;
-    v28 = 1;
-    v80 = 1;
+    LODWORD(v27) = (_DWORD)FileObject
+    v28 = 1
+    v80 = 1
 LABEL_153:
-    v34 = a7;
-    goto LABEL_154;
+    v34 = a7
+    goto LABEL_154
   }
-  v29 = v22;
+  v29 = v22
   if ( (v26 & 0xE5DFFF87) == 0 && !v22 )
   {
-    v29 = 0;
+    v29 = 0
     if ( (*((unsigned __int8 (**)(void))&xmmword_1C0039390 + 1))() == 2 )
-      v29 = 2;
-    v81 = v29;
+      v29 = 2
+    v81 = v29
   }
-  LOBYTE(v25) = v29;
-  ActionsForImage = CiGetActionsForImage(a7, FileObject, v26, v25);
+  LOBYTE(v25) = v29
+  ActionsForImage = CiGetActionsForImage(a7, FileObject, v26, v25)
   if ( (ActionsForImage & 1) != 0 )
   {
     fixed = CipValidateFileInCache(
@@ -2151,7 +2145,7 @@ LABEL_153:
               (__int64)&v92[1],
               (__int64)&v95,
               *(__int64 *)&Size[1],
-              (__int64)v92);
+              (__int64)v92)
     if ( fixed >= 0 )
     {
       if ( (ActionsForImage & 0x10) == 0
@@ -2165,55 +2159,55 @@ LABEL_153:
             || (unsigned int)PsIsProtectedProcess(a7)
             && (v33 = *((_DWORD *)g_CipWhichLevelComparisons + 12), !_bittest(&v33, **(_BYTE **)&Size[1] & 0xF)) )
           {
-            v27 = FileObject;
-            v22 = v81;
-            *v93 = 2;
+            v27 = FileObject
+            v22 = v81
+            *v93 = 2
             if ( (g_CiDeveloperMode & 0x20000) != 0 )
             {
-              LODWORD(v72) = Size[0];
-              LOBYTE(v32) = v81;
-              v34 = a7;
-              CiAuditImageForHvci(0, v26, v32, a7, v27, v90, v72);
-              v28 = 0;
-              v19 = *(_QWORD *)&v92[1];
+              LODWORD(v72) = Size[0]
+              LOBYTE(v32) = v81
+              v34 = a7
+              CiAuditImageForHvci(0, v26, v32, a7, v27, v90, v72)
+              v28 = 0
+              v19 = *(_QWORD *)&v92[1]
 LABEL_154:
               if ( v82 )
               {
                 if ( ((fixed + 1073741793) & 0xFFFFFFFB) != 0 )
                 {
-                  CipReportSharedSectionFailure(v34, (_DWORD)v27, v26, fixed, v28);
+                  CipReportSharedSectionFailure(v34, (_DWORD)v27, v26, fixed, v28)
                   if ( v80 )
                   {
-                    fixed = -1073741701;
-                    goto LABEL_197;
+                    fixed = -1073741701
+                    goto LABEL_197
                   }
                 }
               }
               if ( !v19 )
-                goto LABEL_191;
+                goto LABEL_191
               if ( (v26 & 0xE5DFFF87) != 0 && (v26 & 0x20000000) == 0 )
               {
                 if ( fixed >= 0 )
-                  goto LABEL_184;
+                  goto LABEL_184
                 if ( fixed == -1073740760
                   || fixed == -1073740285
                   || fixed == -1058471934
                   || fixed == -1073740283
                   || fixed == -1058340861 )
                 {
-                  fixed = CipReportAndReprieveDriverAndProtectedImageFailure(v19, v34, (_DWORD)v27, v26, v22, fixed);
+                  fixed = CipReportAndReprieveDriverAndProtectedImageFailure(v19, v34, (_DWORD)v27, v26, v22, fixed)
                   if ( fixed >= 0 )
                   {
 LABEL_181:
-                    *v93 = 0;
-                    goto LABEL_182;
+                    *v93 = 0
+                    goto LABEL_182
                   }
-                  goto LABEL_183;
+                  goto LABEL_183
                 }
 LABEL_182:
                 if ( fixed >= 0 )
-                  goto LABEL_184;
-                goto LABEL_183;
+                  goto LABEL_184
+                goto LABEL_183
               }
               if ( fixed < 0 )
               {
@@ -2224,20 +2218,20 @@ LABEL_182:
                   && fixed != -1058340861
                   && fixed != -1073741701 )
                 {
-                  goto LABEL_182;
+                  goto LABEL_182
                 }
               }
               else
               {
-                v62 = *((_DWORD *)g_CipWhichLevelComparisons + (v22 & 0xF));
+                v62 = *((_DWORD *)g_CipWhichLevelComparisons + (v22 & 0xF))
                 if ( _bittest(&v62, **(_BYTE **)&Size[1] & 0xF) )
                 {
 LABEL_184:
                   if ( (*(_DWORD *)(v19 + 1504) & 2) != 0 )
                   {
-                    v99 = KeQueryPerformanceCounter(0);
+                    v99 = KeQueryPerformanceCounter(0)
                     if ( (unsigned __int8)v22 >= 2u || *(_DWORD *)(v19 + 1480) )
-                      v87 = v22;
+                      v87 = v22
                     CipProcessSIPolicyLogs(
                       v19,
                       (_DWORD)v27,
@@ -2247,20 +2241,20 @@ LABEL_184:
                       v87,
                       **(_BYTE **)&Size[1],
                       (__int64)v90,
-                      Size[0]);
+                      Size[0])
                     if ( (*(_DWORD *)(v19 + 1504) & 1) == 0
                       && *(__int64 (__fastcall ***)())(v19 + 1800) != &off_1C002B000 )
                     {
-                      CiInstrumentVbsPolicyFailure(v19);
+                      CiInstrumentVbsPolicyFailure(v19)
                     }
                   }
-                  goto LABEL_191;
+                  goto LABEL_191
                 }
               }
-              v83[0] = 1;
-              v86 = 0;
-              LOBYTE(v72) = **(_BYTE **)&Size[1];
-              LOBYTE(BaseAddress) = v22;
+              v83[0] = 1
+              v86 = 0
+              LOBYTE(v72) = **(_BYTE **)&Size[1]
+              LOBYTE(BaseAddress) = v22
               fixed = CipReportAndReprieveUMCIFailure(
                         v19,
                         v34,
@@ -2271,29 +2265,29 @@ LABEL_184:
                         v72,
                         fixed,
                         (__int64)&v86,
-                        (__int64)v83);
+                        (__int64)v83)
               if ( fixed >= 0 )
               {
                 if ( !v86 )
-                  goto LABEL_182;
-                **(_BYTE **)&Size[1] = v83[0];
-                goto LABEL_181;
+                  goto LABEL_182
+                **(_BYTE **)&Size[1] = v83[0]
+                goto LABEL_181
               }
 LABEL_183:
-              CiBlackboxValidateImageHeaderFailure(v19, v34, (_DWORD)v27, v26, v22, fixed);
-              goto LABEL_184;
+              CiBlackboxValidateImageHeaderFailure(v19, v34, (_DWORD)v27, v26, v22, fixed)
+              goto LABEL_184
             }
-            v19 = *(_QWORD *)&v92[1];
-            goto LABEL_152;
+            v19 = *(_QWORD *)&v92[1]
+            goto LABEL_152
           }
         }
       }
     }
-    v19 = *(_QWORD *)&v92[1];
+    v19 = *(_QWORD *)&v92[1]
     if ( *(_QWORD *)&v92[1] && fixed == -1073741267 )
       ActionsForImage ^= ((unsigned __int16)ActionsForImage
                         ^ (unsigned __int16)*(_DWORD *)(*(_QWORD *)&v92[1] + 1816LL))
-                       & 0x100;
+                       & 0x100
   }
   if ( (ActionsForImage & 0x40) != 0 )
   {
@@ -2304,23 +2298,23 @@ LABEL_183:
         && (g_CiPolicyState & 0x40) == 0
         && (g_CiPolicyState & 0x80u) == 0 )
       {
-        v35 = ((__int64 (__fastcall *)(PFILE_OBJECT))xmmword_1C0039390)(FileObject);
-        v22 = v81;
-        v83[0] = v35;
-        v36 = *((_DWORD *)g_CipWhichLevelComparisons + (v81 & 0xF));
+        v35 = ((__int64 (__fastcall *)(PFILE_OBJECT))xmmword_1C0039390)(FileObject)
+        v22 = v81
+        v83[0] = v35
+        v36 = *((_DWORD *)g_CipWhichLevelComparisons + (v81 & 0xF))
         if ( _bittest(&v36, v35 & 0xF) )
         {
-          LODWORD(v27) = (_DWORD)FileObject;
-          **(_BYTE **)&Size[1] = v35;
-          *v93 = 2;
-          goto LABEL_47;
+          LODWORD(v27) = (_DWORD)FileObject
+          **(_BYTE **)&Size[1] = v35
+          *v93 = 2
+          goto LABEL_47
         }
       }
     }
   }
-  v37 = ActionsForImage & 0x100;
+  v37 = ActionsForImage & 0x100
   if ( (ActionsForImage & 0x100) != 0 )
-    goto LABEL_61;
+    goto LABEL_61
   if ( (ActionsForImage & 4) != 0 )
   {
     if ( (v26 & 0x10000000) == 0
@@ -2328,35 +2322,35 @@ LABEL_183:
        || (v26 & 5) != 0 && (g_CiOptions & 0x8000) != 0
        || (g_CiOptions & 0x4000) != 0 && (v26 & 0x20000005) == 0) )
     {
-      v38 = 1;
-      goto LABEL_65;
+      v38 = 1
+      goto LABEL_65
     }
     if ( (v26 & 5) != 0 && (g_CiPolicyState & 1) != 0 )
     {
 LABEL_60:
-      v38 = 1;
-      goto LABEL_65;
+      v38 = 1
+      goto LABEL_65
     }
 LABEL_61:
     if ( (v26 & 0x20000005) != 0 || (g_CiPolicyState & 2) == 0 && (ActionsForImage & 0x40) == 0 )
     {
-      v38 = 0;
-      goto LABEL_65;
+      v38 = 0
+      goto LABEL_65
     }
-    goto LABEL_60;
+    goto LABEL_60
   }
-  v38 = v37 + 2;
+  v38 = v37 + 2
 LABEL_65:
   if ( v38 > *a6 )
   {
-    *a6 = v38;
+    *a6 = v38
 LABEL_67:
-    fixed = -1073741789;
-    goto LABEL_197;
+    fixed = -1073741789
+    goto LABEL_197
   }
   if ( !v19 )
   {
-    LODWORD(EventDescriptor) = Size[0];
+    LODWORD(EventDescriptor) = Size[0]
     ValidationContext = CipAllocateValidationContext(
                           v26,
                           ActionsForImage,
@@ -2366,98 +2360,98 @@ LABEL_67:
                           v97,
                           (__int64)v18,
                           a7,
-                          (__int64)&v92[1]);
-    v19 = *(_QWORD *)&v92[1];
-    fixed = ValidationContext;
+                          (__int64)&v92[1])
+    v19 = *(_QWORD *)&v92[1]
+    fixed = ValidationContext
     if ( ValidationContext < 0 )
-      goto LABEL_197;
+      goto LABEL_197
   }
-  v40 = HIDWORD(v95);
-  v41 = Size[0];
-  *(_DWORD *)(v19 + 1816) = ActionsForImage;
-  *(_DWORD *)(v19 + 2088) = v40;
-  *(_DWORD *)(v19 + 2092) = v95;
-  v42 = v90;
+  v40 = HIDWORD(v95)
+  v41 = Size[0]
+  *(_DWORD *)(v19 + 1816) = ActionsForImage
+  *(_DWORD *)(v19 + 2088) = v40
+  *(_DWORD *)(v19 + 2092) = v95
+  v42 = v90
   if ( *a6 >= 1 )
   {
     if ( *a6 == 2 )
     {
-      *(_QWORD *)(v19 + 2096) = v90;
-      *(_DWORD *)(v19 + 2104) = v41;
+      *(_QWORD *)(v19 + 2096) = v90
+      *(_DWORD *)(v19 + 2104) = v41
     }
     else
     {
-      *(LARGE_INTEGER *)(v19 + 2096) = v99;
-      *(_DWORD *)(v19 + 2104) = a5;
+      *(LARGE_INTEGER *)(v19 + 2096) = v99
+      *(_DWORD *)(v19 + 2104) = a5
     }
   }
-  v43 = v37 == 0;
-  v22 = v81;
+  v43 = v37 == 0
+  v22 = v81
   if ( !v43 )
   {
-    v78 = v94[0];
-    LOBYTE(v76) = a12;
-    LOBYTE(v74) = v81;
-    v84 = CipValidateImageHash(&CipValidateFileHash, v19, FileObject, a7, v42, v41, v26, v74, v76);
-    fixed = v84;
+    v78 = v94[0]
+    LOBYTE(v76) = a12
+    LOBYTE(v74) = v81
+    v84 = CipValidateImageHash(&CipValidateFileHash, v19, FileObject, a7, v42, v41, v26, v74, v76)
+    fixed = v84
     if ( v84 >= 0 )
     {
-      LOBYTE(v91) = 1;
-      goto LABEL_93;
+      LOBYTE(v91) = 1
+      goto LABEL_93
     }
     if ( !*(_QWORD *)(v19 + 1800) )
     {
 LABEL_78:
-      *(_QWORD *)(v19 + 1800) = &off_1C002B000;
-      goto LABEL_191;
+      *(_QWORD *)(v19 + 1800) = &off_1C002B000
+      goto LABEL_191
     }
-    ActionsForImage &= ~0x100u;
-    *(_DWORD *)(v19 + 1816) = ActionsForImage;
+    ActionsForImage &= ~0x100u
+    *(_DWORD *)(v19 + 1816) = ActionsForImage
   }
   if ( (ActionsForImage & 4) == 0 )
-    goto LABEL_85;
-  v78 = v94[0];
-  LOBYTE(v76) = a12;
-  LOBYTE(v74) = v81;
-  v44 = CipValidateImageHash(&CipValidatePageHash, v19, FileObject, a7, v90, Size[0], v26, v74, v76);
-  v43 = *(_QWORD *)(v19 + 1800) == 0;
-  fixed = v44;
-  v84 = v44;
+    goto LABEL_85
+  v78 = v94[0]
+  LOBYTE(v76) = a12
+  LOBYTE(v74) = v81
+  v44 = CipValidateImageHash(&CipValidatePageHash, v19, FileObject, a7, v90, Size[0], v26, v74, v76)
+  v43 = *(_QWORD *)(v19 + 1800) == 0
+  fixed = v44
+  v84 = v44
   if ( v43 )
-    goto LABEL_78;
+    goto LABEL_78
   if ( v44 >= 0 )
-    goto LABEL_93;
+    goto LABEL_93
   if ( (ActionsForImage & 8) != 0 )
   {
-    *(_DWORD *)(v19 + 1816) &= ~4u;
+    *(_DWORD *)(v19 + 1816) &= ~4u
 LABEL_85:
     if ( *a6 < 2 )
     {
-      *a6 = 2;
-      goto LABEL_67;
+      *a6 = 2
+      goto LABEL_67
     }
-    v78 = v94[0];
-    LOBYTE(v76) = a12;
-    LOBYTE(v74) = v81;
-    v45 = CipValidateImageHash(&CipValidateFileHash, v19, FileObject, a7, v90, Size[0], v26, v74, v76);
-    v43 = *(_QWORD *)(v19 + 1800) == 0;
-    fixed = v45;
-    v84 = v45;
+    v78 = v94[0]
+    LOBYTE(v76) = a12
+    LOBYTE(v74) = v81
+    v45 = CipValidateImageHash(&CipValidateFileHash, v19, FileObject, a7, v90, Size[0], v26, v74, v76)
+    v43 = *(_QWORD *)(v19 + 1800) == 0
+    fixed = v45
+    v84 = v45
     if ( v43 )
-      goto LABEL_78;
-    v46 = (unsigned __int8)v91;
+      goto LABEL_78
+    v46 = (unsigned __int8)v91
     if ( fixed >= 0 )
-      v46 = 1;
-    v91 = v46;
+      v46 = 1
+    v91 = v46
 LABEL_93:
-    v47 = fixed;
-    v48 = ActionsForImage & 0x40;
+    v47 = fixed
+    v48 = ActionsForImage & 0x40
     if ( (ActionsForImage & 0x40) != 0 )
     {
       if ( fixed < 0 )
-        goto LABEL_129;
-      v49 = v89;
-      v50 = *((_DWORD *)g_CipWhichLevelComparisons + 12);
+        goto LABEL_129
+      v49 = v89
+      v50 = *((_DWORD *)g_CipWhichLevelComparisons + 12)
       if ( !_bittest(&v50, *(_BYTE *)(v89 + 52) & 0xF) )
       {
 LABEL_100:
@@ -2465,88 +2459,88 @@ LABEL_100:
         {
           if ( (g_CiDeveloperMode & 0x20000) != 0 || (v26 & 5) != 0 && (g_CiDeveloperMode & 0x100) != 0 )
           {
-            LOBYTE(v49) = v81;
-            LODWORD(v72) = Size[0];
-            CiAuditImageForHvci(v19, v26, v49, a7, FileObject, v90, v72);
-            v49 = v89;
+            LOBYTE(v49) = v81
+            LODWORD(v72) = Size[0]
+            CiAuditImageForHvci(v19, v26, v49, a7, FileObject, v90, v72)
+            v49 = v89
           }
-          **(_BYTE **)&Size[1] = *(_BYTE *)(v49 + 52);
-          *v93 = *(_DWORD *)(v49 + 48);
-          *(_DWORD *)(v19 + 1504) ^= (*(_DWORD *)(v19 + 1504) ^ ~(*(_DWORD *)(v49 + 60) >> 2)) & 1;
+          **(_BYTE **)&Size[1] = *(_BYTE *)(v49 + 52)
+          *v93 = *(_DWORD *)(v49 + 48)
+          *(_DWORD *)(v19 + 1504) ^= (*(_DWORD *)(v19 + 1504) ^ ~(*(_DWORD *)(v49 + 60) >> 2)) & 1
           if ( g_NumberOfSiPolicies )
-            memmove(*(void **)(v19 + 1488), *(const void **)(v89 + 64), 4LL * (unsigned int)g_NumberOfSiPolicies);
+            memmove(*(void **)(v19 + 1488), *(const void **)(v89 + 64), 4LL * (unsigned int)g_NumberOfSiPolicies)
           if ( (v26 & 5) != 0 )
-            CiAuditDriverAllow(FileObject, v26, v89, v19);
+            CiAuditDriverAllow(FileObject, v26, v89, v19)
           if ( (_BYTE)v91 )
           {
-            v51 = v81 & 0xF;
-            v52 = *((_DWORD *)g_CipWhichLevelComparisons + v51);
+            v51 = v81 & 0xF
+            v52 = *((_DWORD *)g_CipWhichLevelComparisons + v51)
             if ( _bittest(&v52, **(_BYTE **)&Size[1] & 0xF) )
             {
               if ( (ActionsForImage & 2) != 0 && (*(_DWORD *)(v89 + 60) & 4) == 0 && (v92[0] & 0x10) == 0 )
               {
-                v53 = ActionsForImage & 0x100;
+                v53 = ActionsForImage & 0x100
                 if ( !v53
                   || (_DWORD)v95 != 33
                   || !(unsigned __int8)CiDoesFilenameHavePerAppPolicyRules((PCUNICODE_STRING)(v19 + 704)) )
                 {
-                  CipImageValidityPeriod(v19 + 24, &v105);
-                  v54 = 2;
-                  v55 = 2;
+                  CipImageValidityPeriod(v19 + 24, &v105)
+                  v54 = 2
+                  v55 = 2
                   if ( v48 )
                   {
-                    v55 = 66;
-                    v54 = 66;
+                    v55 = 66
+                    v54 = 66
                   }
                   if ( v53 )
-                    v55 = v54 | 0x400;
-                  v56 = *(_QWORD *)(v89 + 16);
+                    v55 = v54 | 0x400
+                  v56 = *(_QWORD *)(v89 + 16)
                   if ( v56 && *(_DWORD *)(v56 + 48) )
                   {
-                    v56 = *(_QWORD *)(v56 + 40);
-                    v57 = a7;
-                    v27 = FileObject;
-                    v79 = a7;
-                    v77 = *(_DWORD *)(v19 + 1728);
-                    v75 = *(_DWORD *)(v19 + 1732);
-                    v73 = v19 + 1736;
-                    BaseAddressa = *(_DWORD *)v56;
-                    EventDescriptora = *(_DWORD *)(v56 + 4);
+                    v56 = *(_QWORD *)(v56 + 40)
+                    v57 = a7
+                    v27 = FileObject
+                    v79 = a7
+                    v77 = *(_DWORD *)(v19 + 1728)
+                    v75 = *(_DWORD *)(v19 + 1732)
+                    v73 = v19 + 1736
+                    BaseAddressa = *(_DWORD *)v56
+                    EventDescriptora = *(_DWORD *)(v56 + 4)
                   }
                   else
                   {
-                    v57 = a7;
-                    v27 = FileObject;
+                    v57 = a7
+                    v27 = FileObject
                     if ( (*((_DWORD *)g_CipWhichLevelComparisons + v51) & 4) == 0 )
-                      goto LABEL_125;
-                    v79 = a7;
-                    v77 = 0;
-                    v75 = 0;
-                    v73 = 0;
-                    BaseAddressa = 0;
-                    EventDescriptora = 0;
+                      goto LABEL_125
+                    v79 = a7
+                    v77 = 0
+                    v75 = 0
+                    v73 = 0
+                    BaseAddressa = 0
+                    EventDescriptora = 0
                   }
-                  LOBYTE(v56) = **(_BYTE **)&Size[1];
-                  CipSetFileCache(v27, v55, v56, EventDescriptora, BaseAddressa, v73, v75, v77, v78, v79);
+                  LOBYTE(v56) = **(_BYTE **)&Size[1]
+                  CipSetFileCache(v27, v55, v56, EventDescriptora, BaseAddressa, v73, v75, v77, v78, v79)
 LABEL_125:
-                  v22 = v81;
+                  v22 = v81
 LABEL_130:
                   if ( !(unsigned __int8)XciSupported() )
                   {
                     if ( fixed < 0 )
                     {
-                      v60 = *(unsigned int *)(v19 + 28);
+                      v60 = *(unsigned int *)(v19 + 28)
                       if ( (_DWORD)v60 )
-                        v60 = ((_BYTE)v60 - 1) & 3;
-                      v59 = 152 * v60 + v19 + 32;
+                        v60 = ((_BYTE)v60 - 1) & 3
+                      v59 = 152 * v60 + v19 + 32
                     }
                     else
                     {
-                      v59 = v89;
+                      v59 = v89
                     }
-                    fixed = CipCallPeauth((unsigned int)fixed, v19 + 4, v57, v26, v59, v27);
+                    fixed = CipCallPeauth((unsigned int)fixed, v19 + 4, v57, v26, v59, v27)
                   }
-                  v84 = v47;
+                  v84 = v47
                   if ( (v26 & 0x2000000) != 0 )
                   {
 LABEL_191:
@@ -2563,45 +2557,45 @@ LABEL_191:
                                     *(_DWORD *)(v19 + 1728),
                                     v89,
                                     (__int64)v100,
-                                    (__int64)v98);
+                                    (__int64)v98)
                         }
                         else
                         {
-                          v63 = v98;
-                          *v100 = 0;
-                          *v63 = 0;
+                          v63 = v98
+                          *v100 = 0
+                          *v63 = 0
                         }
                       }
                       if ( fixed >= 0 )
                       {
-                        v64 = *(volatile signed __int32 ***)v94;
-                        v20 = 1;
+                        v64 = *(volatile signed __int32 ***)v94
+                        v20 = 1
 LABEL_204:
                         if ( v84 >= 0 )
                         {
-                          v65 = *(__int64 (__fastcall **)(volatile signed __int32 *))(*(_QWORD *)(v19 + 1800) + 8LL);
+                          v65 = *(__int64 (__fastcall **)(volatile signed __int32 *))(*(_QWORD *)(v19 + 1800) + 8LL)
                           if ( v65 )
-                            fixed = v65(*v64);
+                            fixed = v65(*v64)
                         }
-                        goto LABEL_207;
+                        goto LABEL_207
                       }
                     }
-                    goto LABEL_197;
+                    goto LABEL_197
                   }
-                  v84 = v47;
+                  v84 = v47
                   if ( fixed >= 0 )
-                    goto LABEL_152;
-                  v84 = v47;
+                    goto LABEL_152
+                  v84 = v47
                   if ( fixed == -1073740285 )
-                    goto LABEL_152;
-                  v84 = v47;
+                    goto LABEL_152
+                  v84 = v47
                   if ( fixed == -1073740283 )
-                    goto LABEL_152;
+                    goto LABEL_152
                   if ( (g_CiOptions & 4) != 0 )
                   {
-                    v84 = v47;
+                    v84 = v47
                     if ( (v26 & 0x80000000) != 0 )
-                      goto LABEL_152;
+                      goto LABEL_152
                   }
                   if ( (g_CiOptions & 2) != 0 && (v84 = v47, (v26 & 1) != 0)
                     || (v84 = v47, (v26 & 0x40000006) != 0)
@@ -2612,73 +2606,72 @@ LABEL_204:
                     || (v84 = v47, (v26 & 0x80000001) == 0) )
                   {
 LABEL_152:
-                    v28 = 0;
-                    goto LABEL_153;
+                    v28 = 0
+                    goto LABEL_153
                   }
-                  LOBYTE(v58) = v22;
-                  CipReportSystemOptionsReprieve((_DWORD)v27, a7, v26, v58, fixed);
-                  v84 = v47;
-                  *v93 = 0;
+                  LOBYTE(v58) = v22
+                  CipReportSystemOptionsReprieve((_DWORD)v27, a7, v26, v58, fixed)
+                  v84 = v47
+                  *v93 = 0
 LABEL_47:
-                  fixed = 0;
-                  v28 = 0;
-                  goto LABEL_153;
+                  fixed = 0
+                  v28 = 0
+                  goto LABEL_153
                 }
               }
             }
-            v22 = v81;
+            v22 = v81
           }
         }
 LABEL_129:
-        v27 = FileObject;
-        v57 = a7;
-        goto LABEL_130;
+        v27 = FileObject
+        v57 = a7
+        goto LABEL_130
       }
       fixed = CipMitigatePPLBypassThroughInterpreters(
                 (_DWORD)FileObject,
                 *(_QWORD *)(v19 + 2096),
                 *(_DWORD *)(v19 + 2104),
                 0,
-                1);
+                1)
       if ( fixed < 0 )
-        goto LABEL_129;
+        goto LABEL_129
       if ( **(_QWORD **)v94 )
       {
-        _InterlockedOr(**(volatile signed __int32 ***)v94, 0x10u);
-        v26 = a9;
-        v19 = *(_QWORD *)&v92[1];
+        _InterlockedOr(**(volatile signed __int32 ***)v94, 0x10u)
+        v26 = a9
+        v19 = *(_QWORD *)&v92[1]
       }
     }
-    v49 = v89;
-    goto LABEL_100;
+    v49 = v89
+    goto LABEL_100
   }
   if ( *a6 != 1 )
-    goto LABEL_93;
-  *a6 = 2;
-  fixed = -1073741789;
-  v20 = 1;
+    goto LABEL_93
+  *a6 = 2
+  fixed = -1073741789
+  v20 = 1
 LABEL_198:
-  v64 = *(volatile signed __int32 ***)v94;
+  v64 = *(volatile signed __int32 ***)v94
   if ( **(_QWORD **)v94 && !v102 )
   {
-    CiReleaseContext();
-    *v64 = 0;
+    CiReleaseContext()
+    *v64 = 0
   }
   if ( fixed >= 0 )
-    goto LABEL_204;
+    goto LABEL_204
 LABEL_207:
   if ( v19 )
-    CiFreeValidationContext((PSLIST_ENTRY)v19);
+    CiFreeValidationContext((PSLIST_ENTRY)v19)
   if ( v20 )
-    CiLogStatusEventWithCorrelationId((unsigned int)fixed, &CiValidateImageHeaderComplete, 0);
-  ExReleasePushLockSharedEx(&g_CipPolicyLock, 0);
-  KeLeaveCriticalRegion();
-  IoClearActivityIdThread(v103);
-  return (unsigned int)fixed;
+    CiLogStatusEventWithCorrelationId((unsigned int)fixed, &CiValidateImageHeaderComplete, 0)
+  ExReleasePushLockSharedEx(&g_CipPolicyLock, 0)
+  KeLeaveCriticalRegion()
+  IoClearActivityIdThread(v103)
+  return (unsigned int)fixed
 }
 
 ```
-
 
 
 --- Callees (Functions this one calls) ---
@@ -2703,143 +2696,143 @@ __int64 __fastcall CiValidateImageHeader(
         _QWORD *a15,
         _DWORD *a16)
 {
-  _BYTE *v17; // rbx
-  _DWORD *v18; // r15
-  __int64 v19; // rsi
-  char v20; // r12
-  int fixed; // edi
-  char v22; // r12
-  int v23; // ebx
-  int v24; // ebx
-  __int64 v25; // r9
-  unsigned int v26; // r14d
-  struct _FILE_OBJECT *v27; // r13
-  char v28; // cl
-  char v29; // di
-  int ActionsForImage; // ebx
-  int v31; // ecx
-  int v32; // r8d
-  int v33; // ecx
-  int v34; // r15d
-  char v35; // al
-  int v36; // edx
-  int v37; // r12d
-  int v38; // eax
-  int ValidationContext; // eax
-  int v40; // eax
-  int v41; // edx
-  PVOID v42; // rcx
-  bool v43; // zf
-  int v44; // eax
-  int v45; // eax
-  int v46; // eax
-  int v47; // r15d
-  int v48; // r13d
-  __int64 v49; // r8
-  int v50; // ecx
-  __int64 v51; // r12
-  int v52; // ecx
-  int v53; // ebx
-  int v54; // eax
-  int v55; // edx
-  __int64 v56; // r8
-  __int64 v57; // rbx
-  int v58; // r9d
-  __int64 v59; // rax
-  __int64 v60; // rax
-  int v61; // eax
-  int v62; // ecx
-  _DWORD *v63; // rax
-  volatile signed __int32 **v64; // rbx
-  __int64 (__fastcall *v65)(volatile signed __int32 *); // rax
-  int EventDescriptorb; // [rsp+20h] [rbp-E0h]
-  PCEVENT_DESCRIPTOR EventDescriptor; // [rsp+20h] [rbp-E0h]
-  int EventDescriptora; // [rsp+20h] [rbp-E0h]
-  int BaseAddress; // [rsp+28h] [rbp-D8h]
-  int BaseAddressa; // [rsp+28h] [rbp-D8h]
-  ULONGLONG v72; // [rsp+30h] [rbp-D0h]
-  ULONGLONG v73; // [rsp+30h] [rbp-D0h]
-  int v74; // [rsp+38h] [rbp-C8h]
-  int v75; // [rsp+38h] [rbp-C8h]
-  int v76; // [rsp+40h] [rbp-C0h]
-  int v77; // [rsp+40h] [rbp-C0h]
-  int v78; // [rsp+48h] [rbp-B8h]
-  __int64 v79; // [rsp+50h] [rbp-B0h]
-  char v80; // [rsp+60h] [rbp-A0h]
-  char v81; // [rsp+70h] [rbp-90h]
-  char v82; // [rsp+74h] [rbp-8Ch] BYREF
-  char v83[3]; // [rsp+75h] [rbp-8Bh] BYREF
-  int v84; // [rsp+78h] [rbp-88h]
-  PFILE_OBJECT FileObject; // [rsp+80h] [rbp-80h]
-  char v86; // [rsp+88h] [rbp-78h] BYREF
-  char v87; // [rsp+89h] [rbp-77h]
-  _DWORD Size[3]; // [rsp+8Ch] [rbp-74h]
-  __int64 v89; // [rsp+98h] [rbp-68h]
-  PVOID v90; // [rsp+A0h] [rbp-60h]
-  int v91; // [rsp+A8h] [rbp-58h]
-  _DWORD v92[3]; // [rsp+ACh] [rbp-54h] BYREF
-  _DWORD *v93; // [rsp+B8h] [rbp-48h]
-  int v94[2]; // [rsp+C0h] [rbp-40h]
-  __int64 v95; // [rsp+C8h] [rbp-38h] BYREF
-  int v96; // [rsp+D0h] [rbp-30h] BYREF
-  __int64 v97; // [rsp+D8h] [rbp-28h]
-  _DWORD *v98; // [rsp+E0h] [rbp-20h]
-  LARGE_INTEGER v99; // [rsp+E8h] [rbp-18h] BYREF
-  _QWORD *v100; // [rsp+F0h] [rbp-10h]
-  LARGE_INTEGER PerformanceCounter; // [rsp+F8h] [rbp-8h] BYREF
-  _DWORD *v102; // [rsp+100h] [rbp+0h]
-  __int64 v103; // [rsp+108h] [rbp+8h]
-  GUID ActivityId; // [rsp+110h] [rbp+10h] BYREF
-  __int128 v105; // [rsp+120h] [rbp+20h] BYREF
+  _BYTE *v17
+  _DWORD *v18
+  __int64 v19
+  char v20
+  int fixed
+  char v22
+  int v23
+  int v24
+  __int64 v25
+  unsigned int v26
+  struct _FILE_OBJECT *v27
+  char v28
+  char v29
+  int ActionsForImage
+  int v31
+  int v32
+  int v33
+  int v34
+  char v35
+  int v36
+  int v37
+  int v38
+  int ValidationContext
+  int v40
+  int v41
+  PVOID v42
+  bool v43
+  int v44
+  int v45
+  int v46
+  int v47
+  int v48
+  __int64 v49
+  int v50
+  __int64 v51
+  int v52
+  int v53
+  int v54
+  int v55
+  __int64 v56
+  __int64 v57
+  int v58
+  __int64 v59
+  __int64 v60
+  int v61
+  int v62
+  _DWORD *v63
+  volatile signed __int32 **v64
+  __int64 (__fastcall *v65)(volatile signed __int32 *)
+  int EventDescriptorb
+  PCEVENT_DESCRIPTOR EventDescriptor
+  int EventDescriptora
+  int BaseAddress
+  int BaseAddressa
+  ULONGLONG v72
+  ULONGLONG v73
+  int v74
+  int v75
+  int v76
+  int v77
+  int v78
+  __int64 v79
+  char v80
+  char v81
+  char v82
+  char v83[3]
+  int v84
+  PFILE_OBJECT FileObject
+  char v86
+  char v87
+  _DWORD Size[3]
+  __int64 v89
+  PVOID v90
+  int v91
+  _DWORD v92[3]
+  _DWORD *v93
+  int v94[2]
+  __int64 v95
+  int v96
+  __int64 v97
+  _DWORD *v98
+  LARGE_INTEGER v99
+  _QWORD *v100
+  LARGE_INTEGER PerformanceCounter
+  _DWORD *v102
+  __int64 v103
+  GUID ActivityId
+  __int128 v105
 
-  v17 = a13;
-  v97 = a8;
-  v93 = a14;
-  v100 = a15;
-  FileObject = a1;
-  v98 = a16;
-  v90 = a2;
-  *(_QWORD *)v94 = a10;
-  v102 = (_DWORD *)*a10;
-  v18 = v102;
-  v99 = a4;
-  Size[0] = a3;
-  v19 = 0;
-  *(_QWORD *)&Size[1] = a13;
-  v20 = 0;
-  LOBYTE(v91) = 0;
-  v96 = 0;
-  v82 = 0;
-  v105 = 0;
-  v89 = 0;
-  v84 = -1073740760;
-  memset(v92, 0, sizeof(v92));
-  ActivityId = 0;
-  v95 = 0;
-  v80 = 0;
-  EtwActivityIdControl(3u, &ActivityId);
-  v103 = IoSetActivityIdThread(&ActivityId);
-  KeEnterCriticalRegion();
-  ExAcquirePushLockSharedEx(&g_CipPolicyLock, 0);
-  PerformanceCounter = KeQueryPerformanceCounter(0);
-  *v17 = 1;
-  fixed = CiInitializePhase2();
+  v17 = a13
+  v97 = a8
+  v93 = a14
+  v100 = a15
+  FileObject = a1
+  v98 = a16
+  v90 = a2
+  *(_QWORD *)v94 = a10
+  v102 = (_DWORD *)*a10
+  v18 = v102
+  v99 = a4
+  Size[0] = a3
+  v19 = 0
+  *(_QWORD *)&Size[1] = a13
+  v20 = 0
+  LOBYTE(v91) = 0
+  v96 = 0
+  v82 = 0
+  v105 = 0
+  v89 = 0
+  v84 = -1073740760
+  memset(v92, 0, sizeof(v92))
+  ActivityId = 0
+  v95 = 0
+  v80 = 0
+  EtwActivityIdControl(3u, &ActivityId)
+  v103 = IoSetActivityIdThread(&ActivityId)
+  KeEnterCriticalRegion()
+  ExAcquirePushLockSharedEx(&g_CipPolicyLock, 0)
+  PerformanceCounter = KeQueryPerformanceCounter(0)
+  *v17 = 1
+  fixed = CiInitializePhase2()
   if ( fixed < 0 )
-    goto LABEL_198;
-  v22 = a11;
-  v23 = a9;
-  v81 = a11;
-  CiLogFileRequestedValidationEvent((_DWORD)a1 + 88, &CiValidateImageHeaderStart);
+    goto LABEL_198
+  v22 = a11
+  v23 = a9
+  v81 = a11
+  CiLogFileRequestedValidationEvent((_DWORD)a1 + 88, &CiValidateImageHeaderStart)
   if ( v18 && (*v18 & 8) == 0 )
   {
-    v24 = (int)v90;
+    v24 = (int)v90
   }
   else
   {
-    ExReleasePushLockSharedEx(&g_CipPolicyLock, 0);
-    KeLeaveCriticalRegion();
-    EventDescriptorb = v23;
-    v24 = (int)v90;
+    ExReleasePushLockSharedEx(&g_CipPolicyLock, 0)
+    KeLeaveCriticalRegion()
+    EventDescriptorb = v23
+    v24 = (int)v90
     fixed = XciValidateImageHeader(
               a1,
               v90,
@@ -2851,53 +2844,53 @@ __int64 __fastcall CiValidateImageHeader(
               *(_QWORD *)&Size[1],
               v93,
               v100,
-              v98);
-    KeEnterCriticalRegion();
-    ExAcquirePushLockSharedEx(&g_CipPolicyLock, 0);
+              v98)
+    KeEnterCriticalRegion()
+    ExAcquirePushLockSharedEx(&g_CipPolicyLock, 0)
     if ( v18 )
-      goto LABEL_191;
-    v18 = **(_DWORD ***)v94;
+      goto LABEL_191
+    v18 = **(_DWORD ***)v94
     if ( fixed != -1073700607 && fixed != -1073741637 )
     {
       if ( v18 )
       {
-        *v18 |= 8u;
+        *v18 |= 8u
       }
       else if ( fixed == -1073741789 )
       {
-        *a6 = 2;
+        *a6 = 2
       }
-      goto LABEL_191;
+      goto LABEL_191
     }
   }
-  fixed = CipFixImageType(v24, (unsigned int)&v96, (unsigned int)&a9, (unsigned int)&v82, (__int64)&v95 + 4);
+  fixed = CipFixImageType(v24, (unsigned int)&v96, (unsigned int)&a9, (unsigned int)&v82, (__int64)&v95 + 4)
   if ( fixed < 0 )
   {
 LABEL_197:
-    v20 = 1;
-    goto LABEL_198;
+    v20 = 1
+    goto LABEL_198
   }
-  v26 = a9;
-  v87 = 4;
+  v26 = a9
+  v87 = 4
   if ( v82 && ((a9 & 8) != 0 || (a9 & 0xE5DFFF97) == 0 && (PsGetProcessProtection(a7) & 7) == 1) )
   {
-    LODWORD(v27) = (_DWORD)FileObject;
-    v28 = 1;
-    v80 = 1;
+    LODWORD(v27) = (_DWORD)FileObject
+    v28 = 1
+    v80 = 1
 LABEL_153:
-    v34 = a7;
-    goto LABEL_154;
+    v34 = a7
+    goto LABEL_154
   }
-  v29 = v22;
+  v29 = v22
   if ( (v26 & 0xE5DFFF87) == 0 && !v22 )
   {
-    v29 = 0;
+    v29 = 0
     if ( (*((unsigned __int8 (**)(void))&xmmword_1C0039390 + 1))() == 2 )
-      v29 = 2;
-    v81 = v29;
+      v29 = 2
+    v81 = v29
   }
-  LOBYTE(v25) = v29;
-  ActionsForImage = CiGetActionsForImage(a7, FileObject, v26, v25);
+  LOBYTE(v25) = v29
+  ActionsForImage = CiGetActionsForImage(a7, FileObject, v26, v25)
   if ( (ActionsForImage & 1) != 0 )
   {
     fixed = CipValidateFileInCache(
@@ -2909,7 +2902,7 @@ LABEL_153:
               (__int64)&v92[1],
               (__int64)&v95,
               *(__int64 *)&Size[1],
-              (__int64)v92);
+              (__int64)v92)
     if ( fixed >= 0 )
     {
       if ( (ActionsForImage & 0x10) == 0
@@ -2923,55 +2916,55 @@ LABEL_153:
             || (unsigned int)PsIsProtectedProcess(a7)
             && (v33 = *((_DWORD *)g_CipWhichLevelComparisons + 12), !_bittest(&v33, **(_BYTE **)&Size[1] & 0xF)) )
           {
-            v27 = FileObject;
-            v22 = v81;
-            *v93 = 2;
+            v27 = FileObject
+            v22 = v81
+            *v93 = 2
             if ( (g_CiDeveloperMode & 0x20000) != 0 )
             {
-              LODWORD(v72) = Size[0];
-              LOBYTE(v32) = v81;
-              v34 = a7;
-              CiAuditImageForHvci(0, v26, v32, a7, v27, v90, v72);
-              v28 = 0;
-              v19 = *(_QWORD *)&v92[1];
+              LODWORD(v72) = Size[0]
+              LOBYTE(v32) = v81
+              v34 = a7
+              CiAuditImageForHvci(0, v26, v32, a7, v27, v90, v72)
+              v28 = 0
+              v19 = *(_QWORD *)&v92[1]
 LABEL_154:
               if ( v82 )
               {
                 if ( ((fixed + 1073741793) & 0xFFFFFFFB) != 0 )
                 {
-                  CipReportSharedSectionFailure(v34, (_DWORD)v27, v26, fixed, v28);
+                  CipReportSharedSectionFailure(v34, (_DWORD)v27, v26, fixed, v28)
                   if ( v80 )
                   {
-                    fixed = -1073741701;
-                    goto LABEL_197;
+                    fixed = -1073741701
+                    goto LABEL_197
                   }
                 }
               }
               if ( !v19 )
-                goto LABEL_191;
+                goto LABEL_191
               if ( (v26 & 0xE5DFFF87) != 0 && (v26 & 0x20000000) == 0 )
               {
                 if ( fixed >= 0 )
-                  goto LABEL_184;
+                  goto LABEL_184
                 if ( fixed == -1073740760
                   || fixed == -1073740285
                   || fixed == -1058471934
                   || fixed == -1073740283
                   || fixed == -1058340861 )
                 {
-                  fixed = CipReportAndReprieveDriverAndProtectedImageFailure(v19, v34, (_DWORD)v27, v26, v22, fixed);
+                  fixed = CipReportAndReprieveDriverAndProtectedImageFailure(v19, v34, (_DWORD)v27, v26, v22, fixed)
                   if ( fixed >= 0 )
                   {
 LABEL_181:
-                    *v93 = 0;
-                    goto LABEL_182;
+                    *v93 = 0
+                    goto LABEL_182
                   }
-                  goto LABEL_183;
+                  goto LABEL_183
                 }
 LABEL_182:
                 if ( fixed >= 0 )
-                  goto LABEL_184;
-                goto LABEL_183;
+                  goto LABEL_184
+                goto LABEL_183
               }
               if ( fixed < 0 )
               {
@@ -2982,20 +2975,20 @@ LABEL_182:
                   && fixed != -1058340861
                   && fixed != -1073741701 )
                 {
-                  goto LABEL_182;
+                  goto LABEL_182
                 }
               }
               else
               {
-                v62 = *((_DWORD *)g_CipWhichLevelComparisons + (v22 & 0xF));
+                v62 = *((_DWORD *)g_CipWhichLevelComparisons + (v22 & 0xF))
                 if ( _bittest(&v62, **(_BYTE **)&Size[1] & 0xF) )
                 {
 LABEL_184:
                   if ( (*(_DWORD *)(v19 + 1504) & 2) != 0 )
                   {
-                    v99 = KeQueryPerformanceCounter(0);
+                    v99 = KeQueryPerformanceCounter(0)
                     if ( (unsigned __int8)v22 >= 2u || *(_DWORD *)(v19 + 1480) )
-                      v87 = v22;
+                      v87 = v22
                     CipProcessSIPolicyLogs(
                       v19,
                       (_DWORD)v27,
@@ -3005,20 +2998,20 @@ LABEL_184:
                       v87,
                       **(_BYTE **)&Size[1],
                       (__int64)v90,
-                      Size[0]);
+                      Size[0])
                     if ( (*(_DWORD *)(v19 + 1504) & 1) == 0
                       && *(__int64 (__fastcall ***)())(v19 + 1800) != &off_1C002B000 )
                     {
-                      CiInstrumentVbsPolicyFailure(v19);
+                      CiInstrumentVbsPolicyFailure(v19)
                     }
                   }
-                  goto LABEL_191;
+                  goto LABEL_191
                 }
               }
-              v83[0] = 1;
-              v86 = 0;
-              LOBYTE(v72) = **(_BYTE **)&Size[1];
-              LOBYTE(BaseAddress) = v22;
+              v83[0] = 1
+              v86 = 0
+              LOBYTE(v72) = **(_BYTE **)&Size[1]
+              LOBYTE(BaseAddress) = v22
               fixed = CipReportAndReprieveUMCIFailure(
                         v19,
                         v34,
@@ -3029,29 +3022,29 @@ LABEL_184:
                         v72,
                         fixed,
                         (__int64)&v86,
-                        (__int64)v83);
+                        (__int64)v83)
               if ( fixed >= 0 )
               {
                 if ( !v86 )
-                  goto LABEL_182;
-                **(_BYTE **)&Size[1] = v83[0];
-                goto LABEL_181;
+                  goto LABEL_182
+                **(_BYTE **)&Size[1] = v83[0]
+                goto LABEL_181
               }
 LABEL_183:
-              CiBlackboxValidateImageHeaderFailure(v19, v34, (_DWORD)v27, v26, v22, fixed);
-              goto LABEL_184;
+              CiBlackboxValidateImageHeaderFailure(v19, v34, (_DWORD)v27, v26, v22, fixed)
+              goto LABEL_184
             }
-            v19 = *(_QWORD *)&v92[1];
-            goto LABEL_152;
+            v19 = *(_QWORD *)&v92[1]
+            goto LABEL_152
           }
         }
       }
     }
-    v19 = *(_QWORD *)&v92[1];
+    v19 = *(_QWORD *)&v92[1]
     if ( *(_QWORD *)&v92[1] && fixed == -1073741267 )
       ActionsForImage ^= ((unsigned __int16)ActionsForImage
                         ^ (unsigned __int16)*(_DWORD *)(*(_QWORD *)&v92[1] + 1816LL))
-                       & 0x100;
+                       & 0x100
   }
   if ( (ActionsForImage & 0x40) != 0 )
   {
@@ -3062,23 +3055,23 @@ LABEL_183:
         && (g_CiPolicyState & 0x40) == 0
         && (g_CiPolicyState & 0x80u) == 0 )
       {
-        v35 = ((__int64 (__fastcall *)(PFILE_OBJECT))xmmword_1C0039390)(FileObject);
-        v22 = v81;
-        v83[0] = v35;
-        v36 = *((_DWORD *)g_CipWhichLevelComparisons + (v81 & 0xF));
+        v35 = ((__int64 (__fastcall *)(PFILE_OBJECT))xmmword_1C0039390)(FileObject)
+        v22 = v81
+        v83[0] = v35
+        v36 = *((_DWORD *)g_CipWhichLevelComparisons + (v81 & 0xF))
         if ( _bittest(&v36, v35 & 0xF) )
         {
-          LODWORD(v27) = (_DWORD)FileObject;
-          **(_BYTE **)&Size[1] = v35;
-          *v93 = 2;
-          goto LABEL_47;
+          LODWORD(v27) = (_DWORD)FileObject
+          **(_BYTE **)&Size[1] = v35
+          *v93 = 2
+          goto LABEL_47
         }
       }
     }
   }
-  v37 = ActionsForImage & 0x100;
+  v37 = ActionsForImage & 0x100
   if ( (ActionsForImage & 0x100) != 0 )
-    goto LABEL_61;
+    goto LABEL_61
   if ( (ActionsForImage & 4) != 0 )
   {
     if ( (v26 & 0x10000000) == 0
@@ -3086,35 +3079,35 @@ LABEL_183:
        || (v26 & 5) != 0 && (g_CiOptions & 0x8000) != 0
        || (g_CiOptions & 0x4000) != 0 && (v26 & 0x20000005) == 0) )
     {
-      v38 = 1;
-      goto LABEL_65;
+      v38 = 1
+      goto LABEL_65
     }
     if ( (v26 & 5) != 0 && (g_CiPolicyState & 1) != 0 )
     {
 LABEL_60:
-      v38 = 1;
-      goto LABEL_65;
+      v38 = 1
+      goto LABEL_65
     }
 LABEL_61:
     if ( (v26 & 0x20000005) != 0 || (g_CiPolicyState & 2) == 0 && (ActionsForImage & 0x40) == 0 )
     {
-      v38 = 0;
-      goto LABEL_65;
+      v38 = 0
+      goto LABEL_65
     }
-    goto LABEL_60;
+    goto LABEL_60
   }
-  v38 = v37 + 2;
+  v38 = v37 + 2
 LABEL_65:
   if ( v38 > *a6 )
   {
-    *a6 = v38;
+    *a6 = v38
 LABEL_67:
-    fixed = -1073741789;
-    goto LABEL_197;
+    fixed = -1073741789
+    goto LABEL_197
   }
   if ( !v19 )
   {
-    LODWORD(EventDescriptor) = Size[0];
+    LODWORD(EventDescriptor) = Size[0]
     ValidationContext = CipAllocateValidationContext(
                           v26,
                           ActionsForImage,
@@ -3124,98 +3117,98 @@ LABEL_67:
                           v97,
                           (__int64)v18,
                           a7,
-                          (__int64)&v92[1]);
-    v19 = *(_QWORD *)&v92[1];
-    fixed = ValidationContext;
+                          (__int64)&v92[1])
+    v19 = *(_QWORD *)&v92[1]
+    fixed = ValidationContext
     if ( ValidationContext < 0 )
-      goto LABEL_197;
+      goto LABEL_197
   }
-  v40 = HIDWORD(v95);
-  v41 = Size[0];
-  *(_DWORD *)(v19 + 1816) = ActionsForImage;
-  *(_DWORD *)(v19 + 2088) = v40;
-  *(_DWORD *)(v19 + 2092) = v95;
-  v42 = v90;
+  v40 = HIDWORD(v95)
+  v41 = Size[0]
+  *(_DWORD *)(v19 + 1816) = ActionsForImage
+  *(_DWORD *)(v19 + 2088) = v40
+  *(_DWORD *)(v19 + 2092) = v95
+  v42 = v90
   if ( *a6 >= 1 )
   {
     if ( *a6 == 2 )
     {
-      *(_QWORD *)(v19 + 2096) = v90;
-      *(_DWORD *)(v19 + 2104) = v41;
+      *(_QWORD *)(v19 + 2096) = v90
+      *(_DWORD *)(v19 + 2104) = v41
     }
     else
     {
-      *(LARGE_INTEGER *)(v19 + 2096) = v99;
-      *(_DWORD *)(v19 + 2104) = a5;
+      *(LARGE_INTEGER *)(v19 + 2096) = v99
+      *(_DWORD *)(v19 + 2104) = a5
     }
   }
-  v43 = v37 == 0;
-  v22 = v81;
+  v43 = v37 == 0
+  v22 = v81
   if ( !v43 )
   {
-    v78 = v94[0];
-    LOBYTE(v76) = a12;
-    LOBYTE(v74) = v81;
-    v84 = CipValidateImageHash(&CipValidateFileHash, v19, FileObject, a7, v42, v41, v26, v74, v76);
-    fixed = v84;
+    v78 = v94[0]
+    LOBYTE(v76) = a12
+    LOBYTE(v74) = v81
+    v84 = CipValidateImageHash(&CipValidateFileHash, v19, FileObject, a7, v42, v41, v26, v74, v76)
+    fixed = v84
     if ( v84 >= 0 )
     {
-      LOBYTE(v91) = 1;
-      goto LABEL_93;
+      LOBYTE(v91) = 1
+      goto LABEL_93
     }
     if ( !*(_QWORD *)(v19 + 1800) )
     {
 LABEL_78:
-      *(_QWORD *)(v19 + 1800) = &off_1C002B000;
-      goto LABEL_191;
+      *(_QWORD *)(v19 + 1800) = &off_1C002B000
+      goto LABEL_191
     }
-    ActionsForImage &= ~0x100u;
-    *(_DWORD *)(v19 + 1816) = ActionsForImage;
+    ActionsForImage &= ~0x100u
+    *(_DWORD *)(v19 + 1816) = ActionsForImage
   }
   if ( (ActionsForImage & 4) == 0 )
-    goto LABEL_85;
-  v78 = v94[0];
-  LOBYTE(v76) = a12;
-  LOBYTE(v74) = v81;
-  v44 = CipValidateImageHash(&CipValidatePageHash, v19, FileObject, a7, v90, Size[0], v26, v74, v76);
-  v43 = *(_QWORD *)(v19 + 1800) == 0;
-  fixed = v44;
-  v84 = v44;
+    goto LABEL_85
+  v78 = v94[0]
+  LOBYTE(v76) = a12
+  LOBYTE(v74) = v81
+  v44 = CipValidateImageHash(&CipValidatePageHash, v19, FileObject, a7, v90, Size[0], v26, v74, v76)
+  v43 = *(_QWORD *)(v19 + 1800) == 0
+  fixed = v44
+  v84 = v44
   if ( v43 )
-    goto LABEL_78;
+    goto LABEL_78
   if ( v44 >= 0 )
-    goto LABEL_93;
+    goto LABEL_93
   if ( (ActionsForImage & 8) != 0 )
   {
-    *(_DWORD *)(v19 + 1816) &= ~4u;
+    *(_DWORD *)(v19 + 1816) &= ~4u
 LABEL_85:
     if ( *a6 < 2 )
     {
-      *a6 = 2;
-      goto LABEL_67;
+      *a6 = 2
+      goto LABEL_67
     }
-    v78 = v94[0];
-    LOBYTE(v76) = a12;
-    LOBYTE(v74) = v81;
-    v45 = CipValidateImageHash(&CipValidateFileHash, v19, FileObject, a7, v90, Size[0], v26, v74, v76);
-    v43 = *(_QWORD *)(v19 + 1800) == 0;
-    fixed = v45;
-    v84 = v45;
+    v78 = v94[0]
+    LOBYTE(v76) = a12
+    LOBYTE(v74) = v81
+    v45 = CipValidateImageHash(&CipValidateFileHash, v19, FileObject, a7, v90, Size[0], v26, v74, v76)
+    v43 = *(_QWORD *)(v19 + 1800) == 0
+    fixed = v45
+    v84 = v45
     if ( v43 )
-      goto LABEL_78;
-    v46 = (unsigned __int8)v91;
+      goto LABEL_78
+    v46 = (unsigned __int8)v91
     if ( fixed >= 0 )
-      v46 = 1;
-    v91 = v46;
+      v46 = 1
+    v91 = v46
 LABEL_93:
-    v47 = fixed;
-    v48 = ActionsForImage & 0x40;
+    v47 = fixed
+    v48 = ActionsForImage & 0x40
     if ( (ActionsForImage & 0x40) != 0 )
     {
       if ( fixed < 0 )
-        goto LABEL_129;
-      v49 = v89;
-      v50 = *((_DWORD *)g_CipWhichLevelComparisons + 12);
+        goto LABEL_129
+      v49 = v89
+      v50 = *((_DWORD *)g_CipWhichLevelComparisons + 12)
       if ( !_bittest(&v50, *(_BYTE *)(v89 + 52) & 0xF) )
       {
 LABEL_100:
@@ -3223,88 +3216,88 @@ LABEL_100:
         {
           if ( (g_CiDeveloperMode & 0x20000) != 0 || (v26 & 5) != 0 && (g_CiDeveloperMode & 0x100) != 0 )
           {
-            LOBYTE(v49) = v81;
-            LODWORD(v72) = Size[0];
-            CiAuditImageForHvci(v19, v26, v49, a7, FileObject, v90, v72);
-            v49 = v89;
+            LOBYTE(v49) = v81
+            LODWORD(v72) = Size[0]
+            CiAuditImageForHvci(v19, v26, v49, a7, FileObject, v90, v72)
+            v49 = v89
           }
-          **(_BYTE **)&Size[1] = *(_BYTE *)(v49 + 52);
-          *v93 = *(_DWORD *)(v49 + 48);
-          *(_DWORD *)(v19 + 1504) ^= (*(_DWORD *)(v19 + 1504) ^ ~(*(_DWORD *)(v49 + 60) >> 2)) & 1;
+          **(_BYTE **)&Size[1] = *(_BYTE *)(v49 + 52)
+          *v93 = *(_DWORD *)(v49 + 48)
+          *(_DWORD *)(v19 + 1504) ^= (*(_DWORD *)(v19 + 1504) ^ ~(*(_DWORD *)(v49 + 60) >> 2)) & 1
           if ( g_NumberOfSiPolicies )
-            memmove(*(void **)(v19 + 1488), *(const void **)(v89 + 64), 4LL * (unsigned int)g_NumberOfSiPolicies);
+            memmove(*(void **)(v19 + 1488), *(const void **)(v89 + 64), 4LL * (unsigned int)g_NumberOfSiPolicies)
           if ( (v26 & 5) != 0 )
-            CiAuditDriverAllow(FileObject, v26, v89, v19);
+            CiAuditDriverAllow(FileObject, v26, v89, v19)
           if ( (_BYTE)v91 )
           {
-            v51 = v81 & 0xF;
-            v52 = *((_DWORD *)g_CipWhichLevelComparisons + v51);
+            v51 = v81 & 0xF
+            v52 = *((_DWORD *)g_CipWhichLevelComparisons + v51)
             if ( _bittest(&v52, **(_BYTE **)&Size[1] & 0xF) )
             {
               if ( (ActionsForImage & 2) != 0 && (*(_DWORD *)(v89 + 60) & 4) == 0 && (v92[0] & 0x10) == 0 )
               {
-                v53 = ActionsForImage & 0x100;
+                v53 = ActionsForImage & 0x100
                 if ( !v53
                   || (_DWORD)v95 != 33
                   || !(unsigned __int8)CiDoesFilenameHavePerAppPolicyRules((PCUNICODE_STRING)(v19 + 704)) )
                 {
-                  CipImageValidityPeriod(v19 + 24, &v105);
-                  v54 = 2;
-                  v55 = 2;
+                  CipImageValidityPeriod(v19 + 24, &v105)
+                  v54 = 2
+                  v55 = 2
                   if ( v48 )
                   {
-                    v55 = 66;
-                    v54 = 66;
+                    v55 = 66
+                    v54 = 66
                   }
                   if ( v53 )
-                    v55 = v54 | 0x400;
-                  v56 = *(_QWORD *)(v89 + 16);
+                    v55 = v54 | 0x400
+                  v56 = *(_QWORD *)(v89 + 16)
                   if ( v56 && *(_DWORD *)(v56 + 48) )
                   {
-                    v56 = *(_QWORD *)(v56 + 40);
-                    v57 = a7;
-                    v27 = FileObject;
-                    v79 = a7;
-                    v77 = *(_DWORD *)(v19 + 1728);
-                    v75 = *(_DWORD *)(v19 + 1732);
-                    v73 = v19 + 1736;
-                    BaseAddressa = *(_DWORD *)v56;
-                    EventDescriptora = *(_DWORD *)(v56 + 4);
+                    v56 = *(_QWORD *)(v56 + 40)
+                    v57 = a7
+                    v27 = FileObject
+                    v79 = a7
+                    v77 = *(_DWORD *)(v19 + 1728)
+                    v75 = *(_DWORD *)(v19 + 1732)
+                    v73 = v19 + 1736
+                    BaseAddressa = *(_DWORD *)v56
+                    EventDescriptora = *(_DWORD *)(v56 + 4)
                   }
                   else
                   {
-                    v57 = a7;
-                    v27 = FileObject;
+                    v57 = a7
+                    v27 = FileObject
                     if ( (*((_DWORD *)g_CipWhichLevelComparisons + v51) & 4) == 0 )
-                      goto LABEL_125;
-                    v79 = a7;
-                    v77 = 0;
-                    v75 = 0;
-                    v73 = 0;
-                    BaseAddressa = 0;
-                    EventDescriptora = 0;
+                      goto LABEL_125
+                    v79 = a7
+                    v77 = 0
+                    v75 = 0
+                    v73 = 0
+                    BaseAddressa = 0
+                    EventDescriptora = 0
                   }
-                  LOBYTE(v56) = **(_BYTE **)&Size[1];
-                  CipSetFileCache(v27, v55, v56, EventDescriptora, BaseAddressa, v73, v75, v77, v78, v79);
+                  LOBYTE(v56) = **(_BYTE **)&Size[1]
+                  CipSetFileCache(v27, v55, v56, EventDescriptora, BaseAddressa, v73, v75, v77, v78, v79)
 LABEL_125:
-                  v22 = v81;
+                  v22 = v81
 LABEL_130:
                   if ( !(unsigned __int8)XciSupported() )
                   {
                     if ( fixed < 0 )
                     {
-                      v60 = *(unsigned int *)(v19 + 28);
+                      v60 = *(unsigned int *)(v19 + 28)
                       if ( (_DWORD)v60 )
-                        v60 = ((_BYTE)v60 - 1) & 3;
-                      v59 = 152 * v60 + v19 + 32;
+                        v60 = ((_BYTE)v60 - 1) & 3
+                      v59 = 152 * v60 + v19 + 32
                     }
                     else
                     {
-                      v59 = v89;
+                      v59 = v89
                     }
-                    fixed = CipCallPeauth((unsigned int)fixed, v19 + 4, v57, v26, v59, v27);
+                    fixed = CipCallPeauth((unsigned int)fixed, v19 + 4, v57, v26, v59, v27)
                   }
-                  v84 = v47;
+                  v84 = v47
                   if ( (v26 & 0x2000000) != 0 )
                   {
 LABEL_191:
@@ -3321,45 +3314,45 @@ LABEL_191:
                                     *(_DWORD *)(v19 + 1728),
                                     v89,
                                     (__int64)v100,
-                                    (__int64)v98);
+                                    (__int64)v98)
                         }
                         else
                         {
-                          v63 = v98;
-                          *v100 = 0;
-                          *v63 = 0;
+                          v63 = v98
+                          *v100 = 0
+                          *v63 = 0
                         }
                       }
                       if ( fixed >= 0 )
                       {
-                        v64 = *(volatile signed __int32 ***)v94;
-                        v20 = 1;
+                        v64 = *(volatile signed __int32 ***)v94
+                        v20 = 1
 LABEL_204:
                         if ( v84 >= 0 )
                         {
-                          v65 = *(__int64 (__fastcall **)(volatile signed __int32 *))(*(_QWORD *)(v19 + 1800) + 8LL);
+                          v65 = *(__int64 (__fastcall **)(volatile signed __int32 *))(*(_QWORD *)(v19 + 1800) + 8LL)
                           if ( v65 )
-                            fixed = v65(*v64);
+                            fixed = v65(*v64)
                         }
-                        goto LABEL_207;
+                        goto LABEL_207
                       }
                     }
-                    goto LABEL_197;
+                    goto LABEL_197
                   }
-                  v84 = v47;
+                  v84 = v47
                   if ( fixed >= 0 )
-                    goto LABEL_152;
-                  v84 = v47;
+                    goto LABEL_152
+                  v84 = v47
                   if ( fixed == -1073740285 )
-                    goto LABEL_152;
-                  v84 = v47;
+                    goto LABEL_152
+                  v84 = v47
                   if ( fixed == -1073740283 )
-                    goto LABEL_152;
+                    goto LABEL_152
                   if ( (g_CiOptions & 4) != 0 )
                   {
-                    v84 = v47;
+                    v84 = v47
                     if ( (v26 & 0x80000000) != 0 )
-                      goto LABEL_152;
+                      goto LABEL_152
                   }
                   if ( (g_CiOptions & 2) != 0 && (v84 = v47, (v26 & 1) != 0)
                     || (v84 = v47, (v26 & 0x40000006) != 0)
@@ -3370,69 +3363,69 @@ LABEL_204:
                     || (v84 = v47, (v26 & 0x80000001) == 0) )
                   {
 LABEL_152:
-                    v28 = 0;
-                    goto LABEL_153;
+                    v28 = 0
+                    goto LABEL_153
                   }
-                  LOBYTE(v58) = v22;
-                  CipReportSystemOptionsReprieve((_DWORD)v27, a7, v26, v58, fixed);
-                  v84 = v47;
-                  *v93 = 0;
+                  LOBYTE(v58) = v22
+                  CipReportSystemOptionsReprieve((_DWORD)v27, a7, v26, v58, fixed)
+                  v84 = v47
+                  *v93 = 0
 LABEL_47:
-                  fixed = 0;
-                  v28 = 0;
-                  goto LABEL_153;
+                  fixed = 0
+                  v28 = 0
+                  goto LABEL_153
                 }
               }
             }
-            v22 = v81;
+            v22 = v81
           }
         }
 LABEL_129:
-        v27 = FileObject;
-        v57 = a7;
-        goto LABEL_130;
+        v27 = FileObject
+        v57 = a7
+        goto LABEL_130
       }
       fixed = CipMitigatePPLBypassThroughInterpreters(
                 (_DWORD)FileObject,
                 *(_QWORD *)(v19 + 2096),
                 *(_DWORD *)(v19 + 2104),
                 0,
-                1);
+                1)
       if ( fixed < 0 )
-        goto LABEL_129;
+        goto LABEL_129
       if ( **(_QWORD **)v94 )
       {
-        _InterlockedOr(**(volatile signed __int32 ***)v94, 0x10u);
-        v26 = a9;
-        v19 = *(_QWORD *)&v92[1];
+        _InterlockedOr(**(volatile signed __int32 ***)v94, 0x10u)
+        v26 = a9
+        v19 = *(_QWORD *)&v92[1]
       }
     }
-    v49 = v89;
-    goto LABEL_100;
+    v49 = v89
+    goto LABEL_100
   }
   if ( *a6 != 1 )
-    goto LABEL_93;
-  *a6 = 2;
-  fixed = -1073741789;
-  v20 = 1;
+    goto LABEL_93
+  *a6 = 2
+  fixed = -1073741789
+  v20 = 1
 LABEL_198:
-  v64 = *(volatile signed __int32 ***)v94;
+  v64 = *(volatile signed __int32 ***)v94
   if ( **(_QWORD **)v94 && !v102 )
   {
-    CiReleaseContext();
-    *v64 = 0;
+    CiReleaseContext()
+    *v64 = 0
   }
   if ( fixed >= 0 )
-    goto LABEL_204;
+    goto LABEL_204
 LABEL_207:
   if ( v19 )
-    CiFreeValidationContext((PSLIST_ENTRY)v19);
+    CiFreeValidationContext((PSLIST_ENTRY)v19)
   if ( v20 )
-    CiLogStatusEventWithCorrelationId((unsigned int)fixed, &CiValidateImageHeaderComplete, 0);
-  ExReleasePushLockSharedEx(&g_CipPolicyLock, 0);
-  KeLeaveCriticalRegion();
-  IoClearActivityIdThread(v103);
-  return (unsigned int)fixed;
+    CiLogStatusEventWithCorrelationId((unsigned int)fixed, &CiValidateImageHeaderComplete, 0)
+  ExReleasePushLockSharedEx(&g_CipPolicyLock, 0)
+  KeLeaveCriticalRegion()
+  IoClearActivityIdThread(v103)
+  return (unsigned int)fixed
 }
 
 ```
@@ -3442,253 +3435,253 @@ LABEL_207:
 ```cpp
 __int64 CiInitializePhase2()
 {
-  int v0; // esi
-  int v1; // r15d
-  int v2; // r13d
-  int v3; // r12d
-  NTSTATUS HashLength; // ebx
-  __int64 v6; // r9
-  __int64 v7; // r8
-  __int64 v8; // rdx
-  __int64 v9; // rcx
-  int v10; // r8d
-  __int16 v11; // cx
-  const EVENT_DESCRIPTOR *v12; // rdx
-  const EVENT_DESCRIPTOR *v13; // rcx
-  int v14; // r8d
-  int v15; // r9d
-  PVOID **v16; // rdi
-  int v17; // eax
-  int v18; // r9d
-  const EVENT_DESCRIPTOR *v19; // rax
-  unsigned int v20; // edx
-  int v21; // ecx
-  unsigned int v22; // edx
-  void *v23; // rdx
-  PVOID *v24; // rcx
-  PVOID *v25; // rax
-  unsigned int i; // edi
-  REGHANDLE v27; // rcx
-  REGHANDLE v28; // rcx
-  REGHANDLE v29; // rcx
-  ULONGLONG RegHandle; // [rsp+40h] [rbp-30h] BYREF
-  __int64 v31; // [rsp+48h] [rbp-28h] BYREF
-  _DWORD v32[4]; // [rsp+50h] [rbp-20h] BYREF
+  int v0
+  int v1
+  int v2
+  int v3
+  NTSTATUS HashLength
+  __int64 v6
+  __int64 v7
+  __int64 v8
+  __int64 v9
+  int v10
+  __int16 v11
+  const EVENT_DESCRIPTOR *v12
+  const EVENT_DESCRIPTOR *v13
+  int v14
+  int v15
+  PVOID **v16
+  int v17
+  int v18
+  const EVENT_DESCRIPTOR *v19
+  unsigned int v20
+  int v21
+  unsigned int v22
+  void *v23
+  PVOID *v24
+  PVOID *v25
+  unsigned int i
+  REGHANDLE v27
+  REGHANDLE v28
+  REGHANDLE v29
+  ULONGLONG RegHandle
+  __int64 v31
+  _DWORD v32[4]
 
-  v0 = -1073741823;
-  RegHandle = 0;
-  v1 = -1073741823;
-  v2 = -1073741823;
-  v3 = -1073741823;
+  v0 = -1073741823
+  RegHandle = 0
+  v1 = -1073741823
+  v2 = -1073741823
+  v3 = -1073741823
   if ( _InterlockedCompareExchange64((volatile signed __int64 *)&g_EtwEventHandle, 0, 0) )
-    return 0;
-  KeEnterCriticalRegion();
-  ExAcquirePushLockExclusiveEx(&g_CiInitLock, 0);
+    return 0
+  KeEnterCriticalRegion()
+  ExAcquirePushLockExclusiveEx(&g_CiInitLock, 0)
   if ( !_InterlockedCompareExchange64((volatile signed __int64 *)&g_EtwEventHandle, 0, 0) )
   {
-    wil_InitializeFeatureStaging();
-    HashLength = EtwRegister(&CodeIntegrityEventProviderId, 0, 0, &RegHandle);
+    wil_InitializeFeatureStaging()
+    HashLength = EtwRegister(&CodeIntegrityEventProviderId, 0, 0, &RegHandle)
     if ( HashLength < 0 )
-      goto LABEL_50;
-    v0 = TlgRegisterAggregateProvider(&dword_1C0038060);
-    v2 = TlgRegisterAggregateProvider(&dword_1C00380D0);
-    v1 = TraceLoggingRegisterEx_EtwRegister_EtwSetInformation(&dword_1C0038098);
-    v3 = TraceLoggingRegisterEx_EtwRegister_EtwSetInformation(&dword_1C0038108);
-    v6 = (unsigned int)g_CiDeveloperMode >> 9;
-    v7 = (unsigned int)g_CiDeveloperMode >> 13;
-    LOBYTE(v6) = (g_CiDeveloperMode & 0x200) != 0;
-    v8 = (unsigned int)g_CiDeveloperMode >> 10;
-    LOBYTE(v7) = (g_CiDeveloperMode & 0x2000) != 0;
-    v9 = (unsigned int)g_CiDeveloperMode >> 7;
-    LOBYTE(v8) = (g_CiDeveloperMode & 0x400) != 0;
-    LOBYTE(v9) = (g_CiDeveloperMode & 0x80) != 0;
-    HashLength = MinCrypK_Initialize(v9, v8, v7, v6);
+      goto LABEL_50
+    v0 = TlgRegisterAggregateProvider(&dword_1C0038060)
+    v2 = TlgRegisterAggregateProvider(&dword_1C00380D0)
+    v1 = TraceLoggingRegisterEx_EtwRegister_EtwSetInformation(&dword_1C0038098)
+    v3 = TraceLoggingRegisterEx_EtwRegister_EtwSetInformation(&dword_1C0038108)
+    v6 = (unsigned int)g_CiDeveloperMode >> 9
+    v7 = (unsigned int)g_CiDeveloperMode >> 13
+    LOBYTE(v6) = (g_CiDeveloperMode & 0x200) != 0
+    v8 = (unsigned int)g_CiDeveloperMode >> 10
+    LOBYTE(v7) = (g_CiDeveloperMode & 0x2000) != 0
+    v9 = (unsigned int)g_CiDeveloperMode >> 7
+    LOBYTE(v8) = (g_CiDeveloperMode & 0x400) != 0
+    LOBYTE(v9) = (g_CiDeveloperMode & 0x80) != 0
+    HashLength = MinCrypK_Initialize(v9, v8, v7, v6)
     if ( HashLength < 0 )
-      goto LABEL_50;
-    HashLength = CiInitializeParallelHashingContexts();
+      goto LABEL_50
+    HashLength = CiInitializeParallelHashingContexts()
     if ( HashLength < 0 )
-      goto LABEL_50;
+      goto LABEL_50
     if ( ((g_CiMinimumHashAlgorithm - 32772) & 0xFFFFFFF7) != 0 )
     {
-      HashLength = -1073741585;
+      HashLength = -1073741585
 LABEL_50:
       if ( g_CiParallelPageHashContexts )
       {
-        ExFreePoolWithTag(g_CiParallelPageHashContexts, 0x63734943u);
-        g_CiParallelPageHashContexts = 0;
+        ExFreePoolWithTag(g_CiParallelPageHashContexts, 0x63734943u)
+        g_CiParallelPageHashContexts = 0
       }
-      g_CiParallelPageHashContextsAvailableMask = 0;
+      g_CiParallelPageHashContextsAvailableMask = 0
       if ( byte_1C0038C78 )
       {
-        byte_1C0038C78 = 0;
-        ExDeletePagedLookasideList(&ListHead);
-        ExDeletePagedLookasideList(&SListHead);
+        byte_1C0038C78 = 0
+        ExDeletePagedLookasideList(&ListHead)
+        ExDeletePagedLookasideList(&SListHead)
       }
       if ( g_pEcurveP256 )
       {
-        SymCryptEcurveFree();
-        g_pEcurveP256 = 0;
+        SymCryptEcurveFree()
+        g_pEcurveP256 = 0
       }
       if ( g_pEcurveP384 )
       {
-        SymCryptEcurveFree();
-        g_pEcurveP384 = 0;
+        SymCryptEcurveFree()
+        g_pEcurveP384 = 0
       }
       if ( RegHandle )
-        EtwUnregister(RegHandle);
+        EtwUnregister(RegHandle)
       if ( v0 >= 0 )
-        TlgUnregisterAggregateProvider();
+        TlgUnregisterAggregateProvider()
       if ( v1 >= 0 )
       {
-        v27 = ::RegHandle;
-        ::RegHandle = 0;
-        dword_1C0038098 = 0;
-        EtwUnregister(v27);
+        v27 = ::RegHandle
+        ::RegHandle = 0
+        dword_1C0038098 = 0
+        EtwUnregister(v27)
       }
       if ( v3 >= 0 )
       {
-        v28 = qword_1C0038128;
-        qword_1C0038128 = 0;
-        dword_1C0038108 = 0;
-        EtwUnregister(v28);
+        v28 = qword_1C0038128
+        qword_1C0038128 = 0
+        dword_1C0038108 = 0
+        EtwUnregister(v28)
       }
       if ( v2 >= 0 )
       {
-        v29 = qword_1C00380F0;
-        qword_1C00380F0 = 0;
-        dword_1C00380D0 = 0;
-        EtwUnregister(v29);
+        v29 = qword_1C00380F0
+        qword_1C00380F0 = 0
+        dword_1C00380D0 = 0
+        EtwUnregister(v29)
       }
       if ( wil_details_featureChangeNotification )
       {
-        RtlUnregisterFeatureConfigurationChangeNotification();
-        wil_details_featureChangeNotification = 0;
+        RtlUnregisterFeatureConfigurationChangeNotification()
+        wil_details_featureChangeNotification = 0
       }
-      goto LABEL_70;
+      goto LABEL_70
     }
-    HashLength = MinCrypK_GetHashLength((unsigned int)g_CiMinimumHashAlgorithm, &g_CatalogFileHashLength);
+    HashLength = MinCrypK_GetHashLength((unsigned int)g_CiMinimumHashAlgorithm, &g_CatalogFileHashLength)
     if ( HashLength >= 0 )
     {
-      g_CatalogFileHashAlgorithm = v10;
+      g_CatalogFileHashAlgorithm = v10
       if ( v10 != 32772 )
-        g_V1CatalogsSupported = 0;
-      g_HvciCatalogLock = 0;
-      HashLength = CipInitializeCatalogStores();
+        g_V1CatalogsSupported = 0
+      g_HvciCatalogLock = 0
+      HashLength = CipInitializeCatalogStores()
     }
     if ( HashLength < 0 )
-      goto LABEL_50;
-    v11 = g_CiDeveloperMode;
+      goto LABEL_50
+    v11 = g_CiDeveloperMode
     if ( (g_CiDeveloperMode & 0x20) == 0 )
-      MinCryptRevokePrereleaseWindowsPCA();
+      MinCryptRevokePrereleaseWindowsPCA()
     if ( (v11 & 0x1000) == 0 )
     {
-      HashLength = CipLoadAndValidateRevocationList();
+      HashLength = CipLoadAndValidateRevocationList()
       if ( HashLength < 0 )
       {
-        CiDeinitializeCatalogs();
-        goto LABEL_50;
+        CiDeinitializeCatalogs()
+        goto LABEL_50
       }
     }
-    qword_1C00385B0 = (__int64)&P;
-    P = &P;
-    ExInitializeResourceLite(&Resource);
-    PESetInitialState();
+    qword_1C00385B0 = (__int64)&P
+    P = &P
+    ExInitializeResourceLite(&Resource)
+    PESetInitialState()
     if ( RtlCheckRegistryKey(2u, (PWSTR)L"MiniNT") >= 0 )
-      g_CiIsWinPE = 1;
-    CipCheckLicensingPhase2();
-    g_TrimBootCacheCatalogEntries = 1;
-    ExInitializePagedLookasideList(&g_CiValidationLookasideList, 0, 0, 0, 0x850u, 0x63734943u, 0);
-    ExInitializePagedLookasideList(&g_CiEaCacheLookasideList, 0, 0, 0, 0x240u, 0x63734943u, 0);
-    SIPolicyInitializeWellKnownSidBuffer();
-    _InterlockedExchange64((volatile __int64 *)&g_EtwEventHandle, RegHandle);
-    v16 = (PVOID **)g_BootDriverList;
+      g_CiIsWinPE = 1
+    CipCheckLicensingPhase2()
+    g_TrimBootCacheCatalogEntries = 1
+    ExInitializePagedLookasideList(&g_CiValidationLookasideList, 0, 0, 0, 0x850u, 0x63734943u, 0)
+    ExInitializePagedLookasideList(&g_CiEaCacheLookasideList, 0, 0, 0, 0x240u, 0x63734943u, 0)
+    SIPolicyInitializeWellKnownSidBuffer()
+    _InterlockedExchange64((volatile __int64 *)&g_EtwEventHandle, RegHandle)
+    v16 = (PVOID **)g_BootDriverList
     if ( g_BootDriverList == &g_BootDriverList )
     {
 LABEL_46:
-      CiLogWhqlSettingsEvent(v13, v12);
-      for ( i = 0; i < g_NumberOfSiPolicies; ++i )
-        CiLogSIPolicyRefresh(*((_QWORD *)g_SiPolicyHandles + i));
-      CiInstrumentInitialize();
-      goto LABEL_70;
+      CiLogWhqlSettingsEvent(v13, v12)
+      for ( i = 0
+        CiLogSIPolicyRefresh(*((_QWORD *)g_SiPolicyHandles + i))
+      CiInstrumentInitialize()
+      goto LABEL_70
     }
     while ( 1 )
     {
-      v17 = *((_DWORD *)v16 + 8);
+      v17 = *((_DWORD *)v16 + 8)
       if ( v17 == -1073740760 )
-        break;
+        break
       if ( v17 == -1073740285 )
       {
         if ( EtwEventEnabled(g_EtwEventHandle, &CiRevokedDriverNotLoaded) )
         {
-          v19 = &CiRevokedDriverNotLoaded;
+          v19 = &CiRevokedDriverNotLoaded
 LABEL_28:
-          LOBYTE(v18) = 1;
-          CiLogFileRequestedValidationEventWithProcessName((_DWORD)v16 + 16, (int)&dword_1C002B8C0, 1, v18, v19);
+          LOBYTE(v18) = 1
+          CiLogFileRequestedValidationEventWithProcessName((_DWORD)v16 + 16, (int)&dword_1C002B8C0, 1, v18, v19)
         }
 LABEL_29:
-        CiAudit(v16 + 2, 5038);
-        goto LABEL_33;
+        CiAudit(v16 + 2, 5038)
+        goto LABEL_33
       }
       if ( v17 >= 0 && (*((_DWORD *)v16 + 9) & 1) != 0 )
-        CiLogFileEvent(v16 + 2, &CiNoEmbeddedSignatureDriverLoaded);
+        CiLogFileEvent(v16 + 2, &CiNoEmbeddedSignatureDriverLoaded)
 LABEL_33:
-      v20 = *((_DWORD *)v16 + 9);
+      v20 = *((_DWORD *)v16 + 9)
       if ( (v20 & 0x20) != 0 )
       {
-        v21 = -1058471934;
+        v21 = -1058471934
         if ( *((int *)v16 + 8) < 0 )
-          v21 = *((_DWORD *)v16 + 8);
-        v22 = v20 >> 14;
-        LOBYTE(v22) = v22 & 1;
-        CiLogSIPolicyEvent2((_DWORD)v16 + 16, v22, v14, v15, v21, v22);
+          v21 = *((_DWORD *)v16 + 8)
+        v22 = v20 >> 14
+        LOBYTE(v22) = v22 & 1
+        CiLogSIPolicyEvent2((_DWORD)v16 + 16, v22, v14, v15, v21, v22)
         if ( (*((_DWORD *)v16 + 9) & 0x4000) != 0 )
         {
-          v31 = 0;
-          v32[0] = -1603140961;
-          v32[1] = 1264474251;
-          v32[2] = -1442448969;
-          v32[3] = -2013889066;
-          SIPolicyIsPolicyActive(v32, &v31);
-          CipInstrumentVbsPolicyFailure(v31, 0, (_DWORD)v16 + 16, (unsigned int)&dword_1C002B8C0, 1);
+          v31 = 0
+          v32[0] = -1603140961
+          v32[1] = 1264474251
+          v32[2] = -1442448969
+          v32[3] = -2013889066
+          SIPolicyIsPolicyActive(v32, &v31)
+          CipInstrumentVbsPolicyFailure(v31, 0, (_DWORD)v16 + 16, (unsigned int)&dword_1C002B8C0, 1)
         }
-        goto LABEL_43;
+        goto LABEL_43
       }
       if ( (v20 & 0x100) != 0 )
       {
-        v23 = &WhqlEnforcementFailureAudit;
+        v23 = &WhqlEnforcementFailureAudit
       }
       else
       {
         if ( (v20 & 0x200) == 0 )
-          goto LABEL_43;
-        v23 = &WhqlEnforcementFailureExempted;
+          goto LABEL_43
+        v23 = &WhqlEnforcementFailureExempted
       }
-      CiLogFileEvent(v16 + 2, v23);
+      CiLogFileEvent(v16 + 2, v23)
 LABEL_43:
-      v24 = *v16;
+      v24 = *v16
       if ( (*v16)[1] != v16 || (v25 = v16[1], *v25 != v16) )
-        __fastfail(3u);
-      *v25 = v24;
-      v24[1] = v25;
-      ExFreePoolWithTag(v16, 0);
-      v16 = (PVOID **)g_BootDriverList;
-      v13 = &CiImageFileHashNotFound;
-      v12 = &CiRevokedDriverNotLoaded;
+        __fastfail(3u)
+      *v25 = v24
+      v24[1] = v25
+      ExFreePoolWithTag(v16, 0)
+      v16 = (PVOID **)g_BootDriverList
+      v13 = &CiImageFileHashNotFound
+      v12 = &CiRevokedDriverNotLoaded
       if ( g_BootDriverList == &g_BootDriverList )
-        goto LABEL_46;
+        goto LABEL_46
     }
     if ( EtwEventEnabled(g_EtwEventHandle, &CiImageFileHashNotFound) )
     {
-      v19 = &CiImageFileHashNotFound;
-      goto LABEL_28;
+      v19 = &CiImageFileHashNotFound
+      goto LABEL_28
     }
-    goto LABEL_29;
+    goto LABEL_29
   }
-  HashLength = 0;
+  HashLength = 0
 LABEL_70:
-  ExReleasePushLockExclusiveEx(&g_CiInitLock, 0);
-  KeLeaveCriticalRegion();
-  return (unsigned int)HashLength;
+  ExReleasePushLockExclusiveEx(&g_CiInitLock, 0)
+  KeLeaveCriticalRegion()
+  return (unsigned int)HashLength
 }
 
 ```
@@ -3703,26 +3696,26 @@ __int64 __fastcall CiLogFileRequestedValidationEvent(
         char a4,
         PCEVENT_DESCRIPTOR EventDescriptor)
 {
-  int v8; // r9d
-  unsigned int v9; // ebx
-  PVOID P; // [rsp+30h] [rbp-48h] BYREF
-  int v12[4]; // [rsp+38h] [rbp-40h] BYREF
+  int v8
+  unsigned int v9
+  PVOID P
+  int v12[4]
 
-  P = 0;
-  *(_OWORD *)v12 = 0;
-  CipQueryProcessName(a2, v12, &P);
+  P = 0
+  *(_OWORD *)v12 = 0
+  CipQueryProcessName(a2, v12, &P)
   if ( EtwEventEnabled(g_EtwEventHandle, EventDescriptor) )
   {
-    LOBYTE(v8) = a4;
-    v9 = CiLogFileRequestedValidationEventWithProcessName(a1, (int)v12, a3, v8, EventDescriptor);
+    LOBYTE(v8) = a4
+    v9 = CiLogFileRequestedValidationEventWithProcessName(a1, (int)v12, a3, v8, EventDescriptor)
   }
   else
   {
-    v9 = 0;
+    v9 = 0
   }
   if ( P )
-    ExFreePoolWithTag(P, 0);
-  return v9;
+    ExFreePoolWithTag(P, 0)
+  return v9
 }
 
 ```
@@ -3732,70 +3725,70 @@ __int64 __fastcall CiLogFileRequestedValidationEvent(
 ```cpp
 __int64 __fastcall CipFixImageType(char *a1, DWORD *a2, _DWORD *a3, bool *a4, DWORD *a5)
 {
-  PIMAGE_NT_HEADERS v9; // rax
-  PIMAGE_NT_HEADERS v10; // r10
-  WORD v11; // r9
-  signed int v12; // edx
-  WORD Magic; // ax
-  WORD DllCharacteristics; // r8
-  __int64 SizeOfHeaders; // rdx
-  unsigned __int64 v16; // r14
-  __int64 v17; // rsi
-  WORD NumberOfSections; // r11
-  bool v19; // cf
-  unsigned __int64 v20; // rbx
+  PIMAGE_NT_HEADERS v9
+  PIMAGE_NT_HEADERS v10
+  WORD v11
+  signed int v12
+  WORD Magic
+  WORD DllCharacteristics
+  __int64 SizeOfHeaders
+  unsigned __int64 v16
+  __int64 v17
+  WORD NumberOfSections
+  bool v19
+  unsigned __int64 v20
 
-  v9 = RtlImageNtHeader(a1);
-  v10 = v9;
-  v11 = 0;
+  v9 = RtlImageNtHeader(a1)
+  v10 = v9
+  v11 = 0
   if ( v9 )
   {
-    Magic = v9->OptionalHeader.Magic;
+    Magic = v9->OptionalHeader.Magic
     if ( Magic == 267 || Magic == 523 )
     {
-      DllCharacteristics = v10->OptionalHeader.DllCharacteristics;
-      *a2 = v10->OptionalHeader.SizeOfImage;
-      SizeOfHeaders = v10->OptionalHeader.SizeOfHeaders;
-      *a5 = v10->FileHeader.TimeDateStamp;
-      v16 = -1;
+      DllCharacteristics = v10->OptionalHeader.DllCharacteristics
+      *a2 = v10->OptionalHeader.SizeOfImage
+      SizeOfHeaders = v10->OptionalHeader.SizeOfHeaders
+      *a5 = v10->FileHeader.TimeDateStamp
+      v16 = -1
       if ( &a1[SizeOfHeaders] >= a1 )
-        v16 = (unsigned __int64)&a1[SizeOfHeaders];
-      v12 = &a1[SizeOfHeaders] < a1 ? 0xC0000095 : 0;
+        v16 = (unsigned __int64)&a1[SizeOfHeaders]
+      v12 = &a1[SizeOfHeaders] < a1 ? 0xC0000095 : 0
       if ( v12 < 0 )
-        v16 = (unsigned __int64)a1;
-      v17 = (__int64)&v10->OptionalHeader + v10->FileHeader.SizeOfOptionalHeader;
+        v16 = (unsigned __int64)a1
+      v17 = (__int64)&v10->OptionalHeader + v10->FileHeader.SizeOfOptionalHeader
       while ( 1 )
       {
-        NumberOfSections = v10->FileHeader.NumberOfSections;
-        v19 = v11 < NumberOfSections;
+        NumberOfSections = v10->FileHeader.NumberOfSections
+        v19 = v11 < NumberOfSections
         if ( v11 >= NumberOfSections )
-          break;
-        v20 = v17 + 40LL * v11;
+          break
+        v20 = v17 + 40LL * v11
         if ( v20 >= v16 || v17 + 40 * (unsigned __int64)((unsigned int)v11 + 1) > v16 )
         {
-          v11 = v10->FileHeader.NumberOfSections;
+          v11 = v10->FileHeader.NumberOfSections
 LABEL_16:
-          v19 = v11 < NumberOfSections;
-          break;
+          v19 = v11 < NumberOfSections
+          break
         }
         if ( (*(_DWORD *)(v20 + 36) & 0x90000000) == 0x90000000 )
-          goto LABEL_16;
-        ++v11;
+          goto LABEL_16
+        ++v11
       }
-      *a4 = v19;
+      *a4 = v19
       if ( (DllCharacteristics & 0x80u) != 0 )
-        *a3 |= 0x80000000;
+        *a3 |= 0x80000000
     }
     else
     {
-      return (unsigned int)-1073741701;
+      return (unsigned int)-1073741701
     }
   }
   else
   {
-    return (unsigned int)-1073741701;
+    return (unsigned int)-1073741701
   }
-  return (unsigned int)v12;
+  return (unsigned int)v12
 }
 
 ```
@@ -3805,9 +3798,9 @@ LABEL_16:
 ```cpp
 __int64 __fastcall guard_dispatch_icall_nop()
 {
-  __int64 (*v0)(void); // rax
+  __int64 (*v0)(void)
 
-  return v0();
+  return v0()
 }
 
 ```
@@ -3817,38 +3810,38 @@ __int64 __fastcall guard_dispatch_icall_nop()
 ```cpp
 __int64 __fastcall CiGetActionsForImage(__int64 a1, __int64 a2, int a3, char a4)
 {
-  int v7; // ecx
-  int v8; // edx
-  int v9; // eax
-  int v10; // esi
-  unsigned int v11; // ebx
+  int v7
+  int v8
+  int v9
+  int v10
+  unsigned int v11
 
   if ( (g_CiOptions & 8) != 0 && (g_CiTestFlags & 0x400) != 0 )
-    a3 |= 0x40u;
+    a3 |= 0x40u
   if ( (a3 & 0xE000000F) != 0 || a4 == 5 )
-    v7 = 0;
+    v7 = 0
   else
-    v7 = ((unsigned __int8)~(_BYTE)a3 >> 6) & 1;
+    v7 = ((unsigned __int8)~(_BYTE)a3 >> 6) & 1
   if ( (a3 & 5) != 0 || (a3 & 0xE000004A) == 0 )
-    v9 = 0;
+    v9 = 0
   else
-    v9 = 4;
-  v8 = v7 | (2 * v7) | (8 * (v7 & 1));
-  v10 = v9 | v8 | ~(((unsigned __int8)v9 | (unsigned __int8)v8) << 6) & 0x80 | 8;
+    v9 = 4
+  v8 = v7 | (2 * v7) | (8 * (v7 & 1))
+  v10 = v9 | v8 | ~(((unsigned __int8)v9 | (unsigned __int8)v8) << 6) & 0x80 | 8
   if ( (a3 & 0x20000002) != 0 )
-    v10 = v9 | v8 | ~(((unsigned __int8)v9 | (unsigned __int8)v8) << 6) & 0x80;
-  v11 = v10;
+    v10 = v9 | v8 | ~(((unsigned __int8)v9 | (unsigned __int8)v8) << 6) & 0x80
+  v11 = v10
   if ( (a3 & 0x20000015) == 0 && (unsigned int)PsIsProtectedProcessLight(a1) )
-    v11 = v10 | 0x40;
+    v11 = v10 | 0x40
   if ( (g_CiDeveloperMode & 0x10000) != 0 )
   {
-    v11 |= 0x10u;
+    v11 |= 0x10u
     if ( (*(_DWORD *)(*(_QWORD *)(a2 + 8) + 48LL) & 0x100) != 0 )
-      v11 = v11 & 0xFFFFFF58 | 0x24;
+      v11 = v11 & 0xFFFFFF58 | 0x24
   }
   if ( (a3 & 0x40) != 0 )
-    v11 |= (v11 & 8) << 6;
-  return v11;
+    v11 |= (v11 & 8) << 6
+  return v11
 }
 
 ```
@@ -3868,79 +3861,79 @@ __int64 __fastcall CipValidateFileInCache(
         _BYTE *a9,
         _DWORD *a10)
 {
-  int v10; // r13d
-  int FileCache; // ebx
-  __int64 v13; // r8
-  __int64 v14; // r9
-  int v15; // r9d
-  unsigned __int8 v16; // r8
-  char v17; // si
-  int v18; // ecx
-  int v20; // edi
-  char v21; // [rsp+60h] [rbp-41h] BYREF
-  int v22; // [rsp+64h] [rbp-3Dh]
-  __int64 v23; // [rsp+68h] [rbp-39h] BYREF
-  __int64 v24; // [rsp+70h] [rbp-31h]
-  __int64 v25; // [rsp+78h] [rbp-29h]
-  __int64 v26; // [rsp+80h] [rbp-21h]
-  int v27; // [rsp+88h] [rbp-19h] BYREF
-  char v28; // [rsp+8Ch] [rbp-15h]
+  int v10
+  int FileCache
+  __int64 v13
+  __int64 v14
+  int v15
+  unsigned __int8 v16
+  char v17
+  int v18
+  int v20
+  char v21
+  int v22
+  __int64 v23
+  __int64 v24
+  __int64 v25
+  __int64 v26
+  int v27
+  char v28
 
-  v10 = (int)Object;
-  v26 = a2;
-  v25 = a3;
-  v24 = a7;
-  v27 = 0;
-  v28 = 0;
-  v21 = 0;
-  LODWORD(v23) = 0;
-  v22 = 0;
-  FileCache = CipGetFileCache(Object, (__int64)&v21, (__int64)&v23, 0, 0, 0, a2, a3, a7);
+  v10 = (int)Object
+  v26 = a2
+  v25 = a3
+  v24 = a7
+  v27 = 0
+  v28 = 0
+  v21 = 0
+  LODWORD(v23) = 0
+  v22 = 0
+  FileCache = CipGetFileCache(Object, (__int64)&v21, (__int64)&v23, 0, 0, 0, a2, a3, a7)
   if ( FileCache >= 0 )
   {
-    LOBYTE(v14) = a6;
-    LOBYTE(v13) = a5;
-    CipInitializeSigningLevelOrder(&v27, a4, v13, v14);
-    v16 = 0;
+    LOBYTE(v14) = a6
+    LOBYTE(v13) = a5
+    CipInitializeSigningLevelOrder(&v27, a4, v13, v14)
+    v16 = 0
     if ( (_BYTE)v27 )
     {
-      v17 = v21;
+      v17 = v21
       while ( 1 )
       {
         if ( !v22 )
         {
-          v18 = *((_DWORD *)g_CipWhichLevelComparisons + (*((_BYTE *)&v27 + v16 + 1) & 0xF));
+          v18 = *((_DWORD *)g_CipWhichLevelComparisons + (*((_BYTE *)&v27 + v16 + 1) & 0xF))
           if ( _bittest(&v18, v21 & 0xF) )
-            break;
+            break
         }
         if ( ++v16 >= (unsigned __int8)v27 )
-          goto LABEL_7;
+          goto LABEL_7
       }
-      v20 = v23;
+      v20 = v23
       if ( (v23 & 0x200) != 0 )
       {
-        LOBYTE(v15) = v21;
-        FileCache = CiApplyPolicyToSyntheticEa(v10, v26, v25, v15, v24);
+        LOBYTE(v15) = v21
+        FileCache = CiApplyPolicyToSyntheticEa(v10, v26, v25, v15, v24)
         if ( FileCache >= 0 )
         {
 LABEL_13:
-          *a9 = v17;
-          *a10 = v20;
-          return (unsigned int)FileCache;
+          *a9 = v17
+          *a10 = v20
+          return (unsigned int)FileCache
         }
-        *a8 = 30;
+        *a8 = 30
       }
       if ( FileCache >= 0 )
-        goto LABEL_13;
+        goto LABEL_13
     }
     else
     {
 LABEL_7:
-      *a8 = 25;
-      return (unsigned int)-1073740760;
+      *a8 = 25
+      return (unsigned int)-1073740760
     }
   }
-  return (unsigned int)FileCache;
+  return (unsigned int)FileCache
 }
 
 ```
@@ -3957,62 +3950,62 @@ __int64 __fastcall CiAuditImageForHvci(
         PVOID BaseAddress,
         ULONGLONG Size)
 {
-  int v9; // eax
-  int v10; // eax
-  int v11; // ebx
-  int v12; // eax
-  int v13; // edx
-  int v14; // ecx
-  __int64 result; // rax
-  ULONGLONG v16; // [rsp+20h] [rbp-C8h]
-  int v17; // [rsp+38h] [rbp-B0h]
-  int v18; // [rsp+40h] [rbp-A8h]
-  int v19; // [rsp+60h] [rbp-88h] BYREF
-  union _LARGE_INTEGER FileSize; // [rsp+68h] [rbp-80h] BYREF
-  PSLIST_ENTRY ListEntry; // [rsp+70h] [rbp-78h] BYREF
-  __int64 v22; // [rsp+78h] [rbp-70h] BYREF
-  __int64 v23; // [rsp+80h] [rbp-68h]
-  __int64 v24; // [rsp+90h] [rbp-58h]
-  _OWORD v25[3]; // [rsp+98h] [rbp-50h] BYREF
+  int v9
+  int v10
+  int v11
+  int v12
+  int v13
+  int v14
+  __int64 result
+  ULONGLONG v16
+  int v17
+  int v18
+  int v19
+  union _LARGE_INTEGER FileSize
+  PSLIST_ENTRY ListEntry
+  __int64 v22
+  __int64 v23
+  __int64 v24
+  _OWORD v25[3]
 
-  ListEntry = 0;
-  FileSize.QuadPart = 0;
-  v22 = 0;
-  v23 = 0;
-  v24 = 0;
+  ListEntry = 0
+  FileSize.QuadPart = 0
+  v22 = 0
+  v23 = 0
+  v24 = 0
   if ( (int)CiValidateImageHeaderMapping(BaseAddress, (unsigned int)Size) >= 0
     && FsRtlGetFileSize(FileObject, &FileSize) >= 0 )
   {
-    v9 = 0;
+    v9 = 0
     if ( FileSize.HighPart )
-      v9 = 2048;
-    v19 = v9;
+      v9 = 2048
+    v19 = v9
     if ( (int)CiCheckNtHeaderForHvciCompliance(v22, &v19) >= 0 )
     {
-      memset(v25, 0, sizeof(v25));
-      v10 = HashpParsePEHeader((_DWORD)BaseAddress, FileSize.LowPart, Size, (unsigned int)&v22, (__int64)v25, 0, 0);
-      v11 = v19;
+      memset(v25, 0, sizeof(v25))
+      v10 = HashpParsePEHeader((_DWORD)BaseAddress, FileSize.LowPart, Size, (unsigned int)&v22, (__int64)v25, 0, 0)
+      v11 = v19
       if ( v10 < 0 )
       {
-        v11 = v19 | 0x800;
-        v19 |= 0x800u;
+        v11 = v19 | 0x800
+        v19 |= 0x800u
       }
       if ( (a2 & 5) == 0 )
       {
-        v11 &= ~1u;
-        v19 = v11;
+        v11 &= ~1u
+        v19 = v11
       }
-      v12 = CiCreateHvciComplianceStatusCode(&v19);
+      v12 = CiCreateHvciComplianceStatusCode(&v19)
       if ( v12 >= 0 )
       {
         if ( !v13 )
-          goto LABEL_30;
+          goto LABEL_30
         if ( (g_CiDeveloperMode & 0x100) == 0 )
-          goto LABEL_30;
+          goto LABEL_30
         if ( (g_CiOptions & 0x4000) == 0 )
-          goto LABEL_30;
-        a2 |= 0x40000000u;
-        LODWORD(v16) = Size;
+          goto LABEL_30
+        a2 |= 0x40000000u
+        LODWORD(v16) = Size
         if ( (int)CipAllocateValidationContext(
                     a2,
                     *(_DWORD *)(a1 + 1816),
@@ -4023,43 +4016,43 @@ __int64 __fastcall CiAuditImageForHvci(
                     0,
                     a4,
                     (__int64)&ListEntry) < 0 )
-          goto LABEL_30;
-        LOBYTE(v18) = 0;
-        LOBYTE(v17) = a3;
-        LODWORD(a1) = (_DWORD)ListEntry;
-        v12 = CipValidateImageHash(&CipValidateFileHash, ListEntry, FileObject, a4, BaseAddress, Size, a2, v17, v18);
+          goto LABEL_30
+        LOBYTE(v18) = 0
+        LOBYTE(v17) = a3
+        LODWORD(a1) = (_DWORD)ListEntry
+        v12 = CipValidateImageHash(&CipValidateFileHash, ListEntry, FileObject, a4, BaseAddress, Size, a2, v17, v18)
         if ( v12 >= 0 )
-          goto LABEL_30;
+          goto LABEL_30
         if ( v12 == -1073741746 )
         {
-          v11 |= 8u;
+          v11 |= 8u
         }
         else if ( v12 == -1073741280 )
         {
-          v11 |= 2u;
+          v11 |= 2u
         }
         else
         {
-          v11 |= 0x1000u;
+          v11 |= 0x1000u
         }
-        v19 = v11;
+        v19 = v11
       }
-      LOBYTE(v14) = 1;
-      CiHvciLogIncompatibility(v14, a1, (_DWORD)FileObject, a2, a4, (__int64)&v19, v12);
+      LOBYTE(v14) = 1
+      CiHvciLogIncompatibility(v14, a1, (_DWORD)FileObject, a2, a4, (__int64)&v19, v12)
       if ( (a2 & 5) != 0 && (g_CiDeveloperMode & 0x100) != 0 )
       {
         if ( (v11 & 2) != 0 || (v11 & 4) != 0 )
-          CipQueryAndLogFileNameForEvent(FileObject, &CiHvciUnalignedSection);
+          CipQueryAndLogFileNameForEvent(FileObject, &CiHvciUnalignedSection)
         if ( (v11 & 8) != 0 || (v11 & 0x10) != 0 )
-          CipQueryAndLogFileNameForEvent(FileObject, &CiWritableExecutableSection);
+          CipQueryAndLogFileNameForEvent(FileObject, &CiWritableExecutableSection)
       }
     }
   }
 LABEL_30:
-  result = CiReleaseContext(v23);
+  result = CiReleaseContext(v23)
   if ( ListEntry )
-    return CiFreeValidationContext(ListEntry);
-  return result;
+    return CiFreeValidationContext(ListEntry)
+  return result
 }
 
 ```
@@ -4078,75 +4071,75 @@ __int64 __fastcall CipAllocateValidationContext(
         __int64 a8,
         PSLIST_ENTRY *a9)
 {
-  unsigned int v11; // r14d
-  NTSTATUS v13; // esi
-  char v14; // cl
-  char v15; // r15
-  WORD Machine; // cx
-  bool v17; // al
-  PSLIST_ENTRY ListEntry; // [rsp+38h] [rbp-40h] BYREF
-  PIMAGE_NT_HEADERS NtHeader; // [rsp+40h] [rbp-38h] BYREF
+  unsigned int v11
+  NTSTATUS v13
+  char v14
+  char v15
+  WORD Machine
+  bool v17
+  PSLIST_ENTRY ListEntry
+  PIMAGE_NT_HEADERS NtHeader
 
-  v11 = a1;
-  ListEntry = 0;
-  NtHeader = 0;
+  v11 = a1
+  ListEntry = 0
+  NtHeader = 0
   if ( !g_HvciSupported )
-    return CipAllocateLocalValidationContext(a1, a6, a8, a3, a9);
-  v13 = CipAllocateLocalValidationContext(a1, a6, a8, a3, &ListEntry);
+    return CipAllocateLocalValidationContext(a1, a6, a8, a3, a9)
+  v13 = CipAllocateLocalValidationContext(a1, a6, a8, a3, &ListEntry)
   if ( v13 >= 0 )
   {
-    v14 = 0;
-    v15 = 0;
+    v14 = 0
+    v15 = 0
     if ( (v11 & 0x10000000) == 0 )
     {
       if ( (v11 & 0x40000000) != 0 || (v11 & 5) != 0 && (g_CiOptions & 0x8000) != 0 )
       {
-        v15 = 1;
+        v15 = 1
       }
       else if ( (g_CiOptions & 0x4000) != 0 && (v11 & 0x20000005) == 0 && (a2 & 4) != 0 )
       {
-        v14 = 1;
+        v14 = 1
       }
     }
-    *((_BYTE *)&ListEntry[129].Next + 8) = v14;
+    *((_BYTE *)&ListEntry[129].Next + 8) = v14
     if ( v15 )
     {
       if ( a7 && (*a7 & 2) == 0 )
       {
-        v13 = -1073741755;
-        goto LABEL_28;
+        v13 = -1073741755
+        goto LABEL_28
       }
     }
     else if ( !v14 )
     {
 LABEL_27:
-      *a9 = ListEntry;
-      ListEntry = 0;
-      goto LABEL_28;
+      *a9 = ListEntry
+      ListEntry = 0
+      goto LABEL_28
     }
-    v13 = RtlImageNtHeaderEx(0, a4, (unsigned int)Size, &NtHeader);
+    v13 = RtlImageNtHeaderEx(0, a4, (unsigned int)Size, &NtHeader)
     if ( v13 >= 0 )
     {
-      Machine = NtHeader->FileHeader.Machine;
-      v17 = Machine != 0x8664u;
+      Machine = NtHeader->FileHeader.Machine
+      v17 = Machine != 0x8664u
       if ( v15 && Machine == 332 )
-        v17 = 0;
+        v17 = 0
       if ( v17 )
       {
-        *((_BYTE *)&ListEntry[129].Next + 8) = 0;
-        goto LABEL_27;
+        *((_BYTE *)&ListEntry[129].Next + 8) = 0
+        goto LABEL_27
       }
       if ( !v15 )
-        goto LABEL_27;
-      v13 = CiHvciSetValidationContextForHvci(ListEntry, v11, a3, a4, Size);
+        goto LABEL_27
+      v13 = CiHvciSetValidationContextForHvci(ListEntry, v11, a3, a4, Size)
       if ( v13 >= 0 )
-        goto LABEL_27;
+        goto LABEL_27
     }
   }
 LABEL_28:
   if ( ListEntry )
-    CiFreeValidationContext(ListEntry);
-  return (unsigned int)v13;
+    CiFreeValidationContext(ListEntry)
+  return (unsigned int)v13
 }
 
 ```
@@ -4167,87 +4160,87 @@ __int64 __fastcall CipValidateImageHash(
         _QWORD *a10,
         __int64 a11)
 {
-  __int64 v11; // rdi
-  __int64 *v12; // r14
-  struct _FILE_OBJECT *v13; // r12
-  unsigned __int8 v14; // r13
-  __int64 v15; // rax
-  unsigned int v16; // esi
-  __int64 v17; // r8
-  char v18; // r15
-  _QWORD *v19; // r13
-  int LowPart; // ebx
-  int v21; // r9d
-  __int64 v22; // r14
-  int v23; // ecx
-  __int64 v24; // rax
-  char IsSignatureTrustedForIum; // al
-  int v26; // ebx
-  int v27; // r13d
-  int v28; // r12d
-  __int64 v29; // r15
-  int v30; // r14d
-  __int64 v31; // rsi
-  __int64 v32; // rdi
-  __int64 v33; // rax
-  void *v34; // rcx
-  int FileOpen; // eax
-  __int64 v36; // r14
-  int v38; // [rsp+30h] [rbp-B1h]
-  unsigned __int8 v39; // [rsp+50h] [rbp-91h]
-  char v40; // [rsp+51h] [rbp-90h]
-  char v41; // [rsp+52h] [rbp-8Fh]
-  unsigned int v42; // [rsp+54h] [rbp-8Dh]
-  union _LARGE_INTEGER FileSize; // [rsp+60h] [rbp-81h] BYREF
-  __int64 v44; // [rsp+68h] [rbp-79h]
-  struct _FILE_OBJECT *v45; // [rsp+70h] [rbp-71h]
-  __int64 v46; // [rsp+78h] [rbp-69h]
-  _QWORD *v47; // [rsp+80h] [rbp-61h]
-  __int64 v48; // [rsp+88h] [rbp-59h]
-  __int64 v49; // [rsp+90h] [rbp-51h] BYREF
-  __int64 (__fastcall *v50)(__int64, struct _FILE_OBJECT *, __int64, __int64, int, unsigned int, int, _QWORD *, __int64 *); // [rsp+98h] [rbp-49h]
-  __int64 v51; // [rsp+A0h] [rbp-41h]
-  void *v52[2]; // [rsp+A8h] [rbp-39h] BYREF
-  __int128 v53; // [rsp+B8h] [rbp-29h]
-  __int64 v54; // [rsp+C8h] [rbp-19h]
-  int v55; // [rsp+D0h] [rbp-11h] BYREF
-  char v56; // [rsp+D4h] [rbp-Dh]
+  __int64 v11
+  __int64 *v12
+  struct _FILE_OBJECT *v13
+  unsigned __int8 v14
+  __int64 v15
+  unsigned int v16
+  __int64 v17
+  char v18
+  _QWORD *v19
+  int LowPart
+  int v21
+  __int64 v22
+  int v23
+  __int64 v24
+  char IsSignatureTrustedForIum
+  int v26
+  int v27
+  int v28
+  __int64 v29
+  int v30
+  __int64 v31
+  __int64 v32
+  __int64 v33
+  void *v34
+  int FileOpen
+  __int64 v36
+  int v38
+  unsigned __int8 v39
+  char v40
+  char v41
+  unsigned int v42
+  union _LARGE_INTEGER FileSize
+  __int64 v44
+  struct _FILE_OBJECT *v45
+  __int64 v46
+  _QWORD *v47
+  __int64 v48
+  __int64 v49
+  __int64 (__fastcall *v50)(__int64, struct _FILE_OBJECT *, __int64, __int64, int, unsigned int, int, _QWORD *, __int64 *)
+  __int64 v51
+  void *v52[2]
+  __int128 v53
+  __int64 v54
+  int v55
+  char v56
 
-  v11 = a2;
-  v12 = (__int64 *)a11;
-  v13 = a3;
-  v14 = 0;
-  v46 = a5;
-  v50 = a1;
-  v47 = a10;
-  v48 = a4;
-  v15 = *a10;
-  v44 = a2;
-  v55 = 0;
-  v56 = 0;
-  v40 = 0;
-  v45 = a3;
-  v51 = v15;
-  v39 = 0;
-  CipInitializeSigningLevelOrder((__int64)&v55, a7, a8, a9);
-  v16 = a7 | 0x8000000;
-  v17 = (unsigned int)g_CiPolicyState >> 2;
-  LOBYTE(v17) = (g_CiPolicyState & 4) != 0;
+  v11 = a2
+  v12 = (__int64 *)a11
+  v13 = a3
+  v14 = 0
+  v46 = a5
+  v50 = a1
+  v47 = a10
+  v48 = a4
+  v15 = *a10
+  v44 = a2
+  v55 = 0
+  v56 = 0
+  v40 = 0
+  v45 = a3
+  v51 = v15
+  v39 = 0
+  CipInitializeSigningLevelOrder((__int64)&v55, a7, a8, a9)
+  v16 = a7 | 0x8000000
+  v17 = (unsigned int)g_CiPolicyState >> 2
+  LOBYTE(v17) = (g_CiPolicyState & 4) != 0
   if ( (g_CiPolicyState & 4) == 0 )
-    v16 = a7;
+    v16 = a7
 LABEL_3:
-  v42 = v16;
+  v42 = v16
   while ( 2 )
   {
-    CiReinitializeValidationContext(v11, v16, v17);
-    v18 = *((_BYTE *)&v55 + v14 + 1);
-    v41 = v18;
+    CiReinitializeValidationContext(v11, v16, v17)
+    v18 = *((_BYTE *)&v55 + v14 + 1)
+    v41 = v18
 LABEL_5:
-    v19 = v47;
+    v19 = v47
     while ( 1 )
     {
-      LOBYTE(v38) = v18;
-      LowPart = v50(v11, v13, v48, v46, a6, v16, v38, v19, v12);
+      LOBYTE(v38) = v18
+      LowPart = v50(v11, v13, v48, v46, a6, v16, v38, v19, v12)
       if ( LowPart >= 0 )
       {
         if ( *(__int64 (__fastcall ***)())(v11 + 1800) == &off_1C002B000 && !v51 )
@@ -4255,8 +4248,8 @@ LABEL_5:
           if ( (g_CiOptions & 0x200000) == 0 )
           {
             if ( !*(_BYTE *)(v11 + 2072) )
-              goto LABEL_37;
-            v22 = *v12;
+              goto LABEL_37
+            v22 = *v12
             if ( (unsigned __int8)CiIsSignatureTrustedForIum(v22)
               && (v23 = *((_DWORD *)g_CipWhichLevelComparisons + 12), _bittest(&v23, *(_BYTE *)(v22 + 52) & 0xF))
               || *(_DWORD *)(v22 + 48) == 1
@@ -4264,139 +4257,139 @@ LABEL_5:
               && ((g_CiOptions & 8) != 0 || (v24 = *(_QWORD *)(v22 + 16)) != 0 && *(_DWORD *)(v24 + 52) == 22)
               && (unsigned __int8)MincryptIsEKUInPolicy(v22, "1.3.6.1.4.1.311.76.57.1.15") )
             {
-              v12 = (__int64 *)a11;
+              v12 = (__int64 *)a11
             }
             else
             {
-              IsSignatureTrustedForIum = CiIsSignatureTrustedForIum(v22);
-              v12 = (__int64 *)a11;
+              IsSignatureTrustedForIum = CiIsSignatureTrustedForIum(v22)
+              v12 = (__int64 *)a11
               if ( !IsSignatureTrustedForIum )
-                goto LABEL_37;
+                goto LABEL_37
             }
           }
           if ( *v19 )
           {
-            CiReleaseContext(*v19);
-            *v19 = 0;
+            CiReleaseContext(*v19)
+            *v19 = 0
           }
-          *v12 = 0;
-          v26 = *(_DWORD *)(v11 + 1816);
-          v27 = *(_DWORD *)(v11 + 2092);
-          v28 = *(_DWORD *)(v11 + 2088);
-          v29 = *(_QWORD *)(v11 + 2096);
-          v30 = *(_DWORD *)(v11 + 2104);
-          v31 = *(_QWORD *)(v11 + 2080);
-          v32 = *(_QWORD *)(v11 + 1808);
-          (**(void (***)(void))(v44 + 1800))();
-          FileSize.LowPart = CiInitializeValidationContext(v42, v45, v44);
-          v33 = v44;
-          *(_DWORD *)(v44 + 1816) = v26;
-          LowPart = FileSize.LowPart;
-          *(_DWORD *)(v33 + 2088) = v28;
-          v13 = v45;
-          *(_QWORD *)(v33 + 2080) = v31;
-          v16 = v42;
-          *(_DWORD *)(v33 + 2092) = v27;
-          *(_QWORD *)(v33 + 2096) = v29;
-          *(_DWORD *)(v33 + 2104) = v30;
-          *(_QWORD *)(v33 + 1808) = v32;
+          *v12 = 0
+          v26 = *(_DWORD *)(v11 + 1816)
+          v27 = *(_DWORD *)(v11 + 2092)
+          v28 = *(_DWORD *)(v11 + 2088)
+          v29 = *(_QWORD *)(v11 + 2096)
+          v30 = *(_DWORD *)(v11 + 2104)
+          v31 = *(_QWORD *)(v11 + 2080)
+          v32 = *(_QWORD *)(v11 + 1808)
+          (**(void (***)(void))(v44 + 1800))()
+          FileSize.LowPart = CiInitializeValidationContext(v42, v45, v44)
+          v33 = v44
+          *(_DWORD *)(v44 + 1816) = v26
+          LowPart = FileSize.LowPart
+          *(_DWORD *)(v33 + 2088) = v28
+          v13 = v45
+          *(_QWORD *)(v33 + 2080) = v31
+          v16 = v42
+          *(_DWORD *)(v33 + 2092) = v27
+          *(_QWORD *)(v33 + 2096) = v29
+          *(_DWORD *)(v33 + 2104) = v30
+          *(_QWORD *)(v33 + 1808) = v32
           if ( LowPart < 0 )
           {
-            v11 = v33;
+            v11 = v33
           }
           else
           {
-            v11 = v44;
-            LowPart = CiHvciSetValidationContextForHvci(v44, v42, v13, v46, a6);
+            v11 = v44
+            LowPart = CiHvciSetValidationContextForHvci(v44, v42, v13, v46, a6)
           }
           if ( LowPart >= 0 )
           {
-            v18 = v41;
-            v12 = (__int64 *)a11;
-            v40 = 1;
-            goto LABEL_5;
+            v18 = v41
+            v12 = (__int64 *)a11
+            v40 = 1
+            goto LABEL_5
           }
-          return (unsigned int)LowPart;
+          return (unsigned int)LowPart
         }
-        goto LABEL_37;
+        goto LABEL_37
       }
       if ( !v40
         || !(unsigned __int8)PsIsCurrentThreadInServerSilo()
         || !(unsigned __int8)CiHvciIsVbsPolicyFailure(v11, 0) )
       {
-        break;
+        break
       }
-      v34 = *(void **)(v11 + 1824);
+      v34 = *(void **)(v11 + 1824)
       if ( v34 )
       {
-        CipReleaseImage(v34);
-        *(_QWORD *)(v11 + 1824) = 0;
+        CipReleaseImage(v34)
+        *(_QWORD *)(v11 + 1824) = 0
       }
-      *(_QWORD *)(v11 + 1800) = &off_1C002B000;
-      CiReinitializeValidationContext(v11, v16, v17);
-      *(_BYTE *)(v11 + 2072) = 0;
+      *(_QWORD *)(v11 + 1800) = &off_1C002B000
+      CiReinitializeValidationContext(v11, v16, v17)
+      *(_BYTE *)(v11 + 2072) = 0
     }
     if ( LowPart == -1073740760 || LowPart == -1073741701 )
-      goto LABEL_39;
+      goto LABEL_39
 LABEL_37:
     if ( LowPart != -1058471934 )
     {
-      LOBYTE(v21) = v18;
+      LOBYTE(v21) = v18
       if ( !(unsigned __int8)CipAllowPolicyEngineToEvaluateObjectWithExpiredAndRevokedCert(
                                (_DWORD)v13,
                                v48,
                                v16,
                                v21,
                                LowPart) )
-        goto LABEL_50;
+        goto LABEL_50
     }
 LABEL_39:
     if ( (v16 & 0xE5DFFF87) == 0
       && (*((_DWORD *)g_CipWhichLevelComparisons + (v18 & 0xF)) & 4) != 0
       && *(_DWORD *)(v11 + 24) != 26 )
     {
-      LOBYTE(v21) = v18;
-      LowPart = CipApplySIPolicyUMCI(v11, LowPart, v16, v21, (__int64)v13, (__int64)v12);
+      LOBYTE(v21) = v18
+      LowPart = CipApplySIPolicyUMCI(v11, LowPart, v16, v21, (__int64)v13, (__int64)v12)
       if ( LowPart >= 0 )
-        return (unsigned int)LowPart;
+        return (unsigned int)LowPart
       if ( *(_DWORD *)(v11 + 24) != 26 )
       {
-        *(_DWORD *)(v11 + 1504) &= ~2u;
-        v49 = 0;
-        FileSize.QuadPart = 0;
-        v54 = 0;
-        *(_OWORD *)v52 = 0;
-        v53 = 0;
-        LowPart = FsRtlGetFileSize(v13, &FileSize);
+        *(_DWORD *)(v11 + 1504) &= ~2u
+        v49 = 0
+        FileSize.QuadPart = 0
+        v54 = 0
+        *(_OWORD *)v52 = 0
+        v53 = 0
+        LowPart = FsRtlGetFileSize(v13, &FileSize)
         if ( LowPart >= 0 )
         {
-          FileOpen = CiReadFileOpen(v13, v52, (__int64)&v49);
-          v36 = v49;
-          LowPart = FileOpen;
+          FileOpen = CiReadFileOpen(v13, v52, (__int64)&v49)
+          v36 = v49
+          LowPart = FileOpen
           if ( FileOpen >= 0 )
-            LowPart = CipValidateDataMappedFileWithContext(v11, v49, FileSize.LowPart, (_DWORD)v13, v16, v18, 0, a11);
+            LowPart = CipValidateDataMappedFileWithContext(v11, v49, FileSize.LowPart, (_DWORD)v13, v16, v18, 0, a11)
           if ( v36 )
-            CiReadFileClose(v52);
-          v12 = (__int64 *)a11;
+            CiReadFileClose(v52)
+          v12 = (__int64 *)a11
         }
       }
     }
 LABEL_50:
     if ( LowPart == -1073740760 || LowPart == -1073741701 || LowPart == -1058471934 || LowPart == -1073740285 )
     {
-      v14 = v39 + 1;
-      v39 = v14;
+      v14 = v39 + 1
+      v39 = v14
       if ( v14 < (unsigned __int8)v55 )
-        continue;
+        continue
       if ( (v16 & 0x8000000) != 0 )
       {
-        v14 = 0;
-        v39 = 0;
-        v16 &= ~0x8000000u;
-        goto LABEL_3;
+        v14 = 0
+        v39 = 0
+        v16 &= ~0x8000000u
+        goto LABEL_3
       }
     }
-    return (unsigned int)LowPart;
+    return (unsigned int)LowPart
   }
 }
 
@@ -4407,22 +4400,22 @@ LABEL_50:
 ```cpp
 __int64 __fastcall CipMitigatePPLBypassThroughInterpreters(__int64 a1, int a2, int a3, char a4, char a5)
 {
-  int v6; // r10d
-  int OriginalFilenameAndVersionFromImage; // eax
-  unsigned int v8; // ebx
-  unsigned int v9; // edi
-  __int64 v10; // rdx
-  __int64 v12; // [rsp+40h] [rbp-30h] BYREF
-  __int64 v13; // [rsp+48h] [rbp-28h] BYREF
-  UNICODE_STRING String2; // [rsp+50h] [rbp-20h] BYREF
-  __int128 v15; // [rsp+60h] [rbp-10h] BYREF
+  int v6
+  int OriginalFilenameAndVersionFromImage
+  unsigned int v8
+  unsigned int v9
+  __int64 v10
+  __int64 v12
+  __int64 v13
+  UNICODE_STRING String2
+  __int128 v15
 
-  v12 = 0;
-  v13 = 0;
-  v6 = a3;
-  LOBYTE(a3) = a4;
-  v15 = 0;
-  String2 = 0;
+  v12 = 0
+  v13 = 0
+  v6 = a3
+  LOBYTE(a3) = a4
+  v15 = 0
+  String2 = 0
   OriginalFilenameAndVersionFromImage = SIPolicyGetOriginalFilenameAndVersionFromImage(
                                           a2,
                                           v6,
@@ -4431,29 +4424,29 @@ __int64 __fastcall CipMitigatePPLBypassThroughInterpreters(__int64 a1, int a2, i
                                           (__int64)&v13,
                                           0,
                                           0,
-                                          0);
-  v8 = OriginalFilenameAndVersionFromImage;
+                                          0)
+  v8 = OriginalFilenameAndVersionFromImage
   if ( OriginalFilenameAndVersionFromImage == -1073741275 )
-    return 0;
+    return 0
   if ( OriginalFilenameAndVersionFromImage < 0 )
-    return v8;
+    return v8
   if ( !String2.Buffer )
-    return 0;
-  v9 = 0;
+    return 0
+  v9 = 0
   while ( !RtlEqualUnicodeString((PCUNICODE_STRING)&g_BlockedDllsForPPL + v9, &String2, 1u) )
   {
     if ( ++v9 >= 5 )
-      return v8;
+      return v8
   }
   if ( a5 )
   {
-    CipQueryFileName(a1, &v15, &v12);
-    CiLogFileEvent((unsigned __int16 *)&v15, &CiPPLRevokedImageNotLoaded);
-    CiInstrumentPPLBypassBlocked(&v15);
+    CipQueryFileName(a1, &v15, &v12)
+    CiLogFileEvent((unsigned __int16 *)&v15, &CiPPLRevokedImageNotLoaded)
+    CiInstrumentPPLBypassBlocked(&v15)
     if ( v12 )
-      FsRtlReleaseFileNameInformation(v12, v10);
+      FsRtlReleaseFileNameInformation(v12, v10)
   }
-  return (unsigned int)-1073740284;
+  return (unsigned int)-1073740284
 }
 
 ```
@@ -4463,77 +4456,77 @@ __int64 __fastcall CipMitigatePPLBypassThroughInterpreters(__int64 a1, int a2, i
 ```cpp
 void *__cdecl memmove(void *a1, const void *Src, size_t Size)
 {
-  void *result; // rax
-  __int64 v4; // r11
-  __int64 v5; // rdx
-  __int128 v6; // xmm1
-  bool v7; // cf
-  signed __int64 v8; // rdx
-  char v9; // r11
-  _BYTE *v10; // rcx
-  char v11; // r11
-  char *v12; // r11
-  signed __int64 v13; // rdx
-  __m128 v14; // xmm0
-  unsigned __int64 v15; // rcx
-  unsigned __int64 v16; // rcx
-  __m128 v17; // xmm1
-  unsigned __int64 v18; // r8
-  unsigned __int64 v19; // r9
-  __int128 v20; // xmm1
-  __int128 v21; // xmm2
-  __int128 v22; // xmm3
-  __m128 v23; // xmm4
-  unsigned __int64 j; // r9
-  unsigned __int64 v25; // r8
-  unsigned __int64 v26; // r9
-  __m128 v27; // xmm1
-  __m128 v28; // xmm2
-  __m128 v29; // xmm3
-  __m128 v30; // xmm4
-  char *v31; // rcx
-  __int128 v32; // xmm0
-  unsigned __int64 v33; // rcx
-  size_t v34; // r8
-  _OWORD *v35; // r11
-  __int128 v36; // xmm1
-  size_t v37; // r9
-  __int128 v38; // xmm1
-  __int128 v39; // xmm2
-  __int128 v40; // xmm3
-  __int128 v41; // xmm4
-  size_t i; // r9
-  size_t v43; // r8
+  void *result
+  __int64 v4
+  __int64 v5
+  __int128 v6
+  bool v7
+  signed __int64 v8
+  char v9
+  _BYTE *v10
+  char v11
+  char *v12
+  signed __int64 v13
+  __m128 v14
+  unsigned __int64 v15
+  unsigned __int64 v16
+  __m128 v17
+  unsigned __int64 v18
+  unsigned __int64 v19
+  __int128 v20
+  __int128 v21
+  __int128 v22
+  __m128 v23
+  unsigned __int64 j
+  unsigned __int64 v25
+  unsigned __int64 v26
+  __m128 v27
+  __m128 v28
+  __m128 v29
+  __m128 v30
+  char *v31
+  __int128 v32
+  unsigned __int64 v33
+  size_t v34
+  _OWORD *v35
+  __int128 v36
+  size_t v37
+  __int128 v38
+  __int128 v39
+  __int128 v40
+  __int128 v41
+  size_t i
+  size_t v43
 
-  result = a1;
+  result = a1
   if ( Size < 8 )
   {
     if ( Size )
     {
-      v7 = Src < a1;
-      v8 = (_BYTE *)Src - (_BYTE *)a1;
+      v7 = Src < a1
+      v8 = (_BYTE *)Src - (_BYTE *)a1
       if ( v7 )
       {
-        v10 = (char *)a1 + Size;
+        v10 = (char *)a1 + Size
         do
         {
-          v11 = v10[v8 - 1];
-          --v10;
-          --Size;
-          *v10 = v11;
+          v11 = v10[v8 - 1]
+          --v10
+          --Size
+          *v10 = v11
         }
-        while ( Size );
+        while ( Size )
       }
       else
       {
         do
         {
-          v9 = *((_BYTE *)a1 + v8);
-          a1 = (char *)a1 + 1;
-          --Size;
-          *((char *)a1 - 1) = v9;
+          v9 = *((_BYTE *)a1 + v8)
+          a1 = (char *)a1 + 1
+          --Size
+          *((char *)a1 - 1) = v9
         }
-        while ( Size );
+        while ( Size )
       }
     }
   }
@@ -4541,141 +4534,141 @@ void *__cdecl memmove(void *a1, const void *Src, size_t Size)
   {
     if ( Size > 0x20 )
     {
-      v12 = (char *)Src + Size;
-      v7 = Src < a1;
-      v13 = (_BYTE *)Src - (_BYTE *)a1;
+      v12 = (char *)Src + Size
+      v7 = Src < a1
+      v13 = (_BYTE *)Src - (_BYTE *)a1
       if ( v7 && v12 > a1 )
       {
-        v31 = (char *)a1 + Size;
-        v32 = *(_OWORD *)&v31[v13 - 16];
-        v33 = (unsigned __int64)(v31 - 16);
-        v34 = Size - 16;
+        v31 = (char *)a1 + Size
+        v32 = *(_OWORD *)&v31[v13 - 16]
+        v33 = (unsigned __int64)(v31 - 16)
+        v34 = Size - 16
         if ( (v33 & 0xF) != 0 )
         {
-          v35 = (_OWORD *)v33;
-          v33 &= 0xFFFFFFFFFFFFFFF0uLL;
-          v36 = *(_OWORD *)(v33 + v13);
-          *v35 = v32;
-          v32 = v36;
-          v34 = v33 - (_QWORD)result;
+          v35 = (_OWORD *)v33
+          v33 &= 0xFFFFFFFFFFFFFFF0uLL
+          v36 = *(_OWORD *)(v33 + v13)
+          *v35 = v32
+          v32 = v36
+          v34 = v33 - (_QWORD)result
         }
-        v37 = v34 >> 6;
+        v37 = v34 >> 6
         if ( v34 >> 6 )
         {
-          v34 &= 0x3Fu;
+          v34 &= 0x3Fu
           do
           {
-            v38 = *(_OWORD *)(v33 + v13 - 16);
-            v39 = *(_OWORD *)(v33 + v13 - 32);
-            v40 = *(_OWORD *)(v33 + v13 - 48);
-            v41 = *(_OWORD *)(v33 + v13 - 64);
-            *(_OWORD *)v33 = v32;
-            v33 -= 64LL;
-            --v37;
-            *(_OWORD *)(v33 + 48) = v38;
-            *(_OWORD *)(v33 + 32) = v39;
-            *(_OWORD *)(v33 + 16) = v40;
-            v32 = v41;
+            v38 = *(_OWORD *)(v33 + v13 - 16)
+            v39 = *(_OWORD *)(v33 + v13 - 32)
+            v40 = *(_OWORD *)(v33 + v13 - 48)
+            v41 = *(_OWORD *)(v33 + v13 - 64)
+            *(_OWORD *)v33 = v32
+            v33 -= 64LL
+            --v37
+            *(_OWORD *)(v33 + 48) = v38
+            *(_OWORD *)(v33 + 32) = v39
+            *(_OWORD *)(v33 + 16) = v40
+            v32 = v41
           }
-          while ( v37 );
+          while ( v37 )
         }
-        for ( i = v34 >> 4; i; --i )
+        for ( i = v34 >> 4
         {
-          *(_OWORD *)v33 = v32;
-          v32 = *(_OWORD *)(v33 + v13 - 16);
-          v33 -= 16LL;
+          *(_OWORD *)v33 = v32
+          v32 = *(_OWORD *)(v33 + v13 - 16)
+          v33 -= 16LL
         }
-        v43 = v34 & 0xF;
+        v43 = v34 & 0xF
         if ( v43 )
-          *(_OWORD *)(v33 - v43) = *(_OWORD *)(v33 - v43 + v13);
-        *(_OWORD *)v33 = v32;
+          *(_OWORD *)(v33 - v43) = *(_OWORD *)(v33 - v43 + v13)
+        *(_OWORD *)v33 = v32
       }
       else
       {
-        v14 = *(__m128 *)((char *)a1 + v13);
-        v15 = (unsigned __int64)a1 + 16;
+        v14 = *(__m128 *)((char *)a1 + v13)
+        v15 = (unsigned __int64)a1 + 16
         if ( (v15 & 0xF) != 0 )
         {
-          v16 = v15 & 0xFFFFFFFFFFFFFFF0uLL;
-          v17 = *(__m128 *)(v16 + v13);
-          *(__m128 *)result = v14;
-          v14 = v17;
-          v15 = v16 + 16;
+          v16 = v15 & 0xFFFFFFFFFFFFFFF0uLL
+          v17 = *(__m128 *)(v16 + v13)
+          *(__m128 *)result = v14
+          v14 = v17
+          v15 = v16 + 16
         }
-        v18 = (unsigned __int64)result + Size - v15;
-        v19 = v18 >> 6;
+        v18 = (unsigned __int64)result + Size - v15
+        v19 = v18 >> 6
         if ( v18 >> 6 )
         {
           if ( v19 > 0x1000 )
           {
-            v26 = v18 >> 6;
-            v18 &= 0x3Fu;
-            _mm_prefetch((const char *)(v15 + v13 + 64), 0);
+            v26 = v18 >> 6
+            v18 &= 0x3Fu
+            _mm_prefetch((const char *)(v15 + v13 + 64), 0)
             do
             {
-              v27 = *(__m128 *)(v15 + v13);
-              v28 = *(__m128 *)(v15 + v13 + 16);
-              v29 = *(__m128 *)(v15 + v13 + 32);
-              v30 = *(__m128 *)(v15 + v13 + 48);
-              _mm_stream_ps((float *)(v15 - 16), v14);
-              v15 += 64LL;
-              _mm_prefetch((const char *)(v15 + v13 + 64), 0);
-              --v26;
-              _mm_stream_ps((float *)(v15 - 64), v27);
-              _mm_stream_ps((float *)(v15 - 48), v28);
-              _mm_stream_ps((float *)(v15 - 32), v29);
-              v14 = v30;
+              v27 = *(__m128 *)(v15 + v13)
+              v28 = *(__m128 *)(v15 + v13 + 16)
+              v29 = *(__m128 *)(v15 + v13 + 32)
+              v30 = *(__m128 *)(v15 + v13 + 48)
+              _mm_stream_ps((float *)(v15 - 16), v14)
+              v15 += 64LL
+              _mm_prefetch((const char *)(v15 + v13 + 64), 0)
+              --v26
+              _mm_stream_ps((float *)(v15 - 64), v27)
+              _mm_stream_ps((float *)(v15 - 48), v28)
+              _mm_stream_ps((float *)(v15 - 32), v29)
+              v14 = v30
             }
-            while ( v26 );
-            _mm_sfence();
+            while ( v26 )
+            _mm_sfence()
           }
           else
           {
-            v18 &= 0x3Fu;
+            v18 &= 0x3Fu
             do
             {
-              v20 = *(_OWORD *)(v15 + v13);
-              v21 = *(_OWORD *)(v15 + v13 + 16);
-              v22 = *(_OWORD *)(v15 + v13 + 32);
-              v23 = *(__m128 *)(v15 + v13 + 48);
-              *(__m128 *)(v15 - 16) = v14;
-              v15 += 64LL;
-              --v19;
-              *(_OWORD *)(v15 - 64) = v20;
-              *(_OWORD *)(v15 - 48) = v21;
-              *(_OWORD *)(v15 - 32) = v22;
-              v14 = v23;
+              v20 = *(_OWORD *)(v15 + v13)
+              v21 = *(_OWORD *)(v15 + v13 + 16)
+              v22 = *(_OWORD *)(v15 + v13 + 32)
+              v23 = *(__m128 *)(v15 + v13 + 48)
+              *(__m128 *)(v15 - 16) = v14
+              v15 += 64LL
+              --v19
+              *(_OWORD *)(v15 - 64) = v20
+              *(_OWORD *)(v15 - 48) = v21
+              *(_OWORD *)(v15 - 32) = v22
+              v14 = v23
             }
-            while ( v19 );
+            while ( v19 )
           }
         }
-        for ( j = v18 >> 4; j; --j )
+        for ( j = v18 >> 4
         {
-          *(__m128 *)(v15 - 16) = v14;
-          v14 = *(__m128 *)(v15 + v13);
-          v15 += 16LL;
+          *(__m128 *)(v15 - 16) = v14
+          v14 = *(__m128 *)(v15 + v13)
+          v15 += 16LL
         }
-        v25 = v18 & 0xF;
+        v25 = v18 & 0xF
         if ( v25 )
-          *(_OWORD *)(v15 + v25 - 16) = *(_OWORD *)(v15 + v25 - 16 + v13);
-        *(__m128 *)(v15 - 16) = v14;
+          *(_OWORD *)(v15 + v25 - 16) = *(_OWORD *)(v15 + v25 - 16 + v13)
+        *(__m128 *)(v15 - 16) = v14
       }
     }
     else
     {
-      v6 = *(_OWORD *)((char *)Src + Size - 16);
-      *(_OWORD *)a1 = *(_OWORD *)Src;
-      *(_OWORD *)((char *)a1 + Size - 16) = v6;
+      v6 = *(_OWORD *)((char *)Src + Size - 16)
+      *(_OWORD *)a1 = *(_OWORD *)Src
+      *(_OWORD *)((char *)a1 + Size - 16) = v6
     }
   }
   else
   {
-    v4 = *(_QWORD *)Src;
-    v5 = *(_QWORD *)((char *)Src + Size - 8);
-    *(_QWORD *)a1 = v4;
-    *(_QWORD *)((char *)a1 + Size - 8) = v5;
+    v4 = *(_QWORD *)Src
+    v5 = *(_QWORD *)((char *)Src + Size - 8)
+    *(_QWORD *)a1 = v4
+    *(_QWORD *)((char *)a1 + Size - 8) = v5
   }
-  return result;
+  return result
 }
 
 ```
@@ -4685,112 +4678,112 @@ void *__cdecl memmove(void *a1, const void *Src, size_t Size)
 ```cpp
 void __fastcall CiAuditDriverAllow(__int64 a1, int a2, __int64 a3, __int64 a4)
 {
-  _DWORD *v5; // rsi
-  int v6; // r14d
-  int v7; // r15d
-  int v9; // edi
-  __int64 v10; // rax
-  int *v11; // rax
-  int v12; // eax
-  PVOID v13; // rdi
-  __int128 v14; // xmm1
-  __int64 v15; // rdx
-  __int16 v16; // ax
-  unsigned __int16 v17; // [rsp+40h] [rbp-C0h] BYREF
-  __int16 v18; // [rsp+44h] [rbp-BCh] BYREF
-  __int16 v19; // [rsp+48h] [rbp-B8h] BYREF
-  __int16 v20; // [rsp+4Ch] [rbp-B4h] BYREF
-  __int16 v21; // [rsp+50h] [rbp-B0h] BYREF
-  int v22; // [rsp+54h] [rbp-ACh] BYREF
-  int v23; // [rsp+58h] [rbp-A8h] BYREF
-  int v24; // [rsp+5Ch] [rbp-A4h] BYREF
-  int v25; // [rsp+60h] [rbp-A0h] BYREF
-  int v26; // [rsp+64h] [rbp-9Ch] BYREF
-  int v27; // [rsp+68h] [rbp-98h]
-  int v28; // [rsp+6Ch] [rbp-94h] BYREF
-  int v29; // [rsp+70h] [rbp-90h] BYREF
-  PVOID P; // [rsp+78h] [rbp-88h] BYREF
-  __int64 v31; // [rsp+80h] [rbp-80h] BYREF
-  char v32[8]; // [rsp+88h] [rbp-78h] BYREF
-  __int64 v33; // [rsp+90h] [rbp-70h] BYREF
-  __int128 v34; // [rsp+98h] [rbp-68h] BYREF
-  __int128 v35; // [rsp+A8h] [rbp-58h]
-  __int128 v36; // [rsp+B8h] [rbp-48h]
-  __int128 v37; // [rsp+C8h] [rbp-38h] BYREF
-  __int128 v38; // [rsp+D8h] [rbp-28h] BYREF
-  struct _EVENT_DATA_DESCRIPTOR v39; // [rsp+F0h] [rbp-10h] BYREF
-  _DWORD *v40; // [rsp+110h] [rbp+10h]
-  __int64 v41; // [rsp+118h] [rbp+18h]
-  __int64 v42; // [rsp+120h] [rbp+20h]
-  _DWORD v43[2]; // [rsp+128h] [rbp+28h] BYREF
-  int *v44; // [rsp+130h] [rbp+30h]
-  __int64 v45; // [rsp+138h] [rbp+38h]
-  unsigned __int16 *v46; // [rsp+140h] [rbp+40h]
-  __int64 v47; // [rsp+148h] [rbp+48h]
-  __int64 v48; // [rsp+150h] [rbp+50h]
-  int v49; // [rsp+158h] [rbp+58h]
-  int v50; // [rsp+15Ch] [rbp+5Ch]
-  __int16 *v51; // [rsp+160h] [rbp+60h]
-  __int64 v52; // [rsp+168h] [rbp+68h]
-  __int16 *v53; // [rsp+170h] [rbp+70h]
-  __int64 v54; // [rsp+178h] [rbp+78h]
-  int *v55; // [rsp+180h] [rbp+80h]
-  __int64 v56; // [rsp+188h] [rbp+88h]
-  int *v57; // [rsp+190h] [rbp+90h]
-  __int64 v58; // [rsp+198h] [rbp+98h]
-  int *v59; // [rsp+1A0h] [rbp+A0h]
-  __int64 v60; // [rsp+1A8h] [rbp+A8h]
-  __int64 v61; // [rsp+1B0h] [rbp+B0h]
-  __int64 v62; // [rsp+1B8h] [rbp+B8h]
-  __int64 *v63; // [rsp+1C0h] [rbp+C0h]
-  __int64 v64; // [rsp+1C8h] [rbp+C8h]
-  int *v65; // [rsp+1D0h] [rbp+D0h]
-  __int64 v66; // [rsp+1D8h] [rbp+D8h]
-  __int16 *v67; // [rsp+1E0h] [rbp+E0h]
-  __int64 v68; // [rsp+1E8h] [rbp+E8h]
-  _DWORD *v69; // [rsp+1F0h] [rbp+F0h]
-  int v70; // [rsp+1F8h] [rbp+F8h]
-  int v71; // [rsp+1FCh] [rbp+FCh]
-  int *v72; // [rsp+200h] [rbp+100h]
-  __int64 v73; // [rsp+208h] [rbp+108h]
-  int *v74; // [rsp+210h] [rbp+110h]
-  __int64 v75; // [rsp+218h] [rbp+118h]
-  __int16 *v76; // [rsp+220h] [rbp+120h]
-  __int64 v77; // [rsp+228h] [rbp+128h]
-  _DWORD *v78; // [rsp+230h] [rbp+130h]
-  __int64 v79; // [rsp+238h] [rbp+138h]
-  __int64 v80; // [rsp+240h] [rbp+140h]
-  _DWORD v81[2]; // [rsp+248h] [rbp+148h] BYREF
-  _DWORD *v82; // [rsp+250h] [rbp+150h]
-  __int64 v83; // [rsp+258h] [rbp+158h]
-  __int64 v84; // [rsp+260h] [rbp+160h]
-  _DWORD v85[2]; // [rsp+268h] [rbp+168h] BYREF
-  __int128 *v86; // [rsp+270h] [rbp+170h]
-  __int64 v87; // [rsp+278h] [rbp+178h]
-  __int128 *v88; // [rsp+280h] [rbp+180h]
-  __int64 v89; // [rsp+288h] [rbp+188h]
+  _DWORD *v5
+  int v6
+  int v7
+  int v9
+  __int64 v10
+  int *v11
+  int v12
+  PVOID v13
+  __int128 v14
+  __int64 v15
+  __int16 v16
+  unsigned __int16 v17
+  __int16 v18
+  __int16 v19
+  __int16 v20
+  __int16 v21
+  int v22
+  int v23
+  int v24
+  int v25
+  int v26
+  int v27
+  int v28
+  int v29
+  PVOID P
+  __int64 v31
+  char v32[8]
+  __int64 v33
+  __int128 v34
+  __int128 v35
+  __int128 v36
+  __int128 v37
+  __int128 v38
+  struct _EVENT_DATA_DESCRIPTOR v39
+  _DWORD *v40
+  __int64 v41
+  __int64 v42
+  _DWORD v43[2]
+  int *v44
+  __int64 v45
+  unsigned __int16 *v46
+  __int64 v47
+  __int64 v48
+  int v49
+  int v50
+  __int16 *v51
+  __int64 v52
+  __int16 *v53
+  __int64 v54
+  int *v55
+  __int64 v56
+  int *v57
+  __int64 v58
+  int *v59
+  __int64 v60
+  __int64 v61
+  __int64 v62
+  __int64 *v63
+  __int64 v64
+  int *v65
+  __int64 v66
+  __int16 *v67
+  __int64 v68
+  _DWORD *v69
+  int v70
+  int v71
+  int *v72
+  __int64 v73
+  int *v74
+  __int64 v75
+  __int16 *v76
+  __int64 v77
+  _DWORD *v78
+  __int64 v79
+  __int64 v80
+  _DWORD v81[2]
+  _DWORD *v82
+  __int64 v83
+  __int64 v84
+  _DWORD v85[2]
+  __int128 *v86
+  __int64 v87
+  __int128 *v88
+  __int64 v89
 
-  v27 = a2;
-  v31 = 0;
-  P = 0;
-  v5 = 0;
-  v34 = 0;
-  v6 = 0;
-  LOWORD(v7) = 0;
-  v35 = 0;
-  v9 = a1;
-  v36 = 0;
-  v37 = 0;
-  v38 = 0;
-  CipQueryFileName(a1, &v34, &v31);
-  v33 = MEMORY[0xFFFFF78000000014];
-  v10 = *(_QWORD *)(a3 + 16);
+  v27 = a2
+  v31 = 0
+  P = 0
+  v5 = 0
+  v34 = 0
+  v6 = 0
+  LOWORD(v7) = 0
+  v35 = 0
+  v9 = a1
+  v36 = 0
+  v37 = 0
+  v38 = 0
+  CipQueryFileName(a1, &v34, &v31)
+  v33 = MEMORY[0xFFFFF78000000014]
+  v10 = *(_QWORD *)(a3 + 16)
   if ( v10 && *(_DWORD *)(v10 + 48) )
   {
-    v11 = *(int **)(v10 + 40);
-    v6 = *v11;
-    v5 = v11 + 2;
-    v7 = v11[1];
+    v11 = *(int **)(v10 + 40)
+    v6 = *v11
+    v5 = v11 + 2
+    v7 = v11[1]
   }
   v12 = CipBuildSigningInformation(
           v9,
@@ -4799,90 +4792,90 @@ void __fastcall CiAuditDriverAllow(__int64 a1, int a2, __int64 a3, __int64 a4)
           *(_DWORD *)(a3 + 72),
           a3,
           (__int64)&P,
-          (__int64)v32);
-  v13 = P;
+          (__int64)v32)
+  v13 = P
   if ( v12 >= 0 )
   {
-    v14 = *(_OWORD *)((char *)P + 56);
-    v35 = *(_OWORD *)((char *)P + 40);
-    v36 = v14;
+    v14 = *(_OWORD *)((char *)P + 56)
+    v35 = *(_OWORD *)((char *)P + 40)
+    v36 = v14
   }
-  CiConvertRtlTimeToSystemTime(a3 + 32, &v37);
-  CiConvertRtlTimeToSystemTime(a3 + 40, &v38);
+  CiConvertRtlTimeToSystemTime(a3 + 32, &v37)
+  CiConvertRtlTimeToSystemTime(a3 + 40, &v38)
   if ( (unsigned int)dword_1C0038108 > 5 && (byte_1C0038118 & 1) != 0 && (qword_1C0038120 & 1) == qword_1C0038120 )
   {
-    v41 = 2;
-    v45 = 4;
-    v43[1] = 0;
-    v40 = v43;
-    v42 = *((_QWORD *)&v34 + 1);
-    v43[0] = (unsigned __int16)v34;
-    v22 = *(_DWORD *)(a3 + 72);
-    v44 = &v22;
-    v17 = *(_WORD *)(a3 + 76);
-    v49 = v17;
-    v51 = &v18;
-    v53 = &v19;
-    v23 = *(_DWORD *)(a4 + 2088);
-    v55 = &v23;
-    v24 = *(_DWORD *)(a3 + 4);
-    v57 = &v24;
-    v25 = *(_DWORD *)(a3 + 8);
-    v59 = &v25;
-    v61 = a3 + 144;
-    v63 = &v33;
-    v65 = &v26;
-    v20 = v7;
-    v70 = (unsigned __int16)v7;
-    v28 = v27;
-    v72 = &v28;
-    v74 = &v29;
-    v16 = (*(_DWORD *)(a3 + 60) >> 3) & 1;
-    v46 = &v17;
-    v21 = v16;
-    v47 = 2;
-    v76 = &v21;
-    v48 = a3 + 80;
-    v50 = 0;
-    v18 = 0;
-    v52 = 2;
-    v19 = 1;
-    v54 = 2;
-    v56 = 4;
-    v58 = 4;
-    v60 = 4;
-    v62 = 8;
-    v64 = 8;
-    v26 = v6;
-    v66 = 4;
-    v67 = &v20;
-    v68 = 2;
-    v69 = v5;
-    v71 = 0;
-    v73 = 4;
-    v29 = 4;
-    v75 = 4;
-    v77 = 2;
-    v78 = v81;
-    v80 = *((_QWORD *)&v35 + 1);
-    v81[0] = (unsigned __int16)v35;
-    v82 = v85;
-    v84 = *((_QWORD *)&v36 + 1);
-    v85[0] = (unsigned __int16)v36;
-    v86 = &v37;
-    v88 = &v38;
-    v79 = 2;
-    v81[1] = 0;
-    v83 = 2;
-    v85[1] = 0;
-    v87 = 16;
-    v89 = 16;
-    tlgWriteTransfer_EtwWriteTransfer((int)&dword_1C0038108, (int)&dword_1C003255B, 0, 0, 0x1Au, &v39);
+    v41 = 2
+    v45 = 4
+    v43[1] = 0
+    v40 = v43
+    v42 = *((_QWORD *)&v34 + 1)
+    v43[0] = (unsigned __int16)v34
+    v22 = *(_DWORD *)(a3 + 72)
+    v44 = &v22
+    v17 = *(_WORD *)(a3 + 76)
+    v49 = v17
+    v51 = &v18
+    v53 = &v19
+    v23 = *(_DWORD *)(a4 + 2088)
+    v55 = &v23
+    v24 = *(_DWORD *)(a3 + 4)
+    v57 = &v24
+    v25 = *(_DWORD *)(a3 + 8)
+    v59 = &v25
+    v61 = a3 + 144
+    v63 = &v33
+    v65 = &v26
+    v20 = v7
+    v70 = (unsigned __int16)v7
+    v28 = v27
+    v72 = &v28
+    v74 = &v29
+    v16 = (*(_DWORD *)(a3 + 60) >> 3) & 1
+    v46 = &v17
+    v21 = v16
+    v47 = 2
+    v76 = &v21
+    v48 = a3 + 80
+    v50 = 0
+    v18 = 0
+    v52 = 2
+    v19 = 1
+    v54 = 2
+    v56 = 4
+    v58 = 4
+    v60 = 4
+    v62 = 8
+    v64 = 8
+    v26 = v6
+    v66 = 4
+    v67 = &v20
+    v68 = 2
+    v69 = v5
+    v71 = 0
+    v73 = 4
+    v29 = 4
+    v75 = 4
+    v77 = 2
+    v78 = v81
+    v80 = *((_QWORD *)&v35 + 1)
+    v81[0] = (unsigned __int16)v35
+    v82 = v85
+    v84 = *((_QWORD *)&v36 + 1)
+    v85[0] = (unsigned __int16)v36
+    v86 = &v37
+    v88 = &v38
+    v79 = 2
+    v81[1] = 0
+    v83 = 2
+    v85[1] = 0
+    v87 = 16
+    v89 = 16
+    tlgWriteTransfer_EtwWriteTransfer((int)&dword_1C0038108, (int)&dword_1C003255B, 0, 0, 0x1Au, &v39)
   }
   if ( v13 )
-    ExFreePoolWithTag(v13, 0x63734943u);
+    ExFreePoolWithTag(v13, 0x63734943u)
   if ( v31 )
-    FsRtlReleaseFileNameInformation(v31, v15);
+    FsRtlReleaseFileNameInformation(v31, v15)
 }
 
 ```
@@ -4892,27 +4885,27 @@ void __fastcall CiAuditDriverAllow(__int64 a1, int a2, __int64 a3, __int64 a4)
 ```cpp
 char __fastcall CiDoesFilenameHavePerAppPolicyRules(PCUNICODE_STRING String2)
 {
-  const UNICODE_STRING *v1; // rdi
-  __int64 v2; // rbx
-  _QWORD v4[3]; // [rsp+20h] [rbp-18h] BYREF
+  const UNICODE_STRING *v1
+  __int64 v2
+  _QWORD v4[3]
 
-  v4[1] = L" ";
-  v4[0] = 262146;
+  v4[1] = L" "
+  v4[0] = 262146
   if ( (g_CiPolicyState & 0x8000) == 0 )
-    return 0;
-  v1 = (const UNICODE_STRING *)v4;
+    return 0
+  v1 = (const UNICODE_STRING *)v4
   if ( String2->Buffer )
-    v1 = String2;
-  v2 = 0;
+    v1 = String2
+  v2 = 0
   if ( !g_NumberOfSiPolicies )
-    return 0;
+    return 0
   while ( !(unsigned __int8)SIPolicyHasPerAppPolicy(*((_QWORD *)g_SiPolicyHandles + v2), v1) )
   {
-    v2 = (unsigned int)(v2 + 1);
+    v2 = (unsigned int)(v2 + 1)
     if ( (unsigned int)v2 >= g_NumberOfSiPolicies )
-      return 0;
+      return 0
   }
-  return 1;
+  return 1
 }
 
 ```
@@ -4922,24 +4915,24 @@ char __fastcall CiDoesFilenameHavePerAppPolicyRules(PCUNICODE_STRING String2)
 ```cpp
 char __fastcall CipImageValidityPeriod(__int64 a1, _OWORD *a2, __int64 a3, __int64 a4)
 {
-  unsigned int v4; // r10d
-  __int64 v5; // r11
-  char v6; // al
-  int v7; // r10d
+  unsigned int v4
+  __int64 v5
+  char v6
+  int v7
 
-  LOBYTE(a4) = 0;
-  v4 = 0;
-  v5 = a1;
-  for ( *a2 = 0; v4 < *(_DWORD *)(v5 + 4); v4 = v7 + 1 )
+  LOBYTE(a4) = 0
+  v4 = 0
+  v5 = a1
+  for ( *a2 = 0
   {
     if ( v4 >= 4 )
-      break;
-    v6 = CipSignatureValidityPeriod(v5 + 152LL * v4 + 8, a2, a3, a4);
-    a4 = (unsigned __int8)a4;
+      break
+    v6 = CipSignatureValidityPeriod(v5 + 152LL * v4 + 8, a2, a3, a4)
+    a4 = (unsigned __int8)a4
     if ( v6 )
-      a4 = 1;
+      a4 = 1
   }
-  return a4;
+  return a4
 }
 
 ```
@@ -4960,79 +4953,79 @@ __int64 __fastcall CipSetFileCache(
         int a10,
         __int64 a11)
 {
-  int v15; // r8d
-  int FileAttributes; // ebx
-  __int64 CurrentProcess; // rax
-  struct _SLIST_ENTRY *v18; // rsi
-  int v19; // ecx
-  int v21; // [rsp+40h] [rbp-40h] BYREF
-  int v22; // [rsp+44h] [rbp-3Ch] BYREF
-  unsigned int v23; // [rsp+48h] [rbp-38h] BYREF
-  __int64 v24; // [rsp+50h] [rbp-30h] BYREF
-  __int64 v25; // [rsp+58h] [rbp-28h] BYREF
-  int v26; // [rsp+60h] [rbp-20h]
-  int v27; // [rsp+64h] [rbp-1Ch]
-  __int64 v28; // [rsp+68h] [rbp-18h]
-  int v29; // [rsp+70h] [rbp-10h]
-  int v30; // [rsp+74h] [rbp-Ch]
+  int v15
+  int FileAttributes
+  __int64 CurrentProcess
+  struct _SLIST_ENTRY *v18
+  int v19
+  int v21
+  int v22
+  unsigned int v23
+  __int64 v24
+  __int64 v25
+  int v26
+  int v27
+  __int64 v28
+  int v29
+  int v30
 
-  v24 = 0;
-  v22 = 0;
-  v23 = 0;
-  v21 = 0;
-  CiLogFileEvent(&FileObject->FileName.Length, &CiSetFileCacheStart);
+  v24 = 0
+  v22 = 0
+  v23 = 0
+  v21 = 0
+  CiLogFileEvent(&FileObject->FileName.Length, &CiSetFileCacheStart)
   if ( (FileObject->DeviceObject->Flags & 0x100) != 0
     || (FileAttributes = CipGetFileAttributes(FileObject, &v21), FileAttributes >= 0)
     && (FileAttributes = CipGetVolumeFlags(FileObject), FileAttributes >= 0) )
   {
     if ( FileObject->SharedWrite )
-      goto LABEL_5;
+      goto LABEL_5
     if ( FileObject->WriteAccess )
     {
-      CurrentProcess = a11;
+      CurrentProcess = a11
       if ( !a11 )
-        CurrentProcess = PsGetCurrentProcess();
+        CurrentProcess = PsGetCurrentProcess()
       if ( (PsGetProcessProtection(CurrentProcess) & 7) != 1 )
       {
 LABEL_5:
-        FileAttributes = -1073741757;
-        goto LABEL_26;
+        FileAttributes = -1073741757
+        goto LABEL_26
       }
     }
-    ++g_CiEaCacheLookasideList.L.TotalAllocates;
-    v18 = ExpInterlockedPopEntrySList(&g_CiEaCacheLookasideList.L.ListHead);
+    ++g_CiEaCacheLookasideList.L.TotalAllocates
+    v18 = ExpInterlockedPopEntrySList(&g_CiEaCacheLookasideList.L.ListHead)
     if ( !v18 )
     {
-      ++g_CiEaCacheLookasideList.L.AllocateMisses;
+      ++g_CiEaCacheLookasideList.L.AllocateMisses
       v18 = (struct _SLIST_ENTRY *)((__int64 (__fastcall *)(_QWORD, _QWORD, _QWORD))g_CiEaCacheLookasideList.L.AllocateEx)(
                                      (unsigned int)g_CiEaCacheLookasideList.L.Type,
                                      g_CiEaCacheLookasideList.L.Size,
-                                     g_CiEaCacheLookasideList.L.Tag);
+                                     g_CiEaCacheLookasideList.L.Tag)
       if ( !v18 )
       {
-        FileAttributes = -1073741801;
-        goto LABEL_26;
+        FileAttributes = -1073741801
+        goto LABEL_26
       }
     }
-    FileAttributes = FsRtlKernelFsControlFile(FileObject, 590063, 0, 0, &v24, 8, &v22);
+    FileAttributes = FsRtlKernelFsControlFile(FileObject, 590063, 0, 0, &v24, 8, &v22)
     if ( FileAttributes != -1073741128 )
-      goto LABEL_20;
+      goto LABEL_20
     if ( !g_CiIsWinPE && ((g_CiOptions & 0x100) != 0 || (FileObject->DeviceObject->Flags & 0x100) != 0) )
     {
-      FileAttributes = CipEnableJournalingAlways(FileObject);
+      FileAttributes = CipEnableJournalingAlways(FileObject)
       if ( FileAttributes >= 0 )
       {
-        FileAttributes = FsRtlKernelFsControlFile(FileObject, 590063, 0, 0, &v24, 8, &v22);
+        FileAttributes = FsRtlKernelFsControlFile(FileObject, 590063, 0, 0, &v24, 8, &v22)
 LABEL_20:
         if ( FileAttributes >= 0 )
         {
-          v26 = a5;
-          v27 = a6;
-          LOBYTE(v19) = a3;
-          v28 = a7;
-          v29 = a8;
-          v30 = a9;
-          v25 = a4;
+          v26 = a5
+          v27 = a6
+          LOBYTE(v19) = a3
+          v28 = a7
+          v29 = a8
+          v30 = a9
+          v25 = a4
           FileAttributes = CiBuildEaCacheContents(
                              v19,
                              a2,
@@ -5040,31 +5033,31 @@ LABEL_20:
                              (unsigned int)&v25,
                              (__int64)v18,
                              576,
-                             (__int64)&v23);
+                             (__int64)&v23)
           if ( FileAttributes >= 0 )
-            FileAttributes = FsRtlSetKernelEaFile(FileObject, v18, v23);
+            FileAttributes = FsRtlSetKernelEaFile(FileObject, v18, v23)
         }
       }
     }
     else
     {
-      FileAttributes = -1073741637;
+      FileAttributes = -1073741637
     }
-    ++g_CiEaCacheLookasideList.L.TotalFrees;
+    ++g_CiEaCacheLookasideList.L.TotalFrees
     if ( ExQueryDepthSList(&g_CiEaCacheLookasideList.L.ListHead) < g_CiEaCacheLookasideList.L.Depth )
     {
-      ExpInterlockedPushEntrySList(&g_CiEaCacheLookasideList.L.ListHead, v18);
+      ExpInterlockedPushEntrySList(&g_CiEaCacheLookasideList.L.ListHead, v18)
     }
     else
     {
-      ++g_CiEaCacheLookasideList.L.FreeMisses;
-      ((void (__fastcall *)(struct _SLIST_ENTRY *))g_CiEaCacheLookasideList.L.FreeEx)(v18);
+      ++g_CiEaCacheLookasideList.L.FreeMisses
+      ((void (__fastcall *)(struct _SLIST_ENTRY *))g_CiEaCacheLookasideList.L.FreeEx)(v18)
     }
   }
 LABEL_26:
-  LOBYTE(v15) = a3;
-  CiLogCacheEvent(FileAttributes, 0, v15, a2, &CiSetFileCacheComplete);
-  return (unsigned int)FileAttributes;
+  LOBYTE(v15) = a3
+  CiLogCacheEvent(FileAttributes, 0, v15, a2, &CiSetFileCacheComplete)
+  return (unsigned int)FileAttributes
 }
 
 ```
@@ -5074,34 +5067,34 @@ LABEL_26:
 ```cpp
 __int64 __fastcall CipCallPeauth(int a1, int a2, struct _KPROCESS *a3, char a4, int a5, __int64 a6)
 {
-  BOOL v9; // ecx
-  unsigned int v10; // esi
-  struct _KAPC_STATE ApcState; // [rsp+30h] [rbp-68h] BYREF
+  BOOL v9
+  unsigned int v10
+  struct _KAPC_STATE ApcState
 
-  v9 = (a4 & 7) != 0;
-  memset(&ApcState, 0, sizeof(ApcState));
+  v9 = (a4 & 7) != 0
+  memset(&ApcState, 0, sizeof(ApcState))
   if ( a1 >= 0 )
-    goto LABEL_6;
+    goto LABEL_6
   if ( a1 != -1073740760 )
   {
     if ( a1 != -1073740285 && a1 != -1073740283 )
-      v9 = 0;
+      v9 = 0
 LABEL_6:
     if ( a1 != -1073740285 && a1 != -1073740283 )
-      goto LABEL_12;
+      goto LABEL_12
   }
   if ( (a4 & 4) != 0 || (a4 & 1) != 0 && (g_CiOptions & 2) != 0 )
-    v9 = 0;
+    v9 = 0
 LABEL_12:
   if ( v9 )
   {
-    KeStackAttachProcess(a3, &ApcState);
-    v10 = PECheckComponentLoad(a1, a2, (a4 & 5) != 0, a5, a6 + 88);
-    KeUnstackDetachProcess(&ApcState);
+    KeStackAttachProcess(a3, &ApcState)
+    v10 = PECheckComponentLoad(a1, a2, (a4 & 5) != 0, a5, a6 + 88)
+    KeUnstackDetachProcess(&ApcState)
     if ( (a4 & 2) != 0 && a1 >= 0 )
-      return v10;
+      return v10
   }
-  return (unsigned int)a1;
+  return (unsigned int)a1
 }
 
 ```
@@ -5111,33 +5104,33 @@ LABEL_12:
 ```cpp
 __int64 __fastcall CipReportSystemOptionsReprieve(__int64 a1, __int64 a2, int a3, char a4, int a5)
 {
-  const EVENT_DESCRIPTOR *v8; // rdx
-  const EVENT_DESCRIPTOR *EventDescriptor; // rax
-  __int64 result; // rax
-  __int64 v11; // rdx
-  __int64 v12; // [rsp+30h] [rbp-28h] BYREF
-  unsigned __int16 v13[16]; // [rsp+38h] [rbp-20h] BYREF
+  const EVENT_DESCRIPTOR *v8
+  const EVENT_DESCRIPTOR *EventDescriptor
+  __int64 result
+  __int64 v11
+  __int64 v12
+  unsigned __int16 v13[16]
 
-  v12 = 0;
-  *(_OWORD *)v13 = 0;
-  CipQueryFileName(a1, v13, &v12);
+  v12 = 0
+  *(_OWORD *)v13 = 0
+  CipQueryFileName(a1, v13, &v12)
   if ( a5 == -1073740285 )
   {
-    v8 = &CiRevokedImageLoaded;
-    EventDescriptor = (const EVENT_DESCRIPTOR *)&CiRevokedDriverLoaded;
+    v8 = &CiRevokedImageLoaded
+    EventDescriptor = (const EVENT_DESCRIPTOR *)&CiRevokedDriverLoaded
   }
   else
   {
-    EventDescriptor = (const EVENT_DESCRIPTOR *)&CiUnsignedDriverLoaded;
-    v8 = (const EVENT_DESCRIPTOR *)&CiUnsignedImageLoaded;
+    EventDescriptor = (const EVENT_DESCRIPTOR *)&CiUnsignedDriverLoaded
+    v8 = (const EVENT_DESCRIPTOR *)&CiUnsignedImageLoaded
   }
   if ( (a3 & 1) == 0 )
-    EventDescriptor = v8;
-  CiLogFileRequestedValidationEvent((int)v13, a2, a3, a4, EventDescriptor);
-  result = CiAudit(v13, 0x13AEu);
+    EventDescriptor = v8
+  CiLogFileRequestedValidationEvent((int)v13, a2, a3, a4, EventDescriptor)
+  result = CiAudit(v13, 0x13AEu)
   if ( v12 )
-    return FsRtlReleaseFileNameInformation(v12, v11);
-  return result;
+    return FsRtlReleaseFileNameInformation(v12, v11)
+  return result
 }
 
 ```
@@ -5147,81 +5140,81 @@ __int64 __fastcall CipReportSystemOptionsReprieve(__int64 a1, __int64 a2, int a3
 ```cpp
 void __fastcall CipReportSharedSectionFailure(struct _KPROCESS *a1, __int64 a2, int a3, int a4, char a5)
 {
-  const EVENT_DESCRIPTOR *v9; // rbx
-  __int64 v10; // rdx
-  const GUID *ActivityIdThread; // rax
-  __int16 v12; // [rsp+30h] [rbp-81h] BYREF
-  __int16 v13; // [rsp+34h] [rbp-7Dh] BYREF
-  int v14; // [rsp+38h] [rbp-79h] BYREF
-  int v15; // [rsp+40h] [rbp-71h] BYREF
-  __int64 v16; // [rsp+48h] [rbp-69h] BYREF
-  PVOID P; // [rsp+50h] [rbp-61h] BYREF
-  __int128 v18; // [rsp+58h] [rbp-59h] BYREF
-  __int128 v19; // [rsp+68h] [rbp-49h] BYREF
-  struct _EVENT_DATA_DESCRIPTOR UserData; // [rsp+80h] [rbp-31h] BYREF
-  __int64 v21; // [rsp+90h] [rbp-21h]
-  int v22; // [rsp+98h] [rbp-19h]
-  int v23; // [rsp+9Ch] [rbp-15h]
-  __int16 *v24; // [rsp+A0h] [rbp-11h]
-  int v25; // [rsp+A8h] [rbp-9h]
-  int v26; // [rsp+ACh] [rbp-5h]
-  __int64 v27; // [rsp+B0h] [rbp-1h]
-  int v28; // [rsp+B8h] [rbp+7h]
-  int v29; // [rsp+BCh] [rbp+Bh]
-  int *v30; // [rsp+C0h] [rbp+Fh]
-  int v31; // [rsp+C8h] [rbp+17h]
-  int v32; // [rsp+CCh] [rbp+1Bh]
-  int *v33; // [rsp+D0h] [rbp+1Fh]
-  int v34; // [rsp+D8h] [rbp+27h]
-  int v35; // [rsp+DCh] [rbp+2Bh]
+  const EVENT_DESCRIPTOR *v9
+  __int64 v10
+  const GUID *ActivityIdThread
+  __int16 v12
+  __int16 v13
+  int v14
+  int v15
+  __int64 v16
+  PVOID P
+  __int128 v18
+  __int128 v19
+  struct _EVENT_DATA_DESCRIPTOR UserData
+  __int64 v21
+  int v22
+  int v23
+  __int16 *v24
+  int v25
+  int v26
+  __int64 v27
+  int v28
+  int v29
+  int *v30
+  int v31
+  int v32
+  int *v33
+  int v34
+  int v35
 
-  v16 = 0;
-  P = 0;
-  v18 = 0;
-  v19 = 0;
-  CipQueryProcessName(a1, &v19, &P);
-  CipQueryFileName(a2, &v18, &v16);
+  v16 = 0
+  P = 0
+  v18 = 0
+  v19 = 0
+  CipQueryProcessName(a1, &v19, &P)
+  CipQueryFileName(a2, &v18, &v16)
   if ( a5 )
   {
-    CiAudit((unsigned __int16 *)&v18, 0x190Au);
-    v9 = &CiImageSdlRequirementNotMet;
+    CiAudit((unsigned __int16 *)&v18, 0x190Au)
+    v9 = &CiImageSdlRequirementNotMet
   }
   else if ( (a3 & 0xE5DFFF97) != 0
          || (v9 = (const EVENT_DESCRIPTOR *)&CiImageSdlRequirementNotMetAudit, (PsGetProcessProtection(a1) & 8) == 0) )
   {
-    v9 = (const EVENT_DESCRIPTOR *)&CiImageSdlRequirementNotMetIgnored;
+    v9 = (const EVENT_DESCRIPTOR *)&CiImageSdlRequirementNotMetIgnored
   }
-  v14 = 1;
-  v15 = a4;
+  v14 = 1
+  v15 = a4
   if ( EtwEventEnabled(g_EtwEventHandle, v9) )
   {
-    UserData.Reserved = 0;
-    v23 = 0;
-    v26 = 0;
-    v29 = 0;
-    v32 = 0;
-    v35 = 0;
-    v12 = (unsigned __int16)v18 >> 1;
-    v13 = (unsigned __int16)v19 >> 1;
-    UserData.Ptr = (ULONGLONG)&v12;
-    v21 = *((_QWORD *)&v18 + 1);
-    v22 = (unsigned __int16)v18;
-    v24 = &v13;
-    v27 = *((_QWORD *)&v19 + 1);
-    v28 = (unsigned __int16)v19;
-    v30 = &v14;
-    v33 = &v15;
-    UserData.Size = 2;
-    v25 = 2;
-    v31 = 1;
-    v34 = 4;
-    ActivityIdThread = (const GUID *)IoGetActivityIdThread();
-    EtwWrite(g_EtwEventHandle, v9, ActivityIdThread, 6u, &UserData);
+    UserData.Reserved = 0
+    v23 = 0
+    v26 = 0
+    v29 = 0
+    v32 = 0
+    v35 = 0
+    v12 = (unsigned __int16)v18 >> 1
+    v13 = (unsigned __int16)v19 >> 1
+    UserData.Ptr = (ULONGLONG)&v12
+    v21 = *((_QWORD *)&v18 + 1)
+    v22 = (unsigned __int16)v18
+    v24 = &v13
+    v27 = *((_QWORD *)&v19 + 1)
+    v28 = (unsigned __int16)v19
+    v30 = &v14
+    v33 = &v15
+    UserData.Size = 2
+    v25 = 2
+    v31 = 1
+    v34 = 4
+    ActivityIdThread = (const GUID *)IoGetActivityIdThread()
+    EtwWrite(g_EtwEventHandle, v9, ActivityIdThread, 6u, &UserData)
   }
   if ( v16 )
-    FsRtlReleaseFileNameInformation(v16, v10);
+    FsRtlReleaseFileNameInformation(v16, v10)
   if ( P )
-    ExFreePoolWithTag(P, 0);
+    ExFreePoolWithTag(P, 0)
 }
 
 ```
@@ -5237,48 +5230,48 @@ __int64 __fastcall CipReportAndReprieveDriverAndProtectedImageFailure(
         char a5,
         unsigned int a6)
 {
-  unsigned int v6; // edx
-  int v10; // edi
-  unsigned int v11; // r14d
-  unsigned int v12; // ecx
-  _DWORD *v13; // rax
-  int v14; // eax
-  __int64 v15; // rdx
-  __int128 v16; // xmm0
-  __int64 v17; // rcx
-  const EVENT_DESCRIPTOR *EventDescriptor; // rdx
-  __int64 v19; // rcx
-  __int64 v20; // rdx
-  int v22; // [rsp+40h] [rbp-59h] BYREF
-  struct _KPROCESS *v23; // [rsp+48h] [rbp-51h]
-  PVOID P; // [rsp+50h] [rbp-49h] BYREF
-  __int64 v25; // [rsp+58h] [rbp-41h] BYREF
-  int v26[4]; // [rsp+60h] [rbp-39h] BYREF
-  __int128 v27; // [rsp+70h] [rbp-29h] BYREF
-  __int128 v28; // [rsp+80h] [rbp-19h]
+  unsigned int v6
+  int v10
+  unsigned int v11
+  unsigned int v12
+  _DWORD *v13
+  int v14
+  __int64 v15
+  __int128 v16
+  __int64 v17
+  const EVENT_DESCRIPTOR *EventDescriptor
+  __int64 v19
+  __int64 v20
+  int v22
+  struct _KPROCESS *v23
+  PVOID P
+  __int64 v25
+  int v26[4]
+  __int128 v27
+  __int128 v28
 
-  v23 = a2;
-  v6 = *(_DWORD *)(a1 + 28);
-  v25 = 0;
-  P = 0;
-  *(_OWORD *)v26 = 0;
+  v23 = a2
+  v6 = *(_DWORD *)(a1 + 28)
+  v25 = 0
+  P = 0
+  *(_OWORD *)v26 = 0
   if ( v6 > 4 )
-    v6 = 4;
-  v10 = a6;
-  v11 = 0;
-  v12 = 0;
-  v27 = 0;
+    v6 = 4
+  v10 = a6
+  v11 = 0
+  v12 = 0
+  v27 = 0
   if ( v6 )
   {
-    v13 = (_DWORD *)(a1 + 88);
+    v13 = (_DWORD *)(a1 + 88)
     while ( *v13 != 25 )
     {
-      ++v12;
-      v13 += 38;
+      ++v12
+      v13 += 38
       if ( v12 >= v6 )
-        goto LABEL_7;
+        goto LABEL_7
     }
-    goto LABEL_13;
+    goto LABEL_13
   }
 LABEL_7:
   if ( (a4 & 0x40000006) == 0
@@ -5286,66 +5279,66 @@ LABEL_7:
     && (_BYTE)KdDebuggerEnabled == 1
     && !(_BYTE)KdDebuggerNotPresent )
   {
-    v11 = 1;
-    v10 = 0;
+    v11 = 1
+    v10 = 0
   }
   if ( !PsIsCurrentThreadPrefetching() )
   {
 LABEL_13:
-    CipQueryFileName(a3, v26, &v25);
+    CipQueryFileName(a3, v26, &v25)
     if ( a6 == -1073740285 )
     {
       if ( *(__int64 (__fastcall ***)())(a1 + 1800) != &off_1C002B000 )
       {
-        v14 = *(_DWORD *)(a1 + 1504);
-        v22 = 0;
-        v28 = 0;
+        v14 = *(_DWORD *)(a1 + 1504)
+        v22 = 0
+        v28 = 0
         if ( (v14 & 2) != 0 && (v14 & 1) == 0 )
         {
-          v15 = *(_QWORD *)(*(_QWORD *)(a1 + 1496) + 8LL * *(unsigned int *)(a1 + 912));
-          v16 = *(_DWORD *)(v15 + 40) >= 6u ? *(_OWORD *)(v15 + 1724) : *(_OWORD *)(v15 + 16);
-          v28 = v16;
+          v15 = *(_QWORD *)(*(_QWORD *)(a1 + 1496) + 8LL * *(unsigned int *)(a1 + 912))
+          v16 = *(_DWORD *)(v15 + 40) >= 6u ? *(_OWORD *)(v15 + 1724) : *(_OWORD *)(v15 + 16)
+          v28 = v16
           if ( xmmword_1C0038200 == v16 )
           {
-            v22 = 0x2000;
-            CipHvciPublishIncompatibleImageWNF(v26, &v22);
+            v22 = 0x2000
+            CipHvciPublishIncompatibleImageWNF(v26, &v22)
           }
         }
       }
-      v17 = 4LL * v11;
+      v17 = 4LL * v11
       if ( (a4 & 1) != 0 )
-        EventDescriptor = (&off_1C002BC10)[v17];
+        EventDescriptor = (&off_1C002BC10)[v17]
       else
-        EventDescriptor = *(&off_1C002BC10 + v17 + 1);
+        EventDescriptor = *(&off_1C002BC10 + v17 + 1)
     }
     else
     {
-      v19 = 4LL * v11;
+      v19 = 4LL * v11
       if ( (a4 & 2) != 0 )
-        EventDescriptor = *(&off_1C002BC10 + v19 + 2);
+        EventDescriptor = *(&off_1C002BC10 + v19 + 2)
       else
-        EventDescriptor = *(&off_1C002BC10 + v19 + 3);
+        EventDescriptor = *(&off_1C002BC10 + v19 + 3)
     }
-    CiLogFileRequestedValidationEvent((int)v26, (__int64)v23, a4, a5, EventDescriptor);
-    CiLogSignatureInformation(a1);
-    CiAudit((unsigned __int16 *)v26, (a4 & 2) != 0 ? 6281 : 5038);
+    CiLogFileRequestedValidationEvent((int)v26, (__int64)v23, a4, a5, EventDescriptor)
+    CiLogSignatureInformation(a1)
+    CiAudit((unsigned __int16 *)v26, (a4 & 2) != 0 ? 6281 : 5038)
     if ( v10 < 0 )
     {
-      CipQueryProcessName(v23, &v27, &P);
-      CiInstrumentDriverBlock(a1, a6);
-      CiInstrumentSignatureFailures(a1, a3, (unsigned int)&v27, a4, a5, a6, 0);
+      CipQueryProcessName(v23, &v27, &P)
+      CiInstrumentDriverBlock(a1, a6)
+      CiInstrumentSignatureFailures(a1, a3, (unsigned int)&v27, a4, a5, a6, 0)
       if ( P )
-        ExFreePoolWithTag(P, 0);
+        ExFreePoolWithTag(P, 0)
     }
     if ( v11 == 1 && (g_CiOptions & 1) != 0 && (_BYTE)KdDebuggerEnabled && (_BYTE)KdDebuggerNotPresent != 1 )
     {
-      DbgPrint("Code Integrity violation:  %d\n", 8008);
-      __debugbreak();
+      DbgPrint("Code Integrity violation:  %d\n", 8008)
+      __debugbreak()
     }
     if ( v25 )
-      FsRtlReleaseFileNameInformation(v25, v20);
+      FsRtlReleaseFileNameInformation(v25, v20)
   }
-  return (unsigned int)v10;
+  return (unsigned int)v10
 }
 
 ```
@@ -5365,136 +5358,136 @@ __int64 __fastcall CipReportAndReprieveUMCIFailure(
         unsigned __int8 *a9,
         char *a10)
 {
-  unsigned int v11; // edi
-  __int64 v12; // r12
-  const EVENT_DESCRIPTOR *v13; // rsi
-  unsigned int v15; // ecx
-  unsigned int v16; // edx
-  _DWORD *v17; // rax
-  __int64 v18; // rdx
-  unsigned int v19; // r12d
-  const UNICODE_STRING *v20; // rax
-  int v21; // r12d
-  const EVENT_DESCRIPTOR *EventDescriptor; // rsi
-  int v23; // r8d
-  int v24; // r9d
-  SIZE_T v25; // rsi
-  wchar_t *PoolWithTag; // rax
-  wchar_t *v27; // r12
-  SIZE_T v28; // rsi
-  wchar_t *v29; // r8
-  wchar_t *v30; // rcx
-  unsigned __int64 v31; // rdx
-  wchar_t *v32; // rax
-  unsigned int v33; // esi
-  const wchar_t **v34; // r13
-  __int64 v35; // r15
-  struct _KPROCESS *v36; // rsi
-  int v37; // r8d
-  int v38; // r9d
-  char v40; // [rsp+40h] [rbp-A1h]
-  char v41; // [rsp+41h] [rbp-A0h] BYREF
-  char v42; // [rsp+42h] [rbp-9Fh] BYREF
-  char v43; // [rsp+43h] [rbp-9Eh] BYREF
-  char v44; // [rsp+44h] [rbp-9Dh]
-  int v45; // [rsp+48h] [rbp-99h]
-  int v46; // [rsp+4Ch] [rbp-95h]
-  __int64 v47; // [rsp+50h] [rbp-91h]
-  int v48; // [rsp+58h] [rbp-89h] BYREF
-  int v49; // [rsp+5Ch] [rbp-85h] BYREF
-  int v50[4]; // [rsp+60h] [rbp-81h] BYREF
-  struct _KPROCESS *v51; // [rsp+70h] [rbp-71h]
-  _QWORD v52[2]; // [rsp+78h] [rbp-69h] BYREF
-  __int64 v53; // [rsp+88h] [rbp-59h] BYREF
-  PVOID P; // [rsp+90h] [rbp-51h] BYREF
-  int v55[4]; // [rsp+98h] [rbp-49h] BYREF
-  __int64 v56; // [rsp+A8h] [rbp-39h]
-  int v57; // [rsp+B0h] [rbp-31h] BYREF
-  const wchar_t *v58; // [rsp+B8h] [rbp-29h]
-  __int64 v59; // [rsp+C0h] [rbp-21h]
-  int v60; // [rsp+C8h] [rbp-19h]
-  __int64 v61; // [rsp+CCh] [rbp-15h]
-  int v62; // [rsp+D4h] [rbp-Dh]
+  unsigned int v11
+  __int64 v12
+  const EVENT_DESCRIPTOR *v13
+  unsigned int v15
+  unsigned int v16
+  _DWORD *v17
+  __int64 v18
+  unsigned int v19
+  const UNICODE_STRING *v20
+  int v21
+  const EVENT_DESCRIPTOR *EventDescriptor
+  int v23
+  int v24
+  SIZE_T v25
+  wchar_t *PoolWithTag
+  wchar_t *v27
+  SIZE_T v28
+  wchar_t *v29
+  wchar_t *v30
+  unsigned __int64 v31
+  wchar_t *v32
+  unsigned int v33
+  const wchar_t **v34
+  __int64 v35
+  struct _KPROCESS *v36
+  int v37
+  int v38
+  char v40
+  char v41
+  char v42
+  char v43
+  char v44
+  int v45
+  int v46
+  __int64 v47
+  int v48
+  int v49
+  int v50[4]
+  struct _KPROCESS *v51
+  _QWORD v52[2]
+  __int64 v53
+  PVOID P
+  int v55[4]
+  __int64 v56
+  int v57
+  const wchar_t *v58
+  __int64 v59
+  int v60
+  __int64 v61
+  int v62
 
-  v11 = a8;
-  v12 = a4;
-  *a9 = 0;
-  v13 = 0;
-  v51 = a2;
-  v47 = a4;
-  *a10 = 1;
-  v15 = a1[7];
-  v56 = a3;
+  v11 = a8
+  v12 = a4
+  *a9 = 0
+  v13 = 0
+  v51 = a2
+  v47 = a4
+  *a10 = 1
+  v15 = a1[7]
+  v56 = a3
   if ( v15 > 4 )
-    v15 = 4;
-  v46 = a5;
-  v42 = 0;
-  v16 = 0;
-  v43 = 0;
-  v53 = 0;
-  v40 = 0;
-  v44 = 0;
-  v41 = 0;
-  P = 0;
-  v48 = 0;
-  v49 = a8;
-  *(_OWORD *)v55 = 0;
-  *(_OWORD *)v50 = 0;
+    v15 = 4
+  v46 = a5
+  v42 = 0
+  v16 = 0
+  v43 = 0
+  v53 = 0
+  v40 = 0
+  v44 = 0
+  v41 = 0
+  P = 0
+  v48 = 0
+  v49 = a8
+  *(_OWORD *)v55 = 0
+  *(_OWORD *)v50 = 0
   if ( !v15 )
   {
 LABEL_7:
-    CipQueryProcessName(a2, v50, &P);
-    CipQueryFileName(v12, v55, &v53);
-    v45 = a5 & 0x20000000;
+    CipQueryProcessName(a2, v50, &P)
+    CipQueryFileName(v12, v55, &v53)
+    v45 = a5 & 0x20000000
     if ( (a5 & 0x20000000) == 0 )
     {
-      a1[376] ^= (a1[376] ^ ((unsigned __int8)CipIsDotNetNativeImage(v12) << 8)) & 0x100;
-      v19 = 0;
+      a1[376] ^= (a1[376] ^ ((unsigned __int8)CipIsDotNetNativeImage(v12) << 8)) & 0x100
+      v19 = 0
       if ( g_CiExclusionListCount )
       {
-        v20 = (const UNICODE_STRING *)(v47 + 88);
-        v52[0] = v47 + 88;
+        v20 = (const UNICODE_STRING *)(v47 + 88)
+        v52[0] = v47 + 88
         while ( !RtlPrefixUnicodeString((PCUNICODE_STRING)(g_CiExclusionList + 16LL * v19), v20, 1u) )
         {
-          v20 = (const UNICODE_STRING *)v52[0];
+          v20 = (const UNICODE_STRING *)v52[0]
           if ( ++v19 >= g_CiExclusionListCount )
-            goto LABEL_12;
+            goto LABEL_12
         }
-        v44 = 1;
-        goto LABEL_45;
+        v44 = 1
+        goto LABEL_45
       }
 LABEL_12:
       if ( (unsigned __int8)a6 <= 1u && a8 == -1073740760 )
       {
-        *a9 = 1;
-        *a10 = 1;
+        *a9 = 1
+        *a10 = 1
 LABEL_15:
-        v12 = v47;
-        goto LABEL_16;
+        v12 = v47
+        goto LABEL_16
       }
       if ( (g_CiDeveloperMode & 1) != 0 )
       {
 LABEL_45:
-        *a9 = 1;
-        v13 = (const EVENT_DESCRIPTOR *)&CiPolicyFailureIgnored;
-        *a10 = a6;
-        goto LABEL_15;
+        *a9 = 1
+        v13 = (const EVENT_DESCRIPTOR *)&CiPolicyFailureIgnored
+        *a10 = a6
+        goto LABEL_15
       }
       if ( (v46 & 0x10) != 0 )
-        goto LABEL_15;
-      v12 = v47;
+        goto LABEL_15
+      v12 = v47
       if ( (PsGetProcessProtection(v51) & 8) != 0 )
       {
-        *a9 = 1;
-        v13 = (const EVENT_DESCRIPTOR *)&CiPolicyFailureAudit;
-        *a10 = 1;
+        *a9 = 1
+        v13 = (const EVENT_DESCRIPTOR *)&CiPolicyFailureAudit
+        *a10 = 1
       }
     }
 LABEL_16:
     if ( *a9 )
-      goto LABEL_75;
+      goto LABEL_75
     if ( !PsIsCurrentThreadPrefetching() && (a6 != 7 || (v46 & 0x10) != 0) && (a1[376] & 0x100) == 0 )
-      CiInstrumentSignatureFailures((__int64)a1, v12, (unsigned __int16 *)v50, v46, a6, a8, *a9);
+      CiInstrumentSignatureFailures((__int64)a1, v12, (unsigned __int16 *)v50, v46, a6, a8, *a9)
     if ( *a9 )
     {
 LABEL_75:
@@ -5504,32 +5497,32 @@ LABEL_75:
         {
           if ( EtwEventEnabled(g_EtwEventHandle, v13) )
           {
-            LOBYTE(v38) = a7;
-            LOBYTE(v37) = a6;
-            CiLogPolicyEvent((int)v55, (int)v50, v37, v38, a8, v13);
+            LOBYTE(v38) = a7
+            LOBYTE(v37) = a6
+            CiLogPolicyEvent((int)v55, (int)v50, v37, v38, a8, v13)
           }
-          CiLogSignatureInformation(a1);
+          CiLogSignatureInformation(a1)
         }
-        CiAudit((unsigned __int16 *)v55, 0x13AEu);
+        CiAudit((unsigned __int16 *)v55, 0x13AEu)
       }
-      v11 = 0;
-      goto LABEL_82;
+      v11 = 0
+      goto LABEL_82
     }
     if ( !PsIsCurrentThreadPrefetching() )
     {
-      v21 = v45;
+      v21 = v45
       if ( (a1[376] & 0x100) != 0 )
-        goto LABEL_59;
-      EventDescriptor = (const EVENT_DESCRIPTOR *)&CiPolicyFailure;
+        goto LABEL_59
+      EventDescriptor = (const EVENT_DESCRIPTOR *)&CiPolicyFailure
       if ( v45 )
-        EventDescriptor = &CiIumPolicyFailure;
+        EventDescriptor = &CiIumPolicyFailure
       if ( EtwEventEnabled(g_EtwEventHandle, EventDescriptor) )
       {
-        LOBYTE(v24) = a7;
-        LOBYTE(v23) = a6;
-        CiLogPolicyEvent((int)v55, (int)v50, v23, v24, a8, EventDescriptor);
+        LOBYTE(v24) = a7
+        LOBYTE(v23) = a6
+        CiLogPolicyEvent((int)v55, (int)v50, v23, v24, a8, EventDescriptor)
       }
-      CiLogSignatureInformation(a1);
+      CiLogSignatureInformation(a1)
       if ( a6 == 7 && (g_CiOptions & 0x400) == 0 )
       {
 LABEL_59:
@@ -5537,24 +5530,24 @@ LABEL_59:
         {
           if ( a1[433] )
           {
-            v35 = v56;
+            v35 = v56
             if ( v56 )
             {
               if ( (v46 & 0x10) != 0 )
               {
                 if ( a6 != 11 )
                 {
-                  v36 = v51;
-                  goto LABEL_67;
+                  v36 = v51
+                  goto LABEL_67
                 }
               }
               else
               {
-                v36 = v51;
+                v36 = v51
                 if ( (unsigned __int8)PsGetProcessSignatureLevel(v51, 0) != 11 )
                 {
 LABEL_67:
-                  PsQueryProcessAttributesByToken(v35, 0, &v41);
+                  PsQueryProcessAttributesByToken(v35, 0, &v41)
                   if ( v41 && a8 != -1058471934 )
                   {
                     if ( (((void (__fastcall *)(struct _KPROCESS *, int *))g_CiPrivateNtosApis)(v36, &v48),
@@ -5567,8 +5560,8 @@ LABEL_67:
                         (_DWORD)a1 + 1736,
                         a1[433],
                         (_DWORD)v36,
-                        (__int64)&v49);
-                      v11 = v49;
+                        (__int64)&v49)
+                      v11 = v49
                     }
                   }
                 }
@@ -5578,90 +5571,90 @@ LABEL_67:
         }
 LABEL_82:
         if ( v53 )
-          FsRtlReleaseFileNameInformation(v53, v18);
+          FsRtlReleaseFileNameInformation(v53, v18)
         if ( P )
-          ExFreePoolWithTag(P, 0);
-        return v11;
+          ExFreePoolWithTag(P, 0)
+        return v11
       }
-      v25 = (unsigned int)LOWORD(v50[0]) + 2;
-      PoolWithTag = (wchar_t *)ExAllocatePoolWithTag(PagedPool, v25, 0x63734943u);
-      v27 = PoolWithTag;
+      v25 = (unsigned int)LOWORD(v50[0]) + 2
+      PoolWithTag = (wchar_t *)ExAllocatePoolWithTag(PagedPool, v25, 0x63734943u)
+      v27 = PoolWithTag
       if ( !PoolWithTag )
-        goto LABEL_52;
-      v28 = v25 >> 1;
+        goto LABEL_52
+      v28 = v25 >> 1
       if ( v28 )
       {
-        v29 = *(wchar_t **)&v50[2];
-        v30 = PoolWithTag;
-        v31 = ((unsigned __int64)LOWORD(v50[0]) >> 1) - v28;
+        v29 = *(wchar_t **)&v50[2]
+        v30 = PoolWithTag
+        v31 = ((unsigned __int64)LOWORD(v50[0]) >> 1) - v28
         do
         {
           if ( !(v31 + v28) )
-            break;
+            break
           if ( !*v29 )
-            break;
-          *v30++ = *v29++;
-          --v28;
+            break
+          *v30++ = *v29++
+          --v28
         }
-        while ( v28 );
-        v32 = v30 - 1;
+        while ( v28 )
+        v32 = v30 - 1
         if ( v28 )
-          v32 = v30;
-        *v32 = 0;
+          v32 = v30
+        *v32 = 0
       }
-      _wcsupr(v27);
-      v33 = 0;
-      v34 = (const wchar_t **)off_1C002BC60;
+      _wcsupr(v27)
+      v33 = 0
+      v34 = (const wchar_t **)off_1C002BC60
       while ( !wcsstr(v27, *v34) )
       {
-        ++v33;
-        ++v34;
+        ++v33
+        ++v34
         if ( v33 >= 4 )
-          goto LABEL_51;
+          goto LABEL_51
       }
-      v40 = 1;
+      v40 = 1
 LABEL_51:
-      ExFreePoolWithTag(v27, 0x63734943u);
+      ExFreePoolWithTag(v27, 0x63734943u)
       if ( !v40 )
       {
 LABEL_52:
-        DbgPrintEx(0x65u, 0, "******************************************************************\n");
-        DbgPrintEx(0x65u, 0, "* This break indicates this binary is not signed correctly: %wZ\n", v55);
-        DbgPrintEx(0x65u, 0, "* and does not meet the system policy.\n");
-        DbgPrintEx(0x65u, 0, "* The binary was attempted to be loaded in the process: %wZ\n", v50);
-        DbgPrintEx(0x65u, 0, "* This is not a failure in CI, but a problem with the failing binary.\n");
-        DbgPrintEx(0x65u, 0, "* Please contact the binary owner for getting the binary correctly signed.\n");
-        DbgPrintEx(0x65u, 0, "******************************************************************\n");
-        v52[0] = 7077994;
-        v52[1] = L"\\Registry\\MACHINE\\System\\CurrentControlSet\\Control\\CI";
-        v58 = L"UMCINoDebugBreak";
-        v61 = 0;
-        v62 = 0;
-        v57 = 2228256;
-        v59 = 4;
-        v60 = 0;
+        DbgPrintEx(0x65u, 0, "******************************************************************\n")
+        DbgPrintEx(0x65u, 0, "* This break indicates this binary is not signed correctly: %wZ\n", v55)
+        DbgPrintEx(0x65u, 0, "* and does not meet the system policy.\n")
+        DbgPrintEx(0x65u, 0, "* The binary was attempted to be loaded in the process: %wZ\n", v50)
+        DbgPrintEx(0x65u, 0, "* This is not a failure in CI, but a problem with the failing binary.\n")
+        DbgPrintEx(0x65u, 0, "* Please contact the binary owner for getting the binary correctly signed.\n")
+        DbgPrintEx(0x65u, 0, "******************************************************************\n")
+        v52[0] = 7077994
+        v52[1] = L"\\Registry\\MACHINE\\System\\CurrentControlSet\\Control\\CI"
+        v58 = L"UMCINoDebugBreak"
+        v61 = 0
+        v62 = 0
+        v57 = 2228256
+        v59 = 4
+        v60 = 0
         if ( (g_CiOptions & 0x80u) == 0
           && ((int)CipGetRegistryParameters((unsigned int)v52, (unsigned int)&v57, 1, 0, 0) < 0 || !v60)
           && (_BYTE)KdDebuggerEnabled
           && (_BYTE)KdDebuggerNotPresent != 1 )
         {
-          DbgPrint("Code Integrity violation:  %d\n", 7715);
-          __debugbreak();
+          DbgPrint("Code Integrity violation:  %d\n", 7715)
+          __debugbreak()
         }
       }
     }
-    v21 = v45;
-    goto LABEL_59;
+    v21 = v45
+    goto LABEL_59
   }
-  v17 = a1 + 22;
+  v17 = a1 + 22
   while ( *v17 != 25 )
   {
-    ++v16;
-    v17 += 38;
+    ++v16
+    v17 += 38
     if ( v16 >= v15 )
-      goto LABEL_7;
+      goto LABEL_7
   }
-  return v11;
+  return v11
 }
 
 ```
@@ -5671,61 +5664,61 @@ LABEL_52:
 ```cpp
 void __fastcall CiBlackboxValidateImageHeaderFailure(_DWORD *a1, __int64 a2, __int64 a3, int a4, char a5, int a6)
 {
-  __int64 v6; // rax
-  __int64 v11; // rsi
-  unsigned __int64 v12; // rcx
-  __int64 v13; // rcx
-  __int128 v14; // xmm1
-  __int64 v15; // rdx
-  __int128 v16; // [rsp+20h] [rbp-10h] BYREF
-  __int64 v17; // [rsp+50h] [rbp+20h] BYREF
+  __int64 v6
+  __int64 v11
+  unsigned __int64 v12
+  __int64 v13
+  __int128 v14
+  __int64 v15
+  __int128 v16
+  __int64 v17
 
-  v17 = 0;
-  v6 = (unsigned int)a1[7];
-  v16 = 0;
+  v17 = 0
+  v6 = (unsigned int)a1[7]
+  v16 = 0
   if ( (_DWORD)v6 )
-    v6 = ((_BYTE)v6 - 1) & 3;
-  v11 = 38 * v6;
-  CipQueryFileName(a3, &v16, &v17);
+    v6 = ((_BYTE)v6 - 1) & 3
+  v11 = 38 * v6
+  CipQueryFileName(a3, &v16, &v17)
   if ( (unsigned __int16)v16 > 0x100u )
   {
-    v12 = ((unsigned __int64)(unsigned __int16)v16 - 256) >> 1;
-    LOWORD(v16) = 256;
-    *((_QWORD *)&v16 + 1) += 2 * v12;
+    v12 = ((unsigned __int64)(unsigned __int16)v16 - 256) >> 1
+    LOWORD(v16) = 256
+    *((_QWORD *)&v16 + 1) += 2 * v12
   }
-  _InterlockedIncrement(dword_1C00384D8);
-  KeEnterCriticalRegion();
-  ExAcquirePushLockExclusiveEx(&qword_1C0038568, 0);
-  dword_1C00384A0 = 0;
-  dword_1C00384C8 = a6;
-  qword_1C00384A8 = MEMORY[0xFFFFF78000000014];
-  qword_1C00384E8 = a2;
-  qword_1C00384F0 = a3;
-  v13 = *(_QWORD *)(*(_QWORD *)(a3 + 40) + 16LL);
-  byte_1C0038508 = a5;
-  qword_1C00384F8 = v13;
-  dword_1C0038504 = a4;
-  dword_1C0038500 = a1[522];
-  dword_1C003850C = a1[6];
-  dword_1C0038510 = a1[7];
-  dword_1C0038514 = a1[v11 + 22];
-  dword_1C0038518 = a1[v11 + 10];
-  byte_1C0038509 = a1[v11 + 21];
-  byte_1C0038520 = (a1[v11 + 23] & 8) != 0;
-  dword_1C003851C = a1[v11 + 26];
-  byte_1C0038521 = a1[v11 + 27];
-  xmmword_1C0038522 = *(_OWORD *)&a1[v11 + 28];
-  xmmword_1C0038532 = *(_OWORD *)&a1[v11 + 32];
-  xmmword_1C0038542 = *(_OWORD *)&a1[v11 + 36];
-  v14 = *(_OWORD *)&a1[v11 + 40];
-  word_1C0038564 = v16;
-  xmmword_1C0038552 = v14;
-  CipBlackBoxUpdate(&dword_1C00384A0, 16, 198);
-  CipBlackBoxUpdate(*((_QWORD *)&v16 + 1), 214, (unsigned __int16)v16);
-  ExReleasePushLockExclusiveEx(&qword_1C0038568, 0);
-  KeLeaveCriticalRegion();
+  _InterlockedIncrement(dword_1C00384D8)
+  KeEnterCriticalRegion()
+  ExAcquirePushLockExclusiveEx(&qword_1C0038568, 0)
+  dword_1C00384A0 = 0
+  dword_1C00384C8 = a6
+  qword_1C00384A8 = MEMORY[0xFFFFF78000000014]
+  qword_1C00384E8 = a2
+  qword_1C00384F0 = a3
+  v13 = *(_QWORD *)(*(_QWORD *)(a3 + 40) + 16LL)
+  byte_1C0038508 = a5
+  qword_1C00384F8 = v13
+  dword_1C0038504 = a4
+  dword_1C0038500 = a1[522]
+  dword_1C003850C = a1[6]
+  dword_1C0038510 = a1[7]
+  dword_1C0038514 = a1[v11 + 22]
+  dword_1C0038518 = a1[v11 + 10]
+  byte_1C0038509 = a1[v11 + 21]
+  byte_1C0038520 = (a1[v11 + 23] & 8) != 0
+  dword_1C003851C = a1[v11 + 26]
+  byte_1C0038521 = a1[v11 + 27]
+  xmmword_1C0038522 = *(_OWORD *)&a1[v11 + 28]
+  xmmword_1C0038532 = *(_OWORD *)&a1[v11 + 32]
+  xmmword_1C0038542 = *(_OWORD *)&a1[v11 + 36]
+  v14 = *(_OWORD *)&a1[v11 + 40]
+  word_1C0038564 = v16
+  xmmword_1C0038552 = v14
+  CipBlackBoxUpdate(&dword_1C00384A0, 16, 198)
+  CipBlackBoxUpdate(*((_QWORD *)&v16 + 1), 214, (unsigned __int16)v16)
+  ExReleasePushLockExclusiveEx(&qword_1C0038568, 0)
+  KeLeaveCriticalRegion()
   if ( v17 )
-    FsRtlReleaseFileNameInformation(v17, v15);
+    FsRtlReleaseFileNameInformation(v17, v15)
 }
 
 ```
@@ -5744,48 +5737,48 @@ void __fastcall CipProcessSIPolicyLogs(
         __int64 a8,
         int a9)
 {
-  unsigned int v13; // esi
-  __int64 *v14; // rbx
-  unsigned __int64 v15; // rax
-  unsigned __int64 v16; // r8
-  __int64 v17; // r9
-  int v18; // r8d
-  int v19; // r9d
-  __int64 v20; // rbp
-  __int64 v21; // rdx
+  unsigned int v13
+  __int64 *v14
+  unsigned __int64 v15
+  unsigned __int64 v16
+  __int64 v17
+  int v18
+  int v19
+  __int64 v20
+  __int64 v21
 
   if ( (g_CiPolicyState & 1) == 0 )
-    return;
-  v13 = 0;
+    return
+  v13 = 0
   if ( !a1 )
-    return;
-  KeEnterCriticalRegion();
-  ExAcquirePushLockExclusiveEx(&g_CipPerfLock, 0);
-  v14 = (__int64 *)(a1 + 904);
-  v15 = (unsigned __int64)(1000000LL * (*a5 - *a4)) / g_CiPerfFrequency.QuadPart;
+    return
+  KeEnterCriticalRegion()
+  ExAcquirePushLockExclusiveEx(&g_CipPerfLock, 0)
+  v14 = (__int64 *)(a1 + 904)
+  v15 = (unsigned __int64)(1000000LL * (*a5 - *a4)) / g_CiPerfFrequency.QuadPart
   if ( v15 + g_CiTotalPerfTime < g_CiTotalPerfTime )
-    goto LABEL_6;
-  g_CiTotalPerfTime += v15;
-  v16 = g_SiTotalPerfTime + *v14;
+    goto LABEL_6
+  g_CiTotalPerfTime += v15
+  v16 = g_SiTotalPerfTime + *v14
   if ( v16 < g_SiTotalPerfTime )
   {
-    g_SiTotalPerfTime = -1;
+    g_SiTotalPerfTime = -1
 LABEL_6:
-    g_CiTotalPerfTime = v15;
-    v16 = *v14;
+    g_CiTotalPerfTime = v15
+    v16 = *v14
   }
-  g_SiTotalPerfTime = v16;
-  ExReleasePushLockExclusiveEx(&g_CipPerfLock, 0);
-  *(_DWORD *)(a1 + 1504) ^= (*(_DWORD *)(a1 + 1504) ^ ((unsigned __int8)CipIsDotNetNativeImage(a2) << 8)) & 0x100;
+  g_SiTotalPerfTime = v16
+  ExReleasePushLockExclusiveEx(&g_CipPerfLock, 0)
+  *(_DWORD *)(a1 + 1504) ^= (*(_DWORD *)(a1 + 1504) ^ ((unsigned __int8)CipIsDotNetNativeImage(a2) << 8)) & 0x100
   if ( (*(_DWORD *)(a1 + 1504) & 0x101) == 0 )
   {
-    LOBYTE(v17) = a6;
-    CipProcessSIPolicyFailure(a1, a3, a2, v17, a7, a8, a9);
-    CiLogSignatureInformation(a1);
+    LOBYTE(v17) = a6
+    CipProcessSIPolicyFailure(a1, a3, a2, v17, a7, a8, a9)
+    CiLogSignatureInformation(a1)
   }
-  ExAcquirePushLockSharedEx(&g_CipPerfLock, 0);
-  LOBYTE(v18) = a6;
-  LOBYTE(v19) = a7;
+  ExAcquirePushLockSharedEx(&g_CipPerfLock, 0)
+  LOBYTE(v18) = a6
+  LOBYTE(v19) = a7
   CipProcessPerformanceLog(
     a3,
     a2,
@@ -5793,25 +5786,25 @@ LABEL_6:
     v19,
     (unsigned __int64)(1000000LL * (*a5 - *a4)) / g_CiPerfFrequency.QuadPart,
     *v14,
-    1000 * g_SiTotalPerfTime / (unsigned __int64)g_CiTotalPerfTime);
-  ExReleasePushLockSharedEx(&g_CipPerfLock, 0);
-  KeLeaveCriticalRegion();
+    1000 * g_SiTotalPerfTime / (unsigned __int64)g_CiTotalPerfTime)
+  ExReleasePushLockSharedEx(&g_CipPerfLock, 0)
+  KeLeaveCriticalRegion()
   if ( *(_DWORD *)(a1 + 28) )
   {
     do
     {
       if ( v13 >= 4 )
-        break;
-      v20 = 152LL * v13;
+        break
+      v20 = 152LL * v13
       if ( (*(_DWORD *)(a1 + v20 + 92) & 2) != 0 )
       {
-        CiLogFileEvent((unsigned __int16 *)(a2 + 88), &WhqlEnforcementFailureAudit);
-        LOBYTE(v21) = *(_BYTE *)(a1 + v20 + 92) & 1;
-        CiLogWhqlDriverExemption(a2 + 88, v21);
+        CiLogFileEvent((unsigned __int16 *)(a2 + 88), &WhqlEnforcementFailureAudit)
+        LOBYTE(v21) = *(_BYTE *)(a1 + v20 + 92) & 1
+        CiLogWhqlDriverExemption(a2 + 88, v21)
       }
-      ++v13;
+      ++v13
     }
-    while ( v13 < *(_DWORD *)(a1 + 28) );
+    while ( v13 < *(_DWORD *)(a1 + 28) )
   }
 }
 
@@ -5822,27 +5815,27 @@ LABEL_6:
 ```cpp
 void __fastcall CiInstrumentVbsPolicyFailure(__int64 a1)
 {
-  __int64 v2; // rdx
-  __int128 v3; // [rsp+30h] [rbp-20h] BYREF
-  __int128 v4; // [rsp+40h] [rbp-10h] BYREF
-  __int64 v5; // [rsp+68h] [rbp+18h] BYREF
-  PVOID P; // [rsp+70h] [rbp+20h] BYREF
-  __int64 v7; // [rsp+78h] [rbp+28h] BYREF
+  __int64 v2
+  __int128 v3
+  __int128 v4
+  __int64 v5
+  PVOID P
+  __int64 v7
 
-  v7 = 0;
-  v5 = 0;
-  P = 0;
-  v4 = 0;
-  v3 = 0;
+  v7 = 0
+  v5 = 0
+  P = 0
+  v4 = 0
+  v3 = 0
   if ( (unsigned __int8)CiHvciIsVbsPolicyFailure(a1, &v5) )
   {
-    CipQueryFileName(*(_QWORD *)(a1 + 928), &v4, &v7);
-    CipQueryProcessName(*(struct _KPROCESS **)(a1 + 2080), &v3, &P);
-    CipInstrumentVbsPolicyFailure(v5, a1, (__int64)&v4, (__int64)&v3, *(_DWORD *)a1);
+    CipQueryFileName(*(_QWORD *)(a1 + 928), &v4, &v7)
+    CipQueryProcessName(*(struct _KPROCESS **)(a1 + 2080), &v3, &P)
+    CipInstrumentVbsPolicyFailure(v5, a1, (__int64)&v4, (__int64)&v3, *(_DWORD *)a1)
     if ( P )
-      ExFreePoolWithTag(P, 0);
+      ExFreePoolWithTag(P, 0)
     if ( v7 )
-      FsRtlReleaseFileNameInformation(v7, v2);
+      FsRtlReleaseFileNameInformation(v7, v2)
   }
 }
 
@@ -5860,83 +5853,83 @@ __int64 __fastcall CipBuildSigningInformation(
         _QWORD *a6,
         unsigned int *a7)
 {
-  unsigned int v7; // esi
-  int v8; // r14d
-  unsigned int v9; // ebp
-  int v10; // r15d
-  unsigned int v11; // r12d
-  __int64 v13; // rax
-  __int64 v14; // rax
-  unsigned __int16 v15; // cx
-  unsigned __int16 v16; // cx
-  char *PoolWithTag; // rax
-  char *v18; // rbx
-  char *v19; // rdi
-  void *v20; // rcx
-  void *v21; // rcx
-  size_t v22; // r8
-  __int16 v23; // ax
+  unsigned int v7
+  int v8
+  unsigned int v9
+  int v10
+  unsigned int v11
+  __int64 v13
+  __int64 v14
+  unsigned __int16 v15
+  unsigned __int16 v16
+  char *PoolWithTag
+  char *v18
+  char *v19
+  void *v20
+  void *v21
+  size_t v22
+  __int16 v23
 
-  v7 = *(unsigned __int16 *)(a1 + 88) + a3 + 104;
-  v8 = 0;
-  v9 = 0;
-  v10 = 0;
-  v11 = 0;
-  v13 = *(_QWORD *)(a5 + 16);
+  v7 = *(unsigned __int16 *)(a1 + 88) + a3 + 104
+  v8 = 0
+  v9 = 0
+  v10 = 0
+  v11 = 0
+  v13 = *(_QWORD *)(a5 + 16)
   if ( v13 && *(_DWORD *)(v13 + 48) )
   {
-    v14 = *(_QWORD *)(v13 + 40);
-    v11 = *(_DWORD *)(v14 + 4);
-    v7 += v11;
+    v14 = *(_QWORD *)(v13 + 40)
+    v11 = *(_DWORD *)(v14 + 4)
+    v7 += v11
     if ( *(_BYTE *)(v14 + 98) == 30 )
-      v15 = *(_WORD *)(v14 + 96);
+      v15 = *(_WORD *)(v14 + 96)
     else
-      v15 = 2 * *(_WORD *)(v14 + 96);
-    v8 = v15;
+      v15 = 2 * *(_WORD *)(v14 + 96)
+    v8 = v15
     if ( *(_BYTE *)(v14 + 82) == 30 )
-      v16 = *(_WORD *)(v14 + 80);
+      v16 = *(_WORD *)(v14 + 80)
     else
-      v16 = 2 * *(_WORD *)(v14 + 80);
-    v9 = v16;
+      v16 = 2 * *(_WORD *)(v14 + 80)
+    v9 = v16
     if ( v8 )
-      v7 += v8 + 2;
+      v7 += v8 + 2
     if ( v16 )
-      v7 += v16 + 2;
+      v7 += v16 + 2
   }
-  PoolWithTag = (char *)ExAllocatePoolWithTag(PagedPool, v7, 0x63734943u);
-  v18 = PoolWithTag;
+  PoolWithTag = (char *)ExAllocatePoolWithTag(PagedPool, v7, 0x63734943u)
+  v18 = PoolWithTag
   if ( PoolWithTag )
   {
-    memset(PoolWithTag + 4, 0, 0x64u);
-    v19 = v18 + 104;
-    *(_DWORD *)v18 = 0;
+    memset(PoolWithTag + 4, 0, 0x64u)
+    v19 = v18 + 104
+    *(_DWORD *)v18 = 0
     if ( a3 )
     {
-      *((_QWORD *)v18 + 9) = v19;
-      v19 += a3;
-      memmove(v18 + 104, a2, a3);
-      *((_DWORD *)v18 + 24) = a3;
-      *((_DWORD *)v18 + 22) = a4;
+      *((_QWORD *)v18 + 9) = v19
+      v19 += a3
+      memmove(v18 + 104, a2, a3)
+      *((_DWORD *)v18 + 24) = a3
+      *((_DWORD *)v18 + 22) = a4
     }
-    v20 = v19;
+    v20 = v19
     if ( v11 )
     {
-      *((_QWORD *)v18 + 10) = v19;
-      v19 += v11;
-      memmove(v20, (const void *)(*(_QWORD *)(*(_QWORD *)(a5 + 16) + 40LL) + 8LL), v11);
-      *((_DWORD *)v18 + 25) = v11;
-      *((_DWORD *)v18 + 23) = **(_DWORD **)(*(_QWORD *)(a5 + 16) + 40LL);
+      *((_QWORD *)v18 + 10) = v19
+      v19 += v11
+      memmove(v20, (const void *)(*(_QWORD *)(*(_QWORD *)(a5 + 16) + 40LL) + 8LL), v11)
+      *((_DWORD *)v18 + 25) = v11
+      *((_DWORD *)v18 + 23) = **(_DWORD **)(*(_QWORD *)(a5 + 16) + 40LL)
     }
-    v21 = v19;
+    v21 = v19
     if ( *(_QWORD *)(a1 + 96) )
     {
-      *((_QWORD *)v18 + 2) = v19;
-      v22 = *(unsigned __int16 *)(a1 + 88);
-      v19 += v22;
-      memmove(v21, *(const void **)(a1 + 96), v22);
-      v23 = *(_WORD *)(a1 + 88);
-      *((_WORD *)v18 + 4) = v23;
-      *((_WORD *)v18 + 5) = v23;
+      *((_QWORD *)v18 + 2) = v19
+      v22 = *(unsigned __int16 *)(a1 + 88)
+      v19 += v22
+      memmove(v21, *(const void **)(a1 + 96), v22)
+      v23 = *(_WORD *)(a1 + 88)
+      *((_WORD *)v18 + 4) = v23
+      *((_WORD *)v18 + 5) = v23
     }
     if ( !v9
       || (*((_QWORD *)v18 + 6) = v19,
@@ -5951,16 +5944,16 @@ __int64 __fastcall CipBuildSigningInformation(
             v10 = MincryptStringToUnicodeString((PUNICODE_STRING)(v18 + 56)),
             v10 >= 0) )
       {
-        *a6 = v18;
-        *a7 = v7;
+        *a6 = v18
+        *a7 = v7
       }
     }
   }
   else
   {
-    return (unsigned int)-1073741801;
+    return (unsigned int)-1073741801
   }
-  return (unsigned int)v10;
+  return (unsigned int)v10
 }
 
 ```
@@ -5971,12 +5964,12 @@ __int64 __fastcall CipBuildSigningInformation(
 __int64 __fastcall CiReleaseContext(_DWORD *a1)
 {
   if ( !a1 )
-    return 3221225711LL;
+    return 3221225711LL
   if ( (*a1 & 2) != 0 )
-    CipReleaseImage(a1);
+    CipReleaseImage(a1)
   else
-    ExFreePoolWithTag(a1, 0x63734943u);
-  return 0;
+    ExFreePoolWithTag(a1, 0x63734943u)
+  return 0
 }
 
 ```
@@ -5986,12 +5979,12 @@ __int64 __fastcall CiReleaseContext(_DWORD *a1)
 ```cpp
 PSLIST_ENTRY __fastcall CiFreeValidationContext(PSLIST_ENTRY ListEntry)
 {
-  (**((void (***)(void))&ListEntry[112].Next + 1))();
-  ++g_CiValidationLookasideList.L.TotalFrees;
+  (**((void (***)(void))&ListEntry[112].Next + 1))()
+  ++g_CiValidationLookasideList.L.TotalFrees
   if ( ExQueryDepthSList(&g_CiValidationLookasideList.L.ListHead) < g_CiValidationLookasideList.L.Depth )
-    return ExpInterlockedPushEntrySList(&g_CiValidationLookasideList.L.ListHead, ListEntry);
-  ++g_CiValidationLookasideList.L.FreeMisses;
-  return (PSLIST_ENTRY)((__int64 (__fastcall *)(PSLIST_ENTRY))g_CiValidationLookasideList.L.FreeEx)(ListEntry);
+    return ExpInterlockedPushEntrySList(&g_CiValidationLookasideList.L.ListHead, ListEntry)
+  ++g_CiValidationLookasideList.L.FreeMisses
+  return (PSLIST_ENTRY)((__int64 (__fastcall *)(PSLIST_ENTRY))g_CiValidationLookasideList.L.FreeEx)(ListEntry)
 }
 
 ```
@@ -6001,18 +5994,18 @@ PSLIST_ENTRY __fastcall CiFreeValidationContext(PSLIST_ENTRY ListEntry)
 ```cpp
 NTSTATUS __fastcall CiLogStatusEventWithCorrelationId(int a1, const EVENT_DESCRIPTOR *a2, const GUID *ActivityIdThread)
 {
-  struct _EVENT_DATA_DESCRIPTOR UserData; // [rsp+30h] [rbp-28h] BYREF
-  int v7; // [rsp+60h] [rbp+8h] BYREF
+  struct _EVENT_DATA_DESCRIPTOR UserData
+  int v7
 
-  v7 = a1;
+  v7 = a1
   if ( !EtwEventEnabled(g_EtwEventHandle, a2) )
-    return 0;
-  UserData.Reserved = 0;
-  UserData.Ptr = (ULONGLONG)&v7;
-  UserData.Size = 4;
+    return 0
+  UserData.Reserved = 0
+  UserData.Ptr = (ULONGLONG)&v7
+  UserData.Size = 4
   if ( !ActivityIdThread )
-    ActivityIdThread = (const GUID *)IoGetActivityIdThread();
-  return EtwWrite(g_EtwEventHandle, a2, ActivityIdThread, 1u, &UserData);
+    ActivityIdThread = (const GUID *)IoGetActivityIdThread()
+  return EtwWrite(g_EtwEventHandle, a2, ActivityIdThread, 1u, &UserData)
 }
 
 ```
@@ -6022,21 +6015,20 @@ NTSTATUS __fastcall CiLogStatusEventWithCorrelationId(int a1, const EVENT_DESCRI
 ```cpp
 void __cdecl _security_check_cookie(uintptr_t StackCookie)
 {
-  __int64 v1; // rcx
+  __int64 v1
 
   if ( StackCookie != _security_cookie )
 ReportFailure:
-    _report_gsfailure(StackCookie);
-  v1 = __ROL8__(StackCookie, 16);
+    _report_gsfailure(StackCookie)
+  v1 = __ROL8__(StackCookie, 16)
   if ( (_WORD)v1 )
   {
-    StackCookie = __ROR8__(v1, 16);
-    goto ReportFailure;
+    StackCookie = __ROR8__(v1, 16)
+    goto ReportFailure
   }
 }
 
 ```
-
 
 
 --- Struct Member Usage & Data Cross-References ---
@@ -6055,42 +6047,40 @@ variable 'v74' is possibly undefined
 variable 'v76' is possibly undefined
 variable 'v58' is possibly undefined
 variable 'BaseAddress' is possibly undefined
-using guessed type __int64 (__fastcall *off_1C002B000)();
-using guessed type __int128 *g_CipWhichLevelComparisons;
-using guessed type int g_CiPolicyState;
-using guessed type int g_CiDeveloperMode;
-using guessed type int g_NumberOfSiPolicies;
-using guessed type int g_CiOptions;
-using guessed type __int64 g_CipPolicyLock;
-using guessed type __int128 xmmword_1C0039390;
-using guessed type __int64 __fastcall XciValidateImageHeader(_QWORD, _QWORD, _QWORD, _QWORD, _DWORD, _QWORD, _DWORD, _QWORD, _QWORD, _QWORD, _QWORD);
-using guessed type __int64 XciSupported(void);
-using guessed type __int64 __fastcall ExReleasePushLockSharedEx(_QWORD, _QWORD);
-using guessed type __int64 __fastcall ExAcquirePushLockSharedEx(_QWORD, _QWORD);
-using guessed type __int64 __fastcall PsGetProcessProtection(_QWORD);
-using guessed type __int64 __fastcall PsIsProtectedProcess(_QWORD);
-using guessed type __int64 __fastcall IoClearActivityIdThread(_QWORD);
-using guessed type __int64 __fastcall IoSetActivityIdThread(_QWORD);
-using guessed type __int64 CiInitializePhase2(void);
-using guessed type __int64 __fastcall CiGetActionsForImage(_QWORD, _QWORD, _QWORD, _QWORD);
-using guessed type __int64 __fastcall CiBlackboxValidateImageHeaderFailure(_DWORD, _DWORD, _DWORD, _DWORD, char, _DWORD);
-using guessed type __int64 __fastcall CipImageValidityPeriod(_QWORD, _QWORD);
-using guessed type __int64 __fastcall CipCallPeauth(_QWORD, _QWORD, _QWORD, _QWORD, _QWORD, _QWORD);
-using guessed type __int64 __fastcall CipFixImageType(_DWORD, _DWORD, _DWORD, _DWORD, __int64);
-using guessed type __int64 __fastcall CipValidateImageHash(_QWORD, _QWORD, _QWORD, _QWORD, _QWORD, _DWORD, _DWORD, _DWORD, _DWORD);
-using guessed type __int64 __fastcall CipBuildSigningInformation(_DWORD, _DWORD, _DWORD, _DWORD, __int64, __int64, __int64);
-using guessed type __int64 __fastcall CipReportSharedSectionFailure(_DWORD, _DWORD, _DWORD, _DWORD, char);
-using guessed type __int64 __fastcall CipReportAndReprieveUMCIFailure(_DWORD, _DWORD, _DWORD, _DWORD, _DWORD, _DWORD, _DWORD, char, __int64, __int64);
-using guessed type __int64 __fastcall CipReportAndReprieveDriverAndProtectedImageFailure(_DWORD, _DWORD, _DWORD, _DWORD, char, _DWORD);
-using guessed type __int64 __fastcall CipReportSystemOptionsReprieve(_DWORD, _DWORD, _DWORD, _DWORD, _DWORD);
-using guessed type __int64 CiReleaseContext(void);
-using guessed type __int64 __fastcall CiAuditDriverAllow(_QWORD, _QWORD, _QWORD, _QWORD);
-using guessed type __int64 __fastcall CiInstrumentVbsPolicyFailure(_QWORD);
-using guessed type __int64 __fastcall CiLogStatusEventWithCorrelationId(_QWORD, _QWORD, _QWORD);
-using guessed type __int64 __fastcall CipProcessSIPolicyLogs(_DWORD, _DWORD, _DWORD, _DWORD, __int64, char, char, __int64, _DWORD);
-using guessed type __int64 __fastcall CipMitigatePPLBypassThroughInterpreters(_DWORD, _DWORD, _DWORD, _DWORD, char);
-
-
+using guessed type __int64 (__fastcall *off_1C002B000)()
+using guessed type __int128 *g_CipWhichLevelComparisons
+using guessed type int g_CiPolicyState
+using guessed type int g_CiDeveloperMode
+using guessed type int g_NumberOfSiPolicies
+using guessed type int g_CiOptions
+using guessed type __int64 g_CipPolicyLock
+using guessed type __int128 xmmword_1C0039390
+using guessed type __int64 __fastcall XciValidateImageHeader(_QWORD, _QWORD, _QWORD, _QWORD, _DWORD, _QWORD, _DWORD, _QWORD, _QWORD, _QWORD, _QWORD)
+using guessed type __int64 XciSupported(void)
+using guessed type __int64 __fastcall ExReleasePushLockSharedEx(_QWORD, _QWORD)
+using guessed type __int64 __fastcall ExAcquirePushLockSharedEx(_QWORD, _QWORD)
+using guessed type __int64 __fastcall PsGetProcessProtection(_QWORD)
+using guessed type __int64 __fastcall PsIsProtectedProcess(_QWORD)
+using guessed type __int64 __fastcall IoClearActivityIdThread(_QWORD)
+using guessed type __int64 __fastcall IoSetActivityIdThread(_QWORD)
+using guessed type __int64 CiInitializePhase2(void)
+using guessed type __int64 __fastcall CiGetActionsForImage(_QWORD, _QWORD, _QWORD, _QWORD)
+using guessed type __int64 __fastcall CiBlackboxValidateImageHeaderFailure(_DWORD, _DWORD, _DWORD, _DWORD, char, _DWORD)
+using guessed type __int64 __fastcall CipImageValidityPeriod(_QWORD, _QWORD)
+using guessed type __int64 __fastcall CipCallPeauth(_QWORD, _QWORD, _QWORD, _QWORD, _QWORD, _QWORD)
+using guessed type __int64 __fastcall CipFixImageType(_DWORD, _DWORD, _DWORD, _DWORD, __int64)
+using guessed type __int64 __fastcall CipValidateImageHash(_QWORD, _QWORD, _QWORD, _QWORD, _QWORD, _DWORD, _DWORD, _DWORD, _DWORD)
+using guessed type __int64 __fastcall CipBuildSigningInformation(_DWORD, _DWORD, _DWORD, _DWORD, __int64, __int64, __int64)
+using guessed type __int64 __fastcall CipReportSharedSectionFailure(_DWORD, _DWORD, _DWORD, _DWORD, char)
+using guessed type __int64 __fastcall CipReportAndReprieveUMCIFailure(_DWORD, _DWORD, _DWORD, _DWORD, _DWORD, _DWORD, _DWORD, char, __int64, __int64)
+using guessed type __int64 __fastcall CipReportAndReprieveDriverAndProtectedImageFailure(_DWORD, _DWORD, _DWORD, _DWORD, char, _DWORD)
+using guessed type __int64 __fastcall CipReportSystemOptionsReprieve(_DWORD, _DWORD, _DWORD, _DWORD, _DWORD)
+using guessed type __int64 CiReleaseContext(void)
+using guessed type __int64 __fastcall CiAuditDriverAllow(_QWORD, _QWORD, _QWORD, _QWORD)
+using guessed type __int64 __fastcall CiInstrumentVbsPolicyFailure(_QWORD)
+using guessed type __int64 __fastcall CiLogStatusEventWithCorrelationId(_QWORD, _QWORD, _QWORD)
+using guessed type __int64 __fastcall CipProcessSIPolicyLogs(_DWORD, _DWORD, _DWORD, _DWORD, __int64, char, char, __int64, _DWORD)
+using guessed type __int64 __fastcall CipMitigatePPLBypassThroughInterpreters(_DWORD, _DWORD, _DWORD, _DWORD, char)
 
 
 Function: 1c004f2c0
@@ -6099,110 +6089,110 @@ Prototype: __int64 __fastcall(char *BaseAddress, ULONGLONG Size, _QWORD *, DWORD
 --- Decompiled C/C++ ---
 __int64 __fastcall CiValidateImageHeaderMapping(char *BaseAddress, ULONGLONG Size, _QWORD *a3, DWORD *a4)
 {
-  DWORD v6; // r15d
-  char *v8; // rax
-  unsigned __int64 v9; // rbx
-  unsigned __int64 v10; // rsi
-  NTSTATUS v11; // ecx
-  __int64 SizeOfOptionalHeader; // r9
-  char *v13; // rax
-  unsigned __int64 v14; // r11
-  WORD Magic; // ax
-  DWORD SizeOfHeaders; // edx
-  int NumberOfSections; // eax
-  char *v18; // r10
-  char *v19; // rcx
-  PIMAGE_NT_HEADERS v21; // [rsp+60h] [rbp+8h] BYREF
+  DWORD v6
+  char *v8
+  unsigned __int64 v9
+  unsigned __int64 v10
+  NTSTATUS v11
+  __int64 SizeOfOptionalHeader
+  char *v13
+  unsigned __int64 v14
+  WORD Magic
+  DWORD SizeOfHeaders
+  int NumberOfSections
+  char *v18
+  char *v19
+  PIMAGE_NT_HEADERS v21
 
-  v6 = Size;
-  v21 = 0;
-  v8 = &BaseAddress[(unsigned int)Size];
-  v9 = -1;
-  v10 = -1;
+  v6 = Size
+  v21 = 0
+  v8 = &BaseAddress[(unsigned int)Size]
+  v9 = -1
+  v10 = -1
   if ( v8 >= BaseAddress )
-    v10 = (unsigned __int64)&BaseAddress[(unsigned int)Size];
-  v11 = v8 < BaseAddress ? 0xC0000095 : 0;
+    v10 = (unsigned __int64)&BaseAddress[(unsigned int)Size]
+  v11 = v8 < BaseAddress ? 0xC0000095 : 0
   if ( v8 >= BaseAddress )
   {
-    v11 = RtlImageNtHeaderEx(0, BaseAddress, (unsigned int)Size, &v21);
+    v11 = RtlImageNtHeaderEx(0, BaseAddress, (unsigned int)Size, &v21)
     if ( v11 >= 0 )
     {
-      SizeOfOptionalHeader = v21->FileHeader.SizeOfOptionalHeader;
-      v13 = (char *)&v21->OptionalHeader + SizeOfOptionalHeader;
-      v14 = -1;
+      SizeOfOptionalHeader = v21->FileHeader.SizeOfOptionalHeader
+      v13 = (char *)&v21->OptionalHeader + SizeOfOptionalHeader
+      v14 = -1
       if ( v13 >= (char *)&v21->OptionalHeader )
-        v14 = (unsigned __int64)&v21->OptionalHeader + SizeOfOptionalHeader;
-      v11 = v13 < (char *)&v21->OptionalHeader ? 0xC0000095 : 0;
+        v14 = (unsigned __int64)&v21->OptionalHeader + SizeOfOptionalHeader
+      v11 = v13 < (char *)&v21->OptionalHeader ? 0xC0000095 : 0
       if ( v13 < (char *)&v21->OptionalHeader || v14 > v10 || (unsigned int)SizeOfOptionalHeader < 0x1A )
-        return (unsigned int)-1073741701;
-      Magic = v21->OptionalHeader.Magic;
+        return (unsigned int)-1073741701
+      Magic = v21->OptionalHeader.Magic
       if ( Magic == 523 )
       {
         if ( (unsigned __int16)SizeOfOptionalHeader < 0xB0u )
-          return (unsigned int)-1073741701;
+          return (unsigned int)-1073741701
       }
       else
       {
         if ( Magic != 267 )
-          return (unsigned int)-1073741701;
+          return (unsigned int)-1073741701
         if ( (unsigned __int16)SizeOfOptionalHeader < 0xA0u )
-          return (unsigned int)-1073741701;
+          return (unsigned int)-1073741701
       }
-      SizeOfHeaders = v21->OptionalHeader.SizeOfHeaders;
+      SizeOfHeaders = v21->OptionalHeader.SizeOfHeaders
       if ( SizeOfHeaders <= v6 )
       {
-        NumberOfSections = v21->FileHeader.NumberOfSections;
+        NumberOfSections = v21->FileHeader.NumberOfSections
         if ( (_WORD)NumberOfSections )
         {
-          v18 = (char *)&v21->OptionalHeader + SizeOfOptionalHeader;
+          v18 = (char *)&v21->OptionalHeader + SizeOfOptionalHeader
           if ( (unsigned __int64)v18 < v14 )
-            return (unsigned int)-1073741701;
-          v19 = &v18[40 * NumberOfSections];
+            return (unsigned int)-1073741701
+          v19 = &v18[40 * NumberOfSections]
           if ( v19 >= v18 )
-            v9 = (unsigned __int64)&v18[40 * NumberOfSections];
-          v11 = v19 < v18 ? 0xC0000095 : 0;
+            v9 = (unsigned __int64)&v18[40 * NumberOfSections]
+          v11 = v19 < v18 ? 0xC0000095 : 0
           if ( v11 < 0 || v9 > v10 )
-            return (unsigned int)-1073741701;
+            return (unsigned int)-1073741701
           if ( v9 - (unsigned __int64)BaseAddress > SizeOfHeaders )
-            return (unsigned int)-1073741701;
+            return (unsigned int)-1073741701
         }
-        *a3 = v21;
+        *a3 = v21
         if ( a4 )
-          *a4 = SizeOfHeaders;
+          *a4 = SizeOfHeaders
       }
       else
       {
-        return (unsigned int)-1073741306;
+        return (unsigned int)-1073741306
       }
     }
   }
-  return (unsigned int)v11;
+  return (unsigned int)v11
 }
 
 
 --- Local Variables ---
-// char * BaseAddress; // location: cx, size: 8
-// ULONGLONG Size; // location: dx, size: 8
-// _QWORD * a3; // location: r8, size: 8
-// DWORD * a4; // location: r9, size: 8
-// __int64 ; // location: r14, size: 8
-// __int64 ; // location: r12, size: 8
-// DWORD v6; // location: r15, size: 4
-// __int64 ; // location: di, size: 8
-// char * v8; // location: ax, size: 8
-// unsigned __int64 v9; // location: bx, size: 8
-// unsigned __int64 v10; // location: si, size: 8
-// NTSTATUS v11; // location: cx, size: 4
-// __int64 SizeOfOptionalHeader; // location: r9, size: 8
-// char * v13; // location: ax, size: 8
-// unsigned __int64 v14; // location: r11, size: 8
-// WORD Magic; // location: ax, size: 2
-// DWORD SizeOfHeaders; // location: dx, size: 4
-// int NumberOfSections; // location: ax, size: 4
-// char * v18; // location: r10, size: 8
-// char * v19; // location: cx, size: 8
-// __int64 ; // location: ax, size: 8
-// PIMAGE_NT_HEADERS v21; // location: ^60, size: 8
+// char * BaseAddress
+// ULONGLONG Size
+// _QWORD * a3
+// DWORD * a4
+// __int64
+// __int64
+// DWORD v6
+// __int64
+// char * v8
+// unsigned __int64 v9
+// unsigned __int64 v10
+// NTSTATUS v11
+// __int64 SizeOfOptionalHeader
+// char * v13
+// unsigned __int64 v14
+// WORD Magic
+// DWORD SizeOfHeaders
+// int NumberOfSections
+// char * v18
+// char * v19
+// __int64
+// PIMAGE_NT_HEADERS v21
 
 
 --- String Literals Referenced ---
@@ -6215,84 +6205,84 @@ __int64 __fastcall CiValidateImageHeaderMapping(char *BaseAddress, ULONGLONG Siz
 ```cpp
 __int64 __fastcall CiValidateImageHeaderMapping(char *BaseAddress, ULONGLONG Size, _QWORD *a3, DWORD *a4)
 {
-  DWORD v6; // r15d
-  char *v8; // rax
-  unsigned __int64 v9; // rbx
-  unsigned __int64 v10; // rsi
-  NTSTATUS v11; // ecx
-  __int64 SizeOfOptionalHeader; // r9
-  char *v13; // rax
-  unsigned __int64 v14; // r11
-  WORD Magic; // ax
-  DWORD SizeOfHeaders; // edx
-  int NumberOfSections; // eax
-  char *v18; // r10
-  char *v19; // rcx
-  PIMAGE_NT_HEADERS v21; // [rsp+60h] [rbp+8h] BYREF
+  DWORD v6
+  char *v8
+  unsigned __int64 v9
+  unsigned __int64 v10
+  NTSTATUS v11
+  __int64 SizeOfOptionalHeader
+  char *v13
+  unsigned __int64 v14
+  WORD Magic
+  DWORD SizeOfHeaders
+  int NumberOfSections
+  char *v18
+  char *v19
+  PIMAGE_NT_HEADERS v21
 
-  v6 = Size;
-  v21 = 0;
-  v8 = &BaseAddress[(unsigned int)Size];
-  v9 = -1;
-  v10 = -1;
+  v6 = Size
+  v21 = 0
+  v8 = &BaseAddress[(unsigned int)Size]
+  v9 = -1
+  v10 = -1
   if ( v8 >= BaseAddress )
-    v10 = (unsigned __int64)&BaseAddress[(unsigned int)Size];
-  v11 = v8 < BaseAddress ? 0xC0000095 : 0;
+    v10 = (unsigned __int64)&BaseAddress[(unsigned int)Size]
+  v11 = v8 < BaseAddress ? 0xC0000095 : 0
   if ( v8 >= BaseAddress )
   {
-    v11 = RtlImageNtHeaderEx(0, BaseAddress, (unsigned int)Size, &v21);
+    v11 = RtlImageNtHeaderEx(0, BaseAddress, (unsigned int)Size, &v21)
     if ( v11 >= 0 )
     {
-      SizeOfOptionalHeader = v21->FileHeader.SizeOfOptionalHeader;
-      v13 = (char *)&v21->OptionalHeader + SizeOfOptionalHeader;
-      v14 = -1;
+      SizeOfOptionalHeader = v21->FileHeader.SizeOfOptionalHeader
+      v13 = (char *)&v21->OptionalHeader + SizeOfOptionalHeader
+      v14 = -1
       if ( v13 >= (char *)&v21->OptionalHeader )
-        v14 = (unsigned __int64)&v21->OptionalHeader + SizeOfOptionalHeader;
-      v11 = v13 < (char *)&v21->OptionalHeader ? 0xC0000095 : 0;
+        v14 = (unsigned __int64)&v21->OptionalHeader + SizeOfOptionalHeader
+      v11 = v13 < (char *)&v21->OptionalHeader ? 0xC0000095 : 0
       if ( v13 < (char *)&v21->OptionalHeader || v14 > v10 || (unsigned int)SizeOfOptionalHeader < 0x1A )
-        return (unsigned int)-1073741701;
-      Magic = v21->OptionalHeader.Magic;
+        return (unsigned int)-1073741701
+      Magic = v21->OptionalHeader.Magic
       if ( Magic == 523 )
       {
         if ( (unsigned __int16)SizeOfOptionalHeader < 0xB0u )
-          return (unsigned int)-1073741701;
+          return (unsigned int)-1073741701
       }
       else
       {
         if ( Magic != 267 )
-          return (unsigned int)-1073741701;
+          return (unsigned int)-1073741701
         if ( (unsigned __int16)SizeOfOptionalHeader < 0xA0u )
-          return (unsigned int)-1073741701;
+          return (unsigned int)-1073741701
       }
-      SizeOfHeaders = v21->OptionalHeader.SizeOfHeaders;
+      SizeOfHeaders = v21->OptionalHeader.SizeOfHeaders
       if ( SizeOfHeaders <= v6 )
       {
-        NumberOfSections = v21->FileHeader.NumberOfSections;
+        NumberOfSections = v21->FileHeader.NumberOfSections
         if ( (_WORD)NumberOfSections )
         {
-          v18 = (char *)&v21->OptionalHeader + SizeOfOptionalHeader;
+          v18 = (char *)&v21->OptionalHeader + SizeOfOptionalHeader
           if ( (unsigned __int64)v18 < v14 )
-            return (unsigned int)-1073741701;
-          v19 = &v18[40 * NumberOfSections];
+            return (unsigned int)-1073741701
+          v19 = &v18[40 * NumberOfSections]
           if ( v19 >= v18 )
-            v9 = (unsigned __int64)&v18[40 * NumberOfSections];
-          v11 = v19 < v18 ? 0xC0000095 : 0;
+            v9 = (unsigned __int64)&v18[40 * NumberOfSections]
+          v11 = v19 < v18 ? 0xC0000095 : 0
           if ( v11 < 0 || v9 > v10 )
-            return (unsigned int)-1073741701;
+            return (unsigned int)-1073741701
           if ( v9 - (unsigned __int64)BaseAddress > SizeOfHeaders )
-            return (unsigned int)-1073741701;
+            return (unsigned int)-1073741701
         }
-        *a3 = v21;
+        *a3 = v21
         if ( a4 )
-          *a4 = SizeOfHeaders;
+          *a4 = SizeOfHeaders
       }
       else
       {
-        return (unsigned int)-1073741306;
+        return (unsigned int)-1073741306
       }
     }
   }
-  return (unsigned int)v11;
+  return (unsigned int)v11
 }
 
 ```
@@ -6302,110 +6292,110 @@ __int64 __fastcall CiValidateImageHeaderMapping(char *BaseAddress, ULONGLONG Siz
 ```cpp
 __int64 __fastcall CipGetCleanHeader(__int64 a1, char *a2, unsigned int a3, __int64 a4, char a5, _QWORD *a6)
 {
-  char *v6; // rdi
-  unsigned int v9; // r8d
-  char v10; // r15
-  __int64 v12; // rax
-  __int64 v14; // r14
-  __int64 v15; // rbp
-  int v16; // ebx
-  unsigned int v17; // ecx
-  _DWORD *v18; // rax
-  int v19; // eax
-  __int64 v20; // r10
-  __int64 v21; // r8
-  _DWORD *v22; // rdx
-  __int64 v23; // r9
-  int v24; // eax
-  char v26; // [rsp+20h] [rbp-48h]
-  void *Buf2; // [rsp+30h] [rbp-38h] BYREF
-  __int64 v28; // [rsp+38h] [rbp-30h] BYREF
-  DWORD v29; // [rsp+88h] [rbp+20h] BYREF
+  char *v6
+  unsigned int v9
+  char v10
+  __int64 v12
+  __int64 v14
+  __int64 v15
+  int v16
+  unsigned int v17
+  _DWORD *v18
+  int v19
+  __int64 v20
+  __int64 v21
+  _DWORD *v22
+  __int64 v23
+  int v24
+  char v26
+  void *Buf2
+  __int64 v28
+  DWORD v29
 
-  v6 = 0;
-  v28 = 0;
-  v29 = 0;
-  v9 = *(unsigned __int16 *)(a4 + 6);
-  v10 = 0;
-  Buf2 = 0;
-  v12 = *(unsigned __int16 *)(a4 + 20);
-  v14 = v12 + a4 + 24;
-  v15 = 40 * v9 + (_DWORD)v12 + (_DWORD)a4 + 24 - (_DWORD)a2;
+  v6 = 0
+  v28 = 0
+  v29 = 0
+  v9 = *(unsigned __int16 *)(a4 + 6)
+  v10 = 0
+  Buf2 = 0
+  v12 = *(unsigned __int16 *)(a4 + 20)
+  v14 = v12 + a4 + 24
+  v15 = 40 * v9 + (_DWORD)v12 + (_DWORD)a4 + 24 - (_DWORD)a2
   if ( (unsigned int)v15 < 40 * v9 )
-    return (unsigned int)-1073741675;
-  v16 = 0;
+    return (unsigned int)-1073741675
+  v16 = 0
   if ( (unsigned int)v15 > a3 )
-    return (unsigned int)-1073740760;
-  v17 = 0;
+    return (unsigned int)-1073740760
+  v17 = 0
   if ( !v9 )
-    goto LABEL_9;
-  v18 = (_DWORD *)(v14 + 20);
+    goto LABEL_9
+  v18 = (_DWORD *)(v14 + 20)
   while ( *(v18 - 1) || *v18 )
   {
-    ++v17;
-    v18 += 10;
+    ++v17
+    v18 += 10
     if ( v17 >= v9 )
-      goto LABEL_9;
+      goto LABEL_9
   }
-  v26 = a5;
-  v19 = CiReadFile(a1, 0, a3, a3, v26, &Buf2);
-  v6 = (char *)Buf2;
-  v16 = v19;
+  v26 = a5
+  v19 = CiReadFile(a1, 0, a3, a3, v26, &Buf2)
+  v6 = (char *)Buf2
+  v16 = v19
   if ( v19 < 0 )
-    goto LABEL_10;
-  v16 = CiValidateImageHeaderMapping((char *)Buf2, a3, &v28, &v29);
+    goto LABEL_10
+  v16 = CiValidateImageHeaderMapping((char *)Buf2, a3, &v28, &v29)
   if ( v16 < 0 )
-    goto LABEL_10;
+    goto LABEL_10
   if ( v29 != a3
     || memcmp(a2, v6, (unsigned int)(v14 - (_DWORD)a2))
     || memcmp(&a2[v15], &v6[v15], a3 - (unsigned int)v15) )
   {
-    goto LABEL_32;
+    goto LABEL_32
   }
-  v20 = 0;
-  v21 = *(unsigned __int16 *)(v28 + 20) + v28 + 24;
+  v20 = 0
+  v21 = *(unsigned __int16 *)(v28 + 20) + v28 + 24
   if ( !*(_WORD *)(a4 + 6) )
   {
 LABEL_9:
-    *a6 = 0;
-    goto LABEL_10;
+    *a6 = 0
+    goto LABEL_10
   }
-  v22 = (_DWORD *)(v21 + 20);
-  v23 = v14 - v21;
+  v22 = (_DWORD *)(v21 + 20)
+  v23 = v14 - v21
   while ( *(_QWORD *)(v14 + 40 * v20) == *(_QWORD *)(v21 + 40 * v20) )
   {
     if ( *(_QWORD *)(v14 + 40 * v20 + 8) != *(_QWORD *)(v21 + 40 * v20 + 8) )
-      break;
+      break
     if ( *(_DWORD *)(v14 + 40 * v20 + 16) != *(_DWORD *)(v21 + 40 * v20 + 16) )
-      break;
+      break
     if ( *(_QWORD *)(v14 + 40 * v20 + 24) != *(_QWORD *)(v21 + 40 * v20 + 24) )
-      break;
+      break
     if ( *(_QWORD *)(v14 + 40 * v20 + 32) != *(_QWORD *)(v21 + 40 * v20 + 32) )
-      break;
-    v24 = *(_DWORD *)((char *)v22 + v23);
+      break
+    v24 = *(_DWORD *)((char *)v22 + v23)
     if ( v24 )
     {
       if ( v24 != *v22 )
-        break;
+        break
     }
     if ( !*(_DWORD *)((char *)v22 + v23 - 4) && *v22 )
-      v10 = 1;
-    v20 = (unsigned int)(v20 + 1);
-    v22 += 10;
+      v10 = 1
+    v20 = (unsigned int)(v20 + 1)
+    v22 += 10
     if ( (unsigned int)v20 >= *(unsigned __int16 *)(a4 + 6) )
     {
       if ( !v10 )
-        goto LABEL_9;
-      *a6 = v6;
-      return (unsigned int)v16;
+        goto LABEL_9
+      *a6 = v6
+      return (unsigned int)v16
     }
   }
 LABEL_32:
-  v16 = -1073740760;
+  v16 = -1073740760
 LABEL_10:
   if ( v6 )
-    ExFreePoolWithTag(v6, 0x63734943u);
-  return (unsigned int)v16;
+    ExFreePoolWithTag(v6, 0x63734943u)
+  return (unsigned int)v16
 }
 
 ```
@@ -6426,175 +6416,175 @@ __int64 __fastcall CipImageGetImageHash(
         __int64 a10,
         __int64 a11)
 {
-  PVOID v13; // r15
-  signed int PageHashContextForImageMapping; // ebx
-  _DWORD *v15; // r13
-  __int16 v16; // ax
-  int v17; // esi
-  char *v18; // rdx
-  char *v19; // rbx
-  unsigned __int64 v20; // r14
-  bool v21; // sf
-  PVOID v22; // rax
-  unsigned int v23; // r15d
-  __int64 v24; // rsi
-  unsigned __int64 v25; // r8
-  unsigned __int64 v26; // rdx
-  void *v27; // rcx
-  unsigned int v28; // esi
-  _DWORD *v29; // r14
-  unsigned int i; // ecx
-  __int64 v31; // r10
-  __int64 v32; // rax
-  __int64 v33; // r8
-  unsigned int v34; // r15d
-  char *v35; // rcx
-  unsigned __int64 v36; // r9
-  unsigned __int64 v37; // rcx
-  __int64 v38; // r10
-  __int64 v39; // rcx
-  unsigned int v40; // edx
-  __int64 v41; // r8
-  unsigned int v42; // r14d
-  __int64 v43; // r10
-  PVOID v44; // rcx
-  int v45; // eax
-  unsigned int v46; // ecx
-  __int64 v47; // r9
-  unsigned int v48; // r9d
-  __int64 v49; // r8
-  __int64 v50; // rax
-  void *v51; // rcx
-  int v53; // [rsp+20h] [rbp-E8h]
-  PVOID P; // [rsp+48h] [rbp-C0h] BYREF
-  void *Src; // [rsp+50h] [rbp-B8h] BYREF
-  unsigned int v56; // [rsp+58h] [rbp-B0h]
-  unsigned int v57; // [rsp+5Ch] [rbp-ACh]
-  __int64 v58; // [rsp+60h] [rbp-A8h] BYREF
-  _DWORD *v59; // [rsp+68h] [rbp-A0h] BYREF
-  unsigned int v60; // [rsp+70h] [rbp-98h] BYREF
-  PVOID PoolWithTag; // [rsp+78h] [rbp-90h]
-  unsigned int v62; // [rsp+80h] [rbp-88h]
-  int v63; // [rsp+84h] [rbp-84h]
-  unsigned int v64; // [rsp+88h] [rbp-80h]
-  char *v65; // [rsp+90h] [rbp-78h]
-  int v66; // [rsp+98h] [rbp-70h]
-  unsigned int v67; // [rsp+9Ch] [rbp-6Ch]
-  char *v68; // [rsp+A0h] [rbp-68h]
-  PVOID v69; // [rsp+A8h] [rbp-60h] BYREF
-  __int64 v70; // [rsp+B0h] [rbp-58h]
-  unsigned __int64 v71; // [rsp+B8h] [rbp-50h]
-  __int64 v72; // [rsp+C0h] [rbp-48h]
-  __int64 v73[8]; // [rsp+C8h] [rbp-40h] BYREF
-  unsigned int Sizea; // [rsp+130h] [rbp+28h]
+  PVOID v13
+  signed int PageHashContextForImageMapping
+  _DWORD *v15
+  __int16 v16
+  int v17
+  char *v18
+  char *v19
+  unsigned __int64 v20
+  bool v21
+  PVOID v22
+  unsigned int v23
+  __int64 v24
+  unsigned __int64 v25
+  unsigned __int64 v26
+  void *v27
+  unsigned int v28
+  _DWORD *v29
+  unsigned int i
+  __int64 v31
+  __int64 v32
+  __int64 v33
+  unsigned int v34
+  char *v35
+  unsigned __int64 v36
+  unsigned __int64 v37
+  __int64 v38
+  __int64 v39
+  unsigned int v40
+  __int64 v41
+  unsigned int v42
+  __int64 v43
+  PVOID v44
+  int v45
+  unsigned int v46
+  __int64 v47
+  unsigned int v48
+  __int64 v49
+  __int64 v50
+  void *v51
+  int v53
+  PVOID P
+  void *Src
+  unsigned int v56
+  unsigned int v57
+  __int64 v58
+  _DWORD *v59
+  unsigned int v60
+  PVOID PoolWithTag
+  unsigned int v62
+  int v63
+  unsigned int v64
+  char *v65
+  int v66
+  unsigned int v67
+  char *v68
+  PVOID v69
+  __int64 v70
+  unsigned __int64 v71
+  __int64 v72
+  __int64 v73[8]
+  unsigned int Sizea
 
-  Src = 0;
-  v69 = 0;
-  v73[0] = 0;
-  LODWORD(v58) = 0;
-  v13 = 0;
-  P = 0;
-  PoolWithTag = 0;
-  v60 = 0;
-  v68 = &a4[Size];
+  Src = 0
+  v69 = 0
+  v73[0] = 0
+  LODWORD(v58) = 0
+  v13 = 0
+  P = 0
+  PoolWithTag = 0
+  v60 = 0
+  v68 = &a4[Size]
   if ( v68 < a4 )
-    goto LABEL_99;
-  *a2 = a9;
+    goto LABEL_99
+  *a2 = a9
   if ( (int)HashpInitHash(a2, a11) >= 0 )
   {
-    PageHashContextForImageMapping = CiValidateImageHeaderMapping(a4, Size, &Src, (DWORD *)&v58);
+    PageHashContextForImageMapping = CiValidateImageHeaderMapping(a4, Size, &Src, (DWORD *)&v58)
     if ( PageHashContextForImageMapping < 0 )
-      goto LABEL_97;
-    v15 = Src;
-    v16 = *((_WORD *)Src + 12);
+      goto LABEL_97
+    v15 = Src
+    v16 = *((_WORD *)Src + 12)
     if ( v16 == 523 )
     {
-      Src = (char *)Src + 88;
-      v17 = (int)a4;
-      HashpHashBytes(a2, a4, (unsigned int)((_DWORD)v15 + 88 - (_DWORD)a4));
-      v18 = (char *)(v15 + 23);
-      Src = v15 + 23;
-      v19 = (char *)(v15 + 42);
-      v65 = (char *)(v15 + 42);
-      LODWORD(v65) = v15[43];
-      v66 = (int)v65;
+      Src = (char *)Src + 88
+      v17 = (int)a4
+      HashpHashBytes(a2, a4, (unsigned int)((_DWORD)v15 + 88 - (_DWORD)a4))
+      v18 = (char *)(v15 + 23)
+      Src = v15 + 23
+      v19 = (char *)(v15 + 42)
+      v65 = (char *)(v15 + 42)
+      LODWORD(v65) = v15[43]
+      v66 = (int)v65
     }
     else
     {
       if ( v16 != 267 )
       {
-        PageHashContextForImageMapping = -1073740760;
-        goto LABEL_97;
+        PageHashContextForImageMapping = -1073740760
+        goto LABEL_97
       }
-      Src = (char *)Src + 88;
-      v17 = (int)a4;
-      HashpHashBytes(a2, a4, (unsigned int)((_DWORD)v15 + 88 - (_DWORD)a4));
-      v18 = (char *)(v15 + 23);
-      Src = v15 + 23;
-      v19 = (char *)(v15 + 38);
-      v65 = (char *)(v15 + 38);
-      LODWORD(v65) = v15[39];
-      v66 = (int)v65;
+      Src = (char *)Src + 88
+      v17 = (int)a4
+      HashpHashBytes(a2, a4, (unsigned int)((_DWORD)v15 + 88 - (_DWORD)a4))
+      v18 = (char *)(v15 + 23)
+      Src = v15 + 23
+      v19 = (char *)(v15 + 38)
+      v65 = (char *)(v15 + 38)
+      LODWORD(v65) = v15[39]
+      v66 = (int)v65
     }
-    HashpHashBytes(a2, v18, (unsigned int)((_DWORD)v19 - (_DWORD)v18));
-    v20 = (unsigned __int64)(v19 + 8);
-    Src = v19 + 8;
+    HashpHashBytes(a2, v18, (unsigned int)((_DWORD)v19 - (_DWORD)v18))
+    v20 = (unsigned __int64)(v19 + 8)
+    Src = v19 + 8
     if ( a8 && *((_WORD *)v15 + 3) )
     {
-      v21 = (int)CipGetCleanHeader(a3, a4, v58, (__int64)v15, a7, &P) < 0;
-      v22 = P;
+      v21 = (int)CipGetCleanHeader(a3, a4, v58, (__int64)v15, a7, &P) < 0
+      v22 = P
       if ( v21 )
-        v22 = 0;
-      P = v22;
+        v22 = 0
+      P = v22
     }
-    v23 = v20 - v17;
+    v23 = v20 - v17
     if ( (unsigned int)v58 < (int)v20 - v17 )
     {
-      v24 = 0xFFFFFFFFLL;
-      PageHashContextForImageMapping = -1073741675;
+      v24 = 0xFFFFFFFFLL
+      PageHashContextForImageMapping = -1073741675
     }
     else
     {
-      v24 = (unsigned int)v58 - v23;
-      PageHashContextForImageMapping = 0;
+      v24 = (unsigned int)v58 - v23
+      PageHashContextForImageMapping = 0
     }
     if ( PageHashContextForImageMapping < 0 )
     {
-      v13 = P;
-      goto LABEL_97;
+      v13 = P
+      goto LABEL_97
     }
-    v25 = v24 + v20;
+    v25 = v24 + v20
     if ( v24 + v20 < v20 )
-      v26 = -1;
+      v26 = -1
     else
-      v26 = v20 + v24;
-    PageHashContextForImageMapping = v25 < v20 ? 0xC0000095 : 0;
+      v26 = v20 + v24
+    PageHashContextForImageMapping = v25 < v20 ? 0xC0000095 : 0
     if ( v25 < v20 || v26 > (unsigned __int64)v68 )
     {
-      PageHashContextForImageMapping = -1073741701;
-      v13 = P;
-      goto LABEL_97;
+      PageHashContextForImageMapping = -1073741701
+      v13 = P
+      goto LABEL_97
     }
     if ( a1 && (*(_DWORD *)(a1 + 1816) & 0x200) != 0 )
     {
-      Src = (void *)(a1 + 2112);
-      v27 = *(void **)(a1 + 2112);
+      Src = (void *)(a1 + 2112)
+      v27 = *(void **)(a1 + 2112)
       if ( v27 )
       {
-        ExFreePoolWithTag(v27, 0x63734943u);
-        *(_QWORD *)Src = 0;
+        ExFreePoolWithTag(v27, 0x63734943u)
+        *(_QWORD *)Src = 0
       }
-      LODWORD(v59) = 0;
+      LODWORD(v59) = 0
       if ( (int)CiCheckNtHeaderForHvciCompliance((__int64)v15, (int *)&v59) >= 0
         && ((unsigned __int8)v59 & 2) == 0
         && ((unsigned __int8)v59 & 4) == 0 )
       {
-        PoolWithTag = ExAllocatePoolWithTag(PagedPool, 0x1000u, 0x63734943u);
+        PoolWithTag = ExAllocatePoolWithTag(PagedPool, 0x1000u, 0x63734943u)
         if ( !PoolWithTag )
         {
-          PageHashContextForImageMapping = -1073741801;
-          v13 = P;
-          goto LABEL_97;
+          PageHashContextForImageMapping = -1073741801
+          v13 = P
+          goto LABEL_97
         }
         PageHashContextForImageMapping = CiCreatePageHashContextForImageMapping(
                                            (_DWORD)v15,
@@ -6603,247 +6593,247 @@ __int64 __fastcall CipImageGetImageHash(
                                            Size,
                                            a6,
                                            (__int64)Src,
-                                           (__int64)&v60);
+                                           (__int64)&v60)
         if ( PageHashContextForImageMapping < 0 )
         {
-          v13 = P;
-          goto LABEL_97;
+          v13 = P
+          goto LABEL_97
         }
       }
     }
     if ( P )
     {
-      HashpHashBytes(a2, (char *)P + v23, (unsigned int)v24);
-      ExFreePoolWithTag(P, 0x63734943u);
-      v13 = 0;
-      P = 0;
+      HashpHashBytes(a2, (char *)P + v23, (unsigned int)v24)
+      ExFreePoolWithTag(P, 0x63734943u)
+      v13 = 0
+      P = 0
     }
     else
     {
-      HashpHashBytes(a2, v20, (unsigned int)v24);
-      v13 = P;
+      HashpHashBytes(a2, v20, (unsigned int)v24)
+      v13 = P
     }
-    v28 = v58;
-    v63 = v58;
+    v28 = v58
+    v63 = v58
     if ( *((_WORD *)v15 + 3) )
     {
-      v29 = (_DWORD *)((char *)v15 + *((unsigned __int16 *)v15 + 10) + 24);
-      PageHashContextForImageMapping = CiGetSortedImageSectionTable(v29, *((unsigned __int16 *)v15 + 3), &v69);
+      v29 = (_DWORD *)((char *)v15 + *((unsigned __int16 *)v15 + 10) + 24)
+      PageHashContextForImageMapping = CiGetSortedImageSectionTable(v29, *((unsigned __int16 *)v15 + 3), &v69)
       if ( PageHashContextForImageMapping < 0 )
-        goto LABEL_97;
+        goto LABEL_97
       if ( v69 )
-        v29 = v69;
-      v59 = v29;
-      for ( i = 0; ; ++i )
+        v29 = v69
+      v59 = v29
+      for ( i = 0
       {
-        v64 = i;
+        v64 = i
         if ( i >= *((unsigned __int16 *)v15 + 3) )
-          break;
-        v31 = i;
-        v72 = i;
-        v32 = 5LL * i;
-        v58 = v32;
-        v33 = (unsigned int)v29[10 * i + 4];
+          break
+        v31 = i
+        v72 = i
+        v32 = 5LL * i
+        v58 = v32
+        v33 = (unsigned int)v29[10 * i + 4]
         if ( (_DWORD)v33 )
         {
-          v34 = v29[10 * i + 5];
+          v34 = v29[10 * i + 5]
           if ( v34 )
           {
-            v35 = &a4[v29[10 * i + 3]];
-            v36 = -1;
+            v35 = &a4[v29[10 * i + 3]]
+            v36 = -1
             if ( v35 >= a4 )
-              v36 = (unsigned __int64)&a4[v29[2 * v32 + 3]];
-            Src = (void *)v36;
-            v71 = v36;
+              v36 = (unsigned __int64)&a4[v29[2 * v32 + 3]]
+            Src = (void *)v36
+            v71 = v36
             if ( v35 < a4 || v36 >= (unsigned __int64)v68 )
             {
-              PageHashContextForImageMapping = -1073741701;
-              v13 = P;
-              goto LABEL_97;
+              PageHashContextForImageMapping = -1073741701
+              v13 = P
+              goto LABEL_97
             }
-            v37 = v36 + v33;
+            v37 = v36 + v33
             if ( v36 + v33 < v36 )
             {
-              v37 = -1;
-              PageHashContextForImageMapping = -1073741675;
+              v37 = -1
+              PageHashContextForImageMapping = -1073741675
             }
             else
             {
-              PageHashContextForImageMapping = 0;
+              PageHashContextForImageMapping = 0
             }
             if ( PageHashContextForImageMapping < 0 || v37 > (unsigned __int64)v68 )
             {
-              PageHashContextForImageMapping = -1073741701;
-              v13 = P;
-              goto LABEL_97;
+              PageHashContextForImageMapping = -1073741701
+              v13 = P
+              goto LABEL_97
             }
-            v38 = 5 * v31;
-            v70 = v38;
+            v38 = 5 * v31
+            v70 = v38
             if ( v28 >= v34 )
             {
-              v40 = v34;
+              v40 = v34
               if ( v28 > v34 )
               {
-                PageHashContextForImageMapping = -1073741701;
-                v13 = P;
-                goto LABEL_97;
+                PageHashContextForImageMapping = -1073741701
+                v13 = P
+                goto LABEL_97
               }
-              v39 = v58;
+              v39 = v58
             }
             else
             {
-              LOBYTE(v53) = a7;
-              PageHashContextForImageMapping = CipImageAppendRangeOfFileToHash(a2, a3, v28, v34 - v28, v53);
+              LOBYTE(v53) = a7
+              PageHashContextForImageMapping = CipImageAppendRangeOfFileToHash(a2, a3, v28, v34 - v28, v53)
               if ( PageHashContextForImageMapping < 0 )
               {
-                v13 = P;
-                goto LABEL_97;
+                v13 = P
+                goto LABEL_97
               }
-              v39 = v58;
-              v28 = v29[2 * v58 + 5];
-              v63 = v28;
-              v34 = v28;
-              v40 = v28;
-              v36 = (unsigned __int64)Src;
-              v38 = v70;
+              v39 = v58
+              v28 = v29[2 * v58 + 5]
+              v63 = v28
+              v34 = v28
+              v40 = v28
+              v36 = (unsigned __int64)Src
+              v38 = v70
             }
-            v57 = 0;
-            v56 = 0;
-            v41 = (unsigned int)v29[2 * v38 + 4];
+            v57 = 0
+            v56 = 0
+            v41 = (unsigned int)v29[2 * v38 + 4]
             if ( (v29[2 * v39 + 9] & 0xE0000000) != 0 )
             {
-              v42 = v29[2 * v38 + 4];
-              v62 = v41;
-              v43 = (unsigned int)v59[2 * v38 + 2];
+              v42 = v29[2 * v38 + 4]
+              v62 = v41
+              v43 = (unsigned int)v59[2 * v38 + 2]
               if ( (unsigned int)v41 > (unsigned int)v43
                 && ((v36 + v41) >> 12) + (((v36 + v41) & 0xFFF) != 0) > ((v36 + v43) >> 12)
                                                                       + (((v36 + v43) & 0xFFF) != 0) )
               {
-                v42 = v43;
-                v62 = v43;
-                v57 = v34 + v43;
-                v56 = v41 - v43;
+                v42 = v43
+                v62 = v43
+                v57 = v34 + v43
+                v56 = v41 - v43
               }
-              v44 = PoolWithTag;
+              v44 = PoolWithTag
               if ( PoolWithTag )
               {
-                v67 = v34;
+                v67 = v34
                 while ( v42 )
                 {
-                  v45 = 4096;
+                  v45 = 4096
                   if ( v42 < 0x1000 )
-                    v45 = v42;
-                  Sizea = v45;
-                  memmove(v44, (const void *)v36, 0x1000u);
+                    v45 = v42
+                  Sizea = v45
+                  memmove(v44, (const void *)v36, 0x1000u)
                   PageHashContextForImageMapping = CiAddPagesToPageHashContext(
                                                      *(_QWORD *)(*(_QWORD *)(a1 + 2112) + 96LL),
                                                      *(_DWORD *)(*(_QWORD *)(a1 + 2112) + 92LL),
                                                      (unsigned int)&v60,
                                                      (_DWORD)PoolWithTag,
                                                      4096,
-                                                     v34);
+                                                     v34)
                   if ( PageHashContextForImageMapping < 0 )
                   {
-                    v13 = P;
-                    goto LABEL_97;
+                    v13 = P
+                    goto LABEL_97
                   }
-                  HashpHashBytes(a2, PoolWithTag, Sizea);
-                  v36 = (unsigned __int64)Src + Sizea;
-                  Src = (void *)v36;
-                  v71 = v36;
-                  v34 += Sizea;
-                  v67 = v34;
-                  v42 -= Sizea;
-                  v62 = v42;
-                  v44 = PoolWithTag;
+                  HashpHashBytes(a2, PoolWithTag, Sizea)
+                  v36 = (unsigned __int64)Src + Sizea
+                  Src = (void *)v36
+                  v71 = v36
+                  v34 += Sizea
+                  v67 = v34
+                  v42 -= Sizea
+                  v62 = v42
+                  v44 = PoolWithTag
                 }
               }
               else
               {
-                HashpHashBytes(a2, v36, v42);
+                HashpHashBytes(a2, v36, v42)
               }
-              v46 = v57;
-              v29 = v59;
-              v47 = v56;
+              v46 = v57
+              v29 = v59
+              v47 = v56
             }
             else
             {
-              v46 = v40;
-              v57 = v40;
-              v47 = (unsigned int)v41;
-              v56 = v41;
+              v46 = v40
+              v57 = v40
+              v47 = (unsigned int)v41
+              v56 = v41
             }
             if ( (_DWORD)v47 )
             {
-              LOBYTE(v53) = a7;
-              PageHashContextForImageMapping = CipImageAppendRangeOfFileToHash(a2, a3, v46, v47, v53);
+              LOBYTE(v53) = a7
+              PageHashContextForImageMapping = CipImageAppendRangeOfFileToHash(a2, a3, v46, v47, v53)
               if ( PageHashContextForImageMapping < 0 )
               {
-                v13 = P;
-                goto LABEL_97;
+                v13 = P
+                goto LABEL_97
               }
             }
-            v28 += v29[10 * v72 + 4];
-            v63 = v28;
-            i = v64;
+            v28 += v29[10 * v72 + 4]
+            v63 = v28
+            i = v64
           }
         }
       }
-      v13 = P;
+      v13 = P
     }
     if ( v28 <= a6 )
     {
-      v48 = a6 - v28;
+      v48 = a6 - v28
       if ( (unsigned int)v65 > a6 - v28 )
-        goto LABEL_3;
+        goto LABEL_3
       if ( (unsigned int)v65 >= v48
         || (LOBYTE(v53) = a7,
             PageHashContextForImageMapping = CipImageAppendRangeOfFileToHash(a2, a3, v28, v48 - (unsigned int)v65, v53),
             PageHashContextForImageMapping >= 0) )
       {
-        v49 = ((a6 + 7) & 0xFFFFFFF8) - a6;
+        v49 = ((a6 + 7) & 0xFFFFFFF8) - a6
         if ( (_DWORD)v49 )
-          HashpHashBytes(a2, v73, v49);
-        HashpFinalizeHash(a2, a10, v49);
+          HashpHashBytes(a2, v73, v49)
+        HashpFinalizeHash(a2, a10, v49)
         if ( a1 )
         {
-          v50 = *(_QWORD *)(a1 + 2112);
+          v50 = *(_QWORD *)(a1 + 2112)
           if ( v50 )
           {
             if ( v60 <= *(_DWORD *)(v50 + 92) )
-              *(_DWORD *)(v50 + 92) = v60;
+              *(_DWORD *)(v50 + 92) = v60
           }
         }
       }
 LABEL_97:
       if ( PageHashContextForImageMapping >= 0 )
-        goto LABEL_103;
-      goto LABEL_100;
+        goto LABEL_103
+      goto LABEL_100
     }
 LABEL_99:
-    PageHashContextForImageMapping = -1073741701;
-    goto LABEL_100;
+    PageHashContextForImageMapping = -1073741701
+    goto LABEL_100
   }
 LABEL_3:
-  PageHashContextForImageMapping = -1073740760;
+  PageHashContextForImageMapping = -1073740760
 LABEL_100:
   if ( a1 )
   {
-    v51 = *(void **)(a1 + 2112);
+    v51 = *(void **)(a1 + 2112)
     if ( v51 )
     {
-      ExFreePoolWithTag(v51, 0x63734943u);
-      *(_QWORD *)(a1 + 2112) = 0;
+      ExFreePoolWithTag(v51, 0x63734943u)
+      *(_QWORD *)(a1 + 2112) = 0
     }
   }
 LABEL_103:
   if ( PoolWithTag )
-    ExFreePoolWithTag(PoolWithTag, 0x63734943u);
+    ExFreePoolWithTag(PoolWithTag, 0x63734943u)
   if ( v69 )
-    ExFreePoolWithTag(v69, 0);
+    ExFreePoolWithTag(v69, 0)
   if ( v13 )
-    ExFreePoolWithTag(v13, 0x63734943u);
-  return (unsigned int)PageHashContextForImageMapping;
+    ExFreePoolWithTag(v13, 0x63734943u)
+  return (unsigned int)PageHashContextForImageMapping
 }
 
 ```
@@ -6860,62 +6850,62 @@ __int64 __fastcall CiAuditImageForHvci(
         PVOID BaseAddress,
         ULONGLONG Size)
 {
-  int v9; // eax
-  int v10; // eax
-  int v11; // ebx
-  int v12; // eax
-  int v13; // edx
-  int v14; // ecx
-  __int64 result; // rax
-  ULONGLONG v16; // [rsp+20h] [rbp-C8h]
-  int v17; // [rsp+38h] [rbp-B0h]
-  int v18; // [rsp+40h] [rbp-A8h]
-  int v19; // [rsp+60h] [rbp-88h] BYREF
-  union _LARGE_INTEGER FileSize; // [rsp+68h] [rbp-80h] BYREF
-  PSLIST_ENTRY ListEntry; // [rsp+70h] [rbp-78h] BYREF
-  __int64 v22; // [rsp+78h] [rbp-70h] BYREF
-  __int64 v23; // [rsp+80h] [rbp-68h]
-  __int64 v24; // [rsp+90h] [rbp-58h]
-  _OWORD v25[3]; // [rsp+98h] [rbp-50h] BYREF
+  int v9
+  int v10
+  int v11
+  int v12
+  int v13
+  int v14
+  __int64 result
+  ULONGLONG v16
+  int v17
+  int v18
+  int v19
+  union _LARGE_INTEGER FileSize
+  PSLIST_ENTRY ListEntry
+  __int64 v22
+  __int64 v23
+  __int64 v24
+  _OWORD v25[3]
 
-  ListEntry = 0;
-  FileSize.QuadPart = 0;
-  v22 = 0;
-  v23 = 0;
-  v24 = 0;
+  ListEntry = 0
+  FileSize.QuadPart = 0
+  v22 = 0
+  v23 = 0
+  v24 = 0
   if ( (int)CiValidateImageHeaderMapping(BaseAddress, (unsigned int)Size) >= 0
     && FsRtlGetFileSize(FileObject, &FileSize) >= 0 )
   {
-    v9 = 0;
+    v9 = 0
     if ( FileSize.HighPart )
-      v9 = 2048;
-    v19 = v9;
+      v9 = 2048
+    v19 = v9
     if ( (int)CiCheckNtHeaderForHvciCompliance(v22, &v19) >= 0 )
     {
-      memset(v25, 0, sizeof(v25));
-      v10 = HashpParsePEHeader((_DWORD)BaseAddress, FileSize.LowPart, Size, (unsigned int)&v22, (__int64)v25, 0, 0);
-      v11 = v19;
+      memset(v25, 0, sizeof(v25))
+      v10 = HashpParsePEHeader((_DWORD)BaseAddress, FileSize.LowPart, Size, (unsigned int)&v22, (__int64)v25, 0, 0)
+      v11 = v19
       if ( v10 < 0 )
       {
-        v11 = v19 | 0x800;
-        v19 |= 0x800u;
+        v11 = v19 | 0x800
+        v19 |= 0x800u
       }
       if ( (a2 & 5) == 0 )
       {
-        v11 &= ~1u;
-        v19 = v11;
+        v11 &= ~1u
+        v19 = v11
       }
-      v12 = CiCreateHvciComplianceStatusCode(&v19);
+      v12 = CiCreateHvciComplianceStatusCode(&v19)
       if ( v12 >= 0 )
       {
         if ( !v13 )
-          goto LABEL_30;
+          goto LABEL_30
         if ( (g_CiDeveloperMode & 0x100) == 0 )
-          goto LABEL_30;
+          goto LABEL_30
         if ( (g_CiOptions & 0x4000) == 0 )
-          goto LABEL_30;
-        a2 |= 0x40000000u;
-        LODWORD(v16) = Size;
+          goto LABEL_30
+        a2 |= 0x40000000u
+        LODWORD(v16) = Size
         if ( (int)CipAllocateValidationContext(
                     a2,
                     *(_DWORD *)(a1 + 1816),
@@ -6926,43 +6916,43 @@ __int64 __fastcall CiAuditImageForHvci(
                     0,
                     a4,
                     (__int64)&ListEntry) < 0 )
-          goto LABEL_30;
-        LOBYTE(v18) = 0;
-        LOBYTE(v17) = a3;
-        LODWORD(a1) = (_DWORD)ListEntry;
-        v12 = CipValidateImageHash(&CipValidateFileHash, ListEntry, FileObject, a4, BaseAddress, Size, a2, v17, v18);
+          goto LABEL_30
+        LOBYTE(v18) = 0
+        LOBYTE(v17) = a3
+        LODWORD(a1) = (_DWORD)ListEntry
+        v12 = CipValidateImageHash(&CipValidateFileHash, ListEntry, FileObject, a4, BaseAddress, Size, a2, v17, v18)
         if ( v12 >= 0 )
-          goto LABEL_30;
+          goto LABEL_30
         if ( v12 == -1073741746 )
         {
-          v11 |= 8u;
+          v11 |= 8u
         }
         else if ( v12 == -1073741280 )
         {
-          v11 |= 2u;
+          v11 |= 2u
         }
         else
         {
-          v11 |= 0x1000u;
+          v11 |= 0x1000u
         }
-        v19 = v11;
+        v19 = v11
       }
-      LOBYTE(v14) = 1;
-      CiHvciLogIncompatibility(v14, a1, (_DWORD)FileObject, a2, a4, (__int64)&v19, v12);
+      LOBYTE(v14) = 1
+      CiHvciLogIncompatibility(v14, a1, (_DWORD)FileObject, a2, a4, (__int64)&v19, v12)
       if ( (a2 & 5) != 0 && (g_CiDeveloperMode & 0x100) != 0 )
       {
         if ( (v11 & 2) != 0 || (v11 & 4) != 0 )
-          CipQueryAndLogFileNameForEvent(FileObject, &CiHvciUnalignedSection);
+          CipQueryAndLogFileNameForEvent(FileObject, &CiHvciUnalignedSection)
         if ( (v11 & 8) != 0 || (v11 & 0x10) != 0 )
-          CipQueryAndLogFileNameForEvent(FileObject, &CiWritableExecutableSection);
+          CipQueryAndLogFileNameForEvent(FileObject, &CiWritableExecutableSection)
       }
     }
   }
 LABEL_30:
-  result = CiReleaseContext(v23);
+  result = CiReleaseContext(v23)
   if ( ListEntry )
-    return CiFreeValidationContext(ListEntry);
-  return result;
+    return CiFreeValidationContext(ListEntry)
+  return result
 }
 
 ```
@@ -6972,41 +6962,40 @@ LABEL_30:
 ```cpp
 __int64 __fastcall CiHvciSetValidationContextForHvci(__int64 a1, int a2, __int64 a3, char *a4, ULONGLONG Size)
 {
-  struct _KPROCESS *v5; // r15
-  int HvciComplianceStatusCode; // ebx
-  __int64 result; // rax
-  __int64 v12; // [rsp+40h] [rbp-28h] BYREF
-  __int64 v13; // [rsp+48h] [rbp-20h] BYREF
-  int v14; // [rsp+70h] [rbp+8h] BYREF
+  struct _KPROCESS *v5
+  int HvciComplianceStatusCode
+  __int64 result
+  __int64 v12
+  __int64 v13
+  int v14
 
-  v5 = *(struct _KPROCESS **)(a1 + 2080);
-  v13 = 0;
-  v14 = 0;
-  v12 = 0;
-  HvciComplianceStatusCode = CiValidateImageHeaderMapping(a4, (unsigned int)Size, &v12, 0);
+  v5 = *(struct _KPROCESS **)(a1 + 2080)
+  v13 = 0
+  v14 = 0
+  v12 = 0
+  HvciComplianceStatusCode = CiValidateImageHeaderMapping(a4, (unsigned int)Size, &v12, 0)
   if ( HvciComplianceStatusCode >= 0
     && (HvciComplianceStatusCode = CiCheckNtHeaderForHvciCompliance(v12, &v14), HvciComplianceStatusCode >= 0)
     && (HvciComplianceStatusCode = CiCreateHvciComplianceStatusCode((unsigned int *)&v14), HvciComplianceStatusCode >= 0) )
   {
     if ( *(_DWORD *)(a1 + 1480) == 2 && (a2 & 5) == 0 && (g_CiPolicyState & 0x20000) != 0 )
-      *(_DWORD *)(a1 + 1480) = 1;
-    result = CiAllocateImageDataForHvci(a3, a4, (unsigned int)Size, &v13);
+      *(_DWORD *)(a1 + 1480) = 1
+    result = CiAllocateImageDataForHvci(a3, a4, (unsigned int)Size, &v13)
     if ( (int)result >= 0 )
     {
-      *(_QWORD *)(a1 + 1824) = v13;
-      *(_QWORD *)(a1 + 1800) = g_HvciImageValidateInterface;
+      *(_QWORD *)(a1 + 1824) = v13
+      *(_QWORD *)(a1 + 1800) = g_HvciImageValidateInterface
     }
   }
   else
   {
-    CiHvciLogIncompatibility(0, 0, a3, a2, v5, &v14, HvciComplianceStatusCode);
-    return (unsigned int)HvciComplianceStatusCode;
+    CiHvciLogIncompatibility(0, 0, a3, a2, v5, &v14, HvciComplianceStatusCode)
+    return (unsigned int)HvciComplianceStatusCode
   }
-  return result;
+  return result
 }
 
 ```
-
 
 
 --- Callees (Functions this one calls) ---
@@ -7015,88 +7004,87 @@ __int64 __fastcall CiHvciSetValidationContextForHvci(__int64 a1, int a2, __int64
 ```cpp
 __int64 __fastcall CiValidateImageHeaderMapping(char *BaseAddress, ULONGLONG Size, _QWORD *a3, DWORD *a4)
 {
-  DWORD v6; // r15d
-  char *v8; // rax
-  unsigned __int64 v9; // rbx
-  unsigned __int64 v10; // rsi
-  NTSTATUS v11; // ecx
-  __int64 SizeOfOptionalHeader; // r9
-  char *v13; // rax
-  unsigned __int64 v14; // r11
-  WORD Magic; // ax
-  DWORD SizeOfHeaders; // edx
-  int NumberOfSections; // eax
-  char *v18; // r10
-  char *v19; // rcx
-  PIMAGE_NT_HEADERS v21; // [rsp+60h] [rbp+8h] BYREF
+  DWORD v6
+  char *v8
+  unsigned __int64 v9
+  unsigned __int64 v10
+  NTSTATUS v11
+  __int64 SizeOfOptionalHeader
+  char *v13
+  unsigned __int64 v14
+  WORD Magic
+  DWORD SizeOfHeaders
+  int NumberOfSections
+  char *v18
+  char *v19
+  PIMAGE_NT_HEADERS v21
 
-  v6 = Size;
-  v21 = 0;
-  v8 = &BaseAddress[(unsigned int)Size];
-  v9 = -1;
-  v10 = -1;
+  v6 = Size
+  v21 = 0
+  v8 = &BaseAddress[(unsigned int)Size]
+  v9 = -1
+  v10 = -1
   if ( v8 >= BaseAddress )
-    v10 = (unsigned __int64)&BaseAddress[(unsigned int)Size];
-  v11 = v8 < BaseAddress ? 0xC0000095 : 0;
+    v10 = (unsigned __int64)&BaseAddress[(unsigned int)Size]
+  v11 = v8 < BaseAddress ? 0xC0000095 : 0
   if ( v8 >= BaseAddress )
   {
-    v11 = RtlImageNtHeaderEx(0, BaseAddress, (unsigned int)Size, &v21);
+    v11 = RtlImageNtHeaderEx(0, BaseAddress, (unsigned int)Size, &v21)
     if ( v11 >= 0 )
     {
-      SizeOfOptionalHeader = v21->FileHeader.SizeOfOptionalHeader;
-      v13 = (char *)&v21->OptionalHeader + SizeOfOptionalHeader;
-      v14 = -1;
+      SizeOfOptionalHeader = v21->FileHeader.SizeOfOptionalHeader
+      v13 = (char *)&v21->OptionalHeader + SizeOfOptionalHeader
+      v14 = -1
       if ( v13 >= (char *)&v21->OptionalHeader )
-        v14 = (unsigned __int64)&v21->OptionalHeader + SizeOfOptionalHeader;
-      v11 = v13 < (char *)&v21->OptionalHeader ? 0xC0000095 : 0;
+        v14 = (unsigned __int64)&v21->OptionalHeader + SizeOfOptionalHeader
+      v11 = v13 < (char *)&v21->OptionalHeader ? 0xC0000095 : 0
       if ( v13 < (char *)&v21->OptionalHeader || v14 > v10 || (unsigned int)SizeOfOptionalHeader < 0x1A )
-        return (unsigned int)-1073741701;
-      Magic = v21->OptionalHeader.Magic;
+        return (unsigned int)-1073741701
+      Magic = v21->OptionalHeader.Magic
       if ( Magic == 523 )
       {
         if ( (unsigned __int16)SizeOfOptionalHeader < 0xB0u )
-          return (unsigned int)-1073741701;
+          return (unsigned int)-1073741701
       }
       else
       {
         if ( Magic != 267 )
-          return (unsigned int)-1073741701;
+          return (unsigned int)-1073741701
         if ( (unsigned __int16)SizeOfOptionalHeader < 0xA0u )
-          return (unsigned int)-1073741701;
+          return (unsigned int)-1073741701
       }
-      SizeOfHeaders = v21->OptionalHeader.SizeOfHeaders;
+      SizeOfHeaders = v21->OptionalHeader.SizeOfHeaders
       if ( SizeOfHeaders <= v6 )
       {
-        NumberOfSections = v21->FileHeader.NumberOfSections;
+        NumberOfSections = v21->FileHeader.NumberOfSections
         if ( (_WORD)NumberOfSections )
         {
-          v18 = (char *)&v21->OptionalHeader + SizeOfOptionalHeader;
+          v18 = (char *)&v21->OptionalHeader + SizeOfOptionalHeader
           if ( (unsigned __int64)v18 < v14 )
-            return (unsigned int)-1073741701;
-          v19 = &v18[40 * NumberOfSections];
+            return (unsigned int)-1073741701
+          v19 = &v18[40 * NumberOfSections]
           if ( v19 >= v18 )
-            v9 = (unsigned __int64)&v18[40 * NumberOfSections];
-          v11 = v19 < v18 ? 0xC0000095 : 0;
+            v9 = (unsigned __int64)&v18[40 * NumberOfSections]
+          v11 = v19 < v18 ? 0xC0000095 : 0
           if ( v11 < 0 || v9 > v10 )
-            return (unsigned int)-1073741701;
+            return (unsigned int)-1073741701
           if ( v9 - (unsigned __int64)BaseAddress > SizeOfHeaders )
-            return (unsigned int)-1073741701;
+            return (unsigned int)-1073741701
         }
-        *a3 = v21;
+        *a3 = v21
         if ( a4 )
-          *a4 = SizeOfHeaders;
+          *a4 = SizeOfHeaders
       }
       else
       {
-        return (unsigned int)-1073741306;
+        return (unsigned int)-1073741306
       }
     }
   }
-  return (unsigned int)v11;
+  return (unsigned int)v11
 }
 
 ```
-
 
 
 --- Struct Member Usage & Data Cross-References ---
@@ -7104,6 +7092,3 @@ __int64 __fastcall CiValidateImageHeaderMapping(char *BaseAddress, ULONGLONG Siz
 
 --- Decompiler Warnings ---
 // No decompiler warnings.
-
-
-

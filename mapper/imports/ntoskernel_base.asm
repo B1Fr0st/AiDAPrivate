@@ -8,14 +8,14 @@ and     rax, [rcx+4h]
 jmp      while_start
 search_mem_start:
 add     rax, 0FFFFFFFFFFFFF000h
-while_start: 
+while_start:
 xor     ecx, ecx
 jmp      search_mem_check
-search_mem_next: 
+search_mem_next:
 add     rcx, 1
 cmp     rcx, 0FF9h
 jz       search_mem_start
-search_mem_check:  
+search_mem_check:
 cmp     byte ptr[rax+rcx], 48h
 jnz     search_mem_next
 cmp     byte ptr[rax+rcx+1], 8Dh
@@ -36,6 +36,6 @@ add     r8d, eax
 lea     eax,[rcx+r8]
 add     eax, 7
 or      rax, rdx
-ret     
+ret
 get_nt_base ENDP
 END

