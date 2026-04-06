@@ -681,7 +681,10 @@ static std::string protobuf_to_text(const std::vector<protobuf_field>& fields, i
                 out += std::to_string(f.varint_value);
 
                 {
-                    int64_t zigzag = static_cast<int64_t>((f.varint_value >> 1) ^ -(f.varint_value & 1));
+                    // WHY: -(uint64_t) triggers MSVC C4146 (unary minus on unsigned).
+                    // uint64_t(0)-(x) is identical bit-pattern (0 or 0xFFFFFFFFFFFFFFFF)
+                    // via well-defined unsigned wraparound — no truncation, no warning.
+                    int64_t zigzag = static_cast<int64_t>((f.varint_value >> 1) ^ (uint64_t(0) - (f.varint_value & 1)));
                     if (zigzag != static_cast<int64_t>(f.varint_value))
                         out += " (zigzag: " + std::to_string(zigzag) + ")";
                 }

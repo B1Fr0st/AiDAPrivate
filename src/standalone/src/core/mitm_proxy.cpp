@@ -15,6 +15,16 @@
 #include <openssl/err.h>
 #include <openssl/bio.h>
 
+// WHY: On Windows, OpenSSL's uplink mechanism bridges its internal file-I/O calls
+// back into the application's C runtime (e.g. _iob, _fileno).  Without this
+// compilation unit providing the applink table, any SSL_CTX_new() call causes
+// OPENSSL_Uplink(NULL,08) → "OPENSSL_Uplink: no OPENSSL_Applink" FATAL crash.
+// This file is the correct single home for applink.c because it is the first
+// translation unit to call SSL_CTX_new() (via cert_generator and handle_tls_connection).
+extern "C" {
+#include <openssl/applink.c>
+}
+
 #include <algorithm>
 #include <cstring>
 #include <string>
