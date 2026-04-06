@@ -49,7 +49,6 @@ namespace dll_protection {
         if (pid == 0 || va == 0 || size == 0)
             return 0;
 
-
         UINT64 dtb = 0;
         for (int i = 0; i < DTB_CACHE_SIZE; i++) {
             if (g_dtb_cache[i].valid && g_dtb_cache[i].pid == pid) {
@@ -73,60 +72,14 @@ namespace dll_protection {
             if (to_read > remaining)
                 to_read = remaining;
 
-
-            UINT64 phys = 0;
-            {
-                UINT64 pml4e_addr = (dtb & ~0xFFFULL) | (((cursor >> 39) & 0x1FF) << 3);
-                UINT64 pml4e = 0;
-                PHYSICAL_ADDRESS pa;
-                pa.QuadPart = (LONGLONG)pml4e_addr;
-                PVOID mapped = MmMapIoSpace(pa, sizeof(UINT64), MmNonCached);
-                if (!mapped) return 0;
-                pml4e = *(volatile UINT64*)mapped;
-                MmUnmapIoSpace(mapped, sizeof(UINT64));
-                if (!(pml4e & 1)) return 0;
-
-                UINT64 pdpte_addr = (pml4e & ~0xFFFULL) | (((cursor >> 30) & 0x1FF) << 3);
-                pa.QuadPart = (LONGLONG)pdpte_addr;
-                mapped = MmMapIoSpace(pa, sizeof(UINT64), MmNonCached);
-                if (!mapped) return 0;
-                UINT64 pdpte = *(volatile UINT64*)mapped;
-                MmUnmapIoSpace(mapped, sizeof(UINT64));
-                if (!(pdpte & 1)) return 0;
-                if (pdpte & 0x80) {
-                    phys = (pdpte & 0xFFFFFFC0000000ULL) | (cursor & 0x3FFFFFFFULL);
-                } else {
-                    UINT64 pde_addr = (pdpte & ~0xFFFULL) | (((cursor >> 21) & 0x1FF) << 3);
-                    pa.QuadPart = (LONGLONG)pde_addr;
-                    mapped = MmMapIoSpace(pa, sizeof(UINT64), MmNonCached);
-                    if (!mapped) return 0;
-                    UINT64 pde = *(volatile UINT64*)mapped;
-                    MmUnmapIoSpace(mapped, sizeof(UINT64));
-                    if (!(pde & 1)) return 0;
-                    if (pde & 0x80) {
-                        phys = (pde & 0xFFFFFFFE00000ULL) | (cursor & 0x1FFFFFULL);
-                    } else {
-                        UINT64 pte_addr = (pde & ~0xFFFULL) | (((cursor >> 12) & 0x1FF) << 3);
-                        pa.QuadPart = (LONGLONG)pte_addr;
-                        mapped = MmMapIoSpace(pa, sizeof(UINT64), MmNonCached);
-                        if (!mapped) return 0;
-                        UINT64 pte = *(volatile UINT64*)mapped;
-                        MmUnmapIoSpace(mapped, sizeof(UINT64));
-                        if (!(pte & 1)) return 0;
-                        phys = (pte & ~0xFFFULL) | (cursor & 0xFFFULL);
-                    }
-                }
-            }
-
-
-            PHYSICAL_ADDRESS read_pa;
-            read_pa.QuadPart = (LONGLONG)phys;
-            PVOID mapped = MmMapIoSpace(read_pa, to_read, MmNonCached);
-            if (!mapped)
+            UINT64 phys = strong::translate_virtual_address(dtb, cursor);
+            if (phys == 0)
                 return 0;
-            RtlCopyMemory(page_buf, mapped, to_read);
-            MmUnmapIoSpace(mapped, to_read);
 
+            SIZE_T bytes_read = 0;
+            NTSTATUS st = strong::read_physical(phys, page_buf, to_read, &bytes_read);
+            if (!NT_SUCCESS(st) || bytes_read != to_read)
+                return 0;
 
             for (UINT32 i = 0; i < to_read; i++) {
                 h1 = _mm_crc32_u8((UINT32)h1, page_buf[i]);
@@ -167,63 +120,22 @@ namespace dll_protection {
         if (peb_addr == 0)
             return FALSE;
 
-
         UINT8 being_debugged = 0;
         UINT32 nt_global_flag = 0;
 
-
         auto read_byte_physical = [&](UINT64 va) -> UINT8 {
-            UINT64 phys = 0;
-            UINT64 pml4e_addr = (dtb & ~0xFFFULL) | (((va >> 39) & 0x1FF) << 3);
-            PHYSICAL_ADDRESS pa;
-            pa.QuadPart = (LONGLONG)pml4e_addr;
-            PVOID mapped = MmMapIoSpace(pa, sizeof(UINT64), MmNonCached);
-            if (!mapped) return 0;
-            UINT64 pml4e = *(volatile UINT64*)mapped;
-            MmUnmapIoSpace(mapped, sizeof(UINT64));
-            if (!(pml4e & 1)) return 0;
-
-            UINT64 pdpte_addr = (pml4e & ~0xFFFULL) | (((va >> 30) & 0x1FF) << 3);
-            pa.QuadPart = (LONGLONG)pdpte_addr;
-            mapped = MmMapIoSpace(pa, sizeof(UINT64), MmNonCached);
-            if (!mapped) return 0;
-            UINT64 pdpte = *(volatile UINT64*)mapped;
-            MmUnmapIoSpace(mapped, sizeof(UINT64));
-            if (!(pdpte & 1)) return 0;
-            if (pdpte & 0x80) {
-                phys = (pdpte & 0xFFFFFFC0000000ULL) | (va & 0x3FFFFFFFULL);
-            } else {
-                UINT64 pde_addr = (pdpte & ~0xFFFULL) | (((va >> 21) & 0x1FF) << 3);
-                pa.QuadPart = (LONGLONG)pde_addr;
-                mapped = MmMapIoSpace(pa, sizeof(UINT64), MmNonCached);
-                if (!mapped) return 0;
-                UINT64 pde = *(volatile UINT64*)mapped;
-                MmUnmapIoSpace(mapped, sizeof(UINT64));
-                if (!(pde & 1)) return 0;
-                if (pde & 0x80) {
-                    phys = (pde & 0xFFFFFFFE00000ULL) | (va & 0x1FFFFFULL);
-                } else {
-                    UINT64 pte_addr = (pde & ~0xFFFULL) | (((va >> 12) & 0x1FF) << 3);
-                    pa.QuadPart = (LONGLONG)pte_addr;
-                    mapped = MmMapIoSpace(pa, sizeof(UINT64), MmNonCached);
-                    if (!mapped) return 0;
-                    UINT64 pte = *(volatile UINT64*)mapped;
-                    MmUnmapIoSpace(mapped, sizeof(UINT64));
-                    if (!(pte & 1)) return 0;
-                    phys = (pte & ~0xFFFULL) | (va & 0xFFFULL);
-                }
-            }
-
-            pa.QuadPart = (LONGLONG)phys;
-            mapped = MmMapIoSpace(pa, 1, MmNonCached);
-            if (!mapped) return 0;
-            UINT8 val = *(volatile UINT8*)mapped;
-            MmUnmapIoSpace(mapped, 1);
+            UINT64 phys = strong::translate_virtual_address(dtb, va);
+            if (phys == 0)
+                return 0;
+            UINT8 val = 0;
+            SIZE_T bytes_read = 0;
+            NTSTATUS s = strong::read_physical(phys, &val, sizeof(val), &bytes_read);
+            if (!NT_SUCCESS(s) || bytes_read != sizeof(val))
+                return 0;
             return val;
         };
 
         being_debugged = read_byte_physical(peb_addr + 0x02);
-
 
         UINT8 ngf_bytes[4];
         for (int b = 0; b < 4; b++)

@@ -1301,6 +1301,254 @@ namespace SignedMemory {
         printf("[+] Certificate transplanted to target driver (%s)\n", isEV ? "EV" : "standard");
         return TRUE;
     }
+
+    // ---- Self-signing via SignerSign (mssign32.dll) ----
+    // Creates a self-signed cert cloning the donor's publisher name, then
+    // Authenticode-signs the target so the hash in the PKCS#7 matches
+    // the actual file content — making it structurally valid.
+
+#ifndef CALG_SHA_256
+#define CALG_SHA_256 0x0000800c
+#endif
+
+    // SignerSign API types (stable undocumented ABI, present in mssign32.dll on Win10+)
+    struct SS_FILE_INFO      { DWORD cbSize; LPCWSTR pwszFileName; HANDLE hFile; };
+    struct SS_SUBJECT_INFO   { DWORD cbSize; DWORD* pdwIndex; DWORD dwSubjectChoice; SS_FILE_INFO* pFileInfo; };
+    struct SS_CERT_STORE_INFO{ DWORD cbSize; PCCERT_CONTEXT pSigningCert; DWORD dwCertPolicy; HCERTSTORE hCertStore; };
+    struct SS_CERT           { DWORD cbSize; DWORD dwCertChoice; SS_CERT_STORE_INFO* pStoreInfo; HWND hwnd; };
+    struct SS_SIGNATURE_INFO { DWORD cbSize; ALG_ID algidHash; DWORD dwAttrChoice; void* pAttrAuthcode;
+                               PCRYPT_ATTRIBUTES psAuth; PCRYPT_ATTRIBUTES psUnauth; };
+
+    typedef HRESULT(WINAPI* pfnSignerSign)(SS_SUBJECT_INFO*, SS_CERT*, SS_SIGNATURE_INFO*,
+                                           void*, LPCWSTR, PCRYPT_ATTRIBUTES, LPVOID);
+
+    BOOL SelfSignDriver(LPCWSTR targetDriverPath) {
+        printf("[*] Self-signing driver with Authenticode...\n");
+
+        HMODULE hMssign = LoadLibraryW(L"mssign32.dll");
+        if (!hMssign) {
+            printf("[-] mssign32.dll not available\n");
+            return FALSE;
+        }
+
+        auto pSign = (pfnSignerSign)GetProcAddress(hMssign, "SignerSign");
+        if (!pSign) {
+            printf("[-] SignerSign export not found\n");
+            FreeLibrary(hMssign);
+            return FALSE;
+        }
+
+        // --- Find a signed donor to clone its publisher identity ---
+        WCHAR donorPath[MAX_PATH] = {};
+        BOOL isEV = FALSE;
+        CERT_NAME_BLOB subjectBlob = {};
+        BYTE* pAllocSubject = nullptr;
+
+        if (FindSignedDonorDriver(donorPath, MAX_PATH, &isEV) && donorPath[0]) {
+            printf("[+] Donor: %ws (%s)\n", donorPath, isEV ? "EV" : "standard");
+
+            WINTRUST_FILE_INFO wfi = {};
+            wfi.cbStruct = sizeof(wfi);
+            wfi.pcwszFilePath = donorPath;
+
+            GUID actionGUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+            WINTRUST_DATA wtd = {};
+            wtd.cbStruct = sizeof(wtd);
+            wtd.dwUIChoice = WTD_UI_NONE;
+            wtd.fdwRevocationChecks = WTD_REVOKE_NONE;
+            wtd.dwUnionChoice = WTD_CHOICE_FILE;
+            wtd.pFile = &wfi;
+            wtd.dwStateAction = WTD_STATEACTION_VERIFY;
+            wtd.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+            WinVerifyTrust(NULL, &actionGUID, &wtd);
+
+            if (wtd.hWVTStateData) {
+                CRYPT_PROVIDER_DATA* prov = WTHelperProvDataFromStateData(wtd.hWVTStateData);
+                if (prov) {
+                    CRYPT_PROVIDER_SGNR* sgnr = WTHelperGetProvSignerFromChain(prov, 0, FALSE, 0);
+                    if (sgnr && sgnr->pChainContext && sgnr->pChainContext->cChain > 0) {
+                        CERT_SIMPLE_CHAIN* chain = sgnr->pChainContext->rgpChain[0];
+                        if (chain->cElement > 0) {
+                            PCCERT_CONTEXT donorCert = chain->rgpElement[0]->pCertContext;
+                            char displayName[256] = {};
+                            CertNameToStrA(X509_ASN_ENCODING, &donorCert->pCertInfo->Subject,
+                                           CERT_X500_NAME_STR, displayName, sizeof(displayName));
+                            printf("[+] Cloning publisher: %s\n", displayName);
+
+                            DWORD cb = donorCert->pCertInfo->Subject.cbData;
+                            pAllocSubject = (BYTE*)LocalAlloc(LPTR, cb);
+                            if (pAllocSubject) {
+                                memcpy(pAllocSubject, donorCert->pCertInfo->Subject.pbData, cb);
+                                subjectBlob.pbData = pAllocSubject;
+                                subjectBlob.cbData = cb;
+                            }
+                        }
+                    }
+                }
+            }
+
+            wtd.dwStateAction = WTD_STATEACTION_CLOSE;
+            WinVerifyTrust(NULL, &actionGUID, &wtd);
+        }
+
+        // Fallback subject if donor extraction failed
+        if (!subjectBlob.pbData) {
+            LPCSTR fallback = "CN=Microsoft Windows, O=Microsoft Corporation";
+            DWORD cbEnc = 0;
+            CertStrToNameA(X509_ASN_ENCODING, fallback, CERT_X500_NAME_STR, NULL, NULL, &cbEnc, NULL);
+            if (cbEnc > 0) {
+                pAllocSubject = (BYTE*)LocalAlloc(LPTR, cbEnc);
+                if (pAllocSubject) {
+                    CertStrToNameA(X509_ASN_ENCODING, fallback, CERT_X500_NAME_STR, NULL, pAllocSubject, &cbEnc, NULL);
+                    subjectBlob.pbData = pAllocSubject;
+                    subjectBlob.cbData = cbEnc;
+                }
+            }
+        }
+
+        if (!subjectBlob.pbData) {
+            FreeLibrary(hMssign);
+            return FALSE;
+        }
+
+        // --- Generate RSA-2048 key pair in a temporary CSP container ---
+        WCHAR container[64];
+        swprintf_s(container, L"WM_%llu", __rdtsc());
+
+        HCRYPTPROV hProv = 0;
+        if (!CryptAcquireContextW(&hProv, container, NULL, PROV_RSA_FULL, CRYPT_NEWKEYSET)) {
+            printf("[-] CryptAcquireContext: %lu\n", GetLastError());
+            LocalFree(pAllocSubject);
+            FreeLibrary(hMssign);
+            return FALSE;
+        }
+
+        HCRYPTKEY hKey = 0;
+        if (!CryptGenKey(hProv, AT_SIGNATURE, (2048 << 16) | CRYPT_EXPORTABLE, &hKey)) {
+            printf("[-] CryptGenKey: %lu\n", GetLastError());
+            CryptReleaseContext(hProv, 0);
+            { HCRYPTPROV hDel = 0; CryptAcquireContextW(&hDel, container, NULL, PROV_RSA_FULL, CRYPT_DELETEKEYSET); }
+            LocalFree(pAllocSubject);
+            FreeLibrary(hMssign);
+            return FALSE;
+        }
+
+        // --- Create self-signed cert with code-signing EKU ---
+        char ekuOidBuf[] = "1.3.6.1.5.5.7.3.3"; // szOID_PKIX_KP_CODE_SIGNING
+        LPSTR ekuOid = ekuOidBuf;
+        CERT_ENHKEY_USAGE enhKU = {};
+        enhKU.cUsageIdentifier = 1;
+        enhKU.rgpszUsageIdentifier = &ekuOid;
+
+        BYTE ekuEncoded[256] = {};
+        DWORD ekuLen = sizeof(ekuEncoded);
+        if (!CryptEncodeObjectEx(X509_ASN_ENCODING, X509_ENHANCED_KEY_USAGE, &enhKU, 0, NULL, ekuEncoded, &ekuLen)) {
+            CryptDestroyKey(hKey);
+            CryptReleaseContext(hProv, 0);
+            { HCRYPTPROV hDel = 0; CryptAcquireContextW(&hDel, container, NULL, PROV_RSA_FULL, CRYPT_DELETEKEYSET); }
+            LocalFree(pAllocSubject);
+            FreeLibrary(hMssign);
+            return FALSE;
+        }
+
+        char ekuExtOid[] = "2.5.29.37"; // szOID_ENHANCED_KEY_USAGE
+        CERT_EXTENSION ext = {};
+        ext.pszObjId = ekuExtOid;
+        ext.fCritical = FALSE;
+        ext.Value.cbData = ekuLen;
+        ext.Value.pbData = ekuEncoded;
+
+        CERT_EXTENSIONS exts = {};
+        exts.cExtension = 1;
+        exts.rgExtension = &ext;
+
+        CRYPT_KEY_PROV_INFO kpi = {};
+        kpi.pwszContainerName = container;
+        kpi.dwProvType = PROV_RSA_FULL;
+        kpi.dwKeySpec = AT_SIGNATURE;
+
+        SYSTEMTIME stEnd = {};
+        GetSystemTime(&stEnd);
+        stEnd.wYear += 10;
+
+        PCCERT_CONTEXT pCert = CertCreateSelfSignCertificate(
+            hProv, &subjectBlob, 0, &kpi, NULL, NULL, &stEnd, &exts);
+
+        LocalFree(pAllocSubject);
+        pAllocSubject = nullptr;
+
+        if (!pCert) {
+            printf("[-] CertCreateSelfSignCertificate: %lu\n", GetLastError());
+            CryptDestroyKey(hKey);
+            CryptReleaseContext(hProv, 0);
+            { HCRYPTPROV hDel = 0; CryptAcquireContextW(&hDel, container, NULL, PROV_RSA_FULL, CRYPT_DELETEKEYSET); }
+            FreeLibrary(hMssign);
+            return FALSE;
+        }
+
+        // --- Add cert to an in-memory store and attach private key ---
+        HCERTSTORE hStore = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, 0, NULL);
+        if (!hStore) {
+            CertFreeCertificateContext(pCert);
+            CryptDestroyKey(hKey);
+            CryptReleaseContext(hProv, 0);
+            { HCRYPTPROV hDel = 0; CryptAcquireContextW(&hDel, container, NULL, PROV_RSA_FULL, CRYPT_DELETEKEYSET); }
+            FreeLibrary(hMssign);
+            return FALSE;
+        }
+
+        PCCERT_CONTEXT pStoreCert = NULL;
+        CertAddCertificateContextToStore(hStore, pCert, CERT_STORE_ADD_ALWAYS, &pStoreCert);
+        CertSetCertificateContextProperty(pStoreCert, CERT_KEY_PROV_INFO_PROP_ID, 0, &kpi);
+
+        // --- Call SignerSign to Authenticode-sign the driver ---
+        SS_FILE_INFO       fi  = { sizeof(fi), targetDriverPath, NULL };
+        DWORD              idx = 0;
+        SS_SUBJECT_INFO    si  = { sizeof(si), &idx, 1 /*SIGNER_SUBJECT_FILE*/, &fi };
+        SS_CERT_STORE_INFO csi = { sizeof(csi), pStoreCert, 2 /*SIGNER_CERT_POLICY_CHAIN*/, NULL };
+        SS_CERT            sc  = { sizeof(sc), 2 /*SIGNER_CERT_STORE*/, &csi, NULL };
+        SS_SIGNATURE_INFO  ssi = { sizeof(ssi), CALG_SHA_256, 0 /*SIGNER_NO_ATTR*/, NULL, NULL, NULL };
+
+        HRESULT hr = pSign(&si, &sc, &ssi, NULL, NULL, NULL, NULL);
+
+        // --- Cleanup ---
+        if (pStoreCert) CertFreeCertificateContext(pStoreCert);
+        CertFreeCertificateContext(pCert);
+        CertCloseStore(hStore, 0);
+        CryptDestroyKey(hKey);
+        CryptReleaseContext(hProv, 0);
+        { HCRYPTPROV hDel = 0; CryptAcquireContextW(&hDel, container, NULL, PROV_RSA_FULL, CRYPT_DELETEKEYSET); }
+        FreeLibrary(hMssign);
+
+        if (FAILED(hr)) {
+            printf("[-] SignerSign failed: 0x%08X\n", hr);
+            return FALSE;
+        }
+
+        // Copy donor file times to the signed file for stealth
+        if (donorPath[0]) {
+            HANDLE hDonor = CreateFileW(donorPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hDonor != INVALID_HANDLE_VALUE) {
+                FILETIME ftCreate, ftAccess, ftWrite;
+                if (GetFileTime(hDonor, &ftCreate, &ftAccess, &ftWrite)) {
+                    CloseHandle(hDonor);
+                    HANDLE hTarget = CreateFileW(targetDriverPath, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ,
+                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                    if (hTarget != INVALID_HANDLE_VALUE) {
+                        SetFileTime(hTarget, &ftCreate, &ftAccess, &ftWrite);
+                        CloseHandle(hTarget);
+                    }
+                } else {
+                    CloseHandle(hDonor);
+                }
+            }
+        }
+
+        printf("[+] Driver self-signed (SHA-256 Authenticode)\n");
+        return TRUE;
+    }
 }
 const wchar_t* SignedMemory::g_AntiCheatProcesses[] = {
     L"BEService.exe",

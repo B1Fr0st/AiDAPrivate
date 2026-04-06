@@ -16,6 +16,7 @@ typedef struct _LDR_DATA_TABLE_ENTRY {
     ULONG          _Reserved1;
     UNICODE_STRING FullDllName;
     UNICODE_STRING BaseDllName;
+    ULONG          Flags;
 } LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
 
 typedef struct _RTL_PROCESS_MODULE_INFORMATION {

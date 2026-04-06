@@ -1895,18 +1895,92 @@ static NTSTATUS aida_query_system_handles(PAIDA_SYSTEM_HANDLE_INFORMATION* out_i
     return STATUS_INSUFFICIENT_RESOURCES;
 }
 
-static BOOLEAN aida_is_afd_device_object(PVOID object) {
-    if (!object || !_MmIsAddressValid(object)) return FALSE;
+// ---------------------------------------------------------------------------
+// safe_reference_file_object — hardened helper for referencing FILE_OBJECTs
+// obtained from the system handle table (ZwQuerySystemInformation snapshot).
+// ---------------------------------------------------------------------------
+// WHY THIS EXISTS:
+//
+// The REFERENCE_BY_POINTER (0x18) BSOD is caused by two compounding bugs in
+// the original code:
+//
+// 1. **NULL object type**: The old code did:
+//        POBJECT_TYPE fileType = (_IoFileObjectType && *_IoFileObjectType)
+//                                ? *_IoFileObjectType : nullptr;
+//        ObReferenceObjectByPointer(fo, 0, fileType, KernelMode);
+//    When fileType is nullptr, the kernel's Object Manager skips the type
+//    check and directly increments the reference count.  If the underlying
+//    memory has been freed/reallocated as a different object type, the
+//    refcount field points to garbage → BSOD with Arg1=0 (NULL type).
+//    The bugcheck dump confirms Arg1=0000000000000000.
+//
+// 2. **Stale pointers from handle-table snapshot**: The system handle table
+//    is a point-in-time snapshot.  Between the snapshot and the call to
+//    ObReferenceObjectByPointer, any handle can be closed and the underlying
+//    object freed and reallocated (classic TOCTOU race).  Without a valid
+//    type check, referencing a freed object corrupts refcounts.
+//
+// The fix:
+//   - ALWAYS pass *_IoFileObjectType (never nullptr) so the kernel validates
+//     the OBJECT_HEADER.Type field before touching the refcount.  If the
+//     object was freed/reallocated as a non-FILE_OBJECT, the call returns
+//     STATUS_OBJECT_TYPE_MISMATCH harmlessly.
+//   - Fail early if _IoFileObjectType is not resolved (driver init issue).
+//   - Validate the pointer is a plausible kernel-space address before use.
+//   - Wrap everything in __try/__except as a last-resort safety net against
+//     page faults on freed pool pages.
+// ---------------------------------------------------------------------------
+static BOOLEAN safe_reference_file_object(PVOID object, PFILE_OBJECT* out_fo) {
+    if (!out_fo)
+        return FALSE;
+    *out_fo = nullptr;
+
+    // Reject NULL, user-space, or currently-paged-out pointers
+    if (!object)
+        return FALSE;
+    if (reinterpret_cast<ULONG_PTR>(object) < 0xFFFF800000000000ULL)
+        return FALSE;
+    if (!_MmIsAddressValid(object))
+        return FALSE;
+
+    // _IoFileObjectType MUST be resolved and point to a valid type object.
+    // If it's not available, we cannot safely reference any FILE_OBJECT.
+    // WHY: Without a valid type pointer, ObReferenceObjectByPointer skips
+    // type validation and directly manipulates the refcount — the exact
+    // condition that caused the 0x18 BSOD (Arg1=0 proves NULL type).
+    if (!_IoFileObjectType || !*_IoFileObjectType)
+        return FALSE;
 
     __try {
-        PFILE_OBJECT fileObj = (PFILE_OBJECT)object;
-
-
-        POBJECT_TYPE fileType = (_IoFileObjectType && *_IoFileObjectType) ? *_IoFileObjectType : nullptr;
-        NTSTATUS ref_status = ObReferenceObjectByPointer(fileObj, 0, fileType, KernelMode);
-        if (!NT_SUCCESS(ref_status)) {
+        PFILE_OBJECT fo = static_cast<PFILE_OBJECT>(object);
+        NTSTATUS ref_status = ObReferenceObjectByPointer(
+            fo,
+            0,
+            *_IoFileObjectType,   // NEVER nullptr — kernel validates type header
+            KernelMode
+        );
+        if (!NT_SUCCESS(ref_status))
             return FALSE;
-        }
+
+        *out_fo = fo;
+        return TRUE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Page fault on freed pool or corrupted object header — object is stale
+        return FALSE;
+    }
+}
+
+static BOOLEAN aida_is_afd_device_object(PVOID object) {
+    // Use the hardened reference helper instead of raw ObReferenceObjectByPointer.
+    // WHY: The original code passed a potentially-NULL object type and didn't
+    // guard against stale pointers from the handle table snapshot, causing
+    // REFERENCE_BY_POINTER (0x18) BSODs when socket handles were closed
+    // between the ZwQuerySystemInformation snapshot and the reference call.
+    PFILE_OBJECT fileObj = nullptr;
+    if (!safe_reference_file_object(object, &fileObj))
+        return FALSE;
+
+    __try {
 
         BOOLEAN is_afd = FALSE;
 
@@ -2053,20 +2127,21 @@ static VOID aida_capture_socket_endpoint(SOCKET_HANDLE_ENTRY* out,
 }
 
 static BOOLEAN aida_extract_socket_info(PVOID file_object, SOCKET_HANDLE_ENTRY* out) {
-    if (!file_object || !out || !_MmIsAddressValid(file_object)) return FALSE;
+    if (!file_object || !out) return FALSE;
 
-    PFILE_OBJECT fo = (PFILE_OBJECT)file_object;
-    BOOLEAN referenced = FALSE;
+    // Use the hardened reference helper.
+    // WHY: Same REFERENCE_BY_POINTER (0x18) root cause as aida_is_afd_device_object — the
+    // original code passed a potentially-NULL type to ObReferenceObjectByPointer and was
+    // vulnerable to stale pointers from the system handle table snapshot (TOCTOU race).
+    // safe_reference_file_object enforces a valid *_IoFileObjectType, kernel-space address
+    // validation, and __try/__except wrapping.
+    PFILE_OBJECT fo = nullptr;
+    if (!safe_reference_file_object(file_object, &fo))
+        return FALSE;
+
     BOOLEAN result = FALSE;
 
     __try {
-        POBJECT_TYPE fileType = (_IoFileObjectType && *_IoFileObjectType) ? *_IoFileObjectType : nullptr;
-        NTSTATUS ref_status = ObReferenceObjectByPointer(fo, 0, fileType, KernelMode);
-        if (!NT_SUCCESS(ref_status)) {
-            result = FALSE;
-            __leave;
-        }
-        referenced = TRUE;
 
         PVOID afd_endpoint = fo->FsContext;
         if (!afd_endpoint || !_MmIsAddressValid(afd_endpoint)) {
@@ -2125,9 +2200,7 @@ static BOOLEAN aida_extract_socket_info(PVOID file_object, SOCKET_HANDLE_ENTRY* 
         result = FALSE;
     }
 
-    if (referenced) {
-        ObDereferenceObject(fo);
-    }
+    ObDereferenceObject(fo);
 
     return result;
 }

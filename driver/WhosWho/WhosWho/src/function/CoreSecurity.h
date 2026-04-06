@@ -363,6 +363,90 @@ namespace caller_validation {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HVCI (Hypervisor-protected Code Integrity) runtime detection
+// ---------------------------------------------------------------------------
+// WHY: Memory Integrity (HVCI) enforces W^X on all loaded driver code pages
+// via the hypervisor's Second Level Address Translation (SLAT/EPT).  When
+// HVCI is active, any attempt to write to a code page — even through MDL
+// remapping — triggers a hypervisor #PF that bugchecks the system.  The
+// driver must detect HVCI at init time so it can skip operations that write
+// to signed code pages (dispatch relocation, PE metadata scrubbing, ETW
+// patching) while leaving data-only operations intact.
+//
+// Detection method:  Read the kernel-shared CODEINTEGRITY_OPTION flags from
+// SharedUserData (KUSER_SHARED_DATA at 0xFFFFF78000000000).  The field
+// CodeIntegrity at offset 0x3A8 encodes HVCI state in bit 0x400
+// (CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED).  This is a lockless read of a
+// memory-mapped page that the kernel keeps up to date — safe at any IRQL
+// and does not require ZwQuerySystemInformation.
+// ---------------------------------------------------------------------------
+namespace hvci_detect {
+
+    // CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED
+    constexpr ULONG CI_OPTION_HVCI_KMCI_ENABLED = 0x400u;
+    // CODEINTEGRITY_OPTION_HVCI_KMCI_STRICTMODE_ENABLED
+    constexpr ULONG CI_OPTION_HVCI_STRICT       = 0x800u;
+    // CODEINTEGRITY_OPTION_ENABLED  (basic CI / Secure Boot)
+    constexpr ULONG CI_OPTION_ENABLED            = 0x01u;
+
+    // Offset of CodeIntegrity inside KUSER_SHARED_DATA (Win10 1903+)
+    constexpr ULONG64 KUSER_SHARED_DATA_VA = 0xFFFFF78000000000ULL;
+    // CodeIntegrity field is a pair: UCHAR CodeIntegrityOptions at +0x03A8
+    // but the full ULONG bitmask is at the same offset (low byte).  On
+    // Windows 10 1903+ the structure has expanded; we read 4 bytes for the
+    // full option set.
+
+    inline volatile LONG g_hvci_state = -1;  // -1 = not checked, 0 = off, 1 = on
+
+    __forceinline BOOLEAN detect_hvci() {
+        __try {
+            // KUSER_SHARED_DATA is always mapped and valid in kernel mode
+            volatile ULONG* ci_options = reinterpret_cast<volatile ULONG*>(
+                KUSER_SHARED_DATA_VA + 0x03A8);
+
+            // Validate the page is accessible (belt-and-suspenders)
+            if (!_MmIsAddressValid(reinterpret_cast<PVOID>(const_cast<ULONG*>(ci_options))))
+                return FALSE;
+
+            ULONG options = *ci_options;
+
+            if (options & CI_OPTION_HVCI_KMCI_ENABLED)
+                return TRUE;
+            if (options & CI_OPTION_HVCI_STRICT)
+                return TRUE;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // If we can't read SharedUserData something is deeply wrong;
+            // assume HVCI is on to avoid crashing with a code-page write.
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    __forceinline BOOLEAN is_hvci_enabled() {
+        LONG state = _InterlockedCompareExchange(&g_hvci_state, -1, -1);
+        if (state >= 0)
+            return (state != 0);
+
+        // First call — detect and cache
+        BOOLEAN enabled = detect_hvci();
+        _InterlockedExchange(&g_hvci_state, enabled ? 1 : 0);
+        return enabled;
+    }
+
+    __forceinline BOOLEAN is_secure_boot_ci_enabled() {
+        __try {
+            volatile ULONG* ci_options = reinterpret_cast<volatile ULONG*>(
+                KUSER_SHARED_DATA_VA + 0x03A8);
+            if (!_MmIsAddressValid(reinterpret_cast<PVOID>(const_cast<ULONG*>(ci_options))))
+                return FALSE;
+            return ((*ci_options) & CI_OPTION_ENABLED) != 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return TRUE;
+        }
+    }
+}
+
 namespace stack_spoof {
 
     inline volatile ULONG64 g_spoof_entropy = 0xCAFEBABEDEADC0DEULL;

