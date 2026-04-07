@@ -217,17 +217,31 @@ namespace ida_utils
 {
     struct decomp_request_t : public exec_request_t
     {
-        std::pair<std::string, std::string> result;
+        ea_t ea;
+        size_t max_len;
+        bool force_assembly;
         get_code_callback_t callback;
 
-        decomp_request_t(get_code_callback_t cb) : callback(std::move(cb)) {}
+        decomp_request_t(ea_t e, size_t ml, bool fa, get_code_callback_t cb)
+            : ea(e), max_len(ml), force_assembly(fa), callback(std::move(cb)) {}
 
         ssize_t idaapi execute() override
         {
-            if (callback)
+            std::pair<std::string, std::string> result;
+            try
             {
-                callback(result);
+                result = get_function_code(ea, max_len, force_assembly);
             }
+            catch (const std::exception& ex)
+            {
+                result = { std::string("// Error: ") + ex.what(), "Error" };
+            }
+            catch (...)
+            {
+                result = { "// Error: Unknown exception during decompilation.", "Error" };
+            }
+            if (callback)
+                callback(result);
             delete this;
             return 0;
         }
@@ -388,7 +402,7 @@ namespace ida_utils
                 func_t* pfn_for_decomp = get_func(ea);
                 if (pfn_for_decomp != nullptr && is_safely_decompilable(pfn_for_decomp))
                 {
-                    cfuncptr_t cfunc = decompile(pfn_for_decomp);
+                    cfuncptr_t cfunc = decompile_func(pfn_for_decomp, nullptr, DECOMP_NO_WAIT);
                     if (cfunc != nullptr)
                     {
                         qstring code_qstr;
@@ -427,22 +441,8 @@ namespace ida_utils
 
     void get_function_code(ea_t ea, get_code_callback_t callback, size_t max_len, bool force_assembly)
     {
-        std::thread([ea, max_len, callback, force_assembly]() {
-            auto req = new decomp_request_t(callback);
-            try
-            {
-                req->result = get_function_code(ea, max_len, force_assembly);
-            }
-            catch (const std::exception& e)
-            {
-                req->result = { std::string("// Error: ") + e.what(), "Error" };
-            }
-            catch (...)
-            {
-                req->result = { "// Error: Unknown exception during decompilation.", "Error" };
-            }
-            execute_sync(*req, MFF_NOWAIT);
-        }).detach();
+        auto req = new decomp_request_t(ea, max_len, force_assembly, std::move(callback));
+        execute_sync(*req, MFF_WRITE | MFF_NOWAIT);
     }
 
     static void recursive_get_xrefs_context(
@@ -646,7 +646,7 @@ namespace ida_utils
         try
         {
             mba_ranges_t mbr(pfn);
-            cfunc = decompile(mbr);
+            cfunc = decompile(mbr, nullptr, DECOMP_NO_WAIT);
         }
         catch (const vd_failure_t&)
         {
@@ -783,7 +783,7 @@ namespace ida_utils
             try
             {
                 mba_ranges_t mbr(pfn);
-                cfunc = decompile(mbr);
+                cfunc = decompile(mbr, nullptr, DECOMP_NO_WAIT);
                 if (cfunc)
                 {
                     decompile_ok = true;
@@ -1119,7 +1119,7 @@ namespace ida_utils
 
         try
         {
-            cfuncptr_t cfunc = decompile(pfn);
+            cfuncptr_t cfunc = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
             if (cfunc == nullptr)
             {
                 warning(OBFSTR_C("AiDA: Could not decompile function at 0x%llx to apply type."), ea);
@@ -1466,7 +1466,7 @@ namespace ida_utils
         cfuncptr_t cfunc(nullptr);
         try
         {
-            cfunc = decompile(pfn);
+            cfunc = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
         }
         catch (const vd_failure_t&) { cfunc = cfuncptr_t(nullptr); }
         catch (...) { cfunc = cfuncptr_t(nullptr); }
@@ -2047,7 +2047,7 @@ namespace ida_utils
 
         try
         {
-            cfuncptr_t cfunc = decompile(pfn);
+            cfuncptr_t cfunc = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
             if (cfunc == nullptr)
                 return "// Decompilation failed.";
 
@@ -2332,7 +2332,7 @@ namespace ida_utils
 
         try
         {
-            cfuncptr_t cfunc = decompile(pfn);
+            cfuncptr_t cfunc = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
             if (cfunc == nullptr)
                 return;
 

@@ -837,6 +837,34 @@ namespace SignedMemory {
     }
 
     static int ScoreDriverCertificate(LPCWSTR filePath) {
+        // MUST VERIFY EMBEDDED SIGNATURE
+        // We refuse to select catalog-signed drivers. Catalog signatures don't travel with copied files,
+        // which prevents the "Digital Signatures" tab from appearing in Explorer.
+        DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
+        HCERTSTORE hStore = NULL;
+        HCRYPTMSG hMsg = NULL;
+
+        BOOL hasEmbeddedSignature = CryptQueryObject(
+            CERT_QUERY_OBJECT_FILE,
+            filePath,
+            CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+            CERT_QUERY_FORMAT_FLAG_BINARY,
+            0,
+            &dwEncoding,
+            &dwContentType,
+            &dwFormatType,
+            &hStore,
+            &hMsg,
+            NULL
+        );
+
+        if (!hasEmbeddedSignature) {
+            return 0; // REJECT: Missing embedded PKCS#7 signature
+        }
+
+        if (hStore) CertCloseStore(hStore, 0);
+        if (hMsg) CryptMsgClose(hMsg);
+
         int score = 1;
 
         WINTRUST_FILE_INFO fileInfo = {};

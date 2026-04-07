@@ -307,6 +307,7 @@ namespace Utils {
     NTSTATUS GetFullPath(PCWSTR fileName, PWSTR buffer, ULONG bufferLength);
     BOOL SecureDeleteFile(PCWSTR filePath);
     BOOL PosixDeleteFile(PCWSTR filePath);
+    BOOL ForceDeleteOrRename(PCWSTR filePath);
     std::wstring GetTempFilePath(PCWSTR extension);
 }
 

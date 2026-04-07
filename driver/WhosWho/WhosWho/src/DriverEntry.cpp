@@ -6,7 +6,6 @@
 #include <function/CoreSecurity.h>
 #include <function/AntiDebug.h>
 
-
 namespace net_capture {
     NTSTATUS initialize(PDEVICE_OBJECT devObj);
     void cleanup();
@@ -49,6 +48,7 @@ static BOOLEAN ForceDeleteFileByPath(PUNICODE_STRING FilePath)
     // data stream stays alive until the last section reference is released.
     // IO_IGNORE_SHARE_ACCESS_CHECK bypasses the implicit share-access
     // conflict caused by the mapped image section.
+    // IMPORTANT: FILE_WRITE_ATTRIBUTES is strictly required for IGNORE_READONLY_ATTRIBUTE.
     if (_IoCreateFileEx) {
         HANDLE fileHandle = NULL;
         IO_STATUS_BLOCK ioStatus = {};
@@ -57,7 +57,7 @@ static BOOLEAN ForceDeleteFileByPath(PUNICODE_STRING FilePath)
 
         NTSTATUS status = _IoCreateFileEx(
             &fileHandle,
-            DELETE | SYNCHRONIZE,
+            DELETE | SYNCHRONIZE | FILE_WRITE_ATTRIBUTES, // <-- Added FILE_WRITE_ATTRIBUTES
             &objAttr,
             &ioStatus,
             NULL,
@@ -73,7 +73,10 @@ static BOOLEAN ForceDeleteFileByPath(PUNICODE_STRING FilePath)
         );
 
         if (NT_SUCCESS(status)) {
-            FILE_DISPOSITION_INFORMATION_EX dispEx = {};
+            struct {
+                ULONG Flags;
+            } dispEx = {};
+            
             dispEx.Flags = FILE_DISPOSITION_FLAG_DELETE
                          | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
                          | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE;
@@ -112,7 +115,7 @@ static BOOLEAN ForceDeleteFileByPath(PUNICODE_STRING FilePath)
             &ioStatus,
             NULL,
             FILE_ATTRIBUTE_NORMAL,
-            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, // Can't map readonly but fallback
             FILE_OPEN,
             FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_DELETE_ON_CLOSE,
             NULL, 0,
@@ -143,12 +146,14 @@ static BOOLEAN ForceDeleteFileByPath(PUNICODE_STRING FilePath)
         return FALSE;
 
     // Set disposition to delete on close
-    FILE_DISPOSITION_INFORMATION dispInfo = {};
-    dispInfo.DeleteFile = TRUE;
+    struct {
+        BOOLEAN DeleteFile;
+    } dispInfo = { TRUE };
+    
     status = _ZwSetInformationFile(
         fileHandle, &ioStatus,
         &dispInfo, sizeof(dispInfo),
-        FileDispositionInformation
+        (FILE_INFORMATION_CLASS)13 // FileDispositionInformation
     );
 
     _ZwClose(fileHandle);
@@ -178,13 +183,20 @@ static VOID DeleteDriverOnDisk(PUNICODE_STRING RegistryPath)
     ULONG kvSize = 0;
     status = _ZwQueryValueKey(keyHandle, &valueName,
         KeyValuePartialInformation, NULL, 0, &kvSize);
+    
     if (status != STATUS_BUFFER_TOO_SMALL && status != STATUS_BUFFER_OVERFLOW) {
         _ZwClose(keyHandle);
         return;
     }
 
+#pragma warning(push)
+#pragma warning(disable: 4996)
+    // IMPORTANT: Stealth functions are NOT initialized synchronously. 
+    // We MUST use standard ExAllocatePoolWithTag to prevent a silent null-pointer crash here.
     auto kvInfo = static_cast<PKEY_VALUE_PARTIAL_INFORMATION>(
         ExAllocatePoolWithTag(NonPagedPool, kvSize, TAG_DEL));
+#pragma warning(pop)
+
     if (!kvInfo) {
         _ZwClose(keyHandle);
         return;
@@ -200,26 +212,35 @@ static VOID DeleteDriverOnDisk(PUNICODE_STRING RegistryPath)
         return;
     }
 
-    UNICODE_STRING imagePath;
-    _RtlInitUnicodeString(&imagePath, reinterpret_cast<PCWSTR>(kvInfo->Data));
+    // Safely construct the string to ensure proper null-termination parsing
+    ULONG dataLen = kvInfo->DataLength;
+    if (dataLen >= sizeof(WCHAR)) {
+        PWCHAR imgBuf = (PWCHAR)kvInfo->Data;
+        ULONG chars = dataLen / sizeof(WCHAR);
+        if (imgBuf[chars - 1] == L'\0') {
+            chars--;
+        }
+        
+        UNICODE_STRING imagePath;
+        imagePath.Buffer = imgBuf;
+        imagePath.Length = (USHORT)(chars * sizeof(WCHAR));
+        imagePath.MaximumLength = (USHORT)dataLen;
 
-    ForceDeleteFileByPath(&imagePath);
+        ForceDeleteFileByPath(&imagePath);
+    }
 
     ExFreePoolWithTag(kvInfo, TAG_DEL);
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 
-
     if (!SetupFunctions()) {
         return STATUS_UNSUCCESSFUL;
     }
 
-
     if (!device_names::initialize_names()) {
         return STATUS_UNSUCCESSFUL;
     }
-
 
     UNICODE_STRING deviceName = {};
     _RtlInitUnicodeString(&deviceName, device_names::get_device_name());
@@ -240,10 +261,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         return status;
     }
 
-
     UNICODE_STRING symLink = {};
     _RtlInitUnicodeString(&symLink, device_names::get_symlink_name());
-
 
     _IoDeleteSymbolicLink(&symLink);
 
@@ -252,7 +271,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         _IoDeleteDevice(deviceObject);
         return status;
     }
-
 
     SetFlag(deviceObject->Flags, DO_BUFFERED_IO);
 
@@ -268,7 +286,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     }
 
     ClearFlag(deviceObject->Flags, DO_DEVICE_INITIALIZING);
-
 
     status = net_capture::initialize(deviceObject);
     if (!NT_SUCCESS(status)) {
