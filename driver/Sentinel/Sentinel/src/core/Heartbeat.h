@@ -6,17 +6,17 @@ namespace heartbeat {
 
 
     struct sentinel_bridge_t {
-        volatile UINT64 heartbeat_tsc;
-        volatile UINT64 sentinel_heartbeat_tsc;
-        volatile UINT32 bridge_magic;
-        volatile UINT32 bridge_version;
-        volatile UINT64 whoswho_code_base;
-        volatile UINT64 whoswho_code_size;
-        volatile UINT32 sentinel_magic;
-        volatile UINT32 sentinel_active;
+        volatile ULONG  magic;
+        volatile ULONG  version;
+        volatile PVOID  code_base;
+        volatile ULONG  code_size;
+        volatile LONG64 whoswho_tsc;
+        volatile LONG64 sentinel_tsc;
     };
 
 
+    constexpr ULONG  BRIDGE_MAGIC = 0x57484F53;
+    constexpr ULONG  BRIDGE_VERSION = 1;
     constexpr UINT64 HEARTBEAT_TIMEOUT_TSC = 30ULL * 3000000000ULL;
 
     inline volatile sentinel_bridge_t* g_bridge = nullptr;
@@ -33,7 +33,6 @@ namespace heartbeat {
         if (!_MmIsAddressValid(whoswho_base))
             return false;
 
-
         PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(whoswho_base);
         if (dos->e_magic != IMAGE_DOS_SIGNATURE)
             return false;
@@ -46,8 +45,6 @@ namespace heartbeat {
         PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
 
         for (USHORT i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-
-
             UCHAR* section_base = static_cast<UCHAR*>(whoswho_base) + sections[i].VirtualAddress;
             ULONG section_size = sections[i].Misc.VirtualSize;
 
@@ -55,52 +52,38 @@ namespace heartbeat {
                 continue;
 
             __try {
-
                 for (ULONG offset = 0; offset <= section_size - sizeof(sentinel_bridge_t); offset += 4) {
                     if (!_MmIsAddressValid(section_base + offset))
                         continue;
 
-
-                    volatile UINT32* candidate = reinterpret_cast<volatile UINT32*>(section_base + offset + 16);
-
-                    if (!_MmIsAddressValid((PVOID)candidate))
+                    volatile UINT32* magic_ptr = reinterpret_cast<volatile UINT32*>(section_base + offset);
+                    if (!_MmIsAddressValid(reinterpret_cast<PVOID>(const_cast<UINT32*>(magic_ptr))))
                         continue;
 
-                    if (*candidate != 0x57484F53)
+                    if (*magic_ptr != BRIDGE_MAGIC)
                         continue;
 
-
-                    volatile UINT32* version_ptr = candidate + 1;
-                    if (!_MmIsAddressValid((PVOID)version_ptr))
+                    volatile UINT32* version_ptr = magic_ptr + 1;
+                    if (!_MmIsAddressValid(reinterpret_cast<PVOID>(const_cast<UINT32*>(version_ptr))))
                         continue;
 
-                    if (*version_ptr != 1)
+                    if (*version_ptr != BRIDGE_VERSION)
                         continue;
-
 
                     volatile sentinel_bridge_t* bridge =
                         reinterpret_cast<volatile sentinel_bridge_t*>(section_base + offset);
 
-                    if (!_MmIsAddressValid((PVOID)bridge))
+                    if (!_MmIsAddressValid(reinterpret_cast<PVOID>(const_cast<sentinel_bridge_t*>(bridge))))
                         continue;
 
-                    UINT64 code_base = bridge->whoswho_code_base;
-                    UINT64 code_size = bridge->whoswho_code_size;
+                    PVOID cb = bridge->code_base;
+                    ULONG cs = bridge->code_size;
 
-
-                    if (code_base > 0xFFFF800000000000ULL &&
-                        code_size > 0 && code_size < 10 * 1024 * 1024) {
-
+                    if (reinterpret_cast<ULONG_PTR>(cb) > 0xFFFF800000000000ULL &&
+                        cs > 0 && cs < 10 * 1024 * 1024) {
                         g_bridge = bridge;
-
-
-                        bridge->sentinel_magic = 0x53454E54;
-                        bridge->sentinel_active = 1;
-
-
-                        g_last_whoswho_tsc = bridge->heartbeat_tsc;
+                        g_last_whoswho_tsc = static_cast<UINT64>(bridge->whoswho_tsc);
                         g_last_check_tsc = __rdtsc();
-
                         return true;
                     }
                 }
@@ -128,17 +111,17 @@ namespace heartbeat {
         if (!_InterlockedCompareExchange(&g_initialized, 1, 1))
             return true;
 
-        if (!g_bridge || !_MmIsAddressValid((PVOID)g_bridge))
+        if (!g_bridge || !_MmIsAddressValid(reinterpret_cast<PVOID>(
+                const_cast<sentinel_bridge_t*>(g_bridge))))
             return true;
 
         __try {
+            InterlockedExchange64(
+                const_cast<volatile LONG64*>(&g_bridge->sentinel_tsc),
+                static_cast<LONG64>(__rdtsc()));
 
-            g_bridge->sentinel_heartbeat_tsc = __rdtsc();
-
-
-            UINT64 current_whoswho_tsc = g_bridge->heartbeat_tsc;
+            UINT64 current_whoswho_tsc = static_cast<UINT64>(g_bridge->whoswho_tsc);
             UINT64 now_tsc = __rdtsc();
-
 
             if (!_InterlockedCompareExchange(&g_first_heartbeat_seen, 0, 0)) {
                 if (current_whoswho_tsc != 0) {
@@ -146,24 +129,18 @@ namespace heartbeat {
                     g_last_whoswho_tsc = current_whoswho_tsc;
                     g_last_check_tsc = now_tsc;
                 }
-
                 return true;
             }
 
-
             if (current_whoswho_tsc != g_last_whoswho_tsc) {
-
                 g_last_whoswho_tsc = current_whoswho_tsc;
                 g_last_check_tsc = now_tsc;
                 return true;
             }
 
-
             UINT64 elapsed = now_tsc - g_last_check_tsc;
 
             if (elapsed > HEARTBEAT_TIMEOUT_TSC) {
-
-
                 if (_KeBugCheckEx) {
                     _KeBugCheckEx(
                         0xDEAD5E05,

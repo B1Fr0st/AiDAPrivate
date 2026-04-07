@@ -163,25 +163,9 @@ namespace etw_disable {
             UINT64 current_value = *static_cast<volatile UINT64*>((PVOID)g_provider_handle);
 
             if (current_value != 0) {
-
-
-                UINT64 zero = 0;
-                if (safe_write_memory((PVOID)g_provider_handle, &zero, sizeof(zero))) {
-
-                    return true;
-                }
-
-
-                if (_KeBugCheckEx) {
-                    _KeBugCheckEx(
-                        0xDEAD5E06,
-                        (ULONG_PTR)g_provider_handle,
-                        (ULONG_PTR)current_value,
-                        (ULONG_PTR)0,
-                        (ULONG_PTR)0
-                    );
-                }
-                return false;
+                InterlockedExchange64(
+                    static_cast<volatile LONG64*>((PVOID)g_provider_handle), 0);
+                return true;
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             return true;

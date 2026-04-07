@@ -204,6 +204,17 @@ inline PVOID              (NTAPI* _RtlLookupElementGenericTableAvl) (PRTL_AVL_TA
 inline BOOLEAN            (NTAPI* _RtlDeleteElementGenericTableAvl) (PRTL_AVL_TABLE, PVOID);
 
 
+inline VOID               (NTAPI* _KeEnterCriticalRegion)           (VOID);
+inline VOID               (NTAPI* _KeLeaveCriticalRegion)           (VOID);
+
+
+inline NTSTATUS           (NTAPI* _ZwOpenKey)                       (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
+inline NTSTATUS           (NTAPI* _ZwQueryValueKey)                 (HANDLE, PUNICODE_STRING, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+inline NTSTATUS           (NTAPI* _ZwDeleteFile)                    (POBJECT_ATTRIBUTES);
+inline NTSTATUS           (NTAPI* _ZwSetInformationFile)            (HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
+inline NTSTATUS           (NTAPI* _IoCreateFileEx)                  (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG, CREATE_FILE_TYPE, PVOID, ULONG, PIO_DRIVER_CREATE_CONTEXT);
+
+
 inline NTSTATUS           (NTAPI* _PsSetCreateProcessNotifyRoutine) (PCREATE_PROCESS_NOTIFY_ROUTINE, BOOLEAN);
 
 
@@ -267,6 +278,17 @@ inline bool SetupFunctions() {
     *(PVOID*)&_ExReleaseResourceLite           = GetProcAddress(kernelBase, (PCHAR)skCrypt("ExReleaseResourceLite"));
     *(PVOID*)&_RtlLookupElementGenericTableAvl = GetProcAddress(kernelBase, (PCHAR)skCrypt("RtlLookupElementGenericTableAvl"));
     *(PVOID*)&_RtlDeleteElementGenericTableAvl = GetProcAddress(kernelBase, (PCHAR)skCrypt("RtlDeleteElementGenericTableAvl"));
+
+
+    *(PVOID*)&_KeEnterCriticalRegion           = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeEnterCriticalRegion"));
+    *(PVOID*)&_KeLeaveCriticalRegion           = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeLeaveCriticalRegion"));
+
+
+    *(PVOID*)&_ZwOpenKey                       = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwOpenKey"));
+    *(PVOID*)&_ZwQueryValueKey                 = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwQueryValueKey"));
+    *(PVOID*)&_ZwDeleteFile                    = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwDeleteFile"));
+    *(PVOID*)&_ZwSetInformationFile            = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwSetInformationFile"));
+    *(PVOID*)&_IoCreateFileEx                  = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoCreateFileEx"));
 
 
     *(PVOID*)&_PsSetCreateProcessNotifyRoutine = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetCreateProcessNotifyRoutine"));
