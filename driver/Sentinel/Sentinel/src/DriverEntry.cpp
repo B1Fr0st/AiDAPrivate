@@ -340,6 +340,11 @@ static void NTAPI init_thread_routine(PVOID ) {
         if (target_driver_obj)
             dispatch_guard::snapshot(target_driver_obj);
 
+        // Initialize PsLoadedModuleList access so dispatch_guard::verify() can
+        // distinguish legitimately-loaded kernel modules (anticheat drivers) from
+        // rogue pool / manually-mapped memory when a dispatch pointer changes.
+        dispatch_guard::init_module_list(g_sentinel_driver_object);
+
 
         {
             PVOID nt_base = reinterpret_cast<PVOID>(get_nt_base());

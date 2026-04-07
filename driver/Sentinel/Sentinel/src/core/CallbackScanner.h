@@ -235,34 +235,19 @@ namespace callback_scanner {
         if (g_load_image_array) {
             ULONG current = count_callback_array(g_load_image_array);
             if (current > g_baseline_load_image_count + 2) {
-
-
-                if (_KeBugCheckEx) {
-                    _KeBugCheckEx(
-                        0xDEAD5E04,
-                        (ULONG_PTR)0,
-                        (ULONG_PTR)g_baseline_load_image_count,
-                        (ULONG_PTR)current,
-                        (ULONG_PTR)g_load_image_array
-                    );
-                }
-                return false;
+                // Callback count grew — this is normal when anticheats, EDRs,
+                // or other kernel software registers notification routines.
+                // Re-baseline instead of treating it as an attack.  The real
+                // tamper detection is CRC integrity checking of WhosWho's .text.
+                g_baseline_load_image_count = current;
             }
         }
 
         if (g_create_process_array) {
             ULONG current = count_callback_array(g_create_process_array);
             if (current > g_baseline_create_process_count + 2) {
-                if (_KeBugCheckEx) {
-                    _KeBugCheckEx(
-                        0xDEAD5E04,
-                        (ULONG_PTR)1,
-                        (ULONG_PTR)g_baseline_create_process_count,
-                        (ULONG_PTR)current,
-                        (ULONG_PTR)g_create_process_array
-                    );
-                }
-                return false;
+                // Same rationale: re-baseline to absorb legitimate registrations.
+                g_baseline_create_process_count = current;
             }
         }
 

@@ -217,6 +217,13 @@ inline NTSTATUS           (NTAPI* _ZwDeleteFile)                    (POBJECT_ATT
 inline NTSTATUS           (NTAPI* _ZwSetInformationFile)           (HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
 inline NTSTATUS           (NTAPI* _IoCreateFileEx)                 (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG, CREATE_FILE_TYPE, PVOID, ULONG, PIO_DRIVER_CREATE_CONTEXT);
 
+inline VOID               (NTAPI* _KeBugCheckEx)                   (ULONG, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
+inline VOID               (NTAPI* _KeInitializeDpc)                (PRKDPC, PKDEFERRED_ROUTINE, PVOID);
+inline VOID               (NTAPI* _KeInitializeTimerEx)            (PKTIMER, TIMER_TYPE);
+inline BOOLEAN            (NTAPI* _KeSetTimerEx)                   (PKTIMER, LARGE_INTEGER, LONG, PKDPC);
+inline BOOLEAN            (NTAPI* _KeCancelTimer)                  (PKTIMER);
+inline VOID               (NTAPI* _KeFlushQueuedDpcs)              (VOID);
+
 
 namespace ssdt_resolver {
     typedef struct _KSERVICE_TABLE_DESCRIPTOR {
@@ -643,6 +650,13 @@ inline bool SetupFunctions() {
     *(PVOID*)&_ZwSetInformationFile = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwSetInformationFile"));
     *(PVOID*)&_IoCreateFileEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoCreateFileEx"));
 
+    *(PVOID*)&_KeBugCheckEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeBugCheckEx"));
+    *(PVOID*)&_KeInitializeDpc = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeInitializeDpc"));
+    *(PVOID*)&_KeInitializeTimerEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeInitializeTimerEx"));
+    *(PVOID*)&_KeSetTimerEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeSetTimerEx"));
+    *(PVOID*)&_KeCancelTimer = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeCancelTimer"));
+    *(PVOID*)&_KeFlushQueuedDpcs = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeFlushQueuedDpcs"));
+
 
     if (!_PsSuspendThread && !_ZwSuspendThread) {
         ssdt_resolver::find_ssdt();
@@ -660,7 +674,9 @@ inline bool SetupFunctions() {
         !_PsCreateSystemThread || !_KeDelayExecutionThread || !_PsTerminateSystemThread ||
         !_KeStackAttachProcess || !_KeUnstackDetachProcess ||
         !_ZwAllocateVirtualMemory || !_ZwFreeVirtualMemory ||
-        !_IoDeleteDevice || !_IoDeleteSymbolicLink) {
+        !_IoDeleteDevice || !_IoDeleteSymbolicLink ||
+        !_KeBugCheckEx || !_KeInitializeDpc || !_KeInitializeTimerEx ||
+        !_KeSetTimerEx || !_KeCancelTimer || !_KeFlushQueuedDpcs) {
         return false;
     }
 

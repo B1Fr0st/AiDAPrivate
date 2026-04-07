@@ -8,6 +8,14 @@ namespace thread_guard {
     inline volatile UINT64 g_target_size = 0;
     inline volatile LONG   g_initialized = 0;
 
+    // Strike counter: incremented each time a HW breakpoint targeting
+    // WhosWho is detected and cleared.  Reset to 0 on a clean check.
+    // A single detection may be an anticheat doing a quick scan; three
+    // consecutive detections (across 9+ seconds of timer ticks) proves
+    // active, persistent debugging — that is an attacker.
+    inline volatile LONG   g_targeted_debug_strikes = 0;
+    constexpr LONG         STRIKE_THRESHOLD = 3;
+
     __forceinline bool init(UINT64 target_base, UINT64 target_size) {
         if (!target_base || !target_size)
             return false;
@@ -86,19 +94,33 @@ namespace thread_guard {
         }
 
         if (_InterlockedCompareExchange(&targeted_debug_detected, 0, 0) != 0) {
+            // HW breakpoints targeting WhosWho were detected and cleared.
+            // Increment the strike counter.  A single hit may be a transient
+            // anticheat scan; only BSOD after STRIKE_THRESHOLD consecutive
+            // detections, which proves persistent, targeted debugging.
+            LONG strikes = _InterlockedIncrement(&g_targeted_debug_strikes);
 
-
-            if (_KeBugCheckEx) {
-                _KeBugCheckEx(
-                    0xDEAD5E03,
-                    (ULONG_PTR)g_target_base,
-                    (ULONG_PTR)g_target_size,
-                    (ULONG_PTR)0,
-                    (ULONG_PTR)0
-                );
+            if (strikes >= STRIKE_THRESHOLD) {
+                if (_KeBugCheckEx) {
+                    _KeBugCheckEx(
+                        0xDEAD5E03,
+                        (ULONG_PTR)g_target_base,
+                        (ULONG_PTR)g_target_size,
+                        (ULONG_PTR)strikes,
+                        (ULONG_PTR)0
+                    );
+                }
+                return false;
             }
-            return false;
+
+            // Below threshold — breakpoints were already cleared by the IPI,
+            // so the debugger gains nothing.  Wait to see if they reappear.
+            return true;
         }
+
+        // Clean check — no targeting detected.  Reset strike counter so
+        // that the attacker cannot accumulate strikes across long gaps.
+        _InterlockedExchange(&g_targeted_debug_strikes, 0);
 
         return true;
     }
