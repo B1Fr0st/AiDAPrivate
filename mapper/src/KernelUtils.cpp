@@ -38,6 +38,11 @@ PVOID g_DriverLoadAddress = nullptr;
 WCHAR g_DonorCopyPath[520] = { 0 };
 WCHAR g_DonorSignerName[256] = { 0 };
 
+// Sentinel guardian support
+WCHAR g_SentinelServicePath[128] = { 0 };
+PVOID g_SentinelLoadAddress = nullptr;
+ULONG g_SentinelImageSize = 0;
+
 struct WindowsVersion {
     DWORD major;
     DWORD minor;
@@ -597,6 +602,94 @@ namespace KernelUtils {
         *outAddress = reinterpret_cast<PVOID>(reinterpret_cast<ULONG_PTR>(ciBase) + offset);
         printf("[+] g_CiDeveloperMode kernel address: %p\n", *outAddress);
         return TRUE;
+    }
+
+    PVOID GetDriverBaseByName(PCWSTR driverFileName, PULONG outImageSize) {
+        // Use NtQuerySystemInformation(SystemModuleInformation = 11) to enumerate
+        // all loaded kernel modules, then match by filename suffix.
+        // This is the same approach used throughout the mapper for finding kernel module bases.
+
+        ULONG needed = 0;
+        NTSTATUS status = NtQuerySystemInformation(
+            static_cast<SYSTEM_INFORMATION_CLASS>(11), // SystemModuleInformation
+            nullptr, 0, &needed);
+
+        if (needed == 0) {
+            printf("[-] GetDriverBaseByName: NtQuerySystemInformation sizing failed\n");
+            return nullptr;
+        }
+
+        // Allocate with extra margin — module list can grow between calls
+        ULONG bufSize = needed + 4096;
+        auto buf = std::make_unique<BYTE[]>(bufSize);
+
+        status = NtQuerySystemInformation(
+            static_cast<SYSTEM_INFORMATION_CLASS>(11),
+            buf.get(), bufSize, &needed);
+
+        if (!NT_SUCCESS(status)) {
+            printf("[-] GetDriverBaseByName: NtQuerySystemInformation failed 0x%08X\n", status);
+            return nullptr;
+        }
+
+        // RTL_PROCESS_MODULES layout:
+        //   ULONG NumberOfModules
+        //   RTL_PROCESS_MODULE_INFORMATION Modules[1]
+        // RTL_PROCESS_MODULE_INFORMATION layout:
+        //   HANDLE Section            (+0x00)
+        //   PVOID  MappedBase         (+0x08)
+        //   PVOID  ImageBase          (+0x10)
+        //   ULONG  ImageSize          (+0x18)
+        //   ULONG  Flags              (+0x1C)
+        //   USHORT LoadOrderIndex     (+0x20)
+        //   USHORT InitOrderIndex     (+0x22)
+        //   USHORT LoadCount          (+0x24)
+        //   USHORT OffsetToFileName   (+0x26)
+        //   UCHAR  FullPathName[256]  (+0x28)
+
+        ULONG moduleCount = *reinterpret_cast<ULONG*>(buf.get());
+        BYTE* entry = buf.get() + sizeof(ULONG);
+        constexpr SIZE_T ENTRY_SIZE = 0x128; // sizeof(RTL_PROCESS_MODULE_INFORMATION) on x64
+
+        // Convert wide target filename to narrow for comparison
+        char targetNarrow[260] = {};
+        {
+            int i = 0;
+            for (; driverFileName[i] && i < 259; i++)
+                targetNarrow[i] = static_cast<char>(driverFileName[i]);
+            targetNarrow[i] = '\0';
+        }
+
+        // Case-insensitive narrow string compare
+        auto stricmpA = [](const char* a, const char* b) -> int {
+            while (*a && *b) {
+                char ca = (*a >= 'A' && *a <= 'Z') ? (*a + 32) : *a;
+                char cb = (*b >= 'A' && *b <= 'Z') ? (*b + 32) : *b;
+                if (ca != cb) return ca - cb;
+                a++; b++;
+            }
+            return static_cast<unsigned char>(*a) - static_cast<unsigned char>(*b);
+        };
+
+        for (ULONG i = 0; i < moduleCount; i++) {
+            PVOID imageBase = *reinterpret_cast<PVOID*>(entry + 0x10);
+            ULONG imageSize = *reinterpret_cast<ULONG*>(entry + 0x18);
+            USHORT nameOffset = *reinterpret_cast<USHORT*>(entry + 0x26);
+            const char* fullPath = reinterpret_cast<const char*>(entry + 0x28);
+            const char* fileName = fullPath + nameOffset;
+
+            if (stricmpA(fileName, targetNarrow) == 0) {
+                printf("[+] Found %s at %p (size 0x%X)\n", fileName, imageBase, imageSize);
+                if (outImageSize)
+                    *outImageSize = imageSize;
+                return imageBase;
+            }
+
+            entry += ENTRY_SIZE;
+        }
+
+        printf("[-] GetDriverBaseByName: '%s' not found in loaded modules\n", targetNarrow);
+        return nullptr;
     }
 
 }

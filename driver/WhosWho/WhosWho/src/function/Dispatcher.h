@@ -6,6 +6,7 @@
 #include <function/Functions.h>
 #include <function/CoreSecurity.h>
 #include <function/AntiDebug.h>
+#include <function/SentinelBridge.h>
 
 __forceinline ULONG hash_build_key(ULONG key) {
     key ^= key >> 16;
@@ -650,6 +651,7 @@ namespace dispatcher {
                         if (existing_key == 0 || (ULONG)existing_key == hb->session_key) {
                             _InterlockedExchange64(&g_last_heartbeat_time, current_time.QuadPart);
                             _InterlockedIncrement((volatile LONG*)&g_heartbeat_counter);
+                            sentinel_bridge::tick();
                             _InterlockedExchange(&g_driver_activated, 1);
 
                             if (existing_key == 0) {

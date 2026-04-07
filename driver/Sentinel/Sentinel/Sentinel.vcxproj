@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <Import Project="$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.4204\build\native\Microsoft.Windows.WDK.x64.props" Condition="Exists('$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.4204\build\native\Microsoft.Windows.WDK.x64.props')" />
   <Import Project="$(SolutionDir)packages\Microsoft.Windows.SDK.CPP.x64.10.0.26100.1\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('$(SolutionDir)packages\Microsoft.Windows.SDK.CPP.x64.10.0.26100.1\build\native\Microsoft.Windows.SDK.cpp.x64.props')" />
@@ -12,23 +12,15 @@
       <Configuration>Release</Configuration>
       <Platform>x64</Platform>
     </ProjectConfiguration>
-    <ProjectConfiguration Include="Debug|ARM64">
-      <Configuration>Debug</Configuration>
-      <Platform>ARM64</Platform>
-    </ProjectConfiguration>
-    <ProjectConfiguration Include="Release|ARM64">
-      <Configuration>Release</Configuration>
-      <Platform>ARM64</Platform>
-    </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
-    <ProjectGuid>{F9F7F612-3409-7052-C129-ECF255509867}</ProjectGuid>
+    <ProjectGuid>{A1B2C3D4-5E6F-7890-ABCD-EF1234567890}</ProjectGuid>
     <TemplateGuid>{1bc93793-694f-48fe-9372-81e2b05556fd}</TemplateGuid>
     <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
     <MinimumVisualStudioVersion>12.0</MinimumVisualStudioVersion>
     <Configuration>Debug</Configuration>
     <Platform Condition="'$(Platform)' == ''">x64</Platform>
-    <RootNamespace>WhosWho</RootNamespace>
+    <RootNamespace>Sentinel</RootNamespace>
     <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -39,7 +31,7 @@
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>KMDF</DriverType>
     <DriverTargetPlatform>Universal</DriverTargetPlatform>
-    <IncludePath>ext;src;..\..\encrypt;$(IncludePath)</IncludePath>
+    <IncludePath>src;..\..\encrypt;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <TargetVersion>Windows10</TargetVersion>
@@ -51,25 +43,8 @@
     <Driver_SpectreMitigation>false</Driver_SpectreMitigation>
     <ALLOW_DATE_TIME>1</ALLOW_DATE_TIME>
   </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
-    <TargetVersion>Windows10</TargetVersion>
-    <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
-    <ConfigurationType>Driver</ConfigurationType>
-    <DriverType>KMDF</DriverType>
-    <DriverTargetPlatform>Universal</DriverTargetPlatform>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'" Label="Configuration">
-    <TargetVersion>Windows10</TargetVersion>
-    <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
-    <ConfigurationType>Driver</ConfigurationType>
-    <DriverType>KMDF</DriverType>
-    <DriverTargetPlatform>Universal</DriverTargetPlatform>
-  </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
-    <!-- masm.props is already imported by WDK package, do not duplicate -->
   </ImportGroup>
   <ImportGroup Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
@@ -79,31 +54,20 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
     <EnableInf2cat>false</EnableInf2cat>
-    <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
-    <Inf2CatWindowsVersionList />
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <IncludePath>ext;src;..\..\encrypt;$(IncludePath)</IncludePath>
+    <IncludePath>src;..\..\encrypt;$(IncludePath)</IncludePath>
     <OutDir>C:\Users\ruar\AiDAPrivate\build\Release\</OutDir>
     <IntDir>$(SolutionDir)artifacts\</IntDir>
     <EnableInf2cat>false</EnableInf2cat>
     <ApiValidator_Enable>false</ApiValidator_Enable>
     <SignMode>Off</SignMode>
   </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
-    <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
-    <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
-    <ClCompile>
-      <PreprocessorDefinitions>AIDA_NET_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-    </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DriverSign>
@@ -123,55 +87,32 @@
       <TreatLinkerWarningAsErrors>false</TreatLinkerWarningAsErrors>
     </Link>
   </ItemDefinitionGroup>
-  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
-    <DriverSign>
-      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
-    </DriverSign>
-  </ItemDefinitionGroup>
-  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
-    <DriverSign>
-      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
-    </DriverSign>
-  </ItemDefinitionGroup>
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\DriverEntry.cpp" />
-    <ClCompile Include="src\function\impl\BaseAddress.cpp" />
-    <ClCompile Include="src\function\impl\DTB.cpp" />
-    <ClCompile Include="src\function\impl\Memory.cpp" />
-    <ClCompile Include="src\function\impl\RemoteCall.cpp" />
-    <ClCompile Include="src\function\impl\Debugger.cpp" />
-    <ClCompile Include="src\function\impl\DllProtect.cpp" />
-    <ClCompile Include="src\function\impl\Network.cpp" />
   </ItemGroup>
-  <!-- 
-    ntoskernel_base.asm has been replaced with a safe C++ implementation in Defs.h
-    The assembly version caused PAGE_FAULT_IN_NONPAGED_AREA (0x50) when loading
-    multiple drivers due to unsafe memory scanning without MmIsAddressValid checks.
-  -->
   <ItemGroup>
     <ClInclude Include="..\..\encrypt\crypter.h" />
-    <ClInclude Include="src\function\AntiDebug.h" />
-    <ClInclude Include="src\function\CoreSecurity.h" />
-    <ClInclude Include="src\function\Dispatcher.h" />
-    <ClInclude Include="src\function\Functions.h" />
-    <ClInclude Include="src\function\impl\driver\PML_Walker.h" />
-    <ClInclude Include="src\function\impl\driver\Strong.h" />
-    <ClInclude Include="src\function\impl\driver\za.h" />
-    <ClInclude Include="src\function\Stealth.h" />
-    <ClInclude Include="src\function\SentinelBridge.h" />
-    <ClInclude Include="src\function\Struct.h" />
     <ClInclude Include="src\imports\Defs.h" />
     <ClInclude Include="src\imports\Strings.h" />
+    <ClInclude Include="src\core\Guardian.h" />
+    <ClInclude Include="src\core\Integrity.h" />
+    <ClInclude Include="src\core\DispatchGuard.h" />
+    <ClInclude Include="src\core\ThreadGuard.h" />
+    <ClInclude Include="src\core\ObjectGuard.h" />
+    <ClInclude Include="src\core\CallbackScanner.h" />
+    <ClInclude Include="src\core\EtwDisable.h" />
+    <ClInclude Include="src\core\PoolScrub.h" />
+    <ClInclude Include="src\core\Heartbeat.h" />
+    <ClInclude Include="src\core\SelfProtect.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
-    <!-- masm.targets is already imported by WDK package, do not duplicate -->
     <Import Project="$(SolutionDir)packages\Microsoft.Windows.SDK.CPP.10.0.26100.1\build\native\Microsoft.Windows.SDK.cpp.targets" Condition="Exists('$(SolutionDir)packages\Microsoft.Windows.SDK.CPP.10.0.26100.1\build\native\Microsoft.Windows.SDK.cpp.targets')" />
   </ImportGroup>
   <Target Name="EnsureNuGetPackageBuildImports" BeforeTargets="PrepareForBuild">

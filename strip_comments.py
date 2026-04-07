@@ -7,12 +7,12 @@ import re
 import os
 
 WORKSPACES = [
-    r"C:\Users\ruar\AiDAPrivate\mapper",
+    r"C:\Users\ruar\AiDAPrivate\driver",
 ]
 
 CPP_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.inl'}
 ASM_EXTENSIONS = {'.asm'}
-SKIP_DIRS = {'build', '.vs', 'x64', 'Debug', 'Release'}
+SKIP_DIRS = {'build', '.vs', 'x64', 'Debug', 'Release', 'packages'}
 
 
 def strip_cpp_comments(source: str) -> str:

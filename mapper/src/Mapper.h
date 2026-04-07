@@ -300,6 +300,11 @@ extern PVOID g_DriverLoadAddress;
 extern WCHAR g_DonorCopyPath[520];
 extern WCHAR g_DonorSignerName[256];
 
+// Sentinel guardian driver support
+extern WCHAR g_SentinelServicePath[128];
+extern PVOID g_SentinelLoadAddress;
+extern ULONG g_SentinelImageSize;
+
 namespace Utils {
     std::wstring GenerateRandomName(size_t length);
     BOOL InitializeNtFunctions();
@@ -324,6 +329,7 @@ namespace KernelUtils {
     BOOL GetCiOptionsAddress(PVOID* outAddress);
     BOOL GetCiDeveloperModeAddress(PVOID* outAddress);
     BOOL PatchDriverSigningFlags(HANDLE device, PCWSTR driverFileName);
+    PVOID GetDriverBaseByName(PCWSTR driverFileName, PULONG outImageSize);
 }
 
 namespace VulnDriver {
@@ -342,10 +348,12 @@ namespace VulnDriver {
 }
 
 namespace MapperCore {
-    NTSTATUS TriggerExploit(PCWSTR targetDriverFileName);
-    NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath);
+    NTSTATUS TriggerExploit(PCWSTR targetDriverFileName, PCWSTR sentinelDriverFileName = nullptr);
+    NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath, PCWSTR sentinelPath = nullptr);
     NTSTATUS RestoreCiCallback(HANDLE device);
     NTSTATUS CleanupArtifacts();
+    BOOL WriteSentinelGlobals(HANDLE device, PVOID sentinelBase, ULONG sentinelImageSize,
+                              PVOID whoswhoBase, ULONG whoswhoImageSize);
 }
 
 namespace SignedMemory {

