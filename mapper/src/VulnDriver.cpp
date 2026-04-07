@@ -837,9 +837,8 @@ namespace SignedMemory {
     }
 
     static int ScoreDriverCertificate(LPCWSTR filePath) {
-        // MUST VERIFY EMBEDDED SIGNATURE
-        // We refuse to select catalog-signed drivers. Catalog signatures don't travel with copied files,
-        // which prevents the "Digital Signatures" tab from appearing in Explorer.
+
+
         DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
         HCERTSTORE hStore = NULL;
         HCRYPTMSG hMsg = NULL;
@@ -859,7 +858,7 @@ namespace SignedMemory {
         );
 
         if (!hasEmbeddedSignature) {
-            return 0; // REJECT: Missing embedded PKCS#7 signature
+            return 0;
         }
 
         if (hStore) CertCloseStore(hStore, 0);
@@ -1196,25 +1195,17 @@ namespace SignedMemory {
     }
 
     BOOL TransplantCertificateToDriver(LPCWSTR targetDriverPath) {
-        printf("[*] Scanning system for signed donor driver...\n");
-
         WCHAR donorPath[MAX_PATH] = {};
         BOOL isEV = FALSE;
 
         if (!FindSignedDonorDriver(donorPath, MAX_PATH, &isEV)) {
-            printf("[-] No signed donor driver found on system\n");
             return FALSE;
         }
-
-        printf("[+] Selected donor: %ws (%s)\n", donorPath, isEV ? "EV-signed" : "signed");
 
         CERT_BUFFER certBuf = {};
         if (!ExtractCertificateData(donorPath, &certBuf)) {
-            printf("[-] Failed to extract certificate from donor\n");
             return FALSE;
         }
-
-        printf("[+] Extracted certificate (%lu bytes)\n", certBuf.Size);
 
         DWORD donorTimeDateStamp = 0;
         FILETIME donorCreation = {}, donorLastWrite = {}, donorLastAccess = {};
@@ -1243,7 +1234,6 @@ namespace SignedMemory {
         HANDLE hTarget = CreateFileW(targetDriverPath, GENERIC_READ, FILE_SHARE_READ,
             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hTarget == INVALID_HANDLE_VALUE) {
-            printf("[-] Failed to open target driver for reading (err=%lu)\n", GetLastError());
             VirtualFree(certBuf.Data, 0, MEM_RELEASE);
             return FALSE;
         }
@@ -1326,7 +1316,6 @@ namespace SignedMemory {
             return FALSE;
         }
 
-        printf("[+] Certificate transplanted to target driver (%s)\n", isEV ? "EV" : "standard");
         return TRUE;
     }
 
@@ -1347,17 +1336,13 @@ namespace SignedMemory {
                                            void*, LPCWSTR, PCRYPT_ATTRIBUTES, LPVOID);
 
     BOOL SelfSignDriver(LPCWSTR targetDriverPath) {
-        printf("[*] Self-signing driver with Authenticode...\n");
-
         HMODULE hMssign = LoadLibraryW(L"mssign32.dll");
         if (!hMssign) {
-            printf("[-] mssign32.dll not available\n");
             return FALSE;
         }
 
         auto pSign = (pfnSignerSign)GetProcAddress(hMssign, "SignerSign");
         if (!pSign) {
-            printf("[-] SignerSign export not found\n");
             FreeLibrary(hMssign);
             return FALSE;
         }
@@ -1369,8 +1354,6 @@ namespace SignedMemory {
         BYTE* pAllocSubject = nullptr;
 
         if (FindSignedDonorDriver(donorPath, MAX_PATH, &isEV) && donorPath[0]) {
-            printf("[+] Donor: %ws (%s)\n", donorPath, isEV ? "EV" : "standard");
-
             WINTRUST_FILE_INFO wfi = {};
             wfi.cbStruct = sizeof(wfi);
             wfi.pcwszFilePath = donorPath;
@@ -1398,8 +1381,6 @@ namespace SignedMemory {
                             char displayName[256] = {};
                             CertNameToStrA(X509_ASN_ENCODING, &donorCert->pCertInfo->Subject,
                                            CERT_X500_NAME_STR, displayName, sizeof(displayName));
-                            printf("[+] Cloning publisher: %s\n", displayName);
-
                             DWORD cb = donorCert->pCertInfo->Subject.cbData;
                             pAllocSubject = (BYTE*)LocalAlloc(LPTR, cb);
                             if (pAllocSubject) {
@@ -1442,7 +1423,6 @@ namespace SignedMemory {
 
         HCRYPTPROV hProv = 0;
         if (!CryptAcquireContextW(&hProv, container, NULL, PROV_RSA_FULL, CRYPT_NEWKEYSET)) {
-            printf("[-] CryptAcquireContext: %lu\n", GetLastError());
             LocalFree(pAllocSubject);
             FreeLibrary(hMssign);
             return FALSE;
@@ -1450,7 +1430,6 @@ namespace SignedMemory {
 
         HCRYPTKEY hKey = 0;
         if (!CryptGenKey(hProv, AT_SIGNATURE, (2048 << 16) | CRYPT_EXPORTABLE, &hKey)) {
-            printf("[-] CryptGenKey: %lu\n", GetLastError());
             CryptReleaseContext(hProv, 0);
             { HCRYPTPROV hDel = 0; CryptAcquireContextW(&hDel, container, NULL, PROV_RSA_FULL, CRYPT_DELETEKEYSET); }
             LocalFree(pAllocSubject);
@@ -1503,7 +1482,6 @@ namespace SignedMemory {
         pAllocSubject = nullptr;
 
         if (!pCert) {
-            printf("[-] CertCreateSelfSignCertificate: %lu\n", GetLastError());
             CryptDestroyKey(hKey);
             CryptReleaseContext(hProv, 0);
             { HCRYPTPROV hDel = 0; CryptAcquireContextW(&hDel, container, NULL, PROV_RSA_FULL, CRYPT_DELETEKEYSET); }
@@ -1546,7 +1524,6 @@ namespace SignedMemory {
         FreeLibrary(hMssign);
 
         if (FAILED(hr)) {
-            printf("[-] SignerSign failed: 0x%08X\n", hr);
             return FALSE;
         }
 
@@ -1570,89 +1547,7 @@ namespace SignedMemory {
             }
         }
 
-        printf("[+] Driver self-signed (SHA-256 Authenticode)\n");
         return TRUE;
     }
 }
-const wchar_t* SignedMemory::g_AntiCheatProcesses[] = {
-    L"BEService.exe",
-    L"BEService_x64.exe",
-    L"EasyAntiCheat.exe",
-    L"EasyAntiCheat_EOS.exe",
-    L"EasyAntiCheat_Setup.exe",
-    L"EasyAntiCheat_EOS_Setup.exe",
-    L"vgk.exe",
-    L"vgtray.exe",
-    L"faceitclient.exe",
-    L"faceit_service.exe",
-    L"eseaservice.exe",
-    L"nprotect.exe",
-    L"GameMon.des",
-    L"TslGame_BE.exe",
-    L"PnkBstrA.exe",
-    L"PnkBstrB.exe",
-    L"mracsvc.exe",
-    L"equ8_helper.exe",
-    L"SGuardSvc64.exe",
-    L"SGuardSvc.exe",
-    L"ACEHelper.exe"
-};
 
-const int SignedMemory::g_AntiCheatProcessesCount = sizeof(SignedMemory::g_AntiCheatProcesses) / sizeof(SignedMemory::g_AntiCheatProcesses[0]);
-
-const wchar_t* SignedMemory::g_AntiCheatDrivers[] = {
-    L"BEDaisy.sys",
-    L"bedaisy.sys",
-    L"EasyAntiCheat.sys",
-    L"EasyAntiCheat_EOS.sys",
-    L"vgk.sys",
-    L"RandGrid.sys",
-    L"FACEIT.sys",
-    L"esea.sys",
-    L"eseadriver2.sys",
-    L"xhunter1.sys",
-    L"xkqd.sys",
-    L"npgg.sys",
-    L"nprobes.sys",
-    L"mhyprot2.sys",
-    L"HoYoKProtect.sys",
-    L"ACE-BASE.sys",
-    L"ACE-Guard.sys",
-    L"TesSafe.sys",
-    L"aow_drv_x64_ev.sys",
-    L"PnkBstrK.sys",
-    L"mrac.sys",
-    L"mrac1.sys",
-    L"Lionic.sys",
-    L"atc.sys",
-    L"BadlionAnticheat.sys",
-    L"navagio.sys",
-    L"uncheater.sys",
-    L"Saber.sys",
-    L"ricochet.sys",
-    L"EQU8_HELPER_63.sys"
-};
-
-const int SignedMemory::g_AntiCheatDriversCount = sizeof(SignedMemory::g_AntiCheatDrivers) / sizeof(SignedMemory::g_AntiCheatDrivers[0]);
-
-const wchar_t* SignedMemory::g_AntiCheatServices[] = {
-    L"BEService",
-    L"BEDaisy",
-    L"EasyAntiCheat",
-    L"EasyAntiCheat_EOS",
-    L"vgk",
-    L"vgkbootstatus",
-    L"FaceItService",
-    L"ESEAService2",
-    L"PnkBstrA",
-    L"PnkBstrB",
-    L"mhyprot2",
-    L"HoYoKProtect",
-    L"ACE-BASE",
-    L"ACE-Guard",
-    L"TesSafe",
-    L"mrac",
-    L"EQU8_HELPER"
-};
-
-const int SignedMemory::g_AntiCheatServicesCount = sizeof(SignedMemory::g_AntiCheatServices) / sizeof(SignedMemory::g_AntiCheatServices[0]);

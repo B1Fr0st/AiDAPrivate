@@ -57,4 +57,5 @@ ai_assistant.cfg
 
 driver/WhosWho/packages/
 driver/Sentinel/packages/
+driver/Sentinel/Sentinel/packages/
 bot/node_modules/

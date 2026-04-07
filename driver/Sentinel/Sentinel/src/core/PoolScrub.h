@@ -206,7 +206,7 @@ namespace pool_scrub {
         if (!nt_base)
             return false;
 
-        resolve_big_pool_table(nt_base);
+        bool resolved = resolve_big_pool_table(nt_base);
 
 
         scrub_tags();

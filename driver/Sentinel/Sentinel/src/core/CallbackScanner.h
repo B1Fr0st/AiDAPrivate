@@ -214,7 +214,6 @@ namespace callback_scanner {
         g_load_image_array = find_load_image_array(nt_base);
         g_create_process_array = find_create_process_array(nt_base);
 
-
         if (g_load_image_array)
             g_baseline_load_image_count = count_callback_array(g_load_image_array);
 
@@ -222,7 +221,6 @@ namespace callback_scanner {
             g_baseline_create_process_count = count_callback_array(g_create_process_array);
 
         _InterlockedExchange(&g_initialized, 1);
-
 
         return true;
     }
@@ -235,10 +233,8 @@ namespace callback_scanner {
         if (g_load_image_array) {
             ULONG current = count_callback_array(g_load_image_array);
             if (current > g_baseline_load_image_count + 2) {
-                // Callback count grew — this is normal when anticheats, EDRs,
-                // or other kernel software registers notification routines.
-                // Re-baseline instead of treating it as an attack.  The real
-                // tamper detection is CRC integrity checking of WhosWho's .text.
+
+
                 g_baseline_load_image_count = current;
             }
         }
@@ -246,7 +242,7 @@ namespace callback_scanner {
         if (g_create_process_array) {
             ULONG current = count_callback_array(g_create_process_array);
             if (current > g_baseline_create_process_count + 2) {
-                // Same rationale: re-baseline to absorb legitimate registrations.
+
                 g_baseline_create_process_count = current;
             }
         }

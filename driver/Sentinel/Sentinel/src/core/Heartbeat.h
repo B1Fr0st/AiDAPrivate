@@ -27,20 +27,25 @@ namespace heartbeat {
 
 
     __forceinline bool locate_bridge(PVOID whoswho_base, ULONG whoswho_size) {
-        if (!whoswho_base || whoswho_size == 0)
-            return false;
 
-        if (!_MmIsAddressValid(whoswho_base))
+        if (!whoswho_base || whoswho_size == 0) {
             return false;
+        }
+
+        if (!_MmIsAddressValid(whoswho_base)) {
+            return false;
+        }
 
         PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(whoswho_base);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
             return false;
+        }
 
         PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(
             static_cast<UCHAR*>(whoswho_base) + dos->e_lfanew);
-        if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE)
+        if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE) {
             return false;
+        }
 
         PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
 
@@ -85,6 +90,7 @@ namespace heartbeat {
                         g_last_whoswho_tsc = static_cast<UINT64>(bridge->whoswho_tsc);
                         g_last_check_tsc = __rdtsc();
                         return true;
+                    } else {
                     }
                 }
             } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -96,11 +102,13 @@ namespace heartbeat {
     }
 
     __forceinline bool init(PVOID whoswho_base, ULONG whoswho_size) {
-        if (!whoswho_base || whoswho_size == 0)
+        if (!whoswho_base || whoswho_size == 0) {
             return false;
+        }
 
-        if (!locate_bridge(whoswho_base, whoswho_size))
+        if (!locate_bridge(whoswho_base, whoswho_size)) {
             return false;
+        }
 
         _InterlockedExchange(&g_initialized, 1);
         return true;
@@ -112,40 +120,41 @@ namespace heartbeat {
             return true;
 
         if (!g_bridge || !_MmIsAddressValid(reinterpret_cast<PVOID>(
-                const_cast<sentinel_bridge_t*>(g_bridge))))
+                const_cast<sentinel_bridge_t*>(g_bridge)))) {
             return true;
+        }
 
         __try {
+            LONG64 now_tsc = static_cast<LONG64>(__rdtsc());
             InterlockedExchange64(
-                const_cast<volatile LONG64*>(&g_bridge->sentinel_tsc),
-                static_cast<LONG64>(__rdtsc()));
+                const_cast<volatile LONG64*>(&g_bridge->sentinel_tsc), now_tsc);
 
             UINT64 current_whoswho_tsc = static_cast<UINT64>(g_bridge->whoswho_tsc);
-            UINT64 now_tsc = __rdtsc();
+            UINT64 now_check = __rdtsc();
 
             if (!_InterlockedCompareExchange(&g_first_heartbeat_seen, 0, 0)) {
                 if (current_whoswho_tsc != 0) {
                     _InterlockedExchange(&g_first_heartbeat_seen, 1);
                     g_last_whoswho_tsc = current_whoswho_tsc;
-                    g_last_check_tsc = now_tsc;
+                    g_last_check_tsc = now_check;
                 }
                 return true;
             }
 
             if (current_whoswho_tsc != g_last_whoswho_tsc) {
                 g_last_whoswho_tsc = current_whoswho_tsc;
-                g_last_check_tsc = now_tsc;
+                g_last_check_tsc = now_check;
                 return true;
             }
 
-            UINT64 elapsed = now_tsc - g_last_check_tsc;
+            UINT64 elapsed = now_check - g_last_check_tsc;
 
             if (elapsed > HEARTBEAT_TIMEOUT_TSC) {
                 if (_KeBugCheckEx) {
                     _KeBugCheckEx(
                         0xDEAD5E05,
                         (ULONG_PTR)g_last_whoswho_tsc,
-                        (ULONG_PTR)now_tsc,
+                        (ULONG_PTR)now_check,
                         (ULONG_PTR)HEARTBEAT_TIMEOUT_TSC,
                         (ULONG_PTR)elapsed
                     );

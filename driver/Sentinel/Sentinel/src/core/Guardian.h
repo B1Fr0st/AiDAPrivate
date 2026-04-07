@@ -68,8 +68,9 @@ namespace guardian {
 
 
     __forceinline bool start() {
-        if (!_KeInitializeDpc || !_KeInitializeTimerEx || !_KeSetTimerEx)
+        if (!_KeInitializeDpc || !_KeInitializeTimerEx || !_KeSetTimerEx) {
             return false;
+        }
 
 
         _KeInitializeTimerEx(&g_timer, NotificationTimer);

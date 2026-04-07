@@ -1,5 +1,11 @@
 #pragma once
 #include <imports/Defs.h>
+#include <core/DispatchGuard.h>
+
+
+namespace self_protect {
+    __forceinline bool safe_write_memory(PVOID dest, PVOID src, SIZE_T size);
+}
 
 
 namespace integrity {
@@ -102,14 +108,16 @@ namespace integrity {
 
 
         if (!_MmIsAddressValid(code_base) ||
-            !_MmIsAddressValid(static_cast<PUCHAR>(code_base) + code_size - 1))
+            !_MmIsAddressValid(static_cast<PUCHAR>(code_base) + code_size - 1)) {
             return false;
+        }
 
         g_code_base = code_base;
         g_code_size = code_size;
 
-        if (!create_shadow_copy(code_base, code_size))
+        if (!create_shadow_copy(code_base, code_size)) {
             return false;
+        }
 
         g_baseline_crc = compute_crc32(code_base, code_size);
 
@@ -123,6 +131,9 @@ namespace integrity {
     }
 
 
+    inline volatile LONG g_integrity_strikes = 0;
+    constexpr LONG       INTEGRITY_STRIKE_THRESHOLD = 5;
+
     __forceinline bool verify() {
         PVOID base = (PVOID)g_code_base;
         ULONG size = g_code_size;
@@ -130,25 +141,38 @@ namespace integrity {
         if (!base || size == 0)
             return true;
 
-
         if (!_MmIsAddressValid(base))
             return true;
 
 
         PVOID bp = scan_for_breakpoints(base, size);
         if (bp) {
-
             ULONG offset = (ULONG)((ULONG_PTR)bp - (ULONG_PTR)base);
-            if (_KeBugCheckEx) {
-                _KeBugCheckEx(
-                    0xDEAD5E01,
-                    (ULONG_PTR)bp,
-                    (ULONG_PTR)0xCC,
-                    (ULONG_PTR)offset,
-                    (ULONG_PTR)1
-                );
+
+
+            UCHAR original_byte = g_shadow_copy[offset];
+            bool restored = self_protect::safe_write_memory(
+                bp, &original_byte, 1);
+
+            if (!restored) {
+
+                LONG strikes = _InterlockedIncrement(&g_integrity_strikes);
+                if (strikes >= INTEGRITY_STRIKE_THRESHOLD) {
+                    if (_KeBugCheckEx) {
+                        _KeBugCheckEx(
+                            0xDEAD5E01,
+                            (ULONG_PTR)bp,
+                            (ULONG_PTR)0xCC,
+                            (ULONG_PTR)offset,
+                            (ULONG_PTR)1
+                        );
+                    }
+                    return false;
+                }
             }
-            return false;
+
+
+            return true;
         }
 
 
@@ -156,18 +180,75 @@ namespace integrity {
 
         if (current_crc != g_baseline_crc) {
             ULONG diff_offset = find_first_diff(base, size);
-            if (_KeBugCheckEx) {
-                _KeBugCheckEx(
-                    0xDEAD5E01,
-                    (ULONG_PTR)base + diff_offset,
-                    (ULONG_PTR)g_baseline_crc,
-                    (ULONG_PTR)current_crc,
-                    (ULONG_PTR)0
-                );
+
+            if (diff_offset != (ULONG)-1) {
+
+
+                UCHAR* diff_addr = static_cast<UCHAR*>(base) + diff_offset;
+
+
+                UCHAR modified_bytes[16] = {};
+                ULONG bytes_to_read = min(16UL, size - diff_offset);
+                __try {
+                    RtlCopyMemory(modified_bytes, diff_addr, bytes_to_read);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+
+                    goto count_strike;
+                }
+
+
+                PVOID hook_dest = dispatch_guard::resolve_hook_destination(
+                    modified_bytes, diff_addr);
+
+                if (hook_dest && dispatch_guard::is_address_in_loaded_module(hook_dest)) {
+
+
+                    g_baseline_crc = current_crc;
+                    __try {
+                        RtlCopyMemory(g_shadow_copy, base, size);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+
+                    }
+                    _InterlockedExchange(&g_integrity_strikes, 0);
+                    return true;
+                }
+
+
+                bool restored = self_protect::safe_write_memory(
+                    diff_addr, g_shadow_copy + diff_offset,
+                    min((ULONG)64, size - diff_offset));
+
+                if (restored) {
+
+                    UINT32 after_crc = compute_crc32(base, size);
+                    if (after_crc == g_baseline_crc) {
+
+                        _InterlockedExchange(&g_integrity_strikes, 0);
+                        return true;
+                    }
+                }
             }
-            return false;
+
+        count_strike:
+
+            LONG strikes = _InterlockedIncrement(&g_integrity_strikes);
+            if (strikes >= INTEGRITY_STRIKE_THRESHOLD) {
+                if (_KeBugCheckEx) {
+                    _KeBugCheckEx(
+                        0xDEAD5E01,
+                        (ULONG_PTR)base + diff_offset,
+                        (ULONG_PTR)g_baseline_crc,
+                        (ULONG_PTR)current_crc,
+                        (ULONG_PTR)0
+                    );
+                }
+                return false;
+            }
+            return true;
         }
 
+
+        _InterlockedExchange(&g_integrity_strikes, 0);
         return true;
     }
 }

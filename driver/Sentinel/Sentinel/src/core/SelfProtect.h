@@ -262,8 +262,9 @@ namespace self_protect {
 
         if (!_ExAcquireResourceExclusiveLite || !_ExReleaseResourceLite ||
             !_KeEnterCriticalRegion || !_KeLeaveCriticalRegion ||
-            !_RtlLookupElementGenericTableAvl || !_RtlDeleteElementGenericTableAvl)
+            !_RtlLookupElementGenericTableAvl || !_RtlDeleteElementGenericTableAvl) {
             return false;
+        }
 
         PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(ldr_entry->DllBase);
         if (dos->e_magic != IMAGE_DOS_SIGNATURE)
@@ -354,8 +355,9 @@ namespace self_protect {
             }
         }
 
-        if (!p_table)
+        if (!p_table) {
             return false;
+        }
 
         PVOID p_lock = nullptr;
 
@@ -901,8 +903,9 @@ namespace self_protect {
             return;
 
         PVOID nt_base = reinterpret_cast<PVOID>(get_nt_base());
-        if (!nt_base)
+        if (!nt_base) {
             return;
+        }
 
         PLDR_DATA_TABLE_ENTRY ldr = nullptr;
         if (driver_object->DriverSection && _MmIsAddressValid(driver_object->DriverSection))
@@ -925,6 +928,12 @@ namespace self_protect {
     }
 
 
+    inline PUCHAR          g_own_shadow_copy  = nullptr;
+
+
+    inline volatile LONG   g_own_integrity_strikes = 0;
+    constexpr LONG         OWN_INTEGRITY_STRIKE_THRESHOLD = 5;
+
     __forceinline bool init_baseline(PVOID own_code_base, ULONG own_code_size) {
         if (!own_code_base || own_code_size == 0)
             return false;
@@ -932,10 +941,24 @@ namespace self_protect {
         g_own_code_base = own_code_base;
         g_own_code_size = own_code_size;
 
+
+        g_own_shadow_copy = static_cast<PUCHAR>(
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, own_code_size, 'sCmM')
+        );
+        if (g_own_shadow_copy) {
+            __try {
+                RtlCopyMemory(g_own_shadow_copy, own_code_base, own_code_size);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                ExFreePoolWithTag(g_own_shadow_copy, 'sCmM');
+                g_own_shadow_copy = nullptr;
+            }
+        }
+
         g_own_baseline_crc = integrity::compute_crc32(own_code_base, own_code_size);
 
-        if (g_own_baseline_crc == 0)
+        if (g_own_baseline_crc == 0) {
             return false;
+        }
 
         _InterlockedExchange(&g_initialized, 1);
         return true;
@@ -955,18 +978,85 @@ namespace self_protect {
         UINT32 current_crc = integrity::compute_crc32(base, size);
 
         if (current_crc != g_own_baseline_crc) {
-            if (_KeBugCheckEx) {
-                _KeBugCheckEx(
-                    0xDEAD5E08,
-                    (ULONG_PTR)base,
-                    (ULONG_PTR)g_own_baseline_crc,
-                    (ULONG_PTR)current_crc,
-                    (ULONG_PTR)0
-                );
+
+
+            ULONG diff_offset = (ULONG)-1;
+            if (g_own_shadow_copy) {
+                const UCHAR* current = static_cast<const UCHAR*>(base);
+                __try {
+                    for (ULONG i = 0; i < size; i++) {
+                        if (current[i] != g_own_shadow_copy[i]) {
+                            diff_offset = i;
+                            break;
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    diff_offset = (ULONG)-1;
+                }
             }
-            return false;
+
+            if (diff_offset != (ULONG)-1) {
+                UCHAR* diff_addr = static_cast<UCHAR*>(base) + diff_offset;
+
+
+                UCHAR modified_bytes[16] = {};
+                ULONG bytes_to_read = min(16UL, size - diff_offset);
+                __try {
+                    RtlCopyMemory(modified_bytes, diff_addr, bytes_to_read);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    goto own_count_strike;
+                }
+
+                PVOID hook_dest = dispatch_guard::resolve_hook_destination(
+                    modified_bytes, diff_addr);
+
+                if (hook_dest && dispatch_guard::is_address_in_loaded_module(hook_dest)) {
+
+                    g_own_baseline_crc = current_crc;
+                    if (g_own_shadow_copy) {
+                        __try {
+                            RtlCopyMemory(g_own_shadow_copy, base, size);
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    }
+                    _InterlockedExchange(&g_own_integrity_strikes, 0);
+                    return true;
+                }
+
+
+                if (g_own_shadow_copy) {
+                    bool restored = safe_write_memory(
+                        diff_addr, g_own_shadow_copy + diff_offset,
+                        min((ULONG)64, size - diff_offset));
+
+                    if (restored) {
+                        UINT32 after_crc = integrity::compute_crc32(base, size);
+                        if (after_crc == g_own_baseline_crc) {
+                            _InterlockedExchange(&g_own_integrity_strikes, 0);
+                            return true;
+                        }
+                    }
+                }
+            }
+
+        own_count_strike:
+            LONG strikes = _InterlockedIncrement(&g_own_integrity_strikes);
+            if (strikes >= OWN_INTEGRITY_STRIKE_THRESHOLD) {
+                if (_KeBugCheckEx) {
+                    _KeBugCheckEx(
+                        0xDEAD5E08,
+                        (ULONG_PTR)base,
+                        (ULONG_PTR)g_own_baseline_crc,
+                        (ULONG_PTR)current_crc,
+                        (ULONG_PTR)0
+                    );
+                }
+                return false;
+            }
+            return true;
         }
 
+
+        _InterlockedExchange(&g_own_integrity_strikes, 0);
         return true;
     }
 }

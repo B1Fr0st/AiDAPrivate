@@ -96,7 +96,7 @@ static BOOLEAN ForceDeleteFileByPath(PUNICODE_STRING FilePath) {
     InitializeObjectAttributes(&objAttr, FilePath,
         OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-    // Pre-step: clear ImageSectionObject so the file can be deleted
+
     {
         HANDLE clearHandle = NULL;
         IO_STATUS_BLOCK clearIosb = {};
@@ -128,7 +128,7 @@ static BOOLEAN ForceDeleteFileByPath(PUNICODE_STRING FilePath) {
         }
     }
 
-    // Tier 0: POSIX unlink via IoCreateFileEx + FileDispositionInformationEx
+
     if (_IoCreateFileEx) {
         HANDLE fileHandle = NULL;
         IO_STATUS_BLOCK ioStatus = {};
@@ -163,13 +163,13 @@ static BOOLEAN ForceDeleteFileByPath(PUNICODE_STRING FilePath) {
         }
     }
 
-    // Tier 1: ZwDeleteFile
+
     if (_ZwDeleteFile) {
         if (NT_SUCCESS(_ZwDeleteFile(&objAttr)))
             return TRUE;
     }
 
-    // Tier 2: DELETE_ON_CLOSE via IoCreateFileEx
+
     if (_IoCreateFileEx) {
         HANDLE fileHandle = NULL;
         IO_STATUS_BLOCK ioStatus = {};
@@ -193,7 +193,7 @@ static BOOLEAN ForceDeleteFileByPath(PUNICODE_STRING FilePath) {
         }
     }
 
-    // Tier 3: standard FileDispositionInformation
+
     {
         HANDLE fileHandle = NULL;
         IO_STATUS_BLOCK ioStatus = {};
@@ -289,7 +289,6 @@ static VOID DeleteDriverOnDisk(PUNICODE_STRING RegistryPath) {
 
 static void NTAPI init_thread_routine(PVOID ) {
 
-
     constexpr ULONG MAX_POLLS = 300;
     constexpr LONG64 POLL_INTERVAL = -1'000'000LL;
 
@@ -297,59 +296,157 @@ static void NTAPI init_thread_routine(PVOID ) {
     interval.QuadPart = POLL_INTERVAL;
 
     for (ULONG i = 0; i < MAX_POLLS; i++) {
-        if (_InterlockedCompareExchange(&g_shutdown_flag, 0, 0))
+        if (_InterlockedCompareExchange(&g_shutdown_flag, 0, 0)) {
             goto exit_thread;
+        }
 
-        if (g_target_driver_base != nullptr)
+        if (g_target_driver_base != nullptr) {
             break;
+        }
 
         _KeDelayExecutionThread(KernelMode, FALSE, &interval);
     }
 
 
-    if (g_target_driver_base == nullptr)
+    if (g_target_driver_base == nullptr) {
+        if (g_sentinel_driver_object &&
+            _MmIsAddressValid(g_sentinel_driver_object) &&
+            g_sentinel_driver_object->DriverSection &&
+            _MmIsAddressValid(g_sentinel_driver_object->DriverSection))
+        {
+            PLDR_DATA_TABLE_ENTRY sentinel_ldr = static_cast<PLDR_DATA_TABLE_ENTRY>(
+                g_sentinel_driver_object->DriverSection);
+            PLIST_ENTRY list_head = &sentinel_ldr->InLoadOrderModuleList;
+            PLIST_ENTRY entry = list_head->Flink;
+            ULONG safety = 512;
+
+            while (entry && entry != list_head && safety-- > 0) {
+                if (!_MmIsAddressValid(entry))
+                    break;
+
+                PLDR_DATA_TABLE_ENTRY mod = CONTAINING_RECORD(
+                    entry, LDR_DATA_TABLE_ENTRY, InLoadOrderModuleList);
+
+                if (!_MmIsAddressValid(mod) || !mod->DllBase || !mod->SizeOfImage) {
+                    entry = entry->Flink;
+                    continue;
+                }
+
+
+                if (mod->DllBase == sentinel_ldr->DllBase) {
+                    entry = entry->Flink;
+                    continue;
+                }
+
+                PVOID mod_base = mod->DllBase;
+                ULONG mod_size = mod->SizeOfImage;
+
+
+                if (reinterpret_cast<ULONG_PTR>(mod_base) < 0xFFFF800000000000ULL ||
+                    mod_size > 50 * 1024 * 1024) {
+                    entry = entry->Flink;
+                    continue;
+                }
+
+
+                __try {
+                    if (!_MmIsAddressValid(mod_base))
+                        goto next_module;
+
+                    PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(mod_base);
+                    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+                        goto next_module;
+
+                    PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(
+                        static_cast<UCHAR*>(mod_base) + dos->e_lfanew);
+                    if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE)
+                        goto next_module;
+
+                    PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
+                    for (USHORT si = 0; si < nt->FileHeader.NumberOfSections; si++) {
+                        UCHAR* sec_base = static_cast<UCHAR*>(mod_base) + sections[si].VirtualAddress;
+                        ULONG sec_size = sections[si].Misc.VirtualSize;
+
+                        if (sec_size < sizeof(heartbeat::sentinel_bridge_t))
+                            continue;
+
+                        for (ULONG off = 0; off <= sec_size - sizeof(heartbeat::sentinel_bridge_t); off += 4) {
+                            if (!_MmIsAddressValid(sec_base + off))
+                                continue;
+
+                            volatile UINT32* magic_ptr = reinterpret_cast<volatile UINT32*>(sec_base + off);
+                            if (*magic_ptr != heartbeat::BRIDGE_MAGIC)
+                                continue;
+
+                            volatile UINT32* ver_ptr = magic_ptr + 1;
+                            if (!_MmIsAddressValid(reinterpret_cast<PVOID>(const_cast<UINT32*>(ver_ptr))))
+                                continue;
+
+                            if (*ver_ptr != heartbeat::BRIDGE_VERSION)
+                                continue;
+
+
+                            g_target_driver_base = mod_base;
+                            g_target_driver_size = mod_size;
+                            goto discovery_done;
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+
+                }
+
+            next_module:
+                entry = entry->Flink;
+            }
+        }
+    }
+discovery_done:
+
+    if (g_target_driver_base == nullptr) {
         goto exit_thread;
+    }
 
 
     {
         PVOID target_base = (PVOID)g_target_driver_base;
 
-        if (!_MmIsAddressValid(target_base))
+        if (!_MmIsAddressValid(target_base)) {
             goto exit_thread;
+        }
 
-
-        if (reinterpret_cast<ULONG_PTR>(target_base) < 0xFFFF800000000000ULL)
+        if (reinterpret_cast<ULONG_PTR>(target_base) < 0xFFFF800000000000ULL) {
             goto exit_thread;
-
+        }
 
         PVOID target_text = nullptr;
         ULONG target_text_size = 0;
-        if (!find_target_text(target_base, &target_text, &target_text_size))
+        if (!find_target_text(target_base, &target_text, &target_text_size)) {
             goto exit_thread;
+        }
 
-        if (!target_text || target_text_size == 0 || target_text_size > 10 * 1024 * 1024)
+        if (!target_text || target_text_size == 0 || target_text_size > 10 * 1024 * 1024) {
             goto exit_thread;
+        }
 
 
         PDRIVER_OBJECT target_driver_obj = find_target_driver_object(target_base);
 
 
-        integrity::init(target_text, target_text_size);
+        bool integrity_ok = integrity::init(target_text, target_text_size);
 
 
-        if (target_driver_obj)
-            dispatch_guard::snapshot(target_driver_obj);
+        if (target_driver_obj) {
+            bool dg_ok = dispatch_guard::snapshot(target_driver_obj);
+        }
 
-        // Initialize PsLoadedModuleList access so dispatch_guard::verify() can
-        // distinguish legitimately-loaded kernel modules (anticheat drivers) from
-        // rogue pool / manually-mapped memory when a dispatch pointer changes.
-        dispatch_guard::init_module_list(g_sentinel_driver_object);
+
+        bool ml_ok = dispatch_guard::init_module_list(g_sentinel_driver_object);
 
 
         {
             PVOID nt_base = reinterpret_cast<PVOID>(get_nt_base());
             if (nt_base) {
-                etw_disable::init();
+                bool etw_ok = etw_disable::init();
             }
         }
 
@@ -357,7 +454,7 @@ static void NTAPI init_thread_routine(PVOID ) {
         {
             PVOID nt_base = reinterpret_cast<PVOID>(get_nt_base());
             if (nt_base) {
-                callback_scanner::init();
+                bool cb_ok = callback_scanner::init();
             }
         }
 
@@ -365,36 +462,41 @@ static void NTAPI init_thread_routine(PVOID ) {
         {
             PVOID nt_base = reinterpret_cast<PVOID>(get_nt_base());
             if (nt_base) {
-                pool_scrub::init();
+                bool ps_ok = pool_scrub::init();
                 pool_scrub::scrub_tags();
             }
         }
 
 
         {
-            heartbeat::init(target_base,
-                            g_target_driver_size ? g_target_driver_size : target_text_size * 4);
+            ULONG hb_size = g_target_driver_size ? g_target_driver_size : target_text_size * 4;
+            bool hb_ok = heartbeat::init(target_base, hb_size);
         }
 
 
-        if (target_driver_obj)
-            object_guard::init(target_driver_obj);
+
+        bool guard_ok = guardian::start();
+
+
+        if (target_driver_obj) {
+            bool og_ok = object_guard::init(target_driver_obj);
+        }
+
 
 
         thread_guard::ipi_clear_all_cpus();
 
 
-        // Apply stealth now — runs in system thread at PASSIVE_LEVEL,
-        // after DriverEntry has returned and IopLoadDriver released its locks
-        self_protect::apply_stealth(g_sentinel_driver_object);
+        __try {
+            self_protect::apply_stealth(g_sentinel_driver_object);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
 
 
-        // Delete the Sentinel driver .sys from disk
-        if (g_registry_path.Buffer && g_registry_path.Length > 0)
+        if (g_registry_path.Buffer && g_registry_path.Length > 0) {
             DeleteDriverOnDisk(&g_registry_path);
+        }
 
-
-        guardian::start();
     }
 
 exit_thread:
@@ -411,8 +513,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     g_sentinel_driver_object = DriverObject;
 
 
-    // Deep-copy RegistryPath for use in the init thread (the original buffer
-    // is only valid for the duration of DriverEntry)
     if (RegistryPath && RegistryPath->Buffer && RegistryPath->Length > 0) {
         USHORT copy_len = RegistryPath->Length;
         if (copy_len > sizeof(g_registry_path_buffer) - sizeof(WCHAR))
@@ -449,9 +549,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         find_text_section(own_base, &own_text, &own_text_size);
     }
 
-
-    if (own_text && own_text_size > 0)
-        self_protect::init_baseline(own_text, own_text_size);
+    if (own_text && own_text_size > 0) {
+        bool bl_ok = self_protect::init_baseline(own_text, own_text_size);
+    }
 
 
     HANDLE thread_handle = nullptr;
@@ -471,7 +571,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         _ZwClose(thread_handle);
         g_init_thread_handle = nullptr;
     }
-
 
     return STATUS_SUCCESS;
 }

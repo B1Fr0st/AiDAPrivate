@@ -300,7 +300,7 @@ extern PVOID g_DriverLoadAddress;
 extern WCHAR g_DonorCopyPath[520];
 extern WCHAR g_DonorSignerName[256];
 
-// Sentinel guardian driver support
+
 extern WCHAR g_SentinelServicePath[128];
 extern PVOID g_SentinelLoadAddress;
 extern ULONG g_SentinelImageSize;
@@ -357,13 +357,6 @@ namespace MapperCore {
 }
 
 namespace SignedMemory {
-    extern const wchar_t* g_AntiCheatProcesses[];
-    extern const int g_AntiCheatProcessesCount;
-    extern const wchar_t* g_AntiCheatDrivers[];
-    extern const int g_AntiCheatDriversCount;
-    extern const wchar_t* g_AntiCheatServices[];
-    extern const int g_AntiCheatServicesCount;
-
     BOOL TransplantCertificateToDriver(LPCWSTR targetDriverPath);
     BOOL SelfSignDriver(LPCWSTR targetDriverPath);
 }

@@ -86,7 +86,7 @@
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
     <IncludePath>ext;src;..\..\encrypt;$(IncludePath)</IncludePath>
     <OutDir>C:\Users\ruar\AiDAPrivate\build\Release\</OutDir>
-    <IntDir>$(SolutionDir)artifacts\</IntDir>
+    <IntDir>$(SolutionDir)artifacts\WhosWho\</IntDir>
     <EnableInf2cat>false</EnableInf2cat>
     <ApiValidator_Enable>false</ApiValidator_Enable>
     <SignMode>Off</SignMode>
@@ -112,6 +112,7 @@
     <ClCompile>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
+      <AdditionalOptions>/FS %(AdditionalOptions)</AdditionalOptions>
       <BufferSecurityCheck>false</BufferSecurityCheck>
       <ControlFlowGuard>false</ControlFlowGuard>
       <TreatWarningAsError>false</TreatWarningAsError>

@@ -47,40 +47,10 @@ typedef struct _FWPS_TRANSPORT_SEND_PARAMS0_COMPAT {
 #define AIDA_ENDPOINT_PID_CACHE_SIZE 128
 
 
-#ifdef AIDA_NET_DEBUG
-#define NET_DBG(fmt, ...) \
-    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL, \
-               "[AIDA-NET] " fmt "\n", ##__VA_ARGS__)
-#define NET_ERR(fmt, ...) \
-    DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL, \
-               "[AIDA-NET][ERR] " fmt "\n", ##__VA_ARGS__)
-#else
 #define NET_DBG(fmt, ...) ((void)0)
 #define NET_ERR(fmt, ...) ((void)0)
-#endif
-
-
-#ifdef AIDA_NET_DEBUG
-static volatile LONG g_net_dbg_inbound_counter = 0;
-static volatile LONG g_net_dbg_outbound_counter = 0;
-#define NET_DBG_RATE_IN(interval, fmt, ...) \
-    do { \
-        LONG _c = _InterlockedIncrement(&g_net_dbg_inbound_counter); \
-        if ((_c % (interval)) == 0) \
-            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL, \
-                       "[AIDA-NET][IN #%ld] " fmt "\n", _c, ##__VA_ARGS__); \
-    } while(0)
-#define NET_DBG_RATE_OUT(interval, fmt, ...) \
-    do { \
-        LONG _c = _InterlockedIncrement(&g_net_dbg_outbound_counter); \
-        if ((_c % (interval)) == 0) \
-            DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_INFO_LEVEL, \
-                       "[AIDA-NET][OUT #%ld] " fmt "\n", _c, ##__VA_ARGS__); \
-    } while(0)
-#else
 #define NET_DBG_RATE_IN(interval, fmt, ...) ((void)0)
 #define NET_DBG_RATE_OUT(interval, fmt, ...) ((void)0)
-#endif
 
 
 typedef struct _FWPS_CALLOUT2_COMPAT {

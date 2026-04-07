@@ -145,7 +145,7 @@ namespace etw_disable {
         if (!nt_base)
             return false;
 
-        find_and_disable(nt_base);
+        bool disabled = find_and_disable(nt_base);
 
         _InterlockedExchange(&g_initialized, 1);
         return true;
