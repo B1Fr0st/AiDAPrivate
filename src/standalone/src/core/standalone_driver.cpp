@@ -550,6 +550,34 @@ namespace driver_bridge
         return false;
     }
 
+    bool write_memory(uint64_t address, const std::vector<uint8_t>& data)
+    {
+        {
+            uint64_t gt = standalone_license::inline_gate_check(
+                standalone_license::gate_driver_read_mem);
+            if (standalone_license::verify_gate_token(
+                    standalone_license::gate_driver_read_mem, gt) < 0.5) {
+                return false;
+            }
+        }
+
+        if (data.empty())
+            return false;
+
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+
+        if (kernel_mode) {
+            const auto bytes_written = device->write_raw(address, data.data(), data.size());
+            return bytes_written > 0;
+        }
+
+        return false;
+    }
+
     bool read_string(uint64_t address, size_t max_length, std::string& out)
     {
         out.clear();

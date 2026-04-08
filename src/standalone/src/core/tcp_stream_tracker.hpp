@@ -17,9 +17,6 @@ extern std::unique_ptr<voyager::device_t> device;
 
 namespace network_view {
 
-// ---------------------------------------------------------------------------
-// FNV-1a keyed stream identity
-// ---------------------------------------------------------------------------
 
 struct stream_key_t {
     uint32_t src_ip4  = 0;
@@ -38,7 +35,7 @@ struct stream_key_t {
 
 struct stream_key_hash_t {
     size_t operator()(const stream_key_t& k) const noexcept {
-        // FNV-1a over the fixed key fields
+
         constexpr uint64_t FNV_OFFSET = 14695981039346656037ULL;
         constexpr uint64_t FNV_PRIME  = 1099511628211ULL;
         uint64_t h = FNV_OFFSET;
@@ -62,24 +59,18 @@ struct stream_key_hash_t {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Per-stream reassembly state
-// ---------------------------------------------------------------------------
 
 struct stream_state_t {
     uint32_t                              expected_seq   = 0;
     bool                                  syn_seen       = false;
     bool                                  fin_seen       = false;
-    std::map<uint32_t, std::vector<uint8_t>> ooo_buffer; // seq → payload
+    std::map<uint32_t, std::vector<uint8_t>> ooo_buffer;
     std::vector<uint8_t>                  assembled;
     uint64_t                              last_activity_ns = 0;
     uint64_t                              total_bytes    = 0;
     uint64_t                              total_packets  = 0;
 };
 
-// ---------------------------------------------------------------------------
-// Snapshot for external consumers
-// ---------------------------------------------------------------------------
 
 struct stream_snapshot_t {
     stream_key_t         key;
@@ -91,9 +82,6 @@ struct stream_snapshot_t {
     bool                 fin_seen       = false;
 };
 
-// ---------------------------------------------------------------------------
-// TCP stream tracker
-// ---------------------------------------------------------------------------
 
 class tcp_stream_tracker_t {
 public:
@@ -122,15 +110,14 @@ public:
 
     bool is_running() const noexcept { return running_.load(); }
 
-    // Feed a single captured packet into the reassembler.
+
     void feed(const voyager::device_t::captured_packet& pkt) {
-        if (pkt.protocol != 6) return; // TCP only
+        if (pkt.protocol != 6) return;
         if (pkt.payload.empty())        return;
 
-        // Build canonical key (smaller port first within same address pair
-        // to merge forward+reverse, OR keep directional - here we keep directional).
+
         stream_key_t key;
-        // direction 0 = inbound (remote→local), 1 = outbound (local→remote)
+
         if (pkt.direction == 0) {
             key.src_ip4  = *reinterpret_cast<const uint32_t*>(pkt.remote_addr);
             key.dst_ip4  = *reinterpret_cast<const uint32_t*>(pkt.local_addr);
@@ -155,15 +142,13 @@ public:
         st.total_packets++;
         st.total_bytes += pkt.payload.size();
 
-        // Simple in-order reassembly: append payload unconditionally.
-        // The kernel driver already handles ordering in the TRACKED_STREAM ring;
-        // for usermode best-effort, we just accumulate.
+
         st.assembled.insert(st.assembled.end(),
                              pkt.payload.begin(), pkt.payload.end());
-        st.syn_seen = true; // approximate - no raw TCP header available
+        st.syn_seen = true;
     }
 
-    // Return a snapshot of a specific stream, or nullopt if not tracked.
+
     std::optional<stream_snapshot_t> get_stream(const stream_key_t& key) const {
         std::lock_guard<std::mutex> lk(streams_mutex_);
         auto it = streams_.find(key);
@@ -171,7 +156,7 @@ public:
         return make_snapshot(key, it->second);
     }
 
-    // Return snapshots of all tracked streams.
+
     std::vector<stream_snapshot_t> get_all() const {
         std::lock_guard<std::mutex> lk(streams_mutex_);
         std::vector<stream_snapshot_t> out;
@@ -181,7 +166,7 @@ public:
         return out;
     }
 
-    // Evict streams with no activity for longer than age_ns nanoseconds.
+
     void evict_stale(uint64_t age_ns = 30'000'000'000ULL) {
         uint64_t now_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -237,7 +222,7 @@ private:
                 evict_counter_ = 0;
             }
 
-            // 5ms polling interval
+
             for (int i = 0; i < 5 && running_.load(); i++)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -253,4 +238,4 @@ private:
 
 inline tcp_stream_tracker_t g_stream_tracker;
 
-} // namespace network_view
+}

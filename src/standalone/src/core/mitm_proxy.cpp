@@ -15,12 +15,7 @@
 #include <openssl/err.h>
 #include <openssl/bio.h>
 
-// WHY: On Windows, OpenSSL's uplink mechanism bridges its internal file-I/O calls
-// back into the application's C runtime (e.g. _iob, _fileno).  Without this
-// compilation unit providing the applink table, any SSL_CTX_new() call causes
-// OPENSSL_Uplink(NULL,08) → "OPENSSL_Uplink: no OPENSSL_Applink" FATAL crash.
-// This file is the correct single home for applink.c because it is the first
-// translation unit to call SSL_CTX_new() (via cert_generator and handle_tls_connection).
+
 extern "C" {
 #include <openssl/applink.c>
 }
@@ -441,12 +436,102 @@ static SOCKET connect_to_target(const std::string& host, uint16_t port) {
 static void websocket_relay(SSL* client_ssl, SSL* target_ssl, http_exchange& exchange, state_t& state) {
     exchange.is_websocket = true;
     fd_set fds;
-    uint8_t buf[65536];
     bool done = false;
 
     SOCKET client_fd = static_cast<SOCKET>(SSL_get_fd(client_ssl));
     SOCKET target_fd = static_cast<SOCKET>(SSL_get_fd(target_ssl));
 
+
+    std::vector<uint8_t> client_buf;
+    std::vector<uint8_t> target_buf;
+    client_buf.reserve(65536);
+    target_buf.reserve(65536);
+
+    auto process_frames = [&](std::vector<uint8_t>& buf, bool outbound,
+                              SSL* from_ssl, SSL* to_ssl) {
+        while (buf.size() >= 2) {
+            auto frame = protocol_parser::parse_ws_frame(buf.data(), buf.size());
+            if (!frame.valid || frame.total_consumed == 0) break;
+
+
+            std::vector<uint8_t> payload;
+            if (frame.masked) {
+                payload = protocol_parser::unmask_payload(frame);
+            } else {
+                payload = std::move(frame.payload);
+            }
+
+
+            http_exchange::ws_frame_entry entry;
+            entry.timestamp = GetTickCount64();
+            entry.outbound = outbound;
+            entry.opcode = frame.opcode;
+            entry.payload = payload;
+            {
+                std::lock_guard<std::mutex> lock(state.history_mutex);
+                exchange.ws_frames.push_back(std::move(entry));
+            }
+
+
+            bool should_forward = true;
+            std::vector<uint8_t> forward_payload = payload;
+            if (script_engine::is_initialized()) {
+                script_engine::hook_ws_frame_data ws_data;
+                ws_data.host = exchange.target_host;
+                ws_data.port = exchange.target_port;
+                ws_data.is_outbound = outbound;
+                ws_data.payload = payload;
+                ws_data.is_text = (frame.opcode == protocol_parser::ws_opcode::text);
+                script_engine::invoke_hook(script_engine::hook_type::on_websocket_frame, ws_data);
+                if (ws_data.dropped) { should_forward = false; }
+                if (ws_data.modified) { forward_payload = std::move(ws_data.payload); }
+            }
+
+            if (should_forward) {
+
+                std::vector<uint8_t> out_frame;
+                uint8_t b0 = static_cast<uint8_t>((frame.fin ? 0x80 : 0x00) |
+                             (static_cast<uint8_t>(frame.opcode) & 0x0F));
+                out_frame.push_back(b0);
+
+
+                if (forward_payload.size() < 126) {
+                    out_frame.push_back(static_cast<uint8_t>(forward_payload.size()));
+                } else if (forward_payload.size() <= 0xFFFF) {
+                    out_frame.push_back(126);
+                    uint16_t len16 = static_cast<uint16_t>(forward_payload.size());
+                    out_frame.push_back(static_cast<uint8_t>((len16 >> 8) & 0xFF));
+                    out_frame.push_back(static_cast<uint8_t>(len16 & 0xFF));
+                } else {
+                    out_frame.push_back(127);
+                    uint64_t len64 = forward_payload.size();
+                    for (int i = 7; i >= 0; i--) {
+                        out_frame.push_back(static_cast<uint8_t>((len64 >> (i * 8)) & 0xFF));
+                    }
+                }
+                out_frame.insert(out_frame.end(), forward_payload.begin(), forward_payload.end());
+                SSL_write(to_ssl, out_frame.data(), static_cast<int>(out_frame.size()));
+            }
+
+            if (outbound) {
+                exchange.ws_frames_sent++;
+                state.total_bytes_in.fetch_add(frame.total_consumed);
+            } else {
+                exchange.ws_frames_recv++;
+                state.total_bytes_out.fetch_add(frame.total_consumed);
+            }
+
+
+            if (frame.opcode == protocol_parser::ws_opcode::close) {
+                done = true;
+                break;
+            }
+
+            buf.erase(buf.begin(), buf.begin() + static_cast<ptrdiff_t>(frame.total_consumed));
+        }
+    };
+
+    uint8_t read_buf[65536];
     while (!done && state.running.load()) {
         FD_ZERO(&fds);
         FD_SET(client_fd, &fds);
@@ -460,59 +545,18 @@ static void websocket_relay(SSL* client_ssl, SSL* target_ssl, http_exchange& exc
         int sel = select(static_cast<int>(max_fd + 1), &fds, nullptr, nullptr, &tv);
         if (sel <= 0) { if (sel < 0) done = true; continue; }
 
-
         if (FD_ISSET(client_fd, &fds)) {
-            int n = SSL_read(client_ssl, buf, sizeof(buf));
+            int n = SSL_read(client_ssl, read_buf, sizeof(read_buf));
             if (n <= 0) { done = true; break; }
-
-
-            if (script_engine::is_initialized()) {
-                script_engine::hook_ws_frame_data ws_data;
-                ws_data.host = exchange.target_host;
-                ws_data.port = exchange.target_port;
-                ws_data.is_outbound = true;
-                ws_data.payload.assign(buf, buf + n);
-                ws_data.is_text = false;
-                script_engine::invoke_hook(script_engine::hook_type::on_websocket_frame, ws_data);
-                if (ws_data.dropped) continue;
-                if (ws_data.modified) {
-                    SSL_write(target_ssl, ws_data.payload.data(), static_cast<int>(ws_data.payload.size()));
-                } else {
-                    SSL_write(target_ssl, buf, n);
-                }
-            } else {
-                SSL_write(target_ssl, buf, n);
-            }
-
-            exchange.ws_frames_sent++;
-            state.total_bytes_in.fetch_add(static_cast<uint64_t>(n));
+            client_buf.insert(client_buf.end(), read_buf, read_buf + n);
+            process_frames(client_buf, true, client_ssl, target_ssl);
         }
 
-
         if (FD_ISSET(target_fd, &fds)) {
-            int n = SSL_read(target_ssl, buf, sizeof(buf));
+            int n = SSL_read(target_ssl, read_buf, sizeof(read_buf));
             if (n <= 0) { done = true; break; }
-
-            if (script_engine::is_initialized()) {
-                script_engine::hook_ws_frame_data ws_data;
-                ws_data.host = exchange.target_host;
-                ws_data.port = exchange.target_port;
-                ws_data.is_outbound = false;
-                ws_data.payload.assign(buf, buf + n);
-                ws_data.is_text = false;
-                script_engine::invoke_hook(script_engine::hook_type::on_websocket_frame, ws_data);
-                if (ws_data.dropped) continue;
-                if (ws_data.modified) {
-                    SSL_write(client_ssl, ws_data.payload.data(), static_cast<int>(ws_data.payload.size()));
-                } else {
-                    SSL_write(client_ssl, buf, n);
-                }
-            } else {
-                SSL_write(client_ssl, buf, n);
-            }
-
-            exchange.ws_frames_recv++;
-            state.total_bytes_out.fetch_add(static_cast<uint64_t>(n));
+            target_buf.insert(target_buf.end(), read_buf, read_buf + n);
+            process_frames(target_buf, false, target_ssl, client_ssl);
         }
     }
 }
@@ -1186,6 +1230,28 @@ static void handle_client(SOCKET client_sock, sockaddr_in client_addr_in, state_
 }
 
 
+static void worker_thread_func(state_t& state) {
+    while (state.running.load()) {
+        work_item item;
+        {
+            std::unique_lock<std::mutex> lock(state.work_mutex);
+            state.work_cv.wait_for(lock, std::chrono::milliseconds(200), [&] {
+                return !state.work_queue.empty() || !state.running.load();
+            });
+            if (!state.running.load() && state.work_queue.empty()) break;
+            if (state.work_queue.empty()) continue;
+            item = state.work_queue.front();
+            state.work_queue.pop();
+        }
+
+        sockaddr_in client_addr_in = {};
+        client_addr_in.sin_family = AF_INET;
+        client_addr_in.sin_addr.s_addr = item.client_ip;
+        client_addr_in.sin_port = htons(item.client_port);
+        handle_client(static_cast<SOCKET>(item.client_socket), client_addr_in, state);
+    }
+}
+
 static void listener_thread_func(state_t& state) {
     while (state.running.load()) {
         fd_set fds;
@@ -1206,8 +1272,15 @@ static void listener_thread_func(state_t& state) {
 
         if (client_sock == INVALID_SOCKET) continue;
 
-
-        std::thread(handle_client, client_sock, client_addr, std::ref(state)).detach();
+        work_item item;
+        item.client_socket = static_cast<uintptr_t>(client_sock);
+        item.client_ip = client_addr.sin_addr.s_addr;
+        item.client_port = ntohs(client_addr.sin_port);
+        {
+            std::lock_guard<std::mutex> lock(state.work_mutex);
+            state.work_queue.push(item);
+        }
+        state.work_cv.notify_one();
     }
 }
 
@@ -1254,12 +1327,19 @@ bool start(const proxy_config& config) {
     g_state.listener_thread = std::thread(listener_thread_func, std::ref(g_state));
 
 
+    g_state.worker_threads.reserve(WORKER_POOL_SIZE);
+    for (uint32_t i = 0; i < WORKER_POOL_SIZE; i++) {
+        g_state.worker_threads.emplace_back(worker_thread_func, std::ref(g_state));
+    }
+
+
     if (config.use_wfp_redirect) {
         if (device && device->is_connected()) {
             uint8_t local_addr[16] = {};
             inet_pton(AF_INET, config.bind_addr.c_str(), local_addr);
 
             uint32_t rule_id = 0;
+            uint32_t own_pid = static_cast<uint32_t>(GetCurrentProcessId());
 
             bool ok = device->traffic_redirect_op(
                 0,
@@ -1270,7 +1350,8 @@ bool start(const proxy_config& config) {
                 config.bind_port,
                 local_addr,
                 2,
-                &rule_id);
+                &rule_id,
+                own_pid);
             if (ok) {
                 g_state.config.wfp_rule_id = rule_id;
             }
@@ -1293,6 +1374,15 @@ void stop() {
     }
 
     g_state.running.store(false);
+
+
+    g_state.work_cv.notify_all();
+
+
+    for (auto& t : g_state.worker_threads) {
+        if (t.joinable()) t.join();
+    }
+    g_state.worker_threads.clear();
 
 
     if (g_state.listen_socket != ~static_cast<uintptr_t>(0)) {

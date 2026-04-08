@@ -11,3 +11,4 @@ namespace emulation_tools    { void register_emulation_tools(mcp_standalone::ser
 namespace debugger_tools     { void register_debugger_tools(mcp_standalone::server_t& srv); }
 namespace coding_tools       { void register_coding_tools(mcp_standalone::server_t& srv); }
 namespace workflow_tools     { void register_workflow_tools(mcp_standalone::server_t& srv); }
+namespace scanner_tools      { void register_scanner_tools(mcp_standalone::server_t& srv); }

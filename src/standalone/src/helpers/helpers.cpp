@@ -31,6 +31,8 @@
 #include "../core/terminal_view.hpp"
 #include "../core/mcp_marketplace.hpp"
 #include "../core/network_view.hpp"
+#include "../core/memory_scanner_view.hpp"
+#include "../core/debugger_view.hpp"
 
 static ID3D11ShaderResourceView* g_send_icon_srv    = nullptr;
 static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
@@ -726,6 +728,14 @@ void helpers::render_title()
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
 			globals::ui::active_center_view = center_view_t::network_view;
+		}
+
+		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_M, false)) {
+			globals::ui::active_center_view = center_view_t::memory_scanner;
+		}
+
+		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
+			globals::ui::active_center_view = center_view_t::debugger_view;
 		}
 	}
 
@@ -3300,6 +3310,86 @@ void helpers::render_title()
 			}
 		}
 
+
+		{
+			bool scan_is_active = (globals::ui::active_center_view == center_view_t::memory_scanner);
+			const char* scan_label = "Scanner";
+			ImVec2 sts = ImGui::CalcTextSize(scan_label);
+			float stw = 10.f * 2.f + sts.x;
+
+			float net_tab_w = 10.f * 2.f + ImGui::CalcTextSize("Network").x;
+			float net_tab_x0 = rbtn_x0 - net_tab_w - 8.f;
+			float tab_h_s = row_h - 2.f;
+			float stx0 = net_tab_x0 - stw - 6.f;
+			float stx1 = stx0 + stw;
+			float sty0 = r1_cy - tab_h_s * 0.5f;
+			float sty1 = sty0 + tab_h_s;
+
+			if (stx0 > hx0 + hdr_pad + 40.f) {
+				bool stab_hov = ImGui::IsMouseHoveringRect(ImVec2(stx0, sty0), ImVec2(stx1, sty1), false);
+
+				if (scan_is_active) {
+					wdl->AddRectFilled(ImVec2(stx0, sty0), ImVec2(stx1, sty1),
+						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
+					wdl->AddLine(ImVec2(stx0 + 2.f, sty1), ImVec2(stx1 - 2.f, sty1),
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+				} else if (stab_hov) {
+					wdl->AddRectFilled(ImVec2(stx0, sty0), ImVec2(stx1, sty1),
+						IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
+				}
+
+				ImU32 stab_col = scan_is_active ? ac_full
+				               : IM_COL32(170, 175, 190, (int)((stab_hov ? 220.f : 160.f)*a));
+				wdl->AddText(ImVec2(stx0 + 10.f, sty0 + (tab_h_s - sts.y) * 0.5f),
+					stab_col, scan_label);
+
+				if (stab_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+					globals::ui::active_center_view = center_view_t::memory_scanner;
+				}
+			}
+		}
+
+
+		{
+			bool dbg_is_active = (globals::ui::active_center_view == center_view_t::debugger_view);
+			const char* dbg_label = "Debugger";
+			ImVec2 dts = ImGui::CalcTextSize(dbg_label);
+			float dtw = 10.f * 2.f + dts.x;
+
+			float net_tw = 10.f * 2.f + ImGui::CalcTextSize("Network").x;
+			float net_x0 = rbtn_x0 - net_tw - 8.f;
+			float scan_tw = 10.f * 2.f + ImGui::CalcTextSize("Scanner").x;
+			float scan_x0 = net_x0 - scan_tw - 6.f;
+			float tab_h_d = row_h - 2.f;
+			float dtx0 = scan_x0 - dtw - 6.f;
+			float dtx1 = dtx0 + dtw;
+			float dty0 = r1_cy - tab_h_d * 0.5f;
+			float dty1 = dty0 + tab_h_d;
+
+			if (dtx0 > hx0 + hdr_pad + 40.f) {
+				bool dtab_hov = ImGui::IsMouseHoveringRect(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1), false);
+
+				if (dbg_is_active) {
+					wdl->AddRectFilled(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1),
+						IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
+					wdl->AddLine(ImVec2(dtx0 + 2.f, dty1), ImVec2(dtx1 - 2.f, dty1),
+						IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+				} else if (dtab_hov) {
+					wdl->AddRectFilled(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1),
+						IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
+				}
+
+				ImU32 dtab_col = dbg_is_active ? ac_full
+				               : IM_COL32(170, 175, 190, (int)((dtab_hov ? 220.f : 160.f)*a));
+				wdl->AddText(ImVec2(dtx0 + 10.f, dty0 + (tab_h_d - dts.y) * 0.5f),
+					dtab_col, dbg_label);
+
+				if (dtab_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+					globals::ui::active_center_view = center_view_t::debugger_view;
+				}
+			}
+		}
+
 		bool cf_clicked = ghost_btn("Choose File",
 			ImGui::GetID("##cfhv"), ImGui::GetID("##cffl"),
 			rbtn_x0, r1_cy, rbtn_w);
@@ -3463,6 +3553,16 @@ void helpers::render_title()
 	else if (cv == center_view_t::network_view)
 	{
 		network_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::memory_scanner)
+	{
+		memory_scanner_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::debugger_view)
+	{
+		debugger_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
 	}
 
 	else

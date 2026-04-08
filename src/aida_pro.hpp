@@ -320,13 +320,10 @@ inline std::string json_str(const nlohmann::json& j, const std::string& key, con
 
 #include "obfuscation.hpp"
 #include "settings.hpp"
-#include "prompts.hpp"
 #include "license.hpp"
 #include "net_security.hpp"
 #include "agent_tools.hpp"
-#include "ai_client.hpp"
 #include "ida_utils.hpp"
 #include "mcp_server.hpp"
-#include "ui.hpp"
 #include "actions.hpp"
 #include "aida.hpp"

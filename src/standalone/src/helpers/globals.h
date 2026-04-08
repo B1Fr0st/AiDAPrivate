@@ -18,7 +18,9 @@ enum class center_view_t : int {
 	hex_view,
 	welcome,
 	settings_view,
-	network_view
+	network_view,
+	memory_scanner,
+	debugger_view
 };
 
 

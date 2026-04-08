@@ -681,9 +681,8 @@ static std::string protobuf_to_text(const std::vector<protobuf_field>& fields, i
                 out += std::to_string(f.varint_value);
 
                 {
-                    // WHY: -(uint64_t) triggers MSVC C4146 (unary minus on unsigned).
-                    // uint64_t(0)-(x) is identical bit-pattern (0 or 0xFFFFFFFFFFFFFFFF)
-                    // via well-defined unsigned wraparound — no truncation, no warning.
+
+
                     int64_t zigzag = static_cast<int64_t>((f.varint_value >> 1) ^ (uint64_t(0) - (f.varint_value & 1)));
                     if (zigzag != static_cast<int64_t>(f.varint_value))
                         out += " (zigzag: " + std::to_string(zigzag) + ")";
@@ -749,7 +748,7 @@ static std::string protobuf_to_text(const std::vector<protobuf_field>& fields, i
     return out;
 }
 
-// Encode a varint to the back of a byte buffer.
+
 static inline void encode_varint(std::vector<uint8_t>& buf, uint64_t v) {
     while (v > 0x7F) {
         buf.push_back(static_cast<uint8_t>((v & 0x7F) | 0x80));
@@ -758,7 +757,7 @@ static inline void encode_varint(std::vector<uint8_t>& buf, uint64_t v) {
     buf.push_back(static_cast<uint8_t>(v & 0x7F));
 }
 
-// Encode a list of protobuf fields back to Protobuf wire format.
+
 static std::vector<uint8_t> protobuf_encode(const std::vector<protobuf_field>& fields) {
     std::vector<uint8_t> out;
     for (auto& f : fields) {
@@ -766,10 +765,10 @@ static std::vector<uint8_t> protobuf_encode(const std::vector<protobuf_field>& f
                        (static_cast<uint64_t>(f.wire_type) & 0x7);
         encode_varint(out, tag);
         switch (f.wire_type) {
-            case 0: // varint
+            case 0:
                 encode_varint(out, f.varint_value);
                 break;
-            case 1: { // 64-bit
+            case 1: {
                 uint64_t v = f.varint_value;
                 for (int i = 0; i < 8; i++) {
                     out.push_back(static_cast<uint8_t>(v & 0xFF));
@@ -777,11 +776,11 @@ static std::vector<uint8_t> protobuf_encode(const std::vector<protobuf_field>& f
                 }
                 break;
             }
-            case 2: // length-delimited
+            case 2:
                 encode_varint(out, f.bytes_value.size());
                 out.insert(out.end(), f.bytes_value.begin(), f.bytes_value.end());
                 break;
-            case 5: { // 32-bit
+            case 5: {
                 uint32_t v = static_cast<uint32_t>(f.varint_value & 0xFFFFFFFF);
                 for (int i = 0; i < 4; i++) {
                     out.push_back(static_cast<uint8_t>(v & 0xFF));
@@ -796,13 +795,12 @@ static std::vector<uint8_t> protobuf_encode(const std::vector<protobuf_field>& f
     return out;
 }
 
-// Wrap raw protobuf bytes with a 5-byte gRPC frame header:
-//   [0x00][len_hi][len_lo2][len_lo1][len_lo0]
+
 static std::vector<uint8_t> grpc_encode(const std::vector<uint8_t>& proto_bytes) {
     std::vector<uint8_t> out;
     out.reserve(5 + proto_bytes.size());
     uint32_t len = static_cast<uint32_t>(proto_bytes.size());
-    out.push_back(0x00); // not compressed
+    out.push_back(0x00);
     out.push_back(static_cast<uint8_t>((len >> 24) & 0xFF));
     out.push_back(static_cast<uint8_t>((len >> 16) & 0xFF));
     out.push_back(static_cast<uint8_t>((len >>  8) & 0xFF));

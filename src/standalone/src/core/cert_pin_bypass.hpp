@@ -5,6 +5,7 @@
 
 #include "comm.h"
 #include "standalone_driver.hpp"
+#include "zydis_disasm.hpp"
 
 #include <cstdint>
 #include <mutex>
@@ -28,6 +29,12 @@ struct bypass_signature {
 
 
     bool return_success = true;
+
+
+    std::vector<std::string> string_hints;
+
+
+    std::string export_name;
 };
 
 struct applied_bypass {
@@ -76,6 +83,8 @@ inline void init_signature_database() {
         sig.mask    = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
         sig.patch = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
         sig.return_success = true;
+        sig.string_hints = { "ssl_verify_cert_chain", "X509_V_ERR_" };
+        sig.export_name = "ssl_verify_cert_chain";
         sigs.push_back(std::move(sig));
     }
 
@@ -89,6 +98,8 @@ inline void init_signature_database() {
         sig.mask    = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
         sig.patch = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
         sig.return_success = true;
+        sig.string_hints = { "X509_verify_cert", "unable to get local issuer certificate" };
+        sig.export_name = "X509_verify_cert";
         sigs.push_back(std::move(sig));
     }
 
@@ -102,6 +113,7 @@ inline void init_signature_database() {
         sig.mask    = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
         sig.patch = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
         sig.return_success = true;
+        sig.string_hints = { "CERTIFICATE_VERIFY_FAILED", "ssl_crypto_x509_session_verify_cert_chain" };
         sigs.push_back(std::move(sig));
     }
 
@@ -115,6 +127,8 @@ inline void init_signature_database() {
         sig.mask    = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
         sig.patch = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
         sig.return_success = true;
+        sig.string_hints = { "CertVerifyCertificateChainPolicy" };
+        sig.export_name = "CertVerifyCertificateChainPolicy";
         sigs.push_back(std::move(sig));
     }
 
@@ -128,6 +142,7 @@ inline void init_signature_database() {
         sig.mask    = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
         sig.patch = { 0x31, 0xC0, 0xC3 };
         sig.return_success = false;
+        sig.string_hints = { "WinHttpSendRequest", "WINHTTP_CALLBACK_STATUS_FLAG_SECURITY" };
         sigs.push_back(std::move(sig));
     }
 
@@ -141,6 +156,7 @@ inline void init_signature_database() {
         sig.mask    = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
         sig.patch = { 0x31, 0xC0, 0xC3 };
         sig.return_success = false;
+        sig.string_hints = { "InternetErrorDlg", "ERROR_INTERNET_SEC_CERT" };
         sigs.push_back(std::move(sig));
     }
 
@@ -154,6 +170,7 @@ inline void init_signature_database() {
         sig.mask    = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
         sig.patch = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
         sig.return_success = true;
+        sig.string_hints = { "System.Net.Security.SslStream", "RemoteCertificateValidationCallback" };
         sigs.push_back(std::move(sig));
     }
 
@@ -167,6 +184,7 @@ inline void init_signature_database() {
         sig.mask    = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
         sig.patch = { 0x31, 0xC0, 0xC3 };
         sig.return_success = false;
+        sig.string_hints = { "ssl3_HandleCertificate", "SEC_ERROR_" };
         sigs.push_back(std::move(sig));
     }
 }
@@ -179,6 +197,143 @@ inline bool pattern_match(const uint8_t* data, size_t data_size,
         if ((data[i] & mask[i]) != (pattern[i] & mask[i])) return false;
     }
     return true;
+}
+
+
+inline bool verify_function_prologue(uint64_t addr) {
+    uint8_t buf[32] = {};
+    size_t rd = device->read_raw(addr, buf, sizeof(buf));
+    if (rd < 4) return false;
+
+    AsmInstr ins = zydis_decode_one(buf, static_cast<int>(rd), addr);
+    if (ins.len == 0) return false;
+
+
+    const char* m = ins.mnem;
+    if (strcmp(m, "push") == 0) return true;
+    if (strcmp(m, "sub") == 0) return true;
+    if (strcmp(m, "mov") == 0) return true;
+    if (strcmp(m, "int3") == 0) return false;
+    if (strcmp(m, "nop") == 0) return false;
+    return false;
+}
+
+
+inline uint64_t find_string_in_module(uint64_t mod_base, uint32_t mod_size,
+                                       const std::string& needle) {
+    constexpr size_t CHUNK_SIZE = 0x10000;
+    for (uint64_t offset = 0; offset < mod_size; offset += CHUNK_SIZE) {
+        size_t read_size = static_cast<size_t>(
+            std::min(static_cast<uint64_t>(CHUNK_SIZE + needle.size()),
+                     static_cast<uint64_t>(mod_size) - offset));
+        std::vector<uint8_t> chunk(read_size);
+        size_t rd = device->read_raw(mod_base + offset, chunk.data(), read_size);
+        if (rd < needle.size()) continue;
+        chunk.resize(rd);
+
+        for (size_t i = 0; i + needle.size() <= chunk.size(); i++) {
+            if (memcmp(chunk.data() + i, needle.data(), needle.size()) == 0) {
+                return mod_base + offset + i;
+            }
+        }
+    }
+    return 0;
+}
+
+
+inline uint64_t find_function_by_string_ref(uint64_t mod_base, uint32_t mod_size,
+                                             uint64_t string_addr) {
+    constexpr size_t CHUNK_SIZE = 0x10000;
+    constexpr size_t MAX_BACKWARD = 256;
+
+    for (uint64_t offset = 0; offset < mod_size; offset += CHUNK_SIZE) {
+        size_t read_size = static_cast<size_t>(
+            std::min(static_cast<uint64_t>(CHUNK_SIZE),
+                     static_cast<uint64_t>(mod_size) - offset));
+        std::vector<uint8_t> chunk(read_size);
+        size_t rd = device->read_raw(mod_base + offset, chunk.data(), read_size);
+        if (rd < 7) continue;
+        chunk.resize(rd);
+
+
+        for (size_t i = 0; i + 7 <= chunk.size(); i++) {
+            uint64_t ip = mod_base + offset + i;
+            AsmInstr ins = zydis_decode_one(chunk.data() + i,
+                                            static_cast<int>(chunk.size() - i), ip);
+            if (ins.len == 0) continue;
+
+
+            if (strcmp(ins.mnem, "lea") == 0) {
+
+                if (ins.len >= 7 && (chunk[i] == 0x48 || chunk[i] == 0x4C)) {
+                    int32_t disp = 0;
+                    memcpy(&disp, chunk.data() + i + 3, 4);
+                    uint64_t target = ip + ins.len + disp;
+                    if (target == string_addr) {
+
+                        uint64_t search_start = (ip > MAX_BACKWARD) ? ip - MAX_BACKWARD : mod_base;
+                        uint8_t backward_buf[MAX_BACKWARD + 16] = {};
+                        size_t brd = device->read_raw(search_start, backward_buf,
+                            static_cast<size_t>(ip - search_start));
+                        if (brd == 0) continue;
+
+
+                        for (size_t b = brd; b > 0; b--) {
+                            if (backward_buf[b - 1] == 0xCC || backward_buf[b - 1] == 0x90) {
+                                uint64_t candidate = search_start + b;
+                                if (verify_function_prologue(candidate)) {
+                                    return candidate;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            i += (ins.len > 1) ? ins.len - 1 : 0;
+        }
+    }
+    return 0;
+}
+
+
+inline uint64_t resolve_bypass_target(const bypass_signature& sig,
+                                       uint64_t mod_base, uint32_t mod_size) {
+
+    if (!sig.export_name.empty()) {
+        uint64_t addr = device->resolve_export(mod_base, sig.export_name.c_str());
+        if (addr != 0) return addr;
+    }
+
+
+    for (const auto& hint : sig.string_hints) {
+        uint64_t str_addr = find_string_in_module(mod_base, mod_size, hint);
+        if (str_addr == 0) continue;
+        uint64_t func_addr = find_function_by_string_ref(mod_base, mod_size, str_addr);
+        if (func_addr != 0 && verify_function_prologue(func_addr)) {
+            return func_addr;
+        }
+    }
+
+
+    constexpr size_t CHUNK_SIZE = 0x10000;
+    for (uint64_t offset = 0; offset < mod_size; offset += CHUNK_SIZE) {
+        size_t read_size = static_cast<size_t>(
+            std::min(static_cast<uint64_t>(CHUNK_SIZE),
+                     static_cast<uint64_t>(mod_size) - offset));
+        std::vector<uint8_t> chunk(read_size);
+        size_t rd = device->read_raw(mod_base + offset, chunk.data(), read_size);
+        if (rd == 0) continue;
+        chunk.resize(rd);
+
+        for (size_t j = 0; j + sig.pattern.size() <= chunk.size(); j++) {
+            if (pattern_match(chunk.data() + j, chunk.size() - j,
+                              sig.pattern.data(), sig.mask.data(), sig.pattern.size())) {
+                return mod_base + offset + j;
+            }
+        }
+    }
+
+    return 0;
 }
 
 
@@ -248,42 +403,21 @@ inline int scan_and_bypass(uint32_t target_pid) {
         if (mod_base == 0 || mod_size == 0) continue;
 
 
-        constexpr size_t CHUNK_SIZE = 0x10000;
-        bool found = false;
+        uint64_t addr = resolve_bypass_target(sig, mod_base, mod_size);
+        if (addr != 0) {
+            applied_bypass bypass;
+            bypass.signature_name = sig.name;
+            bypass.module_name = sig.module_name;
+            bypass.address = addr;
+            bypass.patch_bytes = sig.patch;
+            bypass.original_bytes.resize(sig.patch.size());
+            device->read_raw(addr, bypass.original_bytes.data(), bypass.original_bytes.size());
 
-        for (uint64_t offset = 0; offset < mod_size && !found; offset += CHUNK_SIZE) {
-            size_t read_size = static_cast<size_t>(std::min(static_cast<uint64_t>(CHUNK_SIZE),
-                static_cast<uint64_t>(mod_size) - offset));
-            std::vector<uint8_t> chunk(read_size);
-            size_t actually_read = device->read_raw(mod_base + offset, chunk.data(), read_size);
-            if (actually_read == 0) continue;
-            chunk.resize(actually_read);
-
-
-            for (size_t i = 0; i + sig.pattern.size() <= chunk.size(); i++) {
-                if (pattern_match(chunk.data() + i, chunk.size() - i,
-                                  sig.pattern.data(), sig.mask.data(), sig.pattern.size())) {
-                    uint64_t addr = mod_base + offset + i;
-
-
-                    applied_bypass bypass;
-                    bypass.signature_name = sig.name;
-                    bypass.module_name = sig.module_name;
-                    bypass.address = addr;
-                    bypass.patch_bytes = sig.patch;
-                    bypass.original_bytes.resize(sig.patch.size());
-                    device->read_raw(addr, bypass.original_bytes.data(), bypass.original_bytes.size());
-
-
-                    size_t written = device->write_raw(addr, sig.patch.data(), sig.patch.size());
-                    if (written == sig.patch.size()) {
-                        bypass.active = true;
-                        g_state.active_bypasses.push_back(std::move(bypass));
-                        bypasses_applied++;
-                        found = true;
-                    }
-                    break;
-                }
+            size_t written = device->write_raw(addr, sig.patch.data(), sig.patch.size());
+            if (written == sig.patch.size()) {
+                bypass.active = true;
+                g_state.active_bypasses.push_back(std::move(bypass));
+                bypasses_applied++;
             }
         }
     }

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include "ui_anim.hpp"
 
 namespace disasm_view {
 
@@ -164,9 +165,7 @@ void render(float pos_x, float pos_y, float width, float height,
     const float line_h = 18.f;
 
 
-    st.scroll_y += (st.target_scroll_y - st.scroll_y) * std::min(20.f * dt, 1.f);
-    if (std::abs(st.target_scroll_y - st.scroll_y) < 0.5f)
-        st.scroll_y = st.target_scroll_y;
+    ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 20.f, dt);
     float max_scroll = std::max(0.f, n * line_h - height + line_h);
     st.target_scroll_y = std::max(0.f, std::min(st.target_scroll_y, max_scroll));
     st.scroll_y = std::max(0.f, std::min(st.scroll_y, max_scroll));
@@ -184,7 +183,8 @@ void render(float pos_x, float pos_y, float width, float height,
     if (addr_col_w == 0.f)
         addr_col_w = ImGui::CalcTextSize("0000000140001000").x + 6.f;
 
-    const float x_addr = ox + 4.f;
+    const float gutter_w = 20.f;
+    const float x_addr = ox + gutter_w + 4.f;
     const float x_vsep = x_addr + addr_col_w;
     float x_bytes = x_vsep + 10.f;
     float bytes_col_w = st.show_bytes ? ImGui::CalcTextSize("00 00 00 00 00 00 00").x + 10.f : 0.f;
@@ -351,6 +351,36 @@ void render(float pos_x, float pos_y, float width, float height,
             st.ctx_row = i;
             ImGui::OpenPopup("##disasm_view_ctx");
         }
+    }
+
+    {
+        struct branch_vis_t { float from_y; float to_y; ImU32 color; };
+        std::vector<branch_vis_t> bv;
+        for (int bi = first_row; bi <= last_row; ++bi) {
+            const AsmInstr& bins = instrs[bi];
+            if (!bins.is_branch && !bins.is_call) continue;
+            uint64_t btarget = 0;
+            const char* bhex = strstr(bins.ops, "0x");
+            if (!bhex) bhex = bins.ops;
+            if (sscanf_s(bhex, "%llx", &btarget) != 1)
+                if (sscanf_s(bhex, "0x%llx", &btarget) != 1)
+                    continue;
+            int tidx = find_instr_at(btarget, file);
+            if (tidx < first_row || tidx > last_row) continue;
+            float fy = oy + static_cast<float>(bi) * line_h - st.scroll_y + line_h * 0.5f;
+            float ty = oy + static_cast<float>(tidx) * line_h - st.scroll_y + line_h * 0.5f;
+            ImU32 bcol;
+            if (bins.is_call)
+                bcol = IM_COL32(200, 120, 100, 180);
+            else if (strcmp(bins.mnem, "jmp") == 0)
+                bcol = ui_anim::accent_col_u8(accent_r, accent_g, accent_b, 180);
+            else
+                bcol = IM_COL32(100, 200, 120, 180);
+            bv.push_back({fy, ty, bcol});
+        }
+        float gx = ox + 2.f;
+        for (auto& ba : bv)
+            ui_anim::render_branch_arrow(dl, gx, ba.from_y, ba.to_y, gutter_w, ba.color, 1.f);
     }
 
 
@@ -592,17 +622,12 @@ void render(float pos_x, float pos_y, float width, float height,
             IM_COL32(80, 80, 120, (int)(40 * a)), 13.f);
 
 
-        static float pulse = 0.f;
-        pulse += dt * 3.f;
-        if (pulse > 6.283f) pulse -= 6.283f;
-        float pulse_a = 0.6f + 0.4f * sinf(pulse);
-        if (disasm.live_paused) pulse_a = 0.3f;
-
-        ImU32 dot_col = disasm.live_paused
-            ? IM_COL32(200, 180, 60, (int)(180 * pulse_a * a))
-            : IM_COL32(60, 220, 80, (int)(255 * pulse_a * a));
         float dot_x = ix + 14.f, dot_y = iy + ind_h * 0.5f;
-        dl->AddCircleFilled(ImVec2(dot_x, dot_y), 4.f, dot_col);
+        ImU32 dot_col = disasm.live_paused
+            ? IM_COL32(200, 180, 60, static_cast<int>(200 * a))
+            : IM_COL32(60, 220, 80, static_cast<int>(255 * a));
+        ui_anim::render_status_dot(dl, dot_x, dot_y, 4.f, dot_col,
+            static_cast<float>(ImGui::GetTime()), !disasm.live_paused);
 
 
         const char* status_txt = disasm.live_paused ? "PAUSED" : "LIVE";

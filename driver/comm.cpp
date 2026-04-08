@@ -2231,7 +2231,8 @@ bool voyager::device_t::traffic_redirect_op(std::uint32_t operation, std::uint32
                                              std::uint32_t protocol,
                                              std::uint32_t match_port, const std::uint8_t* match_addr,
                                              std::uint32_t redirect_port, const std::uint8_t* redirect_addr,
-                                             std::uint32_t af, std::uint32_t* out_rule_id) noexcept {
+                                             std::uint32_t af, std::uint32_t* out_rule_id,
+                                             std::uint32_t exclude_pid) noexcept {
     if (!is_connected()) {
         return false;
     }
@@ -2249,6 +2250,7 @@ bool voyager::device_t::traffic_redirect_op(std::uint32_t operation, std::uint32
     req->address_family = af;
     if (match_addr) std::memcpy(req->match_addr, match_addr, 16);
     if (redirect_addr) std::memcpy(req->redirect_addr, redirect_addr, 16);
+    req->exclude_pid = exclude_pid;
 
     bool ok = send_request(ioctl_codes::PRED(), req, static_cast<DWORD>(sizeof(*req)));
     if (ok && out_rule_id) *out_rule_id = req->rule_id;

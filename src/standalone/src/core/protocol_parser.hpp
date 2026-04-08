@@ -125,6 +125,32 @@ struct quic_header {
     std::string packet_type;
     std::string version_name;
     bool     valid = false;
+    bool     is_version_negotiation = false;
+    std::vector<uint32_t> supported_versions;
+    std::vector<uint8_t> token;
+    size_t   payload_offset = 0;
+
+    std::string dcid_hex() const {
+        std::string r;
+        r.reserve(dcid.size() * 2);
+        for (auto b : dcid) {
+            char buf[3];
+            snprintf(buf, sizeof(buf), "%02x", b);
+            r += buf;
+        }
+        return r;
+    }
+
+    std::string scid_hex() const {
+        std::string r;
+        r.reserve(scid.size() * 2);
+        for (auto b : scid) {
+            char buf[3];
+            snprintf(buf, sizeof(buf), "%02x", b);
+            r += buf;
+        }
+        return r;
+    }
 };
 
 bool is_quic_packet(const uint8_t* data, size_t len, uint16_t dst_port);

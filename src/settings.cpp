@@ -645,39 +645,15 @@ void settings_t::load(aida_plugin_t* plugin_instance)
 
     bool config_exists_and_valid = load_from_file();
 
-    if (custom_prompts.empty())
-    {
-        msg(OBFSTR_C("No custom prompts found, loading defaults.\n"));
-        custom_prompts[OBFSTR("Anti-Cheat / Anti-Tamper")] = ANTICHEAT_RE_PROMPT;
-        custom_prompts[OBFSTR("Windows Kernel / Drivers")] = KERNEL_DRIVER_PROMPT;
-        custom_prompts[OBFSTR("Crackme / CTF Challenges")] = CRACKME_PROMPT;
-        custom_prompts[OBFSTR("Malware Analysis")] = MALWARE_ANALYSIS_PROMPT;
-        custom_prompts[OBFSTR("Application RE (General)")] = APPLICATION_RE_PROMPT;
-        custom_prompts[OBFSTR("Firmware / Embedded")] = FIRMWARE_ANALYSIS_PROMPT;
-        custom_prompts[OBFSTR("Cryptography")] = CRYPTO_ANALYSIS_PROMPT;
-        custom_prompts[OBFSTR("Network Protocol")] = NETWORK_PROTOCOL_PROMPT;
-        custom_prompts[OBFSTR("iOS / macOS")] = IOS_MACOS_RE_PROMPT;
-        custom_prompts[OBFSTR("Android")] = ANDROID_RE_PROMPT;
-        custom_prompts[OBFSTR("Linux Userspace / Kernel")] = LINUX_RE_PROMPT;
-        custom_prompts[OBFSTR("Unity Game (IL2CPP)")] = UNITY_GAME_PROMPT;
-        custom_prompts[OBFSTR("Cheat Loader / Malware")] = CHEAT_LOADER_PROMPT;
-        save();
-    }
-
     if (!config_exists_and_valid || api_provider.empty())
     {
-        SettingsForm::show_welcome_and_apply_deferred(plugin_instance);
+        msg(OBFSTR_C("AiDA: No configuration found. MCP server will start with defaults.\n"));
         return;
     }
 
     if (config_exists_and_valid)
     {
         msg(OBFSTR_C("Loaded settings from %s\n"), get_config_file().c_str());
-    }
-
-    if (!api_provider.empty() && get_active_api_key().empty() && !has_custom_base_url())
-    {
-        prompt_for_api_key();
     }
 }
 

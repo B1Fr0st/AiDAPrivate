@@ -1,5 +1,6 @@
 #include "chat_render.hpp"
 #include "../ide_icons.h"
+#include "ui_anim.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -470,7 +471,6 @@ chat_render::render_result_t chat_render::render_rich_message(
         }
 
         case span_type::tool_result: {
-
             if (cursor_x > base_x) {
                 cursor_y += font_size + 4.f;
                 cursor_x = base_x;
@@ -479,38 +479,80 @@ chat_render::render_result_t chat_render::render_rich_message(
 
             float sec_w = max_w - 8.f;
             std::string truncated = span.text;
-            if (truncated.size() > 500) {
+            if (truncated.size() > 500)
                 truncated = truncated.substr(0, 500) + "\n... (truncated)";
-            }
 
+            ImGuiID collapse_id = ImGui::GetID(("tr_col_" + std::to_string(msg_idx) + "_" + std::to_string(&span - &spans[0])).c_str());
+            bool collapsed = ImGui::GetStateStorage()->GetBool(collapse_id, true);
+
+            ImGuiID anim_id = ImGui::GetID(("tr_anim_" + std::to_string(msg_idx) + "_" + std::to_string(&span - &spans[0])).c_str());
+
+            float header_h = 22.f;
             ImVec2 tts = ImGui::CalcTextSize(truncated.c_str(), nullptr, false, sec_w - 16.f);
-            float sec_h = tts.y + 12.f;
+            float expanded_h = header_h + tts.y + 12.f;
+            float target_h = collapsed ? header_h : expanded_h;
+
+            float current_h = ImGui::GetStateStorage()->GetFloat(anim_id, target_h);
+            current_h = ui_anim::smooth_lerp(current_h, target_h, dt, 12.f);
+            ImGui::GetStateStorage()->SetFloat(anim_id, current_h);
 
             ImVec2 smin(cx + 4.f, cursor_y);
-            ImVec2 smax(smin.x + sec_w, smin.y + sec_h);
-            dl->AddRectFilled(smin, smax,
-                IM_COL32(18, 16, 32, (int)(200 * alpha)), 4.f);
-            dl->AddRect(smin, smax,
-                IM_COL32(255, 255, 255, (int)(8 * alpha)), 4.f, 0, 0.5f);
+            ImVec2 smax(smin.x + sec_w, smin.y + current_h);
+            dl->AddRectFilled(smin, smax, IM_COL32(18, 16, 32, (int)(200 * alpha)), 4.f);
+            dl->AddRect(smin, smax, IM_COL32(255, 255, 255, (int)(8 * alpha)), 4.f, 0, 0.5f);
 
-            dl->PushClipRect(smin, smax, true);
-            dl->AddText(ImGui::GetFont(), font_size,
-                ImVec2(smin.x + 8.f, smin.y + 6.f),
-                IM_COL32(150, 148, 175, (int)(180 * alpha)),
-                truncated.c_str(), nullptr, sec_w - 16.f);
-            dl->PopClipRect();
+            std::string hdr = collapsed ?
+                ("\xe2\x96\xb6 Result (" + std::to_string(span.text.size()) + " chars)") :
+                ("\xe2\x96\xbc Result (" + std::to_string(span.text.size()) + " chars)");
+            dl->AddText(ImVec2(smin.x + 8.f, smin.y + 3.f),
+                IM_COL32((int)accent_r, (int)accent_g, (int)accent_b, (int)(200 * alpha)),
+                hdr.c_str());
 
-            cursor_y += sec_h + 4.f;
+            ImVec2 hdr_max(smax.x, smin.y + header_h);
+            if (ImGui::IsMouseHoveringRect(smin, hdr_max) && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                ImGui::GetStateStorage()->SetBool(collapse_id, !collapsed);
+
+            if (!collapsed && current_h > header_h + 2.f) {
+                dl->PushClipRect(ImVec2(smin.x, smin.y + header_h), smax, true);
+                dl->AddText(ImGui::GetFont(), font_size,
+                    ImVec2(smin.x + 8.f, smin.y + header_h + 2.f),
+                    IM_COL32(150, 148, 175, (int)(180 * alpha)),
+                    truncated.c_str(), nullptr, sec_w - 16.f);
+                dl->PopClipRect();
+            }
+
+            cursor_y += current_h + 4.f;
             cursor_x = base_x;
             break;
         }
         }
     }
 
+    if (!show_actions) {
+        float blink = std::fmod(static_cast<float>(ImGui::GetTime()) * 2.f, 2.f);
+        if (blink < 1.2f) {
+            float cursor_alpha = (blink < 0.6f) ? 1.f : (1.2f - blink) / 0.6f;
+            dl->AddRectFilled(
+                ImVec2(cursor_x + 1.f, cursor_y),
+                ImVec2(cursor_x + 3.f, cursor_y + font_size),
+                IM_COL32((int)accent_r, (int)accent_g, (int)accent_b,
+                         static_cast<int>(200 * alpha * cursor_alpha)));
+        }
+    }
 
     float msg_h = cursor_y - origin.y + 5.f;
     result.height = msg_h;
 
+    for (int si = 0; si < 3; ++si) {
+        float sy = origin.y + msg_h + static_cast<float>(si) * 2.f;
+        float sa = (20.f - static_cast<float>(si) * 7.f) * alpha;
+        if (sa > 0.f) {
+            dl->AddRectFilled(
+                ImVec2(origin.x + 2.f + static_cast<float>(si), sy),
+                ImVec2(origin.x + max_w - 2.f - static_cast<float>(si), sy + 2.f),
+                IM_COL32(0, 0, 0, static_cast<int>(sa)), 2.f);
+        }
+    }
 
     if (show_actions) {
         ImVec2 msg_min = origin;

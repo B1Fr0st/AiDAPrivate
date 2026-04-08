@@ -12,13 +12,21 @@
 #include "script_engine.hpp"
 #include "tcp_stream_tracker.hpp"
 #include "page_guard_engine.hpp"
+#include "packet_callstack.hpp"
+#include "pre_encrypt_hook.hpp"
+#include "display_filter.hpp"
+#include "protobuf_codec.hpp"
+#include "network_view.hpp"
+#include "mitm_proxy.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <fstream>
 #include <iomanip>
 #include <map>
 #include <mutex>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -2162,9 +2170,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             return tool_result_t::ok(text, r);
         }, true});
 
-    // -----------------------------------------------------------------------
-    // network_stream_track
-    // -----------------------------------------------------------------------
+
     register_compat(srv, {
         OBFSTR("network_stream_track"), OBFSTR("network"),
         OBFSTR("Dynamic TCP stream tracker backed by the kernel driver. Operations: "
@@ -2201,7 +2207,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 return tool_result_t::ok("TCP stream tracker cleared");
             }
 
-            // Helper: format raw bytes as "XX XX XX ..." + printable ASCII side-by-side
+
             auto format_payload = [](const std::vector<uint8_t>& data) -> std::string {
                 std::ostringstream hex_oss, asc_oss;
                 for (size_t i = 0; i < data.size() && i < 4096; ++i) {
@@ -2213,7 +2219,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 return hex_oss.str() + " | " + asc_oss.str();
             };
 
-            // Helper: build JSON object from a snapshot
+
             auto snap_to_json = [&](const network_view::stream_snapshot_t& s) -> json {
                 char src_buf[32] = {}, dst_buf[32] = {};
                 uint32_t sip = s.key.src_ip4, dip = s.key.dst_ip4;
@@ -2254,7 +2260,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 uint16_t src_port  = static_cast<uint16_t>(params.value("src_port", 0));
                 uint16_t dst_port  = static_cast<uint16_t>(params.value("dst_port", 0));
 
-                // Parse dotted-quad IPv4 into uint32_t (little-endian byte order)
+
                 auto parse_ip4 = [](const std::string& s) -> uint32_t {
                     uint32_t a = 0, b = 0, c = 0, d = 0;
                     sscanf(s.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d);
@@ -2281,9 +2287,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                                         "'. Use start|stop|get_all|get_stream|clear");
         }, false});
 
-    // -----------------------------------------------------------------------
-    // network_pg_sniff
-    // -----------------------------------------------------------------------
+
     register_compat(srv, {
         OBFSTR("network_pg_sniff"), OBFSTR("network"),
         OBFSTR("Pre-encryption page guard sniffer. Installs a VEH-based PAGE_GUARD trap on a "
@@ -2306,7 +2310,7 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                 if (pid == 0)
                     return tool_result_t::error("'pid' is required for install");
 
-                // Accept address as hex string or plain number
+
                 uint64_t addr = 0;
                 if (params.contains("address")) {
                     auto& av = params["address"];
@@ -2409,6 +2413,1021 @@ void register_network_tools(mcp_standalone::server_t& srv) {
             return tool_result_t::error("Unknown operation '" + op +
                                         "'. Use install|get_captures|uninstall|list_sessions");
         }, false});
+
+    register_compat(srv, {
+        OBFSTR("network_packet_callstack"), OBFSTR("network"),
+        OBFSTR("Capture or retrieve the call stack associated with a network packet. "
+               "When a packet is captured with a thread ID, this snapshots the thread's registers "
+               "and walks the RBP chain to show exactly which code sent the packet. "
+               "Operations: enable, disable, get (by packet_index), recent, clear."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("Operation: enable|disable|get|recent|clear"), true},
+         {OBFSTR("packet_index"), OBFSTR("number"), OBFSTR("Packet index for 'get' operation"), false},
+         {OBFSTR("max_count"), OBFSTR("number"), OBFSTR("Max entries for 'recent' operation (default 64)"), false}},
+        [](const json& args) -> tool_result_t {
+            std::string op = args.value("operation", "");
+            if (op.empty())
+                return tool_result_t::error("Missing 'operation' parameter");
+
+            if (op == "enable") {
+                packet_callstack::set_enabled(true);
+                return tool_result_t::ok("Packet callstack capture enabled");
+            }
+            if (op == "disable") {
+                packet_callstack::set_enabled(false);
+                return tool_result_t::ok("Packet callstack capture disabled");
+            }
+            if (op == "clear") {
+                packet_callstack::clear();
+                return tool_result_t::ok("Packet callstack entries cleared");
+            }
+            if (op == "get") {
+                uint64_t idx = args.value("packet_index", static_cast<uint64_t>(0));
+                packet_callstack::packet_callstack_entry_t entry{};
+                if (!packet_callstack::get_callstack(idx, entry))
+                    return tool_result_t::error("No callstack found for packet " + std::to_string(idx));
+                json r;
+                r["packet_index"] = entry.packet_index;
+                r["pid"] = entry.pid;
+                r["tid"] = entry.tid;
+                r["rip"] = (std::ostringstream() << "0x" << std::hex << entry.rip).str();
+                r["rsp"] = (std::ostringstream() << "0x" << std::hex << entry.rsp).str();
+                json frames = json::array();
+                for (const auto& f : entry.frames) {
+                    json fj;
+                    fj["address"] = (std::ostringstream() << "0x" << std::hex << f.address).str();
+                    fj["return_address"] = (std::ostringstream() << "0x" << std::hex << f.return_address).str();
+                    fj["module"] = f.module_name;
+                    fj["offset"] = (std::ostringstream() << "0x" << std::hex << f.module_offset).str();
+                    frames.push_back(fj);
+                }
+                r["frames"] = frames;
+                return tool_result_t::ok(std::to_string(entry.frames.size()) + " frames captured", r);
+            }
+            if (op == "recent") {
+                size_t max_count = args.value("max_count", 64);
+                auto entries = packet_callstack::get_recent(max_count);
+                json arr = json::array();
+                for (const auto& e : entries) {
+                    json ej;
+                    ej["packet_index"] = e.packet_index;
+                    ej["pid"] = e.pid;
+                    ej["tid"] = e.tid;
+                    ej["frame_count"] = static_cast<int>(e.frames.size());
+                    if (!e.frames.empty())
+                        ej["top_frame"] = e.frames[0].module_name + "+0x" +
+                            (std::ostringstream() << std::hex << e.frames[0].module_offset).str();
+                    arr.push_back(ej);
+                }
+                return tool_result_t::ok(std::to_string(entries.size()) + " callstack entries", arr);
+            }
+            return tool_result_t::error("Unknown operation '" + op + "'. Use enable|disable|get|recent|clear");
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("network_pre_encrypt_hook"), OBFSTR("network"),
+        OBFSTR("Hook SSL/TLS encryption functions to capture plaintext data before encryption. "
+               "Auto-detects SSL_write, PR_Write, EncryptMessage, send, WSASend across OpenSSL, NSS, Schannel, Winsock. "
+               "Uses hardware breakpoints (DR0-DR3) to intercept buffers without code modification. "
+               "Operations: auto_hook (auto-detect and hook), hook_address (manual), unhook_all, get_captures, clear, status."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("Operation: auto_hook|hook_address|unhook_all|get_captures|clear|status"), true},
+         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID for auto_hook"), false},
+         {OBFSTR("address"), OBFSTR("string"), OBFSTR("Hex address for hook_address (e.g. '0x7FFA1234')"), false},
+         {OBFSTR("name"), OBFSTR("string"), OBFSTR("Function name label for hook_address"), false},
+         {OBFSTR("buffer_reg"), OBFSTR("number"), OBFSTR("Register index for buffer ptr: 0=RCX 1=RDX 2=R8 3=R9"), false},
+         {OBFSTR("size_reg"), OBFSTR("number"), OBFSTR("Register index for size param"), false},
+         {OBFSTR("max_count"), OBFSTR("number"), OBFSTR("Max captures to return (default 64)"), false}},
+        [](const json& args) -> tool_result_t {
+            std::string op = args.value("operation", "");
+            if (op.empty())
+                return tool_result_t::error("Missing 'operation' parameter");
+
+            if (op == "auto_hook") {
+                uint32_t pid = args.value("pid", static_cast<uint32_t>(0));
+                if (pid == 0)
+                    return tool_result_t::error("Missing 'pid' parameter for auto_hook");
+                if (!pre_encrypt_hook::auto_hook(pid))
+                    return tool_result_t::error("Failed to auto-hook encryption functions in PID " + std::to_string(pid));
+                pre_encrypt_hook::start_polling();
+                json r;
+                std::lock_guard<std::mutex> lock(pre_encrypt_hook::g_state.mutex);
+                r["hooks_installed"] = static_cast<int>(pre_encrypt_hook::g_state.targets.size());
+                json hooks = json::array();
+                for (const auto& t : pre_encrypt_hook::g_state.targets) {
+                    if (t.active) {
+                        json h;
+                        h["name"] = t.function_name;
+                        h["address"] = (std::ostringstream() << "0x" << std::hex << t.address).str();
+                        h["bp_slot"] = t.bp_index;
+                        hooks.push_back(h);
+                    }
+                }
+                r["hooks"] = hooks;
+                return tool_result_t::ok("Hooked " + std::to_string(hooks.size()) + " encryption functions", r);
+            }
+            if (op == "hook_address") {
+                std::string addr_str = args.value("address", "");
+                if (addr_str.empty())
+                    return tool_result_t::error("Missing 'address' parameter");
+                uint64_t addr = std::strtoull(addr_str.c_str(), nullptr, 16);
+                std::string name = args.value("name", "custom_hook");
+                uint32_t buf_reg = args.value("buffer_reg", static_cast<uint32_t>(1));
+                uint32_t sz_reg = args.value("size_reg", static_cast<uint32_t>(2));
+                if (!pre_encrypt_hook::hook_address(addr, name, buf_reg, sz_reg))
+                    return tool_result_t::error("Failed to hook address " + addr_str);
+                pre_encrypt_hook::start_polling();
+                return tool_result_t::ok("Hooked " + name + " at " + addr_str);
+            }
+            if (op == "unhook_all") {
+                pre_encrypt_hook::unhook_all();
+                return tool_result_t::ok("All pre-encryption hooks removed");
+            }
+            if (op == "get_captures") {
+                size_t max_count = args.value("max_count", 64);
+                auto caps = pre_encrypt_hook::get_captures(max_count);
+                json arr = json::array();
+                for (const auto& c : caps) {
+                    json cj;
+                    cj["tid"] = c.tid;
+                    cj["function"] = c.function_name;
+                    cj["buffer_size"] = static_cast<int>(c.buffer.size());
+                    if (c.buffer.size() <= 256) {
+                        std::string text(c.buffer.begin(), c.buffer.end());
+                        bool printable = true;
+                        for (auto b : c.buffer) if (b < 0x20 && b != '\n' && b != '\r' && b != '\t') { printable = false; break; }
+                        if (printable) cj["plaintext"] = text;
+                        else {
+                            std::ostringstream hex;
+                            for (size_t i = 0; i < c.buffer.size() && i < 64; ++i)
+                                hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c.buffer[i]) << " ";
+                            cj["hex_preview"] = hex.str();
+                        }
+                    } else {
+                        std::ostringstream hex;
+                        for (size_t i = 0; i < 64 && i < c.buffer.size(); ++i)
+                            hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c.buffer[i]) << " ";
+                        cj["hex_preview"] = hex.str();
+                    }
+                    if (!c.module_name.empty())
+                        cj["module"] = c.module_name + "+0x" + (std::ostringstream() << std::hex << c.module_offset).str();
+                    arr.push_back(cj);
+                }
+                return tool_result_t::ok(std::to_string(caps.size()) + " plaintext captures", arr);
+            }
+            if (op == "clear") {
+                pre_encrypt_hook::clear_captures();
+                return tool_result_t::ok("Pre-encryption captures cleared");
+            }
+            if (op == "status") {
+                json r;
+                r["active"] = pre_encrypt_hook::is_active();
+                std::lock_guard<std::mutex> lock(pre_encrypt_hook::g_state.mutex);
+                r["hook_count"] = static_cast<int>(pre_encrypt_hook::g_state.targets.size());
+                r["capture_count"] = static_cast<int>(pre_encrypt_hook::g_state.captures.size());
+                return tool_result_t::ok(pre_encrypt_hook::is_active() ? "Active" : "Inactive", r);
+            }
+            return tool_result_t::error("Unknown operation '" + op + "'. Use auto_hook|hook_address|unhook_all|get_captures|clear|status");
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("network_display_filter"), OBFSTR("network"),
+        OBFSTR("Compile and test BPF-style display filter expressions for packet filtering. "
+               "Supports fields: tcp.port, ip.src, ip.dst, http.method, http.status, dns.query, "
+               "tcp.len, pid, protocol, direction, host, summary. "
+               "Operators: ==, !=, >, <, >=, <=, contains. Boolean: && || !. Grouping: (). "
+               "Operations: compile (validate expression), test (test against packet fields), validate."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("Operation: compile|test|validate"), true},
+         {OBFSTR("expression"), OBFSTR("string"), OBFSTR("Filter expression e.g. 'tcp.port == 443 && http.method == \"POST\"'"), true},
+         {OBFSTR("packet"), OBFSTR("object"), OBFSTR("Packet fields object for 'test' operation"), false}},
+        [](const json& args) -> tool_result_t {
+            std::string op = args.value("operation", "compile");
+            std::string expr = args.value("expression", "");
+            if (expr.empty())
+                return tool_result_t::error("Missing 'expression' parameter");
+
+            if (op == "validate") {
+                std::string error;
+                bool valid = display_filter::validate(expr, error);
+                json r;
+                r["valid"] = valid;
+                if (!valid) r["error"] = error;
+                return tool_result_t::ok(valid ? "Filter is valid" : "Filter invalid: " + error, r);
+            }
+            if (op == "compile" || op == "test") {
+                auto filter = display_filter::compile(expr);
+                if (!filter.valid)
+                    return tool_result_t::error("Filter compilation failed: " + filter.error);
+
+                if (op == "compile") {
+                    json r;
+                    r["valid"] = true;
+                    r["expression"] = expr;
+                    return tool_result_t::ok("Filter compiled successfully", r);
+                }
+
+                display_filter::packet_fields_t pkt{};
+                if (args.contains("packet") && args["packet"].is_object()) {
+                    const auto& p = args["packet"];
+                    pkt.pid = p.value("pid", static_cast<uint32_t>(0));
+                    pkt.protocol = static_cast<uint8_t>(p.value("protocol", 0));
+                    pkt.direction = static_cast<uint8_t>(p.value("direction", 0));
+                    pkt.src_port = static_cast<uint16_t>(p.value("src_port", 0));
+                    pkt.dst_port = static_cast<uint16_t>(p.value("dst_port", 0));
+                    pkt.payload_size = p.value("payload_size", static_cast<uint32_t>(0));
+                    pkt.src_ip = p.value("src_ip", "");
+                    pkt.dst_ip = p.value("dst_ip", "");
+                    pkt.protocol_label = p.value("protocol_label", "");
+                    pkt.http_method = p.value("http_method", "");
+                    pkt.http_status = p.value("http_status", 0);
+                    pkt.dns_query = p.value("dns_query", "");
+                    pkt.summary = p.value("summary", "");
+                    pkt.host = p.value("host", "");
+                }
+
+                bool match = filter.matches(pkt);
+                json r;
+                r["matches"] = match;
+                r["expression"] = expr;
+                return tool_result_t::ok(match ? "Packet matches filter" : "Packet does not match filter", r);
+            }
+            return tool_result_t::error("Unknown operation '" + op + "'. Use compile|test|validate");
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("network_protobuf_decode"), OBFSTR("network"),
+        OBFSTR("Decode, encode, and edit Protocol Buffer wire format data without .proto files. "
+               "Supports raw protobuf and gRPC length-prefixed frames. "
+               "Operations: decode (binary to field tree), encode (field tree to binary), "
+               "decode_grpc (gRPC frames), modify (edit field by path), auto_detect (heuristic type inference)."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("Operation: decode|encode|decode_grpc|modify|auto_detect"), true},
+         {OBFSTR("hex_data"), OBFSTR("string"), OBFSTR("Hex-encoded protobuf data for decode/decode_grpc"), false},
+         {OBFSTR("fields"), OBFSTR("array"), OBFSTR("Field tree array for encode operation"), false},
+         {OBFSTR("path"), OBFSTR("string"), OBFSTR("Dot-separated field path for modify (e.g. '1.3.2')"), false},
+         {OBFSTR("value"), OBFSTR("string"), OBFSTR("New value for modify operation"), false},
+         {OBFSTR("field_type"), OBFSTR("string"), OBFSTR("Type for modify: uint|sint|int|bool|float|double|string|bytes"), false}},
+        [](const json& args) -> tool_result_t {
+            std::string op = args.value("operation", "");
+            if (op.empty())
+                return tool_result_t::error("Missing 'operation' parameter");
+
+            auto hex_to_bytes = [](const std::string& hex) -> std::vector<uint8_t> {
+                std::vector<uint8_t> result;
+                for (size_t i = 0; i < hex.size(); i += 2) {
+                    while (i < hex.size() && (hex[i] == ' ' || hex[i] == ':')) ++i;
+                    if (i + 1 >= hex.size()) break;
+                    std::string byte_str = hex.substr(i, 2);
+                    result.push_back(static_cast<uint8_t>(std::strtoul(byte_str.c_str(), nullptr, 16)));
+                }
+                return result;
+            };
+
+            auto bytes_to_hex = [](const std::vector<uint8_t>& data) -> std::string {
+                const char hexc[] = "0123456789abcdef";
+                std::string out;
+                out.reserve(data.size() * 3);
+                for (size_t i = 0; i < data.size(); ++i) {
+                    if (i > 0) out += ' ';
+                    out += hexc[(data[i] >> 4) & 0xF];
+                    out += hexc[data[i] & 0xF];
+                }
+                return out;
+            };
+
+            auto field_to_json = [](const protobuf_codec::field_t& f, auto& self) -> json {
+                json fj;
+                fj["field_number"] = f.field_number;
+                fj["wire_type"] = static_cast<int>(f.wire_type);
+                fj["display_type"] = static_cast<int>(f.display_type);
+                fj["value"] = protobuf_codec::format_field_value(f);
+                if (f.is_nested && !f.nested_fields.empty()) {
+                    json nested = json::array();
+                    for (const auto& nf : f.nested_fields)
+                        nested.push_back(self(nf, self));
+                    fj["nested"] = nested;
+                }
+                return fj;
+            };
+
+            if (op == "decode") {
+                std::string hex = args.value("hex_data", "");
+                if (hex.empty())
+                    return tool_result_t::error("Missing 'hex_data' parameter");
+                auto bytes = hex_to_bytes(hex);
+                auto fields = protobuf_codec::decode(bytes.data(), bytes.size());
+                if (fields.empty())
+                    return tool_result_t::error("Failed to decode protobuf data");
+                protobuf_codec::auto_detect_types(fields);
+                json arr = json::array();
+                for (const auto& f : fields)
+                    arr.push_back(field_to_json(f, field_to_json));
+                json r;
+                r["fields"] = arr;
+                r["field_count"] = static_cast<int>(fields.size());
+                return tool_result_t::ok(std::to_string(fields.size()) + " protobuf fields decoded", r);
+            }
+            if (op == "decode_grpc") {
+                std::string hex = args.value("hex_data", "");
+                if (hex.empty())
+                    return tool_result_t::error("Missing 'hex_data' parameter");
+                auto bytes = hex_to_bytes(hex);
+                auto frames = protobuf_codec::parse_grpc_frames(bytes.data(), bytes.size());
+                if (frames.empty())
+                    return tool_result_t::error("No valid gRPC frames found");
+                json arr = json::array();
+                for (size_t i = 0; i < frames.size(); ++i) {
+                    json fj;
+                    fj["frame_index"] = static_cast<int>(i);
+                    fj["compressed"] = frames[i].compressed != 0;
+                    fj["length"] = frames[i].length;
+                    auto fields = protobuf_codec::decode(frames[i].data.data(), frames[i].data.size());
+                    protobuf_codec::auto_detect_types(fields);
+                    json fields_arr = json::array();
+                    for (const auto& f : fields)
+                        fields_arr.push_back(field_to_json(f, field_to_json));
+                    fj["fields"] = fields_arr;
+                    arr.push_back(fj);
+                }
+                json r;
+                r["frames"] = arr;
+                r["frame_count"] = static_cast<int>(frames.size());
+                return tool_result_t::ok(std::to_string(frames.size()) + " gRPC frames decoded", r);
+            }
+            if (op == "auto_detect") {
+                std::string hex = args.value("hex_data", "");
+                if (hex.empty())
+                    return tool_result_t::error("Missing 'hex_data' parameter");
+                auto bytes = hex_to_bytes(hex);
+                auto fields = protobuf_codec::decode(bytes.data(), bytes.size());
+                if (fields.empty())
+                    return tool_result_t::error("Failed to decode protobuf data");
+                protobuf_codec::auto_detect_types(fields);
+                json arr = json::array();
+                for (const auto& f : fields)
+                    arr.push_back(field_to_json(f, field_to_json));
+                json r;
+                r["fields"] = arr;
+                return tool_result_t::ok("Type detection complete", r);
+            }
+            return tool_result_t::error("Unknown operation '" + op + "'. Use decode|encode|decode_grpc|modify|auto_detect");
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("network_fuzzer"), OBFSTR("network"),
+        OBFSTR("HTTP fuzzer / intruder. Configure target, base request with injection points, "
+               "payload sets, and attack mode. Then start fuzzing to send requests with substituted "
+               "payloads and collect responses. Operations: configure, start, stop, status, get_results, clear."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("configure|start|stop|status|get_results|clear"), true},
+         {OBFSTR("host"), OBFSTR("string"), OBFSTR("Target host for configure"), false},
+         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Target port"), false},
+         {OBFSTR("use_tls"), OBFSTR("boolean"), OBFSTR("Use HTTPS"), false},
+         {OBFSTR("base_request"), OBFSTR("string"), OBFSTR("HTTP request template with injection points"), false},
+         {OBFSTR("attack_mode"), OBFSTR("string"), OBFSTR("sniper|pitchfork|clusterbomb"), false},
+         {OBFSTR("payload_source"), OBFSTR("string"), OBFSTR("Wordlist path or inline data"), false},
+         {OBFSTR("payload_type"), OBFSTR("number"), OBFSTR("0=wordlist, 1=sequential, 2=charset"), false},
+         {OBFSTR("thread_count"), OBFSTR("number"), OBFSTR("Concurrent workers 1-32"), false},
+         {OBFSTR("delay_ms"), OBFSTR("number"), OBFSTR("Throttle between requests in ms"), false},
+         {OBFSTR("match_status"), OBFSTR("number"), OBFSTR("Filter by HTTP status code (0=any)"), false},
+         {OBFSTR("stop_on_match"), OBFSTR("boolean"), OBFSTR("Stop fuzzing when a match is found"), false},
+         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Max results to return for get_results (default 100)"), false}},
+        [](const json& args) -> tool_result_t {
+            std::string op = args.value("operation", "");
+            if (op.empty())
+                return tool_result_t::error(OBFSTR("Missing 'operation' parameter"));
+
+            auto& state = network_view::g_state;
+
+            if (op == "configure") {
+                auto& cfg = state.fuzz_config;
+                if (args.contains("host") && args["host"].is_string())
+                    cfg.host = args["host"].get<std::string>();
+                if (args.contains("port") && args["port"].is_number())
+                    cfg.port = static_cast<uint16_t>(args["port"].get<int>());
+                if (args.contains("use_tls") && args["use_tls"].is_boolean())
+                    cfg.use_tls = args["use_tls"].get<bool>();
+                if (args.contains("base_request") && args["base_request"].is_string())
+                    cfg.base_request = args["base_request"].get<std::string>();
+                if (args.contains("attack_mode") && args["attack_mode"].is_string()) {
+                    std::string m = args["attack_mode"].get<std::string>();
+                    if (m == "pitchfork") cfg.attack_mode = network_view::fuzzer_attack_mode_t::pitchfork;
+                    else if (m == "clusterbomb") cfg.attack_mode = network_view::fuzzer_attack_mode_t::clusterbomb;
+                    else cfg.attack_mode = network_view::fuzzer_attack_mode_t::sniper;
+                }
+                if (args.contains("payload_source") && args["payload_source"].is_string())
+                    cfg.payload_source = args["payload_source"].get<std::string>();
+                if (args.contains("payload_type") && args["payload_type"].is_number())
+                    cfg.payload_type = args["payload_type"].get<int>();
+                if (args.contains("thread_count") && args["thread_count"].is_number())
+                    cfg.thread_count = std::max(1, std::min(32, args["thread_count"].get<int>()));
+                if (args.contains("delay_ms") && args["delay_ms"].is_number())
+                    cfg.delay_ms = args["delay_ms"].get<int>();
+                if (args.contains("match_status") && args["match_status"].is_number())
+                    cfg.match_status = args["match_status"].get<int>();
+                if (args.contains("stop_on_match") && args["stop_on_match"].is_boolean())
+                    cfg.stop_on_match = args["stop_on_match"].get<bool>();
+                json r;
+                r["host"] = cfg.host;
+                r["port"] = cfg.port;
+                r["use_tls"] = cfg.use_tls;
+                r["attack_mode"] = static_cast<int>(cfg.attack_mode);
+                r["thread_count"] = cfg.thread_count;
+                return tool_result_t::ok(OBFSTR("Fuzzer configured"), r);
+            }
+
+            if (op == "start") {
+                if (state.fuzz_running.load())
+                    return tool_result_t::error(OBFSTR("Fuzzer is already running"));
+                {
+                    std::lock_guard<std::mutex> lk(state.fuzz_mutex);
+                    state.fuzz_results.clear();
+                }
+                state.fuzz_progress.store(0);
+                state.fuzz_total.store(0);
+                state.fuzz_running.store(true);
+                if (state.fuzz_thread.joinable()) state.fuzz_thread.join();
+                state.fuzz_thread = std::thread([&state]() {
+                    auto& cfg = state.fuzz_config;
+
+                    auto load_set = [](const network_view::payload_set_t& ps) -> std::vector<std::string> {
+                        std::vector<std::string> lines;
+                        auto push_line = [&](std::istream& is) {
+                            std::string line;
+                            while (std::getline(is, line)) {
+                                if (!line.empty() && line.back() == '\r') line.pop_back();
+                                if (!line.empty()) lines.push_back(std::move(line));
+                            }
+                        };
+                        if (ps.type == 0) {
+                            std::ifstream f(ps.source);
+                            if (f.is_open()) push_line(f);
+                        } else {
+                            std::istringstream ss(ps.source);
+                            push_line(ss);
+                        }
+                        return lines;
+                    };
+
+                    auto load_legacy_set = [&]() -> std::vector<std::string> {
+                        network_view::payload_set_t tmp;
+                        tmp.type = cfg.payload_type;
+                        tmp.source = cfg.payload_source;
+                        if (cfg.payload_type == 1) {
+                            std::vector<std::string> nums;
+                            int start_n = 0, end_n = 100;
+                            if (sscanf(cfg.payload_source.c_str(), "%d-%d", &start_n, &end_n) >= 1)
+                                for (int n = start_n; n <= end_n; n++)
+                                    nums.push_back(std::to_string(n));
+                            return nums;
+                        } else if (cfg.payload_type == 2) {
+                            std::string charset = cfg.payload_source.empty()
+                                ? "abcdefghijklmnopqrstuvwxyz0123456789" : cfg.payload_source;
+                            std::vector<std::string> v;
+                            for (char c : charset) v.push_back(std::string(1, c));
+                            for (char a : charset)
+                                for (char b : charset)
+                                    v.push_back(std::string(1, a) + b);
+                            return v;
+                        }
+                        return load_set(tmp);
+                    };
+
+                    auto make_request_multi = [](const std::string& tmpl,
+                                                  const std::vector<std::string>& payloads) -> std::string {
+                        const std::string marker = "\xc2\xa7";
+                        std::string result;
+                        result.reserve(tmpl.size() + 512);
+                        size_t pos = 0;
+                        size_t pi = 0;
+                        while (pos < tmpl.size()) {
+                            size_t s = tmpl.find(marker, pos);
+                            if (s == std::string::npos) { result.append(tmpl, pos, std::string::npos); break; }
+                            size_t e = tmpl.find(marker, s + marker.size());
+                            if (e == std::string::npos) { result.append(tmpl, pos, std::string::npos); break; }
+                            result.append(tmpl, pos, s - pos);
+                            if (pi < payloads.size()) result.append(payloads[pi]);
+                            pi++;
+                            pos = e + marker.size();
+                        }
+                        if (!payloads.empty()) {
+                            size_t fp = 0;
+                            const std::string fuzz_tok = "FUZZ";
+                            while ((fp = result.find(fuzz_tok, fp)) != std::string::npos) {
+                                result.replace(fp, fuzz_tok.size(), payloads[0]);
+                                fp += payloads[0].size();
+                            }
+                        }
+                        return result;
+                    };
+
+                    using combo_t = std::vector<std::string>;
+                    std::vector<combo_t> combos;
+
+                    switch (cfg.attack_mode) {
+                        case network_view::fuzzer_attack_mode_t::sniper: {
+                            std::vector<std::string> payloads = cfg.payload_sets.empty()
+                                ? load_legacy_set()
+                                : load_set(cfg.payload_sets[0]);
+                            combos.reserve(payloads.size());
+                            for (auto& p : payloads) combos.push_back({ p });
+                            break;
+                        }
+                        case network_view::fuzzer_attack_mode_t::pitchfork: {
+                            if (cfg.payload_sets.empty()) { state.fuzz_running.store(false); return; }
+                            std::vector<std::vector<std::string>> sets;
+                            sets.reserve(cfg.payload_sets.size());
+                            for (auto& ps : cfg.payload_sets) {
+                                sets.push_back(load_set(ps));
+                                if (sets.back().empty()) { state.fuzz_running.store(false); return; }
+                            }
+                            size_t min_len = sets[0].size();
+                            for (auto& s : sets) min_len = std::min(min_len, s.size());
+                            combos.reserve(min_len);
+                            for (size_t i = 0; i < min_len; i++) {
+                                combo_t c;
+                                c.reserve(sets.size());
+                                for (auto& s : sets) c.push_back(s[i]);
+                                combos.push_back(std::move(c));
+                            }
+                            break;
+                        }
+                        case network_view::fuzzer_attack_mode_t::clusterbomb: {
+                            if (cfg.payload_sets.empty()) { state.fuzz_running.store(false); return; }
+                            std::vector<std::vector<std::string>> sets;
+                            sets.reserve(cfg.payload_sets.size());
+                            for (auto& ps : cfg.payload_sets) {
+                                sets.push_back(load_set(ps));
+                                if (sets.back().empty()) { state.fuzz_running.store(false); return; }
+                            }
+                            combos.push_back(combo_t{});
+                            for (auto& s : sets) {
+                                std::vector<combo_t> next;
+                                next.reserve(combos.size() * s.size());
+                                for (auto& base : combos)
+                                    for (auto& val : s) {
+                                        combo_t nc = base;
+                                        nc.push_back(val);
+                                        next.push_back(std::move(nc));
+                                    }
+                                combos = std::move(next);
+                            }
+                            break;
+                        }
+                    }
+
+                    if (combos.empty()) { state.fuzz_running.store(false); return; }
+
+                    state.fuzz_total.store(static_cast<int>(combos.size()));
+                    state.fuzz_progress.store(0);
+
+                    std::atomic<int> next_index{0};
+                    int total = static_cast<int>(combos.size());
+                    int threads = std::min(cfg.thread_count, 32);
+
+                    auto worker = [&]() {
+                        while (state.fuzz_running.load()) {
+                            int idx = next_index.fetch_add(1);
+                            if (idx >= total) break;
+                            auto& combo = combos[static_cast<size_t>(idx)];
+                            std::string req_s = make_request_multi(cfg.base_request, combo);
+                            std::vector<uint8_t> raw_req(req_s.begin(), req_s.end());
+                            auto t0 = GetTickCount64();
+                            auto res = mitm_proxy::repeat_request(cfg.host, cfg.port, cfg.use_tls, raw_req);
+                            auto elapsed = GetTickCount64() - t0;
+                            network_view::state_t::fuzzer_result fr;
+                            fr.index = idx;
+                            fr.payloads = combo;
+                            fr.payload = combo.empty() ? std::string() : combo[0];
+                            fr.latency_ms = elapsed;
+                            if (res.success) {
+                                fr.status_code = res.exchange.response.status_code;
+                                fr.response_len = res.exchange.raw_response.size();
+                                std::string body(res.exchange.raw_response.begin(),
+                                                 res.exchange.raw_response.end());
+                                fr.response_preview = body.substr(0, std::min<size_t>(200, body.size()));
+                                fr.match = (cfg.match_status > 0) ? (fr.status_code == cfg.match_status) : true;
+                            }
+                            {
+                                std::lock_guard<std::mutex> lk(state.fuzz_mutex);
+                                state.fuzz_results.push_back(std::move(fr));
+                            }
+                            state.fuzz_progress.fetch_add(1);
+                            if (cfg.stop_on_match && fr.match) {
+                                state.fuzz_running.store(false);
+                                break;
+                            }
+                            if (cfg.delay_ms > 0) Sleep(static_cast<DWORD>(cfg.delay_ms));
+                        }
+                    };
+
+                    std::vector<std::thread> pool;
+                    pool.reserve(static_cast<size_t>(threads));
+                    for (int t = 0; t < threads; t++) pool.emplace_back(worker);
+                    for (auto& th : pool) if (th.joinable()) th.join();
+                    state.fuzz_running.store(false);
+                });
+                json r;
+                r["status"] = "started";
+                r["host"] = state.fuzz_config.host;
+                r["port"] = state.fuzz_config.port;
+                return tool_result_t::ok(OBFSTR("Fuzzer started"), r);
+            }
+
+            if (op == "stop") {
+                if (!state.fuzz_running.load())
+                    return tool_result_t::ok(OBFSTR("Fuzzer is not running"));
+                state.fuzz_running.store(false);
+                return tool_result_t::ok(OBFSTR("Fuzzer stop signal sent"));
+            }
+
+            if (op == "status") {
+                json r;
+                r["running"] = state.fuzz_running.load();
+                r["progress"] = state.fuzz_progress.load();
+                r["total"] = state.fuzz_total.load();
+                std::lock_guard<std::mutex> lk(state.fuzz_mutex);
+                r["result_count"] = static_cast<int>(state.fuzz_results.size());
+                return tool_result_t::ok(state.fuzz_running.load() ? OBFSTR("Fuzzer running") : OBFSTR("Fuzzer idle"), r);
+            }
+
+            if (op == "get_results") {
+                int max_count = args.value("max_results", 100);
+                std::lock_guard<std::mutex> lk(state.fuzz_mutex);
+                json arr = json::array();
+                int count = 0;
+                for (auto it = state.fuzz_results.rbegin();
+                     it != state.fuzz_results.rend() && count < max_count; ++it, ++count) {
+                    json ej;
+                    ej["index"] = it->index;
+                    ej["payload"] = it->payload;
+                    if (it->payloads.size() > 1) {
+                        json pa = json::array();
+                        for (const auto& p : it->payloads) pa.push_back(p);
+                        ej["payloads"] = pa;
+                    }
+                    ej["status_code"] = it->status_code;
+                    ej["response_len"] = it->response_len;
+                    ej["latency_ms"] = it->latency_ms;
+                    ej["match"] = it->match;
+                    if (!it->response_preview.empty())
+                        ej["response_preview"] = it->response_preview;
+                    if (!it->extracted_value.empty())
+                        ej["extracted_value"] = it->extracted_value;
+                    arr.push_back(ej);
+                }
+                json r;
+                r["results"] = arr;
+                r["total"] = static_cast<int>(state.fuzz_results.size());
+                return tool_result_t::ok(std::to_string(state.fuzz_results.size()) + OBFSTR(" total results"), r);
+            }
+
+            if (op == "clear") {
+                std::lock_guard<std::mutex> lk(state.fuzz_mutex);
+                state.fuzz_results.clear();
+                state.fuzz_progress.store(0);
+                state.fuzz_total.store(0);
+                return tool_result_t::ok(OBFSTR("Fuzzer results cleared"));
+            }
+
+            return tool_result_t::error(OBFSTR("Unknown operation. Use configure|start|stop|status|get_results|clear"));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("network_websocket"), OBFSTR("network"),
+        OBFSTR("WebSocket frame viewer and injector. List captured WebSocket frames from proxy connections, "
+               "filter by host or content, inject new frames, or clear the frame buffer. "
+               "Operations: list_frames, inject_frame, clear."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("list_frames|inject_frame|clear"), true},
+         {OBFSTR("max_count"), OBFSTR("number"), OBFSTR("Max frames to return for list_frames (default 64)"), false},
+         {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Substring filter on host/preview"), false},
+         {OBFSTR("host"), OBFSTR("string"), OBFSTR("Target host for inject_frame"), false},
+         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Target port for inject_frame"), false},
+         {OBFSTR("opcode"), OBFSTR("number"), OBFSTR("WebSocket opcode: 0x1=text, 0x2=binary"), false},
+         {OBFSTR("payload"), OBFSTR("string"), OBFSTR("Frame payload text or hex string"), false},
+         {OBFSTR("is_hex"), OBFSTR("boolean"), OBFSTR("If true, interpret payload as hex"), false}},
+        [](const json& args) -> tool_result_t {
+            std::string op = args.value("operation", "");
+            if (op.empty())
+                return tool_result_t::error(OBFSTR("Missing 'operation' parameter"));
+
+            auto& state = network_view::g_state;
+
+            if (op == "list_frames") {
+                int max_count = args.value("max_count", 64);
+                std::string filter = args.value("filter", "");
+                std::lock_guard<std::mutex> lk(state.ws_mutex);
+                json arr = json::array();
+                int count = 0;
+                for (auto it = state.ws_frames.rbegin();
+                     it != state.ws_frames.rend() && count < max_count; ++it) {
+                    if (!filter.empty()) {
+                        if (it->host.find(filter) == std::string::npos &&
+                            it->preview.find(filter) == std::string::npos)
+                            continue;
+                    }
+                    json fj;
+                    fj["direction"] = it->is_outbound ? "outbound" : "inbound";
+                    fj["host"] = it->host;
+                    fj["port"] = it->port;
+                    fj["opcode"] = it->opcode;
+                    fj["is_text"] = it->is_text;
+                    fj["size"] = it->payload.size();
+                    fj["preview"] = it->preview;
+                    fj["exchange_id"] = it->exchange_id;
+                    fj["timestamp"] = it->timestamp;
+                    arr.push_back(fj);
+                    count++;
+                }
+                json r;
+                r["frames"] = arr;
+                r["total_buffered"] = static_cast<int>(state.ws_frames.size());
+                return tool_result_t::ok(std::to_string(count) + OBFSTR(" WebSocket frames"), r);
+            }
+
+            if (op == "inject_frame") {
+                return tool_result_t::error(OBFSTR("WebSocket frame injection requires an active proxy connection with an established WebSocket upgrade. Use the proxy to intercept and modify frames instead."));
+            }
+
+            if (op == "clear") {
+                std::lock_guard<std::mutex> lk(state.ws_mutex);
+                state.ws_frames.clear();
+                return tool_result_t::ok(OBFSTR("WebSocket frame buffer cleared"));
+            }
+
+            return tool_result_t::error(OBFSTR("Unknown operation. Use list_frames|inject_frame|clear"));
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("network_proxy"), OBFSTR("network"),
+        OBFSTR("HTTP/HTTPS MITM proxy with TLS interception. Start a local proxy that captures all HTTP traffic, "
+               "decrypts TLS, and logs request/response pairs. Supports WebSocket and HTTP/2. "
+               "Operations: start, stop, status, get_history, clear_history, get_exchange."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("start|stop|status|get_history|clear_history|get_exchange"), true},
+         {OBFSTR("bind_addr"), OBFSTR("string"), OBFSTR("Bind address for start (default 127.0.0.1)"), false},
+         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Bind port for start (default 8443)"), false},
+         {OBFSTR("decode_tls"), OBFSTR("boolean"), OBFSTR("Enable TLS MITM decryption"), false},
+         {OBFSTR("max_count"), OBFSTR("number"), OBFSTR("Max entries for get_history"), false},
+         {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Filter on host/method/path"), false},
+         {OBFSTR("exchange_id"), OBFSTR("number"), OBFSTR("Exchange ID for get_exchange"), false}},
+        [](const json& args) -> tool_result_t {
+            std::string op = args.value("operation", "");
+            if (op.empty())
+                return tool_result_t::error(OBFSTR("Missing 'operation' parameter"));
+
+            if (op == "start") {
+                if (mitm_proxy::is_running())
+                    return tool_result_t::error(OBFSTR("Proxy is already running"));
+                mitm_proxy::proxy_config cfg;
+                cfg.bind_addr = args.value("bind_addr", std::string("127.0.0.1"));
+                if (args.contains("port") && args["port"].is_number())
+                    cfg.bind_port = static_cast<uint16_t>(args["port"].get<int>());
+                if (args.contains("decode_tls") && args["decode_tls"].is_boolean())
+                    cfg.decode_tls = args["decode_tls"].get<bool>();
+                if (!mitm_proxy::start(cfg))
+                    return tool_result_t::error(OBFSTR("Failed to start proxy"));
+                json r;
+                r["bind_addr"] = cfg.bind_addr;
+                r["bind_port"] = cfg.bind_port;
+                r["decode_tls"] = cfg.decode_tls;
+                return tool_result_t::ok(OBFSTR("Proxy started on ") + cfg.bind_addr + ":" + std::to_string(cfg.bind_port), r);
+            }
+
+            if (op == "stop") {
+                if (!mitm_proxy::is_running())
+                    return tool_result_t::ok(OBFSTR("Proxy is not running"));
+                mitm_proxy::stop();
+                return tool_result_t::ok(OBFSTR("Proxy stopped"));
+            }
+
+            if (op == "status") {
+                auto stats = mitm_proxy::get_stats();
+                json r;
+                r["running"] = stats.running;
+                r["total_requests"] = stats.total_requests;
+                r["total_bytes_in"] = stats.total_bytes_in;
+                r["total_bytes_out"] = stats.total_bytes_out;
+                r["active_connections"] = stats.active_connections;
+                r["history_size"] = stats.history_size;
+                r["held_count"] = stats.held_count;
+                return tool_result_t::ok(stats.running ? OBFSTR("Proxy running") : OBFSTR("Proxy stopped"), r);
+            }
+
+            if (op == "get_history") {
+                size_t max_count = args.value("max_count", static_cast<size_t>(100));
+                std::string filter = args.value("filter", "");
+                auto history = mitm_proxy::get_history(max_count);
+                json arr = json::array();
+                for (const auto& ex : history) {
+                    if (!filter.empty()) {
+                        bool match = ex.target_host.find(filter) != std::string::npos ||
+                                     ex.request.method.find(filter) != std::string::npos ||
+                                     ex.request.uri.find(filter) != std::string::npos;
+                        if (!match) continue;
+                    }
+                    json ej;
+                    ej["id"] = ex.id;
+                    ej["method"] = ex.request.method;
+                    ej["host"] = ex.target_host;
+                    ej["port"] = ex.target_port;
+                    ej["path"] = ex.request.uri;
+                    ej["status_code"] = ex.response.status_code;
+                    ej["is_tls"] = ex.is_tls;
+                    ej["is_websocket"] = ex.is_websocket;
+                    ej["latency_ms"] = ex.latency_ms;
+                    ej["request_size"] = ex.request_size;
+                    ej["response_size"] = ex.response_size;
+                    arr.push_back(ej);
+                }
+                json r;
+                r["exchanges"] = arr;
+                r["count"] = static_cast<int>(arr.size());
+                return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" proxy exchanges"), r);
+            }
+
+            if (op == "clear_history") {
+                mitm_proxy::clear_history();
+                return tool_result_t::ok(OBFSTR("Proxy history cleared"));
+            }
+
+            if (op == "get_exchange") {
+                if (!args.contains("exchange_id") || !args["exchange_id"].is_number())
+                    return tool_result_t::error(OBFSTR("Missing 'exchange_id' parameter"));
+                uint64_t eid = args["exchange_id"].get<uint64_t>();
+                const auto* ex = mitm_proxy::find_exchange(eid);
+                if (!ex)
+                    return tool_result_t::error(OBFSTR("Exchange not found: ") + std::to_string(eid));
+                json r;
+                r["id"] = ex->id;
+                r["method"] = ex->request.method;
+                r["host"] = ex->target_host;
+                r["port"] = ex->target_port;
+                r["path"] = ex->request.uri;
+                r["status_code"] = ex->response.status_code;
+                r["is_tls"] = ex->is_tls;
+                r["latency_ms"] = ex->latency_ms;
+                json req_headers = json::object();
+                for (const auto& h : ex->request.headers)
+                    req_headers[h.name] = h.value;
+                r["request_headers"] = req_headers;
+                if (!ex->raw_request.empty()) {
+                    std::string req_body(ex->raw_request.begin(), ex->raw_request.end());
+                    r["raw_request"] = req_body.substr(0, std::min<size_t>(4096, req_body.size()));
+                }
+                json resp_headers = json::object();
+                for (const auto& h : ex->response.headers)
+                    resp_headers[h.name] = h.value;
+                r["response_headers"] = resp_headers;
+                if (!ex->raw_response.empty()) {
+                    std::string resp_body(ex->raw_response.begin(), ex->raw_response.end());
+                    r["raw_response"] = resp_body.substr(0, std::min<size_t>(4096, resp_body.size()));
+                }
+                if (ex->is_websocket) {
+                    r["ws_frames_sent"] = ex->ws_frames_sent;
+                    r["ws_frames_recv"] = ex->ws_frames_recv;
+                }
+                if (!ex->tls_sni.empty()) r["tls_sni"] = ex->tls_sni;
+                if (!ex->tls_version_str.empty()) r["tls_version"] = ex->tls_version_str;
+                if (!ex->alpn_protocol.empty()) r["alpn"] = ex->alpn_protocol;
+                return tool_result_t::ok(OBFSTR("Exchange ") + std::to_string(eid), r);
+            }
+
+            return tool_result_t::error(OBFSTR("Unknown operation. Use start|stop|status|get_history|clear_history|get_exchange"));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("network_repeater"), OBFSTR("network"),
+        OBFSTR("HTTP request repeater. Create entries with host/port/request, send them, and inspect responses. "
+               "Like Burp Suite Repeater. Operations: create, send, list, get, delete."),
+        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("create|send|list|get|delete"), true},
+         {OBFSTR("host"), OBFSTR("string"), OBFSTR("Target host"), false},
+         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Target port"), false},
+         {OBFSTR("use_tls"), OBFSTR("boolean"), OBFSTR("Use HTTPS"), false},
+         {OBFSTR("raw_request"), OBFSTR("string"), OBFSTR("Raw HTTP request to send"), false},
+         {OBFSTR("index"), OBFSTR("number"), OBFSTR("Repeater entry index"), false},
+         {OBFSTR("max_count"), OBFSTR("number"), OBFSTR("Max entries to return for list"), false}},
+        [](const json& args) -> tool_result_t {
+            std::string op = args.value("operation", "");
+            if (op.empty())
+                return tool_result_t::error(OBFSTR("Missing 'operation' parameter"));
+
+            auto& state = network_view::g_state;
+
+            if (op == "create") {
+                network_view::repeater_entry entry;
+                entry.host = args.value("host", std::string("localhost"));
+                if (args.contains("port") && args["port"].is_number())
+                    entry.port = static_cast<uint16_t>(args["port"].get<int>());
+                if (args.contains("use_tls") && args["use_tls"].is_boolean())
+                    entry.use_tls = args["use_tls"].get<bool>();
+                if (args.contains("raw_request") && args["raw_request"].is_string())
+                    entry.raw_request = args["raw_request"].get<std::string>();
+                state.repeater_entries.push_back(std::move(entry));
+                int idx = static_cast<int>(state.repeater_entries.size()) - 1;
+                json r;
+                r["index"] = idx;
+                r["host"] = state.repeater_entries[static_cast<size_t>(idx)].host;
+                r["port"] = state.repeater_entries[static_cast<size_t>(idx)].port;
+                return tool_result_t::ok(OBFSTR("Repeater entry created at index ") + std::to_string(idx), r);
+            }
+
+            if (op == "send") {
+                if (!args.contains("index") || !args["index"].is_number())
+                    return tool_result_t::error(OBFSTR("Missing 'index' parameter"));
+                int idx = args["index"].get<int>();
+                if (idx < 0 || idx >= static_cast<int>(state.repeater_entries.size()))
+                    return tool_result_t::error(OBFSTR("Invalid repeater entry index"));
+                auto& entry = state.repeater_entries[static_cast<size_t>(idx)];
+                if (entry.in_progress)
+                    return tool_result_t::error(OBFSTR("Request already in progress for this entry"));
+                if (args.contains("raw_request") && args["raw_request"].is_string())
+                    entry.raw_request = args["raw_request"].get<std::string>();
+                if (args.contains("host") && args["host"].is_string())
+                    entry.host = args["host"].get<std::string>();
+                if (args.contains("port") && args["port"].is_number())
+                    entry.port = static_cast<uint16_t>(args["port"].get<int>());
+                if (args.contains("use_tls") && args["use_tls"].is_boolean())
+                    entry.use_tls = args["use_tls"].get<bool>();
+                entry.in_progress = true;
+                entry.raw_response.clear();
+                entry.status_code = 0;
+                entry.latency_ms = 0;
+                std::string host = entry.host;
+                uint16_t port = entry.port;
+                bool tls = entry.use_tls;
+                std::vector<uint8_t> raw(entry.raw_request.begin(), entry.raw_request.end());
+                std::thread([&entry, host, port, tls, raw]() {
+                    auto t0 = GetTickCount64();
+                    auto res = mitm_proxy::repeat_request(host, port, tls, raw);
+                    entry.latency_ms = GetTickCount64() - t0;
+                    if (res.success) {
+                        entry.status_code = res.exchange.response.status_code;
+                        entry.raw_response = std::string(res.exchange.raw_response.begin(),
+                                                        res.exchange.raw_response.end());
+                    } else {
+                        entry.status_code = 0;
+                        entry.raw_response = res.error;
+                    }
+                    entry.in_progress = false;
+                }).detach();
+                json r;
+                r["index"] = idx;
+                r["status"] = "sending";
+                return tool_result_t::ok(OBFSTR("Request sent for repeater entry ") + std::to_string(idx), r);
+            }
+
+            if (op == "list") {
+                int max_count = args.value("max_count", static_cast<int>(state.repeater_entries.size()));
+                json arr = json::array();
+                for (int i = 0; i < static_cast<int>(state.repeater_entries.size()) && i < max_count; i++) {
+                    const auto& e = state.repeater_entries[static_cast<size_t>(i)];
+                    json ej;
+                    ej["index"] = i;
+                    ej["host"] = e.host;
+                    ej["port"] = e.port;
+                    ej["use_tls"] = e.use_tls;
+                    ej["status_code"] = e.status_code;
+                    ej["latency_ms"] = e.latency_ms;
+                    ej["in_progress"] = e.in_progress;
+                    arr.push_back(ej);
+                }
+                json r;
+                r["entries"] = arr;
+                r["count"] = static_cast<int>(state.repeater_entries.size());
+                return tool_result_t::ok(std::to_string(state.repeater_entries.size()) + OBFSTR(" repeater entries"), r);
+            }
+
+            if (op == "get") {
+                if (!args.contains("index") || !args["index"].is_number())
+                    return tool_result_t::error(OBFSTR("Missing 'index' parameter"));
+                int idx = args["index"].get<int>();
+                if (idx < 0 || idx >= static_cast<int>(state.repeater_entries.size()))
+                    return tool_result_t::error(OBFSTR("Invalid repeater entry index"));
+                const auto& e = state.repeater_entries[static_cast<size_t>(idx)];
+                json r;
+                r["index"] = idx;
+                r["host"] = e.host;
+                r["port"] = e.port;
+                r["use_tls"] = e.use_tls;
+                r["status_code"] = e.status_code;
+                r["latency_ms"] = e.latency_ms;
+                r["in_progress"] = e.in_progress;
+                r["raw_request"] = e.raw_request;
+                r["raw_response"] = e.raw_response.substr(0, std::min<size_t>(4096, e.raw_response.size()));
+                return tool_result_t::ok(OBFSTR("Repeater entry ") + std::to_string(idx), r);
+            }
+
+            if (op == "delete") {
+                if (!args.contains("index") || !args["index"].is_number())
+                    return tool_result_t::error(OBFSTR("Missing 'index' parameter"));
+                int idx = args["index"].get<int>();
+                if (idx < 0 || idx >= static_cast<int>(state.repeater_entries.size()))
+                    return tool_result_t::error(OBFSTR("Invalid repeater entry index"));
+                if (state.repeater_entries[static_cast<size_t>(idx)].in_progress)
+                    return tool_result_t::error(OBFSTR("Cannot delete entry while request is in progress"));
+                state.repeater_entries.erase(state.repeater_entries.begin() + idx);
+                return tool_result_t::ok(OBFSTR("Repeater entry ") + std::to_string(idx) + OBFSTR(" deleted"));
+            }
+
+            return tool_result_t::error(OBFSTR("Unknown operation. Use create|send|list|get|delete"));
+        }, false});
+
 }
 
 }

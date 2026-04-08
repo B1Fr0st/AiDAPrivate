@@ -2,10 +2,12 @@
 
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <vector>
@@ -43,6 +45,15 @@ struct http_exchange {
     bool        is_websocket = false;
     uint32_t    ws_frames_sent = 0;
     uint32_t    ws_frames_recv = 0;
+
+
+    struct ws_frame_entry {
+        uint64_t    timestamp = 0;
+        bool        outbound = false;
+        protocol_parser::ws_opcode opcode = protocol_parser::ws_opcode::text;
+        std::vector<uint8_t> payload;
+    };
+    std::vector<ws_frame_entry> ws_frames;
 
 
     bool        is_h2 = false;
@@ -96,10 +107,24 @@ struct proxy_config {
 using intercept_callback_t = std::function<intercept_action(http_exchange& exchange)>;
 
 
+static constexpr uint32_t WORKER_POOL_SIZE = 4;
+
+struct work_item {
+    uintptr_t   client_socket;
+    uint32_t    client_ip;
+    uint16_t    client_port;
+};
+
 struct state_t {
     proxy_config       config;
     std::atomic<bool>  running{false};
     std::thread        listener_thread;
+
+
+    std::vector<std::thread>      worker_threads;
+    std::queue<work_item>         work_queue;
+    std::mutex                    work_mutex;
+    std::condition_variable       work_cv;
 
 
     std::mutex                 history_mutex;

@@ -373,6 +373,11 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/debugger_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/workflow_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/script_engine.cpp"
+            "${STANDALONE_ROOT}/core/memory_scanner.cpp"
+            "${STANDALONE_ROOT}/core/memory_scanner_view.cpp"
+            "${STANDALONE_ROOT}/core/scanner_tools_standalone.cpp"
+            "${STANDALONE_ROOT}/core/debugger_engine.cpp"
+            "${STANDALONE_ROOT}/core/debugger_view.cpp"
             src/driver_loader.cpp
             driver/comm.cpp
             src/net_security.cpp
@@ -550,15 +555,11 @@ set(AIDA_SOURCES
     src/actions.cpp
     src/agent_tools.cpp
     src/aida.cpp
-    src/ai_client.cpp
-    src/context_manager.cpp
     src/graphrag.cpp
     src/ida_utils.cpp
     src/license.cpp
     src/mcp_server.cpp
     src/settings.cpp
-    src/ui.cpp
-    src/workbench.cpp
     src/driver_loader.cpp
     src/net_security.cpp
     src/emulation_engine.cpp
@@ -575,23 +576,17 @@ set(AIDA_HEADERS
     src/agent_tools.hpp
     src/aida.hpp
     src/aida_pro.hpp
-    src/ai_client.hpp
     src/analysis_db.hpp
     src/anti_re.hpp
-    src/context_manager.hpp
     src/graphrag.hpp
     src/ida_utils.hpp
     src/license.hpp
     src/mcp_server.hpp
     src/obfuscation.hpp
-    src/prompts.hpp
-    src/rlhf.hpp
     src/settings.hpp
     src/driver_loader.hpp
     src/net_security.hpp
     src/emulation_engine.hpp
-    src/ui.hpp
-    src/workbench.hpp
 )
 
 add_library(AiDA SHARED ${AIDA_SOURCES} ${AIDA_HEADERS} ${AIDA_ASM_SOURCES})
@@ -647,13 +642,7 @@ target_compile_definitions(AiDA PRIVATE
     NOMINMAX
 )
 
-target_compile_definitions(AiDA PRIVATE
-    QT_NAMESPACE=QT
-    QT_NO_EMIT
-    QT_CORE_LIB
-    QT_GUI_LIB
-    QT_WIDGETS_LIB
-)
+
 
 if(WIN32)
     target_compile_definitions(AiDA PRIVATE
@@ -661,8 +650,6 @@ if(WIN32)
         __IDP__
         WIN32_LEAN_AND_MEAN
         OPENSSL_NO_DYNAMIC_ENGINE
-        QT_DLL
-        QT_THREAD_SUPPORT
     )
 elseif(APPLE)
     target_compile_definitions(AiDA PRIVATE __MAC__)
@@ -733,161 +720,17 @@ if(WIN32)
         wintrust
         cfgmgr32
     )
-
-    if(DEFINED ENV{QTDIR})
-        set(QT_PREFIX_HINT "$ENV{QTDIR}")
-    elseif(DEFINED QTDIR)
-        set(QT_PREFIX_HINT "${QTDIR}")
-    endif()
-
-    if(DEFINED QT_PREFIX_HINT AND EXISTS "${QT_PREFIX_HINT}")
-        list(PREPEND CMAKE_PREFIX_PATH "${QT_PREFIX_HINT}")
-    endif()
-
-    set(_qt_inc_found FALSE)
-    find_package(Qt6 COMPONENTS Core Gui Widgets QUIET CONFIG)
-    if(Qt6_FOUND)
-        foreach(_comp Core Gui Widgets)
-            get_target_property(_incs Qt6::${_comp} INTERFACE_INCLUDE_DIRECTORIES)
-            if(_incs)
-                foreach(_d IN LISTS _incs)
-                    if(IS_DIRECTORY "${_d}")
-                        target_include_directories(AiDA PRIVATE "${_d}")
-                    endif()
-                endforeach()
-            endif()
-        endforeach()
-        set(_qt_inc_found TRUE)
-    endif()
-
-    if(NOT _qt_inc_found)
-        set(QT_INC "")
-        if(DEFINED QT_PREFIX_HINT AND EXISTS "${QT_PREFIX_HINT}/include")
-            set(QT_INC "${QT_PREFIX_HINT}/include")
-        elseif(DEFINED ENV{QTDIR} AND EXISTS "$ENV{QTDIR}/include")
-            set(QT_INC "$ENV{QTDIR}/include")
-        endif()
-
-        if(QT_INC)
-            target_include_directories(AiDA PRIVATE
-                "${QT_INC}"
-                "${QT_INC}/QtCore"
-                "${QT_INC}/QtGui"
-                "${QT_INC}/QtWidgets"
-            )
-        else()
-            message(WARNING
-                "Qt6 headers not found. Set QTDIR or CMAKE_PREFIX_PATH to your Qt6 installation.")
-        endif()
-    endif()
-
-    set(_qt_import_libs_dir "${CMAKE_CURRENT_SOURCE_DIR}/libs/qt")
-    foreach(_qtmod Core Gui Widgets)
-        set(_def_file "${_qt_import_libs_dir}/Qt6${_qtmod}.def")
-        set(_lib_file "${_qt_import_libs_dir}/Qt6${_qtmod}.lib")
-        if(EXISTS "${_def_file}" AND NOT EXISTS "${_lib_file}")
-            find_program(_msvc_lib_tool lib REQUIRED)
-            message(STATUS "Generating Qt6${_qtmod}.lib from Qt6${_qtmod}.def ...")
-            execute_process(
-                COMMAND "${_msvc_lib_tool}" /DEF:${_def_file} /OUT:${_lib_file} /MACHINE:X64 /NOLOGO
-                WORKING_DIRECTORY "${_qt_import_libs_dir}"
-                RESULT_VARIABLE _lib_gen_result
-                OUTPUT_QUIET ERROR_QUIET
-            )
-            if(NOT _lib_gen_result EQUAL 0)
-                message(WARNING "Failed to generate Qt6${_qtmod}.lib from .def file")
-            endif()
-            file(REMOVE "${_qt_import_libs_dir}/Qt6${_qtmod}.exp")
-        endif()
-    endforeach()
-
-    target_link_directories(AiDA PRIVATE "${_qt_import_libs_dir}")
-    target_link_libraries(AiDA PRIVATE Qt6Core Qt6Gui Qt6Widgets)
 elseif(APPLE)
     find_package(OpenSSL REQUIRED)
     target_link_libraries(AiDA PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
     target_compile_options(AiDA PRIVATE -Wall -Wextra -Wno-nullability-completeness -fPIC)
     target_link_options(AiDA PRIVATE -undefined dynamic_lookup)
-
-    set(_qt_apple_found FALSE)
-    find_package(Qt6 COMPONENTS Core Gui Widgets QUIET CONFIG)
-    if(Qt6_FOUND)
-        foreach(_comp Core Gui Widgets)
-            get_target_property(_incs Qt6::${_comp} INTERFACE_INCLUDE_DIRECTORIES)
-            if(_incs)
-                foreach(_d IN LISTS _incs)
-                    if(IS_DIRECTORY "${_d}")
-                        target_include_directories(AiDA PRIVATE "${_d}")
-                    endif()
-                endforeach()
-            endif()
-        endforeach()
-        set(_qt_apple_found TRUE)
-    endif()
-
-    if(NOT _qt_apple_found)
-        set(_qt_apple_inc "")
-        if(DEFINED ENV{QTDIR} AND IS_DIRECTORY "$ENV{QTDIR}/include")
-            set(_qt_apple_inc "$ENV{QTDIR}/include")
-        elseif(IS_DIRECTORY "/opt/homebrew/opt/qt@6/include")
-            set(_qt_apple_inc "/opt/homebrew/opt/qt@6/include")
-        elseif(IS_DIRECTORY "/usr/local/opt/qt@6/include")
-            set(_qt_apple_inc "/usr/local/opt/qt@6/include")
-        endif()
-        if(_qt_apple_inc)
-            target_include_directories(AiDA PRIVATE
-                "${_qt_apple_inc}"
-                "${_qt_apple_inc}/QtCore"
-                "${_qt_apple_inc}/QtGui"
-                "${_qt_apple_inc}/QtWidgets"
-            )
-        else()
-            message(WARNING "Qt6 headers not found on macOS. Set QTDIR or install Qt6.")
-        endif()
-    endif()
 elseif(UNIX)
     find_package(OpenSSL REQUIRED)
     target_link_libraries(AiDA PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
     target_compile_options(AiDA PRIVATE -Wall -Wextra -fPIC)
-
-    set(_qt_linux_found FALSE)
-    find_package(Qt6 COMPONENTS Core Gui Widgets QUIET CONFIG)
-    if(Qt6_FOUND)
-        foreach(_comp Core Gui Widgets)
-            get_target_property(_incs Qt6::${_comp} INTERFACE_INCLUDE_DIRECTORIES)
-            if(_incs)
-                foreach(_d IN LISTS _incs)
-                    if(IS_DIRECTORY "${_d}")
-                        target_include_directories(AiDA PRIVATE "${_d}")
-                    endif()
-                endforeach()
-            endif()
-        endforeach()
-        set(_qt_linux_found TRUE)
-    endif()
-
-    if(NOT _qt_linux_found)
-        set(_qt_linux_inc "")
-        if(DEFINED ENV{QTDIR} AND IS_DIRECTORY "$ENV{QTDIR}/include")
-            set(_qt_linux_inc "$ENV{QTDIR}/include")
-        elseif(IS_DIRECTORY "/usr/include/x86_64-linux-gnu/qt6")
-            set(_qt_linux_inc "/usr/include/x86_64-linux-gnu/qt6")
-        elseif(IS_DIRECTORY "/usr/include/qt6")
-            set(_qt_linux_inc "/usr/include/qt6")
-        endif()
-        if(_qt_linux_inc)
-            target_include_directories(AiDA PRIVATE
-                "${_qt_linux_inc}"
-                "${_qt_linux_inc}/QtCore"
-                "${_qt_linux_inc}/QtGui"
-                "${_qt_linux_inc}/QtWidgets"
-            )
-        else()
-            message(WARNING "Qt6 headers not found on Linux. Set QTDIR or install qt6-base-dev.")
-        endif()
-    endif()
     
 endif()
 

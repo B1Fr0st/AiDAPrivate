@@ -616,6 +616,7 @@ namespace voyager {
             std::uint32_t address_family;
             std::uint32_t match_count;
             std::uint32_t active;
+            std::uint32_t exclude_pid;
         };
 
         struct traffic_redirect_list {
@@ -1209,7 +1210,8 @@ namespace voyager {
                      std::uint32_t protocol = 0,
                                  std::uint32_t match_port = 0, const std::uint8_t* match_addr = nullptr,
                                  std::uint32_t redirect_port = 0, const std::uint8_t* redirect_addr = nullptr,
-                                 std::uint32_t af = 2, std::uint32_t* out_rule_id = nullptr) noexcept;
+                                 std::uint32_t af = 2, std::uint32_t* out_rule_id = nullptr,
+                                 std::uint32_t exclude_pid = 0) noexcept;
 
         struct redirect_rule_info { std::uint32_t rule_id; std::uint32_t protocol; std::uint32_t match_port;
                                     std::uint32_t redirect_port; std::uint32_t af; std::uint32_t match_count; std::uint32_t active; };

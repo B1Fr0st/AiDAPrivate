@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include "ui_anim.hpp"
 
 namespace hex_view {
 
@@ -53,6 +54,14 @@ void render(float pos_x, float pos_y, float width, float height,
     const float hex_w  = char_w * 50.f;
     const float asc_x  = addr_w + hex_w + char_w * 2.f;
 
+    static bool heat_map_mode = false;
+    static std::vector<uint8_t> prev_bytes;
+    static std::vector<float> byte_flash;
+    if (prev_bytes.size() != st.data.size()) {
+        prev_bytes = st.data;
+        byte_flash.assign(st.data.size(), 0.f);
+    }
+
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 wpos = ImGui::GetWindowPos();
     float ox = wpos.x + pos_x;
@@ -86,6 +95,24 @@ void render(float pos_x, float pos_y, float width, float height,
                 ImVec2(ox + addr_w + hex_w, oy + height),
                 IM_COL32(255, 255, 255, (int)(10 * a)), 1.f);
 
+    {
+        const char* ht_label = heat_map_mode ? "Heat: ON" : "Heat";
+        ImVec2 hts = ImGui::CalcTextSize(ht_label);
+        float ht_x = ox + width - hts.x - 28.f;
+        float ht_y = oy + 2.f;
+        float ht_w = hts.x + 12.f;
+        float ht_h = 16.f;
+        bool ht_hov = ImGui::IsMouseHoveringRect(ImVec2(ht_x, ht_y), ImVec2(ht_x + ht_w, ht_y + ht_h));
+        ImU32 ht_bg = heat_map_mode
+            ? IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
+                       static_cast<int>(accent_b * 255), static_cast<int>(40 * a))
+            : IM_COL32(40, 40, 55, static_cast<int>((ht_hov ? 180 : 120) * a));
+        dl->AddRectFilled(ImVec2(ht_x, ht_y), ImVec2(ht_x + ht_w, ht_y + ht_h), ht_bg, 3.f);
+        dl->AddText(ImVec2(ht_x + 6.f, ht_y + 1.f),
+            IM_COL32(200, 200, 220, static_cast<int>((ht_hov ? 240 : 160) * a)), ht_label);
+        if (ht_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            heat_map_mode = !heat_map_mode;
+    }
 
     int sel_lo = -1, sel_hi = -1;
     if (st.sel_start >= 0 && st.sel_end >= 0) {
@@ -120,25 +147,49 @@ void render(float pos_x, float pos_y, float width, float height,
             float bx = ox + addr_w + col * char_w * 3.f;
             if (col >= 8) bx += char_w;
 
+            if (heat_map_mode) {
+                dl->AddRectFilled(ImVec2(bx - 1.f, y),
+                                  ImVec2(bx + char_w * 2.f + 1.f, y + line_h),
+                                  ui_anim::byte_heat_color(b, a * 0.3f));
+            } else if (b == 0) {
+                dl->AddRectFilled(ImVec2(bx - 1.f, y),
+                                  ImVec2(bx + char_w * 2.f + 1.f, y + line_h),
+                                  IM_COL32(0, 0, 0, static_cast<int>(30 * a)));
+            }
 
             if (sel_lo >= 0 && byte_idx >= sel_lo && byte_idx <= sel_hi) {
                 dl->AddRectFilled(ImVec2(bx - 1.f, y),
                                   ImVec2(bx + char_w * 2.f + 1.f, y + line_h), sel_col);
+                dl->AddRect(ImVec2(bx - 1.f, y),
+                            ImVec2(bx + char_w * 2.f + 1.f, y + line_h),
+                            IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
+                                     static_cast<int>(accent_b * 255), static_cast<int>(100 * a)));
             }
 
+            if (byte_idx < static_cast<int>(prev_bytes.size()) &&
+                st.data[byte_idx] != prev_bytes[byte_idx]) {
+                byte_flash[byte_idx] = 1.f;
+                prev_bytes[byte_idx] = st.data[byte_idx];
+            }
+
+            if (byte_idx < static_cast<int>(byte_flash.size()) && byte_flash[byte_idx] > 0.f) {
+                ui_anim::decay_flash(byte_flash[byte_idx], 3.f, dt);
+                dl->AddRectFilled(ImVec2(bx - 1.f, y),
+                                  ImVec2(bx + char_w * 2.f + 1.f, y + line_h),
+                                  IM_COL32(230, 60, 60, static_cast<int>(byte_flash[byte_idx] * 120.f * a)));
+            }
 
             ImU32 bc;
             if (b == 0)
-                bc = IM_COL32(60, 60, 80, (int)(100 * a));
+                bc = IM_COL32(60, 60, 80, static_cast<int>(100 * a));
             else
-                bc = IM_COL32(200, 200, 230, (int)(220 * a));
-
+                bc = IM_COL32(200, 200, 230, static_cast<int>(220 * a));
 
             if (st.search_match >= 0 && byte_idx == st.search_match) {
                 dl->AddRectFilled(ImVec2(bx - 1.f, y),
                                   ImVec2(bx + char_w * 2.f + 1.f, y + line_h),
-                                  IM_COL32((int)(accent_r * 255), (int)(accent_g * 255),
-                                           (int)(accent_b * 255), (int)(60 * a)));
+                                  IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
+                                           static_cast<int>(accent_b * 255), static_cast<int>(60 * a)));
             }
 
             char hex[4];

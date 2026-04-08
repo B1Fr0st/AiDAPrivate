@@ -300,7 +300,7 @@ namespace net_intercept {
 }
 namespace net_redirect {
     BOOLEAN check_redirect(UINT32 protocol, UINT32 dst_port, const UINT8* dst_addr,
-                           UINT32 af, UINT32* new_port, UINT8* new_addr);
+                           UINT32 af, UINT32 pid, UINT32* new_port, UINT8* new_addr);
     BOOLEAN has_active_rules();
 }
 namespace net_dns_spoof {
@@ -1240,7 +1240,7 @@ namespace net_capture {
             if (pkt_len > 0 && net_redirect::has_active_rules()) {
                 UINT32 redir_port = 0;
                 UINT8 redir_addr[16] = {};
-                if (net_redirect::check_redirect(protocol, remote_port, remote_ip, 2, &redir_port, redir_addr)) {
+                if (net_redirect::check_redirect(protocol, remote_port, remote_ip, 2, pid, &redir_port, redir_addr)) {
                     NET_DBG("classify_outbound: REDIRECTING proto=%u pid=%u port=%u -> %u.%u.%u.%u:%u",
                             protocol, pid, remote_port,
                             redir_addr[0], redir_addr[1], redir_addr[2], redir_addr[3], redir_port);
@@ -4983,6 +4983,7 @@ namespace net_redirect {
         UINT8  redirect_addr[16];
         UINT32 address_family;
         volatile LONG match_count;
+        UINT32 exclude_pid;
     } ACTIVE_REDIR_RULE;
 
     inline ACTIVE_REDIR_RULE g_redir_rules[REDIR_MAX_RULES] = {};
@@ -4995,11 +4996,12 @@ namespace net_redirect {
 
 
     BOOLEAN check_redirect(UINT32 protocol, UINT32 dst_port, const UINT8* dst_addr,
-                           UINT32 af, UINT32* new_port, UINT8* new_addr) {
+                           UINT32 af, UINT32 pid, UINT32* new_port, UINT8* new_addr) {
         if (g_active_redir_count == 0) return FALSE;
         for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
             if (g_redir_rules[i].active != 1) continue;
             ACTIVE_REDIR_RULE* r = &g_redir_rules[i];
+            if (r->exclude_pid != 0 && r->exclude_pid == pid) continue;
             if (r->protocol != 0 && r->protocol != protocol) continue;
             if (r->match_port != 0 && r->match_port != dst_port) continue;
             if (!net_capture::is_zero_ip(r->match_addr)) {
@@ -5030,6 +5032,7 @@ namespace net_redirect {
                     g_redir_rules[i].redirect_port = request->redirect_port;
                     strong::kmemcpy(g_redir_rules[i].redirect_addr, request->redirect_addr, 16);
                     g_redir_rules[i].address_family = request->address_family;
+                    g_redir_rules[i].exclude_pid = request->exclude_pid;
                     g_redir_rules[i].match_count = 0;
                     KeMemoryBarrier();
                     _InterlockedExchange(&g_redir_rules[i].active, 1);

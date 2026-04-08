@@ -4,10 +4,17 @@
 #include <windows.h>
 
 #include "standalone_compat.hpp"
+#include "debugger_engine.hpp"
 #include "comm.h"
 #include "obfuscation.hpp"
 #include "pro.h"
 #include "zydis_disasm.hpp"
+#include "xref_engine.hpp"
+#include "cfg_view.hpp"
+#include "seh_view.hpp"
+#include "module_view.hpp"
+#include "pe_parser.hpp"
+#include "code_patcher.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -1069,6 +1076,892 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
          {OBFSTR("preview_instructions"), OBFSTR("number"), OBFSTR("Instructions to disassemble per handler (default 5, max 32)"), false},
          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
         dbg_map_vm_handlers, true});
+
+
+    register_compat(srv, {
+        OBFSTR("dbg_run"), OBFSTR("debugger"),
+        OBFSTR("Resume execution of the attached process (set debugger state to running)."),
+        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            debugger_engine::run_target();
+            return tool_result_t::ok(OBFSTR("Execution resumed."));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_pause"), OBFSTR("debugger"),
+        OBFSTR("Pause (break) the attached process."),
+        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            debugger_engine::pause_target();
+            return tool_result_t::ok(OBFSTR("Execution paused."));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_step_into"), OBFSTR("debugger"),
+        OBFSTR("Single-step into the next instruction (follows calls)."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            auto tid = parse_tid(params);
+            if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
+            debugger_engine::g_state.active_tid = *tid;
+            debugger_engine::step_into();
+            return tool_result_t::ok(OBFSTR("Step into executed."));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_step_over"), OBFSTR("debugger"),
+        OBFSTR("Step over the next instruction (does not follow calls)."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            auto tid = parse_tid(params);
+            if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
+            debugger_engine::g_state.active_tid = *tid;
+            debugger_engine::step_over();
+            return tool_result_t::ok(OBFSTR("Step over executed."));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_step_out"), OBFSTR("debugger"),
+        OBFSTR("Step out of the current function (run until return)."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            auto tid = parse_tid(params);
+            if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
+            debugger_engine::g_state.active_tid = *tid;
+            debugger_engine::step_out();
+            return tool_result_t::ok(OBFSTR("Step out executed."));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_run_to_address"), OBFSTR("debugger"),
+        OBFSTR("Run until execution reaches a specific address."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address (hex)"), true},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (!params.contains("address") || !params["address"].is_string())
+                return tool_result_t::error(OBFSTR("'address' is required."));
+            auto addr = sa_parse_address(params["address"].get<std::string>());
+            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            debugger_engine::run_to_address(*addr);
+            return tool_result_t::ok(OBFSTR("Running to ") + sa_format_address(*addr));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_get_registers"), OBFSTR("debugger"),
+        OBFSTR("Read all general-purpose registers, RIP, RFLAGS, segment and debug registers "
+               "of a thread in the attached process."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID (default: first thread)"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            auto tid = parse_tid(params);
+            if (tid) debugger_engine::g_state.active_tid = *tid;
+            auto regs = debugger_engine::get_registers();
+
+            json r;
+            r["rax"] = sa_format_address(regs.rax);
+            r["rbx"] = sa_format_address(regs.rbx);
+            r["rcx"] = sa_format_address(regs.rcx);
+            r["rdx"] = sa_format_address(regs.rdx);
+            r["rsi"] = sa_format_address(regs.rsi);
+            r["rdi"] = sa_format_address(regs.rdi);
+            r["rbp"] = sa_format_address(regs.rbp);
+            r["rsp"] = sa_format_address(regs.rsp);
+            r["r8"]  = sa_format_address(regs.r8);
+            r["r9"]  = sa_format_address(regs.r9);
+            r["r10"] = sa_format_address(regs.r10);
+            r["r11"] = sa_format_address(regs.r11);
+            r["r12"] = sa_format_address(regs.r12);
+            r["r13"] = sa_format_address(regs.r13);
+            r["r14"] = sa_format_address(regs.r14);
+            r["r15"] = sa_format_address(regs.r15);
+            r["rip"] = sa_format_address(regs.rip);
+            r["rflags"] = sa_format_address(regs.rflags);
+            r["flags_decoded"] = debugger_engine::format_flags(regs.rflags);
+            return tool_result_t::ok(OBFSTR("Registers read."), r);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_set_register"), OBFSTR("debugger"),
+        OBFSTR("Set a single register value in a thread of the attached process."),
+        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
+         {OBFSTR("register"), OBFSTR("string"), OBFSTR("Register name (e.g. rax, rip, r8)"), true},
+         {OBFSTR("value"), OBFSTR("string"), OBFSTR("New value (hex)"), true},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            auto tid = parse_tid(params);
+            if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
+            if (!params.contains("register") || !params.contains("value"))
+                return tool_result_t::error(OBFSTR("'register' and 'value' required."));
+            auto val = sa_parse_address(params["value"].get<std::string>());
+            if (!val) return tool_result_t::error(OBFSTR("Invalid value."));
+            debugger_engine::g_state.active_tid = *tid;
+            debugger_engine::set_register(params["register"].get<std::string>(), *val);
+            return tool_result_t::ok(OBFSTR("Register set."));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_get_memory_map"), OBFSTR("debugger"),
+        OBFSTR("Get the full virtual memory map of the attached process, including base address, "
+               "size, protection flags, and module name for each region."),
+        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            auto regions = debugger_engine::get_memory_map();
+            json arr = json::array();
+            for (const auto& r : regions) {
+                json rj;
+                rj["base"] = sa_format_address(r.base);
+                rj["size"] = r.size;
+                rj["protect"] = debugger_engine::format_protect(r.protect);
+                if (!r.module_name.empty()) rj["module"] = r.module_name;
+                arr.push_back(rj);
+            }
+            json result;
+            result["count"] = arr.size();
+            result["regions"] = arr;
+            return tool_result_t::ok(
+                OBFSTR("Memory map: ") + std::to_string(arr.size()) + OBFSTR(" regions."), result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_add_watch"), OBFSTR("debugger"),
+        OBFSTR("Add a watch expression. Supports register names (rax, rsp, etc.) and hex addresses."),
+        {{OBFSTR("expression"), OBFSTR("string"), OBFSTR("Watch expression"), true}},
+        [](const json& params) -> tool_result_t {
+            if (!params.contains("expression") || !params["expression"].is_string())
+                return tool_result_t::error(OBFSTR("'expression' is required."));
+            debugger_engine::add_watch(params["expression"].get<std::string>());
+            debugger_engine::refresh_watches();
+            return tool_result_t::ok(OBFSTR("Watch added."));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_remove_watch"), OBFSTR("debugger"),
+        OBFSTR("Remove a watch by index."),
+        {{OBFSTR("index"), OBFSTR("number"), OBFSTR("Watch index"), true}},
+        [](const json& params) -> tool_result_t {
+            if (!params.contains("index") || !params["index"].is_number())
+                return tool_result_t::error(OBFSTR("'index' required."));
+            debugger_engine::remove_watch(params["index"].get<int>());
+            return tool_result_t::ok(OBFSTR("Watch removed."));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_get_watches"), OBFSTR("debugger"),
+        OBFSTR("Get all watch expressions and their current values."),
+        {},
+        [](const json& ) -> tool_result_t {
+            debugger_engine::refresh_watches();
+            auto& st = debugger_engine::g_state;
+            std::lock_guard<std::mutex> lk(st.watch_mutex);
+            json arr = json::array();
+            for (size_t i = 0; i < st.watches.size(); ++i) {
+                json wj;
+                wj["index"] = i;
+                wj["expression"] = st.watches[i].expression;
+                wj["value"] = st.watches[i].value;
+                wj["valid"] = st.watches[i].valid;
+                arr.push_back(wj);
+            }
+            return tool_result_t::ok(
+                std::to_string(arr.size()) + OBFSTR(" watches."), arr);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_start_trace"), OBFSTR("debugger"),
+        OBFSTR("Start instruction tracing on the attached process. Each step records address, "
+               "disassembly, and register state."),
+        {{OBFSTR("max_records"), OBFSTR("number"), OBFSTR("Maximum trace records to keep (default 50000)"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            int max_records = params.value("max_records", 50000);
+            debugger_engine::start_trace(max_records);
+            return tool_result_t::ok(OBFSTR("Trace started."));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_stop_trace"), OBFSTR("debugger"),
+        OBFSTR("Stop instruction tracing."),
+        {},
+        [](const json& ) -> tool_result_t {
+            debugger_engine::stop_trace();
+            return tool_result_t::ok(OBFSTR("Trace stopped."));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_get_trace"), OBFSTR("debugger"),
+        OBFSTR("Get recorded trace entries. Returns instruction addresses, disassembly, and register diffs."),
+        {{OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start index (default 0)"), false},
+         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max entries to return (default 200)"), false}},
+        [](const json& params) -> tool_result_t {
+            auto& st = debugger_engine::g_state;
+            std::lock_guard<std::mutex> lk(st.trace_mutex);
+            int offset = params.value("offset", 0);
+            int limit = params.value("limit", 200);
+            if (limit > 1000) limit = 1000;
+            json arr = json::array();
+            for (int i = offset; i < static_cast<int>(st.trace_log.size()) && i < offset + limit; ++i) {
+                auto& tr = st.trace_log[static_cast<size_t>(i)];
+                json tj;
+                tj["index"] = tr.index;
+                tj["address"] = sa_format_address(tr.address);
+                tj["disasm"] = tr.disasm_text;
+                arr.push_back(tj);
+            }
+            json result;
+            result["total"] = st.trace_log.size();
+            result["returned"] = arr.size();
+            result["entries"] = arr;
+            return tool_result_t::ok(
+                std::to_string(arr.size()) + OBFSTR(" trace entries."), result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_set_comment"), OBFSTR("debugger"),
+        OBFSTR("Set a comment annotation at an address."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true},
+         {OBFSTR("text"), OBFSTR("string"), OBFSTR("Comment text"), true}},
+        [](const json& params) -> tool_result_t {
+            if (!params.contains("address") || !params.contains("text"))
+                return tool_result_t::error(OBFSTR("'address' and 'text' required."));
+            auto addr = sa_parse_address(params["address"].get<std::string>());
+            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            debugger_engine::set_comment(*addr, params["text"].get<std::string>());
+            return tool_result_t::ok(OBFSTR("Comment set at ") + sa_format_address(*addr));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_set_label"), OBFSTR("debugger"),
+        OBFSTR("Set a label (name) at an address."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true},
+         {OBFSTR("text"), OBFSTR("string"), OBFSTR("Label text"), true}},
+        [](const json& params) -> tool_result_t {
+            if (!params.contains("address") || !params.contains("text"))
+                return tool_result_t::error(OBFSTR("'address' and 'text' required."));
+            auto addr = sa_parse_address(params["address"].get<std::string>());
+            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            debugger_engine::set_label(*addr, params["text"].get<std::string>());
+            return tool_result_t::ok(OBFSTR("Label set at ") + sa_format_address(*addr));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_toggle_bookmark"), OBFSTR("debugger"),
+        OBFSTR("Toggle a bookmark at an address."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true}},
+        [](const json& params) -> tool_result_t {
+            if (!params.contains("address"))
+                return tool_result_t::error(OBFSTR("'address' is required."));
+            auto addr = sa_parse_address(params["address"].get<std::string>());
+            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            debugger_engine::toggle_bookmark(*addr);
+            return tool_result_t::ok(OBFSTR("Bookmark toggled at ") + sa_format_address(*addr));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_find_strings"), OBFSTR("debugger"),
+        OBFSTR("Find ASCII strings in the memory of the attached process. Results include address, "
+               "string value, and containing module."),
+        {{OBFSTR("min_length"), OBFSTR("number"), OBFSTR("Minimum string length (default 4)"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            int min_len = params.value("min_length", 4);
+            debugger_engine::find_strings(min_len);
+            auto& st = debugger_engine::g_state;
+            std::lock_guard<std::mutex> lk(st.strings_mutex);
+            json arr = json::array();
+            int count = 0;
+            for (const auto& s : st.strings) {
+                if (count++ >= 500) break;
+                json sj;
+                sj["address"] = sa_format_address(s.address);
+                sj["value"] = s.value;
+                if (!s.module_name.empty()) sj["module"] = s.module_name;
+                arr.push_back(sj);
+            }
+            json result;
+            result["total"] = st.strings.size();
+            result["returned"] = arr.size();
+            result["strings"] = arr;
+            return tool_result_t::ok(
+                std::to_string(st.strings.size()) + OBFSTR(" strings found."), result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_enumerate_handles"), OBFSTR("debugger"),
+        OBFSTR("Enumerate open handles in the attached process (requires NtQuerySystemInformation)."),
+        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            debugger_engine::enumerate_handles();
+            auto& st = debugger_engine::g_state;
+            std::lock_guard<std::mutex> lk(st.handle_mutex);
+            json arr = json::array();
+            for (const auto& h : st.handles) {
+                json hj;
+                hj["handle"] = h.handle;
+                hj["type"] = h.type_name;
+                hj["name"] = h.name;
+                arr.push_back(hj);
+            }
+            json result;
+            result["count"] = arr.size();
+            result["handles"] = arr;
+            return tool_result_t::ok(
+                std::to_string(arr.size()) + OBFSTR(" handles."), result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_add_hw_breakpoint"), OBFSTR("debugger"),
+        OBFSTR("Set a hardware breakpoint using debug registers (DR0-DR3). "
+               "Does not modify code bytes, so it is transparent to anti-tamper. "
+               "Limited to 4 active hardware breakpoints."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true},
+         {OBFSTR("type"), OBFSTR("string"), OBFSTR("Type: 'execute', 'write', 'read' (default 'execute')"), false},
+         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (!params.contains("address") || !params["address"].is_string())
+                return tool_result_t::error(OBFSTR("'address' required."));
+            auto addr = sa_parse_address(params["address"].get<std::string>());
+            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            std::string type_str = params.value("type", "execute");
+            debugger_engine::bp_type_t bpt = debugger_engine::bp_type_t::hardware_execute;
+            if (type_str == "write") bpt = debugger_engine::bp_type_t::hardware_write;
+            else if (type_str == "read") bpt = debugger_engine::bp_type_t::hardware_read;
+            debugger_engine::add_breakpoint(*addr, bpt);
+            return tool_result_t::ok(OBFSTR("Hardware breakpoint set at ") + sa_format_address(*addr));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_toggle_breakpoint"), OBFSTR("debugger"),
+        OBFSTR("Toggle a breakpoint on or off by its index in the breakpoint list."),
+        {{OBFSTR("index"), OBFSTR("number"), OBFSTR("Breakpoint index"), true}},
+        [](const json& params) -> tool_result_t {
+            if (!params.contains("index") || !params["index"].is_number())
+                return tool_result_t::error(OBFSTR("'index' is required."));
+            int idx = params["index"].get<int>();
+            if (!debugger_engine::toggle_breakpoint(idx))
+                return tool_result_t::error(OBFSTR("Failed to toggle breakpoint at index ") + std::to_string(idx));
+            return tool_result_t::ok(OBFSTR("Breakpoint toggled."));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_clear_all_breakpoints"), OBFSTR("debugger"),
+        OBFSTR("Remove all breakpoints (software and hardware)."),
+        {},
+        [](const json&) -> tool_result_t {
+            debugger_engine::clear_all_breakpoints();
+            return tool_result_t::ok(OBFSTR("All breakpoints cleared."));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_get_comment"), OBFSTR("debugger"),
+        OBFSTR("Get the comment annotation at an address."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true}},
+        [](const json& params) -> tool_result_t {
+            if (!params.contains("address") || !params["address"].is_string())
+                return tool_result_t::error(OBFSTR("'address' is required."));
+            auto addr = sa_parse_address(params["address"].get<std::string>());
+            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            std::string text = debugger_engine::get_comment(*addr);
+            json result;
+            result["address"] = sa_format_address(*addr);
+            result["comment"] = text;
+            return tool_result_t::ok(text.empty() ? OBFSTR("No comment at this address.") : text, result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_get_label"), OBFSTR("debugger"),
+        OBFSTR("Get the label (name) at an address."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true}},
+        [](const json& params) -> tool_result_t {
+            if (!params.contains("address") || !params["address"].is_string())
+                return tool_result_t::error(OBFSTR("'address' is required."));
+            auto addr = sa_parse_address(params["address"].get<std::string>());
+            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            std::string text = debugger_engine::get_label(*addr);
+            json result;
+            result["address"] = sa_format_address(*addr);
+            result["label"] = text;
+            return tool_result_t::ok(text.empty() ? OBFSTR("No label at this address.") : text, result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_get_bookmarks"), OBFSTR("debugger"),
+        OBFSTR("Get all bookmarked addresses."),
+        {},
+        [](const json&) -> tool_result_t {
+            auto& st = debugger_engine::g_state;
+            std::lock_guard<std::mutex> lk(st.anno_mutex);
+            json arr = json::array();
+            for (auto addr : st.bookmarks)
+                arr.push_back(sa_format_address(addr));
+            json result;
+            result["count"] = arr.size();
+            result["bookmarks"] = arr;
+            return tool_result_t::ok(
+                std::to_string(arr.size()) + OBFSTR(" bookmark(s)."), result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_get_xrefs_to"), OBFSTR("debugger"),
+        OBFSTR("Get cross-references to a target address. Scans for CALL, JMP, Jcc, LEA and data refs that point to the given address."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address (hex)"), true},
+         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum results to return (default 100)"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (!params.contains("address") || !params["address"].is_string())
+                return tool_result_t::error(OBFSTR("'address' is required."));
+            auto addr = sa_parse_address(params["address"].get<std::string>());
+            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            int max_results = params.value("max_results", 100);
+            if (max_results <= 0) max_results = 100;
+            if (max_results > 10000) max_results = 10000;
+            auto modules = driver_bridge::enumerate_modules();
+            uint64_t search_start = 0;
+            uint64_t search_size = 0;
+            for (const auto& m : modules) {
+                if (*addr >= m.base && *addr < m.base + m.size) {
+                    search_start = m.base;
+                    search_size = m.size;
+                    break;
+                }
+            }
+            if (search_size == 0) {
+                search_start = (*addr > 0x10000) ? *addr - 0x10000 : 0;
+                search_size = 0x20000;
+            }
+            xref_engine::find_xrefs_to(*addr, search_start, search_size);
+            for (int i = 0; i < 300; ++i) {
+                if (!xref_engine::g_state.scanning.load()) break;
+                Sleep(10);
+            }
+            std::lock_guard<std::mutex> lk(xref_engine::g_state.mutex);
+            json arr = json::array();
+            size_t n = std::min(static_cast<size_t>(max_results), xref_engine::g_state.results.size());
+            for (size_t i = 0; i < n; ++i) {
+                const auto& x = xref_engine::g_state.results[i];
+                json xj;
+                xj["from"] = sa_format_address(x.from_addr);
+                xj["to"] = sa_format_address(x.to_addr);
+                xj["type"] = xref_engine::xref_type_name(x.type);
+                xj["disasm"] = x.disasm_text;
+                if (!x.module_name.empty()) xj["module"] = x.module_name;
+                arr.push_back(std::move(xj));
+            }
+            json result;
+            result["count"] = arr.size();
+            result["total"] = xref_engine::g_state.results.size();
+            result["xrefs"] = std::move(arr);
+            return tool_result_t::ok(
+                std::to_string(result["count"].get<size_t>()) + OBFSTR(" xref(s) to ") + sa_format_address(*addr), result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_get_xrefs_from"), OBFSTR("debugger"),
+        OBFSTR("Get cross-references from a source address. Follows instructions and collects all outgoing CALL, JMP, Jcc, LEA and data refs."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Source address (hex)"), true},
+         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum instructions to scan (default 200)"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (!params.contains("address") || !params["address"].is_string())
+                return tool_result_t::error(OBFSTR("'address' is required."));
+            auto addr = sa_parse_address(params["address"].get<std::string>());
+            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            int max_insns = params.value("max_results", 200);
+            if (max_insns <= 0) max_insns = 200;
+            if (max_insns > 10000) max_insns = 10000;
+            std::vector<xref_engine::xref_t> xrefs;
+            xref_engine::find_xrefs_from(*addr, static_cast<size_t>(max_insns), xrefs);
+            json arr = json::array();
+            for (const auto& x : xrefs) {
+                json xj;
+                xj["from"] = sa_format_address(x.from_addr);
+                xj["to"] = sa_format_address(x.to_addr);
+                xj["type"] = xref_engine::xref_type_name(x.type);
+                xj["disasm"] = x.disasm_text;
+                if (!x.module_name.empty()) xj["module"] = x.module_name;
+                arr.push_back(std::move(xj));
+            }
+            json result;
+            result["count"] = arr.size();
+            result["xrefs"] = std::move(arr);
+            return tool_result_t::ok(
+                std::to_string(result["count"].get<size_t>()) + OBFSTR(" xref(s) from ") + sa_format_address(*addr), result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_scan_xrefs"), OBFSTR("debugger"),
+        OBFSTR("Scan a memory range for cross-references that target a specific address."),
+        {{OBFSTR("target_address"), OBFSTR("string"), OBFSTR("Address to find references to (hex)"), true},
+         {OBFSTR("start_address"), OBFSTR("string"), OBFSTR("Start of scan range (hex)"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Size of range in bytes (default 0x10000)"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (!params.contains("target_address") || !params["target_address"].is_string())
+                return tool_result_t::error(OBFSTR("'target_address' is required."));
+            if (!params.contains("start_address") || !params["start_address"].is_string())
+                return tool_result_t::error(OBFSTR("'start_address' is required."));
+            auto target = sa_parse_address(params["target_address"].get<std::string>());
+            if (!target) return tool_result_t::error(OBFSTR("Invalid target_address."));
+            auto start = sa_parse_address(params["start_address"].get<std::string>());
+            if (!start) return tool_result_t::error(OBFSTR("Invalid start_address."));
+            uint64_t size = params.value("size", 0x10000);
+            if (size == 0) size = 0x10000;
+            if (size > 0x1000000) size = 0x1000000;
+            xref_engine::find_xrefs_to(*target, *start, size);
+            for (int i = 0; i < 300; ++i) {
+                if (!xref_engine::g_state.scanning.load()) break;
+                Sleep(10);
+            }
+            std::lock_guard<std::mutex> lk(xref_engine::g_state.mutex);
+            json result;
+            result["total_found"] = xref_engine::g_state.results.size();
+            result["target"] = sa_format_address(*target);
+            result["range_start"] = sa_format_address(*start);
+            result["range_size"] = size;
+            return tool_result_t::ok(
+                OBFSTR("Scan complete. ") + std::to_string(xref_engine::g_state.results.size()) + OBFSTR(" xref(s) found."), result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_build_cfg"), OBFSTR("debugger"),
+        OBFSTR("Build a control flow graph starting from an address. Disassembles and splits into basic blocks with edges."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Entry address to build CFG from (hex)"), true}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (!params.contains("address") || !params["address"].is_string())
+                return tool_result_t::error(OBFSTR("'address' is required."));
+            auto addr = sa_parse_address(params["address"].get<std::string>());
+            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            cfg_view::build_cfg(*addr);
+            for (int i = 0; i < 300; ++i) {
+                if (!cfg_view::g_state.building.load()) break;
+                Sleep(10);
+            }
+            std::lock_guard<std::mutex> lk(cfg_view::g_state.mutex);
+            json result;
+            result["entry"] = sa_format_address(*addr);
+            result["blocks"] = cfg_view::g_state.blocks.size();
+            result["built"] = cfg_view::g_state.built;
+            return tool_result_t::ok(
+                OBFSTR("CFG built: ") + std::to_string(cfg_view::g_state.blocks.size()) + OBFSTR(" blocks."), result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_get_cfg"), OBFSTR("debugger"),
+        OBFSTR("Get the current control flow graph state, including all basic blocks, instructions, and edges."),
+        {},
+        [](const json&) -> tool_result_t {
+            std::lock_guard<std::mutex> lk(cfg_view::g_state.mutex);
+            if (!cfg_view::g_state.built)
+                return tool_result_t::error(OBFSTR("No CFG built. Call dbg_build_cfg first."));
+            json blocks_arr = json::array();
+            for (size_t bi = 0; bi < cfg_view::g_state.blocks.size(); ++bi) {
+                const auto& blk = cfg_view::g_state.blocks[bi];
+                json bj;
+                bj["index"] = bi;
+                bj["start"] = sa_format_address(blk.start_addr);
+                bj["end"] = sa_format_address(blk.end_addr);
+                bj["is_entry"] = blk.is_entry;
+                json insns = json::array();
+                for (const auto& ins : blk.instructions) {
+                    json ij;
+                    ij["addr"] = sa_format_address(ins.addr);
+                    ij["text"] = ins.text;
+                    insns.push_back(std::move(ij));
+                }
+                bj["instructions"] = std::move(insns);
+                bj["successors"] = blk.successors;
+                blocks_arr.push_back(std::move(bj));
+            }
+            json result;
+            result["entry"] = sa_format_address(cfg_view::g_state.entry_addr);
+            result["block_count"] = cfg_view::g_state.blocks.size();
+            result["blocks"] = std::move(blocks_arr);
+            return tool_result_t::ok(
+                OBFSTR("CFG: ") + std::to_string(cfg_view::g_state.blocks.size()) + OBFSTR(" blocks."), result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_get_seh_chain"), OBFSTR("debugger"),
+        OBFSTR("Get the SEH (Structured Exception Handler) chain of the attached process."),
+        {},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            seh_view::refresh();
+            Sleep(500);
+            std::lock_guard<std::mutex> lk(seh_view::g_ui.mutex);
+            json arr = json::array();
+            for (const auto& e : seh_view::g_ui.entries) {
+                json ej;
+                ej["index"] = e.index;
+                ej["handler_addr"] = sa_format_address(e.handler_addr);
+                ej["filter_addr"] = sa_format_address(e.filter_addr);
+                ej["frame_addr"] = sa_format_address(e.frame_addr);
+                if (!e.module_name.empty()) ej["module"] = e.module_name;
+                if (!e.handler_name.empty()) ej["handler_name"] = e.handler_name;
+                arr.push_back(std::move(ej));
+            }
+            json result;
+            result["count"] = arr.size();
+            result["entries"] = std::move(arr);
+            return tool_result_t::ok(
+                std::to_string(arr.size()) + OBFSTR(" SEH handler(s)."), result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_get_modules_detail"), OBFSTR("debugger"),
+        OBFSTR("Get detailed module information with PE analysis including exports and imports."),
+        {{OBFSTR("module_name"), OBFSTR("string"), OBFSTR("Optional module name filter"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            module_view::refresh();
+            Sleep(300);
+            std::string filter;
+            if (params.contains("module_name") && params["module_name"].is_string())
+                filter = params["module_name"].get<std::string>();
+            std::vector<driver_bridge::module_info_t> mods;
+            {
+                std::lock_guard<std::mutex> lk(module_view::g_ui.modules_mutex);
+                mods = module_view::g_ui.modules;
+            }
+            json arr = json::array();
+            for (const auto& m : mods) {
+                if (!filter.empty()) {
+                    std::string lower_name = m.name;
+                    std::string lower_filter = filter;
+                    for (auto& c : lower_name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    for (auto& c : lower_filter) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    if (lower_name.find(lower_filter) == std::string::npos)
+                        continue;
+                }
+                json mj;
+                mj["name"] = m.name;
+                mj["base"] = sa_format_address(m.base);
+                mj["size"] = m.size;
+                pe_parser::pe_info_t pe;
+                if (pe_parser::parse(m.base, pe)) {
+                    mj["entry_point"] = sa_format_address(pe.entry_point);
+                    mj["is_64bit"] = pe.is_64bit;
+                    json sections = json::array();
+                    for (const auto& s : pe.sections) {
+                        json sj;
+                        sj["name"] = s.name;
+                        sj["virtual_address"] = s.virtual_address;
+                        sj["virtual_size"] = s.virtual_size;
+                        sj["characteristics"] = pe_parser::format_characteristics(s.characteristics);
+                        sections.push_back(std::move(sj));
+                    }
+                    mj["sections"] = std::move(sections);
+                    std::vector<pe_parser::export_entry_t> exports;
+                    pe_parser::parse_exports(m.base, pe, exports);
+                    mj["export_count"] = exports.size();
+                    json exp_arr = json::array();
+                    size_t exp_limit = std::min<size_t>(exports.size(), 50);
+                    for (size_t ei = 0; ei < exp_limit; ++ei) {
+                        json ej;
+                        ej["ordinal"] = exports[ei].ordinal;
+                        ej["name"] = exports[ei].name;
+                        ej["address"] = sa_format_address(exports[ei].address);
+                        if (exports[ei].is_forwarded) ej["forward"] = exports[ei].forward_name;
+                        exp_arr.push_back(std::move(ej));
+                    }
+                    mj["exports"] = std::move(exp_arr);
+                    std::vector<pe_parser::import_entry_t> imports;
+                    pe_parser::parse_imports(m.base, pe, imports);
+                    mj["import_count"] = imports.size();
+                    json imp_arr = json::array();
+                    size_t imp_limit = std::min<size_t>(imports.size(), 50);
+                    for (size_t ii = 0; ii < imp_limit; ++ii) {
+                        json ij;
+                        ij["module"] = imports[ii].module_name;
+                        ij["function"] = imports[ii].function_name;
+                        ij["iat_address"] = sa_format_address(imports[ii].iat_address);
+                        imp_arr.push_back(std::move(ij));
+                    }
+                    mj["imports"] = std::move(imp_arr);
+                }
+                arr.push_back(std::move(mj));
+            }
+            json result;
+            result["count"] = arr.size();
+            result["modules"] = std::move(arr);
+            return tool_result_t::ok(
+                std::to_string(result["count"].get<size_t>()) + OBFSTR(" module(s)."), result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_add_patch"), OBFSTR("debugger"),
+        OBFSTR("Apply a code patch at an address. Overwrites bytes and saves original for reverting."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to patch (hex)"), true},
+         {OBFSTR("bytes"), OBFSTR("string"), OBFSTR("Hex bytes to write (e.g. '90 90 90')"), true},
+         {OBFSTR("label"), OBFSTR("string"), OBFSTR("Optional description for this patch"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (!params.contains("address") || !params["address"].is_string())
+                return tool_result_t::error(OBFSTR("'address' is required."));
+            if (!params.contains("bytes") || !params["bytes"].is_string())
+                return tool_result_t::error(OBFSTR("'bytes' is required."));
+            auto addr = sa_parse_address(params["address"].get<std::string>());
+            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            auto patched = code_patcher::parse_bytes(params["bytes"].get<std::string>());
+            if (patched.empty())
+                return tool_result_t::error(OBFSTR("Invalid hex bytes."));
+            std::string label;
+            if (params.contains("label") && params["label"].is_string())
+                label = params["label"].get<std::string>();
+            int idx = code_patcher::create_patch(*addr, patched, label);
+            if (idx < 0)
+                return tool_result_t::error(OBFSTR("Failed to create patch."));
+            if (!code_patcher::apply_patch(idx))
+                return tool_result_t::error(OBFSTR("Patch created but failed to apply."));
+            json result;
+            result["index"] = idx;
+            result["address"] = sa_format_address(*addr);
+            result["size"] = patched.size();
+            result["bytes"] = code_patcher::format_bytes(patched);
+            return tool_result_t::ok(
+                OBFSTR("Patch applied at ") + sa_format_address(*addr) + OBFSTR(" (") + std::to_string(patched.size()) + OBFSTR(" bytes)."), result);
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_remove_patch"), OBFSTR("debugger"),
+        OBFSTR("Remove a code patch by index. Reverts original bytes before removing."),
+        {{OBFSTR("index"), OBFSTR("number"), OBFSTR("Patch index to remove"), true}},
+        [](const json& params) -> tool_result_t {
+            if (!params.contains("index") || !params["index"].is_number())
+                return tool_result_t::error(OBFSTR("'index' is required."));
+            int idx = params["index"].get<int>();
+            if (!code_patcher::revert_patch(idx))
+                return tool_result_t::error(OBFSTR("Failed to revert patch."));
+            if (!code_patcher::remove_patch(idx))
+                return tool_result_t::error(OBFSTR("Failed to remove patch."));
+            return tool_result_t::ok(OBFSTR("Patch removed."));
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_list_patches"), OBFSTR("debugger"),
+        OBFSTR("List all code patches with their status, addresses, and byte values."),
+        {},
+        [](const json&) -> tool_result_t {
+            std::lock_guard<std::mutex> lk(code_patcher::g_state.mtx);
+            json arr = json::array();
+            for (size_t i = 0; i < code_patcher::g_state.patches.size(); ++i) {
+                const auto& p = code_patcher::g_state.patches[i];
+                json pj;
+                pj["index"] = i;
+                pj["address"] = sa_format_address(p.address);
+                pj["original_bytes"] = code_patcher::format_bytes(p.original_bytes);
+                pj["patched_bytes"] = code_patcher::format_bytes(p.patched_bytes);
+                pj["description"] = p.description;
+                pj["active"] = p.active;
+                arr.push_back(std::move(pj));
+            }
+            json result;
+            result["count"] = arr.size();
+            result["patches"] = std::move(arr);
+            return tool_result_t::ok(
+                std::to_string(arr.size()) + OBFSTR(" patch(es)."), result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_nop_fill"), OBFSTR("debugger"),
+        OBFSTR("NOP-fill a range of bytes at the given address."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to start NOP fill (hex)"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Number of bytes to NOP"), true}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (!params.contains("address") || !params["address"].is_string())
+                return tool_result_t::error(OBFSTR("'address' is required."));
+            if (!params.contains("size") || !params["size"].is_number())
+                return tool_result_t::error(OBFSTR("'size' is required."));
+            auto addr = sa_parse_address(params["address"].get<std::string>());
+            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            int size = params["size"].get<int>();
+            if (size <= 0 || size > 4096)
+                return tool_result_t::error(OBFSTR("Size must be between 1 and 4096."));
+            if (!code_patcher::nop_region(*addr, static_cast<size_t>(size), OBFSTR("NOP fill")))
+                return tool_result_t::error(OBFSTR("Failed to NOP-fill region."));
+            int idx = static_cast<int>(code_patcher::count()) - 1;
+            if (!code_patcher::apply_patch(idx))
+                return tool_result_t::error(OBFSTR("NOP patch created but failed to apply."));
+            json result;
+            result["address"] = sa_format_address(*addr);
+            result["size"] = size;
+            return tool_result_t::ok(
+                OBFSTR("NOP-filled ") + std::to_string(size) + OBFSTR(" bytes at ") + sa_format_address(*addr), result);
+        }, false});
+
+    register_compat(srv, {
+        OBFSTR("dbg_find_code_caves"), OBFSTR("debugger"),
+        OBFSTR("Find regions of unused bytes (code caves) near a given address. Searches for consecutive 0x00 or 0xCC bytes."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Module base or search start address (hex)"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Size of region to scan (default 0x1000)"), false},
+         {OBFSTR("min_cave_size"), OBFSTR("number"), OBFSTR("Minimum cave size in bytes (default 16)"), false}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (!params.contains("address") || !params["address"].is_string())
+                return tool_result_t::error(OBFSTR("'address' is required."));
+            auto addr = sa_parse_address(params["address"].get<std::string>());
+            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            uint32_t size = static_cast<uint32_t>(params.value("size", 0x1000));
+            if (size == 0) size = 0x1000;
+            size_t min_size = static_cast<size_t>(params.value("min_cave_size", 16));
+            if (min_size == 0) min_size = 16;
+            auto caves = code_patcher::find_code_caves(*addr, size, min_size);
+            json arr = json::array();
+            for (const auto& c : caves) {
+                json cj;
+                cj["address"] = sa_format_address(c.address);
+                cj["size"] = c.size;
+                if (!c.module_name.empty()) cj["module"] = c.module_name;
+                arr.push_back(std::move(cj));
+            }
+            json result;
+            result["count"] = arr.size();
+            result["caves"] = std::move(arr);
+            return tool_result_t::ok(
+                std::to_string(arr.size()) + OBFSTR(" code cave(s) found."), result);
+        }, true});
+
+    register_compat(srv, {
+        OBFSTR("dbg_conditional_breakpoint"), OBFSTR("debugger"),
+        OBFSTR("Set a breakpoint with a condition expression. The breakpoint will only trigger when the condition is met."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address for breakpoint (hex)"), true},
+         {OBFSTR("condition"), OBFSTR("string"), OBFSTR("Condition expression (e.g. 'rax == 0x1234')"), true}},
+        [](const json& params) -> tool_result_t {
+            if (auto err = ensure_attached(params)) return *err;
+            if (!params.contains("address") || !params["address"].is_string())
+                return tool_result_t::error(OBFSTR("'address' is required."));
+            if (!params.contains("condition") || !params["condition"].is_string())
+                return tool_result_t::error(OBFSTR("'condition' is required."));
+            auto addr = sa_parse_address(params["address"].get<std::string>());
+            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            std::string cond = params["condition"].get<std::string>();
+            int bp_idx = debugger_engine::add_breakpoint(*addr, debugger_engine::bp_type_t::software, "", cond);
+            if (bp_idx < 0)
+                return tool_result_t::error(OBFSTR("Failed to add breakpoint."));
+            json result;
+            result["index"] = bp_idx;
+            result["address"] = sa_format_address(*addr);
+            result["condition"] = cond;
+            return tool_result_t::ok(
+                OBFSTR("Conditional breakpoint set at ") + sa_format_address(*addr) + OBFSTR(" [condition: ") + cond + OBFSTR("]"), result);
+        }, false});
 }
 
 }

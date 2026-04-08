@@ -62,5 +62,6 @@ namespace driver_bridge
 
     bool query_memory(uint64_t address, memory_region_t& region);
     bool read_memory(uint64_t address, size_t size, std::vector<uint8_t>& out);
+    bool write_memory(uint64_t address, const std::vector<uint8_t>& data);
     bool read_string(uint64_t address, size_t max_length, std::string& out);
 }

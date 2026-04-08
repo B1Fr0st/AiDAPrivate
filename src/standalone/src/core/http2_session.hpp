@@ -42,6 +42,34 @@ struct stream_data {
 
 
     bool is_grpc = false;
+
+    struct grpc_message {
+        bool compressed = false;
+        uint32_t length = 0;
+        std::vector<uint8_t> payload;
+    };
+    std::vector<grpc_message> request_grpc_messages;
+    std::vector<grpc_message> response_grpc_messages;
+
+    static std::vector<grpc_message> parse_grpc_frames(const std::vector<uint8_t>& body) {
+        std::vector<grpc_message> messages;
+        size_t pos = 0;
+        while (pos + 5 <= body.size()) {
+            grpc_message msg;
+            msg.compressed = (body[pos] != 0);
+            msg.length = (static_cast<uint32_t>(body[pos + 1]) << 24)
+                       | (static_cast<uint32_t>(body[pos + 2]) << 16)
+                       | (static_cast<uint32_t>(body[pos + 3]) << 8)
+                       | static_cast<uint32_t>(body[pos + 4]);
+            pos += 5;
+            if (pos + msg.length > body.size()) break;
+            msg.payload.assign(body.begin() + static_cast<ptrdiff_t>(pos),
+                               body.begin() + static_cast<ptrdiff_t>(pos + msg.length));
+            pos += msg.length;
+            messages.push_back(std::move(msg));
+        }
+        return messages;
+    }
 };
 
 
@@ -402,9 +430,15 @@ private:
                     auto& sd = it->second;
                     if (self->role_ == role::server && !sd.request_complete) {
                         sd.request_complete = true;
+                        if (sd.is_grpc && !sd.request_body.empty()) {
+                            sd.request_grpc_messages = stream_data::parse_grpc_frames(sd.request_body);
+                        }
                         if (self->on_request_) self->on_request_(sd);
                     } else {
                         sd.response_complete = true;
+                        if (sd.is_grpc && !sd.response_body.empty()) {
+                            sd.response_grpc_messages = stream_data::parse_grpc_frames(sd.response_body);
+                        }
                         if (self->on_response_) self->on_response_(sd);
                     }
                 }

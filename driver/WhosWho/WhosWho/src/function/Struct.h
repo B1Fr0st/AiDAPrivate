@@ -561,6 +561,7 @@ typedef struct _TRAFFIC_REDIRECT_RULE {
     UINT32 address_family;
     UINT32 match_count;
     UINT32 active;
+    UINT32 exclude_pid;
 } TRAFFIC_REDIRECT_RULE, *P_TRAFFIC_REDIRECT_RULE,
   traffic_redirect_rule, *p_traffic_redirect_rule;
 

@@ -6,6 +6,7 @@
 #include "ssl_keylog.hpp"
 #include "script_engine.hpp"
 #include "decoder_pipeline.hpp"
+#include "ui_anim.hpp"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -207,6 +208,12 @@ static void bandwidth_poll_thread(state_t& state) {
         if (device && device->is_connected()) {
             auto raw_bw = device->get_bw_per_process();
 
+            std::vector<bw_entry> old_entries;
+            {
+                std::lock_guard<std::mutex> lock(state.bw_mutex);
+                old_entries = state.bw_entries;
+            }
+
             std::vector<bw_entry> entries;
             entries.reserve(raw_bw.size());
             for (auto& b : raw_bw) {
@@ -216,6 +223,23 @@ static void bandwidth_poll_thread(state_t& state) {
                 e.bytes_out = b.bytes_sent;
                 e.rate_in = 0.f;
                 e.rate_out = 0.f;
+
+                for (auto& old : old_entries) {
+                    if (old.pid == b.pid) {
+                        if (old.bytes_in > 0 || old.bytes_out > 0) {
+                            float dt = 0.5f;
+                            e.rate_in = static_cast<float>(b.bytes_recv > old.bytes_in ? b.bytes_recv - old.bytes_in : 0) / dt;
+                            e.rate_out = static_cast<float>(b.bytes_sent > old.bytes_out ? b.bytes_sent - old.bytes_out : 0) / dt;
+                        }
+                        memcpy(e.rate_history, old.rate_history, sizeof(e.rate_history));
+                        e.history_index = old.history_index;
+                        break;
+                    }
+                }
+
+                e.rate_history[e.history_index % 64] = e.rate_in + e.rate_out;
+                e.history_index++;
+
                 entries.push_back(std::move(e));
             }
 
@@ -273,6 +297,8 @@ static void render_tab_bar(state_t& state, float x, float y, float w, float alph
     float tab_x = x;
     int count = static_cast<int>(sub_tab_t::COUNT);
 
+    ui_anim::render_gradient_header(dl, origin.x + x, origin.y + y, w, tab_h, ar, ag, ab, alpha);
+
     for (int i = 0; i < count; i++) {
         ImVec2 ts = ImGui::CalcTextSize(tab_names[i]);
         float tab_w = ts.x + 20.f;
@@ -325,6 +351,14 @@ static void render_tab_bar(state_t& state, float x, float y, float w, float alph
         ImVec2(origin.x + x, origin.y + y + tab_h),
         ImVec2(origin.x + x + w, origin.y + y + tab_h),
         IM_COL32(80, 80, 100, static_cast<int>(0.3f * alpha * 255)));
+
+    dl->AddRectFilledMultiColor(
+        ImVec2(origin.x + x, origin.y + y + tab_h + 1.f),
+        ImVec2(origin.x + x + w, origin.y + y + tab_h + 4.f),
+        IM_COL32(0, 0, 0, static_cast<int>(30.f * alpha)),
+        IM_COL32(0, 0, 0, static_cast<int>(30.f * alpha)),
+        IM_COL32(0, 0, 0, 0),
+        IM_COL32(0, 0, 0, 0));
 }
 
 
@@ -408,6 +442,7 @@ static void render_connections(state_t& state, float x, float y, float w, float 
 
     std::lock_guard<std::mutex> lock(state.conn_mutex);
     ImVec2 list_org = ImGui::GetWindowPos();
+    int conn_visible_row = 0;
 
     for (int i = 0; i < static_cast<int>(state.connections.size()); i++) {
         auto& c = state.connections[static_cast<size_t>(i)];
@@ -424,6 +459,10 @@ static void render_connections(state_t& state, float x, float y, float w, float 
 
         float ry = ImGui::GetCursorPosY();
         float abs_ry = list_org.y + ry;
+
+        if (conn_visible_row & 1)
+            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h), IM_COL32(255, 255, 255, 3));
+
         ImVec2 mouse = ImGui::GetMousePos();
         bool hovered = (mouse.x >= list_org.x && mouse.x < list_org.x + w &&
                         mouse.y >= abs_ry && mouse.y < abs_ry + row_h);
@@ -448,13 +487,17 @@ static void render_connections(state_t& state, float x, float y, float w, float 
         dl->AddText(ImVec2(cx, abs_ry), txt_col, protocol_name(c.protocol));          cx += col_proto;
 
 
-        ImU32 state_col = txt_col;
+        ImU32 state_col = IM_COL32(150, 150, 170, static_cast<int>(0.6f * alpha * 255));
         if (c.state == 4) state_col = IM_COL32(100, 255, 100, static_cast<int>(0.85f * alpha * 255));
         else if (c.state == 1) state_col = IM_COL32(100, 180, 255, static_cast<int>(0.85f * alpha * 255));
+        else if (c.state == 10) state_col = IM_COL32(255, 220, 80, static_cast<int>(0.85f * alpha * 255));
+        else if (c.state == 7) state_col = IM_COL32(255, 160, 80, static_cast<int>(0.85f * alpha * 255));
+        else if (c.state == 2) state_col = IM_COL32(180, 120, 255, static_cast<int>(0.85f * alpha * 255));
         dl->AddText(ImVec2(cx, abs_ry), state_col, tcp_state_name(c.state));          cx += col_state;
         dl->AddText(ImVec2(cx, abs_ry), txt_col, local_str.c_str());                  cx += col_local;
         dl->AddText(ImVec2(cx, abs_ry), txt_col, remote_str.c_str());
 
+        conn_visible_row++;
         ImGui::SetCursorPosY(ry + row_h);
     }
 
@@ -472,6 +515,17 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
 
 
     ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 40, static_cast<int>(180 * alpha)));
+    {
+        ImDrawList* dot_dl = ImGui::GetWindowDrawList();
+        ImVec2 dpos = ImGui::GetCursorScreenPos();
+        static float cap_dot_time = 0.f;
+        cap_dot_time += ImGui::GetIO().DeltaTime;
+        ImU32 dot_col = state.cap_running
+            ? IM_COL32(80, 220, 80, static_cast<int>(alpha * 255))
+            : IM_COL32(220, 60, 60, static_cast<int>(alpha * 255));
+        ui_anim::render_status_dot(dot_dl, dpos.x + 5.f, dpos.y + 7.f, 4.f, dot_col, cap_dot_time, state.cap_running);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 16.f);
+    }
     if (!driver_ok) ImGui::BeginDisabled();
 
     if (!state.cap_running) {
@@ -558,6 +612,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
     {
         std::lock_guard<std::mutex> lock(state.cap_mutex);
         ImVec2 list_org = ImGui::GetWindowPos();
+        int cap_visible_row = 0;
 
         for (int i = 0; i < static_cast<int>(state.captured_packets.size()); i++) {
             auto& p = state.captured_packets[static_cast<size_t>(i)];
@@ -572,6 +627,10 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
 
             float ry = ImGui::GetCursorPosY();
             float abs_ry = list_org.y + ry;
+
+            if (cap_visible_row & 1)
+                dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h), IM_COL32(255, 255, 255, 3));
+
             ImVec2 mouse = ImGui::GetMousePos();
             bool hovered = (mouse.x >= list_org.x && mouse.x < list_org.x + w &&
                             mouse.y >= abs_ry && mouse.y < abs_ry + row_h);
@@ -589,10 +648,13 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
 
             ImU32 txt_col = IM_COL32(220, 220, 230, static_cast<int>((selected ? 0.95f : 0.7f) * alpha * 255));
 
-
-            if (p.protocol_label == "HTTP") txt_col = IM_COL32(100, 200, 255, static_cast<int>(0.9f * alpha * 255));
-            else if (p.protocol_label == "TLS") txt_col = IM_COL32(255, 200, 100, static_cast<int>(0.9f * alpha * 255));
-            else if (p.protocol_label == "DNS") txt_col = IM_COL32(100, 255, 180, static_cast<int>(0.9f * alpha * 255));
+            ImU32 proto_col = IM_COL32(150, 150, 170, static_cast<int>(0.6f * alpha * 255));
+            if (p.protocol_label == "HTTP") proto_col = IM_COL32(100, 160, 255, static_cast<int>(0.9f * alpha * 255));
+            else if (p.protocol_label == "TLS") proto_col = IM_COL32(80, 220, 120, static_cast<int>(0.9f * alpha * 255));
+            else if (p.protocol_label == "DNS") proto_col = IM_COL32(255, 180, 80, static_cast<int>(0.9f * alpha * 255));
+            else if (p.protocol_label == "QUIC") proto_col = IM_COL32(180, 120, 255, static_cast<int>(0.9f * alpha * 255));
+            else if (p.protocol_label == "TCP") proto_col = IM_COL32(150, 150, 170, static_cast<int>(0.7f * alpha * 255));
+            else if (p.protocol_label == "UDP") proto_col = IM_COL32(80, 220, 230, static_cast<int>(0.9f * alpha * 255));
 
             cx = list_org.x + 4.f;
             char no_buf[16]; snprintf(no_buf, sizeof(no_buf), "%d", i + 1);
@@ -606,13 +668,24 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             dl->AddText(ImVec2(cx, abs_ry), txt_col, src_str.c_str()); cx += col_src;
             dl->AddText(ImVec2(cx, abs_ry), txt_col, dst_str.c_str()); cx += col_dst;
 
-            dl->AddText(ImVec2(cx, abs_ry), txt_col, p.protocol_label.c_str()); cx += col_proto;
+            dl->AddText(ImVec2(cx, abs_ry), proto_col, p.protocol_label.c_str()); cx += col_proto;
 
 
             std::string info = p.summary;
             if (info.size() > 60) info = info.substr(0, 57) + "...";
-            dl->AddText(ImVec2(cx, abs_ry), IM_COL32(200, 200, 210, static_cast<int>(0.65f * alpha * 255)), info.c_str());
+            ImU32 info_col = IM_COL32(200, 200, 210, static_cast<int>(0.65f * alpha * 255));
+            if (!info.empty()) {
+                const char* methods[] = {"GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS "};
+                for (auto* m : methods) {
+                    if (info.compare(0, strlen(m), m) == 0) {
+                        info_col = ui_anim::http_method_color(m, alpha * 0.85f);
+                        break;
+                    }
+                }
+            }
+            dl->AddText(ImVec2(cx, abs_ry), info_col, info.c_str());
 
+            cap_visible_row++;
             ImGui::SetCursorPosY(ry + row_h);
         }
 
@@ -1198,8 +1271,8 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
     float row_h = 20.f;
     float hdr_y = org.y + cursor.y;
 
-    float col_pid = 60.f, col_name = 150.f;
-    float col_in = (w - col_pid - col_name - 20.f) * 0.25f;
+    float col_pid = 60.f, col_name = 150.f, col_spark = 80.f;
+    float col_in = (w - col_pid - col_name - col_spark - 20.f) * 0.25f;
     float col_out = col_in, col_rin = col_in, col_rout = col_in;
 
     float cx = org.x + 4.f;
@@ -1209,7 +1282,8 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
     dl->AddText(ImVec2(cx, hdr_y), hdr_col, "In");        cx += col_in;
     dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Out");       cx += col_out;
     dl->AddText(ImVec2(cx, hdr_y), hdr_col, "In Rate");   cx += col_rin;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Out Rate");
+    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Out Rate");  cx += col_rout;
+    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Trend");
 
     ImGui::SetCursorPosY(cursor.y + row_h + 2.f);
     dl->AddLine(ImVec2(org.x + 2.f, hdr_y + row_h), ImVec2(org.x + w - 2.f, hdr_y + row_h),
@@ -1241,7 +1315,21 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
         dl->AddText(ImVec2(cx, abs_ry), IM_COL32(255, 200, 100, static_cast<int>(0.8f * alpha * 255)),
             format_bytes(b.bytes_out).c_str()); cx += col_out;
         dl->AddText(ImVec2(cx, abs_ry), txt_col, format_rate(b.rate_in).c_str()); cx += col_rin;
-        dl->AddText(ImVec2(cx, abs_ry), txt_col, format_rate(b.rate_out).c_str());
+        dl->AddText(ImVec2(cx, abs_ry), txt_col, format_rate(b.rate_out).c_str()); cx += col_rout;
+
+        int hist_count = std::min(b.history_index, 64);
+        if (hist_count > 1) {
+            float ordered[64];
+            for (int hi = 0; hi < hist_count; hi++) {
+                int idx = (b.history_index - hist_count + hi) % 64;
+                if (idx < 0) idx += 64;
+                ordered[hi] = b.rate_history[idx];
+            }
+            ImU32 spark_line = ui_anim::accent_col_u8(ar, ag, ab, static_cast<int>(180 * alpha));
+            ImU32 spark_fill = ui_anim::accent_col_u8(ar, ag, ab, static_cast<int>(40 * alpha));
+            ui_anim::render_sparkline(dl, cx, abs_ry + 2.f, col_spark - 4.f, row_h - 4.f,
+                                      ordered, hist_count, spark_line, spark_fill);
+        }
 
         ImGui::SetCursorPosY(ry + row_h);
     }
@@ -1916,7 +2004,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
 static void run_fuzzer_thread(state_t& state) {
     auto& cfg = state.fuzz_config;
 
-    // Load entries from a single payload_set_t (file or inline text).
+
     auto load_set = [](const payload_set_t& ps) -> std::vector<std::string> {
         std::vector<std::string> lines;
         auto push_line = [&](std::istream& is) {
@@ -1926,29 +2014,29 @@ static void run_fuzzer_thread(state_t& state) {
                 if (!line.empty()) lines.push_back(std::move(line));
             }
         };
-        if (ps.type == 0) { // wordlist file
+        if (ps.type == 0) {
             std::ifstream f(ps.source);
             if (f.is_open()) push_line(f);
-        } else { // inline newline-separated list
+        } else {
             std::istringstream ss(ps.source);
             push_line(ss);
         }
         return lines;
     };
 
-    // Legacy single-set loader using cfg.payload_source / cfg.payload_type.
+
     auto load_legacy_set = [&]() -> std::vector<std::string> {
         payload_set_t tmp;
         tmp.type   = cfg.payload_type;
         tmp.source = cfg.payload_source;
-        if (cfg.payload_type == 1) { // sequential numbers range
+        if (cfg.payload_type == 1) {
             std::vector<std::string> nums;
             int start_n = 0, end_n = 100;
             if (sscanf(cfg.payload_source.c_str(), "%d-%d", &start_n, &end_n) >= 1)
                 for (int n = start_n; n <= end_n; n++)
                     nums.push_back(std::to_string(n));
             return nums;
-        } else if (cfg.payload_type == 2) { // charset brute (1-2 chars)
+        } else if (cfg.payload_type == 2) {
             std::string charset = cfg.payload_source.empty()
                 ? "abcdefghijklmnopqrstuvwxyz0123456789" : cfg.payload_source;
             std::vector<std::string> v;
@@ -1961,11 +2049,10 @@ static void run_fuzzer_thread(state_t& state) {
         return load_set(tmp);
     };
 
-    // Replace §...§ markers in tmpl sequentially with entries from payloads.
-    // Also replaces bare FUZZ tokens with the first payload (backward compat).
+
     auto make_request_multi = [](const std::string& tmpl,
                                   const std::vector<std::string>& payloads) -> std::string {
-        const std::string marker = "\xc2\xa7"; // UTF-8 §
+        const std::string marker = "\xc2\xa7";
         std::string result;
         result.reserve(tmpl.size() + 512);
         size_t pos = 0;
@@ -1980,7 +2067,7 @@ static void run_fuzzer_thread(state_t& state) {
             pi++;
             pos = e + marker.size();
         }
-        // Legacy: also replace bare FUZZ with the first payload.
+
         if (!payloads.empty()) {
             size_t fp = 0;
             const std::string fuzz_tok = "FUZZ";
@@ -1992,7 +2079,7 @@ static void run_fuzzer_thread(state_t& state) {
         return result;
     };
 
-    // Run a regex against body and return the requested group as a string.
+
     auto do_grep_extract = [](const std::string& body,
                                const char* re_str,
                                const char* grp_str) -> std::string {
@@ -2010,7 +2097,7 @@ static void run_fuzzer_thread(state_t& state) {
         return {};
     };
 
-    // Check whether a response matches the configured match rules.
+
     auto check_match = [&](int sc, const std::string& body, size_t len) -> bool {
         if (cfg.match_status > 0 && sc != cfg.match_status) return false;
         if (!cfg.match_body.empty() && body.find(cfg.match_body) == std::string::npos) return false;
@@ -2020,8 +2107,8 @@ static void run_fuzzer_thread(state_t& state) {
         return true;
     };
 
-    // ---------- Build the flat combo list (one entry per request to send) ----------
-    using combo_t = std::vector<std::string>; // per-position payload values
+
+    using combo_t = std::vector<std::string>;
     std::vector<combo_t> combos;
 
     switch (cfg.attack_mode) {
@@ -2063,7 +2150,7 @@ static void run_fuzzer_thread(state_t& state) {
                 sets.push_back(load_set(ps));
                 if (sets.back().empty()) { state.fuzz_running.store(false); return; }
             }
-            // Iterative cartesian product (row-major).
+
             combos.push_back(combo_t{});
             for (auto& s : sets) {
                 std::vector<combo_t> next;
@@ -2105,7 +2192,7 @@ static void run_fuzzer_thread(state_t& state) {
             state_t::fuzzer_result fr;
             fr.index     = idx;
             fr.payloads  = combo;
-            fr.payload   = combo.empty() ? std::string() : combo[0]; // legacy compat
+            fr.payload   = combo.empty() ? std::string() : combo[0];
             fr.latency_ms = elapsed;
 
             if (res.success) {
@@ -2116,7 +2203,7 @@ static void run_fuzzer_thread(state_t& state) {
                 fr.response_preview = body.substr(0, std::min<size_t>(200, body.size()));
                 fr.match = check_match(fr.status_code, body, fr.response_len);
 
-                // Grep-extract: use regex from the first payload_set (or the only set).
+
                 if (!cfg.payload_sets.empty()) {
                     fr.extracted_value = do_grep_extract(body,
                         cfg.payload_sets[0].grep_regex,
@@ -2158,7 +2245,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
 
     auto& cfg = state.fuzz_config;
 
-    // ---- Target ----
+
     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Host:");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(200.f);
@@ -2177,7 +2264,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
 
     ImGui::Spacing();
 
-    // ---- Attack Mode ----
+
     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Attack Mode:");
     ImGui::SameLine();
     int am = static_cast<int>(cfg.attack_mode);
@@ -2189,9 +2276,9 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
 
     ImGui::Spacing();
 
-    // ---- Payload Sets panel ----
+
     if (cfg.attack_mode == fuzzer_attack_mode_t::sniper) {
-        // Legacy single-source UI
+
         const char* payload_types[] = { "Wordlist File", "Sequential Numbers", "Charset Brute" };
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Payload Type:");
         ImGui::SameLine();
@@ -2211,7 +2298,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
         else if (cfg.payload_type == 1) ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha), "(start-end)");
         else ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha), "(charset)");
 
-        // Grep-extract for sniper (uses payload_sets[0] or creates it)
+
         if (cfg.payload_sets.empty()) cfg.payload_sets.emplace_back();
         auto& ps0 = cfg.payload_sets[0];
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Grep Extract:");
@@ -2226,7 +2313,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
         ImGui::InputText("##fuzz_grp0", ps0.grep_group, sizeof(ps0.grep_group));
 
     } else {
-        // Multi-set panel (pitchfork / clusterbomb)
+
         ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "Payload Sets");
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha), "(one set per injection position §...§)");
@@ -2248,7 +2335,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
             auto& ps = cfg.payload_sets[static_cast<size_t>(si)];
             ImGui::PushID(si);
 
-            // Set header row: index + name + type + source
+
             char set_label[32];
             snprintf(set_label, sizeof(set_label), "Set %d", si + 1);
             if (ImGui::CollapsingHeader(set_label)) {
@@ -2284,7 +2371,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
                         ps.source = src_buf;
                 }
 
-                // Grep-extract config
+
                 ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Grep Extract:");
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(240.f);
@@ -2303,12 +2390,12 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
         }
 
         ImGui::EndChild();
-        ImGui::PopStyleColor(); // ChildBg
+        ImGui::PopStyleColor();
     }
 
     ImGui::Spacing();
 
-    // ---- Thread / Delay controls ----
+
     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Threads:");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(60.f);
@@ -2321,7 +2408,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     ImGui::InputInt("##fuzz_delay", &cfg.delay_ms, 0, 0);
     cfg.delay_ms = std::max(0, cfg.delay_ms);
 
-    // ---- Match rules ----
+
     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Match Status:");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(60.f);
@@ -2333,7 +2420,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
 
     ImGui::Spacing();
 
-    // ---- Request template editor ----
+
     ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "Request Template");
     ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha),
                        "Mark injection points with §value§  (FUZZ also accepted)");
@@ -2354,7 +2441,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
 
     ImGui::Spacing();
 
-    // ---- Start / Stop controls ----
+
     if (!state.fuzz_running.load()) {
         if (ImGui::Button("Start Fuzzer")) {
             {
@@ -2375,6 +2462,16 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     } else {
         int prog = state.fuzz_progress.load();
         int tot  = state.fuzz_total.load();
+        {
+            static float fuzz_spin_time = 0.f;
+            fuzz_spin_time += ImGui::GetIO().DeltaTime;
+            ImDrawList* sdl = ImGui::GetWindowDrawList();
+            ImVec2 spos = ImGui::GetCursorScreenPos();
+            ui_anim::render_spinner(sdl, spos.x + 8.f, spos.y + 8.f, 6.f, 2.f,
+                                    ui_anim::accent_col_u8(ar, ag, ab, static_cast<int>(220 * alpha)),
+                                    fuzz_spin_time);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 20.f);
+        }
         ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "Running: %d / %d", prog, tot);
         float frac = tot > 0 ? static_cast<float>(prog) / static_cast<float>(tot) : 0.f;
         ImGui::ProgressBar(frac, ImVec2(300.f, 0.f));
@@ -2384,14 +2481,14 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
 
     ImGui::Spacing();
 
-    // ---- Results table ----
+
     std::vector<state_t::fuzzer_result> results_copy;
     {
         std::lock_guard<std::mutex> lk(state.fuzz_mutex);
         results_copy = state.fuzz_results;
     }
 
-    // Determine how many payload columns to show.
+
     size_t max_cols = 1;
     for (auto& fr : results_copy)
         max_cols = std::max(max_cols, fr.payloads.size());
@@ -2409,7 +2506,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     ImVec2 list_org  = ImGui::GetWindowPos();
     float row_h      = 18.f;
 
-    // Column widths
+
     float c_idx     = 50.f;
     float c_payload = std::min(180.f, (w - 50.f - 60.f - 80.f - 80.f - 50.f
                                        - (show_extract ? 120.f : 0.f))
@@ -2424,7 +2521,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     float cx0 = list_org.x + 4.f;
     ImU32 hdr_col = IM_COL32(180, 180, 200, static_cast<int>(0.6f * alpha * 255));
 
-    { // Header row
+    {
         float cx = cx0;
         char hbuf[32];
         dl->AddText(ImVec2(cx, cy), hdr_col, "#"); cx += c_idx;
@@ -2469,7 +2566,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
         snprintf(buf, sizeof(buf), "%d", fr.index);
         dl->AddText(ImVec2(cx, abs_ry), txt_col, buf); cx += c_idx;
 
-        // Per-position payload columns
+
         for (size_t pi = 0; pi < max_cols; pi++) {
             std::string pl;
             if (pi < fr.payloads.size()) {
@@ -2479,12 +2576,16 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
             dl->AddText(ImVec2(cx, abs_ry), txt_col, pl.c_str()); cx += c_payload;
         }
 
-        // Status
-        ImU32 sc_col = (fr.status_code >= 200 && fr.status_code < 300)
-            ? IM_COL32(100, 255, 100, static_cast<int>(0.9f * alpha * 255))
-            : (fr.status_code >= 400)
-            ? IM_COL32(255, 100, 100, static_cast<int>(0.9f * alpha * 255))
-            : txt_col;
+
+        ImU32 sc_col = txt_col;
+        if (fr.status_code >= 200 && fr.status_code < 300)
+            sc_col = IM_COL32(100, 255, 100, static_cast<int>(0.9f * alpha * 255));
+        else if (fr.status_code >= 300 && fr.status_code < 400)
+            sc_col = IM_COL32(100, 160, 255, static_cast<int>(0.9f * alpha * 255));
+        else if (fr.status_code >= 400 && fr.status_code < 500)
+            sc_col = IM_COL32(255, 180, 80, static_cast<int>(0.9f * alpha * 255));
+        else if (fr.status_code >= 500)
+            sc_col = IM_COL32(255, 80, 80, static_cast<int>(0.9f * alpha * 255));
         snprintf(buf, sizeof(buf), "%d", fr.status_code);
         dl->AddText(ImVec2(cx, abs_ry), sc_col, buf); cx += c_status;
 
@@ -2907,7 +3008,21 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
         }
         ImGui::PopID();
 
-        py += 24.f;
+        if (i + 1 < state.decoder_pipeline.size()) {
+            float arrow_base_y = pp.y + py + 22.f;
+            float arrow_cx = pp.x + pipe_w * 0.5f;
+            ImU32 arrow_col = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+                                       static_cast<int>(ab * 255), static_cast<int>(0.5f * alpha * 255));
+            dl->AddLine(ImVec2(arrow_cx, arrow_base_y + 2.f), ImVec2(arrow_cx, arrow_base_y + 12.f), arrow_col, 1.5f);
+            dl->AddTriangleFilled(
+                ImVec2(arrow_cx - 4.f, arrow_base_y + 10.f),
+                ImVec2(arrow_cx + 4.f, arrow_base_y + 10.f),
+                ImVec2(arrow_cx, arrow_base_y + 16.f),
+                arrow_col);
+            py += 40.f;
+        } else {
+            py += 24.f;
+        }
     }
 
     ImGui::SetCursorPos(ImVec2(4.f, py + 8.f));

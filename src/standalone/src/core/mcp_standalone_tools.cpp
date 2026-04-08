@@ -728,5 +728,6 @@ namespace mcp_standalone
         debugger_tools::register_debugger_tools(srv);
         coding_tools::register_coding_tools(srv);
         workflow_tools::register_workflow_tools(srv);
+        scanner_tools::register_scanner_tools(srv);
     }
 }

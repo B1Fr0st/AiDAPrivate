@@ -779,19 +779,74 @@ quic_header parse_quic_header(const uint8_t* data, size_t len) {
         if (len < scid_off + 1 + scid_len) return h;
         h.scid.assign(data + scid_off + 1, data + scid_off + 1 + scid_len);
 
+        size_t pos = scid_off + 1 + scid_len;
 
-        uint8_t ptype = (data[0] & 0x30) >> 4;
-        switch (ptype) {
-            case 0: h.packet_type = "Initial"; break;
-            case 1: h.packet_type = "0-RTT"; break;
-            case 2: h.packet_type = "Handshake"; break;
-            case 3: h.packet_type = "Retry"; break;
+        if (h.version == 0) {
+            h.is_version_negotiation = true;
+            h.packet_type = "Version Negotiation";
+            while (pos + 4 <= len) {
+                h.supported_versions.push_back(read_u32(data + pos));
+                pos += 4;
+            }
+            h.payload_offset = pos;
+            h.valid = true;
+        } else {
+            uint8_t ptype = (data[0] & 0x30) >> 4;
+            switch (ptype) {
+                case 0: {
+                    h.packet_type = "Initial";
+                    if (pos < len) {
+                        uint64_t token_len = 0;
+                        size_t varint_bytes = 0;
+                        uint8_t first = data[pos];
+                        uint8_t prefix = first >> 6;
+                        if (prefix == 0) {
+                            token_len = first & 0x3F;
+                            varint_bytes = 1;
+                        } else if (prefix == 1 && pos + 2 <= len) {
+                            token_len = (static_cast<uint64_t>(first & 0x3F) << 8)
+                                      | data[pos + 1];
+                            varint_bytes = 2;
+                        } else if (prefix == 2 && pos + 4 <= len) {
+                            token_len = (static_cast<uint64_t>(first & 0x3F) << 24)
+                                      | (static_cast<uint64_t>(data[pos + 1]) << 16)
+                                      | (static_cast<uint64_t>(data[pos + 2]) << 8)
+                                      | data[pos + 3];
+                            varint_bytes = 4;
+                        }
+                        pos += varint_bytes;
+                        if (token_len > 0 && pos + token_len <= len) {
+                            h.token.assign(data + pos, data + pos + token_len);
+                            pos += static_cast<size_t>(token_len);
+                        }
+                    }
+                    h.payload_offset = pos;
+                    break;
+                }
+                case 1: h.packet_type = "0-RTT"; h.payload_offset = pos; break;
+                case 2: h.packet_type = "Handshake"; h.payload_offset = pos; break;
+                case 3: {
+                    h.packet_type = "Retry";
+                    if (pos < len) {
+                        size_t integrity_tag_size = 16;
+                        size_t token_end = (len >= integrity_tag_size) ? len - integrity_tag_size : len;
+                        if (pos < token_end) {
+                            h.token.assign(data + pos, data + token_end);
+                        }
+                        h.payload_offset = len;
+                    }
+                    break;
+                }
+            }
+            h.valid = true;
         }
-        h.valid = true;
     } else {
-
         h.packet_type = "1-RTT (Short)";
-
+        if (len > 1) {
+            size_t dcid_len = (std::min)(static_cast<size_t>(20), len - 1);
+            h.dcid.assign(data + 1, data + 1 + dcid_len);
+        }
+        h.payload_offset = 1 + h.dcid.size();
         h.valid = true;
     }
     return h;
@@ -977,7 +1032,26 @@ detection_result detect_protocol(const uint8_t* data, size_t len,
         auto qh = parse_quic_header(data, len);
         r.protocol = detected_protocol_t::quic;
         r.label = "QUIC";
-        r.summary = qh.valid ? (qh.packet_type + " " + qh.version_name) : "QUIC";
+        if (qh.valid) {
+            r.summary = qh.packet_type;
+            if (!qh.version_name.empty()) r.summary += " " + qh.version_name;
+            if (!qh.dcid.empty()) r.summary += " DCID=" + qh.dcid_hex();
+            if (qh.is_version_negotiation && !qh.supported_versions.empty()) {
+                r.summary += " (supports:";
+                for (auto v : qh.supported_versions) {
+                    r.summary += " " + quic_version_name(v);
+                }
+                r.summary += ")";
+            }
+            if (!qh.token.empty()) {
+                r.summary += " token=" + std::to_string(qh.token.size()) + "B";
+            }
+            if (!qh.is_long_header) {
+                r.summary += " (encrypted)";
+            }
+        } else {
+            r.summary = "QUIC (encrypted)";
+        }
         return r;
     }
 
