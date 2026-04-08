@@ -39,7 +39,9 @@ namespace object_guard {
     }
 
     __forceinline bool init(PDRIVER_OBJECT target_driver_object) {
+        SN_LOG("object_guard::init: target_driver_object=%p", target_driver_object);
         bool result = hide_device_and_symlink(target_driver_object);
+        SN_LOG("object_guard::init: result=%d", (int)result);
         return result;
     }
 }

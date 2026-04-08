@@ -220,6 +220,7 @@ namespace callback_scanner {
 
     __forceinline bool init() {
         PVOID nt_base = reinterpret_cast<PVOID>(get_nt_base());
+        SN_LOG("callback_scanner::init: nt_base=%p", nt_base);
         if (!nt_base)
             return false;
 
@@ -227,6 +228,8 @@ namespace callback_scanner {
 
         g_load_image_array = find_load_image_array(nt_base);
         g_create_process_array = find_create_process_array(nt_base);
+        SN_LOG("callback_scanner::init: load_image=%p create_process=%p",
+            g_load_image_array, g_create_process_array);
 
         if (g_load_image_array)
             g_baseline_load_image_count = count_callback_array(g_load_image_array);
@@ -235,6 +238,8 @@ namespace callback_scanner {
             g_baseline_create_process_count = count_callback_array(g_create_process_array);
 
         _InterlockedExchange(&g_initialized, 1);
+        SN_LOG("callback_scanner::init: SUCCESS load=%lu proc=%lu",
+            g_baseline_load_image_count, g_baseline_create_process_count);
 
         return true;
     }

@@ -311,6 +311,7 @@ namespace net_bw {
     BOOLEAN is_active();
 }
 namespace net_inject {
+    inline constexpr UINT32 INJECT_FLAG_RAW_TRANSPORT = 0x80000000u;
     BOOLEAN resolve_inject_functions();
     NTSTATUS inject_packet(p_packet_inject_request request);
     void cleanup();
@@ -588,7 +589,7 @@ namespace net_capture {
                                              const UINT8* remote_ip, UINT32 af) {
 
         for (UINT32 i = 0; i < MAX_FILTER_RULES; i++) {
-            if (!g_filter_rules[i].active) continue;
+            if (g_filter_rules[i].active != 1) continue;
             const ACTIVE_FILTER_RULE* r = &g_filter_rules[i];
 
             if (r->direction != 2 && r->direction != direction) continue;
@@ -945,7 +946,6 @@ namespace net_capture {
                         UINT32 spoof_af = 0;
                         UINT32 spoof_ttl = 0;
                         if (net_dns_spoof::check_spoof(spoof_domain, spoof_addr, &spoof_af, &spoof_ttl)) {
-                            UINT16 qtype = ((UINT16)pkt_data[qpos] << 8) | pkt_data[qpos + 1];
                             UINT32 ans_pos = qpos + 4;
                             UINT16 ancount = ((UINT16)pkt_data[6] << 8) | pkt_data[7];
                             BOOLEAN spoofed = FALSE;
@@ -995,8 +995,10 @@ namespace net_capture {
                                 inj.dst_port = local_port;
                                 strong::kmemcpy(inj.src_addr, remote_ip, 4);
                                 strong::kmemcpy(inj.dst_addr, local_ip, 4);
+                                inj.tcp_flags = net_inject::INJECT_FLAG_RAW_TRANSPORT;
                                 inj.payload_size = pkt_len;
-                                strong::kmemcpy(inj.payload, pkt_data, pkt_len);
+                                if (pkt_len <= INJECT_MAX_PAYLOAD)
+                                    strong::kmemcpy(inj.payload, pkt_data, pkt_len);
                                 classifyOut->actionType = FWP_ACTION_BLOCK_;
                                 classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
                                 net_inject::inject_packet(&inj);
@@ -1054,20 +1056,10 @@ namespace net_capture {
                     inj.dst_port = local_port;
                     strong::kmemcpy(inj.src_addr, remote_ip, 4);
                     strong::kmemcpy(inj.dst_addr, local_ip, 4);
-                    UINT32 hdr_skip = 0;
-                    if (protocol == 6 && pkt_len >= 20) {
-                        hdr_skip = ((UINT32)(pkt_data[12] >> 4)) * 4;
-                        if (hdr_skip < 20) hdr_skip = 20;
-                        if (hdr_skip > pkt_len) hdr_skip = pkt_len;
-                        inj.tcp_seq = ((UINT32)pkt_data[4] << 24) | ((UINT32)pkt_data[5] << 16) |
-                                      ((UINT32)pkt_data[6] << 8) | pkt_data[7];
-                        inj.tcp_ack = ((UINT32)pkt_data[8] << 24) | ((UINT32)pkt_data[9] << 16) |
-                                      ((UINT32)pkt_data[10] << 8) | pkt_data[11];
-                        inj.tcp_flags = pkt_data[13];
-                    }
-                    inj.payload_size = pkt_len - hdr_skip;
-                    if (inj.payload_size > 0)
-                        strong::kmemcpy(inj.payload, pkt_data + hdr_skip, inj.payload_size);
+                    inj.tcp_flags = net_inject::INJECT_FLAG_RAW_TRANSPORT;
+                    inj.payload_size = pkt_len;
+                    if (pkt_len <= INJECT_MAX_PAYLOAD)
+                        strong::kmemcpy(inj.payload, pkt_data, pkt_len);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
                     net_inject::inject_packet(&inj);
@@ -1270,6 +1262,8 @@ namespace net_capture {
                         inj.tcp_ack = ((UINT32)pkt_data[8] << 24) | ((UINT32)pkt_data[9] << 16) |
                                       ((UINT32)pkt_data[10] << 8) | pkt_data[11];
                         inj.tcp_flags = pkt_data[13];
+                    } else if (protocol == 17 && pkt_len >= 8) {
+                        hdr_skip = 8;
                     }
                     inj.payload_size = pkt_len - hdr_skip;
                     if (inj.payload_size > 0)
@@ -1328,20 +1322,10 @@ namespace net_capture {
                     inj.dst_port = remote_port;
                     strong::kmemcpy(inj.src_addr, local_ip, 4);
                     strong::kmemcpy(inj.dst_addr, remote_ip, 4);
-                    UINT32 hdr_skip = 0;
-                    if (protocol == 6 && pkt_len >= 20) {
-                        hdr_skip = ((UINT32)(pkt_data[12] >> 4)) * 4;
-                        if (hdr_skip < 20) hdr_skip = 20;
-                        if (hdr_skip > pkt_len) hdr_skip = pkt_len;
-                        inj.tcp_seq = ((UINT32)pkt_data[4] << 24) | ((UINT32)pkt_data[5] << 16) |
-                                      ((UINT32)pkt_data[6] << 8) | pkt_data[7];
-                        inj.tcp_ack = ((UINT32)pkt_data[8] << 24) | ((UINT32)pkt_data[9] << 16) |
-                                      ((UINT32)pkt_data[10] << 8) | pkt_data[11];
-                        inj.tcp_flags = pkt_data[13];
-                    }
-                    inj.payload_size = pkt_len - hdr_skip;
-                    if (inj.payload_size > 0)
-                        strong::kmemcpy(inj.payload, pkt_data + hdr_skip, inj.payload_size);
+                    inj.tcp_flags = net_inject::INJECT_FLAG_RAW_TRANSPORT;
+                    inj.payload_size = pkt_len;
+                    if (pkt_len <= INJECT_MAX_PAYLOAD)
+                        strong::kmemcpy(inj.payload, pkt_data, pkt_len);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
                     net_inject::inject_packet(&inj);
@@ -1958,8 +1942,6 @@ namespace net_capture {
         KeInitializeSpinLock(&g_pid_path_lock);
         KeInitializeSpinLock(&net_fingerprint::g_fp_lock);
 
-        net_fragment::init();
-
 
         SIZE_T ring_size = (SIZE_T)RING_BUFFER_SIZE * sizeof(NET_PACKET_ENTRY);
         g_ring_buffer = (NET_PACKET_ENTRY*)ExAllocatePool2(
@@ -2043,7 +2025,6 @@ namespace net_capture {
         net_inject::cleanup();
         net_stream::cleanup();
         net_dpi::cleanup();
-        net_fragment::cleanup();
 
         if (g_ring_buffer) {
             ExFreePoolWithTag(g_ring_buffer, 'pkNW');
@@ -2955,7 +2936,7 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
             net_capture::g_filter_protocol = request->filter_protocol;
             strong::kmemcpy(net_capture::g_filter_ip, request->filter_ip, 16);
             if (request->filter_pid != 0) {
-                NTSTATUS cache_status = aida_refresh_pid_cache_for_process(
+                aida_refresh_pid_cache_for_process(
                     request->filter_pid,
                     request->filter_protocol);
             }
@@ -3084,7 +3065,7 @@ NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
     switch (request->operation) {
         case 0: {
             for (UINT32 i = 0; i < MAX_FILTER_RULES; i++) {
-                if (_InterlockedCompareExchange(&net_capture::g_filter_rules[i].active, 1, 0) == 0) {
+                if (_InterlockedCompareExchange(&net_capture::g_filter_rules[i].active, 2, 0) == 0) {
                     UINT32 id = (UINT32)_InterlockedIncrement(&net_capture::g_next_rule_id);
                     net_capture::g_filter_rules[i].rule_id = id;
                     net_capture::g_filter_rules[i].action = request->action;
@@ -3094,6 +3075,8 @@ NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
                     net_capture::g_filter_rules[i].port = request->port;
                     strong::kmemcpy(net_capture::g_filter_rules[i].ip_addr, request->ip_addr, 16);
                     strong::kmemcpy(net_capture::g_filter_rules[i].ip_mask, request->ip_mask, 16);
+                    KeMemoryBarrier();
+                    _InterlockedExchange(&net_capture::g_filter_rules[i].active, 1);
                     _InterlockedIncrement(&net_capture::g_active_rule_count);
 
                     request->rule_id = id;
@@ -3105,7 +3088,7 @@ NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
         }
         case 1: {
             for (UINT32 i = 0; i < MAX_FILTER_RULES; i++) {
-                if (net_capture::g_filter_rules[i].active &&
+                if (net_capture::g_filter_rules[i].active == 1 &&
                     net_capture::g_filter_rules[i].rule_id == request->rule_id) {
                     _InterlockedExchange(&net_capture::g_filter_rules[i].active, 0);
                     _InterlockedDecrement(&net_capture::g_active_rule_count);
@@ -3839,6 +3822,28 @@ namespace net_inject {
     static UINT32 build_transport_packet(const packet_inject_request* request, UINT8* out_buf, UINT32 out_cap) {
         if (!request || !out_buf || out_cap == 0)
             return 0;
+
+        if (request->tcp_flags & INJECT_FLAG_RAW_TRANSPORT) {
+            if (request->payload_size > out_cap) return 0;
+            strong::kmemcpy(out_buf, request->payload, request->payload_size);
+            if (request->address_family == AF_INET) {
+                if (request->protocol == IPPROTO_TCP && request->payload_size >= 20) {
+                    write_be16(out_buf + 16, 0);
+                    UINT16 checksum = transport_checksum_ipv4(
+                        request->src_addr, request->dst_addr,
+                        IPPROTO_TCP, out_buf, request->payload_size);
+                    write_be16(out_buf + 16, checksum);
+                } else if (request->protocol == IPPROTO_UDP && request->payload_size >= 8) {
+                    write_be16(out_buf + 6, 0);
+                    UINT16 checksum = transport_checksum_ipv4(
+                        request->src_addr, request->dst_addr,
+                        IPPROTO_UDP, out_buf, request->payload_size);
+                    if (checksum == 0) checksum = 0xFFFFu;
+                    write_be16(out_buf + 6, checksum);
+                }
+            }
+            return request->payload_size;
+        }
 
         if (request->protocol == IPPROTO_UDP) {
             UINT32 total = request->payload_size + 8;
@@ -5173,16 +5178,18 @@ namespace net_stream {
             if (match && g_streams[i].stream_data && data_len > 0) {
                 KIRQL irql;
                 KeAcquireSpinLock(&g_streams[i].lock, &irql);
-                UINT32 avail = STREAM_MAX_SIZE - g_streams[i].stream_size;
-                if (avail > 0) {
-                    UINT32 copy = data_len < avail ? data_len : avail;
-                    strong::kmemcpy(g_streams[i].stream_data + g_streams[i].stream_size, data, copy);
-                    g_streams[i].stream_size += copy;
-                    if (copy < data_len) g_streams[i].truncated = 1;
-                } else {
-                    g_streams[i].truncated = 1;
+                if (g_streams[i].stream_data) {
+                    UINT32 avail = STREAM_MAX_SIZE - g_streams[i].stream_size;
+                    if (avail > 0) {
+                        UINT32 copy = data_len < avail ? data_len : avail;
+                        strong::kmemcpy(g_streams[i].stream_data + g_streams[i].stream_size, data, copy);
+                        g_streams[i].stream_size += copy;
+                        if (copy < data_len) g_streams[i].truncated = 1;
+                    } else {
+                        g_streams[i].truncated = 1;
+                    }
+                    g_streams[i].total_packets++;
                 }
-                g_streams[i].total_packets++;
                 KeReleaseSpinLock(&g_streams[i].lock, irql);
             }
         }
@@ -5265,8 +5272,14 @@ namespace net_stream {
         for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
             _InterlockedExchange(&g_streams[i].active, 0);
             if (g_streams[i].stream_data) {
-                ExFreePoolWithTag(g_streams[i].stream_data, 'stNW');
+                KIRQL irql;
+                KeAcquireSpinLock(&g_streams[i].lock, &irql);
+                UINT8* data = g_streams[i].stream_data;
                 g_streams[i].stream_data = nullptr;
+                KeReleaseSpinLock(&g_streams[i].lock, irql);
+                if (data) {
+                    ExFreePoolWithTag(data, 'stNW');
+                }
             }
         }
         _InterlockedExchange(&g_active_stream_count, 0);
@@ -5297,7 +5310,6 @@ namespace net_dpi {
         if (!g_dpi_ring) return STATUS_INSUFFICIENT_RESOURCES;
         strong::kmemset(g_dpi_ring, 0, sz);
         KeInitializeSpinLock(&g_dpi_lock);
-        _InterlockedExchange(&g_dpi_active, 1);
         return STATUS_SUCCESS;
     }
 
@@ -5498,6 +5510,7 @@ namespace net_dpi {
             NTSTATUS st = init();
             if (!NT_SUCCESS(st)) return st;
         }
+        _InterlockedExchange(&g_dpi_active, 1);
 
         request->result_count = 0;
         KIRQL irql;
@@ -6199,7 +6212,7 @@ namespace net_dns_spoof {
     BOOLEAN check_spoof(const char* domain, UINT8* out_addr, UINT32* out_af, UINT32* out_ttl) {
         if (g_active_spoof_count == 0) return FALSE;
         for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES; i++) {
-            if (!g_spoof_rules[i].active) continue;
+            if (g_spoof_rules[i].active != 1) continue;
             if (domain_matches(g_spoof_rules[i].domain, domain)) {
                 strong::kmemcpy(out_addr, g_spoof_rules[i].spoof_addr, 16);
                 *out_af = g_spoof_rules[i].address_family;
@@ -6217,7 +6230,7 @@ namespace net_dns_spoof {
         switch (request->operation) {
         case 0: {
             for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES; i++) {
-                if (!g_spoof_rules[i].active) {
+                if (_InterlockedCompareExchange(&g_spoof_rules[i].active, 2, 0) == 0) {
                     UINT32 id = (UINT32)_InterlockedIncrement(&g_next_spoof_id);
                     g_spoof_rules[i].rule_id = id;
                     strong::kmemcpy(g_spoof_rules[i].domain, request->domain, DNS_SPOOF_MAX_DOMAIN);
@@ -6237,7 +6250,7 @@ namespace net_dns_spoof {
         }
         case 1: {
             for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES; i++) {
-                if (g_spoof_rules[i].active && g_spoof_rules[i].rule_id == request->rule_id) {
+                if (g_spoof_rules[i].active == 1 && g_spoof_rules[i].rule_id == request->rule_id) {
                     _InterlockedExchange(&g_spoof_rules[i].active, 0);
                     _InterlockedDecrement(&g_active_spoof_count);
                     request->active = 0;
@@ -6248,7 +6261,7 @@ namespace net_dns_spoof {
         }
         case 3: {
             for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES; i++) {
-                if (g_spoof_rules[i].active) {
+                if (g_spoof_rules[i].active == 1) {
                     _InterlockedExchange(&g_spoof_rules[i].active, 0);
                     _InterlockedDecrement(&g_active_spoof_count);
                 }
@@ -6264,7 +6277,7 @@ namespace net_dns_spoof {
         if (!request) return STATUS_INVALID_PARAMETER;
         request->rule_count = 0;
         for (UINT32 i = 0; i < DNS_SPOOF_MAX_RULES && request->rule_count < DNS_SPOOF_MAX_RULES; i++) {
-            if (g_spoof_rules[i].active) {
+            if (g_spoof_rules[i].active == 1) {
                 DNS_SPOOF_RULE* out = &request->rules[request->rule_count];
                 out->rule_id = g_spoof_rules[i].rule_id;
                 strong::kmemcpy(out->domain, g_spoof_rules[i].domain, DNS_SPOOF_MAX_DOMAIN);
@@ -6341,6 +6354,19 @@ namespace net_bw {
         }
         if (free_slot >= 0) {
             if (_InterlockedCompareExchange(&g_bw_entries[free_slot].active, 2, 0) == 0) {
+                for (UINT32 j = 0; j < BW_MAX_PROCESSES; j++) {
+                    if (g_bw_entries[j].active == 1 && g_bw_entries[j].pid == pid) {
+                        _InterlockedExchange(&g_bw_entries[free_slot].active, 0);
+                        if (direction == 0) {
+                            _InterlockedExchangeAdd64(&g_bw_entries[j].bytes_recv, bytes);
+                            _InterlockedIncrement64(&g_bw_entries[j].packets_recv);
+                        } else {
+                            _InterlockedExchangeAdd64(&g_bw_entries[j].bytes_sent, bytes);
+                            _InterlockedIncrement64(&g_bw_entries[j].packets_sent);
+                        }
+                        return;
+                    }
+                }
                 g_bw_entries[free_slot].pid = pid;
                 g_bw_entries[free_slot].bytes_sent = 0;
                 g_bw_entries[free_slot].bytes_recv = 0;
@@ -6877,8 +6903,7 @@ NTSTATUS functions::handle_stream_reassemble(p_stream_reassemble_request request
     NET_DBG("handle_stream_reassemble: enter op=%u pid=%u", request ? request->operation : 0, request ? request->pid : 0);
     if (!request) { NET_ERR("handle_stream_reassemble: NULL request"); return STATUS_INVALID_PARAMETER; }
     if (request->operation == 0 && request->pid != 0) {
-        NTSTATUS cache_status = aida_refresh_pid_cache_for_process(request->pid, IPPROTO_TCP);
-        NET_DBG("handle_stream_reassemble: PID cache refresh status=0x%08x", cache_status);
+        aida_refresh_pid_cache_for_process(request->pid, IPPROTO_TCP);
     }
     NTSTATUS st = net_stream::handle_stream(request);
     NET_DBG("handle_stream_reassemble: exit status=0x%08x", st);
@@ -6889,8 +6914,7 @@ NTSTATUS functions::handle_deep_inspect(p_dpi_request request) {
     NET_DBG("handle_deep_inspect: enter filter_pid=%u filter_proto=%u", request ? request->filter_pid : 0, request ? request->filter_protocol : 0);
     if (!request) { NET_ERR("handle_deep_inspect: NULL request"); return STATUS_INVALID_PARAMETER; }
     if (request->filter_pid != 0) {
-        NTSTATUS cache_status = aida_refresh_pid_cache_for_process(request->filter_pid, request->filter_protocol);
-        NET_DBG("handle_deep_inspect: PID cache refresh status=0x%08x", cache_status);
+        aida_refresh_pid_cache_for_process(request->filter_pid, request->filter_protocol);
     }
     NTSTATUS st = net_dpi::get_results(request);
     NET_DBG("handle_deep_inspect: exit status=0x%08x", st);
@@ -6901,8 +6925,7 @@ NTSTATUS functions::handle_intercept_hold(p_intercept_request request) {
     NET_DBG("handle_intercept_hold: enter op=%u filter_pid=%u", request ? request->operation : 0, request ? request->filter_pid : 0);
     if (!request) { NET_ERR("handle_intercept_hold: NULL request"); return STATUS_INVALID_PARAMETER; }
     if (request->operation == 0 && request->filter_pid != 0) {
-        NTSTATUS cache_status = aida_refresh_pid_cache_for_process(request->filter_pid, request->filter_protocol);
-        NET_DBG("handle_intercept_hold: PID cache refresh status=0x%08x", cache_status);
+        aida_refresh_pid_cache_for_process(request->filter_pid, request->filter_protocol);
     }
     NTSTATUS st = net_intercept::handle_intercept(request);
     NET_DBG("handle_intercept_hold: exit status=0x%08x", st);

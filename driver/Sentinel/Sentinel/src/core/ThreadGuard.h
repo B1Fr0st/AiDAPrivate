@@ -69,11 +69,15 @@ namespace thread_guard {
 
 
     __forceinline bool ipi_clear_all_cpus() {
-        if (!_InterlockedCompareExchange(&g_initialized, 1, 1))
+        if (!_InterlockedCompareExchange(&g_initialized, 1, 1)) {
+            SN_LOG("thread_guard::ipi_clear: not initialized, skip");
             return true;
+        }
 
-        if (!_KeIpiGenericCall)
+        if (!_KeIpiGenericCall) {
+            SN_LOG("thread_guard::ipi_clear: no _KeIpiGenericCall");
             return true;
+        }
 
         volatile LONG targeted_debug_detected = 0;
 
@@ -83,7 +87,7 @@ namespace thread_guard {
                 (ULONG_PTR)&targeted_debug_detected
             );
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-
+            SN_LOG("thread_guard::ipi_clear: EXCEPTION in IPI call");
 
             clear_debug_registers_current_cpu();
             return true;

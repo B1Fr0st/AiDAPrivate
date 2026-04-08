@@ -894,17 +894,21 @@ namespace self_protect {
 
 
     __forceinline void apply_stealth(PDRIVER_OBJECT driver_object) {
+        SN_LOG("self_protect::apply_stealth: driver_object=%p", driver_object);
         if (!driver_object)
             return;
 
         PVOID nt_base = reinterpret_cast<PVOID>(get_nt_base());
         if (!nt_base) {
+            SN_LOG("self_protect::apply_stealth: no nt_base");
             return;
         }
 
         PLDR_DATA_TABLE_ENTRY ldr = nullptr;
         if (driver_object->DriverSection && _MmIsAddressValid(driver_object->DriverSection))
             ldr = static_cast<PLDR_DATA_TABLE_ENTRY>(driver_object->DriverSection);
+
+        SN_LOG("self_protect::apply_stealth: ldr=%p", ldr);
 
         if (ldr && ldr->DllBase)
             clean_piddb_cache(nt_base, ldr);
@@ -920,6 +924,7 @@ namespace self_protect {
         scrub_pe_metadata(driver_object);
 
         disguise_module_entry(driver_object);
+        SN_LOG("self_protect::apply_stealth: complete");
     }
 
 
@@ -930,8 +935,11 @@ namespace self_protect {
     constexpr LONG         OWN_INTEGRITY_STRIKE_THRESHOLD = 5;
 
     __forceinline bool init_baseline(PVOID own_code_base, ULONG own_code_size) {
-        if (!own_code_base || own_code_size == 0)
+        SN_LOG("self_protect::init_baseline: base=%p size=0x%lx", own_code_base, own_code_size);
+        if (!own_code_base || own_code_size == 0) {
+            SN_LOG("self_protect::init_baseline: FAIL - null base or zero size");
             return false;
+        }
 
         g_own_code_base = own_code_base;
         g_own_code_size = own_code_size;
@@ -944,18 +952,24 @@ namespace self_protect {
             __try {
                 RtlCopyMemory(g_own_shadow_copy, own_code_base, own_code_size);
             } __except (EXCEPTION_EXECUTE_HANDLER) {
+                SN_LOG("self_protect::init_baseline: EXCEPTION copying shadow");
                 ExFreePoolWithTag(g_own_shadow_copy, 'sCmM');
                 g_own_shadow_copy = nullptr;
             }
+        } else {
+            SN_LOG("self_protect::init_baseline: shadow alloc failed");
         }
 
         g_own_baseline_crc = integrity::compute_crc32(own_code_base, own_code_size);
+        SN_LOG("self_protect::init_baseline: crc=0x%08lx", g_own_baseline_crc);
 
         if (g_own_baseline_crc == 0) {
+            SN_LOG("self_protect::init_baseline: FAIL - CRC is zero");
             return false;
         }
 
         _InterlockedExchange(&g_initialized, 1);
+        SN_LOG("self_protect::init_baseline: SUCCESS");
         return true;
     }
 
@@ -973,6 +987,8 @@ namespace self_protect {
         UINT32 current_crc = integrity::compute_crc32(base, size);
 
         if (current_crc != g_own_baseline_crc) {
+            SN_LOG("self_protect::verify: CRC mismatch own=0x%08lx current=0x%08lx",
+                g_own_baseline_crc, current_crc);
 
 
             ULONG diff_offset = (ULONG)-1;

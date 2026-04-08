@@ -112,12 +112,16 @@ namespace integrity {
     }
 
     __forceinline bool init(PVOID code_base, ULONG code_size) {
-        if (!code_base || code_size == 0)
+        SN_LOG("integrity::init: code_base=%p code_size=0x%lx", code_base, code_size);
+        if (!code_base || code_size == 0) {
+            SN_LOG("integrity::init: FAIL - null base or zero size");
             return false;
+        }
 
 
         if (!_MmIsAddressValid(code_base) ||
             !_MmIsAddressValid(static_cast<PUCHAR>(code_base) + code_size - 1)) {
+            SN_LOG("integrity::init: FAIL - address not valid");
             return false;
         }
 
@@ -125,17 +129,21 @@ namespace integrity {
         g_code_size = code_size;
 
         if (!create_shadow_copy(code_base, code_size)) {
+            SN_LOG("integrity::init: FAIL - create_shadow_copy failed");
             return false;
         }
 
         g_baseline_crc = compute_crc32(code_base, code_size);
+        SN_LOG("integrity::init: baseline_crc=0x%08lx", g_baseline_crc);
 
         if (g_baseline_crc == 0) {
+            SN_LOG("integrity::init: FAIL - CRC is zero");
             ExFreePoolWithTag(g_shadow_copy, 'mCmM');
             g_shadow_copy = nullptr;
             return false;
         }
 
+        SN_LOG("integrity::init: SUCCESS");
         return true;
     }
 

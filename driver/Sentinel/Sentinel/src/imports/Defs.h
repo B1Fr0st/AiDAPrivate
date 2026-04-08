@@ -173,6 +173,14 @@ inline BOOLEAN            (NTAPI* _KeSetTimerEx)                    (PKTIMER, LA
 inline BOOLEAN            (NTAPI* _KeCancelTimer)                   (PKTIMER);
 inline VOID               (NTAPI* _KeFlushQueuedDpcs)               (VOID);
 
+inline ULONG              (__cdecl* _DbgPrintEx)                   (ULONG, ULONG, PCSTR, ...);
+
+#ifdef DRIVER_DEBUG
+#define SN_LOG(fmt, ...) do { if (_DbgPrintEx) _DbgPrintEx(77, 0, "[SN] " fmt "\n", ##__VA_ARGS__); } while(0)
+#else
+#define SN_LOG(fmt, ...) do { (void)0; } while(0)
+#endif
+
 
 inline VOID               (NTAPI* _KeBugCheckEx)                    (ULONG, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
 
@@ -248,6 +256,8 @@ inline bool SetupFunctions() {
     *(PVOID*)&_KeSetTimerEx                 = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeSetTimerEx"));
     *(PVOID*)&_KeCancelTimer                = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeCancelTimer"));
     *(PVOID*)&_KeFlushQueuedDpcs            = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeFlushQueuedDpcs"));
+
+    *(PVOID*)&_DbgPrintEx                  = GetProcAddress(kernelBase, (PCHAR)skCrypt("DbgPrintEx"));
 
 
     *(PVOID*)&_KeBugCheckEx                 = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeBugCheckEx"));

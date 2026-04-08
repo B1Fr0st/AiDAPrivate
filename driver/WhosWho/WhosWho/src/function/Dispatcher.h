@@ -634,6 +634,9 @@ namespace dispatcher {
 
                 ULONG expectedMagic = get_heartbeat_magic();
 
+                WW_LOG("HB: received magic=0x%lx expected=0x%lx session_key=0x%lx",
+                    hb->magic, expectedMagic, hb->session_key);
+
                 if (hb->magic == expectedMagic) {
                     {
                         LARGE_INTEGER current_time;
@@ -641,6 +644,8 @@ namespace dispatcher {
 
                         LONG existing_key = _InterlockedCompareExchange((volatile LONG*)&g_session_key, (LONG)hb->session_key, 0);
                         if (existing_key != 0 && (ULONG)existing_key != hb->session_key) {
+                            WW_LOG("HB: session key mismatch existing=0x%lx new=0x%lx, resetting",
+                                (ULONG)existing_key, hb->session_key);
                             caller_validation::unregister_client();
                             _InterlockedExchange((volatile LONG*)&g_session_key, 0);
                             _InterlockedExchange((volatile LONG*)&g_heartbeat_counter, 0);
@@ -655,23 +660,33 @@ namespace dispatcher {
                             _InterlockedExchange(&g_driver_activated, 1);
 
                             if (existing_key == 0) {
+                                WW_LOG("HB: first heartbeat, registering client, counter=%ld",
+                                    g_heartbeat_counter);
                                 caller_validation::register_client();
                             }
 
                             hb->response = (UINT64)g_heartbeat_counter ^ dynamic_key::get();
+                            WW_LOG("HB: OK counter=%ld activated=%ld bridge_whoswho_tsc=%lld bridge_sentinel_tsc=%lld",
+                                g_heartbeat_counter, g_driver_activated,
+                                sentinel_bridge::g_bridge.whoswho_tsc,
+                                sentinel_bridge::g_bridge.sentinel_tsc);
                             status = STATUS_SUCCESS;
                         } else {
+                            WW_LOG("HB: ACCESS_DENIED existing_key=0x%lx hb_key=0x%lx",
+                                (ULONG)existing_key, hb->session_key);
                             hb->response = 0;
                             status = STATUS_ACCESS_DENIED;
                         }
                     }
                 } else {
+                    WW_LOG("HB: INVALID_PARAMETER magic mismatch");
                     hb->response = 0;
                     status = STATUS_INVALID_PARAMETER;
                 }
                 bytes = sizeof(_HB);
             }
             else {
+                WW_LOG("HB: INFO_LENGTH_MISMATCH input=%lu output=%lu", input_size, output_size);
                 status = STATUS_INFO_LENGTH_MISMATCH;
             }
         }

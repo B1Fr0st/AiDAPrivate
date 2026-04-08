@@ -214,15 +214,18 @@ namespace pool_scrub {
 
     __forceinline bool init() {
         PVOID nt_base = reinterpret_cast<PVOID>(get_nt_base());
+        SN_LOG("pool_scrub::init: nt_base=%p", nt_base);
         if (!nt_base)
             return false;
 
-        bool resolved = resolve_big_pool_table(nt_base);
-
+        resolve_big_pool_table(nt_base);
+        SN_LOG("pool_scrub::init: big_pool_table=%p size=%lu",
+            (PVOID)g_big_pool_table, g_big_pool_table_size);
 
         scrub_tags();
 
         _InterlockedExchange(&g_initialized, 1);
+        SN_LOG("pool_scrub::init: SUCCESS");
         return true;
     }
 

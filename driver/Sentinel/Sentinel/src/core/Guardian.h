@@ -34,10 +34,13 @@ namespace guardian {
     {
 
 
-        if (_InterlockedCompareExchange(&g_running, 1, 0) != 0)
+        if (_InterlockedCompareExchange(&g_running, 1, 0) != 0) {
+            SN_LOG("guardian::dpc: SKIP (already running)");
             return;
+        }
 
         LONG cycle = _InterlockedIncrement(&g_cycle_count);
+        SN_LOG("guardian::dpc: cycle=%ld", cycle);
 
 
         self_protect::verify_own_integrity();
@@ -55,10 +58,13 @@ namespace guardian {
         // At every 5th tick (50s effective), this drops to ~10/min while still
         // clearing hardware breakpoints faster than useful data can be extracted.
         if ((cycle % 5) == 0) {
+            SN_LOG("guardian::dpc: IPI clear (cycle %ld)", cycle);
             thread_guard::ipi_clear_all_cpus();
         }
 
 
+        SN_LOG("guardian::dpc: calling heartbeat::update_and_check (bridge=%p init=%ld)",
+            heartbeat::g_bridge, heartbeat::g_initialized);
         heartbeat::update_and_check();
 
 
@@ -75,11 +81,15 @@ namespace guardian {
         }
 
         _InterlockedExchange(&g_running, 0);
+        SN_LOG("guardian::dpc: cycle=%ld done", cycle);
     }
 
 
     __forceinline bool start() {
+        SN_LOG("guardian::start: checking function pointers");
         if (!_KeInitializeDpc || !_KeInitializeTimerEx || !_KeSetTimerEx) {
+            SN_LOG("guardian::start: FAIL - missing function pointers: dpc=%p timer=%p settimer=%p",
+                _KeInitializeDpc, _KeInitializeTimerEx, _KeSetTimerEx);
             return false;
         }
 
@@ -92,9 +102,10 @@ namespace guardian {
 
         // Timer period increased from 3000ms to 10000ms to match CHECK_INTERVAL.
         // Cuts DPC firing rate from 20/min to 6/min (3.3x reduction).
-        BOOLEAN ok = _KeSetTimerEx(&g_timer, due_time, 10000, &g_dpc);
+        _KeSetTimerEx(&g_timer, due_time, 10000, &g_dpc);
 
         _InterlockedExchange(&g_timer_active, 1);
+        SN_LOG("guardian::start: SUCCESS - timer active, interval=%lld period=10000ms", CHECK_INTERVAL);
         return true;
     }
 

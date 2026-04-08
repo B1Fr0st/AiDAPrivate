@@ -154,8 +154,11 @@ namespace dispatch_guard {
     }
 
     __forceinline bool snapshot(PDRIVER_OBJECT driver_object) {
-        if (!driver_object || !_MmIsAddressValid(driver_object))
+        SN_LOG("dispatch_guard::snapshot: driver_object=%p", driver_object);
+        if (!driver_object || !_MmIsAddressValid(driver_object)) {
+            SN_LOG("dispatch_guard::snapshot: FAIL - invalid driver object");
             return false;
+        }
 
         g_target_driver_object = driver_object;
 
@@ -174,10 +177,12 @@ namespace dispatch_guard {
                 }
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("dispatch_guard::snapshot: EXCEPTION");
             return false;
         }
 
         _InterlockedExchange(&g_initialized, 1);
+        SN_LOG("dispatch_guard::snapshot: SUCCESS, %lu slots captured", MAX_DISPATCH_SLOTS);
         return true;
     }
 

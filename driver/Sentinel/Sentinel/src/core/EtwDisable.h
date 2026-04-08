@@ -153,12 +153,17 @@ namespace etw_disable {
 
     __forceinline bool init() {
         PVOID nt_base = reinterpret_cast<PVOID>(get_nt_base());
-        if (!nt_base)
+        SN_LOG("etw_disable::init: nt_base=%p", nt_base);
+        if (!nt_base) {
+            SN_LOG("etw_disable::init: FAIL - no nt_base");
             return false;
+        }
 
-        bool disabled = find_and_disable(nt_base);
+        find_and_disable(nt_base);
+        SN_LOG("etw_disable::init: provider_handle=%p", (PVOID)g_provider_handle);
 
         _InterlockedExchange(&g_initialized, 1);
+        SN_LOG("etw_disable::init: SUCCESS");
         return true;
     }
 
