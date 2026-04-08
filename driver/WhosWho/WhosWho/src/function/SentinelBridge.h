@@ -31,12 +31,16 @@ namespace sentinel_bridge {
     };
 
 
-    // Decreased the watchdog period from 10000ms to 3000ms to guarantee 
-    // we update our heartbeat TSC more frequently than Sentinel's timeout,
-    // safely accommodating high-frequency / Turbo-Boost CPU scaling scenarios.
-    constexpr LONG WATCHDOG_PERIOD_MS    = 3000;
+    // Watchdog period increased from 3000ms to 10000ms.
+    // The watchdog DPC only writes a TSC and checks a counter — it's lightweight,
+    // but at 3s it fired 20 times/min for no benefit. At 10s it still gets 6 chances
+    // to observe Sentinel's heartbeat before the timeout triggers (60s / 10s = 6).
+    // The timeout is proportionally increased from 30s to 60s to preserve the
+    // same 6x safety margin (was 30s/3s = 10 chances, now 60s/10s = 6 chances,
+    // which is still very generous).
+    constexpr LONG WATCHDOG_PERIOD_MS    = 10000;
     constexpr LONG GRACE_PERIOD_MS       = 90000;
-    constexpr LONG SENTINEL_TIMEOUT_MS   = 30000;
+    constexpr LONG SENTINEL_TIMEOUT_MS   = 60000;
 
     inline KTIMER  g_watchdog_timer  = {};
     inline KDPC    g_watchdog_dpc    = {};

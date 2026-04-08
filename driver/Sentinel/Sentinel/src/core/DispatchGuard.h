@@ -40,22 +40,32 @@ namespace dispatch_guard {
     }
 
 
-    __forceinline bool is_address_in_loaded_module(PVOID address) {
+    // Cached module range array — built once per verify() call, used for all
+    // 28 dispatch slot checks. Previously, each mismatch walked the full module
+    // list (up to 512 entries) independently, totalling up to 28 × 512 = 14,336
+    // list node traversals per DPC tick. Now we walk once (512 max) and do 28
+    // simple array lookups — a 96% reduction in linked-list traversal overhead.
+    constexpr ULONG MAX_CACHED_MODULES = 256;
+
+    struct module_range_t {
+        ULONG_PTR base;
+        ULONG     size;
+    };
+
+    __forceinline ULONG build_module_cache(module_range_t* cache, ULONG max_count) {
         if (!_InterlockedCompareExchange(&g_module_list_initialized, 1, 1))
-            return false;
+            return 0;
 
         if (!g_module_list_head || !_MmIsAddressValid(g_module_list_head))
-            return false;
+            return 0;
 
-        ULONG_PTR addr = reinterpret_cast<ULONG_PTR>(address);
-        if (addr < 0xFFFF800000000000ULL)
-            return false;
+        ULONG count = 0;
 
         __try {
             PLIST_ENTRY entry = g_module_list_head->Flink;
             ULONG safety = 512;
 
-            while (entry && entry != g_module_list_head && safety-- > 0) {
+            while (entry && entry != g_module_list_head && safety-- > 0 && count < max_count) {
                 if (!_MmIsAddressValid(entry))
                     break;
 
@@ -68,18 +78,40 @@ namespace dispatch_guard {
                 ULONG_PTR mod_base = reinterpret_cast<ULONG_PTR>(mod->DllBase);
                 ULONG     mod_size = mod->SizeOfImage;
 
-                if (mod_base && mod_size &&
-                    addr >= mod_base && addr < mod_base + mod_size) {
-                    return true;
+                if (mod_base && mod_size) {
+                    cache[count].base = mod_base;
+                    cache[count].size = mod_size;
+                    count++;
                 }
 
                 entry = entry->Flink;
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            return false;
+            return count;
         }
 
+        return count;
+    }
+
+    __forceinline bool is_address_in_cached_modules(PVOID address,
+                                                     const module_range_t* cache,
+                                                     ULONG count) {
+        ULONG_PTR addr = reinterpret_cast<ULONG_PTR>(address);
+        if (addr < 0xFFFF800000000000ULL)
+            return false;
+
+        for (ULONG i = 0; i < count; i++) {
+            if (addr >= cache[i].base && addr < cache[i].base + cache[i].size)
+                return true;
+        }
         return false;
+    }
+
+    // Legacy function retained for callers outside verify() that do one-off checks.
+    __forceinline bool is_address_in_loaded_module(PVOID address) {
+        module_range_t cache[MAX_CACHED_MODULES];
+        ULONG count = build_module_cache(cache, MAX_CACHED_MODULES);
+        return is_address_in_cached_modules(address, cache, count);
     }
 
 
@@ -171,6 +203,11 @@ namespace dispatch_guard {
         if (!drv_obj || !_MmIsAddressValid(drv_obj))
             return true;
 
+        // Build the module cache ONCE for all 28 slot checks.
+        // Previously each mismatch walked the linked list independently.
+        module_range_t mod_cache[MAX_CACHED_MODULES];
+        ULONG mod_count = build_module_cache(mod_cache, MAX_CACHED_MODULES);
+
         __try {
             for (ULONG i = 0; i < MAX_DISPATCH_SLOTS; i++) {
                 PDRIVER_DISPATCH current_handler = drv_obj->MajorFunction[i];
@@ -179,7 +216,7 @@ namespace dispatch_guard {
                 if (current_handler != g_snapshot[i].handler) {
 
 
-                    if (is_address_in_loaded_module(reinterpret_cast<PVOID>(current_handler))) {
+                    if (is_address_in_cached_modules(reinterpret_cast<PVOID>(current_handler), mod_cache, mod_count)) {
 
 
                         snapshot(drv_obj);
@@ -221,7 +258,7 @@ namespace dispatch_guard {
                             current_prologue,
                             reinterpret_cast<PVOID>(current_handler));
 
-                        if (hook_dest && is_address_in_loaded_module(hook_dest)) {
+                        if (hook_dest && is_address_in_cached_modules(hook_dest, mod_cache, mod_count)) {
                             snapshot(drv_obj);
                             return true;
                         }

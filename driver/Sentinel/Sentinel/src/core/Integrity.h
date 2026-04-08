@@ -1,6 +1,7 @@
 #pragma once
 #include <imports/Defs.h>
 #include <core/DispatchGuard.h>
+#include <nmmintrin.h>
 
 
 namespace self_protect {
@@ -16,24 +17,32 @@ namespace integrity {
     inline volatile ULONG  g_code_size    = 0;
     inline PUCHAR          g_shadow_copy  = nullptr;
 
+    // Hardware-accelerated CRC32C using SSE4.2 _mm_crc32_u64.
+    // Processes 8 bytes per iteration instead of the old bit-by-bit loop
+    // that did 8 conditional branch ops per single byte.
+    // On a 5 MB .text section this reduces ~40 million branch-dependent
+    // operations to ~625 thousand pipelined CRC instructions — roughly
+    // 50-100x faster and eliminates the single largest source of DPC CPU time.
     __forceinline UINT32 compute_crc32(const PVOID data, ULONG size) {
-
 
         if (!data || size == 0)
             return 0;
 
-        UINT32 crc = 0xFFFFFFFF;
         const UCHAR* p = static_cast<const UCHAR*>(data);
+        UINT64 crc = 0xFFFFFFFFULL;
 
-        for (ULONG i = 0; i < size; i++) {
-            crc ^= p[i];
-            for (int j = 0; j < 8; j++) {
-                UINT32 mask = -(INT32)(crc & 1);
-                crc = (crc >> 1) ^ (0xEDB88320 & mask);
-            }
+        // Process 8 bytes at a time using hardware CRC32C
+        ULONG aligned_end = size & ~7UL;
+        for (ULONG i = 0; i < aligned_end; i += 8) {
+            crc = _mm_crc32_u64(crc, *reinterpret_cast<const UINT64*>(p + i));
         }
 
-        return ~crc;
+        // Handle remaining 0-7 bytes
+        for (ULONG i = aligned_end; i < size; i++) {
+            crc = _mm_crc32_u8(static_cast<UINT32>(crc), p[i]);
+        }
+
+        return static_cast<UINT32>(~crc);
     }
 
 

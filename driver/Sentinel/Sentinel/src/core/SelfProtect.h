@@ -80,14 +80,9 @@ namespace self_protect {
 
         __try {
             if (src) {
-                volatile UCHAR* d = static_cast<volatile UCHAR*>(mapped);
-                volatile UCHAR* s = static_cast<volatile UCHAR*>(src);
-                for (SIZE_T i = 0; i < size; i++)
-                    d[i] = s[i];
+                RtlCopyMemory(mapped, src, size);
             } else {
-                volatile UCHAR* d = static_cast<volatile UCHAR*>(mapped);
-                for (SIZE_T i = 0; i < size; i++)
-                    d[i] = 0;
+                RtlZeroMemory(mapped, size);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             _MmUnmapLockedPages(mapped, mdl);

@@ -273,6 +273,7 @@ namespace net_capture {
     NTSTATUS NTAPI callout_notify(UINT32 notifyType, const GUID* filterKey, const void* filter);
 }
 namespace net_fingerprint {
+    inline KSPIN_LOCK g_fp_lock;
     void analyze_tcp_syn(const UINT8* src_addr, UINT32 af,
                          const UINT8* tcp_data, UINT32 tcp_len,
                          UINT32 ip_ttl);
@@ -314,6 +315,10 @@ namespace net_inject {
     NTSTATUS inject_packet(p_packet_inject_request request);
     void cleanup();
     extern HANDLE g_inject_handle_v4;
+    extern HANDLE g_inject_handle_net_v4;
+    typedef UINT32(NTAPI* fn_FwpsQueryPacketInjectionState0)(
+        HANDLE injectionHandle, PVOID netBufferList, HANDLE* injectionContext);
+    extern fn_FwpsQueryPacketInjectionState0 _FwpsQueryPacketInjectionState0;
 }
 namespace net_checksum {
     UINT16 ip_checksum(const UINT8* ip_header, UINT32 header_len);
@@ -323,7 +328,7 @@ namespace net_checksum {
 }
 namespace net_seq_delta {
     SEQ_DELTA_ENTRY* find_or_create(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port);
-    void apply_delta(UINT8* tcp_header, UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port, BOOLEAN is_outbound);
+    BOOLEAN apply_delta(UINT8* tcp_header, UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port, BOOLEAN is_outbound);
     void record_size_change(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port, BOOLEAN is_outbound, LONG32 delta);
     void cleanup_expired();
     void handle_fin_rst(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port);
@@ -758,6 +763,7 @@ namespace net_capture {
                 } else {
                     while (pos < data_len && data[pos] != 0) {
                         if ((data[pos] & 0xC0) == 0xC0) { pos += 2; goto after_name; }
+                        if (data[pos] > 63) break;
                         pos += data[pos] + 1;
                     }
                     pos++;
@@ -818,6 +824,20 @@ namespace net_capture {
         if (!classifyOut) return;
 
         classifyOut->actionType = FWP_ACTION_PERMIT_;
+
+        // Skip packets we injected ourselves (prevents infinite reinjection loops)
+        if (layerData && net_inject::_FwpsQueryPacketInjectionState0) {
+            if (net_inject::g_inject_handle_v4) {
+                UINT32 state = net_inject::_FwpsQueryPacketInjectionState0(
+                    net_inject::g_inject_handle_v4, layerData, nullptr);
+                if (state == 1 || state == 3) return; // INJECTED_BY_SELF or PREVIOUSLY_INJECTED_BY_SELF
+            }
+            if (net_inject::g_inject_handle_net_v4) {
+                UINT32 state = net_inject::_FwpsQueryPacketInjectionState0(
+                    net_inject::g_inject_handle_net_v4, layerData, nullptr);
+                if (state == 1 || state == 3) return;
+            }
+        }
 
         if (!inFixedValues || !inMetaValues) return;
         if (!should_process_packet_pipeline()) {
@@ -912,32 +932,150 @@ namespace net_capture {
             net_bw::record_traffic(pid, 0, pkt_len);
 
 
-            if (pkt_len > 0) {
-                UINT32 orig_len = pkt_len;
-                BOOLEAN was_modified = net_mod::apply_modifications(pkt_data, &pkt_len, NET_PKT_MAX_PAYLOAD,
-                                            0, protocol, remote_port, pid);
-                if (was_modified && protocol == 6 && pkt_len != orig_len) {
-                    UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
-                                 ((UINT32)local_ip[2] << 8) | local_ip[3];
-                    UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
-                                 ((UINT32)remote_ip[2] << 8) | remote_ip[3];
-                    LONG32 delta = (LONG32)pkt_len - (LONG32)orig_len;
-                    net_seq_delta::record_size_change(rip, lip, (UINT16)remote_port, (UINT16)local_port, FALSE, delta);
+            if (pkt_len >= 12 && protocol == 17 && remote_port == 53 &&
+                net_dns_spoof::has_active_rules()) {
+                UINT16 dns_flags = ((UINT16)pkt_data[2] << 8) | pkt_data[3];
+                BOOLEAN is_dns_response = (dns_flags & 0x8000) != 0;
+                UINT16 qdcount = ((UINT16)pkt_data[4] << 8) | pkt_data[5];
+                if (is_dns_response && qdcount > 0 && qdcount <= 16) {
+                    char spoof_domain[260] = {};
+                    UINT32 qpos = parse_dns_name(pkt_data, 12, pkt_len, spoof_domain, sizeof(spoof_domain));
+                    if (qpos != 0 && qpos + 4 <= pkt_len && spoof_domain[0] != '\0') {
+                        UINT8 spoof_addr[16] = {};
+                        UINT32 spoof_af = 0;
+                        UINT32 spoof_ttl = 0;
+                        if (net_dns_spoof::check_spoof(spoof_domain, spoof_addr, &spoof_af, &spoof_ttl)) {
+                            UINT16 qtype = ((UINT16)pkt_data[qpos] << 8) | pkt_data[qpos + 1];
+                            UINT32 ans_pos = qpos + 4;
+                            UINT16 ancount = ((UINT16)pkt_data[6] << 8) | pkt_data[7];
+                            BOOLEAN spoofed = FALSE;
+                            for (UINT16 ai = 0; ai < ancount && ans_pos < pkt_len; ai++) {
+                                if ((pkt_data[ans_pos] & 0xC0) == 0xC0) {
+                                    ans_pos += 2;
+                                } else {
+                                    while (ans_pos < pkt_len && pkt_data[ans_pos] != 0) {
+                                        if ((pkt_data[ans_pos] & 0xC0) == 0xC0) { ans_pos += 2; goto spoof_after_name; }
+                                        if (pkt_data[ans_pos] > 63) break;
+                                        ans_pos += pkt_data[ans_pos] + 1;
+                                    }
+                                    ans_pos++;
+                                }
+                                spoof_after_name:
+                                if (ans_pos + 10 > pkt_len) break;
+                                UINT16 atype = ((UINT16)pkt_data[ans_pos] << 8) | pkt_data[ans_pos + 1];
+                                ans_pos += 4;
+                                UINT32 ttl_pos = ans_pos;
+                                ans_pos += 4;
+                                UINT16 rdlength = ((UINT16)pkt_data[ans_pos] << 8) | pkt_data[ans_pos + 1];
+                                ans_pos += 2;
+                                if (atype == 1 && rdlength == 4 && ans_pos + 4 <= pkt_len && spoof_af == 2) {
+                                    pkt_data[ttl_pos] = (UINT8)(spoof_ttl >> 24);
+                                    pkt_data[ttl_pos + 1] = (UINT8)(spoof_ttl >> 16);
+                                    pkt_data[ttl_pos + 2] = (UINT8)(spoof_ttl >> 8);
+                                    pkt_data[ttl_pos + 3] = (UINT8)(spoof_ttl);
+                                    strong::kmemcpy(&pkt_data[ans_pos], spoof_addr, 4);
+                                    spoofed = TRUE;
+                                } else if (atype == 28 && rdlength == 16 && ans_pos + 16 <= pkt_len && spoof_af == 23) {
+                                    pkt_data[ttl_pos] = (UINT8)(spoof_ttl >> 24);
+                                    pkt_data[ttl_pos + 1] = (UINT8)(spoof_ttl >> 16);
+                                    pkt_data[ttl_pos + 2] = (UINT8)(spoof_ttl >> 8);
+                                    pkt_data[ttl_pos + 3] = (UINT8)(spoof_ttl);
+                                    strong::kmemcpy(&pkt_data[ans_pos], spoof_addr, 16);
+                                    spoofed = TRUE;
+                                }
+                                ans_pos += rdlength;
+                            }
+                            if (spoofed) {
+                                NET_DBG("classify_inbound: DNS SPOOFED domain=%s", spoof_domain);
+                                packet_inject_request inj = {};
+                                inj.direction = 0;
+                                inj.protocol = 17;
+                                inj.address_family = 2;
+                                inj.src_port = remote_port;
+                                inj.dst_port = local_port;
+                                strong::kmemcpy(inj.src_addr, remote_ip, 4);
+                                strong::kmemcpy(inj.dst_addr, local_ip, 4);
+                                inj.payload_size = pkt_len;
+                                strong::kmemcpy(inj.payload, pkt_data, pkt_len);
+                                classifyOut->actionType = FWP_ACTION_BLOCK_;
+                                classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
+                                net_inject::inject_packet(&inj);
+                                return;
+                            }
+                        }
+                    }
                 }
             }
 
+
+            BOOLEAN needs_reinject = FALSE;
 
             if (protocol == 6 && pkt_len >= 20) {
                 UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
                              ((UINT32)local_ip[2] << 8) | local_ip[3];
                 UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
                              ((UINT32)remote_ip[2] << 8) | remote_ip[3];
-                net_seq_delta::apply_delta(pkt_data, rip, lip, (UINT16)remote_port, (UINT16)local_port, FALSE);
-
+                needs_reinject = net_seq_delta::apply_delta(pkt_data, rip, lip, (UINT16)remote_port, (UINT16)local_port, FALSE);
 
                 UINT8 tcp_flags = pkt_data[13];
                 if (tcp_flags & 0x05) {
                     net_seq_delta::handle_fin_rst(rip, lip, (UINT16)remote_port, (UINT16)local_port);
+                }
+            }
+
+
+            if (pkt_len > 0) {
+                UINT32 orig_len = pkt_len;
+                BOOLEAN was_modified = net_mod::apply_modifications(pkt_data, &pkt_len, NET_PKT_MAX_PAYLOAD,
+                                            0, protocol, remote_port, pid);
+                if (was_modified) {
+                    NET_DBG("classify_inbound: MODIFIED proto=%u pid=%u port=%u (len %u->%u)",
+                            protocol, pid, remote_port, orig_len, pkt_len);
+                    if (protocol == 6 && pkt_len != orig_len) {
+                        UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
+                                     ((UINT32)local_ip[2] << 8) | local_ip[3];
+                        UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
+                                     ((UINT32)remote_ip[2] << 8) | remote_ip[3];
+                        LONG32 delta = (LONG32)pkt_len - (LONG32)orig_len;
+                        net_seq_delta::record_size_change(rip, lip, (UINT16)remote_port, (UINT16)local_port, FALSE, delta);
+                    }
+                    needs_reinject = TRUE;
+                }
+            }
+
+
+            if (needs_reinject && pkt_len > 0) {
+                if (net_inject::g_inject_handle_v4) {
+                    packet_inject_request inj = {};
+                    inj.direction = 0;
+                    inj.protocol = protocol;
+                    inj.address_family = 2;
+                    inj.src_port = remote_port;
+                    inj.dst_port = local_port;
+                    strong::kmemcpy(inj.src_addr, remote_ip, 4);
+                    strong::kmemcpy(inj.dst_addr, local_ip, 4);
+                    UINT32 hdr_skip = 0;
+                    if (protocol == 6 && pkt_len >= 20) {
+                        hdr_skip = ((UINT32)(pkt_data[12] >> 4)) * 4;
+                        if (hdr_skip < 20) hdr_skip = 20;
+                        if (hdr_skip > pkt_len) hdr_skip = pkt_len;
+                        inj.tcp_seq = ((UINT32)pkt_data[4] << 24) | ((UINT32)pkt_data[5] << 16) |
+                                      ((UINT32)pkt_data[6] << 8) | pkt_data[7];
+                        inj.tcp_ack = ((UINT32)pkt_data[8] << 24) | ((UINT32)pkt_data[9] << 16) |
+                                      ((UINT32)pkt_data[10] << 8) | pkt_data[11];
+                        inj.tcp_flags = pkt_data[13];
+                    }
+                    inj.payload_size = pkt_len - hdr_skip;
+                    if (inj.payload_size > 0)
+                        strong::kmemcpy(inj.payload, pkt_data + hdr_skip, inj.payload_size);
+                    classifyOut->actionType = FWP_ACTION_BLOCK_;
+                    classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
+                    net_inject::inject_packet(&inj);
+                } else {
+                    NET_ERR("classify_inbound: packet modified/delta-adjusted but inject handle unavailable, blocking proto=%u pid=%u", protocol, pid);
+                    classifyOut->actionType = FWP_ACTION_BLOCK_;
+                    classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
+                    return;
                 }
             }
 
@@ -1000,6 +1138,20 @@ namespace net_capture {
         if (!classifyOut) return;
 
         classifyOut->actionType = FWP_ACTION_PERMIT_;
+
+        // Skip packets we injected ourselves (prevents infinite reinjection loops)
+        if (layerData && net_inject::_FwpsQueryPacketInjectionState0) {
+            if (net_inject::g_inject_handle_v4) {
+                UINT32 state = net_inject::_FwpsQueryPacketInjectionState0(
+                    net_inject::g_inject_handle_v4, layerData, nullptr);
+                if (state == 1 || state == 3) return; // INJECTED_BY_SELF or PREVIOUSLY_INJECTED_BY_SELF
+            }
+            if (net_inject::g_inject_handle_net_v4) {
+                UINT32 state = net_inject::_FwpsQueryPacketInjectionState0(
+                    net_inject::g_inject_handle_net_v4, layerData, nullptr);
+                if (state == 1 || state == 3) return;
+            }
+        }
 
         if (!inFixedValues || !inMetaValues) return;
         if (!should_process_packet_pipeline()) {
@@ -1093,32 +1245,111 @@ namespace net_capture {
             net_bw::record_traffic(pid, 1, pkt_len);
 
 
-            if (pkt_len > 0) {
-                UINT32 orig_len = pkt_len;
-                BOOLEAN was_modified = net_mod::apply_modifications(pkt_data, &pkt_len, NET_PKT_MAX_PAYLOAD,
-                                            1, protocol, remote_port, pid);
-                if (was_modified && protocol == 6 && pkt_len != orig_len) {
-                    UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
-                                 ((UINT32)local_ip[2] << 8) | local_ip[3];
-                    UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
-                                 ((UINT32)remote_ip[2] << 8) | remote_ip[3];
-                    LONG32 delta = (LONG32)pkt_len - (LONG32)orig_len;
-                    net_seq_delta::record_size_change(lip, rip, (UINT16)local_port, (UINT16)remote_port, TRUE, delta);
+            if (pkt_len > 0 && net_redirect::has_active_rules()) {
+                UINT32 redir_port = 0;
+                UINT8 redir_addr[16] = {};
+                if (net_redirect::check_redirect(protocol, remote_port, remote_ip, 2, &redir_port, redir_addr)) {
+                    NET_DBG("classify_outbound: REDIRECTING proto=%u pid=%u port=%u -> %u.%u.%u.%u:%u",
+                            protocol, pid, remote_port,
+                            redir_addr[0], redir_addr[1], redir_addr[2], redir_addr[3], redir_port);
+                    packet_inject_request inj = {};
+                    inj.direction = 1;
+                    inj.protocol = protocol;
+                    inj.address_family = 2;
+                    inj.src_port = local_port;
+                    inj.dst_port = redir_port;
+                    strong::kmemcpy(inj.src_addr, local_ip, 4);
+                    strong::kmemcpy(inj.dst_addr, redir_addr, 4);
+                    UINT32 hdr_skip = 0;
+                    if (protocol == 6 && pkt_len >= 20) {
+                        hdr_skip = ((UINT32)(pkt_data[12] >> 4)) * 4;
+                        if (hdr_skip < 20) hdr_skip = 20;
+                        if (hdr_skip > pkt_len) hdr_skip = pkt_len;
+                        inj.tcp_seq = ((UINT32)pkt_data[4] << 24) | ((UINT32)pkt_data[5] << 16) |
+                                      ((UINT32)pkt_data[6] << 8) | pkt_data[7];
+                        inj.tcp_ack = ((UINT32)pkt_data[8] << 24) | ((UINT32)pkt_data[9] << 16) |
+                                      ((UINT32)pkt_data[10] << 8) | pkt_data[11];
+                        inj.tcp_flags = pkt_data[13];
+                    }
+                    inj.payload_size = pkt_len - hdr_skip;
+                    if (inj.payload_size > 0)
+                        strong::kmemcpy(inj.payload, pkt_data + hdr_skip, inj.payload_size);
+                    classifyOut->actionType = FWP_ACTION_BLOCK_;
+                    classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
+                    net_inject::inject_packet(&inj);
+                    return;
                 }
             }
 
+
+            BOOLEAN needs_reinject_out = FALSE;
 
             if (protocol == 6 && pkt_len >= 20) {
                 UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
                              ((UINT32)local_ip[2] << 8) | local_ip[3];
                 UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
                              ((UINT32)remote_ip[2] << 8) | remote_ip[3];
-                net_seq_delta::apply_delta(pkt_data, lip, rip, (UINT16)local_port, (UINT16)remote_port, TRUE);
-
+                needs_reinject_out = net_seq_delta::apply_delta(pkt_data, lip, rip, (UINT16)local_port, (UINT16)remote_port, TRUE);
 
                 UINT8 tcp_flags = pkt_data[13];
                 if (tcp_flags & 0x05) {
                     net_seq_delta::handle_fin_rst(lip, rip, (UINT16)local_port, (UINT16)remote_port);
+                }
+            }
+
+
+            if (pkt_len > 0) {
+                UINT32 orig_len = pkt_len;
+                BOOLEAN was_modified = net_mod::apply_modifications(pkt_data, &pkt_len, NET_PKT_MAX_PAYLOAD,
+                                            1, protocol, remote_port, pid);
+                if (was_modified) {
+                    NET_DBG("classify_outbound: MODIFIED proto=%u pid=%u port=%u (len %u->%u)",
+                            protocol, pid, remote_port, orig_len, pkt_len);
+                    if (protocol == 6 && pkt_len != orig_len) {
+                        UINT32 lip = ((UINT32)local_ip[0] << 24) | ((UINT32)local_ip[1] << 16) |
+                                     ((UINT32)local_ip[2] << 8) | local_ip[3];
+                        UINT32 rip = ((UINT32)remote_ip[0] << 24) | ((UINT32)remote_ip[1] << 16) |
+                                     ((UINT32)remote_ip[2] << 8) | remote_ip[3];
+                        LONG32 delta = (LONG32)pkt_len - (LONG32)orig_len;
+                        net_seq_delta::record_size_change(lip, rip, (UINT16)local_port, (UINT16)remote_port, TRUE, delta);
+                    }
+                    needs_reinject_out = TRUE;
+                }
+            }
+
+
+            if (needs_reinject_out && pkt_len > 0) {
+                if (net_inject::g_inject_handle_v4) {
+                    packet_inject_request inj = {};
+                    inj.direction = 1;
+                    inj.protocol = protocol;
+                    inj.address_family = 2;
+                    inj.src_port = local_port;
+                    inj.dst_port = remote_port;
+                    strong::kmemcpy(inj.src_addr, local_ip, 4);
+                    strong::kmemcpy(inj.dst_addr, remote_ip, 4);
+                    UINT32 hdr_skip = 0;
+                    if (protocol == 6 && pkt_len >= 20) {
+                        hdr_skip = ((UINT32)(pkt_data[12] >> 4)) * 4;
+                        if (hdr_skip < 20) hdr_skip = 20;
+                        if (hdr_skip > pkt_len) hdr_skip = pkt_len;
+                        inj.tcp_seq = ((UINT32)pkt_data[4] << 24) | ((UINT32)pkt_data[5] << 16) |
+                                      ((UINT32)pkt_data[6] << 8) | pkt_data[7];
+                        inj.tcp_ack = ((UINT32)pkt_data[8] << 24) | ((UINT32)pkt_data[9] << 16) |
+                                      ((UINT32)pkt_data[10] << 8) | pkt_data[11];
+                        inj.tcp_flags = pkt_data[13];
+                    }
+                    inj.payload_size = pkt_len - hdr_skip;
+                    if (inj.payload_size > 0)
+                        strong::kmemcpy(inj.payload, pkt_data + hdr_skip, inj.payload_size);
+                    classifyOut->actionType = FWP_ACTION_BLOCK_;
+                    classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
+                    net_inject::inject_packet(&inj);
+                } else {
+                    NET_ERR("classify_outbound: packet modified/delta-adjusted but inject handle unavailable, blocking proto=%u pid=%u", protocol, pid);
+                    classifyOut->actionType = FWP_ACTION_BLOCK_;
+                    classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
+                    return;
                 }
             }
 
@@ -1668,6 +1899,16 @@ namespace net_capture {
             if (_FwpmSubLayerDeleteByKey0) {
                 _FwpmSubLayerDeleteByKey0(g_engine_handle, &GUID_AIDA_SUBLAYER);
             }
+            if (_FwpmCalloutDeleteById0) {
+                if (g_callout_id_inbound)
+                    _FwpmCalloutDeleteById0(g_engine_handle, g_callout_id_inbound);
+                if (g_callout_id_outbound)
+                    _FwpmCalloutDeleteById0(g_engine_handle, g_callout_id_outbound);
+                if (g_callout_id_ale_connect)
+                    _FwpmCalloutDeleteById0(g_engine_handle, g_callout_id_ale_connect);
+                if (g_callout_id_ale_recv)
+                    _FwpmCalloutDeleteById0(g_engine_handle, g_callout_id_ale_recv);
+            }
             _FwpmEngineClose0(g_engine_handle);
             g_engine_handle = nullptr;
         }
@@ -1699,8 +1940,11 @@ namespace net_capture {
         }
         if (prev == 1) {
             NET_DBG("initialize: concurrent init detected, waiting...");
-            while (_InterlockedCompareExchange(&g_wfp_initialized, 0, 0) == 1)
+            for (UINT32 spin = 0; spin < 10000000u; spin++) {
+                if (_InterlockedCompareExchange(&g_wfp_initialized, 0, 0) != 1)
+                    break;
                 YieldProcessor();
+            }
             return (g_wfp_initialized == 2) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
         }
 
@@ -1712,6 +1956,7 @@ namespace net_capture {
         KeInitializeSpinLock(&g_seq_delta_lock);
         KeInitializeSpinLock(&g_udp_flow_lock);
         KeInitializeSpinLock(&g_pid_path_lock);
+        KeInitializeSpinLock(&net_fingerprint::g_fp_lock);
 
         net_fragment::init();
 
@@ -1808,6 +2053,8 @@ namespace net_capture {
             ExFreePoolWithTag(g_dns_ring, 'dnNW');
             g_dns_ring = nullptr;
         }
+
+        _InterlockedExchange(&g_wfp_initialized, 0);
     }
 
 }
@@ -2216,12 +2463,27 @@ static VOID aida_store_cached_endpoint_pid(UINT64 endpoint_handle,
 
     KIRQL old_irql;
     KeAcquireSpinLock(&g_endpoint_pid_cache_lock, &old_irql);
-    g_endpoint_pid_cache[slot].endpoint_handle = endpoint_handle;
-    g_endpoint_pid_cache[slot].protocol = protocol;
-    g_endpoint_pid_cache[slot].local_port = local_port;
-    g_endpoint_pid_cache[slot].pid = pid;
+    UINT32 target = slot;
+    UINT32 empty_slot = AIDA_ENDPOINT_PID_CACHE_SIZE;
+    for (UINT32 probe = 0; probe < 4; probe++) {
+        UINT32 idx = (slot + probe) % AIDA_ENDPOINT_PID_CACHE_SIZE;
+        if (!g_endpoint_pid_cache[idx].active) {
+            if (empty_slot == AIDA_ENDPOINT_PID_CACHE_SIZE) empty_slot = idx;
+            continue;
+        }
+        if (g_endpoint_pid_cache[idx].endpoint_handle == endpoint_handle) {
+            target = idx;
+            goto store_endpoint;
+        }
+    }
+    target = (empty_slot != AIDA_ENDPOINT_PID_CACHE_SIZE) ? empty_slot : slot;
+store_endpoint:
+    g_endpoint_pid_cache[target].endpoint_handle = endpoint_handle;
+    g_endpoint_pid_cache[target].protocol = protocol;
+    g_endpoint_pid_cache[target].local_port = local_port;
+    g_endpoint_pid_cache[target].pid = pid;
     KeMemoryBarrier();
-    _InterlockedExchange(&g_endpoint_pid_cache[slot].active, 1);
+    _InterlockedExchange(&g_endpoint_pid_cache[target].active, 1);
     KeReleaseSpinLock(&g_endpoint_pid_cache_lock, old_irql);
 }
 
@@ -2236,11 +2498,26 @@ static VOID aida_store_cached_port_pid(UINT32 protocol,
 
     KIRQL old_irql;
     KeAcquireSpinLock(&g_endpoint_pid_cache_lock, &old_irql);
-    g_port_pid_cache[slot].protocol = protocol;
-    g_port_pid_cache[slot].port = port;
-    g_port_pid_cache[slot].pid = pid;
+    UINT32 target = slot;
+    UINT32 empty_slot = AIDA_ENDPOINT_PID_CACHE_SIZE;
+    for (UINT32 probe = 0; probe < 4; probe++) {
+        UINT32 idx = (slot + probe) % AIDA_ENDPOINT_PID_CACHE_SIZE;
+        if (!g_port_pid_cache[idx].active) {
+            if (empty_slot == AIDA_ENDPOINT_PID_CACHE_SIZE) empty_slot = idx;
+            continue;
+        }
+        if (g_port_pid_cache[idx].protocol == protocol && g_port_pid_cache[idx].port == port) {
+            target = idx;
+            goto store_port;
+        }
+    }
+    target = (empty_slot != AIDA_ENDPOINT_PID_CACHE_SIZE) ? empty_slot : slot;
+store_port:
+    g_port_pid_cache[target].protocol = protocol;
+    g_port_pid_cache[target].port = port;
+    g_port_pid_cache[target].pid = pid;
     KeMemoryBarrier();
-    _InterlockedExchange(&g_port_pid_cache[slot].active, 1);
+    _InterlockedExchange(&g_port_pid_cache[target].active, 1);
     KeReleaseSpinLock(&g_endpoint_pid_cache_lock, old_irql);
 }
 
@@ -2630,6 +2907,8 @@ namespace net_enum {
                                     net_capture::g_pid_path_cache[cache_idx].path[plen] = '\0';
                                 }
                                 KeReleaseSpinLock(&net_capture::g_pid_path_lock, old_irql);
+                            } else if (image_name) {
+                                ExFreePool(image_name);
                             }
                             ObDereferenceObject(process);
                         }
@@ -3445,6 +3724,8 @@ namespace net_inject {
     typedef NTSTATUS(NTAPI* fn_FwpsInjectionHandleCreate0)(
         UINT16 addressFamily, UINT32 flags, HANDLE* injectionHandle);
     typedef NTSTATUS(NTAPI* fn_FwpsInjectionHandleDestroy0)(HANDLE injectionHandle);
+    typedef UINT32(NTAPI* fn_FwpsQueryPacketInjectionState0)(
+        HANDLE injectionHandle, PVOID netBufferList, HANDLE* injectionContext);
     typedef PVOID(NTAPI* fn_NdisAllocateNetBufferListPool)(
         NDIS_HANDLE ndisHandle, PNET_BUFFER_LIST_POOL_PARAMETERS parameters);
     typedef VOID(NTAPI* fn_NdisFreeNetBufferListPool)(PVOID poolHandle);
@@ -3479,6 +3760,7 @@ namespace net_inject {
 
     inline fn_FwpsInjectionHandleCreate0         _FwpsInjectionHandleCreate0   = nullptr;
     inline fn_FwpsInjectionHandleDestroy0        _FwpsInjectionHandleDestroy0  = nullptr;
+    inline fn_FwpsQueryPacketInjectionState0     _FwpsQueryPacketInjectionState0 = nullptr;
     inline fn_NdisAllocateNetBufferListPool      _NdisAllocateNetBufferListPool = nullptr;
     inline fn_NdisFreeNetBufferListPool          _NdisFreeNetBufferListPool     = nullptr;
     inline fn_FwpsAllocateNetBufferAndNetBufferList0 _FwpsAllocateNBL0         = nullptr;
@@ -3645,6 +3927,7 @@ namespace net_inject {
         CHAR f6[] = {'F','w','p','s','I','n','j','e','c','t','T','r','a','n','s','p','o','r','t','R','e','c','e','i','v','e','A','s','y','n','c','0',0};
         CHAR f7[] = {'F','w','p','s','I','n','j','e','c','t','N','e','t','w','o','r','k','S','e','n','d','A','s','y','n','c','0',0};
         CHAR f8[] = {'F','w','p','s','I','n','j','e','c','t','N','e','t','w','o','r','k','R','e','c','e','i','v','e','A','s','y','n','c','0',0};
+        CHAR f9[] = {'F','w','p','s','Q','u','e','r','y','P','a','c','k','e','t','I','n','j','e','c','t','i','o','n','S','t','a','t','e','0',0};
         CHAR n1[] = {'N','d','i','s','A','l','l','o','c','a','t','e','N','e','t','B','u','f','f','e','r','L','i','s','t','P','o','o','l',0};
         CHAR n2[] = {'N','d','i','s','F','r','e','e','N','e','t','B','u','f','f','e','r','L','i','s','t','P','o','o','l',0};
 
@@ -3659,6 +3942,7 @@ namespace net_inject {
         *(PVOID*)&_FwpsInjectRecv0 = GetProcAddress(fwp_base, f6);
         *(PVOID*)&_FwpsInjectNetSend0 = GetProcAddress(fwp_base, f7);
         *(PVOID*)&_FwpsInjectNetRecv0 = GetProcAddress(fwp_base, f8);
+        *(PVOID*)&_FwpsQueryPacketInjectionState0 = GetProcAddress(fwp_base, f9);
         if (ndis_base) {
             *(PVOID*)&_NdisAllocateNetBufferListPool = GetProcAddress(ndis_base, n1);
             *(PVOID*)&_NdisFreeNetBufferListPool = GetProcAddress(ndis_base, n2);
@@ -4150,8 +4434,8 @@ namespace net_seq_delta {
         return nullptr;
     }
 
-    void apply_delta(UINT8* tcp_header, UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port, BOOLEAN is_outbound) {
-        if (!tcp_header) return;
+    BOOLEAN apply_delta(UINT8* tcp_header, UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port, BOOLEAN is_outbound) {
+        if (!tcp_header) return FALSE;
 
         KIRQL old_irql;
         KeAcquireSpinLock(&net_capture::g_seq_delta_lock, &old_irql);
@@ -4171,7 +4455,7 @@ namespace net_seq_delta {
 
         if (!entry || (entry->outbound_delta == 0 && entry->inbound_delta == 0)) {
             KeReleaseSpinLock(&net_capture::g_seq_delta_lock, old_irql);
-            return;
+            return FALSE;
         }
 
 
@@ -4199,6 +4483,7 @@ namespace net_seq_delta {
         }
 
         KeReleaseSpinLock(&net_capture::g_seq_delta_lock, old_irql);
+        return TRUE;
     }
 
     void record_size_change(UINT32 src_ip, UINT32 dst_ip, UINT16 src_port, UINT16 dst_port, BOOLEAN is_outbound, LONG32 delta) {
@@ -4557,7 +4842,7 @@ namespace net_mod {
         BOOLEAN modified = FALSE;
 
         for (UINT32 r = 0; r < MOD_MAX_RULES; r++) {
-            if (!g_mod_rules[r].active) continue;
+            if (g_mod_rules[r].active != 1) continue;
             ACTIVE_MOD_RULE* rule = &g_mod_rules[r];
             if (rule->direction != 2 && rule->direction != direction) continue;
             if (rule->protocol != 0 && rule->protocol != protocol) continue;
@@ -4594,7 +4879,7 @@ namespace net_mod {
                     *data_len = new_len;
                     _InterlockedIncrement(&rule->match_count);
                     modified = TRUE;
-                    i += rule->replace_size - 1;
+                    if (rule->replace_size > 0) i += rule->replace_size - 1;
                 }
             }
         }
@@ -4607,7 +4892,7 @@ namespace net_mod {
         switch (request->operation) {
         case 0: {
             for (UINT32 i = 0; i < MOD_MAX_RULES; i++) {
-                if (!g_mod_rules[i].active) {
+                if (_InterlockedCompareExchange(&g_mod_rules[i].active, 2, 0) == 0) {
                     UINT32 id = (UINT32)_InterlockedIncrement(&g_next_mod_id);
                     g_mod_rules[i].rule_id = id;
                     g_mod_rules[i].direction = request->direction;
@@ -4633,7 +4918,7 @@ namespace net_mod {
         }
         case 1: {
             for (UINT32 i = 0; i < MOD_MAX_RULES; i++) {
-                if (g_mod_rules[i].active && g_mod_rules[i].rule_id == request->rule_id) {
+                if (g_mod_rules[i].active == 1 && g_mod_rules[i].rule_id == request->rule_id) {
                     _InterlockedExchange(&g_mod_rules[i].active, 0);
                     _InterlockedDecrement(&g_active_mod_count);
                     request->active = 0;
@@ -4644,7 +4929,7 @@ namespace net_mod {
         }
         case 3: {
             for (UINT32 i = 0; i < MOD_MAX_RULES; i++) {
-                if (g_mod_rules[i].active) {
+                if (g_mod_rules[i].active == 1) {
                     _InterlockedExchange(&g_mod_rules[i].active, 0);
                     _InterlockedDecrement(&g_active_mod_count);
                 }
@@ -4660,7 +4945,7 @@ namespace net_mod {
         if (!request) return STATUS_INVALID_PARAMETER;
         request->rule_count = 0;
         for (UINT32 i = 0; i < MOD_MAX_RULES && request->rule_count < MOD_MAX_RULES; i++) {
-            if (g_mod_rules[i].active) {
+            if (g_mod_rules[i].active == 1) {
                 PACKET_MOD_RULE* out = &request->rules[request->rule_count];
                 out->rule_id = g_mod_rules[i].rule_id;
                 out->direction = g_mod_rules[i].direction;
@@ -4708,7 +4993,7 @@ namespace net_redirect {
                            UINT32 af, UINT32* new_port, UINT8* new_addr) {
         if (g_active_redir_count == 0) return FALSE;
         for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
-            if (!g_redir_rules[i].active) continue;
+            if (g_redir_rules[i].active != 1) continue;
             ACTIVE_REDIR_RULE* r = &g_redir_rules[i];
             if (r->protocol != 0 && r->protocol != protocol) continue;
             if (r->match_port != 0 && r->match_port != dst_port) continue;
@@ -4731,7 +5016,7 @@ namespace net_redirect {
         switch (request->operation) {
         case 0: {
             for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
-                if (!g_redir_rules[i].active) {
+                if (_InterlockedCompareExchange(&g_redir_rules[i].active, 2, 0) == 0) {
                     UINT32 id = (UINT32)_InterlockedIncrement(&g_next_redir_id);
                     g_redir_rules[i].rule_id = id;
                     g_redir_rules[i].protocol = request->protocol;
@@ -4753,7 +5038,7 @@ namespace net_redirect {
         }
         case 1: {
             for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
-                if (g_redir_rules[i].active && g_redir_rules[i].rule_id == request->rule_id) {
+                if (g_redir_rules[i].active == 1 && g_redir_rules[i].rule_id == request->rule_id) {
                     _InterlockedExchange(&g_redir_rules[i].active, 0);
                     _InterlockedDecrement(&g_active_redir_count);
                     request->active = 0;
@@ -4764,7 +5049,7 @@ namespace net_redirect {
         }
         case 3: {
             for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
-                if (g_redir_rules[i].active) {
+                if (g_redir_rules[i].active == 1) {
                     _InterlockedExchange(&g_redir_rules[i].active, 0);
                     _InterlockedDecrement(&g_active_redir_count);
                 }
@@ -4780,7 +5065,7 @@ namespace net_redirect {
         if (!request) return STATUS_INVALID_PARAMETER;
         request->rule_count = 0;
         for (UINT32 i = 0; i < REDIR_MAX_RULES && request->rule_count < REDIR_MAX_RULES; i++) {
-            if (g_redir_rules[i].active) {
+            if (g_redir_rules[i].active == 1) {
                 TRAFFIC_REDIRECT_RULE* out = &request->rules[request->rule_count];
                 out->rule_id = g_redir_rules[i].rule_id;
                 out->protocol = g_redir_rules[i].protocol;
@@ -4819,13 +5104,10 @@ namespace net_stream {
     } TRACKED_STREAM;
 
     inline TRACKED_STREAM g_streams[MAX_TRACKED_STREAMS] = {};
+    inline volatile LONG g_active_stream_count = 0;
 
     BOOLEAN has_active_streams() {
-        for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
-            if (g_streams[i].active)
-                return TRUE;
-        }
-        return FALSE;
+        return (g_active_stream_count != 0);
     }
 
 
@@ -4833,7 +5115,7 @@ namespace net_stream {
                      const UINT8* src_addr, const UINT8* dst_addr,
                      const UINT8* data, UINT32 data_len) {
         for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
-            if (!g_streams[i].active) continue;
+            if (g_streams[i].active != 1) continue;
 
             BOOLEAN match = FALSE;
             BOOLEAN src_addr_wildcard = net_capture::is_zero_ip(g_streams[i].src_addr);
@@ -4845,7 +5127,7 @@ namespace net_stream {
             if (forward_port_match) {
                 BOOLEAN addr_match = TRUE;
                 if (!src_addr_wildcard) {
-                    for (int j = 0; j < 4; j++) {
+                    for (int j = 0; j < 16; j++) {
                         if (g_streams[i].src_addr[j] != src_addr[j]) {
                             addr_match = FALSE;
                             break;
@@ -4853,7 +5135,7 @@ namespace net_stream {
                     }
                 }
                 if (addr_match && !dst_addr_wildcard) {
-                    for (int j = 0; j < 4; j++) {
+                    for (int j = 0; j < 16; j++) {
                         if (g_streams[i].dst_addr[j] != dst_addr[j]) {
                             addr_match = FALSE;
                             break;
@@ -4869,7 +5151,7 @@ namespace net_stream {
             if (!match && reverse_port_match) {
                 BOOLEAN addr_match = TRUE;
                 if (!src_addr_wildcard) {
-                    for (int j = 0; j < 4; j++) {
+                    for (int j = 0; j < 16; j++) {
                         if (g_streams[i].src_addr[j] != dst_addr[j]) {
                             addr_match = FALSE;
                             break;
@@ -4877,7 +5159,7 @@ namespace net_stream {
                     }
                 }
                 if (addr_match && !dst_addr_wildcard) {
-                    for (int j = 0; j < 4; j++) {
+                    for (int j = 0; j < 16; j++) {
                         if (g_streams[i].dst_addr[j] != src_addr[j]) {
                             addr_match = FALSE;
                             break;
@@ -4912,7 +5194,7 @@ namespace net_stream {
         switch (request->operation) {
         case 0: {
             for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
-                if (!g_streams[i].active) {
+                if (_InterlockedCompareExchange(&g_streams[i].active, 2, 0) == 0) {
                     g_streams[i].src_port = request->src_port;
                     g_streams[i].dst_port = request->dst_port;
                     g_streams[i].pid = request->pid;
@@ -4930,6 +5212,7 @@ namespace net_stream {
                     KeInitializeSpinLock(&g_streams[i].lock);
                     KeMemoryBarrier();
                     _InterlockedExchange(&g_streams[i].active, 1);
+                    _InterlockedIncrement(&g_active_stream_count);
                     return STATUS_SUCCESS;
                 }
             }
@@ -4937,10 +5220,11 @@ namespace net_stream {
         }
         case 1: {
             for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
-                if (g_streams[i].active &&
+                if (g_streams[i].active == 1 &&
                     g_streams[i].src_port == request->src_port &&
                     g_streams[i].dst_port == request->dst_port) {
                     _InterlockedExchange(&g_streams[i].active, 0);
+                    _InterlockedDecrement(&g_active_stream_count);
                     return STATUS_SUCCESS;
                 }
             }
@@ -4948,7 +5232,7 @@ namespace net_stream {
         }
         case 2: {
             for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
-                if (g_streams[i].active &&
+                if (g_streams[i].active == 1 &&
                     g_streams[i].src_port == request->src_port &&
                     g_streams[i].dst_port == request->dst_port) {
                     KIRQL irql;
@@ -4968,7 +5252,7 @@ namespace net_stream {
         case 3: {
             request->stream_count = 0;
             for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
-                if (g_streams[i].active) request->stream_count++;
+                if (g_streams[i].active == 1) request->stream_count++;
             }
             return STATUS_SUCCESS;
         }
@@ -4985,6 +5269,7 @@ namespace net_stream {
                 g_streams[i].stream_data = nullptr;
             }
         }
+        _InterlockedExchange(&g_active_stream_count, 0);
     }
 }
 
@@ -5366,11 +5651,12 @@ namespace net_intercept {
         case 3: {
             KIRQL irql;
             KeAcquireSpinLock(&g_intercept_lock, &irql);
+            packet_inject_request inj = {};
+            BOOLEAN do_inject = FALSE;
             for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
                 if (g_held[i].hold_id == request->hold_id) {
 
                     if (net_inject::g_inject_handle_v4 && g_held[i].payload_size > 0) {
-                        packet_inject_request inj = {};
                         inj.direction = g_held[i].direction;
                         inj.protocol = g_held[i].protocol;
                         inj.address_family = g_held[i].address_family;
@@ -5380,9 +5666,7 @@ namespace net_intercept {
                         strong::kmemcpy(inj.dst_addr, g_held[i].dst_addr, 16);
                         inj.payload_size = g_held[i].payload_size;
                         strong::kmemcpy(inj.payload, g_held[i].payload, g_held[i].payload_size);
-                        KeReleaseSpinLock(&g_intercept_lock, irql);
-                        net_inject::inject_packet(&inj);
-                        KeAcquireSpinLock(&g_intercept_lock, &irql);
+                        do_inject = TRUE;
                     }
                     g_held[i].hold_id = 0;
                     strong::kmemset(&g_held[i], 0, sizeof(HELD_PACKET));
@@ -5392,6 +5676,9 @@ namespace net_intercept {
             }
             request->held_count = g_held_count;
             KeReleaseSpinLock(&g_intercept_lock, irql);
+            if (do_inject) {
+                net_inject::inject_packet(&inj);
+            }
             return STATUS_SUCCESS;
         }
         case 4: {
@@ -5412,12 +5699,13 @@ namespace net_intercept {
         case 5: {
             KIRQL irql;
             KeAcquireSpinLock(&g_intercept_lock, &irql);
+            packet_inject_request inj = {};
+            BOOLEAN do_inject = FALSE;
             for (UINT32 i = 0; i < INTERCEPT_MAX_HELD; i++) {
                 if (g_held[i].hold_id == request->hold_id) {
 
                     if (net_inject::g_inject_handle_v4 && request->modify_payload_size > 0 &&
                         request->modify_payload_size <= INTERCEPT_MAX_PAYLOAD) {
-                        packet_inject_request inj = {};
                         inj.direction = g_held[i].direction;
                         inj.protocol = g_held[i].protocol;
                         inj.address_family = g_held[i].address_family;
@@ -5427,9 +5715,7 @@ namespace net_intercept {
                         strong::kmemcpy(inj.dst_addr, g_held[i].dst_addr, 16);
                         inj.payload_size = request->modify_payload_size;
                         strong::kmemcpy(inj.payload, request->modify_payload, request->modify_payload_size);
-                        KeReleaseSpinLock(&g_intercept_lock, irql);
-                        net_inject::inject_packet(&inj);
-                        KeAcquireSpinLock(&g_intercept_lock, &irql);
+                        do_inject = TRUE;
                     }
                     g_held[i].hold_id = 0;
                     strong::kmemset(&g_held[i], 0, sizeof(HELD_PACKET));
@@ -5439,6 +5725,9 @@ namespace net_intercept {
             }
             request->held_count = g_held_count;
             KeReleaseSpinLock(&g_intercept_lock, irql);
+            if (do_inject) {
+                net_inject::inject_packet(&inj);
+            }
             return STATUS_SUCCESS;
         }
         default:
@@ -6035,7 +6324,7 @@ namespace net_bw {
 
         INT32 free_slot = -1;
         for (UINT32 i = 0; i < BW_MAX_PROCESSES; i++) {
-            if (g_bw_entries[i].active && g_bw_entries[i].pid == pid) {
+            if (g_bw_entries[i].active == 1 && g_bw_entries[i].pid == pid) {
                 if (direction == 0) {
                     _InterlockedExchangeAdd64(&g_bw_entries[i].bytes_recv, bytes);
                     _InterlockedIncrement64(&g_bw_entries[i].packets_recv);
@@ -6051,20 +6340,22 @@ namespace net_bw {
             if (!g_bw_entries[i].active && free_slot == -1) free_slot = i;
         }
         if (free_slot >= 0) {
-            g_bw_entries[free_slot].pid = pid;
-            g_bw_entries[free_slot].bytes_sent = 0;
-            g_bw_entries[free_slot].bytes_recv = 0;
-            g_bw_entries[free_slot].packets_sent = 0;
-            g_bw_entries[free_slot].packets_recv = 0;
-            if (direction == 0)
-                g_bw_entries[free_slot].bytes_recv = bytes;
-            else
-                g_bw_entries[free_slot].bytes_sent = bytes;
-            LARGE_INTEGER ts;
-            KeQuerySystemTime(&ts);
-            g_bw_entries[free_slot].last_activity = ts.QuadPart;
-            KeMemoryBarrier();
-            _InterlockedExchange(&g_bw_entries[free_slot].active, 1);
+            if (_InterlockedCompareExchange(&g_bw_entries[free_slot].active, 2, 0) == 0) {
+                g_bw_entries[free_slot].pid = pid;
+                g_bw_entries[free_slot].bytes_sent = 0;
+                g_bw_entries[free_slot].bytes_recv = 0;
+                g_bw_entries[free_slot].packets_sent = 0;
+                g_bw_entries[free_slot].packets_recv = 0;
+                if (direction == 0)
+                    g_bw_entries[free_slot].bytes_recv = bytes;
+                else
+                    g_bw_entries[free_slot].bytes_sent = bytes;
+                LARGE_INTEGER ts;
+                KeQuerySystemTime(&ts);
+                g_bw_entries[free_slot].last_activity = ts.QuadPart;
+                KeMemoryBarrier();
+                _InterlockedExchange(&g_bw_entries[free_slot].active, 1);
+            }
         }
     }
 
@@ -6119,7 +6410,7 @@ namespace net_bw {
         case 4: {
             request->process_count = 0;
             for (UINT32 i = 0; i < BW_MAX_PROCESSES && request->process_count < BW_MAX_PROCESSES; i++) {
-                if (g_bw_entries[i].active) {
+                if (g_bw_entries[i].active == 1) {
                     if (request->filter_pid != 0 && g_bw_entries[i].pid != request->filter_pid) continue;
                     BW_PROCESS_ENTRY* out = &request->processes[request->process_count];
                     out->pid = g_bw_entries[i].pid;
@@ -6305,6 +6596,12 @@ namespace net_pcap {
                 strong::kmemcpy(&rec->data[16], pkt->local_addr, 4);
             }
 
+            {
+                UINT16 cksum = net_checksum::ip_checksum(rec->data, ip_header_len);
+                rec->data[10] = (UINT8)(cksum >> 8);
+                rec->data[11] = (UINT8)(cksum & 0xFF);
+            }
+
 
             UINT32 payload_copy = pkt->payload_size;
             if (ip_header_len + payload_copy > PCAP_RECORD_MAX_SIZE)
@@ -6332,7 +6629,6 @@ namespace net_fingerprint {
     inline NET_FINGERPRINT_ENTRY g_fp_entries[FINGERPRINT_MAX] = {};
     inline volatile LONG g_fp_count = 0;
     inline volatile LONG g_fp_active = 0;
-    inline KSPIN_LOCK g_fp_lock;
 
     BOOLEAN is_active() {
         return (g_fp_active != 0);
@@ -6482,7 +6778,6 @@ namespace net_fingerprint {
 
         switch (request->operation) {
         case 0:
-            KeInitializeSpinLock(&g_fp_lock);
             _InterlockedExchange(&g_fp_active, 1);
             return STATUS_SUCCESS;
         case 1:

@@ -152,7 +152,7 @@ namespace pml4
                     goto cleanup;
                 }
 
-                if ((total_pages_checked & 0xFFF) == 0) {
+                if ((total_pages_checked & 0xFF) == 0) {
                     YieldProcessor();
                 }
 

@@ -17,7 +17,12 @@ namespace heartbeat {
 
     constexpr ULONG  BRIDGE_MAGIC = 0x57484F53;
     constexpr ULONG  BRIDGE_VERSION = 1;
-    constexpr UINT64 HEARTBEAT_TIMEOUT_TSC = 30ULL * 3000000000ULL;
+    // Increased from 30s to 60s to match WhosWho's new SENTINEL_TIMEOUT_MS = 60000.
+    // With the Guardian DPC now firing every 10s (was 3s), Sentinel updates its
+    // bridge TSC every 10s. WhosWho needs at least 6 missed updates (60s) before
+    // concluding Sentinel is dead. Sentinel mirrors this: if WhosWho hasn't
+    // updated its TSC in 60s, something is wrong.
+    constexpr UINT64 HEARTBEAT_TIMEOUT_TSC = 60ULL * 3000000000ULL;
 
     inline volatile sentinel_bridge_t* g_bridge = nullptr;
     inline volatile UINT64             g_last_whoswho_tsc = 0;

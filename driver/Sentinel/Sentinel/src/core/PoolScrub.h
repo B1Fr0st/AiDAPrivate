@@ -37,6 +37,8 @@ namespace pool_scrub {
     constexpr ULONG TAG_MAP_COUNT = sizeof(g_tag_map) / sizeof(g_tag_map[0]);
 
 
+    // Page-level MmIsAddressValid — same optimization as CallbackScanner.h.
+    // Eliminates thousands of redundant PFN lock acquisitions per pattern scan.
     __forceinline PVOID find_pattern_safe(PVOID start, ULONG size,
                                           const UCHAR* pattern, const char* mask) {
         if (!start || !pattern || !mask || size == 0)
@@ -48,24 +50,33 @@ namespace pool_scrub {
             return nullptr;
 
         const UCHAR* base = static_cast<const UCHAR*>(start);
+        constexpr ULONG page_size = 0x1000;
 
         __try {
-            for (ULONG i = 0; i <= size - mask_len; i++) {
-                if (!_MmIsAddressValid((PVOID)(base + i)))
-                    continue;
+            for (ULONG i = 0; i <= size - mask_len; ) {
+                ULONG_PTR current_addr = reinterpret_cast<ULONG_PTR>(base + i);
+                ULONG_PTR current_page = current_addr & ~(static_cast<ULONG_PTR>(page_size) - 1);
 
-                bool found = true;
-                for (ULONG j = 0; j < mask_len && found; j++) {
-                    if (!_MmIsAddressValid((PVOID)(base + i + j))) {
-                        found = false;
-                        break;
-                    }
-                    if (mask[j] == 'x' && base[i + j] != pattern[j])
-                        found = false;
+                if (!_MmIsAddressValid(reinterpret_cast<PVOID>(current_page))) {
+                    ULONG_PTR next_page = current_page + page_size;
+                    ULONG skip = static_cast<ULONG>(next_page - current_addr);
+                    i += skip;
+                    continue;
                 }
 
-                if (found)
-                    return (PVOID)(base + i);
+                ULONG_PTR page_end = current_page + page_size;
+                ULONG max_this_page = static_cast<ULONG>(page_end - reinterpret_cast<ULONG_PTR>(base));
+                if (max_this_page > size) max_this_page = size;
+
+                for (; i <= max_this_page - mask_len && i <= size - mask_len; ++i) {
+                    bool found = true;
+                    for (ULONG j = 0; j < mask_len && found; j++) {
+                        if (mask[j] == 'x' && base[i + j] != pattern[j])
+                            found = false;
+                    }
+                    if (found)
+                        return (PVOID)(base + i);
+                }
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             return nullptr;
