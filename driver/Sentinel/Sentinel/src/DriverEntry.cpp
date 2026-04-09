@@ -248,11 +248,8 @@ static VOID DeleteDriverOnDisk(PUNICODE_STRING RegistryPath) {
         return;
     }
 
-#pragma warning(push)
-#pragma warning(disable: 4996)
     auto kvInfo = static_cast<PKEY_VALUE_PARTIAL_INFORMATION>(
-        ExAllocatePoolWithTag(NonPagedPool, kvSize, TAG_DEL));
-#pragma warning(pop)
+        ExAllocatePool2(POOL_FLAG_NON_PAGED, kvSize, TAG_DEL));
 
     if (!kvInfo) {
         _ZwClose(keyHandle);

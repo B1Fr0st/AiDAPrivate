@@ -101,7 +101,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
             if (driver_bridge::attached_pid() != disasm.live_pid) {
                 disasm::stop_live(disasm);
-            } else {
+            } else if (disasm.live_fail_count < 5) {
                 disasm::request_live_decode(disasm);
             }
         }
@@ -123,35 +123,81 @@ void render(float pos_x, float pos_y, float width, float height,
             float cx = ox + width * 0.5f;
             float cy = oy + height * 0.5f;
 
-            static float spin = 0.f;
-            spin += dt * 4.f;
-            if (spin > 6.283185f) spin -= 6.283185f;
+            bool failed = disasm.live_mode && disasm.live_decode_failed && disasm.live_fail_count >= 3;
 
+            if (failed) {
+                const char* err_msg = "Failed to read process memory";
+                ImVec2 es = ImGui::CalcTextSize(err_msg);
+                dl->AddText(ImVec2(cx - es.x * 0.5f, cy - 20.f),
+                    IM_COL32(230, 80, 80, static_cast<int>(200 * a)), err_msg);
 
-            for (int i = 0; i < 3; i++) {
-                float phase = spin + i * (6.283185f / 3.f);
-                float dot_a = (sinf(phase) * 0.5f + 0.5f) * 0.7f + 0.3f;
-                float bounce = sinf(phase) * 6.f;
-                dl->AddCircleFilled(
-                    ImVec2(cx + (i - 1) * 18.f, cy - 14.f + bounce), 4.f,
-                    IM_COL32((int)(accent_r*200), (int)(accent_g*200),
-                             (int)(accent_b*200), (int)(255 * dot_a * a)));
-            }
+                const char* hint = "Verify driver connection and process attachment";
+                ImVec2 hs = ImGui::CalcTextSize(hint);
+                dl->AddText(ImVec2(cx - hs.x * 0.5f, cy + 4.f),
+                    IM_COL32(140, 140, 160, static_cast<int>(150 * a)), hint);
 
-            const char* msg = disasm.live_mode
-                ? "Loading live disassembly..."
-                : "Decoding instructions...";
-            ImVec2 ts = ImGui::CalcTextSize(msg);
-            dl->AddText(ImVec2(cx - ts.x * 0.5f, cy + 6.f),
-                IM_COL32(160, 160, 180, (int)(180 * a)), msg);
+                const char* retry_label = "Retry";
+                ImVec2 rs = ImGui::CalcTextSize(retry_label);
+                float bw = rs.x + 24.f;
+                float bh = 24.f;
+                float bx = cx - bw * 0.5f;
+                float by = cy + 30.f;
+                bool btn_hov = ImGui::IsMouseHoveringRect(ImVec2(bx, by), ImVec2(bx + bw, by + bh), false);
+                dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh),
+                    btn_hov ? IM_COL32(static_cast<int>(accent_r*255), static_cast<int>(accent_g*255),
+                                       static_cast<int>(accent_b*255), static_cast<int>(60*a))
+                            : IM_COL32(40, 42, 55, static_cast<int>(180*a)), 4.f);
+                dl->AddRect(ImVec2(bx, by), ImVec2(bx + bw, by + bh),
+                    IM_COL32(80, 85, 100, static_cast<int>(140*a)), 4.f);
+                dl->AddText(ImVec2(bx + (bw - rs.x) * 0.5f, by + (bh - rs.y) * 0.5f),
+                    btn_hov ? IM_COL32(static_cast<int>(accent_r*255), static_cast<int>(accent_g*255),
+                                       static_cast<int>(accent_b*255), static_cast<int>(220*a))
+                            : IM_COL32(200, 200, 210, static_cast<int>(180*a)), retry_label);
+                if (btn_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    disasm.live_fail_count = 0;
+                    disasm.live_decode_failed = false;
+                    disasm.live_needs_refresh = true;
+                }
+            } else {
+                static float spin = 0.f;
+                spin += dt * 4.f;
+                if (spin > 6.283185f) spin -= 6.283185f;
 
+                for (int i = 0; i < 3; i++) {
+                    float phase = spin + i * (6.283185f / 3.f);
+                    float dot_a = (sinf(phase) * 0.5f + 0.5f) * 0.7f + 0.3f;
+                    float bounce = sinf(phase) * 6.f;
+                    dl->AddCircleFilled(
+                        ImVec2(cx + (i - 1) * 18.f, cy - 14.f + bounce), 4.f,
+                        IM_COL32(static_cast<int>(accent_r*200), static_cast<int>(accent_g*200),
+                                 static_cast<int>(accent_b*200), static_cast<int>(255 * dot_a * a)));
+                }
 
-            const std::string& label = disasm.live_mode
-                ? disasm.live_module : disasm.file.filename;
-            if (!label.empty()) {
-                ImVec2 ms = ImGui::CalcTextSize(label.c_str());
-                dl->AddText(ImVec2(cx - ms.x * 0.5f, cy + 6.f + ts.y + 6.f),
-                    IM_COL32(120, 120, 140, (int)(140 * a)), label.c_str());
+                const char* msg = disasm.live_mode
+                    ? "Loading live disassembly..."
+                    : "Decoding instructions...";
+                ImVec2 ts = ImGui::CalcTextSize(msg);
+                dl->AddText(ImVec2(cx - ts.x * 0.5f, cy + 6.f),
+                    IM_COL32(160, 160, 180, static_cast<int>(180 * a)), msg);
+
+                if (disasm.live_mode && disasm.live_fail_count > 0) {
+                    char attempt_buf[48];
+                    snprintf(attempt_buf, sizeof(attempt_buf), "Retry %d/5...", disasm.live_fail_count);
+                    ImVec2 as = ImGui::CalcTextSize(attempt_buf);
+                    dl->AddText(ImVec2(cx - as.x * 0.5f, cy + 6.f + ts.y + 8.f),
+                        IM_COL32(200, 160, 80, static_cast<int>(160 * a)), attempt_buf);
+                }
+
+                const std::string& label = disasm.live_mode
+                    ? disasm.live_module : disasm.file.filename;
+                if (!label.empty()) {
+                    float label_y = cy + 6.f + ImGui::CalcTextSize("A").y + 6.f;
+                    if (disasm.live_mode && disasm.live_fail_count > 0)
+                        label_y += ImGui::CalcTextSize("A").y + 2.f;
+                    ImVec2 ms = ImGui::CalcTextSize(label.c_str());
+                    dl->AddText(ImVec2(cx - ms.x * 0.5f, label_y),
+                        IM_COL32(120, 120, 140, static_cast<int>(140 * a)), label.c_str());
+                }
             }
         }
         return;

@@ -210,6 +210,7 @@ inline NTSTATUS           (NTAPI* _ZwResumeThread)                 (HANDLE, PULO
 
 inline POBJECT_TYPE*       _IoFileObjectType = nullptr;
 inline POBJECT_TYPE        (NTAPI* _ObGetObjectType)(PVOID) = nullptr;
+inline BOOLEAN             (NTAPI* _ObReferenceObjectSafe)(PVOID) = nullptr;
 
 inline NTSTATUS           (NTAPI* _ZwOpenKey)                      (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
 inline NTSTATUS           (NTAPI* _ZwQueryValueKey)                (HANDLE, PUNICODE_STRING, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
@@ -651,6 +652,7 @@ inline bool SetupFunctions() {
 
     _IoFileObjectType = (POBJECT_TYPE*)GetProcAddress(kernelBase, (PCHAR)skCrypt("IoFileObjectType"));
     *(PVOID*)&_ObGetObjectType = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObGetObjectType"));
+    *(PVOID*)&_ObReferenceObjectSafe = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObReferenceObjectSafe"));
 
     *(PVOID*)&_ZwOpenKey = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwOpenKey"));
     *(PVOID*)&_ZwQueryValueKey = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwQueryValueKey"));

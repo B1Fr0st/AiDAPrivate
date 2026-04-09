@@ -24,23 +24,35 @@
 namespace debugger_view {
 
 
-static constexpr float TAB_HEIGHT   = 28.f;
-static constexpr float ROW_HEIGHT   = 18.f;
-static constexpr float HEADER_H     = 22.f;
+static constexpr float TAB_HEIGHT   = 30.f;
+static constexpr float ROW_HEIGHT   = 20.f;
+static constexpr float HEADER_H     = 24.f;
 
 
 static bool draw_row(ImDrawList* dl, float x0, float y0, float x1, float y1,
 					 float a, bool selected, float ar, float ag, float ab) {
 	bool hov = ImGui::IsMouseHoveringRect(ImVec2(x0, y0), ImVec2(x1, y1), false);
 	if (selected) {
-		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
+		ImU32 sel_col = IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+					 static_cast<int>(ab*255), static_cast<int>(30*a));
+		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), sel_col, 3.f);
+		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + 2.f, y1),
 			IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-					 static_cast<int>(ab*255), static_cast<int>(30*a)), 2.f);
+					 static_cast<int>(ab*255), static_cast<int>(160*a)));
 	} else if (hov) {
 		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
-			IM_COL32(255, 255, 255, static_cast<int>(8*a)), 2.f);
+			IM_COL32(255, 255, 255, static_cast<int>(8*a)), 3.f);
 	}
 	return hov;
+}
+
+static void render_column_header(ImDrawList* dl, float ox, float oy, float w,
+								 float a, float ar, float ag, float ab) {
+	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + HEADER_H),
+		IM_COL32(25, 27, 35, static_cast<int>(220*a)));
+	ui_anim::render_gradient_header(dl, ox, oy, w, HEADER_H, ar, ag, ab, a * 0.3f);
+	dl->AddLine(ImVec2(ox, oy + HEADER_H - 1.f), ImVec2(ox + w, oy + HEADER_H - 1.f),
+		IM_COL32(60, 65, 80, static_cast<int>(120*a)));
 }
 
 
@@ -56,47 +68,151 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a,
 	};
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + TAB_HEIGHT),
-		IM_COL32(22, 24, 30, static_cast<int>(230*a)));
+		IM_COL32(22, 24, 30, static_cast<int>(240*a)));
 
-	ui_anim::render_gradient_header(dl, ox, oy, w, TAB_HEIGHT, ar, ag, ab, a);
+	ui_anim::render_gradient_header(dl, ox, oy, w, TAB_HEIGHT, ar, ag, ab, a * 0.6f);
 
-	float tx = ox + 6.f;
-	for (int i = 0; i < static_cast<int>(sub_tab_t::COUNT); ++i) {
+	int count = static_cast<int>(sub_tab_t::COUNT);
+	float tab_widths[static_cast<int>(sub_tab_t::COUNT)];
+	float tab_positions[static_cast<int>(sub_tab_t::COUNT)];
+	float total_tabs_w = 6.f;
+	for (int i = 0; i < count; ++i) {
+		tab_widths[i] = ImGui::CalcTextSize(tab_names[i]).x + 20.f;
+		tab_positions[i] = total_tabs_w;
+		total_tabs_w += tab_widths[i] + 3.f;
+	}
+	total_tabs_w += 6.f;
+
+	bool tabs_overflow = total_tabs_w > w;
+
+	if (tabs_overflow) {
+		bool bar_hov = ImGui::IsMouseHoveringRect(ImVec2(ox, oy), ImVec2(ox + w, oy + TAB_HEIGHT), false);
+		if (bar_hov) {
+			float wheel = ImGui::GetIO().MouseWheel;
+			if (wheel != 0.f)
+				ui.tab_target_scroll_x -= wheel * 60.f;
+		}
+
+		float max_scroll = std::max(0.f, total_tabs_w - w);
+		ui.tab_target_scroll_x = std::clamp(ui.tab_target_scroll_x, 0.f, max_scroll);
+		ui.tab_scroll_x = ui_anim::smooth_lerp(ui.tab_scroll_x, ui.tab_target_scroll_x, 16.f, dt);
+		if (std::abs(ui.tab_target_scroll_x - ui.tab_scroll_x) < 0.3f)
+			ui.tab_scroll_x = ui.tab_target_scroll_x;
+
+		int active_i = static_cast<int>(ui.active_tab);
+		float active_left = tab_positions[active_i] - ui.tab_scroll_x + ox;
+		float active_right = active_left + tab_widths[active_i];
+		if (active_left < ox + 10.f)
+			ui.tab_target_scroll_x = tab_positions[active_i] - 10.f;
+		else if (active_right > ox + w - 10.f)
+			ui.tab_target_scroll_x = tab_positions[active_i] + tab_widths[active_i] - w + 10.f;
+		ui.tab_target_scroll_x = std::clamp(ui.tab_target_scroll_x, 0.f, max_scroll);
+	} else {
+		ui.tab_scroll_x = 0.f;
+		ui.tab_target_scroll_x = 0.f;
+	}
+
+	ImGui::PushClipRect(ImVec2(ox, oy), ImVec2(ox + w, oy + TAB_HEIGHT), true);
+
+	int active_idx = static_cast<int>(ui.active_tab);
+	float target_ul_x = ox + tab_positions[active_idx] - ui.tab_scroll_x + 4.f;
+	float target_ul_w = tab_widths[active_idx] - 8.f;
+
+	if (ui.underline_w < 0.01f) {
+		ui.underline_x = target_ul_x;
+		ui.underline_w = target_ul_w;
+	}
+	ui.underline_x = ui_anim::spring_interp(ui.underline_x, target_ul_x, ui.underline_vel, 280.f, 22.f, dt);
+	ui.underline_w = ui_anim::smooth_lerp(ui.underline_w, target_ul_w, 14.f, dt);
+
+	for (int i = 0; i < count; ++i) {
 		auto tab = static_cast<sub_tab_t>(i);
 		bool active = (ui.active_tab == tab);
-		ImVec2 ts = ImGui::CalcTextSize(tab_names[i]);
-		float tw = ts.x + 16.f;
+		float tx = ox + tab_positions[i] - ui.tab_scroll_x;
+		float tw = tab_widths[i];
 		float ty = oy + 2.f;
-		float th = TAB_HEIGHT - 4.f;
+		float th = TAB_HEIGHT - 5.f;
+
+		if (tx + tw < ox || tx > ox + w) continue;
 
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(tx, ty), ImVec2(tx + tw, ty + th), false);
 
-		if (active) {
+		float& tab_a = ui.tab_anim[i];
+		float tab_target = active ? 1.f : (hov ? 0.5f : 0.f);
+		tab_a = ui_anim::smooth_lerp(tab_a, tab_target, 12.f, dt);
+
+		if (tab_a > 0.01f) {
 			dl->AddRectFilled(ImVec2(tx, ty), ImVec2(tx + tw, ty + th),
-				IM_COL32(255, 255, 255, static_cast<int>(16*a)), 4.f);
-		} else if (hov) {
-			dl->AddRectFilled(ImVec2(tx, ty), ImVec2(tx + tw, ty + th),
-				IM_COL32(255, 255, 255, static_cast<int>(8*a)), 4.f);
+				IM_COL32(255, 255, 255, static_cast<int>(tab_a * 18.f * a)), 4.f);
 		}
 
-		ui_anim::render_tab_underline(dl, tx + 2.f, ty + th, tw - 4.f,
-			ui.tab_anim[i], active, dt, ar, ag, ab, a);
-
+		ImVec2 ts = ImGui::CalcTextSize(tab_names[i]);
+		float text_alpha = active ? 0.95f : (hov ? 0.8f : 0.5f);
 		ImU32 col = active
 			? IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-					   static_cast<int>(ab*255), static_cast<int>(220*a))
-			: IM_COL32(170, 175, 190, static_cast<int>((hov ? 220.f : 150.f)*a));
+					   static_cast<int>(ab*255), static_cast<int>(230*a))
+			: IM_COL32(200, 205, 220, static_cast<int>(text_alpha * 255.f * a));
 
-		dl->AddText(ImVec2(tx + 8.f, ty + (th - ts.y) * 0.5f), col, tab_names[i]);
+		dl->AddText(ImVec2(tx + (tw - ts.x) * 0.5f, ty + (th - ts.y) * 0.5f), col, tab_names[i]);
 
-		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			if (ui.active_tab != tab) {
+				ui.prev_tab = ui.active_tab;
+				ui.content_fade = 0.f;
+			}
 			ui.active_tab = tab;
+		}
+	}
 
-		tx += tw + 2.f;
+	if (ui.underline_w > 0.5f) {
+		float ul_y = oy + TAB_HEIGHT - 3.f;
+
+		for (int g = 0; g < 3; ++g) {
+			float glow_spread = 2.f + static_cast<float>(g) * 2.f;
+			float glow_a = (0.15f - static_cast<float>(g) * 0.04f) * a;
+			dl->AddRectFilled(
+				ImVec2(ui.underline_x - glow_spread, ul_y - glow_spread),
+				ImVec2(ui.underline_x + ui.underline_w + glow_spread, ul_y + 2.f + glow_spread),
+				IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+						 static_cast<int>(ab*255), static_cast<int>(glow_a * 255.f)),
+				3.f + static_cast<float>(g));
+		}
+
+		dl->AddRectFilled(
+			ImVec2(ui.underline_x, ul_y),
+			ImVec2(ui.underline_x + ui.underline_w, ul_y + 2.f),
+			IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+					 static_cast<int>(ab*255), static_cast<int>(230*a)),
+			1.f);
+	}
+
+	ImGui::PopClipRect();
+
+	if (tabs_overflow) {
+		if (ui.tab_scroll_x > 1.f) {
+			for (int f = 0; f < 30; ++f) {
+				float fa = (1.f - static_cast<float>(f) / 30.f) * 0.9f * a;
+				dl->AddRectFilled(
+					ImVec2(ox + static_cast<float>(f), oy),
+					ImVec2(ox + static_cast<float>(f) + 1.f, oy + TAB_HEIGHT),
+					IM_COL32(22, 24, 30, static_cast<int>(fa * 255.f)));
+			}
+		}
+
+		float max_scroll = total_tabs_w - w;
+		if (ui.tab_scroll_x < max_scroll - 1.f) {
+			for (int f = 0; f < 30; ++f) {
+				float fa = (1.f - static_cast<float>(f) / 30.f) * 0.9f * a;
+				dl->AddRectFilled(
+					ImVec2(ox + w - static_cast<float>(f) - 1.f, oy),
+					ImVec2(ox + w - static_cast<float>(f), oy + TAB_HEIGHT),
+					IM_COL32(22, 24, 30, static_cast<int>(fa * 255.f)));
+			}
+		}
 	}
 
 	for (int si = 0; si < 3; ++si) {
-		float sa = (1.f - static_cast<float>(si) / 3.f) * 0.25f * a;
+		float sa = (1.f - static_cast<float>(si) / 3.f) * 0.3f * a;
 		dl->AddRectFilled(
 			ImVec2(ox, oy + TAB_HEIGHT + static_cast<float>(si)),
 			ImVec2(ox + w, oy + TAB_HEIGHT + static_cast<float>(si) + 1.f),
@@ -465,13 +581,12 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 	ImU32 en_col   = IM_COL32(100, 220, 120, static_cast<int>(220*a));
 	ImU32 dis_col  = IM_COL32(220, 100, 100, static_cast<int>(220*a));
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + HEADER_H),
-		IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-	dl->AddText(ImVec2(ox + 6.f, oy + 3.f), dim_col, "#");
-	dl->AddText(ImVec2(ox + 30.f, oy + 3.f), dim_col, "State");
-	dl->AddText(ImVec2(ox + 90.f, oy + 3.f), dim_col, "Address");
-	dl->AddText(ImVec2(ox + 240.f, oy + 3.f), dim_col, "Type");
-	dl->AddText(ImVec2(ox + 320.f, oy + 3.f), dim_col, "Name");
+	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
+	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "#");
+	dl->AddText(ImVec2(ox + 30.f, oy + 4.f), dim_col, "State");
+	dl->AddText(ImVec2(ox + 90.f, oy + 4.f), dim_col, "Address");
+	dl->AddText(ImVec2(ox + 240.f, oy + 4.f), dim_col, "Type");
+	dl->AddText(ImVec2(ox + 320.f, oy + 4.f), dim_col, "Name");
 
 	std::lock_guard<std::mutex> lk(st.bp_mutex);
 	float ry = oy + HEADER_H;
@@ -480,26 +595,34 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 		if (ry + ROW_HEIGHT > oy + h) break;
 		auto& bp = st.breakpoints[static_cast<size_t>(i)];
 		bool sel = (ui.list_selected == i);
+
+		if (i & 1)
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
+				IM_COL32(255, 255, 255, 2));
+
 		bool hov = draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, ar, ag, ab);
 
 		char ibuf[8];
 		snprintf(ibuf, sizeof(ibuf), "%d", i);
-		dl->AddText(ImVec2(ox + 6.f, ry + 1.f), dim_col, ibuf);
+		dl->AddText(ImVec2(ox + 6.f, ry + 2.f), dim_col, ibuf);
 
-		const char* state_str = (bp.state == debugger_engine::bp_state_t::enabled) ? "ON" : "OFF";
-		ImU32 state_col = (bp.state == debugger_engine::bp_state_t::enabled) ? en_col : dis_col;
-		dl->AddText(ImVec2(ox + 30.f, ry + 1.f), state_col, state_str);
+		bool enabled = (bp.state == debugger_engine::bp_state_t::enabled);
+		ui_anim::render_status_dot(dl, ox + 40.f, ry + ROW_HEIGHT * 0.5f, 3.f,
+			enabled ? en_col : dis_col, static_cast<float>(ImGui::GetTime()), enabled);
+		const char* state_str = enabled ? "ON" : "OFF";
+		dl->AddText(ImVec2(ox + 48.f, ry + 2.f), enabled ? en_col : dis_col, state_str);
 
 		char abuf[20];
 		snprintf(abuf, sizeof(abuf), "%016" PRIX64, bp.address);
-		dl->AddText(ImVec2(ox + 90.f, ry + 1.f), addr_col, abuf);
+		dl->AddText(ImVec2(ox + 90.f, ry + 2.f), addr_col, abuf);
 
 		static const char* type_names[] = {"SW", "HW_EXEC", "HW_WRITE", "HW_READ", "MEM"};
-		dl->AddText(ImVec2(ox + 240.f, ry + 1.f), dim_col,
-			type_names[static_cast<int>(bp.type)]);
+		ui_anim::render_badge(dl, type_names[static_cast<int>(bp.type)],
+			ox + 240.f, ry + 2.f,
+			IM_COL32(40, 42, 55, static_cast<int>(180*a)), dim_col);
 
 		if (!bp.name.empty())
-			dl->AddText(ImVec2(ox + 320.f, ry + 1.f), text_col, bp.name.c_str());
+			dl->AddText(ImVec2(ox + 320.f, ry + 2.f), text_col, bp.name.c_str());
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			ui.list_selected = i;
@@ -520,12 +643,11 @@ static void render_memmap(ImDrawList* dl, float ox, float oy, float w, float h,
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + HEADER_H),
-		IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-	dl->AddText(ImVec2(ox + 6.f, oy + 3.f), dim_col, "Base");
-	dl->AddText(ImVec2(ox + 150.f, oy + 3.f), dim_col, "Size");
-	dl->AddText(ImVec2(ox + 240.f, oy + 3.f), dim_col, "Protect");
-	dl->AddText(ImVec2(ox + 380.f, oy + 3.f), dim_col, "Module");
+	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
+	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "Base");
+	dl->AddText(ImVec2(ox + 150.f, oy + 4.f), dim_col, "Size");
+	dl->AddText(ImVec2(ox + 240.f, oy + 4.f), dim_col, "Protect");
+	dl->AddText(ImVec2(ox + 380.f, oy + 4.f), dim_col, "Module");
 
 	std::lock_guard<std::mutex> lk(st.memmap_mutex);
 
@@ -553,6 +675,11 @@ static void render_memmap(ImDrawList* dl, float ox, float oy, float w, float h,
 
 		auto& r = st.memory_map[static_cast<size_t>(i)];
 		bool sel = (ui.list_selected == i);
+
+		if (i & 1)
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
+				IM_COL32(255, 255, 255, 2));
+
 		draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, ar, ag, ab);
 
 		char buf[20];
@@ -586,11 +713,10 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + HEADER_H),
-		IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-	dl->AddText(ImVec2(ox + 6.f, oy + 3.f), dim_col, "#");
-	dl->AddText(ImVec2(ox + 30.f, oy + 3.f), dim_col, "Address");
-	dl->AddText(ImVec2(ox + 180.f, oy + 3.f), dim_col, "Module");
+	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
+	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "#");
+	dl->AddText(ImVec2(ox + 30.f, oy + 4.f), dim_col, "Address");
+	dl->AddText(ImVec2(ox + 180.f, oy + 4.f), dim_col, "Module");
 
 	std::lock_guard<std::mutex> lk(st.stack_mutex);
 	float ry = oy + HEADER_H;
@@ -599,6 +725,11 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 		if (ry + ROW_HEIGHT > oy + h) break;
 		auto& f = st.call_stack[static_cast<size_t>(i)];
 		bool sel = (ui.list_selected == i);
+
+		if (i & 1)
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
+				IM_COL32(255, 255, 255, 2));
+
 		draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, ar, ag, ab);
 
 		char ibuf[8];
@@ -635,10 +766,9 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 	ImU32 val_col  = IM_COL32(180, 220, 160, static_cast<int>(220*a));
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + HEADER_H),
-		IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-	dl->AddText(ImVec2(ox + 6.f, oy + 3.f), dim_col, "Expression");
-	dl->AddText(ImVec2(ox + 200.f, oy + 3.f), dim_col, "Value");
+	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
+	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "Expression");
+	dl->AddText(ImVec2(ox + 200.f, oy + 4.f), dim_col, "Value");
 
 	std::lock_guard<std::mutex> lk(st.watch_mutex);
 	float ry = oy + HEADER_H;
@@ -647,6 +777,11 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 		if (ry + ROW_HEIGHT > oy + h) break;
 		auto& w_entry = st.watches[static_cast<size_t>(i)];
 		bool sel = (ui.list_selected == i);
+
+		if (i & 1)
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
+				IM_COL32(255, 255, 255, 2));
+
 		draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, ar, ag, ab);
 
 		dl->AddText(ImVec2(ox + 6.f, ry + 1.f), text_col, w_entry.expression.c_str());
@@ -672,11 +807,10 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h,
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + HEADER_H),
-		IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-	dl->AddText(ImVec2(ox + 6.f, oy + 3.f), dim_col, "#");
-	dl->AddText(ImVec2(ox + 50.f, oy + 3.f), dim_col, "Address");
-	dl->AddText(ImVec2(ox + 200.f, oy + 3.f), dim_col, "Instruction");
+	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
+	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "#");
+	dl->AddText(ImVec2(ox + 50.f, oy + 4.f), dim_col, "Address");
+	dl->AddText(ImVec2(ox + 200.f, oy + 4.f), dim_col, "Instruction");
 
 	bool tracing = st.tracing.load();
 	const char* status = tracing ? "Recording..." : "Stopped";
@@ -711,6 +845,11 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h,
 
 		auto& tr = st.trace_log[static_cast<size_t>(i)];
 		bool sel = (ui.list_selected == i);
+
+		if (i & 1)
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
+				IM_COL32(255, 255, 255, 2));
+
 		draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, ar, ag, ab);
 
 		char ibuf[12];
@@ -740,11 +879,10 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + HEADER_H),
-		IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-	dl->AddText(ImVec2(ox + 6.f, oy + 3.f), dim_col, "Address");
-	dl->AddText(ImVec2(ox + 150.f, oy + 3.f), dim_col, "String");
-	dl->AddText(ImVec2(ox + w - 80.f, oy + 3.f), dim_col, "Module");
+	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
+	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "Address");
+	dl->AddText(ImVec2(ox + 150.f, oy + 4.f), dim_col, "String");
+	dl->AddText(ImVec2(ox + w - 80.f, oy + 4.f), dim_col, "Module");
 
 	std::lock_guard<std::mutex> lk(st.strings_mutex);
 
@@ -772,6 +910,11 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 
 		auto& sr = st.strings[static_cast<size_t>(i)];
 		bool sel = (ui.list_selected == i);
+
+		if (i & 1)
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
+				IM_COL32(255, 255, 255, 2));
+
 		draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, ar, ag, ab);
 
 		char abuf[20];
@@ -801,17 +944,21 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + HEADER_H),
-		IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-	dl->AddText(ImVec2(ox + 6.f, oy + 3.f), dim_col, "TID");
-	dl->AddText(ImVec2(ox + 80.f, oy + 3.f), dim_col, "Owner PID");
-	dl->AddText(ImVec2(ox + 180.f, oy + 3.f), dim_col, "Priority");
+	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
+	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "TID");
+	dl->AddText(ImVec2(ox + 80.f, oy + 4.f), dim_col, "Owner PID");
+	dl->AddText(ImVec2(ox + 180.f, oy + 4.f), dim_col, "Priority");
 
 	auto threads = driver_bridge::enumerate_threads();
 	float ry = oy + HEADER_H;
+	int ti = 0;
 
 	for (const auto& t : threads) {
 		if (ry + ROW_HEIGHT > oy + h) break;
+
+		if (ti & 1)
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
+				IM_COL32(255, 255, 255, 2));
 
 		char tbuf[12];
 		snprintf(tbuf, sizeof(tbuf), "%u", t.tid);
@@ -825,6 +972,7 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 		snprintf(prbuf, sizeof(prbuf), "%d", t.priority);
 		dl->AddText(ImVec2(ox + 180.f, ry + 1.f), dim_col, prbuf);
 
+		++ti;
 		ry += ROW_HEIGHT;
 	}
 }
@@ -839,11 +987,10 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + HEADER_H),
-		IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-	dl->AddText(ImVec2(ox + 6.f, oy + 3.f), dim_col, "#");
-	dl->AddText(ImVec2(ox + 30.f, oy + 3.f), dim_col, "Address");
-	dl->AddText(ImVec2(ox + 180.f, oy + 3.f), dim_col, "Label");
+	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
+	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "#");
+	dl->AddText(ImVec2(ox + 30.f, oy + 4.f), dim_col, "Address");
+	dl->AddText(ImVec2(ox + 180.f, oy + 4.f), dim_col, "Label");
 
 	std::lock_guard<std::mutex> lk(st.anno_mutex);
 	float ry = oy + HEADER_H;
@@ -852,6 +999,11 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 		if (ry + ROW_HEIGHT > oy + h) break;
 		uint64_t addr = st.bookmarks[static_cast<size_t>(i)];
 		bool sel = (ui.list_selected == i);
+
+		if (i & 1)
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
+				IM_COL32(255, 255, 255, 2));
+
 		draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, ar, ag, ab);
 
 		char ibuf[8], abuf[20];
@@ -874,23 +1026,27 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 
 
 static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
-						   float a, float , float , float ) {
+						   float a, float ar, float ag, float ab) {
 	auto& st = debugger_engine::g_state;
 
 	ImU32 dim_col  = IM_COL32(140, 145, 155, static_cast<int>(150*a));
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + HEADER_H),
-		IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-	dl->AddText(ImVec2(ox + 6.f, oy + 3.f), dim_col, "Handle");
-	dl->AddText(ImVec2(ox + 80.f, oy + 3.f), dim_col, "Type");
-	dl->AddText(ImVec2(ox + 200.f, oy + 3.f), dim_col, "Name");
+	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
+	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "Handle");
+	dl->AddText(ImVec2(ox + 80.f, oy + 4.f), dim_col, "Type");
+	dl->AddText(ImVec2(ox + 200.f, oy + 4.f), dim_col, "Name");
 
 	std::lock_guard<std::mutex> lk(st.handle_mutex);
 	float ry = oy + HEADER_H;
+	int hi = 0;
 
 	for (const auto& h_entry : st.handles) {
 		if (ry + ROW_HEIGHT > oy + h) break;
+
+		if (hi & 1)
+			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
+				IM_COL32(255, 255, 255, 2));
 
 		char hbuf[12];
 		snprintf(hbuf, sizeof(hbuf), "0x%X", static_cast<unsigned>(h_entry.handle));
@@ -898,6 +1054,7 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 		dl->AddText(ImVec2(ox + 80.f, ry + 1.f), dim_col, h_entry.type_name.c_str());
 		dl->AddText(ImVec2(ox + 200.f, ry + 1.f), text_col, h_entry.name.c_str());
 
+		++hi;
 		ry += ROW_HEIGHT;
 	}
 }
@@ -915,13 +1072,16 @@ void render(float pos_x, float pos_y, float width, float height,
 	float oy = wp.y;
 	float w = width;
 	float h = height;
-	float a = alpha;
+	float dt = ImGui::GetIO().DeltaTime;
+
+	g_ui.content_fade = ui_anim::smooth_lerp(g_ui.content_fade, 1.f, 14.f, dt);
+	float a = alpha * std::max(g_ui.content_fade, 0.3f);
 
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h),
-		IM_COL32(18, 20, 26, static_cast<int>(240*a)));
+		IM_COL32(18, 20, 26, static_cast<int>(240*alpha)));
 
-	render_tab_bar(dl, ox, oy, w, a, accent_r, accent_g, accent_b);
+	render_tab_bar(dl, ox, oy, w, alpha, accent_r, accent_g, accent_b);
 
 	float content_y = oy + TAB_HEIGHT;
 	float content_h = h - TAB_HEIGHT;
@@ -967,14 +1127,13 @@ void render(float pos_x, float pos_y, float width, float height,
 			ImU32 addr2 = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 			ImU32 text2 = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-			dl->AddRectFilled(ImVec2(ox, cy), ImVec2(ox + w, cy + HEADER_H),
-				IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-			dl->AddText(ImVec2(ox + 6.f, cy + 3.f), dim2, "#");
-			dl->AddText(ImVec2(ox + 30.f, cy + 3.f), dim2, "Address");
-			dl->AddText(ImVec2(ox + 180.f, cy + 3.f), dim2, "Original");
-			dl->AddText(ImVec2(ox + 320.f, cy + 3.f), dim2, "Patched");
-			dl->AddText(ImVec2(ox + 460.f, cy + 3.f), dim2, "Description");
-			dl->AddText(ImVec2(ox + w - 70.f, cy + 3.f), dim2, "Active");
+			render_column_header(dl, ox, cy, w, a, accent_r, accent_g, accent_b);
+			dl->AddText(ImVec2(ox + 6.f, cy + 4.f), dim2, "#");
+			dl->AddText(ImVec2(ox + 30.f, cy + 4.f), dim2, "Address");
+			dl->AddText(ImVec2(ox + 180.f, cy + 4.f), dim2, "Original");
+			dl->AddText(ImVec2(ox + 320.f, cy + 4.f), dim2, "Patched");
+			dl->AddText(ImVec2(ox + 460.f, cy + 4.f), dim2, "Description");
+			dl->AddText(ImVec2(ox + w - 70.f, cy + 4.f), dim2, "Active");
 
 			std::lock_guard<std::mutex> plk(code_patcher::g_state.mtx);
 			auto& patches = code_patcher::g_state.patches;
@@ -985,23 +1144,28 @@ void render(float pos_x, float pos_y, float width, float height,
 				bool sel = (g_ui.list_selected == i);
 				draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, accent_r, accent_g, accent_b);
 
+				if (i & 1)
+					dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
+						IM_COL32(255, 255, 255, 2));
+
 				char ibuf[8]; snprintf(ibuf, sizeof(ibuf), "%d", i);
 				char abuf[20]; snprintf(abuf, sizeof(abuf), "%016" PRIX64, p.address);
-				dl->AddText(ImVec2(ox + 6.f, ry + 1.f), dim2, ibuf);
-				dl->AddText(ImVec2(ox + 30.f, ry + 1.f), addr2, abuf);
+				dl->AddText(ImVec2(ox + 6.f, ry + 2.f), dim2, ibuf);
+				dl->AddText(ImVec2(ox + 30.f, ry + 2.f), addr2, abuf);
 
 				std::string orig_hex = code_patcher::format_bytes(p.original_bytes);
 				std::string patch_hex = code_patcher::format_bytes(p.patched_bytes);
 
-				dl->AddText(ImVec2(ox + 180.f, ry + 1.f), text2, orig_hex.c_str());
-				dl->AddText(ImVec2(ox + 320.f, ry + 1.f), text2, patch_hex.c_str());
-				dl->AddText(ImVec2(ox + 460.f, ry + 1.f), text2, p.description.c_str());
+				dl->AddText(ImVec2(ox + 180.f, ry + 2.f), text2, orig_hex.c_str());
+				dl->AddText(ImVec2(ox + 320.f, ry + 2.f), text2, patch_hex.c_str());
+				dl->AddText(ImVec2(ox + 460.f, ry + 2.f), text2, p.description.c_str());
 
-				const char* st = p.active ? "ON" : "OFF";
+				const char* st_label = p.active ? "ON" : "OFF";
 				ImU32 sc = p.active
 					? IM_COL32(100, 220, 120, static_cast<int>(200*a))
 					: IM_COL32(180, 100, 100, static_cast<int>(200*a));
-				dl->AddText(ImVec2(ox + w - 70.f, ry + 1.f), sc, st);
+				ui_anim::render_badge(dl, st_label, ox + w - 70.f, ry + 2.f, sc,
+					IM_COL32(20, 20, 25, static_cast<int>(220*a)));
 
 				bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
 				if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -1025,11 +1189,10 @@ void render(float pos_x, float pos_y, float width, float height,
 			ImU32 addr2 = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 			ImU32 text2 = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-			dl->AddRectFilled(ImVec2(ox, cy), ImVec2(ox + w, cy + HEADER_H),
-				IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-			dl->AddText(ImVec2(ox + 6.f, cy + 3.f), dim2, "From");
-			dl->AddText(ImVec2(ox + 180.f, cy + 3.f), dim2, "To");
-			dl->AddText(ImVec2(ox + 350.f, cy + 3.f), dim2, "Type");
+			render_column_header(dl, ox, cy, w, a, accent_r, accent_g, accent_b);
+			dl->AddText(ImVec2(ox + 6.f, cy + 4.f), dim2, "From");
+			dl->AddText(ImVec2(ox + 180.f, cy + 4.f), dim2, "To");
+			dl->AddText(ImVec2(ox + 350.f, cy + 4.f), dim2, "Type");
 
 			std::vector<xref_engine::xref_t> xrefs;
 			{
@@ -1044,10 +1207,14 @@ void render(float pos_x, float pos_y, float width, float height,
 				bool sel = (g_ui.list_selected == i);
 				draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, accent_r, accent_g, accent_b);
 
+				if (i & 1)
+					dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
+						IM_COL32(255, 255, 255, 2));
+
 				char fbuf[20]; snprintf(fbuf, sizeof(fbuf), "%016" PRIX64, x.from_addr);
 				char tbuf[20]; snprintf(tbuf, sizeof(tbuf), "%016" PRIX64, x.to_addr);
-				dl->AddText(ImVec2(ox + 6.f, ry + 1.f), addr2, fbuf);
-				dl->AddText(ImVec2(ox + 180.f, ry + 1.f), addr2, tbuf);
+				dl->AddText(ImVec2(ox + 6.f, ry + 2.f), addr2, fbuf);
+				dl->AddText(ImVec2(ox + 180.f, ry + 2.f), addr2, tbuf);
 
 				const char* type_str = "unknown";
 				switch (x.type) {
@@ -1057,7 +1224,15 @@ void render(float pos_x, float pos_y, float width, float height,
 					case xref_engine::xref_type_t::lea: type_str = "LEA"; break;
 					case xref_engine::xref_type_t::data_ref: type_str = "DATA"; break;
 				}
-				dl->AddText(ImVec2(ox + 350.f, ry + 1.f), text2, type_str);
+				ImU32 xtype_col = text2;
+				if (x.type == xref_engine::xref_type_t::call)
+					xtype_col = IM_COL32(230, 100, 100, static_cast<int>(200*a));
+				else if (x.type == xref_engine::xref_type_t::jump)
+					xtype_col = IM_COL32(100, 200, 230, static_cast<int>(200*a));
+				else if (x.type == xref_engine::xref_type_t::conditional_jump)
+					xtype_col = IM_COL32(100, 230, 140, static_cast<int>(200*a));
+				ui_anim::render_badge(dl, type_str, ox + 350.f, ry + 2.f,
+					IM_COL32(40, 42, 55, static_cast<int>(180*a)), xtype_col);
 
 				bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
 				if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))

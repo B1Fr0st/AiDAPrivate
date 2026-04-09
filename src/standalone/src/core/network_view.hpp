@@ -305,6 +305,14 @@ struct state_t {
 
 
     float tab_anim[static_cast<int>(sub_tab_t::COUNT)] = {};
+
+    float tab_scroll_x = 0.f;
+    float tab_target_scroll_x = 0.f;
+    float underline_x = 0.f;
+    float underline_w = 0.f;
+    float underline_vel = 0.f;
+    float content_fade = 1.f;
+    sub_tab_t prev_tab = sub_tab_t::connections;
 };
 
 inline state_t g_state;

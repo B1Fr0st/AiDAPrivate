@@ -26,8 +26,16 @@ enum class sub_tab_t : int {
 
 struct ui_state_t {
 	sub_tab_t active_tab = sub_tab_t::cpu;
+	sub_tab_t prev_tab   = sub_tab_t::cpu;
 
 	float tab_anim[static_cast<int>(sub_tab_t::COUNT)] = {};
+
+	float tab_scroll_x        = 0.f;
+	float tab_target_scroll_x = 0.f;
+	float underline_x         = 0.f;
+	float underline_w         = 0.f;
+	float underline_vel       = 0.f;
+	float content_fade        = 1.f;
 
 	float disasm_scroll_y = 0.f;
 	float disasm_target_scroll_y = 0.f;

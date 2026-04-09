@@ -294,32 +294,69 @@ static void render_tab_bar(state_t& state, float x, float y, float w, float alph
     ImVec2 origin = ImGui::GetWindowPos();
 
     float tab_h = 28.f;
-    float tab_x = x;
     int count = static_cast<int>(sub_tab_t::COUNT);
 
     ui_anim::render_gradient_header(dl, origin.x + x, origin.y + y, w, tab_h, ar, ag, ab, alpha);
 
+    float total_w = 0.f;
+    float tab_widths[static_cast<int>(sub_tab_t::COUNT)];
+    float tab_offsets[static_cast<int>(sub_tab_t::COUNT)];
     for (int i = 0; i < count; i++) {
-        ImVec2 ts = ImGui::CalcTextSize(tab_names[i]);
-        float tab_w = ts.x + 20.f;
-        bool is_active = (static_cast<int>(state.active_tab) == i);
+        tab_widths[i] = ImGui::CalcTextSize(tab_names[i]).x + 20.f;
+        tab_offsets[i] = total_w;
+        total_w += tab_widths[i] + 2.f;
+    }
 
+    float clip_x0 = origin.x + x;
+    float clip_x1 = origin.x + x + w;
+    float clip_y0 = origin.y + y;
+    float clip_y1 = origin.y + y + tab_h;
 
-        float target = is_active ? 1.f : 0.f;
-        state.tab_anim[i] += (target - state.tab_anim[i]) * std::min(12.f * dt, 1.f);
+    if (ImGui::IsMouseHoveringRect(ImVec2(clip_x0, clip_y0), ImVec2(clip_x1, clip_y1), false)) {
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0.f)
+            state.tab_target_scroll_x -= wheel * 60.f;
+    }
 
-        float bx0 = origin.x + tab_x;
-        float by0 = origin.y + y;
-        float bx1 = bx0 + tab_w;
-        float by1 = by0 + tab_h;
+    float max_scroll = std::max(0.f, total_w - w);
+    state.tab_target_scroll_x = std::clamp(state.tab_target_scroll_x, 0.f, max_scroll);
+    state.tab_scroll_x = ui_anim::smooth_lerp(state.tab_scroll_x, state.tab_target_scroll_x, 14.f, dt);
 
+    int active_idx = static_cast<int>(state.active_tab);
+    float active_left = tab_offsets[active_idx] - state.tab_scroll_x;
+    float active_right = active_left + tab_widths[active_idx];
+    if (active_left < 0.f)
+        state.tab_target_scroll_x = tab_offsets[active_idx];
+    else if (active_right > w)
+        state.tab_target_scroll_x = tab_offsets[active_idx] + tab_widths[active_idx] - w;
+
+    float target_ux = clip_x0 + tab_offsets[active_idx] - state.tab_scroll_x + 4.f;
+    float target_uw = tab_widths[active_idx] - 8.f;
+    if (state.underline_w < 0.1f) {
+        state.underline_x = target_ux;
+        state.underline_w = target_uw;
+    }
+    ui_anim::spring_interp(state.underline_x, target_ux, state.underline_vel, 280.f, 22.f, dt);
+    state.underline_w = ui_anim::smooth_lerp(state.underline_w, target_uw, 16.f, dt);
+
+    ImGui::PushClipRect(ImVec2(clip_x0, clip_y0), ImVec2(clip_x1, clip_y1), true);
+
+    for (int i = 0; i < count; i++) {
+        float bx0 = clip_x0 + tab_offsets[i] - state.tab_scroll_x;
+        float bx1 = bx0 + tab_widths[i];
+        float by0 = clip_y0;
+        float by1 = clip_y0 + tab_h;
+        bool is_active = (i == active_idx);
 
         ImVec2 mouse = ImGui::GetMousePos();
         bool hovered = (mouse.x >= bx0 && mouse.x < bx1 && mouse.y >= by0 && mouse.y < by1);
-
-        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (state.active_tab != static_cast<sub_tab_t>(i)) {
+                state.prev_tab = state.active_tab;
+                state.content_fade = 0.f;
+            }
             state.active_tab = static_cast<sub_tab_t>(i);
-
+        }
 
         float bg_alpha = is_active ? 0.15f : (hovered ? 0.08f : 0.f);
         if (bg_alpha > 0.01f)
@@ -328,24 +365,44 @@ static void render_tab_bar(state_t& state, float x, float y, float w, float alph
                          static_cast<int>(ab * 255), static_cast<int>(bg_alpha * alpha * 255)),
                 4.f);
 
-
-        float ul_alpha = state.tab_anim[i];
-        if (ul_alpha > 0.01f) {
-            dl->AddRectFilled(ImVec2(bx0 + 4.f, by1 - 2.f), ImVec2(bx1 - 4.f, by1),
-                IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
-                         static_cast<int>(ab * 255), static_cast<int>(ul_alpha * alpha * 255)),
-                1.f);
-        }
-
-
+        ImVec2 ts = ImGui::CalcTextSize(tab_names[i]);
         float text_alpha = is_active ? 0.95f : (hovered ? 0.7f : 0.5f);
-        dl->AddText(ImVec2(bx0 + 10.f, by0 + (tab_h - ts.y) * 0.5f),
+        dl->AddText(ImVec2(bx0 + (tab_widths[i] - ts.x) * 0.5f, by0 + (tab_h - ts.y) * 0.5f),
             IM_COL32(255, 255, 255, static_cast<int>(text_alpha * alpha * 255)),
             tab_names[i]);
-
-        tab_x += tab_w + 2.f;
     }
 
+    float ux = state.underline_x;
+    float uw = state.underline_w;
+    float uy = clip_y1 - 2.f;
+    ImU32 ul_col = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+                             static_cast<int>(ab * 255), static_cast<int>(alpha * 255));
+    dl->AddRectFilled(ImVec2(ux, uy), ImVec2(ux + uw, uy + 2.f), ul_col, 1.f);
+    dl->AddRectFilled(ImVec2(ux - 3.f, uy - 1.f), ImVec2(ux + uw + 3.f, uy + 3.f),
+        IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+                 static_cast<int>(ab * 255), static_cast<int>(alpha * 40)), 2.f);
+    dl->AddRectFilled(ImVec2(ux - 6.f, uy - 2.f), ImVec2(ux + uw + 6.f, uy + 5.f),
+        IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+                 static_cast<int>(ab * 255), static_cast<int>(alpha * 15)), 3.f);
+
+    ImGui::PopClipRect();
+
+    if (state.tab_scroll_x > 1.f) {
+        dl->AddRectFilledMultiColor(
+            ImVec2(clip_x0, clip_y0), ImVec2(clip_x0 + 30.f, clip_y1),
+            IM_COL32(18, 20, 26, static_cast<int>(240 * alpha)),
+            IM_COL32(18, 20, 26, 0),
+            IM_COL32(18, 20, 26, 0),
+            IM_COL32(18, 20, 26, static_cast<int>(240 * alpha)));
+    }
+    if (state.tab_scroll_x < max_scroll - 1.f) {
+        dl->AddRectFilledMultiColor(
+            ImVec2(clip_x1 - 30.f, clip_y0), ImVec2(clip_x1, clip_y1),
+            IM_COL32(18, 20, 26, 0),
+            IM_COL32(18, 20, 26, static_cast<int>(240 * alpha)),
+            IM_COL32(18, 20, 26, static_cast<int>(240 * alpha)),
+            IM_COL32(18, 20, 26, 0));
+    }
 
     dl->AddLine(
         ImVec2(origin.x + x, origin.y + y + tab_h),
@@ -424,13 +481,23 @@ static void render_connections(state_t& state, float x, float y, float w, float 
     float col_local = (w - col_pid - col_proto - col_state - 20.f) * 0.5f;
     float col_remote = col_local;
 
+    dl->AddRectFilled(ImVec2(org.x, hdr_y), ImVec2(org.x + w, hdr_y + row_h),
+        IM_COL32(25, 27, 35, static_cast<int>(200 * alpha)));
+    dl->AddRectFilledMultiColor(ImVec2(org.x, hdr_y), ImVec2(org.x + w, hdr_y + row_h),
+        IM_COL32(static_cast<int>(ar*50), static_cast<int>(ag*50), static_cast<int>(ab*50), static_cast<int>(20*alpha)),
+        IM_COL32(static_cast<int>(ar*50), static_cast<int>(ag*50), static_cast<int>(ab*50), 0),
+        IM_COL32(0, 0, 0, 0),
+        IM_COL32(0, 0, 0, 0));
+    dl->AddLine(ImVec2(org.x, hdr_y + row_h), ImVec2(org.x + w, hdr_y + row_h),
+        IM_COL32(60, 65, 75, static_cast<int>(80 * alpha)));
+
     float cx = org.x + 4.f;
-    ImU32 hdr_col = IM_COL32(180, 180, 200, static_cast<int>(0.7f * alpha * 255));
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "PID");   cx += col_pid;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Proto"); cx += col_proto;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "State"); cx += col_state;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Local"); cx += col_local;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Remote");
+    ImU32 hdr_col = IM_COL32(140, 145, 155, static_cast<int>(0.6f * alpha * 255));
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "PID");   cx += col_pid;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Proto"); cx += col_proto;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "State"); cx += col_state;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Local"); cx += col_local;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Remote");
 
     ImGui::SetCursorPosY(cursor.y + row_h + 2.f);
     dl->AddLine(ImVec2(org.x + 2.f, hdr_y + row_h), ImVec2(org.x + w - 2.f, hdr_y + row_h),
@@ -472,7 +539,10 @@ static void render_connections(state_t& state, float x, float y, float w, float 
             ImU32 bg = selected
                 ? IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255), static_cast<int>(ab*255), static_cast<int>(0.2f * alpha * 255))
                 : IM_COL32(255, 255, 255, static_cast<int>(0.04f * alpha * 255));
-            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h), bg);
+            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h), bg, 3.f);
+            if (selected)
+                dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + 2.f, abs_ry + row_h),
+                    IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255), static_cast<int>(ab*255), static_cast<int>(0.8f * alpha * 255)));
         }
 
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -488,12 +558,14 @@ static void render_connections(state_t& state, float x, float y, float w, float 
 
 
         ImU32 state_col = IM_COL32(150, 150, 170, static_cast<int>(0.6f * alpha * 255));
-        if (c.state == 4) state_col = IM_COL32(100, 255, 100, static_cast<int>(0.85f * alpha * 255));
-        else if (c.state == 1) state_col = IM_COL32(100, 180, 255, static_cast<int>(0.85f * alpha * 255));
-        else if (c.state == 10) state_col = IM_COL32(255, 220, 80, static_cast<int>(0.85f * alpha * 255));
-        else if (c.state == 7) state_col = IM_COL32(255, 160, 80, static_cast<int>(0.85f * alpha * 255));
-        else if (c.state == 2) state_col = IM_COL32(180, 120, 255, static_cast<int>(0.85f * alpha * 255));
-        dl->AddText(ImVec2(cx, abs_ry), state_col, tcp_state_name(c.state));          cx += col_state;
+        ImU32 state_bg = IM_COL32(40, 42, 55, static_cast<int>(180 * alpha));
+        if (c.state == 4) { state_col = IM_COL32(100, 255, 100, static_cast<int>(0.85f * alpha * 255)); state_bg = IM_COL32(30, 60, 30, static_cast<int>(180 * alpha)); }
+        else if (c.state == 1) { state_col = IM_COL32(100, 180, 255, static_cast<int>(0.85f * alpha * 255)); state_bg = IM_COL32(25, 40, 60, static_cast<int>(180 * alpha)); }
+        else if (c.state == 10) { state_col = IM_COL32(255, 220, 80, static_cast<int>(0.85f * alpha * 255)); state_bg = IM_COL32(60, 55, 25, static_cast<int>(180 * alpha)); }
+        else if (c.state == 7) { state_col = IM_COL32(255, 160, 80, static_cast<int>(0.85f * alpha * 255)); state_bg = IM_COL32(55, 40, 20, static_cast<int>(180 * alpha)); }
+        else if (c.state == 2) { state_col = IM_COL32(180, 120, 255, static_cast<int>(0.85f * alpha * 255)); state_bg = IM_COL32(40, 30, 60, static_cast<int>(180 * alpha)); }
+        ui_anim::render_badge(dl, tcp_state_name(c.state), cx, abs_ry + 2.f, state_bg, state_col);
+        cx += col_state;
         dl->AddText(ImVec2(cx, abs_ry), txt_col, local_str.c_str());                  cx += col_local;
         dl->AddText(ImVec2(cx, abs_ry), txt_col, remote_str.c_str());
 
@@ -3140,52 +3212,55 @@ void render(float pos_x, float pos_y, float width, float height,
     float tab_h = 30.f;
     render_tab_bar(g_state, pos_x, pos_y, width, alpha, accent_r, accent_g, accent_b, dt);
 
+    g_state.content_fade = ui_anim::smooth_lerp(g_state.content_fade, 1.f, 14.f, dt);
+    float ca = alpha * std::max(g_state.content_fade, 0.3f);
+
     float content_y = pos_y + tab_h + 4.f;
     float content_h = height - tab_h - 4.f;
 
 
     switch (g_state.active_tab) {
         case sub_tab_t::connections:
-            render_connections(g_state, pos_x, content_y, width, content_h, alpha, accent_r, accent_g, accent_b);
+            render_connections(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::capture:
-            render_capture(g_state, pos_x, content_y, width, content_h, alpha, accent_r, accent_g, accent_b);
+            render_capture(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::intercept:
-            render_intercept(g_state, pos_x, content_y, width, content_h, alpha, accent_r, accent_g, accent_b);
+            render_intercept(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::proxy:
-            render_proxy(g_state, pos_x, content_y, width, content_h, alpha, accent_r, accent_g, accent_b);
+            render_proxy(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::dns:
-            render_dns(g_state, pos_x, content_y, width, content_h, alpha, accent_r, accent_g, accent_b);
+            render_dns(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::filters:
-            render_filters(g_state, pos_x, content_y, width, content_h, alpha, accent_r, accent_g, accent_b);
+            render_filters(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::bandwidth:
-            render_bandwidth(g_state, pos_x, content_y, width, content_h, alpha, accent_r, accent_g, accent_b);
+            render_bandwidth(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::repeater:
-            render_repeater(g_state, pos_x, content_y, width, content_h, alpha, accent_r, accent_g, accent_b);
+            render_repeater(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::keylog:
-            render_keylog(g_state, pos_x, content_y, width, content_h, alpha, accent_r, accent_g, accent_b);
+            render_keylog(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::pcap_export:
-            render_pcap_export(g_state, pos_x, content_y, width, content_h, alpha, accent_r, accent_g, accent_b);
+            render_pcap_export(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::fuzzer:
-            render_fuzzer(g_state, pos_x, content_y, width, content_h, alpha, accent_r, accent_g, accent_b);
+            render_fuzzer(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::websocket:
-            render_websocket(g_state, pos_x, content_y, width, content_h, alpha, accent_r, accent_g, accent_b);
+            render_websocket(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::scripting:
-            render_scripting(g_state, pos_x, content_y, width, content_h, alpha, accent_r, accent_g, accent_b);
+            render_scripting(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::decoder:
-            render_decoder(g_state, pos_x, content_y, width, content_h, alpha, accent_r, accent_g, accent_b);
+            render_decoder(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         default:
             break;

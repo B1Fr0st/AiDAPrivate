@@ -2112,18 +2112,23 @@ static BOOLEAN safe_reference_file_object(PVOID object, PFILE_OBJECT* out_fo) {
         return FALSE;
 
     __try {
-        PFILE_OBJECT fo = static_cast<PFILE_OBJECT>(object);
-        NTSTATUS ref_status = ObReferenceObjectByPointer(
-            fo,
-            0,
-            *_IoFileObjectType,
-            KernelMode
-        );
-        if (!NT_SUCCESS(ref_status))
-            return FALSE;
+        if (_ObReferenceObjectSafe) {
+            if (!_ObReferenceObjectSafe(object))
+                return FALSE;
 
-        *out_fo = fo;
-        return TRUE;
+            if (_ObGetObjectType) {
+                POBJECT_TYPE obj_type = _ObGetObjectType(object);
+                if (obj_type != *_IoFileObjectType) {
+                    ObDereferenceObject(object);
+                    return FALSE;
+                }
+            }
+
+            *out_fo = static_cast<PFILE_OBJECT>(object);
+            return TRUE;
+        }
+
+        return FALSE;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
 
         return FALSE;
@@ -2137,30 +2142,23 @@ static BOOLEAN aida_is_afd_device_object(PVOID object) {
     if (!safe_reference_file_object(object, &fileObj))
         return FALSE;
 
+    BOOLEAN is_afd = FALSE;
+
     __try {
 
-        BOOLEAN is_afd = FALSE;
-
-
         PDEVICE_OBJECT devObj = fileObj->DeviceObject;
-        if (!devObj) {
-            ObDereferenceObject(fileObj);
-            return FALSE;
-        }
+        if (!devObj)
+            __leave;
 
         PDRIVER_OBJECT drvObj = devObj->DriverObject;
-        if (!drvObj) {
-            ObDereferenceObject(fileObj);
-            return FALSE;
-        }
+        if (!drvObj)
+            __leave;
 
         PUNICODE_STRING drvName = &drvObj->DriverName;
 
 
-        if (!drvName->Buffer || drvName->Length < 8) {
-            ObDereferenceObject(fileObj);
-            return FALSE;
-        }
+        if (!drvName->Buffer || drvName->Length < 8)
+            __leave;
 
         USHORT max_chars = (USHORT)(drvName->Length / sizeof(wchar_t));
         if (max_chars > 128) {
@@ -2181,12 +2179,12 @@ static BOOLEAN aida_is_afd_device_object(PVOID object) {
                 break;
             }
         }
-
-        ObDereferenceObject(fileObj);
-        return is_afd;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FALSE;
+        is_afd = FALSE;
     }
+
+    ObDereferenceObject(fileObj);
+    return is_afd;
 }
 
 static __forceinline UINT32 aida_sockaddr_addr_len(UINT16 family) {

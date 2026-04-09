@@ -74,6 +74,8 @@ struct DisasmState
     bool     live_paused     = false;
     bool     live_needs_refresh = false;
     bool     live_decoding   = false;
+    bool     live_decode_failed = false;
+    int      live_fail_count    = 0;
     std::vector<AsmInstr> live_pending_instrs;
     uint64_t live_pending_va = 0;
     std::atomic<bool> live_pending_ready{false};
@@ -349,6 +351,14 @@ namespace disasm
                 }
             }
 
+            if (instrs.empty()) {
+                state.live_decode_failed = true;
+                state.live_fail_count++;
+            } else {
+                state.live_decode_failed = false;
+                state.live_fail_count = 0;
+            }
+
             state.live_pending_instrs = std::move(instrs);
             state.live_pending_va = win_start;
             state.live_pending_ready.store(true, std::memory_order_release);
@@ -369,6 +379,8 @@ namespace disasm
         state.live_module = module_name;
         state.live_paused = false;
         state.live_decoding = false;
+        state.live_decode_failed = false;
+        state.live_fail_count = 0;
         state.live_pending_ready.store(false);
         state.live_refresh_timer = 0.f;
         state.live_needs_refresh = true;
@@ -396,6 +408,8 @@ namespace disasm
         state.live_module.clear();
         state.live_paused = false;
         state.live_decoding = false;
+        state.live_decode_failed = false;
+        state.live_fail_count = 0;
         state.live_pending_ready.store(false);
         state.live_pending_instrs.clear();
     }

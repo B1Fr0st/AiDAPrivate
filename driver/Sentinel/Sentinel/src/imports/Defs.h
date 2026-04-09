@@ -321,3 +321,54 @@ inline bool SetupFunctions() {
 
     return true;
 }
+
+
+// ─── HVCI (Memory Integrity) Detection ───────────────────────────────────────
+// Reads the CI options from KUSER_SHARED_DATA (read-only page, always safe).
+// HVCI uses second-level address translation (EPT/SLAT) to enforce W^X on
+// kernel pages: no page can be both writable and executable.  When HVCI is
+// active, MDL-based writable remappings of kernel code pages
+// (MmMapLockedPagesSpecifyCache on .text sections), runtime-generated
+// shellcode execution, and direct data-structure tampering in ntoskrnl are
+// all blocked by the hypervisor's EPT.  Subsystems that rely on those
+// techniques must check this at runtime and degrade gracefully.
+namespace hvci_detect {
+
+    constexpr ULONG CI_OPTION_HVCI_KMCI_ENABLED = 0x400u;
+    constexpr ULONG CI_OPTION_HVCI_STRICT       = 0x800u;
+    constexpr ULONG64 KUSER_SHARED_DATA_VA      = 0xFFFFF78000000000ULL;
+
+    inline volatile LONG g_hvci_state = -1;
+
+    __forceinline BOOLEAN detect_hvci() {
+        __try {
+            volatile ULONG* ci_options = reinterpret_cast<volatile ULONG*>(
+                KUSER_SHARED_DATA_VA + 0x03A8);
+
+            if (!_MmIsAddressValid(reinterpret_cast<PVOID>(const_cast<ULONG*>(ci_options))))
+                return FALSE;
+
+            ULONG options = *ci_options;
+
+            if (options & CI_OPTION_HVCI_KMCI_ENABLED)
+                return TRUE;
+            if (options & CI_OPTION_HVCI_STRICT)
+                return TRUE;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // If we can't read KUSER_SHARED_DATA, assume HVCI is active
+            // (fail-safe: disable write-dependent subsystems).
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    __forceinline BOOLEAN is_hvci_enabled() {
+        LONG state = _InterlockedCompareExchange(&g_hvci_state, -1, -1);
+        if (state >= 0)
+            return (state != 0);
+
+        BOOLEAN enabled = detect_hvci();
+        _InterlockedExchange(&g_hvci_state, enabled ? 1 : 0);
+        return enabled;
+    }
+}

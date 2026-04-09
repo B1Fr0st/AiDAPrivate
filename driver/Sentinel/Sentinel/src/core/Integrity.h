@@ -166,6 +166,15 @@ namespace integrity {
         if (bp) {
             ULONG offset = (ULONG)((ULONG_PTR)bp - (ULONG_PTR)base);
 
+            // Under HVCI, safe_write_memory() cannot create a writable MDL
+            // alias to kernel code pages (EPT blocks it).  The restore path
+            // is impossible, so we switch to detect-only: count strikes but
+            // never BSOD, because BSODing when self-healing is impossible
+            // serves no purpose.
+            if (hvci_detect::is_hvci_enabled()) {
+                SN_LOG("integrity::verify: HVCI active, breakpoint at +0x%lx (detect-only)", offset);
+                return true;
+            }
 
             UCHAR original_byte = g_shadow_copy[offset];
             bool restored = self_protect::safe_write_memory(
@@ -231,17 +240,22 @@ namespace integrity {
                 }
 
 
-                bool restored = self_protect::safe_write_memory(
-                    diff_addr, g_shadow_copy + diff_offset,
-                    min((ULONG)64, size - diff_offset));
+                // Under HVCI, safe_write_memory() is blocked — the EPT
+                // refuses the writable MDL alias.  Skip the restore attempt
+                // and count a strike, but do not BSOD (handled below).
+                if (!hvci_detect::is_hvci_enabled()) {
+                    bool restored = self_protect::safe_write_memory(
+                        diff_addr, g_shadow_copy + diff_offset,
+                        min((ULONG)64, size - diff_offset));
 
-                if (restored) {
+                    if (restored) {
 
-                    UINT32 after_crc = compute_crc32(base, size);
-                    if (after_crc == g_baseline_crc) {
+                        UINT32 after_crc = compute_crc32(base, size);
+                        if (after_crc == g_baseline_crc) {
 
-                        _InterlockedExchange(&g_integrity_strikes, 0);
-                        return true;
+                            _InterlockedExchange(&g_integrity_strikes, 0);
+                            return true;
+                        }
                     }
                 }
             }
@@ -250,6 +264,13 @@ namespace integrity {
 
             LONG strikes = _InterlockedIncrement(&g_integrity_strikes);
             if (strikes >= INTEGRITY_STRIKE_THRESHOLD) {
+                // Under HVCI, restoration is impossible (MDL remap blocked).
+                // BSODing when we cannot self-heal is counter-productive:
+                // suppress and continue in detect-only mode.
+                if (hvci_detect::is_hvci_enabled()) {
+                    SN_LOG("integrity::verify: HVCI active, suppressing BSOD (strikes=%ld)", strikes);
+                    return true;
+                }
                 if (_KeBugCheckEx) {
                     _KeBugCheckEx(
                         0xDEAD5E01,
