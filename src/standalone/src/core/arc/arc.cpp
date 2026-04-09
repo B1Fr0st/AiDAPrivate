@@ -1,17 +1,4 @@
-// ============================================================================
-// AiDA Runtime Core (ARC) — Implementation
-// ============================================================================
-// This DLL is the server-delivered dependency that bridges AiDA ↔ driver.
-// Without it loaded, AiDA's UI works but every RE tool returns failure.
-//
-// Security measures:
-//   - HWID verification (FNV-1a recomputation)
-//   - Session token validation
-//   - Anti-debug: PEB.BeingDebugged, NtQueryInformationProcess, timing
-//   - Code integrity: FNV-1a hash of own .text section
-//   - Session state spread across multiple allocations
-//   - All internal strings are encrypted with rolling XOR
-// ============================================================================
+
 
 #define ARC_EXPORTS
 #define WIN32_LEAN_AND_MEAN
@@ -35,31 +22,29 @@
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "bcrypt.lib")
 
-// ─── Internal State ─────────────────────────────────────────────────────────
 
 namespace
 {
-    // Session state (encrypted in memory)
+
     struct arc_session_t
     {
         bool     initialized;
-        uint64_t session_hash;         // FNV-1a of session_token
-        uint64_t hwid_hash;            // FNV-1a of hwid
-        uint64_t init_timestamp;       // When arc_init was called
-        uint64_t xor_key;              // Random key XORed with state for in-memory obfuscation
-        uint64_t code_hash;            // FNV-1a of ARC's own .text section
-        uint64_t heartbeat_counter;    // Incremented each heartbeat
-        uint64_t last_heartbeat_tsc;   // __rdtsc() at last heartbeat
+        uint64_t session_hash;
+        uint64_t hwid_hash;
+        uint64_t init_timestamp;
+        uint64_t xor_key;
+        uint64_t code_hash;
+        uint64_t heartbeat_counter;
+        uint64_t last_heartbeat_tsc;
     };
 
     std::mutex      g_session_mtx;
     arc_session_t   g_session = {};
 
-    // The comm vtable instance
+
     arc_comm_vtable_t g_vtable = {};
     bool              g_vtable_ready = false;
 
-    // ─── FNV-1a Hashing ─────────────────────────────────────────────────
 
     uint64_t fnv1a(const void* data, size_t len)
     {
@@ -78,8 +63,6 @@ namespace
         return fnv1a(s, strlen(s));
     }
 
-    // ─── HWID Recomputation ─────────────────────────────────────────────
-    // Must match the generate_hwid() in standalone_license.cpp exactly.
 
     std::string recompute_hwid()
     {
@@ -137,15 +120,14 @@ namespace
         return out;
     }
 
-    // ─── Anti-Debug Checks ──────────────────────────────────────────────
 
     bool check_debugger_present()
     {
-        // PEB.BeingDebugged
+
         if (IsDebuggerPresent())
             return true;
 
-        // NtQueryInformationProcess — DebugPort
+
         using NtQIP_t = LONG(WINAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
         auto NtQIP = reinterpret_cast<NtQIP_t>(
             GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
@@ -153,7 +135,7 @@ namespace
             ULONG_PTR debug_port = 0;
             LONG status = NtQIP(
                 GetCurrentProcess(),
-                7,          // ProcessDebugPort
+                7,
                 &debug_port,
                 sizeof(debug_port),
                 nullptr);
@@ -161,13 +143,13 @@ namespace
                 return true;
         }
 
-        // Heap flags check (debug heap indicators)
+
         auto* peb = reinterpret_cast<const uint8_t*>(
             __readgsqword(0x60));
         if (peb) {
-            // NtGlobalFlag at offset 0xBC in PEB (x64)
+
             uint32_t flags = *reinterpret_cast<const uint32_t*>(peb + 0xBC);
-            // FLG_HEAP_ENABLE_TAIL_CHECK | FLG_HEAP_ENABLE_FREE_CHECK | FLG_HEAP_VALIDATE_PARAMETERS
+
             if (flags & 0x70)
                 return true;
         }
@@ -175,14 +157,12 @@ namespace
         return false;
     }
 
-    // ─── Code Integrity ─────────────────────────────────────────────────
-    // Hash our own .text section to detect in-memory patches.
 
     uint64_t compute_own_code_hash()
     {
         HMODULE hMod = nullptr;
 
-        // Get our own module handle without incrementing reference count
+
         MEMORY_BASIC_INFORMATION mbi = {};
         if (VirtualQuery(reinterpret_cast<const void*>(&compute_own_code_hash), &mbi, sizeof(mbi)) == 0)
             return 0;
@@ -210,7 +190,6 @@ namespace
         return combined;
     }
 
-    // ─── Session Validation ─────────────────────────────────────────────
 
     bool is_session_valid()
     {
@@ -218,12 +197,12 @@ namespace
         if (!g_session.initialized)
             return false;
 
-        // Verify XOR-obfuscated state is consistent
+
         uint64_t check = g_session.session_hash ^ g_session.hwid_hash ^ g_session.xor_key;
         if (check == 0)
             return false;
 
-        // Verify timestamp is reasonable (within 24 hours)
+
         int64_t now = static_cast<int64_t>(time(nullptr));
         int64_t delta = now - static_cast<int64_t>(g_session.init_timestamp);
         if (delta < -300 || delta > 86400)
@@ -232,10 +211,8 @@ namespace
         return true;
     }
 
-    // ─── VTable Wrappers ────────────────────────────────────────────────
-    // Each wrapper validates session state before forwarding to device_t.
 
-    bool vtable_connect(uint64_t /*seed*/)
+    bool vtable_connect(uint64_t )
     {
         if (!is_session_valid()) return false;
         if (check_debugger_present()) return false;
@@ -404,7 +381,6 @@ namespace
     }
 }
 
-// ─── Exported Functions ─────────────────────────────────────────────────────
 
 extern "C"
 {
@@ -415,43 +391,43 @@ ARC_API bool arc_init(
     int64_t      timestamp,
     uint32_t     interface_version)
 {
-    // Version check — reject stale ARC binaries
+
     if (interface_version != ARC_INTERFACE_VERSION)
         return false;
 
     if (!session_token || !hwid)
         return false;
 
-    // Validate session token format (64 hex chars)
+
     size_t token_len = strlen(session_token);
     if (token_len < 32 || token_len > 128)
         return false;
 
-    // Validate HWID length
+
     size_t hwid_len = strlen(hwid);
     if (hwid_len < 8 || hwid_len > 64)
         return false;
 
-    // Anti-debug: refuse to initialize under debugger
+
     if (check_debugger_present())
         return false;
 
-    // HWID verification: recompute locally and compare
+
     std::string local_hwid = recompute_hwid();
     if (local_hwid != hwid)
         return false;
 
-    // Timestamp freshness check (within 5 minutes)
+
     int64_t now = static_cast<int64_t>(time(nullptr));
     int64_t drift = now - timestamp;
     if (drift < -300 || drift > 300)
         return false;
 
-    // All checks passed — initialize session state
+
     {
         std::lock_guard<std::mutex> lk(g_session_mtx);
 
-        // Generate random XOR key for in-memory obfuscation
+
         uint64_t tsc = __rdtsc();
         g_session.xor_key = tsc ^ 0xA1DA'CAFE'BABE'C0DEull;
 
@@ -526,23 +502,23 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
     {
         std::lock_guard<std::mutex> lk(g_session_mtx);
         if (g_session.code_hash != 0 && current_hash != g_session.code_hash) {
-            // Code has been patched — invalidate session
+
             g_session.initialized = false;
             SecureZeroMemory(&g_session, sizeof(g_session));
             return result;
         }
 
-        // Anti-debug check
+
         if (check_debugger_present()) {
             g_session.initialized = false;
             SecureZeroMemory(&g_session, sizeof(g_session));
             return result;
         }
 
-        // Timestamp monotonicity check (clock rollback detection)
+
         uint64_t current_tsc = __rdtsc();
         if (current_tsc < g_session.last_heartbeat_tsc) {
-            // TSC went backwards — suspicious
+
             g_session.initialized = false;
             SecureZeroMemory(&g_session, sizeof(g_session));
             return result;
@@ -550,7 +526,7 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
         g_session.last_heartbeat_tsc = current_tsc;
         g_session.heartbeat_counter++;
 
-        // Generate proof token: HMAC-like construction
+
         uint64_t proof_data[5] = {
             g_session.session_hash,
             g_session.hwid_hash,
@@ -570,23 +546,22 @@ ARC_API void arc_cleanup()
 {
     std::lock_guard<std::mutex> lk(g_session_mtx);
 
-    // Securely wipe session state
+
     SecureZeroMemory(&g_session, sizeof(g_session));
 
-    // Zero the vtable function pointers
+
     SecureZeroMemory(&g_vtable, sizeof(g_vtable));
     g_vtable_ready = false;
 }
 
-} // extern "C"
+}
 
-// ─── DllMain ────────────────────────────────────────────────────────────────
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
 {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
-        // Minimal initialization — real init happens in arc_init()
+
         break;
     case DLL_PROCESS_DETACH:
         arc_cleanup();

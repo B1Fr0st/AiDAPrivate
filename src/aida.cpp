@@ -64,9 +64,7 @@ extern "C" bool __stdcall simpleline_place_t__equals(
     return simpleline_place_t__compare2(a, b, ud) == 0;
 }
 
-// ---------------------------------------------------------------------------
-// show_eula_dialog  (IDA SDK only, no Qt)
-// ---------------------------------------------------------------------------
+
 static bool show_eula_dialog()
 {
     int choice = ask_yn(ASKBTN_NO,
@@ -87,9 +85,7 @@ static bool show_eula_dialog()
     return choice == ASKBTN_YES;
 }
 
-// ---------------------------------------------------------------------------
-// Right-click context menu population  (only the 4 kept actions)
-// ---------------------------------------------------------------------------
+
 static int idaapi finish_populating_widget_popup(
     TWidget* widget, TPopupMenu* popup_handle,
     const action_activation_ctx_t* ctx)
@@ -114,9 +110,7 @@ static int idaapi finish_populating_widget_popup(
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// ui_event_listener_t
-// ---------------------------------------------------------------------------
+
 ssize_t idaapi ui_event_listener_t::on_event(ssize_t code, va_list va)
 {
 #ifdef __NT__

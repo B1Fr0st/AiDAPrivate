@@ -85,12 +85,12 @@ namespace
     std::atomic<uint64_t> s_gate_tokens[standalone_license::GATE_SLOT_COUNT] = {};
     int64_t s_sweep_start_time = 0;
 
-    /* ── ARC (AiDA Runtime Core) state ───────────────────── */
+
     arc_loader::loaded_module_t  s_arc_module{};
     std::mutex                   s_arc_mtx;
     bool                         s_arc_loaded = false;
 
-    // ARC function pointers resolved after reflective load
+
     using arc_init_fn           = bool(*)(const char*, const char*, int64_t, uint32_t);
     using arc_get_comm_bridge_fn = const arc_comm_vtable_t*(*)();
     using arc_validate_tool_fn  = uint64_t(*)(uint64_t, uint64_t);
@@ -440,9 +440,7 @@ namespace
         set_obfuscated_valid(true, nonce_seed);
     }
 
-    // ─── ARC Download + Decrypt + Reflective Load ───────────────────────
 
-    // Base64 decode (standard alphabet)
     std::vector<uint8_t> base64_decode(const std::string& encoded)
     {
         static const uint8_t table[256] = {
@@ -480,14 +478,14 @@ namespace
         return out;
     }
 
-    // HMAC-SHA256 key derivation using BCrypt (matches server: arc-encrypt.js)
+
     std::vector<uint8_t> derive_session_key(
         const std::string& session_token,
         const std::string& hwid,
         int64_t issued_at,
         const std::string& master_secret)
     {
-        // message = "session_token|hwid|issued_at"
+
         std::string message = session_token + "|" + hwid + "|" + std::to_string(issued_at);
 
         BCRYPT_ALG_HANDLE hAlg = nullptr;
@@ -528,7 +526,7 @@ namespace
         return result;
     }
 
-    // AES-256-GCM decryption using BCrypt (matches server: arc-encrypt.js)
+
     std::vector<uint8_t> aes_gcm_decrypt(
         const std::vector<uint8_t>& key,
         const std::vector<uint8_t>& iv,
@@ -592,7 +590,7 @@ namespace
         return plaintext;
     }
 
-    // Hex decode utility
+
     std::vector<uint8_t> hex_decode(const std::string& hex)
     {
         std::vector<uint8_t> out;
@@ -610,11 +608,11 @@ namespace
     {
         std::lock_guard<std::mutex> lk(s_arc_mtx);
 
-        // If already loaded, skip
+
         if (s_arc_loaded)
             return true;
 
-        // Download encrypted ARC blob from server
+
         try {
             httplib::Client client(get_cloud_function_host());
             client.set_connection_timeout(15);
@@ -638,7 +636,7 @@ namespace
                 return false;
             }
 
-            // Extract encrypted blob, IV, auth tag
+
             std::string blob_b64   = resp.value("encrypted_blob", "");
             std::string iv_hex     = resp.value("iv", "");
             std::string tag_hex    = resp.value("auth_tag", "");
@@ -657,10 +655,7 @@ namespace
                 return false;
             }
 
-            // Derive per-session decryption key
-            // Key = HMAC-SHA256(master_secret, "session_token|hwid|issued_at")
-            // The client uses the session token as the master secret component
-            // that matches the server's derivation
+
             auto session_key = derive_session_key(
                 settings.license_session_token,
                 hwid,
@@ -672,7 +667,7 @@ namespace
                 return false;
             }
 
-            // Decrypt ARC blob (AES-256-GCM)
+
             auto pe_data = aes_gcm_decrypt(session_key, iv, auth_tag, encrypted_blob);
             SecureZeroMemory(session_key.data(), session_key.size());
 
@@ -681,7 +676,7 @@ namespace
                 return false;
             }
 
-            // Reflective load
+
             s_arc_module = arc_loader::load(pe_data.data(), pe_data.size());
             if (!s_arc_module.base) {
                 OutputDebugStringA("ARC: Reflective load failed: ");
@@ -690,7 +685,7 @@ namespace
                 return false;
             }
 
-            // Resolve exports
+
             s_fn_arc_init = reinterpret_cast<arc_init_fn>(
                 arc_loader::get_export(s_arc_module, "arc_init"));
             s_fn_arc_get_comm_bridge = reinterpret_cast<arc_get_comm_bridge_fn>(
@@ -709,7 +704,7 @@ namespace
                 return false;
             }
 
-            // Initialize ARC with session data
+
             int64_t now = static_cast<int64_t>(std::time(nullptr));
             if (!s_fn_arc_init(
                     settings.license_session_token.c_str(),
@@ -919,7 +914,7 @@ namespace standalone_license
             return false;
         }
 
-        // Download and reflectively load ARC after successful validation
+
         const std::string hwid = settings.license_hwid.empty() ? generate_hwid() : settings.license_hwid;
         download_and_load_arc(settings, hwid);
 
@@ -943,7 +938,7 @@ namespace standalone_license
 
         apply_valid_response(settings, key, hwid, response);
 
-        // Download and reflectively load ARC after successful activation
+
         download_and_load_arc(settings, hwid);
 
         snapshot_code_hashes();
@@ -1220,7 +1215,6 @@ namespace standalone_license
         return decode_status_string_impl(static_cast<status_string_id>(string_id));
     }
 
-    // ─── ARC Public Accessors ───────────────────────────────────────────
 
     bool is_arc_loaded()
     {

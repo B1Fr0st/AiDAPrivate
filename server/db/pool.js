@@ -1,14 +1,9 @@
-// ============================================================================
-// AiDA License Server — PostgreSQL Connection Pool
-// ============================================================================
-// Provides a shared pg.Pool instance backed by DATABASE_URL.
-// All queries go through pool.query() for automatic connection management.
-// ============================================================================
+
 
 const path = require('path');
 const fs = require('fs');
 
-// Load .env if not already loaded by PM2 ecosystem
+
 (function loadDotEnv() {
     if (process.env.DATABASE_URL) return;
     const envPath = path.join(__dirname, '..', '.env');

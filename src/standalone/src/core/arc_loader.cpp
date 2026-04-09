@@ -19,7 +19,6 @@ namespace
         OutputDebugStringA("\n");
     }
 
-    // ─── PE Header Validation ───────────────────────────────────────────
 
     bool validate_pe(const uint8_t* buf, size_t size)
     {
@@ -58,12 +57,11 @@ namespace
         return true;
     }
 
-    // ─── Map Sections ───────────────────────────────────────────────────
 
     bool map_sections(uint8_t* image_base, const uint8_t* pe_buf, size_t pe_size,
                       const IMAGE_NT_HEADERS* nt)
     {
-        // Copy headers first
+
         size_t header_size = nt->OptionalHeader.SizeOfHeaders;
         if (header_size > pe_size) {
             set_error("SizeOfHeaders exceeds PE buffer.");
@@ -71,19 +69,19 @@ namespace
         }
         memcpy(image_base, pe_buf, header_size);
 
-        // Copy each section
+
         const auto* sec = IMAGE_FIRST_SECTION(nt);
         for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
             if (sec[i].SizeOfRawData == 0)
                 continue;
 
-            // Bounds check source
+
             if (static_cast<size_t>(sec[i].PointerToRawData) + sec[i].SizeOfRawData > pe_size) {
                 set_error("Section raw data exceeds PE buffer.");
                 return false;
             }
 
-            // Bounds check destination
+
             if (static_cast<size_t>(sec[i].VirtualAddress) + sec[i].SizeOfRawData >
                 nt->OptionalHeader.SizeOfImage) {
                 set_error("Section virtual address exceeds image size.");
@@ -98,14 +96,13 @@ namespace
         return true;
     }
 
-    // ─── Process Relocations ────────────────────────────────────────────
 
     bool process_relocations(uint8_t* image_base, const IMAGE_NT_HEADERS* nt)
     {
         auto delta = reinterpret_cast<uintptr_t>(image_base) -
                      nt->OptionalHeader.ImageBase;
         if (delta == 0)
-            return true; // No relocations needed
+            return true;
 
         const auto& reloc_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
         if (reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0) {
@@ -132,7 +129,7 @@ namespace
 
                 switch (type) {
                 case IMAGE_REL_BASED_ABSOLUTE:
-                    break; // Padding, skip
+                    break;
                 case IMAGE_REL_BASED_DIR64: {
                     auto* patch = reinterpret_cast<uint64_t*>(
                         image_base + reloc->VirtualAddress + offset);
@@ -158,12 +155,10 @@ namespace
         return true;
     }
 
-    // ─── Resolve Imports ────────────────────────────────────────────────
-    // Only allow imports from trusted system DLLs.
 
     bool is_allowed_import_dll(const char* name)
     {
-        // Case-insensitive comparison for allowed DLLs
+
         static const char* allowed[] = {
             "kernel32.dll",
             "ntdll.dll",
@@ -199,7 +194,7 @@ namespace
     {
         const auto& import_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
         if (import_dir.VirtualAddress == 0 || import_dir.Size == 0)
-            return true; // No imports
+            return true;
 
         auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
             image_base + import_dir.VirtualAddress);
@@ -250,7 +245,6 @@ namespace
         return true;
     }
 
-    // ─── Set Section Permissions ────────────────────────────────────────
 
     void finalize_sections(uint8_t* image_base, const IMAGE_NT_HEADERS* nt)
     {
@@ -281,7 +275,6 @@ namespace
         }
     }
 
-    // ─── Process TLS Callbacks ──────────────────────────────────────────
 
     void process_tls(uint8_t* image_base, const IMAGE_NT_HEADERS* nt)
     {
@@ -300,7 +293,6 @@ namespace
         }
     }
 
-    // ─── Export Resolution ──────────────────────────────────────────────
 
     void* find_export(uint8_t* image_base, const IMAGE_NT_HEADERS* nt, const char* name)
     {
@@ -321,10 +313,10 @@ namespace
                 uint16_t ordinal = ordinals[i];
                 uint32_t rva = functions[ordinal];
 
-                // Check for forwarded export (RVA within export directory)
+
                 if (rva >= export_dir.VirtualAddress &&
                     rva < export_dir.VirtualAddress + export_dir.Size) {
-                    // Forwarded exports not supported for ARC
+
                     return nullptr;
                 }
 
@@ -336,7 +328,6 @@ namespace
     }
 }
 
-// ─── Public API ─────────────────────────────────────────────────────────────
 
 namespace arc_loader
 {
@@ -362,7 +353,7 @@ namespace arc_loader
             return result;
         }
 
-        // Allocate memory for the image
+
         auto* image_base = static_cast<uint8_t*>(
             VirtualAlloc(nullptr, image_size,
                          MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -371,38 +362,38 @@ namespace arc_loader
             return result;
         }
 
-        // Map sections from PE buffer to allocated memory
+
         if (!map_sections(image_base, pe_buffer, pe_size, nt)) {
             VirtualFree(image_base, 0, MEM_RELEASE);
             return result;
         }
 
-        // Get the NT headers from the mapped image (not from the original buffer)
+
         auto* mapped_nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
             image_base + dos->e_lfanew);
 
-        // Process relocations
+
         if (!process_relocations(image_base, mapped_nt)) {
             VirtualFree(image_base, 0, MEM_RELEASE);
             return result;
         }
 
-        // Resolve imports
+
         if (!resolve_imports(image_base, mapped_nt)) {
             VirtualFree(image_base, 0, MEM_RELEASE);
             return result;
         }
 
-        // Set section permissions
+
         finalize_sections(image_base, mapped_nt);
 
-        // Process TLS callbacks
+
         process_tls(image_base, mapped_nt);
 
-        // Securely zero the original PE buffer
+
         SecureZeroMemory(pe_buffer, pe_size);
 
-        // Call DllMain(DLL_PROCESS_ATTACH)
+
         using DllMain_t = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
         auto entry_point = reinterpret_cast<DllMain_t>(
             image_base + mapped_nt->OptionalHeader.AddressOfEntryPoint);
@@ -461,7 +452,7 @@ namespace arc_loader
 
         auto* image_base = static_cast<uint8_t*>(mod.base);
 
-        // Call DllMain(DLL_PROCESS_DETACH) if it was initialized
+
         if (mod.initialized) {
             auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image_base);
             auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS*>(image_base + dos->e_lfanew);
@@ -477,11 +468,11 @@ namespace arc_loader
                     nullptr);
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Ignore exceptions during detach
+
             }
         }
 
-        // Securely zero the image before freeing
+
         SecureZeroMemory(mod.base, mod.image_size);
         VirtualFree(mod.base, 0, MEM_RELEASE);
 

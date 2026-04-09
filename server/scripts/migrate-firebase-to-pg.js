@@ -1,22 +1,8 @@
 #!/usr/bin/env node
-// ============================================================================
-// AiDA — Firebase RTDB → PostgreSQL Migration Script
-// ============================================================================
-// Exports ALL data from Firebase (licenses, sessions, bans, violations) and
-// inserts it into the PostgreSQL database on the new server.
-//
-// Usage:
-//   node migrate-firebase-to-pg.js
-//
-// Environment variables (or uses hardcoded defaults for AiDA):
-//   FIREBASE_DB_URL   — Firebase RTDB URL
-//   FIREBASE_SECRET   — Database secret for admin access
-//   DATABASE_URL      — PostgreSQL connection string
-// ============================================================================
+
 
 const { Pool } = require('pg');
 
-// ─── Configuration ──────────────────────────────────────────────────────────
 
 const FIREBASE_DB_URL = process.env.FIREBASE_DB_URL
     || 'https://aida-license-prod-default-rtdb.europe-west1.firebasedatabase.app';
@@ -30,7 +16,6 @@ const pool = new Pool({
     ssl: false,
 });
 
-// ─── Firebase REST helpers ──────────────────────────────────────────────────
 
 function fbUrl(path) {
     return `${FIREBASE_DB_URL}/${path}.json?auth=${FIREBASE_SECRET}`;
@@ -45,7 +30,6 @@ async function fbGet(path) {
     return res.json();
 }
 
-// ─── Migration Functions ────────────────────────────────────────────────────
 
 async function migrateLicenses() {
     console.log('\n── Migrating licenses ─────────────────────────────────────');
@@ -63,8 +47,8 @@ async function migrateLicenses() {
 
     for (const [key, data] of entries) {
         try {
-            // Firebase stores created_at as either a date string "2025-04-09" or
-            // an epoch number.  Normalize to epoch bigint.
+
+
             let createdAt;
             if (typeof data.created_at === 'number') {
                 createdAt = data.created_at;
@@ -75,7 +59,7 @@ async function migrateLicenses() {
                 createdAt = Math.floor(Date.now() / 1000);
             }
 
-            // Normalize revoked_at the same way
+
             let revokedAt = null;
             if (typeof data.revoked_at === 'number') {
                 revokedAt = data.revoked_at;
@@ -145,7 +129,7 @@ async function migrateSessions() {
 
     for (const [licenseKey, data] of entries) {
         try {
-            // Check that the license exists in PG (foreign key constraint)
+
             const check = await pool.query('SELECT 1 FROM licenses WHERE key = $1', [licenseKey]);
             if (check.rows.length === 0) {
                 console.log(`  ⚠️  ${licenseKey}: license not in PG, skipping session`);
@@ -194,7 +178,7 @@ async function migrateBans() {
 
     let total = 0;
 
-    // HWID bans
+
     const hwidBans = await fbGet('bans/hwid');
     if (hwidBans) {
         const entries = Object.entries(hwidBans);
@@ -231,7 +215,7 @@ async function migrateBans() {
         console.log('  No HWID bans found.');
     }
 
-    // IP bans
+
     const ipBans = await fbGet('bans/ip');
     if (ipBans) {
         const entries = Object.entries(ipBans);
@@ -312,7 +296,6 @@ async function migrateViolations() {
     return migrated;
 }
 
-// ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
     console.log('============================================================');
@@ -323,17 +306,17 @@ async function main() {
     console.log('============================================================');
 
     try {
-        // Test PG connection
+
         const pgTest = await pool.query('SELECT 1 AS ok');
         if (pgTest.rows[0].ok !== 1) throw new Error('PG connection test failed');
         console.log('\n✅ PostgreSQL connection OK');
 
-        // Test Firebase connection by fetching the licenses root
+
         const fbTest = await fbGet('licenses');
         const fbKeyCount = fbTest ? Object.keys(fbTest).length : 0;
         console.log(`✅ Firebase connection OK (${fbKeyCount} license keys found)`);
 
-        // Run migrations in order (licenses first due to FK constraints)
+
         const licensesCount   = await migrateLicenses();
         const sessionsCount   = await migrateSessions();
         const bansCount       = await migrateBans();
@@ -348,7 +331,7 @@ async function main() {
         console.log(`  Violations: ${violationsCount}`);
         console.log('============================================================');
 
-        // Verify counts
+
         const verifyLicenses = await pool.query('SELECT count(*) FROM licenses');
         const verifySessions = await pool.query('SELECT count(*) FROM sessions');
         const verifyBans     = await pool.query('SELECT count(*) FROM bans');

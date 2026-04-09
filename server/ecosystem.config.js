@@ -1,14 +1,9 @@
-// ============================================================================
-// AiDA License Server — PM2 Ecosystem Configuration
-// ============================================================================
-// Domain: aidapro.net | Server: 23.88.62.199
-// Start:  cd /opt/aida/api && pm2 start ecosystem.config.js
-// ============================================================================
+
 
 const path = require('path');
 const fs = require('fs');
 
-// Load .env file manually for PM2 (PM2's env_file doesn't work reliably)
+
 function loadEnv() {
     const envPath = path.join(__dirname, '.env');
     const env = {};

@@ -364,9 +364,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 							ImGui::PopStyleColor(2);
 							if (committed) {
 								uint64_t write_addr = st.base_address + f.offset;
-								auto bytes = memory_scanner::parse_value(ui.edit_value_buf, 
+								auto bytes = memory_scanner::parse_value(ui.edit_value_buf,
 									static_cast<memory_scanner::value_type_t>(
-										std::min(static_cast<int>(f.type), 
+										std::min(static_cast<int>(f.type),
 												 static_cast<int>(memory_scanner::value_type_t::double_val))),
 									false);
 								if (!bytes.empty())

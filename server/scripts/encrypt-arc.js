@@ -1,15 +1,5 @@
 #!/usr/bin/env node
-// ============================================================================
-// AiDA — ARC Blob At-Rest Encryption Tool
-// ============================================================================
-// Encrypts a raw DLL file into the server's at-rest format.
-//
-// Usage:
-//   ARC_MASTER_SECRET=<secret> node encrypt-arc.js <input.dll> <output.bin>
-//
-// The output format is: [12 bytes IV][16 bytes authTag][ciphertext]
-// This is what the server reads from disk and caches in memory.
-// ============================================================================
+
 
 const crypto = require('crypto');
 const fs = require('fs');
@@ -35,13 +25,13 @@ if (!fs.existsSync(inputPath)) {
 
 const plaintext = fs.readFileSync(inputPath);
 
-// Validate MZ header
+
 if (plaintext.length < 2 || plaintext[0] !== 0x4D || plaintext[1] !== 0x5A) {
     console.error('Error: Input file does not have a valid MZ (PE) header');
     process.exit(1);
 }
 
-// Derive at-rest key from master secret (same as server/routes/download.js)
+
 const atRestKey = crypto.createHash('sha256')
     .update(`arc-at-rest|${masterSecret}`)
     .digest();
@@ -51,7 +41,7 @@ const cipher = crypto.createCipheriv('aes-256-gcm', atRestKey, iv);
 const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
 const authTag = cipher.getAuthTag();
 
-// Output: IV + AuthTag + Ciphertext
+
 const output = Buffer.concat([iv, authTag, encrypted]);
 fs.writeFileSync(outputPath, output);
 

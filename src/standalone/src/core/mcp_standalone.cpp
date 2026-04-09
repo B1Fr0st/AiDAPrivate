@@ -265,7 +265,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
                     standalone_license::str_session_revoked));
         }
 
-        // ARC validation: hash tool name and verify via ARC module
+
         if (standalone_license::is_arc_loaded()) {
             if (!params.contains("name") || !params["name"].is_string())
                 return make_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'name'");

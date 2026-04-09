@@ -30,7 +30,7 @@ namespace
     std::mutex      g_state_mtx;
     HANDLE          g_process = nullptr;
 
-    // Helper: get the ARC comm vtable if available
+
     const arc_comm_vtable_t* get_arc_vtable()
     {
         return standalone_license::get_arc_comm_bridge();

@@ -1,13 +1,5 @@
 #!/usr/bin/env node
-// ============================================================================
-// AiDA — PE Watermark Reader / Leak Tracer
-// ============================================================================
-// Reads the watermark block appended to a distributed AiDA binary.
-// Used to identify which license holder leaked a binary.
-//
-// Usage:
-//   ARC_MASTER_SECRET=<secret> node read-watermark.js <AiDA.exe>
-// ============================================================================
+
 
 const crypto = require('crypto');
 const fs = require('fs');
@@ -32,16 +24,16 @@ if (!fs.existsSync(filePath)) {
 }
 
 const data = fs.readFileSync(filePath);
-if (data.length < 258) { // MZ + at least 256 watermark
+if (data.length < 258) {
     console.error('Error: File too small to contain a watermark');
     process.exit(1);
 }
 
-// Extract last 256 bytes
+
 const block = Buffer.from(data.subarray(data.length - 256));
 const originalBinary = data.subarray(0, data.length - 256);
 
-// Decrypt XOR stream
+
 const streamKey = crypto.createHash('sha256')
     .update(`watermark-stream|${masterSecret}`)
     .digest();
@@ -49,7 +41,7 @@ for (let i = 0; i < 256; i++) {
     block[i] ^= streamKey[i % 32];
 }
 
-// Parse fields
+
 const magic = block.readUInt32BE(0);
 const version = block.readUInt32BE(4);
 
@@ -67,13 +59,13 @@ const hwidHash = block.subarray(144, 176).toString('hex');
 const ipHash = block.subarray(176, 192).toString('hex');
 const integrityHmac = block.subarray(192, 224).toString('hex');
 
-// Verify integrity of watermark block
+
 const expectedIntegrity = crypto.createHmac('sha256', masterSecret)
     .update(block.subarray(0, 192))
     .digest('hex');
 const integrityValid = expectedIntegrity === integrityHmac;
 
-// Verify binary hash matches the original (pre-watermark) binary
+
 const actualBinaryHash = crypto.createHash('sha256').update(originalBinary).digest('hex');
 const binaryHashValid = actualBinaryHash === binaryHash;
 
@@ -102,7 +94,7 @@ if (!integrityValid) {
     console.log('  or the ARC_MASTER_SECRET does not match the one used during distribution.');
 }
 
-// To identify the leaker, compare keyHash and hwidHash against known licenses:
+
 console.log('\n  To identify the license holder, run this query on the server:');
 console.log(`  SELECT key, hwid, note, plan FROM licenses`);
 console.log('  Then compute SHA-512(key) and SHA-256(hwid) for each row');

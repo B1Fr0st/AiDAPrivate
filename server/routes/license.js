@@ -1,15 +1,4 @@
-// ============================================================================
-// AiDA License Server — License Validation Routes
-// ============================================================================
-// Direct port of firebase/functions/index.js to Express + PostgreSQL.
-// Preserves IDENTICAL request/response format so the existing AiDA client
-// works with only a base URL change.
-//
-// POST /api/license
-//   body.action = "validate"          → Full license activation
-//   body.action = "heartbeat"         → Session keepalive
-//   body.action = "report_violation"  → Anti-RE violation reporting
-// ============================================================================
+
 
 const express = require('express');
 const crypto = require('crypto');
@@ -18,12 +7,10 @@ const { signPayload } = require('../crypto/signing');
 
 const router = express.Router();
 
-// ─── Configuration ──────────────────────────────────────────────────────────
 
 const SESSION_TTL_SECONDS = 3600;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
 
 function todayStr() {
     return new Date().toISOString().slice(0, 10);
@@ -60,9 +47,7 @@ function normalizeIp(ip) {
     return typeof ip === 'string' ? ip.replace(/[.:]/g, '_') : 'unknown';
 }
 
-/**
- * Send a Discord webhook embed (fire-and-forget).
- */
+
 async function sendDiscordWebhook(title, fields, color = 0xFF4444) {
     if (!DISCORD_WEBHOOK_URL) return;
     try {
@@ -82,10 +67,9 @@ async function sendDiscordWebhook(title, fields, color = 0xFF4444) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ embeds: [embed] }),
         });
-    } catch (_) { /* best-effort */ }
+    } catch (_) {  }
 }
 
-// ─── Database Queries ───────────────────────────────────────────────────────
 
 async function lookupLicense(licenseKey) {
     if (!licenseKey || typeof licenseKey !== 'string') {
@@ -121,7 +105,7 @@ async function verifyOrBindHwid(licenseKey, hwid, existingHwid) {
     }
 
     if (!existingHwid || existingHwid === '') {
-        // First activation — bind HWID atomically
+
         await pool.query(
             'UPDATE licenses SET hwid = $1 WHERE key = $2 AND hwid = $3',
             [hwid, licenseKey, '']
@@ -216,7 +200,7 @@ async function recordBan(hwid, clientIp, reason, version) {
     const isoNow = new Date().toISOString();
     const sanitized = reason || 'violation';
 
-    // Ban HWID
+
     if (hwid) {
         await pool.query(`
             INSERT INTO bans (ban_type, value, reason, banned_at, banned_at_iso, plugin_version, ip)
@@ -227,7 +211,7 @@ async function recordBan(hwid, clientIp, reason, version) {
         `, [hwid, sanitized, now, isoNow, version || 'unknown', clientIp || 'unknown']);
     }
 
-    // Ban IP
+
     if (clientIp && clientIp !== 'unknown') {
         const normalized = normalizeIp(clientIp);
         await pool.query(`
@@ -239,13 +223,13 @@ async function recordBan(hwid, clientIp, reason, version) {
         `, [normalized, sanitized, now, isoNow, version || 'unknown', hwid || 'unknown', clientIp]);
     }
 
-    // Audit trail
+
     await pool.query(`
         INSERT INTO violations (hwid, ip, reason, timestamp, timestamp_iso, plugin_version)
         VALUES ($1, $2, $3, $4, $5, $6)
     `, [hwid || 'unknown', clientIp || 'unknown', sanitized, now, isoNow, version || 'unknown']);
 
-    // Cascade: delete all licenses bound to this HWID
+
     let deletedKeys = [];
     if (hwid) {
         const { rows } = await pool.query(
@@ -260,7 +244,7 @@ async function recordBan(hwid, clientIp, reason, version) {
         }
     }
 
-    // Discord webhook
+
     const fields = [
         { name: '\uD83D\uDEA8 Reason', value: sanitized },
         { name: '\uD83D\uDDA5\uFE0F HWID', value: `\`${hwid || 'unknown'}\`` },
@@ -276,7 +260,6 @@ async function recordBan(hwid, clientIp, reason, version) {
     await sendDiscordWebhook('\uD83D\uDEA8 AiDA Violation Detected', fields, 0xFF0000);
 }
 
-// ─── Action: validate ───────────────────────────────────────────────────────
 
 async function handleValidate(body, clientIp) {
     const { license_key, hwid, client_nonce, plugin_version } = body;
@@ -288,7 +271,7 @@ async function handleValidate(body, clientIp) {
         return { status: 400, body: { status: 'error', reason: 'invalid_nonce' } };
     }
 
-    // Clock drift check
+
     if (body.timestamp && typeof body.timestamp === 'number') {
         const drift = Math.abs(Math.floor(Date.now() / 1000) - body.timestamp);
         if (drift > 300) {
@@ -296,25 +279,25 @@ async function handleValidate(body, clientIp) {
         }
     }
 
-    // Ban check BEFORE any license lookup
+
     const banCheck = await checkBans(hwid, clientIp);
     if (banCheck.banned) {
         return { status: 200, body: { status: 'banned', reason: banCheck.reason } };
     }
 
-    // License lookup
+
     const lookup = await lookupLicense(license_key);
     if (!lookup.valid) {
         return { status: 200, body: { status: 'invalid', reason: lookup.reason } };
     }
 
-    // Verify/bind HWID
+
     const hwidResult = await verifyOrBindHwid(license_key, hwid, lookup.data.hwid || '');
     if (!hwidResult.ok) {
         return { status: 200, body: { status: 'invalid', reason: hwidResult.reason } };
     }
 
-    // Generate session
+
     const sessionToken = generateSessionToken();
     const serverNonce = generateServerNonce();
     const issuedAt = Math.floor(Date.now() / 1000);
@@ -331,7 +314,7 @@ async function handleValidate(body, clientIp) {
         last_heartbeat: issuedAt,
     });
 
-    // Sign response
+
     const sigPayload = {
         status: 'valid',
         license_key,
@@ -351,7 +334,6 @@ async function handleValidate(body, clientIp) {
     };
 }
 
-// ─── Action: heartbeat ──────────────────────────────────────────────────────
 
 async function handleHeartbeat(body, clientIp) {
     const { license_key, session_token, hwid } = body;
@@ -360,13 +342,13 @@ async function handleHeartbeat(body, clientIp) {
         return { status: 400, body: { status: 'error', reason: 'missing_fields' } };
     }
 
-    // Ban check
+
     const banCheck = await checkBans(hwid, clientIp);
     if (banCheck.banned) {
         return { status: 200, body: { status: 'banned', reason: banCheck.reason } };
     }
 
-    // Clock drift
+
     if (body.timestamp && typeof body.timestamp === 'number') {
         const drift = Math.abs(Math.floor(Date.now() / 1000) - body.timestamp);
         if (drift > 300) {
@@ -378,7 +360,7 @@ async function handleHeartbeat(body, clientIp) {
         return { status: 200, body: { status: 'invalid', reason: 'invalid_heartbeat_nonce' } };
     }
 
-    // Re-verify license is still active
+
     const lookup = await lookupLicense(license_key);
     if (!lookup.valid) {
         return {
@@ -387,13 +369,13 @@ async function handleHeartbeat(body, clientIp) {
         };
     }
 
-    // Verify session token
+
     const session = await getSession(license_key);
     if (!session || session.session_token !== session_token) {
         return { status: 200, body: { status: 'invalid', reason: 'session_mismatch' } };
     }
 
-    // Session TTL check with 1.5x grace
+
     const now = Math.floor(Date.now() / 1000);
     if (session.issued_at && session.ttl) {
         const expiresAt = session.issued_at + Math.floor(session.ttl * 1.5);
@@ -402,18 +384,18 @@ async function handleHeartbeat(body, clientIp) {
         }
     }
 
-    // HWID consistency
+
     if (hwid && session.hwid && hwid !== session.hwid) {
         return { status: 200, body: { status: 'invalid', reason: 'hwid_mismatch' } };
     }
 
-    // Update last heartbeat
+
     await pool.query(
         'UPDATE sessions SET last_heartbeat = $1 WHERE license_key = $2',
         [now, license_key]
     );
 
-    // Sign and return response
+
     const heartbeatNonce = body.heartbeat_nonce || '';
     const serverNonce = generateServerNonce();
 
@@ -434,12 +416,11 @@ async function handleHeartbeat(body, clientIp) {
     };
 }
 
-// ─── Action: report_violation ───────────────────────────────────────────────
 
 async function handleReportViolation(body, clientIp) {
     const { hwid, reason, version, license_key, session_token } = body;
 
-    // Fail closed — always return ok to prevent probing
+
     if (!hwid || typeof hwid !== 'string' || hwid.length < 8 || hwid.length > 64) {
         return { status: 200, body: { status: 'ok' } };
     }
@@ -468,7 +449,6 @@ async function handleReportViolation(body, clientIp) {
     return { status: 200, body: { status: 'ok' } };
 }
 
-// ─── Route Handler ──────────────────────────────────────────────────────────
 
 router.post('/', async (req, res) => {
     const body = req.body;

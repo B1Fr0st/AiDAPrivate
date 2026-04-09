@@ -7,10 +7,10 @@ import re
 import os
 
 WORKSPACES = [
-    r"C:\Users\ruar\AiDAPrivate\src",
+    r"C:\Users\ruar\AiDAPrivate\server",
 ]
 
-CPP_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.inl'}
+CPP_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.inl', '.js'}
 ASM_EXTENSIONS = {'.asm'}
 SKIP_DIRS = {'build', '.vs', 'x64', 'Debug', 'Release', 'packages'}
 
