@@ -7,6 +7,7 @@
 #include "mcp_standalone.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_license.hpp"
+#include "arc/arc.h"
 #include "zydis_disasm.hpp"
 #include "sandbox.hpp"
 #include <httplib.h>
@@ -262,6 +263,22 @@ json server_t::handle_tools_call(const json& id, const json& params)
             return make_error(id, -32000,
                 standalone_license::decode_status_string(
                     standalone_license::str_session_revoked));
+        }
+
+        // ARC validation: hash tool name and verify via ARC module
+        if (standalone_license::is_arc_loaded()) {
+            if (!params.contains("name") || !params["name"].is_string())
+                return make_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'name'");
+            const std::string early_name = params["name"].get<std::string>();
+            uint64_t name_hash = 14695981039346656037ULL;
+            for (char c : early_name) {
+                name_hash ^= static_cast<uint8_t>(c);
+                name_hash *= 1099511628211ULL;
+            }
+            uint64_t arc_result = standalone_license::arc_validate_tool(name_hash, gt);
+            if (arc_result == 0) {
+                return make_error(id, -32000, "Service unavailable.");
+            }
         }
     }
 

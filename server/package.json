@@ -1,0 +1,21 @@
+{
+  "name": "aida-license-server",
+  "version": "1.0.0",
+  "description": "AiDA License Validation & Distribution Server — PostgreSQL backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "migrate": "psql $DATABASE_URL -f db/schema.sql"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^8.0.0",
+    "pg": "^8.20.0",
+    "uuid": "^11.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

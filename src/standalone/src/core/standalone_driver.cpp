@@ -2,6 +2,7 @@
 #include "standalone_driver.hpp"
 #include "standalone_license.hpp"
 #include "driver_loader.hpp"
+#include "arc/arc.h"
 #include "comm.h"
 
 #include <windows.h>
@@ -28,6 +29,12 @@ namespace
 
     std::mutex      g_state_mtx;
     HANDLE          g_process = nullptr;
+
+    // Helper: get the ARC comm vtable if available
+    const arc_comm_vtable_t* get_arc_vtable()
+    {
+        return standalone_license::get_arc_comm_bridge();
+    }
     uint32_t        g_pid = 0;
     std::string     g_process_name;
     std::string     g_last_error;
@@ -216,15 +223,29 @@ namespace driver_bridge
 
         std::lock_guard<std::mutex> lk(g_state_mtx);
         if (g_kernel_mode && device && device->is_connected()) {
-            device->set_process_id(pid);
-            device->solve_dtb();
-            if (device->get_dtb() == 0) {
-                set_last_error_locked("Kernel bridge failed to resolve target DTB.");
-                return false;
+            const auto* vtable = get_arc_vtable();
+            if (vtable && vtable->set_process_id && vtable->solve_dtb &&
+                vtable->get_dtb && vtable->find_image && vtable->set_base_address) {
+                vtable->set_process_id(pid);
+                uint64_t dtb = vtable->solve_dtb();
+                if (dtb == 0) {
+                    set_last_error_locked("Kernel bridge failed to resolve target DTB.");
+                    return false;
+                }
+                const auto image_base = vtable->find_image();
+                if (image_base != 0)
+                    vtable->set_base_address(image_base);
+            } else {
+                device->set_process_id(pid);
+                device->solve_dtb();
+                if (device->get_dtb() == 0) {
+                    set_last_error_locked("Kernel bridge failed to resolve target DTB.");
+                    return false;
+                }
+                const auto image_base = device->find_image();
+                if (image_base != 0)
+                    device->set_base_address(image_base);
             }
-            const auto image_base = device->find_image();
-            if (image_base != 0)
-                device->set_base_address(image_base);
         }
 
 
@@ -252,7 +273,12 @@ namespace driver_bridge
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             if (g_kernel_mode && device && device->is_connected()) {
-                kernel_pid = device->find_process(process_name.c_str());
+                const auto* vtable = get_arc_vtable();
+                if (vtable && vtable->find_process) {
+                    kernel_pid = vtable->find_process(process_name.c_str());
+                } else {
+                    kernel_pid = device->find_process(process_name.c_str());
+                }
             }
         }
         if (kernel_pid != 0)
@@ -275,8 +301,14 @@ namespace driver_bridge
         close_process_handle_locked();
         g_pid = 0;
         g_process_name.clear();
-        if (g_kernel_mode && device && device->is_connected())
-            device->clear_process_context();
+        if (g_kernel_mode && device && device->is_connected()) {
+            const auto* vtable = get_arc_vtable();
+            if (vtable && vtable->clear_process_context) {
+                vtable->clear_process_context();
+            } else {
+                device->clear_process_context();
+            }
+        }
         set_last_error_locked({});
     }
 
@@ -465,17 +497,36 @@ namespace driver_bridge
         }
 
         if (kernel_mode) {
-            const auto regions = device->enumerate_memory_regions(0, 0, false);
-            for (const auto& src : regions) {
-                memory_region_t region;
-                region.base = src.base;
-                region.size = src.size;
-                region.state = src.state;
-                region.protect = src.protect;
-                region.type = src.type;
-                result.push_back(region);
-                if (result.size() >= max_regions)
-                    break;
+            const auto* vtable = get_arc_vtable();
+            if (vtable && vtable->enumerate_memory_regions) {
+                struct enum_ctx { std::vector<memory_region_t>* out; size_t max; };
+                enum_ctx ctx{&result, max_regions};
+                vtable->enumerate_memory_regions(
+                    [](const arc_comm_vtable_t::memory_region_info_t* info, void* user) {
+                        auto* c = static_cast<enum_ctx*>(user);
+                        if (c->out->size() >= c->max) return;
+                        memory_region_t region;
+                        region.base    = info->base;
+                        region.size    = info->size;
+                        region.state   = info->state;
+                        region.protect = info->protect;
+                        region.type    = info->type;
+                        c->out->push_back(region);
+                    },
+                    &ctx);
+            } else {
+                const auto regions = device->enumerate_memory_regions(0, 0, false);
+                for (const auto& src : regions) {
+                    memory_region_t region;
+                    region.base = src.base;
+                    region.size = src.size;
+                    region.state = src.state;
+                    region.protect = src.protect;
+                    region.type = src.type;
+                    result.push_back(region);
+                    if (result.size() >= max_regions)
+                        break;
+                }
             }
             return result;
         }
@@ -495,16 +546,28 @@ namespace driver_bridge
         }
 
         if (kernel_mode) {
-            voyager::device_t::memory_region_info info = {};
-            if (!device->query_memory(address, info))
-                return false;
-
-            region.base = info.base;
-            region.size = info.size;
-            region.state = info.state;
-            region.protect = info.protect;
-            region.type = info.type;
-            return true;
+            const auto* vtable = get_arc_vtable();
+            if (vtable && vtable->query_memory) {
+                arc_comm_vtable_t::memory_region_info_t arc_info{};
+                if (!vtable->query_memory(address, &arc_info))
+                    return false;
+                region.base    = arc_info.base;
+                region.size    = arc_info.size;
+                region.state   = arc_info.state;
+                region.protect = arc_info.protect;
+                region.type    = arc_info.type;
+                return true;
+            } else {
+                voyager::device_t::memory_region_info info = {};
+                if (!device->query_memory(address, info))
+                    return false;
+                region.base = info.base;
+                region.size = info.size;
+                region.state = info.state;
+                region.protect = info.protect;
+                region.type = info.type;
+                return true;
+            }
         }
 
 
@@ -537,7 +600,13 @@ namespace driver_bridge
 
         if (kernel_mode) {
             out.resize(size);
-            const auto bytes_read = device->read_raw(address, out.data(), size);
+            size_t bytes_read = 0;
+            const auto* vtable = get_arc_vtable();
+            if (vtable && vtable->read_raw) {
+                bytes_read = vtable->read_raw(address, out.data(), size);
+            } else {
+                bytes_read = device->read_raw(address, out.data(), size);
+            }
             if (bytes_read == 0) {
                 out.clear();
                 return false;
@@ -571,7 +640,13 @@ namespace driver_bridge
         }
 
         if (kernel_mode) {
-            const auto bytes_written = device->write_raw(address, data.data(), data.size());
+            size_t bytes_written = 0;
+            const auto* vtable = get_arc_vtable();
+            if (vtable && vtable->write_raw) {
+                bytes_written = vtable->write_raw(address, data.data(), data.size());
+            } else {
+                bytes_written = device->write_raw(address, data.data(), data.size());
+            }
             return bytes_written > 0;
         }
 

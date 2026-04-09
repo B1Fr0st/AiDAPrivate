@@ -1,6 +1,7 @@
 // ============================================================================
 // AiDA License Bot — Discord bot for managing AiDA license keys
 // ============================================================================
+// Migrated from Firebase RTDB to PostgreSQL.
 //
 // Commands (owner-only slash commands):
 //   /generate      duration plan [note]          — Create one license key
@@ -28,7 +29,7 @@
 //   /dashboard                                   — Combined stats overview
 //
 // Only OWNER_ID can invoke any command.
-// Firebase writes use the database secret to bypass security rules.
+// Uses direct PostgreSQL queries (replaces Firebase REST).
 // ============================================================================
 
 const {
@@ -41,69 +42,35 @@ const {
     MessageFlags,
 } = require('discord.js');
 const { v4: uuidv4 } = require('uuid');
+const { Pool } = require('pg');
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
-const BOT_TOKEN       = process.env.AIDA_BOT_TOKEN       || 'MTQ4NzUzNzkyOTM4NjcyNTUyMQ.G1FQRX.HfLlZeo680ebtL1ToqfMcGHFiOF2EAsCdnetCE';
-const OWNER_ID        = process.env.AIDA_OWNER_ID        || '937382022056407160';
-const FIREBASE_DB_URL = process.env.AIDA_FIREBASE_DB_URL || 'https://aida-license-prod-default-rtdb.europe-west1.firebasedatabase.app';
-// Firebase Database Secret — grants admin bypass of all security rules.
-const FIREBASE_SECRET = process.env.AIDA_FIREBASE_SECRET || 'bWLmMKBhD3TE7iYMnKizIjOrt4jXd9R1m0CVCj6P';
+const BOT_TOKEN    = process.env.AIDA_BOT_TOKEN    || 'MTQ4NzUzNzkyOTM4NjcyNTUyMQ.G1FQRX.HfLlZeo680ebtL1ToqfMcGHFiOF2EAsCdnetCE';
+const OWNER_ID     = process.env.AIDA_OWNER_ID     || '937382022056407160';
+const DATABASE_URL = process.env.AIDA_DATABASE_URL  || 'postgresql://ruar:EhF3NbwCQ4ch2NxtkqP7@23.88.62.199:5432/aida_db';
 
-// ─── Firebase REST helpers ────────────────────────────────────────────────────
+// ─── PostgreSQL connection pool ───────────────────────────────────────────────
 
-/** Append ?auth=<secret> so every REST call has admin access. */
-function fbUrl(path) {
-    return `${FIREBASE_DB_URL}/${path}.json?auth=${FIREBASE_SECRET}`;
-}
+const pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: false,
+    max: 5,
+    idleTimeoutMillis: 30000,
+});
 
-async function fbGet(path) {
-    const res = await fetch(fbUrl(path));
-    if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        throw new Error(`Firebase GET ${path} failed: ${res.status} — ${body}`);
-    }
-    return res.json();
-}
+pool.on('error', (err) => {
+    console.error('PostgreSQL pool error:', err.message);
+});
 
-async function fbPut(path, data) {
-    const res = await fetch(fbUrl(path), {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-    });
-    if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        throw new Error(`Firebase PUT ${path} failed: ${res.status} — ${body}`);
-    }
-    return res.json();
-}
+// ─── PostgreSQL helpers ───────────────────────────────────────────────────────
 
-async function fbPatch(path, data) {
-    const res = await fetch(fbUrl(path), {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-    });
-    if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        throw new Error(`Firebase PATCH ${path} failed: ${res.status} — ${body}`);
-    }
-    return res.json();
-}
-
-async function fbDelete(path) {
-    const res = await fetch(fbUrl(path), { method: 'DELETE' });
-    if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        throw new Error(`Firebase DELETE ${path} failed: ${res.status} — ${body}`);
-    }
-    return res.json();
+async function pgQuery(text, params) {
+    return pool.query(text, params);
 }
 
 // ─── Constants & Helpers ─────────────────────────────────────────────────────
 
-/** Plans offered — used for autocomplete. */
 const PLANS = ['pro', 'basic', 'enterprise', 'lifetime', 'trial'];
 
 const DURATION_CHOICES = [
@@ -167,7 +134,6 @@ function addDuration(base, days, hours) {
     return includeTime ? d.toISOString() : d.toISOString().slice(0, 10);
 }
 
-/** Returns { label, color } based on live state of the license record. */
 function licenseStatus(data) {
     if (isExpired(data.expires))
         return { label: '⚠️ Expired',  color: 0xFF8800 };
@@ -240,7 +206,7 @@ const commands = [
     // /revoke
     new SlashCommandBuilder()
         .setName('revoke')
-        .setDescription('�️ Revoke and permanently delete a license key')
+        .setDescription('🗑️ Revoke and permanently delete a license key')
         .addStringOption(opt =>
             opt.setName('key')
                .setDescription('License key to revoke')
@@ -497,11 +463,11 @@ client.on('interactionCreate', async (interaction) => {
             const key      = generateKey();
             const expires  = duration > 0 ? addDays(todayStr(), duration) : '';
 
-            await fbPut(`licenses/${key}`, {
-                active: true, hwid: '', expires, plan, note,
-                created_at: todayStr(),
-                created_by: interaction.user.tag,
-            });
+            await pgQuery(
+                `INSERT INTO licenses (key, active, hwid, expires, plan, note, created_at, created_by)
+                 VALUES ($1, true, '', $2, $3, $4, $5, $6)`,
+                [key, expires, plan, note, Math.floor(Date.now() / 1000), interaction.user.tag]
+            );
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -526,15 +492,16 @@ client.on('interactionCreate', async (interaction) => {
             const plan     = interaction.options.getString('plan').toLowerCase();
             const note     = interaction.options.getString('note') ?? '';
             const expires  = duration > 0 ? addDays(todayStr(), duration) : '';
+            const now      = Math.floor(Date.now() / 1000);
 
             const keys = [];
             for (let i = 0; i < count; i++) {
                 const key = generateKey();
-                await fbPut(`licenses/${key}`, {
-                    active: true, hwid: '', expires, plan, note,
-                    created_at: todayStr(),
-                    created_by: interaction.user.tag,
-                });
+                await pgQuery(
+                    `INSERT INTO licenses (key, active, hwid, expires, plan, note, created_at, created_by)
+                     VALUES ($1, true, '', $2, $3, $4, $5, $6)`,
+                    [key, expires, plan, note, now, interaction.user.tag]
+                );
                 keys.push(key);
             }
 
@@ -556,13 +523,15 @@ client.on('interactionCreate', async (interaction) => {
 
         // ── /revoke ───────────────────────────────────────────────────────────
         else if (commandName === 'revoke') {
-            const key  = interaction.options.getString('key').toUpperCase().trim();
-            const data = await fbGet(`licenses/${key}`);
-            if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+            const key = interaction.options.getString('key').toUpperCase().trim();
 
-            // Revoke = delete from database entirely
-            await fbDelete(`licenses/${key}`);
-            await fbDelete(`sessions/${key}`).catch(() => {});
+            const { rows } = await pgQuery('SELECT * FROM licenses WHERE key = $1', [key]);
+            if (!rows.length) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+            const data = rows[0];
+
+            // Delete session first (FK cascade would handle it, but be explicit)
+            await pgQuery('DELETE FROM sessions WHERE license_key = $1', [key]);
+            await pgQuery('DELETE FROM licenses WHERE key = $1', [key]);
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -580,11 +549,17 @@ client.on('interactionCreate', async (interaction) => {
 
         // ── /info ─────────────────────────────────────────────────────────────
         else if (commandName === 'info') {
-            const key  = interaction.options.getString('key').toUpperCase().trim();
-            const data = await fbGet(`licenses/${key}`);
-            if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+            const key = interaction.options.getString('key').toUpperCase().trim();
 
+            const { rows } = await pgQuery('SELECT * FROM licenses WHERE key = $1', [key]);
+            if (!rows.length) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+            const data = rows[0];
             const { label, color } = licenseStatus(data);
+
+            // Get created_at as a displayable string
+            const createdStr = data.created_at
+                ? new Date(data.created_at * 1000).toISOString().slice(0, 10)
+                : '—';
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -599,7 +574,7 @@ client.on('interactionCreate', async (interaction) => {
                         { name: '🖥️ HWID',  value: data.hwid
                             ? `\`\`\`${data.hwid}\`\`\``
                             : '*(not bound yet)*',                                      inline: false },
-                        { name: '📅 Created', value: data.created_at || '—',           inline: true  },
+                        { name: '📅 Created', value: createdStr,                       inline: true  },
                         { name: '👤 Creator', value: data.created_by || '—',           inline: true  },
                         { name: '📝 Note',    value: data.note || '—',                 inline: true  },
                     )
@@ -609,29 +584,30 @@ client.on('interactionCreate', async (interaction) => {
 
         // ── /list ─────────────────────────────────────────────────────────────
         else if (commandName === 'list') {
-            const filter   = interaction.options.getString('filter') ?? 'all';
-            const licenses = await fbGet('licenses');
+            const filter = interaction.options.getString('filter') ?? 'all';
 
-            if (!licenses || !Object.keys(licenses).length)
+            let query = 'SELECT * FROM licenses ORDER BY created_at DESC';
+            const { rows: allLicenses } = await pgQuery(query);
+
+            if (!allLicenses.length)
                 return interaction.editReply('📭 No licenses found.');
 
-            let entries = Object.entries(licenses);
+            let entries = allLicenses;
 
-            if (filter === 'active')  entries = entries.filter(([, d]) =>  d.active && !isExpired(d.expires));
-            if (filter === 'expired') entries = entries.filter(([, d]) =>  isExpired(d.expires));
-            if (filter === 'unbound') entries = entries.filter(([, d]) => !d.hwid);
+            if (filter === 'active')  entries = entries.filter(d =>  d.active && !isExpired(d.expires));
+            if (filter === 'expired') entries = entries.filter(d =>  isExpired(d.expires));
+            if (filter === 'unbound') entries = entries.filter(d => !d.hwid);
 
             if (!entries.length)
                 return interaction.editReply(`📭 No licenses match filter: **${filter}**.`);
 
-            const lines = entries.map(([key, d]) => {
+            const lines = entries.map(d => {
                 const { label } = licenseStatus(d);
                 const lock = d.hwid ? '🔒' : '🔓';
                 const note = d.note ? ` *(${d.note})*` : '';
-                return `${label} ${lock} \`${key}\` — \`${d.plan || '?'}\`${note}`;
+                return `${label} ${lock} \`${d.key}\` — \`${d.plan || '?'}\`${note}`;
             });
 
-            // Paginate into ≤3800-char chunks to stay under Discord's 4096 embed limit
             const chunks = [];
             let cur = '';
             for (const line of lines) {
@@ -657,24 +633,25 @@ client.on('interactionCreate', async (interaction) => {
 
         // ── /search ───────────────────────────────────────────────────────────
         else if (commandName === 'search') {
-            const query    = interaction.options.getString('query').toLowerCase();
-            const licenses = await fbGet('licenses');
-            if (!licenses) return interaction.editReply('📭 No licenses found.');
+            const query = interaction.options.getString('query').toLowerCase();
 
-            const matches = Object.entries(licenses).filter(([key, d]) =>
-                key.toLowerCase().includes(query) ||
-                (d.note       && d.note.toLowerCase().includes(query))       ||
-                (d.plan       && d.plan.toLowerCase().includes(query))       ||
-                (d.created_by && d.created_by.toLowerCase().includes(query))
+            const { rows: matches } = await pgQuery(
+                `SELECT * FROM licenses
+                 WHERE LOWER(key) LIKE $1
+                    OR LOWER(note) LIKE $1
+                    OR LOWER(plan) LIKE $1
+                    OR LOWER(created_by) LIKE $1
+                 ORDER BY created_at DESC`,
+                [`%${query}%`]
             );
 
             if (!matches.length)
                 return interaction.editReply(`🔍 No keys match \`${query}\`.`);
 
-            const lines = matches.map(([key, d]) => {
+            const lines = matches.map(d => {
                 const { label } = licenseStatus(d);
                 const note = d.note ? ` *(${d.note})*` : '';
-                return `${label} \`${key}\` — \`${d.plan || '?'}\`${note}`;
+                return `${label} \`${d.key}\` — \`${d.plan || '?'}\`${note}`;
             });
 
             await interaction.editReply({ embeds: [
@@ -689,8 +666,8 @@ client.on('interactionCreate', async (interaction) => {
 
         // ── /stats ────────────────────────────────────────────────────────────
         else if (commandName === 'stats') {
-            const licenses = await fbGet('licenses');
-            const all      = Object.values(licenses || {});
+            const { rows: allLicenses } = await pgQuery('SELECT * FROM licenses');
+            const all     = allLicenses;
             const total   = all.length;
             const active  = all.filter(d =>  d.active && !isExpired(d.expires)).length;
             const expired = all.filter(d =>  isExpired(d.expires)).length;
@@ -724,11 +701,15 @@ client.on('interactionCreate', async (interaction) => {
 
         // ── /reset_hwid ───────────────────────────────────────────────────────
         else if (commandName === 'reset_hwid') {
-            const key  = interaction.options.getString('key').toUpperCase().trim();
-            const data = await fbGet(`licenses/${key}`);
-            if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+            const key = interaction.options.getString('key').toUpperCase().trim();
 
-            await fbPatch(`licenses/${key}`, { hwid: '' });
+            const { rows } = await pgQuery('SELECT * FROM licenses WHERE key = $1', [key]);
+            if (!rows.length) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+            const data = rows[0];
+
+            await pgQuery("UPDATE licenses SET hwid = '' WHERE key = $1", [key]);
+            // Also delete session — new HWID means new session
+            await pgQuery('DELETE FROM sessions WHERE license_key = $1', [key]);
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -742,20 +723,23 @@ client.on('interactionCreate', async (interaction) => {
 
         // ── /extend ───────────────────────────────────────────────────────────
         else if (commandName === 'extend') {
-            const key  = interaction.options.getString('key').toUpperCase().trim();
-            const days = interaction.options.getInteger('days');
+            const key   = interaction.options.getString('key').toUpperCase().trim();
+            const days  = interaction.options.getInteger('days');
             const hours = interaction.options.getInteger('hours');
-            const data = await fbGet(`licenses/${key}`);
-            if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+
+            const { rows } = await pgQuery('SELECT * FROM licenses WHERE key = $1', [key]);
+            if (!rows.length) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+            const data = rows[0];
 
             if (!days && !hours)
                 return interaction.editReply('Error: provide days or hours to extend.');
             if (days && hours)
                 return interaction.editReply('Error: provide either days or hours, not both.');
+
             const base = data.expires || (hours ? new Date().toISOString() : todayStr());
             const newExpiry = addDuration(base, days || 0, hours || 0);
             const addedText = hours ? String(hours) + ' hour(s)' : String(days) + ' day(s)';
-            await fbPatch(`licenses/${key}`, { expires: newExpiry, active: true });
+            await pgQuery('UPDATE licenses SET expires = $1, active = true WHERE key = $2', [newExpiry, key]);
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -764,8 +748,8 @@ client.on('interactionCreate', async (interaction) => {
                     .setDescription(`\`${key}\``)
                     .addFields(
                         { name: '📅 Old Expiry', value: formatExpiry(data.expires), inline: true },
-                        { name: '📅 New Expiry', value: formatExpiry(newExpiry),                  inline: true },
-                        { name: '➕ Added', value: addedText,          inline: true },
+                        { name: '📅 New Expiry', value: formatExpiry(newExpiry),    inline: true },
+                        { name: '➕ Added',       value: addedText,                 inline: true },
                     )
                     .setTimestamp(),
             ]});
@@ -775,10 +759,12 @@ client.on('interactionCreate', async (interaction) => {
         else if (commandName === 'setnote') {
             const key  = interaction.options.getString('key').toUpperCase().trim();
             const note = interaction.options.getString('note');
-            const data = await fbGet(`licenses/${key}`);
-            if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
 
-            await fbPatch(`licenses/${key}`, { note });
+            const { rows } = await pgQuery('SELECT * FROM licenses WHERE key = $1', [key]);
+            if (!rows.length) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+            const data = rows[0];
+
+            await pgQuery('UPDATE licenses SET note = $1 WHERE key = $2', [note, key]);
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -799,32 +785,42 @@ client.on('interactionCreate', async (interaction) => {
             const ip     = interaction.options.getString('ip')?.trim() ?? '';
             const reason = interaction.options.getString('reason')?.trim() || 'manual_ban';
             const now    = Math.floor(Date.now() / 1000);
+            const nowIso = new Date().toISOString();
 
-            const banRecord = {
-                reason,
-                banned_at: now,
-                banned_at_iso: new Date().toISOString(),
-                banned_by: interaction.user.tag,
-            };
+            // Insert HWID ban
+            await pgQuery(
+                `INSERT INTO bans (ban_type, value, reason, banned_at, banned_at_iso, ip, banned_by)
+                 VALUES ('hwid', $1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (ban_type, value) DO UPDATE SET
+                     reason = EXCLUDED.reason, banned_at = EXCLUDED.banned_at,
+                     banned_at_iso = EXCLUDED.banned_at_iso, ip = EXCLUDED.ip,
+                     banned_by = EXCLUDED.banned_by`,
+                [hwid, reason, now, nowIso, ip || 'unknown', interaction.user.tag]
+            );
 
-            await fbPut(`bans/hwid/${hwid}`, { ...banRecord, ip: ip || 'unknown' });
-
+            // Also ban IP if provided
             if (ip) {
                 const normalizedIp = ip.replace(/[.:]/g, '_');
-                await fbPut(`bans/ip/${normalizedIp}`, { ...banRecord, hwid, original_ip: ip });
+                await pgQuery(
+                    `INSERT INTO bans (ban_type, value, reason, banned_at, banned_at_iso, hwid, original_ip, banned_by)
+                     VALUES ('ip', $1, $2, $3, $4, $5, $6, $7)
+                     ON CONFLICT (ban_type, value) DO UPDATE SET
+                         reason = EXCLUDED.reason, banned_at = EXCLUDED.banned_at,
+                         banned_at_iso = EXCLUDED.banned_at_iso, hwid = EXCLUDED.hwid,
+                         original_ip = EXCLUDED.original_ip, banned_by = EXCLUDED.banned_by`,
+                    [normalizedIp, reason, now, nowIso, hwid, ip, interaction.user.tag]
+                );
             }
 
             // Delete all licenses bound to this HWID
-            const licenses = await fbGet('licenses');
+            const { rows: boundLicenses } = await pgQuery(
+                'SELECT key FROM licenses WHERE hwid = $1', [hwid]
+            );
             const deleted = [];
-            if (licenses) {
-                for (const [key, d] of Object.entries(licenses)) {
-                    if (d.hwid === hwid) {
-                        await fbDelete(`licenses/${key}`);
-                        await fbDelete(`sessions/${key}`).catch(() => {});
-                        deleted.push(key);
-                    }
-                }
+            for (const row of boundLicenses) {
+                await pgQuery('DELETE FROM sessions WHERE license_key = $1', [row.key]);
+                await pgQuery('DELETE FROM licenses WHERE key = $1', [row.key]);
+                deleted.push(row.key);
             }
 
             const fields = [
@@ -848,24 +844,22 @@ client.on('interactionCreate', async (interaction) => {
         // ── /unban ────────────────────────────────────────────────────────────
         else if (commandName === 'unban') {
             const target = interaction.options.getString('target').trim();
-            let removed = [];
+            const removed = [];
 
-            // Try as HWID (skip if target contains dots/colons — clearly an IP, not an HWID)
+            // Try as HWID
             if (!/[.:]/.test(target)) {
-                const hwidBan = await fbGet(`bans/hwid/${target}`);
-                if (hwidBan) {
-                    await fbDelete(`bans/hwid/${target}`);
-                    removed.push(`HWID \`${target}\``);
-                }
+                const res = await pgQuery(
+                    "DELETE FROM bans WHERE ban_type = 'hwid' AND value = $1 RETURNING *", [target]
+                );
+                if (res.rowCount > 0) removed.push(`HWID \`${target}\``);
             }
 
-            // Try as IP (both raw and normalized)
+            // Try as IP (normalized)
             const normalizedTarget = target.replace(/[.:]/g, '_');
-            const ipBan = await fbGet(`bans/ip/${normalizedTarget}`);
-            if (ipBan) {
-                await fbDelete(`bans/ip/${normalizedTarget}`);
-                removed.push(`IP \`${target}\``);
-            }
+            const res = await pgQuery(
+                "DELETE FROM bans WHERE ban_type = 'ip' AND value = $1 RETURNING *", [normalizedTarget]
+            );
+            if (res.rowCount > 0) removed.push(`IP \`${target}\``);
 
             if (!removed.length)
                 return interaction.editReply(`❌ No bans found for \`${target}\`.`);
@@ -884,11 +878,21 @@ client.on('interactionCreate', async (interaction) => {
         else if (commandName === 'baninfo') {
             const target = interaction.options.getString('target').trim();
 
-            // Check HWID bans (skip if target contains dots/colons — it's an IP)
-            const hwidBan = /[.:]/.test(target) ? null : await fbGet(`bans/hwid/${target}`);
+            // Check HWID bans
+            let hwidBan = null;
+            if (!/[.:]/.test(target)) {
+                const res = await pgQuery(
+                    "SELECT * FROM bans WHERE ban_type = 'hwid' AND value = $1", [target]
+                );
+                if (res.rows.length) hwidBan = res.rows[0];
+            }
+
             // Check IP bans
             const normalizedTarget = target.replace(/[.:]/g, '_');
-            const ipBan = await fbGet(`bans/ip/${normalizedTarget}`);
+            const ipRes = await pgQuery(
+                "SELECT * FROM bans WHERE ban_type = 'ip' AND value = $1", [normalizedTarget]
+            );
+            const ipBan = ipRes.rows.length ? ipRes.rows[0] : null;
 
             if (!hwidBan && !ipBan)
                 return interaction.editReply(`❌ No ban found for \`${target}\`.`);
@@ -897,12 +901,12 @@ client.on('interactionCreate', async (interaction) => {
             const type = hwidBan ? 'HWID' : 'IP';
 
             const fields = [
-                { name: '🏷️ Type',     value: type,                                        inline: true },
-                { name: '🎯 Target',   value: `\`${target}\``,                             inline: true },
-                { name: '📝 Reason',   value: ban.reason || '—',                            inline: true },
-                { name: '📅 Banned',   value: ban.banned_at_iso || '—',                    inline: true },
-                { name: '👤 Banned by',value: ban.banned_by || '*(system)*',               inline: true },
-                { name: '📦 Version',  value: ban.plugin_version || '—',                   inline: true },
+                { name: '🏷️ Type',     value: type,                           inline: true },
+                { name: '🎯 Target',   value: `\`${target}\``,                inline: true },
+                { name: '📝 Reason',   value: ban.reason || '—',               inline: true },
+                { name: '📅 Banned',   value: ban.banned_at_iso || '—',       inline: true },
+                { name: '👤 Banned by',value: ban.banned_by || '*(system)*',  inline: true },
+                { name: '📦 Version',  value: ban.plugin_version || '—',      inline: true },
             ];
             if (ban.hwid) fields.push({ name: '🖥️ HWID', value: `\`${ban.hwid}\``, inline: true });
             if (ban.ip || ban.original_ip) fields.push({ name: '🌐 IP', value: `\`${ban.original_ip || ban.ip}\``, inline: true });
@@ -918,22 +922,23 @@ client.on('interactionCreate', async (interaction) => {
 
         // ── /bans ─────────────────────────────────────────────────────────────
         else if (commandName === 'bans') {
-            const hwidBans = await fbGet('bans/hwid') || {};
-            const ipBans   = await fbGet('bans/ip') || {};
+            const { rows: hwidBans } = await pgQuery(
+                "SELECT * FROM bans WHERE ban_type = 'hwid' ORDER BY banned_at DESC"
+            );
+            const { rows: ipBans } = await pgQuery(
+                "SELECT * FROM bans WHERE ban_type = 'ip' ORDER BY banned_at DESC"
+            );
 
-            const hwidEntries = Object.entries(hwidBans);
-            const ipEntries   = Object.entries(ipBans);
-
-            if (!hwidEntries.length && !ipEntries.length)
+            if (!hwidBans.length && !ipBans.length)
                 return interaction.editReply('📭 No active bans.');
 
             const lines = [];
-            for (const [hwid, d] of hwidEntries) {
+            for (const d of hwidBans) {
                 const reason = d.reason ? ` — *${d.reason}*` : '';
-                lines.push(`🖥️ HWID \`${hwid}\`${reason}`);
+                lines.push(`🖥️ HWID \`${d.value}\`${reason}`);
             }
-            for (const [, d] of ipEntries) {
-                const ip = d.original_ip || '?';
+            for (const d of ipBans) {
+                const ip = d.original_ip || d.value;
                 const reason = d.reason ? ` — *${d.reason}*` : '';
                 lines.push(`🌐 IP \`${ip}\`${reason}`);
             }
@@ -950,7 +955,7 @@ client.on('interactionCreate', async (interaction) => {
             const embeds = chunks.map((chunk, i) =>
                 new EmbedBuilder()
                     .setTitle(i === 0
-                        ? `📛 Active Bans (${hwidEntries.length} HWID, ${ipEntries.length} IP)`
+                        ? `📛 Active Bans (${hwidBans.length} HWID, ${ipBans.length} IP)`
                         : '📛 Continued...')
                     .setColor(0xFF4444)
                     .setDescription(chunk)
@@ -962,22 +967,25 @@ client.on('interactionCreate', async (interaction) => {
         // ── /violations ───────────────────────────────────────────────────────
         else if (commandName === 'violations') {
             const limit = interaction.options.getInteger('limit') ?? 10;
-            const violations = await fbGet('violations') || {};
-            const entries = Object.entries(violations)
-                .sort((a, b) => (b[1].timestamp || 0) - (a[1].timestamp || 0))
-                .slice(0, limit);
+
+            const { rows: totalRes } = await pgQuery('SELECT count(*) FROM violations');
+            const totalCount = parseInt(totalRes[0].count, 10);
+
+            const { rows: entries } = await pgQuery(
+                'SELECT * FROM violations ORDER BY timestamp DESC LIMIT $1', [limit]
+            );
 
             if (!entries.length)
                 return interaction.editReply('📭 No violations recorded.');
 
-            const lines = entries.map(([id, d]) => {
+            const lines = entries.map(d => {
                 const time = d.timestamp_iso ? d.timestamp_iso.slice(0, 19).replace('T', ' ') : '—';
                 return `\`${time}\` 🚨 **${d.reason || '?'}** — HWID \`${(d.hwid || '?').slice(0, 12)}…\` IP \`${d.ip || '?'}\``;
             });
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
-                    .setTitle(`🚨 Violation Log (${entries.length}/${Object.keys(violations).length})`)
+                    .setTitle(`🚨 Violation Log (${entries.length}/${totalCount})`)
                     .setColor(0xFF8800)
                     .setDescription(lines.join('\n'))
                     .setFooter({ text: `Showing ${entries.length} most recent` })
@@ -987,21 +995,26 @@ client.on('interactionCreate', async (interaction) => {
 
         // ── /lookup_hwid ──────────────────────────────────────────────────────
         else if (commandName === 'lookup_hwid') {
-            const hwid    = interaction.options.getString('hwid').trim();
-            const licenses = await fbGet('licenses') || {};
-            const matches = Object.entries(licenses).filter(([, d]) => d.hwid === hwid);
+            const hwid = interaction.options.getString('hwid').trim();
+
+            const { rows: matches } = await pgQuery(
+                'SELECT * FROM licenses WHERE hwid = $1 ORDER BY created_at DESC', [hwid]
+            );
 
             if (!matches.length)
                 return interaction.editReply(`🔎 No licenses found for HWID \`${hwid}\`.`);
 
-            const lines = matches.map(([key, d]) => {
+            const lines = matches.map(d => {
                 const { label } = licenseStatus(d);
                 const note = d.note ? ` *(${d.note})*` : '';
-                return `${label} \`${key}\` — \`${d.plan || '?'}\`${note}`;
+                return `${label} \`${d.key}\` — \`${d.plan || '?'}\`${note}`;
             });
 
             // Check ban status
-            const ban = await fbGet(`bans/hwid/${hwid}`);
+            const { rows: banRows } = await pgQuery(
+                "SELECT * FROM bans WHERE ban_type = 'hwid' AND value = $1", [hwid]
+            );
+            const ban = banRows.length ? banRows[0] : null;
             const banLine = ban
                 ? `\n\n⛔ **This HWID is BANNED** — ${ban.reason || 'no reason'} (${ban.banned_at_iso || '?'})`
                 : '';
@@ -1020,13 +1033,14 @@ client.on('interactionCreate', async (interaction) => {
         else if (commandName === 'transfer') {
             const key     = interaction.options.getString('key').toUpperCase().trim();
             const newHwid = interaction.options.getString('new_hwid').trim();
-            const data    = await fbGet(`licenses/${key}`);
-            if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+
+            const { rows } = await pgQuery('SELECT * FROM licenses WHERE key = $1', [key]);
+            if (!rows.length) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+            const data = rows[0];
 
             const oldHwid = data.hwid || '*(unbound)*';
-            await fbPatch(`licenses/${key}`, { hwid: newHwid });
-            // Clear session so the new machine gets a fresh session
-            await fbDelete(`sessions/${key}`).catch(() => {});
+            await pgQuery('UPDATE licenses SET hwid = $1 WHERE key = $2', [newHwid, key]);
+            await pgQuery('DELETE FROM sessions WHERE license_key = $1', [key]);
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -1047,11 +1061,13 @@ client.on('interactionCreate', async (interaction) => {
         else if (commandName === 'set_plan') {
             const key  = interaction.options.getString('key').toUpperCase().trim();
             const plan = interaction.options.getString('plan').toLowerCase();
-            const data = await fbGet(`licenses/${key}`);
-            if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+
+            const { rows } = await pgQuery('SELECT * FROM licenses WHERE key = $1', [key]);
+            if (!rows.length) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+            const data = rows[0];
 
             const oldPlan = data.plan || '—';
-            await fbPatch(`licenses/${key}`, { plan });
+            await pgQuery('UPDATE licenses SET plan = $1 WHERE key = $2', [plan, key]);
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -1070,14 +1086,16 @@ client.on('interactionCreate', async (interaction) => {
         else if (commandName === 'set_expiry') {
             const key  = interaction.options.getString('key').toUpperCase().trim();
             const date = interaction.options.getString('date').trim().toLowerCase();
-            const data = await fbGet(`licenses/${key}`);
-            if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+
+            const { rows } = await pgQuery('SELECT * FROM licenses WHERE key = $1', [key]);
+            if (!rows.length) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+            const data = rows[0];
 
             const newExpiry = date === 'never' ? '' : date;
             if (newExpiry && !/^\d{4}-\d{2}-\d{2}$/.test(newExpiry))
                 return interaction.editReply('❌ Invalid date format. Use `YYYY-MM-DD` or `never`.');
 
-            await fbPatch(`licenses/${key}`, { expires: newExpiry });
+            await pgQuery('UPDATE licenses SET expires = $1 WHERE key = $2', [newExpiry, key]);
 
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
@@ -1094,23 +1112,25 @@ client.on('interactionCreate', async (interaction) => {
 
         // ── /purge_expired ────────────────────────────────────────────────────
         else if (commandName === 'purge_expired') {
-            const licenses = await fbGet('licenses');
-            if (!licenses) return interaction.editReply('📭 No licenses found.');
+            const today = todayStr();
 
-            const expired = Object.entries(licenses)
-                .filter(([, d]) => isExpired(d.expires));
+            // Find all expired licenses (expires is non-empty and < today)
+            const { rows: expired } = await pgQuery(
+                "SELECT key, expires, note FROM licenses WHERE expires != '' AND expires < $1",
+                [today]
+            );
 
             if (!expired.length)
                 return interaction.editReply('✅ No expired licenses to purge.');
 
-            for (const [key] of expired) {
-                await fbDelete(`licenses/${key}`);
-                await fbDelete(`sessions/${key}`).catch(() => {});
-            }
+            // Delete them all (sessions cascade via FK)
+            const keys = expired.map(r => r.key);
+            await pgQuery('DELETE FROM sessions WHERE license_key = ANY($1)', [keys]);
+            await pgQuery('DELETE FROM licenses WHERE key = ANY($1)', [keys]);
 
-            const lines = expired.slice(0, 20).map(([key, d]) => {
+            const lines = expired.slice(0, 20).map(d => {
                 const note = d.note ? ` *(${d.note})*` : '';
-                return `\`${key}\` — expired \`${d.expires}\`${note}`;
+                return `\`${d.key}\` — expired \`${d.expires}\`${note}`;
             });
             const moreText = expired.length > 20 ? `\n…and ${expired.length - 20} more` : '';
 
@@ -1126,19 +1146,20 @@ client.on('interactionCreate', async (interaction) => {
 
         // ── /sessions ─────────────────────────────────────────────────────────
         else if (commandName === 'sessions') {
-            const sessions = await fbGet('sessions') || {};
-            const entries  = Object.entries(sessions);
+            const { rows: sessions } = await pgQuery(
+                'SELECT * FROM sessions ORDER BY last_heartbeat DESC'
+            );
 
-            if (!entries.length)
+            if (!sessions.length)
                 return interaction.editReply('📭 No active sessions.');
 
             const now = Math.floor(Date.now() / 1000);
-            const lines = entries.map(([key, s]) => {
+            const lines = sessions.map(s => {
                 const lastHb = s.last_heartbeat
                     ? `${Math.floor((now - s.last_heartbeat) / 60)}m ago`
                     : '—';
                 const hwid = s.hwid ? `\`${s.hwid.slice(0, 12)}…\`` : '—';
-                return `🔑 \`${key}\` — ${hwid} — last heartbeat: ${lastHb}`;
+                return `🔑 \`${s.license_key}\` — ${hwid} — last heartbeat: ${lastHb}`;
             });
 
             const chunks = [];
@@ -1153,7 +1174,7 @@ client.on('interactionCreate', async (interaction) => {
             const embeds = chunks.map((chunk, i) =>
                 new EmbedBuilder()
                     .setTitle(i === 0
-                        ? `📡 Active Sessions (${entries.length})`
+                        ? `📡 Active Sessions (${sessions.length})`
                         : '📡 Continued...')
                     .setColor(0x00AAFF)
                     .setDescription(chunk)
@@ -1164,29 +1185,28 @@ client.on('interactionCreate', async (interaction) => {
 
         // ── /nuke ─────────────────────────────────────────────────────────────
         else if (commandName === 'nuke') {
-            const key  = interaction.options.getString('key').toUpperCase().trim();
-            const data = await fbGet(`licenses/${key}`);
-            if (!data) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+            const key = interaction.options.getString('key').toUpperCase().trim();
+
+            const { rows } = await pgQuery('SELECT * FROM licenses WHERE key = $1', [key]);
+            if (!rows.length) return interaction.editReply(`❌ Key \`${key}\` not found.`);
+            const data = rows[0];
 
             const nuked = ['license'];
 
-            // Delete the license
-            await fbDelete(`licenses/${key}`);
+            // Delete the license (session cascades via FK ON DELETE CASCADE)
+            const { rowCount: sessDeleted } = await pgQuery(
+                'DELETE FROM sessions WHERE license_key = $1', [key]
+            );
+            if (sessDeleted > 0) nuked.push('session');
 
-            // Delete session
-            const session = await fbGet(`sessions/${key}`);
-            if (session) {
-                await fbDelete(`sessions/${key}`);
-                nuked.push('session');
-            }
+            await pgQuery('DELETE FROM licenses WHERE key = $1', [key]);
 
             // If HWID-bound, remove HWID ban
             if (data.hwid) {
-                const hwidBan = await fbGet(`bans/hwid/${data.hwid}`);
-                if (hwidBan) {
-                    await fbDelete(`bans/hwid/${data.hwid}`);
-                    nuked.push(`HWID ban (${data.hwid.slice(0, 12)}…)`);
-                }
+                const { rowCount: banDeleted } = await pgQuery(
+                    "DELETE FROM bans WHERE ban_type = 'hwid' AND value = $1", [data.hwid]
+                );
+                if (banDeleted > 0) nuked.push(`HWID ban (${data.hwid.slice(0, 12)}…)`);
             }
 
             await interaction.editReply({ embeds: [
@@ -1206,16 +1226,17 @@ client.on('interactionCreate', async (interaction) => {
 
         // ── /dashboard ────────────────────────────────────────────────────────
         else if (commandName === 'dashboard') {
-            const [licenses, sessions, hwidBans, ipBans, violations] = await Promise.all([
-                fbGet('licenses').then(d => d || {}),
-                fbGet('sessions').then(d => d || {}),
-                fbGet('bans/hwid').then(d => d || {}),
-                fbGet('bans/ip').then(d => d || {}),
-                fbGet('violations').then(d => d || {}),
+            // Run all queries in parallel for speed
+            const [licensesRes, sessionsRes, hwidBansRes, ipBansRes, violationsRes] = await Promise.all([
+                pgQuery('SELECT * FROM licenses'),
+                pgQuery('SELECT * FROM sessions'),
+                pgQuery("SELECT count(*) FROM bans WHERE ban_type = 'hwid'"),
+                pgQuery("SELECT count(*) FROM bans WHERE ban_type = 'ip'"),
+                pgQuery('SELECT * FROM violations ORDER BY timestamp DESC LIMIT 5'),
             ]);
 
-            const all   = Object.values(licenses);
-            const now   = Math.floor(Date.now() / 1000);
+            const all  = licensesRes.rows;
+            const now  = Math.floor(Date.now() / 1000);
 
             const total   = all.length;
             const active  = all.filter(d =>  d.active && !isExpired(d.expires)).length;
@@ -1223,20 +1244,17 @@ client.on('interactionCreate', async (interaction) => {
             const bound   = all.filter(d =>  d.hwid).length;
 
             // Recent activity — keys created in the last 7 days
-            const weekAgo   = addDays(todayStr(), -7);
+            const weekAgo   = Math.floor(Date.now() / 1000) - 7 * 86400;
             const recentKeys = all.filter(d => d.created_at && d.created_at >= weekAgo).length;
 
             // Active sessions (heartbeat within last 10 min)
-            const activeSessions = Object.values(sessions)
+            const activeSessions = sessionsRes.rows
                 .filter(s => s.last_heartbeat && (now - s.last_heartbeat) < 600).length;
 
-            // Recent violations (last 5)
-            const recentViolations = Object.entries(violations)
-                .sort((a, b) => (b[1].timestamp || 0) - (a[1].timestamp || 0))
-                .slice(0, 5);
-
+            // Recent violations
+            const recentViolations = violationsRes.rows;
             const violationLines = recentViolations.length
-                ? recentViolations.map(([, d]) => {
+                ? recentViolations.map(d => {
                     const time = d.timestamp_iso ? d.timestamp_iso.slice(0, 16).replace('T', ' ') : '—';
                     return `\`${time}\` **${d.reason || '?'}** — \`${(d.hwid || '?').slice(0, 12)}…\``;
                 }).join('\n')
@@ -1251,23 +1269,26 @@ client.on('interactionCreate', async (interaction) => {
                 .map(([p, c]) => `\`${p}\`: ${c}`)
                 .join('  ·  ') || '—';
 
+            const hwidBanCount = parseInt(hwidBansRes.rows[0].count, 10);
+            const ipBanCount   = parseInt(ipBansRes.rows[0].count, 10);
+
             await interaction.editReply({ embeds: [
                 new EmbedBuilder()
                     .setAuthor({ name: 'AiDA License System' })
                     .setTitle('📊 Dashboard')
                     .setColor(0x5865F2)
                     .addFields(
-                        { name: '📦 Total Keys',       value: String(total),                  inline: true },
-                        { name: '✅ Active',           value: String(active),                  inline: true },
-                        { name: '⚠️ Expired',         value: String(expired),                 inline: true },
-                        { name: '🔒 HWID Bound',       value: String(bound),                  inline: true },
-                        { name: '📡 Online Now',        value: String(activeSessions),         inline: true },
-                        { name: '🆕 New (7d)',          value: String(recentKeys),             inline: true },
-                        { name: '📈 Plans',             value: planLines,                      inline: false },
-                        { name: '📛 Bans',              value: `${Object.keys(hwidBans).length} HWID · ${Object.keys(ipBans).length} IP`, inline: false },
-                        { name: '🚨 Recent Violations', value: violationLines,                inline: false },
+                        { name: '📦 Total Keys',       value: String(total),           inline: true },
+                        { name: '✅ Active',           value: String(active),           inline: true },
+                        { name: '⚠️ Expired',         value: String(expired),          inline: true },
+                        { name: '🔒 HWID Bound',       value: String(bound),           inline: true },
+                        { name: '📡 Online Now',        value: String(activeSessions),  inline: true },
+                        { name: '🆕 New (7d)',          value: String(recentKeys),      inline: true },
+                        { name: '📈 Plans',             value: planLines,               inline: false },
+                        { name: '📛 Bans',              value: `${hwidBanCount} HWID · ${ipBanCount} IP`, inline: false },
+                        { name: '🚨 Recent Violations', value: violationLines,         inline: false },
                     )
-                    .setFooter({ text: `${Object.keys(sessions).length} total sessions` })
+                    .setFooter({ text: `${sessionsRes.rows.length} total sessions` })
                     .setTimestamp(),
             ]});
         }
@@ -1283,12 +1304,25 @@ client.on('interactionCreate', async (interaction) => {
     }
 });
 
+// ─── Graceful shutdown ────────────────────────────────────────────────────────
+
+process.on('SIGINT', async () => {
+    console.log('\nShutting down...');
+    await pool.end();
+    client.destroy();
+    process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+    console.log('\nShutting down...');
+    await pool.end();
+    client.destroy();
+    process.exit(0);
+});
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 client.login(BOT_TOKEN).catch(err => {
     console.error('❌ Failed to login:', err.message);
     process.exit(1);
 });
-
-
-

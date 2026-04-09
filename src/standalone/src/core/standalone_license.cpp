@@ -4,12 +4,15 @@
 #include "standalone_license.hpp"
 
 #include "standalone_settings.hpp"
+#include "arc/arc.h"
+#include "arc_loader.hpp"
 
 #include <windows.h>
 #include <iphlpapi.h>
 #include <intrin.h>
 #include <psapi.h>
 #include <dbghelp.h>
+#include <bcrypt.h>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -29,6 +32,7 @@
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "Psapi.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 using json = nlohmann::json;
 
@@ -80,6 +84,24 @@ namespace
     std::atomic<int64_t> s_gate_timestamps[standalone_license::GATE_SLOT_COUNT] = {};
     std::atomic<uint64_t> s_gate_tokens[standalone_license::GATE_SLOT_COUNT] = {};
     int64_t s_sweep_start_time = 0;
+
+    /* ── ARC (AiDA Runtime Core) state ───────────────────── */
+    arc_loader::loaded_module_t  s_arc_module{};
+    std::mutex                   s_arc_mtx;
+    bool                         s_arc_loaded = false;
+
+    // ARC function pointers resolved after reflective load
+    using arc_init_fn           = bool(*)(const char*, const char*, int64_t, uint32_t);
+    using arc_get_comm_bridge_fn = const arc_comm_vtable_t*(*)();
+    using arc_validate_tool_fn  = uint64_t(*)(uint64_t, uint64_t);
+    using arc_heartbeat_fn      = arc_heartbeat_result_t(*)();
+    using arc_cleanup_fn        = void(*)();
+
+    arc_init_fn           s_fn_arc_init            = nullptr;
+    arc_get_comm_bridge_fn s_fn_arc_get_comm_bridge = nullptr;
+    arc_validate_tool_fn  s_fn_arc_validate_tool   = nullptr;
+    arc_heartbeat_fn      s_fn_arc_heartbeat       = nullptr;
+    arc_cleanup_fn        s_fn_arc_cleanup          = nullptr;
 
 
     static const uint8_t S_STR_KEY = 0x5A;
@@ -180,7 +202,7 @@ namespace
 
     std::string get_cloud_function_host()
     {
-        return "https://europe-west1-aida-license-prod.cloudfunctions.net";
+        return "https://aidapro.net";
     }
 
     std::string generate_nonce()
@@ -418,6 +440,319 @@ namespace
         set_obfuscated_valid(true, nonce_seed);
     }
 
+    // ─── ARC Download + Decrypt + Reflective Load ───────────────────────
+
+    // Base64 decode (standard alphabet)
+    std::vector<uint8_t> base64_decode(const std::string& encoded)
+    {
+        static const uint8_t table[256] = {
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,62,64,64,64,63,
+            52,53,54,55,56,57,58,59,60,61,64,64,64,64,64,64,
+            64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+            15,16,17,18,19,20,21,22,23,24,25,64,64,64,64,64,
+            64,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+            41,42,43,44,45,46,47,48,49,50,51,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        };
+        std::vector<uint8_t> out;
+        out.reserve(encoded.size() * 3 / 4);
+        uint32_t buf = 0;
+        int bits = 0;
+        for (char c : encoded) {
+            uint8_t val = table[static_cast<uint8_t>(c)];
+            if (val > 63) continue;
+            buf = (buf << 6) | val;
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                out.push_back(static_cast<uint8_t>((buf >> bits) & 0xFF));
+            }
+        }
+        return out;
+    }
+
+    // HMAC-SHA256 key derivation using BCrypt (matches server: arc-encrypt.js)
+    std::vector<uint8_t> derive_session_key(
+        const std::string& session_token,
+        const std::string& hwid,
+        int64_t issued_at,
+        const std::string& master_secret)
+    {
+        // message = "session_token|hwid|issued_at"
+        std::string message = session_token + "|" + hwid + "|" + std::to_string(issued_at);
+
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        std::vector<uint8_t> result(32);
+
+        NTSTATUS status = BCryptOpenAlgorithmProvider(
+            &hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+        if (status != 0) return {};
+
+        status = BCryptCreateHash(
+            hAlg, &hHash,
+            nullptr, 0,
+            reinterpret_cast<PUCHAR>(const_cast<char*>(master_secret.data())),
+            static_cast<ULONG>(master_secret.size()),
+            0);
+        if (status != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return {};
+        }
+
+        status = BCryptHashData(
+            hHash,
+            reinterpret_cast<PUCHAR>(const_cast<char*>(message.data())),
+            static_cast<ULONG>(message.size()),
+            0);
+        if (status != 0) {
+            BCryptDestroyHash(hHash);
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return {};
+        }
+
+        status = BCryptFinishHash(hHash, result.data(), 32, 0);
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+
+        if (status != 0) return {};
+        return result;
+    }
+
+    // AES-256-GCM decryption using BCrypt (matches server: arc-encrypt.js)
+    std::vector<uint8_t> aes_gcm_decrypt(
+        const std::vector<uint8_t>& key,
+        const std::vector<uint8_t>& iv,
+        const std::vector<uint8_t>& auth_tag,
+        const std::vector<uint8_t>& ciphertext)
+    {
+        if (key.size() != 32 || iv.size() != 12 || auth_tag.size() != 16)
+            return {};
+
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_KEY_HANDLE hKey = nullptr;
+        std::vector<uint8_t> plaintext(ciphertext.size());
+
+        NTSTATUS status = BCryptOpenAlgorithmProvider(
+            &hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+        if (status != 0) return {};
+
+        status = BCryptSetProperty(
+            hAlg, BCRYPT_CHAINING_MODE,
+            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+            static_cast<ULONG>(wcslen(BCRYPT_CHAIN_MODE_GCM) * sizeof(wchar_t) + sizeof(wchar_t)),
+            0);
+        if (status != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return {};
+        }
+
+        status = BCryptGenerateSymmetricKey(
+            hAlg, &hKey, nullptr, 0,
+            const_cast<PUCHAR>(key.data()),
+            static_cast<ULONG>(key.size()), 0);
+        if (status != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return {};
+        }
+
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
+        BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
+        authInfo.pbNonce = const_cast<PUCHAR>(iv.data());
+        authInfo.cbNonce = static_cast<ULONG>(iv.size());
+        authInfo.pbTag   = const_cast<PUCHAR>(auth_tag.data());
+        authInfo.cbTag   = static_cast<ULONG>(auth_tag.size());
+
+        ULONG bytes_decrypted = 0;
+        status = BCryptDecrypt(
+            hKey,
+            const_cast<PUCHAR>(ciphertext.data()),
+            static_cast<ULONG>(ciphertext.size()),
+            &authInfo,
+            nullptr, 0,
+            plaintext.data(),
+            static_cast<ULONG>(plaintext.size()),
+            &bytes_decrypted,
+            0);
+
+        BCryptDestroyKey(hKey);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+
+        if (status != 0) return {};
+        plaintext.resize(bytes_decrypted);
+        return plaintext;
+    }
+
+    // Hex decode utility
+    std::vector<uint8_t> hex_decode(const std::string& hex)
+    {
+        std::vector<uint8_t> out;
+        if (hex.size() % 2 != 0) return out;
+        out.reserve(hex.size() / 2);
+        for (size_t i = 0; i < hex.size(); i += 2) {
+            unsigned val = 0;
+            if (sscanf(hex.c_str() + i, "%02x", &val) == 1)
+                out.push_back(static_cast<uint8_t>(val));
+        }
+        return out;
+    }
+
+    bool download_and_load_arc(settings_sa_t& settings, const std::string& hwid)
+    {
+        std::lock_guard<std::mutex> lk(s_arc_mtx);
+
+        // If already loaded, skip
+        if (s_arc_loaded)
+            return true;
+
+        // Download encrypted ARC blob from server
+        try {
+            httplib::Client client(get_cloud_function_host());
+            client.set_connection_timeout(15);
+            client.set_read_timeout(30);
+            client.set_write_timeout(10);
+            client.enable_server_certificate_verification(false);
+
+            json body;
+            body["session_token"] = settings.license_session_token;
+            body["hwid"] = hwid;
+
+            auto res = client.Post("/api/download/arc", body.dump(), "application/json");
+            if (!res || res->status != 200) {
+                OutputDebugStringA("ARC: Download failed.\n");
+                return false;
+            }
+
+            auto resp = json::parse(res->body, nullptr, false);
+            if (resp.is_discarded() || !resp.is_object()) {
+                OutputDebugStringA("ARC: Invalid response JSON.\n");
+                return false;
+            }
+
+            // Extract encrypted blob, IV, auth tag
+            std::string blob_b64   = resp.value("encrypted_blob", "");
+            std::string iv_hex     = resp.value("iv", "");
+            std::string tag_hex    = resp.value("auth_tag", "");
+
+            if (blob_b64.empty() || iv_hex.empty() || tag_hex.empty()) {
+                OutputDebugStringA("ARC: Missing encryption fields.\n");
+                return false;
+            }
+
+            auto encrypted_blob = base64_decode(blob_b64);
+            auto iv       = hex_decode(iv_hex);
+            auto auth_tag = hex_decode(tag_hex);
+
+            if (encrypted_blob.empty() || iv.size() != 12 || auth_tag.size() != 16) {
+                OutputDebugStringA("ARC: Invalid blob format.\n");
+                return false;
+            }
+
+            // Derive per-session decryption key
+            // Key = HMAC-SHA256(master_secret, "session_token|hwid|issued_at")
+            // The client uses the session token as the master secret component
+            // that matches the server's derivation
+            auto session_key = derive_session_key(
+                settings.license_session_token,
+                hwid,
+                settings.license_issued_at,
+                settings.license_session_token);
+
+            if (session_key.empty() || session_key.size() != 32) {
+                OutputDebugStringA("ARC: Key derivation failed.\n");
+                return false;
+            }
+
+            // Decrypt ARC blob (AES-256-GCM)
+            auto pe_data = aes_gcm_decrypt(session_key, iv, auth_tag, encrypted_blob);
+            SecureZeroMemory(session_key.data(), session_key.size());
+
+            if (pe_data.empty()) {
+                OutputDebugStringA("ARC: Decryption failed.\n");
+                return false;
+            }
+
+            // Reflective load
+            s_arc_module = arc_loader::load(pe_data.data(), pe_data.size());
+            if (!s_arc_module.base) {
+                OutputDebugStringA("ARC: Reflective load failed: ");
+                OutputDebugStringA(arc_loader::last_error().c_str());
+                OutputDebugStringA("\n");
+                return false;
+            }
+
+            // Resolve exports
+            s_fn_arc_init = reinterpret_cast<arc_init_fn>(
+                arc_loader::get_export(s_arc_module, "arc_init"));
+            s_fn_arc_get_comm_bridge = reinterpret_cast<arc_get_comm_bridge_fn>(
+                arc_loader::get_export(s_arc_module, "arc_get_comm_bridge"));
+            s_fn_arc_validate_tool = reinterpret_cast<arc_validate_tool_fn>(
+                arc_loader::get_export(s_arc_module, "arc_validate_tool_exec"));
+            s_fn_arc_heartbeat = reinterpret_cast<arc_heartbeat_fn>(
+                arc_loader::get_export(s_arc_module, "arc_heartbeat"));
+            s_fn_arc_cleanup = reinterpret_cast<arc_cleanup_fn>(
+                arc_loader::get_export(s_arc_module, "arc_cleanup"));
+
+            if (!s_fn_arc_init || !s_fn_arc_get_comm_bridge ||
+                !s_fn_arc_validate_tool || !s_fn_arc_heartbeat || !s_fn_arc_cleanup) {
+                OutputDebugStringA("ARC: Missing exports.\n");
+                arc_loader::unload(s_arc_module);
+                return false;
+            }
+
+            // Initialize ARC with session data
+            int64_t now = static_cast<int64_t>(std::time(nullptr));
+            if (!s_fn_arc_init(
+                    settings.license_session_token.c_str(),
+                    hwid.c_str(),
+                    now,
+                    ARC_INTERFACE_VERSION)) {
+                OutputDebugStringA("ARC: arc_init() failed.\n");
+                arc_loader::unload(s_arc_module);
+                s_fn_arc_init = nullptr;
+                s_fn_arc_get_comm_bridge = nullptr;
+                s_fn_arc_validate_tool = nullptr;
+                s_fn_arc_heartbeat = nullptr;
+                s_fn_arc_cleanup = nullptr;
+                return false;
+            }
+
+            s_arc_loaded = true;
+            OutputDebugStringA("ARC: Loaded and initialized successfully.\n");
+            return true;
+
+        } catch (...) {
+            OutputDebugStringA("ARC: Exception during download/load.\n");
+            return false;
+        }
+    }
+
+    void unload_arc()
+    {
+        std::lock_guard<std::mutex> lk(s_arc_mtx);
+        if (s_arc_loaded && s_fn_arc_cleanup) {
+            s_fn_arc_cleanup();
+        }
+        if (s_arc_module.base) {
+            arc_loader::unload(s_arc_module);
+        }
+        s_fn_arc_init = nullptr;
+        s_fn_arc_get_comm_bridge = nullptr;
+        s_fn_arc_validate_tool = nullptr;
+        s_fn_arc_heartbeat = nullptr;
+        s_fn_arc_cleanup = nullptr;
+        s_arc_loaded = false;
+    }
+
     bool try_validate_cached(settings_sa_t& settings, std::string& error_out)
     {
         if (settings.license_key.empty() || settings.license_sig_payload.empty())
@@ -584,6 +919,10 @@ namespace standalone_license
             return false;
         }
 
+        // Download and reflectively load ARC after successful validation
+        const std::string hwid = settings.license_hwid.empty() ? generate_hwid() : settings.license_hwid;
+        download_and_load_arc(settings, hwid);
+
         snapshot_code_hashes();
         restart_heartbeat(settings);
         return true;
@@ -603,6 +942,10 @@ namespace standalone_license
         }
 
         apply_valid_response(settings, key, hwid, response);
+
+        // Download and reflectively load ARC after successful activation
+        download_and_load_arc(settings, hwid);
+
         snapshot_code_hashes();
         restart_heartbeat(settings);
         return true;
@@ -631,6 +974,7 @@ namespace standalone_license
         s_stop.store(true, std::memory_order_release);
         if (s_heartbeat_thread.joinable())
             s_heartbeat_thread.join();
+        unload_arc();
     }
 
 
@@ -874,5 +1218,34 @@ namespace standalone_license
     std::string decode_status_string(int string_id)
     {
         return decode_status_string_impl(static_cast<status_string_id>(string_id));
+    }
+
+    // ─── ARC Public Accessors ───────────────────────────────────────────
+
+    bool is_arc_loaded()
+    {
+        return s_arc_loaded;
+    }
+
+    const arc_comm_vtable_t* get_arc_comm_bridge()
+    {
+        if (!s_arc_loaded || !s_fn_arc_get_comm_bridge)
+            return nullptr;
+        return s_fn_arc_get_comm_bridge();
+    }
+
+    uint64_t arc_validate_tool(uint64_t tool_name_hash, uint64_t gate_token)
+    {
+        if (!s_arc_loaded || !s_fn_arc_validate_tool)
+            return 0;
+        return s_fn_arc_validate_tool(tool_name_hash, gate_token);
+    }
+
+    arc_heartbeat_result_t arc_heartbeat()
+    {
+        arc_heartbeat_result_t result{};
+        if (!s_arc_loaded || !s_fn_arc_heartbeat)
+            return result;
+        return s_fn_arc_heartbeat();
     }
 }

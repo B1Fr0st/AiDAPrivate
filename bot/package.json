@@ -1,13 +1,14 @@
 {
   "name": "aida-license-bot",
   "version": "1.0.0",
-  "description": "Discord bot for managing AiDA license keys via Firebase",
+  "description": "Discord bot for managing AiDA license keys via PostgreSQL",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
   "dependencies": {
     "discord.js": "^14.16.3",
+    "pg": "^8.13.1",
     "uuid": "^11.1.0"
   }
 }

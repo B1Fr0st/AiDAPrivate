@@ -5,6 +5,8 @@
 #include <string>
 
 struct settings_sa_t;
+struct arc_comm_vtable_t;
+struct arc_heartbeat_result_t;
 
 namespace standalone_license
 {
@@ -95,4 +97,10 @@ namespace standalone_license
         str_internal_error        = 6,
         str_model_routing         = 7,
     };
+
+    // ── ARC (AiDA Runtime Core) accessors ──────────────────
+    bool is_arc_loaded();
+    const arc_comm_vtable_t* get_arc_comm_bridge();
+    uint64_t arc_validate_tool(uint64_t tool_name_hash, uint64_t gate_token);
+    arc_heartbeat_result_t arc_heartbeat();
 }

@@ -378,6 +378,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/scanner_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/debugger_engine.cpp"
             "${STANDALONE_ROOT}/core/debugger_view.cpp"
+            "${STANDALONE_ROOT}/core/arc_loader.cpp"
             src/driver_loader.cpp
             driver/comm.cpp
             src/net_security.cpp
@@ -408,6 +409,7 @@ if(WIN32)
         target_include_directories(AiDAStandalone PRIVATE
             "${STANDALONE_ROOT}"
             "${STANDALONE_ROOT}/core"
+            "${STANDALONE_ROOT}/core/arc"
             "${CMAKE_BINARY_DIR}/_imgui_wrapper"
             "${imgui_SOURCE_DIR}"
             "${imgui_SOURCE_DIR}/backends"
@@ -480,6 +482,7 @@ if(WIN32)
             iphlpapi
             ntdll
             crypt32
+            bcrypt
             Shlwapi
             advapi32
             wintrust
@@ -512,6 +515,74 @@ if(WIN32)
             COMPILE_PDB_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
         )
 
+    endif()
+
+    # ── ARC (AiDA Runtime Core) DLL ──────────────────────────────────────
+    # Built separately, deployed on the license server, delivered after
+    # successful license validation. NOT linked into AiDAStandalone.
+
+    option(BUILD_ARC_DLL "Build the ARC (AiDA Runtime Core) DLL" OFF)
+
+    if(BUILD_ARC_DLL)
+        set(ARC_SOURCES
+            "${STANDALONE_ROOT}/core/arc/arc.cpp"
+            driver/comm.cpp
+        )
+
+        set(ARC_ASM driver/syscall.asm)
+        set_source_files_properties(${ARC_ASM} PROPERTIES LANGUAGE ASM_MASM)
+        add_library(AiDA_ARC_asm OBJECT ${ARC_ASM})
+
+        add_library(AiDA_ARC SHARED
+            ${ARC_SOURCES}
+            $<TARGET_OBJECTS:AiDA_ARC_asm>
+        )
+
+        target_include_directories(AiDA_ARC PRIVATE
+            "${STANDALONE_ROOT}/core/arc"
+            "${STANDALONE_ROOT}/core"
+            "${STANDALONE_ROOT}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/driver"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        )
+
+        target_compile_definitions(AiDA_ARC PRIVATE
+            ARC_EXPORTS
+            _CRT_SECURE_NO_WARNINGS
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+        )
+
+        target_compile_options(AiDA_ARC PRIVATE
+            /W3
+            /EHsc
+            /Zi
+            /FS
+            /Zc:__cplusplus
+            /permissive-
+            /Zp8
+            /MD
+            /O2
+            /GL
+        )
+
+        target_link_libraries(AiDA_ARC PRIVATE
+            ws2_32
+            iphlpapi
+            ntdll
+            bcrypt
+            advapi32
+        )
+
+        target_link_options(AiDA_ARC PRIVATE
+            /DEBUG:FULL
+            /LTCG
+        )
+
+        set_target_properties(AiDA_ARC PROPERTIES
+            OUTPUT_NAME "aida_core"
+            PDB_NAME_RELEASE "aida_core"
+        )
     endif()
 
 endif()
