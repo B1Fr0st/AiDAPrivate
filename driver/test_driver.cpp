@@ -16,6 +16,23 @@ static int g_pass = 0;
 static int g_fail = 0;
 static int g_skip = 0;
 
+/*
+ * Ctrl+C / console-close handler.
+ * WHY: Without this, if a DeviceIoControl call blocks (e.g. the kernel does a
+ * long handle enumeration), the process cannot be stopped with Ctrl+C or even
+ * from Task Manager's "End Process" because the main thread is stuck inside
+ * the kernel.  TerminateProcess is the only reliable way out in that scenario.
+ */
+static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
+    if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT || ctrl_type == CTRL_CLOSE_EVENT) {
+        printf("\n  [!] Caught console signal %lu — terminating immediately.\n", ctrl_type);
+        fflush(stdout);
+        TerminateProcess(GetCurrentProcess(), 2);
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static void report(const char* test_name, bool success, const char* detail = nullptr) {
     if (success) {
         g_pass++;
@@ -1543,6 +1560,8 @@ static void test_dll_protection() {
 
 
 int main() {
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+
     printf("================================================================\n");
     printf("  WhosWho Driver - Comprehensive Feature Test\n");
     printf("  Target: test_target.exe (custom traffic-generating test app)\n");
