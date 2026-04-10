@@ -48,8 +48,18 @@ struct ui_state_t {
 	uint64_t dump_address = 0;
 	char     dump_goto_buf[20] = {};
 
-	float list_scroll_y = 0.f;
-	float list_target_scroll_y = 0.f;
+	float memmap_scroll_y        = 0.f;
+	float memmap_target_scroll_y = 0.f;
+	int   memmap_selected        = -1;
+
+	float trace_scroll_y        = 0.f;
+	float trace_target_scroll_y = 0.f;
+	int   trace_selected        = -1;
+
+	float strings_scroll_y        = 0.f;
+	float strings_target_scroll_y = 0.f;
+	int   strings_selected        = -1;
+
 	int   list_selected = -1;
 
 	char  string_filter[128] = {};
@@ -57,6 +67,13 @@ struct ui_state_t {
 
 	uint64_t prev_regs[18] = {};
 	float    reg_flash[18] = {};
+	uint64_t prev_rip = 0;
+	float    rip_flash = 0.f;
+
+	float panel_sep_phase = 0.f;
+	float empty_phase = 0.f;
+
+	float row_hover_anim[64] = {};
 };
 
 inline ui_state_t g_ui;

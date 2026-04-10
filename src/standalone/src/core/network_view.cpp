@@ -177,23 +177,25 @@ static void dns_poll_thread(state_t& state) {
         if (device && device->is_connected()) {
             auto raw_dns = device->get_dns_queries(state.dns_filter_pid);
 
-            std::vector<dns_entry> entries;
-            entries.reserve(raw_dns.size());
-            for (auto& d : raw_dns) {
-                dns_entry e;
-                e.timestamp = d.timestamp;
-                e.pid = d.pid;
-                e.query_type = static_cast<uint16_t>(d.query_type);
-                e.domain = d.domain;
-                e.resolved_addr = format_ip(d.resolved_addr, 2);
-                e.response_code = d.response_code;
-                e.ttl = d.ttl;
-                entries.push_back(std::move(e));
-            }
+            if (!raw_dns.empty()) {
+                std::vector<dns_entry> entries;
+                entries.reserve(raw_dns.size());
+                for (auto& d : raw_dns) {
+                    dns_entry e;
+                    e.timestamp = d.timestamp;
+                    e.pid = d.pid;
+                    e.query_type = static_cast<uint16_t>(d.query_type);
+                    e.domain = d.domain;
+                    e.resolved_addr = format_ip(d.resolved_addr, 2);
+                    e.response_code = d.response_code;
+                    e.ttl = d.ttl;
+                    entries.push_back(std::move(e));
+                }
 
-            {
-                std::lock_guard<std::mutex> lock(state.dns_mutex);
-                state.dns_entries = std::move(entries);
+                {
+                    std::lock_guard<std::mutex> lock(state.dns_mutex);
+                    state.dns_entries = std::move(entries);
+                }
             }
         }
 
@@ -336,7 +338,7 @@ static void render_tab_bar(state_t& state, float x, float y, float w, float alph
         state.underline_x = target_ux;
         state.underline_w = target_uw;
     }
-    ui_anim::spring_interp(state.underline_x, target_ux, state.underline_vel, 280.f, 22.f, dt);
+    state.underline_x = ui_anim::spring_interp(state.underline_x, target_ux, state.underline_vel, 280.f, 22.f, dt);
     state.underline_w = ui_anim::smooth_lerp(state.underline_w, target_uw, 16.f, dt);
 
     ImGui::PushClipRect(ImVec2(clip_x0, clip_y0), ImVec2(clip_x1, clip_y1), true);
@@ -425,7 +427,6 @@ static void render_connections(state_t& state, float x, float y, float w, float 
     ImGui::BeginChild("##net_conn", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
 
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 40, static_cast<int>(180 * alpha)));
     ImGui::SetNextItemWidth(120.f);
     ImGui::InputTextWithHint("##conn_search", "Filter...", state.conn_filter_text, sizeof(state.conn_filter_text));
     ImGui::SameLine();
@@ -466,7 +467,6 @@ static void render_connections(state_t& state, float x, float y, float w, float 
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "%s", count_buf);
     }
 
-    ImGui::PopStyleColor();
     ImGui::Spacing();
 
 
@@ -482,14 +482,10 @@ static void render_connections(state_t& state, float x, float y, float w, float 
     float col_remote = col_local;
 
     dl->AddRectFilled(ImVec2(org.x, hdr_y), ImVec2(org.x + w, hdr_y + row_h),
-        IM_COL32(25, 27, 35, static_cast<int>(200 * alpha)));
-    dl->AddRectFilledMultiColor(ImVec2(org.x, hdr_y), ImVec2(org.x + w, hdr_y + row_h),
-        IM_COL32(static_cast<int>(ar*50), static_cast<int>(ag*50), static_cast<int>(ab*50), static_cast<int>(20*alpha)),
-        IM_COL32(static_cast<int>(ar*50), static_cast<int>(ag*50), static_cast<int>(ab*50), 0),
-        IM_COL32(0, 0, 0, 0),
-        IM_COL32(0, 0, 0, 0));
-    dl->AddLine(ImVec2(org.x, hdr_y + row_h), ImVec2(org.x + w, hdr_y + row_h),
-        IM_COL32(60, 65, 75, static_cast<int>(80 * alpha)));
+        IM_COL32(25, 27, 35, static_cast<int>(220 * alpha)));
+    ui_anim::render_gradient_header(dl, org.x, hdr_y, w, row_h, ar, ag, ab, alpha * 0.35f);
+    dl->AddLine(ImVec2(org.x, hdr_y + row_h - 1.f), ImVec2(org.x + w, hdr_y + row_h - 1.f),
+        IM_COL32(static_cast<int>(ar*60), static_cast<int>(ag*60), static_cast<int>(ab*60), static_cast<int>(80 * alpha)));
 
     float cx = org.x + 4.f;
     ImU32 hdr_col = IM_COL32(140, 145, 155, static_cast<int>(0.6f * alpha * 255));
@@ -509,10 +505,15 @@ static void render_connections(state_t& state, float x, float y, float w, float 
 
     std::lock_guard<std::mutex> lock(state.conn_mutex);
     ImVec2 list_org = ImGui::GetWindowPos();
+    ImVec2 list_sz  = ImGui::GetWindowSize();
+    dl->PushClipRect(list_org, ImVec2(list_org.x + list_sz.x, list_org.y + list_sz.y), true);
     int conn_visible_row = 0;
 
     for (int i = 0; i < static_cast<int>(state.connections.size()); i++) {
         auto& c = state.connections[static_cast<size_t>(i)];
+
+        if (c.pid == 0 && c.protocol == 0 && c.local_port == 0 && c.remote_port == 0)
+            continue;
 
         std::string local_str = format_ip(c.local_addr, c.address_family) + ":" + std::to_string(c.local_port);
         std::string remote_str = format_ip(c.remote_addr, c.address_family) + ":" + std::to_string(c.remote_port);
@@ -540,9 +541,20 @@ static void render_connections(state_t& state, float x, float y, float w, float 
                 ? IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255), static_cast<int>(ab*255), static_cast<int>(0.2f * alpha * 255))
                 : IM_COL32(255, 255, 255, static_cast<int>(0.04f * alpha * 255));
             dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h), bg, 3.f);
-            if (selected)
-                dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + 2.f, abs_ry + row_h),
+            if (selected) {
+                dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + 3.f, abs_ry + row_h),
                     IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255), static_cast<int>(ab*255), static_cast<int>(0.8f * alpha * 255)));
+                for (int gi = 1; gi <= 2; ++gi) {
+                    float ga = (0.06f - static_cast<float>(gi) * 0.02f) * alpha;
+                    dl->AddRectFilled(ImVec2(list_org.x, abs_ry - static_cast<float>(gi)),
+                        ImVec2(list_org.x + w, abs_ry + row_h + static_cast<float>(gi)),
+                        IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+                                 static_cast<int>(ab*255), static_cast<int>(ga * 255.f)), 2.f);
+                }
+            } else {
+                dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + 2.f, abs_ry + row_h),
+                    IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255), static_cast<int>(ab*255), static_cast<int>(0.4f * alpha * 255)));
+            }
         }
 
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -573,6 +585,7 @@ static void render_connections(state_t& state, float x, float y, float w, float 
         ImGui::SetCursorPosY(ry + row_h);
     }
 
+    dl->PopClipRect();
     ImGui::EndChild();
     ImGui::EndChild();
 }
@@ -586,7 +599,6 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
     bool driver_ok = device && device->is_connected();
 
 
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 40, static_cast<int>(180 * alpha)));
     {
         ImDrawList* dot_dl = ImGui::GetWindowDrawList();
         ImVec2 dpos = ImGui::GetCursorScreenPos();
@@ -644,7 +656,6 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         ImGui::TextColored(ImVec4(static_cast<float>(ar), static_cast<float>(ag), static_cast<float>(ab), alpha), "LIVE");
     }
 
-    ImGui::PopStyleColor();
     ImGui::Spacing();
 
 
@@ -658,22 +669,26 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
     float row_h = 18.f;
     float hdr_y = org.y + cursor.y;
 
-    float col_no = 50.f, col_time = 80.f, col_proto = 50.f, col_info = 50.f;
-    float col_src = (w - col_no - col_time - col_proto - col_info - 20.f) * 0.5f;
-    float col_dst = col_src;
+    float col_no = 40.f, col_time = 100.f, col_proto = 55.f, col_src = 160.f, col_dst = 160.f;
+    float col_info = w - col_no - col_time - col_src - col_dst - col_proto - 20.f;
+    if (col_info < 60.f) col_info = 60.f;
+
+    dl->AddRectFilled(ImVec2(org.x, hdr_y), ImVec2(org.x + w, hdr_y + row_h),
+        IM_COL32(25, 27, 35, static_cast<int>(220 * alpha)));
+    ui_anim::render_gradient_header(dl, org.x, hdr_y, w, row_h, ar, ag, ab, alpha * 0.35f);
 
     float cx = org.x + 4.f;
-    ImU32 hdr_col = IM_COL32(180, 180, 200, static_cast<int>(0.7f * alpha * 255));
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "#");     cx += col_no;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Time");  cx += col_time;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Src");   cx += col_src;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Dst");   cx += col_dst;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Proto"); cx += col_proto;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Info");
+    ImU32 hdr_col = IM_COL32(140, 145, 155, static_cast<int>(0.6f * alpha * 255));
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "#");     cx += col_no;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Time");  cx += col_time;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Src");   cx += col_src;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Dst");   cx += col_dst;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Proto"); cx += col_proto;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Info");
 
     ImGui::SetCursorPosY(cursor.y + row_h + 2.f);
-    dl->AddLine(ImVec2(org.x + 2.f, hdr_y + row_h), ImVec2(org.x + w - 2.f, hdr_y + row_h),
-        IM_COL32(80, 80, 100, static_cast<int>(0.3f * alpha * 255)));
+    dl->AddLine(ImVec2(org.x, hdr_y + row_h - 1.f), ImVec2(org.x + w, hdr_y + row_h - 1.f),
+        IM_COL32(static_cast<int>(ar*60), static_cast<int>(ag*60), static_cast<int>(ab*60), static_cast<int>(80 * alpha)));
 
     float list_top = cursor.y + row_h + 4.f;
     float list_h = split_y - list_top;
@@ -684,6 +699,8 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
     {
         std::lock_guard<std::mutex> lock(state.cap_mutex);
         ImVec2 list_org = ImGui::GetWindowPos();
+        ImVec2 list_sz  = ImGui::GetWindowSize();
+        dl->PushClipRect(list_org, ImVec2(list_org.x + list_sz.x, list_org.y + list_sz.y), true);
         int cap_visible_row = 0;
 
         for (int i = 0; i < static_cast<int>(state.captured_packets.size()); i++) {
@@ -708,18 +725,6 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                             mouse.y >= abs_ry && mouse.y < abs_ry + row_h);
             bool selected = (state.cap_selected == i);
 
-            if (hovered || selected) {
-                ImU32 bg = selected
-                    ? IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255), static_cast<int>(ab*255), static_cast<int>(0.2f * alpha * 255))
-                    : IM_COL32(255, 255, 255, static_cast<int>(0.04f * alpha * 255));
-                dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h), bg);
-            }
-
-            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-                state.cap_selected = i;
-
-            ImU32 txt_col = IM_COL32(220, 220, 230, static_cast<int>((selected ? 0.95f : 0.7f) * alpha * 255));
-
             ImU32 proto_col = IM_COL32(150, 150, 170, static_cast<int>(0.6f * alpha * 255));
             if (p.protocol_label == "HTTP") proto_col = IM_COL32(100, 160, 255, static_cast<int>(0.9f * alpha * 255));
             else if (p.protocol_label == "TLS") proto_col = IM_COL32(80, 220, 120, static_cast<int>(0.9f * alpha * 255));
@@ -727,6 +732,30 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             else if (p.protocol_label == "QUIC") proto_col = IM_COL32(180, 120, 255, static_cast<int>(0.9f * alpha * 255));
             else if (p.protocol_label == "TCP") proto_col = IM_COL32(150, 150, 170, static_cast<int>(0.7f * alpha * 255));
             else if (p.protocol_label == "UDP") proto_col = IM_COL32(80, 220, 230, static_cast<int>(0.9f * alpha * 255));
+
+            if (hovered || selected) {
+                ImU32 bg = selected
+                    ? IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255), static_cast<int>(ab*255), static_cast<int>(0.2f * alpha * 255))
+                    : IM_COL32(255, 255, 255, static_cast<int>(0.04f * alpha * 255));
+                dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h), bg, 2.f);
+                if (selected) {
+                    for (int gi = 1; gi <= 2; ++gi) {
+                        float ga = (0.06f - static_cast<float>(gi) * 0.02f) * alpha;
+                        dl->AddRectFilled(ImVec2(list_org.x, abs_ry - static_cast<float>(gi)),
+                            ImVec2(list_org.x + w, abs_ry + row_h + static_cast<float>(gi)),
+                            IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+                                     static_cast<int>(ab*255), static_cast<int>(ga * 255.f)), 2.f);
+                    }
+                }
+            }
+
+            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + 3.f, abs_ry + row_h),
+                proto_col);
+
+            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                state.cap_selected = i;
+
+            ImU32 txt_col = IM_COL32(220, 220, 230, static_cast<int>((selected ? 0.95f : 0.7f) * alpha * 255));
 
             cx = list_org.x + 4.f;
             char no_buf[16]; snprintf(no_buf, sizeof(no_buf), "%d", i + 1);
@@ -764,6 +793,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
 
         if (state.cap_auto_scroll && !state.captured_packets.empty())
             ImGui::SetScrollHereY(1.0f);
+        dl->PopClipRect();
     }
 
     ImGui::EndChild();
@@ -850,7 +880,6 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
 
     bool driver_ok = device && device->is_connected();
 
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 40, static_cast<int>(180 * alpha)));
     if (!driver_ok) ImGui::BeginDisabled();
 
     if (!state.dns_polling.load()) {
@@ -890,7 +919,6 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
     ImGui::SetNextItemWidth(120.f);
     ImGui::InputTextWithHint("##dns_filter", "Filter...", state.dns_filter_text, sizeof(state.dns_filter_text));
 
-    ImGui::PopStyleColor();
     ImGui::Spacing();
 
 
@@ -905,16 +933,22 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
     float col_domain = remaining * 0.55f;
     float col_addr = remaining * 0.45f;
 
+    dl->AddRectFilled(ImVec2(org.x, hdr_y), ImVec2(org.x + w, hdr_y + row_h),
+        IM_COL32(25, 27, 35, static_cast<int>(220 * alpha)));
+    ui_anim::render_gradient_header(dl, org.x, hdr_y, w, row_h, ar, ag, ab, alpha * 0.35f);
+
     float cx = org.x + 4.f;
-    ImU32 hdr_col = IM_COL32(180, 180, 200, static_cast<int>(0.7f * alpha * 255));
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "PID");     cx += col_pid;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Type");    cx += col_type;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Domain");  cx += col_domain;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Address"); cx += col_addr;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "RCode");   cx += col_rcode;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "TTL");
+    ImU32 hdr_col = IM_COL32(140, 145, 155, static_cast<int>(0.6f * alpha * 255));
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "PID");     cx += col_pid;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Type");    cx += col_type;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Domain");  cx += col_domain;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Address"); cx += col_addr;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "RCode");   cx += col_rcode;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "TTL");
 
     ImGui::SetCursorPosY(cursor.y + row_h + 2.f);
+    dl->AddLine(ImVec2(org.x, hdr_y + row_h - 1.f), ImVec2(org.x + w, hdr_y + row_h - 1.f),
+        IM_COL32(static_cast<int>(ar*60), static_cast<int>(ag*60), static_cast<int>(ab*60), static_cast<int>(80 * alpha)));
     dl->AddLine(ImVec2(org.x + 2.f, hdr_y + row_h), ImVec2(org.x + w - 2.f, hdr_y + row_h),
         IM_COL32(80, 80, 100, static_cast<int>(0.3f * alpha * 255)));
 
@@ -923,6 +957,8 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
 
     std::lock_guard<std::mutex> lock(state.dns_mutex);
     ImVec2 list_org = ImGui::GetWindowPos();
+    ImVec2 dns_list_sz = ImGui::GetWindowSize();
+    dl->PushClipRect(list_org, ImVec2(list_org.x + dns_list_sz.x, list_org.y + dns_list_sz.y), true);
 
     for (int i = 0; i < static_cast<int>(state.dns_entries.size()); i++) {
         auto& d = state.dns_entries[static_cast<size_t>(i)];
@@ -943,7 +979,21 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
             ImU32 bg = selected
                 ? IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255), static_cast<int>(ab*255), static_cast<int>(0.2f * alpha * 255))
                 : IM_COL32(255, 255, 255, static_cast<int>(0.04f * alpha * 255));
-            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h), bg);
+            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h), bg, 2.f);
+            if (selected) {
+                dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + 3.f, abs_ry + row_h),
+                    IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255), static_cast<int>(ab*255), static_cast<int>(0.8f * alpha * 255)));
+                for (int gi = 1; gi <= 2; ++gi) {
+                    float ga = (0.06f - static_cast<float>(gi) * 0.02f) * alpha;
+                    dl->AddRectFilled(ImVec2(list_org.x, abs_ry - static_cast<float>(gi)),
+                        ImVec2(list_org.x + w, abs_ry + row_h + static_cast<float>(gi)),
+                        IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+                                 static_cast<int>(ab*255), static_cast<int>(ga * 255.f)), 2.f);
+                }
+            } else {
+                dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + 2.f, abs_ry + row_h),
+                    IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255), static_cast<int>(ab*255), static_cast<int>(0.4f * alpha * 255)));
+            }
         }
 
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -978,6 +1028,7 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
         ImGui::SetCursorPosY(ry + row_h);
     }
 
+    dl->PopClipRect();
     ImGui::EndChild();
     ImGui::EndChild();
 }
@@ -987,8 +1038,6 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
                           float alpha, float ar, float ag, float ab) {
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_proxy", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
-
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 40, static_cast<int>(180 * alpha)));
 
     bool running = mitm_proxy::is_running();
 
@@ -1047,7 +1096,6 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         }
     }
 
-    ImGui::PopStyleColor();
     ImGui::Spacing();
 
 
@@ -1227,8 +1275,6 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
 
     bool driver_ok = device && device->is_connected();
 
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 40, static_cast<int>(180 * alpha)));
-
 
     ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "Add Filter Rule");
     ImGui::Spacing();
@@ -1284,7 +1330,6 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
     }
     if (!driver_ok) ImGui::EndDisabled();
 
-    ImGui::PopStyleColor();
     ImGui::Spacing();
 
 
@@ -1313,7 +1358,6 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
 
     bool driver_ok = device && device->is_connected();
 
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 40, static_cast<int>(180 * alpha)));
     if (!driver_ok) ImGui::BeginDisabled();
 
     if (!state.bw_polling.load()) {
@@ -1333,7 +1377,6 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
     }
 
     if (!driver_ok) ImGui::EndDisabled();
-    ImGui::PopStyleColor();
     ImGui::Spacing();
 
 
@@ -1347,32 +1390,63 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
     float col_in = (w - col_pid - col_name - col_spark - 20.f) * 0.25f;
     float col_out = col_in, col_rin = col_in, col_rout = col_in;
 
+    dl->AddRectFilled(ImVec2(org.x, hdr_y), ImVec2(org.x + w, hdr_y + row_h),
+        IM_COL32(25, 27, 35, static_cast<int>(220 * alpha)));
+    ui_anim::render_gradient_header(dl, org.x, hdr_y, w, row_h, ar, ag, ab, alpha * 0.35f);
+
     float cx = org.x + 4.f;
-    ImU32 hdr_col = IM_COL32(180, 180, 200, static_cast<int>(0.7f * alpha * 255));
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "PID");       cx += col_pid;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Process");   cx += col_name;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "In");        cx += col_in;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Out");       cx += col_out;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "In Rate");   cx += col_rin;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Out Rate");  cx += col_rout;
-    dl->AddText(ImVec2(cx, hdr_y), hdr_col, "Trend");
+    ImU32 hdr_col = IM_COL32(140, 145, 155, static_cast<int>(0.6f * alpha * 255));
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "PID");       cx += col_pid;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Process");   cx += col_name;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "In");        cx += col_in;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Out");       cx += col_out;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "In Rate");   cx += col_rin;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Out Rate");  cx += col_rout;
+    dl->AddText(ImVec2(cx, hdr_y + 2.f), hdr_col, "Trend");
 
     ImGui::SetCursorPosY(cursor.y + row_h + 2.f);
-    dl->AddLine(ImVec2(org.x + 2.f, hdr_y + row_h), ImVec2(org.x + w - 2.f, hdr_y + row_h),
-        IM_COL32(80, 80, 100, static_cast<int>(0.3f * alpha * 255)));
+    dl->AddLine(ImVec2(org.x, hdr_y + row_h - 1.f), ImVec2(org.x + w, hdr_y + row_h - 1.f),
+        IM_COL32(static_cast<int>(ar*60), static_cast<int>(ag*60), static_cast<int>(ab*60), static_cast<int>(80 * alpha)));
 
     float list_h = h - (cursor.y + row_h + 8.f);
     ImGui::BeginChild("##bw_list", ImVec2(w - 4.f, list_h), false, ImGuiWindowFlags_NoBackground);
 
     std::lock_guard<std::mutex> lock(state.bw_mutex);
     ImVec2 list_org = ImGui::GetWindowPos();
+    ImVec2 bw_list_sz = ImGui::GetWindowSize();
+    dl->PushClipRect(list_org, ImVec2(list_org.x + bw_list_sz.x, list_org.y + bw_list_sz.y), true);
 
     for (int i = 0; i < static_cast<int>(state.bw_entries.size()); i++) {
         auto& b = state.bw_entries[static_cast<size_t>(i)];
         float ry = ImGui::GetCursorPosY();
         float abs_ry = list_org.y + ry;
 
-        ImU32 txt_col = IM_COL32(220, 220, 230, static_cast<int>(0.8f * alpha * 255));
+        ImVec2 mouse = ImGui::GetMousePos();
+        bool hovered = (mouse.x >= list_org.x && mouse.x < list_org.x + w &&
+                        mouse.y >= abs_ry && mouse.y < abs_ry + row_h);
+        bool selected = (state.bw_selected == i);
+
+        if (i & 1)
+            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h), IM_COL32(255, 255, 255, 3));
+
+        if (hovered || selected) {
+            ImU32 bg = selected
+                ? IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255), static_cast<int>(ab*255), static_cast<int>(0.2f * alpha * 255))
+                : IM_COL32(255, 255, 255, static_cast<int>(0.04f * alpha * 255));
+            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + w, abs_ry + row_h), bg, 3.f);
+            if (selected) {
+                dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + 3.f, abs_ry + row_h),
+                    IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255), static_cast<int>(ab*255), static_cast<int>(0.8f * alpha * 255)));
+            } else {
+                dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + 2.f, abs_ry + row_h),
+                    IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255), static_cast<int>(ab*255), static_cast<int>(0.4f * alpha * 255)));
+            }
+        }
+
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            state.bw_selected = i;
+
+        ImU32 txt_col = IM_COL32(220, 220, 230, static_cast<int>((selected ? 0.95f : 0.8f) * alpha * 255));
         cx = list_org.x + 4.f;
 
         char buf[32];
@@ -1406,6 +1480,7 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
         ImGui::SetCursorPosY(ry + row_h);
     }
 
+    dl->PopClipRect();
     ImGui::EndChild();
     ImGui::EndChild();
 }
@@ -1415,8 +1490,6 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                              float alpha, float ar, float ag, float ab) {
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_rep", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
-
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 40, static_cast<int>(180 * alpha)));
 
 
     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Host:");
@@ -1441,8 +1514,6 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
         state.repeater_entries.push_back(std::move(rep));
         state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
     }
-
-    ImGui::PopStyleColor();
 
 
     if (!state.repeater_entries.empty()) {
@@ -1469,8 +1540,6 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
             ImGui::BeginChild("##rep_req", ImVec2(half_w, panel_h), false, ImGuiWindowFlags_NoBackground);
             ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "Request");
 
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(20, 20, 30, static_cast<int>(200 * alpha)));
-
             static char req_buf[65536] = {};
             if (rep.raw_request.size() < sizeof(req_buf)) {
                 memcpy(req_buf, rep.raw_request.data(), rep.raw_request.size());
@@ -1480,7 +1549,6 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                 ImVec2(half_w - 4.f, panel_h - 50.f))) {
                 rep.raw_request = req_buf;
             }
-            ImGui::PopStyleColor();
 
             if (!rep.in_progress) {
                 if (ImGui::SmallButton("Send")) {
@@ -1525,12 +1593,10 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                     static_cast<unsigned long long>(rep.latency_ms));
             }
 
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(20, 20, 30, static_cast<int>(200 * alpha)));
             ImGui::InputTextMultiline("##rep_resp_view", const_cast<char*>(rep.raw_response.c_str()),
                 rep.raw_response.size() + 1,
                 ImVec2(half_w - 4.f, panel_h - 50.f),
                 ImGuiInputTextFlags_ReadOnly);
-            ImGui::PopStyleColor();
 
             ImGui::EndChild();
         }
@@ -1549,12 +1615,9 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_intercept", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 40, static_cast<int>(180 * alpha)));
-
     bool running = mitm_proxy::is_running();
     if (!running) {
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Start the proxy first to use intercept mode.");
-        ImGui::PopStyleColor();
         ImGui::EndChild();
         return;
     }
@@ -1713,10 +1776,8 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
             memcpy(int_req_buf, sel.raw_request.data(), sel.raw_request.size());
             int_req_buf[sel.raw_request.size()] = '\0';
         }
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(20, 20, 30, static_cast<int>(200 * alpha)));
         ImGui::InputTextMultiline("##int_req_edit", int_req_buf, sizeof(int_req_buf),
             ImVec2(half_w - 4.f, detail_h - 30.f));
-        ImGui::PopStyleColor();
         ImGui::EndChild();
 
         ImGui::SameLine();
@@ -1733,7 +1794,6 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         ImGui::EndChild();
     }
 
-    ImGui::PopStyleColor();
     ImGui::EndChild();
 }
 
@@ -1742,8 +1802,6 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
                            float alpha, float ar, float ag, float ab) {
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_keylog", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
-
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 40, static_cast<int>(180 * alpha)));
 
 
     ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "SSL Key Logger");
@@ -1787,7 +1845,6 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
     ImGui::Spacing();
     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, alpha), "Captured Keys: %zu", ssl_keylog::entry_count());
 
-    ImGui::PopStyleColor();
     ImGui::Spacing();
 
 
@@ -1923,8 +1980,6 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
                                 float alpha, float ar, float ag, float ab) {
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_pcap", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
-
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 40, static_cast<int>(180 * alpha)));
 
     ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "PCAP Export");
     ImGui::Spacing();
@@ -2068,7 +2123,6 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
         }).detach();
     }
 
-    ImGui::PopStyleColor();
     ImGui::EndChild();
 }
 
@@ -2310,8 +2364,6 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_fuzzer", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 30, 40, static_cast<int>(180 * alpha)));
-
     ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "Fuzzer / Intruder");
     ImGui::Spacing();
 
@@ -2505,11 +2557,9 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     }
 
     float tmpl_h = std::min(h * 0.22f, 180.f);
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(20, 20, 30, static_cast<int>(200 * alpha)));
     if (ImGui::InputTextMultiline("##fuzz_tmpl", tmpl_buf, sizeof(tmpl_buf),
                                    ImVec2(w - 8.f, tmpl_h)))
         cfg.base_request = tmpl_buf;
-    ImGui::PopStyleColor();
 
     ImGui::Spacing();
 
@@ -2686,7 +2736,6 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
 
     ImGui::EndChild();
 
-    ImGui::PopStyleColor();
     ImGui::EndChild();
 }
 
@@ -2910,16 +2959,17 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
 
 
     float editor_h = h * 0.4f;
+    float console_h = 42.f;
+    float log_h = h - editor_h - console_h;
+
     ImGui::BeginChild("##script_editor", ImVec2(right_w, editor_h), false);
     dl = ImGui::GetWindowDrawList();
     ImVec2 ep = ImGui::GetWindowPos();
     dl->AddText(ImVec2(ep.x + 8.f, ep.y + 2.f), txt_col, "Editor");
 
     ImGui::SetCursorPos(ImVec2(4.f, 18.f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(20, 20, 30, static_cast<int>(0.8f * alpha * 255)));
     ImGui::InputTextMultiline("##script_edit", state.script_editor_buf, sizeof(state.script_editor_buf),
         ImVec2(right_w - 8.f, editor_h - 48.f), ImGuiInputTextFlags_AllowTabInput);
-    ImGui::PopStyleColor();
 
     ImGui::SetCursorPos(ImVec2(4.f, editor_h - 26.f));
     if (ImGui::SmallButton("Run##script_run")) {
@@ -2937,7 +2987,6 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
     ImGui::EndChild();
 
 
-    float console_h = h * 0.15f;
     ImGui::BeginChild("##script_console", ImVec2(right_w, console_h), false);
     dl = ImGui::GetWindowDrawList();
     ImVec2 cp = ImGui::GetWindowPos();
@@ -2963,7 +3012,6 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
     ImGui::EndChild();
 
 
-    float log_h = h - editor_h - console_h;
     ImGui::BeginChild("##script_log", ImVec2(right_w, log_h), false);
     dl = ImGui::GetWindowDrawList();
     ImVec2 lop = ImGui::GetWindowPos();
@@ -3175,10 +3223,8 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
     dl->AddText(ImVec2(ip.x + 8.f, ip.y + 4.f), txt_col, "Input");
 
     ImGui::SetCursorPos(ImVec2(4.f, 22.f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(20, 20, 30, static_cast<int>(0.8f * alpha * 255)));
     ImGui::InputTextMultiline("##dec_in", state.decoder_input, sizeof(state.decoder_input),
         ImVec2(right_w - 8.f, input_h - 28.f), ImGuiInputTextFlags_AllowTabInput);
-    ImGui::PopStyleColor();
     ImGui::EndChild();
 
 
@@ -3189,14 +3235,11 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
     dl->AddText(ImVec2(op.x + 8.f, op.y + 4.f), txt_col, "Output");
 
     ImGui::SetCursorPos(ImVec2(4.f, 22.f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(15, 15, 25, static_cast<int>(0.8f * alpha * 255)));
-
     ImGui::InputTextMultiline("##dec_out",
         const_cast<char*>(state.decoder_output.c_str()),
         state.decoder_output.size() + 1,
         ImVec2(right_w - 8.f, output_h - 28.f),
         ImGuiInputTextFlags_ReadOnly);
-    ImGui::PopStyleColor();
     ImGui::EndChild();
 
     ImGui::PopStyleColor();
@@ -3218,6 +3261,16 @@ void render(float pos_x, float pos_y, float width, float height,
     float content_y = pos_y + tab_h + 4.f;
     float content_h = height - tab_h - 4.f;
 
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 38, 52, static_cast<int>(220 * alpha)));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, IM_COL32(48, 52, 70, static_cast<int>(235 * alpha)));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, IM_COL32(58, 62, 82, static_cast<int>(245 * alpha)));
+    ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(70, 75, 100, static_cast<int>(160 * alpha)));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, IM_COL32(20, 22, 30, static_cast<int>(120 * alpha)));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, IM_COL32(60, 65, 85, static_cast<int>(180 * alpha)));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, IM_COL32(80, 85, 110, static_cast<int>(200 * alpha)));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, IM_COL32(100, 105, 135, static_cast<int>(220 * alpha)));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
 
     switch (g_state.active_tab) {
         case sub_tab_t::connections:
@@ -3265,6 +3318,9 @@ void render(float pos_x, float pos_y, float width, float height,
         default:
             break;
     }
+
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(8);
 }
 
 }

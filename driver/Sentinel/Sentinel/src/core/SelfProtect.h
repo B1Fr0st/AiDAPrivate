@@ -47,12 +47,7 @@ namespace self_protect {
         if (!dest || size == 0 || !_MmIsAddressValid(dest))
             return false;
 
-        // Note: Under HVCI (Memory Integrity) the hypervisor's EPT marks
-        // kernel code pages as R+X.  MmMapLockedPagesSpecifyCache will
-        // return NULL (or raise an exception caught by __try) for those
-        // pages, so this function degrades gracefully — it returns false
-        // for .text targets and succeeds normally for data-page targets
-        // (pool, .data, PE headers) which remain R+W in the EPT.
+
         if (!_IoAllocateMdl || !_IoFreeMdl || !_MmProbeAndLockPages ||
             !_MmUnlockPages || !_MmMapLockedPagesSpecifyCache || !_MmUnmapLockedPages)
             return false;
@@ -1057,9 +1052,8 @@ namespace self_protect {
 
         own_count_strike:
             LONG strikes = _InterlockedIncrement(&g_own_integrity_strikes);
-            // Under HVCI, safe_write_memory() is blocked, so restoration
-            // always fails.  BSODing the machine when we can't self-heal
-            // is counter-productive — switch to log-only mode instead.
+
+
             if (strikes >= OWN_INTEGRITY_STRIKE_THRESHOLD) {
                 if (hvci_detect::is_hvci_enabled()) {
                     SN_LOG("self_protect::verify: HVCI active, suppressing BSOD (strikes=%ld)", strikes);

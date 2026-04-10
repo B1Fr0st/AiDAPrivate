@@ -607,10 +607,35 @@ namespace driver_bridge
             } else {
                 bytes_read = device->read_raw(address, out.data(), size);
             }
+
             if (bytes_read == 0) {
-                out.clear();
-                return false;
+                bool re_resolved = false;
+                {
+                    std::lock_guard<std::mutex> lk(g_state_mtx);
+                    if (vtable && vtable->solve_dtb && vtable->get_dtb) {
+                        uint64_t new_dtb = vtable->solve_dtb();
+                        re_resolved = (new_dtb != 0);
+                    } else if (device) {
+                        device->solve_dtb();
+                        re_resolved = (device->get_dtb() != 0);
+                    }
+                }
+
+                if (re_resolved) {
+                    std::memset(out.data(), 0, size);
+                    if (vtable && vtable->read_raw) {
+                        bytes_read = vtable->read_raw(address, out.data(), size);
+                    } else {
+                        bytes_read = device->read_raw(address, out.data(), size);
+                    }
+                }
+
+                if (bytes_read == 0) {
+                    out.clear();
+                    return false;
+                }
             }
+
             out.resize(bytes_read);
             return true;
         }

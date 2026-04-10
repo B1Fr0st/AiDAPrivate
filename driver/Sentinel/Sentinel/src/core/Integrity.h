@@ -17,12 +17,7 @@ namespace integrity {
     inline volatile ULONG  g_code_size    = 0;
     inline PUCHAR          g_shadow_copy  = nullptr;
 
-    // Hardware-accelerated CRC32C using SSE4.2 _mm_crc32_u64.
-    // Processes 8 bytes per iteration instead of the old bit-by-bit loop
-    // that did 8 conditional branch ops per single byte.
-    // On a 5 MB .text section this reduces ~40 million branch-dependent
-    // operations to ~625 thousand pipelined CRC instructions — roughly
-    // 50-100x faster and eliminates the single largest source of DPC CPU time.
+
     __forceinline UINT32 compute_crc32(const PVOID data, ULONG size) {
 
         if (!data || size == 0)
@@ -31,13 +26,13 @@ namespace integrity {
         const UCHAR* p = static_cast<const UCHAR*>(data);
         UINT64 crc = 0xFFFFFFFFULL;
 
-        // Process 8 bytes at a time using hardware CRC32C
+
         ULONG aligned_end = size & ~7UL;
         for (ULONG i = 0; i < aligned_end; i += 8) {
             crc = _mm_crc32_u64(crc, *reinterpret_cast<const UINT64*>(p + i));
         }
 
-        // Handle remaining 0-7 bytes
+
         for (ULONG i = aligned_end; i < size; i++) {
             crc = _mm_crc32_u8(static_cast<UINT32>(crc), p[i]);
         }
@@ -166,11 +161,7 @@ namespace integrity {
         if (bp) {
             ULONG offset = (ULONG)((ULONG_PTR)bp - (ULONG_PTR)base);
 
-            // Under HVCI, safe_write_memory() cannot create a writable MDL
-            // alias to kernel code pages (EPT blocks it).  The restore path
-            // is impossible, so we switch to detect-only: count strikes but
-            // never BSOD, because BSODing when self-healing is impossible
-            // serves no purpose.
+
             if (hvci_detect::is_hvci_enabled()) {
                 SN_LOG("integrity::verify: HVCI active, breakpoint at +0x%lx (detect-only)", offset);
                 return true;
@@ -240,9 +231,6 @@ namespace integrity {
                 }
 
 
-                // Under HVCI, safe_write_memory() is blocked — the EPT
-                // refuses the writable MDL alias.  Skip the restore attempt
-                // and count a strike, but do not BSOD (handled below).
                 if (!hvci_detect::is_hvci_enabled()) {
                     bool restored = self_protect::safe_write_memory(
                         diff_addr, g_shadow_copy + diff_offset,
@@ -264,9 +252,8 @@ namespace integrity {
 
             LONG strikes = _InterlockedIncrement(&g_integrity_strikes);
             if (strikes >= INTEGRITY_STRIKE_THRESHOLD) {
-                // Under HVCI, restoration is impossible (MDL remap blocked).
-                // BSODing when we cannot self-heal is counter-productive:
-                // suppress and continue in detect-only mode.
+
+
                 if (hvci_detect::is_hvci_enabled()) {
                     SN_LOG("integrity::verify: HVCI active, suppressing BSOD (strikes=%ld)", strikes);
                     return true;

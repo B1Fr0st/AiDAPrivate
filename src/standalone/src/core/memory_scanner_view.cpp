@@ -22,9 +22,22 @@ static bool row_hover(ImDrawList* dl, float x0, float y0, float x1, float y1,
 		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
 			IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
 					 static_cast<int>(ab*255), static_cast<int>(30*alpha)), 3.f);
+		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + 3.f, y1),
+			IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+					 static_cast<int>(ab*255), static_cast<int>(200*alpha)));
+		for (int gi = 1; gi <= 3; ++gi) {
+			float ga = (0.08f - static_cast<float>(gi) * 0.02f) * alpha;
+			dl->AddRectFilled(ImVec2(x0, y0 - static_cast<float>(gi)),
+				ImVec2(x1, y1 + static_cast<float>(gi)),
+				IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+						 static_cast<int>(ab*255), static_cast<int>(ga * 255.f)), 2.f);
+		}
 	} else if (hov) {
 		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
 			IM_COL32(255, 255, 255, static_cast<int>(10*alpha)), 3.f);
+		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + 2.f, y1),
+			IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+					 static_cast<int>(ab*255), static_cast<int>(80*alpha)));
 	}
 	return hov;
 }
@@ -225,14 +238,11 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + hdr_h),
-		IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-	dl->AddRectFilledMultiColor(ImVec2(ox, oy), ImVec2(ox + w, oy + hdr_h),
-		IM_COL32(static_cast<int>(ar*50), static_cast<int>(ag*50), static_cast<int>(ab*50), static_cast<int>(20*a)),
-		IM_COL32(static_cast<int>(ar*50), static_cast<int>(ag*50), static_cast<int>(ab*50), 0),
-		IM_COL32(0, 0, 0, 0),
-		IM_COL32(0, 0, 0, 0));
-	dl->AddLine(ImVec2(ox, oy + hdr_h), ImVec2(ox + w, oy + hdr_h),
-		IM_COL32(60, 65, 75, static_cast<int>(80*a)));
+		IM_COL32(25, 27, 35, static_cast<int>(220*a)));
+	ui_anim::render_gradient_header(dl, ox, oy, w, hdr_h, ar, ag, ab, a * 0.35f);
+	dl->AddLine(ImVec2(ox, oy + hdr_h - 1.f), ImVec2(ox + w, oy + hdr_h - 1.f),
+		IM_COL32(static_cast<int>(ar*60), static_cast<int>(ag*60),
+				 static_cast<int>(ab*60), static_cast<int>(80*a)));
 	float col_addr_w = 130.f;
 	float col_val_w  = 120.f;
 	float col_prev_w = 120.f;
@@ -244,6 +254,19 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 	dl->AddText(ImVec2(hx, oy + 4.f), dim_col, "Value");    hx += col_val_w;
 	dl->AddText(ImVec2(hx, oy + 4.f), dim_col, "Previous"); hx += col_prev_w;
 	dl->AddText(ImVec2(hx, oy + 4.f), dim_col, "Module");
+
+	{
+		char count_buf[32];
+		auto& sc2 = memory_scanner::g_state;
+		snprintf(count_buf, sizeof(count_buf), "%zu", sc2.total_found);
+		ImVec2 cs = ImGui::CalcTextSize(count_buf);
+		float bx = ox + w - 10.f - cs.x - 12.f;
+		ImU32 badge_bg = IM_COL32(static_cast<int>(ar*60), static_cast<int>(ag*60),
+								   static_cast<int>(ab*60), static_cast<int>(180*a));
+		ImU32 badge_tc = IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+								   static_cast<int>(ab*255), static_cast<int>(220*a));
+		ui_anim::render_badge(dl, count_buf, bx, oy + 3.f, badge_bg, badge_tc);
+	}
 
 	float body_y = oy + hdr_h;
 	float body_h = h - hdr_h;
@@ -328,15 +351,35 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 	if (total > visible_rows) {
 		float sb_w = 6.f;
 		float sb_x = ox + w - sb_w - 2.f;
-		float ratio = body_h / (static_cast<float>(total) * row_h);
+		float content_total = static_cast<float>(total) * row_h;
+		float ratio = body_h / content_total;
 		float thumb_h = std::max(20.f, body_h * ratio);
 		float track_h = body_h - thumb_h;
 		float thumb_y = body_y + (max_scroll > 0.f ? (ui.result_scroll_y / max_scroll) * track_h : 0.f);
-
 		dl->AddRectFilled(ImVec2(sb_x, body_y), ImVec2(sb_x + sb_w, body_y + body_h),
 			IM_COL32(20, 22, 28, static_cast<int>(60*a)), 3.f);
+		bool sb_hov = ImGui::IsMouseHoveringRect(ImVec2(sb_x, thumb_y), ImVec2(sb_x + sb_w, thumb_y + thumb_h));
+		ImU32 sb_col = sb_hov
+			? IM_COL32(static_cast<int>(ar*180), static_cast<int>(ag*180), static_cast<int>(ab*180), static_cast<int>(200*a))
+			: IM_COL32(80, 85, 95, static_cast<int>(140*a));
 		dl->AddRectFilled(ImVec2(sb_x, thumb_y), ImVec2(sb_x + sb_w, thumb_y + thumb_h),
-			IM_COL32(80, 85, 95, static_cast<int>(140*a)), 3.f);
+			sb_col, 3.f);
+	}
+
+	if (total == 0) {
+		float cx = ox + w * 0.5f;
+		float cy = body_y + body_h * 0.5f;
+		float t = static_cast<float>(ImGui::GetTime());
+		float pulse = std::sin(t * 2.f) * 0.3f + 0.7f;
+		ImU32 empty_col = IM_COL32(100, 100, 120, static_cast<int>(100 * a * pulse));
+		const char* msg = sc.has_initial_scan ? "No results" : "Start a scan to find values";
+		ImVec2 ts = ImGui::CalcTextSize(msg);
+		dl->AddText(ImVec2(cx - ts.x * 0.5f, cy - ts.y * 0.5f), empty_col, msg);
+		if (!sc.has_initial_scan) {
+			ui_anim::render_spinner(dl, cx, cy + 24.f, 6.f, 1.5f,
+				IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+						 static_cast<int>(ab*255), static_cast<int>(60*a)), t);
+		}
 	}
 }
 
@@ -357,14 +400,11 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + hdr_h),
-		IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-	dl->AddRectFilledMultiColor(ImVec2(ox, oy), ImVec2(ox + w, oy + hdr_h),
-		IM_COL32(static_cast<int>(ar*50), static_cast<int>(ag*50), static_cast<int>(ab*50), static_cast<int>(20*a)),
-		IM_COL32(static_cast<int>(ar*50), static_cast<int>(ag*50), static_cast<int>(ab*50), 0),
-		IM_COL32(0, 0, 0, 0),
-		IM_COL32(0, 0, 0, 0));
-	dl->AddLine(ImVec2(ox, oy + hdr_h), ImVec2(ox + w, oy + hdr_h),
-		IM_COL32(60, 65, 75, static_cast<int>(80*a)));
+		IM_COL32(25, 27, 35, static_cast<int>(220*a)));
+	ui_anim::render_gradient_header(dl, ox, oy, w, hdr_h, ar, ag, ab, a * 0.35f);
+	dl->AddLine(ImVec2(ox, oy + hdr_h - 1.f), ImVec2(ox + w, oy + hdr_h - 1.f),
+		IM_COL32(static_cast<int>(ar*60), static_cast<int>(ag*60),
+				 static_cast<int>(ab*60), static_cast<int>(80*a)));
 	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "Address List");
 
 
@@ -499,20 +539,28 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 	if (total > visible_rows) {
 		float sb_w = 6.f;
 		float sb_x = ox + w - sb_w - 2.f;
-		float ratio = body_h / (static_cast<float>(total) * row_h);
+		float content_total = static_cast<float>(total) * row_h;
+		float ratio = body_h / content_total;
 		float thumb_h = std::max(20.f, body_h * ratio);
 		float track_h = body_h - thumb_h;
 		float thumb_y = body_y + (max_scroll > 0.f ? (ui.address_scroll_y / max_scroll) * track_h : 0.f);
-
 		dl->AddRectFilled(ImVec2(sb_x, body_y), ImVec2(sb_x + sb_w, body_y + body_h),
 			IM_COL32(20, 22, 28, static_cast<int>(60*a)), 3.f);
+		bool sb_hov = ImGui::IsMouseHoveringRect(ImVec2(sb_x, thumb_y), ImVec2(sb_x + sb_w, thumb_y + thumb_h));
+		ImU32 sb_col = sb_hov
+			? IM_COL32(static_cast<int>(ar*180), static_cast<int>(ag*180), static_cast<int>(ab*180), static_cast<int>(200*a))
+			: IM_COL32(80, 85, 95, static_cast<int>(140*a));
 		dl->AddRectFilled(ImVec2(sb_x, thumb_y), ImVec2(sb_x + sb_w, thumb_y + thumb_h),
-			IM_COL32(80, 85, 95, static_cast<int>(140*a)), 3.f);
+			sb_col, 3.f);
 	}
 
 	if (total == 0) {
-		dl->AddText(ImVec2(ox + w * 0.5f - 80.f, body_y + body_h * 0.5f - 8.f),
-			IM_COL32(100, 100, 120, static_cast<int>(100*a)),
+		float cx = ox + w * 0.5f;
+		float cy = body_y + body_h * 0.5f - 8.f;
+		float t = static_cast<float>(ImGui::GetTime());
+		float pulse = std::sin(t * 1.8f) * 0.3f + 0.7f;
+		dl->AddText(ImVec2(cx - 80.f, cy),
+			IM_COL32(100, 100, 120, static_cast<int>(100*a*pulse)),
 			"Double-click a result to add");
 	}
 
@@ -574,6 +622,13 @@ void render(float pos_x, float pos_y, float width, float height,
 		static_cast<int>(140 * a));
 	dl->AddLine(ImVec2(ox + 8.f, split_y), ImVec2(ox + w - 8.f, split_y),
 		split_col, 1.f);
+	for (int gi = 1; gi <= 2; ++gi) {
+		float ga = (0.06f - static_cast<float>(gi) * 0.02f) * a * glow;
+		dl->AddRectFilled(ImVec2(ox + 8.f, split_y - static_cast<float>(gi)),
+			ImVec2(ox + w - 8.f, split_y + static_cast<float>(gi) + 1.f),
+			IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
+					 static_cast<int>(accent_b * 255), static_cast<int>(ga * 255.f)));
+	}
 
 	render_address_list(dl, ox, split_y + 1.f, w, address_h - 1.f, a, accent_r, accent_g, accent_b);
 

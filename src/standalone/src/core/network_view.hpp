@@ -190,6 +190,7 @@ struct state_t {
     std::mutex                    bw_mutex;
     std::vector<bw_entry>         bw_entries;
     bool                          bw_monitoring = false;
+    int                           bw_selected = -1;
     std::thread                   bw_thread;
     std::atomic<bool>             bw_polling{false};
 

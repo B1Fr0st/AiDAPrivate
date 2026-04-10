@@ -37,8 +37,6 @@ namespace pool_scrub {
     constexpr ULONG TAG_MAP_COUNT = sizeof(g_tag_map) / sizeof(g_tag_map[0]);
 
 
-    // Page-level MmIsAddressValid — same optimization as CallbackScanner.h.
-    // Eliminates thousands of redundant PFN lock acquisitions per pattern scan.
     __forceinline PVOID find_pattern_safe(PVOID start, ULONG size,
                                           const UCHAR* pattern, const char* mask) {
         if (!start || !pattern || !mask || size == 0)

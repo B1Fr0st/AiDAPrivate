@@ -19,11 +19,6 @@ namespace callback_scanner {
     inline volatile LONG g_initialized = 0;
 
 
-    // Page-level MmIsAddressValid check instead of per-byte.
-    // MmIsAddressValid acquires the PFN lock or walks the TLB — calling it
-    // per byte on a 1 MB scan means 1 million calls. Checking once per 4 KB
-    // page reduces this to ~256 calls (4000x fewer lock acquisitions).
-    // Pattern matches the optimized approach already used in SelfProtect.h.
     __forceinline PVOID find_pattern_safe(PVOID start, ULONG size,
                                           const UCHAR* pattern, const char* mask) {
         if (!start || !pattern || !mask || size == 0)

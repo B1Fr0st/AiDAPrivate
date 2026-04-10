@@ -40,7 +40,6 @@ namespace syscall_indices {
     inline std::uint32_t NtGetContextThread_idx = 0;
     inline std::uint32_t NtSetContextThread_idx = 0;
     inline std::uint32_t NtClose_idx = 0;
-    inline std::uint32_t NtDelayExecution_idx = 0;
     inline std::uint8_t* syscall_instruction_addr = nullptr;
     inline volatile bool indices_resolved = false;
 
@@ -100,36 +99,11 @@ namespace syscall_indices {
         NtGetContextThread_idx = get_syscall_number("NtGetContextThread");
         NtSetContextThread_idx = get_syscall_number("NtSetContextThread");
         NtClose_idx = get_syscall_number("NtClose");
-        NtDelayExecution_idx = get_syscall_number("NtDelayExecution");
 
         indices_resolved = (NtOpenThread_idx && NtSuspendThread_idx && NtResumeThread_idx &&
                            NtGetContextThread_idx && NtSetContextThread_idx && NtClose_idx &&
                            syscall_instruction_addr);
         return indices_resolved;
-    }
-}
-
-namespace anti_debug {
-    __forceinline bool quick_check() {
-        volatile std::uint64_t start = __rdtsc();
-        _mm_lfence();
-        volatile int x = 1;
-        x += 1;
-        (void)x;
-        _mm_lfence();
-        volatile std::uint64_t elapsed = __rdtsc() - start;
-        return elapsed < 0x100000;
-    }
-
-    __forceinline bool check_hardware_bp() {
-        CONTEXT ctx{};
-        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-        if (GetThreadContext(GetCurrentThread(), &ctx)) {
-            if (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3) {
-                return false;
-            }
-        }
-        return true;
     }
 }
 
@@ -282,7 +256,6 @@ std::uint32_t voyager::device_t::find_process(const char* process_name) noexcept
         dtb_ = 0;
         base_address_ = 0;
         spoof_gadget_ = 0;
-    } else {
     }
 
     return found_pid;
@@ -542,7 +515,6 @@ std::uint64_t voyager::device_t::find_image() noexcept {
 
     if (send_request(ioctl_codes::BASE(), &req, sizeof(req))) {
         base_address_ = image_address;
-    } else {
     }
 
     return image_address;
@@ -758,7 +730,6 @@ namespace thread_hijack {
     typedef NTSTATUS(NTAPI* NtClose_t)(HANDLE);
     typedef NTSTATUS(NTAPI* NtDelayExecution_t)(BOOLEAN, PLARGE_INTEGER);
     typedef NTSTATUS(NTAPI* NtYieldExecution_t)();
-    typedef NTSTATUS(NTAPI* NtQuerySystemTime_t)(PLARGE_INTEGER);
 
     inline NtSuspendThread_t pNtSuspendThread = nullptr;
     inline NtResumeThread_t pNtResumeThread = nullptr;
@@ -768,7 +739,6 @@ namespace thread_hijack {
     inline NtClose_t pNtClose = nullptr;
     inline NtDelayExecution_t pNtDelayExecution = nullptr;
     inline NtYieldExecution_t pNtYieldExecution = nullptr;
-    inline NtQuerySystemTime_t pNtQuerySystemTime = nullptr;
     inline volatile bool g_initialized = false;
     inline volatile std::uint64_t g_entropy_pool = 0;
 
@@ -913,7 +883,6 @@ namespace thread_hijack {
         pNtClose = (NtClose_t)get_func("NtClose");
         pNtDelayExecution = (NtDelayExecution_t)get_func("NtDelayExecution");
         pNtYieldExecution = (NtYieldExecution_t)get_func("NtYieldExecution");
-        pNtQuerySystemTime = (NtQuerySystemTime_t)get_func("NtQuerySystemTime");
 
         g_initialized = (pNtSuspendThread && pNtResumeThread && pNtGetContextThread &&
                         pNtSetContextThread && pNtOpenThread && pNtClose && pNtDelayExecution);
@@ -1305,11 +1274,6 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
     spoofer::scatter_execution();
     thread_hijack::collect_entropy();
 
-    if (!result) {
-        DWORD err = GetLastError();
-    } else {
-    }
-
     return result != FALSE;
 }
 
@@ -1391,9 +1355,12 @@ std::vector<voyager::device_t::thread_info> voyager::device_t::enumerate_threads
         return result;
     }
 
-    auto* req = new (std::nothrow) voyager::detail::thread_enum_request{};
+    auto* req = static_cast<voyager::detail::thread_enum_request*>(
+        VirtualAlloc(nullptr, sizeof(voyager::detail::thread_enum_request),
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!req) return result;
 
+    std::memset(req, 0, sizeof(*req));
     req->pid = process_id_;
     req->thread_count = 0;
 
@@ -1406,10 +1373,9 @@ std::vector<voyager::device_t::thread_info> voyager::device_t::enumerate_threads
             ti.rip = req->entries[i].rip;
             result.push_back(ti);
         }
-    } else {
     }
 
-    delete req;
+    VirtualFree(req, 0, MEM_RELEASE);
     return result;
 }
 
@@ -1487,9 +1453,12 @@ std::vector<voyager::detail::region_entry> voyager::device_t::enumerate_memory_r
         return result;
     }
 
-    auto* req = new (std::nothrow) voyager::detail::enum_regions_request{};
+    auto* req = static_cast<voyager::detail::enum_regions_request*>(
+        VirtualAlloc(nullptr, sizeof(voyager::detail::enum_regions_request),
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!req) return result;
 
+    std::memset(req, 0, sizeof(*req));
     req->pid = process_id_;
     req->include_all = include_all ? 1 : 0;
     req->start_address = start;
@@ -1501,10 +1470,9 @@ std::vector<voyager::detail::region_entry> voyager::device_t::enumerate_memory_r
         for (std::uint32_t i = 0; i < req->region_count && i < voyager::detail::MAX_ENUM_REGIONS; i++) {
             result.push_back(req->entries[i]);
         }
-    } else {
     }
 
-    delete req;
+    VirtualFree(req, 0, MEM_RELEASE);
     return result;
 }
 

@@ -499,19 +499,6 @@ discovery_done:
         SN_LOG("init_thread: dispatch_guard::init_module_list = %d", (int)ml_ok);
 
 
-        // ── heartbeat + guardian MUST init before slow subsystems ──
-        // etw_disable, callback_scanner, pool_scrub each pattern-scan ntoskrnl
-        // (~16 MB) which can take tens of seconds. If heartbeat::init() and
-        // guardian::start() come after those, sentinel_tsc stays 0 the entire
-        // time, and WhosWho's watchdog DPC hits the stale-streak threshold
-        // (6 × 10 s = 60 s after the 90 s grace) → false BSOD 0xDEAD5E10.
-        //
-        // heartbeat::init() only locates the bridge struct (fast PE walk).
-        // guardian::start() arms a 10 s DPC that calls update_and_check()
-        // every tick. Every other DPC subsystem (integrity::verify,
-        // dispatch_guard::verify, etw_disable::monitor_reenablement, etc.)
-        // checks its own g_initialized flag and returns early if not yet
-        // initialized, so starting the DPC before those subsystems is safe.
         {
             ULONG hb_size = g_target_driver_size ? g_target_driver_size : target_text_size * 4;
             SN_LOG("init_thread: heartbeat::init target_base=%p hb_size=0x%lx (driver_size=0x%lx text_size=0x%lx)",
@@ -520,8 +507,8 @@ discovery_done:
             SN_LOG("init_thread: heartbeat::init = %d", (int)hb_ok);
 
             if (hb_ok) {
-                // Write a non-zero sentinel_tsc immediately so the watchdog
-                // sees liveness before the first guardian DPC tick (~10 s).
+
+
                 heartbeat::update_and_check();
                 SN_LOG("init_thread: heartbeat initial tick done");
             }
@@ -533,7 +520,6 @@ discovery_done:
         SN_LOG("init_thread: guardian::start = %d", (int)guard_ok);
 
 
-        // ── slow subsystems below — safe now that heartbeat is live ──
         {
             PVOID nt_base = reinterpret_cast<PVOID>(get_nt_base());
             SN_LOG("init_thread: nt_base=%p for etw_disable", nt_base);

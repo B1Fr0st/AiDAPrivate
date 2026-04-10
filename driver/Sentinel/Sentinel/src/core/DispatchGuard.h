@@ -40,11 +40,6 @@ namespace dispatch_guard {
     }
 
 
-    // Cached module range array — built once per verify() call, used for all
-    // 28 dispatch slot checks. Previously, each mismatch walked the full module
-    // list (up to 512 entries) independently, totalling up to 28 × 512 = 14,336
-    // list node traversals per DPC tick. Now we walk once (512 max) and do 28
-    // simple array lookups — a 96% reduction in linked-list traversal overhead.
     constexpr ULONG MAX_CACHED_MODULES = 256;
 
     struct module_range_t {
@@ -107,7 +102,7 @@ namespace dispatch_guard {
         return false;
     }
 
-    // Legacy function retained for callers outside verify() that do one-off checks.
+
     __forceinline bool is_address_in_loaded_module(PVOID address) {
         module_range_t cache[MAX_CACHED_MODULES];
         ULONG count = build_module_cache(cache, MAX_CACHED_MODULES);
@@ -208,8 +203,7 @@ namespace dispatch_guard {
         if (!drv_obj || !_MmIsAddressValid(drv_obj))
             return true;
 
-        // Build the module cache ONCE for all 28 slot checks.
-        // Previously each mismatch walked the linked list independently.
+
         module_range_t mod_cache[MAX_CACHED_MODULES];
         ULONG mod_count = build_module_cache(mod_cache, MAX_CACHED_MODULES);
 

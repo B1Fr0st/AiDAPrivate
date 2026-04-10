@@ -36,12 +36,22 @@ static bool draw_row(ImDrawList* dl, float x0, float y0, float x1, float y1,
 		ImU32 sel_col = IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
 					 static_cast<int>(ab*255), static_cast<int>(30*a));
 		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), sel_col, 3.f);
-		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + 2.f, y1),
+		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + 3.f, y1),
 			IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-					 static_cast<int>(ab*255), static_cast<int>(160*a)));
+					 static_cast<int>(ab*255), static_cast<int>(180*a)));
+		for (int g = 0; g < 3; ++g) {
+			float gw = 6.f + static_cast<float>(g) * 4.f;
+			float ga = (0.08f - static_cast<float>(g) * 0.025f) * a;
+			dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + gw, y1),
+				IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+						 static_cast<int>(ab*255), static_cast<int>(ga * 255.f)));
+		}
 	} else if (hov) {
 		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
-			IM_COL32(255, 255, 255, static_cast<int>(8*a)), 3.f);
+			IM_COL32(255, 255, 255, static_cast<int>(10*a)), 3.f);
+		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + 2.f, y1),
+			IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+					 static_cast<int>(ab*255), static_cast<int>(60*a)));
 	}
 	return hov;
 }
@@ -225,6 +235,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 					   float a, float ar, float ag, float ab) {
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
+	float dt = ImGui::GetIO().DeltaTime;
 
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 	ImU32 dim_col  = IM_COL32(140, 145, 155, static_cast<int>(150*a));
@@ -232,24 +243,70 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 	ImU32 mnem_col = IM_COL32(220, 180, 130, static_cast<int>(220*a));
 	ImU32 reg_col  = IM_COL32(180, 220, 160, static_cast<int>(220*a));
 
+	ui.panel_sep_phase += dt * 1.8f;
+	if (ui.panel_sep_phase > 6.283185f) ui.panel_sep_phase -= 6.283185f;
+	float sep_glow = (std::sin(ui.panel_sep_phase) * 0.5f + 0.5f) * 0.4f + 0.4f;
 
 	float left_w = w * 0.65f;
 	float right_w = w - left_w;
 	float top_h = h * 0.6f;
 	float bot_h = h - top_h;
 
+	auto draw_panel_separator_v = [&](float sx, float sy, float sh) {
+		ImU32 sep_col = IM_COL32(static_cast<int>(ar * 80 * sep_glow),
+								  static_cast<int>(ag * 80 * sep_glow),
+								  static_cast<int>(ab * 80 * sep_glow),
+								  static_cast<int>(120 * a));
+		dl->AddLine(ImVec2(sx, sy), ImVec2(sx, sy + sh), sep_col, 1.f);
+		for (int gi = 1; gi <= 2; ++gi) {
+			float ga = (0.08f - static_cast<float>(gi) * 0.03f) * a * sep_glow;
+			dl->AddRectFilled(ImVec2(sx - static_cast<float>(gi), sy),
+				ImVec2(sx + static_cast<float>(gi) + 1.f, sy + sh),
+				IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+						 static_cast<int>(ab * 255), static_cast<int>(ga * 255.f)));
+		}
+	};
+
+	auto draw_panel_separator_h = [&](float sx, float sy, float sw) {
+		ImU32 sep_col = IM_COL32(static_cast<int>(ar * 80 * sep_glow),
+								  static_cast<int>(ag * 80 * sep_glow),
+								  static_cast<int>(ab * 80 * sep_glow),
+								  static_cast<int>(120 * a));
+		dl->AddLine(ImVec2(sx, sy), ImVec2(sx + sw, sy), sep_col, 1.f);
+		for (int gi = 1; gi <= 2; ++gi) {
+			float ga = (0.08f - static_cast<float>(gi) * 0.03f) * a * sep_glow;
+			dl->AddRectFilled(ImVec2(sx, sy - static_cast<float>(gi)),
+				ImVec2(sx + sw, sy + static_cast<float>(gi) + 1.f),
+				IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+						 static_cast<int>(ab * 255), static_cast<int>(ga * 255.f)));
+		}
+	};
+
+	auto draw_panel_header = [&](float px, float py, float pw, const char* label) {
+		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + HEADER_H),
+			IM_COL32(25, 27, 35, static_cast<int>(220*a)));
+		ui_anim::render_gradient_header(dl, px, py, pw, HEADER_H, ar, ag, ab, a * 0.35f);
+		dl->AddLine(ImVec2(px, py + HEADER_H - 1.f), ImVec2(px + pw, py + HEADER_H - 1.f),
+			IM_COL32(static_cast<int>(ar*60), static_cast<int>(ag*60),
+					 static_cast<int>(ab*60), static_cast<int>(80*a)));
+		dl->AddText(ImVec2(px + 8.f, py + 4.f), dim_col, label);
+	};
+
 
 	{
 		float px = ox, py = oy, pw = left_w - 1.f, ph = top_h - 1.f;
 		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
 			IM_COL32(18, 20, 26, static_cast<int>(240*a)));
-
-		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + HEADER_H),
-			IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-		dl->AddText(ImVec2(px + 6.f, py + 3.f), dim_col, "Disassembly");
+		draw_panel_header(px, py, pw, "Disassembly");
 
 		auto regs = debugger_engine::get_registers();
 		uint64_t rip = regs.rip;
+
+		if (rip != ui.prev_rip && rip != 0) {
+			ui.rip_flash = 1.f;
+			ui.prev_rip = rip;
+		}
+		ui_anim::decay_flash(ui.rip_flash, 3.f, dt);
 
 		if (rip != 0) {
 			std::vector<uint8_t> code;
@@ -280,16 +337,30 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 					bool sel = (ui.disasm_selected == static_cast<int>(i));
 
 					if (is_rip) {
+						float rip_a = 20.f + ui.rip_flash * 25.f;
 						dl->AddRectFilled(ImVec2(px, ry), ImVec2(px + pw, ry + ROW_HEIGHT),
 							IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-									 static_cast<int>(ab*255), static_cast<int>(20*a)));
+									 static_cast<int>(ab*255), static_cast<int>(rip_a*a)));
 
+						float tri_glow = 0.8f + ui.rip_flash * 0.2f;
 						dl->AddTriangleFilled(
 							ImVec2(px + 4.f, ry + 4.f),
 							ImVec2(px + 4.f, ry + ROW_HEIGHT - 4.f),
 							ImVec2(px + 12.f, ry + ROW_HEIGHT * 0.5f),
-							IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-									 static_cast<int>(ab*255), static_cast<int>(220*a)));
+							IM_COL32(static_cast<int>(ar*255*tri_glow), static_cast<int>(ag*255*tri_glow),
+									 static_cast<int>(ab*255*tri_glow), static_cast<int>(230*a)));
+
+						if (ui.rip_flash > 0.01f) {
+							for (int fg = 0; fg < 2; ++fg) {
+								float fga = ui.rip_flash * (0.12f - static_cast<float>(fg) * 0.05f) * a;
+								dl->AddRectFilled(
+									ImVec2(px, ry - static_cast<float>(fg + 1)),
+									ImVec2(px + pw, ry + ROW_HEIGHT + static_cast<float>(fg + 1)),
+									IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+											 static_cast<int>(ab*255), static_cast<int>(fga * 255.f)),
+									2.f);
+							}
+						}
 
 						ui_anim::render_status_dot(dl, px + 8.f, ry + ROW_HEIGHT * 0.5f, 2.f,
 							IM_COL32(80, 220, 100, static_cast<int>(220 * a)),
@@ -360,14 +431,13 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 	}
 
 
+	draw_panel_separator_v(ox + left_w - 0.5f, oy, top_h);
+
 	{
 		float px = ox + left_w, py = oy, pw = right_w, ph = top_h - 1.f;
 		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
 			IM_COL32(20, 22, 28, static_cast<int>(240*a)));
-
-		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + HEADER_H),
-			IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-		dl->AddText(ImVec2(px + 6.f, py + 3.f), dim_col, "Registers");
+		draw_panel_header(px, py, pw, "Registers");
 
 		auto regs = debugger_engine::get_registers();
 		struct reg_info { const char* name; uint64_t val; int idx; };
@@ -431,14 +501,13 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 	}
 
 
+	draw_panel_separator_h(ox, oy + top_h - 0.5f, left_w);
+
 	{
 		float px = ox, py = oy + top_h, pw = left_w - 1.f, ph = bot_h;
 		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
 			IM_COL32(18, 20, 26, static_cast<int>(240*a)));
-
-		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + HEADER_H),
-			IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-		dl->AddText(ImVec2(px + 6.f, py + 3.f), dim_col, "Memory Dump");
+		draw_panel_header(px, py, pw, "Memory Dump");
 
 		uint64_t dump_addr = ui.dump_address;
 		if (dump_addr == 0) {
@@ -520,15 +589,14 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 	}
 
 
+	draw_panel_separator_h(ox + left_w, oy + top_h - 0.5f, right_w);
+	draw_panel_separator_v(ox + left_w - 0.5f, oy + top_h, bot_h);
+
 	{
 		float px = ox + left_w, py = oy + top_h, pw = right_w, ph = bot_h;
 		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
 			IM_COL32(20, 22, 28, static_cast<int>(240*a)));
-
-		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + HEADER_H),
-			IM_COL32(25, 27, 35, static_cast<int>(200*a)));
-		dl->AddText(ImVec2(px + 6.f, py + 3.f), dim_col, "Stack");
-
+		draw_panel_header(px, py, pw, "Stack");
 		auto regs = debugger_engine::get_registers();
 		uint64_t rsp = regs.rsp;
 
@@ -657,24 +725,24 @@ static void render_memmap(ImDrawList* dl, float ox, float oy, float w, float h,
 	if (ImGui::IsMouseHoveringRect(ImVec2(ox, oy + HEADER_H), ImVec2(ox + w, oy + h), false)) {
 		float wheel = ImGui::GetIO().MouseWheel;
 		if (wheel != 0.f)
-			ui.list_target_scroll_y -= wheel * ROW_HEIGHT * 3.f;
+			ui.memmap_target_scroll_y -= wheel * ROW_HEIGHT * 3.f;
 	}
 	float max_sc = std::max(0.f, static_cast<float>(total) * ROW_HEIGHT - (h - HEADER_H));
-	ui.list_target_scroll_y = std::clamp(ui.list_target_scroll_y, 0.f, max_sc);
-	ui.list_scroll_y += (ui.list_target_scroll_y - ui.list_scroll_y) * 0.25f;
+	ui.memmap_target_scroll_y = std::clamp(ui.memmap_target_scroll_y, 0.f, max_sc);
+	ui.memmap_scroll_y += (ui.memmap_target_scroll_y - ui.memmap_scroll_y) * 0.25f;
 
-	int first = static_cast<int>(ui.list_scroll_y / ROW_HEIGHT);
+	int first = static_cast<int>(ui.memmap_scroll_y / ROW_HEIGHT);
 	int last = std::min(total, first + visible + 2);
 
 	float body_y = oy + HEADER_H;
 	ImGui::PushClipRect(ImVec2(ox, body_y), ImVec2(ox + w, oy + h), true);
 
 	for (int i = first; i < last; ++i) {
-		float ry = body_y + static_cast<float>(i) * ROW_HEIGHT - ui.list_scroll_y;
+		float ry = body_y + static_cast<float>(i) * ROW_HEIGHT - ui.memmap_scroll_y;
 		if (ry + ROW_HEIGHT < body_y || ry > oy + h) continue;
 
 		auto& r = st.memory_map[static_cast<size_t>(i)];
-		bool sel = (ui.list_selected == i);
+		bool sel = (ui.memmap_selected == i);
 
 		if (i & 1)
 			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
@@ -697,7 +765,7 @@ static void render_memmap(ImDrawList* dl, float ox, float oy, float w, float h,
 
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			ui.list_selected = i;
+			ui.memmap_selected = i;
 	}
 
 	ImGui::PopClipRect();
@@ -827,24 +895,24 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h,
 	if (ImGui::IsMouseHoveringRect(ImVec2(ox, oy + HEADER_H), ImVec2(ox + w, oy + h), false)) {
 		float wheel = ImGui::GetIO().MouseWheel;
 		if (wheel != 0.f)
-			ui.list_target_scroll_y -= wheel * ROW_HEIGHT * 3.f;
+			ui.trace_target_scroll_y -= wheel * ROW_HEIGHT * 3.f;
 	}
 	float max_sc = std::max(0.f, static_cast<float>(total) * ROW_HEIGHT - (h - HEADER_H));
-	ui.list_target_scroll_y = std::clamp(ui.list_target_scroll_y, 0.f, max_sc);
-	ui.list_scroll_y += (ui.list_target_scroll_y - ui.list_scroll_y) * 0.25f;
+	ui.trace_target_scroll_y = std::clamp(ui.trace_target_scroll_y, 0.f, max_sc);
+	ui.trace_scroll_y += (ui.trace_target_scroll_y - ui.trace_scroll_y) * 0.25f;
 
-	int first = static_cast<int>(ui.list_scroll_y / ROW_HEIGHT);
+	int first = static_cast<int>(ui.trace_scroll_y / ROW_HEIGHT);
 	int last = std::min(total, first + visible + 2);
 
 	float body_y = oy + HEADER_H;
 	ImGui::PushClipRect(ImVec2(ox, body_y), ImVec2(ox + w, oy + h), true);
 
 	for (int i = first; i < last; ++i) {
-		float ry = body_y + static_cast<float>(i) * ROW_HEIGHT - ui.list_scroll_y;
+		float ry = body_y + static_cast<float>(i) * ROW_HEIGHT - ui.trace_scroll_y;
 		if (ry + ROW_HEIGHT < body_y || ry > oy + h) continue;
 
 		auto& tr = st.trace_log[static_cast<size_t>(i)];
-		bool sel = (ui.list_selected == i);
+		bool sel = (ui.trace_selected == i);
 
 		if (i & 1)
 			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
@@ -863,7 +931,7 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h,
 
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			ui.list_selected = i;
+			ui.trace_selected = i;
 	}
 
 	ImGui::PopClipRect();
@@ -892,24 +960,24 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 	if (ImGui::IsMouseHoveringRect(ImVec2(ox, oy + HEADER_H), ImVec2(ox + w, oy + h), false)) {
 		float wheel = ImGui::GetIO().MouseWheel;
 		if (wheel != 0.f)
-			ui.list_target_scroll_y -= wheel * ROW_HEIGHT * 3.f;
+			ui.strings_target_scroll_y -= wheel * ROW_HEIGHT * 3.f;
 	}
 	float max_sc = std::max(0.f, static_cast<float>(total) * ROW_HEIGHT - (h - HEADER_H));
-	ui.list_target_scroll_y = std::clamp(ui.list_target_scroll_y, 0.f, max_sc);
-	ui.list_scroll_y += (ui.list_target_scroll_y - ui.list_scroll_y) * 0.25f;
+	ui.strings_target_scroll_y = std::clamp(ui.strings_target_scroll_y, 0.f, max_sc);
+	ui.strings_scroll_y += (ui.strings_target_scroll_y - ui.strings_scroll_y) * 0.25f;
 
-	int first = static_cast<int>(ui.list_scroll_y / ROW_HEIGHT);
+	int first = static_cast<int>(ui.strings_scroll_y / ROW_HEIGHT);
 	int last = std::min(total, first + visible + 2);
 
 	float body_y = oy + HEADER_H;
 	ImGui::PushClipRect(ImVec2(ox, body_y), ImVec2(ox + w, oy + h), true);
 
 	for (int i = first; i < last; ++i) {
-		float ry = body_y + static_cast<float>(i) * ROW_HEIGHT - ui.list_scroll_y;
+		float ry = body_y + static_cast<float>(i) * ROW_HEIGHT - ui.strings_scroll_y;
 		if (ry + ROW_HEIGHT < body_y || ry > oy + h) continue;
 
 		auto& sr = st.strings[static_cast<size_t>(i)];
-		bool sel = (ui.list_selected == i);
+		bool sel = (ui.strings_selected == i);
 
 		if (i & 1)
 			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
@@ -931,7 +999,7 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			ui.list_selected = i;
+			ui.strings_selected = i;
 	}
 
 	ImGui::PopClipRect();
@@ -1118,7 +1186,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			render_bookmarks(dl, ox, content_y, w, content_h, a, accent_r, accent_g, accent_b);
 			break;
 		case sub_tab_t::modules:
-			module_view::render(0.f, TAB_HEIGHT, w, content_h,
+			module_view::render(ox, content_y, w, content_h,
 				a, accent_r, accent_g, accent_b);
 			break;
 		case sub_tab_t::patches: {
@@ -1176,11 +1244,11 @@ void render(float pos_x, float pos_y, float width, float height,
 			break;
 		}
 		case sub_tab_t::seh_chain:
-			seh_view::render(0.f, TAB_HEIGHT, w, content_h,
+			seh_view::render(ox, content_y, w, content_h,
 				a, accent_r, accent_g, accent_b);
 			break;
 		case sub_tab_t::cfg:
-			cfg_view::render(0.f, TAB_HEIGHT, w, content_h,
+			cfg_view::render(ox, content_y, w, content_h,
 				a, accent_r, accent_g, accent_b);
 			break;
 		case sub_tab_t::xrefs: {

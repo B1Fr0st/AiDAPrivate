@@ -71,6 +71,34 @@ static std::uint32_t find_target_pid() {
     return pid;
 }
 
+/*
+ * WHY: Replace the fixed Sleep(3000) that missed traffic.  test_target now signals
+ * Global\\WhosWhoTestReady after at least 2 network threads have completed their
+ * first operation.  Waiting on this event ensures traffic is actively flowing
+ * before any capture or network test begins.
+ */
+static bool wait_for_ready_event(DWORD timeout_ms = 15000) {
+    HANDLE ready = OpenEventW(SYNCHRONIZE, FALSE, L"Global\\WhosWhoTestReady");
+    if (!ready) {
+        ready = OpenEventW(SYNCHRONIZE, FALSE, L"Local\\WhosWhoTestReady");
+    }
+    if (!ready) {
+        printf("  [WARN] Could not open WhosWhoTestReady event (err=%lu), falling back to 5s sleep\n",
+               GetLastError());
+        Sleep(5000);
+        return true;
+    }
+    printf("  [INFO] Waiting for test_target ready signal (timeout=%lums)...\n", timeout_ms);
+    DWORD result = WaitForSingleObject(ready, timeout_ms);
+    CloseHandle(ready);
+    if (result == WAIT_OBJECT_0) {
+        printf("  [INFO] test_target signaled ready — network traffic is flowing.\n");
+        return true;
+    }
+    printf("  [WARN] Ready event timed out after %lums — proceeding anyway.\n", timeout_ms);
+    return false;
+}
+
 
 static bool test_connect() {
     section("CORE: Connect / Disconnect");
@@ -572,6 +600,24 @@ static void test_network_connections(std::uint32_t target_pid) {
         printf(":%u remote=", c.local_port);
         print_ip(c.remote_addr, c.address_family);
         printf(":%u\n", c.remote_port);
+
+        /*
+         * WHY raw dump: Previous test runs showed garbage data in connections
+         * (proto=2045976688, all-zero addresses).  If protocol or address_family
+         * look invalid, dump raw bytes to diagnose struct alignment issues.
+         */
+        bool suspect = (c.protocol > 255 || c.address_family > 30 ||
+                        (c.address_family != 2 && c.address_family != 23));
+        if (suspect) {
+            printf("  [DIAG] TargetConn[%d] has suspect fields — raw dump:\n", shown);
+            printf("  [DIAG]   af=%u proto=%u state=%u pid=%u\n",
+                   c.address_family, c.protocol, c.state, c.pid);
+            printf("  [DIAG]   local_addr bytes: ");
+            for (int i = 0; i < 16; i++) printf("%02X ", c.local_addr[i]);
+            printf("\n  [DIAG]   remote_addr bytes: ");
+            for (int i = 0; i < 16; i++) printf("%02X ", c.remote_addr[i]);
+            printf("\n  [DIAG]   local_port=%u remote_port=%u\n", c.local_port, c.remote_port);
+        }
         shown++;
     }
 
@@ -637,9 +683,14 @@ static void test_capture(std::uint32_t target_pid) {
     }
 
 
-    printf("  [INFO] Capturing test_target traffic for 5 seconds (polling each second)...\n");
-    for (int sec = 1; sec <= 5; sec++) {
-        Sleep(1000);
+    /*
+     * WHY 10 seconds: The original 5s window was too short — test_target's network
+     * threads fire every 0.5-3 seconds.  A 10s window guarantees multiple packets
+     * from HTTP, DNS, TLS, and loopback threads.  Polling every 2s shows progress.
+     */
+    printf("  [INFO] Capturing test_target traffic for 10 seconds (polling every 2s)...\n");
+    for (int sec = 2; sec <= 10; sec += 2) {
+        Sleep(2000);
         bool poll_active = false;
         std::uint32_t poll_cap = 0, poll_drop = 0;
         device->get_capture_status(poll_active, poll_cap, poll_drop);
@@ -658,6 +709,21 @@ static void test_capture(std::uint32_t target_pid) {
 
 
     auto pkts = device->get_captured_packets(64);
+
+    /*
+     * WHY retry: WFP callbacks may have startup latency, or the test_target's
+     * first network operations may not have completed yet.  Retry up to 3 times
+     * with 3s gaps to maximize the chance of capturing packets.
+     */
+    if (pkts.empty()) {
+        for (int retry = 1; retry <= 3; retry++) {
+            printf("  [INFO] No packets yet, retry %d/3 (waiting 3s)...\n", retry);
+            Sleep(3000);
+            pkts = device->get_captured_packets(64);
+            if (!pkts.empty()) break;
+        }
+    }
+
     snprintf(detail, sizeof(detail), "count=%llu", (unsigned long long)pkts.size());
     report("get_captured_packets(64)", !pkts.empty(), detail);
 
@@ -701,6 +767,21 @@ static void test_dns_queries(std::uint32_t target_pid) {
 
 
     auto dns = device->get_dns_queries(target_pid);
+
+    /*
+     * WHY retry: DNS queries are captured asynchronously.  test_target resolves
+     * domains every 2 seconds, but the first query might not have completed before
+     * we call get_dns_queries().  3 retries × 3 seconds = 9 extra seconds max.
+     */
+    if (dns.empty()) {
+        for (int retry = 1; retry <= 3; retry++) {
+            printf("  [INFO] No DNS queries yet, retry %d/3 (waiting 3s)...\n", retry);
+            Sleep(3000);
+            dns = device->get_dns_queries(target_pid);
+            if (!dns.empty()) break;
+        }
+    }
+
     char detail[256];
     snprintf(detail, sizeof(detail), "count=%llu (test_target resolves multiple domains)",
              (unsigned long long)dns.size());
@@ -1038,6 +1119,21 @@ static void test_dpi(std::uint32_t target_pid) {
 
 
     auto results = device->get_dpi_results(target_pid, 0, 0, 0);
+
+    /*
+     * WHY retry: DPI results are populated by classify callbacks processing real
+     * traffic payloads.  If test_target's HTTP/TLS threads haven't completed a
+     * full request yet, the DPI ring may be empty.  Retry with 3s gaps.
+     */
+    if (results.empty()) {
+        for (int retry = 1; retry <= 3; retry++) {
+            printf("  [INFO] No DPI results yet, retry %d/3 (waiting 3s)...\n", retry);
+            Sleep(3000);
+            results = device->get_dpi_results(target_pid, 0, 0, 0);
+            if (!results.empty()) break;
+        }
+    }
+
     char detail[256];
     snprintf(detail, sizeof(detail), "count=%llu (test_target generates HTTP/TLS/DNS)",
              (unsigned long long)results.size());
@@ -1193,7 +1289,12 @@ static void test_bandwidth_monitor(std::uint32_t target_pid) {
     report("bw_monitor_op(start)", ok, detail);
 
 
-    printf("  [INFO] Sampling bandwidth over 4 seconds (2 intervals)...\n");
+    /*
+     * WHY 6s total with 3 samples: test_target generates traffic every 0.5-3s.
+     * Taking 3 samples over 6 seconds ensures we see at least one full traffic
+     * cycle.  The original 4s / 2 samples was borderline.
+     */
+    printf("  [INFO] Sampling bandwidth over 6 seconds (3 intervals)...\n");
     Sleep(2000);
 
     voyager::device_t::bw_stats stats_t1{};
@@ -1214,16 +1315,30 @@ static void test_bandwidth_monitor(std::uint32_t target_pid) {
            (unsigned long long)stats_t2.bps_in,
            (unsigned long long)stats_t2.bps_out);
 
+    Sleep(2000);
 
-    bool bw_growing = (stats_t2.total_bytes_sent > stats_t1.total_bytes_sent) ||
-                      (stats_t2.total_bytes_recv > stats_t1.total_bytes_recv);
-    snprintf(detail, sizeof(detail), "delta_sent=%llu delta_recv=%llu",
-             (unsigned long long)(stats_t2.total_bytes_sent - stats_t1.total_bytes_sent),
-             (unsigned long long)(stats_t2.total_bytes_recv - stats_t1.total_bytes_recv));
+    voyager::device_t::bw_stats stats_t3{};
+    device->bw_monitor_op(0, 0, &stats_t3);
+    printf("  [INFO] t=6s: sent=%llu recv=%llu bps_in=%llu bps_out=%llu\n",
+           (unsigned long long)stats_t3.total_bytes_sent,
+           (unsigned long long)stats_t3.total_bytes_recv,
+           (unsigned long long)stats_t3.bps_in,
+           (unsigned long long)stats_t3.bps_out);
+
+    /*
+     * WHY compare first to last: maximizes the measurement window (6s)
+     * instead of just the last 2s interval.
+     */
+    bool bw_growing = (stats_t3.total_bytes_sent > stats_t1.total_bytes_sent) ||
+                      (stats_t3.total_bytes_recv > stats_t1.total_bytes_recv);
+    snprintf(detail, sizeof(detail), "delta_sent=%llu delta_recv=%llu (over 4s window)",
+             (unsigned long long)(stats_t3.total_bytes_sent - stats_t1.total_bytes_sent),
+             (unsigned long long)(stats_t3.total_bytes_recv - stats_t1.total_bytes_recv));
     report("bw_monitor_verify(traffic growth)", bw_growing, detail);
 
     if (!bw_growing) {
-        printf("  [DIAG] No traffic growth in 2s window — test_target may not be sending data\n");
+        printf("  [DIAG] No traffic growth in 4s window — test_target may not be sending data\n");
+        printf("  [DIAG] Check that test_target.exe is still running and has active sockets\n");
     }
 
 
@@ -1460,9 +1575,12 @@ int main() {
             CloseHandle(pi.hProcess);
             printf("[INFO] Launched test_target.exe (pid=%u)\n", target_pid);
 
-
-            printf("[INFO] Waiting 3 seconds for network threads to initialize...\n");
-            Sleep(3000);
+            /*
+             * WHY: The old code did Sleep(3000) here, which was a blind wait.
+             * test_target now signals Global\\WhosWhoTestReady after its network
+             * threads complete their first operations, so we synchronize on that.
+             */
+            wait_for_ready_event(15000);
         } else {
             printf("[FATAL] Failed to launch test_target.exe (error=%lu)\n", GetLastError());
             printf("[FATAL] Ensure test_target.exe is in the same directory as this test.\n");
@@ -1494,6 +1612,28 @@ int main() {
 
 
     test_dtb();
+
+    /*
+     * WHY start capture + BW monitor early: The non-network tests (memory, threads,
+     * remote call, DLL protection) take 10-20 seconds.  By starting capture and
+     * bandwidth monitoring NOW, the driver accumulates packets during that entire
+     * window while test_target's continuous network threads are flowing.
+     * This replaces the original approach of starting capture AFTER all non-network
+     * tests, which left only a 5s window that often yielded 0 packets.
+     */
+    printf("\n  [INFO] Starting early packet capture and bandwidth monitor...\n");
+    bool early_capture_ok = device->start_capture(found_pid, 0, 0, nullptr, 1500);
+    if (early_capture_ok) {
+        printf("  [INFO] Early capture started (pid=%u) — will harvest after non-network tests.\n", found_pid);
+    } else {
+        printf("  [WARN] Early capture failed — will retry during network test phase.\n");
+    }
+
+    voyager::device_t::bw_stats early_bw{};
+    bool early_bw_ok = device->bw_monitor_op(0, 0, &early_bw);
+    if (early_bw_ok) {
+        printf("  [INFO] Early bandwidth monitor started.\n");
+    }
 
 
     test_read_write(base);
@@ -1531,8 +1671,22 @@ int main() {
 
 
     printf("\n  [INFO] === Beginning network tests ===\n");
-    printf("  [INFO] test_target.exe generates HTTP, DNS, TLS, and local TCP traffic\n");
+    printf("  [INFO] test_target.exe generates HTTP, DNS, TLS, loopback TCP:44444, loopback UDP:44445\n");
     printf("  [INFO] PID-filtered queries should return real connections and packets\n");
+
+    /*
+     * WHY stop early capture here: We started capture before non-network tests
+     * (~15-25 seconds ago), so the ring buffer should have accumulated packets.
+     * Stop it now and report the results before the dedicated capture test.
+     */
+    if (early_capture_ok) {
+        bool act = false;
+        std::uint32_t cap_count = 0, drop_count = 0;
+        device->get_capture_status(act, cap_count, drop_count);
+        printf("  [INFO] Early capture results: active=%d captured=%u dropped=%u\n",
+               act, cap_count, drop_count);
+        device->stop_capture();
+    }
 
     test_network_connections(target_pid);
     test_capture(target_pid);
@@ -1599,8 +1753,9 @@ int main() {
         printf("  +-------------------------------------------------------+\n");
         printf("  | 21 network features tested. See PASS/FAIL above.      |\n");
         printf("  +-------------------------------------------------------+\n");
-        printf("\n  [INFO] Enable kernel logging: build with AIDA_NET_DEBUG defined\n");
-        printf("  [INFO] View kernel logs: WinDbg or DebugView (Capture Kernel) filter on [AIDA-NET]\n");
+        printf("\n  [INFO] Kernel logging is active (AIDA_NET_DEBUG in Release config)\n");
+        printf("  [INFO] View kernel logs: DebugView (Admin + Capture Kernel) filter on [AIDA-NET]\n");
+        printf("  [INFO] test_target.exe runs continuous traffic on ports 80, 443, 53, 44444(TCP), 44445(UDP)\n");
     }
 
 

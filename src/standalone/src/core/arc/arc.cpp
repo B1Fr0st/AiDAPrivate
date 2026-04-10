@@ -5,7 +5,7 @@
 #define NOMINMAX
 
 #include "arc.h"
-#include "../../comm.h"
+#include "comm.h"
 
 #include <windows.h>
 #include <intrin.h>

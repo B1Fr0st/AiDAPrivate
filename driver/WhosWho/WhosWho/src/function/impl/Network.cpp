@@ -3,6 +3,7 @@
 #include "driver/Strong.h"
 #include "../CoreSecurity.h"
 #include "../Struct.h"
+#include "../Stealth.h"
 #include <ndis.h>
 #include <ndis/nbl.h>
 #include <ndis/nblaccessors.h>
@@ -47,10 +48,27 @@ typedef struct _FWPS_TRANSPORT_SEND_PARAMS0_COMPAT {
 #define AIDA_ENDPOINT_PID_CACHE_SIZE 128
 
 
+#ifdef AIDA_NET_DEBUG
+/*
+ * Debug macros for kernel-side network diagnostics. Visible in DbgView (Admin)
+ * with "Capture Kernel" enabled, filter on [AIDA-NET].
+ *
+ *   NET_DBG  — informational (state changes, results, summaries)
+ *   NET_ERR  — errors and failures only
+ *
+ * Uses component 77 (DPFLTR_DEFAULT_ID) level 0 so output appears by default.
+ * When AIDA_NET_DEBUG is not defined, everything compiles to zero overhead.
+ */
+#define NET_DBG(fmt, ...) \
+    do { if (_DbgPrintEx) _DbgPrintEx(77, 0, "[AIDA-NET] " fmt "\n", ##__VA_ARGS__); } while(0)
+
+#define NET_ERR(fmt, ...) \
+    do { if (_DbgPrintEx) _DbgPrintEx(77, 0, "[AIDA-NET][ERR] " fmt "\n", ##__VA_ARGS__); } while(0)
+
+#else
 #define NET_DBG(fmt, ...) ((void)0)
 #define NET_ERR(fmt, ...) ((void)0)
-#define NET_DBG_RATE_IN(interval, fmt, ...) ((void)0)
-#define NET_DBG_RATE_OUT(interval, fmt, ...) ((void)0)
+#endif
 
 
 typedef struct _FWPS_CALLOUT2_COMPAT {
@@ -614,13 +632,11 @@ namespace net_capture {
 
         UINT32 effective_pid = pid;
         if (effective_pid == 0 && g_filter_pid != 0) {
-            NET_DBG("store_packet: dropped pkt (unknown PID, filter_pid=%u)", g_filter_pid);
             return;
         }
 
 
         if (g_filter_pid != 0 && effective_pid != g_filter_pid) {
-            NET_DBG("store_packet: dropped pkt (pid=%u != filter_pid=%u)", effective_pid, g_filter_pid);
             return;
         }
         if (g_filter_port != 0 && local_port != g_filter_port && remote_port != g_filter_port) return;
@@ -638,7 +654,6 @@ namespace net_capture {
         KeAcquireSpinLock(&g_ring_lock, &old_irql);
 
         if (g_ring_count >= RING_BUFFER_SIZE) {
-            NET_DBG("store_packet: ring overflow, dropping oldest (total_dropped=%ld)", g_total_dropped + 1);
             g_ring_tail = (g_ring_tail + 1) % RING_BUFFER_SIZE;
             g_ring_count--;
             _InterlockedIncrement(&g_total_dropped);
@@ -685,7 +700,6 @@ namespace net_capture {
 
         UINT32 effective_pid = pid;
         if (effective_pid == 0 && g_filter_pid != 0) {
-            NET_DBG("store_dns_entry: dropped DNS (unknown PID, filter_pid=%u)", g_filter_pid);
             return;
         }
 
@@ -693,7 +707,6 @@ namespace net_capture {
         KeAcquireSpinLock(&g_dns_lock, &old_irql);
 
         if (g_dns_count >= DNS_RING_SIZE) {
-            NET_DBG("store_dns_entry: DNS ring overflow, dropping oldest");
             g_dns_tail = (g_dns_tail + 1) % DNS_RING_SIZE;
             g_dns_count--;
         }
@@ -826,12 +839,12 @@ namespace net_capture {
 
         classifyOut->actionType = FWP_ACTION_PERMIT_;
 
-        // Skip packets we injected ourselves (prevents infinite reinjection loops)
+
         if (layerData && net_inject::_FwpsQueryPacketInjectionState0) {
             if (net_inject::g_inject_handle_v4) {
                 UINT32 state = net_inject::_FwpsQueryPacketInjectionState0(
                     net_inject::g_inject_handle_v4, layerData, nullptr);
-                if (state == 1 || state == 3) return; // INJECTED_BY_SELF or PREVIOUSLY_INJECTED_BY_SELF
+                if (state == 1 || state == 3) return;
             }
             if (net_inject::g_inject_handle_net_v4) {
                 UINT32 state = net_inject::_FwpsQueryPacketInjectionState0(
@@ -841,10 +854,7 @@ namespace net_capture {
         }
 
         if (!inFixedValues || !inMetaValues) return;
-        if (!should_process_packet_pipeline()) {
-            NET_DBG_RATE_IN(500, "classify_inbound: pipeline bypassed (capture inactive or shutting down)");
-            return;
-        }
+        if (!should_process_packet_pipeline()) return;
 
         __try {
             UINT32 protocol = 0;
@@ -906,11 +916,6 @@ namespace net_capture {
             }
 
             _InterlockedIncrement64(&g_global_pkts_recv);
-
-            NET_DBG_RATE_IN(100, "classify_inbound: proto=%u pid=%u %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
-                    protocol, pid,
-                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port,
-                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port);
 
             UINT32 rule_action = check_filter_rules(0, protocol, pid, local_port, remote_port, remote_ip, 2);
             if (rule_action == 1) {
@@ -1131,12 +1136,12 @@ namespace net_capture {
 
         classifyOut->actionType = FWP_ACTION_PERMIT_;
 
-        // Skip packets we injected ourselves (prevents infinite reinjection loops)
+
         if (layerData && net_inject::_FwpsQueryPacketInjectionState0) {
             if (net_inject::g_inject_handle_v4) {
                 UINT32 state = net_inject::_FwpsQueryPacketInjectionState0(
                     net_inject::g_inject_handle_v4, layerData, nullptr);
-                if (state == 1 || state == 3) return; // INJECTED_BY_SELF or PREVIOUSLY_INJECTED_BY_SELF
+                if (state == 1 || state == 3) return;
             }
             if (net_inject::g_inject_handle_net_v4) {
                 UINT32 state = net_inject::_FwpsQueryPacketInjectionState0(
@@ -1146,10 +1151,7 @@ namespace net_capture {
         }
 
         if (!inFixedValues || !inMetaValues) return;
-        if (!should_process_packet_pipeline()) {
-            NET_DBG_RATE_OUT(500, "classify_outbound: pipeline bypassed");
-            return;
-        }
+        if (!should_process_packet_pipeline()) return;
 
         __try {
             UINT32 protocol = 0;
@@ -1211,11 +1213,6 @@ namespace net_capture {
             }
 
             _InterlockedIncrement64(&g_global_pkts_sent);
-
-            NET_DBG_RATE_OUT(100, "classify_outbound: proto=%u pid=%u %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u",
-                    protocol, pid,
-                    local_ip[0], local_ip[1], local_ip[2], local_ip[3], local_port,
-                    remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port);
 
             UINT32 rule_action = check_filter_rules(1, protocol, pid, local_port, remote_port, remote_ip, 2);
             if (rule_action == 1) {
@@ -1404,29 +1401,24 @@ namespace net_capture {
             }
             if (pid == 0) return;
 
-            UINT32 protocol = 0;
-            UINT32 local_port = 0;
-            UINT32 remote_port = 0;
-
-            if (inFixedValues->valueCount > FWPS_FIELD_ALE_V4_IP_PROTOCOL)
-                protocol = inFixedValues->incomingValue[FWPS_FIELD_ALE_V4_IP_PROTOCOL].value.uint8;
-            if (inFixedValues->valueCount > FWPS_FIELD_ALE_V4_IP_LOCAL_PORT)
-                local_port = inFixedValues->incomingValue[FWPS_FIELD_ALE_V4_IP_LOCAL_PORT].value.uint16;
-            if (inFixedValues->valueCount > FWPS_FIELD_ALE_V4_IP_REMOTE_PORT)
-                remote_port = inFixedValues->incomingValue[FWPS_FIELD_ALE_V4_IP_REMOTE_PORT].value.uint16;
-
+            /*
+             * FIX: The ALE layer's fixed values (inFixedValues) return garbage
+             * protocol/port numbers (e.g. proto=209 instead of 17, local_port=1
+             * instead of the real port). This is likely due to an ALE-layer-specific
+             * field layout incompatibility with our compat structs.
+             *
+             * DO NOT read protocol/port from inFixedValues at the ALE layer.
+             * Instead, store the PID keyed only by the transport endpoint handle
+             * (which IS reliable from metadata). The transport-layer callbacks will
+             * look up PID by endpoint handle alone.
+             */
             UINT64 endpoint_handle = 0;
             if (inMetaValues->transportEndpointHandle != 0)
                 endpoint_handle = inMetaValues->transportEndpointHandle;
 
             if (endpoint_handle != 0) {
-                aida_store_cached_endpoint_pid(endpoint_handle, protocol, local_port, pid);
+                aida_store_cached_endpoint_pid(endpoint_handle, 0, 0, pid);
             }
-            aida_store_cached_port_pid(protocol, local_port, pid);
-            if (remote_port != 0)
-                aida_store_cached_port_pid(protocol, remote_port, pid);
-            NET_DBG("classify_ale_connect: pid=%u proto=%u local_port=%u remote_port=%u ep_handle=0x%llx",
-                    pid, protocol, local_port, remote_port, endpoint_handle);
         } __except(EXCEPTION_EXECUTE_HANDLER) {
         }
     }
@@ -1457,29 +1449,14 @@ namespace net_capture {
             }
             if (pid == 0) return;
 
-            UINT32 protocol = 0;
-            UINT32 local_port = 0;
-            UINT32 remote_port = 0;
-
-            if (inFixedValues->valueCount > FWPS_FIELD_ALE_V4_IP_PROTOCOL)
-                protocol = inFixedValues->incomingValue[FWPS_FIELD_ALE_V4_IP_PROTOCOL].value.uint8;
-            if (inFixedValues->valueCount > FWPS_FIELD_ALE_V4_IP_LOCAL_PORT)
-                local_port = inFixedValues->incomingValue[FWPS_FIELD_ALE_V4_IP_LOCAL_PORT].value.uint16;
-            if (inFixedValues->valueCount > FWPS_FIELD_ALE_V4_IP_REMOTE_PORT)
-                remote_port = inFixedValues->incomingValue[FWPS_FIELD_ALE_V4_IP_REMOTE_PORT].value.uint16;
-
+            /* FIX: Same as classify_ale_connect — don't read garbage from ALE fixed values */
             UINT64 endpoint_handle = 0;
             if (inMetaValues->transportEndpointHandle != 0)
                 endpoint_handle = inMetaValues->transportEndpointHandle;
 
             if (endpoint_handle != 0) {
-                aida_store_cached_endpoint_pid(endpoint_handle, protocol, local_port, pid);
+                aida_store_cached_endpoint_pid(endpoint_handle, 0, 0, pid);
             }
-            aida_store_cached_port_pid(protocol, local_port, pid);
-            if (remote_port != 0)
-                aida_store_cached_port_pid(protocol, remote_port, pid);
-            NET_DBG("classify_ale_recv: pid=%u proto=%u local_port=%u remote_port=%u ep_handle=0x%llx",
-                    pid, protocol, local_port, remote_port, endpoint_handle);
         } __except(EXCEPTION_EXECUTE_HANDLER) {
         }
     }
@@ -2094,52 +2071,48 @@ static NTSTATUS aida_query_system_handles(PAIDA_SYSTEM_HANDLE_INFORMATION* out_i
 }
 
 
-static BOOLEAN safe_reference_file_object(PVOID object, PFILE_OBJECT* out_fo) {
+static BOOLEAN safe_reference_file_object_by_handle(USHORT pid, USHORT handle_value,
+                                                    PFILE_OBJECT* out_fo) {
     if (!out_fo)
         return FALSE;
     *out_fo = nullptr;
 
-
-    if (!object)
+    if (pid == 0 || handle_value == 0)
         return FALSE;
-    if (reinterpret_cast<ULONG_PTR>(object) < 0xFFFF800000000000ULL)
-        return FALSE;
-    if (!_MmIsAddressValid(object))
-        return FALSE;
-
 
     if (!_IoFileObjectType || !*_IoFileObjectType)
         return FALSE;
 
-    __try {
-        if (_ObReferenceObjectSafe) {
-            if (!_ObReferenceObjectSafe(object))
-                return FALSE;
-
-            if (_ObGetObjectType) {
-                POBJECT_TYPE obj_type = _ObGetObjectType(object);
-                if (obj_type != *_IoFileObjectType) {
-                    ObDereferenceObject(object);
-                    return FALSE;
-                }
-            }
-
-            *out_fo = static_cast<PFILE_OBJECT>(object);
-            return TRUE;
-        }
-
+    PEPROCESS process = nullptr;
+    NTSTATUS status = PsLookupProcessByProcessId(
+        reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid)), &process);
+    if (!NT_SUCCESS(status) || !process)
         return FALSE;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
 
+    KAPC_STATE apc_state = {};
+    KeStackAttachProcess(process, &apc_state);
+
+    PVOID file_obj = nullptr;
+    status = ObReferenceObjectByHandle(
+        reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(handle_value)),
+        0,
+        *_IoFileObjectType,
+        KernelMode,
+        &file_obj,
+        nullptr);
+
+    KeUnstackDetachProcess(&apc_state);
+    ObDereferenceObject(process);
+
+    if (!NT_SUCCESS(status) || !file_obj)
         return FALSE;
-    }
+
+    *out_fo = static_cast<PFILE_OBJECT>(file_obj);
+    return TRUE;
 }
 
-static BOOLEAN aida_is_afd_device_object(PVOID object) {
-
-
-    PFILE_OBJECT fileObj = nullptr;
-    if (!safe_reference_file_object(object, &fileObj))
+static BOOLEAN aida_is_afd_file_object(PFILE_OBJECT fileObj) {
+    if (!fileObj)
         return FALSE;
 
     BOOLEAN is_afd = FALSE;
@@ -2183,12 +2156,7 @@ static BOOLEAN aida_is_afd_device_object(PVOID object) {
         is_afd = FALSE;
     }
 
-    ObDereferenceObject(fileObj);
     return is_afd;
-}
-
-static __forceinline UINT32 aida_sockaddr_addr_len(UINT16 family) {
-    return (family == AF_INET6) ? 16u : 4u;
 }
 
 static BOOLEAN aida_ip_bytes_equal(const UINT8* left, const UINT8* right, UINT32 len) {
@@ -2201,93 +2169,204 @@ static BOOLEAN aida_ip_bytes_equal(const UINT8* left, const UINT8* right, UINT32
     return TRUE;
 }
 
-static BOOLEAN aida_parse_sockaddr_candidate(PVOID candidate,
-                                             UINT32* out_af,
-                                             UINT32* out_port,
-                                             UINT8* out_addr) {
-    if (!candidate || !out_af || !out_port || !out_addr || !_MmIsAddressValid(candidate)) {
+/*
+ * AFD_ENDPOINT offsets (verified by RE of afd.sys)
+ *
+ * Supported: Win10 19041/19045, Win11 24H2 (26100), Win11 25H2 (26100)
+ * Win11 24H2 and 25H2 share the same kernel build (26100) and identical offsets.
+ *
+ * Fields UNCHANGED across all versions:
+ * +0x00: WORD   Type/Signature (0xAFD0=datagram, 0xAFD1=stream, 0xAAFD=unspecified)
+ * +0x02: BYTE   State (1=open, 2=connected, 3=bound, 4=listening)
+ * +0x08: DWORD  Flags (0x100=has_transport_info)
+ *
+ * Fields that SHIFTED between Win10 (build <26100) and Win11 24H2/25H2 (build >=26100):
+ *                              Win10    Win11 24H2/25H2   Delta
+ * PEPROCESS                    +0x28    +0x30             +0x08
+ * Local TA buffer size (DWORD) +0xDC    +0xEC             +0x10
+ * Local TA buffer ptr  (QWORD) +0xE0    +0xF0             +0x10
+ * TransportInfo ptr    (QWORD) +0xF8    +0x108            +0x10
+ *
+ * Offset relationships (invariant across all versions):
+ *   local_addr_ptr  = local_addr_size + 4
+ *   transport_info  = local_addr_size + 0x1C
+ *
+ * TransportInfo sub-structure (offsets within TransportInfo, UNCHANGED):
+ * +0x16: USHORT AddressFamily (2=AF_INET, 23=AF_INET6)
+ * +0x18: DWORD  Protocol (6=TCP, 17=UDP)
+ * +0x1C: WORD   SocketType (1=STREAM, 2=DGRAM, 3=RAW)
+ *
+ * TRANSPORT_ADDRESS layout (pointed to by Local TA buffer ptr, UNCHANGED):
+ * +0x00: LONG   AddressCount
+ * +0x04: USHORT AddressLength
+ * +0x06: USHORT AddressType (AF_INET=2, AF_INET6=23)
+ * +0x08: TDI_ADDRESS_IP / TDI_ADDRESS_IP6:
+ *   IPv4: port(2, big-endian) + in_addr(4) + zeros(8) = 14 bytes
+ *   IPv6: port(2, big-endian) + flowinfo(4) + addr(16) + scope_id(4) = 26 bytes
+ *
+ * Dynamic resolution strategy:
+ *   Primary:  pattern-scan afd.sys!AfdBind for the LocalAddr store pair
+ *   Fallback: build-number table (NtBuildNumber >= 26100 → Win11 offsets)
+ */
+
+struct afd_endpoint_offsets_t {
+    ULONG transport_info;   /* pointer to TransportInfo struct */
+    ULONG local_addr_size;  /* DWORD: TRANSPORT_ADDRESS buffer size */
+    ULONG local_addr_ptr;   /* QWORD: pointer to TRANSPORT_ADDRESS buffer */
+};
+
+/* Build-number fallback tables */
+static const afd_endpoint_offsets_t g_afd_fallback_win10 = { 0xF8,  0xDC,  0xE0  };
+static const afd_endpoint_offsets_t g_afd_fallback_win11 = { 0x108, 0xEC,  0xF0  };
+
+static afd_endpoint_offsets_t g_afd_offsets = {};
+static volatile LONG g_afd_offsets_state = 0; /* 0=uninit, 1=resolving, 2=ready */
+
+/*
+ * Pattern-scan afd.sys for the adjacent instruction pair in AfdBind that
+ * stores the local address buffer pointer and size into the endpoint:
+ *
+ *   Pattern A (ptr-then-size, confirmed on Win11 24H2/25H2):
+ *     48 89 97 XX XX 00 00   mov [rdi+disp32], rdx   (LocalAddr Ptr)
+ *     44 89 A7 XX XX 00 00   mov [rdi+disp32], r12d  (LocalAddr Size)
+ *
+ *   Pattern B (size-then-ptr, alternate compiler ordering):
+ *     44 89 A7 XX XX 00 00   mov [rdi+disp32], r12d  (LocalAddr Size)
+ *     48 89 97 XX XX 00 00   mov [rdi+disp32], rdx   (LocalAddr Ptr)
+ *
+ * Verified unique across entirety of afd.sys on all three OS versions.
+ * TransportInfo derived: transport_info = local_addr_size + 0x1C.
+ */
+static BOOLEAN afd_resolve_offsets_by_scan() {
+    PVOID afd_base = net_capture::find_module_base("afd.sys");
+    if (!afd_base) afd_base = net_capture::find_module_base("afd.SYS");
+    if (!afd_base) {
+        NET_ERR("afd_resolve: afd.sys not found in module list");
         return FALSE;
     }
 
-    __try {
-        const UINT8* sa = (const UINT8*)candidate;
-        if (!_MmIsAddressValid((PVOID)(sa + sizeof(UINT16) - 1))) {
-            return FALSE;
+    static const UCHAR pat_a[] = {
+        0x48, 0x89, 0x97, 0x00, 0x00, 0x00, 0x00,
+        0x44, 0x89, 0xA7, 0x00, 0x00, 0x00, 0x00
+    };
+    static const char mask_a[] = "xxx??xxxxx??xx";
+
+    static const UCHAR pat_b[] = {
+        0x44, 0x89, 0xA7, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x89, 0x97, 0x00, 0x00, 0x00, 0x00
+    };
+    static const char mask_b[] = "xxx??xxxxx??xx";
+
+    ULONG local_addr_size = 0;
+    ULONG local_addr_ptr  = 0;
+
+    PVOID match = stealth::FindPatternInAllSections(afd_base, pat_a, mask_a);
+    if (match) {
+        UCHAR* p = static_cast<UCHAR*>(match);
+        local_addr_ptr  = *reinterpret_cast<ULONG*>(p + 3);
+        local_addr_size = *reinterpret_cast<ULONG*>(p + 10);
+    } else {
+        match = stealth::FindPatternInAllSections(afd_base, pat_b, mask_b);
+        if (match) {
+            UCHAR* p = static_cast<UCHAR*>(match);
+            local_addr_size = *reinterpret_cast<ULONG*>(p + 3);
+            local_addr_ptr  = *reinterpret_cast<ULONG*>(p + 10);
         }
+    }
 
-        UINT16 family = *(const UINT16*)(sa + 0);
-        if (family == AF_INET) {
-            if (!_MmIsAddressValid((PVOID)(sa + 7))) {
-                return FALSE;
-            }
-
-            UINT16 port_be = *(const UINT16*)(sa + 2);
-            strong::kmemset(out_addr, 0, 16);
-            strong::kmemcpy(out_addr, sa + 4, 4);
-            *out_af = AF_INET;
-            *out_port = ((port_be >> 8) & 0xFFu) | ((port_be & 0xFFu) << 8);
-            return TRUE;
-        }
-
-        if (family == AF_INET6) {
-            if (!_MmIsAddressValid((PVOID)(sa + 23))) {
-                return FALSE;
-            }
-
-            UINT16 port_be = *(const UINT16*)(sa + 2);
-            strong::kmemset(out_addr, 0, 16);
-            strong::kmemcpy(out_addr, sa + 8, 16);
-            *out_af = AF_INET6;
-            *out_port = ((port_be >> 8) & 0xFFu) | ((port_be & 0xFFu) << 8);
-            return TRUE;
-        }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
+    if (!match) {
+        NET_ERR("afd_resolve: no pattern match in afd.sys");
         return FALSE;
+    }
+
+    if (local_addr_ptr != local_addr_size + 4) {
+        NET_ERR("afd_resolve: validation failed size=0x%X ptr=0x%X (expected delta=4)",
+                local_addr_size, local_addr_ptr);
+        return FALSE;
+    }
+
+    if (local_addr_size < 0x80 || local_addr_size > 0x400) {
+        NET_ERR("afd_resolve: local_addr_size 0x%X out of expected range", local_addr_size);
+        return FALSE;
+    }
+
+    ULONG transport_info = local_addr_size + 0x1C;
+
+    g_afd_offsets.transport_info  = transport_info;
+    g_afd_offsets.local_addr_size = local_addr_size;
+    g_afd_offsets.local_addr_ptr  = local_addr_ptr;
+
+    NET_DBG("afd_resolve: SCAN OK transport=+0x%X size=+0x%X ptr=+0x%X (match=%p)",
+            transport_info, local_addr_size, local_addr_ptr, match);
+    return TRUE;
+}
+
+static void afd_init_offsets() {
+    LONG prev = _InterlockedCompareExchange(&g_afd_offsets_state, 1, 0);
+    if (prev == 2) return;
+    if (prev == 1) {
+        while (g_afd_offsets_state != 2) YieldProcessor();
+        return;
+    }
+
+    if (!afd_resolve_offsets_by_scan()) {
+        if (stealth::IsWindows11_24H2OrNewer()) {
+            g_afd_offsets = g_afd_fallback_win11;
+            NET_DBG("afd_init: fallback to Win11 offsets (build >= 26100)");
+        } else {
+            g_afd_offsets = g_afd_fallback_win10;
+            NET_DBG("afd_init: fallback to Win10 offsets (build < 26100)");
+        }
+    }
+
+    _InterlockedExchange(&g_afd_offsets_state, 2);
+}
+
+static __forceinline const afd_endpoint_offsets_t& afd_get_offsets() {
+    if (g_afd_offsets_state != 2) afd_init_offsets();
+    return g_afd_offsets;
+}
+
+static BOOLEAN aida_parse_transport_address(const UINT8* ta_buf, UINT32 ta_size,
+                                            UINT32* out_af, UINT32* out_port, UINT8* out_addr) {
+    if (!ta_buf || !out_af || !out_port || !out_addr) return FALSE;
+    if (ta_size < 10) return FALSE;
+
+    if (!_MmIsAddressValid((PVOID)ta_buf) || !_MmIsAddressValid((PVOID)(ta_buf + 9)))
+        return FALSE;
+
+    LONG addr_count = *(const LONG*)(ta_buf + 0);
+    if (addr_count < 1) return FALSE;
+
+    USHORT addr_type = *(const USHORT*)(ta_buf + 6);
+    USHORT port_be   = *(const USHORT*)(ta_buf + 8);
+    UINT32 port_he   = ((port_be >> 8) & 0xFFu) | ((port_be & 0xFFu) << 8);
+
+    strong::kmemset(out_addr, 0, 16);
+
+    if (addr_type == AF_INET) {
+        if (ta_size < 14 || !_MmIsAddressValid((PVOID)(ta_buf + 13)))
+            return FALSE;
+        strong::kmemcpy(out_addr, ta_buf + 10, 4);
+        *out_af = AF_INET;
+        *out_port = port_he;
+        return TRUE;
+    }
+
+    if (addr_type == AF_INET6) {
+        if (ta_size < 30 || !_MmIsAddressValid((PVOID)(ta_buf + 29)))
+            return FALSE;
+        strong::kmemcpy(out_addr, ta_buf + 14, 16);
+        *out_af = AF_INET6;
+        *out_port = port_he;
+        return TRUE;
     }
 
     return FALSE;
 }
 
-static VOID aida_capture_socket_endpoint(SOCKET_HANDLE_ENTRY* out,
-                                         UINT32 af,
-                                         UINT32 port,
-                                         const UINT8* addr) {
-    if (!out || !addr) {
-        return;
-    }
-
-    UINT32 copy_len = aida_sockaddr_addr_len((UINT16)af);
-    if (port == 0 && net_capture::is_zero_ip(addr)) {
-        return;
-    }
-
-    if (out->address_family == 0) {
-        out->address_family = af;
-    }
-
-    if (out->local_port == 0 && net_capture::is_zero_ip(out->local_addr)) {
-        out->local_port = port;
-        strong::kmemcpy(out->local_addr, addr, copy_len);
-        return;
-    }
-
-    if (out->local_port == port && aida_ip_bytes_equal(out->local_addr, addr, copy_len)) {
-        return;
-    }
-
-    if (out->remote_port == 0 && net_capture::is_zero_ip(out->remote_addr)) {
-        out->remote_port = port;
-        strong::kmemcpy(out->remote_addr, addr, copy_len);
-    }
-}
-
-static BOOLEAN aida_extract_socket_info(PVOID file_object, SOCKET_HANDLE_ENTRY* out) {
-    if (!file_object || !out) return FALSE;
-
-
-    PFILE_OBJECT fo = nullptr;
-    if (!safe_reference_file_object(file_object, &fo))
-        return FALSE;
+static BOOLEAN aida_extract_socket_info_from_fo(PFILE_OBJECT fo, SOCKET_HANDLE_ENTRY* out) {
+    if (!fo || !out) return FALSE;
 
     BOOLEAN result = FALSE;
 
@@ -2302,46 +2381,52 @@ static BOOLEAN aida_extract_socket_info(PVOID file_object, SOCKET_HANDLE_ENTRY* 
         out->afd_endpoint_addr = (UINT64)afd_endpoint;
         UINT8* ep = (UINT8*)afd_endpoint;
 
-        if (_MmIsAddressValid(ep + 0x14)) {
-            out->address_family = *(UINT16*)(ep + 0x14);
-        }
-        if (_MmIsAddressValid(ep + 0x18)) {
-            LONG proto = *(LONG*)(ep + 0x18);
-            out->protocol = (UINT32)(proto > 0 ? proto : 0);
-        }
-
+        out->address_family = 0;
+        out->protocol = 0;
         out->state = 0;
         out->local_port = 0;
         out->remote_port = 0;
         strong::kmemset(out->local_addr, 0, 16);
         strong::kmemset(out->remote_addr, 0, 16);
 
-        for (UINT32 offset = 0x20; offset <= 0x90; offset += (UINT32)sizeof(PVOID)) {
-            if (!_MmIsAddressValid(ep + offset + sizeof(PVOID) - 1)) {
-                continue;
-            }
+        const auto& offsets = afd_get_offsets();
 
-            PVOID candidate = *(PVOID*)(ep + offset);
-            UINT32 cand_af = 0;
-            UINT32 cand_port = 0;
-            UINT8 cand_addr[16] = {};
-            if (!aida_parse_sockaddr_candidate(candidate, &cand_af, &cand_port, cand_addr)) {
-                continue;
-            }
-
-            aida_capture_socket_endpoint(out, cand_af, cand_port, cand_addr);
-            if (out->local_port != 0 && out->remote_port != 0) {
-                break;
+        /* Read AF + Protocol from TransportInfo */
+        if (_MmIsAddressValid(ep + offsets.transport_info + sizeof(PVOID) - 1)) {
+            UINT8* transport_info = *(UINT8**)(ep + offsets.transport_info);
+            if (transport_info && _MmIsAddressValid(transport_info) &&
+                _MmIsAddressValid(transport_info + 0x1D)) {
+                out->address_family = *(UINT16*)(transport_info + 0x16);
+                DWORD proto = *(DWORD*)(transport_info + 0x18);
+                out->protocol = (proto <= 256) ? proto : 0;
             }
         }
 
-        if (out->local_port == 0 && _MmIsAddressValid(ep + 0x20)) {
-            PVOID local_info = *(PVOID*)(ep + 0x20);
-            UINT32 cand_af = 0;
-            UINT32 cand_port = 0;
-            UINT8 cand_addr[16] = {};
-            if (aida_parse_sockaddr_candidate(local_info, &cand_af, &cand_port, cand_addr)) {
-                aida_capture_socket_endpoint(out, cand_af, cand_port, cand_addr);
+        /* Read endpoint state from ep+0x02 */
+        if (_MmIsAddressValid(ep + 0x02)) {
+            UINT8 afd_state = *(ep + 0x02);
+            switch (afd_state) {
+                case 2: out->state = 5; break; /* connected → MIB_TCP_STATE_ESTAB */
+                case 3: out->state = 2; break; /* bound → MIB_TCP_STATE_LISTEN (approx) */
+                case 4: out->state = 2; break; /* listening → MIB_TCP_STATE_LISTEN */
+                default: out->state = 0; break;
+            }
+        }
+
+        /* Read local address from TRANSPORT_ADDRESS */
+        if (_MmIsAddressValid(ep + offsets.local_addr_size + 3) && _MmIsAddressValid(ep + offsets.local_addr_ptr + sizeof(PVOID) - 1)) {
+            UINT32 ta_size = *(UINT32*)(ep + offsets.local_addr_size);
+            UINT8* ta_ptr  = *(UINT8**)(ep + offsets.local_addr_ptr);
+            if (ta_ptr && ta_size >= 10 && ta_size <= 256 && _MmIsAddressValid(ta_ptr)) {
+                UINT32 local_af = 0, local_port = 0;
+                UINT8 local_addr[16] = {};
+                if (aida_parse_transport_address(ta_ptr, ta_size, &local_af, &local_port, local_addr)) {
+                    out->local_port = local_port;
+                    strong::kmemcpy(out->local_addr, local_addr, (local_af == AF_INET6) ? 16u : 4u);
+                    if (out->address_family == 0) {
+                        out->address_family = local_af;
+                    }
+                }
             }
         }
 
@@ -2350,8 +2435,40 @@ static BOOLEAN aida_extract_socket_info(PVOID file_object, SOCKET_HANDLE_ENTRY* 
         result = FALSE;
     }
 
-    ObDereferenceObject(fo);
+    if (result) {
+        static volatile LONG s_dbg_count = 0;
+        LONG cnt = _InterlockedIncrement(&s_dbg_count);
+        if (cnt <= 5) {
+            NET_DBG("socket_info[%ld]: af=%u proto=%u state=%u lport=%u rport=%u ep=0x%llx",
+                    cnt, out->address_family, out->protocol, out->state,
+                    out->local_port, out->remote_port, out->afd_endpoint_addr);
+            NET_DBG("socket_info[%ld]: local=%u.%u.%u.%u remote=%u.%u.%u.%u",
+                    cnt,
+                    out->local_addr[0], out->local_addr[1], out->local_addr[2], out->local_addr[3],
+                    out->remote_addr[0], out->remote_addr[1], out->remote_addr[2], out->remote_addr[3]);
+        }
+    }
 
+    return result;
+}
+
+
+static BOOLEAN aida_safe_get_afd_socket_info(USHORT pid, USHORT handle_value,
+                                             SOCKET_HANDLE_ENTRY* out) {
+    if (!out || pid == 0 || handle_value == 0)
+        return FALSE;
+
+    PFILE_OBJECT fo = nullptr;
+    if (!safe_reference_file_object_by_handle(pid, handle_value, &fo))
+        return FALSE;
+
+    if (!aida_is_afd_file_object(fo)) {
+        ObDereferenceObject(fo);
+        return FALSE;
+    }
+
+    BOOLEAN result = aida_extract_socket_info_from_fo(fo, out);
+    ObDereferenceObject(fo);
     return result;
 }
 
@@ -2409,18 +2526,28 @@ static BOOLEAN aida_socket_matches_ports(const SOCKET_HANDLE_ENTRY* socket_info,
 static UINT32 aida_lookup_cached_endpoint_pid(UINT64 endpoint_handle,
                                               UINT32 protocol,
                                               UINT32 local_port) {
+    UNREFERENCED_PARAMETER(protocol);
+    UNREFERENCED_PARAMETER(local_port);
     if (endpoint_handle == 0) return 0;
 
     aida_ensure_endpoint_pid_cache_init();
 
+    /*
+     * FIX: The ALE classify callbacks read garbage protocol/port values from the
+     * fixed values array (e.g. proto=209 instead of 17, local_port=1 instead of
+     * 44445). These garbage values were stored in the endpoint cache. When
+     * transport-layer callbacks looked up using correct proto/port, the secondary
+     * checks rejected the match despite the endpoint handle being correct.
+     *
+     * The endpoint handle is a unique WFP transport endpoint identifier — it alone
+     * is sufficient for matching. Protocol and port checks are removed.
+     */
     KIRQL old_irql;
     KeAcquireSpinLock(&g_endpoint_pid_cache_lock, &old_irql);
     for (UINT32 i = 0; i < AIDA_ENDPOINT_PID_CACHE_SIZE; i++) {
         const AIDA_ENDPOINT_PID_CACHE_ENTRY* entry = &g_endpoint_pid_cache[i];
         if (!entry->active) continue;
         if (entry->endpoint_handle != endpoint_handle) continue;
-        if (entry->protocol != 0 && protocol != 0 && entry->protocol != protocol) continue;
-        if (entry->local_port != 0 && local_port != 0 && entry->local_port != local_port) continue;
 
         UINT32 pid = entry->pid;
         KeReleaseSpinLock(&g_endpoint_pid_cache_lock, old_irql);
@@ -2561,13 +2688,11 @@ static NTSTATUS aida_refresh_pid_cache_for_process(UINT32 target_pid,
         for (ULONG i = 0; i < handles->NumberOfHandles; i++) {
             const AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO* entry = &handles->Handles[i];
             UINT32 pid = (UINT32)entry->UniqueProcessId;
-            if (pid != target_pid || !entry->Object)
-                continue;
-            if (!aida_is_afd_device_object(entry->Object))
+            if (pid != target_pid)
                 continue;
 
             SOCKET_HANDLE_ENTRY socket_info = {};
-            if (!aida_extract_socket_info(entry->Object, &socket_info))
+            if (!aida_safe_get_afd_socket_info(entry->UniqueProcessId, entry->HandleValue, &socket_info))
                 continue;
             if (protocol_filter != 0 && socket_info.protocol != 0 && socket_info.protocol != protocol_filter)
                 continue;
@@ -2603,18 +2728,15 @@ static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
                                       UINT32 remote_port) {
     UINT32 cached_pid = aida_lookup_cached_endpoint_pid(endpoint_handle, protocol, local_port);
     if (cached_pid != 0) {
-        NET_DBG("aida_resolve_packet_pid: endpoint cache HIT pid=%u ep=0x%llx", cached_pid, endpoint_handle);
         return cached_pid;
     }
 
     cached_pid = aida_lookup_cached_port_pid(protocol, local_port, remote_port);
     if (cached_pid != 0) {
-        NET_DBG("aida_resolve_packet_pid: port cache HIT pid=%u proto=%u lport=%u rport=%u", cached_pid, protocol, local_port, remote_port);
         return cached_pid;
     }
 
     if (!aida_can_query_system_handles()) {
-        NET_DBG("aida_resolve_packet_pid: cannot query handles (IRQL too high), returning 0");
         return 0;
     }
 
@@ -2627,11 +2749,9 @@ static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
     __try {
         for (ULONG i = 0; i < handles->NumberOfHandles; i++) {
             const AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO* entry = &handles->Handles[i];
-            if (!entry->Object || !aida_is_afd_device_object(entry->Object))
-                continue;
 
             SOCKET_HANDLE_ENTRY socket_info = {};
-            if (!aida_extract_socket_info(entry->Object, &socket_info))
+            if (!aida_safe_get_afd_socket_info(entry->UniqueProcessId, entry->HandleValue, &socket_info))
                 continue;
 
             BOOLEAN endpoint_match = (endpoint_handle != 0 && socket_info.afd_endpoint_addr == endpoint_handle);
@@ -2754,7 +2874,6 @@ namespace net_enum {
         NET_DBG("resolve_nsi: enter");
         LONG prev = _InterlockedCompareExchange(&g_nsi_resolved, 1, 0);
         if (prev == 2) {
-            NET_DBG("resolve_nsi: already resolved, NsiEnumerate=%p", _NsiEnumerate);
             return _NsiEnumerate != nullptr;
         }
         if (prev == 1) {
@@ -2781,15 +2900,12 @@ namespace net_enum {
     }
 
     NTSTATUS enumerate_connections(p_net_enum_conn request) {
-        NET_DBG("enumerate_connections: enter filter_pid=%u filter_proto=%u",
-                request ? request->filter_pid : 0, request ? request->filter_protocol : 0);
         if (!request) return STATUS_INVALID_PARAMETER;
 
         request->connection_count = 0;
 
         PAIDA_SYSTEM_HANDLE_INFORMATION handles = nullptr;
         NTSTATUS status = aida_query_system_handles(&handles);
-        NET_DBG("enumerate_connections: aida_query_system_handles status=0x%08x handles=%p", status, handles);
         if (!NT_SUCCESS(status) || !handles) {
             NET_ERR("enumerate_connections: system handle query FAILED 0x%08x", status);
             return status;
@@ -2801,11 +2917,10 @@ namespace net_enum {
                 UINT32 pid = (UINT32)entry->UniqueProcessId;
                 if (request->filter_pid != 0 && pid != request->filter_pid)
                     continue;
-                if (!entry->Object || !aida_is_afd_device_object(entry->Object))
-                    continue;
 
                 SOCKET_HANDLE_ENTRY socket_info = {};
-                aida_extract_socket_info(entry->Object, &socket_info);
+                if (!aida_safe_get_afd_socket_info(entry->UniqueProcessId, entry->HandleValue, &socket_info))
+                    continue;
                 if (request->filter_protocol != 0 && socket_info.protocol != 0 &&
                     socket_info.protocol != request->filter_protocol) {
                     continue;
@@ -2903,7 +3018,18 @@ namespace net_enum {
 
         ExFreePoolWithTag(handles, 'hANW');
 
-        NET_DBG("enumerate_connections: exit found=%u connections", request->connection_count);
+        NET_DBG("enumerate_connections: found=%u connections (filter_pid=%u filter_proto=%u)",
+                request->connection_count, request->filter_pid, request->filter_protocol);
+        for (UINT32 dbg_i = 0; dbg_i < request->connection_count && dbg_i < 5; dbg_i++) {
+            const NET_CONN_ENTRY* e = &request->entries[dbg_i];
+            NET_DBG("  conn[%u]: pid=%u proto=%u state=%u af=%u lport=%u rport=%u",
+                    dbg_i, e->pid, e->protocol, e->state, e->address_family,
+                    e->local_port, e->remote_port);
+            NET_DBG("  conn[%u]: local=%u.%u.%u.%u remote=%u.%u.%u.%u",
+                    dbg_i,
+                    e->local_addr[0], e->local_addr[1], e->local_addr[2], e->local_addr[3],
+                    e->remote_addr[0], e->remote_addr[1], e->remote_addr[2], e->remote_addr[3]);
+        }
         return STATUS_SUCCESS;
     }
 
@@ -2911,15 +3037,14 @@ namespace net_enum {
 
 
 NTSTATUS functions::handle_net_enum_conn(p_net_enum_conn request) {
-    NET_DBG("handle_net_enum_conn: enter");
     if (!request) { NET_ERR("handle_net_enum_conn: NULL request"); return STATUS_INVALID_PARAMETER; }
+    NET_DBG("handle_net_enum_conn: filter_pid=%u filter_proto=%u", request->filter_pid, request->filter_protocol);
     NTSTATUS st = net_enum::enumerate_connections(request);
-    NET_DBG("handle_net_enum_conn: exit status=0x%08x", st);
+    NET_DBG("handle_net_enum_conn: returned 0x%08x count=%u", st, request->connection_count);
     return st;
 }
 
 NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
-    NET_DBG("handle_net_cap_ctrl: enter op=%u filter_pid=%u", request ? request->operation : 0, request ? request->filter_pid : 0);
     if (!request) { NET_ERR("handle_net_cap_ctrl: NULL request"); return STATUS_INVALID_PARAMETER; }
 
     if (net_capture::g_wfp_initialized != 2) {
@@ -2977,13 +3102,10 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
     request->packets_captured = (UINT32)net_capture::g_total_captured;
     request->packets_dropped = (UINT32)net_capture::g_total_dropped;
 
-    NET_DBG("handle_net_cap_ctrl: exit active=%u captured=%u dropped=%u",
-            request->capture_active, request->packets_captured, request->packets_dropped);
     return STATUS_SUCCESS;
 }
 
 NTSTATUS functions::handle_net_cap_get(p_net_cap_get request) {
-    NET_DBG("handle_net_cap_get: enter max_packets=%u", request ? request->max_packets : 0);
     if (!request) { NET_ERR("handle_net_cap_get: NULL request"); return STATUS_INVALID_PARAMETER; }
     if (!net_capture::g_ring_buffer) {
         NET_ERR("handle_net_cap_get: ring buffer not allocated");
@@ -3014,12 +3136,10 @@ NTSTATUS functions::handle_net_cap_get(p_net_cap_get request) {
 
     KeReleaseSpinLock(&net_capture::g_ring_lock, old_irql);
 
-    NET_DBG("handle_net_cap_get: exit returned=%u packets", to_read);
     return STATUS_SUCCESS;
 }
 
 NTSTATUS functions::handle_net_dns_get(p_net_dns_get request) {
-    NET_DBG("handle_net_dns_get: enter filter_pid=%u", request ? request->filter_pid : 0);
     if (!request) { NET_ERR("handle_net_dns_get: NULL request"); return STATUS_INVALID_PARAMETER; }
     if (!net_capture::g_dns_ring) {
         NET_ERR("handle_net_dns_get: DNS ring not allocated");
@@ -3052,12 +3172,10 @@ NTSTATUS functions::handle_net_dns_get(p_net_dns_get request) {
 
     KeReleaseSpinLock(&net_capture::g_dns_lock, old_irql);
 
-    NET_DBG("handle_net_dns_get: exit returned=%u entries", out_idx);
     return STATUS_SUCCESS;
 }
 
 NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
-    NET_DBG("handle_net_filter_rule: enter op=%u", request ? request->operation : 0);
     if (!request) { NET_ERR("handle_net_filter_rule: NULL request"); return STATUS_INVALID_PARAMETER; }
 
     switch (request->operation) {
@@ -3079,6 +3197,9 @@ NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
 
                     request->rule_id = id;
                     request->rule_count = (UINT32)net_capture::g_active_rule_count;
+                    NET_DBG("filter_rule: ADDED id=%u action=%u dir=%u proto=%u pid=%u port=%u (total=%u)",
+                            id, request->action, request->direction, request->protocol, request->pid, request->port,
+                            request->rule_count);
                     return STATUS_SUCCESS;
                 }
             }
@@ -3091,6 +3212,7 @@ NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
                     _InterlockedExchange(&net_capture::g_filter_rules[i].active, 0);
                     _InterlockedDecrement(&net_capture::g_active_rule_count);
                     request->rule_count = (UINT32)net_capture::g_active_rule_count;
+                    NET_DBG("filter_rule: REMOVED id=%u (remaining=%u)", request->rule_id, request->rule_count);
                     return STATUS_SUCCESS;
                 }
             }
@@ -3102,6 +3224,7 @@ NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
             }
             _InterlockedExchange(&net_capture::g_active_rule_count, 0);
             request->rule_count = 0;
+            NET_DBG("filter_rule: CLEARED all rules");
             return STATUS_SUCCESS;
         }
         case 3: {
@@ -3114,7 +3237,6 @@ NTSTATUS functions::handle_net_filter_rule(p_net_filter_rule request) {
 }
 
 NTSTATUS functions::handle_net_stats(p_net_stats request) {
-    NET_DBG("handle_net_stats: enter");
     if (!request) { NET_ERR("handle_net_stats: NULL request"); return STATUS_INVALID_PARAMETER; }
 
     request->bytes_sent = (UINT64)net_capture::g_global_bytes_sent;
@@ -3128,9 +3250,11 @@ NTSTATUS functions::handle_net_stats(p_net_stats request) {
     request->total_dns_logged = (UINT32)net_capture::g_total_dns;
     request->active_filter_rules = (UINT32)net_capture::g_active_rule_count;
 
-    NET_DBG("handle_net_stats: exit tx_pkts=%llu rx_pkts=%llu captured=%u dropped=%u",
+    NET_DBG("handle_net_stats: sent=%llu recv=%llu pkts_s=%llu pkts_r=%llu cap=%u captured=%u dropped=%u wfp_init=%d",
+            request->bytes_sent, request->bytes_received,
             request->packets_sent, request->packets_received,
-            request->total_captured, request->total_dropped);
+            request->capture_active, request->total_captured, request->total_dropped,
+            (int)net_capture::g_wfp_initialized);
     return STATUS_SUCCESS;
 }
 
@@ -3383,16 +3507,8 @@ namespace net_socket_enum {
     typedef AIDA_SYSTEM_HANDLE_INFORMATION SYSTEM_HANDLE_INFORMATION_LOCAL;
     typedef PAIDA_SYSTEM_HANDLE_INFORMATION PSYSTEM_HANDLE_INFORMATION_LOCAL;
 
-    static BOOLEAN is_afd_device_object(PVOID object) {
-        return aida_is_afd_device_object(object);
-    }
-
     static NTSTATUS query_system_handles(PSYSTEM_HANDLE_INFORMATION_LOCAL* out_info) {
         return aida_query_system_handles(out_info);
-    }
-
-    static BOOLEAN extract_socket_info(PVOID file_object, SOCKET_HANDLE_ENTRY* out) {
-        return aida_extract_socket_info(file_object, out);
     }
 
     static NTSTATUS enumerate_socket_handles(p_socket_handle_enum request) {
@@ -3413,9 +3529,7 @@ namespace net_socket_enum {
         __try {
             for (ULONG i = 0; i < handles->NumberOfHandles && filled < MAX_SOCKET_HANDLES; i++) {
                 const SYSTEM_HANDLE_TABLE_ENTRY_INFO_LOCAL* entry = &handles->Handles[i];
-                if ((UINT32)entry->UniqueProcessId != target_pid || !entry->Object)
-                    continue;
-                if (!is_afd_device_object(entry->Object))
+                if ((UINT32)entry->UniqueProcessId != target_pid)
                     continue;
 
                 SOCKET_HANDLE_ENTRY* out = &request->entries[filled];
@@ -3423,9 +3537,8 @@ namespace net_socket_enum {
                 out->handle_value = (UINT64)entry->HandleValue;
                 out->pid = target_pid;
 
-                if (!extract_socket_info(entry->Object, out)) {
-                    out->afd_endpoint_addr = (UINT64)((PFILE_OBJECT)entry->Object)->FsContext;
-                }
+                if (!aida_safe_get_afd_socket_info(entry->UniqueProcessId, entry->HandleValue, out))
+                    continue;
 
                 aida_cache_pid_from_socket_info(out, target_pid);
 
@@ -3461,6 +3574,11 @@ namespace net_sniff {
 
     static NTSTATUS handle_sniff(p_sniff_net_buffers request) {
         if (!request) return STATUS_INVALID_PARAMETER;
+
+        NET_DBG("handle_sniff: op=%u target_addr=0x%llx buf_reg=%u size_reg=%u max_cap=%u tid=%u bp=%u",
+                request->operation, request->target_address,
+                request->buffer_reg_index, request->size_reg_index,
+                request->max_captures, request->target_tid, request->bp_index);
 
         if (!g_sniff_lock_initialized) {
             KeInitializeSpinLock(&g_sniff_lock);
@@ -3504,6 +3622,8 @@ namespace net_sniff {
 
             request->active = 1;
             request->capture_count = 0;
+            NET_DBG("handle_sniff[start]: SUCCESS max_cap=%u bp=%u tid=%u buf_reg=%u size_reg=%u",
+                    max_cap, g_sniff_bp_index, g_sniff_tid, g_sniff_buf_reg, g_sniff_size_reg);
             return STATUS_SUCCESS;
         }
         case 1:
@@ -3664,11 +3784,10 @@ namespace net_tcpip {
                 UINT32 pid = (UINT32)entry->UniqueProcessId;
                 if (request->target_pid != 0 && pid != request->target_pid)
                     continue;
-                if (!entry->Object || !aida_is_afd_device_object(entry->Object))
-                    continue;
 
                 SOCKET_HANDLE_ENTRY socket_info = {};
-                aida_extract_socket_info(entry->Object, &socket_info);
+                if (!aida_safe_get_afd_socket_info(entry->UniqueProcessId, entry->HandleValue, &socket_info))
+                    continue;
                 if (request->filter_protocol != 0 && socket_info.protocol != 0 &&
                     socket_info.protocol != request->filter_protocol) {
                     continue;
@@ -4081,14 +4200,27 @@ namespace net_inject {
         if (!request) return STATUS_INVALID_PARAMETER;
         request->status = 1;
 
-        if (!resolve_inject_functions())
-            return STATUS_NOT_SUPPORTED;
+        NET_DBG("inject_packet: dir=%u proto=%u af=%u src_port=%u dst_port=%u payload=%u",
+                request->direction, request->protocol, request->address_family,
+                request->src_port, request->dst_port, request->payload_size);
+        NET_DBG("inject_packet: src=%u.%u.%u.%u dst=%u.%u.%u.%u",
+                request->src_addr[0], request->src_addr[1], request->src_addr[2], request->src_addr[3],
+                request->dst_addr[0], request->dst_addr[1], request->dst_addr[2], request->dst_addr[3]);
 
-        if (!ensure_inject_nbl_pool())
+        if (!resolve_inject_functions()) {
+            NET_ERR("inject_packet: resolve_inject_functions FAILED");
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        if (!ensure_inject_nbl_pool()) {
+            NET_ERR("inject_packet: ensure_inject_nbl_pool FAILED");
             return STATUS_INSUFFICIENT_RESOURCES;
+        }
 
         BOOLEAN have_transport = (g_inject_handle_v4 != nullptr && _FwpsInjectSend0 && _FwpsInjectRecv0);
         BOOLEAN have_network = (g_inject_handle_net_v4 != nullptr && (_FwpsInjectNetSend0 || _FwpsInjectNetRecv0));
+        NET_DBG("inject_packet: have_transport=%d have_network=%d handle_v4=%p handle_net_v4=%p",
+                (int)have_transport, (int)have_network, g_inject_handle_v4, g_inject_handle_net_v4);
         if (!have_transport && !have_network)
             return STATUS_NOT_SUPPORTED;
 
@@ -4101,6 +4233,7 @@ namespace net_inject {
         UINT8 packet_buf[INJECT_MAX_PAYLOAD + 32] = {};
         UINT32 packet_size = build_transport_packet(request, packet_buf, sizeof(packet_buf));
         if (packet_size == 0) {
+            NET_ERR("inject_packet: build_transport_packet returned 0");
             return STATUS_INVALID_PARAMETER;
         }
 
@@ -4111,6 +4244,8 @@ namespace net_inject {
         UINT32 recv_interface_index = loopback_v4 ? 1u : 0u;
 
         UINT64 endpoint_handle = lookup_endpoint_handle_by_port(request->protocol, request->src_port);
+        NET_DBG("inject_packet: packet_size=%u loopback=%d endpoint_handle=0x%llx",
+                packet_size, (int)loopback_v4, endpoint_handle);
 
         NTSTATUS st = STATUS_UNSUCCESSFUL;
         BOOLEAN transport_attempted = FALSE;
@@ -4148,6 +4283,7 @@ namespace net_inject {
             }
 
             transport_attempted = TRUE;
+            NET_DBG("inject_packet: trying transport path, dir=%u", request->direction);
 
             if (request->direction == 1) {
                 FWPS_TRANSPORT_SEND_PARAMS0_COMPAT sendArgs = {};
@@ -4177,10 +4313,12 @@ namespace net_inject {
             }
 
             if (NT_SUCCESS(st)) {
+                NET_DBG("inject_packet: transport inject SUCCESS st=0x%08x", st);
                 request->status = 0;
                 return STATUS_SUCCESS;
             }
 
+            NET_ERR("inject_packet: transport inject FAILED 0x%08x", st);
             _FwpsFreeNBL0(nbl);
             IoFreeMdl(mdl);
             ExFreePoolWithTag(completion, 'jcNW');
@@ -4188,6 +4326,7 @@ namespace net_inject {
         }
 
         if (!have_network) {
+            NET_ERR("inject_packet: no network inject path available, returning 0x%08x", st);
             return st;
         }
 
@@ -4230,13 +4369,16 @@ namespace net_inject {
         }
 
         if (request->direction == 1 && _FwpsInjectNetSend0) {
+            NET_DBG("inject_packet: trying network send path ip_size=%u", ip_packet_size);
             st = _FwpsInjectNetSend0(g_inject_handle_net_v4, nullptr, 0, 0,
                 net_nbl, (PVOID)inject_completion, net_completion);
         } else if (_FwpsInjectNetRecv0) {
+            NET_DBG("inject_packet: trying network recv path ip_size=%u if_idx=%u", ip_packet_size, recv_interface_index);
             st = _FwpsInjectNetRecv0(g_inject_handle_net_v4, nullptr, 0, 0,
                 recv_interface_index, 0, net_nbl,
                 (PVOID)inject_completion, net_completion);
         } else if (_FwpsInjectNetSend0) {
+            NET_DBG("inject_packet: fallback network send path");
             st = _FwpsInjectNetSend0(g_inject_handle_net_v4, nullptr, 0, 0,
                 net_nbl, (PVOID)inject_completion, net_completion);
         } else {
@@ -4244,6 +4386,7 @@ namespace net_inject {
         }
 
         if (!NT_SUCCESS(st)) {
+            NET_ERR("inject_packet: network inject FAILED 0x%08x", st);
             _FwpsFreeNBL0(net_nbl);
             IoFreeMdl(net_mdl);
             ExFreePoolWithTag(net_completion, 'jcNW');
@@ -4251,6 +4394,7 @@ namespace net_inject {
             return st;
         }
 
+        NET_DBG("inject_packet: network inject SUCCESS");
         request->status = 0;
         return STATUS_SUCCESS;
     }
@@ -4892,6 +5036,11 @@ namespace net_mod {
     NTSTATUS handle_mod_rule(p_packet_mod_rule request) {
         if (!request) return STATUS_INVALID_PARAMETER;
 
+        NET_DBG("handle_mod_rule: op=%u rule_id=%u dir=%u proto=%u port=%u pid=%u pat_sz=%u rep_sz=%u",
+                request->operation, request->rule_id, request->direction,
+                request->protocol, request->port, request->pid,
+                request->pattern_size, request->replace_size);
+
         switch (request->operation) {
         case 0: {
             for (UINT32 i = 0; i < MOD_MAX_RULES; i++) {
@@ -4914,6 +5063,8 @@ namespace net_mod {
                     _InterlockedIncrement(&g_active_mod_count);
                     request->rule_id = id;
                     request->active = 1;
+                    NET_DBG("handle_mod_rule: ADDED rule slot=%u id=%u dir=%u proto=%u port=%u",
+                            i, id, request->direction, request->protocol, request->port);
                     return STATUS_SUCCESS;
                 }
             }
@@ -5018,6 +5169,11 @@ namespace net_redirect {
     NTSTATUS handle_redirect_rule(p_traffic_redirect_rule request) {
         if (!request) return STATUS_INVALID_PARAMETER;
 
+        NET_DBG("handle_redirect_rule: op=%u rule_id=%u proto=%u match_port=%u redir_port=%u af=%u excl_pid=%u",
+                request->operation, request->rule_id, request->protocol,
+                request->match_port, request->redirect_port,
+                request->address_family, request->exclude_pid);
+
         switch (request->operation) {
         case 0: {
             for (UINT32 i = 0; i < REDIR_MAX_RULES; i++) {
@@ -5037,6 +5193,8 @@ namespace net_redirect {
                     _InterlockedIncrement(&g_active_redir_count);
                     request->rule_id = id;
                     request->active = 1;
+                    NET_DBG("handle_redirect_rule: ADDED rule slot=%u id=%u proto=%u match_port=%u redir_port=%u",
+                            i, id, request->protocol, request->match_port, request->redirect_port);
                     return STATUS_SUCCESS;
                 }
             }
@@ -5199,6 +5357,9 @@ namespace net_stream {
     NTSTATUS handle_stream(p_stream_reassemble_request request) {
         if (!request) return STATUS_INVALID_PARAMETER;
 
+        NET_DBG("handle_stream: op=%u src_port=%u dst_port=%u pid=%u",
+                request->operation, request->src_port, request->dst_port, request->pid);
+
         switch (request->operation) {
         case 0: {
             for (UINT32 i = 0; i < MAX_TRACKED_STREAMS; i++) {
@@ -5221,6 +5382,8 @@ namespace net_stream {
                     KeMemoryBarrier();
                     _InterlockedExchange(&g_streams[i].active, 1);
                     _InterlockedIncrement(&g_active_stream_count);
+                    NET_DBG("handle_stream[start]: slot=%u src_port=%u dst_port=%u pid=%u",
+                            i, request->src_port, request->dst_port, request->pid);
                     return STATUS_SUCCESS;
                 }
             }
@@ -5986,13 +6149,9 @@ namespace net_kill {
         __try {
             for (ULONG i = 0; i < handles->NumberOfHandles; i++) {
                 const AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO* entry = &handles->Handles[i];
-                if (!entry->Object)
-                    continue;
-                if (!aida_is_afd_device_object(entry->Object))
-                    continue;
 
                 SOCKET_HANDLE_ENTRY socket_info = {};
-                if (!aida_extract_socket_info(entry->Object, &socket_info))
+                if (!aida_safe_get_afd_socket_info(entry->UniqueProcessId, entry->HandleValue, &socket_info))
                     continue;
                 if (!socket_matches_kill_request(&socket_info, request)) {
                     continue;
@@ -6030,13 +6189,11 @@ namespace net_kill {
         __try {
             for (ULONG i = 0; i < handles->NumberOfHandles; i++) {
                 const AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO* entry = &handles->Handles[i];
-                if ((UINT32)entry->UniqueProcessId != owner_pid || !entry->Object)
-                    continue;
-                if (!aida_is_afd_device_object(entry->Object))
+                if ((UINT32)entry->UniqueProcessId != owner_pid)
                     continue;
 
                 SOCKET_HANDLE_ENTRY socket_info = {};
-                if (!aida_extract_socket_info(entry->Object, &socket_info))
+                if (!aida_safe_get_afd_socket_info(entry->UniqueProcessId, entry->HandleValue, &socket_info))
                     continue;
                 if (!socket_matches_kill_request(&socket_info, request)) {
                     continue;
@@ -6070,13 +6227,9 @@ namespace net_kill {
         __try {
             for (ULONG i = 0; i < handles->NumberOfHandles; i++) {
                 const AIDA_SYSTEM_HANDLE_TABLE_ENTRY_INFO* entry = &handles->Handles[i];
-                if (!entry->Object)
-                    continue;
-                if (!aida_is_afd_device_object(entry->Object))
-                    continue;
 
                 SOCKET_HANDLE_ENTRY socket_info = {};
-                if (!aida_extract_socket_info(entry->Object, &socket_info))
+                if (!aida_safe_get_afd_socket_info(entry->UniqueProcessId, entry->HandleValue, &socket_info))
                     continue;
                 if (!socket_matches_kill_request(&socket_info, request))
                     continue;
@@ -6389,6 +6542,9 @@ namespace net_bw {
     NTSTATUS handle_bw(p_bw_monitor_request request) {
         if (!request) return STATUS_INVALID_PARAMETER;
 
+        NET_DBG("handle_bw: op=%u filter_pid=%u bw_active=%d",
+                request->operation, request->filter_pid, (int)g_bw_active);
+
         switch (request->operation) {
         case 0:
             _InterlockedExchange(&g_bw_active, 1);
@@ -6404,6 +6560,10 @@ namespace net_bw {
             request->total_packets_sent = g_bw_total_pkts_sent;
             request->total_packets_recv = g_bw_total_pkts_recv;
             request->monitoring_active = g_bw_active;
+
+            NET_DBG("handle_bw[get]: total_sent=%lld total_recv=%lld pkts_s=%lld pkts_r=%lld active=%d",
+                    (LONG64)g_bw_total_sent, (LONG64)g_bw_total_recv,
+                    (LONG64)g_bw_total_pkts_sent, (LONG64)g_bw_total_pkts_recv, (int)g_bw_active);
 
 
             LARGE_INTEGER now;
@@ -6464,14 +6624,89 @@ namespace net_if_enum {
 
     typedef NTSTATUS(NTAPI* fn_GetIfTable2)(PVOID* Table);
     typedef void(NTAPI* fn_FreeMibTable)(PVOID Table);
-    typedef NTSTATUS(NTAPI* fn_GetAdaptersAddresses)(
-        ULONG Family, ULONG Flags, PVOID Reserved,
-        PVOID AdapterAddresses, PULONG SizePointer);
+
+    /*
+     * Local definition of MIB_IF_ROW2 / MIB_IF_TABLE2 matching the documented
+     * Windows SDK/WDK layout (verified against WDK 10.0.26100.0, offsetof test).
+     *
+     * Defined locally rather than relying on <netioapi.h> because the driver
+     * dynamically resolves GetIfTable2/FreeMibTable from netio.sys at runtime.
+     * Including <netioapi.h> in the kernel build context risks header conflicts.
+     * Local types give identical binary layout with zero header dependencies.
+     *
+     * MIB_IF_ROW2 is a documented, ABI-stable public API structure.  Its layout
+     * does NOT change between Windows 10 and Windows 11 — the WDK compiler
+     * generates the same offsets for all x64 targets.  This eliminates the need
+     * for per-build-number offset tables entirely.
+     *
+     * sizeof verified: 1352 bytes (0x548).
+     */
+    typedef struct _AIDA_MIB_IF_ROW2 {
+        UINT64 InterfaceLuid;                           /* +0x000 NET_LUID            */
+        UINT32 InterfaceIndex;                          /* +0x008 NET_IFINDEX          */
+        GUID   InterfaceGuid;                           /* +0x00C                      */
+        WCHAR  Alias[257];                              /* +0x01C IF_MAX_STRING_SIZE+1 */
+        WCHAR  Description[257];                        /* +0x21E IF_MAX_STRING_SIZE+1 */
+        UINT32 PhysicalAddressLength;                   /* +0x420                      */
+        UINT8  PhysicalAddress[32];                     /* +0x424 IF_MAX_PHYS_ADDRESS_LENGTH */
+        UINT8  PermanentPhysicalAddress[32];            /* +0x444                      */
+        UINT32 Mtu;                                     /* +0x464                      */
+        UINT32 Type;                                    /* +0x468 IFTYPE               */
+        UINT32 TunnelType;                              /* +0x46C TUNNEL_TYPE          */
+        UINT32 MediaType;                               /* +0x470 NDIS_MEDIUM          */
+        UINT32 PhysicalMediumType;                      /* +0x474 NDIS_PHYSICAL_MEDIUM */
+        UINT32 AccessType;                              /* +0x478 NET_IF_ACCESS_TYPE   */
+        UINT32 DirectionType;                           /* +0x47C NET_IF_DIRECTION_TYPE*/
+        struct {
+            BOOLEAN HardwareInterface  : 1;
+            BOOLEAN FilterInterface    : 1;
+            BOOLEAN ConnectorPresent   : 1;
+            BOOLEAN NotAuthenticated   : 1;
+            BOOLEAN NotMediaConnected  : 1;
+            BOOLEAN Paused             : 1;
+            BOOLEAN LowPower           : 1;
+            BOOLEAN EndPointInterface  : 1;
+        } InterfaceAndOperStatusFlags;                  /* +0x480 (1 byte + 3 pad)     */
+        UINT32 OperStatus;                              /* +0x484 IF_OPER_STATUS       */
+        UINT32 AdminStatus;                             /* +0x488 NET_IF_ADMIN_STATUS  */
+        UINT32 MediaConnectState;                       /* +0x48C                      */
+        GUID   NetworkGuid;                             /* +0x490                      */
+        UINT32 ConnectionType;                          /* +0x4A0 (+ 4 pad for align)  */
+        UINT64 TransmitLinkSpeed;                       /* +0x4A8                      */
+        UINT64 ReceiveLinkSpeed;                        /* +0x4B0                      */
+        UINT64 InOctets;                                /* +0x4B8                      */
+        UINT64 InUcastPkts;
+        UINT64 InNUcastPkts;
+        UINT64 InDiscards;
+        UINT64 InErrors;
+        UINT64 InUnknownProtos;
+        UINT64 InUcastOctets;
+        UINT64 InMulticastOctets;
+        UINT64 InBroadcastOctets;
+        UINT64 OutOctets;                               /* +0x500                      */
+        UINT64 OutUcastPkts;
+        UINT64 OutNUcastPkts;
+        UINT64 OutDiscards;
+        UINT64 OutErrors;
+        UINT64 OutUcastOctets;
+        UINT64 OutMulticastOctets;
+        UINT64 OutBroadcastOctets;
+        UINT64 OutQLen;                                 /* +0x540                      */
+    } AIDA_MIB_IF_ROW2;
+
+    typedef struct _AIDA_MIB_IF_TABLE2 {
+        UINT32 NumEntries;
+        AIDA_MIB_IF_ROW2 Table[1];
+    } AIDA_MIB_IF_TABLE2;
+
+    static_assert(sizeof(AIDA_MIB_IF_ROW2) == 1352,
+        "AIDA_MIB_IF_ROW2 layout mismatch — must be 1352 bytes to match MIB_IF_ROW2");
 
     NTSTATUS enumerate_interfaces(p_net_interface_enum request) {
         if (!request) return STATUS_INVALID_PARAMETER;
         request->interface_count = 0;
 
+        NET_DBG("enumerate_interfaces: enter");
 
         PVOID netio = net_capture::find_module_base("netio.sys");
         if (!netio) netio = net_capture::find_module_base("NETIO.SYS");
@@ -6487,56 +6722,58 @@ namespace net_if_enum {
 
         PVOID table = nullptr;
         NTSTATUS st = _GetIfTable2(&table);
-        if (!NT_SUCCESS(st) || !table) return st;
+        if (!NT_SUCCESS(st) || !table) {
+            NET_ERR("enumerate_interfaces: GetIfTable2 failed 0x%08x table=%p", st, table);
+            return st;
+        }
 
         __try {
+            const AIDA_MIB_IF_TABLE2* if_table = static_cast<const AIDA_MIB_IF_TABLE2*>(table);
+            NET_DBG("enumerate_interfaces: NumEntries=%u", if_table->NumEntries);
 
-
-            ULONG num = *(ULONG*)table;
-            UINT8* rows = (UINT8*)table + 8;
-
-
-            #define MIB_IF_ROW2_SIZE 1352
-
-            for (ULONG i = 0; i < num && request->interface_count < NET_IF_MAX; i++) {
-                UINT8* row = rows + (SIZE_T)i * MIB_IF_ROW2_SIZE;
-                if (!_MmIsAddressValid(row)) break;
+            for (ULONG i = 0; i < if_table->NumEntries && request->interface_count < NET_IF_MAX; i++) {
+                const AIDA_MIB_IF_ROW2* row = &if_table->Table[i];
+                if (!_MmIsAddressValid(const_cast<AIDA_MIB_IF_ROW2*>(row))) break;
 
                 NET_INTERFACE_ENTRY* e = &request->interfaces[request->interface_count];
                 strong::kmemset(e, 0, sizeof(NET_INTERFACE_ENTRY));
 
-                e->if_index = *(UINT32*)(row + 0x08);
-                e->mtu = *(UINT32*)(row + 0x46C);
-                e->if_type = *(UINT32*)(row + 0x470);
-                e->speed = *(UINT64*)(row + 0x488);
-                e->oper_status = *(UINT32*)(row + 0x498);
+                e->if_index = row->InterfaceIndex;
+                e->mtu = row->Mtu;
+                e->if_type = row->Type;
+                e->speed = row->TransmitLinkSpeed;
+                e->oper_status = row->OperStatus;
 
-
-                UINT32 phys_len = *(UINT32*)(row + 0x428);
-                if (phys_len >= 6) {
-                    strong::kmemcpy(e->mac_addr, row + 0x42C, 6);
+                if (row->PhysicalAddressLength >= 6) {
+                    strong::kmemcpy(e->mac_addr, row->PhysicalAddress, 6);
                 }
 
-
-                wchar_t* alias = (wchar_t*)(row + 0x01C);
-                for (UINT32 j = 0; j < NET_IF_NAME_LEN - 1 && alias[j]; j++) {
-                    e->name[j] = (char)(alias[j] & 0x7F);
+                for (UINT32 j = 0; j < NET_IF_NAME_LEN - 1 && row->Alias[j]; j++) {
+                    e->name[j] = static_cast<char>(row->Alias[j] & 0x7F);
                 }
 
-
-                wchar_t* desc = (wchar_t*)(row + 0x222);
-                for (UINT32 j = 0; j < NET_IF_NAME_LEN - 1 && desc[j]; j++) {
-                    e->description[j] = (char)(desc[j] & 0x7F);
+                for (UINT32 j = 0; j < NET_IF_NAME_LEN - 1 && row->Description[j]; j++) {
+                    e->description[j] = static_cast<char>(row->Description[j] & 0x7F);
                 }
 
-
-                e->in_octets = *(UINT64*)(row + 0x508);
-                e->out_octets = *(UINT64*)(row + 0x510);
+                e->in_octets = row->InOctets;
+                e->out_octets = row->OutOctets;
 
                 request->interface_count++;
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
+            NET_ERR("enumerate_interfaces: exception during enumeration");
+        }
 
+        NET_DBG("enumerate_interfaces: returned %u interfaces", request->interface_count);
+        for (UINT32 dbg_i = 0; dbg_i < request->interface_count && dbg_i < 3; dbg_i++) {
+            const NET_INTERFACE_ENTRY* e = &request->interfaces[dbg_i];
+            NET_DBG("  iface[%u]: idx=%u type=%u mtu=%u oper=%u speed=%llu mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                    dbg_i, e->if_index, e->if_type, e->mtu, e->oper_status, e->speed,
+                    e->mac_addr[0], e->mac_addr[1], e->mac_addr[2],
+                    e->mac_addr[3], e->mac_addr[4], e->mac_addr[5]);
+            NET_DBG("  iface[%u]: name='%.32s' desc='%.32s'",
+                    dbg_i, e->name, e->description);
         }
 
         _FreeMibTable(table);
@@ -6828,163 +7065,139 @@ namespace net_fingerprint {
 
 
 NTSTATUS functions::handle_wfp_callout_enum(p_wfp_callout_enum request) {
-    NET_DBG("handle_wfp_callout_enum: enter");
     if (!request) { NET_ERR("handle_wfp_callout_enum: NULL request"); return STATUS_INVALID_PARAMETER; }
-    NTSTATUS st = net_wfp_enum::enumerate_wfp_callouts(request);
-    NET_DBG("handle_wfp_callout_enum: exit status=0x%08x", st);
-    return st;
+    return net_wfp_enum::enumerate_wfp_callouts(request);
 }
 
 NTSTATUS functions::handle_socket_handle_enum(p_socket_handle_enum request) {
-    NET_DBG("handle_socket_handle_enum: enter");
     if (!request) { NET_ERR("handle_socket_handle_enum: NULL request"); return STATUS_INVALID_PARAMETER; }
-    NTSTATUS st = net_socket_enum::enumerate_socket_handles(request);
-    NET_DBG("handle_socket_handle_enum: exit status=0x%08x", st);
-    return st;
+    return net_socket_enum::enumerate_socket_handles(request);
 }
 
 NTSTATUS functions::handle_sniff_net_buffers(p_sniff_net_buffers request) {
-    NET_DBG("handle_sniff_net_buffers: enter");
     if (!request) { NET_ERR("handle_sniff_net_buffers: NULL request"); return STATUS_INVALID_PARAMETER; }
+    NET_DBG("handle_sniff_net_buffers: op=%u", request->operation);
     NTSTATUS st = net_sniff::handle_sniff(request);
-    NET_DBG("handle_sniff_net_buffers: exit status=0x%08x", st);
+    NET_DBG("handle_sniff_net_buffers: returned 0x%08x active=%u capture_count=%u",
+            st, request->active, request->capture_count);
     return st;
 }
 
 NTSTATUS functions::handle_tcpip_conn_dump(p_tcpip_conn_dump request) {
-    NET_DBG("handle_tcpip_conn_dump: enter");
     if (!request) { NET_ERR("handle_tcpip_conn_dump: NULL request"); return STATUS_INVALID_PARAMETER; }
-    NTSTATUS st = net_tcpip::dump_connections(request);
-    NET_DBG("handle_tcpip_conn_dump: exit status=0x%08x", st);
-    return st;
+    return net_tcpip::dump_connections(request);
 }
 
 
 NTSTATUS functions::handle_packet_inject(p_packet_inject_request request) {
-    NET_DBG("handle_packet_inject: enter");
     if (!request) { NET_ERR("handle_packet_inject: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_inject::inject_packet(request);
-    NET_DBG("handle_packet_inject: exit status=0x%08x", st);
+    if (!NT_SUCCESS(st)) {
+        NET_ERR("handle_packet_inject: FAILED dir=%u proto=%u af=%u payload=%u status=0x%08x",
+                request->direction, request->protocol, request->address_family, request->payload_size, st);
+    }
     return st;
 }
 
 NTSTATUS functions::handle_packet_mod_rule(p_packet_mod_rule request) {
-    NET_DBG("handle_packet_mod_rule: enter");
     if (!request) { NET_ERR("handle_packet_mod_rule: NULL request"); return STATUS_INVALID_PARAMETER; }
+    NET_DBG("handle_packet_mod_rule: op=%u rule_id=%u", request->operation, request->rule_id);
     NTSTATUS st = net_mod::handle_mod_rule(request);
-    NET_DBG("handle_packet_mod_rule: exit status=0x%08x", st);
+    NET_DBG("handle_packet_mod_rule: returned 0x%08x rule_id=%u active=%u",
+            st, request->rule_id, request->active);
     return st;
 }
 
 NTSTATUS functions::handle_packet_mod_rule_list(p_packet_mod_rule_list request) {
-    NET_DBG("handle_packet_mod_rule_list: enter");
     if (!request) { NET_ERR("handle_packet_mod_rule_list: NULL request"); return STATUS_INVALID_PARAMETER; }
-    NTSTATUS st = net_mod::handle_mod_rule_list(request);
-    NET_DBG("handle_packet_mod_rule_list: exit status=0x%08x", st);
-    return st;
+    return net_mod::handle_mod_rule_list(request);
 }
 
 NTSTATUS functions::handle_traffic_redirect(p_traffic_redirect_rule request) {
-    NET_DBG("handle_traffic_redirect: enter");
     if (!request) { NET_ERR("handle_traffic_redirect: NULL request"); return STATUS_INVALID_PARAMETER; }
+    NET_DBG("handle_traffic_redirect: op=%u rule_id=%u", request->operation, request->rule_id);
     NTSTATUS st = net_redirect::handle_redirect_rule(request);
-    NET_DBG("handle_traffic_redirect: exit status=0x%08x", st);
+    NET_DBG("handle_traffic_redirect: returned 0x%08x rule_id=%u active=%u",
+            st, request->rule_id, request->active);
     return st;
 }
 
 NTSTATUS functions::handle_traffic_redirect_list(p_traffic_redirect_list request) {
-    NET_DBG("handle_traffic_redirect_list: enter");
     if (!request) { NET_ERR("handle_traffic_redirect_list: NULL request"); return STATUS_INVALID_PARAMETER; }
-    NTSTATUS st = net_redirect::handle_redirect_list(request);
-    NET_DBG("handle_traffic_redirect_list: exit status=0x%08x", st);
-    return st;
+    return net_redirect::handle_redirect_list(request);
 }
 
 NTSTATUS functions::handle_stream_reassemble(p_stream_reassemble_request request) {
-    NET_DBG("handle_stream_reassemble: enter op=%u pid=%u", request ? request->operation : 0, request ? request->pid : 0);
     if (!request) { NET_ERR("handle_stream_reassemble: NULL request"); return STATUS_INVALID_PARAMETER; }
+    NET_DBG("handle_stream_reassemble: op=%u src_port=%u dst_port=%u pid=%u",
+            request->operation, request->src_port, request->dst_port, request->pid);
     if (request->operation == 0 && request->pid != 0) {
         aida_refresh_pid_cache_for_process(request->pid, IPPROTO_TCP);
     }
     NTSTATUS st = net_stream::handle_stream(request);
-    NET_DBG("handle_stream_reassemble: exit status=0x%08x", st);
+    NET_DBG("handle_stream_reassemble: returned 0x%08x stream_size=%u total_pkts=%u",
+            st, request->stream_size, request->total_packets);
     return st;
 }
 
 NTSTATUS functions::handle_deep_inspect(p_dpi_request request) {
-    NET_DBG("handle_deep_inspect: enter filter_pid=%u filter_proto=%u", request ? request->filter_pid : 0, request ? request->filter_protocol : 0);
     if (!request) { NET_ERR("handle_deep_inspect: NULL request"); return STATUS_INVALID_PARAMETER; }
     if (request->filter_pid != 0) {
         aida_refresh_pid_cache_for_process(request->filter_pid, request->filter_protocol);
     }
-    NTSTATUS st = net_dpi::get_results(request);
-    NET_DBG("handle_deep_inspect: exit status=0x%08x", st);
-    return st;
+    return net_dpi::get_results(request);
 }
 
 NTSTATUS functions::handle_intercept_hold(p_intercept_request request) {
-    NET_DBG("handle_intercept_hold: enter op=%u filter_pid=%u", request ? request->operation : 0, request ? request->filter_pid : 0);
     if (!request) { NET_ERR("handle_intercept_hold: NULL request"); return STATUS_INVALID_PARAMETER; }
     if (request->operation == 0 && request->filter_pid != 0) {
         aida_refresh_pid_cache_for_process(request->filter_pid, request->filter_protocol);
     }
-    NTSTATUS st = net_intercept::handle_intercept(request);
-    NET_DBG("handle_intercept_hold: exit status=0x%08x", st);
-    return st;
+    return net_intercept::handle_intercept(request);
 }
 
 NTSTATUS functions::handle_conn_kill(p_conn_kill_request request) {
-    NET_DBG("handle_conn_kill: enter");
     if (!request) { NET_ERR("handle_conn_kill: NULL request"); return STATUS_INVALID_PARAMETER; }
     NTSTATUS st = net_kill::kill_connection(request);
-    NET_DBG("handle_conn_kill: exit status=0x%08x", st);
+    if (!NT_SUCCESS(st)) {
+        NET_ERR("handle_conn_kill: FAILED status=0x%08x", st);
+    }
     return st;
 }
 
 NTSTATUS functions::handle_dns_spoof(p_dns_spoof_rule request) {
-    NET_DBG("handle_dns_spoof: enter");
     if (!request) { NET_ERR("handle_dns_spoof: NULL request"); return STATUS_INVALID_PARAMETER; }
-    NTSTATUS st = net_dns_spoof::handle_spoof_rule(request);
-    NET_DBG("handle_dns_spoof: exit status=0x%08x", st);
-    return st;
+    return net_dns_spoof::handle_spoof_rule(request);
 }
 
 NTSTATUS functions::handle_dns_spoof_list(p_dns_spoof_list request) {
-    NET_DBG("handle_dns_spoof_list: enter");
     if (!request) { NET_ERR("handle_dns_spoof_list: NULL request"); return STATUS_INVALID_PARAMETER; }
-    NTSTATUS st = net_dns_spoof::handle_spoof_list(request);
-    NET_DBG("handle_dns_spoof_list: exit status=0x%08x", st);
-    return st;
+    return net_dns_spoof::handle_spoof_list(request);
 }
 
 NTSTATUS functions::handle_bw_monitor(p_bw_monitor_request request) {
-    NET_DBG("handle_bw_monitor: enter");
     if (!request) { NET_ERR("handle_bw_monitor: NULL request"); return STATUS_INVALID_PARAMETER; }
+    NET_DBG("handle_bw_monitor: op=%u filter_pid=%u", request->operation, request->filter_pid);
     NTSTATUS st = net_bw::handle_bw(request);
-    NET_DBG("handle_bw_monitor: exit status=0x%08x", st);
+    NET_DBG("handle_bw_monitor: returned 0x%08x active=%u total_sent=%llu total_recv=%llu",
+            st, request->monitoring_active, request->total_bytes_sent, request->total_bytes_recv);
     return st;
 }
 
 NTSTATUS functions::handle_net_iface_enum(p_net_interface_enum request) {
-    NET_DBG("handle_net_iface_enum: enter");
     if (!request) { NET_ERR("handle_net_iface_enum: NULL request"); return STATUS_INVALID_PARAMETER; }
+    NET_DBG("handle_net_iface_enum: enter");
     NTSTATUS st = net_if_enum::enumerate_interfaces(request);
-    NET_DBG("handle_net_iface_enum: exit status=0x%08x", st);
+    NET_DBG("handle_net_iface_enum: returned 0x%08x count=%u", st, request->interface_count);
     return st;
 }
 
 NTSTATUS functions::handle_pcap_export(p_pcap_export_request request) {
-    NET_DBG("handle_pcap_export: enter");
     if (!request) { NET_ERR("handle_pcap_export: NULL request"); return STATUS_INVALID_PARAMETER; }
-    NTSTATUS st = net_pcap::export_pcap(request);
-    NET_DBG("handle_pcap_export: exit status=0x%08x", st);
-    return st;
+    return net_pcap::export_pcap(request);
 }
 
 NTSTATUS functions::handle_net_fingerprint(p_net_fingerprint_request request) {
-    NET_DBG("handle_net_fingerprint: enter");
     if (!request) { NET_ERR("handle_net_fingerprint: NULL request"); return STATUS_INVALID_PARAMETER; }
-    NTSTATUS st = net_fingerprint::handle_fingerprint(request);
-    NET_DBG("handle_net_fingerprint: exit status=0x%08x", st);
-    return st;
+    return net_fingerprint::handle_fingerprint(request);
 }

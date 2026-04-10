@@ -31,13 +31,6 @@ namespace sentinel_bridge {
     };
 
 
-    // Watchdog period increased from 3000ms to 10000ms.
-    // The watchdog DPC only writes a TSC and checks a counter — it's lightweight,
-    // but at 3s it fired 20 times/min for no benefit. At 10s it still gets 6 chances
-    // to observe Sentinel's heartbeat before the timeout triggers (60s / 10s = 6).
-    // The timeout is proportionally increased from 30s to 60s to preserve the
-    // same 6x safety margin (was 30s/3s = 10 chances, now 60s/10s = 6 chances,
-    // which is still very generous).
     constexpr LONG WATCHDOG_PERIOD_MS    = 10000;
     constexpr LONG GRACE_PERIOD_MS       = 90000;
     constexpr LONG SENTINEL_TIMEOUT_MS   = 60000;
@@ -50,8 +43,6 @@ namespace sentinel_bridge {
     inline volatile LONG    g_watchdog_active        = 0;
 
 
-    // Relocated the tick() prototype above the DPC routine so it can be 
-    // autonomously fired by the kernel without requiring forward-declarations.
     __forceinline void tick() {
         LONG64 tsc = static_cast<LONG64>(__rdtsc());
         _InterlockedExchange64(&g_bridge.whoswho_tsc, tsc);

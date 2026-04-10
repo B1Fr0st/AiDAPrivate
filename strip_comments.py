@@ -7,7 +7,7 @@ import re
 import os
 
 WORKSPACES = [
-    r"C:\Users\ruar\AiDAPrivate\server",
+    r"C:\Users\ruar\AiDAPrivate\driver",
 ]
 
 CPP_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.inl', '.js'}
