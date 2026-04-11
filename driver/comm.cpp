@@ -14,6 +14,12 @@
 #include <intrin.h>
 #include <cstdio>
 
+#ifdef _DEBUG
+#define RC_UM_DBG(fmt, ...) do { char _rc_buf[512]; _snprintf_s(_rc_buf, sizeof(_rc_buf), _TRUNCATE, "[AIDA-RC-UM] " fmt "\n", ##__VA_ARGS__); OutputDebugStringA(_rc_buf); } while(0)
+#else
+#define RC_UM_DBG(fmt, ...) do { char _rc_buf[512]; _snprintf_s(_rc_buf, sizeof(_rc_buf), _TRUNCATE, "[AIDA-RC-UM] " fmt "\n", ##__VA_ARGS__); OutputDebugStringA(_rc_buf); } while(0)
+#endif
+
 #pragma comment(lib, "ntdll.lib")
 
 #ifndef _PCLIENT_ID_DEFINED
@@ -730,6 +736,8 @@ namespace thread_hijack {
     typedef NTSTATUS(NTAPI* NtClose_t)(HANDLE);
     typedef NTSTATUS(NTAPI* NtDelayExecution_t)(BOOLEAN, PLARGE_INTEGER);
     typedef NTSTATUS(NTAPI* NtYieldExecution_t)();
+    typedef NTSTATUS(NTAPI* NtAlertThread_t)(HANDLE);
+    typedef BOOL(WINAPI* CancelSynchronousIo_t)(HANDLE);
 
     inline NtSuspendThread_t pNtSuspendThread = nullptr;
     inline NtResumeThread_t pNtResumeThread = nullptr;
@@ -739,8 +747,14 @@ namespace thread_hijack {
     inline NtClose_t pNtClose = nullptr;
     inline NtDelayExecution_t pNtDelayExecution = nullptr;
     inline NtYieldExecution_t pNtYieldExecution = nullptr;
+    inline NtAlertThread_t pNtAlertThread = nullptr;
+    inline CancelSynchronousIo_t pCancelSynchronousIo = nullptr;
     inline volatile bool g_initialized = false;
     inline volatile std::uint64_t g_entropy_pool = 0;
+
+
+    inline std::uint64_t g_ntdll_base = 0;
+    inline std::uint64_t g_ntdll_size = 0;
 
     extern "C" NTSTATUS do_syscall_4(std::uint32_t syscall_idx, std::uint8_t* syscall_addr, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4);
 
@@ -883,6 +897,37 @@ namespace thread_hijack {
         pNtClose = (NtClose_t)get_func("NtClose");
         pNtDelayExecution = (NtDelayExecution_t)get_func("NtDelayExecution");
         pNtYieldExecution = (NtYieldExecution_t)get_func("NtYieldExecution");
+        pNtAlertThread = (NtAlertThread_t)get_func("NtAlertThread");
+
+
+        HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (kernel32) {
+            pCancelSynchronousIo = reinterpret_cast<CancelSynchronousIo_t>(
+                GetProcAddress(kernel32, "CancelSynchronousIo"));
+        }
+
+
+        {
+            std::uint8_t* base = reinterpret_cast<std::uint8_t*>(ntdll);
+            g_ntdll_base = reinterpret_cast<std::uint64_t>(base);
+            g_ntdll_size = 0;
+
+            __try {
+                PIMAGE_DOS_HEADER dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
+                if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                    PIMAGE_NT_HEADERS nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
+                    if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                        g_ntdll_size = static_cast<std::uint64_t>(nt->OptionalHeader.SizeOfImage);
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+
+            }
+
+            if (g_ntdll_size == 0) {
+                g_ntdll_size = 0x200000;
+            }
+        }
 
         g_initialized = (pNtSuspendThread && pNtResumeThread && pNtGetContextThread &&
                         pNtSetContextThread && pNtOpenThread && pNtClose && pNtDelayExecution);
@@ -922,31 +967,222 @@ namespace thread_hijack {
             default: break;
         }
     }
+
+
+    inline std::uint64_t g_tsc_ticks_per_us = 0;
+
+    __forceinline void calibrate_tsc() {
+        if (g_tsc_ticks_per_us != 0) return;
+
+        LARGE_INTEGER freq;
+        QueryPerformanceFrequency(&freq);
+
+
+        LARGE_INTEGER qpc_start, qpc_end;
+        QueryPerformanceCounter(&qpc_start);
+        std::uint64_t tsc_start = __rdtsc();
+
+
+        for (;;) {
+            QueryPerformanceCounter(&qpc_end);
+            if ((qpc_end.QuadPart - qpc_start.QuadPart) * 1000 >= freq.QuadPart)
+                break;
+            _mm_pause();
+        }
+
+        std::uint64_t tsc_end = __rdtsc();
+        std::uint64_t tsc_elapsed = tsc_end - tsc_start;
+        std::uint64_t us_elapsed = static_cast<std::uint64_t>(
+            (qpc_end.QuadPart - qpc_start.QuadPart) * 1000000 / freq.QuadPart);
+
+        if (us_elapsed > 0) {
+            g_tsc_ticks_per_us = tsc_elapsed / us_elapsed;
+        }
+        if (g_tsc_ticks_per_us == 0) {
+            g_tsc_ticks_per_us = 3000;
+        }
+    }
+
+    __forceinline void delay_us_rdtsc(std::uint64_t microseconds) {
+        if (g_tsc_ticks_per_us == 0) calibrate_tsc();
+        std::uint64_t target = __rdtsc() + (microseconds * g_tsc_ticks_per_us);
+        while (__rdtsc() < target) {
+            _mm_pause();
+        }
+    }
+
+
+    __forceinline void force_wake_thread(HANDLE thread_handle) {
+
+
+        if (pCancelSynchronousIo) {
+            pCancelSynchronousIo(thread_handle);
+        }
+
+
+        if (pNtAlertThread) {
+            pNtAlertThread(thread_handle);
+        }
+    }
+
+
+    __forceinline bool is_rip_in_ntdll(std::uint64_t rip) {
+        if (g_ntdll_base == 0) return false;
+        return (rip >= g_ntdll_base && rip < g_ntdll_base + g_ntdll_size);
+    }
 }
 
 std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, std::uint64_t arg1, std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4) noexcept {
     SPOOF_FUNC;
 
+    RC_UM_DBG("call_function: ENTER target=0x%llX args=(0x%llX, 0x%llX, 0x%llX, 0x%llX)",
+        function_address, arg1, arg2, arg3, arg4);
+
     if (!is_connected() || dtb_ == 0 || function_address == 0) {
+        RC_UM_DBG("call_function: ABORT connected=%d dtb=0x%llX func=0x%llX",
+            is_connected() ? 1 : 0, dtb_, function_address);
         return 0;
     }
 
     if (!ensure_shellcode_allocated()) {
+        RC_UM_DBG("call_function: ensure_shellcode_allocated FAILED");
         return 0;
     }
     if (!find_spoof_gadget()) {
+        RC_UM_DBG("call_function: find_spoof_gadget FAILED");
         return 0;
     }
     if (!thread_hijack::initialize()) {
+        RC_UM_DBG("call_function: thread_hijack::initialize FAILED");
         return 0;
     }
+
+
+    ntdll_base_ = thread_hijack::g_ntdll_base;
+    ntdll_size_ = thread_hijack::g_ntdll_size;
+
+
+    thread_hijack::calibrate_tsc();
+
+
+    constexpr int MAX_ATTEMPTS = 5;
+    DWORD blacklist[MAX_ATTEMPTS] = {};
+    int blacklist_count = 0;
+
+    for (int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
+        if (attempt > 0) {
+            RC_UM_DBG("call_function: RETRY attempt=%d/%d blacklisted=%d tids",
+                attempt + 1, MAX_ATTEMPTS, blacklist_count);
+
+            thread_hijack::delay_us(5000);
+        }
+
+        bool attempt_completed = false;
+        std::uint64_t result = call_function_attempt(
+            function_address, arg1, arg2, arg3, arg4,
+            blacklist, blacklist_count, attempt_completed);
+
+        if (attempt_completed) {
+            return result;
+        }
+
+
+        if (last_failed_tid_ != 0 && blacklist_count < MAX_ATTEMPTS) {
+            blacklist[blacklist_count++] = last_failed_tid_;
+        }
+
+
+        if (shellcode_address_ == 0) {
+            if (!ensure_shellcode_allocated()) {
+                RC_UM_DBG("call_function: re-alloc FAILED on attempt %d", attempt + 1);
+                return 0;
+            }
+        }
+    }
+
+    RC_UM_DBG("call_function: ALL %d attempts FAILED for target=0x%llX", MAX_ATTEMPTS, function_address);
+    return 0;
+}
+
+
+bool voyager::device_t::send_poll_request(void* input, DWORD input_size) const noexcept {
+    DWORD bytes_ret = 0;
+    BOOL ok = DeviceIoControl(
+        driver_handle_,
+        ioctl_codes::CR(),
+        input, input_size,
+        input, input_size,
+        &bytes_ret, nullptr);
+
+    if (ok && bytes_ret >= input_size) {
+        return true;
+    }
+
+
+    DWORD err = GetLastError();
+    if (!ok && err != ERROR_IO_PENDING && err != ERROR_IO_INCOMPLETE) {
+        force_heartbeat();
+
+
+        bytes_ret = 0;
+        ok = DeviceIoControl(
+            driver_handle_,
+            ioctl_codes::CR(),
+            input, input_size,
+            input, input_size,
+            &bytes_ret, nullptr);
+
+        if (ok && bytes_ret >= input_size) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+bool voyager::device_t::force_heartbeat() const noexcept {
+    detail::heartbeat_request hb{};
+    hb.magic = detail::get_heartbeat_magic();
+    hb.session_key = session_key_;
+    hb.timestamp = __rdtsc();
+    hb.response = 0;
+
+    DWORD hb_bytes = 0;
+    BOOL hb_result = DeviceIoControl(
+        driver_handle_,
+        ioctl_codes::HB(),
+        &hb, sizeof(hb),
+        &hb, sizeof(hb),
+        &hb_bytes, nullptr);
+
+    if (hb_result && hb_bytes >= sizeof(hb) && hb.response != 0) {
+        last_heartbeat_tsc_ = __rdtsc();
+        return true;
+    }
+    return false;
+}
+
+
+std::uint64_t voyager::device_t::call_function_attempt(
+    std::uint64_t function_address,
+    std::uint64_t arg1, std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4,
+    const DWORD* blacklist, int blacklist_count,
+    bool& out_completed) noexcept
+{
+    SPOOF_FUNC;
+
+    out_completed = false;
+
+    RC_UM_DBG("call_function: shellcode_addr=0x%llX spoof_gadget=0x%llX dtb=0x%llX",
+        shellcode_address_, spoof_gadget_, dtb_);
 
     thread_hijack::scatter_timing();
 
     std::uint64_t context_base = shellcode_address_;
 
-
     thread_hijack::scatter_timing();
+
 
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
@@ -978,10 +1214,19 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
                     continue;
                 }
 
-
                 if (last_hijacked_tid_ != 0 && te.th32ThreadID == last_hijacked_tid_) {
                     continue;
                 }
+
+
+                bool is_blacklisted = false;
+                for (int b = 0; b < blacklist_count; ++b) {
+                    if (blacklist[b] == te.th32ThreadID) {
+                        is_blacklisted = true;
+                        break;
+                    }
+                }
+                if (is_blacklisted) continue;
 
                 thread_scan_count++;
                 thread_hijack::scatter_timing();
@@ -996,7 +1241,7 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
                 HANDLE th = nullptr;
                 NTSTATUS status = thread_hijack::indirect_NtOpenThread(
                     &th,
-                    THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+                    THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION | THREAD_TERMINATE,
                     &objAttr,
                     &clientId
                 );
@@ -1020,9 +1265,17 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
                                 std::int32_t priority = static_cast<std::int32_t>(te.tpBasePri);
 
 
-                                bool is_waiting = (ctx.Rip >= 0x00007FF000000000ULL);
-                                if (is_waiting) {
-                                    priority -= 10;
+                                bool in_ntdll = thread_hijack::is_rip_in_ntdll(ctx.Rip);
+
+
+                                bool in_target = (base_address_ != 0 &&
+                                                  ctx.Rip >= base_address_ &&
+                                                  ctx.Rip < base_address_ + 0x100000);
+
+                                if (in_target) {
+                                    priority += 20;
+                                } else if (in_ntdll) {
+                                    priority -= 20;
                                 }
 
 
@@ -1058,11 +1311,17 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
     CloseHandle(snapshot);
 
     if (!best_thread || best_tid == 0) {
+        RC_UM_DBG("call_function: NO suitable thread found (scanned %u)", thread_scan_count);
         return 0;
     }
 
     target_thread = best_thread;
     target_tid = best_tid;
+
+    bool is_in_ntdll = thread_hijack::is_rip_in_ntdll(best_ctx.Rip);
+    bool is_in_target = (base_address_ != 0 && best_ctx.Rip >= base_address_ && best_ctx.Rip < base_address_ + 0x100000);
+    RC_UM_DBG("call_function: SELECTED tid=%u rip=0x%llX rsp=0x%llX priority=%d in_ntdll=%d in_target=%d scanned=%u",
+        target_tid, best_ctx.Rip, best_ctx.Rsp, best_priority, is_in_ntdll ? 1 : 0, is_in_target ? 1 : 0, thread_scan_count);
 
     thread_hijack::scatter_timing();
 
@@ -1096,48 +1355,71 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
 
     std::uint64_t code_entry = req.shellcode_address;
 
+
     CONTEXT hijack_ctx = original_ctx;
     hijack_ctx.Rip = code_entry;
 
     std::uint64_t shellcode_rsp = ((hijack_ctx.Rsp - 0x108) & ~0xFULL) + 0x8;
     hijack_ctx.Rsp = shellcode_rsp;
 
+    RC_UM_DBG("call_function: HIJACK rip=0x%llX->0x%llX rsp=0x%llX->0x%llX",
+        original_ctx.Rip, hijack_ctx.Rip, original_ctx.Rsp, hijack_ctx.Rsp);
+
     thread_hijack::scatter_timing();
 
     NTSTATUS set_status = thread_hijack::indirect_NtSetContextThread(target_thread, &hijack_ctx);
     if (set_status < 0) {
+        RC_UM_DBG("call_function: NtSetContextThread FAILED status=0x%08X", (unsigned)set_status);
         thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
         thread_hijack::indirect_NtClose(target_thread);
         return 0;
     }
+    RC_UM_DBG("call_function: NtSetContextThread OK, resuming tid=%u", target_tid);
     last_hijacked_tid_ = target_tid;
 
     thread_hijack::collect_entropy();
 
     thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
 
-    constexpr int MAX_WAIT_ITERATIONS = 12000;
+
+    if (is_in_ntdll) {
+        thread_hijack::force_wake_thread(target_thread);
+        RC_UM_DBG("call_function: force_wake sent to tid=%u (was in ntdll)", target_tid);
+    }
+
+
+    constexpr int MAX_WAIT_ITERATIONS = 6000;
     constexpr int FAST_POLL_THRESHOLD = 500;
-    constexpr int MEDIUM_POLL_THRESHOLD = 3000;
+    constexpr int MEDIUM_POLL_THRESHOLD = 2000;
 
     std::uint64_t result = 0;
     bool completed = false;
     int consecutive_poll_failures = 0;
 
+    RC_UM_DBG("call_function: POLLING start (max=%d iterations) ctx_base=0x%llX",
+        MAX_WAIT_ITERATIONS, context_base);
+
     thread_hijack::collect_entropy();
 
+
+    force_heartbeat();
+
+    int last_log_iteration = 0;
     for (int i = 0; i < MAX_WAIT_ITERATIONS && !completed; ++i) {
-        std::uint64_t base_delay;
+
+
         if (i < FAST_POLL_THRESHOLD) {
-            base_delay = 25;
+
+            thread_hijack::delay_us_rdtsc(25);
         } else if (i < MEDIUM_POLL_THRESHOLD) {
-            base_delay = 75;
+
+            thread_hijack::delay_us_rdtsc(100);
         } else {
-            base_delay = 200;
+
+            std::uint64_t jitter = static_cast<std::uint64_t>((thread_hijack::g_entropy_pool ^ __rdtsc()) & 0x7F);
+            thread_hijack::delay_us(static_cast<LONGLONG>(500 + jitter));
         }
 
-        std::uint64_t jitter = static_cast<std::uint64_t>((thread_hijack::g_entropy_pool ^ __rdtsc()) & 0x7F);
-        thread_hijack::delay_us(static_cast<LONGLONG>(base_delay + jitter));
 
         detail::call_result_request result_req{};
         result_req.dtb = dtb_;
@@ -1145,53 +1427,42 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
         result_req.result = 0;
         result_req.completed = 0;
 
-        DWORD bytes_ret = 0;
-        BOOL ioctl_result = DeviceIoControl(
-            driver_handle_,
-            ioctl_codes::CR(),
-            &result_req,
-            sizeof(result_req),
-            &result_req,
-            sizeof(result_req),
-            &bytes_ret,
-            nullptr
-        );
-
-        if (ioctl_result && bytes_ret >= sizeof(result_req)) {
+        if (send_poll_request(&result_req, sizeof(result_req))) {
             if (result_req.completed != 0) {
                 result = result_req.result;
                 completed = true;
+                RC_UM_DBG("call_function: COMPLETED at iteration %d result=0x%llX", i, result);
                 break;
             }
 
             consecutive_poll_failures = 0;
-            continue;
-        }
-
-        if (!ioctl_result) {
-            DWORD poll_error = GetLastError();
-
-            if (poll_error == ERROR_IO_PENDING || poll_error == ERROR_IO_INCOMPLETE) {
-                consecutive_poll_failures = 0;
-            } else {
-                ++consecutive_poll_failures;
-                if (consecutive_poll_failures >= 8) {
-                    break;
-                }
+            if (i - last_log_iteration >= 2000) {
+                RC_UM_DBG("call_function: POLLING iter=%d still waiting (exec_done=0)", i);
+                last_log_iteration = i;
             }
         } else {
-            consecutive_poll_failures = 0;
+
+
+            ++consecutive_poll_failures;
+            if (consecutive_poll_failures >= 16) {
+                RC_UM_DBG("call_function: POLL FAILED 16x consecutively, iter=%d", i);
+                break;
+            }
         }
 
-        if ((i & 0x3F) == 0) {
-            thread_hijack::scatter_timing();
+
+        if ((i & 0xF) == 0) {
             thread_hijack::collect_entropy();
             spoofer::scatter_execution();
-
-
             refresh_heartbeat();
+
+
+            if ((i & 0xFF) == 0 && i > 0 && is_in_ntdll) {
+                thread_hijack::force_wake_thread(target_thread);
+            }
         }
     }
+
 
     thread_hijack::scatter_timing();
 
@@ -1200,12 +1471,33 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
     thread_hijack::scatter_timing();
 
     if (!completed) {
+        RC_UM_DBG("call_function: TIMEOUT after %d iterations, tid=%u rip_was=0x%llX target=0x%llX",
+            MAX_WAIT_ITERATIONS, target_tid, original_ctx.Rip, function_address);
+
+
+        CONTEXT check_ctx{};
+        check_ctx.ContextFlags = CONTEXT_FULL;
+        if (thread_hijack::indirect_NtGetContextThread(target_thread, &check_ctx) >= 0) {
+            RC_UM_DBG("call_function: TIMEOUT current_rip=0x%llX current_rsp=0x%llX (expected_rip=0x%llX)",
+                check_ctx.Rip, check_ctx.Rsp, code_entry);
+        }
+
+
+        {
+            std::uint64_t diag_done = read<std::uint64_t>(context_base + 0x50);
+            std::uint64_t diag_ret = read<std::uint64_t>(context_base + 0x30);
+            std::uint64_t diag_rsp = read<std::uint64_t>(context_base + 0x38);
+            RC_UM_DBG("call_function: TIMEOUT diag exec_done=0x%llX ret_value=0x%llX saved_rsp=0x%llX",
+                diag_done, diag_ret, diag_rsp);
+        }
+
         thread_hijack::indirect_NtSetContextThread(target_thread, &original_ctx);
         last_failed_tid_ = target_tid;
 
 
-        shellcode_address_ = 0;
     } else {
+        RC_UM_DBG("call_function: SUCCESS result=0x%llX tid=%u target=0x%llX",
+            result, target_tid, function_address);
         thread_hijack::indirect_NtSetContextThread(target_thread, &original_ctx);
         last_failed_tid_ = 0;
         last_hijacked_tid_ = 0;
@@ -1214,6 +1506,7 @@ std::uint64_t voyager::device_t::call_function(std::uint64_t function_address, s
     thread_hijack::indirect_NtResumeThread(target_thread, nullptr);
     thread_hijack::indirect_NtClose(target_thread);
 
+    out_completed = completed;
     return result;
 }
 

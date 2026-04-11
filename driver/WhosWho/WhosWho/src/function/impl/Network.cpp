@@ -2371,9 +2371,7 @@ static BOOLEAN aida_parse_transport_address(const UINT8* ta_buf, UINT32 ta_size,
 
     strong::kmemset(out_addr, 0, 16);
 
-    // Detect raw SOCKADDR_IN (16 bytes) or SOCKADDR_IN6 (28 bytes).
-    // AFD stores the bound address as a raw SOCKADDR when ta_size matches exactly.
-    // A TDI TRANSPORT_ADDRESS for IPv4 needs >= 22 bytes, so 16 is unambiguous.
+
     USHORT sa_family = *(const USHORT*)(ta_buf + 0);
 
     if (sa_family == AF_INET && ta_size >= 8 && ta_size <= 16) {
@@ -2400,7 +2398,7 @@ static BOOLEAN aida_parse_transport_address(const UINT8* ta_buf, UINT32 ta_size,
         return TRUE;
     }
 
-    // Fall through to TDI TRANSPORT_ADDRESS format (AddressCount at +0, AddressType at +6)
+
     if (ta_size < 10 || !_MmIsAddressValid((PVOID)(ta_buf + 9)))
         return FALSE;
 
@@ -2867,16 +2865,10 @@ namespace net_enum {
         PVOID StaticParamData, UINT32 StaticParamSize,
         PUINT32 Count);
 
-    // NsiStore values validated by NsiEnumerateObjectsAllParametersEx:
-    //   (NsiStore - 1) must be <= 1, so only 1 or 2 are accepted.
-    //   1 = NsiActive  (runtime connection table)
-    //   2 = NsiBoth    (runtime + persistent/configured)
+
     inline constexpr UINT32 NSI_STORE_ACTIVE = 1;
 
-    // NsiQueryMode (first param) selects the query path inside
-    // NsiEnumerateObjectsAllParametersEx:
-    //   0 = NsipEnumeratePersistentData  (persistent/configured objects)
-    //   1 = NMP provider lookup           (runtime/active connections)
+
     inline constexpr UINT32 NSI_QUERY_RUNTIME = 1;
 
     inline fn_NsiEnumerateObjectsAllParameters _NsiEnumerate = nullptr;
@@ -2919,10 +2911,10 @@ namespace net_enum {
     } NSI_TCP_DYNAMIC;
 
     typedef struct _NSI_TCP_STATIC {
-        UINT8  _pad0[12];       // reserved (zero on Win10 22H2)
-        UINT32 mod_pid;          // owning PID at offset 12
-        UINT64 create_time;      // FILETIME at offset 16
-        UINT8  _pad1[8];        // reserved
+        UINT8  _pad0[12];
+        UINT32 mod_pid;
+        UINT64 create_time;
+        UINT8  _pad1[8];
     } NSI_TCP_STATIC;
 
     typedef struct _NSI_UDP_KEY {
@@ -2930,10 +2922,10 @@ namespace net_enum {
     } NSI_UDP_KEY;
 
     typedef struct _NSI_UDP_STATIC {
-        UINT32 mod_pid;          // owning PID at offset 0
-        UINT32 _pad0;            // reserved
-        UINT64 create_time;      // FILETIME at offset 8
-        UINT8  _pad1[16];       // reserved
+        UINT32 mod_pid;
+        UINT32 _pad0;
+        UINT64 create_time;
+        UINT8  _pad1[16];
     } NSI_UDP_STATIC;
     #pragma pack(pop)
 
@@ -3062,13 +3054,6 @@ namespace net_enum {
             (UINT32)sizeof(NSI_TCP_KEY), (UINT32)sizeof(NSI_TCP_DYNAMIC), (UINT32)sizeof(NSI_TCP_STATIC));
 
 
-        // WHY: netio!NsipValidateEnumerateObjectsAllParametersRequest rejects
-        // nullptr buffers when the corresponding element size is non-zero,
-        // returning STATUS_INVALID_PARAMETER (0xC000000D). The old two-phase
-        // "count query then data query" pattern always failed at the count
-        // step because it passed nullptr + sizeof(struct). Fix: allocate
-        // real buffers up front for an estimated 512 entries, call once,
-        // and retry with a larger buffer if the table grew.
         {
             UINT32 tcp_capacity = 4096;
             UINT32 tcp_count = 0;
@@ -3122,7 +3107,7 @@ namespace net_enum {
                 }
                 ExFreePoolWithTag(buf, 'nsNW');
                 buf = nullptr;
-                break;  // Unrecoverable error
+                break;
             }
 
             if (buf && NT_SUCCESS(st) && tcp_count > 0) {
@@ -3156,8 +3141,6 @@ namespace net_enum {
         }
 
 
-        // WHY: Same nullptr+size rejection bug as TCP. Direct enumeration
-        // with pre-allocated buffers, retry on overflow.
         {
             UINT32 udp_capacity = 4096;
             UINT32 udp_count = 0;
@@ -3749,9 +3732,6 @@ static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
         return 0;
 
 
-    // WHY: Same nullptr+size validation bug. Direct enumeration with
-    // pre-allocated buffers. This function is called from WFP classify
-    // callbacks at PASSIVE_LEVEL to resolve packet PIDs.
     if (protocol == 0 || protocol == IPPROTO_TCP) {
         UINT32 tcp_capacity = 4096;
         UINT32 tcp_count = 0;
@@ -3770,9 +3750,7 @@ static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
             auto* keys = reinterpret_cast<net_enum::NSI_TCP_KEY*>(buf);
             auto* stats = reinterpret_cast<net_enum::NSI_TCP_STATIC*>(buf + key_sz);
 
-            // WHY: Pass dynamic size=0 when dynamic buffer is nullptr.
-            // NsipValidate rejects nullptr+nonzero size. We don't need
-            // dynamic data here (only keys+static for PID resolution).
+
             st = net_enum::_NsiEnumerate(
                 net_enum::NSI_QUERY_RUNTIME, net_enum::NSI_STORE_ACTIVE, (PVOID)net_enum::NPI_MS_TCP_MODULEID,
                 3, keys, sizeof(net_enum::NSI_TCP_KEY),
@@ -3781,7 +3759,7 @@ static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
                 stats, sizeof(net_enum::NSI_TCP_STATIC),
                 &tcp_count);
 
-            // Search returned entries (valid even on overflow)
+
             if (NT_SUCCESS(st) || st == STATUS_BUFFER_OVERFLOW ||
                 st == STATUS_BUFFER_TOO_SMALL || st == static_cast<NTSTATUS>(0xC0000023)) {
                 for (UINT32 i = 0; i < tcp_count; i++) {
@@ -3825,7 +3803,6 @@ static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
     }
 
 
-    // WHY: Same nullptr+size validation bug for UDP path.
     if (protocol == 0 || protocol == IPPROTO_UDP) {
         UINT32 udp_capacity = 4096;
         UINT32 udp_count = 0;
@@ -3852,7 +3829,7 @@ static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
                 stats, sizeof(net_enum::NSI_UDP_STATIC),
                 &udp_count);
 
-            // Search returned entries (valid even on overflow)
+
             if (NT_SUCCESS(st) || st == STATUS_BUFFER_OVERFLOW ||
                 st == STATUS_BUFFER_TOO_SMALL || st == static_cast<NTSTATUS>(0xC0000023)) {
                 for (UINT32 i = 0; i < udp_count; i++) {
@@ -4228,10 +4205,10 @@ namespace net_tcpip {
     } TCP4_DYNAMIC;
 
     typedef struct _TCP4_STATIC {
-        UINT8  _pad0[12];       // reserved (zero on Win10 22H2)
-        UINT32 mod_pid;          // owning PID at offset 12
-        UINT64 create_time;      // FILETIME at offset 16
-        UINT8  _pad1[8];        // reserved
+        UINT8  _pad0[12];
+        UINT32 mod_pid;
+        UINT64 create_time;
+        UINT8  _pad1[8];
     } TCP4_STATIC;
 
     typedef struct _UDP4_KEY {
@@ -4242,10 +4219,10 @@ namespace net_tcpip {
     } UDP4_KEY;
 
     typedef struct _UDP4_STATIC {
-        UINT32 mod_pid;          // owning PID at offset 0
-        UINT32 _pad0;            // reserved
-        UINT64 create_time;      // FILETIME at offset 8
-        UINT8  _pad1[16];       // reserved
+        UINT32 mod_pid;
+        UINT32 _pad0;
+        UINT64 create_time;
+        UINT8  _pad1[16];
     } UDP4_STATIC;
     #pragma pack(pop)
 
@@ -4263,7 +4240,6 @@ namespace net_tcpip {
         UINT32 filled = 0;
 
 
-        // WHY: netio!NsipValidate rejects nullptr+size. Direct enumeration.
         if (request->filter_protocol == 0 || request->filter_protocol == 6) {
             UINT32 tcp_capacity = 4096;
             UINT32 tcp_count = 0;
@@ -4337,7 +4313,6 @@ namespace net_tcpip {
         }
 
 
-        // WHY: Same nullptr+size validation bug for UDP.
         if (request->filter_protocol == 0 || request->filter_protocol == 17) {
             UINT32 udp_capacity = 4096;
             UINT32 udp_count = 0;
@@ -6740,8 +6715,6 @@ namespace net_kill {
             return 0;
 
 
-        // WHY: netio!NsipValidate rejects nullptr+size. Direct enumeration
-        // to find the owner PID of a TCP connection for kill_connection.
         if (request->protocol == 6 && net_enum::resolve_nsi()) {
             UINT32 tcp_capacity = 4096;
             UINT32 tcp_count = 0;
@@ -6760,7 +6733,7 @@ namespace net_kill {
                 auto* keys = reinterpret_cast<net_enum::NSI_TCP_KEY*>(buf);
                 auto* stats = reinterpret_cast<net_enum::NSI_TCP_STATIC*>(buf + key_sz);
 
-                // WHY: dynamic size must be 0 when dynamic buffer is nullptr.
+
                 st = net_enum::_NsiEnumerate(
                     net_enum::NSI_QUERY_RUNTIME, net_enum::NSI_STORE_ACTIVE, (PVOID)net_enum::NPI_MS_TCP_MODULEID,
                     3, keys, sizeof(net_enum::NSI_TCP_KEY),
@@ -6769,7 +6742,7 @@ namespace net_kill {
                     stats, sizeof(net_enum::NSI_TCP_STATIC),
                     &tcp_count);
 
-                // Search returned entries (valid even on overflow)
+
                 if (NT_SUCCESS(st) || st == STATUS_BUFFER_OVERFLOW ||
                     st == STATUS_BUFFER_TOO_SMALL || st == static_cast<NTSTATUS>(0xC0000023)) {
                     for (UINT32 i = 0; i < tcp_count; i++) {

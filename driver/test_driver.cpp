@@ -16,13 +16,7 @@ static int g_pass = 0;
 static int g_fail = 0;
 static int g_skip = 0;
 
-/*
- * Ctrl+C / console-close handler.
- * WHY: Without this, if a DeviceIoControl call blocks (e.g. the kernel does a
- * long handle enumeration), the process cannot be stopped with Ctrl+C or even
- * from Task Manager's "End Process" because the main thread is stuck inside
- * the kernel.  TerminateProcess is the only reliable way out in that scenario.
- */
+
 static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT || ctrl_type == CTRL_CLOSE_EVENT) {
         printf("\n  [!] Caught console signal %lu — terminating immediately.\n", ctrl_type);
@@ -88,12 +82,7 @@ static std::uint32_t find_target_pid() {
     return pid;
 }
 
-/*
- * WHY: Replace the fixed Sleep(3000) that missed traffic.  test_target now signals
- * Global\\WhosWhoTestReady after at least 2 network threads have completed their
- * first operation.  Waiting on this event ensures traffic is actively flowing
- * before any capture or network test begins.
- */
+
 static bool wait_for_ready_event(DWORD timeout_ms = 15000) {
     HANDLE ready = OpenEventW(SYNCHRONIZE, FALSE, L"Global\\WhosWhoTestReady");
     if (!ready) {
@@ -618,11 +607,7 @@ static void test_network_connections(std::uint32_t target_pid) {
         print_ip(c.remote_addr, c.address_family);
         printf(":%u\n", c.remote_port);
 
-        /*
-         * WHY raw dump: Previous test runs showed garbage data in connections
-         * (proto=2045976688, all-zero addresses).  If protocol or address_family
-         * look invalid, dump raw bytes to diagnose struct alignment issues.
-         */
+
         bool suspect = (c.protocol > 255 || c.address_family > 30 ||
                         (c.address_family != 2 && c.address_family != 23));
         if (suspect) {
@@ -700,11 +685,6 @@ static void test_capture(std::uint32_t target_pid) {
     }
 
 
-    /*
-     * WHY 10 seconds: The original 5s window was too short — test_target's network
-     * threads fire every 0.5-3 seconds.  A 10s window guarantees multiple packets
-     * from HTTP, DNS, TLS, and loopback threads.  Polling every 2s shows progress.
-     */
     printf("  [INFO] Capturing test_target traffic for 10 seconds (polling every 2s)...\n");
     for (int sec = 2; sec <= 10; sec += 2) {
         Sleep(2000);
@@ -727,11 +707,7 @@ static void test_capture(std::uint32_t target_pid) {
 
     auto pkts = device->get_captured_packets(64);
 
-    /*
-     * WHY retry: WFP callbacks may have startup latency, or the test_target's
-     * first network operations may not have completed yet.  Retry up to 3 times
-     * with 3s gaps to maximize the chance of capturing packets.
-     */
+
     if (pkts.empty()) {
         for (int retry = 1; retry <= 3; retry++) {
             printf("  [INFO] No packets yet, retry %d/3 (waiting 3s)...\n", retry);
@@ -785,11 +761,7 @@ static void test_dns_queries(std::uint32_t target_pid) {
 
     auto dns = device->get_dns_queries(target_pid);
 
-    /*
-     * WHY retry: DNS queries are captured asynchronously.  test_target resolves
-     * domains every 2 seconds, but the first query might not have completed before
-     * we call get_dns_queries().  3 retries × 3 seconds = 9 extra seconds max.
-     */
+
     if (dns.empty()) {
         for (int retry = 1; retry <= 3; retry++) {
             printf("  [INFO] No DNS queries yet, retry %d/3 (waiting 3s)...\n", retry);
@@ -1137,11 +1109,7 @@ static void test_dpi(std::uint32_t target_pid) {
 
     auto results = device->get_dpi_results(target_pid, 0, 0, 0);
 
-    /*
-     * WHY retry: DPI results are populated by classify callbacks processing real
-     * traffic payloads.  If test_target's HTTP/TLS threads haven't completed a
-     * full request yet, the DPI ring may be empty.  Retry with 3s gaps.
-     */
+
     if (results.empty()) {
         for (int retry = 1; retry <= 3; retry++) {
             printf("  [INFO] No DPI results yet, retry %d/3 (waiting 3s)...\n", retry);
@@ -1306,11 +1274,6 @@ static void test_bandwidth_monitor(std::uint32_t target_pid) {
     report("bw_monitor_op(start)", ok, detail);
 
 
-    /*
-     * WHY 6s total with 3 samples: test_target generates traffic every 0.5-3s.
-     * Taking 3 samples over 6 seconds ensures we see at least one full traffic
-     * cycle.  The original 4s / 2 samples was borderline.
-     */
     printf("  [INFO] Sampling bandwidth over 6 seconds (3 intervals)...\n");
     Sleep(2000);
 
@@ -1342,10 +1305,7 @@ static void test_bandwidth_monitor(std::uint32_t target_pid) {
            (unsigned long long)stats_t3.bps_in,
            (unsigned long long)stats_t3.bps_out);
 
-    /*
-     * WHY compare first to last: maximizes the measurement window (6s)
-     * instead of just the last 2s interval.
-     */
+
     bool bw_growing = (stats_t3.total_bytes_sent > stats_t1.total_bytes_sent) ||
                       (stats_t3.total_bytes_recv > stats_t1.total_bytes_recv);
     snprintf(detail, sizeof(detail), "delta_sent=%llu delta_recv=%llu (over 4s window)",
@@ -1594,11 +1554,7 @@ int main() {
             CloseHandle(pi.hProcess);
             printf("[INFO] Launched test_target.exe (pid=%u)\n", target_pid);
 
-            /*
-             * WHY: The old code did Sleep(3000) here, which was a blind wait.
-             * test_target now signals Global\\WhosWhoTestReady after its network
-             * threads complete their first operations, so we synchronize on that.
-             */
+
             wait_for_ready_event(15000);
         } else {
             printf("[FATAL] Failed to launch test_target.exe (error=%lu)\n", GetLastError());
@@ -1632,14 +1588,7 @@ int main() {
 
     test_dtb();
 
-    /*
-     * WHY start capture + BW monitor early: The non-network tests (memory, threads,
-     * remote call, DLL protection) take 10-20 seconds.  By starting capture and
-     * bandwidth monitoring NOW, the driver accumulates packets during that entire
-     * window while test_target's continuous network threads are flowing.
-     * This replaces the original approach of starting capture AFTER all non-network
-     * tests, which left only a 5s window that often yielded 0 packets.
-     */
+
     printf("\n  [INFO] Starting early packet capture and bandwidth monitor...\n");
     bool early_capture_ok = device->start_capture(found_pid, 0, 0, nullptr, 1500);
     if (early_capture_ok) {
@@ -1693,11 +1642,7 @@ int main() {
     printf("  [INFO] test_target.exe generates HTTP, DNS, TLS, loopback TCP:44444, loopback UDP:44445\n");
     printf("  [INFO] PID-filtered queries should return real connections and packets\n");
 
-    /*
-     * WHY stop early capture here: We started capture before non-network tests
-     * (~15-25 seconds ago), so the ring buffer should have accumulated packets.
-     * Stop it now and report the results before the dedicated capture test.
-     */
+
     if (early_capture_ok) {
         bool act = false;
         std::uint32_t cap_count = 0, drop_count = 0;

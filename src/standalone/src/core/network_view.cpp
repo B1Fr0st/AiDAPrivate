@@ -1,5 +1,5 @@
 #include "network_view.hpp"
-#include "comm.h"
+#include "standalone_driver.hpp"
 #include "protocol_parser.hpp"
 #include "mitm_proxy.hpp"
 #include "cert_pin_bypass.hpp"
@@ -100,8 +100,8 @@ static bool filter_text_match(const char* filter, const std::string& text) {
 
 static void connection_poll_thread(state_t& state) {
     while (state.conn_polling.load()) {
-        if (device && device->is_connected()) {
-            auto raw_conns = device->enumerate_connections(
+        if (driver_bridge::using_kernel_driver()) {
+            auto raw_conns = driver_bridge::enumerate_connections(
                 state.conn_filter_pid, state.conn_filter_protocol);
 
             std::vector<connection_entry> entries;
@@ -133,8 +133,8 @@ static void connection_poll_thread(state_t& state) {
 
 static void capture_poll_thread(state_t& state) {
     while (state.cap_polling.load()) {
-        if (device && device->is_connected()) {
-            auto raw_packets = device->get_captured_packets(64);
+        if (driver_bridge::using_kernel_driver()) {
+            auto raw_packets = driver_bridge::get_captured_packets(64);
 
             if (!raw_packets.empty()) {
                 std::lock_guard<std::mutex> lock(state.cap_mutex);
@@ -174,8 +174,8 @@ static void capture_poll_thread(state_t& state) {
 
 static void dns_poll_thread(state_t& state) {
     while (state.dns_polling.load()) {
-        if (device && device->is_connected()) {
-            auto raw_dns = device->get_dns_queries(state.dns_filter_pid);
+        if (driver_bridge::using_kernel_driver()) {
+            auto raw_dns = driver_bridge::get_dns_queries(state.dns_filter_pid);
 
             if (!raw_dns.empty()) {
                 std::vector<dns_entry> entries;
@@ -207,8 +207,8 @@ static void dns_poll_thread(state_t& state) {
 
 static void bandwidth_poll_thread(state_t& state) {
     while (state.bw_polling.load()) {
-        if (device && device->is_connected()) {
-            auto raw_bw = device->get_bw_per_process();
+        if (driver_bridge::using_kernel_driver()) {
+            auto raw_bw = driver_bridge::get_bw_per_process();
 
             std::vector<bw_entry> old_entries;
             {
@@ -431,7 +431,7 @@ static void render_connections(state_t& state, float x, float y, float w, float 
     ImGui::InputTextWithHint("##conn_search", "Filter...", state.conn_filter_text, sizeof(state.conn_filter_text));
     ImGui::SameLine();
 
-    bool driver_ok = device && device->is_connected();
+    bool driver_ok = driver_bridge::using_kernel_driver();
     if (!driver_ok) ImGui::BeginDisabled();
     if (ImGui::SmallButton(state.conn_auto_refresh ? "Auto" : "Manual")) {
         state.conn_auto_refresh = !state.conn_auto_refresh;
@@ -440,7 +440,7 @@ static void render_connections(state_t& state, float x, float y, float w, float 
     if (ImGui::SmallButton("Refresh")) {
 
         if (driver_ok) {
-            auto raw = device->enumerate_connections(state.conn_filter_pid, state.conn_filter_protocol);
+            auto raw = driver_bridge::enumerate_connections(state.conn_filter_pid, state.conn_filter_protocol);
             std::lock_guard<std::mutex> lock(state.conn_mutex);
             state.connections.clear();
             for (auto& c : raw) {
@@ -596,7 +596,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_cap", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
-    bool driver_ok = device && device->is_connected();
+    bool driver_ok = driver_bridge::using_kernel_driver();
 
 
     {
@@ -614,7 +614,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
 
     if (!state.cap_running) {
         if (ImGui::SmallButton("Start Capture")) {
-            if (device->start_capture(state.cap_filter_pid, state.cap_filter_port,
+            if (driver_bridge::start_capture(state.cap_filter_pid, state.cap_filter_port,
                                        state.cap_filter_protocol, nullptr)) {
                 state.cap_running = true;
                 state.cap_polling.store(true);
@@ -623,7 +623,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         }
     } else {
         if (ImGui::SmallButton("Stop Capture")) {
-            device->stop_capture();
+            driver_bridge::stop_capture();
             state.cap_running = false;
             state.cap_polling.store(false);
             if (state.cap_thread.joinable()) state.cap_thread.join();
@@ -878,7 +878,7 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_dns", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
-    bool driver_ok = device && device->is_connected();
+    bool driver_ok = driver_bridge::using_kernel_driver();
 
     if (!driver_ok) ImGui::BeginDisabled();
 
@@ -896,7 +896,7 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
     ImGui::SameLine();
     if (ImGui::SmallButton("Refresh")) {
         if (driver_ok) {
-            auto raw = device->get_dns_queries(state.dns_filter_pid);
+            auto raw = driver_bridge::get_dns_queries(state.dns_filter_pid);
             std::lock_guard<std::mutex> lock(state.dns_mutex);
             state.dns_entries.clear();
             for (auto& d : raw) {
@@ -1273,7 +1273,7 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_filters", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
-    bool driver_ok = device && device->is_connected();
+    bool driver_ok = driver_bridge::using_kernel_driver();
 
 
     ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "Add Filter Rule");
@@ -1316,7 +1316,7 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
             inet_pton(AF_INET, state.nf_ip, ip_bytes);
         }
 
-        device->add_filter_rule(
+        driver_bridge::add_filter_rule(
             static_cast<uint32_t>(state.nf_action),
             static_cast<uint32_t>(state.nf_direction),
             static_cast<uint32_t>(state.nf_protocol),
@@ -1325,7 +1325,7 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
 
     ImGui::SameLine();
     if (ImGui::SmallButton("Clear All")) {
-        device->clear_filter_rules();
+        driver_bridge::clear_filter_rules();
         state.filters.clear();
     }
     if (!driver_ok) ImGui::EndDisabled();
@@ -1356,20 +1356,20 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_bw", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
-    bool driver_ok = device && device->is_connected();
+    bool driver_ok = driver_bridge::using_kernel_driver();
 
     if (!driver_ok) ImGui::BeginDisabled();
 
     if (!state.bw_polling.load()) {
         if (ImGui::SmallButton("Start Monitoring")) {
-            device->bw_monitor_op(0);
+            driver_bridge::bw_monitor_op(0);
             state.bw_monitoring = true;
             state.bw_polling.store(true);
             state.bw_thread = std::thread(bandwidth_poll_thread, std::ref(state));
         }
     } else {
         if (ImGui::SmallButton("Stop Monitoring")) {
-            device->bw_monitor_op(1);
+            driver_bridge::bw_monitor_op(1);
             state.bw_monitoring = false;
             state.bw_polling.store(false);
             if (state.bw_thread.joinable()) state.bw_thread.join();

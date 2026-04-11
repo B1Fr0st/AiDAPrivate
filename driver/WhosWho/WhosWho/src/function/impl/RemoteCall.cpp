@@ -541,7 +541,7 @@ NTSTATUS functions::handle7781(p_remote_call request) {
     KeMemoryBarrier();
     _mm_mfence();
 
-    /* Verify shellcode was written correctly by reading back first 16 bytes */
+
     {
         UINT64 verify_phys = strong::translate_virtual_address(dtb_clean, code_addr);
         if (verify_phys) {
@@ -635,7 +635,7 @@ NTSTATUS functions::handle7782(p_call_result request) {
         request->completed = 1;
         RC_DBG("handle7782: DONE exec_done=0x%llX ret_value=0x%llX", (UINT64)done_flag, ctx.ret_value);
     } else {
-        /* polled frequently -- don't spam logs */
+
     }
 
     return STATUS_SUCCESS;
