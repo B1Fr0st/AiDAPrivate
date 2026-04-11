@@ -7,6 +7,16 @@
 
 #pragma intrinsic(_mm_mfence)
 
+#ifdef AIDA_NET_DEBUG
+#define RC_DBG(fmt, ...) \
+    do { if (_DbgPrintEx) _DbgPrintEx(77, 0, "[AIDA-RC] " fmt "\n", ##__VA_ARGS__); } while(0)
+#define RC_ERR(fmt, ...) \
+    do { if (_DbgPrintEx) _DbgPrintEx(77, 0, "[AIDA-RC][ERR] " fmt "\n", ##__VA_ARGS__); } while(0)
+#else
+#define RC_DBG(fmt, ...) ((void)0)
+#define RC_ERR(fmt, ...) ((void)0)
+#endif
+
 namespace call_guard {
     __forceinline BOOLEAN is_valid_user_range(UINT64 addr) {
         return (addr > 0x10000ULL && addr < 0x00007FFFFFFFFFFFULL);
@@ -357,22 +367,33 @@ namespace shellcode_builder {
 
 NTSTATUS functions::handle7781(p_remote_call request) {
     if (!request) {
+        RC_ERR("handle7781: null request");
         return STATUS_INVALID_PARAMETER;
     }
 
+    RC_DBG("handle7781: target_func=0x%llX shellcode_addr=0x%llX dtb=0x%llX spoof=0x%llX",
+        request->target_function, request->shellcode_address, request->dtb, request->spoof_return);
+    RC_DBG("handle7781: args: 0x%llX, 0x%llX, 0x%llX, 0x%llX",
+        request->arg1, request->arg2, request->arg3, request->arg4);
+    RC_DBG("handle7781: original_rip=0x%llX", request->original_rip);
+
     if (!call_guard::is_valid_code_ptr(request->target_function)) {
+        RC_ERR("handle7781: invalid target_function 0x%llX", request->target_function);
         return STATUS_INVALID_ADDRESS;
     }
 
     if (!call_guard::is_valid_dtb(request->dtb)) {
+        RC_ERR("handle7781: invalid dtb 0x%llX", request->dtb);
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->shellcode_address == 0) {
+        RC_ERR("handle7781: shellcode_address is 0");
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!call_guard::is_valid_user_range(request->shellcode_address)) {
+        RC_ERR("handle7781: shellcode_address 0x%llX out of user range", request->shellcode_address);
         return STATUS_INVALID_ADDRESS;
     }
 
@@ -403,35 +424,49 @@ NTSTATUS functions::handle7781(p_remote_call request) {
     SIZE_T sc_size = 0;
 
     if (request->spoof_return != 0 && call_guard::is_valid_code_ptr(request->spoof_return)) {
+        RC_DBG("handle7781: using JMP RBX spoofed call, gadget=0x%llX", request->spoof_return);
         sc_size = shellcode_builder::build_jmp_rbx_spoofed(shellcode, context_addr, request->spoof_return, epilogue_addr);
     } else {
+        RC_DBG("handle7781: using direct call");
         sc_size = shellcode_builder::build_direct_call(shellcode, context_addr, epilogue_addr);
     }
 
     if (sc_size == 0 || sc_size > sizeof(shellcode)) {
+        RC_ERR("handle7781: shellcode build failed, sc_size=%llu", (UINT64)sc_size);
         return STATUS_UNSUCCESSFUL;
     }
+
+    RC_DBG("handle7781: shellcode built, size=%llu bytes", (UINT64)sc_size);
 
     UINT8 epilogue[256];
     SIZE_T ep_size = shellcode_builder::build_epilogue_v2(epilogue, context_addr);
 
     if (ep_size == 0 || ep_size > sizeof(epilogue)) {
+        RC_ERR("handle7781: epilogue build failed, ep_size=%llu", (UINT64)ep_size);
         return STATUS_UNSUCCESSFUL;
     }
 
+    RC_DBG("handle7781: epilogue built, size=%llu bytes", (UINT64)ep_size);
+    RC_DBG("handle7781: layout base=0x%llX ctx=0x%llX code=0x%llX epi=0x%llX",
+        base_addr, context_addr, code_addr, epilogue_addr);
 
     SIZE_T bytes_written = 0;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
 
     UINT64 phys_ctx = strong::translate_virtual_address(dtb_clean, context_addr);
     if (!phys_ctx) {
+        RC_ERR("handle7781: translate context_addr 0x%llX failed", context_addr);
         return STATUS_INVALID_ADDRESS;
     }
 
     status = strong::write_physical((PVOID)phys_ctx, &ctx, sizeof(ctx), &bytes_written);
     if (!NT_SUCCESS(status) || bytes_written != sizeof(ctx)) {
+        RC_ERR("handle7781: write context failed st=0x%08X written=%llu/%llu",
+            status, (UINT64)bytes_written, (UINT64)sizeof(ctx));
         return STATUS_UNSUCCESSFUL;
     }
+
+    RC_DBG("handle7781: context written to phys=0x%llX (%llu bytes)", phys_ctx, (UINT64)bytes_written);
 
     SIZE_T remaining = sc_size;
     SIZE_T offset = 0;
@@ -441,6 +476,7 @@ NTSTATUS functions::handle7781(p_remote_call request) {
         UINT64 physical_addr = strong::translate_virtual_address(dtb_clean, current_va);
 
         if (!physical_addr) {
+            RC_ERR("handle7781: translate shellcode VA 0x%llX failed at offset=%llu", current_va, (UINT64)offset);
             return STATUS_INVALID_ADDRESS;
         }
 
@@ -457,12 +493,15 @@ NTSTATUS functions::handle7781(p_remote_call request) {
         );
 
         if (!NT_SUCCESS(status)) {
+            RC_ERR("handle7781: write shellcode failed st=0x%08X at VA=0x%llX phys=0x%llX", status, current_va, physical_addr);
             return status;
         }
 
         remaining -= written;
         offset += written;
     }
+
+    RC_DBG("handle7781: shellcode written to code_addr=0x%llX (%llu bytes)", code_addr, (UINT64)sc_size);
 
     remaining = ep_size;
     offset = 0;
@@ -472,6 +511,7 @@ NTSTATUS functions::handle7781(p_remote_call request) {
         UINT64 physical_addr = strong::translate_virtual_address(dtb_clean, current_va);
 
         if (!physical_addr) {
+            RC_ERR("handle7781: translate epilogue VA 0x%llX failed at offset=%llu", current_va, (UINT64)offset);
             return STATUS_INVALID_ADDRESS;
         }
 
@@ -488,6 +528,7 @@ NTSTATUS functions::handle7781(p_remote_call request) {
         );
 
         if (!NT_SUCCESS(status)) {
+            RC_ERR("handle7781: write epilogue failed st=0x%08X at VA=0x%llX phys=0x%llX", status, current_va, physical_addr);
             return status;
         }
 
@@ -495,31 +536,65 @@ NTSTATUS functions::handle7781(p_remote_call request) {
         offset += written;
     }
 
+    RC_DBG("handle7781: epilogue written to epilogue_addr=0x%llX (%llu bytes)", epilogue_addr, (UINT64)ep_size);
+
     KeMemoryBarrier();
     _mm_mfence();
+
+    /* Verify shellcode was written correctly by reading back first 16 bytes */
+    {
+        UINT64 verify_phys = strong::translate_virtual_address(dtb_clean, code_addr);
+        if (verify_phys) {
+            UINT8 verify_buf[16] = { 0 };
+            SIZE_T verify_read = 0;
+            NTSTATUS vst = strong::read_physical(verify_phys, verify_buf, sizeof(verify_buf), &verify_read);
+            if (NT_SUCCESS(vst) && verify_read >= 16) {
+                RC_DBG("handle7781: verify code[0..15]: %02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X",
+                    verify_buf[0], verify_buf[1], verify_buf[2], verify_buf[3],
+                    verify_buf[4], verify_buf[5], verify_buf[6], verify_buf[7],
+                    verify_buf[8], verify_buf[9], verify_buf[10], verify_buf[11],
+                    verify_buf[12], verify_buf[13], verify_buf[14], verify_buf[15]);
+                RC_DBG("handle7781: expected[0..15]:  %02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X",
+                    shellcode[0], shellcode[1], shellcode[2], shellcode[3],
+                    shellcode[4], shellcode[5], shellcode[6], shellcode[7],
+                    shellcode[8], shellcode[9], shellcode[10], shellcode[11],
+                    shellcode[12], shellcode[13], shellcode[14], shellcode[15]);
+            } else {
+                RC_ERR("handle7781: verify read-back failed st=0x%08X read=%llu", vst, (UINT64)verify_read);
+            }
+        } else {
+            RC_ERR("handle7781: verify translate code_addr 0x%llX failed", code_addr);
+        }
+    }
 
     request->shellcode_address = code_addr;
     request->result = 0;
     request->completed = 0;
 
+    RC_DBG("handle7781: SUCCESS -- entry=0x%llX ctx=0x%llX epi=0x%llX target=0x%llX",
+        code_addr, context_addr, epilogue_addr, request->target_function);
 
     return STATUS_SUCCESS;
 }
 
 NTSTATUS functions::handle7782(p_call_result request) {
     if (!request) {
+        RC_ERR("handle7782: null request");
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!call_guard::is_valid_dtb(request->dtb)) {
+        RC_ERR("handle7782: invalid dtb 0x%llX", request->dtb);
         return STATUS_INVALID_PARAMETER;
     }
 
     if (request->result_address == 0) {
+        RC_ERR("handle7782: result_address is 0");
         return STATUS_INVALID_PARAMETER;
     }
 
     if (!call_guard::is_valid_user_range(request->result_address)) {
+        RC_ERR("handle7782: result_address 0x%llX out of user range", request->result_address);
         return STATUS_INVALID_ADDRESS;
     }
 
@@ -527,6 +602,7 @@ NTSTATUS functions::handle7782(p_call_result request) {
     UINT64 physical_addr = strong::translate_virtual_address(dtb_clean, request->result_address);
 
     if (!physical_addr) {
+        RC_ERR("handle7782: translate result_address 0x%llX failed", request->result_address);
         return STATUS_INVALID_ADDRESS;
     }
 
@@ -543,6 +619,8 @@ NTSTATUS functions::handle7782(p_call_result request) {
     );
 
     if (!NT_SUCCESS(status) || bytes_read != sizeof(ctx)) {
+        RC_ERR("handle7782: read_physical failed st=0x%08X read=%llu/%llu",
+            status, (UINT64)bytes_read, (UINT64)sizeof(ctx));
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -555,7 +633,9 @@ NTSTATUS functions::handle7782(p_call_result request) {
     if (done_flag != 0) {
         request->result = ctx.ret_value;
         request->completed = 1;
+        RC_DBG("handle7782: DONE exec_done=0x%llX ret_value=0x%llX", (UINT64)done_flag, ctx.ret_value);
     } else {
+        /* polled frequently -- don't spam logs */
     }
 
     return STATUS_SUCCESS;

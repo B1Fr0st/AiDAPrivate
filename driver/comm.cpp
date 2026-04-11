@@ -1,4 +1,4 @@
-#include "comm.h"
+﻿#include "comm.h"
 #include <algorithm>
 #include <cctype>
 #include <cwchar>

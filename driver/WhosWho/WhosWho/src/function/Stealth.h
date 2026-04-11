@@ -236,6 +236,11 @@ namespace stealth {
             SIZE_T pageEnd = currentPage + pageSize - reinterpret_cast<ULONG_PTR>(data);
             if (pageEnd > size) pageEnd = size;
 
+            if (pageEnd < maskLen) {
+                i = pageEnd;
+                continue;
+            }
+
             for (; i <= pageEnd - maskLen && i <= size - maskLen; ++i) {
                 bool hit = true;
                 for (SIZE_T j = 0; j < maskLen; ++j) {
@@ -247,6 +252,10 @@ namespace stealth {
                 if (hit)
                     return const_cast<UCHAR*>(&data[i]);
             }
+
+
+            if (pageEnd < size && i < pageEnd)
+                i = pageEnd;
         }
         return nullptr;
     }

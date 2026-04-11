@@ -246,6 +246,7 @@ static VOID aida_store_cached_endpoint_pid(UINT64 endpoint_handle,
                                            UINT32 local_port,
                                            UINT32 pid);
 static __forceinline BOOLEAN aida_can_query_system_handles();
+static void afd_init_offsets();
 
 namespace net_capture {
     void NTAPI classify_inbound(
@@ -705,9 +706,6 @@ namespace net_capture {
         if (!g_dns_ring) return;
 
         UINT32 effective_pid = pid;
-        if (effective_pid == 0 && g_filter_pid != 0) {
-            return;
-        }
 
         KIRQL old_irql;
         KeAcquireSpinLock(&g_dns_lock, &old_irql);
@@ -1106,7 +1104,30 @@ namespace net_capture {
 
 
             if (protocol == 6 && pkt_len >= 20) {
-                net_fingerprint::analyze_tcp_syn(remote_ip, 2, pkt_data, pkt_len, 0);
+                UINT8 ip_ttl = 0;
+                if (layerData && inMetaValues->ipHeaderSize >= 20) {
+                    __try {
+                        PNET_BUFFER_LIST ttl_nbl = reinterpret_cast<PNET_BUFFER_LIST>(layerData);
+                        PNET_BUFFER ttl_nb = NET_BUFFER_LIST_FIRST_NB(ttl_nbl);
+                        if (ttl_nb) {
+                            PMDL curMdl = NET_BUFFER_CURRENT_MDL(ttl_nb);
+                            ULONG curOff = NET_BUFFER_CURRENT_MDL_OFFSET(ttl_nb);
+                            ULONG ipSz = inMetaValues->ipHeaderSize;
+                            if (curMdl && curOff >= ipSz) {
+                                PUCHAR mapped = reinterpret_cast<PUCHAR>(
+                                    MmGetSystemAddressForMdlSafe(curMdl, NormalPagePriority | MdlMappingNoExecute));
+                                if (mapped) {
+                                    ULONG ttlOff = curOff - ipSz + 8;
+                                    if (ttlOff < MmGetMdlByteCount(curMdl)) {
+                                        ip_ttl = mapped[ttlOff];
+                                    }
+                                }
+                            }
+                        }
+                    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                }
+                if (ip_ttl == 0) ip_ttl = 128;
+                net_fingerprint::analyze_tcp_syn(remote_ip, 2, pkt_data, pkt_len, ip_ttl);
             }
 
 
@@ -1380,7 +1401,7 @@ namespace net_capture {
             }
 
             if (protocol == 6 && pkt_len >= 20) {
-                net_fingerprint::analyze_tcp_syn(local_ip, 2, pkt_data, pkt_len, 0);
+                net_fingerprint::analyze_tcp_syn(local_ip, 2, pkt_data, pkt_len, 128);
             }
 
 
@@ -1501,18 +1522,23 @@ namespace net_capture {
 
 
     PVOID find_module_base(const char* module_name) {
+        NET_DBG("find_module_base: looking for '%s' IRQL=%u", module_name, (UINT32)KeGetCurrentIrql());
         ULONG required = 0;
+        NET_DBG("find_module_base: calling ZwQuerySystemInformation(size query)...");
         NTSTATUS status = ZwQuerySystemInformation(
             SystemModuleInformationInternal, nullptr, 0, &required);
+        NET_DBG("find_module_base: size query returned 0x%08x required=%lu", status, required);
         if (required == 0) return nullptr;
 
         required += sizeof(RTL_PROCESS_MODULE_INFORMATION) * 4;
         PRTL_PROCESS_MODULES mods = (PRTL_PROCESS_MODULES)
             ExAllocatePool2(POOL_FLAG_NON_PAGED, required, 'teNW');
-        if (!mods) return nullptr;
+        if (!mods) { NET_ERR("find_module_base: alloc failed size=%lu", required); return nullptr; }
 
+        NET_DBG("find_module_base: calling ZwQuerySystemInformation(full query size=%lu)...", required);
         status = ZwQuerySystemInformation(
             SystemModuleInformationInternal, mods, required, nullptr);
+        NET_DBG("find_module_base: full query returned 0x%08x modules=%lu", status, NT_SUCCESS(status) ? mods->NumberOfModules : 0);
         if (!NT_SUCCESS(status)) {
             ExFreePoolWithTag(mods, 'teNW');
             return nullptr;
@@ -1529,6 +1555,7 @@ namespace net_capture {
         }
 
         ExFreePoolWithTag(mods, 'teNW');
+        NET_DBG("find_module_base: '%s' => %p", module_name, base);
         return base;
     }
 
@@ -2022,6 +2049,12 @@ namespace net_capture {
         KeMemoryBarrier();
         _InterlockedExchange(&g_wfp_initialized, 2);
         NET_DBG("initialize: WFP fully initialized (state=2)");
+
+
+        NET_DBG("initialize: pre-resolving AFD offsets");
+        afd_init_offsets();
+        NET_DBG("initialize: AFD offsets resolved");
+
         return STATUS_SUCCESS;
     }
 
@@ -2067,78 +2100,47 @@ static NTSTATUS aida_query_system_handles(PAIDA_SYSTEM_HANDLE_INFORMATION* out_i
     *out_info = nullptr;
 
     if (!aida_can_query_system_handles()) {
+        NET_ERR("query_handles: blocked - not at PASSIVE_LEVEL");
         return STATUS_INVALID_DEVICE_STATE;
     }
 
     constexpr SYSTEM_INFORMATION_CLASS_INTERNAL system_handle_information_class =
         (SYSTEM_INFORMATION_CLASS_INTERNAL)16;
 
-    ULONG size = 0x10000;
-    for (UINT32 attempt = 0; attempt < 8; attempt++) {
+    NET_DBG("query_handles: ENTER initial_size=4MB");
+    ULONG size = 0x400000;
+    for (UINT32 attempt = 0; attempt < 4; attempt++) {
+        NET_DBG("query_handles: attempt %u alloc_size=%lu", attempt, size);
         PAIDA_SYSTEM_HANDLE_INFORMATION info = (PAIDA_SYSTEM_HANDLE_INFORMATION)
             ExAllocatePool2(POOL_FLAG_NON_PAGED, size, 'hANW');
         if (!info) {
+            NET_ERR("query_handles: alloc FAILED size=%lu", size);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
         ULONG required = 0;
+        NET_DBG("query_handles: calling ZwQuerySystemInformation...");
         NTSTATUS status = ZwQuerySystemInformation(system_handle_information_class, info, size, &required);
+        NET_DBG("query_handles: ZwQuery returned 0x%08x required=%lu", status, required);
         if (NT_SUCCESS(status)) {
+            NET_DBG("query_handles: SUCCESS handle_count=%lu", info->NumberOfHandles);
             *out_info = info;
             return STATUS_SUCCESS;
         }
 
         ExFreePoolWithTag(info, 'hANW');
         if (status != STATUS_INFO_LENGTH_MISMATCH && status != STATUS_BUFFER_TOO_SMALL) {
+            NET_ERR("query_handles: unexpected status 0x%08x", status);
             return status;
         }
 
         size = (required > size) ? (required + 0x4000) : (size << 1);
     }
 
+    NET_ERR("query_handles: exhausted 4 attempts");
     return STATUS_INSUFFICIENT_RESOURCES;
 }
 
-
-static BOOLEAN safe_reference_file_object_by_handle(USHORT pid, USHORT handle_value,
-                                                    PFILE_OBJECT* out_fo) {
-    if (!out_fo)
-        return FALSE;
-    *out_fo = nullptr;
-
-    if (pid == 0 || handle_value == 0)
-        return FALSE;
-
-    if (!_IoFileObjectType || !*_IoFileObjectType)
-        return FALSE;
-
-    PEPROCESS process = nullptr;
-    NTSTATUS status = PsLookupProcessByProcessId(
-        reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid)), &process);
-    if (!NT_SUCCESS(status) || !process)
-        return FALSE;
-
-    KAPC_STATE apc_state = {};
-    KeStackAttachProcess(process, &apc_state);
-
-    PVOID file_obj = nullptr;
-    status = ObReferenceObjectByHandle(
-        reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(handle_value)),
-        0,
-        *_IoFileObjectType,
-        KernelMode,
-        &file_obj,
-        nullptr);
-
-    KeUnstackDetachProcess(&apc_state);
-    ObDereferenceObject(process);
-
-    if (!NT_SUCCESS(status) || !file_obj)
-        return FALSE;
-
-    *out_fo = static_cast<PFILE_OBJECT>(file_obj);
-    return TRUE;
-}
 
 static BOOLEAN aida_is_afd_file_object(PFILE_OBJECT fileObj) {
     if (!fileObj)
@@ -2214,39 +2216,87 @@ static volatile LONG g_afd_offsets_state = 0;
 
 
 static BOOLEAN afd_resolve_offsets_by_scan() {
+    NET_DBG("afd_resolve: ENTER");
     PVOID afd_base = net_capture::find_module_base("afd.sys");
+    NET_DBG("afd_resolve: find_module_base('afd.sys') => %p", afd_base);
     if (!afd_base) afd_base = net_capture::find_module_base("afd.SYS");
     if (!afd_base) {
         NET_ERR("afd_resolve: afd.sys not found in module list");
         return FALSE;
     }
 
-    static const UCHAR pat_a[] = {
+    NET_DBG("afd_resolve: afd_base=%p, starting pattern scan", afd_base);
+
+
+    static const UCHAR pat_w11_a[] = {
         0x48, 0x89, 0x97, 0x00, 0x00, 0x00, 0x00,
         0x44, 0x89, 0xA7, 0x00, 0x00, 0x00, 0x00
     };
-    static const char mask_a[] = "xxx??xxxxx??xx";
-
-    static const UCHAR pat_b[] = {
+    static const UCHAR pat_w11_b[] = {
         0x44, 0x89, 0xA7, 0x00, 0x00, 0x00, 0x00,
         0x48, 0x89, 0x97, 0x00, 0x00, 0x00, 0x00
     };
+
+    static const UCHAR pat_w10_a[] = {
+        0x4C, 0x89, 0xBF, 0x00, 0x00, 0x00, 0x00,
+        0x44, 0x89, 0xA7, 0x00, 0x00, 0x00, 0x00
+    };
+    static const UCHAR pat_w10_b[] = {
+        0x44, 0x89, 0xA7, 0x00, 0x00, 0x00, 0x00,
+        0x4C, 0x89, 0xBF, 0x00, 0x00, 0x00, 0x00
+    };
+    static const char mask_a[] = "xxx??xxxxx??xx";
     static const char mask_b[] = "xxx??xxxxx??xx";
 
     ULONG local_addr_size = 0;
     ULONG local_addr_ptr  = 0;
+    PVOID match = nullptr;
+    BOOLEAN reversed = FALSE;
 
-    PVOID match = stealth::FindPatternInAllSections(afd_base, pat_a, mask_a);
+
+    BOOLEAN is_win11 = stealth::IsWindows11();
+
+    if (is_win11) {
+        NET_DBG("afd_resolve: Win11 detected, scanning Win11 patterns first...");
+        match = stealth::FindPatternInAllSections(afd_base, pat_w11_a, mask_a);
+        NET_DBG("afd_resolve: Win11 pattern A result=%p", match);
+        if (!match) {
+            match = stealth::FindPatternInAllSections(afd_base, pat_w11_b, mask_b);
+            NET_DBG("afd_resolve: Win11 pattern B result=%p", match);
+            reversed = (match != nullptr);
+        }
+    }
+
+    if (!match) {
+        NET_DBG("afd_resolve: scanning Win10 patterns...");
+        match = stealth::FindPatternInAllSections(afd_base, pat_w10_a, mask_a);
+        NET_DBG("afd_resolve: Win10 pattern A result=%p", match);
+        if (!match) {
+            match = stealth::FindPatternInAllSections(afd_base, pat_w10_b, mask_b);
+            NET_DBG("afd_resolve: Win10 pattern B result=%p", match);
+            reversed = (match != nullptr);
+        }
+    }
+
+    if (!match && !is_win11) {
+        NET_DBG("afd_resolve: scanning Win11 patterns as fallback...");
+        match = stealth::FindPatternInAllSections(afd_base, pat_w11_a, mask_a);
+        NET_DBG("afd_resolve: Win11 pattern A fallback result=%p", match);
+        if (!match) {
+            match = stealth::FindPatternInAllSections(afd_base, pat_w11_b, mask_b);
+            NET_DBG("afd_resolve: Win11 pattern B fallback result=%p", match);
+            reversed = (match != nullptr);
+        }
+    }
+
     if (match) {
         UCHAR* p = static_cast<UCHAR*>(match);
-        local_addr_ptr  = *reinterpret_cast<ULONG*>(p + 3);
-        local_addr_size = *reinterpret_cast<ULONG*>(p + 10);
-    } else {
-        match = stealth::FindPatternInAllSections(afd_base, pat_b, mask_b);
-        if (match) {
-            UCHAR* p = static_cast<UCHAR*>(match);
+        if (reversed) {
             local_addr_size = *reinterpret_cast<ULONG*>(p + 3);
             local_addr_ptr  = *reinterpret_cast<ULONG*>(p + 10);
+        } else {
+            local_addr_ptr  = *reinterpret_cast<ULONG*>(p + 3);
+            local_addr_size = *reinterpret_cast<ULONG*>(p + 10);
         }
     }
 
@@ -2278,10 +2328,18 @@ static BOOLEAN afd_resolve_offsets_by_scan() {
 }
 
 static void afd_init_offsets() {
+    NET_DBG("afd_init_offsets: ENTER state=%ld", g_afd_offsets_state);
     LONG prev = _InterlockedCompareExchange(&g_afd_offsets_state, 1, 0);
-    if (prev == 2) return;
+    if (prev == 2) { NET_DBG("afd_init_offsets: already done"); return; }
     if (prev == 1) {
-        while (g_afd_offsets_state != 2) YieldProcessor();
+        NET_DBG("afd_init_offsets: another thread initializing, waiting...");
+        volatile UINT32 spin = 0;
+        while (g_afd_offsets_state != 2 && spin < 100000) { YieldProcessor(); spin++; }
+        if (g_afd_offsets_state != 2) {
+            NET_ERR("afd_init_offsets: SPIN TIMEOUT after 100K iterations, state=%ld", g_afd_offsets_state);
+        } else {
+            NET_DBG("afd_init_offsets: wait done after %u spins", spin);
+        }
         return;
     }
 
@@ -2306,9 +2364,44 @@ static __forceinline const afd_endpoint_offsets_t& afd_get_offsets() {
 static BOOLEAN aida_parse_transport_address(const UINT8* ta_buf, UINT32 ta_size,
                                             UINT32* out_af, UINT32* out_port, UINT8* out_addr) {
     if (!ta_buf || !out_af || !out_port || !out_addr) return FALSE;
-    if (ta_size < 10) return FALSE;
+    if (ta_size < 4) return FALSE;
 
-    if (!_MmIsAddressValid((PVOID)ta_buf) || !_MmIsAddressValid((PVOID)(ta_buf + 9)))
+    if (!_MmIsAddressValid((PVOID)ta_buf) || !_MmIsAddressValid((PVOID)(ta_buf + 3)))
+        return FALSE;
+
+    strong::kmemset(out_addr, 0, 16);
+
+    // Detect raw SOCKADDR_IN (16 bytes) or SOCKADDR_IN6 (28 bytes).
+    // AFD stores the bound address as a raw SOCKADDR when ta_size matches exactly.
+    // A TDI TRANSPORT_ADDRESS for IPv4 needs >= 22 bytes, so 16 is unambiguous.
+    USHORT sa_family = *(const USHORT*)(ta_buf + 0);
+
+    if (sa_family == AF_INET && ta_size >= 8 && ta_size <= 16) {
+        if (!_MmIsAddressValid((PVOID)(ta_buf + 7)))
+            return FALSE;
+        USHORT port_be = *(const USHORT*)(ta_buf + 2);
+        UINT32 port_he = ((port_be >> 8) & 0xFFu) | ((port_be & 0xFFu) << 8);
+        if (ta_size >= 8 && _MmIsAddressValid((PVOID)(ta_buf + 7)))
+            strong::kmemcpy(out_addr, ta_buf + 4, 4);
+        *out_af = AF_INET;
+        *out_port = port_he;
+        return TRUE;
+    }
+
+    if (sa_family == AF_INET6 && ta_size >= 8 && ta_size <= 28) {
+        if (!_MmIsAddressValid((PVOID)(ta_buf + 7)))
+            return FALSE;
+        USHORT port_be = *(const USHORT*)(ta_buf + 2);
+        UINT32 port_he = ((port_be >> 8) & 0xFFu) | ((port_be & 0xFFu) << 8);
+        if (ta_size >= 24 && _MmIsAddressValid((PVOID)(ta_buf + 23)))
+            strong::kmemcpy(out_addr, ta_buf + 8, 16);
+        *out_af = AF_INET6;
+        *out_port = port_he;
+        return TRUE;
+    }
+
+    // Fall through to TDI TRANSPORT_ADDRESS format (AddressCount at +0, AddressType at +6)
+    if (ta_size < 10 || !_MmIsAddressValid((PVOID)(ta_buf + 9)))
         return FALSE;
 
     LONG addr_count = *(const LONG*)(ta_buf + 0);
@@ -2317,8 +2410,6 @@ static BOOLEAN aida_parse_transport_address(const UINT8* ta_buf, UINT32 ta_size,
     USHORT addr_type = *(const USHORT*)(ta_buf + 6);
     USHORT port_be   = *(const USHORT*)(ta_buf + 8);
     UINT32 port_he   = ((port_be >> 8) & 0xFFu) | ((port_be & 0xFFu) << 8);
-
-    strong::kmemset(out_addr, 0, 16);
 
     if (addr_type == AF_INET) {
         if (ta_size < 14 || !_MmIsAddressValid((PVOID)(ta_buf + 13)))
@@ -2370,11 +2461,21 @@ static BOOLEAN aida_extract_socket_info_from_fo(PFILE_OBJECT fo, SOCKET_HANDLE_E
 
         if (_MmIsAddressValid(ep + offsets.transport_info + sizeof(PVOID) - 1)) {
             UINT8* transport_info = *(UINT8**)(ep + offsets.transport_info);
+            NET_DBG("socket_extract: ep=0x%llx ti_offset=0x%x ti_ptr=0x%llx",
+                    (UINT64)ep, offsets.transport_info, (UINT64)transport_info);
             if (transport_info && _MmIsAddressValid(transport_info) &&
                 _MmIsAddressValid(transport_info + 0x1D)) {
-                out->address_family = *(UINT16*)(transport_info + 0x16);
-                DWORD proto = *(DWORD*)(transport_info + 0x18);
-                out->protocol = (proto <= 256) ? proto : 0;
+                UINT16 raw_af = *(UINT16*)(transport_info + 0x16);
+                if (raw_af == 0 && _MmIsAddressValid(transport_info + 0x17)) {
+                    DWORD dw_af = *(DWORD*)(transport_info + 0x14);
+                    if (dw_af == AF_INET || dw_af == AF_INET6)
+                        raw_af = static_cast<UINT16>(dw_af);
+                }
+                DWORD raw_proto = *(DWORD*)(transport_info + 0x18);
+                NET_DBG("socket_extract: ti raw af=%u proto=%u (at ti+0x16, ti+0x18)",
+                        raw_af, raw_proto);
+                out->address_family = raw_af;
+                out->protocol = (raw_proto <= 256) ? raw_proto : 0;
             }
         }
 
@@ -2393,6 +2494,8 @@ static BOOLEAN aida_extract_socket_info_from_fo(PFILE_OBJECT fo, SOCKET_HANDLE_E
         if (_MmIsAddressValid(ep + offsets.local_addr_size + 3) && _MmIsAddressValid(ep + offsets.local_addr_ptr + sizeof(PVOID) - 1)) {
             UINT32 ta_size = *(UINT32*)(ep + offsets.local_addr_size);
             UINT8* ta_ptr  = *(UINT8**)(ep + offsets.local_addr_ptr);
+            NET_DBG("socket_extract: la_size_off=0x%x la_ptr_off=0x%x ta_size=%u ta_ptr=0x%llx",
+                    offsets.local_addr_size, offsets.local_addr_ptr, ta_size, (UINT64)ta_ptr);
             if (ta_ptr && ta_size >= 10 && ta_size <= 256 && _MmIsAddressValid(ta_ptr)) {
                 UINT32 local_af = 0, local_port = 0;
                 UINT8 local_addr[16] = {};
@@ -2429,25 +2532,6 @@ static BOOLEAN aida_extract_socket_info_from_fo(PFILE_OBJECT fo, SOCKET_HANDLE_E
 }
 
 
-static BOOLEAN aida_safe_get_afd_socket_info(USHORT pid, USHORT handle_value,
-                                             SOCKET_HANDLE_ENTRY* out) {
-    if (!out || pid == 0 || handle_value == 0)
-        return FALSE;
-
-    PFILE_OBJECT fo = nullptr;
-    if (!safe_reference_file_object_by_handle(pid, handle_value, &fo))
-        return FALSE;
-
-    if (!aida_is_afd_file_object(fo)) {
-        ObDereferenceObject(fo);
-        return FALSE;
-    }
-
-    BOOLEAN result = aida_extract_socket_info_from_fo(fo, out);
-    ObDereferenceObject(fo);
-    return result;
-}
-
 typedef struct _AIDA_ENDPOINT_PID_CACHE_ENTRY {
     volatile LONG active;
     UINT64 endpoint_handle;
@@ -2478,25 +2562,11 @@ static VOID aida_ensure_endpoint_pid_cache_init() {
         return;
     }
 
-    while (_InterlockedCompareExchange(&g_endpoint_pid_cache_lock_state, 2, 2) != 2) {
+    for (UINT32 spin = 0; spin < 100000; spin++) {
+        if (_InterlockedCompareExchange(&g_endpoint_pid_cache_lock_state, 2, 2) == 2)
+            return;
         YieldProcessor();
     }
-}
-
-static BOOLEAN aida_socket_matches_ports(const SOCKET_HANDLE_ENTRY* socket_info,
-                                         UINT32 protocol,
-                                         UINT32 local_port,
-                                         UINT32 remote_port) {
-    if (!socket_info) return FALSE;
-    if (protocol != 0 && socket_info->protocol != 0 && socket_info->protocol != protocol)
-        return FALSE;
-    if (local_port != 0 && socket_info->local_port != local_port && socket_info->remote_port != local_port)
-        return FALSE;
-    if (remote_port != 0 && socket_info->remote_port != 0 &&
-        socket_info->local_port != remote_port && socket_info->remote_port != remote_port) {
-        return FALSE;
-    }
-    return TRUE;
 }
 
 static UINT32 aida_lookup_cached_endpoint_pid(UINT64 endpoint_handle,
@@ -2652,7 +2722,7 @@ static NTSTATUS aida_refresh_pid_cache_for_process(UINT32 target_pid,
         return status;
 
 
-    constexpr UINT32 MAX_PID_HANDLES = 4096;
+    constexpr UINT32 MAX_PID_HANDLES = 1024;
     USHORT* pid_handles = static_cast<USHORT*>(
         ExAllocatePool2(POOL_FLAG_NON_PAGED, MAX_PID_HANDLES * sizeof(USHORT), 'pcNW'));
     if (!pid_handles) {
@@ -2682,6 +2752,9 @@ static NTSTATUS aida_refresh_pid_cache_for_process(UINT32 target_pid,
         ExFreePoolWithTag(pid_handles, 'pcNW');
         return status;
     }
+
+
+    (void)afd_get_offsets();
 
     UINT32 cached = 0;
     KAPC_STATE apc_state = {};
@@ -2738,7 +2811,7 @@ static volatile LONG64 g_last_handle_enum_tsc = 0;
 static constexpr ULONG HANDLE_ENUM_MAX_ITER = 50000;
 
 
-static constexpr LONG64 HANDLE_ENUM_COOLDOWN_TSC = 5000000000LL;
+static constexpr LONG64 HANDLE_ENUM_COOLDOWN_TSC = 500000000LL;
 
 static __forceinline BOOLEAN aida_can_query_system_handles() {
     KIRQL irql = KeGetCurrentIrql();
@@ -2787,12 +2860,24 @@ namespace net_enum {
 
 
     typedef NTSTATUS(NTAPI* fn_NsiEnumerateObjectsAllParameters)(
-        UINT64 NsiHandle, UINT32 Nsi0, const PVOID NsiModule,
+        UINT32 NsiQueryMode, UINT32 NsiStore, const PVOID NsiModule,
         UINT32 NsiType, PVOID KeyData, UINT32 KeySize,
         PVOID RwParamData, UINT32 RwParamSize,
         PVOID DynParamData, UINT32 DynParamSize,
         PVOID StaticParamData, UINT32 StaticParamSize,
         PUINT32 Count);
+
+    // NsiStore values validated by NsiEnumerateObjectsAllParametersEx:
+    //   (NsiStore - 1) must be <= 1, so only 1 or 2 are accepted.
+    //   1 = NsiActive  (runtime connection table)
+    //   2 = NsiBoth    (runtime + persistent/configured)
+    inline constexpr UINT32 NSI_STORE_ACTIVE = 1;
+
+    // NsiQueryMode (first param) selects the query path inside
+    // NsiEnumerateObjectsAllParametersEx:
+    //   0 = NsipEnumeratePersistentData  (persistent/configured objects)
+    //   1 = NMP provider lookup           (runtime/active connections)
+    inline constexpr UINT32 NSI_QUERY_RUNTIME = 1;
 
     inline fn_NsiEnumerateObjectsAllParameters _NsiEnumerate = nullptr;
     inline volatile LONG g_nsi_resolved = 0;
@@ -2815,30 +2900,40 @@ namespace net_enum {
 
 
     #pragma pack(push, 1)
+    typedef struct _NSI_SOCKADDR_IN6 {
+        UINT16 family;
+        UINT16 port_be;
+        UINT32 flowinfo;
+        UINT8  addr[16];
+        UINT32 scope_id;
+    } NSI_SOCKADDR_IN6;
+
     typedef struct _NSI_TCP_KEY {
-        UINT8  local_addr[16];
-        UINT32 local_port;
-        UINT8  remote_addr[16];
-        UINT32 remote_port;
+        NSI_SOCKADDR_IN6 local;
+        NSI_SOCKADDR_IN6 remote;
     } NSI_TCP_KEY;
 
     typedef struct _NSI_TCP_DYNAMIC {
         UINT32 state;
+        UINT8  _pad[44];
     } NSI_TCP_DYNAMIC;
 
     typedef struct _NSI_TCP_STATIC {
-        UINT32 pid;
-        UINT64 create_time;
+        UINT8  _pad0[12];       // reserved (zero on Win10 22H2)
+        UINT32 mod_pid;          // owning PID at offset 12
+        UINT64 create_time;      // FILETIME at offset 16
+        UINT8  _pad1[8];        // reserved
     } NSI_TCP_STATIC;
 
     typedef struct _NSI_UDP_KEY {
-        UINT8  local_addr[16];
-        UINT32 local_port;
+        NSI_SOCKADDR_IN6 local;
     } NSI_UDP_KEY;
 
     typedef struct _NSI_UDP_STATIC {
-        UINT32 pid;
-        UINT64 create_time;
+        UINT32 mod_pid;          // owning PID at offset 0
+        UINT32 _pad0;            // reserved
+        UINT64 create_time;      // FILETIME at offset 8
+        UINT8  _pad1[16];       // reserved
     } NSI_UDP_STATIC;
     #pragma pack(pop)
 
@@ -2849,8 +2944,11 @@ namespace net_enum {
             return _NsiEnumerate != nullptr;
         }
         if (prev == 1) {
-            while (_InterlockedCompareExchange(&g_nsi_resolved, 0, 0) == 1)
+            for (UINT32 spin = 0; spin < 100000; spin++) {
+                if (_InterlockedCompareExchange(&g_nsi_resolved, 0, 0) != 1)
+                    break;
                 YieldProcessor();
+            }
             return _NsiEnumerate != nullptr;
         }
 
@@ -2960,150 +3058,186 @@ namespace net_enum {
             return STATUS_NOT_SUPPORTED;
         }
 
+        NET_DBG("enumerate_connections: NSI struct sizes KEY=%u DYN=%u STA=%u",
+            (UINT32)sizeof(NSI_TCP_KEY), (UINT32)sizeof(NSI_TCP_DYNAMIC), (UINT32)sizeof(NSI_TCP_STATIC));
 
+
+        // WHY: netio!NsipValidateEnumerateObjectsAllParametersRequest rejects
+        // nullptr buffers when the corresponding element size is non-zero,
+        // returning STATUS_INVALID_PARAMETER (0xC000000D). The old two-phase
+        // "count query then data query" pattern always failed at the count
+        // step because it passed nullptr + sizeof(struct). Fix: allocate
+        // real buffers up front for an estimated 512 entries, call once,
+        // and retry with a larger buffer if the table grew.
         {
+            UINT32 tcp_capacity = 4096;
             UINT32 tcp_count = 0;
+            NTSTATUS st = STATUS_UNSUCCESSFUL;
+            UINT8* buf = nullptr;
+            NSI_TCP_KEY*     keys = nullptr;
+            NSI_TCP_DYNAMIC* dyns = nullptr;
+            NSI_TCP_STATIC*  stats = nullptr;
 
-            NTSTATUS st = _NsiEnumerate(
-                0, 0, (PVOID)NPI_MS_TCP_MODULEID,
-                3,
-                nullptr, sizeof(NSI_TCP_KEY),
-                nullptr, 0,
-                nullptr, sizeof(NSI_TCP_DYNAMIC),
-                nullptr, sizeof(NSI_TCP_STATIC),
-                &tcp_count);
-
-            if (tcp_count > 0 && (st == STATUS_SUCCESS || st == STATUS_BUFFER_OVERFLOW ||
-                st == STATUS_BUFFER_TOO_SMALL || st == (NTSTATUS)0xC0000023 )) {
-                if (tcp_count > 8192) tcp_count = 8192;
-                ULONG key_sz = tcp_count * sizeof(NSI_TCP_KEY);
-                ULONG dyn_sz = tcp_count * sizeof(NSI_TCP_DYNAMIC);
-                ULONG sta_sz = tcp_count * sizeof(NSI_TCP_STATIC);
+            for (UINT32 attempt = 0; attempt < 8; attempt++) {
+                tcp_count = tcp_capacity;
+                ULONG key_sz = tcp_capacity * sizeof(NSI_TCP_KEY);
+                ULONG dyn_sz = tcp_capacity * sizeof(NSI_TCP_DYNAMIC);
+                ULONG sta_sz = tcp_capacity * sizeof(NSI_TCP_STATIC);
                 ULONG total  = key_sz + dyn_sz + sta_sz;
 
-                UINT8* buf = (UINT8*)ExAllocatePool2(POOL_FLAG_NON_PAGED, total, 'nsNW');
-                if (buf) {
-                    NSI_TCP_KEY*     keys = (NSI_TCP_KEY*)buf;
-                    NSI_TCP_DYNAMIC* dyns = (NSI_TCP_DYNAMIC*)(buf + key_sz);
-                    NSI_TCP_STATIC*  stats = (NSI_TCP_STATIC*)(buf + key_sz + dyn_sz);
+                buf = static_cast<UINT8*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, total, 'nsNW'));
+                if (!buf) break;
 
-                    st = _NsiEnumerate(
-                        0, 0, (PVOID)NPI_MS_TCP_MODULEID,
-                        3, keys, sizeof(NSI_TCP_KEY),
-                        nullptr, 0,
-                        dyns, sizeof(NSI_TCP_DYNAMIC),
-                        stats, sizeof(NSI_TCP_STATIC),
-                        &tcp_count);
+                keys  = reinterpret_cast<NSI_TCP_KEY*>(buf);
+                dyns  = reinterpret_cast<NSI_TCP_DYNAMIC*>(buf + key_sz);
+                stats = reinterpret_cast<NSI_TCP_STATIC*>(buf + key_sz + dyn_sz);
 
-                    if (NT_SUCCESS(st)) {
-                        for (UINT32 i = 0; i < tcp_count && request->connection_count < MAX_NET_CONNECTIONS; i++) {
-                            UINT32 pid = stats[i].pid;
-                            if (request->filter_pid != 0 && pid != request->filter_pid)
-                                continue;
-                            if (request->filter_protocol != 0 && request->filter_protocol != 6)
-                                continue;
+                st = _NsiEnumerate(
+                    NSI_QUERY_RUNTIME, NSI_STORE_ACTIVE, (PVOID)NPI_MS_TCP_MODULEID,
+                    3, keys, sizeof(NSI_TCP_KEY),
+                    nullptr, 0,
+                    dyns, sizeof(NSI_TCP_DYNAMIC),
+                    stats, sizeof(NSI_TCP_STATIC),
+                    &tcp_count);
 
-                            NET_CONN_ENTRY* out = &request->entries[request->connection_count];
-                            strong::kmemset(out, 0, sizeof(NET_CONN_ENTRY));
-                            out->pid = pid;
-                            out->protocol = 6;
-                            out->state = nsi_tcp_state_to_mib(dyns[i].state);
-                            out->address_family = AF_INET;
+                NET_DBG("enumerate_connections: TCP direct [cap=%u] st=0x%08x count=%u",
+                        tcp_capacity, st, tcp_count);
 
+                if (NT_SUCCESS(st)) break;
 
-                            out->local_port  = ((keys[i].local_port >> 8) & 0xFF) | ((keys[i].local_port & 0xFF) << 8);
-                            out->remote_port = ((keys[i].remote_port >> 8) & 0xFF) | ((keys[i].remote_port & 0xFF) << 8);
-
-
-                            strong::kmemcpy(out->local_addr, keys[i].local_addr, 4);
-                            strong::kmemcpy(out->remote_addr, keys[i].remote_addr, 4);
-
-                            fill_process_path(out, pid);
-                            request->connection_count++;
-                        }
-                    } else {
-                        NET_ERR("enumerate_connections: NSI TCP4 enum failed 0x%08x", st);
+                if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL ||
+                    st == static_cast<NTSTATUS>(0xC0000023)) {
+                    UINT32 next = (tcp_count > tcp_capacity) ? tcp_count + 64 : tcp_capacity * 2;
+                    if (next > 65536) next = 65536;
+                    if (attempt == 7 || next == tcp_capacity) {
+                        NET_ERR("enumerate_connections: TCP exhausted retries at cap=%u", tcp_capacity);
+                        ExFreePoolWithTag(buf, 'nsNW');
+                        buf = nullptr;
+                        break;
                     }
                     ExFreePoolWithTag(buf, 'nsNW');
+                    buf = nullptr;
+                    tcp_capacity = next;
+                    continue;
                 }
+                ExFreePoolWithTag(buf, 'nsNW');
+                buf = nullptr;
+                break;  // Unrecoverable error
             }
+
+            if (buf && NT_SUCCESS(st) && tcp_count > 0) {
+                for (UINT32 i = 0; i < tcp_count && request->connection_count < MAX_NET_CONNECTIONS; i++) {
+                    UINT32 pid = static_cast<UINT32>(stats[i].mod_pid);
+                    if (request->filter_pid != 0 && pid != request->filter_pid)
+                        continue;
+                    if (request->filter_protocol != 0 && request->filter_protocol != 6)
+                        continue;
+
+                    NET_CONN_ENTRY* out = &request->entries[request->connection_count];
+                    strong::kmemset(out, 0, sizeof(NET_CONN_ENTRY));
+                    out->pid = pid;
+                    out->protocol = 6;
+                    out->state = nsi_tcp_state_to_mib(dyns[i].state);
+                    out->address_family = AF_INET;
+
+                    out->local_port  = ((keys[i].local.port_be >> 8) & 0xFF) | ((keys[i].local.port_be & 0xFF) << 8);
+                    out->remote_port = ((keys[i].remote.port_be >> 8) & 0xFF) | ((keys[i].remote.port_be & 0xFF) << 8);
+
+                    strong::kmemcpy(out->local_addr, keys[i].local.addr, 4);
+                    strong::kmemcpy(out->remote_addr, keys[i].remote.addr, 4);
+
+                    fill_process_path(out, pid);
+                    request->connection_count++;
+                }
+            } else if (buf) {
+                NET_ERR("enumerate_connections: NSI TCP4 enum failed 0x%08x", st);
+            }
+            if (buf) ExFreePoolWithTag(buf, 'nsNW');
         }
 
 
+        // WHY: Same nullptr+size rejection bug as TCP. Direct enumeration
+        // with pre-allocated buffers, retry on overflow.
         {
-            UINT32 tcp6_count = 0;
-            NTSTATUS st = _NsiEnumerate(
-                0, 0, (PVOID)NPI_MS_TCP_MODULEID,
-                3, nullptr, sizeof(NSI_TCP_KEY),
-                nullptr, 0,
-                nullptr, sizeof(NSI_TCP_DYNAMIC),
-                nullptr, sizeof(NSI_TCP_STATIC),
-                &tcp6_count);
-
-
-        }
-
-
-        {
+            UINT32 udp_capacity = 4096;
             UINT32 udp_count = 0;
-            NTSTATUS st = _NsiEnumerate(
-                0, 0, (PVOID)NPI_MS_UDP_MODULEID,
-                1,
-                nullptr, sizeof(NSI_UDP_KEY),
-                nullptr, 0,
-                nullptr, 0,
-                nullptr, sizeof(NSI_UDP_STATIC),
-                &udp_count);
+            NTSTATUS st = STATUS_UNSUCCESSFUL;
+            UINT8* buf = nullptr;
+            NSI_UDP_KEY*    keys  = nullptr;
+            NSI_UDP_STATIC* stats = nullptr;
 
-            if (udp_count > 0 && (st == STATUS_SUCCESS || st == STATUS_BUFFER_OVERFLOW ||
-                st == STATUS_BUFFER_TOO_SMALL || st == (NTSTATUS)0xC0000023)) {
-                if (udp_count > 8192) udp_count = 8192;
-                ULONG key_sz = udp_count * sizeof(NSI_UDP_KEY);
-                ULONG sta_sz = udp_count * sizeof(NSI_UDP_STATIC);
+            for (UINT32 attempt = 0; attempt < 8; attempt++) {
+                udp_count = udp_capacity;
+                ULONG key_sz = udp_capacity * sizeof(NSI_UDP_KEY);
+                ULONG sta_sz = udp_capacity * sizeof(NSI_UDP_STATIC);
                 ULONG total  = key_sz + sta_sz;
 
-                UINT8* buf = (UINT8*)ExAllocatePool2(POOL_FLAG_NON_PAGED, total, 'nsNW');
-                if (buf) {
-                    NSI_UDP_KEY*    keys  = (NSI_UDP_KEY*)buf;
-                    NSI_UDP_STATIC* stats = (NSI_UDP_STATIC*)(buf + key_sz);
+                buf = static_cast<UINT8*>(ExAllocatePool2(POOL_FLAG_NON_PAGED, total, 'nsNW'));
+                if (!buf) break;
 
-                    st = _NsiEnumerate(
-                        0, 0, (PVOID)NPI_MS_UDP_MODULEID,
-                        1, keys, sizeof(NSI_UDP_KEY),
-                        nullptr, 0,
-                        nullptr, 0,
-                        stats, sizeof(NSI_UDP_STATIC),
-                        &udp_count);
+                keys  = reinterpret_cast<NSI_UDP_KEY*>(buf);
+                stats = reinterpret_cast<NSI_UDP_STATIC*>(buf + key_sz);
 
-                    if (NT_SUCCESS(st)) {
-                        for (UINT32 i = 0; i < udp_count && request->connection_count < MAX_NET_CONNECTIONS; i++) {
-                            UINT32 pid = stats[i].pid;
-                            if (request->filter_pid != 0 && pid != request->filter_pid)
-                                continue;
-                            if (request->filter_protocol != 0 && request->filter_protocol != 17)
-                                continue;
+                st = _NsiEnumerate(
+                    NSI_QUERY_RUNTIME, NSI_STORE_ACTIVE, (PVOID)NPI_MS_UDP_MODULEID,
+                    1, keys, sizeof(NSI_UDP_KEY),
+                    nullptr, 0,
+                    nullptr, 0,
+                    stats, sizeof(NSI_UDP_STATIC),
+                    &udp_count);
 
-                            NET_CONN_ENTRY* out = &request->entries[request->connection_count];
-                            strong::kmemset(out, 0, sizeof(NET_CONN_ENTRY));
-                            out->pid = pid;
-                            out->protocol = 17;
-                            out->state = 0;
-                            out->address_family = AF_INET;
+                NET_DBG("enumerate_connections: UDP direct [cap=%u] st=0x%08x count=%u",
+                        udp_capacity, st, udp_count);
 
-                            out->local_port = ((keys[i].local_port >> 8) & 0xFF) | ((keys[i].local_port & 0xFF) << 8);
-                            out->remote_port = 0;
+                if (NT_SUCCESS(st)) break;
 
-                            strong::kmemcpy(out->local_addr, keys[i].local_addr, 4);
-
-                            fill_process_path(out, pid);
-                            request->connection_count++;
-                        }
-                    } else {
-                        NET_ERR("enumerate_connections: NSI UDP enum failed 0x%08x", st);
+                if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL ||
+                    st == static_cast<NTSTATUS>(0xC0000023)) {
+                    UINT32 next = (udp_count > udp_capacity) ? udp_count + 64 : udp_capacity * 2;
+                    if (next > 65536) next = 65536;
+                    if (attempt == 7 || next == udp_capacity) {
+                        NET_ERR("enumerate_connections: UDP exhausted retries at cap=%u", udp_capacity);
+                        ExFreePoolWithTag(buf, 'nsNW');
+                        buf = nullptr;
+                        break;
                     }
                     ExFreePoolWithTag(buf, 'nsNW');
+                    buf = nullptr;
+                    udp_capacity = next;
+                    continue;
                 }
+                ExFreePoolWithTag(buf, 'nsNW');
+                buf = nullptr;
+                break;
             }
+
+            if (buf && NT_SUCCESS(st) && udp_count > 0) {
+                for (UINT32 i = 0; i < udp_count && request->connection_count < MAX_NET_CONNECTIONS; i++) {
+                    UINT32 pid = static_cast<UINT32>(stats[i].mod_pid);
+                    if (request->filter_pid != 0 && pid != request->filter_pid)
+                        continue;
+                    if (request->filter_protocol != 0 && request->filter_protocol != 17)
+                        continue;
+
+                    NET_CONN_ENTRY* out = &request->entries[request->connection_count];
+                    strong::kmemset(out, 0, sizeof(NET_CONN_ENTRY));
+                    out->pid = pid;
+                    out->protocol = 17;
+                    out->state = 0;
+                    out->address_family = AF_INET;
+
+                    out->local_port = ((keys[i].local.port_be >> 8) & 0xFF) | ((keys[i].local.port_be & 0xFF) << 8);
+                    out->remote_port = 0;
+
+                    strong::kmemcpy(out->local_addr, keys[i].local.addr, 4);
+
+                    fill_process_path(out, pid);
+                    request->connection_count++;
+                }
+            } else if (buf) {
+                NET_ERR("enumerate_connections: NSI UDP enum failed 0x%08x", st);
+            }
+            if (buf) ExFreePoolWithTag(buf, 'nsNW');
         }
 
         NET_DBG("enumerate_connections: found=%u connections (filter_pid=%u filter_proto=%u)",
@@ -3237,20 +3371,19 @@ NTSTATUS functions::handle_net_dns_get(p_net_dns_get request) {
     KeAcquireSpinLock(&net_capture::g_dns_lock, &old_irql);
 
     UINT32 available = (UINT32)net_capture::g_dns_count;
-    UINT32 to_read = (available < NET_DNS_GET_MAX) ? available : NET_DNS_GET_MAX;
 
     UINT32 out_idx = 0;
-    for (UINT32 i = 0; i < to_read; i++) {
-        NET_DNS_ENTRY* src = &net_capture::g_dns_ring[net_capture::g_dns_tail];
-
+    LONG local_tail = net_capture::g_dns_tail;
+    LONG local_count = available;
+    for (UINT32 i = 0; i < (UINT32)local_count && out_idx < NET_DNS_GET_MAX; i++) {
+        NET_DNS_ENTRY* src = &net_capture::g_dns_ring[local_tail];
 
         if (request->filter_pid == 0 || src->pid == request->filter_pid) {
             strong::kmemcpy(&request->entries[out_idx], src, sizeof(NET_DNS_ENTRY));
             out_idx++;
         }
 
-        net_capture::g_dns_tail = (net_capture::g_dns_tail + 1) % DNS_RING_SIZE;
-        net_capture::g_dns_count--;
+        local_tail = (local_tail + 1) % DNS_RING_SIZE;
     }
 
     request->entry_count = out_idx;
@@ -3616,109 +3749,142 @@ static UINT32 aida_resolve_packet_pid(UINT64 endpoint_handle,
         return 0;
 
 
+    // WHY: Same nullptr+size validation bug. Direct enumeration with
+    // pre-allocated buffers. This function is called from WFP classify
+    // callbacks at PASSIVE_LEVEL to resolve packet PIDs.
     if (protocol == 0 || protocol == IPPROTO_TCP) {
+        UINT32 tcp_capacity = 4096;
         UINT32 tcp_count = 0;
-        NTSTATUS st = net_enum::_NsiEnumerate(
-            0, 0, (PVOID)net_enum::NPI_MS_TCP_MODULEID,
-            3, nullptr, sizeof(net_enum::NSI_TCP_KEY),
-            nullptr, 0,
-            nullptr, sizeof(net_enum::NSI_TCP_DYNAMIC),
-            nullptr, sizeof(net_enum::NSI_TCP_STATIC),
-            &tcp_count);
+        NTSTATUS st = STATUS_UNSUCCESSFUL;
+        UINT8* buf = nullptr;
 
-        if (tcp_count > 0 && (st == STATUS_SUCCESS || st == STATUS_BUFFER_OVERFLOW ||
-            st == STATUS_BUFFER_TOO_SMALL || st == static_cast<NTSTATUS>(0xC0000023))) {
-            if (tcp_count > 8192) tcp_count = 8192;
-            ULONG key_sz = tcp_count * sizeof(net_enum::NSI_TCP_KEY);
-            ULONG sta_sz = tcp_count * sizeof(net_enum::NSI_TCP_STATIC);
+        for (UINT32 attempt = 0; attempt < 8; attempt++) {
+            tcp_count = tcp_capacity;
+            ULONG key_sz = tcp_capacity * sizeof(net_enum::NSI_TCP_KEY);
+            ULONG sta_sz = tcp_capacity * sizeof(net_enum::NSI_TCP_STATIC);
 
-            UINT8* buf = static_cast<UINT8*>(
+            buf = static_cast<UINT8*>(
                 ExAllocatePool2(POOL_FLAG_NON_PAGED, key_sz + sta_sz, 'rpNW'));
-            if (buf) {
-                auto* keys = reinterpret_cast<net_enum::NSI_TCP_KEY*>(buf);
-                auto* stats = reinterpret_cast<net_enum::NSI_TCP_STATIC*>(buf + key_sz);
+            if (!buf) break;
 
-                st = net_enum::_NsiEnumerate(
-                    0, 0, (PVOID)net_enum::NPI_MS_TCP_MODULEID,
-                    3, keys, sizeof(net_enum::NSI_TCP_KEY),
-                    nullptr, 0,
-                    nullptr, sizeof(net_enum::NSI_TCP_DYNAMIC),
-                    stats, sizeof(net_enum::NSI_TCP_STATIC),
-                    &tcp_count);
+            auto* keys = reinterpret_cast<net_enum::NSI_TCP_KEY*>(buf);
+            auto* stats = reinterpret_cast<net_enum::NSI_TCP_STATIC*>(buf + key_sz);
 
-                if (NT_SUCCESS(st)) {
-                    for (UINT32 i = 0; i < tcp_count; i++) {
-                        UINT32 lp = ((keys[i].local_port >> 8) & 0xFF) | ((keys[i].local_port & 0xFF) << 8);
-                        UINT32 rp = ((keys[i].remote_port >> 8) & 0xFF) | ((keys[i].remote_port & 0xFF) << 8);
+            // WHY: Pass dynamic size=0 when dynamic buffer is nullptr.
+            // NsipValidate rejects nullptr+nonzero size. We don't need
+            // dynamic data here (only keys+static for PID resolution).
+            st = net_enum::_NsiEnumerate(
+                net_enum::NSI_QUERY_RUNTIME, net_enum::NSI_STORE_ACTIVE, (PVOID)net_enum::NPI_MS_TCP_MODULEID,
+                3, keys, sizeof(net_enum::NSI_TCP_KEY),
+                nullptr, 0,
+                nullptr, 0,
+                stats, sizeof(net_enum::NSI_TCP_STATIC),
+                &tcp_count);
 
-                        BOOLEAN match = FALSE;
-                        if (local_port != 0 && lp == local_port) match = TRUE;
-                        if (!match && remote_port != 0 && rp == remote_port) match = TRUE;
-                        if (!match && local_port != 0 && rp == local_port) match = TRUE;
+            // Search returned entries (valid even on overflow)
+            if (NT_SUCCESS(st) || st == STATUS_BUFFER_OVERFLOW ||
+                st == STATUS_BUFFER_TOO_SMALL || st == static_cast<NTSTATUS>(0xC0000023)) {
+                for (UINT32 i = 0; i < tcp_count; i++) {
+                    UINT32 lp = ((keys[i].local.port_be >> 8) & 0xFF) | ((keys[i].local.port_be & 0xFF) << 8);
+                    UINT32 rp = ((keys[i].remote.port_be >> 8) & 0xFF) | ((keys[i].remote.port_be & 0xFF) << 8);
 
-                        if (match && stats[i].pid != 0) {
-                            UINT32 pid = stats[i].pid;
-                            aida_store_cached_port_pid(IPPROTO_TCP, local_port, pid);
-                            aida_store_cached_port_pid(IPPROTO_TCP, remote_port, pid);
-                            if (endpoint_handle != 0)
-                                aida_store_cached_endpoint_pid(endpoint_handle, protocol, local_port, pid);
-                            ExFreePoolWithTag(buf, 'rpNW');
-                            return pid;
-                        }
+                    BOOLEAN match = FALSE;
+                    if (local_port != 0 && lp == local_port) match = TRUE;
+                    if (!match && remote_port != 0 && rp == remote_port) match = TRUE;
+                    if (!match && local_port != 0 && rp == local_port) match = TRUE;
+
+                    if (match && static_cast<UINT32>(stats[i].mod_pid) != 0) {
+                        UINT32 pid = static_cast<UINT32>(stats[i].mod_pid);
+                        aida_store_cached_port_pid(IPPROTO_TCP, local_port, pid);
+                        aida_store_cached_port_pid(IPPROTO_TCP, remote_port, pid);
+                        if (endpoint_handle != 0)
+                            aida_store_cached_endpoint_pid(endpoint_handle, protocol, local_port, pid);
+                        ExFreePoolWithTag(buf, 'rpNW');
+                        return pid;
                     }
                 }
-                ExFreePoolWithTag(buf, 'rpNW');
             }
+
+            if (NT_SUCCESS(st)) {
+                ExFreePoolWithTag(buf, 'rpNW');
+                break;
+            }
+
+            ExFreePoolWithTag(buf, 'rpNW');
+            buf = nullptr;
+            if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL ||
+                st == static_cast<NTSTATUS>(0xC0000023)) {
+                UINT32 next = (tcp_count > tcp_capacity) ? tcp_count + 64 : tcp_capacity * 2;
+                if (next > 65536) next = 65536;
+                if (next == tcp_capacity) break;
+                tcp_capacity = next;
+                continue;
+            }
+            break;
         }
     }
 
 
+    // WHY: Same nullptr+size validation bug for UDP path.
     if (protocol == 0 || protocol == IPPROTO_UDP) {
+        UINT32 udp_capacity = 4096;
         UINT32 udp_count = 0;
-        NTSTATUS st = net_enum::_NsiEnumerate(
-            0, 0, (PVOID)net_enum::NPI_MS_UDP_MODULEID,
-            1, nullptr, sizeof(net_enum::NSI_UDP_KEY),
-            nullptr, 0,
-            nullptr, 0,
-            nullptr, sizeof(net_enum::NSI_UDP_STATIC),
-            &udp_count);
+        NTSTATUS st = STATUS_UNSUCCESSFUL;
+        UINT8* buf = nullptr;
 
-        if (udp_count > 0 && (st == STATUS_SUCCESS || st == STATUS_BUFFER_OVERFLOW ||
-            st == STATUS_BUFFER_TOO_SMALL || st == static_cast<NTSTATUS>(0xC0000023))) {
-            if (udp_count > 8192) udp_count = 8192;
-            ULONG key_sz = udp_count * sizeof(net_enum::NSI_UDP_KEY);
-            ULONG sta_sz = udp_count * sizeof(net_enum::NSI_UDP_STATIC);
+        for (UINT32 attempt = 0; attempt < 8; attempt++) {
+            udp_count = udp_capacity;
+            ULONG key_sz = udp_capacity * sizeof(net_enum::NSI_UDP_KEY);
+            ULONG sta_sz = udp_capacity * sizeof(net_enum::NSI_UDP_STATIC);
 
-            UINT8* buf = static_cast<UINT8*>(
+            buf = static_cast<UINT8*>(
                 ExAllocatePool2(POOL_FLAG_NON_PAGED, key_sz + sta_sz, 'rpNW'));
-            if (buf) {
-                auto* keys = reinterpret_cast<net_enum::NSI_UDP_KEY*>(buf);
-                auto* stats = reinterpret_cast<net_enum::NSI_UDP_STATIC*>(buf + key_sz);
+            if (!buf) break;
 
-                st = net_enum::_NsiEnumerate(
-                    0, 0, (PVOID)net_enum::NPI_MS_UDP_MODULEID,
-                    1, keys, sizeof(net_enum::NSI_UDP_KEY),
-                    nullptr, 0,
-                    nullptr, 0,
-                    stats, sizeof(net_enum::NSI_UDP_STATIC),
-                    &udp_count);
+            auto* keys = reinterpret_cast<net_enum::NSI_UDP_KEY*>(buf);
+            auto* stats = reinterpret_cast<net_enum::NSI_UDP_STATIC*>(buf + key_sz);
 
-                if (NT_SUCCESS(st)) {
-                    for (UINT32 i = 0; i < udp_count; i++) {
-                        UINT32 lp = ((keys[i].local_port >> 8) & 0xFF) | ((keys[i].local_port & 0xFF) << 8);
+            st = net_enum::_NsiEnumerate(
+                net_enum::NSI_QUERY_RUNTIME, net_enum::NSI_STORE_ACTIVE, (PVOID)net_enum::NPI_MS_UDP_MODULEID,
+                1, keys, sizeof(net_enum::NSI_UDP_KEY),
+                nullptr, 0,
+                nullptr, 0,
+                stats, sizeof(net_enum::NSI_UDP_STATIC),
+                &udp_count);
 
-                        if ((local_port != 0 && lp == local_port) && stats[i].pid != 0) {
-                            UINT32 pid = stats[i].pid;
-                            aida_store_cached_port_pid(IPPROTO_UDP, local_port, pid);
-                            if (endpoint_handle != 0)
-                                aida_store_cached_endpoint_pid(endpoint_handle, protocol, local_port, pid);
-                            ExFreePoolWithTag(buf, 'rpNW');
-                            return pid;
-                        }
+            // Search returned entries (valid even on overflow)
+            if (NT_SUCCESS(st) || st == STATUS_BUFFER_OVERFLOW ||
+                st == STATUS_BUFFER_TOO_SMALL || st == static_cast<NTSTATUS>(0xC0000023)) {
+                for (UINT32 i = 0; i < udp_count; i++) {
+                    UINT32 lp = ((keys[i].local.port_be >> 8) & 0xFF) | ((keys[i].local.port_be & 0xFF) << 8);
+
+                    if ((local_port != 0 && lp == local_port) && static_cast<UINT32>(stats[i].mod_pid) != 0) {
+                        UINT32 pid = static_cast<UINT32>(stats[i].mod_pid);
+                        aida_store_cached_port_pid(IPPROTO_UDP, local_port, pid);
+                        if (endpoint_handle != 0)
+                            aida_store_cached_endpoint_pid(endpoint_handle, protocol, local_port, pid);
+                        ExFreePoolWithTag(buf, 'rpNW');
+                        return pid;
                     }
                 }
-                ExFreePoolWithTag(buf, 'rpNW');
             }
+
+            if (NT_SUCCESS(st)) {
+                ExFreePoolWithTag(buf, 'rpNW');
+                break;
+            }
+
+            ExFreePoolWithTag(buf, 'rpNW');
+            buf = nullptr;
+            if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL ||
+                st == static_cast<NTSTATUS>(0xC0000023)) {
+                UINT32 next = (udp_count > udp_capacity) ? udp_count + 64 : udp_capacity * 2;
+                if (next > 65536) next = 65536;
+                if (next == udp_capacity) break;
+                udp_capacity = next;
+                continue;
+            }
+            break;
         }
     }
 
@@ -3742,19 +3908,28 @@ namespace net_socket_enum {
         request->socket_count = 0;
 
         UINT32 target_pid = request->target_pid;
-        if (target_pid == 0) return STATUS_INVALID_PARAMETER;
+        NET_DBG("enum_sock: ENTER target_pid=%u IRQL=%u", target_pid, (UINT32)KeGetCurrentIrql());
+        if (target_pid == 0) {
+            NET_ERR("enum_sock: target_pid is 0, returning INVALID_PARAMETER");
+            return STATUS_INVALID_PARAMETER;
+        }
 
-        if (!aida_can_query_system_handles())
+        if (!aida_can_query_system_handles()) {
+            NET_ERR("enum_sock: cannot query handles (IRQL too high)");
             return STATUS_INVALID_DEVICE_STATE;
+        }
 
+        NET_DBG("enum_sock: calling query_system_handles...");
         PSYSTEM_HANDLE_INFORMATION_LOCAL handles = nullptr;
         NTSTATUS status = query_system_handles(&handles);
+        NET_DBG("enum_sock: query_system_handles returned 0x%08x handles=%p", status, handles);
         if (!NT_SUCCESS(status) || !handles) {
+            NET_ERR("enum_sock: query_system_handles FAILED 0x%08x", status);
             return status;
         }
 
 
-        constexpr UINT32 MAX_PID_HANDLES = 4096;
+        constexpr UINT32 MAX_PID_HANDLES = 1024;
         USHORT* pid_handles = static_cast<USHORT*>(
             ExAllocatePool2(POOL_FLAG_NON_PAGED, MAX_PID_HANDLES * sizeof(USHORT), 'shNW'));
         if (!pid_handles) {
@@ -3762,6 +3937,7 @@ namespace net_socket_enum {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
+        NET_DBG("enum_sock: total system handles=%lu, scanning for pid=%u", handles->NumberOfHandles, target_pid);
         UINT32 pid_handle_count = 0;
         for (ULONG i = 0; i < handles->NumberOfHandles && pid_handle_count < MAX_PID_HANDLES; i++) {
             const SYSTEM_HANDLE_TABLE_ENTRY_INFO_LOCAL* entry = &handles->Handles[i];
@@ -3772,8 +3948,11 @@ namespace net_socket_enum {
         ExFreePoolWithTag(handles, 'hANW');
         handles = nullptr;
 
+        NET_DBG("enum_sock: found %u handles for pid %u", pid_handle_count, target_pid);
+
         if (pid_handle_count == 0) {
             ExFreePoolWithTag(pid_handles, 'shNW');
+            NET_DBG("enum_sock: no handles, returning SUCCESS with count=0");
             return STATUS_SUCCESS;
         }
 
@@ -3782,17 +3961,25 @@ namespace net_socket_enum {
         status = PsLookupProcessByProcessId(
             reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(target_pid)), &process);
         if (!NT_SUCCESS(status) || !process) {
+            NET_ERR("enum_sock: PsLookupProcessByProcessId failed 0x%08x", status);
             ExFreePoolWithTag(pid_handles, 'shNW');
             return status;
         }
 
+
+        NET_DBG("enum_sock: pre-initializing AFD offsets before attach");
+        (void)afd_get_offsets();
+        NET_DBG("enum_sock: AFD offsets ready, attaching to process %u, iterating %u handles", target_pid, pid_handle_count);
         UINT32 filled = 0;
+        UINT32 ref_fail = 0, not_afd = 0, extract_fail = 0;
         KAPC_STATE apc_state = {};
         KeStackAttachProcess(process, &apc_state);
 
         __try {
             for (UINT32 i = 0; i < pid_handle_count && filled < MAX_SOCKET_HANDLES; i++) {
                 HANDLE h = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid_handles[i]));
+                if (i < 3 || (i % 100 == 0))
+                    NET_DBG("enum_sock: handle[%u/%u] val=0x%X", i, pid_handle_count, pid_handles[i]);
 
 
                 PVOID file_obj = nullptr;
@@ -3800,16 +3987,22 @@ namespace net_socket_enum {
                     h, 0,
                     (_IoFileObjectType && *_IoFileObjectType) ? *_IoFileObjectType : nullptr,
                     KernelMode, &file_obj, nullptr);
-                if (!NT_SUCCESS(ref_st) || !file_obj)
+                if (!NT_SUCCESS(ref_st) || !file_obj) {
+                    ref_fail++;
                     continue;
+                }
 
                 PFILE_OBJECT fo = static_cast<PFILE_OBJECT>(file_obj);
 
 
                 if (!aida_is_afd_file_object(fo)) {
                     ObDereferenceObject(fo);
+                    not_afd++;
                     continue;
                 }
+
+                if (i < 3 || (i % 100 == 0))
+                    NET_DBG("enum_sock: handle[%u] is AFD, extracting info", i);
 
                 SOCKET_HANDLE_ENTRY* out = &request->entries[filled];
                 strong::kmemset(out, 0, sizeof(SOCKET_HANDLE_ENTRY));
@@ -3819,20 +4012,23 @@ namespace net_socket_enum {
                 BOOLEAN ok = aida_extract_socket_info_from_fo(fo, out);
                 ObDereferenceObject(fo);
 
-                if (!ok)
+                if (!ok) {
+                    extract_fail++;
                     continue;
+                }
 
                 aida_cache_pid_from_socket_info(out, target_pid);
                 filled++;
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
-
+            NET_ERR("enum_sock: EXCEPTION in handle loop at iteration, filled=%u", filled);
         }
 
         KeUnstackDetachProcess(&apc_state);
         ObDereferenceObject(process);
         ExFreePoolWithTag(pid_handles, 'shNW');
 
+        NET_DBG("enum_sock: DONE filled=%u ref_fail=%u not_afd=%u extract_fail=%u", filled, ref_fail, not_afd, extract_fail);
         request->socket_count = filled;
         return STATUS_SUCCESS;
     }
@@ -4032,8 +4228,10 @@ namespace net_tcpip {
     } TCP4_DYNAMIC;
 
     typedef struct _TCP4_STATIC {
-        UINT64 create_time;
-        UINT64 mod_pid;
+        UINT8  _pad0[12];       // reserved (zero on Win10 22H2)
+        UINT32 mod_pid;          // owning PID at offset 12
+        UINT64 create_time;      // FILETIME at offset 16
+        UINT8  _pad1[8];        // reserved
     } TCP4_STATIC;
 
     typedef struct _UDP4_KEY {
@@ -4044,8 +4242,10 @@ namespace net_tcpip {
     } UDP4_KEY;
 
     typedef struct _UDP4_STATIC {
-        UINT64 create_time;
-        UINT64 mod_pid;
+        UINT32 mod_pid;          // owning PID at offset 0
+        UINT32 _pad0;            // reserved
+        UINT64 create_time;      // FILETIME at offset 8
+        UINT8  _pad1[16];       // reserved
     } UDP4_STATIC;
     #pragma pack(pop)
 
@@ -4063,115 +4263,147 @@ namespace net_tcpip {
         UINT32 filled = 0;
 
 
+        // WHY: netio!NsipValidate rejects nullptr+size. Direct enumeration.
         if (request->filter_protocol == 0 || request->filter_protocol == 6) {
+            UINT32 tcp_capacity = 4096;
             UINT32 tcp_count = 0;
-            NTSTATUS st = net_enum::_NsiEnumerate(
-                0, 0, (PVOID)net_enum::NPI_MS_TCP_MODULEID,
-                3, nullptr, sizeof(net_enum::NSI_TCP_KEY),
-                nullptr, 0,
-                nullptr, sizeof(net_enum::NSI_TCP_DYNAMIC),
-                nullptr, sizeof(net_enum::NSI_TCP_STATIC),
-                &tcp_count);
+            NTSTATUS st = STATUS_UNSUCCESSFUL;
+            UINT8* buf = nullptr;
 
-            if (tcp_count > 0 && (st == STATUS_SUCCESS || st == STATUS_BUFFER_OVERFLOW ||
-                st == STATUS_BUFFER_TOO_SMALL || st == static_cast<NTSTATUS>(0xC0000023))) {
-                if (tcp_count > 8192) tcp_count = 8192;
-                ULONG key_sz = tcp_count * sizeof(net_enum::NSI_TCP_KEY);
-                ULONG dyn_sz = tcp_count * sizeof(net_enum::NSI_TCP_DYNAMIC);
-                ULONG sta_sz = tcp_count * sizeof(net_enum::NSI_TCP_STATIC);
+            for (UINT32 attempt = 0; attempt < 8; attempt++) {
+                tcp_count = tcp_capacity;
+                ULONG key_sz = tcp_capacity * sizeof(net_enum::NSI_TCP_KEY);
+                ULONG dyn_sz = tcp_capacity * sizeof(net_enum::NSI_TCP_DYNAMIC);
+                ULONG sta_sz = tcp_capacity * sizeof(net_enum::NSI_TCP_STATIC);
 
-                UINT8* buf = static_cast<UINT8*>(
+                buf = static_cast<UINT8*>(
                     ExAllocatePool2(POOL_FLAG_NON_PAGED, key_sz + dyn_sz + sta_sz, 'tdNW'));
-                if (buf) {
-                    auto* keys  = reinterpret_cast<net_enum::NSI_TCP_KEY*>(buf);
-                    auto* dyns  = reinterpret_cast<net_enum::NSI_TCP_DYNAMIC*>(buf + key_sz);
-                    auto* stats = reinterpret_cast<net_enum::NSI_TCP_STATIC*>(buf + key_sz + dyn_sz);
+                if (!buf) break;
 
-                    st = net_enum::_NsiEnumerate(
-                        0, 0, (PVOID)net_enum::NPI_MS_TCP_MODULEID,
-                        3, keys, sizeof(net_enum::NSI_TCP_KEY),
-                        nullptr, 0,
-                        dyns, sizeof(net_enum::NSI_TCP_DYNAMIC),
-                        stats, sizeof(net_enum::NSI_TCP_STATIC),
-                        &tcp_count);
+                auto* keys  = reinterpret_cast<net_enum::NSI_TCP_KEY*>(buf);
+                auto* dyns  = reinterpret_cast<net_enum::NSI_TCP_DYNAMIC*>(buf + key_sz);
+                auto* stats = reinterpret_cast<net_enum::NSI_TCP_STATIC*>(buf + key_sz + dyn_sz);
 
-                    if (NT_SUCCESS(st)) {
-                        for (UINT32 i = 0; i < tcp_count && filled < MAX_TCPIP_CONNECTIONS; i++) {
-                            UINT32 pid = stats[i].pid;
-                            if (request->target_pid != 0 && pid != request->target_pid)
-                                continue;
+                st = net_enum::_NsiEnumerate(
+                    net_enum::NSI_QUERY_RUNTIME, net_enum::NSI_STORE_ACTIVE, (PVOID)net_enum::NPI_MS_TCP_MODULEID,
+                    3, keys, sizeof(net_enum::NSI_TCP_KEY),
+                    nullptr, 0,
+                    dyns, sizeof(net_enum::NSI_TCP_DYNAMIC),
+                    stats, sizeof(net_enum::NSI_TCP_STATIC),
+                    &tcp_count);
 
-                            TCPIP_CONN_ENTRY* out = &request->entries[filled];
-                            strong::kmemset(out, 0, sizeof(TCPIP_CONN_ENTRY));
-                            out->pid = pid;
-                            out->protocol = 6;
-                            out->state = net_enum::nsi_tcp_state_to_mib(dyns[i].state);
-                            out->address_family = AF_INET;
-                            out->local_port  = ((keys[i].local_port >> 8) & 0xFF) | ((keys[i].local_port & 0xFF) << 8);
-                            out->remote_port = ((keys[i].remote_port >> 8) & 0xFF) | ((keys[i].remote_port & 0xFF) << 8);
-                            strong::kmemcpy(out->local_addr, keys[i].local_addr, 4);
-                            strong::kmemcpy(out->remote_addr, keys[i].remote_addr, 4);
-                            out->create_time = stats[i].create_time;
-                            filled++;
-                        }
+                if (NT_SUCCESS(st)) {
+                    for (UINT32 i = 0; i < tcp_count && filled < MAX_TCPIP_CONNECTIONS; i++) {
+                        UINT32 pid = static_cast<UINT32>(stats[i].mod_pid);
+                        if (request->target_pid != 0 && pid != request->target_pid)
+                            continue;
+
+                        TCPIP_CONN_ENTRY* out = &request->entries[filled];
+                        strong::kmemset(out, 0, sizeof(TCPIP_CONN_ENTRY));
+                        out->pid = pid;
+                        out->protocol = 6;
+                        out->state = net_enum::nsi_tcp_state_to_mib(dyns[i].state);
+                        out->address_family = AF_INET;
+                        out->local_port  = ((keys[i].local.port_be >> 8) & 0xFF) | ((keys[i].local.port_be & 0xFF) << 8);
+                        out->remote_port = ((keys[i].remote.port_be >> 8) & 0xFF) | ((keys[i].remote.port_be & 0xFF) << 8);
+                        strong::kmemcpy(out->local_addr, keys[i].local.addr, 4);
+                        strong::kmemcpy(out->remote_addr, keys[i].remote.addr, 4);
+                        out->create_time = stats[i].create_time;
+                        filled++;
                     }
                     ExFreePoolWithTag(buf, 'tdNW');
+                    break;
                 }
+
+                if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL ||
+                    st == static_cast<NTSTATUS>(0xC0000023)) {
+                    UINT32 next = (tcp_count > tcp_capacity) ? tcp_count + 64 : tcp_capacity * 2;
+                    if (next > 65536) next = 65536;
+                    if (attempt == 7 || next == tcp_capacity) {
+                        NET_ERR("dump_connections: TCP exhausted retries at cap=%u", tcp_capacity);
+                        ExFreePoolWithTag(buf, 'tdNW');
+                        buf = nullptr;
+                        break;
+                    }
+                    ExFreePoolWithTag(buf, 'tdNW');
+                    buf = nullptr;
+                    tcp_capacity = next;
+                    continue;
+                }
+                ExFreePoolWithTag(buf, 'tdNW');
+                buf = nullptr;
+                break;
             }
         }
 
 
+        // WHY: Same nullptr+size validation bug for UDP.
         if (request->filter_protocol == 0 || request->filter_protocol == 17) {
+            UINT32 udp_capacity = 4096;
             UINT32 udp_count = 0;
-            NTSTATUS st = net_enum::_NsiEnumerate(
-                0, 0, (PVOID)net_enum::NPI_MS_UDP_MODULEID,
-                1, nullptr, sizeof(net_enum::NSI_UDP_KEY),
-                nullptr, 0,
-                nullptr, 0,
-                nullptr, sizeof(net_enum::NSI_UDP_STATIC),
-                &udp_count);
+            NTSTATUS st = STATUS_UNSUCCESSFUL;
+            UINT8* buf = nullptr;
 
-            if (udp_count > 0 && (st == STATUS_SUCCESS || st == STATUS_BUFFER_OVERFLOW ||
-                st == STATUS_BUFFER_TOO_SMALL || st == static_cast<NTSTATUS>(0xC0000023))) {
-                if (udp_count > 8192) udp_count = 8192;
-                ULONG key_sz = udp_count * sizeof(net_enum::NSI_UDP_KEY);
-                ULONG sta_sz = udp_count * sizeof(net_enum::NSI_UDP_STATIC);
+            for (UINT32 attempt = 0; attempt < 8; attempt++) {
+                udp_count = udp_capacity;
+                ULONG key_sz = udp_capacity * sizeof(net_enum::NSI_UDP_KEY);
+                ULONG sta_sz = udp_capacity * sizeof(net_enum::NSI_UDP_STATIC);
 
-                UINT8* buf = static_cast<UINT8*>(
+                buf = static_cast<UINT8*>(
                     ExAllocatePool2(POOL_FLAG_NON_PAGED, key_sz + sta_sz, 'tdNW'));
-                if (buf) {
-                    auto* keys  = reinterpret_cast<net_enum::NSI_UDP_KEY*>(buf);
-                    auto* stats = reinterpret_cast<net_enum::NSI_UDP_STATIC*>(buf + key_sz);
+                if (!buf) break;
 
-                    st = net_enum::_NsiEnumerate(
-                        0, 0, (PVOID)net_enum::NPI_MS_UDP_MODULEID,
-                        1, keys, sizeof(net_enum::NSI_UDP_KEY),
-                        nullptr, 0,
-                        nullptr, 0,
-                        stats, sizeof(net_enum::NSI_UDP_STATIC),
-                        &udp_count);
+                auto* keys  = reinterpret_cast<net_enum::NSI_UDP_KEY*>(buf);
+                auto* stats = reinterpret_cast<net_enum::NSI_UDP_STATIC*>(buf + key_sz);
 
-                    if (NT_SUCCESS(st)) {
-                        for (UINT32 i = 0; i < udp_count && filled < MAX_TCPIP_CONNECTIONS; i++) {
-                            UINT32 pid = stats[i].pid;
-                            if (request->target_pid != 0 && pid != request->target_pid)
-                                continue;
+                st = net_enum::_NsiEnumerate(
+                    net_enum::NSI_QUERY_RUNTIME, net_enum::NSI_STORE_ACTIVE, (PVOID)net_enum::NPI_MS_UDP_MODULEID,
+                    1, keys, sizeof(net_enum::NSI_UDP_KEY),
+                    nullptr, 0,
+                    nullptr, 0,
+                    stats, sizeof(net_enum::NSI_UDP_STATIC),
+                    &udp_count);
 
-                            TCPIP_CONN_ENTRY* out = &request->entries[filled];
-                            strong::kmemset(out, 0, sizeof(TCPIP_CONN_ENTRY));
-                            out->pid = pid;
-                            out->protocol = 17;
-                            out->state = 0;
-                            out->address_family = AF_INET;
-                            out->local_port = ((keys[i].local_port >> 8) & 0xFF) | ((keys[i].local_port & 0xFF) << 8);
-                            out->remote_port = 0;
-                            strong::kmemcpy(out->local_addr, keys[i].local_addr, 4);
-                            out->create_time = stats[i].create_time;
-                            filled++;
-                        }
+                if (NT_SUCCESS(st)) {
+                    for (UINT32 i = 0; i < udp_count && filled < MAX_TCPIP_CONNECTIONS; i++) {
+                        UINT32 pid = static_cast<UINT32>(stats[i].mod_pid);
+                        if (request->target_pid != 0 && pid != request->target_pid)
+                            continue;
+
+                        TCPIP_CONN_ENTRY* out = &request->entries[filled];
+                        strong::kmemset(out, 0, sizeof(TCPIP_CONN_ENTRY));
+                        out->pid = pid;
+                        out->protocol = 17;
+                        out->state = 0;
+                        out->address_family = AF_INET;
+                        out->local_port = ((keys[i].local.port_be >> 8) & 0xFF) | ((keys[i].local.port_be & 0xFF) << 8);
+                        out->remote_port = 0;
+                        strong::kmemcpy(out->local_addr, keys[i].local.addr, 4);
+                        out->create_time = stats[i].create_time;
+                        filled++;
                     }
                     ExFreePoolWithTag(buf, 'tdNW');
+                    break;
                 }
+
+                if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL ||
+                    st == static_cast<NTSTATUS>(0xC0000023)) {
+                    UINT32 next = (udp_count > udp_capacity) ? udp_count + 64 : udp_capacity * 2;
+                    if (next > 65536) next = 65536;
+                    if (attempt == 7 || next == udp_capacity) {
+                        NET_ERR("dump_connections: UDP exhausted retries at cap=%u", udp_capacity);
+                        ExFreePoolWithTag(buf, 'tdNW');
+                        buf = nullptr;
+                        break;
+                    }
+                    ExFreePoolWithTag(buf, 'tdNW');
+                    buf = nullptr;
+                    udp_capacity = next;
+                    continue;
+                }
+                ExFreePoolWithTag(buf, 'tdNW');
+                buf = nullptr;
+                break;
             }
         }
 
@@ -4390,8 +4622,11 @@ namespace net_inject {
             return g_inject_handle_v4 != nullptr;
         }
         if (prev == 1) {
-            while (_InterlockedCompareExchange(&g_inject_resolved, 0, 0) == 1)
+            for (UINT32 spin = 0; spin < 100000; spin++) {
+                if (_InterlockedCompareExchange(&g_inject_resolved, 0, 0) != 1)
+                    break;
                 YieldProcessor();
+            }
             return g_inject_handle_v4 != nullptr;
         }
 
@@ -6505,54 +6740,70 @@ namespace net_kill {
             return 0;
 
 
+        // WHY: netio!NsipValidate rejects nullptr+size. Direct enumeration
+        // to find the owner PID of a TCP connection for kill_connection.
         if (request->protocol == 6 && net_enum::resolve_nsi()) {
+            UINT32 tcp_capacity = 4096;
             UINT32 tcp_count = 0;
-            NTSTATUS st = net_enum::_NsiEnumerate(
-                0, 0, (PVOID)net_enum::NPI_MS_TCP_MODULEID,
-                3, nullptr, sizeof(net_enum::NSI_TCP_KEY),
-                nullptr, 0,
-                nullptr, sizeof(net_enum::NSI_TCP_DYNAMIC),
-                nullptr, sizeof(net_enum::NSI_TCP_STATIC),
-                &tcp_count);
+            NTSTATUS st = STATUS_UNSUCCESSFUL;
+            UINT8* buf = nullptr;
 
-            if (tcp_count > 0 && (st == STATUS_SUCCESS || st == STATUS_BUFFER_OVERFLOW ||
-                st == STATUS_BUFFER_TOO_SMALL || st == static_cast<NTSTATUS>(0xC0000023))) {
-                if (tcp_count > 8192) tcp_count = 8192;
-                ULONG key_sz = tcp_count * sizeof(net_enum::NSI_TCP_KEY);
-                ULONG sta_sz = tcp_count * sizeof(net_enum::NSI_TCP_STATIC);
+            for (UINT32 attempt = 0; attempt < 8; attempt++) {
+                tcp_count = tcp_capacity;
+                ULONG key_sz = tcp_capacity * sizeof(net_enum::NSI_TCP_KEY);
+                ULONG sta_sz = tcp_capacity * sizeof(net_enum::NSI_TCP_STATIC);
 
-                UINT8* buf = static_cast<UINT8*>(
+                buf = static_cast<UINT8*>(
                     ExAllocatePool2(POOL_FLAG_NON_PAGED, key_sz + sta_sz, 'klNW'));
-                if (buf) {
-                    auto* keys = reinterpret_cast<net_enum::NSI_TCP_KEY*>(buf);
-                    auto* stats = reinterpret_cast<net_enum::NSI_TCP_STATIC*>(buf + key_sz);
+                if (!buf) break;
 
-                    st = net_enum::_NsiEnumerate(
-                        0, 0, (PVOID)net_enum::NPI_MS_TCP_MODULEID,
-                        3, keys, sizeof(net_enum::NSI_TCP_KEY),
-                        nullptr, 0,
-                        nullptr, sizeof(net_enum::NSI_TCP_DYNAMIC),
-                        stats, sizeof(net_enum::NSI_TCP_STATIC),
-                        &tcp_count);
+                auto* keys = reinterpret_cast<net_enum::NSI_TCP_KEY*>(buf);
+                auto* stats = reinterpret_cast<net_enum::NSI_TCP_STATIC*>(buf + key_sz);
 
-                    if (NT_SUCCESS(st)) {
-                        for (UINT32 i = 0; i < tcp_count; i++) {
-                            UINT32 lport = ((keys[i].local_port >> 8) & 0xFF) | ((keys[i].local_port & 0xFF) << 8);
-                            UINT32 rport = ((keys[i].remote_port >> 8) & 0xFF) | ((keys[i].remote_port & 0xFF) << 8);
+                // WHY: dynamic size must be 0 when dynamic buffer is nullptr.
+                st = net_enum::_NsiEnumerate(
+                    net_enum::NSI_QUERY_RUNTIME, net_enum::NSI_STORE_ACTIVE, (PVOID)net_enum::NPI_MS_TCP_MODULEID,
+                    3, keys, sizeof(net_enum::NSI_TCP_KEY),
+                    nullptr, 0,
+                    nullptr, 0,
+                    stats, sizeof(net_enum::NSI_TCP_STATIC),
+                    &tcp_count);
 
-                            BOOLEAN match = TRUE;
-                            if (request->src_port != 0 && lport != request->src_port) match = FALSE;
-                            if (match && request->dst_port != 0 && rport != request->dst_port) match = FALSE;
+                // Search returned entries (valid even on overflow)
+                if (NT_SUCCESS(st) || st == STATUS_BUFFER_OVERFLOW ||
+                    st == STATUS_BUFFER_TOO_SMALL || st == static_cast<NTSTATUS>(0xC0000023)) {
+                    for (UINT32 i = 0; i < tcp_count; i++) {
+                        UINT32 lport = ((keys[i].local.port_be >> 8) & 0xFF) | ((keys[i].local.port_be & 0xFF) << 8);
+                        UINT32 rport = ((keys[i].remote.port_be >> 8) & 0xFF) | ((keys[i].remote.port_be & 0xFF) << 8);
 
-                            if (match && stats[i].pid != 0) {
-                                UINT32 pid = stats[i].pid;
-                                ExFreePoolWithTag(buf, 'klNW');
-                                return pid;
-                            }
+                        BOOLEAN match = TRUE;
+                        if (request->src_port != 0 && lport != request->src_port) match = FALSE;
+                        if (match && request->dst_port != 0 && rport != request->dst_port) match = FALSE;
+
+                        if (match && static_cast<UINT32>(stats[i].mod_pid) != 0) {
+                            UINT32 pid = static_cast<UINT32>(stats[i].mod_pid);
+                            ExFreePoolWithTag(buf, 'klNW');
+                            return pid;
                         }
                     }
-                    ExFreePoolWithTag(buf, 'klNW');
                 }
+
+                if (NT_SUCCESS(st)) {
+                    ExFreePoolWithTag(buf, 'klNW');
+                    break;
+                }
+
+                ExFreePoolWithTag(buf, 'klNW');
+                buf = nullptr;
+                if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL ||
+                    st == static_cast<NTSTATUS>(0xC0000023)) {
+                    UINT32 next = (tcp_count > tcp_capacity) ? tcp_count + 64 : tcp_capacity * 2;
+                    if (next > 65536) next = 65536;
+                    if (next == tcp_capacity) break;
+                    tcp_capacity = next;
+                    continue;
+                }
+                break;
             }
         }
 
@@ -6599,6 +6850,9 @@ namespace net_kill {
             ExFreePoolWithTag(pid_handles, 'khNW');
             return status;
         }
+
+
+        (void)afd_get_offsets();
 
         NTSTATUS close_status = STATUS_NOT_FOUND;
         KAPC_STATE apc = {};
@@ -6939,6 +7193,27 @@ namespace net_bw {
         case 0:
             _InterlockedExchange(&g_bw_active, 1);
             request->monitoring_active = 1;
+            request->total_bytes_sent = g_bw_total_sent;
+            request->total_bytes_recv = g_bw_total_recv;
+            request->total_packets_sent = g_bw_total_pkts_sent;
+            request->total_packets_recv = g_bw_total_pkts_recv;
+            {
+                LARGE_INTEGER now;
+                KeQuerySystemTime(&now);
+                UINT64 elapsed = now.QuadPart - g_bw_last_sample_time;
+                if (elapsed > 0 && g_bw_last_sample_time != 0) {
+                    LONG64 delta_sent = g_bw_total_sent - g_bw_last_sample_sent;
+                    LONG64 delta_recv = g_bw_total_recv - g_bw_last_sample_recv;
+                    UINT64 seconds = elapsed / 10000000ULL;
+                    if (seconds > 0) {
+                        request->bytes_per_second_out = delta_sent / seconds;
+                        request->bytes_per_second_in = delta_recv / seconds;
+                    }
+                }
+                g_bw_last_sample_sent = g_bw_total_sent;
+                g_bw_last_sample_recv = g_bw_total_recv;
+                g_bw_last_sample_time = now.QuadPart;
+            }
             return STATUS_SUCCESS;
         case 1:
             _InterlockedExchange(&g_bw_active, 0);
@@ -7184,20 +7459,26 @@ namespace net_pcap {
         KIRQL irql;
         KeAcquireSpinLock(&net_capture::g_ring_lock, &irql);
 
-        LONG count = net_capture::g_ring_count;
-        LONG idx = net_capture::g_ring_tail;
+        LONG idx = 0;
+        LONG total_scan = RING_BUFFER_SIZE;
 
-        while (count > 0 && request->packet_count < max_pkts) {
+        while (total_scan > 0 && request->packet_count < max_pkts) {
             NET_PACKET_ENTRY* pkt = &net_capture::g_ring_buffer[idx];
+
+            if (pkt->timestamp == 0) {
+                idx = (idx + 1) % RING_BUFFER_SIZE;
+                total_scan--;
+                continue;
+            }
 
             if (request->filter_pid != 0 && pkt->pid != 0 && pkt->pid != request->filter_pid) {
                 idx = (idx + 1) % RING_BUFFER_SIZE;
-                count--;
+                total_scan--;
                 continue;
             }
             if (request->filter_protocol != 0 && pkt->protocol != request->filter_protocol) {
                 idx = (idx + 1) % RING_BUFFER_SIZE;
-                count--;
+                total_scan--;
                 continue;
             }
 
@@ -7253,7 +7534,7 @@ namespace net_pcap {
 
             request->packet_count++;
             idx = (idx + 1) % RING_BUFFER_SIZE;
-            count--;
+            total_scan--;
         }
 
         KeReleaseSpinLock(&net_capture::g_ring_lock, irql);
@@ -7446,7 +7727,10 @@ NTSTATUS functions::handle_wfp_callout_enum(p_wfp_callout_enum request) {
 
 NTSTATUS functions::handle_socket_handle_enum(p_socket_handle_enum request) {
     if (!request) { NET_ERR("handle_socket_handle_enum: NULL request"); return STATUS_INVALID_PARAMETER; }
-    return net_socket_enum::enumerate_socket_handles(request);
+    NET_DBG("handle_socket_handle_enum: ENTER target_pid=%u", request->target_pid);
+    NTSTATUS st = net_socket_enum::enumerate_socket_handles(request);
+    NET_DBG("handle_socket_handle_enum: EXIT status=0x%08x socket_count=%u", st, request->socket_count);
+    return st;
 }
 
 NTSTATUS functions::handle_sniff_net_buffers(p_sniff_net_buffers request) {
