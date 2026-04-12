@@ -15,6 +15,7 @@
 #include "module_view.hpp"
 #include "pe_parser.hpp"
 #include "code_patcher.hpp"
+#include "stealth_engine.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -1962,6 +1963,88 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             return tool_result_t::ok(
                 OBFSTR("Conditional breakpoint set at ") + sa_format_address(*addr) + OBFSTR(" [condition: ") + cond + OBFSTR("]"), result);
         }, false});
+
+	srv.register_tool({
+		"enable_stealth",
+		"Enable anti-anti-debug stealth mode for the attached process. Spoofs PEB debug flags, hooks RDTSC to return fake timestamps, and patches known anti-debug checks.",
+		{
+			{"process_id", "integer", "PID to enable stealth on (uses attached if omitted)", false}
+		},
+		true,
+		[](const json& params) -> tool_result_t {
+			if (auto err = ensure_attached(params)) return *err;
+
+			uint32_t pid = device->get_process_id();
+			if (pid == 0)
+				return tool_result_t::error("Not attached to a process.");
+
+			if (stealth_engine::is_active())
+				return tool_result_t::error("Stealth mode is already active.");
+
+			bool ok = stealth_engine::enable_stealth(pid);
+			if (!ok)
+				return tool_result_t::error("Failed to enable stealth mode.");
+
+			auto status = stealth_engine::get_status();
+			json result;
+			result["status"] = "active";
+			result["pid"] = pid;
+			result["peb_spoofed"] = status.peb_spoofed;
+			result["rdtsc_hooks"] = static_cast<int>(status.hooks.size());
+			return tool_result_t::ok(result);
+		}
+	});
+
+	srv.register_tool({
+		"disable_stealth",
+		"Disable anti-anti-debug stealth mode and restore all patches and hooks.",
+		{},
+		true,
+		[](const json&) -> tool_result_t {
+			if (!stealth_engine::is_active())
+				return tool_result_t::error("Stealth mode is not active.");
+
+			stealth_engine::disable_stealth();
+
+			json result;
+			result["status"] = "disabled";
+			return tool_result_t::ok(result);
+		}
+	});
+
+	srv.register_tool({
+		"stealth_status",
+		"Get current stealth engine status including active hooks and PEB spoofing state.",
+		{},
+		true,
+		[](const json&) -> tool_result_t {
+			json result;
+			result["active"] = stealth_engine::is_active();
+
+			if (stealth_engine::is_active()) {
+				auto status = stealth_engine::get_status();
+				result["pid"] = status.pid;
+				result["peb_spoofed"] = status.peb_spoofed;
+				result["rdtsc_hooks"] = static_cast<int>(status.hooks.size());
+
+				json hooks_arr = json::array();
+				for (auto& h : status.hooks) {
+					json hobj;
+					char abuf[32];
+					std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(h.target_addr));
+					hobj["address"] = abuf;
+					char tbuf[32];
+					std::snprintf(tbuf, sizeof(tbuf), "0x%llX", static_cast<unsigned long long>(h.trampoline_addr));
+					hobj["trampoline"] = tbuf;
+					hobj["active"] = h.active;
+					hooks_arr.push_back(hobj);
+				}
+				result["hooks"] = hooks_arr;
+			}
+
+			return tool_result_t::ok(result);
+		}
+	});
 }
 
 }

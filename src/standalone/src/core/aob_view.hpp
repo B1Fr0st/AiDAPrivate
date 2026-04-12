@@ -108,6 +108,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		aob_generator::save_current();
 	}
 
+	bool batch_running = gen.batch_generating.load();
+	if (batch_running) {
+		ImGui::SameLine();
+		char batch_buf[32];
+		std::snprintf(batch_buf, sizeof(batch_buf), "Batch %d/%d",
+		              gen.batch_done.load(), gen.batch_total.load());
+		ImGui::SmallButton(batch_buf);
+	}
+
 	ImGui::PopStyleColor(4);
 
 	cy += 28.f;
@@ -122,11 +131,28 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		dl->AddRectFilled(ImVec2(cx - 4.f, cy), ImVec2(pos_x + left_w - 8.f, cy + 24.f), panel_bg);
 
 		char info_buf[128];
-		std::snprintf(info_buf, sizeof(info_buf), "0x%llX  |  %s  |  %zu bytes",
+		std::snprintf(info_buf, sizeof(info_buf), "0x%llX  |  %s  |  %zu bytes  |  Score: %.0f%% (%s)",
 		              static_cast<unsigned long long>(current_copy.address),
 		              current_copy.module_name.empty() ? "<unknown>" : current_copy.module_name.c_str(),
-		              current_copy.bytes.size());
+		              current_copy.bytes.size(),
+		              current_copy.quality_score * 100.f,
+		              aob_generator::score_grade(current_copy.quality_score));
 		dl->AddText(ImVec2(cx, cy + 4.f), dim_col, info_buf);
+
+		{
+			float score_x = pos_x + left_w - 60.f;
+			ImU32 grade_col = dim_col;
+			float qs = current_copy.quality_score;
+			if (qs >= 0.85f) grade_col = IM_COL32(152, 195, 121, static_cast<int>(alpha * 255));
+			else if (qs >= 0.7f) grade_col = IM_COL32(97, 175, 239, static_cast<int>(alpha * 255));
+			else if (qs >= 0.5f) grade_col = IM_COL32(229, 192, 123, static_cast<int>(alpha * 255));
+			else grade_col = IM_COL32(224, 108, 117, static_cast<int>(alpha * 255));
+			dl->AddRectFilled(ImVec2(score_x, cy + 2.f), ImVec2(score_x + 40.f, cy + 20.f), grade_col, 3.f);
+			const char* grade_str = aob_generator::score_grade(current_copy.quality_score);
+			ImVec2 gsz = ImGui::CalcTextSize(grade_str);
+			dl->AddText(ImVec2(score_x + 20.f - gsz.x * 0.5f, cy + 3.f),
+			            IM_COL32(30, 30, 30, static_cast<int>(alpha * 255)), grade_str);
+		}
 		cy += 30.f;
 
 		float byte_x = cx;
@@ -171,6 +197,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		cy += 16.f;
 		std::string code_fmt = aob_generator::format_code_signature(current_copy);
 		dl->AddText(ImVec2(cx, cy), text_col, code_fmt.c_str(), code_fmt.c_str() + std::min(code_fmt.size(), static_cast<size_t>(200)));
+		cy += 16.f;
+
+		dl->AddText(ImVec2(cx, cy), dim_col, "x64dbg:");
+		cy += 16.f;
+		std::string x64dbg_fmt = aob_generator::format_x64dbg_signature(current_copy);
+		dl->AddText(ImVec2(cx, cy), text_col, x64dbg_fmt.c_str(), x64dbg_fmt.c_str() + std::min(x64dbg_fmt.size(), static_cast<size_t>(200)));
 		cy += 20.f;
 
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
@@ -189,6 +221,74 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::SameLine();
 		if (ImGui::SmallButton("Copy Code")) {
 			ImGui::SetClipboardText(code_fmt.c_str());
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Copy YARA")) {
+			std::string yara = aob_generator::format_yara_rule(current_copy);
+			ImGui::SetClipboardText(yara.c_str());
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Copy x64dbg")) {
+			ImGui::SetClipboardText(x64dbg_fmt.c_str());
+		}
+
+		cy += 22.f;
+		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+
+		if (ImGui::SmallButton("Optimize")) {
+			std::lock_guard<std::mutex> lk(gen.mutex);
+			aob_generator::optimize_signature(gen.current);
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Export JSON")) {
+			char* appdata = nullptr;
+			size_t elen = 0;
+			_dupenv_s(&appdata, &elen, "APPDATA");
+			if (appdata) {
+				std::string path = std::string(appdata) + "\\AiDA\\Standalone\\aob_export.json";
+				free(appdata);
+				aob_generator::export_signatures_json(path);
+			}
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Export YARA")) {
+			char* appdata = nullptr;
+			size_t elen = 0;
+			_dupenv_s(&appdata, &elen, "APPDATA");
+			if (appdata) {
+				std::string path = std::string(appdata) + "\\AiDA\\Standalone\\aob_export.yar";
+				free(appdata);
+				aob_generator::export_signatures_yara(path);
+			}
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Export Header")) {
+			char* appdata = nullptr;
+			size_t elen = 0;
+			_dupenv_s(&appdata, &elen, "APPDATA");
+			if (appdata) {
+				std::string path = std::string(appdata) + "\\AiDA\\Standalone\\signatures.hpp";
+				free(appdata);
+				aob_generator::export_signatures_header(path);
+			}
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Compare")) {
+			std::lock_guard<std::mutex> lk(gen.mutex);
+			auto results = aob_generator::compare_signatures_against_process(gen.saved_signatures);
+			for (size_t ri = 0; ri < results.size() && ri < gen.saved_signatures.size(); ++ri) {
+				gen.saved_signatures[ri].unique = results[ri].still_found;
+				gen.saved_signatures[ri].uniqueness_count = results[ri].match_count;
+				gen.saved_signatures[ri].quality_score = aob_generator::compute_quality_score(gen.saved_signatures[ri]);
+			}
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Save Disk")) {
+			aob_generator::save_signatures_to_disk();
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Load Disk")) {
+			aob_generator::load_signatures_from_disk();
 		}
 
 		ImGui::PopStyleColor(4);
@@ -230,27 +330,41 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		dl->AddRectFilled(rmin, rmax, hovered ? row_hover : (selected ? header_bg : (i % 2 == 0 ? row_even : row_odd)));
 
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-			st.selected_saved = static_cast<int>(i);
+			st.selected_saved = (selected ? -1 : static_cast<int>(i));
 		}
 
 		auto& sig = saved_copy[i];
 		char addr_buf[32];
 		std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX", static_cast<unsigned long long>(sig.address));
 
-		dl->AddText(ImVec2(rx + 6.f, row_y + 3.f), text_col, sig.name.c_str());
+		{
+			ImU32 g_bg = IM_COL32(80, 80, 80, static_cast<int>(alpha * 180));
+			ImU32 g_fg = IM_COL32(30, 30, 30, static_cast<int>(alpha * 255));
+			float qs = sig.quality_score;
+			if (qs >= 0.85f) g_bg = IM_COL32(152, 195, 121, static_cast<int>(alpha * 200));
+			else if (qs >= 0.7f) g_bg = IM_COL32(97, 175, 239, static_cast<int>(alpha * 200));
+			else if (qs >= 0.5f) g_bg = IM_COL32(229, 192, 123, static_cast<int>(alpha * 200));
+			else if (qs > 0.f) g_bg = IM_COL32(224, 108, 117, static_cast<int>(alpha * 200));
+			const char* g_str = aob_generator::score_grade(qs);
+			dl->AddRectFilled(ImVec2(rx + 4.f, row_y + 3.f), ImVec2(rx + 22.f, row_y + row_h - 3.f), g_bg, 2.f);
+			ImVec2 g_tsz = ImGui::CalcTextSize(g_str);
+			dl->AddText(ImVec2(rx + 13.f - g_tsz.x * 0.5f, row_y + 3.f), g_fg, g_str);
+		}
+
+		dl->AddText(ImVec2(rx + 28.f, row_y + 3.f), text_col, sig.name.c_str());
 
 		float mid_x = rx + right_w * 0.4f;
 		dl->AddText(ImVec2(mid_x, row_y + 3.f), dim_col, addr_buf);
 
-		float end_x = rx + right_w * 0.7f;
+		float end_x = rx + right_w * 0.65f;
 		char sz_buf[16];
 		std::snprintf(sz_buf, sizeof(sz_buf), "%zu bytes", sig.bytes.size());
 		dl->AddText(ImVec2(end_x, row_y + 3.f), dim_col, sz_buf);
 
 		if (sig.uniqueness_count > 0) {
-			float u_x = rx + right_w - 50.f;
+			float u_x = rx + right_w - 55.f;
 			dl->AddText(ImVec2(u_x, row_y + 3.f), sig.unique ? unique_col : notuniq_col,
-			            sig.unique ? "Unique" : "Not unique");
+			            sig.unique ? "Unique" : "Non-unique");
 		}
 	}
 

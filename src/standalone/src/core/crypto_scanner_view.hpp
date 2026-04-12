@@ -6,7 +6,10 @@
 
 #include "imgui.h"
 #include "crypto_scanner.hpp"
+#include "disasm_view.hpp"
 #include "ui_anim.hpp"
+
+extern DisasmState g_disasm;
 
 namespace crypto_scanner_view {
 
@@ -19,6 +22,7 @@ struct state_t {
 	char   search_filter[128] = {};
 	int    sort_column = -1;
 	bool   sort_ascending = true;
+	int    ctx_hit_idx = -1;
 };
 
 inline state_t g_state;
@@ -69,10 +73,54 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::SameLine();
 	if (!scanning) {
 		if (ImGui::SmallButton("Scan File")) {
-			auto& files = globals::disasm_files;
-			if (globals::active_file_idx >= 0 && globals::active_file_idx < static_cast<int>(files.size())) {
-				crypto_scanner::scan_file(files[static_cast<size_t>(globals::active_file_idx)]);
+			if (g_disasm.file.loaded) {
+				crypto_scanner::scan_file(g_disasm.file);
 			}
+		}
+	}
+
+	ImGui::SameLine();
+	if (!scanning && !cs.scanning.load()) {
+		if (ImGui::SmallButton("Entropy")) {
+			crypto_scanner::scan_entropy();
+		}
+	}
+
+	ImGui::SameLine();
+	{
+		bool analyzing = cs.analyzing.load();
+		if (analyzing) {
+			ImGui::BeginDisabled();
+			ImGui::SmallButton("Analyzing...");
+			ImGui::EndDisabled();
+		} else {
+			if (ImGui::SmallButton("AI Analyze")) {
+				crypto_scanner::ai_analyze_results();
+			}
+		}
+	}
+
+	ImGui::SameLine();
+	if (ImGui::SmallButton("JSON")) {
+		char* appdata = nullptr;
+		size_t len = 0;
+		_dupenv_s(&appdata, &len, "APPDATA");
+		if (appdata) {
+			std::string path = std::string(appdata) + "\\AiDA\\Standalone\\crypto_export.json";
+			free(appdata);
+			crypto_scanner::export_results_json(path);
+		}
+	}
+
+	ImGui::SameLine();
+	if (ImGui::SmallButton("CSV")) {
+		char* appdata = nullptr;
+		size_t len = 0;
+		_dupenv_s(&appdata, &len, "APPDATA");
+		if (appdata) {
+			std::string path = std::string(appdata) + "\\AiDA\\Standalone\\crypto_export.csv";
+			free(appdata);
+			crypto_scanner::export_results_csv(path);
 		}
 	}
 
@@ -156,11 +204,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const float row_h = 22.f;
 	const float table_top = cy;
 	const float table_h = pos_y + height - cy - 8.f;
-	const float col_widths[5] = {width * 0.14f, width * 0.22f, width * 0.18f, width * 0.26f, width * 0.18f};
-	const char* col_names[5] = {"Algorithm", "Signature", "Address", "Module + Offset", "Category"};
+	const float col_widths[6] = {width * 0.12f, width * 0.18f, width * 0.16f, width * 0.22f, width * 0.14f, width * 0.16f};
+	const char* col_names[6] = {"Algorithm", "Signature", "Address", "Module + Offset", "Category", "Refs"};
 
 	float hx = cx;
-	for (int c = 0; c < 5; ++c) {
+	for (int c = 0; c < 6; ++c) {
 		dl->AddRectFilled(ImVec2(hx, cy), ImVec2(hx + col_widths[c], cy + row_h), header_bg);
 		ImGui::SetCursorScreenPos(ImVec2(hx + 6.f, cy + 3.f));
 		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.9f, 0.9f, alpha));
@@ -202,6 +250,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
 			globals::ui::active_center_view = center_view_t::disassembly;
+			disasm_view::goto_address(hit.address, g_disasm);
+		}
+
+		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+			st.ctx_hit_idx = i;
+			ImGui::OpenPopup("##crypto_ctx");
 		}
 
 		float rx = cx;
@@ -221,15 +275,71 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		rx += col_widths[3];
 
 		dl->AddText(ImVec2(rx + 6.f, ry + 3.f), dim_col, crypto_scanner::category_name(hit.category));
+
+		rx += col_widths[4];
+		if (!hit.referencing_functions.empty()) {
+			char ref_buf[32];
+			std::snprintf(ref_buf, sizeof(ref_buf), "%zu refs", hit.referencing_functions.size());
+			dl->AddText(ImVec2(rx + 6.f, ry + 3.f), accent, ref_buf);
+		}
 	}
 
 	ImGui::PopClipRect();
 
+	if (ImGui::BeginPopup("##crypto_ctx")) {
+		if (st.ctx_hit_idx >= 0 && st.ctx_hit_idx < static_cast<int>(filtered.size())) {
+			auto& ctx_hit = filtered[static_cast<size_t>(st.ctx_hit_idx)];
+
+			if (ImGui::MenuItem("Go to Disassembly")) {
+				globals::ui::active_center_view = center_view_t::disassembly;
+				disasm_view::goto_address(ctx_hit.address, g_disasm);
+			}
+
+			if (!ctx_hit.referencing_functions.empty()) {
+				if (ImGui::BeginMenu("Show References")) {
+					for (auto ref_addr : ctx_hit.referencing_functions) {
+						char ref_label[64];
+						std::snprintf(ref_label, sizeof(ref_label), "0x%llX", static_cast<unsigned long long>(ref_addr));
+						auto lbl = crypto_scanner::get_function_label(ref_addr);
+						std::string menu_text = ref_label;
+						if (!lbl.empty()) menu_text += " (" + lbl + ")";
+						if (ImGui::MenuItem(menu_text.c_str())) {
+							globals::ui::active_center_view = center_view_t::disassembly;
+							disasm_view::goto_address(ref_addr, g_disasm);
+						}
+					}
+					ImGui::EndMenu();
+				}
+			}
+
+			if (ImGui::MenuItem("Copy Address")) {
+				char addr_copy[32];
+				std::snprintf(addr_copy, sizeof(addr_copy), "0x%llX", static_cast<unsigned long long>(ctx_hit.address));
+				ImGui::SetClipboardText(addr_copy);
+			}
+
+			if (!ctx_hit.ai_analysis.empty()) {
+				if (ImGui::BeginMenu("AI Analysis")) {
+					ImGui::PushTextWrapPos(400.f);
+					ImGui::TextUnformatted(ctx_hit.ai_analysis.c_str());
+					ImGui::PopTextWrapPos();
+					ImGui::EndMenu();
+				}
+			}
+		}
+		ImGui::EndPopup();
+	}
+
 	{
-		char count_buf[64];
+		char count_buf[128];
 		std::lock_guard<std::mutex> lk(cs.mutex);
-		std::snprintf(count_buf, sizeof(count_buf), "%zu results", filtered.size());
-		dl->AddText(ImVec2(pos_x + width - 120.f, pos_y + height - 20.f), dim_col, count_buf);
+		size_t entropy_count = cs.entropy_map.size();
+		if (entropy_count > 0) {
+			std::snprintf(count_buf, sizeof(count_buf), "%zu results  |  %zu entropy regions", filtered.size(), entropy_count);
+		} else {
+			std::snprintf(count_buf, sizeof(count_buf), "%zu results", filtered.size());
+		}
+		dl->AddText(ImVec2(pos_x + width - 200.f, pos_y + height - 20.f), dim_col, count_buf);
 	}
 
 	if (content_h > visible_h) {

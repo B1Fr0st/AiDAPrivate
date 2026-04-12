@@ -12,6 +12,7 @@
 #include "decompiler_engine.hpp"
 #include "aob_generator.hpp"
 #include "standalone_settings.hpp"
+#include "symbol_store.hpp"
 
 namespace disasm_view {
 
@@ -367,6 +368,14 @@ void render(float pos_x, float pos_y, float width, float height,
             if (!hex_p) hex_p = ins.ops;
             if (sscanf_s(hex_p, "%llx", &target) == 1 || sscanf_s(hex_p, "0x%llx", &target) == 1) {
 
+                std::string sym_name = symbol_store::resolve_symbol(target);
+                if (!sym_name.empty()) {
+                    float ops_w = ImGui::CalcTextSize(ins.ops).x;
+                    std::string label = "; " + sym_name;
+                    dl->AddText(ImVec2(x_ops + ops_w + 12.f, y + 1.f),
+                        IM_COL32(120, 180, 140, static_cast<int>(180 * a)), label.c_str());
+                }
+
                 if (!instrs.empty() && target >= instrs.front().addr && target <= instrs.back().addr) {
                     float arrow_x = ox + width - 16.f;
                     dl->AddTriangleFilled(
@@ -547,8 +556,19 @@ void render(float pos_x, float pos_y, float width, float height,
             ImGui::Separator();
 
             if (ImGui::MenuItem("Decompile Function")) {
-                decompiler_engine::decompile_function(ci.addr, get_standalone_settings());
-                globals::ui::active_center_view = center_view_t::decompiler;
+                globals::ui::decompile_popup_addr = ci.addr;
+                if (globals::ui::decompile_default_mode == 0) {
+                    decompiler_engine::decompile_function(ci.addr, get_standalone_settings());
+                    globals::ui::active_center_view = center_view_t::decompiler;
+                } else if (globals::ui::decompile_default_mode == 1) {
+                    decompiler_engine::decompile_function_native(ci.addr);
+                    globals::ui::active_center_view = center_view_t::decompiler;
+                } else if (globals::ui::decompile_default_mode == 2) {
+                    decompiler_engine::decompile_function_hybrid(ci.addr, get_standalone_settings());
+                    globals::ui::active_center_view = center_view_t::decompiler;
+                } else {
+                    globals::ui::show_decompile_popup = true;
+                }
             }
             if (ImGui::MenuItem("Generate AOB Signature")) {
                 char addr_buf[32];

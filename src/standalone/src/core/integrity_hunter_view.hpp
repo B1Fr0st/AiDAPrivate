@@ -1,0 +1,318 @@
+#pragma once
+
+#include "integrity_hunter.hpp"
+#include "imgui/imgui.h"
+#include "../helpers/globals.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+namespace integrity_hunter_view {
+
+struct local_state_t {
+	float scroll_y = 0.f;
+	float target_scroll_y = 0.f;
+	int   selected_node = -1;
+	bool  show_event_log = false;
+	float log_scroll_y = 0.f;
+};
+
+static local_state_t s_state;
+
+inline void render(float pos_x, float pos_y, float width, float height,
+                   float alpha, float accent_r, float accent_g, float accent_b)
+{
+	auto* dl = ImGui::GetWindowDrawList();
+	auto& st = s_state;
+	auto& ih = integrity_hunter::g_state;
+
+	const ImU32 bg        = IM_COL32(30, 30, 30, static_cast<int>(alpha * 255));
+	const ImU32 text_col  = IM_COL32(212, 212, 212, static_cast<int>(alpha * 255));
+	const ImU32 dim_col   = IM_COL32(140, 140, 140, static_cast<int>(alpha * 255));
+	const ImU32 accent    = IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
+	                                  static_cast<int>(accent_b * 255), static_cast<int>(alpha * 255));
+	const ImU32 header_bg = IM_COL32(45, 45, 45, static_cast<int>(alpha * 255));
+	const ImU32 row_even  = IM_COL32(35, 35, 35, static_cast<int>(alpha * 255));
+	const ImU32 row_odd   = IM_COL32(40, 40, 40, static_cast<int>(alpha * 255));
+	const ImU32 row_hover = IM_COL32(55, 55, 55, static_cast<int>(alpha * 255));
+	const ImU32 sel_col   = IM_COL32(60, 60, 80, static_cast<int>(alpha * 255));
+	const ImU32 red_col   = IM_COL32(224, 108, 117, static_cast<int>(alpha * 255));
+	const ImU32 green_col = IM_COL32(152, 195, 121, static_cast<int>(alpha * 255));
+	const ImU32 yellow_col = IM_COL32(229, 192, 123, static_cast<int>(alpha * 255));
+
+	ImVec2 wpos = ImGui::GetWindowPos();
+	float cx = wpos.x + pos_x;
+	float cy = wpos.y + pos_y;
+
+	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + width, cy + height), bg);
+
+	const float toolbar_h = 68.f;
+	const float pad = 12.f;
+
+	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + width, cy + toolbar_h), header_bg);
+
+	float tx = cx + pad;
+	float ty = cy + 8.f;
+
+	ImGui::SetCursorScreenPos(ImVec2(tx, ty));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.15f, alpha));
+	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.83f, 0.83f, 0.83f, alpha));
+
+	ImGui::PushItemWidth(180.f);
+	ImGui::InputTextWithHint("##ih_addr", "Target Address (hex)", ih.address_input, sizeof(ih.address_input));
+	ImGui::PopItemWidth();
+	ImGui::SameLine();
+	ImGui::PushItemWidth(80.f);
+	ImGui::InputTextWithHint("##ih_size", "Size", ih.size_input, sizeof(ih.size_input));
+	ImGui::PopItemWidth();
+	ImGui::SameLine();
+
+	ImGui::PopStyleColor(2);
+
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(accent_r, accent_g, accent_b, 0.7f * alpha));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(accent_r, accent_g, accent_b, 0.9f * alpha));
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(accent_r, accent_g, accent_b, 1.0f * alpha));
+	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, alpha));
+
+	bool hunting = ih.hunting.load();
+
+	if (!hunting) {
+		if (ImGui::SmallButton("Start Hunt")) {
+			uint64_t addr = 0;
+			uint64_t sz = 4096;
+			if (ih.address_input[0])
+				addr = std::strtoull(ih.address_input, nullptr, 16);
+			if (ih.size_input[0])
+				sz = std::strtoull(ih.size_input, nullptr, 0);
+			if (addr != 0) {
+				integrity_hunter::start_hunt(addr, sz);
+			}
+		}
+	} else {
+		if (ImGui::SmallButton("Stop Hunt")) {
+			integrity_hunter::stop_hunt();
+		}
+	}
+
+	ImGui::SameLine();
+
+	bool log_toggle = st.show_event_log;
+	if (ImGui::SmallButton(log_toggle ? "Hide Log" : "Show Log")) {
+		st.show_event_log = !st.show_event_log;
+	}
+
+	ImGui::PopStyleColor(4);
+
+	ty += 26.f;
+
+	{
+		std::string status;
+		{
+			std::lock_guard<std::mutex> lk(ih.mutex);
+			status = ih.status_text;
+		}
+		if (!status.empty()) {
+			dl->AddText(ImVec2(cx + pad, ty + 2.f), dim_col, status.c_str());
+		}
+
+		if (hunting) {
+			uint64_t reads = ih.total_reads.load();
+			char rbuf[64];
+			std::snprintf(rbuf, sizeof(rbuf), "Total reads: %llu",
+			              static_cast<unsigned long long>(reads));
+			ImVec2 rs = ImGui::CalcTextSize(rbuf);
+			dl->AddText(ImVec2(cx + width - pad - rs.x, ty + 2.f), accent, rbuf);
+		}
+	}
+
+	float table_top = cy + toolbar_h + 4.f;
+	float log_h = st.show_event_log ? 160.f : 0.f;
+	float table_h = height - toolbar_h - 4.f - log_h;
+	if (table_h < 100.f) table_h = 100.f;
+
+	const float row_h = 22.f;
+	float hx = cx + pad;
+	float hy = table_top;
+
+	const float col_rip_w = 140.f;
+	const float col_module_w = 200.f;
+	const float col_compare_w = 120.f;
+	const float col_reads_w = 80.f;
+	const float col_rps_w = 70.f;
+	const float col_status_w = 80.f;
+	const float col_actions_w = (std::max)(0.f, width - col_rip_w - col_module_w - col_compare_w -
+	                             col_reads_w - col_rps_w - col_status_w - pad * 2.f);
+
+	dl->AddRectFilled(ImVec2(hx, hy), ImVec2(hx + width - pad * 2.f, hy + row_h), header_bg);
+
+	float hdr_x = hx + 4.f;
+	dl->AddText(ImVec2(hdr_x, hy + 3.f), text_col, "Reader RIP");
+	hdr_x += col_rip_w;
+	dl->AddText(ImVec2(hdr_x, hy + 3.f), text_col, "Module");
+	hdr_x += col_module_w;
+	dl->AddText(ImVec2(hdr_x, hy + 3.f), text_col, "Compare Addr");
+	hdr_x += col_compare_w;
+	dl->AddText(ImVec2(hdr_x, hy + 3.f), text_col, "Reads");
+	hdr_x += col_reads_w;
+	dl->AddText(ImVec2(hdr_x, hy + 3.f), text_col, "R/s");
+	hdr_x += col_rps_w;
+	dl->AddText(ImVec2(hdr_x, hy + 3.f), text_col, "Status");
+
+	hy += row_h;
+
+	std::vector<integrity_hunter::integrity_node_t> nodes_copy;
+	{
+		std::lock_guard<std::mutex> lk(ih.mutex);
+		nodes_copy = ih.nodes;
+	}
+
+	int visible_rows = static_cast<int>((table_h - row_h) / row_h);
+	int total_rows = static_cast<int>(nodes_copy.size());
+
+	if (ImGui::IsMouseHoveringRect(ImVec2(cx, table_top), ImVec2(cx + width, table_top + table_h))) {
+		float wheel = ImGui::GetIO().MouseWheel;
+		if (wheel != 0.f) {
+			st.target_scroll_y -= wheel * row_h * 3.f;
+		}
+	}
+
+	float max_scroll = (std::max)(0.f, static_cast<float>(total_rows) * row_h - (table_h - row_h));
+	if (st.target_scroll_y < 0.f) st.target_scroll_y = 0.f;
+	if (st.target_scroll_y > max_scroll) st.target_scroll_y = max_scroll;
+	st.scroll_y += (st.target_scroll_y - st.scroll_y) * 0.3f;
+
+	int start_row = static_cast<int>(st.scroll_y / row_h);
+	if (start_row < 0) start_row = 0;
+
+	for (int i = start_row; i < total_rows && i < start_row + visible_rows + 1; ++i) {
+		float ry = hy + static_cast<float>(i - start_row) * row_h;
+		if (ry > table_top + table_h) break;
+
+		auto& node = nodes_copy[static_cast<size_t>(i)];
+
+		bool hovered = ImGui::IsMouseHoveringRect(
+			ImVec2(hx, ry), ImVec2(hx + width - pad * 2.f, ry + row_h));
+		bool selected = (st.selected_node == i);
+
+		ImU32 row_bg = selected ? sel_col : (hovered ? row_hover : (i % 2 == 0 ? row_even : row_odd));
+		dl->AddRectFilled(ImVec2(hx, ry), ImVec2(hx + width - pad * 2.f, ry + row_h), row_bg);
+
+		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			st.selected_node = i;
+		}
+
+		float col_x = hx + 4.f;
+
+		char rip_buf[24];
+		std::snprintf(rip_buf, sizeof(rip_buf), "0x%llX",
+		              static_cast<unsigned long long>(node.reader_rip));
+		dl->AddText(ImVec2(col_x, ry + 3.f), text_col, rip_buf);
+		col_x += col_rip_w;
+
+		std::string mod_display = node.module_name;
+		if (mod_display.size() > 30) mod_display = mod_display.substr(0, 27) + "...";
+		dl->AddText(ImVec2(col_x, ry + 3.f), dim_col, mod_display.c_str());
+		col_x += col_module_w;
+
+		if (node.hash_compare_addr != 0) {
+			char cmp_buf[24];
+			std::snprintf(cmp_buf, sizeof(cmp_buf), "0x%llX",
+			              static_cast<unsigned long long>(node.hash_compare_addr));
+			dl->AddText(ImVec2(col_x, ry + 3.f), yellow_col, cmp_buf);
+		} else {
+			dl->AddText(ImVec2(col_x, ry + 3.f), dim_col, "N/A");
+		}
+		col_x += col_compare_w;
+
+		char reads_buf[16];
+		std::snprintf(reads_buf, sizeof(reads_buf), "%d", node.read_count);
+		dl->AddText(ImVec2(col_x, ry + 3.f), text_col, reads_buf);
+		col_x += col_reads_w;
+
+		char rps_buf[16];
+		std::snprintf(rps_buf, sizeof(rps_buf), "%.1f", node.reads_per_second);
+		dl->AddText(ImVec2(col_x, ry + 3.f), dim_col, rps_buf);
+		col_x += col_rps_w;
+
+		if (node.neutralized) {
+			dl->AddText(ImVec2(col_x, ry + 3.f), green_col, "Patched");
+		} else {
+			dl->AddText(ImVec2(col_x, ry + 3.f), red_col, "Active");
+		}
+
+		if (selected && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+			ImGui::OpenPopup("##ih_ctx");
+		}
+	}
+
+	if (ImGui::BeginPopup("##ih_ctx")) {
+		if (st.selected_node >= 0 && st.selected_node < total_rows) {
+			auto& sel_node = nodes_copy[static_cast<size_t>(st.selected_node)];
+
+			if (!sel_node.neutralized) {
+				if (ImGui::MenuItem("Neutralize")) {
+					integrity_hunter::neutralize(st.selected_node);
+				}
+			} else {
+				if (ImGui::MenuItem("Restore Original")) {
+					integrity_hunter::restore(st.selected_node);
+				}
+			}
+
+			if (ImGui::MenuItem("Go to Disassembly")) {
+				globals::ui::active_center_view = center_view_t::disassembly;
+			}
+
+			if (ImGui::MenuItem("Decompile Reader")) {
+				globals::ui::active_center_view = center_view_t::decompiler;
+			}
+		}
+		ImGui::EndPopup();
+	}
+
+	if (total_rows == 0) {
+		const char* hint = hunting
+			? "Waiting for integrity checker reads..."
+			: "Enter a code address and click 'Start Hunt' to find integrity checkers";
+		ImVec2 hs = ImGui::CalcTextSize(hint);
+		dl->AddText(ImVec2(cx + width * 0.5f - hs.x * 0.5f, table_top + table_h * 0.4f),
+		            dim_col, hint);
+	}
+
+	if (st.show_event_log && log_h > 0.f) {
+		float log_top = table_top + table_h + 2.f;
+		dl->AddRectFilled(ImVec2(cx, log_top), ImVec2(cx + width, log_top + log_h), header_bg);
+		dl->AddText(ImVec2(cx + pad, log_top + 2.f), text_col, "Event Log");
+
+		float log_content_top = log_top + 20.f;
+		float log_content_h = log_h - 22.f;
+
+		std::vector<integrity_hunter::capture_event_t> events;
+		{
+			std::lock_guard<std::mutex> lk(ih.mutex);
+			size_t start_idx = ih.event_log.size() > 100 ? ih.event_log.size() - 100 : 0;
+			events.assign(ih.event_log.begin() + static_cast<ptrdiff_t>(start_idx), ih.event_log.end());
+		}
+
+		float ey = log_content_top;
+		const float log_row_h = 16.f;
+		int visible_log = static_cast<int>(log_content_h / log_row_h);
+		int start_log = (std::max)(0, static_cast<int>(events.size()) - visible_log);
+
+		for (int i = start_log; i < static_cast<int>(events.size()); ++i) {
+			if (ey > log_top + log_h) break;
+			auto& evt = events[static_cast<size_t>(i)];
+			char line[128];
+			std::snprintf(line, sizeof(line), "[%s] RIP=0x%llX  Addr=0x%llX",
+			              evt.access_type == 0 ? "R" : "W",
+			              static_cast<unsigned long long>(evt.rip),
+			              static_cast<unsigned long long>(evt.fault_addr));
+			dl->AddText(ImGui::GetFont(), 12.f, ImVec2(cx + pad, ey), dim_col, line);
+			ey += log_row_h;
+		}
+	}
+}
+
+}

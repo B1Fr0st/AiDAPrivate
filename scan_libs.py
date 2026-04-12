@@ -16,7 +16,7 @@ from datetime import datetime
 from collections import Counter
 
 # ─── HARDCODED DIRECTORY TO SCAN ───
-SCAN_DIR = r"C:\Users\ruar\Downloads\Aetrix Src (2)\Aetrix Src\Fn External\Aewtix\source\utils\mapper"
+SCAN_DIR = r"C:\Users\ruar\Downloads\Rynz Ext"
 # ────────────────────────────────────
 
 # ─── VISUAL STUDIO TOOLCHAIN PATHS ───

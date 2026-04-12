@@ -25,7 +25,15 @@ enum class center_view_t : int {
 	struct_recon,
 	crypto_scanner,
 	aob_generator,
-	fuzzer_view
+	fuzzer_view,
+	xref_browser,
+	snapshot_diff,
+	pointer_scanner,
+	decrypt_oracle,
+	integrity_hunter,
+	symbolic_view,
+	taint_view,
+	deobfuscation_view
 };
 
 
@@ -472,6 +480,10 @@ namespace globals
 		inline int theme = 0;
 
 		inline bool is_moving = false;
+
+		inline bool show_decompile_popup = false;
+		inline uint64_t decompile_popup_addr = 0;
+		inline int decompile_default_mode = -1;
 
 		inline int welcome_set = -1;
 		inline float welcome_timer = 0.f;

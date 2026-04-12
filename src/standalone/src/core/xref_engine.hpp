@@ -294,4 +294,23 @@ inline void cancel_scan()
 	g_state.cancel.store(true);
 }
 
+inline bool is_scanning()
+{
+	return g_state.scanning.load();
+}
+
+inline void find_xrefs_to(uint64_t target_addr)
+{
+	auto modules = driver_bridge::enumerate_modules();
+	for (auto& m : modules) {
+		if (target_addr >= m.base && target_addr < m.base + m.size) {
+			find_xrefs_to(target_addr, m.base, m.size);
+			return;
+		}
+	}
+	if (!modules.empty()) {
+		find_xrefs_to(target_addr, modules[0].base, modules[0].size);
+	}
+}
+
 }

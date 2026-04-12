@@ -2,6 +2,7 @@
 #include "decompiler_engine.hpp"
 #include "syntax_highlight.hpp"
 #include "ui_anim.hpp"
+#include "disasm_view.hpp"
 
 #include "imgui/imgui.h"
 
@@ -16,6 +17,8 @@
 #include <windows.h>
 #endif
 
+extern DisasmState g_disasm;
+
 namespace decompiler_view {
 
 namespace {
@@ -24,6 +27,9 @@ struct line_info_t {
 	std::string text;
 	int         number = 0;
 };
+
+char batch_input[2048] = {};
+bool show_batch_panel = false;
 
 std::vector<line_info_t> split_lines(const std::string& text)
 {
@@ -124,6 +130,36 @@ void render(float pos_x, float pos_y, float width, float height,
 			snprintf(title, sizeof(title), "Decompiler");
 		}
 		dl->AddText(ImVec2(ox + 10.f, oy + (toolbar_h - 14.f) * 0.5f), accent_col, title);
+
+		const char* mode_label = nullptr;
+		ImU32 mode_color = 0;
+		switch (st.active_mode) {
+		case decompiler_engine::decompile_mode_t::ai:
+			mode_label = "AI";
+			mode_color = IM_COL32(100, 180, 255, 220);
+			break;
+		case decompiler_engine::decompile_mode_t::native_ghidra:
+			mode_label = "Ghidra";
+			mode_color = IM_COL32(100, 220, 120, 220);
+			break;
+		case decompiler_engine::decompile_mode_t::hybrid:
+			mode_label = "Hybrid";
+			mode_color = IM_COL32(220, 180, 80, 220);
+			break;
+		}
+		if (mode_label && st.current.function_addr) {
+			ImVec2 title_size = ImGui::CalcTextSize(title);
+			float badge_x = ox + 10.f + title_size.x + 10.f;
+			float badge_y = oy + (toolbar_h - 16.f) * 0.5f;
+			ImVec2 label_size = ImGui::CalcTextSize(mode_label);
+			float badge_w = label_size.x + 10.f;
+			float badge_h = 16.f;
+			dl->AddRectFilled(ImVec2(badge_x, badge_y),
+			                  ImVec2(badge_x + badge_w, badge_y + badge_h),
+			                  mode_color, 3.f);
+			dl->AddText(ImVec2(badge_x + 5.f, badge_y + 1.f),
+			            IM_COL32(0, 0, 0, 240), mode_label);
+		}
 	}
 
 	float btn_x = ox + code_w - 10.f;
@@ -187,8 +223,103 @@ void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
+	{
+		size_t cs = decompiler_engine::cache_size();
+		if (cs > 0) {
+			char cache_lbl[32];
+			snprintf(cache_lbl, sizeof(cache_lbl), "Cache: %zu", cs);
+			if (toolbar_button(cache_lbl, btn_x)) {
+				decompiler_engine::clear_cache();
+			}
+		}
+	}
+
+	if (st.batch_running.load()) {
+		char batch_lbl[48];
+		snprintf(batch_lbl, sizeof(batch_lbl), "Batch %d/%d",
+		         st.batch_done.load(), st.batch_total.load());
+		toolbar_button(batch_lbl, btn_x);
+	}
+
+	{
+		uint64_t sync_addr = 0;
+		{
+			std::lock_guard<std::mutex> lk(st.mutex);
+			sync_addr = st.current.function_addr;
+		}
+		if (sync_addr != 0) {
+			if (toolbar_button("Disasm", btn_x)) {
+				globals::ui::active_center_view = center_view_t::disassembly;
+				disasm_view::goto_address(sync_addr, g_disasm);
+			}
+		}
+	}
+
+	if (!st.batch_running.load() && !st.decompiling.load()) {
+		if (toolbar_button("Batch", btn_x)) {
+			show_batch_panel = !show_batch_panel;
+		}
+	}
+
+	if (toolbar_button("Save$", btn_x)) {
+		decompiler_engine::detail::save_all_cache_to_disk();
+	}
+
 	float code_top = oy + toolbar_h + 1.f;
 	float code_h = height - toolbar_h - 1.f;
+
+	if (show_batch_panel && !st.batch_running.load() && !st.decompiling.load()) {
+		float batch_panel_h = 120.f;
+		dl->AddRectFilled(ImVec2(ox, code_top), ImVec2(ox + code_w, code_top + batch_panel_h),
+		                  IM_COL32(25, 25, 35, static_cast<int>(230 * alpha)));
+		dl->AddLine(ImVec2(ox, code_top + batch_panel_h),
+		            ImVec2(ox + code_w, code_top + batch_panel_h),
+		            IM_COL32(50, 50, 65, static_cast<int>(180 * alpha)));
+
+		ImGui::SetCursorScreenPos(ImVec2(ox + 10.f, code_top + 4.f));
+		dl->AddText(ImVec2(ox + 10.f, code_top + 4.f), accent_col, "Batch Decompile — one hex address per line");
+
+		ImGui::SetCursorScreenPos(ImVec2(ox + 10.f, code_top + 22.f));
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.1f, 0.1f, 0.14f, alpha));
+		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.83f, 0.83f, 0.83f, alpha));
+		ImGui::PushItemWidth(code_w - 100.f);
+		ImGui::InputTextMultiline("##batch_addrs", batch_input, sizeof(batch_input),
+		                          ImVec2(code_w - 100.f, batch_panel_h - 30.f));
+		ImGui::PopItemWidth();
+		ImGui::PopStyleColor(2);
+
+		ImGui::SetCursorScreenPos(ImVec2(ox + code_w - 80.f, code_top + 22.f));
+		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(accent_r, accent_g, accent_b, 0.7f * alpha));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(accent_r, accent_g, accent_b, 0.9f * alpha));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(accent_r, accent_g, accent_b, 1.0f * alpha));
+		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, alpha));
+
+		if (ImGui::Button("Run##batch", ImVec2(70.f, 30.f))) {
+			std::vector<uint64_t> addrs;
+			std::string text = batch_input;
+			size_t pos = 0;
+			while (pos < text.size()) {
+				size_t nl = text.find('\n', pos);
+				if (nl == std::string::npos) nl = text.size();
+				std::string line = text.substr(pos, nl - pos);
+				pos = nl + 1;
+				while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+				if (line.empty()) continue;
+				uint64_t a = std::strtoull(line.c_str(), nullptr, 16);
+				if (a != 0) addrs.push_back(a);
+			}
+			if (!addrs.empty()) {
+				extern const settings_sa_t& get_standalone_settings();
+				decompiler_engine::batch_decompile(addrs, get_standalone_settings());
+				show_batch_panel = false;
+			}
+		}
+
+		ImGui::PopStyleColor(4);
+
+		code_top += batch_panel_h;
+		code_h -= batch_panel_h;
+	}
 	dl->PushClipRect(ImVec2(ox, code_top), ImVec2(ox + code_w, code_top + code_h), true);
 
 	if ((st.decompiling.load() || st.emulating.load()) && !st.current.complete) {
@@ -416,9 +547,33 @@ void render(float pos_x, float pos_y, float width, float height,
 
 			for (auto& callee : st.current.callees) {
 				if (py + 14.f > rp_y + rp_h - 4.f) break;
-				dl->AddText(ImVec2(rp_x + 14.f, py),
-				            IM_COL32(97, 175, 239, static_cast<int>(200 * alpha)),
-				            callee.c_str());
+
+				ImVec2 cp0(rp_x + 10.f, py);
+				ImVec2 cts = ImGui::CalcTextSize(callee.c_str());
+				ImVec2 cp1(cp0.x + cts.x + 8.f, py + 16.f);
+				bool callee_hov = ImGui::IsMouseHoveringRect(cp0, cp1, false);
+
+				ImU32 callee_col = callee_hov
+					? accent_col
+					: IM_COL32(97, 175, 239, static_cast<int>(200 * alpha));
+				dl->AddText(ImVec2(rp_x + 14.f, py), callee_col, callee.c_str());
+
+				if (callee_hov) {
+					dl->AddLine(ImVec2(rp_x + 14.f, py + cts.y),
+					            ImVec2(rp_x + 14.f + cts.x, py + cts.y),
+					            callee_col);
+				}
+
+				if (callee_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+					uint64_t target_addr = 0;
+					if (callee.size() > 4 && callee.substr(0, 4) == "sub_") {
+						if (sscanf_s(callee.c_str() + 4, "%llx", &target_addr) == 1 && target_addr != 0) {
+							extern const settings_sa_t& get_standalone_settings();
+							decompiler_engine::decompile_function(target_addr, get_standalone_settings());
+						}
+					}
+				}
+
 				py += 16.f;
 			}
 		}
@@ -435,10 +590,25 @@ void render(float pos_x, float pos_y, float width, float height,
 				for (int hi = static_cast<int>(st.history.size()) - 1; hi >= 0; --hi) {
 					if (py + 14.f > rp_y + rp_h - 4.f) break;
 					auto& he = st.history[hi];
+
+					ImVec2 hp0(rp_x + 10.f, py);
+					ImVec2 hts = ImGui::CalcTextSize(he.name.c_str());
+					ImVec2 hp1(hp0.x + hts.x + 8.f, py + 16.f);
+					bool hist_hov = ImGui::IsMouseHoveringRect(hp0, hp1, false);
+
 					ImU32 hc = (hi == st.history_pos)
 						? accent_col
-						: IM_COL32(150, 150, 165, static_cast<int>(180 * alpha));
+						: hist_hov
+							? IM_COL32(200, 200, 210, static_cast<int>(220 * alpha))
+							: IM_COL32(150, 150, 165, static_cast<int>(180 * alpha));
 					dl->AddText(ImVec2(rp_x + 14.f, py), hc, he.name.c_str());
+
+					if (hist_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hi != st.history_pos) {
+						st.history_pos = hi;
+						extern const settings_sa_t& get_standalone_settings();
+						decompiler_engine::decompile_function(he.addr, get_standalone_settings());
+					}
+
 					py += 16.f;
 				}
 			}

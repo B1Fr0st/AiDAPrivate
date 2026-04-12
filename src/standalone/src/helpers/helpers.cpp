@@ -38,6 +38,14 @@
 #include "../core/crypto_scanner_view.hpp"
 #include "../core/aob_view.hpp"
 #include "../core/fuzzer_view.hpp"
+#include "../core/xref_db_view.hpp"
+#include "../core/snapshot_diff.hpp"
+#include "../core/pointer_scanner_view.hpp"
+#include "../core/decrypt_oracle_view.hpp"
+#include "../core/integrity_hunter_view.hpp"
+#include "../core/symbolic_view.hpp"
+#include "../core/taint_view.hpp"
+#include "../core/deobfuscation_view.hpp"
 
 static ID3D11ShaderResourceView* g_send_icon_srv    = nullptr;
 static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
@@ -742,6 +750,123 @@ void helpers::render_title()
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
 			globals::ui::active_center_view = center_view_t::debugger_view;
 		}
+
+		if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
+			uint64_t dec_addr = decompiler_engine::g_state.current.function_addr;
+			if (dec_addr == 0)
+				dec_addr = globals::ui::decompile_popup_addr;
+			if (globals::ui::decompile_default_mode == 0) {
+				if (dec_addr)
+					decompiler_engine::decompile_function(dec_addr, get_standalone_settings());
+				globals::ui::active_center_view = center_view_t::decompiler;
+			} else if (globals::ui::decompile_default_mode == 1) {
+				if (dec_addr)
+					decompiler_engine::decompile_function_native(dec_addr);
+				globals::ui::active_center_view = center_view_t::decompiler;
+			} else if (globals::ui::decompile_default_mode == 2) {
+				if (dec_addr)
+					decompiler_engine::decompile_function_hybrid(dec_addr, get_standalone_settings());
+				globals::ui::active_center_view = center_view_t::decompiler;
+			} else {
+				globals::ui::show_decompile_popup = true;
+			}
+		}
+
+		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_X, false)) {
+			globals::ui::active_center_view = center_view_t::xref_browser;
+		}
+
+		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
+			globals::ui::active_center_view = center_view_t::deobfuscation_view;
+		}
+	}
+
+	if (globals::ui::show_decompile_popup) {
+		ImGui::OpenPopup("##decompile_choice");
+		globals::ui::show_decompile_popup = false;
+	}
+
+	if (ImGui::BeginPopupModal("##decompile_choice", nullptr,
+	    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove)) {
+		ImVec2 display = ImGui::GetIO().DisplaySize;
+		ImVec2 win_size = ImGui::GetWindowSize();
+		ImGui::SetWindowPos(ImVec2(display.x * 0.5f - win_size.x * 0.5f,
+		                            display.y * 0.5f - win_size.y * 0.5f));
+
+		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.9f, 0.95f, 1.f));
+		ImGui::Text("Decompile Function");
+		ImGui::PopStyleColor();
+		ImGui::Separator();
+		ImGui::Spacing();
+
+		float btn_w = 260.f;
+		float btn_h = 52.f;
+
+		uint64_t popup_addr = globals::ui::decompile_popup_addr;
+		if (popup_addr == 0)
+			popup_addr = decompiler_engine::g_state.current.function_addr;
+
+		if (ImGui::Button("AI Decompiler##dec_ai", ImVec2(btn_w, btn_h))) {
+			if (popup_addr)
+				decompiler_engine::decompile_function(popup_addr, get_standalone_settings());
+			globals::ui::active_center_view = center_view_t::decompiler;
+			if (remember_choice) {
+				globals::ui::decompile_default_mode = 0;
+				g_sa_settings.decompile_default_mode = 0;
+				g_sa_settings.save();
+			}
+			ImGui::CloseCurrentPopup();
+		}
+		if (ImGui::IsItemHovered()) {
+			ImGui::SetTooltip("Uses AI to generate high-quality pseudocode with variable naming.\nRequires API key. ~3-15 seconds.");
+		}
+
+		ImGui::Spacing();
+
+		if (ImGui::Button("Ghidra Decompiler##dec_ghidra", ImVec2(btn_w, btn_h))) {
+			if (popup_addr)
+				decompiler_engine::decompile_function_native(popup_addr);
+			globals::ui::active_center_view = center_view_t::decompiler;
+			if (remember_choice) {
+				globals::ui::decompile_default_mode = 1;
+				g_sa_settings.decompile_default_mode = 1;
+				g_sa_settings.save();
+			}
+			ImGui::CloseCurrentPopup();
+		}
+		if (ImGui::IsItemHovered()) {
+			ImGui::SetTooltip("Native decompilation engine. Instant results (~100ms).\nNo API key needed. Deterministic output.");
+		}
+
+		ImGui::Spacing();
+
+		if (ImGui::Button("Hybrid (Ghidra + AI)##dec_hybrid", ImVec2(btn_w, btn_h))) {
+			if (popup_addr)
+				decompiler_engine::decompile_function_hybrid(popup_addr, get_standalone_settings());
+			globals::ui::active_center_view = center_view_t::decompiler;
+			if (remember_choice) {
+				globals::ui::decompile_default_mode = 2;
+				g_sa_settings.decompile_default_mode = 2;
+				g_sa_settings.save();
+			}
+			ImGui::CloseCurrentPopup();
+		}
+		if (ImGui::IsItemHovered()) {
+			ImGui::SetTooltip("Ghidra for instant structure, then AI refines variable names.\nBest of both worlds.");
+		}
+
+		ImGui::Spacing();
+		ImGui::Separator();
+
+		static bool remember_choice = false;
+		ImGui::Checkbox("Remember my choice", &remember_choice);
+
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel")) {
+			ImGui::CloseCurrentPopup();
+		}
+
+		ImGui::EndPopup();
 	}
 
 	if (!helpers::themes_loaded && g_pd3dDevice) {
@@ -1245,6 +1370,7 @@ void helpers::render_title()
 			globals::ui::panel_left_visible  = g_sa_settings.workspace.left_visible;
 			globals::ui::panel_right_visible = g_sa_settings.workspace.right_visible;
 			globals::ui::panel_bottom_visible = g_sa_settings.workspace.bottom_visible;
+			globals::ui::decompile_default_mode = g_sa_settings.decompile_default_mode;
 			s_layout_synced = true;
 		}
 	}
@@ -3431,6 +3557,14 @@ void helpers::render_title()
 			anchor = add_right_tab("Crypto",     center_view_t::crypto_scanner, anchor);
 			anchor = add_right_tab("AOB",        center_view_t::aob_generator, anchor);
 			anchor = add_right_tab("Fuzzer",     center_view_t::fuzzer_view, anchor);
+			anchor = add_right_tab("XRefs",      center_view_t::xref_browser, anchor);
+			anchor = add_right_tab("Snapshots",  center_view_t::snapshot_diff, anchor);
+			anchor = add_right_tab("Pointers",   center_view_t::pointer_scanner, anchor);
+			anchor = add_right_tab("Decrypt",    center_view_t::decrypt_oracle, anchor);
+			anchor = add_right_tab("Integrity",  center_view_t::integrity_hunter, anchor);
+			anchor = add_right_tab("Symbolic",   center_view_t::symbolic_view, anchor);
+			anchor = add_right_tab("Taint",      center_view_t::taint_view, anchor);
+			anchor = add_right_tab("Deobfusc",   center_view_t::deobfuscation_view, anchor);
 		}
 
 		bool cf_clicked = ghost_btn("Choose File",
@@ -3631,6 +3765,46 @@ void helpers::render_title()
 	else if (cv == center_view_t::fuzzer_view)
 	{
 		fuzzer_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::xref_browser)
+	{
+		xref_db_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::snapshot_diff)
+	{
+		snapshot_diff::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::pointer_scanner)
+	{
+		pointer_scanner_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::decrypt_oracle)
+	{
+		decrypt_oracle_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::integrity_hunter)
+	{
+		integrity_hunter_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::symbolic_view)
+	{
+		symbolic_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::taint_view)
+	{
+		taint_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::deobfuscation_view)
+	{
+		deobfuscation_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
 	}
 
 	else

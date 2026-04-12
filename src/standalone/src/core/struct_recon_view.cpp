@@ -1,5 +1,6 @@
 #include "struct_recon_view.hpp"
 #include "struct_recon_engine.hpp"
+#include "struct_monitor.hpp"
 #include "ui_anim.hpp"
 #include "imgui.h"
 
@@ -101,6 +102,35 @@ void render(float pos_x, float pos_y, float width, float height,
 				struct_recon::monitor_with_hwbp(addr, sz, sr.name_input);
 			}
 		}
+		ImGui::SameLine();
+		{
+			bool live_active = struct_monitor::g_state.active.load();
+			if (!live_active) {
+				if (ImGui::SmallButton("Live Monitor")) {
+					uint64_t addr = 0;
+					int sz = 256;
+					if (sr.address_input[0]) addr = std::strtoull(sr.address_input, nullptr, 16);
+					if (sr.size_input[0]) sz = static_cast<int>(std::strtol(sr.size_input, nullptr, 0));
+					if (sz <= 0) sz = 256;
+					if (sz > 4096) sz = 4096;
+					if (addr != 0) {
+						struct_monitor::start(addr, sz, sr.name_input);
+					}
+				}
+			} else {
+				if (ImGui::SmallButton("Stop Live")) {
+					struct_monitor::stop();
+				}
+				ImGui::SameLine();
+				uint64_t cps = struct_monitor::g_state.captures_per_second.load();
+				uint64_t total = struct_monitor::g_state.total_captures.load();
+				char live_buf[64];
+				std::snprintf(live_buf, sizeof(live_buf), "%llu cap/s  %llu total",
+				              static_cast<unsigned long long>(cps),
+				              static_cast<unsigned long long>(total));
+				ImGui::TextColored(ImVec4(accent_r, accent_g, accent_b, alpha), "%s", live_buf);
+			}
+		}
 	} else {
 		if (ImGui::SmallButton("Cancel")) {
 			struct_recon::cancel();
@@ -119,6 +149,35 @@ void render(float pos_x, float pos_y, float width, float height,
 		std::lock_guard<std::mutex> lk(sr.mutex);
 		std::string cpp = struct_recon::export_as_cpp(sr.current);
 		ImGui::SetClipboardText(cpp.c_str());
+	}
+
+	ImGui::SameLine();
+	{
+		bool ai_naming = sr.ai_naming.load();
+		if (ai_naming) {
+			ImGui::BeginDisabled();
+			ImGui::SmallButton("Naming...");
+			ImGui::EndDisabled();
+		} else {
+			if (ImGui::SmallButton("AI Name")) {
+				struct_recon::ai_name_fields();
+			}
+		}
+	}
+
+	ImGui::SameLine();
+	if (ImGui::SmallButton("Save")) {
+		struct_recon::save_struct_to_disk(sr.current);
+	}
+
+	ImGui::SameLine();
+	if (ImGui::SmallButton("Load All")) {
+		struct_recon::load_structs_from_disk();
+	}
+
+	ImGui::SameLine();
+	if (ImGui::SmallButton("Refresh")) {
+		struct_recon::refresh_value_history(sr.current);
 	}
 
 	ImGui::PopStyleColor(4);
@@ -159,11 +218,11 @@ void render(float pos_x, float pos_y, float width, float height,
 	float content_h = static_cast<float>(current_copy.fields.size()) * row_h;
 	float visible_h = table_h;
 
-	const char* col_names[] = {"Offset", "Type", "Name", "Size", "Comment"};
-	const float col_pcts[] = {0.12f, 0.14f, 0.24f, 0.10f, 0.40f};
+	const char* col_names[] = {"Offset", "Type", "Name", "Size", "Conf", "Heat", "Comment"};
+	const float col_pcts[] = {0.10f, 0.12f, 0.18f, 0.07f, 0.07f, 0.06f, 0.40f};
 
 	float hx = cx;
-	for (int c = 0; c < 5; ++c) {
+	for (int c = 0; c < 7; ++c) {
 		float cw = main_w * col_pcts[c];
 		dl->AddRectFilled(ImVec2(hx, cy), ImVec2(hx + cw, cy + row_h), header_bg);
 		dl->AddText(ImVec2(hx + 6.f, cy + 3.f), text_col, col_names[c]);
@@ -212,7 +271,12 @@ void render(float pos_x, float pos_y, float width, float height,
 
 		cw = main_w * col_pcts[1];
 		ImU32 type_col = struct_recon::field_type_color(field.type, alpha);
-		dl->AddText(ImVec2(rx + 6.f, ry + 3.f), type_col, struct_recon::field_type_name(field.type));
+		if (field.array_count > 1) {
+			std::snprintf(buf, sizeof(buf), "%s[%d]", struct_recon::field_type_name(field.type), field.array_count);
+			dl->AddText(ImVec2(rx + 6.f, ry + 3.f), type_col, buf);
+		} else {
+			dl->AddText(ImVec2(rx + 6.f, ry + 3.f), type_col, struct_recon::field_type_name(field.type));
+		}
 		rx += cw;
 
 		cw = main_w * col_pcts[2];
@@ -225,6 +289,45 @@ void render(float pos_x, float pos_y, float width, float height,
 		rx += cw;
 
 		cw = main_w * col_pcts[4];
+		{
+			const char* conf_str = "?";
+			ImU32 conf_col = dim_col;
+			switch (field.type_confidence) {
+			case struct_recon::confidence_t::strong:
+				conf_str = "Strong";
+				conf_col = IM_COL32(152, 195, 121, static_cast<int>(alpha * 255));
+				break;
+			case struct_recon::confidence_t::moderate:
+				conf_str = "Med";
+				conf_col = IM_COL32(229, 192, 123, static_cast<int>(alpha * 255));
+				break;
+			case struct_recon::confidence_t::weak:
+				conf_str = "Weak";
+				conf_col = IM_COL32(224, 108, 117, static_cast<int>(alpha * 255));
+				break;
+			default:
+				conf_str = "-";
+				break;
+			}
+			dl->AddText(ImVec2(rx + 6.f, ry + 3.f), conf_col, conf_str);
+		}
+		rx += cw;
+
+		cw = main_w * col_pcts[5];
+		{
+			int heat = field.value_history.heat_level();
+			if (heat > 0) {
+				float bar_w = (cw - 12.f) * (static_cast<float>(heat) / 10.f);
+				ImU32 heat_col;
+				if (heat <= 3) heat_col = IM_COL32(60, 140, 60, static_cast<int>(alpha * 180));
+				else if (heat <= 6) heat_col = IM_COL32(229, 192, 123, static_cast<int>(alpha * 180));
+				else heat_col = IM_COL32(224, 108, 117, static_cast<int>(alpha * 180));
+				dl->AddRectFilled(ImVec2(rx + 6.f, ry + 5.f), ImVec2(rx + 6.f + bar_w, ry + row_h - 5.f), heat_col, 2.f);
+			}
+		}
+		rx += cw;
+
+		cw = main_w * col_pcts[6];
 		if (!field.comment.empty()) {
 			dl->AddText(ImVec2(rx + 6.f, ry + 3.f), dim_col, field.comment.c_str());
 		} else if (!field.accesses.empty()) {
@@ -264,6 +367,32 @@ void render(float pos_x, float pos_y, float width, float height,
 		dl->AddText(ImVec2(right_x, ry), type_c, buf);
 		ry += 16.f;
 
+		if (sel.array_count > 1) {
+			std::snprintf(buf, sizeof(buf), "Array: [%d]", sel.array_count);
+			dl->AddText(ImVec2(right_x, ry), accent, buf);
+			ry += 16.f;
+		}
+
+		{
+			const char* conf_name = "Unknown";
+			switch (sel.type_confidence) {
+			case struct_recon::confidence_t::strong:   conf_name = "Strong"; break;
+			case struct_recon::confidence_t::moderate:  conf_name = "Moderate"; break;
+			case struct_recon::confidence_t::weak:      conf_name = "Weak"; break;
+			default: break;
+			}
+			std::snprintf(buf, sizeof(buf), "Confidence: %s", conf_name);
+			dl->AddText(ImVec2(right_x, ry), text_col, buf);
+			ry += 16.f;
+		}
+
+		{
+			int heat = sel.value_history.heat_level();
+			std::snprintf(buf, sizeof(buf), "Heat: %d/10 (%d unique vals)", heat, static_cast<int>(sel.value_history.unique_count()));
+			dl->AddText(ImVec2(right_x, ry), text_col, buf);
+			ry += 16.f;
+		}
+
 		dl->AddText(ImVec2(right_x, ry), text_col,
 		            (std::string("Name: ") + sel.name).c_str());
 		ry += 20.f;
@@ -274,11 +403,25 @@ void render(float pos_x, float pos_y, float width, float height,
 
 			for (size_t vi = 0; vi < sel.vtable_entries.size() && vi < 32; ++vi) {
 				auto& ve = sel.vtable_entries[vi];
-				std::snprintf(buf, sizeof(buf), "[%2d] 0x%llX  %s",
-				              ve.index,
-				              static_cast<unsigned long long>(ve.func_addr),
-				              ve.name.c_str());
-				dl->AddText(ImVec2(right_x + 4.f, ry), dim_col, buf);
+
+				bool has_symbol = ve.name.find('!') != std::string::npos ||
+				                  ve.name.find('+') != std::string::npos;
+				ImU32 name_col = has_symbol ? accent : dim_col;
+
+				char idx_buf[16];
+				std::snprintf(idx_buf, sizeof(idx_buf), "[%2d]", ve.index);
+				dl->AddText(ImVec2(right_x + 4.f, ry), dim_col, idx_buf);
+
+				char addr_buf[24];
+				std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
+				              static_cast<unsigned long long>(ve.func_addr));
+				dl->AddText(ImVec2(right_x + 40.f, ry), dim_col, addr_buf);
+
+				float name_x = right_x + 170.f;
+				if (name_x + 10.f < pos_x + width - 12.f) {
+					dl->AddText(ImVec2(name_x, ry), name_col, ve.name.c_str());
+				}
+
 				ry += 15.f;
 			}
 		}

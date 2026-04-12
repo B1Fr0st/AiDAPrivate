@@ -378,6 +378,8 @@ struct settings_sa_t
 
     bool        activity_bar_visible = true;
 
+    int         decompile_default_mode = -1;
+
 
     int         window_x = -1;
     int         window_y = -1;
@@ -407,6 +409,11 @@ struct settings_sa_t
     std::string local_llm_base_url = "http://127.0.0.1:11434";
     std::string local_llm_model_name = "llama3.3:latest";
     std::string local_llm_api_key;
+
+    std::string pdb_search_paths;
+    std::string symbol_cache_dir;
+    bool        symbol_auto_download = false;
+    std::string symbol_server_url = "https://msdl.microsoft.com/download/symbols";
 
     static std::filesystem::path config_path()
     {
@@ -1117,6 +1124,11 @@ struct settings_sa_t
         str("local_llm_model_name", local_llm_model_name);
         str("local_llm_base_url", local_llm_base_url);
 
+        str("pdb_search_paths", pdb_search_paths);
+        str("symbol_cache_dir", symbol_cache_dir);
+        boolean("symbol_auto_download", symbol_auto_download);
+        str("symbol_server_url", symbol_server_url);
+
         if (root.contains("temperature") && root["temperature"].is_number())
             temperature = root["temperature"].get<double>();
         integer("mcp_port", mcp_port);
@@ -1192,6 +1204,7 @@ struct settings_sa_t
             condense_buffer = root["condense_buffer"].get<double>();
         str("recent_workspaces_json", recent_workspaces_json);
         boolean("activity_bar_visible", activity_bar_visible);
+        integer("decompile_default_mode", decompile_default_mode);
 
         integer("window_x", window_x);
         integer("window_y", window_y);
@@ -1337,6 +1350,11 @@ struct settings_sa_t
         root["local_llm_model_name"] = local_llm_model_name;
         root["local_llm_base_url"] = local_llm_base_url;
 
+        root["pdb_search_paths"] = pdb_search_paths;
+        root["symbol_cache_dir"] = symbol_cache_dir;
+        root["symbol_auto_download"] = symbol_auto_download;
+        root["symbol_server_url"] = symbol_server_url;
+
         root["temperature"] = temperature;
         root["mcp_port"] = mcp_port;
         root["mcp_enabled"] = mcp_enabled;
@@ -1404,6 +1422,7 @@ struct settings_sa_t
         root["condense_buffer"] = condense_buffer;
         root["recent_workspaces_json"] = recent_workspaces_json;
         root["activity_bar_visible"] = activity_bar_visible;
+        root["decompile_default_mode"] = decompile_default_mode;
 
         root["window_x"] = window_x;
         root["window_y"] = window_y;

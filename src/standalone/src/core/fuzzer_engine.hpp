@@ -5,12 +5,20 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "standalone_ai_client.hpp"
+#include "standalone_settings.hpp"
+
+#include <nlohmann/json.hpp>
 
 #ifdef __NT__
 #include "../../../emulation_engine.hpp"
@@ -38,6 +46,14 @@ enum class crash_type_t : int {
 	assertion,
 };
 
+enum class exploit_score_t : int {
+	unknown = 0,
+	low,
+	medium,
+	high,
+	critical,
+};
+
 struct mutation_t {
 	mutation_strategy_t strategy;
 	size_t              offset = 0;
@@ -48,14 +64,22 @@ struct mutation_t {
 
 struct crash_info_t {
 	crash_type_t type = crash_type_t::none;
+	exploit_score_t score = exploit_score_t::unknown;
 	uint64_t     fault_address = 0;
 	uint64_t     instruction_address = 0;
+	uint64_t     crash_hash = 0;
 	std::string  description;
+	std::string  crashing_instruction;
 	std::vector<uint8_t> input;
 	mutation_t   mutation;
 	uint64_t     rax = 0, rbx = 0, rcx = 0, rdx = 0;
 	uint64_t     rsp = 0, rbp = 0, rsi = 0, rdi = 0;
 	uint64_t     rip = 0;
+	uint64_t     r8 = 0, r9 = 0, r10 = 0, r11 = 0;
+	uint64_t     r12 = 0, r13 = 0, r14 = 0, r15 = 0;
+	std::string  ai_analysis;
+	std::vector<uint8_t> minimized_input;
+	bool         is_minimized = false;
 };
 
 struct coverage_info_t {
@@ -70,6 +94,8 @@ struct corpus_entry_t {
 	uint32_t               edge_hits = 0;
 	uint32_t               new_coverage = 0;
 	std::string            source;
+	float                  energy = 1.f;
+	uint64_t               exec_us = 0;
 };
 
 struct fuzz_config_t {
@@ -106,10 +132,13 @@ struct state_t {
 	std::vector<corpus_entry_t> corpus;
 	std::vector<crash_info_t>   crashes;
 	std::vector<crash_info_t>   unique_crashes;
+	std::set<uint64_t>          crash_hashes;
 
 	std::mutex      mutex;
 	std::atomic<bool> running{false};
 	std::atomic<bool> cancel{false};
+	std::atomic<bool> minimizing{false};
+	std::atomic<bool> analyzing_crash{false};
 	bool            active = false;
 
 	char addr_input[32] = {};
@@ -122,6 +151,63 @@ struct state_t {
 inline state_t g_state;
 
 namespace detail {
+
+inline uint64_t compute_crash_hash(uint64_t rip, crash_type_t type)
+{
+	uint64_t h = 0xcbf29ce484222325ULL;
+	auto mix = [&](uint64_t v) {
+		for (int i = 0; i < 8; ++i) {
+			h ^= (v >> (i * 8)) & 0xFF;
+			h *= 0x100000001b3ULL;
+		}
+	};
+	mix(rip);
+	mix(static_cast<uint64_t>(type));
+	return h;
+}
+
+inline exploit_score_t compute_exploit_score(const crash_info_t& crash)
+{
+	bool rip_controlled = false;
+	bool rsp_corrupted = false;
+	bool write_av = false;
+
+	if (crash.type == crash_type_t::access_violation) {
+		if (crash.rip < 0x10000 || crash.rip == 0x4141414141414141ULL ||
+		    crash.rip == 0xCCCCCCCCCCCCCCCCULL || crash.rip == 0xDEADBEEFDEADBEEFULL) {
+			rip_controlled = true;
+		}
+
+		std::string desc_lower = crash.description;
+		for (auto& c : desc_lower) c = static_cast<char>(std::tolower(c));
+		if (desc_lower.find("write") != std::string::npos) write_av = true;
+
+		if (crash.rsp < 0x1000 || crash.rsp > 0x7FFFFFFFE000ULL) {
+			rsp_corrupted = true;
+		}
+	}
+
+	if (rip_controlled) return exploit_score_t::critical;
+
+	if (crash.type == crash_type_t::stack_overflow && rsp_corrupted)
+		return exploit_score_t::high;
+
+	if (write_av) return exploit_score_t::high;
+
+	if (crash.type == crash_type_t::access_violation)
+		return exploit_score_t::medium;
+
+	if (crash.type == crash_type_t::invalid_instruction)
+		return exploit_score_t::medium;
+
+	if (crash.type == crash_type_t::division_by_zero)
+		return exploit_score_t::low;
+
+	if (crash.type == crash_type_t::timeout)
+		return exploit_score_t::low;
+
+	return exploit_score_t::unknown;
+}
 
 static constexpr int32_t interesting_8[]  = {0, 1, -1, 16, 32, 64, 100, 127, -128};
 static constexpr int32_t interesting_16[] = {0, 1, -1, 128, 255, 256, 512, 1000, 1024, 4096, 32767, -32768, 65535};
@@ -348,6 +434,53 @@ inline bool has_new_coverage(coverage_info_t& cov, const uint8_t* trace_bitmap)
 	return found_new;
 }
 
+inline size_t select_corpus_weighted(std::mt19937& rng, const std::vector<corpus_entry_t>& corpus)
+{
+	if (corpus.empty()) return 0;
+	if (corpus.size() == 1) return 0;
+
+	float total = 0.f;
+	for (auto& e : corpus) total += e.energy;
+	if (total <= 0.f) {
+		std::uniform_int_distribution<size_t> dist(0, corpus.size() - 1);
+		return dist(rng);
+	}
+
+	std::uniform_real_distribution<float> pick(0.f, total);
+	float r = pick(rng);
+	float acc = 0.f;
+	for (size_t i = 0; i < corpus.size(); ++i) {
+		acc += corpus[i].energy;
+		if (r <= acc) return i;
+	}
+	return corpus.size() - 1;
+}
+
+inline void update_corpus_energy(std::vector<corpus_entry_t>& corpus)
+{
+	if (corpus.empty()) return;
+
+	size_t avg_size = 0;
+	for (auto& e : corpus) avg_size += e.data.size();
+	avg_size /= corpus.size();
+	if (avg_size == 0) avg_size = 1;
+
+	for (auto& e : corpus) {
+		float size_factor = static_cast<float>(avg_size) / static_cast<float>((std::max)(e.data.size(), size_t(1)));
+		size_factor = (std::min)(size_factor, 4.f);
+
+		float cov_factor = 1.f + static_cast<float>(e.new_coverage) * 2.f;
+
+		float speed_factor = 1.f;
+		if (e.exec_us > 0 && e.exec_us < 100000)
+			speed_factor = 2.f;
+		else if (e.exec_us > 500000)
+			speed_factor = 0.5f;
+
+		e.energy = size_factor * cov_factor * speed_factor;
+	}
+}
+
 }
 
 inline const char* strategy_name(mutation_strategy_t s)
@@ -376,6 +509,17 @@ inline const char* crash_type_name(crash_type_t t)
 	}
 }
 
+inline const char* exploit_score_name(exploit_score_t s)
+{
+	switch (s) {
+	case exploit_score_t::critical: return "CRITICAL";
+	case exploit_score_t::high:     return "HIGH";
+	case exploit_score_t::medium:   return "MEDIUM";
+	case exploit_score_t::low:      return "LOW";
+	default: return "UNKNOWN";
+	}
+}
+
 inline void start_fuzzing()
 {
 #ifdef __NT__
@@ -388,6 +532,7 @@ inline void start_fuzzing()
 		g_state.stats = {};
 		g_state.crashes.clear();
 		g_state.unique_crashes.clear();
+		g_state.crash_hashes.clear();
 		std::memset(g_state.coverage.bitmap, 0, sizeof(g_state.coverage.bitmap));
 		g_state.coverage.edge_count = 0;
 		g_state.coverage.total_edges_discovered = 0;
@@ -429,8 +574,13 @@ inline void start_fuzzing()
 			{
 				std::lock_guard<std::mutex> lk(g_state.mutex);
 				if (g_state.corpus.empty()) break;
-				std::uniform_int_distribution<size_t> corpus_dist(0, g_state.corpus.size() - 1);
-				input = g_state.corpus[corpus_dist(rng)].data;
+				size_t idx = detail::select_corpus_weighted(rng, g_state.corpus);
+				input = g_state.corpus[idx].data;
+			}
+
+			if (iter > 0 && iter % 500 == 0) {
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				detail::update_corpus_energy(g_state.corpus);
 			}
 
 			mutation_t last_mutation;
@@ -498,21 +648,30 @@ inline void start_fuzzing()
 					else if (delta.name == "rsi") crash.rsi = delta.after;
 					else if (delta.name == "rdi") crash.rdi = delta.after;
 					else if (delta.name == "rip") crash.rip = delta.after;
+					else if (delta.name == "r8")  crash.r8 = delta.after;
+					else if (delta.name == "r9")  crash.r9 = delta.after;
+					else if (delta.name == "r10") crash.r10 = delta.after;
+					else if (delta.name == "r11") crash.r11 = delta.after;
+					else if (delta.name == "r12") crash.r12 = delta.after;
+					else if (delta.name == "r13") crash.r13 = delta.after;
+					else if (delta.name == "r14") crash.r14 = delta.after;
+					else if (delta.name == "r15") crash.r15 = delta.after;
 				}
+
+				if (!result.trace.empty()) {
+					auto& last_trace = result.trace.back();
+					crash.crashing_instruction = last_trace.disasm;
+				}
+
+				crash.crash_hash = detail::compute_crash_hash(crash.rip, crash.type);
+				crash.score = detail::compute_exploit_score(crash);
 
 				std::lock_guard<std::mutex> lk(g_state.mutex);
 				stats.total_crashes++;
 				g_state.crashes.push_back(crash);
 
-				bool is_unique = true;
-				for (auto& uc : g_state.unique_crashes) {
-					if (uc.instruction_address == crash.instruction_address &&
-					    uc.type == crash.type) {
-						is_unique = false;
-						break;
-					}
-				}
-				if (is_unique) {
+				if (g_state.crash_hashes.find(crash.crash_hash) == g_state.crash_hashes.end()) {
+					g_state.crash_hashes.insert(crash.crash_hash);
 					stats.total_unique_crashes++;
 					g_state.unique_crashes.push_back(crash);
 				}
@@ -573,6 +732,334 @@ inline void start_fuzzing()
 inline void stop_fuzzing()
 {
 	g_state.cancel.store(true);
+}
+
+inline void ai_analyze_crash(int crash_index)
+{
+#ifdef __NT__
+	if (g_state.analyzing_crash.load()) return;
+
+	crash_info_t target_crash;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		if (crash_index < 0 || crash_index >= static_cast<int>(g_state.unique_crashes.size())) return;
+		target_crash = g_state.unique_crashes[crash_index];
+	}
+
+	g_state.analyzing_crash.store(true);
+
+	std::thread([target_crash, crash_index]() {
+		std::string prompt = "You are a vulnerability researcher analyzing a crash found by a fuzzer.\n\n";
+		prompt += "CRASH DETAILS:\n";
+		prompt += "Type: " + std::string(crash_type_name(target_crash.type)) + "\n";
+		prompt += "Exploitability: " + std::string(exploit_score_name(target_crash.score)) + "\n";
+		prompt += "Description: " + target_crash.description + "\n";
+
+		char reg_buf[1024];
+		std::snprintf(reg_buf, sizeof(reg_buf),
+			"\nREGISTER STATE:\n"
+			"RAX=0x%016llX RBX=0x%016llX RCX=0x%016llX RDX=0x%016llX\n"
+			"RSP=0x%016llX RBP=0x%016llX RSI=0x%016llX RDI=0x%016llX\n"
+			"RIP=0x%016llX R8 =0x%016llX R9 =0x%016llX R10=0x%016llX\n"
+			"R11=0x%016llX R12=0x%016llX R13=0x%016llX R14=0x%016llX\nR15=0x%016llX\n",
+			static_cast<unsigned long long>(target_crash.rax),
+			static_cast<unsigned long long>(target_crash.rbx),
+			static_cast<unsigned long long>(target_crash.rcx),
+			static_cast<unsigned long long>(target_crash.rdx),
+			static_cast<unsigned long long>(target_crash.rsp),
+			static_cast<unsigned long long>(target_crash.rbp),
+			static_cast<unsigned long long>(target_crash.rsi),
+			static_cast<unsigned long long>(target_crash.rdi),
+			static_cast<unsigned long long>(target_crash.rip),
+			static_cast<unsigned long long>(target_crash.r8),
+			static_cast<unsigned long long>(target_crash.r9),
+			static_cast<unsigned long long>(target_crash.r10),
+			static_cast<unsigned long long>(target_crash.r11),
+			static_cast<unsigned long long>(target_crash.r12),
+			static_cast<unsigned long long>(target_crash.r13),
+			static_cast<unsigned long long>(target_crash.r14),
+			static_cast<unsigned long long>(target_crash.r15));
+		prompt += reg_buf;
+
+		if (!target_crash.crashing_instruction.empty())
+			prompt += "\nCrashing instruction: " + target_crash.crashing_instruction + "\n";
+
+		if (!target_crash.input.empty()) {
+			prompt += "\nInput hex (first 128 bytes):\n";
+			size_t show = (std::min)(target_crash.input.size(), size_t(128));
+			for (size_t i = 0; i < show; ++i) {
+				char hx[4];
+				std::snprintf(hx, sizeof(hx), "%02X ", target_crash.input[i]);
+				prompt += hx;
+				if ((i + 1) % 16 == 0) prompt += "\n";
+			}
+			prompt += "\n";
+		}
+
+		prompt += "\nMutation that caused crash: " + std::string(strategy_name(target_crash.mutation.strategy)) + "\n";
+		char mut_buf[128];
+		std::snprintf(mut_buf, sizeof(mut_buf), "Mutation offset: 0x%llX, size: %llu\n",
+			static_cast<unsigned long long>(target_crash.mutation.offset),
+			static_cast<unsigned long long>(target_crash.mutation.size));
+		prompt += mut_buf;
+
+		prompt += "\nAnalyze this crash. Determine:\n"
+		          "1. Root cause (buffer overflow, use-after-free, integer overflow, etc.)\n"
+		          "2. Exploitability assessment with reasoning\n"
+		          "3. Which register or memory location is tainted by the input\n"
+		          "4. Suggested proof-of-concept strategy if exploitable\n"
+		          "5. Recommended fix\n"
+		          "Be concise but thorough.";
+
+		extern const settings_sa_t& get_standalone_settings();
+		auto ai = std::make_unique<standalone_ai_client_t>(get_standalone_settings());
+		if (!ai->is_available()) {
+			g_state.analyzing_crash.store(false);
+			return;
+		}
+
+		std::vector<std::pair<std::string, std::string>> history;
+		std::string result = ai->chat_blocking(prompt, history, nullptr, nullptr);
+
+		if (!result.empty()) {
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			if (crash_index < static_cast<int>(g_state.unique_crashes.size()))
+				g_state.unique_crashes[crash_index].ai_analysis = result;
+		}
+
+		g_state.analyzing_crash.store(false);
+	}).detach();
+#else
+	(void)crash_index;
+#endif
+}
+
+inline void minimize_crash(int crash_index)
+{
+#ifdef __NT__
+	if (g_state.minimizing.load()) return;
+
+	crash_info_t target_crash;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		if (crash_index < 0 || crash_index >= static_cast<int>(g_state.unique_crashes.size())) return;
+		target_crash = g_state.unique_crashes[crash_index];
+	}
+
+	if (target_crash.input.empty()) return;
+
+	g_state.minimizing.store(true);
+
+	std::thread([target_crash, crash_index]() {
+		auto& cfg = g_state.config;
+
+		emulation::process_snapshot_t snapshot;
+		if (cfg.pid != 0 && cfg.tid != 0)
+			snapshot = emulation::driver_snapshot(cfg.pid, cfg.tid);
+
+		auto test_input = [&](const std::vector<uint8_t>& input) -> bool {
+			emulation::emulation_config_t emu_cfg;
+			emu_cfg.start_address = cfg.target_address;
+			emu_cfg.stop_address = cfg.end_address;
+			emu_cfg.max_instructions = cfg.max_instructions;
+			emu_cfg.timeout_us = static_cast<uint64_t>(cfg.timeout_ms) * 1000;
+			emu_cfg.max_trace_entries = 100;
+
+			auto snap_copy = snapshot;
+			if (cfg.input_address != 0) {
+				for (auto& region : snap_copy.regions) {
+					if (cfg.input_address >= region.base &&
+					    cfg.input_address + input.size() <= region.base + region.data.size()) {
+						size_t offset = static_cast<size_t>(cfg.input_address - region.base);
+						std::memset(region.data.data() + offset, 0, (std::min)(target_crash.input.size(), region.data.size() - offset));
+						std::memcpy(region.data.data() + offset, input.data(),
+						            (std::min)(input.size(), region.data.size() - offset));
+						break;
+					}
+				}
+			}
+
+			auto result = emulation::emulate_from_snapshot(snap_copy, emu_cfg);
+			if (!result.success && !result.error.empty()) {
+				uint64_t crash_hash = detail::compute_crash_hash(result.end_address, target_crash.type);
+				return crash_hash == target_crash.crash_hash;
+			}
+			return false;
+		};
+
+		std::vector<uint8_t> current = target_crash.input;
+
+		size_t block_size = current.size() / 2;
+		while (block_size >= 1 && !g_state.cancel.load()) {
+			size_t pos = 0;
+			bool changed = false;
+			while (pos + block_size <= current.size() && !g_state.cancel.load()) {
+				std::vector<uint8_t> candidate;
+				candidate.insert(candidate.end(), current.begin(), current.begin() + static_cast<ptrdiff_t>(pos));
+				candidate.insert(candidate.end(), current.begin() + static_cast<ptrdiff_t>(pos + block_size),
+				                 current.end());
+
+				if (!candidate.empty() && test_input(candidate)) {
+					current = candidate;
+					changed = true;
+				} else {
+					pos += block_size;
+				}
+			}
+			if (!changed)
+				block_size /= 2;
+		}
+
+		for (size_t i = 0; i < current.size() && !g_state.cancel.load(); ++i) {
+			if (current[i] == 0) continue;
+			uint8_t orig = current[i];
+			current[i] = 0;
+			if (!test_input(current))
+				current[i] = orig;
+		}
+
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			if (crash_index < static_cast<int>(g_state.unique_crashes.size())) {
+				g_state.unique_crashes[crash_index].minimized_input = current;
+				g_state.unique_crashes[crash_index].is_minimized = true;
+			}
+		}
+
+		g_state.minimizing.store(false);
+	}).detach();
+#else
+	(void)crash_index;
+#endif
+}
+
+inline std::string get_crash_export_dir()
+{
+	const char* appdata = std::getenv("APPDATA");
+	if (!appdata) return {};
+	return std::string(appdata) + "\\AiDA\\Standalone\\fuzzer_crashes";
+}
+
+inline void export_crashes()
+{
+	std::string dir = get_crash_export_dir();
+	if (dir.empty()) return;
+
+	std::error_code ec;
+	std::filesystem::create_directories(dir, ec);
+	if (ec) return;
+
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	for (size_t i = 0; i < g_state.unique_crashes.size(); ++i) {
+		auto& crash = g_state.unique_crashes[i];
+
+		nlohmann::json j;
+		j["type"] = static_cast<int>(crash.type);
+		j["score"] = static_cast<int>(crash.score);
+		j["fault_address"] = crash.fault_address;
+		j["instruction_address"] = crash.instruction_address;
+		j["crash_hash"] = crash.crash_hash;
+		j["description"] = crash.description;
+		j["crashing_instruction"] = crash.crashing_instruction;
+		j["rip"] = crash.rip;
+		j["rax"] = crash.rax;
+		j["rbx"] = crash.rbx;
+		j["rcx"] = crash.rcx;
+		j["rdx"] = crash.rdx;
+		j["rsp"] = crash.rsp;
+		j["rbp"] = crash.rbp;
+		j["rsi"] = crash.rsi;
+		j["rdi"] = crash.rdi;
+
+		std::string input_hex;
+		for (auto b : crash.input) {
+			char hx[4];
+			std::snprintf(hx, sizeof(hx), "%02X", b);
+			input_hex += hx;
+		}
+		j["input_hex"] = input_hex;
+		j["ai_analysis"] = crash.ai_analysis;
+
+		if (crash.is_minimized) {
+			std::string min_hex;
+			for (auto b : crash.minimized_input) {
+				char hx[4];
+				std::snprintf(hx, sizeof(hx), "%02X", b);
+				min_hex += hx;
+			}
+			j["minimized_hex"] = min_hex;
+		}
+
+		char fname[256];
+		std::snprintf(fname, sizeof(fname), "%s\\crash_%llX_%zu.json",
+		              dir.c_str(), static_cast<unsigned long long>(crash.crash_hash), i);
+
+		std::ofstream ofs(fname);
+		if (ofs.is_open()) ofs << j.dump(2);
+	}
+}
+
+inline void import_crashes()
+{
+	std::string dir = get_crash_export_dir();
+	if (dir.empty()) return;
+
+	std::error_code ec;
+	if (!std::filesystem::exists(dir, ec)) return;
+
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+
+	for (auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+		if (ec) break;
+		if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
+
+		std::ifstream ifs(entry.path());
+		if (!ifs.is_open()) continue;
+
+		try {
+			nlohmann::json j;
+			ifs >> j;
+
+			crash_info_t crash;
+			crash.type = static_cast<crash_type_t>(j.value("type", 0));
+			crash.score = static_cast<exploit_score_t>(j.value("score", 0));
+			crash.fault_address = j.value("fault_address", uint64_t(0));
+			crash.instruction_address = j.value("instruction_address", uint64_t(0));
+			crash.crash_hash = j.value("crash_hash", uint64_t(0));
+			crash.description = j.value("description", std::string{});
+			crash.crashing_instruction = j.value("crashing_instruction", std::string{});
+			crash.rip = j.value("rip", uint64_t(0));
+			crash.rax = j.value("rax", uint64_t(0));
+			crash.rbx = j.value("rbx", uint64_t(0));
+			crash.rcx = j.value("rcx", uint64_t(0));
+			crash.rdx = j.value("rdx", uint64_t(0));
+			crash.rsp = j.value("rsp", uint64_t(0));
+			crash.rbp = j.value("rbp", uint64_t(0));
+			crash.rsi = j.value("rsi", uint64_t(0));
+			crash.rdi = j.value("rdi", uint64_t(0));
+			crash.ai_analysis = j.value("ai_analysis", std::string{});
+
+			std::string input_hex = j.value("input_hex", std::string{});
+			for (size_t k = 0; k + 2 <= input_hex.size(); k += 2) {
+				uint8_t byte = static_cast<uint8_t>(std::strtoul(input_hex.substr(k, 2).c_str(), nullptr, 16));
+				crash.input.push_back(byte);
+			}
+
+			if (j.contains("minimized_hex")) {
+				crash.is_minimized = true;
+				std::string min_hex = j["minimized_hex"].get<std::string>();
+				for (size_t k = 0; k + 2 <= min_hex.size(); k += 2) {
+					uint8_t byte = static_cast<uint8_t>(std::strtoul(min_hex.substr(k, 2).c_str(), nullptr, 16));
+					crash.minimized_input.push_back(byte);
+				}
+			}
+
+			if (g_state.crash_hashes.find(crash.crash_hash) == g_state.crash_hashes.end()) {
+				g_state.crash_hashes.insert(crash.crash_hash);
+				g_state.unique_crashes.push_back(std::move(crash));
+			}
+		} catch (...) {}
+	}
 }
 
 }

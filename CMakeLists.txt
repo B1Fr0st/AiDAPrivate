@@ -123,6 +123,188 @@ if(MSVC AND TARGET unicorn-common)
     target_compile_options(unicorn-common PRIVATE /wd4319)
 endif()
 
+# --- Z3 (pre-built static library) ---
+# Download pre-built Z3 from GitHub releases if not already present
+set(Z3_VERSION "4.13.4")
+set(Z3_DIR "${CMAKE_BINARY_DIR}/.deps/z3")
+set(Z3_ARCHIVE_NAME "z3-${Z3_VERSION}-x64-win")
+set(Z3_ARCHIVE_PATH "${Z3_DIR}/${Z3_ARCHIVE_NAME}.zip")
+set(Z3_INSTALL_DIR "${Z3_DIR}/${Z3_ARCHIVE_NAME}")
+
+if(NOT EXISTS "${Z3_INSTALL_DIR}/include/z3.h")
+    message(STATUS "Downloading Z3 ${Z3_VERSION} pre-built binaries...")
+    file(MAKE_DIRECTORY "${Z3_DIR}")
+    file(DOWNLOAD
+        "https://github.com/Z3Prover/z3/releases/download/z3-${Z3_VERSION}/${Z3_ARCHIVE_NAME}.zip"
+        "${Z3_ARCHIVE_PATH}"
+        STATUS Z3_DL_STATUS
+        TIMEOUT 120
+    )
+    list(GET Z3_DL_STATUS 0 Z3_DL_CODE)
+    if(NOT Z3_DL_CODE EQUAL 0)
+        message(FATAL_ERROR "Failed to download Z3: ${Z3_DL_STATUS}")
+    endif()
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E tar xf "${Z3_ARCHIVE_PATH}"
+        WORKING_DIRECTORY "${Z3_DIR}"
+        RESULT_VARIABLE Z3_EXTRACT_RESULT
+    )
+    if(NOT Z3_EXTRACT_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to extract Z3 archive")
+    endif()
+endif()
+
+set(Z3_INCLUDE_DIRS "${Z3_INSTALL_DIR}/include" CACHE PATH "Z3 include directory" FORCE)
+set(Z3_LIBRARIES "${Z3_INSTALL_DIR}/bin/libz3.lib" CACHE FILEPATH "Z3 library" FORCE)
+set(Z3_FOUND TRUE CACHE BOOL "" FORCE)
+
+# --- Triton (symbolic execution engine) ---
+set(BUILD_SHARED_LIBS_SAVED_TRITON "${BUILD_SHARED_LIBS}")
+set(BUILD_SHARED_LIBS OFF)
+set(Z3_INTERFACE ON CACHE BOOL "" FORCE)
+set(BITWUZLA_INTERFACE OFF CACHE BOOL "" FORCE)
+set(LLVM_INTERFACE OFF CACHE BOOL "" FORCE)
+set(BOOST_INTERFACE OFF CACHE BOOL "" FORCE)
+set(PYTHON_BINDINGS OFF CACHE BOOL "" FORCE)
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ENABLE_TEST OFF CACHE BOOL "" FORCE)
+set(MSVC_STATIC OFF CACHE BOOL "" FORCE)
+
+set(TRITON_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Triton")
+add_subdirectory("${TRITON_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/.deps/triton")
+set(BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS_SAVED_TRITON}")
+
+if(MSVC AND TARGET triton)
+    target_compile_options(triton PRIVATE /W0 /wd4005 /wd4244 /wd4267 /wd4146 /wd4996)
+endif()
+
+# --- Ghidra Native Decompiler (embedded as static library) ---
+set(GHIDRA_DECOMP_DIR "${CMAKE_SOURCE_DIR}/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp")
+set(GHIDRA_SPECS_SRC_DIR "${CMAKE_SOURCE_DIR}/ghidra/Ghidra/Processors/x86/data/languages")
+set(GHIDRA_SPECS_OUTPUT_DIR "${CMAKE_BINARY_DIR}/ghidra_specs")
+
+file(GLOB GHIDRA_ALL_CC "${GHIDRA_DECOMP_DIR}/*.cc")
+
+set(GHIDRA_LIBDECOMP_EXCLUDE
+    "${GHIDRA_DECOMP_DIR}/ghidra_arch.cc"
+    "${GHIDRA_DECOMP_DIR}/ghidra_context.cc"
+    "${GHIDRA_DECOMP_DIR}/ghidra_process.cc"
+    "${GHIDRA_DECOMP_DIR}/ghidra_translate.cc"
+    "${GHIDRA_DECOMP_DIR}/inject_ghidra.cc"
+    "${GHIDRA_DECOMP_DIR}/loadimage_ghidra.cc"
+    "${GHIDRA_DECOMP_DIR}/typegrp_ghidra.cc"
+    "${GHIDRA_DECOMP_DIR}/database_ghidra.cc"
+    "${GHIDRA_DECOMP_DIR}/cpool_ghidra.cc"
+    "${GHIDRA_DECOMP_DIR}/comment_ghidra.cc"
+    "${GHIDRA_DECOMP_DIR}/string_ghidra.cc"
+    "${GHIDRA_DECOMP_DIR}/signature_ghidra.cc"
+    "${GHIDRA_DECOMP_DIR}/slgh_compile.cc"
+    "${GHIDRA_DECOMP_DIR}/slghparse.cc"
+    "${GHIDRA_DECOMP_DIR}/slghscan.cc"
+    "${GHIDRA_DECOMP_DIR}/consolemain.cc"
+    "${GHIDRA_DECOMP_DIR}/sleighexample.cc"
+    "${GHIDRA_DECOMP_DIR}/test.cc"
+    "${GHIDRA_DECOMP_DIR}/bfd_arch.cc"
+    "${GHIDRA_DECOMP_DIR}/loadimage_bfd.cc"
+    "${GHIDRA_DECOMP_DIR}/raw_arch.cc"
+    "${GHIDRA_DECOMP_DIR}/xml_arch.cc"
+    "${GHIDRA_DECOMP_DIR}/loadimage_xml.cc"
+)
+
+set(GHIDRA_LIBDECOMP_SOURCES ${GHIDRA_ALL_CC})
+list(REMOVE_ITEM GHIDRA_LIBDECOMP_SOURCES ${GHIDRA_LIBDECOMP_EXCLUDE})
+
+add_library(libdecomp_aida STATIC ${GHIDRA_LIBDECOMP_SOURCES})
+target_include_directories(libdecomp_aida PRIVATE
+    "${GHIDRA_DECOMP_DIR}"
+    "${zlib_SOURCE_DIR}"
+    "${zlib_BINARY_DIR}"
+)
+target_compile_definitions(libdecomp_aida PRIVATE
+    _CRT_SECURE_NO_WARNINGS
+    NOMINMAX
+)
+if(MSVC)
+    target_compile_options(libdecomp_aida PRIVATE /W0 /EHsc /MD)
+endif()
+target_link_libraries(libdecomp_aida PRIVATE zlibstatic)
+
+add_executable(ghidra_sleigh_compiler
+    "${GHIDRA_DECOMP_DIR}/xml.cc"
+    "${GHIDRA_DECOMP_DIR}/marshal.cc"
+    "${GHIDRA_DECOMP_DIR}/space.cc"
+    "${GHIDRA_DECOMP_DIR}/float.cc"
+    "${GHIDRA_DECOMP_DIR}/address.cc"
+    "${GHIDRA_DECOMP_DIR}/pcoderaw.cc"
+    "${GHIDRA_DECOMP_DIR}/translate.cc"
+    "${GHIDRA_DECOMP_DIR}/opcodes.cc"
+    "${GHIDRA_DECOMP_DIR}/globalcontext.cc"
+    "${GHIDRA_DECOMP_DIR}/sleigh.cc"
+    "${GHIDRA_DECOMP_DIR}/pcodeparse.cc"
+    "${GHIDRA_DECOMP_DIR}/pcodecompile.cc"
+    "${GHIDRA_DECOMP_DIR}/sleighbase.cc"
+    "${GHIDRA_DECOMP_DIR}/slghsymbol.cc"
+    "${GHIDRA_DECOMP_DIR}/slghpatexpress.cc"
+    "${GHIDRA_DECOMP_DIR}/slghpattern.cc"
+    "${GHIDRA_DECOMP_DIR}/semantics.cc"
+    "${GHIDRA_DECOMP_DIR}/context.cc"
+    "${GHIDRA_DECOMP_DIR}/slaformat.cc"
+    "${GHIDRA_DECOMP_DIR}/compression.cc"
+    "${GHIDRA_DECOMP_DIR}/filemanage.cc"
+    "${GHIDRA_DECOMP_DIR}/slgh_compile.cc"
+    "${GHIDRA_DECOMP_DIR}/slghparse.cc"
+    "${GHIDRA_DECOMP_DIR}/slghscan.cc"
+)
+target_include_directories(ghidra_sleigh_compiler PRIVATE
+    "${GHIDRA_DECOMP_DIR}"
+    "${zlib_SOURCE_DIR}"
+    "${zlib_BINARY_DIR}"
+)
+target_compile_definitions(ghidra_sleigh_compiler PRIVATE
+    _CRT_SECURE_NO_WARNINGS
+    NOMINMAX
+)
+if(MSVC)
+    target_compile_options(ghidra_sleigh_compiler PRIVATE /W0 /EHsc /MD /O2)
+endif()
+target_link_libraries(ghidra_sleigh_compiler PRIVATE zlibstatic)
+
+file(MAKE_DIRECTORY "${GHIDRA_SPECS_OUTPUT_DIR}")
+
+add_custom_command(
+    OUTPUT "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
+    COMMAND ghidra_sleigh_compiler "${GHIDRA_SPECS_SRC_DIR}/x86-64.slaspec" "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
+    DEPENDS ghidra_sleigh_compiler "${GHIDRA_SPECS_SRC_DIR}/x86-64.slaspec"
+    WORKING_DIRECTORY "${GHIDRA_SPECS_SRC_DIR}"
+    COMMENT "Compiling SLEIGH: x86-64.slaspec -> x86-64.sla"
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.pspec"
+           "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64-win.cspec"
+           "${GHIDRA_SPECS_OUTPUT_DIR}/x86.ldefs"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${GHIDRA_SPECS_SRC_DIR}/x86-64.pspec" "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.pspec"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${GHIDRA_SPECS_SRC_DIR}/x86-64-win.cspec" "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64-win.cspec"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${GHIDRA_SPECS_SRC_DIR}/x86.ldefs" "${GHIDRA_SPECS_OUTPUT_DIR}/x86.ldefs"
+    DEPENDS
+        "${GHIDRA_SPECS_SRC_DIR}/x86-64.pspec"
+        "${GHIDRA_SPECS_SRC_DIR}/x86-64-win.cspec"
+        "${GHIDRA_SPECS_SRC_DIR}/x86.ldefs"
+    COMMENT "Copying Ghidra spec files"
+    VERBATIM
+)
+
+add_custom_target(ghidra_specs ALL DEPENDS
+    "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
+    "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.pspec"
+    "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64-win.cspec"
+    "${GHIDRA_SPECS_OUTPUT_DIR}/x86.ldefs"
+)
+
 if(BUILD_AIDA_PLUGIN)
     if(NOT DEFINED IDASDK_DIR)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ida-sdk/src/include/ida.hpp")
@@ -433,6 +615,10 @@ if(WIN32)
             "${zlib_BINARY_DIR}"
             "${IDA_STUBS_DIR}"
             "${CMAKE_CURRENT_SOURCE_DIR}/mapper/src"
+            "${TRITON_SOURCE_DIR}/src/libtriton/includes"
+            "${CMAKE_BINARY_DIR}/.deps/triton/src/libtriton/includes"
+            "${Z3_INCLUDE_DIRS}"
+            "${GHIDRA_DECOMP_DIR}"
         )
 
         target_compile_definitions(AiDAStandalone PRIVATE
@@ -445,6 +631,8 @@ if(WIN32)
             UNICODE
             _UNICODE
             SOL_ALL_SAFETIES_ON=1
+            TRITON_Z3_INTERFACE
+            GHIDRA_SPECS_DIR="${GHIDRA_SPECS_OUTPUT_DIR}"
         )
 
         target_compile_options(AiDAStandalone PRIVATE
@@ -466,6 +654,8 @@ if(WIN32)
         target_link_libraries(AiDAStandalone PRIVATE
             Zydis
             unicorn
+            triton
+            libdecomp_aida
             freetype
             zlibstatic
             brotlidec
@@ -517,6 +707,20 @@ if(WIN32)
             COMPILE_PDB_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
             COMPILE_PDB_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
             COMPILE_PDB_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
+        )
+
+        add_dependencies(AiDAStandalone ghidra_specs)
+
+        add_custom_command(TARGET AiDAStandalone POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
+                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.pspec"
+                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64-win.cspec"
+                "${GHIDRA_SPECS_OUTPUT_DIR}/x86.ldefs"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs/"
+            COMMENT "Copying Ghidra specs to output directory"
+            VERBATIM
         )
 
     endif()

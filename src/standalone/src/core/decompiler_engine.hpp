@@ -2,24 +2,38 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "cfg_view.hpp"
+#include "pe_parser.hpp"
 #include "standalone_ai_client.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
 #include "xref_engine.hpp"
 #include "zydis_disasm.hpp"
+#include "ghidra_decompiler.hpp"
+
+#include <nlohmann/json.hpp>
 
 #ifdef __NT__
 #include "emulation_engine.hpp"
 #endif
 
 namespace decompiler_engine {
+
+enum class decompile_mode_t {
+	ai = 0,
+	native_ghidra = 1,
+	hybrid = 2
+};
 
 struct decompile_result_t {
 	uint64_t    function_addr = 0;
@@ -54,6 +68,15 @@ struct state_t {
 
 	float scroll_y = 0.f;
 	float target_scroll_y = 0.f;
+
+	std::unordered_map<uint64_t, decompile_result_t> cache;
+
+	std::atomic<bool>  batch_running{false};
+	std::atomic<int>   batch_total{0};
+	std::atomic<int>   batch_done{0};
+	std::vector<uint64_t> batch_queue;
+
+	decompile_mode_t active_mode = decompile_mode_t::ai;
 };
 
 inline state_t g_state;
@@ -155,6 +178,317 @@ inline std::string resolve_module_symbols(uint64_t func_addr)
 		}
 	}
 	return out;
+}
+
+struct import_lookup_t {
+	std::unordered_map<uint64_t, std::string> iat_map;
+	std::unordered_map<uint64_t, std::string> export_map;
+	std::vector<driver_bridge::module_info_t> modules;
+};
+
+inline import_lookup_t build_import_lookup(uint64_t func_addr)
+{
+	import_lookup_t result;
+	result.modules = driver_bridge::enumerate_modules();
+
+	driver_bridge::module_info_t target_module{};
+	bool found_module = false;
+	for (auto& m : result.modules) {
+		if (func_addr >= m.base && func_addr < m.base + m.size) {
+			target_module = m;
+			found_module = true;
+			break;
+		}
+	}
+
+	if (!found_module) return result;
+
+	pe_parser::pe_info_t pe;
+	if (!pe_parser::parse(target_module.base, pe)) return result;
+
+	std::vector<pe_parser::import_entry_t> imports;
+	if (pe_parser::parse_imports(target_module.base, pe, imports)) {
+		for (auto& imp : imports) {
+			if (imp.iat_address == 0 || imp.function_name.empty()) continue;
+			std::string mod_short = imp.module_name;
+			size_t dot = mod_short.rfind('.');
+			if (dot != std::string::npos) mod_short = mod_short.substr(0, dot);
+			result.iat_map[imp.iat_address] = mod_short + "!" + imp.function_name;
+			if (imp.bound_address != 0)
+				result.export_map[imp.bound_address] = mod_short + "!" + imp.function_name;
+		}
+	}
+
+	return result;
+}
+
+inline std::string resolve_call_name(import_lookup_t& lookup, uint64_t call_target, uint64_t iat_addr = 0)
+{
+	if (iat_addr != 0) {
+		auto it = lookup.iat_map.find(iat_addr);
+		if (it != lookup.iat_map.end()) return it->second;
+	}
+
+	auto eit = lookup.export_map.find(call_target);
+	if (eit != lookup.export_map.end()) return eit->second;
+
+	for (auto& m : lookup.modules) {
+		if (call_target < m.base || call_target >= m.base + m.size) continue;
+
+		pe_parser::pe_info_t mod_pe;
+		if (!pe_parser::parse(m.base, mod_pe)) break;
+
+		std::vector<pe_parser::export_entry_t> exports;
+		if (!pe_parser::parse_exports(m.base, mod_pe, exports)) break;
+
+		std::string mod_short = m.name;
+		size_t dot = mod_short.rfind('.');
+		if (dot != std::string::npos) mod_short = mod_short.substr(0, dot);
+
+		for (auto& exp : exports) {
+			if (!exp.name.empty() && !exp.is_forwarded)
+				lookup.export_map[exp.address] = mod_short + "!" + exp.name;
+		}
+
+		auto eit2 = lookup.export_map.find(call_target);
+		if (eit2 != lookup.export_map.end()) return eit2->second;
+		break;
+	}
+
+	return {};
+}
+
+inline std::string try_read_string_at(uint64_t addr, size_t max_len = 128)
+{
+	std::vector<uint8_t> data;
+	driver_bridge::read_memory(addr, max_len, data);
+	if (data.size() < 4) return {};
+
+	int printable = 0;
+	int total = 0;
+	for (size_t i = 0; i < data.size(); ++i) {
+		uint8_t c = data[i];
+		if (c == 0) break;
+		total++;
+		if (c >= 0x20 && c < 0x7F) printable++;
+	}
+
+	if (total >= 4 && printable * 2 > total) {
+		std::string result;
+		result.reserve(static_cast<size_t>(total));
+		for (int i = 0; i < total && static_cast<size_t>(i) < data.size() && data[i] != 0; ++i)
+			result.push_back(static_cast<char>(data[i]));
+		return result;
+	}
+
+	printable = 0;
+	total = 0;
+	for (size_t i = 0; i + 2 <= data.size(); i += 2) {
+		uint16_t c = 0;
+		std::memcpy(&c, data.data() + i, 2);
+		if (c == 0) break;
+		total++;
+		if (c >= 0x20 && c < 0x7F) printable++;
+	}
+
+	if (total >= 4 && printable * 2 > total) {
+		std::string result;
+		result.reserve(static_cast<size_t>(total));
+		for (size_t i = 0; i + 2 <= data.size(); i += 2) {
+			uint16_t c = 0;
+			std::memcpy(&c, data.data() + i, 2);
+			if (c == 0) break;
+			if (c < 0x80) result.push_back(static_cast<char>(c));
+			else result += '?';
+		}
+		return result;
+	}
+
+	return {};
+}
+
+inline void annotate_instructions(std::vector<cfg_view::basic_block_t>& blocks,
+                                   const uint8_t* mem, uint64_t mem_base, size_t mem_size,
+                                   import_lookup_t& lookup)
+{
+	for (auto& blk : blocks) {
+		for (auto& ins : blk.instructions) {
+			if (ins.addr < mem_base) continue;
+			uint64_t off = ins.addr - mem_base;
+			if (off >= mem_size) continue;
+
+			const uint8_t* raw = mem + off;
+			int avail = static_cast<int>((std::min)(mem_size - off, static_cast<size_t>(15)));
+
+			if (avail >= 5 && raw[0] == 0xE8) {
+				int32_t rel = 0;
+				std::memcpy(&rel, raw + 1, 4);
+				uint64_t target = ins.addr + 5 + rel;
+				std::string name = resolve_call_name(lookup, target);
+				if (!name.empty()) {
+					ins.text += " ; ";
+					ins.text += name;
+				}
+			}
+			else if (avail >= 6 && raw[0] == 0xFF && raw[1] == 0x15) {
+				int32_t disp = 0;
+				std::memcpy(&disp, raw + 2, 4);
+				uint64_t iat_addr = ins.addr + 6 + disp;
+				std::string name = resolve_call_name(lookup, 0, iat_addr);
+				if (!name.empty()) {
+					ins.text += " ; ";
+					ins.text += name;
+				}
+			}
+			else {
+				bool is_lea = false;
+				int lea_disp_offset = 0;
+				int lea_insn_len = 0;
+
+				if (avail >= 7 && (raw[0] == 0x48 || raw[0] == 0x4C) && raw[1] == 0x8D) {
+					uint8_t modrm = raw[2];
+					uint8_t mod_field = (modrm >> 6) & 3;
+					uint8_t rm_field = modrm & 7;
+					if (mod_field == 0 && rm_field == 5) {
+						is_lea = true;
+						lea_disp_offset = 3;
+						lea_insn_len = 7;
+					}
+				}
+
+				if (!is_lea && avail >= 7 && raw[0] == 0x48 && raw[1] == 0x8B) {
+					uint8_t modrm = raw[2];
+					uint8_t mod_field = (modrm >> 6) & 3;
+					uint8_t rm_field = modrm & 7;
+					if (mod_field == 0 && rm_field == 5) {
+						is_lea = true;
+						lea_disp_offset = 3;
+						lea_insn_len = 7;
+					}
+				}
+
+				if (is_lea && lea_disp_offset + 4 <= avail) {
+					int32_t disp = 0;
+					std::memcpy(&disp, raw + lea_disp_offset, 4);
+					uint64_t target = ins.addr + lea_insn_len + disp;
+
+					std::string str = try_read_string_at(target);
+					if (!str.empty()) {
+						if (str.size() > 64) {
+							str.resize(64);
+							str += "...";
+						}
+						ins.text += " ; \"";
+						ins.text += str;
+						ins.text += "\"";
+					}
+				}
+			}
+		}
+	}
+}
+
+inline std::string get_cache_dir()
+{
+	const char* appdata = std::getenv("APPDATA");
+	if (!appdata) return {};
+	return std::string(appdata) + "\\AiDA\\Standalone\\decompiler_cache";
+}
+
+inline void save_cache_entry_to_disk(uint64_t func_addr, const decompile_result_t& result)
+{
+	std::string dir = get_cache_dir();
+	if (dir.empty()) return;
+
+	std::error_code ec;
+	std::filesystem::create_directories(dir, ec);
+	if (ec) return;
+
+	std::string module_name;
+	uint64_t rva = func_addr;
+	auto modules = driver_bridge::enumerate_modules();
+	for (auto& m : modules) {
+		if (func_addr >= m.base && func_addr < m.base + m.size) {
+			module_name = m.name;
+			rva = func_addr - m.base;
+			break;
+		}
+	}
+
+	if (module_name.empty()) {
+		char buf[32];
+		std::snprintf(buf, sizeof(buf), "unk_%llX", static_cast<unsigned long long>(func_addr));
+		module_name = buf;
+	}
+
+	for (auto& c : module_name) {
+		if (c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
+			c = '_';
+	}
+
+	char fname[256];
+	std::snprintf(fname, sizeof(fname), "%s\\%s_%llX.json",
+	              dir.c_str(), module_name.c_str(), static_cast<unsigned long long>(rva));
+
+	nlohmann::json j;
+	j["function_addr"] = func_addr;
+	j["function_name"] = result.function_name;
+	j["pseudocode"] = result.pseudocode;
+	j["parameters"] = result.parameters;
+	j["callees"] = result.callees;
+
+	std::ofstream ofs(fname);
+	if (ofs.is_open()) {
+		ofs << j.dump(2);
+	}
+}
+
+inline void save_all_cache_to_disk()
+{
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	for (auto& [addr, result] : g_state.cache) {
+		save_cache_entry_to_disk(addr, result);
+	}
+}
+
+inline void load_cache_from_disk()
+{
+	std::string dir = get_cache_dir();
+	if (dir.empty()) return;
+
+	std::error_code ec;
+	if (!std::filesystem::exists(dir, ec)) return;
+
+	for (auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+		if (ec) break;
+		if (!entry.is_regular_file()) continue;
+		if (entry.path().extension() != ".json") continue;
+
+		std::ifstream ifs(entry.path());
+		if (!ifs.is_open()) continue;
+
+		try {
+			nlohmann::json j;
+			ifs >> j;
+
+			decompile_result_t result;
+			result.function_addr = j.value("function_addr", uint64_t(0));
+			result.function_name = j.value("function_name", std::string{});
+			result.pseudocode = j.value("pseudocode", std::string{});
+			result.parameters = j.value("parameters", std::string{});
+			if (j.contains("callees") && j["callees"].is_array()) {
+				for (auto& c : j["callees"])
+					result.callees.push_back(c.get<std::string>());
+			}
+			result.complete = true;
+
+			if (result.function_addr != 0 && !result.pseudocode.empty()) {
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				if (g_state.cache.find(result.function_addr) == g_state.cache.end())
+					g_state.cache[result.function_addr] = std::move(result);
+			}
+		} catch (...) {}
+	}
 }
 
 inline std::string build_decompile_prompt(uint64_t func_addr,
@@ -331,6 +665,27 @@ inline void decompile_function(uint64_t func_addr, const settings_sa_t& settings
 {
 	if (g_state.decompiling.load()) return;
 
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		auto cache_it = g_state.cache.find(func_addr);
+		if (cache_it != g_state.cache.end()) {
+			g_state.current = cache_it->second;
+			g_state.streaming_text.clear();
+			g_state.active = true;
+
+			if (g_state.history_pos < 0 ||
+			    g_state.history_pos >= static_cast<int>(g_state.history.size()) ||
+			    g_state.history[g_state.history_pos].addr != func_addr) {
+				if (g_state.history_pos + 1 < static_cast<int>(g_state.history.size()))
+					g_state.history.erase(g_state.history.begin() + g_state.history_pos + 1,
+					                      g_state.history.end());
+				g_state.history.push_back({func_addr, g_state.current.function_name});
+				g_state.history_pos = static_cast<int>(g_state.history.size()) - 1;
+			}
+			return;
+		}
+	}
+
 	g_state.decompiling.store(true);
 	g_state.cancel.store(false);
 
@@ -388,9 +743,38 @@ inline void decompile_function(uint64_t func_addr, const settings_sa_t& settings
 			int sz = static_cast<int>(mem.size());
 			int pos = 0;
 
+			std::set<uint64_t> known_targets;
+			known_targets.insert(func_addr);
+			bool after_terminator = false;
+
 			while (pos < sz && all_insns.size() < 4096) {
-				int avail = (std::min)(sz - pos, 15);
 				uint64_t va = func_addr + pos;
+
+				if (after_terminator) {
+					if (known_targets.find(va) == known_targets.end()) {
+						auto it = known_targets.upper_bound(va);
+						if (it != known_targets.end() && *it < func_addr + max_bytes) {
+							int pad_end = pos;
+							bool is_padding = true;
+							while (pad_end < sz && static_cast<uint64_t>(pad_end) < (*it - func_addr)) {
+								if (data[pad_end] != 0xCC && data[pad_end] != 0x90 && data[pad_end] != 0x00) {
+									is_padding = false;
+									break;
+								}
+								pad_end++;
+							}
+							if (is_padding || *it - func_addr - pos <= 16) {
+								pos = static_cast<int>(*it - func_addr);
+								after_terminator = false;
+								continue;
+							}
+						}
+						break;
+					}
+					after_terminator = false;
+				}
+
+				int avail = (std::min)(sz - pos, 15);
 				AsmInstr ins = zydis_decode_one(data + pos, avail, va);
 
 				decoded_t d;
@@ -418,9 +802,21 @@ inline void decompile_function(uint64_t func_addr, const settings_sa_t& settings
 					}
 				}
 
+				if (d.has_target && !d.ins.is_call) {
+					if (d.branch_target >= func_addr && d.branch_target < func_addr + max_bytes)
+						known_targets.insert(d.branch_target);
+				}
+
 				all_insns.push_back(d);
-				if (ins.is_ret) break;
 				pos += ins.len;
+
+				if (ins.is_ret) {
+					after_terminator = true;
+				} else if (d.has_target && !d.ins.is_call) {
+					bool is_uncond = (std::strcmp(d.ins.mnem, "jmp") == 0 || std::strcmp(d.ins.mnem, "JMP") == 0);
+					if (is_uncond)
+						after_terminator = true;
+				}
 			}
 
 			for (auto& d2 : all_insns) {
@@ -532,6 +928,9 @@ inline void decompile_function(uint64_t func_addr, const settings_sa_t& settings
 			return;
 		}
 
+		detail::import_lookup_t lookup = detail::build_import_lookup(func_addr);
+		detail::annotate_instructions(blocks, mem.data(), func_addr, mem.size(), lookup);
+
 		std::string prompt = detail::build_decompile_prompt(func_addr, blocks);
 
 		std::string system_prompt =
@@ -583,6 +982,10 @@ inline void decompile_function(uint64_t func_addr, const settings_sa_t& settings
 
 			g_state.current.complete = true;
 			g_state.streaming_text.clear();
+			if (!g_state.current.is_error) {
+				g_state.cache[func_addr] = g_state.current;
+				detail::save_cache_entry_to_disk(func_addr, g_state.current);
+			}
 		}
 
 		g_state.decompiling.store(false);
@@ -815,6 +1218,9 @@ inline void decompile_with_deobfuscation(uint64_t func_addr, const settings_sa_t
 
 			g_state.current.complete = true;
 			g_state.streaming_text.clear();
+			if (!g_state.current.is_error) {
+				g_state.cache[func_addr] = g_state.current;
+			}
 		}
 
 		g_state.decompiling.store(false);
@@ -840,6 +1246,477 @@ inline void navigate_forward()
 		extern const settings_sa_t& get_standalone_settings();
 		decompile_function(entry.addr, get_standalone_settings());
 	}
+}
+
+inline void clear_cache()
+{
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	g_state.cache.clear();
+}
+
+inline size_t cache_size()
+{
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	return g_state.cache.size();
+}
+
+inline void batch_decompile(const std::vector<uint64_t>& addresses)
+{
+	if (g_state.batch_running.load() || g_state.decompiling.load()) return;
+
+	g_state.batch_running.store(true);
+	g_state.cancel.store(false);
+	g_state.batch_total.store(static_cast<int>(addresses.size()));
+	g_state.batch_done.store(0);
+
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.batch_queue = addresses;
+	}
+
+	std::thread([addresses]() {
+		extern const settings_sa_t& get_standalone_settings();
+		auto& settings = get_standalone_settings();
+
+		for (int i = 0; i < static_cast<int>(addresses.size()); ++i) {
+			if (g_state.cancel.load()) break;
+
+			uint64_t addr = addresses[i];
+
+			{
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				if (g_state.cache.count(addr)) {
+					g_state.batch_done.store(i + 1);
+					continue;
+				}
+			}
+
+			g_state.decompiling.store(true);
+
+			{
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.streaming_text.clear();
+				g_state.current = {};
+				g_state.current.function_addr = addr;
+				g_state.active = true;
+
+				char name[64];
+				snprintf(name, sizeof(name), "sub_%llX", static_cast<unsigned long long>(addr));
+				g_state.current.function_name = name;
+			}
+
+			const size_t max_bytes = 0x10000;
+			std::vector<uint8_t> mem;
+			driver_bridge::read_memory(addr, max_bytes, mem);
+
+			if (mem.empty()) {
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.current.is_error = true;
+				g_state.current.error_text = "Failed to read memory.";
+				g_state.current.complete = true;
+				g_state.batch_done.store(i + 1);
+				g_state.decompiling.store(false);
+				continue;
+			}
+
+			std::vector<cfg_view::basic_block_t> blocks;
+			{
+				std::map<uint64_t, bool> leaders;
+				leaders[addr] = true;
+
+				struct decoded_t { AsmInstr ins; uint64_t branch_target = 0; bool has_target = false; };
+				std::vector<decoded_t> all_insns;
+				all_insns.reserve(4096);
+
+				const uint8_t* data = mem.data();
+				int sz = static_cast<int>(mem.size());
+				int pos = 0;
+
+				std::set<uint64_t> known_targets;
+				known_targets.insert(addr);
+				bool after_terminator = false;
+
+				while (pos < sz && all_insns.size() < 4096) {
+					uint64_t va = addr + pos;
+
+					if (after_terminator) {
+						if (known_targets.find(va) == known_targets.end()) {
+							auto it = known_targets.upper_bound(va);
+							if (it != known_targets.end() && *it < addr + max_bytes) {
+								int pad_end = pos;
+								bool is_padding = true;
+								while (pad_end < sz && static_cast<uint64_t>(pad_end) < (*it - addr)) {
+									if (data[pad_end] != 0xCC && data[pad_end] != 0x90 && data[pad_end] != 0x00) {
+										is_padding = false;
+										break;
+									}
+									pad_end++;
+								}
+								if (is_padding || *it - addr - pos <= 16) {
+									pos = static_cast<int>(*it - addr);
+									after_terminator = false;
+									continue;
+								}
+							}
+							break;
+						}
+						after_terminator = false;
+					}
+
+					int avail = (std::min)(sz - pos, 15);
+					AsmInstr ins = zydis_decode_one(data + pos, avail, va);
+
+					decoded_t d; d.ins = ins;
+					if (ins.is_call || ins.is_branch) {
+						if (ins.len == 5 && (data[pos] == 0xE8 || data[pos] == 0xE9)) {
+							int32_t rel = 0; std::memcpy(&rel, data + pos + 1, 4);
+							d.branch_target = va + ins.len + rel; d.has_target = true;
+						} else if (ins.len == 2 && (data[pos] >= 0x70 && data[pos] <= 0x7F)) {
+							int8_t rel = static_cast<int8_t>(data[pos + 1]);
+							d.branch_target = va + ins.len + rel; d.has_target = true;
+						} else if (ins.len == 6 && data[pos] == 0x0F && (data[pos+1] >= 0x80 && data[pos+1] <= 0x8F)) {
+							int32_t rel = 0; std::memcpy(&rel, data + pos + 2, 4);
+							d.branch_target = va + ins.len + rel; d.has_target = true;
+						} else if (ins.len == 2 && data[pos] == 0xEB) {
+							int8_t rel = static_cast<int8_t>(data[pos + 1]);
+							d.branch_target = va + ins.len + rel; d.has_target = true;
+						}
+					}
+
+					if (d.has_target && !d.ins.is_call) {
+						if (d.branch_target >= addr && d.branch_target < addr + max_bytes)
+							known_targets.insert(d.branch_target);
+					}
+
+					all_insns.push_back(d);
+					pos += ins.len;
+
+					if (ins.is_ret) {
+						after_terminator = true;
+					} else if (d.has_target && !d.ins.is_call) {
+						bool is_uncond = (std::strcmp(d.ins.mnem, "jmp") == 0 || std::strcmp(d.ins.mnem, "JMP") == 0);
+						if (is_uncond)
+							after_terminator = true;
+					}
+				}
+
+				for (auto& d2 : all_insns) {
+					if (d2.has_target && !d2.ins.is_call) {
+						leaders[d2.branch_target] = true;
+						leaders[d2.ins.addr + d2.ins.len] = true;
+					}
+					if (d2.ins.is_ret) leaders[d2.ins.addr + d2.ins.len] = true;
+				}
+
+				std::map<uint64_t, int> addr_to_block;
+				int cur_block = -1;
+
+				for (auto& d2 : all_insns) {
+					if (leaders.count(d2.ins.addr)) {
+						auto it = addr_to_block.find(d2.ins.addr);
+						if (it != addr_to_block.end()) cur_block = it->second;
+						else {
+							cur_block = static_cast<int>(blocks.size());
+							blocks.emplace_back();
+							blocks.back().start_addr = d2.ins.addr;
+							addr_to_block[d2.ins.addr] = cur_block;
+						}
+						if (d2.ins.addr == addr) blocks[cur_block].is_entry = true;
+					}
+					if (cur_block < 0) {
+						cur_block = static_cast<int>(blocks.size());
+						blocks.emplace_back();
+						blocks.back().start_addr = d2.ins.addr;
+						addr_to_block[d2.ins.addr] = cur_block;
+					}
+
+					cfg_view::instruction_line_t line;
+					line.addr = d2.ins.addr;
+					char buf[192];
+					snprintf(buf, sizeof(buf), "%s %s", d2.ins.mnem, d2.ins.ops);
+					line.text = buf;
+					blocks[cur_block].instructions.push_back(std::move(line));
+					blocks[cur_block].end_addr = d2.ins.addr + d2.ins.len;
+
+					if (d2.ins.is_ret) continue;
+					if (d2.has_target && !d2.ins.is_call) {
+						auto it_t = addr_to_block.find(d2.branch_target);
+						if (it_t != addr_to_block.end())
+							blocks[cur_block].successors.push_back(it_t->second);
+						else {
+							int tidx = static_cast<int>(blocks.size());
+							blocks.emplace_back();
+							blocks.back().start_addr = d2.branch_target;
+							addr_to_block[d2.branch_target] = tidx;
+							blocks[cur_block].successors.push_back(tidx);
+						}
+						bool is_uncond = (std::strcmp(d2.ins.mnem, "jmp") == 0 || std::strcmp(d2.ins.mnem, "JMP") == 0);
+						if (!is_uncond) {
+							uint64_t fall = d2.ins.addr + d2.ins.len;
+							auto it_f = addr_to_block.find(fall);
+							if (it_f != addr_to_block.end())
+								blocks[cur_block].successors.push_back(it_f->second);
+							else {
+								int fidx = static_cast<int>(blocks.size());
+								blocks.emplace_back();
+								blocks.back().start_addr = fall;
+								addr_to_block[fall] = fidx;
+								blocks[cur_block].successors.push_back(fidx);
+							}
+						}
+						cur_block = -1;
+					}
+				}
+			}
+
+			if (blocks.empty()) {
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.current.is_error = true;
+				g_state.current.error_text = "No CFG blocks.";
+				g_state.current.complete = true;
+				g_state.batch_done.store(i + 1);
+				g_state.decompiling.store(false);
+				continue;
+			}
+
+			for (auto& blk : blocks) {
+				for (auto& ins : blk.instructions) {
+					if (ins.text.find("call") != std::string::npos || ins.text.find("CALL") != std::string::npos) {
+						uint64_t target = 0;
+						if (sscanf_s(ins.text.c_str() + ins.text.find("call") + 4, " %llx", &target) == 1 ||
+						    sscanf_s(ins.text.c_str() + ins.text.find("call") + 4, " 0x%llx", &target) == 1) {
+							char target_str[64];
+							snprintf(target_str, sizeof(target_str), "sub_%llX", static_cast<unsigned long long>(target));
+							std::lock_guard<std::mutex> lk(g_state.mutex);
+							bool found = false;
+							for (auto& c : g_state.current.callees) { if (c == target_str) { found = true; break; } }
+							if (!found) g_state.current.callees.push_back(target_str);
+						}
+					}
+				}
+			}
+
+			if (g_state.cancel.load()) break;
+
+			detail::import_lookup_t batch_lookup = detail::build_import_lookup(addr);
+			detail::annotate_instructions(blocks, mem.data(), addr, mem.size(), batch_lookup);
+
+			std::string prompt = detail::build_decompile_prompt(addr, blocks);
+
+			auto ai = std::make_unique<standalone_ai_client_t>(settings);
+			if (!ai->is_available()) {
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.current.is_error = true;
+				g_state.current.error_text = "AI unavailable.";
+				g_state.current.complete = true;
+				g_state.batch_done.store(i + 1);
+				g_state.decompiling.store(false);
+				continue;
+			}
+
+			std::vector<std::pair<std::string, std::string>> history;
+			std::string result = ai->chat_blocking(
+				prompt, history,
+				[](const std::string& chunk) {
+					std::lock_guard<std::mutex> lk(g_state.mutex);
+					g_state.streaming_text += chunk;
+				},
+				[](const std::string&) -> bool { return g_state.cancel.load(); }
+			);
+
+			{
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				if (!result.empty()) g_state.current.pseudocode = result;
+				else g_state.current.pseudocode = g_state.streaming_text;
+
+				size_t fn_start = g_state.current.pseudocode.find('(');
+				if (fn_start != std::string::npos) {
+					size_t fn_end = g_state.current.pseudocode.find(')', fn_start);
+					if (fn_end != std::string::npos)
+						g_state.current.parameters = g_state.current.pseudocode.substr(fn_start + 1, fn_end - fn_start - 1);
+				}
+
+				g_state.current.complete = true;
+				g_state.streaming_text.clear();
+
+				if (!g_state.current.is_error) {
+					g_state.cache[addr] = g_state.current;
+					detail::save_cache_entry_to_disk(addr, g_state.current);
+				}
+			}
+
+			g_state.decompiling.store(false);
+			g_state.batch_done.store(i + 1);
+		}
+
+		g_state.batch_running.store(false);
+		g_state.decompiling.store(false);
+	}).detach();
+}
+
+inline void decompile_function_native(uint64_t func_addr) {
+	if (g_state.decompiling.load())
+		return;
+
+	g_state.decompiling.store(true);
+	g_state.cancel.store(false);
+	g_state.active_mode = decompile_mode_t::native_ghidra;
+
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.current = {};
+		g_state.current.function_addr = func_addr;
+		g_state.streaming_text.clear();
+	}
+
+	std::thread([func_addr]() {
+		auto ghidra_result = ghidra_decompiler::decompile_function(func_addr);
+
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.current.function_addr = func_addr;
+		g_state.current.function_name = ghidra_result.function_name;
+		g_state.current.pseudocode = ghidra_result.pseudocode;
+		g_state.current.complete = ghidra_result.complete;
+		g_state.current.is_error = ghidra_result.is_error;
+		g_state.current.error_text = ghidra_result.error_text;
+		g_state.streaming_text = ghidra_result.pseudocode;
+
+		if (!g_state.current.is_error) {
+			g_state.cache[func_addr] = g_state.current;
+			detail::save_cache_entry_to_disk(func_addr, g_state.current);
+		}
+
+		g_state.history.push_back({func_addr, g_state.current.function_name});
+		g_state.history_pos = static_cast<int>(g_state.history.size()) - 1;
+		g_state.decompiling.store(false);
+	}).detach();
+}
+
+inline void decompile_function_hybrid(uint64_t func_addr, const settings_sa_t& settings) {
+	if (g_state.decompiling.load())
+		return;
+
+	g_state.decompiling.store(true);
+	g_state.cancel.store(false);
+	g_state.active_mode = decompile_mode_t::hybrid;
+
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.current = {};
+		g_state.current.function_addr = func_addr;
+		g_state.streaming_text.clear();
+	}
+
+	std::thread([func_addr, settings]() {
+		auto ghidra_result = ghidra_decompiler::decompile_function(func_addr);
+
+		if (ghidra_result.is_error) {
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.current.is_error = true;
+			g_state.current.error_text = "ghidra: " + ghidra_result.error_text;
+			g_state.decompiling.store(false);
+			return;
+		}
+
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.current.pseudocode = ghidra_result.pseudocode;
+			g_state.current.function_name = ghidra_result.function_name;
+			g_state.streaming_text = ghidra_result.pseudocode;
+		}
+
+		std::string ghidra_code = ghidra_result.pseudocode;
+
+		std::vector<cfg_view::basic_block_t> blocks;
+		cfg_view::build_cfg(func_addr, blocks);
+		std::string block_text = detail::build_block_text(blocks);
+		std::string xref_text = detail::build_xref_text(func_addr);
+		std::string mod_text = detail::resolve_module_symbols(func_addr);
+		auto import_lookup = detail::build_import_lookup(func_addr);
+		detail::annotate_instructions(blocks, import_lookup);
+		std::string annotated = detail::build_block_text(blocks);
+
+		std::string system_prompt =
+			"You are an expert reverse engineer. The user provides Ghidra's raw decompiler output "
+			"for a function, along with disassembly and cross-reference context. "
+			"Your task is to IMPROVE the Ghidra output by:\n"
+			"1. Renaming variables and parameters to meaningful names based on usage context\n"
+			"2. Adding brief inline comments for complex logic\n"
+			"3. Fixing type casts and pointer arithmetic to be more readable\n"
+			"4. Identifying common patterns (vtable dispatch, string operations, memory allocation)\n"
+			"Output ONLY the improved C pseudocode. No explanations.";
+
+		std::string user_prompt;
+		user_prompt.reserve(ghidra_code.size() + annotated.size() + xref_text.size() + mod_text.size() + 512);
+		user_prompt += "## Ghidra Decompiler Output\n```c\n";
+		user_prompt += ghidra_code;
+		user_prompt += "\n```\n\n";
+		user_prompt += "## Disassembly Context\n```\n";
+		user_prompt += annotated;
+		user_prompt += "\n```\n\n";
+		if (!xref_text.empty()) {
+			user_prompt += "## Cross References\n```\n";
+			user_prompt += xref_text;
+			user_prompt += "\n```\n\n";
+		}
+		if (!mod_text.empty()) {
+			user_prompt += "## Module Info\n";
+			user_prompt += mod_text;
+			user_prompt += "\n\n";
+		}
+		user_prompt += "Improve this decompiled function. Output only the improved C pseudocode.";
+
+		standalone_ai_client::request_t req;
+		req.system_prompt = system_prompt;
+
+		standalone_ai_client::message_t msg;
+		msg.role = "user";
+		msg.content = user_prompt;
+		req.messages.push_back(msg);
+
+		req.model = settings.ai_model;
+		req.temperature = 0.2f;
+		req.max_tokens = 8192;
+
+		standalone_ai_client::stream(req, settings,
+			[func_addr](const std::string& chunk, bool done) {
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.streaming_text += chunk;
+
+				if (done) {
+					std::string full = g_state.streaming_text;
+
+					auto fence_start = full.find("```");
+					if (fence_start != std::string::npos) {
+						auto nl = full.find('\n', fence_start);
+						if (nl != std::string::npos) {
+							auto fence_end = full.find("```", nl);
+							if (fence_end != std::string::npos)
+								full = full.substr(nl + 1, fence_end - nl - 1);
+							else
+								full = full.substr(nl + 1);
+						}
+					}
+
+					g_state.current.pseudocode = full;
+					g_state.current.function_addr = func_addr;
+					g_state.current.complete = true;
+					g_state.streaming_text = full;
+
+					g_state.cache[func_addr] = g_state.current;
+					detail::save_cache_entry_to_disk(func_addr, g_state.current);
+
+					g_state.decompiling.store(false);
+				}
+			},
+			[](const std::string& err) {
+				std::lock_guard<std::mutex> lk(g_state.mutex);
+				g_state.current.is_error = true;
+				g_state.current.error_text = err;
+				g_state.decompiling.store(false);
+			}
+		);
+	}).detach();
 }
 
 }

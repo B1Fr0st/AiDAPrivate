@@ -1,6 +1,7 @@
 #include "debugger_view.hpp"
 #include "debugger_engine.hpp"
 #include "standalone_driver.hpp"
+#include "stealth_engine.hpp"
 #include "zydis_disasm.hpp"
 #include "../helpers/globals.h"
 #include "ui_anim.hpp"
@@ -227,6 +228,47 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a,
 			ImVec2(ox, oy + TAB_HEIGHT + static_cast<float>(si)),
 			ImVec2(ox + w, oy + TAB_HEIGHT + static_cast<float>(si) + 1.f),
 			IM_COL32(0, 0, 0, static_cast<int>(sa * 255.f)));
+	}
+
+	{
+		bool stealth_active = stealth_engine::is_active();
+		const char* stealth_label = stealth_active ? "Stealth: ON" : "Stealth: OFF";
+		ImVec2 stealth_sz = ImGui::CalcTextSize(stealth_label);
+		float stealth_btn_w = stealth_sz.x + 16.f;
+		float stealth_btn_h = 20.f;
+		float stealth_x = ox + w - stealth_btn_w - 8.f;
+		float stealth_y = oy + (TAB_HEIGHT - stealth_btn_h) * 0.5f;
+
+		bool stealth_hov = ImGui::IsMouseHoveringRect(
+			ImVec2(stealth_x, stealth_y),
+			ImVec2(stealth_x + stealth_btn_w, stealth_y + stealth_btn_h), false);
+
+		ImU32 stealth_bg = stealth_active
+			? IM_COL32(static_cast<int>(ag*255), static_cast<int>(ag*255*0.8f), 0, static_cast<int>(120*a))
+			: (stealth_hov
+				? IM_COL32(255, 255, 255, static_cast<int>(15*a))
+				: IM_COL32(255, 255, 255, static_cast<int>(8*a)));
+
+		dl->AddRectFilled(ImVec2(stealth_x, stealth_y),
+		                   ImVec2(stealth_x + stealth_btn_w, stealth_y + stealth_btn_h),
+		                   stealth_bg, 4.f);
+
+		ImU32 stealth_text_col = stealth_active
+			? IM_COL32(152, 195, 121, static_cast<int>(230*a))
+			: IM_COL32(200, 205, 220, static_cast<int>(150*a));
+		dl->AddText(ImVec2(stealth_x + 8.f, stealth_y + (stealth_btn_h - stealth_sz.y) * 0.5f),
+		            stealth_text_col, stealth_label);
+
+		if (stealth_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			if (stealth_active) {
+				stealth_engine::disable_stealth();
+			} else {
+				uint32_t pid = driver_bridge::attached_pid();
+				if (pid != 0) {
+					stealth_engine::enable_stealth(pid);
+				}
+			}
+		}
 	}
 }
 

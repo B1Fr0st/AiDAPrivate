@@ -121,6 +121,15 @@ void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
+	ImGui::SameLine();
+	if (ImGui::SmallButton("Export")) {
+		fuzzer_engine::export_crashes();
+	}
+	ImGui::SameLine();
+	if (ImGui::SmallButton("Import")) {
+		fuzzer_engine::import_crashes();
+	}
+
 	ImGui::PopStyleColor(4);
 
 	cy += toolbar_h - 40.f;
@@ -195,7 +204,8 @@ void render(float pos_x, float pos_y, float width, float height,
 	dl->AddText(ImVec2(cx, cy + 3.f), accent, buf);
 	cy += 24.f;
 
-	float crash_table_h = pos_y + height - cy - 8.f;
+	const float detail_panel_h = (st.selected_crash >= 0 && st.selected_crash < static_cast<int>(crashes_copy.size())) ? 240.f : 0.f;
+	float crash_table_h = pos_y + height - cy - 8.f - detail_panel_h;
 	float row_h = 22.f;
 	float content_h = static_cast<float>(crashes_copy.size()) * row_h;
 
@@ -223,7 +233,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		dl->AddRectFilled(rmin, rmax, selected ? sel_col : (hovered ? row_hover : (i % 2 == 0 ? row_even : row_odd)));
 
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-			st.selected_crash = i;
+			st.selected_crash = selected ? -1 : i;
 		}
 
 		float rx = cx;
@@ -233,17 +243,56 @@ void render(float pos_x, float pos_y, float width, float height,
 		dl->AddText(ImVec2(rx, ry + 3.f), dim_col, idx_buf);
 		rx += 40.f;
 
+		{
+			ImU32 score_bg = IM_COL32(80, 80, 80, static_cast<int>(alpha * 200));
+			ImU32 score_fg = text_col;
+			switch (crash.score) {
+			case fuzzer_engine::exploit_score_t::critical:
+				score_bg = IM_COL32(180, 40, 40, static_cast<int>(alpha * 220));
+				score_fg = IM_COL32(255, 255, 255, static_cast<int>(alpha * 255));
+				break;
+			case fuzzer_engine::exploit_score_t::high:
+				score_bg = IM_COL32(200, 120, 40, static_cast<int>(alpha * 220));
+				score_fg = IM_COL32(255, 255, 255, static_cast<int>(alpha * 255));
+				break;
+			case fuzzer_engine::exploit_score_t::medium:
+				score_bg = IM_COL32(180, 180, 50, static_cast<int>(alpha * 200));
+				score_fg = IM_COL32(30, 30, 30, static_cast<int>(alpha * 255));
+				break;
+			case fuzzer_engine::exploit_score_t::low:
+				score_bg = IM_COL32(60, 140, 60, static_cast<int>(alpha * 200));
+				score_fg = IM_COL32(255, 255, 255, static_cast<int>(alpha * 255));
+				break;
+			default: break;
+			}
+			const char* score_str = fuzzer_engine::exploit_score_name(crash.score);
+			ImVec2 tsz = ImGui::CalcTextSize(score_str);
+			float badge_w = tsz.x + 8.f;
+			dl->AddRectFilled(ImVec2(rx, ry + 2.f), ImVec2(rx + badge_w, ry + row_h - 2.f), score_bg, 3.f);
+			dl->AddText(ImVec2(rx + 4.f, ry + 3.f), score_fg, score_str);
+			rx += badge_w + 6.f;
+		}
+
 		dl->AddText(ImVec2(rx, ry + 3.f), crash_col, fuzzer_engine::crash_type_name(crash.type));
-		rx += width * 0.18f;
+		rx += width * 0.14f;
 
 		char addr_buf[32];
 		std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX", static_cast<unsigned long long>(crash.instruction_address));
 		dl->AddText(ImVec2(rx, ry + 3.f), text_col, addr_buf);
-		rx += width * 0.16f;
+		rx += width * 0.14f;
+
+		if (!crash.crashing_instruction.empty()) {
+			dl->AddText(ImVec2(rx, ry + 3.f), dim_col,
+			            crash.crashing_instruction.c_str(),
+			            crash.crashing_instruction.c_str() + std::min(crash.crashing_instruction.size(), static_cast<size_t>(30)));
+			rx += width * 0.18f;
+		} else {
+			rx += width * 0.18f;
+		}
 
 		dl->AddText(ImVec2(rx, ry + 3.f), dim_col,
 		            crash.description.c_str(),
-		            crash.description.c_str() + std::min(crash.description.size(), static_cast<size_t>(60)));
+		            crash.description.c_str() + std::min(crash.description.size(), static_cast<size_t>(40)));
 	}
 
 	ImGui::PopClipRect();
@@ -252,6 +301,160 @@ void render(float pos_x, float pos_y, float width, float height,
 		ui_anim::render_custom_scrollbar(dl, pos_x + width - 12.f, cy, 10.f, crash_table_h,
 		                                  st.scroll_y, content_h, crash_table_h,
 		                                  alpha, st.scrollbar_dragging, st.scrollbar_drag_offset);
+	}
+
+	if (detail_panel_h > 0.f && st.selected_crash >= 0 && st.selected_crash < static_cast<int>(crashes_copy.size())) {
+		auto& sel = crashes_copy[static_cast<size_t>(st.selected_crash)];
+		float dy = cy + crash_table_h + 4.f;
+		float dw = width - 8.f;
+
+		dl->AddRectFilled(ImVec2(pos_x + 4.f, dy), ImVec2(pos_x + 4.f + dw, dy + detail_panel_h - 4.f), stat_bg);
+		dl->AddRect(ImVec2(pos_x + 4.f, dy), ImVec2(pos_x + 4.f + dw, dy + detail_panel_h - 4.f),
+		            IM_COL32(60, 60, 60, static_cast<int>(alpha * 200)));
+
+		float dx = pos_x + 16.f;
+		float dcy = dy + 6.f;
+
+		char detail_buf[128];
+		std::snprintf(detail_buf, sizeof(detail_buf), "Crash #%d — %s [%s]",
+		              st.selected_crash + 1,
+		              fuzzer_engine::crash_type_name(sel.type),
+		              fuzzer_engine::exploit_score_name(sel.score));
+		dl->AddText(ImVec2(dx, dcy), accent, detail_buf);
+		dcy += 18.f;
+
+		if (!sel.crashing_instruction.empty()) {
+			std::snprintf(detail_buf, sizeof(detail_buf), "Instruction: %s", sel.crashing_instruction.c_str());
+			dl->AddText(ImVec2(dx, dcy), text_col, detail_buf);
+			dcy += 16.f;
+		}
+
+		std::snprintf(detail_buf, sizeof(detail_buf), "Fault: 0x%llX  RIP: 0x%llX",
+		              static_cast<unsigned long long>(sel.fault_address),
+		              static_cast<unsigned long long>(sel.rip));
+		dl->AddText(ImVec2(dx, dcy), text_col, detail_buf);
+		dcy += 16.f;
+
+		float col1 = dx;
+		float col2 = dx + dw * 0.25f;
+		float col3 = dx + dw * 0.5f;
+		float col4 = dx + dw * 0.75f;
+
+		auto draw_reg = [&](float rx, float ry, const char* name, uint64_t val) {
+			std::snprintf(detail_buf, sizeof(detail_buf), "%-4s 0x%016llX", name, static_cast<unsigned long long>(val));
+			dl->AddText(ImVec2(rx, ry), dim_col, detail_buf);
+		};
+
+		draw_reg(col1, dcy, "RAX", sel.rax);
+		draw_reg(col2, dcy, "RBX", sel.rbx);
+		draw_reg(col3, dcy, "RCX", sel.rcx);
+		draw_reg(col4, dcy, "RDX", sel.rdx);
+		dcy += 14.f;
+
+		draw_reg(col1, dcy, "RSP", sel.rsp);
+		draw_reg(col2, dcy, "RBP", sel.rbp);
+		draw_reg(col3, dcy, "RSI", sel.rsi);
+		draw_reg(col4, dcy, "RDI", sel.rdi);
+		dcy += 14.f;
+
+		draw_reg(col1, dcy, "R8", sel.r8);
+		draw_reg(col2, dcy, "R9", sel.r9);
+		draw_reg(col3, dcy, "R10", sel.r10);
+		draw_reg(col4, dcy, "R11", sel.r11);
+		dcy += 14.f;
+
+		draw_reg(col1, dcy, "R12", sel.r12);
+		draw_reg(col2, dcy, "R13", sel.r13);
+		draw_reg(col3, dcy, "R14", sel.r14);
+		draw_reg(col4, dcy, "R15", sel.r15);
+		dcy += 18.f;
+
+		const char* mut_strat = "unknown";
+		switch (sel.mutation.strategy) {
+		case fuzzer_engine::mutation_strategy_t::bit_flip: mut_strat = "bit_flip"; break;
+		case fuzzer_engine::mutation_strategy_t::byte_flip: mut_strat = "byte_flip"; break;
+		case fuzzer_engine::mutation_strategy_t::arithmetic: mut_strat = "arithmetic"; break;
+		case fuzzer_engine::mutation_strategy_t::interesting_values: mut_strat = "interesting"; break;
+		case fuzzer_engine::mutation_strategy_t::havoc: mut_strat = "havoc"; break;
+		case fuzzer_engine::mutation_strategy_t::splice: mut_strat = "splice"; break;
+		default: break;
+		}
+		std::snprintf(detail_buf, sizeof(detail_buf), "Mutation: %s  offset=%zu  size=%zu",
+		              mut_strat, sel.mutation.offset, sel.mutation.size);
+		dl->AddText(ImVec2(dx, dcy), dim_col, detail_buf);
+		dcy += 16.f;
+
+		if (!sel.input.empty()) {
+			std::string hex_str = "Input: ";
+			size_t show_n = std::min(sel.input.size(), static_cast<size_t>(32));
+			for (size_t bi = 0; bi < show_n; ++bi) {
+				char hb[4];
+				std::snprintf(hb, sizeof(hb), "%02X ", sel.input[bi]);
+				hex_str += hb;
+			}
+			if (sel.input.size() > 32) hex_str += "...";
+			dl->AddText(ImVec2(dx, dcy), dim_col, hex_str.c_str());
+			dcy += 16.f;
+		}
+
+		if (sel.is_minimized) {
+			std::string min_str = "Minimized: ";
+			size_t show_n = std::min(sel.minimized_input.size(), static_cast<size_t>(32));
+			for (size_t bi = 0; bi < show_n; ++bi) {
+				char hb[4];
+				std::snprintf(hb, sizeof(hb), "%02X ", sel.minimized_input[bi]);
+				min_str += hb;
+			}
+			if (sel.minimized_input.size() > 32) min_str += "...";
+			std::snprintf(detail_buf, sizeof(detail_buf), "%s (%zu bytes)", min_str.c_str(), sel.minimized_input.size());
+			dl->AddText(ImVec2(dx, dcy), IM_COL32(152, 195, 121, static_cast<int>(alpha * 255)), detail_buf);
+			dcy += 16.f;
+		}
+
+		dcy += 4.f;
+		ImGui::SetCursorScreenPos(ImVec2(dx, dcy));
+		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.2f, 0.3f, alpha));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.3f, 0.4f, alpha));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.35f, 0.35f, 0.45f, alpha));
+		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.9f, 0.9f, alpha));
+
+		bool analyzing = fz.analyzing_crash.load();
+		bool minimizing = fz.minimizing.load();
+
+		if (analyzing) {
+			ImGui::BeginDisabled();
+			ImGui::SmallButton("Analyzing...");
+			ImGui::EndDisabled();
+		} else {
+			if (ImGui::SmallButton("AI Analyze")) {
+				fuzzer_engine::ai_analyze_crash(st.selected_crash);
+			}
+		}
+		ImGui::SameLine();
+		if (minimizing) {
+			ImGui::BeginDisabled();
+			ImGui::SmallButton("Minimizing...");
+			ImGui::EndDisabled();
+		} else {
+			if (ImGui::SmallButton("Minimize")) {
+				fuzzer_engine::minimize_crash(st.selected_crash);
+			}
+		}
+
+		ImGui::PopStyleColor(4);
+		dcy += 26.f;
+
+		if (!sel.ai_analysis.empty()) {
+			dl->AddText(ImVec2(dx, dcy), accent, "AI Analysis:");
+			dcy += 16.f;
+			float wrap_w = dw - 24.f;
+			ImVec2 tsz = ImGui::CalcTextSize(sel.ai_analysis.c_str(), nullptr, false, wrap_w);
+			dl->AddText(nullptr, 0.f, ImVec2(dx, dcy),
+			            IM_COL32(180, 180, 195, static_cast<int>(alpha * 220)),
+			            sel.ai_analysis.c_str(),
+			            sel.ai_analysis.c_str() + sel.ai_analysis.size(),
+			            wrap_w);
+		}
 	}
 
 	if (!fz.active && !running) {

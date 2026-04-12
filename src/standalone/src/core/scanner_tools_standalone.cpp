@@ -6,7 +6,6 @@
 #include "memory_scanner.hpp"
 #include "obfuscation.hpp"
 #include "struct_dissector.hpp"
-#include "speedhack.hpp"
 
 #include <cinttypes>
 #include <sstream>
@@ -548,34 +547,6 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			return tool_result_t::ok(code, result);
 		}, true});
 
-	register_compat(srv, {OBFSTR("scanner_speedhack_enable"), OBFSTR("memory_scanner"),
-		OBFSTR("Enable speedhack (time manipulation) on the attached process. Hooks QueryPerformanceCounter and GetTickCount64."),
-		{{OBFSTR("speed_factor"), OBFSTR("number"), OBFSTR("Speed multiplier (e.g. 2.0 for 2x, 0.5 for half)"), true}},
-		[](const json& params) -> tool_result_t {
-			if (!params.contains("speed_factor") || !params["speed_factor"].is_number())
-				return tool_result_t::error(OBFSTR("'speed_factor' is required."));
-			float factor = params["speed_factor"].get<float>();
-			if (factor <= 0.f || factor > 100.f)
-				return tool_result_t::error(OBFSTR("speed_factor must be between 0 and 100."));
-			if (!speedhack::enable(factor))
-				return tool_result_t::error(OBFSTR("Speedhack failed: ") + speedhack::last_error());
-			json result;
-			result["speed_factor"] = factor;
-			result["active"] = true;
-			return tool_result_t::ok(
-				OBFSTR("Speedhack enabled at ") + std::to_string(factor) + OBFSTR("x speed."), result);
-		}, false});
-
-	register_compat(srv, {OBFSTR("scanner_speedhack_disable"), OBFSTR("memory_scanner"),
-		OBFSTR("Disable speedhack and restore original timing functions."),
-		{},
-		[](const json&) -> tool_result_t {
-			if (!speedhack::disable())
-				return tool_result_t::error(OBFSTR("Failed to disable speedhack: ") + speedhack::last_error());
-			json result;
-			result["active"] = false;
-			return tool_result_t::ok(OBFSTR("Speedhack disabled."), result);
-		}, false});
 }
 
 }
