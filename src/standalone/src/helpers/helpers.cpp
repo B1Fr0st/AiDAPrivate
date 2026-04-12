@@ -33,6 +33,11 @@
 #include "../core/network_view.hpp"
 #include "../core/memory_scanner_view.hpp"
 #include "../core/debugger_view.hpp"
+#include "../core/decompiler_view.hpp"
+#include "../core/struct_recon_view.hpp"
+#include "../core/crypto_scanner_view.hpp"
+#include "../core/aob_view.hpp"
+#include "../core/fuzzer_view.hpp"
 
 static ID3D11ShaderResourceView* g_send_icon_srv    = nullptr;
 static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
@@ -3390,6 +3395,44 @@ void helpers::render_title()
 			}
 		}
 
+
+		{
+			auto add_right_tab = [&](const char* label, center_view_t view_id, float anchor_x0) {
+				bool is_active = (globals::ui::active_center_view == view_id);
+				ImVec2 lsz = ImGui::CalcTextSize(label);
+				float tw = 10.f * 2.f + lsz.x;
+				float tx0 = anchor_x0 - tw - 6.f;
+				float tx1 = tx0 + tw;
+				float th = row_h - 2.f;
+				float ty0 = r1_cy - th * 0.5f;
+				float ty1 = ty0 + th;
+				if (tx0 > hx0 + hdr_pad + 40.f) {
+					bool hov = ImGui::IsMouseHoveringRect(ImVec2(tx0, ty0), ImVec2(tx1, ty1), false);
+					if (is_active) {
+						wdl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
+							IM_COL32(255,255,255,(int)(16*a)), 4.f, ImDrawFlags_RoundCornersTop);
+						wdl->AddLine(ImVec2(tx0 + 2.f, ty1), ImVec2(tx1 - 2.f, ty1),
+							IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(200*a)), 2.f);
+					} else if (hov) {
+						wdl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
+							IM_COL32(255,255,255,(int)(8*a)), 4.f, ImDrawFlags_RoundCornersTop);
+					}
+					ImU32 tc = is_active ? ac_full : IM_COL32(170, 175, 190, (int)((hov ? 220.f : 160.f)*a));
+					wdl->AddText(ImVec2(tx0 + 10.f, ty0 + (th - lsz.y) * 0.5f), tc, label);
+					if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+						globals::ui::active_center_view = view_id;
+				}
+				return tx0;
+			};
+
+			float anchor = dtx0;
+			anchor = add_right_tab("Decompiler", center_view_t::decompiler, anchor);
+			anchor = add_right_tab("Structs",    center_view_t::struct_recon, anchor);
+			anchor = add_right_tab("Crypto",     center_view_t::crypto_scanner, anchor);
+			anchor = add_right_tab("AOB",        center_view_t::aob_generator, anchor);
+			anchor = add_right_tab("Fuzzer",     center_view_t::fuzzer_view, anchor);
+		}
+
 		bool cf_clicked = ghost_btn("Choose File",
 			ImGui::GetID("##cfhv"), ImGui::GetID("##cffl"),
 			rbtn_x0, r1_cy, rbtn_w);
@@ -3563,6 +3606,31 @@ void helpers::render_title()
 	else if (cv == center_view_t::debugger_view)
 	{
 		debugger_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::decompiler)
+	{
+		decompiler_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::struct_recon)
+	{
+		struct_recon_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::crypto_scanner)
+	{
+		crypto_scanner_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::aob_generator)
+	{
+		aob_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::fuzzer_view)
+	{
+		fuzzer_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
 	}
 
 	else

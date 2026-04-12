@@ -210,7 +210,7 @@ json server_t::handle_initialize(const json& id, const json&)
 
     static const char* instructions =
         "You are connected to AiDA Standalone â€” a reverse-engineering assistant "
-        "that operates through a kernel-backed live inspection bridge (with user-mode fallback), "
+        "that operates through a kernel-backed live inspection bridge, "
         "Zydis for disassembly, and Windows Sandbox for safe sample execution.\n\n"
         "## Capabilities\n"
         "- Read live process memory from an attached process\n"

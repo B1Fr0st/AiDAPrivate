@@ -3,7 +3,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-#include "comm.h"
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
 
@@ -201,11 +200,10 @@ inline bool pattern_match(const uint8_t* data, size_t data_size,
 
 
 inline bool verify_function_prologue(uint64_t addr) {
-    uint8_t buf[32] = {};
-    size_t rd = device->read_raw(addr, buf, sizeof(buf));
-    if (rd < 4) return false;
+    std::vector<uint8_t> buf;
+    if (!driver_bridge::read_memory(addr, 32, buf) || buf.size() < 4) return false;
 
-    AsmInstr ins = zydis_decode_one(buf, static_cast<int>(rd), addr);
+    AsmInstr ins = zydis_decode_one(buf.data(), static_cast<int>(buf.size()), addr);
     if (ins.len == 0) return false;
 
 
@@ -226,10 +224,8 @@ inline uint64_t find_string_in_module(uint64_t mod_base, uint32_t mod_size,
         size_t read_size = static_cast<size_t>(
             std::min(static_cast<uint64_t>(CHUNK_SIZE + needle.size()),
                      static_cast<uint64_t>(mod_size) - offset));
-        std::vector<uint8_t> chunk(read_size);
-        size_t rd = device->read_raw(mod_base + offset, chunk.data(), read_size);
-        if (rd < needle.size()) continue;
-        chunk.resize(rd);
+        std::vector<uint8_t> chunk;
+        if (!driver_bridge::read_memory(mod_base + offset, read_size, chunk) || chunk.size() < needle.size()) continue;
 
         for (size_t i = 0; i + needle.size() <= chunk.size(); i++) {
             if (memcmp(chunk.data() + i, needle.data(), needle.size()) == 0) {
@@ -250,10 +246,8 @@ inline uint64_t find_function_by_string_ref(uint64_t mod_base, uint32_t mod_size
         size_t read_size = static_cast<size_t>(
             std::min(static_cast<uint64_t>(CHUNK_SIZE),
                      static_cast<uint64_t>(mod_size) - offset));
-        std::vector<uint8_t> chunk(read_size);
-        size_t rd = device->read_raw(mod_base + offset, chunk.data(), read_size);
-        if (rd < 7) continue;
-        chunk.resize(rd);
+        std::vector<uint8_t> chunk;
+        if (!driver_bridge::read_memory(mod_base + offset, read_size, chunk) || chunk.size() < 7) continue;
 
 
         for (size_t i = 0; i + 7 <= chunk.size(); i++) {
@@ -272,10 +266,10 @@ inline uint64_t find_function_by_string_ref(uint64_t mod_base, uint32_t mod_size
                     if (target == string_addr) {
 
                         uint64_t search_start = (ip > MAX_BACKWARD) ? ip - MAX_BACKWARD : mod_base;
-                        uint8_t backward_buf[MAX_BACKWARD + 16] = {};
-                        size_t brd = device->read_raw(search_start, backward_buf,
-                            static_cast<size_t>(ip - search_start));
-                        if (brd == 0) continue;
+                        std::vector<uint8_t> backward_buf;
+                        if (!driver_bridge::read_memory(search_start,
+                            static_cast<size_t>(ip - search_start), backward_buf) || backward_buf.empty()) continue;
+                        size_t brd = backward_buf.size();
 
 
                         for (size_t b = brd; b > 0; b--) {
@@ -300,7 +294,7 @@ inline uint64_t resolve_bypass_target(const bypass_signature& sig,
                                        uint64_t mod_base, uint32_t mod_size) {
 
     if (!sig.export_name.empty()) {
-        uint64_t addr = device->resolve_export(mod_base, sig.export_name.c_str());
+        uint64_t addr = driver_bridge::resolve_export(mod_base, sig.export_name.c_str());
         if (addr != 0) return addr;
     }
 
@@ -320,10 +314,8 @@ inline uint64_t resolve_bypass_target(const bypass_signature& sig,
         size_t read_size = static_cast<size_t>(
             std::min(static_cast<uint64_t>(CHUNK_SIZE),
                      static_cast<uint64_t>(mod_size) - offset));
-        std::vector<uint8_t> chunk(read_size);
-        size_t rd = device->read_raw(mod_base + offset, chunk.data(), read_size);
-        if (rd == 0) continue;
-        chunk.resize(rd);
+        std::vector<uint8_t> chunk;
+        if (!driver_bridge::read_memory(mod_base + offset, read_size, chunk) || chunk.empty()) continue;
 
         for (size_t j = 0; j + sig.pattern.size() <= chunk.size(); j++) {
             if (pattern_match(chunk.data() + j, chunk.size() - j,
@@ -338,24 +330,30 @@ inline uint64_t resolve_bypass_target(const bypass_signature& sig,
 
 
 inline int scan_and_bypass(uint32_t target_pid) {
-    if (!device || !device->is_connected()) return -1;
+    if (!driver_bridge::using_kernel_driver()) return -1;
 
 
     if (g_state.signatures.empty()) init_signature_database();
 
 
-    uint32_t original_pid = device->get_process_id();
+    uint32_t original_pid = driver_bridge::attached_pid();
 
 
-    device->clear_process_context();
-    device->set_process_id(target_pid);
-    auto target_image = device->find_image();
-    if (!target_image) {
-        device->clear_process_context();
-        if (original_pid) device->set_process_id(original_pid);
+    if (!driver_bridge::attach(target_pid)) {
+        if (original_pid) driver_bridge::attach(original_pid);
         return -1;
     }
-    device->solve_dtb();
+
+    driver_bridge::peb_info_t peb_out;
+    uint64_t target_image = 0;
+    if (driver_bridge::read_peb(peb_out)) {
+        target_image = peb_out.image_base;
+    }
+    if (!target_image) {
+        driver_bridge::detach();
+        if (original_pid) driver_bridge::attach(original_pid);
+        return -1;
+    }
 
     g_state.target_pid = target_pid;
     g_state.attached = true;
@@ -376,12 +374,13 @@ inline int scan_and_bypass(uint32_t target_pid) {
 
             mod_base = target_image;
 
-            uint8_t pe_buf[0x200] = {};
-            device->read_raw(mod_base, pe_buf, sizeof(pe_buf));
-            auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(pe_buf);
-            if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew < 0x180) {
-                auto nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(pe_buf + dos->e_lfanew);
-                mod_size = nt->OptionalHeader.SizeOfImage;
+            std::vector<uint8_t> pe_buf;
+            if (driver_bridge::read_memory(mod_base, 0x200, pe_buf) && pe_buf.size() >= 0x200) {
+                auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(pe_buf.data());
+                if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew < 0x180) {
+                    auto nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(pe_buf.data() + dos->e_lfanew);
+                    mod_size = nt->OptionalHeader.SizeOfImage;
+                }
             }
             if (mod_size == 0) mod_size = 0x1000000;
         } else {
@@ -410,11 +409,9 @@ inline int scan_and_bypass(uint32_t target_pid) {
             bypass.module_name = sig.module_name;
             bypass.address = addr;
             bypass.patch_bytes = sig.patch;
-            bypass.original_bytes.resize(sig.patch.size());
-            device->read_raw(addr, bypass.original_bytes.data(), bypass.original_bytes.size());
+            if (!driver_bridge::read_memory(addr, sig.patch.size(), bypass.original_bytes)) continue;
 
-            size_t written = device->write_raw(addr, sig.patch.data(), sig.patch.size());
-            if (written == sig.patch.size()) {
+            if (driver_bridge::write_memory(addr, sig.patch)) {
                 bypass.active = true;
                 g_state.active_bypasses.push_back(std::move(bypass));
                 bypasses_applied++;
@@ -423,45 +420,36 @@ inline int scan_and_bypass(uint32_t target_pid) {
     }
 
 
-    device->clear_process_context();
-    if (original_pid) {
-        device->set_process_id(original_pid);
-        device->find_image();
-        device->solve_dtb();
-    }
+    driver_bridge::detach();
+    if (original_pid) driver_bridge::attach(original_pid);
 
     return bypasses_applied;
 }
 
 
 inline int revert_all_bypasses() {
-    if (!device || !device->is_connected()) return -1;
+    if (!driver_bridge::using_kernel_driver()) return -1;
     if (g_state.target_pid == 0) return 0;
 
-    uint32_t original_pid = device->get_process_id();
+    uint32_t original_pid = driver_bridge::attached_pid();
 
-    device->clear_process_context();
-    device->set_process_id(g_state.target_pid);
-    device->find_image();
-    device->solve_dtb();
+    if (!driver_bridge::attach(g_state.target_pid)) {
+        if (original_pid) driver_bridge::attach(original_pid);
+        return -1;
+    }
 
     std::lock_guard<std::mutex> lock(g_state.mutex);
     int reverted = 0;
     for (auto& bypass : g_state.active_bypasses) {
         if (!bypass.active) continue;
-        size_t written = device->write_raw(bypass.address, bypass.original_bytes.data(), bypass.original_bytes.size());
-        if (written == bypass.original_bytes.size()) {
+        if (driver_bridge::write_memory(bypass.address, bypass.original_bytes)) {
             bypass.active = false;
             reverted++;
         }
     }
 
-    device->clear_process_context();
-    if (original_pid) {
-        device->set_process_id(original_pid);
-        device->find_image();
-        device->solve_dtb();
-    }
+    driver_bridge::detach();
+    if (original_pid) driver_bridge::attach(original_pid);
 
     return reverted;
 }

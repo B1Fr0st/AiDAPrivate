@@ -5,7 +5,7 @@
 #include <windows.h>
 
 #include "standalone_compat.hpp"
-#include "comm.h"
+#include "standalone_driver.hpp"
 #include "emulation_engine.hpp"
 #include "obfuscation.hpp"
 #include "pro.h"
@@ -37,10 +37,10 @@ static constexpr std::uint64_t SYNTH_STACK_SIZE        = 0x20000ULL;
 
 static tool_result_t check_driver_for_address(std::uint64_t addr)
 {
-    if (!device || !device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
 
-    if (!is_kernel_address(addr) && device->get_process_id() == 0)
+    if (!is_kernel_address(addr) && driver_bridge::attached_pid() == 0)
         return tool_result_t::error(OBFSTR("Not attached to a process. Call driver_attach first (kernel addresses work without attachment)."));
 
     return tool_result_t::ok("", {});
@@ -184,13 +184,13 @@ tool_result_t disassemble_zydis(const json& params)
 
 tool_result_t driver_snapshot_and_emulate(const json& params)
 {
-    if (!device || !device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
 
-    if (device->get_process_id() == 0)
+    if (driver_bridge::attached_pid() == 0)
         return tool_result_t::error(OBFSTR("Not attached to a process. Call driver_attach first."));
 
-    std::uint32_t pid = device->get_process_id();
+    std::uint32_t pid = driver_bridge::attached_pid();
     std::uint32_t tid = 0;
 
     if (params.contains("tid"))
@@ -207,7 +207,7 @@ tool_result_t driver_snapshot_and_emulate(const json& params)
 
     if (tid == 0)
     {
-        auto threads = device->enumerate_threads();
+        auto threads = driver_bridge::enumerate_threads();
         if (threads.empty())
             return tool_result_t::error(OBFSTR("No threads found in target process"));
         tid = threads[0].tid;

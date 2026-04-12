@@ -44,6 +44,12 @@ inline void refresh()
 {
 	if (g_ui.loading.load())
 		return;
+	/* Validate kernel driver is connected and a process is attached
+	   before spawning a background thread.  Without this check the
+	   thread would call enumerate_modules() which requires the
+	   kernel LDR walk — failing silently and leaving loading=true. */
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0)
+		return;
 	g_ui.loading.store(true);
 
 	std::thread([]() {

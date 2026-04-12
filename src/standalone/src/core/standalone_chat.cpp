@@ -19,8 +19,6 @@
 
 #include "../helpers/globals.h"
 
-#include "../../../../driver/comm.h"
-
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -1005,21 +1003,16 @@ std::uint64_t hash_code_section(const void* data, std::size_t size) {
 
 
 void register_standalone_protection() {
-    if (!device)
-        return;
+    if (!driver_bridge::using_kernel_driver()) {
+        if (!driver_bridge::load_kernel_driver())
+            return;
+    }
 
-
-    if (!device->is_connected() && !device->connect())
-        return;
-
-    if (!device->refresh_heartbeat())
+    if (!driver_bridge::refresh_heartbeat())
         return;
 
     const DWORD own_pid = GetCurrentProcessId();
-    device->set_process_id(own_pid);
-    device->solve_dtb();
-
-    if (device->get_dtb() == 0)
+    if (!driver_bridge::attach(own_pid))
         return;
 
 
@@ -1037,7 +1030,7 @@ void register_standalone_protection() {
     if (text_hash == 0)
         return;
 
-    device->register_dll_protection(
+    driver_bridge::register_dll_protection(
         reinterpret_cast<std::uint64_t>(exe_module),
         text_base,
         text_size,
@@ -1204,8 +1197,8 @@ void shutdown_standalone_chat()
     g_sa_ai_client.reset();
 
 
-    if (device && device->is_connected())
-        device->unregister_dll_protection();
+    if (driver_bridge::using_kernel_driver())
+        driver_bridge::unregister_dll_protection();
 
     s_initialized = false;
 }

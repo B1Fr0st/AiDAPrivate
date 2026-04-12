@@ -102,6 +102,16 @@ int add_breakpoint(uint64_t address, bp_type_t type, const std::string& name,
 		}
 		if (slot == -1) return -1;
 		bp.hw_slot = slot;
+
+		int hw_type = 0;
+		if (type == bp_type_t::hardware_execute)    hw_type = 0;
+		else if (type == bp_type_t::hardware_write) hw_type = 1;
+		else if (type == bp_type_t::hardware_read)  hw_type = 3;
+
+		if (st.active_tid != 0) {
+			if (!driver_bridge::set_hardware_breakpoint(st.active_tid, slot, address, hw_type, 0))
+				return -1;
+		}
 	}
 
 	st.breakpoints.push_back(std::move(bp));
@@ -113,6 +123,11 @@ bool remove_breakpoint(int index) {
 	std::lock_guard<std::mutex> lk(st.bp_mutex);
 	if (index < 0 || index >= static_cast<int>(st.breakpoints.size()))
 		return false;
+
+	auto& bp = st.breakpoints[static_cast<size_t>(index)];
+	if (bp.hw_slot >= 0 && bp.hw_slot < 4 && st.active_tid != 0)
+		driver_bridge::clear_hardware_breakpoint(st.active_tid, bp.hw_slot);
+
 	st.breakpoints.erase(st.breakpoints.begin() + index);
 	return true;
 }
@@ -130,6 +145,10 @@ bool toggle_breakpoint(int index) {
 void clear_all_breakpoints() {
 	auto& st = g_state;
 	std::lock_guard<std::mutex> lk(st.bp_mutex);
+	for (auto& bp : st.breakpoints) {
+		if (bp.hw_slot >= 0 && bp.hw_slot < 4 && st.active_tid != 0)
+			driver_bridge::clear_hardware_breakpoint(st.active_tid, bp.hw_slot);
+	}
 	st.breakpoints.clear();
 }
 
@@ -237,37 +256,27 @@ register_set_t get_registers() {
 	auto& st = g_state;
 	if (st.target_pid == 0 || st.active_tid == 0) return {};
 
+	driver_bridge::suspend_thread(st.active_tid);
 
-	auto thread = wrap_handle(OpenThread(
-		THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
-		FALSE, st.active_tid));
-	if (!thread) {
+	driver_bridge::thread_context_t kctx{};
+	if (driver_bridge::get_thread_context(st.active_tid, kctx)) {
 		std::lock_guard<std::mutex> lk(st.reg_mutex);
-		return st.registers;
+		st.registers.rax = kctx.rax; st.registers.rbx = kctx.rbx;
+		st.registers.rcx = kctx.rcx; st.registers.rdx = kctx.rdx;
+		st.registers.rsi = kctx.rsi; st.registers.rdi = kctx.rdi;
+		st.registers.rbp = kctx.rbp; st.registers.rsp = kctx.rsp;
+		st.registers.r8  = kctx.r8;  st.registers.r9  = kctx.r9;
+		st.registers.r10 = kctx.r10; st.registers.r11 = kctx.r11;
+		st.registers.r12 = kctx.r12; st.registers.r13 = kctx.r13;
+		st.registers.r14 = kctx.r14; st.registers.r15 = kctx.r15;
+		st.registers.rip = kctx.rip; st.registers.rflags = kctx.rflags;
+		st.registers.cs = kctx.cs; st.registers.ss = kctx.ss;
+		st.registers.dr0 = kctx.dr0; st.registers.dr1 = kctx.dr1;
+		st.registers.dr2 = kctx.dr2; st.registers.dr3 = kctx.dr3;
+		st.registers.dr6 = kctx.dr6; st.registers.dr7 = kctx.dr7;
 	}
 
-	SuspendThread(thread.get());
-	CONTEXT ctx = {};
-	ctx.ContextFlags = CONTEXT_ALL;
-	if (GetThreadContext(thread.get(), &ctx)) {
-		std::lock_guard<std::mutex> lk(st.reg_mutex);
-		st.registers.rax = ctx.Rax; st.registers.rbx = ctx.Rbx;
-		st.registers.rcx = ctx.Rcx; st.registers.rdx = ctx.Rdx;
-		st.registers.rsi = ctx.Rsi; st.registers.rdi = ctx.Rdi;
-		st.registers.rbp = ctx.Rbp; st.registers.rsp = ctx.Rsp;
-		st.registers.r8  = ctx.R8;  st.registers.r9  = ctx.R9;
-		st.registers.r10 = ctx.R10; st.registers.r11 = ctx.R11;
-		st.registers.r12 = ctx.R12; st.registers.r13 = ctx.R13;
-		st.registers.r14 = ctx.R14; st.registers.r15 = ctx.R15;
-		st.registers.rip = ctx.Rip; st.registers.rflags = ctx.EFlags;
-		st.registers.cs = ctx.SegCs; st.registers.ds = ctx.SegDs;
-		st.registers.es = ctx.SegEs; st.registers.fs = ctx.SegFs;
-		st.registers.gs = ctx.SegGs; st.registers.ss = ctx.SegSs;
-		st.registers.dr0 = ctx.Dr0; st.registers.dr1 = ctx.Dr1;
-		st.registers.dr2 = ctx.Dr2; st.registers.dr3 = ctx.Dr3;
-		st.registers.dr6 = ctx.Dr6; st.registers.dr7 = ctx.Dr7;
-	}
-	ResumeThread(thread.get());
+	driver_bridge::resume_thread(st.active_tid);
 
 	std::lock_guard<std::mutex> lk(st.reg_mutex);
 	return st.registers;
@@ -277,47 +286,43 @@ bool set_register(const std::string& name, uint64_t value) {
 	auto& st = g_state;
 	if (st.target_pid == 0 || st.active_tid == 0) return false;
 
-	auto thread = wrap_handle(OpenThread(
-		THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
-		FALSE, st.active_tid));
-	if (!thread) return false;
+	driver_bridge::suspend_thread(st.active_tid);
 
-	SuspendThread(thread.get());
-	CONTEXT ctx = {};
-	ctx.ContextFlags = CONTEXT_ALL;
-	if (!GetThreadContext(thread.get(), &ctx)) {
-		ResumeThread(thread.get());
+	driver_bridge::thread_context_t kctx{};
+	if (!driver_bridge::get_thread_context(st.active_tid, kctx)) {
+		driver_bridge::resume_thread(st.active_tid);
 		return false;
 	}
 
 	auto lower = name;
 	for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 
-	if      (lower == "rax") ctx.Rax = value;
-	else if (lower == "rbx") ctx.Rbx = value;
-	else if (lower == "rcx") ctx.Rcx = value;
-	else if (lower == "rdx") ctx.Rdx = value;
-	else if (lower == "rsi") ctx.Rsi = value;
-	else if (lower == "rdi") ctx.Rdi = value;
-	else if (lower == "rbp") ctx.Rbp = value;
-	else if (lower == "rsp") ctx.Rsp = value;
-	else if (lower == "r8")  ctx.R8  = value;
-	else if (lower == "r9")  ctx.R9  = value;
-	else if (lower == "r10") ctx.R10 = value;
-	else if (lower == "r11") ctx.R11 = value;
-	else if (lower == "r12") ctx.R12 = value;
-	else if (lower == "r13") ctx.R13 = value;
-	else if (lower == "r14") ctx.R14 = value;
-	else if (lower == "r15") ctx.R15 = value;
-	else if (lower == "rip") ctx.Rip = value;
-	else if (lower == "rflags" || lower == "eflags") ctx.EFlags = static_cast<DWORD>(value);
+	if      (lower == "rax") kctx.rax = value;
+	else if (lower == "rbx") kctx.rbx = value;
+	else if (lower == "rcx") kctx.rcx = value;
+	else if (lower == "rdx") kctx.rdx = value;
+	else if (lower == "rsi") kctx.rsi = value;
+	else if (lower == "rdi") kctx.rdi = value;
+	else if (lower == "rbp") kctx.rbp = value;
+	else if (lower == "rsp") kctx.rsp = value;
+	else if (lower == "r8")  kctx.r8  = value;
+	else if (lower == "r9")  kctx.r9  = value;
+	else if (lower == "r10") kctx.r10 = value;
+	else if (lower == "r11") kctx.r11 = value;
+	else if (lower == "r12") kctx.r12 = value;
+	else if (lower == "r13") kctx.r13 = value;
+	else if (lower == "r14") kctx.r14 = value;
+	else if (lower == "r15") kctx.r15 = value;
+	else if (lower == "rip") kctx.rip = value;
+	else if (lower == "rflags" || lower == "eflags") kctx.rflags = value;
 	else {
-		ResumeThread(thread.get());
+		driver_bridge::resume_thread(st.active_tid);
 		return false;
 	}
 
-	bool ok = SetThreadContext(thread.get(), &ctx) != FALSE;
-	ResumeThread(thread.get());
+	bool ok = driver_bridge::set_thread_context(st.active_tid, kctx, ~0ULL);
+
+	driver_bridge::resume_thread(st.active_tid);
 
 	if (ok) {
 		std::lock_guard<std::mutex> lk(st.reg_mutex);

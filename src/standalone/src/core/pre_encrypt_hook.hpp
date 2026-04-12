@@ -10,7 +10,6 @@
 #include <cctype>
 
 #include "standalone_driver.hpp"
-#include "comm.h"
 
 namespace pre_encrypt_hook {
 
@@ -89,7 +88,7 @@ inline std::string resolve_module_from_rip(uint64_t rip, uint64_t& offset_out) {
 
 inline bool hook_address(uint64_t address, const std::string& name,
                          uint32_t buffer_reg, uint32_t size_reg) {
-    if (!device || !device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return false;
 
     std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -118,7 +117,7 @@ inline bool hook_address(uint64_t address, const std::string& name,
             return true;
     }
 
-    if (!device->sniff_net_buffers_start(address, buffer_reg, size_reg, 16, 0, bp_slot))
+    if (!driver_bridge::sniff_net_buffers_start(address, buffer_reg, size_reg, 16, 0, bp_slot))
         return false;
 
     hook_target_t target;
@@ -136,7 +135,7 @@ inline bool hook_address(uint64_t address, const std::string& name,
 }
 
 inline bool auto_hook(uint32_t pid) {
-    if (!device || !device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return false;
 
     if (!driver_bridge::is_loaded())
@@ -171,7 +170,7 @@ inline bool auto_hook(uint32_t pid) {
             if (!ci_contains(mod.name, known.module_pattern))
                 continue;
 
-            uint64_t func_addr = device->resolve_export(mod.base, known.export_name);
+            uint64_t func_addr = driver_bridge::resolve_export(mod.base, known.export_name);
             if (func_addr == 0)
                 continue;
 
@@ -192,10 +191,10 @@ inline void unhook_all() {
 
     std::lock_guard<std::mutex> lock(g_state.mutex);
 
-    if (device && device->is_connected()) {
+    if (driver_bridge::using_kernel_driver()) {
         for (auto& t : g_state.targets) {
             if (t.active) {
-                device->sniff_net_buffers_stop();
+                driver_bridge::sniff_net_buffers_stop();
                 t.active = false;
             }
         }
@@ -206,11 +205,11 @@ inline void unhook_all() {
 }
 
 inline void poll_captures() {
-    if (!device || !device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return;
 
     bool active = false;
-    auto results = device->sniff_net_buffers_get(active);
+    auto results = driver_bridge::sniff_net_buffers_get(active);
 
     if (results.empty())
         return;

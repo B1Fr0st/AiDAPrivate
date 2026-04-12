@@ -1,6 +1,6 @@
 #include "mitm_proxy.hpp"
 #include "cert_generator.hpp"
-#include "comm.h"
+#include "standalone_driver.hpp"
 #include "protocol_parser.hpp"
 #include "http_parser_engine.hpp"
 #include "http2_session.hpp"
@@ -1334,14 +1334,14 @@ bool start(const proxy_config& config) {
 
 
     if (config.use_wfp_redirect) {
-        if (device && device->is_connected()) {
+        if (driver_bridge::using_kernel_driver()) {
             uint8_t local_addr[16] = {};
             inet_pton(AF_INET, config.bind_addr.c_str(), local_addr);
 
             uint32_t rule_id = 0;
             uint32_t own_pid = static_cast<uint32_t>(GetCurrentProcessId());
 
-            bool ok = device->traffic_redirect_op(
+            bool ok = driver_bridge::traffic_redirect_op(
                 0,
                 0,
                 6,
@@ -1366,9 +1366,9 @@ void stop() {
 
 
     if (g_state.config.wfp_rule_id != 0) {
-        if (device && device->is_connected()) {
+        if (driver_bridge::using_kernel_driver()) {
 
-            device->traffic_redirect_op(1, g_state.config.wfp_rule_id);
+            driver_bridge::traffic_redirect_op(1, g_state.config.wfp_rule_id);
         }
         g_state.config.wfp_rule_id = 0;
     }

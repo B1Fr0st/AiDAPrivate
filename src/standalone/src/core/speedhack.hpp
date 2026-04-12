@@ -5,7 +5,6 @@
 #endif
 #include <windows.h>
 
-#include "../../../driver/comm.h"
 #include "standalone_driver.hpp"
 
 #include <algorithm>
@@ -13,8 +12,6 @@
 #include <cstring>
 #include <string>
 #include <vector>
-
-extern std::unique_ptr<voyager::device_t> device;
 
 namespace speedhack {
 
@@ -151,7 +148,7 @@ inline void build_gtc64_hook(std::vector<uint8_t>& sc, uint64_t data_addr_val, u
 }
 
 inline uint64_t resolve_api_in_target(const char* module_name, const char* func_name) {
-	if (!device || !device->is_connected()) return 0;
+	if (!driver_bridge::using_kernel_driver()) return 0;
 	auto mods = driver_bridge::enumerate_modules();
 	for (const auto& m : mods) {
 		std::string lower_name = m.name;
@@ -161,7 +158,7 @@ inline uint64_t resolve_api_in_target(const char* module_name, const char* func_
 		std::transform(lower_target.begin(), lower_target.end(), lower_target.begin(),
 					   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 		if (lower_name.find(lower_target) != std::string::npos) {
-			uint64_t addr = device->resolve_export(m.base, func_name);
+			uint64_t addr = driver_bridge::resolve_export(m.base, func_name);
 			if (addr != 0) return addr;
 		}
 	}
@@ -182,7 +179,7 @@ inline bool enable(float speed) {
 		g_state.err = "no process attached";
 		return false;
 	}
-	if (!device || !device->is_connected()) {
+	if (!driver_bridge::using_kernel_driver()) {
 		g_state.err = "device not connected";
 		return false;
 	}
@@ -203,31 +200,31 @@ inline bool enable(float speed) {
 		return false;
 	}
 
-	uint64_t sc_addr = device->allocate_memory(SHELLCODE_REGION_SIZE);
+	uint64_t sc_addr = driver_bridge::allocate_memory(SHELLCODE_REGION_SIZE);
 	if (sc_addr == 0) {
 		g_state.err = "failed to allocate shellcode memory";
 		return false;
 	}
 
-	uint64_t d_addr = device->allocate_memory(DATA_BLOCK_SIZE);
+	uint64_t d_addr = driver_bridge::allocate_memory(DATA_BLOCK_SIZE);
 	if (d_addr == 0) {
-		device->free_memory(sc_addr);
+		driver_bridge::free_memory(sc_addr);
 		g_state.err = "failed to allocate data memory";
 		return false;
 	}
 
-	std::vector<uint8_t> orig_qpc(HOOK_PATCH_SIZE);
-	if (device->read_raw(qpc_addr, orig_qpc.data(), HOOK_PATCH_SIZE) < HOOK_PATCH_SIZE) {
-		device->free_memory(sc_addr);
-		device->free_memory(d_addr);
+	std::vector<uint8_t> orig_qpc;
+	if (!driver_bridge::read_memory(qpc_addr, HOOK_PATCH_SIZE, orig_qpc) || orig_qpc.size() < HOOK_PATCH_SIZE) {
+		driver_bridge::free_memory(sc_addr);
+		driver_bridge::free_memory(d_addr);
 		g_state.err = "failed to read QPC bytes";
 		return false;
 	}
 
-	std::vector<uint8_t> orig_gtc64(HOOK_PATCH_SIZE);
-	if (device->read_raw(gtc64_addr, orig_gtc64.data(), HOOK_PATCH_SIZE) < HOOK_PATCH_SIZE) {
-		device->free_memory(sc_addr);
-		device->free_memory(d_addr);
+	std::vector<uint8_t> orig_gtc64;
+	if (!driver_bridge::read_memory(gtc64_addr, HOOK_PATCH_SIZE, orig_gtc64) || orig_gtc64.size() < HOOK_PATCH_SIZE) {
+		driver_bridge::free_memory(sc_addr);
+		driver_bridge::free_memory(d_addr);
 		g_state.err = "failed to read GTC64 bytes";
 		return false;
 	}
@@ -254,9 +251,9 @@ inline bool enable(float speed) {
 	std::memcpy(data_block.data() + DATA_QPC_TRAMP, &qpc_tramp, 8);
 	std::memcpy(data_block.data() + DATA_GTC64_TRAMP, &gtc64_tramp, 8);
 
-	if (device->write_raw(d_addr, data_block.data(), data_block.size()) < data_block.size()) {
-		device->free_memory(sc_addr);
-		device->free_memory(d_addr);
+	if (!driver_bridge::write_memory(d_addr, data_block)) {
+		driver_bridge::free_memory(sc_addr);
+		driver_bridge::free_memory(d_addr);
 		g_state.err = "failed to write data block";
 		return false;
 	}
@@ -267,28 +264,31 @@ inline bool enable(float speed) {
 	build_qpc_hook(sc, d_addr, qpc_tramp);
 	build_gtc64_hook(sc, d_addr, gtc64_tramp);
 
-	if (device->write_raw(sc_addr, sc.data(), sc.size()) < sc.size()) {
-		device->free_memory(sc_addr);
-		device->free_memory(d_addr);
+	std::vector<uint8_t> sc_vec(sc.begin(), sc.end());
+	if (!driver_bridge::write_memory(sc_addr, sc_vec)) {
+		driver_bridge::free_memory(sc_addr);
+		driver_bridge::free_memory(d_addr);
 		g_state.err = "failed to write shellcode";
 		return false;
 	}
 
 	uint8_t qpc_patch[HOOK_PATCH_SIZE];
 	build_jmp_abs(qpc_patch, sc_addr + QPC_HOOK_OFFSET);
-	if (device->write_raw(qpc_addr, qpc_patch, HOOK_PATCH_SIZE) < HOOK_PATCH_SIZE) {
-		device->free_memory(sc_addr);
-		device->free_memory(d_addr);
+	std::vector<uint8_t> qpc_patch_vec(qpc_patch, qpc_patch + HOOK_PATCH_SIZE);
+	if (!driver_bridge::write_memory(qpc_addr, qpc_patch_vec)) {
+		driver_bridge::free_memory(sc_addr);
+		driver_bridge::free_memory(d_addr);
 		g_state.err = "failed to patch QPC";
 		return false;
 	}
 
 	uint8_t gtc64_patch[HOOK_PATCH_SIZE];
 	build_jmp_abs(gtc64_patch, sc_addr + GTC64_HOOK_OFFSET);
-	if (device->write_raw(gtc64_addr, gtc64_patch, HOOK_PATCH_SIZE) < HOOK_PATCH_SIZE) {
-		device->write_raw(qpc_addr, orig_qpc.data(), orig_qpc.size());
-		device->free_memory(sc_addr);
-		device->free_memory(d_addr);
+	std::vector<uint8_t> gtc64_patch_vec(gtc64_patch, gtc64_patch + HOOK_PATCH_SIZE);
+	if (!driver_bridge::write_memory(gtc64_addr, gtc64_patch_vec)) {
+		driver_bridge::write_memory(qpc_addr, orig_qpc);
+		driver_bridge::free_memory(sc_addr);
+		driver_bridge::free_memory(d_addr);
 		g_state.err = "failed to patch GTC64";
 		return false;
 	}
@@ -313,7 +313,7 @@ inline bool disable() {
 		g_state.err = "speedhack not active";
 		return false;
 	}
-	if (!device || !device->is_connected()) {
+	if (!driver_bridge::using_kernel_driver()) {
 		g_state.err = "device not connected";
 		return false;
 	}
@@ -321,25 +321,23 @@ inline bool disable() {
 	bool ok = true;
 
 	if (g_state.patched_qpc && !g_state.original_qpc_bytes.empty()) {
-		if (device->write_raw(g_state.qpc_addr, g_state.original_qpc_bytes.data(),
-							  g_state.original_qpc_bytes.size()) < g_state.original_qpc_bytes.size()) {
+		if (!driver_bridge::write_memory(g_state.qpc_addr, g_state.original_qpc_bytes)) {
 			g_state.err = "failed to restore QPC";
 			ok = false;
 		}
 	}
 
 	if (g_state.patched_gtc64 && !g_state.original_gtc64_bytes.empty()) {
-		if (device->write_raw(g_state.gtc64_addr, g_state.original_gtc64_bytes.data(),
-							  g_state.original_gtc64_bytes.size()) < g_state.original_gtc64_bytes.size()) {
+		if (!driver_bridge::write_memory(g_state.gtc64_addr, g_state.original_gtc64_bytes)) {
 			g_state.err = "failed to restore GTC64";
 			ok = false;
 		}
 	}
 
 	if (g_state.shellcode_addr != 0)
-		device->free_memory(g_state.shellcode_addr);
+		driver_bridge::free_memory(g_state.shellcode_addr);
 	if (g_state.data_addr != 0)
-		device->free_memory(g_state.data_addr);
+		driver_bridge::free_memory(g_state.data_addr);
 
 	g_state.active = false;
 	g_state.speed = 1.0f;
@@ -360,7 +358,7 @@ inline bool set_speed(float speed) {
 		g_state.err = "speedhack not active";
 		return false;
 	}
-	if (!device || !device->is_connected()) {
+	if (!driver_bridge::using_kernel_driver()) {
 		g_state.err = "device not connected";
 		return false;
 	}
@@ -369,8 +367,8 @@ inline bool set_speed(float speed) {
 	QueryPerformanceCounter(&qpc_now);
 	uint64_t tick_now = GetTickCount64();
 
-	std::vector<uint8_t> old_data(DATA_BLOCK_SIZE);
-	if (device->read_raw(g_state.data_addr, old_data.data(), DATA_BLOCK_SIZE) < DATA_BLOCK_SIZE) {
+	std::vector<uint8_t> old_data;
+	if (!driver_bridge::read_memory(g_state.data_addr, DATA_BLOCK_SIZE, old_data) || old_data.size() < DATA_BLOCK_SIZE) {
 		g_state.err = "failed to read data block";
 		return false;
 	}
@@ -402,7 +400,7 @@ inline bool set_speed(float speed) {
 	std::memcpy(new_data.data() + DATA_QPC_TRAMP, old_data.data() + DATA_QPC_TRAMP, 8);
 	std::memcpy(new_data.data() + DATA_GTC64_TRAMP, old_data.data() + DATA_GTC64_TRAMP, 8);
 
-	if (device->write_raw(g_state.data_addr, new_data.data(), new_data.size()) < new_data.size()) {
+	if (!driver_bridge::write_memory(g_state.data_addr, new_data)) {
 		g_state.err = "failed to write new speed";
 		return false;
 	}

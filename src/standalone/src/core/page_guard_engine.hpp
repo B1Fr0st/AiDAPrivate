@@ -6,7 +6,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 
-#include "../../../driver/comm.h"
+#include "standalone_driver.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -17,8 +17,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
-extern std::unique_ptr<voyager::device_t> device;
 
 namespace page_guard_engine {
 
@@ -217,50 +215,50 @@ public:
 
 
     uint32_t install(uint32_t pid, uint64_t target_addr, uint64_t region_size) {
-        if (!device || !device->is_connected()) return 0;
+        if (!driver_bridge::using_kernel_driver()) return 0;
 
 
-        voyager::device_t::memory_region_info mri{};
-        if (!device->query_memory(target_addr, mri))     return 0;
+        driver_bridge::memory_region_t mri{};
+        if (!driver_bridge::query_memory(target_addr, mri))     return 0;
         uint32_t orig_protect = mri.protect;
 
 
         uint64_t k32_base = find_module_base(pid, "kernel32.dll");
         if (k32_base == 0) return 0;
-        uint64_t virt_protect_fn = device->resolve_export(k32_base, "VirtualProtect");
+        uint64_t virt_protect_fn = driver_bridge::resolve_export(k32_base, "VirtualProtect");
         if (virt_protect_fn == 0) return 0;
 
 
-        uint64_t ring_addr = device->allocate_memory(RING_TOTAL_SIZE + 16);
+        uint64_t ring_addr = driver_bridge::allocate_memory(RING_TOTAL_SIZE + 16);
         if (ring_addr == 0) return 0;
 
-        uint64_t sc_addr = device->allocate_memory(SHELLCODE_SIZE + 16);
+        uint64_t sc_addr = driver_bridge::allocate_memory(SHELLCODE_SIZE + 16);
         if (sc_addr == 0) return 0;
 
 
         std::vector<uint8_t> zeroes(RING_TOTAL_SIZE, 0);
-        device->write_raw(ring_addr, zeroes.data(), RING_TOTAL_SIZE);
+        driver_bridge::write_memory(ring_addr, zeroes);
 
 
         auto sc = generate_veh_shellcode(ring_addr, target_addr,
                                          region_size, orig_protect,
                                          virt_protect_fn);
-        device->write_raw(sc_addr, sc.data(), sc.size());
+        driver_bridge::write_memory(sc_addr, sc);
 
 
         uint32_t old_prot = 0;
-        if (!device->protect_memory(target_addr, region_size,
+        if (!driver_bridge::protect_memory(target_addr, region_size,
                                     orig_protect | 0x100 , &old_prot))
             return 0;
 
 
         uint64_t ntdll_base_install = find_module_base(pid, "ntdll.dll");
         if (ntdll_base_install == 0) return 0;
-        uint64_t rtl_add_fn = device->resolve_export(ntdll_base_install,
+        uint64_t rtl_add_fn = driver_bridge::resolve_export(ntdll_base_install,
                                                       "RtlAddVectoredExceptionHandler");
         if (rtl_add_fn == 0) return 0;
 
-        uint64_t veh_handle = device->call_function(rtl_add_fn, 1, sc_addr);
+        uint64_t veh_handle = driver_bridge::call_function(rtl_add_fn, 1, sc_addr);
 
 
         auto session         = std::make_unique<pg_session_t>();
@@ -317,18 +315,18 @@ public:
         sess->polling.store(false);
         if (sess->poll_thread.joinable()) sess->poll_thread.join();
 
-        if (device && device->is_connected()) {
+        if (driver_bridge::using_kernel_driver()) {
 
             if (sess->veh_handle) {
                 uint64_t ntdll_base = find_module_base(sess->pid, "ntdll.dll");
                 if (ntdll_base) {
-                    uint64_t rtl_rm = device->resolve_export(ntdll_base,
+                    uint64_t rtl_rm = driver_bridge::resolve_export(ntdll_base,
                                                               "RtlRemoveVectoredExceptionHandler");
-                    if (rtl_rm) device->call_function(rtl_rm, sess->veh_handle);
+                    if (rtl_rm) driver_bridge::call_function(rtl_rm, sess->veh_handle);
                 }
             }
 
-            device->protect_memory(sess->target_addr, sess->region_size,
+            driver_bridge::protect_memory(sess->target_addr, sess->region_size,
                                    sess->orig_protect, nullptr);
         }
         return true;
@@ -363,33 +361,21 @@ public:
 
 
     static uint64_t find_module_base(uint32_t pid, const char* name_lower) noexcept {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
-                                               static_cast<DWORD>(pid));
-        if (snap == INVALID_HANDLE_VALUE) return 0;
-        MODULEENTRY32W me{};
-        me.dwSize = sizeof(me);
-        if (Module32FirstW(snap, &me)) {
-            do {
-                char buf[128]{};
-                WideCharToMultiByte(CP_UTF8, 0, me.szModule, -1,
-                                    buf, static_cast<int>(sizeof(buf) - 1),
-                                    nullptr, nullptr);
-                for (char* p = buf; *p; ++p)
-                    *p = static_cast<char>(tolower(static_cast<unsigned char>(*p)));
-                if (strcmp(buf, name_lower) == 0) {
-                    CloseHandle(snap);
-                    return reinterpret_cast<uint64_t>(me.modBaseAddr);
-                }
-            } while (Module32NextW(snap, &me));
+        auto modules = driver_bridge::enumerate_modules();
+        for (const auto& m : modules) {
+            std::string lower_name = m.name;
+            for (char& c : lower_name)
+                c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            if (lower_name == name_lower)
+                return m.base;
         }
-        CloseHandle(snap);
         return 0;
     }
 
 private:
     void poll_ring(pg_session_t* sess) {
         while (sess->polling.load()) {
-            if (device && device->is_connected()) {
+            if (driver_bridge::using_kernel_driver()) {
                 drain_ring(sess);
             }
 
@@ -401,9 +387,10 @@ private:
     void drain_ring(pg_session_t* sess) {
 
         pg_ring_header_t hdr{};
-        auto read_bytes = device->read_raw(sess->ring_addr,
-                                           &hdr, sizeof(hdr));
-        if (read_bytes != sizeof(hdr)) return;
+        std::vector<uint8_t> hdr_buf;
+        if (!driver_bridge::read_memory(sess->ring_addr, sizeof(hdr), hdr_buf) || hdr_buf.size() < sizeof(hdr))
+            return;
+        std::memcpy(&hdr, hdr_buf.data(), sizeof(hdr));
 
         uint32_t w = hdr.write_idx & (RING_ENTRIES - 1);
         uint32_t r = hdr.read_idx  & (RING_ENTRIES - 1);
@@ -419,7 +406,9 @@ private:
             pg_capture_t entry{};
             uint64_t entry_addr = sess->ring_addr + sizeof(pg_ring_header_t)
                                   + r * sizeof(pg_capture_t);
-            if (device->read_raw(entry_addr, &entry, sizeof(entry)) == sizeof(entry)) {
+            std::vector<uint8_t> entry_buf;
+            if (driver_bridge::read_memory(entry_addr, sizeof(entry), entry_buf) && entry_buf.size() >= sizeof(entry)) {
+                std::memcpy(&entry, entry_buf.data(), sizeof(entry));
                 std::lock_guard<std::mutex> lk(sess->captures_mutex);
                 sess->captures.push(entry);
             }
@@ -431,8 +420,9 @@ private:
         if (r != (hdr.read_idx & (RING_ENTRIES - 1))) {
 
             uint32_t new_r = r;
-            device->write_raw(sess->ring_addr + offsetof(pg_ring_header_t, read_idx),
-                              &new_r, sizeof(new_r));
+            std::vector<uint8_t> r_buf(sizeof(new_r));
+            std::memcpy(r_buf.data(), &new_r, sizeof(new_r));
+            driver_bridge::write_memory(sess->ring_addr + offsetof(pg_ring_header_t, read_idx), r_buf);
         }
     }
 

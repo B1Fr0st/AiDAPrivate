@@ -9,6 +9,9 @@
 #include <cstdio>
 #include <cstring>
 #include "ui_anim.hpp"
+#include "decompiler_engine.hpp"
+#include "aob_generator.hpp"
+#include "standalone_settings.hpp"
 
 namespace disasm_view {
 
@@ -540,6 +543,20 @@ void render(float pos_x, float pos_y, float width, float height,
 
             if (ImGui::MenuItem("Show Bytes", nullptr, st.show_bytes))
                 st.show_bytes = !st.show_bytes;
+
+            ImGui::Separator();
+
+            if (ImGui::MenuItem("Decompile Function")) {
+                decompiler_engine::decompile_function(ci.addr, get_standalone_settings());
+                globals::ui::active_center_view = center_view_t::decompiler;
+            }
+            if (ImGui::MenuItem("Generate AOB Signature")) {
+                char addr_buf[32];
+                snprintf(addr_buf, sizeof(addr_buf), "%llX", (unsigned long long)ci.addr);
+                strncpy(aob_generator::g_state.address_input, addr_buf, sizeof(aob_generator::g_state.address_input) - 1);
+                aob_generator::generate_from_address(ci.addr, aob_generator::g_state.instruction_count, aob_generator::g_state.auto_wildcard);
+                globals::ui::active_center_view = center_view_t::aob_generator;
+            }
         }
         ImGui::EndPopup();
     }

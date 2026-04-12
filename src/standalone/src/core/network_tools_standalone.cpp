@@ -1,11 +1,11 @@
-﻿
+
 
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
 #include "standalone_compat.hpp"
-#include "comm.h"
+#include "standalone_driver.hpp"
 #include "obfuscation.hpp"
 #include "pro.h"
 #include "decoder_pipeline.hpp"
@@ -114,7 +114,7 @@ static std::string extract_ascii(const std::uint8_t* data, std::size_t len, std:
 
 tool_result_t network_enumerate_connections(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
 
     std::uint32_t filter_pid = 0, filter_protocol = 0;
@@ -128,7 +128,7 @@ tool_result_t network_enumerate_connections(const json& params)
         filter_protocol = params["protocol"].get<std::uint32_t>();
     }
 
-    auto conns = device->enumerate_connections(filter_pid, filter_protocol);
+    auto conns = driver_bridge::enumerate_connections(filter_pid, filter_protocol);
 
     json arr = json::array();
     for (const auto& c : conns) {
@@ -149,7 +149,7 @@ tool_result_t network_enumerate_connections(const json& params)
 
 tool_result_t network_start_capture(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected. Call driver_connect first."));
 
     std::uint32_t filter_pid = 0, filter_port = 0, filter_protocol = 0, max_payload = 1500;
@@ -172,7 +172,7 @@ tool_result_t network_start_capture(const json& params)
     if (params.contains("max_payload") && params["max_payload"].is_number())
         max_payload = params["max_payload"].get<std::uint32_t>();
 
-    bool ok = device->start_capture(filter_pid, filter_port, filter_protocol,
+    bool ok = driver_bridge::start_capture(filter_pid, filter_port, filter_protocol,
         filter_ip, max_payload);
 
     if (!ok)
@@ -191,10 +191,10 @@ tool_result_t network_start_capture(const json& params)
 
 tool_result_t network_stop_capture(const json&)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
-    if (!device->stop_capture())
+    if (!driver_bridge::stop_capture())
         return tool_result_t::error(OBFSTR("Failed to stop packet capture."));
 
     return tool_result_t::ok(OBFSTR("Packet capture stopped"));
@@ -202,7 +202,7 @@ tool_result_t network_stop_capture(const json&)
 
 tool_result_t network_get_packets(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t max_packets = 32;
@@ -210,7 +210,7 @@ tool_result_t network_get_packets(const json& params)
         max_packets = params["count"].get<std::uint32_t>();
     if (max_packets > 32) max_packets = 32;
 
-    auto packets = device->get_captured_packets(max_packets);
+    auto packets = driver_bridge::get_captured_packets(max_packets);
 
     json arr = json::array();
     for (const auto& p : packets) {
@@ -237,11 +237,11 @@ tool_result_t network_get_packets(const json& params)
 
 tool_result_t network_analyze_packet(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
 
-    auto packets = device->get_captured_packets(1);
+    auto packets = driver_bridge::get_captured_packets(1);
     if (packets.empty())
         return tool_result_t::error(OBFSTR("No packets available. Start capture first."));
 
@@ -289,14 +289,14 @@ tool_result_t network_analyze_packet(const json& params)
 
 tool_result_t network_dns_log(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t filter_pid = 0;
     if (params.contains("pid") && params["pid"].is_number())
         filter_pid = params["pid"].get<std::uint32_t>();
 
-    auto entries = device->get_dns_queries(filter_pid);
+    auto entries = driver_bridge::get_dns_queries(filter_pid);
 
     json arr = json::array();
     for (const auto& e : entries) {
@@ -337,7 +337,7 @@ tool_result_t network_dns_log(const json& params)
 
 tool_result_t network_add_filter(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t action = 2;
@@ -374,7 +374,7 @@ tool_result_t network_add_filter(const json& params)
     }
 
     std::uint32_t rule_id = 0;
-    bool ok = device->add_filter_rule(action, direction, protocol, pid, port,
+    bool ok = driver_bridge::add_filter_rule(action, direction, protocol, pid, port,
         ip_addr, ip_mask, &rule_id);
 
     if (!ok)
@@ -394,14 +394,14 @@ tool_result_t network_add_filter(const json& params)
 
 tool_result_t network_remove_filter(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     if (!params.contains("rule_id") || !params["rule_id"].is_number())
         return tool_result_t::error(OBFSTR("Missing required parameter: rule_id"));
 
     std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
-    if (!device->remove_filter_rule(rule_id))
+    if (!driver_bridge::remove_filter_rule(rule_id))
         return tool_result_t::error(OBFSTR("Failed to remove filter rule ") + std::to_string(rule_id));
 
     return tool_result_t::ok(OBFSTR("Filter rule ") + std::to_string(rule_id) + OBFSTR(" removed"));
@@ -409,10 +409,10 @@ tool_result_t network_remove_filter(const json& params)
 
 tool_result_t network_clear_filters(const json&)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
-    if (!device->clear_filter_rules())
+    if (!driver_bridge::clear_filter_rules())
         return tool_result_t::error(OBFSTR("Failed to clear filter rules."));
 
     return tool_result_t::ok(OBFSTR("All filter rules cleared"));
@@ -420,11 +420,11 @@ tool_result_t network_clear_filters(const json&)
 
 tool_result_t network_stats(const json&)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
-    voyager::device_t::network_stats stats{};
-    if (!device->get_network_stats(stats))
+    driver_bridge::network_stats_t stats{};
+    if (!driver_bridge::get_network_stats(stats))
         return tool_result_t::error(OBFSTR("Failed to get network stats."));
 
     json result;
@@ -443,12 +443,12 @@ tool_result_t network_stats(const json&)
 
 tool_result_t network_capture_status(const json&)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     bool active = false;
     std::uint32_t captured = 0, dropped = 0;
-    if (!device->get_capture_status(active, captured, dropped))
+    if (!driver_bridge::get_capture_status(active, captured, dropped))
         return tool_result_t::error(OBFSTR("Failed to get capture status."));
 
     json result;
@@ -461,7 +461,7 @@ tool_result_t network_capture_status(const json&)
 
 tool_result_t network_block_ip(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     if (!params.contains("ip") || !params["ip"].is_string())
@@ -481,7 +481,7 @@ tool_result_t network_block_ip(const json& params)
     }
 
     std::uint32_t rule_id = 0;
-    if (!device->add_filter_rule(1, direction, 0, 0, 0, ip, mask, &rule_id))
+    if (!driver_bridge::add_filter_rule(1, direction, 0, 0, 0, ip, mask, &rule_id))
         return tool_result_t::error(OBFSTR("Failed to add block rule"));
 
     json result;
@@ -493,7 +493,7 @@ tool_result_t network_block_ip(const json& params)
 
 tool_result_t network_block_port(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     if (!params.contains("port") || !params["port"].is_number())
@@ -508,7 +508,7 @@ tool_result_t network_block_port(const json& params)
     }
 
     std::uint32_t rule_id = 0;
-    if (!device->add_filter_rule(1, 2, protocol, 0, port, nullptr, nullptr, &rule_id))
+    if (!driver_bridge::add_filter_rule(1, 2, protocol, 0, port, nullptr, nullptr, &rule_id))
         return tool_result_t::error(OBFSTR("Failed to add port block rule"));
 
     json result;
@@ -520,7 +520,7 @@ tool_result_t network_block_port(const json& params)
 
 tool_result_t network_block_process(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     if (!params.contains("pid") || !params["pid"].is_number())
@@ -529,7 +529,7 @@ tool_result_t network_block_process(const json& params)
     std::uint32_t pid = params["pid"].get<std::uint32_t>();
 
     std::uint32_t rule_id = 0;
-    if (!device->add_filter_rule(1, 2, 0, pid, 0, nullptr, nullptr, &rule_id))
+    if (!driver_bridge::add_filter_rule(1, 2, 0, pid, 0, nullptr, nullptr, &rule_id))
         return tool_result_t::error(OBFSTR("Failed to add process block rule"));
 
     json result;
@@ -813,7 +813,7 @@ static std::string format_ipv4_bytes(const std::uint8_t* ip) {
 
 tool_result_t network_deep_inspect(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t filter_pid = 0, filter_protocol = 0, filter_port = 0;
@@ -825,7 +825,7 @@ tool_result_t network_deep_inspect(const json& params)
         else if (p == "udp" || p == "UDP") filter_protocol = 17;
     }
 
-    auto results = device->get_dpi_results(filter_pid, filter_protocol, filter_port, 0);
+    auto results = driver_bridge::get_dpi_results(filter_pid, filter_protocol, filter_port, 0);
     json arr = json::array();
     for (const auto& d : results) {
         json entry;
@@ -860,7 +860,7 @@ tool_result_t network_deep_inspect(const json& params)
 
 tool_result_t network_follow_tcp_stream(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
         return tool_result_t::error(OBFSTR("Missing required parameter: operation ('start', 'stop', or 'get')"));
@@ -872,18 +872,18 @@ tool_result_t network_follow_tcp_stream(const json& params)
     if (params.contains("pid") && params["pid"].is_number()) pid = params["pid"].get<std::uint32_t>();
 
     if (op == "start") {
-        bool ok = device->stream_reassemble_op(0, src_port, dst_port, pid, nullptr, nullptr, nullptr, nullptr, nullptr);
+        bool ok = driver_bridge::stream_reassemble_op(0, src_port, dst_port, pid, nullptr, nullptr, nullptr, nullptr, nullptr);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to start stream reassembly. Max 1024 concurrent streams."));
         json r; r["status"] = "started"; r["src_port"] = src_port; r["dst_port"] = dst_port;
         return tool_result_t::ok(OBFSTR("TCP stream reassembly started"), r);
     } else if (op == "stop") {
-        bool ok = device->stream_reassemble_op(1, src_port, dst_port, pid, nullptr, nullptr, nullptr, nullptr, nullptr);
+        bool ok = driver_bridge::stream_reassemble_op(1, src_port, dst_port, pid, nullptr, nullptr, nullptr, nullptr, nullptr);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to stop stream reassembly."));
         return tool_result_t::ok(OBFSTR("TCP stream reassembly stopped"));
     } else if (op == "get") {
         std::vector<std::uint8_t> stream_data;
         std::uint32_t total_packets = 0, truncated = 0;
-        bool ok = device->stream_reassemble_op(2, src_port, dst_port, pid, nullptr, nullptr, &stream_data, &total_packets, &truncated);
+        bool ok = driver_bridge::stream_reassemble_op(2, src_port, dst_port, pid, nullptr, nullptr, &stream_data, &total_packets, &truncated);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to get reassembled stream data."));
         json r;
         r["total_bytes"] = stream_data.size();
@@ -900,7 +900,7 @@ tool_result_t network_follow_tcp_stream(const json& params)
 
 tool_result_t network_parse_http(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t max_pkts = 32;
@@ -908,7 +908,7 @@ tool_result_t network_parse_http(const json& params)
         max_pkts = params["count"].get<std::uint32_t>();
     if (max_pkts > 32) max_pkts = 32;
 
-    auto packets = device->get_captured_packets(max_pkts);
+    auto packets = driver_bridge::get_captured_packets(max_pkts);
     json arr = json::array();
     for (const auto& p : packets) {
         if (p.payload.empty()) continue;
@@ -950,7 +950,7 @@ tool_result_t network_parse_http(const json& params)
 
 tool_result_t network_parse_tls(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t max_pkts = 32;
@@ -958,7 +958,7 @@ tool_result_t network_parse_tls(const json& params)
         max_pkts = params["count"].get<std::uint32_t>();
     if (max_pkts > 32) max_pkts = 32;
 
-    auto packets = device->get_captured_packets(max_pkts);
+    auto packets = driver_bridge::get_captured_packets(max_pkts);
     json arr = json::array();
     for (const auto& p : packets) {
         if (p.payload.size() < 5) continue;
@@ -1001,14 +1001,14 @@ tool_result_t network_parse_tls(const json& params)
 
 tool_result_t network_enumerate_wfp_callouts(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::string filter_module;
     if (params.contains("module") && params["module"].is_string())
         filter_module = params["module"].get<std::string>();
 
-    auto callouts = device->enumerate_wfp_callouts(filter_module);
+    auto callouts = driver_bridge::enumerate_wfp_callouts(filter_module);
     json arr = json::array();
     for (const auto& c : callouts) {
         json entry;
@@ -1029,14 +1029,14 @@ tool_result_t network_enumerate_wfp_callouts(const json& params)
 
 tool_result_t network_get_socket_handles(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t target_pid = 0;
     if (params.contains("pid") && params["pid"].is_number())
         target_pid = params["pid"].get<std::uint32_t>();
 
-    auto socks = device->get_socket_handles(target_pid);
+    auto socks = driver_bridge::get_socket_handles(target_pid);
     json arr = json::array();
     for (const auto& s : socks) {
         json entry;
@@ -1054,7 +1054,7 @@ tool_result_t network_get_socket_handles(const json& params)
 
 tool_result_t network_dump_tcpip(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t target_pid = 0, filter_protocol = 0;
@@ -1065,7 +1065,7 @@ tool_result_t network_dump_tcpip(const json& params)
         else if (p == "udp" || p == "UDP") filter_protocol = 17;
     }
 
-    auto conns = device->dump_tcpip_connections(target_pid, filter_protocol);
+    auto conns = driver_bridge::dump_tcpip_connections(target_pid, filter_protocol);
     json arr = json::array();
     for (const auto& c : conns) {
         json entry;
@@ -1088,10 +1088,10 @@ tool_result_t network_dump_tcpip(const json& params)
 
 tool_result_t network_enumerate_interfaces(const json&)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
-    auto ifaces = device->enumerate_interfaces();
+    auto ifaces = driver_bridge::enumerate_interfaces();
     json arr = json::array();
     for (const auto& ifc : ifaces) {
         json entry;
@@ -1114,7 +1114,7 @@ tool_result_t network_enumerate_interfaces(const json&)
 
 tool_result_t network_inject_packet(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t direction = 1, protocol = 6, af = 2;
@@ -1148,7 +1148,7 @@ tool_result_t network_inject_packet(const json& params)
     if (payload.empty())
         return tool_result_t::error(OBFSTR("Payload required. Provide 'payload_hex' or 'payload_text'."));
 
-    bool ok = device->inject_packet(direction, protocol, af, src_port, dst_port,
+    bool ok = driver_bridge::inject_packet(direction, protocol, af, src_port, dst_port,
         src_addr, dst_addr, payload.data(), static_cast<std::uint32_t>(payload.size()),
         tcp_flags, tcp_seq, tcp_ack);
 
@@ -1162,7 +1162,7 @@ tool_result_t network_inject_packet(const json& params)
 
 tool_result_t network_modify_packet_rule(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
         return tool_result_t::error(OBFSTR("Missing required parameter: operation ('add', 'remove', or 'clear')"));
@@ -1200,7 +1200,7 @@ tool_result_t network_modify_packet_rule(const json& params)
             return tool_result_t::error(OBFSTR("Pattern required for 'add'. Provide 'pattern_hex' or 'pattern_text'."));
 
         std::uint32_t rule_id = 0;
-        bool ok = device->packet_mod_rule_op(0, 0, direction, protocol, port, pid,
+        bool ok = driver_bridge::packet_mod_rule_op(0, 0, direction, protocol, port, pid,
             pattern.data(), static_cast<std::uint32_t>(pattern.size()),
             replacement.empty() ? nullptr : replacement.data(), static_cast<std::uint32_t>(replacement.size()),
             &rule_id);
@@ -1211,11 +1211,11 @@ tool_result_t network_modify_packet_rule(const json& params)
         if (!params.contains("rule_id") || !params["rule_id"].is_number())
             return tool_result_t::error(OBFSTR("Missing required parameter: rule_id"));
         std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
-        bool ok = device->packet_mod_rule_op(1, rule_id);
+        bool ok = driver_bridge::packet_mod_rule_op(1, rule_id);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to remove modification rule."));
         return tool_result_t::ok(OBFSTR("Modification rule ") + std::to_string(rule_id) + OBFSTR(" removed"));
     } else if (op == "clear") {
-        bool ok = device->packet_mod_rule_op(3);
+        bool ok = driver_bridge::packet_mod_rule_op(3);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to clear modification rules."));
         return tool_result_t::ok(OBFSTR("All packet modification rules cleared"));
     }
@@ -1224,10 +1224,10 @@ tool_result_t network_modify_packet_rule(const json& params)
 
 tool_result_t network_list_mod_rules(const json&)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
-    auto rules = device->list_packet_mod_rules();
+    auto rules = driver_bridge::list_packet_mod_rules();
     json arr = json::array();
     for (const auto& r : rules) {
         json entry;
@@ -1245,7 +1245,7 @@ tool_result_t network_list_mod_rules(const json&)
 
 tool_result_t network_redirect_traffic(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
         return tool_result_t::error(OBFSTR("Missing required parameter: operation ('add', 'remove', or 'clear')"));
@@ -1264,7 +1264,7 @@ tool_result_t network_redirect_traffic(const json& params)
         if (params.contains("redirect_ip") && params["redirect_ip"].is_string()) parse_ipv4(params["redirect_ip"].get<std::string>(), redirect_addr);
 
         std::uint32_t rule_id = 0;
-        bool ok = device->traffic_redirect_op(0, 0, protocol, match_port, match_addr, redirect_port, redirect_addr, af, &rule_id);
+        bool ok = driver_bridge::traffic_redirect_op(0, 0, protocol, match_port, match_addr, redirect_port, redirect_addr, af, &rule_id);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to add redirect rule. Max 16 rules."));
         json r; r["rule_id"] = rule_id;
         return tool_result_t::ok(OBFSTR("Traffic redirect rule added (ID: ") + std::to_string(rule_id) + ")", r);
@@ -1272,11 +1272,11 @@ tool_result_t network_redirect_traffic(const json& params)
         if (!params.contains("rule_id") || !params["rule_id"].is_number())
             return tool_result_t::error(OBFSTR("Missing required parameter: rule_id"));
         std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
-        bool ok = device->traffic_redirect_op(1, rule_id);
+        bool ok = driver_bridge::traffic_redirect_op(1, rule_id);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to remove redirect rule."));
         return tool_result_t::ok(OBFSTR("Redirect rule ") + std::to_string(rule_id) + OBFSTR(" removed"));
     } else if (op == "clear") {
-        bool ok = device->traffic_redirect_op(3);
+        bool ok = driver_bridge::traffic_redirect_op(3);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to clear redirect rules."));
         return tool_result_t::ok(OBFSTR("All traffic redirect rules cleared"));
     }
@@ -1285,10 +1285,10 @@ tool_result_t network_redirect_traffic(const json& params)
 
 tool_result_t network_list_redirect_rules(const json&)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
-    auto rules = device->list_redirect_rules();
+    auto rules = driver_bridge::list_redirect_rules();
     json arr = json::array();
     for (const auto& r : rules) {
         json entry;
@@ -1305,7 +1305,7 @@ tool_result_t network_list_redirect_rules(const json&)
 
 tool_result_t network_intercept(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
         return tool_result_t::error(OBFSTR("Missing required parameter: operation ('enable' or 'disable')"));
@@ -1321,12 +1321,12 @@ tool_result_t network_intercept(const json& params)
             else if (p == "udp" || p == "UDP") filter_protocol = 17;
         }
         std::uint32_t held_count = 0; bool active = false;
-        bool ok = device->intercept_op(0, filter_pid, filter_port, filter_protocol, 0, nullptr, 0, &held_count, &active);
+        bool ok = driver_bridge::intercept_op(0, filter_pid, filter_port, filter_protocol, 0, nullptr, 0, &held_count, &active);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to enable packet interception."));
         json r; r["active"] = active; r["held_count"] = held_count;
         return tool_result_t::ok(OBFSTR("Packet interception enabled. Matching packets will be held for inspection."), r);
     } else if (op == "disable") {
-        bool ok = device->intercept_op(1, 0, 0, 0, 0, nullptr, 0, nullptr, nullptr);
+        bool ok = driver_bridge::intercept_op(1, 0, 0, 0, 0, nullptr, 0, nullptr, nullptr);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to disable packet interception."));
         return tool_result_t::ok(OBFSTR("Packet interception disabled. All held packets released."));
     }
@@ -1335,10 +1335,10 @@ tool_result_t network_intercept(const json& params)
 
 tool_result_t network_get_held_packets(const json&)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
-    auto held = device->get_held_packets();
+    auto held = driver_bridge::get_held_packets();
     json arr = json::array();
     for (const auto& h : held) {
         json entry;
@@ -1361,7 +1361,7 @@ tool_result_t network_get_held_packets(const json&)
 
 tool_result_t network_release_packet(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("hold_id") || !params["hold_id"].is_number())
         return tool_result_t::error(OBFSTR("Missing required parameter: hold_id"));
@@ -1385,7 +1385,7 @@ tool_result_t network_release_packet(const json& params)
         }
     }
 
-    bool ok = device->intercept_op(operation, 0, 0, 0, hold_id,
+    bool ok = driver_bridge::intercept_op(operation, 0, 0, 0, hold_id,
         modify_payload.empty() ? nullptr : modify_payload.data(),
         static_cast<std::uint32_t>(modify_payload.size()), nullptr, nullptr);
     if (!ok) return tool_result_t::error(OBFSTR("Failed to release/process held packet."));
@@ -1396,7 +1396,7 @@ tool_result_t network_release_packet(const json& params)
 
 tool_result_t network_kill_connection(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t protocol = 6, af = 2, src_port = 0, dst_port = 0, pid = 0;
@@ -1412,14 +1412,14 @@ tool_result_t network_kill_connection(const json& params)
     if (params.contains("dst_ip") && params["dst_ip"].is_string()) parse_ipv4(params["dst_ip"].get<std::string>(), dst_addr);
     if (params.contains("pid") && params["pid"].is_number()) pid = params["pid"].get<std::uint32_t>();
 
-    bool ok = device->kill_connection(protocol, af, src_port, dst_port, src_addr, dst_addr, pid);
+    bool ok = driver_bridge::kill_connection(protocol, af, src_port, dst_port, src_addr, dst_addr, pid);
     if (!ok) return tool_result_t::error(OBFSTR("Failed to kill connection. Tries socket close + RST injection."));
     return tool_result_t::ok(OBFSTR("Connection killed successfully"));
 }
 
 tool_result_t network_spoof_dns(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
         return tool_result_t::error(OBFSTR("Missing required parameter: operation ('add', 'remove', or 'clear')"));
@@ -1438,7 +1438,7 @@ tool_result_t network_spoof_dns(const json& params)
         if (params.contains("ttl") && params["ttl"].is_number()) ttl = params["ttl"].get<std::uint32_t>();
 
         std::uint32_t rule_id = 0;
-        bool ok = device->dns_spoof_op(0, 0, domain.c_str(), spoof_addr, 2, ttl, &rule_id);
+        bool ok = driver_bridge::dns_spoof_op(0, 0, domain.c_str(), spoof_addr, 2, ttl, &rule_id);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to add DNS spoof rule. Max 32 rules."));
         json r; r["rule_id"] = rule_id; r["domain"] = domain;
         return tool_result_t::ok(OBFSTR("DNS spoof rule added: ") + domain + OBFSTR(" -> ") + params["spoof_ip"].get<std::string>(), r);
@@ -1446,11 +1446,11 @@ tool_result_t network_spoof_dns(const json& params)
         if (!params.contains("rule_id") || !params["rule_id"].is_number())
             return tool_result_t::error(OBFSTR("Missing required parameter: rule_id"));
         std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
-        bool ok = device->dns_spoof_op(1, rule_id, nullptr, nullptr, 2, 0, nullptr);
+        bool ok = driver_bridge::dns_spoof_op(1, rule_id, nullptr, nullptr, 2, 0, nullptr);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to remove DNS spoof rule."));
         return tool_result_t::ok(OBFSTR("DNS spoof rule ") + std::to_string(rule_id) + OBFSTR(" removed"));
     } else if (op == "clear") {
-        bool ok = device->dns_spoof_op(3, 0, nullptr, nullptr, 2, 0, nullptr);
+        bool ok = driver_bridge::dns_spoof_op(3, 0, nullptr, nullptr, 2, 0, nullptr);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to clear DNS spoof rules."));
         return tool_result_t::ok(OBFSTR("All DNS spoof rules cleared"));
     }
@@ -1459,10 +1459,10 @@ tool_result_t network_spoof_dns(const json& params)
 
 tool_result_t network_list_dns_spoof_rules(const json&)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
-    auto rules = device->list_dns_spoof_rules();
+    auto rules = driver_bridge::list_dns_spoof_rules();
     json arr = json::array();
     for (const auto& r : rules) {
         json entry;
@@ -1478,7 +1478,7 @@ tool_result_t network_list_dns_spoof_rules(const json&)
 
 tool_result_t network_bandwidth_monitor(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
         return tool_result_t::error(OBFSTR("Missing required parameter: operation ('start', 'stop', 'get', or 'reset')"));
@@ -1488,16 +1488,16 @@ tool_result_t network_bandwidth_monitor(const json& params)
     if (params.contains("pid") && params["pid"].is_number()) filter_pid = params["pid"].get<std::uint32_t>();
 
     if (op == "start") {
-        bool ok = device->bw_monitor_op(0, filter_pid, nullptr);
+        bool ok = driver_bridge::bw_monitor_op(0, filter_pid, nullptr);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to start bandwidth monitoring."));
         return tool_result_t::ok(OBFSTR("Bandwidth monitoring started"));
     } else if (op == "stop") {
-        bool ok = device->bw_monitor_op(1, 0, nullptr);
+        bool ok = driver_bridge::bw_monitor_op(1, 0, nullptr);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to stop bandwidth monitoring."));
         return tool_result_t::ok(OBFSTR("Bandwidth monitoring stopped"));
     } else if (op == "get") {
-        voyager::device_t::bw_stats stats{};
-        bool ok = device->bw_monitor_op(2, filter_pid, &stats);
+        driver_bridge::bw_stats_t stats{};
+        bool ok = driver_bridge::bw_monitor_op(2, filter_pid, &stats);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to get bandwidth stats."));
         json r;
         r["active"] = stats.active;
@@ -1509,7 +1509,7 @@ tool_result_t network_bandwidth_monitor(const json& params)
         r["bps_out"] = stats.bps_out;
         return tool_result_t::ok(OBFSTR("Bandwidth statistics"), r);
     } else if (op == "reset") {
-        bool ok = device->bw_monitor_op(3, 0, nullptr);
+        bool ok = driver_bridge::bw_monitor_op(3, 0, nullptr);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to reset bandwidth counters."));
         return tool_result_t::ok(OBFSTR("Bandwidth counters reset"));
     }
@@ -1518,13 +1518,13 @@ tool_result_t network_bandwidth_monitor(const json& params)
 
 tool_result_t network_bandwidth_per_process(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t filter_pid = 0;
     if (params.contains("pid") && params["pid"].is_number()) filter_pid = params["pid"].get<std::uint32_t>();
 
-    auto procs = device->get_bw_per_process(filter_pid);
+    auto procs = driver_bridge::get_bw_per_process(filter_pid);
     json arr = json::array();
     for (const auto& p : procs) {
         json entry;
@@ -1541,22 +1541,22 @@ tool_result_t network_bandwidth_per_process(const json& params)
 
 tool_result_t network_os_fingerprint(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
         return tool_result_t::error(OBFSTR("Missing required parameter: operation ('enable', 'disable', or 'get')"));
 
     std::string op = params["operation"].get<std::string>();
     if (op == "enable") {
-        bool ok = device->fingerprint_op(0);
+        bool ok = driver_bridge::fingerprint_op(0);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to enable OS fingerprinting."));
         return tool_result_t::ok(OBFSTR("Passive OS fingerprinting enabled. Analyzing TCP SYN packets."));
     } else if (op == "disable") {
-        bool ok = device->fingerprint_op(1);
+        bool ok = driver_bridge::fingerprint_op(1);
         if (!ok) return tool_result_t::error(OBFSTR("Failed to disable OS fingerprinting."));
         return tool_result_t::ok(OBFSTR("OS fingerprinting disabled"));
     } else if (op == "get") {
-        auto fps = device->get_fingerprints();
+        auto fps = driver_bridge::get_fingerprints();
         json arr = json::array();
         for (const auto& f : fps) {
             json entry;
@@ -1577,7 +1577,7 @@ tool_result_t network_os_fingerprint(const json& params)
 
 tool_result_t network_export_pcap(const json& params)
 {
-    if (!device->is_connected())
+    if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
 
     std::uint32_t filter_pid = 0, filter_protocol = 0, max_packets = 256;
@@ -1591,8 +1591,8 @@ tool_result_t network_export_pcap(const json& params)
         max_packets = params["max_packets"].get<std::uint32_t>();
     if (max_packets > 256) max_packets = 256;
 
-    voyager::device_t::pcap_export_result pcap{};
-    bool ok = device->export_pcap(filter_pid, filter_protocol, max_packets, &pcap);
+    driver_bridge::pcap_export_result_t pcap{};
+    bool ok = driver_bridge::export_pcap(filter_pid, filter_protocol, max_packets, &pcap);
     if (!ok) return tool_result_t::error(OBFSTR("Failed to export PCAP data from driver."));
 
     std::string filename;

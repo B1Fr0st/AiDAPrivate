@@ -20,7 +20,12 @@ enum class center_view_t : int {
 	settings_view,
 	network_view,
 	memory_scanner,
-	debugger_view
+	debugger_view,
+	decompiler,
+	struct_recon,
+	crypto_scanner,
+	aob_generator,
+	fuzzer_view
 };
 
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../../driver/comm.h"
+#include "standalone_driver.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -12,8 +12,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
-extern std::unique_ptr<voyager::device_t> device;
 
 namespace network_view {
 
@@ -111,7 +109,7 @@ public:
     bool is_running() const noexcept { return running_.load(); }
 
 
-    void feed(const voyager::device_t::captured_packet& pkt) {
+    void feed(const driver_bridge::captured_packet_t& pkt) {
         if (pkt.protocol != 6) return;
         if (pkt.payload.empty())        return;
 
@@ -207,8 +205,8 @@ private:
 
     void poll_loop() {
         while (running_.load()) {
-            if (device && device->is_connected()) {
-                auto packets = device->get_captured_packets(32);
+            if (driver_bridge::using_kernel_driver()) {
+                auto packets = driver_bridge::get_captured_packets(32);
                 for (auto& pkt : packets) {
                     if (filter_pid_ == 0 || pkt.pid == filter_pid_)
                         feed(pkt);

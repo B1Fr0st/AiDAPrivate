@@ -729,5 +729,6 @@ namespace mcp_standalone
         coding_tools::register_coding_tools(srv);
         workflow_tools::register_workflow_tools(srv);
         scanner_tools::register_scanner_tools(srv);
+        analysis_tools::register_analysis_tools(srv);
     }
 }

@@ -1,5 +1,6 @@
 #include "hex_view.hpp"
 #include "../helpers/globals.h"
+#include "standalone_driver.hpp"
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 #include <Windows.h>
@@ -35,6 +36,28 @@ void load_from_file(const std::string& path, size_t offset, size_t size) {
     auto pos = path.find_last_of("/\\");
     std::string name = (pos != std::string::npos) ? path.substr(pos + 1) : path;
     set_data(buf, (uint64_t)offset, name);
+}
+
+bool read_from_process(uint64_t address, size_t size) {
+    if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
+        return false;
+    if (driver_bridge::attached_pid() == 0)
+        return false;
+    if (size == 0 || size > 64 * 1024 * 1024)
+        return false;
+
+    std::vector<uint8_t> buf;
+    if (!driver_bridge::read_memory(address, size, buf))
+        return false;
+    if (buf.empty())
+        return false;
+
+    char label[64];
+    snprintf(label, sizeof(label), "PID %u @ %016llX",
+             driver_bridge::attached_pid(),
+             static_cast<unsigned long long>(address));
+    set_data(buf, address, label);
+    return true;
 }
 
 void render(float pos_x, float pos_y, float width, float height,

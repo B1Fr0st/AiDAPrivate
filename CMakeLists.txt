@@ -378,6 +378,10 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/scanner_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/debugger_engine.cpp"
             "${STANDALONE_ROOT}/core/debugger_view.cpp"
+            "${STANDALONE_ROOT}/core/decompiler_view.cpp"
+            "${STANDALONE_ROOT}/core/struct_recon_view.cpp"
+            "${STANDALONE_ROOT}/core/fuzzer_view.cpp"
+            "${STANDALONE_ROOT}/core/analysis_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/arc_loader.cpp"
             src/driver_loader.cpp
             driver/comm.cpp

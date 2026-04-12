@@ -46,6 +46,8 @@ inline void refresh()
 {
 	if (g_ui.refreshing.load())
 		return;
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0)
+		return;
 	g_ui.refreshing.store(true);
 
 	std::thread([]() {
@@ -59,12 +61,61 @@ inline void refresh()
 			thread_entry_t e;
 			e.tid = t.tid;
 			e.priority = t.priority;
-			e.state_text = "Running";
-			e.rip = 0;
+
+			/* The kernel driver returns an RIP for each thread, but it is
+			   captured from the ETHREAD and may be zero for running threads
+			   whose context lives in registers, not in the trap frame.
+			   For those threads we briefly suspend → read context → resume
+			   to obtain accurate RIP/RSP values.  The suspend window is
+			   sub-microsecond; this is standard debugger practice. */
+			e.rip = t.rip;
 			e.rsp = 0;
 			e.entry_point = 0;
-			e.suspended = false;
 
+			/* Determine suspended state from the kernel-reported thread
+			   state.  State == 5 is "Waiting / Suspended" in the Windows
+			   scheduler (KTHREAD.State).  State == 0 is "Initialized",
+			   state == 2 is "Running", etc. */
+			bool was_already_suspended = (t.state == 5);
+			e.suspended = was_already_suspended;
+
+			if (t.state == 5)
+				e.state_text = "Suspended";
+			else if (t.state == 2)
+				e.state_text = "Running";
+			else if (t.state == 1)
+				e.state_text = "Ready";
+			else if (t.state == 0)
+				e.state_text = "Initialized";
+			else
+				e.state_text = "Waiting";
+
+			/* If the kernel-provided RIP is zero (running thread) or we
+			   want the RSP as well, suspend briefly and read full context.
+			   Skip for threads that are already suspended — their trap frame
+			   RIP from the kernel is accurate. */
+			if (e.rip == 0 && !was_already_suspended) {
+				if (driver_bridge::suspend_thread(t.tid, nullptr)) {
+					driver_bridge::thread_context_t ctx{};
+					if (driver_bridge::get_thread_context(t.tid, ctx)) {
+						e.rip = ctx.rip;
+						e.rsp = ctx.rsp;
+					}
+					driver_bridge::resume_thread(t.tid, nullptr);
+				}
+			} else if (was_already_suspended) {
+				/* Already suspended — safe to read context without
+				   additional suspend/resume. */
+				driver_bridge::thread_context_t ctx{};
+				if (driver_bridge::get_thread_context(t.tid, ctx)) {
+					if (e.rip == 0)
+						e.rip = ctx.rip;
+					e.rsp = ctx.rsp;
+				}
+			}
+
+			/* Resolve module name from RIP — now that RIP is populated
+			   this lookup will actually match. */
 			for (auto& m : modules) {
 				if (e.rip >= m.base && e.rip < m.base + m.size) {
 					e.module_name = m.name;

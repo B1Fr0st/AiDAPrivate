@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "imgui/imgui.h"
+#include "standalone_driver.hpp"
 #include "debugger_engine.hpp"
 #include "ui_anim.hpp"
 
@@ -36,6 +37,13 @@ inline ui_state_t g_ui;
 inline void refresh()
 {
 	if (g_ui.refreshing.load())
+		return;
+	/* Validate kernel driver is connected and a process is attached
+	   before spawning a background thread.  get_memory_map() ultimately
+	   calls driver_bridge::enumerate_memory_regions() which requires the
+	   kernel driver — without this guard the thread runs for nothing and
+	   refreshing stays true, blocking future refresh attempts. */
+	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0)
 		return;
 	g_ui.refreshing.store(true);
 

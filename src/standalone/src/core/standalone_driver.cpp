@@ -13,6 +13,7 @@
 #include <cstdarg>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -25,6 +26,7 @@ namespace
 {
     driver_bridge::log_fn_t     g_log_fn;
     driver_bridge::confirm_fn_t g_confirm_fn;
+    std::vector<driver_bridge::pre_detach_fn_t> g_pre_detach_hooks;
     std::mutex                  g_callback_mtx;
 
     std::mutex      g_state_mtx;
@@ -154,6 +156,12 @@ namespace driver_bridge
         g_confirm_fn = std::move(fn);
     }
 
+    void add_pre_detach_callback(pre_detach_fn_t fn)
+    {
+        std::lock_guard<std::mutex> lk(g_callback_mtx);
+        g_pre_detach_hooks.push_back(std::move(fn));
+    }
+
     bool initialize()
     {
         std::lock_guard<std::mutex> lk(g_state_mtx);
@@ -171,7 +179,7 @@ namespace driver_bridge
         }
 
         g_initialized = true;
-        logf("AiDA Standalone: Kernel driver unavailable, using user-mode fallback bridge.\n");
+        logf("AiDA Standalone: Kernel driver unavailable. Live inspection operations require the kernel driver and will not function until it is loaded.\n");
         return true;
     }
 
@@ -302,6 +310,19 @@ namespace driver_bridge
 
     void detach()
     {
+        /* Run pre-detach hooks BEFORE acquiring the state mutex and
+           before clearing the kernel process context.  This gives
+           subsystems like speedhack and page_guard_engine a chance
+           to restore original bytes and free their kernel-side
+           allocations (shellcode, ring buffers, etc.) while the
+           DTB is still valid. */
+        {
+            std::lock_guard<std::mutex> lk(g_callback_mtx);
+            for (auto& hook : g_pre_detach_hooks) {
+                if (hook) hook();
+            }
+        }
+
         std::lock_guard<std::mutex> lk(g_state_mtx);
         close_process_handle_locked();
         g_pid = 0;
@@ -326,12 +347,12 @@ namespace driver_bridge
         if (g_pid == 0) {
             return kernel_active
                 ? "Live inspection bridge: kernel backend ready (no process attached)"
-                : "Live inspection bridge: user-mode backend ready (no process attached)";
+                : "Live inspection bridge: kernel driver required (not loaded)";
         }
 
         char buf[256];
         snprintf(buf, sizeof(buf), "Live inspection bridge: %s attached to PID %u (%s)",
-                 kernel_active ? "kernel backend" : "user-mode backend",
+                 kernel_active ? "kernel backend" : "kernel driver required (not loaded)",
                  g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str());
         return buf;
     }
@@ -762,6 +783,33 @@ namespace driver_bridge
             } else {
                 bytes_written = device->write_raw(address, data.data(), data.size());
             }
+
+            /* Mirror the DTB re-solve logic from read_memory(): if the
+               write returned 0 bytes it may be because the target
+               process's page tables changed (module load/unload, CoW
+               fault, etc.).  Re-solve the DTB and retry once. */
+            if (bytes_written == 0) {
+                bool re_resolved = false;
+                {
+                    std::lock_guard<std::mutex> lk(g_state_mtx);
+                    if (vtable && vtable->solve_dtb && vtable->get_dtb) {
+                        uint64_t new_dtb = vtable->solve_dtb();
+                        re_resolved = (new_dtb != 0);
+                    } else if (device) {
+                        device->solve_dtb();
+                        re_resolved = (device->get_dtb() != 0);
+                    }
+                }
+
+                if (re_resolved) {
+                    if (vtable && vtable->write_raw) {
+                        bytes_written = vtable->write_raw(address, data.data(), data.size());
+                    } else {
+                        bytes_written = device->write_raw(address, data.data(), data.size());
+                    }
+                }
+            }
+
             return bytes_written > 0;
         }
 
@@ -1244,7 +1292,7 @@ namespace driver_bridge
         return true;
     }
 
-    bool bw_monitor_op(uint32_t operation, uint32_t filter_pid)
+    bool bw_monitor_op(uint32_t operation, uint32_t filter_pid, bw_stats_t* out_stats)
     {
         bool kernel_mode = false;
         {
@@ -1256,7 +1304,18 @@ namespace driver_bridge
             return false;
         }
 
-        return device->bw_monitor_op(operation, filter_pid);
+        voyager::device_t::bw_stats raw{};
+        bool ok = device->bw_monitor_op(operation, filter_pid, out_stats ? &raw : nullptr);
+        if (ok && out_stats) {
+            out_stats->total_bytes_sent    = raw.total_bytes_sent;
+            out_stats->total_bytes_recv    = raw.total_bytes_recv;
+            out_stats->total_packets_sent  = raw.total_packets_sent;
+            out_stats->total_packets_recv  = raw.total_packets_recv;
+            out_stats->bps_in              = raw.bps_in;
+            out_stats->bps_out             = raw.bps_out;
+            out_stats->active              = raw.active;
+        }
+        return ok;
     }
 
     std::vector<bw_process_info_t> get_bw_per_process(uint32_t filter_pid)
@@ -1284,5 +1343,700 @@ namespace driver_bridge
             result.push_back(bw);
         }
         return result;
+    }
+
+
+    uint64_t call_function(uint64_t function_address, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
+    {
+        if (function_address == 0)
+            return 0;
+
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: call_function requires kernel driver.\n");
+            return 0;
+        }
+
+        const auto* vtable = get_arc_vtable();
+        if (vtable && vtable->remote_call)
+            return vtable->remote_call(function_address, arg1, arg2, arg3, arg4);
+
+        return device->call_function(function_address, arg1, arg2, arg3, arg4);
+    }
+
+    uint64_t find_gadget(const char* pattern, size_t pattern_size)
+    {
+        if (!pattern || pattern_size == 0)
+            return 0;
+
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: find_gadget requires kernel driver.\n");
+            return 0;
+        }
+
+        return device->find_gadget(pattern, pattern_size);
+    }
+
+    bool set_hardware_breakpoint(uint32_t tid, int index, uint64_t address, int type, int size)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: set_hardware_breakpoint requires kernel driver.\n");
+            return false;
+        }
+
+        return device->set_hardware_breakpoint(tid, index, address, type, size);
+    }
+
+    bool clear_hardware_breakpoint(uint32_t tid, int index)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: clear_hardware_breakpoint requires kernel driver.\n");
+            return false;
+        }
+
+        return device->clear_hardware_breakpoint(tid, index);
+    }
+
+    bool spoof_debug_flags(uint32_t* result_flags)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: spoof_debug_flags requires kernel driver.\n");
+            return false;
+        }
+
+        return device->spoof_debug_flags(result_flags);
+    }
+
+    bool refresh_heartbeat()
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode)
+            return false;
+
+        return device->refresh_heartbeat();
+    }
+
+    bool register_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size,
+                                 uint64_t expected_hash, uint32_t check_interval_ms)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: register_dll_protection requires kernel driver.\n");
+            return false;
+        }
+
+        return device->register_dll_protection(module_base, text_va, text_size,
+                                               expected_hash, check_interval_ms);
+    }
+
+    bool query_dll_protection(dll_protect_status_t& out)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: query_dll_protection requires kernel driver.\n");
+            return false;
+        }
+
+        voyager::device_t::dll_protect_status raw{};
+        if (!device->query_dll_protection(raw))
+            return false;
+
+        out.status         = raw.status;
+        out.current_hash   = raw.current_hash;
+        out.expected_hash  = raw.expected_hash;
+        out.last_check_tsc = raw.last_check_tsc;
+        return true;
+    }
+
+    bool unregister_dll_protection()
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: unregister_dll_protection requires kernel driver.\n");
+            return false;
+        }
+
+        return device->unregister_dll_protection();
+    }
+
+    bool traffic_redirect_op(uint32_t operation, uint32_t rule_id, uint32_t protocol,
+                             uint32_t match_port, const uint8_t* match_addr,
+                             uint32_t redirect_port, const uint8_t* redirect_addr,
+                             uint32_t af, uint32_t* out_rule_id, uint32_t exclude_pid)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: traffic_redirect_op requires kernel driver.\n");
+            return false;
+        }
+
+        return device->traffic_redirect_op(operation, rule_id, protocol, match_port, match_addr,
+                                           redirect_port, redirect_addr, af, out_rule_id, exclude_pid);
+    }
+
+    bool inject_packet(uint32_t direction, uint32_t protocol, uint32_t af,
+                       uint32_t src_port, uint32_t dst_port,
+                       const uint8_t* src_addr, const uint8_t* dst_addr,
+                       const uint8_t* payload, uint32_t payload_size,
+                       uint32_t tcp_flags, uint32_t tcp_seq, uint32_t tcp_ack)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: inject_packet requires kernel driver.\n");
+            return false;
+        }
+
+        return device->inject_packet(direction, protocol, af, src_port, dst_port,
+                                     src_addr, dst_addr, payload, payload_size,
+                                     tcp_flags, tcp_seq, tcp_ack);
+    }
+
+    bool kill_connection(uint32_t protocol, uint32_t af,
+                         uint32_t src_port, uint32_t dst_port,
+                         const uint8_t* src_addr, const uint8_t* dst_addr,
+                         uint32_t pid)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: kill_connection requires kernel driver.\n");
+            return false;
+        }
+
+        return device->kill_connection(protocol, af, src_port, dst_port, src_addr, dst_addr, pid);
+    }
+
+    bool intercept_op(uint32_t operation, uint32_t filter_pid, uint32_t filter_port,
+                      uint32_t filter_protocol, uint64_t hold_id,
+                      const uint8_t* modify_payload, uint32_t modify_size,
+                      uint32_t* out_held_count, bool* out_active)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: intercept_op requires kernel driver.\n");
+            return false;
+        }
+
+        return device->intercept_op(operation, filter_pid, filter_port, filter_protocol,
+                                    hold_id, modify_payload, modify_size,
+                                    out_held_count, out_active);
+    }
+
+    bool dns_spoof_op(uint32_t operation, uint32_t rule_id, const char* domain,
+                      const uint8_t* spoof_addr, uint32_t af,
+                      uint32_t ttl, uint32_t* out_rule_id)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: dns_spoof_op requires kernel driver.\n");
+            return false;
+        }
+
+        return device->dns_spoof_op(operation, rule_id, domain, spoof_addr, af, ttl, out_rule_id);
+    }
+
+    bool packet_mod_rule_op(uint32_t operation, uint32_t rule_id,
+                            uint32_t direction, uint32_t protocol,
+                            uint32_t port, uint32_t pid,
+                            const uint8_t* pattern, uint32_t pattern_size,
+                            const uint8_t* replacement, uint32_t replace_size,
+                            uint32_t* out_rule_id)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: packet_mod_rule_op requires kernel driver.\n");
+            return false;
+        }
+
+        return device->packet_mod_rule_op(operation, rule_id, direction, protocol,
+                                          port, pid, pattern, pattern_size,
+                                          replacement, replace_size, out_rule_id);
+    }
+
+    bool stream_reassemble_op(uint32_t operation, uint32_t src_port, uint32_t dst_port,
+                              uint32_t pid, const uint8_t* src_addr,
+                              const uint8_t* dst_addr,
+                              std::vector<uint8_t>* out_data,
+                              uint32_t* out_packets, uint32_t* out_truncated)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: stream_reassemble_op requires kernel driver.\n");
+            return false;
+        }
+
+        return device->stream_reassemble_op(operation, src_port, dst_port, pid,
+                                            src_addr, dst_addr, out_data,
+                                            out_packets, out_truncated);
+    }
+
+    bool sniff_net_buffers_start(uint64_t address, uint32_t buf_reg, uint32_t size_reg,
+                                 uint32_t max_captures, uint32_t tid, uint32_t bp_index)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: sniff_net_buffers_start requires kernel driver.\n");
+            return false;
+        }
+
+        return device->sniff_net_buffers_start(address, buf_reg, size_reg, max_captures, tid, bp_index);
+    }
+
+    bool sniff_net_buffers_stop()
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: sniff_net_buffers_stop requires kernel driver.\n");
+            return false;
+        }
+
+        return device->sniff_net_buffers_stop();
+    }
+
+    std::vector<sniff_result_t> sniff_net_buffers_get(bool& active)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            active = false;
+            return {};
+        }
+
+        auto raw = device->sniff_net_buffers_get(active);
+        std::vector<sniff_result_t> out;
+        out.reserve(raw.size());
+        for (auto& r : raw) {
+            sniff_result_t sr;
+            sr.timestamp = r.timestamp;
+            sr.thread_id = r.thread_id;
+            sr.buffer    = std::move(r.buffer);
+            out.push_back(std::move(sr));
+        }
+        return out;
+    }
+
+    std::vector<dpi_result_t> get_dpi_results(uint32_t filter_pid, uint32_t filter_protocol, uint32_t filter_port, uint32_t flags)
+    {
+        std::vector<dpi_result_t> result;
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return result;
+
+        auto raw = device->get_dpi_results(filter_pid, filter_protocol, filter_port, flags);
+        result.reserve(raw.size());
+        for (const auto& src : raw) {
+            dpi_result_t d;
+            d.timestamp      = src.timestamp;
+            d.direction      = src.direction;
+            d.protocol       = src.protocol;
+            d.src_port       = src.src_port;
+            d.dst_port       = src.dst_port;
+            d.pid            = src.pid;
+            d.payload_size   = src.payload_size;
+            d.af             = src.af;
+            std::memcpy(d.src_addr, src.src_addr, 16);
+            std::memcpy(d.dst_addr, src.dst_addr, 16);
+            d.tcp_flags      = src.tcp_flags;
+            d.tcp_window     = src.tcp_window;
+            d.is_http        = src.is_http;
+            d.is_tls         = src.is_tls;
+            d.is_dns         = src.is_dns;
+            d.http_method    = src.http_method;
+            d.tls_version    = src.tls_version;
+            d.tls_content_type = src.tls_content_type;
+            d.http_host      = src.http_host;
+            d.http_path      = src.http_path;
+            d.tls_sni        = src.tls_sni;
+            result.push_back(std::move(d));
+        }
+        return result;
+    }
+
+    std::vector<wfp_callout_info_t> enumerate_wfp_callouts(const std::string& filter_module)
+    {
+        std::vector<wfp_callout_info_t> result;
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return result;
+
+        auto raw = device->enumerate_wfp_callouts(filter_module);
+        result.reserve(raw.size());
+        for (const auto& src : raw) {
+            wfp_callout_info_t c;
+            c.classify_fn          = src.classify_fn;
+            c.notify_fn            = src.notify_fn;
+            c.flow_delete_fn       = src.flow_delete_fn;
+            c.owning_module_base   = src.owning_module_base;
+            c.callout_id           = src.callout_id;
+            c.layer_id             = src.layer_id;
+            c.flags                = src.flags;
+            c.callout_key_str      = src.callout_key_str;
+            c.applicable_layer_str = src.applicable_layer_str;
+            c.owning_module        = src.owning_module;
+            result.push_back(std::move(c));
+        }
+        return result;
+    }
+
+    std::vector<socket_info_t> get_socket_handles(uint32_t target_pid)
+    {
+        std::vector<socket_info_t> result;
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return result;
+
+        auto raw = device->get_socket_handles(target_pid);
+        result.reserve(raw.size());
+        for (const auto& src : raw) {
+            socket_info_t s;
+            s.handle_value     = src.handle_value;
+            s.afd_endpoint_addr = src.afd_endpoint_addr;
+            s.pid              = src.pid;
+            s.protocol         = src.protocol;
+            s.state            = src.state;
+            s.local_port       = src.local_port;
+            s.remote_port      = src.remote_port;
+            s.address_family   = src.address_family;
+            std::memcpy(s.local_addr, src.local_addr, 16);
+            std::memcpy(s.remote_addr, src.remote_addr, 16);
+            result.push_back(s);
+        }
+        return result;
+    }
+
+    std::vector<tcpip_connection_t> dump_tcpip_connections(uint32_t target_pid, uint32_t filter_protocol)
+    {
+        std::vector<tcpip_connection_t> result;
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return result;
+
+        auto raw = device->dump_tcpip_connections(target_pid, filter_protocol);
+        result.reserve(raw.size());
+        for (const auto& src : raw) {
+            tcpip_connection_t c;
+            c.tcb_address        = src.tcb_address;
+            c.owning_module_base = src.owning_module_base;
+            c.pid                = src.pid;
+            c.protocol           = src.protocol;
+            c.state              = src.state;
+            c.local_port         = src.local_port;
+            c.remote_port        = src.remote_port;
+            c.address_family     = src.address_family;
+            std::memcpy(c.local_addr, src.local_addr, 16);
+            std::memcpy(c.remote_addr, src.remote_addr, 16);
+            c.create_time        = src.create_time;
+            c.bytes_in           = src.bytes_in;
+            c.bytes_out          = src.bytes_out;
+            result.push_back(c);
+        }
+        return result;
+    }
+
+    std::vector<net_iface_info_t> enumerate_interfaces()
+    {
+        std::vector<net_iface_info_t> result;
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return result;
+
+        auto raw = device->enumerate_interfaces();
+        result.reserve(raw.size());
+        for (const auto& src : raw) {
+            net_iface_info_t ifc;
+            ifc.if_index    = src.if_index;
+            ifc.if_type     = src.if_type;
+            ifc.mtu         = src.mtu;
+            ifc.oper_status = src.oper_status;
+            ifc.speed       = src.speed;
+            std::memcpy(ifc.mac_addr, src.mac_addr, 6);
+            std::memcpy(ifc.ipv4_addr, src.ipv4_addr, 4);
+            std::memcpy(ifc.ipv4_mask, src.ipv4_mask, 4);
+            std::memcpy(ifc.ipv6_addr, src.ipv6_addr, 16);
+            ifc.name        = src.name;
+            ifc.description = src.description;
+            ifc.in_octets   = src.in_octets;
+            ifc.out_octets  = src.out_octets;
+            result.push_back(std::move(ifc));
+        }
+        return result;
+    }
+
+    std::vector<held_packet_info_t> get_held_packets()
+    {
+        std::vector<held_packet_info_t> result;
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return result;
+
+        auto raw = device->get_held_packets();
+        result.reserve(raw.size());
+        for (auto& src : raw) {
+            held_packet_info_t h;
+            h.hold_id      = src.hold_id;
+            h.timestamp    = src.timestamp;
+            h.direction    = src.direction;
+            h.protocol     = src.protocol;
+            h.src_port     = src.src_port;
+            h.dst_port     = src.dst_port;
+            h.pid          = src.pid;
+            h.payload_size = src.payload_size;
+            h.af           = src.af;
+            std::memcpy(h.src_addr, src.src_addr, 16);
+            std::memcpy(h.dst_addr, src.dst_addr, 16);
+            h.payload      = std::move(src.payload);
+            result.push_back(std::move(h));
+        }
+        return result;
+    }
+
+    std::vector<mod_rule_info_t> list_packet_mod_rules()
+    {
+        std::vector<mod_rule_info_t> result;
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return result;
+
+        auto raw = device->list_packet_mod_rules();
+        result.reserve(raw.size());
+        for (const auto& src : raw) {
+            mod_rule_info_t r;
+            r.rule_id     = src.rule_id;
+            r.direction   = src.direction;
+            r.protocol    = src.protocol;
+            r.port        = src.port;
+            r.pid         = src.pid;
+            r.match_count = src.match_count;
+            r.active      = src.active;
+            result.push_back(r);
+        }
+        return result;
+    }
+
+    std::vector<redirect_rule_info_t> list_redirect_rules()
+    {
+        std::vector<redirect_rule_info_t> result;
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return result;
+
+        auto raw = device->list_redirect_rules();
+        result.reserve(raw.size());
+        for (const auto& src : raw) {
+            redirect_rule_info_t r;
+            r.rule_id       = src.rule_id;
+            r.protocol      = src.protocol;
+            r.match_port    = src.match_port;
+            r.redirect_port = src.redirect_port;
+            r.af            = src.af;
+            r.match_count   = src.match_count;
+            r.active        = src.active;
+            result.push_back(r);
+        }
+        return result;
+    }
+
+    std::vector<dns_spoof_info_t> list_dns_spoof_rules()
+    {
+        std::vector<dns_spoof_info_t> result;
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return result;
+
+        auto raw = device->list_dns_spoof_rules();
+        result.reserve(raw.size());
+        for (const auto& src : raw) {
+            dns_spoof_info_t r;
+            r.rule_id     = src.rule_id;
+            r.domain      = src.domain;
+            r.af          = src.af;
+            r.match_count = src.match_count;
+            r.active      = src.active;
+            r.ttl         = src.ttl;
+            result.push_back(std::move(r));
+        }
+        return result;
+    }
+
+    bool fingerprint_op(uint32_t operation)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: fingerprint_op requires kernel driver.\n");
+            return false;
+        }
+        return device->fingerprint_op(operation);
+    }
+
+    std::vector<fingerprint_info_t> get_fingerprints()
+    {
+        std::vector<fingerprint_info_t> result;
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return result;
+
+        auto raw = device->get_fingerprints();
+        result.reserve(raw.size());
+        for (const auto& src : raw) {
+            fingerprint_info_t f;
+            std::memcpy(f.remote_addr, src.remote_addr, 16);
+            f.af             = src.af;
+            f.ttl            = src.ttl;
+            f.window_size    = src.window_size;
+            f.mss            = src.mss;
+            f.window_scale   = src.window_scale;
+            f.df_flag        = src.df_flag;
+            f.sack_permitted = src.sack_permitted;
+            f.nop_count      = src.nop_count;
+            f.os_guess       = src.os_guess;
+            result.push_back(std::move(f));
+        }
+        return result;
+    }
+
+    bool export_pcap(uint32_t filter_pid, uint32_t filter_protocol, uint32_t max_packets, pcap_export_result_t* out)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            logf("AiDA Standalone: export_pcap requires kernel driver.\n");
+            return false;
+        }
+
+        voyager::device_t::pcap_export_result raw{};
+        bool ok = device->export_pcap(filter_pid, filter_protocol, max_packets, out ? &raw : nullptr);
+        if (ok && out) {
+            out->header.magic_number  = raw.header.magic_number;
+            out->header.version_major = raw.header.version_major;
+            out->header.version_minor = raw.header.version_minor;
+            out->header.thiszone      = raw.header.thiszone;
+            out->header.sigfigs       = raw.header.sigfigs;
+            out->header.snaplen       = raw.header.snaplen;
+            out->header.network       = raw.header.network;
+            out->packets.reserve(raw.packets.size());
+            for (auto& src : raw.packets) {
+                pcap_packet_t p;
+                p.ts_sec  = src.ts_sec;
+                p.ts_usec = src.ts_usec;
+                p.data    = std::move(src.data);
+                out->packets.push_back(std::move(p));
+            }
+        }
+        return ok;
     }
 }

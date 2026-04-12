@@ -10,7 +10,6 @@
 #include <cstring>
 
 #include "standalone_driver.hpp"
-#include "comm.h"
 
 namespace packet_callstack {
 
@@ -69,7 +68,7 @@ inline void capture_for_packet(uint64_t packet_idx, uint64_t timestamp,
 	if (!g_state.enabled.load())
 		return;
 
-	if (!device || !device->is_connected())
+	if (!driver_bridge::using_kernel_driver())
 		return;
 
 	packet_callstack_entry_t entry{};
@@ -79,8 +78,8 @@ inline void capture_for_packet(uint64_t packet_idx, uint64_t timestamp,
 	entry.tid = tid;
 	entry.resolved = false;
 
-	voyager::device_t::thread_context ctx{};
-	if (!device->get_thread_context(tid, ctx)) {
+	driver_bridge::thread_context_t ctx{};
+	if (!driver_bridge::get_thread_context(tid, ctx)) {
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		g_state.entries.push_back(std::move(entry));
 		while (g_state.entries.size() > g_state.max_entries)

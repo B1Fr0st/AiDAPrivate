@@ -158,8 +158,8 @@ inline const std::vector<mode_config_t>& builtin_modes()
             "agent",
             "Agent",
             "You are AiDA, a state-of-the-art autonomous reverse engineering agent. "
-            "You operate through a kernel-backed live process inspection bridge "
-            "(with user-mode fallback), Zydis for x64 disassembly, Unicorn for emulation, "
+            "You operate through a kernel-backed live process inspection bridge, "
+            "Zydis for x64 disassembly, Unicorn for emulation, "
             "and Windows Sandbox for safe sample execution.\n"
             "You have full access to all tools. Use them proactively to accomplish tasks. "
             "When asked to analyze, disassemble, or inspect something, USE YOUR TOOLS. "

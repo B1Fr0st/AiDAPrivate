@@ -10,6 +10,7 @@ namespace driver_bridge
 {
     using log_fn_t = std::function<void(const char* msg)>;
     using confirm_fn_t = std::function<bool(const char* question)>;
+    using pre_detach_fn_t = std::function<void()>;
 
     struct process_info_t {
         uint32_t    pid = 0;
@@ -121,8 +122,179 @@ namespace driver_bridge
         uint64_t last_activity = 0;
     };
 
+    struct bw_stats_t {
+        uint64_t total_bytes_sent = 0;
+        uint64_t total_bytes_recv = 0;
+        uint64_t total_packets_sent = 0;
+        uint64_t total_packets_recv = 0;
+        uint64_t bps_in = 0;
+        uint64_t bps_out = 0;
+        bool     active = false;
+    };
+
+    struct wfp_callout_info_t {
+        uint64_t    classify_fn = 0;
+        uint64_t    notify_fn = 0;
+        uint64_t    flow_delete_fn = 0;
+        uint64_t    owning_module_base = 0;
+        uint32_t    callout_id = 0;
+        uint32_t    layer_id = 0;
+        uint32_t    flags = 0;
+        std::string callout_key_str;
+        std::string applicable_layer_str;
+        std::string owning_module;
+    };
+
+    struct socket_info_t {
+        uint64_t handle_value = 0;
+        uint64_t afd_endpoint_addr = 0;
+        uint32_t pid = 0;
+        uint32_t protocol = 0;
+        uint32_t state = 0;
+        uint32_t local_port = 0;
+        uint32_t remote_port = 0;
+        uint32_t address_family = 0;
+        uint8_t  local_addr[16] = {};
+        uint8_t  remote_addr[16] = {};
+    };
+
+    struct tcpip_connection_t {
+        uint64_t tcb_address = 0;
+        uint64_t owning_module_base = 0;
+        uint32_t pid = 0;
+        uint32_t protocol = 0;
+        uint32_t state = 0;
+        uint32_t local_port = 0;
+        uint32_t remote_port = 0;
+        uint32_t address_family = 0;
+        uint8_t  local_addr[16] = {};
+        uint8_t  remote_addr[16] = {};
+        uint64_t create_time = 0;
+        uint64_t bytes_in = 0;
+        uint64_t bytes_out = 0;
+    };
+
+    struct dpi_result_t {
+        uint64_t timestamp = 0;
+        uint32_t direction = 0;
+        uint32_t protocol = 0;
+        uint32_t src_port = 0;
+        uint32_t dst_port = 0;
+        uint32_t pid = 0;
+        uint32_t payload_size = 0;
+        uint32_t af = 0;
+        uint8_t  src_addr[16] = {};
+        uint8_t  dst_addr[16] = {};
+        uint32_t tcp_flags = 0;
+        uint32_t tcp_window = 0;
+        bool     is_http = false;
+        bool     is_tls = false;
+        bool     is_dns = false;
+        uint32_t http_method = 0;
+        uint32_t tls_version = 0;
+        uint32_t tls_content_type = 0;
+        std::string http_host;
+        std::string http_path;
+        std::string tls_sni;
+    };
+
+    struct held_packet_info_t {
+        uint64_t hold_id = 0;
+        uint64_t timestamp = 0;
+        uint32_t direction = 0;
+        uint32_t protocol = 0;
+        uint32_t src_port = 0;
+        uint32_t dst_port = 0;
+        uint32_t pid = 0;
+        uint32_t payload_size = 0;
+        uint32_t af = 0;
+        uint8_t  src_addr[16] = {};
+        uint8_t  dst_addr[16] = {};
+        std::vector<uint8_t> payload;
+    };
+
+    struct mod_rule_info_t {
+        uint32_t rule_id = 0;
+        uint32_t direction = 0;
+        uint32_t protocol = 0;
+        uint32_t port = 0;
+        uint32_t pid = 0;
+        uint32_t match_count = 0;
+        uint32_t active = 0;
+    };
+
+    struct redirect_rule_info_t {
+        uint32_t rule_id = 0;
+        uint32_t protocol = 0;
+        uint32_t match_port = 0;
+        uint32_t redirect_port = 0;
+        uint32_t af = 0;
+        uint32_t match_count = 0;
+        uint32_t active = 0;
+    };
+
+    struct dns_spoof_info_t {
+        uint32_t    rule_id = 0;
+        std::string domain;
+        uint32_t    af = 0;
+        uint32_t    match_count = 0;
+        uint32_t    active = 0;
+        uint32_t    ttl = 0;
+    };
+
+    struct net_iface_info_t {
+        uint32_t    if_index = 0;
+        uint32_t    if_type = 0;
+        uint32_t    mtu = 0;
+        uint32_t    oper_status = 0;
+        uint64_t    speed = 0;
+        uint8_t     mac_addr[6] = {};
+        uint8_t     ipv4_addr[4] = {};
+        uint8_t     ipv4_mask[4] = {};
+        uint8_t     ipv6_addr[16] = {};
+        std::string name;
+        std::string description;
+        uint64_t    in_octets = 0;
+        uint64_t    out_octets = 0;
+    };
+
+    struct pcap_packet_t {
+        uint32_t ts_sec = 0;
+        uint32_t ts_usec = 0;
+        std::vector<uint8_t> data;
+    };
+
+    struct pcap_global_header_t {
+        uint32_t magic_number = 0;
+        uint16_t version_major = 0;
+        uint16_t version_minor = 0;
+        int32_t  thiszone = 0;
+        uint32_t sigfigs = 0;
+        uint32_t snaplen = 0;
+        uint32_t network = 0;
+    };
+
+    struct pcap_export_result_t {
+        pcap_global_header_t header;
+        std::vector<pcap_packet_t> packets;
+    };
+
+    struct fingerprint_info_t {
+        uint8_t     remote_addr[16] = {};
+        uint32_t    af = 0;
+        uint32_t    ttl = 0;
+        uint32_t    window_size = 0;
+        uint32_t    mss = 0;
+        uint32_t    window_scale = 0;
+        uint32_t    df_flag = 0;
+        uint32_t    sack_permitted = 0;
+        uint32_t    nop_count = 0;
+        std::string os_guess;
+    };
+
     void set_log_callback(log_fn_t fn);
     void set_confirm_callback(confirm_fn_t fn);
+    void add_pre_detach_callback(pre_detach_fn_t fn);
 
     bool initialize();
     bool load_kernel_driver();
@@ -173,6 +345,87 @@ namespace driver_bridge
     bool remove_filter_rule(uint32_t rule_id);
     bool clear_filter_rules();
     bool get_network_stats(network_stats_t& stats);
-    bool bw_monitor_op(uint32_t operation, uint32_t filter_pid = 0);
+    bool bw_monitor_op(uint32_t operation, uint32_t filter_pid = 0, bw_stats_t* out_stats = nullptr);
     std::vector<bw_process_info_t> get_bw_per_process(uint32_t filter_pid = 0);
+    std::vector<dpi_result_t> get_dpi_results(uint32_t filter_pid = 0, uint32_t filter_protocol = 0, uint32_t filter_port = 0, uint32_t flags = 0);
+    std::vector<wfp_callout_info_t> enumerate_wfp_callouts(const std::string& filter_module = {});
+    std::vector<socket_info_t> get_socket_handles(uint32_t target_pid = 0);
+    std::vector<tcpip_connection_t> dump_tcpip_connections(uint32_t target_pid = 0, uint32_t filter_protocol = 0);
+    std::vector<net_iface_info_t> enumerate_interfaces();
+    std::vector<held_packet_info_t> get_held_packets();
+    std::vector<mod_rule_info_t> list_packet_mod_rules();
+    std::vector<redirect_rule_info_t> list_redirect_rules();
+    std::vector<dns_spoof_info_t> list_dns_spoof_rules();
+    bool fingerprint_op(uint32_t operation);
+    std::vector<fingerprint_info_t> get_fingerprints();
+    bool export_pcap(uint32_t filter_pid = 0, uint32_t filter_protocol = 0, uint32_t max_packets = 64, pcap_export_result_t* out = nullptr);
+
+    struct dll_protect_status_t {
+        uint32_t status = 0;
+        uint64_t current_hash = 0;
+        uint64_t expected_hash = 0;
+        uint64_t last_check_tsc = 0;
+    };
+
+    uint64_t call_function(uint64_t function_address, uint64_t arg1 = 0, uint64_t arg2 = 0, uint64_t arg3 = 0, uint64_t arg4 = 0);
+    uint64_t find_gadget(const char* pattern, size_t pattern_size);
+
+    bool set_hardware_breakpoint(uint32_t tid, int index, uint64_t address, int type = 0, int size = 0);
+    bool clear_hardware_breakpoint(uint32_t tid, int index);
+
+    bool spoof_debug_flags(uint32_t* result_flags = nullptr);
+    bool refresh_heartbeat();
+
+    bool register_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size, uint64_t expected_hash, uint32_t check_interval_ms = 2000);
+    bool query_dll_protection(dll_protect_status_t& out);
+    bool unregister_dll_protection();
+
+    bool traffic_redirect_op(uint32_t operation, uint32_t rule_id = 0, uint32_t protocol = 0,
+                             uint32_t match_port = 0, const uint8_t* match_addr = nullptr,
+                             uint32_t redirect_port = 0, const uint8_t* redirect_addr = nullptr,
+                             uint32_t af = 2, uint32_t* out_rule_id = nullptr, uint32_t exclude_pid = 0);
+
+    bool inject_packet(uint32_t direction, uint32_t protocol, uint32_t af,
+                       uint32_t src_port, uint32_t dst_port,
+                       const uint8_t* src_addr, const uint8_t* dst_addr,
+                       const uint8_t* payload, uint32_t payload_size,
+                       uint32_t tcp_flags = 0, uint32_t tcp_seq = 0, uint32_t tcp_ack = 0);
+
+    bool kill_connection(uint32_t protocol, uint32_t af,
+                         uint32_t src_port, uint32_t dst_port,
+                         const uint8_t* src_addr, const uint8_t* dst_addr,
+                         uint32_t pid = 0);
+
+    bool intercept_op(uint32_t operation, uint32_t filter_pid = 0, uint32_t filter_port = 0,
+                      uint32_t filter_protocol = 0, uint64_t hold_id = 0,
+                      const uint8_t* modify_payload = nullptr, uint32_t modify_size = 0,
+                      uint32_t* out_held_count = nullptr, bool* out_active = nullptr);
+
+    bool dns_spoof_op(uint32_t operation, uint32_t rule_id = 0, const char* domain = nullptr,
+                      const uint8_t* spoof_addr = nullptr, uint32_t af = 2,
+                      uint32_t ttl = 300, uint32_t* out_rule_id = nullptr);
+
+    bool packet_mod_rule_op(uint32_t operation, uint32_t rule_id = 0,
+                            uint32_t direction = 2, uint32_t protocol = 0,
+                            uint32_t port = 0, uint32_t pid = 0,
+                            const uint8_t* pattern = nullptr, uint32_t pattern_size = 0,
+                            const uint8_t* replacement = nullptr, uint32_t replace_size = 0,
+                            uint32_t* out_rule_id = nullptr);
+
+    bool stream_reassemble_op(uint32_t operation, uint32_t src_port = 0, uint32_t dst_port = 0,
+                              uint32_t pid = 0, const uint8_t* src_addr = nullptr,
+                              const uint8_t* dst_addr = nullptr,
+                              std::vector<uint8_t>* out_data = nullptr,
+                              uint32_t* out_packets = nullptr, uint32_t* out_truncated = nullptr);
+
+    bool sniff_net_buffers_start(uint64_t address, uint32_t buf_reg, uint32_t size_reg,
+                                 uint32_t max_captures = 1, uint32_t tid = 0, uint32_t bp_index = 0);
+    bool sniff_net_buffers_stop();
+
+    struct sniff_result_t {
+        uint64_t timestamp;
+        uint64_t thread_id;
+        std::vector<uint8_t> buffer;
+    };
+    std::vector<sniff_result_t> sniff_net_buffers_get(bool& active);
 }
