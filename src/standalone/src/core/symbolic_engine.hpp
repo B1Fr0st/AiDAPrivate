@@ -106,39 +106,39 @@ namespace detail {
 
 inline triton::arch::register_e name_to_triton_reg(const std::string& name) {
 	static const std::unordered_map<std::string, triton::arch::register_e> map = {
-		{"rax", triton::arch::x86::ID_REG_X86_RAX},
-		{"rbx", triton::arch::x86::ID_REG_X86_RBX},
-		{"rcx", triton::arch::x86::ID_REG_X86_RCX},
-		{"rdx", triton::arch::x86::ID_REG_X86_RDX},
-		{"rsi", triton::arch::x86::ID_REG_X86_RSI},
-		{"rdi", triton::arch::x86::ID_REG_X86_RDI},
-		{"rbp", triton::arch::x86::ID_REG_X86_RBP},
-		{"rsp", triton::arch::x86::ID_REG_X86_RSP},
-		{"r8",  triton::arch::x86::ID_REG_X86_R8},
-		{"r9",  triton::arch::x86::ID_REG_X86_R9},
-		{"r10", triton::arch::x86::ID_REG_X86_R10},
-		{"r11", triton::arch::x86::ID_REG_X86_R11},
-		{"r12", triton::arch::x86::ID_REG_X86_R12},
-		{"r13", triton::arch::x86::ID_REG_X86_R13},
-		{"r14", triton::arch::x86::ID_REG_X86_R14},
-		{"r15", triton::arch::x86::ID_REG_X86_R15},
-		{"rip", triton::arch::x86::ID_REG_X86_RIP},
-		{"rflags", triton::arch::x86::ID_REG_X86_EFLAGS},
-		{"eax", triton::arch::x86::ID_REG_X86_EAX},
-		{"ebx", triton::arch::x86::ID_REG_X86_EBX},
-		{"ecx", triton::arch::x86::ID_REG_X86_ECX},
-		{"edx", triton::arch::x86::ID_REG_X86_EDX},
-		{"esi", triton::arch::x86::ID_REG_X86_ESI},
-		{"edi", triton::arch::x86::ID_REG_X86_EDI},
-		{"ebp", triton::arch::x86::ID_REG_X86_EBP},
-		{"esp", triton::arch::x86::ID_REG_X86_ESP},
+		{"rax", triton::arch::ID_REG_X86_RAX},
+		{"rbx", triton::arch::ID_REG_X86_RBX},
+		{"rcx", triton::arch::ID_REG_X86_RCX},
+		{"rdx", triton::arch::ID_REG_X86_RDX},
+		{"rsi", triton::arch::ID_REG_X86_RSI},
+		{"rdi", triton::arch::ID_REG_X86_RDI},
+		{"rbp", triton::arch::ID_REG_X86_RBP},
+		{"rsp", triton::arch::ID_REG_X86_RSP},
+		{"r8",  triton::arch::ID_REG_X86_R8},
+		{"r9",  triton::arch::ID_REG_X86_R9},
+		{"r10", triton::arch::ID_REG_X86_R10},
+		{"r11", triton::arch::ID_REG_X86_R11},
+		{"r12", triton::arch::ID_REG_X86_R12},
+		{"r13", triton::arch::ID_REG_X86_R13},
+		{"r14", triton::arch::ID_REG_X86_R14},
+		{"r15", triton::arch::ID_REG_X86_R15},
+		{"rip", triton::arch::ID_REG_X86_RIP},
+		{"rflags", triton::arch::ID_REG_X86_EFLAGS},
+		{"eax", triton::arch::ID_REG_X86_EAX},
+		{"ebx", triton::arch::ID_REG_X86_EBX},
+		{"ecx", triton::arch::ID_REG_X86_ECX},
+		{"edx", triton::arch::ID_REG_X86_EDX},
+		{"esi", triton::arch::ID_REG_X86_ESI},
+		{"edi", triton::arch::ID_REG_X86_EDI},
+		{"ebp", triton::arch::ID_REG_X86_EBP},
+		{"esp", triton::arch::ID_REG_X86_ESP},
 	};
 
 	std::string lower = name;
 	std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 	auto it = map.find(lower);
 	if (it != map.end()) return it->second;
-	return triton::arch::x86::ID_REG_INVALID;
+	return triton::arch::ID_REG_INVALID;
 }
 
 inline void load_snapshot_into_context(triton::Context& ctx, const emulation::process_snapshot_t& snap) {
@@ -174,7 +174,7 @@ inline std::string ast_to_string(const triton::ast::SharedAbstractNode& node) {
 	return ss.str();
 }
 
-inline traced_instruction_t build_traced_insn(triton::Context& ctx, const triton::arch::Instruction& insn) {
+inline traced_instruction_t build_traced_insn(triton::Context& ctx, triton::arch::Instruction& insn) {
 	traced_instruction_t t;
 	t.address = insn.getAddress();
 	t.size = insn.getSize();
@@ -212,7 +212,7 @@ inline traced_instruction_t build_traced_insn(triton::Context& ctx, const triton
 	return t;
 }
 
-inline bool is_dead_store(triton::Context& ctx, const triton::arch::Instruction& insn,
+inline bool is_dead_store(triton::Context& ctx, triton::arch::Instruction& insn,
 						  const std::unordered_set<triton::arch::register_e>& live_regs,
 						  const std::unordered_set<uint64_t>& live_mem) {
 	bool writes_live = false;
@@ -263,7 +263,7 @@ inline symbolic_result_t execute_symbolic(
 	ctx.setSolverTimeout(5000);
 
 	uint32_t pid = device->get_process_id();
-	auto threads = device->enumerate_threads(pid);
+	auto threads = device->enumerate_threads();
 	uint32_t tid = 0;
 	if (!threads.empty()) tid = threads[0].tid;
 
@@ -277,7 +277,7 @@ inline symbolic_result_t execute_symbolic(
 
 	for (auto& reg_name : symbolize_regs) {
 		auto reg_id = detail::name_to_triton_reg(reg_name);
-		if (reg_id != triton::arch::x86::ID_REG_INVALID) {
+		if (reg_id != triton::arch::ID_REG_INVALID) {
 			ctx.symbolizeRegister(ctx.getRegister(reg_id), reg_name);
 		}
 	}
@@ -380,7 +380,7 @@ inline slice_result_t slice_to_register(
 	}
 
 	auto target_reg_id = detail::name_to_triton_reg(target_reg_name);
-	if (target_reg_id == triton::arch::x86::ID_REG_INVALID) {
+	if (target_reg_id == triton::arch::ID_REG_INVALID) {
 		result.error = "Unknown register: " + target_reg_name;
 		return result;
 	}
@@ -389,7 +389,7 @@ inline slice_result_t slice_to_register(
 	ctx.setMode(triton::modes::ALIGNED_MEMORY, true);
 
 	uint32_t pid = device->get_process_id();
-	auto threads = device->enumerate_threads(pid);
+	auto threads = device->enumerate_threads();
 	uint32_t tid = 0;
 	if (!threads.empty()) tid = threads[0].tid;
 
@@ -500,7 +500,7 @@ inline solve_result_t solve_for_path(
 	ctx.setSolverTimeout(10000);
 
 	uint32_t pid = device->get_process_id();
-	auto threads = device->enumerate_threads(pid);
+	auto threads = device->enumerate_threads();
 	uint32_t tid = 0;
 	if (!threads.empty()) tid = threads[0].tid;
 
@@ -515,7 +515,7 @@ inline solve_result_t solve_for_path(
 	std::unordered_map<std::string, triton::engines::symbolic::SharedSymbolicVariable> sym_vars;
 	for (auto& reg_name : symbolic_regs) {
 		auto reg_id = detail::name_to_triton_reg(reg_name);
-		if (reg_id != triton::arch::x86::ID_REG_INVALID) {
+		if (reg_id != triton::arch::ID_REG_INVALID) {
 			auto sv = ctx.symbolizeRegister(ctx.getRegister(reg_id), reg_name);
 			sym_vars[reg_name] = sv;
 		}
@@ -622,7 +622,7 @@ inline taint_result_t taint_trace(
 	ctx.setMode(triton::modes::TAINT_THROUGH_POINTERS, true);
 
 	uint32_t pid = device->get_process_id();
-	auto threads = device->enumerate_threads(pid);
+	auto threads = device->enumerate_threads();
 	uint32_t tid = 0;
 	if (!threads.empty()) tid = threads[0].tid;
 
@@ -636,7 +636,7 @@ inline taint_result_t taint_trace(
 
 	for (auto& reg_name : taint_regs) {
 		auto reg_id = detail::name_to_triton_reg(reg_name);
-		if (reg_id != triton::arch::x86::ID_REG_INVALID) {
+		if (reg_id != triton::arch::ID_REG_INVALID) {
 			ctx.taintRegister(ctx.getRegister(reg_id));
 		}
 	}
@@ -706,7 +706,7 @@ inline std::string get_register_expression(
 	ctx.setMode(triton::modes::ALIGNED_MEMORY, true);
 
 	uint32_t pid = device->get_process_id();
-	auto threads = device->enumerate_threads(pid);
+	auto threads = device->enumerate_threads();
 	uint32_t tid = 0;
 	if (!threads.empty()) tid = threads[0].tid;
 
@@ -717,7 +717,7 @@ inline std::string get_register_expression(
 
 	for (auto& reg_name : symbolize_regs) {
 		auto reg_id = detail::name_to_triton_reg(reg_name);
-		if (reg_id != triton::arch::x86::ID_REG_INVALID) {
+		if (reg_id != triton::arch::ID_REG_INVALID) {
 			ctx.symbolizeRegister(ctx.getRegister(reg_id), reg_name);
 		}
 	}
@@ -741,7 +741,7 @@ inline std::string get_register_expression(
 	}
 
 	auto target_id = detail::name_to_triton_reg(target_reg);
-	if (target_id == triton::arch::x86::ID_REG_INVALID) return "<unknown reg>";
+	if (target_id == triton::arch::ID_REG_INVALID) return "<unknown reg>";
 
 	auto ast = ctx.getRegisterAst(ctx.getRegister(target_id));
 	auto simplified = ctx.simplify(ast, true);
@@ -773,7 +773,7 @@ inline bool is_opaque_predicate(
 	ctx.setMode(triton::modes::ALIGNED_MEMORY, true);
 
 	uint32_t pid = device->get_process_id();
-	auto threads = device->enumerate_threads(pid);
+	auto threads = device->enumerate_threads();
 	uint32_t tid = 0;
 	if (!threads.empty()) tid = threads[0].tid;
 

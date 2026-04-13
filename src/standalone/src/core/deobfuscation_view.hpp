@@ -1,6 +1,7 @@
 #pragma once
 
 #include "deobfuscation_engine.hpp"
+#include "ui_anim.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
 
@@ -22,11 +23,16 @@ struct state_t {
 	float       code_scroll_y = 0.f;
 	float       code_target_scroll = 0.f;
 	int         selected_insn = -1;
+	bool        code_scrollbar_dragging = false;
+	float       code_scrollbar_drag_offset = 0.f;
 
 	float       info_scroll_y = 0.f;
 	float       info_target_scroll = 0.f;
 	int         active_info_tab = 0;
+	bool        info_scrollbar_dragging = false;
+	float       info_scrollbar_drag_offset = 0.f;
 
+	float       anim_time = 0.f;
 	bool show_junk = false;
 };
 
@@ -35,9 +41,18 @@ static state_t s_state;
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float accent_r, float accent_g, float accent_b)
 {
+	ImGui::BeginChild("##deobfuscation_view", ImVec2(width, height), false,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 	auto* dl = ImGui::GetWindowDrawList();
 	auto& st = s_state;
 	auto& eng = deobfuscation_engine::g_state;
+
+	ImVec2 wp = ImGui::GetWindowPos();
+	float cx = wp.x;
+	float cy = wp.y;
+
+	st.anim_time += ImGui::GetIO().DeltaTime;
+	float dt = ImGui::GetIO().DeltaTime;
 
 	const ImU32 bg        = IM_COL32(30, 30, 30, static_cast<int>(alpha * 255));
 	const ImU32 text_col  = IM_COL32(212, 212, 212, static_cast<int>(alpha * 255));
@@ -56,10 +71,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const ImU32 magenta_col = IM_COL32(198, 120, 221, static_cast<int>(alpha * 255));
 	const ImU32 junk_col  = IM_COL32(100, 60, 60, static_cast<int>(alpha * 200));
 	const ImU32 junk_text = IM_COL32(180, 100, 100, static_cast<int>(alpha * 180));
-
-	ImVec2 wpos = ImGui::GetWindowPos();
-	float cx = wpos.x + pos_x;
-	float cy = wpos.y + pos_y;
 
 	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + width, cy + height), bg);
 
@@ -174,10 +185,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImVec2 hs = ImGui::CalcTextSize(hint);
 		dl->AddText(ImVec2(cx + width * 0.5f - hs.x * 0.5f, body_top + body_h * 0.4f),
 		            res.error.empty() ? dim_col : red_col, hint);
+		ImGui::EndChild();
 		return;
 	}
 
-	if (!res.success) return;
+	if (!res.success) {
+		ui_anim::render_spinner(dl, cx + width * 0.5f, body_top + body_h * 0.4f, 14.f, accent, st.anim_time);
+		dl->AddText(ImVec2(cx + width * 0.5f - 50.f, body_top + body_h * 0.4f + 24.f), dim_col, "Deobfuscating...");
+		ImGui::EndChild();
+		return;
+	}
 
 	float code_w = width * 0.62f;
 	float info_w = width - code_w - pad;
@@ -215,17 +232,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float avail_h = body_h - row_h;
 		int visible = static_cast<int>(avail_h / row_h);
 
-		if (ImGui::IsMouseHoveringRect(ImVec2(code_x, body_top), ImVec2(code_x + code_w, body_top + body_h))) {
-			float wheel = ImGui::GetIO().MouseWheel;
-			if (wheel != 0.f) {
-				st.code_target_scroll -= wheel * row_h * 3.f;
-			}
-		}
-
 		float max_sc = (std::max)(0.f, static_cast<float>(total) * row_h - avail_h);
-		if (st.code_target_scroll < 0.f) st.code_target_scroll = 0.f;
-		if (st.code_target_scroll > max_sc) st.code_target_scroll = max_sc;
-		st.code_scroll_y += (st.code_target_scroll - st.code_scroll_y) * 0.3f;
+		ImGui::SetCursorScreenPos(ImVec2(code_x, body_top + row_h));
+		ImGui::InvisibleButton("##deob_code_scroll", ImVec2(code_w - 10.f, avail_h));
+		ui_anim::handle_scroll_input(st.code_target_scroll, max_sc, row_h * 3.f);
+		ui_anim::smooth_scroll(st.code_scroll_y, st.code_target_scroll, dt);
+		ui_anim::clamp_scroll(st.code_scroll_y, max_sc);
+		ui_anim::clamp_scroll(st.code_target_scroll, max_sc);
 
 		int start_row = static_cast<int>(st.code_scroll_y / row_h);
 		if (start_row < 0) start_row = 0;
@@ -288,6 +301,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (total == 0) {
 			dl->AddText(ImVec2(code_x + 8.f, hdr_y + 8.f), dim_col, "No instructions");
 		}
+
+		ui_anim::render_custom_scrollbar(dl, code_x + code_w - 8.f, body_top + row_h, 6.f, avail_h,
+			st.code_scroll_y, max_sc, st.code_scrollbar_dragging, st.code_scrollbar_drag_offset,
+			accent, IM_COL32(60, 60, 60, static_cast<int>(alpha * 150)));
 	}
 
 	{
@@ -408,6 +425,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 		}
 	}
+
+	ImGui::EndChild();
 }
 
 }

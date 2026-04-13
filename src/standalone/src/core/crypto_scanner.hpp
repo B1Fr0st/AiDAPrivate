@@ -527,6 +527,8 @@ inline const char* category_name(crypto_category_t cat)
 	}
 }
 
+inline void auto_label_references(); // forward declaration
+
 inline void scan_process()
 {
 	if (g_state.scanning.load()) return;
@@ -983,8 +985,7 @@ inline void ai_analyze_results()
 		          "5. Identify high-entropy regions that could be keys, IVs, or encrypted data\n"
 		          "Be concise and actionable.";
 
-		extern const settings_sa_t& get_standalone_settings();
-		auto ai = std::make_unique<standalone_ai_client_t>(get_standalone_settings());
+		auto ai = std::make_unique<standalone_ai_client_t>(g_sa_settings);
 		if (!ai->is_available()) {
 			g_state.analyzing.store(false);
 			return;

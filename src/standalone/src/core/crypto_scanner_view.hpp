@@ -30,6 +30,10 @@ inline state_t g_state;
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float accent_r, float accent_g, float accent_b)
 {
+	ImGui::BeginChild("##crypto_view", ImVec2(width, height), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+	ImVec2 wp = ImGui::GetWindowPos();
+	float ox = wp.x;
+	float oy = wp.y;
 	auto* dl = ImGui::GetWindowDrawList();
 	auto& st = g_state;
 	auto& cs = crypto_scanner::g_state;
@@ -44,13 +48,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const ImU32 header_bg = IM_COL32(45, 45, 45, static_cast<int>(alpha * 255));
 	const ImU32 bar_bg    = IM_COL32(50, 50, 50, static_cast<int>(alpha * 255));
 
-	dl->AddRectFilled(ImVec2(pos_x, pos_y), ImVec2(pos_x + width, pos_y + height), bg);
+	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height), bg);
 
-	float cx = pos_x + 12.f;
-	float cy = pos_y + 8.f;
+	float cx = ox + 12.f;
+	float cy = oy + 8.f;
 	const float toolbar_h = 36.f;
 
-	dl->AddRectFilled(ImVec2(pos_x, cy - 4.f), ImVec2(pos_x + width, cy + toolbar_h), header_bg);
+	dl->AddRectFilled(ImVec2(ox, cy - 4.f), ImVec2(ox + width, cy + toolbar_h), header_bg);
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy + 2.f));
 	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(accent_r, accent_g, accent_b, 0.7f * alpha));
@@ -203,7 +207,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	const float row_h = 22.f;
 	const float table_top = cy;
-	const float table_h = pos_y + height - cy - 8.f;
+	const float table_h = oy + height - cy - 8.f;
 	const float col_widths[6] = {width * 0.12f, width * 0.18f, width * 0.16f, width * 0.22f, width * 0.14f, width * 0.16f};
 	const char* col_names[6] = {"Algorithm", "Signature", "Address", "Module + Offset", "Category", "Refs"};
 
@@ -227,7 +231,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ui_anim::handle_scroll_input(st.target_scroll_y, 0.f, std::max(0.f, content_h - visible_h), row_h);
 	ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 12.f, ImGui::GetIO().DeltaTime);
 
-	ImGui::PushClipRect(ImVec2(pos_x, cy), ImVec2(pos_x + width - 14.f, pos_y + height - 8.f), true);
+	ImGui::PushClipRect(ImVec2(ox, cy), ImVec2(ox + width - 14.f, oy + height - 8.f), true);
 
 	int first_visible = static_cast<int>(st.scroll_y / row_h);
 	int last_visible = first_visible + static_cast<int>(visible_h / row_h) + 2;
@@ -239,11 +243,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	for (int i = first_visible; i < last_visible; ++i) {
 		float ry = cy + static_cast<float>(i) * row_h - st.scroll_y;
-		if (ry + row_h < cy || ry > pos_y + height) continue;
+		if (ry + row_h < cy || ry > oy + height) continue;
 
 		auto& hit = filtered[static_cast<size_t>(i)];
-		ImVec2 row_min(pos_x, ry);
-		ImVec2 row_max(pos_x + width - 14.f, ry + row_h);
+		ImVec2 row_min(ox, ry);
+		ImVec2 row_max(ox + width - 14.f, ry + row_h);
 
 		bool hovered = ImGui::IsMouseHoveringRect(row_min, row_max);
 		dl->AddRectFilled(row_min, row_max, hovered ? row_hover : (i % 2 == 0 ? row_even : row_odd));
@@ -339,14 +343,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		} else {
 			std::snprintf(count_buf, sizeof(count_buf), "%zu results", filtered.size());
 		}
-		dl->AddText(ImVec2(pos_x + width - 200.f, pos_y + height - 20.f), dim_col, count_buf);
+		dl->AddText(ImVec2(ox + width - 200.f, oy + height - 20.f), dim_col, count_buf);
 	}
 
 	if (content_h > visible_h) {
-		ui_anim::render_custom_scrollbar(dl, pos_x + width - 12.f, table_top + row_h + 1.f,
+		ui_anim::render_custom_scrollbar(dl, ox + width - 12.f, table_top + row_h + 1.f,
 		                                  10.f, visible_h, st.scroll_y, content_h, visible_h,
 		                                  alpha, st.scrollbar_dragging, st.scrollbar_drag_offset);
 	}
+	ImGui::EndChild();
 }
 
 }

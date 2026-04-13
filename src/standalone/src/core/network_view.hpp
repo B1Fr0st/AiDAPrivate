@@ -168,10 +168,12 @@ struct state_t {
 
 
     std::mutex                    dns_mutex;
-    std::vector<dns_entry>        dns_entries;
+    std::deque<dns_entry>         dns_entries;
+    size_t                        dns_max_entries = 8192;
     int                           dns_selected = -1;
     uint32_t                      dns_filter_pid = 0;
     char                          dns_filter_text[128] = {};
+    bool                          dns_auto_scroll = true;
     std::thread                   dns_thread;
     std::atomic<bool>             dns_polling{false};
 

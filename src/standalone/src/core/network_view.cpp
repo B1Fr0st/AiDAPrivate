@@ -178,24 +178,31 @@ static void dns_poll_thread(state_t& state) {
             auto raw_dns = driver_bridge::get_dns_queries(state.dns_filter_pid);
 
             if (!raw_dns.empty()) {
-                std::vector<dns_entry> entries;
-                entries.reserve(raw_dns.size());
+                std::lock_guard<std::mutex> lock(state.dns_mutex);
                 for (auto& d : raw_dns) {
-                    dns_entry e;
-                    e.timestamp = d.timestamp;
-                    e.pid = d.pid;
-                    e.query_type = static_cast<uint16_t>(d.query_type);
-                    e.domain = d.domain;
-                    e.resolved_addr = format_ip(d.resolved_addr, 2);
-                    e.response_code = d.response_code;
-                    e.ttl = d.ttl;
-                    entries.push_back(std::move(e));
+                    bool duplicate = false;
+                    for (auto it = state.dns_entries.rbegin();
+                         it != state.dns_entries.rend() && it != state.dns_entries.rbegin() + (std::min)(static_cast<size_t>(256), state.dns_entries.size());
+                         ++it) {
+                        if (it->timestamp == d.timestamp && it->domain == d.domain && it->pid == d.pid) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) {
+                        dns_entry e;
+                        e.timestamp = d.timestamp;
+                        e.pid = d.pid;
+                        e.query_type = static_cast<uint16_t>(d.query_type);
+                        e.domain = d.domain;
+                        e.resolved_addr = format_ip(d.resolved_addr, 2);
+                        e.response_code = d.response_code;
+                        e.ttl = d.ttl;
+                        state.dns_entries.push_back(std::move(e));
+                    }
                 }
-
-                {
-                    std::lock_guard<std::mutex> lock(state.dns_mutex);
-                    state.dns_entries = std::move(entries);
-                }
+                while (state.dns_entries.size() > state.dns_max_entries)
+                    state.dns_entries.pop_front();
             }
         }
 
@@ -898,18 +905,30 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
         if (driver_ok) {
             auto raw = driver_bridge::get_dns_queries(state.dns_filter_pid);
             std::lock_guard<std::mutex> lock(state.dns_mutex);
-            state.dns_entries.clear();
             for (auto& d : raw) {
-                dns_entry e;
-                e.timestamp = d.timestamp;
-                e.pid = d.pid;
-                e.query_type = static_cast<uint16_t>(d.query_type);
-                e.domain = d.domain;
-                e.resolved_addr = format_ip(d.resolved_addr, 2);
-                e.response_code = d.response_code;
-                e.ttl = d.ttl;
-                state.dns_entries.push_back(std::move(e));
+                bool duplicate = false;
+                for (auto it = state.dns_entries.rbegin();
+                     it != state.dns_entries.rend() && it != state.dns_entries.rbegin() + (std::min)(static_cast<size_t>(256), state.dns_entries.size());
+                     ++it) {
+                    if (it->timestamp == d.timestamp && it->domain == d.domain && it->pid == d.pid) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate) {
+                    dns_entry e;
+                    e.timestamp = d.timestamp;
+                    e.pid = d.pid;
+                    e.query_type = static_cast<uint16_t>(d.query_type);
+                    e.domain = d.domain;
+                    e.resolved_addr = format_ip(d.resolved_addr, 2);
+                    e.response_code = d.response_code;
+                    e.ttl = d.ttl;
+                    state.dns_entries.push_back(std::move(e));
+                }
             }
+            while (state.dns_entries.size() > state.dns_max_entries)
+                state.dns_entries.pop_front();
         }
     }
 

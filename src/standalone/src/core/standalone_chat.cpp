@@ -2574,7 +2574,7 @@ void do_process_detach()
 
 bool is_process_attached()
 {
-    return driver_bridge::is_loaded();
+    return driver_bridge::attached_pid() != 0;
 }
 
 std::string get_attached_process_name()
@@ -2584,5 +2584,5 @@ std::string get_attached_process_name()
 
 unsigned long get_attached_pid()
 {
-    return 0;
+    return driver_bridge::attached_pid();
 }

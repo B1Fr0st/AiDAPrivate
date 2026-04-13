@@ -124,39 +124,45 @@ if(MSVC AND TARGET unicorn-common)
 endif()
 
 # --- Z3 (pre-built static library) ---
-# Download pre-built Z3 from GitHub releases if not already present
+# Use pre-existing Z3 library at .deps/z3/z3-4.13.4-x64-win
 set(Z3_VERSION "4.13.4")
-set(Z3_DIR "${CMAKE_BINARY_DIR}/.deps/z3")
-set(Z3_ARCHIVE_NAME "z3-${Z3_VERSION}-x64-win")
-set(Z3_ARCHIVE_PATH "${Z3_DIR}/${Z3_ARCHIVE_NAME}.zip")
-set(Z3_INSTALL_DIR "${Z3_DIR}/${Z3_ARCHIVE_NAME}")
+set(Z3_INSTALL_DIR "${DEPS_DIR}/z3/z3-${Z3_VERSION}-x64-win")
 
 if(NOT EXISTS "${Z3_INSTALL_DIR}/include/z3.h")
-    message(STATUS "Downloading Z3 ${Z3_VERSION} pre-built binaries...")
-    file(MAKE_DIRECTORY "${Z3_DIR}")
-    file(DOWNLOAD
-        "https://github.com/Z3Prover/z3/releases/download/z3-${Z3_VERSION}/${Z3_ARCHIVE_NAME}.zip"
-        "${Z3_ARCHIVE_PATH}"
-        STATUS Z3_DL_STATUS
-        TIMEOUT 120
-    )
-    list(GET Z3_DL_STATUS 0 Z3_DL_CODE)
-    if(NOT Z3_DL_CODE EQUAL 0)
-        message(FATAL_ERROR "Failed to download Z3: ${Z3_DL_STATUS}")
-    endif()
-    execute_process(
-        COMMAND ${CMAKE_COMMAND} -E tar xf "${Z3_ARCHIVE_PATH}"
-        WORKING_DIRECTORY "${Z3_DIR}"
-        RESULT_VARIABLE Z3_EXTRACT_RESULT
-    )
-    if(NOT Z3_EXTRACT_RESULT EQUAL 0)
-        message(FATAL_ERROR "Failed to extract Z3 archive")
-    endif()
+    message(FATAL_ERROR "Z3 library not found at ${Z3_INSTALL_DIR}")
 endif()
 
 set(Z3_INCLUDE_DIRS "${Z3_INSTALL_DIR}/include" CACHE PATH "Z3 include directory" FORCE)
 set(Z3_LIBRARIES "${Z3_INSTALL_DIR}/bin/libz3.lib" CACHE FILEPATH "Z3 library" FORCE)
 set(Z3_FOUND TRUE CACHE BOOL "" FORCE)
+
+# --- Capstone (required by Triton) ---
+set(CAPSTONE_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory("${DEPS_DIR}/capstone/capstone-5.0.7" "${CMAKE_BINARY_DIR}/.deps/capstone")
+
+# Suppress warnings from Capstone on MSVC
+if(MSVC AND TARGET capstone)
+    target_compile_options(capstone PRIVATE /W0)
+endif()
+
+# capstone 5.x creates capstone::capstone alias automatically, but guard just in case
+if(NOT TARGET capstone::capstone)
+    if(TARGET capstone_static)
+        add_library(capstone::capstone ALIAS capstone_static)
+    elseif(TARGET capstone)
+        add_library(capstone::capstone ALIAS capstone)
+    endif()
+endif()
+
+# Pre-populate CAPSTONE variables so Triton's FindCAPSTONE.cmake does not call
+# find_path/find_library (which would fail at configure time before the build).
+set(CAPSTONE_FOUND TRUE CACHE BOOL "" FORCE)
+set(CAPSTONE_INCLUDE_DIRS "${DEPS_DIR}/capstone/capstone-5.0.7/include" CACHE PATH "" FORCE)
+set(CAPSTONE_LIBRARIES "capstone" CACHE STRING "" FORCE)
 
 # --- Triton (symbolic execution engine) ---
 set(BUILD_SHARED_LIBS_SAVED_TRITON "${BUILD_SHARED_LIBS}")
@@ -171,6 +177,7 @@ set(ENABLE_TEST OFF CACHE BOOL "" FORCE)
 set(MSVC_STATIC OFF CACHE BOOL "" FORCE)
 
 set(TRITON_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Triton")
+set(TRITON_INSTALL_RULES OFF CACHE BOOL "" FORCE)
 add_subdirectory("${TRITON_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/.deps/triton")
 set(BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS_SAVED_TRITON}")
 
@@ -209,6 +216,8 @@ set(GHIDRA_LIBDECOMP_EXCLUDE
     "${GHIDRA_DECOMP_DIR}/raw_arch.cc"
     "${GHIDRA_DECOMP_DIR}/xml_arch.cc"
     "${GHIDRA_DECOMP_DIR}/loadimage_xml.cc"
+    "${GHIDRA_DECOMP_DIR}/analyzesigs.cc"
+    "${GHIDRA_DECOMP_DIR}/codedata.cc"
 )
 
 set(GHIDRA_LIBDECOMP_SOURCES ${GHIDRA_ALL_CC})
@@ -720,6 +729,14 @@ if(WIN32)
                 "${GHIDRA_SPECS_OUTPUT_DIR}/x86.ldefs"
                 "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs/"
             COMMENT "Copying Ghidra specs to output directory"
+            VERBATIM
+        )
+
+        add_custom_command(TARGET AiDAStandalone POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${Z3_INSTALL_DIR}/bin/libz3.dll"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/"
+            COMMENT "Copying libz3.dll to output directory"
             VERBATIM
         )
 

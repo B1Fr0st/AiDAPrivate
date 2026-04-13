@@ -31,21 +31,11 @@
 #include "../core/terminal_view.hpp"
 #include "../core/mcp_marketplace.hpp"
 #include "../core/network_view.hpp"
-#include "../core/memory_scanner_view.hpp"
 #include "../core/debugger_view.hpp"
 #include "../core/decompiler_view.hpp"
-#include "../core/struct_recon_view.hpp"
-#include "../core/crypto_scanner_view.hpp"
-#include "../core/aob_view.hpp"
-#include "../core/fuzzer_view.hpp"
-#include "../core/xref_db_view.hpp"
-#include "../core/snapshot_diff.hpp"
-#include "../core/pointer_scanner_view.hpp"
-#include "../core/decrypt_oracle_view.hpp"
-#include "../core/integrity_hunter_view.hpp"
-#include "../core/symbolic_view.hpp"
-#include "../core/taint_view.hpp"
-#include "../core/deobfuscation_view.hpp"
+#include "../core/scan_hub_view.hpp"
+#include "../core/types_hub_view.hpp"
+#include "../core/analysis_hub_view.hpp"
 
 static ID3D11ShaderResourceView* g_send_icon_srv    = nullptr;
 static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
@@ -744,7 +734,7 @@ void helpers::render_title()
 		}
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_M, false)) {
-			globals::ui::active_center_view = center_view_t::memory_scanner;
+			globals::ui::active_center_view = center_view_t::scan_hub;
 		}
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
@@ -757,7 +747,7 @@ void helpers::render_title()
 				dec_addr = globals::ui::decompile_popup_addr;
 			if (globals::ui::decompile_default_mode == 0) {
 				if (dec_addr)
-					decompiler_engine::decompile_function(dec_addr, get_standalone_settings());
+					decompiler_engine::decompile_function(dec_addr, g_sa_settings);
 				globals::ui::active_center_view = center_view_t::decompiler;
 			} else if (globals::ui::decompile_default_mode == 1) {
 				if (dec_addr)
@@ -765,7 +755,7 @@ void helpers::render_title()
 				globals::ui::active_center_view = center_view_t::decompiler;
 			} else if (globals::ui::decompile_default_mode == 2) {
 				if (dec_addr)
-					decompiler_engine::decompile_function_hybrid(dec_addr, get_standalone_settings());
+					decompiler_engine::decompile_function_hybrid(dec_addr, g_sa_settings);
 				globals::ui::active_center_view = center_view_t::decompiler;
 			} else {
 				globals::ui::show_decompile_popup = true;
@@ -773,11 +763,13 @@ void helpers::render_title()
 		}
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_X, false)) {
-			globals::ui::active_center_view = center_view_t::xref_browser;
+			scan_hub_view::set_sub_tab(scan_hub_view::sub_tab_t::xrefs);
+			globals::ui::active_center_view = center_view_t::scan_hub;
 		}
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
-			globals::ui::active_center_view = center_view_t::deobfuscation_view;
+			analysis_hub_view::set_sub_tab(analysis_hub_view::sub_tab_t::deobfuscation);
+			globals::ui::active_center_view = center_view_t::analysis_hub;
 		}
 	}
 
@@ -786,6 +778,7 @@ void helpers::render_title()
 		globals::ui::show_decompile_popup = false;
 	}
 
+	static bool remember_choice = false;
 	if (ImGui::BeginPopupModal("##decompile_choice", nullptr,
 	    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove)) {
 		ImVec2 display = ImGui::GetIO().DisplaySize;
@@ -808,7 +801,7 @@ void helpers::render_title()
 
 		if (ImGui::Button("AI Decompiler##dec_ai", ImVec2(btn_w, btn_h))) {
 			if (popup_addr)
-				decompiler_engine::decompile_function(popup_addr, get_standalone_settings());
+				decompiler_engine::decompile_function(popup_addr, g_sa_settings);
 			globals::ui::active_center_view = center_view_t::decompiler;
 			if (remember_choice) {
 				globals::ui::decompile_default_mode = 0;
@@ -842,7 +835,7 @@ void helpers::render_title()
 
 		if (ImGui::Button("Hybrid (Ghidra + AI)##dec_hybrid", ImVec2(btn_w, btn_h))) {
 			if (popup_addr)
-				decompiler_engine::decompile_function_hybrid(popup_addr, get_standalone_settings());
+				decompiler_engine::decompile_function_hybrid(popup_addr, g_sa_settings);
 			globals::ui::active_center_view = center_view_t::decompiler;
 			if (remember_choice) {
 				globals::ui::decompile_default_mode = 2;
@@ -858,7 +851,6 @@ void helpers::render_title()
 		ImGui::Spacing();
 		ImGui::Separator();
 
-		static bool remember_choice = false;
 		ImGui::Checkbox("Remember my choice", &remember_choice);
 
 		ImGui::SameLine();
@@ -3443,8 +3435,17 @@ void helpers::render_title()
 
 
 		{
-			bool scan_is_active = (globals::ui::active_center_view == center_view_t::memory_scanner);
-			const char* scan_label = "Scanner";
+			auto scv = globals::ui::active_center_view;
+			bool scan_is_active = (scv == center_view_t::scan_hub
+				|| scv == center_view_t::memory_scanner
+				|| scv == center_view_t::crypto_scanner
+				|| scv == center_view_t::aob_generator
+				|| scv == center_view_t::xref_browser
+				|| scv == center_view_t::snapshot_diff
+				|| scv == center_view_t::pointer_scanner
+				|| scv == center_view_t::decrypt_oracle
+				|| scv == center_view_t::integrity_hunter);
+			const char* scan_label = "Scan";
 			ImVec2 sts = ImGui::CalcTextSize(scan_label);
 			float stw = 10.f * 2.f + sts.x;
 
@@ -3475,12 +3476,13 @@ void helpers::render_title()
 					stab_col, scan_label);
 
 				if (stab_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-					globals::ui::active_center_view = center_view_t::memory_scanner;
+					globals::ui::active_center_view = center_view_t::scan_hub;
 				}
 			}
 		}
 
 
+		float dtx0 = 0.f;
 		{
 			bool dbg_is_active = (globals::ui::active_center_view == center_view_t::debugger_view);
 			const char* dbg_label = "Debugger";
@@ -3489,10 +3491,10 @@ void helpers::render_title()
 
 			float net_tw = 10.f * 2.f + ImGui::CalcTextSize("Network").x;
 			float net_x0 = rbtn_x0 - net_tw - 8.f;
-			float scan_tw = 10.f * 2.f + ImGui::CalcTextSize("Scanner").x;
+			float scan_tw = 10.f * 2.f + ImGui::CalcTextSize("Scan").x;
 			float scan_x0 = net_x0 - scan_tw - 6.f;
 			float tab_h_d = row_h - 2.f;
-			float dtx0 = scan_x0 - dtw - 6.f;
+			dtx0 = scan_x0 - dtw - 6.f;
 			float dtx1 = dtx0 + dtw;
 			float dty0 = r1_cy - tab_h_d * 0.5f;
 			float dty1 = dty0 + tab_h_d;
@@ -3523,8 +3525,23 @@ void helpers::render_title()
 
 
 		{
+			auto acv = globals::ui::active_center_view;
+
+			auto is_hub_active = [&](center_view_t hub) -> bool {
+				if (acv == hub) return true;
+				if (hub == center_view_t::types_hub)
+					return acv == center_view_t::struct_recon;
+				if (hub == center_view_t::analysis_hub)
+					return acv == center_view_t::symbolic_view
+						|| acv == center_view_t::taint_view
+						|| acv == center_view_t::deobfuscation_view
+						|| acv == center_view_t::stealth_view
+						|| acv == center_view_t::fuzzer_view;
+				return false;
+			};
+
 			auto add_right_tab = [&](const char* label, center_view_t view_id, float anchor_x0) {
-				bool is_active = (globals::ui::active_center_view == view_id);
+				bool is_active = (acv == view_id) || is_hub_active(view_id);
 				ImVec2 lsz = ImGui::CalcTextSize(label);
 				float tw = 10.f * 2.f + lsz.x;
 				float tx0 = anchor_x0 - tw - 6.f;
@@ -3553,18 +3570,8 @@ void helpers::render_title()
 
 			float anchor = dtx0;
 			anchor = add_right_tab("Decompiler", center_view_t::decompiler, anchor);
-			anchor = add_right_tab("Structs",    center_view_t::struct_recon, anchor);
-			anchor = add_right_tab("Crypto",     center_view_t::crypto_scanner, anchor);
-			anchor = add_right_tab("AOB",        center_view_t::aob_generator, anchor);
-			anchor = add_right_tab("Fuzzer",     center_view_t::fuzzer_view, anchor);
-			anchor = add_right_tab("XRefs",      center_view_t::xref_browser, anchor);
-			anchor = add_right_tab("Snapshots",  center_view_t::snapshot_diff, anchor);
-			anchor = add_right_tab("Pointers",   center_view_t::pointer_scanner, anchor);
-			anchor = add_right_tab("Decrypt",    center_view_t::decrypt_oracle, anchor);
-			anchor = add_right_tab("Integrity",  center_view_t::integrity_hunter, anchor);
-			anchor = add_right_tab("Symbolic",   center_view_t::symbolic_view, anchor);
-			anchor = add_right_tab("Taint",      center_view_t::taint_view, anchor);
-			anchor = add_right_tab("Deobfusc",   center_view_t::deobfuscation_view, anchor);
+			anchor = add_right_tab("Types",      center_view_t::types_hub, anchor);
+			anchor = add_right_tab("Analysis",   center_view_t::analysis_hub, anchor);
 		}
 
 		bool cf_clicked = ghost_btn("Choose File",
@@ -3732,11 +3739,6 @@ void helpers::render_title()
 		network_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
 	}
 
-	else if (cv == center_view_t::memory_scanner)
-	{
-		memory_scanner_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-	}
-
 	else if (cv == center_view_t::debugger_view)
 	{
 		debugger_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
@@ -3747,64 +3749,25 @@ void helpers::render_title()
 		decompiler_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
 	}
 
-	else if (cv == center_view_t::struct_recon)
+	else if (cv == center_view_t::scan_hub || cv == center_view_t::memory_scanner
+		|| cv == center_view_t::crypto_scanner || cv == center_view_t::aob_generator
+		|| cv == center_view_t::xref_browser || cv == center_view_t::snapshot_diff
+		|| cv == center_view_t::pointer_scanner || cv == center_view_t::decrypt_oracle
+		|| cv == center_view_t::integrity_hunter)
 	{
-		struct_recon_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		scan_hub_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
 	}
 
-	else if (cv == center_view_t::crypto_scanner)
+	else if (cv == center_view_t::types_hub || cv == center_view_t::struct_recon)
 	{
-		crypto_scanner_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		types_hub_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
 	}
 
-	else if (cv == center_view_t::aob_generator)
+	else if (cv == center_view_t::analysis_hub || cv == center_view_t::symbolic_view
+		|| cv == center_view_t::taint_view || cv == center_view_t::deobfuscation_view
+		|| cv == center_view_t::stealth_view || cv == center_view_t::fuzzer_view)
 	{
-		aob_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-	}
-
-	else if (cv == center_view_t::fuzzer_view)
-	{
-		fuzzer_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-	}
-
-	else if (cv == center_view_t::xref_browser)
-	{
-		xref_db_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-	}
-
-	else if (cv == center_view_t::snapshot_diff)
-	{
-		snapshot_diff::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-	}
-
-	else if (cv == center_view_t::pointer_scanner)
-	{
-		pointer_scanner_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-	}
-
-	else if (cv == center_view_t::decrypt_oracle)
-	{
-		decrypt_oracle_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-	}
-
-	else if (cv == center_view_t::integrity_hunter)
-	{
-		integrity_hunter_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-	}
-
-	else if (cv == center_view_t::symbolic_view)
-	{
-		symbolic_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-	}
-
-	else if (cv == center_view_t::taint_view)
-	{
-		taint_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-	}
-
-	else if (cv == center_view_t::deobfuscation_view)
-	{
-		deobfuscation_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		analysis_hub_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
 	}
 
 	else
@@ -6066,29 +6029,33 @@ void helpers::render_title()
 
 				if (do_attach && can_attach) {
 					auto& p = pa_proc_list[pa_selected];
-					driver_bridge::attach(p.pid);
-
-					auto modules = driver_bridge::enumerate_modules();
-					if (!modules.empty()) {
-						const auto* target_mod = &modules[0];
-						for (const auto& m : modules) {
-							std::string mn = m.name;
-							for (auto& c : mn) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-							std::string pn = p.name;
-							for (auto& c : pn) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-							if (mn == pn) { target_mod = &m; break; }
-						}
-						uint64_t mod_size = target_mod->size;
-						if (mod_size == 0) mod_size = 0x100000;
-						disasm::start_live(g_disasm, p.pid, target_mod->base, mod_size, target_mod->name);
-						globals::ui::active_center_view = center_view_t::disassembly;
-					} else {
-						g_disasm.file = DisasmFile{};
+					if (!driver_bridge::attach(p.pid)) {
 						output_log::push(bottom_tab_t::output,
-							"[Driver] Attached to PID " + std::to_string(p.pid) + " but could not enumerate modules.\n");
+							"[Driver] Failed to attach to PID " + std::to_string(p.pid) + ": " +
+							driver_bridge::last_error() + "\n");
+						pa_closing = true;
+					} else {
+						auto modules = driver_bridge::enumerate_modules();
+						if (!modules.empty()) {
+							const auto* target_mod = &modules[0];
+							for (const auto& m : modules) {
+								std::string mn = m.name;
+								for (auto& c : mn) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+								std::string pn = p.name;
+								for (auto& c : pn) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+								if (mn == pn) { target_mod = &m; break; }
+							}
+							uint64_t mod_size = target_mod->size;
+							if (mod_size == 0) mod_size = 0x100000;
+							disasm::start_live(g_disasm, p.pid, target_mod->base, mod_size, target_mod->name);
+							globals::ui::active_center_view = center_view_t::disassembly;
+						} else {
+							g_disasm.file = DisasmFile{};
+							output_log::push(bottom_tab_t::output,
+								"[Driver] Attached to PID " + std::to_string(p.pid) + " but could not enumerate modules.\n");
+						}
+						pa_closing = true;
 					}
-
-					pa_closing = true;
 				}
 			}
 			ImGui::EndChild();

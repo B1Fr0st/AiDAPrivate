@@ -2,6 +2,7 @@
 
 #include "symbolic_engine.hpp"
 #include "deobfuscation_engine.hpp"
+#include "ui_anim.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
 
@@ -23,8 +24,13 @@ struct local_state_t {
 	int selected_trace_row = -1;
 	int selected_expr_row = -1;
 	float trace_scroll_y = 0.f;
+	float target_trace_scroll_y = 0.f;
 	float expr_scroll_y = 0.f;
+	float target_expr_scroll_y = 0.f;
 	int active_tab = 0;
+	bool scrollbar_dragging = false;
+	float scrollbar_drag_offset = 0.f;
+	float anim_time = 0.f;
 	bool show_junk = true;
 	bool show_tainted_only = false;
 
@@ -111,8 +117,15 @@ inline void start_solve(local_state_t& st) {
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float accent_r, float accent_g, float accent_b)
 {
+	ImGui::BeginChild("##symbolic_view", ImVec2(width, height), false,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 	auto* dl = ImGui::GetWindowDrawList();
+	ImVec2 wp = ImGui::GetWindowPos();
+	float ox = wp.x;
+	float oy = wp.y;
 	auto& st = s_state;
+	float dt = ImGui::GetIO().DeltaTime;
+	st.anim_time += dt;
 
 	const ImU32 bg        = IM_COL32(30, 30, 30, static_cast<int>(alpha * 255));
 	const ImU32 text_col  = IM_COL32(212, 212, 212, static_cast<int>(alpha * 255));
@@ -130,9 +143,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const ImU32 green_col = IM_COL32(152, 195, 121, static_cast<int>(alpha * 255));
 	const ImU32 warn_col  = IM_COL32(229, 192, 123, static_cast<int>(alpha * 255));
 
-	ImVec2 wpos = ImGui::GetWindowPos();
-	float cx = wpos.x + pos_x;
-	float cy = wpos.y + pos_y;
+	float cx = ox;
+	float cy = oy;
 
 	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + width, cy + height), bg);
 
@@ -241,6 +253,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImGui::PushStyleColor(ImGuiCol_PlotHistogram, accent);
 			ImGui::ProgressBar(frac, ImVec2(200.f, 20.f));
 			ImGui::PopStyleColor();
+		} else {
+			ui_anim::render_spinner(dl, cx + pad + btn_w * 4 + 70.f, btn_row_y + 14.f, 7.f, 2.f, accent, st.anim_time);
 		}
 	}
 
@@ -293,15 +307,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		ImGui::SetCursorScreenPos(ImVec2(cx, list_y));
 		ImGui::InvisibleButton("##sym_trace_scroll", ImVec2(width, list_h));
-		if (ImGui::IsItemHovered()) {
-			st.trace_scroll_y -= ImGui::GetIO().MouseWheel * row_h * 3.f;
-		}
 
 		auto& trace = res.trace;
 		int total = static_cast<int>(trace.size());
-		if (st.trace_scroll_y < 0.f) st.trace_scroll_y = 0.f;
 		float max_scroll = (std::max)(0.f, static_cast<float>(total - visible_rows) * row_h);
-		if (st.trace_scroll_y > max_scroll) st.trace_scroll_y = max_scroll;
+		if (ImGui::IsItemHovered())
+			ui_anim::handle_scroll_input(st.target_trace_scroll_y, 0.f, max_scroll, row_h);
+		ui_anim::smooth_scroll(st.trace_scroll_y, st.target_trace_scroll_y, 12.f, dt);
 
 		int start_row = static_cast<int>(st.trace_scroll_y / row_h);
 		ImGui::PushClipRect(ImVec2(cx, list_y), ImVec2(cx + width, list_y + list_h), true);
@@ -354,6 +366,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		ImGui::PopClipRect();
 
+		ui_anim::render_custom_scrollbar(dl, cx + width - 8.f, list_y, 6.f, list_h,
+			st.trace_scroll_y, static_cast<float>(total) * row_h, list_h,
+			alpha, st.scrollbar_dragging, st.scrollbar_drag_offset);
+
 		dl->AddText(ImVec2(cx + pad, list_y + list_h - 16.f), dim_col,
 			(std::to_string(res.total_instructions) + " insns | " +
 			 std::to_string(res.tainted_count) + " tainted | " +
@@ -396,12 +412,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 			ImGui::SetCursorScreenPos(ImVec2(cx, list_y2));
 			ImGui::InvisibleButton("##deob_scroll", ImVec2(width, list_h2));
-			if (ImGui::IsItemHovered()) {
-				st.expr_scroll_y -= ImGui::GetIO().MouseWheel * row_h * 3.f;
-			}
-			if (st.expr_scroll_y < 0.f) st.expr_scroll_y = 0.f;
 			float max_s = (std::max)(0.f, static_cast<float>(total - visible) * row_h);
-			if (st.expr_scroll_y > max_s) st.expr_scroll_y = max_s;
+			if (ImGui::IsItemHovered())
+				ui_anim::handle_scroll_input(st.target_expr_scroll_y, 0.f, max_s, row_h);
+			ui_anim::smooth_scroll(st.expr_scroll_y, st.target_expr_scroll_y, 12.f, dt);
 
 			int start = static_cast<int>(st.expr_scroll_y / row_h);
 			ImGui::PushClipRect(ImVec2(cx, list_y2), ImVec2(cx + width, list_y2 + list_h2), true);
@@ -431,6 +445,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 
 			ImGui::PopClipRect();
+
+			ui_anim::render_custom_scrollbar(dl, cx + width - 8.f, list_y2, 6.f, list_h2,
+				st.expr_scroll_y, static_cast<float>(total) * row_h, list_h2,
+				alpha, st.scrollbar_dragging, st.scrollbar_drag_offset);
 		}
 	}
 
@@ -523,6 +541,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			dl->AddText(ImVec2(cx + pad, ty), dim_col, "Select an instruction from the Trace tab to view its symbolic state");
 		}
 	}
+	ImGui::EndChild();
 }
 
 }

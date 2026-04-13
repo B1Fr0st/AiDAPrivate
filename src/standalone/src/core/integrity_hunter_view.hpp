@@ -1,6 +1,7 @@
 #pragma once
 
 #include "integrity_hunter.hpp"
+#include "ui_anim.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
 
@@ -17,6 +18,9 @@ struct local_state_t {
 	int   selected_node = -1;
 	bool  show_event_log = false;
 	float log_scroll_y = 0.f;
+	bool  scrollbar_dragging = false;
+	float scrollbar_drag_offset = 0.f;
+	float anim_time = 0.f;
 };
 
 static local_state_t s_state;
@@ -24,9 +28,18 @@ static local_state_t s_state;
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float accent_r, float accent_g, float accent_b)
 {
+	ImGui::BeginChild("##integrity_hunter_view", ImVec2(width, height), false,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 	auto* dl = ImGui::GetWindowDrawList();
 	auto& st = s_state;
 	auto& ih = integrity_hunter::g_state;
+
+	ImVec2 wp = ImGui::GetWindowPos();
+	float cx = wp.x;
+	float cy = wp.y;
+
+	st.anim_time += ImGui::GetIO().DeltaTime;
+	float dt = ImGui::GetIO().DeltaTime;
 
 	const ImU32 bg        = IM_COL32(30, 30, 30, static_cast<int>(alpha * 255));
 	const ImU32 text_col  = IM_COL32(212, 212, 212, static_cast<int>(alpha * 255));
@@ -41,10 +54,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const ImU32 red_col   = IM_COL32(224, 108, 117, static_cast<int>(alpha * 255));
 	const ImU32 green_col = IM_COL32(152, 195, 121, static_cast<int>(alpha * 255));
 	const ImU32 yellow_col = IM_COL32(229, 192, 123, static_cast<int>(alpha * 255));
-
-	ImVec2 wpos = ImGui::GetWindowPos();
-	float cx = wpos.x + pos_x;
-	float cy = wpos.y + pos_y;
 
 	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + width, cy + height), bg);
 
@@ -179,9 +188,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	float max_scroll = (std::max)(0.f, static_cast<float>(total_rows) * row_h - (table_h - row_h));
-	if (st.target_scroll_y < 0.f) st.target_scroll_y = 0.f;
-	if (st.target_scroll_y > max_scroll) st.target_scroll_y = max_scroll;
-	st.scroll_y += (st.target_scroll_y - st.scroll_y) * 0.3f;
+	ui_anim::clamp_scroll(st.target_scroll_y, max_scroll);
+	ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, dt);
+	ui_anim::clamp_scroll(st.scroll_y, max_scroll);
 
 	int start_row = static_cast<int>(st.scroll_y / row_h);
 	if (start_row < 0) start_row = 0;
@@ -313,6 +322,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ey += log_row_h;
 		}
 	}
+
+	ui_anim::render_custom_scrollbar(dl, cx + width - 8.f, table_top + row_h, 6.f, table_h - row_h,
+		st.scroll_y, max_scroll, st.scrollbar_dragging, st.scrollbar_drag_offset,
+		accent, IM_COL32(60, 60, 60, static_cast<int>(alpha * 150)));
+
+	ImGui::EndChild();
 }
 
 }

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "standalone_ai_client.hpp"
+#include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
 
 #include <nlohmann/json.hpp>
@@ -378,12 +379,12 @@ inline void mutate_havoc(std::vector<uint8_t>& data, std::mt19937& rng, mutation
 		if (data.size() > 1) {
 			std::uniform_int_distribution<size_t> pos_dist(0, data.size() - 1);
 			size_t pos = pos_dist(rng);
-			std::uniform_int_distribution<uint8_t> val_dist(0, 255);
+			std::uniform_int_distribution<int> val_dist(0, 255);
 			mut.strategy = mutation_strategy_t::havoc;
 			mut.offset = pos;
 			mut.size = 1;
 			mut.original = {data[pos]};
-			data[pos] = val_dist(rng);
+			data[pos] = static_cast<uint8_t>(val_dist(rng));
 			mut.mutated = {data[pos]};
 		}
 		break;
@@ -811,8 +812,7 @@ inline void ai_analyze_crash(int crash_index)
 		          "5. Recommended fix\n"
 		          "Be concise but thorough.";
 
-		extern const settings_sa_t& get_standalone_settings();
-		auto ai = std::make_unique<standalone_ai_client_t>(get_standalone_settings());
+		auto ai = std::make_unique<standalone_ai_client_t>(g_sa_settings);
 		if (!ai->is_available()) {
 			g_state.analyzing_crash.store(false);
 			return;

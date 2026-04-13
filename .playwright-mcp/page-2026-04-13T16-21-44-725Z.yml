@@ -1,0 +1,2012 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - generic [ref=e5]:
+      - link "Perception AngelScript & Lua API" [ref=e7] [cursor=pointer]:
+        - /url: /perception-angel-script-api
+        - generic [ref=e8]: Perception AngelScript & Lua API
+      - generic [ref=e12]:
+        - img "search" [ref=e14]
+        - textbox "Search" [ref=e16]:
+          - /placeholder: Search…
+        - generic [ref=e18]:
+          - generic [ref=e20]: Ctrl
+          - generic [ref=e21]: k
+  - generic [ref=e23]:
+    - complementary [ref=e24]:
+      - generic [ref=e25]:
+        - generic [ref=e26]:
+          - list [ref=e28]:
+            - listitem [ref=e29]:
+              - link "Perception IDE chevron-right" [ref=e30] [cursor=pointer]:
+                - /url: /perception-angel-script-api
+                - text: Perception IDE
+                - button "chevron-right" [ref=e31]:
+                  - img "chevron-right" [ref=e32]
+              - list [ref=e35]:
+                - listitem [ref=e36]:
+                  - link "Extensions API" [ref=e37] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/perception-ide/extensions-api
+            - listitem [ref=e38]:
+              - link "Perception Analyzer" [ref=e39] [cursor=pointer]:
+                - /url: /perception-angel-script-api/perception-analyzer
+            - listitem [ref=e40]:
+              - generic [ref=e41]: LUA SCRIPT
+              - list [ref=e42]:
+                - listitem [ref=e43]:
+                  - link "Overview" [ref=e44] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/overview
+                - listitem [ref=e45]:
+                  - link "Life Cycle" [ref=e46] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/life-cycle
+                - listitem [ref=e47]:
+                  - link "Engine" [ref=e48] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/engine
+                - listitem [ref=e49]:
+                  - link "Render API" [ref=e50] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/render-api
+                - listitem [ref=e51]:
+                  - link "Input API" [ref=e52] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/input-api
+                - listitem [ref=e53]:
+                  - link "Proc API" [ref=e54] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/proc-api
+                - listitem [ref=e55]:
+                  - link "GUI API" [ref=e56] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/gui-api
+                - listitem [ref=e57]:
+                  - link "System API (CPU & Disassembly)" [ref=e58] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/system-api-cpu-and-disassembly
+                - listitem [ref=e59]:
+                  - link "Net API" [ref=e60] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/net-api
+                - listitem [ref=e61]:
+                  - link "File System" [ref=e62] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/file-system
+                - listitem [ref=e63]:
+                  - link "Extended Math API" [ref=e64] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/extended-math-api
+                - listitem [ref=e65]:
+                  - link "Win API" [ref=e66] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/win-api
+                - listitem [ref=e67]:
+                  - link "Engine Specific API" [ref=e68] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/engine-specific-api
+                - listitem [ref=e69]:
+                  - link "Json API" [ref=e70] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/json-api
+                - listitem [ref=e71]:
+                  - link "Utilities" [ref=e72] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/utilities
+                - listitem [ref=e73]:
+                  - link "Sound API" [ref=e74] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/sound-api
+                - listitem [ref=e75]:
+                  - link "CS2 Extended API" [ref=e76] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/cs2-extended-api
+                - listitem [ref=e77]:
+                  - link "Others" [ref=e78] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/lua-script/others
+            - listitem [ref=e79]:
+              - generic [ref=e80]: Angel Script
+              - list [ref=e81]:
+                - listitem [ref=e82]:
+                  - link "Overview" [ref=e83] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/overview
+                - listitem [ref=e84]:
+                  - link "Life Cycle" [ref=e85] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/life-cycle
+                - listitem [ref=e86]:
+                  - link "Engine" [ref=e87] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/engine
+                - listitem [ref=e88]:
+                  - link "Atomic Types" [ref=e89] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/atomic-types
+                - listitem [ref=e90]:
+                  - link "Unicorn" [ref=e91] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/unicorn
+                - listitem [ref=e92]:
+                  - link "Render API" [ref=e93] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/render-api
+                - listitem [ref=e94]:
+                  - link "Input API" [ref=e95] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/input-api
+                - listitem [ref=e96]:
+                  - link "Proc API" [ref=e97] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/proc-api
+                - listitem [ref=e98]:
+                  - link "Mutex API" [ref=e99] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/mutex-api
+                - listitem [ref=e100]:
+                  - link "GUI API" [ref=e101] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/gui-api
+                - listitem [ref=e102]:
+                  - link "System API (CPU & Disassembly)" [ref=e103] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/system-api-cpu-and-disassembly
+                - listitem [ref=e104]:
+                  - link "Net API" [ref=e105] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/net-api
+                - listitem [ref=e106]:
+                  - link "File System" [ref=e107] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/file-system
+                - listitem [ref=e108]:
+                  - link "Extended Math API" [ref=e109] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/extended-math-api
+                - listitem [ref=e110]:
+                  - link "Win API" [ref=e111] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/win-api
+                - listitem [ref=e112]:
+                  - link "Engine Specific API" [ref=e113] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/engine-specific-api
+                - listitem [ref=e114]:
+                  - link "Json API" [ref=e115] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/json-api
+                - listitem [ref=e116]:
+                  - link "Utilities" [ref=e117] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/utilities
+                - listitem [ref=e118]:
+                  - link "Zydis Encoder" [ref=e119] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/zydis-encoder
+                - listitem [ref=e120]:
+                  - link "Intrinsics" [ref=e121] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/intrinsics
+                - listitem [ref=e122]:
+                  - link "Sound API" [ref=e123] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/sound-api
+                - listitem [ref=e124]:
+                  - link "Bit Reinterpret Helpers" [ref=e125] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/bit-reinterpret-helpers
+                - listitem [ref=e126]:
+                  - link "CS2 Extended API" [ref=e127] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/cs2-extended-api
+                - listitem [ref=e128]:
+                  - link "Others" [ref=e129] [cursor=pointer]:
+                    - /url: /perception-angel-script-api/angel-script/others
+          - button "Scroll back":
+            - img "chevron-up"
+          - button "Scroll further":
+            - img "chevron-down"
+        - link "Powered by GitBook" [ref=e130] [cursor=pointer]:
+          - /url: https://www.gitbook.com/?utm_source=content&utm_medium=trademark&utm_campaign=yqdDE5brIYWRTIL9X3M4&utm_content=site_5j6D3
+          - img "gitbook" [ref=e131]
+          - generic [ref=e133]: Powered by GitBook
+    - main [ref=e136]:
+      - generic [ref=e137]:
+        - generic [ref=e139]:
+          - button "Copy page" [ref=e140] [cursor=pointer]:
+            - img "copy" [ref=e141]
+            - generic [ref=e143]: Copy
+          - button "More" [ref=e144] [cursor=pointer]:
+            - img "chevron-down" [ref=e145]
+        - heading "Perception IDE" [level=1] [ref=e147]
+        - paragraph [ref=e148]: Script Editor & AI Assistant
+      - generic [ref=e149]:
+        - paragraph [ref=e150]: Perception.cx ships with a fully integrated code editor and AI assistant. It's a native overlay panel — no Electron, no browser runtime. Write, test, and iterate on scripts without ever leaving the platform.
+        - paragraph [ref=e151]: AI chat connects to OpenAI-compatible endpoints, GitHub Models, and GitHub Copilot via OAuth — so your existing Copilot subscription works out of the box.
+        - separator [ref=e152]
+        - paragraph [ref=e173]:
+          - strong [ref=e174]: Editor
+        - paragraph [ref=e175]:
+          - strong [ref=e176]: Multi-Tab Editing
+        - paragraph [ref=e177]: Open as many files as you want. Drag tabs to reorder, middle-click or click the × to close. Each tab tracks its own undo history, cursor position, and unsaved state.
+        - paragraph [ref=e178]:
+          - strong [ref=e179]: Syntax Highlighting
+        - paragraph [ref=e180]: "17 languages are supported: AngelScript, Lua, C/C++, Rust, JavaScript, Python, PHP, HTML, XML, CSS, JSON, Shell, PowerShell, Batch, INI, Markdown, tsx, jsx, vue, go, cs, and log files."
+        - paragraph [ref=e181]:
+          - strong [ref=e182]: IntelliSense
+        - paragraph [ref=e183]:
+          - text: Full autocompletion for the Perception.cx API surface in both AngelScript and Lua. Includes function signatures, parameter hints, type info, and namespace-aware resolution (e.g.
+          - code [ref=e184]: sdk::player_t
+          - text: resolves correctly). Trigger manually with
+          - strong [ref=e185]: Ctrl+Space
+          - text: or let it appear automatically as you type.
+        - paragraph [ref=e186]:
+          - strong [ref=e187]: Find & Replace
+        - paragraph [ref=e188]:
+          - text: Open with
+          - strong [ref=e189]: Ctrl+F
+          - text: (find) or
+          - strong [ref=e190]: Ctrl+H
+          - text: (find & replace). Supports regex, case sensitivity, and whole-word matching. Navigate matches with Enter/Shift+Enter or the arrow buttons.
+        - paragraph [ref=e191]:
+          - strong [ref=e192]: Line Operations
+        - list [ref=e193]:
+          - listitem [ref=e194]:
+            - generic [ref=e196]: •
+            - paragraph [ref=e198]:
+              - strong [ref=e199]: Ctrl+D
+              - text: — Duplicate line or selection
+          - listitem [ref=e200]:
+            - generic [ref=e202]: •
+            - paragraph [ref=e204]:
+              - strong [ref=e205]: Ctrl+/
+              - text: — Toggle line comment
+          - listitem [ref=e206]:
+            - generic [ref=e208]: •
+            - paragraph [ref=e210]:
+              - strong [ref=e211]: Tab / Shift+Tab
+              - text: — Indent / unindent selection
+          - listitem [ref=e212]:
+            - generic [ref=e214]: •
+            - paragraph [ref=e216]:
+              - strong [ref=e217]: Ctrl+A
+              - text: — Select all
+          - listitem [ref=e218]:
+            - generic [ref=e220]: •
+            - paragraph [ref=e222]:
+              - text: "Standard clipboard:"
+              - strong [ref=e223]: Ctrl+C
+              - text: ","
+              - strong [ref=e224]: Ctrl+X
+              - text: ","
+              - strong [ref=e225]: Ctrl+V
+        - paragraph [ref=e226]:
+          - text: Undo (
+          - strong [ref=e227]: Ctrl+Z
+          - text: ) and Redo (
+          - strong [ref=e228]: Ctrl+Y
+          - text: ) use coalesced history — fast typing gets grouped into single undo steps.
+        - paragraph [ref=e229]:
+          - strong [ref=e230]: Font Scaling
+        - paragraph [ref=e231]:
+          - strong [ref=e232]: Ctrl+Scroll
+          - text: to zoom the editor font in or out.
+        - separator [ref=e233]
+        - paragraph [ref=e234]:
+          - strong [ref=e235]: Sidebar
+        - paragraph [ref=e236]: "The left sidebar has six tabs accessible via the activity bar icons:"
+        - list [ref=e237]:
+          - listitem [ref=e238]:
+            - generic [ref=e240]: •
+            - paragraph [ref=e242]:
+              - strong [ref=e243]: Explorer
+              - text: — project file tree
+          - listitem [ref=e244]:
+            - generic [ref=e246]: •
+            - paragraph [ref=e248]:
+              - strong [ref=e249]: Chat
+              - text: — AI chat panel
+          - listitem [ref=e250]:
+            - generic [ref=e252]: •
+            - paragraph [ref=e254]:
+              - strong [ref=e255]: Settings
+              - text: — editor configuration
+          - listitem [ref=e256]:
+            - generic [ref=e258]: •
+            - paragraph [ref=e260]:
+              - strong [ref=e261]: Timeline
+              - text: — file backup history and diff viewer
+          - listitem [ref=e262]:
+            - generic [ref=e264]: •
+            - paragraph [ref=e266]:
+              - strong [ref=e267]: Extensions
+              - text: — manage loaded extensions
+        - separator [ref=e268]
+        - paragraph [ref=e269]:
+          - strong [ref=e270]: File Explorer
+        - paragraph [ref=e271]: "The left sidebar shows your project's file tree with expand/collapse for folders. Right-click any item to access the context menu:"
+        - list [ref=e272]:
+          - listitem [ref=e273]:
+            - generic [ref=e275]: •
+            - paragraph [ref=e277]:
+              - strong [ref=e278]: New File
+              - text: — create a file in the selected directory
+          - listitem [ref=e279]:
+            - generic [ref=e281]: •
+            - paragraph [ref=e283]:
+              - strong [ref=e284]: New Folder
+              - text: — create a subdirectory
+          - listitem [ref=e285]:
+            - generic [ref=e287]: •
+            - paragraph [ref=e289]:
+              - strong [ref=e290]: Rename
+              - text: — rename the selected file or folder
+          - listitem [ref=e291]:
+            - generic [ref=e293]: •
+            - paragraph [ref=e295]:
+              - strong [ref=e296]: Delete
+              - text: — remove the selected item
+          - listitem [ref=e297]:
+            - generic [ref=e299]: •
+            - paragraph [ref=e301]:
+              - strong [ref=e302]: AI Root
+              - text: — set or remove the selected folder as an AI Root (see
+              - strong [ref=e303]: AI Root
+              - text: below)
+        - paragraph [ref=e304]:
+          - strong [ref=e305]: Workspace Folders
+        - paragraph [ref=e306]:
+          - text: You can add additional folders to your workspace from
+          - strong [ref=e307]: Settings → Project → Workspace Folders
+          - text: . These appear alongside the root directory in the Explorer and are included in cross-project operations like
+          - code [ref=e308]: find_references
+          - text: . Click
+          - strong [ref=e309]: Add Folder
+          - text: to browse, and
+          - strong [ref=e310]: ×
+          - text: to remove. Workspace folders persist across sessions.
+        - separator [ref=e311]
+        - paragraph [ref=e312]:
+          - strong [ref=e313]: Script Toolbar
+        - paragraph [ref=e314]: "The toolbar across the top of the editor provides one-click access to the script lifecycle:"
+        - generic [ref=e317]:
+          - rowgroup [ref=e318]:
+            - row "Button Action" [ref=e319]:
+              - columnheader "Button" [ref=e320]
+              - columnheader "Action" [ref=e321]
+          - table [ref=e322]:
+            - rowgroup [ref=e323]:
+              - row "Execute Compile and run the current script immediately" [ref=e324]:
+                - cell "Execute" [ref=e325]:
+                  - paragraph [ref=e327]:
+                    - strong [ref=e328]: Execute
+                - cell "Compile and run the current script immediately" [ref=e329]:
+                  - paragraph [ref=e331]: Compile and run the current script immediately
+              - row "Reload Hot-reload a running script without restarting" [ref=e332]:
+                - cell "Reload" [ref=e333]:
+                  - paragraph [ref=e335]:
+                    - strong [ref=e336]: Reload
+                - cell "Hot-reload a running script without restarting" [ref=e337]:
+                  - paragraph [ref=e339]: Hot-reload a running script without restarting
+              - row "Unload Stop and unload the script cleanly" [ref=e340]:
+                - cell "Unload" [ref=e341]:
+                  - paragraph [ref=e343]:
+                    - strong [ref=e344]: Unload
+                - cell "Stop and unload the script cleanly" [ref=e345]:
+                  - paragraph [ref=e347]: Stop and unload the script cleanly
+              - row "Verify Compile-check only (no execution) — shows errors with line numbers" [ref=e348]:
+                - cell "Verify" [ref=e349]:
+                  - paragraph [ref=e351]:
+                    - strong [ref=e352]: Verify
+                - cell "Compile-check only (no execution) — shows errors with line numbers" [ref=e353]:
+                  - paragraph [ref=e355]: Compile-check only (no execution) — shows errors with line numbers
+              - 'row "Bundle Resolve all #include directives into a single merged output file" [ref=e356]':
+                - cell "Bundle" [ref=e357]:
+                  - paragraph [ref=e359]:
+                    - strong [ref=e360]: Bundle
+                - 'cell "Resolve all #include directives into a single merged output file" [ref=e361]':
+                  - paragraph [ref=e363]:
+                    - text: Resolve all
+                    - code [ref=e364]: "#include"
+                    - text: directives into a single merged output file
+        - paragraph [ref=e365]:
+          - text: The
+          - strong [ref=e366]: Bundle
+          - text: button uses the built-in
+          - code [ref=e367]: "#include"
+          - text: resolver by default. You can replace it with a custom build command using
+          - strong [ref=e368]: Custom Commands
+          - text: .
+        - separator [ref=e369]
+        - paragraph [ref=e370]:
+          - strong [ref=e371]: Integrated Terminal
+        - paragraph [ref=e372]:
+          - text: A built-in
+          - code [ref=e373]: cmd.exe
+          - text: terminal lives at the bottom of the editor. Toggle it with
+          - strong [ref=e374]: "Ctrl+`"
+          - text: .
+        - paragraph [ref=e375]:
+          - strong [ref=e376]: Terminal Tabs
+        - paragraph [ref=e377]:
+          - text: The terminal supports up to
+          - strong [ref=e378]: 8 independent tabs
+          - text: ", each running its own"
+          - code [ref=e379]: cmd.exe
+          - text: process with a separate output buffer, scroll position, and command history.
+        - list [ref=e380]:
+          - listitem [ref=e381]:
+            - generic [ref=e383]: •
+            - paragraph [ref=e385]:
+              - text: Click
+              - strong [ref=e386]: +
+              - text: to open a new tab
+          - listitem [ref=e387]:
+            - generic [ref=e389]: •
+            - paragraph [ref=e391]: Click a tab to switch to it
+          - listitem [ref=e392]:
+            - generic [ref=e394]: •
+            - paragraph [ref=e396]:
+              - text: Click
+              - strong [ref=e397]: ×
+              - text: on a tab to close it (at least one tab is always kept)
+          - listitem [ref=e398]:
+            - generic [ref=e400]: •
+            - paragraph [ref=e402]: "Each tab shows a colored status dot: green = alive, red = process exited"
+        - paragraph [ref=e403]:
+          - strong [ref=e404]: Terminal Shortcuts
+        - generic [ref=e407]:
+          - rowgroup [ref=e408]:
+            - row "Key Action" [ref=e409]:
+              - columnheader "Key" [ref=e410]
+              - columnheader "Action" [ref=e411]
+          - table [ref=e412]:
+            - rowgroup [ref=e413]:
+              - 'row "Ctrl+` Expand / collapse terminal" [ref=e414]':
+                - 'cell "Ctrl+`" [ref=e415]':
+                  - paragraph [ref=e417]:
+                    - strong [ref=e418]: "Ctrl+`"
+                - cell "Expand / collapse terminal" [ref=e419]:
+                  - paragraph [ref=e421]: Expand / collapse terminal
+              - row "Ctrl+L Clear terminal output" [ref=e422]:
+                - cell "Ctrl+L" [ref=e423]:
+                  - paragraph [ref=e425]:
+                    - strong [ref=e426]: Ctrl+L
+                - cell "Clear terminal output" [ref=e427]:
+                  - paragraph [ref=e429]: Clear terminal output
+              - row "Up / Down Navigate command history" [ref=e430]:
+                - cell "Up / Down" [ref=e431]:
+                  - paragraph [ref=e433]:
+                    - strong [ref=e434]: Up / Down
+                - cell "Navigate command history" [ref=e435]:
+                  - paragraph [ref=e437]: Navigate command history
+              - row "Ctrl+C Send interrupt signal to process" [ref=e438]:
+                - cell "Ctrl+C" [ref=e439]:
+                  - paragraph [ref=e441]:
+                    - strong [ref=e442]: Ctrl+C
+                - cell "Send interrupt signal to process" [ref=e443]:
+                  - paragraph [ref=e445]: Send interrupt signal to process
+              - row "Esc Return keyboard focus to editor" [ref=e446]:
+                - cell "Esc" [ref=e447]:
+                  - paragraph [ref=e449]:
+                    - strong [ref=e450]: Esc
+                - cell "Return keyboard focus to editor" [ref=e451]:
+                  - paragraph [ref=e453]: Return keyboard focus to editor
+        - blockquote [ref=e454]:
+          - paragraph [ref=e455]:
+            - strong [ref=e456]: "AI integration:"
+            - text: When the AI runs shell commands, they always execute in the
+            - strong [ref=e457]: active terminal tab
+            - text: . You can dedicate one tab for AI operations and keep another for manual commands.
+        - separator [ref=e458]
+        - paragraph [ref=e459]:
+          - strong [ref=e460]: AI Chat
+        - paragraph [ref=e461]: The editor includes a full AI chat panel with built-in support for three API providers, plus any custom OpenAI-compatible endpoint.
+        - paragraph [ref=e462]:
+          - strong [ref=e463]: Providers
+        - paragraph [ref=e464]:
+          - text: The
+          - strong [ref=e465]: Settings → Chatbot → Provider
+          - text: section lets you choose between three provider modes. Each provider has completely independent settings — switching providers never overwrites another provider's configuration.
+        - list [ref=e466]:
+          - listitem [ref=e467]:
+            - generic [ref=e469]: •
+            - paragraph [ref=e471]:
+              - strong [ref=e472]: Default
+              - text: — connect to any OpenAI-compatible API endpoint. Enter a URL, API key, and model name manually. Works with OpenRouter, LM Studio, Ollama, Together, Groq, or any cloud/local provider that speaks the standard chat completions format
+          - listitem [ref=e473]:
+            - generic [ref=e475]: •
+            - paragraph [ref=e477]:
+              - strong [ref=e478]: GitHub Models
+              - text: — connect to GitHub's inference API at
+              - code [ref=e479]: models.github.ai
+              - text: . Enter a GitHub Personal Access Token (PAT) with
+              - code [ref=e480]: models:read
+              - text: scope, then click
+              - strong [ref=e481]: Fetch Models
+              - text: to populate the model list from the catalog. Free tier has strict rate limits (50 req/day, 4K input tokens on most models) — enable paid billing in GitHub settings for production-grade limits
+          - listitem [ref=e482]:
+            - generic [ref=e484]: •
+            - paragraph [ref=e486]:
+              - strong [ref=e487]: Copilot
+              - text: — connect to the GitHub Copilot API at
+              - code [ref=e488]: api.githubcopilot.com
+              - text: using your existing Copilot subscription (Pro, Pro+, Business, or Enterprise). Click
+              - strong [ref=e489]: Sign in with GitHub
+              - text: to authenticate via OAuth device flow — the editor opens your browser, you enter the code shown, and the token is saved automatically. Then click
+              - strong [ref=e490]: Fetch Models
+              - text: to get available models. Uses your Copilot subscription's rate limits and premium request allowance — no separate billing needed
+        - paragraph [ref=e491]:
+          - strong [ref=e492]: Getting Started
+        - list [ref=e493]:
+          - listitem [ref=e494]:
+            - generic [ref=e496]: "1."
+            - paragraph [ref=e498]:
+              - text: Open the
+              - strong [ref=e499]: Settings
+              - text: sidebar (gear icon)
+          - listitem [ref=e500]:
+            - generic [ref=e502]: "2."
+            - paragraph [ref=e504]:
+              - text: Under
+              - strong [ref=e505]: Chatbot
+              - text: ", choose a"
+              - strong [ref=e506]: Provider
+              - text: (Default, GitHub, or Copilot)
+          - listitem [ref=e507]:
+            - generic [ref=e509]: "3."
+            - paragraph [ref=e511]:
+              - strong [ref=e512]: Default
+              - text: ": enter your endpoint"
+              - strong [ref=e513]: URL
+              - text: ","
+              - strong [ref=e514]: API Key
+              - text: ", and add a model to the"
+              - strong [ref=e515]: Planning / Reasoning
+              - text: list
+          - listitem [ref=e516]:
+            - generic [ref=e518]: "4."
+            - paragraph [ref=e520]:
+              - strong [ref=e521]: GitHub
+              - text: ": paste your PAT in the"
+              - strong [ref=e522]: GitHub Token
+              - text: field, click
+              - strong [ref=e523]: Fetch Models
+              - text: ", then select a model from the dropdown"
+          - listitem [ref=e524]:
+            - generic [ref=e526]: "5."
+            - paragraph [ref=e528]:
+              - strong [ref=e529]: Copilot
+              - text: ": click"
+              - strong [ref=e530]: Sign in with GitHub
+              - text: ", complete the OAuth flow in your browser, then click"
+              - strong [ref=e531]: Fetch Models
+              - text: and select a model
+          - listitem [ref=e532]:
+            - generic [ref=e534]: "6."
+            - paragraph [ref=e536]:
+              - text: Optionally configure an
+              - strong [ref=e537]: Implementation / Coder
+              - text: model for tandem mode (see
+              - strong [ref=e538]: Tandem AI
+              - text: )
+          - listitem [ref=e539]:
+            - generic [ref=e541]: "7."
+            - paragraph [ref=e543]:
+              - text: Open the
+              - strong [ref=e544]: Chat
+              - text: sidebar tab and start typing
+        - paragraph [ref=e545]: You can configure multiple endpoints and switch between them from the dropdown at the top of the chat panel.
+        - paragraph [ref=e546]:
+          - strong [ref=e547]: Model Selection
+        - paragraph [ref=e548]: "Each provider maintains its own model lists for planning and coder roles. Models can be managed in two ways:"
+        - list [ref=e549]:
+          - listitem [ref=e550]:
+            - generic [ref=e552]: •
+            - paragraph [ref=e554]:
+              - strong [ref=e555]: Manual entry
+              - text: (Default provider) — click
+              - strong [ref=e556]: + Add Model
+              - text: in the settings model list, enter a display name and model ID
+          - listitem [ref=e557]:
+            - generic [ref=e559]: •
+            - paragraph [ref=e561]:
+              - strong [ref=e562]: Catalog fetch
+              - text: (GitHub / Copilot) — click
+              - strong [ref=e563]: Fetch Models
+              - text: to pull all available models from the API. The model list populates automatically
+        - paragraph [ref=e564]:
+          - text: Select your active model from the
+          - strong [ref=e565]: filterable dropdown
+          - text: at the bottom of the chat panel. Type to search, scroll with the mouse wheel, and click to select. Both planner and coder dropdowns support filtering and scrolling.
+        - paragraph [ref=e566]:
+          - strong [ref=e567]: Chat Features
+        - list [ref=e568]:
+          - listitem [ref=e569]:
+            - generic [ref=e571]: •
+            - paragraph [ref=e573]:
+              - strong [ref=e574]: Streaming responses
+              - text: with real-time token usage display in the header bar
+          - listitem [ref=e575]:
+            - generic [ref=e577]: •
+            - paragraph [ref=e579]:
+              - strong [ref=e580]: Live generation stats
+              - text: — while streaming, an animated spinner shows alongside the current speed (
+              - code [ref=e581]: ~35 tok/s · 1.3s
+              - text: ). After completion, final stats persist below each assistant message (
+              - code [ref=e582]: 456 tokens · 99.1 tok/s · 4.6s
+              - text: ) using the accurate token count from the API's usage response
+          - listitem [ref=e583]:
+            - generic [ref=e585]: •
+            - paragraph [ref=e587]:
+              - strong [ref=e588]: Auto-continue
+              - text: — if the model hits its max output token limit mid-response, the editor automatically sends a "Continue" message and resumes streaming. This repeats up to 5 times per user turn, so long analysis sessions (e.g. multi-step reverse engineering) don't require manual intervention
+          - listitem [ref=e589]:
+            - generic [ref=e591]: •
+            - paragraph [ref=e593]:
+              - strong [ref=e594]: Full markdown rendering
+              - text: — headings, bold/italic, inline code, fenced code blocks with syntax highlighting, tables with word-wrapped cells and per-cell clipping, horizontal rules, lists, and blockquotes
+          - listitem [ref=e595]:
+            - generic [ref=e597]: •
+            - paragraph [ref=e599]:
+              - strong [ref=e600]: Thinking / reasoning
+              - text: — models that output reasoning tokens get collapsible "Thinking" blocks. When collapsed, an auto-generated summary appears (e.g. "Read 3 files, edited 2 files"). Non-thinking models work normally without the thinking block
+          - listitem [ref=e601]:
+            - generic [ref=e603]: •
+            - generic [ref=e604]:
+              - paragraph [ref=e605]:
+                - strong [ref=e606]: Conversation management
+                - text: "— the dropdown menu offers:"
+              - list [ref=e607]:
+                - listitem [ref=e608]:
+                  - generic [ref=e610]: ◦
+                  - paragraph [ref=e612]:
+                    - strong [ref=e613]: New Chat
+                    - text: — start a fresh conversation
+                - listitem [ref=e614]:
+                  - generic [ref=e616]: ◦
+                  - paragraph [ref=e618]:
+                    - strong [ref=e619]: History
+                    - text: — browse and load previous chat sessions (tool call badges and results are fully preserved across save/load)
+                - listitem [ref=e620]:
+                  - generic [ref=e622]: ◦
+                  - paragraph [ref=e624]:
+                    - strong [ref=e625]: Clear
+                    - text: — wipe the current conversation
+                - listitem [ref=e626]:
+                  - generic [ref=e628]: ◦
+                  - paragraph [ref=e630]:
+                    - strong [ref=e631]: Summarize & Continue
+                    - text: — compress older messages to free up context space. Uses structured summaries that preserve goal, changes made, validation results, pending work, and key technical details
+          - listitem [ref=e632]:
+            - generic [ref=e634]: •
+            - paragraph [ref=e636]:
+              - strong [ref=e637]: Automatic context optimization
+              - text: — when the assistant fully completes a response (all tool loops finished, no pending follow-ups), older tool results and tool call arguments are automatically trimmed. Large file reads become one-line summaries (e.g.
+              - code [ref=e638]: "[Previously read 45 lines from foo.cpp]"
+              - text: ), write_file arguments are replaced with compact stubs, and RE tool outputs are condensed. Context is never trimmed mid-loop — the AI keeps full unmodified context for its entire working session
+          - listitem [ref=e639]:
+            - generic [ref=e641]: •
+            - paragraph [ref=e643]:
+              - strong [ref=e644]: Tandem AI
+              - text: — optionally use two models cooperatively. A planning model handles reasoning and architecture, a coder model handles implementation. See
+              - strong [ref=e645]: Tandem AI
+              - text: below
+          - listitem [ref=e646]:
+            - generic [ref=e648]: •
+            - paragraph [ref=e650]:
+              - strong [ref=e651]: Extra system prompt
+              - text: — add your own persistent instructions in the multiline text area at the bottom of the AI Chat settings section. These are injected into every API request
+          - listitem [ref=e652]:
+            - generic [ref=e654]: •
+            - paragraph [ref=e656]:
+              - strong [ref=e657]: Panel positioning
+              - text: — pin the chat panel on the left or right side of the editor via the
+              - strong [ref=e658]: AI Chat on Right Side
+              - text: checkbox
+        - paragraph [ref=e659]:
+          - strong [ref=e660]: Stopping a Response
+        - paragraph [ref=e661]:
+          - text: Click
+          - strong [ref=e662]: Stop
+          - text: or press
+          - strong [ref=e663]: Ctrl+C
+          - text: while the AI is streaming or running tools to cancel immediately. The Stop button appears in red during both streaming and tool execution (including long-running memory scans). You can then edit your message or send a new one without any issues.
+        - paragraph [ref=e664]:
+          - strong [ref=e665]: Text Selection in Chat
+        - paragraph [ref=e666]: "You can select and copy text from any message in the chat:"
+        - list [ref=e667]:
+          - listitem [ref=e668]:
+            - generic [ref=e670]: •
+            - paragraph [ref=e672]:
+              - strong [ref=e673]: Click and drag
+              - text: on any user or assistant message text to select a range
+          - listitem [ref=e674]:
+            - generic [ref=e676]: •
+            - paragraph [ref=e678]:
+              - strong [ref=e679]: Thinking blocks
+              - text: (when expanded) support independent text selection
+          - listitem [ref=e680]:
+            - generic [ref=e682]: •
+            - paragraph [ref=e684]:
+              - strong [ref=e685]: Ctrl+C
+              - text: copies the selected text, or the full hovered message if no selection exists
+          - listitem [ref=e686]:
+            - generic [ref=e688]: •
+            - paragraph [ref=e690]:
+              - text: The
+              - strong [ref=e691]: Copy
+              - text: button on assistant messages copies the full message content
+        - paragraph [ref=e692]:
+          - strong [ref=e693]: Web Search
+        - paragraph [ref=e694]:
+          - text: The AI can search the web for current information using the
+          - code [ref=e695]: web_search
+          - text: "tool. Two backends are supported:"
+        - list [ref=e696]:
+          - listitem [ref=e697]:
+            - generic [ref=e699]: •
+            - paragraph [ref=e701]:
+              - strong [ref=e702]: OpenRouter
+              - text: — if your active endpoint is on OpenRouter, web search works automatically with no additional configuration. It uses OpenRouter's web plugin which is powered by native search (for OpenAI, Anthropic, Perplexity, xAI models) or Exa for other models. OpenRouter charges $4 per 1000 results ($0.02 per request at default 5 results). For example,
+              - code [ref=e703]: openai/gpt-5.2:online
+              - text: works well as a search-capable model
+          - listitem [ref=e704]:
+            - generic [ref=e706]: •
+            - paragraph [ref=e708]:
+              - strong [ref=e709]: Brave Search
+              - text: — for non-OpenRouter endpoints, enter a Brave Search API key in Settings →
+              - strong [ref=e710]: Brave Search Key
+              - text: . Get a key at
+              - link "brave.com/search/apiarrow-up-right" [ref=e711] [cursor=pointer]:
+                - /url: https://brave.com/search/api/
+                - text: brave.com/search/api
+                - img "arrow-up-right" [ref=e712]
+        - paragraph [ref=e714]:
+          - text: Enable the
+          - strong [ref=e715]: Web Search
+          - text: toggle in Settings → Tools to make the tool available to the AI.
+        - separator [ref=e716]
+        - paragraph [ref=e717]:
+          - strong [ref=e718]: AI Code Fill
+        - paragraph [ref=e719]: Separate from the chat, the editor supports inline AI code completions — similar to Copilot but running on your own model.
+        - list [ref=e720]:
+          - listitem [ref=e721]:
+            - generic [ref=e723]: •
+            - paragraph [ref=e725]: Triggers automatically after a configurable delay while typing
+          - listitem [ref=e726]:
+            - generic [ref=e728]: •
+            - paragraph [ref=e730]:
+              - strong [ref=e731]: Ghost text
+              - text: appears inline in grey — press
+              - strong [ref=e732]: Tab
+              - text: to accept,
+              - strong [ref=e733]: Esc
+              - text: to dismiss
+          - listitem [ref=e734]:
+            - generic [ref=e736]: •
+            - paragraph [ref=e738]:
+              - text: Supports
+              - strong [ref=e739]: FIM (Fill-in-the-Middle)
+              - text: tokens for models like Qwen Coder
+          - listitem [ref=e740]:
+            - generic [ref=e742]: •
+            - paragraph [ref=e744]:
+              - text: Uses a
+              - strong [ref=e745]: separate endpoint, model, and API key
+              - text: from the chat — run a small fast model for completions and a larger model for chat
+          - listitem [ref=e746]:
+            - generic [ref=e748]: •
+            - paragraph [ref=e750]:
+              - text: Configurable
+              - strong [ref=e751]: context window
+              - text: (number of surrounding lines sent to the model)
+          - listitem [ref=e752]:
+            - generic [ref=e754]: •
+            - paragraph [ref=e756]: Platform API context is injected automatically so the model knows the Perception.cx API
+        - paragraph [ref=e757]:
+          - strong [ref=e758]: Code Fill Settings
+        - generic [ref=e761]:
+          - rowgroup [ref=e762]:
+            - row "Setting Description" [ref=e763]:
+              - columnheader "Setting" [ref=e764]
+              - columnheader "Description" [ref=e765]
+          - table [ref=e766]:
+            - rowgroup [ref=e767]:
+              - row "Enable Code Fills Master toggle" [ref=e768]:
+                - cell "Enable Code Fills" [ref=e769]:
+                  - paragraph [ref=e771]: Enable Code Fills
+                - cell "Master toggle" [ref=e772]:
+                  - paragraph [ref=e774]: Master toggle
+              - row "URL / Model / API Key Endpoint for completions (separate from chat)" [ref=e775]:
+                - cell "URL / Model / API Key" [ref=e776]:
+                  - paragraph [ref=e778]: URL / Model / API Key
+                - cell "Endpoint for completions (separate from chat)" [ref=e779]:
+                  - paragraph [ref=e781]: Endpoint for completions (separate from chat)
+              - row "Max Tokens Maximum completion length" [ref=e782]:
+                - cell "Max Tokens" [ref=e783]:
+                  - paragraph [ref=e785]: Max Tokens
+                - cell "Maximum completion length" [ref=e786]:
+                  - paragraph [ref=e788]: Maximum completion length
+              - row "Trigger Delay (ms) Idle time before requesting a completion" [ref=e789]:
+                - cell "Trigger Delay (ms)" [ref=e790]:
+                  - paragraph [ref=e792]: Trigger Delay (ms)
+                - cell "Idle time before requesting a completion" [ref=e793]:
+                  - paragraph [ref=e795]: Idle time before requesting a completion
+              - row "Context Lines Number of surrounding code lines to include" [ref=e796]:
+                - cell "Context Lines" [ref=e797]:
+                  - paragraph [ref=e799]: Context Lines
+                - cell "Number of surrounding code lines to include" [ref=e800]:
+                  - paragraph [ref=e802]: Number of surrounding code lines to include
+              - row "Use FIM Tokens Enable Fill-in-the-Middle token wrapping" [ref=e803]:
+                - cell "Use FIM Tokens" [ref=e804]:
+                  - paragraph [ref=e806]: Use FIM Tokens
+                - cell "Enable Fill-in-the-Middle token wrapping" [ref=e807]:
+                  - paragraph [ref=e809]: Enable Fill-in-the-Middle token wrapping
+              - row "FIM Prefix / Suffix / Middle Custom FIM token strings for your model" [ref=e810]:
+                - cell "FIM Prefix / Suffix / Middle" [ref=e811]:
+                  - paragraph [ref=e813]: FIM Prefix / Suffix / Middle
+                - cell "Custom FIM token strings for your model" [ref=e814]:
+                  - paragraph [ref=e816]: Custom FIM token strings for your model
+        - separator [ref=e817]
+        - paragraph [ref=e818]:
+          - strong [ref=e819]: Tandem AI
+        - paragraph [ref=e820]:
+          - text: Tandem AI lets two models cooperate on tasks — a
+          - strong [ref=e821]: Planning / Reasoning
+          - text: model handles analysis, architecture, and review while an
+          - strong [ref=e822]: Implementation / Coder
+          - text: model handles code writing, edits, and validation loops.
+        - paragraph [ref=e823]:
+          - strong [ref=e824]: How It Works
+        - paragraph [ref=e825]:
+          - text: The planner model starts every conversation. When it has a detailed plan ready, it calls the
+          - code [ref=e826]: switch_model
+          - text: tool to hand off to the coder. The coder implements the plan, validates the code, then switches back to the planner for review. The models self-route — no heuristic decides for them.
+        - paragraph [ref=e827]:
+          - text: Both models see the full conversation history, so handoff is seamless. The
+          - code [ref=e828]: switch_model
+          - text: tool call itself documents the transition in the message history.
+        - paragraph [ref=e829]:
+          - strong [ref=e830]: Setting Up
+        - list [ref=e831]:
+          - listitem [ref=e832]:
+            - generic [ref=e834]: "1."
+            - paragraph [ref=e836]:
+              - text: In
+              - strong [ref=e837]: Settings → Chatbot
+              - text: ", add your planning model to the"
+              - strong [ref=e838]: Planning / Reasoning
+              - text: model list (e.g.
+              - code [ref=e839]: anthropic/claude-sonnet-4
+              - text: )
+          - listitem [ref=e840]:
+            - generic [ref=e842]: "2."
+            - paragraph [ref=e844]:
+              - text: Add your coding model to the
+              - strong [ref=e845]: Implementation / Coder
+              - text: model list (e.g.
+              - code [ref=e846]: google/gemini-2.5-flash
+              - text: )
+          - listitem [ref=e847]:
+            - generic [ref=e849]: "3."
+            - paragraph [ref=e851]: Select the desired model from each dropdown at the bottom of the chat panel
+          - listitem [ref=e852]:
+            - generic [ref=e854]: "4."
+            - paragraph [ref=e856]:
+              - text: For the
+              - strong [ref=e857]: Default
+              - text: provider, you can optionally set a separate
+              - strong [ref=e858]: Coder URL
+              - text: and
+              - strong [ref=e859]: Coder API Key
+              - text: if the coder model runs on a different endpoint (e.g. planner on OpenRouter, coder on local Ollama). Leave these empty to use the planner's endpoint for both models
+        - paragraph [ref=e860]: Select "No Coder" in the coder dropdown to disable tandem and use a single model. If both dropdowns point to the same model name, tandem is also disabled automatically.
+        - paragraph [ref=e861]:
+          - strong [ref=e862]: Separate Endpoints (Default Provider Only)
+        - paragraph [ref=e863]: "By default, the coder uses the same URL and API key as the planner — just with a different model name in the request. If you want the coder to hit a completely different server:"
+        - list [ref=e864]:
+          - listitem [ref=e865]:
+            - generic [ref=e867]: •
+            - paragraph [ref=e869]:
+              - strong [ref=e870]: Coder URL
+              - text: — set a different API endpoint for the coder model
+          - listitem [ref=e871]:
+            - generic [ref=e873]: •
+            - paragraph [ref=e875]:
+              - strong [ref=e876]: Coder API Key
+              - text: — set a different API key for the coder model
+        - paragraph [ref=e877]: Leave these empty to use the planner's endpoint. These fields are only available on the Default provider — GitHub and Copilot providers use a single endpoint for all models.
+        - paragraph [ref=e878]:
+          - strong [ref=e879]: Tips
+        - list [ref=e880]:
+          - listitem [ref=e881]:
+            - generic [ref=e883]: •
+            - paragraph [ref=e885]: The planner sets the quality ceiling. A thorough plan with exact files, functions, and changes lets even a cheap coder model execute precisely
+          - listitem [ref=e886]:
+            - generic [ref=e888]: •
+            - paragraph [ref=e890]: Use a strong model for planning (Claude, GPT-4, etc.) and a fast/cheap model for coding (Gemini Flash, Qwen Coder, etc.) to balance quality and cost
+          - listitem [ref=e891]:
+            - generic [ref=e893]: •
+            - paragraph [ref=e895]: The planner is instructed to read code before planning, produce detailed plans with exact changes, and include edge cases and validation steps
+          - listitem [ref=e896]:
+            - generic [ref=e898]: •
+            - paragraph [ref=e900]: The coder is instructed to work autonomously through the full implementation and only switch back when done, when hitting an unplanned design decision, or after 5+ validation failures
+        - separator [ref=e901]
+        - paragraph [ref=e902]:
+          - strong [ref=e903]: AI Tool Use
+        - paragraph [ref=e904]:
+          - text: The AI doesn't just chat — it can take actions. When
+          - strong [ref=e905]: Enable Tool Calls
+          - text: is checked in settings, the AI has access to
+          - strong [ref=e906]: 65+ tools
+          - text: and loops automatically until the task is done (up to the configurable
+          - strong [ref=e907]: Tool Loop Limit
+          - text: ). Heavy reverse engineering tools run asynchronously on a background thread, keeping the UI responsive during multi-second scans. The AI keeps full context during its working session — trimming only happens after the assistant fully completes.
+        - paragraph [ref=e908]:
+          - strong [ref=e909]: File & Code Tools
+        - generic [ref=e912]:
+          - rowgroup [ref=e913]:
+            - row "Tool Description" [ref=e914]:
+              - columnheader "Tool" [ref=e915]
+              - columnheader "Description" [ref=e916]
+          - table [ref=e917]:
+            - rowgroup [ref=e918]:
+              - row "read_file Read a file's contents (truncated at 16KB for large files — use read_lines for targeted access)" [ref=e919]:
+                - cell "read_file" [ref=e920]:
+                  - paragraph [ref=e922]:
+                    - code [ref=e923]: read_file
+                - cell "Read a file's contents (truncated at 16KB for large files — use read_lines for targeted access)" [ref=e924]:
+                  - paragraph [ref=e926]:
+                    - text: Read a file's contents (truncated at 16KB for large files — use
+                    - code [ref=e927]: read_lines
+                    - text: for targeted access)
+              - row "read_lines Read a specific line range" [ref=e928]:
+                - cell "read_lines" [ref=e929]:
+                  - paragraph [ref=e931]:
+                    - code [ref=e932]: read_lines
+                - cell "Read a specific line range" [ref=e933]:
+                  - paragraph [ref=e935]: Read a specific line range
+              - row "write_file Write full file contents (shows diff for review)" [ref=e936]:
+                - cell "write_file" [ref=e937]:
+                  - paragraph [ref=e939]:
+                    - code [ref=e940]: write_file
+                - cell "Write full file contents (shows diff for review)" [ref=e941]:
+                  - paragraph [ref=e943]: Write full file contents (shows diff for review)
+              - row "edit_file Search/replace edit — old text must match exactly" [ref=e944]:
+                - cell "edit_file" [ref=e945]:
+                  - paragraph [ref=e947]:
+                    - code [ref=e948]: edit_file
+                - cell "Search/replace edit — old text must match exactly" [ref=e949]:
+                  - paragraph [ref=e951]: Search/replace edit — old text must match exactly
+              - row "batch_edit Apply multiple search/replace edits atomically" [ref=e952]:
+                - cell "batch_edit" [ref=e953]:
+                  - paragraph [ref=e955]:
+                    - code [ref=e956]: batch_edit
+                - cell "Apply multiple search/replace edits atomically" [ref=e957]:
+                  - paragraph [ref=e959]: Apply multiple search/replace edits atomically
+              - row "replace_all Find and replace ALL occurrences in a file" [ref=e960]:
+                - cell "replace_all" [ref=e961]:
+                  - paragraph [ref=e963]:
+                    - code [ref=e964]: replace_all
+                - cell "Find and replace ALL occurrences in a file" [ref=e965]:
+                  - paragraph [ref=e967]: Find and replace ALL occurrences in a file
+              - row "create_file Create a new file (fails if it already exists)" [ref=e968]:
+                - cell "create_file" [ref=e969]:
+                  - paragraph [ref=e971]:
+                    - code [ref=e972]: create_file
+                - cell "Create a new file (fails if it already exists)" [ref=e973]:
+                  - paragraph [ref=e975]: Create a new file (fails if it already exists)
+              - row "create_directory Create a directory and all parent directories" [ref=e976]:
+                - cell "create_directory" [ref=e977]:
+                  - paragraph [ref=e979]:
+                    - code [ref=e980]: create_directory
+                - cell "Create a directory and all parent directories" [ref=e981]:
+                  - paragraph [ref=e983]: Create a directory and all parent directories
+              - row "insert_lines Insert text before a specific line" [ref=e984]:
+                - cell "insert_lines" [ref=e985]:
+                  - paragraph [ref=e987]:
+                    - code [ref=e988]: insert_lines
+                - cell "Insert text before a specific line" [ref=e989]:
+                  - paragraph [ref=e991]: Insert text before a specific line
+              - row "delete_lines Delete a range of lines" [ref=e992]:
+                - cell "delete_lines" [ref=e993]:
+                  - paragraph [ref=e995]:
+                    - code [ref=e996]: delete_lines
+                - cell "Delete a range of lines" [ref=e997]:
+                  - paragraph [ref=e999]: Delete a range of lines
+              - row "replace_lines Replace a line range with new text. More efficient than edit_file when line numbers are known — no content duplication" [ref=e1000]:
+                - cell "replace_lines" [ref=e1001]:
+                  - paragraph [ref=e1003]:
+                    - code [ref=e1004]: replace_lines
+                - cell "Replace a line range with new text. More efficient than edit_file when line numbers are known — no content duplication" [ref=e1005]:
+                  - paragraph [ref=e1007]:
+                    - text: Replace a line range with new text. More efficient than
+                    - code [ref=e1008]: edit_file
+                    - text: when line numbers are known — no content duplication
+              - row "replace_selection Replace the current editor selection" [ref=e1009]:
+                - cell "replace_selection" [ref=e1010]:
+                  - paragraph [ref=e1012]:
+                    - code [ref=e1013]: replace_selection
+                - cell "Replace the current editor selection" [ref=e1014]:
+                  - paragraph [ref=e1016]: Replace the current editor selection
+              - row "search_text Search across open files" [ref=e1017]:
+                - cell "search_text" [ref=e1018]:
+                  - paragraph [ref=e1020]:
+                    - code [ref=e1021]: search_text
+                - cell "Search across open files" [ref=e1022]:
+                  - paragraph [ref=e1024]: Search across open files
+              - row "find_references Search across ALL project files on disk (all workspace roots)" [ref=e1025]:
+                - cell "find_references" [ref=e1026]:
+                  - paragraph [ref=e1028]:
+                    - code [ref=e1029]: find_references
+                - cell "Search across ALL project files on disk (all workspace roots)" [ref=e1030]:
+                  - paragraph [ref=e1032]: Search across ALL project files on disk (all workspace roots)
+              - 'row "get_file_info Get file info: path, language, lines, size in bytes. Accepts optional path (defaults to active file). Use to check size before reading unknown files" [ref=e1033]':
+                - cell "get_file_info" [ref=e1034]:
+                  - paragraph [ref=e1036]:
+                    - code [ref=e1037]: get_file_info
+                - 'cell "Get file info: path, language, lines, size in bytes. Accepts optional path (defaults to active file). Use to check size before reading unknown files" [ref=e1038]':
+                  - paragraph [ref=e1040]: "Get file info: path, language, lines, size in bytes. Accepts optional path (defaults to active file). Use to check size before reading unknown files"
+              - row "get_open_files List all open buffers with line counts and modified status" [ref=e1041]:
+                - cell "get_open_files" [ref=e1042]:
+                  - paragraph [ref=e1044]:
+                    - code [ref=e1045]: get_open_files
+                - cell "List all open buffers with line counts and modified status" [ref=e1046]:
+                  - paragraph [ref=e1048]: List all open buffers with line counts and modified status
+              - row "list_files List directory contents (lists all workspace roots when given .)" [ref=e1049]:
+                - cell "list_files" [ref=e1050]:
+                  - paragraph [ref=e1052]:
+                    - code [ref=e1053]: list_files
+                - cell "List directory contents (lists all workspace roots when given .)" [ref=e1054]:
+                  - paragraph [ref=e1056]:
+                    - text: List directory contents (lists all workspace roots when given
+                    - code [ref=e1057]: .
+                    - text: )
+              - row "get_symbols List function/struct/class/enum definitions in a file" [ref=e1058]:
+                - cell "get_symbols" [ref=e1059]:
+                  - paragraph [ref=e1061]:
+                    - code [ref=e1062]: get_symbols
+                - cell "List function/struct/class/enum definitions in a file" [ref=e1063]:
+                  - paragraph [ref=e1065]: List function/struct/class/enum definitions in a file
+              - row "open_file Open a file in a new editor tab" [ref=e1066]:
+                - cell "open_file" [ref=e1067]:
+                  - paragraph [ref=e1069]:
+                    - code [ref=e1070]: open_file
+                - cell "Open a file in a new editor tab" [ref=e1071]:
+                  - paragraph [ref=e1073]: Open a file in a new editor tab
+              - row "save_file Save a file to disk" [ref=e1074]:
+                - cell "save_file" [ref=e1075]:
+                  - paragraph [ref=e1077]:
+                    - code [ref=e1078]: save_file
+                - cell "Save a file to disk" [ref=e1079]:
+                  - paragraph [ref=e1081]: Save a file to disk
+              - row "goto_line Move cursor to a line number" [ref=e1082]:
+                - cell "goto_line" [ref=e1083]:
+                  - paragraph [ref=e1085]:
+                    - code [ref=e1086]: goto_line
+                - cell "Move cursor to a line number" [ref=e1087]:
+                  - paragraph [ref=e1089]: Move cursor to a line number
+              - row "get_clipboard Read system clipboard text" [ref=e1090]:
+                - cell "get_clipboard" [ref=e1091]:
+                  - paragraph [ref=e1093]:
+                    - code [ref=e1094]: get_clipboard
+                - cell "Read system clipboard text" [ref=e1095]:
+                  - paragraph [ref=e1097]: Read system clipboard text
+              - row "get_recent_changes Get last 20 undo history entries" [ref=e1098]:
+                - cell "get_recent_changes" [ref=e1099]:
+                  - paragraph [ref=e1101]:
+                    - code [ref=e1102]: get_recent_changes
+                - cell "Get last 20 undo history entries" [ref=e1103]:
+                  - paragraph [ref=e1105]: Get last 20 undo history entries
+              - row "add_bookmark / get_bookmarks Manage named bookmarks" [ref=e1106]:
+                - cell "add_bookmark / get_bookmarks" [ref=e1107]:
+                  - paragraph [ref=e1109]:
+                    - code [ref=e1110]: add_bookmark
+                    - text: /
+                    - code [ref=e1111]: get_bookmarks
+                - cell "Manage named bookmarks" [ref=e1112]:
+                  - paragraph [ref=e1114]: Manage named bookmarks
+              - row "check_script Compile-check a script for errors without executing. Automatically uses the extension API surface for files in extensions/" [ref=e1115]:
+                - cell "check_script" [ref=e1116]:
+                  - paragraph [ref=e1118]:
+                    - code [ref=e1119]: check_script
+                - cell "Compile-check a script for errors without executing. Automatically uses the extension API surface for files in extensions/" [ref=e1120]:
+                  - paragraph [ref=e1122]:
+                    - text: Compile-check a script for errors without executing. Automatically uses the extension API surface for files in
+                    - code [ref=e1123]: extensions/
+              - row "validate_script Compile and optionally run a script. Extensions are compile-only (no run=true — they have no main())" [ref=e1124]:
+                - cell "validate_script" [ref=e1125]:
+                  - paragraph [ref=e1127]:
+                    - code [ref=e1128]: validate_script
+                - cell "Compile and optionally run a script. Extensions are compile-only (no run=true — they have no main())" [ref=e1129]:
+                  - paragraph [ref=e1131]:
+                    - text: Compile and optionally run a script. Extensions are compile-only (no
+                    - code [ref=e1132]: run=true
+                    - text: — they have no
+                    - code [ref=e1133]: main()
+                    - text: )
+              - row "get_script_api Load the Perception.cx scripting API reference for a language (angelscript, lua, or extension). Mandatory — the AI must call this before writing any script code" [ref=e1134]:
+                - cell "get_script_api" [ref=e1135]:
+                  - paragraph [ref=e1137]:
+                    - code [ref=e1138]: get_script_api
+                - cell "Load the Perception.cx scripting API reference for a language (angelscript, lua, or extension). Mandatory — the AI must call this before writing any script code" [ref=e1139]:
+                  - paragraph [ref=e1141]:
+                    - text: Load the Perception.cx scripting API reference for a language (
+                    - code [ref=e1142]: angelscript
+                    - text: ","
+                    - code [ref=e1143]: lua
+                    - text: ", or"
+                    - code [ref=e1144]: extension
+                    - text: ).
+                    - strong [ref=e1145]: Mandatory
+                    - text: — the AI must call this before writing any script code
+        - paragraph [ref=e1146]:
+          - strong [ref=e1147]: Shell & Automation Tools
+        - generic [ref=e1150]:
+          - rowgroup [ref=e1151]:
+            - row "Tool Description" [ref=e1152]:
+              - columnheader "Tool" [ref=e1153]
+              - columnheader "Description" [ref=e1154]
+          - table [ref=e1155]:
+            - rowgroup [ref=e1156]:
+              - row "exec_shell_command Run a command in the active terminal tab (30s timeout)" [ref=e1157]:
+                - cell "exec_shell_command" [ref=e1158]:
+                  - paragraph [ref=e1160]:
+                    - code [ref=e1161]: exec_shell_command
+                - cell "Run a command in the active terminal tab (30s timeout)" [ref=e1162]:
+                  - paragraph [ref=e1164]: Run a command in the active terminal tab (30s timeout)
+              - row "run_custom_command Run a user-defined custom command by name" [ref=e1165]:
+                - cell "run_custom_command" [ref=e1166]:
+                  - paragraph [ref=e1168]:
+                    - code [ref=e1169]: run_custom_command
+                - cell "Run a user-defined custom command by name" [ref=e1170]:
+                  - paragraph [ref=e1172]: Run a user-defined custom command by name
+              - row "execute_script Write and run an AngelScript/Lua script on the fly" [ref=e1173]:
+                - cell "execute_script" [ref=e1174]:
+                  - paragraph [ref=e1176]:
+                    - code [ref=e1177]: execute_script
+                - cell "Write and run an AngelScript/Lua script on the fly" [ref=e1178]:
+                  - paragraph [ref=e1180]: Write and run an AngelScript/Lua script on the fly
+              - row "ask_user Pause and ask you a question, then resume after you respond" [ref=e1181]:
+                - cell "ask_user" [ref=e1182]:
+                  - paragraph [ref=e1184]:
+                    - code [ref=e1185]: ask_user
+                - cell "Pause and ask you a question, then resume after you respond" [ref=e1186]:
+                  - paragraph [ref=e1188]: Pause and ask you a question, then resume after you respond
+              - row "ask_mcq Pause and ask you multiple questions in one tool call, then result after you respond" [ref=e1189]:
+                - cell "ask_mcq" [ref=e1190]:
+                  - paragraph [ref=e1192]:
+                    - code [ref=e1193]: ask_mcq
+                - cell "Pause and ask you multiple questions in one tool call, then result after you respond" [ref=e1194]:
+                  - paragraph [ref=e1196]: Pause and ask you multiple questions in one tool call, then result after you respond
+              - row "web_search Search the web via Brave Search API or OpenRouter web plugin" [ref=e1197]:
+                - cell "web_search" [ref=e1198]:
+                  - paragraph [ref=e1200]:
+                    - code [ref=e1201]: web_search
+                - cell "Search the web via Brave Search API or OpenRouter web plugin" [ref=e1202]:
+                  - paragraph [ref=e1204]: Search the web via Brave Search API or OpenRouter web plugin
+              - 'row "manage_context AI self-optimizes its context window: drop_tools removes unneeded tool categories (saves tokens), trim_history trims old turns" [ref=e1205]':
+                - cell "manage_context" [ref=e1206]:
+                  - paragraph [ref=e1208]:
+                    - code [ref=e1209]: manage_context
+                - 'cell "AI self-optimizes its context window: drop_tools removes unneeded tool categories (saves tokens), trim_history trims old turns" [ref=e1210]':
+                  - paragraph [ref=e1212]:
+                    - text: "AI self-optimizes its context window:"
+                    - code [ref=e1213]: drop_tools
+                    - text: removes unneeded tool categories (saves tokens),
+                    - code [ref=e1214]: trim_history
+                    - text: trims old turns
+              - row "update_notes Persistent working notes (2KB) that survive context trimming. The AI uses this to preserve key discoveries from RE sessions — addresses, offsets, struct layouts, decrypted values" [ref=e1215]:
+                - cell "update_notes" [ref=e1216]:
+                  - paragraph [ref=e1218]:
+                    - code [ref=e1219]: update_notes
+                - cell "Persistent working notes (2KB) that survive context trimming. The AI uses this to preserve key discoveries from RE sessions — addresses, offsets, struct layouts, decrypted values" [ref=e1220]:
+                  - paragraph [ref=e1222]: Persistent working notes (2KB) that survive context trimming. The AI uses this to preserve key discoveries from RE sessions — addresses, offsets, struct layouts, decrypted values
+              - row "switch_model Switch between planning and coder models during tandem AI. Only available when an Implementation / Coder model is configured" [ref=e1223]:
+                - cell "switch_model" [ref=e1224]:
+                  - paragraph [ref=e1226]:
+                    - code [ref=e1227]: switch_model
+                - cell "Switch between planning and coder models during tandem AI. Only available when an Implementation / Coder model is configured" [ref=e1228]:
+                  - paragraph [ref=e1230]: Switch between planning and coder models during tandem AI. Only available when an Implementation / Coder model is configured
+        - paragraph [ref=e1231]:
+          - strong [ref=e1232]: Diff Review Tools
+        - generic [ref=e1235]:
+          - rowgroup [ref=e1236]:
+            - row "Tool Description" [ref=e1237]:
+              - columnheader "Tool" [ref=e1238]
+              - columnheader "Description" [ref=e1239]
+          - table [ref=e1240]:
+            - rowgroup [ref=e1241]:
+              - row "get_diff Get current pending diff state" [ref=e1242]:
+                - cell "get_diff" [ref=e1243]:
+                  - paragraph [ref=e1245]:
+                    - code [ref=e1246]: get_diff
+                - cell "Get current pending diff state" [ref=e1247]:
+                  - paragraph [ref=e1249]: Get current pending diff state
+              - row "wait_for_diff_review Pause until you resolve all pending diffs" [ref=e1250]:
+                - cell "wait_for_diff_review" [ref=e1251]:
+                  - paragraph [ref=e1253]:
+                    - code [ref=e1254]: wait_for_diff_review
+                - cell "Pause until you resolve all pending diffs" [ref=e1255]:
+                  - paragraph [ref=e1257]: Pause until you resolve all pending diffs
+        - paragraph [ref=e1258]:
+          - strong [ref=e1259]: Reverse Engineering Tools
+        - generic [ref=e1262]:
+          - rowgroup [ref=e1263]:
+            - row "Tool Description" [ref=e1264]:
+              - columnheader "Tool" [ref=e1265]
+              - columnheader "Description" [ref=e1266]
+          - table [ref=e1267]:
+            - rowgroup [ref=e1268]:
+              - row "list_processes List processes with PID, name, base address, EPROCESS" [ref=e1269]:
+                - cell "list_processes" [ref=e1270]:
+                  - paragraph [ref=e1272]:
+                    - code [ref=e1273]: list_processes
+                - cell "List processes with PID, name, base address, EPROCESS" [ref=e1274]:
+                  - paragraph [ref=e1276]: List processes with PID, name, base address, EPROCESS
+              - 'row "get_process_info Detailed process info: modules, threads, PEB, DTB" [ref=e1277]':
+                - cell "get_process_info" [ref=e1278]:
+                  - paragraph [ref=e1280]:
+                    - code [ref=e1281]: get_process_info
+                - 'cell "Detailed process info: modules, threads, PEB, DTB" [ref=e1282]':
+                  - paragraph [ref=e1284]: "Detailed process info: modules, threads, PEB, DTB"
+              - row "read_memory Read bytes as hex dump + ASCII (max 4096 bytes)" [ref=e1285]:
+                - cell "read_memory" [ref=e1286]:
+                  - paragraph [ref=e1288]:
+                    - code [ref=e1289]: read_memory
+                - cell "Read bytes as hex dump + ASCII (max 4096 bytes)" [ref=e1290]:
+                  - paragraph [ref=e1292]: Read bytes as hex dump + ASCII (max 4096 bytes)
+              - 'row "read_typed_value Read typed values: uint8–64, float, double, pointer arrays" [ref=e1293]':
+                - cell "read_typed_value" [ref=e1294]:
+                  - paragraph [ref=e1296]:
+                    - code [ref=e1297]: read_typed_value
+                - 'cell "Read typed values: uint8–64, float, double, pointer arrays" [ref=e1298]':
+                  - paragraph [ref=e1300]: "Read typed values: uint8–64, float, double, pointer arrays"
+              - row "find_pattern IDA-style byte pattern scanning with ? wildcards" [ref=e1301]:
+                - cell "find_pattern" [ref=e1302]:
+                  - paragraph [ref=e1304]:
+                    - code [ref=e1305]: find_pattern
+                - cell "IDA-style byte pattern scanning with ? wildcards" [ref=e1306]:
+                  - paragraph [ref=e1308]:
+                    - text: IDA-style byte pattern scanning with
+                    - code [ref=e1309]: "?"
+                    - text: wildcards
+              - row "read_pointer_chain Follow pointer chain with offsets at each dereference" [ref=e1310]:
+                - cell "read_pointer_chain" [ref=e1311]:
+                  - paragraph [ref=e1313]:
+                    - code [ref=e1314]: read_pointer_chain
+                - cell "Follow pointer chain with offsets at each dereference" [ref=e1315]:
+                  - paragraph [ref=e1317]: Follow pointer chain with offsets at each dereference
+              - row "read_string Read ASCII or Unicode string from memory" [ref=e1318]:
+                - cell "read_string" [ref=e1319]:
+                  - paragraph [ref=e1321]:
+                    - code [ref=e1322]: read_string
+                - cell "Read ASCII or Unicode string from memory" [ref=e1323]:
+                  - paragraph [ref=e1325]: Read ASCII or Unicode string from memory
+              - row "get_module_exports List exported functions from a module's PE export table" [ref=e1326]:
+                - cell "get_module_exports" [ref=e1327]:
+                  - paragraph [ref=e1329]:
+                    - code [ref=e1330]: get_module_exports
+                - cell "List exported functions from a module's PE export table" [ref=e1331]:
+                  - paragraph [ref=e1333]: List exported functions from a module's PE export table
+              - row "get_module_imports List imported functions from a module's PE import table (DLL names, function names, IAT addresses, resolved targets)" [ref=e1334]:
+                - cell "get_module_imports" [ref=e1335]:
+                  - paragraph [ref=e1337]:
+                    - code [ref=e1338]: get_module_imports
+                - cell "List imported functions from a module's PE import table (DLL names, function names, IAT addresses, resolved targets)" [ref=e1339]:
+                  - paragraph [ref=e1341]: List imported functions from a module's PE import table (DLL names, function names, IAT addresses, resolved targets)
+        - paragraph [ref=e1342]:
+          - strong [ref=e1343]: Advanced Tools
+        - paragraph [ref=e1344]:
+          - text: These are gated behind the
+          - strong [ref=e1345]: Allow Advanced Writing Tools
+          - text: "checkbox in settings:"
+        - generic [ref=e1348]:
+          - rowgroup [ref=e1349]:
+            - row "Tool Description" [ref=e1350]:
+              - columnheader "Tool" [ref=e1351]
+              - columnheader "Description" [ref=e1352]
+          - table [ref=e1353]:
+            - rowgroup [ref=e1354]:
+              - row "memory_write Write bytes to process memory (works on any section including .text — no protection changes needed)" [ref=e1355]:
+                - cell "memory_write" [ref=e1356]:
+                  - paragraph [ref=e1358]:
+                    - code [ref=e1359]: memory_write
+                - cell "Write bytes to process memory (works on any section including .text — no protection changes needed)" [ref=e1360]:
+                  - paragraph [ref=e1362]:
+                    - text: Write bytes to process memory (works on any section including
+                    - code [ref=e1363]: .text
+                    - text: — no protection changes needed)
+              - row "scan_string / scan_wstring Scan ALL committed process memory for ASCII/Unicode strings. Full VAD scan — no range limit" [ref=e1364]:
+                - cell "scan_string / scan_wstring" [ref=e1365]:
+                  - paragraph [ref=e1367]:
+                    - code [ref=e1368]: scan_string
+                    - text: /
+                    - code [ref=e1369]: scan_wstring
+                - cell "Scan ALL committed process memory for ASCII/Unicode strings. Full VAD scan — no range limit" [ref=e1370]:
+                  - paragraph [ref=e1372]: Scan ALL committed process memory for ASCII/Unicode strings. Full VAD scan — no range limit
+              - row "disassemble Disassemble x86-64 instructions at an address (Zydis)" [ref=e1373]:
+                - cell "disassemble" [ref=e1374]:
+                  - paragraph [ref=e1376]:
+                    - code [ref=e1377]: disassemble
+                - cell "Disassemble x86-64 instructions at an address (Zydis)" [ref=e1378]:
+                  - paragraph [ref=e1380]: Disassemble x86-64 instructions at an address (Zydis)
+              - row "delete_file Permanently delete a file" [ref=e1381]:
+                - cell "delete_file" [ref=e1382]:
+                  - paragraph [ref=e1384]:
+                    - code [ref=e1385]: delete_file
+                - cell "Permanently delete a file" [ref=e1386]:
+                  - paragraph [ref=e1388]: Permanently delete a file
+              - row "scan_pointer_to Reverse pointer scan — find all memory locations containing a pointer to a target address. Full VAD scan" [ref=e1389]:
+                - cell "scan_pointer_to" [ref=e1390]:
+                  - paragraph [ref=e1392]:
+                    - code [ref=e1393]: scan_pointer_to
+                - cell "Reverse pointer scan — find all memory locations containing a pointer to a target address. Full VAD scan" [ref=e1394]:
+                  - paragraph [ref=e1396]: Reverse pointer scan — find all memory locations containing a pointer to a target address. Full VAD scan
+              - row "scan_value Scan ALL process memory for typed values (uint16–64, int32/64, float, double) with optional tolerance" [ref=e1397]:
+                - cell "scan_value" [ref=e1398]:
+                  - paragraph [ref=e1400]:
+                    - code [ref=e1401]: scan_value
+                - cell "Scan ALL process memory for typed values (uint16–64, int32/64, float, double) with optional tolerance" [ref=e1402]:
+                  - paragraph [ref=e1404]: Scan ALL process memory for typed values (uint16–64, int32/64, float, double) with optional tolerance
+              - 'row "scan_changed Cheat Engine-style iterative scanning: first scan → filter by changed/increased/decreased/unchanged/exact" [ref=e1405]':
+                - cell "scan_changed" [ref=e1406]:
+                  - paragraph [ref=e1408]:
+                    - code [ref=e1409]: scan_changed
+                - 'cell "Cheat Engine-style iterative scanning: first scan → filter by changed/increased/decreased/unchanged/exact" [ref=e1410]':
+                  - paragraph [ref=e1412]: "Cheat Engine-style iterative scanning: first scan → filter by changed/increased/decreased/unchanged/exact"
+              - row "diff_memory Snapshot a memory region, wait, snapshot again, report all changed bytes with hex + float interpretations" [ref=e1413]:
+                - cell "diff_memory" [ref=e1414]:
+                  - paragraph [ref=e1416]:
+                    - code [ref=e1417]: diff_memory
+                - cell "Snapshot a memory region, wait, snapshot again, report all changed bytes with hex + float interpretations" [ref=e1418]:
+                  - paragraph [ref=e1420]: Snapshot a memory region, wait, snapshot again, report all changed bytes with hex + float interpretations
+              - 'row "struct_dump Read memory and heuristically classify each 8-byte field: pointers, vtables, floats, doubles, ints, nulls" [ref=e1421]':
+                - cell "struct_dump" [ref=e1422]:
+                  - paragraph [ref=e1424]:
+                    - code [ref=e1425]: struct_dump
+                - 'cell "Read memory and heuristically classify each 8-byte field: pointers, vtables, floats, doubles, ints, nulls" [ref=e1426]':
+                  - paragraph [ref=e1428]: "Read memory and heuristically classify each 8-byte field: pointers, vtables, floats, doubles, ints, nulls"
+              - row "find_xrefs Find all code cross-references to an address. Scans entire module in 4MB chunks — no size cap, works on 400MB+ modules" [ref=e1429]:
+                - cell "find_xrefs" [ref=e1430]:
+                  - paragraph [ref=e1432]:
+                    - code [ref=e1433]: find_xrefs
+                - cell "Find all code cross-references to an address. Scans entire module in 4MB chunks — no size cap, works on 400MB+ modules" [ref=e1434]:
+                  - paragraph [ref=e1436]: Find all code cross-references to an address. Scans entire module in 4MB chunks — no size cap, works on 400MB+ modules
+              - row "find_string_refs Find code that references a string. Combines scan_string + find_xrefs in one call — scans all memory for the string, then sweeps entire module code for LEA/MOV instructions pointing to it" [ref=e1437]:
+                - cell "find_string_refs" [ref=e1438]:
+                  - paragraph [ref=e1440]:
+                    - code [ref=e1441]: find_string_refs
+                - cell "Find code that references a string. Combines scan_string + find_xrefs in one call — scans all memory for the string, then sweeps entire module code for LEA/MOV instructions pointing to it" [ref=e1442]:
+                  - paragraph [ref=e1444]:
+                    - text: Find code that references a string. Combines
+                    - code [ref=e1445]: scan_string
+                    - text: +
+                    - code [ref=e1446]: find_xrefs
+                    - text: in one call — scans all memory for the string, then sweeps entire module code for LEA/MOV instructions pointing to it
+              - row "find_function_bounds Given any address inside a function, detect prologue/epilogue to find function start and end" [ref=e1447]:
+                - cell "find_function_bounds" [ref=e1448]:
+                  - paragraph [ref=e1450]:
+                    - code [ref=e1451]: find_function_bounds
+                - cell "Given any address inside a function, detect prologue/epilogue to find function start and end" [ref=e1452]:
+                  - paragraph [ref=e1454]: Given any address inside a function, detect prologue/epilogue to find function start and end
+              - row "analyze_function Annotated disassembly with basic block labels, CALL targets, stack frame size, and control flow markers" [ref=e1455]:
+                - cell "analyze_function" [ref=e1456]:
+                  - paragraph [ref=e1458]:
+                    - code [ref=e1459]: analyze_function
+                - cell "Annotated disassembly with basic block labels, CALL targets, stack frame size, and control flow markers" [ref=e1460]:
+                  - paragraph [ref=e1462]: Annotated disassembly with basic block labels, CALL targets, stack frame size, and control flow markers
+              - 'row "trace_register Static backward trace: find where a register gets its value, resolve RIP-relative globals" [ref=e1463]':
+                - cell "trace_register" [ref=e1464]:
+                  - paragraph [ref=e1466]:
+                    - code [ref=e1467]: trace_register
+                - 'cell "Static backward trace: find where a register gets its value, resolve RIP-relative globals" [ref=e1468]':
+                  - paragraph [ref=e1470]: "Static backward trace: find where a register gets its value, resolve RIP-relative globals"
+              - row "analyze_vtable Read vtable slots and verify each is a valid function pointer by decoding prologue bytes" [ref=e1471]:
+                - cell "analyze_vtable" [ref=e1472]:
+                  - paragraph [ref=e1474]:
+                    - code [ref=e1475]: analyze_vtable
+                - cell "Read vtable slots and verify each is a valid function pointer by decoding prologue bytes" [ref=e1476]:
+                  - paragraph [ref=e1478]: Read vtable slots and verify each is a valid function pointer by decoding prologue bytes
+              - row "read_rtti Read MSVC RTTI from an object pointer or vtable address. Returns class name, base classes, and inheritance hierarchy" [ref=e1479]:
+                - cell "read_rtti" [ref=e1480]:
+                  - paragraph [ref=e1482]:
+                    - code [ref=e1483]: read_rtti
+                - cell "Read MSVC RTTI from an object pointer or vtable address. Returns class name, base classes, and inheritance hierarchy" [ref=e1484]:
+                  - paragraph [ref=e1486]: Read MSVC RTTI from an object pointer or vtable address. Returns class name, base classes, and inheritance hierarchy
+              - row "generate_signature Auto-generate IDA-style byte signatures with automatic wildcarding of RIP-relative displacements" [ref=e1487]:
+                - cell "generate_signature" [ref=e1488]:
+                  - paragraph [ref=e1490]:
+                    - code [ref=e1491]: generate_signature
+                - cell "Auto-generate IDA-style byte signatures with automatic wildcarding of RIP-relative displacements" [ref=e1492]:
+                  - paragraph [ref=e1494]: Auto-generate IDA-style byte signatures with automatic wildcarding of RIP-relative displacements
+              - row "build_call_graph Build recursive call graph from a function showing call relationships, instruction counts, and depth" [ref=e1495]:
+                - cell "build_call_graph" [ref=e1496]:
+                  - paragraph [ref=e1498]:
+                    - code [ref=e1499]: build_call_graph
+                - cell "Build recursive call graph from a function showing call relationships, instruction counts, and depth" [ref=e1500]:
+                  - paragraph [ref=e1502]: Build recursive call graph from a function showing call relationships, instruction counts, and depth
+              - row "get_module_imports List imported functions from a module's PE import directory" [ref=e1503]:
+                - cell "get_module_imports" [ref=e1504]:
+                  - paragraph [ref=e1506]:
+                    - code [ref=e1507]: get_module_imports
+                - cell "List imported functions from a module's PE import directory" [ref=e1508]:
+                  - paragraph [ref=e1510]: List imported functions from a module's PE import directory
+        - blockquote [ref=e1511]:
+          - paragraph [ref=e1512]:
+            - strong [ref=e1513]: "Physical memory:"
+            - text: All process memory operations use physical memory page table translation. This means you can read and write any memory including executable
+            - code [ref=e1514]: .text
+            - text: sections without changing page protection — no
+            - code [ref=e1515]: VirtualProtect
+            - text: needed.
+        - separator [ref=e1516]
+        - paragraph [ref=e1517]:
+          - strong [ref=e1518]: Diff Review
+        - paragraph [ref=e1519]: "When the AI edits a file, it doesn't overwrite your code directly. Every change goes through a diff review:"
+        - list [ref=e1520]:
+          - listitem [ref=e1521]:
+            - generic [ref=e1523]: •
+            - paragraph [ref=e1525]:
+              - text: Changes are displayed as individual
+              - strong [ref=e1526]: hunks
+              - text: with green (added) / red (removed) highlighting
+          - listitem [ref=e1527]:
+            - generic [ref=e1529]: •
+            - paragraph [ref=e1531]:
+              - text: Navigate between hunks with
+              - strong [ref=e1532]: Up / Down
+              - text: arrow keys
+          - listitem [ref=e1533]:
+            - generic [ref=e1535]: •
+            - paragraph [ref=e1537]:
+              - strong [ref=e1538]: Enter
+              - text: — accept the focused hunk
+          - listitem [ref=e1539]:
+            - generic [ref=e1541]: •
+            - paragraph [ref=e1543]:
+              - strong [ref=e1544]: Delete
+              - text: — reject the focused hunk
+          - listitem [ref=e1545]:
+            - generic [ref=e1547]: •
+            - paragraph [ref=e1549]:
+              - strong [ref=e1550]: Ctrl+Shift+A
+              - text: — accept all hunks at once
+          - listitem [ref=e1551]:
+            - generic [ref=e1553]: •
+            - paragraph [ref=e1555]:
+              - strong [ref=e1556]: Esc
+              - text: — reject all remaining hunks
+        - paragraph [ref=e1557]:
+          - text: The AI can call
+          - code [ref=e1558]: wait_for_diff_review
+          - text: to pause until you've resolved all pending diffs before it continues. Alternatively, enable
+          - strong [ref=e1559]: Auto-accept AI edits
+          - text: in settings to skip review entirely.
+        - separator [ref=e1560]
+        - paragraph [ref=e1561]:
+          - strong [ref=e1562]: AI Root
+        - paragraph [ref=e1563]: AI Root lets you scope where the AI operates within your project. When set, the AI will only read, write, and browse files within the designated folder(s).
+        - paragraph [ref=e1564]:
+          - strong [ref=e1565]: Setting an AI Root
+        - list [ref=e1566]:
+          - listitem [ref=e1567]:
+            - generic [ref=e1569]: "1."
+            - paragraph [ref=e1571]:
+              - text: In the
+              - strong [ref=e1572]: File Explorer
+              - text: sidebar, right-click any folder
+          - listitem [ref=e1573]:
+            - generic [ref=e1575]: "2."
+            - paragraph [ref=e1577]:
+              - text: Click
+              - strong [ref=e1578]: AI Root
+              - text: to toggle it on or off
+          - listitem [ref=e1579]:
+            - generic [ref=e1581]: "3."
+            - paragraph [ref=e1583]: Folders marked as AI Root show a visual indicator in the tree
+        - paragraph [ref=e1584]: You can set multiple AI Roots. When at least one is set, the AI's file operations are restricted to those directories. When no AI Roots are set, the AI can access the entire project.
+        - paragraph [ref=e1585]: AI Roots persist across sessions and are saved with your editor state.
+        - separator [ref=e1586]
+        - paragraph [ref=e1587]:
+          - strong [ref=e1588]: Custom Commands
+        - paragraph [ref=e1589]:
+          - text: Custom Commands let you define named shell commands that integrate into the editor and AI workflow. Define them in
+          - strong [ref=e1590]: Settings → Custom Commands
+          - text: .
+        - paragraph [ref=e1591]:
+          - strong [ref=e1592]: Creating a Command
+        - list [ref=e1593]:
+          - listitem [ref=e1594]:
+            - generic [ref=e1596]: "1."
+            - paragraph [ref=e1598]:
+              - text: Click
+              - strong [ref=e1599]: + Add Command
+          - listitem [ref=e1600]:
+            - generic [ref=e1602]: "2."
+            - paragraph [ref=e1604]:
+              - text: Enter a
+              - strong [ref=e1605]: Name
+              - text: (e.g. "Build", "Test", "Deploy")
+          - listitem [ref=e1606]:
+            - generic [ref=e1608]: "3."
+            - paragraph [ref=e1610]:
+              - text: Enter a
+              - strong [ref=e1611]: Command
+              - text: (e.g.
+              - code [ref=e1612]: build.bat
+              - text: ","
+              - code [ref=e1613]: python test.py
+              - text: ","
+              - code [ref=e1614]: npm run build
+              - text: )
+          - listitem [ref=e1615]:
+            - generic [ref=e1617]: "4."
+            - paragraph [ref=e1619]:
+              - text: Optionally check
+              - strong [ref=e1620]: Use as Bundler
+              - text: to replace the toolbar's Bundle button with this command
+        - paragraph [ref=e1621]:
+          - strong [ref=e1622]: Bundler Override
+        - paragraph [ref=e1623]:
+          - text: When a custom command has
+          - strong [ref=e1624]: Use as Bundler
+          - text: enabled, clicking the
+          - strong [ref=e1625]: Bundle
+          - text: button in the script toolbar will run your custom command in the terminal instead of the built-in
+          - code [ref=e1626]: "#include"
+          - text: resolver. Only one command can be the active bundler at a time.
+        - paragraph [ref=e1627]: This is useful for custom build pipelines — C-preprocessor macro expansion, hash baking, minification, or any project-specific processing the built-in bundler doesn't cover.
+        - paragraph [ref=e1628]:
+          - strong [ref=e1629]: AI Integration
+        - paragraph [ref=e1630]:
+          - text: Custom commands are automatically exposed to the AI as the
+          - code [ref=e1631]: run_custom_command
+          - text: tool. The AI can invoke any of your defined commands by name during agentic workflows. For example, after editing files the AI could run your custom build command to verify compilation.
+        - separator [ref=e1632]
+        - paragraph [ref=e1633]:
+          - strong [ref=e1634]: Extensions
+        - paragraph [ref=e1635]: The editor supports AngelScript-based extensions that hook into the editor lifecycle, AI chat pipeline, and provide custom UI widgets. Extensions have full access to the Perception.cx platform API — the same surface available to regular scripts.
+        - paragraph [ref=e1636]:
+          - strong [ref=e1637]: Installing Extensions
+        - paragraph [ref=e1638]:
+          - text: Place
+          - code [ref=e1639]: .as
+          - text: files in the
+          - code [ref=e1640]: extensions/
+          - text: folder inside your scripting main directory. The editor scans this directory every 3 seconds and automatically picks up new files or removes deleted ones.
+        - paragraph [ref=e1641]:
+          - strong [ref=e1642]: Managing Extensions
+        - paragraph [ref=e1643]:
+          - text: Click the 🧩 puzzle icon in the activity bar to open the
+          - strong [ref=e1644]: Extensions
+          - text: panel. Each extension shows a card with its name, version, description, ON/OFF toggle, Reload button, and any compile errors. Extension state persists across sessions.
+        - paragraph [ref=e1645]:
+          - strong [ref=e1646]: What Extensions Can Do
+        - list [ref=e1647]:
+          - listitem [ref=e1648]:
+            - generic [ref=e1650]: •
+            - paragraph [ref=e1652]:
+              - strong [ref=e1653]: Editor events
+              - text: — react to files being opened, saved, edited, or tabs switching
+          - listitem [ref=e1654]:
+            - generic [ref=e1656]: •
+            - paragraph [ref=e1658]:
+              - strong [ref=e1659]: AI pipeline
+              - text: — intercept prompts before sending, inject system prompt text, observe or handle tool calls, register custom AI tools
+          - listitem [ref=e1660]:
+            - generic [ref=e1662]: •
+            - paragraph [ref=e1664]:
+              - strong [ref=e1665]: IntelliSense
+              - text: — provide custom completions and hover tooltips for any file type (not limited to AngelScript/Lua)
+          - listitem [ref=e1666]:
+            - generic [ref=e1668]: •
+            - paragraph [ref=e1670]:
+              - strong [ref=e1671]: Custom UI
+              - text: — render checkboxes, sliders, buttons, text inputs, progress bars, dropdowns, color pickers, and keybind capture widgets in the sidebar
+          - listitem [ref=e1672]:
+            - generic [ref=e1674]: •
+            - paragraph [ref=e1676]:
+              - strong [ref=e1677]: Editor manipulation
+              - text: — insert text, replace selection, set selection range, open files, save files, and jump to lines programmatically
+          - listitem [ref=e1678]:
+            - generic [ref=e1680]: •
+            - paragraph [ref=e1682]:
+              - strong [ref=e1683]: File I/O
+              - text: — read files, write files, check existence, and list directories from extension code
+          - listitem [ref=e1684]:
+            - generic [ref=e1686]: •
+            - paragraph [ref=e1688]:
+              - strong [ref=e1689]: Clipboard
+              - text: — get and set system clipboard text
+          - listitem [ref=e1690]:
+            - generic [ref=e1692]: •
+            - paragraph [ref=e1694]:
+              - strong [ref=e1695]: Network
+              - text: — synchronous HTTP GET/POST requests with custom headers (10s timeout)
+          - listitem [ref=e1696]:
+            - generic [ref=e1698]: •
+            - paragraph [ref=e1700]:
+              - strong [ref=e1701]: Platform access
+              - text: — use a selection of Perception.cx APIs including rendering, input, CPU intrinsics, WinAPI, JSON, Zydis, and utilities. Process memory, mutexes, and extended math are not available in extensions
+        - paragraph [ref=e1702]:
+          - strong [ref=e1703]: Validation
+        - paragraph [ref=e1704]:
+          - text: Extension scripts can be validated using the same
+          - code [ref=e1705]: check_script
+          - text: and
+          - code [ref=e1706]: validate_script
+          - text: tools (or the Verify toolbar button). The editor automatically detects that the file is in
+          - code [ref=e1707]: extensions/
+          - text: and uses a dedicated validator with the extension API surface. Note that
+          - code [ref=e1708]: validate_script
+          - text: with
+          - code [ref=e1709]: run=true
+          - text: is not supported for extensions — they are event-driven and have no
+          - code [ref=e1710]: main()
+          - text: entry point. The
+          - code [ref=e1711]: execute_script
+          - text: tool also cannot be used with extension code.
+        - paragraph [ref=e1712]:
+          - text: For the full extension API reference, examples, and hook documentation, see the
+          - strong [ref=e1713]: Extension Development
+          - text: page.
+        - separator [ref=e1714]
+        - paragraph [ref=e1715]:
+          - strong [ref=e1716]: File Backups & Timeline
+        - paragraph [ref=e1717]:
+          - text: Every save creates a timestamped backup. The
+          - strong [ref=e1718]: Timeline
+          - text: "sidebar tab lets you browse and compare backups:"
+        - list [ref=e1719]:
+          - listitem [ref=e1720]:
+            - generic [ref=e1722]: •
+            - paragraph [ref=e1724]: All backups for the current file are listed, sorted by date
+          - listitem [ref=e1725]:
+            - generic [ref=e1727]: •
+            - paragraph [ref=e1729]:
+              - text: Click any backup to open a
+              - strong [ref=e1730]: side-by-side diff view
+              - text: comparing it against the current version
+          - listitem [ref=e1731]:
+            - generic [ref=e1733]: •
+            - paragraph [ref=e1735]: Line-level add/remove/change highlighting
+          - listitem [ref=e1736]:
+            - generic [ref=e1738]: •
+            - paragraph [ref=e1740]:
+              - text: Configurable
+              - strong [ref=e1741]: max backup count
+              - text: and
+              - strong [ref=e1742]: backup directory
+              - text: in settings
+          - listitem [ref=e1743]:
+            - generic [ref=e1745]: •
+            - paragraph [ref=e1747]: Deleted file recovery — the most recent backup of removed files is preserved
+        - separator [ref=e1748]
+        - paragraph [ref=e1749]:
+          - strong [ref=e1750]: Settings
+        - paragraph [ref=e1751]:
+          - text: All configuration lives in the
+          - strong [ref=e1752]: Settings
+          - text: sidebar tab (gear icon). Everything persists to disk automatically.
+        - paragraph [ref=e1753]:
+          - strong [ref=e1754]: Project
+        - list [ref=e1755]:
+          - listitem [ref=e1756]:
+            - generic [ref=e1758]: •
+            - paragraph [ref=e1760]:
+              - strong [ref=e1761]: Root Directory
+              - text: — your project folder. Set via the text field and click Apply
+          - listitem [ref=e1762]:
+            - generic [ref=e1764]: •
+            - paragraph [ref=e1766]:
+              - strong [ref=e1767]: Workspace Folders
+              - text: — additional folders to include alongside the root directory. Click
+              - strong [ref=e1768]: Add Folder
+              - text: to browse,
+              - strong [ref=e1769]: ×
+              - text: to remove
+          - listitem [ref=e1770]:
+            - generic [ref=e1772]: •
+            - paragraph [ref=e1774]:
+              - strong [ref=e1775]: AI Root
+              - text: — managed via right-click in the file explorer (see
+              - strong [ref=e1776]: AI Root
+              - text: )
+        - paragraph [ref=e1777]:
+          - strong [ref=e1778]: Editor
+        - list [ref=e1779]:
+          - listitem [ref=e1780]:
+            - generic [ref=e1782]: •
+            - paragraph [ref=e1784]:
+              - strong [ref=e1785]: Scroll Speed
+              - text: — mouse wheel scroll multiplier
+          - listitem [ref=e1786]:
+            - generic [ref=e1788]: •
+            - paragraph [ref=e1790]:
+              - strong [ref=e1791]: Autoscroll Speed
+              - text: — speed when auto-scrolling during selection drag
+        - paragraph [ref=e1792]:
+          - strong [ref=e1793]: Bundler
+        - list [ref=e1794]:
+          - listitem [ref=e1795]:
+            - generic [ref=e1797]: •
+            - paragraph [ref=e1799]:
+              - strong [ref=e1800]: Strip comments from output
+              - text: — remove comments when bundling
+              - code [ref=e1801]: "#include"
+              - text: files
+        - paragraph [ref=e1802]:
+          - strong [ref=e1803]: Chatbot
+        - generic [ref=e1806]:
+          - rowgroup [ref=e1807]:
+            - row "Setting Description" [ref=e1808]:
+              - columnheader "Setting" [ref=e1809]
+              - columnheader "Description" [ref=e1810]
+          - table [ref=e1811]:
+            - rowgroup [ref=e1812]:
+              - row "AI Chat on Right Side Pin the chat panel to the right side of the editor" [ref=e1813]:
+                - cell "AI Chat on Right Side" [ref=e1814]:
+                  - paragraph [ref=e1816]: AI Chat on Right Side
+                - cell "Pin the chat panel to the right side of the editor" [ref=e1817]:
+                  - paragraph [ref=e1819]: Pin the chat panel to the right side of the editor
+              - row "Auto-accept AI edits Skip diff review and apply AI changes immediately" [ref=e1820]:
+                - cell "Auto-accept AI edits" [ref=e1821]:
+                  - paragraph [ref=e1823]: Auto-accept AI edits
+                - cell "Skip diff review and apply AI changes immediately" [ref=e1824]:
+                  - paragraph [ref=e1826]: Skip diff review and apply AI changes immediately
+              - 'row "Allow Advanced Writing Tools Enable dangerous tools: memory write, disassemble, delete file, string scan, and advanced RE analysis tools" [ref=e1827]':
+                - cell "Allow Advanced Writing Tools" [ref=e1828]:
+                  - paragraph [ref=e1830]: Allow Advanced Writing Tools
+                - 'cell "Enable dangerous tools: memory write, disassemble, delete file, string scan, and advanced RE analysis tools" [ref=e1831]':
+                  - paragraph [ref=e1833]: "Enable dangerous tools: memory write, disassemble, delete file, string scan, and advanced RE analysis tools"
+              - row "Enable Tool Calls Allow the AI to use tools (file ops, RE tools, shell, etc.)" [ref=e1834]:
+                - cell "Enable Tool Calls" [ref=e1835]:
+                  - paragraph [ref=e1837]: Enable Tool Calls
+                - cell "Allow the AI to use tools (file ops, RE tools, shell, etc.)" [ref=e1838]:
+                  - paragraph [ref=e1840]: Allow the AI to use tools (file ops, RE tools, shell, etc.)
+              - row "Provider Choose Default, GitHub, or Copilot. Each provider has independent settings that don't affect the others" [ref=e1841]:
+                - cell "Provider" [ref=e1842]:
+                  - paragraph [ref=e1844]: Provider
+                - cell "Choose Default, GitHub, or Copilot. Each provider has independent settings that don't affect the others" [ref=e1845]:
+                  - paragraph [ref=e1847]:
+                    - text: Choose
+                    - strong [ref=e1848]: Default
+                    - text: ","
+                    - strong [ref=e1849]: GitHub
+                    - text: ", or"
+                    - strong [ref=e1850]: Copilot
+                    - text: . Each provider has independent settings that don't affect the others
+              - row "URL (Default only) API endpoint URL (OpenAI-compatible)" [ref=e1851]:
+                - cell "URL (Default only)" [ref=e1852]:
+                  - paragraph [ref=e1854]: URL (Default only)
+                - cell "API endpoint URL (OpenAI-compatible)" [ref=e1855]:
+                  - paragraph [ref=e1857]: API endpoint URL (OpenAI-compatible)
+              - row "API Key (Default only) Bearer token for authentication" [ref=e1858]:
+                - cell "API Key (Default only)" [ref=e1859]:
+                  - paragraph [ref=e1861]: API Key (Default only)
+                - cell "Bearer token for authentication" [ref=e1862]:
+                  - paragraph [ref=e1864]: Bearer token for authentication
+              - row "GitHub Token (GitHub only) Personal Access Token with models:read scope" [ref=e1865]:
+                - cell "GitHub Token (GitHub only)" [ref=e1866]:
+                  - paragraph [ref=e1868]: GitHub Token (GitHub only)
+                - cell "Personal Access Token with models:read scope" [ref=e1869]:
+                  - paragraph [ref=e1871]:
+                    - text: Personal Access Token with
+                    - code [ref=e1872]: models:read
+                    - text: scope
+              - row "Sign in (Copilot only) OAuth device flow — click to authenticate with your GitHub Copilot subscription" [ref=e1873]:
+                - cell "Sign in (Copilot only)" [ref=e1874]:
+                  - paragraph [ref=e1876]: Sign in (Copilot only)
+                - cell "OAuth device flow — click to authenticate with your GitHub Copilot subscription" [ref=e1877]:
+                  - paragraph [ref=e1879]: OAuth device flow — click to authenticate with your GitHub Copilot subscription
+              - row "Planning / Reasoning Model list for the planning model. Add models manually (Default) or fetch from catalog (GitHub/Copilot)" [ref=e1880]:
+                - cell "Planning / Reasoning" [ref=e1881]:
+                  - paragraph [ref=e1883]: Planning / Reasoning
+                - cell "Model list for the planning model. Add models manually (Default) or fetch from catalog (GitHub/Copilot)" [ref=e1884]:
+                  - paragraph [ref=e1886]: Model list for the planning model. Add models manually (Default) or fetch from catalog (GitHub/Copilot)
+              - row "Implementation / Coder Model list for the coder model. Select \"No Coder\" to disable tandem mode" [ref=e1887]:
+                - cell "Implementation / Coder" [ref=e1888]:
+                  - paragraph [ref=e1890]: Implementation / Coder
+                - cell "Model list for the coder model. Select \"No Coder\" to disable tandem mode" [ref=e1891]:
+                  - paragraph [ref=e1893]: Model list for the coder model. Select "No Coder" to disable tandem mode
+              - row "Coder URL (Default only) Separate API endpoint for the coder model. Leave empty to use the planner's endpoint" [ref=e1894]:
+                - cell "Coder URL (Default only)" [ref=e1895]:
+                  - paragraph [ref=e1897]: Coder URL (Default only)
+                - cell "Separate API endpoint for the coder model. Leave empty to use the planner's endpoint" [ref=e1898]:
+                  - paragraph [ref=e1900]: Separate API endpoint for the coder model. Leave empty to use the planner's endpoint
+              - row "Coder API Key (Default only) Separate API key for the coder model. Leave empty to use the planner's key" [ref=e1901]:
+                - cell "Coder API Key (Default only)" [ref=e1902]:
+                  - paragraph [ref=e1904]: Coder API Key (Default only)
+                - cell "Separate API key for the coder model. Leave empty to use the planner's key" [ref=e1905]:
+                  - paragraph [ref=e1907]: Separate API key for the coder model. Leave empty to use the planner's key
+              - row "Tool Loop Limit Maximum number of consecutive tool call rounds" [ref=e1908]:
+                - cell "Tool Loop Limit" [ref=e1909]:
+                  - paragraph [ref=e1911]: Tool Loop Limit
+                - cell "Maximum number of consecutive tool call rounds" [ref=e1912]:
+                  - paragraph [ref=e1914]: Maximum number of consecutive tool call rounds
+              - row "Temperature Sampling temperature (0.0–2.0). Not sent for GitHub/Copilot providers — models use their own defaults" [ref=e1915]:
+                - cell "Temperature" [ref=e1916]:
+                  - paragraph [ref=e1918]: Temperature
+                - cell "Sampling temperature (0.0–2.0). Not sent for GitHub/Copilot providers — models use their own defaults" [ref=e1919]:
+                  - paragraph [ref=e1921]: Sampling temperature (0.0–2.0). Not sent for GitHub/Copilot providers — models use their own defaults
+              - row "Top P Nucleus sampling threshold. Not sent for GitHub/Copilot providers" [ref=e1922]:
+                - cell "Top P" [ref=e1923]:
+                  - paragraph [ref=e1925]: Top P
+                - cell "Nucleus sampling threshold. Not sent for GitHub/Copilot providers" [ref=e1926]:
+                  - paragraph [ref=e1928]: Nucleus sampling threshold. Not sent for GitHub/Copilot providers
+              - row "Brave Search Key API key for Brave web search (not required if using OpenRouter — web search works automatically via OpenRouter's web plugin)" [ref=e1929]:
+                - cell "Brave Search Key" [ref=e1930]:
+                  - paragraph [ref=e1932]: Brave Search Key
+                - cell "API key for Brave web search (not required if using OpenRouter — web search works automatically via OpenRouter's web plugin)" [ref=e1933]:
+                  - paragraph [ref=e1935]: API key for Brave web search (not required if using OpenRouter — web search works automatically via OpenRouter's web plugin)
+              - row "Extra System Prompt Your own persistent instructions appended to every request" [ref=e1936]:
+                - cell "Extra System Prompt" [ref=e1937]:
+                  - paragraph [ref=e1939]: Extra System Prompt
+                - cell "Your own persistent instructions appended to every request" [ref=e1940]:
+                  - paragraph [ref=e1942]: Your own persistent instructions appended to every request
+        - paragraph [ref=e1943]:
+          - strong [ref=e1944]: Code Fill
+        - paragraph [ref=e1945]:
+          - text: See
+          - strong [ref=e1946]: AI Code Fill
+          - text: for details on each setting.
+        - paragraph [ref=e1947]:
+          - strong [ref=e1948]: Backups
+        - generic [ref=e1951]:
+          - rowgroup [ref=e1952]:
+            - row "Setting Description" [ref=e1953]:
+              - columnheader "Setting" [ref=e1954]
+              - columnheader "Description" [ref=e1955]
+          - table [ref=e1956]:
+            - rowgroup [ref=e1957]:
+              - row "Max Backups Maximum number of backups per file" [ref=e1958]:
+                - cell "Max Backups" [ref=e1959]:
+                  - paragraph [ref=e1961]: Max Backups
+                - cell "Maximum number of backups per file" [ref=e1962]:
+                  - paragraph [ref=e1964]: Maximum number of backups per file
+              - row "Backup Directory Where backup files are stored" [ref=e1965]:
+                - cell "Backup Directory" [ref=e1966]:
+                  - paragraph [ref=e1968]: Backup Directory
+                - cell "Where backup files are stored" [ref=e1969]:
+                  - paragraph [ref=e1971]: Where backup files are stored
+        - paragraph [ref=e1972]:
+          - strong [ref=e1973]: Custom Commands
+        - paragraph [ref=e1974]:
+          - text: See
+          - strong [ref=e1975]: Custom Commands
+          - text: for details.
+        - separator [ref=e1976]
+        - paragraph [ref=e1977]:
+          - strong [ref=e1978]: Keyboard Shortcuts
+        - paragraph [ref=e1979]:
+          - strong [ref=e1980]: Editor
+        - generic [ref=e1983]:
+          - rowgroup [ref=e1984]:
+            - row "Key Action" [ref=e1985]:
+              - columnheader "Key" [ref=e1986]
+              - columnheader "Action" [ref=e1987]
+          - table [ref=e1988]:
+            - rowgroup [ref=e1989]:
+              - row "Ctrl+S Save file" [ref=e1990]:
+                - cell "Ctrl+S" [ref=e1991]:
+                  - paragraph [ref=e1993]: Ctrl+S
+                - cell "Save file" [ref=e1994]:
+                  - paragraph [ref=e1996]: Save file
+              - row "Ctrl+W Close tab" [ref=e1997]:
+                - cell "Ctrl+W" [ref=e1998]:
+                  - paragraph [ref=e2000]: Ctrl+W
+                - cell "Close tab" [ref=e2001]:
+                  - paragraph [ref=e2003]: Close tab
+              - row "Ctrl+F Find" [ref=e2004]:
+                - cell "Ctrl+F" [ref=e2005]:
+                  - paragraph [ref=e2007]: Ctrl+F
+                - cell "Find" [ref=e2008]:
+                  - paragraph [ref=e2010]: Find
+              - row "Ctrl+H Find & Replace" [ref=e2011]:
+                - cell "Ctrl+H" [ref=e2012]:
+                  - paragraph [ref=e2014]: Ctrl+H
+                - cell "Find & Replace" [ref=e2015]:
+                  - paragraph [ref=e2017]: Find & Replace
+              - row "Ctrl+Z Undo" [ref=e2018]:
+                - cell "Ctrl+Z" [ref=e2019]:
+                  - paragraph [ref=e2021]: Ctrl+Z
+                - cell "Undo" [ref=e2022]:
+                  - paragraph [ref=e2024]: Undo
+              - row "Ctrl+Y Redo" [ref=e2025]:
+                - cell "Ctrl+Y" [ref=e2026]:
+                  - paragraph [ref=e2028]: Ctrl+Y
+                - cell "Redo" [ref=e2029]:
+                  - paragraph [ref=e2031]: Redo
+              - row "Ctrl+D Duplicate line / selection" [ref=e2032]:
+                - cell "Ctrl+D" [ref=e2033]:
+                  - paragraph [ref=e2035]: Ctrl+D
+                - cell "Duplicate line / selection" [ref=e2036]:
+                  - paragraph [ref=e2038]: Duplicate line / selection
+              - row "Ctrl+/ Toggle comment" [ref=e2039]:
+                - cell "Ctrl+/" [ref=e2040]:
+                  - paragraph [ref=e2042]: Ctrl+/
+                - cell "Toggle comment" [ref=e2043]:
+                  - paragraph [ref=e2045]: Toggle comment
+              - row "Ctrl+Space Trigger code fill manually" [ref=e2046]:
+                - cell "Ctrl+Space" [ref=e2047]:
+                  - paragraph [ref=e2049]: Ctrl+Space
+                - cell "Trigger code fill manually" [ref=e2050]:
+                  - paragraph [ref=e2052]: Trigger code fill manually
+              - row "Ctrl+Scroll Zoom font size" [ref=e2053]:
+                - cell "Ctrl+Scroll" [ref=e2054]:
+                  - paragraph [ref=e2056]: Ctrl+Scroll
+                - cell "Zoom font size" [ref=e2057]:
+                  - paragraph [ref=e2059]: Zoom font size
+              - row "Tab Accept AI suggestion / Indent" [ref=e2060]:
+                - cell "Tab" [ref=e2061]:
+                  - paragraph [ref=e2063]: Tab
+                - cell "Accept AI suggestion / Indent" [ref=e2064]:
+                  - paragraph [ref=e2066]: Accept AI suggestion / Indent
+              - row "Esc Dismiss AI suggestion / Close find" [ref=e2067]:
+                - cell "Esc" [ref=e2068]:
+                  - paragraph [ref=e2070]: Esc
+                - cell "Dismiss AI suggestion / Close find" [ref=e2071]:
+                  - paragraph [ref=e2073]: Dismiss AI suggestion / Close find
+        - paragraph [ref=e2074]:
+          - strong [ref=e2075]: Diff Review
+        - generic [ref=e2078]:
+          - rowgroup [ref=e2079]:
+            - row "Key Action" [ref=e2080]:
+              - columnheader "Key" [ref=e2081]
+              - columnheader "Action" [ref=e2082]
+          - table [ref=e2083]:
+            - rowgroup [ref=e2084]:
+              - row "Enter Accept hunk" [ref=e2085]:
+                - cell "Enter" [ref=e2086]:
+                  - paragraph [ref=e2088]: Enter
+                - cell "Accept hunk" [ref=e2089]:
+                  - paragraph [ref=e2091]: Accept hunk
+              - row "Delete Reject hunk" [ref=e2092]:
+                - cell "Delete" [ref=e2093]:
+                  - paragraph [ref=e2095]: Delete
+                - cell "Reject hunk" [ref=e2096]:
+                  - paragraph [ref=e2098]: Reject hunk
+              - row "Up / Down Navigate between hunks" [ref=e2099]:
+                - cell "Up / Down" [ref=e2100]:
+                  - paragraph [ref=e2102]: Up / Down
+                - cell "Navigate between hunks" [ref=e2103]:
+                  - paragraph [ref=e2105]: Navigate between hunks
+              - row "Ctrl+Shift+A Accept all hunks" [ref=e2106]:
+                - cell "Ctrl+Shift+A" [ref=e2107]:
+                  - paragraph [ref=e2109]: Ctrl+Shift+A
+                - cell "Accept all hunks" [ref=e2110]:
+                  - paragraph [ref=e2112]: Accept all hunks
+              - row "Esc Reject all hunks" [ref=e2113]:
+                - cell "Esc" [ref=e2114]:
+                  - paragraph [ref=e2116]: Esc
+                - cell "Reject all hunks" [ref=e2117]:
+                  - paragraph [ref=e2119]: Reject all hunks
+        - paragraph [ref=e2120]:
+          - strong [ref=e2121]: Chat
+        - generic [ref=e2124]:
+          - rowgroup [ref=e2125]:
+            - row "Key Action" [ref=e2126]:
+              - columnheader "Key" [ref=e2127]
+              - columnheader "Action" [ref=e2128]
+          - table [ref=e2129]:
+            - rowgroup [ref=e2130]:
+              - row "Enter Send message" [ref=e2131]:
+                - cell "Enter" [ref=e2132]:
+                  - paragraph [ref=e2134]: Enter
+                - cell "Send message" [ref=e2135]:
+                  - paragraph [ref=e2137]: Send message
+              - row "Shift+Enter New line in message" [ref=e2138]:
+                - cell "Shift+Enter" [ref=e2139]:
+                  - paragraph [ref=e2141]: Shift+Enter
+                - cell "New line in message" [ref=e2142]:
+                  - paragraph [ref=e2144]: New line in message
+              - row "Ctrl+C Cancel AI stream (while streaming) / Copy selected text or hovered message" [ref=e2145]:
+                - cell "Ctrl+C" [ref=e2146]:
+                  - paragraph [ref=e2148]: Ctrl+C
+                - cell "Cancel AI stream (while streaming) / Copy selected text or hovered message" [ref=e2149]:
+                  - paragraph [ref=e2151]: Cancel AI stream (while streaming) / Copy selected text or hovered message
+        - paragraph [ref=e2152]:
+          - strong [ref=e2153]: Terminal
+        - generic [ref=e2156]:
+          - rowgroup [ref=e2157]:
+            - row "Key Action" [ref=e2158]:
+              - columnheader "Key" [ref=e2159]
+              - columnheader "Action" [ref=e2160]
+          - table [ref=e2161]:
+            - rowgroup [ref=e2162]:
+              - 'row "Ctrl+` Expand / collapse terminal" [ref=e2163]':
+                - 'cell "Ctrl+`" [ref=e2164]':
+                  - paragraph [ref=e2166]: "Ctrl+`"
+                - cell "Expand / collapse terminal" [ref=e2167]:
+                  - paragraph [ref=e2169]: Expand / collapse terminal
+              - row "Ctrl+L Clear terminal output" [ref=e2170]:
+                - cell "Ctrl+L" [ref=e2171]:
+                  - paragraph [ref=e2173]: Ctrl+L
+                - cell "Clear terminal output" [ref=e2174]:
+                  - paragraph [ref=e2176]: Clear terminal output
+              - row "Up / Down Command history" [ref=e2177]:
+                - cell "Up / Down" [ref=e2178]:
+                  - paragraph [ref=e2180]: Up / Down
+                - cell "Command history" [ref=e2181]:
+                  - paragraph [ref=e2183]: Command history
+              - row "Ctrl+C Send interrupt to process" [ref=e2184]:
+                - cell "Ctrl+C" [ref=e2185]:
+                  - paragraph [ref=e2187]: Ctrl+C
+                - cell "Send interrupt to process" [ref=e2188]:
+                  - paragraph [ref=e2190]: Send interrupt to process
+              - row "Esc Return focus to editor" [ref=e2191]:
+                - cell "Esc" [ref=e2192]:
+                  - paragraph [ref=e2194]: Esc
+                - cell "Return focus to editor" [ref=e2195]:
+                  - paragraph [ref=e2197]: Return focus to editor
+      - link "Next Extensions API chevron-right" [ref=e2199] [cursor=pointer]:
+        - /url: /perception-angel-script-api/perception-ide/extensions-api
+        - generic [ref=e2200]:
+          - generic [ref=e2201]: Next
+          - generic [ref=e2202]: Extensions API
+        - img "chevron-right" [ref=e2203]
+      - paragraph [ref=e2206]:
+        - text: Last updated
+        - time [ref=e2207]: 9 days ago
+  - alert [ref=e2208]

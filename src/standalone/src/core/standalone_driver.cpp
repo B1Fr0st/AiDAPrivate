@@ -2,6 +2,7 @@
 #include "standalone_driver.hpp"
 #include "standalone_license.hpp"
 #include "driver_loader.hpp"
+#include "toast_notification.hpp"
 #include "arc/arc.h"
 #include "comm.h"
 
@@ -76,8 +77,16 @@ namespace
     void set_last_error_locked(const std::string& text)
     {
         g_last_error = text;
-        if (!text.empty())
+        if (!text.empty()) {
             logf("AiDA Standalone: %s\n", text.c_str());
+            toast_notification::push(text);
+        }
+    }
+
+    void require_kernel_fail(const char* func_name)
+    {
+        logf("AiDA Standalone: %s requires kernel driver.\n", func_name);
+        toast_notification::push(std::string(func_name) + " requires kernel driver");
     }
 
     std::string utf8_from_wide(const wchar_t* text)
@@ -171,7 +180,9 @@ namespace driver_bridge
         g_kernel_mode = false;
         set_last_error_locked({});
 
-        if (driver_loader::initialize_and_load() && device && device->connect()) {
+        driver_loader::initialize_and_load();
+
+        if (device && device->connect()) {
             g_kernel_mode = true;
             g_initialized = true;
             logf("AiDA Standalone: Live inspection bridge initialized with kernel driver backend.\n");
@@ -189,12 +200,10 @@ namespace driver_bridge
         if (g_kernel_mode && device && device->is_connected())
             return true;
 
-        if (!driver_loader::initialize_and_load()) {
-            set_last_error_locked("Failed to load the kernel driver.");
-            return false;
-        }
+        driver_loader::initialize_and_load();
+
         if (!device || !device->connect()) {
-            set_last_error_locked("Kernel driver loaded, but user-mode bridge failed to connect to device.");
+            set_last_error_locked("Failed to connect to the kernel driver.");
             return false;
         }
 
@@ -231,52 +240,68 @@ namespace driver_bridge
 
         std::lock_guard<std::mutex> lk(g_state_mtx);
 
-        if (!g_kernel_mode || !device || !device->is_connected()) {
-            set_last_error_locked("Kernel driver required. Load the driver before attaching to a process.");
+        DWORD access = PROCESS_QUERY_LIMITED_INFORMATION;
+        unique_handle process(OpenProcess(access, FALSE, pid));
+        if (!process) {
+            set_last_error_locked("OpenProcess failed for PID " + std::to_string(pid) +
+                                  " (error " + std::to_string(GetLastError()) + ")");
             return false;
         }
 
-        const auto* vtable = get_arc_vtable();
-        if (vtable && vtable->set_process_id && vtable->solve_dtb &&
-            vtable->get_dtb && vtable->find_image && vtable->set_base_address) {
-            vtable->set_process_id(pid);
-            uint64_t dtb = vtable->solve_dtb();
-            if (dtb == 0) {
-                set_last_error_locked("Kernel bridge failed to resolve target DTB.");
-                return false;
-            }
-            const auto image_base = vtable->find_image();
-            if (image_base != 0)
-                vtable->set_base_address(image_base);
-        } else {
-            device->set_process_id(pid);
-            device->solve_dtb();
-            if (device->get_dtb() == 0) {
-                set_last_error_locked("Kernel bridge failed to resolve target DTB.");
-                return false;
-            }
-            const auto image_base = device->find_image();
-            if (image_base != 0)
-                device->set_base_address(image_base);
-        }
-
-        device->solve_kernel_dtb();
-        if (device->get_kernel_dtb() != 0) {
-            logf("AiDA Standalone: Kernel DTB solved: 0x%llX\n",
-                 static_cast<unsigned long long>(device->get_kernel_dtb()));
-        }
-
-        unique_handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
         close_process_handle_locked();
         g_process = process.release();
         g_pid = pid;
         if (!refresh_process_name_locked())
             g_process_name = process_name_from_pid(pid);
 
+        bool kernel_ok = g_kernel_mode && device && device->is_connected();
+        if (kernel_ok) {
+            const auto* vtable = get_arc_vtable();
+            if (vtable && vtable->set_process_id && vtable->solve_dtb &&
+                vtable->get_dtb && vtable->find_image && vtable->set_base_address) {
+                vtable->set_process_id(pid);
+                uint64_t dtb = vtable->solve_dtb();
+                if (dtb != 0) {
+                    const auto image_base = vtable->find_image();
+                    if (image_base != 0)
+                        vtable->set_base_address(image_base);
+                    device->set_process_id(pid);
+                    device->solve_dtb();
+                    if (image_base != 0)
+                        device->set_base_address(image_base);
+                } else {
+                    kernel_ok = false;
+                }
+            } else {
+                device->set_process_id(pid);
+                device->solve_dtb();
+                if (device->get_dtb() == 0) {
+                    kernel_ok = false;
+                } else {
+                    const auto image_base = device->find_image();
+                    if (image_base != 0)
+                        device->set_base_address(image_base);
+                }
+            }
+
+            if (kernel_ok) {
+                device->solve_kernel_dtb();
+                if (device->get_kernel_dtb() != 0) {
+                    logf("AiDA Standalone: Kernel DTB solved: 0x%llX\n",
+                         static_cast<unsigned long long>(device->get_kernel_dtb()));
+                }
+            }
+        }
+
         set_last_error_locked({});
-        logf("AiDA Standalone: Attached to PID %u (%s) via kernel driver. DTB=0x%llX\n",
-             g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str(),
-             static_cast<unsigned long long>(device->get_dtb()));
+        if (kernel_ok) {
+            logf("AiDA Standalone: Attached to PID %u (%s) via kernel driver. DTB=0x%llX\n",
+                 g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str(),
+                 static_cast<unsigned long long>(device->get_dtb()));
+        } else {
+            logf("AiDA Standalone: Attached to PID %u (%s) via user-mode handle.\n",
+                 g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str());
+        }
         return true;
     }
 
@@ -448,12 +473,55 @@ namespace driver_bridge
         return result;
     }
 
+    static std::vector<module_info_t> enumerate_modules_usermode(uint32_t pid, HANDLE process)
+    {
+        std::vector<module_info_t> result;
+
+        auto snapshot = make_handle(CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid));
+        if (!snapshot)
+            return result;
+
+        MODULEENTRY32W me = {};
+        me.dwSize = sizeof(me);
+        if (Module32FirstW(snapshot.get(), &me)) {
+            do {
+                module_info_t mod;
+                mod.base = reinterpret_cast<uint64_t>(me.modBaseAddr);
+                mod.size = me.modBaseSize;
+                mod.name = utf8_from_wide(me.szModule);
+                mod.path = utf8_from_wide(me.szExePath);
+                result.push_back(std::move(mod));
+            } while (Module32NextW(snapshot.get(), &me));
+        }
+
+        std::sort(result.begin(), result.end(), [](const module_info_t& a, const module_info_t& b) {
+            return a.base < b.base;
+        });
+        return result;
+    }
+
     std::vector<module_info_t> enumerate_modules()
     {
         std::vector<module_info_t> result;
         const uint32_t pid = attached_pid();
         if (!pid)
             return result;
+
+        HANDLE process = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            process = g_process;
+        }
+
+        if (process) {
+            result = enumerate_modules_usermode(pid, process);
+        }
+
+        if (!result.empty()) {
+            logf("AiDA Standalone: enumerate_modules: resolved %zu modules via user-mode snapshot for PID %u.\n",
+                 result.size(), pid);
+            return result;
+        }
 
         bool kernel_mode = false;
         {
@@ -462,7 +530,7 @@ namespace driver_bridge
         }
 
         if (!kernel_mode) {
-            logf("AiDA Standalone: enumerate_modules requires kernel driver.\n");
+            logf("AiDA Standalone: enumerate_modules: no modules resolved for PID %u.\n", pid);
             return result;
         }
 
@@ -553,7 +621,29 @@ namespace driver_bridge
         }
 
         if (!kernel_mode) {
-            logf("AiDA Standalone: enumerate_threads requires kernel driver.\n");
+            auto snapshot = make_handle(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+            if (snapshot) {
+                THREADENTRY32 te = {};
+                te.dwSize = sizeof(te);
+                if (Thread32First(snapshot.get(), &te)) {
+                    do {
+                        if (te.th32OwnerProcessID == pid) {
+                            thread_info_t t;
+                            t.tid = te.th32ThreadID;
+                            t.owner_pid = pid;
+                            t.priority = te.tpBasePri;
+                            t.state = 0;
+                            t.rip = 0;
+                            result.push_back(t);
+                        }
+                    } while (Thread32Next(snapshot.get(), &te));
+                }
+            }
+            std::sort(result.begin(), result.end(), [](const thread_info_t& a, const thread_info_t& b) {
+                return a.tid < b.tid;
+            });
+            logf("AiDA Standalone: enumerate_threads: resolved %zu threads via user-mode snapshot for PID %u.\n",
+                 result.size(), pid);
             return result;
         }
 
@@ -642,7 +732,6 @@ namespace driver_bridge
             return result;
         }
 
-        logf("AiDA Standalone: enumerate_memory_regions requires kernel driver.\n");
         return result;
     }
 
@@ -681,7 +770,6 @@ namespace driver_bridge
             }
         }
 
-        logf("AiDA Standalone: query_memory requires kernel driver.\n");
         return false;
     }
 
@@ -751,7 +839,6 @@ namespace driver_bridge
             return true;
         }
 
-        logf("AiDA Standalone: read_memory requires kernel driver.\n");
         return false;
     }
 
@@ -813,7 +900,6 @@ namespace driver_bridge
             return bytes_written > 0;
         }
 
-        logf("AiDA Standalone: write_memory requires kernel driver.\n");
         return false;
     }
 
@@ -848,7 +934,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: read_kernel_memory requires kernel driver.\n");
+            require_kernel_fail("read_kernel_memory");
             return false;
         }
 
@@ -873,7 +959,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: write_kernel_memory requires kernel driver.\n");
+            require_kernel_fail("write_kernel_memory");
             return false;
         }
 
@@ -893,7 +979,6 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: allocate_memory requires kernel driver.\n");
             return 0;
         }
 
@@ -911,7 +996,6 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: free_memory requires kernel driver.\n");
             return false;
         }
 
@@ -926,7 +1010,6 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: protect_memory requires kernel driver.\n");
             return false;
         }
 
@@ -942,7 +1025,6 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: get_thread_context requires kernel driver.\n");
             return false;
         }
 
@@ -969,7 +1051,6 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: set_thread_context requires kernel driver.\n");
             return false;
         }
 
@@ -993,7 +1074,6 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: suspend_thread requires kernel driver.\n");
             return false;
         }
 
@@ -1008,7 +1088,6 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: resume_thread requires kernel driver.\n");
             return false;
         }
 
@@ -1024,7 +1103,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: read_peb requires kernel driver.\n");
+            require_kernel_fail("read_peb");
             return false;
         }
 
@@ -1055,7 +1134,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: resolve_export requires kernel driver.\n");
+            require_kernel_fail("resolve_export");
             return 0;
         }
 
@@ -1073,7 +1152,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: virtual_to_physical requires kernel driver.\n");
+            require_kernel_fail("virtual_to_physical");
             return 0;
         }
 
@@ -1091,7 +1170,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: enumerate_connections requires kernel driver.\n");
+            require_kernel_fail("enumerate_connections");
             return result;
         }
 
@@ -1122,7 +1201,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: start_capture requires kernel driver.\n");
+            require_kernel_fail("start_capture");
             return false;
         }
 
@@ -1137,7 +1216,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: stop_capture requires kernel driver.\n");
+            require_kernel_fail("stop_capture");
             return false;
         }
 
@@ -1227,7 +1306,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: add_filter_rule requires kernel driver.\n");
+            require_kernel_fail("add_filter_rule");
             return false;
         }
 
@@ -1242,7 +1321,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: remove_filter_rule requires kernel driver.\n");
+            require_kernel_fail("remove_filter_rule");
             return false;
         }
 
@@ -1257,7 +1336,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: clear_filter_rules requires kernel driver.\n");
+            require_kernel_fail("clear_filter_rules");
             return false;
         }
 
@@ -1300,7 +1379,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: bw_monitor_op requires kernel driver.\n");
+            require_kernel_fail("bw_monitor_op");
             return false;
         }
 
@@ -1357,7 +1436,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: call_function requires kernel driver.\n");
+            require_kernel_fail("call_function");
             return 0;
         }
 
@@ -1379,7 +1458,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: find_gadget requires kernel driver.\n");
+            require_kernel_fail("find_gadget");
             return 0;
         }
 
@@ -1394,7 +1473,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: set_hardware_breakpoint requires kernel driver.\n");
+            require_kernel_fail("set_hardware_breakpoint");
             return false;
         }
 
@@ -1409,7 +1488,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: clear_hardware_breakpoint requires kernel driver.\n");
+            require_kernel_fail("clear_hardware_breakpoint");
             return false;
         }
 
@@ -1424,7 +1503,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: spoof_debug_flags requires kernel driver.\n");
+            require_kernel_fail("spoof_debug_flags");
             return false;
         }
 
@@ -1453,7 +1532,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: register_dll_protection requires kernel driver.\n");
+            require_kernel_fail("register_dll_protection");
             return false;
         }
 
@@ -1469,7 +1548,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: query_dll_protection requires kernel driver.\n");
+            require_kernel_fail("query_dll_protection");
             return false;
         }
 
@@ -1492,7 +1571,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: unregister_dll_protection requires kernel driver.\n");
+            require_kernel_fail("unregister_dll_protection");
             return false;
         }
 
@@ -1510,7 +1589,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: traffic_redirect_op requires kernel driver.\n");
+            require_kernel_fail("traffic_redirect_op");
             return false;
         }
 
@@ -1530,7 +1609,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: inject_packet requires kernel driver.\n");
+            require_kernel_fail("inject_packet");
             return false;
         }
 
@@ -1550,7 +1629,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: kill_connection requires kernel driver.\n");
+            require_kernel_fail("kill_connection");
             return false;
         }
 
@@ -1568,7 +1647,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: intercept_op requires kernel driver.\n");
+            require_kernel_fail("intercept_op");
             return false;
         }
 
@@ -1587,7 +1666,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: dns_spoof_op requires kernel driver.\n");
+            require_kernel_fail("dns_spoof_op");
             return false;
         }
 
@@ -1607,7 +1686,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: packet_mod_rule_op requires kernel driver.\n");
+            require_kernel_fail("packet_mod_rule_op");
             return false;
         }
 
@@ -1628,7 +1707,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: stream_reassemble_op requires kernel driver.\n");
+            require_kernel_fail("stream_reassemble_op");
             return false;
         }
 
@@ -1646,7 +1725,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: sniff_net_buffers_start requires kernel driver.\n");
+            require_kernel_fail("sniff_net_buffers_start");
             return false;
         }
 
@@ -1661,7 +1740,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: sniff_net_buffers_stop requires kernel driver.\n");
+            require_kernel_fail("sniff_net_buffers_stop");
             return false;
         }
 
@@ -1971,7 +2050,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: fingerprint_op requires kernel driver.\n");
+            require_kernel_fail("fingerprint_op");
             return false;
         }
         return device->fingerprint_op(operation);
@@ -2014,7 +2093,7 @@ namespace driver_bridge
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
         if (!kernel_mode) {
-            logf("AiDA Standalone: export_pcap requires kernel driver.\n");
+            require_kernel_fail("export_pcap");
             return false;
         }
 

@@ -1233,8 +1233,7 @@ inline void navigate_back()
 	if (g_state.history_pos > 0) {
 		g_state.history_pos--;
 		auto& entry = g_state.history[g_state.history_pos];
-		extern const settings_sa_t& get_standalone_settings();
-		decompile_function(entry.addr, get_standalone_settings());
+		decompile_function(entry.addr, g_sa_settings);
 	}
 }
 
@@ -1243,8 +1242,7 @@ inline void navigate_forward()
 	if (g_state.history_pos + 1 < static_cast<int>(g_state.history.size())) {
 		g_state.history_pos++;
 		auto& entry = g_state.history[g_state.history_pos];
-		extern const settings_sa_t& get_standalone_settings();
-		decompile_function(entry.addr, get_standalone_settings());
+		decompile_function(entry.addr, g_sa_settings);
 	}
 }
 
@@ -1275,8 +1273,7 @@ inline void batch_decompile(const std::vector<uint64_t>& addresses)
 	}
 
 	std::thread([addresses]() {
-		extern const settings_sa_t& get_standalone_settings();
-		auto& settings = get_standalone_settings();
+		auto& settings = g_sa_settings;
 
 		for (int i = 0; i < static_cast<int>(addresses.size()); ++i) {
 			if (g_state.cancel.load()) break;
@@ -1570,7 +1567,15 @@ inline void decompile_function_native(uint64_t func_addr) {
 	}
 
 	std::thread([func_addr]() {
-		auto ghidra_result = ghidra_decompiler::decompile_function(func_addr);
+		auto ghidra_result = ghidra_decompiler::decompile_function(func_addr, &g_state.cancel);
+
+		if (g_state.cancel.load()) {
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.current.is_error = true;
+			g_state.current.error_text = "decompilation cancelled";
+			g_state.decompiling.store(false);
+			return;
+		}
 
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		g_state.current.function_addr = func_addr;
@@ -1608,7 +1613,7 @@ inline void decompile_function_hybrid(uint64_t func_addr, const settings_sa_t& s
 	}
 
 	std::thread([func_addr, settings]() {
-		auto ghidra_result = ghidra_decompiler::decompile_function(func_addr);
+		auto ghidra_result = ghidra_decompiler::decompile_function(func_addr, &g_state.cancel);
 
 		if (ghidra_result.is_error) {
 			std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -1627,13 +1632,22 @@ inline void decompile_function_hybrid(uint64_t func_addr, const settings_sa_t& s
 
 		std::string ghidra_code = ghidra_result.pseudocode;
 
+		cfg_view::build_cfg(func_addr);
+		while (cfg_view::g_state.building.load())
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
 		std::vector<cfg_view::basic_block_t> blocks;
-		cfg_view::build_cfg(func_addr, blocks);
+		{
+			std::lock_guard<std::mutex> lk(cfg_view::g_state.mutex);
+			blocks = cfg_view::g_state.blocks;
+		}
 		std::string block_text = detail::build_block_text(blocks);
 		std::string xref_text = detail::build_xref_text(func_addr);
 		std::string mod_text = detail::resolve_module_symbols(func_addr);
 		auto import_lookup = detail::build_import_lookup(func_addr);
-		detail::annotate_instructions(blocks, import_lookup);
+		std::vector<uint8_t> func_mem;
+		driver_bridge::read_memory(func_addr, 0x8000, func_mem);
+		if (!func_mem.empty())
+			detail::annotate_instructions(blocks, func_mem.data(), func_addr, func_mem.size(), import_lookup);
 		std::string annotated = detail::build_block_text(blocks);
 
 		std::string system_prompt =
@@ -1666,56 +1680,49 @@ inline void decompile_function_hybrid(uint64_t func_addr, const settings_sa_t& s
 		}
 		user_prompt += "Improve this decompiled function. Output only the improved C pseudocode.";
 
-		standalone_ai_client::request_t req;
-		req.system_prompt = system_prompt;
-
-		standalone_ai_client::message_t msg;
-		msg.role = "user";
-		msg.content = user_prompt;
-		req.messages.push_back(msg);
-
-		req.model = settings.ai_model;
-		req.temperature = 0.2f;
-		req.max_tokens = 8192;
-
-		standalone_ai_client::stream(req, settings,
-			[func_addr](const std::string& chunk, bool done) {
+		std::string full_prompt = system_prompt + "\n\n---\n\n" + user_prompt;
+		auto ai = std::make_unique<standalone_ai_client_t>(settings);
+		std::vector<std::pair<std::string, std::string>> history;
+		std::string ai_result = ai->chat_blocking(
+			full_prompt, history,
+			[](const std::string& chunk) {
 				std::lock_guard<std::mutex> lk(g_state.mutex);
 				g_state.streaming_text += chunk;
-
-				if (done) {
-					std::string full = g_state.streaming_text;
-
-					auto fence_start = full.find("```");
-					if (fence_start != std::string::npos) {
-						auto nl = full.find('\n', fence_start);
-						if (nl != std::string::npos) {
-							auto fence_end = full.find("```", nl);
-							if (fence_end != std::string::npos)
-								full = full.substr(nl + 1, fence_end - nl - 1);
-							else
-								full = full.substr(nl + 1);
-						}
-					}
-
-					g_state.current.pseudocode = full;
-					g_state.current.function_addr = func_addr;
-					g_state.current.complete = true;
-					g_state.streaming_text = full;
-
-					g_state.cache[func_addr] = g_state.current;
-					detail::save_cache_entry_to_disk(func_addr, g_state.current);
-
-					g_state.decompiling.store(false);
-				}
 			},
-			[](const std::string& err) {
-				std::lock_guard<std::mutex> lk(g_state.mutex);
-				g_state.current.is_error = true;
-				g_state.current.error_text = err;
-				g_state.decompiling.store(false);
-			}
+			[](const std::string&) -> bool { return g_state.cancel.load(); }
 		);
+
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			std::string full = ai_result;
+			auto fence_start = full.find("```");
+			if (fence_start != std::string::npos) {
+				auto nl = full.find('\n', fence_start);
+				if (nl != std::string::npos) {
+					auto fence_end = full.find("```", nl);
+					if (fence_end != std::string::npos)
+						full = full.substr(nl + 1, fence_end - nl - 1);
+					else
+						full = full.substr(nl + 1);
+				}
+			}
+
+			if (full.empty()) {
+				g_state.current.is_error = true;
+				g_state.current.error_text = "AI returned empty result";
+				g_state.decompiling.store(false);
+				return;
+			}
+
+			g_state.current.pseudocode = full;
+			g_state.current.function_addr = func_addr;
+			g_state.current.complete = true;
+			g_state.streaming_text = full;
+
+			g_state.cache[func_addr] = g_state.current;
+			detail::save_cache_entry_to_disk(func_addr, g_state.current);
+			g_state.decompiling.store(false);
+		}
 	}).detach();
 }
 

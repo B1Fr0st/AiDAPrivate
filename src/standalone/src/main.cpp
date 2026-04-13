@@ -18,6 +18,7 @@
 #include "core/standalone_driver.hpp"
 #include "core/network_view.hpp"
 #include "core/script_engine.hpp"
+#include "core/toast_notification.hpp"
 #include "helpers/stb_image.h"
 
 #include <thread>
@@ -384,6 +385,7 @@ int main(int, char**)
         {
 
             helper.render_title();
+            toast_notification::render();
 
         }
 

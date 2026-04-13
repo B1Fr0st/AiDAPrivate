@@ -1,0 +1,951 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - generic [ref=e5]:
+      - generic [ref=e6]:
+        - button "Open table of contents" [ref=e7] [cursor=pointer]:
+          - img "bars" [ref=e8]
+        - link "Perception AngelScript & Lua API" [ref=e10] [cursor=pointer]:
+          - /url: /perception-angel-script-api
+          - generic [ref=e11]: Perception AngelScript & Lua API
+      - generic [ref=e15]:
+        - img "search" [ref=e17]
+        - textbox "Search" [ref=e19]:
+          - /placeholder: Search…
+  - main [ref=e24]:
+    - generic [ref=e25]:
+      - generic [ref=e27]:
+        - button "Copy page" [ref=e28] [cursor=pointer]:
+          - img "copy" [ref=e29]
+          - generic [ref=e31]: Copy
+        - button "More" [ref=e32] [cursor=pointer]:
+          - img "chevron-down" [ref=e33]
+      - heading "Perception Analyzer" [level=1] [ref=e35]
+    - generic [ref=e36]:
+      - paragraph [ref=e37]: The Perception Analyzer is an integrated binary analysis tool built into the Perception.cx platform. It provides IDA-style disassembly, a full F5 decompiler, source reconstruction, hex viewing, memory scanning, and structure editing — all operating directly on live processes through Perception's memory access layer.
+      - paragraph [ref=e38]: The Analyzer is designed from the ground up for speed. Analysis that takes minutes in traditional tools completes in seconds. Function detection, cross-reference building, string scanning, and decompilation all run in parallel across multiple threads, keeping the UI fully responsive throughout.
+      - paragraph [ref=e39]:
+        - text: I am also actively working on the
+        - strong [ref=e40]: Reconstruct Source
+        - text: feature shown in the screenshots below. This feature is still experimental and not yet fully mature, but it is being continuously developed with the goal of becoming a truly state-of-the-art reconstruction system.
+      - paragraph [ref=e41]: If this feature interests you and you would like to help improve it, please feel free to share suggestions and bug reports.
+      - paragraph [ref=e42]:
+        - text: —
+        - strong [ref=e43]: Timefall / Admin
+      - paragraph [ref=e64]: F5 Decompiler (Advance Decompiler - Generates Pseudo C) - This feature is still under development with ongoing tests and improvements.
+      - paragraph [ref=e73]:
+        - text: The experimental
+        - strong [ref=e74]: Reconstruct Source
+        - text: feature generates a full project-style source reconstruction from a binary with a single click.
+      - paragraph [ref=e75]: "The output includes:"
+      - list [ref=e76]:
+        - listitem [ref=e77]:
+          - generic [ref=e79]: •
+          - paragraph [ref=e81]:
+            - strong [ref=e82]: Header files
+            - text: — types, structs, enums, globals, imports, vtables, string constants, and static data references
+        - listitem [ref=e83]:
+          - generic [ref=e85]: •
+          - paragraph [ref=e87]:
+            - strong [ref=e88]: Source files
+            - text: — decompiled functions grouped into named modules (e.g.,
+            - code [ref=e89]: module_render
+            - text: ","
+            - code [ref=e90]: module_network
+            - text: ","
+            - code [ref=e91]: module_audio
+            - text: )
+        - listitem [ref=e92]:
+          - generic [ref=e94]: •
+          - paragraph [ref=e96]:
+            - strong [ref=e97]: Common helpers
+            - text: — frequently used utility functions extracted into
+            - code [ref=e98]: common.cpp
+        - listitem [ref=e99]:
+          - generic [ref=e101]: •
+          - paragraph [ref=e103]:
+            - strong [ref=e104]: Hostile / unresolved functions
+            - text: — obfuscated or failed functions emit
+            - code [ref=e105]: "__asm {}"
+            - text: blocks with the raw disassembly
+        - listitem [ref=e106]:
+          - generic [ref=e108]: •
+          - paragraph [ref=e110]:
+            - strong [ref=e111]: Analysis metadata
+            - text: — cross-references and module assignments exported as JSON
+      - paragraph [ref=e112]:
+        - text: The project structure and files shown below are generated automatically using the
+        - strong [ref=e113]: Reconstruct Source
+        - text: button.
+      - separator [ref=e134]
+      - heading "Direct link to heading Getting Started" [level=3] [ref=e135]:
+        - link "Direct link to heading" [ref=e137] [cursor=pointer]:
+          - /url: "#getting-started"
+          - img "hashtag" [ref=e138]
+        - generic [ref=e140]: Getting Started
+      - heading "Direct link to heading Attaching to a Process" [level=4] [ref=e141]:
+        - link "Direct link to heading" [ref=e143] [cursor=pointer]:
+          - /url: "#attaching-to-a-process"
+          - img "hashtag" [ref=e144]
+        - generic [ref=e146]: Attaching to a Process
+      - paragraph [ref=e151]: When the Analyzer opens, you are presented with a process selection screen. All active processes detected by Perception are listed. You can filter the list by typing in the search field at the top.
+      - paragraph [ref=e152]:
+        - text: Click a process to select it, then click
+        - strong [ref=e153]: Attach
+        - text: to begin analysis.
+      - heading "Direct link to heading Module Loading Modes" [level=4] [ref=e154]:
+        - link "Direct link to heading" [ref=e156] [cursor=pointer]:
+          - /url: "#module-loading-modes"
+          - img "hashtag" [ref=e157]
+        - generic [ref=e159]: Module Loading Modes
+      - paragraph [ref=e164]:
+        - text: Before attaching, you can choose how modules are loaded using the
+        - strong [ref=e165]: Module Loading
+        - text: "pills at the bottom of the process selection card:"
+      - generic [ref=e168]:
+        - rowgroup [ref=e169]:
+          - row "Mode Behavior" [ref=e170]:
+            - columnheader "Mode" [ref=e171]
+            - columnheader "Behavior" [ref=e172]
+        - table [ref=e173]:
+          - rowgroup [ref=e174]:
+            - row "Disabled No modules are analyzed." [ref=e175]:
+              - cell "Disabled" [ref=e176]:
+                - paragraph [ref=e178]:
+                  - strong [ref=e179]: Disabled
+              - cell "No modules are analyzed." [ref=e180]:
+                - paragraph [ref=e182]: No modules are analyzed.
+            - row "Primary Only the main executable is fully analyzed. Other modules receive header-only loading (exports + sections visible, disassembly via on-demand decode)." [ref=e183]:
+              - cell "Primary" [ref=e184]:
+                - paragraph [ref=e186]:
+                  - strong [ref=e187]: Primary
+              - cell "Only the main executable is fully analyzed. Other modules receive header-only loading (exports + sections visible, disassembly via on-demand decode)." [ref=e188]:
+                - paragraph [ref=e190]: Only the main executable is fully analyzed. Other modules receive header-only loading (exports + sections visible, disassembly via on-demand decode).
+            - row "Selected After attaching, a checkbox list lets you choose which modules to fully analyze. The main executable and critical system DLLs are always included." [ref=e191]:
+              - cell "Selected" [ref=e192]:
+                - paragraph [ref=e194]:
+                  - strong [ref=e195]: Selected
+              - cell "After attaching, a checkbox list lets you choose which modules to fully analyze. The main executable and critical system DLLs are always included." [ref=e196]:
+                - paragraph [ref=e198]: After attaching, a checkbox list lets you choose which modules to fully analyze. The main executable and critical system DLLs are always included.
+            - row "All Every loaded module is fully analyzed. This can take significantly longer for large processes." [ref=e199]:
+              - cell "All" [ref=e200]:
+                - paragraph [ref=e202]:
+                  - strong [ref=e203]: All
+              - cell "Every loaded module is fully analyzed. This can take significantly longer for large processes." [ref=e204]:
+                - paragraph [ref=e206]: Every loaded module is fully analyzed. This can take significantly longer for large processes.
+      - blockquote [ref=e207]:
+        - paragraph [ref=e208]:
+          - strong [ref=e209]: Header-only modules
+          - text: are still browsable — you can view exports, navigate sections, and disassemble code on the fly. Full analysis adds function detection, cross-references, and string identification.
+      - paragraph [ref=e210]:
+        - strong [ref=e211]: Module Switching
+      - paragraph [ref=e212]:
+        - text: Once attached, the module badge in the toolbar (e.g.,
+        - code [ref=e213]: smss.exe
+        - text: ) acts as a dropdown. Click it to switch between loaded modules. A filter field at the top of the dropdown lets you search by module name.
+      - separator [ref=e214]
+      - heading "Direct link to heading Views" [level=4] [ref=e215]:
+        - link "Direct link to heading" [ref=e217] [cursor=pointer]:
+          - /url: "#views"
+          - img "hashtag" [ref=e218]
+        - generic [ref=e220]: Views
+      - paragraph [ref=e221]: "The Analyzer has five main views, accessible from the tab bar at the top of the workspace:"
+      - paragraph [ref=e222]:
+        - strong [ref=e223]: Disasm (Disassembly)
+      - paragraph [ref=e224]: "The primary view. Displays a linear disassembly of the current module with:"
+      - list [ref=e225]:
+        - listitem [ref=e226]:
+          - generic [ref=e228]: •
+          - paragraph [ref=e230]:
+            - strong [ref=e231]: Address column
+            - text: — Virtual addresses or symbol labels (e.g.,
+            - code [ref=e232]: "str_7FF7D1C92778:"
+            - text: for strings)
+        - listitem [ref=e233]:
+          - generic [ref=e235]: •
+          - paragraph [ref=e237]:
+            - strong [ref=e238]: Bytes column
+            - text: — Raw instruction bytes (toggle in Settings)
+        - listitem [ref=e239]:
+          - generic [ref=e241]: •
+          - paragraph [ref=e243]:
+            - strong [ref=e244]: Mnemonic column
+            - text: — Instruction mnemonic with syntax coloring (calls, jumps, returns, NOPs)
+        - listitem [ref=e245]:
+          - generic [ref=e247]: •
+          - paragraph [ref=e249]:
+            - strong [ref=e250]: Operands column
+            - text: — Instruction operands with resolved targets
+        - listitem [ref=e251]:
+          - generic [ref=e253]: •
+          - paragraph [ref=e255]:
+            - strong [ref=e256]: Comment column
+            - text: — Auto-generated cross-reference hints and string previews
+      - paragraph [ref=e257]:
+        - strong [ref=e258]: Function headers
+        - text: appear as highlighted bars showing the function name, size, and xref count.
+        - strong [ref=e259]: Labels
+        - text: (
+        - code [ref=e260]: "loc_xxxx:"
+        - text: ","
+        - code [ref=e261]: "sub_xxxx:"
+        - text: ) mark branch targets and function entries.
+        - strong [ref=e262]: String references
+        - text: display IDA-style with the symbol name in the address column and the quoted string value at the mnemonic position.
+      - paragraph [ref=e263]:
+        - strong [ref=e264]: Navigation
+      - generic [ref=e267]:
+        - rowgroup [ref=e268]:
+          - row "Action Effect" [ref=e269]:
+            - columnheader "Action" [ref=e270]
+            - columnheader "Effect" [ref=e271]
+        - table [ref=e272]:
+          - rowgroup [ref=e273]:
+            - row "Click a branch target Navigate to that address" [ref=e274]:
+              - cell "Click a branch target" [ref=e275]:
+                - paragraph [ref=e277]: Click a branch target
+              - cell "Navigate to that address" [ref=e278]:
+                - paragraph [ref=e280]: Navigate to that address
+            - row "Ctrl+G Go to address (supports hex, decimal, and expressions like base+0x1000)" [ref=e281]:
+              - cell "Ctrl+G" [ref=e282]:
+                - paragraph [ref=e284]:
+                  - code [ref=e285]: Ctrl+G
+              - cell "Go to address (supports hex, decimal, and expressions like base+0x1000)" [ref=e286]:
+                - paragraph [ref=e288]:
+                  - text: Go to address (supports hex, decimal, and expressions like
+                  - code [ref=e289]: base+0x1000
+                  - text: )
+            - row "Alt+Left / Alt+Right Navigate back / forward" [ref=e290]:
+              - cell "Alt+Left / Alt+Right" [ref=e291]:
+                - paragraph [ref=e293]:
+                  - code [ref=e294]: Alt+Left
+                  - text: /
+                  - code [ref=e295]: Alt+Right
+              - cell "Navigate back / forward" [ref=e296]:
+                - paragraph [ref=e298]: Navigate back / forward
+            - row "M4 / M5 (mouse buttons) Navigate back / forward" [ref=e299]:
+              - cell "M4 / M5 (mouse buttons)" [ref=e300]:
+                - paragraph [ref=e302]:
+                  - code [ref=e303]: M4
+                  - text: /
+                  - code [ref=e304]: M5
+                  - text: (mouse buttons)
+              - cell "Navigate back / forward" [ref=e305]:
+                - paragraph [ref=e307]: Navigate back / forward
+            - row "Ctrl+F Open search popup" [ref=e308]:
+              - cell "Ctrl+F" [ref=e309]:
+                - paragraph [ref=e311]:
+                  - code [ref=e312]: Ctrl+F
+              - cell "Open search popup" [ref=e313]:
+                - paragraph [ref=e315]: Open search popup
+            - row "Page Up / Page Down Scroll by screen" [ref=e316]:
+              - cell "Page Up / Page Down" [ref=e317]:
+                - paragraph [ref=e319]:
+                  - code [ref=e320]: Page Up
+                  - text: /
+                  - code [ref=e321]: Page Down
+              - cell "Scroll by screen" [ref=e322]:
+                - paragraph [ref=e324]: Scroll by screen
+            - row "Shift+Scroll Horizontal scroll" [ref=e325]:
+              - cell "Shift+Scroll" [ref=e326]:
+                - paragraph [ref=e328]:
+                  - code [ref=e329]: Shift+Scroll
+              - cell "Horizontal scroll" [ref=e330]:
+                - paragraph [ref=e332]: Horizontal scroll
+            - row "Home Reset horizontal scroll" [ref=e333]:
+              - cell "Home" [ref=e334]:
+                - paragraph [ref=e336]:
+                  - code [ref=e337]: Home
+              - cell "Reset horizontal scroll" [ref=e338]:
+                - paragraph [ref=e340]: Reset horizontal scroll
+      - paragraph [ref=e341]:
+        - strong [ref=e342]: Search
+      - paragraph [ref=e343]:
+        - text: Click the
+        - strong [ref=e344]: Search
+        - text: button or press
+        - code [ref=e345]: Ctrl+F
+        - text: to open the search popup. Toggle between
+        - strong [ref=e346]: Hex
+        - text: and
+        - strong [ref=e347]: String
+        - text: "mode using the pills:"
+      - list [ref=e348]:
+        - listitem [ref=e349]:
+          - generic [ref=e351]: •
+          - paragraph [ref=e353]:
+            - strong [ref=e354]: Hex mode
+            - text: "— Pattern search with wildcards:"
+            - code [ref=e355]: 48 8B ?? 4C 89 ...
+            - text: (
+            - code [ref=e356]: "??"
+            - text: matches any byte)
+        - listitem [ref=e357]:
+          - generic [ref=e359]: •
+          - paragraph [ref=e361]:
+            - strong [ref=e362]: String mode
+            - text: — Case-insensitive text search
+      - paragraph [ref=e363]:
+        - text: Results are navigated with the
+        - strong [ref=e364]: Prev
+        - text: /
+        - strong [ref=e365]: Next
+        - text: buttons. The status bar shows the current match index and total count.
+      - blockquote [ref=e366]:
+        - paragraph [ref=e367]: Searches scan PE sections only — headers, padding, and zero-filled regions are excluded.
+      - paragraph [ref=e368]:
+        - strong [ref=e369]: Symbols and Comments
+      - generic [ref=e372]:
+        - rowgroup [ref=e373]:
+          - row "Key Action" [ref=e374]:
+            - columnheader "Key" [ref=e375]
+            - columnheader "Action" [ref=e376]
+        - table [ref=e377]:
+          - rowgroup [ref=e378]:
+            - row "N Rename the symbol at the current address" [ref=e379]:
+              - cell "N" [ref=e380]:
+                - paragraph [ref=e382]:
+                  - code [ref=e383]: "N"
+              - cell "Rename the symbol at the current address" [ref=e384]:
+                - paragraph [ref=e386]: Rename the symbol at the current address
+            - row "; Add or edit a comment at the current address" [ref=e387]:
+              - cell ";" [ref=e388]:
+                - paragraph [ref=e390]:
+                  - code [ref=e391]: ;
+              - cell "Add or edit a comment at the current address" [ref=e392]:
+                - paragraph [ref=e394]: Add or edit a comment at the current address
+      - paragraph [ref=e395]: Renames and comments are saved with the session and persist across restarts.
+      - separator [ref=e396]
+      - paragraph [ref=e397]:
+        - strong [ref=e398]: Hex
+      - paragraph [ref=e399]: A traditional hex editor view of the module's raw image. Displays bytes in configurable columns with an ASCII sidebar. Useful for inspecting data regions, padding, and raw binary content.
+      - separator [ref=e400]
+      - paragraph [ref=e401]:
+        - strong [ref=e402]: Types (Structure Editor)
+      - paragraph [ref=e403]: A ReClass-style structure editor for defining and inspecting memory layouts.
+      - paragraph [ref=e404]:
+        - strong [ref=e405]: Creating Structures
+      - list [ref=e406]:
+        - listitem [ref=e407]:
+          - generic [ref=e409]: "1."
+          - paragraph [ref=e411]:
+            - text: Click
+            - strong [ref=e412]: New
+            - text: in the left panel to create a new struct.
+        - listitem [ref=e413]:
+          - generic [ref=e415]: "2."
+          - paragraph [ref=e417]:
+            - text: Set the
+            - strong [ref=e418]: Name
+            - text: and
+            - strong [ref=e419]: Base Address
+            - text: fields at the top.
+        - listitem [ref=e420]:
+          - generic [ref=e422]: "3."
+          - paragraph [ref=e424]: "Click any type button in the toolbar to add a field:"
+      - generic [ref=e427]:
+        - rowgroup [ref=e428]:
+          - row "Category Types" [ref=e429]:
+            - columnheader "Category" [ref=e430]
+            - columnheader "Types" [ref=e431]
+        - table [ref=e432]:
+          - rowgroup [ref=e433]:
+            - row "Integer Hex8, U8, U16, U32, U64, I8, I16, I32, I64" [ref=e434]:
+              - cell "Integer" [ref=e435]:
+                - paragraph [ref=e437]: Integer
+              - cell "Hex8, U8, U16, U32, U64, I8, I16, I32, I64" [ref=e438]:
+                - paragraph [ref=e440]:
+                  - code [ref=e441]: Hex8
+                  - text: ","
+                  - code [ref=e442]: U8
+                  - text: ","
+                  - code [ref=e443]: U16
+                  - text: ","
+                  - code [ref=e444]: U32
+                  - text: ","
+                  - code [ref=e445]: U64
+                  - text: ","
+                  - code [ref=e446]: I8
+                  - text: ","
+                  - code [ref=e447]: I16
+                  - text: ","
+                  - code [ref=e448]: I32
+                  - text: ","
+                  - code [ref=e449]: I64
+            - row "Float Float, Double" [ref=e450]:
+              - cell "Float" [ref=e451]:
+                - paragraph [ref=e453]: Float
+              - cell "Float, Double" [ref=e454]:
+                - paragraph [ref=e456]:
+                  - code [ref=e457]: Float
+                  - text: ","
+                  - code [ref=e458]: Double
+            - row "Other Bool, Ptr, UTF8, UTF16, Pad" [ref=e459]:
+              - cell "Other" [ref=e460]:
+                - paragraph [ref=e462]: Other
+              - cell "Bool, Ptr, UTF8, UTF16, Pad" [ref=e463]:
+                - paragraph [ref=e465]:
+                  - code [ref=e466]: Bool
+                  - text: ","
+                  - code [ref=e467]: Ptr
+                  - text: ","
+                  - code [ref=e468]: UTF8
+                  - text: ","
+                  - code [ref=e469]: UTF16
+                  - text: ","
+                  - code [ref=e470]: Pad
+            - row "Vector Vec2, Vec3, Vec4, Vec2D, Vec3D, Vec4D" [ref=e471]:
+              - cell "Vector" [ref=e472]:
+                - paragraph [ref=e474]: Vector
+              - cell "Vec2, Vec3, Vec4, Vec2D, Vec3D, Vec4D" [ref=e475]:
+                - paragraph [ref=e477]:
+                  - code [ref=e478]: Vec2
+                  - text: ","
+                  - code [ref=e479]: Vec3
+                  - text: ","
+                  - code [ref=e480]: Vec4
+                  - text: ","
+                  - code [ref=e481]: Vec2D
+                  - text: ","
+                  - code [ref=e482]: Vec3D
+                  - text: ","
+                  - code [ref=e483]: Vec4D
+            - row "Matrix M3x4, M4x4, M3x4D, M4x4D" [ref=e484]:
+              - cell "Matrix" [ref=e485]:
+                - paragraph [ref=e487]: Matrix
+              - cell "M3x4, M4x4, M3x4D, M4x4D" [ref=e488]:
+                - paragraph [ref=e490]:
+                  - code [ref=e491]: M3x4
+                  - text: ","
+                  - code [ref=e492]: M4x4
+                  - text: ","
+                  - code [ref=e493]: M3x4D
+                  - text: ","
+                  - code [ref=e494]: M4x4D
+      - paragraph [ref=e495]: Fields are displayed with their offset, type, name, and live value read from the target process.
+      - paragraph [ref=e496]:
+        - strong [ref=e497]: Editing Fields
+      - generic [ref=e500]:
+        - rowgroup [ref=e501]:
+          - row "Key Action" [ref=e502]:
+            - columnheader "Key" [ref=e503]
+            - columnheader "Action" [ref=e504]
+        - table [ref=e505]:
+          - rowgroup [ref=e506]:
+            - row "T / Shift+T Retype the selected node (cycle forward / backward)" [ref=e507]:
+              - cell "T / Shift+T" [ref=e508]:
+                - paragraph [ref=e510]:
+                  - code [ref=e511]: T
+                  - text: /
+                  - code [ref=e512]: Shift+T
+              - cell "Retype the selected node (cycle forward / backward)" [ref=e513]:
+                - paragraph [ref=e515]: Retype the selected node (cycle forward / backward)
+            - row "R Rename the selected node" [ref=e516]:
+              - cell "R" [ref=e517]:
+                - paragraph [ref=e519]:
+                  - code [ref=e520]: R
+              - cell "Rename the selected node" [ref=e521]:
+                - paragraph [ref=e523]: Rename the selected node
+            - row "Delete Delete the selected node" [ref=e524]:
+              - cell "Delete" [ref=e525]:
+                - paragraph [ref=e527]:
+                  - code [ref=e528]: Delete
+              - cell "Delete the selected node" [ref=e529]:
+                - paragraph [ref=e531]: Delete the selected node
+      - paragraph [ref=e532]:
+        - strong [ref=e533]: Import / Export
+      - list [ref=e534]:
+        - listitem [ref=e535]:
+          - generic [ref=e537]: •
+          - paragraph [ref=e539]:
+            - strong [ref=e540]: Import
+            - text: — Paste a C-style struct definition to auto-generate fields.
+        - listitem [ref=e541]:
+          - generic [ref=e543]: •
+          - paragraph [ref=e545]:
+            - strong [ref=e546]: "Export: C++"
+            - text: /
+            - strong [ref=e547]: "Export: AS"
+            - text: /
+            - strong [ref=e548]: "Export: Lua"
+            - text: — Export the struct as code in the selected language.
+      - blockquote [ref=e549]:
+        - paragraph [ref=e550]: Structures are saved automatically and persist across sessions.
+      - separator [ref=e551]
+      - paragraph [ref=e552]:
+        - strong [ref=e553]: Scan (Memory Scanner)
+      - paragraph [ref=e554]: A live memory scanner for finding values in the target process's address space.
+      - paragraph [ref=e555]:
+        - strong [ref=e556]: First Scan
+      - list [ref=e557]:
+        - listitem [ref=e558]:
+          - generic [ref=e560]: "1."
+          - paragraph [ref=e562]:
+            - text: Select the
+            - strong [ref=e563]: Type
+            - text: (UInt8 through Double, String, or WString).
+        - listitem [ref=e564]:
+          - generic [ref=e566]: "2."
+          - paragraph [ref=e568]:
+            - text: Select the
+            - strong [ref=e569]: Compare
+            - text: "mode:"
+      - generic [ref=e572]:
+        - rowgroup [ref=e573]:
+          - row "Compare Description" [ref=e574]:
+            - columnheader "Compare" [ref=e575]
+            - columnheader "Description" [ref=e576]
+        - table [ref=e577]:
+          - rowgroup [ref=e578]:
+            - row "Exact Value equals the input exactly" [ref=e579]:
+              - cell "Exact" [ref=e580]:
+                - paragraph [ref=e582]: Exact
+              - cell "Value equals the input exactly" [ref=e583]:
+                - paragraph [ref=e585]: Value equals the input exactly
+            - row "Greater Than Value is greater than the input" [ref=e586]:
+              - cell "Greater Than" [ref=e587]:
+                - paragraph [ref=e589]: Greater Than
+              - cell "Value is greater than the input" [ref=e590]:
+                - paragraph [ref=e592]: Value is greater than the input
+            - row "Less Than Value is less than the input" [ref=e593]:
+              - cell "Less Than" [ref=e594]:
+                - paragraph [ref=e596]: Less Than
+              - cell "Value is less than the input" [ref=e597]:
+                - paragraph [ref=e599]: Value is less than the input
+            - row "Unknown Value Capture all addresses (for later refinement)" [ref=e600]:
+              - cell "Unknown Value" [ref=e601]:
+                - paragraph [ref=e603]: Unknown Value
+              - cell "Capture all addresses (for later refinement)" [ref=e604]:
+                - paragraph [ref=e606]: Capture all addresses (for later refinement)
+      - list [ref=e607]:
+        - listitem [ref=e608]:
+          - generic [ref=e610]: "3."
+          - paragraph [ref=e612]:
+            - text: Enter a
+            - strong [ref=e613]: Value
+            - text: (not needed for Unknown Value).
+        - listitem [ref=e614]:
+          - generic [ref=e616]: "4."
+          - paragraph [ref=e618]:
+            - text: Click
+            - strong [ref=e619]: First Scan
+            - text: .
+      - paragraph [ref=e620]:
+        - strong [ref=e621]: Next Scan
+      - paragraph [ref=e622]: "After the first scan, refine results with additional compare modes:"
+      - generic [ref=e625]:
+        - rowgroup [ref=e626]:
+          - row "Compare Description" [ref=e627]:
+            - columnheader "Compare" [ref=e628]
+            - columnheader "Description" [ref=e629]
+        - table [ref=e630]:
+          - rowgroup [ref=e631]:
+            - row "Changed Value changed since last scan" [ref=e632]:
+              - cell "Changed" [ref=e633]:
+                - paragraph [ref=e635]: Changed
+              - cell "Value changed since last scan" [ref=e636]:
+                - paragraph [ref=e638]: Value changed since last scan
+            - row "Unchanged Value stayed the same" [ref=e639]:
+              - cell "Unchanged" [ref=e640]:
+                - paragraph [ref=e642]: Unchanged
+              - cell "Value stayed the same" [ref=e643]:
+                - paragraph [ref=e645]: Value stayed the same
+            - row "Increased Value increased" [ref=e646]:
+              - cell "Increased" [ref=e647]:
+                - paragraph [ref=e649]: Increased
+              - cell "Value increased" [ref=e650]:
+                - paragraph [ref=e652]: Value increased
+            - row "Decreased Value decreased" [ref=e653]:
+              - cell "Decreased" [ref=e654]:
+                - paragraph [ref=e656]: Decreased
+              - cell "Value decreased" [ref=e657]:
+                - paragraph [ref=e659]: Value decreased
+      - paragraph [ref=e660]:
+        - text: Click
+        - strong [ref=e661]: Next Scan
+        - text: to filter. Click
+        - strong [ref=e662]: Clear
+        - text: to reset and start over.
+      - paragraph [ref=e663]:
+        - strong [ref=e664]: Options
+      - list [ref=e665]:
+        - listitem [ref=e666]:
+          - generic [ref=e668]: •
+          - paragraph [ref=e670]:
+            - strong [ref=e671]: Aligned Only
+            - text: — Only scan addresses aligned to the data type size (faster, may miss unaligned values).
+        - listitem [ref=e672]:
+          - generic [ref=e674]: •
+          - paragraph [ref=e676]:
+            - strong [ref=e677]: Heap Only
+            - text: — Restrict scanning to heap memory regions.
+      - blockquote [ref=e678]:
+        - paragraph [ref=e679]: String and WString scans compare the full byte pattern. WString automatically converts the input to UTF-16 (little-endian) before scanning.
+      - separator [ref=e680]
+      - paragraph [ref=e681]:
+        - strong [ref=e682]: Settings
+      - paragraph [ref=e683]: "Configure Analyzer behavior:"
+      - generic [ref=e686]:
+        - rowgroup [ref=e687]:
+          - row "Setting Description" [ref=e688]:
+            - columnheader "Setting" [ref=e689]
+            - columnheader "Description" [ref=e690]
+        - table [ref=e691]:
+          - rowgroup [ref=e692]:
+            - row "Scroll Speed Adjusts scroll sensitivity across all views (slider, 0.01–2.0)" [ref=e693]:
+              - cell "Scroll Speed" [ref=e694]:
+                - paragraph [ref=e696]:
+                  - strong [ref=e697]: Scroll Speed
+              - cell "Adjusts scroll sensitivity across all views (slider, 0.01–2.0)" [ref=e698]:
+                - paragraph [ref=e700]: Adjusts scroll sensitivity across all views (slider, 0.01–2.0)
+            - row "Hex Refresh Interval How often live values refresh in the Hex and Types views (50–5000 ms)" [ref=e701]:
+              - cell "Hex Refresh Interval" [ref=e702]:
+                - paragraph [ref=e704]:
+                  - strong [ref=e705]: Hex Refresh Interval
+              - cell "How often live values refresh in the Hex and Types views (50–5000 ms)" [ref=e706]:
+                - paragraph [ref=e708]: How often live values refresh in the Hex and Types views (50–5000 ms)
+            - row "Show bytes in disassembly Toggle the raw bytes column in the Disasm view" [ref=e709]:
+              - cell "Show bytes in disassembly" [ref=e710]:
+                - paragraph [ref=e712]:
+                  - strong [ref=e713]: Show bytes in disassembly
+              - cell "Toggle the raw bytes column in the Disasm view" [ref=e714]:
+                - paragraph [ref=e716]: Toggle the raw bytes column in the Disasm view
+            - row "Show inspector panel Toggle the right-side inspector panel" [ref=e717]:
+              - cell "Show inspector panel" [ref=e718]:
+                - paragraph [ref=e720]:
+                  - strong [ref=e721]: Show inspector panel
+              - cell "Toggle the right-side inspector panel" [ref=e722]:
+                - paragraph [ref=e724]: Toggle the right-side inspector panel
+      - paragraph [ref=e725]: All settings are saved automatically and persist across restarts.
+      - separator [ref=e726]
+      - heading "Direct link to heading Inspector Panel" [level=4] [ref=e727]:
+        - link "Direct link to heading" [ref=e729] [cursor=pointer]:
+          - /url: "#inspector-panel"
+          - img "hashtag" [ref=e730]
+        - generic [ref=e732]: Inspector Panel
+      - paragraph [ref=e733]: "The right-side panel displays context-sensitive information about the currently selected address:"
+      - paragraph [ref=e734]:
+        - strong [ref=e735]: Location
+      - paragraph [ref=e736]: Shows the virtual address (VA), relative virtual address (RVA), section name, containing function, and symbol name.
+      - paragraph [ref=e737]:
+        - strong [ref=e738]: Xrefs To
+      - paragraph [ref=e739]:
+        - text: All cross-references pointing
+        - strong [ref=e740]: to
+        - text: the current address — calls, jumps, conditional jumps, and data references. Each entry shows the xref type and the source function name. Click to navigate.
+      - paragraph [ref=e741]:
+        - strong [ref=e742]: Xrefs From
+      - paragraph [ref=e743]:
+        - text: All cross-references going
+        - strong [ref=e744]: from
+        - text: the current address to other locations.
+      - paragraph [ref=e745]:
+        - strong [ref=e746]: Bytes
+      - paragraph [ref=e747]: A hex dump of the bytes at the current address.
+      - paragraph [ref=e748]:
+        - strong [ref=e749]: Callers
+      - paragraph [ref=e750]: Functions that call the current function (derived from call-type xrefs to the function's entry point).
+      - paragraph [ref=e751]:
+        - strong [ref=e752]: Callees
+      - paragraph [ref=e753]: Functions called by the current function (unique call targets within the function body).
+      - blockquote [ref=e754]:
+        - paragraph [ref=e755]: All inspector sections have a fixed height with independent scrolling and scrollbar indicators.
+      - separator [ref=e756]
+      - heading "Direct link to heading Sidebar" [level=4] [ref=e757]:
+        - link "Direct link to heading" [ref=e759] [cursor=pointer]:
+          - /url: "#sidebar"
+          - img "hashtag" [ref=e760]
+        - generic [ref=e762]: Sidebar
+      - paragraph [ref=e763]: "The left panel provides filtered, searchable lists:"
+      - generic [ref=e766]:
+        - rowgroup [ref=e767]:
+          - row "Tab Contents" [ref=e768]:
+            - columnheader "Tab" [ref=e769]
+            - columnheader "Contents" [ref=e770]
+        - table [ref=e771]:
+          - rowgroup [ref=e772]:
+            - row "Functions All detected functions with xref counts. Click to navigate." [ref=e773]:
+              - cell "Functions" [ref=e774]:
+                - paragraph [ref=e776]:
+                  - strong [ref=e777]: Functions
+              - cell "All detected functions with xref counts. Click to navigate." [ref=e778]:
+                - paragraph [ref=e780]: All detected functions with xref counts. Click to navigate.
+            - row "Imports Imported functions grouped by DLL. Click to navigate to the IAT entry." [ref=e781]:
+              - cell "Imports" [ref=e782]:
+                - paragraph [ref=e784]:
+                  - strong [ref=e785]: Imports
+              - cell "Imported functions grouped by DLL. Click to navigate to the IAT entry." [ref=e786]:
+                - paragraph [ref=e788]: Imported functions grouped by DLL. Click to navigate to the IAT entry.
+            - row "Exports Exported functions. The entry point is listed as DllMain or WinMain." [ref=e789]:
+              - cell "Exports" [ref=e790]:
+                - paragraph [ref=e792]:
+                  - strong [ref=e793]: Exports
+              - cell "Exported functions. The entry point is listed as DllMain or WinMain." [ref=e794]:
+                - paragraph [ref=e796]:
+                  - text: Exported functions. The entry point is listed as
+                  - code [ref=e797]: DllMain
+                  - text: or
+                  - code [ref=e798]: WinMain
+                  - text: .
+            - row "Strings Detected strings with their section and value. Click to navigate." [ref=e799]:
+              - cell "Strings" [ref=e800]:
+                - paragraph [ref=e802]:
+                  - strong [ref=e803]: Strings
+              - cell "Detected strings with their section and value. Click to navigate." [ref=e804]:
+                - paragraph [ref=e806]: Detected strings with their section and value. Click to navigate.
+            - row "Sections PE sections with flags (XRW), virtual address, size, and entropy. Process information (PID, module count) is shown below." [ref=e807]:
+              - cell "Sections" [ref=e808]:
+                - paragraph [ref=e810]:
+                  - strong [ref=e811]: Sections
+              - cell "PE sections with flags (XRW), virtual address, size, and entropy. Process information (PID, module count) is shown below." [ref=e812]:
+                - paragraph [ref=e814]: PE sections with flags (XRW), virtual address, size, and entropy. Process information (PID, module count) is shown below.
+      - paragraph [ref=e815]: All tabs support text filtering. Type in the filter field to narrow results.
+      - separator [ref=e816]
+      - heading "Direct link to heading Toolbar" [level=4] [ref=e817]:
+        - link "Direct link to heading" [ref=e819] [cursor=pointer]:
+          - /url: "#toolbar"
+          - img "hashtag" [ref=e820]
+        - generic [ref=e822]: Toolbar
+      - paragraph [ref=e823]: "The toolbar provides quick access to common actions:"
+      - generic [ref=e826]:
+        - rowgroup [ref=e827]:
+          - row "Button Action" [ref=e828]:
+            - columnheader "Button" [ref=e829]
+            - columnheader "Action" [ref=e830]
+        - table [ref=e831]:
+          - rowgroup [ref=e832]:
+            - row "Search Opens the hex/string search popup" [ref=e833]:
+              - cell "Search" [ref=e834]:
+                - paragraph [ref=e836]:
+                  - strong [ref=e837]: Search
+              - cell "Opens the hex/string search popup" [ref=e838]:
+                - paragraph [ref=e840]: Opens the hex/string search popup
+            - row "Detach Saves the session and returns to the process selection screen" [ref=e841]:
+              - cell "Detach" [ref=e842]:
+                - paragraph [ref=e844]:
+                  - strong [ref=e845]: Detach
+              - cell "Saves the session and returns to the process selection screen" [ref=e846]:
+                - paragraph [ref=e848]: Saves the session and returns to the process selection screen
+            - row "Dump Opens the dump popup for saving the module image to disk" [ref=e849]:
+              - cell "Dump" [ref=e850]:
+                - paragraph [ref=e852]:
+                  - strong [ref=e853]: Dump
+              - cell "Opens the dump popup for saving the module image to disk" [ref=e854]:
+                - paragraph [ref=e856]: Opens the dump popup for saving the module image to disk
+            - row "Reconstruct Opens the source reconstruction popup — decompiles all functions and exports a full project with headers, source files, and metadata" [ref=e857]:
+              - cell "Reconstruct" [ref=e858]:
+                - paragraph [ref=e860]:
+                  - strong [ref=e861]: Reconstruct
+              - cell "Opens the source reconstruction popup — decompiles all functions and exports a full project with headers, source files, and metadata" [ref=e862]:
+                - paragraph [ref=e864]: Opens the source reconstruction popup — decompiles all functions and exports a full project with headers, source files, and metadata
+            - row "Re-resolve Re-reads zero-filled pages from the target process and rebuilds data cross-references" [ref=e865]:
+              - cell "Re-resolve" [ref=e866]:
+                - paragraph [ref=e868]:
+                  - strong [ref=e869]: Re-resolve
+              - cell "Re-reads zero-filled pages from the target process and rebuilds data cross-references" [ref=e870]:
+                - paragraph [ref=e872]: Re-reads zero-filled pages from the target process and rebuilds data cross-references
+      - paragraph [ref=e873]:
+        - strong [ref=e874]: Dump
+      - paragraph [ref=e875]: "The dump popup lets you save the current module's memory image to disk:"
+      - list [ref=e876]:
+        - listitem [ref=e877]:
+          - generic [ref=e879]: •
+          - paragraph [ref=e881]:
+            - strong [ref=e882]: Output Path
+            - text: — The file path for the dump. Defaults to
+            - code [ref=e883]: "[module_name]_dump.exe"
+            - text: or
+            - code [ref=e884]: "[module_name]_dump.dll"
+            - text: in the scripting directory.
+        - listitem [ref=e885]:
+          - generic [ref=e887]: •
+          - paragraph [ref=e889]:
+            - strong [ref=e890]: Wait for VEH
+            - text: — Enable this for processes with page encryption (e.g., games using VEH-based decryption). The dumper will repeatedly read zero-filled / invalid pages within the timeout, waiting for the VEH handler to decrypt them.
+        - listitem [ref=e891]:
+          - generic [ref=e893]: •
+          - paragraph [ref=e895]:
+            - strong [ref=e896]: Timeout
+            - text: — How long to wait for VEH decryption (1–60 seconds).
+      - paragraph [ref=e897]: After dumping, the status bar reports how many pages were recovered via VEH.
+      - separator [ref=e898]
+      - heading "Direct link to heading Sessions" [level=4] [ref=e899]:
+        - link "Direct link to heading" [ref=e901] [cursor=pointer]:
+          - /url: "#sessions"
+          - img "hashtag" [ref=e902]
+        - generic [ref=e904]: Sessions
+      - paragraph [ref=e905]: "The Analyzer automatically saves and loads session data per module:"
+      - list [ref=e906]:
+        - listitem [ref=e907]:
+          - generic [ref=e909]: •
+          - paragraph [ref=e911]:
+            - strong [ref=e912]: Cursor position
+            - text: — Restored on next attach
+        - listitem [ref=e913]:
+          - generic [ref=e915]: •
+          - paragraph [ref=e917]:
+            - strong [ref=e918]: Custom renames
+            - text: — Symbol names you've assigned with
+            - code [ref=e919]: "N"
+        - listitem [ref=e920]:
+          - generic [ref=e922]: •
+          - paragraph [ref=e924]:
+            - strong [ref=e925]: Comments
+            - text: — Annotations you've added with
+            - code [ref=e926]: ;
+        - listitem [ref=e927]:
+          - generic [ref=e929]: •
+          - paragraph [ref=e931]:
+            - strong [ref=e932]: Bookmarks
+            - text: — Saved address bookmarks
+      - paragraph [ref=e933]:
+        - text: Sessions are stored as encrypted
+        - code [ref=e934]: .pak
+        - text: files in the scripting directory and are keyed by module name.
+      - separator [ref=e935]
+      - heading "Direct link to heading Context Menu" [level=4] [ref=e936]:
+        - link "Direct link to heading" [ref=e938] [cursor=pointer]:
+          - /url: "#context-menu"
+          - img "hashtag" [ref=e939]
+        - generic [ref=e941]: Context Menu
+      - paragraph [ref=e942]: "Right-click in the disassembly or sidebar function list to access context actions:"
+      - generic [ref=e945]:
+        - rowgroup [ref=e946]:
+          - row "Action Description" [ref=e947]:
+            - columnheader "Action" [ref=e948]
+            - columnheader "Description" [ref=e949]
+        - table [ref=e950]:
+          - rowgroup [ref=e951]:
+            - row "Make Function Define a new function starting at the selected address" [ref=e952]:
+              - cell "Make Function" [ref=e953]:
+                - paragraph [ref=e955]:
+                  - strong [ref=e956]: Make Function
+              - cell "Define a new function starting at the selected address" [ref=e957]:
+                - paragraph [ref=e959]: Define a new function starting at the selected address
+            - row "Copy Address Copy the virtual address to the clipboard" [ref=e960]:
+              - cell "Copy Address" [ref=e961]:
+                - paragraph [ref=e963]:
+                  - strong [ref=e964]: Copy Address
+              - cell "Copy the virtual address to the clipboard" [ref=e965]:
+                - paragraph [ref=e967]: Copy the virtual address to the clipboard
+            - row "Copy Function ASM Copy the full disassembly of the containing function" [ref=e968]:
+              - cell "Copy Function ASM" [ref=e969]:
+                - paragraph [ref=e971]:
+                  - strong [ref=e972]: Copy Function ASM
+              - cell "Copy the full disassembly of the containing function" [ref=e973]:
+                - paragraph [ref=e975]: Copy the full disassembly of the containing function
+            - 'row "Dump Function Info Copy a complete analysis dump: the function''s assembly, its F5 decompiled output, and the assembly of all called/referenced functions. Useful for sharing context with AI tools or teammates." [ref=e976]':
+              - cell "Dump Function Info" [ref=e977]:
+                - paragraph [ref=e979]:
+                  - strong [ref=e980]: Dump Function Info
+              - 'cell "Copy a complete analysis dump: the function''s assembly, its F5 decompiled output, and the assembly of all called/referenced functions. Useful for sharing context with AI tools or teammates." [ref=e981]':
+                - paragraph [ref=e983]: "Copy a complete analysis dump: the function's assembly, its F5 decompiled output, and the assembly of all called/referenced functions. Useful for sharing context with AI tools or teammates."
+            - row "Make Signature Generate a byte pattern signature with wildcards for the instruction at the current address" [ref=e984]:
+              - cell "Make Signature" [ref=e985]:
+                - paragraph [ref=e987]:
+                  - strong [ref=e988]: Make Signature
+              - cell "Generate a byte pattern signature with wildcards for the instruction at the current address" [ref=e989]:
+                - paragraph [ref=e991]: Generate a byte pattern signature with wildcards for the instruction at the current address
+      - separator [ref=e992]
+      - heading "Direct link to heading Keyboard Shortcuts" [level=4] [ref=e993]:
+        - link "Direct link to heading" [ref=e995] [cursor=pointer]:
+          - /url: "#keyboard-shortcuts"
+          - img "hashtag" [ref=e996]
+        - generic [ref=e998]: Keyboard Shortcuts
+      - generic [ref=e1001]:
+        - rowgroup [ref=e1002]:
+          - row "Shortcut Action" [ref=e1003]:
+            - columnheader "Shortcut" [ref=e1004]
+            - columnheader "Action" [ref=e1005]
+        - table [ref=e1006]:
+          - rowgroup [ref=e1007]:
+            - row "Ctrl+G Go to address" [ref=e1008]:
+              - cell "Ctrl+G" [ref=e1009]:
+                - paragraph [ref=e1011]:
+                  - code [ref=e1012]: Ctrl+G
+              - cell "Go to address" [ref=e1013]:
+                - paragraph [ref=e1015]: Go to address
+            - row "Ctrl+F Search (hex pattern or string)" [ref=e1016]:
+              - cell "Ctrl+F" [ref=e1017]:
+                - paragraph [ref=e1019]:
+                  - code [ref=e1020]: Ctrl+F
+              - cell "Search (hex pattern or string)" [ref=e1021]:
+                - paragraph [ref=e1023]: Search (hex pattern or string)
+            - row "Alt+Left Navigate back" [ref=e1024]:
+              - cell "Alt+Left" [ref=e1025]:
+                - paragraph [ref=e1027]:
+                  - code [ref=e1028]: Alt+Left
+              - cell "Navigate back" [ref=e1029]:
+                - paragraph [ref=e1031]: Navigate back
+            - row "Alt+Right Navigate forward" [ref=e1032]:
+              - cell "Alt+Right" [ref=e1033]:
+                - paragraph [ref=e1035]:
+                  - code [ref=e1036]: Alt+Right
+              - cell "Navigate forward" [ref=e1037]:
+                - paragraph [ref=e1039]: Navigate forward
+            - row "M4 / M5 Navigate back / forward" [ref=e1040]:
+              - cell "M4 / M5" [ref=e1041]:
+                - paragraph [ref=e1043]:
+                  - code [ref=e1044]: M4
+                  - text: /
+                  - code [ref=e1045]: M5
+              - cell "Navigate back / forward" [ref=e1046]:
+                - paragraph [ref=e1048]: Navigate back / forward
+            - row "Ctrl+S Save session" [ref=e1049]:
+              - cell "Ctrl+S" [ref=e1050]:
+                - paragraph [ref=e1052]:
+                  - code [ref=e1053]: Ctrl+S
+              - cell "Save session" [ref=e1054]:
+                - paragraph [ref=e1056]: Save session
+            - row "Ctrl+M Switch module" [ref=e1057]:
+              - cell "Ctrl+M" [ref=e1058]:
+                - paragraph [ref=e1060]:
+                  - code [ref=e1061]: Ctrl+M
+              - cell "Switch module" [ref=e1062]:
+                - paragraph [ref=e1064]: Switch module
+            - row "T / Shift+T Retype struct node" [ref=e1065]:
+              - cell "T / Shift+T" [ref=e1066]:
+                - paragraph [ref=e1068]:
+                  - code [ref=e1069]: T
+                  - text: /
+                  - code [ref=e1070]: Shift+T
+              - cell "Retype struct node" [ref=e1071]:
+                - paragraph [ref=e1073]: Retype struct node
+            - row "R Rename struct node" [ref=e1074]:
+              - cell "R" [ref=e1075]:
+                - paragraph [ref=e1077]:
+                  - code [ref=e1078]: R
+              - cell "Rename struct node" [ref=e1079]:
+                - paragraph [ref=e1081]: Rename struct node
+            - row "Delete Delete struct node" [ref=e1082]:
+              - cell "Delete" [ref=e1083]:
+                - paragraph [ref=e1085]:
+                  - code [ref=e1086]: Delete
+              - cell "Delete struct node" [ref=e1087]:
+                - paragraph [ref=e1089]: Delete struct node
+            - row "N Rename symbol (disasm)" [ref=e1090]:
+              - cell "N" [ref=e1091]:
+                - paragraph [ref=e1093]:
+                  - code [ref=e1094]: "N"
+              - cell "Rename symbol (disasm)" [ref=e1095]:
+                - paragraph [ref=e1097]: Rename symbol (disasm)
+            - row "; Add comment (disasm)" [ref=e1098]:
+              - cell ";" [ref=e1099]:
+                - paragraph [ref=e1101]:
+                  - code [ref=e1102]: ;
+              - cell "Add comment (disasm)" [ref=e1103]:
+                - paragraph [ref=e1105]: Add comment (disasm)
+    - generic [ref=e1106]:
+      - link "Previous Extensions API" [ref=e1107] [cursor=pointer]:
+        - /url: /perception-angel-script-api/perception-ide/extensions-api
+        - generic [ref=e1108]:
+          - generic [ref=e1109]: Previous
+          - generic [ref=e1110]: Extensions API
+      - link "Next Overview" [ref=e1111] [cursor=pointer]:
+        - /url: /perception-angel-script-api/lua-script/overview
+        - generic [ref=e1112]:
+          - generic [ref=e1113]: Next
+          - generic [ref=e1114]: Overview
+    - paragraph [ref=e1116]:
+      - text: Last updated
+      - time [ref=e1117]: 9 days ago
+  - alert [ref=e1118]

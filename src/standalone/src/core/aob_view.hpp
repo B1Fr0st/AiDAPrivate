@@ -22,9 +22,19 @@ inline state_t g_state;
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float accent_r, float accent_g, float accent_b)
 {
+	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
+	ImGui::BeginChild("##aob_view", ImVec2(width, height), false,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
+
 	auto* dl = ImGui::GetWindowDrawList();
 	auto& st = g_state;
 	auto& gen = aob_generator::g_state;
+
+	ImVec2 wp = ImGui::GetWindowPos();
+	float ox = wp.x;
+	float oy = wp.y;
+	float w = ImGui::GetWindowSize().x;
+	float h = ImGui::GetWindowSize().y;
 
 	const ImU32 bg          = IM_COL32(30, 30, 30, static_cast<int>(alpha * 255));
 	const ImU32 text_col    = IM_COL32(212, 212, 212, static_cast<int>(alpha * 255));
@@ -41,15 +51,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const ImU32 unique_col  = IM_COL32(152, 195, 121, static_cast<int>(alpha * 255));
 	const ImU32 notuniq_col = IM_COL32(224, 108, 117, static_cast<int>(alpha * 255));
 
-	dl->AddRectFilled(ImVec2(pos_x, pos_y), ImVec2(pos_x + width, pos_y + height), bg);
+	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h), bg);
 
-	float left_w = width * 0.55f;
-	float right_w = width - left_w - 4.f;
+	float left_w = w * 0.55f;
+	float right_w = w - left_w - 4.f;
 
-	float cx = pos_x + 12.f;
-	float cy = pos_y + 8.f;
+	float cx = ox + 12.f;
+	float cy = oy + 8.f;
 
-	dl->AddRectFilled(ImVec2(pos_x, cy - 4.f), ImVec2(pos_x + left_w, cy + 32.f), header_bg);
+	dl->AddRectFilled(ImVec2(ox, cy - 4.f), ImVec2(ox + left_w, cy + 32.f), header_bg);
 	dl->AddText(ImVec2(cx, cy + 2.f), accent, "AOB Signature Generator");
 	cy += 38.f;
 
@@ -128,7 +138,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	if (!current_copy.bytes.empty()) {
-		dl->AddRectFilled(ImVec2(cx - 4.f, cy), ImVec2(pos_x + left_w - 8.f, cy + 24.f), panel_bg);
+		dl->AddRectFilled(ImVec2(cx - 4.f, cy), ImVec2(ox + left_w - 8.f, cy + 24.f), panel_bg);
 
 		char info_buf[128];
 		std::snprintf(info_buf, sizeof(info_buf), "0x%llX  |  %s  |  %zu bytes  |  Score: %.0f%% (%s)",
@@ -140,7 +150,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		dl->AddText(ImVec2(cx, cy + 4.f), dim_col, info_buf);
 
 		{
-			float score_x = pos_x + left_w - 60.f;
+			float score_x = ox + left_w - 60.f;
 			ImU32 grade_col = dim_col;
 			float qs = current_copy.quality_score;
 			if (qs >= 0.85f) grade_col = IM_COL32(152, 195, 121, static_cast<int>(alpha * 255));
@@ -159,7 +169,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float byte_y = cy;
 		const float byte_w = 22.f;
 		const float byte_h = 18.f;
-		const float max_x = pos_x + left_w - 20.f;
+		const float max_x = ox + left_w - 20.f;
 
 		for (size_t i = 0; i < current_copy.bytes.size(); ++i) {
 			if (byte_x + byte_w > max_x) {
@@ -297,8 +307,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		dl->AddText(ImVec2(cx, cy + 58.f), dim_col, "Auto-wildcard masks RIP-relative offsets and large immediates.");
 	}
 
-	float rx = pos_x + left_w + 4.f;
-	float ry = pos_y + 8.f;
+	float rx = ox + left_w + 4.f;
+	float ry = oy + 8.f;
 	dl->AddRectFilled(ImVec2(rx, ry - 4.f), ImVec2(rx + right_w, ry + 32.f), header_bg);
 	dl->AddText(ImVec2(rx + 8.f, ry + 2.f), accent, "Saved Signatures");
 	ry += 38.f;
@@ -309,18 +319,18 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		saved_copy = gen.saved_signatures;
 	}
 
-	float saved_h = pos_y + height - ry - 8.f;
+	float saved_h = oy + h - ry - 8.f;
 	float row_h = 22.f;
 	float content_h = static_cast<float>(saved_copy.size()) * row_h;
 
 	ui_anim::handle_scroll_input(st.target_scroll_y, 0.f, std::max(0.f, content_h - saved_h), row_h);
 	ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 12.f, ImGui::GetIO().DeltaTime);
 
-	ImGui::PushClipRect(ImVec2(rx, ry), ImVec2(rx + right_w, pos_y + height - 8.f), true);
+	ImGui::PushClipRect(ImVec2(rx, ry), ImVec2(rx + right_w, oy + h - 8.f), true);
 
 	for (size_t i = 0; i < saved_copy.size(); ++i) {
 		float row_y = ry + static_cast<float>(i) * row_h - st.scroll_y;
-		if (row_y + row_h < ry || row_y > pos_y + height) continue;
+		if (row_y + row_h < ry || row_y > oy + h) continue;
 
 		ImVec2 rmin(rx, row_y);
 		ImVec2 rmax(rx + right_w, row_y + row_h);
@@ -375,6 +385,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		                                  st.scroll_y, content_h, saved_h,
 		                                  alpha, st.scrollbar_dragging, st.scrollbar_drag_offset);
 	}
+
+	ImGui::EndChild();
 }
 
 }

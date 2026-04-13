@@ -167,6 +167,9 @@ struct state_t {
 
 inline state_t g_state;
 
+inline bool is_valid_utf16_at(uint64_t addr, int& out_len);
+inline void detect_arrays(std::vector<struct_field_t>& fields);
+
 inline const char* field_type_name(field_type_t t)
 {
 	switch (t) {
@@ -649,6 +652,8 @@ inline void detect_vtable(uint64_t base_addr, int struct_size,
 	}
 }
 
+}
+
 inline bool is_valid_utf8_at(uint64_t addr, int& out_len)
 {
 	std::vector<uint8_t> str_data;
@@ -685,6 +690,8 @@ inline bool is_valid_utf16_at(uint64_t addr, int& out_len)
 	out_len = total;
 	return total >= 4 && printable > total / 2;
 }
+
+namespace detail {
 
 inline void merge_compound_types(std::vector<struct_field_t>& fields, uint64_t base_address)
 {
@@ -1461,8 +1468,7 @@ inline void ai_name_fields()
 		          "Output ONLY a JSON array of objects with \"offset\" (hex string like \"0x0040\") and \"name\" (the suggested name).\n"
 		          "No markdown, no explanations, just the JSON array.";
 
-		extern const settings_sa_t& get_standalone_settings();
-		auto ai = std::make_unique<standalone_ai_client_t>(get_standalone_settings());
+		auto ai = std::make_unique<standalone_ai_client_t>(g_sa_settings);
 		if (!ai->is_available()) {
 			g_state.ai_naming.store(false);
 			return;

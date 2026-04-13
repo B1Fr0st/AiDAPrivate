@@ -8,12 +8,38 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "standalone_driver.hpp"
+
+// Undefine Windows macros that conflict with Ghidra/SLEIGH identifier names
+#ifdef small
+#  undef small
+#endif
+#ifdef near
+#  undef near
+#endif
+#ifdef NEAR
+#  undef NEAR
+#  define NEAR
+#endif
+#ifdef far
+#  undef far
+#endif
+#ifdef FAR
+#  undef FAR
+#  define FAR
+#endif
+#ifdef pascal
+#  undef pascal
+#endif
+#ifdef cdecl
+#  undef cdecl
+#endif
 
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -44,14 +70,32 @@ struct ghidra_result_t {
 	double elapsed_ms = 0.0;
 };
 
+inline std::atomic<bool>* s_cancel_ptr = nullptr;
+
 class aida_live_load_image_t : public ghidra::LoadImage {
 public:
 	aida_live_load_image_t() : ghidra::LoadImage("aida_live") {}
 
 	void loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra::Address& addr) override {
+		if (s_cancel_ptr && s_cancel_ptr->load(std::memory_order_acquire)) {
+			std::memset(ptr, 0, static_cast<size_t>(size));
+			return;
+		}
+
 		uint64_t offset = addr.getOffset();
-		std::vector<uint8_t> data;
-		driver_bridge::read_memory(offset, static_cast<size_t>(size), data);
+		auto fut = std::async(std::launch::async, [offset, size]() {
+			std::vector<uint8_t> data;
+			driver_bridge::read_memory(offset, static_cast<size_t>(size), data);
+			return data;
+		});
+
+		auto status = fut.wait_for(std::chrono::seconds(2));
+		if (status == std::future_status::timeout) {
+			std::memset(ptr, 0, static_cast<size_t>(size));
+			return;
+		}
+
+		auto data = fut.get();
 		if (static_cast<ghidra::int4>(data.size()) >= size) {
 			std::memcpy(ptr, data.data(), static_cast<size_t>(size));
 		}
@@ -249,7 +293,7 @@ inline bool init(const std::string& specs_dir = "") {
 	}
 }
 
-inline ghidra_result_t decompile_function(uint64_t entry_addr) {
+inline ghidra_result_t decompile_function(uint64_t entry_addr, std::atomic<bool>* cancel = nullptr) {
 	std::lock_guard<std::mutex> lk(g_state.mtx);
 
 	ghidra_result_t result;
@@ -263,24 +307,26 @@ inline ghidra_result_t decompile_function(uint64_t entry_addr) {
 		}
 	}
 
+	s_cancel_ptr = cancel;
+
 	try {
-		return detail::do_decompile(g_state.arch, entry_addr);
+		result = detail::do_decompile(g_state.arch, entry_addr);
 	}
 	catch (ghidra::LowlevelError& err) {
 		result.is_error = true;
 		result.error_text = err.explain;
-		return result;
 	}
 	catch (ghidra::DecoderError& err) {
 		result.is_error = true;
 		result.error_text = err.explain;
-		return result;
 	}
 	catch (...) {
 		result.is_error = true;
 		result.error_text = "unknown decompilation error";
-		return result;
 	}
+
+	s_cancel_ptr = nullptr;
+	return result;
 }
 
 inline ghidra_result_t decompile_buffer(const uint8_t* data, size_t size,

@@ -79,6 +79,8 @@ struct DisasmState
     std::vector<AsmInstr> live_pending_instrs;
     uint64_t live_pending_va = 0;
     std::atomic<bool> live_pending_ready{false};
+	uint64_t goto_address = 0;
+	bool has_new_goto = false;
 };
 
 

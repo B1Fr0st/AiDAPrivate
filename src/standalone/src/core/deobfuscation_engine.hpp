@@ -125,7 +125,7 @@ inline std::vector<block_range_t> recover_cfg_blocks(uint64_t entry_addr, uint32
 		for (size_t i = 0; i < insns.size(); ++i) {
 			auto& insn = insns[i];
 			block.insns.push_back(insn);
-			block.end = insn.address + insn.size;
+			block.end = insn.address + insn.length;
 
 			bool is_ret = (insn.mnemonic.find("ret") != std::string::npos);
 			bool is_jmp = (insn.mnemonic == "jmp");
@@ -136,8 +136,8 @@ inline std::vector<block_range_t> recover_cfg_blocks(uint64_t entry_addr, uint32
 
 			if (is_jmp) {
 				uint64_t target = 0;
-				if (!insn.op_str.empty() && insn.op_str[0] == '0') {
-					target = std::strtoull(insn.op_str.c_str(), nullptr, 16);
+				if (!insn.operands_text.empty() && insn.operands_text[0] == '0') {
+					target = std::strtoull(insn.operands_text.c_str(), nullptr, 16);
 				}
 				if (target != 0) work_queue.insert(target);
 				break;
@@ -145,10 +145,10 @@ inline std::vector<block_range_t> recover_cfg_blocks(uint64_t entry_addr, uint32
 
 			if (is_jcc) {
 				uint64_t target = 0;
-				if (!insn.op_str.empty() && insn.op_str[0] == '0') {
-					target = std::strtoull(insn.op_str.c_str(), nullptr, 16);
+				if (!insn.operands_text.empty() && insn.operands_text[0] == '0') {
+					target = std::strtoull(insn.operands_text.c_str(), nullptr, 16);
 				}
-				uint64_t fallthrough = insn.address + insn.size;
+				uint64_t fallthrough = insn.address + insn.length;
 				if (target != 0) work_queue.insert(target);
 				work_queue.insert(fallthrough);
 				break;
@@ -170,17 +170,17 @@ inline std::vector<block_range_t> recover_cfg_blocks(uint64_t entry_addr, uint32
 
 		if (is_jmp) {
 			uint64_t target = 0;
-			if (!last.op_str.empty() && last.op_str[0] == '0')
-				target = std::strtoull(last.op_str.c_str(), nullptr, 16);
+			if (!last.operands_text.empty() && last.operands_text[0] == '0')
+				target = std::strtoull(last.operands_text.c_str(), nullptr, 16);
 			if (target != 0) {
 				auto it2 = addr_to_idx.find(target);
 				if (it2 != addr_to_idx.end()) block.successor_indices.push_back(it2->second);
 			}
 		} else if (is_jcc) {
 			uint64_t target = 0;
-			if (!last.op_str.empty() && last.op_str[0] == '0')
-				target = std::strtoull(last.op_str.c_str(), nullptr, 16);
-			uint64_t fallthrough = last.address + last.size;
+			if (!last.operands_text.empty() && last.operands_text[0] == '0')
+				target = std::strtoull(last.operands_text.c_str(), nullptr, 16);
+			uint64_t fallthrough = last.address + last.length;
 			if (target != 0) {
 				auto it2 = addr_to_idx.find(target);
 				if (it2 != addr_to_idx.end()) block.successor_indices.push_back(it2->second);
@@ -188,7 +188,7 @@ inline std::vector<block_range_t> recover_cfg_blocks(uint64_t entry_addr, uint32
 			auto it3 = addr_to_idx.find(fallthrough);
 			if (it3 != addr_to_idx.end()) block.successor_indices.push_back(it3->second);
 		} else {
-			uint64_t fallthrough = last.address + last.size;
+			uint64_t fallthrough = last.address + last.length;
 			auto it2 = addr_to_idx.find(fallthrough);
 			if (it2 != addr_to_idx.end()) block.successor_indices.push_back(it2->second);
 		}
@@ -204,7 +204,7 @@ inline bool detect_state_machine(triton::Context& ctx, const std::vector<block_r
 	for (auto& block : blocks) {
 		for (auto& insn : block.insns) {
 			if (insn.mnemonic == "cmp" || insn.mnemonic == "test") {
-				std::string ops = insn.op_str;
+				std::string ops = insn.operands_text;
 				size_t comma = ops.find(',');
 				if (comma != std::string::npos) {
 					std::string reg_part = ops.substr(0, comma);
@@ -233,10 +233,10 @@ inline bool detect_state_machine(triton::Context& ctx, const std::vector<block_r
 
 	for (auto& block : blocks) {
 		for (auto& insn : block.insns) {
-			if (insn.mnemonic == "cmp" && insn.op_str.find(best_reg) != std::string::npos) {
-				size_t comma = insn.op_str.find(',');
+			if (insn.mnemonic == "cmp" && insn.operands_text.find(best_reg) != std::string::npos) {
+				size_t comma = insn.operands_text.find(',');
 				if (comma != std::string::npos) {
-					std::string val_str = insn.op_str.substr(comma + 1);
+					std::string val_str = insn.operands_text.substr(comma + 1);
 					while (!val_str.empty() && val_str.front() == ' ') val_str.erase(val_str.begin());
 					uint64_t val = std::strtoull(val_str.c_str(), nullptr, 0);
 					if (val != 0) {
@@ -257,12 +257,11 @@ inline void resolve_state_targets(triton::Context& ctx_template,
 	state_var.dispatcher_addr = dispatcher_addr;
 
 	auto reg_id = symbolic_engine::detail::name_to_triton_reg(state_var.register_name);
-	if (reg_id == triton::arch::x86::ID_REG_INVALID) return;
+	if (reg_id == triton::arch::ID_REG_INVALID) return;
 
 	for (auto state_val : state_var.concrete_values) {
 		triton::Context ctx(triton::arch::ARCH_X86_64);
 		ctx.setMode(triton::modes::ALIGNED_MEMORY, true);
-		ctx.setConcreteState(ctx_template.getCpuInstance()->getArchitecture());
 
 		auto& reg = ctx.getRegister(reg_id);
 		ctx.setConcreteRegisterValue(reg, state_val);
@@ -315,7 +314,7 @@ inline std::vector<clean_instruction_t> strip_junk_from_block(
 	std::vector<std::pair<triton::arch::Instruction, clean_instruction_t>> processed;
 
 	for (auto& raw_insn : block.insns) {
-		auto code = emulation::driver_read_bytes(raw_insn.address, raw_insn.size);
+		auto code = emulation::driver_read_bytes(raw_insn.address, raw_insn.length);
 		if (code.empty()) continue;
 
 		triton::arch::Instruction insn;
@@ -326,8 +325,8 @@ inline std::vector<clean_instruction_t> strip_junk_from_block(
 
 		clean_instruction_t ci;
 		ci.address = raw_insn.address;
-		ci.size = raw_insn.size;
-		ci.disasm = raw_insn.mnemonic + " " + raw_insn.op_str;
+		ci.size = raw_insn.length;
+		ci.disasm = raw_insn.mnemonic + " " + raw_insn.operands_text;
 		processed.push_back({insn, ci});
 	}
 
@@ -409,7 +408,7 @@ inline deobfuscated_result_t deobfuscate_function(uint64_t entry_addr, uint32_t 
 	ctx.setSolverTimeout(5000);
 
 	uint32_t pid = device->get_process_id();
-	auto threads = device->enumerate_threads(pid);
+	auto threads = device->enumerate_threads();
 	uint32_t tid = 0;
 	if (!threads.empty()) tid = threads[0].tid;
 
@@ -435,13 +434,13 @@ inline deobfuscated_result_t deobfuscate_function(uint64_t entry_addr, uint32_t 
 	g_state.progress_current.store(3);
 
 	std::unordered_set<triton::arch::register_e> live_out = {
-		triton::arch::x86::ID_REG_X86_RAX,
-		triton::arch::x86::ID_REG_X86_RCX,
-		triton::arch::x86::ID_REG_X86_RDX,
-		triton::arch::x86::ID_REG_X86_R8,
-		triton::arch::x86::ID_REG_X86_R9,
-		triton::arch::x86::ID_REG_X86_RSP,
-		triton::arch::x86::ID_REG_X86_RBP,
+		triton::arch::ID_REG_X86_RAX,
+		triton::arch::ID_REG_X86_RCX,
+		triton::arch::ID_REG_X86_RDX,
+		triton::arch::ID_REG_X86_R8,
+		triton::arch::ID_REG_X86_R9,
+		triton::arch::ID_REG_X86_RSP,
+		triton::arch::ID_REG_X86_RBP,
 	};
 
 	for (size_t bi = 0; bi < blocks.size(); ++bi) {
@@ -457,7 +456,7 @@ inline deobfuscated_result_t deobfuscate_function(uint64_t entry_addr, uint32_t 
 		cblock.start_addr = block.start;
 		cblock.end_addr = block.end;
 		cblock.is_entry = block.is_entry;
-		cblock.successor_indices = block.successor_indices;
+		cblock.successors = block.successor_indices;
 
 		for (auto& ci : clean_insns) {
 			if (!ci.was_junk) {
@@ -483,7 +482,7 @@ inline deobfuscated_result_t deobfuscate_function(uint64_t entry_addr, uint32_t 
 	}
 
 	for (size_t bi = 0; bi < result.clean_blocks.size(); ++bi) {
-		for (auto succ_idx : result.clean_blocks[bi].successor_indices) {
+		for (auto succ_idx : result.clean_blocks[bi].successors) {
 			cfg_edge_t edge;
 			edge.from_block = static_cast<int>(bi);
 			edge.to_block = succ_idx;

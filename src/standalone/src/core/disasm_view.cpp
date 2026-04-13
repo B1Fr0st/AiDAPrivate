@@ -11,6 +11,7 @@
 #include "ui_anim.hpp"
 #include "decompiler_engine.hpp"
 #include "aob_generator.hpp"
+#include "scan_hub_view.hpp"
 #include "standalone_settings.hpp"
 #include "symbol_store.hpp"
 
@@ -558,13 +559,13 @@ void render(float pos_x, float pos_y, float width, float height,
             if (ImGui::MenuItem("Decompile Function")) {
                 globals::ui::decompile_popup_addr = ci.addr;
                 if (globals::ui::decompile_default_mode == 0) {
-                    decompiler_engine::decompile_function(ci.addr, get_standalone_settings());
+                    decompiler_engine::decompile_function(ci.addr, g_sa_settings);
                     globals::ui::active_center_view = center_view_t::decompiler;
                 } else if (globals::ui::decompile_default_mode == 1) {
                     decompiler_engine::decompile_function_native(ci.addr);
                     globals::ui::active_center_view = center_view_t::decompiler;
                 } else if (globals::ui::decompile_default_mode == 2) {
-                    decompiler_engine::decompile_function_hybrid(ci.addr, get_standalone_settings());
+                    decompiler_engine::decompile_function_hybrid(ci.addr, g_sa_settings);
                     globals::ui::active_center_view = center_view_t::decompiler;
                 } else {
                     globals::ui::show_decompile_popup = true;
@@ -575,7 +576,8 @@ void render(float pos_x, float pos_y, float width, float height,
                 snprintf(addr_buf, sizeof(addr_buf), "%llX", (unsigned long long)ci.addr);
                 strncpy(aob_generator::g_state.address_input, addr_buf, sizeof(aob_generator::g_state.address_input) - 1);
                 aob_generator::generate_from_address(ci.addr, aob_generator::g_state.instruction_count, aob_generator::g_state.auto_wildcard);
-                globals::ui::active_center_view = center_view_t::aob_generator;
+                scan_hub_view::set_sub_tab(scan_hub_view::sub_tab_t::aob);
+                globals::ui::active_center_view = center_view_t::scan_hub;
             }
         }
         ImGui::EndPopup();
@@ -594,6 +596,31 @@ void render(float pos_x, float pos_y, float width, float height,
             navigate_back();
         if (ImGui::GetIO().KeyAlt && ImGui::IsKeyPressed(ImGuiKey_RightArrow, false))
             navigate_forward();
+
+        if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
+            uint64_t f5_addr = 0;
+            if (st.ctx_row >= 0 && st.ctx_row < n)
+                f5_addr = instrs[st.ctx_row].addr;
+            if (f5_addr == 0 && !instrs.empty())
+                f5_addr = instrs[0].addr;
+            if (f5_addr != 0)
+                globals::ui::decompile_popup_addr = f5_addr;
+            if (globals::ui::decompile_default_mode == 0) {
+                if (f5_addr)
+                    decompiler_engine::decompile_function(f5_addr, g_sa_settings);
+                globals::ui::active_center_view = center_view_t::decompiler;
+            } else if (globals::ui::decompile_default_mode == 1) {
+                if (f5_addr)
+                    decompiler_engine::decompile_function_native(f5_addr);
+                globals::ui::active_center_view = center_view_t::decompiler;
+            } else if (globals::ui::decompile_default_mode == 2) {
+                if (f5_addr)
+                    decompiler_engine::decompile_function_hybrid(f5_addr, g_sa_settings);
+                globals::ui::active_center_view = center_view_t::decompiler;
+            } else {
+                globals::ui::show_decompile_popup = true;
+            }
+        }
 
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))
             st.goto_visible = false;

@@ -91,6 +91,13 @@ namespace
     bool                         s_arc_loaded = false;
 
 
+    std::shared_ptr<httplib::Client> s_license_client;
+    std::string                      s_license_host;
+    std::shared_ptr<httplib::Client> s_ip_client;
+    std::string                      s_ip_host;
+    std::mutex                       s_http_mtx;
+
+
     using arc_init_fn           = bool(*)(const char*, const char*, int64_t, uint32_t);
     using arc_get_comm_bridge_fn = const arc_comm_vtable_t*(*)();
     using arc_validate_tool_fn  = uint64_t(*)(uint64_t, uint64_t);
@@ -205,6 +212,53 @@ namespace
         return "https://aidapro.net";
     }
 
+    std::shared_ptr<httplib::Client> get_or_create_license_client()
+    {
+        std::lock_guard<std::mutex> lk(s_http_mtx);
+        std::string host = get_cloud_function_host();
+        if (!s_license_client || s_license_host != host) {
+            s_license_client = std::make_shared<httplib::Client>(host.c_str());
+            s_license_host = host;
+            s_license_client->set_connection_timeout(15);
+            s_license_client->set_read_timeout(30);
+            s_license_client->set_write_timeout(10);
+            s_license_client->set_keep_alive(true);
+            s_license_client->set_tcp_nodelay(true);
+            s_license_client->set_decompress(true);
+            s_license_client->set_follow_location(true);
+            s_license_client->enable_server_certificate_verification(false);
+        }
+        return s_license_client;
+    }
+
+    std::shared_ptr<httplib::Client> get_or_create_ip_client()
+    {
+        std::lock_guard<std::mutex> lk(s_http_mtx);
+        const std::string host = "https://api.ipify.org";
+        if (!s_ip_client || s_ip_host != host) {
+            s_ip_client = std::make_shared<httplib::Client>(host.c_str());
+            s_ip_host = host;
+            s_ip_client->set_connection_timeout(5);
+            s_ip_client->set_read_timeout(5);
+            s_ip_client->set_write_timeout(5);
+            s_ip_client->set_keep_alive(true);
+            s_ip_client->set_tcp_nodelay(true);
+            s_ip_client->set_decompress(true);
+            s_ip_client->set_follow_location(true);
+            s_ip_client->enable_server_certificate_verification(false);
+        }
+        return s_ip_client;
+    }
+
+    void reset_license_clients()
+    {
+        std::lock_guard<std::mutex> lk(s_http_mtx);
+        s_license_client.reset();
+        s_license_host.clear();
+        s_ip_client.reset();
+        s_ip_host.clear();
+    }
+
     std::string generate_nonce()
     {
         LARGE_INTEGER counter{};
@@ -295,11 +349,8 @@ namespace
     std::string get_public_ip()
     {
         try {
-            httplib::Client client("https://api.ipify.org");
-            client.set_connection_timeout(5);
-            client.set_read_timeout(5);
-            client.enable_server_certificate_verification(false);
-            auto res = client.Get("/?format=json");
+            auto client = get_or_create_ip_client();
+            auto res = client->Get("/?format=json");
             if (!res || res->status != 200)
                 return {};
             auto j = json::parse(res->body, nullptr, false);
@@ -309,6 +360,57 @@ namespace
         } catch (...) {
             return {};
         }
+    }
+
+    bool call_validation_endpoint_once(
+        const std::string& action,
+        const std::string& key,
+        const std::string& hwid,
+        const std::string& session_token,
+        const std::string& nonce,
+        const std::string& body_str,
+        std::string& error_out,
+        json& response_out)
+    {
+        auto client = get_or_create_license_client();
+        auto res = client->Post("/validateLicense", body_str, "application/json");
+        if (!res) {
+            error_out = "License service transport error: " + httplib::to_string(res.error());
+            return false;
+        }
+        if (res->status >= 500) {
+            error_out = "License service returned HTTP " + std::to_string(res->status);
+            return false;
+        }
+        if (res->status != 200) {
+            error_out = "License service returned HTTP " + std::to_string(res->status);
+            return false;
+        }
+
+        response_out = json::parse(res->body, nullptr, false);
+        if (response_out.is_discarded() || !response_out.is_object()) {
+            error_out = "License service returned invalid JSON.";
+            return false;
+        }
+
+        const std::string status = response_out.value("status", "");
+        if (status != "valid") {
+            error_out = response_out.value("reason", status.empty() ? std::string("license rejected") : status);
+            return false;
+        }
+        if (action == "validate" && response_out.value("client_nonce", "") != nonce) {
+            error_out = "License service returned a nonce mismatch.";
+            return false;
+        }
+        if (action == "heartbeat" && response_out.value("heartbeat_nonce", "") != nonce) {
+            error_out = "License heartbeat nonce mismatch.";
+            return false;
+        }
+        if (response_out.value("license_key", "") != key || response_out.value("hwid", "") != hwid) {
+            error_out = "License response identity mismatch.";
+            return false;
+        }
+        return true;
     }
 
     bool call_validation_endpoint(settings_sa_t& ,
@@ -321,13 +423,6 @@ namespace
                                   json& response_out)
     {
         try {
-            httplib::Client client(get_cloud_function_host());
-            client.set_connection_timeout(15);
-            client.set_read_timeout(20);
-            client.set_write_timeout(10);
-            client.set_follow_location(true);
-            client.enable_server_certificate_verification(false);
-
             json body;
             body["action"] = action;
             body["license_key"] = key;
@@ -344,45 +439,32 @@ namespace
                 body["plugin_version"] = "aida-standalone";
             }
 
-            auto res = client.Post("/validateLicense", body.dump(), "application/json");
-            if (!res) {
-                error_out = "License service transport error: " + httplib::to_string(res.error());
-                return false;
-            }
-            if (res->status != 200) {
-                error_out = "License service returned HTTP " + std::to_string(res->status);
-                return false;
+            std::string body_str = body.dump();
+
+            if (call_validation_endpoint_once(action, key, hwid, session_token, nonce,
+                                              body_str, error_out, response_out)) {
+                return true;
             }
 
-            response_out = json::parse(res->body, nullptr, false);
-            if (response_out.is_discarded() || !response_out.is_object()) {
-                error_out = "License service returned invalid JSON.";
-                return false;
-            }
+            bool is_transport_or_server_error =
+                error_out.find("transport error") != std::string::npos ||
+                error_out.find("HTTP 5") != std::string::npos;
 
-            const std::string status = response_out.value("status", "");
-            if (status != "valid") {
-                error_out = response_out.value("reason", status.empty() ? std::string("license rejected") : status);
+            if (!is_transport_or_server_error)
                 return false;
-            }
-            if (action == "validate" && response_out.value("client_nonce", "") != nonce) {
-                error_out = "License service returned a nonce mismatch.";
-                return false;
-            }
-            if (action == "heartbeat" && response_out.value("heartbeat_nonce", "") != nonce) {
-                error_out = "License heartbeat nonce mismatch.";
-                return false;
-            }
-            if (response_out.value("license_key", "") != key || response_out.value("hwid", "") != hwid) {
-                error_out = "License response identity mismatch.";
-                return false;
-            }
-            return true;
+
+            reset_license_clients();
+
+            error_out.clear();
+            return call_validation_endpoint_once(action, key, hwid, session_token, nonce,
+                                                body_str, error_out, response_out);
         } catch (const std::exception& e) {
             error_out = std::string("License service exception: ") + e.what();
+            reset_license_clients();
             return false;
         } catch (...) {
             error_out = "License service unexpected exception.";
+            reset_license_clients();
             return false;
         }
     }
@@ -614,17 +696,13 @@ namespace
 
 
         try {
-            httplib::Client client(get_cloud_function_host());
-            client.set_connection_timeout(15);
-            client.set_read_timeout(30);
-            client.set_write_timeout(10);
-            client.enable_server_certificate_verification(false);
+            auto client = get_or_create_license_client();
 
             json body;
             body["session_token"] = settings.license_session_token;
             body["hwid"] = hwid;
 
-            auto res = client.Post("/api/download/arc", body.dump(), "application/json");
+            auto res = client->Post("/api/download/arc", body.dump(), "application/json");
             if (!res || res->status != 200) {
                 OutputDebugStringA("ARC: Download failed.\n");
                 return false;
@@ -844,7 +922,7 @@ namespace
                 const int heartbeat_jitter_s = 10;
                 wait_s = heartbeat_base_s + static_cast<int>(rng() % (heartbeat_jitter_s + 1));
             } else {
-                wait_s = (std::min)(30 * (1 << (consecutive_failures - 1)), 300);
+                wait_s = (std::min)(30 * (1 << (consecutive_failures - 1)), 120);
             }
 
             for (int waited = 0; waited < wait_s && !s_stop.load(std::memory_order_acquire); waited += 1)
@@ -969,6 +1047,7 @@ namespace standalone_license
         s_stop.store(true, std::memory_order_release);
         if (s_heartbeat_thread.joinable())
             s_heartbeat_thread.join();
+        reset_license_clients();
         unload_arc();
     }
 
@@ -997,7 +1076,7 @@ namespace standalone_license
 
         auto now_ms = std::chrono::steady_clock::now().time_since_epoch().count() / 1000000;
         auto last = s_last_heartbeat_time.load(std::memory_order_acquire);
-        if (last > 0 && (now_ms - last) > 90000)
+        if (last > 0 && (now_ms - last) > 180000)
             return false;
         return check_obfuscated_valid();
     }
@@ -1053,7 +1132,7 @@ namespace standalone_license
         auto now_ms = static_cast<int64_t>(
             std::chrono::steady_clock::now().time_since_epoch().count() / 1000000);
         int64_t delta = now_ms - last;
-        return delta >= 0 && delta < 90000;
+        return delta >= 0 && delta < 180000;
     }
 
     double compute_degradation_factor()

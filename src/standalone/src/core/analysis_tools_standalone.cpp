@@ -13,6 +13,7 @@
 #include "struct_monitor.hpp"
 #include "symbolic_engine.hpp"
 #include "deobfuscation_engine.hpp"
+#include "stealth_engine.hpp"
 #include "../helpers/globals.h"
 
 #include <cinttypes>
@@ -544,11 +545,11 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			json out;
 			out["statistics"] = {
-				{"total_instructions", result.statistics.total_instructions},
-				{"clean_instructions", result.statistics.clean_instructions},
-				{"junk_removed", result.statistics.junk_removed},
-				{"opaque_predicates", result.statistics.opaque_predicates_found},
-				{"constants_resolved", result.statistics.constants_resolved}
+				{"total_instructions", result.total_original},
+				{"clean_instructions", result.total_clean},
+				{"junk_removed", result.removed_junk},
+				{"opaque_predicates", result.opaque_predicates_found},
+				{"constants_resolved", result.constants_resolved}
 			};
 
 			json insns = json::array();
@@ -558,7 +559,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(ci.address));
 				obj["address"] = abuf;
 				obj["disasm"] = ci.disasm;
-				obj["is_original"] = ci.is_original;
+				obj["is_original"] = !ci.was_junk;
 				obj["was_constant_folded"] = ci.was_constant_folded;
 				insns.push_back(obj);
 			}
@@ -570,8 +571,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				char abuf[32];
 				std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(op.address));
 				obj["address"] = abuf;
-				obj["condition_str"] = op.condition_str;
-				obj["always_true"] = op.always_true;
+				obj["condition_str"] = op.condition_ast;
+				obj["always_true"] = op.always_taken;
 				opaques.push_back(obj);
 			}
 			out["opaque_predicates"] = opaques;
@@ -582,9 +583,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				char abuf[32];
 				std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(cf.address));
 				obj["address"] = abuf;
-				obj["original_expression"] = cf.original_expression;
+				obj["original_expression"] = cf.original_ast;
 				char vbuf[32];
-				std::snprintf(vbuf, sizeof(vbuf), "0x%llX", static_cast<unsigned long long>(cf.resolved_value));
+				std::snprintf(vbuf, sizeof(vbuf), "0x%llX", static_cast<unsigned long long>(cf.concrete_value));
 				obj["resolved_value"] = vbuf;
 				constants.push_back(obj);
 			}
@@ -620,7 +621,6 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			out["total_instructions"] = result.total_instructions;
 			out["effective_instructions"] = result.effective_count;
 			out["removed_count"] = result.total_instructions - result.effective_count;
-			out["final_expression"] = result.final_expression;
 
 			json insns = json::array();
 			for (auto& ti : result.effective_instructions) {
@@ -672,7 +672,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			json out;
 			out["satisfiable"] = result.satisfiable;
-			out["instructions_processed"] = result.instructions_processed;
+			out["solving_time_ms"] = result.solving_time_ms;
 
 			if (result.satisfiable) {
 				json vars = json::object();
@@ -683,11 +683,6 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				}
 				out["solution"] = vars;
 			}
-
-			json constraints = json::array();
-			for (auto& c : result.constraint_strings)
-				constraints.push_back(c);
-			out["path_constraints"] = constraints;
 
 			return tool_result_t::ok(out);
 		}
@@ -725,7 +720,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				}
 			}
 
-			std::vector<uint64_t> taint_mem;
+			std::vector<std::pair<uint64_t, uint32_t>> taint_mem;
 			{
 				std::string mem_str = params.value("taint_memory", "");
 				std::istringstream iss(mem_str);
@@ -734,14 +729,14 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 					while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
 					while (!tok.empty() && tok.back() == ' ') tok.pop_back();
 					if (!tok.empty())
-						taint_mem.push_back(std::strtoull(tok.c_str(), nullptr, 16));
+						taint_mem.push_back({std::strtoull(tok.c_str(), nullptr, 16), 1});
 				}
 			}
 
 			auto result = symbolic_engine::taint_trace(start, end, max_insns, taint_regs, taint_mem);
 
 			json out;
-			out["total_instructions"] = result.total_instructions;
+			out["total_instructions"] = result.total_processed;
 			out["tainted_instructions"] = result.tainted_count;
 
 			json insns = json::array();
@@ -765,12 +760,12 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			out["instructions"] = insns;
 
 			json tainted_regs_out = json::array();
-			for (auto& r : result.final_tainted_regs)
+			for (auto& r : result.tainted_registers)
 				tainted_regs_out.push_back(r);
 			out["final_tainted_registers"] = tainted_regs_out;
 
 			json tainted_mem_out = json::array();
-			for (auto addr : result.final_tainted_addrs) {
+			for (auto addr : result.tainted_memory_addresses) {
 				char abuf[32];
 				std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(addr));
 				tainted_mem_out.push_back(abuf);
@@ -829,22 +824,21 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			if (addr == 0)
 				return tool_result_t::error("invalid address");
 
-			extern const settings_sa_t& get_standalone_settings();
-			decompiler_engine::decompile_function_hybrid(addr, get_standalone_settings());
+			decompiler_engine::decompile_function_hybrid(addr, g_sa_settings);
 
 			auto& st = decompiler_engine::g_state;
 			int timeout_ms = 60000;
 			int waited = 0;
-			while (st.is_decompiling.load() && waited < timeout_ms) {
+			while (st.decompiling.load() && waited < timeout_ms) {
 				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 				waited += 100;
 			}
 
-			if (st.is_decompiling.load())
+			if (st.decompiling.load())
 				return tool_result_t::error("decompilation timed out after 60 seconds");
 
-			std::lock_guard<std::mutex> lock(st.mtx);
-			if (st.current.code.empty())
+			std::lock_guard<std::mutex> lock(st.mutex);
+			if (st.current.pseudocode.empty())
 				return tool_result_t::error("decompilation produced no output");
 
 			json out;
@@ -852,8 +846,65 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			std::snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(st.current.function_addr));
 			out["address"] = abuf;
 			out["function_name"] = st.current.function_name;
-			out["pseudocode"] = st.current.code;
+			out["pseudocode"] = st.current.pseudocode;
 			out["mode"] = "hybrid";
+			return tool_result_t::ok(out);
+		}
+	});
+
+	srv.register_tool({
+		"enable_stealth_context",
+		"Install anti-debug hooks in the target process: PEB flag spoofing and RDTSC timing patch. Hides hardware breakpoints from anti-cheat context inspection. Call this before setting hardware breakpoints to ensure the target cannot detect analysis.",
+		{{"pid", "string", "Target process PID as decimal string. Leave empty to use the currently attached PID.", false}},
+		true,
+		[](const json& params) -> tool_result_t {
+			uint32_t pid = 0;
+			std::string pid_str = params.value("pid", "");
+			if (!pid_str.empty())
+				pid = static_cast<uint32_t>(std::strtoul(pid_str.c_str(), nullptr, 10));
+			if (pid == 0)
+				pid = driver_bridge::attached_pid();
+			if (pid == 0)
+				return tool_result_t::error("no target PID: attach driver first or provide pid parameter");
+
+			if (stealth_engine::is_active())
+				return tool_result_t::ok(json{{"status", stealth_engine::get_status()}, {"already_active", true}});
+
+			stealth_engine::enable_stealth(pid);
+
+			json out;
+			out["pid"] = pid;
+			out["status"] = stealth_engine::get_status();
+			out["active"] = stealth_engine::is_active();
+			{
+				std::lock_guard<std::mutex> lk(stealth_engine::g_state.mutex);
+				out["peb_spoofed"] = stealth_engine::g_state.session.peb_spoofed;
+				out["rdtsc_hooks"] = static_cast<int>(stealth_engine::g_state.session.hooks.size());
+			}
+			return tool_result_t::ok(out);
+		}
+	});
+
+	srv.register_tool({
+		"disable_stealth_context",
+		"Remove all stealth hooks installed by enable_stealth_context and restore original bytes. Safe to call even if stealth is not active.",
+		{},
+		true,
+		[](const json& params) -> tool_result_t {
+			if (!stealth_engine::is_active())
+				return tool_result_t::ok(json{{"status", "stealth was not active"}, {"hooks_removed", 0}});
+
+			int hook_count = 0;
+			{
+				std::lock_guard<std::mutex> lk(stealth_engine::g_state.mutex);
+				hook_count = static_cast<int>(stealth_engine::g_state.session.hooks.size());
+			}
+
+			stealth_engine::disable_stealth();
+
+			json out;
+			out["status"] = stealth_engine::get_status();
+			out["hooks_removed"] = hook_count;
 			return tool_result_t::ok(out);
 		}
 	});

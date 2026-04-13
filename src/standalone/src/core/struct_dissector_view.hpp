@@ -61,6 +61,8 @@ inline ImU32 type_color(struct_dissector::field_type_t t, float alpha) {
 
 inline void render(float pos_x, float pos_y, float width, float height,
 				   float alpha, float accent_r, float accent_g, float accent_b) {
+	ImGui::BeginChild("##struct_dissector_view", ImVec2(width, height), false,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 	auto& ui = g_ui;
 	auto& st = struct_dissector::g_state;
 	const float dt = ImGui::GetIO().DeltaTime;
@@ -70,8 +72,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	ImVec2 wpos = ImGui::GetWindowPos();
-	float ox = wpos.x + pos_x;
-	float oy = wpos.y + pos_y;
+	float ox = wpos.x;
+	float oy = wpos.y;
 
 	ImU32 accent_col = IM_COL32(
 		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
@@ -274,6 +276,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (active_idx < 0) {
 			dl->AddText(ImVec2(rx + rw * 0.5f - 60.f, ry_start + rh * 0.5f),
 						dim_col, "No struct selected");
+			ImGui::EndChild();
 			return;
 		}
 
@@ -460,6 +463,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 		ImGui::PopStyleColor(3);
 	}
-}
 
+	ImGui::EndChild();
 }

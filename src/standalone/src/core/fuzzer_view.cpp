@@ -23,6 +23,10 @@ static local_state_t s_state;
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b)
 {
+	ImGui::BeginChild("##fuzzer_view", ImVec2(width, height), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+	ImVec2 wp = ImGui::GetWindowPos();
+	float ox = wp.x;
+	float oy = wp.y;
 	auto* dl = ImGui::GetWindowDrawList();
 	auto& st = s_state;
 	auto& fz = fuzzer_engine::g_state;
@@ -44,13 +48,13 @@ void render(float pos_x, float pos_y, float width, float height,
 	const ImU32 graph_line  = IM_COL32(static_cast<int>(accent_r * 200), static_cast<int>(accent_g * 200),
 	                                    static_cast<int>(accent_b * 200), static_cast<int>(alpha * 200));
 
-	dl->AddRectFilled(ImVec2(pos_x, pos_y), ImVec2(pos_x + width, pos_y + height), bg);
+	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height), bg);
 
-	float cx = pos_x + 12.f;
-	float cy = pos_y + 8.f;
+	float cx = ox + 12.f;
+	float cy = oy + 8.f;
 	const float toolbar_h = 72.f;
 
-	dl->AddRectFilled(ImVec2(pos_x, cy - 4.f), ImVec2(pos_x + width, cy + toolbar_h), header_bg);
+	dl->AddRectFilled(ImVec2(ox, cy - 4.f), ImVec2(ox + width, cy + toolbar_h), header_bg);
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy + 2.f));
 	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.15f, alpha));
@@ -145,7 +149,7 @@ void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	float stat_panel_h = 100.f;
-	dl->AddRectFilled(ImVec2(pos_x + 4.f, cy), ImVec2(pos_x + width - 4.f, cy + stat_panel_h), stat_bg);
+	dl->AddRectFilled(ImVec2(ox + 4.f, cy), ImVec2(ox + width - 4.f, cy + stat_panel_h), stat_bg);
 
 	struct stat_box_t { const char* label; std::string value; ImU32 color; };
 	char buf[64];
@@ -170,7 +174,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	float box_w = (width - 32.f) / 8.f;
 	for (int i = 0; i < 8; ++i) {
-		float bx = pos_x + 12.f + static_cast<float>(i) * box_w;
+		float bx = ox + 12.f + static_cast<float>(i) * box_w;
 		float by = cy + 8.f;
 		dl->AddText(ImVec2(bx, by), dim_col, boxes[i].label);
 		dl->AddText(ImVec2(bx, by + 18.f), boxes[i].color, boxes[i].value.c_str());
@@ -179,7 +183,7 @@ void render(float pos_x, float pos_y, float width, float height,
 	float graph_y = cy + 50.f;
 	float graph_h = stat_panel_h - 58.f;
 	float graph_w = width - 32.f;
-	float gx = pos_x + 12.f;
+	float gx = ox + 12.f;
 
 	dl->AddRectFilled(ImVec2(gx, graph_y), ImVec2(gx + graph_w, graph_y + graph_h), graph_bg);
 
@@ -199,20 +203,20 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	cy += stat_panel_h + 8.f;
 
-	dl->AddRectFilled(ImVec2(pos_x + 4.f, cy), ImVec2(pos_x + width - 4.f, cy + 22.f), header_bg);
+	dl->AddRectFilled(ImVec2(ox + 4.f, cy), ImVec2(ox + width - 4.f, cy + 22.f), header_bg);
 	std::snprintf(buf, sizeof(buf), "Unique Crashes (%zu)", crashes_copy.size());
 	dl->AddText(ImVec2(cx, cy + 3.f), accent, buf);
 	cy += 24.f;
 
 	const float detail_panel_h = (st.selected_crash >= 0 && st.selected_crash < static_cast<int>(crashes_copy.size())) ? 240.f : 0.f;
-	float crash_table_h = pos_y + height - cy - 8.f - detail_panel_h;
+	float crash_table_h = oy + height - cy - 8.f - detail_panel_h;
 	float row_h = 22.f;
 	float content_h = static_cast<float>(crashes_copy.size()) * row_h;
 
 	ui_anim::handle_scroll_input(st.target_scroll_y, 0.f, std::max(0.f, content_h - crash_table_h), row_h);
 	ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 12.f, ImGui::GetIO().DeltaTime);
 
-	ImGui::PushClipRect(ImVec2(pos_x, cy), ImVec2(pos_x + width - 14.f, pos_y + height - 8.f), true);
+	ImGui::PushClipRect(ImVec2(ox, cy), ImVec2(ox + width - 14.f, oy + height - 8.f), true);
 
 	int first_vis = static_cast<int>(st.scroll_y / row_h);
 	int last_vis = first_vis + static_cast<int>(crash_table_h / row_h) + 2;
@@ -221,12 +225,12 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	for (int i = first_vis; i < last_vis; ++i) {
 		float ry = cy + static_cast<float>(i) * row_h - st.scroll_y;
-		if (ry + row_h < cy || ry > pos_y + height) continue;
+		if (ry + row_h < cy || ry > oy + height) continue;
 
 		auto& crash = crashes_copy[static_cast<size_t>(i)];
 
-		ImVec2 rmin(pos_x + 4.f, ry);
-		ImVec2 rmax(pos_x + width - 14.f, ry + row_h);
+		ImVec2 rmin(ox + 4.f, ry);
+		ImVec2 rmax(ox + width - 14.f, ry + row_h);
 
 		bool hovered = ImGui::IsMouseHoveringRect(rmin, rmax);
 		bool selected = st.selected_crash == i;
@@ -298,7 +302,7 @@ void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopClipRect();
 
 	if (content_h > crash_table_h) {
-		ui_anim::render_custom_scrollbar(dl, pos_x + width - 12.f, cy, 10.f, crash_table_h,
+		ui_anim::render_custom_scrollbar(dl, ox + width - 12.f, cy, 10.f, crash_table_h,
 		                                  st.scroll_y, content_h, crash_table_h,
 		                                  alpha, st.scrollbar_dragging, st.scrollbar_drag_offset);
 	}
@@ -308,11 +312,11 @@ void render(float pos_x, float pos_y, float width, float height,
 		float dy = cy + crash_table_h + 4.f;
 		float dw = width - 8.f;
 
-		dl->AddRectFilled(ImVec2(pos_x + 4.f, dy), ImVec2(pos_x + 4.f + dw, dy + detail_panel_h - 4.f), stat_bg);
-		dl->AddRect(ImVec2(pos_x + 4.f, dy), ImVec2(pos_x + 4.f + dw, dy + detail_panel_h - 4.f),
+		dl->AddRectFilled(ImVec2(ox + 4.f, dy), ImVec2(ox + 4.f + dw, dy + detail_panel_h - 4.f), stat_bg);
+		dl->AddRect(ImVec2(ox + 4.f, dy), ImVec2(ox + 4.f + dw, dy + detail_panel_h - 4.f),
 		            IM_COL32(60, 60, 60, static_cast<int>(alpha * 200)));
 
-		float dx = pos_x + 16.f;
+		float dx = ox + 16.f;
 		float dcy = dy + 6.f;
 
 		char detail_buf[128];
@@ -458,10 +462,11 @@ void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	if (!fz.active && !running) {
-		float center_y = pos_y + height * 0.5f;
+		float center_y = oy + height * 0.5f;
 		dl->AddText(ImVec2(cx, center_y), dim_col, "Configure target function address and input buffer, then click Start Fuzzing.");
 		dl->AddText(ImVec2(cx, center_y + 18.f), dim_col, "The fuzzer uses Unicorn emulation snapshots for crash-safe iteration.");
 	}
+	ImGui::EndChild();
 }
 
 }

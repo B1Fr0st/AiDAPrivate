@@ -1985,7 +1985,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
 			if (!ok)
 				return tool_result_t::error("Failed to enable stealth mode.");
 
-			auto status = stealth_engine::get_status();
+			auto status = stealth_engine::get_session_info();
 			json result;
 			result["status"] = "active";
 			result["pid"] = pid;
@@ -2022,7 +2022,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
 			result["active"] = stealth_engine::is_active();
 
 			if (stealth_engine::is_active()) {
-				auto status = stealth_engine::get_status();
+				auto status = stealth_engine::get_session_info();
 				result["pid"] = status.pid;
 				result["peb_spoofed"] = status.peb_spoofed;
 				result["rdtsc_hooks"] = static_cast<int>(status.hooks.size());

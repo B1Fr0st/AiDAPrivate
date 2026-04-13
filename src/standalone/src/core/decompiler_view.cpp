@@ -3,6 +3,7 @@
 #include "syntax_highlight.hpp"
 #include "ui_anim.hpp"
 #include "disasm_view.hpp"
+#include "../helpers/globals.h"
 
 #include "imgui/imgui.h"
 
@@ -204,8 +205,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		}
 		if (deobf_addr != 0) {
 			if (toolbar_button("Deobfuscate", btn_x)) {
-				extern const settings_sa_t& get_standalone_settings();
-				decompiler_engine::decompile_with_deobfuscation(deobf_addr, get_standalone_settings());
+				decompiler_engine::decompile_with_deobfuscation(deobf_addr, g_sa_settings);
 			}
 		}
 	}
@@ -309,8 +309,7 @@ void render(float pos_x, float pos_y, float width, float height,
 				if (a != 0) addrs.push_back(a);
 			}
 			if (!addrs.empty()) {
-				extern const settings_sa_t& get_standalone_settings();
-				decompiler_engine::batch_decompile(addrs, get_standalone_settings());
+				decompiler_engine::batch_decompile(addrs);
 				show_batch_panel = false;
 			}
 		}
@@ -568,8 +567,7 @@ void render(float pos_x, float pos_y, float width, float height,
 					uint64_t target_addr = 0;
 					if (callee.size() > 4 && callee.substr(0, 4) == "sub_") {
 						if (sscanf_s(callee.c_str() + 4, "%llx", &target_addr) == 1 && target_addr != 0) {
-							extern const settings_sa_t& get_standalone_settings();
-							decompiler_engine::decompile_function(target_addr, get_standalone_settings());
+							decompiler_engine::decompile_function(target_addr, g_sa_settings);
 						}
 					}
 				}
@@ -605,8 +603,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
 					if (hist_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hi != st.history_pos) {
 						st.history_pos = hi;
-						extern const settings_sa_t& get_standalone_settings();
-						decompiler_engine::decompile_function(he.addr, get_standalone_settings());
+						decompiler_engine::decompile_function(he.addr, g_sa_settings);
 					}
 
 					py += 16.f;

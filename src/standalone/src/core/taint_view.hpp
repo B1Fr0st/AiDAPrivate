@@ -1,8 +1,12 @@
 #pragma once
 
 #include "symbolic_engine.hpp"
+#include "disasm_view.hpp"
+#include "ui_anim.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
+
+extern DisasmState g_disasm;
 
 #include <algorithm>
 #include <cstdint>
@@ -31,6 +35,10 @@ struct local_state_t {
 	int max_insns = 10000;
 	int selected_row = -1;
 	float scroll_y = 0.f;
+	float target_scroll_y = 0.f;
+	bool  scrollbar_dragging = false;
+	float scrollbar_drag_offset = 0.f;
+	float anim_time = 0.f;
 	int view_mode = 0;
 };
 
@@ -115,8 +123,17 @@ inline std::vector<taint_node_t> build_taint_flow(const symbolic_engine::taint_r
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float accent_r, float accent_g, float accent_b)
 {
+	ImGui::BeginChild("##taint_view", ImVec2(width, height), false,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 	auto* dl = ImGui::GetWindowDrawList();
 	auto& st = s_state;
+
+	ImVec2 wp = ImGui::GetWindowPos();
+	float cx = wp.x;
+	float cy = wp.y;
+
+	st.anim_time += ImGui::GetIO().DeltaTime;
+	float dt = ImGui::GetIO().DeltaTime;
 
 	const ImU32 bg        = IM_COL32(30, 30, 30, static_cast<int>(alpha * 255));
 	const ImU32 text_col  = IM_COL32(212, 212, 212, static_cast<int>(alpha * 255));
@@ -132,10 +149,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const ImU32 prop_col   = IM_COL32(229, 192, 123, static_cast<int>(alpha * 255));
 	const ImU32 sink_col   = IM_COL32(224, 108, 117, static_cast<int>(alpha * 255));
 	const ImU32 green_col  = IM_COL32(152, 195, 121, static_cast<int>(alpha * 255));
-
-	ImVec2 wpos = ImGui::GetWindowPos();
-	float cx = wpos.x + pos_x;
-	float cy = wpos.y + pos_y;
 
 	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + width, cy + height), bg);
 
@@ -234,11 +247,18 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	if (!res.success && !res.error.empty()) {
 		dl->AddText(ImVec2(cx + pad, content_y + pad), sink_col, res.error.c_str());
+		ImGui::EndChild();
 		return;
 	}
 
 	if (!res.success) {
-		dl->AddText(ImVec2(cx + pad, content_y + pad), dim_col, "Configure taint sources and click Start Trace");
+		if (busy) {
+			ui_anim::render_spinner(dl, cx + width * 0.5f, content_y + content_h * 0.4f, 14.f, accent, st.anim_time);
+			dl->AddText(ImVec2(cx + width * 0.5f - 40.f, content_y + content_h * 0.4f + 24.f), dim_col, "Tracing...");
+		} else {
+			dl->AddText(ImVec2(cx + pad, content_y + pad), dim_col, "Configure taint sources and click Start Trace");
+		}
+		ImGui::EndChild();
 		return;
 	}
 
@@ -279,14 +299,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		auto nodes = detail::build_taint_flow(res, source_regs);
 		int total = static_cast<int>(nodes.size());
 
-		ImGui::SetCursorScreenPos(ImVec2(cx, list_y));
-		ImGui::InvisibleButton("##taint_scroll", ImVec2(width, list_h));
-		if (ImGui::IsItemHovered()) {
-			st.scroll_y -= ImGui::GetIO().MouseWheel * row_h * 3.f;
-		}
-		if (st.scroll_y < 0.f) st.scroll_y = 0.f;
 		float max_scroll = (std::max)(0.f, static_cast<float>(total - visible) * row_h);
-		if (st.scroll_y > max_scroll) st.scroll_y = max_scroll;
+		ImGui::SetCursorScreenPos(ImVec2(cx, list_y));
+		ImGui::InvisibleButton("##taint_scroll", ImVec2(width - 10.f, list_h));
+		ui_anim::handle_scroll_input(st.target_scroll_y, max_scroll, row_h * 3.f);
+		ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, dt);
+		ui_anim::clamp_scroll(st.scroll_y, max_scroll);
+		ui_anim::clamp_scroll(st.target_scroll_y, max_scroll);
 
 		int start = static_cast<int>(st.scroll_y / row_h);
 		ImGui::PushClipRect(ImVec2(cx, list_y), ImVec2(cx + width, list_y + list_h), true);
@@ -305,7 +324,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (ImGui::IsItemClicked()) st.selected_row = i;
 			if (ImGui::IsItemClicked() && ImGui::IsMouseDoubleClicked(0)) {
 				globals::ui::active_center_view = center_view_t::disassembly;
-				globals::disasm::go_to_address = n.address;
+				disasm_view::goto_address(n.address, g_disasm);
 			}
 
 			dl->AddRectFilled(ImVec2(cx, ry), ImVec2(cx + width, ry + row_h), rbg);
@@ -330,6 +349,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 
 		ImGui::PopClipRect();
+
+		ui_anim::render_custom_scrollbar(dl, cx + width - 8.f, list_y, 6.f, list_h,
+			st.scroll_y, max_scroll, st.scrollbar_dragging, st.scrollbar_drag_offset,
+			accent, IM_COL32(60, 60, 60, static_cast<int>(alpha * 150)));
 	}
 
 	else if (st.view_mode == 1) {
@@ -338,6 +361,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		if (nodes.empty()) {
 			dl->AddText(ImVec2(cx + pad, table_y + pad), dim_col, "No tainted instructions");
+			ImGui::EndChild();
 			return;
 		}
 
@@ -359,14 +383,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (start > total - max_vis) start = total - max_vis;
 		}
 
+		float max_s = static_cast<float>((std::max)(0, total - max_vis)) * (node_h + node_spacing);
 		ImGui::SetCursorScreenPos(ImVec2(cx, table_y));
-		ImGui::InvisibleButton("##flow_scroll", ImVec2(width, table_h));
-		if (ImGui::IsItemHovered()) {
-			st.scroll_y -= ImGui::GetIO().MouseWheel * (node_h + node_spacing) * 3.f;
-			if (st.scroll_y < 0.f) st.scroll_y = 0.f;
-			float max_s = static_cast<float>((std::max)(0, total - max_vis)) * (node_h + node_spacing);
-			if (st.scroll_y > max_s) st.scroll_y = max_s;
-		}
+		ImGui::InvisibleButton("##flow_scroll", ImVec2(width - 10.f, table_h));
+		ui_anim::handle_scroll_input(st.target_scroll_y, max_s, (node_h + node_spacing) * 3.f);
+		ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, dt);
+		ui_anim::clamp_scroll(st.scroll_y, max_s);
+		ui_anim::clamp_scroll(st.target_scroll_y, max_s);
 
 		for (int i = start; i < total && i < start + max_vis; ++i) {
 			auto& n = nodes[i];
@@ -404,7 +427,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 
 		ImGui::PopClipRect();
+
+		ui_anim::render_custom_scrollbar(dl, cx + width - 8.f, table_y, 6.f, table_h,
+			st.scroll_y, max_s, st.scrollbar_dragging, st.scrollbar_drag_offset,
+			accent, IM_COL32(60, 60, 60, static_cast<int>(alpha * 150)));
 	}
+
+	ImGui::EndChild();
 }
 
 }

@@ -33,7 +33,11 @@ enum class center_view_t : int {
 	integrity_hunter,
 	symbolic_view,
 	taint_view,
-	deobfuscation_view
+	deobfuscation_view,
+	stealth_view,
+	scan_hub,
+	types_hub,
+	analysis_hub
 };
 
 
