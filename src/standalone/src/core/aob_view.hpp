@@ -6,6 +6,7 @@
 #include "imgui.h"
 #include "aob_generator.hpp"
 #include "ui_anim.hpp"
+#include "../helpers/globals.h"
 
 namespace aob_view {
 
@@ -36,18 +37,22 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float w = ImGui::GetWindowSize().x;
 	float h = ImGui::GetWindowSize().y;
 
-	const ImU32 bg          = IM_COL32(30, 30, 30, static_cast<int>(alpha * 255));
-	const ImU32 text_col    = IM_COL32(212, 212, 212, static_cast<int>(alpha * 255));
-	const ImU32 dim_col     = IM_COL32(140, 140, 140, static_cast<int>(alpha * 255));
+	const auto& _t = themes::resolved;
+	const auto _ta = [alpha](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, alpha);
+	};
+	const ImU32 bg          = _ta(_t.bg_base);
+	const ImU32 text_col    = _ta(_t.text_primary);
+	const ImU32 dim_col     = _ta(_t.text_dim);
 	const ImU32 accent      = IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 	                                    static_cast<int>(accent_b * 255), static_cast<int>(alpha * 255));
 	const ImU32 fixed_col   = IM_COL32(86, 182, 194, static_cast<int>(alpha * 255));
 	const ImU32 wild_col    = IM_COL32(224, 108, 117, static_cast<int>(alpha * 255));
-	const ImU32 panel_bg    = IM_COL32(35, 35, 35, static_cast<int>(alpha * 255));
-	const ImU32 header_bg   = IM_COL32(45, 45, 45, static_cast<int>(alpha * 255));
-	const ImU32 row_even    = IM_COL32(35, 35, 35, static_cast<int>(alpha * 255));
-	const ImU32 row_odd     = IM_COL32(40, 40, 40, static_cast<int>(alpha * 255));
-	const ImU32 row_hover   = IM_COL32(55, 55, 55, static_cast<int>(alpha * 255));
+	const ImU32 panel_bg    = _ta(_t.panel_bg);
+	const ImU32 header_bg   = _ta(_t.panel_header);
+	const ImU32 row_even    = _ta(_t.panel_bg);
+	const ImU32 row_odd     = _ta(ui_anim::lighten(_t.panel_bg, 8));
+	const ImU32 row_hover   = _ta(ui_anim::lighten(_t.panel_header, 14));
 	const ImU32 unique_col  = IM_COL32(152, 195, 121, static_cast<int>(alpha * 255));
 	const ImU32 notuniq_col = IM_COL32(224, 108, 117, static_cast<int>(alpha * 255));
 
@@ -59,13 +64,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float cx = ox + 12.f;
 	float cy = oy + 8.f;
 
-	dl->AddRectFilled(ImVec2(ox, cy - 4.f), ImVec2(ox + left_w, cy + 32.f), header_bg);
-	dl->AddText(ImVec2(cx, cy + 2.f), accent, "AOB Signature Generator");
+	ui_anim::render_toolbar(dl, ox, cy - 4.f, left_w, 36.f, accent_r, accent_g, accent_b, alpha);
+	ImU32 hdr_text = IM_COL32(static_cast<int>(accent_r * 200 + 55), static_cast<int>(accent_g * 200 + 55), static_cast<int>(accent_b * 200 + 55), static_cast<int>(alpha * 255));
+	dl->AddText(ImVec2(cx, cy + 2.f), hdr_text, "AOB Signature Generator");
 	cy += 38.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.15f, alpha));
-	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.83f, 0.83f, 0.83f, alpha));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(alpha * 220)));
+	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(alpha * 120)));
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(210, 212, 220, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 
 	ImGui::PushItemWidth(160.f);
 	ImGui::InputTextWithHint("##aob_addr", "Address (hex)", gen.address_input, sizeof(gen.address_input));
@@ -81,22 +90,24 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (gen.instruction_count > 128) gen.instruction_count = 128;
 	ImGui::PopItemWidth();
 
-	ImGui::PopStyleColor(2);
+	ImGui::PopStyleColor(3); ImGui::PopStyleVar(2);
 
 	cy += 28.f;
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 
-	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.83f, 0.83f, 0.83f, alpha));
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(210, 212, 220, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleColor(ImGuiCol_CheckMark, accent);
 	ImGui::Checkbox("Auto-wildcard", &gen.auto_wildcard);
 	ImGui::SameLine();
 	ImGui::Checkbox("Validate uniqueness", &gen.validate_uniqueness);
-	ImGui::PopStyleColor();
+	ImGui::PopStyleColor(2);
 
 	ImGui::SameLine();
-	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(accent_r, accent_g, accent_b, 0.7f * alpha));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(accent_r, accent_g, accent_b, 0.9f * alpha));
-	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(accent_r, accent_g, accent_b, 1.0f * alpha));
-	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, alpha));
+	ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(static_cast<int>(accent_r * 140), static_cast<int>(accent_g * 140), static_cast<int>(accent_b * 140), static_cast<int>(alpha * 200)));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(static_cast<int>(accent_r * 180), static_cast<int>(accent_g * 180), static_cast<int>(accent_b * 180), static_cast<int>(alpha * 220)));
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(static_cast<int>(accent_r * 100), static_cast<int>(accent_g * 100), static_cast<int>(accent_b * 100), static_cast<int>(alpha * 255)));
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 
 	bool generating = gen.generating.load();
 	if (!generating) {
@@ -127,7 +138,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::SmallButton(batch_buf);
 	}
 
-	ImGui::PopStyleColor(4);
+	ImGui::PopStyleColor(4); ImGui::PopStyleVar();
 
 	cy += 28.f;
 
@@ -216,10 +227,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		cy += 20.f;
 
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.2f, 0.2f, alpha));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.3f, 0.3f, alpha));
-		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.35f, 0.35f, 0.35f, alpha));
-		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.9f, 0.9f, alpha));
+		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(40, 42, 55, static_cast<int>(alpha * 200)));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(55, 58, 75, static_cast<int>(alpha * 220)));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(30, 32, 42, static_cast<int>(alpha * 255)));
+		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(220, 222, 230, static_cast<int>(alpha * 255)));
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 
 		if (ImGui::SmallButton("Copy Standard")) {
 			ImGui::SetClipboardText(standard_fmt.c_str());
@@ -301,16 +313,18 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			aob_generator::load_signatures_from_disk();
 		}
 
-		ImGui::PopStyleColor(4);
+		ImGui::PopStyleColor(4); ImGui::PopStyleVar();
 	} else {
-		dl->AddText(ImVec2(cx, cy + 40.f), dim_col, "Enter an address and click Generate to create an AOB signature.");
-		dl->AddText(ImVec2(cx, cy + 58.f), dim_col, "Auto-wildcard masks RIP-relative offsets and large immediates.");
+		ui_anim::render_empty_state(dl, ox, cy + 10.f, left_w, 100.f,
+			"Enter an address and click Generate to create an AOB signature",
+			accent_r, accent_g, accent_b, alpha, static_cast<float>(ImGui::GetTime()));
 	}
 
 	float rx = ox + left_w + 4.f;
 	float ry = oy + 8.f;
-	dl->AddRectFilled(ImVec2(rx, ry - 4.f), ImVec2(rx + right_w, ry + 32.f), header_bg);
-	dl->AddText(ImVec2(rx + 8.f, ry + 2.f), accent, "Saved Signatures");
+	ui_anim::render_toolbar(dl, rx, ry - 4.f, right_w, 36.f, accent_r, accent_g, accent_b, alpha);
+	ImU32 saved_hdr_text = IM_COL32(static_cast<int>(accent_r * 200 + 55), static_cast<int>(accent_g * 200 + 55), static_cast<int>(accent_b * 200 + 55), static_cast<int>(alpha * 255));
+	dl->AddText(ImVec2(rx + 8.f, ry + 2.f), saved_hdr_text, "Saved Signatures");
 	ry += 38.f;
 
 	std::vector<aob_generator::signature_t> saved_copy;
@@ -337,7 +351,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		bool hovered = ImGui::IsMouseHoveringRect(rmin, rmax);
 		bool selected = (st.selected_saved == static_cast<int>(i));
-		dl->AddRectFilled(rmin, rmax, hovered ? row_hover : (selected ? header_bg : (i % 2 == 0 ? row_even : row_odd)));
+		float row_alpha_sig = ui_anim::render_row_entrance(static_cast<int>(i), 0.04f, alpha);
+		ui_anim::table_row_style_t rs{};
+		rs.selected = selected;
+		rs.hovered = hovered;
+		rs.index = static_cast<int>(i);
+		rs.alpha = alpha;
+		rs.entrance = row_alpha_sig / alpha;
+		rs.ar = accent_r; rs.ag = accent_g; rs.ab = accent_b;
+		ui_anim::render_table_row(dl, rmin.x, rmin.y, rmax.x - rmin.x, row_h, rs);
 
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			st.selected_saved = (selected ? -1 : static_cast<int>(i));

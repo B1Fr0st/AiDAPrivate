@@ -45,7 +45,6 @@ enum class activity_item_t : int {
 	explorer = 0,
 	search,
 	debug,
-	extensions,
 	settings,
 	COUNT
 };
@@ -487,7 +486,7 @@ namespace globals
 
 		inline bool show_decompile_popup = false;
 		inline uint64_t decompile_popup_addr = 0;
-		inline int decompile_default_mode = -1;
+		inline int decompile_default_mode = 1;
 
 		inline int welcome_set = -1;
 		inline float welcome_timer = 0.f;
@@ -738,12 +737,3 @@ namespace file_tabs {
 	}
 }
 
-
-namespace marketplace_ui
-{
-	inline char  search_buf[256] = {};
-	inline int   selected_idx = -1;
-	inline int   active_tab = 0;
-	inline bool  show_detail = false;
-	inline int   registry_idx = 0;
-}

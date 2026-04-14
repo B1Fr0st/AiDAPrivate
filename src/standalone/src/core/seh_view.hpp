@@ -139,10 +139,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float row_h = 20.f;
 	float col_header_h = 22.f;
 
-	dl->AddRectFilled(ImVec2(pos_x, pos_y), ImVec2(pos_x + width, pos_y + header_h),
-					  IM_COL32(25, 27, 35, static_cast<int>(240 * alpha)));
+	ui_anim::render_toolbar(dl, pos_x, pos_y, width, header_h, ar, ag, ab, alpha);
 	dl->AddText(ImVec2(pos_x + 10.f, pos_y + 8.f),
-				IM_COL32(200, 200, 210, static_cast<int>(220 * alpha)), "SEH Chain");
+				IM_COL32(static_cast<int>(ar * 200) + 55, static_cast<int>(ag * 200) + 55, static_cast<int>(ab * 200) + 55, static_cast<int>(220 * alpha)), "SEH Chain");
 
 	float refresh_x = pos_x + 90.f;
 	ImVec2 btn_min(refresh_x, pos_y + 4.f);
@@ -164,14 +163,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float col_module = pos_x + 400.f;
 	float col_name = pos_x + 540.f;
 
-	dl->AddRectFilled(ImVec2(pos_x, table_y), ImVec2(pos_x + width, table_y + col_header_h),
-					  IM_COL32(30, 32, 40, static_cast<int>(220 * alpha)));
-	ImU32 hdr_col = IM_COL32(160, 160, 175, static_cast<int>(200 * alpha));
-	dl->AddText(ImVec2(col_idx, table_y + 3.f), hdr_col, "#");
-	dl->AddText(ImVec2(col_frame, table_y + 3.f), hdr_col, "Frame Address");
-	dl->AddText(ImVec2(col_handler, table_y + 3.f), hdr_col, "Handler Address");
-	dl->AddText(ImVec2(col_module, table_y + 3.f), hdr_col, "Module");
-	dl->AddText(ImVec2(col_name, table_y + 3.f), hdr_col, "Name");
+	{
+		ui_anim::table_col_t cols[] = {{"#", 40.f}, {"Frame Address", 170.f}, {"Handler Address", 180.f}, {"Module", 140.f}, {"Name", 200.f}};
+		ui_anim::render_table_header(dl, pos_x, table_y, width, col_header_h, cols, 5, ar, ag, ab, alpha);
+	}
 
 	float list_y = table_y + col_header_h;
 	float list_h = height - header_h - col_header_h;
@@ -186,8 +181,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	if (snapshot.empty()) {
-		dl->AddText(ImVec2(pos_x + width * 0.5f - 70.f, list_y + list_h * 0.5f - 8.f),
-					IM_COL32(100, 100, 110, static_cast<int>(140 * alpha)), "No SEH chain found");
+		ui_anim::render_empty_state(dl, pos_x, list_y, width, list_h, "No SEH chain found",
+			ar, ag, ab, alpha, static_cast<float>(ImGui::GetTime()));
 		dl->PopClipRect();
 		return;
 	}

@@ -8,6 +8,7 @@
 #include "crypto_scanner.hpp"
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
+#include "../helpers/globals.h"
 
 extern DisasmState g_disasm;
 
@@ -37,16 +38,20 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	auto* dl = ImGui::GetWindowDrawList();
 	auto& st = g_state;
 	auto& cs = crypto_scanner::g_state;
-	const ImU32 bg        = IM_COL32(30, 30, 30, static_cast<int>(alpha * 255));
-	const ImU32 text_col  = IM_COL32(212, 212, 212, static_cast<int>(alpha * 255));
-	const ImU32 dim_col   = IM_COL32(140, 140, 140, static_cast<int>(alpha * 255));
+	const auto& _t = themes::resolved;
+	const auto _ta = [alpha](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, alpha);
+	};
+	const ImU32 bg        = _ta(_t.bg_base);
+	const ImU32 text_col  = _ta(_t.text_primary);
+	const ImU32 dim_col   = _ta(_t.text_dim);
 	const ImU32 accent    = IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 	                                  static_cast<int>(accent_b * 255), static_cast<int>(alpha * 255));
-	const ImU32 row_even  = IM_COL32(35, 35, 35, static_cast<int>(alpha * 255));
-	const ImU32 row_odd   = IM_COL32(40, 40, 40, static_cast<int>(alpha * 255));
-	const ImU32 row_hover = IM_COL32(55, 55, 55, static_cast<int>(alpha * 255));
-	const ImU32 header_bg = IM_COL32(45, 45, 45, static_cast<int>(alpha * 255));
-	const ImU32 bar_bg    = IM_COL32(50, 50, 50, static_cast<int>(alpha * 255));
+	const ImU32 row_even  = _ta(_t.panel_bg);
+	const ImU32 row_odd   = _ta(ui_anim::lighten(_t.panel_bg, 8));
+	const ImU32 row_hover = _ta(ui_anim::lighten(_t.panel_header, 14));
+	const ImU32 header_bg = _ta(_t.panel_header);
+	const ImU32 bar_bg    = _ta(ui_anim::lighten(_t.panel_header, 8));
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height), bg);
 
@@ -54,13 +59,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float cy = oy + 8.f;
 	const float toolbar_h = 36.f;
 
-	dl->AddRectFilled(ImVec2(ox, cy - 4.f), ImVec2(ox + width, cy + toolbar_h), header_bg);
+	ui_anim::render_toolbar(dl, ox, cy - 4.f, width, toolbar_h + 4.f, accent_r, accent_g, accent_b, alpha);
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy + 2.f));
-	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(accent_r, accent_g, accent_b, 0.7f * alpha));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(accent_r, accent_g, accent_b, 0.9f * alpha));
-	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(accent_r, accent_g, accent_b, 1.0f * alpha));
-	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, alpha));
+	ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(static_cast<int>(accent_r * 140), static_cast<int>(accent_g * 140), static_cast<int>(accent_b * 140), static_cast<int>(alpha * 200)));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(static_cast<int>(accent_r * 180), static_cast<int>(accent_g * 180), static_cast<int>(accent_b * 180), static_cast<int>(alpha * 220)));
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(static_cast<int>(accent_r * 100), static_cast<int>(accent_g * 100), static_cast<int>(accent_b * 100), static_cast<int>(alpha * 255)));
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 
 	bool scanning = cs.scanning.load();
 
@@ -131,37 +137,42 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::SameLine();
 
 	ImGui::PopStyleColor(4);
+	ImGui::PopStyleVar();
 
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.15f, alpha));
-	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.83f, 0.83f, 0.83f, alpha));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(alpha * 220)));
+	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(alpha * 120)));
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(210, 212, 220, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 	ImGui::PushItemWidth(180.f);
 	ImGui::InputTextWithHint("##crypto_filter", "Filter...", st.search_filter, sizeof(st.search_filter));
 	ImGui::PopItemWidth();
-	ImGui::PopStyleColor(2);
+	ImGui::PopStyleColor(3);
+	ImGui::PopStyleVar(2);
 
 	ImGui::SameLine();
 
 	const char* cats[] = {"All", "Symmetric", "Hash", "Stream Cipher", "Block Cipher", "Checksum", "Encoding", "Asymmetric"};
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.15f, alpha));
-	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.83f, 0.83f, 0.83f, alpha));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(alpha * 220)));
+	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(alpha * 120)));
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(210, 212, 220, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 	ImGui::PushItemWidth(120.f);
 	int combo_sel = st.category_filter + 1;
 	if (ImGui::Combo("##cat_combo", &combo_sel, cats, 8)) {
 		st.category_filter = combo_sel - 1;
 	}
 	ImGui::PopItemWidth();
-	ImGui::PopStyleColor(2);
+	ImGui::PopStyleColor(3);
+	ImGui::PopStyleVar(2);
 
 	if (scanning) {
 		ImGui::SameLine();
 		float prog = cs.progress.load();
-		ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(accent_r, accent_g, accent_b, alpha));
-		ImGui::PushItemWidth(120.f);
-		char prog_buf[32];
-		std::snprintf(prog_buf, sizeof(prog_buf), "%.1f%%", prog * 100.f);
-		ImGui::ProgressBar(prog, ImVec2(120, 0), prog_buf);
-		ImGui::PopItemWidth();
-		ImGui::PopStyleColor();
+		ImVec2 pbar_pos = ImGui::GetCursorScreenPos();
+		ui_anim::render_progress_bar_animated(dl, pbar_pos.x, pbar_pos.y + 4.f, 140.f, 12.f, prog, accent_r, accent_g, accent_b, alpha, static_cast<float>(ImGui::GetTime()));
+		ImGui::Dummy(ImVec2(150.f, 16.f));
 	}
 
 	cy += toolbar_h + 8.f;
@@ -211,12 +222,21 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const float col_widths[6] = {width * 0.12f, width * 0.18f, width * 0.16f, width * 0.22f, width * 0.14f, width * 0.16f};
 	const char* col_names[6] = {"Algorithm", "Signature", "Address", "Module + Offset", "Category", "Refs"};
 
+	{
+		ui_anim::table_col_t hdr_cols[6];
+		for (int c = 0; c < 6; ++c) { hdr_cols[c].label = col_names[c]; hdr_cols[c].width = col_widths[c]; }
+		ui_anim::render_table_header(dl, cx, cy, width - 24.f, row_h, hdr_cols, 6, accent_r, accent_g, accent_b, alpha);
+	}
 	float hx = cx;
 	for (int c = 0; c < 6; ++c) {
-		dl->AddRectFilled(ImVec2(hx, cy), ImVec2(hx + col_widths[c], cy + row_h), header_bg);
 		ImGui::SetCursorScreenPos(ImVec2(hx + 6.f, cy + 3.f));
 		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.9f, 0.9f, alpha));
-		if (ImGui::SmallButton(col_names[c])) {
+		char sort_label[64];
+		if (st.sort_column == c)
+			std::snprintf(sort_label, sizeof(sort_label), "%s %s", col_names[c], st.sort_ascending ? "\xe2\x96\xb2" : "\xe2\x96\xbc");
+		else
+			std::snprintf(sort_label, sizeof(sort_label), "%s", col_names[c]);
+		if (ImGui::SmallButton(sort_label)) {
 			if (st.sort_column == c) st.sort_ascending = !st.sort_ascending;
 			else { st.sort_column = c; st.sort_ascending = true; }
 		}
@@ -250,7 +270,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImVec2 row_max(ox + width - 14.f, ry + row_h);
 
 		bool hovered = ImGui::IsMouseHoveringRect(row_min, row_max);
-		dl->AddRectFilled(row_min, row_max, hovered ? row_hover : (i % 2 == 0 ? row_even : row_odd));
+		float row_alpha = ui_anim::render_row_entrance(i, 0.04f, alpha);
+		ui_anim::table_row_style_t rs{};
+		rs.hovered = hovered;
+		rs.index = i;
+		rs.alpha = alpha;
+		rs.entrance = row_alpha / alpha;
+		rs.ar = accent_r; rs.ag = accent_g; rs.ab = accent_b;
+		ui_anim::render_table_row(dl, row_min.x, row_min.y, row_max.x - row_min.x, row_h, rs);
 
 		if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
 			globals::ui::active_center_view = center_view_t::disassembly;
@@ -263,7 +290,18 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 
 		float rx = cx;
-		dl->AddText(ImVec2(rx + 6.f, ry + 3.f), accent, hit.algorithm.c_str());
+		ImU32 algo_col = accent;
+		switch (hit.category) {
+		case crypto_scanner::crypto_category_t::symmetric:    algo_col = IM_COL32(100, 160, 255, static_cast<int>(row_alpha * 255)); break;
+		case crypto_scanner::crypto_category_t::hash:         algo_col = IM_COL32(80, 210, 140, static_cast<int>(row_alpha * 255)); break;
+		case crypto_scanner::crypto_category_t::stream_cipher:algo_col = IM_COL32(80, 220, 220, static_cast<int>(row_alpha * 255)); break;
+		case crypto_scanner::crypto_category_t::block_cipher: algo_col = IM_COL32(240, 170, 80, static_cast<int>(row_alpha * 255)); break;
+		case crypto_scanner::crypto_category_t::checksum:     algo_col = IM_COL32(220, 210, 80, static_cast<int>(row_alpha * 255)); break;
+		case crypto_scanner::crypto_category_t::encoding:     algo_col = IM_COL32(180, 130, 240, static_cast<int>(row_alpha * 255)); break;
+		case crypto_scanner::crypto_category_t::asymmetric:   algo_col = IM_COL32(240, 100, 130, static_cast<int>(row_alpha * 255)); break;
+		default: break;
+		}
+		dl->AddText(ImVec2(rx + 6.f, ry + 3.f), algo_col, hit.algorithm.c_str());
 		rx += col_widths[0];
 
 		dl->AddText(ImVec2(rx + 6.f, ry + 3.f), text_col, hit.signature_name.c_str());
@@ -278,7 +316,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		dl->AddText(ImVec2(rx + 6.f, ry + 3.f), dim_col, offset_buf);
 		rx += col_widths[3];
 
-		dl->AddText(ImVec2(rx + 6.f, ry + 3.f), dim_col, crypto_scanner::category_name(hit.category));
+		const char* cat_name = crypto_scanner::category_name(hit.category);
+		ImVec2 cat_ts = ImGui::CalcTextSize(cat_name);
+		float pill_w = cat_ts.x + 12.f;
+		float pill_h = cat_ts.y + 4.f;
+		float pill_x = rx + 4.f;
+		float pill_y = ry + (row_h - pill_h) * 0.5f;
+		ImU32 pill_bg = IM_COL32(
+			(algo_col >> IM_COL32_R_SHIFT) & 0xFF,
+			(algo_col >> IM_COL32_G_SHIFT) & 0xFF,
+			(algo_col >> IM_COL32_B_SHIFT) & 0xFF,
+			static_cast<int>(row_alpha * 50));
+		dl->AddRectFilled(ImVec2(pill_x, pill_y), ImVec2(pill_x + pill_w, pill_y + pill_h), pill_bg, pill_h * 0.5f);
+		dl->AddText(ImVec2(pill_x + 6.f, pill_y + 2.f), algo_col, cat_name);
 
 		rx += col_widths[4];
 		if (!hit.referencing_functions.empty()) {
@@ -335,6 +385,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	{
+		float footer_h = 28.f;
+		ui_anim::render_panel_card(dl, ox + 4.f, oy + height - footer_h - 4.f, width - 8.f, footer_h, accent_r, accent_g, accent_b, alpha * 0.6f, 4.f, false);
 		char count_buf[128];
 		std::lock_guard<std::mutex> lk(cs.mutex);
 		size_t entropy_count = cs.entropy_map.size();
@@ -343,7 +395,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		} else {
 			std::snprintf(count_buf, sizeof(count_buf), "%zu results", filtered.size());
 		}
-		dl->AddText(ImVec2(ox + width - 200.f, oy + height - 20.f), dim_col, count_buf);
+		ImVec2 fts = ImGui::CalcTextSize(count_buf);
+		dl->AddText(ImVec2(ox + width - fts.x - 14.f, oy + height - footer_h - 4.f + (footer_h - fts.y) * 0.5f), dim_col, count_buf);
 	}
 
 	if (content_h > visible_h) {

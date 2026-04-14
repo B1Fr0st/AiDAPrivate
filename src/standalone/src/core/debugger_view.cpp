@@ -10,9 +10,7 @@
 #include "module_view.hpp"
 #include "seh_view.hpp"
 #include "cfg_view.hpp"
-#include "xref_engine.hpp"
 #include "code_patcher.hpp"
-#include "struct_dissector_view.hpp"
 
 #include "imgui.h"
 
@@ -75,7 +73,7 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a,
 	static const char* tab_names[] = {
 		"CPU", "Breakpoints", "Memory Map", "Call Stack", "Threads",
 		"Watches", "Handles", "Trace", "Strings", "Bookmarks",
-		"Modules", "Patches", "SEH", "CFG", "Xrefs", "Structs"
+		"Modules", "Patches", "SEH", "CFG"
 	};
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + TAB_HEIGHT),
@@ -691,12 +689,10 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 	ImU32 en_col   = IM_COL32(100, 220, 120, static_cast<int>(220*a));
 	ImU32 dis_col  = IM_COL32(220, 100, 100, static_cast<int>(220*a));
 
-	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
-	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "#");
-	dl->AddText(ImVec2(ox + 30.f, oy + 4.f), dim_col, "State");
-	dl->AddText(ImVec2(ox + 90.f, oy + 4.f), dim_col, "Address");
-	dl->AddText(ImVec2(ox + 240.f, oy + 4.f), dim_col, "Type");
-	dl->AddText(ImVec2(ox + 320.f, oy + 4.f), dim_col, "Name");
+	{
+		ui_anim::table_col_t cols[] = {{"#", 22.f}, {"State", 60.f}, {"Address", 150.f}, {"Type", 80.f}, {"Name", 200.f}};
+		ui_anim::render_table_header(dl, ox, oy, w, HEADER_H, cols, 5, ar, ag, ab, a);
+	}
 
 	std::lock_guard<std::mutex> lk(st.bp_mutex);
 	float ry = oy + HEADER_H;
@@ -706,11 +702,8 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 		auto& bp = st.breakpoints[static_cast<size_t>(i)];
 		bool sel = (ui.list_selected == i);
 
-		if (i & 1)
-			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
-				IM_COL32(255, 255, 255, 2));
-
-		bool hov = draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, ar, ag, ab);
+		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, ar, ag, ab});
 
 		char ibuf[8];
 		snprintf(ibuf, sizeof(ibuf), "%d", i);
@@ -719,8 +712,18 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 		bool enabled = (bp.state == debugger_engine::bp_state_t::enabled);
 		ui_anim::render_status_dot(dl, ox + 40.f, ry + ROW_HEIGHT * 0.5f, 3.f,
 			enabled ? en_col : dis_col, static_cast<float>(ImGui::GetTime()), enabled);
-		const char* state_str = enabled ? "ON" : "OFF";
-		dl->AddText(ImVec2(ox + 48.f, ry + 2.f), enabled ? en_col : dis_col, state_str);
+		{
+			const char* state_str = enabled ? "ON" : "OFF";
+			ImU32 pill_col = enabled ? en_col : dis_col;
+			ImVec2 sts = ImGui::CalcTextSize(state_str);
+			float pw = sts.x + 8.f;
+			float ph = sts.y + 2.f;
+			float py = ry + (ROW_HEIGHT - ph) * 0.5f;
+			dl->AddRectFilled(ImVec2(ox + 48.f, py), ImVec2(ox + 48.f + pw, py + ph),
+				IM_COL32((pill_col >> IM_COL32_R_SHIFT) & 0xFF, (pill_col >> IM_COL32_G_SHIFT) & 0xFF,
+				         (pill_col >> IM_COL32_B_SHIFT) & 0xFF, static_cast<int>(35*a)), ph * 0.5f);
+			dl->AddText(ImVec2(ox + 52.f, ry + 2.f), pill_col, state_str);
+		}
 
 		char abuf[20];
 		snprintf(abuf, sizeof(abuf), "%016" PRIX64, bp.address);
@@ -741,6 +744,11 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 
 		ry += ROW_HEIGHT;
 	}
+
+	if (st.breakpoints.empty())
+		ui_anim::render_empty_state(dl, ox, oy + HEADER_H, w, h - HEADER_H,
+			"No breakpoints set. Double-click in disassembly to add.",
+			ar, ag, ab, a, static_cast<float>(ImGui::GetTime()));
 }
 
 
@@ -753,11 +761,10 @@ static void render_memmap(ImDrawList* dl, float ox, float oy, float w, float h,
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
-	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "Base");
-	dl->AddText(ImVec2(ox + 150.f, oy + 4.f), dim_col, "Size");
-	dl->AddText(ImVec2(ox + 240.f, oy + 4.f), dim_col, "Protect");
-	dl->AddText(ImVec2(ox + 380.f, oy + 4.f), dim_col, "Module");
+	{
+		ui_anim::table_col_t cols[] = {{"Base", 142.f}, {"Size", 90.f}, {"Protect", 140.f}, {"Module", 200.f}};
+		ui_anim::render_table_header(dl, ox, oy, w, HEADER_H, cols, 4, ar, ag, ab, a);
+	}
 
 	std::lock_guard<std::mutex> lk(st.memmap_mutex);
 
@@ -785,12 +792,8 @@ static void render_memmap(ImDrawList* dl, float ox, float oy, float w, float h,
 
 		auto& r = st.memory_map[static_cast<size_t>(i)];
 		bool sel = (ui.memmap_selected == i);
-
-		if (i & 1)
-			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
-				IM_COL32(255, 255, 255, 2));
-
-		draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, ar, ag, ab);
+		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, ar, ag, ab});
 
 		char buf[20];
 		snprintf(buf, sizeof(buf), "%016" PRIX64, r.base);
@@ -800,12 +803,26 @@ static void render_memmap(ImDrawList* dl, float ox, float oy, float w, float h,
 		dl->AddText(ImVec2(ox + 150.f, ry + 1.f), text_col, buf);
 
 		auto prot_str = debugger_engine::format_protect(r.protect);
-		dl->AddText(ImVec2(ox + 240.f, ry + 1.f), dim_col, prot_str.c_str());
+		{
+			ImU32 prot_col = dim_col;
+			bool has_exec = (r.protect & 0xF0) != 0;
+			bool has_write = (r.protect & 0x04) || (r.protect & 0x08) || (r.protect & 0x40) || (r.protect & 0x80);
+			if (has_exec) prot_col = IM_COL32(240, 90, 90, static_cast<int>(220*a));
+			else if (has_write) prot_col = IM_COL32(230, 195, 80, static_cast<int>(220*a));
+			else prot_col = IM_COL32(90, 200, 130, static_cast<int>(200*a));
+			ImVec2 pts = ImGui::CalcTextSize(prot_str.c_str());
+			float pw = pts.x + 10.f;
+			float ph = pts.y + 2.f;
+			float py = ry + (ROW_HEIGHT - ph) * 0.5f;
+			dl->AddRectFilled(ImVec2(ox + 238.f, py), ImVec2(ox + 238.f + pw, py + ph),
+				IM_COL32((prot_col >> IM_COL32_R_SHIFT) & 0xFF, (prot_col >> IM_COL32_G_SHIFT) & 0xFF,
+				         (prot_col >> IM_COL32_B_SHIFT) & 0xFF, static_cast<int>(35*a)), ph * 0.5f);
+			dl->AddText(ImVec2(ox + 243.f, ry + 1.f), prot_col, prot_str.c_str());
+		}
 
 		if (!r.module_name.empty())
 			dl->AddText(ImVec2(ox + 380.f, ry + 1.f), text_col, r.module_name.c_str());
 
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			ui.memmap_selected = i;
 	}
@@ -823,10 +840,10 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
-	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "#");
-	dl->AddText(ImVec2(ox + 30.f, oy + 4.f), dim_col, "Address");
-	dl->AddText(ImVec2(ox + 180.f, oy + 4.f), dim_col, "Module");
+	{
+		ui_anim::table_col_t cols[] = {{"#", 22.f}, {"Address", 150.f}, {"Module", 200.f}};
+		ui_anim::render_table_header(dl, ox, oy, w, HEADER_H, cols, 3, ar, ag, ab, a);
+	}
 
 	std::lock_guard<std::mutex> lk(st.stack_mutex);
 	float ry = oy + HEADER_H;
@@ -835,12 +852,8 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 		if (ry + ROW_HEIGHT > oy + h) break;
 		auto& f = st.call_stack[static_cast<size_t>(i)];
 		bool sel = (ui.list_selected == i);
-
-		if (i & 1)
-			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
-				IM_COL32(255, 255, 255, 2));
-
-		draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, ar, ag, ab);
+		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, ar, ag, ab});
 
 		char ibuf[8];
 		snprintf(ibuf, sizeof(ibuf), "%d", i);
@@ -858,7 +871,6 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 		}
 		dl->AddText(ImVec2(ox + 180.f, ry + 1.f), text_col, mod_info.c_str());
 
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			ui.list_selected = i;
 
@@ -876,9 +888,10 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 	ImU32 val_col  = IM_COL32(180, 220, 160, static_cast<int>(220*a));
 
-	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
-	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "Expression");
-	dl->AddText(ImVec2(ox + 200.f, oy + 4.f), dim_col, "Value");
+	{
+		ui_anim::table_col_t cols[] = {{"Expression", 192.f}, {"Value", 200.f}};
+		ui_anim::render_table_header(dl, ox, oy, w, HEADER_H, cols, 2, ar, ag, ab, a);
+	}
 
 	std::lock_guard<std::mutex> lk(st.watch_mutex);
 	float ry = oy + HEADER_H;
@@ -887,19 +900,14 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 		if (ry + ROW_HEIGHT > oy + h) break;
 		auto& w_entry = st.watches[static_cast<size_t>(i)];
 		bool sel = (ui.list_selected == i);
-
-		if (i & 1)
-			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
-				IM_COL32(255, 255, 255, 2));
-
-		draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, ar, ag, ab);
+		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, ar, ag, ab});
 
 		dl->AddText(ImVec2(ox + 6.f, ry + 1.f), text_col, w_entry.expression.c_str());
 		dl->AddText(ImVec2(ox + 200.f, ry + 1.f),
 			w_entry.valid ? val_col : IM_COL32(220, 100, 100, static_cast<int>(200*a)),
 			w_entry.value.c_str());
 
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			ui.list_selected = i;
 
@@ -917,17 +925,28 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h,
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
-	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "#");
-	dl->AddText(ImVec2(ox + 50.f, oy + 4.f), dim_col, "Address");
-	dl->AddText(ImVec2(ox + 200.f, oy + 4.f), dim_col, "Instruction");
+	{
+		ui_anim::table_col_t cols[] = {{"#", 42.f}, {"Address", 150.f}, {"Instruction", 200.f}};
+		ui_anim::render_table_header(dl, ox, oy, w, HEADER_H, cols, 3, ar, ag, ab, a);
+	}
 
 	bool tracing = st.tracing.load();
 	const char* status = tracing ? "Recording..." : "Stopped";
 	ImU32 sc = tracing ? IM_COL32(100, 220, 120, static_cast<int>(200*a))
 					   : IM_COL32(180, 100, 100, static_cast<int>(200*a));
-	ImVec2 sts = ImGui::CalcTextSize(status);
-	dl->AddText(ImVec2(ox + w - sts.x - 8.f, oy + 3.f), sc, status);
+	{
+		ImVec2 sts = ImGui::CalcTextSize(status);
+		float pw = sts.x + 22.f;
+		float ph = sts.y + 4.f;
+		float px = ox + w - pw - 6.f;
+		float py = oy + (HEADER_H - ph) * 0.5f;
+		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
+			IM_COL32((sc >> IM_COL32_R_SHIFT) & 0xFF, (sc >> IM_COL32_G_SHIFT) & 0xFF,
+			         (sc >> IM_COL32_B_SHIFT) & 0xFF, static_cast<int>(30*a)), ph * 0.5f);
+		ui_anim::render_status_dot(dl, px + 8.f, py + ph * 0.5f, 3.f, sc,
+			static_cast<float>(ImGui::GetTime()), tracing);
+		dl->AddText(ImVec2(px + 16.f, py + 2.f), sc, status);
+	}
 
 	std::lock_guard<std::mutex> lk(st.trace_mutex);
 
@@ -955,12 +974,8 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h,
 
 		auto& tr = st.trace_log[static_cast<size_t>(i)];
 		bool sel = (ui.trace_selected == i);
-
-		if (i & 1)
-			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
-				IM_COL32(255, 255, 255, 2));
-
-		draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, ar, ag, ab);
+		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, ar, ag, ab});
 
 		char ibuf[12];
 		snprintf(ibuf, sizeof(ibuf), "%d", tr.index);
@@ -971,12 +986,16 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h,
 		dl->AddText(ImVec2(ox + 50.f, ry + 1.f), addr_col, abuf);
 		dl->AddText(ImVec2(ox + 200.f, ry + 1.f), text_col, tr.disasm_text.c_str());
 
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			ui.trace_selected = i;
 	}
 
 	ImGui::PopClipRect();
+
+	if (st.trace_log.empty() && !tracing)
+		ui_anim::render_empty_state(dl, ox, oy + HEADER_H, w, h - HEADER_H,
+			"No trace entries. Start recording to capture execution.",
+			ar, ag, ab, a, static_cast<float>(ImGui::GetTime()));
 }
 
 
@@ -989,10 +1008,10 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
-	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "Address");
-	dl->AddText(ImVec2(ox + 150.f, oy + 4.f), dim_col, "String");
-	dl->AddText(ImVec2(ox + w - 80.f, oy + 4.f), dim_col, "Module");
+	{
+		ui_anim::table_col_t cols[] = {{"Address", 142.f}, {"String", 400.f}, {"Module", 100.f}};
+		ui_anim::render_table_header(dl, ox, oy, w, HEADER_H, cols, 3, ar, ag, ab, a);
+	}
 
 	std::lock_guard<std::mutex> lk(st.strings_mutex);
 
@@ -1020,12 +1039,8 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 
 		auto& sr = st.strings[static_cast<size_t>(i)];
 		bool sel = (ui.strings_selected == i);
-
-		if (i & 1)
-			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
-				IM_COL32(255, 255, 255, 2));
-
-		draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, ar, ag, ab);
+		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, ar, ag, ab});
 
 		char abuf[20];
 		snprintf(abuf, sizeof(abuf), "%016" PRIX64, sr.address);
@@ -1039,7 +1054,6 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 		if (!sr.module_name.empty())
 			dl->AddText(ImVec2(ox + w - 80.f, ry + 1.f), dim_col, sr.module_name.c_str());
 
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			ui.strings_selected = i;
 	}
@@ -1054,21 +1068,24 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
-	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "TID");
-	dl->AddText(ImVec2(ox + 80.f, oy + 4.f), dim_col, "Owner PID");
-	dl->AddText(ImVec2(ox + 180.f, oy + 4.f), dim_col, "Priority");
+	{
+		ui_anim::table_col_t cols[] = {{"TID", 72.f}, {"Owner PID", 100.f}, {"Priority", 100.f}, {"State", 100.f}};
+		ui_anim::render_table_header(dl, ox, oy, w, HEADER_H, cols, 4, ar, ag, ab, a);
+	}
 
 	auto threads = driver_bridge::enumerate_threads();
-	float ry = oy + HEADER_H;
-	int ti = 0;
+	float body_y = oy + HEADER_H;
+	ImGui::PushClipRect(ImVec2(ox, body_y), ImVec2(ox + w, oy + h), true);
 
-	for (const auto& t : threads) {
+	for (int ti = 0; ti < static_cast<int>(threads.size()); ++ti) {
+		float ry = body_y + static_cast<float>(ti) * ROW_HEIGHT;
 		if (ry + ROW_HEIGHT > oy + h) break;
+		if (ry + ROW_HEIGHT < body_y) continue;
 
-		if (ti & 1)
-			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
-				IM_COL32(255, 255, 255, 2));
+		auto& t = threads[ti];
+		bool sel = (g_ui.list_selected == ti);
+		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, ti, a, 1.f, ar, ag, ab});
 
 		char tbuf[12];
 		snprintf(tbuf, sizeof(tbuf), "%u", t.tid);
@@ -1082,9 +1099,11 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 		snprintf(prbuf, sizeof(prbuf), "%d", t.priority);
 		dl->AddText(ImVec2(ox + 180.f, ry + 1.f), dim_col, prbuf);
 
-		++ti;
-		ry += ROW_HEIGHT;
+		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+			g_ui.list_selected = ti;
 	}
+
+	ImGui::PopClipRect();
 }
 
 
@@ -1097,10 +1116,10 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
-	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "#");
-	dl->AddText(ImVec2(ox + 30.f, oy + 4.f), dim_col, "Address");
-	dl->AddText(ImVec2(ox + 180.f, oy + 4.f), dim_col, "Label");
+	{
+		ui_anim::table_col_t cols[] = {{"#", 22.f}, {"Address", 150.f}, {"Label", 200.f}};
+		ui_anim::render_table_header(dl, ox, oy, w, HEADER_H, cols, 3, ar, ag, ab, a);
+	}
 
 	std::lock_guard<std::mutex> lk(st.anno_mutex);
 	float ry = oy + HEADER_H;
@@ -1109,12 +1128,8 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 		if (ry + ROW_HEIGHT > oy + h) break;
 		uint64_t addr = st.bookmarks[static_cast<size_t>(i)];
 		bool sel = (ui.list_selected == i);
-
-		if (i & 1)
-			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
-				IM_COL32(255, 255, 255, 2));
-
-		draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, ar, ag, ab);
+		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, ar, ag, ab});
 
 		char ibuf[8], abuf[20];
 		snprintf(ibuf, sizeof(ibuf), "%d", i);
@@ -1126,7 +1141,6 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 		if (it != st.labels.end())
 			dl->AddText(ImVec2(ox + 180.f, ry + 1.f), text_col, it->second.text.c_str());
 
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			ui.list_selected = i;
 
@@ -1142,31 +1156,59 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 	ImU32 dim_col  = IM_COL32(140, 145, 155, static_cast<int>(150*a));
 	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-	render_column_header(dl, ox, oy, w, a, ar, ag, ab);
-	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "Handle");
-	dl->AddText(ImVec2(ox + 80.f, oy + 4.f), dim_col, "Type");
-	dl->AddText(ImVec2(ox + 200.f, oy + 4.f), dim_col, "Name");
+	{
+		ui_anim::table_col_t cols[] = {{"Handle", 72.f}, {"Type", 120.f}, {"Name", 200.f}};
+		ui_anim::render_table_header(dl, ox, oy, w, HEADER_H, cols, 3, ar, ag, ab, a);
+	}
 
 	std::lock_guard<std::mutex> lk(st.handle_mutex);
-	float ry = oy + HEADER_H;
-	int hi = 0;
+	float body_y = oy + HEADER_H;
+	int total = static_cast<int>(st.handles.size());
+	ImGui::PushClipRect(ImVec2(ox, body_y), ImVec2(ox + w, oy + h), true);
 
-	for (const auto& h_entry : st.handles) {
+	for (int hi = 0; hi < total; ++hi) {
+		float ry = body_y + static_cast<float>(hi) * ROW_HEIGHT;
 		if (ry + ROW_HEIGHT > oy + h) break;
+		if (ry + ROW_HEIGHT < body_y) continue;
 
-		if (hi & 1)
-			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
-				IM_COL32(255, 255, 255, 2));
+		auto& h_entry = st.handles[static_cast<size_t>(hi)];
+		bool sel = (g_ui.list_selected == hi);
+		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, hi, a, 1.f, ar, ag, ab});
 
 		char hbuf[12];
 		snprintf(hbuf, sizeof(hbuf), "0x%X", static_cast<unsigned>(h_entry.handle));
 		dl->AddText(ImVec2(ox + 6.f, ry + 1.f), text_col, hbuf);
-		dl->AddText(ImVec2(ox + 80.f, ry + 1.f), dim_col, h_entry.type_name.c_str());
+		{
+			ImU32 type_col = dim_col;
+			if (h_entry.type_name == "File") type_col = IM_COL32(100, 200, 255, static_cast<int>(220*a));
+			else if (h_entry.type_name == "Thread") type_col = IM_COL32(255, 200, 100, static_cast<int>(220*a));
+			else if (h_entry.type_name == "Mutant") type_col = IM_COL32(200, 130, 240, static_cast<int>(220*a));
+			else if (h_entry.type_name == "Section") type_col = IM_COL32(240, 100, 130, static_cast<int>(220*a));
+			else if (h_entry.type_name == "Key") type_col = IM_COL32(130, 220, 160, static_cast<int>(220*a));
+			else if (h_entry.type_name == "Event" || h_entry.type_name == "Semaphore")
+				type_col = IM_COL32(220, 210, 80, static_cast<int>(220*a));
+			ImVec2 tts = ImGui::CalcTextSize(h_entry.type_name.c_str());
+			float pw = tts.x + 10.f;
+			float ph = tts.y + 2.f;
+			float py = ry + (ROW_HEIGHT - ph) * 0.5f;
+			dl->AddRectFilled(ImVec2(ox + 78.f, py), ImVec2(ox + 78.f + pw, py + ph),
+				IM_COL32((type_col >> IM_COL32_R_SHIFT) & 0xFF, (type_col >> IM_COL32_G_SHIFT) & 0xFF,
+				         (type_col >> IM_COL32_B_SHIFT) & 0xFF, static_cast<int>(35*a)), ph * 0.5f);
+			dl->AddText(ImVec2(ox + 83.f, ry + 1.f), type_col, h_entry.type_name.c_str());
+		}
 		dl->AddText(ImVec2(ox + 200.f, ry + 1.f), text_col, h_entry.name.c_str());
 
-		++hi;
-		ry += ROW_HEIGHT;
+		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+			g_ui.list_selected = hi;
 	}
+
+	ImGui::PopClipRect();
+
+	if (st.handles.empty())
+		ui_anim::render_empty_state(dl, ox, oy + HEADER_H, w, h - HEADER_H,
+			"No handles found. Attach to a process to enumerate handles.",
+			ar, ag, ab, a, static_cast<float>(ImGui::GetTime()));
 }
 
 
@@ -1237,13 +1279,10 @@ void render(float pos_x, float pos_y, float width, float height,
 			ImU32 addr2 = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 			ImU32 text2 = IM_COL32(210, 215, 225, static_cast<int>(210*a));
 
-			render_column_header(dl, ox, cy, w, a, accent_r, accent_g, accent_b);
-			dl->AddText(ImVec2(ox + 6.f, cy + 4.f), dim2, "#");
-			dl->AddText(ImVec2(ox + 30.f, cy + 4.f), dim2, "Address");
-			dl->AddText(ImVec2(ox + 180.f, cy + 4.f), dim2, "Original");
-			dl->AddText(ImVec2(ox + 320.f, cy + 4.f), dim2, "Patched");
-			dl->AddText(ImVec2(ox + 460.f, cy + 4.f), dim2, "Description");
-			dl->AddText(ImVec2(ox + w - 70.f, cy + 4.f), dim2, "Active");
+			{
+				ui_anim::table_col_t cols[] = {{"#", 22.f}, {"Address", 150.f}, {"Original", 140.f}, {"Patched", 140.f}, {"Description", 140.f}, {"Active", 70.f}};
+				ui_anim::render_table_header(dl, ox, cy, w, HEADER_H, cols, 6, accent_r, accent_g, accent_b, a);
+			}
 
 			std::lock_guard<std::mutex> plk(code_patcher::g_state.mtx);
 			auto& patches = code_patcher::g_state.patches;
@@ -1252,11 +1291,8 @@ void render(float pos_x, float pos_y, float width, float height,
 				if (ry + ROW_HEIGHT > content_y + content_h) break;
 				auto& p = patches[static_cast<size_t>(i)];
 				bool sel = (g_ui.list_selected == i);
-				draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, accent_r, accent_g, accent_b);
-
-				if (i & 1)
-					dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
-						IM_COL32(255, 255, 255, 2));
+				bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
+				ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, accent_r, accent_g, accent_b});
 
 				char ibuf[8]; snprintf(ibuf, sizeof(ibuf), "%d", i);
 				char abuf[20]; snprintf(abuf, sizeof(abuf), "%016" PRIX64, p.address);
@@ -1277,7 +1313,6 @@ void render(float pos_x, float pos_y, float width, float height,
 				ui_anim::render_badge(dl, st_label, ox + w - 70.f, ry + 2.f, sc,
 					IM_COL32(20, 20, 25, static_cast<int>(220*a)));
 
-				bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
 				if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 					g_ui.list_selected = i;
 
@@ -1291,69 +1326,6 @@ void render(float pos_x, float pos_y, float width, float height,
 			break;
 		case sub_tab_t::cfg:
 			cfg_view::render(ox, content_y, w, content_h,
-				a, accent_r, accent_g, accent_b);
-			break;
-		case sub_tab_t::xrefs: {
-			float cy = content_y;
-			ImU32 dim2 = IM_COL32(140, 145, 155, static_cast<int>(150*a));
-			ImU32 addr2 = IM_COL32(130, 170, 255, static_cast<int>(220*a));
-			ImU32 text2 = IM_COL32(210, 215, 225, static_cast<int>(210*a));
-
-			render_column_header(dl, ox, cy, w, a, accent_r, accent_g, accent_b);
-			dl->AddText(ImVec2(ox + 6.f, cy + 4.f), dim2, "From");
-			dl->AddText(ImVec2(ox + 180.f, cy + 4.f), dim2, "To");
-			dl->AddText(ImVec2(ox + 350.f, cy + 4.f), dim2, "Type");
-
-			std::vector<xref_engine::xref_t> xrefs;
-			{
-				std::lock_guard<std::mutex> xlk(xref_engine::g_state.mutex);
-				xrefs = xref_engine::g_state.results;
-			}
-
-			float ry = cy + HEADER_H;
-			for (int i = 0; i < static_cast<int>(xrefs.size()); ++i) {
-				if (ry + ROW_HEIGHT > content_y + content_h) break;
-				auto& x = xrefs[static_cast<size_t>(i)];
-				bool sel = (g_ui.list_selected == i);
-				draw_row(dl, ox, ry, ox + w, ry + ROW_HEIGHT, a, sel, accent_r, accent_g, accent_b);
-
-				if (i & 1)
-					dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT),
-						IM_COL32(255, 255, 255, 2));
-
-				char fbuf[20]; snprintf(fbuf, sizeof(fbuf), "%016" PRIX64, x.from_addr);
-				char tbuf[20]; snprintf(tbuf, sizeof(tbuf), "%016" PRIX64, x.to_addr);
-				dl->AddText(ImVec2(ox + 6.f, ry + 2.f), addr2, fbuf);
-				dl->AddText(ImVec2(ox + 180.f, ry + 2.f), addr2, tbuf);
-
-				const char* type_str = "unknown";
-				switch (x.type) {
-					case xref_engine::xref_type_t::call: type_str = "CALL"; break;
-					case xref_engine::xref_type_t::jump: type_str = "JMP"; break;
-					case xref_engine::xref_type_t::conditional_jump: type_str = "Jcc"; break;
-					case xref_engine::xref_type_t::lea: type_str = "LEA"; break;
-					case xref_engine::xref_type_t::data_ref: type_str = "DATA"; break;
-				}
-				ImU32 xtype_col = text2;
-				if (x.type == xref_engine::xref_type_t::call)
-					xtype_col = IM_COL32(230, 100, 100, static_cast<int>(200*a));
-				else if (x.type == xref_engine::xref_type_t::jump)
-					xtype_col = IM_COL32(100, 200, 230, static_cast<int>(200*a));
-				else if (x.type == xref_engine::xref_type_t::conditional_jump)
-					xtype_col = IM_COL32(100, 230, 140, static_cast<int>(200*a));
-				ui_anim::render_badge(dl, type_str, ox + 350.f, ry + 2.f,
-					IM_COL32(40, 42, 55, static_cast<int>(180*a)), xtype_col);
-
-				bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
-				if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-					g_ui.list_selected = i;
-
-				ry += ROW_HEIGHT;
-			}
-			break;
-		}
-		case sub_tab_t::struct_dissect:
-			struct_dissector_view::render(0.f, TAB_HEIGHT, w, content_h,
 				a, accent_r, accent_g, accent_b);
 			break;
 		default:

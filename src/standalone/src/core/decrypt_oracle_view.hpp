@@ -41,16 +41,20 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	st.anim_time += ImGui::GetIO().DeltaTime;
 	float dt = ImGui::GetIO().DeltaTime;
 
-	const ImU32 bg        = IM_COL32(30, 30, 30, static_cast<int>(alpha * 255));
-	const ImU32 text_col  = IM_COL32(212, 212, 212, static_cast<int>(alpha * 255));
-	const ImU32 dim_col   = IM_COL32(140, 140, 140, static_cast<int>(alpha * 255));
+	const auto& _t = themes::resolved;
+	const auto _ta = [alpha](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, alpha);
+	};
+	const ImU32 bg        = _ta(_t.bg_base);
+	const ImU32 text_col  = _ta(_t.text_primary);
+	const ImU32 dim_col   = _ta(_t.text_dim);
 	const ImU32 accent    = IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 	                                  static_cast<int>(accent_b * 255), static_cast<int>(alpha * 255));
-	const ImU32 header_bg = IM_COL32(45, 45, 45, static_cast<int>(alpha * 255));
-	const ImU32 row_even  = IM_COL32(35, 35, 35, static_cast<int>(alpha * 255));
-	const ImU32 row_odd   = IM_COL32(40, 40, 40, static_cast<int>(alpha * 255));
-	const ImU32 row_hover = IM_COL32(55, 55, 55, static_cast<int>(alpha * 255));
-	const ImU32 sel_col   = IM_COL32(60, 60, 80, static_cast<int>(alpha * 255));
+	const ImU32 header_bg = _ta(_t.panel_header);
+	const ImU32 row_even  = _ta(_t.panel_bg);
+	const ImU32 row_odd   = _ta(ui_anim::lighten(_t.panel_bg, 8));
+	const ImU32 row_hover = _ta(ui_anim::lighten(_t.panel_header, 14));
+	const ImU32 sel_col   = _ta(ui_anim::lighten(_t.panel_header, 10));
 	const ImU32 green_col = IM_COL32(152, 195, 121, static_cast<int>(alpha * 255));
 
 	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + width, cy + height), bg);
@@ -58,14 +62,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const float toolbar_h = 68.f;
 	const float pad = 12.f;
 
-	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + width, cy + toolbar_h), header_bg);
+	ui_anim::render_toolbar(dl, cx, cy, width, toolbar_h, accent_r, accent_g, accent_b, alpha);
 
 	float tx = cx + pad;
 	float ty = cy + 8.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(tx, ty));
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.15f, alpha));
-	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.83f, 0.83f, 0.83f, alpha));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(alpha * 220)));
+	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(alpha * 120)));
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(210, 212, 220, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 
 	ImGui::PushItemWidth(180.f);
 	ImGui::InputTextWithHint("##do_addr", "Encrypted Region (hex)", oracle.address_input, sizeof(oracle.address_input));
@@ -76,12 +83,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopItemWidth();
 	ImGui::SameLine();
 
-	ImGui::PopStyleColor(2);
+	ImGui::PopStyleColor(3); ImGui::PopStyleVar(2);
 
-	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(accent_r, accent_g, accent_b, 0.7f * alpha));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(accent_r, accent_g, accent_b, 0.9f * alpha));
-	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(accent_r, accent_g, accent_b, 1.0f * alpha));
-	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, alpha));
+	ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(static_cast<int>(accent_r * 140), static_cast<int>(accent_g * 140), static_cast<int>(accent_b * 140), static_cast<int>(alpha * 200)));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(static_cast<int>(accent_r * 180), static_cast<int>(accent_g * 180), static_cast<int>(accent_b * 180), static_cast<int>(alpha * 220)));
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(static_cast<int>(accent_r * 100), static_cast<int>(accent_g * 100), static_cast<int>(accent_b * 100), static_cast<int>(alpha * 255)));
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 
 	bool scanning = oracle.scanning.load();
 
@@ -103,7 +111,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
-	ImGui::PopStyleColor(4);
+	ImGui::PopStyleColor(4); ImGui::PopStyleVar();
 
 	ty += 26.f;
 
@@ -150,15 +158,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float hy = table_top;
 	const float row_h = 22.f;
 
-	dl->AddRectFilled(ImVec2(hx, hy), ImVec2(hx + width - pad * 2.f, hy + row_h), header_bg);
+	{
+		ui_anim::table_col_t hdr_cols[] = {
+			{"Source Func", col_func_w}, {"Enc Offset", col_offset_w},
+			{"Decrypted String", col_string_w}, {"Conf", col_conf_w}, {"Len", col_len_w}
+		};
+		ui_anim::render_table_header(dl, hx, hy, width - pad * 2.f, row_h, hdr_cols, 5, accent_r, accent_g, accent_b, alpha);
+	}
 
-	dl->AddText(ImVec2(hx + 4.f, hy + 3.f), text_col, "Source Func");
-	dl->AddText(ImVec2(hx + col_func_w + 4.f, hy + 3.f), text_col, "Enc Offset");
-	dl->AddText(ImVec2(hx + col_func_w + col_offset_w + 4.f, hy + 3.f), text_col, "Decrypted String");
 	float conf_x = hx + col_func_w + col_offset_w + col_string_w;
-	dl->AddText(ImVec2(conf_x + 4.f, hy + 3.f), text_col, "Conf");
-	dl->AddText(ImVec2(conf_x + col_conf_w + 4.f, hy + 3.f), text_col, "Len");
-
 	hy += row_h;
 
 	std::vector<decrypt_oracle::decrypted_string_t> results_copy;
@@ -178,9 +186,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	float max_scroll = (std::max)(0.f, static_cast<float>(total_rows) * row_h - (table_h - row_h));
-	ui_anim::clamp_scroll(st.target_scroll_y, max_scroll);
-	ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, dt);
-	ui_anim::clamp_scroll(st.scroll_y, max_scroll);
+	ui_anim::clamp_scroll(st.target_scroll_y, 0.f, max_scroll);
+	ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 15.f, dt);
+	ui_anim::clamp_scroll(st.scroll_y, 0.f, max_scroll);
 
 	int start_row = static_cast<int>(st.scroll_y / row_h);
 	if (start_row < 0) start_row = 0;
@@ -195,8 +203,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImVec2(hx, ry), ImVec2(hx + width - pad * 2.f, ry + row_h));
 		bool selected = (st.selected_row == i);
 
-		ImU32 row_bg = selected ? sel_col : (hovered ? row_hover : (i % 2 == 0 ? row_even : row_odd));
-		dl->AddRectFilled(ImVec2(hx, ry), ImVec2(hx + width - pad * 2.f, ry + row_h), row_bg);
+		float row_a = ui_anim::render_row_entrance(i, 0.04f, alpha);
+		ui_anim::table_row_style_t rs{};
+		rs.selected = selected;
+		rs.hovered = hovered;
+		rs.index = i;
+		rs.alpha = alpha;
+		rs.entrance = row_a / alpha;
+		rs.ar = accent_r; rs.ag = accent_g; rs.ab = accent_b;
+		ui_anim::render_table_row(dl, hx, ry, width - pad * 2.f, row_h, rs);
 
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			st.selected_row = i;
@@ -237,15 +252,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	if (total_rows == 0 && !scanning) {
-		const char* hint = "Enter an encrypted region address and click 'Scan & Decrypt'";
-		ImVec2 hs = ImGui::CalcTextSize(hint);
-		dl->AddText(ImVec2(cx + width * 0.5f - hs.x * 0.5f, table_top + table_h * 0.4f),
-		            dim_col, hint);
+		ui_anim::render_empty_state(dl, cx, table_top, width, table_h,
+		    "Enter an encrypted region address and click Scan & Decrypt",
+		    accent_r, accent_g, accent_b, alpha, static_cast<float>(ImGui::GetTime()));
 	}
 
 	ui_anim::render_custom_scrollbar(dl, cx + width - 8.f, table_top + row_h, 6.f, table_h - row_h,
-		st.scroll_y, max_scroll, st.scrollbar_dragging, st.scrollbar_drag_offset,
-		accent, IM_COL32(60, 60, 60, static_cast<int>(alpha * 150)));
+		st.scroll_y, static_cast<float>(total_rows) * row_h, table_h - row_h,
+		alpha, st.scrollbar_dragging, st.scrollbar_drag_offset);
 
 	ImGui::EndChild();
 }

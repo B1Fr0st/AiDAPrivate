@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -1555,6 +1556,27 @@ inline void decompile_function_native(uint64_t func_addr) {
 	if (g_state.decompiling.load())
 		return;
 
+	// Check cache first — instant return if we already have it
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		auto cache_it = g_state.cache.find(func_addr);
+		if (cache_it != g_state.cache.end()) {
+			g_state.current = cache_it->second;
+			g_state.streaming_text.clear();
+			g_state.active = true;
+			if (g_state.history_pos < 0 ||
+			    g_state.history_pos >= static_cast<int>(g_state.history.size()) ||
+			    g_state.history[g_state.history_pos].addr != func_addr) {
+				if (g_state.history_pos + 1 < static_cast<int>(g_state.history.size()))
+					g_state.history.erase(g_state.history.begin() + g_state.history_pos + 1,
+					                      g_state.history.end());
+				g_state.history.push_back({func_addr, g_state.current.function_name});
+				g_state.history_pos = static_cast<int>(g_state.history.size()) - 1;
+			}
+			return;
+		}
+	}
+
 	g_state.decompiling.store(true);
 	g_state.cancel.store(false);
 	g_state.active_mode = decompile_mode_t::native_ghidra;
@@ -1564,15 +1586,40 @@ inline void decompile_function_native(uint64_t func_addr) {
 		g_state.current = {};
 		g_state.current.function_addr = func_addr;
 		g_state.streaming_text.clear();
+		g_state.active = true;
+
+		char name[64];
+		snprintf(name, sizeof(name), "sub_%llX", static_cast<unsigned long long>(func_addr));
+		g_state.current.function_name = name;
 	}
 
 	std::thread([func_addr]() {
-		auto ghidra_result = ghidra_decompiler::decompile_function(func_addr, &g_state.cancel);
+		// WHY: Pre-read 256KB in one driver call instead of letting Ghidra's
+		// loadFill make hundreds of individual IOCTLs.  This is the single
+		// biggest change that eliminates the UI freeze.
+		constexpr size_t PREREAD_SIZE = 0x40000;  // 256 KB
+		std::vector<uint8_t> mem;
+		driver_bridge::read_memory(func_addr, PREREAD_SIZE, mem);
+
+		if (mem.empty()) {
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.current.is_error = true;
+			g_state.current.error_text = "failed to read memory at target address";
+			g_state.current.complete = true;
+			g_state.decompiling.store(false);
+			return;
+		}
+
+		// WHY: decompile_buffer() creates a temporary Architecture + BufferLoader
+		// with no global mutex held.  This means the render thread is never blocked.
+		auto ghidra_result = ghidra_decompiler::decompile_buffer(
+			mem.data(), mem.size(), func_addr, func_addr, &g_state.cancel);
 
 		if (g_state.cancel.load()) {
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.current.is_error = true;
 			g_state.current.error_text = "decompilation cancelled";
+			g_state.current.complete = true;
 			g_state.decompiling.store(false);
 			return;
 		}
@@ -1591,8 +1638,15 @@ inline void decompile_function_native(uint64_t func_addr) {
 			detail::save_cache_entry_to_disk(func_addr, g_state.current);
 		}
 
-		g_state.history.push_back({func_addr, g_state.current.function_name});
-		g_state.history_pos = static_cast<int>(g_state.history.size()) - 1;
+		if (g_state.history_pos < 0 ||
+		    g_state.history_pos >= static_cast<int>(g_state.history.size()) ||
+		    g_state.history[g_state.history_pos].addr != func_addr) {
+			if (g_state.history_pos + 1 < static_cast<int>(g_state.history.size()))
+				g_state.history.erase(g_state.history.begin() + g_state.history_pos + 1,
+				                      g_state.history.end());
+			g_state.history.push_back({func_addr, g_state.current.function_name});
+			g_state.history_pos = static_cast<int>(g_state.history.size()) - 1;
+		}
 		g_state.decompiling.store(false);
 	}).detach();
 }
@@ -1610,15 +1664,33 @@ inline void decompile_function_hybrid(uint64_t func_addr, const settings_sa_t& s
 		g_state.current = {};
 		g_state.current.function_addr = func_addr;
 		g_state.streaming_text.clear();
+		g_state.active = true;
 	}
 
 	std::thread([func_addr, settings]() {
-		auto ghidra_result = ghidra_decompiler::decompile_function(func_addr, &g_state.cancel);
+		// WHY: Pre-read memory once; used by both the Ghidra decompilation
+		// (via decompile_buffer) and the CFG annotation (via the raw bytes).
+		constexpr size_t PREREAD_SIZE = 0x40000;  // 256 KB
+		std::vector<uint8_t> mem;
+		driver_bridge::read_memory(func_addr, PREREAD_SIZE, mem);
+
+		if (mem.empty()) {
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			g_state.current.is_error = true;
+			g_state.current.error_text = "failed to read memory at target address";
+			g_state.current.complete = true;
+			g_state.decompiling.store(false);
+			return;
+		}
+
+		auto ghidra_result = ghidra_decompiler::decompile_buffer(
+			mem.data(), mem.size(), func_addr, func_addr, &g_state.cancel);
 
 		if (ghidra_result.is_error) {
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.current.is_error = true;
 			g_state.current.error_text = "ghidra: " + ghidra_result.error_text;
+			g_state.current.complete = true;
 			g_state.decompiling.store(false);
 			return;
 		}
@@ -1644,10 +1716,8 @@ inline void decompile_function_hybrid(uint64_t func_addr, const settings_sa_t& s
 		std::string xref_text = detail::build_xref_text(func_addr);
 		std::string mod_text = detail::resolve_module_symbols(func_addr);
 		auto import_lookup = detail::build_import_lookup(func_addr);
-		std::vector<uint8_t> func_mem;
-		driver_bridge::read_memory(func_addr, 0x8000, func_mem);
-		if (!func_mem.empty())
-			detail::annotate_instructions(blocks, func_mem.data(), func_addr, func_mem.size(), import_lookup);
+		if (!mem.empty())
+			detail::annotate_instructions(blocks, mem.data(), func_addr, mem.size(), import_lookup);
 		std::string annotated = detail::build_block_text(blocks);
 
 		std::string system_prompt =
@@ -1710,6 +1780,7 @@ inline void decompile_function_hybrid(uint64_t func_addr, const settings_sa_t& s
 			if (full.empty()) {
 				g_state.current.is_error = true;
 				g_state.current.error_text = "AI returned empty result";
+				g_state.current.complete = true;
 				g_state.decompiling.store(false);
 				return;
 			}
@@ -1721,8 +1792,89 @@ inline void decompile_function_hybrid(uint64_t func_addr, const settings_sa_t& s
 
 			g_state.cache[func_addr] = g_state.current;
 			detail::save_cache_entry_to_disk(func_addr, g_state.current);
+
+			if (g_state.history_pos < 0 ||
+			    g_state.history_pos >= static_cast<int>(g_state.history.size()) ||
+			    g_state.history[g_state.history_pos].addr != func_addr) {
+				if (g_state.history_pos + 1 < static_cast<int>(g_state.history.size()))
+					g_state.history.erase(g_state.history.begin() + g_state.history_pos + 1,
+					                      g_state.history.end());
+				g_state.history.push_back({func_addr, g_state.current.function_name});
+				g_state.history_pos = static_cast<int>(g_state.history.size()) - 1;
+			}
 			g_state.decompiling.store(false);
 		}
+	}).detach();
+}
+
+// ---------------------------------------------------------------------------
+//  batch_decompile_native() — bulk Ghidra decompilation using thread pool
+//  WHY: The old batch_decompile() used AI (network-bound, $$$ per function).
+//       This new function uses the Ghidra thread pool to decompile hundreds
+//       of functions per second locally.  It pre-reads the module memory
+//       once from the driver, then distributes work across all CPU cores.
+// ---------------------------------------------------------------------------
+
+inline void batch_decompile_native(const std::vector<uint64_t>& addresses) {
+	if (g_state.batch_running.load() || g_state.decompiling.load()) return;
+
+	g_state.batch_running.store(true);
+	g_state.cancel.store(false);
+	g_state.batch_total.store(static_cast<int>(addresses.size()));
+	g_state.batch_done.store(0);
+
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.batch_queue = addresses;
+	}
+
+	std::thread([addresses]() {
+		if (addresses.empty()) {
+			g_state.batch_running.store(false);
+			return;
+		}
+
+		// Find the memory range spanning all requested addresses
+		uint64_t min_addr = *std::min_element(addresses.begin(), addresses.end());
+		uint64_t max_addr = *std::max_element(addresses.begin(), addresses.end());
+		// Add 256KB past the last address for function body coverage
+		constexpr size_t TAIL_SIZE = 0x40000;
+		size_t total_size = static_cast<size_t>(max_addr - min_addr) + TAIL_SIZE;
+		if (total_size > 0x10000000) total_size = 0x10000000; // 256 MB cap
+
+		// Pre-read the full range in one driver call
+		std::vector<uint8_t> module_mem;
+		driver_bridge::read_memory(min_addr, total_size, module_mem);
+
+		if (module_mem.empty()) {
+			g_state.batch_running.store(false);
+			return;
+		}
+
+		// Use Ghidra's parallel batch_decompile
+		std::vector<ghidra_decompiler::ghidra_result_t> results;
+		ghidra_decompiler::batch_decompile(
+			module_mem.data(), module_mem.size(), min_addr,
+			addresses, results,
+			&g_state.batch_done, &g_state.cancel);
+
+		// Store results into the decompiler cache
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			for (size_t i = 0; i < results.size(); ++i) {
+				if (results[i].complete && !results[i].is_error) {
+					decompile_result_t dr;
+					dr.function_addr = results[i].function_addr;
+					dr.function_name = results[i].function_name;
+					dr.pseudocode = results[i].pseudocode;
+					dr.complete = true;
+					g_state.cache[dr.function_addr] = dr;
+				}
+			}
+		}
+
+		g_state.batch_running.store(false);
+		g_state.decompiling.store(false);
 	}).detach();
 }
 

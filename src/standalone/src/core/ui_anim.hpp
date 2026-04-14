@@ -7,6 +7,18 @@
 
 namespace ui_anim {
 
+inline ImU32 theme_alpha(ImU32 c, float alpha) {
+	return (c & 0x00FFFFFF) | (static_cast<ImU32>(((c >> 24) & 0xFF) * alpha) << 24);
+}
+
+inline ImU32 lighten(ImU32 c, int d) {
+	int r = static_cast<int>((c >> IM_COL32_R_SHIFT) & 0xFF) + d;
+	int g = static_cast<int>((c >> IM_COL32_G_SHIFT) & 0xFF) + d;
+	int b = static_cast<int>((c >> IM_COL32_B_SHIFT) & 0xFF) + d;
+	return IM_COL32(r > 255 ? 255 : r, g > 255 ? 255 : g, b > 255 ? 255 : b,
+	                (c >> IM_COL32_A_SHIFT) & 0xFF);
+}
+
 inline float smooth_lerp(float current, float target, float speed, float dt)
 {
 	float t = std::min(speed * dt, 1.f);
@@ -411,5 +423,853 @@ struct smooth_value_t {
 		}
 	}
 };
+
+inline void render_toolbar(ImDrawList* dl, float x, float y, float w, float h,
+						   float ar, float ag, float ab, float alpha)
+{
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+		IM_COL32(22, 24, 32, static_cast<int>(230 * alpha)));
+	render_gradient_header(dl, x, y, w, h, ar, ag, ab, alpha * 0.4f);
+	dl->AddLine(ImVec2(x, y + h - 1.f), ImVec2(x + w, y + h - 1.f),
+		IM_COL32(60, 65, 80, static_cast<int>(120 * alpha)));
+	dl->AddRectFilledMultiColor(
+		ImVec2(x, y + h), ImVec2(x + w, y + h + 3.f),
+		IM_COL32(0, 0, 0, static_cast<int>(25 * alpha)),
+		IM_COL32(0, 0, 0, static_cast<int>(25 * alpha)),
+		IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
+}
+
+inline void render_section_header(ImDrawList* dl, float x, float y, float w, float h,
+								  const char* title, float ar, float ag, float ab, float alpha,
+								  int badge_count = -1)
+{
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+		IM_COL32(25, 27, 36, static_cast<int>(220 * alpha)));
+	render_gradient_header(dl, x, y, w, h, ar, ag, ab, alpha * 0.3f);
+
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 3.f, y + h),
+		IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+				 static_cast<int>(ab * 255), static_cast<int>(180 * alpha)));
+
+	ImVec2 tsz = ImGui::CalcTextSize(title);
+	dl->AddText(ImVec2(x + 12.f, y + (h - tsz.y) * 0.5f),
+		IM_COL32(static_cast<int>(ar * 200 + 55), static_cast<int>(ag * 200 + 55),
+				 static_cast<int>(ab * 200 + 55), static_cast<int>(alpha * 240)),
+		title);
+
+	if (badge_count >= 0) {
+		char buf[16];
+		std::snprintf(buf, sizeof(buf), "%d", badge_count);
+		float bx = x + 14.f + tsz.x + 8.f;
+		render_badge(dl, buf, bx, y + (h - ImGui::CalcTextSize(buf).y - 2.f) * 0.5f,
+			IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+					 static_cast<int>(ab * 255), static_cast<int>(alpha * 160)),
+			IM_COL32(255, 255, 255, static_cast<int>(alpha * 220)));
+	}
+
+	dl->AddLine(ImVec2(x, y + h - 1.f), ImVec2(x + w, y + h - 1.f),
+		IM_COL32(60, 65, 80, static_cast<int>(100 * alpha)));
+}
+
+inline void render_empty_state(ImDrawList* dl, float x, float y, float w, float h,
+							   const char* message, float ar, float ag, float ab, float alpha,
+							   float time)
+{
+	float pulse = (std::sin(time * 2.f) + 1.f) * 0.5f;
+	float text_a = 0.35f + pulse * 0.25f;
+
+	ImVec2 msz = ImGui::CalcTextSize(message);
+	float text_x = x + (w - msz.x) * 0.5f;
+	float text_y = y + (h - msz.y) * 0.5f + 12.f;
+
+	ImU32 dot_col = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+							  static_cast<int>(ab * 255), static_cast<int>(alpha * (30 + pulse * 35)));
+	float dot_r = 18.f + pulse * 4.f;
+	float dcx = x + w * 0.5f;
+	float dcy = text_y - 28.f;
+	dl->AddCircleFilled(ImVec2(dcx, dcy), dot_r, dot_col, 32);
+	dl->AddCircle(ImVec2(dcx, dcy), dot_r + 4.f,
+		IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+				 static_cast<int>(ab * 255), static_cast<int>(alpha * pulse * 20)), 32, 1.5f);
+
+	ImU32 line_col = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+							   static_cast<int>(ab * 255), static_cast<int>(alpha * (20 + pulse * 15)));
+	dl->AddLine(ImVec2(dcx - 7.f, dcy - 7.f), ImVec2(dcx + 7.f, dcy + 7.f), line_col, 2.f);
+	dl->AddLine(ImVec2(dcx - 7.f, dcy + 7.f), ImVec2(dcx + 7.f, dcy - 7.f), line_col, 2.f);
+
+	dl->AddText(ImVec2(text_x, text_y),
+		IM_COL32(180, 185, 195, static_cast<int>(text_a * alpha * 255)), message);
+}
+
+inline void render_stat_card(ImDrawList* dl, float x, float y, float w, float h,
+							 const char* label, const char* value,
+							 float ar, float ag, float ab, float alpha,
+							 ImU32 value_col = 0)
+{
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+		IM_COL32(28, 30, 40, static_cast<int>(200 * alpha)), 6.f);
+	dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h),
+		IM_COL32(50, 55, 70, static_cast<int>(100 * alpha)), 6.f);
+
+	ImU32 top_line = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+							   static_cast<int>(ab * 255), static_cast<int>(alpha * 120));
+	dl->AddLine(ImVec2(x + 4.f, y), ImVec2(x + w - 4.f, y), top_line, 2.f);
+
+	ImVec2 lsz = ImGui::CalcTextSize(label);
+	dl->AddText(ImVec2(x + (w - lsz.x) * 0.5f, y + 6.f),
+		IM_COL32(140, 145, 160, static_cast<int>(alpha * 200)), label);
+
+	if (value_col == 0)
+		value_col = IM_COL32(220, 225, 235, static_cast<int>(alpha * 255));
+	else
+		value_col = theme_alpha(value_col, alpha);
+
+	ImVec2 vsz = ImGui::CalcTextSize(value);
+	dl->AddText(ImVec2(x + (w - vsz.x) * 0.5f, y + h - vsz.y - 8.f), value_col, value);
+}
+
+inline float render_row_entrance(int row_index, float anim_time, float stagger_delay = 0.015f,
+								 float duration = 0.3f)
+{
+	float row_start = static_cast<float>(row_index) * stagger_delay;
+	float elapsed = anim_time - row_start;
+	if (elapsed < 0.f) return 0.f;
+	if (elapsed >= duration) return 1.f;
+	return ease_out_cubic(elapsed / duration);
+}
+
+inline void render_separator(ImDrawList* dl, float x, float y, float w,
+							 float ar, float ag, float ab, float alpha)
+{
+	ImU32 left = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+						   static_cast<int>(ab * 255), static_cast<int>(60 * alpha));
+	ImU32 right = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+							static_cast<int>(ab * 255), 0);
+	dl->AddRectFilledMultiColor(ImVec2(x, y), ImVec2(x + w, y + 1.f), left, right, right, left);
+}
+
+inline void render_progress_bar_animated(ImDrawList* dl, float x, float y, float w, float h,
+										 float progress, float ar, float ag, float ab, float alpha,
+										 float time)
+{
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+		IM_COL32(20, 22, 30, static_cast<int>(200 * alpha)), h * 0.5f);
+
+	float fill_w = w * std::clamp(progress, 0.f, 1.f);
+	if (fill_w > 1.f) {
+		ImU32 fill_left = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+									static_cast<int>(ab * 255), static_cast<int>(220 * alpha));
+		ImU32 fill_right = IM_COL32(static_cast<int>(ar * 200 + 55), static_cast<int>(ag * 200 + 55),
+									 static_cast<int>(ab * 200 + 55), static_cast<int>(220 * alpha));
+		dl->AddRectFilledMultiColor(ImVec2(x, y), ImVec2(x + fill_w, y + h),
+			fill_left, fill_right, fill_right, fill_left);
+
+		float shimmer = (std::fmod(time * 0.8f, 1.f));
+		float shimmer_x = x + shimmer * fill_w;
+		float shimmer_w = fill_w * 0.25f;
+		if (shimmer_x + shimmer_w <= x + fill_w) {
+			ImU32 shimmer_col = IM_COL32(255, 255, 255, static_cast<int>(25 * alpha));
+			dl->AddRectFilledMultiColor(
+				ImVec2(shimmer_x, y), ImVec2(shimmer_x + shimmer_w, y + h),
+				IM_COL32(255, 255, 255, 0), shimmer_col, shimmer_col, IM_COL32(255, 255, 255, 0));
+		}
+
+		ImU32 glow = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+							   static_cast<int>(ab * 255), static_cast<int>(30 * alpha));
+		dl->AddRectFilled(ImVec2(x, y - 2.f), ImVec2(x + fill_w, y), glow, 1.f);
+		dl->AddRectFilled(ImVec2(x, y + h), ImVec2(x + fill_w, y + h + 2.f), glow, 1.f);
+	}
+
+	char pct[8];
+	std::snprintf(pct, sizeof(pct), "%d%%", static_cast<int>(progress * 100.f));
+	ImVec2 psz = ImGui::CalcTextSize(pct);
+	if (psz.x + 4.f < w)
+		dl->AddText(ImVec2(x + (w - psz.x) * 0.5f, y + (h - psz.y) * 0.5f),
+			IM_COL32(255, 255, 255, static_cast<int>(alpha * 200)), pct);
+}
+
+inline void render_glow_rect(ImDrawList* dl, float x, float y, float w, float h,
+							 float ar, float ag, float ab, float alpha, float intensity = 1.f)
+{
+	for (int i = 3; i >= 0; --i) {
+		float expand = static_cast<float>(i) * 3.f;
+		float ga = (0.06f - static_cast<float>(i) * 0.012f) * alpha * intensity;
+		dl->AddRectFilled(
+			ImVec2(x - expand, y - expand), ImVec2(x + w + expand, y + h + expand),
+			IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+					 static_cast<int>(ab * 255), static_cast<int>(ga * 255)), 4.f + expand);
+	}
+}
+
+inline bool render_pill_button(ImDrawList* dl, const char* label, float x, float y,
+							   float ar, float ag, float ab, float alpha,
+							   float& hover_anim, float dt)
+{
+	ImVec2 tsz = ImGui::CalcTextSize(label);
+	float pad = 10.f;
+	float w = tsz.x + pad * 2.f;
+	float h = tsz.y + 8.f;
+	float rounding = h * 0.5f;
+
+	ImVec2 rmin(x, y);
+	ImVec2 rmax(x + w, y + h);
+	bool hovered = ImGui::IsMouseHoveringRect(rmin, rmax, false);
+	bool clicked = hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+
+	float hover_target = hovered ? 1.f : 0.f;
+	hover_anim = smooth_lerp(hover_anim, hover_target, 12.f, dt);
+
+	float bg_a = 0.5f + hover_anim * 0.3f;
+	dl->AddRectFilled(rmin, rmax,
+		IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+				 static_cast<int>(ab * 255), static_cast<int>(bg_a * alpha * 255)), rounding);
+
+	if (hover_anim > 0.01f) {
+		dl->AddRect(rmin, rmax,
+			IM_COL32(static_cast<int>(ar * 200 + 55), static_cast<int>(ag * 200 + 55),
+					 static_cast<int>(ab * 200 + 55), static_cast<int>(hover_anim * alpha * 100)),
+			rounding, 0, 1.f);
+	}
+
+	dl->AddText(ImVec2(x + pad, y + 4.f),
+		IM_COL32(255, 255, 255, static_cast<int>(alpha * (200 + hover_anim * 55))), label);
+
+	return clicked;
+}
+
+inline void render_toggle_switch(ImDrawList* dl, float x, float y, bool active, float& anim,
+								 float ar, float ag, float ab, float alpha, float dt)
+{
+	float sw_w = 28.f;
+	float sw_h = 14.f;
+	float rounding = sw_h * 0.5f;
+
+	float target = active ? 1.f : 0.f;
+	anim = smooth_lerp(anim, target, 12.f, dt);
+
+	ImU32 bg_off = IM_COL32(60, 62, 72, static_cast<int>(200 * alpha));
+	ImU32 bg_on = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+						    static_cast<int>(ab * 255), static_cast<int>(200 * alpha));
+	ImU32 bg = color_lerp(bg_off, bg_on, anim);
+
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + sw_w, y + sw_h), bg, rounding);
+
+	float knob_r = sw_h * 0.4f;
+	float knob_x = x + rounding + anim * (sw_w - sw_h);
+	float knob_y = y + sw_h * 0.5f;
+	dl->AddCircleFilled(ImVec2(knob_x, knob_y), knob_r,
+		IM_COL32(255, 255, 255, static_cast<int>(alpha * 240)), 16);
+}
+
+inline void render_hub_tab_bar(ImDrawList* dl, ImVec2 origin, float x, float y, float w,
+							   const char* const* names, int count, int& active_idx,
+							   float& scroll_x, float& target_scroll_x,
+							   float& underline_x, float& underline_w, float& underline_vel,
+							   float& content_fade, int& prev_idx,
+							   float ar, float ag, float ab, float alpha, float dt)
+{
+	float tab_h = 28.f;
+	render_gradient_header(dl, origin.x + x, origin.y + y, w, tab_h, ar, ag, ab, alpha);
+
+	float total_w = 0.f;
+	float tab_widths[32] = {};
+	float tab_offsets[32] = {};
+	for (int i = 0; i < count && i < 32; i++) {
+		tab_widths[i] = ImGui::CalcTextSize(names[i]).x + 20.f;
+		tab_offsets[i] = total_w;
+		total_w += tab_widths[i] + 2.f;
+	}
+
+	float clip_x0 = origin.x + x;
+	float clip_x1 = origin.x + x + w;
+	float clip_y0 = origin.y + y;
+	float clip_y1 = origin.y + y + tab_h;
+
+	if (ImGui::IsMouseHoveringRect(ImVec2(clip_x0, clip_y0), ImVec2(clip_x1, clip_y1), false)) {
+		float wheel = ImGui::GetIO().MouseWheel;
+		if (wheel != 0.f)
+			target_scroll_x -= wheel * 60.f;
+	}
+
+	float max_scroll = std::max(0.f, total_w - w);
+	target_scroll_x = std::clamp(target_scroll_x, 0.f, max_scroll);
+	scroll_x = smooth_lerp(scroll_x, target_scroll_x, 14.f, dt);
+
+	float active_left = tab_offsets[active_idx] - scroll_x;
+	float active_right = active_left + tab_widths[active_idx];
+	if (active_left < 0.f)
+		target_scroll_x = tab_offsets[active_idx];
+	else if (active_right > w)
+		target_scroll_x = tab_offsets[active_idx] + tab_widths[active_idx] - w;
+
+	float target_ux = clip_x0 + tab_offsets[active_idx] - scroll_x + 4.f;
+	float target_uw = tab_widths[active_idx] - 8.f;
+	if (underline_w < 0.1f) {
+		underline_x = target_ux;
+		underline_w = target_uw;
+	}
+	underline_x = spring_interp(underline_x, target_ux, underline_vel, 280.f, 22.f, dt);
+	underline_w = smooth_lerp(underline_w, target_uw, 16.f, dt);
+
+	ImGui::PushClipRect(ImVec2(clip_x0, clip_y0), ImVec2(clip_x1, clip_y1), true);
+
+	for (int i = 0; i < count; i++) {
+		float bx0 = clip_x0 + tab_offsets[i] - scroll_x;
+		float bx1 = bx0 + tab_widths[i];
+		float by0 = clip_y0;
+		float by1 = clip_y0 + tab_h;
+		bool is_active = (i == active_idx);
+
+		ImVec2 mouse = ImGui::GetMousePos();
+		bool hovered = (mouse.x >= bx0 && mouse.x < bx1 && mouse.y >= by0 && mouse.y < by1);
+		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			if (active_idx != i) {
+				prev_idx = active_idx;
+				content_fade = 0.f;
+			}
+			active_idx = i;
+		}
+
+		float bg_alpha_val = is_active ? 0.15f : (hovered ? 0.08f : 0.f);
+		if (bg_alpha_val > 0.01f)
+			dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1),
+				IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+						 static_cast<int>(ab * 255), static_cast<int>(bg_alpha_val * alpha * 255)),
+				4.f);
+
+		ImVec2 ts = ImGui::CalcTextSize(names[i]);
+		float text_alpha = is_active ? 0.95f : (hovered ? 0.7f : 0.5f);
+		dl->AddText(ImVec2(bx0 + (tab_widths[i] - ts.x) * 0.5f, by0 + (tab_h - ts.y) * 0.5f),
+			IM_COL32(255, 255, 255, static_cast<int>(text_alpha * alpha * 255)),
+			names[i]);
+	}
+
+	float ux = underline_x;
+	float uw = underline_w;
+	float uy = clip_y1 - 2.f;
+	ImU32 ul_col = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+							 static_cast<int>(ab * 255), static_cast<int>(alpha * 255));
+	dl->AddRectFilled(ImVec2(ux, uy), ImVec2(ux + uw, uy + 2.f), ul_col, 1.f);
+	dl->AddRectFilled(ImVec2(ux - 3.f, uy - 1.f), ImVec2(ux + uw + 3.f, uy + 3.f),
+		IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+				 static_cast<int>(ab * 255), static_cast<int>(alpha * 40)), 2.f);
+	dl->AddRectFilled(ImVec2(ux - 6.f, uy - 2.f), ImVec2(ux + uw + 6.f, uy + 5.f),
+		IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+				 static_cast<int>(ab * 255), static_cast<int>(alpha * 15)), 3.f);
+
+	ImGui::PopClipRect();
+
+	if (scroll_x > 1.f) {
+		dl->AddRectFilledMultiColor(
+			ImVec2(clip_x0, clip_y0), ImVec2(clip_x0 + 30.f, clip_y1),
+			IM_COL32(18, 20, 26, static_cast<int>(240 * alpha)),
+			IM_COL32(18, 20, 26, 0),
+			IM_COL32(18, 20, 26, 0),
+			IM_COL32(18, 20, 26, static_cast<int>(240 * alpha)));
+	}
+	if (scroll_x < max_scroll - 1.f) {
+		dl->AddRectFilledMultiColor(
+			ImVec2(clip_x1 - 30.f, clip_y0), ImVec2(clip_x1, clip_y1),
+			IM_COL32(18, 20, 26, 0),
+			IM_COL32(18, 20, 26, static_cast<int>(240 * alpha)),
+			IM_COL32(18, 20, 26, static_cast<int>(240 * alpha)),
+			IM_COL32(18, 20, 26, 0));
+	}
+
+	dl->AddLine(ImVec2(origin.x + x, origin.y + y + tab_h),
+		ImVec2(origin.x + x + w, origin.y + y + tab_h),
+		IM_COL32(80, 80, 100, static_cast<int>(0.3f * alpha * 255)));
+	dl->AddRectFilledMultiColor(
+		ImVec2(origin.x + x, origin.y + y + tab_h + 1.f),
+		ImVec2(origin.x + x + w, origin.y + y + tab_h + 4.f),
+		IM_COL32(0, 0, 0, static_cast<int>(30.f * alpha)),
+		IM_COL32(0, 0, 0, static_cast<int>(30.f * alpha)),
+		IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
+}
+
+inline float ease_out_back(float t)
+{
+	t = std::clamp(t, 0.f, 1.f);
+	const float c1 = 1.70158f;
+	const float c3 = c1 + 1.f;
+	float f = t - 1.f;
+	return 1.f + c3 * f * f * f + c1 * f * f;
+}
+
+inline float ease_out_quint(float t)
+{
+	t = std::clamp(t, 0.f, 1.f);
+	float f = t - 1.f;
+	return 1.f + f * f * f * f * f;
+}
+
+struct table_col_t {
+	const char* label;
+	float       width;
+};
+
+inline void render_table_header(ImDrawList* dl, float x, float y, float w, float row_h,
+								const table_col_t* cols, int col_count,
+								float ar, float ag, float ab, float alpha)
+{
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + row_h),
+		IM_COL32(30, 32, 44, static_cast<int>(230 * alpha)));
+	render_gradient_header(dl, x, y, w, row_h, ar, ag, ab, alpha * 0.25f);
+	dl->AddLine(ImVec2(x, y + row_h - 1.f), ImVec2(x + w, y + row_h - 1.f),
+		IM_COL32(60, 65, 80, static_cast<int>(120 * alpha)));
+
+	ImU32 hdr_col = IM_COL32(static_cast<int>(ar * 180 + 60), static_cast<int>(ag * 180 + 60),
+							  static_cast<int>(ab * 180 + 60), static_cast<int>(220 * alpha));
+	float cx = x + 8.f;
+	for (int i = 0; i < col_count; ++i) {
+		dl->AddText(ImVec2(cx, y + (row_h - ImGui::CalcTextSize(cols[i].label).y) * 0.5f),
+			hdr_col, cols[i].label);
+		cx += cols[i].width;
+		if (i < col_count - 1)
+			dl->AddLine(ImVec2(cx - 4.f, y + 4.f), ImVec2(cx - 4.f, y + row_h - 4.f),
+				IM_COL32(60, 65, 80, static_cast<int>(50 * alpha)));
+	}
+}
+
+struct table_row_style_t {
+	bool  selected;
+	bool  hovered;
+	int   index;
+	float alpha;
+	float entrance;
+	float ar, ag, ab;
+};
+
+inline void render_table_row(ImDrawList* dl, float x, float y, float w, float h,
+							 const table_row_style_t& s)
+{
+	float ra = s.alpha * s.entrance;
+	if (ra < 0.01f) return;
+
+	if (s.selected) {
+		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+			IM_COL32(static_cast<int>(s.ar * 180), static_cast<int>(s.ag * 180),
+					 static_cast<int>(s.ab * 180), static_cast<int>(28 * ra)));
+		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 3.f, y + h),
+			IM_COL32(static_cast<int>(s.ar * 255), static_cast<int>(s.ag * 255),
+					 static_cast<int>(s.ab * 255), static_cast<int>(200 * ra)));
+	} else if (s.hovered) {
+		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+			IM_COL32(255, 255, 255, static_cast<int>(10 * ra)));
+	} else if (s.index & 1) {
+		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+			IM_COL32(255, 255, 255, static_cast<int>(3 * ra)));
+	}
+}
+
+inline void render_panel_card(ImDrawList* dl, float x, float y, float w, float h,
+							  float ar, float ag, float ab, float alpha,
+							  float rounding = 6.f, bool header_stripe = true)
+{
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+		IM_COL32(24, 26, 36, static_cast<int>(210 * alpha)), rounding);
+	dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h),
+		IM_COL32(50, 55, 70, static_cast<int>(80 * alpha)), rounding);
+	if (header_stripe) {
+		dl->AddLine(ImVec2(x + rounding, y), ImVec2(x + w - rounding, y),
+			IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+					 static_cast<int>(ab * 255), static_cast<int>(100 * alpha)), 2.f);
+	}
+	dl->AddRectFilledMultiColor(
+		ImVec2(x, y + h), ImVec2(x + w, y + h + 3.f),
+		IM_COL32(0, 0, 0, static_cast<int>(18 * alpha)),
+		IM_COL32(0, 0, 0, static_cast<int>(18 * alpha)),
+		IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
+}
+
+inline void render_separator_animated(ImDrawList* dl, float x, float y, float w,
+									  float ar, float ag, float ab, float alpha, float time,
+									  bool vertical = false)
+{
+	float pulse = (std::sin(time * 1.5f) + 1.f) * 0.5f;
+	float base_a = 0.25f + pulse * 0.15f;
+	ImU32 center_col = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+								 static_cast<int>(ab * 255), static_cast<int>(base_a * alpha * 255));
+	ImU32 edge_col = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+							   static_cast<int>(ab * 255), 0);
+	if (vertical) {
+		float half = w * 0.5f;
+		dl->AddRectFilledMultiColor(ImVec2(x, y), ImVec2(x + 1.f, y + half),
+			edge_col, edge_col, center_col, center_col);
+		dl->AddRectFilledMultiColor(ImVec2(x, y + half), ImVec2(x + 1.f, y + w),
+			center_col, center_col, edge_col, edge_col);
+	} else {
+		float half = w * 0.5f;
+		dl->AddRectFilledMultiColor(ImVec2(x, y), ImVec2(x + half, y + 1.f),
+			edge_col, center_col, center_col, edge_col);
+		dl->AddRectFilledMultiColor(ImVec2(x + half, y), ImVec2(x + w, y + 1.f),
+			center_col, edge_col, edge_col, center_col);
+	}
+}
+
+inline void render_popup_frame(ImDrawList* dl, float cx, float cy, float w, float h,
+							   float fade, float ar, float ag, float ab, float alpha,
+							   float vp_x, float vp_y, float vp_w, float vp_h)
+{
+	float fa = alpha * fade;
+	dl->AddRectFilled(ImVec2(vp_x, vp_y), ImVec2(vp_x + vp_w, vp_y + vp_h),
+		IM_COL32(0, 0, 0, static_cast<int>(130 * fa)));
+
+	float t = ease_out_back(std::clamp(fade * 1.2f, 0.f, 1.f));
+	float scale = 0.92f + 0.08f * t;
+	float pw = w * scale;
+	float ph = h * scale;
+	float px = cx - pw * 0.5f;
+	float py = cy - ph * 0.5f + (1.f - t) * 12.f;
+
+	for (int g = 3; g >= 1; --g) {
+		float expand = static_cast<float>(g) * 3.f;
+		int ga = static_cast<int>(12 * fa / static_cast<float>(g));
+		dl->AddRect(ImVec2(px - expand, py - expand),
+			ImVec2(px + pw + expand, py + ph + expand),
+			IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+					 static_cast<int>(ab * 255), ga), 10.f + expand, 0, 1.f);
+	}
+
+	dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
+		IM_COL32(20, 22, 30, static_cast<int>(248 * fa)), 8.f);
+	dl->AddRect(ImVec2(px, py), ImVec2(px + pw, py + ph),
+		IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+				 static_cast<int>(ab * 255), static_cast<int>(70 * fa)), 8.f, 0, 1.5f);
+}
+
+inline void render_popup_header(ImDrawList* dl, float px, float py, float pw, float h,
+								const char* title, float ar, float ag, float ab, float fa)
+{
+	dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + h),
+		IM_COL32(28, 30, 40, static_cast<int>(220 * fa)), 8.f, ImDrawFlags_RoundCornersTop);
+	render_gradient_header(dl, px, py, pw, h, ar, ag, ab, fa * 0.35f);
+	dl->AddLine(ImVec2(px, py + h), ImVec2(px + pw, py + h),
+		IM_COL32(static_cast<int>(ar * 100), static_cast<int>(ag * 100),
+				 static_cast<int>(ab * 100), static_cast<int>(120 * fa)));
+	ImU32 title_col = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+								static_cast<int>(ab * 255), static_cast<int>(255 * fa));
+	dl->AddText(ImVec2(px + 14.f, py + (h - ImGui::CalcTextSize(title).y) * 0.5f), title_col, title);
+}
+
+inline bool render_popup_close_button(ImDrawList* dl, float px, float py, float pw, float header_h,
+									  float fa, float& hover_anim, float dt)
+{
+	float btn_sz = 20.f;
+	float bx = px + pw - btn_sz - 8.f;
+	float by = py + (header_h - btn_sz) * 0.5f;
+	ImVec2 rmin(bx, by);
+	ImVec2 rmax(bx + btn_sz, by + btn_sz);
+	bool hov = ImGui::IsMouseHoveringRect(rmin, rmax, false);
+	bool clicked = hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+
+	hover_anim = smooth_lerp(hover_anim, hov ? 1.f : 0.f, 14.f, dt);
+
+	if (hover_anim > 0.01f)
+		dl->AddRectFilled(rmin, rmax,
+			IM_COL32(200, 60, 60, static_cast<int>(hover_anim * 80 * fa)), 4.f);
+
+	float cx = bx + btn_sz * 0.5f;
+	float cy = by + btn_sz * 0.5f;
+	float s = 5.f;
+	ImU32 xc = IM_COL32(180, 180, 200, static_cast<int>((140 + hover_anim * 115) * fa));
+	dl->AddLine(ImVec2(cx - s, cy - s), ImVec2(cx + s, cy + s), xc, 1.5f);
+	dl->AddLine(ImVec2(cx + s, cy - s), ImVec2(cx - s, cy + s), xc, 1.5f);
+
+	return clicked;
+}
+
+inline void render_donut_chart(ImDrawList* dl, float cx, float cy, float radius, float thickness,
+							   const float* fractions, const ImU32* colors, int segment_count,
+							   float alpha, const char* center_label = nullptr)
+{
+	const int arc_segments = 64;
+	const float start_angle = -1.5707963f;
+	float angle = start_angle;
+
+	for (int s = 0; s < segment_count; ++s) {
+		float sweep = fractions[s] * 6.2831853f;
+		int segs_for_this = std::max(2, static_cast<int>(static_cast<float>(arc_segments) * fractions[s]));
+		ImU32 col = theme_alpha(colors[s], alpha);
+
+		for (int i = 0; i < segs_for_this; ++i) {
+			float t0 = angle + (static_cast<float>(i) / segs_for_this) * sweep;
+			float t1 = angle + (static_cast<float>(i + 1) / segs_for_this) * sweep;
+			ImVec2 outer0(cx + std::cos(t0) * radius, cy + std::sin(t0) * radius);
+			ImVec2 outer1(cx + std::cos(t1) * radius, cy + std::sin(t1) * radius);
+			ImVec2 inner0(cx + std::cos(t0) * (radius - thickness), cy + std::sin(t0) * (radius - thickness));
+			ImVec2 inner1(cx + std::cos(t1) * (radius - thickness), cy + std::sin(t1) * (radius - thickness));
+			dl->AddQuadFilled(outer0, outer1, inner1, inner0, col);
+		}
+		angle += sweep;
+	}
+
+	if (center_label) {
+		ImVec2 tsz = ImGui::CalcTextSize(center_label);
+		dl->AddText(ImVec2(cx - tsz.x * 0.5f, cy - tsz.y * 0.5f),
+			IM_COL32(200, 205, 220, static_cast<int>(200 * alpha)), center_label);
+	}
+}
+
+inline void render_status_pill(ImDrawList* dl, float x, float y,
+							   const char* text, ImU32 color, float alpha,
+							   float time = 0.f, bool pulsing = false)
+{
+	ImVec2 tsz = ImGui::CalcTextSize(text);
+	float pad_x = 8.f;
+	float pad_y = 2.f;
+	float w = tsz.x + pad_x * 2.f + (pulsing ? 12.f : 0.f);
+	float h = tsz.y + pad_y * 2.f;
+	float rounding = h * 0.5f;
+
+	int cr = (color >> IM_COL32_R_SHIFT) & 0xFF;
+	int cg = (color >> IM_COL32_G_SHIFT) & 0xFF;
+	int cb = (color >> IM_COL32_B_SHIFT) & 0xFF;
+
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+		IM_COL32(cr, cg, cb, static_cast<int>(30 * alpha)), rounding);
+	dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h),
+		IM_COL32(cr, cg, cb, static_cast<int>(80 * alpha)), rounding, 0, 1.f);
+
+	float text_x = x + pad_x;
+	if (pulsing) {
+		float pulse = (std::sin(time * 4.f) + 1.f) * 0.5f;
+		float dot_cx = x + 10.f;
+		float dot_cy = y + h * 0.5f;
+		dl->AddCircleFilled(ImVec2(dot_cx, dot_cy), 3.f + pulse * 1.f,
+			IM_COL32(cr, cg, cb, static_cast<int>((150 + pulse * 105) * alpha)), 12);
+		text_x += 12.f;
+	}
+
+	dl->AddText(ImVec2(text_x, y + pad_y),
+		IM_COL32(cr, cg, cb, static_cast<int>(220 * alpha)), text);
+}
+
+inline bool render_toolbar_button(ImDrawList* dl, const char* label, float x, float y,
+								  float ar, float ag, float ab, float alpha,
+								  float& hover_anim, float dt,
+								  bool active = false, bool disabled = false)
+{
+	ImVec2 tsz = ImGui::CalcTextSize(label);
+	float pad = 8.f;
+	float w = tsz.x + pad * 2.f;
+	float h = 22.f;
+
+	ImVec2 rmin(x, y);
+	ImVec2 rmax(x + w, y + h);
+	bool hovered = !disabled && ImGui::IsMouseHoveringRect(rmin, rmax, false);
+	bool clicked = hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+
+	float target = active ? 1.f : (hovered ? 0.7f : 0.f);
+	hover_anim = smooth_lerp(hover_anim, target, 14.f, dt);
+
+	float bg_a = hover_anim * 0.35f;
+	if (bg_a > 0.01f)
+		dl->AddRectFilled(rmin, rmax,
+			IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+					 static_cast<int>(ab * 255), static_cast<int>(bg_a * alpha * 255)), 4.f);
+
+	if (active)
+		dl->AddRectFilled(ImVec2(x, y + h - 2.f), ImVec2(x + w, y + h),
+			IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+					 static_cast<int>(ab * 255), static_cast<int>(180 * alpha)), 1.f);
+
+	float text_a = disabled ? 0.3f : (0.55f + hover_anim * 0.45f);
+	dl->AddText(ImVec2(x + pad, y + (h - tsz.y) * 0.5f),
+		IM_COL32(255, 255, 255, static_cast<int>(text_a * alpha * 255)), label);
+
+	return clicked && !disabled;
+}
+
+inline float toolbar_button_width(const char* label)
+{
+	return ImGui::CalcTextSize(label).x + 16.f;
+}
+
+inline void render_collapsible_header(ImDrawList* dl, float x, float y, float w, float h,
+									  const char* title, bool expanded, float& arrow_anim,
+									  float ar, float ag, float ab, float alpha, float dt)
+{
+	arrow_anim = smooth_lerp(arrow_anim, expanded ? 1.f : 0.f, 12.f, dt);
+
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+		IM_COL32(28, 30, 42, static_cast<int>(220 * alpha)));
+	render_gradient_header(dl, x, y, w, h, ar, ag, ab, alpha * 0.2f);
+	dl->AddLine(ImVec2(x, y + h - 1.f), ImVec2(x + w, y + h - 1.f),
+		IM_COL32(50, 55, 70, static_cast<int>(80 * alpha)));
+
+	float arrow_cx = x + 14.f;
+	float arrow_cy = y + h * 0.5f;
+	float angle = arrow_anim * 1.5707963f;
+	float sz = 4.f;
+
+	float ca = std::cos(angle);
+	float sa = std::sin(angle);
+
+	ImVec2 p0(arrow_cx + (-sz) * ca - (-sz) * sa, arrow_cy + (-sz) * sa + (-sz) * ca);
+	ImVec2 p1(arrow_cx + (sz) * ca - (0.f) * sa, arrow_cy + (sz) * sa + (0.f) * ca);
+	ImVec2 p2(arrow_cx + (-sz) * ca - (sz) * sa, arrow_cy + (-sz) * sa + (sz) * ca);
+
+	ImU32 arrow_col = IM_COL32(static_cast<int>(ar * 200 + 55), static_cast<int>(ag * 200 + 55),
+								static_cast<int>(ab * 200 + 55), static_cast<int>(180 * alpha));
+	dl->AddTriangleFilled(p0, p1, p2, arrow_col);
+
+	dl->AddText(ImVec2(x + 28.f, y + (h - ImGui::CalcTextSize(title).y) * 0.5f),
+		IM_COL32(220, 225, 235, static_cast<int>(220 * alpha)), title);
+}
+
+inline void render_color_legend(ImDrawList* dl, float x, float y,
+								const char* const* labels, const ImU32* colors, int count, float alpha)
+{
+	float cx = x;
+	float dot_r = 4.f;
+	float spacing = 6.f;
+	float item_gap = 16.f;
+
+	for (int i = 0; i < count; ++i) {
+		dl->AddCircleFilled(ImVec2(cx + dot_r, y + dot_r + 1.f), dot_r,
+			theme_alpha(colors[i], alpha), 12);
+		cx += dot_r * 2.f + spacing;
+		ImVec2 tsz = ImGui::CalcTextSize(labels[i]);
+		dl->AddText(ImVec2(cx, y),
+			IM_COL32(180, 185, 195, static_cast<int>(180 * alpha)), labels[i]);
+		cx += tsz.x + item_gap;
+	}
+}
+
+inline void render_confidence_bar(ImDrawList* dl, float x, float y, float w, float h,
+								  float confidence, float alpha)
+{
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+		IM_COL32(30, 32, 40, static_cast<int>(180 * alpha)), h * 0.5f);
+
+	float fill = w * std::clamp(confidence, 0.f, 1.f);
+	if (fill > 1.f) {
+		ImU32 col;
+		if (confidence > 0.75f)
+			col = IM_COL32(80, 200, 120, static_cast<int>(200 * alpha));
+		else if (confidence > 0.5f)
+			col = IM_COL32(220, 200, 80, static_cast<int>(200 * alpha));
+		else
+			col = IM_COL32(230, 120, 80, static_cast<int>(200 * alpha));
+		dl->AddRectFilled(ImVec2(x, y), ImVec2(x + fill, y + h), col, h * 0.5f);
+	}
+}
+
+inline void render_mini_sparkline(ImDrawList* dl, float x, float y, float w, float h,
+								  const float* vals, int count, ImU32 color, float alpha)
+{
+	if (!vals || count < 2) return;
+	float mx = 0.001f;
+	for (int i = 0; i < count; ++i)
+		if (vals[i] > mx) mx = vals[i];
+
+	float step = w / static_cast<float>(count - 1);
+	ImU32 lc = theme_alpha(color, alpha);
+	ImU32 fc = theme_alpha(color, alpha * 0.15f);
+
+	for (int i = 0; i < count - 1; ++i) {
+		float x0 = x + step * static_cast<float>(i);
+		float x1 = x + step * static_cast<float>(i + 1);
+		float y0 = y + h - (vals[i] / mx) * h;
+		float y1 = y + h - (vals[i + 1] / mx) * h;
+		dl->AddLine(ImVec2(x0, y0), ImVec2(x1, y1), lc, 1.f);
+		ImVec2 quad[4] = { ImVec2(x0, y0), ImVec2(x1, y1), ImVec2(x1, y + h), ImVec2(x0, y + h) };
+		dl->AddConvexPolyFilled(quad, 4, fc);
+	}
+}
+
+inline void render_severity_badge(ImDrawList* dl, float x, float y, int severity, float alpha)
+{
+	const char* labels[] = { "LOW", "MED", "HIGH", "CRIT" };
+	ImU32 colors[] = {
+		IM_COL32(80, 200, 120, static_cast<int>(200 * alpha)),
+		IM_COL32(220, 200, 80, static_cast<int>(200 * alpha)),
+		IM_COL32(240, 140, 60, static_cast<int>(200 * alpha)),
+		IM_COL32(230, 70, 70, static_cast<int>(200 * alpha))
+	};
+	ImU32 bg_colors[] = {
+		IM_COL32(80, 200, 120, static_cast<int>(30 * alpha)),
+		IM_COL32(220, 200, 80, static_cast<int>(30 * alpha)),
+		IM_COL32(240, 140, 60, static_cast<int>(30 * alpha)),
+		IM_COL32(230, 70, 70, static_cast<int>(30 * alpha))
+	};
+	int idx = std::clamp(severity, 0, 3);
+	render_badge(dl, labels[idx], x, y, bg_colors[idx], colors[idx]);
+}
+
+inline void render_protection_badge(ImDrawList* dl, float x, float y, uint32_t protect, float alpha)
+{
+	bool exec = (protect & 0xF0) != 0;
+	bool write = (protect == 0x04 || protect == 0x08 || protect == 0x40 || protect == 0x80);
+	bool read = (protect != 0);
+
+	float cx = x;
+	if (read) {
+		render_badge(dl, "R", cx, y,
+			IM_COL32(80, 140, 220, static_cast<int>(30 * alpha)),
+			IM_COL32(80, 140, 220, static_cast<int>(200 * alpha)));
+		cx += ImGui::CalcTextSize("R").x + 14.f;
+	}
+	if (write) {
+		render_badge(dl, "W", cx, y,
+			IM_COL32(80, 200, 80, static_cast<int>(30 * alpha)),
+			IM_COL32(80, 200, 80, static_cast<int>(200 * alpha)));
+		cx += ImGui::CalcTextSize("W").x + 14.f;
+	}
+	if (exec) {
+		render_badge(dl, "X", cx, y,
+			IM_COL32(220, 80, 80, static_cast<int>(30 * alpha)),
+			IM_COL32(220, 80, 80, static_cast<int>(200 * alpha)));
+	}
+}
+
+inline void render_formatted_size(ImDrawList* dl, float x, float y, uint64_t bytes,
+								  float alpha)
+{
+	char buf[32];
+	if (bytes >= 1024ULL * 1024ULL * 1024ULL)
+		std::snprintf(buf, sizeof(buf), "%.1f GB", static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
+	else if (bytes >= 1024ULL * 1024ULL)
+		std::snprintf(buf, sizeof(buf), "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+	else if (bytes >= 1024ULL)
+		std::snprintf(buf, sizeof(buf), "%.1f KB", static_cast<double>(bytes) / 1024.0);
+	else
+		std::snprintf(buf, sizeof(buf), "%llu B", static_cast<unsigned long long>(bytes));
+
+	dl->AddText(ImVec2(x, y),
+		IM_COL32(200, 205, 220, static_cast<int>(200 * alpha)), buf);
+}
+
+inline void render_hex_address(ImDrawList* dl, float x, float y, uint64_t addr, float alpha,
+							   ImU32 color = 0)
+{
+	char buf[20];
+	std::snprintf(buf, sizeof(buf), "%016llX", static_cast<unsigned long long>(addr));
+	if (color == 0)
+		color = IM_COL32(229, 192, 123, static_cast<int>(220 * alpha));
+	else
+		color = theme_alpha(color, alpha);
+	dl->AddText(ImVec2(x, y), color, buf);
+}
+
+inline void render_context_menu_bg(ImDrawList* dl, float x, float y, float w, float h,
+								   float fade, float alpha)
+{
+	float fa = alpha * fade;
+	float t = ease_out_back(std::clamp(fade * 1.3f, 0.f, 1.f));
+	float scale = 0.95f + 0.05f * t;
+	float pw = w * scale;
+	float ph = h * scale;
+	float px = x + (w - pw) * 0.5f;
+	float py = y + (h - ph) * 0.5f;
+
+	dl->AddRectFilled(ImVec2(px - 2.f, py + 2.f), ImVec2(px + pw + 2.f, py + ph + 4.f),
+		IM_COL32(0, 0, 0, static_cast<int>(60 * fa)), 8.f);
+	dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
+		IM_COL32(26, 28, 38, static_cast<int>(245 * fa)), 6.f);
+	dl->AddRect(ImVec2(px, py), ImVec2(px + pw, py + ph),
+		IM_COL32(60, 65, 80, static_cast<int>(100 * fa)), 6.f, 0, 1.f);
+}
 
 }

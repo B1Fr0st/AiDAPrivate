@@ -62,20 +62,12 @@ inline void refresh()
 			e.tid = t.tid;
 			e.priority = t.priority;
 
-			/* The kernel driver returns an RIP for each thread, but it is
-			   captured from the ETHREAD and may be zero for running threads
-			   whose context lives in registers, not in the trap frame.
-			   For those threads we briefly suspend → read context → resume
-			   to obtain accurate RIP/RSP values.  The suspend window is
-			   sub-microsecond; this is standard debugger practice. */
+
 			e.rip = t.rip;
 			e.rsp = 0;
 			e.entry_point = 0;
 
-			/* Determine suspended state from the kernel-reported thread
-			   state.  State == 5 is "Waiting / Suspended" in the Windows
-			   scheduler (KTHREAD.State).  State == 0 is "Initialized",
-			   state == 2 is "Running", etc. */
+
 			bool was_already_suspended = (t.state == 5);
 			e.suspended = was_already_suspended;
 
@@ -90,10 +82,7 @@ inline void refresh()
 			else
 				e.state_text = "Waiting";
 
-			/* If the kernel-provided RIP is zero (running thread) or we
-			   want the RSP as well, suspend briefly and read full context.
-			   Skip for threads that are already suspended — their trap frame
-			   RIP from the kernel is accurate. */
+
 			if (e.rip == 0 && !was_already_suspended) {
 				if (driver_bridge::suspend_thread(t.tid, nullptr)) {
 					driver_bridge::thread_context_t ctx{};
@@ -104,8 +93,8 @@ inline void refresh()
 					driver_bridge::resume_thread(t.tid, nullptr);
 				}
 			} else if (was_already_suspended) {
-				/* Already suspended — safe to read context without
-				   additional suspend/resume. */
+
+
 				driver_bridge::thread_context_t ctx{};
 				if (driver_bridge::get_thread_context(t.tid, ctx)) {
 					if (e.rip == 0)
@@ -114,8 +103,7 @@ inline void refresh()
 				}
 			}
 
-			/* Resolve module name from RIP — now that RIP is populated
-			   this lookup will actually match. */
+
 			for (auto& m : modules) {
 				if (e.rip >= m.base && e.rip < m.base + m.size) {
 					e.module_name = m.name;
@@ -166,8 +154,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float row_h = 20.f;
 	float col_header_h = 22.f;
 
-	dl->AddRectFilled(ImVec2(pos_x, pos_y), ImVec2(pos_x + width, pos_y + header_h),
-					  IM_COL32(25, 27, 35, static_cast<int>(240 * alpha)));
+	ui_anim::render_toolbar(dl, pos_x, pos_y, width, header_h, ar, ag, ab, alpha);
 	dl->AddText(ImVec2(pos_x + 10.f, pos_y + 8.f),
 				IM_COL32(200, 200, 210, static_cast<int>(220 * alpha)), "Threads");
 
@@ -207,16 +194,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float col_prio = pos_x + 660.f;
 	float col_state = pos_x + 730.f;
 
-	dl->AddRectFilled(ImVec2(pos_x, table_y), ImVec2(pos_x + width, table_y + col_header_h),
-					  IM_COL32(30, 32, 40, static_cast<int>(220 * alpha)));
-	ImU32 hdr_col = IM_COL32(160, 160, 175, static_cast<int>(200 * alpha));
-	dl->AddText(ImVec2(col_tid, table_y + 3.f), hdr_col, "TID");
-	dl->AddText(ImVec2(col_entry, table_y + 3.f), hdr_col, "Entry");
-	dl->AddText(ImVec2(col_rip, table_y + 3.f), hdr_col, "RIP");
-	dl->AddText(ImVec2(col_rsp, table_y + 3.f), hdr_col, "RSP");
-	dl->AddText(ImVec2(col_module, table_y + 3.f), hdr_col, "Module");
-	dl->AddText(ImVec2(col_prio, table_y + 3.f), hdr_col, "Priority");
-	dl->AddText(ImVec2(col_state, table_y + 3.f), hdr_col, "State");
+	{
+		ui_anim::table_col_t cols[] = {{"TID", 70.f}, {"Entry", 140.f}, {"RIP", 160.f}, {"RSP", 150.f}, {"Module", 130.f}, {"Priority", 70.f}, {"State", 80.f}};
+		ui_anim::render_table_header(dl, pos_x, table_y, width, col_header_h, cols, 7, ar, ag, ab, alpha);
+	}
 
 	float list_y = table_y + col_header_h;
 	float list_h = height - header_h - col_header_h;

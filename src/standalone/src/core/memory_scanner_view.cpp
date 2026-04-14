@@ -53,13 +53,7 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a,
 	ImU32 ac_col    = IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
 								static_cast<int>(ab*255), static_cast<int>(220*a));
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + 34.f),
-		IM_COL32(22, 24, 30, static_cast<int>(200*a)));
-	dl->AddRectFilledMultiColor(ImVec2(ox, oy), ImVec2(ox + w, oy + 34.f),
-		IM_COL32(static_cast<int>(ar*40), static_cast<int>(ag*40), static_cast<int>(ab*40), static_cast<int>(15*a)),
-		IM_COL32(static_cast<int>(ar*40), static_cast<int>(ag*40), static_cast<int>(ab*40), 0),
-		IM_COL32(0, 0, 0, 0),
-		IM_COL32(0, 0, 0, 0));
+	ui_anim::render_toolbar(dl, ox, oy, w, 34.f, a, ar, ag, ab);
 	dl->AddLine(ImVec2(ox, oy + 34.f), ImVec2(ox + w, oy + 34.f),
 		IM_COL32(60, 65, 75, static_cast<int>(80*a)));
 
@@ -146,30 +140,17 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a,
 	cx += 50.f;
 
 
+	static float scan_btn_hover[4] = {};
+	int scan_btn_idx = 0;
+	float sdt = ImGui::GetIO().DeltaTime;
 	auto scan_btn = [&](const char* label, bool enabled) -> bool {
-		ImVec2 ts = ImGui::CalcTextSize(label);
-		float bw = ts.x + 16.f;
-		float bh = 22.f;
-		ImVec2 bmin(cx, cy);
-		ImVec2 bmax(cx + bw, cy + bh);
-		bool bhov = enabled && ImGui::IsMouseHoveringRect(bmin, bmax, false);
-		ImU32 bg = enabled ? (bhov ? IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-			static_cast<int>(ab*255), static_cast<int>(60*a))
-			: IM_COL32(40, 42, 50, static_cast<int>(200*a)))
-			: IM_COL32(30, 30, 35, static_cast<int>(100*a));
-		dl->AddRectFilled(bmin, bmax, bg, 4.f);
-		if (bhov) {
-			dl->AddRectFilled(ImVec2(bmin.x - 2.f, bmin.y - 2.f),
-				ImVec2(bmax.x + 2.f, bmax.y + 2.f),
-				IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-					static_cast<int>(ab*255), static_cast<int>(15*a)), 6.f);
-		}
-		dl->AddRect(bmin, bmax, enabled ? IM_COL32(80, 85, 95, static_cast<int>(140*a))
-			: IM_COL32(50, 50, 55, static_cast<int>(80*a)), 4.f);
-		ImU32 tc = enabled ? (bhov ? ac_col : text_col) : dim_col;
-		dl->AddText(ImVec2(cx + (bw - ts.x)*0.5f, cy + (bh - ts.y)*0.5f), tc, label);
+		float bw = ui_anim::toolbar_button_width(label);
+		int idx = scan_btn_idx++;
+		if (idx >= 4) idx = 3;
+		bool clicked = ui_anim::render_toolbar_button(dl, label, cx, cy,
+			ar, ag, ab, a, scan_btn_hover[idx], sdt, false, !enabled);
 		cx += bw + 6.f;
-		return bhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+		return clicked;
 	};
 
 	bool scanning = sc.scanning.load();
@@ -236,24 +217,17 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 	float row_h = 20.f;
 	float hdr_h = 22.f;
 
-
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + hdr_h),
-		IM_COL32(25, 27, 35, static_cast<int>(220*a)));
-	ui_anim::render_gradient_header(dl, ox, oy, w, hdr_h, ar, ag, ab, a * 0.35f);
-	dl->AddLine(ImVec2(ox, oy + hdr_h - 1.f), ImVec2(ox + w, oy + hdr_h - 1.f),
-		IM_COL32(static_cast<int>(ar*60), static_cast<int>(ag*60),
-				 static_cast<int>(ab*60), static_cast<int>(80*a)));
 	float col_addr_w = 130.f;
 	float col_val_w  = 120.f;
 	float col_prev_w = 120.f;
 	float col_mod_w  = w - col_addr_w - col_val_w - col_prev_w;
 	if (col_mod_w < 40.f) col_mod_w = 40.f;
 
-	float hx = ox + 6.f;
-	dl->AddText(ImVec2(hx, oy + 4.f), dim_col, "Address");  hx += col_addr_w;
-	dl->AddText(ImVec2(hx, oy + 4.f), dim_col, "Value");    hx += col_val_w;
-	dl->AddText(ImVec2(hx, oy + 4.f), dim_col, "Previous"); hx += col_prev_w;
-	dl->AddText(ImVec2(hx, oy + 4.f), dim_col, "Module");
+	ui_anim::table_col_t result_cols[] = {
+		{"Address", col_addr_w}, {"Value", col_val_w},
+		{"Previous", col_prev_w}, {"Module", col_mod_w}
+	};
+	ui_anim::render_table_header(dl, ox, oy, w, hdr_h, result_cols, 4, ar, ag, ab, a);
 
 	{
 		char count_buf[32];
@@ -298,12 +272,10 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 		float ry = body_y + static_cast<float>(i) * row_h - ui.result_scroll_y;
 		if (ry + row_h < body_y || ry > body_y + body_h) continue;
 
-		if (i & 1)
-			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h),
-				IM_COL32(255, 255, 255, 3));
-
 		bool sel = (ui.selected_result == i);
-		bool hov = row_hover(dl, ox, ry, ox + w, ry + row_h, a, sel, ar, ag, ab);
+		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h), false);
+		ui_anim::render_table_row(dl, ox, ry, w, row_h,
+			{sel, hov, i, a, 1.f, ar, ag, ab});
 
 		auto& r = sc.results[static_cast<size_t>(i)];
 
@@ -399,12 +371,7 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 	float hdr_h = 22.f;
 
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + hdr_h),
-		IM_COL32(25, 27, 35, static_cast<int>(220*a)));
-	ui_anim::render_gradient_header(dl, ox, oy, w, hdr_h, ar, ag, ab, a * 0.35f);
-	dl->AddLine(ImVec2(ox, oy + hdr_h - 1.f), ImVec2(ox + w, oy + hdr_h - 1.f),
-		IM_COL32(static_cast<int>(ar*60), static_cast<int>(ag*60),
-				 static_cast<int>(ab*60), static_cast<int>(80*a)));
+	ui_anim::render_toolbar(dl, ox, oy, w, hdr_h, a, ar, ag, ab);
 	dl->AddText(ImVec2(ox + 6.f, oy + 4.f), dim_col, "Address List");
 
 
@@ -462,12 +429,10 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 		float ry = body_y + static_cast<float>(i) * row_h - ui.address_scroll_y;
 		if (ry + row_h < body_y || ry > body_y + body_h) continue;
 
-		if (i & 1)
-			dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h),
-				IM_COL32(255, 255, 255, 2));
-
 		bool sel = (ui.selected_address == i);
-		bool hov = row_hover(dl, ox, ry, ox + w, ry + row_h, a, sel, ar, ag, ab);
+		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h), false);
+		ui_anim::render_table_row(dl, ox, ry, w, row_h,
+			{sel, hov, i, a, 1.f, ar, ag, ab});
 
 		auto& e = sc.address_list[static_cast<size_t>(i)];
 		float rx = ox + 6.f;

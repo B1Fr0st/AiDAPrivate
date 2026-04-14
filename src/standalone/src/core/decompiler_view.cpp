@@ -114,9 +114,9 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	bool has_right_panel = (width > 600.f);
 	float code_w = has_right_panel ? (width - right_panel_w) : width;
+	float dt = ImGui::GetIO().DeltaTime;
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + toolbar_h),
-	                  IM_COL32(25, 25, 35, static_cast<int>(230 * alpha)));
+	ui_anim::render_toolbar(dl, ox, oy, width, toolbar_h, alpha, accent_r, accent_g, accent_b);
 	dl->AddLine(ImVec2(ox, oy + toolbar_h), ImVec2(ox + width, oy + toolbar_h),
 	            IM_COL32(50, 50, 65, static_cast<int>(180 * alpha)));
 
@@ -152,14 +152,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			ImVec2 title_size = ImGui::CalcTextSize(title);
 			float badge_x = ox + 10.f + title_size.x + 10.f;
 			float badge_y = oy + (toolbar_h - 16.f) * 0.5f;
-			ImVec2 label_size = ImGui::CalcTextSize(mode_label);
-			float badge_w = label_size.x + 10.f;
-			float badge_h = 16.f;
-			dl->AddRectFilled(ImVec2(badge_x, badge_y),
-			                  ImVec2(badge_x + badge_w, badge_y + badge_h),
-			                  mode_color, 3.f);
-			dl->AddText(ImVec2(badge_x + 5.f, badge_y + 1.f),
-			            IM_COL32(0, 0, 0, 240), mode_label);
+			ui_anim::render_badge(dl, mode_label, badge_x, badge_y, mode_color, IM_COL32(0, 0, 0, 240));
 		}
 	}
 
@@ -168,19 +161,15 @@ void render(float pos_x, float pos_y, float width, float height,
 	float btn_h = 22.f;
 	float btn_y = oy + (toolbar_h - btn_h) * 0.5f;
 
+	static float btn_hover[12] = {};
+	int btn_idx = 0;
 	auto toolbar_button = [&](const char* label, float& bx) -> bool {
-		ImVec2 ts = ImGui::CalcTextSize(label);
-		float w = ts.x + 16.f;
+		float w = ui_anim::toolbar_button_width(label);
 		bx -= w + 4.f;
-		ImVec2 p0(bx, btn_y);
-		ImVec2 p1(bx + w, btn_y + btn_h);
-		bool hov = ImGui::IsMouseHoveringRect(p0, p1, false);
-		dl->AddRectFilled(p0, p1,
-		    hov ? IM_COL32(70, 70, 90, static_cast<int>(180 * alpha))
-		        : IM_COL32(40, 40, 55, static_cast<int>(160 * alpha)), 4.f);
-		dl->AddText(ImVec2(bx + 8.f, btn_y + (btn_h - ts.y) * 0.5f),
-		            IM_COL32(200, 200, 210, static_cast<int>(220 * alpha)), label);
-		return hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+		int idx = btn_idx++;
+		if (idx >= 12) idx = 11;
+		return ui_anim::render_toolbar_button(dl, label, bx, btn_y,
+			accent_r, accent_g, accent_b, alpha, btn_hover[idx], dt);
 	};
 
 	if (toolbar_button("Copy", btn_x)) {
@@ -280,19 +269,24 @@ void render(float pos_x, float pos_y, float width, float height,
 		dl->AddText(ImVec2(ox + 10.f, code_top + 4.f), accent_col, "Batch Decompile — one hex address per line");
 
 		ImGui::SetCursorScreenPos(ImVec2(ox + 10.f, code_top + 22.f));
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.1f, 0.1f, 0.14f, alpha));
-		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.83f, 0.83f, 0.83f, alpha));
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(200 * alpha)));
+		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(120 * alpha)));
+		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(210, 210, 220, static_cast<int>(220 * alpha)));
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 		ImGui::PushItemWidth(code_w - 100.f);
 		ImGui::InputTextMultiline("##batch_addrs", batch_input, sizeof(batch_input),
 		                          ImVec2(code_w - 100.f, batch_panel_h - 30.f));
 		ImGui::PopItemWidth();
-		ImGui::PopStyleColor(2);
+		ImGui::PopStyleVar(2);
+		ImGui::PopStyleColor(3);
 
 		ImGui::SetCursorScreenPos(ImVec2(ox + code_w - 80.f, code_top + 22.f));
-		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(accent_r, accent_g, accent_b, 0.7f * alpha));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(accent_r, accent_g, accent_b, 0.9f * alpha));
-		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(accent_r, accent_g, accent_b, 1.0f * alpha));
-		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, alpha));
+		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(static_cast<int>(accent_r * 140), static_cast<int>(accent_g * 140), static_cast<int>(accent_b * 140), static_cast<int>(200 * alpha)));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(static_cast<int>(accent_r * 180), static_cast<int>(accent_g * 180), static_cast<int>(accent_b * 180), static_cast<int>(220 * alpha)));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(static_cast<int>(accent_r * 100), static_cast<int>(accent_g * 100), static_cast<int>(accent_b * 100), static_cast<int>(240 * alpha)));
+		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, static_cast<int>(255 * alpha)));
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 
 		if (ImGui::Button("Run##batch", ImVec2(70.f, 30.f))) {
 			std::vector<uint64_t> addrs;
@@ -314,6 +308,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			}
 		}
 
+		ImGui::PopStyleVar();
 		ImGui::PopStyleColor(4);
 
 		code_top += batch_panel_h;
@@ -408,12 +403,10 @@ void render(float pos_x, float pos_y, float width, float height,
 			            IM_COL32(220, 80, 80, static_cast<int>(220 * alpha)),
 			            st.current.error_text.c_str());
 		} else if (st.current.pseudocode.empty()) {
-			const char* hint = "Right-click a function in Disassembly or CFG and select 'Decompile Function'";
-			ImVec2 ts = ImGui::CalcTextSize(hint);
-			float cx = ox + code_w * 0.5f;
-			float cy = code_top + code_h * 0.5f;
-			dl->AddText(ImVec2(cx - ts.x * 0.5f, cy - ts.y * 0.5f),
-			            IM_COL32(100, 100, 120, static_cast<int>(150 * alpha)), hint);
+			ui_anim::render_empty_state(dl, ox, code_top, code_w, code_h,
+				"Right-click a function in Disassembly view to decompile",
+				accent_r, accent_g, accent_b, alpha,
+				static_cast<float>(ImGui::GetTime()));
 		} else {
 			auto lines = split_lines(st.current.pseudocode);
 			static auto cpp_lang = syntax::lang_cpp();
@@ -488,8 +481,8 @@ void render(float pos_x, float pos_y, float width, float height,
 
 		dl->AddLine(ImVec2(rp_x, rp_y), ImVec2(rp_x, rp_y + rp_h),
 		            IM_COL32(50, 50, 65, static_cast<int>(180 * alpha)));
-		dl->AddRectFilled(ImVec2(rp_x, rp_y), ImVec2(rp_x + right_panel_w, rp_y + rp_h),
-		                  IM_COL32(22, 22, 30, static_cast<int>(220 * alpha)));
+		ui_anim::render_panel_card(dl, rp_x, rp_y, right_panel_w, rp_h,
+		                           accent_r, accent_g, accent_b, alpha, 0.f, true);
 
 		float py = rp_y + 8.f;
 
@@ -528,7 +521,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
 			float wrap = right_panel_w - 20.f;
 			ImVec2 ps = ImGui::CalcTextSize(st.current.parameters.c_str(), nullptr, false, wrap);
-			dl->AddText(nullptr, 0.f, ImVec2(rp_x + 14.f, py), 
+			dl->AddText(nullptr, 0.f, ImVec2(rp_x + 14.f, py),
 			            IM_COL32(86, 182, 194, static_cast<int>(200 * alpha)),
 			            st.current.parameters.c_str(),
 			            st.current.parameters.c_str() + st.current.parameters.size(),

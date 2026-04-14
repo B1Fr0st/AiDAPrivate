@@ -371,6 +371,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			edge_col = IM_COL32(140, 140, 160, static_cast<int>(120 * alpha));
 		}
 
+		dl->AddBezierCubic(p1, p2, p3, p4,
+			IM_COL32((edge_col >> IM_COL32_R_SHIFT) & 0xFF, (edge_col >> IM_COL32_G_SHIFT) & 0xFF,
+					 (edge_col >> IM_COL32_B_SHIFT) & 0xFF, static_cast<int>(40 * alpha)),
+			4.f * z);
 		dl->AddBezierCubic(p1, p2, p3, p4, edge_col, 1.5f * z);
 
 		float arrow_sz = 5.f * z;
@@ -411,12 +415,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			is_rip_block = true;
 
 		ImU32 bg_col = IM_COL32(28, 30, 38, static_cast<int>(220 * alpha));
+		dl->AddRectFilled(ImVec2(tl.x + 3.f * z, tl.y + 3.f * z),
+						  ImVec2(br.x + 3.f * z, br.y + 3.f * z),
+						  IM_COL32(0, 0, 0, static_cast<int>(60 * alpha)), 4.f * z);
 		dl->AddRectFilled(tl, br, bg_col, 4.f * z);
 
 		if (is_rip_block) {
 			ImU32 glow = IM_COL32(ar, ag, ab, static_cast<int>(60 * alpha));
 			dl->AddRectFilled(tl, br, glow, 4.f * z);
 			dl->AddRect(tl, br, IM_COL32(ar, ag, ab, static_cast<int>(200 * alpha)), 4.f * z, 0, 2.f * z);
+		} else if (blk.is_entry) {
+			ImU32 entry_glow = IM_COL32(ar, ag, ab, static_cast<int>(30 * alpha));
+			dl->AddRectFilled(tl, br, entry_glow, 4.f * z);
+			dl->AddRect(tl, br, IM_COL32(ar, ag, ab, static_cast<int>(140 * alpha)), 4.f * z, 0, 1.5f * z);
 		} else if (n.id == g_state.selected_block) {
 			dl->AddRect(tl, br, IM_COL32(ar, ag, ab, static_cast<int>(160 * alpha)), 4.f * z, 0, 1.5f * z);
 		} else {
@@ -461,6 +472,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
 				g_state.navigate_to = blk.start_addr;
 		}
+	}
+
+	{
+		char zoom_buf[16];
+		snprintf(zoom_buf, sizeof(zoom_buf), "%.0f%%", g_state.zoom * 100.f);
+		ImVec2 zts = ImGui::CalcTextSize(zoom_buf);
+		float zx = pos_x + width - zts.x - 16.f;
+		float zy = pos_y + 8.f;
+		dl->AddRectFilled(ImVec2(zx - 6.f, zy - 2.f), ImVec2(zx + zts.x + 6.f, zy + zts.y + 2.f),
+			IM_COL32(20, 22, 30, static_cast<int>(180 * alpha)), 4.f);
+		dl->AddText(ImVec2(zx, zy), IM_COL32(160, 160, 170, static_cast<int>(200 * alpha)), zoom_buf);
 	}
 
 	dl->PopClipRect();

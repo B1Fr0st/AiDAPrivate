@@ -15,7 +15,7 @@ set(DEPS_DIR "${CMAKE_SOURCE_DIR}/.deps")
 set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
-set(ZYDIS_FEATURE_ENCODER OFF CACHE BOOL "" FORCE)
+set(ZYDIS_FEATURE_ENCODER ON CACHE BOOL "" FORCE)
 
 set(zydis_SOURCE_DIR "${DEPS_DIR}/zydis")
 set(zydis_BINARY_DIR "${CMAKE_BINARY_DIR}/.deps/zydis")
@@ -232,6 +232,7 @@ target_include_directories(libdecomp_aida PRIVATE
 target_compile_definitions(libdecomp_aida PRIVATE
     _CRT_SECURE_NO_WARNINGS
     NOMINMAX
+    AIDA_STANDALONE
 )
 if(MSVC)
     target_compile_options(libdecomp_aida PRIVATE /W0 /EHsc /MD)

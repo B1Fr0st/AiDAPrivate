@@ -44,10 +44,8 @@ inline void refresh()
 {
 	if (g_ui.loading.load())
 		return;
-	/* Validate kernel driver is connected and a process is attached
-	   before spawning a background thread.  Without this check the
-	   thread would call enumerate_modules() which requires the
-	   kernel LDR walk — failing silently and leaving loading=true. */
+
+
 	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0)
 		return;
 	g_ui.loading.store(true);
@@ -123,10 +121,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float row_h = 20.f;
 	float col_header_h = 22.f;
 
-	dl->AddRectFilled(ImVec2(pos_x, pos_y), ImVec2(pos_x + left_w, pos_y + header_h),
-					  IM_COL32(25, 27, 35, static_cast<int>(240 * alpha)));
+	ui_anim::render_toolbar(dl, pos_x, pos_y, left_w, header_h, ar, ag, ab, alpha);
 	dl->AddText(ImVec2(pos_x + 10.f, pos_y + 8.f),
-				IM_COL32(200, 200, 210, static_cast<int>(220 * alpha)), "Modules");
+				IM_COL32(static_cast<int>(ar * 200) + 55, static_cast<int>(ag * 200) + 55, static_cast<int>(ab * 200) + 55, static_cast<int>(220 * alpha)), "Modules");
 
 	float refresh_x = pos_x + 80.f;
 	ImVec2 btn_min(refresh_x, pos_y + 4.f);
@@ -145,12 +142,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float mod_col_size = pos_x + left_w * 0.75f;
 
 	float mod_table_y = pos_y + header_h;
-	dl->AddRectFilled(ImVec2(pos_x, mod_table_y), ImVec2(pos_x + left_w, mod_table_y + col_header_h),
-					  IM_COL32(30, 32, 40, static_cast<int>(220 * alpha)));
+	{
+		ui_anim::table_col_t cols[] = {{"Name", left_w * 0.45f - 10.f}, {"Base", left_w * 0.3f}, {"Size", left_w * 0.25f}};
+		ui_anim::render_table_header(dl, pos_x, mod_table_y, left_w, col_header_h, cols, 3, ar, ag, ab, alpha);
+	}
 	ImU32 hdr_col = IM_COL32(160, 160, 175, static_cast<int>(200 * alpha));
-	dl->AddText(ImVec2(mod_col_name, mod_table_y + 3.f), hdr_col, "Name");
-	dl->AddText(ImVec2(mod_col_base, mod_table_y + 3.f), hdr_col, "Base");
-	dl->AddText(ImVec2(mod_col_size, mod_table_y + 3.f), hdr_col, "Size");
 
 	float mod_list_y = mod_table_y + col_header_h;
 	float mod_list_h = height - header_h - col_header_h;
@@ -217,8 +213,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	float right_x = pos_x + left_w + 2.f;
 
-	dl->AddRectFilled(ImVec2(right_x, pos_y), ImVec2(right_x + right_w, pos_y + header_h),
-					  IM_COL32(25, 27, 35, static_cast<int>(240 * alpha)));
+	ui_anim::render_toolbar(dl, right_x, pos_y, right_w, header_h, ar, ag, ab, alpha);
 
 	const char* sub_labels[] = {"Exports", "Imports"};
 	float tab_x = right_x + 10.f;
@@ -260,11 +255,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float ec_name = right_x + 70.f;
 		float ec_addr = right_x + right_w * 0.65f;
 
-		dl->AddRectFilled(ImVec2(right_x, det_table_y), ImVec2(right_x + right_w, det_table_y + col_header_h),
-						  IM_COL32(30, 32, 40, static_cast<int>(220 * alpha)));
-		dl->AddText(ImVec2(ec_ord, det_table_y + 3.f), hdr_col, "Ordinal");
-		dl->AddText(ImVec2(ec_name, det_table_y + 3.f), hdr_col, "Name");
-		dl->AddText(ImVec2(ec_addr, det_table_y + 3.f), hdr_col, "Address");
+		{
+			ui_anim::table_col_t cols[] = {{"Ordinal", 60.f}, {"Name", right_w * 0.55f}, {"Address", right_w * 0.3f}};
+			ui_anim::render_table_header(dl, right_x, det_table_y, right_w, col_header_h, cols, 3, ar, ag, ab, alpha);
+		}
 
 		float det_list_y = det_table_y + col_header_h;
 		float det_list_h = height - header_h - col_header_h;
@@ -334,11 +328,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float ic_func = right_x + right_w * 0.3f;
 		float ic_addr = right_x + right_w * 0.7f;
 
-		dl->AddRectFilled(ImVec2(right_x, det_table_y), ImVec2(right_x + right_w, det_table_y + col_header_h),
-						  IM_COL32(30, 32, 40, static_cast<int>(220 * alpha)));
-		dl->AddText(ImVec2(ic_mod, det_table_y + 3.f), hdr_col, "Module");
-		dl->AddText(ImVec2(ic_func, det_table_y + 3.f), hdr_col, "Function");
-		dl->AddText(ImVec2(ic_addr, det_table_y + 3.f), hdr_col, "Address");
+		{
+			ui_anim::table_col_t cols[] = {{"Module", right_w * 0.3f - 10.f}, {"Function", right_w * 0.4f}, {"Address", right_w * 0.3f}};
+			ui_anim::render_table_header(dl, right_x, det_table_y, right_w, col_header_h, cols, 3, ar, ag, ab, alpha);
+		}
 
 		float det_list_y = det_table_y + col_header_h;
 		float det_list_h = height - header_h - col_header_h;

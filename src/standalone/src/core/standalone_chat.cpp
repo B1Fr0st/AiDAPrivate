@@ -521,6 +521,7 @@ void run_agentic(std::string user_message,
 
     const bool force_xml = g_sa_settings.force_xml_tools;
     std::string system_prompt = build_system_prompt(force_xml);
+
     const int max_turns = (std::max)(g_sa_settings.max_agentic_rounds, 1);
     int64_t budget_used = 0;
 

@@ -2,7 +2,7 @@ import os
 import re
 
 # Hardcoded target directory
-TARGET_DIR = r"C:\Users\ruar\Downloads\Rynz Ext\others"
+TARGET_DIR = r"C:\Users\ruar\Downloads"
 
 def extract_bytes_from_header(header_filename, output_filename):
     header_path = os.path.join(TARGET_DIR, header_filename)

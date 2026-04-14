@@ -19,8 +19,6 @@ enum class sub_tab_t : int {
 	patches,
 	seh_chain,
 	cfg,
-	xrefs,
-	struct_dissect,
 	COUNT
 };
 

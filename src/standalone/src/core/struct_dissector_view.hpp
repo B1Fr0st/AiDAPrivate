@@ -88,8 +88,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImU32 separator_col = IM_COL32(255, 255, 255, static_cast<int>(10 * alpha));
 	ImU32 changed_col = IM_COL32(255, 80, 80, static_cast<int>(200 * alpha));
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + top_bar_h),
-					  IM_COL32(18, 20, 26, static_cast<int>(200 * alpha)));
+	ui_anim::render_toolbar(dl, ox, oy, width, top_bar_h, accent_r, accent_g, accent_b, alpha);
 	dl->AddLine(ImVec2(ox, oy + top_bar_h), ImVec2(ox + width, oy + top_bar_h), separator_col);
 
 	float bx = ox + 6.f;
@@ -99,8 +98,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	bx += ImGui::CalcTextSize("Base:").x + 6.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 32, 40, static_cast<int>(200 * alpha)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(200 * alpha)));
+	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(120 * alpha)));
 	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 200, 220, 255));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 	ImGui::PushItemWidth(char_w * 18.f);
 	if (ImGui::InputText("##sd_addr", ui.addr_buf, sizeof(ui.addr_buf),
 						 ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_EnterReturnsTrue)) {
@@ -111,7 +113,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 	ImGui::PopItemWidth();
-	ImGui::PopStyleColor(2);
+	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor(3);
 	bx += char_w * 18.f + 12.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
@@ -274,8 +277,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 
 		if (active_idx < 0) {
-			dl->AddText(ImVec2(rx + rw * 0.5f - 60.f, ry_start + rh * 0.5f),
-						dim_col, "No struct selected");
+			ui_anim::render_empty_state(dl, rx, ry_start, rw, rh, "No struct selected",
+				accent_r, accent_g, accent_b, alpha, static_cast<float>(ImGui::GetTime()));
 			ImGui::EndChild();
 			return;
 		}
@@ -287,18 +290,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (col_value_w < char_w * 10.f) col_value_w = char_w * 10.f;
 
 		float hdr_y = ry_start;
-		dl->AddRectFilled(ImVec2(rx, hdr_y), ImVec2(rx + rw, hdr_y + line_h),
-						  IM_COL32(22, 24, 32, static_cast<int>(200 * alpha)));
-		float cx = rx + 4.f;
-		dl->AddText(ImVec2(cx, hdr_y + 2.f), header_col, "Offset");
-		cx += col_offset_w;
-		dl->AddText(ImVec2(cx, hdr_y + 2.f), header_col, "Name");
-		cx += col_name_w;
-		dl->AddText(ImVec2(cx, hdr_y + 2.f), header_col, "Type");
-		cx += col_type_w;
-		dl->AddText(ImVec2(cx, hdr_y + 2.f), header_col, "Value");
-		cx += col_value_w;
-		dl->AddText(ImVec2(cx, hdr_y + 2.f), header_col, "Description");
+		{
+			ui_anim::table_col_t hdr_cols[] = {
+				{"Offset", col_offset_w}, {"Name", col_name_w}, {"Type", col_type_w},
+				{"Value", col_value_w}, {"Description", char_w * 14.f}
+			};
+			ui_anim::render_table_header(dl, rx, hdr_y, rw, line_h, hdr_cols, 5, accent_r, accent_g, accent_b, alpha);
+		}
 
 		float table_y = ry_start + line_h;
 		float table_h = rh - line_h - line_h - 4.f;
@@ -465,4 +463,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	ImGui::EndChild();
+}
+
 }

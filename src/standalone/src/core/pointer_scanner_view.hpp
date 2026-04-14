@@ -3,6 +3,7 @@
 #include "imgui/imgui.h"
 #include "pointer_scanner.hpp"
 #include "disasm_view.hpp"
+#include "ui_anim.hpp"
 
 extern DisasmState g_disasm;
 
@@ -45,7 +46,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float detail_panel_h = 160.f;
 	float row_h = 22.f;
 
-	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + width, y0 + toolbar_h), hdr_bg);
+	ui_anim::render_toolbar(dl, x0, y0, width, toolbar_h, accent_r, accent_g, accent_b, a);
 
 	ImGui::SetCursorPos(ImVec2(pos_x + 8.f, pos_y + 6.f));
 	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
@@ -68,7 +69,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float cfg_y = y0 + toolbar_h;
 	float cfg_h = height - toolbar_h;
 
-	dl->AddRectFilled(ImVec2(cfg_x, cfg_y), ImVec2(cfg_x + config_panel_w, cfg_y + cfg_h), panel_bg);
+	ui_anim::render_panel_card(dl, cfg_x, cfg_y, config_panel_w, cfg_h, accent_r, accent_g, accent_b, a, 0.f, false);
 	dl->AddLine(ImVec2(cfg_x + config_panel_w, cfg_y), ImVec2(cfg_x + config_panel_w, cfg_y + cfg_h), sep_col);
 
 	ImGui::SetCursorPos(ImVec2(pos_x + 10.f, pos_y + toolbar_h + 10.f));
@@ -225,18 +226,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (col_chain_w < 100.f) col_chain_w = 100.f;
 
 	float hdr_h = 24.f;
-	dl->AddRectFilled(ImVec2(table_x, table_y), ImVec2(table_x + table_w, table_y + hdr_h), hdr_bg);
-
-	float cx = table_x + 6.f;
-	dl->AddText(ImVec2(cx, table_y + 4.f), text_dim, "Depth");
-	cx += col_depth_w;
-	dl->AddText(ImVec2(cx, table_y + 4.f), text_dim, "Module");
-	cx += col_module_w;
-	dl->AddText(ImVec2(cx, table_y + 4.f), text_dim, "Base+Offset");
-	cx += col_base_w;
-	dl->AddText(ImVec2(cx, table_y + 4.f), text_dim, "Chain");
-	cx += col_chain_w;
-	dl->AddText(ImVec2(cx, table_y + 4.f), text_dim, "Valid");
+	{
+		ui_anim::table_col_t hdr_cols[] = {
+			{"Depth", col_depth_w}, {"Module", col_module_w}, {"Base+Offset", col_base_w},
+			{"Chain", col_chain_w}, {"Valid", col_status_w}
+		};
+		ui_anim::render_table_header(dl, table_x, table_y, table_w, hdr_h, hdr_cols, 5, accent_r, accent_g, accent_b, a);
+	}
 
 	float body_y = table_y + hdr_h;
 	float body_h = table_h - hdr_h;
@@ -274,10 +270,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		                mp.y >= ry && mp.y < ry + row_h);
 		bool selected = (i == st.selected_result);
 
-		if (selected)
-			dl->AddRectFilled(ImVec2(table_x, ry), ImVec2(table_x + table_w, ry + row_h), row_sel);
-		else if (hovered)
-			dl->AddRectFilled(ImVec2(table_x, ry), ImVec2(table_x + table_w, ry + row_h), row_hover);
+		float row_a = ui_anim::render_row_entrance(i, 0.04f, a);
+		ui_anim::table_row_style_t rs{};
+		rs.selected = selected;
+		rs.hovered = hovered;
+		rs.index = i;
+		rs.alpha = a;
+		rs.entrance = row_a / a;
+		rs.ar = accent_r; rs.ag = accent_g; rs.ab = accent_b;
+		ui_anim::render_table_row(dl, table_x, ry, table_w, row_h, rs);
 
 		if (hovered && ImGui::IsMouseClicked(0))
 			st.selected_result = i;
@@ -327,7 +328,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		dl->AddText(ImVec2(rx, ry + 3.f),
 		            chain.validated ? text_val : text_inv,
-		            chain.validated ? "yes" : "?");
+		            chain.validated ? "\xe2\x9c\x93" : "?");
+		if (chain.validated) {
+			ImVec2 badge_min(rx - 2.f, ry + 2.f);
+			ImVec2 badge_max(rx + 14.f, ry + row_h - 2.f);
+			dl->AddRectFilled(badge_min, badge_max, IM_COL32(40, 180, 100, static_cast<int>(40 * row_a)), 4.f);
+		}
 
 		if (i < total - 1)
 			dl->AddLine(ImVec2(table_x, ry + row_h), ImVec2(table_x + table_w, ry + row_h),
@@ -342,8 +348,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float det_w = table_w;
 
 	dl->AddLine(ImVec2(det_x, det_y), ImVec2(det_x + det_w, det_y), sep_col);
-	dl->AddRectFilled(ImVec2(det_x, det_y + 1.f), ImVec2(det_x + det_w, det_y + detail_panel_h), panel_bg);
-
+		ui_anim::render_panel_card(dl, det_x, det_y + 1.f, det_w, detail_panel_h - 1.f, accent_r, accent_g, accent_b, a, 0.f, true);
 	if (st.selected_result >= 0 && st.selected_result < total) {
 		auto& chain = st.results[st.selected_result];
 
@@ -429,14 +434,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 
 		for (size_t j = 0; j < chain.offsets.size(); ++j) {
-			ddl->AddLine(ImVec2(cwp.x + dx, cwp.y + diagram_y_start + node_h / 2.f),
-			             ImVec2(cwp.x + dx + gap, cwp.y + diagram_y_start + node_h / 2.f),
-			             text_dim);
+			float lx0 = cwp.x + dx;
+			float ly0 = cwp.y + diagram_y_start + node_h / 2.f;
+			float lx1 = cwp.x + dx + gap;
+			float cp = gap * 0.4f;
+			ddl->AddBezierCubic(
+				ImVec2(lx0, ly0), ImVec2(lx0 + cp, ly0 - 6.f),
+				ImVec2(lx1 - cp, ly0 + 6.f), ImVec2(lx1, ly0),
+				accent_dim, 1.5f);
 			ddl->AddTriangleFilled(
-				ImVec2(cwp.x + dx + gap - 6.f, cwp.y + diagram_y_start + node_h / 2.f - 4.f),
-				ImVec2(cwp.x + dx + gap - 6.f, cwp.y + diagram_y_start + node_h / 2.f + 4.f),
-				ImVec2(cwp.x + dx + gap, cwp.y + diagram_y_start + node_h / 2.f),
-				text_dim);
+				ImVec2(lx1 - 6.f, ly0 - 4.f),
+				ImVec2(lx1 - 6.f, ly0 + 4.f),
+				ImVec2(lx1, ly0),
+				accent_col);
 			dx += gap;
 
 			char ob[24];

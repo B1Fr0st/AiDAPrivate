@@ -8,6 +8,7 @@
 #include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
 #include "zydis_disasm.hpp"
+#include "source_reconstructor.hpp"
 
 #include <httplib.h>
 
@@ -662,6 +663,86 @@ namespace
             "Found " + std::to_string(results.size()) + " results for: " + query,
             json{{"results", results}});
     }
+
+    tool_result_t handle_reconstruct_source(const json& params)
+    {
+        if (source_reconstructor::is_running())
+            return error("Source reconstruction is already running.");
+
+        if (!driver_bridge::is_loaded())
+            return error("Kernel driver not loaded. Call driver_load first.");
+
+        source_reconstructor::reconstruction_config_t config;
+        config.project_name = params.value("project_name", "reconstructed");
+        config.output_dir = params.value("output_dir", "");
+        config.module_name = params.value("module_name", "");
+        config.include_imports = params.value("include_imports", true);
+        config.include_exports = params.value("include_exports", true);
+        config.generate_cmake = params.value("generate_cmake", true);
+        config.use_ai_refinement = params.value("use_ai", true);
+        config.max_functions = params.value("max_functions", 0);
+
+        if (config.output_dir.empty())
+            return error("Missing required parameter: output_dir");
+
+
+        if (!config.module_name.empty()) {
+            for (auto& mod : driver_bridge::enumerate_modules()) {
+                if (to_lower(mod.name) == to_lower(config.module_name)) {
+                    config.module_base = mod.base;
+                    config.module_size = mod.size;
+                    break;
+                }
+            }
+            if (config.module_base == 0)
+                return error("Module not found: " + config.module_name);
+        } else {
+
+            auto base_opt = parse_addr_opt(params, "module_base");
+            if (!base_opt.has_value())
+                return error("Provide either module_name or module_base.");
+            config.module_base = base_opt.value();
+            config.module_size = params.value("module_size", 0u);
+            if (config.module_size == 0)
+                return error("module_size is required when using module_base.");
+        }
+
+        source_reconstructor::reconstruct(config);
+
+        return tool_result_t::ok("Source reconstruction started for " +
+            config.module_name + " → " + config.output_dir,
+            json{{"status", "started"}, {"module_base", hex_addr(config.module_base)},
+                 {"module_size", config.module_size}, {"output_dir", config.output_dir}});
+    }
+
+    tool_result_t handle_reconstruct_status(const json&)
+    {
+        json result;
+        result["running"] = source_reconstructor::is_running();
+        result["progress"] = source_reconstructor::get_progress();
+        result["status"] = source_reconstructor::get_status();
+
+        if (!source_reconstructor::is_running()) {
+            auto& last = source_reconstructor::get_last_result();
+            result["success"] = last.success;
+            result["error"] = last.error;
+            result["total_functions"] = last.total_functions;
+            result["decompiled_functions"] = last.decompiled_functions;
+            result["modules_created"] = last.modules_created;
+            result["files_created"] = static_cast<int>(last.files_created.size());
+            result["output_dir"] = last.output_dir;
+        }
+
+        return tool_result_t::ok(result);
+    }
+
+    tool_result_t handle_reconstruct_cancel(const json&)
+    {
+        if (!source_reconstructor::is_running())
+            return error("No reconstruction is running.");
+        source_reconstructor::cancel();
+        return tool_result_t::ok("Reconstruction cancellation requested.");
+    }
 }
 
 namespace mcp_standalone
@@ -730,5 +811,27 @@ namespace mcp_standalone
         workflow_tools::register_workflow_tools(srv);
         scanner_tools::register_scanner_tools(srv);
         analysis_tools::register_analysis_tools(srv);
+
+
+        srv.register_tool({"reconstruct_source",
+            "Reconstruct a compilable C project from a loaded module. "
+            "Discovers functions, decompiles them, groups into modules, and generates headers, source files, and CMakeLists.txt.",
+            {{"output_dir", "string", "Directory to write the reconstructed project", true},
+             {"module_name", "string", "Name of the module to reconstruct (e.g., 'game.exe')", false},
+             {"module_base", "string", "Base address of the module (hex). Use if module_name is not provided.", false},
+             {"module_size", "number", "Size of the module in bytes. Required with module_base.", false},
+             {"project_name", "string", "Name for the reconstructed project (default: 'reconstructed')", false},
+             {"include_imports", "boolean", "Include import declarations (default: true)", false},
+             {"include_exports", "boolean", "Include export declarations (default: true)", false},
+             {"generate_cmake", "boolean", "Generate CMakeLists.txt (default: true)", false},
+             {"use_ai", "boolean", "Use AI refinement during decompilation (default: true)", false},
+             {"max_functions", "number", "Maximum functions to decompile (0 = all, default: 0)", false}},
+            false, handle_reconstruct_source});
+        srv.register_tool({"reconstruct_status",
+            "Check the progress and results of an in-flight source reconstruction.",
+            {}, true, handle_reconstruct_status});
+        srv.register_tool({"reconstruct_cancel",
+            "Cancel a running source reconstruction.",
+            {}, false, handle_reconstruct_cancel});
     }
 }

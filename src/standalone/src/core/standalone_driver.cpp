@@ -335,12 +335,8 @@ namespace driver_bridge
 
     void detach()
     {
-        /* Run pre-detach hooks BEFORE acquiring the state mutex and
-           before clearing the kernel process context.  This gives
-           subsystems like speedhack and page_guard_engine a chance
-           to restore original bytes and free their kernel-side
-           allocations (shellcode, ring buffers, etc.) while the
-           DTB is still valid. */
+
+
         {
             std::lock_guard<std::mutex> lk(g_callback_mtx);
             for (auto& hook : g_pre_detach_hooks) {
@@ -871,10 +867,7 @@ namespace driver_bridge
                 bytes_written = device->write_raw(address, data.data(), data.size());
             }
 
-            /* Mirror the DTB re-solve logic from read_memory(): if the
-               write returned 0 bytes it may be because the target
-               process's page tables changed (module load/unload, CoW
-               fault, etc.).  Re-solve the DTB and retry once. */
+
             if (bytes_written == 0) {
                 bool re_resolved = false;
                 {

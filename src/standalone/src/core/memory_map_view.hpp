@@ -38,11 +38,8 @@ inline void refresh()
 {
 	if (g_ui.refreshing.load())
 		return;
-	/* Validate kernel driver is connected and a process is attached
-	   before spawning a background thread.  get_memory_map() ultimately
-	   calls driver_bridge::enumerate_memory_regions() which requires the
-	   kernel driver — without this guard the thread runs for nothing and
-	   refreshing stays true, blocking future refresh attempts. */
+
+
 	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0)
 		return;
 	g_ui.refreshing.store(true);
@@ -147,8 +144,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float row_h = 20.f;
 	float col_header_h = 22.f;
 
-	dl->AddRectFilled(ImVec2(pos_x, pos_y), ImVec2(pos_x + width, pos_y + header_h),
-					  IM_COL32(25, 27, 35, static_cast<int>(240 * alpha)));
+	ui_anim::render_toolbar(dl, pos_x, pos_y, width, header_h, ar, ag, ab, alpha);
 	dl->AddText(ImVec2(pos_x + 10.f, pos_y + 8.f),
 				IM_COL32(200, 200, 210, static_cast<int>(220 * alpha)), "Memory Map");
 
@@ -191,16 +187,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float col_mod = pos_x + 560.f;
 	float col_info = pos_x + 700.f;
 
-	dl->AddRectFilled(ImVec2(pos_x, table_y), ImVec2(pos_x + width, table_y + col_header_h),
-					  IM_COL32(30, 32, 40, static_cast<int>(220 * alpha)));
-	ImU32 hdr_col = IM_COL32(160, 160, 175, static_cast<int>(200 * alpha));
-	dl->AddText(ImVec2(col_addr, table_y + 3.f), hdr_col, "Address");
-	dl->AddText(ImVec2(col_size, table_y + 3.f), hdr_col, "Size");
-	dl->AddText(ImVec2(col_prot, table_y + 3.f), hdr_col, "Protection");
-	dl->AddText(ImVec2(col_state, table_y + 3.f), hdr_col, "State");
-	dl->AddText(ImVec2(col_type, table_y + 3.f), hdr_col, "Type");
-	dl->AddText(ImVec2(col_mod, table_y + 3.f), hdr_col, "Module");
-	dl->AddText(ImVec2(col_info, table_y + 3.f), hdr_col, "Info");
+	{
+		ui_anim::table_col_t cols[] = {{"Address", 150.f}, {"Size", 90.f}, {"Protection", 130.f}, {"State", 90.f}, {"Type", 90.f}, {"Module", 140.f}, {"Info", 150.f}};
+		ui_anim::render_table_header(dl, pos_x, table_y, width, col_header_h, cols, 7, ar, ag, ab, alpha);
+	}
 
 	float list_y = table_y + col_header_h;
 	float list_h = height - header_h - col_header_h;

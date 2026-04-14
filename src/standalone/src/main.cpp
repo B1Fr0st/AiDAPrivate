@@ -19,6 +19,7 @@
 #include "core/network_view.hpp"
 #include "core/script_engine.hpp"
 #include "core/toast_notification.hpp"
+#include "core/source_reconstruct_view.hpp"
 #include "helpers/stb_image.h"
 
 #include <thread>
@@ -385,6 +386,7 @@ int main(int, char**)
         {
 
             helper.render_title();
+            source_reconstruct_view::render(1.0f, globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
             toast_notification::render();
 
         }

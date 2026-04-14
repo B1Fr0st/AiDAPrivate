@@ -527,7 +527,7 @@ inline const char* category_name(crypto_category_t cat)
 	}
 }
 
-inline void auto_label_references(); // forward declaration
+inline void auto_label_references();
 
 inline void scan_process()
 {

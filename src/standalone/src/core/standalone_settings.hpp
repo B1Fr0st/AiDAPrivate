@@ -378,7 +378,7 @@ struct settings_sa_t
 
     bool        activity_bar_visible = true;
 
-    int         decompile_default_mode = -1;
+    int         decompile_default_mode = 1;
 
 
     int         window_x = -1;

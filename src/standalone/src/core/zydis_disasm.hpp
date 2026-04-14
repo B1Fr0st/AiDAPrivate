@@ -332,11 +332,8 @@ namespace disasm
 
         std::thread([&state, win_start, read_sz, pid]() {
             std::vector<uint8_t> mem;
-            /* Check both that the driver is actually loaded/connected
-               AND that the currently attached PID still matches.  The
-               previous check only verified PID, so a mid-session driver
-               disconnect would attempt reads that fail repeatedly,
-               causing the 3-failure delayed error path. */
+
+
             if (driver_bridge::is_loaded() &&
                 driver_bridge::using_kernel_driver() &&
                 driver_bridge::attached_pid() == pid) {

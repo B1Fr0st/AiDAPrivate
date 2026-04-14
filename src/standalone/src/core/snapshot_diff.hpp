@@ -390,7 +390,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + width, y0 + height), bg);
 
 	float toolbar_h = 36.f;
-	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + width, y0 + toolbar_h), hdr_bg);
+	ui_anim::render_toolbar(dl, x0, y0, width, toolbar_h, accent_r, accent_g, accent_b, a);
+	dl->AddLine(ImVec2(x0, y0 + toolbar_h), ImVec2(x0 + width, y0 + toolbar_h), IM_COL32(60, 65, 80, static_cast<int>(80 * a)));
 
 	ImGui::SetCursorPos(ImVec2(pos_x + 8.f, pos_y + 6.f));
 	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
@@ -507,13 +508,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float col_mod_w = width - col_addr_w - col_old_w - col_new_w - col_type_w - 24.f;
 	if (col_mod_w < 60.f) col_mod_w = 60.f;
 
-	dl->AddRectFilled(ImVec2(x0, content_y), ImVec2(x0 + width, content_y + 24.f), hdr_bg);
-	float hx = x0 + 4.f;
-	dl->AddText(ImVec2(hx, content_y + 4.f), text_sec, "Address"); hx += col_addr_w;
-	dl->AddText(ImVec2(hx, content_y + 4.f), text_sec, "Old Value"); hx += col_old_w;
-	dl->AddText(ImVec2(hx, content_y + 4.f), text_sec, "New Value"); hx += col_new_w;
-	dl->AddText(ImVec2(hx, content_y + 4.f), text_sec, "Type"); hx += col_type_w;
-	dl->AddText(ImVec2(hx, content_y + 4.f), text_sec, "Module");
+	{
+		ui_anim::table_col_t hdr_cols[] = {
+			{"Address", col_addr_w}, {"Old Value", col_old_w}, {"New Value", col_new_w},
+			{"Type", col_type_w}, {"Module", col_mod_w}
+		};
+		ui_anim::render_table_header(dl, x0, content_y, width, 24.f, hdr_cols, 5, accent_r, accent_g, accent_b, a);
+	}
 
 	ImGui::SetCursorPos(ImVec2(pos_x, pos_y + toolbar_h + 24.f));
 	ImGui::BeginChild("##snap_diff_table", ImVec2(width, table_h - 24.f), false,
@@ -537,8 +538,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		bool hov = ImGui::IsMouseHoveringRect(rp, ImVec2(rp.x + width, rp.y + row_height), true);
 		bool sel = (g_state.selected_change == i);
 
-		if (sel) dl->AddRectFilled(rp, ImVec2(rp.x + width, rp.y + row_height), row_sel, 2.f);
-		else if (hov) dl->AddRectFilled(rp, ImVec2(rp.x + width, rp.y + row_height), row_hover, 2.f);
+		ui_anim::table_row_style_t rs{};
+		rs.selected = sel;
+		rs.hovered = hov;
+		rs.index = i;
+		rs.alpha = a;
+		rs.entrance = 1.f;
+		rs.ar = accent_r; rs.ag = accent_g; rs.ab = accent_b;
+		ui_anim::render_table_row(dl, rp.x, rp.y, width, row_height, rs);
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			g_state.selected_change = i;
@@ -571,7 +578,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		else if (c.type == change_type_t::float_changed) type_col = IM_COL32(100, 200, 255, static_cast<int>(220 * a));
 		else if (c.type == change_type_t::counter_incremented || c.type == change_type_t::counter_decremented)
 			type_col = IM_COL32(200, 255, 100, static_cast<int>(220 * a));
-		dl->AddText(ImVec2(rp.x + col_addr_w + col_old_w + col_new_w + 4.f, rp.y + 2.f), type_col, type_str);
+		{
+			float tx = rp.x + col_addr_w + col_old_w + col_new_w + 4.f;
+			ImVec2 tts = ImGui::CalcTextSize(type_str);
+			float pw = tts.x + 10.f;
+			float ph = tts.y + 2.f;
+			float py = rp.y + (row_height - ph) * 0.5f;
+			dl->AddRectFilled(ImVec2(tx, py), ImVec2(tx + pw, py + ph),
+				IM_COL32((type_col >> IM_COL32_R_SHIFT) & 0xFF,
+				         (type_col >> IM_COL32_G_SHIFT) & 0xFF,
+				         (type_col >> IM_COL32_B_SHIFT) & 0xFF,
+				         static_cast<int>(40 * a)), ph * 0.5f);
+			dl->AddText(ImVec2(tx + 5.f, py + 1.f), type_col, type_str);
+		}
 
 		dl->AddText(ImVec2(rp.x + col_addr_w + col_old_w + col_new_w + col_type_w + 4.f, rp.y + 2.f),
 		            text_dim, c.module_name.c_str());
@@ -580,11 +599,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	if (filtered.empty()) {
-		ImVec2 cp = ImGui::GetCursorScreenPos();
-		const char* hint = g_state.snapshots.empty()
-			? "Take snapshots of the target process to compare memory states"
-			: "Select two snapshots and click 'Compare' to view differences";
-		dl->AddText(ImVec2(cp.x + 20.f, cp.y + 20.f), text_dim, hint);
+		const char* empty_msg = g_state.snapshots.empty()
+			? "Take snapshots of the target process to compare memory states."
+			: "Select two snapshots and click 'Compare' to view differences.";
+		ui_anim::render_empty_state(dl, x0, content_y + 24.f, width, table_h - 24.f,
+			empty_msg, accent_r, accent_g, accent_b, a, static_cast<float>(ImGui::GetTime()));
 	}
 
 	ImGui::EndChild();
@@ -593,7 +612,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		auto& c = filtered[g_state.selected_change];
 		float dy = y0 + height - detail_h;
 		dl->AddLine(ImVec2(x0, dy), ImVec2(x0 + width, dy), sep_col);
-		dl->AddRectFilled(ImVec2(x0, dy), ImVec2(x0 + width, y0 + height), panel_bg);
+		ui_anim::render_panel_card(dl, x0, dy, width, detail_h, accent_r, accent_g, accent_b, a, 0.f, true);
 
 		dl->AddText(ImVec2(x0 + 8.f, dy + 6.f), text_sec, "Detail");
 

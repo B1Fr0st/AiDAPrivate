@@ -3,6 +3,7 @@
 #include "struct_monitor.hpp"
 #include "ui_anim.hpp"
 #include "imgui.h"
+#include "../helpers/globals.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -34,17 +35,21 @@ void render(float pos_x, float pos_y, float width, float height,
 	float ox = wp.x;
 	float oy = wp.y;
 
-	const ImU32 bg        = IM_COL32(30, 30, 30, static_cast<int>(alpha * 255));
-	const ImU32 text_col  = IM_COL32(212, 212, 212, static_cast<int>(alpha * 255));
-	const ImU32 dim_col   = IM_COL32(140, 140, 140, static_cast<int>(alpha * 255));
+	const auto& _t = themes::resolved;
+	const auto _ta = [alpha](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, alpha);
+	};
+	const ImU32 bg        = _ta(_t.bg_base);
+	const ImU32 text_col  = _ta(_t.text_primary);
+	const ImU32 dim_col   = _ta(_t.text_dim);
 	const ImU32 accent    = IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 	                                  static_cast<int>(accent_b * 255), static_cast<int>(alpha * 255));
-	const ImU32 header_bg = IM_COL32(45, 45, 45, static_cast<int>(alpha * 255));
-	const ImU32 panel_bg  = IM_COL32(35, 35, 35, static_cast<int>(alpha * 255));
-	const ImU32 row_even  = IM_COL32(35, 35, 35, static_cast<int>(alpha * 255));
-	const ImU32 row_odd   = IM_COL32(40, 40, 40, static_cast<int>(alpha * 255));
-	const ImU32 row_hover = IM_COL32(55, 55, 55, static_cast<int>(alpha * 255));
-	const ImU32 sel_col   = IM_COL32(60, 60, 80, static_cast<int>(alpha * 255));
+	const ImU32 header_bg = _ta(_t.panel_header);
+	const ImU32 panel_bg  = _ta(_t.panel_bg);
+	const ImU32 row_even  = _ta(_t.panel_bg);
+	const ImU32 row_odd   = _ta(ui_anim::lighten(_t.panel_bg, 8));
+	const ImU32 row_hover = _ta(ui_anim::lighten(_t.panel_header, 14));
+	const ImU32 sel_col   = _ta(ui_anim::lighten(_t.panel_header, 10));
 	const ImU32 vtable_col= IM_COL32(224, 108, 117, static_cast<int>(alpha * 255));
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height), bg);
@@ -53,11 +58,14 @@ void render(float pos_x, float pos_y, float width, float height,
 	float cy = oy + 8.f;
 	const float toolbar_h = 64.f;
 
-	dl->AddRectFilled(ImVec2(ox, cy - 4.f), ImVec2(ox + width, cy + toolbar_h), header_bg);
+	ui_anim::render_toolbar(dl, ox, cy - 4.f, width, toolbar_h + 4.f, alpha, accent_r, accent_g, accent_b);
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy + 2.f));
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.15f, alpha));
-	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.83f, 0.83f, 0.83f, alpha));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(200 * alpha)));
+	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(120 * alpha)));
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(210, 210, 220, static_cast<int>(220 * alpha)));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 
 	ImGui::PushItemWidth(150.f);
 	ImGui::InputTextWithHint("##sr_addr", "Base Address (hex)", sr.address_input, sizeof(sr.address_input));
@@ -71,15 +79,17 @@ void render(float pos_x, float pos_y, float width, float height,
 	ImGui::InputTextWithHint("##sr_size", "Size", sr.size_input, sizeof(sr.size_input));
 	ImGui::PopItemWidth();
 
-	ImGui::PopStyleColor(2);
+	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor(3);
 
 	cy += 28.f;
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 
-	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(accent_r, accent_g, accent_b, 0.7f * alpha));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(accent_r, accent_g, accent_b, 0.9f * alpha));
-	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(accent_r, accent_g, accent_b, 1.0f * alpha));
-	ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, alpha));
+	ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(static_cast<int>(accent_r * 140), static_cast<int>(accent_g * 140), static_cast<int>(accent_b * 140), static_cast<int>(200 * alpha)));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(static_cast<int>(accent_r * 180), static_cast<int>(accent_g * 180), static_cast<int>(accent_b * 180), static_cast<int>(220 * alpha)));
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(static_cast<int>(accent_r * 100), static_cast<int>(accent_g * 100), static_cast<int>(accent_b * 100), static_cast<int>(240 * alpha)));
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, static_cast<int>(255 * alpha)));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 
 	bool monitoring = sr.monitoring.load();
 
@@ -185,6 +195,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		struct_recon::refresh_value_history();
 	}
 
+	ImGui::PopStyleVar();
 	ImGui::PopStyleColor(4);
 
 	cy += toolbar_h - 24.f;
@@ -196,8 +207,10 @@ void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	if (current_copy.fields.empty() && !monitoring) {
-		dl->AddText(ImVec2(cx, cy + 40.f), dim_col, "Enter a base address and click Snapshot to reconstruct a struct.");
-		dl->AddText(ImVec2(cx, cy + 58.f), dim_col, "Monitor (HWBP) mode uses hardware breakpoints for live analysis.");
+		ui_anim::render_empty_state(dl, ox, cy, width, oy + height - cy - 8.f,
+			"Enter a base address and click Snapshot to reconstruct",
+			accent_r, accent_g, accent_b, alpha,
+			static_cast<float>(ImGui::GetTime()));
 		ImGui::EndChild();
 		return;
 	}
@@ -227,13 +240,12 @@ void render(float pos_x, float pos_y, float width, float height,
 	const char* col_names[] = {"Offset", "Type", "Name", "Size", "Conf", "Heat", "Comment"};
 	const float col_pcts[] = {0.10f, 0.12f, 0.18f, 0.07f, 0.07f, 0.06f, 0.40f};
 
-	float hx = cx;
-	for (int c = 0; c < 7; ++c) {
-		float cw = main_w * col_pcts[c];
-		dl->AddRectFilled(ImVec2(hx, cy), ImVec2(hx + cw, cy + row_h), header_bg);
-		dl->AddText(ImVec2(hx + 6.f, cy + 3.f), text_col, col_names[c]);
-		hx += cw;
-	}
+	ui_anim::table_col_t struct_cols[] = {
+		{"Offset", main_w * 0.10f}, {"Type", main_w * 0.12f}, {"Name", main_w * 0.18f},
+		{"Size", main_w * 0.07f}, {"Conf", main_w * 0.07f}, {"Heat", main_w * 0.06f},
+		{"Comment", main_w * 0.40f}
+	};
+	ui_anim::render_table_header(dl, cx, cy, main_w, row_h, struct_cols, 7, accent_r, accent_g, accent_b, alpha);
 	cy += row_h + 1.f;
 	visible_h -= row_h + 1.f;
 
@@ -260,8 +272,8 @@ void render(float pos_x, float pos_y, float width, float height,
 
 		bool hovered = ImGui::IsMouseHoveringRect(rmin, rmax);
 		bool selected = st.selected_field == i;
-		ImU32 row_col = selected ? sel_col : (hovered ? row_hover : (i % 2 == 0 ? row_even : row_odd));
-		dl->AddRectFilled(rmin, rmax, row_col);
+		ui_anim::render_table_row(dl, ox, ry, main_w, row_h,
+			{selected, hovered, i, alpha, 1.f, accent_r, accent_g, accent_b});
 
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			st.selected_field = i;
@@ -349,7 +361,9 @@ void render(float pos_x, float pos_y, float width, float height,
 		auto& sel = current_copy.fields[static_cast<size_t>(st.selected_field)];
 
 		float ry = table_top;
-		dl->AddRectFilled(ImVec2(right_x - 4.f, ry), ImVec2(ox + width - 8.f, ry + row_h), header_bg);
+		float rp_w = (ox + width - 8.f) - (right_x - 4.f);
+		ui_anim::render_panel_card(dl, right_x - 4.f, ry, rp_w, row_h,
+			accent_r, accent_g, accent_b, alpha, 4.f, true);
 		dl->AddText(ImVec2(right_x, ry + 3.f), accent, "Field Details");
 		ry += row_h + 4.f;
 

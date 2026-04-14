@@ -40,6 +40,7 @@ struct local_state_t {
 	float scrollbar_drag_offset = 0.f;
 	float anim_time = 0.f;
 	int view_mode = 0;
+	float mode_crossfade = 1.f;
 };
 
 static local_state_t s_state;
@@ -135,16 +136,20 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	st.anim_time += ImGui::GetIO().DeltaTime;
 	float dt = ImGui::GetIO().DeltaTime;
 
-	const ImU32 bg        = IM_COL32(30, 30, 30, static_cast<int>(alpha * 255));
-	const ImU32 text_col  = IM_COL32(212, 212, 212, static_cast<int>(alpha * 255));
-	const ImU32 dim_col   = IM_COL32(140, 140, 140, static_cast<int>(alpha * 255));
+	const auto& _t = themes::resolved;
+	const auto _ta = [alpha](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, alpha);
+	};
+	const ImU32 bg        = _ta(_t.bg_base);
+	const ImU32 text_col  = _ta(_t.text_primary);
+	const ImU32 dim_col   = _ta(_t.text_dim);
 	const ImU32 accent    = IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 	                                  static_cast<int>(accent_b * 255), static_cast<int>(alpha * 255));
-	const ImU32 header_bg = IM_COL32(45, 45, 45, static_cast<int>(alpha * 255));
-	const ImU32 row_even  = IM_COL32(35, 35, 35, static_cast<int>(alpha * 255));
-	const ImU32 row_odd   = IM_COL32(40, 40, 40, static_cast<int>(alpha * 255));
-	const ImU32 row_hover = IM_COL32(55, 55, 55, static_cast<int>(alpha * 255));
-	const ImU32 sel_col   = IM_COL32(60, 60, 80, static_cast<int>(alpha * 255));
+	const ImU32 header_bg = _ta(_t.panel_header);
+	const ImU32 row_even  = _ta(_t.panel_bg);
+	const ImU32 row_odd   = _ta(ui_anim::lighten(_t.panel_bg, 8));
+	const ImU32 row_hover = _ta(ui_anim::lighten(_t.panel_header, 14));
+	const ImU32 sel_col   = _ta(ui_anim::lighten(_t.panel_header, 10));
 	const ImU32 source_col = IM_COL32(86, 182, 194, static_cast<int>(alpha * 255));
 	const ImU32 prop_col   = IM_COL32(229, 192, 123, static_cast<int>(alpha * 255));
 	const ImU32 sink_col   = IM_COL32(224, 108, 117, static_cast<int>(alpha * 255));
@@ -157,37 +162,53 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const float row_h = 20.f;
 	const float btn_h = 28.f;
 
+	ui_anim::render_toolbar(dl, cx, cy, width, toolbar_h, accent_r, accent_g, accent_b, alpha);
+
 	ImGui::PushItemWidth(140.f);
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(alpha * 150)));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 
 	ImGui::SetCursorScreenPos(ImVec2(cx + pad, cy + pad));
-	ImGui::TextColored(ImVec4(accent_r, accent_g, accent_b, alpha), "Start");
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(static_cast<int>(accent_r * 200 + 55),
+		static_cast<int>(accent_g * 200 + 55), static_cast<int>(accent_b * 200 + 55),
+		static_cast<int>(alpha * 220)));
+	ImGui::TextUnformatted("Start");
+	ImGui::PopStyleColor();
 	ImGui::SameLine();
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(50, 50, 50, static_cast<int>(alpha * 255)));
 	ImGui::InputText("##taint_addr", st.addr_buf, sizeof(st.addr_buf));
-	ImGui::PopStyleColor();
 
 	ImGui::SameLine();
-	ImGui::TextColored(ImVec4(accent_r, accent_g, accent_b, alpha), "End");
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(static_cast<int>(accent_r * 200 + 55),
+		static_cast<int>(accent_g * 200 + 55), static_cast<int>(accent_b * 200 + 55),
+		static_cast<int>(alpha * 220)));
+	ImGui::TextUnformatted("End");
+	ImGui::PopStyleColor();
 	ImGui::SameLine();
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(50, 50, 50, static_cast<int>(alpha * 255)));
 	ImGui::InputText("##taint_end", st.end_addr_buf, sizeof(st.end_addr_buf));
-	ImGui::PopStyleColor();
 
 	ImGui::SameLine();
-	ImGui::TextColored(ImVec4(accent_r, accent_g, accent_b, alpha), "Taint Regs");
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(static_cast<int>(accent_r * 200 + 55),
+		static_cast<int>(accent_g * 200 + 55), static_cast<int>(accent_b * 200 + 55),
+		static_cast<int>(alpha * 220)));
+	ImGui::TextUnformatted("Taint Regs");
+	ImGui::PopStyleColor();
 	ImGui::SameLine();
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(50, 50, 50, static_cast<int>(alpha * 255)));
 	ImGui::InputText("##taint_regs", st.taint_regs_buf, sizeof(st.taint_regs_buf));
-	ImGui::PopStyleColor();
 
 	ImGui::SameLine();
-	ImGui::TextColored(ImVec4(accent_r, accent_g, accent_b, alpha), "Mem");
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(static_cast<int>(accent_r * 200 + 55),
+		static_cast<int>(accent_g * 200 + 55), static_cast<int>(accent_b * 200 + 55),
+		static_cast<int>(alpha * 220)));
+	ImGui::TextUnformatted("Mem");
+	ImGui::PopStyleColor();
 	ImGui::SameLine();
 	ImGui::SetNextItemWidth(120.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(50, 50, 50, static_cast<int>(alpha * 255)));
 	ImGui::InputText("##taint_mem", st.taint_mem_buf, sizeof(st.taint_mem_buf));
-	ImGui::PopStyleColor();
 
+	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor(2);
 	ImGui::PopItemWidth();
 
 	float btn_y = cy + pad + 28.f;
@@ -195,52 +216,81 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	bool busy = symbolic_engine::g_state.processing.load();
 
-	ImGui::PushStyleColor(ImGuiCol_Button, busy ? IM_COL32(80, 80, 80, 200) : IM_COL32(50, 50, 70, static_cast<int>(alpha * 255)));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(70, 70, 100, static_cast<int>(alpha * 255)));
-	ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(40, 40, 60, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
+	if (busy) {
+		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(50, 52, 62, static_cast<int>(alpha * 200)));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(50, 52, 62, static_cast<int>(alpha * 200)));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(50, 52, 62, static_cast<int>(alpha * 200)));
+	} else {
+		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(static_cast<int>(accent_r * 140),
+			static_cast<int>(accent_g * 140), static_cast<int>(accent_b * 140), static_cast<int>(alpha * 200)));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(static_cast<int>(accent_r * 180),
+			static_cast<int>(accent_g * 180), static_cast<int>(accent_b * 180), static_cast<int>(alpha * 240)));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(static_cast<int>(accent_r * 100),
+			static_cast<int>(accent_g * 100), static_cast<int>(accent_b * 100), static_cast<int>(alpha * 255)));
+	}
 
 	if (ImGui::Button("Start Trace", ImVec2(110.f, btn_h)) && !busy) {
 		detail::start_taint_trace(st);
 	}
 
 	ImGui::PopStyleColor(3);
+	ImGui::PopStyleVar();
 
 	if (busy) {
 		ImGui::SameLine();
 		uint32_t cur = symbolic_engine::g_state.progress_current.load();
 		uint32_t tot = symbolic_engine::g_state.progress_total.load();
 		if (tot > 0) {
-			ImGui::PushStyleColor(ImGuiCol_PlotHistogram, accent);
-			ImGui::ProgressBar(static_cast<float>(cur) / static_cast<float>(tot), ImVec2(200.f, 20.f));
-			ImGui::PopStyleColor();
+			float frac = static_cast<float>(cur) / static_cast<float>(tot);
+			float pb_x = ImGui::GetCursorScreenPos().x;
+			float pb_y = btn_y + 4.f;
+			ui_anim::render_progress_bar_animated(dl, pb_x, pb_y, 200.f, 20.f, frac,
+				accent_r, accent_g, accent_b, alpha, st.anim_time);
+			ImGui::Dummy(ImVec2(200.f, 20.f));
 		}
 	}
 
 	ImGui::SameLine();
-	ImGui::SetNextItemWidth(100.f);
-	ImGui::TextColored(ImVec4(accent_r, accent_g, accent_b, alpha), "Max");
+	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(static_cast<int>(accent_r * 200 + 55),
+		static_cast<int>(accent_g * 200 + 55), static_cast<int>(accent_b * 200 + 55),
+		static_cast<int>(alpha * 220)));
+	ImGui::TextUnformatted("Max");
+	ImGui::PopStyleColor();
 	ImGui::SameLine();
 	ImGui::SetNextItemWidth(100.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(50, 50, 50, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleColor(ImGuiCol_SliderGrab, accent);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::SliderInt("##taint_max", &st.max_insns, 100, 100000);
-	ImGui::PopStyleColor();
+	ImGui::PopStyleVar();
+	ImGui::PopStyleColor(2);
 
 	ImGui::SameLine();
 	const char* modes[] = { "Table", "Flow" };
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 	for (int i = 0; i < 2; ++i) {
 		ImGui::SameLine();
 		bool active = (st.view_mode == i);
 		if (active) {
 			ImGui::PushStyleColor(ImGuiCol_Button, accent);
 		} else {
-			ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(50, 50, 50, static_cast<int>(alpha * 200)));
+			ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(40, 42, 55, static_cast<int>(alpha * 200)));
 		}
-		if (ImGui::Button(modes[i], ImVec2(60.f, btn_h))) st.view_mode = i;
-		ImGui::PopStyleColor();
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(static_cast<int>(accent_r * 180),
+			static_cast<int>(accent_g * 180), static_cast<int>(accent_b * 180), static_cast<int>(alpha * 200)));
+		if (ImGui::Button(modes[i], ImVec2(60.f, btn_h))) {
+			if (st.view_mode != i) st.mode_crossfade = 0.f;
+			st.view_mode = i;
+		}
+		ImGui::PopStyleColor(2);
 	}
+	ImGui::PopStyleVar();
 
-	float content_y = cy + toolbar_h;
-	float content_h = height - toolbar_h;
+	st.mode_crossfade = ui_anim::smooth_lerp(st.mode_crossfade, 1.f, 10.f, dt);
+
+	float content_y = cy + toolbar_h + 3.f;
+	float content_h = height - toolbar_h - 3.f;
 
 	std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 	auto& res = symbolic_engine::g_state.last_taint;
@@ -253,43 +303,61 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	if (!res.success) {
 		if (busy) {
-			ui_anim::render_spinner(dl, cx + width * 0.5f, content_y + content_h * 0.4f, 14.f, accent, st.anim_time);
-			dl->AddText(ImVec2(cx + width * 0.5f - 40.f, content_y + content_h * 0.4f + 24.f), dim_col, "Tracing...");
+			ui_anim::render_spinner(dl, cx + width * 0.5f, content_y + content_h * 0.4f, 14.f, 2.f, accent, st.anim_time);
+			ImVec2 trsz = ImGui::CalcTextSize("Tracing...");
+			dl->AddText(ImVec2(cx + (width - trsz.x) * 0.5f, content_y + content_h * 0.4f + 24.f), dim_col, "Tracing...");
 		} else {
-			dl->AddText(ImVec2(cx + pad, content_y + pad), dim_col, "Configure taint sources and click Start Trace");
+			ui_anim::render_empty_state(dl, cx, content_y, width, content_h,
+				"Configure taint sources and click Start Trace", accent_r, accent_g, accent_b, alpha, st.anim_time);
 		}
 		ImGui::EndChild();
 		return;
 	}
 
-	char summary[256];
-	std::snprintf(summary, sizeof(summary),
-		"Processed: %u | Tainted: %u | Tainted regs: %zu | Tainted mem addrs: %zu",
-		res.total_processed, res.tainted_count,
-		res.tainted_registers.size(), res.tainted_memory_addresses.size());
-	dl->AddText(ImVec2(cx + pad, content_y + 2.f), green_col, summary);
+	float card_h2 = 40.f;
+	float card_w2 = (width - pad * 2.f - 12.f) / 4.f;
+	float sx = cx + pad;
+	float sy = content_y + 2.f;
+
+	char b1[16], b2[16], b3[16], b4[16];
+	std::snprintf(b1, sizeof(b1), "%u", res.total_processed);
+	std::snprintf(b2, sizeof(b2), "%u", res.tainted_count);
+	std::snprintf(b3, sizeof(b3), "%zu", res.tainted_registers.size());
+	std::snprintf(b4, sizeof(b4), "%zu", res.tainted_memory_addresses.size());
+
+	ui_anim::render_stat_card(dl, sx, sy, card_w2, card_h2, "Processed", b1,
+		accent_r, accent_g, accent_b, alpha);
+	sx += card_w2 + 4.f;
+	ui_anim::render_stat_card(dl, sx, sy, card_w2, card_h2, "Tainted", b2,
+		accent_r, accent_g, accent_b, alpha, prop_col);
+	sx += card_w2 + 4.f;
+	ui_anim::render_stat_card(dl, sx, sy, card_w2, card_h2, "Taint Regs", b3,
+		accent_r, accent_g, accent_b, alpha, source_col);
+	sx += card_w2 + 4.f;
+	ui_anim::render_stat_card(dl, sx, sy, card_w2, card_h2, "Taint Addrs", b4,
+		accent_r, accent_g, accent_b, alpha, sink_col);
 
 	float legend_x = cx + width - 300.f;
-	dl->AddRectFilled(ImVec2(legend_x, content_y), ImVec2(legend_x + 12.f, content_y + 12.f), source_col);
-	dl->AddText(ImVec2(legend_x + 16.f, content_y), text_col, "Source");
-	dl->AddRectFilled(ImVec2(legend_x + 80.f, content_y), ImVec2(legend_x + 92.f, content_y + 12.f), prop_col);
-	dl->AddText(ImVec2(legend_x + 96.f, content_y), text_col, "Propagation");
-	dl->AddRectFilled(ImVec2(legend_x + 190.f, content_y), ImVec2(legend_x + 202.f, content_y + 12.f), sink_col);
-	dl->AddText(ImVec2(legend_x + 206.f, content_y), text_col, "Sink");
+	float legend_y = sy + card_h2 + 4.f;
+	const char* legend_labels[] = { "Source", "Propagation", "Sink" };
+	const ImU32 legend_colors[] = { source_col, prop_col, sink_col };
+	ui_anim::render_color_legend(dl, legend_x, legend_y, legend_labels, legend_colors, 3, alpha);
 
-	float table_y = content_y + 20.f;
-	float table_h = content_h - 20.f;
+	float table_y = legend_y + 18.f;
+	float table_h = content_h - (table_y - content_y);
+
+	float mode_alpha = alpha * st.mode_crossfade;
 
 	if (st.view_mode == 0) {
 		const char* cols[] = { "Address", "Instruction", "Source Regs", "Dest Regs", "Flow" };
 		float col_w[] = { 120.f, 220.f, 140.f, 140.f, 80.f };
 
-		dl->AddRectFilled(ImVec2(cx, table_y), ImVec2(cx + width, table_y + row_h), header_bg);
-		float hx = cx + 4.f;
-		for (int c = 0; c < 5; ++c) {
-			dl->AddText(ImVec2(hx, table_y + 2.f), accent, cols[c]);
-			hx += col_w[c];
-		}
+		ui_anim::table_col_t taint_cols[] = {
+			{ "Address", 120.f }, { "Instruction", 220.f },
+			{ "Source Regs", 140.f }, { "Dest Regs", 140.f }, { "Flow", 80.f }
+		};
+		ui_anim::render_table_header(dl, cx, table_y, width, row_h,
+			taint_cols, 5, accent_r, accent_g, accent_b, mode_alpha);
 
 		float list_y = table_y + row_h;
 		float list_h = table_h - row_h;
@@ -302,10 +370,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float max_scroll = (std::max)(0.f, static_cast<float>(total - visible) * row_h);
 		ImGui::SetCursorScreenPos(ImVec2(cx, list_y));
 		ImGui::InvisibleButton("##taint_scroll", ImVec2(width - 10.f, list_h));
-		ui_anim::handle_scroll_input(st.target_scroll_y, max_scroll, row_h * 3.f);
-		ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, dt);
-		ui_anim::clamp_scroll(st.scroll_y, max_scroll);
-		ui_anim::clamp_scroll(st.target_scroll_y, max_scroll);
+		ui_anim::handle_scroll_input(st.target_scroll_y, 0.f, max_scroll, row_h * 3.f);
+		ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 15.f, dt);
+		ui_anim::clamp_scroll(st.scroll_y, 0.f, max_scroll);
+		ui_anim::clamp_scroll(st.target_scroll_y, 0.f, max_scroll);
 
 		int start = static_cast<int>(st.scroll_y / row_h);
 		ImGui::PushClipRect(ImVec2(cx, list_y), ImVec2(cx + width, list_y + list_h), true);
@@ -317,6 +385,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (ry + row_h < list_y || ry > list_y + list_h) continue;
 
 			ImU32 rbg = (i == st.selected_row) ? sel_col : (i % 2 == 0 ? row_even : row_odd);
+			float row_t = ui_anim::render_row_entrance(i - start, st.anim_time > 1.f ? 1.f : st.anim_time);
 
 			ImGui::SetCursorScreenPos(ImVec2(cx, ry));
 			ImGui::InvisibleButton(("##trow" + std::to_string(i)).c_str(), ImVec2(width, row_h));
@@ -327,7 +396,18 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				disasm_view::goto_address(n.address, g_disasm);
 			}
 
-			dl->AddRectFilled(ImVec2(cx, ry), ImVec2(cx + width, ry + row_h), rbg);
+			if (i == st.selected_row) {
+				ui_anim::render_glow_rect(dl, cx, ry, width, row_h,
+					accent_r, accent_g, accent_b, alpha * row_t, 0.5f);
+			}
+			dl->AddRectFilled(ImVec2(cx, ry), ImVec2(cx + width, ry + row_h),
+				ui_anim::theme_alpha(rbg, row_t));
+
+			if (i == st.selected_row) {
+				dl->AddRectFilled(ImVec2(cx, ry), ImVec2(cx + 3.f, ry + row_h),
+					IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
+							 static_cast<int>(accent_b * 255), static_cast<int>(180 * alpha * row_t)));
+			}
 
 			ImU32 flow_col = n.is_source ? source_col : (n.is_sink ? sink_col : prop_col);
 
@@ -351,8 +431,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PopClipRect();
 
 		ui_anim::render_custom_scrollbar(dl, cx + width - 8.f, list_y, 6.f, list_h,
-			st.scroll_y, max_scroll, st.scrollbar_dragging, st.scrollbar_drag_offset,
-			accent, IM_COL32(60, 60, 60, static_cast<int>(alpha * 150)));
+			st.scroll_y, static_cast<float>(total) * row_h, list_h,
+			alpha, st.scrollbar_dragging, st.scrollbar_drag_offset);
 	}
 
 	else if (st.view_mode == 1) {
@@ -360,7 +440,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		auto nodes = detail::build_taint_flow(res, source_regs);
 
 		if (nodes.empty()) {
-			dl->AddText(ImVec2(cx + pad, table_y + pad), dim_col, "No tainted instructions");
+			ui_anim::render_empty_state(dl, cx, table_y, width, table_h,
+				"No tainted instructions found in the trace",
+				accent_r, accent_g, accent_b, alpha, st.anim_time);
 			ImGui::EndChild();
 			return;
 		}
@@ -386,10 +468,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float max_s = static_cast<float>((std::max)(0, total - max_vis)) * (node_h + node_spacing);
 		ImGui::SetCursorScreenPos(ImVec2(cx, table_y));
 		ImGui::InvisibleButton("##flow_scroll", ImVec2(width - 10.f, table_h));
-		ui_anim::handle_scroll_input(st.target_scroll_y, max_s, (node_h + node_spacing) * 3.f);
-		ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, dt);
-		ui_anim::clamp_scroll(st.scroll_y, max_s);
-		ui_anim::clamp_scroll(st.target_scroll_y, max_s);
+		ui_anim::handle_scroll_input(st.target_scroll_y, 0.f, max_s, (node_h + node_spacing) * 3.f);
+		ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 15.f, dt);
+		ui_anim::clamp_scroll(st.scroll_y, 0.f, max_s);
+		ui_anim::clamp_scroll(st.target_scroll_y, 0.f, max_s);
 
 		for (int i = start; i < total && i < start + max_vis; ++i) {
 			auto& n = nodes[i];
@@ -402,35 +484,70 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImU32 border = n.is_source ? source_col : (n.is_sink ? sink_col : prop_col);
 
 			float nx = flow_x + (flow_w - node_w) * 0.5f;
+
+			if (n.is_source || n.is_sink) {
+				float pulse = (std::sin(st.anim_time * 3.f + static_cast<float>(i) * 0.5f) + 1.f) * 0.5f;
+				ImU32 glow = (border & 0x00FFFFFF) | (static_cast<ImU32>(static_cast<int>(pulse * 25.f * alpha)) << 24);
+				dl->AddRectFilled(ImVec2(nx - 3.f, ny - 3.f), ImVec2(nx + node_w + 3.f, ny + node_h + 3.f), glow, 6.f);
+			}
+
 			dl->AddRectFilled(ImVec2(nx, ny), ImVec2(nx + node_w, ny + node_h), node_bg, 4.f);
 			dl->AddRect(ImVec2(nx, ny), ImVec2(nx + node_w, ny + node_h), border, 4.f);
+
+			const char* type_label = n.is_source ? "SRC" : (n.is_sink ? "SINK" : "PROP");
+			ImU32 type_bg = n.is_source ? IM_COL32(60, 120, 130, static_cast<int>(alpha * 200))
+				: (n.is_sink ? IM_COL32(130, 60, 70, static_cast<int>(alpha * 200))
+				: IM_COL32(100, 90, 60, static_cast<int>(alpha * 200)));
+			ImVec2 type_sz = ImGui::CalcTextSize(type_label);
+			float badge_w = type_sz.x + 8.f;
+			dl->AddRectFilled(ImVec2(nx + 4.f, ny + 3.f), ImVec2(nx + 4.f + badge_w, ny + node_h - 3.f),
+				type_bg, (node_h - 6.f) * 0.5f);
+			dl->AddText(ImVec2(nx + 8.f, ny + 4.f), IM_COL32(255, 255, 255, static_cast<int>(alpha * 230)), type_label);
 
 			char label[128];
 			std::snprintf(label, sizeof(label), "%llX  %s",
 				static_cast<unsigned long long>(n.address), n.disasm.c_str());
 			std::string lbl(label);
-			if (lbl.size() > 45) lbl = lbl.substr(0, 42) + "...";
-			dl->AddText(ImVec2(nx + 6.f, ny + 4.f), text_col, lbl.c_str());
+			if (lbl.size() > 40) lbl = lbl.substr(0, 37) + "...";
+			dl->AddText(ImVec2(nx + 10.f + badge_w, ny + 4.f), text_col, lbl.c_str());
 
 			if (i > start) {
 				float prev_y = ny - node_spacing;
 				float center_x = nx + node_w * 0.5f;
-				dl->AddLine(ImVec2(center_x, prev_y), ImVec2(center_x, ny), dim_col, 1.f);
 
-				float arrow_sz = 4.f;
+				ImVec2 p1(center_x, prev_y);
+				ImVec2 p2(center_x, prev_y + node_spacing * 0.3f);
+				ImVec2 p3(center_x, ny - node_spacing * 0.3f);
+				ImVec2 p4(center_x, ny);
+				ImU32 line_col = border;
+				ImU32 line_glow = (line_col & 0x00FFFFFF) | (static_cast<ImU32>(static_cast<int>(20.f * alpha)) << 24);
+				dl->AddBezierCubic(p1, p2, p3, p4, line_glow, 4.f);
+				dl->AddBezierCubic(p1, p2, p3, p4, line_col, 1.5f);
+
+				for (int pi = 0; pi < 2; ++pi) {
+					float pt = std::fmod(st.anim_time * 0.8f + static_cast<float>(pi) * 0.5f + static_cast<float>(i) * 0.15f, 1.f);
+					float u = 1.f - pt;
+					float px = u*u*u*p1.x + 3.f*u*u*pt*p2.x + 3.f*u*pt*pt*p3.x + pt*pt*pt*p4.x;
+					float py_v = u*u*u*p1.y + 3.f*u*u*pt*p2.y + 3.f*u*pt*pt*p3.y + pt*pt*pt*p4.y;
+					float dot_a = std::sin(pt * 3.14159f) * alpha;
+					ImU32 dot_col = (line_col & 0x00FFFFFF) | (static_cast<ImU32>(static_cast<int>(180.f * dot_a)) << 24);
+					dl->AddCircleFilled(ImVec2(px, py_v), 2.5f, dot_col, 8);
+				}
+
+				float arrow_sz = 5.f;
 				dl->AddTriangleFilled(
-					ImVec2(center_x - arrow_sz, ny - arrow_sz),
-					ImVec2(center_x + arrow_sz, ny - arrow_sz),
+					ImVec2(center_x - arrow_sz, ny - arrow_sz - 1.f),
+					ImVec2(center_x + arrow_sz, ny - arrow_sz - 1.f),
 					ImVec2(center_x, ny),
-					dim_col);
+					line_col);
 			}
 		}
 
 		ImGui::PopClipRect();
 
 		ui_anim::render_custom_scrollbar(dl, cx + width - 8.f, table_y, 6.f, table_h,
-			st.scroll_y, max_s, st.scrollbar_dragging, st.scrollbar_drag_offset,
-			accent, IM_COL32(60, 60, 60, static_cast<int>(alpha * 150)));
+			st.scroll_y, static_cast<float>(total) * (node_h + node_spacing), table_h,
+			alpha, st.scrollbar_dragging, st.scrollbar_drag_offset);
 	}
 
 	ImGui::EndChild();
