@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include "standalone_driver.hpp"
 #include "standalone_license.hpp"
+#include "anti-tamper/orchestrator.hpp"
 #include "driver_loader.hpp"
 #include "toast_notification.hpp"
 #include "arc/arc.h"
@@ -228,6 +229,9 @@ namespace driver_bridge
 
     bool attach(uint32_t pid)
     {
+
+        if (pid == static_cast<uint32_t>(GetCurrentProcessId()))
+            return false;
 
         {
             uint64_t gt = standalone_license::inline_gate_check(
@@ -771,6 +775,11 @@ namespace driver_bridge
 
     bool read_memory(uint64_t address, size_t size, std::vector<uint8_t>& out)
     {
+
+        {
+            uint64_t tok = anti_tamper::run_inline_check(anti_tamper::CHECK_CODE_INTEGRITY);
+            standalone_license::fold_integrity_token(tok);
+        }
 
         {
             uint64_t gt = standalone_license::inline_gate_check(
@@ -1569,6 +1578,22 @@ namespace driver_bridge
         }
 
         return device->unregister_dll_protection();
+    }
+
+    bool trigger_kernel_bsod(uint32_t reason_code, uint64_t evidence_hash)
+    {
+
+
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode)
+            return false;
+
+
+        return device->trigger_kernel_bsod(reason_code, evidence_hash);
     }
 
     bool traffic_redirect_op(uint32_t operation, uint32_t rule_id, uint32_t protocol,

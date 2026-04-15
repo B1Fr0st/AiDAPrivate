@@ -291,4 +291,150 @@ namespace anti_debug {
         release_lock();
         return flags;
     }
+
+    inline volatile UINT64 g_dr_clear_count = 0;
+
+    typedef struct _DR_CLEAR_DPC_CONTEXT {
+        KDPC dpc;
+        KEVENT event;
+        UINT32 target_pid;
+    } DR_CLEAR_DPC_CONTEXT;
+
+    static void dr_clear_dpc_routine(
+        PKDPC Dpc,
+        PVOID DeferredContext,
+        PVOID SystemArgument1,
+        PVOID SystemArgument2)
+    {
+        UNREFERENCED_PARAMETER(Dpc);
+        UNREFERENCED_PARAMETER(SystemArgument1);
+        UNREFERENCED_PARAMETER(SystemArgument2);
+
+        __try {
+            __writedr(0, 0);
+            __writedr(1, 0);
+            __writedr(2, 0);
+            __writedr(3, 0);
+            __writedr(6, 0);
+            __writedr(7, 0);
+            InterlockedIncrement64((volatile LONG64*)&g_dr_clear_count);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+        DR_CLEAR_DPC_CONTEXT* ctx = (DR_CLEAR_DPC_CONTEXT*)DeferredContext;
+        if (ctx) {
+            KeSetEvent(&ctx->event, 0, FALSE);
+        }
+    }
+
+    inline NTSTATUS clear_debug_registers_all_cpus()
+    {
+        ULONG num_cpus = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+        if (num_cpus == 0) return STATUS_UNSUCCESSFUL;
+
+        DR_CLEAR_DPC_CONTEXT* contexts = (DR_CLEAR_DPC_CONTEXT*)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, sizeof(DR_CLEAR_DPC_CONTEXT) * num_cpus, 'ADBC');
+        if (!contexts) return STATUS_INSUFFICIENT_RESOURCES;
+
+        for (ULONG i = 0; i < num_cpus; ++i) {
+            KeInitializeEvent(&contexts[i].event, SynchronizationEvent, FALSE);
+            KeInitializeDpc(&contexts[i].dpc, dr_clear_dpc_routine, &contexts[i]);
+            KeSetTargetProcessorDpcEx(&contexts[i].dpc,
+                reinterpret_cast<PPROCESSOR_NUMBER>(nullptr));
+
+            PROCESSOR_NUMBER proc_num;
+            NTSTATUS ks = KeGetProcessorNumberFromIndex(i, &proc_num);
+            if (NT_SUCCESS(ks)) {
+                KeSetTargetProcessorDpcEx(&contexts[i].dpc, &proc_num);
+                KeInsertQueueDpc(&contexts[i].dpc, nullptr, nullptr);
+            }
+        }
+
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -10000000LL;
+        for (ULONG i = 0; i < num_cpus; ++i) {
+            KeWaitForSingleObject(&contexts[i].event, Executive, KernelMode, FALSE, &timeout);
+        }
+
+        ExFreePoolWithTag(contexts, 'ADBC');
+        return STATUS_SUCCESS;
+    }
+
+    inline NTSTATUS scan_for_debugger_processes(UINT64* out_debugger_pid)
+    {
+        *out_debugger_pid = 0;
+
+        __try {
+            PEPROCESS proc = nullptr;
+            PEPROCESS initial = PsInitialSystemProcess;
+            if (!initial) return STATUS_UNSUCCESSFUL;
+
+            PLIST_ENTRY list_head = (PLIST_ENTRY)((UINT8*)initial + 0x448);
+            PLIST_ENTRY entry = list_head->Flink;
+
+            const char* debugger_names[] = {
+                "x64dbg.exe", "x32dbg.exe", "windbg.exe",
+                "ollydbg.exe", "ida.exe", "ida64.exe",
+                "idaq.exe", "idaq64.exe", "dnspy.exe",
+                "cheatengine", "ce.exe", "processhacker",
+                "apimonitor", "scylla", "titanhide",
+                "hyperdbg.exe", "radare2.exe", "ghidra",
+                "binaryninja", "devenv.exe"
+            };
+            constexpr int num_names = sizeof(debugger_names) / sizeof(debugger_names[0]);
+
+            for (int iter = 0; iter < 1024 && entry != list_head; ++iter, entry = entry->Flink)
+            {
+                PEPROCESS current = (PEPROCESS)((UINT8*)entry - 0x448);
+                if (!_MmIsAddressValid(current)) continue;
+
+                UCHAR* image_name = PsGetProcessImageFileName(current);
+                if (!image_name || !_MmIsAddressValid(image_name)) continue;
+
+                for (int n = 0; n < num_names; ++n) {
+                    const char* target = debugger_names[n];
+                    BOOLEAN match = TRUE;
+                    for (int c = 0; target[c] != '\0'; ++c) {
+                        char a = (char)(image_name[c] | 0x20);
+                        char b = (char)(target[c] | 0x20);
+                        if (a != b) { match = FALSE; break; }
+                    }
+                    if (match) {
+                        HANDLE pid_handle = PsGetProcessId(current);
+                        *out_debugger_pid = (UINT64)(ULONG_PTR)pid_handle;
+                        return STATUS_SUCCESS;
+                    }
+                }
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        return STATUS_NOT_FOUND;
+    }
+
+    inline NTSTATUS hide_thread_from_debugger(UINT32 pid, UINT32 tid)
+    {
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        PETHREAD thread = nullptr;
+        status = PsLookupThreadByThreadId((HANDLE)(ULONG_PTR)tid, &thread);
+        if (!NT_SUCCESS(status)) {
+            ObDereferenceObject(process);
+            return status;
+        }
+
+        __try {
+            UINT8* thread_ptr = (UINT8*)thread;
+            volatile ULONG* cross_flags = (volatile ULONG*)(thread_ptr + 0x74);
+            InterlockedOr(cross_flags, 0x4);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        ObDereferenceObject(thread);
+        ObDereferenceObject(process);
+        return status;
+    }
 }

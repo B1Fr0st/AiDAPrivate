@@ -297,6 +297,143 @@ namespace dll_protection {
 }
 
 
+namespace anti_dump_driver {
+
+    inline NTSTATUS trim_working_set(UINT32 pid)
+    {
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        __try {
+            UCHAR* eproc = (UCHAR*)process;
+            volatile UINT64* ws_lock = (volatile UINT64*)(eproc + 0x4E0);
+            volatile UINT32* ws_size = (volatile UINT32*)(eproc + 0x4E8);
+
+            if (_MmIsAddressValid((PVOID)ws_size) && *ws_size > 256) {
+                InterlockedExchange((volatile LONG*)ws_size, 64);
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            ObDereferenceObject(process);
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        ObDereferenceObject(process);
+        return STATUS_SUCCESS;
+    }
+
+    inline NTSTATUS detect_external_handles(UINT32 target_pid, UINT64* suspicious_pid)
+    {
+        *suspicious_pid = 0;
+
+        __try {
+            PEPROCESS target_proc = nullptr;
+            NTSTATUS st = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)target_pid, &target_proc);
+            if (!NT_SUCCESS(st)) return st;
+
+            PEPROCESS initial = PsInitialSystemProcess;
+            if (!initial) {
+                ObDereferenceObject(target_proc);
+                return STATUS_UNSUCCESSFUL;
+            }
+
+            PLIST_ENTRY list_head = (PLIST_ENTRY)((UINT8*)initial + 0x448);
+            PLIST_ENTRY entry = list_head->Flink;
+
+            for (int iter = 0; iter < 2048 && entry != list_head; ++iter, entry = entry->Flink)
+            {
+                PEPROCESS scan_proc = (PEPROCESS)((UINT8*)entry - 0x448);
+                if (!_MmIsAddressValid(scan_proc)) continue;
+                if (scan_proc == target_proc) continue;
+
+                HANDLE scan_pid = PsGetProcessId(scan_proc);
+                if ((UINT64)(ULONG_PTR)scan_pid <= 4) continue;
+
+                UINT8* eproc = (UINT8*)scan_proc;
+                if (!_MmIsAddressValid(eproc + 0x570)) continue;
+
+                volatile UINT64* object_table = (volatile UINT64*)(eproc + 0x570);
+                if (*object_table == 0) continue;
+
+                UCHAR* image_name = PsGetProcessImageFileName(scan_proc);
+                if (!image_name || !_MmIsAddressValid(image_name)) continue;
+
+                const char* dump_tools[] = {
+                    "processdump", "procdump", "taskdmp", "minidumper",
+                    "hollowshunt", "pe-sieve", "scylla"
+                };
+
+                for (int n = 0; n < (int)(sizeof(dump_tools) / sizeof(dump_tools[0])); ++n) {
+                    const char* target = dump_tools[n];
+                    BOOLEAN match = TRUE;
+                    for (int c = 0; target[c] != '\0'; ++c) {
+                        char a = (char)(image_name[c] | 0x20);
+                        char b = (char)(target[c] | 0x20);
+                        if (a != b) { match = FALSE; break; }
+                    }
+                    if (match) {
+                        *suspicious_pid = (UINT64)(ULONG_PTR)scan_pid;
+                        ObDereferenceObject(target_proc);
+                        return STATUS_SUCCESS;
+                    }
+                }
+            }
+
+            ObDereferenceObject(target_proc);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        return STATUS_NOT_FOUND;
+    }
+
+    inline NTSTATUS corrupt_vad_protection(UINT32 pid, UINT64 region_base)
+    {
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        __try {
+            UCHAR* eproc = (UCHAR*)process;
+            PVOID vad_root = *(PVOID*)(eproc + 0x7D8);
+
+            if (!vad_root || !_MmIsAddressValid(vad_root)) {
+                ObDereferenceObject(process);
+                return STATUS_NOT_FOUND;
+            }
+
+            UINT64 vpn = region_base >> 12;
+
+            PVOID node = vad_root;
+            for (int depth = 0; depth < 64 && node && _MmIsAddressValid(node); ++depth) {
+                UINT64 start_vpn = *(UINT64*)((UCHAR*)node + 0x18);
+                UINT64 end_vpn = *(UINT64*)((UCHAR*)node + 0x20);
+
+                if (vpn < start_vpn) {
+                    node = *(PVOID*)((UCHAR*)node + 0x00);
+                } else if (vpn > end_vpn) {
+                    node = *(PVOID*)((UCHAR*)node + 0x08);
+                } else {
+                    volatile UINT32* protection = (volatile UINT32*)((UCHAR*)node + 0x30);
+                    if (_MmIsAddressValid((PVOID)protection)) {
+                        *protection = (*protection & ~0x1F) | 0x01;
+                    }
+                    ObDereferenceObject(process);
+                    return STATUS_SUCCESS;
+                }
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            ObDereferenceObject(process);
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        ObDereferenceObject(process);
+        return STATUS_NOT_FOUND;
+    }
+
+}
+
+
 NTSTATUS functions::handle_dll_protect(p_dll_protect request) {
     if (!request)
         return STATUS_INVALID_PARAMETER;

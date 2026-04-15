@@ -2,6 +2,7 @@
 #include <Crypter.h>
 #include <imports/Defs.h>
 #include <core/Guardian.h>
+#include <core/ProcessNotify.h>
 
 
 #pragma data_seg(".sntl")
@@ -553,6 +554,11 @@ discovery_done:
         if (target_driver_obj) {
             bool og_ok = object_guard::init(target_driver_obj);
             SN_LOG("init_thread: object_guard::init = %d", (int)og_ok);
+        }
+
+        {
+            bool pn_ok = process_notify::init();
+            SN_LOG("init_thread: process_notify::init = %d", (int)pn_ok);
         }
 
 

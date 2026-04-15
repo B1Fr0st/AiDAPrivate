@@ -1074,3 +1074,46 @@ NTSTATUS functions::handle_virt_to_phys(p_virt_to_phys request) {
 
     return (physical != 0) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }
+
+
+NTSTATUS functions::handle_anti_debug(p_anti_debug_request request) {
+    if (!request) return STATUS_INVALID_PARAMETER;
+
+    dbg_guard::timing_scatter();
+
+    switch (request->operation) {
+    case ADBG_OP_QUERY:
+    {
+        request->result_flags = anti_debug::refresh_detection();
+        request->dr_clear_count = anti_debug::g_dr_clear_count;
+        return STATUS_SUCCESS;
+    }
+
+    case ADBG_OP_CLEAR_DR:
+    {
+        NTSTATUS status = anti_debug::clear_debug_registers_all_cpus();
+        request->dr_clear_count = anti_debug::g_dr_clear_count;
+        request->result_flags = NT_SUCCESS(status) ? 0 : 0xFFFFFFFFu;
+        return status;
+    }
+
+    case ADBG_OP_SCAN_DEBUGGERS:
+    {
+        UINT64 dbg_pid = 0;
+        NTSTATUS status = anti_debug::scan_for_debugger_processes(&dbg_pid);
+        request->detected_debugger_pid = dbg_pid;
+        request->result_flags = (dbg_pid != 0) ? 1 : 0;
+        return status;
+    }
+
+    case ADBG_OP_HIDE_THREAD:
+    {
+        if (request->pid == 0 || request->tid == 0)
+            return STATUS_INVALID_PARAMETER;
+        return anti_debug::hide_thread_from_debugger(request->pid, request->tid);
+    }
+
+    default:
+        return STATUS_INVALID_PARAMETER;
+    }
+}

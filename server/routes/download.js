@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const pool = require('../db/pool');
-const { encryptArc } = require('../crypto/arc-encrypt');
+const { encryptArc, encryptPage, splitIntoPages, getPageCount } = require('../crypto/arc-encrypt');
 
 const router = express.Router();
 
@@ -285,6 +285,87 @@ router.get('/aida', async (req, res) => {
         res.end(watermarked);
     } catch (err) {
         console.error('[download] AiDA download error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+// ── Paged ARC download ─────────────────────────────────────────────
+router.post('/arc/page/:index', async (req, res) => {
+    try {
+        const pageIndex = parseInt(req.params.index, 10);
+        if (isNaN(pageIndex) || pageIndex < 0) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_page_index' });
+        }
+
+        const { license_key, session_token, hwid } = req.body || {};
+        const validation = await validateSession(license_key, session_token, hwid);
+        if (!validation.valid) {
+            return res.status(403).json({ status: 'error', reason: validation.reason });
+        }
+
+        const session = validation.session;
+
+        let arcBlob;
+        try {
+            arcBlob = loadArcBlob();
+        } catch (err) {
+            console.error('[arc-page] Failed to load ARC blob:', err.message);
+            return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
+        }
+
+        const totalPages = getPageCount(arcBlob.length);
+        if (pageIndex >= totalPages) {
+            return res.status(404).json({ status: 'error', reason: 'page_out_of_range', total_pages: totalPages });
+        }
+
+        const pages = splitIntoPages(arcBlob);
+        const { encrypted, iv, authTag, hmac } = encryptPage(
+            pages[pageIndex],
+            pageIndex,
+            session.session_token,
+            hwid,
+            session.issued_at
+        );
+
+        return res.json({
+            status: 'ok',
+            page_index: pageIndex,
+            total_pages: totalPages,
+            blob_size: arcBlob.length,
+            data: encrypted.toString('base64'),
+            iv: iv.toString('hex'),
+            auth_tag: authTag.toString('hex'),
+            hmac: hmac,
+        });
+    } catch (err) {
+        console.error('[arc-page] Page download error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+// Page count metadata (lightweight, no blob data)
+router.post('/arc/pages', async (req, res) => {
+    try {
+        const { license_key, session_token, hwid } = req.body || {};
+        const validation = await validateSession(license_key, session_token, hwid);
+        if (!validation.valid) {
+            return res.status(403).json({ status: 'error', reason: validation.reason });
+        }
+
+        let arcBlob;
+        try {
+            arcBlob = loadArcBlob();
+        } catch (err) {
+            return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
+        }
+
+        return res.json({
+            status: 'ok',
+            total_pages: getPageCount(arcBlob.length),
+            page_size: 4096,
+            blob_size: arcBlob.length,
+        });
+    } catch (err) {
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }
 });

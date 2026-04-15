@@ -16,16 +16,34 @@
 #include "core/standalone_chat.hpp"
 #include "core/standalone_license.hpp"
 #include "core/standalone_driver.hpp"
+#include "core/anti-tamper/orchestrator.hpp"
 #include "core/network_view.hpp"
 #include "core/script_engine.hpp"
 #include "core/toast_notification.hpp"
 #include "core/source_reconstruct_view.hpp"
 #include "helpers/stb_image.h"
 
+#include "core/embedded_resources.hpp"
+
+#include <delayimp.h>
 #include <thread>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "Shcore.lib")
+
+
+static FARPROC WINAPI delay_load_hook(unsigned dliNotify, PDelayLoadInfo pdli)
+{
+    if (dliNotify == dliNotePreLoadLibrary) {
+        if (pdli && pdli->szDll && _stricmp(pdli->szDll, "libz3.dll") == 0) {
+            if (embedded_resources::g_z3_module)
+                return reinterpret_cast<FARPROC>(embedded_resources::g_z3_module);
+        }
+    }
+    return nullptr;
+}
+
+extern "C" const PfnDliHook __pfnDliNotifyHook2 = delay_load_hook;
 
 ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
@@ -106,6 +124,11 @@ void set_acrylic_color(HWND hwnd)
 
 int main(int, char**)
 {
+
+
+    embedded_resources::extract_and_load_z3();
+    std::atexit(embedded_resources::cleanup_z3);
+
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"AiDAStandaloneWindow", nullptr };
@@ -245,6 +268,7 @@ int main(int, char**)
 
 
     standalone_license::snapshot_code_hashes();
+    anti_tamper::initialize();
 
 
     ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -405,6 +429,7 @@ int main(int, char**)
     }
 
 
+    anti_tamper::shutdown();
     globals::terminal_mgr.shutdown();
 
     network_view::shutdown();

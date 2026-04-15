@@ -895,6 +895,31 @@ typedef struct _DPRT {
     UINT64 last_check_tsc;
 } dll_protect, *p_dll_protect;
 static_assert(sizeof(dll_protect) == 64, "dll_protect size must be 64 bytes");
+
+
+typedef struct _ABRT {
+    UINT32 magic;
+    UINT32 reason_code;
+    UINT64 evidence_hash;
+    UINT64 timestamp;
+} abort_request, *p_abort_request;
+static_assert(sizeof(abort_request) == 24, "abort_request size must be 24 bytes");
+
+
+#define ADBG_OP_QUERY          0
+#define ADBG_OP_CLEAR_DR       1
+#define ADBG_OP_SCAN_DEBUGGERS 2
+#define ADBG_OP_HIDE_THREAD    3
+
+typedef struct _ADBG {
+    UINT32 operation;
+    UINT32 pid;
+    UINT32 tid;
+    UINT32 result_flags;
+    UINT64 detected_debugger_pid;
+    UINT64 dr_clear_count;
+} anti_debug_request, *p_anti_debug_request;
+static_assert(sizeof(anti_debug_request) == 32, "anti_debug_request size must be 32 bytes");
 inline volatile LONG g_cache_lock = 0;
 
 __forceinline void AcquireCacheLock() {

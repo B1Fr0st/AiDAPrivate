@@ -83,6 +83,7 @@ namespace standalone_license
 
     uint64_t compute_integrity_token(int frame_counter, int function_id);
 
+    void     fold_integrity_token(uint64_t token);
 
     std::string decode_status_string(int string_id);
 

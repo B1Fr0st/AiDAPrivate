@@ -44,10 +44,18 @@ CREATE TABLE IF NOT EXISTS sessions (
     hwid            TEXT        NOT NULL DEFAULT '',
     ip              TEXT        NOT NULL DEFAULT '',
     plugin_version  TEXT        NOT NULL DEFAULT 'unknown',
-    last_heartbeat  BIGINT      NOT NULL
+    last_heartbeat  BIGINT      NOT NULL,
+    kill_flag       BOOLEAN     NOT NULL DEFAULT false,
+    heartbeat_count INTEGER     NOT NULL DEFAULT 0,
+    last_proof_token TEXT       NOT NULL DEFAULT '',
+    last_code_hash  TEXT        NOT NULL DEFAULT '',
+    anomaly_score   REAL        NOT NULL DEFAULT 0,
+    ip_history      TEXT[]      NOT NULL DEFAULT '{}',
+    heartbeat_times BIGINT[]    NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions (session_token);
+CREATE INDEX IF NOT EXISTS idx_sessions_kill  ON sessions (kill_flag) WHERE kill_flag = true;
 
 -- ─── Bans ───────────────────────────────────────────────────────────────────
 -- Two ban types: 'hwid' and 'ip'.

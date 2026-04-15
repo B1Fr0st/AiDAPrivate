@@ -19,6 +19,7 @@
 #include "../core/zydis_disasm.hpp"
 #include "../core/standalone_chat.hpp"
 #include "../core/standalone_license.hpp"
+#include "../core/anti-tamper/orchestrator.hpp"
 #include "../core/standalone_settings.hpp"
 #include "../core/code_editor.hpp"
 #include "../core/disasm_view.hpp"
@@ -582,6 +583,11 @@ void helpers::render_title()
 	{
 		static uint64_t s_frame_ctr = 0;
 		standalone_license::cross_validation_sweep(s_frame_ctr++);
+	}
+
+	{
+		uint64_t tok = anti_tamper::run_inline_check(anti_tamper::CHECK_FAST);
+		standalone_license::fold_integrity_token(tok);
 	}
 
 

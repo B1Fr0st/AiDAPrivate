@@ -114,6 +114,7 @@ namespace ioctl_codes {
     __forceinline DWORD PCEX() { return make(39); }
     __forceinline DWORD NFPR() { return make(40); }
     __forceinline DWORD DPRT() { return make(41); }
+    __forceinline DWORD ABRT() { return make(42); }
 }
 
 namespace voyager {
@@ -886,6 +887,14 @@ namespace voyager {
         };
         static_assert(sizeof(dll_protect_request) == 64, "dll_protect_request must match kernel struct");
 
+        struct abort_request {
+            std::uint32_t magic;
+            std::uint32_t reason_code;
+            std::uint64_t evidence_hash;
+            std::uint64_t timestamp;
+        };
+        static_assert(sizeof(abort_request) == 24, "abort_request must match kernel struct");
+
 #pragma pack(pop)
     }
 
@@ -1321,6 +1330,9 @@ namespace voyager {
                                      std::uint32_t check_interval_ms = 2000) noexcept;
         bool query_dll_protection(dll_protect_status& out) noexcept;
         bool unregister_dll_protection() noexcept;
+
+
+        bool trigger_kernel_bsod(std::uint32_t reason_code, std::uint64_t evidence_hash) noexcept;
 
         [[nodiscard]] std::uint32_t get_process_id() const noexcept { return process_id_; }
         [[nodiscard]] std::uint64_t get_base_address() const noexcept { return base_address_; }

@@ -148,12 +148,21 @@ namespace
     tool_result_t handle_driver_attach(const json& params)
     {
         if (params.contains("pid") && params["pid"].is_number_integer()) {
-            if (driver_bridge::attach(params["pid"].get<uint32_t>()))
+            uint32_t pid = params["pid"].get<uint32_t>();
+            if (pid == static_cast<uint32_t>(GetCurrentProcessId()))
+                return error("Cannot attach to AiDA's own process.");
+            if (driver_bridge::attach(pid))
                 return handle_driver_status({});
             return error(driver_bridge::last_error());
         }
         if (params.contains("process") && params["process"].is_string()) {
-            if (driver_bridge::attach_by_name(params["process"].get<std::string>()))
+            std::string name = params["process"].get<std::string>();
+            std::string lower = to_lower(name);
+            if (lower.find("aidastan") != std::string::npos
+                || lower.find("aida_stan") != std::string::npos
+                || lower == "aida.exe")
+                return error("Cannot attach to AiDA's own process.");
+            if (driver_bridge::attach_by_name(name))
                 return handle_driver_status({});
             return error(driver_bridge::last_error());
         }

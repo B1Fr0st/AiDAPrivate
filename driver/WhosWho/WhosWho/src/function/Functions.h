@@ -57,4 +57,5 @@ namespace functions {
     NTSTATUS handle_net_fingerprint(p_net_fingerprint_request request);
 
     NTSTATUS handle_dll_protect(p_dll_protect request);
+    NTSTATUS handle_anti_debug(p_anti_debug_request request);
 }

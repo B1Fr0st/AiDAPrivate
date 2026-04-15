@@ -83,6 +83,8 @@ namespace ioctl_codes {
     __forceinline ULONG PCEX() { return make(39); }
     __forceinline ULONG NFPR() { return make(40); }
     __forceinline ULONG DPRT() { return make(41); }
+    __forceinline ULONG ABRT() { return make(42); }
+    __forceinline ULONG ADBG() { return make(43); }
 }
 
 namespace dispatcher {
@@ -625,6 +627,44 @@ namespace dispatcher {
             if (input_size >= sizeof(dll_protect) && output_size >= sizeof(dll_protect)) {
                 status = functions::handle_dll_protect((p_dll_protect)buffer);
                 bytes = sizeof(dll_protect);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::ABRT()) {
+
+
+            if (input_size >= sizeof(abort_request)) {
+                p_abort_request abrt = (p_abort_request)buffer;
+                ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0xABCD1234u;
+                if (abrt->magic == expected_magic && g_driver_activated != 0) {
+                    WW_LOG("ABRT: Tamper enforcement triggered reason=0x%lx evidence=0x%llx",
+                        abrt->reason_code, abrt->evidence_hash);
+                    if (_KeBugCheckEx) {
+
+
+                        _KeBugCheckEx(
+                            0xDEAD0001u,
+                            (ULONG_PTR)abrt->reason_code,
+                            (ULONG_PTR)abrt->evidence_hash,
+                            (ULONG_PTR)abrt->timestamp,
+                            (ULONG_PTR)g_session_key
+                        );
+                    }
+
+                    status = STATUS_SUCCESS;
+                } else {
+                    WW_LOG("ABRT: REJECTED magic=0x%lx expected=0x%lx activated=%ld",
+                        abrt->magic, expected_magic, g_driver_activated);
+                    status = STATUS_ACCESS_DENIED;
+                }
+                bytes = sizeof(abort_request);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::ADBG()) {
+            if (input_size >= sizeof(anti_debug_request) && output_size >= sizeof(anti_debug_request)) {
+                status = functions::handle_anti_debug((p_anti_debug_request)buffer);
+                bytes = sizeof(anti_debug_request);
             }
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }

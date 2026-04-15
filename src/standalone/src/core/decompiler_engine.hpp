@@ -1556,7 +1556,7 @@ inline void decompile_function_native(uint64_t func_addr) {
 	if (g_state.decompiling.load())
 		return;
 
-	// Check cache first — instant return if we already have it
+
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		auto cache_it = g_state.cache.find(func_addr);
@@ -1594,10 +1594,9 @@ inline void decompile_function_native(uint64_t func_addr) {
 	}
 
 	std::thread([func_addr]() {
-		// WHY: Pre-read 256KB in one driver call instead of letting Ghidra's
-		// loadFill make hundreds of individual IOCTLs.  This is the single
-		// biggest change that eliminates the UI freeze.
-		constexpr size_t PREREAD_SIZE = 0x40000;  // 256 KB
+
+
+		constexpr size_t PREREAD_SIZE = 0x40000;
 		std::vector<uint8_t> mem;
 		driver_bridge::read_memory(func_addr, PREREAD_SIZE, mem);
 
@@ -1610,8 +1609,7 @@ inline void decompile_function_native(uint64_t func_addr) {
 			return;
 		}
 
-		// WHY: decompile_buffer() creates a temporary Architecture + BufferLoader
-		// with no global mutex held.  This means the render thread is never blocked.
+
 		auto ghidra_result = ghidra_decompiler::decompile_buffer(
 			mem.data(), mem.size(), func_addr, func_addr, &g_state.cancel);
 
@@ -1668,9 +1666,9 @@ inline void decompile_function_hybrid(uint64_t func_addr, const settings_sa_t& s
 	}
 
 	std::thread([func_addr, settings]() {
-		// WHY: Pre-read memory once; used by both the Ghidra decompilation
-		// (via decompile_buffer) and the CFG annotation (via the raw bytes).
-		constexpr size_t PREREAD_SIZE = 0x40000;  // 256 KB
+
+
+		constexpr size_t PREREAD_SIZE = 0x40000;
 		std::vector<uint8_t> mem;
 		driver_bridge::read_memory(func_addr, PREREAD_SIZE, mem);
 
@@ -1807,13 +1805,6 @@ inline void decompile_function_hybrid(uint64_t func_addr, const settings_sa_t& s
 	}).detach();
 }
 
-// ---------------------------------------------------------------------------
-//  batch_decompile_native() — bulk Ghidra decompilation using thread pool
-//  WHY: The old batch_decompile() used AI (network-bound, $$$ per function).
-//       This new function uses the Ghidra thread pool to decompile hundreds
-//       of functions per second locally.  It pre-reads the module memory
-//       once from the driver, then distributes work across all CPU cores.
-// ---------------------------------------------------------------------------
 
 inline void batch_decompile_native(const std::vector<uint64_t>& addresses) {
 	if (g_state.batch_running.load() || g_state.decompiling.load()) return;
@@ -1834,15 +1825,15 @@ inline void batch_decompile_native(const std::vector<uint64_t>& addresses) {
 			return;
 		}
 
-		// Find the memory range spanning all requested addresses
+
 		uint64_t min_addr = *std::min_element(addresses.begin(), addresses.end());
 		uint64_t max_addr = *std::max_element(addresses.begin(), addresses.end());
-		// Add 256KB past the last address for function body coverage
+
 		constexpr size_t TAIL_SIZE = 0x40000;
 		size_t total_size = static_cast<size_t>(max_addr - min_addr) + TAIL_SIZE;
-		if (total_size > 0x10000000) total_size = 0x10000000; // 256 MB cap
+		if (total_size > 0x10000000) total_size = 0x10000000;
 
-		// Pre-read the full range in one driver call
+
 		std::vector<uint8_t> module_mem;
 		driver_bridge::read_memory(min_addr, total_size, module_mem);
 
@@ -1851,14 +1842,14 @@ inline void batch_decompile_native(const std::vector<uint64_t>& addresses) {
 			return;
 		}
 
-		// Use Ghidra's parallel batch_decompile
+
 		std::vector<ghidra_decompiler::ghidra_result_t> results;
 		ghidra_decompiler::batch_decompile(
 			module_mem.data(), module_mem.size(), min_addr,
 			addresses, results,
 			&g_state.batch_done, &g_state.cancel);
 
-		// Store results into the decompiler cache
+
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			for (size_t i = 0; i < results.size(); ++i) {

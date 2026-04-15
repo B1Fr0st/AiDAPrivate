@@ -97,6 +97,16 @@ struct arc_heartbeat_result_t
 };
 
 
+struct arc_page_result_t
+{
+    bool     valid;
+    uint32_t page_index;
+    uint32_t total_pages;
+    uint32_t page_size;       // actual bytes in this page (<=4096)
+    uint64_t blob_size;
+};
+
+
 extern "C"
 {
 
@@ -122,4 +132,24 @@ extern "C"
 
 
     ARC_API void arc_cleanup();
+
+
+    // ── Paged ARC download ─────────────────────────────────────
+    ARC_API arc_page_result_t arc_request_page_count(
+        const char* server_url
+    );
+
+    ARC_API bool arc_download_page(
+        const char*  server_url,
+        uint32_t     page_index,
+        uint8_t*     out_decrypted,
+        uint32_t*    out_size
+    );
+
+    ARC_API bool arc_download_all_pages(
+        const char*  server_url,
+        uint8_t*     out_blob,
+        uint64_t     blob_buf_size,
+        uint64_t*    out_total_size
+    );
 }

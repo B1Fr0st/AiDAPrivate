@@ -596,10 +596,19 @@ if(WIN32)
         set_source_files_properties(${STANDALONE_ASM} PROPERTIES LANGUAGE ASM_MASM)
         add_library(AiDAStandalone_asm OBJECT ${STANDALONE_ASM})
 
+        # --- Embedded resources (libz3.dll + ghidra specs) ---
+        set(Z3_DLL_PATH "${Z3_INSTALL_DIR}/bin/libz3.dll")
+        configure_file(
+            "${STANDALONE_ROOT}/resources/aida_embedded.rc.in"
+            "${CMAKE_BINARY_DIR}/aida_embedded.rc"
+            @ONLY
+        )
+
         add_executable(AiDAStandalone WIN32
             ${STANDALONE_SOURCES}
             ${IMGUI_SOURCES}
             $<TARGET_OBJECTS:AiDAStandalone_asm>
+            "${CMAKE_BINARY_DIR}/aida_embedded.rc"
         )
 
         target_include_directories(AiDAStandalone PRIVATE
@@ -701,7 +710,10 @@ if(WIN32)
             /NODEFAULTLIB:LIBCMT
             /IGNORE:4099
             "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
+            /DELAYLOAD:libz3.dll
         )
+
+        target_link_libraries(AiDAStandalone PRIVATE delayimp)
 
         set_target_properties(AiDAStandalone PROPERTIES
             OUTPUT_NAME "AiDAStandalone"
@@ -721,25 +733,8 @@ if(WIN32)
 
         add_dependencies(AiDAStandalone ghidra_specs)
 
-        add_custom_command(TARGET AiDAStandalone POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
-                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.pspec"
-                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64-win.cspec"
-                "${GHIDRA_SPECS_OUTPUT_DIR}/x86.ldefs"
-                "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs/"
-            COMMENT "Copying Ghidra specs to output directory"
-            VERBATIM
-        )
-
-        add_custom_command(TARGET AiDAStandalone POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${Z3_INSTALL_DIR}/bin/libz3.dll"
-                "$<TARGET_FILE_DIR:AiDAStandalone>/"
-            COMMENT "Copying libz3.dll to output directory"
-            VERBATIM
-        )
+        # Post-build copies removed — libz3.dll and ghidra_specs are now
+        # embedded as Win32 resources inside the .exe via aida_embedded.rc.
 
     endif()
 
@@ -798,6 +793,7 @@ if(WIN32)
             ntdll
             bcrypt
             advapi32
+            winhttp
         )
 
         target_link_options(AiDA_ARC PRIVATE

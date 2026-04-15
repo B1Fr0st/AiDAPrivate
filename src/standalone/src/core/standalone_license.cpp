@@ -437,6 +437,14 @@ namespace
                 body["session_token"] = session_token;
                 body["heartbeat_nonce"] = nonce;
                 body["plugin_version"] = "aida-standalone";
+                if (s_arc_loaded && s_fn_arc_heartbeat) {
+                    auto hb = s_fn_arc_heartbeat();
+                    if (hb.valid) {
+                        char pt[32];
+                        snprintf(pt, sizeof(pt), "%016llX", static_cast<unsigned long long>(hb.proof_token));
+                        body["proof_token"] = pt;
+                    }
+                }
             }
 
             std::string body_str = body.dump();
@@ -940,6 +948,16 @@ namespace
             if (!call_validation_endpoint(*settings, "heartbeat", settings->license_key,
                                           s_cached_hwid, settings->license_session_token,
                                           nonce, error, response)) {
+
+                if (response.is_object() &&
+                    (response.value("status", "") == "killed" ||
+                     response.value("alive", true) == false)) {
+                    std::lock_guard<std::mutex> lk(s_state_mtx);
+                    s_error = "session_terminated";
+                    set_obfuscated_valid(false);
+                    break;
+                }
+
                 consecutive_failures++;
 
 
@@ -1287,6 +1305,14 @@ namespace standalone_license
             static_cast<uint64_t>(function_id)
         };
         return fnv1a(buf, sizeof(buf));
+    }
+
+    void fold_integrity_token(uint64_t token)
+    {
+        if (token == 0) return;
+        uint64_t prev = s_proof_hash.load(std::memory_order_acquire);
+        uint64_t next = prev ^ token ^ _rotl64(token, 31);
+        s_proof_hash.store(next, std::memory_order_release);
     }
 
     std::string decode_status_string(int string_id)

@@ -6,6 +6,7 @@
 #include <function/CoreSecurity.h>
 #include <function/AntiDebug.h>
 #include <function/SentinelBridge.h>
+#include <function/ProcessGuard.h>
 
 namespace net_capture {
     NTSTATUS initialize(PDEVICE_OBJECT devObj);
@@ -424,7 +425,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     WW_LOG("DriverEntry: starting watchdog...");
     sentinel_bridge::start_watchdog();
-    WW_LOG("DriverEntry: watchdog started, scheduling stealth hide...");
+
+    NTSTATUS ob_status = process_guard::init();
+    WW_LOG("DriverEntry: process_guard::init returned 0x%08lx", ob_status);
+
+    WW_LOG("DriverEntry: scheduling stealth hide...");
     stealth::ScheduleDelayedHide(DriverObject);
 
     if (!hvci_detect::is_hvci_enabled()) {

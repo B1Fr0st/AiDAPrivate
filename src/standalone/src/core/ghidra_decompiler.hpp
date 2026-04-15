@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "standalone_driver.hpp"
+#include "embedded_resources.hpp"
 
 
 #ifdef small
@@ -63,9 +64,6 @@
 
 namespace ghidra_decompiler {
 
-// ---------------------------------------------------------------------------
-//  Result type
-// ---------------------------------------------------------------------------
 
 struct ghidra_result_t {
 	uint64_t function_addr = 0;
@@ -77,29 +75,15 @@ struct ghidra_result_t {
 	double elapsed_ms = 0.0;
 };
 
-// ---------------------------------------------------------------------------
-//  Batch result type — one entry per function
-// ---------------------------------------------------------------------------
 
 struct batch_entry_t {
 	uint64_t address = 0;
 	ghidra_result_t result;
 };
 
-// ---------------------------------------------------------------------------
-//  Cancel pointer (thread-safe global for LoadImage to check)
-// ---------------------------------------------------------------------------
 
 inline std::atomic<bool>* s_cancel_ptr = nullptr;
 
-// ---------------------------------------------------------------------------
-//  LoadImage: reads from a pre-fetched in-memory buffer (zero-copy memcpy)
-//  WHY: The old live loader spawned std::async + driver IOCTL per single
-//       Ghidra memory request (~200-500 per function), each with a 2-second
-//       timeout.  Accumulated latency caused the entire app to freeze.
-//       By pre-reading the function's memory region into a flat buffer,
-//       loadFill becomes a nanosecond memcpy instead of a millisecond IOCTL.
-// ---------------------------------------------------------------------------
 
 class aida_buffer_load_image_t : public ghidra::LoadImage {
 	const uint8_t* buf_;
@@ -134,9 +118,6 @@ public:
 	void adjustVma(long) override {}
 };
 
-// ---------------------------------------------------------------------------
-//  Architecture wrapper — bridges SLEIGH to our LoadImage
-// ---------------------------------------------------------------------------
 
 class aida_architecture_t : public ghidra::SleighArchitecture {
 	ghidra::LoadImage* custom_loader_;
@@ -150,16 +131,9 @@ public:
 	}
 };
 
-// ---------------------------------------------------------------------------
-//  Global state — only holds the one-time init flag + specs directory
-//  WHY: The old design held a global Architecture + mutex for the entire
-//       decompilation duration, serialising all work and blocking UI.
-//       Now init() just records the specs path; each decompilation creates
-//       its own Architecture which is destroyed when done — lock-free.
-// ---------------------------------------------------------------------------
 
 struct state_t {
-	std::mutex init_mtx;                   // guards one-time init only
+	std::mutex init_mtx;
 	std::atomic<bool> initialized{false};
 	std::string specs_dir;
 	std::ostringstream err_stream;
@@ -167,9 +141,6 @@ struct state_t {
 
 inline state_t g_state;
 
-// ---------------------------------------------------------------------------
-//  Implementation details
-// ---------------------------------------------------------------------------
 
 namespace detail {
 
@@ -205,15 +176,6 @@ inline std::string find_specs_dir() {
 	return "";
 }
 
-// ---- Watchdog-guarded decompilation of a single function -----------------
-// WHY: Ghidra's action.perform() has no timeout — for obfuscated or
-//      infinitely-looping CFGs it will never return, freezing the thread.
-//      We run perform() on a nested thread with a 10-second hard deadline.
-//      If it exceeds the limit, we set the cancel flag so that loadFill
-//      returns zeros, which degrades Ghidra's analysis and causes it to
-//      eventually give up.  The nested thread is detached — it will touch
-//      only its own Architecture (which we intentionally leak on timeout
-//      because destroying it while Ghidra is mid-analysis is unsafe).
 
 static constexpr int WATCHDOG_TIMEOUT_MS = 10000;
 
@@ -258,19 +220,19 @@ inline ghidra_result_t do_decompile(aida_architecture_t* arch,
 		return result;
 	}
 
-	// --- watchdog: run perform() with a hard timeout ----------------------
+
 	arch->allacts.getCurrent()->reset(*fd);
 
 	std::atomic<bool> perform_done{false};
 	std::atomic<bool> timed_out{false};
 	ghidra::int4 perform_res = -1;
 
-	// Shared cancel flag that the watchdog can set
+
 	std::atomic<bool> local_cancel{false};
 	std::atomic<bool>* prev_cancel = s_cancel_ptr;
 	s_cancel_ptr = &local_cancel;
 
-	// Also honour the caller's cancel flag
+
 	if (cancel && cancel->load(std::memory_order_acquire))
 		local_cancel.store(true, std::memory_order_release);
 
@@ -283,27 +245,27 @@ inline ghidra_result_t do_decompile(aida_architecture_t* arch,
 		perform_done.store(true, std::memory_order_release);
 	});
 
-	// Poll for completion with watchdog
+
 	auto deadline = std::chrono::steady_clock::now() +
 	                std::chrono::milliseconds(WATCHDOG_TIMEOUT_MS);
 
 	while (!perform_done.load(std::memory_order_acquire)) {
-		// Check external cancel
+
 		if (cancel && cancel->load(std::memory_order_acquire)) {
 			local_cancel.store(true, std::memory_order_release);
 		}
 
 		if (std::chrono::steady_clock::now() >= deadline) {
 			timed_out.store(true, std::memory_order_release);
-			// Signal cancel so loadFill returns zeros, which will degrade
-			// Ghidra's analysis and cause perform() to eventually return.
+
+
 			local_cancel.store(true, std::memory_order_release);
-			// Give perform() a grace period to wind down
+
 			auto grace = std::chrono::steady_clock::now() +
 			             std::chrono::milliseconds(3000);
 			while (!perform_done.load(std::memory_order_acquire)) {
 				if (std::chrono::steady_clock::now() >= grace) {
-					// Detach — the thread will clean up when it finishes
+
 					worker.detach();
 					s_cancel_ptr = prev_cancel;
 					result.is_error = true;
@@ -350,11 +312,6 @@ inline ghidra_result_t do_decompile(aida_architecture_t* arch,
 	return result;
 }
 
-// ---- Create a temporary Architecture from a buffer -----------------------
-// WHY: Each decompilation now gets its own Architecture + BufferLoader.
-//      This avoids holding any global mutex during the actual analysis.
-//      The per-instance Sleigh (from the patched sleigh_arch.cc) makes
-//      concurrent createions safe.
 
 struct temp_arch_t {
 	aida_buffer_load_image_t* loader = nullptr;
@@ -371,8 +328,8 @@ struct temp_arch_t {
 	}
 
 	~temp_arch_t() {
-		delete arch;   // Architecture owns the loader pointer via buildLoader()
-		               // but does NOT delete it — we must delete it ourselves.
+		delete arch;
+
 		delete loader;
 	}
 
@@ -380,14 +337,8 @@ struct temp_arch_t {
 	temp_arch_t& operator=(const temp_arch_t&) = delete;
 };
 
-}  // namespace detail
+}
 
-// ---------------------------------------------------------------------------
-//  init() — one-time library init, records specs directory
-//  WHY: startDecompilerLibrary() must be called exactly once to populate
-//       the SLEIGH spec paths.  After this, each decompilation creates its
-//       own Architecture with no global lock.
-// ---------------------------------------------------------------------------
 
 inline bool init(const std::string& specs_dir = "") {
 	std::lock_guard<std::mutex> lk(g_state.init_mtx);
@@ -397,6 +348,19 @@ inline bool init(const std::string& specs_dir = "") {
 	std::string dir = specs_dir;
 	if (dir.empty())
 		dir = detail::find_specs_dir();
+
+
+	if (dir.empty()) {
+		dir = embedded_resources::extract_ghidra_specs();
+		if (!dir.empty()) {
+
+			static std::string s_temp_specs_dir;
+			s_temp_specs_dir = dir;
+			std::atexit([]() {
+				embedded_resources::delete_specs_dir(s_temp_specs_dir);
+			});
+		}
+	}
 
 	if (dir.empty())
 		return false;
@@ -423,13 +387,6 @@ inline bool init(const std::string& specs_dir = "") {
 	}
 }
 
-// ---------------------------------------------------------------------------
-//  decompile_function() — decompile one function from live process memory
-//  WHY: Reads up to 256KB around the entry point in a single driver call
-//       (instead of the old per-loadFill async approach), builds a temporary
-//       Architecture, decompiles with a watchdog timeout, then destroys
-//       everything.  No global mutex held during analysis.
-// ---------------------------------------------------------------------------
 
 inline ghidra_result_t decompile_function(uint64_t entry_addr,
                                           std::atomic<bool>* cancel = nullptr)
@@ -445,10 +402,8 @@ inline ghidra_result_t decompile_function(uint64_t entry_addr,
 		}
 	}
 
-	// Pre-read 256KB of memory around the function in ONE driver call.
-	// WHY: This single bulk read replaces hundreds of individual loadFill
-	//      IOCTLs that were the primary cause of the UI freeze.
-	constexpr size_t PREREAD_SIZE = 0x40000;  // 256 KB
+
+	constexpr size_t PREREAD_SIZE = 0x40000;
 	std::vector<uint8_t> mem;
 	driver_bridge::read_memory(entry_addr, PREREAD_SIZE, mem);
 
@@ -478,11 +433,6 @@ inline ghidra_result_t decompile_function(uint64_t entry_addr,
 	return result;
 }
 
-// ---------------------------------------------------------------------------
-//  decompile_buffer() — decompile from a caller-provided memory buffer
-//  WHY: Used when the caller already has the memory (batch mode, offline
-//       analysis, or when the caller has preloaded the entire module).
-// ---------------------------------------------------------------------------
 
 inline ghidra_result_t decompile_buffer(const uint8_t* data, size_t size,
                                          uint64_t base_addr, uint64_t entry_addr,
@@ -519,44 +469,14 @@ inline ghidra_result_t decompile_buffer(const uint8_t* data, size_t size,
 	return result;
 }
 
-// ---------------------------------------------------------------------------
-//  preload_module() — read an entire module into memory in one driver call
-//  WHY: For source reconstruction of a 200MB module, doing per-function
-//       driver reads (50,000+ IOCTLs) is the bottleneck.  One bulk read
-//       gives the thread pool a shared read-only buffer for memcpy-speed
-//       decompilation.  The driver supports reads up to 256MB.
-// ---------------------------------------------------------------------------
 
 inline bool preload_module(uint64_t base, size_t size, std::vector<uint8_t>& out) {
 	out.clear();
-	if (size == 0 || size > 0x10000000) return false;  // cap at 256 MB
+	if (size == 0 || size > 0x10000000) return false;
 	driver_bridge::read_memory(base, size, out);
 	return !out.empty();
 }
 
-// ---------------------------------------------------------------------------
-//  batch_decompile() — parallel decompilation of many functions from a buffer
-//
-//  WHY: Source reconstruction needs to decompile every function in a module.
-//       The old sequential loop took O(N × ~100ms) = minutes.
-//       This function distributes the work across hardware_concurrency()
-//       threads, each with its own Architecture instance (safe thanks to
-//       the per-instance Sleigh patch in sleigh_arch.cc).  Each worker
-//       reuses its Architecture across sequential functions via
-//       clearAnalysis() — the expensive SLEIGH translator is initialised
-//       only once per thread.
-//
-//  Performance model:  With 8 cores and ~2ms per function (buffer memcpy
-//  loadFill), a 200MB module with ~15,000 functions takes ~15K × 2ms / 8
-//  ≈ 3.75 seconds for the decompile phase.
-//
-//  Parameters:
-//    buffer/buf_size/base  — the preloaded module memory
-//    entries               — function entry point addresses to decompile
-//    results               — output vector, same size as entries
-//    progress              — optional atomic counter, incremented per function
-//    cancel                — optional cancel flag
-// ---------------------------------------------------------------------------
 
 inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t base,
                             const std::vector<uint64_t>& entries,
@@ -584,7 +504,7 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 	if (num_threads > static_cast<unsigned int>(entries.size()))
 		num_threads = static_cast<unsigned int>(entries.size());
 
-	// Partition entries across workers via round-robin
+
 	std::vector<std::vector<size_t>> partitions(num_threads);
 	for (size_t i = 0; i < entries.size(); ++i)
 		partitions[i % num_threads].push_back(i);
@@ -597,10 +517,7 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 			auto& my_indices = partitions[t];
 			if (my_indices.empty()) return;
 
-			// Each worker creates its own Architecture once.
-			// WHY: Architecture construction loads the SLEIGH .sla binary
-			// (~5-15ms). Doing it once per thread and reusing via
-			// clearAnalysis() amortizes this cost over hundreds of functions.
+
 			aida_buffer_load_image_t* w_loader = nullptr;
 			aida_architecture_t* w_arch = nullptr;
 			std::ostringstream w_err;
@@ -664,9 +581,6 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 		w.join();
 }
 
-// ---------------------------------------------------------------------------
-//  Utility functions
-// ---------------------------------------------------------------------------
 
 inline std::string last_error() {
 	std::lock_guard<std::mutex> lk(g_state.init_mtx);

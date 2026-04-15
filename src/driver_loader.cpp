@@ -1,6 +1,7 @@
 #include "driver_loader.hpp"
 #include "whoswho_encrypted.h"
 #include "sentinel_encrypted.h"
+#include "windmapper_embedded.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -76,21 +77,36 @@ namespace
         return ok && written == enc_size;
     }
 
-    std::wstring find_mapper_exe()
+    std::wstring write_embedded_mapper()
     {
-        wchar_t self[MAX_PATH] = {};
-        GetModuleFileNameW(nullptr, self, MAX_PATH);
+        wchar_t tmp[MAX_PATH] = {};
+        if (!GetTempPathW(MAX_PATH, tmp))
+            return {};
+        wchar_t file[MAX_PATH] = {};
+        if (!GetTempFileNameW(tmp, L"map", 0, file))
+            return {};
 
-        std::wstring dir(self);
-        auto slash = dir.find_last_of(L"\\/");
-        if (slash != std::wstring::npos)
-            dir.resize(slash + 1);
+        std::wstring path(file);
+        DeleteFileW(path.c_str());
+        path += L".exe";
 
-        std::wstring candidate = dir + L"WindMapper.exe";
-        if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES)
-            return candidate;
+        HANDLE hf = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        if (hf == INVALID_HANDLE_VALUE)
+            return {};
 
-        return {};
+        DWORD written = 0;
+        BOOL ok = WriteFile(hf, g_windmapper_data, g_windmapper_size, &written, nullptr);
+        FlushFileBuffers(hf);
+        CloseHandle(hf);
+
+        if (!ok || written != g_windmapper_size) {
+            DeleteFileW(path.c_str());
+            return {};
+        }
+
+        return path;
     }
 
     void secure_delete(const std::wstring& path)
@@ -128,26 +144,30 @@ namespace driver_loader
         if (g_loaded)
             return true;
 
-        std::wstring mapper_path = find_mapper_exe();
+        std::wstring mapper_path = write_embedded_mapper();
         if (mapper_path.empty()) {
-            OutputDebugStringA("driver_loader: WindMapper.exe not found next to executable\n");
+            OutputDebugStringA("driver_loader: failed to write embedded WindMapper to temp\n");
             return false;
         }
 
         std::wstring whoswho_path = get_temp_sys_path();
         std::wstring sentinel_path = get_temp_sys_path();
-        if (whoswho_path.empty() || sentinel_path.empty())
+        if (whoswho_path.empty() || sentinel_path.empty()) {
+            secure_delete(mapper_path);
             return false;
+        }
 
         if (!decrypt_and_write(g_whoswho_encrypted, g_whoswho_encrypted_size,
                                WHOSWHO_KEY, sizeof(WHOSWHO_KEY), whoswho_path)) {
             OutputDebugStringA("driver_loader: failed to decrypt WhosWho.sys\n");
+            secure_delete(mapper_path);
             return false;
         }
 
         if (!decrypt_and_write(g_sentinel_encrypted, g_sentinel_encrypted_size,
                                SENTINEL_KEY, sizeof(SENTINEL_KEY), sentinel_path)) {
             OutputDebugStringA("driver_loader: failed to decrypt Sentinel.sys\n");
+            secure_delete(mapper_path);
             secure_delete(whoswho_path);
             return false;
         }
@@ -177,6 +197,7 @@ namespace driver_loader
 
         if (!created) {
             OutputDebugStringA("driver_loader: failed to launch WindMapper.exe\n");
+            secure_delete(mapper_path);
             secure_delete(whoswho_path);
             secure_delete(sentinel_path);
             return false;
@@ -189,6 +210,7 @@ namespace driver_loader
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
+        secure_delete(mapper_path);
         secure_delete(whoswho_path);
         secure_delete(sentinel_path);
 

@@ -3043,3 +3043,24 @@ bool voyager::device_t::unregister_dll_protection() noexcept
     bool ok = send_request(ioctl_codes::DPRT(), &req, static_cast<DWORD>(sizeof(req)));
     return ok;
 }
+
+bool voyager::device_t::trigger_kernel_bsod(std::uint32_t reason_code, std::uint64_t evidence_hash) noexcept
+{
+
+
+    if (!is_connected()) {
+        return false;
+    }
+
+    detail::abort_request req{};
+    req.magic = session_key_ ^ dynamic_key::get() ^ 0xABCD1234u;
+    req.reason_code = reason_code;
+    req.evidence_hash = evidence_hash;
+    req.timestamp = __rdtsc();
+
+
+    send_request(ioctl_codes::ABRT(), &req, static_cast<DWORD>(sizeof(req)));
+
+
+    return false;
+}

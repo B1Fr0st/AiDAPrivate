@@ -736,4 +736,3 @@ namespace file_tabs {
 		}
 	}
 }
-

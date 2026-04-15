@@ -44,4 +44,50 @@ namespace object_guard {
         SN_LOG("object_guard::init: result=%d", (int)result);
         return result;
     }
+
+    inline volatile UINT64 g_last_suspicious_pid = 0;
+    inline volatile UINT32 g_suspicious_handle_count = 0;
+
+    __forceinline void scan_suspicious_handles() {
+        __try {
+            PEPROCESS initial = PsInitialSystemProcess;
+            if (!initial || !_MmIsAddressValid(initial)) return;
+
+            PLIST_ENTRY list_head = (PLIST_ENTRY)((UINT8*)initial + 0x448);
+            PLIST_ENTRY entry = list_head->Flink;
+
+            const char* dump_tools[] = {
+                "procdump", "processdump", "hollowshunt",
+                "pe-sieve", "scylla", "taskdmp", "minidump"
+            };
+            constexpr int num_tools = sizeof(dump_tools) / sizeof(dump_tools[0]);
+
+            for (int iter = 0; iter < 1024 && entry != list_head; ++iter, entry = entry->Flink) {
+                PEPROCESS proc = (PEPROCESS)((UINT8*)entry - 0x448);
+                if (!_MmIsAddressValid(proc)) continue;
+
+                UCHAR* name = PsGetProcessImageFileName(proc);
+                if (!name || !_MmIsAddressValid(name)) continue;
+
+                for (int t = 0; t < num_tools; ++t) {
+                    const char* target = dump_tools[t];
+                    bool match = true;
+                    for (int c = 0; target[c] != '\0'; ++c) {
+                        char a = (char)(name[c] | 0x20);
+                        char b = (char)(target[c] | 0x20);
+                        if (a != b) { match = false; break; }
+                    }
+                    if (match) {
+                        HANDLE pid = PsGetProcessId(proc);
+                        g_last_suspicious_pid = (UINT64)(ULONG_PTR)pid;
+                        InterlockedIncrement((volatile LONG*)&g_suspicious_handle_count);
+                        SN_LOG("object_guard::scan: DUMP TOOL DETECTED pid=%llu name=%.15s",
+                            (UINT64)(ULONG_PTR)pid, name);
+
+                        return;
+                    }
+                }
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
 }

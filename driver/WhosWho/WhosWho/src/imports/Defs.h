@@ -225,6 +225,9 @@ inline BOOLEAN            (NTAPI* _KeSetTimerEx)                   (PKTIMER, LAR
 inline BOOLEAN            (NTAPI* _KeCancelTimer)                  (PKTIMER);
 inline VOID               (NTAPI* _KeFlushQueuedDpcs)              (VOID);
 
+inline NTSTATUS           (NTAPI* _ObRegisterCallbacks)             (POB_CALLBACK_REGISTRATION, PVOID*);
+inline VOID               (NTAPI* _ObUnRegisterCallbacks)           (PVOID);
+
 inline ULONG              (__cdecl* _DbgPrintEx)                   (ULONG, ULONG, PCSTR, ...);
 
 #ifdef DRIVER_DEBUG
@@ -666,6 +669,9 @@ inline bool SetupFunctions() {
     *(PVOID*)&_KeSetTimerEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeSetTimerEx"));
     *(PVOID*)&_KeCancelTimer = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeCancelTimer"));
     *(PVOID*)&_KeFlushQueuedDpcs = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeFlushQueuedDpcs"));
+
+    *(PVOID*)&_ObRegisterCallbacks = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObRegisterCallbacks"));
+    *(PVOID*)&_ObUnRegisterCallbacks = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObUnRegisterCallbacks"));
 
     *(PVOID*)&_DbgPrintEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("DbgPrintEx"));
 

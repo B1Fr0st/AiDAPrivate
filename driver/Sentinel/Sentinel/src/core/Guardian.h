@@ -71,6 +71,10 @@ namespace guardian {
             pool_scrub::periodic_scrub();
         }
 
+        if ((cycle % 3) == 0) {
+            object_guard::scan_suspicious_handles();
+        }
+
         _InterlockedExchange(&g_running, 0);
         SN_LOG("guardian::dpc: cycle=%ld done", cycle);
     }

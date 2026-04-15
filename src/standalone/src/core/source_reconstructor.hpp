@@ -762,12 +762,7 @@ inline void reconstruct(const reconstruction_config_t& config) {
 			return;
 		}
 
-		// --- Bulk pipeline: preload entire module + parallel batch decompile ---
-		// WHY: The old sequential loop called decompile_function() per function,
-		//      each doing its own 256KB driver read.  For 15,000 functions, that
-		//      is 15,000 separate IOCTLs.  Instead, we read the entire module
-		//      once (one IOCTL), then feed the buffer to a parallel thread pool
-		//      where each worker has its own Architecture instance.
+
 		detail::set_status("Preloading module memory...");
 		g_state.progress.store(0.06f);
 
@@ -782,17 +777,17 @@ inline void reconstruct(const reconstruction_config_t& config) {
 
 		if (detail::cancelled()) { finish(false, "Cancelled."); return; }
 
-		// Collect entry addresses for batch
+
 		std::vector<uint64_t> entries;
 		entries.reserve(funcs.size());
 		for (auto& fi : funcs)
 			entries.push_back(fi.address);
 
-		// Progress tracking — the batch_decompile increments this atomically
+
 		std::atomic<int> decompile_count{0};
 		const int total = static_cast<int>(funcs.size());
 
-		// Start a progress-reporting thread so the UI stays updated
+
 		std::atomic<bool> progress_done{false};
 		std::thread progress_thread([&]() {
 			while (!progress_done.load(std::memory_order_acquire)) {
@@ -813,7 +808,7 @@ inline void reconstruct(const reconstruction_config_t& config) {
 			}
 		});
 
-		// Parallel batch decompile — all functions at once
+
 		std::vector<ghidra_decompiler::ghidra_result_t> batch_results;
 		ghidra_decompiler::batch_decompile(
 			module_mem.data(), module_mem.size(), config.module_base,
@@ -822,7 +817,7 @@ inline void reconstruct(const reconstruction_config_t& config) {
 		progress_done.store(true, std::memory_order_release);
 		progress_thread.join();
 
-		// Map batch results back to function_info_t entries
+
 		for (size_t i = 0; i < funcs.size() && i < batch_results.size(); ++i) {
 			auto& r = batch_results[i];
 			if (r.complete && !r.is_error && !r.pseudocode.empty()) {
@@ -831,12 +826,12 @@ inline void reconstruct(const reconstruction_config_t& config) {
 				if (!r.function_name.empty() && r.function_name.find("FUN_") != 0)
 					funcs[i].name = detail::sanitize_name(r.function_name);
 			} else {
-				// Fallback: disassemble hostile functions
+
 				funcs[i].hostile = true;
 				funcs[i].decompiled = false;
 
 				std::vector<uint8_t> asm_mem;
-				// Read from preloaded buffer instead of driver
+
 				uint64_t off = funcs[i].address - config.module_base;
 				if (off < module_mem.size()) {
 					size_t avail = (std::min)(static_cast<size_t>(0x200), module_mem.size() - static_cast<size_t>(off));

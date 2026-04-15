@@ -54,6 +54,19 @@ static bool is_ida_host_process_name(const std::string& process_name)
         || lower.find("idat64.exe") != std::string::npos;
 }
 
+static bool is_self_target_process_name(const std::string& process_name)
+{
+    const std::string lower = to_lower_ascii_copy(process_name);
+    return lower.find("aidastan") != std::string::npos
+        || lower.find("aida_stan") != std::string::npos
+        || lower == "aida.exe";
+}
+
+static bool is_self_target_pid(uint32_t pid)
+{
+    return pid != 0 && pid == static_cast<uint32_t>(GetCurrentProcessId());
+}
+
 static std::string trim_ascii_copy(const std::string& text)
 {
     const std::size_t first = text.find_first_not_of(" \t\r\n");
@@ -577,9 +590,15 @@ tool_result_t driver_attach(const json& params)
     if (is_ida_host_process_name(process_name))
         return tool_result_t::error(OBFSTR("Refusing to attach kernel driver to IDA host process name."));
 
+    if (is_self_target_process_name(process_name))
+        return tool_result_t::error(OBFSTR("Cannot attach to AiDA's own process."));
+
     std::uint32_t pid = device->find_process(process_name.c_str());
     if (pid == 0)
         return tool_result_t::error(OBFSTR("Process not found: ") + process_name);
+
+    if (is_self_target_pid(pid))
+        return tool_result_t::error(OBFSTR("Cannot attach to AiDA's own process."));
 
     if (false)
     {

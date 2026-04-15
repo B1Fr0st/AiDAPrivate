@@ -380,6 +380,9 @@ namespace driver_bridge
     bool query_dll_protection(dll_protect_status_t& out);
     bool unregister_dll_protection();
 
+
+    bool trigger_kernel_bsod(uint32_t reason_code, uint64_t evidence_hash);
+
     bool traffic_redirect_op(uint32_t operation, uint32_t rule_id = 0, uint32_t protocol = 0,
                              uint32_t match_port = 0, const uint8_t* match_addr = nullptr,
                              uint32_t redirect_port = 0, const uint8_t* redirect_addr = nullptr,
