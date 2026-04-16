@@ -102,7 +102,7 @@ struct arc_page_result_t
     bool     valid;
     uint32_t page_index;
     uint32_t total_pages;
-    uint32_t page_size;       // actual bytes in this page (<=4096)
+    uint32_t page_size;
     uint64_t blob_size;
 };
 
@@ -134,7 +134,6 @@ extern "C"
     ARC_API void arc_cleanup();
 
 
-    // ── Paged ARC download ─────────────────────────────────────
     ARC_API arc_page_result_t arc_request_page_count(
         const char* server_url
     );

@@ -12,14 +12,28 @@ namespace heartbeat {
         volatile ULONG  code_size;
         volatile LONG64 whoswho_tsc;
         volatile LONG64 sentinel_tsc;
+        volatile ULONG  sentinel_cmd;
+        volatile ULONG  sentinel_cmd_param;
+        volatile UINT64 sentinel_challenge;
+        volatile UINT64 whoswho_response;
+        volatile UINT64 challenge_issued_tsc;
     };
 
 
     constexpr ULONG  BRIDGE_MAGIC = 0x57484F53;
     constexpr ULONG  BRIDGE_VERSION = 1;
 
+    constexpr ULONG BRIDGE_CMD_NONE             = 0;
+    constexpr ULONG BRIDGE_CMD_DEBUGGER_FOUND   = 1;
+    constexpr ULONG BRIDGE_CMD_DUMP_TOOL_FOUND  = 2;
+    constexpr ULONG BRIDGE_CMD_INTEGRITY_FAIL   = 3;
+    constexpr ULONG BRIDGE_CMD_CALLBACK_REMOVED = 4;
+    constexpr ULONG BRIDGE_CMD_ETW_REACTIVATED  = 5;
+
 
     constexpr UINT64 HEARTBEAT_TIMEOUT_TSC = 60ULL * 3000000000ULL;
+    constexpr UINT64 CHALLENGE_TIMEOUT_TSC = 30ULL * 3000000000ULL;
+    constexpr UINT64 CHALLENGE_HMAC_KEY    = 0x7A3F1D9E5BC82A46ULL;
 
     inline volatile sentinel_bridge_t* g_bridge = nullptr;
     inline volatile UINT64             g_last_whoswho_tsc = 0;
@@ -221,5 +235,157 @@ namespace heartbeat {
         }
 
         return true;
+    }
+
+    __forceinline void send_command(ULONG cmd, ULONG param = 0) {
+        if (!_InterlockedCompareExchange(&g_initialized, 1, 1))
+            return;
+        if (!g_bridge || !_MmIsAddressValid(reinterpret_cast<PVOID>(
+                const_cast<sentinel_bridge_t*>(g_bridge))))
+            return;
+
+        __try {
+            _InterlockedExchange((volatile LONG*)&g_bridge->sentinel_cmd_param, (LONG)param);
+            _InterlockedExchange((volatile LONG*)&g_bridge->sentinel_cmd, (LONG)cmd);
+            SN_LOG("heartbeat::send_command: cmd=%lu param=0x%lx", cmd, param);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("heartbeat::send_command: EXCEPTION");
+        }
+    }
+
+    __forceinline UINT64 compute_expected_response(UINT64 challenge) {
+        UINT64 h = challenge ^ CHALLENGE_HMAC_KEY;
+        h ^= h >> 33;
+        h *= 0xFF51AFD7ED558CCDULL;
+        h ^= h >> 33;
+        h *= 0xC4CEB9FE1A85EC53ULL;
+        h ^= h >> 33;
+        return h;
+    }
+
+    __forceinline void issue_challenge() {
+        if (!_InterlockedCompareExchange(&g_initialized, 1, 1))
+            return;
+        if (!g_bridge || !_MmIsAddressValid(reinterpret_cast<PVOID>(
+                const_cast<sentinel_bridge_t*>(g_bridge))))
+            return;
+
+        __try {
+            UINT64 challenge = __rdtsc() ^ (static_cast<UINT64>(__rdtsc()) << 17);
+            challenge |= 1;
+            InterlockedExchange64(
+                const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
+                    &g_bridge->sentinel_challenge)),
+                static_cast<LONG64>(challenge));
+            InterlockedExchange64(
+                const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
+                    &g_bridge->whoswho_response)),
+                0);
+            InterlockedExchange64(
+                const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
+                    &g_bridge->challenge_issued_tsc)),
+                static_cast<LONG64>(__rdtsc()));
+            SN_LOG("heartbeat::issue_challenge: challenge=0x%llx", challenge);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("heartbeat::issue_challenge: EXCEPTION");
+        }
+    }
+
+    inline volatile LONG g_challenge_failures = 0;
+    constexpr LONG CHALLENGE_FAILURE_THRESHOLD = 3;
+
+    __forceinline bool verify_challenge_response() {
+        if (!_InterlockedCompareExchange(&g_initialized, 1, 1))
+            return true;
+        if (!g_bridge || !_MmIsAddressValid(reinterpret_cast<PVOID>(
+                const_cast<sentinel_bridge_t*>(g_bridge))))
+            return true;
+
+        __try {
+            UINT64 challenge = static_cast<UINT64>(g_bridge->sentinel_challenge);
+            if (challenge == 0)
+                return true;
+
+            UINT64 issued_tsc = static_cast<UINT64>(g_bridge->challenge_issued_tsc);
+            UINT64 now = __rdtsc();
+            if (now - issued_tsc < 10ULL * 3000000000ULL)
+                return true;
+
+            UINT64 response = static_cast<UINT64>(g_bridge->whoswho_response);
+            UINT64 expected = compute_expected_response(challenge);
+
+            if (response == expected) {
+                _InterlockedExchange(&g_challenge_failures, 0);
+                InterlockedExchange64(
+                    const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
+                        &g_bridge->sentinel_challenge)),
+                    0);
+                SN_LOG("heartbeat::verify_challenge: PASS");
+                return true;
+            }
+
+            if (now - issued_tsc > CHALLENGE_TIMEOUT_TSC) {
+                LONG fails = _InterlockedIncrement(&g_challenge_failures);
+                SN_LOG("heartbeat::verify_challenge: TIMEOUT fails=%ld response=0x%llx expected=0x%llx",
+                    fails, response, expected);
+
+                if (fails >= CHALLENGE_FAILURE_THRESHOLD) {
+                    SN_LOG("heartbeat::verify_challenge: BUGCHECK - challenge auth failed %ld times", fails);
+                    if (_KeBugCheckEx) {
+                        _KeBugCheckEx(0xDEAD5E06, challenge, response, expected, static_cast<ULONG_PTR>(fails));
+                    }
+                    return false;
+                }
+
+                InterlockedExchange64(
+                    const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
+                        &g_bridge->sentinel_challenge)),
+                    0);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("heartbeat::verify_challenge: EXCEPTION");
+        }
+        return true;
+    }
+
+    __forceinline bool verify_module_presence() {
+        extern volatile PVOID g_target_driver_base;
+        extern PDRIVER_OBJECT g_sentinel_driver_object;
+
+        if (!g_target_driver_base || !g_sentinel_driver_object)
+            return true;
+
+        if (!_MmIsAddressValid(g_sentinel_driver_object) ||
+            !g_sentinel_driver_object->DriverSection ||
+            !_MmIsAddressValid(g_sentinel_driver_object->DriverSection))
+            return true;
+
+        PLDR_DATA_TABLE_ENTRY sentinel_ldr = static_cast<PLDR_DATA_TABLE_ENTRY>(
+            g_sentinel_driver_object->DriverSection);
+        PLIST_ENTRY list_head = &sentinel_ldr->InLoadOrderModuleList;
+
+        __try {
+            PLIST_ENTRY entry = list_head->Flink;
+            ULONG safety = 512;
+
+            while (entry && entry != list_head && safety-- > 0) {
+                if (!_MmIsAddressValid(entry))
+                    break;
+
+                PLDR_DATA_TABLE_ENTRY mod = CONTAINING_RECORD(
+                    entry, LDR_DATA_TABLE_ENTRY, InLoadOrderModuleList);
+
+                if (_MmIsAddressValid(mod) && mod->DllBase == (PVOID)g_target_driver_base)
+                    return true;
+
+                entry = entry->Flink;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return true;
+        }
+
+        SN_LOG("heartbeat::verify_module_presence: target module %p NOT FOUND in module list",
+            (PVOID)g_target_driver_base);
+        return false;
     }
 }

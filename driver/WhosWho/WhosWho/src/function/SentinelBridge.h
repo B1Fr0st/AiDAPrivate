@@ -10,6 +10,12 @@ namespace sentinel_bridge {
 
     constexpr ULONG BUGCHECK_SENTINEL_ABSENT = 0xDEAD5E10;
 
+    constexpr ULONG BRIDGE_CMD_NONE             = 0;
+    constexpr ULONG BRIDGE_CMD_DEBUGGER_FOUND   = 1;
+    constexpr ULONG BRIDGE_CMD_DUMP_TOOL_FOUND  = 2;
+    constexpr ULONG BRIDGE_CMD_INTEGRITY_FAIL   = 3;
+    constexpr ULONG BRIDGE_CMD_CALLBACK_REMOVED = 4;
+    constexpr ULONG BRIDGE_CMD_ETW_REACTIVATED  = 5;
 
     struct bridge_t {
         volatile ULONG   magic;
@@ -18,6 +24,11 @@ namespace sentinel_bridge {
         volatile ULONG   code_size;
         volatile LONG64  whoswho_tsc;
         volatile LONG64  sentinel_tsc;
+        volatile ULONG   sentinel_cmd;
+        volatile ULONG   sentinel_cmd_param;
+        volatile UINT64  sentinel_challenge;
+        volatile UINT64  whoswho_response;
+        volatile UINT64  challenge_issued_tsc;
     };
 
 
@@ -27,8 +38,15 @@ namespace sentinel_bridge {
         nullptr,
         0,
         0,
+        0,
+        BRIDGE_CMD_NONE,
+        0,
+        0,
+        0,
         0
     };
+
+    constexpr UINT64 CHALLENGE_HMAC_KEY = 0x7A3F1D9E5BC82A46ULL;
 
 
     constexpr LONG WATCHDOG_PERIOD_MS    = 10000;
@@ -43,9 +61,28 @@ namespace sentinel_bridge {
     inline volatile LONG    g_watchdog_active        = 0;
 
 
+    __forceinline UINT64 compute_challenge_response(UINT64 challenge) {
+        UINT64 h = challenge ^ CHALLENGE_HMAC_KEY;
+        h ^= h >> 33;
+        h *= 0xFF51AFD7ED558CCDULL;
+        h ^= h >> 33;
+        h *= 0xC4CEB9FE1A85EC53ULL;
+        h ^= h >> 33;
+        return h;
+    }
+
     __forceinline void tick() {
         LONG64 tsc = static_cast<LONG64>(__rdtsc());
         _InterlockedExchange64(&g_bridge.whoswho_tsc, tsc);
+
+        UINT64 challenge = g_bridge.sentinel_challenge;
+        if (challenge != 0 && g_bridge.whoswho_response == 0) {
+            UINT64 response = compute_challenge_response(challenge);
+            InterlockedExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_bridge.whoswho_response),
+                static_cast<LONG64>(response));
+        }
+
         WW_LOG("tick: wrote whoswho_tsc=%lld", tsc);
     }
 
@@ -92,6 +129,20 @@ namespace sentinel_bridge {
             _InterlockedExchange(&g_stale_streak, 0);
             WW_LOG("watchdog_dpc: Sentinel ALIVE, tsc changed from %lld to %lld",
                 last, current_sentinel_tsc);
+
+            ULONG cmd = _InterlockedExchange((volatile LONG*)&g_bridge.sentinel_cmd, BRIDGE_CMD_NONE);
+            if (cmd != BRIDGE_CMD_NONE) {
+                ULONG param = _InterlockedExchange((volatile LONG*)&g_bridge.sentinel_cmd_param, 0);
+                WW_LOG("watchdog_dpc: Sentinel command=%lu param=0x%lx", cmd, param);
+
+                if (cmd == BRIDGE_CMD_DEBUGGER_FOUND || cmd == BRIDGE_CMD_DUMP_TOOL_FOUND ||
+                    cmd == BRIDGE_CMD_INTEGRITY_FAIL || cmd == BRIDGE_CMD_CALLBACK_REMOVED) {
+                    if (_KeBugCheckEx) {
+                        _KeBugCheckEx(0xDEAD0002u, cmd, param, 0, 0);
+                    }
+                }
+            }
+
             return;
         }
 

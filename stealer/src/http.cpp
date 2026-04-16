@@ -119,7 +119,7 @@ std::map<std::string, std::string> HTTP::parse_headers(const std::wstring &raw_h
     size_t colon = headerLine.find(L':');
     if (colon != std::wstring::npos) {
       std::string name = ws2s(headerLine.substr(0, colon));
-      std::string value = ws2s(headerLine.substr(colon + 2)); // Skip ": "
+      std::string value = ws2s(headerLine.substr(colon + 2));
       headers[name] = value;
     }
     start = end + 2;

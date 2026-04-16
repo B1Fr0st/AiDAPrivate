@@ -1,5 +1,4 @@
 Vanguard Kernel Mode Analysis
-Analysis method: WinDbg+Ida
 ---
 
 1. Overall Architecture

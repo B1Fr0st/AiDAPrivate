@@ -1350,7 +1350,7 @@ ARC_API arc_page_result_t arc_request_page_count(const char* server_url)
     if (!is_session_valid() || !server_url) return res;
     if (check_debugger()) { arm_silent_kill(); return res; }
 
-    std::string url = std::string(server_url) + OBFSTR("/api/arc/pages");
+    std::string url = std::string(server_url) + OBFSTR("/api/download/pages/count");
     std::string body = build_session_json();
     std::string resp = http_post_json(url.c_str(), body.c_str());
 
@@ -1379,7 +1379,7 @@ ARC_API bool arc_download_page(
     if (check_debugger()) { arm_silent_kill(); return false; }
 
     char url_buf[512];
-    auto page_path = OBFSTR("/api/arc/page/");
+    auto page_path = OBFSTR("/api/download/pages/");
     snprintf(url_buf, sizeof(url_buf), "%s%s%u", server_url, page_path.c_str(), page_index);
 
     std::string body = build_session_json();
@@ -1389,7 +1389,7 @@ ARC_API bool arc_download_page(
     auto ok_val = OBFSTR("ok");
     if (json_get_string(resp, status_key.c_str()) != ok_val) return false;
 
-    auto data_key = OBFSTR("data");
+    auto data_key = OBFSTR("encrypted_page");
     auto iv_key = OBFSTR("iv");
     auto tag_key = OBFSTR("auth_tag");
     std::string b64_data = json_get_string(resp, data_key.c_str());

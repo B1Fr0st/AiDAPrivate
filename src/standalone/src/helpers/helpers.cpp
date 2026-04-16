@@ -1291,19 +1291,37 @@ void helpers::render_title()
 			license::error_msg.clear();
 
 			std::string key_copy(license::key_buf);
-			std::thread([key_copy]() {
+			try
+			{
+				std::thread([key_copy]() {
+					std::string error_text;
+					if (standalone_license::activate(g_sa_settings, key_copy, error_text)) {
+						license::saved_key  = key_copy;
+						license::validated  = true;
+						license::checking   = false;
+						license::error_msg.clear();
+					} else {
+						license::error_msg   = error_text.empty() ? "License validation failed." : error_text;
+						license::check_failed = true;
+						license::checking    = false;
+					}
+				}).detach();
+			}
+			catch (...)
+			{
+
+
 				std::string error_text;
 				if (standalone_license::activate(g_sa_settings, key_copy, error_text)) {
 					license::saved_key  = key_copy;
 					license::validated  = true;
-					license::checking   = false;
 					license::error_msg.clear();
 				} else {
 					license::error_msg   = error_text.empty() ? "License validation failed." : error_text;
 					license::check_failed = true;
-					license::checking    = false;
 				}
-			}).detach();
+				license::checking = false;
+			}
 		}
 
 

@@ -14,6 +14,7 @@
 #include "process_scan.hpp"
 #include "enforcement.hpp"
 #include "webhook.hpp"
+#include "obfuscation_macros.hpp"
 
 namespace anti_tamper {
 
@@ -153,6 +154,7 @@ namespace token_chain {
     inline uint64_t run_inline_check(check_class_t which, uint64_t proof_hash)
     {
         auto& rt = state::get();
+        uint64_t token = 0;
 
         if (!rt.initialized.load(std::memory_order_acquire))
             return 0;
@@ -165,52 +167,62 @@ namespace token_chain {
         bool violation = false;
         const char* violation_reason = nullptr;
 
-        switch (which)
+        OBFUSCATE_JUNK(tic_pre);
+
+        CFF_BEGIN(tic_cff)
+        CFF_STATE(tic_cff, 0)
         {
-        case CHECK_FAST:
-            check_result = detail::run_fast_checks(rt);
-            rt.chain.last_fast_check_ms.store(now, std::memory_order_release);
-            rt.chain.fast_check_count.fetch_add(1, std::memory_order_relaxed);
-            if (check_result & 0x1F)
+            switch (which)
             {
-                violation = true;
-                violation_reason = "fast_check_tamper";
-            }
-            break;
+            case CHECK_FAST:
+                check_result = detail::run_fast_checks(rt);
+                rt.chain.last_fast_check_ms.store(now, std::memory_order_release);
+                rt.chain.fast_check_count.fetch_add(1, std::memory_order_relaxed);
+                if (check_result & 0x1F)
+                {
+                    violation = true;
+                    violation_reason = "fast_check_tamper";
+                }
+                break;
 
-        case CHECK_CODE_INTEGRITY:
-            check_result = detail::run_code_integrity_checks(rt);
-            rt.chain.last_integrity_check_ms.store(now, std::memory_order_release);
-            if (check_result != 0)
-            {
-                violation = true;
-                violation_reason = "code_integrity_violation";
-            }
-            break;
+            case CHECK_CODE_INTEGRITY:
+                check_result = detail::run_code_integrity_checks(rt);
+                rt.chain.last_integrity_check_ms.store(now, std::memory_order_release);
+                if (check_result != 0)
+                {
+                    violation = true;
+                    violation_reason = "code_integrity_violation";
+                }
+                break;
 
-        case CHECK_DEEP:
-            check_result = detail::run_deep_checks(rt);
-            rt.chain.last_deep_check_ms.store(now, std::memory_order_release);
-            rt.chain.deep_check_count.fetch_add(1, std::memory_order_relaxed);
-            if (check_result != 0)
-            {
-                violation = true;
-                violation_reason = "deep_scan_violation";
-            }
-            break;
+            case CHECK_DEEP:
+                check_result = detail::run_deep_checks(rt);
+                rt.chain.last_deep_check_ms.store(now, std::memory_order_release);
+                rt.chain.deep_check_count.fetch_add(1, std::memory_order_relaxed);
+                if (check_result != 0)
+                {
+                    violation = true;
+                    violation_reason = "deep_scan_violation";
+                }
+                break;
 
-        case CHECK_PAGE_PROTECT:
-            check_result = detail::run_page_protect_checks(rt);
-            if (check_result != 0)
-            {
-                violation = true;
-                violation_reason = "page_protection_violation";
+            case CHECK_PAGE_PROTECT:
+                check_result = detail::run_page_protect_checks(rt);
+                if (check_result != 0)
+                {
+                    violation = true;
+                    violation_reason = "page_protection_violation";
+                }
+                break;
             }
-            break;
+            CFF_GOTO(tic_cff, 1);
         }
-
-        if (violation)
+        CFF_STATE(tic_cff, 1)
         {
+            OBFUSCATE_JUNK(tic_mid);
+
+            if (violation)
+            {
             std::string detail_str;
             char hdr[128];
             snprintf(hdr, sizeof(hdr), "class=%u result=0x%llx",
@@ -262,21 +274,28 @@ namespace token_chain {
 
             webhook::send_debug_log("token_chain", detail_str, true);
             enforce_violation(violation_reason, detail_str);
-            return 0;
+            CFF_EXIT(tic_cff);
         }
 
-        unsigned int aux;
-        uint64_t tsc = __rdtscp(&aux);
-        uint64_t prev = rt.chain.chain_accumulator.load(std::memory_order_acquire);
+            CFF_GOTO(tic_cff, 2);
+        }
+        CFF_STATE(tic_cff, 2)
+        {
+            unsigned int aux;
+            uint64_t tsc = __rdtscp(&aux);
+            uint64_t prev = rt.chain.chain_accumulator.load(std::memory_order_acquire);
 
-        uint64_t token = detail::mix_token(
-            check_result, prev, tsc, proof_hash,
-            rt.chain.siphash_key[0], rt.chain.siphash_key[1]);
+            token = detail::mix_token(
+                check_result, prev, tsc, proof_hash,
+                rt.chain.siphash_key[0], rt.chain.siphash_key[1]);
 
-        rt.chain.chain_accumulator.store(
-            prev ^ token ^ _rotl64(tsc, 13),
-            std::memory_order_release);
+            rt.chain.chain_accumulator.store(
+                MBA_TRANSFORM(prev ^ token, _rotl64(tsc, 13)),
+                std::memory_order_release);
+        }
+        CFF_END(tic_cff)
 
+        OBFUSCATE_JUNK(tic_post);
         return token;
     }
 

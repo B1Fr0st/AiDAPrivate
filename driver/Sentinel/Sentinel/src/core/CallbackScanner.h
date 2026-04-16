@@ -243,24 +243,128 @@ namespace callback_scanner {
         if (!_InterlockedCompareExchange(&g_initialized, 1, 1))
             return true;
 
+        bool callbacks_intact = true;
 
         if (g_load_image_array) {
             ULONG current = count_callback_array(g_load_image_array);
             if (current > g_baseline_load_image_count + 2) {
-
-
                 g_baseline_load_image_count = current;
+            }
+            if (current < g_baseline_load_image_count && g_baseline_load_image_count > 0) {
+                SN_LOG("callback_scanner: load_image callbacks REMOVED baseline=%lu current=%lu",
+                       g_baseline_load_image_count, current);
+                callbacks_intact = false;
             }
         }
 
         if (g_create_process_array) {
             ULONG current = count_callback_array(g_create_process_array);
             if (current > g_baseline_create_process_count + 2) {
-
                 g_baseline_create_process_count = current;
+            }
+            if (current < g_baseline_create_process_count && g_baseline_create_process_count > 0) {
+                SN_LOG("callback_scanner: create_process callbacks REMOVED baseline=%lu current=%lu",
+                       g_baseline_create_process_count, current);
+                callbacks_intact = false;
             }
         }
 
-        return true;
+        if (g_ob_callback_list) {
+            ULONG current = count_ob_callbacks();
+            if (current < g_baseline_ob_callback_count && g_baseline_ob_callback_count > 0) {
+                SN_LOG("callback_scanner: ObRegisterCallbacks entries REMOVED baseline=%lu current=%lu",
+                       g_baseline_ob_callback_count, current);
+                callbacks_intact = false;
+            }
+            if (current > g_baseline_ob_callback_count + 2) {
+                g_baseline_ob_callback_count = current;
+            }
+        }
+
+        return callbacks_intact;
+    }
+
+
+    inline PVOID g_ob_callback_list = nullptr;
+    inline ULONG g_baseline_ob_callback_count = 0;
+
+    __forceinline ULONG count_ob_callbacks()
+    {
+        if (!g_ob_callback_list || !_MmIsAddressValid(g_ob_callback_list))
+            return 0;
+
+        ULONG count = 0;
+
+        __try {
+            PLIST_ENTRY head = (PLIST_ENTRY)g_ob_callback_list;
+            PLIST_ENTRY entry = head->Flink;
+
+            for (ULONG i = 0; i < MAX_CALLBACKS && entry != head; ++i, entry = entry->Flink)
+            {
+                if (!_MmIsAddressValid(entry)) break;
+                count++;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        return count;
+    }
+
+    __forceinline PVOID find_ob_callback_list(PVOID nt_base)
+    {
+        if (!nt_base || !_MmIsAddressValid(nt_base))
+            return nullptr;
+
+        PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(nt_base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+            return nullptr;
+
+        PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(
+            static_cast<UCHAR*>(nt_base) + dos->e_lfanew);
+        if (!_MmIsAddressValid(nt) || nt->Signature != IMAGE_NT_SIGNATURE)
+            return nullptr;
+
+        PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
+        for (USHORT i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+            if (!(sections[i].Characteristics & IMAGE_SCN_MEM_WRITE))
+                continue;
+
+            PVOID section_base = static_cast<UCHAR*>(nt_base) + sections[i].VirtualAddress;
+            ULONG section_size = sections[i].Misc.VirtualSize;
+
+            if (section_size < 0x100)
+                continue;
+
+            static const UCHAR magic_bytes[] = {
+                0x48, 0x8D, 0x0D
+            };
+
+            PVOID found = find_pattern_safe(section_base, section_size, magic_bytes, "xxx");
+            if (found) {
+                PVOID candidate = resolve_relative(found, 3, 7);
+                if (candidate && _MmIsAddressValid(candidate)) {
+                    PLIST_ENTRY test = (PLIST_ENTRY)candidate;
+                    if (_MmIsAddressValid(test->Flink) && _MmIsAddressValid(test->Blink))
+                        return candidate;
+                }
+            }
+        }
+
+        return nullptr;
+    }
+
+    __forceinline bool init_ob_monitoring()
+    {
+        PVOID nt_base = reinterpret_cast<PVOID>(get_nt_base());
+        if (!nt_base) return false;
+
+        g_ob_callback_list = find_ob_callback_list(nt_base);
+        if (g_ob_callback_list) {
+            g_baseline_ob_callback_count = count_ob_callbacks();
+            SN_LOG("callback_scanner: ob_callbacks baseline=%lu",
+                   g_baseline_ob_callback_count);
+            return true;
+        }
+        return false;
     }
 }

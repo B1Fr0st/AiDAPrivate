@@ -1113,6 +1113,64 @@ NTSTATUS functions::handle_anti_debug(p_anti_debug_request request) {
         return anti_debug::hide_thread_from_debugger(request->pid, request->tid);
     }
 
+    case ADBG_OP_CLEAR_PROC_DR:
+    {
+        if (request->pid == 0)
+            return STATUS_INVALID_PARAMETER;
+        NTSTATUS status = anti_debug::clear_process_debug_registers(request->pid);
+        request->dr_clear_count = anti_debug::g_thread_dr_clear_count;
+        request->result_flags = NT_SUCCESS(status) ? 0 : 0xFFFFFFFFu;
+        return status;
+    }
+
+    case ADBG_OP_HIDE_ALL_THREADS:
+    {
+        if (request->pid == 0)
+            return STATUS_INVALID_PARAMETER;
+        return anti_debug::hide_all_process_threads(request->pid);
+    }
+
+    case ADBG_OP_INSTALL_INSTR_CB:
+    {
+        if (request->pid == 0)
+            return STATUS_INVALID_PARAMETER;
+        return anti_debug::install_instrumentation_callback(
+            request->pid,
+            reinterpret_cast<PVOID>(request->detected_debugger_pid));
+    }
+
+    case ADBG_OP_REMOVE_INSTR_CB:
+    {
+        if (request->pid == 0)
+            return STATUS_INVALID_PARAMETER;
+        return anti_debug::remove_instrumentation_callback(request->pid);
+    }
+
+    case ADBG_OP_START_CONTINUOUS:
+    {
+        if (request->pid == 0)
+            return STATUS_INVALID_PARAMETER;
+        continuous_anti_debug::start(request->pid);
+        request->result_flags = 1;
+        request->dr_clear_count = continuous_anti_debug::g_cycle_count;
+        return STATUS_SUCCESS;
+    }
+
+    case ADBG_OP_STOP_CONTINUOUS:
+    {
+        continuous_anti_debug::stop();
+        request->result_flags = 0;
+        request->dr_clear_count = continuous_anti_debug::g_violations;
+        return STATUS_SUCCESS;
+    }
+
+    case ADBG_OP_CLEAR_DEBUG_OBJ:
+    {
+        if (request->pid == 0)
+            return STATUS_INVALID_PARAMETER;
+        return anti_debug::clear_debug_objects(request->pid);
+    }
+
     default:
         return STATUS_INVALID_PARAMETER;
     }

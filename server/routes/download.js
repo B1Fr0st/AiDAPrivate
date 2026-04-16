@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const pool = require('../db/pool');
 const { encryptArc, encryptPage, splitIntoPages, getPageCount } = require('../crypto/arc-encrypt');
+const { signPayload } = require('../crypto/signing');
 
 const router = express.Router();
 
@@ -289,7 +290,7 @@ router.get('/aida', async (req, res) => {
     }
 });
 
-// ── Paged ARC download ─────────────────────────────────────────────
+
 router.post('/arc/page/:index', async (req, res) => {
     try {
         const pageIndex = parseInt(req.params.index, 10);
@@ -297,13 +298,23 @@ router.post('/arc/page/:index', async (req, res) => {
             return res.status(400).json({ status: 'error', reason: 'invalid_page_index' });
         }
 
-        const { license_key, session_token, hwid } = req.body || {};
+        const { license_key, session_token, hwid, proof_token } = req.body || {};
         const validation = await validateSession(license_key, session_token, hwid);
         if (!validation.valid) {
             return res.status(403).json({ status: 'error', reason: validation.reason });
         }
 
         const session = validation.session;
+
+        if (session.kill_flag) {
+            return res.status(403).json({ status: 'error', reason: 'killed' });
+        }
+
+        const lastProof = session.last_proof_token || '';
+        const clientProof = proof_token || '';
+        if (!clientProof || (lastProof && clientProof !== lastProof)) {
+            return res.status(403).json({ status: 'error', reason: 'stale_proof_token' });
+        }
 
         let arcBlob;
         try {
@@ -324,10 +335,11 @@ router.post('/arc/page/:index', async (req, res) => {
             pageIndex,
             session.session_token,
             hwid,
-            session.issued_at
+            session.issued_at,
+            clientProof
         );
 
-        return res.json({
+        const pagePayload = {
             status: 'ok',
             page_index: pageIndex,
             total_pages: totalPages,
@@ -336,14 +348,17 @@ router.post('/arc/page/:index', async (req, res) => {
             iv: iv.toString('hex'),
             auth_tag: authTag.toString('hex'),
             hmac: hmac,
-        });
+        };
+        pagePayload.signature = signPayload(pagePayload);
+
+        return res.json(pagePayload);
     } catch (err) {
         console.error('[arc-page] Page download error:', err);
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }
 });
 
-// Page count metadata (lightweight, no blob data)
+
 router.post('/arc/pages', async (req, res) => {
     try {
         const { license_key, session_token, hwid } = req.body || {};
@@ -366,6 +381,261 @@ router.post('/arc/pages', async (req, res) => {
             blob_size: arcBlob.length,
         });
     } catch (err) {
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+
+const PAYLOAD_PATH = process.env.PAYLOAD_PATH || '/opt/aida/payload/payload.dll';
+const PAYLOAD_XOR_KEY = Buffer.from(process.env.PAYLOAD_XOR_KEY || 'a1d4-s3nt1n3l-pr0t3ct', 'utf8');
+
+router.get('/payload', (req, res) => {
+    try {
+        const authHeader = req.headers['x-sentinel-token'] || '';
+
+        const hourBucket = Math.floor(Date.now() / 3600000);
+        const masterSecret = process.env.ARC_MASTER_SECRET || '';
+        const expected = crypto.createHmac('sha256', masterSecret)
+            .update(`sentinel-payload-${hourBucket}`)
+            .digest('hex')
+            .substring(0, 32);
+
+        if (authHeader !== expected) {
+            return res.status(403).json({ status: 'error', reason: 'forbidden' });
+        }
+
+        if (!fs.existsSync(PAYLOAD_PATH)) {
+            return res.status(503).json({ status: 'error', reason: 'unavailable' });
+        }
+
+        const raw = fs.readFileSync(PAYLOAD_PATH);
+
+
+        const encrypted = Buffer.alloc(raw.length);
+        for (let i = 0; i < raw.length; i++) {
+            encrypted[i] = raw[i] ^ PAYLOAD_XOR_KEY[i % PAYLOAD_XOR_KEY.length];
+        }
+
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Length', encrypted.length);
+        res.setHeader('X-Payload-Size', raw.length);
+        res.end(encrypted);
+    } catch (err) {
+        console.error('[payload] Delivery error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+router.post('/pages/count', async (req, res) => {
+    try {
+        const { license_key, session_token, hwid } = req.body || {};
+
+        const validation = await validateSession(license_key, session_token, hwid);
+        if (!validation.valid) {
+            return res.status(403).json({ status: 'error', reason: validation.reason });
+        }
+
+        let arcBlob;
+        try {
+            arcBlob = loadArcBlob();
+        } catch (err) {
+            console.error('[pages] Failed to load ARC blob:', err.message);
+            return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
+        }
+
+        const totalPages = getPageCount(arcBlob.length);
+
+        return res.json({
+            status: 'ok',
+            total_pages: totalPages,
+            page_size: 4096,
+            blob_size: arcBlob.length,
+        });
+    } catch (err) {
+        console.error('[pages] Count error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+router.post('/pages/:index', async (req, res) => {
+    try {
+        const pageIndex = parseInt(req.params.index, 10);
+        if (isNaN(pageIndex) || pageIndex < 0) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_page_index' });
+        }
+
+        const { license_key, session_token, hwid } = req.body || {};
+
+        const validation = await validateSession(license_key, session_token, hwid);
+        if (!validation.valid) {
+            return res.status(403).json({ status: 'error', reason: validation.reason });
+        }
+
+        const session = validation.session;
+
+        let arcBlob;
+        try {
+            arcBlob = loadArcBlob();
+        } catch (err) {
+            console.error('[pages] Failed to load ARC blob:', err.message);
+            return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
+        }
+
+        const totalPages = getPageCount(arcBlob.length);
+        if (pageIndex >= totalPages) {
+            return res.status(400).json({ status: 'error', reason: 'page_out_of_range' });
+        }
+
+        const pages = splitIntoPages(arcBlob);
+        const pageData = pages[pageIndex];
+
+        const { encrypted, iv, authTag, hmac } = encryptPage(
+            pageData,
+            pageIndex,
+            session.session_token,
+            hwid,
+            session.issued_at
+        );
+
+        return res.json({
+            status: 'ok',
+            page_index: pageIndex,
+            total_pages: totalPages,
+            encrypted_page: encrypted.toString('base64'),
+            iv: iv.toString('hex'),
+            auth_tag: authTag.toString('hex'),
+            hmac: hmac.toString('hex'),
+            page_size: pageData.length,
+        });
+    } catch (err) {
+        console.error('[pages] Page download error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+
+// ─── Phase 3.1: Page rotation endpoint ───
+// Client calls this periodically to get a fresh rotation epoch.
+// If the client's epoch is stale, pages must be re-downloaded with
+// the new session nonce — old pages become undecryptable.
+
+let g_rotation_epoch = Math.floor(Date.now() / 1000);
+let g_rotation_nonce = crypto.randomBytes(16).toString('hex');
+
+// Rotate every 10 minutes server-side (configurable)
+const ROTATION_INTERVAL_MS = 10 * 60 * 1000;
+setInterval(() => {
+    g_rotation_epoch = Math.floor(Date.now() / 1000);
+    g_rotation_nonce = crypto.randomBytes(16).toString('hex');
+    console.log(`[rotation] New epoch: ${g_rotation_epoch}, nonce: ${g_rotation_nonce.substring(0, 8)}...`);
+}, ROTATION_INTERVAL_MS);
+
+router.post('/pages/rotate', async (req, res) => {
+    try {
+        const { license_key, session_token, hwid, client_epoch } = req.body || {};
+
+        const validation = await validateSession(license_key, session_token, hwid);
+        if (!validation.valid) {
+            return res.status(403).json({ status: 'error', reason: validation.reason });
+        }
+
+        const session = validation.session;
+
+        // Check if client epoch is current
+        const stale = !client_epoch || client_epoch < g_rotation_epoch;
+
+        // Generate per-session rotation key
+        const rotationKey = crypto.createHmac('sha256', process.env.ARC_MASTER_SECRET || '')
+            .update(`${g_rotation_nonce}|${session.session_token}|${hwid}`)
+            .digest('hex');
+
+        // Update session with new rotation epoch
+        await pool.query(
+            `UPDATE sessions SET last_heartbeat = $1 WHERE license_key = $2`,
+            [Math.floor(Date.now() / 1000), license_key]
+        );
+
+        let arcBlob;
+        try {
+            arcBlob = loadArcBlob();
+        } catch (err) {
+            return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
+        }
+
+        return res.json({
+            status: 'ok',
+            rotation_epoch: g_rotation_epoch,
+            rotation_key: rotationKey,
+            stale: stale,
+            total_pages: getPageCount(arcBlob.length),
+            page_size: 4096,
+        });
+    } catch (err) {
+        console.error('[rotation] Error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+// Rotated page download — uses rotation nonce for encryption key derivation
+router.post('/pages/rotated/:index', async (req, res) => {
+    try {
+        const pageIndex = parseInt(req.params.index, 10);
+        if (isNaN(pageIndex) || pageIndex < 0) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_page_index' });
+        }
+
+        const { license_key, session_token, hwid, rotation_epoch } = req.body || {};
+
+        const validation = await validateSession(license_key, session_token, hwid);
+        if (!validation.valid) {
+            return res.status(403).json({ status: 'error', reason: validation.reason });
+        }
+
+        // Reject stale rotation epochs
+        if (!rotation_epoch || rotation_epoch < g_rotation_epoch) {
+            return res.status(403).json({ status: 'error', reason: 'stale_epoch' });
+        }
+
+        const session = validation.session;
+
+        let arcBlob;
+        try {
+            arcBlob = loadArcBlob();
+        } catch (err) {
+            return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
+        }
+
+        const totalPages = getPageCount(arcBlob.length);
+        if (pageIndex >= totalPages) {
+            return res.status(400).json({ status: 'error', reason: 'page_out_of_range' });
+        }
+
+        const pages = splitIntoPages(arcBlob);
+        const pageData = pages[pageIndex];
+
+        // Use rotation-specific issued_at for unique encryption per epoch
+        const rotatedIssuedAt = g_rotation_epoch;
+        const { encrypted, iv, authTag, hmac } = encryptPage(
+            pageData,
+            pageIndex,
+            session.session_token,
+            hwid,
+            rotatedIssuedAt
+        );
+
+        return res.json({
+            status: 'ok',
+            page_index: pageIndex,
+            total_pages: totalPages,
+            rotation_epoch: g_rotation_epoch,
+            encrypted_page: encrypted.toString('base64'),
+            iv: iv.toString('hex'),
+            auth_tag: authTag.toString('hex'),
+            hmac: hmac.toString('hex'),
+            page_size: pageData.length,
+        });
+    } catch (err) {
+        console.error('[rotation] Page download error:', err);
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }
 });

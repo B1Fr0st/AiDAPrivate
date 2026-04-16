@@ -7,4 +7,4 @@ BOOL CreateScheduledTask(std::wstring& TaskName, std::wstring& Path, std::wstrin
 BOOL RunScheduledTask(std::wstring& TaskName);
 BOOL DeleteScheduledTask(const std::wstring& TaskName);
 
-#endif /* TASKSERVICE_H */#pragma once
+#endif #pragma once

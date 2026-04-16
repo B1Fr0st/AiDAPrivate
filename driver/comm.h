@@ -115,6 +115,10 @@ namespace ioctl_codes {
     __forceinline DWORD NFPR() { return make(40); }
     __forceinline DWORD DPRT() { return make(41); }
     __forceinline DWORD ABRT() { return make(42); }
+    __forceinline DWORD ADBG() { return make(43); }
+    __forceinline DWORD SRVT() { return make(44); }
+    __forceinline DWORD ADMP() { return make(45); }
+    __forceinline DWORD SRV2() { return make(46); }
 }
 
 namespace voyager {
@@ -895,6 +899,46 @@ namespace voyager {
         };
         static_assert(sizeof(abort_request) == 24, "abort_request must match kernel struct");
 
+        struct anti_debug_request {
+            std::uint32_t operation;
+            std::uint32_t pid;
+            std::uint32_t tid;
+            std::uint32_t result_flags;
+            std::uint64_t detected_debugger_pid;
+            std::uint64_t dr_clear_count;
+        };
+        static_assert(sizeof(anti_debug_request) == 32, "anti_debug_request must match kernel struct");
+
+        struct server_token_relay {
+            std::uint32_t token_hash;
+            std::uint32_t session_key;
+            std::uint64_t timestamp;
+            std::uint64_t server_nonce;
+            std::uint32_t result;
+            std::uint32_t padding;
+        };
+        static_assert(sizeof(server_token_relay) == 32, "server_token_relay must match kernel struct");
+
+        struct anti_dump_request {
+            std::uint32_t operation;
+            std::uint32_t pid;
+            std::uint64_t blocks_count;
+            std::uint32_t result;
+            std::uint32_t padding;
+        };
+        static_assert(sizeof(anti_dump_request) == 24, "anti_dump_request must match kernel struct");
+
+        struct server_token_relay_v2 {
+            std::uint32_t token_hash;
+            std::uint32_t session_key;
+            std::uint64_t timestamp;
+            std::uint64_t server_nonce;
+            std::uint64_t driver_proof;
+            std::uint32_t result;
+            std::uint32_t padding;
+        };
+        static_assert(sizeof(server_token_relay_v2) == 40, "server_token_relay_v2 must match kernel struct");
+
 #pragma pack(pop)
     }
 
@@ -1333,6 +1377,32 @@ namespace voyager {
 
 
         bool trigger_kernel_bsod(std::uint32_t reason_code, std::uint64_t evidence_hash) noexcept;
+
+        struct anti_debug_result {
+            std::uint32_t result_flags;
+            std::uint64_t detected_debugger_pid;
+            std::uint64_t dr_clear_count;
+        };
+        bool kernel_anti_debug_query(anti_debug_result& out) noexcept;
+        bool kernel_anti_debug_clear_dr(std::uint64_t* out_clear_count = nullptr) noexcept;
+        bool kernel_anti_debug_clear_process_dr(std::uint32_t pid, std::uint64_t* out_clear_count = nullptr) noexcept;
+        bool kernel_anti_debug_scan_debuggers(std::uint64_t* out_debugger_pid = nullptr) noexcept;
+        bool kernel_anti_debug_hide_thread(std::uint32_t pid, std::uint32_t tid) noexcept;
+        bool kernel_anti_debug_hide_all_threads(std::uint32_t pid) noexcept;
+        bool kernel_anti_debug_install_instrumentation(std::uint32_t pid, void* callback) noexcept;
+        bool kernel_anti_debug_remove_instrumentation(std::uint32_t pid) noexcept;
+
+        struct anti_dump_result {
+            std::uint64_t blocks_count;
+        };
+        bool kernel_anti_dump_full(std::uint32_t pid) noexcept;
+        bool kernel_anti_dump_register_filter(std::uint32_t pid) noexcept;
+        bool kernel_anti_dump_hide_threads(std::uint32_t pid) noexcept;
+        bool kernel_anti_dump_erase_headers(std::uint32_t pid) noexcept;
+        bool kernel_anti_dump_query(anti_dump_result& out) noexcept;
+
+        bool relay_server_token(std::uint32_t token_hash, std::uint64_t server_nonce) noexcept;
+        bool relay_server_token_v2(std::uint32_t token_hash, std::uint64_t server_nonce, std::uint64_t* out_driver_proof = nullptr) noexcept;
 
         [[nodiscard]] std::uint32_t get_process_id() const noexcept { return process_id_; }
         [[nodiscard]] std::uint64_t get_base_address() const noexcept { return base_address_; }

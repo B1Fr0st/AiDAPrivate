@@ -76,13 +76,10 @@ private:
 
 public:
 
-    // Constructor
+
     AppBoundDecryptor();
 
-    // Destructor (if needed)
-    //~AppBoundDecryptor();
 
-    // Member function to initialize ChromiumDecryptor
     BOOL RequestCOM(std::string service_parameter);
     std::vector<uint8_t> RetrieveEncryptedKey(std::string process, std::string service_parameter);
     std::string read_json(const std::string& filePath);
@@ -91,7 +88,7 @@ public:
     std::string AESDecrypter(std::vector<BYTE> EncryptedBlob);
 
 private:
-    // Helper functions if needed
+
 };
 
-#endif /* APPBOUNDDECRYPTOR_H */#pragma once
+#endif #pragma once

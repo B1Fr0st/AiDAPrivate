@@ -1,9 +1,11 @@
 #pragma once
 #include <imports/Defs.h>
+#include <core/Heartbeat.h>
 
 namespace process_notify {
 
     inline volatile LONG g_registered = 0;
+    inline volatile LONG g_image_registered = 0;
 
     inline volatile HANDLE g_protected_pid = nullptr;
 
@@ -21,6 +23,18 @@ namespace process_notify {
         { "taskdmp",      7 },
         { "minidump",     8 },
         { "processhack",  11 },
+        { "x64dbg",       6 },
+        { "x32dbg",       6 },
+        { "ollydbg",      7 },
+        { "windbg",       6 },
+        { "ida64",        5 },
+        { "ida32",        5 },
+        { "idaq",         4 },
+        { "cheatengine",  11 },
+        { "reclass",      7 },
+        { "hmpalert",     8 },
+        { "apimonitor",   10 },
+        { "procmon",      7 },
     };
     constexpr int g_num_dump_tools = sizeof(g_dump_tools) / sizeof(g_dump_tools[0]);
 
@@ -107,10 +121,15 @@ namespace process_notify {
             UCHAR* name = PsGetProcessImageFileName(proc);
             if (name && _MmIsAddressValid(name)) {
                 if (is_dump_tool(name)) {
-                    SN_LOG("process_notify: dump tool launched pid=%llu name=%.15s, will monitor",
+                    SN_LOG("process_notify: dump tool launched pid=%llu name=%.15s, TERMINATING",
                         (UINT64)(ULONG_PTR)pid, name);
                     object_guard::g_last_suspicious_pid = (UINT64)(ULONG_PTR)pid;
                     InterlockedIncrement((volatile LONG*)&object_guard::g_suspicious_handle_count);
+                    _ObfDereferenceObject(proc);
+                    terminate_process_by_pid(pid);
+                    heartbeat::send_command(heartbeat::BRIDGE_CMD_DUMP_TOOL_FOUND,
+                        static_cast<ULONG>((ULONG_PTR)pid & 0xFFFFFFFF));
+                    return;
                 }
             }
 
@@ -125,6 +144,70 @@ namespace process_notify {
         SN_LOG("process_notify: protected_pid set to %llu", (UINT64)(ULONG_PTR)pid);
     }
 
+    struct suspicious_dll_t {
+        const char* name;
+        int         len;
+    };
+
+    constexpr suspicious_dll_t g_suspicious_dlls[] = {
+        { "frida",      5 },
+        { "titanh",     6 },
+        { "hyperdbg",   8 },
+        { "dbghelp",    7 },
+        { "symsrv",     6 },
+        { "minhook",    7 },
+        { "detours",    7 },
+        { "easyhook",   8 },
+        { "polyhook",   8 },
+        { "inject",     6 },
+    };
+    constexpr int g_num_suspicious_dlls = sizeof(g_suspicious_dlls) / sizeof(g_suspicious_dlls[0]);
+
+    static VOID image_load_callback(
+        PUNICODE_STRING FullImageName,
+        HANDLE ProcessId,
+        PIMAGE_INFO ImageInfo)
+    {
+        UNREFERENCED_PARAMETER(ImageInfo);
+
+        HANDLE protected = reinterpret_cast<HANDLE>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+        if (!protected || ProcessId != protected)
+            return;
+
+        if (!FullImageName || !FullImageName->Buffer || FullImageName->Length == 0)
+            return;
+
+        __try {
+            USHORT chars = FullImageName->Length / sizeof(WCHAR);
+            USHORT name_start = chars;
+            for (USHORT i = chars; i > 0; --i) {
+                if (FullImageName->Buffer[i - 1] == L'\\' || FullImageName->Buffer[i - 1] == L'/') {
+                    name_start = i;
+                    break;
+                }
+            }
+
+            char narrow[64] = {};
+            USHORT copy_len = chars - name_start;
+            if (copy_len > 63) copy_len = 63;
+            for (USHORT i = 0; i < copy_len; ++i) {
+                narrow[i] = (char)(FullImageName->Buffer[name_start + i] & 0x7F);
+            }
+
+            for (int d = 0; d < g_num_suspicious_dlls; ++d) {
+                if (match_prefix_ci((const UCHAR*)narrow, g_suspicious_dlls[d].name, g_suspicious_dlls[d].len)) {
+                    SN_LOG("process_notify: SUSPICIOUS DLL loaded into protected process: %.60s pid=%llu",
+                        narrow, (UINT64)(ULONG_PTR)ProcessId);
+                    heartbeat::send_command(heartbeat::BRIDGE_CMD_DUMP_TOOL_FOUND,
+                        static_cast<ULONG>((ULONG_PTR)ProcessId & 0xFFFFFFFF));
+                    return;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
     __forceinline bool init() {
         if (!_PsSetCreateProcessNotifyRoutine)
             return false;
@@ -133,16 +216,30 @@ namespace process_notify {
         if (NT_SUCCESS(st)) {
             _InterlockedExchange(&g_registered, 1);
             SN_LOG("process_notify::init: registered process notify callback");
-            return true;
+        } else {
+            SN_LOG("process_notify::init: FAILED status=0x%lx", st);
+            return false;
         }
-        SN_LOG("process_notify::init: FAILED status=0x%lx", st);
-        return false;
+
+        if (_PsSetLoadImageNotifyRoutine) {
+            st = _PsSetLoadImageNotifyRoutine(image_load_callback);
+            if (NT_SUCCESS(st)) {
+                _InterlockedExchange(&g_image_registered, 1);
+                SN_LOG("process_notify::init: registered image load callback");
+            }
+        }
+
+        return true;
     }
 
     __forceinline void cleanup() {
         if (_InterlockedCompareExchange(&g_registered, 0, 1) == 1) {
             if (_PsSetCreateProcessNotifyRoutine)
                 _PsSetCreateProcessNotifyRoutine(process_create_callback, TRUE);
+        }
+        if (_InterlockedCompareExchange(&g_image_registered, 0, 1) == 1) {
+            if (_PsRemoveLoadImageNotifyRoutine)
+                _PsRemoveLoadImageNotifyRoutine(image_load_callback);
         }
     }
 }

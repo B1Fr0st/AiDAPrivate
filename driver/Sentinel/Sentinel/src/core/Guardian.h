@@ -43,6 +43,10 @@ namespace guardian {
 
 
         integrity::verify();
+        if (integrity::g_integrity_strikes >= integrity::INTEGRITY_STRIKE_THRESHOLD) {
+            heartbeat::send_command(heartbeat::BRIDGE_CMD_INTEGRITY_FAIL,
+                static_cast<ULONG>(integrity::g_integrity_strikes));
+        }
 
 
         dispatch_guard::verify();
@@ -60,6 +64,14 @@ namespace guardian {
 
 
         etw_disable::monitor_reenablement();
+        if (etw_disable::g_provider_handle && _MmIsAddressValid((PVOID)etw_disable::g_provider_handle)) {
+            __try {
+                volatile UINT64 val = *static_cast<volatile UINT64*>((PVOID)etw_disable::g_provider_handle);
+                if (val != 0) {
+                    heartbeat::send_command(heartbeat::BRIDGE_CMD_ETW_REACTIVATED, 0);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
 
 
         if ((cycle % 5) == 0) {
@@ -73,6 +85,20 @@ namespace guardian {
 
         if ((cycle % 3) == 0) {
             object_guard::scan_suspicious_handles();
+        }
+
+        if ((cycle % 7) == 0) {
+            if (!heartbeat::verify_module_presence()) {
+                SN_LOG("guardian::dpc: WhosWho UNLOADED from module list!");
+                if (_KeBugCheckEx) {
+                    _KeBugCheckEx(0xDEAD5E07, 0, 0, 0, static_cast<ULONG_PTR>(cycle));
+                }
+            }
+        }
+
+        if ((cycle % 6) == 0) {
+            heartbeat::verify_challenge_response();
+            heartbeat::issue_challenge();
         }
 
         _InterlockedExchange(&g_running, 0);

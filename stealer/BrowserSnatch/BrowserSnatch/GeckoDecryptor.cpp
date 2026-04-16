@@ -2,7 +2,7 @@
 
 GeckoDecryptor::GeckoDecryptor() {}
 GeckoDecryptor::~GeckoDecryptor() {
-	// Free memory allocated for master_key_blob if it's not null
+
 
 	if (m_NssShutdown)
 		m_NssShutdown();
@@ -23,8 +23,6 @@ bool GeckoDecryptor::GeckoDecryptorInit(std::string& target_mozilla_browser)
 		m_hMozGlue = LoadLibrary(wide_mozglue_dll_path.c_str());
 		m_hNss3 = LoadLibrary(wide_mss3_dll_path.c_str());
 
-		//m_hMozGlue = LoadLibraryA(mozglue_dll_path.c_str());
-		//m_hNss3 = LoadLibraryA(mozglue_dll_path.c_str());
 
 		if (!m_hMozGlue || !m_hNss3) return false;
 
@@ -47,7 +45,7 @@ std::string decode_base64(std::string MasterString)
 	std::vector<unsigned char> binaryKey;
 	DWORD binaryKeySize = 0;
 
-	// Decoding the base64 encoded string to binary data.
+
 	if (!CryptStringToBinaryA(MasterString.c_str(), 0, CRYPT_STRING_BASE64, NULL, &binaryKeySize, NULL, NULL))
 	{
 		std::cout << "CryptStringToBinaryA [1] : Failed to convert BASE64 private key. \n";
@@ -66,7 +64,7 @@ std::string decode_base64(std::string MasterString)
 
 bool GeckoDecryptor::set_profile_dir(std::string profile_dir)
 {
-	//NssInit requires a path of working dir i guess. resolve this issue!
+
 	return (m_NssInit((char*)profile_dir.c_str()) == 0);
 }
 

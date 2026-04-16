@@ -161,15 +161,12 @@ namespace opaque {
         uint64_t env = teb_entropy() ^ kuser_entropy() ^ __rdtsc();
         uint64_t h = state_hash(x ^ env, entropy ^ env);
 
-        // Number-theoretic predicate: Fermat's little theorem.
-        // For prime p=257 and any a coprime to p: a^(p-1) ≡ 1 (mod p).
-        // This is ALWAYS true but requires modular exponentiation to verify,
-        // which Z3/angr cannot simplify through bit-level reasoning.
-        constexpr uint64_t p = 257;
-        uint64_t a = (h % (p - 1)) + 1; // a in [1, p-1], guarantees coprime to p
 
-        // Compute a^(p-1) mod p via square-and-multiply
-        uint64_t exp = p - 1; // 256
+        constexpr uint64_t p = 257;
+        uint64_t a = (h % (p - 1)) + 1;
+
+
+        uint64_t exp = p - 1;
         uint64_t result = 1;
         uint64_t base = a % p;
         while (exp > 0)
@@ -179,11 +176,10 @@ namespace opaque {
             exp >>= 1;
         }
 
-        // Fermat's little theorem: result is always 1
-        // But mix with quadratic residue check for additional opacity
+
         uint64_t qr_base = ((h >> 32) % (p - 1)) + 1;
         uint64_t euler = 1;
-        uint64_t qr_exp = (p - 1) / 2; // 128
+        uint64_t qr_exp = (p - 1) / 2;
         uint64_t qr_b = qr_base % p;
         while (qr_exp > 0)
         {
@@ -191,7 +187,7 @@ namespace opaque {
             qr_b = (qr_b * qr_b) % p;
             qr_exp >>= 1;
         }
-        // euler is either 1 or p-1 (Euler's criterion), both squared give 1
+
         uint64_t euler_sq = (euler * euler) % p;
 
         return (result == 1) && (euler_sq == 1);
@@ -199,7 +195,7 @@ namespace opaque {
 
     __forceinline bool predicate_runtime_false(uint64_t x, uint64_t entropy)
     {
-        // The Fermat predicate is always true, so negate it
+
         return !predicate_runtime_true(x, entropy);
     }
 

@@ -82,7 +82,7 @@ async function sendTelegramAlert(title, fields) {
         }
         text += `\n<i>${new Date().toISOString()}</i>`;
 
-        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+        const url = `https:
         await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -530,6 +530,7 @@ async function handleHeartbeat(body, clientIp) {
 
     const heartbeatNonce = body.heartbeat_nonce || '';
     const serverNonce = generateServerNonce();
+    const pageEpoch = (session.heartbeat_count || 0) + 1;
 
     const sigPayload = {
         status: 'valid',
@@ -540,6 +541,7 @@ async function handleHeartbeat(body, clientIp) {
         ttl: SESSION_TTL_SECONDS,
         heartbeat_nonce: heartbeatNonce,
         server_nonce: serverNonce,
+        page_epoch: pageEpoch,
     };
     const signature = signPayload(sigPayload);
 
@@ -630,6 +632,119 @@ async function handleReportViolation(body, clientIp) {
 }
 
 
+// ─── Phase 5.2 server-side: Honeypot trap receiver ───
+async function handleHoneypotTrip(body, clientIp) {
+    const { event, trap, hwid, timestamp, cpuid, tsc } = body;
+
+    if (event !== 'honeypot_trip' || !trap || !hwid) {
+        return { status: 200, body: { status: 'ok' } };
+    }
+
+    const sanitizedTrap = sanitizeReason(trap);
+
+    // Log the honeypot event
+    const now = Math.floor(Date.now() / 1000);
+    await pool.query(`
+        INSERT INTO violations (hwid, ip, reason, timestamp, timestamp_iso, plugin_version)
+        VALUES ($1, $2, $3, $4, $5, $6)
+    `, [
+        hwid,
+        clientIp,
+        `honeypot:${sanitizedTrap}`,
+        now,
+        new Date().toISOString(),
+        'honeypot',
+    ]);
+
+    // Immediately kill any active sessions for this HWID
+    await pool.query('UPDATE sessions SET kill_flag = true WHERE hwid = $1', [hwid]);
+
+    // Revoke all licenses bound to this HWID
+    const { rows: licenseRows } = await pool.query(
+        'SELECT key FROM licenses WHERE hwid = $1 AND active = true',
+        [hwid]
+    );
+    for (const row of licenseRows) {
+        await revokeLicenseAndSession(row.key, `honeypot:${sanitizedTrap}`, 'honeypot', hwid);
+    }
+
+    // Ban the HWID and IP
+    await recordBan(hwid, clientIp, `honeypot:${sanitizedTrap}`, 'honeypot');
+
+    // Alert
+    const fields = [
+        { name: '\uD83C\uDFAF Trap', value: sanitizedTrap },
+        { name: '\uD83D\uDDA5\uFE0F HWID', value: `\`${hwid}\`` },
+        { name: '\uD83C\uDF10 IP', value: `\`${clientIp}\`` },
+        { name: '\u23F0 TSC', value: tsc ? String(tsc) : 'N/A' },
+        { name: 'CPUID', value: cpuid ? String(cpuid) : 'N/A' },
+    ];
+    await sendDiscordWebhook('\uD83C\uDFAF HONEYPOT TRIGGERED — Cracker Detected', fields, 0xFF0000);
+    await sendTelegramAlert('\uD83C\uDFAF HONEYPOT TRIGGERED — Cracker Detected', fields);
+
+    // Return success (don't tip off the cracker)
+    return { status: 200, body: { status: 'ok' } };
+}
+
+
+// ─── Phase 4.2: Enhanced anomaly scoring with driver proof validation ───
+async function handleDriverProof(body, clientIp) {
+    const { license_key, session_token, hwid, driver_proof, server_nonce, tsc_drift } = body;
+
+    if (!license_key || !session_token || !driver_proof) {
+        return { status: 400, body: { status: 'error', reason: 'missing_fields' } };
+    }
+
+    const session = await getSession(license_key);
+    if (!session || session.session_token !== session_token) {
+        return { status: 200, body: { status: 'invalid', reason: 'session_mismatch' } };
+    }
+
+    if (session.kill_flag) {
+        return { status: 200, body: { status: 'killed', alive: false } };
+    }
+
+    // Validate driver proof is non-zero and has entropy
+    const proofNum = BigInt(`0x${driver_proof}`);
+    if (proofNum === 0n) {
+        // Zero proof = no driver loaded or forged
+        const newScore = Math.min(100, (session.anomaly_score || 0) + 40);
+        await pool.query(
+            'UPDATE sessions SET anomaly_score = $1 WHERE license_key = $2',
+            [newScore, license_key]
+        );
+        if (newScore >= 100) {
+            await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
+            await revokeLicenseAndSession(license_key, 'zero_driver_proof', body.plugin_version, hwid);
+            await recordBan(hwid, clientIp, 'zero_driver_proof', body.plugin_version);
+            return { status: 200, body: { status: 'killed', alive: false } };
+        }
+        return { status: 200, body: { status: 'warning', anomaly_score: newScore } };
+    }
+
+    // Check TSC drift (if driver reports implausible timing, it's emulated)
+    if (typeof tsc_drift === 'number' && tsc_drift > 1000000) {
+        const newScore = Math.min(100, (session.anomaly_score || 0) + 25);
+        await pool.query(
+            'UPDATE sessions SET anomaly_score = $1 WHERE license_key = $2',
+            [newScore, license_key]
+        );
+    }
+
+    // Store the driver proof for cross-validation on next heartbeat
+    await pool.query(
+        'UPDATE sessions SET last_proof_token = $1 WHERE license_key = $2',
+        [driver_proof, license_key]
+    );
+
+    const newNonce = generateServerNonce();
+    return {
+        status: 200,
+        body: { status: 'valid', server_nonce: newNonce },
+    };
+}
+
+
 router.post('/', async (req, res) => {
     const body = req.body;
     if (!body || typeof body !== 'object') {
@@ -655,6 +770,9 @@ router.post('/', async (req, res) => {
             case 'kill':
                 result = await handleKillSwitch(body, clientIp);
                 break;
+            case 'driver_proof':
+                result = await handleDriverProof(body, clientIp);
+                break;
             default:
                 return res.status(400).json({ status: 'error', reason: 'unknown_action' });
         }
@@ -663,6 +781,18 @@ router.post('/', async (req, res) => {
     } catch (err) {
         console.error(`[license] Error processing ${action}:`, err);
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+// ─── Sentinel honeypot endpoint ───
+router.post('/honeypot', async (req, res) => {
+    const clientIp = getClientIp(req);
+    try {
+        const result = await handleHoneypotTrip(req.body || {}, clientIp);
+        return res.status(result.status).json(result.body);
+    } catch (err) {
+        console.error('[sentinel] Honeypot handler error:', err);
+        return res.status(200).json({ status: 'ok' });
     }
 });
 

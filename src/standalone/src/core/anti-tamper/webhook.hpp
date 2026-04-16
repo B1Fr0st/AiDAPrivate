@@ -22,6 +22,60 @@ namespace webhook {
 
 namespace detail {
 
+    inline const char* log_path()
+    {
+        static char s_path[MAX_PATH] = {};
+        static std::once_flag s_once;
+        std::call_once(s_once, [](){
+            DWORD ret = GetModuleFileNameA(nullptr, s_path, MAX_PATH);
+            if (ret == 0 || ret >= MAX_PATH)
+            {
+                strcpy_s(s_path, "aida_debug.log");
+                return;
+            }
+            char* last = strrchr(s_path, '\\');
+            if (last)
+                *(last + 1) = '\0';
+            else
+                s_path[0] = '\0';
+            strcat_s(s_path, "aida_debug.log");
+        });
+        return s_path;
+    }
+
+    inline std::mutex& log_mtx()
+    {
+        static std::mutex m;
+        return m;
+    }
+}
+
+inline void write_log(const char* tag, const char* detail)
+{
+    std::lock_guard<std::mutex> lk(detail::log_mtx());
+    const char* path = detail::log_path();
+
+    HANDLE hf = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(hf, 0, nullptr, FILE_END);
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    char line[1024];
+    int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "[%02d:%02d:%02d.%03d] [%s] %s\r\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        tag, detail);
+    if (len > 0) {
+        DWORD written;
+        WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
+    }
+    CloseHandle(hf);
+}
+
+namespace detail {
+
     inline std::mutex& rate_mtx()
     {
         static std::mutex m;

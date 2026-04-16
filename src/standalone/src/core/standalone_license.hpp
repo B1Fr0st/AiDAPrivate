@@ -104,4 +104,6 @@ namespace standalone_license
     const arc_comm_vtable_t* get_arc_comm_bridge();
     uint64_t arc_validate_tool(uint64_t tool_name_hash, uint64_t gate_token);
     arc_heartbeat_result_t arc_heartbeat();
+    uint64_t get_server_nonce_hash();
+    std::string get_session_token();
 }

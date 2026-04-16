@@ -36,13 +36,14 @@ function encryptArc(plaintext, sessionToken, hwid, issuedAt) {
 
 const CODE_PAGE_SIZE = 4096;
 
-function derivePageKey(sessionToken, hwid, issuedAt, pageIndex) {
+function derivePageKey(sessionToken, hwid, issuedAt, pageIndex, proofToken) {
     const masterSecret = process.env.ARC_MASTER_SECRET;
     if (!masterSecret || masterSecret.length < 32) {
         throw new Error('ARC_MASTER_SECRET must be at least 32 characters');
     }
 
-    const data = `page|${pageIndex}|${sessionToken}|${hwid}|${issuedAt}`;
+    const proof = proofToken || '';
+    const data = `page|${pageIndex}|${sessionToken}|${hwid}|${issuedAt}|${proof}`;
     return crypto.createHmac('sha256', masterSecret)
         .update(data)
         .digest();
@@ -52,8 +53,8 @@ function getPageCount(blobSize) {
     return Math.ceil(blobSize / CODE_PAGE_SIZE);
 }
 
-function encryptPage(plaintext, pageIndex, sessionToken, hwid, issuedAt) {
-    const key = derivePageKey(sessionToken, hwid, issuedAt, pageIndex);
+function encryptPage(plaintext, pageIndex, sessionToken, hwid, issuedAt, proofToken) {
+    const key = derivePageKey(sessionToken, hwid, issuedAt, pageIndex, proofToken);
     const iv = crypto.randomBytes(12);
 
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);

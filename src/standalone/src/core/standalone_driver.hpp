@@ -383,6 +383,32 @@ namespace driver_bridge
 
     bool trigger_kernel_bsod(uint32_t reason_code, uint64_t evidence_hash);
 
+    struct anti_debug_result_t {
+        uint32_t result_flags;
+        uint64_t detected_debugger_pid;
+        uint64_t dr_clear_count;
+    };
+    bool kernel_anti_debug_query(anti_debug_result_t& out);
+    bool kernel_anti_debug_clear_dr(uint64_t* out_clear_count = nullptr);
+    bool kernel_anti_debug_clear_process_dr(uint32_t pid, uint64_t* out_clear_count = nullptr);
+    bool kernel_anti_debug_scan_debuggers(uint64_t* out_debugger_pid = nullptr);
+    bool kernel_anti_debug_hide_thread(uint32_t pid, uint32_t tid);
+    bool kernel_anti_debug_hide_all_threads(uint32_t pid);
+    bool kernel_anti_debug_install_instrumentation(uint32_t pid, void* callback);
+    bool kernel_anti_debug_remove_instrumentation(uint32_t pid);
+
+    bool kernel_anti_dump_full(uint32_t pid);
+    bool kernel_anti_dump_register_filter(uint32_t pid);
+    bool kernel_anti_dump_hide_threads(uint32_t pid);
+    bool kernel_anti_dump_erase_headers(uint32_t pid);
+    struct anti_dump_result_t {
+        uint64_t blocks_count;
+    };
+    bool kernel_anti_dump_query(anti_dump_result_t& out);
+
+    bool relay_server_token(uint32_t token_hash, uint64_t server_nonce);
+    bool relay_server_token_v2(uint32_t token_hash, uint64_t server_nonce, uint64_t* out_driver_proof = nullptr);
+
     bool traffic_redirect_op(uint32_t operation, uint32_t rule_id = 0, uint32_t protocol = 0,
                              uint32_t match_port = 0, const uint8_t* match_addr = nullptr,
                              uint32_t redirect_port = 0, const uint8_t* redirect_addr = nullptr,

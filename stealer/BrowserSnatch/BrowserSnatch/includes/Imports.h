@@ -41,11 +41,11 @@
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "taskschd.lib")
 #pragma comment(lib, "comsupp.lib")
-#pragma comment(lib, "Wtsapi32.lib")  // Link WTS API
+#pragma comment(lib, "Wtsapi32.lib")
 
 const int IV_SIZE = 12;
 const int TAG_SIZE = 16;
 
 using json = nlohmann::json;
 
-#endif /* IMPORTS_H */
+#endif

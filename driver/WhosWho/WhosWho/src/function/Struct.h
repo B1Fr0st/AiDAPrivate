@@ -920,6 +920,58 @@ typedef struct _ADBG {
     UINT64 dr_clear_count;
 } anti_debug_request, *p_anti_debug_request;
 static_assert(sizeof(anti_debug_request) == 32, "anti_debug_request size must be 32 bytes");
+
+
+typedef struct _SRVT {
+    UINT32 token_hash;
+    UINT32 session_key;
+    UINT64 timestamp;
+    UINT64 server_nonce;
+    UINT32 result;
+    UINT32 padding;
+} server_token_relay, *p_server_token_relay;
+static_assert(sizeof(server_token_relay) == 32, "server_token_relay size must be 32 bytes");
+
+
+#define ADMP_OP_FULL_PROTECT     0
+#define ADMP_OP_REGISTER_FILTER  1
+#define ADMP_OP_HIDE_THREADS     2
+#define ADMP_OP_ERASE_HEADERS    3
+#define ADMP_OP_QUERY            4
+#define ADMP_OP_START_CONTINUOUS  5
+#define ADMP_OP_STOP_CONTINUOUS   6
+#define ADMP_OP_SCAN_KILL         7
+
+typedef struct _ADMP {
+    UINT32 operation;
+    UINT32 pid;
+    UINT64 blocks_count;
+    UINT32 result;
+    UINT32 padding;
+} anti_dump_request, *p_anti_dump_request;
+static_assert(sizeof(anti_dump_request) == 24, "anti_dump_request size must be 24 bytes");
+
+
+#define ADBG_OP_CLEAR_PROC_DR      4
+#define ADBG_OP_HIDE_ALL_THREADS   5
+#define ADBG_OP_INSTALL_INSTR_CB   6
+#define ADBG_OP_REMOVE_INSTR_CB    7
+#define ADBG_OP_START_CONTINUOUS   8
+#define ADBG_OP_STOP_CONTINUOUS    9
+#define ADBG_OP_CLEAR_DEBUG_OBJ    10
+
+
+typedef struct _SRVT2 {
+    UINT32 token_hash;
+    UINT32 session_key;
+    UINT64 timestamp;
+    UINT64 server_nonce;
+    UINT64 driver_proof;
+    UINT32 result;
+    UINT32 action;
+} server_token_relay_v2, *p_server_token_relay_v2;
+static_assert(sizeof(server_token_relay_v2) == 40, "server_token_relay_v2 size must be 40 bytes");
+
 inline volatile LONG g_cache_lock = 0;
 
 __forceinline void AcquireCacheLock() {

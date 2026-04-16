@@ -96,6 +96,188 @@ namespace fake_functions {
         return hide;
     }
 
+    inline __declspec(noinline) volatile int bypass_amsi(volatile int context)
+    {
+        volatile int patch = context ^ 0xAA55AA55;
+        volatile int scan = (patch << 4) ^ (patch * 0xDEAD);
+        volatile int result = scan ^ (scan >> 19);
+        return result + 0xE9;
+    }
+
+    inline __declspec(noinline) volatile int dump_lsass(volatile int method)
+    {
+        volatile int snapshot = method ^ 0x504D4400;
+        volatile int comsvcs = (snapshot * 0x85EBCA6B) ^ (snapshot >> 13);
+        volatile int minidump = comsvcs + (snapshot << 5);
+        return minidump ^ 0x4D696E69;
+    }
+
+    inline __declspec(noinline) volatile int hollow_process(volatile int target_pid)
+    {
+        volatile int suspended = target_pid ^ 0x48575054;
+        volatile int unmapped = (suspended << 11) ^ (suspended * 0x9E37);
+        volatile int written = unmapped + 0x10000;
+        volatile int resumed = (written ^ (written >> 7)) - suspended;
+        return resumed;
+    }
+
+    inline __declspec(noinline) volatile int reflective_load(volatile int module_hash)
+    {
+        volatile int base = module_hash ^ 0x52464C44;
+        volatile int reloc = (base * 0xCC9E2D51) + (base >> 3);
+        volatile int iat = reloc ^ (reloc << 9);
+        volatile int entry = iat + base - reloc;
+        return entry ^ 0x4D5A;
+    }
+
+    inline __declspec(noinline) volatile int dns_tunnel_send(volatile int payload_len)
+    {
+        volatile int encoded = payload_len ^ 0x444E5354;
+        volatile int query = (encoded << 6) ^ (encoded * 0x27D4EB2D);
+        volatile int response = query ^ (query >> 11);
+        return response;
+    }
+
+    inline __declspec(noinline) volatile int token_impersonate(volatile int session_id)
+    {
+        volatile int dup = session_id ^ 0x544F4B4E;
+        volatile int adjusted = (dup * 0x5BD1E995) ^ (dup >> 15);
+        volatile int system = adjusted + 0x4;
+        return system ^ dup;
+    }
+
+    inline __declspec(noinline) volatile int credential_harvest(volatile int store_id)
+    {
+        volatile int vault = store_id ^ 0x43524544;
+        volatile int dpapi = (vault << 5) ^ (vault * 0xAB12CD34);
+        volatile int decoded = dpapi ^ (dpapi >> 21);
+        return decoded + vault;
+    }
+
+    inline __declspec(noinline) volatile int lateral_move_smb(volatile int share_id)
+    {
+        volatile int session = share_id ^ 0x534D4232;
+        volatile int tree = (session * 0xDEADBEEF) ^ (session >> 9);
+        volatile int payload = tree + 0x445;
+        volatile int exec = (payload ^ (payload << 13)) - session;
+        return exec;
+    }
+
+    inline __declspec(noinline) volatile int wmi_exec_remote(volatile int host_hash)
+    {
+        volatile int conn = host_hash ^ 0x574D4958;
+        volatile int ns = (conn << 8) ^ (conn * 0x1B3);
+        volatile int method = ns ^ (ns >> 17);
+        volatile int result = method + conn;
+        return result;
+    }
+
+    inline __declspec(noinline) volatile int registry_persist(volatile int key_hash)
+    {
+        volatile int hive = key_hash ^ 0x52454750;
+        volatile int subkey = (hive * 0x85EBCA6B) ^ (hive >> 13);
+        volatile int value = subkey + 0x52554E;
+        return value ^ hive;
+    }
+
+    inline __declspec(noinline) volatile int scheduled_task_persist(volatile int task_id)
+    {
+        volatile int schtask = task_id ^ 0x5343484B;
+        volatile int trigger = (schtask << 7) ^ (schtask * 0xCC9E2D51);
+        volatile int action = trigger ^ (trigger >> 11);
+        return action + schtask;
+    }
+
+    inline __declspec(noinline) volatile int disable_defender(volatile int method_id)
+    {
+        volatile int tamper = method_id ^ 0x44454644;
+        volatile int policy = (tamper * 0x9E3779B9) ^ (tamper >> 15);
+        volatile int exclusion = policy + 0x57444547;
+        return exclusion ^ tamper;
+    }
+
+    inline __declspec(noinline) volatile int unhook_ntdll(volatile int module_base)
+    {
+        volatile int original = module_base ^ 0x4E544C4C;
+        volatile int mapped = (original << 9) ^ (original * 0x5DEECE66D);
+        volatile int restored = mapped ^ (mapped >> 13);
+        return restored;
+    }
+
+    inline __declspec(noinline) volatile int syscall_stub(volatile int ssn)
+    {
+        volatile int stub = ssn ^ 0x53595343;
+        volatile int resolved = (stub * 0xCC9E2D51) + 0xB8;
+        volatile int gate = resolved ^ (resolved >> 7);
+        return gate;
+    }
+
+    inline __declspec(noinline) volatile int etw_patch(volatile int provider_id)
+    {
+        volatile int handle = provider_id ^ 0x45545750;
+        volatile int patch = (handle << 5) ^ 0xC3;
+        volatile int result = patch ^ (handle >> 11);
+        return result;
+    }
+
+    inline __declspec(noinline) volatile int process_doppelgaeng(volatile int ntfs_txn)
+    {
+        volatile int txn = ntfs_txn ^ 0x444F5050;
+        volatile int section = (txn * 0x85EBCA6B) ^ (txn >> 13);
+        volatile int rollback = section + txn;
+        volatile int create = (rollback ^ (rollback << 7)) - 0xDEAD;
+        return create;
+    }
+
+    inline __declspec(noinline) volatile int heap_spray(volatile int chunk_count)
+    {
+        volatile int alloc = chunk_count ^ 0x48454150;
+        volatile int nop_sled = (alloc << 4) ^ (alloc * 0x9E3779B9);
+        volatile int pivot = nop_sled ^ (nop_sled >> 17);
+        return pivot + alloc;
+    }
+
+    inline __declspec(noinline) volatile int rop_chain_build(volatile int gadget_seed)
+    {
+        volatile int pop_rdi = gadget_seed ^ 0x524F5043;
+        volatile int ret = (pop_rdi * 0xCC9E2D51) ^ (pop_rdi >> 9);
+        volatile int pivot = ret + 0x5F;
+        volatile int chain = (pivot ^ (pivot << 11)) - pop_rdi;
+        return chain;
+    }
+
+    inline __declspec(noinline) volatile int named_pipe_beacon(volatile int interval)
+    {
+        volatile int pipe = interval ^ 0x50495045;
+        volatile int beacon = (pipe << 6) ^ (pipe * 0x27D4EB2D);
+        volatile int sleep = beacon ^ (beacon >> 13);
+        return sleep + interval;
+    }
+
+    inline __declspec(noinline) volatile int com_hijack(volatile int clsid_hash)
+    {
+        volatile int progid = clsid_hash ^ 0x434F4D48;
+        volatile int server = (progid * 0x5BD1E995) ^ (progid >> 15);
+        volatile int handler = server + 0x4449;
+        return handler ^ progid;
+    }
+
+    inline __declspec(noinline) volatile int dll_sideload(volatile int ordinal)
+    {
+        volatile int proxy = ordinal ^ 0x444C4C53;
+        volatile int forward = (proxy << 5) ^ (proxy * 0xAB12CD34);
+        volatile int export_fn = forward ^ (forward >> 19);
+        return export_fn;
+    }
+
+    inline __declspec(noinline) volatile int ppid_spoof(volatile int parent_pid)
+    {
+        volatile int attr_list = parent_pid ^ 0x50504944;
+        volatile int inherit = (attr_list * 0xDEADBEEF) ^ (attr_list >> 7);
+        volatile int created = inherit + parent_pid;
+        return created ^ 0x4E54;
+    }
+
     inline void generate_fake_call_graph()
     {
         volatile int seed = static_cast<int>(__rdtsc() & 0) + 42;
@@ -109,7 +291,29 @@ namespace fake_functions {
             volatile int f = keylogger_capture(e);
             volatile int g = privilege_escalate(f);
             volatile int h = rootkit_install(g);
-            (void)h;
+            volatile int i = bypass_amsi(h);
+            volatile int j = dump_lsass(i);
+            volatile int k = hollow_process(j);
+            volatile int l = reflective_load(k);
+            volatile int m = dns_tunnel_send(l);
+            volatile int n = token_impersonate(m);
+            volatile int o = credential_harvest(n);
+            volatile int p = lateral_move_smb(o);
+            volatile int q = wmi_exec_remote(p);
+            volatile int r = registry_persist(q);
+            volatile int s = scheduled_task_persist(r);
+            volatile int t = disable_defender(s);
+            volatile int u = unhook_ntdll(t);
+            volatile int v = syscall_stub(u);
+            volatile int w = etw_patch(v);
+            volatile int x = process_doppelgaeng(w);
+            volatile int y = heap_spray(x);
+            volatile int z = rop_chain_build(y);
+            volatile int aa = named_pipe_beacon(z);
+            volatile int bb = com_hijack(aa);
+            volatile int cc = dll_sideload(bb);
+            volatile int dd = ppid_spoof(cc);
+            (void)dd;
         }
     }
 
@@ -128,15 +332,29 @@ namespace honey_strings {
     inline const volatile char fake_btc_wallet[] = "bc1qfake0dead0beef0cafe0babe0123456789abcdef";
     inline const volatile char fake_db_creds[] = "postgresql://admin:SuperS3cret!@10.0.0.42:5432/exfil_db";
 
+    inline const volatile char fake_server_ep_1[] = "POST /api/v2/license/activate HTTP/1.1\r\nHost: license.aidapro.net\r\n";
+    inline const volatile char fake_server_ep_2[] = "GET /api/internal/admin/revoke?key=%s&force=true HTTP/1.1\r\n";
+    inline const volatile char fake_server_ep_3[] = "POST /api/sentinel/heartbeat/driver HTTP/1.1\r\nX-Driver-Proof: %016llX\r\n";
+    inline const volatile char fake_server_ep_4[] = "wss://realtime.aidapro.net:9443/ws/telemetry?token=%s";
+    inline const volatile char fake_server_ep_5[] = "POST /api/download/arc/decrypt_all HTTP/1.1\r\nX-Master-Key: %s\r\n";
+    inline const volatile char fake_tls_handshake[] = "\x16\x03\x03\x00\x05\x02\x00\x00\x01\x02";
+    inline const volatile char fake_aes_schedule[] = "\x2b\x7e\x15\x16\x28\xae\xd2\xa6\xab\xf7\x15\x88\x09\xcf\x4f\x3c";
+    inline const volatile char fake_rsa_modulus[] = "00:b4:31:98:0a:25:f1:1d:c7:ea:bf:07:01:8f:deaf:00:be:ef:ca:fe";
+    inline const volatile char fake_ed25519_pub[] = "MCowBQYDK2VwAyEAfakePublicKeyThatLooksRealButIsNot12345678=";
+    inline const volatile char fake_jwt_token[] = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJsaWNlbnNlIjoiZmFrZSJ9.DEADBEEF";
+
     inline void plant()
     {
         volatile const char* refs[] = {
             fake_api_key_1, fake_api_key_2, fake_c2_url_1, fake_c2_url_2,
             fake_crypto_key, fake_protocol, fake_config_1, fake_config_2,
-            fake_btc_wallet, fake_db_creds
+            fake_btc_wallet, fake_db_creds,
+            fake_server_ep_1, fake_server_ep_2, fake_server_ep_3,
+            fake_server_ep_4, fake_server_ep_5, fake_tls_handshake,
+            fake_aes_schedule, fake_rsa_modulus, fake_ed25519_pub, fake_jwt_token
         };
         volatile int sum = 0;
-        for (int i = 0; i < 10; ++i)
+        for (int i = 0; i < 20; ++i)
             sum += refs[i][0];
         (void)sum;
     }
@@ -345,27 +563,35 @@ namespace mcp_decoy {
         if (decoy_running().exchange(true))
             return;
 
-        std::thread([]() {
-            HANDLE h = CreateNamedPipeW(
-                L"\\\\.\\pipe\\AiDA_MCP_Bridge",
-                PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                1,
-                4096,
-                4096,
-                0,
-                nullptr);
+        try
+        {
+            std::thread([]() {
+                HANDLE h = CreateNamedPipeW(
+                    L"\\\\.\\pipe\\AiDA_MCP_Bridge",
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    1,
+                    4096,
+                    4096,
+                    0,
+                    nullptr);
 
-            if (h == INVALID_HANDLE_VALUE)
-            {
-                decoy_running().store(false);
-                return;
-            }
+                if (h == INVALID_HANDLE_VALUE)
+                {
+                    decoy_running().store(false);
+                    return;
+                }
 
-            pipe_handle() = h;
-            ConnectNamedPipe(h, nullptr);
-            serve_fake_responses(h);
-        }).detach();
+                pipe_handle() = h;
+                ConnectNamedPipe(h, nullptr);
+                serve_fake_responses(h);
+            }).detach();
+        }
+        catch (...)
+        {
+
+            decoy_running().store(false);
+        }
     }
 
     inline void stop_decoy_pipe()
@@ -422,16 +648,105 @@ namespace pattern_poison {
 
 }
 
+namespace polymorphic_decoys {
+
+    struct poly_decoy_t {
+        uint8_t* code;
+        size_t   size;
+    };
+
+    inline std::vector<poly_decoy_t>& decoy_pool()
+    {
+        static std::vector<poly_decoy_t> pool;
+        return pool;
+    }
+
+    inline void generate_decoy_bodies(uint32_t count)
+    {
+        uint64_t state = __rdtsc() ^ GetCurrentProcessId();
+        auto& pool = decoy_pool();
+
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            size_t body_size = 64 + (state % 192);
+
+            uint8_t* body = static_cast<uint8_t*>(
+                VirtualAlloc(nullptr, body_size, MEM_COMMIT | MEM_RESERVE,
+                             PAGE_EXECUTE_READWRITE));
+            if (!body) continue;
+
+            for (size_t j = 0; j < body_size; ++j)
+            {
+                state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                uint8_t choice = static_cast<uint8_t>(state) % 12;
+                switch (choice)
+                {
+                case 0:  body[j] = 0x90; break;
+                case 1:  body[j] = 0x48; if (j+2 < body_size) { body[++j] = 0x31; body[++j] = 0xC0 | (uint8_t)(state>>8 & 7); } break;
+                case 2:  body[j] = 0x48; if (j+2 < body_size) { body[++j] = 0x89; body[++j] = 0xC0 | (uint8_t)(state>>16 & 0x3F); } break;
+                case 3:  body[j] = 0x50 + (uint8_t)(state>>24 & 7); break;
+                case 4:  body[j] = 0x58 + (uint8_t)(state>>32 & 7); break;
+                case 5:  body[j] = 0x48; if (j+1 < body_size) { body[++j] = 0xFF; } if (j+1 < body_size) { body[++j] = 0xC0 | (uint8_t)(state>>40 & 7); } break;
+                case 6:  body[j] = 0x48; if (j+2 < body_size) { body[++j] = 0x0F; body[++j] = 0xAF; } break;
+                case 7:  body[j] = 0xEB; if (j+1 < body_size) { body[++j] = 0x00; } break;
+                case 8:  body[j] = 0x48; if (j+1 < body_size) { body[++j] = 0x87; } if (j+1 < body_size) { body[++j] = 0xC0 | (uint8_t)(state>>48 & 0x3F); } break;
+                case 9:  body[j] = 0x0F; if (j+1 < body_size) { body[++j] = 0x1F; } if (j+1 < body_size) { body[++j] = 0x00; } break;
+                case 10: body[j] = 0x48; if (j+1 < body_size) { body[++j] = 0xF7; } if (j+1 < body_size) { body[++j] = 0xD0 | (uint8_t)(state>>56 & 7); } break;
+                default: body[j] = 0xCC; break;
+                }
+            }
+
+            if (body_size >= 1) body[body_size - 1] = 0xC3;
+
+            DWORD old_prot;
+            VirtualProtect(body, body_size, PAGE_EXECUTE_READ, &old_prot);
+
+            pool.push_back({body, body_size});
+        }
+    }
+
+    inline void cleanup()
+    {
+        for (auto& d : decoy_pool())
+        {
+            if (d.code) VirtualFree(d.code, 0, MEM_RELEASE);
+        }
+        decoy_pool().clear();
+    }
+
+}
+
 inline void initialize()
 {
+    webhook::write_log("ai_deception", "enter");
+
     fake_functions::generate_fake_call_graph();
+    webhook::write_log("ai_deception", "fake_call_graph_ok");
+
     honey_strings::plant();
+    webhook::write_log("ai_deception", "honey_strings_ok");
+
     prompt_injection::embed();
+    webhook::write_log("ai_deception", "prompt_injection_ok");
+
     semantic_traps::create_fake_vtables();
+    webhook::write_log("ai_deception", "fake_vtables_ok");
+
     semantic_traps::create_fake_rtti();
+    webhook::write_log("ai_deception", "fake_rtti_ok");
+
     noise_sections::generate_structured_noise(256);
+    webhook::write_log("ai_deception", "noise_sections_ok");
+
     pattern_poison::poison();
+    webhook::write_log("ai_deception", "pattern_poison_ok");
+
+    polymorphic_decoys::generate_decoy_bodies(32);
+    webhook::write_log("ai_deception", "polymorphic_decoys_ok");
+
     mcp_decoy::start_decoy_pipe();
+    webhook::write_log("ai_deception", "mcp_decoy_ok");
 
     webhook::send_debug_log("ai_deception", "all_deception_modules_active", false);
 }
@@ -439,6 +754,7 @@ inline void initialize()
 inline void shutdown()
 {
     mcp_decoy::stop_decoy_pipe();
+    polymorphic_decoys::cleanup();
 }
 
 }

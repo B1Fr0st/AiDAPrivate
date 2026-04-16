@@ -268,6 +268,53 @@ int main(int, char**)
 
 
     standalone_license::snapshot_code_hashes();
+
+    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
+        char buf[2048];
+        snprintf(buf, sizeof(buf),
+            "EXCEPTION: code=0x%08X addr=0x%016llX\n"
+            "Flags=0x%08X NumParams=%lu\n"
+            "Info[0]=0x%016llX Info[1]=0x%016llX\n"
+            "Rax=%016llX Rcx=%016llX Rdx=%016llX Rbx=%016llX\n"
+            "Rsp=%016llX Rbp=%016llX Rsi=%016llX Rdi=%016llX\n"
+            "R8=%016llX R9=%016llX R10=%016llX R11=%016llX\n"
+            "R12=%016llX R13=%016llX R14=%016llX R15=%016llX\n"
+            "Rip=%016llX\n",
+            ep->ExceptionRecord->ExceptionCode,
+            reinterpret_cast<unsigned long long>(ep->ExceptionRecord->ExceptionAddress),
+            ep->ExceptionRecord->ExceptionFlags,
+            ep->ExceptionRecord->NumberParameters,
+            ep->ExceptionRecord->NumberParameters > 0 ? ep->ExceptionRecord->ExceptionInformation[0] : 0ULL,
+            ep->ExceptionRecord->NumberParameters > 1 ? ep->ExceptionRecord->ExceptionInformation[1] : 0ULL,
+            ep->ContextRecord->Rax, ep->ContextRecord->Rcx,
+            ep->ContextRecord->Rdx, ep->ContextRecord->Rbx,
+            ep->ContextRecord->Rsp, ep->ContextRecord->Rbp,
+            ep->ContextRecord->Rsi, ep->ContextRecord->Rdi,
+            ep->ContextRecord->R8,  ep->ContextRecord->R9,
+            ep->ContextRecord->R10, ep->ContextRecord->R11,
+            ep->ContextRecord->R12, ep->ContextRecord->R13,
+            ep->ContextRecord->R14, ep->ContextRecord->R15,
+            ep->ContextRecord->Rip);
+
+        char path[MAX_PATH];
+        GetModuleFileNameA(nullptr, path, MAX_PATH);
+        char* last = strrchr(path, '\\');
+        if (last) *(last + 1) = '\0';
+        strcat_s(path, "aida_crash.log");
+
+        HANDLE hf = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf != INVALID_HANDLE_VALUE) {
+            DWORD written;
+            WriteFile(hf, buf, static_cast<DWORD>(strlen(buf)), &written, nullptr);
+            CloseHandle(hf);
+        }
+
+        anti_tamper::webhook::send_debug_log("crash", buf, true);
+
+        return EXCEPTION_CONTINUE_SEARCH;
+    });
+
     anti_tamper::initialize();
 
 

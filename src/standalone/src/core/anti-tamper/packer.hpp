@@ -3,7 +3,7 @@
 #include <windows.h>
 #include <intrin.h>
 #include <nmmintrin.h>
-#include <wmmintrin.h>   // AES-NI intrinsics
+#include <wmmintrin.h>
 
 #include <atomic>
 #include <cstdint>
@@ -22,9 +22,9 @@ namespace detail {
     {
         uint64_t base;
         uint32_t size;
-        __m128i  aes_key;         // 128-bit AES key
-        __m128i  aes_nonce;       // CTR nonce (incremented per block)
-        uint64_t hmac;            // SipHash-2-4 integrity tag
+        __m128i  aes_key;
+        __m128i  aes_nonce;
+        uint64_t hmac;
         DWORD    original_protect;
         uint32_t original_crc;
         bool     decrypted;
@@ -80,7 +80,7 @@ namespace detail {
         return h;
     }
 
-    // Derive 128-bit AES key + nonce from section parameters
+
     inline void derive_aes_material(uint64_t section_base, uint32_t section_size,
                                      uint64_t master_seed, __m128i& out_key, __m128i& out_nonce)
     {
@@ -92,7 +92,7 @@ namespace detail {
         out_nonce = _mm_set_epi64x(static_cast<long long>(n1), static_cast<long long>(n0));
     }
 
-    // AES-128 key expansion helper
+
     __forceinline __m128i aes_128_key_assist(__m128i temp1, __m128i temp2)
     {
         temp2 = _mm_shuffle_epi32(temp2, 0xFF);
@@ -105,7 +105,7 @@ namespace detail {
         return _mm_xor_si128(temp1, temp2);
     }
 
-    // Expand AES-128 key into 11 round keys
+
     inline void aes_128_expand_key(__m128i key, __m128i round_keys[11])
     {
         round_keys[0] = key;
@@ -121,7 +121,7 @@ namespace detail {
         round_keys[10] = aes_128_key_assist(round_keys[9],  _mm_aeskeygenassist_si128(round_keys[9],  0x36));
     }
 
-    // Encrypt a single block with AES-128
+
     __forceinline __m128i aes_encrypt_block(__m128i block, const __m128i round_keys[11])
     {
         block = _mm_xor_si128(block, round_keys[0]);
@@ -138,7 +138,7 @@ namespace detail {
         return block;
     }
 
-    // AES-CTR encrypt/decrypt (symmetric — same function for both)
+
     inline void aes_ctr_crypt_region(uint8_t* base, size_t size, __m128i key, __m128i nonce)
     {
         __m128i round_keys[11];
@@ -157,7 +157,7 @@ namespace detail {
             counter = _mm_add_epi64(counter, one);
         }
 
-        // Handle tail bytes (< 16)
+
         size_t tail_offset = full_blocks * 16;
         size_t tail_len = size - tail_offset;
         if (tail_len > 0)
@@ -169,11 +169,11 @@ namespace detail {
                 base[tail_offset + j] ^= ks_bytes[j];
         }
 
-        // Scrub round keys from stack
+
         SecureZeroMemory(round_keys, sizeof(round_keys));
     }
 
-    // SipHash-2-4 for HMAC integrity verification
+
     inline uint64_t siphash_2_4(const uint8_t* data, size_t len, uint64_t k0, uint64_t k1)
     {
         uint64_t v0 = k0 ^ 0x736F6D6570736575ULL;
@@ -222,7 +222,7 @@ namespace detail {
         return v0 ^ v1 ^ v2 ^ v3;
     }
 
-    // Legacy XOR fallback (kept for backward compat if AES-NI unavailable)
+
     inline void xor_encrypt_region(uint8_t* base, size_t size, uint64_t key)
     {
         auto* qw = reinterpret_cast<uint64_t*>(base);
@@ -249,13 +249,13 @@ namespace detail {
         return crc ^ 0xFFFFFFFF;
     }
 
-    // Anti-unpack timing: detect single-step or breakpoint-assisted unpacking
+
     inline bool timing_check()
     {
         unsigned int aux;
         uint64_t t0 = __rdtscp(&aux);
 
-        // Execute several cheap ops — if being single-stepped, this takes >10k cycles
+
         volatile uint64_t dummy = 0;
         for (int i = 0; i < 32; ++i)
             dummy ^= _rotl64(dummy + i, i & 63);
@@ -263,24 +263,24 @@ namespace detail {
         uint64_t t1 = __rdtscp(&aux);
         uint64_t delta = t1 - t0;
 
-        // Normal execution: ~50-200 cycles, single-step: >10,000
+
         return delta < 5000;
     }
 
-    // Constant-time compare to resist timing side-channels on CRC checks
+
     inline bool constant_time_eq32(uint32_t a, uint32_t b)
     {
         volatile uint32_t diff = a ^ b;
         return diff == 0;
     }
 
-    // Build trampoline stubs in RWX memory for import obfuscation
+
     inline uint8_t* alloc_trampoline_page()
     {
         auto* page = static_cast<uint8_t*>(VirtualAlloc(
             nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
         if (page)
-            memset(page, 0xCC, 4096); // fill with INT3
+            memset(page, 0xCC, 4096);
         return page;
     }
 
@@ -288,30 +288,30 @@ namespace detail {
     {
         uint64_t addr = reinterpret_cast<uint64_t>(cursor);
 
-        // mov rax, real_target ^ obf_key
+
         uint64_t encoded = real_target ^ static_cast<uint64_t>(obf_key) * 0x100000001ULL;
-        cursor[0] = 0x48; cursor[1] = 0xB8; // mov rax, imm64
+        cursor[0] = 0x48; cursor[1] = 0xB8;
         memcpy(cursor + 2, &encoded, 8);
         cursor += 10;
 
-        // xor rax, obf_key_expanded
+
         uint64_t key_expanded = static_cast<uint64_t>(obf_key) * 0x100000001ULL;
-        cursor[0] = 0x48; cursor[1] = 0x35; // xor rax, imm32 (sign-extended) — use REX.W + 0x35 for imm32
-        // Actually use mov r11, key; xor rax, r11 for full 64-bit
-        cursor[0] = 0x49; cursor[1] = 0xBB; // mov r11, imm64
+        cursor[0] = 0x48; cursor[1] = 0x35;
+
+        cursor[0] = 0x49; cursor[1] = 0xBB;
         memcpy(cursor + 2, &key_expanded, 8);
         cursor += 10;
 
-        cursor[0] = 0x4C; cursor[1] = 0x33; cursor[2] = 0xD8; // xor r11, rax → wrong
-        // xor rax, r11
-        cursor[0] = 0x49; cursor[1] = 0x33; cursor[2] = 0xC3; // xor rax, r11
+        cursor[0] = 0x4C; cursor[1] = 0x33; cursor[2] = 0xD8;
+
+        cursor[0] = 0x49; cursor[1] = 0x33; cursor[2] = 0xC3;
         cursor += 3;
 
-        // jmp rax
+
         cursor[0] = 0xFF; cursor[1] = 0xE0;
         cursor += 2;
 
-        // Pad to 32-byte alignment
+
         while (reinterpret_cast<uintptr_t>(cursor) % 32 != 0) {
             *cursor++ = 0xCC;
         }
@@ -319,9 +319,8 @@ namespace detail {
         return addr;
     }
 
-} // namespace detail
+}
 
-// ── Section encryption ──────────────────────────────────────────────
 
 inline bool encrypt_sections(uint64_t master_seed)
 {
@@ -346,23 +345,23 @@ inline bool encrypt_sections(uint64_t master_seed)
 
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
     {
-        // Skip sections that are not code or initialized data
-        if (!(sec[i].Characteristics & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_INITIALIZED_DATA)))
+        if (!(sec[i].Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA))
             continue;
-        // Skip tiny sections
+        if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+            continue;
         if (sec[i].Misc.VirtualSize < 64)
             continue;
 
         auto base = reinterpret_cast<uint64_t>(hMod) + sec[i].VirtualAddress;
         uint32_t size = sec[i].Misc.VirtualSize;
 
-        // Derive AES key material
+
         __m128i aes_key, aes_nonce;
         detail::derive_aes_material(base, size, master_seed, aes_key, aes_nonce);
 
         uint32_t crc = detail::crc32_region(reinterpret_cast<const void*>(base), size);
 
-        // Compute SipHash HMAC over plaintext before encryption
+
         uint64_t hmac_k0 = detail::derive_section_key(base, size, master_seed);
         uint64_t hmac_k1 = detail::derive_section_key(base ^ 0xBADC0FFEE0DDF00DULL, size, master_seed);
         uint64_t hmac = detail::siphash_2_4(reinterpret_cast<const uint8_t*>(base), size, hmac_k0, hmac_k1);
@@ -393,7 +392,7 @@ inline bool encrypt_sections(uint64_t master_seed)
     return !detail::sections().empty();
 }
 
-// Decrypt a specific section on demand (lazy unpacking)
+
 inline bool decrypt_section(uint32_t index)
 {
     if (!detail::initialized().load())
@@ -408,7 +407,7 @@ inline bool decrypt_section(uint32_t index)
     if (sec.decrypted)
         return true;
 
-    // Anti-unpack timing check
+
     if (!detail::timing_check())
         return false;
 
@@ -423,24 +422,24 @@ inline bool decrypt_section(uint32_t index)
     DWORD dummy;
     VirtualProtect(reinterpret_cast<void*>(sec.base), sec.size, sec.original_protect, &dummy);
 
-    // Verify CRC after decryption
+
     uint32_t check = detail::crc32_region(reinterpret_cast<const void*>(sec.base), sec.size);
     if (!detail::constant_time_eq32(check, sec.original_crc))
     {
-        // Tampered — re-encrypt and fail
+
         VirtualProtect(reinterpret_cast<void*>(sec.base), sec.size, PAGE_READWRITE, &old_protect);
         detail::aes_ctr_crypt_region(reinterpret_cast<uint8_t*>(sec.base), sec.size, sec.aes_key, sec.aes_nonce);
         VirtualProtect(reinterpret_cast<void*>(sec.base), sec.size, sec.original_protect, &dummy);
         return false;
     }
 
-    // Verify SipHash HMAC
+
     uint64_t hmac_k0 = detail::derive_section_key(sec.base, sec.size, 0);
     uint64_t hmac_k1 = detail::derive_section_key(sec.base ^ 0xBADC0FFEE0DDF00DULL, sec.size, 0);
     uint64_t check_hmac = detail::siphash_2_4(reinterpret_cast<const uint8_t*>(sec.base), sec.size, hmac_k0, hmac_k1);
     if (check_hmac != sec.hmac)
     {
-        // HMAC mismatch — re-encrypt and fail
+
         VirtualProtect(reinterpret_cast<void*>(sec.base), sec.size, PAGE_READWRITE, &old_protect);
         detail::aes_ctr_crypt_region(reinterpret_cast<uint8_t*>(sec.base), sec.size, sec.aes_key, sec.aes_nonce);
         VirtualProtect(reinterpret_cast<void*>(sec.base), sec.size, sec.original_protect, &dummy);
@@ -451,13 +450,13 @@ inline bool decrypt_section(uint32_t index)
     return true;
 }
 
-// Decrypt all sections
+
 inline bool decrypt_all_sections()
 {
     if (!detail::initialized().load())
         return false;
 
-    // Anti-unpack: second timing gate
+
     if (!detail::timing_check())
         return false;
 
@@ -487,7 +486,6 @@ inline bool decrypt_all_sections()
     return true;
 }
 
-// ── Import table obfuscation ────────────────────────────────────────
 
 inline bool obfuscate_imports(uint32_t obf_seed)
 {
@@ -506,7 +504,7 @@ inline bool obfuscate_imports(uint32_t obf_seed)
 
     auto& import_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (import_dir.VirtualAddress == 0 || import_dir.Size == 0)
-        return true; // no imports
+        return true;
 
     auto base = reinterpret_cast<uintptr_t>(hMod);
     auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + import_dir.VirtualAddress);
@@ -526,15 +524,15 @@ inline bool obfuscate_imports(uint32_t obf_seed)
 
         for (; *thunk != 0; ++thunk)
         {
-            // Rotate key per import
+
             key = _mm_crc32_u32(key, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(thunk)));
 
             uint64_t real_target = *thunk;
 
-            // Build trampoline
+
             if (cursor + 32 > trampoline_page + 4096)
             {
-                // Allocate new page
+
                 trampoline_page = detail::alloc_trampoline_page();
                 if (!trampoline_page) break;
                 cursor = trampoline_page;
@@ -542,7 +540,7 @@ inline bool obfuscate_imports(uint32_t obf_seed)
 
             uint64_t tramp = detail::build_trampoline(cursor, real_target, key);
 
-            // Overwrite IAT entry with trampoline address
+
             DWORD old_prot = 0;
             if (VirtualProtect(thunk, 8, PAGE_READWRITE, &old_prot))
             {
@@ -564,18 +562,17 @@ inline bool obfuscate_imports(uint32_t obf_seed)
     return redirect_count > 0;
 }
 
-// ── Anti-unpack verification ────────────────────────────────────────
 
 inline bool verify_unpack_timing()
 {
     uint64_t start = detail::unpack_start_tsc().load();
-    if (start == 0) return true; // no unpack happened yet
+    if (start == 0) return true;
 
     unsigned int aux;
     uint64_t now = __rdtscp(&aux);
     uint64_t elapsed = now - start;
 
-    // If unpacking took more than ~50ms worth of cycles (~150M at 3GHz), suspect tampering
+
     return elapsed < 150'000'000ULL;
 }
 
@@ -591,7 +588,7 @@ inline uint32_t get_redirect_count()
     return static_cast<uint32_t>(detail::redirects().size());
 }
 
-// Re-encrypt all sections (for shutdown or on violation)
+
 inline void re_encrypt_all()
 {
     std::lock_guard<std::mutex> lk(detail::pack_mtx());
@@ -619,5 +616,5 @@ inline void shutdown()
     detail::initialized().store(false);
 }
 
-} // namespace packer
-} // namespace anti_tamper
+}
+}

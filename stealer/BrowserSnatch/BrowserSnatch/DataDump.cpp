@@ -4,14 +4,14 @@ bool dump_password_data(const std::string& db_path, std::vector<DataHolder> data
 	sqlite3* db;
 	char* errorMessage = nullptr;
 
-	// Open the database
+
 	int rc = sqlite3_open(db_path.c_str(), &db);
 	if (rc) {
-		//std::cerr << "Can't open database: " << sqlite3_errmsg(db) << std::endl;
+
 		return false;
 	}
 
-	// Create table if it doesn't exist
+
 	const char* createTableSQL = "CREATE TABLE IF NOT EXISTS logins ("
 		"id INTEGER PRIMARY KEY AUTOINCREMENT,"
 		"url TEXT NOT NULL,"
@@ -22,19 +22,19 @@ bool dump_password_data(const std::string& db_path, std::vector<DataHolder> data
 
 	rc = sqlite3_exec(db, createTableSQL, nullptr, nullptr, &errorMessage);
 	if (rc != SQLITE_OK) {
-		//std::cerr << "SQL error: " << errorMessage << std::endl;
+
 		sqlite3_free(errorMessage);
 		sqlite3_close(db);
 		return false;
 	}
 
-	// Prepare insert statement
+
 	const char* insertSQL = "INSERT INTO logins (url, username, password, host) VALUES (?, ?, ?, ?);";
 	sqlite3_stmt* stmt;
 
 	rc = sqlite3_prepare_v2(db, insertSQL, -1, &stmt, nullptr);
 	if (rc != SQLITE_OK) {
-		//std::cerr << "Failed to prepare statement: " << sqlite3_errmsg(db) << std::endl;
+
 		sqlite3_close(db);
 		return false;
 	}
@@ -44,10 +44,10 @@ bool dump_password_data(const std::string& db_path, std::vector<DataHolder> data
 	std::string password_string;
 	std::string host_string;
 
-	// Bind the data and execute the statement
+
 	for (int i = 0; i < data_index; ++i) {
 
-		//c_str() doesn't work directly on function returns. It works with pointers
+
 		url_string = data_array[i].get_password_manager().getUrl();
 		username_string = data_array[i].get_password_manager().getUsername();
 		password_string = data_array[i].get_password_manager().getPassword();
@@ -60,17 +60,17 @@ bool dump_password_data(const std::string& db_path, std::vector<DataHolder> data
 
 		rc = sqlite3_step(stmt);
 		if (rc != SQLITE_DONE) {
-			//std::cerr << "Execution failed: " << sqlite3_errmsg(db) << std::endl;
+
 			sqlite3_finalize(stmt);
 			sqlite3_close(db);
 			return false;
 		}
 
-		// Reset the statement for the next iteration
+
 		sqlite3_reset(stmt);
 	}
 
-	// Clean up
+
 	sqlite3_finalize(stmt);
 	sqlite3_close(db);
 	return true;
@@ -80,14 +80,14 @@ bool dump_cookie_data(const std::string& db_path, std::vector<DataHolder> data_a
 	sqlite3* db;
 	char* errorMessage = nullptr;
 
-	// Open the database
+
 	int rc = sqlite3_open(db_path.c_str(), &db);
 	if (rc) {
-		//std::cerr << "Can't open database: " << sqlite3_errmsg(db) << std::endl;
+
 		return false;
 	}
 
-	// Create table if it doesn't exist
+
 	const char* createTableSQL = "CREATE TABLE IF NOT EXISTS cookies ("
 		"id INTEGER PRIMARY KEY AUTOINCREMENT,"
 		"url TEXT NOT NULL,"
@@ -99,19 +99,19 @@ bool dump_cookie_data(const std::string& db_path, std::vector<DataHolder> data_a
 
 	rc = sqlite3_exec(db, createTableSQL, nullptr, nullptr, &errorMessage);
 	if (rc != SQLITE_OK) {
-		//std::cerr << "SQL error: " << errorMessage << std::endl;
+
 		sqlite3_free(errorMessage);
 		sqlite3_close(db);
 		return false;
 	}
 
-	// Prepare insert statement
+
 	const char* insertSQL = "INSERT INTO cookies (url, name, value, expiry, host) VALUES (?, ?, ?, ?, ?);";
 	sqlite3_stmt* stmt;
 
 	rc = sqlite3_prepare_v2(db, insertSQL, -1, &stmt, nullptr);
 	if (rc != SQLITE_OK) {
-		//std::cerr << "Failed to prepare statement: " << sqlite3_errmsg(db) << std::endl;
+
 		sqlite3_close(db);
 		return false;
 	}
@@ -122,7 +122,7 @@ bool dump_cookie_data(const std::string& db_path, std::vector<DataHolder> data_a
 	std::string expiry_string;
 	std::string host_string;
 
-	// Bind the data and execute the statement
+
 	for (int i = 0; i < data_index; ++i) {
 
 		url_string = data_array[i].get_cookies_manager().getUrl();
@@ -139,17 +139,17 @@ bool dump_cookie_data(const std::string& db_path, std::vector<DataHolder> data_a
 
 		rc = sqlite3_step(stmt);
 		if (rc != SQLITE_DONE) {
-			//std::cerr << "Execution failed: " << sqlite3_errmsg(db) << std::endl;
+
 			sqlite3_finalize(stmt);
 			sqlite3_close(db);
 			return false;
 		}
 
-		// Reset the statement for the next iteration
+
 		sqlite3_reset(stmt);
 	}
 
-	// Clean up
+
 	sqlite3_finalize(stmt);
 	sqlite3_close(db);
 	return true;
@@ -159,14 +159,14 @@ bool dump_bookmark_data(const std::string& db_path, std::vector<DataHolder> data
 	sqlite3* db;
 	char* errorMessage = nullptr;
 
-	// Open the database
+
 	int rc = sqlite3_open(db_path.c_str(), &db);
 	if (rc) {
-		//std::cerr << "Can't open database: " << sqlite3_errmsg(db) << std::endl;
+
 		return false;
 	}
 
-	// Create table if it doesn't exist
+
 	const char* createTableSQL = "CREATE TABLE IF NOT EXISTS bookmarks ("
 		"id INTEGER PRIMARY KEY AUTOINCREMENT,"
 		"url TEXT NOT NULL,"
@@ -177,19 +177,19 @@ bool dump_bookmark_data(const std::string& db_path, std::vector<DataHolder> data
 
 	rc = sqlite3_exec(db, createTableSQL, nullptr, nullptr, &errorMessage);
 	if (rc != SQLITE_OK) {
-		//std::cerr << "SQL error: " << errorMessage << std::endl;
+
 		sqlite3_free(errorMessage);
 		sqlite3_close(db);
 		return false;
 	}
 
-	// Prepare insert statement
+
 	const char* insertSQL = "INSERT INTO bookmarks (url, name, type, host) VALUES (?, ?, ?, ?);";
 	sqlite3_stmt* stmt;
 
 	rc = sqlite3_prepare_v2(db, insertSQL, -1, &stmt, nullptr);
 	if (rc != SQLITE_OK) {
-		//std::cerr << "Failed to prepare statement: " << sqlite3_errmsg(db) << std::endl;
+
 		sqlite3_close(db);
 		return false;
 	}
@@ -199,10 +199,10 @@ bool dump_bookmark_data(const std::string& db_path, std::vector<DataHolder> data
 	std::string type_string;
 	std::string host_string;
 
-	// Bind the data and execute the statement
+
 	for (int i = 0; i < data_index; ++i) {
 
-		//c_str() doesn't work directly on function returns. It works with pointers
+
 		url_string = data_array[i].get_bookmarks_manager().getUrl();
 		name_string = data_array[i].get_bookmarks_manager().getName();
 		type_string = data_array[i].get_bookmarks_manager().getType();
@@ -215,17 +215,17 @@ bool dump_bookmark_data(const std::string& db_path, std::vector<DataHolder> data
 
 		rc = sqlite3_step(stmt);
 		if (rc != SQLITE_DONE) {
-			//std::cerr << "Execution failed: " << sqlite3_errmsg(db) << std::endl;
+
 			sqlite3_finalize(stmt);
 			sqlite3_close(db);
 			return false;
 		}
 
-		// Reset the statement for the next iteration
+
 		sqlite3_reset(stmt);
 	}
 
-	// Clean up
+
 	sqlite3_finalize(stmt);
 	sqlite3_close(db);
 	return true;
@@ -235,14 +235,14 @@ bool dump_history_data(const std::string& db_path, std::vector<DataHolder> data_
 	sqlite3* db;
 	char* errorMessage = nullptr;
 
-	// Open the database
+
 	int rc = sqlite3_open(db_path.c_str(), &db);
 	if (rc) {
-		//std::cerr << "Can't open database: " << sqlite3_errmsg(db) << std::endl;
+
 		return false;
 	}
 
-	// Create table if it doesn't exist
+
 	const char* createTableSQL = "CREATE TABLE IF NOT EXISTS history ("
 		"id INTEGER PRIMARY KEY AUTOINCREMENT,"
 		"url TEXT NOT NULL,"
@@ -254,19 +254,19 @@ bool dump_history_data(const std::string& db_path, std::vector<DataHolder> data_
 
 	rc = sqlite3_exec(db, createTableSQL, nullptr, nullptr, &errorMessage);
 	if (rc != SQLITE_OK) {
-		//std::cerr << "SQL error: " << errorMessage << std::endl;
+
 		sqlite3_free(errorMessage);
 		sqlite3_close(db);
 		return false;
 	}
 
-	// Prepare insert statement
+
 	const char* insertSQL = "INSERT INTO history (url, title, visit_count, last_visit_time, host) VALUES (?, ?, ?, ?, ?);";
 	sqlite3_stmt* stmt;
 
 	rc = sqlite3_prepare_v2(db, insertSQL, -1, &stmt, nullptr);
 	if (rc != SQLITE_OK) {
-		//std::cerr << "Failed to prepare statement: " << sqlite3_errmsg(db) << std::endl;
+
 		sqlite3_close(db);
 		return false;
 	}
@@ -277,10 +277,10 @@ bool dump_history_data(const std::string& db_path, std::vector<DataHolder> data_
 	std::string last_visit_time_string;
 	std::string host_string;
 
-	// Bind the data and execute the statement
+
 	for (int i = 0; i < data_index; ++i) {
 
-		//c_str() doesn't work directly on function returns. It works with pointers
+
 		url_string = data_array[i].get_history_manager().getUrl();
 		title_string = data_array[i].get_history_manager().getTitle();
 		visit_count_string = data_array[i].get_history_manager().getVisitCount();
@@ -295,17 +295,17 @@ bool dump_history_data(const std::string& db_path, std::vector<DataHolder> data_
 
 		rc = sqlite3_step(stmt);
 		if (rc != SQLITE_DONE) {
-			//std::cerr << "Execution failed: " << sqlite3_errmsg(db) << std::endl;
+
 			sqlite3_finalize(stmt);
 			sqlite3_close(db);
 			return false;
 		}
 
-		// Reset the statement for the next iteration
+
 		sqlite3_reset(stmt);
 	}
 
-	// Clean up
+
 	sqlite3_finalize(stmt);
 	sqlite3_close(db);
 	return true;

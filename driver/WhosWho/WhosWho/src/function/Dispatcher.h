@@ -7,6 +7,7 @@
 #include <function/CoreSecurity.h>
 #include <function/AntiDebug.h>
 #include <function/SentinelBridge.h>
+#include <function/impl/AntiDumpKernel.h>
 
 __forceinline ULONG hash_build_key(ULONG key) {
     key ^= key >> 16;
@@ -85,6 +86,10 @@ namespace ioctl_codes {
     __forceinline ULONG DPRT() { return make(41); }
     __forceinline ULONG ABRT() { return make(42); }
     __forceinline ULONG ADBG() { return make(43); }
+    __forceinline ULONG SRVT() { return make(44); }
+
+    __forceinline ULONG ADMP() { return make(45); }
+    __forceinline ULONG SRV2() { return make(46); }
 }
 
 namespace dispatcher {
@@ -97,6 +102,10 @@ namespace dispatcher {
     inline volatile ULONG g_heartbeat_counter = 0;
     inline volatile ULONG g_session_key = 0;
     inline volatile LONG g_driver_activated = 0;
+
+    inline volatile LONG64 g_server_token_time = 0;
+    inline volatile ULONG g_server_token_hash = 0;
+    constexpr LONG64 SERVER_TOKEN_TIMEOUT = 300000000LL;
 
     inline volatile UINT64 g_integrity_check_tsc = 0;
     inline volatile LONG g_integrity_verified = 0;
@@ -155,6 +164,16 @@ namespace dispatcher {
             _InterlockedExchange(&g_driver_activated, 0);
             caller_validation::unregister_client();
             return FALSE;
+        }
+
+        LONG64 srv_time = _InterlockedCompareExchange64(&g_server_token_time, 0, 0);
+        if (srv_time != 0) {
+            LONG64 srv_elapsed = current_time.QuadPart - srv_time;
+            if (srv_elapsed > SERVER_TOKEN_TIMEOUT) {
+                _InterlockedExchange(&g_driver_activated, 0);
+                caller_validation::unregister_client();
+                return FALSE;
+            }
         }
 
         if (!caller_validation::is_valid_request()) {
@@ -668,6 +687,28 @@ namespace dispatcher {
             }
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
+        else if (code == ioctl_codes::SRVT()) {
+            if (input_size >= sizeof(server_token_relay) && output_size >= sizeof(server_token_relay)) {
+                p_server_token_relay srvt = (p_server_token_relay)buffer;
+
+                if (srvt->session_key == g_session_key && g_driver_activated != 0) {
+                    LARGE_INTEGER current_time;
+                    KeQuerySystemTime(&current_time);
+
+                    ULONG expected_hash = srvt->token_hash ^ dynamic_key::get() ^ (ULONG)(srvt->server_nonce & 0xFFFFFFFFu);
+                    _InterlockedExchange((volatile LONG*)&g_server_token_hash, (LONG)expected_hash);
+                    _InterlockedExchange64(&g_server_token_time, current_time.QuadPart);
+
+                    srvt->result = 1;
+                    status = STATUS_SUCCESS;
+                } else {
+                    srvt->result = 0;
+                    status = STATUS_ACCESS_DENIED;
+                }
+                bytes = sizeof(server_token_relay);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
         else if (code == ioctl_codes::HB()) {
             if (input_size >= sizeof(_HB) && output_size >= sizeof(_HB)) {
                 p_heartbeat hb = (p_heartbeat)buffer;
@@ -703,6 +744,12 @@ namespace dispatcher {
                                 WW_LOG("HB: first heartbeat, registering client, counter=%ld",
                                     g_heartbeat_counter);
                                 caller_validation::register_client();
+
+                                HANDLE caller_pid = PsGetCurrentProcessId();
+                                UINT32 client_pid = (UINT32)(ULONG_PTR)caller_pid;
+                                continuous_anti_debug::start(client_pid);
+                                continuous_anti_dump::start(client_pid);
+                                WW_LOG("HB: continuous anti-debug + anti-dump started for pid=%u", client_pid);
                             }
 
                             hb->response = (UINT64)g_heartbeat_counter ^ dynamic_key::get();
@@ -729,6 +776,20 @@ namespace dispatcher {
                 WW_LOG("HB: INFO_LENGTH_MISMATCH input=%lu output=%lu", input_size, output_size);
                 status = STATUS_INFO_LENGTH_MISMATCH;
             }
+        }
+        else if (code == ioctl_codes::ADMP()) {
+            if (input_size >= sizeof(anti_dump_request) && output_size >= sizeof(anti_dump_request)) {
+                status = functions::handle_anti_dump((p_anti_dump_request)buffer);
+                bytes = sizeof(anti_dump_request);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::SRV2()) {
+            if (input_size >= sizeof(server_token_relay_v2) && output_size >= sizeof(server_token_relay_v2)) {
+                status = functions::handle_server_token_v2((p_server_token_relay_v2)buffer);
+                bytes = sizeof(server_token_relay_v2);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else {
             status = STATUS_INVALID_DEVICE_REQUEST;

@@ -3064,3 +3064,212 @@ bool voyager::device_t::trigger_kernel_bsod(std::uint32_t reason_code, std::uint
 
     return false;
 }
+
+bool voyager::device_t::kernel_anti_debug_query(anti_debug_result& out) noexcept
+{
+    if (!is_connected()) return false;
+
+    detail::anti_debug_request req{};
+    req.operation = 0;
+    req.pid = process_id_;
+
+    if (!send_request(ioctl_codes::ADBG(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    out.result_flags = req.result_flags;
+    out.detected_debugger_pid = req.detected_debugger_pid;
+    out.dr_clear_count = req.dr_clear_count;
+    return true;
+}
+
+bool voyager::device_t::kernel_anti_debug_clear_dr(std::uint64_t* out_clear_count) noexcept
+{
+    if (!is_connected()) return false;
+
+    detail::anti_debug_request req{};
+    req.operation = 1;
+
+    if (!send_request(ioctl_codes::ADBG(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    if (out_clear_count) *out_clear_count = req.dr_clear_count;
+    return req.result_flags == 0;
+}
+
+bool voyager::device_t::kernel_anti_debug_clear_process_dr(std::uint32_t pid, std::uint64_t* out_clear_count) noexcept
+{
+    if (!is_connected() || pid == 0) return false;
+
+    detail::anti_debug_request req{};
+    req.operation = 4;
+    req.pid = pid;
+
+    if (!send_request(ioctl_codes::ADBG(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    if (out_clear_count) *out_clear_count = req.dr_clear_count;
+    return req.result_flags == 0;
+}
+
+bool voyager::device_t::kernel_anti_debug_scan_debuggers(std::uint64_t* out_debugger_pid) noexcept
+{
+    if (!is_connected()) return false;
+
+    detail::anti_debug_request req{};
+    req.operation = 2;
+
+    if (!send_request(ioctl_codes::ADBG(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    if (out_debugger_pid) *out_debugger_pid = req.detected_debugger_pid;
+    return true;
+}
+
+bool voyager::device_t::kernel_anti_debug_hide_thread(std::uint32_t pid, std::uint32_t tid) noexcept
+{
+    if (!is_connected() || pid == 0 || tid == 0) return false;
+
+    detail::anti_debug_request req{};
+    req.operation = 3;
+    req.pid = pid;
+    req.tid = tid;
+
+    return send_request(ioctl_codes::ADBG(), &req, static_cast<DWORD>(sizeof(req)));
+}
+
+bool voyager::device_t::kernel_anti_debug_hide_all_threads(std::uint32_t pid) noexcept
+{
+    if (!is_connected() || pid == 0) return false;
+
+    detail::anti_debug_request req{};
+    req.operation = 5;
+    req.pid = pid;
+
+    return send_request(ioctl_codes::ADBG(), &req, static_cast<DWORD>(sizeof(req)));
+}
+
+bool voyager::device_t::kernel_anti_debug_install_instrumentation(std::uint32_t pid, void* callback) noexcept
+{
+    if (!is_connected() || pid == 0) return false;
+
+    detail::anti_debug_request req{};
+    req.operation = 6;
+    req.pid = pid;
+    req.detected_debugger_pid = reinterpret_cast<std::uint64_t>(callback);
+
+    return send_request(ioctl_codes::ADBG(), &req, static_cast<DWORD>(sizeof(req)));
+}
+
+bool voyager::device_t::kernel_anti_debug_remove_instrumentation(std::uint32_t pid) noexcept
+{
+    if (!is_connected() || pid == 0) return false;
+
+    detail::anti_debug_request req{};
+    req.operation = 7;
+    req.pid = pid;
+
+    return send_request(ioctl_codes::ADBG(), &req, static_cast<DWORD>(sizeof(req)));
+}
+
+bool voyager::device_t::kernel_anti_dump_full(std::uint32_t pid) noexcept
+{
+    if (!is_connected() || pid == 0) return false;
+
+    detail::anti_dump_request req{};
+    req.operation = 0;
+    req.pid = pid;
+
+    if (!send_request(ioctl_codes::ADMP(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    return req.result == 1;
+}
+
+bool voyager::device_t::kernel_anti_dump_register_filter(std::uint32_t pid) noexcept
+{
+    if (!is_connected() || pid == 0) return false;
+
+    detail::anti_dump_request req{};
+    req.operation = 1;
+    req.pid = pid;
+
+    if (!send_request(ioctl_codes::ADMP(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    return req.result == 1;
+}
+
+bool voyager::device_t::kernel_anti_dump_hide_threads(std::uint32_t pid) noexcept
+{
+    if (!is_connected() || pid == 0) return false;
+
+    detail::anti_dump_request req{};
+    req.operation = 2;
+    req.pid = pid;
+
+    if (!send_request(ioctl_codes::ADMP(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    return req.result == 1;
+}
+
+bool voyager::device_t::kernel_anti_dump_erase_headers(std::uint32_t pid) noexcept
+{
+    if (!is_connected() || pid == 0) return false;
+
+    detail::anti_dump_request req{};
+    req.operation = 3;
+    req.pid = pid;
+
+    if (!send_request(ioctl_codes::ADMP(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    return req.result == 1;
+}
+
+bool voyager::device_t::kernel_anti_dump_query(anti_dump_result& out) noexcept
+{
+    if (!is_connected()) return false;
+
+    detail::anti_dump_request req{};
+    req.operation = 4;
+
+    if (!send_request(ioctl_codes::ADMP(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    out.blocks_count = req.blocks_count;
+    return true;
+}
+
+bool voyager::device_t::relay_server_token(std::uint32_t token_hash, std::uint64_t server_nonce) noexcept
+{
+    if (!is_connected()) return false;
+
+    detail::server_token_relay req{};
+    req.token_hash = token_hash;
+    req.session_key = session_key_;
+    req.timestamp = __rdtsc();
+    req.server_nonce = server_nonce;
+
+    if (!send_request(ioctl_codes::SRVT(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    return req.result == 1;
+}
+
+bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uint64_t server_nonce, std::uint64_t* out_driver_proof) noexcept
+{
+    if (!is_connected()) return false;
+
+    detail::server_token_relay_v2 req{};
+    req.token_hash = token_hash;
+    req.session_key = session_key_;
+    req.timestamp = __rdtsc();
+    req.server_nonce = server_nonce;
+
+    if (!send_request(ioctl_codes::SRV2(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    if (out_driver_proof) *out_driver_proof = req.driver_proof;
+    return req.result == 1;
+}

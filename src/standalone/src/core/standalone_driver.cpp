@@ -1596,6 +1596,198 @@ namespace driver_bridge
         return device->trigger_kernel_bsod(reason_code, evidence_hash);
     }
 
+    bool kernel_anti_debug_query(anti_debug_result_t& out)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        voyager::device_t::anti_debug_result raw{};
+        if (!device->kernel_anti_debug_query(raw))
+            return false;
+
+        out.result_flags = raw.result_flags;
+        out.detected_debugger_pid = raw.detected_debugger_pid;
+        out.dr_clear_count = raw.dr_clear_count;
+        return true;
+    }
+
+    bool kernel_anti_debug_clear_dr(uint64_t* out_clear_count)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        return device->kernel_anti_debug_clear_dr(out_clear_count);
+    }
+
+    bool kernel_anti_debug_clear_process_dr(uint32_t pid, uint64_t* out_clear_count)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        return device->kernel_anti_debug_clear_process_dr(pid, out_clear_count);
+    }
+
+    bool kernel_anti_debug_scan_debuggers(uint64_t* out_debugger_pid)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        return device->kernel_anti_debug_scan_debuggers(out_debugger_pid);
+    }
+
+    bool kernel_anti_debug_hide_thread(uint32_t pid, uint32_t tid)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        return device->kernel_anti_debug_hide_thread(pid, tid);
+    }
+
+    bool kernel_anti_debug_hide_all_threads(uint32_t pid)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        return device->kernel_anti_debug_hide_all_threads(pid);
+    }
+
+    bool kernel_anti_debug_install_instrumentation(uint32_t pid, void* callback)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        return device->kernel_anti_debug_install_instrumentation(pid, callback);
+    }
+
+    bool kernel_anti_debug_remove_instrumentation(uint32_t pid)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        return device->kernel_anti_debug_remove_instrumentation(pid);
+    }
+
+    bool kernel_anti_dump_full(uint32_t pid)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        return device->kernel_anti_dump_full(pid);
+    }
+
+    bool kernel_anti_dump_register_filter(uint32_t pid)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        return device->kernel_anti_dump_register_filter(pid);
+    }
+
+    bool kernel_anti_dump_hide_threads(uint32_t pid)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        return device->kernel_anti_dump_hide_threads(pid);
+    }
+
+    bool kernel_anti_dump_erase_headers(uint32_t pid)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        return device->kernel_anti_dump_erase_headers(pid);
+    }
+
+    bool kernel_anti_dump_query(anti_dump_result_t& out)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        voyager::device_t::anti_dump_result raw{};
+        if (!device->kernel_anti_dump_query(raw))
+            return false;
+
+        out.blocks_count = raw.blocks_count;
+        return true;
+    }
+
+    bool relay_server_token(uint32_t token_hash, uint64_t server_nonce)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        return device->relay_server_token(token_hash, server_nonce);
+    }
+
+    bool relay_server_token_v2(uint32_t token_hash, uint64_t server_nonce, uint64_t* out_driver_proof)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        return device->relay_server_token_v2(token_hash, server_nonce, out_driver_proof);
+    }
+
     bool traffic_redirect_op(uint32_t operation, uint32_t rule_id, uint32_t protocol,
                              uint32_t match_port, const uint8_t* match_addr,
                              uint32_t redirect_port, const uint8_t* redirect_addr,

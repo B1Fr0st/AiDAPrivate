@@ -437,4 +437,314 @@ namespace anti_debug {
         ObDereferenceObject(process);
         return status;
     }
+
+
+    inline volatile UINT64 g_thread_dr_clear_count = 0;
+
+    inline NTSTATUS clear_process_debug_registers(UINT32 pid)
+    {
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        UINT32 cleared = 0;
+
+        __try {
+            PETHREAD thread = nullptr;
+            while ((thread = _PsGetNextProcessThread(process, thread)) != nullptr)
+            {
+                HANDLE thread_handle = nullptr;
+                NTSTATUS hs = _ObOpenObjectByPointer(
+                    thread, OBJ_KERNEL_HANDLE, nullptr,
+                    THREAD_SET_CONTEXT | THREAD_GET_CONTEXT,
+                    *PsThreadType, KernelMode, &thread_handle);
+
+                if (!NT_SUCCESS(hs)) continue;
+
+                CONTEXT ctx = {};
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+                UINT8* thread_ptr = (UINT8*)PsGetCurrentThread();
+                KPROCESSOR_MODE* prev_mode = (KPROCESSOR_MODE*)(thread_ptr + 0x232);
+                KPROCESSOR_MODE old_mode = *prev_mode;
+                *prev_mode = KernelMode;
+
+                hs = _PsGetContextThread(thread, &ctx, KernelMode);
+                if (NT_SUCCESS(hs)) {
+                    BOOLEAN need_clear = (ctx.Dr0 != 0 || ctx.Dr1 != 0 ||
+                                          ctx.Dr2 != 0 || ctx.Dr3 != 0 ||
+                                          (ctx.Dr7 & 0xFF) != 0);
+                    if (need_clear) {
+                        ctx.Dr0 = 0;
+                        ctx.Dr1 = 0;
+                        ctx.Dr2 = 0;
+                        ctx.Dr3 = 0;
+                        ctx.Dr6 = 0;
+                        ctx.Dr7 = 0x400;
+
+                        hs = _PsSetContextThread(thread, &ctx, KernelMode);
+                        if (NT_SUCCESS(hs)) cleared++;
+                    }
+                }
+
+                *prev_mode = old_mode;
+                _ZwClose(thread_handle);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        ObDereferenceObject(process);
+        InterlockedAdd64((volatile LONG64*)&g_thread_dr_clear_count, cleared);
+        return STATUS_SUCCESS;
+    }
+
+
+    inline NTSTATUS hide_all_process_threads(UINT32 pid)
+    {
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        UINT32 hidden = 0;
+
+        __try {
+            PETHREAD thread = nullptr;
+            while ((thread = _PsGetNextProcessThread(process, thread)) != nullptr)
+            {
+                UINT8* thread_ptr = (UINT8*)thread;
+                volatile ULONG* cross_flags = (volatile ULONG*)(thread_ptr + 0x74);
+                ULONG old_flags = InterlockedOr(cross_flags, 0x4);
+                if (!(old_flags & 0x4)) hidden++;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        ObDereferenceObject(process);
+        WW_LOG("anti_debug: hid %u threads for pid=%u", hidden, pid);
+        return status;
+    }
+
+
+    typedef struct _PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION {
+        ULONG  Version;
+        ULONG  Reserved;
+        PVOID  Callback;
+    } PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION;
+
+    inline volatile PVOID g_instrumentation_callback = nullptr;
+
+    inline NTSTATUS install_instrumentation_callback(UINT32 pid, PVOID callback_addr)
+    {
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        HANDLE proc_handle = nullptr;
+        status = _ObOpenObjectByPointer(
+            process, OBJ_KERNEL_HANDLE, nullptr,
+            PROCESS_SET_INFORMATION, *PsProcessType, KernelMode, &proc_handle);
+
+        if (!NT_SUCCESS(status)) {
+            ObDereferenceObject(process);
+            return status;
+        }
+
+        PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION info = {};
+        info.Version  = 0;
+        info.Reserved = 0;
+        info.Callback = callback_addr;
+
+        typedef NTSTATUS(NTAPI* fn_NtSetInformationProcess)(
+            HANDLE, ULONG, PVOID, ULONG);
+
+        static fn_NtSetInformationProcess pNtSetInfoProc = nullptr;
+        if (!pNtSetInfoProc) {
+            PVOID nt_base = (PVOID)get_nt_base();
+            if (nt_base) {
+                CHAR name[] = { 'N','t','S','e','t','I','n','f','o','r','m','a','t','i','o','n','P','r','o','c','e','s','s',0 };
+                pNtSetInfoProc = (fn_NtSetInformationProcess)GetProcAddress(nt_base, name);
+            }
+        }
+
+        if (pNtSetInfoProc) {
+            UINT8* thread_ptr = (UINT8*)PsGetCurrentThread();
+            KPROCESSOR_MODE* prev_mode = (KPROCESSOR_MODE*)(thread_ptr + 0x232);
+            KPROCESSOR_MODE old_mode = *prev_mode;
+            *prev_mode = KernelMode;
+
+            status = pNtSetInfoProc(
+                proc_handle,
+                40,
+                &info,
+                sizeof(info));
+
+            *prev_mode = old_mode;
+
+            if (NT_SUCCESS(status)) {
+                g_instrumentation_callback = callback_addr;
+                WW_LOG("anti_debug: instrumentation callback installed for pid=%u", pid);
+            }
+        } else {
+            status = STATUS_NOT_FOUND;
+        }
+
+        _ZwClose(proc_handle);
+        ObDereferenceObject(process);
+        return status;
+    }
+
+    inline NTSTATUS remove_instrumentation_callback(UINT32 pid)
+    {
+        return install_instrumentation_callback(pid, nullptr);
+    }
+
+    inline NTSTATUS clear_debug_objects(UINT32 pid)
+    {
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        __try {
+            UINT8* eprocess = (UINT8*)process;
+            volatile PVOID* debug_port = (volatile PVOID*)(eprocess + 0x578);
+            if (*debug_port != nullptr) {
+                InterlockedExchangePointer(debug_port, nullptr);
+                WW_LOG("anti_debug: cleared debug port for pid=%u", pid);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        ObDereferenceObject(process);
+        return status;
+    }
+
+    inline NTSTATUS clear_instrumentation_callback_eprocess(UINT32 pid)
+    {
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        __try {
+            UINT8* eprocess = (UINT8*)process;
+            volatile PVOID* instr_cb = (volatile PVOID*)(eprocess + 0x460);
+            if (*instr_cb != nullptr && *instr_cb != g_instrumentation_callback) {
+                PVOID old = InterlockedExchangePointer(instr_cb, nullptr);
+                WW_LOG("anti_debug: cleared foreign instrumentation callback %p for pid=%u", old, pid);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        ObDereferenceObject(process);
+        return status;
+    }
+}
+
+namespace continuous_anti_debug {
+
+    inline KTIMER   g_timer = {};
+    inline KDPC     g_dpc   = {};
+    inline volatile LONG   g_active = 0;
+    inline volatile UINT32 g_target_pid = 0;
+    inline volatile UINT64 g_cycle_count = 0;
+    inline volatile UINT64 g_violations = 0;
+
+    constexpr LONG TIMER_PERIOD_MS = 5000;
+
+    inline VOID NTAPI timer_callback(
+        PKDPC,
+        PVOID,
+        PVOID,
+        PVOID)
+    {
+        if (!_InterlockedCompareExchange(&g_active, 0, 0))
+            return;
+
+        UINT32 pid = g_target_pid;
+        if (pid == 0)
+            return;
+
+        InterlockedIncrement64((volatile LONG64*)&g_cycle_count);
+        UINT64 cycle = g_cycle_count;
+
+        UINT32 det_flags = anti_debug::run_all_checks();
+        if (det_flags & (anti_debug::DETECT_KERNEL_DEBUGGER | anti_debug::DETECT_TIMING_ATTACK)) {
+            InterlockedIncrement64((volatile LONG64*)&g_violations);
+            sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
+            sentinel_bridge::g_bridge.sentinel_cmd_param = det_flags;
+        }
+
+        anti_debug::clear_process_debug_registers(pid);
+
+        if ((cycle & 0x1) == 0) {
+            anti_debug::clear_debug_registers_all_cpus();
+        }
+
+        if ((cycle % 3) == 0) {
+            anti_debug::clear_debug_objects(pid);
+            anti_debug::clear_instrumentation_callback_eprocess(pid);
+        }
+
+        if ((cycle % 5) == 0) {
+            UINT64 dbg_pid = 0;
+            NTSTATUS st = anti_debug::scan_for_debugger_processes(&dbg_pid);
+            if (NT_SUCCESS(st) && dbg_pid != 0) {
+                InterlockedIncrement64((volatile LONG64*)&g_violations);
+                sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
+                sentinel_bridge::g_bridge.sentinel_cmd_param = (ULONG)(dbg_pid & 0xFFFFFFFF);
+
+                if (_ZwOpenProcess && _ZwTerminateProcess && _ZwClose) {
+                    OBJECT_ATTRIBUTES oa;
+                    InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
+                    CLIENT_ID cid = {};
+                    cid.UniqueProcess = (HANDLE)(ULONG_PTR)dbg_pid;
+                    HANDLE hProc = nullptr;
+                    if (NT_SUCCESS(_ZwOpenProcess(&hProc, PROCESS_TERMINATE, &oa, &cid)) && hProc) {
+                        _ZwTerminateProcess(hProc, STATUS_ACCESS_DENIED);
+                        _ZwClose(hProc);
+                        WW_LOG("continuous_adbg: killed debugger pid=%llu", dbg_pid);
+                    }
+                }
+            }
+        }
+
+        if ((cycle % 4) == 0) {
+            anti_debug::hide_all_process_threads(pid);
+        }
+    }
+
+    inline void start(UINT32 pid)
+    {
+        if (_InterlockedCompareExchange(&g_active, 1, 0) != 0)
+            return;
+
+        g_target_pid = pid;
+        g_cycle_count = 0;
+        g_violations = 0;
+
+        _KeInitializeTimerEx(&g_timer, SynchronizationTimer);
+        _KeInitializeDpc(&g_dpc, timer_callback, nullptr);
+
+        LARGE_INTEGER due_time;
+        due_time.QuadPart = -static_cast<LONGLONG>(TIMER_PERIOD_MS) * 10000LL;
+
+        _KeSetTimerEx(&g_timer, due_time, TIMER_PERIOD_MS, &g_dpc);
+
+        WW_LOG("continuous_adbg: started for pid=%u period=%dms", pid, TIMER_PERIOD_MS);
+    }
+
+    inline void stop()
+    {
+        if (_InterlockedCompareExchange(&g_active, 0, 1) != 1)
+            return;
+
+        KeCancelTimer(&g_timer);
+        g_target_pid = 0;
+        WW_LOG("continuous_adbg: stopped");
+    }
 }

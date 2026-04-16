@@ -11,29 +11,11 @@ namespace process_guard {
 
     constexpr ACCESS_MASK STRIPPED_PROCESS_ACCESS =
         PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
-        PROCESS_DUP_HANDLE | PROCESS_CREATE_THREAD;
+        PROCESS_DUP_HANDLE | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION;
 
     constexpr ACCESS_MASK STRIPPED_THREAD_ACCESS =
         THREAD_SUSPEND_RESUME | THREAD_SET_CONTEXT |
         THREAD_GET_CONTEXT | THREAD_TERMINATE;
-
-    __forceinline bool is_ida_process(PEPROCESS proc) {
-        if (!proc) return false;
-        UCHAR* name = PsGetProcessImageFileName(proc);
-        if (!name) return false;
-
-        auto ci_eq = [](UCHAR a, char b) -> bool {
-            return (a | 0x20) == (static_cast<UCHAR>(b) | 0x20);
-        };
-
-        if (ci_eq(name[0], 'i') && ci_eq(name[1], 'd') && ci_eq(name[2], 'a')) {
-            if (name[3] == '.' || name[3] == '\0')
-                return true;
-            if (ci_eq(name[3], '6') && ci_eq(name[4], '4') && (name[5] == '.' || name[5] == '\0'))
-                return true;
-        }
-        return false;
-    }
 
     inline OB_PREOP_CALLBACK_STATUS NTAPI process_pre_callback(
         PVOID,
@@ -57,10 +39,6 @@ namespace process_guard {
         if (caller_pid == client_pid)
             return OB_PREOP_SUCCESS;
         if (reinterpret_cast<UINT64>(caller_pid) == 4)
-            return OB_PREOP_SUCCESS;
-
-        PEPROCESS caller_proc = PsGetCurrentProcess();
-        if (caller_proc && is_ida_process(caller_proc))
             return OB_PREOP_SUCCESS;
 
         if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
@@ -97,10 +75,6 @@ namespace process_guard {
         if (caller_pid == client_pid)
             return OB_PREOP_SUCCESS;
         if (reinterpret_cast<UINT64>(caller_pid) == 4)
-            return OB_PREOP_SUCCESS;
-
-        PEPROCESS caller_proc = PsGetCurrentProcess();
-        if (caller_proc && is_ida_process(caller_proc))
             return OB_PREOP_SUCCESS;
 
         if (Info->Operation == OB_OPERATION_HANDLE_CREATE)

@@ -12,7 +12,7 @@
 #include <thread>
 #include <vector>
 
-#include "../../../obfuscation.hpp"
+#include "webhook.hpp"
 
 #pragma comment(lib, "ntdll.lib")
 
@@ -242,10 +242,16 @@ namespace module_stealth
 
     inline void unlink_entry(LIST_ENTRY* entry)
     {
-        entry->Blink->Flink = entry->Flink;
-        entry->Flink->Blink = entry->Blink;
-        entry->Flink = entry;
-        entry->Blink = entry;
+        __try
+        {
+            if (!entry->Blink || !entry->Flink) return;
+            if (entry->Flink == entry) return;
+            entry->Blink->Flink = entry->Flink;
+            entry->Flink->Blink = entry->Blink;
+            entry->Flink = entry;
+            entry->Blink = entry;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 
     inline bool hide_from_peb()
@@ -641,30 +647,56 @@ inline bool initialize()
     if (detail::active().load()) return true;
 
     detail::xor_key() = detail::generate_session_key();
+    webhook::write_log("anti_dump", "xor_key_ok");
 
     dump_poison::corrupt_debug_directory();
+    webhook::write_log("anti_dump", "corrupt_debug_dir_ok");
+
     dump_poison::flood_decoy_memory();
+    webhook::write_log("anti_dump", "flood_decoy_ok");
+
     dump_poison::scramble_thread_objects();
+    webhook::write_log("anti_dump", "scramble_threads_ok");
 
     handle_strip::revoke_debug_privileges();
+    webhook::write_log("anti_dump", "revoke_privs_ok");
+
     handle_strip::strip_process_handle_access();
+    webhook::write_log("anti_dump", "strip_handle_ok");
 
     anti_minidump::hook_minidump();
+    webhook::write_log("anti_dump", "hook_minidump_ok");
 
     module_stealth::hide_from_peb();
+    webhook::write_log("anti_dump", "hide_peb_ok");
+
+    pe_header::inject_fake_sections();
+    webhook::write_log("anti_dump", "inject_fake_sections_ok");
+
+    pe_header::corrupt_nt_headers();
+    webhook::write_log("anti_dump", "corrupt_nt_ok");
 
     pe_header::erase_dos_header();
-    pe_header::corrupt_nt_headers();
-    pe_header::inject_fake_sections();
-
-    section_encrypt::encrypt_non_code_sections();
+    webhook::write_log("anti_dump", "erase_dos_ok");
 
     read_intercept::install_veh();
-    read_intercept::set_guard_pages();
+    webhook::write_log("anti_dump", "install_veh_ok");
 
     detail::active().store(true);
+    webhook::write_log("anti_dump", "active_store_ok");
+
     detail::monitors_running().store(true);
-    std::thread(monitor::run_periodic_reencrypt).detach();
+    webhook::write_log("anti_dump", "monitors_store_ok");
+
+    try
+    {
+        std::thread(monitor::run_periodic_reencrypt).detach();
+        webhook::write_log("anti_dump", "thread_detach_ok");
+    }
+    catch (...)
+    {
+        webhook::write_log("anti_dump", "thread_detach_failed_skipped");
+    }
 
     return true;
 }

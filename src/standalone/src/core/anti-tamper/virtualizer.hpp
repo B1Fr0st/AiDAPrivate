@@ -24,23 +24,20 @@ namespace detail
     static constexpr uint32_t HANDLER_POOL_SIZE = 4096;
     static constexpr uint64_t HANDLER_CRYPT_MAGIC = 0x3C6EF372FE94F82BULL;
 
-    // ── Direct-threading context ─────────────────────────────────────
-    // Each handler computes the addr of the next handler and tail-calls it.
-    // No central loop exists — the CFG fans out across all handlers.
+
     struct vm_continuation_t
     {
-        uintptr_t   next_handler;    // computed by current handler
-        uint64_t    chain_nonce;     // rolling nonce for handler addr derivation
+        uintptr_t   next_handler;
+        uint64_t    chain_nonce;
     };
 
-    // Key used to encrypt/decrypt vm_state_t registers between handler transitions.
-    // Only the next handler in the chain knows the decryption key.
+
     struct context_crypt_t
     {
-        uint64_t    reg_mask;        // XOR mask applied to all regs between handlers
-        uint64_t    flags_mask;      // XOR mask for flags register
-        uint64_t    rsp_mask;        // XOR mask for stack pointer
-        bool        encrypted;       // whether context is currently encrypted
+        uint64_t    reg_mask;
+        uint64_t    flags_mask;
+        uint64_t    rsp_mask;
+        bool        encrypted;
     };
 
     struct vm_state_t
@@ -65,7 +62,7 @@ namespace detail
         uint64_t context_entropy;
         uint32_t shuffle_counter;
 
-        // Direct-threaded dispatch state
+
         vm_continuation_t   continuation;
         context_crypt_t     ctx_crypt;
     };
@@ -100,6 +97,8 @@ namespace detail
         OP_STORE_MEM = 0x19,
         OP_ADD = 0x1A,
         OP_SUB = 0x1B,
+        OP_VM_ENTER = 0x1C,
+        OP_VM_EXIT  = 0x1D,
         OP_MAX
     };
 
@@ -118,8 +117,13 @@ namespace detail
     inline uint32_t       g_active_slots = 0;
     inline uint64_t       g_pool_guard = 0;
     inline handler_fn     g_dispatch_table[256] = {};
+    inline bool           g_poly_initialized = false;
 
     inline bool verify_handler_pool();
+    __forceinline handler_fn select_handler(vm_state_t& vm, uint8_t opcode);
+    inline void init_vm(vm_state_t& vm, uint64_t seed);
+    inline uint64_t vm_execute(vm_state_t& vm, const uint8_t* bytecode, uint32_t bc_size);
+    inline void destroy_vm(vm_state_t& vm);
 
     inline uint64_t xorshift_advance(uint64_t& state)
     {
@@ -237,7 +241,7 @@ namespace detail
 
     __forceinline uint64_t micro_add(uint64_t a, uint64_t b)
     {
-        // Alternate between NAND-gate and MBA decomposition at runtime
+
         uint64_t sel = __rdtsc();
         if (sel & 2)
             return metamorphic::mba::keyed_add(a, b, sel);
@@ -263,7 +267,7 @@ namespace detail
         uint64_t sel = __rdtsc();
         if (sel & 4)
         {
-            // MBA: a - b = a + (~b + 1) via keyed_add
+
             uint64_t neg_b = metamorphic::mba::keyed_add(~b, 1, sel);
             return metamorphic::mba::keyed_add(a, neg_b, sel ^ 0xDEAD);
         }
@@ -320,13 +324,10 @@ namespace detail
         return chain;
     }
 
-    // ── Rolling context encryption ───────────────────────────────────
-    // Between handler calls, encrypt the entire register file + flags + rsp
-    // so a memory dump between transitions yields garbage.
 
     __forceinline void derive_context_masks(vm_state_t& vm)
     {
-        // Derive masks from handler chain key + rdtsc — each transition is unique
+
         uint64_t seed = vm.handler_chain_key ^ __rdtsc();
         seed ^= seed >> 30; seed *= 0xBF58476D1CE4E5B9ULL;
         seed ^= seed >> 27; seed *= 0x94D049BB133111EBULL;
@@ -350,7 +351,7 @@ namespace detail
     __forceinline void decrypt_context(vm_state_t& vm)
     {
         if (!vm.ctx_crypt.encrypted) return;
-        // Decryption is identical to encryption (XOR is self-inverse)
+
         for (int i = 0; i < 16; ++i)
             vm.regs[i] ^= _rotl64(vm.ctx_crypt.reg_mask, i * 4);
         vm.flags ^= vm.ctx_crypt.flags_mask;
@@ -358,19 +359,35 @@ namespace detail
         vm.ctx_crypt.encrypted = false;
     }
 
-    // ── Direct-threaded dispatch core ────────────────────────────────
-    // Each handler calls this at its end to compute and jump to the next handler.
-    // There is no central dispatch loop — the chain flows handler → handler.
+
+    static constexpr uint32_t HANDLER_REGEN_INTERVAL = 512;
+
+    __forceinline void regenerate_handlers(vm_state_t& vm)
+    {
+        uint64_t new_seed = vm.rolling_key ^ vm.handler_chain_key ^ __rdtsc();
+        new_seed ^= vm.insn_count * 0x9E3779B97F4A7C15ULL;
+
+        generate_opcode_map(new_seed, vm.opcode_map, vm.reverse_map);
+        build_handler_pool(vm.reverse_map, new_seed ^ 0x428A2F98D728AE22ULL);
+
+        if (g_poly_initialized) {
+            g_poly_initialized = false;
+            build_poly_table();
+        }
+
+        vm.context_entropy ^= new_seed;
+    }
+
 
     __forceinline void dispatch_next(vm_state_t& vm, const uint8_t* bc, uint32_t bc_size)
     {
-        // Pre-handler: encrypt context (protects state in memory between handlers)
+
         encrypt_context(vm);
 
         if (vm.halted || vm.rip >= bc_size || vm.insn_count >= vm.max_insn)
             return;
 
-        // Periodic pool integrity check (every 256 instructions)
+
         if ((vm.insn_count & 0xFF) == 0)
         {
             if (!verify_handler_pool())
@@ -382,7 +399,14 @@ namespace detail
             }
         }
 
-        // Periodic register shuffle
+        if (vm.insn_count > 0 && (vm.insn_count % HANDLER_REGEN_INTERVAL) == 0)
+        {
+            decrypt_context(vm);
+            regenerate_handlers(vm);
+            encrypt_context(vm);
+        }
+
+
         ++vm.shuffle_counter;
         if (vm.shuffle_counter >= CONTEXT_SHUFFLE_INTERVAL)
         {
@@ -391,7 +415,7 @@ namespace detail
             encrypt_context(vm);
         }
 
-        // Fetch and decode next opcode
+
         decrypt_context(vm);
 
         uint8_t raw = bc[vm.rip];
@@ -401,8 +425,8 @@ namespace detail
         compute_handler_chain_addr(vm, decrypted);
         ++vm.insn_count;
 
-        // Direct-threaded: resolve handler from dispatch table and tail-call
-        auto handler = g_dispatch_table[decrypted];
+
+        auto handler = g_poly_initialized ? select_handler(vm, decrypted) : g_dispatch_table[decrypted];
         handler(vm, bc, bc_size);
     }
 
@@ -615,7 +639,7 @@ namespace detail
         dispatch_next(vm, bc, bc_size);
     }
 
-    // Terminal handlers — these do NOT chain (they end execution)
+
     VM_HANDLER(h_trap)
     {
         (void)bc; (void)bc_size;
@@ -654,7 +678,6 @@ namespace detail
         dispatch_next(vm, bc, bc_size);
     }
 
-    // ── V2 handler variants (semantic duplicates with different implementations) ──
 
     VM_HANDLER(h_nand_v2)
     {
@@ -709,7 +732,6 @@ namespace detail
         dispatch_next(vm, bc, bc_size);
     }
 
-    // ── V3 handler variants (MBA-obfuscated implementations) ──
 
     VM_HANDLER(h_add_v3)
     {
@@ -717,7 +739,7 @@ namespace detail
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
-        // a + b = (a ^ b) + 2*(a & b)
+
         uint64_t xor_ab = micro_xor(va, vb);
         uint64_t and_ab = micro_and(va, vb);
         write_vreg(vm, a, micro_add(xor_ab, micro_add(and_ab, and_ab)));
@@ -731,8 +753,8 @@ namespace detail
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
-        // a - b = a + (~b + 1) via NAND decomposition
-        uint64_t neg_b = nand_op(vb, vb); // ~b
+
+        uint64_t neg_b = nand_op(vb, vb);
         neg_b = micro_add(neg_b, 1);
         write_vreg(vm, a, micro_add(va, neg_b));
         vm.flags = (read_vreg(vm, a) == 0) ? 1 : 0;
@@ -745,7 +767,7 @@ namespace detail
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
-        // a ^ b = (a | b) - (a & b)
+
         uint64_t or_ab  = micro_or(va, vb);
         uint64_t and_ab = micro_and(va, vb);
         write_vreg(vm, a, micro_sub(or_ab, and_ab));
@@ -759,9 +781,9 @@ namespace detail
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t va = read_vreg(vm, a);
         uint64_t vb = read_vreg(vm, b);
-        // ~(a & b) = ~a | ~b (De Morgan's via NOR decomposition)
-        uint64_t na = nand_op(va, va); // ~a
-        uint64_t nb = nand_op(vb, vb); // ~b
+
+        uint64_t na = nand_op(va, va);
+        uint64_t nb = nand_op(vb, vb);
         write_vreg(vm, a, micro_or(na, nb));
         vm.flags = (read_vreg(vm, a) == 0) ? 1 : 0;
         dispatch_next(vm, bc, bc_size);
@@ -774,7 +796,7 @@ namespace detail
         uint64_t addr = read_vreg(vm, addr_reg);
         uint64_t val = 0;
         if (addr) memcpy(&val, reinterpret_cast<const void*>(static_cast<uintptr_t>(addr)), 8);
-        // Additional entropy mixing before store
+
         write_vreg(vm, dst, val ^ (val >> 32) ^ val);
         dispatch_next(vm, bc, bc_size);
     }
@@ -784,7 +806,7 @@ namespace detail
         uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint8_t b = fetch_byte(vm, bc, bc_size) & 0x3F;
         uint64_t va = read_vreg(vm, a);
-        // shl via repeated add
+
         for (uint8_t i = 0; i < b; ++i)
             va = micro_add(va, va);
         write_vreg(vm, a, va);
@@ -797,13 +819,176 @@ namespace detail
         uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
         uint64_t vdst = read_vreg(vm, dst);
         uint64_t vsrc = read_vreg(vm, src);
-        // FNV-1a style with double rotation
+
         vdst ^= vsrc;
         vdst *= 0x01000193ULL;
         vdst = _rotl64(vdst, 13) ^ _rotr64(vdst, 29);
         vdst ^= vdst >> 16;
         write_vreg(vm, dst, vdst);
         dispatch_next(vm, bc, bc_size);
+    }
+
+
+    static constexpr uint32_t MAX_VM_DEPTH = 3;
+    inline thread_local uint32_t g_vm_depth = 0;
+
+    VM_HANDLER(h_vm_enter)
+    {
+        if (g_vm_depth >= MAX_VM_DEPTH) {
+            vm.halted = true;
+            write_vreg(vm, 0, 0xDEADBEEFDEADBEEFULL);
+            return;
+        }
+
+        uint32_t child_bc_offset = fetch_u32(vm, bc, bc_size);
+        uint32_t child_bc_len    = fetch_u32(vm, bc, bc_size);
+
+        if (child_bc_offset + child_bc_len > bc_size) {
+            vm.halted = true;
+            return;
+        }
+
+        uint64_t child_seed = vm.rolling_key ^ vm.handler_chain_key ^ __rdtsc();
+
+        vm_state_t child;
+        init_vm(child, child_seed);
+
+        for (int i = 0; i < 8; ++i)
+            write_vreg(child, i, read_vreg(vm, i));
+
+        g_vm_depth++;
+        uint64_t result = vm_execute(child, bc + child_bc_offset, child_bc_len);
+        g_vm_depth--;
+
+        write_vreg(vm, 0, result);
+        for (int i = 1; i < 4; ++i)
+            write_vreg(vm, i, read_vreg(child, i));
+
+        destroy_vm(child);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_vm_exit)
+    {
+        (void)bc; (void)bc_size;
+        vm.halted = true;
+    }
+
+
+    __forceinline bool verify_environment(vm_state_t& vm)
+    {
+        uint64_t teb_pid = 0;
+        __try {
+            auto* teb = reinterpret_cast<uint8_t*>(__readgsqword(0x30));
+            auto* peb = *reinterpret_cast<uint8_t**>(teb + 0x60);
+            teb_pid = *reinterpret_cast<uint32_t*>(teb + 0x40);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+
+        uint64_t expected_pid = vm.continuation.chain_nonce & 0xFFFFFFFF;
+        if (expected_pid != 0 && teb_pid != expected_pid)
+            return false;
+
+        return true;
+    }
+
+    inline void bind_to_environment(vm_state_t& vm)
+    {
+        __try {
+            auto* teb = reinterpret_cast<uint8_t*>(__readgsqword(0x30));
+            uint32_t pid = *reinterpret_cast<uint32_t*>(teb + 0x40);
+            vm.continuation.chain_nonce =
+                (vm.continuation.chain_nonce & 0xFFFFFFFF00000000ULL) |
+                static_cast<uint64_t>(pid);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    struct poly_dispatch_t
+    {
+        handler_fn variants[4];
+        uint8_t    count;
+    };
+
+    inline poly_dispatch_t g_poly_table[256] = {};
+
+    inline void build_poly_table()
+    {
+        for (int i = 0; i < 256; ++i) {
+            g_poly_table[i].variants[0] = g_dispatch_table[i];
+            g_poly_table[i].count = 1;
+        }
+
+        auto add_variant = [](uint8_t mapped_op, handler_fn alt) {
+            auto& entry = g_poly_table[mapped_op];
+            if (entry.count < 4) {
+                entry.variants[entry.count] = alt;
+                entry.count++;
+            }
+        };
+
+        for (uint8_t op = 0; op < OP_MAX; ++op) {
+            uint8_t mapped = 0;
+            for (int i = 0; i < 256; ++i) {
+                if (g_dispatch_table[i] != h_invalid &&
+                    g_dispatch_table[i] == g_dispatch_table[op]) {
+
+                }
+            }
+        }
+
+
+        for (uint32_t i = 0; i < g_active_slots; ++i) {
+            auto& slot = g_handler_pool[i];
+            if (slot.variant_id == 0) continue;
+
+
+            for (int d = 0; d < 256; ++d) {
+                if (g_dispatch_table[d] != h_invalid) {
+                    auto& pe = g_poly_table[d];
+                    if (pe.count < 4) {
+
+
+                        bool is_arithmetic =
+                            (slot.fn == h_nand_v2 || slot.fn == h_nand_v3 ||
+                             slot.fn == h_xor_v2  || slot.fn == h_xor_v3 ||
+                             slot.fn == h_add_v3  || slot.fn == h_sub_v3);
+
+                        if (is_arithmetic &&
+                            (pe.variants[0] == h_nand && (slot.fn == h_nand_v2 || slot.fn == h_nand_v3))) {
+                            add_variant(static_cast<uint8_t>(d), slot.fn);
+                        }
+                        else if (is_arithmetic &&
+                            (pe.variants[0] == h_xor && (slot.fn == h_xor_v2 || slot.fn == h_xor_v3))) {
+                            add_variant(static_cast<uint8_t>(d), slot.fn);
+                        }
+                        else if (is_arithmetic &&
+                            (pe.variants[0] == h_add && slot.fn == h_add_v3)) {
+                            add_variant(static_cast<uint8_t>(d), slot.fn);
+                        }
+                        else if (is_arithmetic &&
+                            (pe.variants[0] == h_sub && slot.fn == h_sub_v3)) {
+                            add_variant(static_cast<uint8_t>(d), slot.fn);
+                        }
+                    }
+                }
+            }
+        }
+
+        g_poly_initialized = true;
+    }
+
+    __forceinline handler_fn select_handler(vm_state_t& vm, uint8_t opcode)
+    {
+        if (!g_poly_initialized || !verify_environment(vm))
+            return g_dispatch_table[opcode];
+
+        auto& entry = g_poly_table[opcode];
+        if (entry.count <= 1)
+            return entry.variants[0];
+
+        uint64_t sel = vm.rolling_key ^ vm.context_entropy ^ __rdtsc();
+        return entry.variants[sel % entry.count];
     }
 
 #undef VM_HANDLER
@@ -837,11 +1022,13 @@ namespace detail
         base_handlers[OP_ROR]       = h_ror;
         base_handlers[OP_ADD]       = h_add;
         base_handlers[OP_SUB]       = h_sub;
+        base_handlers[OP_VM_ENTER]  = h_vm_enter;
+        base_handlers[OP_VM_EXIT]   = h_vm_exit;
 
         handler_fn variant_table[] = {
             h_nand_v2, h_xor_v2, h_hash_v2, h_cmp_v2,
-            h_nand_v3, h_xor_v3, h_hash_v3, h_cmp_v2,    // v3 set
-            h_add_v3,  h_sub_v3, h_shl_v2,  h_load_mem_v2 // additional variants
+            h_nand_v3, h_xor_v3, h_hash_v3, h_cmp_v2,
+            h_add_v3,  h_sub_v3, h_shl_v2,  h_load_mem_v2
         };
         uint8_t variant_ops[] = {
             OP_NAND, OP_XOR, OP_HASH, OP_CMP,
@@ -932,7 +1119,7 @@ namespace detail
         vm.context_entropy = __rdtsc() ^ seed;
         vm.shuffle_counter = 0;
 
-        // Initialize direct-threading and context encryption state
+
         vm.continuation.next_handler = 0;
         vm.continuation.chain_nonce  = seed ^ 0x3C6EF372FE94F82BULL;
         vm.ctx_crypt.reg_mask   = 0;
@@ -950,6 +1137,10 @@ namespace detail
         generate_opcode_map(seed, vm.opcode_map, vm.reverse_map);
         build_handler_pool(vm.reverse_map, seed ^ 0x428A2F98D728AE22ULL);
 
+        if (!g_poly_initialized)
+            build_poly_table();
+
+        bind_to_environment(vm);
         shuffle_registers(vm);
     }
 
@@ -981,13 +1172,10 @@ namespace detail
         vm.ctx_crypt.flags_mask = 0;
         vm.ctx_crypt.rsp_mask = 0;
 
-        // Direct-threaded entry: kick off the handler chain.
-        // The first dispatch_next fetches the first opcode and calls its handler,
-        // which calls dispatch_next at its end, which calls the next handler, etc.
-        // There is NO central loop — execution flows handler → handler → handler.
+
         dispatch_next(vm, bytecode, bc_size);
 
-        // Ensure context is decrypted when we return
+
         decrypt_context(vm);
 
         return read_vreg(vm, 0);
@@ -1144,7 +1332,7 @@ namespace opaque
     {
         uint64_t h = state_dependent_hash(x);
 
-        // Fermat's little theorem: for prime p=257, a^256 ≡ 1 (mod 257)
+
         constexpr uint64_t p = 257;
         uint64_t a = (h % (p - 1)) + 1;
         uint64_t exp = p - 1;
@@ -1210,6 +1398,34 @@ namespace junk
         (void)c;
     }
 
+}
+
+inline uint64_t g_server_poly_seed = 0;
+
+inline void reseed_from_server(uint64_t server_nonce)
+{
+    g_server_poly_seed = server_nonce ^ 0x9E3779B97F4A7C15ULL;
+
+    auto& c = integrity_vm::get_checker();
+    if (c.initialized)
+    {
+        c.encryption_seed ^= g_server_poly_seed;
+        c.vm.rolling_key ^= g_server_poly_seed;
+        c.vm.handler_chain_key ^= g_server_poly_seed;
+        c.vm.context_entropy ^= g_server_poly_seed;
+
+        detail::generate_opcode_map(c.encryption_seed, c.vm.opcode_map, c.vm.reverse_map);
+        detail::build_handler_pool(c.vm.reverse_map,
+            c.encryption_seed ^ 0x428A2F98D728AE22ULL);
+
+        if (detail::g_poly_initialized)
+        {
+            detail::g_poly_initialized = false;
+            detail::build_poly_table();
+        }
+
+        detail::shuffle_registers(c.vm);
+    }
 }
 
 

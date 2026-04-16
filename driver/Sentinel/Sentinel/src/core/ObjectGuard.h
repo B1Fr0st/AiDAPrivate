@@ -1,5 +1,6 @@
 #pragma once
 #include <imports/Defs.h>
+#include <core/Heartbeat.h>
 
 
 namespace object_guard {
@@ -81,8 +82,28 @@ namespace object_guard {
                         HANDLE pid = PsGetProcessId(proc);
                         g_last_suspicious_pid = (UINT64)(ULONG_PTR)pid;
                         InterlockedIncrement((volatile LONG*)&g_suspicious_handle_count);
-                        SN_LOG("object_guard::scan: DUMP TOOL DETECTED pid=%llu name=%.15s",
+                        SN_LOG("object_guard::scan: DUMP TOOL DETECTED pid=%llu name=%.15s — TERMINATING",
                             (UINT64)(ULONG_PTR)pid, name);
+
+
+                        if (_ZwOpenProcess && _ZwTerminateProcess && _ZwClose) {
+                            OBJECT_ATTRIBUTES oa;
+                            InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
+                            CLIENT_ID cid = {};
+                            cid.UniqueProcess = pid;
+                            HANDLE hProc = nullptr;
+                            NTSTATUS term_st = _ZwOpenProcess(&hProc, PROCESS_TERMINATE, &oa, &cid);
+                            if (NT_SUCCESS(term_st) && hProc) {
+                                _ZwTerminateProcess(hProc, STATUS_ACCESS_DENIED);
+                                _ZwClose(hProc);
+                                SN_LOG("object_guard::scan: terminated dump tool pid=%llu",
+                                    (UINT64)(ULONG_PTR)pid);
+                            }
+                        }
+
+
+                        heartbeat::send_command(heartbeat::BRIDGE_CMD_DUMP_TOOL_FOUND,
+                            static_cast<ULONG>((ULONG_PTR)pid & 0xFFFFFFFF));
 
                         return;
                     }

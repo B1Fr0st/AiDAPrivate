@@ -62,7 +62,7 @@ namespace mba {
     __forceinline uint64_t keyed_xor(uint64_t a, uint64_t b, uint64_t entropy)
     {
         uint64_t noise = entropy * 0x100000001B3ULL;
-        uint64_t mask = (noise & 0xF); // 16 variants
+        uint64_t mask = (noise & 0xF);
         switch (mask)
         {
         case 0: return (a | b) - (a & b);
@@ -76,28 +76,28 @@ namespace mba {
             uint64_t and_ab = (a + b - (a ^ b)) >> 1;
             return or_ab - and_ab;
         }
-        case 4: return (a | b) & ~(a & b);                           // definition via OR/AND/NOT
-        case 5: return (~a & b) + (a & ~b);                          // split via complements
+        case 4: return (a | b) & ~(a & b);
+        case 5: return (~a & b) + (a & ~b);
         case 6: return (((a << 1) + (b << 1) - (a & b) * 2) >> 1)
                        - ((a + b - (a ^ b)) >> 1);
-        case 7: return _rotl64(a ^ b, 0);                            // identity rotation (compiler can't fold)
+        case 7: return _rotl64(a ^ b, 0);
         case 8: {
             uint64_t c = a ^ b;
-            return c + 0 * (a | b);                                  // dead term elimination
+            return c + 0 * (a | b);
         }
-        case 9: return (a - (a & b)) + (b - (a & b));               // dual subtract
-        case 10: return ~(~a ^ ~b) ^ 0xFFFFFFFFFFFFFFFFULL;         // double negate unwrap
+        case 9: return (a - (a & b)) + (b - (a & b));
+        case 10: return ~(~a ^ ~b) ^ 0xFFFFFFFFFFFFFFFFULL;
         case 11: {
             uint64_t t = a ^ b;
-            return (t & 0xAAAAAAAAAAAAAAAAULL) | (t & 0x5555555555555555ULL); // bit-lane split
+            return (t & 0xAAAAAAAAAAAAAAAAULL) | (t & 0x5555555555555555ULL);
         }
-        case 12: return (a + b) ^ ((a & b) << 1);                   // add with carry cancellation
-        case 13: return (~(a & b)) & (a | b);                       // NAND-gated OR
+        case 12: return (a + b) ^ ((a & b) << 1);
+        case 13: return (~(a & b)) & (a | b);
         case 14: {
             uint64_t s = (~a & b) | (a & ~b);
-            return s ^ (s & 0) ;                                     // self-masked identity
+            return s ^ (s & 0) ;
         }
-        default: return _rotr64(_rotl64(a ^ b, 7), 7);              // double rotation identity
+        default: return _rotr64(_rotl64(a ^ b, 7), 7);
         }
     }
 
@@ -118,28 +118,28 @@ namespace mba {
             uint64_t c = (a & b) << 1;
             return t + c;
         }
-        case 4: return a - (~b) - 1;                                // two's complement identity
-        case 5: return (a | b) + (a & b);                           // sum decomposition
+        case 4: return a - (~b) - 1;
+        case 5: return (a | b) + (a & b);
         case 6: {
             uint64_t h = a + b;
-            return h + 0 * (a ^ b);                                 // dead term
+            return h + 0 * (a ^ b);
         }
-        case 7: return ((a << 1) | (b << 1)) - (a ^ b);            // shift-based
-        case 8: return a + b + (a & 0) + (b & 0);                   // zero-masked identity
+        case 7: return ((a << 1) | (b << 1)) - (a ^ b);
+        case 8: return a + b + (a & 0) + (b & 0);
         case 9: {
             uint64_t carry = a & b;
             uint64_t sum = a ^ b;
             while (carry) { uint64_t c2 = sum & (carry << 1); sum ^= (carry << 1); carry = c2; }
             return sum;
         }
-        case 10: return ~(~a - b);                                   // complement subtraction
-        case 11: return (a - (0 - b));                               // double negative
+        case 10: return ~(~a - b);
+        case 11: return (a - (0 - b));
         case 12: {
             uint64_t t = (a ^ b) + ((a & b) << 1);
             return t ^ (t & 0);
         }
-        case 13: return _rotl64(a + b, 0);                          // rotation identity
-        case 14: return ((a ^ b) | ((a & b) << 1)) + ((a ^ b) & ((a & b) << 1)); // recursive half-add
+        case 13: return _rotl64(a + b, 0);
+        case 14: return ((a ^ b) | ((a & b) << 1)) + ((a ^ b) & ((a & b) << 1));
         default: return a + b;
         }
     }
@@ -154,23 +154,23 @@ namespace mba {
         case 1: return ~(~a | ~b);
         case 2: return a - (a & ~b);
         case 3: return ((a | b) - (a ^ b));
-        case 4: return a & b;                                        // identity (deliberate)
-        case 5: return ~(~a | ~b) + 0;                              // De Morgan + zero
-        case 6: return (a | b) ^ (a ^ b);                           // OR-XOR decomposition
-        case 7: return ((a + b) - (a | b));                         // sum minus or
+        case 4: return a & b;
+        case 5: return ~(~a | ~b) + 0;
+        case 6: return (a | b) ^ (a ^ b);
+        case 7: return ((a + b) - (a | b));
         case 8: {
             uint64_t t = a ^ b;
             return (a | b) - t;
         }
-        case 9: return b - (~a & b);                                // complement isolation
-        case 10: return a - (a ^ (a & b));                          // xor-masked subtraction
-        case 11: return (a | b) & ~(~a & ~b) & ~(a ^ b) | (a & b); // over-determined
+        case 9: return b - (~a & b);
+        case 10: return a - (a ^ (a & b));
+        case 11: return (a | b) & ~(~a & ~b) & ~(a ^ b) | (a & b);
         case 12: return _rotl64(a & b, 0);
         case 13: {
             uint64_t nand_ab = ~(a & b);
             return ~nand_ab;
         }
-        case 14: return (a + b + (a ^ b)) >> 1;                    // actually wrong sign, but overflows back correctly for 64-bit
+        case 14: return (a + b + (a ^ b)) >> 1;
         default: return (a & b) ^ 0 ^ 0;
         }
     }
@@ -190,20 +190,20 @@ namespace mba {
             return t + u;
         }
         case 4: return (a | b) + 0;
-        case 5: return a | b;                                        // identity (deliberate)
-        case 6: return (a ^ b) | (a & b);                           // xor-and decomposition
-        case 7: return ~(~a & ~b) ^ 0;                              // De Morgan
-        case 8: return ((a + b) - ((a + b - (a ^ b)) >> 1));       // sum minus AND
-        case 9: return a + (~a & b);                                // complement union
-        case 10: return b + (a & ~b);                               // reverse complement union
+        case 5: return a | b;
+        case 6: return (a ^ b) | (a & b);
+        case 7: return ~(~a & ~b) ^ 0;
+        case 8: return ((a + b) - ((a + b - (a ^ b)) >> 1));
+        case 9: return a + (~a & b);
+        case 10: return b + (a & ~b);
         case 11: {
             uint64_t nor = ~(a | b);
             return ~nor;
         }
         case 12: return _rotl64(a | b, 0);
-        case 13: return (a & ~b) | b;                               // absorb + complement
+        case 13: return (a & ~b) | b;
         case 14: return (a | b) & 0xFFFFFFFFFFFFFFFFULL;
-        default: return (~(~a) | ~(~b));                             // double complement
+        default: return (~(~a) | ~(~b));
         }
     }
 

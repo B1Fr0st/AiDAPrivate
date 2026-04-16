@@ -224,6 +224,8 @@ inline NTSTATUS           (NTAPI* _IoCreateFileEx)                  (PHANDLE, AC
 
 
 inline NTSTATUS           (NTAPI* _PsSetCreateProcessNotifyRoutine) (PCREATE_PROCESS_NOTIFY_ROUTINE, BOOLEAN);
+inline NTSTATUS           (NTAPI* _PsSetLoadImageNotifyRoutine)     (PLOAD_IMAGE_NOTIFY_ROUTINE);
+inline NTSTATUS           (NTAPI* _PsRemoveLoadImageNotifyRoutine)  (PLOAD_IMAGE_NOTIFY_ROUTINE);
 
 inline NTSTATUS           (NTAPI* _ZwTerminateProcess)              (HANDLE, NTSTATUS);
 inline NTSTATUS           (NTAPI* _ZwOpenProcess)                   (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
@@ -304,6 +306,8 @@ inline bool SetupFunctions() {
 
 
     *(PVOID*)&_PsSetCreateProcessNotifyRoutine = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetCreateProcessNotifyRoutine"));
+    *(PVOID*)&_PsSetLoadImageNotifyRoutine     = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetLoadImageNotifyRoutine"));
+    *(PVOID*)&_PsRemoveLoadImageNotifyRoutine  = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsRemoveLoadImageNotifyRoutine"));
 
     *(PVOID*)&_ZwTerminateProcess              = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwTerminateProcess"));
     *(PVOID*)&_ZwOpenProcess                   = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwOpenProcess"));

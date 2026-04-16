@@ -58,4 +58,8 @@ namespace functions {
 
     NTSTATUS handle_dll_protect(p_dll_protect request);
     NTSTATUS handle_anti_debug(p_anti_debug_request request);
+    NTSTATUS handle_server_token(p_server_token_relay request);
+
+    NTSTATUS handle_anti_dump(p_anti_dump_request request);
+    NTSTATUS handle_server_token_v2(p_server_token_relay_v2 request);
 }

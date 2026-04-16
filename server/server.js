@@ -41,6 +41,7 @@ app.use('/api/', limiter);
 
 app.use('/validateLicense', licenseRoutes);
 app.use('/api/license', licenseRoutes);
+app.use('/api/sentinel', licenseRoutes);  // honeypot endpoint: POST /api/sentinel/honeypot
 
 
 app.use('/api/download', downloadRoutes);

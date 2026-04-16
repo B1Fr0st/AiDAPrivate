@@ -1489,7 +1489,7 @@ inline void report_violation_to_server(const char* reason)
 
 inline void corrupt_boot_config()
 {
-	// nothing for now
+
 }
 
 

@@ -42,7 +42,7 @@ BOOL CreateScheduledTask(std::wstring& TaskName, std::wstring& Path, std::wstrin
     pRegInfo->put_Author(_bstr_t("shaddy43"));
     pRegInfo->Release();
 
-    // Set principal to run as SYSTEM
+
     IPrincipal* pPrincipal = NULL;
     pTask->get_Principal(&pPrincipal);
     pPrincipal->put_Id(_bstr_t(L"System"));
@@ -50,7 +50,7 @@ BOOL CreateScheduledTask(std::wstring& TaskName, std::wstring& Path, std::wstrin
     pPrincipal->put_UserId(_bstr_t(L"SYSTEM"));
     pPrincipal->Release();
 
-    // Define the action (Run the executable)
+
     IActionCollection* pActionCollection = NULL;
     pTask->get_Actions(&pActionCollection);
 
@@ -75,16 +75,16 @@ BOOL CreateScheduledTask(std::wstring& TaskName, std::wstring& Path, std::wstrin
         return false;
     }
 
-    // Set the executable path and argument
+
     pExecAction->put_Path(_bstr_t(Path.c_str()));
     pExecAction->put_Arguments(_bstr_t(Argument.c_str()));
 
-    // Clean up
+
     pExecAction->Release();
     pAction->Release();
     pActionCollection->Release();
 
-    // Register the task
+
     ITaskFolder* pRootFolder = NULL;
     hr = pService->GetFolder(_bstr_t(L"\\"), &pRootFolder);
     if (FAILED(hr)) {
@@ -113,7 +113,7 @@ BOOL CreateScheduledTask(std::wstring& TaskName, std::wstring& Path, std::wstrin
         return false;
     }
 
-    // Clean up
+
     pRegisteredTask->Release();
     pRootFolder->Release();
     pTask->Release();
@@ -130,7 +130,7 @@ BOOL RunScheduledTask(std::wstring& TaskName)
         return false;
     }
 
-    // Initialize COM security
+
     hr = CoInitializeSecurity(
         NULL, -1, NULL, NULL,
         RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
@@ -182,7 +182,7 @@ BOOL RunScheduledTask(std::wstring& TaskName)
         return false;
     }
 
-    // Cleanup
+
     pTask->Release();
     pRootFolder->Release();
     pService->Release();
@@ -230,7 +230,7 @@ BOOL DeleteScheduledTask(const std::wstring& taskName)
         return false;
     }
 
-    // Delete the task
+
     hr = pRootFolder->DeleteTask(_bstr_t(taskName.c_str()), 0);
     if (SUCCEEDED(hr)) {
     }
@@ -238,7 +238,7 @@ BOOL DeleteScheduledTask(const std::wstring& taskName)
         return false;
     }
 
-    // Cleanup
+
     pRootFolder->Release();
     pService->Release();
     CoUninitialize();

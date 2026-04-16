@@ -4,8 +4,11 @@
 #include "standalone_license.hpp"
 
 #include "standalone_settings.hpp"
+#include "standalone_driver.hpp"
 #include "arc/arc.h"
 #include "arc_loader.hpp"
+#include "anti-tamper/vm_compiler.hpp"
+#include "anti-tamper/server_pages.hpp"
 
 #include <windows.h>
 #include <iphlpapi.h>
@@ -36,6 +39,39 @@
 
 using json = nlohmann::json;
 
+static void lic_log(const char* step)
+{
+
+    static char s_log_path[MAX_PATH] = {};
+    static INIT_ONCE s_once = INIT_ONCE_STATIC_INIT;
+    BOOL pending;
+    InitOnceBeginInitialize(&s_once, INIT_ONCE_ASYNC, &pending, nullptr);
+    if (pending || s_log_path[0] == '\0') {
+        DWORD n = GetModuleFileNameA(nullptr, s_log_path, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH) {
+            strcpy_s(s_log_path, "aida_debug.log");
+        } else {
+            char* last = strrchr(s_log_path, '\\');
+            if (last) *(last + 1) = '\0'; else s_log_path[0] = '\0';
+            strcat_s(s_log_path, "aida_debug.log");
+        }
+        InitOnceComplete(&s_once, INIT_ONCE_ASYNC, nullptr);
+    }
+
+    HANDLE hf = CreateFileA(s_log_path, GENERIC_WRITE, FILE_SHARE_READ,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(hf, 0, nullptr, FILE_END);
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    char line[512];
+    int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "[%02d:%02d:%02d.%03d] [license] %s\r\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, step);
+    if (len > 0) { DWORD w; WriteFile(hf, line, (DWORD)len, &w, nullptr); }
+    CloseHandle(hf);
+}
+
 namespace
 {
 
@@ -56,9 +92,12 @@ namespace
 
     /* Heartbeat freshness tracking */
     std::atomic<int64_t> s_last_heartbeat_time{0};
+    std::atomic<uint32_t> s_heartbeat_counter{0};
 
     /* Cached HWID for inline re-derivation check */
     std::string s_cached_hwid;
+
+    std::string s_cached_session_token;
 
     /* Proof hash: FNV-1a of (session_token + hwid) */
     std::atomic<uint64_t> s_proof_hash{0};
@@ -207,9 +246,46 @@ namespace
         s_proof_hash.store(fnv1a_str(combined), std::memory_order_release);
     }
 
+    uint64_t vm_generate_proof_token(uint64_t session_seed, uint64_t heartbeat_count,
+                                      uint64_t server_nonce, uint64_t hwid_hash)
+    {
+        uint64_t vm_seed = session_seed ^ __rdtsc() ^ heartbeat_count;
+
+        anti_tamper::virtualizer::detail::vm_state_t vm;
+        anti_tamper::virtualizer::detail::init_vm(vm, vm_seed);
+
+        anti_tamper::vm_compiler::program_t prog;
+        prog.set_key(vm_seed ^ 0x6A09E667F3BCC908ULL);
+        prog.set_opcode_map(vm.opcode_map);
+
+        prog.emit_load_imm(0, session_seed);
+        prog.emit_load_imm(1, heartbeat_count);
+        prog.emit_load_imm(2, server_nonce);
+        prog.emit_load_imm(3, hwid_hash);
+
+        prog.emit_xor(0, 0, 1);
+        prog.emit_load_imm(8, 13);
+        prog.emit_rol(0, 0, 8);
+        prog.emit_xor(0, 0, 2);
+        prog.emit_load_imm(8, 29);
+        prog.emit_rol(0, 0, 8);
+        prog.emit_xor(0, 0, 3);
+        prog.emit_hash(0, 0);
+        prog.emit_junk(3);
+        prog.emit_halt();
+
+        auto bytecode = prog.finalize();
+        return anti_tamper::virtualizer::detail::vm_execute(
+            vm, bytecode.data(), static_cast<uint32_t>(bytecode.size()));
+    }
+
     std::string get_cloud_function_host()
     {
+#ifdef AIDA_LOCAL_LICENSE_SERVER
+        return "http://localhost:3000";
+#else
         return "https://aidapro.net";
+#endif
     }
 
     std::shared_ptr<httplib::Client> get_or_create_license_client()
@@ -413,7 +489,7 @@ namespace
         return true;
     }
 
-    bool call_validation_endpoint(settings_sa_t& ,
+    bool call_validation_endpoint(settings_sa_t& settings,
                                   const std::string& action,
                                   const std::string& key,
                                   const std::string& hwid,
@@ -437,12 +513,66 @@ namespace
                 body["session_token"] = session_token;
                 body["heartbeat_nonce"] = nonce;
                 body["plugin_version"] = "aida-standalone";
+                body["heartbeat_count"] = static_cast<int>(s_heartbeat_counter.load(std::memory_order_acquire));
+
+
+                {
+                    std::lock_guard<std::mutex> lk(s_code_hash_mtx);
+                    if (!s_code_hashes.empty()) {
+                        uint64_t combined = 14695981039346656037ULL;
+                        for (const auto& entry : s_code_hashes) {
+                            uint64_t h = fnv1a(reinterpret_cast<const void*>(entry.base), entry.size);
+                            combined ^= h;
+                            combined *= 1099511628211ULL;
+                        }
+                        char hash_buf[32];
+                        snprintf(hash_buf, sizeof(hash_buf), "%016llX",
+                            static_cast<unsigned long long>(combined));
+                        body["code_hash"] = hash_buf;
+                    }
+                }
+
                 if (s_arc_loaded && s_fn_arc_heartbeat) {
                     auto hb = s_fn_arc_heartbeat();
                     if (hb.valid) {
                         char pt[32];
                         snprintf(pt, sizeof(pt), "%016llX", static_cast<unsigned long long>(hb.proof_token));
                         body["proof_token"] = pt;
+                    }
+                }
+
+                if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
+                {
+                    std::string srv_nonce_str = settings.license_server_nonce;
+                    if (!srv_nonce_str.empty())
+                    {
+                        uint64_t srv_nonce_val = 0;
+                        for (size_t ci = 0; ci < srv_nonce_str.size() && ci < 16; ++ci)
+                        {
+                            uint8_t nibble = 0;
+                            char ch = srv_nonce_str[ci];
+                            if (ch >= '0' && ch <= '9') nibble = ch - '0';
+                            else if (ch >= 'a' && ch <= 'f') nibble = ch - 'a' + 10;
+                            else if (ch >= 'A' && ch <= 'F') nibble = ch - 'A' + 10;
+                            srv_nonce_val = (srv_nonce_val << 4) | nibble;
+                        }
+
+                        uint32_t token_hash = static_cast<uint32_t>(
+                            fnv1a_str(settings.license_session_token) & 0xFFFFFFFF);
+
+                        uint64_t driver_proof = 0;
+                        if (driver_bridge::relay_server_token_v2(token_hash, srv_nonce_val, &driver_proof))
+                        {
+                            char dp_buf[32];
+                            snprintf(dp_buf, sizeof(dp_buf), "%016llX",
+                                static_cast<unsigned long long>(driver_proof));
+                            body["driver_proof"] = dp_buf;
+                            body["server_nonce"] = srv_nonce_str;
+
+                            uint64_t tsc_now = __rdtsc();
+                            uint64_t tsc_base = s_last_heartbeat_time.load(std::memory_order_acquire);
+                            body["tsc_drift"] = static_cast<int64_t>(tsc_now - tsc_base);
+                        }
                     }
                 }
             }
@@ -516,7 +646,17 @@ namespace
         s_magic.store(S_MAGIC_INIT ^ nonce_seed, std::memory_order_release);
 
 
+        s_heartbeat_counter.fetch_add(1, std::memory_order_relaxed);
+
+        if (response.contains("page_epoch") && response["page_epoch"].is_number())
+        {
+            uint64_t new_epoch = response["page_epoch"].get<uint64_t>();
+            anti_tamper::server_pages::advance_epoch(new_epoch);
+        }
+
+
         s_cached_hwid = hwid;
+        s_cached_session_token = settings.license_session_token;
         update_proof_hash(settings.license_session_token, hwid);
 
 
@@ -899,6 +1039,7 @@ namespace
 
 
         s_cached_hwid = hwid;
+        s_cached_session_token = settings.license_session_token;
         update_proof_hash(settings.license_session_token, hwid);
         uint64_t nonce_seed = fnv1a_str(settings.license_server_nonce);
         s_magic.store(S_MAGIC_INIT ^ nonce_seed, std::memory_order_release);
@@ -952,6 +1093,7 @@ namespace
                 if (response.is_object() &&
                     (response.value("status", "") == "killed" ||
                      response.value("alive", true) == false)) {
+                    anti_tamper::server_pages::force_scrub_all();
                     std::lock_guard<std::mutex> lk(s_state_mtx);
                     s_error = "session_terminated";
                     set_obfuscated_valid(false);
@@ -994,7 +1136,114 @@ namespace
             s_heartbeat_thread.join();
 
         s_stop.store(false, std::memory_order_release);
-        s_heartbeat_thread = std::thread(heartbeat_worker, &settings);
+        try
+        {
+            s_heartbeat_thread = std::thread(heartbeat_worker, &settings);
+            lic_log("heartbeat_thread_started");
+        }
+        catch (...)
+        {
+
+
+            lic_log("heartbeat_thread_failed_skipped");
+        }
+    }
+
+
+    std::atomic<bool> s_honeypot_tripped{false};
+    std::atomic<int>  s_honeypot_trip_count{0};
+
+    static void honeypot_report_impl(const char* trap_cstr, size_t trap_len)
+    {
+        auto cli = get_or_create_license_client();
+        if (!cli) return;
+
+        char trap_buf[64] = {};
+        if (trap_len >= sizeof(trap_buf)) trap_len = sizeof(trap_buf) - 1;
+        memcpy(trap_buf, trap_cstr, trap_len);
+
+        json body;
+        body["event"]     = "honeypot_trip";
+        body["trap"]      = trap_buf;
+        body["hwid"]      = s_cached_hwid;
+        body["timestamp"] = static_cast<int64_t>(
+            std::chrono::system_clock::now().time_since_epoch().count());
+
+        int cpuid_buf[4] = {};
+        __cpuid(cpuid_buf, 1);
+        body["cpuid"] = cpuid_buf[0];
+        body["tsc"]   = static_cast<uint64_t>(__rdtsc());
+
+        httplib::Headers headers;
+        headers.emplace("Content-Type", "application/json");
+
+        cli->Post("/api/sentinel/honeypot", headers,
+            body.dump(), "application/json");
+    }
+
+    void honeypot_report_async(const char* trap_name)
+    {
+        s_honeypot_tripped.store(true, std::memory_order_release);
+        s_honeypot_trip_count.fetch_add(1, std::memory_order_relaxed);
+
+        std::thread([trap = std::string(trap_name)]() {
+            try { honeypot_report_impl(trap.c_str(), trap.size()); }
+            catch (...) {}
+        }).detach();
+    }
+
+
+    __declspec(noinline) bool is_product_licensed()
+    {
+        volatile bool licensed = true;
+        if (licensed) {
+            honeypot_report_async("is_product_licensed");
+        }
+        return licensed;
+    }
+
+
+    __declspec(noinline) bool validate_license_key(const char* key)
+    {
+        if (!key || strlen(key) < 8) return false;
+        honeypot_report_async("validate_license_key");
+        return true;
+    }
+
+
+    __declspec(noinline) int get_trial_days_remaining()
+    {
+        honeypot_report_async("get_trial_days_remaining");
+        return 9999;
+    }
+
+
+    __declspec(noinline) bool check_online_activation_status()
+    {
+        honeypot_report_async("check_online_activation");
+        return true;
+    }
+
+
+    __declspec(noinline) bool is_feature_unlocked(int feature_id)
+    {
+        (void)feature_id;
+        honeypot_report_async("is_feature_unlocked");
+        return true;
+    }
+
+
+    volatile uintptr_t s_hp_fn_table[] = {
+        reinterpret_cast<uintptr_t>(&is_product_licensed),
+        reinterpret_cast<uintptr_t>(&validate_license_key),
+        reinterpret_cast<uintptr_t>(&get_trial_days_remaining),
+        reinterpret_cast<uintptr_t>(&check_online_activation_status),
+        reinterpret_cast<uintptr_t>(&is_feature_unlocked),
+    };
+
+    bool is_honeypot_tripped()
+    {
+        return s_honeypot_tripped.load(std::memory_order_acquire);
     }
 }
 
@@ -1002,43 +1251,59 @@ namespace standalone_license
 {
     bool initialize(settings_sa_t& settings)
     {
+        lic_log("initialize_enter");
         std::string error;
         if (!try_validate_cached(settings, error)) {
+            lic_log(("initialize_no_cached: " + error).c_str());
             std::lock_guard<std::mutex> lk(s_state_mtx);
             s_error = error;
             set_obfuscated_valid(false);
             return false;
         }
-
+        lic_log("initialize_cached_ok");
 
         const std::string hwid = settings.license_hwid.empty() ? generate_hwid() : settings.license_hwid;
+        lic_log("initialize_downloading_arc");
         download_and_load_arc(settings, hwid);
+        lic_log("initialize_arc_done");
 
         snapshot_code_hashes();
         restart_heartbeat(settings);
+        lic_log("initialize_complete");
         return true;
     }
 
     bool activate(settings_sa_t& settings, const std::string& key, std::string& error_out)
     {
+        lic_log("activate_enter");
         const std::string hwid = settings.license_hwid.empty() ? generate_hwid() : settings.license_hwid;
+        lic_log("activate_hwid_ok");
         const std::string nonce = generate_nonce();
         json response;
 
+        lic_log("activate_calling_endpoint");
         if (!call_validation_endpoint(settings, "validate", key, hwid, {}, nonce, error_out, response)) {
+            lic_log(("activate_endpoint_failed: " + error_out).c_str());
             std::lock_guard<std::mutex> lk(s_state_mtx);
             s_error = error_out;
             set_obfuscated_valid(false);
             return false;
         }
+        lic_log("activate_endpoint_ok");
 
         apply_valid_response(settings, key, hwid, response);
+        lic_log("activate_applied_response");
 
-
+        lic_log("activate_downloading_arc");
         download_and_load_arc(settings, hwid);
+        lic_log("activate_arc_done");
 
+        lic_log("activate_snapshot_hashes");
         snapshot_code_hashes();
+        lic_log("activate_snapshot_done");
+
         restart_heartbeat(settings);
+        lic_log("activate_complete");
         return true;
     }
 
@@ -1346,5 +1611,17 @@ namespace standalone_license
         if (!s_arc_loaded || !s_fn_arc_heartbeat)
             return result;
         return s_fn_arc_heartbeat();
+    }
+
+    uint64_t get_server_nonce_hash()
+    {
+        std::lock_guard<std::mutex> lk(s_state_mtx);
+        return s_magic.load(std::memory_order_acquire);
+    }
+
+    std::string get_session_token()
+    {
+        std::lock_guard<std::mutex> lk(s_state_mtx);
+        return s_cached_session_token;
     }
 }
