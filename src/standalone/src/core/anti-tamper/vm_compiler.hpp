@@ -28,6 +28,17 @@ namespace vm_compiler {
             advance_rolling_key(rolling_key);
             return raw ^ key_byte;
         }
+
+        inline uint64_t derive_block_key(uint64_t saved_key, uint32_t target)
+        {
+            uint64_t k = saved_key ^ static_cast<uint64_t>(target);
+            k ^= k >> 30;
+            k *= 0xBF58476D1CE4E5B9ULL;
+            k ^= k >> 27;
+            k *= 0x94D049BB133111EBULL;
+            k ^= k >> 31;
+            return k;
+        }
     }
 
     class program_t

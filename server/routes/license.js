@@ -632,7 +632,6 @@ async function handleReportViolation(body, clientIp) {
 }
 
 
-// ─── Phase 5.2 server-side: Honeypot trap receiver ───
 async function handleHoneypotTrip(body, clientIp) {
     const { event, trap, hwid, timestamp, cpuid, tsc } = body;
 
@@ -642,7 +641,7 @@ async function handleHoneypotTrip(body, clientIp) {
 
     const sanitizedTrap = sanitizeReason(trap);
 
-    // Log the honeypot event
+
     const now = Math.floor(Date.now() / 1000);
     await pool.query(`
         INSERT INTO violations (hwid, ip, reason, timestamp, timestamp_iso, plugin_version)
@@ -656,10 +655,10 @@ async function handleHoneypotTrip(body, clientIp) {
         'honeypot',
     ]);
 
-    // Immediately kill any active sessions for this HWID
+
     await pool.query('UPDATE sessions SET kill_flag = true WHERE hwid = $1', [hwid]);
 
-    // Revoke all licenses bound to this HWID
+
     const { rows: licenseRows } = await pool.query(
         'SELECT key FROM licenses WHERE hwid = $1 AND active = true',
         [hwid]
@@ -668,10 +667,10 @@ async function handleHoneypotTrip(body, clientIp) {
         await revokeLicenseAndSession(row.key, `honeypot:${sanitizedTrap}`, 'honeypot', hwid);
     }
 
-    // Ban the HWID and IP
+
     await recordBan(hwid, clientIp, `honeypot:${sanitizedTrap}`, 'honeypot');
 
-    // Alert
+
     const fields = [
         { name: '\uD83C\uDFAF Trap', value: sanitizedTrap },
         { name: '\uD83D\uDDA5\uFE0F HWID', value: `\`${hwid}\`` },
@@ -682,12 +681,11 @@ async function handleHoneypotTrip(body, clientIp) {
     await sendDiscordWebhook('\uD83C\uDFAF HONEYPOT TRIGGERED — Cracker Detected', fields, 0xFF0000);
     await sendTelegramAlert('\uD83C\uDFAF HONEYPOT TRIGGERED — Cracker Detected', fields);
 
-    // Return success (don't tip off the cracker)
+
     return { status: 200, body: { status: 'ok' } };
 }
 
 
-// ─── Phase 4.2: Enhanced anomaly scoring with driver proof validation ───
 async function handleDriverProof(body, clientIp) {
     const { license_key, session_token, hwid, driver_proof, server_nonce, tsc_drift } = body;
 
@@ -704,10 +702,10 @@ async function handleDriverProof(body, clientIp) {
         return { status: 200, body: { status: 'killed', alive: false } };
     }
 
-    // Validate driver proof is non-zero and has entropy
+
     const proofNum = BigInt(`0x${driver_proof}`);
     if (proofNum === 0n) {
-        // Zero proof = no driver loaded or forged
+
         const newScore = Math.min(100, (session.anomaly_score || 0) + 40);
         await pool.query(
             'UPDATE sessions SET anomaly_score = $1 WHERE license_key = $2',
@@ -722,7 +720,7 @@ async function handleDriverProof(body, clientIp) {
         return { status: 200, body: { status: 'warning', anomaly_score: newScore } };
     }
 
-    // Check TSC drift (if driver reports implausible timing, it's emulated)
+
     if (typeof tsc_drift === 'number' && tsc_drift > 1000000) {
         const newScore = Math.min(100, (session.anomaly_score || 0) + 25);
         await pool.query(
@@ -731,7 +729,7 @@ async function handleDriverProof(body, clientIp) {
         );
     }
 
-    // Store the driver proof for cross-validation on next heartbeat
+
     await pool.query(
         'UPDATE sessions SET last_proof_token = $1 WHERE license_key = $2',
         [driver_proof, license_key]
@@ -784,7 +782,7 @@ router.post('/', async (req, res) => {
     }
 });
 
-// ─── Sentinel honeypot endpoint ───
+
 router.post('/honeypot', async (req, res) => {
     const clientIp = getClientIp(req);
     try {

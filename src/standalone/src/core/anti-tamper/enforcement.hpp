@@ -18,6 +18,10 @@
 #include "../../../../../libs/cpp-httplib/httplib.h"
 #include "../../../../../libs/nlohmann/json.hpp"
 
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+#endif
+
 namespace anti_tamper {
 
 namespace enforcement_detail {

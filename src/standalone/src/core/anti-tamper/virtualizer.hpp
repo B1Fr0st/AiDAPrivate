@@ -120,6 +120,8 @@ namespace detail
     inline bool           g_poly_initialized = false;
 
     inline bool verify_handler_pool();
+    inline void build_handler_pool(const uint8_t* reverse_map, uint64_t pool_seed);
+    inline void build_poly_table();
     __forceinline handler_fn select_handler(vm_state_t& vm, uint8_t opcode);
     inline void init_vm(vm_state_t& vm, uint64_t seed);
     inline uint64_t vm_execute(vm_state_t& vm, const uint8_t* bytecode, uint32_t bc_size);
@@ -361,6 +363,51 @@ namespace detail
 
 
     static constexpr uint32_t HANDLER_REGEN_INTERVAL = 512;
+    static constexpr uint32_t VM_ANTIDEBUG_INTERVAL = 37;
+
+    __forceinline bool vm_check_hardware_breakpoints(vm_state_t& vm)
+    {
+        uint64_t dr0 = 0, dr1 = 0, dr2 = 0, dr3 = 0, dr7 = 0;
+        __try {
+            CONTEXT ctx{};
+            ctx.ContextFlags = 0x00100010;
+            if (GetThreadContext(GetCurrentThread(), &ctx)) {
+                dr0 = ctx.Dr0; dr1 = ctx.Dr1;
+                dr2 = ctx.Dr2; dr3 = ctx.Dr3;
+                dr7 = ctx.Dr7;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return true;
+        }
+
+        if ((dr7 & 0xFF) == 0 && dr0 == 0 && dr1 == 0 && dr2 == 0 && dr3 == 0)
+            return false;
+
+        uintptr_t pool_lo = reinterpret_cast<uintptr_t>(&g_handler_pool[0]);
+        uintptr_t pool_hi = pool_lo + sizeof(g_handler_pool);
+        uintptr_t dispatch_lo = reinterpret_cast<uintptr_t>(&g_dispatch_table[0]);
+        uintptr_t dispatch_hi = dispatch_lo + sizeof(g_dispatch_table);
+
+        auto in_range = [&](uint64_t addr) -> bool {
+            if (addr == 0) return false;
+            if (addr >= pool_lo && addr < pool_hi) return true;
+            if (addr >= dispatch_lo && addr < dispatch_hi) return true;
+            for (uint32_t i = 0; i < g_active_slots; ++i) {
+                uintptr_t fn = reinterpret_cast<uintptr_t>(g_handler_pool[i].fn);
+                if (addr >= fn && addr < fn + 256) return true;
+            }
+            return false;
+        };
+
+        if (in_range(dr0) || in_range(dr1) || in_range(dr2) || in_range(dr3)) {
+            vm.rolling_key ^= 0xDEADDEADDEADDEADULL;
+            vm.handler_chain_key = 0;
+            for (int i = 0; i < 16; ++i) vm.regs[i] ^= __rdtsc();
+            return true;
+        }
+
+        return (dr0 != 0 || dr1 != 0 || dr2 != 0 || dr3 != 0);
+    }
 
     __forceinline void regenerate_handlers(vm_state_t& vm)
     {
@@ -397,6 +444,18 @@ namespace detail
                 vm.halted = true;
                 return;
             }
+        }
+
+        if (vm.insn_count > 0 && (vm.insn_count % VM_ANTIDEBUG_INTERVAL) == 0)
+        {
+            decrypt_context(vm);
+            if (vm_check_hardware_breakpoints(vm))
+            {
+                write_vreg(vm, 0, 0xDEADBEEFDEADBEEFULL);
+                vm.halted = true;
+                return;
+            }
+            encrypt_context(vm);
         }
 
         if (vm.insn_count > 0 && (vm.insn_count % HANDLER_REGEN_INTERVAL) == 0)
@@ -543,7 +602,13 @@ namespace detail
         uint64_t saved_key = vm.rolling_key;
         uint32_t target = fetch_u32(vm, bc, bc_size);
         vm.rip = target;
-        vm.rolling_key = saved_key ^ target;
+        uint64_t block_key = saved_key ^ target;
+        block_key ^= block_key >> 30;
+        block_key *= 0xBF58476D1CE4E5B9ULL;
+        block_key ^= block_key >> 27;
+        block_key *= 0x94D049BB133111EBULL;
+        block_key ^= block_key >> 31;
+        vm.rolling_key = block_key;
         dispatch_next(vm, bc, bc_size);
     }
 
@@ -554,7 +619,13 @@ namespace detail
         if (vm.flags == 1)
         {
             vm.rip = target;
-            vm.rolling_key = saved_key ^ target;
+            uint64_t block_key = saved_key ^ target;
+            block_key ^= block_key >> 30;
+            block_key *= 0xBF58476D1CE4E5B9ULL;
+            block_key ^= block_key >> 27;
+            block_key *= 0x94D049BB133111EBULL;
+            block_key ^= block_key >> 31;
+            vm.rolling_key = block_key;
         }
         dispatch_next(vm, bc, bc_size);
     }
@@ -566,7 +637,13 @@ namespace detail
         if (vm.flags != 1)
         {
             vm.rip = target;
-            vm.rolling_key = saved_key ^ target;
+            uint64_t block_key = saved_key ^ target;
+            block_key ^= block_key >> 30;
+            block_key *= 0xBF58476D1CE4E5B9ULL;
+            block_key ^= block_key >> 27;
+            block_key *= 0x94D049BB133111EBULL;
+            block_key ^= block_key >> 31;
+            vm.rolling_key = block_key;
         }
         dispatch_next(vm, bc, bc_size);
     }

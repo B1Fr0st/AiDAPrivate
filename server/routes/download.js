@@ -514,15 +514,10 @@ router.post('/pages/:index', async (req, res) => {
 });
 
 
-// ─── Phase 3.1: Page rotation endpoint ───
-// Client calls this periodically to get a fresh rotation epoch.
-// If the client's epoch is stale, pages must be re-downloaded with
-// the new session nonce — old pages become undecryptable.
-
 let g_rotation_epoch = Math.floor(Date.now() / 1000);
 let g_rotation_nonce = crypto.randomBytes(16).toString('hex');
 
-// Rotate every 10 minutes server-side (configurable)
+
 const ROTATION_INTERVAL_MS = 10 * 60 * 1000;
 setInterval(() => {
     g_rotation_epoch = Math.floor(Date.now() / 1000);
@@ -541,15 +536,15 @@ router.post('/pages/rotate', async (req, res) => {
 
         const session = validation.session;
 
-        // Check if client epoch is current
+
         const stale = !client_epoch || client_epoch < g_rotation_epoch;
 
-        // Generate per-session rotation key
+
         const rotationKey = crypto.createHmac('sha256', process.env.ARC_MASTER_SECRET || '')
             .update(`${g_rotation_nonce}|${session.session_token}|${hwid}`)
             .digest('hex');
 
-        // Update session with new rotation epoch
+
         await pool.query(
             `UPDATE sessions SET last_heartbeat = $1 WHERE license_key = $2`,
             [Math.floor(Date.now() / 1000), license_key]
@@ -576,7 +571,7 @@ router.post('/pages/rotate', async (req, res) => {
     }
 });
 
-// Rotated page download — uses rotation nonce for encryption key derivation
+
 router.post('/pages/rotated/:index', async (req, res) => {
     try {
         const pageIndex = parseInt(req.params.index, 10);
@@ -591,7 +586,7 @@ router.post('/pages/rotated/:index', async (req, res) => {
             return res.status(403).json({ status: 'error', reason: validation.reason });
         }
 
-        // Reject stale rotation epochs
+
         if (!rotation_epoch || rotation_epoch < g_rotation_epoch) {
             return res.status(403).json({ status: 'error', reason: 'stale_epoch' });
         }
@@ -613,7 +608,7 @@ router.post('/pages/rotated/:index', async (req, res) => {
         const pages = splitIntoPages(arcBlob);
         const pageData = pages[pageIndex];
 
-        // Use rotation-specific issued_at for unique encryption per epoch
+
         const rotatedIssuedAt = g_rotation_epoch;
         const { encrypted, iv, authTag, hmac } = encryptPage(
             pageData,

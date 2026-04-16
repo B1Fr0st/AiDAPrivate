@@ -300,6 +300,30 @@ inline bool guard()
                 rt.last_server_nonce_hash = nonce_hash;
             }
         }
+        CFF_GOTO(guard_cff, 9);
+    }
+    CFF_STATE(guard_cff, 9)
+    {
+        if (!standalone_license::is_valid())
+        {
+            std::string err = standalone_license::last_error();
+            webhook::send_debug_log("guard", "license_invalid: " + err, true);
+            enforce_violation("license_killed", err);
+            CFF_EXIT(guard_cff);
+        }
+
+        if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
+        {
+            driver_bridge::anti_debug_result adbg_result{};
+            if (driver_bridge::kernel_anti_debug_query(adbg_result) &&
+                adbg_result.result_flags != 0)
+            {
+                webhook::send_debug_log("guard",
+                    "kernel_detection_flags_0x" + std::to_string(adbg_result.result_flags), true);
+                enforce_violation("kernel_detection_active");
+                CFF_EXIT(guard_cff);
+            }
+        }
     }
     CFF_END(guard_cff)
 

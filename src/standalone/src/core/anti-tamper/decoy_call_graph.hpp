@@ -5,6 +5,25 @@
 #include <cstdint>
 #include <cstring>
 
+namespace anti_tamper::virtualizer::detail {
+    struct handler_slot_t;
+    using handler_fn = void(*)(struct vm_state_t&, const uint8_t*, uint32_t);
+    struct poly_dispatch_t;
+    extern handler_slot_t  g_handler_pool[];
+    extern uint32_t        g_active_slots;
+    extern uint64_t        g_pool_guard;
+    extern handler_fn      g_dispatch_table[];
+    extern bool            g_poly_initialized;
+    extern poly_dispatch_t g_poly_table[];
+}
+
+extern uint64_t g_server_poly_seed;
+
+namespace anti_tamper::call_obfuscation::detail {
+    struct call_entry_t;
+    extern call_entry_t g_table[];
+}
+
 
 namespace anti_tamper::decoy {
 
@@ -313,6 +332,82 @@ namespace anti_tamper::decoy {
         return found;
     }
 
+    __declspec(noinline) static void __cdecl decoy_xref_vm_pool_verify(
+        uint64_t session_key, uint32_t expected_slots)
+    {
+        volatile uint64_t pool_addr = reinterpret_cast<uintptr_t>(
+            &anti_tamper::virtualizer::detail::g_handler_pool[0]);
+        volatile uint64_t guard = anti_tamper::virtualizer::detail::g_pool_guard;
+        volatile uint64_t mix = pool_addr ^ guard ^ session_key;
+        mix = _rotl64(mix, 13) * 0xFF51AFD7ED558CCDULL;
+        mix ^= static_cast<uint64_t>(expected_slots);
+        if (opaque_false(mix)) {
+            volatile uint32_t slots = anti_tamper::virtualizer::detail::g_active_slots;
+            (void)slots;
+        }
+    }
+
+    __declspec(noinline) static uint64_t __cdecl decoy_xref_dispatch_hash(
+        uint32_t table_index, uint64_t nonce)
+    {
+        volatile uintptr_t tbl_addr = reinterpret_cast<uintptr_t>(
+            &anti_tamper::virtualizer::detail::g_dispatch_table[table_index & 0xFF]);
+        volatile uint64_t h = tbl_addr ^ nonce;
+        h ^= h >> 33;
+        h *= 0xBF58476D1CE4E5B9ULL;
+        h ^= h >> 29;
+        if (opaque_false(h))
+            return 0;
+        return h;
+    }
+
+    __declspec(noinline) static bool __cdecl decoy_xref_poly_table_check(
+        uint8_t opcode, uint64_t context_key)
+    {
+        volatile uintptr_t poly_addr = reinterpret_cast<uintptr_t>(
+            &anti_tamper::virtualizer::detail::g_poly_table[opcode]);
+        volatile uint64_t v = poly_addr ^ context_key;
+        v = _rotr64(v, 7) + g_decoy_keys[3];
+        if (opaque_false(v))
+            return false;
+        return true;
+    }
+
+    __declspec(noinline) static uint64_t __cdecl decoy_xref_call_table_probe(
+        uint32_t slot_index, uint64_t salt)
+    {
+        volatile uintptr_t call_tbl = reinterpret_cast<uintptr_t>(
+            &anti_tamper::call_obfuscation::detail::g_table[slot_index % 64]);
+        volatile uint64_t h = call_tbl ^ salt;
+        h *= 0x94D049BB133111EBULL;
+        h ^= h >> 31;
+        if (opaque_false(h))
+            return 0;
+        return h;
+    }
+
+    __declspec(noinline) static int __cdecl decoy_xref_vm_depth_validate(
+        uint32_t max_depth, uint64_t session_nonce)
+    {
+        volatile uint64_t poly_init = anti_tamper::virtualizer::detail::g_poly_initialized ? 1ULL : 0ULL;
+        volatile uint64_t mix = poly_init ^ session_nonce ^ max_depth;
+        mix = _rotl64(mix, 23) ^ g_decoy_keys[9];
+        if (opaque_false(mix))
+            return -1;
+        return static_cast<int>(mix & 0xF);
+    }
+
+    __declspec(noinline) static uint64_t __cdecl decoy_xref_server_poly_derive(
+        uint64_t page_index, uint64_t epoch_key)
+    {
+        volatile uint64_t seed = ::g_server_poly_seed;
+        volatile uint64_t derived = seed ^ epoch_key ^ (page_index * 0x100000001B3ULL);
+        derived = _rotr64(derived, 11) * 0xBF58476D1CE4E5B9ULL;
+        if (opaque_false(derived))
+            return 0;
+        return derived;
+    }
+
 
     __declspec(noinline) static void __cdecl anchor_decoy_graph()
     {
@@ -340,6 +435,12 @@ namespace anti_tamper::decoy {
         sink += reinterpret_cast<uintptr_t>(&decoy_blake2b_compress);
         sink += reinterpret_cast<uintptr_t>(&decoy_ed25519_verify);
         sink += reinterpret_cast<uintptr_t>(&decoy_memory_scan_pattern);
+        sink += reinterpret_cast<uintptr_t>(&decoy_xref_vm_pool_verify);
+        sink += reinterpret_cast<uintptr_t>(&decoy_xref_dispatch_hash);
+        sink += reinterpret_cast<uintptr_t>(&decoy_xref_poly_table_check);
+        sink += reinterpret_cast<uintptr_t>(&decoy_xref_call_table_probe);
+        sink += reinterpret_cast<uintptr_t>(&decoy_xref_vm_depth_validate);
+        sink += reinterpret_cast<uintptr_t>(&decoy_xref_server_poly_derive);
 
         for (int i = 0; i < 5; ++i)
             sink += static_cast<uintptr_t>(g_decoy_keys[i]);
@@ -395,16 +496,22 @@ namespace anti_tamper::decoy {
         (void)sink;
     }
 
+}
 
 #define DECOY_CALL_INTEGRATED(tag)                                               \
     do {                                                                         \
-        if (opaque_false(__rdtsc() ^ (uint64_t)__LINE__)) {                      \
-            volatile uint64_t _dc_r_##tag = decoy_validate_signature(            \
-                reinterpret_cast<const uint8_t*>(g_decoy_strings[__LINE__ % 16]),\
-                16, g_decoy_keys[__LINE__ % 12]);                                \
-            volatile int _dc_s_##tag = decoy_validate_server_token(              \
-                _dc_r_##tag, g_decoy_keys[(__LINE__ + 3) % 12]);                 \
-            volatile bool _dc_v_##tag = decoy_verify_driver_proof(               \
+        if (anti_tamper::decoy::opaque_false(__rdtsc() ^ (uint64_t)__LINE__)) {  \
+            volatile uint64_t _dc_r_##tag =                                      \
+                anti_tamper::decoy::decoy_validate_signature(                    \
+                reinterpret_cast<const uint8_t*>(const_cast<const char*>(         \
+                    anti_tamper::decoy::g_decoy_strings[__LINE__ % 16])),        \
+                16, anti_tamper::decoy::g_decoy_keys[__LINE__ % 12]);            \
+            volatile int _dc_s_##tag =                                           \
+                anti_tamper::decoy::decoy_validate_server_token(                \
+                _dc_r_##tag,                                                     \
+                anti_tamper::decoy::g_decoy_keys[(__LINE__ + 3) % 12]);          \
+            volatile bool _dc_v_##tag =                                          \
+                anti_tamper::decoy::decoy_verify_driver_proof(                  \
                 _dc_r_##tag, static_cast<uint64_t>(_dc_s_##tag));                \
             (void)_dc_v_##tag;                                                   \
         }                                                                        \
@@ -412,16 +519,21 @@ namespace anti_tamper::decoy {
 
 #define DECOY_CRYPTO_INTEGRATED(tag)                                             \
     do {                                                                         \
-        if (opaque_false(__rdtsc() ^ (uint64_t)__LINE__ ^ 0xCAFEULL)) {          \
-            volatile uint64_t _dci_k_##tag = decoy_derive_page_key(              \
-                static_cast<uint32_t>(__LINE__), g_decoy_keys[__LINE__ % 12]);   \
-            volatile uint64_t _dci_h_##tag = decoy_blake2b_compress(             \
-                _dci_k_##tag, g_decoy_keys[5], __rdtsc());                       \
-            volatile bool _dci_e_##tag = decoy_ed25519_verify(                   \
-                reinterpret_cast<const uint8_t*>(&_dci_h_##tag),                 \
-                reinterpret_cast<const uint8_t*>(&_dci_k_##tag), 8);             \
+        if (anti_tamper::decoy::opaque_false(                                   \
+                __rdtsc() ^ (uint64_t)__LINE__ ^ 0xCAFEULL)) {                  \
+            volatile uint64_t _dci_k_##tag =                                     \
+                anti_tamper::decoy::decoy_derive_page_key(                      \
+                static_cast<uint32_t>(__LINE__),                                 \
+                anti_tamper::decoy::g_decoy_keys[__LINE__ % 12]);                \
+            volatile uint64_t _dci_h_##tag =                                     \
+                anti_tamper::decoy::decoy_blake2b_compress(                     \
+                _dci_k_##tag, anti_tamper::decoy::g_decoy_keys[5], __rdtsc());   \
+            uint64_t _dci_hv_##tag = _dci_h_##tag;                               \
+            uint64_t _dci_kv_##tag = _dci_k_##tag;                               \
+            volatile bool _dci_e_##tag =                                         \
+                anti_tamper::decoy::decoy_ed25519_verify(                       \
+                reinterpret_cast<const uint8_t*>(&_dci_hv_##tag),               \
+                reinterpret_cast<const uint8_t*>(&_dci_kv_##tag), 8);            \
             (void)_dci_e_##tag;                                                  \
         }                                                                        \
     } while (0)
-
-}

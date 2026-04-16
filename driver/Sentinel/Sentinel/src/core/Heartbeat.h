@@ -35,6 +35,33 @@ namespace heartbeat {
     constexpr UINT64 CHALLENGE_TIMEOUT_TSC = 30ULL * 3000000000ULL;
     constexpr UINT64 CHALLENGE_HMAC_KEY    = 0x7A3F1D9E5BC82A46ULL;
 
+    inline volatile UINT64 g_bridge_crypt_key = 0;
+
+    __forceinline void derive_bridge_key_from_whoswho(PVOID whoswho_base) {
+        (void)whoswho_base;
+        int cpu[4] = {};
+        __cpuid(cpu, 1);
+        UINT64 k = static_cast<UINT64>(cpu[0]) ^ (static_cast<UINT64>(cpu[2]) << 32);
+        __cpuid(cpu, 0x80000001);
+        k ^= static_cast<UINT64>(cpu[0]) ^ (static_cast<UINT64>(cpu[3]) << 16);
+        k ^= k >> 33;
+        k *= 0xFF51AFD7ED558CCDULL;
+        k ^= k >> 33;
+        k *= 0xC4CEB9FE1A85EC53ULL;
+        k ^= k >> 33;
+        g_bridge_crypt_key = k;
+    }
+
+    __forceinline void bridge_encrypt_cmd(ULONG& cmd, ULONG& param) {
+        UINT64 key = g_bridge_crypt_key;
+        cmd   ^= static_cast<ULONG>(key & 0xFFFFFFFF);
+        param ^= static_cast<ULONG>(key >> 32);
+    }
+
+    __forceinline void bridge_encrypt_challenge(UINT64& challenge) {
+        challenge ^= _rotr64(g_bridge_crypt_key, 17);
+    }
+
     inline volatile sentinel_bridge_t* g_bridge = nullptr;
     inline volatile UINT64             g_last_whoswho_tsc = 0;
     inline volatile UINT64             g_last_check_tsc = 0;
@@ -158,6 +185,8 @@ namespace heartbeat {
             return false;
         }
 
+        derive_bridge_key_from_whoswho(whoswho_base);
+
         if (!locate_bridge(whoswho_base, whoswho_size)) {
             SN_LOG("heartbeat::init: FAIL - locate_bridge returned false");
             return false;
@@ -245,8 +274,11 @@ namespace heartbeat {
             return;
 
         __try {
-            _InterlockedExchange((volatile LONG*)&g_bridge->sentinel_cmd_param, (LONG)param);
-            _InterlockedExchange((volatile LONG*)&g_bridge->sentinel_cmd, (LONG)cmd);
+            ULONG enc_cmd = cmd;
+            ULONG enc_param = param;
+            bridge_encrypt_cmd(enc_cmd, enc_param);
+            _InterlockedExchange((volatile LONG*)&g_bridge->sentinel_cmd_param, (LONG)enc_param);
+            _InterlockedExchange((volatile LONG*)&g_bridge->sentinel_cmd, (LONG)enc_cmd);
             SN_LOG("heartbeat::send_command: cmd=%lu param=0x%lx", cmd, param);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             SN_LOG("heartbeat::send_command: EXCEPTION");
@@ -273,10 +305,12 @@ namespace heartbeat {
         __try {
             UINT64 challenge = __rdtsc() ^ (static_cast<UINT64>(__rdtsc()) << 17);
             challenge |= 1;
+            UINT64 enc_challenge = challenge;
+            bridge_encrypt_challenge(enc_challenge);
             InterlockedExchange64(
                 const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
                     &g_bridge->sentinel_challenge)),
-                static_cast<LONG64>(challenge));
+                static_cast<LONG64>(enc_challenge));
             InterlockedExchange64(
                 const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
                     &g_bridge->whoswho_response)),

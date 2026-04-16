@@ -48,6 +48,43 @@ namespace sentinel_bridge {
 
     constexpr UINT64 CHALLENGE_HMAC_KEY = 0x7A3F1D9E5BC82A46ULL;
 
+    inline volatile UINT64 g_bridge_crypt_key = 0;
+
+    __forceinline UINT64 derive_bridge_key() {
+        int cpu[4] = {};
+        __cpuid(cpu, 1);
+        UINT64 k = static_cast<UINT64>(cpu[0]) ^ (static_cast<UINT64>(cpu[2]) << 32);
+        __cpuid(cpu, 0x80000001);
+        k ^= static_cast<UINT64>(cpu[0]) ^ (static_cast<UINT64>(cpu[3]) << 16);
+        k ^= k >> 33;
+        k *= 0xFF51AFD7ED558CCDULL;
+        k ^= k >> 33;
+        k *= 0xC4CEB9FE1A85EC53ULL;
+        k ^= k >> 33;
+        return k;
+    }
+
+    __forceinline void bridge_encrypt_cmd(ULONG& cmd, ULONG& param) {
+        UINT64 key = g_bridge_crypt_key;
+        cmd   ^= static_cast<ULONG>(key & 0xFFFFFFFF);
+        param ^= static_cast<ULONG>(key >> 32);
+    }
+
+    __forceinline void bridge_decrypt_cmd(ULONG raw_cmd, ULONG raw_param,
+                                          ULONG& cmd, ULONG& param) {
+        UINT64 key = g_bridge_crypt_key;
+        cmd   = raw_cmd   ^ static_cast<ULONG>(key & 0xFFFFFFFF);
+        param = raw_param ^ static_cast<ULONG>(key >> 32);
+    }
+
+    __forceinline void bridge_encrypt_challenge(UINT64& challenge) {
+        challenge ^= _rotr64(g_bridge_crypt_key, 17);
+    }
+
+    __forceinline void bridge_decrypt_challenge(UINT64 raw, UINT64& challenge) {
+        challenge = raw ^ _rotr64(g_bridge_crypt_key, 17);
+    }
+
 
     constexpr LONG WATCHDOG_PERIOD_MS    = 10000;
     constexpr LONG GRACE_PERIOD_MS       = 90000;
@@ -75,7 +112,9 @@ namespace sentinel_bridge {
         LONG64 tsc = static_cast<LONG64>(__rdtsc());
         _InterlockedExchange64(&g_bridge.whoswho_tsc, tsc);
 
-        UINT64 challenge = g_bridge.sentinel_challenge;
+        UINT64 raw_challenge = g_bridge.sentinel_challenge;
+        UINT64 challenge = 0;
+        bridge_decrypt_challenge(raw_challenge, challenge);
         if (challenge != 0 && g_bridge.whoswho_response == 0) {
             UINT64 response = compute_challenge_response(challenge);
             InterlockedExchange64(
@@ -130,9 +169,11 @@ namespace sentinel_bridge {
             WW_LOG("watchdog_dpc: Sentinel ALIVE, tsc changed from %lld to %lld",
                 last, current_sentinel_tsc);
 
-            ULONG cmd = _InterlockedExchange((volatile LONG*)&g_bridge.sentinel_cmd, BRIDGE_CMD_NONE);
+            ULONG raw_cmd = _InterlockedExchange((volatile LONG*)&g_bridge.sentinel_cmd, BRIDGE_CMD_NONE);
+            ULONG raw_param = _InterlockedExchange((volatile LONG*)&g_bridge.sentinel_cmd_param, 0);
+            ULONG cmd = 0, param = 0;
+            bridge_decrypt_cmd(raw_cmd, raw_param, cmd, param);
             if (cmd != BRIDGE_CMD_NONE) {
-                ULONG param = _InterlockedExchange((volatile LONG*)&g_bridge.sentinel_cmd_param, 0);
                 WW_LOG("watchdog_dpc: Sentinel command=%lu param=0x%lx", cmd, param);
 
                 if (cmd == BRIDGE_CMD_DEBUGGER_FOUND || cmd == BRIDGE_CMD_DUMP_TOOL_FOUND ||
@@ -169,6 +210,7 @@ namespace sentinel_bridge {
 
 
     __forceinline void init(PVOID text_base, ULONG text_size) {
+        g_bridge_crypt_key = derive_bridge_key();
         g_bridge.code_base = text_base;
         g_bridge.code_size = text_size;
         WW_LOG("bridge::init: code_base=%p code_size=0x%lx bridge_addr=%p magic=0x%lx version=%lu",

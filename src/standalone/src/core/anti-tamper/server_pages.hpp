@@ -515,7 +515,7 @@ inline void advance_epoch(uint64_t new_epoch)
     if (new_epoch != old_epoch)
     {
         evict_all();
-        webhook::write_log("server_pages", "epoch_advanced_" + std::to_string(new_epoch));
+        webhook::write_log("server_pages", ("epoch_advanced_" + std::to_string(new_epoch)).c_str());
     }
 }
 
