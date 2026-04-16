@@ -59,7 +59,17 @@ namespace object_guard {
 
             const char* dump_tools[] = {
                 "procdump", "processdump", "hollowshunt",
-                "pe-sieve", "scylla", "taskdmp", "minidump"
+                "pe-sieve", "scylla", "taskdmp", "minidump",
+                "dumper", "processhacker", "x64dbg", "x32dbg",
+                "windbg", "ida", "ida64", "idaq", "idaq64",
+                "ghidra", "binaryninja", "dnspy", "ilspy",
+                "cheatengine", "ce.exe", "apimonitor",
+                "ollydbg", "reshack", "pestudio", "radare2",
+                "cutter", "hyperdbg", "reclass", "classinfo",
+                "sigmaker", "peid", "die.exe", "titanhide",
+                "scyllahide", "volatility", "rekall",
+                "vmmap.exe", "apispy", "procmon", "rweverything",
+                "pcihunter", "pchunter", "winobj", "kerneldetect"
             };
             constexpr int num_tools = sizeof(dump_tools) / sizeof(dump_tools[0]);
 

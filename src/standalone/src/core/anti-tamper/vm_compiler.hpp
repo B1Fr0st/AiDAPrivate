@@ -7,6 +7,11 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include <unordered_map>
+
+#ifdef AIDA_STANDALONE
+#include <Zydis/Zydis.h>
+#endif
 
 #include "virtualizer.hpp"
 
@@ -618,6 +623,487 @@ namespace vm_compiler {
 
         return prog.finalize();
     }
+
+#ifdef AIDA_STANDALONE
+namespace x86_lifter {
+
+    static constexpr uint8_t VREG_RAX = 0;
+    static constexpr uint8_t VREG_RCX = 1;
+    static constexpr uint8_t VREG_RDX = 2;
+    static constexpr uint8_t VREG_RBX = 3;
+    static constexpr uint8_t VREG_RSP = 4;
+    static constexpr uint8_t VREG_RBP = 5;
+    static constexpr uint8_t VREG_RSI = 6;
+    static constexpr uint8_t VREG_RDI = 7;
+    static constexpr uint8_t VREG_R8  = 8;
+    static constexpr uint8_t VREG_R9  = 9;
+    static constexpr uint8_t VREG_SCRATCH0 = 10;
+    static constexpr uint8_t VREG_SCRATCH1 = 11;
+    static constexpr uint8_t VREG_SCRATCH2 = 12;
+    static constexpr uint8_t VREG_SCRATCH3 = 13;
+    static constexpr uint8_t VREG_KEY0     = 14;
+    static constexpr uint8_t VREG_KEY1     = 15;
+
+    inline uint8_t zydis_reg_to_vreg(ZydisRegister reg)
+    {
+        switch (reg) {
+        case ZYDIS_REGISTER_RAX: case ZYDIS_REGISTER_EAX: case ZYDIS_REGISTER_AX:
+        case ZYDIS_REGISTER_AL:  case ZYDIS_REGISTER_AH:  return VREG_RAX;
+        case ZYDIS_REGISTER_RCX: case ZYDIS_REGISTER_ECX: case ZYDIS_REGISTER_CX:
+        case ZYDIS_REGISTER_CL:  case ZYDIS_REGISTER_CH:  return VREG_RCX;
+        case ZYDIS_REGISTER_RDX: case ZYDIS_REGISTER_EDX: case ZYDIS_REGISTER_DX:
+        case ZYDIS_REGISTER_DL:  case ZYDIS_REGISTER_DH:  return VREG_RDX;
+        case ZYDIS_REGISTER_RBX: case ZYDIS_REGISTER_EBX: case ZYDIS_REGISTER_BX:
+        case ZYDIS_REGISTER_BL:  case ZYDIS_REGISTER_BH:  return VREG_RBX;
+        case ZYDIS_REGISTER_RSP: case ZYDIS_REGISTER_ESP: return VREG_RSP;
+        case ZYDIS_REGISTER_RBP: case ZYDIS_REGISTER_EBP: return VREG_RBP;
+        case ZYDIS_REGISTER_RSI: case ZYDIS_REGISTER_ESI: return VREG_RSI;
+        case ZYDIS_REGISTER_RDI: case ZYDIS_REGISTER_EDI: return VREG_RDI;
+        case ZYDIS_REGISTER_R8:  case ZYDIS_REGISTER_R8D: return VREG_R8;
+        case ZYDIS_REGISTER_R9:  case ZYDIS_REGISTER_R9D: return VREG_R9;
+        default: return VREG_SCRATCH0;
+        }
+    }
+
+    struct native_exit_t
+    {
+        uint64_t addr;
+        uint32_t length;
+    };
+
+    struct lifted_result_t
+    {
+        std::vector<uint8_t> bytecode;
+        std::vector<native_exit_t> native_exits;
+        uint32_t total_lifted;
+        uint32_t total_native;
+    };
+
+    inline bool is_liftable(const ZydisDecodedInstruction& instr,
+                            const ZydisDecodedOperand* ops)
+    {
+        switch (instr.mnemonic) {
+        case ZYDIS_MNEMONIC_MOV:
+        case ZYDIS_MNEMONIC_ADD:
+        case ZYDIS_MNEMONIC_SUB:
+        case ZYDIS_MNEMONIC_XOR:
+        case ZYDIS_MNEMONIC_AND:
+        case ZYDIS_MNEMONIC_OR:
+        case ZYDIS_MNEMONIC_NOT:
+        case ZYDIS_MNEMONIC_NEG:
+        case ZYDIS_MNEMONIC_SHL:
+        case ZYDIS_MNEMONIC_SHR:
+        case ZYDIS_MNEMONIC_ROL:
+        case ZYDIS_MNEMONIC_ROR:
+        case ZYDIS_MNEMONIC_CMP:
+        case ZYDIS_MNEMONIC_TEST:
+        case ZYDIS_MNEMONIC_PUSH:
+        case ZYDIS_MNEMONIC_POP:
+        case ZYDIS_MNEMONIC_NOP:
+        case ZYDIS_MNEMONIC_LEA:
+        case ZYDIS_MNEMONIC_INC:
+        case ZYDIS_MNEMONIC_DEC:
+        case ZYDIS_MNEMONIC_JB:
+        case ZYDIS_MNEMONIC_JBE:
+        case ZYDIS_MNEMONIC_JL:
+        case ZYDIS_MNEMONIC_JLE:
+        case ZYDIS_MNEMONIC_JNB:
+        case ZYDIS_MNEMONIC_JNBE:
+        case ZYDIS_MNEMONIC_JNL:
+        case ZYDIS_MNEMONIC_JNLE:
+        case ZYDIS_MNEMONIC_JNZ:
+        case ZYDIS_MNEMONIC_JZ:
+        case ZYDIS_MNEMONIC_JMP:
+        case ZYDIS_MNEMONIC_RET:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    inline bool is_branch_mnemonic(ZydisMnemonic m)
+    {
+        return m == ZYDIS_MNEMONIC_JB  || m == ZYDIS_MNEMONIC_JBE ||
+               m == ZYDIS_MNEMONIC_JL  || m == ZYDIS_MNEMONIC_JLE ||
+               m == ZYDIS_MNEMONIC_JNB || m == ZYDIS_MNEMONIC_JNBE ||
+               m == ZYDIS_MNEMONIC_JNL || m == ZYDIS_MNEMONIC_JNLE ||
+               m == ZYDIS_MNEMONIC_JNZ || m == ZYDIS_MNEMONIC_JZ ||
+               m == ZYDIS_MNEMONIC_JMP;
+    }
+
+    inline void lift_reg_reg(program_t& prog, ZydisMnemonic m,
+                             uint8_t dst_vreg, uint8_t src_vreg)
+    {
+        switch (m) {
+        case ZYDIS_MNEMONIC_MOV:
+            prog.emit_load_reg(dst_vreg, src_vreg);
+            break;
+        case ZYDIS_MNEMONIC_ADD:
+            prog.emit_add(dst_vreg, dst_vreg, src_vreg);
+            break;
+        case ZYDIS_MNEMONIC_SUB:
+            prog.emit_sub(dst_vreg, dst_vreg, src_vreg);
+            break;
+        case ZYDIS_MNEMONIC_XOR:
+            prog.emit_xor(dst_vreg, dst_vreg, src_vreg);
+            break;
+        case ZYDIS_MNEMONIC_AND:
+            prog.emit_nand(dst_vreg, dst_vreg, src_vreg);
+            prog.emit_not(dst_vreg, dst_vreg);
+            break;
+        case ZYDIS_MNEMONIC_OR:
+            prog.emit_nor(dst_vreg, dst_vreg, src_vreg);
+            prog.emit_not(dst_vreg, dst_vreg);
+            break;
+        case ZYDIS_MNEMONIC_CMP:
+        case ZYDIS_MNEMONIC_TEST:
+            prog.emit_cmp(dst_vreg, src_vreg);
+            break;
+        default:
+            break;
+        }
+    }
+
+    inline void lift_reg_imm(program_t& prog, ZydisMnemonic m,
+                             uint8_t dst_vreg, uint64_t imm)
+    {
+        prog.emit_load_imm(VREG_SCRATCH0, imm);
+        lift_reg_reg(prog, m, dst_vreg, VREG_SCRATCH0);
+    }
+
+    inline lifted_result_t compile_function(const uint8_t* code, size_t code_len,
+                                            uint64_t base_addr, uint64_t initial_key,
+                                            const uint8_t opcode_map[256])
+    {
+        lifted_result_t result{};
+        result.total_lifted = 0;
+        result.total_native = 0;
+
+        program_t prog;
+        prog.set_key(initial_key);
+        prog.set_opcode_map(opcode_map);
+
+        ZydisDecoder decoder;
+        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+
+        struct instr_info_t {
+            ZydisDecodedInstruction instr;
+            ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT];
+            uint64_t                addr;
+            uint8_t                 raw[16];
+            uint8_t                 length;
+        };
+
+        std::vector<instr_info_t> decoded;
+        uint64_t offset = 0;
+
+        while (offset < code_len) {
+            instr_info_t info{};
+            info.addr = base_addr + offset;
+            auto status = ZydisDecoderDecodeFull(
+                &decoder, code + offset, code_len - offset,
+                &info.instr, info.ops);
+            if (!ZYAN_SUCCESS(status)) break;
+            info.length = static_cast<uint8_t>(info.instr.length);
+            memcpy(info.raw, code + offset, info.length);
+            decoded.push_back(info);
+            offset += info.length;
+
+            if (info.instr.mnemonic == ZYDIS_MNEMONIC_RET ||
+                info.instr.mnemonic == ZYDIS_MNEMONIC_INT3)
+                break;
+        }
+
+        std::unordered_map<uint64_t, uint32_t> addr_to_label;
+        for (auto& di : decoded) {
+            if (is_branch_mnemonic(di.instr.mnemonic)) {
+                for (int i = 0; i < di.instr.operand_count; ++i) {
+                    if (di.ops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                        uint64_t target = di.addr + di.length;
+                        if (di.ops[i].imm.is_relative)
+                            target += di.ops[i].imm.value.s;
+                        else
+                            target = di.ops[i].imm.value.u;
+
+                        if (addr_to_label.find(target) == addr_to_label.end())
+                            addr_to_label[target] = prog.create_label();
+                    }
+                }
+            }
+        }
+
+        prog.emit_vm_enter();
+        prog.emit_junk(2);
+
+        for (size_t idx = 0; idx < decoded.size(); ++idx) {
+            auto& di = decoded[idx];
+
+            auto lbl_it = addr_to_label.find(di.addr);
+            if (lbl_it != addr_to_label.end())
+                prog.bind_label(lbl_it->second);
+
+            if (!is_liftable(di.instr, di.ops)) {
+                native_exit_t ne;
+                ne.addr = di.addr;
+                ne.length = di.length;
+                result.native_exits.push_back(ne);
+                result.total_native++;
+
+                prog.emit_vm_exit();
+                prog.emit_load_imm(VREG_SCRATCH2, di.addr);
+                prog.emit_vm_enter();
+                prog.emit_junk(1);
+                continue;
+            }
+
+            result.total_lifted++;
+
+            if (di.instr.mnemonic == ZYDIS_MNEMONIC_NOP) {
+                prog.emit_nop();
+                continue;
+            }
+
+            if (di.instr.mnemonic == ZYDIS_MNEMONIC_RET) {
+                prog.emit_vm_exit();
+                prog.emit_halt();
+                continue;
+            }
+
+            if (is_branch_mnemonic(di.instr.mnemonic)) {
+                uint64_t target = di.addr + di.length;
+                for (int i = 0; i < di.instr.operand_count; ++i) {
+                    if (di.ops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                        if (di.ops[i].imm.is_relative)
+                            target = di.addr + di.length + di.ops[i].imm.value.s;
+                        else
+                            target = di.ops[i].imm.value.u;
+                        break;
+                    }
+                }
+
+                auto tgt_it = addr_to_label.find(target);
+                if (tgt_it == addr_to_label.end()) {
+                    prog.emit_vm_exit();
+                    prog.emit_load_imm(VREG_SCRATCH2, target);
+                    result.total_native++;
+                    continue;
+                }
+
+                if (di.instr.mnemonic == ZYDIS_MNEMONIC_JMP) {
+                    prog.emit_jmp_label(tgt_it->second);
+                } else if (di.instr.mnemonic == ZYDIS_MNEMONIC_JZ) {
+                    prog.emit_jz_label(tgt_it->second);
+                } else if (di.instr.mnemonic == ZYDIS_MNEMONIC_JNZ) {
+                    prog.emit_jnz_label(tgt_it->second);
+                } else {
+                    prog.emit_vm_exit();
+                    prog.emit_load_imm(VREG_SCRATCH2, target);
+                    result.total_native++;
+                }
+                continue;
+            }
+
+            if (di.instr.mnemonic == ZYDIS_MNEMONIC_PUSH) {
+                if (di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    prog.emit_push(zydis_reg_to_vreg(di.ops[0].reg.value));
+                } else if (di.ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                    prog.emit_load_imm(VREG_SCRATCH0, di.ops[0].imm.value.u);
+                    prog.emit_push(VREG_SCRATCH0);
+                }
+                continue;
+            }
+
+            if (di.instr.mnemonic == ZYDIS_MNEMONIC_POP) {
+                if (di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    prog.emit_pop(zydis_reg_to_vreg(di.ops[0].reg.value));
+                }
+                continue;
+            }
+
+            if (di.instr.mnemonic == ZYDIS_MNEMONIC_NOT) {
+                if (di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    uint8_t r = zydis_reg_to_vreg(di.ops[0].reg.value);
+                    prog.emit_not(r, r);
+                }
+                continue;
+            }
+
+            if (di.instr.mnemonic == ZYDIS_MNEMONIC_NEG) {
+                if (di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    uint8_t r = zydis_reg_to_vreg(di.ops[0].reg.value);
+                    prog.emit_not(r, r);
+                    prog.emit_load_imm(VREG_SCRATCH0, 1);
+                    prog.emit_add(r, r, VREG_SCRATCH0);
+                }
+                continue;
+            }
+
+            if (di.instr.mnemonic == ZYDIS_MNEMONIC_INC) {
+                if (di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    uint8_t r = zydis_reg_to_vreg(di.ops[0].reg.value);
+                    prog.emit_load_imm(VREG_SCRATCH0, 1);
+                    prog.emit_add(r, r, VREG_SCRATCH0);
+                }
+                continue;
+            }
+
+            if (di.instr.mnemonic == ZYDIS_MNEMONIC_DEC) {
+                if (di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    uint8_t r = zydis_reg_to_vreg(di.ops[0].reg.value);
+                    prog.emit_load_imm(VREG_SCRATCH0, 1);
+                    prog.emit_sub(r, r, VREG_SCRATCH0);
+                }
+                continue;
+            }
+
+            if (di.instr.mnemonic == ZYDIS_MNEMONIC_LEA) {
+                if (di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                    di.ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                    uint8_t dst = zydis_reg_to_vreg(di.ops[0].reg.value);
+                    if (di.ops[1].mem.base == ZYDIS_REGISTER_RIP) {
+                        uint64_t lea_target = di.addr + di.length +
+                            static_cast<int64_t>(di.ops[1].mem.disp.value);
+                        prog.emit_load_imm(dst, lea_target);
+                    } else {
+                        uint8_t base_reg = zydis_reg_to_vreg(di.ops[1].mem.base);
+                        prog.emit_load_reg(dst, base_reg);
+                        if (di.ops[1].mem.disp.has_displacement && di.ops[1].mem.disp.value != 0) {
+                            int64_t disp = di.ops[1].mem.disp.value;
+                            prog.emit_load_imm(VREG_SCRATCH1, static_cast<uint64_t>(disp));
+                            prog.emit_add(dst, dst, VREG_SCRATCH1);
+                        }
+                        if (di.ops[1].mem.index != ZYDIS_REGISTER_NONE) {
+                            uint8_t idx_reg = zydis_reg_to_vreg(di.ops[1].mem.index);
+                            uint8_t scale = di.ops[1].mem.scale;
+                            if (scale > 1) {
+                                prog.emit_load_imm(VREG_SCRATCH1, scale);
+                                prog.emit_load_reg(VREG_SCRATCH2, idx_reg);
+                                uint8_t shift_bits = 0;
+                                if (scale == 2) shift_bits = 1;
+                                else if (scale == 4) shift_bits = 2;
+                                else if (scale == 8) shift_bits = 3;
+                                prog.emit_load_imm(VREG_SCRATCH3, shift_bits);
+                                prog.emit_shl(VREG_SCRATCH2, VREG_SCRATCH2, VREG_SCRATCH3);
+                                prog.emit_add(dst, dst, VREG_SCRATCH2);
+                            } else {
+                                prog.emit_add(dst, dst, idx_reg);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (di.instr.mnemonic == ZYDIS_MNEMONIC_SHL ||
+                di.instr.mnemonic == ZYDIS_MNEMONIC_SHR ||
+                di.instr.mnemonic == ZYDIS_MNEMONIC_ROL ||
+                di.instr.mnemonic == ZYDIS_MNEMONIC_ROR) {
+                if (di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    uint8_t dst = zydis_reg_to_vreg(di.ops[0].reg.value);
+                    uint8_t amount = VREG_SCRATCH0;
+                    if (di.ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                        prog.emit_load_imm(VREG_SCRATCH0, di.ops[1].imm.value.u & 0x3F);
+                    } else if (di.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                        amount = zydis_reg_to_vreg(di.ops[1].reg.value);
+                    }
+                    switch (di.instr.mnemonic) {
+                    case ZYDIS_MNEMONIC_SHL: prog.emit_shl(dst, dst, amount); break;
+                    case ZYDIS_MNEMONIC_SHR: prog.emit_shr(dst, dst, amount); break;
+                    case ZYDIS_MNEMONIC_ROL: prog.emit_rol(dst, dst, amount); break;
+                    case ZYDIS_MNEMONIC_ROR: prog.emit_ror(dst, dst, amount); break;
+                    default: break;
+                    }
+                }
+                continue;
+            }
+
+            if (di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                di.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                lift_reg_reg(prog, di.instr.mnemonic,
+                    zydis_reg_to_vreg(di.ops[0].reg.value),
+                    zydis_reg_to_vreg(di.ops[1].reg.value));
+                continue;
+            }
+
+            if (di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                di.ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                lift_reg_imm(prog, di.instr.mnemonic,
+                    zydis_reg_to_vreg(di.ops[0].reg.value),
+                    di.ops[1].imm.value.u);
+                continue;
+            }
+
+            if (di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                di.ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                uint8_t dst = zydis_reg_to_vreg(di.ops[0].reg.value);
+                if (di.ops[1].mem.base == ZYDIS_REGISTER_RIP) {
+                    uint64_t mem_addr = di.addr + di.length +
+                        static_cast<int64_t>(di.ops[1].mem.disp.value);
+                    prog.emit_load_imm(VREG_SCRATCH0, mem_addr);
+                } else {
+                    uint8_t base_reg = zydis_reg_to_vreg(di.ops[1].mem.base);
+                    prog.emit_load_reg(VREG_SCRATCH0, base_reg);
+                    if (di.ops[1].mem.disp.has_displacement && di.ops[1].mem.disp.value != 0) {
+                        prog.emit_load_imm(VREG_SCRATCH1, static_cast<uint64_t>(di.ops[1].mem.disp.value));
+                        prog.emit_add(VREG_SCRATCH0, VREG_SCRATCH0, VREG_SCRATCH1);
+                    }
+                }
+                if (di.instr.mnemonic == ZYDIS_MNEMONIC_MOV) {
+                    prog.emit_load_mem(dst, VREG_SCRATCH0);
+                } else {
+                    prog.emit_load_mem(VREG_SCRATCH1, VREG_SCRATCH0);
+                    lift_reg_reg(prog, di.instr.mnemonic, dst, VREG_SCRATCH1);
+                }
+                continue;
+            }
+
+            if (di.ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                di.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                uint8_t src = zydis_reg_to_vreg(di.ops[1].reg.value);
+                if (di.ops[0].mem.base == ZYDIS_REGISTER_RIP) {
+                    uint64_t mem_addr = di.addr + di.length +
+                        static_cast<int64_t>(di.ops[0].mem.disp.value);
+                    prog.emit_load_imm(VREG_SCRATCH0, mem_addr);
+                } else {
+                    uint8_t base_reg = zydis_reg_to_vreg(di.ops[0].mem.base);
+                    prog.emit_load_reg(VREG_SCRATCH0, base_reg);
+                    if (di.ops[0].mem.disp.has_displacement && di.ops[0].mem.disp.value != 0) {
+                        prog.emit_load_imm(VREG_SCRATCH1, static_cast<uint64_t>(di.ops[0].mem.disp.value));
+                        prog.emit_add(VREG_SCRATCH0, VREG_SCRATCH0, VREG_SCRATCH1);
+                    }
+                }
+                if (di.instr.mnemonic == ZYDIS_MNEMONIC_MOV) {
+                    prog.emit_store_mem(VREG_SCRATCH0, src);
+                } else {
+                    prog.emit_load_mem(VREG_SCRATCH1, VREG_SCRATCH0);
+                    lift_reg_reg(prog, di.instr.mnemonic, VREG_SCRATCH1, src);
+                    prog.emit_store_mem(VREG_SCRATCH0, VREG_SCRATCH1);
+                }
+                continue;
+            }
+
+            native_exit_t ne;
+            ne.addr = di.addr;
+            ne.length = di.length;
+            result.native_exits.push_back(ne);
+            result.total_native++;
+            prog.emit_vm_exit();
+            prog.emit_load_imm(VREG_SCRATCH2, di.addr);
+            prog.emit_vm_enter();
+        }
+
+        if (decoded.empty() || decoded.back().instr.mnemonic != ZYDIS_MNEMONIC_RET) {
+            prog.emit_vm_exit();
+            prog.emit_halt();
+        }
+
+        prog.emit_junk(3);
+        result.bytecode = prog.finalize();
+        return result;
+    }
+
+}
+#endif
 
 }
 }

@@ -10,6 +10,7 @@
 #include <wmmintrin.h>
 #include <nmmintrin.h>
 #include <winhttp.h>
+#include <bcrypt.h>
 
 #include "anti-tamper/cff.hpp"
 #include "obfuscation.hpp"
@@ -21,6 +22,8 @@
 #include <mutex>
 #include <string>
 #include <vector>
+
+#pragma comment(lib, "bcrypt.lib")
 
 namespace arc_internal
 {
@@ -159,50 +162,64 @@ bool aes_gcm_decrypt_ni(const uint8_t* ct, size_t ct_len,
     const uint8_t* key32, const uint8_t* iv12, const uint8_t* tag16,
     uint8_t* pt)
 {
-    __m128i aes_key_lo = _mm_loadu_si128(reinterpret_cast<const __m128i*>(key32));
-    __m128i aes_key_hi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(key32 + 16));
+    if (!ct || !key32 || !iv12 || !tag16 || !pt) return false;
+    if (ct_len > 0xFFFFFFFFu) return false;
 
-    __m128i rk_lo[11], rk_hi[11];
-    aes_128_expand_key(aes_key_lo, rk_lo);
-    aes_128_expand_key(aes_key_hi, rk_hi);
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_KEY_HANDLE hKey = nullptr;
 
-    alignas(16) uint8_t j0[16] = {};
-    memcpy(j0, iv12, 12);
-    j0[15] = 1;
+    NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(st) || !hAlg) return false;
 
-    __m128i j0_block = _mm_loadu_si128(reinterpret_cast<const __m128i*>(j0));
-
-    alignas(16) uint8_t ctr_buf[16];
-    memcpy(ctr_buf, j0, 16);
-
-    size_t offset = 0;
-    while (offset < ct_len)
+    st = BCryptSetProperty(
+        hAlg,
+        BCRYPT_CHAINING_MODE,
+        reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+        static_cast<ULONG>(wcslen(BCRYPT_CHAIN_MODE_GCM) * sizeof(wchar_t) + sizeof(wchar_t)),
+        0);
+    if (!BCRYPT_SUCCESS(st))
     {
-        uint32_t ctr_val;
-        memcpy(&ctr_val, ctr_buf + 12, 4);
-        ctr_val = _byteswap_ulong(_byteswap_ulong(ctr_val) + 1);
-        memcpy(ctr_buf + 12, &ctr_val, 4);
-
-        __m128i ctr_block = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ctr_buf));
-        __m128i ks = aes_encrypt_block(ctr_block, rk_lo);
-
-        size_t chunk = ct_len - offset;
-        if (chunk > 16) chunk = 16;
-
-        alignas(16) uint8_t tmp[16] = {};
-        memcpy(tmp, ct + offset, chunk);
-        __m128i ct_block = _mm_loadu_si128(reinterpret_cast<const __m128i*>(tmp));
-        __m128i pt_block = _mm_xor_si128(ct_block, ks);
-
-        alignas(16) uint8_t out[16];
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(out), pt_block);
-        memcpy(pt + offset, out, chunk);
-        offset += chunk;
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
     }
 
-    SecureZeroMemory(rk_lo, sizeof(rk_lo));
-    SecureZeroMemory(rk_hi, sizeof(rk_hi));
-    return true;
+    st = BCryptGenerateSymmetricKey(
+        hAlg,
+        &hKey,
+        nullptr,
+        0,
+        const_cast<PUCHAR>(key32),
+        32,
+        0);
+    if (!BCRYPT_SUCCESS(st) || !hKey)
+    {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
+    BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
+    authInfo.pbNonce = const_cast<PUCHAR>(iv12);
+    authInfo.cbNonce = 12;
+    authInfo.pbTag = const_cast<PUCHAR>(tag16);
+    authInfo.cbTag = 16;
+
+    ULONG bytes_decrypted = 0;
+    st = BCryptDecrypt(
+        hKey,
+        const_cast<PUCHAR>(ct),
+        static_cast<ULONG>(ct_len),
+        &authInfo,
+        nullptr,
+        0,
+        pt,
+        static_cast<ULONG>(ct_len),
+        &bytes_decrypted,
+        0);
+
+    BCryptDestroyKey(hKey);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return BCRYPT_SUCCESS(st) && bytes_decrypted == static_cast<ULONG>(ct_len);
 }
 
 void* peb_find_module(uint64_t name_hash)
@@ -861,6 +878,42 @@ uint64_t vtable_remote_call(
     return dev->call_function(function_address, arg1, arg2, arg3, arg4);
 }
 
+uint64_t g_vtable_slot_keys[16] = {};
+
+__forceinline void generate_slot_keys(uint64_t master)
+{
+    uint64_t state = master ^ 0x517CC1B727220A95ULL;
+    for (int i = 0; i < 16; ++i) {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        g_vtable_slot_keys[i] = state * 0x2545F4914F6CDD1DULL;
+    }
+}
+
+__forceinline void encrypt_vtable_slots()
+{
+    uintptr_t* slots = reinterpret_cast<uintptr_t*>(&g_vtable);
+    for (int i = 0; i < 16; ++i) {
+        if (slots[i] != 0) {
+            slots[i] ^= static_cast<uintptr_t>(g_vtable_slot_keys[i]);
+            slots[i] = _rotl64(slots[i], static_cast<int>(g_vtable_slot_keys[i] & 0x3F));
+        }
+    }
+}
+
+__forceinline void decrypt_vtable_into(arc_comm_vtable_t* out)
+{
+    memcpy(out, &g_vtable, sizeof(arc_comm_vtable_t));
+    uintptr_t* slots = reinterpret_cast<uintptr_t*>(out);
+    for (int i = 0; i < 16; ++i) {
+        if (slots[i] != 0) {
+            slots[i] = _rotr64(slots[i], static_cast<int>(g_vtable_slot_keys[i] & 0x3F));
+            slots[i] ^= static_cast<uintptr_t>(g_vtable_slot_keys[i]);
+        }
+    }
+}
+
 void init_vtable(uint64_t crypt_key)
 {
     g_vtable_crypt_key = crypt_key;
@@ -883,8 +936,12 @@ void init_vtable(uint64_t crypt_key)
     g_vtable.enumerate_threads        = vtable_enumerate_threads;
     g_vtable.remote_call              = vtable_remote_call;
     memset(g_vtable._reserved, 0, sizeof(g_vtable._reserved));
-    g_vtable_ready = true;
     g_vtable_integrity = compute_vtable_integrity();
+
+    generate_slot_keys(crypt_key);
+    encrypt_vtable_slots();
+
+    g_vtable_ready = true;
 }
 
 }
@@ -1006,12 +1063,15 @@ ARC_API bool arc_init(
     return result;
 }
 
+static thread_local arc_comm_vtable_t g_vtable_decrypted = {};
+
 ARC_API const arc_comm_vtable_t* arc_get_comm_bridge()
 {
     using namespace arc_internal;
     if (!is_session_valid()) return nullptr;
     if (!g_vtable_ready) return nullptr;
-    return &g_vtable;
+    decrypt_vtable_into(&g_vtable_decrypted);
+    return &g_vtable_decrypted;
 }
 
 ARC_API uint64_t arc_validate_tool_exec(
@@ -1317,6 +1377,64 @@ namespace {
         std::lock_guard<std::mutex> lk(g_session_mtx);
         session_data_t sess = {};
         if (!load_session(sess)) { SecureZeroMemory(out_key, 32); return; }
+
+        std::string master_secret;
+        char* env_val = nullptr;
+        size_t env_len = 0;
+        if (_dupenv_s(&env_val, &env_len, "ARC_MASTER_SECRET") == 0 && env_val)
+        {
+            master_secret.assign(env_val);
+            free(env_val);
+        }
+
+        if (master_secret.size() >= 32)
+        {
+            std::string data = "page|" + std::to_string(page_index) + "|"
+                + std::string(sess.session_token) + "|"
+                + std::string(sess.hwid) + "|"
+                + std::to_string(static_cast<int64_t>(sess.init_timestamp)) + "|";
+
+            BCRYPT_ALG_HANDLE hAlg = nullptr;
+            BCRYPT_HASH_HANDLE hHash = nullptr;
+
+            NTSTATUS st = BCryptOpenAlgorithmProvider(
+                &hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+
+            if (BCRYPT_SUCCESS(st) && hAlg)
+            {
+                st = BCryptCreateHash(
+                    hAlg,
+                    &hHash,
+                    nullptr,
+                    0,
+                    reinterpret_cast<PUCHAR>(master_secret.data()),
+                    static_cast<ULONG>(master_secret.size()),
+                    0);
+
+                if (BCRYPT_SUCCESS(st) && hHash)
+                {
+                    st = BCryptHashData(
+                        hHash,
+                        reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())),
+                        static_cast<ULONG>(data.size()),
+                        0);
+
+                    if (BCRYPT_SUCCESS(st))
+                    {
+                        st = BCryptFinishHash(hHash, out_key, 32, 0);
+                    }
+                }
+            }
+
+            if (hHash) BCryptDestroyHash(hHash);
+            if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
+
+            if (BCRYPT_SUCCESS(st))
+            {
+                SecureZeroMemory(&sess, sizeof(sess));
+                return;
+            }
+        }
 
         alignas(16) uint8_t data[32];
         memcpy(data,      &sess.session_hash,    8);

@@ -536,6 +536,8 @@ discovery_done:
             if (nt_base) {
                 bool cb_ok = callback_scanner::init();
                 SN_LOG("init_thread: callback_scanner::init = %d", (int)cb_ok);
+                callback_scanner::init_ob_monitoring();
+                callback_scanner::start_image_load_monitoring();
             }
         }
 

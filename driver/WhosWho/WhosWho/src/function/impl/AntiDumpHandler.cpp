@@ -50,6 +50,14 @@ namespace functions {
                 status = anti_dump_kernel::scan_and_kill_readers(request->pid);
                 break;
 
+            case ADMP_OP_CORRUPT_SECTIONS:
+                status = anti_dump_kernel::corrupt_section_headers(request->pid);
+                break;
+
+            case ADMP_OP_SCRAMBLE_PEB:
+                status = anti_dump_kernel::scramble_peb_loader_data(request->pid);
+                break;
+
             default:
                 status = STATUS_INVALID_PARAMETER;
                 break;

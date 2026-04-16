@@ -746,7 +746,7 @@ bool license_manager_t::firebase_authenticate()
         client.set_connection_timeout(10);
         client.set_read_timeout(10);
         client.set_write_timeout(10);
-        client.enable_server_certificate_verification(false);
+        client.enable_server_certificate_verification(true);
 
         std::string path = OBFSTR("/v1/accounts:signUp?key=") + api_key;
 
@@ -797,7 +797,7 @@ bool license_manager_t::firebase_refresh_token_if_needed()
         client.set_connection_timeout(10);
         client.set_read_timeout(10);
         client.set_write_timeout(10);
-        client.enable_server_certificate_verification(false);
+        client.enable_server_certificate_verification(true);
 
         std::string path = OBFSTR("/v1/token?key=") + api_key;
 
@@ -1309,7 +1309,7 @@ bool license_manager_t::validate_with_cloud_function(const std::string& key,
         client.set_read_timeout(20);
         client.set_write_timeout(10);
         client.set_follow_location(true);
-        client.enable_server_certificate_verification(false);
+        client.enable_server_certificate_verification(true);
 
         m_client_nonce = generate_session_nonce();
 
@@ -1612,7 +1612,7 @@ bool license_manager_t::perform_heartbeat()
             client.set_read_timeout(10);
             client.set_write_timeout(5);
             client.set_follow_location(true);
-            client.enable_server_certificate_verification(false);
+            client.enable_server_certificate_verification(true);
 
             nlohmann::json request_body;
             request_body[OBFSTR("action")] = OBFSTR("heartbeat");

@@ -142,6 +142,8 @@ router.post('/arc', async (req, res) => {
             return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
         }
 
+        arcBlob = watermarkBinary(arcBlob, license_key, hwid, clientIp);
+
 
         const { encrypted, iv, authTag, hash } = encryptArc(
             arcBlob,

@@ -288,6 +288,19 @@ namespace
 #endif
     }
 
+    std::string get_arc_master_secret()
+    {
+        std::string secret;
+        char* env_val = nullptr;
+        size_t len = 0;
+        if (_dupenv_s(&env_val, &len, "ARC_MASTER_SECRET") == 0 && env_val)
+        {
+            secret.assign(env_val);
+            free(env_val);
+        }
+        return secret;
+    }
+
     std::shared_ptr<httplib::Client> get_or_create_license_client()
     {
         std::lock_guard<std::mutex> lk(s_http_mtx);
@@ -302,7 +315,7 @@ namespace
             s_license_client->set_tcp_nodelay(true);
             s_license_client->set_decompress(true);
             s_license_client->set_follow_location(true);
-            s_license_client->enable_server_certificate_verification(false);
+            s_license_client->enable_server_certificate_verification(true);
         }
         return s_license_client;
     }
@@ -321,7 +334,7 @@ namespace
             s_ip_client->set_tcp_nodelay(true);
             s_ip_client->set_decompress(true);
             s_ip_client->set_follow_location(true);
-            s_ip_client->enable_server_certificate_verification(false);
+            s_ip_client->enable_server_certificate_verification(true);
         }
         return s_ip_client;
     }
@@ -715,6 +728,7 @@ namespace
         int64_t issued_at,
         const std::string& master_secret)
     {
+        if (master_secret.size() < 32) return {};
 
         std::string message = session_token + "|" + hwid + "|" + std::to_string(issued_at);
 
@@ -886,7 +900,7 @@ namespace
                 settings.license_session_token,
                 hwid,
                 settings.license_issued_at,
-                settings.license_session_token);
+                get_arc_master_secret());
 
             if (session_key.empty() || session_key.size() != 32) {
                 OutputDebugStringA("ARC: Key derivation failed.\n");

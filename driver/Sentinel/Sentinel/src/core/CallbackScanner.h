@@ -367,4 +367,94 @@ namespace callback_scanner {
         }
         return false;
     }
+
+    inline volatile LONG g_image_notify_active = 0;
+    inline volatile UINT64 g_hostile_driver_loads = 0;
+
+    __forceinline bool is_hostile_driver_name(PUNICODE_STRING image_name) {
+        if (!image_name || !image_name->Buffer || image_name->Length == 0)
+            return false;
+
+        const wchar_t* hostile_drivers[] = {
+            L"dbgv.sys", L"kldbgdrv.sys", L"dbk64.sys",
+            L"virtualKD", L"livekd", L"kdcom.dll",
+            L"syser.sys", L"pchunter", L"kerneldetective",
+            L"windbg", L"kprocesshacker", L"processhacker",
+            L"titanhide", L"scyllahide", L"sharpod",
+            L"hyperdbg", L"DriverMon", L"rwdrv.sys",
+            L"pcileech", L"ftd2xx", L"DumpIt.sys"
+        };
+        constexpr int num_hostile = sizeof(hostile_drivers) / sizeof(hostile_drivers[0]);
+
+        USHORT name_chars = image_name->Length / sizeof(WCHAR);
+        USHORT start_idx = 0;
+        for (USHORT i = name_chars; i > 0; --i) {
+            if (image_name->Buffer[i - 1] == L'\\') {
+                start_idx = i;
+                break;
+            }
+        }
+
+        USHORT filename_len = name_chars - start_idx;
+        const WCHAR* filename = &image_name->Buffer[start_idx];
+
+        for (int h = 0; h < num_hostile; ++h) {
+            const wchar_t* target = hostile_drivers[h];
+            USHORT tlen = 0;
+            while (target[tlen]) tlen++;
+            if (tlen > filename_len) continue;
+
+            bool match = true;
+            for (USHORT c = 0; c < tlen; ++c) {
+                WCHAR a = filename[c];
+                WCHAR b = target[c];
+                if (a >= L'A' && a <= L'Z') a += 32;
+                if (b >= L'A' && b <= L'Z') b += 32;
+                if (a != b) { match = false; break; }
+            }
+            if (match) return true;
+        }
+
+        return false;
+    }
+
+    static VOID image_load_notify_routine(
+        PUNICODE_STRING FullImageName,
+        HANDLE ProcessId,
+        PIMAGE_INFO ImageInfo)
+    {
+        UNREFERENCED_PARAMETER(ImageInfo);
+
+        if (ProcessId != nullptr) return;
+
+        if (!FullImageName || !FullImageName->Buffer) return;
+
+        if (is_hostile_driver_name(FullImageName)) {
+            InterlockedIncrement64((volatile LONG64*)&g_hostile_driver_loads);
+            SN_LOG("callback_scanner: HOSTILE DRIVER LOAD: %wZ", FullImageName);
+            heartbeat::send_command(heartbeat::BRIDGE_CMD_INTEGRITY_FAIL,
+                static_cast<ULONG>(g_hostile_driver_loads & 0xFFFFFFFF));
+        }
+    }
+
+    __forceinline NTSTATUS start_image_load_monitoring() {
+        if (_InterlockedCompareExchange(&g_image_notify_active, 1, 0) != 0)
+            return STATUS_ALREADY_REGISTERED;
+
+        NTSTATUS status = PsSetLoadImageNotifyRoutine(image_load_notify_routine);
+        if (!NT_SUCCESS(status)) {
+            _InterlockedExchange(&g_image_notify_active, 0);
+            SN_LOG("callback_scanner: PsSetLoadImageNotifyRoutine failed 0x%08x", status);
+        } else {
+            SN_LOG("callback_scanner: image load monitoring ACTIVE");
+        }
+        return status;
+    }
+
+    __forceinline void stop_image_load_monitoring() {
+        if (_InterlockedCompareExchange(&g_image_notify_active, 0, 1) != 1)
+            return;
+        PsRemoveLoadImageNotifyRoutine(image_load_notify_routine);
+        SN_LOG("callback_scanner: image load monitoring STOPPED");
+    }
 }

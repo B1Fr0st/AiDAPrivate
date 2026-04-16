@@ -190,6 +190,100 @@ namespace anti_dump_kernel {
     }
 
 
+    inline NTSTATUS corrupt_section_headers(UINT32 pid)
+    {
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        PVOID base = _PsGetProcessSectionBaseAddress(process);
+        if (!base) {
+            ObDereferenceObject(process);
+            return STATUS_NOT_FOUND;
+        }
+
+        KAPC_STATE apc;
+        _KeStackAttachProcess(process, &apc);
+
+        __try {
+            PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+            if (dos->e_magic != 0 && dos->e_magic != IMAGE_DOS_SIGNATURE) {
+                PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((UINT8*)base + dos->e_lfanew);
+                if (_MmIsAddressValid(nt) && nt->Signature == IMAGE_NT_SIGNATURE) {
+                    ULONG old_prot = 0;
+                    SIZE_T sec_offset = (ULONG_PTR)IMAGE_FIRST_SECTION(nt) - (ULONG_PTR)base;
+                    SIZE_T sec_size = nt->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER);
+                    PVOID sec_base = (PVOID)IMAGE_FIRST_SECTION(nt);
+
+                    status = _ZwProtectVirtualMemory(
+                        ZwCurrentProcess(), &sec_base, &sec_size,
+                        PAGE_READWRITE, &old_prot);
+
+                    if (NT_SUCCESS(status)) {
+                        UINT64 tsc = __rdtsc();
+                        UINT8* sec_bytes = (UINT8*)IMAGE_FIRST_SECTION(nt);
+                        for (SIZE_T i = 0; i < sec_size; ++i) {
+                            tsc = tsc * 6364136223846793005ULL + 1442695040888963407ULL;
+                            sec_bytes[i] = (UINT8)(tsc >> 33);
+                        }
+                        _ZwProtectVirtualMemory(
+                            ZwCurrentProcess(), &sec_base, &sec_size,
+                            old_prot, &old_prot);
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        _KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(process);
+        return status;
+    }
+
+    inline NTSTATUS scramble_peb_loader_data(UINT32 pid)
+    {
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        KAPC_STATE apc;
+        _KeStackAttachProcess(process, &apc);
+
+        __try {
+            PVOID peb_raw = _PsGetProcessPeb(process);
+            if (peb_raw && _MmIsAddressValid(peb_raw)) {
+                PVOID ldr = *(PVOID*)((UINT8*)peb_raw + 0x18);
+                if (ldr && _MmIsAddressValid(ldr)) {
+                    PLIST_ENTRY head = (PLIST_ENTRY)((UINT8*)ldr + 0x10);
+                    PLIST_ENTRY entry = head->Flink;
+                    int skip = 0;
+                    for (int iter = 0; iter < 256 && entry && entry != head; ++iter, entry = entry->Flink) {
+                        if (!_MmIsAddressValid(entry)) break;
+                        if (skip++ < 2) continue;
+                        UINT8* ldr_entry = (UINT8*)entry;
+                        PUNICODE_STRING base_name = (PUNICODE_STRING)(ldr_entry + 0x58);
+                        if (_MmIsAddressValid(base_name) &&
+                            base_name->Buffer &&
+                            _MmIsAddressValid(base_name->Buffer) &&
+                            base_name->Length > 0) {
+                            for (USHORT i = 0; i < base_name->Length / sizeof(WCHAR); ++i) {
+                                base_name->Buffer[i] = L'\0';
+                            }
+                        }
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        _KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(process);
+        return status;
+    }
+
+
     inline NTSTATUS full_protect(UINT32 pid)
     {
         NTSTATUS status;
@@ -208,6 +302,9 @@ namespace anti_dump_kernel {
         if (!NT_SUCCESS(status)) {
             WW_LOG("anti_dump: header erase failed 0x%08x", status);
         }
+
+        corrupt_section_headers(pid);
+        scramble_peb_loader_data(pid);
 
         return STATUS_SUCCESS;
     }
@@ -244,7 +341,12 @@ namespace anti_dump_kernel {
                 "dnspy",       "ilspy",       "cheatengine",
                 "ce.exe",      "apimonitor",  "ollydbg",
                 "reshack",     "exeinfope",   "pestudio",
-                "radare2",     "cutter",      "hyperdbg"
+                "radare2",     "cutter",      "hyperdbg",
+                "reclass",     "classinfo",   "hmm.exe",
+                "sigmaker",    "peid",        "die.exe",
+                "titanhide",   "scyllahide",  "sharphound",
+                "volatility",  "rekall",      "vmmap.exe",
+                "apispy",      "wireshark",   "procmon"
             };
             constexpr int num_tools = sizeof(dump_tools) / sizeof(dump_tools[0]);
 
@@ -328,6 +430,14 @@ namespace continuous_anti_dump {
 
         if ((cycle % 10) == 0) {
             anti_dump_kernel::erase_pe_headers(pid);
+        }
+
+        if ((cycle % 7) == 0) {
+            anti_dump_kernel::corrupt_section_headers(pid);
+        }
+
+        if ((cycle % 15) == 0) {
+            anti_dump_kernel::scramble_peb_loader_data(pid);
         }
     }
 

@@ -537,3 +537,48 @@ namespace anti_tamper::decoy {
             (void)_dci_e_##tag;                                                  \
         }                                                                        \
     } while (0)
+
+    inline volatile const char* g_honeypot_strings[] = {
+        "https://api.aida-internal.dev/v3/license/activate",
+        "X-AiDA-Session: %s\r\nX-Proof-Token: %016llx",
+        "AES-256-GCM-SIV",
+        "sk_live_4eC39HqLyjWDarjtT1zdp7dc",
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBg",
+        "HKEY_LOCAL_MACHINE\\SOFTWARE\\AiDA\\LicenseKey",
+        "SELECT hwid, license_key FROM sessions WHERE active=1",
+        "wss://relay.aida-internal.dev/driver-bridge",
+        "X-Driver-Proof: %016llx\r\nX-TSC: %llu",
+        "POST /api/v2/heartbeat HTTP/1.1\r\nHost: license.aida.gg",
+        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJsaWNlbnNl",
+        "Authorization: Bearer %s\r\nX-HWID-Hash: %s",
+        "mutation { revokeUser(hwid: \"%s\") { success } }",
+        "DbgUiRemoteBreakin",
+        "\\Device\\KernelDebugger",
+        "DRIVER_IRQL_NOT_LESS_OR_EQUAL 0xDEAD0003",
+    };
+
+#define DECOY_WEAVE(tag)                                                         \
+    do {                                                                         \
+        constexpr uint64_t _dw_seed_##tag =                                      \
+            (uint64_t)__LINE__ * 0x9E3779B97F4A7C15ULL;                          \
+        if (anti_tamper::decoy::opaque_false(_dw_seed_##tag)) {                  \
+            volatile auto* _hp = anti_tamper::decoy::g_honeypot_strings[         \
+                __LINE__ % 16];                                                  \
+            volatile uint64_t _r1 =                                              \
+                anti_tamper::decoy::decoy_derive_session_key(                    \
+                _dw_seed_##tag,                                                  \
+                anti_tamper::decoy::g_decoy_keys[__LINE__ % 12]);                \
+            volatile uint64_t _r2 =                                              \
+                anti_tamper::decoy::decoy_compute_code_hash(                    \
+                _hp, 32, _r1);                                                   \
+            volatile int _r3 =                                                   \
+                anti_tamper::decoy::decoy_validate_server_token(                \
+                _r2, _dw_seed_##tag ^ __rdtsc());                                \
+            volatile bool _r4 =                                                  \
+                anti_tamper::decoy::decoy_verify_driver_proof(                  \
+                static_cast<uint64_t>(_r3), _r2);                                \
+            anti_tamper::decoy::decoy_xref_vm_pool_verify(                      \
+                _r2, static_cast<uint32_t>(_r3 & 0xFF));                         \
+            (void)_r4;                                                           \
+        }                                                                        \
+    } while (0)

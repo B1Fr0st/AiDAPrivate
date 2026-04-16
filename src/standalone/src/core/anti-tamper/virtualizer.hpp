@@ -874,7 +874,7 @@ namespace detail
         uint64_t val = 0;
         if (addr) memcpy(&val, reinterpret_cast<const void*>(static_cast<uintptr_t>(addr)), 8);
 
-        write_vreg(vm, dst, val ^ (val >> 32) ^ val);
+        write_vreg(vm, dst, val ^ (val >> 32));
         dispatch_next(vm, bc, bc_size);
     }
 
@@ -1537,6 +1537,154 @@ inline uint64_t run_vm_integrity_check()
 inline uint64_t get_expected_hash()
 {
     return integrity_vm::get_checker().expected_result;
+}
+
+
+namespace protection {
+
+    static constexpr uint32_t MAX_PROTECTED = 128;
+
+    struct protected_func_t
+    {
+        uint64_t original_addr;
+        uint32_t original_len;
+        std::vector<uint8_t> bytecode;
+        uint64_t vm_seed;
+        void* trampoline;
+        bool active;
+    };
+
+    struct protection_state_t
+    {
+        protected_func_t entries[MAX_PROTECTED];
+        uint32_t count;
+        void* trampoline_page;
+        uint32_t trampoline_offset;
+        bool initialized;
+    };
+
+    inline protection_state_t& get_state()
+    {
+        static protection_state_t s{};
+        return s;
+    }
+
+    inline bool init_protection()
+    {
+        auto& s = get_state();
+        if (s.initialized) return true;
+        s.trampoline_page = VirtualAlloc(nullptr, 65536,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!s.trampoline_page) return false;
+        s.trampoline_offset = 0;
+        s.count = 0;
+        s.initialized = true;
+        return true;
+    }
+
+    typedef uint64_t(*vm_entry_fn)(uint64_t, uint64_t, uint64_t, uint64_t);
+
+    inline uint64_t vm_trampoline_execute(protected_func_t* entry,
+                                          uint64_t arg0, uint64_t arg1,
+                                          uint64_t arg2, uint64_t arg3)
+    {
+        detail::vm_state_t vm;
+        detail::init_vm(vm, entry->vm_seed);
+        detail::write_vreg(vm, 0, arg0);
+        detail::write_vreg(vm, 1, arg1);
+        detail::write_vreg(vm, 2, arg2);
+        detail::write_vreg(vm, 3, arg3);
+        return detail::vm_execute(vm, entry->bytecode.data(),
+            static_cast<uint32_t>(entry->bytecode.size()));
+    }
+
+    inline bool protect_function(void* func, size_t func_len,
+                                   const std::vector<uint8_t>& compiled_bytecode,
+                                   uint64_t seed)
+    {
+        auto& s = get_state();
+        if (!s.initialized) {
+            if (!init_protection()) return false;
+        }
+        if (s.count >= MAX_PROTECTED) return false;
+        if (compiled_bytecode.empty()) return false;
+
+        uint64_t base_addr = reinterpret_cast<uint64_t>(func);
+
+        auto& entry = s.entries[s.count];
+        entry.original_addr = base_addr;
+        entry.original_len = static_cast<uint32_t>(func_len);
+        entry.vm_seed = seed;
+        entry.bytecode = compiled_bytecode;
+
+        auto* tramp = static_cast<uint8_t*>(s.trampoline_page) + s.trampoline_offset;
+        entry.trampoline = tramp;
+
+        uint64_t entry_ptr = reinterpret_cast<uint64_t>(&s.entries[s.count]);
+        tramp[0] = 0x48; tramp[1] = 0xB9;
+        memcpy(tramp + 2, &entry_ptr, 8);
+
+        uint64_t exec_addr = reinterpret_cast<uint64_t>(&vm_trampoline_execute);
+        tramp[10] = 0x48; tramp[11] = 0xBA;
+        memcpy(tramp + 12, &exec_addr, 8);
+
+        tramp[20] = 0xFF; tramp[21] = 0xE2;
+
+        s.trampoline_offset += 32;
+
+        DWORD old_prot;
+        VirtualProtect(func, func_len > 14 ? func_len : 14,
+            PAGE_EXECUTE_READWRITE, &old_prot);
+
+        auto* target = static_cast<uint8_t*>(func);
+        target[0] = 0xFF;
+        target[1] = 0x25;
+        *reinterpret_cast<uint32_t*>(target + 2) = 0;
+        *reinterpret_cast<uint64_t*>(target + 6) = reinterpret_cast<uint64_t>(tramp);
+
+        for (size_t i = 14; i < func_len && i < 64; ++i)
+            target[i] = 0xCC;
+
+        VirtualProtect(func, func_len > 14 ? func_len : 14, old_prot, &old_prot);
+
+        entry.active = true;
+        s.count++;
+        return true;
+    }
+
+    inline void reencrypt_live_bytecode()
+    {
+        auto& s = get_state();
+        for (uint32_t i = 0; i < s.count; ++i) {
+            auto& entry = s.entries[i];
+            if (!entry.active || entry.bytecode.empty()) continue;
+
+            uint64_t old_key = entry.vm_seed ^ 0x6A09E667F3BCC908ULL;
+            uint64_t new_seed = entry.vm_seed ^ __rdtsc() ^
+                (static_cast<uint64_t>(i) * 0x9E3779B97F4A7C15ULL);
+
+            std::vector<uint8_t> raw(entry.bytecode.size());
+            uint64_t dk = old_key;
+            for (size_t j = 0; j < entry.bytecode.size(); ++j) {
+                uint8_t kb = static_cast<uint8_t>(dk & 0xFF);
+                dk ^= dk << 13; dk ^= dk >> 7; dk ^= dk << 17;
+                raw[j] = entry.bytecode[j] ^ kb;
+            }
+
+            entry.vm_seed = new_seed;
+            uint64_t new_key = new_seed ^ 0x6A09E667F3BCC908ULL;
+            uint64_t ek = new_key;
+            for (size_t j = 0; j < raw.size(); ++j) {
+                uint8_t kb = static_cast<uint8_t>(ek & 0xFF);
+                ek ^= ek << 13; ek ^= ek >> 7; ek ^= ek << 17;
+                entry.bytecode[j] = raw[j] ^ kb;
+            }
+
+            volatile uint8_t* vraw = raw.data();
+            for (size_t j = 0; j < raw.size(); ++j) vraw[j] = 0;
+        }
+    }
+
 }
 
 }
