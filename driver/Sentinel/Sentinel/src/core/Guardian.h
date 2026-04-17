@@ -90,9 +90,6 @@ namespace guardian {
         if ((cycle % 7) == 0) {
             if (!heartbeat::verify_module_presence()) {
                 SN_LOG("guardian::dpc: WhosWho UNLOADED from module list!");
-                if (_KeBugCheckEx) {
-                    _KeBugCheckEx(0xDEAD5E07, 0, 0, 0, static_cast<ULONG_PTR>(cycle));
-                }
             }
         }
 

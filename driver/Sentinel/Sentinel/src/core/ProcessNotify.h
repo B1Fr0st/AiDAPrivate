@@ -1,6 +1,7 @@
 #pragma once
 #include <imports/Defs.h>
 #include <core/Heartbeat.h>
+#include <core/ObjectGuard.h>
 
 namespace process_notify {
 
@@ -102,14 +103,61 @@ namespace process_notify {
         }
     }
 
+    static VOID process_create_callback_ex(
+        PEPROCESS process, HANDLE pid, PPS_CREATE_NOTIFY_INFO create_info)
+    {
+        UNREFERENCED_PARAMETER(process);
+
+        if (!create_info)
+            return;
+
+        HANDLE prot_pid = reinterpret_cast<HANDLE>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+        if (!prot_pid)
+            return;
+
+        if (!create_info->ImageFileName || !create_info->ImageFileName->Buffer)
+            return;
+
+        __try {
+            PCUNICODE_STRING img = create_info->ImageFileName;
+            USHORT chars = img->Length / sizeof(WCHAR);
+            USHORT name_start = chars;
+            for (USHORT i = chars; i > 0; --i) {
+                if (img->Buffer[i - 1] == L'\\' || img->Buffer[i - 1] == L'/') {
+                    name_start = i;
+                    break;
+                }
+            }
+
+            char narrow[64] = {};
+            USHORT copy_len = chars - name_start;
+            if (copy_len > 63) copy_len = 63;
+            for (USHORT i = 0; i < copy_len; ++i)
+                narrow[i] = (char)(img->Buffer[name_start + i] & 0x7F);
+
+            if (is_dump_tool(reinterpret_cast<const UCHAR*>(narrow))) {
+                SN_LOG("process_notify_ex: BLOCKED dump tool pre-create pid=%llu name=%.60s",
+                    (UINT64)(ULONG_PTR)pid, narrow);
+                create_info->CreationStatus = STATUS_ACCESS_DENIED;
+                object_guard::g_last_suspicious_pid = (UINT64)(ULONG_PTR)pid;
+                InterlockedIncrement((volatile LONG*)&object_guard::g_suspicious_handle_count);
+                heartbeat::send_command(heartbeat::BRIDGE_CMD_DUMP_TOOL_FOUND,
+                    static_cast<ULONG>((ULONG_PTR)pid & 0xFFFFFFFF));
+                return;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
     static VOID process_create_callback(HANDLE, HANDLE pid, BOOLEAN create) {
         if (!create)
             return;
 
-        HANDLE protected = reinterpret_cast<HANDLE>(
+        HANDLE prot_pid = reinterpret_cast<HANDLE>(
             _InterlockedCompareExchange64(
                 reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
-        if (!protected)
+        if (!prot_pid)
             return;
 
         __try {
@@ -170,10 +218,10 @@ namespace process_notify {
     {
         UNREFERENCED_PARAMETER(ImageInfo);
 
-        HANDLE protected = reinterpret_cast<HANDLE>(
+        HANDLE prot_pid = reinterpret_cast<HANDLE>(
             _InterlockedCompareExchange64(
                 reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
-        if (!protected || ProcessId != protected)
+        if (!prot_pid || ProcessId != prot_pid)
             return;
 
         if (!FullImageName || !FullImageName->Buffer || FullImageName->Length == 0)
@@ -209,16 +257,29 @@ namespace process_notify {
     }
 
     __forceinline bool init() {
-        if (!_PsSetCreateProcessNotifyRoutine)
-            return false;
+        NTSTATUS st;
 
-        NTSTATUS st = _PsSetCreateProcessNotifyRoutine(process_create_callback, FALSE);
-        if (NT_SUCCESS(st)) {
-            _InterlockedExchange(&g_registered, 1);
-            SN_LOG("process_notify::init: registered process notify callback");
+        if (_PsSetCreateProcessNotifyRoutineEx) {
+            st = _PsSetCreateProcessNotifyRoutineEx(process_create_callback_ex, FALSE);
+            if (NT_SUCCESS(st)) {
+                _InterlockedExchange(&g_registered, 1);
+                SN_LOG("process_notify::init: registered Ex callback (pre-create blocking)");
+            } else {
+                SN_LOG("process_notify::init: Ex FAILED 0x%lx, falling back", st);
+                goto fallback;
+            }
         } else {
-            SN_LOG("process_notify::init: FAILED status=0x%lx", st);
-            return false;
+fallback:
+            if (!_PsSetCreateProcessNotifyRoutine)
+                return false;
+            st = _PsSetCreateProcessNotifyRoutine(process_create_callback, FALSE);
+            if (NT_SUCCESS(st)) {
+                _InterlockedExchange(&g_registered, 1);
+                SN_LOG("process_notify::init: registered legacy callback");
+            } else {
+                SN_LOG("process_notify::init: FAILED status=0x%lx", st);
+                return false;
+            }
         }
 
         if (_PsSetLoadImageNotifyRoutine) {

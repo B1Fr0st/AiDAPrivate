@@ -294,19 +294,13 @@ namespace detail {
         memcpy(cursor + 2, &encoded, 8);
         cursor += 10;
 
-
         uint64_t key_expanded = static_cast<uint64_t>(obf_key) * 0x100000001ULL;
-        cursor[0] = 0x48; cursor[1] = 0x35;
-
         cursor[0] = 0x49; cursor[1] = 0xBB;
         memcpy(cursor + 2, &key_expanded, 8);
         cursor += 10;
 
-        cursor[0] = 0x4C; cursor[1] = 0x33; cursor[2] = 0xD8;
-
-        cursor[0] = 0x49; cursor[1] = 0x33; cursor[2] = 0xC3;
+        cursor[0] = 0x4C; cursor[1] = 0x31; cursor[2] = 0xD8;
         cursor += 3;
-
 
         cursor[0] = 0xFF; cursor[1] = 0xE0;
         cursor += 2;

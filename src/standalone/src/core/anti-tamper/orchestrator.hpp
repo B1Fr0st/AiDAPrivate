@@ -1,10 +1,12 @@
 #pragma once
 
 #include <windows.h>
+#include <psapi.h>
 
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "webhook.hpp"
 #include "state.hpp"
@@ -32,6 +34,8 @@
 #include "server_pages.hpp"
 #include "vm_compiler.hpp"
 #include "stolen_bytes.hpp"
+#include "../standalone_anti_dump.hpp"
+#include "re_detection_engine.hpp"
 
 namespace anti_tamper {
 
@@ -61,6 +65,8 @@ inline bool vm_protect_function(void* func, size_t func_len)
         func, func_len, lifted.bytecode, seed);
 }
 #endif
+
+inline void start_monitors();
 
 inline bool initialize()
 {
@@ -189,8 +195,16 @@ inline bool initialize()
     anti_debug::hide_thread_from_debugger(GetCurrentThread());
     webhook::write_log("init", "hide_thread_ok");
 
+    standalone_anti_dump::initialize();
+    webhook::write_log("init", "anti_dump_standalone_ok");
+
     rt.initialized.store(true);
     webhook::write_log("init", "initialized_ok");
+
+    start_monitors();
+
+    re_detect::initialize();
+    webhook::write_log("init", "re_detect_engine_ok");
 
     return true;
 }
@@ -350,14 +364,88 @@ inline bool guard()
                 CFF_EXIT(guard_cff);
             }
         }
+        CFF_GOTO(guard_cff, 10);
+    }
+    CFF_STATE(guard_cff, 10)
+    {
+        if ((rt.verify_counter & 3u) == 0)
+        {
+            auto ai_report = anti_ai::combined::full_scan();
+            if (ai_report.any_threat())
+            {
+                webhook::send_debug_log("guard", "ai_threat: " + ai_report.summary, true);
+                enforce_violation("ai_threat_detected", ai_report.summary);
+                CFF_EXIT(guard_cff);
+            }
+
+            auto proc_report = process_scan::full_scan();
+            if (proc_report.any_detected())
+            {
+                webhook::send_debug_log("guard", "re_tool: " + proc_report.detail, true);
+                enforce_violation("re_tool_detected", proc_report.detail);
+                CFF_EXIT(guard_cff);
+            }
+        }
+        CFF_GOTO(guard_cff, 11);
+    }
+    CFF_STATE(guard_cff, 11)
+    {
+        MEMORY_BASIC_INFORMATION mbi{};
+        uint64_t addr = rt.code_snap.text_base;
+        const uint64_t end = rt.code_snap.text_base + rt.code_snap.text_size;
+        bool page_ok = true;
+
+        while (addr < end && page_ok)
+        {
+            if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0)
+            {
+                page_ok = false;
+                break;
+            }
+            constexpr DWORD writable = PAGE_EXECUTE_READWRITE | PAGE_READWRITE
+                | PAGE_EXECUTE_WRITECOPY | PAGE_WRITECOPY;
+            if (mbi.Protect & writable)
+                page_ok = false;
+            addr = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+        }
+
+        if (!page_ok)
+        {
+            webhook::send_debug_log("guard", "writable_code_page", true);
+            enforce_violation("writable_code_page");
+            CFF_EXIT(guard_cff);
+        }
     }
     CFF_END(guard_cff)
+
+    ++rt.verify_counter;
 
     return !rt.violation_latched.load(std::memory_order_acquire);
 }
 
+inline void start_monitors()
+{
+    auto& rt = state::get();
+    if (rt.monitors_running.exchange(true))
+        return;
+
+    std::thread([]() {
+        Sleep(5000);
+        auto& rt = state::get();
+        while (rt.monitors_running.load() && !rt.violation_latched.load())
+        {
+            guard();
+            enforcement_tick();
+            Sleep(500);
+        }
+    }).detach();
+}
+
 inline void shutdown()
 {
+    auto& rt = state::get();
+    rt.monitors_running.store(false);
+    standalone_anti_dump::shutdown();
     server_pages::shutdown();
     nanomites::shutdown();
     ai_deception::shutdown();

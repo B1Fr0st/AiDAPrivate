@@ -424,6 +424,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     }
 
     WW_LOG("DriverEntry: starting watchdog...");
+    if (!dispatcher::verify_dispatch_integrity(DriverObject)) {
+        WW_LOG("DriverEntry: dispatch integrity check FAILED before watchdog start");
+        _IoDeleteSymbolicLink(&symLink);
+        _IoDeleteDevice(deviceObject);
+        return STATUS_ACCESS_DENIED;
+    }
     sentinel_bridge::start_watchdog();
 
     NTSTATUS ob_status = process_guard::init();

@@ -2,6 +2,7 @@
 #include <imports/Defs.h>
 #include <core/DispatchGuard.h>
 #include <nmmintrin.h>
+#include <intrin.h>
 
 
 namespace self_protect {
@@ -10,6 +11,136 @@ namespace self_protect {
 
 
 namespace integrity {
+
+    struct sensor_data_t
+    {
+        UINT64 cr4_smep_smap;
+        UINT64 lstar_msr;
+        UINT64 idtr_base;
+        UINT16 idtr_limit;
+        UINT32 vector_2d_hash;
+        UINT32 vector_e9_hash;
+    };
+
+    inline sensor_data_t g_baseline_sensors = {};
+    inline volatile LONG g_sensors_initialized = 0;
+
+    __forceinline UINT32 hash_prologue(const UINT8* data, ULONG len)
+    {
+        UINT32 h = 0x811C9DC5u;
+        for (ULONG i = 0; i < len; i++)
+        {
+            h ^= data[i];
+            h *= 0x01000193u;
+        }
+        return h;
+    }
+
+    __forceinline sensor_data_t collect_sensors()
+    {
+        sensor_data_t s = {};
+
+        __try {
+            UINT64 cr4 = __readcr4();
+            s.cr4_smep_smap = cr4 & ((1ULL << 20) | (1ULL << 21));
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            s.cr4_smep_smap = 0;
+        }
+
+        __try {
+            s.lstar_msr = __readmsr(0xC0000082);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            s.lstar_msr = 0;
+        }
+
+        __try {
+            UINT8 idtr_buf[10] = {};
+            __sidt(idtr_buf);
+            s.idtr_limit = *reinterpret_cast<UINT16*>(idtr_buf);
+            s.idtr_base = *reinterpret_cast<UINT64*>(idtr_buf + 2);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            s.idtr_base = 0;
+            s.idtr_limit = 0;
+        }
+
+        __try {
+            if (s.idtr_base && _MmIsAddressValid(reinterpret_cast<PVOID>(s.idtr_base)))
+            {
+                constexpr ULONG IDT_ENTRY_SIZE = 16;
+                UINT8* idt = reinterpret_cast<UINT8*>(s.idtr_base);
+
+                UINT8* entry_2d = idt + (0x2D * IDT_ENTRY_SIZE);
+                if (_MmIsAddressValid(entry_2d))
+                {
+                    UINT64 handler_2d = 0;
+                    handler_2d = static_cast<UINT64>(*reinterpret_cast<UINT16*>(entry_2d));
+                    handler_2d |= static_cast<UINT64>(*reinterpret_cast<UINT16*>(entry_2d + 6)) << 16;
+                    handler_2d |= static_cast<UINT64>(*reinterpret_cast<UINT32*>(entry_2d + 8)) << 32;
+
+                    if (handler_2d && _MmIsAddressValid(reinterpret_cast<PVOID>(handler_2d)))
+                    {
+                        UINT8 prologue[16];
+                        RtlCopyMemory(prologue, reinterpret_cast<PVOID>(handler_2d), 16);
+                        s.vector_2d_hash = hash_prologue(prologue, 16);
+                    }
+                }
+
+                UINT8* entry_e9 = idt + (0xE9 * IDT_ENTRY_SIZE);
+                if (_MmIsAddressValid(entry_e9))
+                {
+                    UINT64 handler_e9 = 0;
+                    handler_e9 = static_cast<UINT64>(*reinterpret_cast<UINT16*>(entry_e9));
+                    handler_e9 |= static_cast<UINT64>(*reinterpret_cast<UINT16*>(entry_e9 + 6)) << 16;
+                    handler_e9 |= static_cast<UINT64>(*reinterpret_cast<UINT32*>(entry_e9 + 8)) << 32;
+
+                    if (handler_e9 && _MmIsAddressValid(reinterpret_cast<PVOID>(handler_e9)))
+                    {
+                        UINT8 prologue[16];
+                        RtlCopyMemory(prologue, reinterpret_cast<PVOID>(handler_e9), 16);
+                        s.vector_e9_hash = hash_prologue(prologue, 16);
+                    }
+                }
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+        return s;
+    }
+
+    __forceinline void collect_sensor_baseline()
+    {
+        g_baseline_sensors = collect_sensors();
+        _InterlockedExchange(&g_sensors_initialized, 1);
+    }
+
+    __forceinline BOOLEAN detect_sensor_anomaly()
+    {
+        if (!_InterlockedCompareExchange(&g_sensors_initialized, 1, 1))
+            return FALSE;
+
+        sensor_data_t current = collect_sensors();
+
+        if (g_baseline_sensors.cr4_smep_smap != 0 &&
+            current.cr4_smep_smap != g_baseline_sensors.cr4_smep_smap)
+            return TRUE;
+
+        if (g_baseline_sensors.lstar_msr != 0 &&
+            current.lstar_msr != g_baseline_sensors.lstar_msr)
+            return TRUE;
+
+        if (g_baseline_sensors.idtr_base != 0 &&
+            current.idtr_base != g_baseline_sensors.idtr_base)
+            return TRUE;
+
+        if (g_baseline_sensors.vector_2d_hash != 0 &&
+            current.vector_2d_hash != g_baseline_sensors.vector_2d_hash)
+            return TRUE;
+
+        if (g_baseline_sensors.vector_e9_hash != 0 &&
+            current.vector_e9_hash != g_baseline_sensors.vector_e9_hash)
+            return TRUE;
+
+        return FALSE;
+    }
 
 
     inline volatile UINT32 g_baseline_crc = 0;

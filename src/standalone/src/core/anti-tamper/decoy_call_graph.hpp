@@ -17,7 +17,7 @@ namespace anti_tamper::virtualizer::detail {
     extern poly_dispatch_t g_poly_table[];
 }
 
-extern uint64_t g_server_poly_seed;
+namespace anti_tamper::virtualizer { extern uint64_t g_server_poly_seed; }
 
 namespace anti_tamper::call_obfuscation::detail {
     struct call_entry_t;
@@ -32,6 +32,8 @@ namespace anti_tamper::decoy {
         extern volatile uintptr_t s_hp_fn_table[];
     }
 
+    // Observable sink — decoy results XOR into this; chain reads it periodically
+    inline volatile uint64_t g_decoy_sink = 0;
 
     __forceinline bool opaque_true(uint64_t x)
     {
@@ -43,6 +45,18 @@ namespace anti_tamper::decoy {
     __forceinline bool opaque_false(uint64_t x)
     {
         return !opaque_true(x);
+    }
+
+    // Runtime predicate: selects a bit from g_server_poly_seed via compile-time index.
+    // When seed != 0, a subset of decoys actually execute depending on seed bits.
+    // When seed == 0 (pre-server), falls back to opaque_false (never executes).
+    __forceinline bool runtime_gate(uint64_t compile_seed)
+    {
+        uint64_t seed = anti_tamper::virtualizer::g_server_poly_seed;
+        if (!seed)
+            return opaque_false(compile_seed);
+        uint32_t bit = static_cast<uint32_t>((compile_seed * 0x517CC1B727220A95ULL) >> 58);
+        return (seed >> bit) & 1;
     }
 
 
@@ -400,7 +414,7 @@ namespace anti_tamper::decoy {
     __declspec(noinline) static uint64_t __cdecl decoy_xref_server_poly_derive(
         uint64_t page_index, uint64_t epoch_key)
     {
-        volatile uint64_t seed = ::g_server_poly_seed;
+        volatile uint64_t seed = anti_tamper::virtualizer::g_server_poly_seed;
         volatile uint64_t derived = seed ^ epoch_key ^ (page_index * 0x100000001B3ULL);
         derived = _rotr64(derived, 11) * 0xBF58476D1CE4E5B9ULL;
         if (opaque_false(derived))
@@ -500,7 +514,8 @@ namespace anti_tamper::decoy {
 
 #define DECOY_CALL_INTEGRATED(tag)                                               \
     do {                                                                         \
-        if (anti_tamper::decoy::opaque_false(__rdtsc() ^ (uint64_t)__LINE__)) {  \
+        if (anti_tamper::decoy::runtime_gate(                                    \
+                __rdtsc() ^ (uint64_t)__LINE__)) {                               \
             volatile uint64_t _dc_r_##tag =                                      \
                 anti_tamper::decoy::decoy_validate_signature(                    \
                 reinterpret_cast<const uint8_t*>(const_cast<const char*>(         \
@@ -514,13 +529,14 @@ namespace anti_tamper::decoy {
                 anti_tamper::decoy::decoy_verify_driver_proof(                  \
                 _dc_r_##tag, static_cast<uint64_t>(_dc_s_##tag));                \
             (void)_dc_v_##tag;                                                   \
+            anti_tamper::decoy::g_decoy_sink ^= _dc_r_##tag;                     \
         }                                                                        \
     } while (0)
 
 #define DECOY_CRYPTO_INTEGRATED(tag)                                             \
     do {                                                                         \
-        if (anti_tamper::decoy::opaque_false(                                   \
-                __rdtsc() ^ (uint64_t)__LINE__ ^ 0xCAFEULL)) {                  \
+        if (anti_tamper::decoy::runtime_gate(                                    \
+                __rdtsc() ^ (uint64_t)__LINE__ ^ 0xCAFEULL)) {                   \
             volatile uint64_t _dci_k_##tag =                                     \
                 anti_tamper::decoy::decoy_derive_page_key(                      \
                 static_cast<uint32_t>(__LINE__),                                 \
@@ -535,6 +551,7 @@ namespace anti_tamper::decoy {
                 reinterpret_cast<const uint8_t*>(&_dci_hv_##tag),               \
                 reinterpret_cast<const uint8_t*>(&_dci_kv_##tag), 8);            \
             (void)_dci_e_##tag;                                                  \
+            anti_tamper::decoy::g_decoy_sink ^= _dci_h_##tag;                    \
         }                                                                        \
     } while (0)
 
@@ -561,7 +578,7 @@ namespace anti_tamper::decoy {
     do {                                                                         \
         constexpr uint64_t _dw_seed_##tag =                                      \
             (uint64_t)__LINE__ * 0x9E3779B97F4A7C15ULL;                          \
-        if (anti_tamper::decoy::opaque_false(_dw_seed_##tag)) {                  \
+        if (anti_tamper::decoy::runtime_gate(_dw_seed_##tag)) {                  \
             volatile auto* _hp = anti_tamper::decoy::g_honeypot_strings[         \
                 __LINE__ % 16];                                                  \
             volatile uint64_t _r1 =                                              \
@@ -580,5 +597,6 @@ namespace anti_tamper::decoy {
             anti_tamper::decoy::decoy_xref_vm_pool_verify(                      \
                 _r2, static_cast<uint32_t>(_r3 & 0xFF));                         \
             (void)_r4;                                                           \
+            anti_tamper::decoy::g_decoy_sink ^= _r2;                             \
         }                                                                        \
     } while (0)

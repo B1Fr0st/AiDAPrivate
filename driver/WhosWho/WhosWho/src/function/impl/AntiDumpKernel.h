@@ -1,7 +1,7 @@
 #pragma once
 #include <ntifs.h>
 #include <intrin.h>
-#include "../imports/Defs.h"
+#include <imports/Defs.h>
 
 namespace anti_dump_kernel {
 
@@ -112,7 +112,7 @@ namespace anti_dump_kernel {
             while ((thread = _PsGetNextProcessThread(process, thread)) != nullptr) {
                 UINT8* thread_ptr = (UINT8*)thread;
                 volatile ULONG* cross_flags = (volatile ULONG*)(thread_ptr + 0x74);
-                InterlockedOr(cross_flags, 0x4);
+                InterlockedOr((volatile LONG*)cross_flags, 0x4);
                 hidden++;
             }
         }

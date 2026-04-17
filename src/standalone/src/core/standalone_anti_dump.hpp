@@ -192,7 +192,7 @@ namespace pe_header
         if (!VirtualProtect(nt, total + 256, PAGE_READWRITE, &old_prot))
             return false;
 
-        nt->FileHeader.NumberOfSections = 0xFF;
+        nt->FileHeader.NumberOfSections = 8;
 
         auto* sec = IMAGE_FIRST_SECTION(nt);
         for (int i = 0; i < 8; ++i)
@@ -306,7 +306,7 @@ namespace read_intercept
     {
         if (ep->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION)
         {
-            uint64_t fault_addr = reinterpret_cast<uint64_t>(
+            uint64_t fault_addr = static_cast<uint64_t>(
                 ep->ExceptionRecord->ExceptionInformation[1]);
             uint64_t base = trap_page_base.load();
             uint32_t size = trap_page_size.load();
@@ -551,11 +551,26 @@ namespace anti_minidump
             GetProcAddress(dbghelp, "MiniDumpWriteDump"));
         if (!target) return false;
 
-        original_minidump = reinterpret_cast<MiniDumpWriteDump_t>(target);
+        auto* trampoline = static_cast<uint8_t*>(VirtualAlloc(
+            nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        if (!trampoline) return false;
+
+        memcpy(trampoline, target, 14);
+        trampoline[14] = 0xFF;
+        trampoline[15] = 0x25;
+        *reinterpret_cast<uint32_t*>(trampoline + 16) = 0;
+        *reinterpret_cast<uint64_t*>(trampoline + 20) = reinterpret_cast<uint64_t>(target + 14);
+        FlushInstructionCache(GetCurrentProcess(), trampoline, 64);
+
+        original_minidump = reinterpret_cast<MiniDumpWriteDump_t>(trampoline);
 
         DWORD old_prot;
         if (!VirtualProtect(target, 14, PAGE_EXECUTE_READWRITE, &old_prot))
+        {
+            VirtualFree(trampoline, 0, MEM_RELEASE);
+            original_minidump = nullptr;
             return false;
+        }
 
         auto* hook_addr = reinterpret_cast<uint8_t*>(&hooked_minidump);
 
@@ -565,6 +580,7 @@ namespace anti_minidump
         *reinterpret_cast<uint64_t*>(target + 6) = reinterpret_cast<uint64_t>(hook_addr);
 
         VirtualProtect(target, 14, old_prot, &old_prot);
+        FlushInstructionCache(GetCurrentProcess(), target, 14);
         return true;
     }
 

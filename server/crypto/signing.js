@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 
 let cachedPrivateKey = null;
+let cachedNextPrivateKey = null;
 
 
 function getSigningPrivateKey() {
@@ -24,6 +25,27 @@ function getSigningPrivateKey() {
     return cachedPrivateKey;
 }
 
+// Returns next rotation key if configured (for dual-signing during overlap window)
+function getNextSigningPrivateKey() {
+    if (cachedNextPrivateKey !== null) {
+        return cachedNextPrivateKey || null;
+    }
+
+    const b64 = process.env.ED25519_NEXT_PRIVATE_KEY_B64;
+    if (!b64 || typeof b64 !== 'string' || b64.length < 16) {
+        cachedNextPrivateKey = false; // Mark as checked but absent
+        return null;
+    }
+
+    cachedNextPrivateKey = crypto.createPrivateKey({
+        key: Buffer.from(b64, 'base64'),
+        format: 'der',
+        type: 'pkcs8',
+    });
+
+    return cachedNextPrivateKey;
+}
+
 
 function sortObjectKeys(obj) {
     return Object.keys(obj).sort().reduce((sorted, key) => {
@@ -39,8 +61,41 @@ function signPayload(payloadObj) {
         .toString('hex');
 }
 
+// Dual-key signing: signs with both current and next key during rotation overlap
+// Returns { signature, next_signature? } — next_signature only present during overlap
+function dualSignPayload(payloadObj) {
+    const canonical = JSON.stringify(sortObjectKeys(payloadObj));
+    const buf = Buffer.from(canonical, 'utf8');
+
+    const signature = crypto.sign(null, buf, getSigningPrivateKey()).toString('hex');
+
+    const nextNotBefore = parseInt(process.env.ED25519_NEXT_NOT_BEFORE || '0', 10) || 0;
+    const now = Math.floor(Date.now() / 1000);
+
+    // Dual-sign during the overlap window: from 24h before next key activates
+    const OVERLAP_SECONDS = 86400;
+    if (nextNotBefore > 0 && now >= (nextNotBefore - OVERLAP_SECONDS)) {
+        const nextKey = getNextSigningPrivateKey();
+        if (nextKey) {
+            const nextSignature = crypto.sign(null, buf, nextKey).toString('hex');
+            return { signature, next_signature: nextSignature };
+        }
+    }
+
+    return { signature };
+}
+
+// Clear cached keys (for testing or key rotation reload)
+function clearKeyCache() {
+    cachedPrivateKey = null;
+    cachedNextPrivateKey = null;
+}
+
 module.exports = {
     signPayload,
+    dualSignPayload,
     getSigningPrivateKey,
+    getNextSigningPrivateKey,
     sortObjectKeys,
+    clearKeyCache,
 };

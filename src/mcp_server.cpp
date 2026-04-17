@@ -3,6 +3,8 @@
 
 #include <queue>
 #include <chrono>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 
 using json = nlohmann::json;
 
@@ -36,13 +38,22 @@ static const std::string& get_mcp_server_instructions()
 
 static std::string generate_session_id()
 {
+    // Phase 6.5: cryptographically strong session IDs via BCryptGenRandom.
+    unsigned char rnd[16] = {};
+    NTSTATUS st = BCryptGenRandom(nullptr, rnd, sizeof(rnd),
+                                  BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (st != 0) {
+        auto t = std::chrono::steady_clock::now().time_since_epoch().count();
+        for (size_t i = 0; i < sizeof(rnd); ++i)
+            rnd[i] = static_cast<unsigned char>((t >> (i * 8)) ^ i);
+    }
     static const char hex[] = "0123456789abcdef";
     std::string id;
     id.reserve(32);
-    std::srand(static_cast<unsigned>(std::time(nullptr))
-             ^ static_cast<unsigned>(std::clock()));
-    for (int i = 0; i < 32; ++i)
-        id.push_back(hex[std::rand() % 16]);
+    for (size_t i = 0; i < sizeof(rnd); ++i) {
+        id.push_back(hex[rnd[i] >> 4]);
+        id.push_back(hex[rnd[i] & 0x0f]);
+    }
     return id;
 }
 

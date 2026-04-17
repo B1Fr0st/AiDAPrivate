@@ -21,7 +21,6 @@ You review proposed changes or existing code for bugs, thread safety issues, mem
 - Thread safety: identify shared state and verify mutex usage
 - ImGui: verify correct Push/Pop pairing, unique IDs, no leaked style states
 - License code: flag any change that weakens validation
-- Anti-debug: flag any addition of anti-debug/anti-RE code (external protector handles this)
 - Performance: flag main-thread blocking, unnecessary allocations in hot paths, O(n²) in render loops
 
 ## Approach

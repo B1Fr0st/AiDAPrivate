@@ -51,6 +51,7 @@ struct runtime_t
     std::mutex mtx;
     std::atomic<bool> initialized{false};
     std::atomic<bool> violation_latched{false};
+    std::atomic<bool> monitors_running{false};
 
     code_snapshot_t code_snap{};
     std::vector<block_hash_t> block_chain;

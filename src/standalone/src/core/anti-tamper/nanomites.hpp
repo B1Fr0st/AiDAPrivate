@@ -58,7 +58,7 @@ namespace detail {
         condition_code_t condition;
         uint8_t          original_insn_len;
         uint16_t         _pad;
-        uint64_t         guard_hash;
+        uint64_t         guard_hash[2];
     };
 
     struct nanomite_state_t
@@ -127,13 +127,74 @@ namespace detail {
         e.fall_through ^= _rotl64(key, 29);
     }
 
-    inline uint64_t compute_guard_hash(uint64_t addr, uint64_t target, uint8_t cc,
-                                       const uint64_t sip_key[2])
+    inline void siphash_128(const uint8_t* data, size_t len,
+                           uint64_t k0, uint64_t k1,
+                           uint64_t& out0, uint64_t& out1)
     {
-        uint64_t data = addr ^ target ^ (static_cast<uint64_t>(cc) << 48);
-        return integrity::siphash::hash(
-            reinterpret_cast<const uint8_t*>(&data), sizeof(data),
-            sip_key[0], sip_key[1]);
+        uint64_t v0 = 0x736F6D6570736575ULL ^ k0;
+        uint64_t v1 = 0x646F72616E646F6DULL ^ k1;
+        uint64_t v2 = 0x6C7967656E657261ULL ^ k0;
+        uint64_t v3 = 0x7465646279746573ULL ^ k1;
+        v1 ^= 0xEE;
+
+        const uint8_t* end = data + len - (len % 8);
+        const int left = static_cast<int>(len & 7);
+        uint64_t b = static_cast<uint64_t>(len) << 56;
+
+        for (; data != end; data += 8)
+        {
+            uint64_t m;
+            memcpy(&m, data, 8);
+            v3 ^= m;
+            integrity::siphash::sipround(v0, v1, v2, v3);
+            integrity::siphash::sipround(v0, v1, v2, v3);
+            v0 ^= m;
+        }
+
+        switch (left)
+        {
+        case 7: b |= static_cast<uint64_t>(data[6]) << 48; [[fallthrough]];
+        case 6: b |= static_cast<uint64_t>(data[5]) << 40; [[fallthrough]];
+        case 5: b |= static_cast<uint64_t>(data[4]) << 32; [[fallthrough]];
+        case 4: b |= static_cast<uint64_t>(data[3]) << 24; [[fallthrough]];
+        case 3: b |= static_cast<uint64_t>(data[2]) << 16; [[fallthrough]];
+        case 2: b |= static_cast<uint64_t>(data[1]) << 8;  [[fallthrough]];
+        case 1: b |= static_cast<uint64_t>(data[0]);        break;
+        case 0: break;
+        }
+
+        v3 ^= b;
+        integrity::siphash::sipround(v0, v1, v2, v3);
+        integrity::siphash::sipround(v0, v1, v2, v3);
+        v0 ^= b;
+
+        v2 ^= 0xEE;
+        integrity::siphash::sipround(v0, v1, v2, v3);
+        integrity::siphash::sipround(v0, v1, v2, v3);
+        integrity::siphash::sipround(v0, v1, v2, v3);
+        integrity::siphash::sipround(v0, v1, v2, v3);
+        out0 = v0 ^ v1 ^ v2 ^ v3;
+
+        v1 ^= 0xDD;
+        integrity::siphash::sipround(v0, v1, v2, v3);
+        integrity::siphash::sipround(v0, v1, v2, v3);
+        integrity::siphash::sipround(v0, v1, v2, v3);
+        integrity::siphash::sipround(v0, v1, v2, v3);
+        out1 = v0 ^ v1 ^ v2 ^ v3;
+    }
+
+    inline void compute_guard_hash(uint64_t addr, uint64_t target,
+                                   uint64_t fall_through, uint8_t cc,
+                                   const uint64_t sip_key[2],
+                                   uint64_t out[2])
+    {
+        uint8_t data[32];
+        memcpy(data, &addr, 8);
+        memcpy(data + 8, &target, 8);
+        memcpy(data + 16, &fall_through, 8);
+        uint64_t cc_packed = static_cast<uint64_t>(cc);
+        memcpy(data + 24, &cc_packed, 8);
+        siphash_128(data, 32, sip_key[0], sip_key[1], out[0], out[1]);
     }
 
 
@@ -149,9 +210,11 @@ namespace detail {
             if (tmp.int3_addr == rip)
             {
 
-                uint64_t expected = compute_guard_hash(
-                    tmp.int3_addr, tmp.taken_target, tmp.condition, s.session_key);
-                if (tmp.guard_hash != expected)
+                uint64_t expected[2];
+                compute_guard_hash(
+                    tmp.int3_addr, tmp.taken_target, tmp.fall_through,
+                    tmp.condition, s.session_key, expected);
+                if (tmp.guard_hash[0] != expected[0] || tmp.guard_hash[1] != expected[1])
                 {
 
                     return nullptr;
@@ -335,8 +398,9 @@ inline uint32_t protect_function(uintptr_t func_addr, size_t func_size)
             entry.original_insn_len = jcc.insn_len;
 
 
-            entry.guard_hash = detail::compute_guard_hash(
-                entry.int3_addr, entry.taken_target, entry.condition, s.session_key);
+            detail::compute_guard_hash(
+                entry.int3_addr, entry.taken_target, entry.fall_through,
+                entry.condition, s.session_key, entry.guard_hash);
 
 
             detail::encrypt_entry(entry, s.encryption_key);
@@ -405,9 +469,11 @@ inline bool verify_table_integrity()
         detail::nanomite_entry_t tmp = s.entries[i];
         detail::decrypt_entry(tmp, s.encryption_key);
 
-        uint64_t expected = detail::compute_guard_hash(
-            tmp.int3_addr, tmp.taken_target, tmp.condition, s.session_key);
-        if (tmp.guard_hash != expected)
+        uint64_t expected[2];
+        detail::compute_guard_hash(
+            tmp.int3_addr, tmp.taken_target, tmp.fall_through,
+            tmp.condition, s.session_key, expected);
+        if (expected[0] != tmp.guard_hash[0] || expected[1] != tmp.guard_hash[1])
             return false;
     }
     return true;

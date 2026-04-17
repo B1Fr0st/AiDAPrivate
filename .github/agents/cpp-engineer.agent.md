@@ -27,7 +27,6 @@ You implement features, fix bugs, and optimize performance in the C++ codebase. 
 - **snake_case everything**: variables, functions, types (`_t` suffix), namespaces, files
 - **`#pragma once`** in all headers
 - **Match existing indentation** in the file being edited (tabs or spaces)
-- Never add anti-debug/anti-RE features — external protector handles that
 - Never touch license validation logic unless explicitly asked
 - Never introduce new dependencies without explicit approval
 

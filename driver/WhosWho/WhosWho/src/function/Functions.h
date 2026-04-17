@@ -2,6 +2,7 @@
 #include <ntifs.h>
 #include "Struct.h"
 #include "impl/driver/Strong.h"
+#include "AntiDebug.h"
 
 namespace functions {
     NTSTATUS handle777d(p_dtb_solve request);

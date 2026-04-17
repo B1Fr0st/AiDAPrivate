@@ -17,7 +17,6 @@ You make high-level structural decisions: where new code lives, how components i
 ## Constraints
 
 - Respect `src/standalone/src/` layout: `core/` for logic, `helpers/` for UI glue, `assets/` for resources
-- Never propose anti-debug, anti-RE, or anti-dynamic-analysis features — an external protector handles that
 - Never weaken or restructure license validation code
 - All async work must use `std::thread` + result queuing — never block the render thread
 - Global state lives in namespaces in `globals.h`, not singletons or god-objects

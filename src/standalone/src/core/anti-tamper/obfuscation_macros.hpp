@@ -102,12 +102,16 @@ namespace detail {
 
 
 #define MBA_ADD(a, b)                                                             \
-    (static_cast<uint64_t>(a) + static_cast<uint64_t>(b) +                       \
-     (MBA_TRANSFORM(a, b) & 0) )
+    ::anti_tamper::metamorphic::mba::keyed_add(                                  \
+        static_cast<uint64_t>(a),                                                \
+        static_cast<uint64_t>(b),                                                \
+        static_cast<uint64_t>(__rdtsc()))
 
 #define MBA_SUB(a, b)                                                             \
-    (static_cast<uint64_t>(a) - static_cast<uint64_t>(b) +                       \
-     (MBA_TRANSFORM(a, b) & 0) )
+    ::anti_tamper::metamorphic::mba::keyed_add(                                  \
+        static_cast<uint64_t>(a),                                                \
+        (~static_cast<uint64_t>(b)) + 1ULL,                                      \
+        static_cast<uint64_t>(__rdtsc()))
 
 
 #define OBFUSCATE_JUNK_CRYPTO(tag)                                               \
@@ -222,29 +226,6 @@ namespace anti_tamper {
 namespace obfuscation {
 namespace opaque_predicates {
 
-    __forceinline bool fermat_true(uint64_t seed)
-    {
-        uint64_t p = (seed | 3) % 251;
-        if (p < 2) p = 7;
-        uint64_t a = ((seed >> 8) % (p - 2)) + 2;
-        uint64_t result = 1;
-        uint64_t base = a % p;
-        uint64_t exp = p - 1;
-        while (exp > 0) {
-            if (exp & 1) result = (result * base) % p;
-            base = (base * base) % p;
-            exp >>= 1;
-        }
-        return result == 1;
-    }
-
-    __forceinline bool quadratic_residue_true(uint64_t seed)
-    {
-        uint64_t x = (seed | 1) & 0xFFFFFFFF;
-        uint64_t sq = x * x;
-        return (sq % 4) != 3;
-    }
-
     __forceinline bool sum_of_squares_true(uint64_t seed)
     {
         volatile uint64_t a = (seed >> 3) & 0xFFFF;
@@ -258,6 +239,21 @@ namespace opaque_predicates {
         volatile uint64_t n = (seed | 1) & 0x7FFFFFFF;
         volatile uint64_t n_sq = n * n;
         return n_sq >= n || n == 1;
+    }
+
+    // Phase 4.5: the original Fermat little-theorem and quadratic-residue
+    // predicates had a recognizable math shape (modexp over small primes,
+    // square-then-mod-4). Static scanners flag them instantly. Re-route
+    // both names to sum_of_squares/euler_identity so existing OPAQUE_*_FERMAT
+    // and OPAQUE_*_QUADRATIC call sites compile but emit unrecognizable code.
+    __forceinline bool fermat_true(uint64_t seed)
+    {
+        return sum_of_squares_true(seed ^ 0x9E3779B97F4A7C15ULL);
+    }
+
+    __forceinline bool quadratic_residue_true(uint64_t seed)
+    {
+        return euler_identity_true(seed ^ 0xBF58476D1CE4E5B9ULL);
     }
 
 }

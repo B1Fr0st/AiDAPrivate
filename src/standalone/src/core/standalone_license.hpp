@@ -37,7 +37,6 @@ namespace standalone_license
 
     double  compute_degradation_factor();
 
-
     void    snapshot_code_hashes();
     bool    verify_code_hashes();
 
@@ -74,6 +73,7 @@ namespace standalone_license
 
     uint64_t inline_gate_check(gate_slot_t slot);
 
+    bool    check_feature_allowed(gate_slot_t slot);
 
     double   verify_gate_token(gate_slot_t slot, uint64_t token);
 
@@ -107,3 +107,16 @@ namespace standalone_license
     uint64_t get_server_nonce_hash();
     std::string get_session_token();
 }
+
+// VERIFY_LICENSE_INLINE: single macro combining gate check + token verify + feature allow.
+// Evaluates to true if the feature is allowed, false if degraded/blocked.
+// Also fires the gate + folds the integrity token as side effects.
+#define VERIFY_LICENSE_INLINE(slot)                                          \
+    ([&]() -> bool {                                                        \
+        if (!standalone_license::check_feature_allowed(slot))               \
+            return false;                                                   \
+        uint64_t _vli_gt = standalone_license::inline_gate_check(slot);     \
+        double _vli_v = standalone_license::verify_gate_token(slot, _vli_gt); \
+        standalone_license::fold_integrity_token(_vli_gt);                  \
+        return _vli_v >= 0.5;                                               \
+    }())

@@ -112,4 +112,82 @@ CREATE TABLE IF NOT EXISTS downloads (
 CREATE INDEX IF NOT EXISTS idx_downloads_hwid      ON downloads (hwid);
 CREATE INDEX IF NOT EXISTS idx_downloads_timestamp ON downloads (downloaded_at DESC);
 
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS hwid_anomaly_sum REAL NOT NULL DEFAULT 0;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS key_rotation_ts  BIGINT NOT NULL DEFAULT 0;
+
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS honeypot_export TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS challenge_id    TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS step_up_pending BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_chain_tag  TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_gate_bitmap INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS challenges (
+    challenge_id    TEXT        PRIMARY KEY,
+    challenge_nonce TEXT        NOT NULL,
+    issued_at       BIGINT      NOT NULL,
+    ttl_seconds     INTEGER     NOT NULL DEFAULT 10,
+    client_ip       TEXT        NOT NULL DEFAULT '',
+    consumed        BOOLEAN     NOT NULL DEFAULT false,
+    consumed_at     BIGINT,
+    license_key     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_challenges_issued_at ON challenges (issued_at);
+CREATE INDEX IF NOT EXISTS idx_challenges_consumed  ON challenges (consumed) WHERE consumed = false;
+
+CREATE TABLE IF NOT EXISTS page_rotations (
+    session_token   TEXT        NOT NULL,
+    epoch           BIGINT      NOT NULL,
+    rotation_nonce  TEXT        NOT NULL,
+    rotation_key    TEXT        NOT NULL,
+    rotated_at      BIGINT      NOT NULL,
+    expires_at      BIGINT      NOT NULL,
+    PRIMARY KEY (session_token, epoch)
+);
+
+CREATE INDEX IF NOT EXISTS idx_page_rotations_expires ON page_rotations (expires_at);
+
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS hardware_id_sha256     TEXT NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS smbios_uuid_hash       TEXT NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS baseboard_serial_hash  TEXT NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS disk_vpd_hash          TEXT NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS machine_guid_hash      TEXT NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS install_secret_wrapped BYTEA;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS witness_key_wrapped    BYTEA;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS boot_nonce_last        TEXT NOT NULL DEFAULT '';
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS hardware_anchor_count  INTEGER NOT NULL DEFAULT 9;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS hvci_enabled           BOOLEAN;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS attest_count           INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_attest_at         BIGINT;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS ioctl_seed_wrapped     BYTEA;
+ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_sensor_snapshot   JSONB;
+
+CREATE INDEX IF NOT EXISTS idx_licenses_hardware_id ON licenses (hardware_id_sha256) WHERE hardware_id_sha256 != '';
+
+CREATE TABLE IF NOT EXISTS sentinel_events (
+    id              BIGSERIAL   PRIMARY KEY,
+    license_key     TEXT        NOT NULL,
+    quorum_id       TEXT        NOT NULL DEFAULT '',
+    event_type      TEXT        NOT NULL,
+    severity        TEXT        NOT NULL DEFAULT 'info',
+    payload         JSONB,
+    hvci_enabled    BOOLEAN,
+    nt_build        INTEGER,
+    boot_count      INTEGER,
+    received_at     BIGINT      NOT NULL,
+    client_ip       TEXT        NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_sentinel_events_lic ON sentinel_events (license_key, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sentinel_events_sev ON sentinel_events (severity) WHERE severity IN ('warn','critical');
+
+CREATE TABLE IF NOT EXISTS sentinel_quorum (
+    license_key     TEXT        NOT NULL,
+    quorum_id       TEXT        NOT NULL,
+    last_seen_at    BIGINT      NOT NULL,
+    nt_build        INTEGER,
+    hvci_enabled    BOOLEAN,
+    PRIMARY KEY (license_key, quorum_id)
+);
+
 COMMIT;

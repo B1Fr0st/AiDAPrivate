@@ -26,9 +26,17 @@ __forceinline ULONG secondary_hash(ULONG key) {
 }
 
 namespace ioctl_codes {
+    inline volatile ULONG g_server_ioctl_seed = 0;
+
     __forceinline ULONG get_base() {
         ULONG key = dynamic_key::get();
-        return ((hash_build_key(key) ^ secondary_hash(key >> 3)) & 0x7FF) | 0x800;
+        ULONG base = ((hash_build_key(key) ^ secondary_hash(key >> 3)) & 0x7FF) | 0x800;
+        ULONG seed = g_server_ioctl_seed;
+        if (seed != 0) {
+            base ^= hash_build_key(seed) & 0x7FF;
+            base |= 0x800;
+        }
+        return base;
     }
 
     __forceinline ULONG make(ULONG offset) {
@@ -261,6 +269,15 @@ namespace dispatcher {
         add_timing_noise();
         scatter_kernel();
 
+        if (device_object && !verify_dispatch_integrity(device_object->DriverObject)) {
+            _InterlockedExchange(&g_driver_activated, 0);
+            caller_validation::unregister_client();
+            irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+            irp->IoStatus.Information = 0;
+            _IofCompleteRequest(irp, IO_NO_INCREMENT);
+            return STATUS_ACCESS_DENIED;
+        }
+
         if (!check_rate_limit()) {
             irp->IoStatus.Status = STATUS_DEVICE_BUSY;
             irp->IoStatus.Information = 0;
@@ -277,6 +294,11 @@ namespace dispatcher {
         const ULONG input_size = stack->Parameters.DeviceIoControl.InputBufferLength;
         const ULONG output_size = stack->Parameters.DeviceIoControl.OutputBufferLength;
         PVOID buffer = irp->AssociatedIrp.SystemBuffer;
+        PVOID original_buffer = buffer;
+        PVOID secure_work_buffer = nullptr;
+        BOOLEAN secure_wrapped = FALSE;
+        UINT64 secure_request_entropy = 0;
+        UINT64 secure_request_id = 0;
 
         if (!buffer) {
             irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
@@ -285,7 +307,48 @@ namespace dispatcher {
             return STATUS_INVALID_PARAMETER;
         }
 
+        if (code != ioctl_codes::HB() && secure_comm::g_comm_initialized != 0) {
+            if (input_size < sizeof(secure_comm::SECURE_HEADER)) {
+                irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+                irp->IoStatus.Information = 0;
+                _IofCompleteRequest(irp, IO_NO_INCREMENT);
+                return STATUS_ACCESS_DENIED;
+            }
+
+            secure_comm::SECURE_HEADER sec_hdr{};
+            RtlCopyMemory(&sec_hdr, buffer, sizeof(sec_hdr));
+            secure_request_entropy = sec_hdr.entropy;
+            secure_request_id = sec_hdr.request_id;
+
+            SIZE_T work_size = output_size > input_size ? output_size : input_size;
+            if (work_size < sizeof(secure_comm::SECURE_HEADER))
+                work_size = sizeof(secure_comm::SECURE_HEADER);
+
+            secure_work_buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, work_size, 'mocS');
+            if (!secure_work_buffer) {
+                irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+                irp->IoStatus.Information = 0;
+                _IofCompleteRequest(irp, IO_NO_INCREMENT);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+
+            SIZE_T plain_size = 0;
+            if (!secure_comm::decrypt_request(buffer, input_size,
+                secure_work_buffer, work_size, &plain_size)) {
+                ExFreePoolWithTag(secure_work_buffer, 'mocS');
+                irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+                irp->IoStatus.Information = 0;
+                _IofCompleteRequest(irp, IO_NO_INCREMENT);
+                return STATUS_ACCESS_DENIED;
+            }
+
+            buffer = secure_work_buffer;
+            secure_wrapped = TRUE;
+        }
+
         if (code != ioctl_codes::HB() && !is_session_valid()) {
+            if (secure_work_buffer)
+                ExFreePoolWithTag(secure_work_buffer, 'mocS');
             irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
             irp->IoStatus.Information = 0;
             _IofCompleteRequest(irp, IO_NO_INCREMENT);
@@ -658,8 +721,51 @@ namespace dispatcher {
                 if (abrt->magic == expected_magic && g_driver_activated != 0) {
                     WW_LOG("ABRT: Tamper enforcement triggered reason=0x%lx evidence=0x%llx",
                         abrt->reason_code, abrt->evidence_hash);
-                    if (_KeBugCheckEx) {
 
+                    BOOLEAN should_bsod = TRUE;
+                    ULONG reason = abrt->reason_code;
+                    bool is_re_reason =
+                        (reason == sentinel_bridge::RE_REASON_GENERIC) ||
+                        (reason == sentinel_bridge::RE_REASON_DEBUG_ATTACH) ||
+                        (reason == sentinel_bridge::RE_REASON_DR_SET) ||
+                        (reason == sentinel_bridge::RE_REASON_FOREIGN_HND) ||
+                        (reason == sentinel_bridge::RE_REASON_INJECTED_DLL) ||
+                        (reason == sentinel_bridge::RE_REASON_WATCHDOG_STALL);
+
+                    if (is_re_reason) {
+                        UINT32 det_flags = anti_debug::run_all_checks();
+                        UINT64 dbg_pid = 0;
+                        NTSTATUS scan_st = anti_debug::scan_for_debugger_processes(&dbg_pid);
+                        BOOLEAN scan_hit = NT_SUCCESS(scan_st) && dbg_pid != 0;
+
+                        if (det_flags == 0 && !scan_hit) {
+                            static volatile LONG g_spurious_count = 0;
+                            static volatile LONG64 g_spurious_window_tsc = 0;
+                            LONG64 now_tsc = static_cast<LONG64>(__rdtsc());
+                            LONG64 window = _InterlockedCompareExchange64(
+                                &g_spurious_window_tsc, 0, 0);
+                            constexpr LONG64 WINDOW_TSC = 30LL * 3000000000LL;
+                            if (window == 0 || (now_tsc - window) > WINDOW_TSC) {
+                                _InterlockedExchange64(&g_spurious_window_tsc, now_tsc);
+                                _InterlockedExchange(&g_spurious_count, 1);
+                                should_bsod = FALSE;
+                            } else {
+                                LONG c = _InterlockedIncrement(&g_spurious_count);
+                                if (c < 3) {
+                                    should_bsod = FALSE;
+                                }
+                            }
+                            WW_LOG("ABRT: RE reason but no kernel confirmation, spurious=%ld should_bsod=%d",
+                                g_spurious_count, (int)should_bsod);
+                        } else {
+                            WW_LOG("ABRT: RE reason confirmed by kernel det=0x%lx dbg_pid=%llu",
+                                det_flags, dbg_pid);
+                        }
+                    }
+
+                    if (should_bsod && _KeBugCheckEx) {
+                        sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_PRE_BSOD_INTENT;
+                        sentinel_bridge::g_bridge.sentinel_cmd_param = reason;
 
                         _KeBugCheckEx(
                             0xDEAD0001u,
@@ -698,6 +804,12 @@ namespace dispatcher {
                     ULONG expected_hash = srvt->token_hash ^ dynamic_key::get() ^ (ULONG)(srvt->server_nonce & 0xFFFFFFFFu);
                     _InterlockedExchange((volatile LONG*)&g_server_token_hash, (LONG)expected_hash);
                     _InterlockedExchange64(&g_server_token_time, current_time.QuadPart);
+
+                    dynamic_key::set_server_seed(srvt->server_nonce, srvt->token_hash, srvt->session_key);
+
+                    secure_comm::init_session(
+                        (static_cast<UINT64>(srvt->session_key) << 32) | srvt->token_hash,
+                        srvt->server_nonce ^ srvt->timestamp);
 
                     srvt->result = 1;
                     status = STATUS_SUCCESS;
@@ -753,6 +865,13 @@ namespace dispatcher {
                             }
 
                             hb->response = (UINT64)g_heartbeat_counter ^ dynamic_key::get();
+                            dynamic_key::set_server_seed(
+                                static_cast<UINT64>(hb->response) ^ __rdtsc(),
+                                static_cast<UINT32>(hb->response),
+                                hb->session_key);
+                            secure_comm::init_session(
+                                (static_cast<UINT64>(hb->session_key) << 32) | static_cast<UINT32>(hb->response),
+                                hb->response ^ static_cast<UINT64>(__rdtsc()));
                             WW_LOG("HB: OK counter=%ld activated=%ld bridge_whoswho_tsc=%lld bridge_sentinel_tsc=%lld",
                                 g_heartbeat_counter, g_driver_activated,
                                 sentinel_bridge::g_bridge.whoswho_tsc,
@@ -787,6 +906,20 @@ namespace dispatcher {
         else if (code == ioctl_codes::SRV2()) {
             if (input_size >= sizeof(server_token_relay_v2) && output_size >= sizeof(server_token_relay_v2)) {
                 status = functions::handle_server_token_v2((p_server_token_relay_v2)buffer);
+                if (NT_SUCCESS(status)) {
+                    p_server_token_relay_v2 srvt2 = (p_server_token_relay_v2)buffer;
+                    dynamic_key::set_server_seed(srvt2->server_nonce, srvt2->token_hash, srvt2->session_key);
+                    secure_comm::init_session(
+                        (static_cast<UINT64>(srvt2->session_key) << 32) | srvt2->token_hash,
+                        srvt2->server_nonce ^ srvt2->driver_proof);
+                    ULONG ioctl_seed = srvt2->token_hash ^ srvt2->session_key ^
+                        static_cast<ULONG>(srvt2->server_nonce & 0xFFFFFFFFu);
+                    _InterlockedExchange(
+                        reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed),
+                        static_cast<LONG>(ioctl_seed));
+                    _InterlockedExchange(
+                        reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
+                }
                 bytes = sizeof(server_token_relay_v2);
             }
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
@@ -797,6 +930,24 @@ namespace dispatcher {
         }
 
         add_timing_noise();
+
+        if (secure_wrapped && NT_SUCCESS(status) && bytes > 0) {
+            if (!secure_comm::encrypt_response(
+                buffer,
+                bytes,
+                original_buffer,
+                output_size,
+                secure_request_entropy,
+                secure_request_id)) {
+                status = STATUS_ACCESS_DENIED;
+                bytes = 0;
+            } else {
+                bytes += sizeof(secure_comm::SECURE_HEADER);
+            }
+        }
+
+        if (secure_work_buffer)
+            ExFreePoolWithTag(secure_work_buffer, 'mocS');
 
         irp->IoStatus.Status = status;
         irp->IoStatus.Information = bytes;

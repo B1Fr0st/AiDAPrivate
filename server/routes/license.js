@@ -3,16 +3,37 @@
 const express = require('express');
 const crypto = require('crypto');
 const pool = require('../db/pool');
-const { signPayload } = require('../crypto/signing');
+const { signPayload, dualSignPayload } = require('../crypto/signing');
 const { deriveKeySeed } = require('../crypto/arc-encrypt');
+const kwWrap = require('../crypto/kw_wrap');
 
 const router = express.Router();
 
 
 const SESSION_TTL_SECONDS = 3600;
+const SESSION_TTL_GRACE_FACTOR = 1.1;
+const CHALLENGE_TTL_SECONDS = 10;
+const CHALLENGE_REQUIRED = (process.env.CHALLENGE_REQUIRED || '0') === '1';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 const TELEGRAM_BOT_TOKEN  = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID    = process.env.TELEGRAM_CHAT_ID || '';
+
+const ED25519_KEY_ROTATION_NOT_BEFORE = parseInt(process.env.ED25519_KEY_NOT_BEFORE || '0', 10) || 0;
+const ED25519_NEXT_PUBKEY_B64 = process.env.ED25519_NEXT_PUBKEY_B64 || '';
+const ED25519_NEXT_NOT_BEFORE = parseInt(process.env.ED25519_NEXT_NOT_BEFORE || '0', 10) || 0;
+const ED25519_NEXT_NEXT_PUBKEY_B64 = process.env.ED25519_NEXT_NEXT_PUBKEY_B64 || '';
+const ED25519_NEXT_NEXT_NOT_BEFORE = parseInt(process.env.ED25519_NEXT_NEXT_NOT_BEFORE || '0', 10) || 0;
+
+const CHALLENGE_SIGNING_SECRET = process.env.CHALLENGE_SIGNING_SECRET
+    || process.env.ARC_MASTER_SECRET
+    || '';
+
+const HONEYPOT_POOL = [
+    'NtProtectVirtualMemoryEx', 'RtlpSilentSuspend', 'DbgkpHiddenTrace',
+    'KiEnableDebugHook', 'PspInvisibleTerminate', 'RtlSuppressPageTable',
+    'MmGhostMap', 'CmRegisterSilentCallback', 'ObFilterHandleStripped',
+    'PspRemapWithoutPeb', 'IoSealDispatch', 'RtlpFrontendTeleport',
+];
 
 
 function todayStr() {
@@ -50,6 +71,100 @@ function normalizeIp(ip) {
     return typeof ip === 'string' ? ip.replace(/[.:]/g, '_') : 'unknown';
 }
 
+function pickHoneypotExport() {
+    const idx = crypto.randomInt(0, HONEYPOT_POOL.length);
+    const salt = crypto.randomBytes(3).toString('hex');
+    return `${HONEYPOT_POOL[idx]}_${salt}`;
+}
+
+function signChallenge(challengeId, challengeNonce, issuedAt, ttl) {
+    if (!CHALLENGE_SIGNING_SECRET) return '';
+    const canonical = `${challengeId}|${challengeNonce}|${issuedAt}|${ttl}`;
+    return crypto.createHmac('sha256', CHALLENGE_SIGNING_SECRET)
+        .update(canonical)
+        .digest('hex');
+}
+
+async function createChallenge(clientIp) {
+    const challengeId = crypto.randomBytes(12).toString('hex');
+    const challengeNonce = crypto.randomBytes(16).toString('hex');
+    const issuedAt = Math.floor(Date.now() / 1000);
+
+    await pool.query(`
+        INSERT INTO challenges (challenge_id, challenge_nonce, issued_at, ttl_seconds, client_ip, consumed)
+        VALUES ($1, $2, $3, $4, $5, false)
+    `, [challengeId, challengeNonce, issuedAt, CHALLENGE_TTL_SECONDS, clientIp || '']);
+
+    const signature = signChallenge(challengeId, challengeNonce, issuedAt, CHALLENGE_TTL_SECONDS);
+    return { challenge_id: challengeId, challenge_nonce: challengeNonce, issued_at: issuedAt, ttl: CHALLENGE_TTL_SECONDS, signature };
+}
+
+async function consumeChallenge(challengeId, clientSignature, clientIp, licenseKey) {
+    if (!challengeId || typeof challengeId !== 'string' || !/^[a-fA-F0-9]{16,48}$/.test(challengeId)) {
+        return { ok: false, reason: 'invalid_challenge_id' };
+    }
+    const { rows } = await pool.query('SELECT * FROM challenges WHERE challenge_id = $1', [challengeId]);
+    if (rows.length === 0) return { ok: false, reason: 'challenge_not_found' };
+    const ch = rows[0];
+    if (ch.consumed) return { ok: false, reason: 'challenge_consumed' };
+
+    const now = Math.floor(Date.now() / 1000);
+    if (now > (ch.issued_at + ch.ttl_seconds)) {
+        return { ok: false, reason: 'challenge_expired' };
+    }
+
+    if (CHALLENGE_SIGNING_SECRET) {
+        const expected = signChallenge(ch.challenge_id, ch.challenge_nonce, ch.issued_at, ch.ttl_seconds);
+        if (typeof clientSignature !== 'string' || clientSignature.length !== expected.length) {
+            return { ok: false, reason: 'challenge_signature_mismatch' };
+        }
+        const a = Buffer.from(clientSignature, 'utf8');
+        const b = Buffer.from(expected, 'utf8');
+        if (!crypto.timingSafeEqual(a, b)) {
+            return { ok: false, reason: 'challenge_signature_mismatch' };
+        }
+    }
+
+    await pool.query(
+        'UPDATE challenges SET consumed = true, consumed_at = $1, license_key = $2 WHERE challenge_id = $3',
+        [now, licenseKey || null, challengeId]
+    );
+    return { ok: true, challenge_nonce: ch.challenge_nonce };
+}
+
+async function purgeExpiredChallenges() {
+    const cutoff = Math.floor(Date.now() / 1000) - (CHALLENGE_TTL_SECONDS * 10);
+    try {
+        await pool.query('DELETE FROM challenges WHERE issued_at < $1', [cutoff]);
+    } catch (_) { }
+}
+
+setInterval(purgeExpiredChallenges, 60 * 1000).unref();
+
+async function enforceChallenge(body, clientIp, licenseKey) {
+    const challengeId = body && body.challenge_id;
+    const challengeSig = body && body.challenge_signature;
+    if (!challengeId) {
+        if (CHALLENGE_REQUIRED) return { ok: false, reason: 'missing_challenge' };
+        return { ok: true, skipped: true };
+    }
+    return consumeChallenge(challengeId, challengeSig, clientIp, licenseKey);
+}
+
+function buildRotationBlock() {
+    const block = {};
+    if (ED25519_KEY_ROTATION_NOT_BEFORE > 0) block.key_not_before = ED25519_KEY_ROTATION_NOT_BEFORE;
+    if (ED25519_NEXT_PUBKEY_B64) {
+        block.next_key_pubkey = ED25519_NEXT_PUBKEY_B64;
+        block.next_key_not_before = ED25519_NEXT_NOT_BEFORE;
+    }
+    if (ED25519_NEXT_NEXT_PUBKEY_B64) {
+        block.next_next_key_pubkey = ED25519_NEXT_NEXT_PUBKEY_B64;
+        block.next_next_key_not_before = ED25519_NEXT_NEXT_NOT_BEFORE;
+    }
+    return block;
+}
+
 
 async function sendDiscordWebhook(title, fields, color = 0xFF4444) {
     if (!DISCORD_WEBHOOK_URL) return;
@@ -83,7 +198,7 @@ async function sendTelegramAlert(title, fields) {
         }
         text += `\n<i>${new Date().toISOString()}</i>`;
 
-        const url = `https:
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
         await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -148,8 +263,8 @@ async function verifyOrBindHwid(licenseKey, hwid, existingHwid) {
 
 async function storeSession(licenseKey, sessionData) {
     await pool.query(`
-        INSERT INTO sessions (license_key, session_token, server_nonce, issued_at, ttl, hwid, ip, plugin_version, last_heartbeat, kill_flag, heartbeat_count, last_proof_token, last_code_hash, anomaly_score, ip_history, heartbeat_times)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, 0, '', '', 0, ARRAY[$7]::TEXT[], ARRAY[]::BIGINT[])
+        INSERT INTO sessions (license_key, session_token, server_nonce, issued_at, ttl, hwid, ip, plugin_version, last_heartbeat, kill_flag, heartbeat_count, last_proof_token, last_code_hash, anomaly_score, ip_history, heartbeat_times, honeypot_export, challenge_id, step_up_pending, last_chain_tag)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, 0, '', '', 0, ARRAY[$7]::TEXT[], ARRAY[]::BIGINT[], $10, $11, false, '')
         ON CONFLICT (license_key) DO UPDATE SET
             session_token     = EXCLUDED.session_token,
             server_nonce      = EXCLUDED.server_nonce,
@@ -165,7 +280,11 @@ async function storeSession(licenseKey, sessionData) {
             last_code_hash    = '',
             anomaly_score     = 0,
             ip_history        = ARRAY[EXCLUDED.ip]::TEXT[],
-            heartbeat_times   = ARRAY[]::BIGINT[]
+            heartbeat_times   = ARRAY[]::BIGINT[],
+            honeypot_export   = EXCLUDED.honeypot_export,
+            challenge_id      = EXCLUDED.challenge_id,
+            step_up_pending   = false,
+            last_chain_tag    = ''
     `, [
         licenseKey,
         sessionData.session_token,
@@ -176,6 +295,8 @@ async function storeSession(licenseKey, sessionData) {
         sessionData.ip,
         sessionData.plugin_version,
         sessionData.last_heartbeat,
+        sessionData.honeypot_export || '',
+        sessionData.challenge_id || '',
     ]);
 }
 
@@ -326,6 +447,12 @@ async function handleValidate(body, clientIp) {
     }
 
 
+    const chResult = await enforceChallenge(body, clientIp, license_key);
+    if (!chResult.ok) {
+        return { status: 200, body: { status: 'invalid', reason: chResult.reason } };
+    }
+
+
     const hwidResult = await verifyOrBindHwid(license_key, hwid, lookup.data.hwid || '');
     if (!hwidResult.ok) {
         return { status: 200, body: { status: 'invalid', reason: hwidResult.reason } };
@@ -336,6 +463,7 @@ async function handleValidate(body, clientIp) {
     const serverNonce = generateServerNonce();
     const issuedAt = Math.floor(Date.now() / 1000);
     const ttl = SESSION_TTL_SECONDS;
+    const honeypotExport = pickHoneypotExport();
 
     await storeSession(license_key, {
         session_token: sessionToken,
@@ -346,6 +474,8 @@ async function handleValidate(body, clientIp) {
         ip: clientIp,
         plugin_version: plugin_version || 'unknown',
         last_heartbeat: issuedAt,
+        honeypot_export: honeypotExport,
+        challenge_id: (body && body.challenge_id) || '',
     });
 
 
@@ -362,12 +492,19 @@ async function handleValidate(body, clientIp) {
         server_nonce: serverNonce,
         client_nonce,
         key_seed: keySeed.toString('hex'),
+        honeypot_export: honeypotExport,
+        ttl_grace_factor: SESSION_TTL_GRACE_FACTOR,
     };
-    const signature = signPayload(sigPayload);
+    const rotationBlock = buildRotationBlock();
+    Object.assign(sigPayload, rotationBlock);
+    const { signature, next_signature } = dualSignPayload(sigPayload);
+
+    const responseBody = { ...sigPayload, signature };
+    if (next_signature) responseBody.next_signature = next_signature;
 
     return {
         status: 200,
-        body: { ...sigPayload, signature },
+        body: responseBody,
     };
 }
 
@@ -414,7 +551,7 @@ async function handleHeartbeat(body, clientIp) {
 
     const now = Math.floor(Date.now() / 1000);
     if (session.issued_at && session.ttl) {
-        const expiresAt = session.issued_at + Math.floor(session.ttl * 1.5);
+        const expiresAt = session.issued_at + Math.floor(session.ttl * SESSION_TTL_GRACE_FACTOR);
         if (now > expiresAt) {
             return { status: 200, body: { status: 'invalid', reason: 'session_expired' } };
         }
@@ -422,6 +559,24 @@ async function handleHeartbeat(body, clientIp) {
 
     if (hwid && session.hwid && hwid !== session.hwid) {
         return { status: 200, body: { status: 'invalid', reason: 'hwid_mismatch' } };
+    }
+
+
+    const chHbResult = await enforceChallenge(body, clientIp, license_key);
+    if (!chHbResult.ok) {
+        return { status: 200, body: { status: 'invalid', reason: chHbResult.reason } };
+    }
+
+
+    if (session.honeypot_export && Array.isArray(body.called_honeypot_names)) {
+        for (const nm of body.called_honeypot_names) {
+            if (typeof nm === 'string' && nm === session.honeypot_export) {
+                await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
+                await revokeLicenseAndSession(license_key, 'honeypot_export_called', body.plugin_version, hwid || session.hwid);
+                await recordBan(hwid || session.hwid, clientIp, 'honeypot_export_called', body.plugin_version);
+                return { status: 200, body: { status: 'killed', alive: false, reason: 'honeypot' } };
+            }
+        }
     }
 
     let anomalyDelta = 0;
@@ -453,6 +608,22 @@ async function handleHeartbeat(body, clientIp) {
             anomalyDelta += 50;
             anomalyReasons.push('code_hash_mismatch');
         }
+    }
+
+    // Phase 5.2: gate bitmap monotonic check. Client accumulates which gates
+    // fired this session (anti_re, driver, sentinel, etc.) into a 24-bit
+    // integer. Within one session the bitmap can only grow; shrinking means
+    // the client dropped a gate check it had previously run.
+    const prevGateBitmap = Number(session.last_gate_bitmap || 0);
+    const curGateBitmap  = Number(body.gate_bitmap || 0) | 0;
+    if (curGateBitmap >= 0 && curGateBitmap < (1 << 24)) {
+        if (prevGateBitmap !== 0 && (curGateBitmap & prevGateBitmap) !== prevGateBitmap) {
+            anomalyDelta += 35;
+            anomalyReasons.push('gate_bitmap_regression');
+        }
+    } else if (body.gate_bitmap !== undefined) {
+        anomalyDelta += 10;
+        anomalyReasons.push('gate_bitmap_invalid');
     }
 
     const ipHistory = session.ip_history || [];
@@ -491,7 +662,52 @@ async function handleHeartbeat(body, clientIp) {
         }
     }
 
-    const newAnomalyScore = Math.min(100, (session.anomaly_score || 0) + anomalyDelta);
+    const stepUpOk = !session.step_up_pending
+        || (typeof body.step_up_response === 'string' && body.step_up_response.length >= 32);
+    if (session.step_up_pending && !stepUpOk) {
+        anomalyDelta += 10;
+        anomalyReasons.push('step_up_missing');
+    }
+
+    const priorScore = Number(session.anomaly_score || 0);
+    let nextScore = priorScore + anomalyDelta;
+    if (anomalyDelta === 0) {
+        nextScore = Math.max(0, priorScore - 2);
+    }
+    nextScore = Math.max(0, Math.min(100, nextScore));
+
+    let stepUpPending = session.step_up_pending || false;
+    let stepUpNonce = '';
+    let degradationFactor = 0.0;
+    let tierLabel = 'clean';
+    if (nextScore >= 100) tierLabel = 'nuclear';
+    else if (nextScore >= 80) {
+        tierLabel = 'degrade';
+        degradationFactor = Math.min(1.0, (nextScore - 80) / 20.0);
+    } else if (nextScore >= 60) {
+        tierLabel = 'stepup';
+        if (!stepUpPending) {
+            stepUpPending = true;
+            stepUpNonce = crypto.randomBytes(16).toString('hex');
+        }
+    } else if (nextScore >= 40) {
+        tierLabel = 'silent';
+    } else {
+        stepUpPending = false;
+    }
+
+    if (stepUpOk && session.step_up_pending && nextScore < 60) {
+        stepUpPending = false;
+    }
+
+    let crossSessionSum = Number(lookup.data.hwid_anomaly_sum || 0);
+    if (anomalyDelta > 0) {
+        crossSessionSum += anomalyDelta;
+        await pool.query(
+            'UPDATE licenses SET hwid_anomaly_sum = $1 WHERE key = $2',
+            [crossSessionSum, license_key]
+        );
+    }
 
     await pool.query(`
         UPDATE sessions SET
@@ -501,35 +717,42 @@ async function handleHeartbeat(body, clientIp) {
             last_code_hash    = $3,
             anomaly_score     = $4,
             ip_history        = $5,
-            heartbeat_times   = $6
-        WHERE license_key = $7
+            heartbeat_times   = $6,
+            step_up_pending   = $7,
+            last_gate_bitmap  = $9
+        WHERE license_key = $8
     `, [
         now,
         (typeof proof_token === 'string' ? proof_token : ''),
         (typeof code_hash === 'string' ? code_hash : session.last_code_hash || ''),
-        newAnomalyScore,
+        nextScore,
         newIpHistory,
         newHbTimes,
+        stepUpPending,
         license_key,
+        Math.max(prevGateBitmap, curGateBitmap & ((1 << 24) - 1)),
     ]);
 
-    if (newAnomalyScore >= 80) {
+    if (nextScore >= 80 && anomalyDelta > 0) {
         const fields = [
             { name: 'License', value: `\`${license_key}\`` },
             { name: 'HWID', value: `\`${hwid || session.hwid || 'unknown'}\`` },
             { name: 'IP', value: `\`${clientIp}\`` },
-            { name: 'Score', value: `${newAnomalyScore}/100` },
+            { name: 'Score', value: `${nextScore}/100` },
+            { name: 'Tier', value: tierLabel },
+            { name: 'CrossSession', value: `${crossSessionSum}` },
             { name: 'Flags', value: anomalyReasons.join(', ') || 'accumulated' },
         ];
         await sendDiscordWebhook('\u26A0\uFE0F Anomaly Threshold Reached', fields, 0xFFA500);
         await sendTelegramAlert('\u26A0\uFE0F Anomaly Threshold Reached', fields);
     }
 
-    if (newAnomalyScore >= 100) {
+    if (nextScore >= 100 || crossSessionSum >= 300) {
         await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
-        await revokeLicenseAndSession(license_key, 'anomaly_auto_kill', body.plugin_version, hwid || session.hwid);
-        await recordBan(hwid || session.hwid, clientIp, 'anomaly_auto_kill', body.plugin_version);
-        return { status: 200, body: { status: 'killed', alive: false, reason: 'anomaly' } };
+        const killReason = crossSessionSum >= 300 ? 'cross_session_anomaly_ban' : 'anomaly_auto_kill';
+        await revokeLicenseAndSession(license_key, killReason, body.plugin_version, hwid || session.hwid);
+        await recordBan(hwid || session.hwid, clientIp, killReason, body.plugin_version);
+        return { status: 200, body: { status: 'killed', alive: false, reason: killReason } };
     }
 
     const heartbeatNonce = body.heartbeat_nonce || '';
@@ -546,12 +769,22 @@ async function handleHeartbeat(body, clientIp) {
         heartbeat_nonce: heartbeatNonce,
         server_nonce: serverNonce,
         page_epoch: pageEpoch,
+        anomaly_score: nextScore,
+        anomaly_tier: tierLabel,
+        degradation_factor: degradationFactor,
+        ttl_grace_factor: SESSION_TTL_GRACE_FACTOR,
     };
-    const signature = signPayload(sigPayload);
+    if (stepUpPending && stepUpNonce) sigPayload.step_up_nonce = stepUpNonce;
+    const rotationBlock = buildRotationBlock();
+    Object.assign(sigPayload, rotationBlock);
+    const { signature, next_signature } = dualSignPayload(sigPayload);
+
+    const responseBody = { ...sigPayload, signature };
+    if (next_signature) responseBody.next_signature = next_signature;
 
     return {
         status: 200,
-        body: { ...sigPayload, signature },
+        body: responseBody,
     };
 }
 
@@ -734,6 +967,41 @@ async function handleDriverProof(body, clientIp) {
     }
 
 
+    if (body.proof_version === 3) {
+        const lic = await lookupLicense(license_key);
+        if (!lic || !lic.witness_key_wrapped) {
+            return { status: 200, body: { status: 'invalid', reason: 'kw_not_issued' } };
+        }
+        let kw;
+        try { kw = kwWrap.unwrap(lic.witness_key_wrapped, 'kw/v1'); }
+        catch (_) { return { status: 200, body: { status: 'invalid', reason: 'kw_unwrap_failed' } }; }
+
+        const { token_hash, tsc, cr3, boot_nonce, hardware_id } = body;
+        if (!token_hash || !boot_nonce || !hardware_id) {
+            return { status: 400, body: { status: 'error', reason: 'proof_v3_missing_fields' } };
+        }
+        if (lic.hardware_id_sha256 && lic.hardware_id_sha256 !== hardware_id) {
+            return { status: 200, body: { status: 'invalid', reason: 'hardware_mismatch' } };
+        }
+        const subkey = kwWrap.deriveKwSubkey(kw, 'driver_proof/v3');
+        const canonical = `${token_hash}|${server_nonce || session.server_nonce}|${tsc || 0}|${cr3 || 0}|${boot_nonce}|${hardware_id}`;
+        const expected = crypto.createHmac('sha256', subkey).update(canonical).digest('hex');
+        const aBuf = Buffer.from(expected, 'utf8');
+        const bBuf = Buffer.from(String(driver_proof), 'utf8');
+        if (aBuf.length !== bBuf.length || !crypto.timingSafeEqual(aBuf, bBuf)) {
+            const newScore = Math.min(100, (session.anomaly_score || 0) + 50);
+            await pool.query('UPDATE sessions SET anomaly_score = $1 WHERE license_key = $2', [newScore, license_key]);
+            if (newScore >= 100) {
+                await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
+                await revokeLicenseAndSession(license_key, 'proof_v3_mismatch', body.plugin_version, hwid);
+                await recordBan(hwid, clientIp, 'proof_v3_mismatch', body.plugin_version);
+                return { status: 200, body: { status: 'killed', alive: false } };
+            }
+            return { status: 200, body: { status: 'invalid', reason: 'proof_v3_mismatch', anomaly_score: newScore } };
+        }
+    }
+
+
     await pool.query(
         'UPDATE sessions SET last_proof_token = $1 WHERE license_key = $2',
         [driver_proof, license_key]
@@ -795,6 +1063,17 @@ router.post('/honeypot', async (req, res) => {
     } catch (err) {
         console.error('[sentinel] Honeypot handler error:', err);
         return res.status(200).json({ status: 'ok' });
+    }
+});
+
+router.get('/challenge', async (req, res) => {
+    try {
+        const clientIp = getClientIp(req);
+        const challenge = await createChallenge(clientIp);
+        return res.status(200).json({ status: 'ok', ...challenge });
+    } catch (err) {
+        console.error('[challenge] Error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }
 });
 

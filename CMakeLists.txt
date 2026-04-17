@@ -315,6 +315,67 @@ add_custom_target(ghidra_specs ALL DEPENDS
     "${GHIDRA_SPECS_OUTPUT_DIR}/x86.ldefs"
 )
 
+# --- Auto-encrypt embedded driver/mapper byte arrays ---
+# When WhosWho.c, Sentinel.c, or WindMapper.c change, the corresponding
+# encrypted headers are regenerated so driver_loader.cpp picks up the new bytes.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_FOUND)
+    # WhosWho.c  ->  src/whoswho_encrypted.h
+    add_custom_command(
+        OUTPUT "${CMAKE_BINARY_DIR}/whoswho_encrypted.stamp"
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_whoswho.py"
+        COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/whoswho_encrypted.stamp"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/WhosWho.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_whoswho.py"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Encrypting WhosWho.c -> whoswho_encrypted.h"
+        VERBATIM
+    )
+
+    # Sentinel.c  ->  src/sentinel_encrypted.h
+    add_custom_command(
+        OUTPUT "${CMAKE_BINARY_DIR}/sentinel_encrypted.stamp"
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_sentinel.py"
+        COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_BINARY_DIR}/sentinel_encrypted.stamp"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/Sentinel.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/encrypt_sentinel.py"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Encrypting Sentinel.c -> sentinel_encrypted.h"
+        VERBATIM
+    )
+
+    add_custom_target(encrypt_drivers DEPENDS
+        "${CMAKE_BINARY_DIR}/whoswho_encrypted.stamp"
+        "${CMAKE_BINARY_DIR}/sentinel_encrypted.stamp"
+    )
+else()
+    message(WARNING "Python3 not found -- encrypt_drivers target disabled. "
+                    "Re-run encrypt scripts manually after updating WhosWho.c / Sentinel.c.")
+endif()
+
+# Track the generated encrypted headers so MSVC recompiles driver_loader.cpp
+# when they change (even outside the encrypt_drivers flow).
+set(ENCRYPTED_DRIVER_HEADERS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/whoswho_encrypted.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/sentinel_encrypted.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/windmapper_embedded.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/windmapper_data.inc"
+)
+set_source_files_properties(
+    src/driver_loader.cpp
+    PROPERTIES OBJECT_DEPENDS "${ENCRYPTED_DRIVER_HEADERS}"
+)
+
+# Track #include'd asset .c files so embedded_assets.cpp rebuilds when they change.
+set(EMBEDDED_ASSET_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/aidalogo.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/background.c"
+)
+set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src/helpers/embedded_assets.cpp"
+    PROPERTIES OBJECT_DEPENDS "${EMBEDDED_ASSET_FILES}"
+)
+
 if(BUILD_AIDA_PLUGIN)
     if(NOT DEFINED IDASDK_DIR)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ida-sdk/src/include/ida.hpp")
@@ -579,6 +640,9 @@ if(WIN32)
             driver/comm.cpp
             src/net_security.cpp
             src/emulation_engine.cpp
+            "${STANDALONE_ROOT}/core/tls_exporter.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/telemetry/telemetry_client.cpp"
         )
 
         set(IMGUI_SOURCES
@@ -615,6 +679,7 @@ if(WIN32)
             "${STANDALONE_ROOT}"
             "${STANDALONE_ROOT}/core"
             "${STANDALONE_ROOT}/core/arc"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/shared"
             "${CMAKE_BINARY_DIR}/_imgui_wrapper"
             "${imgui_SOURCE_DIR}"
             "${imgui_SOURCE_DIR}/backends"
@@ -732,6 +797,9 @@ if(WIN32)
         )
 
         add_dependencies(AiDAStandalone ghidra_specs)
+        if(TARGET encrypt_drivers)
+            add_dependencies(AiDAStandalone encrypt_drivers)
+        endif()
 
         # Post-build copies removed — libz3.dll and ghidra_specs are now
         # embedded as Win32 resources inside the .exe via aida_embedded.rc.
@@ -880,9 +948,16 @@ set(AIDA_HEADERS
     src/driver_loader.hpp
     src/net_security.hpp
     src/emulation_engine.hpp
+    src/whoswho_encrypted.h
+    src/sentinel_encrypted.h
+    src/windmapper_embedded.h
 )
 
 add_library(AiDA SHARED ${AIDA_SOURCES} ${AIDA_HEADERS} ${AIDA_ASM_SOURCES})
+
+if(TARGET encrypt_drivers)
+    add_dependencies(AiDA encrypt_drivers)
+endif()
 
 if(WIN32)
     target_sources(AiDA PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/AiDA.def")

@@ -7,6 +7,52 @@
 #include <Crypter.h>
 #include <imports/Strings.h>
 
+// Process access rights — not available in kernel-mode WDK headers
+#ifndef PROCESS_TERMINATE
+#define PROCESS_TERMINATE           0x0001
+#endif
+#ifndef PROCESS_CREATE_THREAD
+#define PROCESS_CREATE_THREAD       0x0002
+#endif
+#ifndef PROCESS_SET_INFORMATION
+#define PROCESS_SET_INFORMATION     0x0200
+#endif
+#ifndef PROCESS_VM_OPERATION
+#define PROCESS_VM_OPERATION        0x0008
+#endif
+#ifndef PROCESS_VM_READ
+#define PROCESS_VM_READ             0x0010
+#endif
+#ifndef PROCESS_VM_WRITE
+#define PROCESS_VM_WRITE            0x0020
+#endif
+#ifndef PROCESS_DUP_HANDLE
+#define PROCESS_DUP_HANDLE          0x0040
+#endif
+#ifndef PROCESS_QUERY_INFORMATION
+#define PROCESS_QUERY_INFORMATION   0x0400
+#endif
+#ifndef PROCESS_SUSPEND_RESUME
+#define PROCESS_SUSPEND_RESUME      0x0800
+#endif
+
+// PsGetProcessImageFileName — exported by ntoskrnl but not in all WDK headers
+extern "C" UCHAR* NTAPI PsGetProcessImageFileName(PEPROCESS Process);
+
+// Thread access rights — not available in kernel-mode WDK headers
+#ifndef THREAD_TERMINATE
+#define THREAD_TERMINATE            0x0001
+#endif
+#ifndef THREAD_SUSPEND_RESUME
+#define THREAD_SUSPEND_RESUME       0x0002
+#endif
+#ifndef THREAD_GET_CONTEXT
+#define THREAD_GET_CONTEXT          0x0008
+#endif
+#ifndef THREAD_SET_CONTEXT
+#define THREAD_SET_CONTEXT          0x0010
+#endif
+
 
 typedef struct _LDR_DATA_TABLE_ENTRY {
     LIST_ENTRY     InLoadOrderModuleList;
@@ -195,6 +241,8 @@ inline NTSTATUS           (NTAPI* _PsTerminateSystemThread)         (NTSTATUS);
 
 inline VOID               (NTAPI* _ObfDereferenceObject)            (PVOID);
 inline NTSTATUS           (NTAPI* _ObReferenceObjectByName)         (PUNICODE_STRING, ULONG, PACCESS_STATE, ACCESS_MASK, POBJECT_TYPE, KPROCESSOR_MODE, PVOID, PVOID*);
+inline NTSTATUS           (NTAPI* _ObRegisterCallbacks)             (POB_CALLBACK_REGISTRATION, PVOID*);
+inline VOID               (NTAPI* _ObUnRegisterCallbacks)           (PVOID);
 inline NTSTATUS           (NTAPI* _ZwClose)                         (HANDLE);
 
 
@@ -224,6 +272,8 @@ inline NTSTATUS           (NTAPI* _IoCreateFileEx)                  (PHANDLE, AC
 
 
 inline NTSTATUS           (NTAPI* _PsSetCreateProcessNotifyRoutine) (PCREATE_PROCESS_NOTIFY_ROUTINE, BOOLEAN);
+typedef VOID (NTAPI* PCREATE_PROCESS_NOTIFY_ROUTINE_EX)(PEPROCESS, HANDLE, PPS_CREATE_NOTIFY_INFO);
+inline NTSTATUS           (NTAPI* _PsSetCreateProcessNotifyRoutineEx) (PCREATE_PROCESS_NOTIFY_ROUTINE_EX, BOOLEAN);
 inline NTSTATUS           (NTAPI* _PsSetLoadImageNotifyRoutine)     (PLOAD_IMAGE_NOTIFY_ROUTINE);
 inline NTSTATUS           (NTAPI* _PsRemoveLoadImageNotifyRoutine)  (PLOAD_IMAGE_NOTIFY_ROUTINE);
 
@@ -277,6 +327,8 @@ inline bool SetupFunctions() {
 
     *(PVOID*)&_ObfDereferenceObject         = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObfDereferenceObject"));
     *(PVOID*)&_ObReferenceObjectByName      = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObReferenceObjectByName"));
+    *(PVOID*)&_ObRegisterCallbacks          = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObRegisterCallbacks"));
+    *(PVOID*)&_ObUnRegisterCallbacks        = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObUnRegisterCallbacks"));
     *(PVOID*)&_ZwClose                      = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwClose"));
 
 
@@ -306,6 +358,7 @@ inline bool SetupFunctions() {
 
 
     *(PVOID*)&_PsSetCreateProcessNotifyRoutine = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetCreateProcessNotifyRoutine"));
+    *(PVOID*)&_PsSetCreateProcessNotifyRoutineEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetCreateProcessNotifyRoutineEx"));
     *(PVOID*)&_PsSetLoadImageNotifyRoutine     = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetLoadImageNotifyRoutine"));
     *(PVOID*)&_PsRemoveLoadImageNotifyRoutine  = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsRemoveLoadImageNotifyRoutine"));
 

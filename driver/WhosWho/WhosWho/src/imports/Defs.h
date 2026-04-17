@@ -7,6 +7,38 @@
 #include <Crypter.h>
 #include <imports/Strings.h>
 
+// Process access rights — not available in kernel-mode WDK headers
+#ifndef PROCESS_TERMINATE
+#define PROCESS_TERMINATE           0x0001
+#endif
+#ifndef PROCESS_CREATE_THREAD
+#define PROCESS_CREATE_THREAD       0x0002
+#endif
+#ifndef PROCESS_SET_INFORMATION
+#define PROCESS_SET_INFORMATION     0x0200
+#endif
+#ifndef PROCESS_VM_OPERATION
+#define PROCESS_VM_OPERATION        0x0008
+#endif
+#ifndef PROCESS_VM_READ
+#define PROCESS_VM_READ             0x0010
+#endif
+#ifndef PROCESS_VM_WRITE
+#define PROCESS_VM_WRITE            0x0020
+#endif
+#ifndef PROCESS_DUP_HANDLE
+#define PROCESS_DUP_HANDLE          0x0040
+#endif
+#ifndef PROCESS_QUERY_INFORMATION
+#define PROCESS_QUERY_INFORMATION   0x0400
+#endif
+#ifndef PROCESS_SUSPEND_RESUME
+#define PROCESS_SUSPEND_RESUME      0x0800
+#endif
+
+// PsGetProcessImageFileName — exported by ntoskrnl but not in all WDK headers
+extern "C" UCHAR* NTAPI PsGetProcessImageFileName(PEPROCESS Process);
+
 typedef struct _LDR_DATA_TABLE_ENTRY {
     LIST_ENTRY     InLoadOrderModuleList;
     UCHAR          _Reserved0[0x20];
@@ -173,6 +205,7 @@ inline VOID               (NTAPI* _IRQL_requires_max_(HIGH_LEVEL) _KeLowerIrql) 
 inline BOOLEAN            (NTAPI* _MmIsAddressValid)               (PVOID);
 inline NTSTATUS           (NTAPI* _ZwOpenProcess)                  (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
 inline NTSTATUS           (NTAPI* _ZwClose)                        (HANDLE);
+inline NTSTATUS           (NTAPI* _ZwTerminateProcess)             (HANDLE, NTSTATUS);
 
 inline PMDL               (NTAPI* _IoAllocateMdl)                  (PVOID, ULONG, BOOLEAN, BOOLEAN, PIRP);
 inline VOID               (NTAPI* _IoFreeMdl)                      (PMDL);
@@ -227,6 +260,10 @@ inline VOID               (NTAPI* _KeFlushQueuedDpcs)              (VOID);
 
 inline NTSTATUS           (NTAPI* _ObRegisterCallbacks)             (POB_CALLBACK_REGISTRATION, PVOID*);
 inline VOID               (NTAPI* _ObUnRegisterCallbacks)           (PVOID);
+
+typedef VOID (NTAPI* PCREATE_PROCESS_NOTIFY_ROUTINE_EX)(
+    PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo);
+inline NTSTATUS           (NTAPI* _PsSetCreateProcessNotifyRoutineEx)(PCREATE_PROCESS_NOTIFY_ROUTINE_EX, BOOLEAN);
 
 inline ULONG              (__cdecl* _DbgPrintEx)                   (ULONG, ULONG, PCSTR, ...);
 
@@ -618,6 +655,7 @@ inline bool SetupFunctions() {
     *(PVOID*)&_MmIsAddressValid = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmIsAddressValid"));
     *(PVOID*)&_ZwOpenProcess = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwOpenProcess"));
     *(PVOID*)&_ZwClose = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwClose"));
+    *(PVOID*)&_ZwTerminateProcess = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwTerminateProcess"));
 
     *(PVOID*)&_IoAllocateMdl = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoAllocateMdl"));
     *(PVOID*)&_IoFreeMdl = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoFreeMdl"));
@@ -672,6 +710,8 @@ inline bool SetupFunctions() {
 
     *(PVOID*)&_ObRegisterCallbacks = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObRegisterCallbacks"));
     *(PVOID*)&_ObUnRegisterCallbacks = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObUnRegisterCallbacks"));
+
+    *(PVOID*)&_PsSetCreateProcessNotifyRoutineEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsSetCreateProcessNotifyRoutineEx"));
 
     *(PVOID*)&_DbgPrintEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("DbgPrintEx"));
 

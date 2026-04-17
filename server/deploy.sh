@@ -123,7 +123,7 @@ ARC_MASTER_SECRET=${ARC_SECRET}
 DISCORD_WEBHOOK_URL=
 ARC_BLOB_PATH=/opt/aida/arc/aida_core.bin
 AIDA_BINARY_PATH=/opt/aida/bin/AiDA.exe
-PORT=3000
+PORT=3001
 NODE_ENV=production
 ENVEOF
 
@@ -214,7 +214,7 @@ echo "  AiDA License Server — Deployment Complete"
 echo "============================================================================"
 echo ""
 echo "  Server:   https://aidapro.net (23.88.62.199)"
-echo "  API Port: 3000 (proxied via Nginx on 443)"
+echo "  API Port: 3001 (proxied via Nginx on 443)"
 echo "  PM2 Name: aida-api"
 echo ""
 echo "  Endpoints:"

@@ -164,6 +164,130 @@ namespace dll_protection {
     }
 
 
+    static BOOLEAN check_debug_port_eprocess(UINT32 pid, UINT64* out_port) {
+        *out_port = 0;
+        if (pid == 0) return FALSE;
+
+        PEPROCESS process = nullptr;
+        NTSTATUS st = PsLookupProcessByProcessId((HANDLE)(UINT_PTR)pid, &process);
+        if (!NT_SUCCESS(st) || !process)
+            return FALSE;
+
+        BOOLEAN detected = FALSE;
+        __try {
+            UINT8* eprocess = (UINT8*)process;
+            volatile PVOID* debug_port = (volatile PVOID*)(eprocess + 0x578);
+            if (_MmIsAddressValid((PVOID)debug_port)) {
+                PVOID port = *debug_port;
+                if (port != nullptr) {
+                    *out_port = (UINT64)(ULONG_PTR)port;
+                    detected = TRUE;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            detected = FALSE;
+        }
+
+        ObDereferenceObject(process);
+        return detected;
+    }
+
+
+    static BOOLEAN check_foreign_instrumentation(UINT32 pid, UINT64* out_cb) {
+        *out_cb = 0;
+        if (pid == 0) return FALSE;
+
+        PEPROCESS process = nullptr;
+        NTSTATUS st = PsLookupProcessByProcessId((HANDLE)(UINT_PTR)pid, &process);
+        if (!NT_SUCCESS(st) || !process)
+            return FALSE;
+
+        BOOLEAN detected = FALSE;
+        __try {
+            UINT8* eprocess = (UINT8*)process;
+            volatile PVOID* instr_cb = (volatile PVOID*)(eprocess + 0x460);
+            if (_MmIsAddressValid((PVOID)instr_cb)) {
+                PVOID cb = *instr_cb;
+                if (cb != nullptr) {
+                    *out_cb = (UINT64)(ULONG_PTR)cb;
+                    detected = TRUE;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            detected = FALSE;
+        }
+
+        ObDereferenceObject(process);
+        return detected;
+    }
+
+
+    static BOOLEAN scan_thread_drs(UINT32 pid, UINT64 text_va, UINT32 text_size,
+                                   UINT32* out_tid, int* out_index, UINT64* out_dr_value) {
+        *out_tid = 0;
+        *out_index = -1;
+        *out_dr_value = 0;
+
+        if (!_PsGetNextProcessThread || !_PsGetContextThread)
+            return FALSE;
+
+        PEPROCESS process = nullptr;
+        NTSTATUS st = PsLookupProcessByProcessId((HANDLE)(UINT_PTR)pid, &process);
+        if (!NT_SUCCESS(st) || !process)
+            return FALSE;
+
+        UINT64 text_end = text_va + text_size;
+        BOOLEAN found = FALSE;
+        PETHREAD thread = nullptr;
+        int scanned = 0;
+
+        __try {
+            while ((thread = _PsGetNextProcessThread(process, thread)) != nullptr) {
+                if (++scanned > 256) break;
+
+                CONTEXT ctx = {};
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                NTSTATUS ctx_st = _PsGetContextThread(thread, &ctx, KernelMode);
+                if (!NT_SUCCESS(ctx_st))
+                    continue;
+
+                UINT64 drs[4] = { ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3 };
+                for (int i = 0; i < 4; ++i) {
+                    if (drs[i] != 0 && drs[i] >= text_va && drs[i] < text_end) {
+                        *out_tid = (UINT32)(ULONG_PTR)PsGetThreadId(thread);
+                        *out_index = i;
+                        *out_dr_value = drs[i];
+                        found = TRUE;
+                        break;
+                    }
+                }
+
+                if (!found && (ctx.Dr7 & 0x55ULL) != 0) {
+                    UINT8 enabled_mask = (UINT8)(ctx.Dr7 & 0x55ULL);
+                    for (int i = 0; i < 4; ++i) {
+                        if (enabled_mask & (1 << (i * 2))) {
+                            if (drs[i] != 0) {
+                                *out_tid = (UINT32)(ULONG_PTR)PsGetThreadId(thread);
+                                *out_index = 4 + i;
+                                *out_dr_value = drs[i];
+                                found = TRUE;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (found) break;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            found = FALSE;
+        }
+
+        ObDereferenceObject(process);
+        return found;
+    }
+
+
     static int find_slot(UINT32 pid, UINT64 module_base) {
         for (int i = 0; i < (int)MAX_PROTECT_SLOTS; i++) {
             if (_InterlockedCompareExchange(&g_slots[i].active, 1, 1) == 1 &&
@@ -242,6 +366,42 @@ namespace dll_protection {
                 KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)slot.pid,
                              (ULONG_PTR)slot.text_va, 0xDB6u, (ULONG_PTR)i);
                 return;
+            }
+
+
+            UINT64 debug_port = 0;
+            if (check_debug_port_eprocess(slot.pid, &debug_port)) {
+                slot.status = DPRT_STATUS_DEBUGGER;
+                _InterlockedExchange(&slot.active, 0);
+                KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)slot.pid,
+                             (ULONG_PTR)slot.text_va, (ULONG_PTR)debug_port, 0xDBDBu);
+                return;
+            }
+
+
+            {
+                UINT32 bad_tid = 0;
+                int dr_idx = -1;
+                UINT64 dr_val = 0;
+                if (scan_thread_drs(slot.pid, slot.text_va, slot.text_size,
+                                    &bad_tid, &dr_idx, &dr_val)) {
+                    slot.status = DPRT_STATUS_DEBUGGER;
+                    _InterlockedExchange(&slot.active, 0);
+                    KeBugCheckEx(0xDEAD0ADAu, (ULONG_PTR)slot.pid,
+                                 (ULONG_PTR)bad_tid,
+                                 (ULONG_PTR)dr_val,
+                                 (ULONG_PTR)(0xD7D70000u | (UINT32)dr_idx));
+                    return;
+                }
+            }
+
+
+            {
+                UINT64 instr_cb = 0;
+                if (check_foreign_instrumentation(slot.pid, &instr_cb)) {
+                    sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
+                    sentinel_bridge::g_bridge.sentinel_cmd_param = (ULONG)(instr_cb & 0xFFFFFFFFu);
+                }
             }
 
 

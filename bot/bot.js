@@ -414,6 +414,59 @@ const commands = [
     new SlashCommandBuilder()
         .setName('dashboard')
         .setDescription('📊 Combined dashboard: stats, recent activity, bans'),
+
+    // /extend_all (Phase 6 admin)
+    new SlashCommandBuilder()
+        .setName('extend_all')
+        .setDescription('📅 Extend EVERY active license by N days (use with care)')
+        .addIntegerOption(opt =>
+            opt.setName('days')
+               .setDescription('Number of days to add to every active license')
+               .setRequired(true)
+               .setMinValue(1)
+               .setMaxValue(365)),
+
+    // /kill (Phase 6 admin)
+    new SlashCommandBuilder()
+        .setName('kill')
+        .setDescription('☠️ Mark a license\'s session kill_flag = true (server refuses further heartbeats)')
+        .addStringOption(opt =>
+            opt.setName('key')
+               .setDescription('License key whose session should be killed')
+               .setRequired(true))
+        .addStringOption(opt =>
+            opt.setName('reason')
+               .setDescription('Reason (logged)')
+               .setRequired(false)),
+
+    // /anomaly_report (Phase 6 admin)
+    new SlashCommandBuilder()
+        .setName('anomaly_report')
+        .setDescription('🚨 List sessions sorted by anomaly_score (top offenders)')
+        .addIntegerOption(opt =>
+            opt.setName('limit')
+               .setDescription('Max rows (default 15)')
+               .setRequired(false)
+               .setMinValue(1)
+               .setMaxValue(100)),
+
+    // /global_kill_all (Phase 6 admin)
+    new SlashCommandBuilder()
+        .setName('global_kill_all')
+        .setDescription('🔥 EMERGENCY: kill every session globally (requires confirm=YES)')
+        .addStringOption(opt =>
+            opt.setName('confirm')
+               .setDescription('Type YES to confirm')
+               .setRequired(true)),
+
+    // /rotate_kw (Phase 6 admin)
+    new SlashCommandBuilder()
+        .setName('rotate_kw')
+        .setDescription('🔑 Force Kw (per-license master key) rotation for one license')
+        .addStringOption(opt =>
+            opt.setName('key')
+               .setDescription('License key whose Kw should rotate on next activation')
+               .setRequired(true)),
 ];
 
 // ─── Register Commands on Ready ───────────────────────────────────────────────
@@ -1289,6 +1342,140 @@ client.on('interactionCreate', async (interaction) => {
                         { name: '🚨 Recent Violations', value: violationLines,         inline: false },
                     )
                     .setFooter({ text: `${sessionsRes.rows.length} total sessions` })
+                    .setTimestamp(),
+            ]});
+        }
+
+        // ── /extend_all ───────────────────────────────────────────────────────
+        else if (commandName === 'extend_all') {
+            const days = interaction.options.getInteger('days');
+            const today = todayStr();
+            const { rows: active } = await pgQuery(
+                "SELECT key, expires FROM licenses WHERE active = true AND (expires = '' OR expires >= $1)",
+                [today]
+            );
+            if (!active.length)
+                return interaction.editReply('📭 No active licenses to extend.');
+
+            let updated = 0;
+            for (const r of active) {
+                const base = r.expires || todayStr();
+                const newExpiry = addDuration(base, days, 0);
+                await pgQuery('UPDATE licenses SET expires = $1 WHERE key = $2', [newExpiry, r.key]);
+                updated++;
+            }
+
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setTitle(`📅 Extended ${updated} License(s) by ${days}d`)
+                    .setColor(0x00AAFF)
+                    .setFooter({ text: `By ${interaction.user.tag}` })
+                    .setTimestamp(),
+            ]});
+        }
+
+        // ── /kill ─────────────────────────────────────────────────────────────
+        else if (commandName === 'kill') {
+            const key = interaction.options.getString('key').toUpperCase().trim();
+            const reason = interaction.options.getString('reason') || 'admin_kill';
+
+            const { rowCount } = await pgQuery(
+                'UPDATE sessions SET kill_flag = true WHERE license_key = $1',
+                [key]
+            );
+            if (rowCount === 0)
+                return interaction.editReply(`❌ No active session for \`${key}\`.`);
+
+            await pgQuery(
+                "INSERT INTO violations (hwid, reason, timestamp, timestamp_iso) VALUES ($1, $2, $3, $4)",
+                [key, `admin_kill:${reason}`, Math.floor(Date.now()/1000), new Date().toISOString()]
+            );
+
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setTitle('☠️ Session Killed')
+                    .setColor(0xFF0000)
+                    .setDescription(`\`${key}\`\nReason: \`${reason}\``)
+                    .setFooter({ text: `By ${interaction.user.tag}` })
+                    .setTimestamp(),
+            ]});
+        }
+
+        // ── /anomaly_report ───────────────────────────────────────────────────
+        else if (commandName === 'anomaly_report') {
+            const limit = interaction.options.getInteger('limit') || 15;
+            const { rows } = await pgQuery(
+                `SELECT license_key, anomaly_score, kill_flag, last_heartbeat, hwid, ip
+                 FROM sessions
+                 WHERE anomaly_score > 0
+                 ORDER BY anomaly_score DESC
+                 LIMIT $1`,
+                [limit]
+            );
+            if (!rows.length)
+                return interaction.editReply('✅ No sessions with anomaly_score > 0.');
+
+            const now = Math.floor(Date.now() / 1000);
+            const lines = rows.map(r => {
+                const age = r.last_heartbeat ? `${Math.floor((now - r.last_heartbeat)/60)}m` : '—';
+                const killed = r.kill_flag ? ' ☠️' : '';
+                return `\`${r.license_key}\` · **${r.anomaly_score}** · ${age}${killed}`;
+            });
+
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setTitle(`🚨 Anomaly Report (top ${rows.length})`)
+                    .setColor(0xFFA500)
+                    .setDescription(lines.join('\n'))
+                    .setTimestamp(),
+            ]});
+        }
+
+        // ── /global_kill_all ──────────────────────────────────────────────────
+        else if (commandName === 'global_kill_all') {
+            const confirm = interaction.options.getString('confirm');
+            if (confirm !== 'YES')
+                return interaction.editReply('❌ Aborted — confirm must be exactly `YES`.');
+
+            const { rowCount } = await pgQuery(
+                'UPDATE sessions SET kill_flag = true WHERE kill_flag = false'
+            );
+
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setTitle(`🔥 GLOBAL KILL — ${rowCount} Session(s)`)
+                    .setColor(0xFF0000)
+                    .setDescription('Every active session now has kill_flag = true.')
+                    .setFooter({ text: `By ${interaction.user.tag}` })
+                    .setTimestamp(),
+            ]});
+        }
+
+        // ── /rotate_kw ────────────────────────────────────────────────────────
+        else if (commandName === 'rotate_kw') {
+            const key = interaction.options.getString('key').toUpperCase().trim();
+            const { rows } = await pgQuery('SELECT key FROM licenses WHERE key = $1', [key]);
+            if (!rows.length)
+                return interaction.editReply(`❌ Key \`${key}\` not found.`);
+
+            // Bump key_rotation_ts — next activation re-wraps Kw under new epoch.
+            const now = Math.floor(Date.now() / 1000);
+            await pgQuery(
+                'UPDATE licenses SET key_rotation_ts = $1 WHERE key = $2',
+                [now, key]
+            );
+            // Also invalidate current session so client must re-validate.
+            await pgQuery(
+                'UPDATE sessions SET kill_flag = true WHERE license_key = $1',
+                [key]
+            );
+
+            await interaction.editReply({ embeds: [
+                new EmbedBuilder()
+                    .setTitle('🔑 Kw Rotation Armed')
+                    .setColor(0x9B59B6)
+                    .setDescription(`\`${key}\`\nkey_rotation_ts = ${now}\nsession killed — next activation will re-wrap.`)
+                    .setFooter({ text: `By ${interaction.user.tag}` })
                     .setTimestamp(),
             ]});
         }

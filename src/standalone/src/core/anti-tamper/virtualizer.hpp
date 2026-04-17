@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <intrin.h>
 
 #include <atomic>
@@ -136,6 +137,75 @@ namespace detail
         OP_MAX
     };
 
+    inline bool bcrypt_random(uint8_t* buf, uint32_t len)
+    {
+        return BCryptGenRandom(nullptr, buf, len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+    }
+
+    inline bool hmac_sha256(const uint8_t* key, uint32_t key_len,
+                            const uint8_t* data, uint32_t data_len,
+                            uint8_t out[32])
+    {
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        bool ok = false;
+        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM,
+                                        nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+            return false;
+        if (BCryptCreateHash(hAlg, &hHash, nullptr, 0,
+                             const_cast<PUCHAR>(key), key_len, 0) != 0)
+        {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return false;
+        }
+        if (BCryptHashData(hHash, const_cast<PUCHAR>(data), data_len, 0) == 0)
+            ok = (BCryptFinishHash(hHash, out, 32, 0) == 0);
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return ok;
+    }
+
+    inline void hkdf_expand_sha256(const uint8_t prk[32], const uint8_t* info,
+                                    uint32_t info_len, uint8_t* okm, uint32_t okm_len)
+    {
+        uint8_t t[32] = {};
+        uint32_t t_len = 0;
+        uint8_t counter = 1;
+        uint32_t pos = 0;
+        while (pos < okm_len)
+        {
+            uint32_t input_len = t_len + info_len + 1;
+            auto* input = static_cast<uint8_t*>(_alloca(input_len));
+            if (t_len > 0) memcpy(input, t, t_len);
+            memcpy(input + t_len, info, info_len);
+            input[t_len + info_len] = counter;
+            hmac_sha256(prk, 32, input, input_len, t);
+            t_len = 32;
+            uint32_t copy = (okm_len - pos < 32) ? (okm_len - pos) : 32;
+            memcpy(okm + pos, t, copy);
+            pos += copy;
+            counter++;
+        }
+    }
+
+    inline uint64_t secure_seed()
+    {
+        uint8_t buf[32];
+        if (!bcrypt_random(buf, 32))
+            return __rdtsc() ^ GetCurrentProcessId();
+        uint64_t seed;
+        memcpy(&seed, buf, 8);
+        uint64_t mix;
+        memcpy(&mix, buf + 8, 8);
+        seed ^= mix;
+        memcpy(&mix, buf + 16, 8);
+        seed ^= _rotl64(mix, 17);
+        memcpy(&mix, buf + 24, 8);
+        seed ^= _rotr64(mix, 23);
+        SecureZeroMemory(buf, 32);
+        return seed;
+    }
+
     using handler_fn = void(*)(vm_state_t& vm, const uint8_t* bc, uint32_t bc_size);
 
     struct handler_slot_t
@@ -171,7 +241,7 @@ namespace detail
 
     inline void shuffle_registers(vm_state_t& vm)
     {
-        uint64_t entropy = __rdtsc() ^ vm.context_entropy;
+        uint64_t entropy = secure_seed() ^ vm.context_entropy;
 
         uint64_t old_xor = vm.reg_xor_key;
         for (int i = 0; i < 16; ++i)
@@ -427,7 +497,7 @@ namespace detail
     __forceinline void derive_context_masks(vm_state_t& vm)
     {
 
-        uint64_t seed = vm.handler_chain_key ^ __rdtsc();
+        uint64_t seed = vm.handler_chain_key ^ secure_seed();
         seed ^= seed >> 30; seed *= 0xBF58476D1CE4E5B9ULL;
         seed ^= seed >> 27; seed *= 0x94D049BB133111EBULL;
         seed ^= seed >> 31;
@@ -510,7 +580,7 @@ namespace detail
 
     __forceinline void regenerate_handlers(vm_state_t& vm)
     {
-        uint64_t new_seed = vm.rolling_key ^ vm.handler_chain_key ^ __rdtsc();
+        uint64_t new_seed = vm.rolling_key ^ vm.handler_chain_key ^ secure_seed();
         new_seed ^= vm.insn_count * 0x9E3779B97F4A7C15ULL;
 
         generate_opcode_map(new_seed, vm.opcode_map, vm.reverse_map);
@@ -1044,6 +1114,184 @@ namespace detail
         dispatch_next(vm, bc, bc_size);
     }
 
+    VM_HANDLER(h_shr_v2)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t amt_reg = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, src);
+        uint8_t b = static_cast<uint8_t>(read_vreg(vm, amt_reg)) & 0x3F;
+        uint64_t result = 0;
+        for (int i = 63; i >= 0; --i) {
+            uint64_t bit = (va >> i) & 1;
+            int new_pos = i - static_cast<int>(b);
+            if (new_pos >= 0)
+                result |= (bit << new_pos);
+        }
+        write_vreg(vm, dst, result);
+        update_flags_logic(vm, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_shr_v3)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t amt_reg = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, src);
+        uint8_t b = static_cast<uint8_t>(read_vreg(vm, amt_reg)) & 0x3F;
+        uint64_t mask = (b >= 64) ? 0 : (0xFFFFFFFFFFFFFFFFULL >> b);
+        uint64_t result = (va >> b) & mask;
+        write_vreg(vm, dst, result);
+        update_flags_logic(vm, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_rol_v2)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t amt_reg = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, src);
+        uint8_t b = static_cast<uint8_t>(read_vreg(vm, amt_reg)) & 0x3F;
+        uint64_t left = va << b;
+        uint64_t right = (b == 0) ? 0 : (va >> (64 - b));
+        uint64_t result = micro_or(left, right);
+        write_vreg(vm, dst, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_ror_v2)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t amt_reg = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, src);
+        uint8_t b = static_cast<uint8_t>(read_vreg(vm, amt_reg)) & 0x3F;
+        uint64_t right = va >> b;
+        uint64_t left = (b == 0) ? 0 : (va << (64 - b));
+        uint64_t result = micro_or(right, left);
+        write_vreg(vm, dst, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_not_v2)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, src);
+        uint64_t result = nand_op(va, va);
+        write_vreg(vm, dst, result);
+        update_flags_logic(vm, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_not_v3)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, src);
+        uint64_t result = micro_xor(va, 0xFFFFFFFFFFFFFFFFULL);
+        write_vreg(vm, dst, result);
+        update_flags_logic(vm, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_mul_v2)
+    {
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb = read_vreg(vm, b);
+        uint64_t result = micro_mul(va, vb);
+        write_vreg(vm, a, result);
+        vm.vflags.ZF = (result == 0) ? 1 : 0;
+        vm.vflags.SF = (result >> 63) & 1;
+        vm.vflags.PF = compute_parity(result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_push_v2)
+    {
+        uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t val = read_vreg(vm, src);
+        if (vm.rsp < 8) { vm.halted = true; return; }
+        vm.rsp = micro_sub(vm.rsp, 8);
+        memcpy(vm.stack + vm.rsp, &val, 8);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_pop_v2)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        if (vm.rsp + 8 > vm.stack_size) { vm.halted = true; return; }
+        uint64_t val;
+        memcpy(&val, vm.stack + vm.rsp, 8);
+        vm.rsp = micro_add(vm.rsp, 8);
+        write_vreg(vm, dst, val);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_add_v2)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb = read_vreg(vm, b);
+        uint64_t result = micro_sub(va, micro_sub(0, vb));
+        write_vreg(vm, dst, result);
+        update_flags_add(vm, va, vb, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_sub_v2)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb = read_vreg(vm, b);
+        uint64_t not_b = nand_op(vb, vb);
+        uint64_t one = micro_and(1ULL, 1ULL);
+        uint64_t neg_b = micro_add(not_b, one);
+        uint64_t xor_ab = micro_xor(va, neg_b);
+        uint64_t and_ab = micro_and(va, neg_b);
+        uint64_t result = micro_add(xor_ab, micro_add(and_ab, and_ab));
+        write_vreg(vm, dst, result);
+        update_flags_sub(vm, va, vb, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_store_mem_v2)
+    {
+        uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t addr_reg = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t addr = read_vreg(vm, addr_reg);
+        uint64_t val = read_vreg(vm, src);
+        if (addr) {
+            volatile uint64_t guard = addr ^ vm.rolling_key;
+            (void)guard;
+            memcpy(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)), &val, 8);
+        }
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_nor_v2)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb = read_vreg(vm, b);
+        uint64_t not_a = nand_op(va, va);
+        uint64_t not_b = nand_op(vb, vb);
+        uint64_t result = micro_and(not_a, not_b);
+        write_vreg(vm, dst, result);
+        update_flags_logic(vm, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
     VM_HANDLER(h_load_imm8)
     {
         uint8_t reg = fetch_byte(vm, bc, bc_size) & 0x0F;
@@ -1252,7 +1500,7 @@ namespace detail
             return;
         }
 
-        uint64_t child_seed = vm.rolling_key ^ vm.handler_chain_key ^ __rdtsc();
+        uint64_t child_seed = vm.rolling_key ^ vm.handler_chain_key ^ secure_seed();
 
         vm_state_t child;
         init_vm(child, child_seed);
@@ -1331,50 +1579,40 @@ namespace detail
             }
         };
 
-        for (uint8_t op = 0; op < OP_MAX; ++op) {
-            uint8_t mapped = 0;
-            for (int i = 0; i < 256; ++i) {
-                if (g_dispatch_table[i] != h_invalid &&
-                    g_dispatch_table[i] == g_dispatch_table[op]) {
+        struct variant_pair_t { handler_fn base; handler_fn alt; };
+        variant_pair_t pairs[] = {
+            { h_nand,      h_nand_v2 },
+            { h_nand,      h_nand_v3 },
+            { h_xor,       h_xor_v2  },
+            { h_xor,       h_xor_v3  },
+            { h_hash,      h_hash_v2 },
+            { h_hash,      h_hash_v3 },
+            { h_cmp,       h_cmp_v2  },
+            { h_add,       h_add_v2  },
+            { h_add,       h_add_v3  },
+            { h_sub,       h_sub_v2  },
+            { h_sub,       h_sub_v3  },
+            { h_shl,       h_shl_v2  },
+            { h_shr,       h_shr_v2  },
+            { h_shr,       h_shr_v3  },
+            { h_rol,       h_rol_v2  },
+            { h_ror,       h_ror_v2  },
+            { h_not,       h_not_v2  },
+            { h_not,       h_not_v3  },
+            { h_nor,       h_nor_v2  },
+            { h_mul,       h_mul_v2  },
+            { h_push,      h_push_v2 },
+            { h_pop,       h_pop_v2  },
+            { h_load_mem_v2,  h_load_mem_v2 },
+            { h_store_mem_v2, h_store_mem_v2 },
+        };
+        constexpr int num_pairs = sizeof(pairs) / sizeof(pairs[0]);
 
-                }
-            }
-        }
-
-
-        for (uint32_t i = 0; i < g_active_slots; ++i) {
-            auto& slot = g_handler_pool[i];
-            if (slot.variant_id == 0) continue;
-
-
-            for (int d = 0; d < 256; ++d) {
-                if (g_dispatch_table[d] != h_invalid) {
-                    auto& pe = g_poly_table[d];
-                    if (pe.count < 4) {
-
-
-                        bool is_arithmetic =
-                            (slot.fn == h_nand_v2 || slot.fn == h_nand_v3 ||
-                             slot.fn == h_xor_v2  || slot.fn == h_xor_v3 ||
-                             slot.fn == h_add_v3  || slot.fn == h_sub_v3);
-
-                        if (is_arithmetic &&
-                            (pe.variants[0] == h_nand && (slot.fn == h_nand_v2 || slot.fn == h_nand_v3))) {
-                            add_variant(static_cast<uint8_t>(d), slot.fn);
-                        }
-                        else if (is_arithmetic &&
-                            (pe.variants[0] == h_xor && (slot.fn == h_xor_v2 || slot.fn == h_xor_v3))) {
-                            add_variant(static_cast<uint8_t>(d), slot.fn);
-                        }
-                        else if (is_arithmetic &&
-                            (pe.variants[0] == h_add && slot.fn == h_add_v3)) {
-                            add_variant(static_cast<uint8_t>(d), slot.fn);
-                        }
-                        else if (is_arithmetic &&
-                            (pe.variants[0] == h_sub && slot.fn == h_sub_v3)) {
-                            add_variant(static_cast<uint8_t>(d), slot.fn);
-                        }
-                    }
+        for (int d = 0; d < 256; ++d) {
+            if (g_dispatch_table[d] == h_invalid) continue;
+            for (int p = 0; p < num_pairs; ++p) {
+                if (g_dispatch_table[d] == pairs[p].base) {
+                    add_variant(static_cast<uint8_t>(d), pairs[p].alt);
                 }
             }
         }
@@ -1391,7 +1629,7 @@ namespace detail
         if (entry.count <= 1)
             return entry.variants[0];
 
-        uint64_t sel = vm.rolling_key ^ vm.context_entropy ^ __rdtsc();
+        uint64_t sel = vm.rolling_key ^ vm.context_entropy ^ secure_seed();
         return entry.variants[sel % entry.count];
     }
 
@@ -1455,12 +1693,20 @@ namespace detail
         handler_fn variant_table[] = {
             h_nand_v2, h_xor_v2, h_hash_v2, h_cmp_v2,
             h_nand_v3, h_xor_v3, h_hash_v3, h_cmp_v2,
-            h_add_v3,  h_sub_v3, h_shl_v2,  h_load_mem_v2
+            h_add_v3,  h_sub_v3, h_shl_v2,  h_load_mem_v2,
+            h_shr_v2,  h_shr_v3, h_rol_v2,  h_ror_v2,
+            h_not_v2,  h_not_v3, h_mul_v2,  h_push_v2,
+            h_pop_v2,  h_add_v2, h_sub_v2,  h_store_mem_v2,
+            h_nor_v2
         };
         uint8_t variant_ops[] = {
             OP_NAND, OP_XOR, OP_HASH, OP_CMP,
             OP_NAND, OP_XOR, OP_HASH, OP_CMP,
-            OP_ADD,  OP_SUB, OP_SHL,  OP_LOAD_MEM
+            OP_ADD,  OP_SUB, OP_SHL,  OP_LOAD_MEM,
+            OP_SHR,  OP_SHR, OP_ROL,  OP_ROR,
+            OP_NOT,  OP_NOT, OP_MUL,  OP_PUSH,
+            OP_POP,  OP_ADD, OP_SUB,  OP_STORE_MEM,
+            OP_NOR
         };
         constexpr int num_variants = sizeof(variant_ops) / sizeof(variant_ops[0]);
 
@@ -1544,7 +1790,7 @@ namespace detail
         memset(&vm.vflags, 0, sizeof(vflags_t));
         vm.rolling_key = seed ^ 0x6A09E667F3BCC908ULL;
         vm.handler_chain_key = seed ^ 0xBB67AE8584CAA73BULL;
-        vm.context_entropy = __rdtsc() ^ seed;
+        vm.context_entropy = secure_seed() ^ seed;
         vm.shuffle_counter = 0;
 
 
@@ -1675,7 +1921,7 @@ namespace integrity_vm
     {
         auto& c = get_checker();
 
-        uint64_t seed = __rdtsc() ^ reinterpret_cast<uint64_t>(&c) ^ GetCurrentProcessId();
+        uint64_t seed = detail::secure_seed() ^ reinterpret_cast<uint64_t>(&c);
         c.encryption_seed = seed;
         detail::init_vm(c.vm, seed);
         c.bytecode.clear();
@@ -1832,15 +2078,43 @@ inline uint64_t g_server_poly_seed = 0;
 
 inline void reseed_from_server(uint64_t server_nonce)
 {
-    g_server_poly_seed = server_nonce ^ 0x9E3779B97F4A7C15ULL;
+    uint8_t nonce_hex[17];
+    for (int i = 0; i < 8; ++i)
+    {
+        uint8_t nibble_hi = static_cast<uint8_t>((server_nonce >> (60 - i * 8)) & 0xF);
+        uint8_t nibble_lo = static_cast<uint8_t>((server_nonce >> (56 - i * 8)) & 0xF);
+        nonce_hex[i * 2]     = nibble_hi < 10 ? ('0' + nibble_hi) : ('a' + nibble_hi - 10);
+        nonce_hex[i * 2 + 1] = nibble_lo < 10 ? ('0' + nibble_lo) : ('a' + nibble_lo - 10);
+    }
+    nonce_hex[16] = 0;
+
+    const char prefix[] = "opcode_map|";
+    uint8_t hmac_input[27];
+    memcpy(hmac_input, prefix, 11);
+    memcpy(hmac_input + 11, nonce_hex, 16);
+
+    uint8_t key_seed[32];
+    detail::bcrypt_random(key_seed, 32);
+
+    uint8_t prk[32];
+    detail::hmac_sha256(key_seed, 32, hmac_input, 27, prk);
+
+    uint64_t derived[4];
+    detail::hkdf_expand_sha256(prk, hmac_input, 27,
+                                reinterpret_cast<uint8_t*>(derived), 32);
+
+    g_server_poly_seed = derived[0] ^ derived[1];
+
+    uint64_t opcode_seed = derived[2];
+    uint64_t key_schedule = derived[3];
 
     auto& c = integrity_vm::get_checker();
     if (c.initialized)
     {
-        c.encryption_seed ^= g_server_poly_seed;
-        c.vm.rolling_key ^= g_server_poly_seed;
-        c.vm.handler_chain_key ^= g_server_poly_seed;
-        c.vm.context_entropy ^= g_server_poly_seed;
+        c.encryption_seed = opcode_seed ^ key_schedule;
+        c.vm.rolling_key = c.encryption_seed ^ 0x6A09E667F3BCC908ULL;
+        c.vm.handler_chain_key = c.encryption_seed ^ 0xBB67AE8584CAA73BULL;
+        c.vm.context_entropy = key_schedule ^ derived[0];
 
         detail::generate_opcode_map(c.encryption_seed, c.vm.opcode_map, c.vm.reverse_map);
         detail::build_handler_pool(c.vm.reverse_map,
@@ -1854,6 +2128,10 @@ inline void reseed_from_server(uint64_t server_nonce)
 
         detail::shuffle_registers(c.vm);
     }
+
+    SecureZeroMemory(key_seed, 32);
+    SecureZeroMemory(prk, 32);
+    SecureZeroMemory(derived, 32);
 }
 
 
@@ -2011,7 +2289,7 @@ namespace protection {
             if (!entry.active || entry.bytecode.empty()) continue;
 
             uint64_t old_key = entry.vm_seed ^ 0x6A09E667F3BCC908ULL;
-            uint64_t new_seed = entry.vm_seed ^ __rdtsc() ^
+            uint64_t new_seed = entry.vm_seed ^ detail::secure_seed() ^
                 (static_cast<uint64_t>(i) * 0x9E3779B97F4A7C15ULL);
 
             std::vector<uint8_t> raw(entry.bytecode.size());

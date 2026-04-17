@@ -80,10 +80,18 @@ namespace mba {
         case 5: return (~a & b) + (a & ~b);
         case 6: return (((a << 1) + (b << 1) - (a & b) * 2) >> 1)
                        - ((a + b - (a ^ b)) >> 1);
-        case 7: return _rotl64(a ^ b, 0);
+        case 7: {
+            volatile uint64_t va = a;
+            volatile uint64_t vb = b;
+            uint64_t nand_ab = ~(va & vb);
+            return ~(~va | ~vb) ^ nand_ab ^ ~(va | vb) ^ ~nand_ab;
+        }
         case 8: {
-            uint64_t c = a ^ b;
-            return c + 0 * (a | b);
+            uint64_t not_a = ~a;
+            uint64_t not_b = ~b;
+            uint64_t nand_notab = ~(not_a & not_b);
+            uint64_t nand_ab = ~(a & b);
+            return nand_notab & nand_ab;
         }
         case 9: return (a - (a & b)) + (b - (a & b));
         case 10: return ~(~a ^ ~b) ^ 0xFFFFFFFFFFFFFFFFULL;
@@ -94,10 +102,19 @@ namespace mba {
         case 12: return (a + b) ^ ((a & b) << 1);
         case 13: return (~(a & b)) & (a | b);
         case 14: {
-            uint64_t s = (~a & b) | (a & ~b);
-            return s ^ (s & 0) ;
+            volatile uint64_t va = a;
+            volatile uint64_t vb = b;
+            uint64_t p = (~va & vb);
+            uint64_t q = (va & ~vb);
+            uint64_t r = p | q;
+            uint64_t guard = (va | vb) - (va & vb);
+            return r & guard | r & ~guard | guard & ~r ^ r;
         }
-        default: return _rotr64(_rotl64(a ^ b, 7), 7);
+        default: {
+            uint64_t c = a ^ b;
+            uint64_t d = _rotl64(c, 13);
+            return _rotr64(d, 13);
+        }
         }
     }
 
@@ -121,11 +138,17 @@ namespace mba {
         case 4: return a - (~b) - 1;
         case 5: return (a | b) + (a & b);
         case 6: {
-            uint64_t h = a + b;
-            return h + 0 * (a ^ b);
+            volatile uint64_t va = a;
+            volatile uint64_t vb = b;
+            uint64_t xor_ab = va ^ vb;
+            uint64_t carry = (va & vb) << 1;
+            return xor_ab + carry;
         }
         case 7: return ((a << 1) | (b << 1)) - (a ^ b);
-        case 8: return a + b + (a & 0) + (b & 0);
+        case 8: {
+            uint64_t not_a = ~a;
+            return ~(not_a - b);
+        }
         case 9: {
             uint64_t carry = a & b;
             uint64_t sum = a ^ b;
@@ -135,12 +158,23 @@ namespace mba {
         case 10: return ~(~a - b);
         case 11: return (a - (0 - b));
         case 12: {
-            uint64_t t = (a ^ b) + ((a & b) << 1);
-            return t ^ (t & 0);
+            volatile uint64_t va = a;
+            volatile uint64_t vb = b;
+            uint64_t or_ab = va | vb;
+            uint64_t and_ab = va & vb;
+            return or_ab + and_ab;
         }
-        case 13: return _rotl64(a + b, 0);
+        case 13: {
+            uint64_t r = a + b;
+            uint64_t check = _rotl64(r, 17);
+            return _rotr64(check, 17);
+        }
         case 14: return ((a ^ b) | ((a & b) << 1)) + ((a ^ b) & ((a & b) << 1));
-        default: return a + b;
+        default: {
+            volatile uint64_t va = a;
+            volatile uint64_t vb = b;
+            return va + vb;
+        }
         }
     }
 
@@ -359,23 +393,48 @@ namespace jit {
     inline decryptor_stub_t generate_decryptor(uint64_t key, uint64_t target_addr, uint32_t size)
     {
         std::vector<uint8_t> code;
-        code.reserve(256);
-
-        uint8_t key_reg = detail::map_reg(0);
-        uint8_t addr_reg = detail::map_reg(1);
-        uint8_t count_reg = detail::map_reg(2);
-        uint8_t tmp_reg = detail::map_reg(3);
+        code.reserve(64);
 
         emit_nop_sled(code, 2);
 
         uint64_t part1 = key ^ 0xDEADC0DEULL;
         uint64_t part2 = 0xDEADC0DEULL;
-        emit_mov_reg_imm64(code, key_reg, part1);
-        emit_mov_reg_imm64(code, tmp_reg, part2);
-        emit_xor_reg_reg(code, key_reg, tmp_reg);
 
-        emit_mov_reg_imm64(code, addr_reg, target_addr);
-        emit_mov_reg_imm64(code, count_reg, size / 8);
+        code.push_back(0x49); code.push_back(0xB8);
+        uint8_t imm8[8];
+        memcpy(imm8, &part1, 8);
+        code.insert(code.end(), imm8, imm8 + 8);
+
+        code.push_back(0x49); code.push_back(0xB9);
+        memcpy(imm8, &part2, 8);
+        code.insert(code.end(), imm8, imm8 + 8);
+
+        code.push_back(0x4D); code.push_back(0x31); code.push_back(0xC8);
+
+        code.push_back(0x48); code.push_back(0xB9);
+        memcpy(imm8, &target_addr, 8);
+        code.insert(code.end(), imm8, imm8 + 8);
+
+        uint64_t count = static_cast<uint64_t>(size / 8);
+        code.push_back(0x48); code.push_back(0xBA);
+        memcpy(imm8, &count, 8);
+        code.insert(code.end(), imm8, imm8 + 8);
+
+        code.push_back(0x48); code.push_back(0x85); code.push_back(0xD2);
+        size_t jz_pos = code.size();
+        code.push_back(0x74); code.push_back(0x00);
+
+        size_t loop_start = code.size();
+
+        code.push_back(0x4C); code.push_back(0x31); code.push_back(0x01);
+        code.push_back(0x48); code.push_back(0x83); code.push_back(0xC1); code.push_back(0x08);
+        code.push_back(0x48); code.push_back(0x83); code.push_back(0xEA); code.push_back(0x01);
+
+        int back = static_cast<int>(loop_start) - static_cast<int>(code.size() + 2);
+        code.push_back(0x75); code.push_back(static_cast<uint8_t>(static_cast<int8_t>(back)));
+
+        size_t after_loop = code.size();
+        code[jz_pos + 1] = static_cast<uint8_t>(static_cast<int8_t>(static_cast<int>(after_loop) - static_cast<int>(jz_pos + 2)));
 
         emit_nop_sled(code, 1);
         emit_ret(code);

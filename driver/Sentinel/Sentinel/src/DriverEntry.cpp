@@ -3,6 +3,12 @@
 #include <imports/Defs.h>
 #include <core/Guardian.h>
 #include <core/ProcessNotify.h>
+#include <core/HardwareId.h>
+#include <core/WitnessKey.h>
+#include <core/BridgeV2.h>
+#include <core/WskTransport.h>
+#include <core/Attestation.h>
+#include <core/Resurrect.h>
 
 
 #pragma data_seg(".sntl")
@@ -31,7 +37,7 @@ static constexpr FILE_INFORMATION_CLASS FileDispositionInformationExClass =
 constexpr ULONG TAG_DEL = 'leDW';
 
 
-static PDRIVER_OBJECT g_sentinel_driver_object = nullptr;
+PDRIVER_OBJECT g_sentinel_driver_object = nullptr;
 static volatile LONG  g_shutdown_flag = 0;
 static HANDLE         g_init_thread_handle = nullptr;
 static WCHAR          g_registry_path_buffer[512] = {};
@@ -515,6 +521,52 @@ discovery_done:
             }
         }
 
+        {
+            bool hw_ok = hardware_id::collect_all();
+            SN_LOG("init_thread: hardware_id::collect_all = %d", (int)hw_ok);
+
+            bool kw_ok = witness_key::init();
+            SN_LOG("init_thread: witness_key::init = %d", (int)kw_ok);
+
+            if (kw_ok) {
+                UINT8 kw_seed[32] = {};
+                if (hw_ok) {
+                    RtlCopyMemory(kw_seed, hardware_id::g_anchors.composite_sha256, sizeof(kw_seed));
+                } else {
+                    kernel_crypto::gen_random(kw_seed, sizeof(kw_seed));
+                }
+
+                kw_ok = witness_key::store_kw(kw_seed);
+                SN_LOG("init_thread: witness_key::store_kw = %d", (int)kw_ok);
+                RtlSecureZeroMemory(kw_seed, sizeof(kw_seed));
+
+                UINT8 bridge_key[32] = {};
+                bool derive_ok = witness_key::derive_subkey("bridge-v2", bridge_key);
+                SN_LOG("init_thread: witness_key::derive_subkey = %d", (int)derive_ok);
+
+                bool bridge_ok = FALSE;
+                if (derive_ok) {
+                    bridge_ok = bridge_v2::init_bridge(bridge_key);
+                }
+                SN_LOG("init_thread: bridge_v2::init_bridge = %d", (int)bridge_ok);
+                RtlSecureZeroMemory(bridge_key, sizeof(bridge_key));
+            }
+
+            NTSTATUS wsk_st = wsk_transport::init();
+            SN_LOG("init_thread: wsk_transport::init status=0x%08lx", wsk_st);
+
+            if (NT_SUCCESS(wsk_st)) {
+                wsk_transport::start_heartbeat_timer();
+                SN_LOG("init_thread: wsk heartbeat timer started");
+            }
+
+            bool attest_ok = attestation::init();
+            SN_LOG("init_thread: attestation::init = %d", (int)attest_ok);
+
+            integrity::collect_sensor_baseline();
+            SN_LOG("init_thread: integrity::collect_sensor_baseline done");
+        }
+
 
         SN_LOG("init_thread: starting guardian...");
         bool guard_ok = guardian::start();
@@ -565,6 +617,15 @@ discovery_done:
 
 
         SN_LOG("init_thread: calling thread_guard::ipi_clear_all_cpus");
+        if (g_target_driver_base && g_target_driver_size) {
+            UINT64 tg_base = reinterpret_cast<UINT64>(const_cast<PVOID>(g_target_driver_base));
+            UINT64 tg_size = static_cast<UINT64>(g_target_driver_size);
+            bool tg_ok = thread_guard::init(tg_base, tg_size);
+            SN_LOG("init_thread: thread_guard::init base=0x%llx size=0x%llx = %d",
+                tg_base, tg_size, (int)tg_ok);
+        } else {
+            SN_LOG("init_thread: thread_guard::init SKIPPED (no target base/size)");
+        }
         thread_guard::ipi_clear_all_cpus();
         SN_LOG("init_thread: thread_guard done");
 

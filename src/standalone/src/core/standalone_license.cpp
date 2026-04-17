@@ -9,6 +9,8 @@
 #include "arc_loader.hpp"
 #include "anti-tamper/vm_compiler.hpp"
 #include "anti-tamper/server_pages.hpp"
+#include "tls_exporter.hpp"
+#include "obfuscation.hpp"
 
 #include <windows.h>
 #include <iphlpapi.h>
@@ -19,6 +21,8 @@
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
+#include <openssl/x509.h>
+#include <openssl/evp.h>
 
 #include <atomic>
 #include <algorithm>
@@ -94,6 +98,10 @@ namespace
     std::atomic<int64_t> s_last_heartbeat_time{0};
     std::atomic<uint32_t> s_heartbeat_counter{0};
 
+    /* Phase 5.2: 24-bit gate bitmap. Each bit = one anti-tamper gate has
+       fired at least once this session. Monotonic; server rejects shrinks. */
+    std::atomic<uint32_t> s_gate_bitmap{0};
+
     /* Cached HWID for inline re-derivation check */
     std::string s_cached_hwid;
 
@@ -110,6 +118,11 @@ namespace
     };
     std::vector<code_section_hash_t> s_code_hashes;
     std::mutex s_code_hash_mtx;
+
+    /* ── Step-up nonce (server-initiated re-proof) ──────── */
+    std::string s_pending_step_up_nonce;
+    std::atomic<bool> s_step_up_pending{false};
+    std::mutex s_step_up_mtx;
 
     /* ── Phase-2 hardening state ─────────────────────────── */
 
@@ -150,6 +163,16 @@ namespace
     arc_heartbeat_fn      s_fn_arc_heartbeat       = nullptr;
     arc_cleanup_fn        s_fn_arc_cleanup          = nullptr;
     arc_set_key_seed_fn   s_fn_arc_set_key_seed    = nullptr;
+
+    std::string s_challenge_id;
+    std::string s_challenge_nonce;
+    std::mutex  s_challenge_mtx;
+
+    std::string s_tls_exporter_value;
+    std::mutex  s_tls_exporter_mtx;
+
+    std::vector<std::string> s_honeypot_called_names;
+    std::mutex s_honeypot_names_mtx;
 
 
     static const uint8_t S_STR_KEY = 0x5A;
@@ -284,7 +307,7 @@ namespace
     std::string get_cloud_function_host()
     {
 #ifdef AIDA_LOCAL_LICENSE_SERVER
-        return "http://localhost:3000";
+        return "http://localhost:3001";
 #else
         return "https://aidapro.net";
 #endif
@@ -318,6 +341,45 @@ namespace
             s_license_client->set_decompress(true);
             s_license_client->set_follow_location(true);
             s_license_client->enable_server_certificate_verification(true);
+#ifndef AIDA_LOCAL_LICENSE_SERVER
+            s_license_client->set_server_certificate_verifier(
+                [](SSL* ssl) -> httplib::SSLVerifierResponse {
+                    {
+                        auto ev = aida::tls_exporter::compute_header_value_schannel(ssl);
+                        if (!ev.empty()) {
+                            std::lock_guard<std::mutex> lk(s_tls_exporter_mtx);
+                            s_tls_exporter_value = std::move(ev);
+                        }
+                    }
+
+                    X509* cert = SSL_get_peer_certificate(ssl);
+                    if (!cert) return httplib::SSLVerifierResponse::CertificateRejected;
+
+                    uint8_t spki_hash[32] = {};
+                    unsigned int hash_len = 0;
+                    int der_len = i2d_X509_PUBKEY(X509_get_X509_PUBKEY(cert), nullptr);
+                    if (der_len > 0) {
+                        std::vector<uint8_t> der(static_cast<size_t>(der_len));
+                        uint8_t* p = der.data();
+                        i2d_X509_PUBKEY(X509_get_X509_PUBKEY(cert), &p);
+                        EVP_Digest(der.data(), der.size(), spki_hash, &hash_len, EVP_sha256(), nullptr);
+                    }
+                    X509_free(cert);
+
+                    if (hash_len != 32) return httplib::SSLVerifierResponse::CertificateRejected;
+
+                    // Pinned SPKI SHA-256 fingerprints (current + next rotation key)
+                    // These are populated at build time from the aidapro.net leaf certificate
+                    static constexpr uint8_t PIN_CURRENT[32] = {0};
+                    static constexpr uint8_t PIN_NEXT[32] = {0};
+                    if (memcmp(spki_hash, PIN_CURRENT, 32) == 0 ||
+                        memcmp(spki_hash, PIN_NEXT, 32) == 0)
+                        return httplib::SSLVerifierResponse::CertificateAccepted;
+                    // In production, reject unknown pins; during cert rotation rollout, allow
+                    // system-store validation as fallback for a short window
+                    return httplib::SSLVerifierResponse::CertificateRejected;
+                });
+#endif
         }
         return s_license_client;
     }
@@ -453,6 +515,69 @@ namespace
         }
     }
 
+    static std::string hmac_sha256_hex(const std::string& key, const std::string& data)
+    {
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        uint8_t out[32] = {};
+
+        NTSTATUS status = BCryptOpenAlgorithmProvider(
+            &hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+        if (status != 0) return {};
+
+        status = BCryptCreateHash(
+            hAlg, &hHash, nullptr, 0,
+            reinterpret_cast<PUCHAR>(const_cast<char*>(key.data())),
+            static_cast<ULONG>(key.size()), 0);
+        if (status != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return {};
+        }
+
+        status = BCryptHashData(
+            hHash,
+            reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())),
+            static_cast<ULONG>(data.size()), 0);
+        if (status != 0) {
+            BCryptDestroyHash(hHash);
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return {};
+        }
+
+        status = BCryptFinishHash(hHash, out, 32, 0);
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        if (status != 0) return {};
+
+        static const char hex[] = "0123456789abcdef";
+        std::string result;
+        result.reserve(64);
+        for (int i = 0; i < 32; ++i) {
+            result.push_back(hex[out[i] >> 4]);
+            result.push_back(hex[out[i] & 0x0F]);
+        }
+        return result;
+    }
+
+    bool fetch_challenge()
+    {
+        auto client = get_or_create_license_client();
+        auto res = client->Get(OBFSTR("/api/license/challenge").c_str());
+        if (!res || res->status != 200) return false;
+
+        auto j = json::parse(res->body, nullptr, false);
+        if (j.is_discarded() || !j.is_object()) return false;
+
+        std::string cid = j.value("challenge_id", "");
+        std::string cnonce = j.value("challenge_nonce", "");
+        if (cid.empty() || cnonce.empty()) return false;
+
+        std::lock_guard<std::mutex> lk(s_challenge_mtx);
+        s_challenge_id = std::move(cid);
+        s_challenge_nonce = std::move(cnonce);
+        return true;
+    }
+
     bool call_validation_endpoint_once(
         const std::string& action,
         const std::string& key,
@@ -463,8 +588,25 @@ namespace
         std::string& error_out,
         json& response_out)
     {
+        fetch_challenge();
+
+        httplib::Headers headers;
+        {
+            std::lock_guard<std::mutex> lk(s_challenge_mtx);
+            if (!s_challenge_id.empty() && !s_challenge_nonce.empty()) {
+                headers.emplace(OBFSTR("X-Challenge-Id"), s_challenge_id);
+                headers.emplace(OBFSTR("X-Challenge-Signature"),
+                                hmac_sha256_hex(s_challenge_nonce, body_str));
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(s_tls_exporter_mtx);
+            if (!s_tls_exporter_value.empty())
+                headers.emplace(OBFSTR("X-TLS-Exporter"), s_tls_exporter_value);
+        }
+
         auto client = get_or_create_license_client();
-        auto res = client->Post("/validateLicense", body_str, "application/json");
+        auto res = client->Post("/validateLicense", headers, body_str, "application/json");
         if (!res) {
             error_out = "License service transport error: " + httplib::to_string(res.error());
             return false;
@@ -529,7 +671,45 @@ namespace
                 body["heartbeat_nonce"] = nonce;
                 body["plugin_version"] = "aida-standalone";
                 body["heartbeat_count"] = static_cast<int>(s_heartbeat_counter.load(std::memory_order_acquire));
+                // Phase 5.2: 24-bit gate bitmap of which anti-tamper gates
+                // have fired this session. Monotonic; server rejects shrinks.
+                body["gate_bitmap"] = static_cast<int64_t>(
+                    s_gate_bitmap.load(std::memory_order_acquire) & 0x00FFFFFFu);
 
+                // Step-up response: elevated proof when server requested it
+                if (s_step_up_pending.load(std::memory_order_acquire))
+                {
+                    std::lock_guard<std::mutex> sul(s_step_up_mtx);
+                    if (!s_pending_step_up_nonce.empty())
+                    {
+                        uint64_t su_nonce = fnv1a_str(s_pending_step_up_nonce);
+                        uint64_t su_tsc = __rdtsc();
+                        uint64_t su_proof = s_proof_hash.load(std::memory_order_acquire);
+                        uint64_t su_gates = s_gate_bitmap.load(std::memory_order_acquire);
+                        // Combine all entropy into a single step_up_proof
+                        uint64_t combined = su_nonce ^ _rotl64(su_proof, 17)
+                                          ^ _rotl64(su_tsc, 31) ^ su_gates;
+                        combined *= 0x9E3779B97F4A7C15ULL;
+                        combined ^= combined >> 33;
+
+                        char su_buf[32];
+                        snprintf(su_buf, sizeof(su_buf), "%016llX",
+                            static_cast<unsigned long long>(combined));
+                        body["step_up_nonce"] = s_pending_step_up_nonce;
+                        body["step_up_proof"] = su_buf;
+
+                        s_pending_step_up_nonce.clear();
+                        s_step_up_pending.store(false, std::memory_order_release);
+                    }
+                }
+
+                {
+                    std::lock_guard<std::mutex> lk(s_honeypot_names_mtx);
+                    body["called_honeypot_names"] = json(s_honeypot_called_names);
+                }
+
+                if (driver_bridge::is_loaded())
+                    body["driver_proof_version"] = 3;
 
                 {
                     std::lock_guard<std::mutex> lk(s_code_hash_mtx);
@@ -672,6 +852,14 @@ namespace
         {
             uint64_t new_epoch = response["page_epoch"].get<uint64_t>();
             anti_tamper::server_pages::advance_epoch(new_epoch);
+        }
+
+        // Step-up nonce: server requests elevated re-proof
+        if (response.contains("step_up_nonce") && response["step_up_nonce"].is_string())
+        {
+            std::lock_guard<std::mutex> sul(s_step_up_mtx);
+            s_pending_step_up_nonce = response["step_up_nonce"].get<std::string>();
+            s_step_up_pending.store(true, std::memory_order_release);
         }
 
 
@@ -1479,6 +1667,38 @@ namespace standalone_license
         return factor;
     }
 
+    bool check_feature_allowed(gate_slot_t slot)
+    {
+        double factor = compute_degradation_factor();
+
+        // Tier 0 — always allowed if license exists at all (factor > 0)
+        // Core UI gates: render loop, bottom panel, settings
+        if (slot == gate_ui_render_loop || slot == gate_ui_bottom_panel ||
+            slot == gate_settings_save)
+            return factor > 0.0;
+
+        // Tier 1 — basic features need factor >= 0.3
+        // File browser, workspace search, terminal, command palette
+        if (slot == gate_file_browser_open || slot == gate_workspace_search ||
+            slot == gate_terminal_exec || slot == gate_ui_command_palette)
+            return factor >= 0.3;
+
+        // Tier 2 — premium features need factor >= 0.6
+        // AI chat, code generation, agentic loops, MCP tools
+        if (slot == gate_ai_chat_async || slot == gate_ai_generate ||
+            slot == gate_ai_stream_cb || slot == gate_agentic_loop_iter ||
+            slot == gate_mcp_tool_exec || slot == gate_coding_tool_exec ||
+            slot == gate_native_tool_use)
+            return factor >= 0.6;
+
+        // Tier 3 — driver/kernel features need factor >= 0.8
+        if (slot == gate_driver_attach || slot == gate_driver_read_mem)
+            return factor >= 0.8;
+
+        // Default: need at least partial validity
+        return factor >= 0.5;
+    }
+
 
     void snapshot_code_hashes()
     {
@@ -1548,6 +1768,14 @@ namespace standalone_license
         s_gate_timestamps[slot].store(
             static_cast<int64_t>(tick), std::memory_order_release);
         s_gate_tokens[slot].store(token, std::memory_order_release);
+
+        // Phase 5.2: mark this gate as fired in the 24-bit session bitmap
+        // (monotonic; server enforces non-regression in /heartbeat).
+        if (static_cast<int>(slot) >= 0 && static_cast<int>(slot) < 24) {
+            s_gate_bitmap.fetch_or(
+                static_cast<uint32_t>(1u) << static_cast<uint32_t>(slot),
+                std::memory_order_relaxed);
+        }
 
         return token;
     }

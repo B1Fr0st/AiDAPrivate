@@ -239,6 +239,31 @@ namespace callback_scanner {
         return true;
     }
 
+    inline PVOID g_ob_callback_list = nullptr;
+    inline ULONG g_baseline_ob_callback_count = 0;
+
+    __forceinline ULONG count_ob_callbacks()
+    {
+        if (!g_ob_callback_list || !_MmIsAddressValid(g_ob_callback_list))
+            return 0;
+
+        ULONG count = 0;
+
+        __try {
+            PLIST_ENTRY head = (PLIST_ENTRY)g_ob_callback_list;
+            PLIST_ENTRY entry = head->Flink;
+
+            for (ULONG i = 0; i < MAX_CALLBACKS && entry != head; ++i, entry = entry->Flink)
+            {
+                if (!_MmIsAddressValid(entry)) break;
+                count++;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        return count;
+    }
+
     __forceinline bool verify() {
         if (!_InterlockedCompareExchange(&g_initialized, 1, 1))
             return true;
@@ -284,31 +309,6 @@ namespace callback_scanner {
         return callbacks_intact;
     }
 
-
-    inline PVOID g_ob_callback_list = nullptr;
-    inline ULONG g_baseline_ob_callback_count = 0;
-
-    __forceinline ULONG count_ob_callbacks()
-    {
-        if (!g_ob_callback_list || !_MmIsAddressValid(g_ob_callback_list))
-            return 0;
-
-        ULONG count = 0;
-
-        __try {
-            PLIST_ENTRY head = (PLIST_ENTRY)g_ob_callback_list;
-            PLIST_ENTRY entry = head->Flink;
-
-            for (ULONG i = 0; i < MAX_CALLBACKS && entry != head; ++i, entry = entry->Flink)
-            {
-                if (!_MmIsAddressValid(entry)) break;
-                count++;
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-        return count;
-    }
 
     __forceinline PVOID find_ob_callback_list(PVOID nt_base)
     {

@@ -2,6 +2,7 @@
 #include "../../imports/Defs.h"
 #include "../Struct.h"
 #include "../AntiDebug.h"
+#include "../Dispatcher.h"
 #include "AntiDumpKernel.h"
 
 namespace functions {

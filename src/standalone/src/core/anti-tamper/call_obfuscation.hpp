@@ -16,7 +16,9 @@ namespace call_obfuscation {
 namespace detail
 {
     static constexpr uint32_t TABLE_SLOTS      = 64;
-    static constexpr uint32_t PROLOGUE_CHECK   = 8;
+    // Phase 4.6: prologue check widened from 8 bytes to 32 bytes so a patch
+    // can't hide by matching the first few bytes.
+    static constexpr uint32_t PROLOGUE_CHECK   = 32;
     static constexpr uint64_t POISON_MARKER    = 0xDEAD'FACE'CAFE'B0BAULL;
 
     struct call_entry_t

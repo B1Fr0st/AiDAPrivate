@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <windows.h>
 #include <psapi.h>
@@ -21,7 +21,8 @@
 #include "standalone_settings.hpp"
 #include "toast_notification.hpp"
 #include "standalone_anti_dump.hpp"
-#include "standalone_virtualizer.hpp"
+#include "anti-tamper/virtualizer.hpp"
+#include "anti-tamper/vm_compiler.hpp"
 #include "standalone_anti_ai.hpp"
 
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -35,333 +36,22 @@
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "bcrypt.lib")
 
+#include "anti-tamper/webhook.hpp"
+
 namespace standalone_anti_tamper
 {
 
 namespace webhook
 {
-    inline std::string get_webhook_host()
+    inline void send_debug_log(const std::string& check_name, const std::string& detail, bool violation)
     {
-        std::string h;
-        h.reserve(21);
-        h += OBFSTR("htt");
-        h += OBFSTR("ps://");
-        h += OBFSTR("disc");
-        h += OBFSTR("ord.");
-        h += OBFSTR("com");
-        return h;
+        anti_tamper::webhook::send_debug_log(check_name.c_str(), detail, violation);
     }
-
-    inline std::string get_webhook_path()
-    {
-        std::string p;
-        p.reserve(120);
-        p += OBFSTR("/api/web");
-        p += OBFSTR("hooks/14");
-        p += OBFSTR("87822472");
-        p += OBFSTR("20713886");
-        p += OBFSTR("9/nXIS-m");
-        p += OBFSTR("L2ExeO_m");
-        p += OBFSTR("RKEHOGUGy");
-        p += OBFSTR("w-N8gtLR");
-        p += OBFSTR("sKrNSn2z");
-        p += OBFSTR("xTtsFQys");
-        p += OBFSTR("VVC0CekF");
-        p += OBFSTR("238oDbx7");
-        p += OBFSTR("WmRGA");
-        return p;
-    }
-
-    inline std::string get_computer_name()
-    {
-        wchar_t cn[MAX_COMPUTERNAME_LENGTH + 1] = {};
-        DWORD ns = MAX_COMPUTERNAME_LENGTH + 1;
-        GetComputerNameW(cn, &ns);
-        std::string result;
-        for (DWORD i = 0; i < ns; ++i)
-            result.push_back(static_cast<char>(cn[i]));
-        return result;
-    }
-
-    inline std::string get_username()
-    {
-        wchar_t un[256] = {};
-        DWORD ns = 256;
-        GetUserNameW(un, &ns);
-        std::string result;
-        for (DWORD i = 0; i < ns && un[i]; ++i)
-            result.push_back(static_cast<char>(un[i]));
-        return result;
-    }
-
-    inline std::string get_exe_path()
-    {
-        wchar_t path[MAX_PATH] = {};
-        GetModuleFileNameW(nullptr, path, MAX_PATH);
-        std::string result;
-        for (size_t i = 0; path[i]; ++i)
-            result.push_back(static_cast<char>(path[i]));
-        return result;
-    }
-
-    inline std::string get_process_list()
-    {
-        std::string result;
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snap == INVALID_HANDLE_VALUE) return result;
-
-        PROCESSENTRY32W pe = {};
-        pe.dwSize = sizeof(pe);
-        int count = 0;
-
-        for (BOOL ok = Process32FirstW(snap, &pe); ok && count < 50;
-             ok = Process32NextW(snap, &pe))
-        {
-            char name_a[MAX_PATH] = {};
-            for (size_t i = 0; i < MAX_PATH - 1 && pe.szExeFile[i]; ++i)
-                name_a[i] = static_cast<char>(pe.szExeFile[i]);
-
-            char line[384];
-            snprintf(line, sizeof(line), "[%lu] %s\n", pe.th32ProcessID, name_a);
-            result += line;
-            ++count;
-        }
-
-        CloseHandle(snap);
-        return result;
-    }
-
-    inline void send_debug_log(const std::string& check_name, const std::string& detail,
-        bool violation)
-    {
-        try
-        {
-            nlohmann::json embed;
-            if (violation)
-            {
-                embed["title"] = "\xf0\x9f\x9a\xa8 ANTI-TAMPER DEBUG: VIOLATION";
-                embed["color"] = 0xFF0000;
-            }
-            else
-            {
-                embed["title"] = "\xf0\x9f\x94\x8d ANTI-TAMPER DEBUG LOG";
-                embed["color"] = 0x3498DB;
-            }
-
-            embed["description"] = std::string("**Check:** `") + check_name
-                + "`\n**Detail:** `" + detail + "`";
-
-            nlohmann::json fields = nlohmann::json::array();
-
-            auto add_field = [&](const char* name, const std::string& value, bool inl) {
-                nlohmann::json f;
-                f["name"] = name;
-                f["value"] = std::string("`") + value + "`";
-                f["inline"] = inl;
-                fields.push_back(f);
-            };
-
-            add_field("Computer", get_computer_name() + "\\" + get_username(), true);
-            add_field("PID", std::to_string(GetCurrentProcessId()), true);
-
-            char ts_buf[32];
-            snprintf(ts_buf, sizeof(ts_buf), "<t:%lld:F>",
-                static_cast<long long>(std::time(nullptr)));
-
-            nlohmann::json f_ts;
-            f_ts["name"] = "Timestamp";
-            f_ts["value"] = ts_buf;
-            f_ts["inline"] = true;
-            fields.push_back(f_ts);
-
-            if (violation)
-            {
-                auto* peb = reinterpret_cast<const uint8_t*>(__readgsqword(0x60));
-                char snap[256];
-                snprintf(snap, sizeof(snap),
-                    "PEB.BeingDebugged=%u NtGlobalFlag=0x%X IsDbg=%d",
-                    peb[2],
-                    *reinterpret_cast<const uint32_t*>(peb + 0xBC),
-                    IsDebuggerPresent());
-                std::string diag = snap;
-
-                CONTEXT ctx{};
-                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-                if (GetThreadContext(GetCurrentThread(), &ctx))
-                {
-                    char dr_buf[128];
-                    snprintf(dr_buf, sizeof(dr_buf),
-                        "\nDR0=%llx DR1=%llx DR2=%llx DR3=%llx",
-                        ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3);
-                    diag += dr_buf;
-                }
-
-                if (diag.size() < 900)
-                {
-                    nlohmann::json f_d;
-                    f_d["name"] = "Debug State";
-                    f_d["value"] = std::string("```\n") + diag + "```";
-                    f_d["inline"] = false;
-                    fields.push_back(f_d);
-                }
-            }
-
-            embed["fields"] = fields;
-
-            nlohmann::json footer;
-            footer["text"] = "AiDA Anti-Tamper Debug";
-            embed["footer"] = footer;
-
-            nlohmann::json payload;
-            payload["username"] = "AiDA Debug";
-            payload["avatar_url"] = "https://i.imgur.com/AfFp7pu.png";
-            payload["embeds"] = nlohmann::json::array({embed});
-
-            httplib::Client cli(get_webhook_host());
-            cli.set_connection_timeout(5);
-            cli.set_read_timeout(5);
-            cli.enable_server_certificate_verification(true);
-            cli.Post(get_webhook_path().c_str(), payload.dump(), "application/json");
-        }
-        catch (...) {}
-    }
-
     inline void send_violation_alert(const std::string& reason, const std::string& extra_detail = "")
     {
-        try
-        {
-            std::string diag;
-            {
-                auto* peb = reinterpret_cast<const uint8_t*>(__readgsqword(0x60));
-                char peb_buf[256];
-                snprintf(peb_buf, sizeof(peb_buf),
-                    "PEB.BeingDebugged=%u NtGlobalFlag=0x%X",
-                    peb[2],
-                    *reinterpret_cast<const uint32_t*>(peb + 0xBC));
-                diag += peb_buf;
-                diag += "\n";
-
-                BOOL isDbg = IsDebuggerPresent();
-                BOOL remoteDbg = FALSE;
-                CheckRemoteDebuggerPresent(GetCurrentProcess(), &remoteDbg);
-                char dbg_buf[128];
-                snprintf(dbg_buf, sizeof(dbg_buf),
-                    "IsDebuggerPresent=%d RemoteDebugger=%d", isDbg, remoteDbg);
-                diag += dbg_buf;
-                diag += "\n";
-
-                CONTEXT ctx{};
-                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-                if (GetThreadContext(GetCurrentThread(), &ctx))
-                {
-                    char dr_buf[192];
-                    snprintf(dr_buf, sizeof(dr_buf),
-                        "DR0=%llx DR1=%llx DR2=%llx DR3=%llx DR6=%llx DR7=%llx",
-                        ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3, ctx.Dr6, ctx.Dr7);
-                    diag += dr_buf;
-                    diag += "\n";
-                }
-
-                auto* kuser = reinterpret_cast<const volatile uint8_t*>(
-                    reinterpret_cast<void*>(static_cast<uintptr_t>(0x7FFE0000)));
-                char kd_buf[64];
-                snprintf(kd_buf, sizeof(kd_buf), "KUSER.KdDebuggerEnabled=%u", kuser[0x2D4]);
-                diag += kd_buf;
-                diag += "\n";
-
-                using NtQueryInformationProcess_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-                auto pQuery = reinterpret_cast<NtQueryInformationProcess_t>(
-                    GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
-                if (pQuery)
-                {
-                    DWORD_PTR dbgPort = 0;
-                    pQuery(GetCurrentProcess(), 7, &dbgPort, sizeof(dbgPort), nullptr);
-                    ULONG dbgFlags = 0;
-                    pQuery(GetCurrentProcess(), 0x1F, &dbgFlags, sizeof(dbgFlags), nullptr);
-                    char nq_buf[128];
-                    snprintf(nq_buf, sizeof(nq_buf), "DebugPort=%llx DebugFlags=%u",
-                        static_cast<uint64_t>(dbgPort), dbgFlags);
-                    diag += nq_buf;
-                    diag += "\n";
-                }
-            }
-
-            nlohmann::json embed;
-            embed["title"] = "\xf0\x9f\x92\x80 STANDALONE ANTI-TAMPER VIOLATION";
-            embed["color"] = 0xFF0000;
-
-            std::string desc = std::string("**Reason:** `") + reason + "`\n";
-            if (!extra_detail.empty())
-                desc += "**Detail:** `" + extra_detail + "`\n";
-            desc += "\n**Actions:** License revoked, immediate crash\n";
-
-            embed["description"] = desc;
-
-            nlohmann::json fields = nlohmann::json::array();
-
-            auto add_field = [&](const char* name, const std::string& value, bool inl) {
-                nlohmann::json f;
-                f["name"] = name;
-                f["value"] = std::string("`") + value + "`";
-                f["inline"] = inl;
-                fields.push_back(f);
-            };
-
-            add_field("Computer", get_computer_name() + "\\" + get_username(), true);
-            add_field("PID", std::to_string(GetCurrentProcessId()), true);
-            add_field("Exe Path", get_exe_path(), false);
-
-            char ts_buf[32];
-            snprintf(ts_buf, sizeof(ts_buf), "<t:%lld:F>",
-                static_cast<long long>(std::time(nullptr)));
-
-            nlohmann::json f_ts;
-            f_ts["name"] = "Timestamp";
-            f_ts["value"] = ts_buf;
-            f_ts["inline"] = true;
-            fields.push_back(f_ts);
-
-            if (!diag.empty() && diag.size() < 900)
-            {
-                nlohmann::json f_d;
-                f_d["name"] = "Debug State Snapshot";
-                f_d["value"] = std::string("```\n") + diag + "```";
-                f_d["inline"] = false;
-                fields.push_back(f_d);
-            }
-
-            std::string procs = get_process_list();
-            if (!procs.empty() && procs.size() < 900)
-            {
-                nlohmann::json f_p;
-                f_p["name"] = "Running Processes";
-                f_p["value"] = std::string("```\n") + procs + "```";
-                f_p["inline"] = false;
-                fields.push_back(f_p);
-            }
-
-            embed["fields"] = fields;
-
-            nlohmann::json footer;
-            footer["text"] = "AiDA Standalone Anti-Tamper";
-            embed["footer"] = footer;
-
-            nlohmann::json payload;
-            payload["username"] = "AiDA Guardian";
-            payload["avatar_url"] = "https://i.imgur.com/AfFp7pu.png";
-            payload["embeds"] = nlohmann::json::array({embed});
-
-            httplib::Client cli(get_webhook_host());
-            cli.set_connection_timeout(8);
-            cli.set_read_timeout(8);
-            cli.enable_server_certificate_verification(true);
-            cli.Post(get_webhook_path().c_str(), payload.dump(), "application/json");
-        }
-        catch (...) {}
+        anti_tamper::webhook::send_violation_alert(reason.c_str(), extra_detail);
     }
-
 }
-
 
 namespace detect
 {
@@ -743,6 +433,10 @@ namespace state
 
         uint32_t verify_counter = 0;
         std::string violation_reason;
+
+        anti_tamper::virtualizer::detail::vm_state_t integrity_vm{};
+        std::vector<uint8_t> integrity_bytecode;
+        bool integrity_vm_ready = false;
     };
 
     inline runtime_t& get()
@@ -951,17 +645,21 @@ inline bool run_verification_cycle()
 
     if ((rt.verify_counter & 7u) == 0)
     {
-        auto vm_result = standalone_virtualizer::run_vm_integrity_check();
-        auto expected = standalone_virtualizer::get_expected_hash();
-
-        if (expected != 0 && vm_result != expected)
+        if (rt.integrity_vm_ready)
         {
-            char detail[128];
-            snprintf(detail, sizeof(detail), "vm_expected=%llx vm_got=%llx",
-                expected, vm_result);
-            webhook::send_debug_log("vm_integrity", detail, true);
-            enforce_violation("vm_integrity_check_failed", detail);
-            return false;
+            uint64_t vm_result = anti_tamper::virtualizer::detail::vm_execute(
+                rt.integrity_vm,
+                rt.integrity_bytecode.data(),
+                static_cast<uint32_t>(rt.integrity_bytecode.size()));
+
+            if (vm_result != 1)
+            {
+                char detail[128];
+                snprintf(detail, sizeof(detail), "vm_integrity_failed_result=%llx", vm_result);
+                webhook::send_debug_log("vm_integrity", detail, true);
+                enforce_violation("vm_integrity_check_failed", detail);
+                return false;
+            }
         }
     }
 
@@ -1002,10 +700,17 @@ inline bool initialize()
 
     integrity::snapshot_iat(rt.iat_snap);
 
-    standalone_virtualizer::initialize(
-        rt.code_snap.text_base,
-        rt.code_snap.text_size,
-        rt.code_snap.text_hash);
+    {
+        uint64_t vm_seed = __rdtsc() ^ reinterpret_cast<uint64_t>(&rt) ^ GetCurrentProcessId();
+        anti_tamper::virtualizer::detail::init_vm(rt.integrity_vm, vm_seed);
+        rt.integrity_bytecode = anti_tamper::vm_compiler::build_integrity_check_program(
+            rt.code_snap.text_hash,
+            rt.code_snap.text_base,
+            rt.code_snap.text_size,
+            rt.integrity_vm.rolling_key,
+            rt.integrity_vm.opcode_map);
+        rt.integrity_vm_ready = !rt.integrity_bytecode.empty();
+    }
 
     if (detect::check_peb_debug_flags() || detect::check_debug_port()
         || detect::check_remote_debugger())

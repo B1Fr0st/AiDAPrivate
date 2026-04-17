@@ -116,7 +116,7 @@
       <BufferSecurityCheck>false</BufferSecurityCheck>
       <ControlFlowGuard>false</ControlFlowGuard>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <DisableSpecificWarnings>4083;4005;4244;4714;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <DisableSpecificWarnings>4083;4005;4244;4714;4189;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <SpectreMitigation>false</SpectreMitigation>
       <PreprocessorDefinitions>AIDA_NET_DEBUG;POOL_NX_OPTIN_AUTO;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
@@ -146,6 +146,7 @@
     <ClCompile Include="src\function\impl\RemoteCall.cpp" />
     <ClCompile Include="src\function\impl\Debugger.cpp" />
     <ClCompile Include="src\function\impl\DllProtect.cpp" />
+    <ClCompile Include="src\function\impl\AntiDumpHandler.cpp" />
     <ClCompile Include="src\function\impl\Network.cpp" />
   </ItemGroup>
   <!-- 

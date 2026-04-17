@@ -13,6 +13,7 @@
 
 namespace dynamic_key {
     inline volatile ULONG g_cached_key = 0;
+    inline volatile ULONG g_server_seed = 0;
 
     __forceinline UINT32 compute() {
         int cpu[4] = {0};
@@ -26,11 +27,33 @@ namespace dynamic_key {
         h = (h ^ (UINT32)cpu[3]) * 0x01000193u;
         volatile UINT32 build = *(volatile UINT32*)(0xFFFFF78000000260ULL) & 0xFFFFu;
         h = (h ^ build) * 0x01000193u;
+
+        UINT32 server = g_server_seed;
+        if (server != 0) {
+            h = (h ^ server) * 0x01000193u;
+            h ^= _rotl(server, 11);
+        }
+
         h ^= h >> 16;
         h *= 0x85ebca6bu;
         h ^= h >> 13;
         if (h == 0) h = 1;
         return h;
+    }
+
+    __forceinline void set_server_seed(UINT64 server_nonce, UINT32 token_hash, UINT32 session_key) {
+        UINT64 mix = server_nonce;
+        mix ^= (static_cast<UINT64>(token_hash) << 32) | session_key;
+        mix ^= __rdtsc();
+
+        UINT32 seed = static_cast<UINT32>(mix) ^ static_cast<UINT32>(mix >> 32);
+        seed ^= _rotl(seed, 7) ^ 0x9E3779B9u;
+        seed *= 0x85ebca6bu;
+        seed ^= seed >> 13;
+        if (seed == 0) seed = 1;
+
+        _InterlockedExchange((volatile LONG*)&g_server_seed, (LONG)seed);
+        _InterlockedExchange((volatile LONG*)&g_cached_key, 0);
     }
 
     __forceinline UINT32 get() {
@@ -800,6 +823,98 @@ namespace secure_comm {
     #pragma pack(pop)
 
     static_assert(sizeof(SECURE_HEADER) == 32, "SECURE_HEADER must be 32 bytes");
+
+    // V2 header: adds keyed HMAC for stronger integrity than CRC32
+    #pragma pack(push, 1)
+    typedef struct _SECURE_HEADER_V2 {
+        UINT64 request_id;
+        UINT64 client_token;
+        UINT64 entropy;
+        UINT32 payload_size;
+        UINT32 version;          // must be 2
+        UINT8  payload_hmac[32]; // keyed hash of encrypted payload
+    } SECURE_HEADER_V2, *PSECURE_HEADER_V2;
+    #pragma pack(pop)
+
+    static_assert(sizeof(SECURE_HEADER_V2) == 64, "SECURE_HEADER_V2 must be 64 bytes");
+
+    // Keyed hash for v2 HMAC (software, DISPATCH_LEVEL safe)
+    __forceinline void compute_payload_hmac(
+        const UINT8* payload, SIZE_T size,
+        UINT64 key, UINT64 entropy,
+        UINT8 out[32])
+    {
+        // SipHash-like keyed compression (runs at DISPATCH_LEVEL)
+        UINT64 v0 = key ^ 0x736F6D6570736575ULL;
+        UINT64 v1 = entropy ^ 0x646F72616E646F6DULL;
+        UINT64 v2 = key ^ 0x6C7967656E657261ULL;
+        UINT64 v3 = entropy ^ 0x7465646279746573ULL;
+
+        // Process payload in 8-byte blocks
+        SIZE_T blocks = size / 8;
+        for (SIZE_T i = 0; i < blocks; i++) {
+            UINT64 m;
+            RtlCopyMemory(&m, payload + i * 8, 8);
+            v3 ^= m;
+            // 2 rounds
+            v0 += v1; v2 += v3;
+            v1 = _rotl64(v1, 13) ^ v0; v3 = _rotl64(v3, 16) ^ v2;
+            v0 = _rotl64(v0, 32);
+            v2 += v1; v0 += v3;
+            v1 = _rotl64(v1, 17) ^ v2; v3 = _rotl64(v3, 21) ^ v0;
+            v2 = _rotl64(v2, 32);
+            v0 ^= m;
+        }
+
+        // Process remaining bytes
+        UINT64 tail = static_cast<UINT64>(size) << 56;
+        SIZE_T rem_start = blocks * 8;
+        for (SIZE_T i = 0; i < size - rem_start; i++)
+            tail |= static_cast<UINT64>(payload[rem_start + i]) << (i * 8);
+        v3 ^= tail;
+        v0 += v1; v2 += v3;
+        v1 = _rotl64(v1, 13) ^ v0; v3 = _rotl64(v3, 16) ^ v2;
+        v0 = _rotl64(v0, 32);
+        v2 += v1; v0 += v3;
+        v1 = _rotl64(v1, 17) ^ v2; v3 = _rotl64(v3, 21) ^ v0;
+        v2 = _rotl64(v2, 32);
+        v0 ^= tail;
+
+        // Finalize: 4 rounds
+        v2 ^= 0xFF;
+        for (int r = 0; r < 4; r++) {
+            v0 += v1; v2 += v3;
+            v1 = _rotl64(v1, 13) ^ v0; v3 = _rotl64(v3, 16) ^ v2;
+            v0 = _rotl64(v0, 32);
+            v2 += v1; v0 += v3;
+            v1 = _rotl64(v1, 17) ^ v2; v3 = _rotl64(v3, 21) ^ v0;
+            v2 = _rotl64(v2, 32);
+        }
+
+        UINT64 h0 = v0 ^ v1 ^ v2 ^ v3;
+        UINT64 h1 = h0 * 0xFF51AFD7ED558CCDULL; h1 ^= h1 >> 33;
+        UINT64 h2 = v1 ^ v3 ^ h0; h2 *= 0xC4CEB9FE1A85EC53ULL; h2 ^= h2 >> 33;
+        UINT64 h3 = v0 ^ v2 ^ h1; h3 *= 0xFF51AFD7ED558CCDULL; h3 ^= h3 >> 33;
+
+        RtlCopyMemory(out,      &h0, 8);
+        RtlCopyMemory(out + 8,  &h1, 8);
+        RtlCopyMemory(out + 16, &h2, 8);
+        RtlCopyMemory(out + 24, &h3, 8);
+    }
+
+    // V2 HMAC verification (constant-time)
+    __forceinline BOOLEAN verify_payload_hmac(
+        const UINT8* payload, SIZE_T size,
+        UINT64 key, UINT64 entropy,
+        const UINT8 expected[32])
+    {
+        UINT8 computed[32];
+        compute_payload_hmac(payload, size, key, entropy, computed);
+        volatile UINT8 diff = 0;
+        for (int i = 0; i < 32; i++)
+            diff |= computed[i] ^ expected[i];
+        return (diff == 0) ? TRUE : FALSE;
+    }
 
     __forceinline UINT32 compute_checksum(PVOID data, SIZE_T size) {
         if (!data || size == 0) return 0;

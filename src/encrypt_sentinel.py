@@ -1,14 +1,14 @@
 """
-XOR-encrypt the built Sentinel.sys binary into src/sentinel_encrypted.h
-for embedding in AiDAStandalone.
+XOR-encrypt the raw Sentinel.sys bytes exported by HxD (Sentinel.c)
+into src/sentinel_encrypted.h for embedding in AiDAStandalone.
 
 Usage:
     python src/encrypt_sentinel.py
 
-The script reads build/Release/Sentinel.sys and writes the
+The script reads Sentinel.c from the project root and writes the
 encrypted header to src/sentinel_encrypted.h.
 """
-import os, sys
+import re, os, sys
 
 SENTINEL_XOR_KEY = bytes([
     0xD7, 0x2B, 0x83, 0x4E, 0xF1, 0x69, 0xA5, 0x1C,
@@ -17,7 +17,7 @@ SENTINEL_XOR_KEY = bytes([
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-INPUT_PATH = os.path.join(PROJECT_ROOT, "build", "Release", "Sentinel.sys")
+INPUT_PATH = os.path.join(PROJECT_ROOT, "Sentinel.c")
 OUTPUT_PATH = os.path.join(SCRIPT_DIR, "sentinel_encrypted.h")
 
 def main():
@@ -25,11 +25,15 @@ def main():
         print(f"[!] Input file not found: {INPUT_PATH}")
         sys.exit(1)
 
-    with open(INPUT_PATH, "rb") as f:
-        raw_bytes = f.read()
+    with open(INPUT_PATH, "r") as f:
+        content = f.read()
 
+    hex_pattern = re.compile(r"0x([0-9A-Fa-f]{2})")
+    matches = hex_pattern.findall(content)
+    raw_bytes = bytes([int(m, 16) for m in matches])
     total = len(raw_bytes)
-    print(f"[*] Read {total} bytes from {INPUT_PATH}")
+
+    print(f"[*] Parsed {total} bytes from {INPUT_PATH}")
     print(f"[*] First 2 bytes: 0x{raw_bytes[0]:02X} 0x{raw_bytes[1]:02X}")
 
     if raw_bytes[0] != 0x4D or raw_bytes[1] != 0x5A:

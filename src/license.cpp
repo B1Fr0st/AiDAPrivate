@@ -29,7 +29,10 @@
 
 static std::string get_hardcoded_firebase_api_key()
 {
-    return OBFBYTES("bWLmMKBhD3TE7iYMnKizIjOrt4jXd9R1m0CVCj6P");
+    // Phase 6.1: hardcoded Firebase API key removed. Returns empty string.
+    // If firebase_api_key is still set in settings (legacy), get_effective_*
+    // will pick it up, but we no longer ship a key in the binary.
+    return std::string();
 }
 
 static std::string get_effective_firebase_api_key()

@@ -35,11 +35,20 @@ function encryptArc(plaintext, sessionToken, hwid, issuedAt) {
 
 const CODE_PAGE_SIZE = 4096;
 
-function derivePageKey(keySeed, pageIndex, sessionToken, hwid, issuedAt, proofToken) {
+function derivePageKey(keySeed, pageIndex, sessionToken, hwid, issuedAt, proofToken, chainTag) {
     const proof = proofToken || '';
-    const data = `page|${pageIndex}|${sessionToken}|${hwid}|${issuedAt}|${proof}`;
+    const chain = chainTag || '';
+    const data = `page|${pageIndex}|${sessionToken}|${hwid}|${issuedAt}|${proof}|${chain}`;
     return crypto.createHmac('sha256', keySeed)
         .update(data)
+        .digest();
+}
+
+function deriveChainTag(prevTag, authTag) {
+    const prev = prevTag ? Buffer.from(prevTag, 'hex') : Buffer.alloc(32, 0);
+    return crypto.createHmac('sha256', prev)
+        .update(authTag)
+        .update('chain')
         .digest();
 }
 
@@ -47,9 +56,9 @@ function getPageCount(blobSize) {
     return Math.ceil(blobSize / CODE_PAGE_SIZE);
 }
 
-function encryptPage(plaintext, pageIndex, sessionToken, hwid, issuedAt, proofToken) {
+function encryptPage(plaintext, pageIndex, sessionToken, hwid, issuedAt, proofToken, chainTag) {
     const keySeed = deriveKeySeed(sessionToken, hwid, issuedAt);
-    const key = derivePageKey(keySeed, pageIndex, sessionToken, hwid, issuedAt, proofToken);
+    const key = derivePageKey(keySeed, pageIndex, sessionToken, hwid, issuedAt, proofToken, chainTag);
     const iv = crypto.randomBytes(12);
 
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -80,6 +89,7 @@ module.exports = {
     deriveSessionKey,
     encryptArc,
     derivePageKey,
+    deriveChainTag,
     getPageCount,
     encryptPage,
     splitIntoPages,

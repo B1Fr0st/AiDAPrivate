@@ -2,6 +2,8 @@
 #include <ntifs.h>
 #include <intrin.h>
 #include "../imports/Defs.h"
+#include <function/CoreSecurity.h>
+#include "SentinelBridge.h"
 
 #ifndef YieldProcessor
 #define YieldProcessor() _mm_pause()
@@ -149,8 +151,12 @@ namespace anti_debug {
         __try {
 
 
-            UINT64 old_irql = __readcr8();
-            __writecr8(2);
+            BOOLEAN hvci_on = hvci_detect::is_hvci_enabled();
+            UINT64 old_irql = 0;
+            if (!hvci_on) {
+                old_irql = __readcr8();
+                __writecr8(2);
+            }
 
             constexpr UINT32 NUM_TRIALS = 3;
             constexpr UINT64 TIMING_THRESHOLD = 2000000ULL;
@@ -173,7 +179,9 @@ namespace anti_debug {
                 }
             }
 
-            __writecr8(old_irql);
+            if (!hvci_on) {
+                __writecr8(old_irql);
+            }
 
 
             if (fail_count >= 2) {
@@ -428,7 +436,7 @@ namespace anti_debug {
         __try {
             UINT8* thread_ptr = (UINT8*)thread;
             volatile ULONG* cross_flags = (volatile ULONG*)(thread_ptr + 0x74);
-            InterlockedOr(cross_flags, 0x4);
+            InterlockedOr((volatile LONG*)cross_flags, 0x4);
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             status = STATUS_UNSUCCESSFUL;
         }
@@ -515,7 +523,7 @@ namespace anti_debug {
             {
                 UINT8* thread_ptr = (UINT8*)thread;
                 volatile ULONG* cross_flags = (volatile ULONG*)(thread_ptr + 0x74);
-                ULONG old_flags = InterlockedOr(cross_flags, 0x4);
+                ULONG old_flags = InterlockedOr((volatile LONG*)cross_flags, 0x4);
                 if (!(old_flags & 0x4)) hidden++;
             }
         }

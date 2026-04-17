@@ -37,7 +37,7 @@ module.exports = {
         max_memory_restart: '256M',
         env: {
             NODE_ENV: 'production',
-            PORT: 3000,
+            PORT: 3001,
             ...dotenv,
         },
         error_file: '/var/log/aida/error.log',

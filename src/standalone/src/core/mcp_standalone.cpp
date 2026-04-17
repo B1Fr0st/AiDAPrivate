@@ -1,5 +1,7 @@
 ﻿#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 #include <shlobj.h>
 #include <shlwapi.h>
 #pragma comment(lib, "shlwapi.lib")
@@ -32,13 +34,21 @@ static std::string json_dump_safe(const json& j, int indent = -1)
 
 static std::string generate_session_id()
 {
-    static std::atomic<uint64_t> counter{0};
-    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-    std::mt19937_64 rng(now ^ (++counter));
-    char buf[64];
-    snprintf(buf, sizeof(buf), "sa-%016llx-%04llx",
-             static_cast<unsigned long long>(rng()),
-             static_cast<unsigned long long>(counter.load()));
+    // Phase 6.5: cryptographically strong session IDs via BCryptGenRandom.
+    unsigned char rnd[16] = {};
+    NTSTATUS st = BCryptGenRandom(nullptr, rnd, sizeof(rnd),
+                                  BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (st != 0) {
+        // Fallback only on catastrophic failure; still avoid mt19937.
+        auto t = std::chrono::steady_clock::now().time_since_epoch().count();
+        for (size_t i = 0; i < sizeof(rnd); ++i)
+            rnd[i] = static_cast<unsigned char>((t >> (i * 8)) ^ i);
+    }
+    char buf[48];
+    snprintf(buf, sizeof(buf),
+             "sa-%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+             rnd[0], rnd[1], rnd[2], rnd[3], rnd[4], rnd[5], rnd[6], rnd[7],
+             rnd[8], rnd[9], rnd[10], rnd[11], rnd[12], rnd[13], rnd[14], rnd[15]);
     return buf;
 }
 

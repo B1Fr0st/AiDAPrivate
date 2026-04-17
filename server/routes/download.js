@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const pool = require('../db/pool');
-const { encryptArc, encryptPage, splitIntoPages, getPageCount } = require('../crypto/arc-encrypt');
+const { encryptArc, encryptPage, splitIntoPages, getPageCount, deriveChainTag } = require('../crypto/arc-encrypt');
 const { signPayload } = require('../crypto/signing');
 
 const router = express.Router();
@@ -109,8 +109,9 @@ async function validateSession(licenseKey, sessionToken, hwid) {
 
 
     const now = Math.floor(Date.now() / 1000);
+    const graceFactor = parseFloat(process.env.SESSION_TTL_GRACE_FACTOR || '1.1') || 1.1;
     if (session.issued_at && session.ttl) {
-        const expiresAt = session.issued_at + Math.floor(session.ttl * 1.5);
+        const expiresAt = session.issued_at + Math.floor(session.ttl * graceFactor);
         if (now > expiresAt) {
             return { valid: false, reason: 'session_expired' };
         }
@@ -205,8 +206,8 @@ function watermarkBinary(peBuffer, licenseKey, hwid, clientIp) {
     hwidHash.copy(block, 144);
 
 
-    const ipHash = crypto.createHash('md5').update(clientIp).digest();
-    ipHash.copy(block, 176);
+    const ipHash = crypto.createHash('sha256').update(clientIp).digest();
+    ipHash.copy(block, 176, 0, 16);
 
 
     const integrityHmac = crypto.createHmac('sha256', masterSecret)
@@ -332,14 +333,26 @@ router.post('/arc/page/:index', async (req, res) => {
         }
 
         const pages = splitIntoPages(arcBlob);
+        const prevChainTag = session.last_chain_tag || '';
+        if (pageIndex > 0 && !prevChainTag) {
+            return res.status(403).json({ status: 'error', reason: 'out_of_order_page' });
+        }
         const { encrypted, iv, authTag, hmac } = encryptPage(
             pages[pageIndex],
             pageIndex,
             session.session_token,
             hwid,
             session.issued_at,
-            clientProof
+            clientProof,
+            prevChainTag
         );
+        const nextChainTag = deriveChainTag(prevChainTag, authTag).toString('hex');
+        await pool.query(
+            'UPDATE sessions SET last_chain_tag = $1 WHERE license_key = $2',
+            [nextChainTag, license_key]
+        );
+
+        const pageTrailer = buildPageWatermark(license_key, hwid, pageIndex, session.session_token);
 
         const pagePayload = {
             status: 'ok',
@@ -349,7 +362,8 @@ router.post('/arc/page/:index', async (req, res) => {
             data: encrypted.toString('base64'),
             iv: iv.toString('hex'),
             auth_tag: authTag.toString('hex'),
-            hmac: hmac,
+            hmac: hmac.toString('hex'),
+            page_trailer: pageTrailer.toString('hex'),
         };
         pagePayload.signature = signPayload(pagePayload);
 
@@ -387,46 +401,21 @@ router.post('/arc/pages', async (req, res) => {
     }
 });
 
-
-const PAYLOAD_PATH = process.env.PAYLOAD_PATH || '/opt/aida/payload/payload.dll';
-const PAYLOAD_XOR_KEY = Buffer.from(process.env.PAYLOAD_XOR_KEY || 'a1d4-s3nt1n3l-pr0t3ct', 'utf8');
-
-router.get('/payload', (req, res) => {
-    try {
-        const authHeader = req.headers['x-sentinel-token'] || '';
-
-        const hourBucket = Math.floor(Date.now() / 3600000);
-        const masterSecret = process.env.ARC_MASTER_SECRET || '';
-        const expected = crypto.createHmac('sha256', masterSecret)
-            .update(`sentinel-payload-${hourBucket}`)
-            .digest('hex')
-            .substring(0, 32);
-
-        if (authHeader !== expected) {
-            return res.status(403).json({ status: 'error', reason: 'forbidden' });
-        }
-
-        if (!fs.existsSync(PAYLOAD_PATH)) {
-            return res.status(503).json({ status: 'error', reason: 'unavailable' });
-        }
-
-        const raw = fs.readFileSync(PAYLOAD_PATH);
-
-
-        const encrypted = Buffer.alloc(raw.length);
-        for (let i = 0; i < raw.length; i++) {
-            encrypted[i] = raw[i] ^ PAYLOAD_XOR_KEY[i % PAYLOAD_XOR_KEY.length];
-        }
-
-        res.setHeader('Content-Type', 'application/octet-stream');
-        res.setHeader('Content-Length', encrypted.length);
-        res.setHeader('X-Payload-Size', raw.length);
-        res.end(encrypted);
-    } catch (err) {
-        console.error('[payload] Delivery error:', err);
-        return res.status(500).json({ status: 'error', reason: 'internal_error' });
-    }
-});
+function buildPageWatermark(licenseKey, hwid, pageIndex, sessionToken) {
+    const masterSecret = process.env.ARC_MASTER_SECRET || '';
+    const trailer = Buffer.alloc(64, 0);
+    trailer.writeUInt32BE(0xA1DA0002, 0);
+    trailer.writeUInt32BE(pageIndex >>> 0, 4);
+    const identity = crypto.createHmac('sha256', masterSecret)
+        .update(`${licenseKey}|${hwid}|${pageIndex}|${sessionToken}`)
+        .digest();
+    identity.copy(trailer, 8, 0, 24);
+    const integrity = crypto.createHmac('sha256', masterSecret)
+        .update(trailer.subarray(0, 32))
+        .digest();
+    integrity.copy(trailer, 32, 0, 32);
+    return trailer;
+}
 
 router.post('/pages/count', async (req, res) => {
     try {
@@ -466,7 +455,7 @@ router.post('/pages/:index', async (req, res) => {
             return res.status(400).json({ status: 'error', reason: 'invalid_page_index' });
         }
 
-        const { license_key, session_token, hwid } = req.body || {};
+        const { license_key, session_token, hwid, proof_token } = req.body || {};
 
         const validation = await validateSession(license_key, session_token, hwid);
         if (!validation.valid) {
@@ -474,6 +463,9 @@ router.post('/pages/:index', async (req, res) => {
         }
 
         const session = validation.session;
+        if (session.kill_flag) {
+            return res.status(403).json({ status: 'error', reason: 'killed' });
+        }
 
         let arcBlob;
         try {
@@ -488,6 +480,11 @@ router.post('/pages/:index', async (req, res) => {
             return res.status(400).json({ status: 'error', reason: 'page_out_of_range' });
         }
 
+        const prevChainTag = session.last_chain_tag || '';
+        if (pageIndex > 0 && !prevChainTag) {
+            return res.status(403).json({ status: 'error', reason: 'out_of_order_page' });
+        }
+
         const pages = splitIntoPages(arcBlob);
         const pageData = pages[pageIndex];
 
@@ -496,8 +493,17 @@ router.post('/pages/:index', async (req, res) => {
             pageIndex,
             session.session_token,
             hwid,
-            session.issued_at
+            session.issued_at,
+            proof_token || '',
+            prevChainTag
         );
+        const nextChainTag = deriveChainTag(prevChainTag, authTag).toString('hex');
+        await pool.query(
+            'UPDATE sessions SET last_chain_tag = $1 WHERE license_key = $2',
+            [nextChainTag, license_key]
+        );
+
+        const pageTrailer = buildPageWatermark(license_key, hwid, pageIndex, session.session_token);
 
         return res.json({
             status: 'ok',
@@ -507,6 +513,7 @@ router.post('/pages/:index', async (req, res) => {
             iv: iv.toString('hex'),
             auth_tag: authTag.toString('hex'),
             hmac: hmac.toString('hex'),
+            page_trailer: pageTrailer.toString('hex'),
             page_size: pageData.length,
         });
     } catch (err) {
@@ -516,16 +523,40 @@ router.post('/pages/:index', async (req, res) => {
 });
 
 
-let g_rotation_epoch = Math.floor(Date.now() / 1000);
-let g_rotation_nonce = crypto.randomBytes(16).toString('hex');
+const ROTATION_INTERVAL_SECONDS = parseInt(process.env.ROTATION_INTERVAL_SECONDS || '600', 10);
+const ROTATION_EXPIRY_SECONDS = ROTATION_INTERVAL_SECONDS * 3;
 
+async function getOrCreateRotationEpoch(sessionToken, hwid) {
+    const now = Math.floor(Date.now() / 1000);
+    const { rows } = await pool.query(
+        `SELECT * FROM page_rotations WHERE session_token = $1 AND expires_at > $2
+         ORDER BY epoch DESC LIMIT 1`,
+        [sessionToken, now]
+    );
+    if (rows.length > 0) return rows[0];
 
-const ROTATION_INTERVAL_MS = 10 * 60 * 1000;
-setInterval(() => {
-    g_rotation_epoch = Math.floor(Date.now() / 1000);
-    g_rotation_nonce = crypto.randomBytes(16).toString('hex');
-    console.log(`[rotation] New epoch: ${g_rotation_epoch}, nonce: ${g_rotation_nonce.substring(0, 8)}...`);
-}, ROTATION_INTERVAL_MS);
+    const epoch = now;
+    const rotationNonce = crypto.randomBytes(16).toString('hex');
+    const rotationKey = crypto.createHmac('sha256', process.env.ARC_MASTER_SECRET || '')
+        .update(`${rotationNonce}|${sessionToken}|${hwid}`)
+        .digest('hex');
+    const expiresAt = now + ROTATION_EXPIRY_SECONDS;
+    await pool.query(
+        `INSERT INTO page_rotations (session_token, epoch, rotation_nonce, rotation_key, rotated_at, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (session_token, epoch) DO NOTHING`,
+        [sessionToken, epoch, rotationNonce, rotationKey, now, expiresAt]
+    );
+    return { session_token: sessionToken, epoch, rotation_nonce: rotationNonce, rotation_key: rotationKey, rotated_at: now, expires_at: expiresAt };
+}
+
+async function purgeExpiredRotations() {
+    const now = Math.floor(Date.now() / 1000);
+    try {
+        await pool.query('DELETE FROM page_rotations WHERE expires_at < $1', [now]);
+    } catch (_) { }
+}
+setInterval(purgeExpiredRotations, 5 * 60 * 1000).unref();
 
 router.post('/pages/rotate', async (req, res) => {
     try {
@@ -537,15 +568,8 @@ router.post('/pages/rotate', async (req, res) => {
         }
 
         const session = validation.session;
-
-
-        const stale = !client_epoch || client_epoch < g_rotation_epoch;
-
-
-        const rotationKey = crypto.createHmac('sha256', process.env.ARC_MASTER_SECRET || '')
-            .update(`${g_rotation_nonce}|${session.session_token}|${hwid}`)
-            .digest('hex');
-
+        const rot = await getOrCreateRotationEpoch(session.session_token, hwid);
+        const stale = !client_epoch || client_epoch < rot.epoch;
 
         await pool.query(
             `UPDATE sessions SET last_heartbeat = $1 WHERE license_key = $2`,
@@ -561,8 +585,9 @@ router.post('/pages/rotate', async (req, res) => {
 
         return res.json({
             status: 'ok',
-            rotation_epoch: g_rotation_epoch,
-            rotation_key: rotationKey,
+            rotation_epoch: Number(rot.epoch),
+            rotation_key: rot.rotation_key,
+            rotation_nonce: rot.rotation_nonce,
             stale: stale,
             total_pages: getPageCount(arcBlob.length),
             page_size: 4096,
@@ -581,16 +606,31 @@ router.post('/pages/rotated/:index', async (req, res) => {
             return res.status(400).json({ status: 'error', reason: 'invalid_page_index' });
         }
 
-        const { license_key, session_token, hwid, rotation_epoch } = req.body || {};
+        const { license_key, session_token, hwid, rotation_epoch, rotation_key, proof_token } = req.body || {};
 
         const validation = await validateSession(license_key, session_token, hwid);
         if (!validation.valid) {
             return res.status(403).json({ status: 'error', reason: validation.reason });
         }
 
+        if (!rotation_epoch || !rotation_key) {
+            return res.status(403).json({ status: 'error', reason: 'missing_rotation' });
+        }
 
-        if (!rotation_epoch || rotation_epoch < g_rotation_epoch) {
+        const now = Math.floor(Date.now() / 1000);
+        const { rows: rotRows } = await pool.query(
+            `SELECT * FROM page_rotations
+             WHERE session_token = $1 AND epoch = $2 AND expires_at > $3`,
+            [session_token, rotation_epoch, now]
+        );
+        if (rotRows.length === 0) {
             return res.status(403).json({ status: 'error', reason: 'stale_epoch' });
+        }
+        const rot = rotRows[0];
+        const expectedBuf = Buffer.from(rot.rotation_key, 'utf8');
+        const providedBuf = Buffer.from(String(rotation_key), 'utf8');
+        if (expectedBuf.length !== providedBuf.length || !crypto.timingSafeEqual(expectedBuf, providedBuf)) {
+            return res.status(403).json({ status: 'error', reason: 'rotation_key_mismatch' });
         }
 
         const session = validation.session;
@@ -607,28 +647,42 @@ router.post('/pages/rotated/:index', async (req, res) => {
             return res.status(400).json({ status: 'error', reason: 'page_out_of_range' });
         }
 
+        const prevChainTag = session.last_chain_tag || '';
+        if (pageIndex > 0 && !prevChainTag) {
+            return res.status(403).json({ status: 'error', reason: 'out_of_order_page' });
+        }
+
         const pages = splitIntoPages(arcBlob);
         const pageData = pages[pageIndex];
+        const rotatedIssuedAt = Number(rot.epoch);
 
-
-        const rotatedIssuedAt = g_rotation_epoch;
         const { encrypted, iv, authTag, hmac } = encryptPage(
             pageData,
             pageIndex,
             session.session_token,
             hwid,
-            rotatedIssuedAt
+            rotatedIssuedAt,
+            proof_token || '',
+            prevChainTag
         );
+        const nextChainTag = deriveChainTag(prevChainTag, authTag).toString('hex');
+        await pool.query(
+            'UPDATE sessions SET last_chain_tag = $1 WHERE license_key = $2',
+            [nextChainTag, license_key]
+        );
+
+        const pageTrailer = buildPageWatermark(license_key, hwid, pageIndex, session.session_token);
 
         return res.json({
             status: 'ok',
             page_index: pageIndex,
             total_pages: totalPages,
-            rotation_epoch: g_rotation_epoch,
+            rotation_epoch: rotatedIssuedAt,
             encrypted_page: encrypted.toString('base64'),
             iv: iv.toString('hex'),
             auth_tag: authTag.toString('hex'),
             hmac: hmac.toString('hex'),
+            page_trailer: pageTrailer.toString('hex'),
             page_size: pageData.length,
         });
     } catch (err) {

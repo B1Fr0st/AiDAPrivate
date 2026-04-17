@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <intrin.h>
 #include <nmmintrin.h>
 
@@ -12,6 +13,8 @@
 
 #include "state.hpp"
 #include "integrity.hpp"
+
+#pragma comment(lib, "bcrypt.lib")
 
 namespace anti_tamper {
 namespace code_encrypt {
@@ -44,10 +47,10 @@ namespace detail {
         return a;
     }
 
-    inline uint64_t& session_seed()
+    inline uint8_t (&session_prk())[32]
     {
-        static uint64_t s = 0;
-        return s;
+        static uint8_t prk[32] = {};
+        return prk;
     }
 
     struct eop_trampoline_t
@@ -55,6 +58,7 @@ namespace detail {
         uint64_t trigger_addr;
         uint64_t target_addr;
         uint64_t decrypt_key;
+        uint32_t target_size;
         uint8_t  exception_type;
         bool     armed;
     };
@@ -93,30 +97,84 @@ namespace detail {
         FlushInstructionCache(GetCurrentProcess(), addr, 6);
     }
 
-    inline uint64_t fnv1a_hash(const void* data, size_t len)
+    inline bool hkdf_hmac_sha256(const uint8_t* key, uint32_t key_len,
+                                  const uint8_t* data, uint32_t data_len,
+                                  uint8_t out[32])
     {
-        uint64_t h = 0xCBF29CE484222325ULL;
-        const auto* p = static_cast<const uint8_t*>(data);
-        for (size_t i = 0; i < len; ++i)
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        bool ok = false;
+        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM,
+                                        nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+            return false;
+        if (BCryptCreateHash(hAlg, &hHash, nullptr, 0,
+                             const_cast<PUCHAR>(key), key_len, 0) != 0)
         {
-            h ^= p[i];
-            h *= 0x100000001B3ULL;
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return false;
         }
-        return h;
+        if (BCryptHashData(hHash, const_cast<PUCHAR>(data), data_len, 0) == 0)
+            ok = (BCryptFinishHash(hHash, out, 32, 0) == 0);
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return ok;
     }
 
-    inline uint64_t derive_section_key(const char* section_name, uint64_t seed)
+    inline void hkdf_expand(const uint8_t prk[32], const uint8_t* info,
+                             uint32_t info_len, uint8_t* okm, uint32_t okm_len)
     {
-        uint64_t name_hash = fnv1a_hash(section_name, strlen(section_name));
-        return name_hash ^ seed ^ _rotl64(seed, 17);
+        uint8_t t[32] = {};
+        uint32_t t_len = 0;
+        uint8_t counter = 1;
+        uint32_t pos = 0;
+        while (pos < okm_len)
+        {
+            uint32_t input_len = t_len + info_len + 1;
+            auto* input = static_cast<uint8_t*>(_alloca(input_len));
+            if (t_len > 0) memcpy(input, t, t_len);
+            memcpy(input + t_len, info, info_len);
+            input[t_len + info_len] = counter;
+            hkdf_hmac_sha256(prk, 32, input, input_len, t);
+            t_len = 32;
+            uint32_t copy = (okm_len - pos < 32) ? (okm_len - pos) : 32;
+            memcpy(okm + pos, t, copy);
+            pos += copy;
+            counter++;
+        }
     }
 
-    inline uint64_t derive_page_key(uint64_t page_addr, uint64_t section_key)
+    inline uint64_t derive_section_key(const char* section_name, const uint8_t prk[32])
     {
-        uint8_t buf[16];
-        memcpy(buf, &page_addr, 8);
-        memcpy(buf + 8, &section_key, 8);
-        return integrity::siphash::hash(buf, 16, section_key, page_addr ^ 0x7A3E1F9DC5B28A04ULL);
+        const char label[] = "code_encrypt|section|";
+        size_t name_len = strlen(section_name);
+        uint32_t info_len = static_cast<uint32_t>(sizeof(label) - 1 + name_len);
+        auto* info = static_cast<uint8_t*>(_alloca(info_len));
+        memcpy(info, label, sizeof(label) - 1);
+        memcpy(info + sizeof(label) - 1, section_name, name_len);
+
+        uint8_t derived[8];
+        hkdf_expand(prk, info, info_len, derived, 8);
+
+        uint64_t key;
+        memcpy(&key, derived, 8);
+        return key;
+    }
+
+    inline uint64_t derive_page_key(uint64_t page_addr, uint64_t section_key,
+                                     const uint8_t prk[32])
+    {
+        const char label[] = "code_encrypt|page|";
+        uint8_t info[sizeof(label) - 1 + 16];
+        memcpy(info, label, sizeof(label) - 1);
+        memcpy(info + sizeof(label) - 1, &page_addr, 8);
+        memcpy(info + sizeof(label) - 1 + 8, &section_key, 8);
+
+        uint8_t derived[8];
+        hkdf_expand(prk, info, static_cast<uint32_t>(sizeof(info)), derived, 8);
+
+        uint64_t key;
+        memcpy(&key, derived, 8);
+        return key;
     }
 
     inline void xor_region(uint8_t* data, uint32_t size, uint64_t key)
@@ -198,15 +256,17 @@ inline LONG CALLBACK code_guard_handler(EXCEPTION_POINTERS* ep)
                 tramp.exception_type != detail::EOP_INT3) continue;
             if (rip >= tramp.trigger_addr && rip <= tramp.trigger_addr + 2)
             {
-                if (tramp.decrypt_key != 0)
+                if (tramp.decrypt_key != 0 && tramp.target_size != 0)
                 {
                     DWORD old_prot;
-                    VirtualProtect(reinterpret_cast<void*>(tramp.target_addr), 64,
+                    VirtualProtect(reinterpret_cast<void*>(tramp.target_addr), tramp.target_size,
                         PAGE_EXECUTE_READWRITE, &old_prot);
                     detail::xor_region(reinterpret_cast<uint8_t*>(tramp.target_addr),
-                        64, tramp.decrypt_key);
-                    VirtualProtect(reinterpret_cast<void*>(tramp.target_addr), 64,
+                        tramp.target_size, tramp.decrypt_key);
+                    VirtualProtect(reinterpret_cast<void*>(tramp.target_addr), tramp.target_size,
                         PAGE_EXECUTE_READ, &old_prot);
+                    FlushInstructionCache(GetCurrentProcess(),
+                        reinterpret_cast<void*>(tramp.target_addr), tramp.target_size);
                 }
                 ep->ContextRecord->Rip = tramp.target_addr;
                 return EXCEPTION_CONTINUE_EXECUTION;
@@ -224,15 +284,17 @@ inline LONG CALLBACK code_guard_handler(EXCEPTION_POINTERS* ep)
             if (tramp.exception_type != detail::EOP_DIV_ZERO) continue;
             if (rip >= tramp.trigger_addr && rip <= tramp.trigger_addr + 6)
             {
-                if (tramp.decrypt_key != 0)
+                if (tramp.decrypt_key != 0 && tramp.target_size != 0)
                 {
                     DWORD old_prot;
-                    VirtualProtect(reinterpret_cast<void*>(tramp.target_addr), 64,
+                    VirtualProtect(reinterpret_cast<void*>(tramp.target_addr), tramp.target_size,
                         PAGE_EXECUTE_READWRITE, &old_prot);
                     detail::xor_region(reinterpret_cast<uint8_t*>(tramp.target_addr),
-                        64, tramp.decrypt_key);
-                    VirtualProtect(reinterpret_cast<void*>(tramp.target_addr), 64,
+                        tramp.target_size, tramp.decrypt_key);
+                    VirtualProtect(reinterpret_cast<void*>(tramp.target_addr), tramp.target_size,
                         PAGE_EXECUTE_READ, &old_prot);
+                    FlushInstructionCache(GetCurrentProcess(),
+                        reinterpret_cast<void*>(tramp.target_addr), tramp.target_size);
                 }
                 ep->ContextRecord->Rip = tramp.target_addr;
                 return EXCEPTION_CONTINUE_EXECUTION;
@@ -247,7 +309,14 @@ inline bool initialize(uint64_t code_hash)
 {
     if (detail::active().load()) return true;
 
-    detail::session_seed() = __rdtsc() ^ code_hash ^ GetCurrentProcessId();
+    uint8_t ikm[32];
+    if (BCryptGenRandom(nullptr, ikm, 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+        return false;
+
+    uint8_t salt[8];
+    memcpy(salt, &code_hash, 8);
+    detail::hkdf_hmac_sha256(salt, 8, ikm, 32, detail::session_prk());
+    SecureZeroMemory(ikm, 32);
 
     veh_handle = AddVectoredExceptionHandler(1, code_guard_handler);
     if (!veh_handle) return false;
@@ -260,8 +329,8 @@ inline void encrypt_region(uint64_t base, uint32_t size, const char* section_nam
 {
     if (!detail::active().load()) return;
 
-    uint64_t sec_key = detail::derive_section_key(section_name, detail::session_seed());
-    uint64_t page_key = detail::derive_page_key(base, sec_key);
+    uint64_t sec_key = detail::derive_section_key(section_name, detail::session_prk());
+    uint64_t page_key = detail::derive_page_key(base, sec_key, detail::session_prk());
 
     DWORD old_prot;
     if (!VirtualProtect(reinterpret_cast<void*>(base), size,
@@ -281,8 +350,13 @@ inline void rotate_keys()
 {
     std::lock_guard<std::mutex> lk(detail::page_mtx());
 
-    uint64_t new_seed = __rdtsc() ^ detail::session_seed();
-    detail::session_seed() = new_seed;
+    uint8_t new_ikm[32];
+    BCryptGenRandom(nullptr, new_ikm, 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    uint8_t new_prk[32];
+    detail::hkdf_hmac_sha256(detail::session_prk(), 32, new_ikm, 32, new_prk);
+    SecureZeroMemory(new_ikm, 32);
+    memcpy(detail::session_prk(), new_prk, 32);
+    SecureZeroMemory(new_prk, 32);
 
     for (auto& page : detail::encrypted_pages())
     {
@@ -294,7 +368,8 @@ inline void rotate_keys()
         detail::xor_region(reinterpret_cast<uint8_t*>(page.base), page.size, page.key);
 
         uint64_t new_key = detail::derive_page_key(page.base,
-            detail::derive_section_key(".text", new_seed));
+            detail::derive_section_key(".text", detail::session_prk()),
+            detail::session_prk());
         detail::xor_region(reinterpret_cast<uint8_t*>(page.base), page.size, new_key);
 
         page.key = new_key;
@@ -305,13 +380,13 @@ inline void rotate_keys()
 }
 
 inline void register_eop_trampoline(uint64_t trigger_addr, uint64_t target_addr,
-    uint64_t decrypt_key, detail::eop_exception_type type)
+    uint64_t decrypt_key, uint32_t target_size, detail::eop_exception_type type)
 {
     if (!detail::active().load()) return;
 
     std::lock_guard<std::mutex> lk(detail::page_mtx());
     detail::eop_trampolines().push_back({trigger_addr, target_addr, decrypt_key,
-        static_cast<uint8_t>(type), true});
+        target_size, static_cast<uint8_t>(type), true});
 
     switch (type)
     {
@@ -346,6 +421,7 @@ inline void shutdown()
             page.original_protect, &old_prot);
     }
     detail::encrypted_pages().clear();
+    SecureZeroMemory(detail::session_prk(), 32);
 }
 
 }

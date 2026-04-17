@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "integrity.hpp"
+#include "virtualizer.hpp"
+#include "vm_compiler.hpp"
 
 namespace anti_tamper {
 namespace stolen_bytes {
@@ -24,6 +26,9 @@ namespace detail {
         uint32_t prologue_len;
         uint64_t trampoline_addr;
         uint64_t encryption_key;
+        std::vector<uint8_t> vm_bytecode;
+        uint64_t vm_seed;
+        uint64_t continuation_addr;
     };
 
     struct stolen_state_t
@@ -131,6 +136,23 @@ namespace detail {
 
 }
 
+inline void vm_prologue_execute(detail::stolen_entry_t* entry)
+{
+    if (!entry || entry->vm_bytecode.empty())
+        return;
+
+    anti_tamper::virtualizer::detail::vm_state_t vm;
+    anti_tamper::virtualizer::detail::init_vm(vm, entry->vm_seed);
+    anti_tamper::virtualizer::detail::vm_execute(
+        vm, entry->vm_bytecode.data(),
+        static_cast<uint32_t>(entry->vm_bytecode.size()));
+    anti_tamper::virtualizer::detail::destroy_vm(vm);
+
+    auto cont = reinterpret_cast<void(*)()>(
+        static_cast<uintptr_t>(entry->continuation_addr));
+    cont();
+}
+
 inline bool initialize()
 {
     auto& s = detail::get_state();
@@ -159,12 +181,13 @@ inline bool steal_function_prologue(void* target_func)
     if (steal_len < 5 || steal_len > detail::MAX_STOLEN)
         return false;
 
-    if (s.trampoline_offset + steal_len + 14 > 4096)
+    if (s.trampoline_offset + 64 > 4096)
         return false;
 
     auto& entry = s.entries[s.count];
     entry.original_addr = reinterpret_cast<uint64_t>(code);
     entry.prologue_len = steal_len;
+    entry.continuation_addr = reinterpret_cast<uint64_t>(code) + steal_len;
 
     uint8_t buf[16];
     uint64_t addr_val = reinterpret_cast<uint64_t>(code);
@@ -175,18 +198,42 @@ inline bool steal_function_prologue(void* target_func)
 
     detail::encrypt_prologue(entry.encrypted_prologue, code, steal_len, entry.encryption_key);
 
+    uint64_t vm_seed = anti_tamper::virtualizer::detail::secure_seed();
+    entry.vm_seed = vm_seed;
+
+    anti_tamper::virtualizer::detail::vm_state_t tmp_vm;
+    anti_tamper::virtualizer::detail::init_vm(tmp_vm, vm_seed);
+
+#ifdef AIDA_STANDALONE
+    auto lifted = vm_compiler::x86_lifter::compile_function(
+        code, steal_len, reinterpret_cast<uint64_t>(code),
+        vm_seed ^ 0x6A09E667F3BCC908ULL, tmp_vm.opcode_map);
+    entry.vm_bytecode = lifted.bytecode;
+#else
+    vm_compiler::program_t prog;
+    prog.set_key(vm_seed ^ 0x6A09E667F3BCC908ULL);
+    prog.set_opcode_map(tmp_vm.opcode_map);
+    for (uint32_t i = 0; i < steal_len; ++i)
+        prog.emit_nop();
+    prog.emit_halt();
+    entry.vm_bytecode = prog.finalize();
+#endif
+
+    anti_tamper::virtualizer::detail::destroy_vm(tmp_vm);
+
     auto* tramp = static_cast<uint8_t*>(s.trampoline_page) + s.trampoline_offset;
     entry.trampoline_addr = reinterpret_cast<uint64_t>(tramp);
 
-    memcpy(tramp, code, steal_len);
+    uint64_t entry_ptr = reinterpret_cast<uint64_t>(&s.entries[s.count]);
+    uint64_t exec_addr = reinterpret_cast<uint64_t>(&vm_prologue_execute);
 
-    uint64_t return_addr = reinterpret_cast<uint64_t>(code) + steal_len;
-    tramp[steal_len]     = 0xFF;
-    tramp[steal_len + 1] = 0x25;
-    *reinterpret_cast<uint32_t*>(tramp + steal_len + 2) = 0;
-    *reinterpret_cast<uint64_t*>(tramp + steal_len + 6) = return_addr;
+    tramp[0] = 0x48; tramp[1] = 0xB9;
+    memcpy(tramp + 2, &entry_ptr, 8);
+    tramp[10] = 0x48; tramp[11] = 0xBA;
+    memcpy(tramp + 12, &exec_addr, 8);
+    tramp[20] = 0xFF; tramp[21] = 0xE2;
 
-    s.trampoline_offset += steal_len + 14;
+    s.trampoline_offset += 32;
 
     DWORD old_prot;
     VirtualProtect(code, steal_len, PAGE_EXECUTE_READWRITE, &old_prot);
@@ -214,13 +261,25 @@ inline bool verify_stolen_bytes()
     for (uint32_t i = 0; i < s.count; ++i)
     {
         auto& entry = s.entries[i];
-        auto* tramp = reinterpret_cast<const uint8_t*>(entry.trampoline_addr);
+
+        if (entry.vm_bytecode.empty())
+            return false;
 
         uint8_t decrypted[detail::MAX_STOLEN];
         detail::decrypt_prologue(decrypted, entry.encrypted_prologue,
                                   entry.prologue_len, entry.encryption_key);
 
-        if (memcmp(tramp, decrypted, entry.prologue_len) != 0)
+        uint64_t prologue_hash = integrity::siphash::hash(
+            decrypted, entry.prologue_len,
+            s.session_key[0], s.session_key[1]);
+
+        uint64_t bc_hash = integrity::siphash::hash(
+            entry.vm_bytecode.data(),
+            entry.vm_bytecode.size(),
+            s.session_key[0] ^ prologue_hash,
+            s.session_key[1] ^ prologue_hash);
+
+        if (bc_hash == 0)
             return false;
 
         auto* original = reinterpret_cast<const uint8_t*>(entry.original_addr);

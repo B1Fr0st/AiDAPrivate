@@ -1,6 +1,12 @@
 #pragma once
 #include <imports/Defs.h>
 
+// Declared in DriverEntry.cpp — global scope
+extern volatile PVOID  g_target_driver_base;
+extern volatile PVOID  g_target_driver_object;
+extern volatile ULONG  g_target_driver_size;
+extern PDRIVER_OBJECT  g_sentinel_driver_object;
+
 
 namespace heartbeat {
 
@@ -29,6 +35,11 @@ namespace heartbeat {
     constexpr ULONG BRIDGE_CMD_INTEGRITY_FAIL   = 3;
     constexpr ULONG BRIDGE_CMD_CALLBACK_REMOVED = 4;
     constexpr ULONG BRIDGE_CMD_ETW_REACTIVATED  = 5;
+    constexpr ULONG BRIDGE_CMD_RE_EVIDENCE      = 6;
+    constexpr ULONG BRIDGE_CMD_SET_PROTECTED_PID= 7;
+    constexpr ULONG BRIDGE_CMD_PRE_BSOD_INTENT  = 8;
+    constexpr ULONG BRIDGE_CMD_HEARTBEAT_STALL  = 9;
+    constexpr ULONG BRIDGE_CMD_INJECTED_DLL     = 10;
 
 
     constexpr UINT64 HEARTBEAT_TIMEOUT_TSC = 60ULL * 3000000000ULL;
@@ -67,6 +78,47 @@ namespace heartbeat {
     inline volatile UINT64             g_last_check_tsc = 0;
     inline volatile LONG               g_initialized = 0;
     inline volatile LONG               g_first_heartbeat_seen = 0;
+    inline volatile ULONG              g_quorum_fail_mask = 0;
+    inline volatile UINT64             g_quorum_fail_tsc = 0;
+
+    constexpr ULONG QUORUM_FAIL_STALE   = 0x1;
+    constexpr ULONG QUORUM_FAIL_CHALL   = 0x2;
+    constexpr ULONG QUORUM_FAIL_MODULE  = 0x4;
+    constexpr UINT64 QUORUM_WINDOW_TSC  = 90ULL * 3000000000ULL;
+
+    __forceinline ULONG popcount32(ULONG v) {
+        ULONG c = 0;
+        while (v) {
+            v &= (v - 1);
+            c++;
+        }
+        return c;
+    }
+
+    __forceinline bool register_quorum_failure(ULONG bit, ULONG_PTR a, ULONG_PTR b, ULONG_PTR c) {
+        UINT64 now = __rdtsc();
+        UINT64 last = g_quorum_fail_tsc;
+        ULONG mask = g_quorum_fail_mask;
+
+        if (last == 0 || (now - last) > QUORUM_WINDOW_TSC) {
+            mask = 0;
+        }
+
+        mask |= bit;
+        g_quorum_fail_mask = mask;
+        g_quorum_fail_tsc = now;
+
+        ULONG failures = popcount32(mask);
+        SN_LOG("heartbeat::quorum: bit=0x%lx mask=0x%lx failures=%lu", bit, mask, failures);
+
+        if (failures >= 2) {
+            if (_KeBugCheckEx) {
+                _KeBugCheckEx(0xDEAD5E08, mask, a, b, c);
+            }
+            return false;
+        }
+        return true;
+    }
 
 
     __forceinline bool locate_bridge(PVOID whoswho_base, ULONG whoswho_size) {
@@ -246,17 +298,12 @@ namespace heartbeat {
                 current_whoswho_tsc, elapsed, HEARTBEAT_TIMEOUT_TSC);
 
             if (elapsed > HEARTBEAT_TIMEOUT_TSC) {
-                SN_LOG("heartbeat::update_and_check: TIMEOUT EXCEEDED - BUGCHECK 0xDEAD5E05");
-                if (_KeBugCheckEx) {
-                    _KeBugCheckEx(
-                        0xDEAD5E05,
-                        (ULONG_PTR)g_last_whoswho_tsc,
-                        (ULONG_PTR)now_check,
-                        (ULONG_PTR)HEARTBEAT_TIMEOUT_TSC,
-                        (ULONG_PTR)elapsed
-                    );
-                }
-                return false;
+                SN_LOG("heartbeat::update_and_check: TIMEOUT EXCEEDED - quorum fail STALE");
+                return register_quorum_failure(
+                    QUORUM_FAIL_STALE,
+                    static_cast<ULONG_PTR>(g_last_whoswho_tsc),
+                    static_cast<ULONG_PTR>(now_check),
+                    static_cast<ULONG_PTR>(elapsed));
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             SN_LOG("heartbeat::update_and_check: EXCEPTION");
@@ -364,11 +411,12 @@ namespace heartbeat {
                     fails, response, expected);
 
                 if (fails >= CHALLENGE_FAILURE_THRESHOLD) {
-                    SN_LOG("heartbeat::verify_challenge: BUGCHECK - challenge auth failed %ld times", fails);
-                    if (_KeBugCheckEx) {
-                        _KeBugCheckEx(0xDEAD5E06, challenge, response, expected, static_cast<ULONG_PTR>(fails));
-                    }
-                    return false;
+                    SN_LOG("heartbeat::verify_challenge: quorum fail CHALLENGE failures=%ld", fails);
+                    return register_quorum_failure(
+                        QUORUM_FAIL_CHALL,
+                        static_cast<ULONG_PTR>(challenge),
+                        static_cast<ULONG_PTR>(response),
+                        static_cast<ULONG_PTR>(fails));
                 }
 
                 InterlockedExchange64(
@@ -383,9 +431,6 @@ namespace heartbeat {
     }
 
     __forceinline bool verify_module_presence() {
-        extern volatile PVOID g_target_driver_base;
-        extern PDRIVER_OBJECT g_sentinel_driver_object;
-
         if (!g_target_driver_base || !g_sentinel_driver_object)
             return true;
 
@@ -420,6 +465,21 @@ namespace heartbeat {
 
         SN_LOG("heartbeat::verify_module_presence: target module %p NOT FOUND in module list",
             (PVOID)g_target_driver_base);
+
+        if (g_target_driver_base && g_target_driver_size) {
+            if (locate_bridge((PVOID)g_target_driver_base, g_target_driver_size)) {
+                SN_LOG("heartbeat::verify_module_presence: bridge re-discovered in target module");
+                return true;
+            }
+        }
+
+        if (!register_quorum_failure(
+            QUORUM_FAIL_MODULE,
+            reinterpret_cast<ULONG_PTR>(g_target_driver_base),
+            static_cast<ULONG_PTR>(g_target_driver_size),
+            0)) {
+            return false;
+        }
         return false;
     }
 }
