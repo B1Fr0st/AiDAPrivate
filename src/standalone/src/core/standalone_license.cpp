@@ -142,12 +142,14 @@ namespace
     using arc_validate_tool_fn  = uint64_t(*)(uint64_t, uint64_t);
     using arc_heartbeat_fn      = arc_heartbeat_result_t(*)();
     using arc_cleanup_fn        = void(*)();
+    using arc_set_key_seed_fn   = void(*)(const uint8_t*, uint32_t);
 
     arc_init_fn           s_fn_arc_init            = nullptr;
     arc_get_comm_bridge_fn s_fn_arc_get_comm_bridge = nullptr;
     arc_validate_tool_fn  s_fn_arc_validate_tool   = nullptr;
     arc_heartbeat_fn      s_fn_arc_heartbeat       = nullptr;
     arc_cleanup_fn        s_fn_arc_cleanup          = nullptr;
+    arc_set_key_seed_fn   s_fn_arc_set_key_seed    = nullptr;
 
 
     static const uint8_t S_STR_KEY = 0x5A;
@@ -651,7 +653,12 @@ namespace
         settings.license_issued_at = response.contains("issued_at")
             ? response["issued_at"].get<int64_t>() : (settings.license_issued_at > 0 ? settings.license_issued_at : static_cast<int64_t>(std::time(nullptr)));
         settings.license_ttl = response.value("ttl", static_cast<int64_t>(3600));
+        if (response.contains("key_seed") && response["key_seed"].is_string())
+            settings.license_key_seed = response["key_seed"].get<std::string>();
         settings.save();
+
+        if (!settings.license_key_seed.empty())
+            anti_tamper::server_pages::detail::stored_key_seed() = settings.license_key_seed;
 
 
         uint64_t nonce_seed = fnv1a_str(settings.license_server_nonce);
@@ -896,15 +903,19 @@ namespace
             }
 
 
-            auto session_key = derive_session_key(
-                settings.license_session_token,
-                hwid,
-                settings.license_issued_at,
-                get_arc_master_secret());
+            auto session_key = hex_decode(settings.license_key_seed);
 
             if (session_key.empty() || session_key.size() != 32) {
-                OutputDebugStringA("ARC: Key derivation failed.\n");
-                return false;
+                auto fallback_key = derive_session_key(
+                    settings.license_session_token,
+                    hwid,
+                    settings.license_issued_at,
+                    get_arc_master_secret());
+                if (fallback_key.empty() || fallback_key.size() != 32) {
+                    OutputDebugStringA("ARC: Key derivation failed.\n");
+                    return false;
+                }
+                session_key = std::move(fallback_key);
             }
 
 
@@ -936,6 +947,8 @@ namespace
                 arc_loader::get_export(s_arc_module, "arc_heartbeat"));
             s_fn_arc_cleanup = reinterpret_cast<arc_cleanup_fn>(
                 arc_loader::get_export(s_arc_module, "arc_cleanup"));
+            s_fn_arc_set_key_seed = reinterpret_cast<arc_set_key_seed_fn>(
+                arc_loader::get_export(s_arc_module, "arc_set_key_seed"));
 
             if (!s_fn_arc_init || !s_fn_arc_get_comm_bridge ||
                 !s_fn_arc_validate_tool || !s_fn_arc_heartbeat || !s_fn_arc_cleanup) {
@@ -962,6 +975,14 @@ namespace
             }
 
             s_arc_loaded = true;
+
+            if (s_fn_arc_set_key_seed && !settings.license_key_seed.empty())
+            {
+                auto seed_bytes = hex_decode(settings.license_key_seed);
+                if (seed_bytes.size() == 32)
+                    s_fn_arc_set_key_seed(seed_bytes.data(), 32);
+            }
+
             OutputDebugStringA("ARC: Loaded and initialized successfully.\n");
             return true;
 
@@ -985,6 +1006,7 @@ namespace
         s_fn_arc_validate_tool = nullptr;
         s_fn_arc_heartbeat = nullptr;
         s_fn_arc_cleanup = nullptr;
+        s_fn_arc_set_key_seed = nullptr;
         s_arc_loaded = false;
     }
 
@@ -1055,6 +1077,10 @@ namespace
         s_cached_hwid = hwid;
         s_cached_session_token = settings.license_session_token;
         update_proof_hash(settings.license_session_token, hwid);
+
+        if (!settings.license_key_seed.empty())
+            anti_tamper::server_pages::detail::stored_key_seed() = settings.license_key_seed;
+
         uint64_t nonce_seed = fnv1a_str(settings.license_server_nonce);
         s_magic.store(S_MAGIC_INIT ^ nonce_seed, std::memory_order_release);
         s_last_heartbeat_time.store(

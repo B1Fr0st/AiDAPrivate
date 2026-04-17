@@ -2,22 +2,23 @@
 
 const crypto = require('crypto');
 
-
-function deriveSessionKey(sessionToken, hwid, issuedAt) {
+function deriveKeySeed(sessionToken, hwid, issuedAt) {
     const masterSecret = process.env.ARC_MASTER_SECRET;
     if (!masterSecret || masterSecret.length < 32) {
         throw new Error('ARC_MASTER_SECRET must be at least 32 characters');
     }
-
     const data = `${sessionToken}|${hwid}|${issuedAt}`;
     return crypto.createHmac('sha256', masterSecret)
         .update(data)
         .digest();
 }
 
+function deriveSessionKey(sessionToken, hwid, issuedAt) {
+    return deriveKeySeed(sessionToken, hwid, issuedAt);
+}
 
 function encryptArc(plaintext, sessionToken, hwid, issuedAt) {
-    const key = deriveSessionKey(sessionToken, hwid, issuedAt);
+    const key = deriveKeySeed(sessionToken, hwid, issuedAt);
     const iv = crypto.randomBytes(12);
 
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -27,24 +28,17 @@ function encryptArc(plaintext, sessionToken, hwid, issuedAt) {
     ]);
     const authTag = cipher.getAuthTag();
 
-
     const hash = crypto.createHash('sha256').update(plaintext).digest('hex');
 
     return { encrypted, iv, authTag, hash };
 }
 
-
 const CODE_PAGE_SIZE = 4096;
 
-function derivePageKey(sessionToken, hwid, issuedAt, pageIndex, proofToken) {
-    const masterSecret = process.env.ARC_MASTER_SECRET;
-    if (!masterSecret || masterSecret.length < 32) {
-        throw new Error('ARC_MASTER_SECRET must be at least 32 characters');
-    }
-
+function derivePageKey(keySeed, pageIndex, sessionToken, hwid, issuedAt, proofToken) {
     const proof = proofToken || '';
     const data = `page|${pageIndex}|${sessionToken}|${hwid}|${issuedAt}|${proof}`;
-    return crypto.createHmac('sha256', masterSecret)
+    return crypto.createHmac('sha256', keySeed)
         .update(data)
         .digest();
 }
@@ -54,7 +48,8 @@ function getPageCount(blobSize) {
 }
 
 function encryptPage(plaintext, pageIndex, sessionToken, hwid, issuedAt, proofToken) {
-    const key = derivePageKey(sessionToken, hwid, issuedAt, pageIndex, proofToken);
+    const keySeed = deriveKeySeed(sessionToken, hwid, issuedAt);
+    const key = derivePageKey(keySeed, pageIndex, sessionToken, hwid, issuedAt, proofToken);
     const iv = crypto.randomBytes(12);
 
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -81,6 +76,7 @@ function splitIntoPages(blob) {
 }
 
 module.exports = {
+    deriveKeySeed,
     deriveSessionKey,
     encryptArc,
     derivePageKey,

@@ -308,6 +308,7 @@ struct settings_sa_t
     std::string license_hwid;
     int64_t     license_issued_at = 0;
     int64_t     license_ttl = 3600;
+    std::string license_key_seed;
     std::string firebase_api_key;
 
     int         active_theme_idx = 0;
@@ -1144,6 +1145,7 @@ struct settings_sa_t
         str("license_hwid", license_hwid);
         i64("license_issued_at", license_issued_at);
         i64("license_ttl", license_ttl);
+        secret("license_key_seed", license_key_seed);
         secret("firebase_api_key", firebase_api_key);
 
         integer("active_theme_idx", active_theme_idx);
@@ -1368,6 +1370,7 @@ struct settings_sa_t
         root["license_hwid"] = license_hwid;
         root["license_issued_at"] = license_issued_at;
         root["license_ttl"] = license_ttl;
+        root["license_key_seed"] = sa_settings_detail::obfuscate_key(license_key_seed);
         root["firebase_api_key"] = sa_settings_detail::obfuscate_key(firebase_api_key);
 
         root["active_theme_idx"] = active_theme_idx;

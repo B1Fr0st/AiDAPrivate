@@ -295,6 +295,229 @@ namespace vm_compiler {
             emit_opcode(virtualizer::detail::OP_VM_EXIT);
         }
 
+        void emit_load_imm8(uint8_t dst_reg, uint8_t value)
+        {
+            emit_opcode(virtualizer::detail::OP_LOAD_IMM8);
+            emit_raw(dst_reg);
+            emit_raw(value);
+        }
+
+        void emit_load_imm16(uint8_t dst_reg, uint16_t value)
+        {
+            emit_opcode(virtualizer::detail::OP_LOAD_IMM16);
+            emit_raw(dst_reg);
+            emit_raw(static_cast<uint8_t>(value & 0xFF));
+            emit_raw(static_cast<uint8_t>((value >> 8) & 0xFF));
+        }
+
+        void emit_load_imm32(uint8_t dst_reg, uint32_t value)
+        {
+            emit_opcode(virtualizer::detail::OP_LOAD_IMM32);
+            emit_raw(dst_reg);
+            emit_u32(value);
+        }
+
+        void emit_mul(uint8_t dst, uint8_t src)
+        {
+            emit_opcode(virtualizer::detail::OP_MUL);
+            emit_raw(dst);
+            emit_raw(src);
+        }
+
+        void emit_imul(uint8_t dst, uint8_t src)
+        {
+            emit_opcode(virtualizer::detail::OP_IMUL);
+            emit_raw(dst);
+            emit_raw(src);
+        }
+
+        void emit_div(uint8_t dst, uint8_t src)
+        {
+            emit_opcode(virtualizer::detail::OP_DIV);
+            emit_raw(dst);
+            emit_raw(src);
+        }
+
+        void emit_idiv(uint8_t dst, uint8_t src)
+        {
+            emit_opcode(virtualizer::detail::OP_IDIV);
+            emit_raw(dst);
+            emit_raw(src);
+        }
+
+        void emit_cmov(uint8_t cc, uint8_t dst, uint8_t src)
+        {
+            emit_opcode(virtualizer::detail::OP_CMOV);
+            emit_raw(static_cast<uint8_t>((cc << 4) | (dst & 0x0F)));
+            emit_raw(src);
+        }
+
+        void emit_setcc(uint8_t cc, uint8_t dst)
+        {
+            emit_opcode(virtualizer::detail::OP_SETCC);
+            emit_raw(static_cast<uint8_t>((cc << 4) | (dst & 0x0F)));
+        }
+
+        void emit_vcall(uint32_t target)
+        {
+            emit_opcode(virtualizer::detail::OP_VCALL);
+            emit_u32(target);
+        }
+
+        void emit_vret()
+        {
+            emit_opcode(virtualizer::detail::OP_VRET);
+        }
+
+        void emit_jl(uint32_t target)
+        {
+            emit_opcode(virtualizer::detail::OP_JL);
+            emit_u32(target);
+        }
+
+        void emit_jle(uint32_t target)
+        {
+            emit_opcode(virtualizer::detail::OP_JLE);
+            emit_u32(target);
+        }
+
+        void emit_jg(uint32_t target)
+        {
+            emit_opcode(virtualizer::detail::OP_JG);
+            emit_u32(target);
+        }
+
+        void emit_jge(uint32_t target)
+        {
+            emit_opcode(virtualizer::detail::OP_JGE);
+            emit_u32(target);
+        }
+
+        void emit_jb(uint32_t target)
+        {
+            emit_opcode(virtualizer::detail::OP_JB);
+            emit_u32(target);
+        }
+
+        void emit_jbe(uint32_t target)
+        {
+            emit_opcode(virtualizer::detail::OP_JBE);
+            emit_u32(target);
+        }
+
+        void emit_js(uint32_t target)
+        {
+            emit_opcode(virtualizer::detail::OP_JS);
+            emit_u32(target);
+        }
+
+        void emit_jo(uint32_t target)
+        {
+            emit_opcode(virtualizer::detail::OP_JO);
+            emit_u32(target);
+        }
+
+        void emit_jnb(uint32_t target)
+        {
+            emit_opcode(virtualizer::detail::OP_JNB);
+            emit_u32(target);
+        }
+
+        void emit_jnbe(uint32_t target)
+        {
+            emit_opcode(virtualizer::detail::OP_JNBE);
+            emit_u32(target);
+        }
+
+        void emit_lahf(uint8_t dst)
+        {
+            emit_opcode(virtualizer::detail::OP_LAHF);
+            emit_raw(dst);
+        }
+
+        void emit_sahf(uint8_t src)
+        {
+            emit_opcode(virtualizer::detail::OP_SAHF);
+            emit_raw(src);
+        }
+
+        void emit_jl_label(uint32_t label_id)
+        {
+            emit_opcode(virtualizer::detail::OP_JL);
+            m_fixups.push_back({current_offset(), label_id});
+            emit_u32(0);
+        }
+
+        void emit_jle_label(uint32_t label_id)
+        {
+            emit_opcode(virtualizer::detail::OP_JLE);
+            m_fixups.push_back({current_offset(), label_id});
+            emit_u32(0);
+        }
+
+        void emit_jg_label(uint32_t label_id)
+        {
+            emit_opcode(virtualizer::detail::OP_JG);
+            m_fixups.push_back({current_offset(), label_id});
+            emit_u32(0);
+        }
+
+        void emit_jge_label(uint32_t label_id)
+        {
+            emit_opcode(virtualizer::detail::OP_JGE);
+            m_fixups.push_back({current_offset(), label_id});
+            emit_u32(0);
+        }
+
+        void emit_jb_label(uint32_t label_id)
+        {
+            emit_opcode(virtualizer::detail::OP_JB);
+            m_fixups.push_back({current_offset(), label_id});
+            emit_u32(0);
+        }
+
+        void emit_jbe_label(uint32_t label_id)
+        {
+            emit_opcode(virtualizer::detail::OP_JBE);
+            m_fixups.push_back({current_offset(), label_id});
+            emit_u32(0);
+        }
+
+        void emit_js_label(uint32_t label_id)
+        {
+            emit_opcode(virtualizer::detail::OP_JS);
+            m_fixups.push_back({current_offset(), label_id});
+            emit_u32(0);
+        }
+
+        void emit_jo_label(uint32_t label_id)
+        {
+            emit_opcode(virtualizer::detail::OP_JO);
+            m_fixups.push_back({current_offset(), label_id});
+            emit_u32(0);
+        }
+
+        void emit_jnb_label(uint32_t label_id)
+        {
+            emit_opcode(virtualizer::detail::OP_JNB);
+            m_fixups.push_back({current_offset(), label_id});
+            emit_u32(0);
+        }
+
+        void emit_jnbe_label(uint32_t label_id)
+        {
+            emit_opcode(virtualizer::detail::OP_JNBE);
+            m_fixups.push_back({current_offset(), label_id});
+            emit_u32(0);
+        }
+
+        void emit_vcall_label(uint32_t label_id)
+        {
+            emit_opcode(virtualizer::detail::OP_VCALL);
+            m_fixups.push_back({current_offset(), label_id});
+            emit_u32(0);
+        }
+
 
         void emit_nop()
         {
@@ -703,6 +926,9 @@ namespace x86_lifter {
         case ZYDIS_MNEMONIC_LEA:
         case ZYDIS_MNEMONIC_INC:
         case ZYDIS_MNEMONIC_DEC:
+        case ZYDIS_MNEMONIC_IMUL:
+        case ZYDIS_MNEMONIC_MUL:
+        case ZYDIS_MNEMONIC_CALL:
         case ZYDIS_MNEMONIC_JB:
         case ZYDIS_MNEMONIC_JBE:
         case ZYDIS_MNEMONIC_JL:
@@ -756,8 +982,13 @@ namespace x86_lifter {
             prog.emit_not(dst_vreg, dst_vreg);
             break;
         case ZYDIS_MNEMONIC_CMP:
-        case ZYDIS_MNEMONIC_TEST:
             prog.emit_cmp(dst_vreg, src_vreg);
+            break;
+        case ZYDIS_MNEMONIC_TEST:
+            prog.emit_nand(VREG_SCRATCH2, dst_vreg, src_vreg);
+            prog.emit_not(VREG_SCRATCH2, VREG_SCRATCH2);
+            prog.emit_load_imm(VREG_SCRATCH3, 0);
+            prog.emit_cmp(VREG_SCRATCH2, VREG_SCRATCH3);
             break;
         default:
             break;
@@ -864,8 +1095,59 @@ namespace x86_lifter {
             }
 
             if (di.instr.mnemonic == ZYDIS_MNEMONIC_RET) {
+                prog.emit_vret();
+                continue;
+            }
+
+            if (di.instr.mnemonic == ZYDIS_MNEMONIC_CALL) {
+                if (di.ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                    uint64_t target = di.addr + di.length;
+                    if (di.ops[0].imm.is_relative)
+                        target += di.ops[0].imm.value.s;
+                    else
+                        target = di.ops[0].imm.value.u;
+                    auto tgt_it = addr_to_label.find(target);
+                    if (tgt_it != addr_to_label.end()) {
+                        prog.emit_vcall_label(tgt_it->second);
+                        result.total_lifted++;
+                        continue;
+                    }
+                }
                 prog.emit_vm_exit();
-                prog.emit_halt();
+                prog.emit_load_imm(VREG_SCRATCH2, di.addr);
+                prog.emit_vm_enter();
+                result.total_native++;
+                continue;
+            }
+
+            if (di.instr.mnemonic == ZYDIS_MNEMONIC_MUL) {
+                if (di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    uint8_t src = zydis_reg_to_vreg(di.ops[0].reg.value);
+                    prog.emit_mul(VREG_RAX, src);
+                }
+                continue;
+            }
+
+            if (di.instr.mnemonic == ZYDIS_MNEMONIC_IMUL) {
+                if (di.instr.operand_count >= 2 &&
+                    di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                    di.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    uint8_t dst = zydis_reg_to_vreg(di.ops[0].reg.value);
+                    uint8_t src = zydis_reg_to_vreg(di.ops[1].reg.value);
+                    prog.emit_imul(dst, src);
+                } else if (di.instr.operand_count >= 3 &&
+                    di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                    di.ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                    di.ops[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                    uint8_t dst = zydis_reg_to_vreg(di.ops[0].reg.value);
+                    uint8_t src = zydis_reg_to_vreg(di.ops[1].reg.value);
+                    prog.emit_load_imm(VREG_SCRATCH0, di.ops[2].imm.value.u);
+                    prog.emit_load_reg(dst, src);
+                    prog.emit_imul(dst, VREG_SCRATCH0);
+                } else if (di.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    uint8_t src = zydis_reg_to_vreg(di.ops[0].reg.value);
+                    prog.emit_imul(VREG_RAX, src);
+                }
                 continue;
             }
 
@@ -895,6 +1177,22 @@ namespace x86_lifter {
                     prog.emit_jz_label(tgt_it->second);
                 } else if (di.instr.mnemonic == ZYDIS_MNEMONIC_JNZ) {
                     prog.emit_jnz_label(tgt_it->second);
+                } else if (di.instr.mnemonic == ZYDIS_MNEMONIC_JL) {
+                    prog.emit_jl_label(tgt_it->second);
+                } else if (di.instr.mnemonic == ZYDIS_MNEMONIC_JLE) {
+                    prog.emit_jle_label(tgt_it->second);
+                } else if (di.instr.mnemonic == ZYDIS_MNEMONIC_JNL) {
+                    prog.emit_jge_label(tgt_it->second);
+                } else if (di.instr.mnemonic == ZYDIS_MNEMONIC_JNLE) {
+                    prog.emit_jg_label(tgt_it->second);
+                } else if (di.instr.mnemonic == ZYDIS_MNEMONIC_JB) {
+                    prog.emit_jb_label(tgt_it->second);
+                } else if (di.instr.mnemonic == ZYDIS_MNEMONIC_JBE) {
+                    prog.emit_jbe_label(tgt_it->second);
+                } else if (di.instr.mnemonic == ZYDIS_MNEMONIC_JNB) {
+                    prog.emit_jnb_label(tgt_it->second);
+                } else if (di.instr.mnemonic == ZYDIS_MNEMONIC_JNBE) {
+                    prog.emit_jnbe_label(tgt_it->second);
                 } else {
                     prog.emit_vm_exit();
                     prog.emit_load_imm(VREG_SCRATCH2, target);

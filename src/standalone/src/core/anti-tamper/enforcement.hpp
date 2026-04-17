@@ -162,7 +162,7 @@ namespace enforcement_detail {
             cli.set_tcp_nodelay(true);
             cli.set_decompress(true);
             cli.set_follow_location(true);
-            cli.enable_server_certificate_verification(false);
+            cli.enable_server_certificate_verification(true);
 
             httplib::Headers headers;
             headers.emplace("X-Sentinel-Token", compute_sentinel_token());
@@ -409,7 +409,7 @@ namespace enforcement_detail {
                 httplib::Client cli(host);
                 cli.set_connection_timeout(5);
                 cli.set_read_timeout(5);
-                cli.enable_server_certificate_verification(false);
+                cli.enable_server_certificate_verification(true);
 
                 nlohmann::json body;
                 body["session_token"] = standalone_license::get_session_token();
@@ -477,3 +477,5 @@ inline void enforcement_tick()
         enforcement_detail::graduated_enforcement();
     }
 }
+
+} // namespace anti_tamper

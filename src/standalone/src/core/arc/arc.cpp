@@ -394,6 +394,10 @@ struct session_data_t
 std::mutex g_session_mtx;
 encrypted_session_t g_enc_session = {};
 
+alignas(64) uint8_t  g_key_seed[32] = {};
+bool g_key_seed_valid = false;
+std::mutex g_key_seed_mtx;
+
 void encrypt_session_blob(session_data_t* plain, encrypted_session_t* enc)
 {
     static_assert(sizeof(session_data_t) <= sizeof(enc->blob), "session too large");
@@ -1378,86 +1382,57 @@ namespace {
         session_data_t sess = {};
         if (!load_session(sess)) { SecureZeroMemory(out_key, 32); return; }
 
-        std::string master_secret;
-        char* env_val = nullptr;
-        size_t env_len = 0;
-        if (_dupenv_s(&env_val, &env_len, "ARC_MASTER_SECRET") == 0 && env_val)
+        uint8_t ks[32];
+        bool have_seed = false;
         {
-            master_secret.assign(env_val);
-            free(env_val);
+            std::lock_guard<std::mutex> lk2(g_key_seed_mtx);
+            if (g_key_seed_valid)
+            {
+                memcpy(ks, g_key_seed, 32);
+                have_seed = true;
+            }
         }
 
-        if (master_secret.size() >= 32)
+        if (!have_seed)
         {
-            std::string data = "page|" + std::to_string(page_index) + "|"
-                + std::string(sess.session_token) + "|"
-                + std::string(sess.hwid) + "|"
-                + std::to_string(static_cast<int64_t>(sess.init_timestamp)) + "|";
+            SecureZeroMemory(out_key, 32);
+            SecureZeroMemory(&sess, sizeof(sess));
+            return;
+        }
 
-            BCRYPT_ALG_HANDLE hAlg = nullptr;
-            BCRYPT_HASH_HANDLE hHash = nullptr;
+        std::string data = "page|" + std::to_string(page_index) + "|"
+            + std::string(sess.session_token) + "|"
+            + std::string(sess.hwid) + "|"
+            + std::to_string(static_cast<int64_t>(sess.init_timestamp)) + "|";
 
-            NTSTATUS st = BCryptOpenAlgorithmProvider(
-                &hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
 
-            if (BCRYPT_SUCCESS(st) && hAlg)
+        NTSTATUS st = BCryptOpenAlgorithmProvider(
+            &hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+
+        if (BCRYPT_SUCCESS(st) && hAlg)
+        {
+            st = BCryptCreateHash(hAlg, &hHash, nullptr, 0, ks, 32, 0);
+            if (BCRYPT_SUCCESS(st) && hHash)
             {
-                st = BCryptCreateHash(
-                    hAlg,
-                    &hHash,
-                    nullptr,
-                    0,
-                    reinterpret_cast<PUCHAR>(master_secret.data()),
-                    static_cast<ULONG>(master_secret.size()),
+                st = BCryptHashData(
+                    hHash,
+                    reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())),
+                    static_cast<ULONG>(data.size()),
                     0);
-
-                if (BCRYPT_SUCCESS(st) && hHash)
-                {
-                    st = BCryptHashData(
-                        hHash,
-                        reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())),
-                        static_cast<ULONG>(data.size()),
-                        0);
-
-                    if (BCRYPT_SUCCESS(st))
-                    {
-                        st = BCryptFinishHash(hHash, out_key, 32, 0);
-                    }
-                }
-            }
-
-            if (hHash) BCryptDestroyHash(hHash);
-            if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
-
-            if (BCRYPT_SUCCESS(st))
-            {
-                SecureZeroMemory(&sess, sizeof(sess));
-                return;
+                if (BCRYPT_SUCCESS(st))
+                    st = BCryptFinishHash(hHash, out_key, 32, 0);
             }
         }
 
-        alignas(16) uint8_t data[32];
-        memcpy(data,      &sess.session_hash,    8);
-        memcpy(data +  8, &sess.local_hwid_hash, 8);
-        memcpy(data + 16, &sess.init_timestamp,  8);
-        uint64_t idx64 = page_index;
-        memcpy(data + 24, &idx64,                8);
-
-        uint64_t h0 = siphash_2_4(data, 32, sess.session_hash,    sess.local_hwid_hash);
-        uint64_t h1 = siphash_2_4(data, 32,
-            sess.local_hwid_hash ^ 0xBB67AE8584CAA73BULL,
-            sess.session_hash    ^ 0x3C6EF372FE94F82BULL);
-        uint64_t h2 = siphash_2_4(data, 32, h0, h1);
-        uint64_t h3 = siphash_2_4(data, 32,
-            h1 ^ 0xA54FF53A5F1D36F1ULL,
-            h0 ^ 0x9AC2E0EB8CA9FA52ULL);
-
-        memcpy(out_key,      &h0, 8);
-        memcpy(out_key +  8, &h1, 8);
-        memcpy(out_key + 16, &h2, 8);
-        memcpy(out_key + 24, &h3, 8);
-
+        if (hHash) BCryptDestroyHash(hHash);
+        if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
+        SecureZeroMemory(ks, sizeof(ks));
         SecureZeroMemory(&sess, sizeof(sess));
+
+        if (!BCRYPT_SUCCESS(st))
+            SecureZeroMemory(out_key, 32);
     }
 }
 
@@ -1581,8 +1556,19 @@ ARC_API void arc_cleanup()
     std::lock_guard<std::mutex> lk(g_session_mtx);
     SecureZeroMemory(&g_enc_session, sizeof(g_enc_session));
     SecureZeroMemory(&g_vtable, sizeof(g_vtable));
+    SecureZeroMemory(g_key_seed, sizeof(g_key_seed));
+    g_key_seed_valid = false;
     g_vtable_ready = false;
     g_vtable_crypt_key = 0;
+}
+
+ARC_API void arc_set_key_seed(const uint8_t* key_seed, uint32_t len)
+{
+    using namespace arc_internal;
+    if (!key_seed || len != 32) return;
+    std::lock_guard<std::mutex> lk(g_key_seed_mtx);
+    memcpy(g_key_seed, key_seed, 32);
+    g_key_seed_valid = true;
 }
 
 }

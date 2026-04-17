@@ -4,6 +4,7 @@ const express = require('express');
 const crypto = require('crypto');
 const pool = require('../db/pool');
 const { signPayload } = require('../crypto/signing');
+const { deriveKeySeed } = require('../crypto/arc-encrypt');
 
 const router = express.Router();
 
@@ -348,6 +349,8 @@ async function handleValidate(body, clientIp) {
     });
 
 
+    const keySeed = deriveKeySeed(sessionToken, hwid, issuedAt);
+
     const sigPayload = {
         status: 'valid',
         license_key,
@@ -358,6 +361,7 @@ async function handleValidate(body, clientIp) {
         issued_at: issuedAt,
         server_nonce: serverNonce,
         client_nonce,
+        key_seed: keySeed.toString('hex'),
     };
     const signature = signPayload(sigPayload);
 

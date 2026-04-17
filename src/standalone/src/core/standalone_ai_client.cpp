@@ -202,7 +202,7 @@ std::shared_ptr<httplib::Client> standalone_ai_client_t::get_or_create_client(
         _http->set_keep_alive(true);
         _http->set_decompress(true);
         _http->set_follow_location(true);
-        _http->enable_server_certificate_verification(false);
+        _http->enable_server_certificate_verification(true);
     }
     return _http;
 }

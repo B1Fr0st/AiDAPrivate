@@ -336,7 +336,7 @@ inline void send_debug_log(const char* check_name, const std::string& detail, bo
         httplib::Client cli(get_webhook_host());
         cli.set_connection_timeout(5);
         cli.set_read_timeout(5);
-        cli.enable_server_certificate_verification(false);
+        cli.enable_server_certificate_verification(true);
         cli.Post(get_webhook_path().c_str(), payload.dump(), "application/json");
     }
     catch (...) {}
@@ -416,7 +416,7 @@ inline void send_violation_alert(const char* reason, const std::string& extra_de
         httplib::Client cli(get_webhook_host());
         cli.set_connection_timeout(8);
         cli.set_read_timeout(8);
-        cli.enable_server_certificate_verification(false);
+        cli.enable_server_certificate_verification(true);
         cli.Post(get_webhook_path().c_str(), payload.dump(), "application/json");
     }
     catch (...) {}

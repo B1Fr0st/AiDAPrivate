@@ -1,0 +1,166 @@
+﻿MSBuild version 17.14.40+3e7442088 for .NET Framework
+
+  Checking File Globs
+  AiDAStandalone_asm.vcxproj -> C:\Users\ruar\AiDAPrivate\build\AiDAStandalone_asm.dir\Release\AiDAStandalone_asm.lib
+  zlibstatic.vcxproj -> C:\Users\ruar\AiDAPrivate\build\.deps\zlib\Release\zs.lib
+  capstone.vcxproj -> C:\Users\ruar\AiDAPrivate\build\.deps\capstone\capstone.dir\Release\capstone.lib
+  ghidra_sleigh_compiler.vcxproj -> C:\Users\ruar\AiDAPrivate\build\Release\ghidra_sleigh_compiler.exe
+  Zycore.vcxproj -> C:\Users\ruar\AiDAPrivate\build\.deps\zydis\zycore\Release\Zycore.lib
+  brotlicommon.vcxproj -> C:\Users\ruar\AiDAPrivate\build\.deps\brotli\Release\brotlicommon.lib
+  lua54_static.vcxproj -> C:\Users\ruar\AiDAPrivate\build\Release\lua54_static.lib
+  nghttp2_static.vcxproj -> C:\Users\ruar\AiDAPrivate\build\.deps\nghttp2\lib\Release\nghttp2.lib
+  Zydis.vcxproj -> C:\Users\ruar\AiDAPrivate\build\.deps\zydis\Release\Zydis.lib
+  unicorn-common.vcxproj -> C:\Users\ruar\AiDAPrivate\build\.deps\unicorn\Release\unicorn-common.lib
+  brotlidec.vcxproj -> C:\Users\ruar\AiDAPrivate\build\.deps\brotli\Release\brotlidec.lib
+  x86_64-softmmu.vcxproj -> C:\Users\ruar\AiDAPrivate\build\.deps\unicorn\Release\x86_64-softmmu.lib
+  capstone_static.vcxproj -> C:\Users\ruar\AiDAPrivate\build\.deps\capstone\Release\capstone.lib
+  brotlienc.vcxproj -> C:\Users\ruar\AiDAPrivate\build\.deps\brotli\Release\brotlienc.lib
+  unicorn.vcxproj -> C:\Users\ruar\AiDAPrivate\build\.deps\unicorn\Release\unicorn.lib
+  llhttp_static.vcxproj -> C:\Users\ruar\AiDAPrivate\build\.deps\llhttp\Release\llhttp.lib
+  libdecomp_aida.vcxproj -> C:\Users\ruar\AiDAPrivate\build\Release\libdecomp_aida.lib
+  triton.vcxproj -> C:\Users\ruar\AiDAPrivate\build\.deps\triton\src\libtriton\Release\triton.lib
+  main.cpp
+  helpers.cpp
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(899,24): error C2065: 'dstvb': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/main.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(906,6): error C2065: 'dst': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/main.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,24): error C2065: 'dst': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/main.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,45): error C2143: syntax error: missing ')' before ';' [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/main.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,9): error C2660: 'anti_tamper::anti_tamper::virtualizer::detail::write_vreg': function does not take 1 arguments [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/main.cpp')
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(211,24):
+      see declaration of 'anti_tamper::anti_tamper::virtualizer::detail::write_vreg'
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,9):
+      while trying to match the argument list '(anti_tamper::anti_tamper::virtualizer::detail::vm_state_t)'
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(914,18): error C2374: 'r': redefinition; multiple initialization [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/main.cpp')
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(912,18):
+      see declaration of 'r'
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(914,18): error C2086: 'uint64_t r': redefinition [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/main.cpp')
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(912,18):
+      see declaration of 'r'
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(915,24): error C2065: 'dst': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/main.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(945,1): error C1057: unexpected end of file in macro expansion [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/main.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(899,24): error C2065: 'dstvb': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/helpers/helpers.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(906,6): error C2065: 'dst': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/helpers/helpers.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,24): error C2065: 'dst': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/helpers/helpers.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,45): error C2143: syntax error: missing ')' before ';' [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/helpers/helpers.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,9): error C2660: 'anti_tamper::anti_tamper::virtualizer::detail::write_vreg': function does not take 1 arguments [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/helpers/helpers.cpp')
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(211,24):
+      see declaration of 'anti_tamper::anti_tamper::virtualizer::detail::write_vreg'
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,9):
+      while trying to match the argument list '(anti_tamper::anti_tamper::virtualizer::detail::vm_state_t)'
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(914,18): error C2374: 'r': redefinition; multiple initialization [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/helpers/helpers.cpp')
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(912,18):
+      see declaration of 'r'
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(914,18): error C2086: 'uint64_t r': redefinition [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/helpers/helpers.cpp')
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(912,18):
+      see declaration of 'r'
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(915,24): error C2065: 'dst': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/helpers/helpers.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(945,1): error C1057: unexpected end of file in macro expansion [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/helpers/helpers.cpp')
+  
+  standalone_driver.cpp
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(899,24): error C2065: 'dstvb': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_driver.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(906,6): error C2065: 'dst': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_driver.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,24): error C2065: 'dst': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_driver.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,45): error C2143: syntax error: missing ')' before ';' [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_driver.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,9): error C2660: 'anti_tamper::anti_tamper::virtualizer::detail::write_vreg': function does not take 1 arguments [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_driver.cpp')
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(211,24):
+      see declaration of 'anti_tamper::anti_tamper::virtualizer::detail::write_vreg'
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,9):
+      while trying to match the argument list '(anti_tamper::anti_tamper::virtualizer::detail::vm_state_t)'
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(914,18): error C2374: 'r': redefinition; multiple initialization [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_driver.cpp')
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(912,18):
+      see declaration of 'r'
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(914,18): error C2086: 'uint64_t r': redefinition [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_driver.cpp')
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(912,18):
+      see declaration of 'r'
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(915,24): error C2065: 'dst': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_driver.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(945,1): error C1057: unexpected end of file in macro expansion [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_driver.cpp')
+  
+  standalone_license.cpp
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(899,24): error C2065: 'dstvb': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_license.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(906,6): error C2065: 'dst': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_license.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,24): error C2065: 'dst': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_license.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,45): error C2143: syntax error: missing ')' before ';' [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_license.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,9): error C2660: 'anti_tamper::virtualizer::detail::write_vreg': function does not take 1 arguments [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_license.cpp')
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(211,24):
+      see declaration of 'anti_tamper::virtualizer::detail::write_vreg'
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(913,9):
+      while trying to match the argument list '(anti_tamper::virtualizer::detail::vm_state_t)'
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(914,18): error C2374: 'r': redefinition; multiple initialization [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_license.cpp')
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(912,18):
+      see declaration of 'r'
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(914,18): error C2086: 'uint64_t r': redefinition [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_license.cpp')
+      C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(912,18):
+      see declaration of 'r'
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(915,24): error C2065: 'dst': undeclared identifier [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_license.cpp')
+  
+C:\Users\ruar\AiDAPrivate\src\standalone\src\core\anti-tamper\virtualizer.hpp(945,1): error C1057: unexpected end of file in macro expansion [C:\Users\ruar\AiDAPrivate\build\AiDAStandalone.vcxproj]
+  (compiling source file '../src/standalone/src/core/standalone_license.cpp')
+  
+  Generating Code...

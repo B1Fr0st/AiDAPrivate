@@ -139,7 +139,7 @@ namespace arc_page_manager {
         client->set_tcp_nodelay(true);
         client->set_decompress(true);
         client->set_follow_location(true);
-        client->enable_server_certificate_verification(false);
+        client->enable_server_certificate_verification(true);
 
         while (!s.stop.load(std::memory_order_acquire))
         {
@@ -194,7 +194,7 @@ namespace arc_page_manager {
         client->set_tcp_nodelay(true);
         client->set_decompress(true);
         client->set_follow_location(true);
-        client->enable_server_certificate_verification(false);
+        client->enable_server_certificate_verification(true);
 
         check_rotation(client);
 

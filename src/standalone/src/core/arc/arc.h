@@ -118,6 +118,7 @@ extern "C"
         uint32_t     interface_version
     );
 
+    ARC_API void arc_set_key_seed(const uint8_t* key_seed, uint32_t len);
 
     ARC_API const arc_comm_vtable_t* arc_get_comm_bridge();
 

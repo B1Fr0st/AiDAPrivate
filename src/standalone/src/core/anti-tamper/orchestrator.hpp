@@ -340,7 +340,7 @@ inline bool guard()
 
         if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
         {
-            driver_bridge::anti_debug_result adbg_result{};
+            driver_bridge::anti_debug_result_t adbg_result{};
             if (driver_bridge::kernel_anti_debug_query(adbg_result) &&
                 adbg_result.result_flags != 0)
             {

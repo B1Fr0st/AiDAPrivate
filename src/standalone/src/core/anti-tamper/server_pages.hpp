@@ -76,6 +76,18 @@ namespace detail {
         return u;
     }
 
+    inline std::string& stored_key_seed()
+    {
+        static std::string ks;
+        return ks;
+    }
+
+    inline std::string& stored_proof_token()
+    {
+        static std::string pt;
+        return pt;
+    }
+
     inline uint32_t& total_pages()
     {
         static uint32_t t = 0;
@@ -235,21 +247,18 @@ namespace detail {
                                 const std::string& session_token,
                                 const std::string& hwid,
                                 int64_t issued_at,
+                                const std::string& proof_token,
                                 uint8_t* out_key_32)
     {
-        std::string master_secret;
-        char* env_val = nullptr;
-        size_t len = 0;
-        if (_dupenv_s(&env_val, &len, "ARC_MASTER_SECRET") == 0 && env_val)
-        {
-            master_secret = env_val;
-            free(env_val);
-        }
-        if (master_secret.size() < 32) return false;
+        auto& ks = stored_key_seed();
+        if (ks.size() != 64) return false;
+
+        uint8_t key_seed_bytes[32];
+        if (!hex_decode(ks, key_seed_bytes, 32)) return false;
 
         std::string data = "page|" + std::to_string(page_index) + "|"
                          + session_token + "|" + hwid + "|"
-                         + std::to_string(issued_at);
+                         + std::to_string(issued_at) + "|" + proof_token;
 
         BCRYPT_ALG_HANDLE hAlg = nullptr;
         BCRYPT_HASH_HANDLE hHash = nullptr;
@@ -259,8 +268,7 @@ namespace detail {
         if (!BCRYPT_SUCCESS(st) || !hAlg) return false;
 
         st = BCryptCreateHash(hAlg, &hHash, nullptr, 0,
-            reinterpret_cast<PUCHAR>(master_secret.data()),
-            static_cast<ULONG>(master_secret.size()), 0);
+            key_seed_bytes, 32, 0);
         if (!BCRYPT_SUCCESS(st) || !hHash)
         {
             BCryptCloseAlgorithmProvider(hAlg, 0);
@@ -282,6 +290,7 @@ namespace detail {
 
         BCryptDestroyHash(hHash);
         BCryptCloseAlgorithmProvider(hAlg, 0);
+        SecureZeroMemory(key_seed_bytes, 32);
         return ok;
     }
 
@@ -300,12 +309,13 @@ namespace detail {
         cli.set_tcp_nodelay(true);
         cli.set_decompress(true);
         cli.set_follow_location(true);
-        cli.enable_server_certificate_verification(false);
+        cli.enable_server_certificate_verification(true);
 
         nlohmann::json body;
         body["license_key"] = license_key;
         body["session_token"] = session_token;
         body["hwid"] = hwid;
+        body["proof_token"] = stored_proof_token();
 
         std::string path = "/api/download/arc/page/" + std::to_string(page_index);
         auto res = cli.Post(path, body.dump(), "application/json");
@@ -330,7 +340,8 @@ namespace detail {
         if (!hex_decode(tag_hex, auth_tag, 16)) return false;
 
         uint8_t page_key[32];
-        if (!derive_page_key(page_index, session_token, hwid, issued_at, page_key))
+        if (!derive_page_key(page_index, session_token, hwid, issued_at,
+                             stored_proof_token(), page_key))
             return false;
 
         out_plaintext.resize(ciphertext.size());
@@ -363,7 +374,7 @@ inline bool query_page_count(const std::string& license_key,
     cli.set_tcp_nodelay(true);
     cli.set_decompress(true);
     cli.set_follow_location(true);
-    cli.enable_server_certificate_verification(false);
+    cli.enable_server_certificate_verification(true);
 
     nlohmann::json body;
     body["license_key"] = license_key;
