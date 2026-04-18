@@ -8,6 +8,7 @@
 #include <function/AntiDebug.h>
 #include <function/SentinelBridge.h>
 #include <function/impl/AntiDumpKernel.h>
+#include <function/DmaCanary.h>
 
 __forceinline ULONG hash_build_key(ULONG key) {
     key ^= key >> 16;
@@ -98,6 +99,63 @@ namespace ioctl_codes {
 
     __forceinline ULONG ADMP() { return make(45); }
     __forceinline ULONG SRV2() { return make(46); }
+    __forceinline ULONG RECU() { return make(47); }
+    __forceinline ULONG TIRA() { return make(48); }
+    __forceinline ULONG CANR() { return make(49); }
+    __forceinline ULONG CANQ() { return make(50); }
+    __forceinline ULONG DBGA() { return make(51); }
+}
+
+namespace phase3_msg {
+
+    struct re_evidence_blob_k {
+        UINT64 magic;
+        UINT32 version;
+        UINT32 signal_family;
+        UINT32 signal_id;
+        UINT32 score;
+        UINT32 pid;
+        UINT32 reserved0;
+        UINT64 caller_image_hash;
+        UINT64 signals_bitmap_hash;
+        UINT64 timestamp;
+    };
+    static_assert(sizeof(re_evidence_blob_k) == 56, "re_evidence_blob_k must be 56 bytes");
+
+    struct re_confirmed_usermode_request_k {
+        UINT32 magic;
+        UINT32 session_key;
+        re_evidence_blob_k evidence;
+    };
+    static_assert(sizeof(re_confirmed_usermode_request_k) == 64, "re_confirmed_usermode_request_k must be 64 bytes");
+
+    struct tier_a_query_request_k {
+        UINT32 magic;
+        UINT32 session_key;
+        UINT32 present_flag;
+        UINT32 tier_mask;
+        UINT64 first_driver_base;
+    };
+    static_assert(sizeof(tier_a_query_request_k) == 24, "tier_a_query_request_k must be 24 bytes");
+
+    struct canary_register_request_k {
+        UINT32 magic;
+        UINT32 session_key;
+        UINT64 va;
+        UINT64 size;
+        UINT32 pid;
+        UINT32 result;
+    };
+    static_assert(sizeof(canary_register_request_k) == 32, "canary_register_request_k must be 32 bytes");
+
+    struct debug_attach_request_k {
+        UINT32 magic;
+        UINT32 session_key;
+        UINT32 pid;
+        UINT32 result_flags;
+        UINT64 reserved;
+    };
+    static_assert(sizeof(debug_attach_request_k) == 24, "debug_attach_request_k must be 24 bytes");
 }
 
 namespace dispatcher {
@@ -923,6 +981,147 @@ namespace dispatcher {
                 bytes = sizeof(server_token_relay_v2);
             }
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::DBGA()) {
+            if (input_size >= sizeof(phase3_msg::debug_attach_request_k) &&
+                output_size >= sizeof(phase3_msg::debug_attach_request_k)) {
+                auto* req = reinterpret_cast<phase3_msg::debug_attach_request_k*>(buffer);
+                if (req->session_key != g_session_key) {
+                    status = STATUS_ACCESS_DENIED;
+                } else {
+                    ULONG pid = req->pid;
+                    if (pid == 0)
+                        pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(
+                            caller_validation::g_registered_client_pid));
+
+                    UINT32 flags = 0;
+                    BOOLEAN kd_now = anti_debug::kd_transitioned_to_enabled();
+                    if (kd_now) flags |= 0x1;
+
+                    PEPROCESS proc = nullptr;
+                    if (pid != 0 &&
+                        NT_SUCCESS(PsLookupProcessByProcessId(
+                            reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid)), &proc)) &&
+                        proc) {
+                        PVOID debug_port = nullptr;
+                        __try {
+                            debug_port = *reinterpret_cast<PVOID*>(
+                                reinterpret_cast<UCHAR*>(proc) + 0x578);
+                        } __except (EXCEPTION_EXECUTE_HANDLER) { debug_port = nullptr; }
+                        if (debug_port) flags |= 0x2;
+                        ObDereferenceObject(proc);
+                    }
+
+                    if (flags != 0) {
+                        sentinel_bridge::populate_evidence_blob(
+                            0x20u, sentinel_bridge::RE_REASON_DEBUG_ATTACH,
+                            100, pid, 0, 0, flags);
+                        ULONG cmd = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
+                        ULONG par = pid;
+                        sentinel_bridge::bridge_encrypt_cmd(cmd, par);
+                        _InterlockedExchange(
+                            reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd),
+                            static_cast<LONG>(cmd));
+                        _InterlockedExchange(
+                            reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd_param),
+                            static_cast<LONG>(par));
+                        if (_KeBugCheckEx) {
+                            _KeBugCheckEx(
+                                sentinel_bridge::BUGCHECK_RE_USERMODE_CONFIRMED,
+                                sentinel_bridge::RE_REASON_DEBUG_ATTACH,
+                                sentinel_bridge::g_evidence_blob_offset,
+                                static_cast<ULONG_PTR>(pid),
+                                static_cast<ULONG_PTR>(flags));
+                        }
+                    }
+                    req->result_flags = flags;
+                    status = STATUS_SUCCESS;
+                }
+                bytes = sizeof(phase3_msg::debug_attach_request_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::CANR()) {
+            if (input_size >= sizeof(phase3_msg::canary_register_request_k) &&
+                output_size >= sizeof(phase3_msg::canary_register_request_k)) {
+                auto* req = reinterpret_cast<phase3_msg::canary_register_request_k*>(buffer);
+                if (req->session_key != g_session_key) {
+                    status = STATUS_ACCESS_DENIED;
+                } else {
+                    ULONG pid = req->pid;
+                    if (pid == 0)
+                        pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(
+                            caller_validation::g_registered_client_pid));
+                    req->result = anti_dma_canary::register_canary(req->va, req->size, pid) ? 1u : 0u;
+                    status = STATUS_SUCCESS;
+                }
+                bytes = sizeof(phase3_msg::canary_register_request_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::CANQ()) {
+            if (input_size >= sizeof(phase3_msg::canary_register_request_k) &&
+                output_size >= sizeof(phase3_msg::canary_register_request_k)) {
+                auto* req = reinterpret_cast<phase3_msg::canary_register_request_k*>(buffer);
+                if (req->session_key != g_session_key) {
+                    status = STATUS_ACCESS_DENIED;
+                } else {
+                    req->result = anti_dma_canary::g_canary_count;
+                    status = STATUS_SUCCESS;
+                }
+                bytes = sizeof(phase3_msg::canary_register_request_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::TIRA()) {
+            if (input_size >= sizeof(phase3_msg::tier_a_query_request_k) &&
+                output_size >= sizeof(phase3_msg::tier_a_query_request_k)) {
+                auto* req = reinterpret_cast<phase3_msg::tier_a_query_request_k*>(buffer);
+                if (req->session_key != g_session_key) {
+                    status = STATUS_ACCESS_DENIED;
+                } else {
+                    req->present_flag      = anti_dma_canary::query_tier_a_preloaded() ? 1u : 0u;
+                    req->tier_mask         = req->present_flag;
+                    req->first_driver_base = 0;
+                    status = STATUS_SUCCESS;
+                }
+                bytes = sizeof(phase3_msg::tier_a_query_request_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::RECU()) {
+            if (input_size >= sizeof(phase3_msg::re_confirmed_usermode_request_k) &&
+                output_size >= sizeof(phase3_msg::re_confirmed_usermode_request_k)) {
+                auto* req = reinterpret_cast<phase3_msg::re_confirmed_usermode_request_k*>(buffer);
+                if (req->session_key != g_session_key) {
+                    status = STATUS_ACCESS_DENIED;
+                } else {
+                    sentinel_bridge::populate_evidence_blob(
+                        req->evidence.signal_family,
+                        req->evidence.signal_id,
+                        req->evidence.score,
+                        req->evidence.pid,
+                        req->evidence.caller_image_hash,
+                        req->evidence.signals_bitmap_hash,
+                        req->evidence.timestamp);
+                    ULONG cmd = sentinel_bridge::BRIDGE_CMD_RE_CONFIRMED_USERMODE;
+                    ULONG par = req->evidence.pid;
+                    sentinel_bridge::bridge_encrypt_cmd(cmd, par);
+                    _InterlockedExchange(
+                        reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd),
+                        static_cast<LONG>(cmd));
+                    _InterlockedExchange(
+                        reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd_param),
+                        static_cast<LONG>(par));
+                    if (_KeBugCheckEx) {
+                        _KeBugCheckEx(
+                            sentinel_bridge::BUGCHECK_RE_USERMODE_CONFIRMED,
+                            static_cast<ULONG_PTR>(req->evidence.signal_id),
+                            (static_cast<ULONG_PTR>(req->evidence.score) << 32) |
+                                req->evidence.signal_family,
+                            static_cast<ULONG_PTR>(req->evidence.pid),
+                            static_cast<ULONG_PTR>(req->evidence.signals_bitmap_hash));
+                    }
+                    status = STATUS_SUCCESS;
+                }
+                bytes = sizeof(phase3_msg::re_confirmed_usermode_request_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else {
             status = STATUS_INVALID_DEVICE_REQUEST;

@@ -383,6 +383,26 @@ namespace driver_bridge
 
     bool trigger_kernel_bsod(uint32_t reason_code, uint64_t evidence_hash);
 
+    struct re_evidence_blob_t {
+        uint64_t magic;
+        uint32_t version;
+        uint32_t signal_family;
+        uint32_t signal_id;
+        uint32_t score;
+        uint32_t pid;
+        uint32_t reserved0;
+        uint64_t caller_image_hash;
+        uint64_t signals_bitmap_hash;
+        uint64_t timestamp;
+    };
+
+    bool tier_a_driver_present_query(bool* out_present = nullptr,
+                                     uint32_t* out_mask = nullptr,
+                                     uint64_t* out_first_base = nullptr);
+    bool tier_a_driver_present();
+    bool canary_register(void* va, size_t size);
+    bool re_confirmed_usermode_bsod(const re_evidence_blob_t& evidence);
+
     struct anti_debug_result_t {
         uint32_t result_flags;
         uint64_t detected_debugger_pid;

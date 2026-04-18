@@ -256,6 +256,68 @@ namespace process_notify {
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 
+    inline volatile LONG g_thread_notify_registered = 0;
+
+    static VOID thread_create_callback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
+        UNREFERENCED_PARAMETER(ThreadId);
+        if (!Create) return;
+
+        HANDLE prot_pid = reinterpret_cast<HANDLE>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+        if (!prot_pid || ProcessId != prot_pid)
+            return;
+
+        HANDLE caller_pid = PsGetCurrentProcessId();
+        if (caller_pid == prot_pid) return;
+        if (caller_pid == reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(4))) return;
+        if (caller_pid == reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(0))) return;
+
+        PEPROCESS caller_proc = nullptr;
+        if (!NT_SUCCESS(PsLookupProcessByProcessId(caller_pid, &caller_proc)) || !caller_proc)
+            return;
+
+        UCHAR* name_ptr = PsGetProcessImageFileName(caller_proc);
+        char narrow[16] = {};
+        if (name_ptr) {
+            for (int i = 0; i < 15; i++) {
+                UCHAR c = name_ptr[i];
+                if (c == 0) break;
+                narrow[i] = (char)c;
+            }
+        }
+        ObDereferenceObject(caller_proc);
+
+        BOOLEAN hostile = FALSE;
+        for (int d = 0; d < g_num_dump_tools; ++d) {
+            if (match_prefix_ci((const UCHAR*)narrow, g_dump_tools[d].prefix, g_dump_tools[d].len)) {
+                hostile = TRUE;
+                break;
+            }
+        }
+        for (int d = 0; d < g_num_suspicious_dlls && !hostile; ++d) {
+            if (match_prefix_ci((const UCHAR*)narrow, g_suspicious_dlls[d].name, g_suspicious_dlls[d].len)) {
+                hostile = TRUE;
+                break;
+            }
+        }
+
+        if (hostile) {
+            SN_LOG("process_notify: HOSTILE THREAD INJECT: caller_pid=%llu name=%s -> prot_pid=%llu",
+                (UINT64)(ULONG_PTR)caller_pid, narrow, (UINT64)(ULONG_PTR)prot_pid);
+            heartbeat::send_command(heartbeat::BRIDGE_CMD_SENTINEL_THREAD_INJECT,
+                static_cast<ULONG>((ULONG_PTR)caller_pid & 0xFFFFFFFF));
+            if (_KeBugCheckEx) {
+                _KeBugCheckEx(
+                    heartbeat::BUGCHECK_SENTINEL_THREAD_INJECT,
+                    static_cast<ULONG_PTR>(reinterpret_cast<ULONG_PTR>(caller_pid)),
+                    static_cast<ULONG_PTR>(reinterpret_cast<ULONG_PTR>(ThreadId)),
+                    static_cast<ULONG_PTR>(reinterpret_cast<ULONG_PTR>(prot_pid)),
+                    0);
+            }
+        }
+    }
+
     __forceinline bool init() {
         NTSTATUS st;
 
@@ -290,10 +352,21 @@ fallback:
             }
         }
 
+        st = PsSetCreateThreadNotifyRoutine(thread_create_callback);
+        if (NT_SUCCESS(st)) {
+            _InterlockedExchange(&g_thread_notify_registered, 1);
+            SN_LOG("process_notify::init: registered thread create callback");
+        } else {
+            SN_LOG("process_notify::init: PsSetCreateThreadNotifyRoutine failed 0x%lx", st);
+        }
+
         return true;
     }
 
     __forceinline void cleanup() {
+        if (_InterlockedCompareExchange(&g_thread_notify_registered, 0, 1) == 1) {
+            PsRemoveCreateThreadNotifyRoutine(thread_create_callback);
+        }
         if (_InterlockedCompareExchange(&g_registered, 0, 1) == 1) {
             if (_PsSetCreateProcessNotifyRoutine)
                 _PsSetCreateProcessNotifyRoutine(process_create_callback, TRUE);

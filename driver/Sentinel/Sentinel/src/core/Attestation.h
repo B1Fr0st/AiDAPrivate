@@ -225,12 +225,17 @@ namespace attestation
 
     __forceinline BOOLEAN init()
     {
+        SN_LOG("attestation::init: collecting hardware anchors");
         collect_hardware_anchors();
+        SN_LOG("attestation::init: computing hardware ID");
         NTSTATUS st = compute_hardware_id();
-        if (!NT_SUCCESS(st))
+        if (!NT_SUCCESS(st)) {
+            SN_LOG("attestation::init: FAIL - compute_hardware_id status=0x%08lx", st);
             return FALSE;
+        }
 
         g_attest.valid = TRUE;
+        SN_LOG("attestation::init: SUCCESS");
         return TRUE;
     }
 }

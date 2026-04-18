@@ -529,6 +529,25 @@ if(WIN32)
         set(OPENSSL_MSVC_STATIC_RT OFF)
         find_package(OpenSSL REQUIRED)
 
+        # Force static OpenSSL libs — CMake's FindOpenSSL picks the import libs
+        # (libssl.lib/libcrypto.lib) even with OPENSSL_USE_STATIC_LIBS=TRUE on MSVC.
+        # Override to the _static variants so users don't need DLLs at runtime.
+        if(MSVC AND OPENSSL_FOUND)
+            get_filename_component(_ossl_lib_dir "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
+            if(EXISTS "${_ossl_lib_dir}/libssl_static.lib")
+                set_target_properties(OpenSSL::SSL PROPERTIES
+                    IMPORTED_LOCATION "${_ossl_lib_dir}/libssl_static.lib"
+                    IMPORTED_LOCATION_RELEASE "${_ossl_lib_dir}/libssl_static.lib"
+                    IMPORTED_LOCATION_DEBUG "${_ossl_lib_dir}/../MDd/libssl_static.lib"
+                )
+                set_target_properties(OpenSSL::Crypto PROPERTIES
+                    IMPORTED_LOCATION "${_ossl_lib_dir}/libcrypto_static.lib"
+                    IMPORTED_LOCATION_RELEASE "${_ossl_lib_dir}/libcrypto_static.lib"
+                    IMPORTED_LOCATION_DEBUG "${_ossl_lib_dir}/../MDd/libcrypto_static.lib"
+                )
+            endif()
+        endif()
+
         set(IMGUI_WRAPPER_DIR "${CMAKE_BINARY_DIR}/_imgui_wrapper/imgui")
         file(MAKE_DIRECTORY "${IMGUI_WRAPPER_DIR}")
         file(MAKE_DIRECTORY "${IMGUI_WRAPPER_DIR}/freetype")

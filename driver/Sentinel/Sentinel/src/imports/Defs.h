@@ -221,11 +221,7 @@ inline VOID               (NTAPI* _KeFlushQueuedDpcs)               (VOID);
 
 inline ULONG              (__cdecl* _DbgPrintEx)                   (ULONG, ULONG, PCSTR, ...);
 
-#ifdef DRIVER_DEBUG
 #define SN_LOG(fmt, ...) do { if (_DbgPrintEx) _DbgPrintEx(77, 0, "[SN] " fmt "\n", ##__VA_ARGS__); } while(0)
-#else
-#define SN_LOG(fmt, ...) do { (void)0; } while(0)
-#endif
 
 
 inline VOID               (NTAPI* _KeBugCheckEx)                    (ULONG, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
@@ -262,6 +258,8 @@ inline BOOLEAN            (NTAPI* _RtlDeleteElementGenericTableAvl) (PRTL_AVL_TA
 
 inline VOID               (NTAPI* _KeEnterCriticalRegion)           (VOID);
 inline VOID               (NTAPI* _KeLeaveCriticalRegion)           (VOID);
+
+inline VOID               (NTAPI* _ExQueueWorkItem)                (PWORK_QUEUE_ITEM, WORK_QUEUE_TYPE);
 
 
 inline NTSTATUS           (NTAPI* _ZwOpenKey)                       (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
@@ -349,6 +347,8 @@ inline bool SetupFunctions() {
     *(PVOID*)&_KeEnterCriticalRegion           = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeEnterCriticalRegion"));
     *(PVOID*)&_KeLeaveCriticalRegion           = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeLeaveCriticalRegion"));
 
+    *(PVOID*)&_ExQueueWorkItem                 = GetProcAddress(kernelBase, (PCHAR)skCrypt("ExQueueWorkItem"));
+
 
     *(PVOID*)&_ZwOpenKey                       = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwOpenKey"));
     *(PVOID*)&_ZwQueryValueKey                 = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwQueryValueKey"));
@@ -367,6 +367,23 @@ inline bool SetupFunctions() {
 
     _IoDriverObjectType_ptr = (POBJECT_TYPE*)GetProcAddress(kernelBase, (PCHAR)skCrypt("IoDriverObjectType"));
 
+    SN_LOG("SetupFunctions: kernelBase=%p", kernelBase);
+    SN_LOG("SetupFunctions: _MmIsAddressValid=%p _MmCopyMemory=%p _MmMapIoSpaceEx=%p _MmUnmapIoSpace=%p", _MmIsAddressValid, _MmCopyMemory, _MmMapIoSpaceEx, _MmUnmapIoSpace);
+    SN_LOG("SetupFunctions: _IoAllocateMdl=%p _IoFreeMdl=%p _MmBuildMdlForNonPagedPool=%p", _IoAllocateMdl, _IoFreeMdl, _MmBuildMdlForNonPagedPool);
+    SN_LOG("SetupFunctions: _MmMapLockedPagesSpecifyCache=%p _MmUnmapLockedPages=%p _MmProbeAndLockPages=%p _MmUnlockPages=%p", _MmMapLockedPagesSpecifyCache, _MmUnmapLockedPages, _MmProbeAndLockPages, _MmUnlockPages);
+    SN_LOG("SetupFunctions: _KeInitializeDpc=%p _KeInitializeTimerEx=%p _KeSetTimerEx=%p _KeCancelTimer=%p _KeFlushQueuedDpcs=%p", _KeInitializeDpc, _KeInitializeTimerEx, _KeSetTimerEx, _KeCancelTimer, _KeFlushQueuedDpcs);
+    SN_LOG("SetupFunctions: _DbgPrintEx=%p _KeBugCheckEx=%p _KeIpiGenericCall=%p", _DbgPrintEx, _KeBugCheckEx, _KeIpiGenericCall);
+    SN_LOG("SetupFunctions: _PsCreateSystemThread=%p _KeDelayExecutionThread=%p _PsTerminateSystemThread=%p", _PsCreateSystemThread, _KeDelayExecutionThread, _PsTerminateSystemThread);
+    SN_LOG("SetupFunctions: _ObfDereferenceObject=%p _ObReferenceObjectByName=%p _ObRegisterCallbacks=%p _ObUnRegisterCallbacks=%p", _ObfDereferenceObject, _ObReferenceObjectByName, _ObRegisterCallbacks, _ObUnRegisterCallbacks);
+    SN_LOG("SetupFunctions: _ZwClose=%p _RtlInitUnicodeString=%p _RtlGetVersion=%p", _ZwClose, _RtlInitUnicodeString, _RtlGetVersion);
+    SN_LOG("SetupFunctions: _KfRaiseIrql=%p _KeLowerIrql=%p", _KfRaiseIrql, _KeLowerIrql);
+    SN_LOG("SetupFunctions: _ExAcquireResourceExclusiveLite=%p _ExReleaseResourceLite=%p", _ExAcquireResourceExclusiveLite, _ExReleaseResourceLite);
+    SN_LOG("SetupFunctions: _RtlLookupElementGenericTableAvl=%p _RtlDeleteElementGenericTableAvl=%p", _RtlLookupElementGenericTableAvl, _RtlDeleteElementGenericTableAvl);
+    SN_LOG("SetupFunctions: _KeEnterCriticalRegion=%p _KeLeaveCriticalRegion=%p _ExQueueWorkItem=%p", _KeEnterCriticalRegion, _KeLeaveCriticalRegion, _ExQueueWorkItem);
+    SN_LOG("SetupFunctions: _ZwOpenKey=%p _ZwQueryValueKey=%p _ZwDeleteFile=%p _ZwSetInformationFile=%p _IoCreateFileEx=%p", _ZwOpenKey, _ZwQueryValueKey, _ZwDeleteFile, _ZwSetInformationFile, _IoCreateFileEx);
+    SN_LOG("SetupFunctions: _PsSetCreateProcessNotifyRoutine=%p _PsSetCreateProcessNotifyRoutineEx=%p", _PsSetCreateProcessNotifyRoutine, _PsSetCreateProcessNotifyRoutineEx);
+    SN_LOG("SetupFunctions: _PsSetLoadImageNotifyRoutine=%p _PsRemoveLoadImageNotifyRoutine=%p", _PsSetLoadImageNotifyRoutine, _PsRemoveLoadImageNotifyRoutine);
+    SN_LOG("SetupFunctions: _ZwTerminateProcess=%p _ZwOpenProcess=%p _IoDriverObjectType_ptr=%p", _ZwTerminateProcess, _ZwOpenProcess, _IoDriverObjectType_ptr);
 
     if (!_MmIsAddressValid || !_MmCopyMemory ||
         !_IoAllocateMdl || !_IoFreeMdl || !_MmBuildMdlForNonPagedPool ||
@@ -376,10 +393,13 @@ inline bool SetupFunctions() {
         !_PsCreateSystemThread || !_KeDelayExecutionThread || !_PsTerminateSystemThread ||
         !_ObfDereferenceObject || !_ZwClose ||
         !_RtlInitUnicodeString || !_RtlGetVersion ||
-        !_ExAcquireResourceExclusiveLite || !_ExReleaseResourceLite) {
+        !_ExAcquireResourceExclusiveLite || !_ExReleaseResourceLite ||
+        !_ExQueueWorkItem) {
+        SN_LOG("SetupFunctions: CRITICAL FUNCTION MISSING - returning false");
         return false;
     }
 
+    SN_LOG("SetupFunctions: ALL functions resolved successfully");
     return true;
 }
 

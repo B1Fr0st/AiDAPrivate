@@ -252,11 +252,13 @@ inline NTSTATUS           (NTAPI* _ZwSetInformationFile)           (HANDLE, PIO_
 inline NTSTATUS           (NTAPI* _IoCreateFileEx)                 (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG, CREATE_FILE_TYPE, PVOID, ULONG, PIO_DRIVER_CREATE_CONTEXT);
 
 inline VOID               (NTAPI* _KeBugCheckEx)                   (ULONG, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
+inline BOOLEAN            (NTAPI* _KdRefreshDebuggerNotPresent)    (VOID) = nullptr;
 inline VOID               (NTAPI* _KeInitializeDpc)                (PRKDPC, PKDEFERRED_ROUTINE, PVOID);
 inline VOID               (NTAPI* _KeInitializeTimerEx)            (PKTIMER, TIMER_TYPE);
 inline BOOLEAN            (NTAPI* _KeSetTimerEx)                   (PKTIMER, LARGE_INTEGER, LONG, PKDPC);
 inline BOOLEAN            (NTAPI* _KeCancelTimer)                  (PKTIMER);
 inline VOID               (NTAPI* _KeFlushQueuedDpcs)              (VOID);
+inline VOID               (NTAPI* _ExQueueWorkItem)                (PWORK_QUEUE_ITEM, WORK_QUEUE_TYPE);
 
 inline NTSTATUS           (NTAPI* _ObRegisterCallbacks)             (POB_CALLBACK_REGISTRATION, PVOID*);
 inline VOID               (NTAPI* _ObUnRegisterCallbacks)           (PVOID);
@@ -267,11 +269,7 @@ inline NTSTATUS           (NTAPI* _PsSetCreateProcessNotifyRoutineEx)(PCREATE_PR
 
 inline ULONG              (__cdecl* _DbgPrintEx)                   (ULONG, ULONG, PCSTR, ...);
 
-#ifdef DRIVER_DEBUG
 #define WW_LOG(fmt, ...) do { if (_DbgPrintEx) _DbgPrintEx(77, 0, "[WW] " fmt "\n", ##__VA_ARGS__); } while(0)
-#else
-#define WW_LOG(fmt, ...) do { (void)0; } while(0)
-#endif
 
 
 namespace ssdt_resolver {
@@ -702,11 +700,13 @@ inline bool SetupFunctions() {
     *(PVOID*)&_IoCreateFileEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("IoCreateFileEx"));
 
     *(PVOID*)&_KeBugCheckEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeBugCheckEx"));
+    *(PVOID*)&_KdRefreshDebuggerNotPresent = GetProcAddress(kernelBase, (PCHAR)skCrypt("KdRefreshDebuggerNotPresent"));
     *(PVOID*)&_KeInitializeDpc = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeInitializeDpc"));
     *(PVOID*)&_KeInitializeTimerEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeInitializeTimerEx"));
     *(PVOID*)&_KeSetTimerEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeSetTimerEx"));
     *(PVOID*)&_KeCancelTimer = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeCancelTimer"));
     *(PVOID*)&_KeFlushQueuedDpcs = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeFlushQueuedDpcs"));
+    *(PVOID*)&_ExQueueWorkItem = GetProcAddress(kernelBase, (PCHAR)skCrypt("ExQueueWorkItem"));
 
     *(PVOID*)&_ObRegisterCallbacks = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObRegisterCallbacks"));
     *(PVOID*)&_ObUnRegisterCallbacks = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObUnRegisterCallbacks"));
@@ -715,9 +715,34 @@ inline bool SetupFunctions() {
 
     *(PVOID*)&_DbgPrintEx = GetProcAddress(kernelBase, (PCHAR)skCrypt("DbgPrintEx"));
 
+    WW_LOG("SetupFunctions: kernelBase=%p", kernelBase);
+    WW_LOG("SetupFunctions: _RtlInitUnicodeString=%p _IoCreateDevice=%p _IoCreateSymbolicLink=%p", _RtlInitUnicodeString, _IoCreateDevice, _IoCreateSymbolicLink);
+    WW_LOG("SetupFunctions: _IofCompleteRequest=%p _MmCopyMemory=%p _MmMapIoSpaceEx=%p", _IofCompleteRequest, _MmCopyMemory, _MmMapIoSpaceEx);
+    WW_LOG("SetupFunctions: _MmUnmapIoSpace=%p _PsLookupProcessByProcessId=%p _PsGetProcessSectionBaseAddress=%p", _MmUnmapIoSpace, _PsLookupProcessByProcessId, _PsGetProcessSectionBaseAddress);
+    WW_LOG("SetupFunctions: _ObfDereferenceObject=%p _ObReferenceObjectByName=%p _MmGetPhysicalMemoryRanges=%p", _ObfDereferenceObject, _ObReferenceObjectByName, _MmGetPhysicalMemoryRanges);
+    WW_LOG("SetupFunctions: _MmGetVirtualForPhysical=%p _RtlGetVersion=%p _KfRaiseIrql=%p _KeLowerIrql=%p", _MmGetVirtualForPhysical, _RtlGetVersion, _KfRaiseIrql, _KeLowerIrql);
+    WW_LOG("SetupFunctions: _MmIsAddressValid=%p _ZwOpenProcess=%p _ZwClose=%p _ZwTerminateProcess=%p", _MmIsAddressValid, _ZwOpenProcess, _ZwClose, _ZwTerminateProcess);
+    WW_LOG("SetupFunctions: _IoAllocateMdl=%p _IoFreeMdl=%p _MmBuildMdlForNonPagedPool=%p", _IoAllocateMdl, _IoFreeMdl, _MmBuildMdlForNonPagedPool);
+    WW_LOG("SetupFunctions: _MmMapLockedPagesSpecifyCache=%p _MmUnmapLockedPages=%p _MmProbeAndLockPages=%p _MmUnlockPages=%p", _MmMapLockedPagesSpecifyCache, _MmUnmapLockedPages, _MmProbeAndLockPages, _MmUnlockPages);
+    WW_LOG("SetupFunctions: _PsCreateSystemThread=%p _KeDelayExecutionThread=%p _PsTerminateSystemThread=%p", _PsCreateSystemThread, _KeDelayExecutionThread, _PsTerminateSystemThread);
+    WW_LOG("SetupFunctions: _KeStackAttachProcess=%p _KeUnstackDetachProcess=%p _ZwAllocateVirtualMemory=%p _ZwFreeVirtualMemory=%p", _KeStackAttachProcess, _KeUnstackDetachProcess, _ZwAllocateVirtualMemory, _ZwFreeVirtualMemory);
+    WW_LOG("SetupFunctions: _IoDeleteDevice=%p _IoDeleteSymbolicLink=%p", _IoDeleteDevice, _IoDeleteSymbolicLink);
+    WW_LOG("SetupFunctions: _PsLookupThreadByThreadId=%p _PsGetNextProcessThread=%p _PsGetThreadId=%p", _PsLookupThreadByThreadId, _PsGetNextProcessThread, _PsGetThreadId);
+    WW_LOG("SetupFunctions: _PsGetContextThread=%p _PsSetContextThread=%p _PsSuspendThread=%p _PsResumeThread=%p", _PsGetContextThread, _PsSetContextThread, _PsSuspendThread, _PsResumeThread);
+    WW_LOG("SetupFunctions: _PsGetProcessPeb=%p _ZwQueryVirtualMemory=%p _ZwProtectVirtualMemory=%p", _PsGetProcessPeb, _ZwQueryVirtualMemory, _ZwProtectVirtualMemory);
+    WW_LOG("SetupFunctions: _ObOpenObjectByPointer=%p _ZwSuspendThread=%p _ZwResumeThread=%p", _ObOpenObjectByPointer, _ZwSuspendThread, _ZwResumeThread);
+    WW_LOG("SetupFunctions: _IoFileObjectType=%p _ObGetObjectType=%p _ObReferenceObjectSafe=%p", _IoFileObjectType, _ObGetObjectType, _ObReferenceObjectSafe);
+    WW_LOG("SetupFunctions: _ZwOpenKey=%p _ZwQueryValueKey=%p _ZwDeleteFile=%p _ZwSetInformationFile=%p", _ZwOpenKey, _ZwQueryValueKey, _ZwDeleteFile, _ZwSetInformationFile);
+    WW_LOG("SetupFunctions: _IoCreateFileEx=%p _KeBugCheckEx=%p _KdRefreshDebuggerNotPresent=%p", _IoCreateFileEx, _KeBugCheckEx, _KdRefreshDebuggerNotPresent);
+    WW_LOG("SetupFunctions: _KeInitializeDpc=%p _KeInitializeTimerEx=%p _KeSetTimerEx=%p _KeCancelTimer=%p _KeFlushQueuedDpcs=%p", _KeInitializeDpc, _KeInitializeTimerEx, _KeSetTimerEx, _KeCancelTimer, _KeFlushQueuedDpcs);
+    WW_LOG("SetupFunctions: _ExQueueWorkItem=%p", _ExQueueWorkItem);
+    WW_LOG("SetupFunctions: _ObRegisterCallbacks=%p _ObUnRegisterCallbacks=%p _PsSetCreateProcessNotifyRoutineEx=%p", _ObRegisterCallbacks, _ObUnRegisterCallbacks, _PsSetCreateProcessNotifyRoutineEx);
+    WW_LOG("SetupFunctions: _DbgPrintEx=%p", _DbgPrintEx);
 
     if (!_PsSuspendThread && !_ZwSuspendThread) {
+        WW_LOG("SetupFunctions: no PsSuspendThread or ZwSuspendThread, resolving SSDT");
         ssdt_resolver::find_ssdt();
+        WW_LOG("SetupFunctions: SSDT resolve done, ssdt=%p NtSuspend=%p NtResume=%p", ssdt_resolver::g_ssdt, ssdt_resolver::g_NtSuspendThread, ssdt_resolver::g_NtResumeThread);
     }
 
     if (!_RtlInitUnicodeString || !_IoCreateDevice ||
@@ -734,10 +759,12 @@ inline bool SetupFunctions() {
         !_ZwAllocateVirtualMemory || !_ZwFreeVirtualMemory ||
         !_IoDeleteDevice || !_IoDeleteSymbolicLink ||
         !_KeBugCheckEx || !_KeInitializeDpc || !_KeInitializeTimerEx ||
-        !_KeSetTimerEx || !_KeCancelTimer || !_KeFlushQueuedDpcs) {
+        !_KeSetTimerEx || !_KeCancelTimer || !_KeFlushQueuedDpcs ||
+        !_ExQueueWorkItem) {
+        WW_LOG("SetupFunctions: CRITICAL FUNCTION MISSING - returning false");
         return false;
     }
 
-
+    WW_LOG("SetupFunctions: ALL functions resolved successfully");
     return true;
 }

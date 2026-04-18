@@ -49,6 +49,15 @@
     <ClInclude Include="src\core\CallbackScanner.h">
       <Filter>Header Files\core</Filter>
     </ClInclude>
+    <ClInclude Include="src\core\DeviceScan.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\EvidenceRing.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\DriverLoadAudit.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
     <ClInclude Include="src\core\EtwDisable.h">
       <Filter>Header Files\core</Filter>
     </ClInclude>

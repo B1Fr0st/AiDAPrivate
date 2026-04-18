@@ -3,6 +3,9 @@
 #include "driver/Strong.h"
 #include "../CoreSecurity.h"
 #include "../Struct.h"
+#include "../AntiDebug.h"
+#include "../SentinelBridge.h"
+#include "../Dispatcher.h"
 
 typedef struct _SYSTEM_PROCESS_INFORMATION_LOCAL {
     ULONG NextEntryOffset;
@@ -950,6 +953,115 @@ NTSTATUS functions::handle_spoof_debug_flags(p_spoof_debug request) {
     return STATUS_SUCCESS;
 }
 
+namespace debug_attach_monitor {
+
+    inline KTIMER   g_timer;
+    inline KDPC     g_dpc;
+    inline WORK_QUEUE_ITEM g_work_item;
+    inline volatile LONG g_strikes = 0;
+    inline volatile LONG g_running = 0;
+    inline volatile LONG g_work_queued = 0;
+    inline volatile ULONG g_pending_pid = 0;
+
+    __forceinline ULONG resolve_debug_port_offset() {
+        ULONG build = strong::get_windows_version();
+        if (build >= 22000) return 0x578;
+        if (build >= 19041) return 0x578;
+        if (build >= 17763) return 0x550;
+        return 0x420;
+    }
+
+    static VOID NTAPI work_routine(PVOID) {
+        ULONG pid = static_cast<ULONG>(_InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_pending_pid), 0));
+        if (pid == 0) {
+            _InterlockedExchange(&g_work_queued, 0);
+            return;
+        }
+
+        PEPROCESS proc = nullptr;
+        if (!NT_SUCCESS(PsLookupProcessByProcessId(reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid)), &proc)) || !proc) {
+            _InterlockedExchange(&g_work_queued, 0);
+            return;
+        }
+
+        PVOID debug_port = nullptr;
+        ULONG debug_port_offset = resolve_debug_port_offset();
+        if (debug_port_offset != 0) {
+            __try {
+                debug_port = *reinterpret_cast<PVOID*>(reinterpret_cast<UCHAR*>(proc) + debug_port_offset);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                debug_port = nullptr;
+            }
+        }
+        ObDereferenceObject(proc);
+
+        BOOLEAN kd_enabled_now = anti_debug::kd_transitioned_to_enabled();
+
+        if (debug_port != nullptr || kd_enabled_now) {
+            LONG strikes = _InterlockedIncrement(&g_strikes);
+            sentinel_bridge::populate_evidence_blob(
+                0x20u,
+                sentinel_bridge::RE_REASON_DEBUG_ATTACH,
+                100,
+                pid,
+                0,
+                0,
+                0);
+
+            ULONG cmd   = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
+            ULONG param = pid;
+            sentinel_bridge::bridge_encrypt_cmd(cmd, param);
+            _InterlockedExchange(reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd), static_cast<LONG>(cmd));
+            _InterlockedExchange(reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd_param), static_cast<LONG>(param));
+
+            if (strikes >= 2) {
+                if (_KeBugCheckEx) {
+                    _KeBugCheckEx(
+                        sentinel_bridge::BUGCHECK_RE_USERMODE_CONFIRMED,
+                        sentinel_bridge::RE_REASON_DEBUG_ATTACH,
+                        sentinel_bridge::g_evidence_blob_offset,
+                        static_cast<ULONG_PTR>(pid),
+                        0);
+                }
+            }
+        } else {
+            _InterlockedExchange(&g_strikes, 0);
+        }
+
+        _InterlockedExchange(&g_work_queued, 0);
+    }
+
+    static VOID NTAPI dpc_routine(_KDPC*, PVOID, PVOID, PVOID) {
+        if (!_InterlockedCompareExchange(&g_running, 0, 0)) return;
+        if (!dispatcher::is_session_valid()) return;
+
+        HANDLE pid_handle = caller_validation::g_registered_client_pid;
+        ULONG pid = static_cast<ULONG>(reinterpret_cast<ULONG_PTR>(pid_handle));
+        if (pid == 0) return;
+
+        if (_InterlockedCompareExchange(&g_work_queued, 1, 0) != 0) return;
+
+        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_pending_pid), static_cast<LONG>(pid));
+        ExInitializeWorkItem(&g_work_item, work_routine, nullptr);
+        ExQueueWorkItem(&g_work_item, DelayedWorkQueue);
+    }
+
+    VOID start() {
+        if (_InterlockedCompareExchange(&g_running, 1, 0) != 0) return;
+        _KeInitializeTimerEx(&g_timer, SynchronizationTimer);
+        _KeInitializeDpc(&g_dpc, dpc_routine, nullptr);
+        LARGE_INTEGER due;
+        due.QuadPart = -10000000LL;
+        _KeSetTimerEx(&g_timer, due, 1000, &g_dpc);
+    }
+
+    VOID stop() {
+        if (_InterlockedCompareExchange(&g_running, 0, 1) != 1) return;
+        _KeCancelTimer(&g_timer);
+        _KeFlushQueuedDpcs();
+    }
+
+}
 
 NTSTATUS functions::handle_get_module_export(p_module_export request) {
     if (!request || request->module_base == 0) {

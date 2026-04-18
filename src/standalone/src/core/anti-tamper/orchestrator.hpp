@@ -37,6 +37,8 @@
 #include "../standalone_anti_dump.hpp"
 #include "re_detection_engine.hpp"
 
+#include "../../../obfuscation.hpp"
+
 namespace anti_tamper {
 
 inline uint64_t run_inline_check(check_class_t which, uint64_t proof_hash = 0)
@@ -77,6 +79,28 @@ inline bool initialize()
 
     syscall::initialize();
     webhook::write_log("init", "syscall_ok");
+
+    if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
+    {
+        bool tier_a_present = false;
+        if (driver_bridge::tier_a_driver_present_query(&tier_a_present, nullptr, nullptr)
+            && tier_a_present)
+        {
+            webhook::send_debug_log("init", "tier_a_driver_present_startup", true);
+            std::wstring msg = WOBFSTR(L"AiDA cannot start because a kernel-mode analysis driver is loaded. Unload it and try again.");
+            std::wstring title = WOBFSTR(L"AiDA");
+            MessageBoxW(nullptr, msg.c_str(), title.c_str(),
+                MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_TOPMOST);
+            ExitProcess(1);
+        }
+
+        void* canary = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS);
+        if (canary != nullptr)
+        {
+            rt.canary_page = canary;
+            driver_bridge::canary_register(canary, 4096);
+        }
+    }
 
     if (!integrity::snapshot_code(rt.code_snap))
         return false;

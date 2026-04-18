@@ -21,8 +21,10 @@ namespace witness_key
     };
 
     inline kw_storage_t g_kw = {};
+    inline WORK_QUEUE_ITEM g_rotate_work_item = {};
+    inline volatile LONG   g_rotate_work_queued = 0;
 
-    __forceinline void rotate_mask_dpc(KDPC*, PVOID, PVOID, PVOID)
+    static VOID NTAPI rotate_work_item_callback(PVOID)
     {
         KIRQL old_irql;
         KeAcquireSpinLock(&g_kw.lock, &old_irql);
@@ -33,16 +35,39 @@ namespace witness_key
             RtlCopyMemory(old_mask, g_kw.mask, KW_SIZE);
 
             UINT8 new_mask[KW_SIZE];
+            KeReleaseSpinLock(&g_kw.lock, old_irql);
+
             kernel_crypto::gen_random(new_mask, KW_SIZE);
 
-            for (ULONG i = 0; i < KW_SIZE; ++i)
-                g_kw.page[i] = (g_kw.page[i] ^ old_mask[i]) ^ new_mask[i];
+            KeAcquireSpinLock(&g_kw.lock, &old_irql);
 
-            RtlCopyMemory(g_kw.mask, new_mask, KW_SIZE);
-            kernel_crypto::gen_random(g_kw.page + KW_SIZE, KW_PAGE_SIZE - KW_SIZE);
+            if (g_kw.valid && g_kw.page)
+            {
+                for (ULONG i = 0; i < KW_SIZE; ++i)
+                    g_kw.page[i] = (g_kw.page[i] ^ old_mask[i]) ^ new_mask[i];
+
+                RtlCopyMemory(g_kw.mask, new_mask, KW_SIZE);
+            }
+
+            KeReleaseSpinLock(&g_kw.lock, old_irql);
+
+            UINT8* decoy_buf = g_kw.page + KW_SIZE;
+            kernel_crypto::gen_random(decoy_buf, KW_PAGE_SIZE - KW_SIZE);
+        }
+        else
+        {
+            KeReleaseSpinLock(&g_kw.lock, old_irql);
         }
 
-        KeReleaseSpinLock(&g_kw.lock, old_irql);
+        _InterlockedExchange(&g_rotate_work_queued, 0);
+    }
+
+    __forceinline void rotate_mask_dpc(KDPC*, PVOID, PVOID, PVOID)
+    {
+        if (_InterlockedCompareExchange(&g_rotate_work_queued, 1, 0) == 0) {
+            ExInitializeWorkItem(&g_rotate_work_item, rotate_work_item_callback, nullptr);
+            _ExQueueWorkItem(&g_rotate_work_item, DelayedWorkQueue);
+        }
 
         LARGE_INTEGER due;
         due.QuadPart = -static_cast<LONGLONG>(KW_MASK_ROTATE_INTERVAL_MS) * 10000LL;
@@ -124,6 +149,8 @@ namespace witness_key
     __forceinline void shutdown()
     {
         KeCancelTimer(&g_kw.rotate_timer);
+        if (_KeFlushQueuedDpcs)
+            _KeFlushQueuedDpcs();
 
         if (g_kw.page)
         {

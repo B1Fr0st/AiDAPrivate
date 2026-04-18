@@ -1,11 +1,50 @@
 #pragma once
 #include <imports/Defs.h>
+#include <core/ProcessNotify.h>
+#include <core/DriverLoadAudit.h>
 
 
 namespace callback_scanner {
 
 
     constexpr ULONG MAX_CALLBACKS = 64;
+
+    __forceinline ULONG64 driver_name_fnv64(PCUNICODE_STRING name) {
+        ULONG64 h = 0xCBF29CE484222325ULL;
+        if (!name || !name->Buffer) return h;
+        USHORT cnt = name->Length / sizeof(WCHAR);
+        for (USHORT i = 0; i < cnt; ++i) {
+            WCHAR c = name->Buffer[i];
+            if (c >= L'A' && c <= L'Z') c = static_cast<WCHAR>(c + 0x20);
+            h ^= static_cast<ULONG64>(c);
+            h *= 0x100000001B3ULL;
+        }
+        return h;
+    }
+
+    __forceinline BOOLEAN is_tier_a_hostile_name(PCUNICODE_STRING name) {
+        static const wchar_t* kTierA[] = {
+            L"dbk64.sys", L"dbk32.sys", L"hyperdbg.sys", L"dbgv.sys", L"kldbgdrv.sys",
+            L"syser.sys", L"livekd.sys", L"pcileech.sys", L"rwdrv.sys", L"winio.sys",
+            L"winio64.sys", L"capcom.sys", L"gdrv.sys", L"atszio64.sys", L"asmmap64.sys",
+            L"dumpit.sys", L"physmem.sys"
+        };
+        if (!name || !name->Buffer || name->Length == 0) return FALSE;
+        UNICODE_STRING lower;
+        WCHAR buf[260];
+        lower.Buffer = buf;
+        lower.MaximumLength = sizeof(buf);
+        lower.Length = 0;
+        if (!NT_SUCCESS(RtlDowncaseUnicodeString(&lower, const_cast<PUNICODE_STRING>(name), FALSE)))
+            return FALSE;
+        for (const wchar_t* tgt : kTierA) {
+            UNICODE_STRING us;
+            RtlInitUnicodeString(&us, tgt);
+            if (RtlSuffixUnicodeString(&us, &lower, FALSE))
+                return TRUE;
+        }
+        return FALSE;
+    }
 
     struct callback_info_t {
         PVOID   routine;
@@ -423,8 +462,6 @@ namespace callback_scanner {
         HANDLE ProcessId,
         PIMAGE_INFO ImageInfo)
     {
-        UNREFERENCED_PARAMETER(ImageInfo);
-
         if (ProcessId != nullptr) return;
 
         if (!FullImageName || !FullImageName->Buffer) return;
@@ -434,6 +471,46 @@ namespace callback_scanner {
             SN_LOG("callback_scanner: HOSTILE DRIVER LOAD: %wZ", FullImageName);
             heartbeat::send_command(heartbeat::BRIDGE_CMD_INTEGRITY_FAIL,
                 static_cast<ULONG>(g_hostile_driver_loads & 0xFFFFFFFF));
+        }
+
+        {
+            ULONG64 name_hash_for_audit = driver_name_fnv64(FullImageName);
+            ULONG_PTR base_for_audit = ImageInfo ? reinterpret_cast<ULONG_PTR>(ImageInfo->ImageBase) : 0;
+            ULONG_PTR size_for_audit = ImageInfo ? static_cast<ULONG_PTR>(ImageInfo->ImageSize) : 0;
+            UINT32 tier = 0;
+            if (is_tier_a_hostile_name(FullImageName)) tier = 2;
+            else if (is_hostile_driver_name(FullImageName)) tier = 1;
+            driver_load_audit::record(name_hash_for_audit,
+                static_cast<UINT64>(base_for_audit),
+                static_cast<UINT32>(size_for_audit & 0xFFFFFFFF),
+                tier);
+        }
+
+        if (is_tier_a_hostile_name(FullImageName)) {
+            ULONG64 name_hash = driver_name_fnv64(FullImageName);
+            ULONG_PTR image_base = ImageInfo ? reinterpret_cast<ULONG_PTR>(ImageInfo->ImageBase) : 0;
+            ULONG_PTR image_size = ImageInfo ? static_cast<ULONG_PTR>(ImageInfo->ImageSize) : 0;
+
+            HANDLE prot_pid = reinterpret_cast<HANDLE>(
+                _InterlockedCompareExchange64(
+                    reinterpret_cast<volatile LONG64*>(&process_notify::g_protected_pid), 0, 0));
+
+            if (prot_pid) {
+                heartbeat::send_command(heartbeat::BRIDGE_CMD_HOSTILE_DRIVER,
+                    static_cast<ULONG>(image_base & 0xFFFFFFFF));
+                SN_LOG("callback_scanner: TIER-A DRIVER LOAD while AiDA running - BUGCHECK: %wZ", FullImageName);
+                if (_KeBugCheckEx) {
+                    _KeBugCheckEx(heartbeat::BUGCHECK_HOSTILE_DRIVER_LOAD,
+                        static_cast<ULONG_PTR>(name_hash),
+                        image_base,
+                        image_size,
+                        0);
+                }
+            } else {
+                SN_LOG("callback_scanner: TIER-A DRIVER pre-loaded (AiDA not running) signaling: %wZ", FullImageName);
+                heartbeat::send_command(heartbeat::BRIDGE_CMD_TIER_A_PRE_LOADED,
+                    static_cast<ULONG>(name_hash & 0xFFFFFFFF));
+            }
         }
     }
 

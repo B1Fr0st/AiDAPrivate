@@ -1596,6 +1596,76 @@ namespace driver_bridge
         return device->trigger_kernel_bsod(reason_code, evidence_hash);
     }
 
+    bool tier_a_driver_present_query(bool* out_present, uint32_t* out_mask, uint64_t* out_first_base)
+    {
+        if (out_present) *out_present = false;
+        if (out_mask) *out_mask = 0;
+        if (out_first_base) *out_first_base = 0;
+
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        bool present = false;
+        uint32_t mask = 0;
+        uint64_t base = 0;
+        if (!device->tier_a_driver_present_query(present, &mask, &base))
+            return false;
+
+        if (out_present) *out_present = present;
+        if (out_mask) *out_mask = mask;
+        if (out_first_base) *out_first_base = base;
+        return true;
+    }
+
+    bool tier_a_driver_present()
+    {
+        bool present = false;
+        if (!tier_a_driver_present_query(&present, nullptr, nullptr))
+            return false;
+        return present;
+    }
+
+    bool canary_register(void* va, size_t size)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        return device->canary_register(reinterpret_cast<uint64_t>(va),
+                                       static_cast<uint64_t>(size));
+    }
+
+    bool re_confirmed_usermode_bsod(const re_evidence_blob_t& evidence)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) return false;
+
+        voyager::detail::re_evidence_blob_t raw{};
+        raw.magic = evidence.magic;
+        raw.version = evidence.version;
+        raw.signal_family = evidence.signal_family;
+        raw.signal_id = evidence.signal_id;
+        raw.score = evidence.score;
+        raw.pid = evidence.pid;
+        raw.reserved0 = evidence.reserved0;
+        raw.caller_image_hash = evidence.caller_image_hash;
+        raw.signals_bitmap_hash = evidence.signals_bitmap_hash;
+        raw.timestamp = evidence.timestamp;
+
+        return device->re_confirmed_usermode_bsod(raw);
+    }
+
     bool kernel_anti_debug_query(anti_debug_result_t& out)
     {
         bool kernel_mode = false;

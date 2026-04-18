@@ -30,9 +30,13 @@ namespace bridge_v2
 
     __forceinline BOOLEAN init_bridge(const UINT8 kw_subkey[32])
     {
+        SN_LOG("bridge_v2::init_bridge: allocating bridge_v2_t size=0x%lx", (ULONG)sizeof(bridge_v2_t));
         g_bridge_v2 = static_cast<bridge_v2_t*>(
             ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(bridge_v2_t), BRIDGE_POOL_TAG));
-        if (!g_bridge_v2) return FALSE;
+        if (!g_bridge_v2) {
+            SN_LOG("bridge_v2::init_bridge: FAIL - ExAllocatePool2 returned NULL");
+            return FALSE;
+        }
 
         RtlZeroMemory(g_bridge_v2, sizeof(bridge_v2_t));
         g_bridge_v2->version = BRIDGE_V2_VERSION;
@@ -42,6 +46,7 @@ namespace bridge_v2
         KeInitializeSpinLock(&g_bridge_lock);
         g_last_counter = 0;
 
+        SN_LOG("bridge_v2::init_bridge: SUCCESS bridge=%p version=%u", g_bridge_v2, g_bridge_v2->version);
         return TRUE;
     }
 

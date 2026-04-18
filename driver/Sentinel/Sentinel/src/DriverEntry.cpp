@@ -9,6 +9,9 @@
 #include <core/WskTransport.h>
 #include <core/Attestation.h>
 #include <core/Resurrect.h>
+#include <core/DeviceScan.h>
+#include <core/EvidenceRing.h>
+#include <core/DriverLoadAudit.h>
 
 
 #pragma data_seg(".sntl")
@@ -563,6 +566,12 @@ discovery_done:
             bool attest_ok = attestation::init();
             SN_LOG("init_thread: attestation::init = %d", (int)attest_ok);
 
+            bool ev_ok = evidence::init();
+            SN_LOG("init_thread: evidence::init = %d", (int)ev_ok);
+
+            bool dla_ok = driver_load_audit::init();
+            SN_LOG("init_thread: driver_load_audit::init = %d", (int)dla_ok);
+
             integrity::collect_sensor_baseline();
             SN_LOG("init_thread: integrity::collect_sensor_baseline done");
         }
@@ -592,6 +601,8 @@ discovery_done:
                 callback_scanner::start_image_load_monitoring();
             }
         }
+
+        device_scan::start();
 
 
         {

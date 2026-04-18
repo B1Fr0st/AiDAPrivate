@@ -10,6 +10,17 @@ namespace sentinel_bridge {
 
     constexpr ULONG BUGCHECK_SENTINEL_ABSENT = 0xDEAD5E10;
 
+    constexpr ULONG BUGCHECK_RE_USERMODE_CONFIRMED = 0xDEAD0002u;
+    constexpr ULONG BUGCHECK_HOSTILE_DRIVER_LOAD   = 0xDEAD5E40u;
+    constexpr ULONG BUGCHECK_HOSTILE_DEVICE_OBJECT = 0xDEAD5E41u;
+    constexpr ULONG BUGCHECK_KD_ENABLED_POST_INIT  = 0xDEAD5E42u;
+    constexpr ULONG BUGCHECK_DMA_CANARY_HIT        = 0xDEAD5E43u;
+    constexpr ULONG BUGCHECK_SENTINEL_THREAD_INJECT= 0xDEAD5E44u;
+
+    constexpr ULONG BUGCHECK_TIER_A_DRIVER_LOADED  = BUGCHECK_HOSTILE_DRIVER_LOAD;
+    constexpr ULONG BUGCHECK_CANARY_FOREIGN_PT     = BUGCHECK_DMA_CANARY_HIT;
+    constexpr ULONG BUGCHECK_KDBG_ENABLED_POSTINIT = BUGCHECK_KD_ENABLED_POST_INIT;
+
     constexpr ULONG BRIDGE_CMD_NONE             = 0;
     constexpr ULONG BRIDGE_CMD_DEBUGGER_FOUND   = 1;
     constexpr ULONG BRIDGE_CMD_DUMP_TOOL_FOUND  = 2;
@@ -21,6 +32,19 @@ namespace sentinel_bridge {
     constexpr ULONG BRIDGE_CMD_PRE_BSOD_INTENT  = 8;
     constexpr ULONG BRIDGE_CMD_HEARTBEAT_STALL  = 9;
     constexpr ULONG BRIDGE_CMD_INJECTED_DLL     = 10;
+    constexpr ULONG BRIDGE_CMD_HOSTILE_DRIVER    = 11;
+    constexpr ULONG BRIDGE_CMD_HOSTILE_DEVICE    = 12;
+    constexpr ULONG BRIDGE_CMD_KD_ENABLED        = 13;
+    constexpr ULONG BRIDGE_CMD_DMA_CANARY_HIT    = 14;
+    constexpr ULONG BRIDGE_CMD_EVIDENCE_READY    = 15;
+    constexpr ULONG BRIDGE_CMD_TIER_A_PRE_LOADED = 16;
+    constexpr ULONG BRIDGE_CMD_RE_CONFIRMED_USERMODE = 17;
+    constexpr ULONG BRIDGE_CMD_SENTINEL_THREAD_INJECT = 18;
+
+    constexpr ULONG BRIDGE_CMD_TIER_A_DRIVER_PRESENT = BRIDGE_CMD_HOSTILE_DRIVER;
+    constexpr ULONG BRIDGE_CMD_KDBG_TRANSITION       = BRIDGE_CMD_KD_ENABLED;
+    constexpr ULONG BRIDGE_CMD_CANARY_FOREIGN_PT     = BRIDGE_CMD_DMA_CANARY_HIT;
+    constexpr ULONG BRIDGE_CMD_DEVICE_OBJECT_HIT     = BRIDGE_CMD_HOSTILE_DEVICE;
 
     constexpr ULONG RE_REASON_GENERIC       = 0x0000DEEEu;
     constexpr ULONG RE_REASON_DEBUG_ATTACH  = 0x0000DBDBu;
@@ -28,6 +52,29 @@ namespace sentinel_bridge {
     constexpr ULONG RE_REASON_FOREIGN_HND   = 0x0000AD7Du;
     constexpr ULONG RE_REASON_INJECTED_DLL  = 0x0000114Du;
     constexpr ULONG RE_REASON_WATCHDOG_STALL= 0x0000DEDDu;
+    constexpr ULONG RE_REASON_PARENT_RE_TOOL   = 0x0000BA7Eu;
+    constexpr ULONG RE_REASON_VAD_MAPPED_IN_RE = 0x0000DA7Au;
+    constexpr ULONG RE_REASON_TEXT_WRITABLE    = 0x0000D7ECu;
+    constexpr ULONG RE_REASON_HOSTILE_DRIVER   = 0x00005E40u;
+    constexpr ULONG RE_REASON_HOSTILE_DEVICE   = 0x00005E41u;
+    constexpr ULONG RE_REASON_KD_ENABLED       = 0x00005E42u;
+    constexpr ULONG RE_REASON_DMA_CANARY       = 0x00005E43u;
+
+    struct RE_EVIDENCE_BLOB {
+        UINT64 magic;
+        UINT32 version;
+        UINT32 signal_family;
+        UINT32 signal_id;
+        UINT32 score;
+        UINT32 pid;
+        UINT32 reserved0;
+        UINT64 caller_image_hash;
+        UINT64 signals_bitmap_hash;
+        UINT64 timestamp;
+    };
+    static_assert(sizeof(RE_EVIDENCE_BLOB) == 56, "RE_EVIDENCE_BLOB must be 56 bytes");
+    constexpr UINT64 RE_EVIDENCE_MAGIC = 0x5645444149414941ULL;
+    constexpr UINT32 RE_EVIDENCE_VERSION = 1;
 
     struct bridge_t {
         volatile ULONG   magic;
@@ -272,15 +319,17 @@ namespace sentinel_bridge {
 
             ULONG raw_cmd = _InterlockedExchange((volatile LONG*)&g_bridge.sentinel_cmd, BRIDGE_CMD_NONE);
             ULONG raw_param = _InterlockedExchange((volatile LONG*)&g_bridge.sentinel_cmd_param, 0);
-            ULONG cmd = 0, param = 0;
-            bridge_decrypt_cmd(raw_cmd, raw_param, cmd, param);
-            if (cmd != BRIDGE_CMD_NONE) {
-                WW_LOG("watchdog_dpc: Sentinel command=%lu param=0x%lx", cmd, param);
+            if (raw_cmd != 0) {
+                ULONG cmd = 0, param = 0;
+                bridge_decrypt_cmd(raw_cmd, raw_param, cmd, param);
+                if (cmd != BRIDGE_CMD_NONE) {
+                    WW_LOG("watchdog_dpc: Sentinel command=%lu param=0x%lx", cmd, param);
 
-                if (cmd == BRIDGE_CMD_DEBUGGER_FOUND || cmd == BRIDGE_CMD_DUMP_TOOL_FOUND ||
-                    cmd == BRIDGE_CMD_INTEGRITY_FAIL || cmd == BRIDGE_CMD_CALLBACK_REMOVED) {
-                    if (_KeBugCheckEx) {
-                        _KeBugCheckEx(0xDEAD0002u, cmd, param, 0, 0);
+                    if (cmd == BRIDGE_CMD_DEBUGGER_FOUND || cmd == BRIDGE_CMD_DUMP_TOOL_FOUND ||
+                        cmd == BRIDGE_CMD_INTEGRITY_FAIL || cmd == BRIDGE_CMD_CALLBACK_REMOVED) {
+                        if (_KeBugCheckEx) {
+                            _KeBugCheckEx(0xDEAD0002u, cmd, param, 0, 0);
+                        }
                     }
                 }
             }
@@ -343,5 +392,71 @@ namespace sentinel_bridge {
         WW_LOG("start_watchdog: armed, period=%ldms grace=%ldms timeout=%ldms initial_sentinel_tsc=%lld bridge=%p",
             WATCHDOG_PERIOD_MS, GRACE_PERIOD_MS, SENTINEL_TIMEOUT_MS,
             initial_sentinel_tsc, &g_bridge);
+    }
+
+    constexpr ULONG EVIDENCE_BLOB_MAGIC = 0x45564944u;
+    constexpr ULONG EVIDENCE_BLOB_SIZE  = 512;
+    constexpr ULONG EVIDENCE_BLOB_TAG   = 'DivE';
+
+    struct evidence_blob_t {
+        volatile ULONG   magic;
+        volatile ULONG   version;
+        volatile ULONG   signal_family;
+        volatile ULONG   signal_id;
+        volatile ULONG   score;
+        volatile ULONG   source_pid;
+        volatile ULONG64 caller_image_hash;
+        volatile ULONG64 signals_bitmap;
+        volatile ULONG64 evidence_siphash;
+        volatile LARGE_INTEGER timestamp;
+        volatile LONG    seq;
+        volatile ULONG   _pad;
+        UCHAR            aux[EVIDENCE_BLOB_SIZE - 64];
+    };
+    static_assert(sizeof(evidence_blob_t) == EVIDENCE_BLOB_SIZE, "evidence_blob_t size mismatch");
+
+    inline evidence_blob_t* g_evidence_blob = nullptr;
+    inline ULONG_PTR        g_evidence_blob_offset = 0;
+
+    __forceinline NTSTATUS allocate_evidence_blob() {
+        if (g_evidence_blob) return STATUS_SUCCESS;
+        PVOID p = ExAllocatePool2(POOL_FLAG_NON_PAGED, EVIDENCE_BLOB_SIZE, EVIDENCE_BLOB_TAG);
+        if (!p) return STATUS_INSUFFICIENT_RESOURCES;
+        auto* b = static_cast<evidence_blob_t*>(p);
+        b->magic = EVIDENCE_BLOB_MAGIC;
+        b->version = 1;
+        g_evidence_blob = b;
+        ULONG_PTR bridge_base = reinterpret_cast<ULONG_PTR>(&g_bridge);
+        ULONG_PTR blob_addr   = reinterpret_cast<ULONG_PTR>(b);
+        g_evidence_blob_offset = (blob_addr >= bridge_base) ? (blob_addr - bridge_base) : (bridge_base - blob_addr);
+        return STATUS_SUCCESS;
+    }
+
+    __forceinline void free_evidence_blob() {
+        if (!g_evidence_blob) return;
+        ExFreePoolWithTag(g_evidence_blob, EVIDENCE_BLOB_TAG);
+        g_evidence_blob = nullptr;
+        g_evidence_blob_offset = 0;
+    }
+
+    __forceinline void populate_evidence_blob(
+        ULONG family, ULONG signal_id, ULONG score, ULONG pid,
+        ULONG64 image_hash, ULONG64 bitmap, ULONG64 siphash)
+    {
+        evidence_blob_t* b = g_evidence_blob;
+        if (!b) return;
+        _InterlockedIncrement(&b->seq);
+        b->signal_family     = family;
+        b->signal_id         = signal_id;
+        b->score             = score;
+        b->source_pid        = pid;
+        b->caller_image_hash = image_hash;
+        b->signals_bitmap    = bitmap;
+        b->evidence_siphash  = siphash;
+        LARGE_INTEGER now;
+        KeQuerySystemTime(&now);
+        b->timestamp.QuadPart = now.QuadPart;
+        KeMemoryBarrier();
+        b->magic             = EVIDENCE_BLOB_MAGIC;
     }
 }

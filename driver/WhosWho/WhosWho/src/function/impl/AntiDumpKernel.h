@@ -100,6 +100,8 @@ namespace anti_dump_kernel {
 
     inline NTSTATUS hide_all_threads(UINT32 pid)
     {
+        if (!_PsGetNextProcessThread) return STATUS_NOT_SUPPORTED;
+
         PEPROCESS process = nullptr;
         NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
         if (!NT_SUCCESS(status))
@@ -403,8 +405,49 @@ namespace continuous_anti_dump {
     inline volatile LONG   g_active = 0;
     inline volatile UINT32 g_target_pid = 0;
     inline volatile UINT64 g_cycle_count = 0;
+    inline WORK_QUEUE_ITEM g_work_item = {};
+    inline volatile LONG   g_work_item_queued = 0;
 
     constexpr LONG TIMER_PERIOD_MS = 7000;
+
+    inline VOID NTAPI work_item_callback(PVOID)
+    {
+        if (!_InterlockedCompareExchange(&g_active, 0, 0)) {
+            _InterlockedExchange(&g_work_item_queued, 0);
+            return;
+        }
+
+        {
+            UINT32 pid = g_target_pid;
+            if (pid == 0) {
+                _InterlockedExchange(&g_work_item_queued, 0);
+                return;
+            }
+
+            InterlockedIncrement64((volatile LONG64*)&g_cycle_count);
+            UINT64 cycle = g_cycle_count;
+
+            anti_dump_kernel::scan_and_kill_readers(pid);
+
+            if ((cycle % 3) == 0) {
+                anti_dump_kernel::hide_all_threads(pid);
+            }
+
+            if ((cycle % 10) == 0) {
+                anti_dump_kernel::erase_pe_headers(pid);
+            }
+
+            if ((cycle % 7) == 0) {
+                anti_dump_kernel::corrupt_section_headers(pid);
+            }
+
+            if ((cycle % 15) == 0) {
+                anti_dump_kernel::scramble_peb_loader_data(pid);
+            }
+        }
+
+        _InterlockedExchange(&g_work_item_queued, 0);
+    }
 
     inline VOID NTAPI timer_callback(
         PKDPC,
@@ -415,29 +458,9 @@ namespace continuous_anti_dump {
         if (!_InterlockedCompareExchange(&g_active, 0, 0))
             return;
 
-        UINT32 pid = g_target_pid;
-        if (pid == 0)
-            return;
-
-        InterlockedIncrement64((volatile LONG64*)&g_cycle_count);
-        UINT64 cycle = g_cycle_count;
-
-        anti_dump_kernel::scan_and_kill_readers(pid);
-
-        if ((cycle % 3) == 0) {
-            anti_dump_kernel::hide_all_threads(pid);
-        }
-
-        if ((cycle % 10) == 0) {
-            anti_dump_kernel::erase_pe_headers(pid);
-        }
-
-        if ((cycle % 7) == 0) {
-            anti_dump_kernel::corrupt_section_headers(pid);
-        }
-
-        if ((cycle % 15) == 0) {
-            anti_dump_kernel::scramble_peb_loader_data(pid);
+        if (_InterlockedCompareExchange(&g_work_item_queued, 1, 0) == 0) {
+            ExInitializeWorkItem(&g_work_item, work_item_callback, nullptr);
+            _ExQueueWorkItem(&g_work_item, DelayedWorkQueue);
         }
     }
 
@@ -466,6 +489,8 @@ namespace continuous_anti_dump {
             return;
 
         KeCancelTimer(&g_timer);
+        if (_KeFlushQueuedDpcs)
+            _KeFlushQueuedDpcs();
         g_target_pid = 0;
         WW_LOG("continuous_admp: stopped");
     }

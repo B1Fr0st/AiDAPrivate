@@ -71,6 +71,9 @@
     <ClInclude Include="src\function\AntiDebug.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\function\DmaCanary.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\function\CallerValidation.h">
       <Filter>Header Files</Filter>
     </ClInclude>

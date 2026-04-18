@@ -166,6 +166,7 @@
     <ClInclude Include="src\function\Stealth.h" />
     <ClInclude Include="src\function\SentinelBridge.h" />
     <ClInclude Include="src\function\Struct.h" />
+    <ClInclude Include="src\function\DmaCanary.h" />
     <ClInclude Include="src\imports\Defs.h" />
     <ClInclude Include="src\imports\Strings.h" />
   </ItemGroup>

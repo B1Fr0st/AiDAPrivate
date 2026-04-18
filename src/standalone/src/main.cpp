@@ -17,6 +17,7 @@
 #include "core/standalone_license.hpp"
 #include "core/standalone_driver.hpp"
 #include "core/anti-tamper/orchestrator.hpp"
+#include "core/anti-tamper/hv_preflight.hpp"
 #include "core/network_view.hpp"
 #include "core/script_engine.hpp"
 #include "core/toast_notification.hpp"
@@ -125,6 +126,12 @@ void set_acrylic_color(HWND hwnd)
 int main(int, char**)
 {
 
+
+    {
+        auto r = anti_tamper::hv_preflight::run();
+        if (r.result != anti_tamper::hv_preflight::result_t::allow)
+            anti_tamper::hv_preflight::show_refuse_ui_and_exit(r);
+    }
 
     embedded_resources::extract_and_load_z3();
     std::atexit(embedded_resources::cleanup_z3);

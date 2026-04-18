@@ -109,6 +109,9 @@
     <ClInclude Include="src\core\PoolScrub.h" />
     <ClInclude Include="src\core\Heartbeat.h" />
     <ClInclude Include="src\core\SelfProtect.h" />
+    <ClInclude Include="src\core\DeviceScan.h" />
+    <ClInclude Include="src\core\EvidenceRing.h" />
+    <ClInclude Include="src\core\DriverLoadAudit.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />

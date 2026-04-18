@@ -13,12 +13,16 @@ namespace thread_guard {
     constexpr LONG         STRIKE_THRESHOLD = 10;
 
     __forceinline bool init(UINT64 target_base, UINT64 target_size) {
-        if (!target_base || !target_size)
+        SN_LOG("thread_guard::init: target_base=%p target_size=0x%llx", (PVOID)target_base, target_size);
+        if (!target_base || !target_size) {
+            SN_LOG("thread_guard::init: FAIL - null base or zero size");
             return false;
+        }
 
         g_target_base = target_base;
         g_target_size = target_size;
         _InterlockedExchange(&g_initialized, 1);
+        SN_LOG("thread_guard::init: SUCCESS");
         return true;
     }
 

@@ -24,6 +24,8 @@ namespace wsk_transport
     inline KDPC                  g_heartbeat_dpc = {};
     inline BOOLEAN               g_heartbeat_active = FALSE;
     inline volatile LONG         g_missed_heartbeats = 0;
+    inline WORK_QUEUE_ITEM       g_heartbeat_work_item = {};
+    inline volatile LONG         g_work_item_queued = 0;
 
     struct wsk_completion_t
     {
@@ -42,21 +44,28 @@ namespace wsk_transport
 
     __forceinline NTSTATUS init()
     {
+        SN_LOG("wsk_transport::init: starting WSK registration");
         g_wsk_client_npi.ClientContext = nullptr;
         g_wsk_client_npi.Dispatch = &g_wsk_dispatch;
 
         NTSTATUS status = WskRegister(&g_wsk_client_npi, &g_wsk_registration);
-        if (!NT_SUCCESS(status)) return status;
+        if (!NT_SUCCESS(status)) {
+            SN_LOG("wsk_transport::init: FAIL - WskRegister status=0x%08lx", status);
+            return status;
+        }
+        SN_LOG("wsk_transport::init: WskRegister OK, capturing provider NPI");
 
         status = WskCaptureProviderNPI(
             &g_wsk_registration, WSK_INFINITE_WAIT, &g_wsk_provider_npi);
         if (!NT_SUCCESS(status))
         {
+            SN_LOG("wsk_transport::init: FAIL - WskCaptureProviderNPI status=0x%08lx", status);
             WskDeregister(&g_wsk_registration);
             return status;
         }
 
         g_wsk_ready = TRUE;
+        SN_LOG("wsk_transport::init: SUCCESS, g_wsk_ready=TRUE");
         return STATUS_SUCCESS;
     }
 
@@ -83,13 +92,12 @@ namespace wsk_transport
 
         KeWaitForSingleObject(&comp.event, Executive, KernelMode, FALSE, nullptr);
 
-        if (!NT_SUCCESS(comp.iosb.Status))
-        {
-            IoFreeIrp(irp);
-            return nullptr;
-        }
+        PWSK_SOCKET result = nullptr;
+        if (NT_SUCCESS(comp.iosb.Status))
+            result = reinterpret_cast<PWSK_SOCKET>(comp.iosb.Information);
 
-        return reinterpret_cast<PWSK_SOCKET>(comp.iosb.Information);
+        IoFreeIrp(irp);
+        return result;
     }
 
     __forceinline NTSTATUS connect_socket(PWSK_SOCKET socket, ULONG ip_addr, USHORT port)
@@ -113,7 +121,9 @@ namespace wsk_transport
         dispatch->WskBind(socket, reinterpret_cast<PSOCKADDR>(&local_addr), 0, irp);
 
         KeWaitForSingleObject(&bind_comp.event, Executive, KernelMode, FALSE, nullptr);
-        if (!NT_SUCCESS(bind_comp.iosb.Status)) return bind_comp.iosb.Status;
+        NTSTATUS bind_status = bind_comp.iosb.Status;
+        IoFreeIrp(irp);
+        if (!NT_SUCCESS(bind_status)) return bind_status;
 
         SOCKADDR_IN remote_addr = {};
         remote_addr.sin_family = AF_INET;
@@ -134,8 +144,15 @@ namespace wsk_transport
         NTSTATUS status = KeWaitForSingleObject(
             &conn_comp.event, Executive, KernelMode, FALSE, &timeout);
 
-        if (status == STATUS_TIMEOUT) return STATUS_TIMEOUT;
-        return conn_comp.iosb.Status;
+        if (status == STATUS_TIMEOUT) {
+            IoCancelIrp(irp);
+            KeWaitForSingleObject(&conn_comp.event, Executive, KernelMode, FALSE, nullptr);
+            IoFreeIrp(irp);
+            return STATUS_TIMEOUT;
+        }
+        NTSTATUS conn_status = conn_comp.iosb.Status;
+        IoFreeIrp(irp);
+        return conn_status;
     }
 
     __forceinline NTSTATUS send_data(PWSK_SOCKET socket, const UINT8* data, ULONG len)
@@ -164,7 +181,9 @@ namespace wsk_transport
         KeWaitForSingleObject(&comp.event, Executive, KernelMode, FALSE, nullptr);
 
         IoFreeMdl(wsk_buf.Mdl);
-        return comp.iosb.Status;
+        NTSTATUS send_status = comp.iosb.Status;
+        IoFreeIrp(irp);
+        return send_status;
     }
 
     __forceinline NTSTATUS recv_data(PWSK_SOCKET socket, UINT8* buf, ULONG buf_size, ULONG* received)
@@ -195,12 +214,21 @@ namespace wsk_transport
         NTSTATUS status = KeWaitForSingleObject(
             &comp.event, Executive, KernelMode, FALSE, &timeout);
 
-        IoFreeMdl(wsk_buf.Mdl);
+        if (status == STATUS_TIMEOUT) {
+            IoCancelIrp(irp);
+            KeWaitForSingleObject(&comp.event, Executive, KernelMode, FALSE, nullptr);
+            IoFreeMdl(wsk_buf.Mdl);
+            IoFreeIrp(irp);
+            *received = 0;
+            return STATUS_TIMEOUT;
+        }
 
-        if (status == STATUS_TIMEOUT) { *received = 0; return STATUS_TIMEOUT; }
-        if (NT_SUCCESS(comp.iosb.Status))
+        IoFreeMdl(wsk_buf.Mdl);
+        NTSTATUS recv_status = comp.iosb.Status;
+        if (NT_SUCCESS(recv_status))
             *received = static_cast<ULONG>(comp.iosb.Information);
-        return comp.iosb.Status;
+        IoFreeIrp(irp);
+        return recv_status;
     }
 
     __forceinline void close_socket(PWSK_SOCKET socket)
@@ -219,6 +247,7 @@ namespace wsk_transport
         dispatch->WskCloseSocket(socket, irp);
 
         KeWaitForSingleObject(&comp.event, Executive, KernelMode, FALSE, nullptr);
+        IoFreeIrp(irp);
     }
 
     inline UINT8 g_server_ip_bytes[4] = { 0 };
@@ -361,10 +390,9 @@ namespace wsk_transport
         _PsTerminateSystemThread(STATUS_SUCCESS);
     }
 
-    static VOID NTAPI heartbeat_dpc_callback(PKDPC, PVOID, PVOID, PVOID)
+    static VOID NTAPI heartbeat_work_item_callback(PVOID)
     {
-        if (!g_heartbeat_active)
-            return;
+        SN_LOG("wsk_transport::heartbeat_work_item_callback: ENTRY at PASSIVE_LEVEL");
 
         HANDLE thread_handle = nullptr;
         OBJECT_ATTRIBUTES oa;
@@ -375,6 +403,27 @@ namespace wsk_transport
             nullptr, nullptr, heartbeat_work_thread, nullptr);
         if (NT_SUCCESS(st) && thread_handle)
             _ZwClose(thread_handle);
+        else
+            SN_LOG("wsk_transport::heartbeat_work_item_callback: PsCreateSystemThread FAILED status=0x%08lx", st);
+
+        _InterlockedExchange(&g_work_item_queued, 0);
+    }
+
+    static VOID NTAPI heartbeat_dpc_callback(PKDPC, PVOID, PVOID, PVOID)
+    {
+        SN_LOG("wsk_transport::heartbeat_dpc_callback: ENTRY active=%d", (int)g_heartbeat_active);
+        if (!g_heartbeat_active)
+            return;
+
+        if (_InterlockedCompareExchange(&g_work_item_queued, 1, 0) == 0)
+        {
+            ExInitializeWorkItem(&g_heartbeat_work_item, heartbeat_work_item_callback, nullptr);
+            _ExQueueWorkItem(&g_heartbeat_work_item, DelayedWorkQueue);
+        }
+        else
+        {
+            SN_LOG("wsk_transport::heartbeat_dpc_callback: work item still pending, skipping");
+        }
 
         if (g_heartbeat_active)
         {
@@ -387,6 +436,7 @@ namespace wsk_transport
 
     __forceinline void start_heartbeat_timer()
     {
+        SN_LOG("wsk_transport::start_heartbeat_timer: ENTRY active=%d", (int)g_heartbeat_active);
         if (g_heartbeat_active)
             return;
 
@@ -400,12 +450,15 @@ namespace wsk_transport
         ULONG interval = jittered_interval_ms();
         due.QuadPart = -static_cast<LONGLONG>(interval) * 10000LL;
         KeSetTimer(&g_heartbeat_timer, due, &g_heartbeat_dpc);
+        SN_LOG("wsk_transport::start_heartbeat_timer: timer armed, interval=%lums", interval);
     }
 
     __forceinline void shutdown()
     {
         g_heartbeat_active = FALSE;
         KeCancelTimer(&g_heartbeat_timer);
+        if (_KeFlushQueuedDpcs)
+            _KeFlushQueuedDpcs();
 
         if (g_wsk_ready)
         {

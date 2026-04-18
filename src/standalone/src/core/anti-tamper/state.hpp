@@ -62,6 +62,7 @@ struct runtime_t
     uint32_t verify_counter = 0;
     std::string violation_reason;
     uint64_t last_server_nonce_hash = 0;
+    void* canary_page = nullptr;
 };
 
 inline runtime_t& get()

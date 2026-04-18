@@ -41,6 +41,29 @@ namespace anti_debug {
 
     constexpr UINT64 CHECK_INTERVAL_TSC = 300000000ULL;
 
+    inline volatile UCHAR g_kd_baseline = 0;
+    inline volatile LONG  g_kd_baseline_captured = 0;
+
+    __forceinline UCHAR read_kd_shared_byte() {
+        UCHAR volatile* kud = reinterpret_cast<UCHAR volatile*>(0xFFFFF78000000000ULL + 0x2D4);
+        return *kud;
+    }
+
+    __forceinline void initialize_kd_baseline() {
+        if (_InterlockedCompareExchange(&g_kd_baseline_captured, 1, 0) == 0) {
+            g_kd_baseline = read_kd_shared_byte();
+        }
+    }
+
+    __forceinline BOOLEAN kd_transitioned_to_enabled() {
+        if (_KdRefreshDebuggerNotPresent) {
+            _KdRefreshDebuggerNotPresent();
+        }
+        UCHAR current = read_kd_shared_byte();
+        UCHAR baseline = g_kd_baseline;
+        return (current != 0) && (baseline == 0);
+    }
+
     __forceinline void acquire_lock() {
         while (_InterlockedCompareExchange(&g_check_lock, 1, 0) != 0) {
             YieldProcessor();
@@ -451,6 +474,8 @@ namespace anti_debug {
 
     inline NTSTATUS clear_process_debug_registers(UINT32 pid)
     {
+        if (!_PsGetNextProcessThread) return STATUS_NOT_SUPPORTED;
+
         PEPROCESS process = nullptr;
         NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
         if (!NT_SUCCESS(status)) return status;
@@ -511,6 +536,8 @@ namespace anti_debug {
 
     inline NTSTATUS hide_all_process_threads(UINT32 pid)
     {
+        if (!_PsGetNextProcessThread) return STATUS_NOT_SUPPORTED;
+
         PEPROCESS process = nullptr;
         NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
         if (!NT_SUCCESS(status)) return status;
@@ -661,21 +688,23 @@ namespace continuous_anti_debug {
     inline volatile UINT32 g_target_pid = 0;
     inline volatile UINT64 g_cycle_count = 0;
     inline volatile UINT64 g_violations = 0;
+    inline WORK_QUEUE_ITEM g_work_item = {};
+    inline volatile LONG   g_work_item_queued = 0;
 
     constexpr LONG TIMER_PERIOD_MS = 5000;
 
-    inline VOID NTAPI timer_callback(
-        PKDPC,
-        PVOID,
-        PVOID,
-        PVOID)
+    inline VOID NTAPI work_item_callback(PVOID)
     {
-        if (!_InterlockedCompareExchange(&g_active, 0, 0))
+        if (!_InterlockedCompareExchange(&g_active, 0, 0)) {
+            _InterlockedExchange(&g_work_item_queued, 0);
             return;
+        }
 
         UINT32 pid = g_target_pid;
-        if (pid == 0)
+        if (pid == 0) {
+            _InterlockedExchange(&g_work_item_queued, 0);
             return;
+        }
 
         InterlockedIncrement64((volatile LONG64*)&g_cycle_count);
         UINT64 cycle = g_cycle_count;
@@ -724,6 +753,23 @@ namespace continuous_anti_debug {
         if ((cycle % 4) == 0) {
             anti_debug::hide_all_process_threads(pid);
         }
+
+        _InterlockedExchange(&g_work_item_queued, 0);
+    }
+
+    inline VOID NTAPI timer_callback(
+        PKDPC,
+        PVOID,
+        PVOID,
+        PVOID)
+    {
+        if (!_InterlockedCompareExchange(&g_active, 0, 0))
+            return;
+
+        if (_InterlockedCompareExchange(&g_work_item_queued, 1, 0) == 0) {
+            ExInitializeWorkItem(&g_work_item, work_item_callback, nullptr);
+            _ExQueueWorkItem(&g_work_item, DelayedWorkQueue);
+        }
     }
 
     inline void start(UINT32 pid)
@@ -752,6 +798,8 @@ namespace continuous_anti_debug {
             return;
 
         KeCancelTimer(&g_timer);
+        if (_KeFlushQueuedDpcs)
+            _KeFlushQueuedDpcs();
         g_target_pid = 0;
         WW_LOG("continuous_adbg: stopped");
     }

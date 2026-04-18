@@ -3065,6 +3065,58 @@ bool voyager::device_t::trigger_kernel_bsod(std::uint32_t reason_code, std::uint
     return false;
 }
 
+bool voyager::device_t::tier_a_driver_present_query(bool& out_present, std::uint32_t* out_mask,
+                                                    std::uint64_t* out_first_base) noexcept
+{
+    out_present = false;
+    if (out_mask) *out_mask = 0;
+    if (out_first_base) *out_first_base = 0;
+
+    if (!is_connected()) return false;
+
+    detail::tier_a_query_request req{};
+    req.magic = session_key_ ^ dynamic_key::get() ^ 0x7A1E0011u;
+    req.session_key = session_key_;
+
+    if (!send_request(ioctl_codes::TIRA(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    out_present = req.present_flag != 0;
+    if (out_mask) *out_mask = req.tier_mask;
+    if (out_first_base) *out_first_base = req.first_driver_base;
+    return true;
+}
+
+bool voyager::device_t::canary_register(std::uint64_t va, std::uint64_t size) noexcept
+{
+    if (!is_connected()) return false;
+
+    detail::canary_register_request req{};
+    req.magic = session_key_ ^ dynamic_key::get() ^ 0xCA110013u;
+    req.session_key = session_key_;
+    req.va = va;
+    req.size = size;
+    req.pid = process_id_ != 0 ? process_id_ : GetCurrentProcessId();
+
+    if (!send_request(ioctl_codes::CANR(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    return req.result == 0;
+}
+
+bool voyager::device_t::re_confirmed_usermode_bsod(const detail::re_evidence_blob_t& evidence) noexcept
+{
+    if (!is_connected()) return false;
+
+    detail::re_confirmed_usermode_request req{};
+    req.magic = session_key_ ^ dynamic_key::get() ^ 0xDEAD0010u;
+    req.session_key = session_key_;
+    req.evidence = evidence;
+
+    send_request(ioctl_codes::RECU(), &req, static_cast<DWORD>(sizeof(req)));
+    return false;
+}
+
 bool voyager::device_t::kernel_anti_debug_query(anti_debug_result& out) noexcept
 {
     if (!is_connected()) return false;

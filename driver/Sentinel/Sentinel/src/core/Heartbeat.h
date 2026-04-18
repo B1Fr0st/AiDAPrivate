@@ -27,7 +27,7 @@ namespace heartbeat {
 
 
     constexpr ULONG  BRIDGE_MAGIC = 0x57484F53;
-    constexpr ULONG  BRIDGE_VERSION = 1;
+    constexpr ULONG  BRIDGE_VERSION = 2;
 
     constexpr ULONG BRIDGE_CMD_NONE             = 0;
     constexpr ULONG BRIDGE_CMD_DEBUGGER_FOUND   = 1;
@@ -40,6 +40,59 @@ namespace heartbeat {
     constexpr ULONG BRIDGE_CMD_PRE_BSOD_INTENT  = 8;
     constexpr ULONG BRIDGE_CMD_HEARTBEAT_STALL  = 9;
     constexpr ULONG BRIDGE_CMD_INJECTED_DLL     = 10;
+    constexpr ULONG BRIDGE_CMD_HOSTILE_DRIVER    = 11;
+    constexpr ULONG BRIDGE_CMD_HOSTILE_DEVICE    = 12;
+    constexpr ULONG BRIDGE_CMD_KD_ENABLED        = 13;
+    constexpr ULONG BRIDGE_CMD_DMA_CANARY_HIT    = 14;
+    constexpr ULONG BRIDGE_CMD_EVIDENCE_READY    = 15;
+    constexpr ULONG BRIDGE_CMD_TIER_A_PRE_LOADED = 16;
+    constexpr ULONG BRIDGE_CMD_RE_CONFIRMED_USERMODE  = 17;
+    constexpr ULONG BRIDGE_CMD_SENTINEL_THREAD_INJECT = 18;
+
+    constexpr ULONG BRIDGE_CMD_TIER_A_DRIVER_PRESENT = BRIDGE_CMD_HOSTILE_DRIVER;
+    constexpr ULONG BRIDGE_CMD_KDBG_TRANSITION       = BRIDGE_CMD_KD_ENABLED;
+    constexpr ULONG BRIDGE_CMD_CANARY_FOREIGN_PT     = BRIDGE_CMD_DMA_CANARY_HIT;
+    constexpr ULONG BRIDGE_CMD_DEVICE_OBJECT_HIT     = BRIDGE_CMD_HOSTILE_DEVICE;
+
+    constexpr ULONG BUGCHECK_RE_USERMODE_CONFIRMED = 0xDEAD0002u;
+    constexpr ULONG BUGCHECK_HOSTILE_DRIVER_LOAD   = 0xDEAD5E40u;
+    constexpr ULONG BUGCHECK_HOSTILE_DEVICE_OBJECT = 0xDEAD5E41u;
+    constexpr ULONG BUGCHECK_KD_ENABLED_POST_INIT  = 0xDEAD5E42u;
+    constexpr ULONG BUGCHECK_DMA_CANARY_HIT        = 0xDEAD5E43u;
+    constexpr ULONG BUGCHECK_SENTINEL_THREAD_INJECT= 0xDEAD5E44u;
+    constexpr ULONG BUGCHECK_TIER_A_DRIVER_LOADED  = BUGCHECK_HOSTILE_DRIVER_LOAD;
+    constexpr ULONG BUGCHECK_CANARY_FOREIGN_PT     = BUGCHECK_DMA_CANARY_HIT;
+    constexpr ULONG BUGCHECK_KDBG_ENABLED_POSTINIT = BUGCHECK_KD_ENABLED_POST_INIT;
+
+    struct RE_EVIDENCE_BLOB {
+        UINT64 magic;
+        UINT32 version;
+        UINT32 signal_family;
+        UINT32 signal_id;
+        UINT32 score;
+        UINT32 pid;
+        UINT32 reserved0;
+        UINT64 caller_image_hash;
+        UINT64 signals_bitmap_hash;
+        UINT64 timestamp;
+    };
+    static_assert(sizeof(RE_EVIDENCE_BLOB) == 56, "RE_EVIDENCE_BLOB must be 56 bytes");
+    constexpr UINT64 RE_EVIDENCE_MAGIC = 0x5645444149414941ULL;
+    constexpr UINT32 RE_EVIDENCE_VERSION = 1;
+
+    constexpr ULONG RE_REASON_GENERIC           = 0x0000DEEEu;
+    constexpr ULONG RE_REASON_DEBUG_ATTACH      = 0x0000DBDBu;
+    constexpr ULONG RE_REASON_DR_SET            = 0x0000D7D7u;
+    constexpr ULONG RE_REASON_FOREIGN_HND       = 0x0000AD7Du;
+    constexpr ULONG RE_REASON_INJECTED_DLL      = 0x0000114Du;
+    constexpr ULONG RE_REASON_WATCHDOG_STALL    = 0x0000DEDDu;
+    constexpr ULONG RE_REASON_PARENT_RE_TOOL    = 0x0000BA7Eu;
+    constexpr ULONG RE_REASON_VAD_MAPPED_IN_RE  = 0x0000DA7Au;
+    constexpr ULONG RE_REASON_TEXT_WRITABLE     = 0x0000D7ECu;
+    constexpr ULONG RE_REASON_HOSTILE_DRIVER    = 0x00005E40u;
+    constexpr ULONG RE_REASON_HOSTILE_DEVICE    = 0x00005E41u;
+    constexpr ULONG RE_REASON_KD_ENABLED        = 0x00005E42u;
+    constexpr ULONG RE_REASON_DMA_CANARY        = 0x00005E43u;
 
 
     constexpr UINT64 HEARTBEAT_TIMEOUT_TSC = 60ULL * 3000000000ULL;
@@ -356,16 +409,16 @@ namespace heartbeat {
             bridge_encrypt_challenge(enc_challenge);
             InterlockedExchange64(
                 const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
-                    &g_bridge->sentinel_challenge)),
-                static_cast<LONG64>(enc_challenge));
-            InterlockedExchange64(
-                const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
                     &g_bridge->whoswho_response)),
                 0);
             InterlockedExchange64(
                 const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
                     &g_bridge->challenge_issued_tsc)),
                 static_cast<LONG64>(__rdtsc()));
+            InterlockedExchange64(
+                const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
+                    &g_bridge->sentinel_challenge)),
+                static_cast<LONG64>(enc_challenge));
             SN_LOG("heartbeat::issue_challenge: challenge=0x%llx", challenge);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             SN_LOG("heartbeat::issue_challenge: EXCEPTION");
@@ -383,14 +436,17 @@ namespace heartbeat {
             return true;
 
         __try {
-            UINT64 challenge = static_cast<UINT64>(g_bridge->sentinel_challenge);
-            if (challenge == 0)
+            UINT64 enc_challenge = static_cast<UINT64>(g_bridge->sentinel_challenge);
+            if (enc_challenge == 0)
                 return true;
 
             UINT64 issued_tsc = static_cast<UINT64>(g_bridge->challenge_issued_tsc);
             UINT64 now = __rdtsc();
             if (now - issued_tsc < 10ULL * 3000000000ULL)
                 return true;
+
+            UINT64 challenge = enc_challenge;
+            bridge_encrypt_challenge(challenge);
 
             UINT64 response = static_cast<UINT64>(g_bridge->whoswho_response);
             UINT64 expected = compute_expected_response(challenge);

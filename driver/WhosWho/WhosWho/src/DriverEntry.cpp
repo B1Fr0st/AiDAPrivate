@@ -13,6 +13,11 @@ namespace net_capture {
     void cleanup();
 }
 
+namespace debug_attach_monitor {
+    VOID start();
+    VOID stop();
+}
+
 constexpr ULONG TAG_DEL = 'leDW';
 
 
@@ -431,6 +436,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         return STATUS_ACCESS_DENIED;
     }
     sentinel_bridge::start_watchdog();
+
+    sentinel_bridge::allocate_evidence_blob();
+    anti_debug::initialize_kd_baseline();
+    debug_attach_monitor::start();
+    anti_dma_canary::init_timer();
 
     NTSTATUS ob_status = process_guard::init();
     WW_LOG("DriverEntry: process_guard::init returned 0x%08lx", ob_status);

@@ -161,6 +161,35 @@ namespace object_guard {
         return result && cb_ok;
     }
 
+    inline volatile UINT64 g_pending_kill_pid = 0;
+    inline WORK_QUEUE_ITEM g_kill_work_item = {};
+    inline volatile LONG   g_kill_work_queued = 0;
+
+    static VOID NTAPI kill_work_item_callback(PVOID)
+    {
+        UINT64 pid_val = g_pending_kill_pid;
+        if (pid_val == 0)
+            goto done;
+
+        if (_ZwOpenProcess && _ZwTerminateProcess && _ZwClose) {
+            OBJECT_ATTRIBUTES oa;
+            InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
+            CLIENT_ID cid = {};
+            cid.UniqueProcess = (HANDLE)(ULONG_PTR)pid_val;
+            HANDLE hProc = nullptr;
+            NTSTATUS term_st = _ZwOpenProcess(&hProc, PROCESS_TERMINATE, &oa, &cid);
+            if (NT_SUCCESS(term_st) && hProc) {
+                _ZwTerminateProcess(hProc, STATUS_ACCESS_DENIED);
+                _ZwClose(hProc);
+                SN_LOG("object_guard::kill_work: terminated dump tool pid=%llu",
+                    pid_val);
+            }
+        }
+
+    done:
+        _InterlockedExchange(&g_kill_work_queued, 0);
+    }
+
     __forceinline void scan_suspicious_handles() {
         __try {
             PEPROCESS initial = PsInitialSystemProcess;
@@ -183,20 +212,10 @@ namespace object_guard {
                     SN_LOG("object_guard::scan: DUMP TOOL DETECTED pid=%llu name=%.15s — TERMINATING",
                         (UINT64)(ULONG_PTR)pid, name);
 
-
-                    if (_ZwOpenProcess && _ZwTerminateProcess && _ZwClose) {
-                        OBJECT_ATTRIBUTES oa;
-                        InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
-                        CLIENT_ID cid = {};
-                        cid.UniqueProcess = pid;
-                        HANDLE hProc = nullptr;
-                        NTSTATUS term_st = _ZwOpenProcess(&hProc, PROCESS_TERMINATE, &oa, &cid);
-                        if (NT_SUCCESS(term_st) && hProc) {
-                            _ZwTerminateProcess(hProc, STATUS_ACCESS_DENIED);
-                            _ZwClose(hProc);
-                            SN_LOG("object_guard::scan: terminated dump tool pid=%llu",
-                                (UINT64)(ULONG_PTR)pid);
-                        }
+                    if (_InterlockedCompareExchange(&g_kill_work_queued, 1, 0) == 0) {
+                        g_pending_kill_pid = (UINT64)(ULONG_PTR)pid;
+                        ExInitializeWorkItem(&g_kill_work_item, kill_work_item_callback, nullptr);
+                        _ExQueueWorkItem(&g_kill_work_item, DelayedWorkQueue);
                     }
 
 

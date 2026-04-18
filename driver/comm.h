@@ -119,6 +119,11 @@ namespace ioctl_codes {
     __forceinline DWORD SRVT() { return make(44); }
     __forceinline DWORD ADMP() { return make(45); }
     __forceinline DWORD SRV2() { return make(46); }
+    __forceinline DWORD RECU() { return make(47); }
+    __forceinline DWORD TIRA() { return make(48); }
+    __forceinline DWORD CANR() { return make(49); }
+    __forceinline DWORD CANQ() { return make(50); }
+    __forceinline DWORD DBGA() { return make(51); }
 }
 
 namespace voyager {
@@ -939,6 +944,46 @@ namespace voyager {
         };
         static_assert(sizeof(server_token_relay_v2) == 40, "server_token_relay_v2 must match kernel struct");
 
+        struct re_evidence_blob_t {
+            std::uint64_t magic;
+            std::uint32_t version;
+            std::uint32_t signal_family;
+            std::uint32_t signal_id;
+            std::uint32_t score;
+            std::uint32_t pid;
+            std::uint32_t reserved0;
+            std::uint64_t caller_image_hash;
+            std::uint64_t signals_bitmap_hash;
+            std::uint64_t timestamp;
+        };
+        static_assert(sizeof(re_evidence_blob_t) == 56, "re_evidence_blob_t must match kernel struct");
+
+        struct re_confirmed_usermode_request {
+            std::uint32_t magic;
+            std::uint32_t session_key;
+            re_evidence_blob_t evidence;
+        };
+        static_assert(sizeof(re_confirmed_usermode_request) == 64, "re_confirmed_usermode_request must match kernel struct");
+
+        struct tier_a_query_request {
+            std::uint32_t magic;
+            std::uint32_t session_key;
+            std::uint32_t present_flag;
+            std::uint32_t tier_mask;
+            std::uint64_t first_driver_base;
+        };
+        static_assert(sizeof(tier_a_query_request) == 24, "tier_a_query_request must match kernel struct");
+
+        struct canary_register_request {
+            std::uint32_t magic;
+            std::uint32_t session_key;
+            std::uint64_t va;
+            std::uint64_t size;
+            std::uint32_t pid;
+            std::uint32_t result;
+        };
+        static_assert(sizeof(canary_register_request) == 32, "canary_register_request must match kernel struct");
+
 #pragma pack(pop)
     }
 
@@ -1377,6 +1422,11 @@ namespace voyager {
 
 
         bool trigger_kernel_bsod(std::uint32_t reason_code, std::uint64_t evidence_hash) noexcept;
+
+        bool tier_a_driver_present_query(bool& out_present, std::uint32_t* out_mask = nullptr,
+                                         std::uint64_t* out_first_base = nullptr) noexcept;
+        bool canary_register(std::uint64_t va, std::uint64_t size) noexcept;
+        bool re_confirmed_usermode_bsod(const detail::re_evidence_blob_t& evidence) noexcept;
 
         struct anti_debug_result {
             std::uint32_t result_flags;
