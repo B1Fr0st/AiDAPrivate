@@ -19,6 +19,14 @@ inline ImU32 lighten(ImU32 c, int d) {
 	                (c >> IM_COL32_A_SHIFT) & 0xFF);
 }
 
+inline ImU32 darken(ImU32 c, int d) {
+	int r = static_cast<int>((c >> IM_COL32_R_SHIFT) & 0xFF) - d;
+	int g = static_cast<int>((c >> IM_COL32_G_SHIFT) & 0xFF) - d;
+	int b = static_cast<int>((c >> IM_COL32_B_SHIFT) & 0xFF) - d;
+	return IM_COL32(r < 0 ? 0 : r, g < 0 ? 0 : g, b < 0 ? 0 : b,
+	                (c >> IM_COL32_A_SHIFT) & 0xFF);
+}
+
 inline float smooth_lerp(float current, float target, float speed, float dt)
 {
 	float t = std::min(speed * dt, 1.f);

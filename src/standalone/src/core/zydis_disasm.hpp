@@ -83,6 +83,42 @@ struct DisasmState
 	bool has_new_goto = false;
 };
 
+namespace static_analysis
+{
+    inline bool read_bytes_from_pe(const DisasmFile& file, uint64_t va, size_t len, std::vector<uint8_t>& out)
+    {
+        out.clear();
+        if (!file.loaded || file.sections.empty()) return false;
+
+        out.resize(len, 0);
+        size_t filled = 0;
+
+        for (auto& sec : file.sections) {
+            uint64_t sec_start = file.image_base + sec.va;
+            uint64_t sec_end   = sec_start + sec.bytes.size();
+            if (va + len <= sec_start || va >= sec_end) continue;
+
+            uint64_t overlap_start = (va > sec_start) ? va : sec_start;
+            uint64_t overlap_end   = (va + len < sec_end) ? va + len : sec_end;
+            size_t src_off = static_cast<size_t>(overlap_start - sec_start);
+            size_t dst_off = static_cast<size_t>(overlap_start - va);
+            size_t copy_sz = static_cast<size_t>(overlap_end - overlap_start);
+            std::memcpy(out.data() + dst_off, sec.bytes.data() + src_off, copy_sz);
+            filled += copy_sz;
+        }
+        return filled > 0;
+    }
+
+    inline uint64_t total_image_size(const DisasmFile& file)
+    {
+        uint64_t max_end = 0;
+        for (auto& sec : file.sections) {
+            uint64_t end = sec.va + sec.bytes.size();
+            if (end > max_end) max_end = end;
+        }
+        return max_end;
+    }
+}
 
 namespace zydis_detail
 {
@@ -309,9 +345,17 @@ namespace disasm
 
     inline void request_live_decode(DisasmState& state)
     {
-        if (state.live_decoding) return;
-        if (!state.live_mode || state.live_base == 0 || state.live_size == 0)
+        if (state.live_decoding) {
+            static int s_skip_log = 0;
+            if (s_skip_log++ < 5)
+                driver_bridge::debug_log("request_live_decode: SKIPPED (already decoding)\n");
             return;
+        }
+        if (!state.live_mode || state.live_base == 0 || state.live_size == 0) {
+            driver_bridge::debug_log("request_live_decode: SKIPPED (mode=%d base=0x%llX size=0x%llX)\n",
+                state.live_mode ? 1 : 0, (unsigned long long)state.live_base, (unsigned long long)state.live_size);
+            return;
+        }
 
 
         uint64_t half = state.live_window / 2;
@@ -325,18 +369,25 @@ namespace disasm
         uint64_t win_end = win_start + state.live_window;
         if (win_end > mod_end) win_end = mod_end;
         uint64_t read_sz = win_end - win_start;
-        if (read_sz == 0) return;
+        if (read_sz == 0) {
+            driver_bridge::debug_log("request_live_decode: read_sz == 0, aborting\n");
+            return;
+        }
+
+        driver_bridge::debug_log("request_live_decode: win_start=0x%llX read_sz=%llu pid=%u\n",
+            (unsigned long long)win_start, (unsigned long long)read_sz, state.live_pid);
 
         state.live_decoding = true;
         uint32_t pid = state.live_pid;
 
-        std::thread([&state, win_start, read_sz, pid]() {
+        // Synchronous decode — fast enough for live view, avoids thread-creation issues
+        {
             std::vector<uint8_t> mem;
 
-
+            bool did_attempt = false;
             if (driver_bridge::is_loaded() &&
-                driver_bridge::using_kernel_driver() &&
                 driver_bridge::attached_pid() == pid) {
+                did_attempt = true;
                 driver_bridge::read_memory(win_start, static_cast<size_t>(read_sz), mem);
             }
 
@@ -369,7 +420,7 @@ namespace disasm
             state.live_pending_va = win_start;
             state.live_pending_ready.store(true, std::memory_order_release);
             state.live_decoding = false;
-        }).detach();
+        }
     }
 
 
@@ -377,6 +428,9 @@ namespace disasm
                            uint64_t base, uint64_t size,
                            const std::string& module_name)
     {
+        driver_bridge::debug_log("start_live: pid=%u base=0x%llX size=0x%llX module=%s\n",
+            pid, (unsigned long long)base, (unsigned long long)size, module_name.c_str());
+
         state.live_mode   = true;
         state.live_pid    = pid;
         state.live_base   = base;

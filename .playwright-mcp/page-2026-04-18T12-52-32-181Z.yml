@@ -1,0 +1,36 @@
+- generic [active] [ref=e1]:
+  - navigation [ref=e2]:
+    - link "VERGILIUS" [ref=e3] [cursor=pointer]:
+      - /url: /
+    - list [ref=e5]:
+      - listitem [ref=e6]:
+        - link "HOME" [ref=e7] [cursor=pointer]:
+          - /url: /
+      - listitem [ref=e8]:
+        - button "KERNELS" [ref=e9] [cursor=pointer]
+      - listitem [ref=e10]:
+        - link "ABOUT" [ref=e11] [cursor=pointer]:
+          - /url: /about
+  - generic [ref=e13]:
+    - heading "- Houston, we have a problem..." [level=2] [ref=e17]
+    - heading "Page not found" [level=1] [ref=e21]
+    - heading "404" [level=1] [ref=e25]
+  - contentinfo [ref=e26]:
+    - generic [ref=e28]:
+      - generic [ref=e29]:
+        - link "Terms of Service" [ref=e30] [cursor=pointer]:
+          - /url: /terms
+          - strong [ref=e31]: Terms of Service
+        - text: "|"
+        - link "Privacy Policy" [ref=e32] [cursor=pointer]:
+          - /url: /privacy
+          - strong [ref=e33]: Privacy Policy
+        - text: "|"
+        - link "Report a Bug" [ref=e34] [cursor=pointer]:
+          - /url: https://github.com/VergiliusProject/vergilius-project/issues
+          - strong [ref=e35]: Report a Bug
+        - text: "| © 2018-2025 Copyright"
+        - link "VergiliusProject" [ref=e36] [cursor=pointer]:
+          - /url: https://github.com/VergiliusProject
+          - strong [ref=e37]: VergiliusProject
+      - generic [ref=e38]: revision 24c124f

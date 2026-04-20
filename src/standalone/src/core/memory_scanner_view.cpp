@@ -17,6 +17,7 @@ namespace memory_scanner_view {
 
 static bool row_hover(ImDrawList* dl, float x0, float y0, float x1, float y1,
 					  float alpha, bool selected, float ar, float ag, float ab) {
+	const auto& _t = themes::resolved;
 	bool hov = ImGui::IsMouseHoveringRect(ImVec2(x0, y0), ImVec2(x1, y1), false);
 	if (selected) {
 		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
@@ -34,7 +35,7 @@ static bool row_hover(ImDrawList* dl, float x0, float y0, float x1, float y1,
 		}
 	} else if (hov) {
 		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
-			IM_COL32(255, 255, 255, static_cast<int>(10*alpha)), 3.f);
+			ui_anim::theme_alpha(_t.panel_header, alpha), 3.f);
 		dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + 2.f, y1),
 			IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
 					 static_cast<int>(ab*255), static_cast<int>(80*alpha)));
@@ -48,14 +49,19 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a,
 	auto& sc = memory_scanner::g_state;
 	auto& ui = g_ui;
 
-	ImU32 text_col  = IM_COL32(210, 215, 225, static_cast<int>(220*a));
-	ImU32 dim_col   = IM_COL32(140, 145, 155, static_cast<int>(160*a));
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
+
+	ImU32 text_col  = _ta(_t.text_primary);
+	ImU32 dim_col   = _ta(_t.text_secondary);
 	ImU32 ac_col    = IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
 								static_cast<int>(ab*255), static_cast<int>(220*a));
 
 	ui_anim::render_toolbar(dl, ox, oy, w, 34.f, a, ar, ag, ab);
 	dl->AddLine(ImVec2(ox, oy + 34.f), ImVec2(ox + w, oy + 34.f),
-		IM_COL32(60, 65, 75, static_cast<int>(80*a)));
+		_ta(ui_anim::lighten(_t.panel_bg, 12)));
 
 	float pad = 8.f;
 	float cy = oy + pad;
@@ -64,9 +70,9 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a,
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 	ImGui::PushItemWidth(90.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 32, 40, static_cast<int>(180*a)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
 	ImGui::PushStyleColor(ImGuiCol_Text, text_col);
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, IM_COL32(25, 27, 35, static_cast<int>(240*a)));
+	ImGui::PushStyleColor(ImGuiCol_PopupBg, _ta(_t.panel_bg));
 	if (ImGui::BeginCombo("##vtype", memory_scanner::value_type_name(sc.config.value_type))) {
 		for (int i = 0; i < static_cast<int>(memory_scanner::value_type_t::COUNT); ++i) {
 			auto vt = static_cast<memory_scanner::value_type_t>(i);
@@ -83,9 +89,9 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a,
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 	ImGui::PushItemWidth(120.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 32, 40, static_cast<int>(180*a)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
 	ImGui::PushStyleColor(ImGuiCol_Text, text_col);
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, IM_COL32(25, 27, 35, static_cast<int>(240*a)));
+	ImGui::PushStyleColor(ImGuiCol_PopupBg, _ta(_t.panel_bg));
 	if (ImGui::BeginCombo("##smode", memory_scanner::scan_mode_name(sc.config.scan_mode))) {
 		for (int i = 0; i < static_cast<int>(memory_scanner::scan_mode_t::COUNT); ++i) {
 			auto sm = static_cast<memory_scanner::scan_mode_t>(i);
@@ -109,7 +115,7 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a,
 	if (needs_value) {
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		ImGui::PushItemWidth(140.f);
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 32, 40, static_cast<int>(180*a)));
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
 		ImGui::PushStyleColor(ImGuiCol_Text, text_col);
 		ImGui::InputText("##val", ui.value_buf, sizeof(ui.value_buf));
 		ImGui::PopStyleColor(2);
@@ -123,7 +129,7 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a,
 		cx += 22.f;
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		ImGui::PushItemWidth(100.f);
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 32, 40, static_cast<int>(180*a)));
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
 		ImGui::PushStyleColor(ImGuiCol_Text, text_col);
 		ImGui::InputText("##val2", ui.value_buf2, sizeof(ui.value_buf2));
 		ImGui::PopStyleColor(2);
@@ -133,7 +139,7 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a,
 
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 32, 40, static_cast<int>(180*a)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
 	ImGui::PushStyleColor(ImGuiCol_CheckMark, ac_col);
 	ImGui::Checkbox("Hex##shex", &sc.config.hex_input);
 	ImGui::PopStyleColor(2);
@@ -181,7 +187,7 @@ static void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a,
 		float ring_cx = cx + ring_r + 2.f;
 		float ring_cy = cy + 11.f;
 		ui_anim::render_progress_ring(dl, ring_cx, ring_cy, ring_r, 2.5f, prog,
-			IM_COL32(30, 32, 40, static_cast<int>(120*a)), ac_col);
+			_ta(_t.panel_bg), ac_col);
 		char pct_buf[8];
 		snprintf(pct_buf, sizeof(pct_buf), "%d%%", static_cast<int>(prog * 100.f));
 		ImVec2 pct_sz = ImGui::CalcTextSize(pct_buf);
@@ -208,14 +214,22 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 	auto& sc = memory_scanner::g_state;
 	auto& ui = g_ui;
 
-	ImU32 text_col  = IM_COL32(210, 215, 225, static_cast<int>(210*a));
-	ImU32 dim_col   = IM_COL32(140, 145, 155, static_cast<int>(150*a));
-	ImU32 addr_col  = IM_COL32(130, 170, 255, static_cast<int>(220*a));
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
+
+	ImU32 text_col  = _ta(_t.text_primary);
+	ImU32 dim_col   = _ta(_t.text_secondary);
+	ImU32 addr_col  = _ta(ui_anim::lighten(_t.text_secondary, 30));
 	ImU32 val_col   = IM_COL32(180, 220, 160, static_cast<int>(220*a));
-	ImU32 prev_col  = IM_COL32(180, 160, 130, static_cast<int>(180*a));
+	ImU32 prev_col  = _ta(_t.text_dim);
 
 	float row_h = 20.f;
 	float hdr_h = 22.f;
+
+	static float result_row_anim_time = 0.f;
+	result_row_anim_time += ImGui::GetIO().DeltaTime;
 
 	float col_addr_w = 130.f;
 	float col_val_w  = 120.f;
@@ -259,9 +273,7 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 	float max_scroll = std::max(0.f, static_cast<float>(total) * row_h - body_h);
 	ui.result_target_scroll_y = std::clamp(ui.result_target_scroll_y, 0.f, max_scroll);
 	float rdt = ImGui::GetIO().DeltaTime;
-	ui.result_scroll_y += (ui.result_target_scroll_y - ui.result_scroll_y) * std::min(20.f * rdt, 1.f);
-	if (std::abs(ui.result_target_scroll_y - ui.result_scroll_y) < 0.5f)
-		ui.result_scroll_y = ui.result_target_scroll_y;
+	ui_anim::smooth_scroll(ui.result_scroll_y, ui.result_target_scroll_y, 20.f, rdt);
 
 	int first_row = static_cast<int>(ui.result_scroll_y / row_h);
 	int last_row = std::min(total, first_row + visible_rows + 2);
@@ -272,10 +284,17 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 		float ry = body_y + static_cast<float>(i) * row_h - ui.result_scroll_y;
 		if (ry + row_h < body_y || ry > body_y + body_h) continue;
 
+		float row_entrance = ui_anim::render_row_entrance(i - first_row, result_row_anim_time, 0.015f);
 		bool sel = (ui.selected_result == i);
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + row_h), false);
-		ui_anim::render_table_row(dl, ox, ry, w, row_h,
-			{sel, hov, i, a, 1.f, ar, ag, ab});
+		ui_anim::table_row_style_t rrs{};
+		rrs.selected = sel;
+		rrs.hovered = hov;
+		rrs.index = i;
+		rrs.alpha = a;
+		rrs.entrance = row_entrance;
+		rrs.ar = ar; rrs.ag = ag; rrs.ab = ab;
+		ui_anim::render_table_row(dl, ox, ry, w, row_h, rrs);
 
 		auto& r = sc.results[static_cast<size_t>(i)];
 
@@ -324,18 +343,9 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 		float sb_w = 6.f;
 		float sb_x = ox + w - sb_w - 2.f;
 		float content_total = static_cast<float>(total) * row_h;
-		float ratio = body_h / content_total;
-		float thumb_h = std::max(20.f, body_h * ratio);
-		float track_h = body_h - thumb_h;
-		float thumb_y = body_y + (max_scroll > 0.f ? (ui.result_scroll_y / max_scroll) * track_h : 0.f);
-		dl->AddRectFilled(ImVec2(sb_x, body_y), ImVec2(sb_x + sb_w, body_y + body_h),
-			IM_COL32(20, 22, 28, static_cast<int>(60*a)), 3.f);
-		bool sb_hov = ImGui::IsMouseHoveringRect(ImVec2(sb_x, thumb_y), ImVec2(sb_x + sb_w, thumb_y + thumb_h));
-		ImU32 sb_col = sb_hov
-			? IM_COL32(static_cast<int>(ar*180), static_cast<int>(ag*180), static_cast<int>(ab*180), static_cast<int>(200*a))
-			: IM_COL32(80, 85, 95, static_cast<int>(140*a));
-		dl->AddRectFilled(ImVec2(sb_x, thumb_y), ImVec2(sb_x + sb_w, thumb_y + thumb_h),
-			sb_col, 3.f);
+		ui_anim::render_custom_scrollbar(dl, sb_x, body_y, sb_w, body_h,
+			ui.result_scroll_y, content_total, body_h,
+			a, ui.result_sb_dragging, ui.result_sb_drag_offset);
 	}
 
 	if (total == 0) {
@@ -343,14 +353,14 @@ static void render_results(ImDrawList* dl, float ox, float oy, float w, float h,
 		float cy = body_y + body_h * 0.5f;
 		float t = static_cast<float>(ImGui::GetTime());
 		float pulse = std::sin(t * 2.f) * 0.3f + 0.7f;
-		ImU32 empty_col = IM_COL32(100, 100, 120, static_cast<int>(100 * a * pulse));
+		ImU32 empty_col = ui_anim::theme_alpha(_t.text_dim, a * pulse);
 		const char* msg = sc.has_initial_scan ? "No results" : "Start a scan to find values";
 		ImVec2 ts = ImGui::CalcTextSize(msg);
 		dl->AddText(ImVec2(cx - ts.x * 0.5f, cy - ts.y * 0.5f), empty_col, msg);
 		if (!sc.has_initial_scan) {
-			ui_anim::render_spinner(dl, cx, cy + 24.f, 6.f, 1.5f,
-				IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
-						 static_cast<int>(ab*255), static_cast<int>(60*a)), t);
+			ImU32 spinner_col = IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
+					 static_cast<int>(ab*255), static_cast<int>(60*a));
+			ui_anim::render_spinner(dl, cx, cy + 24.f, 6.f, 1.5f, spinner_col, t);
 		}
 	}
 }
@@ -361,9 +371,14 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 	auto& sc = memory_scanner::g_state;
 	auto& ui = g_ui;
 
-	ImU32 text_col  = IM_COL32(210, 215, 225, static_cast<int>(210*a));
-	ImU32 dim_col   = IM_COL32(140, 145, 155, static_cast<int>(150*a));
-	ImU32 addr_col  = IM_COL32(130, 170, 255, static_cast<int>(220*a));
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
+
+	ImU32 text_col  = _ta(_t.text_primary);
+	ImU32 dim_col   = _ta(_t.text_secondary);
+	ImU32 addr_col  = _ta(ui_anim::lighten(_t.text_secondary, 30));
 	ImU32 val_col   = IM_COL32(180, 220, 160, static_cast<int>(220*a));
 	ImU32 freeze_col = IM_COL32(255, 140, 80, static_cast<int>(220*a));
 
@@ -384,13 +399,29 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 					   static_cast<int>(ab*255), static_cast<int>(200*a))
 			: dim_col;
 		bool ar_hov = ImGui::IsMouseHoveringRect(ImVec2(arx, oy), ImVec2(arx + arts.x + 8.f, oy + hdr_h), false);
-		dl->AddText(ImVec2(arx, oy + 3.f), ar_hov ? IM_COL32(255,255,255,static_cast<int>(230*a)) : arc, ar_label);
+		dl->AddText(ImVec2(arx, oy + 3.f), ar_hov ? _ta(_t.text_primary) : arc, ar_label);
 		if (ar_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			ui.auto_refresh = !ui.auto_refresh;
 	}
 
-	float body_y = oy + hdr_h;
-	float body_h = h - hdr_h;
+	float col_freeze_w = 40.f;
+	float col_desc_w   = 150.f;
+	float col_addr_w   = 130.f;
+	float col_type_w   = 80.f;
+	float col_val_w    = w - col_freeze_w - col_desc_w - col_addr_w - col_type_w;
+	if (col_val_w < 60.f) col_val_w = 60.f;
+
+	float tbl_hdr_h = 20.f;
+	{
+		ui_anim::table_col_t addr_hdr_cols[] = {
+			{"Freeze", col_freeze_w}, {"Description", col_desc_w},
+			{"Address", col_addr_w}, {"Type", col_type_w}, {"Value", col_val_w}
+		};
+		ui_anim::render_table_header(dl, ox, oy + hdr_h, w, tbl_hdr_h, addr_hdr_cols, 5, ar, ag, ab, a);
+	}
+
+	float body_y = oy + hdr_h + tbl_hdr_h;
+	float body_h = h - hdr_h - tbl_hdr_h;
 	int visible_rows = static_cast<int>(body_h / row_h);
 	if (visible_rows < 1) visible_rows = 1;
 
@@ -409,19 +440,10 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 	float max_scroll = std::max(0.f, static_cast<float>(total) * row_h - body_h);
 	ui.address_target_scroll_y = std::clamp(ui.address_target_scroll_y, 0.f, max_scroll);
 	float adt = ImGui::GetIO().DeltaTime;
-	ui.address_scroll_y += (ui.address_target_scroll_y - ui.address_scroll_y) * std::min(20.f * adt, 1.f);
-	if (std::abs(ui.address_target_scroll_y - ui.address_scroll_y) < 0.5f)
-		ui.address_scroll_y = ui.address_target_scroll_y;
+	ui_anim::smooth_scroll(ui.address_scroll_y, ui.address_target_scroll_y, 20.f, adt);
 
 	int first_row = static_cast<int>(ui.address_scroll_y / row_h);
 	int last_row = std::min(total, first_row + visible_rows + 2);
-
-	float col_freeze_w = 40.f;
-	float col_desc_w   = 150.f;
-	float col_addr_w   = 130.f;
-	float col_type_w   = 80.f;
-	float col_val_w    = w - col_freeze_w - col_desc_w - col_addr_w - col_type_w;
-	if (col_val_w < 60.f) col_val_w = 60.f;
 
 	ImGui::PushClipRect(ImVec2(ox, body_y), ImVec2(ox + w, body_y + body_h), true);
 
@@ -456,7 +478,7 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 					static_cast<float>(ImGui::GetTime()) * 2.36f, true);
 			} else {
 				ui_anim::render_status_dot(dl, dot_cx, dot_cy, 3.f,
-					IM_COL32(80, 80, 95, static_cast<int>(120*a)),
+					_ta(_t.text_dim),
 					0.f, false);
 			}
 			bool cb_hov = ImGui::IsMouseHoveringRect(ImVec2(cb_x - 2, cb_y - 2),
@@ -505,18 +527,9 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 		float sb_w = 6.f;
 		float sb_x = ox + w - sb_w - 2.f;
 		float content_total = static_cast<float>(total) * row_h;
-		float ratio = body_h / content_total;
-		float thumb_h = std::max(20.f, body_h * ratio);
-		float track_h = body_h - thumb_h;
-		float thumb_y = body_y + (max_scroll > 0.f ? (ui.address_scroll_y / max_scroll) * track_h : 0.f);
-		dl->AddRectFilled(ImVec2(sb_x, body_y), ImVec2(sb_x + sb_w, body_y + body_h),
-			IM_COL32(20, 22, 28, static_cast<int>(60*a)), 3.f);
-		bool sb_hov = ImGui::IsMouseHoveringRect(ImVec2(sb_x, thumb_y), ImVec2(sb_x + sb_w, thumb_y + thumb_h));
-		ImU32 sb_col = sb_hov
-			? IM_COL32(static_cast<int>(ar*180), static_cast<int>(ag*180), static_cast<int>(ab*180), static_cast<int>(200*a))
-			: IM_COL32(80, 85, 95, static_cast<int>(140*a));
-		dl->AddRectFilled(ImVec2(sb_x, thumb_y), ImVec2(sb_x + sb_w, thumb_y + thumb_h),
-			sb_col, 3.f);
+		ui_anim::render_custom_scrollbar(dl, sb_x, body_y, sb_w, body_h,
+			ui.address_scroll_y, content_total, body_h,
+			a, ui.address_sb_dragging, ui.address_sb_drag_offset);
 	}
 
 	if (total == 0) {
@@ -525,7 +538,7 @@ static void render_address_list(ImDrawList* dl, float ox, float oy, float w, flo
 		float t = static_cast<float>(ImGui::GetTime());
 		float pulse = std::sin(t * 1.8f) * 0.3f + 0.7f;
 		dl->AddText(ImVec2(cx - 80.f, cy),
-			IM_COL32(100, 100, 120, static_cast<int>(100*a*pulse)),
+			ui_anim::theme_alpha(_t.text_dim, a * pulse),
 			"Double-click a result to add");
 	}
 
@@ -552,9 +565,13 @@ void render(float pos_x, float pos_y, float width, float height,
 	float h = height;
 	float a = alpha;
 
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h),
-		IM_COL32(18, 20, 26, static_cast<int>(240*a)));
+		_ta(_t.bg_base));
 
 
 	auto& ui = g_ui;

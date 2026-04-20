@@ -68,9 +68,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float ty = cy + 8.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(tx, ty));
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(alpha * 220)));
-	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(alpha * 120)));
-	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(210, 212, 220, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
+	ImGui::PushStyleColor(ImGuiCol_Border, _ta(ui_anim::lighten(_t.panel_bg, 12)));
+	ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 
@@ -126,7 +126,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float bar_y = ty + 4.f;
 
 		dl->AddRectFilled(ImVec2(bar_x, bar_y), ImVec2(bar_x + bar_w, bar_y + bar_h),
-		                   IM_COL32(60, 60, 60, static_cast<int>(alpha * 255)), 3.f);
+		                   _ta(ui_anim::lighten(_t.panel_bg, 12)), 3.f);
 		dl->AddRectFilled(ImVec2(bar_x, bar_y), ImVec2(bar_x + bar_w * prog, bar_y + bar_h),
 		                   accent, 3.f);
 

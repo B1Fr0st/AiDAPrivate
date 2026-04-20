@@ -295,11 +295,13 @@ namespace driver_bridge
     void set_log_callback(log_fn_t fn);
     void set_confirm_callback(confirm_fn_t fn);
     void add_pre_detach_callback(pre_detach_fn_t fn);
+    void debug_log(const char* fmt, ...);
 
     bool initialize();
     bool load_kernel_driver();
     bool is_loaded();
     bool using_kernel_driver();
+    bool can_read_memory();
     bool attach(uint32_t pid);
     bool attach_by_name(const std::string& process_name);
     void detach();
@@ -477,4 +479,43 @@ namespace driver_bridge
         std::vector<uint8_t> buffer;
     };
     std::vector<sniff_result_t> sniff_net_buffers_get(bool& active);
+
+    struct hv_kernel_detect_result_t {
+        uint8_t sidt_lock_prefix;
+        uint8_t sidt_invalid_pf;
+        uint8_t sidt_tlb_only;
+        uint8_t sidt_timing;
+        uint8_t sidt_compat_mode;
+        uint8_t sidt_noncanonical_gp;
+        uint8_t sidt_noncanonical_ss;
+        uint8_t sidt_cpl3_umip_off;
+        uint8_t sidt_cpl3_umip_on;
+
+        uint8_t lidt_lock_prefix;
+        uint8_t lidt_invalid_pf;
+        uint8_t lidt_tlb_only;
+        uint8_t lidt_timing;
+        uint8_t lidt_noncanonical_gp;
+        uint8_t lidt_noncanonical_ss;
+        uint8_t lidt_cpl3_gp;
+
+        uint8_t ve_trigger;
+        uint8_t ve_lbr_stack;
+        uint8_t ve_garbage_msr;
+        uint8_t ve_xsetbv_gp;
+        uint8_t ve_synthetic_msr;
+        uint8_t ve_cpuid_leaf_cmp;
+        uint8_t ve_rdtsc_cpuid;
+        uint8_t ve_aperf_divergence;
+        uint8_t ve_invd_cache;
+        uint8_t ve_cr4_vmxe;
+        uint8_t ve_lbr_tos;
+
+        uint8_t total_failed;
+        uint8_t total_run;
+        uint8_t ms_hv_skipped;
+
+        bool any_detected() const { return total_failed > 0; }
+    };
+    bool run_kernel_hv_detection(hv_kernel_detect_result_t& result);
 }

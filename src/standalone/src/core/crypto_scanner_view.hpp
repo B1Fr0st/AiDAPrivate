@@ -139,9 +139,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopStyleColor(4);
 	ImGui::PopStyleVar();
 
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(alpha * 220)));
-	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(alpha * 120)));
-	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(210, 212, 220, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
+	ImGui::PushStyleColor(ImGuiCol_Border, _ta(ui_anim::lighten(_t.panel_bg, 12)));
+	ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 	ImGui::PushItemWidth(180.f);
@@ -153,9 +153,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::SameLine();
 
 	const char* cats[] = {"All", "Symmetric", "Hash", "Stream Cipher", "Block Cipher", "Checksum", "Encoding", "Asymmetric"};
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(alpha * 220)));
-	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(alpha * 120)));
-	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(210, 212, 220, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
+	ImGui::PushStyleColor(ImGuiCol_Border, _ta(ui_anim::lighten(_t.panel_bg, 12)));
+	ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 	ImGui::PushItemWidth(120.f);

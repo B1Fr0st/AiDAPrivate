@@ -191,40 +191,52 @@ namespace object_guard {
     }
 
     __forceinline void scan_suspicious_handles() {
-        __try {
-            PEPROCESS initial = PsInitialSystemProcess;
-            if (!initial || !_MmIsAddressValid(initial)) return;
+        PEPROCESS initial = PsInitialSystemProcess;
+        if (!initial || !_MmIsAddressValid(initial)) return;
 
-            PLIST_ENTRY list_head = (PLIST_ENTRY)((UINT8*)initial + 0x448);
-            PLIST_ENTRY entry = list_head->Flink;
+        PLIST_ENTRY list_head = (PLIST_ENTRY)((UINT8*)initial + 0x448);
+        if (!_MmIsAddressValid(list_head)) return;
 
-            for (int iter = 0; iter < 1024 && entry != list_head; ++iter, entry = entry->Flink) {
-                PEPROCESS proc = (PEPROCESS)((UINT8*)entry - 0x448);
-                if (!_MmIsAddressValid(proc)) continue;
+        PLIST_ENTRY entry = list_head->Flink;
 
-                UCHAR* name = PsGetProcessImageFileName(proc);
-                if (!name || !_MmIsAddressValid(name)) continue;
+        for (int iter = 0; iter < 1024 && entry && entry != list_head; ++iter) {
+            if (!_MmIsAddressValid(entry))
+                break;
 
-                if (is_dump_tool_name(reinterpret_cast<const char*>(name))) {
-                    HANDLE pid = PsGetProcessId(proc);
-                    g_last_suspicious_pid = (UINT64)(ULONG_PTR)pid;
-                    InterlockedIncrement((volatile LONG*)&g_suspicious_handle_count);
-                    SN_LOG("object_guard::scan: DUMP TOOL DETECTED pid=%llu name=%.15s — TERMINATING",
-                        (UINT64)(ULONG_PTR)pid, name);
+            PLIST_ENTRY next = entry->Flink;
 
-                    if (_InterlockedCompareExchange(&g_kill_work_queued, 1, 0) == 0) {
-                        g_pending_kill_pid = (UINT64)(ULONG_PTR)pid;
-                        ExInitializeWorkItem(&g_kill_work_item, kill_work_item_callback, nullptr);
-                        _ExQueueWorkItem(&g_kill_work_item, DelayedWorkQueue);
-                    }
-
-
-                    heartbeat::send_command(heartbeat::BRIDGE_CMD_DUMP_TOOL_FOUND,
-                        static_cast<ULONG>((ULONG_PTR)pid & 0xFFFFFFFF));
-
-                    return;
-                }
+            PEPROCESS proc = (PEPROCESS)((UINT8*)entry - 0x448);
+            if (!_MmIsAddressValid(proc)) {
+                entry = next;
+                continue;
             }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+            UCHAR* name = PsGetProcessImageFileName(proc);
+            if (!name || !_MmIsAddressValid(name)) {
+                entry = next;
+                continue;
+            }
+
+            if (is_dump_tool_name(reinterpret_cast<const char*>(name))) {
+                HANDLE pid = PsGetProcessId(proc);
+                g_last_suspicious_pid = (UINT64)(ULONG_PTR)pid;
+                InterlockedIncrement((volatile LONG*)&g_suspicious_handle_count);
+                SN_LOG("object_guard::scan: DUMP TOOL DETECTED pid=%llu name=%.15s — TERMINATING",
+                    (UINT64)(ULONG_PTR)pid, name);
+
+                if (_InterlockedCompareExchange(&g_kill_work_queued, 1, 0) == 0) {
+                    g_pending_kill_pid = (UINT64)(ULONG_PTR)pid;
+                    ExInitializeWorkItem(&g_kill_work_item, kill_work_item_callback, nullptr);
+                    _ExQueueWorkItem(&g_kill_work_item, DelayedWorkQueue);
+                }
+
+                heartbeat::send_command(heartbeat::BRIDGE_CMD_DUMP_TOOL_FOUND,
+                    static_cast<ULONG>((ULONG_PTR)pid & 0xFFFFFFFF));
+
+                return;
+            }
+
+            entry = next;
+        }
     }
 }

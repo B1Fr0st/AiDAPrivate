@@ -57,16 +57,24 @@ static bool draw_row(ImDrawList* dl, float x0, float y0, float x1, float y1,
 
 static void render_column_header(ImDrawList* dl, float ox, float oy, float w,
 								 float a, float ar, float ag, float ab) {
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + HEADER_H),
-		IM_COL32(25, 27, 35, static_cast<int>(220*a)));
+		_ta(_t.panel_header));
 	ui_anim::render_gradient_header(dl, ox, oy, w, HEADER_H, ar, ag, ab, a * 0.3f);
 	dl->AddLine(ImVec2(ox, oy + HEADER_H - 1.f), ImVec2(ox + w, oy + HEADER_H - 1.f),
-		IM_COL32(60, 65, 80, static_cast<int>(120*a)));
+		_ta(ui_anim::lighten(_t.panel_bg, 12)));
 }
 
 
 static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a,
 						   float ar, float ag, float ab) {
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
 	auto& ui = g_ui;
 	float dt = ImGui::GetIO().DeltaTime;
 
@@ -77,7 +85,7 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a,
 	};
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + TAB_HEIGHT),
-		IM_COL32(22, 24, 30, static_cast<int>(240*a)));
+		_ta(_t.bg_base));
 
 	ui_anim::render_gradient_header(dl, ox, oy, w, TAB_HEIGHT, ar, ag, ab, a * 0.6f);
 
@@ -160,7 +168,7 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a,
 		ImU32 col = active
 			? IM_COL32(static_cast<int>(ar*255), static_cast<int>(ag*255),
 					   static_cast<int>(ab*255), static_cast<int>(230*a))
-			: IM_COL32(200, 205, 220, static_cast<int>(text_alpha * 255.f * a));
+			: ui_anim::theme_alpha(_t.text_primary, text_alpha * a);
 
 		dl->AddText(ImVec2(tx + (tw - ts.x) * 0.5f, ty + (th - ts.y) * 0.5f), col, tab_names[i]);
 
@@ -204,7 +212,7 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a,
 				dl->AddRectFilled(
 					ImVec2(ox + static_cast<float>(f), oy),
 					ImVec2(ox + static_cast<float>(f) + 1.f, oy + TAB_HEIGHT),
-					IM_COL32(22, 24, 30, static_cast<int>(fa * 255.f)));
+					ui_anim::theme_alpha(_t.bg_base, fa));
 			}
 		}
 
@@ -215,7 +223,7 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a,
 				dl->AddRectFilled(
 					ImVec2(ox + w - static_cast<float>(f) - 1.f, oy),
 					ImVec2(ox + w - static_cast<float>(f), oy + TAB_HEIGHT),
-					IM_COL32(22, 24, 30, static_cast<int>(fa * 255.f)));
+					ui_anim::theme_alpha(_t.bg_base, fa));
 			}
 		}
 	}
@@ -253,7 +261,7 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a,
 
 		ImU32 stealth_text_col = stealth_active
 			? IM_COL32(152, 195, 121, static_cast<int>(230*a))
-			: IM_COL32(200, 205, 220, static_cast<int>(150*a));
+			: _ta(_t.text_secondary);
 		dl->AddText(ImVec2(stealth_x + 8.f, stealth_y + (stealth_btn_h - stealth_sz.y) * 0.5f),
 		            stealth_text_col, stealth_label);
 
@@ -276,9 +284,13 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
 	float dt = ImGui::GetIO().DeltaTime;
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
 
-	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
-	ImU32 dim_col  = IM_COL32(140, 145, 155, static_cast<int>(150*a));
+	ImU32 text_col = _ta(_t.text_primary);
+	ImU32 dim_col  = _ta(_t.text_secondary);
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 	ImU32 mnem_col = IM_COL32(220, 180, 130, static_cast<int>(220*a));
 	ImU32 reg_col  = IM_COL32(180, 220, 160, static_cast<int>(220*a));
@@ -324,7 +336,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 
 	auto draw_panel_header = [&](float px, float py, float pw, const char* label) {
 		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + HEADER_H),
-			IM_COL32(25, 27, 35, static_cast<int>(220*a)));
+			_ta(_t.panel_header));
 		ui_anim::render_gradient_header(dl, px, py, pw, HEADER_H, ar, ag, ab, a * 0.35f);
 		dl->AddLine(ImVec2(px, py + HEADER_H - 1.f), ImVec2(px + pw, py + HEADER_H - 1.f),
 			IM_COL32(static_cast<int>(ar*60), static_cast<int>(ag*60),
@@ -336,7 +348,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 	{
 		float px = ox, py = oy, pw = left_w - 1.f, ph = top_h - 1.f;
 		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
-			IM_COL32(18, 20, 26, static_cast<int>(240*a)));
+			_ta(_t.bg_base));
 		draw_panel_header(px, py, pw, "Disassembly");
 
 		auto regs = debugger_engine::get_registers();
@@ -466,7 +478,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 			}
 		} else {
 			dl->AddText(ImVec2(px + pw * 0.5f - 40.f, py + ph * 0.5f),
-				IM_COL32(100, 100, 120, static_cast<int>(100*a)), "No target");
+				_ta(_t.text_dim), "No target");
 		}
 	}
 
@@ -476,7 +488,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 	{
 		float px = ox + left_w, py = oy, pw = right_w, ph = top_h - 1.f;
 		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
-			IM_COL32(20, 22, 28, static_cast<int>(240*a)));
+			_ta(_t.bg_base));
 		draw_panel_header(px, py, pw, "Registers");
 
 		auto regs = debugger_engine::get_registers();
@@ -546,7 +558,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 	{
 		float px = ox, py = oy + top_h, pw = left_w - 1.f, ph = bot_h;
 		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
-			IM_COL32(18, 20, 26, static_cast<int>(240*a)));
+			_ta(_t.bg_base));
 		draw_panel_header(px, py, pw, "Memory Dump");
 
 		uint64_t dump_addr = ui.dump_address;
@@ -585,6 +597,18 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 			float dy = py + HEADER_H;
 			ImGui::PushClipRect(ImVec2(px, dy), ImVec2(px + pw, py + ph), true);
 
+			{
+				float hhx = px + 150.f;
+				for (size_t c = 0; c < bytes_per_row; ++c) {
+					char hc[4];
+					snprintf(hc, sizeof(hc), "%X", static_cast<int>(c));
+					dl->AddText(ImVec2(hhx + 4.f, dy + 1.f), dim_col, hc);
+					hhx += 22.f;
+					if (c == 7) hhx += 6.f;
+				}
+				dy += ROW_HEIGHT;
+			}
+
 			for (int r = 0; r < rows && r * static_cast<int>(bytes_per_row) < static_cast<int>(buf.size()); ++r) {
 				float ry = dy + static_cast<float>(r) * ROW_HEIGHT;
 
@@ -619,7 +643,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 						? static_cast<char>(buf[off + b]) : '.';
 					char cbuf[2] = {ch, 0};
 					dl->AddText(ImVec2(ax, ry + 1.f),
-						IM_COL32(170, 170, 180, static_cast<int>(160*a)), cbuf);
+						_ta(_t.text_secondary), cbuf);
 					ax += 8.f;
 				}
 			}
@@ -635,7 +659,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h,
 	{
 		float px = ox + left_w, py = oy + top_h, pw = right_w, ph = bot_h;
 		dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph),
-			IM_COL32(20, 22, 28, static_cast<int>(240*a)));
+			_ta(_t.bg_base));
 		draw_panel_header(px, py, pw, "Stack");
 		auto regs = debugger_engine::get_registers();
 		uint64_t rsp = regs.rsp;
@@ -682,9 +706,13 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 							   float a, float ar, float ag, float ab) {
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
 
-	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
-	ImU32 dim_col  = IM_COL32(140, 145, 155, static_cast<int>(150*a));
+	ImU32 text_col = _ta(_t.text_primary);
+	ImU32 dim_col  = _ta(_t.text_secondary);
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
 	ImU32 en_col   = IM_COL32(100, 220, 120, static_cast<int>(220*a));
 	ImU32 dis_col  = IM_COL32(220, 100, 100, static_cast<int>(220*a));
@@ -703,7 +731,8 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 		bool sel = (ui.list_selected == i);
 
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, ar, ag, ab});
+		float row_a = ui_anim::render_row_entrance(i, 0, ImGui::GetIO().DeltaTime, a);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, row_a, 1.f, ar, ag, ab});
 
 		char ibuf[8];
 		snprintf(ibuf, sizeof(ibuf), "%d", i);
@@ -732,7 +761,7 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 		static const char* type_names[] = {"SW", "HW_EXEC", "HW_WRITE", "HW_READ", "MEM"};
 		ui_anim::render_badge(dl, type_names[static_cast<int>(bp.type)],
 			ox + 240.f, ry + 2.f,
-			IM_COL32(40, 42, 55, static_cast<int>(180*a)), dim_col);
+			_ta(_t.panel_bg), dim_col);
 
 		if (!bp.name.empty())
 			dl->AddText(ImVec2(ox + 320.f, ry + 2.f), text_col, bp.name.c_str());
@@ -743,6 +772,15 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 			debugger_engine::toggle_breakpoint(i);
 
 		ry += ROW_HEIGHT;
+	}
+
+	float total_content = static_cast<float>(st.breakpoints.size()) * ROW_HEIGHT;
+	float visible_h = h - HEADER_H;
+	if (total_content > visible_h) {
+		static bool bp_scrollbar_dragging = false;
+		static float bp_scrollbar_offset = 0.f;
+		ui_anim::render_custom_scrollbar(dl, ox + w - 8.f, oy + HEADER_H, 8.f, visible_h,
+			ui.bp_scroll_y, total_content, visible_h, a, bp_scrollbar_dragging, bp_scrollbar_offset);
 	}
 
 	if (st.breakpoints.empty())
@@ -756,10 +794,14 @@ static void render_memmap(ImDrawList* dl, float ox, float oy, float w, float h,
 						  float a, float ar, float ag, float ab) {
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
 
-	ImU32 dim_col  = IM_COL32(140, 145, 155, static_cast<int>(150*a));
+	ImU32 dim_col  = _ta(_t.text_secondary);
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
-	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
+	ImU32 text_col = _ta(_t.text_primary);
 
 	{
 		ui_anim::table_col_t cols[] = {{"Base", 142.f}, {"Size", 90.f}, {"Protect", 140.f}, {"Module", 200.f}};
@@ -835,10 +877,14 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 							 float a, float ar, float ag, float ab) {
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
 
-	ImU32 dim_col  = IM_COL32(140, 145, 155, static_cast<int>(150*a));
+	ImU32 dim_col  = _ta(_t.text_secondary);
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
-	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
+	ImU32 text_col = _ta(_t.text_primary);
 
 	{
 		ui_anim::table_col_t cols[] = {{"#", 22.f}, {"Address", 150.f}, {"Module", 200.f}};
@@ -853,7 +899,8 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 		auto& f = st.call_stack[static_cast<size_t>(i)];
 		bool sel = (ui.list_selected == i);
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, ar, ag, ab});
+		float row_a = ui_anim::render_row_entrance(i, 0, ImGui::GetIO().DeltaTime, a);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, row_a, 1.f, ar, ag, ab});
 
 		char ibuf[8];
 		snprintf(ibuf, sizeof(ibuf), "%d", i);
@@ -876,6 +923,15 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 
 		ry += ROW_HEIGHT;
 	}
+
+	float total_content = static_cast<float>(st.call_stack.size()) * ROW_HEIGHT;
+	float visible_h = h - HEADER_H;
+	if (total_content > visible_h) {
+		static bool cs_scrollbar_dragging = false;
+		static float cs_scrollbar_offset = 0.f;
+		ui_anim::render_custom_scrollbar(dl, ox + w - 8.f, oy + HEADER_H, 8.f, visible_h,
+			ui.callstack_scroll_y, total_content, visible_h, a, cs_scrollbar_dragging, cs_scrollbar_offset);
+	}
 }
 
 
@@ -883,9 +939,13 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 						   float a, float ar, float ag, float ab) {
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
 
-	ImU32 dim_col  = IM_COL32(140, 145, 155, static_cast<int>(150*a));
-	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
+	ImU32 dim_col  = _ta(_t.text_secondary);
+	ImU32 text_col = _ta(_t.text_primary);
 	ImU32 val_col  = IM_COL32(180, 220, 160, static_cast<int>(220*a));
 
 	{
@@ -901,7 +961,8 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 		auto& w_entry = st.watches[static_cast<size_t>(i)];
 		bool sel = (ui.list_selected == i);
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, ar, ag, ab});
+		float row_a = ui_anim::render_row_entrance(i, 0, ImGui::GetIO().DeltaTime, a);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, row_a, 1.f, ar, ag, ab});
 
 		dl->AddText(ImVec2(ox + 6.f, ry + 1.f), text_col, w_entry.expression.c_str());
 		dl->AddText(ImVec2(ox + 200.f, ry + 1.f),
@@ -913,6 +974,15 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 
 		ry += ROW_HEIGHT;
 	}
+
+	float total_content = static_cast<float>(st.watches.size()) * ROW_HEIGHT;
+	float visible_h = h - HEADER_H;
+	if (total_content > visible_h) {
+		static bool watch_scrollbar_dragging = false;
+		static float watch_scrollbar_offset = 0.f;
+		ui_anim::render_custom_scrollbar(dl, ox + w - 8.f, oy + HEADER_H, 8.f, visible_h,
+			ui.watch_scroll_y, total_content, visible_h, a, watch_scrollbar_dragging, watch_scrollbar_offset);
+	}
 }
 
 
@@ -920,10 +990,14 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h,
 						 float a, float ar, float ag, float ab) {
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
 
-	ImU32 dim_col  = IM_COL32(140, 145, 155, static_cast<int>(150*a));
+	ImU32 dim_col  = _ta(_t.text_secondary);
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
-	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
+	ImU32 text_col = _ta(_t.text_primary);
 
 	{
 		ui_anim::table_col_t cols[] = {{"#", 42.f}, {"Address", 150.f}, {"Instruction", 200.f}};
@@ -975,7 +1049,8 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h,
 		auto& tr = st.trace_log[static_cast<size_t>(i)];
 		bool sel = (ui.trace_selected == i);
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, ar, ag, ab});
+		float row_a = ui_anim::render_row_entrance(i, first, ImGui::GetIO().DeltaTime, a);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, row_a, 1.f, ar, ag, ab});
 
 		char ibuf[12];
 		snprintf(ibuf, sizeof(ibuf), "%d", tr.index);
@@ -1003,10 +1078,14 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 						   float a, float ar, float ag, float ab) {
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
 
-	ImU32 dim_col  = IM_COL32(140, 145, 155, static_cast<int>(150*a));
+	ImU32 dim_col  = _ta(_t.text_secondary);
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
-	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
+	ImU32 text_col = _ta(_t.text_primary);
 
 	{
 		ui_anim::table_col_t cols[] = {{"Address", 142.f}, {"String", 400.f}, {"Module", 100.f}};
@@ -1040,7 +1119,8 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 		auto& sr = st.strings[static_cast<size_t>(i)];
 		bool sel = (ui.strings_selected == i);
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, ar, ag, ab});
+		float row_a = ui_anim::render_row_entrance(i, first, ImGui::GetIO().DeltaTime, a);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, row_a, 1.f, ar, ag, ab});
 
 		char abuf[20];
 		snprintf(abuf, sizeof(abuf), "%016" PRIX64, sr.address);
@@ -1064,9 +1144,14 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 
 static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 						   float a, float ar, float ag, float ab) {
-	ImU32 dim_col  = IM_COL32(140, 145, 155, static_cast<int>(150*a));
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
+
+	ImU32 dim_col  = _ta(_t.text_secondary);
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
-	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
+	ImU32 text_col = _ta(_t.text_primary);
 
 	{
 		ui_anim::table_col_t cols[] = {{"TID", 72.f}, {"Owner PID", 100.f}, {"Priority", 100.f}, {"State", 100.f}};
@@ -1085,7 +1170,8 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 		auto& t = threads[ti];
 		bool sel = (g_ui.list_selected == ti);
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, ti, a, 1.f, ar, ag, ab});
+		float row_a = ui_anim::render_row_entrance(ti, 0, ImGui::GetIO().DeltaTime, a);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, ti, row_a, 1.f, ar, ag, ab});
 
 		char tbuf[12];
 		snprintf(tbuf, sizeof(tbuf), "%u", t.tid);
@@ -1111,10 +1197,14 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 							 float a, float ar, float ag, float ab) {
 	auto& st = debugger_engine::g_state;
 	auto& ui = g_ui;
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
 
-	ImU32 dim_col  = IM_COL32(140, 145, 155, static_cast<int>(150*a));
+	ImU32 dim_col  = _ta(_t.text_secondary);
 	ImU32 addr_col = IM_COL32(130, 170, 255, static_cast<int>(220*a));
-	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
+	ImU32 text_col = _ta(_t.text_primary);
 
 	{
 		ui_anim::table_col_t cols[] = {{"#", 22.f}, {"Address", 150.f}, {"Label", 200.f}};
@@ -1129,7 +1219,8 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 		uint64_t addr = st.bookmarks[static_cast<size_t>(i)];
 		bool sel = (ui.list_selected == i);
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, ar, ag, ab});
+		float row_a = ui_anim::render_row_entrance(i, 0, ImGui::GetIO().DeltaTime, a);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, row_a, 1.f, ar, ag, ab});
 
 		char ibuf[8], abuf[20];
 		snprintf(ibuf, sizeof(ibuf), "%d", i);
@@ -1146,15 +1237,28 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 
 		ry += ROW_HEIGHT;
 	}
+
+	float total_content = static_cast<float>(st.bookmarks.size()) * ROW_HEIGHT;
+	float visible_h = h - HEADER_H;
+	if (total_content > visible_h) {
+		static bool bk_scrollbar_dragging = false;
+		static float bk_scrollbar_offset = 0.f;
+		ui_anim::render_custom_scrollbar(dl, ox + w - 8.f, oy + HEADER_H, 8.f, visible_h,
+			ui.bookmark_scroll_y, total_content, visible_h, a, bk_scrollbar_dragging, bk_scrollbar_offset);
+	}
 }
 
 
 static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 						   float a, float ar, float ag, float ab) {
 	auto& st = debugger_engine::g_state;
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
 
-	ImU32 dim_col  = IM_COL32(140, 145, 155, static_cast<int>(150*a));
-	ImU32 text_col = IM_COL32(210, 215, 225, static_cast<int>(210*a));
+	ImU32 dim_col  = _ta(_t.text_secondary);
+	ImU32 text_col = _ta(_t.text_primary);
 
 	{
 		ui_anim::table_col_t cols[] = {{"Handle", 72.f}, {"Type", 120.f}, {"Name", 200.f}};
@@ -1174,7 +1278,8 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 		auto& h_entry = st.handles[static_cast<size_t>(hi)];
 		bool sel = (g_ui.list_selected == hi);
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, hi, a, 1.f, ar, ag, ab});
+		float row_a = ui_anim::render_row_entrance(hi, 0, ImGui::GetIO().DeltaTime, a);
+		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, hi, row_a, 1.f, ar, ag, ab});
 
 		char hbuf[12];
 		snprintf(hbuf, sizeof(hbuf), "0x%X", static_cast<unsigned>(h_entry.handle));
@@ -1205,6 +1310,15 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 
 	ImGui::PopClipRect();
 
+	float total_content = static_cast<float>(total) * ROW_HEIGHT;
+	float visible_h = h - HEADER_H;
+	if (total_content > visible_h) {
+		static bool hdl_scrollbar_dragging = false;
+		static float hdl_scrollbar_offset = 0.f;
+		ui_anim::render_custom_scrollbar(dl, ox + w - 8.f, oy + HEADER_H, 8.f, visible_h,
+			g_ui.handle_scroll_y, total_content, visible_h, a, hdl_scrollbar_dragging, hdl_scrollbar_offset);
+	}
+
 	if (st.handles.empty())
 		ui_anim::render_empty_state(dl, ox, oy + HEADER_H, w, h - HEADER_H,
 			"No handles found. Attach to a process to enumerate handles.",
@@ -1228,10 +1342,14 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	g_ui.content_fade = ui_anim::smooth_lerp(g_ui.content_fade, 1.f, 14.f, dt);
 	float a = alpha * std::max(g_ui.content_fade, 0.3f);
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
 
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h),
-		IM_COL32(18, 20, 26, static_cast<int>(240*alpha)));
+		ui_anim::theme_alpha(_t.bg_base, alpha));
 
 	render_tab_bar(dl, ox, oy, w, alpha, accent_r, accent_g, accent_b);
 
@@ -1275,9 +1393,9 @@ void render(float pos_x, float pos_y, float width, float height,
 			break;
 		case sub_tab_t::patches: {
 			float cy = content_y;
-			ImU32 dim2 = IM_COL32(140, 145, 155, static_cast<int>(150*a));
+			ImU32 dim2 = _ta(_t.text_secondary);
 			ImU32 addr2 = IM_COL32(130, 170, 255, static_cast<int>(220*a));
-			ImU32 text2 = IM_COL32(210, 215, 225, static_cast<int>(210*a));
+			ImU32 text2 = _ta(_t.text_primary);
 
 			{
 				ui_anim::table_col_t cols[] = {{"#", 22.f}, {"Address", 150.f}, {"Original", 140.f}, {"Patched", 140.f}, {"Description", 140.f}, {"Active", 70.f}};
@@ -1287,12 +1405,20 @@ void render(float pos_x, float pos_y, float width, float height,
 			std::lock_guard<std::mutex> plk(code_patcher::g_state.mtx);
 			auto& patches = code_patcher::g_state.patches;
 			float ry = cy + HEADER_H;
+
+			if (patches.empty()) {
+				ui_anim::render_empty_state(dl, ox, cy + HEADER_H, w, content_h - HEADER_H,
+					"No patches applied. Use the patcher to modify code.",
+					accent_r, accent_g, accent_b, a, static_cast<float>(ImGui::GetTime()));
+			}
+
 			for (int i = 0; i < static_cast<int>(patches.size()); ++i) {
 				if (ry + ROW_HEIGHT > content_y + content_h) break;
 				auto& p = patches[static_cast<size_t>(i)];
 				bool sel = (g_ui.list_selected == i);
 				bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
-				ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, a, 1.f, accent_r, accent_g, accent_b});
+				float row_a = ui_anim::render_row_entrance(i, 0, ImGui::GetIO().DeltaTime, a);
+				ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, row_a, 1.f, accent_r, accent_g, accent_b});
 
 				char ibuf[8]; snprintf(ibuf, sizeof(ibuf), "%d", i);
 				char abuf[20]; snprintf(abuf, sizeof(abuf), "%016" PRIX64, p.address);
@@ -1311,7 +1437,7 @@ void render(float pos_x, float pos_y, float width, float height,
 					? IM_COL32(100, 220, 120, static_cast<int>(200*a))
 					: IM_COL32(180, 100, 100, static_cast<int>(200*a));
 				ui_anim::render_badge(dl, st_label, ox + w - 70.f, ry + 2.f, sc,
-					IM_COL32(20, 20, 25, static_cast<int>(220*a)));
+					_ta(_t.bg_base));
 
 				if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 					g_ui.list_selected = i;

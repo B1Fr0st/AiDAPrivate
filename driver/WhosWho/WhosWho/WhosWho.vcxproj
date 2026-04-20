@@ -69,7 +69,6 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
-    <!-- masm.props is already imported by WDK package, do not duplicate -->
   </ImportGroup>
   <ImportGroup Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
@@ -169,13 +168,29 @@
     <ClInclude Include="src\function\DmaCanary.h" />
     <ClInclude Include="src\imports\Defs.h" />
     <ClInclude Include="src\imports\Strings.h" />
+    <ClInclude Include="src\hv_detect\includes.h" />
+    <ClInclude Include="src\hv_detect\ia32_defs.h" />
+    <ClInclude Include="src\hv_detect\hv_structs.h" />
+    <ClInclude Include="src\hv_detect\func_defs.h" />
+    <ClInclude Include="src\hv_detect\physmem_structs.h" />
+    <ClInclude Include="src\hv_detect\physmem_decl.h" />
+    <ClInclude Include="src\hv_detect\page_table_helpers.h" />
+    <ClInclude Include="src\hv_detect\win_helpers.h" />
+    <ClInclude Include="src\hv_detect\physmem.h" />
+    <ClInclude Include="src\hv_detect\safety_net.h" />
+    <ClInclude Include="src\hv_detect\idt_detect.h" />
+    <ClInclude Include="src\hv_detect\ve_detect.h" />
+    <ClInclude Include="src\hv_detect\hv_detect.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <MASM Include="src\hv_detect\general_asm.asm" />
+    <MASM Include="src\hv_detect\safety_net_asm.asm" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
-    <!-- masm.targets is already imported by WDK package, do not duplicate -->
     <Import Project="$(SolutionDir)packages\Microsoft.Windows.SDK.CPP.10.0.26100.1\build\native\Microsoft.Windows.SDK.cpp.targets" Condition="Exists('$(SolutionDir)packages\Microsoft.Windows.SDK.CPP.10.0.26100.1\build\native\Microsoft.Windows.SDK.cpp.targets')" />
   </ImportGroup>
   <Target Name="EnsureNuGetPackageBuildImports" BeforeTargets="PrepareForBuild">

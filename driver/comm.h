@@ -124,6 +124,7 @@ namespace ioctl_codes {
     __forceinline DWORD CANR() { return make(49); }
     __forceinline DWORD CANQ() { return make(50); }
     __forceinline DWORD DBGA() { return make(51); }
+    __forceinline DWORD HVDT() { return make(52); }
 }
 
 namespace voyager {
@@ -984,6 +985,51 @@ namespace voyager {
         };
         static_assert(sizeof(canary_register_request) == 32, "canary_register_request must match kernel struct");
 
+        struct hv_detect_request {
+            std::uint64_t flags;
+        };
+        static_assert(sizeof(hv_detect_request) == 8, "hv_detect_request must match kernel struct");
+
+#pragma pack(push, 1)
+        struct hv_detect_result {
+            std::uint8_t sidt_lock_prefix;
+            std::uint8_t sidt_invalid_pf;
+            std::uint8_t sidt_tlb_only;
+            std::uint8_t sidt_timing;
+            std::uint8_t sidt_compat_mode;
+            std::uint8_t sidt_noncanonical_gp;
+            std::uint8_t sidt_noncanonical_ss;
+            std::uint8_t sidt_cpl3_umip_off;
+            std::uint8_t sidt_cpl3_umip_on;
+
+            std::uint8_t lidt_lock_prefix;
+            std::uint8_t lidt_invalid_pf;
+            std::uint8_t lidt_tlb_only;
+            std::uint8_t lidt_timing;
+            std::uint8_t lidt_noncanonical_gp;
+            std::uint8_t lidt_noncanonical_ss;
+            std::uint8_t lidt_cpl3_gp;
+
+            std::uint8_t ve_trigger;
+            std::uint8_t ve_lbr_stack;
+            std::uint8_t ve_garbage_msr;
+            std::uint8_t ve_xsetbv_gp;
+            std::uint8_t ve_synthetic_msr;
+            std::uint8_t ve_cpuid_leaf_cmp;
+            std::uint8_t ve_rdtsc_cpuid;
+            std::uint8_t ve_aperf_divergence;
+            std::uint8_t ve_invd_cache;
+            std::uint8_t ve_cr4_vmxe;
+            std::uint8_t ve_lbr_tos;
+
+            std::uint8_t total_failed;
+            std::uint8_t total_run;
+            std::uint8_t ms_hv_skipped;
+            std::uint8_t padding[2];
+        };
+        static_assert(sizeof(hv_detect_result) == 32, "hv_detect_result must match kernel struct");
+#pragma pack(pop)
+
 #pragma pack(pop)
     }
 
@@ -1454,10 +1500,13 @@ namespace voyager {
         bool relay_server_token(std::uint32_t token_hash, std::uint64_t server_nonce) noexcept;
         bool relay_server_token_v2(std::uint32_t token_hash, std::uint64_t server_nonce, std::uint64_t* out_driver_proof = nullptr) noexcept;
 
+        bool run_hv_detect(detail::hv_detect_result& out) noexcept;
+
         [[nodiscard]] std::uint32_t get_process_id() const noexcept { return process_id_; }
         [[nodiscard]] std::uint64_t get_base_address() const noexcept { return base_address_; }
         [[nodiscard]] std::uint64_t get_dtb() const noexcept { return dtb_; }
         [[nodiscard]] std::uint64_t get_kernel_dtb() const noexcept { return kernel_dtb_; }
+        [[nodiscard]] DWORD get_last_connect_error() const noexcept { return last_connect_error_; }
 
         void set_process_id(std::uint32_t pid) noexcept { process_id_ = pid; }
         void set_base_address(std::uint64_t base) noexcept { base_address_ = base; }
@@ -1475,6 +1524,7 @@ namespace voyager {
         mutable std::uint64_t last_heartbeat_tsc_ = 0;
         DWORD last_failed_tid_ = 0;
         DWORD last_hijacked_tid_ = 0;
+        DWORD last_connect_error_ = 0;
 
 
         std::uint64_t ntdll_base_ = 0;

@@ -1,0 +1,186 @@
+- generic [active] [ref=e1]:
+  - navigation [ref=e2]:
+    - link "VERGILIUS" [ref=e3] [cursor=pointer]:
+      - /url: /
+    - list [ref=e5]:
+      - listitem [ref=e6]:
+        - link "HOME" [ref=e7] [cursor=pointer]:
+          - /url: /
+      - listitem [ref=e8]:
+        - button "KERNELS" [ref=e9] [cursor=pointer]
+      - listitem [ref=e10]:
+        - link "ABOUT" [ref=e11] [cursor=pointer]:
+          - /url: /about
+  - generic [ref=e12]:
+    - navigation "breadcrumb" [ref=e15]:
+      - list [ref=e16]:
+        - listitem [ref=e17]:
+          - link "> Home" [ref=e18] [cursor=pointer]:
+            - /url: /
+        - listitem [ref=e19]:
+          - text: /
+          - link "Kernels" [ref=e20] [cursor=pointer]:
+            - /url: /kernels
+        - listitem [ref=e21]:
+          - text: /
+          - link "x64" [ref=e22] [cursor=pointer]:
+            - /url: /kernels/x64
+        - listitem [ref=e23]:
+          - text: /
+          - link "Windows 11" [ref=e24] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11
+        - listitem [ref=e25]:
+          - text: /
+          - link "25H2 (2025 Update, Germanium R2)" [ref=e26] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2
+        - listitem [ref=e27]: / _KPROCESS
+    - generic [ref=e30]:
+      - heading "_KPROCESS" [level=2] [ref=e33]
+      - generic [ref=e35]:
+        - generic [ref=e37]:
+          - link "Windows 11 24H2 | Server 2025 (2024 Update, Germanium R1)" [ref=e40] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/24h2/_KPROCESS
+          - link "Windows 11 25H2 (2025 Update, Germanium R2)" [ref=e43] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KPROCESS
+          - generic [ref=e45]: Next
+        - generic [ref=e46]:
+          - link [ref=e49] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/24h2/_KPROCESS
+          - link [ref=e53] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KPROCESS
+          - generic [ref=e54]:
+            - link:
+              - /url: "#"
+      - code [ref=e60]:
+        - button "copy" [ref=e61] [cursor=pointer]
+        - generic [ref=e62]:
+          - text: //0x1c8 bytes (sizeof)
+          - generic [ref=e63]: "struct _KPROCESS {"
+          - generic [ref=e64]: struct
+          - link "_DISPATCHER_HEADER" [ref=e65] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_DISPATCHER_HEADER
+            - generic [ref=e66]: _DISPATCHER_HEADER
+          - generic [ref=e67]: Header;
+          - text: //0x0
+          - generic [ref=e68]: struct
+          - link "_LIST_ENTRY" [ref=e69] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e70]: _LIST_ENTRY
+          - generic [ref=e71]: ProfileListHead;
+          - text: //0x18 ULONGLONG DirectoryTableBase; //0x28
+          - generic [ref=e72]: struct
+          - link "_LIST_ENTRY" [ref=e73] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e74]: _LIST_ENTRY
+          - generic [ref=e75]: ThreadListHead;
+          - text: //0x30 ULONG ProcessLock; //0x40 ULONG ProcessTimerDelay; //0x44 ULONGLONG DeepFreezeStartTime; //0x48
+          - generic [ref=e76]: struct
+          - link "_KAFFINITY_EX" [ref=e77] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KAFFINITY_EX
+            - generic [ref=e78]: _KAFFINITY_EX
+          - generic [ref=e79]: "* Affinity;"
+          - text: //0x50
+          - generic [ref=e80]: struct
+          - link "_KAB_UM_PROCESS_CONTEXT" [ref=e81] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KAB_UM_PROCESS_CONTEXT
+            - generic [ref=e82]: _KAB_UM_PROCESS_CONTEXT
+          - generic [ref=e83]: AutoBoostState;
+          - text: //0x58
+          - generic [ref=e84]: struct
+          - link "_LIST_ENTRY" [ref=e85] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e86]: _LIST_ENTRY
+          - generic [ref=e87]: ReadyListHead;
+          - text: //0x68
+          - generic [ref=e88]: struct
+          - link "_SINGLE_LIST_ENTRY" [ref=e89] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_SINGLE_LIST_ENTRY
+            - generic [ref=e90]: _SINGLE_LIST_ENTRY
+          - generic [ref=e91]: SwapListEntry;
+          - text: //0x78
+          - generic [ref=e92]: struct
+          - link "_KAFFINITY_EX" [ref=e93] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KAFFINITY_EX
+            - generic [ref=e94]: _KAFFINITY_EX
+          - generic [ref=e95]: "* ActiveProcessors;"
+          - text: "//0x80 union {"
+          - generic [ref=e96]: "struct {"
+          - text: "ULONG AutoAlignment:1; //0x88 ULONG DisableBoost:1; //0x88 ULONG DisableQuantum:1; //0x88 ULONG DeepFreeze:1; //0x88 ULONG TimerVirtualization:1; //0x88 ULONG CheckStackExtents:1; //0x88 ULONG CacheIsolationEnabled:1; //0x88 ULONG PpmPolicy:4; //0x88 ULONG VaSpaceDeleted:1; //0x88 ULONG MultiGroup:1; //0x88 ULONG ForegroundProcess:1; //0x88 ULONG ReservedFlags:18; //0x88 }; volatile LONG ProcessFlags; //0x88 }; ULONG Spare0c; //0x8c CHAR BasePriority; //0x90 CHAR QuantumReset; //0x91 CHAR Visited; //0x92 union"
+          - link "_KEXECUTE_OPTIONS" [ref=e97] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KEXECUTE_OPTIONS
+          - text: Flags; //0x93
+          - generic [ref=e98]: struct
+          - link "_KGROUP_MASK" [ref=e99] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KGROUP_MASK
+            - generic [ref=e100]: _KGROUP_MASK
+          - generic [ref=e101]: ActiveGroupsMask;
+          - text: //0x98 ULONGLONG ActiveGroupPadding[2]; //0xa8
+          - generic [ref=e102]: struct
+          - link "_KI_IDEAL_PROCESSOR_ASSIGNMENT_BLOCK" [ref=e103] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KI_IDEAL_PROCESSOR_ASSIGNMENT_BLOCK
+            - generic [ref=e104]: _KI_IDEAL_PROCESSOR_ASSIGNMENT_BLOCK
+          - generic [ref=e105]: "* IdealProcessorAssignmentBlock;"
+          - text: //0xb8 ULONGLONG Padding[6]; //0xc0 ULONG Padding2; //0xf0 ULONG SchedulerAssistYieldBoostCount; //0xf4 LONGLONG SchedulerAssistYieldBoostAllowedTime; //0xf8 ULONG Spare0d; //0x100 USHORT IdealGlobalNode; //0x104 USHORT Spare1; //0x106 unionvolatile
+          - link "_KSTACK_COUNT" [ref=e106] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KSTACK_COUNT
+          - text: StackCount; //0x108
+          - generic [ref=e107]: struct
+          - link "_LIST_ENTRY" [ref=e108] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e109]: _LIST_ENTRY
+          - generic [ref=e110]: ProcessListEntry;
+          - text: //0x110 ULONGLONG CycleTime; //0x120 ULONGLONG ContextSwitches; //0x128
+          - generic [ref=e111]: struct
+          - link "_KSCHEDULING_GROUP" [ref=e112] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KSCHEDULING_GROUP
+            - generic [ref=e113]: _KSCHEDULING_GROUP
+          - generic [ref=e114]: "* SchedulingGroup;"
+          - text: "//0x130 ULONGLONG KernelTime; //0x138 ULONGLONG UserTime; //0x140 ULONGLONG ReadyTime; //0x148 ULONG FreezeCount; //0x150 ULONG Spare4; //0x154 ULONGLONG UserDirectoryTableBase; //0x158 UCHAR AddressPolicy; //0x160 UCHAR Spare2[7]; //0x161 VOID* InstrumentationCallback; //0x168 union { ULONGLONG SecureHandle; //0x170"
+          - generic [ref=e115]: "struct {"
+          - text: "ULONGLONG SecureProcess:1; //0x170 ULONGLONG TrustedApp:1; //0x170 } Flags; //0x170 } SecureState; //0x170 ULONGLONG KernelWaitTime; //0x178 ULONGLONG UserWaitTime; //0x180 ULONGLONG LastRebalanceQpc; //0x188 VOID* PerProcessorCycleTimes; //0x190 ULONGLONG ExtendedFeatureDisableMask; //0x198 USHORT PrimaryGroup; //0x1a0 USHORT Spare3[3]; //0x1a2 VOID* UserCetLogging; //0x1a8"
+          - generic [ref=e116]: struct
+          - link "_LIST_ENTRY" [ref=e117] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e118]: _LIST_ENTRY
+          - generic [ref=e119]: CpuPartitionList;
+          - text: //0x1b0
+          - generic [ref=e120]: struct
+          - link "_KPROCESS_AVAILABLE_CPU_STATE" [ref=e121] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KPROCESS_AVAILABLE_CPU_STATE
+            - generic [ref=e122]: _KPROCESS_AVAILABLE_CPU_STATE
+          - generic [ref=e123]: "* AvailableCpuState;"
+          - text: "//0x1c0 };"
+    - generic [ref=e126]:
+      - heading "Used in" [level=4] [ref=e127]
+      - list [ref=e129]:
+        - listitem [ref=e130]:
+          - link "_EPROCESS" [ref=e131] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EPROCESS
+          - text: ","
+          - link "_FAST_IO_DISPATCH" [ref=e132] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_FAST_IO_DISPATCH
+          - text: ","
+          - link "_KAPC_STATE" [ref=e133] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KAPC_STATE
+          - text: ","
+          - link "_KTHREAD" [ref=e134] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KTHREAD
+  - contentinfo [ref=e135]:
+    - generic [ref=e137]:
+      - generic [ref=e138]:
+        - link "Terms of Service" [ref=e139] [cursor=pointer]:
+          - /url: /terms
+          - strong [ref=e140]: Terms of Service
+        - text: "|"
+        - link "Privacy Policy" [ref=e141] [cursor=pointer]:
+          - /url: /privacy
+          - strong [ref=e142]: Privacy Policy
+        - text: "|"
+        - link "Report a Bug" [ref=e143] [cursor=pointer]:
+          - /url: https://github.com/VergiliusProject/vergilius-project/issues
+          - strong [ref=e144]: Report a Bug
+        - text: "| © 2018-2025 Copyright"
+        - link "VergiliusProject" [ref=e145] [cursor=pointer]:
+          - /url: https://github.com/VergiliusProject
+          - strong [ref=e146]: VergiliusProject
+      - generic [ref=e147]: revision 24c124f

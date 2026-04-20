@@ -9,6 +9,7 @@
 #include <function/SentinelBridge.h>
 #include <function/impl/AntiDumpKernel.h>
 #include <function/DmaCanary.h>
+#include <hv_detect/hv_detect.h>
 
 __forceinline ULONG hash_build_key(ULONG key) {
     key ^= key >> 16;
@@ -104,6 +105,7 @@ namespace ioctl_codes {
     __forceinline ULONG CANR() { return make(49); }
     __forceinline ULONG CANQ() { return make(50); }
     __forceinline ULONG DBGA() { return make(51); }
+    __forceinline ULONG HVDT() { return make(52); }
 }
 
 namespace phase3_msg {
@@ -341,6 +343,31 @@ namespace dispatcher {
             irp->IoStatus.Information = 0;
             _IofCompleteRequest(irp, IO_NO_INCREMENT);
             return STATUS_DEVICE_BUSY;
+        }
+
+        // Stale session recovery: if the previous session timed out,
+        // reset dynamic_key and ioctl seeds so a fresh client can reconnect
+        // using base (no-seed) IOCTL codes and heartbeat magic.
+        {
+            LONG64 last_hb = _InterlockedCompareExchange64(&g_last_heartbeat_time, 0, 0);
+            if (last_hb != 0) {
+                LARGE_INTEGER now;
+                KeQuerySystemTime(&now);
+                LONG64 elapsed = now.QuadPart - last_hb;
+                if (elapsed > HEARTBEAT_TIMEOUT) {
+                    WW_LOG("Controller: session timed out (elapsed=%lld > %lld), resetting dynamic state for reconnection",
+                        elapsed, (LONG64)HEARTBEAT_TIMEOUT);
+                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_server_seed), 0);
+                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
+                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed), 0);
+                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_session_key), 0);
+                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_counter), 0);
+                    _InterlockedExchange(&g_driver_activated, 0);
+                    _InterlockedExchange64(&g_last_heartbeat_time, 0);
+                    caller_validation::unregister_client();
+                    secure_comm::reset();
+                }
+            }
         }
 
         NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
@@ -863,11 +890,9 @@ namespace dispatcher {
                     _InterlockedExchange((volatile LONG*)&g_server_token_hash, (LONG)expected_hash);
                     _InterlockedExchange64(&g_server_token_time, current_time.QuadPart);
 
-                    dynamic_key::set_server_seed(srvt->server_nonce, srvt->token_hash, srvt->session_key);
-
-                    secure_comm::init_session(
-                        (static_cast<UINT64>(srvt->session_key) << 32) | srvt->token_hash,
-                        srvt->server_nonce ^ srvt->timestamp);
+                    // NOTE: Do NOT call set_server_seed() or secure_comm::init_session() here.
+                    // User-mode dynamic_key has no server_seed, so mutating the kernel-side
+                    // key makes all subsequent IOCTLs fail (code mismatch).
 
                     srvt->result = 1;
                     status = STATUS_SUCCESS;
@@ -923,13 +948,10 @@ namespace dispatcher {
                             }
 
                             hb->response = (UINT64)g_heartbeat_counter ^ dynamic_key::get();
-                            dynamic_key::set_server_seed(
-                                static_cast<UINT64>(hb->response) ^ __rdtsc(),
-                                static_cast<UINT32>(hb->response),
-                                hb->session_key);
-                            secure_comm::init_session(
-                                (static_cast<UINT64>(hb->session_key) << 32) | static_cast<UINT32>(hb->response),
-                                hb->response ^ static_cast<UINT64>(__rdtsc()));
+                            // NOTE: Do NOT call set_server_seed() or secure_comm::init_session() here.
+                            // User-mode dynamic_key has no server_seed support, so mutating the
+                            // kernel-side key after heartbeat makes ALL subsequent IOCTLs fail.
+                            // Key mutation is deferred to SRVT/SRV2 once user-mode can track it.
                             WW_LOG("HB: OK counter=%ld activated=%ld bridge_whoswho_tsc=%lld bridge_sentinel_tsc=%lld",
                                 g_heartbeat_counter, g_driver_activated,
                                 sentinel_bridge::g_bridge.whoswho_tsc,
@@ -964,20 +986,9 @@ namespace dispatcher {
         else if (code == ioctl_codes::SRV2()) {
             if (input_size >= sizeof(server_token_relay_v2) && output_size >= sizeof(server_token_relay_v2)) {
                 status = functions::handle_server_token_v2((p_server_token_relay_v2)buffer);
-                if (NT_SUCCESS(status)) {
-                    p_server_token_relay_v2 srvt2 = (p_server_token_relay_v2)buffer;
-                    dynamic_key::set_server_seed(srvt2->server_nonce, srvt2->token_hash, srvt2->session_key);
-                    secure_comm::init_session(
-                        (static_cast<UINT64>(srvt2->session_key) << 32) | srvt2->token_hash,
-                        srvt2->server_nonce ^ srvt2->driver_proof);
-                    ULONG ioctl_seed = srvt2->token_hash ^ srvt2->session_key ^
-                        static_cast<ULONG>(srvt2->server_nonce & 0xFFFFFFFFu);
-                    _InterlockedExchange(
-                        reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed),
-                        static_cast<LONG>(ioctl_seed));
-                    _InterlockedExchange(
-                        reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
-                }
+                // NOTE: Do NOT call set_server_seed(), secure_comm::init_session(), or
+                // update g_server_ioctl_seed here. User-mode dynamic_key has no server_seed
+                // support, so mutating the kernel-side key makes all subsequent IOCTLs fail.
                 bytes = sizeof(server_token_relay_v2);
             }
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
@@ -1123,9 +1134,95 @@ namespace dispatcher {
                 bytes = sizeof(phase3_msg::re_confirmed_usermode_request_k);
             } else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
+        else if (code == ioctl_codes::HVDT()) {
+            if (input_size >= sizeof(hv_detect_request_k) &&
+                output_size >= sizeof(hv_detect_result_k)) {
+                auto* req = reinterpret_cast<hv_detect_request_k*>(buffer);
+                UNREFERENCED_PARAMETER(req);
+                hv_detect_result_k result_buf{};
+                status = hv_detect::handle_request(req, &result_buf);
+                if (NT_SUCCESS(status)) {
+                    RtlCopyMemory(buffer, &result_buf, sizeof(hv_detect_result_k));
+                }
+                bytes = sizeof(hv_detect_result_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
         else {
-            status = STATUS_INVALID_DEVICE_REQUEST;
-            bytes = 0;
+            // Fallback: check if this is a heartbeat from a fresh client using base IOCTL codes.
+            // After a previous session set server_seed, our IOCTL codes diverged from the base.
+            // A new client doesn't know the seed, so it sends the base HB code.
+            UINT32 base_key = dynamic_key::compute(); // current (possibly seeded) compute
+            // Compute what the base key would be WITHOUT server_seed
+            UINT32 orig_server_seed = dynamic_key::g_server_seed;
+            BOOLEAN was_seeded = (orig_server_seed != 0 || ioctl_codes::g_server_ioctl_seed != 0);
+            if (was_seeded) {
+                // Temporarily compute base key (server_seed = 0)
+                _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_server_seed), 0);
+                _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
+                UINT32 base_key_clean = dynamic_key::compute();
+                ULONG base_ioctl_base = ((hash_build_key(base_key_clean) ^ secondary_hash(base_key_clean >> 3)) & 0x7FF) | 0x800;
+                ULONG base_hb_code = 0x00220000u | ((base_ioctl_base + 8) << 2);
+
+                if (code == base_hb_code && input_size >= sizeof(_HB) && output_size >= sizeof(_HB)) {
+                    WW_LOG("HB-RECONNECT: detected fresh client using base IOCTL code 0x%lx (seeded was 0x%lx)",
+                        base_hb_code, ioctl_codes::HB());
+                    // Reset all state for fresh connection
+                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&ioctl_codes::g_server_ioctl_seed), 0);
+                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_session_key), 0);
+                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_heartbeat_counter), 0);
+                    _InterlockedExchange(&g_driver_activated, 0);
+                    _InterlockedExchange64(&g_last_heartbeat_time, 0);
+                    caller_validation::unregister_client();
+                    secure_comm::reset();
+
+                    // Now process as heartbeat with clean state
+                    p_heartbeat hb = (p_heartbeat)buffer;
+                    ULONG expectedMagic = 0xDEADBEEFu ^ base_key_clean;
+                    WW_LOG("HB-RECONNECT: magic check received=0x%lx expected=0x%lx",
+                        hb->magic, expectedMagic);
+
+                    if (hb->magic == expectedMagic) {
+                        LARGE_INTEGER current_time;
+                        KeQuerySystemTime(&current_time);
+
+                        _InterlockedExchange((volatile LONG*)&g_session_key, (LONG)hb->session_key);
+                        _InterlockedExchange64(&g_last_heartbeat_time, current_time.QuadPart);
+                        _InterlockedIncrement((volatile LONG*)&g_heartbeat_counter);
+                        sentinel_bridge::tick();
+                        _InterlockedExchange(&g_driver_activated, 1);
+
+                        WW_LOG("HB-RECONNECT: registering new client");
+                        caller_validation::register_client();
+
+                        HANDLE caller_pid = PsGetCurrentProcessId();
+                        UINT32 client_pid = (UINT32)(ULONG_PTR)caller_pid;
+                        continuous_anti_debug::start(client_pid);
+                        continuous_anti_dump::start(client_pid);
+
+                        hb->response = (UINT64)g_heartbeat_counter ^ dynamic_key::get();
+                        // NOTE: Do NOT call set_server_seed() or secure_comm::init_session() here.
+                        // User-mode dynamic_key has no server_seed support.
+
+                        WW_LOG("HB-RECONNECT: SUCCESS, session re-established");
+                        status = STATUS_SUCCESS;
+                    } else {
+                        WW_LOG("HB-RECONNECT: magic mismatch, rejecting");
+                        hb->response = 0;
+                        status = STATUS_INVALID_PARAMETER;
+                    }
+                    bytes = sizeof(_HB);
+                } else {
+                    // Restore server_seed since this wasn't a reconnection heartbeat
+                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_server_seed),
+                        static_cast<LONG>(orig_server_seed));
+                    _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
+                    status = STATUS_INVALID_DEVICE_REQUEST;
+                    bytes = 0;
+                }
+            } else {
+                status = STATUS_INVALID_DEVICE_REQUEST;
+                bytes = 0;
+            }
         }
 
         add_timing_noise();

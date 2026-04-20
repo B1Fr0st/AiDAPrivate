@@ -61,9 +61,9 @@ void render(float pos_x, float pos_y, float width, float height,
 	ui_anim::render_toolbar(dl, ox, cy - 4.f, width, toolbar_h + 4.f, alpha, accent_r, accent_g, accent_b);
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy + 2.f));
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(200 * alpha)));
-	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(120 * alpha)));
-	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(210, 210, 220, static_cast<int>(220 * alpha)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
+	ImGui::PushStyleColor(ImGuiCol_Border, _ta(ui_anim::lighten(_t.panel_bg, 12)));
+	ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 

@@ -43,6 +43,7 @@ static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
 static int                        g_loader_icon_w    = 0;
 static int                        g_loader_icon_h    = 0;
 DisasmState                       g_disasm;
+const char*                       g_render_section = "idle";
 
 
 #include "../assets/theme_icons/kaneki.h"
@@ -576,28 +577,54 @@ void conversations::delete_conversation(const std::string& id)
 
 void helpers::render_title()
 {
+	g_render_section = "entry";
 	float dt = ImGui::GetIO().DeltaTime;
 	globals::ui::load_timer += dt;
 
+	static bool bg_completed = false;
+	static float bg_completed_at = 0.f;
+	if (!bg_completed && globals::ui::bg_init_done && globals::ui::bg_init_done->load(std::memory_order_acquire)) {
+		bg_completed = true;
+		bg_completed_at = globals::ui::load_timer;
+	}
 
+	g_render_section = "inline_checks";
 	{
 		static uint64_t s_frame_ctr = 0;
-		standalone_license::cross_validation_sweep(s_frame_ctr++);
+		standalone_license::cross_validation_sweep(static_cast<int>(s_frame_ctr++));
 	}
 
 	{
 		uint64_t tok = anti_tamper::run_inline_check(anti_tamper::CHECK_FAST);
 		standalone_license::fold_integrity_token(tok);
+		static uint64_t s_inline_log_ctr = 0;
+		++s_inline_log_ctr;
+		if (s_inline_log_ctr <= 3 || (s_inline_log_ctr % 500) == 0) {
+			char dbg[128];
+			_snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+				"inline_check frame=%llu tok=0x%llX",
+				s_inline_log_ctr, tok);
+			anti_tamper::webhook::write_log("render", dbg);
+		}
 	}
-
 
 	{
 		uint64_t gt = standalone_license::inline_gate_check(
 			standalone_license::gate_ui_render_loop);
 		(void)standalone_license::verify_gate_token(
 			standalone_license::gate_ui_render_loop, gt);
+		static uint64_t s_gate_log_ctr = 0;
+		++s_gate_log_ctr;
+		if (s_gate_log_ctr <= 3 || (s_gate_log_ctr % 500) == 0) {
+			char dbg[128];
+			_snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+				"gate_check frame=%llu gt=0x%llX",
+				s_gate_log_ctr, gt);
+			anti_tamper::webhook::write_log("render", dbg);
+		}
 	}
 
+	g_render_section = "theme_resolve";
 	if (custom_themes::active_custom >= 0 &&
 	    custom_themes::active_custom < (int)custom_themes::list.size()) {
 		auto& ct = custom_themes::list[custom_themes::active_custom];
@@ -935,7 +962,9 @@ void helpers::render_title()
 		}
 	};
 
-	bool loading = globals::ui::load_timer < 3.0f;
+	bool loading = !bg_completed || globals::ui::load_timer < 3.0f;
+
+	g_render_section = loading ? "loading_screen" : "post_loading";
 
 	if (!loading)
 	{
@@ -1276,10 +1305,27 @@ void helpers::render_title()
 		if (btn_ht > 0.01f)
 			dl->AddRect(btn_min, btn_max, IM_COL32((int)ax, (int)ay, (int)az, (int)(60 * btn_ht * la)), 6.f);
 
-		const char* btn_label = license::checking ? "Checking..." : "Activate";
-		ImVec2 btn_ts = ImGui::CalcTextSize(btn_label);
-		dl->AddText(ImVec2(btn_min.x + (btn_w - btn_ts.x) * 0.5f, btn_min.y + (btn_h - btn_ts.y) * 0.5f),
-			IM_COL32(230, 228, 255, (int)(240 * la)), btn_label);
+		if (license::checking) {
+			// Bouncing dots animation (same style as the AiDA loading screen)
+			float dot_r  = 3.5f;
+			float dot_sp = 14.f;
+			float bcx = btn_min.x + btn_w * 0.5f;
+			float bcy = btn_min.y + btn_h * 0.5f;
+			for (int i = 0; i < 3; i++) {
+				float phase  = globals::ui::load_timer * 4.f + i * (2.f * 3.14159f / 3.f);
+				float bounce = sinf(phase) * 5.f;
+				float dot_a  = (sinf(phase) * 0.5f + 0.5f) * 0.6f + 0.4f;
+				dl->AddCircleFilled(
+					ImVec2(bcx + (i - 1) * dot_sp, bcy + bounce),
+					dot_r,
+					IM_COL32(230, 228, 255, (int)(255 * dot_a * la)));
+			}
+		} else {
+			const char* btn_label = "Activate";
+			ImVec2 btn_ts = ImGui::CalcTextSize(btn_label);
+			dl->AddText(ImVec2(btn_min.x + (btn_w - btn_ts.x) * 0.5f, btn_min.y + (btn_h - btn_ts.y) * 0.5f),
+				IM_COL32(230, 228, 255, (int)(240 * la)), btn_label);
+		}
 
 		ImGui::InvisibleButton("##activate_btn", ImVec2(btn_w, btn_h));
 		bool btn_clicked = ImGui::IsItemClicked();
@@ -1365,6 +1411,7 @@ void helpers::render_title()
 	}
 
 
+	g_render_section = "ide_layout";
 	float a = globals::ui::ui_alpha;
 
 
@@ -1440,6 +1487,7 @@ void helpers::render_title()
 	float right_total_h = wh - pad * 2.f - chrome_h;
 	float content_top = pad + title_h + menu_h;
 
+	g_render_section = "title_bar";
 	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, a);
 
 
@@ -2114,16 +2162,32 @@ void helpers::render_title()
 						}
 						if (menu_item("Open Folder...", "Ctrl+K")) {
 							char folder[MAX_PATH] = {};
-							BROWSEINFOA bi = {};
-							bi.lpszTitle = "Open Workspace Folder";
-							bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-							PIDLIST_ABSOLUTE pid = SHBrowseForFolderA(&bi);
-							if (pid) {
-								SHGetPathFromIDListA(pid, folder);
-								CoTaskMemFree(pid);
-								file_browser::refresh(folder);
-								g_sa_settings.workspace.root_path = folder;
-								g_sa_settings.save();
+							IFileOpenDialog* pfd = nullptr;
+							HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+								IID_IFileOpenDialog, reinterpret_cast<void**>(&pfd));
+							if (SUCCEEDED(hr) && pfd) {
+								DWORD opts = 0;
+								pfd->GetOptions(&opts);
+								pfd->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+								pfd->SetTitle(L"Open Workspace Folder");
+								hr = pfd->Show(g_hwnd);
+								if (SUCCEEDED(hr)) {
+									IShellItem* psi = nullptr;
+									hr = pfd->GetResult(&psi);
+									if (SUCCEEDED(hr) && psi) {
+										PWSTR wpath = nullptr;
+										psi->GetDisplayName(SIGDN_FILESYSPATH, &wpath);
+										if (wpath) {
+											WideCharToMultiByte(CP_UTF8, 0, wpath, -1, folder, MAX_PATH, nullptr, nullptr);
+											CoTaskMemFree(wpath);
+											file_browser::refresh(folder);
+											g_sa_settings.workspace.root_path = folder;
+											g_sa_settings.save();
+										}
+										psi->Release();
+									}
+								}
+								pfd->Release();
 							}
 						}
 						menu_sep();
@@ -3487,6 +3551,7 @@ void helpers::render_title()
 	{
 
 
+	g_render_section = "center_view_dispatch";
 	auto cv = globals::ui::active_center_view;
 
 
@@ -3574,7 +3639,7 @@ void helpers::render_title()
 	ImGui::EndChild();
 	ImGui::PopStyleVar();
 
-
+	g_render_section = "file_tabs_popup";
 	{
 		bool popup_active = (file_tabs::pending_close_idx >= 0);
 
@@ -3718,6 +3783,7 @@ void helpers::render_title()
 		}
 	}
 
+	g_render_section = "right_panel";
 	if (right_w > 1.f) {
 	begin_child("##chat", ImVec2(pad + left_gap + center_w + gap, content_top), ImVec2(right_w, right_total_h), a);
 
@@ -3743,7 +3809,8 @@ void helpers::render_title()
 
 
 		float line_h     = ImGui::GetFontSize();
-		float input_pad  = 8.f;
+		float input_pad  = 10.f;
+		float pill_zone_h = 28.f;
 		int   num_lines  = 1;
 		{
 			for (const char* p = g_chat_buf; *p; ++p)
@@ -3758,7 +3825,7 @@ void helpers::render_title()
 		}
 		int   max_lines  = 8;
 		int   vis_lines  = std::max(1, std::min(num_lines, max_lines));
-		float input_h    = vis_lines * line_h + input_pad * 2.f;
+		float input_h    = vis_lines * line_h + input_pad * 2.f + pill_zone_h;
 		float bot_pad    = 4.f;
 		float input_y    = ch - input_h - bot_pad;
 		float chat_sep_y = input_y - 6.f;
@@ -4565,153 +4632,6 @@ void helpers::render_title()
 			float igap   = 4.f;
 
 
-			{
-				static bool model_open = false;
-				static float popup_alpha = 0.f;
-				auto* active_profile = g_sa_settings.get_active_profile();
-				std::string provider = active_profile ? active_profile->display_name : "No profile";
-				std::string model    = active_profile ? active_profile->model : "No model";
-
-				if (model.empty()) model = "Select model";
-				std::string pill_text = provider + " / " + model;
-
-				float max_pill_w = cw * 0.7f;
-				ImVec2 pill_ts = ImGui::CalcTextSize(pill_text.c_str());
-				if (pill_ts.x > max_pill_w && pill_text.size() > 20) {
-					pill_text.resize(20);
-					pill_text += "...";
-					pill_ts = ImGui::CalcTextSize(pill_text.c_str());
-				}
-
-				float pill_h  = 26.f;
-				float pill_y  = input_y - pill_h - 4.f;
-				float pill_w  = pill_ts.x + 24.f;
-				float pill_x  = 4.f;
-
-				float hit_pad_x = 6.f;
-				float hit_pad_y = 6.f;
-				float hit_x = pill_x - hit_pad_x;
-				float hit_y = pill_y - hit_pad_y;
-				float hit_w = pill_w + hit_pad_x * 2.f;
-				float hit_h = pill_h + hit_pad_y * 2.f;
-
-				ImGui::SetCursorPos(ImVec2(pill_x, pill_y));
-				ImVec2 pmin = ImGui::GetCursorScreenPos();
-				ImVec2 pmax(pmin.x + pill_w, pmin.y + pill_h);
-
-				bool pill_hov = ImGui::IsMouseHoveringRect(
-					ImVec2(pmin.x - hit_pad_x, pmin.y - hit_pad_y),
-					ImVec2(pmax.x + hit_pad_x, pmax.y + hit_pad_y));
-				static float pill_ht = 0.f;
-				pill_ht += ((pill_hov ? 1.f : 0.f) - pill_ht) * std::min(10.f * dt, 1.f);
-
-				dl->AddRectFilled(pmin, pmax,
-					IM_COL32(40, 38, 60, (int)((160 + 40 * pill_ht) * a)), 13.f);
-				dl->AddRect(pmin, pmax,
-					IM_COL32(255, 255, 255, (int)((15 + 20 * pill_ht) * a)), 13.f, 0, 0.75f);
-				dl->AddText(ImVec2(pmin.x + 12.f, pmin.y + (pill_h - pill_ts.y) * 0.5f),
-					IM_COL32(160, 158, 190, (int)((200 + 40 * pill_ht) * a)), pill_text.c_str());
-
-				ImGui::SetCursorPos(ImVec2(hit_x, hit_y));
-				ImGui::InvisibleButton("##model_pill", ImVec2(hit_w, hit_h));
-				if (ImGui::IsItemClicked())
-					model_open = !model_open;
-				if (ImGui::IsItemHovered())
-					ImGui::SetTooltip("Click to change model");
-
-				float popup_target = model_open ? 1.f : 0.f;
-				popup_alpha += (popup_target - popup_alpha) * std::min(12.f * dt, 1.f);
-				if (popup_alpha < 0.01f) popup_alpha = 0.f;
-
-				if (popup_alpha > 0.01f) {
-					float offset_y = 6.f * popup_alpha;
-					ImGui::SetNextWindowPos(ImVec2(pmin.x, pmin.y - offset_y), ImGuiCond_Always, ImVec2(0.f, 1.f));
-					ImGui::SetNextWindowBgAlpha(0.96f * popup_alpha);
-					ImGui::SetNextWindowSizeConstraints(ImVec2(260.f, 60.f), ImVec2(380.f, 400.f));
-					ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
-					ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.f, 6.f));
-					ImGui::PushStyleVar(ImGuiStyleVar_Alpha, popup_alpha);
-					ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(th_ph_r/255.f, th_ph_g/255.f, th_ph_b/255.f, 1.f));
-					ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1, 1, 1, 0.08f));
-
-					bool popup_visible = true;
-					if (ImGui::Begin("##model_popup", &popup_visible,
-						ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-						ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
-						ImGuiWindowFlags_NoFocusOnAppearing))
-					{
-						if (!popup_visible) model_open = false;
-
-						static char model_filter[64] = {};
-						ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
-						ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
-						ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.06f, 0.06f, 0.09f, 1.f));
-						ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-						ImGui::InputTextWithHint("##model_search", "Search models...", model_filter, sizeof(model_filter));
-						ImGui::PopStyleColor();
-						ImGui::PopStyleVar(2);
-
-						ImGui::Spacing();
-						std::string filter_lower;
-						for (const char* p = model_filter; *p; p++)
-							filter_lower += (char)tolower(*p);
-
-
-						ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.f), "Providers");
-						ImGui::Separator();
-						for (auto& profile : g_sa_settings.provider_profiles) {
-							if (!filter_lower.empty()) {
-								std::string pname_lower;
-								for (char ch : profile.display_name)
-									pname_lower += (char)tolower(ch);
-								if (pname_lower.find(filter_lower) == std::string::npos)
-									continue;
-							}
-							bool is_active = (profile.id == g_sa_settings.active_provider_profile_id);
-							if (is_active) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ax3, ay3, az3, 1.f));
-							if (ImGui::Selectable(profile.display_name.c_str(), is_active, 0, ImVec2(200.f, 0.f))) {
-								g_sa_settings.active_provider_profile_id = profile.id;
-								g_sa_settings.sync_legacy_fields_from_active_profile();
-								g_sa_settings.save();
-							}
-							if (is_active) ImGui::PopStyleColor();
-						}
-
-						ImGui::Spacing();
-						ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.f), "Models");
-						ImGui::Separator();
-
-						if (auto* current_profile = g_sa_settings.get_active_profile()) {
-							const auto& model_list = settings_sa_t::models_for_kind(current_profile->kind);
-							for (const auto& m : model_list) {
-								if (!filter_lower.empty()) {
-									std::string m_lower;
-									for (char ch : m)
-										m_lower += (char)tolower(ch);
-									if (m_lower.find(filter_lower) == std::string::npos)
-										continue;
-								}
-								bool is_sel = (current_profile->model == m);
-								if (is_sel) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ax3, ay3, az3, 1.f));
-								if (ImGui::Selectable(m.c_str(), is_sel, 0, ImVec2(260.f, 0.f))) {
-									current_profile->model = m;
-									g_sa_settings.sync_legacy_fields_from_active_profile();
-									g_sa_settings.save();
-									model_open = false;
-								}
-								if (is_sel) ImGui::PopStyleColor();
-							}
-						}
-					}
-					ImGui::End();
-					ImGui::PopStyleColor(2);
-					ImGui::PopStyleVar(3);
-
-					if (model_open && !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-						model_open = false;
-				}
-			}
-
 			ImGui::SetCursorPos(ImVec2(0.f, input_y));
 			ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(th_pb_r/255.f, th_pb_g/255.f, th_pb_b/255.f, 0.85f * a));
 			ImGui::PushStyleColor(ImGuiCol_Border,  ImVec4(1, 1, 1, 0.08f * a));
@@ -4757,6 +4677,131 @@ void helpers::render_title()
 				float ph_y = input_min.y + input_pad;
 				dl->AddText(ImVec2(input_min.x + 8.f, ph_y),
 					IM_COL32(110, 105, 145, (int)(140 * a)), "Ask anything...");
+			}
+
+			{
+				static float popup_alpha = 0.f;
+				auto* active_profile = g_sa_settings.get_active_profile();
+				std::string provider = active_profile ? active_profile->display_name : "No profile";
+				std::string model    = active_profile ? active_profile->model : "No model";
+
+				if (model.empty()) model = "Select model";
+				std::string pill_text = provider + " / " + model;
+
+				float max_pill_w = (input_max.x - input_min.x) * 0.7f;
+				ImVec2 pill_ts = ImGui::CalcTextSize(pill_text.c_str());
+				if (pill_ts.x > max_pill_w && pill_text.size() > 20) {
+					pill_text.resize(20);
+					pill_text += "...";
+					pill_ts = ImGui::CalcTextSize(pill_text.c_str());
+				}
+
+				float pill_h  = 22.f;
+				float pill_w  = pill_ts.x + 24.f;
+				float pill_x  = input_min.x + 8.f;
+				float pill_y_abs = input_max.y - pill_h - 4.f;
+
+				ImVec2 pmin(pill_x, pill_y_abs);
+				ImVec2 pmax(pill_x + pill_w, pill_y_abs + pill_h);
+
+				bool pill_hov = ImGui::IsMouseHoveringRect(pmin, pmax);
+				static float pill_ht = 0.f;
+				pill_ht += ((pill_hov ? 1.f : 0.f) - pill_ht) * std::min(10.f * dt, 1.f);
+
+				dl->AddRectFilled(pmin, pmax,
+					IM_COL32(40, 38, 60, (int)((160 + 40 * pill_ht) * a)), 11.f);
+				dl->AddRect(pmin, pmax,
+					IM_COL32(255, 255, 255, (int)((15 + 20 * pill_ht) * a)), 11.f, 0, 0.75f);
+				dl->AddText(ImVec2(pmin.x + 12.f, pmin.y + (pill_h - pill_ts.y) * 0.5f),
+					IM_COL32(160, 158, 190, (int)((200 + 40 * pill_ht) * a)), pill_text.c_str());
+
+				ImVec2 wp = ImGui::GetWindowPos();
+				ImGui::SetCursorPos(ImVec2(pmin.x - wp.x, pmin.y - wp.y));
+				ImGui::InvisibleButton("##model_pill", ImVec2(pill_w, pill_h));
+				if (ImGui::IsItemClicked())
+					ImGui::OpenPopup("##model_popup");
+				if (ImGui::IsItemHovered())
+					ImGui::SetTooltip("Click to change model");
+
+				bool popup_open = ImGui::IsPopupOpen("##model_popup");
+				float popup_target = popup_open ? 1.f : 0.f;
+				popup_alpha += (popup_target - popup_alpha) * std::min(12.f * dt, 1.f);
+				if (popup_alpha < 0.01f) popup_alpha = 0.f;
+
+				ImGui::SetNextWindowPos(ImVec2(pmin.x, pmin.y - 6.f * std::min(popup_alpha * 2.f, 1.f)), ImGuiCond_Always, ImVec2(0.f, 1.f));
+				ImGui::SetNextWindowSizeConstraints(ImVec2(260.f, 60.f), ImVec2(380.f, 400.f));
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.f, 6.f));
+				ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::min(popup_alpha * 2.f, 1.f));
+				ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(th_ph_r/255.f, th_ph_g/255.f, th_ph_b/255.f, 0.96f));
+				ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1, 1, 1, 0.08f));
+
+				if (ImGui::BeginPopup("##model_popup", ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+					ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
+				{
+					static char model_filter[64] = {};
+					ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+					ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
+					ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.06f, 0.06f, 0.09f, 1.f));
+					ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+					ImGui::InputTextWithHint("##model_search", "Search models...", model_filter, sizeof(model_filter));
+					ImGui::PopStyleColor();
+					ImGui::PopStyleVar(2);
+
+					ImGui::Spacing();
+					std::string filter_lower;
+					for (const char* p = model_filter; *p; p++)
+						filter_lower += (char)tolower(*p);
+
+					ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.f), "Providers");
+					ImGui::Separator();
+					for (auto& profile : g_sa_settings.provider_profiles) {
+						if (!filter_lower.empty()) {
+							std::string pname_lower;
+							for (char ch : profile.display_name)
+								pname_lower += (char)tolower(ch);
+							if (pname_lower.find(filter_lower) == std::string::npos)
+								continue;
+						}
+						bool is_active = (profile.id == g_sa_settings.active_provider_profile_id);
+						if (is_active) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ax3, ay3, az3, 1.f));
+						if (ImGui::Selectable(profile.display_name.c_str(), is_active, 0, ImVec2(200.f, 0.f))) {
+							g_sa_settings.active_provider_profile_id = profile.id;
+							g_sa_settings.sync_legacy_fields_from_active_profile();
+							g_sa_settings.save();
+						}
+						if (is_active) ImGui::PopStyleColor();
+					}
+
+					ImGui::Spacing();
+					ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.f), "Models");
+					ImGui::Separator();
+
+					if (auto* current_profile = g_sa_settings.get_active_profile()) {
+						const auto& model_list = settings_sa_t::models_for_kind(current_profile->kind);
+						for (const auto& m : model_list) {
+							if (!filter_lower.empty()) {
+								std::string m_lower;
+								for (char ch : m)
+									m_lower += (char)tolower(ch);
+								if (m_lower.find(filter_lower) == std::string::npos)
+									continue;
+							}
+							bool is_sel = (current_profile->model == m);
+							if (is_sel) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ax3, ay3, az3, 1.f));
+							if (ImGui::Selectable(m.c_str(), is_sel, 0, ImVec2(260.f, 0.f))) {
+								current_profile->model = m;
+								g_sa_settings.sync_legacy_fields_from_active_profile();
+								g_sa_settings.save();
+								ImGui::CloseCurrentPopup();
+							}
+							if (is_sel) ImGui::PopStyleColor();
+						}
+					}
+					ImGui::EndPopup();
+				}
+				ImGui::PopStyleColor(2);
+				ImGui::PopStyleVar(3);
 			}
 
 
@@ -4834,7 +4879,7 @@ void helpers::render_title()
 	end_child();
 	}
 
-
+	g_render_section = "bottom_panel";
 	if (bottom_h > 5.f) {
 		float right_gap_bp = (right_w > 1.f) ? (right_w + gap) : 0.f;
 		float bp_x = pad;
@@ -5097,7 +5142,7 @@ void helpers::render_title()
 		}
 	}
 
-
+	g_render_section = "status_bar";
 	{
 		ImVec2 wp = ImGui::GetWindowPos();
 		ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -5294,7 +5339,8 @@ void helpers::render_title()
 	tick_ai_chat();
 	poll_ai_chat();
 
-
+	g_render_section = "popups";
+	g_render_section = "popups_command_palette";
 	if (globals::ui::command_palette_open) {
 		struct PaletteCmd {
 			const char* label;
@@ -5576,6 +5622,7 @@ void helpers::render_title()
 	}
 
 
+	g_render_section = "popups_attach_dialog";
 	static int pa_open_frame = -1;
 	static float pa_anim = 0.f;
 	static bool pa_closing = false;
@@ -5702,7 +5749,11 @@ void helpers::render_title()
 
 				pa_refresh_timer -= ImGui::GetIO().DeltaTime;
 				if (pa_refresh_timer <= 0.f || pa_proc_list.empty()) {
-					pa_proc_list = driver_bridge::enumerate_processes();
+					try {
+						pa_proc_list = driver_bridge::enumerate_processes();
+					} catch (...) {
+						OutputDebugStringA("AiDA Standalone: EXCEPTION in enumerate_processes()\n");
+					}
 					pa_refresh_timer = 2.f;
 				}
 
@@ -5823,14 +5874,19 @@ void helpers::render_title()
 
 
 				if (do_attach && can_attach) {
+				  try {
 					auto& p = pa_proc_list[pa_selected];
+					driver_bridge::debug_log("ATTACH: attempting pid=%u name=%s\n", p.pid, p.name.c_str());
 					if (!driver_bridge::attach(p.pid)) {
+						driver_bridge::debug_log("ATTACH: FAILED for pid=%u err=%s\n", p.pid, driver_bridge::last_error().c_str());
 						output_log::push(bottom_tab_t::output,
 							"[Driver] Failed to attach to PID " + std::to_string(p.pid) + ": " +
 							driver_bridge::last_error() + "\n");
 						pa_closing = true;
 					} else {
+						driver_bridge::debug_log("ATTACH: SUCCESS pid=%u, enumerating modules...\n", p.pid);
 						auto modules = driver_bridge::enumerate_modules();
+						driver_bridge::debug_log("ATTACH: enumerate_modules returned %llu modules\n", (unsigned long long)modules.size());
 						if (!modules.empty()) {
 							const auto* target_mod = &modules[0];
 							for (const auto& m : modules) {
@@ -5842,6 +5898,8 @@ void helpers::render_title()
 							}
 							uint64_t mod_size = target_mod->size;
 							if (mod_size == 0) mod_size = 0x100000;
+							driver_bridge::debug_log("ATTACH: calling start_live pid=%u base=0x%llX size=0x%llX mod=%s\n",
+								p.pid, (unsigned long long)target_mod->base, (unsigned long long)mod_size, target_mod->name.c_str());
 							disasm::start_live(g_disasm, p.pid, target_mod->base, mod_size, target_mod->name);
 							globals::ui::active_center_view = center_view_t::disassembly;
 						} else {
@@ -5851,6 +5909,15 @@ void helpers::render_title()
 						}
 						pa_closing = true;
 					}
+				  } catch (const std::exception& e) {
+					char dbg[512];
+					snprintf(dbg, sizeof(dbg), "AiDA Standalone: EXCEPTION in attach handler: %s\n", e.what());
+					OutputDebugStringA(dbg);
+					pa_closing = true;
+				  } catch (...) {
+					OutputDebugStringA("AiDA Standalone: UNKNOWN EXCEPTION in attach handler\n");
+					pa_closing = true;
+				  }
 				}
 			}
 			ImGui::EndChild();
@@ -5864,25 +5931,59 @@ void helpers::render_title()
 	}
 
 
-	if (globals::ui::driver_status_open) {
-		ImDrawList* fdl = ImGui::GetForegroundDrawList();
+	g_render_section = "popups_driver_status";
+	static int ds_open_frame = -1;
+	static float ds_anim = 0.f;
+	static bool ds_closing = false;
+
+	{
+		float dt_ds = ImGui::GetIO().DeltaTime;
+		float ds_target = (globals::ui::driver_status_open && !ds_closing) ? 1.f : 0.f;
+		ds_anim += (ds_target - ds_anim) * (std::min)(dt_ds * 14.f, 1.f);
+		if (std::abs(ds_anim - ds_target) < 0.003f) ds_anim = ds_target;
+
+		if (ds_closing && ds_anim < 0.01f) {
+			ds_closing = false;
+			globals::ui::driver_status_open = false;
+			ds_open_frame = -1;
+			ds_anim = 0.f;
+		}
+	}
+
+	if (globals::ui::driver_status_open || ds_anim > 0.005f) {
+		if (ds_open_frame < 0) ds_open_frame = ImGui::GetFrameCount();
+
 		ImVec2 vp = ImGui::GetIO().DisplaySize;
-		fdl->AddRectFilled(ImVec2(0, 0), vp, IM_COL32(0, 0, 0, 120));
+		ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(0, 0), vp,
+			IM_COL32(0, 0, 0, static_cast<int>(140.f * ds_anim)));
 
 		float pw = 500.f, ph = 380.f;
-		float px = (vp.x - pw) * 0.5f, py = (vp.y - ph) * 0.5f;
+		float ds_scale = 0.96f + 0.04f * ds_anim;
+		float sw = pw * ds_scale, sh = ph * ds_scale;
+		float px = (vp.x - sw) * 0.5f, py = (vp.y - sh) * 0.5f;
+
+		if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ds_closing)
+			ds_closing = true;
+
+		if (ImGui::GetFrameCount() > ds_open_frame + 1 && !ds_closing &&
+			ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			ImVec2 mp = ImGui::GetIO().MousePos;
+			if (mp.x < px || mp.x > px + sw || mp.y < py || mp.y > py + sh)
+				ds_closing = true;
+		}
 
 		ImGui::SetNextWindowPos(ImVec2(px, py));
-		ImGui::SetNextWindowSize(ImVec2(pw, ph));
-		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(28, 28, 36, 245));
-		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(70, 70, 90, 200));
+		ImGui::SetNextWindowSize(ImVec2(sw, sh));
+		ImGui::SetNextWindowFocus();
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(28, 28, 36, static_cast<int>(245.f * ds_anim)));
+		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(70, 70, 90, static_cast<int>(200.f * ds_anim)));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 12));
 
-		if (ImGui::Begin("Driver Status##drv_dlg", &globals::ui::driver_status_open,
-				ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-				ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
-
+		ImGui::Begin("Driver Status##drv_dlg", nullptr,
+				ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+				ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+		{
 			bool is_attached = driver_bridge::attached_pid() != 0;
 			ImGui::TextColored(is_attached ? ImVec4(0.4f, 0.8f, 0.4f, 1.f) : ImVec4(0.6f, 0.6f, 0.7f, 1.f),
 				is_attached ? "Status: Attached" : "Status: Detached");
@@ -5897,7 +5998,7 @@ void helpers::render_title()
 					if (ImGui::BeginTabItem("Modules")) {
 						drv_tab = 0;
 						auto mods = driver_bridge::enumerate_modules();
-						ImGui::BeginChild("##mod_list", ImVec2(-1, ph - 180.f));
+						ImGui::BeginChild("##mod_list", ImVec2(-1, sh - 180.f));
 						for (auto& m : mods) {
 							ImGui::Text("0x%llX  %s", (unsigned long long)m.base, m.name.c_str());
 						}
@@ -5907,7 +6008,7 @@ void helpers::render_title()
 					if (ImGui::BeginTabItem("Threads")) {
 						drv_tab = 1;
 						auto threads = driver_bridge::enumerate_threads();
-						ImGui::BeginChild("##thr_list", ImVec2(-1, ph - 180.f));
+						ImGui::BeginChild("##thr_list", ImVec2(-1, sh - 180.f));
 						for (auto& t : threads) {
 							ImGui::Text("TID %u  Priority %d", (unsigned)t.tid, t.priority);
 						}
@@ -5927,7 +6028,7 @@ void helpers::render_title()
 				ImGui::SameLine();
 			}
 			if (ImGui::Button("Close", ImVec2(btn_w, 26))) {
-				globals::ui::driver_status_open = false;
+				ds_closing = true;
 			}
 		}
 		ImGui::End();
@@ -5936,25 +6037,59 @@ void helpers::render_title()
 	}
 
 
-	if (globals::ui::about_dialog_open) {
-		ImDrawList* fdl = ImGui::GetForegroundDrawList();
+	static int ab_open_frame = -1;
+	static float ab_anim = 0.f;
+	static bool ab_closing = false;
+
+	{
+		float dt_ab = ImGui::GetIO().DeltaTime;
+		float ab_target = (globals::ui::about_dialog_open && !ab_closing) ? 1.f : 0.f;
+		ab_anim += (ab_target - ab_anim) * (std::min)(dt_ab * 14.f, 1.f);
+		if (std::abs(ab_anim - ab_target) < 0.003f) ab_anim = ab_target;
+
+		if (ab_closing && ab_anim < 0.01f) {
+			ab_closing = false;
+			globals::ui::about_dialog_open = false;
+			ab_open_frame = -1;
+			ab_anim = 0.f;
+		}
+	}
+
+	g_render_section = "popups_about";
+	if (globals::ui::about_dialog_open || ab_anim > 0.005f) {
+		if (ab_open_frame < 0) ab_open_frame = ImGui::GetFrameCount();
+
 		ImVec2 vp = ImGui::GetIO().DisplaySize;
-		fdl->AddRectFilled(ImVec2(0, 0), vp, IM_COL32(0, 0, 0, 120));
+		ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(0, 0), vp,
+			IM_COL32(0, 0, 0, static_cast<int>(140.f * ab_anim)));
 
 		float pw = 360.f, ph = 220.f;
-		float px = (vp.x - pw) * 0.5f, py = (vp.y - ph) * 0.5f;
+		float ab_scale = 0.96f + 0.04f * ab_anim;
+		float sw = pw * ab_scale, sh = ph * ab_scale;
+		float px = (vp.x - sw) * 0.5f, py = (vp.y - sh) * 0.5f;
+
+		if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ab_closing)
+			ab_closing = true;
+
+		if (ImGui::GetFrameCount() > ab_open_frame + 1 && !ab_closing &&
+			ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			ImVec2 mp = ImGui::GetIO().MousePos;
+			if (mp.x < px || mp.x > px + sw || mp.y < py || mp.y > py + sh)
+				ab_closing = true;
+		}
 
 		ImGui::SetNextWindowPos(ImVec2(px, py));
-		ImGui::SetNextWindowSize(ImVec2(pw, ph));
-		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(28, 28, 36, 245));
-		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(70, 70, 90, 200));
+		ImGui::SetNextWindowSize(ImVec2(sw, sh));
+		ImGui::SetNextWindowFocus();
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(28, 28, 36, static_cast<int>(245.f * ab_anim)));
+		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(70, 70, 90, static_cast<int>(200.f * ab_anim)));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20, 16));
 
-		if (ImGui::Begin("About AiDA##about_dlg", &globals::ui::about_dialog_open,
-				ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-				ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
-
+		ImGui::Begin("About AiDA##about_dlg", nullptr,
+				ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+				ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+		{
 			ImVec4 ac = globals::ui::accent;
 			ImGui::TextColored(ac, "AiDA Standalone IDE");
 			ImGui::Spacing();
@@ -5967,7 +6102,7 @@ void helpers::render_title()
 			ImGui::TextWrapped("Multi-provider AI: Anthropic, OpenAI, Google, OpenRouter, Local.");
 			ImGui::Spacing();
 			if (ImGui::Button("OK", ImVec2(80, 26))) {
-				globals::ui::about_dialog_open = false;
+				ab_closing = true;
 			}
 		}
 		ImGui::End();
@@ -5976,25 +6111,59 @@ void helpers::render_title()
 	}
 
 
-	if (globals::ui::shortcuts_dialog_open) {
-		ImDrawList* fdl = ImGui::GetForegroundDrawList();
+	static int kb_open_frame = -1;
+	static float kb_anim = 0.f;
+	static bool kb_closing = false;
+
+	{
+		float dt_kb = ImGui::GetIO().DeltaTime;
+		float kb_target = (globals::ui::shortcuts_dialog_open && !kb_closing) ? 1.f : 0.f;
+		kb_anim += (kb_target - kb_anim) * (std::min)(dt_kb * 14.f, 1.f);
+		if (std::abs(kb_anim - kb_target) < 0.003f) kb_anim = kb_target;
+
+		if (kb_closing && kb_anim < 0.01f) {
+			kb_closing = false;
+			globals::ui::shortcuts_dialog_open = false;
+			kb_open_frame = -1;
+			kb_anim = 0.f;
+		}
+	}
+
+	g_render_section = "popups_shortcuts";
+	if (globals::ui::shortcuts_dialog_open || kb_anim > 0.005f) {
+		if (kb_open_frame < 0) kb_open_frame = ImGui::GetFrameCount();
+
 		ImVec2 vp = ImGui::GetIO().DisplaySize;
-		fdl->AddRectFilled(ImVec2(0, 0), vp, IM_COL32(0, 0, 0, 120));
+		ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(0, 0), vp,
+			IM_COL32(0, 0, 0, static_cast<int>(140.f * kb_anim)));
 
 		float pw = 500.f, ph = 440.f;
-		float px = (vp.x - pw) * 0.5f, py = (vp.y - ph) * 0.5f;
+		float kb_scale = 0.96f + 0.04f * kb_anim;
+		float sw = pw * kb_scale, sh = ph * kb_scale;
+		float px = (vp.x - sw) * 0.5f, py = (vp.y - sh) * 0.5f;
+
+		if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !kb_closing)
+			kb_closing = true;
+
+		if (ImGui::GetFrameCount() > kb_open_frame + 1 && !kb_closing &&
+			ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			ImVec2 mp = ImGui::GetIO().MousePos;
+			if (mp.x < px || mp.x > px + sw || mp.y < py || mp.y > py + sh)
+				kb_closing = true;
+		}
 
 		ImGui::SetNextWindowPos(ImVec2(px, py));
-		ImGui::SetNextWindowSize(ImVec2(pw, ph));
-		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(28, 28, 36, 245));
-		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(70, 70, 90, 200));
+		ImGui::SetNextWindowSize(ImVec2(sw, sh));
+		ImGui::SetNextWindowFocus();
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(28, 28, 36, static_cast<int>(245.f * kb_anim)));
+		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(70, 70, 90, static_cast<int>(200.f * kb_anim)));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 12));
 
-		if (ImGui::Begin("Keyboard Shortcuts##kb_dlg", &globals::ui::shortcuts_dialog_open,
-				ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-				ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
-
+		ImGui::Begin("Keyboard Shortcuts##kb_dlg", nullptr,
+				ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+				ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+		{
 			struct ShortcutEntry { const char* keys; const char* desc; };
 			static const ShortcutEntry general[] = {
 				{ "Ctrl+Shift+P", "Command Palette" },
@@ -6025,7 +6194,7 @@ void helpers::render_title()
 				{ "Ctrl+Shift+Tab", "Previous Tab" },
 			};
 
-			auto render_section = [](const char* title, const ShortcutEntry* entries, int count) {
+			auto render_section = [&](const char* title, const ShortcutEntry* entries, int count) {
 				ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.f), "%s", title);
 				ImGui::Separator();
 				for (int i = 0; i < count; i++) {
@@ -6034,7 +6203,7 @@ void helpers::render_title()
 				ImGui::Spacing();
 			};
 
-			ImGui::BeginChild("##kb_scroll", ImVec2(-1, ph - 80.f));
+			ImGui::BeginChild("##kb_scroll", ImVec2(-1, sh - 80.f));
 			render_section("General", general, 6);
 			render_section("Editor", editor, 9);
 			render_section("Panels", panels, 7);
@@ -6042,7 +6211,7 @@ void helpers::render_title()
 
 			ImGui::Spacing();
 			if (ImGui::Button("Close", ImVec2(80, 26))) {
-				globals::ui::shortcuts_dialog_open = false;
+				kb_closing = true;
 			}
 		}
 		ImGui::End();
@@ -6050,7 +6219,9 @@ void helpers::render_title()
 		ImGui::PopStyleColor(2);
 	}
 
+	g_render_section = "popups_tool_approval";
 	render_tool_approval_dialog();
 	ImGui::PopStyleVar();
 	ImGui::End();
+	g_render_section = "done";
 }

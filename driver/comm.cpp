@@ -167,11 +167,14 @@ bool voyager::device_t::connect() noexcept {
     );
 
     if (!is_connected()) {
+        last_connect_error_ = GetLastError();
         return false;
     }
+    last_connect_error_ = 0;
     session_key_ = static_cast<std::uint32_t>(__rdtsc() ^ 0xDEADC0DEu);
     if (session_key_ == 0) session_key_ = 0x12345678u;
     if (!send_heartbeat()) {
+        last_connect_error_ = 0xBEA70000u | GetLastError();
         CloseHandle(driver_handle_);
         driver_handle_ = INVALID_HANDLE_VALUE;
         session_key_ = 0;
@@ -1564,6 +1567,12 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
         nullptr
     );
 
+    if (!result) {
+        DWORD err = GetLastError();
+        RC_UM_DBG("send_request FAILED ioctl=0x%08X input_size=%u err=%lu handle=0x%llX",
+            control_code, input_size, err, reinterpret_cast<unsigned long long>(driver_handle_));
+    }
+
     spoofer::scatter_execution();
     thread_hijack::collect_entropy();
 
@@ -1936,6 +1945,7 @@ std::vector<voyager::device_t::net_connection_info> voyager::device_t::enumerate
     req->filter_protocol = filter_protocol;
 
     if (send_request(ioctl_codes::NCON(), req, static_cast<DWORD>(sizeof(*req)))) {
+        RC_UM_DBG("enumerate_connections: ioctl OK, connection_count=%u", req->connection_count);
         result.reserve(req->connection_count);
         for (std::uint32_t i = 0; i < req->connection_count; i++) {
             net_connection_info info{};
@@ -1972,8 +1982,10 @@ bool voyager::device_t::start_capture(std::uint32_t filter_pid, std::uint32_t fi
     if (filter_ip) std::memcpy(req.filter_ip, filter_ip, 16);
 
     if (!send_request(ioctl_codes::NCAP(), &req, sizeof(req))) {
+        RC_UM_DBG("start_capture: ioctl FAILED");
         return false;
     }
+    RC_UM_DBG("start_capture: ioctl OK, capture_active=%u", req.capture_active);
     return req.capture_active != 0;
 }
 
@@ -2022,6 +2034,7 @@ std::vector<voyager::device_t::captured_packet> voyager::device_t::get_captured_
     req->max_packets = max_packets;
 
     if (send_request(ioctl_codes::NCPG(), req, static_cast<DWORD>(sizeof(*req)))) {
+        RC_UM_DBG("get_captured_packets: ioctl OK, packet_count=%u", req->packet_count);
         result.reserve(req->packet_count);
         for (std::uint32_t i = 0; i < req->packet_count; i++) {
             captured_packet pkt{};
@@ -2064,6 +2077,7 @@ std::vector<voyager::device_t::dns_entry> voyager::device_t::get_dns_queries(std
     req->filter_pid = filter_pid;
 
     if (send_request(ioctl_codes::NDNS(), req, static_cast<DWORD>(sizeof(*req)))) {
+        RC_UM_DBG("get_dns_queries: ioctl OK, entry_count=%u", req->entry_count);
         result.reserve(req->entry_count);
         for (std::uint32_t i = 0; i < req->entry_count; i++) {
             dns_entry entry{};
@@ -3324,4 +3338,24 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
 
     if (out_driver_proof) *out_driver_proof = req.driver_proof;
     return req.result == 1;
+}
+
+bool voyager::device_t::run_hv_detect(detail::hv_detect_result& out) noexcept {
+    if (!is_connected()) {
+        return false;
+    }
+
+    union {
+        detail::hv_detect_request req;
+        detail::hv_detect_result  result;
+    } buf{};
+    buf.req.flags = 0;
+
+    DWORD buf_size = sizeof(buf);
+    if (!send_request(ioctl_codes::HVDT(), &buf, buf_size)) {
+        return false;
+    }
+
+    std::memcpy(&out, &buf.result, sizeof(out));
+    return true;
 }

@@ -56,7 +56,21 @@ namespace detail {
             || wcsstr(lower_name, L"winapioverride") || wcsstr(lower_name, L"rohitab")
             || wcsstr(lower_name, L"dumpbin") || wcsstr(lower_name, L"immunity")
             || wcsstr(lower_name, L"frida") || wcsstr(lower_name, L"pin.exe")
-            || wcsstr(lower_name, L"pintool");
+            || wcsstr(lower_name, L"pintool")
+            || wcsstr(lower_name, L"cheatengine") || wcsstr(lower_name, L"cheat engine")
+            || wcsstr(lower_name, L"ce.exe") || wcsstr(lower_name, L"scylla")
+            || wcsstr(lower_name, L"processhacker") || wcsstr(lower_name, L"systeminformer")
+            || wcsstr(lower_name, L"hyperdbg") || wcsstr(lower_name, L"pebear")
+            || wcsstr(lower_name, L"pe-bear") || wcsstr(lower_name, L"detect_it_easy")
+            || wcsstr(lower_name, L"exeinfope") || wcsstr(lower_name, L"procmon")
+            || wcsstr(lower_name, L"procexp") || wcsstr(lower_name, L"de4dot")
+            || wcsstr(lower_name, L"ilspy") || wcsstr(lower_name, L"jd-gui")
+            || wcsstr(lower_name, L"jadx") || wcsstr(lower_name, L"snowman")
+            || wcsstr(lower_name, L"retdec") || wcsstr(lower_name, L"imhex")
+            || wcsstr(lower_name, L"httpdebugger") || wcsstr(lower_name, L"fiddler")
+            || wcsstr(lower_name, L"charles.exe") || wcsstr(lower_name, L"mitmproxy")
+            || wcsstr(lower_name, L"titanhide") || wcsstr(lower_name, L"sharphide")
+            || wcsstr(lower_name, L"dbgview") || wcsstr(lower_name, L"dbgchild");
     }
 
 }

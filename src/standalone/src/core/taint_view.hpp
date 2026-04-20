@@ -165,42 +165,34 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ui_anim::render_toolbar(dl, cx, cy, width, toolbar_h, accent_r, accent_g, accent_b, alpha);
 
 	ImGui::PushItemWidth(140.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(alpha * 255)));
-	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(alpha * 150)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
+	ImGui::PushStyleColor(ImGuiCol_Border, _ta(ui_anim::lighten(_t.panel_bg, 12)));
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 
 	ImGui::SetCursorScreenPos(ImVec2(cx + pad, cy + pad));
-	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(static_cast<int>(accent_r * 200 + 55),
-		static_cast<int>(accent_g * 200 + 55), static_cast<int>(accent_b * 200 + 55),
-		static_cast<int>(alpha * 220)));
+	ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_secondary));
 	ImGui::TextUnformatted("Start");
 	ImGui::PopStyleColor();
 	ImGui::SameLine();
 	ImGui::InputText("##taint_addr", st.addr_buf, sizeof(st.addr_buf));
 
 	ImGui::SameLine();
-	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(static_cast<int>(accent_r * 200 + 55),
-		static_cast<int>(accent_g * 200 + 55), static_cast<int>(accent_b * 200 + 55),
-		static_cast<int>(alpha * 220)));
+	ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_secondary));
 	ImGui::TextUnformatted("End");
 	ImGui::PopStyleColor();
 	ImGui::SameLine();
 	ImGui::InputText("##taint_end", st.end_addr_buf, sizeof(st.end_addr_buf));
 
 	ImGui::SameLine();
-	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(static_cast<int>(accent_r * 200 + 55),
-		static_cast<int>(accent_g * 200 + 55), static_cast<int>(accent_b * 200 + 55),
-		static_cast<int>(alpha * 220)));
+	ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_secondary));
 	ImGui::TextUnformatted("Taint Regs");
 	ImGui::PopStyleColor();
 	ImGui::SameLine();
 	ImGui::InputText("##taint_regs", st.taint_regs_buf, sizeof(st.taint_regs_buf));
 
 	ImGui::SameLine();
-	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(static_cast<int>(accent_r * 200 + 55),
-		static_cast<int>(accent_g * 200 + 55), static_cast<int>(accent_b * 200 + 55),
-		static_cast<int>(alpha * 220)));
+	ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_secondary));
 	ImGui::TextUnformatted("Mem");
 	ImGui::PopStyleColor();
 	ImGui::SameLine();
@@ -218,9 +210,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 	if (busy) {
-		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(50, 52, 62, static_cast<int>(alpha * 200)));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(50, 52, 62, static_cast<int>(alpha * 200)));
-		ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(50, 52, 62, static_cast<int>(alpha * 200)));
+		ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(_t.panel_header));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, _ta(_t.panel_header));
 	} else {
 		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(static_cast<int>(accent_r * 140),
 			static_cast<int>(accent_g * 140), static_cast<int>(accent_b * 140), static_cast<int>(alpha * 200)));
@@ -252,14 +244,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	ImGui::SameLine();
-	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(static_cast<int>(accent_r * 200 + 55),
-		static_cast<int>(accent_g * 200 + 55), static_cast<int>(accent_b * 200 + 55),
-		static_cast<int>(alpha * 220)));
+	ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_secondary));
 	ImGui::TextUnformatted("Max");
 	ImGui::PopStyleColor();
 	ImGui::SameLine();
 	ImGui::SetNextItemWidth(100.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
 	ImGui::PushStyleColor(ImGuiCol_SliderGrab, accent);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::SliderInt("##taint_max", &st.max_insns, 100, 100000);
@@ -275,7 +265,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (active) {
 			ImGui::PushStyleColor(ImGuiCol_Button, accent);
 		} else {
-			ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(40, 42, 55, static_cast<int>(alpha * 200)));
+			ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
 		}
 		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(static_cast<int>(accent_r * 180),
 			static_cast<int>(accent_g * 180), static_cast<int>(accent_b * 180), static_cast<int>(alpha * 200)));
@@ -337,13 +327,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ui_anim::render_stat_card(dl, sx, sy, card_w2, card_h2, "Taint Addrs", b4,
 		accent_r, accent_g, accent_b, alpha, sink_col);
 
-	float legend_x = cx + width - 300.f;
-	float legend_y = sy + card_h2 + 4.f;
+	float legend_x = cx + width - 180.f;
+	float legend_y = content_y + 6.f;
+	dl->AddRectFilled(ImVec2(legend_x - 6.f, legend_y - 4.f), ImVec2(cx + width - 6.f, legend_y + 18.f),
+		_ta(ui_anim::darken(_t.panel_bg, 10)), 4.f);
+	dl->AddRect(ImVec2(legend_x - 6.f, legend_y - 4.f), ImVec2(cx + width - 6.f, legend_y + 18.f),
+		_ta(ui_anim::lighten(_t.panel_bg, 12)), 4.f);
 	const char* legend_labels[] = { "Source", "Propagation", "Sink" };
 	const ImU32 legend_colors[] = { source_col, prop_col, sink_col };
 	ui_anim::render_color_legend(dl, legend_x, legend_y, legend_labels, legend_colors, 3, alpha);
 
-	float table_y = legend_y + 18.f;
+	float table_y = sy + card_h2 + 8.f;
 	float table_h = content_h - (table_y - content_y);
 
 	float mode_alpha = alpha * st.mode_crossfade;
@@ -447,7 +441,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			return;
 		}
 
-		float node_w = 300.f;
+		float node_w = (std::min)(300.f, width * 0.4f);
 		float node_h = 24.f;
 		float node_spacing = 8.f;
 		float flow_x = cx + pad;
@@ -477,9 +471,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			auto& n = nodes[i];
 			float ny = flow_y + static_cast<float>(i - start) * (node_h + node_spacing);
 
-			ImU32 node_bg = n.is_source ? IM_COL32(40, 70, 75, static_cast<int>(alpha * 255))
-				: (n.is_sink ? IM_COL32(75, 40, 45, static_cast<int>(alpha * 255))
-				: IM_COL32(60, 55, 40, static_cast<int>(alpha * 255)));
+			ImU32 node_bg = n.is_source ? _ta(ui_anim::darken(_t.panel_bg, 8))
+				: (n.is_sink ? _ta(ui_anim::darken(_t.panel_bg, 6))
+				: _ta(ui_anim::darken(_t.panel_bg, 4)));
 
 			ImU32 border = n.is_source ? source_col : (n.is_sink ? sink_col : prop_col);
 
@@ -495,14 +489,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			dl->AddRect(ImVec2(nx, ny), ImVec2(nx + node_w, ny + node_h), border, 4.f);
 
 			const char* type_label = n.is_source ? "SRC" : (n.is_sink ? "SINK" : "PROP");
-			ImU32 type_bg = n.is_source ? IM_COL32(60, 120, 130, static_cast<int>(alpha * 200))
-				: (n.is_sink ? IM_COL32(130, 60, 70, static_cast<int>(alpha * 200))
-				: IM_COL32(100, 90, 60, static_cast<int>(alpha * 200)));
+			ImU32 type_bg = n.is_source ? ui_anim::theme_alpha(source_col, 0.5f * alpha)
+				: (n.is_sink ? ui_anim::theme_alpha(sink_col, 0.5f * alpha)
+				: ui_anim::theme_alpha(prop_col, 0.5f * alpha));
 			ImVec2 type_sz = ImGui::CalcTextSize(type_label);
 			float badge_w = type_sz.x + 8.f;
 			dl->AddRectFilled(ImVec2(nx + 4.f, ny + 3.f), ImVec2(nx + 4.f + badge_w, ny + node_h - 3.f),
 				type_bg, (node_h - 6.f) * 0.5f);
-			dl->AddText(ImVec2(nx + 8.f, ny + 4.f), IM_COL32(255, 255, 255, static_cast<int>(alpha * 230)), type_label);
+			dl->AddText(ImVec2(nx + 8.f, ny + 4.f), text_col, type_label);
 
 			char label[128];
 			std::snprintf(label, sizeof(label), "%llX  %s",

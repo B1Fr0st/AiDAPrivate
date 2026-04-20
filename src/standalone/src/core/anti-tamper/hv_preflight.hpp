@@ -260,8 +260,18 @@ inline bool scan_vm_processes()
     return hit;
 }
 
+inline bool cpu_supports_xsave()
+{
+    int regs[4] = {};
+    __cpuid(regs, 1);
+    return (regs[2] & (1 << 26)) != 0 && (regs[2] & (1 << 27)) != 0;
+}
+
 inline bool xsetbv_probe()
 {
+    if (!cpu_supports_xsave())
+        return false;
+
     unsigned long long xcr0 = 0;
     bool forwarded = false;
     __try
@@ -296,7 +306,37 @@ inline uint32_t timing_probe_median()
     return samples[16];
 }
 
+inline bool validate_ms_hv_features()
+{
+    int regs[4] = {};
+    __cpuid(regs, 0x40000003);
+    constexpr uint32_t kAccessVpRuntime    = 1u << 0;
+    constexpr uint32_t kAccessPartRefCount = 1u << 1;
+    constexpr uint32_t kAccessSyntheticTimers = 1u << 3;
+    constexpr uint32_t kAccessAPIC = 1u << 4;
+    constexpr uint32_t kAccessHypercall = 1u << 5;
+    uint32_t part_priv = static_cast<uint32_t>(regs[0]);
+    uint32_t expected = kAccessVpRuntime | kAccessPartRefCount
+        | kAccessHypercall;
+    return (part_priv & expected) == expected;
 }
+
+inline uint32_t get_windows_build_number()
+{
+    auto* shared = reinterpret_cast<const uint8_t*>(0x7FFE0000ULL);
+    __try
+    {
+        return *reinterpret_cast<const uint32_t*>(shared + 0x260);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0;
+    }
+}
+
+}
+
+inline bool g_ms_hv_approved = false;
 
 inline report_t run()
 {
@@ -353,21 +393,18 @@ inline report_t run()
     const bool ms_hv = r.hv_bit_set && detail::is_microsoft_hv(vendor12);
     const bool known_non_ms = r.hv_bit_set && detail::is_known_non_ms_hv(vendor12);
 
-    if (ms_hv && r.hvci_enabled && !r.firmware_hit && !r.process_hit)
+    if (ms_hv)
     {
+        bool genuine_ms = detail::validate_ms_hv_features();
+
+        if (!genuine_ms)
+        {
+            r.result = result_t::refuse_hv;
+            return r;
+        }
+
+        g_ms_hv_approved = true;
         r.result = result_t::allow;
-        return r;
-    }
-
-    if (ms_hv && r.hvci_enabled && (r.firmware_hit || r.process_hit))
-    {
-        r.result = result_t::refuse_hv_nested;
-        return r;
-    }
-
-    if (ms_hv && !r.hvci_enabled)
-    {
-        r.result = result_t::refuse_hv;
         return r;
     }
 
@@ -383,7 +420,7 @@ inline report_t run()
         return r;
     }
 
-    if (r.firmware_hit || r.xsetbv_forwarded)
+    if (r.firmware_hit)
     {
         r.result = result_t::refuse_hv;
         return r;
@@ -407,8 +444,18 @@ inline void show_refuse_ui_and_exit(const report_t& r)
     case result_t::refuse_hv:
     case result_t::refuse_hv_nested:
     default:
-        message = WOBFSTR(L"AiDA cannot start while a hypervisor is active. Restart your PC with virtualization disabled in firmware (or disable VBS if you require AiDA).");
+    {
+        std::wstring vendor_str(r.vendor);
+        if (vendor_str.empty() || vendor_str[0] == L'\0')
+            vendor_str = L"unknown";
+        message = L"AiDA cannot start: a non-Microsoft hypervisor was detected (vendor: "
+            + vendor_str + L"). Disable it and restart your PC.";
+        if (r.firmware_hit)
+            message += L"\n\nAdditional: VM firmware signatures detected in SMBIOS.";
+        if (r.process_hit)
+            message += L"\n\nAdditional: VM guest agent processes are running.";
         break;
+    }
     }
 
     std::wstring title = WOBFSTR(L"AiDA");

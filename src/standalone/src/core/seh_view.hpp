@@ -11,6 +11,7 @@
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
 #include "ui_anim.hpp"
+#include "../helpers/globals.h"
 
 namespace seh_view {
 
@@ -131,9 +132,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 {
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	float dt = ImGui::GetIO().DeltaTime;
+	const auto& _t = themes::resolved;
+	const auto _ta = [alpha](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, alpha);
+	};
 
 	dl->AddRectFilled(ImVec2(pos_x, pos_y), ImVec2(pos_x + width, pos_y + height),
-					  IM_COL32(18, 18, 24, static_cast<int>(240 * alpha)));
+					  _ta(_t.bg_base));
 
 	float header_h = 32.f;
 	float row_h = 20.f;
@@ -141,27 +146,27 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	ui_anim::render_toolbar(dl, pos_x, pos_y, width, header_h, ar, ag, ab, alpha);
 	dl->AddText(ImVec2(pos_x + 10.f, pos_y + 8.f),
-				IM_COL32(static_cast<int>(ar * 200) + 55, static_cast<int>(ag * 200) + 55, static_cast<int>(ab * 200) + 55, static_cast<int>(220 * alpha)), "SEH Chain");
+				_ta(_t.text_primary), "SEH Chain");
 
 	float refresh_x = pos_x + 90.f;
 	ImVec2 btn_min(refresh_x, pos_y + 4.f);
 	ImVec2 btn_max(refresh_x + 60.f, pos_y + 26.f);
 	bool btn_hover = ImGui::IsMouseHoveringRect(btn_min, btn_max, false);
 	dl->AddRectFilled(btn_min, btn_max,
-					  btn_hover ? IM_COL32(50, 52, 60, static_cast<int>(200 * alpha))
-								: IM_COL32(35, 37, 45, static_cast<int>(200 * alpha)), 3.f);
+					  btn_hover ? _ta(ui_anim::lighten(_t.panel_header, 14))
+								: _ta(_t.panel_header), 3.f);
 	dl->AddText(ImVec2(refresh_x + 8.f, pos_y + 7.f),
-				IM_COL32(180, 180, 190, static_cast<int>(200 * alpha)), "Refresh");
+				_ta(_t.text_secondary), "Refresh");
 	if (btn_hover && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 		refresh();
 
 	float table_y = pos_y + header_h;
 
-	float col_idx = pos_x + 10.f;
-	float col_frame = pos_x + 50.f;
-	float col_handler = pos_x + 220.f;
-	float col_module = pos_x + 400.f;
-	float col_name = pos_x + 540.f;
+	float col_idx = pos_x + width * 0.01f;
+	float col_frame = pos_x + width * 0.06f;
+	float col_handler = pos_x + width * 0.28f;
+	float col_module = pos_x + width * 0.52f;
+	float col_name = pos_x + width * 0.70f;
 
 	{
 		ui_anim::table_col_t cols[] = {{"#", 40.f}, {"Frame Address", 170.f}, {"Handler Address", 180.f}, {"Module", 140.f}, {"Name", 200.f}};
@@ -208,28 +213,32 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float ry = list_y + idx * row_h - g_ui.scroll_y;
 		if (ry + row_h < list_y || ry > list_y + list_h) continue;
 
-		ui_anim::row_hover_select(dl, pos_x, ry, width - 12.f, row_h, idx, g_ui.selected, alpha, ar, ag, ab);
+		float row_alpha = ui_anim::render_row_entrance(idx, first_visible, dt, alpha);
+		ui_anim::row_hover_select(dl, pos_x, ry, width - 12.f, row_h, idx, g_ui.selected, row_alpha, ar, ag, ab);
 
 		char idx_buf[8];
 		snprintf(idx_buf, sizeof(idx_buf), "%d", e.index);
 		dl->AddText(ImVec2(col_idx, ry + 2.f),
-					IM_COL32(160, 160, 170, static_cast<int>(180 * alpha)), idx_buf);
+					_ta(_t.text_secondary), idx_buf);
 
 		char frame_buf[24];
 		snprintf(frame_buf, sizeof(frame_buf), "%016llX", static_cast<unsigned long long>(e.frame_addr));
 		dl->AddText(ImVec2(col_frame, ry + 2.f),
-					IM_COL32(180, 190, 210, static_cast<int>(210 * alpha)), frame_buf);
+					_ta(_t.text_primary), frame_buf);
 
 		char handler_buf[24];
 		snprintf(handler_buf, sizeof(handler_buf), "%016llX", static_cast<unsigned long long>(e.handler_addr));
 		dl->AddText(ImVec2(col_handler, ry + 2.f),
-					IM_COL32(180, 190, 210, static_cast<int>(210 * alpha)), handler_buf);
+					_ta(_t.text_primary), handler_buf);
 
 		dl->AddText(ImVec2(col_module, ry + 2.f),
-					IM_COL32(160, 170, 200, static_cast<int>(200 * alpha)), e.module_name.c_str());
+					_ta(_t.text_secondary), e.module_name.c_str());
 
 		dl->AddText(ImVec2(col_name, ry + 2.f),
-					IM_COL32(200, 200, 210, static_cast<int>(210 * alpha)), e.handler_name.c_str());
+					_ta(_t.text_primary), e.handler_name.c_str());
+
+		if (idx == g_ui.selected && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+			ImGui::OpenPopup("##seh_ctx");
 	}
 
 	dl->PopClipRect();
@@ -238,6 +247,20 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ui_anim::render_custom_scrollbar(dl, pos_x + width - sb_w - 2.f, list_y, sb_w, list_h,
 									 g_ui.scroll_y, content_h, list_h, alpha,
 									 g_ui.scrollbar_dragging, g_ui.scrollbar_drag_offset);
+
+	if (ImGui::BeginPopup("##seh_ctx")) {
+		if (g_ui.selected >= 0 && g_ui.selected < static_cast<int>(snapshot.size())) {
+			if (ImGui::MenuItem("Go to Handler")) {
+			}
+			if (ImGui::MenuItem("Copy Address")) {
+				char abuf[24];
+				snprintf(abuf, sizeof(abuf), "%016llX",
+						 static_cast<unsigned long long>(snapshot[g_ui.selected].handler_addr));
+				ImGui::SetClipboardText(abuf);
+			}
+		}
+		ImGui::EndPopup();
+	}
 }
 
 }

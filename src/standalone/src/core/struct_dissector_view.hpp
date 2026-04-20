@@ -5,6 +5,7 @@
 #include "standalone_driver.hpp"
 #include "ui_anim.hpp"
 #include "imgui/imgui.h"
+#include "../helpers/globals.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -40,10 +41,14 @@ struct ui_state_t {
 inline ui_state_t g_ui;
 
 inline ImU32 type_color(struct_dissector::field_type_t t, float alpha) {
+	const auto& _t = themes::resolved;
 	int a = static_cast<int>(220 * alpha);
 	switch (t) {
 	case struct_dissector::field_type_t::pointer:
-		return IM_COL32(100, 160, 255, a);
+		return IM_COL32(
+			std::min(255, static_cast<int>((_t.text_primary >> IM_COL32_R_SHIFT) & 0xFF) / 2 + 50),
+			std::min(255, static_cast<int>((_t.text_primary >> IM_COL32_G_SHIFT) & 0xFF) / 2 + 80),
+			255, a);
 	case struct_dissector::field_type_t::ascii_string:
 	case struct_dissector::field_type_t::utf16_string:
 		return IM_COL32(140, 220, 140, a);
@@ -51,11 +56,17 @@ inline ImU32 type_color(struct_dissector::field_type_t t, float alpha) {
 	case struct_dissector::field_type_t::float64:
 		return IM_COL32(230, 180, 100, a);
 	case struct_dissector::field_type_t::padding:
-		return IM_COL32(100, 100, 100, a);
+		return IM_COL32(
+			((_t.text_dim >> IM_COL32_R_SHIFT) & 0xFF),
+			((_t.text_dim >> IM_COL32_G_SHIFT) & 0xFF),
+			((_t.text_dim >> IM_COL32_B_SHIFT) & 0xFF), a);
 	case struct_dissector::field_type_t::nested_struct:
 		return IM_COL32(200, 130, 220, a);
 	default:
-		return IM_COL32(210, 210, 230, a);
+		return IM_COL32(
+			((_t.text_primary >> IM_COL32_R_SHIFT) & 0xFF),
+			((_t.text_primary >> IM_COL32_G_SHIFT) & 0xFF),
+			((_t.text_primary >> IM_COL32_B_SHIFT) & 0xFF), a);
 	}
 }
 
@@ -75,18 +86,25 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float ox = wpos.x;
 	float oy = wpos.y;
 
+	const auto& _t = themes::resolved;
+	const auto _ta = [alpha](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, alpha);
+	};
+
 	ImU32 accent_col = IM_COL32(
 		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 		static_cast<int>(accent_b * 255), static_cast<int>(220 * alpha));
 	ImU32 accent_dim = IM_COL32(
 		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 		static_cast<int>(accent_b * 255), static_cast<int>(30 * alpha));
-	ImU32 header_col = IM_COL32(160, 170, 200, static_cast<int>(200 * alpha));
-	ImU32 text_col = IM_COL32(200, 200, 220, static_cast<int>(220 * alpha));
-	ImU32 dim_col = IM_COL32(120, 120, 140, static_cast<int>(150 * alpha));
-	ImU32 bg_alt = IM_COL32(255, 255, 255, static_cast<int>(3 * alpha));
-	ImU32 separator_col = IM_COL32(255, 255, 255, static_cast<int>(10 * alpha));
+	ImU32 header_col = _ta(_t.text_secondary);
+	ImU32 text_col = _ta(_t.text_primary);
+	ImU32 dim_col = _ta(_t.text_dim);
+	ImU32 bg_alt = _ta(_t.panel_header);
+	ImU32 separator_col = _ta(ui_anim::lighten(_t.panel_bg, 12));
 	ImU32 changed_col = IM_COL32(255, 80, 80, static_cast<int>(200 * alpha));
+	static float row_anim_time = 0.f;
+	row_anim_time += dt;
 
 	ui_anim::render_toolbar(dl, ox, oy, width, top_bar_h, accent_r, accent_g, accent_b, alpha);
 	dl->AddLine(ImVec2(ox, oy + top_bar_h), ImVec2(ox + width, oy + top_bar_h), separator_col);
@@ -98,9 +116,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	bx += ImGui::CalcTextSize("Base:").x + 6.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(200 * alpha)));
-	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(120 * alpha)));
-	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 200, 220, 255));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
+	ImGui::PushStyleColor(ImGuiCol_Border, _ta(ui_anim::lighten(_t.panel_bg, 12)));
+	ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 	ImGui::PushItemWidth(char_w * 18.f);
@@ -118,9 +136,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	bx += char_w * 18.f + 12.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
-	ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(40, 42, 52, static_cast<int>(200 * alpha)));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(55, 58, 70, static_cast<int>(200 * alpha)));
-	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 200, 220, 255));
+	ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
+	ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 	if (ImGui::SmallButton("Refresh##sd")) {
 		struct_dissector::refresh_values();
 	}
@@ -224,17 +242,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		float btn_y = ly + lh - line_h;
 		ImGui::SetCursorScreenPos(ImVec2(lx + 4.f, btn_y + 2.f));
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 32, 40, static_cast<int>(200 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 200, 220, 255));
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
+		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 		ImGui::PushItemWidth(lw * 0.5f);
 		ImGui::InputText("##sd_newname", ui.name_buf, sizeof(ui.name_buf));
 		ImGui::PopItemWidth();
 		ImGui::PopStyleColor(2);
 
 		ImGui::SameLine();
-		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(40, 80, 40, static_cast<int>(200 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(50, 100, 50, static_cast<int>(200 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 220, 200, 255));
+		ImGui::PushStyleColor(ImGuiCol_Button, _ta(ui_anim::darken(_t.panel_header, 10)));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
+		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 		if (ImGui::SmallButton("+##sd_add") && ui.name_buf[0] != '\0') {
 			struct_dissector::create_struct(ui.name_buf);
 			ui.name_buf[0] = '\0';
@@ -242,9 +260,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PopStyleColor(3);
 
 		ImGui::SameLine();
-		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(80, 40, 40, static_cast<int>(200 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(100, 50, 50, static_cast<int>(200 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(220, 200, 200, 255));
+		ImGui::PushStyleColor(ImGuiCol_Button, _ta(ui_anim::darken(_t.panel_header, 10)));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
+		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 		if (ImGui::SmallButton("-##sd_del")) {
 			std::lock_guard<std::mutex> lk(st.mtx);
 			if (st.active_struct >= 0 && st.active_struct < static_cast<int>(st.structs.size())) {
@@ -323,14 +341,27 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					float row_y = table_y + fi * line_h - ui.scroll_y;
 					if (row_y + line_h < table_y || row_y > table_y + table_h) continue;
 
-					if (fi & 1)
-						dl->AddRectFilled(ImVec2(rx, row_y), ImVec2(rx + rw, row_y + line_h), bg_alt);
+					float row_entrance = ui_anim::render_row_entrance(fi, row_anim_time, 0.02f);
+					if (row_entrance < 0.01f) continue;
+					float row_alpha = alpha * row_entrance;
 
-					int sel = ui.selected_field;
-					if (ui_anim::row_hover_select(dl, rx, row_y, rw, line_h, fi, sel, alpha,
-												  accent_r, accent_g, accent_b)) {
+					if (fi & 1)
+						dl->AddRectFilled(ImVec2(rx, row_y), ImVec2(rx + rw, row_y + line_h),
+							(bg_alt & 0x00FFFFFFu) | (static_cast<ImU32>(((bg_alt >> 24) / 255.f) * row_entrance * 255.f) << 24));
+
+					bool row_sel = (ui.selected_field == fi);
+					bool row_hov = ImGui::IsMouseHoveringRect(ImVec2(rx, row_y), ImVec2(rx + rw, row_y + line_h), false);
+					ui_anim::table_row_style_t rs{};
+					rs.selected = row_sel;
+					rs.hovered = row_hov;
+					rs.index = fi;
+					rs.alpha = row_alpha;
+					rs.entrance = row_entrance;
+					rs.ar = accent_r; rs.ag = accent_g; rs.ab = accent_b;
+					ui_anim::render_table_row(dl, rx, row_y, rw, line_h, rs);
+
+					if (row_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 						ui.selected_field = fi;
-					}
 
 					const auto& f = sd.fields[fi];
 					float fx = rx + 4.f;
@@ -338,7 +369,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					char off_str[16];
 					std::snprintf(off_str, sizeof(off_str), "+0x%03X", f.offset);
 					dl->AddText(ImVec2(fx, row_y + 2.f),
-								IM_COL32(75, 95, 155, static_cast<int>(170 * alpha)), off_str);
+								_ta(ui_anim::darken(_t.text_secondary, 20)), off_str);
 					fx += col_offset_w;
 
 					dl->AddText(ImVec2(fx, row_y + 2.f), text_col, f.name.c_str());
@@ -355,8 +386,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 						if (ui.editing_field == fi) {
 							ImGui::SetCursorScreenPos(ImVec2(fx, row_y));
-							ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(40, 42, 55, 230));
-							ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, 255));
+							ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_header));
+							ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 							ImGui::PushItemWidth(col_value_w - 4.f);
 							bool committed = ImGui::InputText("##sd_edit_val", ui.edit_value_buf,
 								sizeof(ui.edit_value_buf),
@@ -405,8 +436,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		float add_y = ry_start + rh - line_h - 2.f;
 		ImGui::SetCursorScreenPos(ImVec2(rx + 4.f, add_y));
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(30, 32, 40, static_cast<int>(200 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 200, 220, 255));
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
+		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 
 		ImGui::PushItemWidth(char_w * 14.f);
 		ImGui::InputText("##sd_fn", ui.field_name_buf, sizeof(ui.field_name_buf));
@@ -432,9 +463,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		ImGui::PopStyleColor(2);
 
-		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(40, 80, 40, static_cast<int>(200 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(50, 100, 50, static_cast<int>(200 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 220, 200, 255));
+		ImGui::PushStyleColor(ImGuiCol_Button, _ta(ui_anim::darken(_t.panel_header, 10)));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
+		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 		if (ImGui::SmallButton("Add##sd_af") && ui.field_name_buf[0] != '\0') {
 			struct_dissector::field_def_t fd;
 			fd.name = ui.field_name_buf;
@@ -451,9 +482,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PopStyleColor(3);
 
 		ImGui::SameLine();
-		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(80, 40, 40, static_cast<int>(200 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(100, 50, 50, static_cast<int>(200 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(220, 200, 200, 255));
+		ImGui::PushStyleColor(ImGuiCol_Button, _ta(ui_anim::darken(_t.panel_header, 10)));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
+		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 		if (ImGui::SmallButton("Del##sd_df") && ui.selected_field >= 0) {
 			struct_dissector::remove_field(active_idx, ui.selected_field);
 			ui.selected_field = -1;

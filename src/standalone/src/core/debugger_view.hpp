@@ -71,6 +71,12 @@ struct ui_state_t {
 	float panel_sep_phase = 0.f;
 	float empty_phase = 0.f;
 
+	float bp_scroll_y = 0.f;
+	float callstack_scroll_y = 0.f;
+	float watch_scroll_y = 0.f;
+	float bookmark_scroll_y = 0.f;
+	float handle_scroll_y = 0.f;
+
 	float row_hover_anim[64] = {};
 };
 

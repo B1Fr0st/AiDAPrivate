@@ -81,12 +81,15 @@ static void launch_xref_scan(uint64_t addr)
     st.xref_popup_scroll = 0.f;
     st.xref_popup_target_scroll = 0.f;
 
+    try {
     std::thread([addr]() {
         auto modules = driver_bridge::enumerate_modules();
 
         uint64_t search_base = 0;
         uint64_t search_size = 0;
         std::string mod_name;
+
+        bool use_static = false;
 
         for (auto& m : modules) {
             if (addr >= m.base && addr < m.base + m.size) {
@@ -103,6 +106,13 @@ static void launch_xref_scan(uint64_t addr)
             mod_name = modules[0].name;
         }
 
+        if (search_size == 0 && g_disasm.file.loaded && !g_disasm.file.sections.empty()) {
+            use_static = true;
+            search_base = g_disasm.file.image_base;
+            search_size = static_analysis::total_image_size(g_disasm.file);
+            mod_name = g_disasm.file.filename;
+        }
+
         if (search_size == 0) {
             g_state.xref_scanning.store(false);
             return;
@@ -117,7 +127,15 @@ static void launch_xref_scan(uint64_t addr)
                 chunk = static_cast<size_t>(search_size - offset);
 
             std::vector<uint8_t> page_data;
-            if (!driver_bridge::read_memory(search_base + offset, chunk, page_data))
+            bool got_page = false;
+
+            if (!use_static)
+                got_page = driver_bridge::read_memory(search_base + offset, chunk, page_data);
+
+            if (!got_page)
+                got_page = static_analysis::read_bytes_from_pe(g_disasm.file, search_base + offset, chunk, page_data);
+
+            if (!got_page || page_data.empty())
                 continue;
 
             const uint8_t* data = page_data.data();
@@ -154,6 +172,10 @@ static void launch_xref_scan(uint64_t addr)
         }
         g_state.xref_scanning.store(false);
     }).detach();
+    } catch (...) {
+        g_state.xref_scanning.store(false);
+        driver_bridge::debug_log("[disasm] xref scan thread creation failed\n");
+    }
 }
 
 static float s_close_btn_anim = 0.f;
@@ -173,6 +195,8 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
         return;
 
     float fa = alpha * st.xref_popup_fade;
+    const auto& _t = themes::resolved;
+    const auto _ta = [fa](ImU32 c) -> ImU32 { return ui_anim::theme_alpha(c, fa); };
     ImDrawList* fdl = ImGui::GetForegroundDrawList();
 
     float popup_w = std::min(760.f, width * 0.88f);
@@ -211,9 +235,9 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
     float toolbar_y = py + header_h;
     float toolbar_h = 30.f;
     fdl->AddRectFilled(ImVec2(px, toolbar_y), ImVec2(px + pw, toolbar_y + toolbar_h),
-        IM_COL32(25, 27, 36, static_cast<int>(200 * fa)));
+        _ta(_t.panel_bg));
     fdl->AddLine(ImVec2(px, toolbar_y + toolbar_h - 1.f), ImVec2(px + pw, toolbar_y + toolbar_h - 1.f),
-        IM_COL32(50, 55, 70, static_cast<int>(80 * fa)));
+        _ta(ui_anim::lighten(_t.panel_bg, 12)));
 
     float btn_x = px + 10.f;
     float btn_y = toolbar_y + 4.f;
@@ -258,7 +282,7 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
              results_copy.size(), results_copy.size() == 1 ? "" : "s");
     ImVec2 cs = ImGui::CalcTextSize(count_buf);
     fdl->AddText(ImVec2(px + pw - cs.x - (scanning ? 42.f : 14.f), py + 11.f),
-        IM_COL32(140, 140, 160, static_cast<int>(200 * fa)), count_buf);
+        _ta(_t.text_secondary), count_buf);
 
     float toolbar_end = toolbar_y + toolbar_h;
     float table_y = toolbar_end + 2.f;
@@ -403,13 +427,13 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
             std::string mod_short = e.module_name.size() > max_mod
                 ? e.module_name.substr(0, max_mod - 2) + ".." : e.module_name;
             fdl->AddText(ImVec2(rx, ry + 4.f),
-                IM_COL32(140, 160, 180, static_cast<int>(180 * row_alpha)), mod_short.c_str());
+                ui_anim::theme_alpha(_t.text_secondary, row_alpha), mod_short.c_str());
         }
         rx += col_mod_w;
 
         const char* disasm_end = e.disasm_text.c_str() + std::min(e.disasm_text.size(), static_cast<size_t>(60));
         fdl->AddText(ImVec2(rx, ry + 4.f),
-            IM_COL32(200, 200, 220, static_cast<int>(200 * row_alpha)),
+            ui_anim::theme_alpha(_t.text_primary, row_alpha),
             e.disasm_text.c_str(), disasm_end);
 
     }
@@ -457,7 +481,7 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
         const char* empty_msg = "No cross references found";
         ImVec2 es = ImGui::CalcTextSize(empty_msg);
         fdl->AddText(ImVec2(px + (pw - es.x) * 0.5f, ey),
-            IM_COL32(100, 100, 120, static_cast<int>(160 * fa)), empty_msg);
+            _ta(_t.text_dim), empty_msg);
     }
 
     if (!st.xref_popup_open && !popup_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -477,12 +501,21 @@ static void render_inline_graph(float pos_x, float pos_y, float width, float hei
         s_inline_cfg.building.store(true);
         uint64_t entry = st.cfg_entry_addr;
 
+        try {
         std::thread([entry]() {
             const size_t max_bytes = 0x10000;
             const size_t max_insns = 4096;
 
             std::vector<uint8_t> mem;
-            driver_bridge::read_memory(entry, max_bytes, mem);
+            bool have_data = false;
+
+            if (driver_bridge::attached_pid() != 0) {
+                have_data = driver_bridge::read_memory(entry, max_bytes, mem);
+            }
+
+            if (!have_data || mem.empty()) {
+                have_data = static_analysis::read_bytes_from_pe(g_disasm.file, entry, max_bytes, mem);
+            }
 
             if (mem.empty()) {
                 s_inline_cfg.building.store(false);
@@ -633,6 +666,10 @@ static void render_inline_graph(float pos_x, float pos_y, float width, float hei
 
             s_inline_cfg.building.store(false);
         }).detach();
+        } catch (...) {
+            s_inline_cfg.building.store(false);
+            driver_bridge::debug_log("[disasm] CFG build thread creation failed\n");
+        }
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -641,8 +678,10 @@ static void render_inline_graph(float pos_x, float pos_y, float width, float hei
     float oy = wp.y + pos_y;
 
     dl->PushClipRect(ImVec2(ox, oy), ImVec2(ox + width, oy + height), true);
+    const auto& _t = themes::resolved;
+    const auto _ta = [alpha](ImU32 c) -> ImU32 { return ui_anim::theme_alpha(c, alpha); };
     dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height),
-        IM_COL32(18, 18, 24, static_cast<int>(240 * alpha)));
+        _ta(_t.bg_base));
 
     float mode_badge_x = ox + width - 110.f;
     float mode_badge_y = oy + 6.f;
@@ -659,7 +698,7 @@ static void render_inline_graph(float pos_x, float pos_y, float width, float hei
     const char* hint = "Press SPACE to return to linear view";
     ImVec2 hs = ImGui::CalcTextSize(hint);
     dl->AddText(ImVec2(ox + 10.f, oy + 8.f),
-        IM_COL32(100, 100, 120, static_cast<int>(140 * alpha)), hint);
+        _ta(_t.text_dim), hint);
 
     if (s_inline_cfg.building.load()) {
         float cx = ox + width * 0.5f;
@@ -672,7 +711,7 @@ static void render_inline_graph(float pos_x, float pos_y, float width, float hei
         const char* bld = "Building CFG...";
         ImVec2 bs = ImGui::CalcTextSize(bld);
         dl->AddText(ImVec2(cx - bs.x * 0.5f, cy + 8.f),
-            IM_COL32(160, 160, 180, static_cast<int>(180 * alpha)), bld);
+            _ta(_t.text_secondary), bld);
         dl->PopClipRect();
         return;
     }
@@ -685,7 +724,7 @@ static void render_inline_graph(float pos_x, float pos_y, float width, float hei
         const char* msg = "No CFG available";
         ImVec2 ms = ImGui::CalcTextSize(msg);
         dl->AddText(ImVec2(cx - ms.x * 0.5f, cy),
-            IM_COL32(100, 100, 120, static_cast<int>(150 * alpha)), msg);
+            _ta(_t.text_dim), msg);
         dl->PopClipRect();
         return;
     }
@@ -795,7 +834,7 @@ static void render_inline_graph(float pos_x, float pos_y, float width, float hei
 
         if (br.x < ox || tl.x > ox + width || br.y < oy || tl.y > oy + height) continue;
 
-        ImU32 bg_col = IM_COL32(28, 30, 38, static_cast<int>(220 * alpha));
+        ImU32 bg_col = _ta(_t.panel_bg);
         dl->AddRectFilled(tl, br, bg_col, 4.f * z);
 
         bool is_sel = (n.id == s_inline_cfg.selected_block);
@@ -807,7 +846,7 @@ static void render_inline_graph(float pos_x, float pos_y, float width, float hei
         } else if (is_sel) {
             dl->AddRect(tl, br, IM_COL32(ar, ag, ab, static_cast<int>(160 * alpha)), 4.f * z, 0, 1.5f * z);
         } else {
-            dl->AddRect(tl, br, IM_COL32(60, 62, 70, static_cast<int>(180 * alpha)), 4.f * z, 0, 1.f * z);
+            dl->AddRect(tl, br, _ta(ui_anim::lighten(_t.panel_bg, 12)), 4.f * z, 0, 1.f * z);
         }
 
         if (blk.has_breakpoint) {
@@ -823,8 +862,8 @@ static void render_inline_graph(float pos_x, float pos_y, float width, float hei
             char addr_buf[24];
             snprintf(addr_buf, sizeof(addr_buf), "%llX", static_cast<unsigned long long>(line.addr));
 
-            ImU32 addr_col = IM_COL32(100, 110, 140, static_cast<int>(200 * alpha));
-            ImU32 text_col = IM_COL32(210, 210, 220, static_cast<int>(220 * alpha));
+            ImU32 addr_col = _ta(_t.text_dim);
+            ImU32 text_col = _ta(_t.text_primary);
 
             if (st.selected_row >= 0 && st.selected_row < static_cast<int>(disasm.file.instrs.size())
                 && disasm.file.instrs[st.selected_row].addr == line.addr) {
@@ -860,6 +899,9 @@ void render(float pos_x, float pos_y, float width, float height,
 
     if (disasm.live_mode && disasm.live_pending_ready.load(std::memory_order_acquire)) {
 
+        driver_bridge::debug_log("disasm_view: live_pending_ready=TRUE, moving %llu instrs to display\n",
+            (unsigned long long)disasm.live_pending_instrs.size());
+
         uint64_t scroll_addr = 0;
         if (st.selected_row >= 0 && st.selected_row < static_cast<int>(disasm.file.instrs.size()))
             scroll_addr = disasm.file.instrs[st.selected_row].addr;
@@ -891,8 +933,14 @@ void render(float pos_x, float pos_y, float width, float height,
             disasm.live_needs_refresh = false;
 
             if (driver_bridge::attached_pid() != disasm.live_pid) {
+                driver_bridge::debug_log("disasm_view: pid mismatch (attached=%u live=%u), stopping live\n",
+                    driver_bridge::attached_pid(), disasm.live_pid);
                 disasm::stop_live(disasm);
             } else if (disasm.live_fail_count < 5) {
+                static int s_req_log = 0;
+                if (s_req_log++ < 20)
+                    driver_bridge::debug_log("disasm_view: triggering request_live_decode (fail_count=%d, decoding=%d)\n",
+                        disasm.live_fail_count, disasm.live_decoding ? 1 : 0);
                 disasm::request_live_decode(disasm);
             }
         }
@@ -901,6 +949,8 @@ void render(float pos_x, float pos_y, float width, float height,
     auto& file  = disasm.file;
     auto& instrs = file.instrs;
     const float a = alpha;
+    const auto& _t = themes::resolved;
+    const auto _ta = [a](ImU32 c) -> ImU32 { return ui_anim::theme_alpha(c, a); };
     const int n = (int)instrs.size();
 
     if (n == 0) {
@@ -916,6 +966,15 @@ void render(float pos_x, float pos_y, float width, float height,
 
             bool failed = disasm.live_mode && disasm.live_decode_failed && disasm.live_fail_count >= 3;
 
+            {
+                static int s_spinner_log = 0;
+                if (s_spinner_log++ < 10)
+                    driver_bridge::debug_log("disasm_view SPINNER: n=%d live_mode=%d decoding=%d failed=%d fail_count=%d pending_ready=%d paused=%d\n",
+                        n, disasm.live_mode ? 1 : 0, disasm.live_decoding ? 1 : 0,
+                        disasm.live_decode_failed ? 1 : 0, disasm.live_fail_count,
+                        disasm.live_pending_ready.load() ? 1 : 0, disasm.live_paused ? 1 : 0);
+            }
+
             if (failed) {
                 const char* err_msg = "Failed to read process memory";
                 ImVec2 es = ImGui::CalcTextSize(err_msg);
@@ -925,7 +984,7 @@ void render(float pos_x, float pos_y, float width, float height,
                 const char* hint = "Verify driver connection and process attachment";
                 ImVec2 hs = ImGui::CalcTextSize(hint);
                 dl->AddText(ImVec2(cx - hs.x * 0.5f, cy + 4.f),
-                    IM_COL32(140, 140, 160, static_cast<int>(150 * a)), hint);
+                    _ta(_t.text_secondary), hint);
 
                 const char* retry_label = "Retry";
                 ImVec2 rs = ImGui::CalcTextSize(retry_label);
@@ -937,13 +996,13 @@ void render(float pos_x, float pos_y, float width, float height,
                 dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh),
                     btn_hov ? IM_COL32(static_cast<int>(accent_r*255), static_cast<int>(accent_g*255),
                                        static_cast<int>(accent_b*255), static_cast<int>(60*a))
-                            : IM_COL32(40, 42, 55, static_cast<int>(180*a)), 4.f);
+                            : _ta(_t.panel_bg), 4.f);
                 dl->AddRect(ImVec2(bx, by), ImVec2(bx + bw, by + bh),
-                    IM_COL32(80, 85, 100, static_cast<int>(140*a)), 4.f);
+                    _ta(ui_anim::lighten(_t.panel_bg, 12)), 4.f);
                 dl->AddText(ImVec2(bx + (bw - rs.x) * 0.5f, by + (bh - rs.y) * 0.5f),
                     btn_hov ? IM_COL32(static_cast<int>(accent_r*255), static_cast<int>(accent_g*255),
                                        static_cast<int>(accent_b*255), static_cast<int>(220*a))
-                            : IM_COL32(200, 200, 210, static_cast<int>(180*a)), retry_label);
+                            : _ta(_t.text_primary), retry_label);
                 if (btn_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                     disasm.live_fail_count = 0;
                     disasm.live_decode_failed = false;
@@ -969,7 +1028,7 @@ void render(float pos_x, float pos_y, float width, float height,
                     : "Decoding instructions...";
                 ImVec2 ts = ImGui::CalcTextSize(msg);
                 dl->AddText(ImVec2(cx - ts.x * 0.5f, cy + 6.f),
-                    IM_COL32(160, 160, 180, static_cast<int>(180 * a)), msg);
+                    _ta(_t.text_secondary), msg);
 
                 if (disasm.live_mode && disasm.live_fail_count > 0) {
                     char attempt_buf[48];
@@ -987,7 +1046,7 @@ void render(float pos_x, float pos_y, float width, float height,
                         label_y += ImGui::CalcTextSize("A").y + 2.f;
                     ImVec2 ms = ImGui::CalcTextSize(label.c_str());
                     dl->AddText(ImVec2(cx - ms.x * 0.5f, label_y),
-                        IM_COL32(120, 120, 140, static_cast<int>(140 * a)), label.c_str());
+                        _ta(_t.text_dim), label.c_str());
                 }
             }
         }
@@ -1050,7 +1109,7 @@ void render(float pos_x, float pos_y, float width, float height,
         float by1 = oy + nav_band_h;
 
         dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1),
-            IM_COL32(22, 24, 30, static_cast<int>(220 * a)));
+            _ta(_t.bg_base));
 
         if (n > 0) {
             uint64_t range_start = instrs[0].addr;
@@ -1227,7 +1286,7 @@ void render(float pos_x, float pos_y, float width, float height,
             if (ins.len > 7)
                 snprintf(bytes_buf + boff, 64 - boff, "..");
             dl->AddText(ImVec2(x_bytes, y + 1.f),
-                        IM_COL32(100, 100, 120, (int)(120 * a)), bytes_buf);
+                        _ta(_t.text_dim), bytes_buf);
         }
 
 
@@ -1563,8 +1622,6 @@ void render(float pos_x, float pos_y, float width, float height,
                         entry = instrs[st.selected_row].addr;
                     else if (n > 0)
                         entry = instrs[0].addr;
-                    if (entry != 0 && !instrs.empty())
-                        entry = instrs[0].addr;
                     if (entry != 0) {
                         st.cfg_entry_addr = entry;
                         st.cfg_needs_build = true;
@@ -1620,7 +1677,7 @@ void render(float pos_x, float pos_y, float width, float height,
         float gy = oy_content + 4.f;
         ImDrawList* fdl = ImGui::GetForegroundDrawList();
         fdl->AddRectFilled(ImVec2(ox + 10.f, gy), ImVec2(ox + 260.f, gy + 30.f),
-            IM_COL32(30, 30, 40, (int)(240 * a)), 6.f);
+            _ta(_t.panel_bg), 6.f);
 
         ImGui::SetCursorPos(ImVec2(pos_x + 18.f, pos_y + 8.f));
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
@@ -1649,7 +1706,7 @@ void render(float pos_x, float pos_y, float width, float height,
     if (!st.bookmarks.empty()) {
         float bm_y = oy_content + content_height - 22.f;
         dl->AddRectFilled(ImVec2(ox, bm_y), ImVec2(ox + width, bm_y + 20.f),
-                          IM_COL32(20, 20, 30, (int)(200 * a)));
+                          _ta(_t.bg_base));
 
 
         float total_bm_w = 6.f;
@@ -1695,7 +1752,7 @@ void render(float pos_x, float pos_y, float width, float height,
                 float ga = (1.f - gi / 20.f) * a;
                 dl->AddLine(ImVec2(ox + static_cast<float>(gi), bm_y),
                             ImVec2(ox + static_cast<float>(gi), bm_y + 20.f),
-                            IM_COL32(20, 20, 30, (int)(200 * ga)));
+                            ui_anim::theme_alpha(_t.bg_base, ga));
             }
         }
         if (st.bm_scroll_x < max_scroll) {
@@ -1703,7 +1760,7 @@ void render(float pos_x, float pos_y, float width, float height,
                 float ga = (1.f - gi / 20.f) * a;
                 dl->AddLine(ImVec2(ox + width - 1.f - static_cast<float>(gi), bm_y),
                             ImVec2(ox + width - 1.f - static_cast<float>(gi), bm_y + 20.f),
-                            IM_COL32(20, 20, 30, (int)(200 * ga)));
+                            ui_anim::theme_alpha(_t.bg_base, ga));
             }
         }
     }
@@ -1716,9 +1773,9 @@ void render(float pos_x, float pos_y, float width, float height,
 
 
         dl->AddRectFilled(ImVec2(ix, iy), ImVec2(ix + ind_w, iy + ind_h),
-            IM_COL32(15, 15, 22, (int)(220 * a)), 13.f);
+            _ta(_t.bg_base), 13.f);
         dl->AddRect(ImVec2(ix, iy), ImVec2(ix + ind_w, iy + ind_h),
-            IM_COL32(80, 80, 120, (int)(40 * a)), 13.f);
+            _ta(ui_anim::lighten(_t.panel_bg, 12)), 13.f);
 
 
         float dot_x = ix + 14.f, dot_y = iy + ind_h * 0.5f;
@@ -1741,7 +1798,7 @@ void render(float pos_x, float pos_y, float width, float height,
         std::string mod_short = disasm.live_module;
         if (mod_short.size() > 18) mod_short = mod_short.substr(0, 15) + "...";
         dl->AddText(ImVec2(label_x, iy + (ind_h - ImGui::GetFontSize()) * 0.5f),
-            IM_COL32(160, 160, 180, (int)(180 * a)), mod_short.c_str());
+            _ta(_t.text_secondary), mod_short.c_str());
 
 
         float btn_x = ix + ind_w - 56.f;
@@ -1755,7 +1812,7 @@ void render(float pos_x, float pos_y, float width, float height,
         const char* btn_lbl = disasm.live_paused ? "Play" : "Pause";
         ImVec2 bts = ImGui::CalcTextSize(btn_lbl);
         dl->AddText(ImVec2(btn_x + (btn_w2 - bts.x) * 0.5f, btn_y + (btn_h2 - bts.y) * 0.5f),
-            IM_COL32(200, 200, 220, (int)(200 * a)), btn_lbl);
+            _ta(_t.text_primary), btn_lbl);
         if (btn_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             disasm.live_paused = !disasm.live_paused;
             if (!disasm.live_paused)

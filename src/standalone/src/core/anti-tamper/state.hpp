@@ -63,6 +63,12 @@ struct runtime_t
     std::string violation_reason;
     uint64_t last_server_nonce_hash = 0;
     void* canary_page = nullptr;
+
+    std::atomic<uint8_t> last_peb_being_debugged{0};
+    std::atomic<uint8_t> last_debug_port_present{0};
+    uint32_t veh_baseline_count = 0;
+    std::atomic<bool> veh_baseline_captured{false};
+    std::atomic<bool> self_job_active{false};
 };
 
 inline runtime_t& get()

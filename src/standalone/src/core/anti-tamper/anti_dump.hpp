@@ -99,17 +99,36 @@ namespace pe_header
     inline bool erase_dos_header()
     {
         HMODULE mod = GetModuleHandleW(nullptr);
-        if (!mod) return false;
+        if (!mod) {
+            webhook::write_log("anti_dump", "erase_dos: GetModuleHandle null");
+            return false;
+        }
 
         auto* base = reinterpret_cast<uint8_t*>(mod);
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+            char buf[128];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "erase_dos: e_magic=0x%X (not MZ), already erased?", dos->e_magic);
+            webhook::write_log("anti_dump", buf);
+            return false;
+        }
 
         DWORD e_lfanew = dos->e_lfanew;
 
+        {
+            char buf[128];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "erase_dos_pre: e_magic=0x%X e_lfanew=0x%X base=0x%llX",
+                dos->e_magic, e_lfanew, reinterpret_cast<uint64_t>(base));
+            webhook::write_log("anti_dump", buf);
+        }
+
         DWORD old_prot = 0;
-        if (!VirtualProtect(base, e_lfanew, PAGE_READWRITE, &old_prot))
+        if (!VirtualProtect(base, e_lfanew, PAGE_READWRITE, &old_prot)) {
+            webhook::write_log("anti_dump", "erase_dos: VirtualProtect failed");
             return false;
+        }
 
         uint16_t saved_magic = dos->e_magic;
         uint32_t saved_lfanew = dos->e_lfanew;
@@ -121,17 +140,30 @@ namespace pe_header
         }
 
         auto* new_dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-        new_dos->e_magic = 0;
+        // preserve e_magic so the loader can still traverse DOS→NT→TLS for thread creation
+        new_dos->e_magic = saved_magic;
         new_dos->e_lfanew = static_cast<LONG>(e_lfanew);
 
         VirtualProtect(base, e_lfanew, old_prot, &old_prot);
+
+        {
+            char buf[128];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "erase_dos_post: e_magic=0x%X e_lfanew=0x%X (preserved for loader)",
+                new_dos->e_magic, new_dos->e_lfanew);
+            webhook::write_log("anti_dump", buf);
+        }
+
         return true;
     }
 
     inline bool corrupt_nt_headers()
     {
         HMODULE mod = GetModuleHandleW(nullptr);
-        if (!mod) return false;
+        if (!mod) {
+            webhook::write_log("anti_dump", "corrupt_nt: GetModuleHandle null");
+            return false;
+        }
 
         auto* base = reinterpret_cast<uint8_t*>(mod);
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
@@ -143,19 +175,58 @@ namespace pe_header
         WORD num_sections = nt->FileHeader.NumberOfSections;
         DWORD total = nt_size + num_sections * sizeof(IMAGE_SECTION_HEADER);
 
+        {
+            char buf[512];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "corrupt_nt_pre: base=0x%llX nt_off=0x%X sig=0x%X magic=0x%X machine=0x%X "
+                "num_sec=%u sizeof_opt=%u sizeof_image=0x%X imagebase=0x%llX "
+                "tls_rva=0x%X tls_size=0x%X exc_rva=0x%X exc_size=0x%X numrva=%u",
+                reinterpret_cast<uint64_t>(base), nt_offset,
+                nt->Signature, nt->OptionalHeader.Magic, nt->FileHeader.Machine,
+                num_sections, nt->FileHeader.SizeOfOptionalHeader,
+                nt->OptionalHeader.SizeOfImage,
+                static_cast<unsigned long long>(nt->OptionalHeader.ImageBase),
+                (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS)
+                    ? nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress : 0u,
+                (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS)
+                    ? nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size : 0u,
+                (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+                    ? nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress : 0u,
+                (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+                    ? nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size : 0u,
+                nt->OptionalHeader.NumberOfRvaAndSizes);
+            webhook::write_log("anti_dump", buf);
+        }
+
         DWORD old_prot = 0;
-        if (!VirtualProtect(nt, total, PAGE_READWRITE, &old_prot))
+        if (!VirtualProtect(nt, total, PAGE_READWRITE, &old_prot)) {
+            webhook::write_log("anti_dump", "corrupt_nt: VirtualProtect failed");
             return false;
+        }
+
+        // preserve TLS directory — CRT needs it to spawn threads via _beginthreadex
+        IMAGE_DATA_DIRECTORY saved_tls = {};
+        if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS)
+            saved_tls = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+
+        // preserve exception directory — needed for SEH/unwind on x64
+        IMAGE_DATA_DIRECTORY saved_exception = {};
+        if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+            saved_exception = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+
+        // preserve fields the loader needs for thread creation / TLS init
+        WORD saved_sizeof_opt = nt->FileHeader.SizeOfOptionalHeader;
+        DWORD saved_sizeof_image = nt->OptionalHeader.SizeOfImage;
+        ULONGLONG saved_image_base = nt->OptionalHeader.ImageBase;
+        DWORD saved_signature = nt->Signature;
+        WORD saved_magic = nt->OptionalHeader.Magic;
 
         nt->Signature = 0;
         nt->OptionalHeader.Magic = 0;
         nt->OptionalHeader.AddressOfEntryPoint = 0xDEADDEAD;
-        nt->OptionalHeader.ImageBase = 0;
-        nt->OptionalHeader.SizeOfImage = 0;
         nt->OptionalHeader.SizeOfHeaders = 0;
         nt->OptionalHeader.CheckSum = 0xFFFFFFFF;
 
-        nt->FileHeader.SizeOfOptionalHeader = 0;
         nt->FileHeader.Machine = 0;
 
         auto* sec = IMAGE_FIRST_SECTION(nt);
@@ -169,11 +240,45 @@ namespace pe_header
             sec[i].Characteristics = 0;
         }
 
-        nt->OptionalHeader.NumberOfRvaAndSizes = 0;
+        nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
         memset(nt->OptionalHeader.DataDirectory, 0,
                sizeof(nt->OptionalHeader.DataDirectory));
 
+        // restore loader-critical fields so CreateThread / TLS init / SEH still work
+        // ntdll!LdrpInitializeThread → LdrpAllocateTls re-parses PE headers in user memory
+        // to find IMAGE_TLS_DIRECTORY for each module — needs Signature + Magic to be valid
+        nt->Signature = saved_signature;
+        nt->OptionalHeader.Magic = saved_magic;
+        nt->FileHeader.SizeOfOptionalHeader = saved_sizeof_opt;
+        nt->OptionalHeader.SizeOfImage = saved_sizeof_image;
+        nt->OptionalHeader.ImageBase = saved_image_base;
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS] = saved_tls;
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION] = saved_exception;
+
         VirtualProtect(nt, total, old_prot, &old_prot);
+
+        {
+            char buf[512];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "corrupt_nt_post: sig=0x%X magic=0x%X machine=0x%X "
+                "sizeof_opt=%u sizeof_image=0x%X imagebase=0x%llX "
+                "tls_rva=0x%X tls_size=0x%X exc_rva=0x%X exc_size=0x%X "
+                "entry=0x%X checksum=0x%X headers_size=0x%X numrva=%u",
+                nt->Signature, nt->OptionalHeader.Magic, nt->FileHeader.Machine,
+                nt->FileHeader.SizeOfOptionalHeader,
+                nt->OptionalHeader.SizeOfImage,
+                static_cast<unsigned long long>(nt->OptionalHeader.ImageBase),
+                nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress,
+                nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size,
+                nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress,
+                nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size,
+                nt->OptionalHeader.AddressOfEntryPoint,
+                nt->OptionalHeader.CheckSum,
+                nt->OptionalHeader.SizeOfHeaders,
+                nt->OptionalHeader.NumberOfRvaAndSizes);
+            webhook::write_log("anti_dump", buf);
+        }
+
         return true;
     }
 
@@ -186,12 +291,24 @@ namespace pe_header
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
         auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
 
+        WORD orig_num_sections = nt->FileHeader.NumberOfSections;
         DWORD total = sizeof(IMAGE_NT_HEADERS64)
             + nt->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER);
 
+        {
+            char dbg[256];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "inject_fake_sections: orig_num_sec=%d total_size=0x%X base=0x%llX",
+                orig_num_sections, total, reinterpret_cast<uint64_t>(base));
+            webhook::write_log("anti_dump", dbg);
+        }
+
         DWORD old_prot = 0;
         if (!VirtualProtect(nt, total + 256, PAGE_READWRITE, &old_prot))
+        {
+            webhook::write_log("anti_dump", "inject_fake_sections: VirtualProtect failed");
             return false;
+        }
 
         nt->FileHeader.NumberOfSections = 8;
 
@@ -330,13 +447,14 @@ namespace read_intercept
             uint64_t base = trap_page_base.load();
             uint32_t size = trap_page_size.load();
 
+            // only handle single-step if our trap pages are active
             if (base != 0 && size != 0)
             {
                 DWORD old_prot;
                 VirtualProtect(reinterpret_cast<void*>(base), size,
                     PAGE_EXECUTE_READ | PAGE_GUARD, &old_prot);
+                return EXCEPTION_CONTINUE_EXECUTION;
             }
-            return EXCEPTION_CONTINUE_EXECUTION;
         }
 
         return EXCEPTION_CONTINUE_SEARCH;
@@ -351,6 +469,7 @@ namespace read_intercept
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base_ptr);
         if (dos->e_magic != IMAGE_DOS_SIGNATURE && dos->e_magic != 0)
         {
+            webhook::write_log("anti_dump", "set_guard_pages: pe_corrupted, setting guards");
             auto* nt_at_offset = reinterpret_cast<IMAGE_NT_HEADERS64*>(
                 base_ptr + dos->e_lfanew);
 
@@ -361,6 +480,7 @@ namespace read_intercept
             uint64_t data_start = header_end;
             uint64_t data_end = reinterpret_cast<uint64_t>(mod) + mi.SizeOfImage;
 
+            int guard_count = 0;
             MEMORY_BASIC_INFORMATION mbi{};
             uint64_t scan = data_start;
             while (scan < data_end)
@@ -376,10 +496,21 @@ namespace read_intercept
                     DWORD old_prot;
                     VirtualProtect(mbi.BaseAddress, mbi.RegionSize,
                         mbi.Protect | PAGE_GUARD, &old_prot);
+                    ++guard_count;
                 }
 
                 scan = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
             }
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "guard_pages_set count=%d", guard_count);
+            webhook::write_log("anti_dump", dbg);
+        }
+        else
+        {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "set_guard_pages: e_magic=0x%X (preserved or zero), skipping", dos->e_magic);
+            webhook::write_log("anti_dump", dbg);
         }
         return true;
     }
@@ -613,10 +744,19 @@ namespace handle_strip
         using NtSetInformationProcess_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
         auto pSet = reinterpret_cast<NtSetInformationProcess_t>(
             GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationProcess"));
-        if (!pSet) return;
+        if (!pSet) {
+            webhook::write_log("anti_dump", "seal_strip_no_NtSetInformationProcess");
+            return;
+        }
 
         ULONG protected_proc = 1;
-        pSet(GetCurrentProcess(), 0x3D, &protected_proc, sizeof(protected_proc));
+        NTSTATUS st = pSet(GetCurrentProcess(), 0x3D, &protected_proc, sizeof(protected_proc));
+        {
+            char buf[128];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "seal_strip_0x3D status=0x%08X", static_cast<unsigned>(st));
+            webhook::write_log("anti_dump", buf);
+        }
     }
 
 }
@@ -674,18 +814,33 @@ inline bool initialize()
     dump_poison::scramble_thread_objects();
     webhook::write_log("anti_dump", "scramble_threads_ok");
 
-    handle_strip::revoke_debug_privileges();
-    webhook::write_log("anti_dump", "revoke_privs_ok");
-
-    handle_strip::strip_process_handle_access();
-    webhook::write_log("anti_dump", "strip_handle_ok");
-
     anti_minidump::hook_minidump();
     webhook::write_log("anti_dump", "hook_minidump_ok");
 
-    module_stealth::hide_from_peb();
-    webhook::write_log("anti_dump", "hide_peb_ok");
+    // activate + spawn monitor thread BEFORE PE corruption so thread creation works
+    detail::active().store(true);
+    webhook::write_log("anti_dump", "active_store_ok");
 
+    detail::monitors_running().store(true);
+    webhook::write_log("anti_dump", "monitors_store_ok");
+
+    try
+    {
+        std::thread(monitor::run_periodic_reencrypt).detach();
+        webhook::write_log("anti_dump", "thread_detach_ok");
+    }
+    catch (const std::exception& ex)
+    {
+        char buf[256];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "thread_detach_fail: %s", ex.what());
+        webhook::write_log("anti_dump", buf);
+    }
+    catch (...)
+    {
+        webhook::write_log("anti_dump", "thread_detach_fail_unknown");
+    }
+
+    // PE corruption phase — after thread spawn
     pe_header::inject_fake_sections();
     webhook::write_log("anti_dump", "inject_fake_sections_ok");
 
@@ -698,23 +853,21 @@ inline bool initialize()
     read_intercept::install_veh();
     webhook::write_log("anti_dump", "install_veh_ok");
 
-    detail::active().store(true);
-    webhook::write_log("anti_dump", "active_store_ok");
-
-    detail::monitors_running().store(true);
-    webhook::write_log("anti_dump", "monitors_store_ok");
-
-    try
-    {
-        std::thread(monitor::run_periodic_reencrypt).detach();
-        webhook::write_log("anti_dump", "thread_detach_ok");
-    }
-    catch (...)
-    {
-        webhook::write_log("anti_dump", "thread_detach_failed_skipped");
-    }
-
     return true;
+}
+
+inline void seal_handles()
+{
+    handle_strip::revoke_debug_privileges();
+    webhook::write_log("anti_dump", "seal_revoke_privs_ok");
+
+    handle_strip::strip_process_handle_access();
+    webhook::write_log("anti_dump", "seal_strip_handle_ok");
+}
+
+inline void hide_module()
+{
+    module_stealth::hide_from_peb();
 }
 
 inline void shutdown()

@@ -198,7 +198,7 @@ async function sendTelegramAlert(title, fields) {
         }
         text += `\n<i>${new Date().toISOString()}</i>`;
 
-        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+        const url = `https:
         await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -610,10 +610,7 @@ async function handleHeartbeat(body, clientIp) {
         }
     }
 
-    // Phase 5.2: gate bitmap monotonic check. Client accumulates which gates
-    // fired this session (anti_re, driver, sentinel, etc.) into a 24-bit
-    // integer. Within one session the bitmap can only grow; shrinking means
-    // the client dropped a gate check it had previously run.
+
     const prevGateBitmap = Number(session.last_gate_bitmap || 0);
     const curGateBitmap  = Number(body.gate_bitmap || 0) | 0;
     if (curGateBitmap >= 0 && curGateBitmap < (1 << 24)) {

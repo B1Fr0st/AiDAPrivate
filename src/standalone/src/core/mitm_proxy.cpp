@@ -15,11 +15,6 @@
 #include <openssl/err.h>
 #include <openssl/bio.h>
 
-
-extern "C" {
-#include <openssl/applink.c>
-}
-
 #include <algorithm>
 #include <cstring>
 #include <string>

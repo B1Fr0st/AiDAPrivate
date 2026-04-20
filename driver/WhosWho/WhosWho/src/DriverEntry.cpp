@@ -1,12 +1,15 @@
 #include <ntifs.h>
 #include <Crypter.h>
 #include <imports/Defs.h>
+
+#define SAFETY_NET_IMPLEMENT
 #include <function/Dispatcher.h>
 #include <function/Stealth.h>
 #include <function/CoreSecurity.h>
 #include <function/AntiDebug.h>
 #include <function/SentinelBridge.h>
 #include <function/ProcessGuard.h>
+#include <function/impl/driver/FileHandleScanner.h>
 
 namespace net_capture {
     NTSTATUS initialize(PDEVICE_OBJECT devObj);
@@ -441,6 +444,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     anti_debug::initialize_kd_baseline();
     debug_attach_monitor::start();
     anti_dma_canary::init_timer();
+    file_handle_scanner::start(30);
 
     NTSTATUS ob_status = process_guard::init();
     WW_LOG("DriverEntry: process_guard::init returned 0x%08lx", ob_status);

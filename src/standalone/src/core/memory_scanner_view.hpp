@@ -11,6 +11,11 @@ struct ui_state_t {
 	float  address_scroll_y = 0.f;
 	float  address_target_scroll_y = 0.f;
 
+	bool   result_sb_dragging = false;
+	float  result_sb_drag_offset = 0.f;
+	bool   address_sb_dragging = false;
+	float  address_sb_drag_offset = 0.f;
+
 	char   value_buf[256] = {};
 	char   value_buf2[64] = {};
 

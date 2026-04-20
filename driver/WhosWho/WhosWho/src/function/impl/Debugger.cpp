@@ -6,6 +6,10 @@
 #include "../AntiDebug.h"
 #include "../SentinelBridge.h"
 #include "../Dispatcher.h"
+#include "driver/FileHandleScanner.h"
+
+extern "C" NTSTATUS NTAPI ZwQueryInformationProcess(
+    HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
 
 typedef struct _SYSTEM_PROCESS_INFORMATION_LOCAL {
     ULONG NextEntryOffset;
@@ -971,6 +975,108 @@ namespace debug_attach_monitor {
         return 0x420;
     }
 
+    __forceinline bool attribute_debugger_to_re_tool(HANDLE target_pid) {
+        if (!_PsLookupProcessByProcessId || !_ObfDereferenceObject)
+            return false;
+
+        ULONG buf_size = 4 * 1024 * 1024;
+        PVOID buf = ExAllocatePool2(POOL_FLAG_PAGED, buf_size, 'dAaW');
+        if (!buf) return false;
+
+        ULONG ret_len = 0;
+        NTSTATUS st = ZwQuerySystemInformation(
+            (SYSTEM_INFORMATION_CLASS_INTERNAL)64,
+            buf, buf_size, &ret_len);
+        if (st == STATUS_INFO_LENGTH_MISMATCH && ret_len > buf_size) {
+            ExFreePoolWithTag(buf, 'dAaW');
+            buf_size = ret_len + 65536;
+            buf = ExAllocatePool2(POOL_FLAG_PAGED, buf_size, 'dAaW');
+            if (!buf) return false;
+            st = ZwQuerySystemInformation(
+                (SYSTEM_INFORMATION_CLASS_INTERNAL)64,
+                buf, buf_size, &ret_len);
+        }
+        if (!NT_SUCCESS(st)) {
+            ExFreePoolWithTag(buf, 'dAaW');
+            return false;
+        }
+
+        struct HANDLE_ENTRY_EX {
+            PVOID Object;
+            ULONG_PTR UniqueProcessId;
+            ULONG_PTR HandleValue;
+            ACCESS_MASK GrantedAccess;
+            USHORT CreatorBackTraceIndex;
+            USHORT ObjectTypeIndex;
+            ULONG HandleAttributes;
+            ULONG Reserved;
+        };
+        struct HANDLE_INFO_EX {
+            ULONG_PTR NumberOfHandles;
+            ULONG_PTR Reserved;
+            HANDLE_ENTRY_EX Handles[1];
+        };
+
+        auto* info = (HANDLE_INFO_EX*)buf;
+        bool found_re = false;
+        constexpr ACCESS_MASK DBG_ACCESS =
+            PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_SUSPEND_RESUME;
+
+        for (ULONG_PTR i = 0; i < info->NumberOfHandles && i < 500000; ++i) {
+            auto& h = info->Handles[i];
+            if ((HANDLE)h.UniqueProcessId == target_pid) continue;
+            if ((h.GrantedAccess & DBG_ACCESS) != DBG_ACCESS) continue;
+
+            PEPROCESS owner_proc = nullptr;
+            if (!NT_SUCCESS(_PsLookupProcessByProcessId((HANDLE)h.UniqueProcessId, &owner_proc)))
+                continue;
+
+            UCHAR* image = PsGetProcessImageFileName(owner_proc);
+            bool is_re = file_handle_scanner::_match_tool((const char*)image);
+            _ObfDereferenceObject(owner_proc);
+
+            if (is_re) {
+                PEPROCESS handle_target = nullptr;
+                __try {
+                    if (_MmIsAddressValid && _MmIsAddressValid(h.Object)) {
+                        HANDLE hval = (HANDLE)h.HandleValue;
+                        HANDLE owner_handle = nullptr;
+                        CLIENT_ID cid = {};
+                        cid.UniqueProcess = (HANDLE)h.UniqueProcessId;
+                        cid.UniqueThread = nullptr;
+                        OBJECT_ATTRIBUTES oa = {};
+                        InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
+                        if (_ZwOpenProcess && NT_SUCCESS(_ZwOpenProcess(&owner_handle, PROCESS_DUP_HANDLE, &oa, &cid))) {
+                            HANDLE dup = nullptr;
+                            OBJECT_ATTRIBUTES dup_oa = {};
+                            InitializeObjectAttributes(&dup_oa, nullptr, 0, nullptr, nullptr);
+                            if (ZwDuplicateObject(owner_handle, hval, NtCurrentProcess(),
+                                    &dup, 0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, 0, 0) >= 0 && dup) {
+                                PROCESS_BASIC_INFORMATION pbi = {};
+                                ULONG pbi_ret = 0;
+                                // ZwQueryInformationProcess declared at file scope
+                                
+                                if (NT_SUCCESS(ZwQueryInformationProcess(dup,
+                                        ProcessBasicInformation, &pbi, sizeof(pbi), &pbi_ret))) {
+                                    if ((HANDLE)(ULONG_PTR)pbi.UniqueProcessId == target_pid) {
+                                        found_re = true;
+                                    }
+                                }
+                                if (_ZwClose) _ZwClose(dup);
+                            }
+                            if (_ZwClose) _ZwClose(owner_handle);
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+                if (found_re) break;
+            }
+        }
+
+        ExFreePoolWithTag(buf, 'dAaW');
+        return found_re;
+    }
+
     static VOID NTAPI work_routine(PVOID) {
         ULONG pid = static_cast<ULONG>(_InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_pending_pid), 0));
         if (pid == 0) {
@@ -999,9 +1105,18 @@ namespace debug_attach_monitor {
 
         if (debug_port != nullptr || kd_enabled_now) {
             LONG strikes = _InterlockedIncrement(&g_strikes);
+
+            ULONG evidence_reason = sentinel_bridge::RE_REASON_DEBUG_ATTACH;
+            if (debug_port != nullptr) {
+                HANDLE pid_handle = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid));
+                if (attribute_debugger_to_re_tool(pid_handle)) {
+                    evidence_reason = sentinel_bridge::RE_REASON_DEBUG_BY_RE_TOOL;
+                }
+            }
+
             sentinel_bridge::populate_evidence_blob(
                 0x20u,
-                sentinel_bridge::RE_REASON_DEBUG_ATTACH,
+                evidence_reason,
                 100,
                 pid,
                 0,

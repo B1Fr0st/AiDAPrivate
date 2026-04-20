@@ -99,8 +99,11 @@ void render(float pos_x, float pos_y, float width, float height,
 	float ox = origin.x + pos_x;
 	float oy = origin.y + pos_y;
 
+	const auto& _t = themes::resolved;
+	const auto _ta = [alpha](ImU32 c) -> ImU32 { return ui_anim::theme_alpha(c, alpha); };
+
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height),
-	                  IM_COL32(18, 18, 24, static_cast<int>(240 * alpha)));
+	                  _ta(_t.bg_base));
 
 	int ar_i = static_cast<int>(accent_r * 255);
 	int ag_i = static_cast<int>(accent_g * 255);
@@ -118,7 +121,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	ui_anim::render_toolbar(dl, ox, oy, width, toolbar_h, alpha, accent_r, accent_g, accent_b);
 	dl->AddLine(ImVec2(ox, oy + toolbar_h), ImVec2(ox + width, oy + toolbar_h),
-	            IM_COL32(50, 50, 65, static_cast<int>(180 * alpha)));
+	            _ta(ui_anim::lighten(_t.panel_bg, 12)));
 
 	{
 		std::lock_guard<std::mutex> lk(st.mutex);
@@ -260,18 +263,18 @@ void render(float pos_x, float pos_y, float width, float height,
 	if (show_batch_panel && !st.batch_running.load() && !st.decompiling.load()) {
 		float batch_panel_h = 120.f;
 		dl->AddRectFilled(ImVec2(ox, code_top), ImVec2(ox + code_w, code_top + batch_panel_h),
-		                  IM_COL32(25, 25, 35, static_cast<int>(230 * alpha)));
+		                  _ta(_t.panel_bg));
 		dl->AddLine(ImVec2(ox, code_top + batch_panel_h),
 		            ImVec2(ox + code_w, code_top + batch_panel_h),
-		            IM_COL32(50, 50, 65, static_cast<int>(180 * alpha)));
+		            _ta(ui_anim::lighten(_t.panel_bg, 12)));
 
 		ImGui::SetCursorScreenPos(ImVec2(ox + 10.f, code_top + 4.f));
 		dl->AddText(ImVec2(ox + 10.f, code_top + 4.f), accent_col, "Batch Decompile — one hex address per line");
 
 		ImGui::SetCursorScreenPos(ImVec2(ox + 10.f, code_top + 22.f));
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(200 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(120 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(210, 210, 220, static_cast<int>(220 * alpha)));
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
+		ImGui::PushStyleColor(ImGuiCol_Border, _ta(ui_anim::lighten(_t.panel_bg, 12)));
+		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 		ImGui::PushItemWidth(code_w - 100.f);
@@ -282,10 +285,10 @@ void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PopStyleColor(3);
 
 		ImGui::SetCursorScreenPos(ImVec2(ox + code_w - 80.f, code_top + 22.f));
-		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(static_cast<int>(accent_r * 140), static_cast<int>(accent_g * 140), static_cast<int>(accent_b * 140), static_cast<int>(200 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(static_cast<int>(accent_r * 180), static_cast<int>(accent_g * 180), static_cast<int>(accent_b * 180), static_cast<int>(220 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(static_cast<int>(accent_r * 100), static_cast<int>(accent_g * 100), static_cast<int>(accent_b * 100), static_cast<int>(240 * alpha)));
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, static_cast<int>(255 * alpha)));
+		ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, _ta(ui_anim::darken(_t.panel_header, 10)));
+		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 
 		if (ImGui::Button("Run##batch", ImVec2(70.f, 30.f))) {
@@ -334,7 +337,7 @@ void render(float pos_x, float pos_y, float width, float height,
 				std::string msg = prog_msg;
 				ImVec2 ts = ImGui::CalcTextSize(msg.c_str());
 				dl->AddText(ImVec2(cx - ts.x * 0.5f, cy - ts.y * 0.5f - 10.f),
-				            IM_COL32(140, 140, 160, static_cast<int>(200 * alpha)),
+				            _ta(_t.text_secondary),
 				            msg.c_str());
 
 				float bar_w = 200.f;
@@ -342,7 +345,7 @@ void render(float pos_x, float pos_y, float width, float height,
 				float bar_x = cx - bar_w * 0.5f;
 				float bar_y = cy + 10.f;
 				dl->AddRectFilled(ImVec2(bar_x, bar_y), ImVec2(bar_x + bar_w, bar_y + bar_h),
-				                  IM_COL32(50, 50, 65, static_cast<int>(150 * alpha)), 2.f);
+				                  _ta(ui_anim::lighten(_t.panel_bg, 12)), 2.f);
 				dl->AddRectFilled(ImVec2(bar_x, bar_y),
 				                  ImVec2(bar_x + bar_w * emu_prog, bar_y + bar_h),
 				                  accent_col, 2.f);
@@ -350,7 +353,7 @@ void render(float pos_x, float pos_y, float width, float height,
 				std::string msg = "Decompiling" + dots;
 				ImVec2 ts = ImGui::CalcTextSize(msg.c_str());
 				dl->AddText(ImVec2(cx - ts.x * 0.5f, cy - ts.y * 0.5f),
-				            IM_COL32(140, 140, 160, static_cast<int>(200 * alpha)),
+				            _ta(_t.text_secondary),
 				            msg.c_str());
 			}
 		} else {
@@ -359,7 +362,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			std::vector<syntax::token_t> tokens;
 
 			dl->AddRectFilled(ImVec2(ox, code_top), ImVec2(ox + gutter_w, code_top + code_h),
-			                  IM_COL32(22, 22, 30, static_cast<int>(220 * alpha)));
+			                  _ta(_t.bg_base));
 
 			for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
 				float ly = code_top + static_cast<float>(i) * line_h;
@@ -369,7 +372,7 @@ void render(float pos_x, float pos_y, float width, float height,
 				snprintf(num, sizeof(num), "%d", lines[i].number);
 				ImVec2 ns = ImGui::CalcTextSize(num);
 				dl->AddText(ImVec2(ox + gutter_w - ns.x - 8.f, ly + 1.f),
-				            IM_COL32(80, 80, 100, static_cast<int>(150 * alpha)), num);
+				            _ta(_t.text_dim), num);
 
 				syntax::tokenize(lines[i].text, cpp_lang, tokens);
 				float tx = ox + gutter_w + 8.f;
@@ -429,7 +432,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			int vis_count = static_cast<int>(visible_h / line_h) + 2;
 
 			dl->AddRectFilled(ImVec2(ox, code_top), ImVec2(ox + gutter_w, code_top + code_h),
-			                  IM_COL32(22, 22, 30, static_cast<int>(220 * alpha)));
+			                  _ta(_t.bg_base));
 
 			for (int i = first_vis; i < (std::min)(first_vis + vis_count, static_cast<int>(lines.size())); ++i) {
 				float ly = code_top + static_cast<float>(i) * line_h - st.scroll_y;
@@ -438,7 +441,7 @@ void render(float pos_x, float pos_y, float width, float height,
 				snprintf(num, sizeof(num), "%d", lines[i].number);
 				ImVec2 ns = ImGui::CalcTextSize(num);
 				dl->AddText(ImVec2(ox + gutter_w - ns.x - 8.f, ly + 1.f),
-				            IM_COL32(80, 80, 100, static_cast<int>(150 * alpha)), num);
+				            _ta(_t.text_dim), num);
 
 				syntax::tokenize(lines[i].text, cpp_lang, tokens);
 				float tx = ox + gutter_w + 8.f;
@@ -480,7 +483,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		float rp_h = code_h;
 
 		dl->AddLine(ImVec2(rp_x, rp_y), ImVec2(rp_x, rp_y + rp_h),
-		            IM_COL32(50, 50, 65, static_cast<int>(180 * alpha)));
+		            _ta(ui_anim::lighten(_t.panel_bg, 12)));
 		ui_anim::render_panel_card(dl, rp_x, rp_y, right_panel_w, rp_h,
 		                           accent_r, accent_g, accent_b, alpha, 0.f, true);
 
@@ -489,7 +492,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		dl->AddText(ImVec2(rp_x + 10.f, py), accent_col, "Function Info");
 		py += 20.f;
 		dl->AddLine(ImVec2(rp_x + 6.f, py), ImVec2(rp_x + right_panel_w - 6.f, py),
-		            IM_COL32(50, 50, 65, static_cast<int>(120 * alpha)));
+		            _ta(ui_anim::lighten(_t.panel_bg, 12)));
 		py += 8.f;
 
 		std::lock_guard<std::mutex> lk(st.mutex);
@@ -499,24 +502,24 @@ void render(float pos_x, float pos_y, float width, float height,
 			snprintf(addr, sizeof(addr), "0x%llX",
 			         static_cast<unsigned long long>(st.current.function_addr));
 			dl->AddText(ImVec2(rp_x + 10.f, py),
-			            IM_COL32(120, 120, 140, static_cast<int>(180 * alpha)), "Address:");
+			            _ta(_t.text_dim), "Address:");
 			dl->AddText(ImVec2(rp_x + 70.f, py),
-			            IM_COL32(180, 180, 195, static_cast<int>(200 * alpha)), addr);
+			            _ta(_t.text_secondary), addr);
 			py += 16.f;
 		}
 
 		if (!st.current.function_name.empty()) {
 			dl->AddText(ImVec2(rp_x + 10.f, py),
-			            IM_COL32(120, 120, 140, static_cast<int>(180 * alpha)), "Name:");
+			            _ta(_t.text_dim), "Name:");
 			dl->AddText(ImVec2(rp_x + 70.f, py),
-			            IM_COL32(180, 180, 195, static_cast<int>(200 * alpha)),
+			            _ta(_t.text_secondary),
 			            st.current.function_name.c_str());
 			py += 16.f;
 		}
 
 		if (!st.current.parameters.empty()) {
 			dl->AddText(ImVec2(rp_x + 10.f, py),
-			            IM_COL32(120, 120, 140, static_cast<int>(180 * alpha)), "Params:");
+			            _ta(_t.text_dim), "Params:");
 			py += 16.f;
 
 			float wrap = right_panel_w - 20.f;
@@ -534,7 +537,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			dl->AddText(ImVec2(rp_x + 10.f, py), accent_col, "Callees");
 			py += 20.f;
 			dl->AddLine(ImVec2(rp_x + 6.f, py), ImVec2(rp_x + right_panel_w - 6.f, py),
-			            IM_COL32(50, 50, 65, static_cast<int>(120 * alpha)));
+			            _ta(ui_anim::lighten(_t.panel_bg, 12)));
 			py += 6.f;
 
 			for (auto& callee : st.current.callees) {
@@ -575,7 +578,7 @@ void render(float pos_x, float pos_y, float width, float height,
 				dl->AddText(ImVec2(rp_x + 10.f, py), accent_col, "History");
 				py += 20.f;
 				dl->AddLine(ImVec2(rp_x + 6.f, py), ImVec2(rp_x + right_panel_w - 6.f, py),
-				            IM_COL32(50, 50, 65, static_cast<int>(120 * alpha)));
+				            _ta(ui_anim::lighten(_t.panel_bg, 12)));
 				py += 6.f;
 
 				for (int hi = static_cast<int>(st.history.size()) - 1; hi >= 0; --hi) {
@@ -590,8 +593,8 @@ void render(float pos_x, float pos_y, float width, float height,
 					ImU32 hc = (hi == st.history_pos)
 						? accent_col
 						: hist_hov
-							? IM_COL32(200, 200, 210, static_cast<int>(220 * alpha))
-							: IM_COL32(150, 150, 165, static_cast<int>(180 * alpha));
+							? _ta(_t.text_primary)
+							: _ta(_t.text_secondary);
 					dl->AddText(ImVec2(rp_x + 14.f, py), hc, he.name.c_str());
 
 					if (hist_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hi != st.history_pos) {

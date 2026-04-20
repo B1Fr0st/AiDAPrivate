@@ -13,6 +13,7 @@
 #include "standalone_driver.hpp"
 #include "debugger_engine.hpp"
 #include "ui_anim.hpp"
+#include "../helpers/globals.h"
 
 namespace memory_map_view {
 
@@ -136,9 +137,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 {
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	float dt = ImGui::GetIO().DeltaTime;
+	const auto& _t = themes::resolved;
+	const auto _ta = [alpha](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, alpha);
+	};
+	const ImU32 accent = IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+								  static_cast<int>(ab * 255), static_cast<int>(alpha * 255));
 
 	dl->AddRectFilled(ImVec2(pos_x, pos_y), ImVec2(pos_x + width, pos_y + height),
-					  IM_COL32(18, 18, 24, static_cast<int>(240 * alpha)));
+					  _ta(_t.bg_base));
 
 	float header_h = 32.f;
 	float row_h = 20.f;
@@ -146,7 +153,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	ui_anim::render_toolbar(dl, pos_x, pos_y, width, header_h, ar, ag, ab, alpha);
 	dl->AddText(ImVec2(pos_x + 10.f, pos_y + 8.f),
-				IM_COL32(200, 200, 210, static_cast<int>(220 * alpha)), "Memory Map");
+				_ta(_t.text_primary), "Memory Map");
 
 	float refresh_x = pos_x + 100.f;
 	float refresh_y = pos_y + 4.f;
@@ -154,22 +161,21 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImVec2 btn_max(refresh_x + 60.f, refresh_y + 22.f);
 	bool btn_hover = ImGui::IsMouseHoveringRect(btn_min, btn_max, false);
 	dl->AddRectFilled(btn_min, btn_max,
-					  btn_hover ? IM_COL32(50, 52, 60, static_cast<int>(200 * alpha))
-								: IM_COL32(35, 37, 45, static_cast<int>(200 * alpha)), 3.f);
+					  btn_hover ? _ta(ui_anim::lighten(_t.panel_header, 14))
+								: _ta(_t.panel_header), 3.f);
 	dl->AddText(ImVec2(refresh_x + 8.f, refresh_y + 3.f),
-				IM_COL32(180, 180, 190, static_cast<int>(200 * alpha)), "Refresh");
+				_ta(_t.text_secondary), "Refresh");
 	if (btn_hover && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 		refresh();
 
 	if (g_ui.refreshing.load()) {
-		dl->AddText(ImVec2(refresh_x + 70.f, refresh_y + 3.f),
-					IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
-							 static_cast<int>(ab * 255), static_cast<int>(200 * alpha)), "...");
+		ui_anim::render_spinner(dl, refresh_x + 80.f, refresh_y + 11.f, 6.f, 1.5f,
+								accent, static_cast<float>(ImGui::GetTime()));
 	}
 
 	float filter_x = pos_x + width - 220.f;
 	dl->AddText(ImVec2(filter_x - 40.f, pos_y + 8.f),
-				IM_COL32(140, 140, 150, static_cast<int>(180 * alpha)), "Filter:");
+				_ta(_t.text_dim), "Filter:");
 	ImGui::SetCursorScreenPos(ImVec2(filter_x, pos_y + 5.f));
 	ImGui::PushItemWidth(200.f);
 	ImGui::PushID("##memmapfilter");
@@ -179,13 +185,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	float table_y = pos_y + header_h;
 
-	float col_addr = pos_x + 10.f;
-	float col_size = pos_x + 160.f;
-	float col_prot = pos_x + 250.f;
-	float col_state = pos_x + 380.f;
-	float col_type = pos_x + 470.f;
-	float col_mod = pos_x + 560.f;
-	float col_info = pos_x + 700.f;
+	float col_addr = pos_x + width * 0.01f;
+	float col_size = pos_x + width * 0.18f;
+	float col_prot = pos_x + width * 0.28f;
+	float col_state = pos_x + width * 0.43f;
+	float col_type = pos_x + width * 0.54f;
+	float col_mod = pos_x + width * 0.64f;
+	float col_info = pos_x + width * 0.80f;
 
 	{
 		ui_anim::table_col_t cols[] = {{"Address", 150.f}, {"Size", 90.f}, {"Protection", 130.f}, {"State", 90.f}, {"Type", 90.f}, {"Module", 140.f}, {"Info", 150.f}};
@@ -221,6 +227,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (first_visible < 0) first_visible = 0;
 	int visible_count = static_cast<int>(list_h / row_h) + 2;
 
+	if (filtered.empty() && !g_ui.refreshing.load()) {
+		ui_anim::render_empty_state(dl, pos_x, list_y, width, list_h,
+			"No memory regions found", ar, ag, ab, alpha, static_cast<float>(ImGui::GetTime()));
+		dl->PopClipRect();
+		return;
+	}
+
 	for (int vi = 0; vi < visible_count; ++vi) {
 		int idx = first_visible + vi;
 		if (idx >= static_cast<int>(filtered.size())) break;
@@ -229,16 +242,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float ry = list_y + idx * row_h - g_ui.scroll_y;
 		if (ry + row_h < list_y || ry > list_y + list_h) continue;
 
-		ui_anim::row_hover_select(dl, pos_x, ry, width - 12.f, row_h, idx, g_ui.selected, alpha, ar, ag, ab);
+		float row_alpha = ui_anim::render_row_entrance(idx, first_visible, dt, alpha);
+		ui_anim::row_hover_select(dl, pos_x, ry, width - 12.f, row_h, idx, g_ui.selected, row_alpha, ar, ag, ab);
 
 		char addr_buf[24];
 		snprintf(addr_buf, sizeof(addr_buf), "%016llX", static_cast<unsigned long long>(r.base));
 		dl->AddText(ImVec2(col_addr, ry + 2.f),
-					IM_COL32(180, 190, 210, static_cast<int>(210 * alpha)), addr_buf);
+					_ta(_t.text_secondary), addr_buf);
 
 		std::string sz_str = detail::format_size(r.size);
 		dl->AddText(ImVec2(col_size, ry + 2.f),
-					IM_COL32(180, 180, 190, static_cast<int>(200 * alpha)), sz_str.c_str());
+					_ta(_t.text_secondary), sz_str.c_str());
 
 		std::string prot_str = debugger_engine::format_protect(r.protect);
 		dl->AddText(ImVec2(col_prot, ry + 2.f), detail::protect_color(r.protect, alpha), prot_str.c_str());
@@ -250,9 +264,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		dl->AddText(ImVec2(col_type, ry + 2.f), detail::type_color(r.type, alpha), type_str.c_str());
 
 		dl->AddText(ImVec2(col_mod, ry + 2.f),
-					IM_COL32(160, 170, 200, static_cast<int>(200 * alpha)), r.module_name.c_str());
+					_ta(_t.text_secondary), r.module_name.c_str());
 		dl->AddText(ImVec2(col_info, ry + 2.f),
-					IM_COL32(140, 140, 150, static_cast<int>(170 * alpha)), r.info.c_str());
+					_ta(_t.text_dim), r.info.c_str());
 
 		if (idx == g_ui.selected && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
 			g_ui.context_addr = r.base;

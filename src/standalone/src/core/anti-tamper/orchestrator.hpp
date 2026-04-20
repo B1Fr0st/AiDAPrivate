@@ -149,9 +149,6 @@ inline bool initialize()
     code_encrypt::initialize(rt.code_snap.text_hash);
     webhook::write_log("init", "code_encrypt_ok");
 
-    anti_dump::initialize();
-    webhook::write_log("init", "anti_dump_ok");
-
     metamorphic::initialize();
     webhook::write_log("init", "metamorphic_ok");
 
@@ -167,11 +164,19 @@ inline bool initialize()
     decoy::initialize();
     webhook::write_log("init", "decoy_call_graph_ok");
 
-    packer::encrypt_sections(rt.code_snap.text_hash ^ __rdtsc());
-    webhook::write_log("init", "packer_encrypt_ok");
+    // packer::encrypt_sections encrypts .data/.rdata in-place with AES-CTR.
+    // No on-demand decrypt VEH exists, so encrypted sections become immediately
+    // unreadable — any access to static data, string literals, or vtables in
+    // those sections causes an immediate crash. MUST remain disabled until a
+    // guard-page-based auto-decrypt handler is implemented.
+    // packer::encrypt_sections(rt.code_snap.text_hash ^ __rdtsc());
+    webhook::write_log("init", "packer_encrypt_SKIPPED_no_autodecrypt");
 
-    packer::obfuscate_imports(static_cast<uint32_t>(rt.code_snap.text_hash));
-    webhook::write_log("init", "packer_imports_ok");
+    // packer::obfuscate_imports redirects IAT through XOR trampolines.
+    // Breaks CRT internal function pointers (e.g. _beginthreadex path)
+    // and can crash on any imported call made after this point.
+    // packer::obfuscate_imports(static_cast<uint32_t>(rt.code_snap.text_hash));
+    webhook::write_log("init", "packer_imports_SKIPPED_breaks_crt");
 
     nanomites::initialize();
     webhook::write_log("init", "nanomites_ok");
@@ -198,6 +203,7 @@ inline bool initialize()
         driver_bridge::kernel_anti_debug_hide_all_threads(self_pid);
         webhook::write_log("init", "kernel_anti_debug_ok");
 
+        // kernel anti-dump: runs before thread spawning so TLS-preserved headers are still intact
         driver_bridge::kernel_anti_dump_full(self_pid);
         webhook::write_log("init", "kernel_anti_dump_ok");
 
@@ -219,27 +225,126 @@ inline bool initialize()
     anti_debug::hide_thread_from_debugger(GetCurrentThread());
     webhook::write_log("init", "hide_thread_ok");
 
-    standalone_anti_dump::initialize();
-    webhook::write_log("init", "anti_dump_standalone_ok");
-
     rt.initialized.store(true);
     webhook::write_log("init", "initialized_ok");
 
-    start_monitors();
+    // spawn all background threads BEFORE PE corruption
+    try
+    {
+        webhook::write_log("init", "start_monitors_entering");
+        start_monitors();
+        webhook::write_log("init", "monitors_started_ok");
+    }
+    catch (const std::exception& ex)
+    {
+        webhook::write_log("init", (std::string("start_monitors_exception: ") + ex.what()).c_str());
+    }
+    catch (...)
+    {
+        webhook::write_log("init", "start_monitors_unknown_exception");
+    }
 
-    re_detect::initialize();
-    webhook::write_log("init", "re_detect_engine_ok");
+    try
+    {
+        webhook::write_log("init", "re_detect_entering");
+        re_detect::initialize();
+        webhook::write_log("init", "re_detect_engine_ok");
+    }
+    catch (const std::exception& ex)
+    {
+        webhook::write_log("init", (std::string("re_detect_exception: ") + ex.what()).c_str());
+    }
+    catch (...)
+    {
+        webhook::write_log("init", "re_detect_unknown_exception");
+    }
+
+    // PE corruption phase — runs AFTER all threads are spawned
+    // anti_dump corrupts PE headers (preserving TLS/exception/Signature/Magic/SizeOfOptionalHeader)
+    try
+    {
+        webhook::write_log("init", "anti_dump_entering");
+        anti_dump::initialize();
+        webhook::write_log("init", "anti_dump_ok");
+    }
+    catch (const std::exception& ex)
+    {
+        webhook::write_log("init", (std::string("anti_dump_exception: ") + ex.what()).c_str());
+    }
+    catch (...)
+    {
+        webhook::write_log("init", "anti_dump_unknown_exception");
+    }
+
+    try
+    {
+        webhook::write_log("init", "standalone_anti_dump_entering");
+        standalone_anti_dump::initialize();
+        webhook::write_log("init", "standalone_anti_dump_ok");
+    }
+    catch (const std::exception& ex)
+    {
+        webhook::write_log("init", (std::string("standalone_anti_dump_exception: ") + ex.what()).c_str());
+    }
+    catch (...)
+    {
+        webhook::write_log("init", "standalone_anti_dump_unknown_exception");
+    }
+
+    anti_dump::seal_handles();
+    webhook::write_log("init", "seal_handles_ok");
+
+    standalone_anti_dump::seal_handles();
+    webhook::write_log("init", "standalone_seal_handles_ok");
+
+    // verify thread creation still works after PE corruption + seal
+    try
+    {
+        std::atomic<bool> test_done{false};
+        std::thread([&test_done]() { test_done.store(true); }).join();
+        webhook::write_log("init", test_done.load()
+            ? "post_seal_thread_test_PASS"
+            : "post_seal_thread_test_FAIL_no_exec");
+    }
+    catch (const std::exception& ex)
+    {
+        char buf[256];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "post_seal_thread_test_FAIL: %s", ex.what());
+        webhook::write_log("init", buf);
+    }
+    catch (...)
+    {
+        webhook::write_log("init", "post_seal_thread_test_FAIL_unknown");
+    }
+
+    anti_dump::hide_module();
+    webhook::write_log("init", "hide_peb_ok");
 
     return true;
 }
 
 inline bool guard()
 {
+    static bool s_first_guard = true;
+    static uint64_t s_guard_call_count = 0;
+    ++s_guard_call_count;
+    if (s_first_guard) {
+        webhook::write_log("guard", "first_guard_entry");
+        s_first_guard = false;
+    }
+
     auto& rt = state::get();
 
     CFF_BEGIN(guard_cff)
     CFF_STATE(guard_cff, 0)
     {
+        if (s_guard_call_count <= 3 || (s_guard_call_count % 20) == 0) {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "guard_iter=%llu state=0 violation_latched=%d",
+                s_guard_call_count, rt.violation_latched.load() ? 1 : 0);
+            webhook::write_log("guard", dbg);
+        }
         if (rt.violation_latched.load(std::memory_order_acquire))
         {
             CFF_EXIT(guard_cff);
@@ -248,7 +353,14 @@ inline bool guard()
     }
     CFF_STATE(guard_cff, 1)
     {
-        if (token_chain::is_chain_stale())
+        bool chain_stale = token_chain::is_chain_stale();
+        if (s_guard_call_count <= 3) {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "guard_iter=%llu state=1 chain_stale=%d",
+                s_guard_call_count, chain_stale ? 1 : 0);
+            webhook::write_log("guard", dbg);
+        }
+        if (chain_stale)
         {
             webhook::send_debug_log("guard", "chain_stale", true);
             enforce_violation("integrity_chain_stale");
@@ -258,7 +370,14 @@ inline bool guard()
     }
     CFF_STATE(guard_cff, 2)
     {
-        if (!packer::verify_unpack_timing())
+        bool unpack_ok = packer::verify_unpack_timing();
+        if (s_guard_call_count <= 3) {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "guard_iter=%llu state=2 unpack_timing_ok=%d",
+                s_guard_call_count, unpack_ok ? 1 : 0);
+            webhook::write_log("guard", dbg);
+        }
+        if (!unpack_ok)
         {
             webhook::send_debug_log("guard", "unpack_timing_anomaly", true);
             enforce_violation("unpack_timing_anomaly");
@@ -270,6 +389,14 @@ inline bool guard()
     {
         DECOY_CALL_INTEGRATED(g3);
         auto dbg = anti_debug::full_scan(rt.code_snap.module_base, rt.code_snap.module_end);
+        if (s_guard_call_count <= 3) {
+            char dbg_buf[256];
+            _snprintf_s(dbg_buf, sizeof(dbg_buf), _TRUNCATE,
+                "guard_iter=%llu state=3 anti_debug_any=%d summary=%s",
+                s_guard_call_count, dbg.any_detected() ? 1 : 0,
+                dbg.summary.empty() ? "none" : dbg.summary.c_str());
+            webhook::write_log("guard", dbg_buf);
+        }
         if (dbg.any_detected())
         {
             webhook::send_debug_log("guard", "debugger_detected: " + dbg.summary, true);
@@ -280,7 +407,25 @@ inline bool guard()
     }
     CFF_STATE(guard_cff, 4)
     {
+        if (s_guard_call_count <= 3) {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "guard_iter=%llu state=4 iat_snap_size=%zu entering_hook_scan",
+                s_guard_call_count, rt.iat_snap.size());
+            webhook::write_log("guard", dbg);
+        }
         auto hook = anti_hook::full_scan(rt.iat_snap);
+        if (s_guard_call_count <= 3) {
+            char dbg[256];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "guard_iter=%llu state=4 hook_any=%d iat=%d ntdll=%d k32=%d syscall=%d eat=%d summary=%s",
+                s_guard_call_count, hook.any_detected() ? 1 : 0,
+                hook.iat_modified ? 1 : 0, hook.ntdll_inline_hooked ? 1 : 0,
+                hook.kernel32_inline_hooked ? 1 : 0, hook.syscall_stubs_modified ? 1 : 0,
+                hook.eat_hooked ? 1 : 0,
+                hook.summary.empty() ? "none" : hook.summary.c_str());
+            webhook::write_log("guard", dbg);
+        }
         if (hook.any_detected())
         {
             webhook::send_debug_log("guard", "hook_detected: " + hook.summary, true);
@@ -292,7 +437,15 @@ inline bool guard()
     CFF_STATE(guard_cff, 5)
     {
         DECOY_CRYPTO_INTEGRATED(g5);
-        if (!integrity::verify_self_hash())
+        bool self_hash_ok = integrity::verify_self_hash();
+        if (s_guard_call_count <= 3) {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "guard_iter=%llu state=5 self_hash_ok=%d",
+                s_guard_call_count, self_hash_ok ? 1 : 0);
+            webhook::write_log("guard", dbg);
+        }
+        if (!self_hash_ok)
         {
             webhook::send_debug_log("guard", "code_integrity_fail", true);
             enforce_violation("code_integrity_runtime");
@@ -302,7 +455,15 @@ inline bool guard()
     }
     CFF_STATE(guard_cff, 6)
     {
-        if (!integrity::verify_block_chain(rt.code_snap, rt.block_chain))
+        bool bc_ok = integrity::verify_block_chain(rt.code_snap, rt.block_chain);
+        if (s_guard_call_count <= 3) {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "guard_iter=%llu state=6 block_chain_ok=%d",
+                s_guard_call_count, bc_ok ? 1 : 0);
+            webhook::write_log("guard", dbg);
+        }
+        if (!bc_ok)
         {
             webhook::send_debug_log("guard", "block_chain_fail", true);
             enforce_violation("block_chain_runtime");
@@ -313,7 +474,15 @@ inline bool guard()
     CFF_STATE(guard_cff, 7)
     {
         DECOY_CALL_INTEGRATED(g7);
-        if (!call_obfuscation::verify_table_integrity())
+        bool call_obf_ok = call_obfuscation::verify_table_integrity();
+        if (s_guard_call_count <= 3) {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "guard_iter=%llu state=7 call_obf_ok=%d",
+                s_guard_call_count, call_obf_ok ? 1 : 0);
+            webhook::write_log("guard", dbg);
+        }
+        if (!call_obf_ok)
         {
             webhook::send_debug_log("guard", "call_obfuscation_tamper", true);
             enforce_violation("call_obfuscation_tamper");
@@ -323,8 +492,15 @@ inline bool guard()
 
         call_obfuscation::re_encrypt_all();
 
-
-        if (!nanomites::verify_table_integrity())
+        bool nano_ok = nanomites::verify_table_integrity();
+        if (s_guard_call_count <= 3) {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "guard_iter=%llu state=7 nanomite_ok=%d",
+                s_guard_call_count, nano_ok ? 1 : 0);
+            webhook::write_log("guard", dbg);
+        }
+        if (!nano_ok)
         {
             webhook::send_debug_log("guard", "nanomite_table_tamper", true);
             enforce_violation("nanomite_table_tamper");
@@ -336,7 +512,16 @@ inline bool guard()
     }
     CFF_STATE(guard_cff, 8)
     {
-        if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
+        bool drv_loaded = driver_bridge::is_loaded();
+        bool drv_kernel = drv_loaded && driver_bridge::using_kernel_driver();
+        if (s_guard_call_count <= 3) {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "guard_iter=%llu state=8 drv_loaded=%d drv_kernel=%d",
+                s_guard_call_count, drv_loaded ? 1 : 0, drv_kernel ? 1 : 0);
+            webhook::write_log("guard", dbg);
+        }
+        if (drv_kernel)
         {
             driver_bridge::kernel_anti_debug_clear_dr();
 
@@ -368,7 +553,15 @@ inline bool guard()
     }
     CFF_STATE(guard_cff, 9)
     {
-        if (!standalone_license::is_valid())
+        bool lic_valid = standalone_license::is_valid();
+        if (s_guard_call_count <= 3) {
+            char dbg[256];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "guard_iter=%llu state=9 license_valid=%d",
+                s_guard_call_count, lic_valid ? 1 : 0);
+            webhook::write_log("guard", dbg);
+        }
+        if (!lic_valid)
         {
             std::string err = standalone_license::last_error();
             webhook::send_debug_log("guard", "license_invalid: " + err, true);
@@ -394,7 +587,19 @@ inline bool guard()
     {
         if ((rt.verify_counter & 3u) == 0)
         {
+            webhook::write_log("guard", "ai_scan_entering");
             auto ai_report = anti_ai::combined::full_scan();
+            {
+                char dbg[256];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "ai_scan_result: mcp=%d llm=%d tool=%d mem=%d handle=%d clip=%d threat=%d summary=%s",
+                    ai_report.mcp_detected ? 1 : 0, ai_report.llm_detected ? 1 : 0,
+                    ai_report.ai_tool_detected ? 1 : 0, ai_report.memory_scanner_detected ? 1 : 0,
+                    ai_report.handle_to_us_detected ? 1 : 0, ai_report.clipboard_monitored ? 1 : 0,
+                    ai_report.any_threat() ? 1 : 0,
+                    ai_report.summary.empty() ? "none" : ai_report.summary.c_str());
+                webhook::write_log("guard", dbg);
+            }
             if (ai_report.any_threat())
             {
                 webhook::send_debug_log("guard", "ai_threat: " + ai_report.summary, true);
@@ -403,6 +608,14 @@ inline bool guard()
             }
 
             auto proc_report = process_scan::full_scan();
+            {
+                char dbg[256];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "proc_scan_result: detected=%d detail=%s",
+                    proc_report.any_detected() ? 1 : 0,
+                    proc_report.detail.empty() ? "none" : proc_report.detail.c_str());
+                webhook::write_log("guard", dbg);
+            }
             if (proc_report.any_detected())
             {
                 webhook::send_debug_log("guard", "re_tool: " + proc_report.detail, true);
@@ -418,24 +631,41 @@ inline bool guard()
         uint64_t addr = rt.code_snap.text_base;
         const uint64_t end = rt.code_snap.text_base + rt.code_snap.text_size;
         bool page_ok = true;
+        DWORD failed_prot = 0;
+        uint64_t failed_addr = 0;
 
         while (addr < end && page_ok)
         {
             if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0)
             {
                 page_ok = false;
+                failed_addr = addr;
                 break;
             }
             constexpr DWORD writable = PAGE_EXECUTE_READWRITE | PAGE_READWRITE
                 | PAGE_EXECUTE_WRITECOPY | PAGE_WRITECOPY;
-            if (mbi.Protect & writable)
+            if (mbi.Protect & writable) {
                 page_ok = false;
+                failed_prot = mbi.Protect;
+                failed_addr = reinterpret_cast<uint64_t>(mbi.BaseAddress);
+            }
             addr = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
         }
 
+        if (s_guard_call_count <= 3) {
+            char dbg[256];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "guard_iter=%llu state=11 page_ok=%d failed_prot=0x%X failed_addr=0x%llX text_base=0x%llX text_size=0x%X",
+                s_guard_call_count, page_ok ? 1 : 0, failed_prot,
+                failed_addr, rt.code_snap.text_base, (unsigned)rt.code_snap.text_size);
+            webhook::write_log("guard", dbg);
+        }
         if (!page_ok)
         {
-            webhook::send_debug_log("guard", "writable_code_page", true);
+            char detail[256];
+            _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                "writable_code_page prot=0x%X addr=0x%llX", failed_prot, failed_addr);
+            webhook::send_debug_log("guard", detail, true);
             enforce_violation("writable_code_page");
             CFF_EXIT(guard_cff);
         }
@@ -453,16 +683,50 @@ inline void start_monitors()
     if (rt.monitors_running.exchange(true))
         return;
 
-    std::thread([]() {
-        Sleep(5000);
-        auto& rt = state::get();
-        while (rt.monitors_running.load() && !rt.violation_latched.load())
-        {
-            guard();
-            enforcement_tick();
-            Sleep(500);
-        }
-    }).detach();
+    try
+    {
+        std::thread([]() {
+            Sleep(5000);
+            webhook::write_log("monitor", "thread_started");
+            auto& rt = state::get();
+            uint64_t iter = 0;
+            while (rt.monitors_running.load() && !rt.violation_latched.load())
+            {
+                ++iter;
+                if (iter <= 5 || (iter % 20) == 0) {
+                    char dbg[128];
+                    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "monitor_loop iter=%llu", iter);
+                    webhook::write_log("monitor", dbg);
+                }
+                bool guard_result = guard();
+                if (iter <= 5 || !guard_result) {
+                    char dbg[128];
+                    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "guard_returned=%d iter=%llu",
+                        guard_result ? 1 : 0, iter);
+                    webhook::write_log("monitor", dbg);
+                }
+                enforcement_tick();
+                Sleep(500);
+            }
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "thread_exiting monitors_running=%d violation_latched=%d iter=%llu",
+                rt.monitors_running.load() ? 1 : 0, rt.violation_latched.load() ? 1 : 0, iter);
+            webhook::write_log("monitor", dbg);
+        }).detach();
+    }
+    catch (const std::exception& ex)
+    {
+        char buf[256];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "monitor_thread_exception: %s", ex.what());
+        webhook::write_log("init", buf);
+        rt.monitors_running.store(false);
+    }
+    catch (...)
+    {
+        webhook::write_log("init", "monitor_thread_failed_unknown");
+        rt.monitors_running.store(false);
+    }
 }
 
 inline void shutdown()

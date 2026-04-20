@@ -1,6 +1,7 @@
 #pragma once
 
 #include "imgui/imgui.h"
+#include "../helpers/globals.h"
 #include "xref_db.hpp"
 #include "ui_anim.hpp"
 
@@ -16,6 +17,8 @@ struct state_t {
 	char  filter_buf[128] = {};
 	int   filter_type = -1;
 	bool  show_to = true;
+	bool  sb_dragging = false;
+	float sb_drag_offset = 0.f;
 };
 
 inline state_t g_view;
@@ -27,23 +30,28 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImVec2 wp = ImGui::GetWindowPos();
 	float a = alpha;
 
-	ImU32 bg = IM_COL32(18, 18, 24, static_cast<int>(220 * a));
-	ImU32 panel_bg = IM_COL32(26, 26, 34, static_cast<int>(200 * a));
-	ImU32 hdr_bg = IM_COL32(34, 34, 44, static_cast<int>(230 * a));
-	ImU32 text_main = IM_COL32(230, 228, 255, static_cast<int>(240 * a));
-	ImU32 text_dim = IM_COL32(130, 130, 160, static_cast<int>(180 * a));
-	ImU32 text_sec = IM_COL32(170, 175, 190, static_cast<int>(200 * a));
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
+
+	ImU32 bg = _ta(_t.bg_base);
+	ImU32 panel_bg = _ta(_t.panel_bg);
+	ImU32 hdr_bg = _ta(_t.panel_header);
+	ImU32 text_main = _ta(_t.text_primary);
+	ImU32 text_dim = _ta(_t.text_dim);
+	ImU32 text_sec = _ta(_t.text_secondary);
 	ImU32 accent_col = IM_COL32(
 		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 		static_cast<int>(accent_b * 255), static_cast<int>(220 * a));
 	ImU32 accent_dim = IM_COL32(
 		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 		static_cast<int>(accent_b * 255), static_cast<int>(80 * a));
-	ImU32 row_hover = IM_COL32(255, 255, 255, static_cast<int>(12 * a));
+	ImU32 row_hover_col = _ta(_t.panel_header);
 	ImU32 row_sel = IM_COL32(
 		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 		static_cast<int>(accent_b * 255), static_cast<int>(30 * a));
-	ImU32 sep_col = IM_COL32(60, 60, 80, static_cast<int>(80 * a));
+	ImU32 sep_col = _ta(ui_anim::lighten(_t.panel_bg, 12));
 
 	float x0 = wp.x + pos_x;
 	float y0 = wp.y + pos_y;
@@ -51,10 +59,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + width, y0 + height), bg);
 
 	float toolbar_h = 36.f;
-	float left_panel_w = 220.f;
+	float left_panel_w = std::max(180.f, width * 0.2f);
 
 	ui_anim::render_toolbar(dl, x0, y0, width, toolbar_h, accent_r, accent_g, accent_b, a);
-	dl->AddLine(ImVec2(x0, y0 + toolbar_h), ImVec2(x0 + width, y0 + toolbar_h), IM_COL32(60, 65, 80, static_cast<int>(80 * a)));
+	dl->AddLine(ImVec2(x0, y0 + toolbar_h), ImVec2(x0 + width, y0 + toolbar_h), _ta(ui_anim::lighten(_t.panel_bg, 12)));
 
 	ImGui::SetCursorPos(ImVec2(pos_x + 8.f, pos_y + 6.f));
 	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
@@ -63,7 +71,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	ImGui::SetCursorPos(ImVec2(pos_x + 240.f, pos_y + 6.f));
 	ImGui::PushItemWidth(140.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(40, 40, 55, static_cast<int>(200 * a)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_header));
 	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
@@ -73,8 +81,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopItemWidth();
 
 	ImGui::SameLine();
-	ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(50, 50, 70, static_cast<int>(200 * a)));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(70, 70, 100, static_cast<int>(200 * a)));
+	ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
 	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 
@@ -103,7 +111,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	ImGui::SameLine();
 	ImGui::PushItemWidth(120.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(40, 40, 55, static_cast<int>(200 * a)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_header));
 	ImGui::InputTextWithHint("##xref_filter", "Filter...", g_view.filter_buf, sizeof(g_view.filter_buf));
 	ImGui::PopStyleColor();
 	ImGui::PopItemWidth();
@@ -118,7 +126,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float bx = x0 + width - bar_w - 60.f;
 		float by = y0 + toolbar_h * 0.5f - bar_h * 0.5f;
 		dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bar_w, by + bar_h),
-		                  IM_COL32(40, 40, 55, static_cast<int>(200 * a)), 4.f);
+		                  _ta(_t.panel_header), 4.f);
 		dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bar_w * prog, by + bar_h),
 		                  accent_col, 4.f);
 		char pct[16];
@@ -160,7 +168,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		bool hov = ImGui::IsMouseHoveringRect(cp, ImVec2(cp.x + lw, cp.y + row_h), true);
 		if (hov)
-			dl->AddRectFilled(cp, ImVec2(cp.x + lw, cp.y + row_h), row_hover, 3.f);
+			dl->AddRectFilled(cp, ImVec2(cp.x + lw, cp.y + row_h), row_hover_col, 3.f);
 
 		ImU32 name_col = indexed ? accent_col : text_main;
 		dl->AddText(ImVec2(cp.x + 4.f, cp.y + 3.f), name_col, m.name.c_str());
@@ -172,7 +180,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			float bx_off = lw - bw - 4.f;
 			ImGui::SetCursorScreenPos(ImVec2(cp.x + bx_off, cp.y + 1.f));
 			ImGui::PushID(static_cast<int>(i));
-			ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(50, 50, 70, static_cast<int>(200 * a)));
+			ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
 			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, accent_dim);
 			ImGui::PushStyleColor(ImGuiCol_Text, text_main);
 			ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.f);
@@ -232,11 +240,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
+	static float xref_row_anim_time = 0.f;
+	xref_row_anim_time += ImGui::GetIO().DeltaTime;
+
 	float row_height = 20.f;
 	for (int i = 0; i < static_cast<int>(filtered.size()); ++i) {
 		auto& e = filtered[i];
 		ImVec2 rp = ImGui::GetCursorScreenPos();
 
+		float row_entrance = ui_anim::render_row_entrance(i, xref_row_anim_time, 0.015f);
 		bool hov = ImGui::IsMouseHoveringRect(rp, ImVec2(rp.x + table_w, rp.y + row_height), true);
 		bool sel = (g_view.selected_row == i);
 
@@ -245,7 +257,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		rs.hovered = hov;
 		rs.index = i;
 		rs.alpha = a;
-		rs.entrance = 1.f;
+		rs.entrance = row_entrance;
 		rs.ar = accent_r; rs.ag = accent_g; rs.ab = accent_b;
 		ui_anim::render_table_row(dl, rp.x, rp.y, table_w, row_height, rs);
 
@@ -302,6 +314,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	ImGui::EndChild();
+
+	{
+		float content_total = static_cast<float>(filtered.size()) * row_height;
+		if (content_total > table_body_h) {
+			float sb_x = table_x + table_w - 8.f;
+			ui_anim::render_custom_scrollbar(dl, sb_x, table_body_y, 6.f, table_body_h,
+				g_view.scroll_y, content_total, table_body_h,
+				a, g_view.sb_dragging, g_view.sb_drag_offset);
+		}
+	}
 
 	char count_str[48];
 	snprintf(count_str, sizeof(count_str), "%d results", static_cast<int>(filtered.size()));

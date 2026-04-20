@@ -34,6 +34,7 @@ namespace anti_debug {
     constexpr UINT32 DETECT_INSTRUMENTATION  = 0x00000008u;
     constexpr UINT32 DETECT_TIMING_ATTACK    = 0x00000010u;
     constexpr UINT32 DETECT_PAGE_GUARD       = 0x00000020u;
+    constexpr UINT32 DETECT_SIDT_ANOMALY     = 0x00000040u;
 
     inline volatile UINT32 g_detection_flags = DETECT_NONE;
     inline volatile UINT64 g_last_check_tsc = 0;
@@ -122,6 +123,17 @@ namespace anti_debug {
                         vendor_id[6] == 'o' && vendor_id[7] == 'f' &&
                         vendor_id[8] == 't' && vendor_id[9] == ' ' &&
                         vendor_id[10] == 'H' && vendor_id[11] == 'v') {
+
+                        int features[4] = {};
+                        __cpuid(features, 0x40000003);
+                        constexpr UINT32 kExpected =
+                            (1u << 0) | (1u << 1) | (1u << 5);
+                        UINT32 priv = static_cast<UINT32>(features[0]);
+                        if ((priv & kExpected) != kExpected) {
+                            WW_LOG("check_hypervisor: MS Hv vendor string but missing partition privileges 0x%lx", priv);
+                            return TRUE;
+                        }
+
                         return FALSE;
                     }
 
@@ -167,6 +179,36 @@ namespace anti_debug {
             return FALSE;
         }
 
+        return FALSE;
+    }
+
+    #pragma pack(push, 1)
+    struct idt_descriptor_t {
+        USHORT limit;
+        ULONG_PTR base;
+    };
+    #pragma pack(pop)
+
+    __forceinline BOOLEAN check_sidt_compat_anomaly() {
+        __try {
+            idt_descriptor_t idt1 = {};
+            __sidt(&idt1);
+
+            idt_descriptor_t idt2 = {};
+            __sidt(&idt2);
+
+            if (idt1.base != idt2.base)
+                return TRUE;
+
+            if (idt1.base == 0 || idt1.limit == 0)
+                return TRUE;
+
+            if (idt1.limit != 0x0FFF)
+                return TRUE;
+
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return FALSE;
+        }
         return FALSE;
     }
 
@@ -283,6 +325,10 @@ namespace anti_debug {
             flags |= DETECT_INSTRUMENTATION;
         }
 
+        if (check_sidt_compat_anomaly()) {
+            flags |= DETECT_SIDT_ANOMALY;
+        }
+
         return flags;
     }
 
@@ -369,8 +415,6 @@ namespace anti_debug {
         for (ULONG i = 0; i < num_cpus; ++i) {
             KeInitializeEvent(&contexts[i].event, SynchronizationEvent, FALSE);
             KeInitializeDpc(&contexts[i].dpc, dr_clear_dpc_routine, &contexts[i]);
-            KeSetTargetProcessorDpcEx(&contexts[i].dpc,
-                reinterpret_cast<PPROCESSOR_NUMBER>(nullptr));
 
             PROCESSOR_NUMBER proc_num;
             NTSTATUS ks = KeGetProcessorNumberFromIndex(i, &proc_num);

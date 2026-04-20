@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <intrin.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 
 #include <atomic>
 #include <chrono>
@@ -40,6 +41,12 @@ constexpr uint32_t SIGNAL_TEXT_WRITABLE     = 1u << 13;
 constexpr uint32_t SIGNAL_PROC_DEBUG_HANDLE = 1u << 14;
 constexpr uint32_t SIGNAL_CMDLINE_DEBUG     = 1u << 15;
 constexpr uint32_t SIGNAL_JOB_FOREIGN       = 1u << 16;
+constexpr uint32_t SIGNAL_THREAD_SUSPENDED  = 1u << 17;
+constexpr uint32_t SIGNAL_VEH_TAMPERED      = 1u << 18;
+constexpr uint32_t SIGNAL_DEBUG_REATTACH    = 1u << 19;
+constexpr uint32_t SIGNAL_TARGET_FILE_IN_RE = 1u << 20;
+constexpr uint32_t SIGNAL_DEBUG_OWNER_RE    = 1u << 21;
+constexpr uint32_t SIGNAL_KD_TARGETING_US   = 1u << 22;
 
 constexpr uint32_t FAMILY_TARGET    = 0x01;
 constexpr uint32_t FAMILY_HANDLE    = 0x02;
@@ -54,6 +61,7 @@ constexpr uint32_t FAMILY_MEMORY    = 0x200;
 constexpr uint32_t FAMILY_DPORT_X   = 0x400;
 constexpr uint32_t FAMILY_CMDLINE   = 0x800;
 constexpr uint32_t FAMILY_JOB       = 0x1000;
+constexpr uint32_t FAMILY_SIDECHANNEL = 0x2000;
 
 constexpr uint64_t EVIDENCE_MAGIC = 0x5645444149414941ULL;
 constexpr uint32_t EVIDENCE_VERSION = 1u;
@@ -103,6 +111,12 @@ inline const signal_desc_t& signals(uint32_t bit)
         { SIGNAL_PROC_DEBUG_HANDLE,  95, FAMILY_DPORT_X },
         { SIGNAL_CMDLINE_DEBUG,      50, FAMILY_CMDLINE },
         { SIGNAL_JOB_FOREIGN,        40, FAMILY_JOB },
+        { SIGNAL_THREAD_SUSPENDED,   90, FAMILY_TARGET },
+        { SIGNAL_VEH_TAMPERED,       85, FAMILY_INJECTION },
+        { SIGNAL_DEBUG_REATTACH,     95, FAMILY_ATTACH },
+        { SIGNAL_TARGET_FILE_IN_RE, 100, FAMILY_TARGET },
+        { SIGNAL_DEBUG_OWNER_RE,    100, FAMILY_DPORT_X },
+        { SIGNAL_KD_TARGETING_US,   100, FAMILY_KDEBUG },
     };
     static const signal_desc_t zero = { 0, 0, 0 };
     for (const auto& d : table) {
@@ -275,7 +289,10 @@ namespace detail {
                 lower[i] = towlower(fd.cFileName[i]);
             if (wcsstr(lower, L"x64dbg") || wcsstr(lower, L"x32dbg") ||
                 wcsstr(lower, L"ida_") || wcsstr(lower, L"windbg") ||
-                wcsstr(lower, L"scyllahide")) {
+                wcsstr(lower, L"scyllahide") || wcsstr(lower, L"frida") ||
+                wcsstr(lower, L"hyperdbg") || wcsstr(lower, L"ollydbg") ||
+                wcsstr(lower, L"ghidra") || wcsstr(lower, L"cheatengine") ||
+                wcsstr(lower, L"titanhide")) {
                 hit = true;
                 break;
             }
@@ -682,6 +699,10 @@ namespace detail {
         if (!in_job)
             return false;
 
+        auto& rt = state::get();
+        if (rt.self_job_active.load(std::memory_order_acquire))
+            return false;
+
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
         if (!QueryInformationJobObject(
                 nullptr,
@@ -696,8 +717,7 @@ namespace detail {
         const DWORD hostile =
             JOB_OBJECT_LIMIT_BREAKAWAY_OK
             | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
-            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
-            | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
         if ((flags & hostile) != 0)
             return true;
 
@@ -705,7 +725,440 @@ namespace detail {
             || b.ActiveProcessLimit != 0)
             return true;
 
-        return true;
+        return false;
+    }
+
+    inline bool detect_thread_suspended()
+    {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE)
+            return false;
+
+        DWORD pid = GetCurrentProcessId();
+        DWORD main_tid = GetCurrentThreadId();
+        int suspended_count = 0;
+        int total_threads = 0;
+
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        if (Thread32First(snap, &te))
+        {
+            do
+            {
+                if (te.th32OwnerProcessID != pid)
+                    continue;
+                if (te.th32ThreadID == main_tid)
+                    continue;
+                ++total_threads;
+
+                HANDLE th = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | THREAD_SUSPEND_RESUME,
+                    FALSE, te.th32ThreadID);
+                if (!th) continue;
+
+                DWORD prev = SuspendThread(th);
+                if (prev != (DWORD)-1)
+                {
+                    ResumeThread(th);
+                    if (prev > 0)
+                        ++suspended_count;
+                }
+                CloseHandle(th);
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+
+        if (total_threads < 2)
+            return false;
+
+        return suspended_count >= 2
+            || (total_threads > 0 && suspended_count * 2 >= total_threads);
+    }
+
+    inline bool detect_veh_tampered()
+    {
+        auto& rt_veh = state::get();
+        if (!rt_veh.veh_baseline_captured.load(std::memory_order_acquire))
+            return false;
+
+        typedef struct _VEH_ENTRY {
+            LIST_ENTRY list;
+            PVOID handler;
+        } VEH_ENTRY;
+
+        auto ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (!ntdll)
+            return false;
+
+        using NtQueryInfoProcess_t = LONG(NTAPI*)(
+            HANDLE, ULONG, PVOID, ULONG, PULONG);
+        auto NtQIP = reinterpret_cast<NtQueryInfoProcess_t>(
+            GetProcAddress(ntdll, "NtQueryInformationProcess"));
+        if (!NtQIP) return false;
+
+        ULONG handler_count = 0;
+        ULONG ret_len = 0;
+        LONG st = NtQIP(GetCurrentProcess(), 83,
+            &handler_count, sizeof(handler_count), &ret_len);
+        if (st < 0)
+        {
+            ULONG_PTR peb_addr = reinterpret_cast<ULONG_PTR>(NtCurrentTeb()->ProcessEnvironmentBlock);
+            ULONG_PTR ldr = *reinterpret_cast<ULONG_PTR*>(peb_addr + 0x18);
+            (void)ldr;
+            return false;
+        }
+
+        uint32_t baseline = rt_veh.veh_baseline_count;
+
+        if (handler_count < baseline && baseline > 0)
+            return true;
+        if (handler_count > baseline + 3)
+            return true;
+
+        return false;
+    }
+
+    inline bool detect_debug_reattach()
+    {
+        auto ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (!ntdll) return false;
+
+        using NtQueryInfoProcess_t = LONG(NTAPI*)(
+            HANDLE, ULONG, PVOID, ULONG, PULONG);
+        auto NtQIP = reinterpret_cast<NtQueryInfoProcess_t>(
+            GetProcAddress(ntdll, "NtQueryInformationProcess"));
+        if (!NtQIP) return false;
+
+        ULONG dbg_flags = 1;
+        LONG st = NtQIP(GetCurrentProcess(), 31,
+            &dbg_flags, sizeof(dbg_flags), nullptr);
+        bool debug_port_present = false;
+        if (st >= 0 && dbg_flags == 0)
+            debug_port_present = true;
+
+        if (!debug_port_present)
+        {
+            ULONG_PTR dbg_port = 0;
+            st = NtQIP(GetCurrentProcess(), 7,
+                &dbg_port, sizeof(dbg_port), nullptr);
+            if (st >= 0 && dbg_port != 0)
+                debug_port_present = true;
+        }
+
+        auto& rt_dbg = state::get();
+        uint8_t prev = rt_dbg.last_debug_port_present.exchange(
+            debug_port_present ? 1 : 0, std::memory_order_acq_rel);
+
+        if (debug_port_present && prev == 0)
+        {
+            uint8_t prev_peb = rt_dbg.last_peb_being_debugged.load(
+                std::memory_order_acquire);
+            if (prev_peb == 0)
+                return true;
+        }
+
+        auto* peb = NtCurrentTeb()->ProcessEnvironmentBlock;
+        uint8_t being_dbg = peb->BeingDebugged;
+        rt_dbg.last_peb_being_debugged.store(
+            being_dbg, std::memory_order_release);
+
+        return false;
+    }
+
+    inline bool detect_target_file_in_re_tool()
+    {
+        wchar_t our_path[MAX_PATH] = {};
+        DWORD our_path_len = GetModuleFileNameW(nullptr, our_path, MAX_PATH);
+        if (our_path_len == 0)
+            return false;
+
+        wchar_t our_lower[MAX_PATH] = {};
+        for (DWORD i = 0; i < our_path_len && i < MAX_PATH - 1; ++i)
+            our_lower[i] = towlower(our_path[i]);
+
+        if (!syscall::is_initialized())
+            return false;
+
+        ULONG buf_size = 2 * 1024 * 1024;
+        std::vector<uint8_t> buf(buf_size);
+        ULONG ret_len = 0;
+
+        NTSTATUS st = syscall::NtQuerySystemInformation()(
+            64, buf.data(), buf_size, &ret_len);
+        if (st == static_cast<NTSTATUS>(0xC0000004) && ret_len > buf_size) {
+            buf_size = ret_len + 65536;
+            buf.resize(buf_size);
+            st = syscall::NtQuerySystemInformation()(
+                64, buf.data(), buf_size, &ret_len);
+        }
+        if (st < 0) return false;
+
+        struct handle_entry_t {
+            PVOID Object;
+            ULONG_PTR UniqueProcessId;
+            ULONG_PTR HandleValue;
+            ACCESS_MASK GrantedAccess;
+            USHORT CreatorBackTraceIndex;
+            USHORT ObjectTypeIndex;
+            ULONG HandleAttributes;
+            ULONG Reserved;
+        };
+        struct handle_info_ex_t {
+            ULONG_PTR NumberOfHandles;
+            ULONG_PTR Reserved;
+            handle_entry_t Handles[1];
+        };
+
+        auto* info = reinterpret_cast<handle_info_ex_t*>(buf.data());
+        DWORD my_pid = GetCurrentProcessId();
+
+        USHORT file_type_index = 0;
+        for (ULONG_PTR i = 0; i < info->NumberOfHandles && i < 500000; ++i) {
+            if (file_type_index != 0) break;
+            const auto& h = info->Handles[i];
+            if (static_cast<DWORD>(h.UniqueProcessId) != my_pid) continue;
+            HANDLE dup = nullptr;
+            HANDLE self = GetCurrentProcess();
+            if (DuplicateHandle(self, reinterpret_cast<HANDLE>(h.HandleValue),
+                    self, &dup, 0, FALSE, DUPLICATE_SAME_ACCESS) && dup) {
+                DWORD ft = GetFileType(dup);
+                if (ft == FILE_TYPE_DISK) {
+                    file_type_index = h.ObjectTypeIndex;
+                }
+                CloseHandle(dup);
+            }
+        }
+
+        if (file_type_index == 0)
+            return false;
+
+        for (ULONG_PTR i = 0; i < info->NumberOfHandles && i < 500000; ++i) {
+            const auto& h = info->Handles[i];
+            if (static_cast<DWORD>(h.UniqueProcessId) == my_pid)
+                continue;
+            if (h.ObjectTypeIndex != file_type_index)
+                continue;
+
+            DWORD owner_pid = static_cast<DWORD>(h.UniqueProcessId);
+            HANDLE hproc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_DUP_HANDLE,
+                FALSE, owner_pid);
+            if (!hproc) continue;
+
+            wchar_t proc_path[MAX_PATH] = {};
+            DWORD proc_sz = MAX_PATH;
+            BOOL got_name = QueryFullProcessImageNameW(hproc, 0, proc_path, &proc_sz);
+            if (!got_name) {
+                CloseHandle(hproc);
+                continue;
+            }
+
+            const wchar_t* bn = proc_path;
+            for (const wchar_t* p = proc_path; *p; ++p)
+                if (*p == L'\\' || *p == L'/') bn = p + 1;
+            wchar_t lower_bn[MAX_PATH] = {};
+            for (int j = 0; j < MAX_PATH - 1 && bn[j]; ++j)
+                lower_bn[j] = towlower(bn[j]);
+
+            if (!extended_re_tool_name_match(lower_bn)) {
+                CloseHandle(hproc);
+                continue;
+            }
+
+            HANDLE dup = nullptr;
+            BOOL dup_ok = DuplicateHandle(hproc,
+                reinterpret_cast<HANDLE>(h.HandleValue),
+                GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS);
+            CloseHandle(hproc);
+            if (!dup_ok || !dup) continue;
+
+            struct {
+                ULONG Length;
+                WCHAR Name[512];
+            } name_info = {};
+
+            using NtQueryObject_t = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+            static NtQueryObject_t NtQueryObj = nullptr;
+            if (!NtQueryObj) {
+                HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+                if (nt) NtQueryObj = reinterpret_cast<NtQueryObject_t>(
+                    GetProcAddress(nt, "NtQueryObject"));
+            }
+
+            bool match = false;
+            if (NtQueryObj) {
+                ULONG ret = 0;
+                LONG qst = NtQueryObj(dup, 1, &name_info, sizeof(name_info), &ret);
+                if (qst >= 0 && name_info.Length > 0) {
+                    ULONG name_chars = name_info.Length / sizeof(WCHAR);
+                    wchar_t obj_lower[512] = {};
+                    for (ULONG c = 0; c < name_chars && c < 511; ++c)
+                        obj_lower[c] = towlower(name_info.Name[c]);
+
+                    const wchar_t* our_bn = our_lower;
+                    for (const wchar_t* p = our_lower; *p; ++p)
+                        if (*p == L'\\' || *p == L'/') our_bn = p + 1;
+
+                    if (wcsstr(obj_lower, our_bn))
+                        match = true;
+                }
+            }
+
+            CloseHandle(dup);
+            if (match)
+                return true;
+        }
+
+        return false;
+    }
+
+    __declspec(noinline) inline bool query_debug_port_seh()
+    {
+        bool result = false;
+        __try {
+            ULONG dbg_flags = 1;
+            NTSTATUS st = syscall::NtQueryInformationProcess()(
+                GetCurrentProcess(), 31,
+                &dbg_flags, sizeof(dbg_flags), nullptr);
+            if (st >= 0 && dbg_flags == 0)
+                result = true;
+
+            if (!result) {
+                ULONG_PTR dbg_port = 0;
+                st = syscall::NtQueryInformationProcess()(
+                    GetCurrentProcess(), 7,
+                    &dbg_port, sizeof(dbg_port), nullptr);
+                if (st >= 0 && dbg_port != 0)
+                    result = true;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+        return result;
+    }
+
+    inline bool detect_debug_port_owner_is_re_tool()
+    {
+        if (!syscall::is_initialized())
+            return false;
+
+        bool has_debug_port = query_debug_port_seh();
+
+        if (!has_debug_port)
+            return false;
+
+        DWORD my_pid = GetCurrentProcessId();
+
+        ULONG buf_size = 2 * 1024 * 1024;
+        std::vector<uint8_t> buf(buf_size);
+        ULONG ret_len = 0;
+
+        NTSTATUS st = syscall::NtQuerySystemInformation()(
+            64, buf.data(), buf_size, &ret_len);
+        if (st == static_cast<NTSTATUS>(0xC0000004) && ret_len > buf_size) {
+            buf_size = ret_len + 65536;
+            buf.resize(buf_size);
+            st = syscall::NtQuerySystemInformation()(
+                64, buf.data(), buf_size, &ret_len);
+        }
+        if (st < 0) return false;
+
+        struct handle_entry_t {
+            PVOID Object;
+            ULONG_PTR UniqueProcessId;
+            ULONG_PTR HandleValue;
+            ACCESS_MASK GrantedAccess;
+            USHORT CreatorBackTraceIndex;
+            USHORT ObjectTypeIndex;
+            ULONG HandleAttributes;
+            ULONG Reserved;
+        };
+        struct handle_info_ex_t {
+            ULONG_PTR NumberOfHandles;
+            ULONG_PTR Reserved;
+            handle_entry_t Handles[1];
+        };
+
+        auto* info = reinterpret_cast<handle_info_ex_t*>(buf.data());
+        constexpr ACCESS_MASK DEBUG_GRADE =
+            PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
+            PROCESS_SUSPEND_RESUME | PROCESS_CREATE_THREAD;
+
+        for (ULONG_PTR i = 0; i < info->NumberOfHandles && i < 500000; ++i) {
+            const auto& h = info->Handles[i];
+            if (static_cast<DWORD>(h.UniqueProcessId) == my_pid) continue;
+            if ((h.GrantedAccess & DEBUG_GRADE) == 0) continue;
+
+            DWORD owner_pid = static_cast<DWORD>(h.UniqueProcessId);
+            HANDLE src_proc = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
+                FALSE, owner_pid);
+            if (!src_proc) continue;
+
+            HANDLE dup = nullptr;
+            BOOL dup_ok = DuplicateHandle(src_proc,
+                reinterpret_cast<HANDLE>(h.HandleValue),
+                GetCurrentProcess(), &dup,
+                PROCESS_QUERY_LIMITED_INFORMATION, FALSE, 0);
+            if (!dup_ok || !dup) {
+                CloseHandle(src_proc);
+                continue;
+            }
+
+            DWORD target_pid = GetProcessId(dup);
+            CloseHandle(dup);
+
+            if (target_pid != my_pid) {
+                CloseHandle(src_proc);
+                continue;
+            }
+
+            wchar_t proc_path[MAX_PATH] = {};
+            DWORD proc_sz = MAX_PATH;
+            BOOL got_name = QueryFullProcessImageNameW(src_proc, 0, proc_path, &proc_sz);
+            CloseHandle(src_proc);
+            if (!got_name) continue;
+
+            const wchar_t* bn = proc_path;
+            for (const wchar_t* p = proc_path; *p; ++p)
+                if (*p == L'\\' || *p == L'/') bn = p + 1;
+            wchar_t lower_bn[MAX_PATH] = {};
+            for (int j = 0; j < MAX_PATH - 1 && bn[j]; ++j)
+                lower_bn[j] = towlower(bn[j]);
+
+            if (extended_re_tool_name_match(lower_bn))
+                return true;
+        }
+
+        return false;
+    }
+
+    inline bool detect_kd_targeting_us()
+    {
+        __try {
+            auto* shared = reinterpret_cast<const volatile uint8_t*>(0x7FFE0000ULL);
+            uint8_t kd_enabled = *(shared + 0x2D4);
+            if (kd_enabled == 0)
+                return false;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+
+        auto fn = reinterpret_cast<LONG(WINAPI*)(ULONG, PVOID, ULONG, PULONG)>(nullptr);
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        if (nt)
+            fn = reinterpret_cast<decltype(fn)>(
+                GetProcAddress(nt, "NtQuerySystemInformation"));
+        if (!fn)
+            return false;
+
+        struct {
+            BOOLEAN KernelDebuggerEnabled;
+            BOOLEAN KernelDebuggerNotPresent;
+        } kdi = {};
+        ULONG ret = 0;
+        LONG st = fn(0x23, &kdi, sizeof(kdi), &ret);
+        if (st < 0)
+            return false;
+
+        return kdi.KernelDebuggerEnabled != 0 && kdi.KernelDebuggerNotPresent == 0;
     }
 
     inline uint64_t module_image_hash()
@@ -819,6 +1272,24 @@ namespace detail {
         if (detect_foreign_job())
             mask |= SIGNAL_JOB_FOREIGN;
 
+        if (detect_thread_suspended())
+            mask |= SIGNAL_THREAD_SUSPENDED;
+
+        if (detect_veh_tampered())
+            mask |= SIGNAL_VEH_TAMPERED;
+
+        if (detect_debug_reattach())
+            mask |= SIGNAL_DEBUG_REATTACH;
+
+        if (detect_target_file_in_re_tool())
+            mask |= SIGNAL_TARGET_FILE_IN_RE;
+
+        if (detect_debug_port_owner_is_re_tool())
+            mask |= SIGNAL_DEBUG_OWNER_RE;
+
+        if (detect_kd_targeting_us())
+            mask |= SIGNAL_KD_TARGETING_US;
+
         return mask;
     }
 
@@ -869,6 +1340,14 @@ inline void tick()
 
     uint32_t mask = detail::collect_signals();
     s.last_mask.store(mask);
+
+    static std::atomic<uint32_t> s_tick_num{0};
+    uint32_t tn = s_tick_num.fetch_add(1);
+    if (mask != 0 || tn < 5 || (tn % 20) == 0) {
+        char tb[128];
+        _snprintf_s(tb, sizeof(tb), _TRUNCATE, "tick=%u mask=0x%X", tn, mask);
+        webhook::write_log("re_tick", tb);
+    }
 
     if ((mask & SIGNAL_PARENT_RE_TOOL) != 0 && should_bsod(mask))
     {
@@ -926,6 +1405,9 @@ inline void tick()
                 else if (intersect & SIGNAL_VAD_MAPPED_IN_RE) reason = 0x0000DA7Au;
                 else if (intersect & SIGNAL_TEXT_WRITABLE)   reason = 0x0000D7ECu;
                 else if (intersect & SIGNAL_PARENT_RE_TOOL)  reason = 0x0000BA7Eu;
+                else if (intersect & SIGNAL_TARGET_FILE_IN_RE) reason = 0x00007A60u;
+                else if (intersect & SIGNAL_DEBUG_OWNER_RE)    reason = 0x00007A62u;
+                else if (intersect & SIGNAL_KD_TARGETING_US)   reason = 0x00007A63u;
                 driver_bridge::trigger_kernel_bsod(reason, evidence);
             }
             enforce_violation("re_detected", detail_str);
@@ -939,13 +1421,49 @@ inline void tick()
     s.persist_mask.store(mask);
 }
 
+inline int __declspec(noinline) seh_tick_wrapper()
+{
+    __try {
+        tick();
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return static_cast<int>(GetExceptionCode());
+    }
+}
+
 inline void worker_loop()
 {
     Sleep(2000);
     auto& s = state_ref();
     while (s.running.load()) {
-        tick();
+        int rc = seh_tick_wrapper();
+        if (rc != 0) {
+            char tb[64];
+            _snprintf_s(tb, sizeof(tb), _TRUNCATE, "seh_crash code=0x%X", rc);
+            webhook::write_log("re_worker", tb);
+        }
         Sleep(TICK_INTERVAL_MS);
+    }
+}
+
+inline int __declspec(noinline) seh_watchdog_step(
+    engine_state_t* s, state::runtime_t* rt, uint64_t* last_counter)
+{
+    __try {
+        uint64_t current = s->verify_counter.load();
+        bool monitors_ok = rt->monitors_running.load();
+        bool advanced = current != *last_counter;
+        if (!advanced || !monitors_ok) {
+            uint32_t mask = detail::collect_signals();
+            if (detail::score_exceeds_threshold(mask)) {
+                *last_counter = current;
+                return static_cast<int>(mask);
+            }
+        }
+        *last_counter = current;
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -static_cast<int>(GetExceptionCode());
     }
 }
 
@@ -956,26 +1474,25 @@ inline void watchdog_loop()
     uint64_t last_counter = 0;
     while (s.running.load()) {
         Sleep(2000);
-        uint64_t current = s.verify_counter.load();
-        bool monitors_ok = rt.monitors_running.load();
-        bool advanced = current != last_counter;
-        if (!advanced || !monitors_ok) {
-            uint32_t mask = detail::collect_signals();
-            if (detail::score_exceeds_threshold(mask)) {
-                uint64_t evidence = detail::hash_evidence(mask);
-                standalone_license::fold_integrity_token(evidence);
-                webhook::send_debug_log("re_watchdog",
-                    "watchdog_stall mask=0x" + std::to_string(mask), true);
-                webhook::post_critical_then_enforce("re_watchdog_stall",
-                    "mask=0x" + std::to_string(mask), mask);
-                if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver()) {
-                    driver_bridge::trigger_kernel_bsod(0x0000DEDDu, evidence);
-                }
-                enforce_violation("re_watchdog_stall");
-                return;
+        int rc = seh_watchdog_step(&s, &rt, &last_counter);
+        if (rc < 0) {
+            char tb[64];
+            _snprintf_s(tb, sizeof(tb), _TRUNCATE, "seh_crash code=0x%X", -rc);
+            webhook::write_log("re_watchdog", tb);
+        } else if (rc > 0) {
+            uint32_t mask = static_cast<uint32_t>(rc);
+            uint64_t evidence = detail::hash_evidence(mask);
+            standalone_license::fold_integrity_token(evidence);
+            webhook::send_debug_log("re_watchdog",
+                "watchdog_stall mask=0x" + std::to_string(mask), true);
+            webhook::post_critical_then_enforce("re_watchdog_stall",
+                "mask=0x" + std::to_string(mask), mask);
+            if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver()) {
+                driver_bridge::trigger_kernel_bsod(0x0000DEDDu, evidence);
             }
+            enforce_violation("re_watchdog_stall");
+            return;
         }
-        last_counter = current;
     }
 }
 
@@ -984,10 +1501,43 @@ inline void initialize()
     auto& s = state_ref();
     if (s.running.exchange(true))
         return;
-    s.worker = std::thread(worker_loop);
-    s.watchdog = std::thread(watchdog_loop);
-    s.worker.detach();
-    s.watchdog.detach();
+
+    if (!state::get().veh_baseline_captured.load(std::memory_order_acquire))
+    {
+        auto ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll)
+        {
+            using NtQIP_t = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+            auto NtQIP = reinterpret_cast<NtQIP_t>(
+                GetProcAddress(ntdll, "NtQueryInformationProcess"));
+            if (NtQIP)
+            {
+                ULONG count = 0;
+                LONG st = NtQIP(GetCurrentProcess(), 83,
+                    &count, sizeof(count), nullptr);
+                if (st >= 0)
+                {
+                    state::get().veh_baseline_count = count;
+                    state::get().veh_baseline_captured.store(
+                        true, std::memory_order_release);
+                }
+            }
+        }
+    }
+
+    try
+    {
+        s.worker = std::thread(worker_loop);
+        s.worker.detach();
+    }
+    catch (...) {}
+
+    try
+    {
+        s.watchdog = std::thread(watchdog_loop);
+        s.watchdog.detach();
+    }
+    catch (...) {}
 }
 
 inline void shutdown()

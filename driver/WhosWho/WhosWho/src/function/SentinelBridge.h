@@ -16,6 +16,9 @@ namespace sentinel_bridge {
     constexpr ULONG BUGCHECK_KD_ENABLED_POST_INIT  = 0xDEAD5E42u;
     constexpr ULONG BUGCHECK_DMA_CANARY_HIT        = 0xDEAD5E43u;
     constexpr ULONG BUGCHECK_SENTINEL_THREAD_INJECT= 0xDEAD5E44u;
+    constexpr ULONG BUGCHECK_TARGET_FILE_SCANNED   = 0xDEAD7A60u;
+    constexpr ULONG BUGCHECK_DEBUG_BY_RE_TOOL      = 0xDEAD7A62u;
+    constexpr ULONG BUGCHECK_KD_TARGETING_US       = 0xDEAD7A63u;
 
     constexpr ULONG BUGCHECK_TIER_A_DRIVER_LOADED  = BUGCHECK_HOSTILE_DRIVER_LOAD;
     constexpr ULONG BUGCHECK_CANARY_FOREIGN_PT     = BUGCHECK_DMA_CANARY_HIT;
@@ -55,10 +58,25 @@ namespace sentinel_bridge {
     constexpr ULONG RE_REASON_PARENT_RE_TOOL   = 0x0000BA7Eu;
     constexpr ULONG RE_REASON_VAD_MAPPED_IN_RE = 0x0000DA7Au;
     constexpr ULONG RE_REASON_TEXT_WRITABLE    = 0x0000D7ECu;
-    constexpr ULONG RE_REASON_HOSTILE_DRIVER   = 0x00005E40u;
-    constexpr ULONG RE_REASON_HOSTILE_DEVICE   = 0x00005E41u;
-    constexpr ULONG RE_REASON_KD_ENABLED       = 0x00005E42u;
-    constexpr ULONG RE_REASON_DMA_CANARY       = 0x00005E43u;
+    constexpr ULONG RE_REASON_HOSTILE_DRIVER          = 0x00005E40u;
+    constexpr ULONG RE_REASON_HOSTILE_DEVICE          = 0x00005E41u;
+    constexpr ULONG RE_REASON_KD_ENABLED              = 0x00005E42u;
+    constexpr ULONG RE_REASON_DMA_CANARY              = 0x00005E43u;
+    constexpr ULONG RE_REASON_TARGET_FILE_OPENED      = 0x00007A60u;
+    constexpr ULONG RE_REASON_TARGET_SECTION_MAPPED   = 0x00007A61u;
+    constexpr ULONG RE_REASON_DEBUG_BY_RE_TOOL        = 0x00007A62u;
+    constexpr ULONG RE_REASON_KD_TARGETING_US         = 0x00007A63u;
+    constexpr ULONG RE_REASON_SIDECHANNEL_CORROBORATED = 0x0000AE03u;
+
+    constexpr UINT32 EVIDENCE_FAMILY_SIDECHANNEL = 0x01u;
+    constexpr UINT32 EVIDENCE_FAMILY_DEBUG       = 0x02u;
+    constexpr UINT32 EVIDENCE_FAMILY_DR          = 0x04u;
+    constexpr UINT32 EVIDENCE_FAMILY_HANDLE      = 0x08u;
+    constexpr UINT32 EVIDENCE_FAMILY_INTEGRITY   = 0x10u;
+    constexpr UINT32 EVIDENCE_FAMILY_DMA         = 0x20u;
+    constexpr UINT32 EVIDENCE_FAMILY_INJECTION   = 0x40u;
+    constexpr UINT32 EVIDENCE_FAMILY_TARGET      = 0x80u;
+    constexpr UINT32 EVIDENCE_FAMILY_KD          = 0x100u;
 
     struct RE_EVIDENCE_BLOB {
         UINT64 magic;
@@ -187,6 +205,91 @@ namespace sentinel_bridge {
         h *= 0xC4CEB9FE1A85EC53ULL;
         h ^= h >> 33;
         return h;
+    }
+
+    namespace evidence_accumulator {
+        constexpr ULONG MAX_ENTRIES = 32;
+        constexpr UINT64 WINDOW_TSC = 60ULL * 3000000000ULL;
+        constexpr ULONG REQUIRED_FAMILIES = 3;
+
+        struct entry_t {
+            ULONG reason;
+            UINT32 family;
+            UINT64 tsc;
+        };
+
+        inline entry_t g_entries[MAX_ENTRIES] = {};
+        inline volatile LONG g_entry_count = 0;
+
+        __forceinline UINT32 classify_family(ULONG reason) {
+            if (reason >= 0xAE00 && reason <= 0xAEFF) return EVIDENCE_FAMILY_SIDECHANNEL;
+            if (reason == RE_REASON_TARGET_FILE_OPENED)    return EVIDENCE_FAMILY_TARGET;
+            if (reason == RE_REASON_TARGET_SECTION_MAPPED) return EVIDENCE_FAMILY_TARGET;
+            if (reason == RE_REASON_DEBUG_BY_RE_TOOL)      return EVIDENCE_FAMILY_DEBUG;
+            if (reason == RE_REASON_KD_TARGETING_US)       return EVIDENCE_FAMILY_KD;
+            if (reason == RE_REASON_DEBUG_ATTACH)          return EVIDENCE_FAMILY_DEBUG;
+            if (reason == RE_REASON_DR_SET)                return EVIDENCE_FAMILY_DR;
+            if (reason == RE_REASON_FOREIGN_HND)           return EVIDENCE_FAMILY_HANDLE;
+            if (reason == RE_REASON_INJECTED_DLL)          return EVIDENCE_FAMILY_INJECTION;
+            if (reason == RE_REASON_TEXT_WRITABLE)          return EVIDENCE_FAMILY_INTEGRITY;
+            if (reason == RE_REASON_WATCHDOG_STALL)        return EVIDENCE_FAMILY_SIDECHANNEL;
+            if (reason == RE_REASON_PARENT_RE_TOOL)        return EVIDENCE_FAMILY_TARGET;
+            if (reason == RE_REASON_VAD_MAPPED_IN_RE)      return EVIDENCE_FAMILY_TARGET;
+            if (reason == RE_REASON_DMA_CANARY)            return EVIDENCE_FAMILY_DMA;
+            if (reason == RE_REASON_KD_ENABLED)            return EVIDENCE_FAMILY_KD;
+            return 0;
+        }
+
+        __forceinline bool is_direct_bsod_reason(ULONG reason) {
+            return reason == RE_REASON_DEBUG_BY_RE_TOOL
+                || reason == RE_REASON_DMA_CANARY;
+        }
+
+        __forceinline void add_evidence(ULONG reason) {
+            UINT64 now = __rdtsc();
+            UINT32 family = classify_family(reason);
+
+            LONG count = _InterlockedCompareExchange(&g_entry_count, 0, 0);
+            for (LONG i = 0; i < count && i < MAX_ENTRIES; i++) {
+                if (g_entries[i].reason == reason)
+                    return;
+            }
+
+            LONG idx = _InterlockedIncrement(&g_entry_count) - 1;
+            if (idx >= MAX_ENTRIES) {
+                _InterlockedDecrement(&g_entry_count);
+                return;
+            }
+
+            g_entries[idx].reason = reason;
+            g_entries[idx].family = family;
+            g_entries[idx].tsc = now;
+        }
+
+        __forceinline ULONG popcount32(UINT32 v) {
+            ULONG c = 0;
+            while (v) { v &= (v - 1); c++; }
+            return c;
+        }
+
+        __forceinline bool should_bugcheck() {
+            UINT64 now = __rdtsc();
+            UINT32 families_present = 0;
+            LONG count = _InterlockedCompareExchange(&g_entry_count, 0, 0);
+
+            for (LONG i = 0; i < count && i < MAX_ENTRIES; i++) {
+                if ((now - g_entries[i].tsc) > WINDOW_TSC)
+                    continue;
+                families_present |= g_entries[i].family;
+            }
+
+            UINT32 non_sc = families_present & ~EVIDENCE_FAMILY_SIDECHANNEL;
+            if (non_sc == 0)
+                return false;
+
+            ULONG family_count = popcount32(families_present);
+            return family_count >= REQUIRED_FAMILIES;
+        }
     }
 
     // V2: rotate bridge nonce and recompute HMAC over v1 fields
@@ -325,11 +428,33 @@ namespace sentinel_bridge {
                 if (cmd != BRIDGE_CMD_NONE) {
                     WW_LOG("watchdog_dpc: Sentinel command=%lu param=0x%lx", cmd, param);
 
-                    if (cmd == BRIDGE_CMD_DEBUGGER_FOUND || cmd == BRIDGE_CMD_DUMP_TOOL_FOUND ||
-                        cmd == BRIDGE_CMD_INTEGRITY_FAIL || cmd == BRIDGE_CMD_CALLBACK_REMOVED) {
-                        if (_KeBugCheckEx) {
-                            _KeBugCheckEx(0xDEAD0002u, cmd, param, 0, 0);
+                    if (cmd == BRIDGE_CMD_DMA_CANARY_HIT) {
+                        if (_KeBugCheckEx)
+                            _KeBugCheckEx(BUGCHECK_DMA_CANARY_HIT, cmd, param, 0, 0);
+                    }
+                    else if (cmd == BRIDGE_CMD_INTEGRITY_FAIL) {
+                        if (_KeBugCheckEx)
+                            _KeBugCheckEx(BUGCHECK_RE_USERMODE_CONFIRMED, cmd, param, 0, 0);
+                    }
+                    else if (cmd == BRIDGE_CMD_RE_EVIDENCE) {
+                        WW_LOG("watchdog_dpc: RE_EVIDENCE reason=0x%lx -> accumulator", param);
+                        evidence_accumulator::add_evidence(param);
+
+                        if (evidence_accumulator::is_direct_bsod_reason(param)) {
+                            WW_LOG("watchdog_dpc: direct BSOD reason=0x%lx", param);
+                            if (_KeBugCheckEx)
+                                _KeBugCheckEx(BUGCHECK_RE_USERMODE_CONFIRMED, cmd, param, 0, 0);
                         }
+                        else if (evidence_accumulator::should_bugcheck()) {
+                            WW_LOG("watchdog_dpc: accumulator quorum met, BSOD");
+                            if (_KeBugCheckEx)
+                                _KeBugCheckEx(BUGCHECK_RE_USERMODE_CONFIRMED, cmd, param, 0, 0);
+                        }
+                    }
+                    else if (cmd == BRIDGE_CMD_DEBUGGER_FOUND || cmd == BRIDGE_CMD_DUMP_TOOL_FOUND ||
+                             cmd == BRIDGE_CMD_CALLBACK_REMOVED) {
+                        if (_KeBugCheckEx)
+                            _KeBugCheckEx(BUGCHECK_RE_USERMODE_CONFIRMED, cmd, param, 0, 0);
                     }
                 }
             }

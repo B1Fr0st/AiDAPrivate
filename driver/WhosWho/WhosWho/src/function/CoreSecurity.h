@@ -942,6 +942,14 @@ namespace secure_comm {
         return TRUE;
     }
 
+    __forceinline void reset() {
+        _InterlockedExchange(&g_comm_initialized, 0);
+        g_client_token = 0;
+        g_session_entropy = 0x5A5A5A5A5A5A5A5AULL;
+        g_request_id = 0;
+        KeMemoryBarrier();
+    }
+
     __forceinline BOOLEAN decrypt_request(
         PVOID encrypted_buffer,
         SIZE_T buffer_size,

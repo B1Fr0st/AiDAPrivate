@@ -99,8 +99,17 @@ static bool filter_text_match(const char* filter, const std::string& text) {
 
 
 static void connection_poll_thread(state_t& state) {
+    driver_bridge::debug_log("[network] connection_poll_thread STARTED\n");
+    int poll_iter = 0;
     while (state.conn_polling.load()) {
-        if (driver_bridge::using_kernel_driver()) {
+        bool drv_ok = driver_bridge::using_kernel_driver();
+        if (poll_iter < 5 || (poll_iter % 100) == 0) {
+            char dbg[128];
+            snprintf(dbg, sizeof(dbg), "[network] conn_poll iter=%d drv_ok=%d\n", poll_iter, drv_ok ? 1 : 0);
+            driver_bridge::debug_log(dbg);
+        }
+        ++poll_iter;
+        if (drv_ok) {
             auto raw_conns = driver_bridge::enumerate_connections(
                 state.conn_filter_pid, state.conn_filter_protocol);
 
@@ -132,11 +141,23 @@ static void connection_poll_thread(state_t& state) {
 }
 
 static void capture_poll_thread(state_t& state) {
+    driver_bridge::debug_log("[network] capture_poll_thread STARTED\n");
+    int poll_iter = 0;
     while (state.cap_polling.load()) {
-        if (driver_bridge::using_kernel_driver()) {
+        bool drv_ok = driver_bridge::using_kernel_driver();
+        if (poll_iter < 5 || (poll_iter % 100) == 0) {
+            char dbg[128];
+            snprintf(dbg, sizeof(dbg), "[network] capture_poll iter=%d drv_ok=%d\n", poll_iter, drv_ok ? 1 : 0);
+            driver_bridge::debug_log(dbg);
+        }
+        ++poll_iter;
+        if (drv_ok) {
             auto raw_packets = driver_bridge::get_captured_packets(64);
 
             if (!raw_packets.empty()) {
+                char dbg[128];
+                snprintf(dbg, sizeof(dbg), "[network] capture_poll got %zu packets\n", raw_packets.size());
+                driver_bridge::debug_log(dbg);
                 std::lock_guard<std::mutex> lock(state.cap_mutex);
                 for (auto& p : raw_packets) {
                     packet_entry entry;
@@ -173,11 +194,23 @@ static void capture_poll_thread(state_t& state) {
 }
 
 static void dns_poll_thread(state_t& state) {
+    driver_bridge::debug_log("[network] dns_poll_thread STARTED\n");
+    int poll_iter = 0;
     while (state.dns_polling.load()) {
-        if (driver_bridge::using_kernel_driver()) {
+        bool drv_ok = driver_bridge::using_kernel_driver();
+        if (poll_iter < 5 || (poll_iter % 100) == 0) {
+            char dbg[128];
+            snprintf(dbg, sizeof(dbg), "[network] dns_poll iter=%d drv_ok=%d\n", poll_iter, drv_ok ? 1 : 0);
+            driver_bridge::debug_log(dbg);
+        }
+        ++poll_iter;
+        if (drv_ok) {
             auto raw_dns = driver_bridge::get_dns_queries(state.dns_filter_pid);
 
             if (!raw_dns.empty()) {
+                char dbg[128];
+                snprintf(dbg, sizeof(dbg), "[network] dns_poll got %zu entries\n", raw_dns.size());
+                driver_bridge::debug_log(dbg);
                 std::lock_guard<std::mutex> lock(state.dns_mutex);
                 for (auto& d : raw_dns) {
                     bool duplicate = false;
@@ -621,11 +654,26 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
 
     if (!state.cap_running) {
         if (ImGui::SmallButton("Start Capture")) {
+            char dbg[256];
+            snprintf(dbg, sizeof(dbg), "[network] START_CAPTURE clicked: filter_pid=%u filter_port=%u filter_proto=%u drv_ok=%d\n",
+                state.cap_filter_pid, state.cap_filter_port, state.cap_filter_protocol,
+                driver_bridge::using_kernel_driver() ? 1 : 0);
+            driver_bridge::debug_log(dbg);
             if (driver_bridge::start_capture(state.cap_filter_pid, state.cap_filter_port,
                                        state.cap_filter_protocol, nullptr)) {
+                driver_bridge::debug_log("[network] start_capture returned TRUE, spawning poll thread\n");
                 state.cap_running = true;
                 state.cap_polling.store(true);
-                state.cap_thread = std::thread(capture_poll_thread, std::ref(state));
+                try {
+                    state.cap_thread = std::thread(capture_poll_thread, std::ref(state));
+                } catch (...) {
+                    state.cap_running = false;
+                    state.cap_polling.store(false);
+                    driver_bridge::stop_capture();
+                    driver_bridge::debug_log("[network] capture thread creation failed\n");
+                }
+            } else {
+                driver_bridge::debug_log("[network] start_capture returned false (driver not connected?)\n");
             }
         }
     } else {
@@ -637,14 +685,14 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         }
     }
 
+    if (!driver_ok) ImGui::EndDisabled();
+
     ImGui::SameLine();
     if (ImGui::SmallButton("Clear")) {
         std::lock_guard<std::mutex> lock(state.cap_mutex);
         state.captured_packets.clear();
         state.cap_selected = -1;
     }
-
-    if (!driver_ok) ImGui::EndDisabled();
 
     ImGui::SameLine();
     ImGui::SetNextItemWidth(120.f);
@@ -892,7 +940,12 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
     if (!state.dns_polling.load()) {
         if (ImGui::SmallButton("Start DNS Monitor")) {
             state.dns_polling.store(true);
-            state.dns_thread = std::thread(dns_poll_thread, std::ref(state));
+            try {
+                state.dns_thread = std::thread(dns_poll_thread, std::ref(state));
+            } catch (...) {
+                state.dns_polling.store(false);
+                driver_bridge::debug_log("[network] dns monitor thread creation failed\n");
+            }
         }
     } else {
         if (ImGui::SmallButton("Stop DNS Monitor")) {

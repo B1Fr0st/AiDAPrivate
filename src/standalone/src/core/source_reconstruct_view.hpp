@@ -6,6 +6,7 @@
 #include <string>
 
 #include "imgui/imgui.h"
+#include "../helpers/globals.h"
 #include "source_reconstructor.hpp"
 #include "ui_anim.hpp"
 
@@ -59,6 +60,11 @@ inline void render(float alpha, float ar, float ag, float ab) {
 	ImDrawList* dl = ImGui::GetForegroundDrawList();
 	ImVec2 vp = ImGui::GetMainViewport()->Size;
 
+	const auto& _t = themes::resolved;
+	const auto _ta = [fa](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, fa);
+	};
+
 	dl->AddRectFilled(ImVec2(0, 0), vp,
 		IM_COL32(0, 0, 0, static_cast<int>(120 * fa)));
 
@@ -75,8 +81,8 @@ inline void render(float alpha, float ar, float ag, float ab) {
 	ImVec2 dmin(dx, dy);
 	ImVec2 dmax(dx + sw, dy + sh);
 
-	ImU32 bg = IM_COL32(22, 22, 30, static_cast<int>(245 * fa));
-	ImU32 border = IM_COL32(60, 60, 80, static_cast<int>(140 * fa));
+	ImU32 bg = _ta(_t.bg_base);
+	ImU32 border = _ta(ui_anim::lighten(_t.panel_bg, 12));
 	ImU32 accent = IM_COL32(
 		static_cast<int>(ar * 255), static_cast<int>(ag * 255),
 		static_cast<int>(ab * 255), static_cast<int>(220 * fa));
@@ -86,9 +92,9 @@ inline void render(float alpha, float ar, float ag, float ab) {
 	ImU32 accent_glow = IM_COL32(
 		static_cast<int>(ar * 255), static_cast<int>(ag * 255),
 		static_cast<int>(ab * 255), static_cast<int>(30 * fa));
-	ImU32 text_primary = IM_COL32(220, 222, 235, static_cast<int>(240 * fa));
-	ImU32 text_secondary = IM_COL32(140, 142, 165, static_cast<int>(180 * fa));
-	ImU32 text_dim = IM_COL32(100, 102, 120, static_cast<int>(140 * fa));
+	ImU32 text_primary = _ta(_t.text_primary);
+	ImU32 text_secondary = _ta(_t.text_secondary);
+	ImU32 text_dim = _ta(_t.text_dim);
 
 	dl->AddRectFilled(dmin, dmax, bg, 12.f);
 	dl->AddRect(dmin, dmax, border, 12.f, 0, 1.f);
@@ -110,7 +116,7 @@ inline void render(float alpha, float ar, float ag, float ab) {
 		ImVec2 cmax(close_x + 16.f, cur_y + 16.f);
 		bool close_hov = ImGui::IsMouseHoveringRect(cmin, cmax);
 		ImU32 close_col = close_hov ? IM_COL32(230, 80, 80, static_cast<int>(220 * fa))
-		                            : IM_COL32(160, 160, 180, static_cast<int>(160 * fa));
+		                            : _ta(_t.text_secondary);
 		dl->AddLine(ImVec2(close_x + 2, cur_y + 2), ImVec2(close_x + 14, cur_y + 14), close_col, 2.f);
 		dl->AddLine(ImVec2(close_x + 14, cur_y + 2), ImVec2(close_x + 2, cur_y + 14), close_col, 2.f);
 
@@ -132,19 +138,19 @@ inline void render(float alpha, float ar, float ag, float ab) {
 		ImVec2 imin(dx + pad, cur_y);
 		ImVec2 imax(dx + pad + input_w, cur_y + input_h);
 
-		dl->AddRectFilled(imin, imax, IM_COL32(14, 14, 20, static_cast<int>(220 * fa)), 4.f);
-		dl->AddRect(imin, imax, IM_COL32(50, 52, 70, static_cast<int>(120 * fa)), 4.f, 0, 1.f);
+		dl->AddRectFilled(imin, imax, _ta(_t.bg_base), 4.f);
+		dl->AddRect(imin, imax, _ta(ui_anim::lighten(_t.panel_bg, 12)), 4.f, 0, 1.f);
 
 		ImGui::SetCursorScreenPos(ImVec2(imin.x + 6.f, imin.y + 4.f));
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(200, 202, 220, static_cast<int>(230 * fa)));
+		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
 		ImGui::PushItemWidth(input_w - 16.f);
 
 		if (!st.started)
 			ImGui::InputText("##recon_outdir", st.output_dir, sizeof(st.output_dir), ImGuiInputTextFlags_None);
 		else {
-			ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(140, 142, 160, static_cast<int>(180 * fa)));
+			ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_secondary));
 			ImGui::InputText("##recon_outdir", st.output_dir, sizeof(st.output_dir), ImGuiInputTextFlags_ReadOnly);
 			ImGui::PopStyleColor();
 		}
@@ -203,7 +209,7 @@ inline void render(float alpha, float ar, float ag, float ab) {
 		dl->AddLine(
 			ImVec2(pipeline_x, pipeline_y),
 			ImVec2(pipeline_x + pipeline_w, pipeline_y),
-			IM_COL32(40, 42, 55, static_cast<int>(140 * fa)), 2.f);
+			_ta(_t.panel_header), 2.f);
 
 		if (st.started) {
 			float fill_w = pipeline_w * st.pipeline_line_anim;
@@ -248,7 +254,7 @@ inline void render(float alpha, float ar, float ag, float ab) {
 			else if (active)
 				dot_col = accent;
 			else
-				dot_col = IM_COL32(50, 52, 65, static_cast<int>(180 * fa));
+				dot_col = _ta(_t.panel_header);
 
 			dl->AddCircleFilled(ImVec2(dot_x, dot_y), dot_radius, dot_col, 20);
 
@@ -284,7 +290,7 @@ inline void render(float alpha, float ar, float ag, float ab) {
 
 		dl->AddRectFilled(
 			ImVec2(bar_x, bar_y), ImVec2(bar_x + bar_w, bar_y + bar_h),
-			IM_COL32(18, 18, 26, static_cast<int>(200 * fa)), bar_h * 0.5f);
+			_ta(_t.bg_base), bar_h * 0.5f);
 
 		float fill_w = bar_w * st.progress_display;
 		if (fill_w > 2.f) {
@@ -378,7 +384,7 @@ inline void render(float alpha, float ar, float ag, float ab) {
 
 			ImU32 btn_bg;
 			if (!has_output)
-				btn_bg = IM_COL32(40, 42, 55, static_cast<int>(120 * fa));
+				btn_bg = _ta(_t.panel_header);
 			else if (bhov)
 				btn_bg = IM_COL32(
 					(std::min)(static_cast<int>(ar * 255 + 40), 255),
@@ -397,7 +403,7 @@ inline void render(float alpha, float ar, float ag, float ab) {
 			const char* start_lbl = "Start";
 			ImVec2 slsz = ImGui::CalcTextSize(start_lbl);
 			ImU32 start_text_col = has_output ? IM_COL32(255, 255, 255, static_cast<int>(240 * fa))
-			                                  : IM_COL32(100, 100, 120, static_cast<int>(120 * fa));
+			                                  : _ta(_t.text_dim);
 			dl->AddText(ImVec2(btn_x + btn_w * 0.5f - slsz.x * 0.5f,
 			                    btn_y + btn_h * 0.5f - slsz.y * 0.5f), start_text_col, start_lbl);
 
@@ -464,7 +470,7 @@ inline void render(float alpha, float ar, float ag, float ab) {
 				bool cbhov = ImGui::IsMouseHoveringRect(cbmin, cbmax);
 
 				dl->AddRectFilled(cbmin, cbmax,
-					IM_COL32(50, 52, 70, static_cast<int>((cbhov ? 200 : 140) * fa)), 6.f);
+					cbhov ? _ta(ui_anim::lighten(_t.panel_header, 14)) : _ta(_t.panel_header), 6.f);
 				const char* close_lbl = "Close";
 				ImVec2 clsz2 = ImGui::CalcTextSize(close_lbl);
 				dl->AddText(ImVec2(close_btn_x + close_btn_w * 0.5f - clsz2.x * 0.5f,

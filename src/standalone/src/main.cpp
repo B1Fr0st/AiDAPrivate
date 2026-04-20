@@ -26,8 +26,13 @@
 
 #include "core/embedded_resources.hpp"
 
+extern "C" {
+#include <openssl/applink.c>
+}
+
 #include <delayimp.h>
 #include <thread>
+#include <cstdarg>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "Shcore.lib")
@@ -123,27 +128,113 @@ void set_acrylic_color(HWND hwnd)
     SetWindowCompositionAttribute(hwnd, &data);
 }
 
+static char s_cached_log_dir[MAX_PATH] = {};
+static bool s_log_dir_cached = false;
+
+static void cache_log_dir()
+{
+    if (s_log_dir_cached) return;
+    DWORD ret = GetModuleFileNameA(nullptr, s_cached_log_dir, MAX_PATH);
+    if (ret == 0 || ret >= MAX_PATH) {
+        s_cached_log_dir[0] = '\0';
+    } else {
+        char* last = strrchr(s_cached_log_dir, '\\');
+        if (last) *(last + 1) = '\0';
+        else s_cached_log_dir[0] = '\0';
+    }
+    s_log_dir_cached = true;
+}
+
+static void crash_log_write(const char* msg)
+{
+    cache_log_dir();
+    char path[MAX_PATH];
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%saida_debug.log", s_cached_log_dir);
+    HANDLE hf = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(hf, 0, nullptr, FILE_END);
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    char line[2048];
+    int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "[%02d:%02d:%02d.%03d] [main] %s\r\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
+    if (len > 0) {
+        DWORD written;
+        WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
+        FlushFileBuffers(hf);
+    }
+    CloseHandle(hf);
+}
+
+static void crash_log_fmt(const char* fmt, ...)
+{
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    crash_log_write(buf);
+}
+
+__declspec(noinline) static DWORD seh_render_title(helpers* h, uint64_t frame_number)
+{
+    __try {
+        h->render_title();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_render_source_reconstruct(uint64_t frame_number)
+{
+    __try {
+        source_reconstruct_view::render(1.0f, globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_render_toast(uint64_t frame_number)
+{
+    __try {
+        toast_notification::render();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
 int main(int, char**)
 {
-
+    crash_log_write("main_enter");
 
     {
         auto r = anti_tamper::hv_preflight::run();
+        crash_log_write("hv_preflight_done");
         if (r.result != anti_tamper::hv_preflight::result_t::allow)
             anti_tamper::hv_preflight::show_refuse_ui_and_exit(r);
     }
 
+    crash_log_write("extracting_z3");
     embedded_resources::extract_and_load_z3();
+    crash_log_fmt("z3_loaded module=%p", embedded_resources::g_z3_module);
     std::atexit(embedded_resources::cleanup_z3);
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    crash_log_write("dpi_awareness_set");
 
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"AiDAStandaloneWindow", nullptr };
     ::RegisterClassExW(&wc);
     int screen_w = GetSystemMetrics(SM_CXSCREEN);
     int screen_h = GetSystemMetrics(SM_CYSCREEN);
+    crash_log_fmt("screen=%dx%d", screen_w, screen_h);
     HWND hwnd = ::CreateWindowExW(WS_EX_LAYERED | WS_EX_APPWINDOW, wc.lpszClassName, L"AiDA Standalone", WS_POPUP, (screen_w - 200) / 2, (screen_h - 250) / 2, 200, 250, nullptr, nullptr, wc.hInstance, nullptr);
     g_hwnd = hwnd;
+    crash_log_fmt("hwnd=%p", hwnd);
 
 
     {
@@ -170,12 +261,15 @@ int main(int, char**)
             stbi_image_free(px);
         }
     }
+    crash_log_write("creating_d3d");
     if (!CreateDeviceD3D(hwnd))
     {
+        crash_log_write("d3d_creation_FAILED");
         CleanupDeviceD3D();
         ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
         return 1;
     }
+    crash_log_fmt("d3d_ok device=%p ctx=%p swapchain=%p", g_pd3dDevice, g_pd3dDeviceContext, g_pSwapChain);
 
     ::ShowWindow(hwnd, SW_SHOWDEFAULT);
     const MARGINS margin = { -1 };
@@ -189,9 +283,11 @@ int main(int, char**)
 
     set_acrylic_color(hwnd);
     ::UpdateWindow(hwnd);
+    crash_log_write("window_shown_acrylic_set");
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    crash_log_write("imgui_context_created");
     ImGuiIO& io = ImGui::GetIO(); (void)io;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
@@ -253,8 +349,11 @@ int main(int, char**)
         g_code_font = io.Fonts->AddFontFromFileTTF(consolas_path.c_str(), font_size, &mono_cfg);
     }
 
+    crash_log_write("fonts_built");
     ImGui_ImplWin32_Init(hwnd);
+    crash_log_write("imgui_win32_init_ok");
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+    crash_log_write("imgui_dx11_init_ok");
     D3D11_BLEND_DESC blend_desc = {};
     blend_desc.RenderTarget[0].BlendEnable = TRUE;
     blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
@@ -266,29 +365,75 @@ int main(int, char**)
     blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     g_pd3dDevice->CreateBlendState(&blend_desc, &blend_state);
     g_pd3dDeviceContext->OMSetBlendState(blend_state, nullptr, 0xffffffff);
+    crash_log_fmt("blend_state=%p", blend_state);
     Blur::Init(g_pd3dDevice, g_pd3dDeviceContext, 100, 130);
-    init_standalone_chat();
-    network_view::initialize();
-    script_engine::initialize();
+    crash_log_write("blur_init_ok");
 
+    // ── Background initialization ──────────────────────────────────────
+    // Move heavy init off the main thread so the loading animation renders
+    // immediately instead of showing a frozen window for 15+ seconds.
+    static std::atomic<bool> bg_init_done{false};
+    globals::ui::bg_init_done = &bg_init_done;
+    std::thread([]() {
+        init_standalone_chat();
+        crash_log_write("standalone_chat_init_ok");
+        network_view::initialize();
+        crash_log_write("network_view_init_ok");
+        script_engine::initialize();
+        crash_log_write("script_engine_init_ok");
+
+        standalone_license::snapshot_code_hashes();
+        crash_log_write("code_hashes_snapshot_ok");
+
+        crash_log_write("anti_tamper_initialize_entering");
+        bool at_result = anti_tamper::initialize();
+        crash_log_fmt("anti_tamper_initialize_result=%d", at_result ? 1 : 0);
+
+        bg_init_done.store(true, std::memory_order_release);
+    }).detach();
+
+    // Hook driver_bridge logging into aida_debug.log via crash_log_write
+    driver_bridge::set_log_callback([](const std::string& msg) {
+        crash_log_write(msg.c_str());
+    });
+
+    // driver_bridge already launches on its own thread
     std::thread([] { driver_bridge::initialize(); }).detach();
-
-
-    standalone_license::snapshot_code_hashes();
+    crash_log_write("driver_bridge_thread_launched");
 
     SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
-        char buf[2048];
+        standalone_anti_dump::handle_strip::clear_critical_flags();
+
+        char buf[4096];
+        HMODULE crash_mod = nullptr;
+        char crash_mod_name[MAX_PATH] = "<unknown>";
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(ep->ExceptionRecord->ExceptionAddress), &crash_mod);
+        if (crash_mod)
+            GetModuleFileNameA(crash_mod, crash_mod_name, MAX_PATH);
+
+        HMODULE exe_base = GetModuleHandleA(nullptr);
+        uintptr_t rip_offset = ep->ContextRecord->Rip - reinterpret_cast<uintptr_t>(exe_base);
+        uintptr_t addr_offset = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress) - reinterpret_cast<uintptr_t>(crash_mod);
+
         snprintf(buf, sizeof(buf),
             "EXCEPTION: code=0x%08X addr=0x%016llX\n"
+            "CrashModule=%s ModuleOffset=0x%llX\n"
+            "ExeBase=0x%p RipOffsetFromExe=0x%llX\n"
             "Flags=0x%08X NumParams=%lu\n"
             "Info[0]=0x%016llX Info[1]=0x%016llX\n"
             "Rax=%016llX Rcx=%016llX Rdx=%016llX Rbx=%016llX\n"
             "Rsp=%016llX Rbp=%016llX Rsi=%016llX Rdi=%016llX\n"
             "R8=%016llX R9=%016llX R10=%016llX R11=%016llX\n"
             "R12=%016llX R13=%016llX R14=%016llX R15=%016llX\n"
-            "Rip=%016llX\n",
+            "Rip=%016llX\n"
+            "LastError=%lu\n",
             ep->ExceptionRecord->ExceptionCode,
             reinterpret_cast<unsigned long long>(ep->ExceptionRecord->ExceptionAddress),
+            crash_mod_name,
+            static_cast<unsigned long long>(addr_offset),
+            exe_base,
+            static_cast<unsigned long long>(rip_offset),
             ep->ExceptionRecord->ExceptionFlags,
             ep->ExceptionRecord->NumberParameters,
             ep->ExceptionRecord->NumberParameters > 0 ? ep->ExceptionRecord->ExceptionInformation[0] : 0ULL,
@@ -301,15 +446,16 @@ int main(int, char**)
             ep->ContextRecord->R10, ep->ContextRecord->R11,
             ep->ContextRecord->R12, ep->ContextRecord->R13,
             ep->ContextRecord->R14, ep->ContextRecord->R15,
-            ep->ContextRecord->Rip);
+            ep->ContextRecord->Rip,
+            GetLastError());
 
-        char path[MAX_PATH];
-        GetModuleFileNameA(nullptr, path, MAX_PATH);
-        char* last = strrchr(path, '\\');
-        if (last) *(last + 1) = '\0';
-        strcat_s(path, "aida_crash.log");
+        crash_log_write(buf);
 
-        HANDLE hf = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        cache_log_dir();
+        char crash_path[MAX_PATH];
+        _snprintf_s(crash_path, sizeof(crash_path), _TRUNCATE, "%saida_crash.log", s_cached_log_dir);
+
+        HANDLE hf = CreateFileA(crash_path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hf != INVALID_HANDLE_VALUE) {
             DWORD written;
@@ -321,18 +467,32 @@ int main(int, char**)
 
         return EXCEPTION_CONTINUE_SEARCH;
     });
-
-    anti_tamper::initialize();
+    crash_log_write("exception_filter_set");
 
 
     ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    crash_log_write("entering_render_loop");
 
 
     bool done = false;
     static int prev_state = -1;
+    static uint64_t frame_number = 0;
     while (!done)
     {
+        if (frame_number < 5 || (frame_number % 500) == 0)
+            crash_log_fmt("frame_begin #%llu", frame_number);
 
+        static DWORD s_start_tick = GetTickCount();
+        DWORD elapsed_ms = GetTickCount() - s_start_tick;
+        if (frame_number < 5 || (frame_number >= 250 && frame_number <= 260)
+            || (elapsed_ms >= 4500 && elapsed_ms <= 7000 && (frame_number % 10) == 0)
+            || (frame_number % 100) == 0)
+        {
+            crash_log_fmt("frame_detail #%llu elapsed_ms=%lu state=%d bg_done=%d",
+                frame_number, elapsed_ms,
+                (globals::ui::load_timer >= 3.0f ? 1 : 0) + (globals::ui::welcome_done ? 2 : 0),
+                (globals::ui::bg_init_done && globals::ui::bg_init_done->load(std::memory_order_relaxed)) ? 1 : 0);
+        }
 
         if (themes::changed)
         {
@@ -457,20 +617,46 @@ int main(int, char**)
             prev_h = ih;
         }
 
+        if (frame_number < 5)
+            crash_log_write("dx11_new_frame");
         ImGui_ImplDX11_NewFrame();
+        if (frame_number < 5)
+            crash_log_write("win32_new_frame");
         ImGui_ImplWin32_NewFrame();
+        if (frame_number < 5)
+            crash_log_write("imgui_new_frame");
         ImGui::NewFrame();
 
         {
+            if (frame_number < 5)
+                crash_log_write("render_title_entering");
 
-            helper.render_title();
-            source_reconstruct_view::render(1.0f, globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
-            toast_notification::render();
+            DWORD seh_rt = seh_render_title(&helper, frame_number);
+            if (seh_rt != 0)
+                crash_log_fmt("SEH_in_render_title code=0x%08X frame=%llu section=%s", seh_rt, frame_number, g_render_section);
 
+            if (frame_number < 5)
+                crash_log_write("render_title_done");
+
+            DWORD seh_sr = seh_render_source_reconstruct(frame_number);
+            if (seh_sr != 0)
+                crash_log_fmt("SEH_in_source_reconstruct code=0x%08X frame=%llu", seh_sr, frame_number);
+
+            if (frame_number < 5)
+                crash_log_write("source_reconstruct_done");
+
+            DWORD seh_toast = seh_render_toast(frame_number);
+            if (seh_toast != 0)
+                crash_log_fmt("SEH_in_toast code=0x%08X frame=%llu", seh_toast, frame_number);
+
+            if (frame_number < 5)
+                crash_log_write("toast_done");
         }
 
         const float clear_color_with_alpha[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
+        if (frame_number < 5)
+            crash_log_write("render_submit");
         g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
         ImGui::Render();
@@ -478,8 +664,14 @@ int main(int, char**)
         g_pd3dDeviceContext->OMSetBlendState(blend_state, nullptr, 0xffffffff);
 
         HRESULT hr = g_pSwapChain->Present(1, 0);
+        if (frame_number < 5)
+            crash_log_fmt("present_hr=0x%08X", hr);
 
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
+
+        if (frame_number < 5 || (frame_number % 500) == 0)
+            crash_log_fmt("frame_end #%llu", frame_number);
+        frame_number++;
     }
 
 

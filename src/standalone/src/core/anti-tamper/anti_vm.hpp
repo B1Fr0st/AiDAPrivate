@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "webhook.hpp"
+#include "hv_preflight.hpp"
+#include "../standalone_driver.hpp"
 
 #pragma comment(lib, "iphlpapi.lib")
 
@@ -26,6 +28,10 @@ struct vm_report_t
     bool vm_mac_prefix = false;
     bool vm_processes = false;
     bool firmware_vm_string = false;
+    bool cpuid_leaf_mismatch = false;
+    bool kernel_detections_failed = false;
+    uint8_t kernel_detection_count = 0;
+    uint8_t kernel_total_run = 0;
     std::string vendor_name;
     std::string summary;
 
@@ -33,7 +39,7 @@ struct vm_report_t
     {
         return cpuid_hypervisor_bit || cpuid_vendor_vm || registry_vm_services
             || registry_vm_hardware || vm_mac_prefix || vm_processes
-            || firmware_vm_string;
+            || firmware_vm_string || cpuid_leaf_mismatch || kernel_detections_failed;
     }
 };
 
@@ -56,7 +62,6 @@ inline std::string check_cpuid_vendor_string()
 
     const char* known_vm_vendors[] = {
         "VMwareVMware",
-        "Microsoft Hv",
         "KVMKVMKVM\0\0\0",
         "VBoxVBoxVBox",
         "XenVMMXenVMM",
@@ -135,28 +140,33 @@ inline bool check_vm_hardware_ids()
 
 inline bool check_vm_timing_overhead()
 {
-    constexpr int samples = 11;
-    uint64_t results[samples];
+    constexpr int samples = 64;
+    uint32_t results[samples];
 
     for (int s = 0; s < samples; ++s)
     {
-        uint64_t t0 = __rdtsc();
         int regs[4];
+        _mm_lfence();
+        uint64_t t0 = __rdtsc();
+        _mm_lfence();
         __cpuid(regs, 0);
+        _mm_lfence();
         uint64_t t1 = __rdtsc();
-        results[s] = t1 - t0;
+        _mm_lfence();
+        uint64_t delta = t1 - t0;
+        results[s] = (delta > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : static_cast<uint32_t>(delta);
     }
 
     for (int i = 0; i < samples - 1; ++i)
-        for (int j = 0; j < samples - i - 1; ++j)
-            if (results[j] > results[j + 1])
+        for (int j = i + 1; j < samples; ++j)
+            if (results[j] < results[i])
             {
-                uint64_t tmp = results[j];
-                results[j] = results[j + 1];
-                results[j + 1] = tmp;
+                uint32_t tmp = results[i];
+                results[i] = results[j];
+                results[j] = tmp;
             }
 
-    uint64_t median = results[samples / 2];
+    uint32_t median = results[samples / 2];
     return median > 1500;
 }
 
@@ -269,9 +279,47 @@ inline bool check_firmware_tables()
     return false;
 }
 
+inline bool check_cpuid_leaf_comparison()
+{
+    int regs[4] = {};
+    __cpuid(regs, 1);
+    if ((regs[2] & (1 << 31)) != 0)
+        return false;
+
+    int invalid_leaf[4] = {};
+    int reserved_leaf[4] = {};
+
+    __cpuid(invalid_leaf, 0x13371337);
+    __cpuid(reserved_leaf, 0x40000000);
+
+    if (invalid_leaf[0] != reserved_leaf[0] ||
+        invalid_leaf[1] != reserved_leaf[1] ||
+        invalid_leaf[2] != reserved_leaf[2] ||
+        invalid_leaf[3] != reserved_leaf[3])
+        return true;
+
+    int max_basic[4] = {};
+    __cpuid(max_basic, 0);
+    int highest_basic[4] = {};
+    __cpuid(highest_basic, max_basic[0]);
+
+    if (highest_basic[0] != reserved_leaf[0] ||
+        highest_basic[1] != reserved_leaf[1] ||
+        highest_basic[2] != reserved_leaf[2] ||
+        highest_basic[3] != reserved_leaf[3])
+        return true;
+
+    return false;
+}
+
 inline vm_report_t full_scan()
 {
     vm_report_t report{};
+
+    if (hv_preflight::g_ms_hv_approved) {
+        report.summary = "ms_hv_approved_by_preflight";
+        return report;
+    }
 
     report.cpuid_hypervisor_bit = check_cpuid_hypervisor_bit();
 
@@ -290,6 +338,17 @@ inline vm_report_t full_scan()
 
     report.firmware_vm_string = check_firmware_tables();
 
+    report.cpuid_leaf_mismatch = check_cpuid_leaf_comparison();
+
+    {
+        driver_bridge::hv_kernel_detect_result_t kresult{};
+        if (driver_bridge::run_kernel_hv_detection(kresult)) {
+            report.kernel_detections_failed = kresult.any_detected();
+            report.kernel_detection_count = kresult.total_failed;
+            report.kernel_total_run = kresult.total_run;
+        }
+    }
+
     if (report.cpuid_hypervisor_bit) report.summary += "cpuid_hv ";
     if (report.cpuid_vendor_vm) report.summary += "vendor:" + report.vendor_name + " ";
     if (report.registry_vm_services) report.summary += "reg_svc ";
@@ -298,6 +357,8 @@ inline vm_report_t full_scan()
     if (report.vm_mac_prefix) report.summary += "mac ";
     if (report.vm_processes) report.summary += "procs ";
     if (report.firmware_vm_string) report.summary += "firmware ";
+    if (report.cpuid_leaf_mismatch) report.summary += "cpuid_leaf ";
+    if (report.kernel_detections_failed) report.summary += "kernel_hv(" + std::to_string(report.kernel_detection_count) + "/" + std::to_string(report.kernel_total_run) + ") ";
 
     return report;
 }

@@ -302,6 +302,7 @@ namespace detail {
                                        std::vector<uint8_t>& out_plaintext)
     {
         httplib::Client cli(get_api_host());
+        cli.set_address_family(AF_INET);
         cli.set_connection_timeout(FETCH_TIMEOUT_SEC);
         cli.set_read_timeout(FETCH_TIMEOUT_SEC);
         cli.set_write_timeout(FETCH_TIMEOUT_SEC);
@@ -368,6 +369,7 @@ inline bool query_page_count(const std::string& license_key,
                              const std::string& hwid)
 {
     httplib::Client cli(detail::get_api_host());
+    cli.set_address_family(AF_INET);
     cli.set_connection_timeout(detail::FETCH_TIMEOUT_SEC);
     cli.set_read_timeout(detail::FETCH_TIMEOUT_SEC);
     cli.set_keep_alive(false);

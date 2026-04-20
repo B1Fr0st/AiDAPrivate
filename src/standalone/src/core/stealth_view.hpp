@@ -49,14 +49,15 @@ inline ImU32 severity_color(stealth_engine::finding_severity_t s, float alpha)
 
 inline ImU32 severity_text_color(stealth_engine::finding_severity_t s, float alpha)
 {
+	const auto& _t = themes::resolved;
 	switch (s) {
-	case stealth_engine::finding_severity_t::critical: return IM_COL32(255, 255, 255, static_cast<int>(alpha * 255));
-	case stealth_engine::finding_severity_t::high:     return IM_COL32(255, 255, 255, static_cast<int>(alpha * 255));
-	case stealth_engine::finding_severity_t::medium:   return IM_COL32(30, 30, 30, static_cast<int>(alpha * 255));
-	case stealth_engine::finding_severity_t::low:      return IM_COL32(255, 255, 255, static_cast<int>(alpha * 255));
-	case stealth_engine::finding_severity_t::info:     return IM_COL32(255, 255, 255, static_cast<int>(alpha * 255));
+	case stealth_engine::finding_severity_t::critical: return ui_anim::theme_alpha(_t.text_primary, alpha);
+	case stealth_engine::finding_severity_t::high:     return ui_anim::theme_alpha(_t.text_primary, alpha);
+	case stealth_engine::finding_severity_t::medium:   return ui_anim::theme_alpha(_t.bg_base, alpha);
+	case stealth_engine::finding_severity_t::low:      return ui_anim::theme_alpha(_t.text_primary, alpha);
+	case stealth_engine::finding_severity_t::info:     return ui_anim::theme_alpha(_t.text_primary, alpha);
 	}
-	return IM_COL32(255, 255, 255, static_cast<int>(alpha * 255));
+	return ui_anim::theme_alpha(_t.text_primary, alpha);
 }
 
 inline void render(float pos_x, float pos_y, float width, float height,
@@ -103,7 +104,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float dt = ImGui::GetIO().DeltaTime;
 
 	dl->AddRectFilled(ImVec2(ox, cy), ImVec2(ox + w, cy + 28.f),
-		IM_COL32(22, 24, 33, static_cast<int>(alpha * 220)));
+		_ta(_t.bg_base));
 
 	float target_ux = cx;
 	float target_uw = 0.f;
@@ -124,11 +125,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		if (hov && st.active_sub_tab != ti) {
 			dl->AddRectFilled(ImVec2(tab_x, cy), ImVec2(tab_x + tab_w, cy + 26.f),
-				IM_COL32(255, 255, 255, static_cast<int>(alpha * 8)), 4.f, ImDrawFlags_RoundCornersTop);
+				_ta(ui_anim::lighten(_t.panel_bg, 8)), 4.f, ImDrawFlags_RoundCornersTop);
 		}
 
 		dl->AddText(ImVec2(tab_x + 12.f, cy + 5.f),
-			IM_COL32(255, 255, 255, static_cast<int>(text_alpha_val * alpha * 255)), tab_names_arr[ti]);
+			ui_anim::theme_alpha(_t.text_primary, text_alpha_val * alpha), tab_names_arr[ti]);
 
 		tab_x += tab_w + 2.f;
 	}
@@ -146,7 +147,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	cy += 30.f;
 	dl->AddLine(ImVec2(ox, cy - 1.f), ImVec2(ox + w, cy - 1.f),
-		IM_COL32(50, 55, 70, static_cast<int>(alpha * 60)));
+		_ta(ui_anim::lighten(_t.panel_bg, 12)));
 	cy += 4.f;
 
 	if (st.active_sub_tab == 0) {
@@ -161,7 +162,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			static_cast<int>(accent_g * 180), static_cast<int>(accent_b * 180), static_cast<int>(alpha * 240)));
 		ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(static_cast<int>(accent_r * 100),
 			static_cast<int>(accent_g * 100), static_cast<int>(accent_b * 100), static_cast<int>(alpha * 255)));
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, static_cast<int>(alpha * 255)));
+		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 
 		bool scanning = stealth_engine::g_scan.scanning.load();
 
@@ -190,11 +191,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PopStyleVar();
 
 		ImGui::SameLine();
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(alpha * 255)));
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(212, 212, 212, static_cast<int>(alpha * 255)));
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
+		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
-		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(alpha * 150)));
+		ImGui::PushStyleColor(ImGuiCol_Border, _ta(ui_anim::lighten(_t.panel_bg, 12)));
 		const char* sev_items[] = {"All Severity", "Critical", "High", "Medium", "Low", "Info"};
 		ImGui::PushItemWidth(100.f);
 		int sev_sel = st.severity_filter + 1;
@@ -217,7 +218,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImGui::SameLine();
 			float prog = stealth_engine::g_scan.progress.load();
 			ui_anim::render_progress_ring(dl, ImGui::GetCursorScreenPos().x + 8.f,
-				cy + 17.f, 7.f, 2.f, prog, IM_COL32(40, 40, 40, static_cast<int>(alpha * 255)), accent_col);
+				cy + 17.f, 7.f, 2.f, prog, _ta(ui_anim::lighten(_t.panel_bg, 12)), accent_col);
 			ImGui::Dummy(ImVec2(24.f, 0.f));
 			ImGui::SameLine();
 			std::lock_guard<std::mutex> lk(stealth_engine::g_scan.mutex);
@@ -243,8 +244,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 
 		const float row_h = 24.f;
+		const float bottom_h = 56.f;
 		const float table_top = cy;
-		const float table_h = oy + h - cy - 8.f;
+		const float table_h = oy + h - cy - 8.f - bottom_h;
 
 		float col_sev_w = 70.f;
 		float col_cat_w = 120.f;
@@ -315,6 +317,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			const char* sev_str = stealth_engine::severity_name(f.severity);
 			ImVec2 sev_sz = ImGui::CalcTextSize(sev_str);
 			float badge_w = sev_sz.x + 10.f;
+			if (f.severity == stealth_engine::finding_severity_t::critical) {
+				float glow_pulse = (std::sin(st.anim_t * 3.f + static_cast<float>(i) * 0.7f) + 1.f) * 0.5f;
+				ImU32 crit_glow = IM_COL32(220, 50, 50, static_cast<int>(row_alpha * (15.f + glow_pulse * 20.f)));
+				dl->AddRectFilled(ImVec2(rx - 3.f, ry + 1.f), ImVec2(rx + badge_w + 3.f, ry + row_h - 1.f),
+					crit_glow, 5.f);
+			}
 			dl->AddRectFilled(ImVec2(rx, ry + 3.f), ImVec2(rx + badge_w, ry + row_h - 3.f),
 				severity_color(f.severity, row_alpha), 3.f);
 			dl->AddText(ImVec2(rx + 5.f, ry + 4.f),
@@ -322,7 +330,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			rx = cx + col_sev_w + 4.f;
 
 			dl->AddText(ImVec2(rx, ry + 4.f),
-				IM_COL32(170, 170, 170, static_cast<int>(row_alpha * 255)),
+				ui_anim::theme_alpha(_t.text_secondary, row_alpha),
 				stealth_engine::category_name(f.category));
 			rx += col_cat_w;
 
@@ -331,19 +339,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
 					static_cast<unsigned long long>(f.address));
 				dl->AddText(ImVec2(rx, ry + 4.f),
-					IM_COL32(229, 192, 123, static_cast<int>(row_alpha * 255)),
+					ui_anim::theme_alpha(_t.text_secondary, row_alpha),
 					addr_buf);
 			}
 			rx += col_addr_w;
 
 			dl->AddText(ImVec2(rx, ry + 4.f),
-				IM_COL32(212, 212, 212, static_cast<int>(row_alpha * 255)),
+				ui_anim::theme_alpha(_t.text_primary, row_alpha),
 				f.title.c_str(),
 				f.title.c_str() + std::min(f.title.size(), static_cast<size_t>(40)));
 			rx += col_title_w;
 
 			dl->AddText(ImVec2(rx, ry + 4.f),
-				IM_COL32(140, 140, 140, static_cast<int>(row_alpha * 255)),
+				ui_anim::theme_alpha(_t.text_secondary, row_alpha),
 				f.detail.c_str(),
 				f.detail.c_str() + std::min(f.detail.size(), static_cast<size_t>(60)));
 		}
@@ -377,7 +385,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				}
 			}
 
-			float bottom_h = 56.f;
 			float card_y = oy + h - bottom_h;
 			ui_anim::render_panel_card(dl, ox + 4.f, card_y, w - 8.f, bottom_h - 4.f,
 				accent_r, accent_g, accent_b, alpha, 6.f, false);
@@ -388,7 +395,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			int total_f = static_cast<int>(filtered.size());
 			if (total_f > 0) {
 				int seg_counts[] = { crit, hi, med, lo, inf };
-				float seg_fracs[5];
 				ImU32 seg_colors[] = {
 					IM_COL32(220, 50, 50, static_cast<int>(alpha * 240)),
 					IM_COL32(220, 130, 50, static_cast<int>(alpha * 240)),
@@ -440,6 +446,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ui_anim::render_stat_card(dl, sx, card_y + 6.f, card_w, 40.f, "Low", b_lo,
 				accent_r, accent_g, accent_b, alpha,
 				IM_COL32(80, 160, 80, static_cast<int>(alpha * 255)));
+		} else {
+			float card_y = oy + h - bottom_h;
+			ui_anim::render_panel_card(dl, ox + 4.f, card_y, w - 8.f, bottom_h - 4.f,
+				accent_r, accent_g, accent_b, alpha * 0.4f, 6.f, false);
+			ImVec2 ph_sz = ImGui::CalcTextSize("Run a scan to see summary");
+			dl->AddText(ImVec2(ox + (w - ph_sz.x) * 0.5f, card_y + (bottom_h - ph_sz.y) * 0.5f - 2.f),
+				_ta(ui_anim::lighten(_t.text_dim, 0)), "Run a scan to see summary");
 		}
 	}
 	else {
@@ -450,9 +463,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float ty = cy + 8.f;
 
 		ImGui::SetCursorScreenPos(ImVec2(tx, ty));
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(alpha * 255)));
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(212, 212, 212, static_cast<int>(alpha * 255)));
-		ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(alpha * 150)));
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
+		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
+		ImGui::PushStyleColor(ImGuiCol_Border, _ta(ui_anim::lighten(_t.panel_bg, 12)));
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 		ImGui::PushItemWidth(140.f);
@@ -472,7 +485,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			static_cast<int>(accent_g * 180), static_cast<int>(accent_b * 180), static_cast<int>(alpha * 240)));
 		ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(static_cast<int>(accent_r * 100),
 			static_cast<int>(accent_g * 100), static_cast<int>(accent_b * 100), static_cast<int>(alpha * 255)));
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, static_cast<int>(alpha * 255)));
+		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 
 		if (!stealth_active) {
 			if (ImGui::SmallButton("Start Stealth")) {
@@ -508,7 +521,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		ty += 18.f;
 		ImGui::SetCursorScreenPos(ImVec2(cx, ty));
-		ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(212, 212, 212, static_cast<int>(alpha * 255)));
+		ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 		ImGui::PushStyleColor(ImGuiCol_CheckMark, accent_col);
 		ImGui::Checkbox("Spoof PEB Flags##stealth", &st.opt_peb);
 		ImGui::SameLine();
@@ -593,7 +606,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
 				static_cast<unsigned long long>(hook.target_addr));
 			dl->AddText(ImVec2(rx, yt),
-				IM_COL32(229, 192, 123, static_cast<int>(alpha * 255)), addr_buf);
+				ui_anim::theme_alpha(_t.text_secondary, alpha * row_t), addr_buf);
 			rx += col_target_w;
 
 			char tramp_buf[20];

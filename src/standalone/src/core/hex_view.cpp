@@ -39,7 +39,7 @@ void load_from_file(const std::string& path, size_t offset, size_t size) {
 }
 
 bool read_from_process(uint64_t address, size_t size) {
-    if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
+    if (!driver_bridge::is_loaded() || !driver_bridge::can_read_memory())
         return false;
     if (driver_bridge::attached_pid() == 0)
         return false;
@@ -67,6 +67,11 @@ void render(float pos_x, float pos_y, float width, float height,
     auto& st = g_state;
     const float a   = alpha;
     const float dt  = ImGui::GetIO().DeltaTime;
+
+    const auto& _t = themes::resolved;
+    const auto _ta = [a](ImU32 c) -> ImU32 {
+        return ui_anim::theme_alpha(c, a);
+    };
     const float line_h = 18.f;
     const float char_w = ImGui::CalcTextSize("0").x;
     const int   bytes_per_row = 16;
@@ -89,6 +94,27 @@ void render(float pos_x, float pos_y, float width, float height,
     ImVec2 wpos = ImGui::GetWindowPos();
     float ox = wpos.x + pos_x;
     float oy = wpos.y + pos_y;
+
+    dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height), _ta(_t.bg_base));
+
+    float col_hdr_h = line_h;
+    {
+        dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + col_hdr_h),
+            _ta(_t.panel_header));
+        float hx = ox + addr_w;
+        for (int c = 0; c < bytes_per_row; ++c) {
+            float bx = hx + c * char_w * 3.f;
+            if (c >= 8) bx += char_w;
+            char hdr[4];
+            snprintf(hdr, sizeof(hdr), "%02X", c);
+            dl->AddText(ImVec2(bx, oy + 1.f), _ta(_t.text_dim), hdr);
+        }
+        dl->AddText(ImVec2(ox + asc_x, oy + 1.f), _ta(_t.text_dim), "Decoded Text");
+        dl->AddLine(ImVec2(ox, oy + col_hdr_h - 1.f), ImVec2(ox + width, oy + col_hdr_h - 1.f),
+            _ta(ui_anim::lighten(_t.panel_header, 10)));
+    }
+    oy += col_hdr_h;
+    height -= col_hdr_h;
 
 
     st.scroll_y += (st.target_scroll_y - st.scroll_y) * std::min(20.f * dt, 1.f);
@@ -113,10 +139,10 @@ void render(float pos_x, float pos_y, float width, float height,
 
     dl->AddLine(ImVec2(ox + addr_w - char_w, oy),
                 ImVec2(ox + addr_w - char_w, oy + height),
-                IM_COL32(255, 255, 255, (int)(10 * a)), 1.f);
+                _ta(ui_anim::lighten(_t.panel_header, 10)), 1.f);
     dl->AddLine(ImVec2(ox + addr_w + hex_w, oy),
                 ImVec2(ox + addr_w + hex_w, oy + height),
-                IM_COL32(255, 255, 255, (int)(10 * a)), 1.f);
+                _ta(ui_anim::lighten(_t.panel_header, 10)), 1.f);
 
     {
         const char* ht_label = heat_map_mode ? "Heat: ON" : "Heat";
@@ -129,10 +155,10 @@ void render(float pos_x, float pos_y, float width, float height,
         ImU32 ht_bg = heat_map_mode
             ? IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
                        static_cast<int>(accent_b * 255), static_cast<int>(40 * a))
-            : IM_COL32(40, 40, 55, static_cast<int>((ht_hov ? 180 : 120) * a));
+            : ui_anim::theme_alpha(_t.panel_header, (ht_hov ? 0.71f : 0.47f) * a);
         dl->AddRectFilled(ImVec2(ht_x, ht_y), ImVec2(ht_x + ht_w, ht_y + ht_h), ht_bg, 3.f);
         dl->AddText(ImVec2(ht_x + 6.f, ht_y + 1.f),
-            IM_COL32(200, 200, 220, static_cast<int>((ht_hov ? 240 : 160) * a)), ht_label);
+            ui_anim::theme_alpha(_t.text_primary, (ht_hov ? 0.94f : 0.63f) * a), ht_label);
         if (ht_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
             heat_map_mode = !heat_map_mode;
     }
@@ -204,9 +230,9 @@ void render(float pos_x, float pos_y, float width, float height,
 
             ImU32 bc;
             if (b == 0)
-                bc = IM_COL32(60, 60, 80, static_cast<int>(100 * a));
+                bc = _ta(_t.text_dim);
             else
-                bc = IM_COL32(200, 200, 230, static_cast<int>(220 * a));
+                bc = _ta(_t.text_primary);
 
             if (st.search_match >= 0 && byte_idx == st.search_match) {
                 dl->AddRectFilled(ImVec2(bx - 1.f, y),
@@ -255,10 +281,10 @@ void render(float pos_x, float pos_y, float width, float height,
 
             if (b >= 0x20 && b <= 0x7E) {
                 ch[0] = (char)b;
-                ac = IM_COL32(180, 180, 200, (int)(200 * a));
+                ac = _ta(_t.text_secondary);
             } else if (b == 0) {
                 ch[0] = '.';
-                ac = IM_COL32(60, 60, 80, (int)(80 * a));
+                ac = _ta(_t.text_dim);
             } else {
                 ch[0] = '.';
                 ac = IM_COL32(209, 154, 102, (int)(160 * a));
@@ -277,8 +303,17 @@ void render(float pos_x, float pos_y, float width, float height,
     if (sel_lo >= 0 && sel_lo < (int)st.data.size()) {
         float insp_w = 260.f;
         float insp_h = 0.f;
-        float insp_x = ox + width - insp_w - 8.f;
+        float insp_target_x = ox + width - insp_w - 8.f;
         float insp_y = oy + 8.f;
+
+        static float insp_anim_x = 0.f;
+        static bool insp_was_visible = false;
+        if (!insp_was_visible) {
+            insp_anim_x = ox + width;
+            insp_was_visible = true;
+        }
+        insp_anim_x += (insp_target_x - insp_anim_x) * std::min(12.f * dt, 1.f);
+        float insp_x = insp_anim_x;
 
         ImDrawList* fdl = ImGui::GetForegroundDrawList();
         int remaining = (int)st.data.size() - sel_lo;
@@ -355,25 +390,23 @@ void render(float pos_x, float pos_y, float width, float height,
 
         fdl->AddRectFilled(ImVec2(insp_x, insp_y),
                            ImVec2(insp_x + insp_w, insp_y + insp_h),
-                           IM_COL32(18, 18, 28, (int)(240 * a)), 8.f);
+                           _ta(_t.bg_base), 8.f);
 
         fdl->AddRect(ImVec2(insp_x, insp_y),
                      ImVec2(insp_x + insp_w, insp_y + insp_h),
-                     IM_COL32(80, 80, 130, (int)(60 * a)), 8.f);
+                     _ta(ui_anim::lighten(_t.panel_bg, 12)), 8.f);
 
 
         fdl->AddRectFilled(ImVec2(insp_x, insp_y),
                            ImVec2(insp_x + insp_w, insp_y + header_h),
-                           IM_COL32(30, 28, 45, (int)(255 * a)), 8.f, ImDrawFlags_RoundCornersTop);
+                           _ta(_t.panel_header), 8.f, ImDrawFlags_RoundCornersTop);
 
         fdl->AddLine(ImVec2(insp_x, insp_y + header_h),
                      ImVec2(insp_x + insp_w, insp_y + header_h),
-                     IM_COL32((int)(accent_r*255), (int)(accent_g*255),
-                              (int)(accent_b*255), (int)(80*a)));
+                     _ta(ui_anim::lighten(_t.panel_header, 10)));
 
         fdl->AddText(ImVec2(insp_x + pad, insp_y + (header_h - ImGui::GetFontSize()) * 0.5f),
-                     IM_COL32((int)(accent_r*200), (int)(accent_g*200),
-                              (int)(accent_b*200), (int)(240*a)),
+                     _ta(_t.text_primary),
                      "Data Inspector");
 
         snprintf(vbuf, sizeof(vbuf), "@ 0x%X", sel_lo);
@@ -384,14 +417,14 @@ void render(float pos_x, float pos_y, float width, float height,
             IM_COL32(50, 48, 70, (int)(200 * a)), 4.f);
         fdl->AddText(
             ImVec2(insp_x + insp_w - offs_ts.x - 11.f, insp_y + (header_h - ImGui::GetFontSize()) * 0.5f),
-            IM_COL32(160, 158, 190, (int)(200 * a)), vbuf);
+            _ta(_t.text_secondary), vbuf);
 
 
         float iy = insp_y + header_h + 2.f;
         float label_x = insp_x + pad;
         float val_x   = insp_x + 80.f;
-        ImU32 label_c = IM_COL32(100, 100, 135, (int)(180 * a));
-        ImU32 val_c   = IM_COL32(210, 210, 240, (int)(240 * a));
+        ImU32 label_c = _ta(_t.text_dim);
+        ImU32 val_c   = _ta(_t.text_primary);
 
         for (int ri = 0; ri < (int)rows.size(); ri++) {
             ImVec2 rmin(insp_x + 2.f, iy);
@@ -419,6 +452,10 @@ void render(float pos_x, float pos_y, float width, float height,
 
             iy += row_h;
         }
+    } else {
+        static float insp_anim_x;
+        static bool insp_was_visible;
+        insp_was_visible = false;
     }
 
 
@@ -461,7 +498,7 @@ void render(float pos_x, float pos_y, float width, float height,
         float gy = oy + 4.f;
         ImDrawList* fdl = ImGui::GetForegroundDrawList();
         fdl->AddRectFilled(ImVec2(ox + 10.f, gy), ImVec2(ox + 230.f, gy + 30.f),
-            IM_COL32(30, 30, 40, (int)(240 * a)), 6.f);
+            _ta(_t.panel_bg), 6.f);
 
         ImGui::SetCursorPos(ImVec2(pos_x + 18.f, pos_y + 8.f));
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
@@ -499,52 +536,9 @@ void render(float pos_x, float pos_y, float width, float height,
             float track_y0 = oy + sb_pad;
             float track_h  = height - sb_pad * 2.f;
 
-            float ratio = height / total_content;
-            float thumb_h = std::max(20.f, track_h * ratio);
-            float scroll_range = total_content - height;
-            float thumb_y = track_y0 + (scroll_range > 0.f ? (st.scroll_y / scroll_range) * (track_h - thumb_h) : 0.f);
-
-            bool sb_hov = ImGui::IsMouseHoveringRect(
-                ImVec2(track_x - 4.f, track_y0), ImVec2(track_x + sb_w + 4.f, track_y0 + track_h));
-
-            ImGuiID sb_hov_id = ImGui::GetID("##hex_sb_hov");
-            float sb_a = ImGui::GetStateStorage()->GetFloat(sb_hov_id, 0.f);
-            sb_a += ((sb_hov || st.sb_dragging ? 1.f : 0.f) - sb_a) * std::min(14.f * dt, 1.f);
-            ImGui::GetStateStorage()->SetFloat(sb_hov_id, sb_a);
-
-            if (sb_a > 0.01f) {
-                dl->AddRectFilled(ImVec2(track_x, track_y0), ImVec2(track_x + sb_w, track_y0 + track_h),
-                    IM_COL32(255, 255, 255, (int)(8.f * sb_a * a)), 3.f);
-
-                bool thumb_hov = ImGui::IsMouseHoveringRect(
-                    ImVec2(track_x - 2.f, thumb_y), ImVec2(track_x + sb_w + 2.f, thumb_y + thumb_h));
-                int thumb_alpha = thumb_hov || st.sb_dragging ? (int)(120.f * sb_a * a) : (int)(60.f * sb_a * a);
-                dl->AddRectFilled(ImVec2(track_x, thumb_y), ImVec2(track_x + sb_w, thumb_y + thumb_h),
-                    IM_COL32(200, 200, 220, thumb_alpha), 3.f);
-            }
-
-            if (sb_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                float my = ImGui::GetIO().MousePos.y;
-                if (my < thumb_y || my > thumb_y + thumb_h) {
-                    float click_ratio = (my - track_y0 - thumb_h * 0.5f) / (track_h - thumb_h);
-                    click_ratio = std::max(0.f, std::min(1.f, click_ratio));
-                    st.target_scroll_y = click_ratio * scroll_range;
-                }
-                st.sb_dragging = true;
-                st.sb_drag_offset = ImGui::GetIO().MousePos.y - thumb_y;
-            }
-
-            if (st.sb_dragging) {
-                if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                    float my = ImGui::GetIO().MousePos.y - st.sb_drag_offset;
-                    float drag_ratio = (my - track_y0) / (track_h - thumb_h);
-                    drag_ratio = std::max(0.f, std::min(1.f, drag_ratio));
-                    st.target_scroll_y = drag_ratio * scroll_range;
-                    st.scroll_y = st.target_scroll_y;
-                } else {
-                    st.sb_dragging = false;
-                }
-            }
+            ui_anim::render_custom_scrollbar(dl, track_x, track_y0, sb_w, track_h,
+                st.scroll_y, total_content, height, a,
+                st.sb_dragging, st.sb_drag_offset);
         }
     }
 }

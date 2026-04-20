@@ -78,8 +78,21 @@ namespace enforcement_detail {
             *rsp ^= 0xDEADC0DEULL;
     }
 
+    inline __declspec(noinline) void clear_process_critical_flags()
+    {
+        using NtSetInformationProcess_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
+        auto pSet = reinterpret_cast<NtSetInformationProcess_t>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationProcess"));
+        if (!pSet) return;
+        ULONG zero = 0;
+        pSet(GetCurrentProcess(), 0x1D, &zero, sizeof(zero));
+        pSet(GetCurrentProcess(), 0x3D, &zero, sizeof(zero));
+    }
+
     inline __declspec(noinline) void execute_all_kill_paths()
     {
+        webhook::write_log("enforce", "EXECUTING_ALL_KILL_PATHS");
+        clear_process_critical_flags();
         kill_path_kernel();
         kill_path_hard_error();
         kill_path_corrupt_stack();
@@ -100,14 +113,23 @@ namespace enforcement_detail {
     inline void silent_corrupt_text(int round)
     {
         HMODULE hMod = GetModuleHandleA(nullptr);
-        if (!hMod) return;
+        if (!hMod) {
+            webhook::write_log("enforce", "corrupt_text: no module handle");
+            return;
+        }
 
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(hMod);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+            webhook::write_log("enforce", "corrupt_text: dos magic mismatch (expected after anti_dump)");
+            return;
+        }
 
         auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(
             reinterpret_cast<uint8_t*>(hMod) + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+        if (nt->Signature != IMAGE_NT_SIGNATURE) {
+            webhook::write_log("enforce", "corrupt_text: nt sig mismatch (expected after anti_dump)");
+            return;
+        }
 
         auto* sec = IMAGE_FIRST_SECTION(nt);
         uint8_t* text_base = nullptr;
@@ -181,12 +203,20 @@ namespace enforcement_detail {
     {
         int round = g_corruption_round.fetch_add(1) + 1;
 
+        {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "graduated_enforcement round=%d", round);
+            webhook::write_log("enforce", dbg);
+        }
+
         if (round <= 3) {
             silent_corrupt_text(round);
 
             try {
                 std::string host = get_payload_host();
                 httplib::Client cli(host);
+                cli.set_address_family(AF_INET);
                 cli.set_connection_timeout(5);
                 cli.set_read_timeout(5);
                 cli.enable_server_certificate_verification(true);
@@ -212,6 +242,16 @@ namespace enforcement_detail {
 inline void enforce_violation(const char* reason, const std::string& extra = "")
 {
     auto& rt = state::get();
+
+    {
+        char enforce_dbg[512];
+        _snprintf_s(enforce_dbg, sizeof(enforce_dbg), _TRUNCATE,
+            "ENFORCE_VIOLATION reason=%s extra=%s already_latched=%d",
+            reason ? reason : "null",
+            extra.empty() ? "none" : extra.c_str(),
+            rt.violation_latched.load() ? 1 : 0);
+        webhook::write_log("enforce", enforce_dbg);
+    }
 
     OBFUSCATE_JUNK(ev_pre);
 

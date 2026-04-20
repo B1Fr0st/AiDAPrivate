@@ -1,20 +1,17 @@
 'use strict';
 
-// Phase 6: server crypto unit tests. Uses Node's built-in node:test runner
-// so no new dependencies are required. Run with `npm test` from /server.
 
 const test    = require('node:test');
 const assert  = require('node:assert/strict');
 const crypto  = require('crypto');
 
-// Environment setup — must happen BEFORE requiring modules that read env at import.
+
 process.env.ARC_MASTER_SECRET    = process.env.ARC_MASTER_SECRET
     || 'a'.repeat(32) + 'test-secret-only-for-unit-tests';
 process.env.SERVER_MASTER_KEY_B64 = process.env.SERVER_MASTER_KEY_B64
     || crypto.randomBytes(32).toString('base64');
 
-// Generate a fresh Ed25519 keypair for signing tests (in DER/PKCS8 to match
-// signing.js expectations).
+
 {
     const { privateKey } = crypto.generateKeyPairSync('ed25519');
     process.env.ED25519_PRIVATE_KEY_B64 = privateKey.export({
@@ -26,7 +23,6 @@ const arc     = require('../crypto/arc-encrypt.js');
 const kwWrap  = require('../crypto/kw_wrap.js');
 const signing = require('../crypto/signing.js');
 
-// ─── arc-encrypt round-trip ───────────────────────────────────────────────────
 
 test('arc encrypt → decrypt yields original plaintext', () => {
     const pt = Buffer.from('hello-aida-fortress-phase6', 'utf8');
@@ -39,7 +35,7 @@ test('arc encrypt → decrypt yields original plaintext', () => {
     assert.equal(iv.length, 12);
     assert.equal(authTag.length, 16);
 
-    // Manual decrypt using the same derivation:
+
     const key = arc.deriveSessionKey(sess, hwid, issuedAt);
     const dec = crypto.createDecipheriv('aes-256-gcm', key, iv);
     dec.setAuthTag(authTag);
@@ -64,7 +60,6 @@ test('arc decrypt fails on tampered authTag', () => {
     });
 });
 
-// ─── Kw wrap / unwrap ─────────────────────────────────────────────────────────
 
 test('kw_wrap.wrap then unwrap recovers plaintext', () => {
     const kw = crypto.randomBytes(32);
@@ -88,7 +83,6 @@ test('kw_wrap.unwrap fails on truncated blob', () => {
     assert.throws(() => kwWrap.unwrap(blob.subarray(0, 10)));
 });
 
-// ─── Signing round-trip ───────────────────────────────────────────────────────
 
 test('signPayload produces verifiable Ed25519 signature', () => {
     const payload = {
@@ -102,7 +96,7 @@ test('signPayload produces verifiable Ed25519 signature', () => {
     const sig = Buffer.from(hex, 'hex');
     assert.equal(sig.length, 64);
 
-    // Verify using the same private key's derived public key.
+
     const priv = signing.getSigningPrivateKey();
     const pub  = crypto.createPublicKey(priv);
     const canonical = JSON.stringify(signing.sortObjectKeys(payload));
@@ -122,7 +116,6 @@ test('signPayload rejects tampered payload', () => {
     assert.equal(ok, false);
 });
 
-// ─── Canonical key ordering (required for cross-platform verification) ────────
 
 test('sortObjectKeys is stable regardless of input order', () => {
     const a = signing.sortObjectKeys({ c: 3, a: 1, b: 2 });
@@ -130,7 +123,6 @@ test('sortObjectKeys is stable regardless of input order', () => {
     assert.equal(JSON.stringify(a), JSON.stringify(b));
 });
 
-// ─── dualSignPayload ──────────────────────────────────────────────────────────
 
 test('dualSignPayload returns single signature when no next key configured', () => {
     delete process.env.ED25519_NEXT_PRIVATE_KEY_B64;
@@ -146,12 +138,12 @@ test('dualSignPayload returns single signature when no next key configured', () 
 });
 
 test('dualSignPayload returns both signatures during overlap window', () => {
-    // Generate a second keypair for the next key
+
     const { privateKey: nextPriv } = crypto.generateKeyPairSync('ed25519');
     process.env.ED25519_NEXT_PRIVATE_KEY_B64 = nextPriv.export({
         format: 'der', type: 'pkcs8',
     }).toString('base64');
-    // Set next key activation to 12h from now (inside the 24h overlap)
+
     process.env.ED25519_NEXT_NOT_BEFORE = String(
         Math.floor(Date.now() / 1000) + 43200
     );
@@ -166,7 +158,7 @@ test('dualSignPayload returns both signatures during overlap window', () => {
     assert.equal(Buffer.from(result.next_signature, 'hex').length, 64);
     assert.notEqual(result.signature, result.next_signature);
 
-    // Verify the next signature with the next key's public
+
     const nextPub = crypto.createPublicKey(nextPriv);
     const canonical = JSON.stringify(signing.sortObjectKeys(payload));
     const ok = crypto.verify(
@@ -175,7 +167,7 @@ test('dualSignPayload returns both signatures during overlap window', () => {
     );
     assert.equal(ok, true);
 
-    // Cleanup
+
     delete process.env.ED25519_NEXT_PRIVATE_KEY_B64;
     delete process.env.ED25519_NEXT_NOT_BEFORE;
     signing.clearKeyCache();
@@ -186,7 +178,7 @@ test('dualSignPayload omits next_signature when outside overlap window', () => {
     process.env.ED25519_NEXT_PRIVATE_KEY_B64 = nextPriv.export({
         format: 'der', type: 'pkcs8',
     }).toString('base64');
-    // Set activation far in the future (beyond 24h overlap)
+
     process.env.ED25519_NEXT_NOT_BEFORE = String(
         Math.floor(Date.now() / 1000) + 200000
     );
@@ -204,7 +196,7 @@ test('clearKeyCache forces re-read of env vars', () => {
     const payload = { x: 1 };
     const sig1 = signing.dualSignPayload(payload).signature;
 
-    // Generate a completely new primary key
+
     const { privateKey: newPriv } = crypto.generateKeyPairSync('ed25519');
     process.env.ED25519_PRIVATE_KEY_B64 = newPriv.export({
         format: 'der', type: 'pkcs8',
@@ -215,7 +207,6 @@ test('clearKeyCache forces re-read of env vars', () => {
     assert.notEqual(sig1, sig2, 'Signature should differ after key rotation');
 });
 
-// ─── TLS exporter ─────────────────────────────────────────────────────────────
 
 const tls = require('../crypto/tls_exporter.js');
 
@@ -225,14 +216,14 @@ test('deriveExpected produces deterministic HMAC from hex secret', () => {
     const b = tls.deriveExpected(secretHex);
     assert.equal(a, b);
     assert.equal(typeof a, 'string');
-    assert.equal(a.length, 64); // sha256 hex = 64 chars
+    assert.equal(a.length, 64);
 });
 
 test('deriveExpected returns null for invalid inputs', () => {
     assert.equal(tls.deriveExpected(null), null);
     assert.equal(tls.deriveExpected(''), null);
     assert.equal(tls.deriveExpected('not-hex!!'), null);
-    assert.equal(tls.deriveExpected('ab'), null); // too short
+    assert.equal(tls.deriveExpected('ab'), null);
     assert.equal(tls.deriveExpected(123), null);
 });
 

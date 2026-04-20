@@ -1,0 +1,98 @@
+- generic [active] [ref=e1]:
+  - navigation [ref=e2]:
+    - link "VERGILIUS" [ref=e3] [cursor=pointer]:
+      - /url: /
+    - list [ref=e5]:
+      - listitem [ref=e6]:
+        - link "HOME" [ref=e7] [cursor=pointer]:
+          - /url: /
+      - listitem [ref=e8]:
+        - button "KERNELS" [ref=e9] [cursor=pointer]
+      - listitem [ref=e10]:
+        - link "ABOUT" [ref=e11] [cursor=pointer]:
+          - /url: /about
+  - generic [ref=e12]:
+    - navigation "breadcrumb" [ref=e15]:
+      - list [ref=e16]:
+        - listitem [ref=e17]:
+          - link "> Home" [ref=e18] [cursor=pointer]:
+            - /url: /
+        - listitem [ref=e19]:
+          - text: /
+          - link "Kernels" [ref=e20] [cursor=pointer]:
+            - /url: /kernels
+        - listitem [ref=e21]:
+          - text: /
+          - link "x64" [ref=e22] [cursor=pointer]:
+            - /url: /kernels/x64
+        - listitem [ref=e23]: / Windows 11
+    - generic [ref=e28]:
+      - heading "Windows 11" [level=2] [ref=e29]
+      - generic [ref=e31]:
+        - generic [ref=e34]:
+          - link [ref=e37] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2
+          - generic [ref=e38]:
+            - link "25H2 (2025 Update, Germanium R2)" [ref=e39] [cursor=pointer]:
+              - /url: /kernels/x64/windows-11/25h2
+            - paragraph [ref=e40]: "build: 10.0.26200.6584"
+            - paragraph [ref=e41]: "date: 2025-09-15"
+        - generic [ref=e44]:
+          - link [ref=e47] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/24h2
+          - generic [ref=e48]:
+            - link "24H2 | Server 2025 (2024 Update, Germanium R1)" [ref=e49] [cursor=pointer]:
+              - /url: /kernels/x64/windows-11/24h2
+            - paragraph [ref=e50]: "build: 10.0.26100.1742"
+            - paragraph [ref=e51]: "date: 2024-09-06"
+        - generic [ref=e54]:
+          - link [ref=e57] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/23h2
+          - generic [ref=e58]:
+            - link "23H2 (2023 Update, Nickel R2)" [ref=e59] [cursor=pointer]:
+              - /url: /kernels/x64/windows-11/23h2
+            - paragraph [ref=e60]: "build: 10.0.22631.2428"
+            - paragraph [ref=e61]: "date: 2023-10-01"
+        - generic [ref=e64]:
+          - link [ref=e67] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/22h2
+          - generic [ref=e68]:
+            - link "22H2 (2022 Update, Nickel R1)" [ref=e69] [cursor=pointer]:
+              - /url: /kernels/x64/windows-11/22h2
+            - paragraph [ref=e70]: "build: 10.0.22621.382"
+            - paragraph [ref=e71]: "date: 2022-08-06"
+        - generic [ref=e74]:
+          - link [ref=e77] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/21h2
+          - generic [ref=e78]:
+            - link "21H2 (Original Release, Cobalt)" [ref=e79] [cursor=pointer]:
+              - /url: /kernels/x64/windows-11/21h2
+            - paragraph [ref=e80]: "build: 10.0.22000.194"
+            - paragraph [ref=e81]: "date: 2021-09-13"
+        - generic [ref=e84]:
+          - link [ref=e87] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/insider-preview-jun-2021
+          - generic [ref=e88]:
+            - link "Insider Preview (Jun 2021)" [ref=e89] [cursor=pointer]:
+              - /url: /kernels/x64/windows-11/insider-preview-jun-2021
+            - paragraph [ref=e90]: "build: 10.0.22000.1"
+            - paragraph [ref=e91]: "date: 2021-06-05"
+  - contentinfo [ref=e92]:
+    - generic [ref=e94]:
+      - generic [ref=e95]:
+        - link "Terms of Service" [ref=e96] [cursor=pointer]:
+          - /url: /terms
+          - strong [ref=e97]: Terms of Service
+        - text: "|"
+        - link "Privacy Policy" [ref=e98] [cursor=pointer]:
+          - /url: /privacy
+          - strong [ref=e99]: Privacy Policy
+        - text: "|"
+        - link "Report a Bug" [ref=e100] [cursor=pointer]:
+          - /url: https://github.com/VergiliusProject/vergilius-project/issues
+          - strong [ref=e101]: Report a Bug
+        - text: "| © 2018-2025 Copyright"
+        - link "VergiliusProject" [ref=e102] [cursor=pointer]:
+          - /url: https://github.com/VergiliusProject
+          - strong [ref=e103]: VergiliusProject
+      - generic [ref=e104]: revision 24c124f

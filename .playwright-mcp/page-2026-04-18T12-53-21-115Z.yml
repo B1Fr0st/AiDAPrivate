@@ -1,0 +1,562 @@
+- generic [active] [ref=e1]:
+  - navigation [ref=e2]:
+    - link "VERGILIUS" [ref=e3] [cursor=pointer]:
+      - /url: /
+    - list [ref=e5]:
+      - listitem [ref=e6]:
+        - link "HOME" [ref=e7] [cursor=pointer]:
+          - /url: /
+      - listitem [ref=e8]:
+        - button "KERNELS" [ref=e9] [cursor=pointer]
+      - listitem [ref=e10]:
+        - link "ABOUT" [ref=e11] [cursor=pointer]:
+          - /url: /about
+  - generic [ref=e12]:
+    - navigation "breadcrumb" [ref=e15]:
+      - list [ref=e16]:
+        - listitem [ref=e17]:
+          - link "> Home" [ref=e18] [cursor=pointer]:
+            - /url: /
+        - listitem [ref=e19]:
+          - text: /
+          - link "Kernels" [ref=e20] [cursor=pointer]:
+            - /url: /kernels
+        - listitem [ref=e21]:
+          - text: /
+          - link "x64" [ref=e22] [cursor=pointer]:
+            - /url: /kernels/x64
+        - listitem [ref=e23]:
+          - text: /
+          - link "Windows 11" [ref=e24] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11
+        - listitem [ref=e25]:
+          - text: /
+          - link "25H2 (2025 Update, Germanium R2)" [ref=e26] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2
+        - listitem [ref=e27]: / _EPROCESS
+    - generic [ref=e30]:
+      - heading "_EPROCESS" [level=2] [ref=e33]
+      - generic [ref=e35]:
+        - generic [ref=e37]:
+          - link "Windows 11 24H2 | Server 2025 (2024 Update, Germanium R1)" [ref=e40] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/24h2/_EPROCESS
+          - link "Windows 11 25H2 (2025 Update, Germanium R2)" [ref=e43] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EPROCESS
+          - generic [ref=e45]: Next
+        - generic [ref=e46]:
+          - link [ref=e49] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/24h2/_EPROCESS
+          - link [ref=e53] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EPROCESS
+          - generic [ref=e54]:
+            - link:
+              - /url: "#"
+      - code [ref=e60]:
+        - button "copy" [ref=e61] [cursor=pointer]
+        - generic [ref=e62]:
+          - text: //0x840 bytes (sizeof)
+          - generic [ref=e63]: "struct _EPROCESS {"
+          - generic [ref=e64]: struct
+          - link "_KPROCESS" [ref=e65] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KPROCESS
+            - generic [ref=e66]: _KPROCESS
+          - generic [ref=e67]: Pcb;
+          - text: //0x0
+          - generic [ref=e68]: struct
+          - link "_EX_PUSH_LOCK" [ref=e69] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EX_PUSH_LOCK
+            - generic [ref=e70]: _EX_PUSH_LOCK
+          - generic [ref=e71]: ProcessLock;
+          - text: //0x1c8 VOID* UniqueProcessId; //0x1d0
+          - generic [ref=e72]: struct
+          - link "_LIST_ENTRY" [ref=e73] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e74]: _LIST_ENTRY
+          - generic [ref=e75]: ActiveProcessLinks;
+          - text: //0x1d8
+          - generic [ref=e76]: struct
+          - link "_EX_RUNDOWN_REF" [ref=e77] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EX_RUNDOWN_REF
+            - generic [ref=e78]: _EX_RUNDOWN_REF
+          - generic [ref=e79]: RundownProtect;
+          - text: "//0x1e8 union { ULONG Flags2; //0x1f0"
+          - generic [ref=e80]: "struct {"
+          - text: "ULONG JobNotReallyActive:1; //0x1f0 ULONG AccountingFolded:1; //0x1f0 ULONG NewProcessReported:1; //0x1f0 ULONG ExitProcessReported:1; //0x1f0 ULONG ReportCommitChanges:1; //0x1f0 ULONG LastReportMemory:1; //0x1f0 ULONG ForceWakeCharge:1; //0x1f0 ULONG CrossSessionCreate:1; //0x1f0 ULONG NeedsHandleRundown:1; //0x1f0 ULONG RefTraceEnabled:1; //0x1f0 ULONG PicoCreated:1; //0x1f0 ULONG EmptyJobEvaluated:1; //0x1f0 ULONG DefaultPagePriority:3; //0x1f0 ULONG PrimaryTokenFrozen:1; //0x1f0 ULONG ProcessVerifierTarget:1; //0x1f0 ULONG RestrictSetThreadContext:1; //0x1f0 ULONG AffinityPermanent:1; //0x1f0 ULONG AffinityUpdateEnable:1; //0x1f0 ULONG PropagateNode:1; //0x1f0 ULONG ExplicitAffinity:1; //0x1f0 ULONG Flags2Available1:2; //0x1f0 ULONG EnableReadVmLogging:1; //0x1f0 ULONG EnableWriteVmLogging:1; //0x1f0 ULONG FatalAccessTerminationRequested:1; //0x1f0 ULONG DisableSystemAllowedCpuSet:1; //0x1f0 ULONG Flags2Available2:3; //0x1f0 ULONG InPrivate:1; //0x1f0 }; }; union { ULONG Flags; //0x1f4"
+          - generic [ref=e81]: "struct {"
+          - text: "ULONG CreateReported:1; //0x1f4 ULONG NoDebugInherit:1; //0x1f4 ULONG ProcessExiting:1; //0x1f4 ULONG ProcessDelete:1; //0x1f4 ULONG ManageExecutableMemoryWrites:1; //0x1f4 ULONG VmDeleted:1; //0x1f4 ULONG OutswapEnabled:1; //0x1f4 ULONG Outswapped:1; //0x1f4 ULONG FailFastOnCommitFail:1; //0x1f4 ULONG Wow64VaSpace4Gb:1; //0x1f4 ULONG AddressSpaceInitialized:2; //0x1f4 ULONG SetTimerResolution:1; //0x1f4 ULONG BreakOnTermination:1; //0x1f4 ULONG DeprioritizeViews:1; //0x1f4 ULONG WriteWatch:1; //0x1f4 ULONG ProcessInSession:1; //0x1f4 ULONG OverrideAddressSpace:1; //0x1f4 ULONG HasAddressSpace:1; //0x1f4 ULONG LaunchPrefetched:1; //0x1f4 ULONG Reserved:1; //0x1f4 ULONG VmTopDown:1; //0x1f4 ULONG ImageNotifyDone:1; //0x1f4 ULONG PdeUpdateNeeded:1; //0x1f4 ULONG VdmAllowed:1; //0x1f4 ULONG ProcessRundown:1; //0x1f4 ULONG ProcessInserted:1; //0x1f4 ULONG DefaultIoPriority:3; //0x1f4 ULONG ProcessSelfDelete:1; //0x1f4 ULONG SetTimerResolutionLink:1; //0x1f4 }; }; union"
+          - link "_LARGE_INTEGER" [ref=e82] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LARGE_INTEGER
+          - text: CreateTime; //0x1f8 ULONGLONG ProcessQuotaUsage[2]; //0x200 ULONGLONG ProcessQuotaPeak[2]; //0x210 ULONGLONG PeakVirtualSize; //0x220 ULONGLONG VirtualSize; //0x228
+          - generic [ref=e83]: struct
+          - link "_LIST_ENTRY" [ref=e84] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e85]: _LIST_ENTRY
+          - generic [ref=e86]: SessionProcessLinks;
+          - text: "//0x230 union { VOID* ExceptionPortData; //0x240 ULONGLONG ExceptionPortValue; //0x240 ULONGLONG ExceptionPortState:3; //0x240 };"
+          - generic [ref=e87]: struct
+          - link "_EX_FAST_REF" [ref=e88] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EX_FAST_REF
+            - generic [ref=e89]: _EX_FAST_REF
+          - generic [ref=e90]: Token;
+          - text: //0x248 ULONGLONG MmReserved; //0x250
+          - generic [ref=e91]: struct
+          - link "_EX_PUSH_LOCK" [ref=e92] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EX_PUSH_LOCK
+            - generic [ref=e93]: _EX_PUSH_LOCK
+          - generic [ref=e94]: AddressCreationLock;
+          - text: //0x258
+          - generic [ref=e95]: struct
+          - link "_EX_PUSH_LOCK" [ref=e96] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EX_PUSH_LOCK
+            - generic [ref=e97]: _EX_PUSH_LOCK
+          - generic [ref=e98]: PageTableCommitmentLock;
+          - text: //0x260
+          - generic [ref=e99]: struct
+          - link "_ETHREAD" [ref=e100] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_ETHREAD
+            - generic [ref=e101]: _ETHREAD
+          - generic [ref=e102]: "* RotateInProgress;"
+          - text: //0x268
+          - generic [ref=e103]: struct
+          - link "_ETHREAD" [ref=e104] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_ETHREAD
+            - generic [ref=e105]: _ETHREAD
+          - generic [ref=e106]: "* ForkInProgress;"
+          - text: //0x270
+          - generic [ref=e107]: struct
+          - link "_EJOB" [ref=e108] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EJOB
+            - generic [ref=e109]: _EJOB
+          - generic [ref=e110]: "* volatile CommitChargeJob;"
+          - text: //0x278
+          - generic [ref=e111]: struct
+          - link "_RTL_AVL_TREE" [ref=e112] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_RTL_AVL_TREE
+            - generic [ref=e113]: _RTL_AVL_TREE
+          - generic [ref=e114]: CloneRoot;
+          - text: //0x280 volatile ULONGLONG NumberOfPrivatePages; //0x288 volatile ULONGLONG NumberOfLockedPages; //0x290 VOID* Win32Process; //0x298
+          - generic [ref=e115]: struct
+          - link "_EJOB" [ref=e116] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EJOB
+            - generic [ref=e117]: _EJOB
+          - generic [ref=e118]: "* volatile Job;"
+          - text: //0x2a0 VOID* SectionObject; //0x2a8 VOID* SectionBaseAddress; //0x2b0 ULONG Cookie; //0x2b8
+          - generic [ref=e119]: struct
+          - link "_PAGEFAULT_HISTORY" [ref=e120] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_PAGEFAULT_HISTORY
+            - generic [ref=e121]: _PAGEFAULT_HISTORY
+          - generic [ref=e122]: "* WorkingSetWatch;"
+          - text: //0x2c0 VOID* Win32WindowStation; //0x2c8 VOID* InheritedFromUniqueProcessId; //0x2d0 volatile ULONGLONG OwnerProcessId; //0x2d8
+          - generic [ref=e123]: struct
+          - link "_PEB" [ref=e124] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_PEB
+            - generic [ref=e125]: _PEB
+          - generic [ref=e126]: "* Peb;"
+          - text: //0x2e0
+          - generic [ref=e127]: struct
+          - link "_PSP_SESSION_SPACE" [ref=e128] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_PSP_SESSION_SPACE
+            - generic [ref=e129]: _PSP_SESSION_SPACE
+          - generic [ref=e130]: "* Session;"
+          - text: //0x2e8 VOID* Spare1; //0x2f0
+          - generic [ref=e131]: struct
+          - link "_EPROCESS_QUOTA_BLOCK" [ref=e132] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EPROCESS_QUOTA_BLOCK
+            - generic [ref=e133]: _EPROCESS_QUOTA_BLOCK
+          - generic [ref=e134]: "* QuotaBlock;"
+          - text: //0x2f8
+          - generic [ref=e135]: struct
+          - link "_HANDLE_TABLE" [ref=e136] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_HANDLE_TABLE
+            - generic [ref=e137]: _HANDLE_TABLE
+          - generic [ref=e138]: "* ObjectTable;"
+          - text: //0x300 VOID* DebugPort; //0x308
+          - generic [ref=e139]: struct
+          - link "_EWOW64PROCESS" [ref=e140] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EWOW64PROCESS
+            - generic [ref=e141]: _EWOW64PROCESS
+          - generic [ref=e142]: "* WoW64Process;"
+          - text: //0x310
+          - generic [ref=e143]: struct
+          - link "_EX_FAST_REF" [ref=e144] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EX_FAST_REF
+            - generic [ref=e145]: _EX_FAST_REF
+          - generic [ref=e146]: DeviceMap;
+          - text: //0x318 VOID* EtwDataSource; //0x320 ULONGLONG PageDirectoryPte; //0x328
+          - generic [ref=e147]: struct
+          - link "_FILE_OBJECT" [ref=e148] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_FILE_OBJECT
+            - generic [ref=e149]: _FILE_OBJECT
+          - generic [ref=e150]: "* ImageFilePointer;"
+          - text: //0x330 UCHAR ImageFileName[15]; //0x338 UCHAR PriorityClass; //0x347 VOID* SecurityPort; //0x348
+          - generic [ref=e151]: struct
+          - link "_SE_AUDIT_PROCESS_CREATION_INFO" [ref=e152] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_SE_AUDIT_PROCESS_CREATION_INFO
+            - generic [ref=e153]: _SE_AUDIT_PROCESS_CREATION_INFO
+          - generic [ref=e154]: SeAuditProcessCreationInfo;
+          - text: //0x350
+          - generic [ref=e155]: struct
+          - link "_LIST_ENTRY" [ref=e156] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e157]: _LIST_ENTRY
+          - generic [ref=e158]: JobLinks;
+          - text: //0x358 VOID* HighestUserAddress; //0x368
+          - generic [ref=e159]: struct
+          - link "_LIST_ENTRY" [ref=e160] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e161]: _LIST_ENTRY
+          - generic [ref=e162]: ThreadListHead;
+          - text: //0x370 volatile ULONG ActiveThreads; //0x380 ULONG ImagePathHash; //0x384 ULONG DefaultHardErrorProcessing; //0x388 LONG LastThreadExitStatus; //0x38c
+          - generic [ref=e163]: struct
+          - link "_EX_FAST_REF" [ref=e164] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EX_FAST_REF
+            - generic [ref=e165]: _EX_FAST_REF
+          - generic [ref=e166]: PrefetchTrace;
+          - text: //0x390 VOID* LockedPagesList; //0x398 union
+          - link "_LARGE_INTEGER" [ref=e167] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LARGE_INTEGER
+          - text: ReadOperationCount; //0x3a0 union
+          - link "_LARGE_INTEGER" [ref=e168] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LARGE_INTEGER
+          - text: WriteOperationCount; //0x3a8 union
+          - link "_LARGE_INTEGER" [ref=e169] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LARGE_INTEGER
+          - text: OtherOperationCount; //0x3b0 union
+          - link "_LARGE_INTEGER" [ref=e170] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LARGE_INTEGER
+          - text: ReadTransferCount; //0x3b8 union
+          - link "_LARGE_INTEGER" [ref=e171] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LARGE_INTEGER
+          - text: WriteTransferCount; //0x3c0 union
+          - link "_LARGE_INTEGER" [ref=e172] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LARGE_INTEGER
+          - text: OtherTransferCount; //0x3c8 ULONGLONG CommitChargeLimit; //0x3d0 volatile ULONGLONG CommitCharge; //0x3d8 volatile ULONGLONG CommitChargePeak; //0x3e0
+          - generic [ref=e173]: struct
+          - link "_MMSUPPORT_FULL" [ref=e174] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_MMSUPPORT_FULL
+            - generic [ref=e175]: _MMSUPPORT_FULL
+          - generic [ref=e176]: Vm;
+          - text: //0x400
+          - generic [ref=e177]: struct
+          - link "_LIST_ENTRY" [ref=e178] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e179]: _LIST_ENTRY
+          - generic [ref=e180]: MmProcessLinks;
+          - text: //0x540 volatile ULONG ModifiedPageCount; //0x550 LONG ExitStatus; //0x554
+          - generic [ref=e181]: struct
+          - link "_RTL_AVL_TREE" [ref=e182] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_RTL_AVL_TREE
+            - generic [ref=e183]: _RTL_AVL_TREE
+          - generic [ref=e184]: VadRoot;
+          - text: //0x558 VOID* VadHint; //0x560 ULONGLONG VadCount; //0x568 volatile ULONGLONG VadPhysicalPages; //0x570 ULONGLONG VadPhysicalPagesLimit; //0x578
+          - generic [ref=e185]: struct
+          - link "_ALPC_PROCESS_CONTEXT" [ref=e186] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_ALPC_PROCESS_CONTEXT
+            - generic [ref=e187]: _ALPC_PROCESS_CONTEXT
+          - generic [ref=e188]: AlpcContext;
+          - text: //0x580
+          - generic [ref=e189]: struct
+          - link "_LIST_ENTRY" [ref=e190] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e191]: _LIST_ENTRY
+          - generic [ref=e192]: TimerResolutionLink;
+          - text: //0x5a0
+          - generic [ref=e193]: struct
+          - link "_PO_DIAG_STACK_RECORD" [ref=e194] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_PO_DIAG_STACK_RECORD
+            - generic [ref=e195]: _PO_DIAG_STACK_RECORD
+          - generic [ref=e196]: "* TimerResolutionStackRecord;"
+          - text: //0x5b0 ULONG RequestedTimerResolution; //0x5b8 ULONG SmallestTimerResolution; //0x5bc union
+          - link "_LARGE_INTEGER" [ref=e197] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LARGE_INTEGER
+          - text: ExitTime; //0x5c0
+          - generic [ref=e198]: struct
+          - link "_INVERTED_FUNCTION_TABLE_KERNEL_MODE" [ref=e199] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_INVERTED_FUNCTION_TABLE_KERNEL_MODE
+            - generic [ref=e200]: _INVERTED_FUNCTION_TABLE_KERNEL_MODE
+          - generic [ref=e201]: "* InvertedFunctionTable;"
+          - text: //0x5c8
+          - generic [ref=e202]: struct
+          - link "_EX_PUSH_LOCK" [ref=e203] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EX_PUSH_LOCK
+            - generic [ref=e204]: _EX_PUSH_LOCK
+          - generic [ref=e205]: InvertedFunctionTableLock;
+          - text: //0x5d0 ULONG ActiveThreadsHighWatermark; //0x5d8 ULONG LargePrivateVadCount; //0x5dc
+          - generic [ref=e206]: struct
+          - link "_EX_PUSH_LOCK" [ref=e207] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EX_PUSH_LOCK
+            - generic [ref=e208]: _EX_PUSH_LOCK
+          - generic [ref=e209]: ThreadListLock;
+          - text: //0x5e0 VOID* WnfContext; //0x5e8
+          - generic [ref=e210]: struct
+          - link "_EJOB" [ref=e211] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EJOB
+            - generic [ref=e212]: _EJOB
+          - generic [ref=e213]: "* ServerSilo;"
+          - text: //0x5f0 UCHAR SignatureLevel; //0x5f8 UCHAR SectionSignatureLevel; //0x5f9
+          - generic [ref=e214]: struct
+          - link "_PS_PROTECTION" [ref=e215] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_PS_PROTECTION
+            - generic [ref=e216]: _PS_PROTECTION
+          - generic [ref=e217]: Protection;
+          - text: "//0x5fa UCHAR HangCount:3; //0x5fb UCHAR GhostCount:3; //0x5fb UCHAR PrefilterException:1; //0x5fb union { ULONG Flags3; //0x5fc"
+          - generic [ref=e218]: "struct {"
+          - text: "ULONG Minimal:1; //0x5fc ULONG ReplacingPageRoot:1; //0x5fc ULONG Crashed:1; //0x5fc ULONG JobVadsAreTracked:1; //0x5fc ULONG VadTrackingDisabled:1; //0x5fc ULONG AuxiliaryProcess:1; //0x5fc ULONG SubsystemProcess:1; //0x5fc ULONG IndirectCpuSets:1; //0x5fc ULONG RelinquishedCommit:1; //0x5fc ULONG HighGraphicsPriority:1; //0x5fc ULONG CommitFailLogged:1; //0x5fc ULONG ReserveFailLogged:1; //0x5fc ULONG SystemProcess:1; //0x5fc ULONG AllImagesAtBasePristineBase:1; //0x5fc ULONG AddressPolicyFrozen:1; //0x5fc ULONG ProcessFirstResume:1; //0x5fc ULONG ForegroundExternal:1; //0x5fc ULONG ForegroundSystem:1; //0x5fc ULONG HighMemoryPriority:1; //0x5fc ULONG EnableProcessSuspendResumeLogging:1; //0x5fc ULONG EnableThreadSuspendResumeLogging:1; //0x5fc ULONG SecurityDomainChanged:1; //0x5fc ULONG SecurityFreezeComplete:1; //0x5fc ULONG VmProcessorHost:1; //0x5fc ULONG VmProcessorHostTransition:1; //0x5fc ULONG AltSyscall:1; //0x5fc ULONG TimerResolutionIgnore:1; //0x5fc ULONG DisallowUserTerminate:1; //0x5fc ULONG EnableProcessRemoteExecProtectVmLogging:1; //0x5fc ULONG EnableProcessLocalExecProtectVmLogging:1; //0x5fc ULONG MemoryCompressionProcess:1; //0x5fc ULONG EnableProcessImpersonationLogging:1; //0x5fc }; }; LONG DeviceAsid; //0x600 VOID* SvmData; //0x608"
+          - generic [ref=e219]: struct
+          - link "_EX_PUSH_LOCK" [ref=e220] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EX_PUSH_LOCK
+            - generic [ref=e221]: _EX_PUSH_LOCK
+          - generic [ref=e222]: SvmProcessLock;
+          - text: //0x610 ULONGLONG SvmLock; //0x618
+          - generic [ref=e223]: struct
+          - link "_LIST_ENTRY" [ref=e224] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e225]: _LIST_ENTRY
+          - generic [ref=e226]: SvmProcessDeviceListHead;
+          - text: //0x620 ULONGLONG LastFreezeInterruptTime; //0x630
+          - generic [ref=e227]: struct
+          - link "_PROCESS_DISK_COUNTERS" [ref=e228] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_PROCESS_DISK_COUNTERS
+            - generic [ref=e229]: _PROCESS_DISK_COUNTERS
+          - generic [ref=e230]: "* DiskCounters;"
+          - text: //0x638 VOID* PicoContext; //0x640 VOID* EnclaveTable; //0x648 ULONGLONG EnclaveNumber; //0x650
+          - generic [ref=e231]: struct
+          - link "_EX_PUSH_LOCK" [ref=e232] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EX_PUSH_LOCK
+            - generic [ref=e233]: _EX_PUSH_LOCK
+          - generic [ref=e234]: EnclaveLock;
+          - text: //0x658 ULONG HighPriorityFaultsAllowed; //0x660
+          - generic [ref=e235]: struct
+          - link "_PO_PROCESS_ENERGY_CONTEXT" [ref=e236] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_PO_PROCESS_ENERGY_CONTEXT
+            - generic [ref=e237]: _PO_PROCESS_ENERGY_CONTEXT
+          - generic [ref=e238]: "* EnergyContext;"
+          - text: //0x668 VOID* VmContext; //0x670 ULONGLONG SequenceNumber; //0x678 ULONGLONG CreateInterruptTime; //0x680 ULONGLONG CreateUnbiasedInterruptTime; //0x688 ULONGLONG TotalUnbiasedFrozenTime; //0x690 ULONGLONG LastAppStateUpdateTime; //0x698 ULONGLONG LastAppStateUptime:61; //0x6a0 ULONGLONG LastAppState:3; //0x6a0 volatile ULONGLONG SharedCommitCharge; //0x6a8
+          - generic [ref=e239]: struct
+          - link "_EX_PUSH_LOCK" [ref=e240] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EX_PUSH_LOCK
+            - generic [ref=e241]: _EX_PUSH_LOCK
+          - generic [ref=e242]: SharedCommitLock;
+          - text: //0x6b0
+          - generic [ref=e243]: struct
+          - link "_LIST_ENTRY" [ref=e244] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e245]: _LIST_ENTRY
+          - generic [ref=e246]: SharedCommitLinks;
+          - text: "//0x6b8 union {"
+          - generic [ref=e247]: "struct {"
+          - text: "ULONGLONG AllowedCpuSets; //0x6c8 ULONGLONG DefaultCpuSets; //0x6d0 };"
+          - generic [ref=e248]: "struct {"
+          - text: "ULONGLONG* AllowedCpuSetsIndirect; //0x6c8 ULONGLONG* DefaultCpuSetsIndirect; //0x6d0 }; }; VOID* DiskIoAttribution; //0x6d8 VOID* DxgProcess; //0x6e0 ULONG Win32KFilterSet; //0x6e8 USHORT Machine; //0x6ec UCHAR MmSlabIdentity; //0x6ee UCHAR Spare0; //0x6ef unionvolatile"
+          - link "_PS_INTERLOCKED_TIMER_DELAY_VALUES" [ref=e249] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_PS_INTERLOCKED_TIMER_DELAY_VALUES
+          - text: ProcessTimerDelay; //0x6f0 volatile ULONG KTimerSets; //0x6f8 volatile ULONG KTimer2Sets; //0x6fc volatile ULONG ThreadTimerSets; //0x700 ULONGLONG VirtualTimerListLock; //0x708
+          - generic [ref=e250]: struct
+          - link "_LIST_ENTRY" [ref=e251] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e252]: _LIST_ENTRY
+          - generic [ref=e253]: VirtualTimerListHead;
+          - text: "//0x710 union {"
+          - generic [ref=e254]: struct
+          - link "_WNF_STATE_NAME" [ref=e255] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_WNF_STATE_NAME
+            - generic [ref=e256]: _WNF_STATE_NAME
+          - generic [ref=e257]: WakeChannel;
+          - text: //0x720
+          - generic [ref=e258]: struct
+          - link "_PS_PROCESS_WAKE_INFORMATION" [ref=e259] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_PS_PROCESS_WAKE_INFORMATION
+            - generic [ref=e260]: _PS_PROCESS_WAKE_INFORMATION
+          - generic [ref=e261]: WakeInfo;
+          - text: "//0x720 }; union { ULONG MitigationFlags; //0x750"
+          - generic [ref=e262]: "struct {"
+          - text: "ULONG ControlFlowGuardEnabled:1; //0x750 ULONG ControlFlowGuardExportSuppressionEnabled:1; //0x750 ULONG ControlFlowGuardStrict:1; //0x750 ULONG DisallowStrippedImages:1; //0x750 ULONG ForceRelocateImages:1; //0x750 ULONG HighEntropyASLREnabled:1; //0x750 ULONG StackRandomizationDisabled:1; //0x750 ULONG ExtensionPointDisable:1; //0x750 ULONG DisableDynamicCode:1; //0x750 ULONG DisableDynamicCodeAllowOptOut:1; //0x750 ULONG DisableDynamicCodeAllowRemoteDowngrade:1; //0x750 ULONG AuditDisableDynamicCode:1; //0x750 ULONG DisallowWin32kSystemCalls:1; //0x750 ULONG AuditDisallowWin32kSystemCalls:1; //0x750 ULONG EnableFilteredWin32kAPIs:1; //0x750 ULONG AuditFilteredWin32kAPIs:1; //0x750 ULONG DisableNonSystemFonts:1; //0x750 ULONG AuditNonSystemFontLoading:1; //0x750 ULONG PreferSystem32Images:1; //0x750 ULONG ProhibitRemoteImageMap:1; //0x750 ULONG AuditProhibitRemoteImageMap:1; //0x750 ULONG ProhibitLowILImageMap:1; //0x750 ULONG AuditProhibitLowILImageMap:1; //0x750 ULONG SignatureMitigationOptIn:1; //0x750 ULONG AuditBlockNonMicrosoftBinaries:1; //0x750 ULONG AuditBlockNonMicrosoftBinariesAllowStore:1; //0x750 ULONG LoaderIntegrityContinuityEnabled:1; //0x750 ULONG AuditLoaderIntegrityContinuity:1; //0x750 ULONG EnableModuleTamperingProtection:1; //0x750 ULONG EnableModuleTamperingProtectionNoInherit:1; //0x750 ULONG RestrictIndirectBranchPrediction:1; //0x750 ULONG IsolateSecurityDomain:1; //0x750 } MitigationFlagsValues; //0x750 }; union { ULONG MitigationFlags2; //0x754"
+          - generic [ref=e263]: "struct {"
+          - text: "ULONG EnableExportAddressFilter:1; //0x754 ULONG AuditExportAddressFilter:1; //0x754 ULONG EnableExportAddressFilterPlus:1; //0x754 ULONG AuditExportAddressFilterPlus:1; //0x754 ULONG EnableRopStackPivot:1; //0x754 ULONG AuditRopStackPivot:1; //0x754 ULONG EnableRopCallerCheck:1; //0x754 ULONG AuditRopCallerCheck:1; //0x754 ULONG EnableRopSimExec:1; //0x754 ULONG AuditRopSimExec:1; //0x754 ULONG EnableImportAddressFilter:1; //0x754 ULONG AuditImportAddressFilter:1; //0x754 ULONG DisablePageCombine:1; //0x754 ULONG SpeculativeStoreBypassDisable:1; //0x754 ULONG CetUserShadowStacks:1; //0x754 ULONG AuditCetUserShadowStacks:1; //0x754 ULONG AuditCetUserShadowStacksLogged:1; //0x754 ULONG UserCetSetContextIpValidation:1; //0x754 ULONG AuditUserCetSetContextIpValidation:1; //0x754 ULONG AuditUserCetSetContextIpValidationLogged:1; //0x754 ULONG CetUserShadowStacksStrictMode:1; //0x754 ULONG BlockNonCetBinaries:1; //0x754 ULONG BlockNonCetBinariesNonEhcont:1; //0x754 ULONG AuditBlockNonCetBinaries:1; //0x754 ULONG AuditBlockNonCetBinariesLogged:1; //0x754 ULONG XtendedControlFlowGuard_Deprecated:1; //0x754 ULONG AuditXtendedControlFlowGuard_Deprecated:1; //0x754 ULONG PointerAuthUserIp:1; //0x754 ULONG AuditPointerAuthUserIp:1; //0x754 ULONG AuditPointerAuthUserIpLogged:1; //0x754 ULONG CetDynamicApisOutOfProcOnly:1; //0x754 ULONG UserCetSetContextIpValidationRelaxedMode:1; //0x754 } MitigationFlags2Values; //0x754 }; VOID* PartitionObject; //0x758 ULONGLONG SecurityDomain; //0x760 ULONGLONG ParentSecurityDomain; //0x768 VOID* CoverageSamplerContext; //0x770 VOID* MmHotPatchContext; //0x778"
+          - generic [ref=e264]: struct
+          - link "_RTL_AVL_TREE" [ref=e265] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_RTL_AVL_TREE
+            - generic [ref=e266]: _RTL_AVL_TREE
+          - generic [ref=e267]: DynamicEHContinuationTargetsTree;
+          - text: //0x780
+          - generic [ref=e268]: struct
+          - link "_EX_PUSH_LOCK" [ref=e269] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EX_PUSH_LOCK
+            - generic [ref=e270]: _EX_PUSH_LOCK
+          - generic [ref=e271]: DynamicEHContinuationTargetsLock;
+          - text: //0x788
+          - generic [ref=e272]: struct
+          - link "_PS_DYNAMIC_ENFORCED_ADDRESS_RANGES" [ref=e273] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_PS_DYNAMIC_ENFORCED_ADDRESS_RANGES
+            - generic [ref=e274]: _PS_DYNAMIC_ENFORCED_ADDRESS_RANGES
+          - generic [ref=e275]: DynamicEnforcedCetCompatibleRanges;
+          - text: //0x790 ULONG DisabledComponentFlags; //0x7a0 volatile LONG PageCombineSequence; //0x7a4
+          - generic [ref=e276]: struct
+          - link "_EX_PUSH_LOCK" [ref=e277] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EX_PUSH_LOCK
+            - generic [ref=e278]: _EX_PUSH_LOCK
+          - generic [ref=e279]: EnableOptionalXStateFeaturesLock;
+          - text: //0x7a8 ULONG* volatile PathRedirectionHashes; //0x7b0
+          - generic [ref=e280]: struct
+          - link "_PS_SYSCALL_PROVIDER" [ref=e281] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_PS_SYSCALL_PROVIDER
+            - generic [ref=e282]: _PS_SYSCALL_PROVIDER
+          - generic [ref=e283]: "* SyscallProvider;"
+          - text: //0x7b8
+          - generic [ref=e284]: struct
+          - link "_LIST_ENTRY" [ref=e285] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e286]: _LIST_ENTRY
+          - generic [ref=e287]: SyscallProviderProcessLinks;
+          - text: //0x7c0
+          - generic [ref=e288]: struct
+          - link "_PSP_SYSCALL_PROVIDER_DISPATCH_CONTEXT" [ref=e289] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_PSP_SYSCALL_PROVIDER_DISPATCH_CONTEXT
+            - generic [ref=e290]: _PSP_SYSCALL_PROVIDER_DISPATCH_CONTEXT
+          - generic [ref=e291]: SyscallProviderDispatchContext;
+          - text: "//0x7d0 union { ULONG MitigationFlags3; //0x7d8"
+          - generic [ref=e292]: "struct {"
+          - text: "ULONG RestrictCoreSharing:1; //0x7d8 ULONG DisallowFsctlSystemCalls:1; //0x7d8 ULONG AuditDisallowFsctlSystemCalls:1; //0x7d8 ULONG MitigationFlags3Spare:29; //0x7d8 } MitigationFlags3Values; //0x7d8 }; union { ULONG Flags4; //0x7dc"
+          - generic [ref=e293]: "struct {"
+          - text: "ULONG ThreadWasActive:1; //0x7dc ULONG MinimalTerminate:1; //0x7dc ULONG ImageExpansionDisable:1; //0x7dc ULONG SessionFirstProcess:1; //0x7dc }; }; union { ULONG SyscallUsage; //0x7e0"
+          - generic [ref=e294]: "struct {"
+          - text: "ULONG SystemModuleInformation:1; //0x7e0 ULONG SystemModuleInformationEx:1; //0x7e0 ULONG SystemLocksInformation:1; //0x7e0 ULONG SystemStackTraceInformation:1; //0x7e0 ULONG SystemHandleInformation:1; //0x7e0 ULONG SystemExtendedHandleInformation:1; //0x7e0 ULONG SystemObjectInformation:1; //0x7e0 ULONG SystemBigPoolInformation:1; //0x7e0 ULONG SystemExtendedProcessInformation:1; //0x7e0 ULONG SystemSessionProcessInformation:1; //0x7e0 ULONG SystemMemoryTopologyInformation:1; //0x7e0 ULONG SystemMemoryChannelInformation:1; //0x7e0 ULONG SystemUnused:1; //0x7e0 ULONG SystemPlatformBinaryInformation:1; //0x7e0 ULONG SystemFirmwareTableInformation:1; //0x7e0 ULONG SystemBootMetadataInformation:1; //0x7e0 ULONG SystemWheaIpmiHardwareInformation:1; //0x7e0 ULONG SystemSuperfetchPrefetch:1; //0x7e0 ULONG SystemSuperfetchPfnQuery:1; //0x7e0 ULONG SystemSuperfetchPrivSourceQuery:1; //0x7e0 ULONG SystemSuperfetchMemoryListQuery:1; //0x7e0 ULONG SystemSuperfetchMemoryRangesQuery:1; //0x7e0 ULONG SystemSuperfetchPfnSetPriority:1; //0x7e0 ULONG SystemSuperfetchMovePages:1; //0x7e0 ULONG SystemSuperfetchPfnSetPageHeat:1; //0x7e0 ULONG SysDbgGetTriageDump:1; //0x7e0 ULONG SysDbgGetLiveKernelDump:1; //0x7e0 ULONG SyscallUsageValuesSpare:5; //0x7e0 } SyscallUsageValues; //0x7e0 }; LONG SupervisorDeviceAsid; //0x7e4 VOID* SupervisorSvmData; //0x7e8"
+          - generic [ref=e295]: struct
+          - link "_PROCESS_NETWORK_COUNTERS" [ref=e296] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_PROCESS_NETWORK_COUNTERS
+            - generic [ref=e297]: _PROCESS_NETWORK_COUNTERS
+          - generic [ref=e298]: "* NetworkCounters;"
+          - text: //0x7f0 union
+          - link "_PROCESS_EXECUTION" [ref=e299] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_PROCESS_EXECUTION
+          - text: Execution; //0x7f8 VOID* ThreadIndexTable; //0x800
+          - generic [ref=e300]: struct
+          - link "_LIST_ENTRY" [ref=e301] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LIST_ENTRY
+            - generic [ref=e302]: _LIST_ENTRY
+          - generic [ref=e303]: FreezeWorkLinks;
+          - text: "//0x808 };"
+    - generic [ref=e306]:
+      - heading "Used in" [level=4] [ref=e307]
+      - list [ref=e309]:
+        - listitem [ref=e310]:
+          - link "_ALPC_COMPLETION_LIST" [ref=e311] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_ALPC_COMPLETION_LIST
+          - text: ","
+          - link "_ALPC_PORT" [ref=e312] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_ALPC_PORT
+          - text: ","
+          - link "_DBGK_SILOSTATE" [ref=e313] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_DBGK_SILOSTATE
+          - text: ","
+          - link "_DIAGNOSTIC_CONTEXT" [ref=e314] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_DIAGNOSTIC_CONTEXT
+          - text: ","
+          - link "_EPARTITION" [ref=e315] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_EPARTITION
+          - text: ","
+          - link "_ESERVERSILO_GLOBALS" [ref=e316] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_ESERVERSILO_GLOBALS
+          - text: ","
+          - link "_ETW_REALTIME_CONSUMER" [ref=e317] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_ETW_REALTIME_CONSUMER
+          - text: ","
+          - link "_ETW_REG_ENTRY" [ref=e318] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_ETW_REG_ENTRY
+          - text: ","
+          - link "_FAST_IO_DISPATCH" [ref=e319] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_FAST_IO_DISPATCH
+          - text: ","
+          - link "_HANDLE_TABLE" [ref=e320] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_HANDLE_TABLE
+          - text: ","
+          - link "_KALPC_MESSAGE" [ref=e321] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KALPC_MESSAGE
+          - text: ","
+          - link "_KALPC_SECTION" [ref=e322] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KALPC_SECTION
+          - text: ","
+          - link "_KALPC_SECURITY_DATA" [ref=e323] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KALPC_SECURITY_DATA
+          - text: ","
+          - link "_KALPC_VIEW" [ref=e324] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KALPC_VIEW
+          - text: ","
+          - link "_KRESOURCEMANAGER_COMPLETION_BINDING" [ref=e325] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_KRESOURCEMANAGER_COMPLETION_BINDING
+          - text: ","
+          - link "_LOCK_TRACKER" [ref=e326] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_LOCK_TRACKER
+          - text: ","
+          - link "_MDL" [ref=e327] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_MDL
+          - text: ","
+          - link "_MI_PARTITION_STORES" [ref=e328] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_MI_PARTITION_STORES
+          - text: ","
+          - link "_MI_REVERSE_VIEW_MAP" [ref=e329] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_MI_REVERSE_VIEW_MAP
+          - text: ","
+          - link "_MMVAD" [ref=e330] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_MMVAD
+          - text: ","
+          - link "_MM_PAGE_ACCESS_INFO_HEADER" [ref=e331] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_MM_PAGE_ACCESS_INFO_HEADER
+          - text: ","
+          - link "_NONOPAQUE_OPLOCK" [ref=e332] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_NONOPAQUE_OPLOCK
+          - text: ","
+          - link "_OBJECT_HANDLE_COUNT_ENTRY" [ref=e333] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_OBJECT_HANDLE_COUNT_ENTRY
+          - text: ","
+          - link "_OBJECT_HEADER_PROCESS_INFO" [ref=e334] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_OBJECT_HEADER_PROCESS_INFO
+          - text: ","
+          - link "_OBJECT_TYPE_INITIALIZER" [ref=e335] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_OBJECT_TYPE_INITIALIZER
+          - text: ","
+          - link "_OB_DUPLICATE_OBJECT_STATE" [ref=e336] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_OB_DUPLICATE_OBJECT_STATE
+          - text: ","
+          - link "_POOL_HEADER" [ref=e337] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_POOL_HEADER
+          - text: ","
+          - link "_POOL_TRACKER_BIG_PAGES" [ref=e338] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_POOL_TRACKER_BIG_PAGES
+          - text: ","
+          - link "_POP_SHUTDOWN_BUG_CHECK" [ref=e339] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_POP_SHUTDOWN_BUG_CHECK
+          - text: ","
+          - link "_RH_OP_CONTEXT" [ref=e340] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_RH_OP_CONTEXT
+          - text: ","
+          - link "_WNF_NAME_INSTANCE" [ref=e341] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_WNF_NAME_INSTANCE
+          - text: ","
+          - link "_WNF_PROCESS_CONTEXT" [ref=e342] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_WNF_PROCESS_CONTEXT
+          - text: ","
+          - link "_WNF_SUBSCRIPTION" [ref=e343] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_WNF_SUBSCRIPTION
+          - text: ","
+          - link "_WORK_QUEUE_ENTRY" [ref=e344] [cursor=pointer]:
+            - /url: /kernels/x64/windows-11/25h2/_WORK_QUEUE_ENTRY
+  - contentinfo [ref=e345]:
+    - generic [ref=e347]:
+      - generic [ref=e348]:
+        - link "Terms of Service" [ref=e349] [cursor=pointer]:
+          - /url: /terms
+          - strong [ref=e350]: Terms of Service
+        - text: "|"
+        - link "Privacy Policy" [ref=e351] [cursor=pointer]:
+          - /url: /privacy
+          - strong [ref=e352]: Privacy Policy
+        - text: "|"
+        - link "Report a Bug" [ref=e353] [cursor=pointer]:
+          - /url: https://github.com/VergiliusProject/vergilius-project/issues
+          - strong [ref=e354]: Report a Bug
+        - text: "| © 2018-2025 Copyright"
+        - link "VergiliusProject" [ref=e355] [cursor=pointer]:
+          - /url: https://github.com/VergiliusProject
+          - strong [ref=e356]: VergiliusProject
+      - generic [ref=e357]: revision 24c124f

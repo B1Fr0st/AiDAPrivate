@@ -2,6 +2,26 @@
 #include "P2CDriverBytes.h"
 #include <Windows.h>
 #include <intrin.h>
+#include <cstdio>
+#include <cstdarg>
+
+// Forward declare from MapperCore.cpp
+extern FILE* g_LogFile;
+static void EDDbgLog(const char* func, const char* fmt, ...) {
+    char buf[2048];
+    va_list args;
+    va_start(args, fmt);
+    int prefixLen = snprintf(buf, sizeof(buf), "[EmbeddedDriver][%s] ", func);
+    if (prefixLen < 0) prefixLen = 0;
+    vsnprintf(buf + prefixLen, sizeof(buf) - prefixLen, fmt, args);
+    va_end(args);
+    printf("%s\n", buf);
+    fflush(stdout);
+    OutputDebugStringA(buf);
+    OutputDebugStringA("\n");
+    if (g_LogFile) { fprintf(g_LogFile, "%s\n", buf); fflush(g_LogFile); }
+}
+#define EDLOG(fmt, ...) EDDbgLog(__FUNCTION__, fmt, ##__VA_ARGS__)
 
 unsigned char* g_P2CDriverData = nullptr;
 size_t g_P2CDriverSize = 0;
@@ -12,7 +32,9 @@ static constexpr unsigned char XOR_KEY[] = {
 };
 
 BOOL InitializeDriverData() {
+    EDLOG("rawDataSize=%zu", rawDataSize);
     if (rawDataSize < 2) {
+        EDLOG("ERROR: rawDataSize too small!");
         return FALSE;
     }
 
@@ -20,14 +42,17 @@ BOOL InitializeDriverData() {
         nullptr, rawDataSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
     if (!g_P2CDriverData) {
+        EDLOG("ERROR: VirtualAlloc failed, GLE=%u", GetLastError());
         return FALSE;
     }
+    EDLOG("Allocated %zu bytes at %p", rawDataSize, g_P2CDriverData);
 
     for (size_t i = 0; i < rawDataSize; i++) {
         g_P2CDriverData[i] = rawData[i] ^ XOR_KEY[i % sizeof(XOR_KEY)];
     }
 
     if (g_P2CDriverData[0] != 'M' || g_P2CDriverData[1] != 'Z') {
+        EDLOG("ERROR: MZ validation failed! First bytes: 0x%02X 0x%02X", g_P2CDriverData[0], g_P2CDriverData[1]);
         SecureZeroMemory(g_P2CDriverData, rawDataSize);
         VirtualFree(g_P2CDriverData, 0, MEM_RELEASE);
         g_P2CDriverData = nullptr;
@@ -35,6 +60,7 @@ BOOL InitializeDriverData() {
     }
 
     g_P2CDriverSize = rawDataSize;
+    EDLOG("Driver data initialized OK, size=%zu, MZ validated", g_P2CDriverSize);
     return TRUE;
 }
 

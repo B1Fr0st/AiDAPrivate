@@ -44,3 +44,4 @@ namespace icon_loader
 }
 
 extern HWND g_hwnd;
+extern const char* g_render_section;

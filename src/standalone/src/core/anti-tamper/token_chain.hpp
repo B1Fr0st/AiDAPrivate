@@ -292,6 +292,8 @@ namespace token_chain {
             rt.chain.chain_accumulator.store(
                 MBA_TRANSFORM(prev ^ token, _rotl64(tsc, 13)),
                 std::memory_order_release);
+
+            CFF_EXIT(tic_cff);
         }
         CFF_END(tic_cff)
 
@@ -304,12 +306,16 @@ namespace token_chain {
         auto& rt = state::get();
         int64_t now = detail::now_ms();
 
+        int64_t init_time = rt.chain.last_deep_check_ms.load(std::memory_order_acquire);
+        if (init_time > 0 && (now - init_time) < 30000)
+            return false;
+
         int64_t last_fast = rt.chain.last_fast_check_ms.load(std::memory_order_acquire);
-        if (last_fast > 0 && (now - last_fast) > 500)
+        if (last_fast > 0 && (now - last_fast) > 10000)
             return true;
 
         int64_t last_integ = rt.chain.last_integrity_check_ms.load(std::memory_order_acquire);
-        if (last_integ > 0 && (now - last_integ) > 10000)
+        if (last_integ > 0 && (now - last_integ) > 60000)
             return true;
 
         return false;

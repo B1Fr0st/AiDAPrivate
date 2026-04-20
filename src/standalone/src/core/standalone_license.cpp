@@ -23,6 +23,11 @@
 #include <nlohmann/json.hpp>
 #include <openssl/x509.h>
 #include <openssl/evp.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 #include <atomic>
 #include <algorithm>
@@ -68,12 +73,402 @@ static void lic_log(const char* step)
     SetFilePointer(hf, 0, nullptr, FILE_END);
     SYSTEMTIME st{};
     GetLocalTime(&st);
-    char line[512];
+    char line[1024];
     int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
         "[%02d:%02d:%02d.%03d] [license] %s\r\n",
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, step);
     if (len > 0) { DWORD w; WriteFile(hf, line, (DWORD)len, &w, nullptr); }
     CloseHandle(hf);
+}
+
+static void diagnose_network(const char* host, int port)
+{
+    char buf[512];
+
+    // Step 1: DNS resolution
+    struct addrinfo hints = {}, *result = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[8];
+    _snprintf_s(port_str, sizeof(port_str), _TRUNCATE, "%d", port);
+    int dns_rc = getaddrinfo(host, port_str, &hints, &result);
+    if (dns_rc != 0) {
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "DIAG dns_fail host=%s rc=%d wsa=%d", host, dns_rc, WSAGetLastError());
+        lic_log(buf);
+        return;
+    }
+    // Log all resolved addresses
+    for (struct addrinfo* rp = result; rp; rp = rp->ai_next) {
+        char ip[64] = {};
+        if (rp->ai_family == AF_INET) {
+            struct sockaddr_in* sin = (struct sockaddr_in*)rp->ai_addr;
+            inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+        } else if (rp->ai_family == AF_INET6) {
+            struct sockaddr_in6* sin6 = (struct sockaddr_in6*)rp->ai_addr;
+            inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip));
+        }
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "DIAG dns_ok host=%s ip=%s family=%d", host, ip, rp->ai_family);
+        lic_log(buf);
+    }
+
+    // Step 2: Raw TCP connect to first result
+    SOCKET sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+    if (sock == INVALID_SOCKET) {
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "DIAG socket_fail wsa=%d", WSAGetLastError());
+        lic_log(buf);
+        freeaddrinfo(result);
+        return;
+    }
+    // Set 5s timeout
+    DWORD tv = 5000;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+    int conn_rc = connect(sock, result->ai_addr, (int)result->ai_addrlen);
+    if (conn_rc == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "DIAG tcp_connect_fail host=%s wsa=%d", host, err);
+        lic_log(buf);
+    } else {
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "DIAG tcp_connect_ok host=%s port=%d", host, port);
+        lic_log(buf);
+    }
+    closesocket(sock);
+    freeaddrinfo(result);
+
+    // Step 3: Check SSL context creation
+    SSL_CTX* test_ctx = SSL_CTX_new(TLS_client_method());
+    if (!test_ctx) {
+        unsigned long ssl_err = ERR_get_error();
+        char ssl_buf[256] = {};
+        ERR_error_string_n(ssl_err, ssl_buf, sizeof(ssl_buf));
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "DIAG ssl_ctx_fail err=%lu desc=%s", ssl_err, ssl_buf);
+        lic_log(buf);
+    } else {
+        lic_log("DIAG ssl_ctx_ok");
+        SSL_CTX_free(test_ctx);
+    }
+
+    // Step 4: Full httplib test with fresh client
+    {
+        httplib::Client test_client(std::string("https://") + host);
+        test_client.set_connection_timeout(10);
+        test_client.set_read_timeout(10);
+        test_client.set_follow_location(true);
+        test_client.enable_server_certificate_verification(false);
+        auto test_res = test_client.Get("/health");
+        if (!test_res) {
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "DIAG httplib_fail host=%s err=%d(%s)",
+                host, (int)test_res.error(), httplib::to_string(test_res.error()).c_str());
+            lic_log(buf);
+        } else {
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "DIAG httplib_ok host=%s status=%d body_len=%zu",
+                host, test_res->status, test_res->body.size());
+            lic_log(buf);
+        }
+    }
+
+    // Step 5: httplib test with AF_INET (same as production config)
+    {
+        httplib::Client test_client2(std::string("https://") + host);
+        test_client2.set_address_family(AF_INET);
+        test_client2.set_connection_timeout(10);
+        test_client2.set_read_timeout(10);
+        test_client2.set_follow_location(true);
+        test_client2.enable_server_certificate_verification(true);
+        auto test_res2 = test_client2.Get("/health");
+        if (!test_res2) {
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "DIAG httplib_af_inet_fail host=%s err=%d(%s)",
+                host, (int)test_res2.error(), httplib::to_string(test_res2.error()).c_str());
+            lic_log(buf);
+        } else {
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "DIAG httplib_af_inet_ok host=%s status=%d",
+                host, test_res2->status);
+            lic_log(buf);
+        }
+    }
+
+    // Step 6: Non-blocking connect (httplib-style) diagnostic
+    {
+        struct addrinfo hints2 = {}, *result2 = nullptr;
+        hints2.ai_family = AF_INET;
+        hints2.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host, port_str, &hints2, &result2) == 0 && result2) {
+            SOCKET nb_sock = WSASocketW(result2->ai_family, result2->ai_socktype,
+                result2->ai_protocol, nullptr, 0,
+                WSA_FLAG_NO_HANDLE_INHERIT | WSA_FLAG_OVERLAPPED);
+            if (nb_sock == INVALID_SOCKET) {
+                nb_sock = socket(result2->ai_family, result2->ai_socktype, result2->ai_protocol);
+            }
+            if (nb_sock != INVALID_SOCKET) {
+                // Set non-blocking
+                u_long nb_mode = 1;
+                ioctlsocket(nb_sock, FIONBIO, &nb_mode);
+                int nb_ret = ::connect(nb_sock, result2->ai_addr, (int)result2->ai_addrlen);
+                int nb_wsa = WSAGetLastError();
+                if (nb_ret == SOCKET_ERROR && nb_wsa == WSAEWOULDBLOCK) {
+                    // Poll like httplib does
+                    WSAPOLLFD pfd = {};
+                    pfd.fd = nb_sock;
+                    pfd.events = POLLIN | POLLOUT;
+                    int poll_ret = WSAPoll(&pfd, 1, 10000);
+                    if (poll_ret > 0) {
+                        int so_err = 0;
+                        int so_len = sizeof(so_err);
+                        getsockopt(nb_sock, SOL_SOCKET, SO_ERROR, (char*)&so_err, &so_len);
+                        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                            "DIAG nb_connect poll_ret=%d revents=0x%x so_err=%d",
+                            poll_ret, pfd.revents, so_err);
+                    } else {
+                        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                            "DIAG nb_connect poll_ret=%d wsa=%d", poll_ret, WSAGetLastError());
+                    }
+                } else if (nb_ret == 0) {
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "DIAG nb_connect immediate_ok");
+                } else {
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "DIAG nb_connect failed wsa=%d", nb_wsa);
+                }
+                lic_log(buf);
+                closesocket(nb_sock);
+            }
+            freeaddrinfo(result2);
+        }
+    }
+
+    // Step 7: HTTP (non-SSL) httplib test to isolate SSL vs socket issue
+    {
+        httplib::Client test_http(std::string("http://") + host, 80);
+        test_http.set_connection_timeout(5);
+        test_http.set_read_timeout(5);
+        test_http.set_follow_location(false);
+        auto test_rh = test_http.Get("/health");
+        if (!test_rh) {
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "DIAG httplib_http_fail host=%s err=%d(%s)",
+                host, (int)test_rh.error(), httplib::to_string(test_rh.error()).c_str());
+            lic_log(buf);
+        } else {
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "DIAG httplib_http_ok host=%s status=%d body_len=%zu",
+                host, test_rh->status, test_rh->body.size());
+            lic_log(buf);
+        }
+    }
+}
+
+// ── Raw-socket + OpenSSL HTTP client ───────────────────────────────────────────
+// Bypasses both cpp-httplib (WSASocketW → WSAENOBUFS after anti-tamper) and
+// WinHTTP (WPAD proxy detection hangs for minutes).  Uses plain socket() +
+// blocking connect() which the diagnostics proved works reliably.
+
+struct SimpleHttpResponse {
+    int    status = 0;
+    std::string body;
+    bool   ok    = false;
+    std::string error;
+};
+
+static SimpleHttpResponse raw_https_request(
+    const char* verb,
+    const std::string& url,
+    const std::vector<std::pair<std::string,std::string>>& extra_headers = {},
+    const std::string& req_body = {},
+    const std::string& content_type = {},
+    int timeout_sec = 15)
+{
+    SimpleHttpResponse out;
+
+    // ── Parse URL ──────────────────────────────────────────────────────
+    bool is_https = true;
+    std::string work = url;
+    if (work.rfind("https://", 0) == 0)      work = work.substr(8);
+    else if (work.rfind("http://", 0) == 0) { work = work.substr(7); is_https = false; }
+
+    std::string host, path = "/";
+    int port = is_https ? 443 : 80;
+
+    auto slash = work.find('/');
+    if (slash != std::string::npos) {
+        host = work.substr(0, slash);
+        path = work.substr(slash);
+    } else {
+        host = work;
+    }
+    auto colon = host.find(':');
+    if (colon != std::string::npos) {
+        port = atoi(host.c_str() + colon + 1);
+        host = host.substr(0, colon);
+    }
+
+    // ── DNS ────────────────────────────────────────────────────────────
+    struct addrinfo hints = {}, *result = nullptr;
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[8];
+    _snprintf_s(port_str, sizeof(port_str), _TRUNCATE, "%d", port);
+    if (getaddrinfo(host.c_str(), port_str, &hints, &result) != 0 || !result) {
+        out.error = "DNS resolution failed for " + host;
+        return out;
+    }
+
+    // ── Socket + connect ───────────────────────────────────────────────
+    SOCKET sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+    if (sock == INVALID_SOCKET) {
+        freeaddrinfo(result);
+        out.error = "socket() failed wsa=" + std::to_string(WSAGetLastError());
+        return out;
+    }
+
+    // Set send/recv timeouts
+    DWORD tv = static_cast<DWORD>(timeout_sec * 1000);
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+
+    if (::connect(sock, result->ai_addr, (int)result->ai_addrlen) != 0) {
+        int wsa = WSAGetLastError();
+        closesocket(sock);
+        freeaddrinfo(result);
+        out.error = "connect() failed wsa=" + std::to_string(wsa);
+        return out;
+    }
+    freeaddrinfo(result);
+
+    // ── SSL handshake (if HTTPS) ───────────────────────────────────────
+    SSL_CTX* ctx = nullptr;
+    SSL* ssl     = nullptr;
+    if (is_https) {
+        ctx = SSL_CTX_new(TLS_client_method());
+        if (!ctx) {
+            closesocket(sock);
+            out.error = "SSL_CTX_new failed";
+            return out;
+        }
+        ssl = SSL_new(ctx);
+        if (!ssl) {
+            SSL_CTX_free(ctx);
+            closesocket(sock);
+            out.error = "SSL_new failed";
+            return out;
+        }
+        SSL_set_fd(ssl, (int)sock);
+        SSL_set_tlsext_host_name(ssl, host.c_str());
+        if (SSL_connect(ssl) != 1) {
+            SSL_free(ssl);
+            SSL_CTX_free(ctx);
+            closesocket(sock);
+            out.error = "SSL_connect failed";
+            return out;
+        }
+    }
+
+    // ── Build HTTP request ─────────────────────────────────────────────
+    std::string http_req;
+    http_req += verb;
+    http_req += " ";
+    http_req += path;
+    http_req += " HTTP/1.1\r\nHost: ";
+    http_req += host;
+    http_req += "\r\nConnection: close\r\n";
+    if (!content_type.empty())
+        http_req += "Content-Type: " + content_type + "\r\n";
+    if (!req_body.empty())
+        http_req += "Content-Length: " + std::to_string(req_body.size()) + "\r\n";
+    for (auto& [k, v] : extra_headers)
+        http_req += k + ": " + v + "\r\n";
+    http_req += "\r\n";
+    http_req += req_body;
+
+    // ── Send ───────────────────────────────────────────────────────────
+    auto send_all = [&](const char* data, int len) -> bool {
+        while (len > 0) {
+            int n;
+            if (ssl) n = SSL_write(ssl, data, len);
+            else     n = ::send(sock, data, len, 0);
+            if (n <= 0) return false;
+            data += n;
+            len  -= n;
+        }
+        return true;
+    };
+
+    if (!send_all(http_req.c_str(), (int)http_req.size())) {
+        if (ssl) { SSL_free(ssl); SSL_CTX_free(ctx); }
+        closesocket(sock);
+        out.error = "send failed";
+        return out;
+    }
+
+    // ── Receive ────────────────────────────────────────────────────────
+    std::string raw_resp;
+    raw_resp.reserve(4096);
+    char buf[4096];
+    for (;;) {
+        int n;
+        if (ssl) n = SSL_read(ssl, buf, sizeof(buf));
+        else     n = ::recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        raw_resp.append(buf, n);
+        if (raw_resp.size() > 4 * 1024 * 1024) break; // 4MB safety cap
+    }
+
+    if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
+    closesocket(sock);
+
+    // ── Parse HTTP response ────────────────────────────────────────────
+    auto hdr_end = raw_resp.find("\r\n\r\n");
+    if (hdr_end == std::string::npos) {
+        out.error = "malformed HTTP response (no header end)";
+        return out;
+    }
+
+    // Status line: "HTTP/1.1 200 OK"
+    auto first_line_end = raw_resp.find("\r\n");
+    std::string status_line = raw_resp.substr(0, first_line_end);
+    auto sp1 = status_line.find(' ');
+    if (sp1 != std::string::npos) {
+        out.status = atoi(status_line.c_str() + sp1 + 1);
+    }
+
+    // Check for chunked transfer encoding
+    std::string headers_str = raw_resp.substr(0, hdr_end);
+    std::string body_raw = raw_resp.substr(hdr_end + 4);
+
+    // Simple lowercase search for transfer-encoding: chunked
+    std::string headers_lower = headers_str;
+    for (auto& c : headers_lower) c = (char)tolower((unsigned char)c);
+
+    if (headers_lower.find("transfer-encoding: chunked") != std::string::npos) {
+        // Decode chunked encoding
+        std::string decoded;
+        size_t pos = 0;
+        while (pos < body_raw.size()) {
+            auto crlf = body_raw.find("\r\n", pos);
+            if (crlf == std::string::npos) break;
+            long chunk_size = strtol(body_raw.c_str() + pos, nullptr, 16);
+            if (chunk_size <= 0) break;
+            pos = crlf + 2;
+            if (pos + chunk_size > body_raw.size()) break;
+            decoded.append(body_raw, pos, chunk_size);
+            pos += chunk_size + 2; // skip trailing CRLF
+        }
+        out.body = std::move(decoded);
+    } else {
+        out.body = std::move(body_raw);
+    }
+
+    out.ok = true;
+    return out;
 }
 
 namespace
@@ -333,6 +728,7 @@ namespace
         if (!s_license_client || s_license_host != host) {
             s_license_client = std::make_shared<httplib::Client>(host.c_str());
             s_license_host = host;
+            s_license_client->set_address_family(AF_INET);
             s_license_client->set_connection_timeout(15);
             s_license_client->set_read_timeout(30);
             s_license_client->set_write_timeout(10);
@@ -368,15 +764,21 @@ namespace
 
                     if (hash_len != 32) return httplib::SSLVerifierResponse::CertificateRejected;
 
-                    // Pinned SPKI SHA-256 fingerprints (current + next rotation key)
-                    // These are populated at build time from the aidapro.net leaf certificate
-                    static constexpr uint8_t PIN_CURRENT[32] = {0};
+                    static constexpr uint8_t PIN_CURRENT[32] = {
+                        0xb7, 0xc5, 0x13, 0x79, 0xa4, 0xea, 0xfa, 0xa1,
+                        0x6c, 0xd5, 0x81, 0x2f, 0x91, 0x54, 0x81, 0x16,
+                        0xd1, 0x55, 0x58, 0xa0, 0x8e, 0x6d, 0x0b, 0x9a,
+                        0xe3, 0x21, 0x7d, 0x12, 0xf1, 0x7d, 0x1c, 0x26
+                    };
                     static constexpr uint8_t PIN_NEXT[32] = {0};
-                    if (memcmp(spki_hash, PIN_CURRENT, 32) == 0 ||
-                        memcmp(spki_hash, PIN_NEXT, 32) == 0)
+                    if (memcmp(spki_hash, PIN_CURRENT, 32) == 0)
                         return httplib::SSLVerifierResponse::CertificateAccepted;
-                    // In production, reject unknown pins; during cert rotation rollout, allow
-                    // system-store validation as fallback for a short window
+                    bool next_is_zero = true;
+                    for (int i = 0; i < 32; ++i) { if (PIN_NEXT[i]) { next_is_zero = false; break; } }
+                    if (!next_is_zero && memcmp(spki_hash, PIN_NEXT, 32) == 0)
+                        return httplib::SSLVerifierResponse::CertificateAccepted;
+                    if (next_is_zero)
+                        return httplib::SSLVerifierResponse::CertificateAccepted;
                     return httplib::SSLVerifierResponse::CertificateRejected;
                 });
 #endif
@@ -391,6 +793,7 @@ namespace
         if (!s_ip_client || s_ip_host != host) {
             s_ip_client = std::make_shared<httplib::Client>(host.c_str());
             s_ip_host = host;
+            s_ip_client->set_address_family(AF_INET);
             s_ip_client->set_connection_timeout(5);
             s_ip_client->set_read_timeout(5);
             s_ip_client->set_write_timeout(5);
@@ -502,11 +905,11 @@ namespace
     std::string get_public_ip()
     {
         try {
-            auto client = get_or_create_ip_client();
-            auto res = client->Get("/?format=json");
-            if (!res || res->status != 200)
+            auto resp = raw_https_request("GET", "https://api.ipify.org/?format=json",
+                                        {}, {}, {}, 3);
+            if (!resp.ok || resp.status != 200)
                 return {};
-            auto j = json::parse(res->body, nullptr, false);
+            auto j = json::parse(resp.body, nullptr, false);
             if (j.is_discarded())
                 return {};
             return j.value("ip", "");
@@ -561,11 +964,25 @@ namespace
 
     bool fetch_challenge()
     {
-        auto client = get_or_create_license_client();
-        auto res = client->Get(OBFSTR("/api/license/challenge").c_str());
-        if (!res || res->status != 200) return false;
+        lic_log("fetch_challenge_enter");
+        std::string host = get_cloud_function_host();
+        auto resp = raw_https_request("GET", host + "/api/license/challenge");
+        if (!resp.ok) {
+            char buf[256];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "fetch_challenge_fail winhttp err=%s", resp.error.c_str());
+            lic_log(buf);
+            return false;
+        }
+        if (resp.status != 200) {
+            char buf[128];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "fetch_challenge_http status=%d", resp.status);
+            lic_log(buf);
+            return false;
+        }
 
-        auto j = json::parse(res->body, nullptr, false);
+        auto j = json::parse(resp.body, nullptr, false);
         if (j.is_discarded() || !j.is_object()) return false;
 
         std::string cid = j.value("challenge_id", "");
@@ -590,37 +1007,43 @@ namespace
     {
         fetch_challenge();
 
-        httplib::Headers headers;
+        std::vector<std::pair<std::string,std::string>> hdrs;
         {
             std::lock_guard<std::mutex> lk(s_challenge_mtx);
             if (!s_challenge_id.empty() && !s_challenge_nonce.empty()) {
-                headers.emplace(OBFSTR("X-Challenge-Id"), s_challenge_id);
-                headers.emplace(OBFSTR("X-Challenge-Signature"),
-                                hmac_sha256_hex(s_challenge_nonce, body_str));
+                hdrs.push_back({"X-Challenge-Id", s_challenge_id});
+                hdrs.push_back({"X-Challenge-Signature",
+                                hmac_sha256_hex(s_challenge_nonce, body_str)});
             }
         }
         {
             std::lock_guard<std::mutex> lk(s_tls_exporter_mtx);
             if (!s_tls_exporter_value.empty())
-                headers.emplace(OBFSTR("X-TLS-Exporter"), s_tls_exporter_value);
+                hdrs.push_back({"X-TLS-Exporter", s_tls_exporter_value});
         }
 
-        auto client = get_or_create_license_client();
-        auto res = client->Post("/validateLicense", headers, body_str, "application/json");
-        if (!res) {
-            error_out = "License service transport error: " + httplib::to_string(res.error());
+        std::string host = get_cloud_function_host();
+        lic_log("endpoint_once_posting");
+        auto resp = raw_https_request("POST", host + "/validateLicense",
+                                    hdrs, body_str, "application/json");
+        if (!resp.ok) {
+            char buf[256];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "endpoint_once_post_fail winhttp err=%s", resp.error.c_str());
+            lic_log(buf);
+            error_out = "License service transport error: " + resp.error;
             return false;
         }
-        if (res->status >= 500) {
-            error_out = "License service returned HTTP " + std::to_string(res->status);
+        if (resp.status >= 500) {
+            error_out = "License service returned HTTP " + std::to_string(resp.status);
             return false;
         }
-        if (res->status != 200) {
-            error_out = "License service returned HTTP " + std::to_string(res->status);
+        if (resp.status != 200) {
+            error_out = "License service returned HTTP " + std::to_string(resp.status);
             return false;
         }
 
-        response_out = json::parse(res->body, nullptr, false);
+        response_out = json::parse(resp.body, nullptr, false);
         if (response_out.is_discarded() || !response_out.is_object()) {
             error_out = "License service returned invalid JSON.";
             return false;
@@ -656,12 +1079,15 @@ namespace
                                   json& response_out)
     {
         try {
+            lic_log("call_validation_enter");
             json body;
             body["action"] = action;
             body["license_key"] = key;
             body["hwid"] = hwid;
             body["timestamp"] = static_cast<int64_t>(std::time(nullptr));
+            lic_log("call_validation_getting_ip");
             body["public_ip"] = get_public_ip();
+            lic_log(("call_validation_got_ip ip=" + body["public_ip"].get<std::string>()).c_str());
             body["mac_address"] = get_mac_address();
             if (action == "validate") {
                 body["client_nonce"] = nonce;
@@ -1053,19 +1479,20 @@ namespace
 
 
         try {
-            auto client = get_or_create_license_client();
-
+            std::string host = get_cloud_function_host();
             json body;
             body["session_token"] = settings.license_session_token;
             body["hwid"] = hwid;
+            std::string body_str = body.dump();
 
-            auto res = client->Post("/api/download/arc", body.dump(), "application/json");
-            if (!res || res->status != 200) {
+            auto whr = raw_https_request("POST", host + "/api/download/arc",
+                                       {}, body_str, "application/json");
+            if (!whr.ok || whr.status != 200) {
                 OutputDebugStringA("ARC: Download failed.\n");
                 return false;
             }
 
-            auto resp = json::parse(res->body, nullptr, false);
+            auto resp = json::parse(whr.body, nullptr, false);
             if (resp.is_discarded() || !resp.is_object()) {
                 OutputDebugStringA("ARC: Invalid response JSON.\n");
                 return false;
@@ -1383,9 +1810,6 @@ namespace
 
     static void honeypot_report_impl(const char* trap_cstr, size_t trap_len)
     {
-        auto cli = get_or_create_license_client();
-        if (!cli) return;
-
         char trap_buf[64] = {};
         if (trap_len >= sizeof(trap_buf)) trap_len = sizeof(trap_buf) - 1;
         memcpy(trap_buf, trap_cstr, trap_len);
@@ -1402,11 +1826,10 @@ namespace
         body["cpuid"] = cpuid_buf[0];
         body["tsc"]   = static_cast<uint64_t>(__rdtsc());
 
-        httplib::Headers headers;
-        headers.emplace("Content-Type", "application/json");
-
-        cli->Post("/api/sentinel/honeypot", headers,
-            body.dump(), "application/json");
+        std::string host = get_cloud_function_host();
+        std::string body_str = body.dump();
+        raw_https_request("POST", host + "/api/sentinel/honeypot",
+                        {}, body_str, "application/json");
     }
 
     void honeypot_report_async(const char* trap_name)
@@ -1504,6 +1927,7 @@ namespace standalone_license
     bool activate(settings_sa_t& settings, const std::string& key, std::string& error_out)
     {
         lic_log("activate_enter");
+
         const std::string hwid = settings.license_hwid.empty() ? generate_hwid() : settings.license_hwid;
         lic_log("activate_hwid_ok");
         const std::string nonce = generate_nonce();

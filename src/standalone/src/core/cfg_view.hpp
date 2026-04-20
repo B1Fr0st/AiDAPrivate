@@ -13,6 +13,8 @@
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
 #include "debugger_engine.hpp"
+#include "ui_anim.hpp"
+#include "../helpers/globals.h"
 
 namespace cfg_view {
 
@@ -38,7 +40,10 @@ struct cfg_state_t {
 	uint64_t                   current_rip = 0;
 	float                      pan_x = 0.f;
 	float                      pan_y = 0.f;
+	float                      target_pan_x = 0.f;
+	float                      target_pan_y = 0.f;
 	float                      zoom = 1.f;
+	float                      target_zoom = 1.f;
 	int                        selected_block = -1;
 	std::mutex                 mutex;
 	std::atomic<bool>          building{false};
@@ -87,7 +92,15 @@ inline void build_cfg(uint64_t entry_address)
 		const size_t max_insns = 4096;
 
 		std::vector<uint8_t> mem;
-		driver_bridge::read_memory(entry_address, max_bytes, mem);
+		bool have_data = false;
+
+		if (driver_bridge::attached_pid() != 0)
+			have_data = driver_bridge::read_memory(entry_address, max_bytes, mem);
+
+		if (!have_data || mem.empty()) {
+			extern DisasmState g_disasm;
+			have_data = static_analysis::read_bytes_from_pe(g_disasm.file, entry_address, max_bytes, mem);
+		}
 
 		if (mem.empty()) {
 			g_state.building.store(false);
@@ -267,7 +280,10 @@ inline void build_cfg(uint64_t entry_address)
 			g_state.selected_block = -1;
 			g_state.pan_x = 0.f;
 			g_state.pan_y = 0.f;
+			g_state.target_pan_x = 0.f;
+			g_state.target_pan_y = 0.f;
 			g_state.zoom = 1.f;
+			g_state.target_zoom = 1.f;
 		}
 
 		g_state.building.store(false);
@@ -282,12 +298,22 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImVec2 clip_max(pos_x + width, pos_y + height);
 	dl->PushClipRect(clip_min, clip_max, true);
 
-	dl->AddRectFilled(clip_min, clip_max, IM_COL32(18, 18, 24, static_cast<int>(240 * alpha)));
+	const auto& _t = themes::resolved;
+	const auto _ta = [alpha](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, alpha);
+	};
+	const ImU32 accent = IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
+								  static_cast<int>(accent_b * 255), static_cast<int>(alpha * 255));
+	float dt = ImGui::GetIO().DeltaTime;
+
+	dl->AddRectFilled(clip_min, clip_max, _ta(_t.bg_base));
 
 	if (g_state.building.load()) {
 		float cx = pos_x + width * 0.5f;
 		float cy = pos_y + height * 0.5f;
-		dl->AddText(ImVec2(cx - 40.f, cy), IM_COL32(180, 180, 180, static_cast<int>(200 * alpha)), "Building CFG...");
+		ui_anim::render_spinner(dl, cx, cy, 14.f, 2.5f, accent,
+								static_cast<float>(ImGui::GetTime()));
+		dl->AddText(ImVec2(cx - 40.f, cy + 22.f), _ta(_t.text_secondary), "Building CFG...");
 		dl->PopClipRect();
 		return;
 	}
@@ -295,9 +321,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	std::lock_guard<std::mutex> lk(g_state.mutex);
 
 	if (!g_state.built || g_state.blocks.empty()) {
-		float cx = pos_x + width * 0.5f;
-		float cy = pos_y + height * 0.5f;
-		dl->AddText(ImVec2(cx - 60.f, cy), IM_COL32(100, 100, 100, static_cast<int>(150 * alpha)), "No CFG - select an address");
+		ui_anim::render_empty_state(dl, pos_x, pos_y, width, height,
+			"No CFG - select an address", accent_r, accent_g, accent_b, alpha,
+			static_cast<float>(ImGui::GetTime()));
 		dl->PopClipRect();
 		return;
 	}
@@ -306,26 +332,30 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	bool hovered = ImGui::IsMouseHoveringRect(clip_min, clip_max, false);
 
 	if (hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.f)) {
-		g_state.pan_x += io.MouseDelta.x / g_state.zoom;
-		g_state.pan_y += io.MouseDelta.y / g_state.zoom;
+		g_state.target_pan_x += io.MouseDelta.x / g_state.zoom;
+		g_state.target_pan_y += io.MouseDelta.y / g_state.zoom;
 	}
 
 	if (hovered && io.MouseWheel != 0.f) {
 		if (io.KeyCtrl) {
-			float old_zoom = g_state.zoom;
-			g_state.zoom *= (io.MouseWheel > 0) ? 1.1f : 0.9f;
-			if (g_state.zoom < 0.1f) g_state.zoom = 0.1f;
-			if (g_state.zoom > 5.f) g_state.zoom = 5.f;
+			float old_zoom = g_state.target_zoom;
+			g_state.target_zoom *= (io.MouseWheel > 0) ? 1.1f : 0.9f;
+			if (g_state.target_zoom < 0.1f) g_state.target_zoom = 0.1f;
+			if (g_state.target_zoom > 5.f) g_state.target_zoom = 5.f;
 
 			float mx = io.MousePos.x - pos_x - width * 0.5f;
 			float my = io.MousePos.y - pos_y - height * 0.5f;
-			float scale_change = g_state.zoom / old_zoom;
-			g_state.pan_x -= mx * (1.f - 1.f / scale_change) / g_state.zoom;
-			g_state.pan_y -= my * (1.f - 1.f / scale_change) / g_state.zoom;
+			float scale_change = g_state.target_zoom / old_zoom;
+			g_state.target_pan_x -= mx * (1.f - 1.f / scale_change) / g_state.target_zoom;
+			g_state.target_pan_y -= my * (1.f - 1.f / scale_change) / g_state.target_zoom;
 		} else {
-			g_state.pan_y += io.MouseWheel * 40.f / g_state.zoom;
+			g_state.target_pan_y += io.MouseWheel * 40.f / g_state.zoom;
 		}
 	}
+
+	g_state.pan_x = ui_anim::smooth_lerp(g_state.pan_x, g_state.target_pan_x, 12.f, dt);
+	g_state.pan_y = ui_anim::smooth_lerp(g_state.pan_y, g_state.target_pan_y, 12.f, dt);
+	g_state.zoom = ui_anim::smooth_lerp(g_state.zoom, g_state.target_zoom, 12.f, dt);
 
 	float center_x = pos_x + width * 0.5f;
 	float center_y = pos_y + height * 0.5f;
@@ -364,11 +394,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImU32 edge_col;
 		if (e.from < static_cast<int>(blocks.size()) && blocks[e.from].successors.size() > 1) {
 			if (e.is_true_branch)
-				edge_col = IM_COL32(80, 200, 80, static_cast<int>(180 * alpha));
+				edge_col = IM_COL32(80, 200, 80, static_cast<int>(alpha * 220));
 			else
-				edge_col = IM_COL32(200, 80, 80, static_cast<int>(180 * alpha));
+				edge_col = IM_COL32(220, 80, 80, static_cast<int>(alpha * 220));
 		} else {
-			edge_col = IM_COL32(140, 140, 160, static_cast<int>(120 * alpha));
+			edge_col = _ta(_t.text_dim);
 		}
 
 		dl->AddBezierCubic(p1, p2, p3, p4,
@@ -414,7 +444,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (g_state.current_rip >= blk.start_addr && g_state.current_rip < blk.end_addr)
 			is_rip_block = true;
 
-		ImU32 bg_col = IM_COL32(28, 30, 38, static_cast<int>(220 * alpha));
+		ImU32 bg_col = _ta(_t.panel_bg);
 		dl->AddRectFilled(ImVec2(tl.x + 3.f * z, tl.y + 3.f * z),
 						  ImVec2(br.x + 3.f * z, br.y + 3.f * z),
 						  IM_COL32(0, 0, 0, static_cast<int>(60 * alpha)), 4.f * z);
@@ -431,12 +461,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		} else if (n.id == g_state.selected_block) {
 			dl->AddRect(tl, br, IM_COL32(ar, ag, ab, static_cast<int>(160 * alpha)), 4.f * z, 0, 1.5f * z);
 		} else {
-			dl->AddRect(tl, br, IM_COL32(60, 62, 70, static_cast<int>(180 * alpha)), 4.f * z, 0, 1.f * z);
+			dl->AddRect(tl, br, _ta(ui_anim::lighten(_t.panel_bg, 20)), 4.f * z, 0, 1.f * z);
 		}
 
 		if (blk.has_breakpoint) {
 			dl->AddRectFilled(tl, ImVec2(tl.x + 3.f * z, br.y),
-							  IM_COL32(200, 50, 50, static_cast<int>(200 * alpha)), 2.f * z);
+							  IM_COL32(220, 80, 80, static_cast<int>(alpha * 200)), 2.f * z);
+		}
+
+		if (blk.is_entry) {
+			char entry_label[32];
+			snprintf(entry_label, sizeof(entry_label), "entry: %llX",
+					 static_cast<unsigned long long>(blk.start_addr));
+			dl->AddText(ImVec2(tl.x + padding, tl.y - 14.f * z), accent, entry_label);
 		}
 
 		float text_y = tl.y + padding;
@@ -447,21 +484,23 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			char addr_buf[24];
 			snprintf(addr_buf, sizeof(addr_buf), "%llX", static_cast<unsigned long long>(line.addr));
 
-			ImU32 addr_col = IM_COL32(100, 110, 140, static_cast<int>(200 * alpha));
-			ImU32 text_col = IM_COL32(210, 210, 220, static_cast<int>(220 * alpha));
+			ImU32 addr_col = _ta(_t.text_secondary);
+			ImU32 text_col = _ta(_t.text_primary);
 
 			if (line.addr == g_state.current_rip) {
 				dl->AddRectFilled(ImVec2(tl.x + 2.f * z, text_y),
 								  ImVec2(br.x - 2.f * z, text_y + line_h),
 								  IM_COL32(ar, ag, ab, static_cast<int>(35 * alpha)));
-				text_col = IM_COL32(255, 255, 255, static_cast<int>(255 * alpha));
+				text_col = _ta(_t.text_primary);
 			}
 
 			float font_scale = z < 0.5f ? 0.5f : (z > 2.f ? 2.f : z);
-			(void)font_scale;
+			ImGui::SetWindowFontScale(font_scale);
 
 			dl->AddText(ImVec2(tl.x + padding, text_y), addr_col, addr_buf);
 			dl->AddText(ImVec2(tl.x + padding + 80.f * z, text_y), text_col, line.text.c_str());
+
+			ImGui::SetWindowFontScale(1.f);
 
 			text_y += line_h;
 		}
@@ -481,8 +520,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float zx = pos_x + width - zts.x - 16.f;
 		float zy = pos_y + 8.f;
 		dl->AddRectFilled(ImVec2(zx - 6.f, zy - 2.f), ImVec2(zx + zts.x + 6.f, zy + zts.y + 2.f),
-			IM_COL32(20, 22, 30, static_cast<int>(180 * alpha)), 4.f);
-		dl->AddText(ImVec2(zx, zy), IM_COL32(160, 160, 170, static_cast<int>(200 * alpha)), zoom_buf);
+			_ta(_t.panel_bg), 4.f);
+		dl->AddText(ImVec2(zx, zy), _ta(_t.text_secondary), zoom_buf);
 	}
 
 	dl->PopClipRect();

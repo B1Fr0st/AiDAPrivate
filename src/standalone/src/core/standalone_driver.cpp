@@ -44,6 +44,8 @@ namespace
     std::string     g_last_error;
     bool            g_initialized = false;
     bool            g_kernel_mode = false;
+    bool            g_has_vm_read = false;
+    bool            g_kernel_attached = false;
 
     struct handle_closer
     {
@@ -172,6 +174,16 @@ namespace driver_bridge
         g_pre_detach_hooks.push_back(std::move(fn));
     }
 
+    void debug_log(const char* fmt, ...)
+    {
+        char buf[1024];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        logf("%s", buf);
+    }
+
     bool initialize()
     {
         std::lock_guard<std::mutex> lk(g_state_mtx);
@@ -190,6 +202,11 @@ namespace driver_bridge
             return true;
         }
 
+        if (device) {
+            DWORD err = device->get_last_connect_error();
+            logf("AiDA Standalone: Kernel driver connection failed (error 0x%08X).\n", err);
+        }
+
         g_initialized = true;
         logf("AiDA Standalone: Kernel driver unavailable. Live inspection operations require the kernel driver and will not function until it is loaded.\n");
         return true;
@@ -204,7 +221,31 @@ namespace driver_bridge
         driver_loader::initialize_and_load();
 
         if (!device || !device->connect()) {
-            set_last_error_locked("Failed to connect to the kernel driver.");
+            DWORD err = device ? device->get_last_connect_error() : 0xFFFFFFFFu;
+            char buf[256];
+            if (err == 0xFFFFFFFFu) {
+                snprintf(buf, sizeof(buf), "Failed to connect to the kernel driver (device object is null).");
+            } else if ((err & 0xFFFF0000u) == 0xBEA70000u) {
+                snprintf(buf, sizeof(buf),
+                    "Driver device opened but heartbeat failed (0x%08X). "
+                    "Stale session or IOCTL mismatch — try rebooting.",
+                    err);
+            } else if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+                snprintf(buf, sizeof(buf),
+                    "Driver device not found (error %lu). "
+                    "The kernel driver may not be loaded.",
+                    (unsigned long)err);
+            } else if (err == ERROR_ACCESS_DENIED) {
+                snprintf(buf, sizeof(buf),
+                    "Access denied opening driver device. "
+                    "Run AiDA as Administrator.");
+            } else {
+                snprintf(buf, sizeof(buf),
+                    "Failed to connect to the kernel driver (error 0x%08X).",
+                    err);
+            }
+            set_last_error_locked(buf);
+            logf("AiDA Standalone: %s\n", buf);
             return false;
         }
 
@@ -227,6 +268,15 @@ namespace driver_bridge
         return g_kernel_mode && device && device->is_connected();
     }
 
+    bool can_read_memory()
+    {
+        std::lock_guard<std::mutex> lk(g_state_mtx);
+        if (g_pid == 0) return false;
+        if (g_kernel_attached) return true;
+        if (g_has_vm_read && g_process) return true;
+        return false;
+    }
+
     bool attach(uint32_t pid)
     {
 
@@ -244,40 +294,50 @@ namespace driver_bridge
 
         std::lock_guard<std::mutex> lk(g_state_mtx);
 
-        DWORD access = PROCESS_QUERY_LIMITED_INFORMATION;
+        DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ;
         unique_handle process(OpenProcess(access, FALSE, pid));
+        bool has_vm_read = true;
         if (!process) {
-            set_last_error_locked("OpenProcess failed for PID " + std::to_string(pid) +
-                                  " (error " + std::to_string(GetLastError()) + ")");
-            return false;
+            has_vm_read = false;
+            access = PROCESS_QUERY_LIMITED_INFORMATION;
+            process.reset(OpenProcess(access, FALSE, pid));
+            if (!process) {
+                set_last_error_locked("OpenProcess failed for PID " + std::to_string(pid) +
+                                      " (error " + std::to_string(GetLastError()) + ")");
+                return false;
+            }
         }
 
         close_process_handle_locked();
         g_process = process.release();
         g_pid = pid;
+        g_has_vm_read = has_vm_read;
+        g_kernel_attached = false;
         if (!refresh_process_name_locked())
             g_process_name = process_name_from_pid(pid);
 
         bool kernel_ok = g_kernel_mode && device && device->is_connected();
         if (kernel_ok) {
+            device->set_process_id(pid);
+
             const auto* vtable = get_arc_vtable();
+            bool vtable_solved = false;
             if (vtable && vtable->set_process_id && vtable->solve_dtb &&
                 vtable->get_dtb && vtable->find_image && vtable->set_base_address) {
                 vtable->set_process_id(pid);
                 uint64_t dtb = vtable->solve_dtb();
                 if (dtb != 0) {
+                    vtable_solved = true;
                     const auto image_base = vtable->find_image();
                     if (image_base != 0)
                         vtable->set_base_address(image_base);
-                    device->set_process_id(pid);
                     device->solve_dtb();
                     if (image_base != 0)
                         device->set_base_address(image_base);
-                } else {
-                    kernel_ok = false;
                 }
-            } else {
-                device->set_process_id(pid);
+            }
+
+            if (!vtable_solved) {
                 device->solve_dtb();
                 if (device->get_dtb() == 0) {
                     kernel_ok = false;
@@ -289,6 +349,7 @@ namespace driver_bridge
             }
 
             if (kernel_ok) {
+                g_kernel_attached = true;
                 device->solve_kernel_dtb();
                 if (device->get_kernel_dtb() != 0) {
                     logf("AiDA Standalone: Kernel DTB solved: 0x%llX\n",
@@ -302,8 +363,11 @@ namespace driver_bridge
             logf("AiDA Standalone: Attached to PID %u (%s) via kernel driver. DTB=0x%llX\n",
                  g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str(),
                  static_cast<unsigned long long>(device->get_dtb()));
+        } else if (has_vm_read) {
+            logf("AiDA Standalone: Attached to PID %u (%s) via user-mode handle (VM_READ).\n",
+                 g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str());
         } else {
-            logf("AiDA Standalone: Attached to PID %u (%s) via user-mode handle.\n",
+            logf("AiDA Standalone: Attached to PID %u (%s) via limited handle (query-only).\n",
                  g_pid, g_process_name.empty() ? "unknown" : g_process_name.c_str());
         }
         return true;
@@ -352,6 +416,8 @@ namespace driver_bridge
         close_process_handle_locked();
         g_pid = 0;
         g_process_name.clear();
+        g_has_vm_read = false;
+        g_kernel_attached = false;
         if (g_kernel_mode && device && device->is_connected()) {
             const auto* vtable = get_arc_vtable();
             if (vtable && vtable->clear_process_context) {
@@ -732,6 +798,24 @@ namespace driver_bridge
             return result;
         }
 
+        if (process) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            uint64_t addr = 0;
+            while (result.size() < max_regions &&
+                   VirtualQueryEx(process, reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(addr)), &mbi, sizeof(mbi)) == sizeof(mbi)) {
+                memory_region_t region;
+                region.base    = reinterpret_cast<uint64_t>(mbi.BaseAddress);
+                region.size    = mbi.RegionSize;
+                region.state   = mbi.State;
+                region.protect = mbi.Protect;
+                region.type    = mbi.Type;
+                result.push_back(region);
+                uint64_t next = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+                if (next <= addr) break;
+                addr = next;
+            }
+        }
+
         return result;
     }
 
@@ -770,6 +854,19 @@ namespace driver_bridge
             }
         }
 
+        if (process) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQueryEx(process, reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(address)),
+                               &mbi, sizeof(mbi)) == sizeof(mbi)) {
+                region.base    = reinterpret_cast<uint64_t>(mbi.BaseAddress);
+                region.size    = mbi.RegionSize;
+                region.state   = mbi.State;
+                region.protect = mbi.Protect;
+                region.type    = mbi.Type;
+                return true;
+            }
+        }
+
         return false;
     }
 
@@ -794,34 +891,62 @@ namespace driver_bridge
         out.clear();
         HANDLE process = nullptr;
         bool kernel_mode = false;
+        bool has_vm_read = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mtx);
             process = g_process;
             kernel_mode = g_kernel_mode && device && device->is_connected();
+            has_vm_read = g_has_vm_read;
         }
         if (size == 0)
             return false;
 
         if (kernel_mode) {
+            bool kernel_attached = false;
+            {
+                std::lock_guard<std::mutex> lk2(g_state_mtx);
+                kernel_attached = g_kernel_attached;
+            }
+            if (!kernel_attached) {
+                static int s_skip_kernel_log = 0;
+                if (s_skip_kernel_log++ < 10)
+                    logf("read_memory: SKIPPING kernel path (not kernel_attached), falling through to RPM\n");
+            } else {
             out.resize(size);
             size_t bytes_read = 0;
             const auto* vtable = get_arc_vtable();
             if (vtable && vtable->read_raw) {
                 bytes_read = vtable->read_raw(address, out.data(), size);
-            } else {
+            }
+
+            if (bytes_read == 0 && device && device->get_dtb() != 0) {
                 bytes_read = device->read_raw(address, out.data(), size);
+            }
+
+            {
+                static int s_read_log_count = 0;
+                if (s_read_log_count < 50) {
+                    s_read_log_count++;
+                    logf("read_memory: addr=0x%llX sz=%llu kernel=%d vtable=%d dtb=0x%llX bytes=%llu\n",
+                        (unsigned long long)address, (unsigned long long)size,
+                        kernel_mode ? 1 : 0,
+                        (vtable && vtable->read_raw) ? 1 : 0,
+                        device ? (unsigned long long)device->get_dtb() : 0ULL,
+                        (unsigned long long)bytes_read);
+                }
             }
 
             if (bytes_read == 0) {
                 bool re_resolved = false;
                 {
                     std::lock_guard<std::mutex> lk(g_state_mtx);
-                    if (vtable && vtable->solve_dtb && vtable->get_dtb) {
-                        uint64_t new_dtb = vtable->solve_dtb();
-                        re_resolved = (new_dtb != 0);
-                    } else if (device) {
+                    if (device) {
                         device->solve_dtb();
                         re_resolved = (device->get_dtb() != 0);
+                    }
+                    if (!re_resolved && vtable && vtable->solve_dtb && vtable->get_dtb) {
+                        uint64_t new_dtb = vtable->solve_dtb();
+                        re_resolved = (new_dtb != 0);
                     }
                 }
 
@@ -829,19 +954,40 @@ namespace driver_bridge
                     std::memset(out.data(), 0, size);
                     if (vtable && vtable->read_raw) {
                         bytes_read = vtable->read_raw(address, out.data(), size);
-                    } else {
+                    }
+                    if (bytes_read == 0) {
                         bytes_read = device->read_raw(address, out.data(), size);
                     }
                 }
-
-                if (bytes_read == 0) {
-                    out.clear();
-                    return false;
-                }
             }
 
-            out.resize(bytes_read);
-            return true;
+            if (bytes_read > 0) {
+                out.resize(bytes_read);
+                return true;
+            }
+            out.clear();
+            } // end kernel_attached
+        }
+
+        if (has_vm_read && process && size <= 0x10000000) {
+            out.resize(size);
+            SIZE_T bytes_rpm = 0;
+            BOOL rpm_ok = ReadProcessMemory(process, reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(address)),
+                                  out.data(), size, &bytes_rpm);
+            {
+                static int s_rpm_log_count = 0;
+                if (s_rpm_log_count < 50) {
+                    s_rpm_log_count++;
+                    logf("read_memory RPM fallback: addr=0x%llX sz=%llu ok=%d bytes=%llu err=%lu\n",
+                        (unsigned long long)address, (unsigned long long)size,
+                        rpm_ok ? 1 : 0, (unsigned long long)bytes_rpm, rpm_ok ? 0UL : GetLastError());
+                }
+            }
+            if (rpm_ok && bytes_rpm > 0) {
+                out.resize(static_cast<size_t>(bytes_rpm));
+                return true;
+            }
+            out.clear();
         }
 
         return false;
@@ -872,34 +1018,38 @@ namespace driver_bridge
             const auto* vtable = get_arc_vtable();
             if (vtable && vtable->write_raw) {
                 bytes_written = vtable->write_raw(address, data.data(), data.size());
-            } else {
-                bytes_written = device->write_raw(address, data.data(), data.size());
             }
 
+            if (bytes_written == 0 && device && device->get_dtb() != 0) {
+                bytes_written = device->write_raw(address, data.data(), data.size());
+            }
 
             if (bytes_written == 0) {
                 bool re_resolved = false;
                 {
                     std::lock_guard<std::mutex> lk(g_state_mtx);
-                    if (vtable && vtable->solve_dtb && vtable->get_dtb) {
-                        uint64_t new_dtb = vtable->solve_dtb();
-                        re_resolved = (new_dtb != 0);
-                    } else if (device) {
+                    if (device) {
                         device->solve_dtb();
                         re_resolved = (device->get_dtb() != 0);
+                    }
+                    if (!re_resolved && vtable && vtable->solve_dtb && vtable->get_dtb) {
+                        uint64_t new_dtb = vtable->solve_dtb();
+                        re_resolved = (new_dtb != 0);
                     }
                 }
 
                 if (re_resolved) {
                     if (vtable && vtable->write_raw) {
                         bytes_written = vtable->write_raw(address, data.data(), data.size());
-                    } else {
+                    }
+                    if (bytes_written == 0) {
                         bytes_written = device->write_raw(address, data.data(), data.size());
                     }
                 }
             }
 
-            return bytes_written > 0;
+            if (bytes_written > 0)
+                return true;
         }
 
         return false;
@@ -1177,6 +1327,7 @@ namespace driver_bridge
         }
 
         auto raw = device->enumerate_connections(filter_pid, filter_protocol);
+        logf("enumerate_connections: got %zu raw entries (filter_pid=%u proto=%u)\n", raw.size(), filter_pid, filter_protocol);
         result.reserve(raw.size());
         for (const auto& src : raw) {
             net_connection_info_t c;
@@ -1202,12 +1353,15 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
+        logf("start_capture: kernel_mode=%d pid=%u port=%u proto=%u\n", kernel_mode ? 1 : 0, filter_pid, filter_port, filter_protocol);
         if (!kernel_mode) {
             require_kernel_fail("start_capture");
             return false;
         }
 
-        return device->start_capture(filter_pid, filter_port, filter_protocol, filter_ip, max_payload);
+        bool result = device->start_capture(filter_pid, filter_port, filter_protocol, filter_ip, max_payload);
+        logf("start_capture: device->start_capture returned %d\n", result ? 1 : 0);
+        return result;
     }
 
     bool stop_capture()
@@ -1247,10 +1401,15 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!kernel_mode)
+        if (!kernel_mode) {
+            logf("get_captured_packets: kernel_mode=false, returning empty\n");
             return result;
+        }
 
         auto raw = device->get_captured_packets(max_packets);
+        if (!raw.empty()) {
+            logf("get_captured_packets: got %zu raw packets\n", raw.size());
+        }
         result.reserve(raw.size());
         for (auto& src : raw) {
             captured_packet_t pkt;
@@ -1280,10 +1439,13 @@ namespace driver_bridge
             std::lock_guard<std::mutex> lk(g_state_mtx);
             kernel_mode = g_kernel_mode && device && device->is_connected();
         }
-        if (!kernel_mode)
+        if (!kernel_mode) {
+            logf("get_dns_queries: kernel_mode=false, returning empty\n");
             return result;
+        }
 
         auto raw = device->get_dns_queries(filter_pid);
+        logf("get_dns_queries: got %zu raw entries (filter_pid=%u)\n", raw.size(), filter_pid);
         result.reserve(raw.size());
         for (auto& src : raw) {
             dns_entry_t entry;
@@ -2395,6 +2557,53 @@ namespace driver_bridge
                 p.data    = std::move(src.data);
                 out->packets.push_back(std::move(p));
             }
+        }
+        return ok;
+    }
+
+    bool run_kernel_hv_detection(hv_kernel_detect_result_t& result) {
+        bool kernel_mode;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            return false;
+        }
+
+        voyager::detail::hv_detect_result raw{};
+        bool ok = device->run_hv_detect(raw);
+        if (ok) {
+            result.sidt_lock_prefix    = raw.sidt_lock_prefix;
+            result.sidt_invalid_pf     = raw.sidt_invalid_pf;
+            result.sidt_tlb_only       = raw.sidt_tlb_only;
+            result.sidt_timing         = raw.sidt_timing;
+            result.sidt_compat_mode    = raw.sidt_compat_mode;
+            result.sidt_noncanonical_gp = raw.sidt_noncanonical_gp;
+            result.sidt_noncanonical_ss = raw.sidt_noncanonical_ss;
+            result.sidt_cpl3_umip_off  = raw.sidt_cpl3_umip_off;
+            result.sidt_cpl3_umip_on   = raw.sidt_cpl3_umip_on;
+            result.lidt_lock_prefix    = raw.lidt_lock_prefix;
+            result.lidt_invalid_pf     = raw.lidt_invalid_pf;
+            result.lidt_tlb_only       = raw.lidt_tlb_only;
+            result.lidt_timing         = raw.lidt_timing;
+            result.lidt_noncanonical_gp = raw.lidt_noncanonical_gp;
+            result.lidt_noncanonical_ss = raw.lidt_noncanonical_ss;
+            result.lidt_cpl3_gp        = raw.lidt_cpl3_gp;
+            result.ve_trigger          = raw.ve_trigger;
+            result.ve_lbr_stack        = raw.ve_lbr_stack;
+            result.ve_garbage_msr      = raw.ve_garbage_msr;
+            result.ve_xsetbv_gp        = raw.ve_xsetbv_gp;
+            result.ve_synthetic_msr    = raw.ve_synthetic_msr;
+            result.ve_cpuid_leaf_cmp   = raw.ve_cpuid_leaf_cmp;
+            result.ve_rdtsc_cpuid      = raw.ve_rdtsc_cpuid;
+            result.ve_aperf_divergence = raw.ve_aperf_divergence;
+            result.ve_invd_cache       = raw.ve_invd_cache;
+            result.ve_cr4_vmxe         = raw.ve_cr4_vmxe;
+            result.ve_lbr_tos          = raw.ve_lbr_tos;
+            result.total_failed        = raw.total_failed;
+            result.total_run           = raw.total_run;
+            result.ms_hv_skipped       = raw.ms_hv_skipped;
         }
         return ok;
     }

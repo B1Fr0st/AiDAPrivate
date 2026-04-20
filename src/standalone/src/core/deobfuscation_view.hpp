@@ -73,8 +73,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const ImU32 yellow_col = IM_COL32(229, 192, 123, static_cast<int>(alpha * 255));
 	const ImU32 cyan_col  = IM_COL32(86, 182, 194, static_cast<int>(alpha * 255));
 	const ImU32 magenta_col = IM_COL32(198, 120, 221, static_cast<int>(alpha * 255));
-	const ImU32 junk_col  = IM_COL32(100, 60, 60, static_cast<int>(alpha * 200));
-	const ImU32 junk_text = IM_COL32(180, 100, 100, static_cast<int>(alpha * 180));
+	const ImU32 junk_col  = _ta(ui_anim::darken(_t.panel_bg, 10));
+	const ImU32 junk_text = _ta(ui_anim::lighten(_t.text_dim, 10));
 
 	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + width, cy + height), bg);
 
@@ -87,9 +87,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float ty = cy + 8.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(tx, ty));
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(35, 37, 48, static_cast<int>(alpha * 255)));
-	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(212, 212, 212, static_cast<int>(alpha * 255)));
-	ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(60, 65, 80, static_cast<int>(alpha * 150)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
+	ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
+	ImGui::PushStyleColor(ImGuiCol_Border, _ta(ui_anim::lighten(_t.panel_bg, 12)));
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
 
@@ -115,12 +115,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		static_cast<int>(accent_g * 180), static_cast<int>(accent_b * 180), static_cast<int>(alpha * 240)));
 	ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(static_cast<int>(accent_r * 100),
 		static_cast<int>(accent_g * 100), static_cast<int>(accent_b * 100), static_cast<int>(alpha * 255)));
-	ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, static_cast<int>(alpha * 255)));
+	ImGui::PushStyleColor(ImGuiCol_Text, _ta(_t.text_primary));
 
 	bool processing = eng.processing.load();
 
 	if (!processing) {
-		if (ImGui::SmallButton("Deobfuscate")) {
+		if (ImGui::Button("Deobfuscate", ImVec2(100.f, 26.f))) {
 			uint64_t addr = 0;
 			if (st.addr_input[0])
 				addr = std::strtoull(st.addr_input, nullptr, 16);
@@ -138,7 +138,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 		}
 		ImGui::SameLine();
-		if (ImGui::SmallButton("Export ASM")) {
+		if (ImGui::Button("Export ASM", ImVec2(90.f, 26.f))) {
 			std::lock_guard<std::mutex> lk(eng.mutex);
 			if (eng.last_result.success) {
 				std::string asm_text = deobfuscation_engine::export_clean_asm(eng.last_result);
@@ -146,7 +146,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 		}
 		ImGui::SameLine();
-		if (ImGui::SmallButton("Export Stats")) {
+		if (ImGui::Button("Export Stats", ImVec2(96.f, 26.f))) {
 			std::lock_guard<std::mutex> lk(eng.mutex);
 			if (eng.last_result.success) {
 				std::string stats_text = deobfuscation_engine::export_statistics(eng.last_result);
@@ -154,7 +154,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 		}
 	} else {
-		ImGui::SmallButton("Processing...");
+		ImGui::Button("Processing...", ImVec2(100.f, 26.f));
 	}
 
 	ImGui::SameLine();
@@ -306,7 +306,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				float line_y = ry + row_h * 0.5f;
 				dl->AddLine(ImVec2(code_x + 134.f, line_y),
 				            ImVec2(code_x + 134.f + ImGui::CalcTextSize(dtxt.c_str()).x, line_y),
-				            IM_COL32(180, 80, 80, static_cast<int>(alpha * 150)));
+				            _ta(ui_anim::lighten(_t.text_dim, 10)));
 			}
 
 			const char* status_label = nullptr;
@@ -326,7 +326,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 			if (status_label && status_label[0] != 'C') {
 				ui_anim::render_badge(dl, status_label, code_x + code_w - 66.f, ry + 2.f,
-					IM_COL32(40, 42, 55, static_cast<int>(160 * alpha * row_t)),
+					ui_anim::theme_alpha(_t.panel_header, 0.63f * alpha * row_t),
 					ui_anim::theme_alpha(status_color, row_t));
 			} else {
 				dl->AddText(ImVec2(code_x + code_w - 66.f, ry + 2.f),
@@ -348,6 +348,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	{
 		ui_anim::render_panel_card(dl, info_x, body_top, info_w, body_h,
 			accent_r, accent_g, accent_b, alpha, 4.f, false);
+
+		float info_content_h = body_h - 8.f;
+		ImGui::SetCursorScreenPos(ImVec2(info_x, body_top + 4.f));
+		ImGui::BeginChild("##deob_info_panel", ImVec2(info_w, info_content_h), false,
+			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
+		auto* info_dl = ImGui::GetWindowDrawList();
 
 		float iy = body_top + 4.f;
 		float ix = info_x + 10.f;
@@ -384,8 +390,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			float ring_cy = iy + 40.f;
 			float ring_r = 30.f;
 
+			float donut_pulse = (std::sin(st.anim_time * 2.f) + 1.f) * 0.5f;
+			ImU32 ring_glow_outer = IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
+				static_cast<int>(accent_b * 255), static_cast<int>(alpha * (10.f + donut_pulse * 12.f)));
+			dl->AddCircleFilled(ImVec2(ring_cx, ring_cy), ring_r + 12.f, ring_glow_outer, 32);
 			ImU32 ring_glow = IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
-				static_cast<int>(accent_b * 255), static_cast<int>(alpha * 15));
+				static_cast<int>(accent_b * 255), static_cast<int>(alpha * (18.f + donut_pulse * 10.f)));
 			dl->AddCircleFilled(ImVec2(ring_cx, ring_cy), ring_r + 8.f, ring_glow, 32);
 
 			float donut_fracs[] = { res.junk_ratio, 1.f - res.junk_ratio };
@@ -473,6 +483,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				iy += 16.f;
 			}
 		}
+
+		float info_scroll_content = iy - body_top;
+		float info_scroll_visible = info_content_h;
+		if (info_scroll_content > info_scroll_visible) {
+			ui_anim::handle_scroll_input(st.info_target_scroll, 0.f,
+				std::max(0.f, info_scroll_content - info_scroll_visible), 20.f);
+			ui_anim::smooth_scroll(st.info_scroll_y, st.info_target_scroll, 12.f, dt);
+		}
+		ImGui::EndChild();
 	}
 
 	ImGui::EndChild();

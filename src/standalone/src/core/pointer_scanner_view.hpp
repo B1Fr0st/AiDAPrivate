@@ -4,6 +4,7 @@
 #include "pointer_scanner.hpp"
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
+#include "../helpers/globals.h"
 
 extern DisasmState g_disasm;
 
@@ -17,11 +18,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float a = alpha;
 	auto& st = pointer_scanner::g_state;
 
-	ImU32 bg = IM_COL32(18, 18, 24, static_cast<int>(220 * a));
-	ImU32 panel_bg = IM_COL32(26, 26, 34, static_cast<int>(200 * a));
-	ImU32 hdr_bg = IM_COL32(34, 34, 44, static_cast<int>(230 * a));
-	ImU32 text_main = IM_COL32(230, 228, 255, static_cast<int>(240 * a));
-	ImU32 text_dim = IM_COL32(130, 130, 160, static_cast<int>(180 * a));
+	const auto& _t = themes::resolved;
+	const auto _ta = [alpha](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, alpha);
+	};
+
+	ImU32 bg = _ta(_t.bg_base);
+	ImU32 panel_bg = _ta(_t.panel_bg);
+	ImU32 hdr_bg = _ta(_t.panel_header);
+	ImU32 text_main = _ta(_t.text_primary);
+	ImU32 text_dim = _ta(_t.text_dim);
 	ImU32 text_val = IM_COL32(100, 200, 150, static_cast<int>(220 * a));
 	ImU32 text_inv = IM_COL32(220, 80, 80, static_cast<int>(220 * a));
 	ImU32 accent_col = IM_COL32(
@@ -30,11 +36,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImU32 accent_dim = IM_COL32(
 		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 		static_cast<int>(accent_b * 255), static_cast<int>(80 * a));
-	ImU32 row_hover = IM_COL32(255, 255, 255, static_cast<int>(12 * a));
+	ImU32 row_hover_col = _ta(_t.panel_header);
 	ImU32 row_sel = IM_COL32(
 		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 		static_cast<int>(accent_b * 255), static_cast<int>(30 * a));
-	ImU32 sep_col = IM_COL32(60, 60, 80, static_cast<int>(80 * a));
+	ImU32 sep_col = _ta(ui_anim::lighten(_t.panel_bg, 12));
 
 	float x0 = wp.x + pos_x;
 	float y0 = wp.y + pos_y;
@@ -81,7 +87,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopStyleColor();
 	ImGui::Spacing();
 
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(40, 40, 55, static_cast<int>(200 * a)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_bg));
 	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
@@ -148,8 +154,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			pointer_scanner::cancel_all();
 		ImGui::PopStyleColor(3);
 	} else {
-		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(50, 50, 70, static_cast<int>(200 * a)));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(70, 70, 100, static_cast<int>(200 * a)));
+		ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
 		ImGui::PushStyleColor(ImGuiCol_Text, text_main);
 		if (ImGui::Button("Build Pointer Map##ptr", ImVec2(-1.f, 0.f)))
 			pointer_scanner::build_reverse_map();
@@ -173,11 +179,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	} else {
 		bool can_scan = !building && st.map_entry_count > 0;
 		ImGui::PushStyleColor(ImGuiCol_Button, can_scan
-			? IM_COL32(40, 100, 60, static_cast<int>(200 * a))
-			: IM_COL32(50, 50, 50, static_cast<int>(120 * a)));
+			? _ta(ui_anim::darken(_t.panel_header, 5))
+			: _ta(_t.panel_bg));
 		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, can_scan
-			? IM_COL32(60, 130, 80, static_cast<int>(200 * a))
-			: IM_COL32(50, 50, 50, static_cast<int>(120 * a)));
+			? _ta(ui_anim::lighten(_t.panel_header, 14))
+			: _ta(_t.panel_bg));
 		ImGui::PushStyleColor(ImGuiCol_Text, can_scan ? text_main : text_dim);
 		if (ImGui::Button("Scan Chains##ptr", ImVec2(-1.f, 0.f)) && can_scan) {
 			st.config.target_address = strtoull(st.addr_buf, nullptr, 16);
@@ -194,8 +200,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
-	ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(50, 50, 70, static_cast<int>(200 * a)));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(70, 70, 100, static_cast<int>(200 * a)));
+	ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
 	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
 
 	if (ImGui::Button("Validate All##ptr", ImVec2(-1.f, 0.f)))
@@ -255,7 +261,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float max_scroll = (total > visible_count) ? (total - visible_count) * row_h : 0.f;
 		if (st.target_scroll_y > max_scroll) st.target_scroll_y = max_scroll;
 	}
-	st.scroll_y += (st.target_scroll_y - st.scroll_y) * 0.3f;
+	ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 20.f, ImGui::GetIO().DeltaTime);
 
 	int start_row = static_cast<int>(st.scroll_y / row_h);
 	if (start_row < 0) start_row = 0;
@@ -332,12 +338,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (chain.validated) {
 			ImVec2 badge_min(rx - 2.f, ry + 2.f);
 			ImVec2 badge_max(rx + 14.f, ry + row_h - 2.f);
-			dl->AddRectFilled(badge_min, badge_max, IM_COL32(40, 180, 100, static_cast<int>(40 * row_a)), 4.f);
+			dl->AddRectFilled(badge_min, badge_max, IM_COL32(
+				(accent_col >> IM_COL32_R_SHIFT) & 0xFF,
+				(accent_col >> IM_COL32_G_SHIFT) & 0xFF,
+				(accent_col >> IM_COL32_B_SHIFT) & 0xFF,
+				static_cast<int>(40 * row_a)), 4.f);
 		}
 
 		if (i < total - 1)
 			dl->AddLine(ImVec2(table_x, ry + row_h), ImVec2(table_x + table_w, ry + row_h),
-			            IM_COL32(40, 40, 55, static_cast<int>(60 * a)));
+			            _ta(ui_anim::lighten(_t.panel_bg, 12)));
 	}
 
 	ImGui::EndChild();
@@ -362,8 +372,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 3.f));
-		ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(50, 50, 70, static_cast<int>(200 * a)));
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(70, 70, 100, static_cast<int>(200 * a)));
+		ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
 		ImGui::PushStyleColor(ImGuiCol_Text, text_main);
 
 		if (ImGui::Button("Copy Chain##ptr")) {
@@ -458,7 +468,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			float ow = ots.x + 12.f;
 			ddl->AddRectFilled(ImVec2(cwp.x + dx, cwp.y + diagram_y_start),
 			                   ImVec2(cwp.x + dx + ow, cwp.y + diagram_y_start + node_h),
-			                   IM_COL32(40, 40, 60, static_cast<int>(180 * a)), 4.f);
+			                   _ta(_t.panel_bg), 4.f);
 			ddl->AddText(ImVec2(cwp.x + dx + 6.f, cwp.y + diagram_y_start + 2.f), text_main, ob);
 			dx += ow;
 		}

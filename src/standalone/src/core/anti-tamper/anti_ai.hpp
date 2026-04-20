@@ -68,12 +68,26 @@ namespace mcp_detect
         if (h == INVALID_HANDLE_VALUE) return false;
 
         bool found = false;
+        int scanned = 0;
         do
         {
             wchar_t lower[MAX_PATH] = {};
             detail::to_lower_w(fd.cFileName, lower, MAX_PATH);
+            ++scanned;
 
-            if (detail::contains_w(lower, L"mcp")
+            // skip our own pipes — ai_deception creates AiDA_MCP_Bridge
+            if (detail::contains_w(lower, L"aida"))
+                continue;
+
+            // skip generic MCP UUID sockets (VS Code extensions etc.)
+            // pattern: "mcp-XXXXXXXX-..." with hex UUID — these are standard MCP servers, not targeting us
+            if (detail::contains_w(lower, L"mcp-") && detail::contains_w(lower, L".sock"))
+                continue;
+
+            if (detail::contains_w(lower, L"mcp-bridge")
+                || detail::contains_w(lower, L"mcp_bridge")
+                || detail::contains_w(lower, L"mcp-server")
+                || detail::contains_w(lower, L"mcp_server")
                 || detail::contains_w(lower, L"model-context")
                 || detail::contains_w(lower, L"claude-bridge")
                 || detail::contains_w(lower, L"anthropic")
@@ -89,6 +103,10 @@ namespace mcp_detect
                 || detail::contains_w(lower, L"json-rpc-driver")
                 || detail::contains_w(lower, L"tool-server"))
             {
+                char log_buf[512];
+                _snprintf_s(log_buf, sizeof(log_buf), _TRUNCATE,
+                    "scan_named_pipes HIT pipe=%ls scanned=%d", lower, scanned);
+                webhook::write_log("anti_ai", log_buf);
                 found = true;
                 break;
             }
@@ -96,6 +114,12 @@ namespace mcp_detect
         while (FindNextFileW(h, &fd));
 
         FindClose(h);
+        {
+            char log_buf[128];
+            _snprintf_s(log_buf, sizeof(log_buf), _TRUNCATE,
+                "scan_named_pipes done scanned=%d found=%d", scanned, found ? 1 : 0);
+            webhook::write_log("anti_ai", log_buf);
+        }
         return found;
     }
 
@@ -624,6 +648,21 @@ namespace combined
         if (report.memory_scanner_detected) report.summary += "MEM_SCANNER ";
         if (report.handle_to_us_detected) report.summary += "HANDLE_LEAK ";
         if (report.clipboard_monitored) report.summary += "CLIP_MON ";
+
+        {
+            char buf[512];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "ai_scan mcp_pipe=%d mcp_proc=%d mcp_port=%d llm_engine=%d llm_gpu=%d "
+                "ai_tool=%d mem_scan=%d handle=%d clip=%d any_threat=%d summary=%s",
+                mcp.named_pipe_found ? 1 : 0, mcp.mcp_process_found ? 1 : 0,
+                mcp.mcp_port_active ? 1 : 0,
+                llm.inference_engine_found ? 1 : 0, llm.gpu_inference_active ? 1 : 0,
+                report.ai_tool_detected ? 1 : 0, report.memory_scanner_detected ? 1 : 0,
+                report.handle_to_us_detected ? 1 : 0, report.clipboard_monitored ? 1 : 0,
+                report.any_threat() ? 1 : 0,
+                report.summary.empty() ? "none" : report.summary.c_str());
+            webhook::write_log("anti_ai", buf);
+        }
 
         return report;
     }

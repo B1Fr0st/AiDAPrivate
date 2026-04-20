@@ -106,13 +106,55 @@ namespace detail {
 
 }
 
+namespace detail {
+
+    __declspec(noinline) inline bool safe_read_uint64(uint64_t addr, uint64_t* out)
+    {
+        __try {
+            *out = *reinterpret_cast<const volatile uint64_t*>(addr);
+            return true;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            *out = 0;
+            return false;
+        }
+    }
+
+}
+
 inline bool verify_iat_entries(const std::vector<state::iat_entry_t>& snapshot)
 {
-    for (const auto& e : snapshot)
+    for (size_t idx = 0; idx < snapshot.size(); ++idx)
     {
-        const auto current = *reinterpret_cast<const volatile uint64_t*>(e.slot_va);
-        if (current != e.resolved_va)
+        const auto& e = snapshot[idx];
+
+        uint64_t current = 0;
+        if (!detail::safe_read_uint64(e.slot_va, &current))
+        {
+            static int s_iat_exc_logged = 0;
+            if (s_iat_exc_logged < 5) {
+                ++s_iat_exc_logged;
+                char dbg[256];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "iat_read_exception slot_va=0x%llX idx=%zu",
+                    e.slot_va, idx);
+                webhook::write_log("iat_hook", dbg);
+            }
             return false;
+        }
+
+        if (current != e.resolved_va)
+        {
+            static int s_iat_fail_logged = 0;
+            if (s_iat_fail_logged < 5) {
+                ++s_iat_fail_logged;
+                char dbg[256];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "iat_mismatch idx=%zu slot_va=0x%llX expected=0x%llX got=0x%llX",
+                    idx, e.slot_va, e.resolved_va, current);
+                webhook::write_log("iat_hook", dbg);
+            }
+            return false;
+        }
     }
     return true;
 }
@@ -142,7 +184,9 @@ inline bool verify_iat_target_modules(const std::vector<state::iat_entry_t>& sna
 
     for (const auto& e : snapshot)
     {
-        const auto current = *reinterpret_cast<const volatile uint64_t*>(e.slot_va);
+        uint64_t current = 0;
+        if (!detail::safe_read_uint64(e.slot_va, &current))
+            return false;
         bool in_module = false;
         for (const auto& r : ranges)
         {

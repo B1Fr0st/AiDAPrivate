@@ -15,6 +15,7 @@
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
 #include "ui_anim.hpp"
+#include "../helpers/globals.h"
 
 extern DisasmState g_disasm;
 
@@ -367,22 +368,27 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImVec2 wp = ImGui::GetWindowPos();
 	float a = alpha;
 
-	ImU32 bg = IM_COL32(18, 18, 24, static_cast<int>(220 * a));
-	ImU32 panel_bg = IM_COL32(26, 26, 34, static_cast<int>(200 * a));
-	ImU32 hdr_bg = IM_COL32(34, 34, 44, static_cast<int>(230 * a));
-	ImU32 text_main = IM_COL32(230, 228, 255, static_cast<int>(240 * a));
-	ImU32 text_dim = IM_COL32(130, 130, 160, static_cast<int>(180 * a));
-	ImU32 text_sec = IM_COL32(170, 175, 190, static_cast<int>(200 * a));
+	const auto& _t = themes::resolved;
+	const auto _ta = [a](ImU32 c) -> ImU32 {
+		return ui_anim::theme_alpha(c, a);
+	};
+
+	ImU32 bg = _ta(_t.bg_base);
+	ImU32 panel_bg = _ta(_t.panel_bg);
+	ImU32 hdr_bg = _ta(_t.panel_header);
+	ImU32 text_main = _ta(_t.text_primary);
+	ImU32 text_dim = _ta(_t.text_dim);
+	ImU32 text_sec = _ta(_t.text_secondary);
 	ImU32 accent_col = IM_COL32(
 		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 		static_cast<int>(accent_b * 255), static_cast<int>(220 * a));
 	ImU32 red_col = IM_COL32(255, 90, 90, static_cast<int>(200 * a));
 	ImU32 green_col = IM_COL32(90, 255, 130, static_cast<int>(200 * a));
-	ImU32 row_hover = IM_COL32(255, 255, 255, static_cast<int>(12 * a));
+	ImU32 row_hover_col = _ta(_t.panel_header);
 	ImU32 row_sel = IM_COL32(
 		static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 		static_cast<int>(accent_b * 255), static_cast<int>(30 * a));
-	ImU32 sep_col = IM_COL32(60, 60, 80, static_cast<int>(80 * a));
+	ImU32 sep_col = _ta(ui_anim::lighten(_t.panel_bg, 12));
 
 	float x0 = wp.x + pos_x;
 	float y0 = wp.y + pos_y;
@@ -391,15 +397,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	float toolbar_h = 36.f;
 	ui_anim::render_toolbar(dl, x0, y0, width, toolbar_h, accent_r, accent_g, accent_b, a);
-	dl->AddLine(ImVec2(x0, y0 + toolbar_h), ImVec2(x0 + width, y0 + toolbar_h), IM_COL32(60, 65, 80, static_cast<int>(80 * a)));
+	dl->AddLine(ImVec2(x0, y0 + toolbar_h), ImVec2(x0 + width, y0 + toolbar_h), sep_col);
 
 	ImGui::SetCursorPos(ImVec2(pos_x + 8.f, pos_y + 6.f));
 	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
 	ImGui::TextUnformatted("Memory Snapshot Diff");
 	ImGui::PopStyleColor();
 
-	ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(50, 50, 70, static_cast<int>(200 * a)));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(70, 70, 100, static_cast<int>(200 * a)));
+	ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
 	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 4.f));
@@ -416,7 +422,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float bar_h = 8.f;
 		ImVec2 bp = ImGui::GetCursorScreenPos();
 		dl->AddRectFilled(ImVec2(bp.x, bp.y + 8.f), ImVec2(bp.x + bar_w, bp.y + 8.f + bar_h),
-		                  IM_COL32(40, 40, 55, static_cast<int>(200 * a)), 4.f);
+		                  _ta(_t.panel_header), 4.f);
 		dl->AddRectFilled(ImVec2(bp.x, bp.y + 8.f), ImVec2(bp.x + bar_w * prog, bp.y + 8.f + bar_h),
 		                  accent_col, 4.f);
 		char pct[16];
@@ -433,9 +439,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		snap_count = static_cast<int>(g_state.snapshots.size());
 	}
 
-	ImGui::SetCursorPos(ImVec2(pos_x + 380.f, pos_y + 5.f));
+	ImGui::SetCursorPos(ImVec2(pos_x + width * 0.35f, pos_y + 5.f));
 	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(40, 40, 55, static_cast<int>(200 * a)));
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_header));
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 4.f));
 
@@ -474,8 +480,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopStyleColor(2);
 
 	ImGui::SameLine();
-	ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(50, 50, 70, static_cast<int>(200 * a)));
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(70, 70, 100, static_cast<int>(200 * a)));
+	ImGui::PushStyleColor(ImGuiCol_Button, _ta(_t.panel_header));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, _ta(ui_anim::lighten(_t.panel_header, 14)));
 	ImGui::PushStyleColor(ImGuiCol_Text, text_main);
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 4.f));
@@ -530,11 +536,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
+	static float diff_row_anim_time = 0.f;
+	diff_row_anim_time += ImGui::GetIO().DeltaTime;
+
 	float row_height = 20.f;
 	for (int i = 0; i < static_cast<int>(filtered.size()); ++i) {
 		auto& c = filtered[i];
 		ImVec2 rp = ImGui::GetCursorScreenPos();
 
+		float row_entrance = ui_anim::render_row_entrance(i, diff_row_anim_time, 0.012f);
 		bool hov = ImGui::IsMouseHoveringRect(rp, ImVec2(rp.x + width, rp.y + row_height), true);
 		bool sel = (g_state.selected_change == i);
 
@@ -543,7 +553,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		rs.hovered = hov;
 		rs.index = i;
 		rs.alpha = a;
-		rs.entrance = 1.f;
+		rs.entrance = row_entrance;
 		rs.ar = accent_r; rs.ag = accent_g; rs.ab = accent_b;
 		ui_anim::render_table_row(dl, rp.x, rp.y, width, row_height, rs);
 

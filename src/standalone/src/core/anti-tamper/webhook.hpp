@@ -25,21 +25,25 @@ namespace detail {
     inline const char* log_path()
     {
         static char s_path[MAX_PATH] = {};
-        static std::once_flag s_once;
-        std::call_once(s_once, [](){
+        static bool s_init = false;
+        if (!s_init)
+        {
             DWORD ret = GetModuleFileNameA(nullptr, s_path, MAX_PATH);
             if (ret == 0 || ret >= MAX_PATH)
             {
                 strcpy_s(s_path, "aida_debug.log");
-                return;
             }
-            char* last = strrchr(s_path, '\\');
-            if (last)
-                *(last + 1) = '\0';
             else
-                s_path[0] = '\0';
-            strcat_s(s_path, "aida_debug.log");
-        });
+            {
+                char* last = strrchr(s_path, '\\');
+                if (last)
+                    *(last + 1) = '\0';
+                else
+                    s_path[0] = '\0';
+                strcat_s(s_path, "aida_debug.log");
+            }
+            s_init = true;
+        }
         return s_path;
     }
 
@@ -103,6 +107,7 @@ inline void write_log(const char* tag, const char* detail)
     if (len > 0) {
         DWORD written;
         WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
+        FlushFileBuffers(hf);
     }
     CloseHandle(hf);
 }
