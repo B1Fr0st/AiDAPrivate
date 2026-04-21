@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include "work_queue.hpp"
 #include <vector>
 #include <map>
 #include <unordered_map>
@@ -291,8 +292,7 @@ public:
         _state = index_state_t::indexing;
         _stop = false;
 
-        if (_thread.joinable()) _thread.join();
-        _thread = std::thread([this]() { index_workspace(); });
+        work_queue::post([this]() { index_workspace(); });
     }
 
     void stop_indexing()

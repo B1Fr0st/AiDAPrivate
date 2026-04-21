@@ -1,23 +1,21 @@
 # ============================================================================
-# AiDA Deploy Script — Build, Encrypt, Upload
+# AiDA Deploy Script — Encrypt and Upload
 # ============================================================================
-# Builds AiDAStandalone + ARC DLL, encrypts ARC, uploads both to server,
-# and restarts the API. Run from the repo root or anywhere — paths are absolute.
+# Encrypts ARC DLL and uploads built binaries to the server.
+# Build via CMake/MSBuild before running this script.
 #
 # Usage:
-#   .\deploy_to_server.ps1              # Build all + upload
-#   .\deploy_to_server.ps1 -SkipBuild   # Upload existing binaries only
-#   .\deploy_to_server.ps1 -ArcOnly     # Build + upload ARC only
-#   .\deploy_to_server.ps1 -ExeOnly     # Build + upload AiDAStandalone only
+#   .\deploy_to_server.ps1              # Upload ARC + AiDAStandalone
+#   .\deploy_to_server.ps1 -ArcOnly     # Upload ARC only
+#   .\deploy_to_server.ps1 -ExeOnly     # Upload AiDAStandalone only
 # ============================================================================
 
 param(
-    [switch]$SkipBuild,
     [switch]$ArcOnly,
     [switch]$ExeOnly
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -29,8 +27,6 @@ $SERVER              = "ruarr@23.88.62.199"
 $REMOTE_ARC_PATH     = "~/aida-server/arc/aida_core.bin"
 $REMOTE_EXE_PATH     = "~/aida-server/bin/AiDA.exe"
 $ARC_MASTER_SECRET   = "b3c4700abcf39f23d46527f2d2efd4b7d6e81dce0a674bd72d77a73067728453"
-$MSBUILD             = "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe"
-$CMAKE               = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -54,43 +50,6 @@ function Invoke-SSH($cmd) {
         Write-Fail "SSH command failed: $cmd`n$output"
     }
     return $output
-}
-
-# ── Ensure CMake is configured with ARC ──────────────────────────────────────
-
-if (-not $SkipBuild) {
-    # Check if ARC target exists in the build
-    if (-not (Test-Path "$BUILD_DIR\AiDA_ARC.vcxproj")) {
-        Write-Step "Configuring CMake with BUILD_ARC_DLL=ON"
-        & $CMAKE -S $REPO_ROOT -B $BUILD_DIR -G "Visual Studio 17 2022" -A x64 -DBUILD_ARC_DLL=ON 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Fail "CMake configure failed" }
-        Write-Ok "CMake configured"
-    }
-}
-
-# ── Build ────────────────────────────────────────────────────────────────────
-
-$buildTargets = @()
-
-if (-not $SkipBuild) {
-    if ($ArcOnly) {
-        $buildTargets = @("AiDA_ARC")
-    } elseif ($ExeOnly) {
-        $buildTargets = @("AiDAStandalone")
-    } else {
-        $buildTargets = @("AiDAStandalone", "AiDA_ARC")
-    }
-
-    foreach ($target in $buildTargets) {
-        Write-Step "Building $target (Release x64)"
-        & $MSBUILD "$BUILD_DIR\$target.vcxproj" /p:Configuration=Release /p:Platform=x64 /v:minimal /m 2>&1 | ForEach-Object {
-            if ($_ -match "error") { Write-Host $_ -ForegroundColor Red }
-            elseif ($_ -match "warning") { Write-Host $_ -ForegroundColor Yellow }
-            elseif ($_ -match "\.vcxproj ->") { Write-Host $_ -ForegroundColor Green }
-        }
-        if ($LASTEXITCODE -ne 0) { Write-Fail "Build failed for $target" }
-        Write-Ok "$target built"
-    }
 }
 
 # ── Encrypt ARC ──────────────────────────────────────────────────────────────

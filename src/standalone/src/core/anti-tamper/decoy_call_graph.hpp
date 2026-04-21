@@ -32,7 +32,7 @@ namespace anti_tamper::decoy {
         extern volatile uintptr_t s_hp_fn_table[];
     }
 
-    // Observable sink — decoy results XOR into this; chain reads it periodically
+
     inline volatile uint64_t g_decoy_sink = 0;
 
     __forceinline bool opaque_true(uint64_t x)
@@ -47,9 +47,7 @@ namespace anti_tamper::decoy {
         return !opaque_true(x);
     }
 
-    // Runtime predicate: selects a bit from g_server_poly_seed via compile-time index.
-    // When seed != 0, a subset of decoys actually execute depending on seed bits.
-    // When seed == 0 (pre-server), falls back to opaque_false (never executes).
+
     __forceinline bool runtime_gate(uint64_t compile_seed)
     {
         uint64_t seed = anti_tamper::virtualizer::g_server_poly_seed;

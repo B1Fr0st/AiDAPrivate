@@ -1,6 +1,7 @@
 #pragma once
 
 #include "symbolic_engine.hpp"
+#include "work_queue.hpp"
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
 #include "imgui/imgui.h"
@@ -77,12 +78,12 @@ inline void start_taint_trace(local_state_t& st) {
 	}
 
 	symbolic_engine::g_state.processing.store(true);
-	std::thread([addr, end, max_i = static_cast<uint32_t>(st.max_insns), regs, mem_ranges]() {
+	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), regs, mem_ranges]() {
 		auto result = symbolic_engine::taint_trace(addr, end, max_i, regs, mem_ranges);
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_taint = std::move(result);
 		symbolic_engine::g_state.processing.store(false);
-	}).detach();
+	});
 }
 
 inline std::vector<taint_node_t> build_taint_flow(const symbolic_engine::taint_result_t& res,

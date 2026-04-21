@@ -164,18 +164,10 @@ inline bool initialize()
     decoy::initialize();
     webhook::write_log("init", "decoy_call_graph_ok");
 
-    // packer::encrypt_sections encrypts .data/.rdata in-place with AES-CTR.
-    // No on-demand decrypt VEH exists, so encrypted sections become immediately
-    // unreadable — any access to static data, string literals, or vtables in
-    // those sections causes an immediate crash. MUST remain disabled until a
-    // guard-page-based auto-decrypt handler is implemented.
-    // packer::encrypt_sections(rt.code_snap.text_hash ^ __rdtsc());
+
     webhook::write_log("init", "packer_encrypt_SKIPPED_no_autodecrypt");
 
-    // packer::obfuscate_imports redirects IAT through XOR trampolines.
-    // Breaks CRT internal function pointers (e.g. _beginthreadex path)
-    // and can crash on any imported call made after this point.
-    // packer::obfuscate_imports(static_cast<uint32_t>(rt.code_snap.text_hash));
+
     webhook::write_log("init", "packer_imports_SKIPPED_breaks_crt");
 
     nanomites::initialize();
@@ -203,9 +195,6 @@ inline bool initialize()
         driver_bridge::kernel_anti_debug_hide_all_threads(self_pid);
         webhook::write_log("init", "kernel_anti_debug_ok");
 
-        // kernel anti-dump: runs before thread spawning so TLS-preserved headers are still intact
-        driver_bridge::kernel_anti_dump_full(self_pid);
-        webhook::write_log("init", "kernel_anti_dump_ok");
 
         uint64_t debugger_pid = 0;
         driver_bridge::kernel_anti_debug_scan_debuggers(&debugger_pid);
@@ -228,7 +217,7 @@ inline bool initialize()
     rt.initialized.store(true);
     webhook::write_log("init", "initialized_ok");
 
-    // spawn all background threads BEFORE PE corruption
+
     try
     {
         webhook::write_log("init", "start_monitors_entering");
@@ -259,8 +248,7 @@ inline bool initialize()
         webhook::write_log("init", "re_detect_unknown_exception");
     }
 
-    // PE corruption phase — runs AFTER all threads are spawned
-    // anti_dump corrupts PE headers (preserving TLS/exception/Signature/Magic/SizeOfOptionalHeader)
+
     try
     {
         webhook::write_log("init", "anti_dump_entering");
@@ -291,13 +279,21 @@ inline bool initialize()
         webhook::write_log("init", "standalone_anti_dump_unknown_exception");
     }
 
+
+    if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
+    {
+        uint32_t self_pid = GetCurrentProcessId();
+        driver_bridge::kernel_anti_dump_full(self_pid);
+        webhook::write_log("init", "kernel_anti_dump_ok");
+    }
+
     anti_dump::seal_handles();
     webhook::write_log("init", "seal_handles_ok");
 
     standalone_anti_dump::seal_handles();
     webhook::write_log("init", "standalone_seal_handles_ok");
 
-    // verify thread creation still works after PE corruption + seal
+
     try
     {
         std::atomic<bool> test_done{false};
@@ -339,7 +335,7 @@ inline bool guard()
     CFF_BEGIN(guard_cff)
     CFF_STATE(guard_cff, 0)
     {
-        if (s_guard_call_count <= 3 || (s_guard_call_count % 20) == 0) {
+        if (s_guard_call_count <= 3 || (s_guard_call_count % 5) == 0) {
             char dbg[128];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "guard_iter=%llu state=0 violation_latched=%d",
                 s_guard_call_count, rt.violation_latched.load() ? 1 : 0);
@@ -389,7 +385,7 @@ inline bool guard()
     {
         DECOY_CALL_INTEGRATED(g3);
         auto dbg = anti_debug::full_scan(rt.code_snap.module_base, rt.code_snap.module_end);
-        if (s_guard_call_count <= 3) {
+        {
             char dbg_buf[256];
             _snprintf_s(dbg_buf, sizeof(dbg_buf), _TRUNCATE,
                 "guard_iter=%llu state=3 anti_debug_any=%d summary=%s",
@@ -554,7 +550,7 @@ inline bool guard()
     CFF_STATE(guard_cff, 9)
     {
         bool lic_valid = standalone_license::is_valid();
-        if (s_guard_call_count <= 3) {
+        {
             char dbg[256];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
                 "guard_iter=%llu state=9 license_valid=%d",
@@ -652,14 +648,6 @@ inline bool guard()
             addr = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
         }
 
-        if (s_guard_call_count <= 3) {
-            char dbg[256];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "guard_iter=%llu state=11 page_ok=%d failed_prot=0x%X failed_addr=0x%llX text_base=0x%llX text_size=0x%X",
-                s_guard_call_count, page_ok ? 1 : 0, failed_prot,
-                failed_addr, rt.code_snap.text_base, (unsigned)rt.code_snap.text_size);
-            webhook::write_log("guard", dbg);
-        }
         if (!page_ok)
         {
             char detail[256];
@@ -669,6 +657,14 @@ inline bool guard()
             enforce_violation("writable_code_page");
             CFF_EXIT(guard_cff);
         }
+        {
+            char dbg[256];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "page_scan_ok iter=%llu text_base=0x%llX text_size=0x%X",
+                s_guard_call_count, rt.code_snap.text_base, (unsigned)rt.code_snap.text_size);
+            webhook::write_log("guard", dbg);
+        }
+        CFF_EXIT(guard_cff);
     }
     CFF_END(guard_cff)
 
@@ -693,19 +689,39 @@ inline void start_monitors()
             while (rt.monitors_running.load() && !rt.violation_latched.load())
             {
                 ++iter;
-                if (iter <= 5 || (iter % 20) == 0) {
-                    char dbg[128];
-                    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "monitor_loop iter=%llu", iter);
-                    webhook::write_log("monitor", dbg);
+                try
+                {
+                    {
+                        char dbg[128];
+                        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                            "monitor_loop iter=%llu verify_counter=%u violation=%d",
+                            iter, rt.verify_counter, rt.violation_latched.load() ? 1 : 0);
+                        webhook::write_log("monitor", dbg);
+                    }
+                    bool guard_result = guard();
+                    {
+                        char dbg[128];
+                        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                            "guard_returned=%d iter=%llu verify_counter=%u",
+                            guard_result ? 1 : 0, iter, rt.verify_counter);
+                        webhook::write_log("monitor", dbg);
+                    }
+                    enforcement_tick();
                 }
-                bool guard_result = guard();
-                if (iter <= 5 || !guard_result) {
-                    char dbg[128];
-                    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "guard_returned=%d iter=%llu",
-                        guard_result ? 1 : 0, iter);
-                    webhook::write_log("monitor", dbg);
+                catch (const std::exception& ex)
+                {
+                    char ebuf[256];
+                    _snprintf_s(ebuf, sizeof(ebuf), _TRUNCATE,
+                        "monitor_loop_EXCEPTION iter=%llu what=%s", iter, ex.what());
+                    webhook::write_log("monitor", ebuf);
                 }
-                enforcement_tick();
+                catch (...)
+                {
+                    char ebuf[128];
+                    _snprintf_s(ebuf, sizeof(ebuf), _TRUNCATE,
+                        "monitor_loop_UNKNOWN_EXCEPTION iter=%llu", iter);
+                    webhook::write_log("monitor", ebuf);
+                }
                 Sleep(500);
             }
             char dbg[128];

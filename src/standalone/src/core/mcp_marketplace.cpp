@@ -1,6 +1,7 @@
 #define NOMINMAX
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "mcp_marketplace.hpp"
+#include "work_queue.hpp"
 #include "mcp_client.hpp"
 #include "standalone_license.hpp"
 #include "standalone_settings.hpp"
@@ -302,7 +303,7 @@ void search_async(const std::string& query, registry_t reg)
     }
 
     std::string q = query;
-    s_search_thread = std::thread([q, reg]() {
+    work_queue::post([q, reg]() {
         std::vector<package_info_t> results;
         try {
             if (reg == registry_t::npm)
@@ -378,7 +379,7 @@ void install_async(const package_info_t& pkg)
     }
 
     package_info_t p = pkg;
-    s_install_thread = std::thread([p]() {
+    work_queue::post([p]() {
         auto dir = marketplace_dir();
         std::string pkg_dir = (dir / p.name).string();
 
@@ -602,8 +603,6 @@ void tick()
 void shutdown()
 {
     s_shutdown.store(true);
-    if (s_search_thread.joinable())  s_search_thread.join();
-    if (s_install_thread.joinable()) s_install_thread.join();
 }
 
 }

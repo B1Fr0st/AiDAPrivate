@@ -118,6 +118,9 @@ struct work_item {
 struct state_t {
     proxy_config       config;
     std::atomic<bool>  running{false};
+    std::atomic<bool>  proxy_alive{false};
+    std::mutex         proxy_start_mtx;
+    std::condition_variable proxy_start_cv;
     std::thread        listener_thread;
 
 
@@ -153,6 +156,8 @@ inline state_t g_state;
 
 bool start(const proxy_config& config = {});
 void stop();
+void pre_initialize();
+void shutdown();
 bool is_running();
 
 

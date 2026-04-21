@@ -829,7 +829,7 @@ if(WIN32)
     # Built separately, deployed on the license server, delivered after
     # successful license validation. NOT linked into AiDAStandalone.
 
-    option(BUILD_ARC_DLL "Build the ARC (AiDA Runtime Core) DLL" OFF)
+    option(BUILD_ARC_DLL "Build the ARC (AiDA Runtime Core) DLL" ON)
 
     if(BUILD_ARC_DLL)
         set(ARC_SOURCES

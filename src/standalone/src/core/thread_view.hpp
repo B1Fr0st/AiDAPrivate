@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "work_queue.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -51,7 +52,7 @@ inline void refresh()
 		return;
 	g_ui.refreshing.store(true);
 
-	std::thread([]() {
+	work_queue::post([]() {
 		auto raw_threads = driver_bridge::enumerate_threads();
 		auto modules = driver_bridge::enumerate_modules();
 
@@ -120,7 +121,7 @@ inline void refresh()
 			g_ui.threads = std::move(entries);
 		}
 		g_ui.refreshing.store(false);
-	}).detach();
+	});
 }
 
 namespace detail {

@@ -241,11 +241,7 @@ namespace opaque_predicates {
         return n_sq >= n || n == 1;
     }
 
-    // Phase 4.5: the original Fermat little-theorem and quadratic-residue
-    // predicates had a recognizable math shape (modexp over small primes,
-    // square-then-mod-4). Static scanners flag them instantly. Re-route
-    // both names to sum_of_squares/euler_identity so existing OPAQUE_*_FERMAT
-    // and OPAQUE_*_QUADRATIC call sites compile but emit unrecognizable code.
+
     __forceinline bool fermat_true(uint64_t seed)
     {
         return sum_of_squares_true(seed ^ 0x9E3779B97F4A7C15ULL);

@@ -3253,8 +3253,20 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
     if (!request) { NET_ERR("handle_net_cap_ctrl: NULL request"); return STATUS_INVALID_PARAMETER; }
 
     if (net_capture::g_wfp_initialized != 2) {
-        NET_ERR("handle_net_cap_ctrl: WFP not initialized (state=%d)", (int)net_capture::g_wfp_initialized);
-        return STATUS_DEVICE_NOT_READY;
+        // WFP was cleaned up when the previous client session ended.
+        // Re-initialize lazily using the stored device object if available.
+        if (net_capture::g_device_object != nullptr) {
+            NET_DBG("handle_net_cap_ctrl: WFP not ready (state=%d), attempting lazy re-init", (int)net_capture::g_wfp_initialized);
+            NTSTATUS reinit_status = net_capture::initialize(net_capture::g_device_object);
+            if (!NT_SUCCESS(reinit_status)) {
+                NET_ERR("handle_net_cap_ctrl: lazy WFP re-init FAILED status=0x%08lx", reinit_status);
+                return STATUS_DEVICE_NOT_READY;
+            }
+            NET_DBG("handle_net_cap_ctrl: lazy WFP re-init OK");
+        } else {
+            NET_ERR("handle_net_cap_ctrl: WFP not initialized (state=%d) and no device object", (int)net_capture::g_wfp_initialized);
+            return STATUS_DEVICE_NOT_READY;
+        }
     }
 
     switch (request->operation) {

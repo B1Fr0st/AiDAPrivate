@@ -34,12 +34,12 @@ static std::string json_dump_safe(const json& j, int indent = -1)
 
 static std::string generate_session_id()
 {
-    // Phase 6.5: cryptographically strong session IDs via BCryptGenRandom.
+
     unsigned char rnd[16] = {};
     NTSTATUS st = BCryptGenRandom(nullptr, rnd, sizeof(rnd),
                                   BCRYPT_USE_SYSTEM_PREFERRED_RNG);
     if (st != 0) {
-        // Fallback only on catastrophic failure; still avoid mt19937.
+
         auto t = std::chrono::steady_clock::now().time_since_epoch().count();
         for (size_t i = 0; i < sizeof(rnd); ++i)
             rnd[i] = static_cast<unsigned char>((t >> (i * 8)) ^ i);

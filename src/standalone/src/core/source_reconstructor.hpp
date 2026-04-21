@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include "work_queue.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -689,7 +690,7 @@ inline void reconstruct(const reconstruction_config_t& config) {
 		g_state.last_result.output_dir = config.output_dir;
 	}
 
-	std::thread([config]() {
+	work_queue::post([config]() {
 		reconstruction_result_t result;
 		result.output_dir = config.output_dir;
 
@@ -977,7 +978,7 @@ inline void reconstruct(const reconstruction_config_t& config) {
 		result.total_functions = static_cast<int>(funcs.size());
 
 		finish(true);
-	}).detach();
+	});
 }
 
 }

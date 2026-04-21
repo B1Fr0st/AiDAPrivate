@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include "work_queue.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -540,7 +541,7 @@ inline void start_fuzzing()
 		g_state.active = true;
 	}
 
-	std::thread([]() {
+	work_queue::post([]() {
 		auto& cfg = g_state.config;
 		auto& stats = g_state.stats;
 
@@ -726,7 +727,7 @@ inline void start_fuzzing()
 		}
 
 		g_state.running.store(false);
-	}).detach();
+	});
 #endif
 }
 
@@ -749,7 +750,7 @@ inline void ai_analyze_crash(int crash_index)
 
 	g_state.analyzing_crash.store(true);
 
-	std::thread([target_crash, crash_index]() {
+	work_queue::post([target_crash, crash_index]() {
 		std::string prompt = "You are a vulnerability researcher analyzing a crash found by a fuzzer.\n\n";
 		prompt += "CRASH DETAILS:\n";
 		prompt += "Type: " + std::string(crash_type_name(target_crash.type)) + "\n";
@@ -828,7 +829,7 @@ inline void ai_analyze_crash(int crash_index)
 		}
 
 		g_state.analyzing_crash.store(false);
-	}).detach();
+	});
 #else
 	(void)crash_index;
 #endif
@@ -850,7 +851,7 @@ inline void minimize_crash(int crash_index)
 
 	g_state.minimizing.store(true);
 
-	std::thread([target_crash, crash_index]() {
+	work_queue::post([target_crash, crash_index]() {
 		auto& cfg = g_state.config;
 
 		emulation::process_snapshot_t snapshot;
@@ -927,7 +928,7 @@ inline void minimize_crash(int crash_index)
 		}
 
 		g_state.minimizing.store(false);
-	}).detach();
+	});
 #else
 	(void)crash_index;
 #endif

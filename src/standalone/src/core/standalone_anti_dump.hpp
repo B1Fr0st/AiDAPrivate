@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include "work_queue.hpp"
 #include <psapi.h>
 #include <intrin.h>
 #include <winternl.h>
@@ -120,7 +121,7 @@ namespace pe_header
         }
 
         auto* new_dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-        // preserve e_magic so the loader can still traverse DOS→NT→TLS for thread creation
+
         new_dos->e_magic = saved_magic;
         new_dos->e_lfanew = static_cast<LONG>(e_lfanew);
 
@@ -147,7 +148,7 @@ namespace pe_header
         if (!VirtualProtect(nt, total, PAGE_READWRITE, &old_prot))
             return false;
 
-        // preserve fields the loader needs for thread creation / TLS / SEH
+
         IMAGE_DATA_DIRECTORY saved_tls = {};
         if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS)
             saved_tls = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
@@ -183,7 +184,7 @@ namespace pe_header
         memset(nt->OptionalHeader.DataDirectory, 0,
                sizeof(nt->OptionalHeader.DataDirectory));
 
-        // restore loader-critical fields
+
         nt->Signature = saved_signature;
         nt->OptionalHeader.Magic = saved_magic;
         nt->FileHeader.SizeOfOptionalHeader = saved_sizeof_opt;
@@ -772,7 +773,7 @@ inline bool initialize()
         {
             auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(
                 reinterpret_cast<uint8_t*>(mod) + dos->e_lfanew);
-            // Machine==0 means anti_dump already corrupted NT headers
+
             pe_intact = (nt->FileHeader.Machine != 0);
 
             char dbg2[256];
@@ -839,7 +840,7 @@ inline bool initialize()
     anti_tamper::webhook::write_log("anti_dump", "monitors_store_ok");
     try
     {
-        std::thread(monitor::run_periodic_reencrypt).detach();
+        work_queue::post(monitor::run_periodic_reencrypt);
         anti_tamper::webhook::write_log("anti_dump", "sa_thread_detach_ok");
     }
     catch (const std::exception& ex) {

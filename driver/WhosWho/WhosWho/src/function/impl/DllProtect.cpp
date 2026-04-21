@@ -398,7 +398,11 @@ namespace dll_protection {
 
             {
                 UINT64 instr_cb = 0;
-                if (check_foreign_instrumentation(slot.pid, &instr_cb)) {
+                BOOLEAN has_instr = check_foreign_instrumentation(slot.pid, &instr_cb);
+                WW_LOG("[DLL-PROTECT] pid=%u check_foreign_instrumentation=%d cb=%p",
+                    slot.pid, has_instr ? 1 : 0, (PVOID)instr_cb);
+                if (has_instr) {
+                    WW_LOG("[DLL-PROTECT] pid=%u FOREIGN_INSTR_CB=%p triggering BRIDGE_CMD_DEBUGGER_FOUND", slot.pid, (PVOID)instr_cb);
                     sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
                     sentinel_bridge::g_bridge.sentinel_cmd_param = (ULONG)(instr_cb & 0xFFFFFFFFu);
                 }

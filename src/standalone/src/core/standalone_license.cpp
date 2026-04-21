@@ -85,7 +85,7 @@ static void diagnose_network(const char* host, int port)
 {
     char buf[512];
 
-    // Step 1: DNS resolution
+
     struct addrinfo hints = {}, *result = nullptr;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -98,7 +98,7 @@ static void diagnose_network(const char* host, int port)
         lic_log(buf);
         return;
     }
-    // Log all resolved addresses
+
     for (struct addrinfo* rp = result; rp; rp = rp->ai_next) {
         char ip[64] = {};
         if (rp->ai_family == AF_INET) {
@@ -113,7 +113,7 @@ static void diagnose_network(const char* host, int port)
         lic_log(buf);
     }
 
-    // Step 2: Raw TCP connect to first result
+
     SOCKET sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
     if (sock == INVALID_SOCKET) {
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
@@ -122,7 +122,7 @@ static void diagnose_network(const char* host, int port)
         freeaddrinfo(result);
         return;
     }
-    // Set 5s timeout
+
     DWORD tv = 5000;
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
@@ -141,7 +141,7 @@ static void diagnose_network(const char* host, int port)
     closesocket(sock);
     freeaddrinfo(result);
 
-    // Step 3: Check SSL context creation
+
     SSL_CTX* test_ctx = SSL_CTX_new(TLS_client_method());
     if (!test_ctx) {
         unsigned long ssl_err = ERR_get_error();
@@ -155,7 +155,7 @@ static void diagnose_network(const char* host, int port)
         SSL_CTX_free(test_ctx);
     }
 
-    // Step 4: Full httplib test with fresh client
+
     {
         httplib::Client test_client(std::string("https://") + host);
         test_client.set_connection_timeout(10);
@@ -176,7 +176,7 @@ static void diagnose_network(const char* host, int port)
         }
     }
 
-    // Step 5: httplib test with AF_INET (same as production config)
+
     {
         httplib::Client test_client2(std::string("https://") + host);
         test_client2.set_address_family(AF_INET);
@@ -198,7 +198,7 @@ static void diagnose_network(const char* host, int port)
         }
     }
 
-    // Step 6: Non-blocking connect (httplib-style) diagnostic
+
     {
         struct addrinfo hints2 = {}, *result2 = nullptr;
         hints2.ai_family = AF_INET;
@@ -211,13 +211,13 @@ static void diagnose_network(const char* host, int port)
                 nb_sock = socket(result2->ai_family, result2->ai_socktype, result2->ai_protocol);
             }
             if (nb_sock != INVALID_SOCKET) {
-                // Set non-blocking
+
                 u_long nb_mode = 1;
                 ioctlsocket(nb_sock, FIONBIO, &nb_mode);
                 int nb_ret = ::connect(nb_sock, result2->ai_addr, (int)result2->ai_addrlen);
                 int nb_wsa = WSAGetLastError();
                 if (nb_ret == SOCKET_ERROR && nb_wsa == WSAEWOULDBLOCK) {
-                    // Poll like httplib does
+
                     WSAPOLLFD pfd = {};
                     pfd.fd = nb_sock;
                     pfd.events = POLLIN | POLLOUT;
@@ -246,7 +246,7 @@ static void diagnose_network(const char* host, int port)
         }
     }
 
-    // Step 7: HTTP (non-SSL) httplib test to isolate SSL vs socket issue
+
     {
         httplib::Client test_http(std::string("http://") + host, 80);
         test_http.set_connection_timeout(5);
@@ -267,10 +267,6 @@ static void diagnose_network(const char* host, int port)
     }
 }
 
-// ── Raw-socket + OpenSSL HTTP client ───────────────────────────────────────────
-// Bypasses both cpp-httplib (WSASocketW → WSAENOBUFS after anti-tamper) and
-// WinHTTP (WPAD proxy detection hangs for minutes).  Uses plain socket() +
-// blocking connect() which the diagnostics proved works reliably.
 
 struct SimpleHttpResponse {
     int    status = 0;
@@ -289,7 +285,7 @@ static SimpleHttpResponse raw_https_request(
 {
     SimpleHttpResponse out;
 
-    // ── Parse URL ──────────────────────────────────────────────────────
+
     bool is_https = true;
     std::string work = url;
     if (work.rfind("https://", 0) == 0)      work = work.substr(8);
@@ -311,7 +307,7 @@ static SimpleHttpResponse raw_https_request(
         host = host.substr(0, colon);
     }
 
-    // ── DNS ────────────────────────────────────────────────────────────
+
     struct addrinfo hints = {}, *result = nullptr;
     hints.ai_family   = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -322,7 +318,7 @@ static SimpleHttpResponse raw_https_request(
         return out;
     }
 
-    // ── Socket + connect ───────────────────────────────────────────────
+
     SOCKET sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
     if (sock == INVALID_SOCKET) {
         freeaddrinfo(result);
@@ -330,7 +326,7 @@ static SimpleHttpResponse raw_https_request(
         return out;
     }
 
-    // Set send/recv timeouts
+
     DWORD tv = static_cast<DWORD>(timeout_sec * 1000);
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
@@ -344,7 +340,7 @@ static SimpleHttpResponse raw_https_request(
     }
     freeaddrinfo(result);
 
-    // ── SSL handshake (if HTTPS) ───────────────────────────────────────
+
     SSL_CTX* ctx = nullptr;
     SSL* ssl     = nullptr;
     if (is_https) {
@@ -372,7 +368,7 @@ static SimpleHttpResponse raw_https_request(
         }
     }
 
-    // ── Build HTTP request ─────────────────────────────────────────────
+
     std::string http_req;
     http_req += verb;
     http_req += " ";
@@ -389,7 +385,7 @@ static SimpleHttpResponse raw_https_request(
     http_req += "\r\n";
     http_req += req_body;
 
-    // ── Send ───────────────────────────────────────────────────────────
+
     auto send_all = [&](const char* data, int len) -> bool {
         while (len > 0) {
             int n;
@@ -409,7 +405,7 @@ static SimpleHttpResponse raw_https_request(
         return out;
     }
 
-    // ── Receive ────────────────────────────────────────────────────────
+
     std::string raw_resp;
     raw_resp.reserve(4096);
     char buf[4096];
@@ -419,20 +415,20 @@ static SimpleHttpResponse raw_https_request(
         else     n = ::recv(sock, buf, sizeof(buf), 0);
         if (n <= 0) break;
         raw_resp.append(buf, n);
-        if (raw_resp.size() > 4 * 1024 * 1024) break; // 4MB safety cap
+        if (raw_resp.size() > 4 * 1024 * 1024) break;
     }
 
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
     closesocket(sock);
 
-    // ── Parse HTTP response ────────────────────────────────────────────
+
     auto hdr_end = raw_resp.find("\r\n\r\n");
     if (hdr_end == std::string::npos) {
         out.error = "malformed HTTP response (no header end)";
         return out;
     }
 
-    // Status line: "HTTP/1.1 200 OK"
+
     auto first_line_end = raw_resp.find("\r\n");
     std::string status_line = raw_resp.substr(0, first_line_end);
     auto sp1 = status_line.find(' ');
@@ -440,16 +436,16 @@ static SimpleHttpResponse raw_https_request(
         out.status = atoi(status_line.c_str() + sp1 + 1);
     }
 
-    // Check for chunked transfer encoding
+
     std::string headers_str = raw_resp.substr(0, hdr_end);
     std::string body_raw = raw_resp.substr(hdr_end + 4);
 
-    // Simple lowercase search for transfer-encoding: chunked
+
     std::string headers_lower = headers_str;
     for (auto& c : headers_lower) c = (char)tolower((unsigned char)c);
 
     if (headers_lower.find("transfer-encoding: chunked") != std::string::npos) {
-        // Decode chunked encoding
+
         std::string decoded;
         size_t pos = 0;
         while (pos < body_raw.size()) {
@@ -460,7 +456,7 @@ static SimpleHttpResponse raw_https_request(
             pos = crlf + 2;
             if (pos + chunk_size > body_raw.size()) break;
             decoded.append(body_raw, pos, chunk_size);
-            pos += chunk_size + 2; // skip trailing CRLF
+            pos += chunk_size + 2;
         }
         out.body = std::move(decoded);
     } else {
@@ -1026,6 +1022,13 @@ namespace
         lic_log("endpoint_once_posting");
         auto resp = raw_https_request("POST", host + "/validateLicense",
                                     hdrs, body_str, "application/json");
+        {
+            char rl[384];
+            _snprintf_s(rl, sizeof(rl), _TRUNCATE,
+                "endpoint_once_response ok=%d status=%d err=%.80s body=%.150s",
+                (int)resp.ok, resp.status, resp.error.c_str(), resp.body.c_str());
+            lic_log(rl);
+        }
         if (!resp.ok) {
             char buf[256];
             _snprintf_s(buf, sizeof(buf), _TRUNCATE,
@@ -1045,20 +1048,34 @@ namespace
 
         response_out = json::parse(resp.body, nullptr, false);
         if (response_out.is_discarded() || !response_out.is_object()) {
+            lic_log("endpoint_once_invalid_json");
             error_out = "License service returned invalid JSON.";
             return false;
         }
 
         const std::string status = response_out.value("status", "");
+        {
+            char sl[128];
+            _snprintf_s(sl, sizeof(sl), _TRUNCATE,
+                "endpoint_once_status=%.80s action=%.30s", status.c_str(), action.c_str());
+            lic_log(sl);
+        }
         if (status != "valid") {
+            char rej[256];
+            _snprintf_s(rej, sizeof(rej), _TRUNCATE,
+                "endpoint_once_rejected status=%.80s reason=%.100s",
+                status.c_str(), response_out.value("reason", "").c_str());
+            lic_log(rej);
             error_out = response_out.value("reason", status.empty() ? std::string("license rejected") : status);
             return false;
         }
         if (action == "validate" && response_out.value("client_nonce", "") != nonce) {
+            lic_log("endpoint_once_nonce_mismatch_validate");
             error_out = "License service returned a nonce mismatch.";
             return false;
         }
         if (action == "heartbeat" && response_out.value("heartbeat_nonce", "") != nonce) {
+            lic_log("endpoint_once_nonce_mismatch_heartbeat");
             error_out = "License heartbeat nonce mismatch.";
             return false;
         }
@@ -1097,12 +1114,12 @@ namespace
                 body["heartbeat_nonce"] = nonce;
                 body["plugin_version"] = "aida-standalone";
                 body["heartbeat_count"] = static_cast<int>(s_heartbeat_counter.load(std::memory_order_acquire));
-                // Phase 5.2: 24-bit gate bitmap of which anti-tamper gates
-                // have fired this session. Monotonic; server rejects shrinks.
+
+
                 body["gate_bitmap"] = static_cast<int64_t>(
                     s_gate_bitmap.load(std::memory_order_acquire) & 0x00FFFFFFu);
 
-                // Step-up response: elevated proof when server requested it
+
                 if (s_step_up_pending.load(std::memory_order_acquire))
                 {
                     std::lock_guard<std::mutex> sul(s_step_up_mtx);
@@ -1112,7 +1129,7 @@ namespace
                         uint64_t su_tsc = __rdtsc();
                         uint64_t su_proof = s_proof_hash.load(std::memory_order_acquire);
                         uint64_t su_gates = s_gate_bitmap.load(std::memory_order_acquire);
-                        // Combine all entropy into a single step_up_proof
+
                         uint64_t combined = su_nonce ^ _rotl64(su_proof, 17)
                                           ^ _rotl64(su_tsc, 31) ^ su_gates;
                         combined *= 0x9E3779B97F4A7C15ULL;
@@ -1280,7 +1297,7 @@ namespace
             anti_tamper::server_pages::advance_epoch(new_epoch);
         }
 
-        // Step-up nonce: server requests elevated re-proof
+
         if (response.contains("step_up_nonce") && response["step_up_nonce"].is_string())
         {
             std::lock_guard<std::mutex> sul(s_step_up_mtx);
@@ -1741,13 +1758,23 @@ namespace
             const std::string nonce = generate_nonce();
             std::string error;
             json response;
-            if (!call_validation_endpoint(*settings, "heartbeat", settings->license_key,
+            lic_log("heartbeat_calling");
+            const bool hb_ok = call_validation_endpoint(*settings, "heartbeat", settings->license_key,
                                           s_cached_hwid, settings->license_session_token,
-                                          nonce, error, response)) {
+                                          nonce, error, response);
+            {
+                char hbr[256];
+                _snprintf_s(hbr, sizeof(hbr), _TRUNCATE,
+                    "heartbeat_result ok=%d consecutive_fail=%d err=%.150s",
+                    (int)hb_ok, consecutive_failures, error.c_str());
+                lic_log(hbr);
+            }
+            if (!hb_ok) {
 
                 if (response.is_object() &&
                     (response.value("status", "") == "killed" ||
                      response.value("alive", true) == false)) {
+                    lic_log("heartbeat_killed_by_server");
                     anti_tamper::server_pages::force_scrub_all();
                     std::lock_guard<std::mutex> lk(s_state_mtx);
                     s_error = "session_terminated";
@@ -1780,7 +1807,9 @@ namespace
             }
 
             consecutive_failures = 0;
+            lic_log("heartbeat_success_applying");
             apply_valid_response(*settings, settings->license_key, s_cached_hwid, response);
+            lic_log("heartbeat_apply_done");
         }
     }
 
@@ -2095,31 +2124,28 @@ namespace standalone_license
     {
         double factor = compute_degradation_factor();
 
-        // Tier 0 — always allowed if license exists at all (factor > 0)
-        // Core UI gates: render loop, bottom panel, settings
+
         if (slot == gate_ui_render_loop || slot == gate_ui_bottom_panel ||
             slot == gate_settings_save)
             return factor > 0.0;
 
-        // Tier 1 — basic features need factor >= 0.3
-        // File browser, workspace search, terminal, command palette
+
         if (slot == gate_file_browser_open || slot == gate_workspace_search ||
             slot == gate_terminal_exec || slot == gate_ui_command_palette)
             return factor >= 0.3;
 
-        // Tier 2 — premium features need factor >= 0.6
-        // AI chat, code generation, agentic loops, MCP tools
+
         if (slot == gate_ai_chat_async || slot == gate_ai_generate ||
             slot == gate_ai_stream_cb || slot == gate_agentic_loop_iter ||
             slot == gate_mcp_tool_exec || slot == gate_coding_tool_exec ||
             slot == gate_native_tool_use)
             return factor >= 0.6;
 
-        // Tier 3 — driver/kernel features need factor >= 0.8
+
         if (slot == gate_driver_attach || slot == gate_driver_read_mem)
             return factor >= 0.8;
 
-        // Default: need at least partial validity
+
         return factor >= 0.5;
     }
 
@@ -2164,7 +2190,12 @@ namespace standalone_license
         for (const auto& entry : s_code_hashes) {
             uint64_t current = fnv1a(reinterpret_cast<const void*>(entry.base), entry.size);
             if (current != entry.hash) {
-
+                char mismatch_buf[128];
+                _snprintf_s(mismatch_buf, sizeof(mismatch_buf), _TRUNCATE,
+                    "verify_code_hash_MISMATCH base=0x%llX sz=%zu expected=0x%llX got=0x%llX",
+                    (unsigned long long)entry.base, entry.size,
+                    (unsigned long long)entry.hash, (unsigned long long)current);
+                lic_log(mismatch_buf);
                 set_obfuscated_valid(false);
                 return false;
             }
@@ -2193,8 +2224,7 @@ namespace standalone_license
             static_cast<int64_t>(tick), std::memory_order_release);
         s_gate_tokens[slot].store(token, std::memory_order_release);
 
-        // Phase 5.2: mark this gate as fired in the 24-bit session bitmap
-        // (monotonic; server enforces non-regression in /heartbeat).
+
         if (static_cast<int>(slot) >= 0 && static_cast<int>(slot) < 24) {
             s_gate_bitmap.fetch_or(
                 static_cast<uint32_t>(1u) << static_cast<uint32_t>(slot),
@@ -2245,6 +2275,12 @@ namespace standalone_license
             uint64_t e = s_state_e.load(std::memory_order_acquire);
             uint64_t m2 = s_magic_2.load(std::memory_order_acquire);
             if ((d + e) != m2) {
+                char magic_buf[128];
+                _snprintf_s(magic_buf, sizeof(magic_buf), _TRUNCATE,
+                    "cross_validation_magic_FAIL d=%llu e=%llu sum=%llu m2=%llu frame=%d",
+                    (unsigned long long)d, (unsigned long long)e,
+                    (unsigned long long)(d+e), (unsigned long long)m2, frame_counter);
+                lic_log(magic_buf);
                 set_obfuscated_valid(false);
                 return false;
             }

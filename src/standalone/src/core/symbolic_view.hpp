@@ -1,6 +1,7 @@
 #pragma once
 
 #include "symbolic_engine.hpp"
+#include "work_queue.hpp"
 #include "deobfuscation_engine.hpp"
 #include "ui_anim.hpp"
 #include "imgui/imgui.h"
@@ -69,24 +70,24 @@ inline void start_symbolic_exec(local_state_t& st) {
 	auto regs = parse_reg_list(st.sym_regs_buf);
 
 	symbolic_engine::g_state.processing.store(true);
-	std::thread([addr, end, max_i = static_cast<uint32_t>(st.max_insns), regs]() {
+	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), regs]() {
 		auto result = symbolic_engine::execute_symbolic(addr, end, max_i, regs, {});
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_result = std::move(result);
 		symbolic_engine::g_state.processing.store(false);
-	}).detach();
+	});
 }
 
 inline void start_deobfuscate(local_state_t& st) {
 	uint64_t addr = std::strtoull(st.addr_buf, nullptr, 16);
 
 	deobfuscation_engine::g_state.processing.store(true);
-	std::thread([addr, max_i = static_cast<uint32_t>(st.max_insns)]() {
+	work_queue::post([addr, max_i = static_cast<uint32_t>(st.max_insns)]() {
 		auto result = deobfuscation_engine::deobfuscate_function(addr, max_i);
 		std::lock_guard<std::mutex> lk(deobfuscation_engine::g_state.mutex);
 		deobfuscation_engine::g_state.last_result = std::move(result);
 		deobfuscation_engine::g_state.processing.store(false);
-	}).detach();
+	});
 }
 
 inline void start_slice(local_state_t& st) {
@@ -95,12 +96,12 @@ inline void start_slice(local_state_t& st) {
 	std::string target(st.target_reg_buf);
 
 	symbolic_engine::g_state.processing.store(true);
-	std::thread([addr, end, max_i = static_cast<uint32_t>(st.max_insns), target]() {
+	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), target]() {
 		auto result = symbolic_engine::slice_to_register(addr, end, max_i, target);
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_slice = std::move(result);
 		symbolic_engine::g_state.processing.store(false);
-	}).detach();
+	});
 }
 
 inline void start_solve(local_state_t& st) {
@@ -109,12 +110,12 @@ inline void start_solve(local_state_t& st) {
 	auto regs = parse_reg_list(st.sym_regs_buf);
 
 	symbolic_engine::g_state.processing.store(true);
-	std::thread([addr, target, max_i = static_cast<uint32_t>(st.max_insns), regs]() {
+	work_queue::post([addr, target, max_i = static_cast<uint32_t>(st.max_insns), regs]() {
 		auto result = symbolic_engine::solve_for_path(addr, target, max_i, regs);
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_solve = std::move(result);
 		symbolic_engine::g_state.processing.store(false);
-	}).detach();
+	});
 }
 
 }

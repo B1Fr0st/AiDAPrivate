@@ -140,7 +140,7 @@ namespace pe_header
         }
 
         auto* new_dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-        // preserve e_magic so the loader can still traverse DOS→NT→TLS for thread creation
+
         new_dos->e_magic = saved_magic;
         new_dos->e_lfanew = static_cast<LONG>(e_lfanew);
 
@@ -204,17 +204,17 @@ namespace pe_header
             return false;
         }
 
-        // preserve TLS directory — CRT needs it to spawn threads via _beginthreadex
+
         IMAGE_DATA_DIRECTORY saved_tls = {};
         if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS)
             saved_tls = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
 
-        // preserve exception directory — needed for SEH/unwind on x64
+
         IMAGE_DATA_DIRECTORY saved_exception = {};
         if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXCEPTION)
             saved_exception = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
 
-        // preserve fields the loader needs for thread creation / TLS init
+
         WORD saved_sizeof_opt = nt->FileHeader.SizeOfOptionalHeader;
         DWORD saved_sizeof_image = nt->OptionalHeader.SizeOfImage;
         ULONGLONG saved_image_base = nt->OptionalHeader.ImageBase;
@@ -244,9 +244,7 @@ namespace pe_header
         memset(nt->OptionalHeader.DataDirectory, 0,
                sizeof(nt->OptionalHeader.DataDirectory));
 
-        // restore loader-critical fields so CreateThread / TLS init / SEH still work
-        // ntdll!LdrpInitializeThread → LdrpAllocateTls re-parses PE headers in user memory
-        // to find IMAGE_TLS_DIRECTORY for each module — needs Signature + Magic to be valid
+
         nt->Signature = saved_signature;
         nt->OptionalHeader.Magic = saved_magic;
         nt->FileHeader.SizeOfOptionalHeader = saved_sizeof_opt;
@@ -447,7 +445,7 @@ namespace read_intercept
             uint64_t base = trap_page_base.load();
             uint32_t size = trap_page_size.load();
 
-            // only handle single-step if our trap pages are active
+
             if (base != 0 && size != 0)
             {
                 DWORD old_prot;
@@ -817,7 +815,7 @@ inline bool initialize()
     anti_minidump::hook_minidump();
     webhook::write_log("anti_dump", "hook_minidump_ok");
 
-    // activate + spawn monitor thread BEFORE PE corruption so thread creation works
+
     detail::active().store(true);
     webhook::write_log("anti_dump", "active_store_ok");
 
@@ -840,7 +838,7 @@ inline bool initialize()
         webhook::write_log("anti_dump", "thread_detach_fail_unknown");
     }
 
-    // PE corruption phase — after thread spawn
+
     pe_header::inject_fake_sections();
     webhook::write_log("anti_dump", "inject_fake_sections_ok");
 

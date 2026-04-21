@@ -1,6 +1,7 @@
 #pragma once
 
 #include "standalone_driver.hpp"
+#include "work_queue.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -97,7 +98,8 @@ public:
             std::lock_guard<std::mutex> lk(streams_mutex_);
             streams_.clear();
         }
-        poll_thread_ = std::thread([this]() { poll_loop(); });
+        poll_thread_ = {};
+        work_queue::post([this]() { poll_loop(); });
     }
 
     void stop() {

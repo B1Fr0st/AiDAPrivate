@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "work_queue.hpp"
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -38,7 +39,7 @@ inline ui_state_t g_ui;
 
 inline void refresh()
 {
-	std::thread([]() {
+	work_queue::post([]() {
 		std::vector<seh_entry_t> entries;
 
 		auto modules = driver_bridge::enumerate_modules();
@@ -124,7 +125,7 @@ inline void refresh()
 			std::lock_guard<std::mutex> lk(g_ui.mutex);
 			g_ui.entries = std::move(entries);
 		}
-	}).detach();
+	});
 }
 
 inline void render(float pos_x, float pos_y, float width, float height,

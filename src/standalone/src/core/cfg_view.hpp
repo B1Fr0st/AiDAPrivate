@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "work_queue.hpp"
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -87,7 +88,7 @@ inline void build_cfg(uint64_t entry_address)
 
 	g_state.building.store(true);
 
-	std::thread([entry_address]() {
+	work_queue::post([entry_address]() {
 		const size_t max_bytes = 0x10000;
 		const size_t max_insns = 4096;
 
@@ -287,7 +288,7 @@ inline void build_cfg(uint64_t entry_address)
 		}
 
 		g_state.building.store(false);
-	}).detach();
+	});
 }
 
 inline void render(float pos_x, float pos_y, float width, float height,

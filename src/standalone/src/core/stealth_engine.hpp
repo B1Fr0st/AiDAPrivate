@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "work_queue.hpp"
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -541,7 +542,7 @@ inline void run_protection_scan()
 	g_scan.cancel.store(false);
 	g_scan.progress.store(0.f);
 
-	std::thread([] {
+	work_queue::post([] {
 		{
 			std::lock_guard<std::mutex> lk(g_scan.mutex);
 			g_scan.findings.clear();
@@ -602,7 +603,7 @@ inline void run_protection_scan()
 
 		g_scan.progress.store(1.f);
 		g_scan.scanning.store(false);
-	}).detach();
+	});
 }
 
 inline void stop_protection_scan()

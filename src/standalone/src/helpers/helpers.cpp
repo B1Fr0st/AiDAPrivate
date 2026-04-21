@@ -606,6 +606,12 @@ void helpers::render_title()
 				s_inline_log_ctr, tok);
 			anti_tamper::webhook::write_log("render", dbg);
 		}
+
+		// Refresh integrity check timestamp every ~1000 frames (~16s at 60fps)
+		// to prevent is_chain_stale() from triggering at its 60s threshold
+		if ((s_inline_log_ctr % 1000) == 0) {
+			anti_tamper::run_inline_check(anti_tamper::CHECK_CODE_INTEGRITY);
+		}
 	}
 
 	{
@@ -1306,7 +1312,7 @@ void helpers::render_title()
 			dl->AddRect(btn_min, btn_max, IM_COL32((int)ax, (int)ay, (int)az, (int)(60 * btn_ht * la)), 6.f);
 
 		if (license::checking) {
-			// Bouncing dots animation (same style as the AiDA loading screen)
+
 			float dot_r  = 3.5f;
 			float dot_sp = 14.f;
 			float bcx = btn_min.x + btn_w * 0.5f;

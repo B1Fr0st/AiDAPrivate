@@ -1,6 +1,7 @@
-﻿#pragma once
+#pragma once
 
 #include <windows.h>
+#include "work_queue.hpp"
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <bcrypt.h>
@@ -437,6 +438,8 @@ namespace state
         anti_tamper::virtualizer::detail::vm_state_t integrity_vm{};
         std::vector<uint8_t> integrity_bytecode;
         bool integrity_vm_ready = false;
+        std::atomic<uint32_t> soft_violation_count{0};
+        std::atomic<uint64_t> soft_violation_window_tick{0};
     };
 
     inline runtime_t& get()
@@ -607,32 +610,56 @@ inline bool run_verification_cycle()
 
         auto ai_report = standalone_anti_ai::combined::full_scan();
 
-        if (ai_report.mcp_detected)
+        if (ai_report.mcp_detected || ai_report.llm_detected
+            || ai_report.memory_scanner_detected || ai_report.handle_to_us_detected)
         {
-            webhook::send_debug_log("anti_mcp", "mcp_bridge_detected: " + ai_report.summary, true);
-            enforce_violation("mcp_bridge_detected", ai_report.summary);
-            return false;
+            uint64_t now_tick = GetTickCount64();
+            uint64_t first_tick = rt.soft_violation_window_tick.load(std::memory_order_relaxed);
+            uint32_t c;
+            if (first_tick == 0 || (now_tick - first_tick) > 120000ULL)
+            {
+                rt.soft_violation_window_tick.store(now_tick, std::memory_order_relaxed);
+                rt.soft_violation_count.store(1, std::memory_order_relaxed);
+                c = 1;
+            }
+            else
+            {
+                c = rt.soft_violation_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            }
+            if (c >= 3)
+            {
+                const char* viol_reason;
+                std::string detail = ai_report.summary;
+                if (ai_report.mcp_detected)
+                {
+                    viol_reason = "mcp_bridge_detected";
+                    webhook::send_debug_log("anti_mcp", detail, true);
+                }
+                else if (ai_report.llm_detected)
+                {
+                    viol_reason = "local_llm_analysis";
+                    webhook::send_debug_log("anti_llm", detail, true);
+                }
+                else if (ai_report.memory_scanner_detected)
+                {
+                    viol_reason = "memory_scanner_attached";
+                    webhook::send_debug_log("mem_scanner", detail, true);
+                }
+                else
+                {
+                    viol_reason = "foreign_handle_detected";
+                    webhook::send_debug_log("handle_leak", detail, true);
+                }
+                enforce_violation(viol_reason, detail);
+                return false;
+            }
+            webhook::send_debug_log("soft_violation_pending",
+                std::to_string(c) + "/3 " + ai_report.summary, false);
         }
-
-        if (ai_report.llm_detected)
+        else
         {
-            webhook::send_debug_log("anti_llm", "local_llm_detected: " + ai_report.summary, true);
-            enforce_violation("local_llm_analysis", ai_report.summary);
-            return false;
-        }
-
-        if (ai_report.memory_scanner_detected)
-        {
-            webhook::send_debug_log("mem_scanner", "scanner_attached", true);
-            enforce_violation("memory_scanner_attached", ai_report.summary);
-            return false;
-        }
-
-        if (ai_report.handle_to_us_detected)
-        {
-            webhook::send_debug_log("handle_leak", "foreign_handle_to_process", true);
-            enforce_violation("foreign_handle_detected", ai_report.summary);
-            return false;
+            rt.soft_violation_count.store(0, std::memory_order_relaxed);
+            rt.soft_violation_window_tick.store(0, std::memory_order_relaxed);
         }
 
 
@@ -673,7 +700,7 @@ inline void start_monitors()
     if (rt.monitors_running.exchange(true))
         return;
 
-    std::thread([]() {
+    work_queue::post([]() {
         Sleep(5000);
 
         auto& rt = state::get();
@@ -682,7 +709,7 @@ inline void start_monitors()
             run_verification_cycle();
             Sleep(3000);
         }
-    }).detach();
+    });
 }
 
 

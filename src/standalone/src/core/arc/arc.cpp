@@ -1,8 +1,4 @@
-﻿#define ARC_EXPORTS
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-
-#include "arc.h"
+﻿#include "arc.h"
 #include "comm.h"
 
 #include <windows.h>
@@ -27,6 +23,47 @@
 
 namespace arc_internal
 {
+
+// Append a timestamped line to aida_debug.log from within the ARC module.
+// Uses the EXE directory (not CWD) so log entries land in the same file as lic_log.
+static void arc_log(const char* tag, const char* msg)
+{
+    // Cache the absolute log path using the exe directory (same as webhook::write_log).
+    static WCHAR s_log_path[MAX_PATH] = {};
+    static bool  s_path_ready = false;
+    if (!s_path_ready) {
+        WCHAR exe_path[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+        WCHAR* last_sep = wcsrchr(exe_path, L'\\');
+        if (last_sep) {
+            last_sep[1] = L'\0';
+            _snwprintf_s(s_log_path, MAX_PATH, _TRUNCATE, L"%saida_debug.log", exe_path);
+        } else {
+            wcscpy_s(s_log_path, MAX_PATH, L"aida_debug.log");
+        }
+        s_path_ready = true;
+    }
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char line[512];
+    int n = _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "[%02d:%02d:%02d.%03d] [arc/%s] %s\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag, msg);
+    if (n <= 0) return;
+    HANDLE h = CreateFileW(s_log_path, GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        SetFilePointer(h, 0, nullptr, FILE_END);
+        DWORD written = 0;
+        WriteFile(h, line, static_cast<DWORD>(n), &written, nullptr);
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+    OutputDebugStringA(line);
+}
 
 __forceinline uint64_t siphash_2_4(const uint8_t* data, size_t len, uint64_t k0, uint64_t k1)
 {
@@ -368,7 +405,7 @@ corruption_state_t g_corruption = {};
 
 struct encrypted_session_t
 {
-    alignas(64) uint8_t blob[256];
+    alignas(64) uint8_t blob[512];
     uint64_t rolling_key;
     uint64_t xor_mask;
     bool valid;
@@ -490,6 +527,7 @@ void arm_silent_kill()
 {
     if (g_corruption.armed.exchange(true))
         return;
+    arc_log("kill", "arm_silent_kill: fastfail imminent");
     __fastfail(FAST_FAIL_FATAL_APP_EXIT);
 }
 
@@ -497,6 +535,7 @@ void tick_corruption()
 {
     if (!g_corruption.armed.load(std::memory_order_acquire))
         return;
+    arc_log("kill", "tick_corruption: armed, fastfail");
     __fastfail(FAST_FAIL_FATAL_APP_EXIT);
 }
 
@@ -506,11 +545,19 @@ bool check_debugger()
     if (!peb) return false;
 
     if (peb[2] != 0)
+    {
+        arc_log("debugger", "check_debugger: peb_being_debugged");
         return true;
+    }
 
     uint32_t flags = *reinterpret_cast<const uint32_t*>(peb + 0xBC);
     if (flags & 0x70)
+    {
+        char dbg[64];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "check_debugger: ntglobalflag=0x%X", flags);
+        arc_log("debugger", dbg);
         return true;
+    }
 
     unsigned int aux;
     uint64_t t0 = __rdtscp(&aux);
@@ -518,12 +565,20 @@ bool check_debugger()
     for (int i = 0; i < 100; ++i) dummy += i;
     uint64_t t1 = __rdtscp(&aux);
     if ((t1 - t0) > 10000000ULL)
+    {
+        char dbg[64];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "check_debugger: rdtsc_delta=%llu", (unsigned long long)(t1 - t0));
+        arc_log("debugger", dbg);
         return true;
+    }
 
     auto* kuser = reinterpret_cast<const volatile uint8_t*>(
         reinterpret_cast<void*>(static_cast<uintptr_t>(0x7FFE0000)));
     if (kuser[0x2D4] != 0)
+    {
+        arc_log("debugger", "check_debugger: kd_enabled");
         return true;
+    }
 
     CONTEXT ctx{};
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -534,7 +589,10 @@ bool check_debugger()
     if (pNtGetCtx && pNtGetCtx(reinterpret_cast<HANDLE>((LONG_PTR)-2), &ctx) == 0)
     {
         if (ctx.Dr0 | ctx.Dr1 | ctx.Dr2 | ctx.Dr3)
+        {
+            arc_log("debugger", "check_debugger: hw_breakpoints");
             return true;
+        }
     }
 
     using NtQIP_t = LONG(WINAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
@@ -547,7 +605,10 @@ bool check_debugger()
             ULONG_PTR debug_port = 0;
             LONG st = fn(GetCurrentProcess(), 7, &debug_port, sizeof(debug_port), nullptr);
             if (st == 0 && debug_port != 0)
+            {
+                arc_log("debugger", "check_debugger: debug_port");
                 return true;
+            }
         }
     }
 
@@ -635,36 +696,59 @@ std::string recompute_hwid()
 
 uint64_t compute_own_code_hash()
 {
+    // Use VirtualQuery-based region walking instead of PE section header parsing.
+    // PE headers are intentionally corrupted by anti_dump::inject_fake_sections()
+    // (NumberOfSections overwritten, all sections given IMAGE_SCN_MEM_EXECUTE and
+    // random VirtualAddresses). Parsing them produces a different hash at heartbeat
+    // time than at init time, which previously triggered arm_silent_kill() -> __fastfail.
     MEMORY_BASIC_INFORMATION mbi = {};
     if (VirtualQuery(reinterpret_cast<const void*>(&compute_own_code_hash), &mbi, sizeof(mbi)) == 0)
         return 0;
-    auto hMod = static_cast<HMODULE>(mbi.AllocationBase);
+    const auto hMod = static_cast<const uint8_t*>(mbi.AllocationBase);
     if (!hMod) return 0;
 
-    auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(hMod);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
-
-    auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
-        reinterpret_cast<const uint8_t*>(hMod) + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
-
-    const auto* sec = IMAGE_FIRST_SECTION(nt);
+    // Walk committed executable regions that belong to this module allocation.
     uint64_t combined = 0;
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-        if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) {
-            auto base = reinterpret_cast<uintptr_t>(hMod) + sec[i].VirtualAddress;
-            size_t size = sec[i].Misc.VirtualSize;
-            if (size > 0 && size < 64 * 1024 * 1024) {
+    const uintptr_t alloc_base = reinterpret_cast<uintptr_t>(hMod);
+    uintptr_t addr = alloc_base;
+
+    // Cap scan at 256 MB to avoid runaway iteration on pathological mappings.
+    const uintptr_t scan_limit = alloc_base + (256ULL * 1024 * 1024);
+
+    while (addr < scan_limit)
+    {
+        MEMORY_BASIC_INFORMATION r = {};
+        if (VirtualQuery(reinterpret_cast<const void*>(addr), &r, sizeof(r)) == 0)
+            break;
+        if (r.RegionSize == 0)
+            break;
+
+        // Stop once we leave the allocation that contains compute_own_code_hash.
+        if (r.AllocationBase != mbi.AllocationBase)
+            break;
+
+        constexpr DWORD exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+
+        if (r.State == MEM_COMMIT && (r.Protect & exec_mask))
+        {
+            const size_t size = r.RegionSize;
+            if (size > 0 && size < 64ULL * 1024 * 1024)
+            {
+                const uint64_t base_val = reinterpret_cast<uint64_t>(r.BaseAddress);
                 uint8_t buf[32];
-                uint64_t h_val = fnv1a(reinterpret_cast<const void*>(base), size);
-                memcpy(buf, &h_val, 8);
-                memcpy(buf + 8, &base, 8);
-                memcpy(buf + 16, &size, 8);
-                memset(buf + 24, 0, 8);
+                uint64_t h_val = fnv1a(r.BaseAddress, size);
+                memcpy(buf,      &h_val,    8);
+                memcpy(buf + 8,  &base_val, 8);
+                memcpy(buf + 16, &size,     8);
+                memset(buf + 24, 0,         8);
                 combined ^= siphash_2_4(buf, 32, 0xA1DAC0DE5EC0DEULL, 0xCAFEBABEDEADFEEDULL);
             }
         }
+
+        addr += r.RegionSize;
     }
+
     return combined;
 }
 
@@ -1053,6 +1137,13 @@ ARC_API bool arc_init(
         sess.license_key[0] = '\0';
 
         sess.code_hash = compute_own_code_hash();
+        {
+            char dbg[96];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "arc_init code_hash=0x%016llX",
+                static_cast<unsigned long long>(sess.code_hash));
+            arc_log("init", dbg);
+        }
         sess.initialized = true;
 
         store_session(sess);
@@ -1161,11 +1252,27 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
         session_data_t sess = {};
         if (!load_session(sess))
         {
+            arc_log("heartbeat", "state=1 load_session_failed");
             CFF_EXIT(hb_cff);
+        }
+
+        {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "state=1 code_hash_stored=0x%016llX code_hash_current=0x%016llX",
+                static_cast<unsigned long long>(sess.code_hash),
+                static_cast<unsigned long long>(current_hash));
+            arc_log("heartbeat", dbg);
         }
 
         if (sess.code_hash != 0 && current_hash != sess.code_hash)
         {
+            char detail[128];
+            _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                "code_hash_mismatch stored=0x%016llX current=0x%016llX",
+                static_cast<unsigned long long>(sess.code_hash),
+                static_cast<unsigned long long>(current_hash));
+            arc_log("kill", detail);
             arm_silent_kill();
             CFF_EXIT(hb_cff);
         }
@@ -1175,6 +1282,7 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
     {
         if (check_debugger())
         {
+            arc_log("kill", "heartbeat_state=2 debugger_detected");
             arm_silent_kill();
             CFF_EXIT(hb_cff);
         }
@@ -1192,8 +1300,22 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
         uint64_t current_tsc = __rdtsc();
         if (current_tsc < sess.last_heartbeat_tsc)
         {
+            char detail[96];
+            _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                "tsc_rollback current=0x%016llX last=0x%016llX",
+                static_cast<unsigned long long>(current_tsc),
+                static_cast<unsigned long long>(sess.last_heartbeat_tsc));
+            arc_log("kill", detail);
             arm_silent_kill();
             CFF_EXIT(hb_cff);
+        }
+        {
+            char dbg[96];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "heartbeat_ok counter=%llu tsc=0x%016llX",
+                static_cast<unsigned long long>(sess.heartbeat_counter + 1),
+                static_cast<unsigned long long>(current_tsc));
+            arc_log("heartbeat", dbg);
         }
         sess.last_heartbeat_tsc = current_tsc;
         sess.heartbeat_counter++;
@@ -1219,6 +1341,8 @@ ARC_API arc_heartbeat_result_t arc_heartbeat()
     CFF_END(hb_cff)
 
     return hb_result;
+}
+
 }
 
 namespace {
@@ -1435,6 +1559,9 @@ namespace {
             SecureZeroMemory(out_key, 32);
     }
 }
+
+extern "C"
+{
 
 ARC_API arc_page_result_t arc_request_page_count(const char* server_url)
 {

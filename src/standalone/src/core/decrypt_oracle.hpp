@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "work_queue.hpp"
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -188,7 +189,7 @@ inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size)
 	g_state.config.region_address = region_address;
 	g_state.config.region_size = region_size;
 
-	std::thread([region_address, region_size]() {
+	work_queue::post([region_address, region_size]() {
 		uint32_t pid = driver_bridge::attached_pid();
 		if (pid == 0) {
 			std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -328,7 +329,7 @@ inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size)
 
 		g_state.progress.store(1.f);
 		g_state.scanning.store(false);
-	}).detach();
+	});
 #endif
 }
 

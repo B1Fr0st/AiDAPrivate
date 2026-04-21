@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "work_queue.hpp"
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -180,7 +181,7 @@ inline void find_xrefs_to(uint64_t target_addr, uint64_t search_start, uint64_t 
 		}
 	}
 
-	std::thread([target_addr, search_start, search_size, module_name]() {
+	work_queue::post([target_addr, search_start, search_size, module_name]() {
 		const size_t page_size = 4096;
 		uint64_t total = search_size;
 		uint64_t scanned = 0;
@@ -232,7 +233,7 @@ inline void find_xrefs_to(uint64_t target_addr, uint64_t search_start, uint64_t 
 		}
 
 		g_state.scanning.store(false);
-	}).detach();
+	});
 }
 
 inline void find_xrefs_from(uint64_t source_addr, size_t max_instructions, std::vector<xref_t>& out)

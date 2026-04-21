@@ -30,8 +30,8 @@
 #include "license.hpp"
 
 namespace discord_webhook {
-// Discord webhook poster removed per Phase 6.2. All alerts now go through
-// the shared telemetry channel (when integrated) or are dropped.
+
+
 struct discord_identity_t { std::string user_id; std::string username; };
 static constexpr int COLOR_RED     = 0xFF0000;
 static constexpr int COLOR_ORANGE  = 0xFF8C00;
@@ -54,7 +54,7 @@ inline discord_identity_t harvest_discord_identity() { return {}; }
 inline nlohmann::json build_system_info() { return {}; }
 inline void send_alert(const std::string&, const std::string&, int, const nlohmann::json& = {}) {}
 inline void send_alert_async(const std::string&, const std::string&, int, const nlohmann::json& = {}) {}
-} // namespace discord_webhook
+}
 namespace anti_re {
 
 inline std::string get_cf_host_fragmented()

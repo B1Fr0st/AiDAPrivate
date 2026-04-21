@@ -5,6 +5,7 @@
 #define NOMINMAX
 #include <windows.h>
 
+#include "work_queue.hpp"
 #include "imgui/imgui.h"
 
 #include <atomic>
@@ -422,7 +423,8 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr)
 
 
     s.stop_reader.store(false);
-    s.reader_thread = std::thread(reader_thread_func, &s);
+    s.reader_thread = {};
+    work_queue::post([&s]() { reader_thread_func(&s); });
 
     return true;
 }

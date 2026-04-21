@@ -815,7 +815,8 @@ namespace dispatcher {
                         (reason == sentinel_bridge::RE_REASON_DR_SET) ||
                         (reason == sentinel_bridge::RE_REASON_FOREIGN_HND) ||
                         (reason == sentinel_bridge::RE_REASON_INJECTED_DLL) ||
-                        (reason == sentinel_bridge::RE_REASON_WATCHDOG_STALL);
+                        (reason == sentinel_bridge::RE_REASON_WATCHDOG_STALL) ||
+                        (reason == 0x0002u);
 
                     if (is_re_reason) {
                         UINT32 det_flags = anti_debug::run_all_checks();

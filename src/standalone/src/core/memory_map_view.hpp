@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "work_queue.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -45,14 +46,14 @@ inline void refresh()
 		return;
 	g_ui.refreshing.store(true);
 
-	std::thread([]() {
+	work_queue::post([]() {
 		auto map = debugger_engine::get_memory_map();
 		{
 			std::lock_guard<std::mutex> lk(g_ui.regions_mutex);
 			g_ui.regions = std::move(map);
 		}
 		g_ui.refreshing.store(false);
-	}).detach();
+	});
 }
 
 namespace detail {

@@ -33,8 +33,7 @@ namespace
 
     bool g_loaded = false;
 
-    // SHA-256 integrity hash of the decrypted blob (first 32 bytes of a
-    // SipHash-style mix of the full decrypted content — fast, no BCrypt needed)
+
     bool verify_blob_integrity(const unsigned char* data, unsigned long size,
                                unsigned long expected_size)
     {
@@ -43,13 +42,13 @@ namespace
         if (size < 2 || data[0] != 'M' || data[1] != 'Z')
             return false;
 
-        // Verify PE header sanity beyond MZ: e_lfanew must be within bounds
+
         if (size < 64)
             return false;
         uint32_t e_lfanew = *reinterpret_cast<const uint32_t*>(data + 0x3C);
         if (e_lfanew >= size - 4)
             return false;
-        // PE signature check
+
         if (data[e_lfanew] != 'P' || data[e_lfanew + 1] != 'E' ||
             data[e_lfanew + 2] != 0 || data[e_lfanew + 3] != 0)
             return false;
@@ -122,7 +121,7 @@ namespace
         DeleteFileW(path.c_str());
         path += L".exe";
 
-        // XOR-decrypt the mapper blob (same pattern as driver blobs)
+
         auto* buf = static_cast<unsigned char*>(
             VirtualAlloc(nullptr, g_windmapper_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
         if (!buf)
@@ -251,7 +250,7 @@ namespace driver_loader
             return false;
         }
 
-        // Assign mapper to a job object so it dies if we crash
+
         HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
         if (hJob) {
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include "work_queue.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -306,7 +307,7 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 	if (g_state.generating.load()) return;
 	g_state.generating.store(true);
 
-	std::thread([address, num_instructions, auto_wildcard]() {
+	work_queue::post([address, num_instructions, auto_wildcard]() {
 		signature_t sig;
 		sig.address = address;
 
@@ -374,7 +375,7 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 		}
 
 		g_state.generating.store(false);
-	}).detach();
+	});
 #else
 	(void)address;
 	(void)num_instructions;
@@ -389,7 +390,7 @@ inline void generate_from_file(const DisasmFile& file, uint64_t address, int num
 	g_state.generating.store(true);
 
 	auto file_copy = file;
-	std::thread([file_copy, address, num_instructions, auto_wildcard]() {
+	work_queue::post([file_copy, address, num_instructions, auto_wildcard]() {
 		signature_t sig;
 		sig.address = address;
 		sig.module_name = file_copy.filename;
@@ -461,7 +462,7 @@ inline void generate_from_file(const DisasmFile& file, uint64_t address, int num
 		}
 
 		g_state.generating.store(false);
-	}).detach();
+	});
 #else
 	(void)file;
 	(void)address;
@@ -475,7 +476,7 @@ inline void validate_uniqueness_process(signature_t& sig)
 	if (g_state.validating.load()) return;
 	g_state.validating.store(true);
 
-	std::thread([&sig]() {
+	work_queue::post([&sig]() {
 		int total_count = 0;
 		auto regions = driver_bridge::enumerate_memory_regions();
 
@@ -501,7 +502,7 @@ inline void validate_uniqueness_process(signature_t& sig)
 		}
 
 		g_state.validating.store(false);
-	}).detach();
+	});
 }
 
 inline void validate_uniqueness_file(const DisasmFile& file, signature_t& sig)
@@ -540,7 +541,7 @@ inline void generate_batch(const std::vector<uint64_t>& addresses, int num_instr
 	g_state.batch_done.store(0);
 
 	auto addrs = addresses;
-	std::thread([addrs, num_instructions, auto_wildcard]() {
+	work_queue::post([addrs, num_instructions, auto_wildcard]() {
 		ZydisDecoder decoder;
 		ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
 
@@ -619,7 +620,7 @@ inline void generate_batch(const std::vector<uint64_t>& addresses, int num_instr
 		}
 
 		g_state.batch_generating.store(false);
-	}).detach();
+	});
 #else
 	(void)addresses;
 	(void)num_instructions;

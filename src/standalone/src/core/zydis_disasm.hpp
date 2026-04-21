@@ -1,6 +1,7 @@
 
 #pragma once
 #include <windows.h>
+#include "work_queue.hpp"
 #include <commdlg.h>
 
 #include <Zydis/Zydis.h>
@@ -336,10 +337,10 @@ namespace disasm
     {
         if (file.decoding) return;
         file.decoding = true;
-        std::thread([&file]() {
+        work_queue::post([&file]() {
             decode_section(file);
             file.decoding = false;
-        }).detach();
+        });
     }
 
 
@@ -380,7 +381,7 @@ namespace disasm
         state.live_decoding = true;
         uint32_t pid = state.live_pid;
 
-        // Synchronous decode — fast enough for live view, avoids thread-creation issues
+
         {
             std::vector<uint8_t> mem;
 

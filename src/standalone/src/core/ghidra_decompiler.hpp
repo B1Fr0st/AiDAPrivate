@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include "work_queue.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -236,7 +237,7 @@ inline ghidra_result_t do_decompile(aida_architecture_t* arch,
 	if (cancel && cancel->load(std::memory_order_acquire))
 		local_cancel.store(true, std::memory_order_release);
 
-	std::thread worker([&]() {
+	work_queue::post([&]() {
 		try {
 			perform_res = arch->allacts.getCurrent()->perform(*fd);
 		} catch (...) {
@@ -266,7 +267,7 @@ inline ghidra_result_t do_decompile(aida_architecture_t* arch,
 			while (!perform_done.load(std::memory_order_acquire)) {
 				if (std::chrono::steady_clock::now() >= grace) {
 
-					worker.detach();
+
 					s_cancel_ptr = prev_cancel;
 					result.is_error = true;
 					result.error_text = "decompilation timed out (function too complex or obfuscated)";
@@ -278,9 +279,6 @@ inline ghidra_result_t do_decompile(aida_architecture_t* arch,
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(2));
 	}
-
-	if (worker.joinable())
-		worker.join();
 
 	s_cancel_ptr = prev_cancel;
 

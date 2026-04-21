@@ -34,7 +34,7 @@ static std::string addr_to_string(const sockaddr_in& addr) {
 
 static void close_socket(SOCKET s) {
     if (s != INVALID_SOCKET) {
-        shutdown(s, SD_BOTH);
+        ::shutdown(s, SD_BOTH);
         closesocket(s);
     }
 }
@@ -1226,56 +1226,72 @@ static void handle_client(SOCKET client_sock, sockaddr_in client_addr_in, state_
 
 
 static void worker_thread_func(state_t& state) {
-    while (state.running.load()) {
-        work_item item;
+    while (state.proxy_alive.load()) {
         {
-            std::unique_lock<std::mutex> lock(state.work_mutex);
-            state.work_cv.wait_for(lock, std::chrono::milliseconds(200), [&] {
-                return !state.work_queue.empty() || !state.running.load();
+            std::unique_lock<std::mutex> lk(state.proxy_start_mtx);
+            state.proxy_start_cv.wait(lk, [&state]() {
+                return state.running.load() || !state.proxy_alive.load();
             });
-            if (!state.running.load() && state.work_queue.empty()) break;
-            if (state.work_queue.empty()) continue;
-            item = state.work_queue.front();
-            state.work_queue.pop();
         }
+        while (state.running.load()) {
+            work_item item;
+            {
+                std::unique_lock<std::mutex> lock(state.work_mutex);
+                state.work_cv.wait_for(lock, std::chrono::milliseconds(200), [&] {
+                    return !state.work_queue.empty() || !state.running.load();
+                });
+                if (!state.running.load() && state.work_queue.empty()) break;
+                if (state.work_queue.empty()) continue;
+                item = state.work_queue.front();
+                state.work_queue.pop();
+            }
 
-        sockaddr_in client_addr_in = {};
-        client_addr_in.sin_family = AF_INET;
-        client_addr_in.sin_addr.s_addr = item.client_ip;
-        client_addr_in.sin_port = htons(item.client_port);
-        handle_client(static_cast<SOCKET>(item.client_socket), client_addr_in, state);
+            sockaddr_in client_addr_in = {};
+            client_addr_in.sin_family = AF_INET;
+            client_addr_in.sin_addr.s_addr = item.client_ip;
+            client_addr_in.sin_port = htons(item.client_port);
+            handle_client(static_cast<SOCKET>(item.client_socket), client_addr_in, state);
+        }
     }
 }
 
 static void listener_thread_func(state_t& state) {
-    while (state.running.load()) {
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(static_cast<SOCKET>(state.listen_socket), &fds);
-
-        timeval tv;
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-
-        int sel = select(0, &fds, nullptr, nullptr, &tv);
-        if (sel <= 0) continue;
-
-        sockaddr_in client_addr = {};
-        int addr_len = sizeof(client_addr);
-        SOCKET client_sock = accept(static_cast<SOCKET>(state.listen_socket),
-            reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
-
-        if (client_sock == INVALID_SOCKET) continue;
-
-        work_item item;
-        item.client_socket = static_cast<uintptr_t>(client_sock);
-        item.client_ip = client_addr.sin_addr.s_addr;
-        item.client_port = ntohs(client_addr.sin_port);
+    while (state.proxy_alive.load()) {
         {
-            std::lock_guard<std::mutex> lock(state.work_mutex);
-            state.work_queue.push(item);
+            std::unique_lock<std::mutex> lk(state.proxy_start_mtx);
+            state.proxy_start_cv.wait(lk, [&state]() {
+                return state.running.load() || !state.proxy_alive.load();
+            });
         }
-        state.work_cv.notify_one();
+        while (state.running.load()) {
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(static_cast<SOCKET>(state.listen_socket), &fds);
+
+            timeval tv;
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+
+            int sel = select(0, &fds, nullptr, nullptr, &tv);
+            if (sel <= 0) continue;
+
+            sockaddr_in client_addr = {};
+            int addr_len = sizeof(client_addr);
+            SOCKET client_sock = accept(static_cast<SOCKET>(state.listen_socket),
+                reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
+
+            if (client_sock == INVALID_SOCKET) continue;
+
+            work_item item;
+            item.client_socket = static_cast<uintptr_t>(client_sock);
+            item.client_ip = client_addr.sin_addr.s_addr;
+            item.client_port = ntohs(client_addr.sin_port);
+            {
+                std::lock_guard<std::mutex> lock(state.work_mutex);
+                state.work_queue.push(item);
+            }
+            state.work_cv.notify_one();
+        }
     }
 }
 
@@ -1319,13 +1335,7 @@ bool start(const proxy_config& config) {
 
     g_state.listen_socket = static_cast<uintptr_t>(listen_sock);
     g_state.running.store(true);
-    g_state.listener_thread = std::thread(listener_thread_func, std::ref(g_state));
-
-
-    g_state.worker_threads.reserve(WORKER_POOL_SIZE);
-    for (uint32_t i = 0; i < WORKER_POOL_SIZE; i++) {
-        g_state.worker_threads.emplace_back(worker_thread_func, std::ref(g_state));
-    }
+    g_state.proxy_start_cv.notify_all();
 
 
     if (config.use_wfp_redirect) {
@@ -1374,23 +1384,36 @@ void stop() {
     g_state.work_cv.notify_all();
 
 
-    for (auto& t : g_state.worker_threads) {
-        if (t.joinable()) t.join();
-    }
-    g_state.worker_threads.clear();
-
-
     if (g_state.listen_socket != ~static_cast<uintptr_t>(0)) {
         closesocket(static_cast<SOCKET>(g_state.listen_socket));
         g_state.listen_socket = ~static_cast<uintptr_t>(0);
     }
-
-    if (g_state.listener_thread.joinable())
-        g_state.listener_thread.join();
 }
 
 bool is_running() {
     return g_state.running.load();
+}
+
+void pre_initialize() {
+    auto& st = g_state;
+    st.proxy_alive.store(true);
+    st.listener_thread = std::thread(listener_thread_func, std::ref(st));
+    st.worker_threads.reserve(WORKER_POOL_SIZE);
+    for (uint32_t i = 0; i < WORKER_POOL_SIZE; ++i)
+        st.worker_threads.emplace_back(worker_thread_func, std::ref(st));
+}
+
+void shutdown() {
+    auto& st = g_state;
+    stop();
+    st.proxy_alive.store(false);
+    st.work_cv.notify_all();
+    st.proxy_start_cv.notify_all();
+    for (auto& t : st.worker_threads)
+        if (t.joinable()) t.join();
+    st.worker_threads.clear();
+    if (st.listener_thread.joinable())
+        st.listener_thread.join();
 }
 
 std::vector<http_exchange> get_history(size_t max_count) {

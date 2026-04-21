@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <intrin.h>
 
+#include "work_queue.hpp"
 #include "mcp_standalone.hpp"
 #include "mcp_client.hpp"
 #include "mcp_marketplace.hpp"
@@ -69,6 +70,9 @@ std::thread       s_ai_thread;
 std::mutex        s_ai_thread_mtx;
 std::atomic<bool> s_ai_running{false};
 std::atomic<bool> s_cancel{false};
+std::atomic<bool> s_ai_task_done{true};
+std::mutex        s_ai_task_done_mtx;
+std::condition_variable s_ai_task_done_cv;
 
 
 mcp_standalone::server_t s_mcp_server;
@@ -1194,8 +1198,12 @@ void shutdown_standalone_chat()
     s_cancel = true;
     {
         std::lock_guard<std::mutex> lk(s_ai_thread_mtx);
-        if (s_ai_thread.joinable())
-            s_ai_thread.join();
+        s_cancel = true;
+        if (g_sa_ai_client) g_sa_ai_client->cancel();
+        if (!s_ai_task_done.load()) {
+            std::unique_lock<std::mutex> lk2(s_ai_task_done_mtx);
+            s_ai_task_done_cv.wait(lk2, []() { return s_ai_task_done.load(); });
+        }
     }
     if (s_server_started)
         s_mcp_server.stop();
@@ -1281,13 +1289,18 @@ void tick_ai_chat()
             s_cancel = true;
             if (g_sa_ai_client) g_sa_ai_client->cancel();
         }
-        if (s_ai_thread.joinable())
-            s_ai_thread.join();
+        if (!s_ai_task_done.load()) {
+            std::unique_lock<std::mutex> lk2(s_ai_task_done_mtx);
+            s_ai_task_done_cv.wait(lk2, []() { return s_ai_task_done.load(); });
+        }
         s_cancel      = false;
         s_ai_running  = true;
-        s_ai_thread   = std::thread(run_agentic,
-                                    std::move(user_text),
-                                    std::move(history));
+        s_ai_task_done.store(false);
+        work_queue::post([user_text = std::move(user_text), history = std::move(history)]() mutable {
+            run_agentic(std::move(user_text), std::move(history));
+            s_ai_task_done.store(true);
+            s_ai_task_done_cv.notify_all();
+        });
     }
 }
 

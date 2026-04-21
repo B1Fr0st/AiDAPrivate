@@ -1,4 +1,5 @@
 #include "network_view.hpp"
+#include "work_queue.hpp"
 #include "standalone_driver.hpp"
 #include "protocol_parser.hpp"
 #include "mitm_proxy.hpp"
@@ -142,113 +143,144 @@ static void connection_poll_thread(state_t& state) {
 
 static void capture_poll_thread(state_t& state) {
     driver_bridge::debug_log("[network] capture_poll_thread STARTED\n");
+    state.cap_thread_alive.store(true);
     int poll_iter = 0;
-    while (state.cap_polling.load()) {
-        bool drv_ok = driver_bridge::using_kernel_driver();
-        if (poll_iter < 5 || (poll_iter % 100) == 0) {
-            char dbg[128];
-            snprintf(dbg, sizeof(dbg), "[network] capture_poll iter=%d drv_ok=%d\n", poll_iter, drv_ok ? 1 : 0);
-            driver_bridge::debug_log(dbg);
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lk(state.cap_cv_mutex);
+            state.cap_cv.wait(lk, [&state]() {
+                return state.cap_polling.load() || !state.cap_thread_alive.load();
+            });
         }
-        ++poll_iter;
-        if (drv_ok) {
-            auto raw_packets = driver_bridge::get_captured_packets(64);
-
-            if (!raw_packets.empty()) {
+        if (!state.cap_thread_alive.load())
+            break;
+        poll_iter = 0;
+        while (state.cap_polling.load()) {
+            bool drv_ok = driver_bridge::using_kernel_driver();
+            if (poll_iter < 5 || (poll_iter % 100) == 0) {
                 char dbg[128];
-                snprintf(dbg, sizeof(dbg), "[network] capture_poll got %zu packets\n", raw_packets.size());
+                snprintf(dbg, sizeof(dbg), "[network] capture_poll iter=%d drv_ok=%d\n", poll_iter, drv_ok ? 1 : 0);
                 driver_bridge::debug_log(dbg);
-                std::lock_guard<std::mutex> lock(state.cap_mutex);
-                for (auto& p : raw_packets) {
-                    packet_entry entry;
-                    entry.timestamp = p.timestamp;
-                    entry.pid = p.pid;
-                    entry.protocol = static_cast<uint8_t>(p.protocol);
-                    entry.direction = static_cast<uint8_t>(p.direction);
-                    entry.src_port = static_cast<uint16_t>(p.local_port);
-                    entry.dst_port = static_cast<uint16_t>(p.remote_port);
-                    memcpy(entry.src_addr, p.local_addr, 16);
-                    memcpy(entry.dst_addr, p.remote_addr, 16);
-                    entry.payload_size = p.payload_size;
-                    entry.payload = p.payload;
+            }
+            ++poll_iter;
+            if (drv_ok) {
+                auto raw_packets = driver_bridge::get_captured_packets(64);
 
+                if (!raw_packets.empty()) {
+                    char dbg[128];
+                    snprintf(dbg, sizeof(dbg), "[network] capture_poll got %zu packets\n", raw_packets.size());
+                    driver_bridge::debug_log(dbg);
+                    std::lock_guard<std::mutex> lock(state.cap_mutex);
+                    for (auto& p : raw_packets) {
+                        packet_entry entry;
+                        entry.timestamp = p.timestamp;
+                        entry.pid = p.pid;
+                        entry.protocol = static_cast<uint8_t>(p.protocol);
+                        entry.direction = static_cast<uint8_t>(p.direction);
+                        entry.src_port = static_cast<uint16_t>(p.local_port);
+                        entry.dst_port = static_cast<uint16_t>(p.remote_port);
+                        memcpy(entry.src_addr, p.local_addr, 16);
+                        memcpy(entry.dst_addr, p.remote_addr, 16);
+                        entry.payload_size = p.payload_size;
+                        entry.payload = p.payload;
 
-                    auto det = protocol_parser::detect_protocol(
-                        p.payload.data(), p.payload.size(),
-                        static_cast<uint16_t>(p.local_port), static_cast<uint16_t>(p.remote_port),
-                        p.protocol);
-                    entry.protocol_label = det.label;
-                    entry.summary = det.summary;
+                        auto det = protocol_parser::detect_protocol(
+                            p.payload.data(), p.payload.size(),
+                            static_cast<uint16_t>(p.local_port), static_cast<uint16_t>(p.remote_port),
+                            p.protocol);
+                        entry.protocol_label = det.label;
+                        entry.summary = det.summary;
 
-                    state.captured_packets.push_back(std::move(entry));
-                    while (state.captured_packets.size() > state.cap_max_packets)
-                        state.captured_packets.pop_front();
+                        state.captured_packets.push_back(std::move(entry));
+                        while (state.captured_packets.size() > state.cap_max_packets)
+                            state.captured_packets.pop_front();
+                    }
                 }
             }
+
+            for (int i = 0; i < 10 && state.cap_polling.load(); i++)
+                Sleep(10);
         }
-
-
-        for (int i = 0; i < 10 && state.cap_polling.load(); i++)
-            Sleep(10);
     }
 }
 
 static void dns_poll_thread(state_t& state) {
     driver_bridge::debug_log("[network] dns_poll_thread STARTED\n");
+    state.dns_thread_alive.store(true);
     int poll_iter = 0;
-    while (state.dns_polling.load()) {
-        bool drv_ok = driver_bridge::using_kernel_driver();
-        if (poll_iter < 5 || (poll_iter % 100) == 0) {
-            char dbg[128];
-            snprintf(dbg, sizeof(dbg), "[network] dns_poll iter=%d drv_ok=%d\n", poll_iter, drv_ok ? 1 : 0);
-            driver_bridge::debug_log(dbg);
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lk(state.dns_cv_mutex);
+            state.dns_cv.wait(lk, [&state]() {
+                return state.dns_polling.load() || !state.dns_thread_alive.load();
+            });
         }
-        ++poll_iter;
-        if (drv_ok) {
-            auto raw_dns = driver_bridge::get_dns_queries(state.dns_filter_pid);
-
-            if (!raw_dns.empty()) {
+        if (!state.dns_thread_alive.load())
+            break;
+        poll_iter = 0;
+        while (state.dns_polling.load()) {
+            bool drv_ok = driver_bridge::using_kernel_driver();
+            if (poll_iter < 5 || (poll_iter % 100) == 0) {
                 char dbg[128];
-                snprintf(dbg, sizeof(dbg), "[network] dns_poll got %zu entries\n", raw_dns.size());
+                snprintf(dbg, sizeof(dbg), "[network] dns_poll iter=%d drv_ok=%d\n", poll_iter, drv_ok ? 1 : 0);
                 driver_bridge::debug_log(dbg);
-                std::lock_guard<std::mutex> lock(state.dns_mutex);
-                for (auto& d : raw_dns) {
-                    bool duplicate = false;
-                    for (auto it = state.dns_entries.rbegin();
-                         it != state.dns_entries.rend() && it != state.dns_entries.rbegin() + (std::min)(static_cast<size_t>(256), state.dns_entries.size());
-                         ++it) {
-                        if (it->timestamp == d.timestamp && it->domain == d.domain && it->pid == d.pid) {
-                            duplicate = true;
-                            break;
+            }
+            ++poll_iter;
+            if (drv_ok) {
+                auto raw_dns = driver_bridge::get_dns_queries(state.dns_filter_pid);
+
+                if (!raw_dns.empty()) {
+                    char dbg[128];
+                    snprintf(dbg, sizeof(dbg), "[network] dns_poll got %zu entries\n", raw_dns.size());
+                    driver_bridge::debug_log(dbg);
+                    std::lock_guard<std::mutex> lock(state.dns_mutex);
+                    for (auto& d : raw_dns) {
+                        bool duplicate = false;
+                        for (auto it = state.dns_entries.rbegin();
+                             it != state.dns_entries.rend() && it != state.dns_entries.rbegin() + (std::min)(static_cast<size_t>(256), state.dns_entries.size());
+                             ++it) {
+                            if (it->timestamp == d.timestamp && it->domain == d.domain && it->pid == d.pid) {
+                                duplicate = true;
+                                break;
+                            }
+                        }
+                        if (!duplicate) {
+                            dns_entry e;
+                            e.timestamp = d.timestamp;
+                            e.pid = d.pid;
+                            e.query_type = static_cast<uint16_t>(d.query_type);
+                            e.domain = d.domain;
+                            e.resolved_addr = format_ip(d.resolved_addr, 2);
+                            e.response_code = d.response_code;
+                            e.ttl = d.ttl;
+                            state.dns_entries.push_back(std::move(e));
                         }
                     }
-                    if (!duplicate) {
-                        dns_entry e;
-                        e.timestamp = d.timestamp;
-                        e.pid = d.pid;
-                        e.query_type = static_cast<uint16_t>(d.query_type);
-                        e.domain = d.domain;
-                        e.resolved_addr = format_ip(d.resolved_addr, 2);
-                        e.response_code = d.response_code;
-                        e.ttl = d.ttl;
-                        state.dns_entries.push_back(std::move(e));
-                    }
+                    while (state.dns_entries.size() > state.dns_max_entries)
+                        state.dns_entries.pop_front();
                 }
-                while (state.dns_entries.size() > state.dns_max_entries)
-                    state.dns_entries.pop_front();
             }
+
+            for (int i = 0; i < 50 && state.dns_polling.load(); i++)
+                Sleep(10);
         }
-
-
-        for (int i = 0; i < 50 && state.dns_polling.load(); i++)
-            Sleep(10);
     }
 }
 
 static void bandwidth_poll_thread(state_t& state) {
-    while (state.bw_polling.load()) {
-        if (driver_bridge::using_kernel_driver()) {
-            auto raw_bw = driver_bridge::get_bw_per_process();
+    state.bw_thread_alive.store(true);
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lk(state.bw_cv_mutex);
+            state.bw_cv.wait(lk, [&state]() {
+                return state.bw_polling.load() || !state.bw_thread_alive.load();
+            });
+        }
+        if (!state.bw_thread_alive.load())
+            break;
+        while (state.bw_polling.load()) {
+            if (driver_bridge::using_kernel_driver()) {
+                auto raw_bw = driver_bridge::get_bw_per_process();
 
             std::vector<bw_entry> old_entries;
             {
@@ -289,34 +321,76 @@ static void bandwidth_poll_thread(state_t& state) {
                 std::lock_guard<std::mutex> lock(state.bw_mutex);
                 state.bw_entries = std::move(entries);
             }
+            }
+
+
+            for (int i = 0; i < 50 && state.bw_polling.load(); i++)
+                Sleep(10);
         }
-
-
-        for (int i = 0; i < 50 && state.bw_polling.load(); i++)
-            Sleep(10);
     }
 }
 
 
+static void run_fuzzer_thread(state_t& state);
+
 void initialize() {
     g_state.active = true;
 
+    work_queue::initialize();
 
     g_state.conn_polling.store(true);
     g_state.conn_thread = std::thread(connection_poll_thread, std::ref(g_state));
+
+    g_state.cap_thread_alive.store(true);
+    g_state.cap_thread = std::thread(capture_poll_thread, std::ref(g_state));
+
+    g_state.dns_thread_alive.store(true);
+    g_state.dns_thread = std::thread(dns_poll_thread, std::ref(g_state));
+
+    g_state.bw_thread_alive.store(true);
+    g_state.bw_thread = std::thread(bandwidth_poll_thread, std::ref(g_state));
+
+    g_state.fuzz_thread_alive.store(true);
+    g_state.fuzz_thread = std::thread([]() {
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lk(g_state.fuzz_cv_mutex);
+                g_state.fuzz_cv.wait(lk, []() {
+                    return g_state.fuzz_running.load() || !g_state.fuzz_thread_alive.load();
+                });
+            }
+            if (!g_state.fuzz_thread_alive.load())
+                break;
+            run_fuzzer_thread(g_state);
+        }
+    });
 }
 
 void shutdown() {
     g_state.conn_polling.store(false);
-    g_state.cap_polling.store(false);
-    g_state.dns_polling.store(false);
     g_state.bw_polling.store(false);
+    g_state.bw_thread_alive.store(false);
+    g_state.bw_cv.notify_all();
+
+    g_state.cap_polling.store(false);
+    g_state.cap_thread_alive.store(false);
+    g_state.cap_cv.notify_all();
+
+    g_state.dns_polling.store(false);
+    g_state.dns_thread_alive.store(false);
+    g_state.dns_cv.notify_all();
+
+    g_state.fuzz_running.store(false);
+    g_state.fuzz_thread_alive.store(false);
+    g_state.fuzz_cv.notify_all();
 
     if (g_state.conn_thread.joinable()) g_state.conn_thread.join();
     if (g_state.cap_thread.joinable()) g_state.cap_thread.join();
     if (g_state.dns_thread.joinable()) g_state.dns_thread.join();
     if (g_state.bw_thread.joinable()) g_state.bw_thread.join();
+    if (g_state.fuzz_thread.joinable()) g_state.fuzz_thread.join();
 
+    work_queue::shutdown();
     mitm_proxy::stop();
     ssl_keylog::stop_watching();
     g_state.active = false;
@@ -661,19 +735,18 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             driver_bridge::debug_log(dbg);
             if (driver_bridge::start_capture(state.cap_filter_pid, state.cap_filter_port,
                                        state.cap_filter_protocol, nullptr)) {
-                driver_bridge::debug_log("[network] start_capture returned TRUE, spawning poll thread\n");
+                driver_bridge::debug_log("[network] start_capture returned TRUE, signaling poll thread\n");
                 state.cap_running = true;
                 state.cap_polling.store(true);
-                try {
-                    state.cap_thread = std::thread(capture_poll_thread, std::ref(state));
-                } catch (...) {
-                    state.cap_running = false;
-                    state.cap_polling.store(false);
-                    driver_bridge::stop_capture();
-                    driver_bridge::debug_log("[network] capture thread creation failed\n");
-                }
+                state.cap_cv.notify_all();
             } else {
-                driver_bridge::debug_log("[network] start_capture returned false (driver not connected?)\n");
+                driver_bridge::debug_log("[network] start_capture returned FALSE — driver IOCTL may have failed or capture_active=0\n");
+
+                char fail_msg[256];
+                snprintf(fail_msg, sizeof(fail_msg),
+                    "[network] start_capture FAILED (kernel_mode=%d). Check driver capture/WFP support.",
+                    driver_bridge::using_kernel_driver() ? 1 : 0);
+                driver_bridge::debug_log(fail_msg);
             }
         }
     } else {
@@ -681,7 +754,6 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             driver_bridge::stop_capture();
             state.cap_running = false;
             state.cap_polling.store(false);
-            if (state.cap_thread.joinable()) state.cap_thread.join();
         }
     }
 
@@ -940,17 +1012,11 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
     if (!state.dns_polling.load()) {
         if (ImGui::SmallButton("Start DNS Monitor")) {
             state.dns_polling.store(true);
-            try {
-                state.dns_thread = std::thread(dns_poll_thread, std::ref(state));
-            } catch (...) {
-                state.dns_polling.store(false);
-                driver_bridge::debug_log("[network] dns monitor thread creation failed\n");
-            }
+            state.dns_cv.notify_all();
         }
     } else {
         if (ImGui::SmallButton("Stop DNS Monitor")) {
             state.dns_polling.store(false);
-            if (state.dns_thread.joinable()) state.dns_thread.join();
         }
     }
     ImGui::SameLine();
@@ -1437,14 +1503,13 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
             driver_bridge::bw_monitor_op(0);
             state.bw_monitoring = true;
             state.bw_polling.store(true);
-            state.bw_thread = std::thread(bandwidth_poll_thread, std::ref(state));
+            state.bw_cv.notify_one();
         }
     } else {
         if (ImGui::SmallButton("Stop Monitoring")) {
             driver_bridge::bw_monitor_op(1);
             state.bw_monitoring = false;
             state.bw_polling.store(false);
-            if (state.bw_thread.joinable()) state.bw_thread.join();
         }
     }
 
@@ -1626,7 +1691,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                 if (ImGui::SmallButton("Send")) {
                     rep.in_progress = true;
                     auto* entry_ptr = &rep;
-                    std::thread([entry_ptr]() {
+                    work_queue::post([entry_ptr]() {
                         std::vector<uint8_t> raw(entry_ptr->raw_request.begin(), entry_ptr->raw_request.end());
                         auto result = mitm_proxy::repeat_request(
                             entry_ptr->host, entry_ptr->port, entry_ptr->use_tls, raw);
@@ -1640,7 +1705,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                             entry_ptr->status_code = 0;
                         }
                         entry_ptr->in_progress = false;
-                    }).detach();
+                    });
                 }
             } else {
                 ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "Sending...");
@@ -2118,7 +2183,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
             auto* written_count = &state.pcap_written_count;
             auto* writing_flag = &state.pcap_writing;
 
-            std::thread([packets_copy = std::move(packets_copy), path, filter_pid, filter_proto,
+            work_queue::post([packets_copy = std::move(packets_copy), path, filter_pid, filter_proto,
                          written_count, writing_flag]() {
                 std::ofstream f(path, std::ios::binary);
                 if (!f.is_open()) {
@@ -2137,7 +2202,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
                 *written_count = count;
                 f.close();
                 *writing_flag = false;
-            }).detach();
+            });
         }
     } else {
         ImGui::TextColored(ImVec4(ar, ag, ab, alpha), "Writing PCAP file...");
@@ -2165,7 +2230,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
         std::string har_path = std::string(temp) + "aida_proxy_export.har";
 
         auto history = mitm_proxy::get_history(0);
-        std::thread([history = std::move(history), har_path]() {
+        work_queue::post([history = std::move(history), har_path]() {
 
             std::ofstream f(har_path);
             if (!f.is_open()) return;
@@ -2192,7 +2257,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
             }
             f << "\n    ]\n  }\n}\n";
             f.close();
-        }).detach();
+        });
     }
 
     ImGui::EndChild();
@@ -2423,10 +2488,21 @@ static void run_fuzzer_thread(state_t& state) {
         }
     };
 
-    std::vector<std::thread> pool;
-    pool.reserve(static_cast<size_t>(threads));
-    for (int t = 0; t < threads; t++) pool.emplace_back(worker);
-    for (auto& th : pool) if (th.joinable()) th.join();
+    std::atomic<int> remaining{threads};
+    std::mutex done_mtx;
+    std::condition_variable done_cv;
+
+    for (int t = 0; t < threads; t++) {
+        work_queue::post([&worker, &remaining, &done_cv]() {
+            worker();
+            if (--remaining == 0)
+                done_cv.notify_all();
+        });
+    }
+    {
+        std::unique_lock<std::mutex> lk(done_mtx);
+        done_cv.wait(lk, [&remaining]() { return remaining.load() == 0; });
+    }
 
     state.fuzz_running.store(false);
 }
@@ -2645,8 +2721,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
             state.fuzz_progress.store(0);
             state.fuzz_total.store(0);
             state.fuzz_running.store(true);
-            if (state.fuzz_thread.joinable()) state.fuzz_thread.join();
-            state.fuzz_thread = std::thread([&state]() { run_fuzzer_thread(state); });
+            state.fuzz_cv.notify_one();
         }
         ImGui::SameLine();
         if (ImGui::Button("Clear Results##fuzz")) {

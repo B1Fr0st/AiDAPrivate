@@ -385,7 +385,7 @@ namespace globals
 
 
 		inline float load_timer = 0.f;
-		inline std::atomic<bool>* bg_init_done = nullptr;  // set from main.cpp
+		inline std::atomic<bool>* bg_init_done = nullptr;
 		inline float window_w = 250;
 		inline float window_h = 200;
 		inline float ui_alpha = 0.f;

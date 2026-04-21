@@ -19,6 +19,8 @@
 #include "core/anti-tamper/orchestrator.hpp"
 #include "core/anti-tamper/hv_preflight.hpp"
 #include "core/network_view.hpp"
+#include "core/memory_scanner.hpp"
+#include "core/mitm_proxy.hpp"
 #include "core/script_engine.hpp"
 #include "core/toast_notification.hpp"
 #include "core/source_reconstruct_view.hpp"
@@ -369,9 +371,7 @@ int main(int, char**)
     Blur::Init(g_pd3dDevice, g_pd3dDeviceContext, 100, 130);
     crash_log_write("blur_init_ok");
 
-    // ── Background initialization ──────────────────────────────────────
-    // Move heavy init off the main thread so the loading animation renders
-    // immediately instead of showing a frozen window for 15+ seconds.
+
     static std::atomic<bool> bg_init_done{false};
     globals::ui::bg_init_done = &bg_init_done;
     std::thread([]() {
@@ -379,6 +379,10 @@ int main(int, char**)
         crash_log_write("standalone_chat_init_ok");
         network_view::initialize();
         crash_log_write("network_view_init_ok");
+        memory_scanner::initialize();
+        crash_log_write("memory_scanner_init_ok");
+        mitm_proxy::pre_initialize();
+        crash_log_write("mitm_proxy_pre_init_ok");
         script_engine::initialize();
         crash_log_write("script_engine_init_ok");
 
@@ -392,12 +396,12 @@ int main(int, char**)
         bg_init_done.store(true, std::memory_order_release);
     }).detach();
 
-    // Hook driver_bridge logging into aida_debug.log via crash_log_write
+
     driver_bridge::set_log_callback([](const std::string& msg) {
         crash_log_write(msg.c_str());
     });
 
-    // driver_bridge already launches on its own thread
+
     std::thread([] { driver_bridge::initialize(); }).detach();
     crash_log_write("driver_bridge_thread_launched");
 

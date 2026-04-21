@@ -4,6 +4,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include "work_queue.hpp"
 #include <tlhelp32.h>
 
 #include "standalone_driver.hpp"
@@ -275,7 +276,8 @@ public:
         session->session_id = sid;
 
         auto* sess_ptr = session.get();
-        session->poll_thread = std::thread([this, sess_ptr]() {
+        session->poll_thread = {};
+        work_queue::post([this, sess_ptr]() {
             poll_ring(sess_ptr);
         });
 

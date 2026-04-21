@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include "work_queue.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -207,7 +208,7 @@ inline void take_snapshot(const std::string& name = "")
 		snap_name = buf;
 	}
 
-	std::thread([snap_name]() {
+	work_queue::post([snap_name]() {
 		snapshot_t snap;
 		snap.name = snap_name;
 		snap.pid = driver_bridge::attached_pid();
@@ -256,7 +257,7 @@ inline void take_snapshot(const std::string& name = "")
 		}
 
 		g_state.capturing.store(false);
-	}).detach();
+	});
 }
 
 inline void compare_snapshots(int idx_a, int idx_b)
@@ -268,7 +269,7 @@ inline void compare_snapshots(int idx_a, int idx_b)
 	g_state.cancel.store(false);
 	g_state.progress.store(0.f);
 
-	std::thread([idx_a, idx_b]() {
+	work_queue::post([idx_a, idx_b]() {
 		diff_result_t result;
 
 		snapshot_t snap_a, snap_b;
@@ -348,7 +349,7 @@ inline void compare_snapshots(int idx_a, int idx_b)
 		}
 
 		g_state.comparing.store(false);
-	}).detach();
+	});
 }
 
 inline void clear_snapshots()

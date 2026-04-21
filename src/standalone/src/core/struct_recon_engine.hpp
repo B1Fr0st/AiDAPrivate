@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include "work_queue.hpp"
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -840,7 +841,7 @@ inline void reconstruct_from_snapshot(uint64_t base_address, int struct_size, co
 	g_state.cancel.store(false);
 	g_state.progress.store(0.f);
 
-	std::thread([base_address, struct_size, name]() {
+	work_queue::post([base_address, struct_size, name]() {
 		reconstructed_struct_t result;
 		result.base_address = base_address;
 		result.total_size = struct_size;
@@ -928,7 +929,7 @@ inline void reconstruct_from_snapshot(uint64_t base_address, int struct_size, co
 
 		g_state.progress.store(1.f);
 		g_state.monitoring.store(false);
-	}).detach();
+	});
 }
 
 namespace insn_analysis {
@@ -1053,7 +1054,7 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 	g_state.cancel.store(false);
 	g_state.progress.store(0.f);
 
-	std::thread([base_address, struct_size, name]() {
+	work_queue::post([base_address, struct_size, name]() {
 		reconstructed_struct_t result;
 		result.base_address = base_address;
 		result.total_size = struct_size;
@@ -1310,7 +1311,7 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 
 		g_state.progress.store(1.f);
 		g_state.monitoring.store(false);
-	}).detach();
+	});
 }
 
 inline std::string export_as_cpp(const reconstructed_struct_t& s)
@@ -1405,7 +1406,7 @@ inline void ai_name_fields()
 
 	g_state.ai_naming.store(true);
 
-	std::thread([snapshot]() {
+	work_queue::post([snapshot]() {
 		std::string prompt = "You are analyzing a reconstructed memory structure from a running process.\n";
 		prompt += "Base address: 0x";
 		char addr_buf[32];
@@ -1518,7 +1519,7 @@ inline void ai_name_fields()
 		}
 
 		g_state.ai_naming.store(false);
-	}).detach();
+	});
 }
 
 inline void detect_arrays(std::vector<struct_field_t>& fields)

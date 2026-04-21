@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "work_queue.hpp"
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -83,7 +84,7 @@ inline void start(uint64_t base_address, int struct_size, const std::string& nam
 		}
 	}
 
-	std::thread([base_address, struct_size, pid]() {
+	work_queue::post([base_address, struct_size, pid]() {
 		monitor_session_t& sess = g_state.session;
 
 		bool pg_ok = false;
@@ -288,7 +289,7 @@ inline void start(uint64_t base_address, int struct_size, const std::string& nam
 		}
 
 		g_state.active.store(false);
-	}).detach();
+	});
 }
 
 inline void stop()

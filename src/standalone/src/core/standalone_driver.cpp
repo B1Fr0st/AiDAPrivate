@@ -966,7 +966,7 @@ namespace driver_bridge
                 return true;
             }
             out.clear();
-            } // end kernel_attached
+            }
         }
 
         if (has_vm_read && process && size <= 0x10000000) {

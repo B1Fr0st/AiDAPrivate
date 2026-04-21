@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include "work_queue.hpp"
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -196,7 +197,7 @@ inline void build_reverse_map()
 	g_state.map_cancel.store(false);
 	g_state.map_progress.store(0.f);
 
-	std::thread([]() {
+	work_queue::post([]() {
 		auto modules = driver_bridge::enumerate_modules();
 		auto regions = driver_bridge::enumerate_memory_regions(4096);
 
@@ -276,7 +277,7 @@ inline void build_reverse_map()
 		}
 
 		g_state.map_building.store(false);
-	}).detach();
+	});
 }
 
 inline void start_scan()
@@ -295,7 +296,7 @@ inline void start_scan()
 	g_state.scan_cancel.store(false);
 	g_state.scan_progress.store(0.f);
 
-	std::thread([]() {
+	work_queue::post([]() {
 		std::vector<pointer_chain_t> results;
 		std::mutex results_mutex;
 
@@ -322,7 +323,7 @@ inline void start_scan()
 		}
 
 		g_state.scanning.store(false);
-	}).detach();
+	});
 }
 
 inline bool validate_chain(const pointer_chain_t& chain)

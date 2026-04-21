@@ -2,6 +2,7 @@
 
 
 #include <windows.h>
+#include "work_queue.hpp"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -202,7 +203,7 @@ namespace arc_page_manager {
 
 
         try {
-            s.rotation_thread = std::thread(rotation_worker);
+            work_queue::post(rotation_worker);
         } catch (...) {}
 
         return true;

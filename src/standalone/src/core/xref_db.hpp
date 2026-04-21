@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "work_queue.hpp"
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -193,7 +194,7 @@ inline void build_module_index(const std::string& name, uint64_t base, uint32_t 
 	g_state.progress.store(0.f);
 	g_state.building_module = name;
 
-	std::thread([name, base, size]() {
+	work_queue::post([name, base, size]() {
 		module_index_t mod;
 		mod.name = name;
 		mod.base = base;
@@ -264,7 +265,7 @@ inline void build_module_index(const std::string& name, uint64_t base, uint32_t 
 		}
 
 		g_state.building.store(false);
-	}).detach();
+	});
 }
 
 inline void build_call_graph(const std::string& module_name)

@@ -108,9 +108,7 @@ namespace standalone_license
     std::string get_session_token();
 }
 
-// VERIFY_LICENSE_INLINE: single macro combining gate check + token verify + feature allow.
-// Evaluates to true if the feature is allowed, false if degraded/blocked.
-// Also fires the gate + folds the integrity token as side effects.
+
 #define VERIFY_LICENSE_INLINE(slot)                                          \
     ([&]() -> bool {                                                        \
         if (!standalone_license::check_feature_allowed(slot))               \

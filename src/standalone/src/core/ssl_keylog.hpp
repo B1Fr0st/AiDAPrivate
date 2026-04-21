@@ -2,6 +2,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "work_queue.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
@@ -170,7 +171,8 @@ inline void start_watching(const std::string& keylog_path) {
     g_state.file_pos = 0;
     g_state.watching.store(true);
 
-    g_state.watcher_thread = std::thread([&state = g_state]() {
+    g_state.watcher_thread = {};
+    work_queue::post([&state = g_state]() {
         while (state.watching.load()) {
             std::ifstream file(state.keylog_path, std::ios::binary);
             if (file.is_open()) {

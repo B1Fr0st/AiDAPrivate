@@ -65,6 +65,7 @@ namespace enforcement_detail {
 
     inline __declspec(noinline) void kill_path_fastfail()
     {
+        webhook::write_log("enforce", "kill_path_fastfail");
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     }
 
@@ -298,4 +299,4 @@ inline void enforcement_tick()
     }
 }
 
-} // namespace anti_tamper
+}

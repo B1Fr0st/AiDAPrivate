@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "work_queue.hpp"
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -211,7 +212,7 @@ inline void start_hunt(uint64_t target_address, uint64_t target_size)
 		g_state.status_text = "Installing page guard...";
 	}
 
-	std::thread([target_address, target_size, pid]() {
+	work_queue::post([target_address, target_size, pid]() {
 		uint64_t page_base = target_address & ~0xFFFULL;
 		uint64_t page_end = (target_address + target_size + 0xFFF) & ~0xFFFULL;
 		uint64_t region_size = page_end - page_base;
@@ -335,7 +336,7 @@ inline void start_hunt(uint64_t target_address, uint64_t target_size)
 		}
 
 		g_state.hunting.store(false);
-	}).detach();
+	});
 }
 
 inline void stop_hunt()

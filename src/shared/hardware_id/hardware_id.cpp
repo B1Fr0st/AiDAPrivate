@@ -221,7 +221,7 @@ namespace aida::hardware_id
         return a;
     }
 
-    bool collect_from_driver(anchor_set_t& /*out*/) noexcept
+    bool collect_from_driver(anchor_set_t& ) noexcept
     {
         return false;
     }

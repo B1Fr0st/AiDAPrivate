@@ -1,6 +1,7 @@
 #pragma once
 
 #include "deobfuscation_engine.hpp"
+#include "work_queue.hpp"
 #include "ui_anim.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
@@ -127,14 +128,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (addr != 0) {
 				uint32_t max_insn = static_cast<uint32_t>(st.max_instructions);
 				eng.processing.store(true);
-				std::thread([addr, max_insn]() {
+				work_queue::post([addr, max_insn]() {
 					auto result = deobfuscation_engine::deobfuscate_function(addr, max_insn);
 					{
 						std::lock_guard<std::mutex> lk(deobfuscation_engine::g_state.mutex);
 						deobfuscation_engine::g_state.last_result = std::move(result);
 					}
 					deobfuscation_engine::g_state.processing.store(false);
-				}).detach();
+				});
 			}
 		}
 		ImGui::SameLine();

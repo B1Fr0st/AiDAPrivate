@@ -38,7 +38,7 @@ static const std::string& get_mcp_server_instructions()
 
 static std::string generate_session_id()
 {
-    // Phase 6.5: cryptographically strong session IDs via BCryptGenRandom.
+
     unsigned char rnd[16] = {};
     NTSTATUS st = BCryptGenRandom(nullptr, rnd, sizeof(rnd),
                                   BCRYPT_USE_SYSTEM_PREFERRED_RNG);

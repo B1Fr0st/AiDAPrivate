@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "work_queue.hpp"
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -542,7 +543,7 @@ inline void scan_process()
 		g_state.active = true;
 	}
 
-	std::thread([]() {
+	work_queue::post([]() {
 		auto signatures = get_signatures();
 
 		std::vector<custom_signature_t> custom_copy;
@@ -626,7 +627,7 @@ inline void scan_process()
 
 		auto_label_references();
 		g_state.scanning.store(false);
-	}).detach();
+	});
 }
 
 inline void scan_file(const DisasmFile& file)
@@ -642,7 +643,7 @@ inline void scan_file(const DisasmFile& file)
 		g_state.active = true;
 	}
 
-	std::thread([file]() {
+	work_queue::post([file]() {
 		auto signatures = get_signatures();
 
 		size_t total_bytes = 0;
@@ -681,7 +682,7 @@ inline void scan_file(const DisasmFile& file)
 
 		auto_label_references();
 		g_state.scanning.store(false);
-	}).detach();
+	});
 }
 
 inline void auto_label_references()
@@ -829,7 +830,7 @@ inline void scan_entropy()
 	g_state.cancel.store(false);
 	g_state.progress.store(0.f);
 
-	std::thread([]() {
+	work_queue::post([]() {
 		auto regions = driver_bridge::enumerate_memory_regions();
 		auto modules = driver_bridge::enumerate_modules();
 
@@ -891,7 +892,7 @@ inline void scan_entropy()
 		}
 
 		g_state.scanning.store(false);
-	}).detach();
+	});
 }
 
 inline void add_custom_signature(const std::string& name, const std::string& algorithm,
@@ -932,7 +933,7 @@ inline void ai_analyze_results()
 
 	g_state.analyzing.store(true);
 
-	std::thread([results_copy, entropy_copy]() {
+	work_queue::post([results_copy, entropy_copy]() {
 		std::string prompt = "You are analyzing cryptographic usage in a binary. ";
 		prompt += "The following crypto constants/tables were found in process memory:\n\n";
 
@@ -1001,7 +1002,7 @@ inline void ai_analyze_results()
 		}
 
 		g_state.analyzing.store(false);
-	}).detach();
+	});
 }
 
 inline void export_results_json(const std::string& path)

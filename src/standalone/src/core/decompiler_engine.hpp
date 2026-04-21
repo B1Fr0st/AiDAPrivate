@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include "work_queue.hpp"
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -712,7 +713,7 @@ inline void decompile_function(uint64_t func_addr, const settings_sa_t& settings
 		}
 	}
 
-	std::thread([func_addr, &settings]() {
+	work_queue::post([func_addr, &settings]() {
 		const size_t max_bytes = 0x10000;
 		std::vector<uint8_t> mem;
 		driver_bridge::read_memory(func_addr, max_bytes, mem);
@@ -990,7 +991,7 @@ inline void decompile_function(uint64_t func_addr, const settings_sa_t& settings
 		}
 
 		g_state.decompiling.store(false);
-	}).detach();
+	});
 }
 
 inline void cancel_decompile()
@@ -1030,7 +1031,7 @@ inline void decompile_with_deobfuscation(uint64_t func_addr, const settings_sa_t
 		}
 	}
 
-	std::thread([func_addr, &settings]() {
+	work_queue::post([func_addr, &settings]() {
 		uint32_t pid = driver_bridge::attached_pid();
 		if (pid == 0) {
 			std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -1225,7 +1226,7 @@ inline void decompile_with_deobfuscation(uint64_t func_addr, const settings_sa_t
 		}
 
 		g_state.decompiling.store(false);
-	}).detach();
+	});
 }
 #endif
 
@@ -1273,7 +1274,7 @@ inline void batch_decompile(const std::vector<uint64_t>& addresses)
 		g_state.batch_queue = addresses;
 	}
 
-	std::thread([addresses]() {
+	work_queue::post([addresses]() {
 		auto& settings = g_sa_settings;
 
 		for (int i = 0; i < static_cast<int>(addresses.size()); ++i) {
@@ -1549,7 +1550,7 @@ inline void batch_decompile(const std::vector<uint64_t>& addresses)
 
 		g_state.batch_running.store(false);
 		g_state.decompiling.store(false);
-	}).detach();
+	});
 }
 
 inline void decompile_function_native(uint64_t func_addr) {
@@ -1593,7 +1594,7 @@ inline void decompile_function_native(uint64_t func_addr) {
 		g_state.current.function_name = name;
 	}
 
-	std::thread([func_addr]() {
+	work_queue::post([func_addr]() {
 
 
 		constexpr size_t PREREAD_SIZE = 0x40000;
@@ -1646,7 +1647,7 @@ inline void decompile_function_native(uint64_t func_addr) {
 			g_state.history_pos = static_cast<int>(g_state.history.size()) - 1;
 		}
 		g_state.decompiling.store(false);
-	}).detach();
+	});
 }
 
 inline void decompile_function_hybrid(uint64_t func_addr, const settings_sa_t& settings) {
@@ -1665,7 +1666,7 @@ inline void decompile_function_hybrid(uint64_t func_addr, const settings_sa_t& s
 		g_state.active = true;
 	}
 
-	std::thread([func_addr, settings]() {
+	work_queue::post([func_addr, settings]() {
 
 
 		constexpr size_t PREREAD_SIZE = 0x40000;
@@ -1802,7 +1803,7 @@ inline void decompile_function_hybrid(uint64_t func_addr, const settings_sa_t& s
 			}
 			g_state.decompiling.store(false);
 		}
-	}).detach();
+	});
 }
 
 
@@ -1819,7 +1820,7 @@ inline void batch_decompile_native(const std::vector<uint64_t>& addresses) {
 		g_state.batch_queue = addresses;
 	}
 
-	std::thread([addresses]() {
+	work_queue::post([addresses]() {
 		if (addresses.empty()) {
 			g_state.batch_running.store(false);
 			return;
@@ -1866,7 +1867,7 @@ inline void batch_decompile_native(const std::vector<uint64_t>& addresses) {
 
 		g_state.batch_running.store(false);
 		g_state.decompiling.store(false);
-	}).detach();
+	});
 }
 
 }

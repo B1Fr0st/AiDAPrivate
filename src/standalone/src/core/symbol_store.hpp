@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "work_queue.hpp"
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -140,7 +141,7 @@ inline void load_pdb_for_module(const std::string& module_name, uint64_t base, u
 		ms.status_text = "Searching for PDB...";
 	}
 
-	std::thread([module_name]() {
+	work_queue::post([module_name]() {
 		std::string pdb_path = detail::find_pdb_local(module_name);
 
 		if (pdb_path.empty()) {
@@ -190,7 +191,7 @@ inline void load_pdb_for_module(const std::string& module_name, uint64_t base, u
 			ms.failed = true;
 			ms.status_text = "Failed to parse PDB";
 		}
-	}).detach();
+	});
 }
 
 inline void auto_load_attached_modules()

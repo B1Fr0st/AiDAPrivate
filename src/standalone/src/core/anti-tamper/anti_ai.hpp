@@ -75,12 +75,11 @@ namespace mcp_detect
             detail::to_lower_w(fd.cFileName, lower, MAX_PATH);
             ++scanned;
 
-            // skip our own pipes — ai_deception creates AiDA_MCP_Bridge
+
             if (detail::contains_w(lower, L"aida"))
                 continue;
 
-            // skip generic MCP UUID sockets (VS Code extensions etc.)
-            // pattern: "mcp-XXXXXXXX-..." with hex UUID — these are standard MCP servers, not targeting us
+
             if (detail::contains_w(lower, L"mcp-") && detail::contains_w(lower, L".sock"))
                 continue;
 

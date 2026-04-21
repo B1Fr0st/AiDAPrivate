@@ -6,6 +6,7 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include "work_queue.hpp"
 #include <algorithm>
 #include <cctype>
 
@@ -243,7 +244,8 @@ inline void start_polling() {
 
     g_state.polling.store(true);
 
-    g_state.poll_thread = std::thread([]() {
+    g_state.poll_thread = {};
+    work_queue::post([]() {
         while (g_state.polling.load()) {
             poll_captures();
             std::this_thread::sleep_for(std::chrono::milliseconds(100));

@@ -4,6 +4,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include "work_queue.hpp"
 
 #include <atomic>
 #include <filesystem>

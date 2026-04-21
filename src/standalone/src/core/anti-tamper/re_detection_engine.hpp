@@ -1343,9 +1343,21 @@ inline void tick()
 
     static std::atomic<uint32_t> s_tick_num{0};
     uint32_t tn = s_tick_num.fetch_add(1);
-    if (mask != 0 || tn < 5 || (tn % 20) == 0) {
-        char tb[128];
-        _snprintf_s(tb, sizeof(tb), _TRUNCATE, "tick=%u mask=0x%X", tn, mask);
+    {
+        // compute score for logging
+        uint32_t _sc = 0, _fam = 0; int _fc = 0;
+        for (int _b = 0; _b < 32; ++_b) {
+            if ((mask & (1u << _b)) == 0) continue;
+            const auto& _d = signals(1u << _b);
+            _sc += _d.weight;
+            if ((_fam & _d.family) == 0) { _fam |= _d.family; ++_fc; }
+        }
+        bool _dev = detail::is_devmode_hwid_allowlisted();
+        bool _exc = _sc >= THRESHOLD_CONFIRMED && _fc >= 2;
+        char tb[192];
+        _snprintf_s(tb, sizeof(tb), _TRUNCATE,
+            "re_tick tick=%u mask=0x%X score=%u families=%d threshold=%u exceeds=%d devmode=%d",
+            tn, mask, _sc, _fc, THRESHOLD_CONFIRMED, (int)_exc, (int)_dev);
         webhook::write_log("re_tick", tb);
     }
 
@@ -1386,6 +1398,13 @@ inline void tick()
     uint32_t intersect = prev & mask;
     if (intersect != 0) {
         uint32_t c = s.persist_count.fetch_add(1) + 1;
+        {
+            char pb[128];
+            _snprintf_s(pb, sizeof(pb), _TRUNCATE,
+                "re_persist intersect=0x%X count=%u persistence_ticks=%u should_bsod=%d",
+                intersect, c, PERSISTENCE_TICKS, (int)should_bsod(intersect));
+            webhook::write_log("re_tick", pb);
+        }
         if (c >= PERSISTENCE_TICKS && should_bsod(intersect)) {
             uint64_t evidence = detail::hash_evidence(intersect);
             standalone_license::fold_integrity_token(evidence);

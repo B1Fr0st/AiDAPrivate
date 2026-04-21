@@ -452,8 +452,7 @@ namespace anti_debug {
                 "idaq.exe", "idaq64.exe", "dnspy.exe",
                 "cheatengine", "ce.exe", "processhacker",
                 "apimonitor", "scylla", "titanhide",
-                "hyperdbg.exe", "radare2.exe", "ghidra",
-                "binaryninja", "devenv.exe"
+                "hyperdbg.exe", "radare2.exe"
             };
             constexpr int num_names = sizeof(debugger_names) / sizeof(debugger_names[0]);
 
@@ -710,12 +709,67 @@ namespace anti_debug {
 
         __try {
             UINT8* eprocess = (UINT8*)process;
+
+            RTL_OSVERSIONINFOW osver = {};
+            osver.dwOSVersionInfoSize = sizeof(osver);
+            if (_RtlGetVersion) _RtlGetVersion(&osver);
+
+            UCHAR* img_name = PsGetProcessImageFileName(process);
+
+            PVOID val_430 = *(volatile PVOID*)(eprocess + 0x430);
+            PVOID val_438 = *(volatile PVOID*)(eprocess + 0x438);
+            PVOID val_440 = *(volatile PVOID*)(eprocess + 0x440);
+            PVOID val_448 = *(volatile PVOID*)(eprocess + 0x448);
+            PVOID val_450 = *(volatile PVOID*)(eprocess + 0x450);
+            PVOID val_458 = *(volatile PVOID*)(eprocess + 0x458);
+            PVOID val_460 = *(volatile PVOID*)(eprocess + 0x460);
+            PVOID val_468 = *(volatile PVOID*)(eprocess + 0x468);
+            PVOID val_470 = *(volatile PVOID*)(eprocess + 0x470);
+            PVOID val_478 = *(volatile PVOID*)(eprocess + 0x478);
+            PVOID val_4D0 = *(volatile PVOID*)(eprocess + 0x4D0);
+            PVOID val_4D8 = *(volatile PVOID*)(eprocess + 0x4D8);
+            PVOID val_4E0 = *(volatile PVOID*)(eprocess + 0x4E0);
+            PVOID val_4E8 = *(volatile PVOID*)(eprocess + 0x4E8);
+            PVOID val_5C0 = *(volatile PVOID*)(eprocess + 0x5C0);
+            PVOID val_5C8 = *(volatile PVOID*)(eprocess + 0x5C8);
+
+            WW_LOG("[INSTR-DUMP] pid=%u name=%s eprocess=%p build=%lu.%lu g_instr_cb=%p",
+                pid,
+                img_name ? (const char*)img_name : "?",
+                (PVOID)eprocess,
+                osver.dwMajorVersion * 1000 + osver.dwMinorVersion,
+                osver.dwBuildNumber,
+                g_instrumentation_callback);
+
+            WW_LOG("[INSTR-DUMP] +0x430=%p +0x438=%p +0x440=%p +0x448=%p",
+                val_430, val_438, val_440, val_448);
+            WW_LOG("[INSTR-DUMP] +0x450=%p +0x458=%p +0x460=%p +0x468=%p",
+                val_450, val_458, val_460, val_468);
+            WW_LOG("[INSTR-DUMP] +0x470=%p +0x478=%p",
+                val_470, val_478);
+            WW_LOG("[INSTR-DUMP] +0x4D0=%p +0x4D8=%p +0x4E0=%p +0x4E8=%p",
+                val_4D0, val_4D8, val_4E0, val_4E8);
+            WW_LOG("[INSTR-DUMP] +0x5C0=%p +0x5C8=%p",
+                val_5C0, val_5C8);
+
             volatile PVOID* instr_cb = (volatile PVOID*)(eprocess + 0x460);
-            if (*instr_cb != nullptr && *instr_cb != g_instrumentation_callback) {
-                PVOID old = InterlockedExchangePointer(instr_cb, nullptr);
-                WW_LOG("anti_debug: cleared foreign instrumentation callback %p for pid=%u", old, pid);
+            PVOID cur = *instr_cb;
+            BOOLEAN is_canonical = (cur == nullptr) ||
+                ((UINT64)cur < 0x00007FFFFFFFFFFull) ||
+                ((UINT64)cur >= 0xFFFF800000000000ull);
+
+            WW_LOG("[INSTR-DUMP] offset=0x460 cur=%p is_canonical=%d matches_own=%d",
+                cur, is_canonical ? 1 : 0,
+                (cur == g_instrumentation_callback) ? 1 : 0);
+
+            if (cur != nullptr && cur != g_instrumentation_callback) {
+                WW_LOG("[INSTR-DUMP] WOULD_CLEAR pid=%u cur=%p g=%p — SKIPPING CLEAR, logging only",
+                    pid, cur, g_instrumentation_callback);
+            } else {
+                WW_LOG("[INSTR-DUMP] no foreign cb at 0x460 for pid=%u (cur=%p)", pid, cur);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            WW_LOG("[INSTR-DUMP] EXCEPTION during dump for pid=%u", pid);
             status = STATUS_UNSUCCESSFUL;
         }
 
@@ -768,27 +822,47 @@ namespace continuous_anti_debug {
 
         if ((cycle % 3) == 0) {
             anti_debug::clear_debug_objects(pid);
+            WW_LOG("[CONT-ADBG] cycle=%llu calling clear_instrumentation_callback_eprocess pid=%u", cycle, pid);
             anti_debug::clear_instrumentation_callback_eprocess(pid);
         }
 
         if ((cycle % 5) == 0) {
-            UINT64 dbg_pid = 0;
-            NTSTATUS st = anti_debug::scan_for_debugger_processes(&dbg_pid);
-            if (NT_SUCCESS(st) && dbg_pid != 0) {
-                InterlockedIncrement64((volatile LONG64*)&g_violations);
-                sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
-                sentinel_bridge::g_bridge.sentinel_cmd_param = (ULONG)(dbg_pid & 0xFFFFFFFF);
+            // Only act if the protected process is ACTUALLY being debugged.
+            // A debugger tool merely running on the system is not a threat.
+            BOOLEAN target_being_debugged = FALSE;
+            {
+                PEPROCESS target_proc = nullptr;
+                if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &target_proc)) && target_proc) {
+                    __try {
+                        // EPROCESS.DebugPort is at offset 0x578 on Win10/11 x64 (all major builds).
+                        // Non-null means a debug port is attached to this process.
+                        ULONG_PTR* debug_port_ptr = (ULONG_PTR*)((UINT8*)target_proc + 0x578);
+                        if (_MmIsAddressValid(debug_port_ptr) && *debug_port_ptr != 0)
+                            target_being_debugged = TRUE;
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    ObDereferenceObject(target_proc);
+                }
+            }
 
-                if (_ZwOpenProcess && _ZwTerminateProcess && _ZwClose) {
-                    OBJECT_ATTRIBUTES oa;
-                    InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
-                    CLIENT_ID cid = {};
-                    cid.UniqueProcess = (HANDLE)(ULONG_PTR)dbg_pid;
-                    HANDLE hProc = nullptr;
-                    if (NT_SUCCESS(_ZwOpenProcess(&hProc, PROCESS_TERMINATE, &oa, &cid)) && hProc) {
-                        _ZwTerminateProcess(hProc, STATUS_ACCESS_DENIED);
-                        _ZwClose(hProc);
-                        WW_LOG("continuous_adbg: killed debugger pid=%llu", dbg_pid);
+            if (target_being_debugged) {
+                UINT64 dbg_pid = 0;
+                NTSTATUS st = anti_debug::scan_for_debugger_processes(&dbg_pid);
+                if (NT_SUCCESS(st) && dbg_pid != 0) {
+                    InterlockedIncrement64((volatile LONG64*)&g_violations);
+                    sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
+                    sentinel_bridge::g_bridge.sentinel_cmd_param = (ULONG)(dbg_pid & 0xFFFFFFFF);
+
+                    if (_ZwOpenProcess && _ZwTerminateProcess && _ZwClose) {
+                        OBJECT_ATTRIBUTES oa;
+                        InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
+                        CLIENT_ID cid = {};
+                        cid.UniqueProcess = (HANDLE)(ULONG_PTR)dbg_pid;
+                        HANDLE hProc = nullptr;
+                        if (NT_SUCCESS(_ZwOpenProcess(&hProc, PROCESS_TERMINATE, &oa, &cid)) && hProc) {
+                            _ZwTerminateProcess(hProc, STATUS_ACCESS_DENIED);
+                            _ZwClose(hProc);
+                            WW_LOG("continuous_adbg: killed debugger pid=%llu (was attached to protected pid=%u)", dbg_pid, pid);
+                        }
                     }
                 }
             }

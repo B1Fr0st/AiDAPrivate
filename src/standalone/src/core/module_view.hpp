@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "work_queue.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -51,14 +52,14 @@ inline void refresh()
 		return;
 	g_ui.loading.store(true);
 
-	std::thread([]() {
+	work_queue::post([]() {
 		auto mods = driver_bridge::enumerate_modules();
 		{
 			std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
 			g_ui.modules = std::move(mods);
 		}
 		g_ui.loading.store(false);
-	}).detach();
+	});
 }
 
 inline void load_module_details(int index)
@@ -76,7 +77,7 @@ inline void load_module_details(int index)
 
 	g_ui.loading.store(true);
 
-	std::thread([base]() {
+	work_queue::post([base]() {
 		pe_parser::pe_info_t pe;
 		pe_parser::parse(base, pe);
 		{
@@ -88,7 +89,7 @@ inline void load_module_details(int index)
 			g_ui.detail_target_scroll_y = 0.f;
 		}
 		g_ui.loading.store(false);
-	}).detach();
+	});
 }
 
 namespace detail {
