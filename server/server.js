@@ -1,5 +1,21 @@
 
 
+// Load .env file if present (no dotenv dependency needed)
+(function loadEnvFile() {
+    const fs = require('fs'), path = require('path');
+    const envPath = path.join(__dirname, '.env');
+    if (!fs.existsSync(envPath)) return;
+    for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {
+        const t = line.trim();
+        if (!t || t.startsWith('#')) continue;
+        const idx = t.indexOf('=');
+        if (idx < 0) continue;
+        const k = t.substring(0, idx).trim();
+        const v = t.substring(idx + 1).trim();
+        if (k && !(k in process.env)) process.env[k] = v;
+    }
+})();
+
 const express = require('express');
 const helmet = require('helmet');
 const cors = require('cors');
@@ -30,7 +46,6 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization', 'X-TLS-Exporter', 'X-Challenge-Id', 'X-Challenge-Signature', 'X-Sentinel-Token'],
 }));
 app.use(express.json({ limit: '1mb' }));
-
 
 const limiter = rateLimit({
     windowMs: 60 * 1000,

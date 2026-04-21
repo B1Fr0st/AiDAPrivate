@@ -700,7 +700,7 @@ namespace
 #ifdef AIDA_LOCAL_LICENSE_SERVER
         return "http://localhost:3001";
 #else
-        return "https://aidapro.net";
+        return "https://api.aidapro.net";
 #endif
     }
 

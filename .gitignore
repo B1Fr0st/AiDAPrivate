@@ -30,6 +30,7 @@ compile_commands.json
 
 # Artifacts / distribution
 artifacts/
+packages/
 dist/
 *.zip
 

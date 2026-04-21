@@ -198,7 +198,7 @@ async function sendTelegramAlert(title, fields) {
         }
         text += `\n<i>${new Date().toISOString()}</i>`;
 
-        const url = `https:
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
         await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1072,6 +1072,61 @@ router.get('/challenge', async (req, res) => {
         console.error('[challenge] Error:', err);
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }
+});
+
+router.post('/create', async (req, res) => {
+    const expectedAdminKey = process.env.ADMIN_API_KEY || '';
+    const { admin_key, plan, note, expires, created_by } = req.body || {};
+
+    if (!expectedAdminKey || !admin_key || typeof admin_key !== 'string') {
+        return res.status(403).json({ status: 'error', reason: 'unauthorized' });
+    }
+
+    const hmacKey = Buffer.from('aida-keygen-cmp-v1');
+    const submittedHmac = crypto.createHmac('sha256', hmacKey).update(admin_key).digest();
+    const expectedHmac  = crypto.createHmac('sha256', hmacKey).update(expectedAdminKey).digest();
+    if (!crypto.timingSafeEqual(submittedHmac, expectedHmac)) {
+        return res.status(403).json({ status: 'error', reason: 'unauthorized' });
+    }
+
+    if (plan !== 'pro') {
+        return res.status(400).json({ status: 'error', reason: 'invalid_plan', valid_plans: ['pro'] });
+    }
+
+    if (expires !== undefined && expires !== null && expires !== '') {
+        if (typeof expires !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(expires)) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_expires_format' });
+        }
+        const d = new Date(expires + 'T00:00:00Z');
+        if (isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== expires) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_expires_date' });
+        }
+    }
+
+    const safeNote = (typeof note === 'string' ? note : '').slice(0, 512).replace(/[^\x20-\x7E]/g, '');
+    const safeCreatedBy = (typeof created_by === 'string' ? created_by : 'payment_system').slice(0, 128).replace(/[^\x20-\x7E]/g, '');
+
+    const segments = [
+        crypto.randomBytes(2).toString('hex').toUpperCase(),
+        crypto.randomBytes(2).toString('hex').toUpperCase(),
+        crypto.randomBytes(2).toString('hex').toUpperCase(),
+        crypto.randomBytes(2).toString('hex').toUpperCase(),
+    ];
+    const key = 'AIDA-' + segments.join('-');
+    const now = Math.floor(Date.now() / 1000);
+
+    try {
+        await pool.query(
+            `INSERT INTO licenses (key, active, hwid, expires, plan, note, created_at, created_by)
+             VALUES ($1, true, '', $2, $3, $4, $5, $6)`,
+            [key, expires || '', plan, safeNote, now, safeCreatedBy]
+        );
+    } catch (err) {
+        console.error('[license/create] DB insert error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+
+    return res.status(200).json({ status: 'ok', key, plan, expires: expires || null });
 });
 
 module.exports = router;

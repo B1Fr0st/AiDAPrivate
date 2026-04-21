@@ -203,7 +203,7 @@ namespace anti_debug {
             if (idt1.base == 0 || idt1.limit == 0)
                 return TRUE;
 
-            if (idt1.limit != 0x0FFF)
+            if (idt1.limit < 0x07FFu)
                 return TRUE;
 
         } __except (EXCEPTION_EXECUTE_HANDLER) {
