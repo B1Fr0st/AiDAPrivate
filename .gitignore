@@ -31,6 +31,7 @@ compile_commands.json
 # Artifacts / distribution
 artifacts/
 sources/
+.venv/
 packages/
 dist/
 *.zip
