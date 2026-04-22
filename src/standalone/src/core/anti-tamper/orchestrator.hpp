@@ -562,9 +562,14 @@ inline bool guard()
         }
         if (!lic_valid)
         {
-            std::string err = standalone_license::last_error();
-            webhook::send_debug_log("guard", "license_invalid: " + err, true);
-            enforce_violation("license_killed", err);
+            if (!rt.license_pending_activation.load(std::memory_order_acquire))
+            {
+                std::string err = standalone_license::last_error();
+                webhook::send_debug_log("guard", "license_invalid: " + err, true);
+                enforce_violation("license_killed", err);
+                CFF_EXIT(guard_cff);
+            }
+            webhook::write_log("guard", "license_pending_activation_skip");
             CFF_EXIT(guard_cff);
         }
 

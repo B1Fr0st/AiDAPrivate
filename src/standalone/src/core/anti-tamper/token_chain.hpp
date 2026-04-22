@@ -291,6 +291,10 @@ namespace token_chain {
     inline bool is_chain_stale()
     {
         auto& rt = state::get();
+
+        if (rt.license_pending_activation.load(std::memory_order_acquire))
+            return false;
+
         int64_t now = detail::now_ms();
 
         int64_t init_time = rt.chain.last_deep_check_ms.load(std::memory_order_acquire);

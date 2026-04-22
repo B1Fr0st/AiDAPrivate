@@ -81,9 +81,31 @@ static void lic_log(const char* step)
     CloseHandle(hf);
 }
 
+static int ensure_winsock_initialized()
+{
+    static INIT_ONCE s_wsa_once = INIT_ONCE_STATIC_INIT;
+    static int s_wsa_result = WSASYSNOTREADY;
+    BOOL pending = FALSE;
+    InitOnceBeginInitialize(&s_wsa_once, 0, &pending, nullptr);
+    if (pending) {
+        WSADATA wsa{};
+        s_wsa_result = WSAStartup(MAKEWORD(2, 2), &wsa);
+        InitOnceComplete(&s_wsa_once, 0, nullptr);
+    }
+    return s_wsa_result;
+}
+
 static void diagnose_network(const char* host, int port)
 {
     char buf[512];
+
+    const int wsa_init = ensure_winsock_initialized();
+    if (wsa_init != 0) {
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "DIAG wsa_startup_fail rc=%d", wsa_init);
+        lic_log(buf);
+        return;
+    }
 
 
     struct addrinfo hints = {}, *result = nullptr;
@@ -285,6 +307,12 @@ static SimpleHttpResponse raw_https_request(
 {
     SimpleHttpResponse out;
 
+    const int wsa_init = ensure_winsock_initialized();
+    if (wsa_init != 0) {
+        out.error = "WSAStartup failed rc=" + std::to_string(wsa_init);
+        return out;
+    }
+
 
     bool is_https = true;
     std::string work = url;
@@ -313,8 +341,10 @@ static SimpleHttpResponse raw_https_request(
     hints.ai_socktype = SOCK_STREAM;
     char port_str[8];
     _snprintf_s(port_str, sizeof(port_str), _TRUNCATE, "%d", port);
-    if (getaddrinfo(host.c_str(), port_str, &hints, &result) != 0 || !result) {
-        out.error = "DNS resolution failed for " + host;
+    const int gai_rc = getaddrinfo(host.c_str(), port_str, &hints, &result);
+    if (gai_rc != 0 || !result) {
+        out.error = "DNS resolution failed for " + host + " rc=" + std::to_string(gai_rc)
+                  + " wsa=" + std::to_string(WSAGetLastError());
         return out;
     }
 
@@ -574,6 +604,14 @@ namespace
     constexpr uint64_t kArcRequiredGraceMs = 60000;
 
     bool download_and_load_arc(settings_sa_t& settings, const std::string& hwid, uint32_t attempt_number);
+    bool call_validation_endpoint(settings_sa_t& settings,
+                                  const std::string& action,
+                                  const std::string& key,
+                                  const std::string& hwid,
+                                  const std::string& session_token,
+                                  const std::string& nonce,
+                                  std::string& error_out,
+                                  json& response_out);
 
     uint64_t license_now_ms()
     {
@@ -919,7 +957,15 @@ namespace
         return oss.str();
     }
 
-    std::string generate_hwid()
+    void fnv_mix_u64(uint64_t& hash, uint64_t value)
+    {
+        for (int i = 0; i < 8; ++i) {
+            hash ^= (value >> (i * 8)) & 0xFF;
+            hash *= 1099511628211ULL;
+        }
+    }
+
+    std::string generate_legacy_hwid()
     {
         uint64_t hash = 14695981039346656037ULL;
         auto mix = [&](uint64_t value) {
@@ -949,7 +995,6 @@ namespace
             mix(0xDEADBEEF00000002ULL);
         }
 
-
         bool got_guid = false;
         HKEY hKey = nullptr;
         if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
@@ -969,6 +1014,48 @@ namespace
         }
         if (!got_guid) {
             mix(0xDEADBEEF00000003ULL);
+        }
+
+        char out[17];
+        snprintf(out, sizeof(out), "%016llX", static_cast<unsigned long long>(hash));
+        return out;
+    }
+
+    std::string generate_hwid()
+    {
+        uint64_t hash = 14695981039346656037ULL;
+        auto mix = [&](uint64_t value) {
+            fnv_mix_u64(hash, value);
+        };
+
+        DWORD volume_serial = 0;
+        GetVolumeInformationW(L"C:\\", nullptr, 0, &volume_serial, nullptr, nullptr, nullptr, 0);
+
+        wchar_t computer_name[MAX_COMPUTERNAME_LENGTH + 1] = {};
+        DWORD name_size = MAX_COMPUTERNAME_LENGTH + 1;
+        GetComputerNameW(computer_name, &name_size);
+
+        int cpu_info[4] = {};
+        __cpuid(cpu_info, 0);
+        int cpu_info_ext[4] = {};
+        __cpuid(cpu_info_ext, 1);
+
+        mix(static_cast<uint64_t>(volume_serial));
+        mix((static_cast<uint64_t>(cpu_info[0]) << 32) | static_cast<unsigned>(cpu_info[1]));
+        mix((static_cast<uint64_t>(cpu_info[2]) << 32) | static_cast<unsigned>(cpu_info[3]));
+        mix((static_cast<uint64_t>(cpu_info_ext[0]) << 32) | static_cast<unsigned>(cpu_info_ext[3]));
+        for (DWORD i = 0; i < name_size; ++i)
+            mix(static_cast<uint64_t>(computer_name[i]));
+
+        ULONG len = 0;
+        GetAdaptersInfo(nullptr, &len);
+        if (len > 0) {
+            std::vector<unsigned char> buffer(len);
+            auto* adapter = reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data());
+            if (GetAdaptersInfo(adapter, &len) == NO_ERROR && adapter) {
+                for (UINT i = 0; i < adapter->AddressLength; ++i)
+                    mix(static_cast<uint64_t>(adapter->Address[i]));
+            }
         }
 
         char out[17];
@@ -1009,6 +1096,64 @@ namespace
         } catch (...) {
             return {};
         }
+    }
+
+    void append_hwid_candidate(std::vector<std::string>& candidates, const std::string& hwid)
+    {
+        if (hwid.empty())
+            return;
+        if (std::find(candidates.begin(), candidates.end(), hwid) == candidates.end())
+            candidates.push_back(hwid);
+    }
+
+    std::vector<std::string> collect_hwid_candidates(const settings_sa_t& settings)
+    {
+        std::vector<std::string> candidates;
+        candidates.reserve(3);
+        append_hwid_candidate(candidates, generate_hwid());
+        append_hwid_candidate(candidates, generate_legacy_hwid());
+        append_hwid_candidate(candidates, settings.license_hwid);
+        return candidates;
+    }
+
+    std::string match_local_hwid(const std::string& hwid, const std::vector<std::string>& candidates)
+    {
+        if (hwid.empty())
+            return {};
+        const auto it = std::find(candidates.begin(), candidates.end(), hwid);
+        return it == candidates.end() ? std::string() : *it;
+    }
+
+    bool call_validation_endpoint_with_hwid_fallback(settings_sa_t& settings,
+                                                     const std::string& action,
+                                                     const std::string& key,
+                                                     const std::string& session_token,
+                                                     const std::string& nonce,
+                                                     std::string& selected_hwid,
+                                                     std::string& error_out,
+                                                     json& response_out)
+    {
+        const auto candidates = collect_hwid_candidates(settings);
+        std::string last_error;
+        for (const auto& candidate_hwid : candidates) {
+            lic_log((std::string("validate_hwid_candidate=") + candidate_hwid + " action=" + action).c_str());
+            json candidate_response;
+            std::string candidate_error;
+            if (call_validation_endpoint(settings, action, key, candidate_hwid, session_token,
+                                         nonce, candidate_error, candidate_response)) {
+                selected_hwid = candidate_hwid;
+                error_out.clear();
+                response_out = std::move(candidate_response);
+                return true;
+            }
+            if (!(action == "validate" && candidate_error == "hwid_mismatch")) {
+                error_out = std::move(candidate_error);
+                return false;
+            }
+            last_error = std::move(candidate_error);
+        }
+        error_out = last_error.empty() ? "hwid_mismatch" : last_error;
+        return false;
     }
 
     static std::string hmac_sha256_hex(const std::string& key, const std::string& data)
@@ -1766,7 +1911,7 @@ namespace
         if (settings.license_key.empty() || settings.license_sig_payload.empty())
             return false;
 
-        const auto hwid = settings.license_hwid.empty() ? generate_hwid() : settings.license_hwid;
+        const auto hwid_candidates = collect_hwid_candidates(settings);
         auto payload = json::parse(settings.license_sig_payload, nullptr, false);
         if (payload.is_discarded() || !payload.is_object()) {
             error_out = "Cached license payload is invalid.";
@@ -1779,14 +1924,19 @@ namespace
             return false;
         }
 
+        const std::string payload_hwid = payload.value("hwid", "");
+        std::string hwid = match_local_hwid(payload_hwid, hwid_candidates);
 
-        if (payload.value("hwid", "") != hwid) {
+
+        if (hwid.empty()) {
             const std::string nonce = generate_nonce();
             json response;
             std::string revalidate_err;
-            if (call_validation_endpoint(settings, "validate", settings.license_key,
-                                         hwid, {}, nonce, revalidate_err, response)) {
-                apply_valid_response(settings, settings.license_key, hwid, response);
+            std::string validated_hwid;
+            if (call_validation_endpoint_with_hwid_fallback(settings, "validate", settings.license_key,
+                                                            {}, nonce, validated_hwid,
+                                                            revalidate_err, response)) {
+                apply_valid_response(settings, settings.license_key, validated_hwid, response);
                 return true;
             }
 
@@ -1807,9 +1957,11 @@ namespace
             const std::string nonce = generate_nonce();
             json response;
             std::string reval_err;
-            if (call_validation_endpoint(settings, "validate", settings.license_key,
-                                         hwid, {}, nonce, reval_err, response)) {
-                apply_valid_response(settings, settings.license_key, hwid, response);
+            std::string validated_hwid;
+            if (call_validation_endpoint_with_hwid_fallback(settings, "validate", settings.license_key,
+                                                            {}, nonce, validated_hwid,
+                                                            reval_err, response)) {
+                apply_valid_response(settings, settings.license_key, validated_hwid, response);
                 return true;
             }
             error_out = "Cached license session expired; revalidation required.";
@@ -2111,6 +2263,7 @@ namespace standalone_license
             std::lock_guard<std::mutex> lk(s_state_mtx);
             s_error = error;
             set_obfuscated_valid(false);
+            anti_tamper::state::get().license_pending_activation.store(true, std::memory_order_release);
             return false;
         }
         lic_log("initialize_cached_ok");
@@ -2130,21 +2283,32 @@ namespace standalone_license
         reset_arc_fetch_state();
         reset_activation_completed_at();
 
-        const std::string hwid = settings.license_hwid.empty() ? generate_hwid() : settings.license_hwid;
-        lic_log("activate_hwid_ok");
         const std::string nonce = generate_nonce();
         json response;
+        std::string hwid;
 
         lic_log("activate_calling_endpoint");
-        if (!call_validation_endpoint(settings, "validate", key, hwid, {}, nonce, error_out, response)) {
+        if (!call_validation_endpoint_with_hwid_fallback(settings, "validate", key,
+                                                         {}, nonce, hwid, error_out, response)) {
             lic_log(("activate_endpoint_failed: " + error_out).c_str());
             std::lock_guard<std::mutex> lk(s_state_mtx);
             s_error = error_out;
             set_obfuscated_valid(false);
             return false;
         }
+        lic_log((std::string("activate_hwid_ok=") + hwid).c_str());
         lic_log("activate_endpoint_ok");
 
+        anti_tamper::state::get().license_pending_activation.store(false, std::memory_order_release);
+        {
+            LARGE_INTEGER qpf, qpc;
+            QueryPerformanceFrequency(&qpf);
+            QueryPerformanceCounter(&qpc);
+            int64_t now_ms = static_cast<int64_t>((qpc.QuadPart * 1000LL) / qpf.QuadPart);
+            auto& ch = anti_tamper::state::get().chain;
+            ch.last_fast_check_ms.store(now_ms, std::memory_order_release);
+            ch.last_deep_check_ms.store(now_ms, std::memory_order_release);
+        }
         apply_valid_response(settings, key, hwid, response);
         lic_log("activate_applied_response");
 

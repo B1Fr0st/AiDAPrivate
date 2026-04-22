@@ -176,7 +176,7 @@ set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ENABLE_TEST OFF CACHE BOOL "" FORCE)
 set(MSVC_STATIC OFF CACHE BOOL "" FORCE)
 
-set(TRITON_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Triton")
+set(TRITON_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/sources/Triton")
 set(TRITON_INSTALL_RULES OFF CACHE BOOL "" FORCE)
 add_subdirectory("${TRITON_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/.deps/triton")
 set(BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS_SAVED_TRITON}")
@@ -186,8 +186,8 @@ if(MSVC AND TARGET triton)
 endif()
 
 # --- Ghidra Native Decompiler (embedded as static library) ---
-set(GHIDRA_DECOMP_DIR "${CMAKE_SOURCE_DIR}/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp")
-set(GHIDRA_SPECS_SRC_DIR "${CMAKE_SOURCE_DIR}/ghidra/Ghidra/Processors/x86/data/languages")
+set(GHIDRA_DECOMP_DIR "${CMAKE_SOURCE_DIR}/sources/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp")
+set(GHIDRA_SPECS_SRC_DIR "${CMAKE_SOURCE_DIR}/sources/ghidra/Ghidra/Processors/x86/data/languages")
 set(GHIDRA_SPECS_OUTPUT_DIR "${CMAKE_BINARY_DIR}/ghidra_specs")
 
 file(GLOB GHIDRA_ALL_CC "${GHIDRA_DECOMP_DIR}/*.cc")

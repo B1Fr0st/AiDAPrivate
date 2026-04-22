@@ -30,6 +30,7 @@ compile_commands.json
 
 # Artifacts / distribution
 artifacts/
+sources/
 packages/
 dist/
 *.zip
@@ -60,3 +61,4 @@ driver/WhosWho/packages/
 driver/Sentinel/packages/
 driver/Sentinel/Sentinel/packages/
 bot/node_modules/
+.aider*

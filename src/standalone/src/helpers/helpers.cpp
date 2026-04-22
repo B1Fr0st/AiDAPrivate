@@ -1218,7 +1218,9 @@ void helpers::render_title()
 			float msg_a = std::min(std::max(t - 1.4f, 0.f) / 0.5f, 1.f) * fade_out;
 			if (msg_a > 0.01f)
 			{
-				const char* msg = "Your session is ready.";
+				const char* msg = license::validated
+					? "Your session is ready."
+					: "Enter your license key to continue.";
 				ImVec2 msg_ts = ImGui::CalcTextSize(msg);
 				dl->AddText(ImVec2(cx - msg_ts.x * 0.5f, rule_y + 8.f + sub_ts.y + 12.f),
 					IM_COL32(170, 165, 200, (int)(210 * msg_a)), msg);
@@ -1287,7 +1289,7 @@ void helpers::render_title()
 		if (license::key_buf[0] == '\0' && !ImGui::IsItemActive()) {
 			ImVec2 ip = ImGui::GetItemRectMin();
 			dl->AddText(ImVec2(ip.x + 10.f, ip.y + 6.f),
-				IM_COL32(110, 105, 145, (int)(140 * la)), "XXXX-XXXX-XXXX-XXXX");
+				IM_COL32(110, 105, 145, (int)(140 * la)), "AIDA-XXXX-XXXX-XXXX-XXXX");
 		}
 
 

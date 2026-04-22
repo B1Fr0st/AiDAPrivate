@@ -73,6 +73,7 @@ struct runtime_t
     uint64_t kernel_flags_settle_start_ms = 0;
     uint32_t last_kernel_flags = 0;
     uint32_t kernel_flag_persist_count = 0;
+    std::atomic<bool> license_pending_activation{false};
 };
 
 inline runtime_t& get()
