@@ -10,8 +10,6 @@
 #include "anti_debug.hpp"
 #include "anti_hook.hpp"
 #include "anti_emulation.hpp"
-#include "anti_ai.hpp"
-#include "process_scan.hpp"
 #include "enforcement.hpp"
 #include "webhook.hpp"
 #include "obfuscation_macros.hpp"
@@ -120,18 +118,9 @@ namespace token_chain {
             if (hook.any_detected())
                 result |= 2ULL;
 
-            auto ps = process_scan::full_scan();
-            if (ps.re_tool_with_binary || ps.injected_dll || ps.sideloaded_system_dll)
-                result |= 4ULL;
-
             auto emu = anti_emulation::full_scan();
             if (emu.cpuid_features || emu.fpu_precision || emu.self_modifying_code)
                 result |= 8ULL;
-
-            auto ai_report = anti_ai::combined::full_scan();
-            if (ai_report.mcp_detected || ai_report.llm_detected ||
-                ai_report.memory_scanner_detected || ai_report.handle_to_us_detected)
-                result |= 16ULL;
 
             return result;
         }
@@ -256,9 +245,7 @@ namespace token_chain {
                 std::string flags;
                 if (check_result & 1ULL) flags += "debugger ";
                 if (check_result & 2ULL) flags += "hooks ";
-                if (check_result & 4ULL) flags += "process_scan ";
                 if (check_result & 8ULL) flags += "emulation ";
-                if (check_result & 16ULL) flags += "ai_tool ";
                 detail_str += " [" + flags + "]";
                 break;
             }

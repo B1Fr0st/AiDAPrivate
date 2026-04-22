@@ -9,6 +9,7 @@
 #include <function/SentinelBridge.h>
 #include <function/impl/AntiDumpKernel.h>
 #include <function/DmaCanary.h>
+#include <function/TargetingLatch.h>
 #include <hv_detect/hv_detect.h>
 
 __forceinline ULONG hash_build_key(ULONG key) {
@@ -106,9 +107,18 @@ namespace ioctl_codes {
     __forceinline ULONG CANQ() { return make(50); }
     __forceinline ULONG DBGA() { return make(51); }
     __forceinline ULONG HVDT() { return make(52); }
+    __forceinline ULONG RELA() { return make(53); }
 }
 
 namespace phase3_msg {
+
+    struct latch_targeting_request_k {
+        UINT32 magic;
+        UINT32 session_key;
+        UINT32 reason;
+        UINT32 reserved;
+    };
+    static_assert(sizeof(latch_targeting_request_k) == 16, "latch_targeting_request_k must be 16 bytes");
 
     struct re_evidence_blob_k {
         UINT64 magic;
@@ -1151,6 +1161,23 @@ namespace dispatcher {
                     RtlCopyMemory(buffer, &result_buf, sizeof(hv_detect_result_k));
                 }
                 bytes = sizeof(hv_detect_result_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::RELA()) {
+            if (input_size >= sizeof(phase3_msg::latch_targeting_request_k)) {
+                auto* req = reinterpret_cast<phase3_msg::latch_targeting_request_k*>(buffer);
+                ULONG expected_magic = g_session_key ^ dynamic_key::get() ^ 0x1A7C4B2Eu;
+                if (req->magic == expected_magic && req->session_key == g_session_key) {
+                    targeting_latch::latch_targeting(
+                        req->reason,
+                        (UINT64)(ULONG_PTR)caller_validation::g_registered_client_pid,
+                        0, 0, 0
+                    );
+                    status = STATUS_SUCCESS;
+                } else {
+                    status = STATUS_ACCESS_DENIED;
+                }
+                bytes = sizeof(phase3_msg::latch_targeting_request_k);
             } else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else {

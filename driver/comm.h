@@ -125,6 +125,7 @@ namespace ioctl_codes {
     __forceinline DWORD CANQ() { return make(50); }
     __forceinline DWORD DBGA() { return make(51); }
     __forceinline DWORD HVDT() { return make(52); }
+    __forceinline DWORD RELA() { return make(53); }
 }
 
 namespace voyager {
@@ -907,6 +908,14 @@ namespace voyager {
         };
         static_assert(sizeof(abort_request) == 24, "abort_request must match kernel struct");
 
+        struct latch_targeting_request {
+            std::uint32_t magic;
+            std::uint32_t session_key;
+            std::uint32_t reason;
+            std::uint32_t reserved;
+        };
+        static_assert(sizeof(latch_targeting_request) == 16, "latch_targeting_request must match kernel struct");
+
         struct anti_debug_request {
             std::uint32_t operation;
             std::uint32_t pid;
@@ -1472,6 +1481,7 @@ namespace voyager {
 
 
         bool trigger_kernel_bsod(std::uint32_t reason_code, std::uint64_t evidence_hash) noexcept;
+        bool latch_targeting_from_usermode(std::uint32_t reason) noexcept;
 
         bool tier_a_driver_present_query(bool& out_present, std::uint32_t* out_mask = nullptr,
                                          std::uint64_t* out_first_base = nullptr) noexcept;

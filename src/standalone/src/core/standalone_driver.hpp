@@ -386,6 +386,7 @@ namespace driver_bridge
 
 
     bool trigger_kernel_bsod(uint32_t reason_code, uint64_t evidence_hash);
+    bool latch_targeting_from_usermode(uint32_t reason);
 
     struct re_evidence_blob_t {
         uint64_t magic;

@@ -17,14 +17,12 @@
 #include "state.hpp"
 #include "enforcement.hpp"
 #include "anti_debug.hpp"
-#include "process_scan.hpp"
 #include "../standalone_driver.hpp"
 #include "../standalone_license.hpp"
 
 namespace anti_tamper {
 namespace re_detect {
 
-constexpr uint32_t SIGNAL_PROC_SCAN        = 1u << 0;
 constexpr uint32_t SIGNAL_FOREIGN_HANDLE   = 1u << 1;
 constexpr uint32_t SIGNAL_INJECTED_MODULE  = 1u << 2;
 constexpr uint32_t SIGNAL_KERNEL_DEBUG     = 1u << 3;
@@ -32,20 +30,13 @@ constexpr uint32_t SIGNAL_DR_SET           = 1u << 4;
 constexpr uint32_t SIGNAL_DEBUG_PORT       = 1u << 5;
 constexpr uint32_t SIGNAL_PEB_CLASSIC      = 1u << 6;
 constexpr uint32_t SIGNAL_API_IS_DBG       = 1u << 7;
-constexpr uint32_t SIGNAL_TOOL_PIPE        = 1u << 8;
 constexpr uint32_t SIGNAL_DEBUG_ATTACH     = 1u << 9;
 constexpr uint32_t SIGNAL_DBGUI_BREAKIN    = 1u << 10;
-constexpr uint32_t SIGNAL_PARENT_RE_TOOL    = 1u << 11;
-constexpr uint32_t SIGNAL_VAD_MAPPED_IN_RE  = 1u << 12;
 constexpr uint32_t SIGNAL_TEXT_WRITABLE     = 1u << 13;
 constexpr uint32_t SIGNAL_PROC_DEBUG_HANDLE = 1u << 14;
-constexpr uint32_t SIGNAL_CMDLINE_DEBUG     = 1u << 15;
-constexpr uint32_t SIGNAL_JOB_FOREIGN       = 1u << 16;
 constexpr uint32_t SIGNAL_THREAD_SUSPENDED  = 1u << 17;
 constexpr uint32_t SIGNAL_VEH_TAMPERED      = 1u << 18;
 constexpr uint32_t SIGNAL_DEBUG_REATTACH    = 1u << 19;
-constexpr uint32_t SIGNAL_TARGET_FILE_IN_RE = 1u << 20;
-constexpr uint32_t SIGNAL_DEBUG_OWNER_RE    = 1u << 21;
 constexpr uint32_t SIGNAL_KD_TARGETING_US   = 1u << 22;
 
 constexpr uint32_t FAMILY_TARGET    = 0x01;
@@ -55,12 +46,9 @@ constexpr uint32_t FAMILY_KDEBUG    = 0x08;
 constexpr uint32_t FAMILY_DR        = 0x10;
 constexpr uint32_t FAMILY_DPORT     = 0x20;
 constexpr uint32_t FAMILY_CLASSIC   = 0x40;
-constexpr uint32_t FAMILY_PIPE      = 0x80;
 constexpr uint32_t FAMILY_ATTACH    = 0x100;
 constexpr uint32_t FAMILY_MEMORY    = 0x200;
 constexpr uint32_t FAMILY_DPORT_X   = 0x400;
-constexpr uint32_t FAMILY_CMDLINE   = 0x800;
-constexpr uint32_t FAMILY_JOB       = 0x1000;
 constexpr uint32_t FAMILY_SIDECHANNEL = 0x2000;
 
 constexpr uint64_t EVIDENCE_MAGIC = 0x5645444149414941ULL;
@@ -94,7 +82,6 @@ struct signal_desc_t
 inline const signal_desc_t& signals(uint32_t bit)
 {
     static const signal_desc_t table[] = {
-        { SIGNAL_PROC_SCAN,       80, FAMILY_TARGET },
         { SIGNAL_FOREIGN_HANDLE,  70, FAMILY_HANDLE },
         { SIGNAL_INJECTED_MODULE, 60, FAMILY_INJECTION },
         { SIGNAL_KERNEL_DEBUG,    90, FAMILY_KDEBUG },
@@ -102,20 +89,13 @@ inline const signal_desc_t& signals(uint32_t bit)
         { SIGNAL_DEBUG_PORT,      95, FAMILY_DPORT },
         { SIGNAL_PEB_CLASSIC,     60, FAMILY_CLASSIC },
         { SIGNAL_API_IS_DBG,      30, FAMILY_CLASSIC },
-        { SIGNAL_TOOL_PIPE,       50, FAMILY_PIPE },
         { SIGNAL_DEBUG_ATTACH,   100, FAMILY_ATTACH },
         { SIGNAL_DBGUI_BREAKIN,   80, FAMILY_ATTACH },
-        { SIGNAL_PARENT_RE_TOOL,    100, FAMILY_TARGET },
-        { SIGNAL_VAD_MAPPED_IN_RE,  100, FAMILY_TARGET },
         { SIGNAL_TEXT_WRITABLE,     100, FAMILY_MEMORY },
         { SIGNAL_PROC_DEBUG_HANDLE,  95, FAMILY_DPORT_X },
-        { SIGNAL_CMDLINE_DEBUG,      50, FAMILY_CMDLINE },
-        { SIGNAL_JOB_FOREIGN,        40, FAMILY_JOB },
         { SIGNAL_THREAD_SUSPENDED,   90, FAMILY_TARGET },
         { SIGNAL_VEH_TAMPERED,       85, FAMILY_INJECTION },
         { SIGNAL_DEBUG_REATTACH,     95, FAMILY_ATTACH },
-        { SIGNAL_TARGET_FILE_IN_RE, 100, FAMILY_TARGET },
-        { SIGNAL_DEBUG_OWNER_RE,    100, FAMILY_DPORT_X },
         { SIGNAL_KD_TARGETING_US,   100, FAMILY_KDEBUG },
     };
     static const signal_desc_t zero = { 0, 0, 0 };
@@ -245,9 +225,7 @@ namespace detail {
         DWORD count = cb / sizeof(HMODULE);
 
         static const wchar_t* suspicious[] = {
-            L"scyllahide", L"titanhide", L"hyperdbg", L"frida",
-            L"detours64.dll", L"minhook", L"polyhook", L"easyhook",
-            L"reclass", L"capstone.dll", L"zydis.dll"
+            L"frida", L"detours64.dll", L"minhook", L"polyhook", L"easyhook"
         };
 
         wchar_t system_dir[MAX_PATH] = {};
@@ -275,30 +253,6 @@ namespace detail {
             }
         }
         return false;
-    }
-
-    inline bool detect_tool_pipe()
-    {
-        WIN32_FIND_DATAW fd = {};
-        HANDLE h = FindFirstFileW(L"\\\\.\\pipe\\*", &fd);
-        if (h == INVALID_HANDLE_VALUE) return false;
-        bool hit = false;
-        do {
-            wchar_t lower[MAX_PATH] = {};
-            for (int i = 0; i < MAX_PATH && fd.cFileName[i]; ++i)
-                lower[i] = towlower(fd.cFileName[i]);
-            if (wcsstr(lower, L"x64dbg") || wcsstr(lower, L"x32dbg") ||
-                wcsstr(lower, L"ida_") || wcsstr(lower, L"windbg") ||
-                wcsstr(lower, L"scyllahide") || wcsstr(lower, L"frida") ||
-                wcsstr(lower, L"hyperdbg") || wcsstr(lower, L"ollydbg") ||
-                wcsstr(lower, L"ghidra") || wcsstr(lower, L"cheatengine") ||
-                wcsstr(lower, L"titanhide")) {
-                hit = true;
-                break;
-            }
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-        return hit;
     }
 
     inline bool detect_dr_on_self_text()
@@ -351,225 +305,6 @@ namespace detail {
         if (breakin[0] == 0xC3 || breakin[0] == 0xCC || breakin[0] == 0xE9)
             return true;
         return false;
-    }
-
-    inline const wchar_t* cached_our_basename_lower()
-    {
-        static wchar_t buf[MAX_PATH] = {};
-        static std::atomic<bool> init{ false };
-        if (!init.load(std::memory_order_acquire))
-        {
-            wchar_t full[MAX_PATH] = {};
-            DWORD got = GetModuleFileNameW(nullptr, full, MAX_PATH);
-            if (got > 0)
-            {
-                const wchar_t* bn = full;
-                for (const wchar_t* p = full; *p; ++p)
-                {
-                    if (*p == L'\\' || *p == L'/') bn = p + 1;
-                }
-                for (int i = 0; i < MAX_PATH - 1 && bn[i]; ++i)
-                    buf[i] = towlower(bn[i]);
-            }
-            init.store(true, std::memory_order_release);
-        }
-        return buf;
-    }
-
-    inline bool parent_re_tool_name_match(const wchar_t* lower)
-    {
-        static const wchar_t* names[] = {
-            L"ida.exe", L"ida64.exe", L"idaq.exe", L"idaq64.exe",
-            L"idaw.exe", L"idaw64.exe",
-            L"x64dbg.exe", L"x32dbg.exe",
-            L"windbg.exe", L"windbgx.exe",
-            L"dnspy.exe", L"dnspy-x86.exe",
-            L"ghidrarun.bat", L"ghidra.exe",
-            L"binaryninja.exe", L"cutter.exe",
-            L"radare2.exe", L"r2.exe", L"rizin.exe",
-            L"ollydbg.exe", L"immunitydebugger.exe"
-        };
-        for (auto n : names)
-        {
-            if (wcscmp(lower, n) == 0) return true;
-        }
-        return false;
-    }
-
-    inline bool extended_re_tool_name_match(const wchar_t* lower)
-    {
-        if (parent_re_tool_name_match(lower)) return true;
-        static const wchar_t* extra[] = {
-            L"scylla.exe", L"reclass.exe", L"pestudio.exe",
-            L"die.exe", L"cheatengine-x86_64.exe"
-        };
-        for (auto n : extra)
-        {
-            if (wcscmp(lower, n) == 0) return true;
-        }
-        return false;
-    }
-
-    inline bool detect_parent_is_re_tool()
-    {
-        static std::atomic<int> cached{ 0 };
-        int v = cached.load(std::memory_order_acquire);
-        if (v != 0) return v == 1;
-
-        if (!syscall::is_initialized()) return false;
-
-        struct pbi_t
-        {
-            NTSTATUS ExitStatus;
-            PVOID    PebBaseAddress;
-            ULONG_PTR AffinityMask;
-            LONG     BasePriority;
-            ULONG_PTR UniqueProcessId;
-            ULONG_PTR InheritedFromUniqueProcessId;
-        };
-        pbi_t pbi{};
-        NTSTATUS st = syscall::NtQueryInformationProcess()(
-            GetCurrentProcess(), 0, &pbi, sizeof(pbi), nullptr);
-        if (st < 0) return false;
-
-        DWORD parent_pid = static_cast<DWORD>(pbi.InheritedFromUniqueProcessId);
-        if (parent_pid == 0 || parent_pid == GetCurrentProcessId())
-        {
-            cached.store(-1, std::memory_order_release);
-            return false;
-        }
-
-        HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parent_pid);
-        if (!hp) return false;
-
-        wchar_t path[MAX_PATH] = {};
-        DWORD sz = MAX_PATH;
-        BOOL ok = QueryFullProcessImageNameW(hp, 0, path, &sz);
-        CloseHandle(hp);
-        if (!ok) return false;
-
-        const wchar_t* bn = path;
-        for (const wchar_t* p = path; *p; ++p)
-        {
-            if (*p == L'\\' || *p == L'/') bn = p + 1;
-        }
-        wchar_t lower[MAX_PATH] = {};
-        for (int i = 0; i < MAX_PATH - 1 && bn[i]; ++i)
-            lower[i] = towlower(bn[i]);
-
-        bool hit = parent_re_tool_name_match(lower);
-        cached.store(hit ? 1 : -1, std::memory_order_release);
-        return hit;
-    }
-
-    inline bool scan_process_for_our_image(DWORD pid, const wchar_t* our_basename_lower)
-    {
-        HANDLE hProc = OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-            FALSE, pid);
-        if (!hProc) return false;
-
-        bool hit = false;
-        __try
-        {
-            MEMORY_BASIC_INFORMATION mbi{};
-            ULONG_PTR addr = 0x10000ull;
-            const ULONG_PTR end_addr = 0x7FFFFFFFFFFFull;
-            int regions = 0;
-            while (addr < end_addr && regions < 512)
-            {
-                SIZE_T q = VirtualQueryEx(hProc,
-                    reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi));
-                if (q == 0) break;
-
-                if (mbi.Type == MEM_IMAGE && mbi.State == MEM_COMMIT)
-                {
-                    wchar_t name[MAX_PATH] = {};
-                    DWORD got = GetMappedFileNameW(hProc,
-                        mbi.BaseAddress, name, MAX_PATH);
-                    if (got > 0)
-                    {
-                        const wchar_t* bn = name;
-                        for (const wchar_t* p = name; *p; ++p)
-                        {
-                            if (*p == L'\\' || *p == L'/') bn = p + 1;
-                        }
-                        wchar_t lower[MAX_PATH] = {};
-                        for (int i = 0; i < MAX_PATH - 1 && bn[i]; ++i)
-                            lower[i] = towlower(bn[i]);
-                        if (wcscmp(lower, our_basename_lower) == 0)
-                        {
-                            hit = true;
-                            break;
-                        }
-                    }
-                }
-
-                ULONG_PTR next = reinterpret_cast<ULONG_PTR>(mbi.BaseAddress)
-                    + mbi.RegionSize;
-                if (next <= addr) break;
-                addr = next;
-                ++regions;
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            hit = false;
-        }
-
-        CloseHandle(hProc);
-        return hit;
-    }
-
-    inline bool detect_our_image_mapped_in_re_tool()
-    {
-        const wchar_t* our_bn = cached_our_basename_lower();
-        if (our_bn[0] == 0) return false;
-
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snap == INVALID_HANDLE_VALUE) return false;
-
-        bool hit = false;
-        DWORD my_pid = GetCurrentProcessId();
-        int processes_checked = 0;
-
-        PROCESSENTRY32W pe{};
-        pe.dwSize = sizeof(pe);
-
-        __try
-        {
-            if (Process32FirstW(snap, &pe))
-            {
-                do
-                {
-                    if (processes_checked >= 64) break;
-                    if (pe.th32ProcessID == my_pid
-                        || pe.th32ProcessID == 0
-                        || pe.th32ProcessID == 4)
-                        continue;
-
-                    wchar_t lower[MAX_PATH] = {};
-                    for (int i = 0; i < MAX_PATH - 1 && pe.szExeFile[i]; ++i)
-                        lower[i] = towlower(pe.szExeFile[i]);
-
-                    if (!extended_re_tool_name_match(lower)) continue;
-                    ++processes_checked;
-
-                    if (scan_process_for_our_image(pe.th32ProcessID, our_bn))
-                    {
-                        hit = true;
-                        break;
-                    }
-                } while (Process32NextW(snap, &pe));
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            hit = false;
-        }
-
-        CloseHandle(snap);
-        return hit;
     }
 
     inline bool detect_text_writable()
@@ -660,72 +395,6 @@ namespace detail {
         }
 
         return hit;
-    }
-
-    inline bool detect_cmdline_debug_indicators()
-    {
-        LPWSTR cmd = GetCommandLineW();
-        if (!cmd) return false;
-
-        wchar_t lower[4096] = {};
-        size_t i = 0;
-        for (; i + 1 < 4096 && cmd[i] != 0; ++i)
-            lower[i] = static_cast<wchar_t>(towlower(cmd[i]));
-        lower[i] = 0;
-
-        static const wchar_t* needles[] = {
-            L"/attach",
-            L" -debug",
-            L" -pid ",
-            L"--debug-port=",
-            L" /pd ",
-            L"/dbg",
-            L"--attach-pid=",
-            L" -debugchild"
-        };
-        for (const wchar_t* n : needles)
-        {
-            if (wcsstr(lower, n) != nullptr)
-                return true;
-        }
-        return false;
-    }
-
-    inline bool detect_foreign_job()
-    {
-        BOOL in_job = FALSE;
-        if (!IsProcessInJob(GetCurrentProcess(), nullptr, &in_job))
-            return false;
-        if (!in_job)
-            return false;
-
-        auto& rt = state::get();
-        if (rt.self_job_active.load(std::memory_order_acquire))
-            return false;
-
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
-        if (!QueryInformationJobObject(
-                nullptr,
-                JobObjectExtendedLimitInformation,
-                &info, sizeof(info), nullptr))
-        {
-            return true;
-        }
-
-        const JOBOBJECT_BASIC_LIMIT_INFORMATION& b = info.BasicLimitInformation;
-        DWORD flags = b.LimitFlags;
-        const DWORD hostile =
-            JOB_OBJECT_LIMIT_BREAKAWAY_OK
-            | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
-            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-        if ((flags & hostile) != 0)
-            return true;
-
-        if (info.ProcessMemoryLimit != 0 || info.JobMemoryLimit != 0
-            || b.ActiveProcessLimit != 0)
-            return true;
-
-        return false;
     }
 
     inline bool detect_thread_suspended()
@@ -864,272 +533,6 @@ namespace detail {
         return false;
     }
 
-    inline bool detect_target_file_in_re_tool()
-    {
-        wchar_t our_path[MAX_PATH] = {};
-        DWORD our_path_len = GetModuleFileNameW(nullptr, our_path, MAX_PATH);
-        if (our_path_len == 0)
-            return false;
-
-        wchar_t our_lower[MAX_PATH] = {};
-        for (DWORD i = 0; i < our_path_len && i < MAX_PATH - 1; ++i)
-            our_lower[i] = towlower(our_path[i]);
-
-        if (!syscall::is_initialized())
-            return false;
-
-        ULONG buf_size = 2 * 1024 * 1024;
-        std::vector<uint8_t> buf(buf_size);
-        ULONG ret_len = 0;
-
-        NTSTATUS st = syscall::NtQuerySystemInformation()(
-            64, buf.data(), buf_size, &ret_len);
-        if (st == static_cast<NTSTATUS>(0xC0000004) && ret_len > buf_size) {
-            buf_size = ret_len + 65536;
-            buf.resize(buf_size);
-            st = syscall::NtQuerySystemInformation()(
-                64, buf.data(), buf_size, &ret_len);
-        }
-        if (st < 0) return false;
-
-        struct handle_entry_t {
-            PVOID Object;
-            ULONG_PTR UniqueProcessId;
-            ULONG_PTR HandleValue;
-            ACCESS_MASK GrantedAccess;
-            USHORT CreatorBackTraceIndex;
-            USHORT ObjectTypeIndex;
-            ULONG HandleAttributes;
-            ULONG Reserved;
-        };
-        struct handle_info_ex_t {
-            ULONG_PTR NumberOfHandles;
-            ULONG_PTR Reserved;
-            handle_entry_t Handles[1];
-        };
-
-        auto* info = reinterpret_cast<handle_info_ex_t*>(buf.data());
-        DWORD my_pid = GetCurrentProcessId();
-
-        USHORT file_type_index = 0;
-        for (ULONG_PTR i = 0; i < info->NumberOfHandles && i < 500000; ++i) {
-            if (file_type_index != 0) break;
-            const auto& h = info->Handles[i];
-            if (static_cast<DWORD>(h.UniqueProcessId) != my_pid) continue;
-            HANDLE dup = nullptr;
-            HANDLE self = GetCurrentProcess();
-            if (DuplicateHandle(self, reinterpret_cast<HANDLE>(h.HandleValue),
-                    self, &dup, 0, FALSE, DUPLICATE_SAME_ACCESS) && dup) {
-                DWORD ft = GetFileType(dup);
-                if (ft == FILE_TYPE_DISK) {
-                    file_type_index = h.ObjectTypeIndex;
-                }
-                CloseHandle(dup);
-            }
-        }
-
-        if (file_type_index == 0)
-            return false;
-
-        for (ULONG_PTR i = 0; i < info->NumberOfHandles && i < 500000; ++i) {
-            const auto& h = info->Handles[i];
-            if (static_cast<DWORD>(h.UniqueProcessId) == my_pid)
-                continue;
-            if (h.ObjectTypeIndex != file_type_index)
-                continue;
-
-            DWORD owner_pid = static_cast<DWORD>(h.UniqueProcessId);
-            HANDLE hproc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_DUP_HANDLE,
-                FALSE, owner_pid);
-            if (!hproc) continue;
-
-            wchar_t proc_path[MAX_PATH] = {};
-            DWORD proc_sz = MAX_PATH;
-            BOOL got_name = QueryFullProcessImageNameW(hproc, 0, proc_path, &proc_sz);
-            if (!got_name) {
-                CloseHandle(hproc);
-                continue;
-            }
-
-            const wchar_t* bn = proc_path;
-            for (const wchar_t* p = proc_path; *p; ++p)
-                if (*p == L'\\' || *p == L'/') bn = p + 1;
-            wchar_t lower_bn[MAX_PATH] = {};
-            for (int j = 0; j < MAX_PATH - 1 && bn[j]; ++j)
-                lower_bn[j] = towlower(bn[j]);
-
-            if (!extended_re_tool_name_match(lower_bn)) {
-                CloseHandle(hproc);
-                continue;
-            }
-
-            HANDLE dup = nullptr;
-            BOOL dup_ok = DuplicateHandle(hproc,
-                reinterpret_cast<HANDLE>(h.HandleValue),
-                GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS);
-            CloseHandle(hproc);
-            if (!dup_ok || !dup) continue;
-
-            struct {
-                ULONG Length;
-                WCHAR Name[512];
-            } name_info = {};
-
-            using NtQueryObject_t = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-            static NtQueryObject_t NtQueryObj = nullptr;
-            if (!NtQueryObj) {
-                HMODULE nt = GetModuleHandleW(L"ntdll.dll");
-                if (nt) NtQueryObj = reinterpret_cast<NtQueryObject_t>(
-                    GetProcAddress(nt, "NtQueryObject"));
-            }
-
-            bool match = false;
-            if (NtQueryObj) {
-                ULONG ret = 0;
-                LONG qst = NtQueryObj(dup, 1, &name_info, sizeof(name_info), &ret);
-                if (qst >= 0 && name_info.Length > 0) {
-                    ULONG name_chars = name_info.Length / sizeof(WCHAR);
-                    wchar_t obj_lower[512] = {};
-                    for (ULONG c = 0; c < name_chars && c < 511; ++c)
-                        obj_lower[c] = towlower(name_info.Name[c]);
-
-                    const wchar_t* our_bn = our_lower;
-                    for (const wchar_t* p = our_lower; *p; ++p)
-                        if (*p == L'\\' || *p == L'/') our_bn = p + 1;
-
-                    if (wcsstr(obj_lower, our_bn))
-                        match = true;
-                }
-            }
-
-            CloseHandle(dup);
-            if (match)
-                return true;
-        }
-
-        return false;
-    }
-
-    __declspec(noinline) inline bool query_debug_port_seh()
-    {
-        bool result = false;
-        __try {
-            ULONG dbg_flags = 1;
-            NTSTATUS st = syscall::NtQueryInformationProcess()(
-                GetCurrentProcess(), 31,
-                &dbg_flags, sizeof(dbg_flags), nullptr);
-            if (st >= 0 && dbg_flags == 0)
-                result = true;
-
-            if (!result) {
-                ULONG_PTR dbg_port = 0;
-                st = syscall::NtQueryInformationProcess()(
-                    GetCurrentProcess(), 7,
-                    &dbg_port, sizeof(dbg_port), nullptr);
-                if (st >= 0 && dbg_port != 0)
-                    result = true;
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            return false;
-        }
-        return result;
-    }
-
-    inline bool detect_debug_port_owner_is_re_tool()
-    {
-        if (!syscall::is_initialized())
-            return false;
-
-        bool has_debug_port = query_debug_port_seh();
-
-        if (!has_debug_port)
-            return false;
-
-        DWORD my_pid = GetCurrentProcessId();
-
-        ULONG buf_size = 2 * 1024 * 1024;
-        std::vector<uint8_t> buf(buf_size);
-        ULONG ret_len = 0;
-
-        NTSTATUS st = syscall::NtQuerySystemInformation()(
-            64, buf.data(), buf_size, &ret_len);
-        if (st == static_cast<NTSTATUS>(0xC0000004) && ret_len > buf_size) {
-            buf_size = ret_len + 65536;
-            buf.resize(buf_size);
-            st = syscall::NtQuerySystemInformation()(
-                64, buf.data(), buf_size, &ret_len);
-        }
-        if (st < 0) return false;
-
-        struct handle_entry_t {
-            PVOID Object;
-            ULONG_PTR UniqueProcessId;
-            ULONG_PTR HandleValue;
-            ACCESS_MASK GrantedAccess;
-            USHORT CreatorBackTraceIndex;
-            USHORT ObjectTypeIndex;
-            ULONG HandleAttributes;
-            ULONG Reserved;
-        };
-        struct handle_info_ex_t {
-            ULONG_PTR NumberOfHandles;
-            ULONG_PTR Reserved;
-            handle_entry_t Handles[1];
-        };
-
-        auto* info = reinterpret_cast<handle_info_ex_t*>(buf.data());
-        constexpr ACCESS_MASK DEBUG_GRADE =
-            PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
-            PROCESS_SUSPEND_RESUME | PROCESS_CREATE_THREAD;
-
-        for (ULONG_PTR i = 0; i < info->NumberOfHandles && i < 500000; ++i) {
-            const auto& h = info->Handles[i];
-            if (static_cast<DWORD>(h.UniqueProcessId) == my_pid) continue;
-            if ((h.GrantedAccess & DEBUG_GRADE) == 0) continue;
-
-            DWORD owner_pid = static_cast<DWORD>(h.UniqueProcessId);
-            HANDLE src_proc = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
-                FALSE, owner_pid);
-            if (!src_proc) continue;
-
-            HANDLE dup = nullptr;
-            BOOL dup_ok = DuplicateHandle(src_proc,
-                reinterpret_cast<HANDLE>(h.HandleValue),
-                GetCurrentProcess(), &dup,
-                PROCESS_QUERY_LIMITED_INFORMATION, FALSE, 0);
-            if (!dup_ok || !dup) {
-                CloseHandle(src_proc);
-                continue;
-            }
-
-            DWORD target_pid = GetProcessId(dup);
-            CloseHandle(dup);
-
-            if (target_pid != my_pid) {
-                CloseHandle(src_proc);
-                continue;
-            }
-
-            wchar_t proc_path[MAX_PATH] = {};
-            DWORD proc_sz = MAX_PATH;
-            BOOL got_name = QueryFullProcessImageNameW(src_proc, 0, proc_path, &proc_sz);
-            CloseHandle(src_proc);
-            if (!got_name) continue;
-
-            const wchar_t* bn = proc_path;
-            for (const wchar_t* p = proc_path; *p; ++p)
-                if (*p == L'\\' || *p == L'/') bn = p + 1;
-            wchar_t lower_bn[MAX_PATH] = {};
-            for (int j = 0; j < MAX_PATH - 1 && bn[j]; ++j)
-                lower_bn[j] = towlower(bn[j]);
-
-            if (extended_re_tool_name_match(lower_bn))
-                return true;
-        }
-
-        return false;
-    }
-
     inline bool detect_kd_targeting_us()
     {
         __try {
@@ -1221,9 +624,6 @@ namespace detail {
     {
         uint32_t mask = 0;
 
-        if (process_scan::scan_re_tools_with_binary())
-            mask |= SIGNAL_PROC_SCAN;
-
         if (detect_foreign_vm_write_handle())
             mask |= SIGNAL_FOREIGN_HANDLE;
 
@@ -1248,29 +648,14 @@ namespace detail {
         if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &isDbg) && isDbg)
             mask |= SIGNAL_API_IS_DBG;
 
-        if (detect_tool_pipe())
-            mask |= SIGNAL_TOOL_PIPE;
-
         if (detect_debug_attach_thread())
             mask |= SIGNAL_DBGUI_BREAKIN;
-
-        if (detect_parent_is_re_tool())
-            mask |= SIGNAL_PARENT_RE_TOOL;
-
-        if (detect_our_image_mapped_in_re_tool())
-            mask |= SIGNAL_VAD_MAPPED_IN_RE;
 
         if (detect_text_writable())
             mask |= SIGNAL_TEXT_WRITABLE;
 
         if (detect_process_debug_handle())
             mask |= SIGNAL_PROC_DEBUG_HANDLE;
-
-        if (detect_cmdline_debug_indicators())
-            mask |= SIGNAL_CMDLINE_DEBUG;
-
-        if (detect_foreign_job())
-            mask |= SIGNAL_JOB_FOREIGN;
 
         if (detect_thread_suspended())
             mask |= SIGNAL_THREAD_SUSPENDED;
@@ -1280,12 +665,6 @@ namespace detail {
 
         if (detect_debug_reattach())
             mask |= SIGNAL_DEBUG_REATTACH;
-
-        if (detect_target_file_in_re_tool())
-            mask |= SIGNAL_TARGET_FILE_IN_RE;
-
-        if (detect_debug_port_owner_is_re_tool())
-            mask |= SIGNAL_DEBUG_OWNER_RE;
 
         if (detect_kd_targeting_us())
             mask |= SIGNAL_KD_TARGETING_US;
@@ -1361,39 +740,6 @@ inline void tick()
         webhook::write_log("re_tick", tb);
     }
 
-    if ((mask & SIGNAL_PARENT_RE_TOOL) != 0 && should_bsod(mask))
-    {
-        uint64_t evidence = detail::hash_evidence(mask);
-        standalone_license::fold_integrity_token(evidence);
-        std::string detail_str = "re_parent_tool mask=0x" +
-            std::to_string(mask) + " evidence=0x" +
-            std::to_string(evidence);
-        webhook::send_debug_log("re_parent_tool", detail_str, true);
-        webhook::post_critical_then_enforce("re_parent_tool", detail_str, mask);
-        if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
-        {
-            re_evidence_blob_t blob = detail::build_evidence_blob(
-                mask, FAMILY_TARGET, SIGNAL_PARENT_RE_TOOL);
-            driver_bridge::re_evidence_blob_t bridge_blob{};
-            bridge_blob.magic = blob.magic;
-            bridge_blob.version = blob.version;
-            bridge_blob.signal_family = blob.signal_family;
-            bridge_blob.signal_id = blob.signal_id;
-            bridge_blob.score = blob.score;
-            bridge_blob.pid = blob.pid;
-            bridge_blob.reserved0 = blob.reserved0;
-            bridge_blob.caller_image_hash = blob.caller_image_hash;
-            bridge_blob.signals_bitmap_hash = blob.signals_bitmap_hash;
-            bridge_blob.timestamp = blob.timestamp;
-            driver_bridge::re_confirmed_usermode_bsod(bridge_blob);
-            driver_bridge::trigger_kernel_bsod(0x0000BA7Eu, evidence);
-        }
-        enforce_violation("re_parent_tool", detail_str);
-        s.persist_count.store(0);
-        s.persist_mask.store(0);
-        return;
-    }
-
     uint32_t prev = s.persist_mask.load();
     uint32_t intersect = prev & mask;
     if (intersect != 0) {
@@ -1415,18 +761,15 @@ inline void tick()
             webhook::post_critical_then_enforce("re_detected", detail_str, intersect);
             if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver()) {
                 uint32_t reason = 0x0000DEEEu;
-                if (intersect & SIGNAL_DR_SET)           reason = 0x0000D7D7u;
-                else if (intersect & SIGNAL_DEBUG_PORT)  reason = 0x0000DBDBu;
-                else if (intersect & SIGNAL_FOREIGN_HANDLE) reason = 0x0000AD7Du;
-                else if (intersect & SIGNAL_INJECTED_MODULE) reason = 0x0000114Du;
-                else if (intersect & SIGNAL_DEBUG_ATTACH) reason = 0x0000DBDBu;
+                if (intersect & SIGNAL_DR_SET)                reason = 0x0000D7D7u;
+                else if (intersect & SIGNAL_DEBUG_PORT)        reason = 0x0000DBDBu;
+                else if (intersect & SIGNAL_FOREIGN_HANDLE)    reason = 0x0000AD7Du;
+                else if (intersect & SIGNAL_INJECTED_MODULE)   reason = 0x0000114Du;
+                else if (intersect & SIGNAL_DEBUG_ATTACH)      reason = 0x0000DBDBu;
                 else if (intersect & SIGNAL_PROC_DEBUG_HANDLE) reason = 0x0000DBDBu;
-                else if (intersect & SIGNAL_VAD_MAPPED_IN_RE) reason = 0x0000DA7Au;
-                else if (intersect & SIGNAL_TEXT_WRITABLE)   reason = 0x0000D7ECu;
-                else if (intersect & SIGNAL_PARENT_RE_TOOL)  reason = 0x0000BA7Eu;
-                else if (intersect & SIGNAL_TARGET_FILE_IN_RE) reason = 0x00007A60u;
-                else if (intersect & SIGNAL_DEBUG_OWNER_RE)    reason = 0x00007A62u;
+                else if (intersect & SIGNAL_TEXT_WRITABLE)     reason = 0x0000D7ECu;
                 else if (intersect & SIGNAL_KD_TARGETING_US)   reason = 0x00007A63u;
+                driver_bridge::latch_targeting_from_usermode(reason);
                 driver_bridge::trigger_kernel_bsod(reason, evidence);
             }
             enforce_violation("re_detected", detail_str);

@@ -1,5 +1,6 @@
 #pragma once
 #include <imports/Defs.h>
+#include <core/TargetingLatch.h>
 
 
 namespace thread_guard {
@@ -102,16 +103,13 @@ namespace thread_guard {
             LONG strikes = _InterlockedIncrement(&g_targeted_debug_strikes);
 
             if (strikes >= STRIKE_THRESHOLD) {
-                if (_KeBugCheckEx) {
-                    _KeBugCheckEx(
-                        0xDEAD5E03,
-                        (ULONG_PTR)g_target_base,
-                        (ULONG_PTR)g_target_size,
-                        (ULONG_PTR)strikes,
-                        (ULONG_PTR)0
-                    );
-                }
-                return false;
+                targeting_latch::latch_targeting(
+                    targeting_latch::RE_REASON_DR_ON_TEXT,
+                    g_target_base,
+                    g_target_size,
+                    static_cast<UINT64>(strikes),
+                    0
+                );
             }
 
 

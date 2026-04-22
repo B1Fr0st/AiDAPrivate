@@ -15,30 +15,6 @@ namespace process_notify {
         int         len;
     };
 
-    constexpr tool_sig_t g_dump_tools[] = {
-        { "procdump",     8 },
-        { "processdump",  11 },
-        { "hollowshunt",  11 },
-        { "pe-sieve",     8 },
-        { "scylla",       6 },
-        { "taskdmp",      7 },
-        { "minidump",     8 },
-        { "processhack",  11 },
-        { "x64dbg",       6 },
-        { "x32dbg",       6 },
-        { "ollydbg",      7 },
-        { "windbg",       6 },
-        { "ida64",        5 },
-        { "ida32",        5 },
-        { "idaq",         4 },
-        { "cheatengine",  11 },
-        { "reclass",      7 },
-        { "hmpalert",     8 },
-        { "apimonitor",   10 },
-        { "procmon",      7 },
-    };
-    constexpr int g_num_dump_tools = sizeof(g_dump_tools) / sizeof(g_dump_tools[0]);
-
     __forceinline bool match_prefix_ci(const UCHAR* name, const char* prefix, int prefix_len) {
         for (int i = 0; i < prefix_len; ++i) {
             char a = static_cast<char>(name[i] | 0x20);
@@ -46,61 +22,6 @@ namespace process_notify {
             if (a != b) return false;
         }
         return true;
-    }
-
-    __forceinline bool is_dump_tool(const UCHAR* name) {
-        for (int t = 0; t < g_num_dump_tools; ++t) {
-            if (match_prefix_ci(name, g_dump_tools[t].prefix, g_dump_tools[t].len))
-                return true;
-        }
-        return false;
-    }
-
-    __forceinline bool process_has_handle_to_target(HANDLE tool_pid, HANDLE target_pid) {
-        if (!_ZwOpenProcess || !_ZwClose)
-            return false;
-
-        OBJECT_ATTRIBUTES oa;
-        InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
-        CLIENT_ID cid = {};
-        cid.UniqueProcess = tool_pid;
-
-        HANDLE hToolProc = nullptr;
-        NTSTATUS st = _ZwOpenProcess(&hToolProc, PROCESS_QUERY_INFORMATION, &oa, &cid);
-        if (!NT_SUCCESS(st) || !hToolProc)
-            return false;
-
-        _ZwClose(hToolProc);
-
-        PEPROCESS target_proc = nullptr;
-        st = PsLookupProcessByProcessId(target_pid, &target_proc);
-        if (!NT_SUCCESS(st) || !target_proc)
-            return false;
-
-        UCHAR* target_name = PsGetProcessImageFileName(target_proc);
-        _ObfDereferenceObject(target_proc);
-
-        if (!target_name || !_MmIsAddressValid(target_name))
-            return false;
-
-        return true;
-    }
-
-    __forceinline void terminate_process_by_pid(HANDLE pid) {
-        if (!_ZwOpenProcess || !_ZwTerminateProcess || !_ZwClose)
-            return;
-
-        OBJECT_ATTRIBUTES oa;
-        InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
-        CLIENT_ID cid = {};
-        cid.UniqueProcess = pid;
-
-        HANDLE hProc = nullptr;
-        NTSTATUS st = _ZwOpenProcess(&hProc, PROCESS_TERMINATE, &oa, &cid);
-        if (NT_SUCCESS(st) && hProc) {
-            _ZwTerminateProcess(hProc, STATUS_ACCESS_DENIED);
-            _ZwClose(hProc);
-        }
     }
 
     static VOID process_create_callback_ex(
@@ -137,16 +58,7 @@ namespace process_notify {
             for (USHORT i = 0; i < copy_len; ++i)
                 narrow[i] = (char)(img->Buffer[name_start + i] & 0x7F);
 
-            if (is_dump_tool(reinterpret_cast<const UCHAR*>(narrow))) {
-                SN_LOG("process_notify_ex: BLOCKED dump tool pre-create pid=%llu name=%.60s",
-                    (UINT64)(ULONG_PTR)pid, narrow);
-                create_info->CreationStatus = STATUS_ACCESS_DENIED;
-                object_guard::g_last_suspicious_pid = (UINT64)(ULONG_PTR)pid;
-                InterlockedIncrement((volatile LONG*)&object_guard::g_suspicious_handle_count);
-                heartbeat::send_command(heartbeat::BRIDGE_CMD_DUMP_TOOL_FOUND,
-                    static_cast<ULONG>((ULONG_PTR)pid & 0xFFFFFFFF));
-                return;
-            }
+            UNREFERENCED_PARAMETER(narrow);
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 
@@ -167,20 +79,7 @@ namespace process_notify {
                 return;
 
             UCHAR* name = PsGetProcessImageFileName(proc);
-            if (name && _MmIsAddressValid(name)) {
-                if (is_dump_tool(name)) {
-                    SN_LOG("process_notify: dump tool launched pid=%llu name=%.15s, TERMINATING",
-                        (UINT64)(ULONG_PTR)pid, name);
-                    object_guard::g_last_suspicious_pid = (UINT64)(ULONG_PTR)pid;
-                    InterlockedIncrement((volatile LONG*)&object_guard::g_suspicious_handle_count);
-                    _ObfDereferenceObject(proc);
-                    terminate_process_by_pid(pid);
-                    heartbeat::send_command(heartbeat::BRIDGE_CMD_DUMP_TOOL_FOUND,
-                        static_cast<ULONG>((ULONG_PTR)pid & 0xFFFFFFFF));
-                    return;
-                }
-            }
-
+            UNREFERENCED_PARAMETER(name);
             _ObfDereferenceObject(proc);
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
@@ -189,6 +88,7 @@ namespace process_notify {
         _InterlockedExchange64(
             reinterpret_cast<volatile LONG64*>(&g_protected_pid),
             reinterpret_cast<LONG64>(pid));
+        object_guard::set_protected_pid(pid);
         SN_LOG("process_notify: protected_pid set to %llu", (UINT64)(ULONG_PTR)pid);
     }
 
@@ -260,62 +160,8 @@ namespace process_notify {
 
     static VOID thread_create_callback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
         UNREFERENCED_PARAMETER(ThreadId);
-        if (!Create) return;
-
-        HANDLE prot_pid = reinterpret_cast<HANDLE>(
-            _InterlockedCompareExchange64(
-                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
-        if (!prot_pid || ProcessId != prot_pid)
-            return;
-
-        HANDLE caller_pid = PsGetCurrentProcessId();
-        if (caller_pid == prot_pid) return;
-        if (caller_pid == reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(4))) return;
-        if (caller_pid == reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(0))) return;
-
-        PEPROCESS caller_proc = nullptr;
-        if (!NT_SUCCESS(PsLookupProcessByProcessId(caller_pid, &caller_proc)) || !caller_proc)
-            return;
-
-        UCHAR* name_ptr = PsGetProcessImageFileName(caller_proc);
-        char narrow[16] = {};
-        if (name_ptr) {
-            for (int i = 0; i < 15; i++) {
-                UCHAR c = name_ptr[i];
-                if (c == 0) break;
-                narrow[i] = (char)c;
-            }
-        }
-        ObDereferenceObject(caller_proc);
-
-        BOOLEAN hostile = FALSE;
-        for (int d = 0; d < g_num_dump_tools; ++d) {
-            if (match_prefix_ci((const UCHAR*)narrow, g_dump_tools[d].prefix, g_dump_tools[d].len)) {
-                hostile = TRUE;
-                break;
-            }
-        }
-        for (int d = 0; d < g_num_suspicious_dlls && !hostile; ++d) {
-            if (match_prefix_ci((const UCHAR*)narrow, g_suspicious_dlls[d].name, g_suspicious_dlls[d].len)) {
-                hostile = TRUE;
-                break;
-            }
-        }
-
-        if (hostile) {
-            SN_LOG("process_notify: HOSTILE THREAD INJECT: caller_pid=%llu name=%s -> prot_pid=%llu",
-                (UINT64)(ULONG_PTR)caller_pid, narrow, (UINT64)(ULONG_PTR)prot_pid);
-            heartbeat::send_command(heartbeat::BRIDGE_CMD_SENTINEL_THREAD_INJECT,
-                static_cast<ULONG>((ULONG_PTR)caller_pid & 0xFFFFFFFF));
-            if (_KeBugCheckEx) {
-                _KeBugCheckEx(
-                    heartbeat::BUGCHECK_SENTINEL_THREAD_INJECT,
-                    static_cast<ULONG_PTR>(reinterpret_cast<ULONG_PTR>(caller_pid)),
-                    static_cast<ULONG_PTR>(reinterpret_cast<ULONG_PTR>(ThreadId)),
-                    static_cast<ULONG_PTR>(reinterpret_cast<ULONG_PTR>(prot_pid)),
-                    0);
-            }
-        }
+        UNREFERENCED_PARAMETER(ProcessId);
+        UNREFERENCED_PARAMETER(Create);
     }
 
     __forceinline bool init() {

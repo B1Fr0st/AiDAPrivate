@@ -4,6 +4,7 @@
 #include "../imports/Defs.h"
 #include "CoreSecurity.h"
 #include "SentinelBridge.h"
+#include "TargetingLatch.h"
 
 namespace process_guard {
 
@@ -19,79 +20,59 @@ namespace process_guard {
         PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
         PROCESS_SUSPEND_RESUME | PROCESS_SET_INFORMATION;
 
-    struct debugger_sig_t {
-        const char* prefix;
-        int len;
-    };
+    __forceinline bool is_allowlisted_system_caller(HANDLE caller_pid) {
+        static const char* const ALLOWLIST[] = {
+            "csrss", "services", "wininit", "lsass",
+            "msmpeng", "securityheal", "werfault"
+        };
+        static const int ALLOWLIST_LENS[] = { 5, 8, 7, 5, 7, 12, 8 };
+        constexpr int ALLOWLIST_COUNT = 7;
 
-    constexpr debugger_sig_t g_debugger_images[] = {
-        { "x64dbg",      6 },
-        { "x32dbg",      6 },
-        { "windbg",      6 },
-        { "ollydbg",     7 },
-        { "ida64",       5 },
-        { "ida32",       5 },
-        { "idaq",        4 },
-        { "ghidra",      6 },
-        { "dnspy",       5 },
-        { "reclass",     7 },
-        { "cheatengine", 11 },
-        { "frida",       5 },
-        { "titanhide",   9 },
-        { "scyllahide",  10 },
-        { "hyperdbg",    8 },
-        { "radare2",     7 },
-        { "rizin",       5 },
-        { "binja",       5 },
-        { "binaryninja", 11 },
-        { "cutter",      6 },
-        { "pestudio",    8 },
-    };
-    constexpr int g_debugger_image_count =
-        sizeof(g_debugger_images) / sizeof(g_debugger_images[0]);
-
-    __forceinline bool debugger_name_match_ci(const UCHAR* name, const char* prefix, int prefix_len) {
-        for (int i = 0; i < prefix_len; ++i) {
-            char a = (char)(name[i] | 0x20);
-            char b = (char)(prefix[i] | 0x20);
-            if (a != b) return false;
-        }
-        return true;
-    }
-
-    __forceinline bool is_debugger_image(HANDLE caller_pid) {
-        if (!caller_pid) return false;
-        PEPROCESS caller_proc = nullptr;
-        NTSTATUS st = PsLookupProcessByProcessId(caller_pid, &caller_proc);
-        if (!NT_SUCCESS(st) || !caller_proc)
+        PEPROCESS proc = nullptr;
+        if (!NT_SUCCESS(PsLookupProcessByProcessId(caller_pid, &proc)) || !proc)
             return false;
-        bool match = false;
+
+        bool allowed = false;
         __try {
-            UCHAR* img = PsGetProcessImageFileName(caller_proc);
+            UCHAR* img = PsGetProcessImageFileName(proc);
             if (img && _MmIsAddressValid(img)) {
-                for (int t = 0; t < g_debugger_image_count; ++t) {
-                    if (debugger_name_match_ci(img,
-                            g_debugger_images[t].prefix,
-                            g_debugger_images[t].len)) {
-                        match = true;
-                        break;
+                for (int i = 0; i < ALLOWLIST_COUNT; ++i) {
+                    const char* prefix = ALLOWLIST[i];
+                    int plen = ALLOWLIST_LENS[i];
+                    bool match = true;
+                    for (int c = 0; c < plen; ++c) {
+                        char a = (char)(img[c] | 0x20);
+                        char b = (char)(prefix[c] | 0x20);
+                        if (a != b) { match = false; break; }
                     }
+                    if (match) { allowed = true; break; }
                 }
             }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            match = false;
-        }
-        ObDereferenceObject(caller_proc);
-        return match;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { allowed = false; }
+
+        _ObfDereferenceObject(proc);
+        return allowed;
     }
 
-    constexpr ACCESS_MASK STRIPPED_PROCESS_ACCESS =
-        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
-        PROCESS_DUP_HANDLE | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION;
-
-    constexpr ACCESS_MASK STRIPPED_THREAD_ACCESS =
-        THREAD_SUSPEND_RESUME | THREAD_SET_CONTEXT |
-        THREAD_GET_CONTEXT | THREAD_TERMINATE;
+    __forceinline bool is_werfault_caller(HANDLE caller_pid) {
+        PEPROCESS proc = nullptr;
+        if (!NT_SUCCESS(PsLookupProcessByProcessId(caller_pid, &proc)) || !proc)
+            return false;
+        bool is_wer = false;
+        __try {
+            UCHAR* img = PsGetProcessImageFileName(proc);
+            if (img && _MmIsAddressValid(img)) {
+                const char prefix[] = "werfault";
+                bool match = true;
+                for (int c = 0; c < 8; ++c) {
+                    if ((char)(img[c] | 0x20) != prefix[c]) { match = false; break; }
+                }
+                is_wer = match;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { is_wer = false; }
+        _ObfDereferenceObject(proc);
+        return is_wer;
+    }
 
     inline OB_PREOP_CALLBACK_STATUS NTAPI process_pre_callback(
         PVOID,
@@ -123,25 +104,36 @@ namespace process_guard {
         else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
             requested = Info->Parameters->DuplicateHandleInformation.DesiredAccess;
 
-        if ((requested & DEBUG_GRADE_ACCESS) != 0 && is_debugger_image(caller_pid)) {
-            WW_LOG("process_guard: named debugger pid=%llu requested 0x%lx on client - BSOD",
-                (UINT64)(ULONG_PTR)caller_pid, requested);
-            sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_PRE_BSOD_INTENT;
-            sentinel_bridge::g_bridge.sentinel_cmd_param = sentinel_bridge::RE_REASON_FOREIGN_HND;
-            if (_KeBugCheckEx) {
-                _KeBugCheckEx(
-                    0xDEAD0001u,
-                    (ULONG_PTR)sentinel_bridge::RE_REASON_FOREIGN_HND,
-                    (ULONG_PTR)caller_pid,
-                    (ULONG_PTR)requested,
-                    0xAD7DAD7Du);
-            }
-        }
+        if (is_werfault_caller(caller_pid))
+            return OB_PREOP_SUCCESS;
 
-        if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
-            Info->Parameters->CreateHandleInformation.DesiredAccess &= ~STRIPPED_PROCESS_ACCESS;
-        else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
-            Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~STRIPPED_PROCESS_ACCESS;
+        constexpr ACCESS_MASK HOSTILE_PROC =
+            PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
+            PROCESS_SUSPEND_RESUME | PROCESS_VM_OPERATION | PROCESS_SET_INFORMATION;
+        constexpr ACCESS_MASK STRIP_READ = PROCESS_VM_READ;
+
+        bool is_system = is_allowlisted_system_caller(caller_pid);
+
+        if (requested & HOSTILE_PROC) {
+            if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                Info->Parameters->CreateHandleInformation.DesiredAccess &= ~(HOSTILE_PROC | STRIP_READ);
+            else
+                Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~(HOSTILE_PROC | STRIP_READ);
+
+            if (!is_system) {
+                targeting_latch::latch_targeting(
+                    sentinel_bridge::RE_REASON_OB_WRITE,
+                    (UINT64)(ULONG_PTR)caller_pid,
+                    (UINT64)requested,
+                    0, 0
+                );
+            }
+        } else if (requested & STRIP_READ) {
+            if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                Info->Parameters->CreateHandleInformation.DesiredAccess &= ~STRIP_READ;
+            else
+                Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~STRIP_READ;
+        }
 
         return OB_PREOP_SUCCESS;
     }
@@ -174,10 +166,41 @@ namespace process_guard {
         if (reinterpret_cast<UINT64>(caller_pid) == 4)
             return OB_PREOP_SUCCESS;
 
+        if (is_werfault_caller(caller_pid))
+            return OB_PREOP_SUCCESS;
+
+        ACCESS_MASK requested = 0;
         if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
-            Info->Parameters->CreateHandleInformation.DesiredAccess &= ~STRIPPED_THREAD_ACCESS;
+            requested = Info->Parameters->CreateHandleInformation.DesiredAccess;
         else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
-            Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~STRIPPED_THREAD_ACCESS;
+            requested = Info->Parameters->DuplicateHandleInformation.DesiredAccess;
+
+        constexpr ACCESS_MASK HOSTILE_THR =
+            THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_TERMINATE;
+        constexpr ACCESS_MASK STRIP_THR = HOSTILE_THR | THREAD_GET_CONTEXT;
+
+        bool is_system = is_allowlisted_system_caller(caller_pid);
+
+        if (requested & HOSTILE_THR) {
+            if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                Info->Parameters->CreateHandleInformation.DesiredAccess &= ~STRIP_THR;
+            else
+                Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~STRIP_THR;
+
+            if (!is_system) {
+                targeting_latch::latch_targeting(
+                    sentinel_bridge::RE_REASON_OB_SUSPEND,
+                    (UINT64)(ULONG_PTR)caller_pid,
+                    (UINT64)requested,
+                    0, 0
+                );
+            }
+        } else if (requested & THREAD_GET_CONTEXT) {
+            if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                Info->Parameters->CreateHandleInformation.DesiredAccess &= ~THREAD_GET_CONTEXT;
+            else
+                Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~THREAD_GET_CONTEXT;
+        }
 
         return OB_PREOP_SUCCESS;
     }
@@ -248,21 +271,7 @@ namespace process_guard {
         if (reinterpret_cast<UINT64>(caller_pid) == 4)
             return;
 
-        if (is_debugger_image(caller_pid)) {
-            WW_LOG("thread_guard: named debugger pid=%llu created thread %llu in client - BSOD",
-                (UINT64)(ULONG_PTR)caller_pid,
-                (UINT64)(ULONG_PTR)ThreadId);
-            sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_PRE_BSOD_INTENT;
-            sentinel_bridge::g_bridge.sentinel_cmd_param = sentinel_bridge::RE_REASON_INJECTED_DLL;
-            if (_KeBugCheckEx) {
-                _KeBugCheckEx(
-                    0xDEAD0001u,
-                    (ULONG_PTR)sentinel_bridge::RE_REASON_INJECTED_DLL,
-                    (ULONG_PTR)caller_pid,
-                    (ULONG_PTR)ThreadId,
-                    0x114D114Du);
-            }
-        }
+        UNREFERENCED_PARAMETER(ThreadId);
     }
 
     // Process creation notification: deny creation of processes that request

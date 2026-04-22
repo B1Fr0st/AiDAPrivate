@@ -17,8 +17,6 @@
 #include "anti_hook.hpp"
 #include "anti_emulation.hpp"
 #include "anti_dump.hpp"
-#include "anti_ai.hpp"
-#include "process_scan.hpp"
 #include "virtualizer.hpp"
 #include "code_encrypt.hpp"
 #include "metamorphic.hpp"
@@ -678,44 +676,6 @@ inline bool guard()
     }
     CFF_STATE(guard_cff, 10)
     {
-        if ((rt.verify_counter & 3u) == 0)
-        {
-            webhook::write_log("guard", "ai_scan_entering");
-            auto ai_report = anti_ai::combined::full_scan();
-            {
-                char dbg[256];
-                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                    "ai_scan_result: mcp=%d llm=%d tool=%d mem=%d handle=%d clip=%d threat=%d summary=%s",
-                    ai_report.mcp_detected ? 1 : 0, ai_report.llm_detected ? 1 : 0,
-                    ai_report.ai_tool_detected ? 1 : 0, ai_report.memory_scanner_detected ? 1 : 0,
-                    ai_report.handle_to_us_detected ? 1 : 0, ai_report.clipboard_monitored ? 1 : 0,
-                    ai_report.any_threat() ? 1 : 0,
-                    ai_report.summary.empty() ? "none" : ai_report.summary.c_str());
-                webhook::write_log("guard", dbg);
-            }
-            if (ai_report.any_threat())
-            {
-                webhook::send_debug_log("guard", "ai_threat: " + ai_report.summary, true);
-                enforce_violation("ai_threat_detected", ai_report.summary);
-                CFF_EXIT(guard_cff);
-            }
-
-            auto proc_report = process_scan::full_scan();
-            {
-                char dbg[256];
-                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                    "proc_scan_result: detected=%d detail=%s",
-                    proc_report.any_detected() ? 1 : 0,
-                    proc_report.detail.empty() ? "none" : proc_report.detail.c_str());
-                webhook::write_log("guard", dbg);
-            }
-            if (proc_report.any_detected())
-            {
-                webhook::send_debug_log("guard", "re_tool: " + proc_report.detail, true);
-                enforce_violation("re_tool_detected", proc_report.detail);
-                CFF_EXIT(guard_cff);
-            }
-        }
         CFF_GOTO(guard_cff, 11);
     }
     CFF_STATE(guard_cff, 11)

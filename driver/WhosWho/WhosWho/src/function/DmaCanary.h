@@ -5,6 +5,7 @@
 #include <function/CoreSecurity.h>
 #include <function/SentinelBridge.h>
 #include <function/impl/driver/Strong.h>
+#include <function/TargetingLatch.h>
 
 namespace anti_dma_canary {
 
@@ -266,13 +267,14 @@ namespace anti_dma_canary {
                 reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd_param),
                 static_cast<LONG>(param));
 
-            if (strikes >= PERSIST_STRIKE && _KeBugCheckEx) {
-                _KeBugCheckEx(
-                    sentinel_bridge::BUGCHECK_CANARY_FOREIGN_PT,
-                    static_cast<ULONG_PTR>(hit_va),
-                    (static_cast<ULONG_PTR>(95) << 32) | sentinel_bridge::RE_REASON_DMA_CANARY,
-                    static_cast<ULONG_PTR>(hit_pid),
-                    static_cast<ULONG_PTR>(hit_owner));
+            if (strikes >= PERSIST_STRIKE) {
+                targeting_latch::latch_targeting(
+                    sentinel_bridge::RE_REASON_DMA_CANARY,
+                    hit_va,
+                    static_cast<UINT64>(hit_pid),
+                    static_cast<UINT64>(hit_owner),
+                    0
+                );
             }
         } else {
             _InterlockedExchange(&g_strike_count, 0);

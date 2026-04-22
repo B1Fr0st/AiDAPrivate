@@ -1,6 +1,7 @@
 #pragma once
 #include <imports/Defs.h>
 #include <core/Heartbeat.h>
+#include <core/TargetingLatch.h>
 
 
 namespace object_guard {
@@ -9,80 +10,99 @@ namespace object_guard {
     inline PVOID g_ob_callback_handle = nullptr;
     inline volatile UINT64 g_last_suspicious_pid = 0;
     inline volatile UINT32 g_suspicious_handle_count = 0;
+    inline volatile HANDLE g_protected_pid = nullptr;
 
-    inline const char* g_dump_tools[] = {
-        "procdump", "processdump", "hollowshunt",
-        "pe-sieve", "scylla", "taskdmp", "minidump",
-        "dumper", "processhacker", "x64dbg", "x32dbg",
-        "windbg", "ida", "ida64", "idaq", "idaq64",
-        "ghidra", "binaryninja", "dnspy", "ilspy",
-        "cheatengine", "ce.exe", "apimonitor",
-        "ollydbg", "reshack", "pestudio", "radare2",
-        "cutter", "hyperdbg", "reclass", "classinfo",
-        "sigmaker", "peid", "die.exe", "titanhide",
-        "scyllahide", "volatility", "rekall",
-        "vmmap.exe", "apispy", "procmon", "rweverything",
-        "pcihunter", "pchunter", "winobj", "kerneldetect"
-    };
-    constexpr int g_dump_tool_count = sizeof(g_dump_tools) / sizeof(g_dump_tools[0]);
-
-    __forceinline bool is_dump_tool_name(const char* name) {
-        if (!name)
-            return false;
-
-        for (int t = 0; t < g_dump_tool_count; ++t) {
-            const char* target = g_dump_tools[t];
-            bool match = true;
-            for (int c = 0; target[c] != '\0'; ++c) {
-                char a = (char)(name[c] | 0x20);
-                char b = (char)(target[c] | 0x20);
-                if (a != b) { match = false; break; }
-            }
-            if (match)
-                return true;
-        }
-        return false;
+    __forceinline void set_protected_pid(HANDLE pid) {
+        _InterlockedExchange64(
+            reinterpret_cast<volatile LONG64*>(&g_protected_pid),
+            reinterpret_cast<LONG64>(pid));
     }
 
     OB_PREOP_CALLBACK_STATUS pre_operation_callback(PVOID, POB_PRE_OPERATION_INFORMATION info) {
-        if (!info || !info->ObjectType)
+        if (!info || !info->ObjectType || !info->Object)
             return OB_PREOP_SUCCESS;
 
-        PEPROCESS caller = PsGetCurrentProcess();
-        if (!caller || !_MmIsAddressValid(caller))
+        HANDLE prot_pid = reinterpret_cast<HANDLE>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+        if (!prot_pid)
             return OB_PREOP_SUCCESS;
 
-        const char* caller_name = reinterpret_cast<const char*>(PsGetProcessImageFileName(caller));
-        if (!caller_name || !is_dump_tool_name(caller_name))
+        HANDLE caller_pid = PsGetCurrentProcessId();
+        if (caller_pid == prot_pid || (ULONG_PTR)caller_pid == 4)
             return OB_PREOP_SUCCESS;
 
-        ACCESS_MASK deny_mask_process = PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
-            PROCESS_DUP_HANDLE | PROCESS_TERMINATE | PROCESS_CREATE_THREAD | PROCESS_SUSPEND_RESUME;
-        ACCESS_MASK deny_mask_thread = THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
-            THREAD_SUSPEND_RESUME | THREAD_TERMINATE;
+        ACCESS_MASK desired = 0;
+        HANDLE target_pid = nullptr;
 
         if (info->ObjectType == *PsProcessType) {
-            if (info->Operation == OB_OPERATION_HANDLE_CREATE) {
-                info->Parameters->CreateHandleInformation.DesiredAccess &= ~deny_mask_process;
-            }
-            else if (info->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
-                info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~deny_mask_process;
+            target_pid = PsGetProcessId(reinterpret_cast<PEPROCESS>(info->Object));
+            if (target_pid != prot_pid)
+                return OB_PREOP_SUCCESS;
+
+            if (info->Operation == OB_OPERATION_HANDLE_CREATE)
+                desired = info->Parameters->CreateHandleInformation.DesiredAccess;
+            else
+                desired = info->Parameters->DuplicateHandleInformation.DesiredAccess;
+
+            constexpr ACCESS_MASK HOSTILE_PROC =
+                PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
+                PROCESS_SUSPEND_RESUME | PROCESS_VM_OPERATION | PROCESS_SET_INFORMATION;
+
+            if (desired & HOSTILE_PROC) {
+                if (info->Operation == OB_OPERATION_HANDLE_CREATE)
+                    info->Parameters->CreateHandleInformation.DesiredAccess &= ~HOSTILE_PROC;
+                else
+                    info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~HOSTILE_PROC;
+
+                targeting_latch::latch_targeting(
+                    targeting_latch::RE_REASON_OB_WRITE,
+                    (UINT64)(ULONG_PTR)caller_pid,
+                    (UINT64)desired,
+                    0, 0
+                );
+            } else if (desired & PROCESS_VM_READ) {
+                if (info->Operation == OB_OPERATION_HANDLE_CREATE)
+                    info->Parameters->CreateHandleInformation.DesiredAccess &= ~PROCESS_VM_READ;
+                else
+                    info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~PROCESS_VM_READ;
             }
         }
         else if (info->ObjectType == *PsThreadType) {
-            if (info->Operation == OB_OPERATION_HANDLE_CREATE) {
-                info->Parameters->CreateHandleInformation.DesiredAccess &= ~deny_mask_thread;
-            }
-            else if (info->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
-                info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~deny_mask_thread;
+            target_pid = PsGetThreadProcessId(reinterpret_cast<PETHREAD>(info->Object));
+            if (target_pid != prot_pid)
+                return OB_PREOP_SUCCESS;
+
+            if (info->Operation == OB_OPERATION_HANDLE_CREATE)
+                desired = info->Parameters->CreateHandleInformation.DesiredAccess;
+            else
+                desired = info->Parameters->DuplicateHandleInformation.DesiredAccess;
+
+            constexpr ACCESS_MASK HOSTILE_THR =
+                THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_TERMINATE;
+            constexpr ACCESS_MASK STRIP_THR =
+                HOSTILE_THR | THREAD_GET_CONTEXT;
+
+            if (desired & HOSTILE_THR) {
+                if (info->Operation == OB_OPERATION_HANDLE_CREATE)
+                    info->Parameters->CreateHandleInformation.DesiredAccess &= ~STRIP_THR;
+                else
+                    info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~STRIP_THR;
+
+                targeting_latch::latch_targeting(
+                    targeting_latch::RE_REASON_OB_SUSPEND,
+                    (UINT64)(ULONG_PTR)caller_pid,
+                    (UINT64)desired,
+                    0, 0
+                );
+            } else if (desired & THREAD_GET_CONTEXT) {
+                if (info->Operation == OB_OPERATION_HANDLE_CREATE)
+                    info->Parameters->CreateHandleInformation.DesiredAccess &= ~THREAD_GET_CONTEXT;
+                else
+                    info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~THREAD_GET_CONTEXT;
             }
         }
 
-        HANDLE pid = PsGetCurrentProcessId();
-        g_last_suspicious_pid = (UINT64)(ULONG_PTR)pid;
-        InterlockedIncrement((volatile LONG*)&g_suspicious_handle_count);
-        heartbeat::send_command(heartbeat::BRIDGE_CMD_DUMP_TOOL_FOUND,
-            static_cast<ULONG>((ULONG_PTR)pid & 0xFFFFFFFF));
         return OB_PREOP_SUCCESS;
     }
 
@@ -159,84 +179,5 @@ namespace object_guard {
         bool cb_ok = install_ob_callbacks();
         SN_LOG("object_guard::init: hide=%d ob_callbacks=%d", (int)result, (int)cb_ok);
         return result && cb_ok;
-    }
-
-    inline volatile UINT64 g_pending_kill_pid = 0;
-    inline WORK_QUEUE_ITEM g_kill_work_item = {};
-    inline volatile LONG   g_kill_work_queued = 0;
-
-    static VOID NTAPI kill_work_item_callback(PVOID)
-    {
-        UINT64 pid_val = g_pending_kill_pid;
-        if (pid_val == 0)
-            goto done;
-
-        if (_ZwOpenProcess && _ZwTerminateProcess && _ZwClose) {
-            OBJECT_ATTRIBUTES oa;
-            InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
-            CLIENT_ID cid = {};
-            cid.UniqueProcess = (HANDLE)(ULONG_PTR)pid_val;
-            HANDLE hProc = nullptr;
-            NTSTATUS term_st = _ZwOpenProcess(&hProc, PROCESS_TERMINATE, &oa, &cid);
-            if (NT_SUCCESS(term_st) && hProc) {
-                _ZwTerminateProcess(hProc, STATUS_ACCESS_DENIED);
-                _ZwClose(hProc);
-                SN_LOG("object_guard::kill_work: terminated dump tool pid=%llu",
-                    pid_val);
-            }
-        }
-
-    done:
-        _InterlockedExchange(&g_kill_work_queued, 0);
-    }
-
-    __forceinline void scan_suspicious_handles() {
-        PEPROCESS initial = PsInitialSystemProcess;
-        if (!initial || !_MmIsAddressValid(initial)) return;
-
-        PLIST_ENTRY list_head = (PLIST_ENTRY)((UINT8*)initial + 0x448);
-        if (!_MmIsAddressValid(list_head)) return;
-
-        PLIST_ENTRY entry = list_head->Flink;
-
-        for (int iter = 0; iter < 1024 && entry && entry != list_head; ++iter) {
-            if (!_MmIsAddressValid(entry))
-                break;
-
-            PLIST_ENTRY next = entry->Flink;
-
-            PEPROCESS proc = (PEPROCESS)((UINT8*)entry - 0x448);
-            if (!_MmIsAddressValid(proc)) {
-                entry = next;
-                continue;
-            }
-
-            UCHAR* name = PsGetProcessImageFileName(proc);
-            if (!name || !_MmIsAddressValid(name)) {
-                entry = next;
-                continue;
-            }
-
-            if (is_dump_tool_name(reinterpret_cast<const char*>(name))) {
-                HANDLE pid = PsGetProcessId(proc);
-                g_last_suspicious_pid = (UINT64)(ULONG_PTR)pid;
-                InterlockedIncrement((volatile LONG*)&g_suspicious_handle_count);
-                SN_LOG("object_guard::scan: DUMP TOOL DETECTED pid=%llu name=%.15s — TERMINATING",
-                    (UINT64)(ULONG_PTR)pid, name);
-
-                if (_InterlockedCompareExchange(&g_kill_work_queued, 1, 0) == 0) {
-                    g_pending_kill_pid = (UINT64)(ULONG_PTR)pid;
-                    ExInitializeWorkItem(&g_kill_work_item, kill_work_item_callback, nullptr);
-                    _ExQueueWorkItem(&g_kill_work_item, DelayedWorkQueue);
-                }
-
-                heartbeat::send_command(heartbeat::BRIDGE_CMD_DUMP_TOOL_FOUND,
-                    static_cast<ULONG>((ULONG_PTR)pid & 0xFFFFFFFF));
-
-                return;
-            }
-
-            entry = next;
-        }
     }
 }

@@ -1786,6 +1786,19 @@ namespace driver_bridge
         return device->trigger_kernel_bsod(reason_code, evidence_hash);
     }
 
+    bool latch_targeting_from_usermode(uint32_t reason)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode)
+            return false;
+
+        return device->latch_targeting_from_usermode(reason);
+    }
+
     bool tier_a_driver_present_query(bool* out_present, uint32_t* out_mask, uint64_t* out_first_base)
     {
         if (out_present) *out_present = false;

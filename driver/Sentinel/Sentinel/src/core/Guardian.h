@@ -9,6 +9,8 @@
 #include <core/PoolScrub.h>
 #include <core/ObjectGuard.h>
 #include <core/HyperVAllowList.h>
+#include <core/DebugPortTrap.h>
+#include <core/VadTextGuard.h>
 
 
 namespace guardian {
@@ -206,7 +208,15 @@ namespace guardian {
         }
 
         if ((cycle % 3) == 0) {
-            object_guard::scan_suspicious_handles();
+            debug_port_trap::check(reinterpret_cast<HANDLE>(
+                _InterlockedCompareExchange64(
+                    reinterpret_cast<volatile LONG64*>(&object_guard::g_protected_pid), 0, 0)));
+        }
+
+        if ((cycle % 2) == 0) {
+            vad_text_guard::check(reinterpret_cast<HANDLE>(
+                _InterlockedCompareExchange64(
+                    reinterpret_cast<volatile LONG64*>(&object_guard::g_protected_pid), 0, 0)));
         }
 
         if ((cycle % 7) == 0) {
@@ -263,6 +273,8 @@ namespace guardian {
 
         _KeInitializeTimerEx(&g_timer, NotificationTimer);
         _KeInitializeDpc(&g_dpc, dpc_callback, nullptr);
+
+        targeting_latch::init();
 
         LARGE_INTEGER due_time;
         due_time.QuadPart = CHECK_INTERVAL;

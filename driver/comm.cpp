@@ -3090,6 +3090,20 @@ bool voyager::device_t::trigger_kernel_bsod(std::uint32_t reason_code, std::uint
     return false;
 }
 
+bool voyager::device_t::latch_targeting_from_usermode(std::uint32_t reason) noexcept
+{
+    if (!is_connected())
+        return false;
+
+    detail::latch_targeting_request req{};
+    req.magic        = session_key_ ^ dynamic_key::get() ^ 0x1A7C4B2Eu;
+    req.session_key  = session_key_;
+    req.reason       = reason;
+    req.reserved     = 0;
+
+    return send_request(ioctl_codes::RELA(), &req, static_cast<DWORD>(sizeof(req)));
+}
+
 bool voyager::device_t::tier_a_driver_present_query(bool& out_present, std::uint32_t* out_mask,
                                                     std::uint64_t* out_first_base) noexcept
 {

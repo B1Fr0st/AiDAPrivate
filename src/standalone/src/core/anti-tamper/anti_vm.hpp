@@ -26,7 +26,6 @@ struct vm_report_t
     bool registry_vm_hardware = false;
     bool timing_overhead = false;
     bool vm_mac_prefix = false;
-    bool vm_processes = false;
     bool firmware_vm_string = false;
     bool cpuid_leaf_mismatch = false;
     bool kernel_detections_failed = false;
@@ -38,7 +37,7 @@ struct vm_report_t
     bool any_detected() const
     {
         return cpuid_hypervisor_bit || cpuid_vendor_vm || registry_vm_services
-            || registry_vm_hardware || vm_mac_prefix || vm_processes
+            || registry_vm_hardware || vm_mac_prefix
             || firmware_vm_string || cpuid_leaf_mismatch || kernel_detections_failed;
     }
 };
@@ -215,39 +214,6 @@ inline bool check_vm_mac_prefixes()
     return found;
 }
 
-inline bool check_vm_processes()
-{
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return false;
-
-    bool found = false;
-    PROCESSENTRY32W pe = {};
-    pe.dwSize = sizeof(pe);
-
-    for (BOOL ok = Process32FirstW(snap, &pe); ok && !found;
-         ok = Process32NextW(snap, &pe))
-    {
-        wchar_t lower[MAX_PATH] = {};
-        for (int i = 0; i < MAX_PATH - 1 && pe.szExeFile[i]; ++i)
-            lower[i] = towlower(pe.szExeFile[i]);
-
-        if (wcsstr(lower, L"vmtoolsd.exe")
-            || wcsstr(lower, L"vboxservice.exe")
-            || wcsstr(lower, L"vboxtray.exe")
-            || wcsstr(lower, L"vmwaretray.exe")
-            || wcsstr(lower, L"vmwareuser.exe")
-            || wcsstr(lower, L"qemu-ga.exe")
-            || wcsstr(lower, L"xenservice.exe")
-            || wcsstr(lower, L"vgauthservice.exe"))
-        {
-            found = true;
-        }
-    }
-
-    CloseHandle(snap);
-    return found;
-}
-
 inline bool check_firmware_tables()
 {
     UINT size = 0;
@@ -334,8 +300,6 @@ inline vm_report_t full_scan()
 
     report.vm_mac_prefix = check_vm_mac_prefixes();
 
-    report.vm_processes = check_vm_processes();
-
     report.firmware_vm_string = check_firmware_tables();
 
     report.cpuid_leaf_mismatch = check_cpuid_leaf_comparison();
@@ -355,7 +319,6 @@ inline vm_report_t full_scan()
     if (report.registry_vm_hardware) report.summary += "reg_hw ";
     if (report.timing_overhead) report.summary += "timing ";
     if (report.vm_mac_prefix) report.summary += "mac ";
-    if (report.vm_processes) report.summary += "procs ";
     if (report.firmware_vm_string) report.summary += "firmware ";
     if (report.cpuid_leaf_mismatch) report.summary += "cpuid_leaf ";
     if (report.kernel_detections_failed) report.summary += "kernel_hv(" + std::to_string(report.kernel_detection_count) + "/" + std::to_string(report.kernel_total_run) + ") ";
