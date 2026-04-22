@@ -264,38 +264,23 @@ json server_t::handle_tools_list(const json& id, const json&)
 
 json server_t::handle_tools_call(const json& id, const json& params)
 {
+    if (!params.contains("name") || !params["name"].is_string())
+        return make_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'name'");
+
+    const std::string early_name = params["name"].get<std::string>();
 
     {
         uint64_t gt = standalone_license::inline_gate_check(
             standalone_license::gate_mcp_tool_exec);
-        if (standalone_license::verify_gate_token(
-                standalone_license::gate_mcp_tool_exec, gt) < 0.5) {
+        if (!standalone_license::verify_tool_runtime(
+                standalone_license::gate_mcp_tool_exec, gt, early_name)) {
             return make_error(id, -32000,
                 standalone_license::decode_status_string(
                     standalone_license::str_session_revoked));
         }
-
-
-        if (standalone_license::is_arc_loaded()) {
-            if (!params.contains("name") || !params["name"].is_string())
-                return make_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'name'");
-            const std::string early_name = params["name"].get<std::string>();
-            uint64_t name_hash = 14695981039346656037ULL;
-            for (char c : early_name) {
-                name_hash ^= static_cast<uint8_t>(c);
-                name_hash *= 1099511628211ULL;
-            }
-            uint64_t arc_result = standalone_license::arc_validate_tool(name_hash, gt);
-            if (arc_result == 0) {
-                return make_error(id, -32000, "Service unavailable.");
-            }
-        }
     }
 
-    if (!params.contains("name") || !params["name"].is_string())
-        return make_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'name'");
-
-    std::string tool_name = params["name"].get<std::string>();
+    std::string tool_name = early_name;
     json arguments = params.contains("arguments") && params["arguments"].is_object()
                    ? params["arguments"] : json::object();
 

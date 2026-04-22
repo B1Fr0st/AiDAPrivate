@@ -520,9 +520,12 @@ namespace
 
     /* Additional obfuscated state pair: d + e == magic_2 */
     constexpr uint64_t S_MAGIC2_INIT = 0xCAFE'BABE'1337'C0DEull;
+    constexpr uint64_t S_ARC_MAGIC_INIT = 0x51A7'F00D'44CC'19E5ull;
     std::atomic<uint64_t> s_state_d{0};
     std::atomic<uint64_t> s_state_e{0};
     std::atomic<uint64_t> s_magic_2{S_MAGIC2_INIT};
+    std::atomic<uint64_t> s_arc_magic{S_ARC_MAGIC_INIT};
+    std::atomic<uint64_t> s_arc_state{0};
 
 
     std::atomic<int64_t> s_gate_timestamps[standalone_license::GATE_SLOT_COUNT] = {};
@@ -533,6 +536,8 @@ namespace
     arc_loader::loaded_module_t  s_arc_module{};
     std::mutex                   s_arc_mtx;
     bool                         s_arc_loaded = false;
+    std::atomic<bool>            s_arc_fetch_deferred{false};
+    std::atomic<uint64_t>        s_activation_completed_at_ms{0};
 
 
     std::shared_ptr<httplib::Client> s_license_client;
@@ -565,6 +570,91 @@ namespace
 
     std::vector<std::string> s_honeypot_called_names;
     std::mutex s_honeypot_names_mtx;
+
+    constexpr uint64_t kArcRequiredGraceMs = 60000;
+
+    bool download_and_load_arc(settings_sa_t& settings, const std::string& hwid, uint32_t attempt_number);
+
+    uint64_t license_now_ms()
+    {
+        return static_cast<uint64_t>(GetTickCount64());
+    }
+
+    void log_arc_status(const char* detail)
+    {
+        anti_tamper::webhook::write_log("license", detail);
+        lic_log(detail);
+    }
+
+    void set_arc_obfuscated_state(bool loaded)
+    {
+        uint64_t arc_magic = s_arc_magic.load(std::memory_order_acquire);
+        s_arc_state.store(loaded ? arc_magic : 0, std::memory_order_release);
+    }
+
+    void reset_arc_fetch_state()
+    {
+        s_arc_fetch_deferred.store(false, std::memory_order_release);
+    }
+
+    void reset_activation_completed_at()
+    {
+        s_activation_completed_at_ms.store(0, std::memory_order_release);
+    }
+
+    void mark_activation_completed()
+    {
+        s_activation_completed_at_ms.store(license_now_ms(), std::memory_order_release);
+    }
+
+    bool arc_grace_active()
+    {
+        uint64_t activation_completed_at_ms = s_activation_completed_at_ms.load(std::memory_order_acquire);
+        if (activation_completed_at_ms == 0)
+            return s_arc_fetch_deferred.load(std::memory_order_acquire);
+        return (license_now_ms() - activation_completed_at_ms) < kArcRequiredGraceMs;
+    }
+
+    void defer_arc_fetch()
+    {
+        s_arc_fetch_deferred.store(true, std::memory_order_release);
+    }
+
+    bool relay_server_token_v2_if_ready(uint32_t token_hash, uint64_t server_nonce, uint64_t* out_driver_proof)
+    {
+        if (!driver_bridge::sentinel_bridge_ready())
+            return false;
+        return driver_bridge::relay_server_token_v2(token_hash, server_nonce, out_driver_proof);
+    }
+
+    bool try_load_arc_with_retries(settings_sa_t& settings, const std::string& hwid)
+    {
+        static const uint32_t kRetryDelayMs[3] = { 0u, 2000u, 5000u };
+        for (uint32_t attempt = 0; attempt < 3; ++attempt)
+        {
+            if (attempt != 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(kRetryDelayMs[attempt]));
+
+            if (download_and_load_arc(settings, hwid, attempt + 1))
+            {
+                log_arc_status("arc_download_ok");
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool attempt_deferred_arc_fetch(settings_sa_t& settings, const std::string& hwid)
+    {
+        if (!s_arc_fetch_deferred.load(std::memory_order_acquire) || s_arc_loaded)
+            return false;
+        if (s_activation_completed_at_ms.load(std::memory_order_acquire) == 0)
+            return false;
+
+        s_arc_fetch_deferred.store(false, std::memory_order_release);
+        return try_load_arc_with_retries(settings, hwid);
+    }
 
 
     static const uint8_t S_STR_KEY = 0x5A;
@@ -612,6 +702,7 @@ namespace
             s_magic_2.store(magic2, std::memory_order_release);
             s_state_d.store(d, std::memory_order_release);
             s_state_e.store(magic2 - d, std::memory_order_release);
+            set_arc_obfuscated_state(true);
 
 
             if (s_sweep_start_time == 0)
@@ -625,6 +716,7 @@ namespace
 
             s_state_d.store(0, std::memory_order_release);
             s_state_e.store(0, std::memory_order_release);
+            set_arc_obfuscated_state(false);
         }
     }
 
@@ -635,7 +727,11 @@ namespace
         uint64_t b = s_state_b.load(std::memory_order_acquire);
         uint64_t c = s_state_c.load(std::memory_order_acquire);
         uint64_t magic = s_magic.load(std::memory_order_acquire);
-        return (a ^ b ^ c) == magic;
+        uint64_t arc_magic = s_arc_magic.load(std::memory_order_acquire);
+        uint64_t arc_state = (s_arc_loaded || arc_grace_active())
+            ? s_arc_state.load(std::memory_order_acquire)
+            : 0;
+        return (a ^ b ^ c ^ arc_state) == (magic ^ arc_magic);
     }
 
 
@@ -1213,7 +1309,7 @@ namespace
                             fnv1a_str(settings.license_session_token) & 0xFFFFFFFF);
 
                         uint64_t driver_proof = 0;
-                        if (driver_bridge::relay_server_token_v2(token_hash, srv_nonce_val, &driver_proof))
+                        if (relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof))
                         {
                             char dp_buf[32];
                             snprintf(dp_buf, sizeof(dp_buf), "%016llX",
@@ -1500,7 +1596,7 @@ namespace
         return out;
     }
 
-    bool download_and_load_arc(settings_sa_t& settings, const std::string& hwid)
+    bool download_and_load_arc(settings_sa_t& settings, const std::string& hwid, uint32_t attempt_number)
     {
         std::lock_guard<std::mutex> lk(s_arc_mtx);
 
@@ -1508,10 +1604,17 @@ namespace
         if (s_arc_loaded)
             return true;
 
+        if (settings.license_key.empty() || settings.license_session_token.empty() || hwid.empty())
+        {
+            log_arc_status("arc_skip_preconditions");
+            return false;
+        }
+
 
         try {
             std::string host = get_cloud_function_host();
             json body;
+            body["license_key"] = settings.license_key;
             body["session_token"] = settings.license_session_token;
             body["hwid"] = hwid;
             std::string body_str = body.dump();
@@ -1519,13 +1622,16 @@ namespace
             auto whr = raw_https_request("POST", host + "/api/download/arc",
                                        {}, body_str, "application/json");
             if (!whr.ok || whr.status != 200) {
-                OutputDebugStringA("ARC: Download failed.\n");
+                char arc_fail_buf[96];
+                _snprintf_s(arc_fail_buf, sizeof(arc_fail_buf), _TRUNCATE,
+                    "arc_download_failed status=%d attempt=%u", whr.status, attempt_number);
+                log_arc_status(arc_fail_buf);
                 return false;
             }
 
             auto resp = json::parse(whr.body, nullptr, false);
             if (resp.is_discarded() || !resp.is_object()) {
-                OutputDebugStringA("ARC: Invalid response JSON.\n");
+                log_arc_status("arc_invalid_response_json");
                 return false;
             }
 
@@ -1535,7 +1641,7 @@ namespace
             std::string tag_hex    = resp.value("auth_tag", "");
 
             if (blob_b64.empty() || iv_hex.empty() || tag_hex.empty()) {
-                OutputDebugStringA("ARC: Missing encryption fields.\n");
+                log_arc_status("arc_missing_encryption_fields");
                 return false;
             }
 
@@ -1544,7 +1650,7 @@ namespace
             auto auth_tag = hex_decode(tag_hex);
 
             if (encrypted_blob.empty() || iv.size() != 12 || auth_tag.size() != 16) {
-                OutputDebugStringA("ARC: Invalid blob format.\n");
+                log_arc_status("arc_invalid_blob_format");
                 return false;
             }
 
@@ -1558,7 +1664,7 @@ namespace
                     settings.license_issued_at,
                     get_arc_master_secret());
                 if (fallback_key.empty() || fallback_key.size() != 32) {
-                    OutputDebugStringA("ARC: Key derivation failed.\n");
+                    log_arc_status("arc_key_derivation_failed");
                     return false;
                 }
                 session_key = std::move(fallback_key);
@@ -1569,16 +1675,14 @@ namespace
             SecureZeroMemory(session_key.data(), session_key.size());
 
             if (pe_data.empty()) {
-                OutputDebugStringA("ARC: Decryption failed.\n");
+                log_arc_status("arc_decryption_failed");
                 return false;
             }
 
 
             s_arc_module = arc_loader::load(pe_data.data(), pe_data.size());
             if (!s_arc_module.base) {
-                OutputDebugStringA("ARC: Reflective load failed: ");
-                OutputDebugStringA(arc_loader::last_error().c_str());
-                OutputDebugStringA("\n");
+                log_arc_status("arc_reflective_load_failed");
                 return false;
             }
 
@@ -1598,7 +1702,7 @@ namespace
 
             if (!s_fn_arc_init || !s_fn_arc_get_comm_bridge ||
                 !s_fn_arc_validate_tool || !s_fn_arc_heartbeat || !s_fn_arc_cleanup) {
-                OutputDebugStringA("ARC: Missing exports.\n");
+                log_arc_status("arc_missing_exports");
                 arc_loader::unload(s_arc_module);
                 return false;
             }
@@ -1610,7 +1714,7 @@ namespace
                     hwid.c_str(),
                     now,
                     ARC_INTERFACE_VERSION)) {
-                OutputDebugStringA("ARC: arc_init() failed.\n");
+                log_arc_status("arc_init_failed");
                 arc_loader::unload(s_arc_module);
                 s_fn_arc_init = nullptr;
                 s_fn_arc_get_comm_bridge = nullptr;
@@ -1621,6 +1725,7 @@ namespace
             }
 
             s_arc_loaded = true;
+            set_arc_obfuscated_state(true);
 
             if (s_fn_arc_set_key_seed && !settings.license_key_seed.empty())
             {
@@ -1629,11 +1734,10 @@ namespace
                     s_fn_arc_set_key_seed(seed_bytes.data(), 32);
             }
 
-            OutputDebugStringA("ARC: Loaded and initialized successfully.\n");
             return true;
 
         } catch (...) {
-            OutputDebugStringA("ARC: Exception during download/load.\n");
+            log_arc_status("arc_download_exception");
             return false;
         }
     }
@@ -1654,6 +1758,7 @@ namespace
         s_fn_arc_cleanup = nullptr;
         s_fn_arc_set_key_seed = nullptr;
         s_arc_loaded = false;
+        set_arc_obfuscated_state(false);
     }
 
     bool try_validate_cached(settings_sa_t& settings, std::string& error_out)
@@ -1823,6 +1928,10 @@ namespace
             consecutive_failures = 0;
             lic_log("heartbeat_success_applying");
             apply_valid_response(*settings, settings->license_key, s_cached_hwid, response);
+            if (s_activation_completed_at_ms.load(std::memory_order_acquire) == 0)
+                mark_activation_completed();
+            if (!s_arc_loaded)
+                attempt_deferred_arc_fetch(*settings, s_cached_hwid);
             lic_log("heartbeat_apply_done");
         }
     }
@@ -1862,7 +1971,7 @@ namespace
                 fnv1a_str(settings->license_session_token) & 0xFFFFFFFF);
 
             uint64_t driver_proof = 0;
-            driver_bridge::relay_server_token_v2(token_hash, srv_nonce_val, &driver_proof);
+            relay_server_token_v2_if_ready(token_hash, srv_nonce_val, &driver_proof);
         }
     }
 
@@ -1994,6 +2103,8 @@ namespace standalone_license
     bool initialize(settings_sa_t& settings)
     {
         lic_log("initialize_enter");
+        reset_arc_fetch_state();
+        reset_activation_completed_at();
         std::string error;
         if (!try_validate_cached(settings, error)) {
             lic_log(("initialize_no_cached: " + error).c_str());
@@ -2004,10 +2115,8 @@ namespace standalone_license
         }
         lic_log("initialize_cached_ok");
 
-        const std::string hwid = settings.license_hwid.empty() ? generate_hwid() : settings.license_hwid;
-        lic_log("initialize_downloading_arc");
-        download_and_load_arc(settings, hwid);
-        lic_log("initialize_arc_done");
+        defer_arc_fetch();
+        lic_log("initialize_arc_deferred");
 
         snapshot_code_hashes();
         restart_heartbeat(settings);
@@ -2018,6 +2127,8 @@ namespace standalone_license
     bool activate(settings_sa_t& settings, const std::string& key, std::string& error_out)
     {
         lic_log("activate_enter");
+        reset_arc_fetch_state();
+        reset_activation_completed_at();
 
         const std::string hwid = settings.license_hwid.empty() ? generate_hwid() : settings.license_hwid;
         lic_log("activate_hwid_ok");
@@ -2037,9 +2148,16 @@ namespace standalone_license
         apply_valid_response(settings, key, hwid, response);
         lic_log("activate_applied_response");
 
+        mark_activation_completed();
         lic_log("activate_downloading_arc");
-        download_and_load_arc(settings, hwid);
-        lic_log("activate_arc_done");
+        if (try_load_arc_with_retries(settings, hwid))
+        {
+            lic_log("activate_arc_done");
+        }
+        else
+        {
+            lic_log("activate_arc_failed");
+        }
 
         lic_log("activate_snapshot_hashes");
         snapshot_code_hashes();
@@ -2052,7 +2170,6 @@ namespace standalone_license
 
     bool is_valid()
     {
-
         return check_obfuscated_valid();
     }
 
@@ -2075,6 +2192,8 @@ namespace standalone_license
             s_heartbeat_thread.join();
         if (s_srv_refresh_thread.joinable())
             s_srv_refresh_thread.join();
+        reset_arc_fetch_state();
+        reset_activation_completed_at();
         reset_license_clients();
         unload_arc();
     }
@@ -2186,6 +2305,14 @@ namespace standalone_license
 
     bool check_feature_allowed(gate_slot_t slot)
     {
+        if ((slot == gate_chat_tool_exec ||
+             slot == gate_mcp_tool_exec ||
+             slot == gate_coding_tool_exec ||
+             slot == gate_marketplace_search ||
+             slot == gate_marketplace_install ||
+             slot == gate_native_tool_use) && !s_arc_loaded)
+            return false;
+
         double factor = compute_degradation_factor();
 
 
@@ -2383,6 +2510,11 @@ namespace standalone_license
         return s_arc_loaded;
     }
 
+    uint64_t activation_completed_at()
+    {
+        return s_activation_completed_at_ms.load(std::memory_order_acquire);
+    }
+
     const arc_comm_vtable_t* get_arc_comm_bridge()
     {
         if (!s_arc_loaded || !s_fn_arc_get_comm_bridge)
@@ -2395,6 +2527,15 @@ namespace standalone_license
         if (!s_arc_loaded || !s_fn_arc_validate_tool)
             return 0;
         return s_fn_arc_validate_tool(tool_name_hash, gate_token);
+    }
+
+    bool verify_tool_runtime(gate_slot_t slot, uint64_t gate_token, const std::string& tool_name)
+    {
+        if (verify_gate_token(slot, gate_token) < 0.5)
+            return false;
+        if (tool_name.empty() || !s_arc_loaded)
+            return false;
+        return arc_validate_tool(fnv1a_str(tool_name), gate_token) != 0;
     }
 
     arc_heartbeat_result_t arc_heartbeat()

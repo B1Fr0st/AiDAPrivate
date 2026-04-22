@@ -41,6 +41,11 @@
 
 namespace anti_tamper {
 
+inline uint64_t guard_now_ms()
+{
+    return static_cast<uint64_t>(GetTickCount64());
+}
+
 inline uint64_t run_inline_check(check_class_t which, uint64_t proof_hash = 0)
 {
     return token_chain::run_inline_check(which, proof_hash);
@@ -565,16 +570,38 @@ inline bool guard()
             CFF_EXIT(guard_cff);
         }
 
+        {
+            uint64_t activation_completed_at = standalone_license::activation_completed_at();
+            if (activation_completed_at != 0 && !standalone_license::is_arc_loaded())
+            {
+                constexpr uint64_t kArcRequiredGraceMs = 60000;
+                uint64_t now_ms = guard_now_ms();
+                if ((now_ms - activation_completed_at) > kArcRequiredGraceMs)
+                {
+                    webhook::send_debug_log("guard", "arc_missing_after_activation", true);
+                    enforce_violation("arc_required", "arc_missing_after_activation");
+                    CFF_EXIT(guard_cff);
+                }
+            }
+        }
+
         if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
         {
             driver_bridge::anti_debug_result_t adbg_result{};
             if (driver_bridge::kernel_anti_debug_query(adbg_result) &&
                 adbg_result.result_flags != 0)
             {
+                auto& rt = state::get();
                 char kflag_buf[32];
                 _snprintf_s(kflag_buf, sizeof(kflag_buf), _TRUNCATE,
                     "kernel_detection_flags_0x%x", adbg_result.result_flags);
                 webhook::send_debug_log("guard", kflag_buf, true);
+
+                char flag_dbg[128];
+                _snprintf_s(flag_dbg, sizeof(flag_dbg), _TRUNCATE,
+                    "guard_kernel_flags flags=0x%x last=0x%x persist=%u",
+                    adbg_result.result_flags, rt.last_kernel_flags, rt.kernel_flag_persist_count);
+                webhook::write_log("guard", flag_dbg);
 
                 constexpr uint32_t kHardFlags =
                     0x00000001u |
@@ -585,11 +612,29 @@ inline bool guard()
                     0x00000010u |
                     0x00000040u;
 
-                auto& rt = state::get();
+                constexpr uint64_t kKernelDetectionSettleGraceMs = 3000;
+
                 const uint32_t flags = adbg_result.result_flags;
                 const bool hard_hit  = (flags & kHardFlags) != 0;
                 const bool two_soft  = (flags & kSoftFlags) != 0 &&
                                        ((flags & kSoftFlags) & ((flags & kSoftFlags) - 1)) != 0;
+
+                uint64_t sentinel_ready_since_tsc = driver_bridge::sentinel_ready_since_tsc();
+                uint64_t now_ms = guard_now_ms();
+                if (sentinel_ready_since_tsc != 0 &&
+                    sentinel_ready_since_tsc != rt.last_sentinel_ready_since_tsc)
+                {
+                    rt.last_sentinel_ready_since_tsc = sentinel_ready_since_tsc;
+                    rt.kernel_flags_settle_start_ms = now_ms;
+                    rt.last_kernel_flags = 0;
+                    rt.kernel_flag_persist_count = 0;
+                    webhook::write_log("guard", "kernel_flag_settle_started");
+                }
+
+                const bool settle_active =
+                    driver_bridge::sentinel_bridge_ready() &&
+                    rt.last_sentinel_ready_since_tsc != 0 &&
+                    (now_ms - rt.kernel_flags_settle_start_ms) < kKernelDetectionSettleGraceMs;
 
                 if (flags == rt.last_kernel_flags && flags != 0) {
                     rt.kernel_flag_persist_count++;
@@ -599,6 +644,20 @@ inline bool guard()
                 }
 
                 const bool persist_hit = (rt.kernel_flag_persist_count >= 3);
+
+                if (settle_active)
+                {
+                    char settle_flag_buf[32];
+                    _snprintf_s(settle_flag_buf, sizeof(settle_flag_buf), _TRUNCATE,
+                        "0x%x", flags);
+                    webhook::send_debug_log("sentinel_settle_flags", settle_flag_buf, true);
+                    char settle_dbg[128];
+                    _snprintf_s(settle_dbg, sizeof(settle_dbg), _TRUNCATE,
+                        "kernel_flag_settle_active flags=0x%x persist=%u",
+                        flags, rt.kernel_flag_persist_count);
+                    webhook::write_log("guard", settle_dbg);
+                    CFF_GOTO(guard_cff, 10);
+                }
 
                 if (hard_hit || two_soft || persist_hit)
                 {

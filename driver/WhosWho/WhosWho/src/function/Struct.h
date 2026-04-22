@@ -107,8 +107,10 @@ typedef struct _HB {
     UINT32 session_key;
     UINT64 timestamp;
     UINT64 response;
+    UINT64 whoswho_tsc;
+    UINT64 sentinel_tsc;
 } heartbeat, * p_heartbeat;
-static_assert(sizeof(heartbeat) == 24, "heartbeat size must be 24 bytes");
+static_assert(sizeof(heartbeat) == 40, "heartbeat size must be 40 bytes");
 
 
 typedef struct _TCTX {

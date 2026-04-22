@@ -140,8 +140,10 @@ namespace voyager {
             std::uint32_t session_key;
             std::uint64_t timestamp;
             std::uint64_t response;
+            std::uint64_t whoswho_tsc;
+            std::uint64_t sentinel_tsc;
         };
-        static_assert(sizeof(heartbeat_request) == 24, "heartbeat_request size mismatch with kernel driver");
+        static_assert(sizeof(heartbeat_request) == 40, "heartbeat_request size mismatch with kernel driver");
 
         struct dtb_solve {
             std::uint32_t pid;
@@ -1097,6 +1099,8 @@ namespace voyager {
 
         bool send_heartbeat() noexcept;
         bool refresh_heartbeat() noexcept;
+        [[nodiscard]] bool sentinel_bridge_ready() const noexcept { return last_bridge_sentinel_tsc_ != 0; }
+        [[nodiscard]] std::uint64_t sentinel_ready_since_tsc() const noexcept { return first_sentinel_ready_tsc_; }
 
         std::uint32_t find_process(const char* process_name) noexcept;
         std::uint64_t find_image() noexcept;
@@ -1522,6 +1526,9 @@ namespace voyager {
         std::uint64_t spoof_gadget_ = 0;
         std::uint32_t session_key_ = 0;
         mutable std::uint64_t last_heartbeat_tsc_ = 0;
+        mutable std::uint64_t last_bridge_whoswho_tsc_ = 0;
+        mutable std::uint64_t last_bridge_sentinel_tsc_ = 0;
+        mutable std::uint64_t first_sentinel_ready_tsc_ = 0;
         DWORD last_failed_tid_ = 0;
         DWORD last_hijacked_tid_ = 0;
         DWORD last_connect_error_ = 0;

@@ -377,6 +377,8 @@ namespace driver_bridge
 
     bool spoof_debug_flags(uint32_t* result_flags = nullptr);
     bool refresh_heartbeat();
+    bool sentinel_bridge_ready();
+    uint64_t sentinel_ready_since_tsc();
 
     bool register_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size, uint64_t expected_hash, uint32_t check_interval_ms = 2000);
     bool query_dll_protection(dll_protect_status_t& out);

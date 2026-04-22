@@ -101,8 +101,10 @@ namespace standalone_license
 
 
     bool is_arc_loaded();
+    uint64_t activation_completed_at();
     const arc_comm_vtable_t* get_arc_comm_bridge();
     uint64_t arc_validate_tool(uint64_t tool_name_hash, uint64_t gate_token);
+    bool verify_tool_runtime(gate_slot_t slot, uint64_t gate_token, const std::string& tool_name);
     arc_heartbeat_result_t arc_heartbeat();
     uint64_t get_server_nonce_hash();
     std::string get_session_token();

@@ -670,8 +670,8 @@ void run_agentic(std::string user_message,
                 {
                     uint64_t gate = standalone_license::inline_gate_check(
                         standalone_license::gate_chat_tool_exec);
-                    if (standalone_license::verify_gate_token(
-                            standalone_license::gate_chat_tool_exec, gate) < 0.5) {
+                    if (!standalone_license::verify_tool_runtime(
+                            standalone_license::gate_chat_tool_exec, gate, tc.name)) {
                         tool_results += "\n<tool_result name=\"" + tc.name + "\">\nService unavailable.\n</tool_result>\n";
                         continue;
                     }
@@ -877,8 +877,8 @@ void run_agentic(std::string user_message,
             {
                 uint64_t gate = standalone_license::inline_gate_check(
                     standalone_license::gate_chat_tool_exec);
-                if (standalone_license::verify_gate_token(
-                        standalone_license::gate_chat_tool_exec, gate) < 0.5) {
+                if (!standalone_license::verify_tool_runtime(
+                        standalone_license::gate_chat_tool_exec, gate, tc.name)) {
                     tool_result_content.push_back(
                         standalone_ai_client_t::make_tool_result_block(tc.id, "Service unavailable.", true));
                     continue;

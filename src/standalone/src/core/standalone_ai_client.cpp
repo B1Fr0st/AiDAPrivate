@@ -1268,7 +1268,8 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools(
     {
         uint64_t gt = standalone_license::inline_gate_check(
             standalone_license::gate_native_tool_use);
-        if (gt == 0) {
+        if (!standalone_license::verify_tool_runtime(
+                standalone_license::gate_native_tool_use, gt, "native_tool_use")) {
             result.is_error = true;
             result.text = "Error: License gate blocked native tool use.";
             return result;
@@ -1305,7 +1306,8 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
     {
         uint64_t gt = standalone_license::inline_gate_check(
             standalone_license::gate_native_tool_use);
-        if (gt == 0) {
+        if (!standalone_license::verify_tool_runtime(
+                standalone_license::gate_native_tool_use, gt, "native_tool_use")) {
             result.is_error = true;
             result.text = "Error: License gate blocked native tool use.";
             return result;

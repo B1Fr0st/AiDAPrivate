@@ -1687,6 +1687,34 @@ namespace driver_bridge
         return device->refresh_heartbeat();
     }
 
+    bool sentinel_bridge_ready()
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode)
+            return false;
+
+        device->refresh_heartbeat();
+        return device->sentinel_bridge_ready();
+    }
+
+    uint64_t sentinel_ready_since_tsc()
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode)
+            return 0;
+
+        device->refresh_heartbeat();
+        return device->sentinel_ready_since_tsc();
+    }
+
     bool register_dll_protection(uint64_t module_base, uint64_t text_va, uint32_t text_size,
                                  uint64_t expected_hash, uint32_t check_interval_ms)
     {

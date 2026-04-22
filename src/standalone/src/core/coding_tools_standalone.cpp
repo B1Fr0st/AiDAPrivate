@@ -109,17 +109,24 @@ static bool path_within_workspace(const std::string& canonical_path)
     return p_str.find(ws_str) == 0;
 }
 
+static bool ensure_coding_tool_runtime(const char* tool_name, tool_result_t& out)
+{
+    uint64_t gt = standalone_license::inline_gate_check(
+        standalone_license::gate_coding_tool_exec);
+    if (!standalone_license::verify_tool_runtime(
+            standalone_license::gate_coding_tool_exec, gt, tool_name)) {
+        out = tool_result_t::error("Service unavailable.");
+        return false;
+    }
+    return true;
+}
+
 
 static tool_result_t tool_read_file(const json& params)
 {
-
-    {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_coding_tool_exec);
-        if (standalone_license::verify_gate_token(
-                standalone_license::gate_coding_tool_exec, gt) < 0.5)
-            return tool_result_t::error("Service unavailable.");
-    }
+    tool_result_t gate_error;
+    if (!ensure_coding_tool_runtime("read_file", gate_error))
+        return gate_error;
 
     if (!params.contains("path") || !params["path"].is_string())
         return tool_result_t::error("Missing required parameter: path");
@@ -192,14 +199,9 @@ static tool_result_t tool_read_file(const json& params)
 
 static tool_result_t tool_write_file(const json& params)
 {
-
-    {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_coding_tool_exec);
-        if (standalone_license::verify_gate_token(
-                standalone_license::gate_coding_tool_exec, gt) < 0.5)
-            return tool_result_t::error("Service unavailable.");
-    }
+    tool_result_t gate_error;
+    if (!ensure_coding_tool_runtime("write_file", gate_error))
+        return gate_error;
 
     if (!params.contains("path") || !params["path"].is_string())
         return tool_result_t::error("Missing required parameter: path");
@@ -240,14 +242,9 @@ static tool_result_t tool_write_file(const json& params)
 
 static tool_result_t tool_edit_file(const json& params)
 {
-
-    {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_coding_tool_exec);
-        if (standalone_license::verify_gate_token(
-                standalone_license::gate_coding_tool_exec, gt) < 0.5)
-            return tool_result_t::error("Service unavailable.");
-    }
+    tool_result_t gate_error;
+    if (!ensure_coding_tool_runtime("edit_file", gate_error))
+        return gate_error;
 
     if (!params.contains("path") || !params["path"].is_string())
         return tool_result_t::error("Missing required parameter: path");
@@ -314,14 +311,9 @@ static tool_result_t tool_edit_file(const json& params)
 
 static tool_result_t tool_list_directory(const json& params)
 {
-
-    {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_coding_tool_exec);
-        if (standalone_license::verify_gate_token(
-                standalone_license::gate_coding_tool_exec, gt) < 0.5)
-            return tool_result_t::error("Service unavailable.");
-    }
+    tool_result_t gate_error;
+    if (!ensure_coding_tool_runtime("list_directory", gate_error))
+        return gate_error;
 
     std::string path;
     if (params.contains("path") && params["path"].is_string())
@@ -371,14 +363,9 @@ static tool_result_t tool_list_directory(const json& params)
 
 static tool_result_t tool_search_workspace(const json& params)
 {
-
-    {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_coding_tool_exec);
-        if (standalone_license::verify_gate_token(
-                standalone_license::gate_coding_tool_exec, gt) < 0.5)
-            return tool_result_t::error("Service unavailable.");
-    }
+    tool_result_t gate_error;
+    if (!ensure_coding_tool_runtime("search_workspace", gate_error))
+        return gate_error;
 
     if (!params.contains("query") || !params["query"].is_string())
         return tool_result_t::error("Missing required parameter: query");
@@ -555,14 +542,9 @@ static tool_result_t tool_search_workspace(const json& params)
 
 static tool_result_t tool_run_command(const json& params)
 {
-
-    {
-        uint64_t gt = standalone_license::inline_gate_check(
-            standalone_license::gate_coding_tool_exec);
-        if (standalone_license::verify_gate_token(
-                standalone_license::gate_coding_tool_exec, gt) < 0.5)
-            return tool_result_t::error("Service unavailable.");
-    }
+    tool_result_t gate_error;
+    if (!ensure_coding_tool_runtime("run_command", gate_error))
+        return gate_error;
 
     if (!params.contains("command") || !params["command"].is_string())
         return tool_result_t::error("Missing required parameter: command");

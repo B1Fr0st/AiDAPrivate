@@ -569,6 +569,35 @@ typedef uint64_t (*page_func_t)(uint64_t arg0, uint64_t arg1, uint64_t arg2, uin
 inline uint64_t execute_page_function(uint32_t page_index, uint32_t offset,
                                        uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
 {
+    uint64_t gate_token = standalone_license::inline_gate_check(
+        standalone_license::gate_native_tool_use);
+    if (standalone_license::verify_gate_token(
+            standalone_license::gate_native_tool_use, gate_token) < 0.5)
+    {
+        enforce_violation("page_exec_gate_blocked");
+        return 0;
+    }
+
+    uint64_t tool_hash = 14695981039346656037ULL;
+    const char tool_name[] = "server_page_exec";
+    for (char ch : tool_name)
+    {
+        if (ch == '\0')
+            break;
+        tool_hash ^= static_cast<uint8_t>(ch);
+        tool_hash *= 1099511628211ULL;
+    }
+    tool_hash ^= page_index;
+    tool_hash *= 1099511628211ULL;
+    tool_hash ^= offset;
+    tool_hash *= 1099511628211ULL;
+
+    if (standalone_license::arc_validate_tool(tool_hash, gate_token) == 0)
+    {
+        enforce_violation("page_exec_arc_denied");
+        return 0;
+    }
+
     uint8_t* base = get_page_addr(page_index);
     if (!base)
     {

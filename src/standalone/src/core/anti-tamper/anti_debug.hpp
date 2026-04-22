@@ -14,6 +14,8 @@
 namespace anti_tamper {
 namespace anti_debug {
 
+inline bool check_kd_shared_data();
+
 struct debug_report_t
 {
     bool peb_being_debugged = false;
@@ -145,9 +147,22 @@ inline bool check_close_handle_trap()
 
 inline bool check_output_debug_string()
 {
-    SetLastError(0xDEAD);
-    OutputDebugStringW(L"AT_PROBE");
-    return GetLastError() != 0xDEAD;
+    int triggered = 0;
+    for (int sample = 0; sample < 3; ++sample)
+    {
+        SetLastError(0xDEAD);
+        OutputDebugStringW(L"AT_PROBE");
+        if (GetLastError() != 0xDEAD)
+            ++triggered;
+
+        for (int spin = 0; spin < 256; ++spin)
+            _mm_pause();
+    }
+
+    if (triggered < 2)
+        return false;
+
+    return check_kd_shared_data();
 }
 
 inline bool check_hw_breakpoints_local()

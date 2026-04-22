@@ -197,6 +197,9 @@ void voyager::device_t::disconnect() noexcept {
     kernel_dtb_ = 0;
     session_key_ = 0;
     last_heartbeat_tsc_ = 0;
+    last_bridge_whoswho_tsc_ = 0;
+    last_bridge_sentinel_tsc_ = 0;
+    first_sentinel_ready_tsc_ = 0;
 }
 
 void voyager::device_t::clear_process_context() noexcept {
@@ -298,6 +301,10 @@ bool voyager::device_t::send_heartbeat() noexcept {
 
     if (result && bytes_returned >= sizeof(hb) && hb.response != 0) {
         last_heartbeat_tsc_ = __rdtsc();
+        last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
+        last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
+        if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
+            first_sentinel_ready_tsc_ = hb.sentinel_tsc;
         return true;
     }
 
@@ -1541,6 +1548,10 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
 
             if (hb_result && hb_bytes >= sizeof(hb) && hb.response != 0) {
                 last_heartbeat_tsc_ = __rdtsc();
+                last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
+                last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
+                if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
+                    first_sentinel_ready_tsc_ = hb.sentinel_tsc;
             }
         }
     }

@@ -69,6 +69,8 @@ struct runtime_t
     uint32_t veh_baseline_count = 0;
     std::atomic<bool> veh_baseline_captured{false};
     std::atomic<bool> self_job_active{false};
+    uint64_t last_sentinel_ready_since_tsc = 0;
+    uint64_t kernel_flags_settle_start_ms = 0;
     uint32_t last_kernel_flags = 0;
     uint32_t kernel_flag_persist_count = 0;
 };

@@ -934,6 +934,8 @@ namespace dispatcher {
                             _InterlockedIncrement((volatile LONG*)&g_heartbeat_counter);
                             sentinel_bridge::tick();
                             _InterlockedExchange(&g_driver_activated, 1);
+                            hb->whoswho_tsc = (UINT64)sentinel_bridge::g_bridge.whoswho_tsc;
+                            hb->sentinel_tsc = (UINT64)sentinel_bridge::g_bridge.sentinel_tsc;
 
                             if (existing_key == 0) {
                                 WW_LOG("HB: first heartbeat, registering client, counter=%ld",
@@ -961,12 +963,16 @@ namespace dispatcher {
                             WW_LOG("HB: ACCESS_DENIED existing_key=0x%lx hb_key=0x%lx",
                                 (ULONG)existing_key, hb->session_key);
                             hb->response = 0;
+                            hb->whoswho_tsc = 0;
+                            hb->sentinel_tsc = 0;
                             status = STATUS_ACCESS_DENIED;
                         }
                     }
                 } else {
                     WW_LOG("HB: INVALID_PARAMETER magic mismatch");
                     hb->response = 0;
+                    hb->whoswho_tsc = 0;
+                    hb->sentinel_tsc = 0;
                     status = STATUS_INVALID_PARAMETER;
                 }
                 bytes = sizeof(_HB);
