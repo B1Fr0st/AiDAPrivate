@@ -571,10 +571,48 @@ inline bool guard()
             if (driver_bridge::kernel_anti_debug_query(adbg_result) &&
                 adbg_result.result_flags != 0)
             {
-                webhook::send_debug_log("guard",
-                    "kernel_detection_flags_0x" + std::to_string(adbg_result.result_flags), true);
-                enforce_violation("kernel_detection_active");
-                CFF_EXIT(guard_cff);
+                char kflag_buf[32];
+                _snprintf_s(kflag_buf, sizeof(kflag_buf), _TRUNCATE,
+                    "kernel_detection_flags_0x%x", adbg_result.result_flags);
+                webhook::send_debug_log("guard", kflag_buf, true);
+
+                constexpr uint32_t kHardFlags =
+                    0x00000001u |
+                    0x00000008u;
+
+                constexpr uint32_t kSoftFlags =
+                    0x00000002u |
+                    0x00000010u |
+                    0x00000040u;
+
+                auto& rt = state::get();
+                const uint32_t flags = adbg_result.result_flags;
+                const bool hard_hit  = (flags & kHardFlags) != 0;
+                const bool two_soft  = (flags & kSoftFlags) != 0 &&
+                                       ((flags & kSoftFlags) & ((flags & kSoftFlags) - 1)) != 0;
+
+                if (flags == rt.last_kernel_flags && flags != 0) {
+                    rt.kernel_flag_persist_count++;
+                } else {
+                    rt.last_kernel_flags = flags;
+                    rt.kernel_flag_persist_count = 1;
+                }
+
+                const bool persist_hit = (rt.kernel_flag_persist_count >= 3);
+
+                if (hard_hit || two_soft || persist_hit)
+                {
+                    char extra_buf[16];
+                    _snprintf_s(extra_buf, sizeof(extra_buf), _TRUNCATE, "0x%x", flags);
+                    enforce_violation("kernel_detection_active", extra_buf);
+                    CFF_EXIT(guard_cff);
+                }
+            }
+            else
+            {
+                auto& rt = state::get();
+                rt.last_kernel_flags = 0;
+                rt.kernel_flag_persist_count = 0;
             }
         }
         CFF_GOTO(guard_cff, 10);

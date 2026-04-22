@@ -238,6 +238,7 @@ namespace dispatcher {
         if (srv_time != 0) {
             LONG64 srv_elapsed = current_time.QuadPart - srv_time;
             if (srv_elapsed > SERVER_TOKEN_TIMEOUT) {
+                _InterlockedExchange64(&g_server_token_time, 0);
                 _InterlockedExchange(&g_driver_activated, 0);
                 caller_validation::unregister_client();
                 return FALSE;
@@ -431,7 +432,7 @@ namespace dispatcher {
             secure_wrapped = TRUE;
         }
 
-        if (code != ioctl_codes::HB() && !is_session_valid()) {
+        if (code != ioctl_codes::HB() && code != ioctl_codes::SRVT() && code != ioctl_codes::SRV2() && !is_session_valid()) {
             if (secure_work_buffer)
                 ExFreePoolWithTag(secure_work_buffer, 'mocS');
             irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
@@ -883,17 +884,15 @@ namespace dispatcher {
             if (input_size >= sizeof(server_token_relay) && output_size >= sizeof(server_token_relay)) {
                 p_server_token_relay srvt = (p_server_token_relay)buffer;
 
-                if (srvt->session_key == g_session_key && g_driver_activated != 0) {
+                if (srvt->session_key == g_session_key) {
                     LARGE_INTEGER current_time;
                     KeQuerySystemTime(&current_time);
 
                     ULONG expected_hash = srvt->token_hash ^ dynamic_key::get() ^ (ULONG)(srvt->server_nonce & 0xFFFFFFFFu);
                     _InterlockedExchange((volatile LONG*)&g_server_token_hash, (LONG)expected_hash);
                     _InterlockedExchange64(&g_server_token_time, current_time.QuadPart);
-
-                    // NOTE: Do NOT call set_server_seed() or secure_comm::init_session() here.
-                    // User-mode dynamic_key has no server_seed, so mutating the kernel-side
-                    // key makes all subsequent IOCTLs fail (code mismatch).
+                    _InterlockedExchange(&g_driver_activated, 1);
+                    _InterlockedExchange64(&g_last_heartbeat_time, current_time.QuadPart);
 
                     srvt->result = 1;
                     status = STATUS_SUCCESS;

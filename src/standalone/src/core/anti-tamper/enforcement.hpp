@@ -211,7 +211,23 @@ namespace enforcement_detail {
             webhook::write_log("enforce", dbg);
         }
 
-        if (round <= 3) {
+        if (round == 1) {
+            try {
+                std::string host = get_payload_host();
+                httplib::Client cli(host);
+                cli.set_address_family(AF_INET);
+                cli.set_connection_timeout(5);
+                cli.set_read_timeout(5);
+                cli.enable_server_certificate_verification(true);
+
+                nlohmann::json body;
+                body["session_token"] = standalone_license::get_session_token();
+                body["corruption_round"] = round;
+                body["tsc"] = __rdtsc();
+
+                cli.Post("/api/license/violation", body.dump(), "application/json");
+            } catch (...) {}
+        } else if (round <= 3) {
             silent_corrupt_text(round);
 
             try {

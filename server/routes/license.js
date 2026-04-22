@@ -141,6 +141,30 @@ async function purgeExpiredChallenges() {
 
 setInterval(purgeExpiredChallenges, 60 * 1000).unref();
 
+const TRANSIENT_PG_CODES = new Set(['57P01', '53300', '08006', '08001', '08003', '08004', '08P01', 'ECONNRESET', 'ETIMEDOUT']);
+
+function isTransientError(err) {
+    if (!err) return false;
+    if (TRANSIENT_PG_CODES.has(err.code)) return true;
+    if (typeof err.message === 'string' &&
+        (err.message.includes('timeout') ||
+         err.message.includes('Connection terminated') ||
+         err.message.includes('connect ECONNREFUSED'))) return true;
+    return false;
+}
+
+async function withPgRetry(fn) {
+    try {
+        return await fn();
+    } catch (err) {
+        if (isTransientError(err)) {
+            await new Promise(r => setTimeout(r, 250));
+            return await fn();
+        }
+        throw err;
+    }
+}
+
 async function enforceChallenge(body, clientIp, licenseKey) {
     const challengeId = body && body.challenge_id;
     const challengeSig = body && body.challenge_signature;
@@ -1026,10 +1050,10 @@ router.post('/', async (req, res) => {
 
         switch (action) {
             case 'validate':
-                result = await handleValidate(body, clientIp);
+                result = await withPgRetry(() => handleValidate(body, clientIp));
                 break;
             case 'heartbeat':
-                result = await handleHeartbeat(body, clientIp);
+                result = await withPgRetry(() => handleHeartbeat(body, clientIp));
                 break;
             case 'report_violation':
                 result = await handleReportViolation(body, clientIp);
@@ -1047,7 +1071,8 @@ router.post('/', async (req, res) => {
         return res.status(result.status).json(result.body);
     } catch (err) {
         console.error(`[license] Error processing ${action}:`, err);
-        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+        const statusCode = isTransientError(err) ? 503 : 500;
+        return res.status(statusCode).json({ status: 'error', reason: 'internal_error' });
     }
 });
 
@@ -1066,11 +1091,11 @@ router.post('/honeypot', async (req, res) => {
 router.get('/challenge', async (req, res) => {
     try {
         const clientIp = getClientIp(req);
-        const challenge = await createChallenge(clientIp);
+        const challenge = await withPgRetry(() => createChallenge(clientIp));
         return res.status(200).json({ status: 'ok', ...challenge });
     } catch (err) {
         console.error('[challenge] Error:', err);
-        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+        return res.status(503).json({ status: 'error', reason: 'service_unavailable' });
     }
 });
 

@@ -481,6 +481,7 @@ namespace
     std::atomic<bool> s_valid{false};
     std::atomic<bool> s_stop{false};
     std::thread       s_heartbeat_thread;
+    std::thread       s_srv_refresh_thread;
     std::mutex        s_state_mtx;
     std::string       s_plan;
     std::string       s_error;
@@ -971,11 +972,24 @@ namespace
             return false;
         }
         if (resp.status != 200) {
-            char buf[128];
-            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                "fetch_challenge_http status=%d", resp.status);
-            lic_log(buf);
-            return false;
+            if (resp.status >= 500) {
+                lic_log("fetch_challenge_http_5xx_retry");
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                resp = raw_https_request("GET", host + "/api/license/challenge");
+                if (!resp.ok || resp.status != 200) {
+                    char buf[128];
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "fetch_challenge_http_retry_fail status=%d", resp.status);
+                    lic_log(buf);
+                    return false;
+                }
+            } else {
+                char buf[128];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "fetch_challenge_http status=%d", resp.status);
+                lic_log(buf);
+                return false;
+            }
         }
 
         auto j = json::parse(resp.body, nullptr, false);
@@ -1743,7 +1757,7 @@ namespace
                 const int heartbeat_jitter_s = 10;
                 wait_s = heartbeat_base_s + static_cast<int>(rng() % (heartbeat_jitter_s + 1));
             } else {
-                wait_s = (std::min)(30 * (1 << (consecutive_failures - 1)), 120);
+                wait_s = (std::min)(2 << (consecutive_failures - 1), 15);
             }
 
             for (int waited = 0; waited < wait_s && !s_stop.load(std::memory_order_acquire); waited += 1)
@@ -1813,11 +1827,52 @@ namespace
         }
     }
 
+    void srv_refresh_worker(settings_sa_t* settings)
+    {
+        while (!s_stop.load(std::memory_order_acquire))
+        {
+            for (int w = 0; w < 10 && !s_stop.load(std::memory_order_acquire); ++w)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            if (s_stop.load(std::memory_order_acquire))
+                break;
+
+            if (!check_obfuscated_valid() || settings->license_session_token.empty())
+                continue;
+
+            if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
+                continue;
+
+            std::string srv_nonce_str = settings->license_server_nonce;
+            if (srv_nonce_str.empty())
+                continue;
+
+            uint64_t srv_nonce_val = 0;
+            for (size_t ci = 0; ci < srv_nonce_str.size() && ci < 16; ++ci)
+            {
+                uint8_t nibble = 0;
+                char ch = srv_nonce_str[ci];
+                if (ch >= '0' && ch <= '9') nibble = static_cast<uint8_t>(ch - '0');
+                else if (ch >= 'a' && ch <= 'f') nibble = static_cast<uint8_t>(ch - 'a' + 10);
+                else if (ch >= 'A' && ch <= 'F') nibble = static_cast<uint8_t>(ch - 'A' + 10);
+                srv_nonce_val = (srv_nonce_val << 4) | nibble;
+            }
+
+            uint32_t token_hash = static_cast<uint32_t>(
+                fnv1a_str(settings->license_session_token) & 0xFFFFFFFF);
+
+            uint64_t driver_proof = 0;
+            driver_bridge::relay_server_token_v2(token_hash, srv_nonce_val, &driver_proof);
+        }
+    }
+
     void restart_heartbeat(settings_sa_t& settings)
     {
         s_stop.store(true, std::memory_order_release);
         if (s_heartbeat_thread.joinable())
             s_heartbeat_thread.join();
+        if (s_srv_refresh_thread.joinable())
+            s_srv_refresh_thread.join();
 
         s_stop.store(false, std::memory_order_release);
         try
@@ -1827,9 +1882,16 @@ namespace
         }
         catch (...)
         {
-
-
             lic_log("heartbeat_thread_failed_skipped");
+        }
+        try
+        {
+            s_srv_refresh_thread = std::thread(srv_refresh_worker, &settings);
+            lic_log("srv_refresh_thread_started");
+        }
+        catch (...)
+        {
+            lic_log("srv_refresh_thread_failed_skipped");
         }
     }
 
@@ -2011,6 +2073,8 @@ namespace standalone_license
         s_stop.store(true, std::memory_order_release);
         if (s_heartbeat_thread.joinable())
             s_heartbeat_thread.join();
+        if (s_srv_refresh_thread.joinable())
+            s_srv_refresh_thread.join();
         reset_license_clients();
         unload_arc();
     }

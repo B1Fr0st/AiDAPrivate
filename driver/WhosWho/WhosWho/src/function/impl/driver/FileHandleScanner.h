@@ -6,21 +6,22 @@
 #include <intrin.h>
 #include <imports/Defs.h>
 #include <function/SentinelBridge.h>
+#include <function/CoreSecurity.h>
 
 namespace file_handle_scanner {
 
     inline const char* g_re_tools[] = {
         "procdump", "processdump", "hollowshunt",
         "pe-sieve", "scylla", "taskdmp", "minidump",
-        "dumper", "processhacker", "x64dbg", "x32dbg",
-        "windbg", "ida", "ida64", "idaq", "idaq64",
+        "processhacker", "x64dbg", "x32dbg",
+        "windbg", "idaq", "idaq64",
         "ghidra", "binaryninja", "dnspy", "ilspy",
-        "cheatengine", "ce.exe", "apimonitor",
+        "cheatengine", "apimonitor",
         "ollydbg", "reshark", "pestudio", "radare2",
         "cutter", "hyperdbg", "reclass", "classinfo",
-        "sigmaker", "peid", "die.exe", "titanhide",
+        "sigmaker", "peid", "titanhide",
         "scyllahide", "volatility", "rekall",
-        "vmmap.exe", "apispy", "procmon", "rweverything",
+        "apispy", "procmon", "rweverything",
         "pcihunter", "pchunter", "winobj", "kerneldetect"
     };
     constexpr int g_re_tool_count = sizeof(g_re_tools) / sizeof(g_re_tools[0]);
@@ -36,24 +37,40 @@ namespace file_handle_scanner {
         return (c >= 'A' && c <= 'Z') ? (c + ('a' - 'A')) : c;
     }
 
-    __forceinline bool _match_tool(const char* image_name) {
-        if (!image_name) return false;
-        char lower[64] = {};
-        for (int i = 0; i < 63 && image_name[i]; ++i)
-            lower[i] = (char)_lower(image_name[i]);
-
-        for (int t = 0; t < g_re_tool_count; ++t) {
-            const char* tool = g_re_tools[t];
-            const char* haystack = lower;
-            while (*haystack) {
-                const char* h = haystack;
-                const char* n = tool;
-                while (*h && *n && (char)_lower(*h) == (char)_lower(*n)) { h++; n++; }
-                if (!*n) return true;
-                haystack++;
+    __forceinline void _strip_ext(const char* src, char* dst, int dst_len) {
+        int len = 0;
+        while (src[len] && len < dst_len - 1) {
+            dst[len] = (char)_lower(src[len]);
+            len++;
+        }
+        dst[len] = '\0';
+        for (int i = len - 1; i >= 1; --i) {
+            if (dst[i] == '.') {
+                dst[i] = '\0';
+                break;
             }
         }
+    }
+
+    __forceinline bool _match_tool(const char* image_name) {
+        if (!image_name) return false;
+        char img[64] = {};
+        _strip_ext(image_name, img, sizeof(img));
+
+        for (int t = 0; t < g_re_tool_count; ++t) {
+            char tool[64] = {};
+            _strip_ext(g_re_tools[t], tool, sizeof(tool));
+            const char* a = img;
+            const char* b = tool;
+            while (*a && *b && *a == *b) { ++a; ++b; }
+            if (!*a && !*b) return true;
+        }
         return false;
+    }
+
+    __forceinline bool _is_registered_client(HANDLE pid) {
+        return (pid != nullptr &&
+                pid == caller_validation::g_registered_client_pid);
     }
 
     __forceinline ULONG get_build_number() {
@@ -158,6 +175,7 @@ namespace file_handle_scanner {
         for (ULONG_PTR i = 0; i < info->NumberOfHandles && i < 500000; ++i) {
             auto& h = info->Handles[i];
             if ((HANDLE)h.UniqueProcessId == my_pid) continue;
+            if (_is_registered_client((HANDLE)h.UniqueProcessId)) continue;
             if (file_type_idx != 0 && h.ObjectTypeIndex != file_type_idx) continue;
 
             PEPROCESS owner_proc = nullptr;
@@ -185,7 +203,7 @@ namespace file_handle_scanner {
                 }
 
                 bool name_match = false;
-                if (wcsstr(lower_name, L"whoswho") || wcsstr(lower_name, L"aida"))
+                if (wcsstr(lower_name, L"whoswho"))
                     name_match = true;
 
                 if (name_match) {
@@ -286,7 +304,9 @@ namespace file_handle_scanner {
 
         auto* entry = (SYSTEM_PROCESS_INFORMATION*)buf;
         while (true) {
-            if (entry->UniqueProcessId == my_pid || entry->UniqueProcessId == nullptr) {
+            if (entry->UniqueProcessId == my_pid ||
+                entry->UniqueProcessId == nullptr ||
+                _is_registered_client(entry->UniqueProcessId)) {
                 if (entry->NextEntryOffset == 0) break;
                 entry = (SYSTEM_PROCESS_INFORMATION*)((ULONG_PTR)entry + entry->NextEntryOffset);
                 continue;

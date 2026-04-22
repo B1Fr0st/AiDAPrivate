@@ -124,16 +124,6 @@ namespace anti_debug {
                         vendor_id[8] == 't' && vendor_id[9] == ' ' &&
                         vendor_id[10] == 'H' && vendor_id[11] == 'v') {
 
-                        int features[4] = {};
-                        __cpuid(features, 0x40000003);
-                        constexpr UINT32 kExpected =
-                            (1u << 0) | (1u << 1) | (1u << 5);
-                        UINT32 priv = static_cast<UINT32>(features[0]);
-                        if ((priv & kExpected) != kExpected) {
-                            WW_LOG("check_hypervisor: MS Hv vendor string but missing partition privileges 0x%lx", priv);
-                            return TRUE;
-                        }
-
                         return FALSE;
                     }
 
@@ -214,7 +204,9 @@ namespace anti_debug {
 
     __forceinline BOOLEAN check_timing_attack() {
         __try {
-
+            if (KeGetCurrentIrql() > APC_LEVEL) {
+                return FALSE;
+            }
 
             BOOLEAN hvci_on = hvci_detect::is_hvci_enabled();
             UINT64 old_irql = 0;
@@ -224,7 +216,7 @@ namespace anti_debug {
             }
 
             constexpr UINT32 NUM_TRIALS = 3;
-            constexpr UINT64 TIMING_THRESHOLD = 2000000ULL;
+            constexpr UINT64 TIMING_THRESHOLD = 10000000ULL;
             UINT32 fail_count = 0;
 
             for (UINT32 trial = 0; trial < NUM_TRIALS; trial++) {
@@ -248,28 +240,7 @@ namespace anti_debug {
                 __writecr8(old_irql);
             }
 
-
-            if (fail_count >= 2) {
-                return TRUE;
-            }
-
-
-            UINT64 times[4];
-            for (int i = 0; i < 4; i++) {
-                UINT64 s = __rdtsc();
-                for (int j = 0; j < 8; j++) {
-                    YieldProcessor();
-                }
-                times[i] = __rdtsc() - s;
-            }
-
-            UINT64 variance = 0;
-            for (int i = 1; i < 4; i++) {
-                UINT64 diff = (times[i] > times[0]) ? (times[i] - times[0]) : (times[0] - times[i]);
-                variance += diff;
-            }
-
-            if (variance < 3 && times[0] > 500) {
+            if (fail_count == NUM_TRIALS) {
                 return TRUE;
             }
 

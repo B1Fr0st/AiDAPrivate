@@ -69,6 +69,8 @@ struct runtime_t
     uint32_t veh_baseline_count = 0;
     std::atomic<bool> veh_baseline_captured{false};
     std::atomic<bool> self_job_active{false};
+    uint32_t last_kernel_flags = 0;
+    uint32_t kernel_flag_persist_count = 0;
 };
 
 inline runtime_t& get()

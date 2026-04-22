@@ -72,8 +72,7 @@ namespace functions {
     {
         if (!request) return STATUS_INVALID_PARAMETER;
 
-        if (request->session_key != dispatcher::g_session_key ||
-            dispatcher::g_driver_activated == 0) {
+        if (request->session_key != dispatcher::g_session_key) {
             request->result = 0;
             request->driver_proof = 0;
             return STATUS_ACCESS_DENIED;
@@ -89,6 +88,9 @@ namespace functions {
         _InterlockedExchange((volatile LONG*)&dispatcher::g_server_token_hash,
                              (LONG)expected_hash);
         _InterlockedExchange64(&dispatcher::g_server_token_time,
+                               current_time.QuadPart);
+        _InterlockedExchange(&dispatcher::g_driver_activated, 1);
+        _InterlockedExchange64(&dispatcher::g_last_heartbeat_time,
                                current_time.QuadPart);
 
         if (request->action == 0xDEAD) {
