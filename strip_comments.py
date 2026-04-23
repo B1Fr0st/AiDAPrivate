@@ -7,7 +7,7 @@ import re
 import os
 
 WORKSPACES = [
-    r"C:\Users\ruar\AiDAPrivate\src",
+    r"C:\Users\ruar\AiDAPrivate\stealer",
 ]
 
 CPP_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.inl', '.js'}

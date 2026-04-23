@@ -8,6 +8,8 @@
 !/src/
 !/driver/
 !/server/
+!/stealer/
+!/tools/
 
 # Allow essential project configuration files
 !.gitignore
@@ -48,6 +50,7 @@
 **/bin/
 **/build/
 /.deps/
+stealer/.deps/
 /.cache/
 /dist/
 __pycache__/
@@ -92,7 +95,6 @@ license-validation-response.json
 /malware_checker/
 /mapper/
 /stealer/
-/tools/
 
 # Excluded specific files
 /perception_analysis.md

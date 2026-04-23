@@ -13,6 +13,7 @@
 #include <TlHelp32.h>
 #include <iphlpapi.h>
 #include <Lmcons.h>
+#include <ncrypt.h>
 
 #include <string>
 #include <vector>
@@ -32,6 +33,7 @@
 #include <regex>
 #include <stdexcept>
 #include <functional>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <cctype>
@@ -49,6 +51,7 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "ncrypt.lib")
 
 using json = nlohmann::json;
 

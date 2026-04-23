@@ -9,6 +9,7 @@
 #include <iphlpapi.h>
 #include <nlohmann/json.hpp>
 #include <iomanip>
+#include <algorithm>
 
 namespace {
     inline std::string GetVendorFromMAC(const BYTE* mac, DWORD len) {
@@ -21,12 +22,54 @@ namespace {
             {"00155D", "Microsoft Hyper-V"},
             {"080027", "Oracle VirtualBox"},
             {"000C29", "VMware (old)"},
-            {"001C42", "Intel Corporation"},
+            {"001C42", "Parallels"},
             {"D85ED4", "Raspberry Pi Trading Ltd."},
+
+            {"000569", "VMware vSphere"},
+            {"001C14", "VMware ESXi"},
+            {"005069", "VMware Player"},
+            {"0A0027", "VirtualBox (alt)"},
+            {"0003FF", "Microsoft Hyper-V (alt)"},
+            {"0021F6", "Microsoft Virtual PC"},
+            {"0050F2", "Microsoft Virtual"},
+            {"525400", "QEMU/KVM"},
+            {"00163E", "Xen HVM"},
+            {"000F4B", "Virtual Iron"},
         };
         auto it = ouiMap.find(oui);
         return it != ouiMap.end() ? it->second : std::string("Unknown (") + oui + ")";
     }
+
+
+    inline bool is_vm_mac(const std::string& mac) {
+
+        if (mac.size() < 8) return false;
+        std::string prefix = mac.substr(0, 8);
+        std::transform(prefix.begin(), prefix.end(), prefix.begin(), ::tolower);
+
+
+        const std::string vm_prefixes[] = {
+            xor("00:05:69"),
+            xor("00:0c:29"),
+            xor("00:1c:14"),
+            xor("00:50:56"),
+            xor("08:00:27"),
+            xor("0a:00:27"),
+            xor("00:03:ff"),
+            xor("00:15:5d"),
+            xor("00:21:f6"),
+            xor("00:50:f2"),
+            xor("52:54:00"),
+            xor("00:16:3e"),
+            xor("00:1c:42"),
+            xor("00:0f:4b"),
+        };
+        for (const auto& vp : vm_prefixes) {
+            if (prefix == vp) return true;
+        }
+        return false;
+    }
+
 
     inline bool IsVirtualAdapter(const BYTE* mac, DWORD len) {
         if (len < 3) return false;
@@ -34,7 +77,10 @@ namespace {
         sprintf_s(oui, "%02X%02X%02X", mac[0], mac[1], mac[2]);
         std::string s(oui);
         return s == "005056" || s == "00155D" || s == "080027" ||
-               s == "000C29" || s == "0050F2" || s == "0003FF";
+               s == "000C29" || s == "0050F2" || s == "0003FF" ||
+               s == "000569" || s == "001C14" || s == "005069" ||
+               s == "0A0027" || s == "525400" || s == "00163E" ||
+               s == "001C42" || s == "000F4B" || s == "0021F6";
     }
 }
 
@@ -119,8 +165,11 @@ public:
                 std::string mac = format_mac_address(pAdapter->Address, pAdapter->AddressLength);
                 std::string vendor = GetVendorFromMAC(pAdapter->Address, pAdapter->AddressLength);
                 bool isVirtual = IsVirtualAdapter(pAdapter->Address, pAdapter->AddressLength);
+                bool vmDetected = is_vm_mac(mac);
 
-                append_extra_info("  " + std::string(pAdapter->AdapterName));
+                std::string vm_tag = (isVirtual || vmDetected) ? " [VM]" : "";
+
+                append_extra_info("  " + std::string(pAdapter->AdapterName) + vm_tag);
                 append_extra_info("    MAC: " + mac);
                 append_extra_info("    Vendor: " + vendor);
                 append_extra_info("    Type: " + std::string(isVirtual ? "Virtual" : "Physical"));

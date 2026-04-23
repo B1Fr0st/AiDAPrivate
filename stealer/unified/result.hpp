@@ -16,9 +16,11 @@ struct Cookie {
 inline std::vector<Cookie> cookies;
 
 struct CreditCard {
+    std::string guid;
     std::string name;
     std::string expiration;
     std::string number;
+    std::string cvv;
     std::string city;
     std::string state;
     std::string zip;
@@ -72,6 +74,7 @@ inline std::string dump_results() {
         ss << "  " << card.name << "\n";
         ss << "    Expiration: " << card.expiration << "\n";
         ss << "    Number: " << card.number << "\n";
+        if (!card.cvv.empty())     ss << "    CVV: " << card.cvv << "\n";
         if (!card.city.empty())    ss << "    City: " << card.city << "\n";
         if (!card.state.empty())   ss << "    State: " << card.state << "\n";
         if (!card.zip.empty())     ss << "    Zip: " << card.zip << "\n";
