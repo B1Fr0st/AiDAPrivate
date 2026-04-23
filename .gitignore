@@ -73,7 +73,7 @@ models.json
 license-validation-response.json
 
 # Massive Third-Party Headers/Directories
-/src/freetype/
+**/freetype/
 **/stb_image.h
 
 # Asset Byte Arrays (Using ** to catch them anywhere)
@@ -100,3 +100,4 @@ license-validation-response.json
 /win10afd.md
 /win11_24h2_afd.md
 /win11_25h2_afd.md
+.aider*
