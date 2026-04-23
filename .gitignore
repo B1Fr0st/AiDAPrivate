@@ -35,6 +35,8 @@ sources/
 packages/
 dist/
 *.zip
+.venv/
+node_modules/
 
 # IDA SDK (fetched by CI)
 idasdk/
