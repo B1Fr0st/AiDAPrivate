@@ -1,6 +1,10 @@
 #pragma once
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <bcrypt.h>
 #include <intrin.h>
@@ -770,9 +774,45 @@ struct packed_header_t {
     uint32_t stub_code_offset;
     uint32_t master_key_pe_timestamp;
     uint32_t master_key_pe_size_of_code;
+    uint32_t bind_flags;
+    uint32_t aux_offset;
+    uint32_t aux_size;
+    uint8_t  bind_salt[16];
+    uint32_t reserved[3];
 };
 
-static_assert(sizeof(packed_header_t) == 56, "packed_header_t must be 56 bytes");
+static_assert(sizeof(packed_header_t) == 96, "packed_header_t must be 96 bytes");
+
+constexpr uint32_t kBindFlagCpuid = 0x1u;
+
+constexpr uint32_t kAuxMagic   = 0x4D585541u;
+constexpr uint32_t kAuxVersion = 0x00020000u;
+
+#pragma pack(push, 1)
+struct aux_block_t {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t spread_seed;
+    uint32_t tamper_response_level;
+    uint32_t bind_flags;
+    uint32_t reserved0;
+    uint8_t  watermark[16];
+    uint8_t  watermark_hash[32];
+    uint8_t  fingerprint_hash[32];
+    uint8_t  bind_salt[16];
+    uint32_t phase_flags;
+    uint32_t stolen_block_count;
+    uint32_t stolen_block_table_rva;
+    uint32_t stolen_block_table_size;
+    uint64_t rdtsc_entangle_seed;
+    uint64_t polymorphic_build_nonce;
+    uint32_t stub_signature_tag;
+    uint32_t ghost_veh_flags;
+    uint8_t  reserved1[16];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(aux_block_t) == 176, "aux_block_t must be 176 bytes");
 
 struct section_descriptor_t {
     uint32_t original_rva;
@@ -863,6 +903,7 @@ struct packed_section_layout_t {
     uint32_t resource_table_offset;
     uint32_t blob_data_offset;
     uint32_t master_key_offset;
+    uint32_t aux_offset;
     uint32_t stub_offset;
     uint32_t tls_stub_offset;
     uint32_t total_size;
@@ -881,12 +922,18 @@ struct transform_result_t {
     uint32_t    reserved_main_stub_size;
     uint32_t    reserved_tls_stub_size;
     uint64_t    seed_used;
+    uint32_t    bind_flags;
+    uint8_t     bind_salt[16];
+    uint32_t    aux_size;
+    uint32_t    watermark_spread_seed;
+    uint8_t     watermark_hash[32];
+    uint8_t     fingerprint_hash[32];
     import_hash_table_t    imports;
     string_fixup_table_t   strings;
     resource_fixup_table_t resources;
 };
 
-constexpr uint32_t kReservedMainStubSize = 0x2000u;
+constexpr uint32_t kReservedMainStubSize = 0x6000u;
 constexpr uint32_t kReservedTlsStubSize = 0x200u;
 
 struct protect_options_t {
@@ -901,6 +948,17 @@ struct protect_options_t {
     bool pack_sections = true;
     bool mangle_headers = true;
     bool randomize_section_names = true;
+    bool embed_watermark = false;
+    bool bind_machine = false;
+    bool polymorphic_stub = false;
+    bool merge_sections = false;
+    bool flatten_entropy = false;
+    bool deep_steal = false;
+    bool ghost_veh = false;
+    bool rdtsc_entangle = false;
+    bool opaque_predicates = false;
+    uint32_t tamper_response_level = 0;
+    uint8_t  license_hash[16] = {0};
 };
 
 struct section_skip_list {
@@ -1633,6 +1691,9 @@ inline packed_section_layout_t build_packed_section(pe_file::pe_image_t& pe,
                                                      const resource_fixup_table_t& resources,
                                                      const std::vector<uint8_t>& stub_code,
                                                      const std::vector<uint8_t>& tls_stub_code,
+                                                     uint32_t bind_flags,
+                                                     const uint8_t bind_salt[16],
+                                                     const aux_block_t& aux,
                                                      rng_detail::rng_source& rng) {
     packed_section_layout_t layout{};
 
@@ -1663,6 +1724,9 @@ inline packed_section_layout_t build_packed_section(pe_file::pe_image_t& pe,
     layout.master_key_offset = cursor;
     cursor += 64u;
 
+    layout.aux_offset = cursor;
+    cursor += static_cast<uint32_t>(sizeof(aux_block_t));
+
     layout.tls_stub_offset = tls_stub_code.empty() ? 0u : cursor;
     cursor += static_cast<uint32_t>(tls_stub_code.size());
 
@@ -1688,6 +1752,10 @@ inline packed_section_layout_t build_packed_section(pe_file::pe_image_t& pe,
     hdr.stub_code_offset = layout.stub_offset;
     hdr.master_key_pe_timestamp = master_key_pe_timestamp;
     hdr.master_key_pe_size_of_code = master_key_pe_size_of_code;
+    hdr.bind_flags = bind_flags;
+    hdr.aux_offset = layout.aux_offset;
+    hdr.aux_size = static_cast<uint32_t>(sizeof(aux_block_t));
+    std::memcpy(hdr.bind_salt, bind_salt, 16);
     std::memcpy(buf.data(), &hdr, sizeof(hdr));
 
     for (size_t i = 0; i < blobs.size(); ++i) {
@@ -1723,6 +1791,8 @@ inline packed_section_layout_t build_packed_section(pe_file::pe_image_t& pe,
     std::memcpy(buf.data() + layout.master_key_offset, obfuscated_master_key, 32);
     std::memcpy(buf.data() + layout.master_key_offset + 32u, key_obfuscation_mask, 32);
 
+    std::memcpy(buf.data() + layout.aux_offset, &aux, sizeof(aux));
+
     if (!tls_stub_code.empty()) {
         std::memcpy(buf.data() + layout.tls_stub_offset,
                     tls_stub_code.data(), tls_stub_code.size());
@@ -1751,32 +1821,27 @@ inline void finalize_headers(pe_file::pe_image_t& pe) {
     pe_file::recalculate_headers(pe);
 }
 
-inline packed_section_layout_t build_packed_section(pe_file::pe_image_t& pe,
-                                                     const uint8_t master[32],
-                                                     uint32_t master_key_pe_timestamp,
-                                                     uint32_t master_key_pe_size_of_code,
-                                                     const std::vector<packed_section_blob_t>& blobs,
-                                                     const import_hash_table_t& imports,
-                                                     const string_fixup_table_t& strings,
-                                                     const resource_fixup_table_t& resources,
-                                                     const std::vector<uint8_t>& stub_code,
-                                                     const std::vector<uint8_t>& tls_stub_code,
-                                                     rng_detail::rng_source& rng,
-                                                     uint8_t out_obfuscated_master_key[32],
-                                                     uint8_t out_key_obfuscation_mask[32]) {
-    rng.get(out_key_obfuscation_mask, 32);
-    obfuscate_master_key_with_mask(master,
-                                    out_key_obfuscation_mask,
-                                    master_key_pe_timestamp,
-                                    master_key_pe_size_of_code,
-                                    out_obfuscated_master_key);
-    return build_packed_section(pe,
-                                 out_obfuscated_master_key,
-                                 out_key_obfuscation_mask,
-                                 master_key_pe_timestamp,
-                                 master_key_pe_size_of_code,
-                                 blobs, imports, strings, resources,
-                                 stub_code, tls_stub_code, rng);
+inline void apply_machine_binding_xor(uint8_t master[32], const uint8_t salt[16], uint32_t fp) {
+    for (int i = 0; i < 4; ++i) {
+        uint64_t k0 = 0;
+        uint64_t k1 = 0;
+        std::memcpy(&k0, salt + 0, 8);
+        std::memcpy(&k1, salt + 8, 8);
+        k0 ^= static_cast<uint64_t>(fp);
+        k1 ^= static_cast<uint64_t>(i) * 0x9E3779B97F4A7C15ull;
+        uint8_t blk[8] = {0};
+        blk[0] = static_cast<uint8_t>(i);
+        uint64_t h = siphash_2_4(blk, 8, k0, k1);
+        for (int j = 0; j < 8; ++j) {
+            master[i * 8 + j] ^= static_cast<uint8_t>(h >> (j * 8));
+        }
+    }
+}
+
+inline uint32_t collect_cpuid_fingerprint() {
+    int regs[4] = {0, 0, 0, 0};
+    __cpuid(regs, 1);
+    return static_cast<uint32_t>(regs[0]);
 }
 
 inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_options_t& opt) {
@@ -1817,12 +1882,62 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
         master[i] = static_cast<uint8_t>(outer[i] ^ inner[i]);
     }
 
+    uint32_t bind_flags = 0;
+    uint8_t  bind_salt[16] = {0};
+    uint8_t  fingerprint_hash[32] = {0};
+    uint32_t cpuid_fp = 0;
+    if (opt.bind_machine) {
+        rng.get(bind_salt, 16);
+        cpuid_fp = collect_cpuid_fingerprint();
+        uint8_t fp_bytes[20];
+        std::memcpy(fp_bytes, &cpuid_fp, 4);
+        std::memcpy(fp_bytes + 4, bind_salt, 16);
+        sha256_detail::sha256(fp_bytes, sizeof(fp_bytes), fingerprint_hash);
+        apply_machine_binding_xor(master, bind_salt, cpuid_fp);
+        bind_flags |= kBindFlagCpuid;
+    }
+    std::memcpy(result.bind_salt, bind_salt, 16);
+    result.bind_flags = bind_flags;
+    std::memcpy(result.fingerprint_hash, fingerprint_hash, 32);
+
     rng.get(result.key_obfuscation_mask, 32);
     obfuscate_master_key_with_mask(master,
                                     result.key_obfuscation_mask,
                                     result.master_key_pe_timestamp,
                                     result.master_key_pe_size_of_code,
                                     result.obfuscated_master_key);
+
+    aux_block_t aux{};
+    aux.magic = kAuxMagic;
+    aux.version = kAuxVersion;
+    aux.bind_flags = bind_flags;
+    aux.tamper_response_level = opt.tamper_response_level;
+    {
+        uint8_t seed_src[8];
+        rng.get(seed_src, 8);
+        uint32_t spread_seed = 0;
+        std::memcpy(&spread_seed, seed_src, 4);
+        if (spread_seed == 0u) { spread_seed = 0xA5A5A5A5u; }
+        aux.spread_seed = spread_seed;
+        result.watermark_spread_seed = spread_seed;
+    }
+    std::memcpy(aux.watermark, opt.license_hash, 16);
+    sha256_detail::sha256(aux.watermark, 16, aux.watermark_hash);
+    std::memcpy(result.watermark_hash, aux.watermark_hash, 32);
+    std::memcpy(aux.fingerprint_hash, fingerprint_hash, 32);
+    std::memcpy(aux.bind_salt, bind_salt, 16);
+    {
+        uint32_t pf = 0u;
+        if (opt.polymorphic_stub)   { pf |= 0x1u; }
+        if (opt.merge_sections)     { pf |= 0x2u; }
+        if (opt.flatten_entropy)    { pf |= 0x4u; }
+        if (opt.deep_steal)         { pf |= 0x8u; }
+        if (opt.ghost_veh)          { pf |= 0x10u; }
+        if (opt.rdtsc_entangle)     { pf |= 0x20u; }
+        if (opt.opaque_predicates)  { pf |= 0x40u; }
+        aux.phase_flags = pf;
+    }
+    result.aux_size = static_cast<uint32_t>(sizeof(aux_block_t));
 
     import_hash_table_t imports{};
     string_fixup_table_t strings{};
@@ -1875,6 +1990,9 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
                                           resources,
                                           stub_code,
                                           tls_stub_code,
+                                          bind_flags,
+                                          bind_salt,
+                                          aux,
                                           rng);
     result.packed_section_rva = pe.sections.back().virtual_address;
 
@@ -1901,6 +2019,16 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
     result.resources = std::move(resources);
 
     finalize_headers(pe);
+
+    if (opt.embed_watermark) {
+        uint8_t wm_id[8];
+        std::memcpy(wm_id, result.watermark_hash, 8);
+        uint32_t lo = 0, hi = 0;
+        std::memcpy(&lo, wm_id + 0, 4);
+        std::memcpy(&hi, wm_id + 4, 4);
+        pe.optional_header.Win32VersionValue = lo;
+        pe.optional_header.LoaderFlags = hi;
+    }
 
     if (opt.verbose) {
         (void)opt.verbose;

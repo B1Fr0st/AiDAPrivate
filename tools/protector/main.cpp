@@ -34,10 +34,21 @@ struct config_t {
     bool pack_sections = false;
     bool mangle_headers = false;
     bool randomize_section_names = false;
+    bool embed_watermark = false;
+    bool bind_machine = false;
+    bool polymorphic_stub = false;
+    bool merge_sections = false;
+    bool flatten_entropy = false;
+    bool deep_steal = false;
+    bool ghost_veh = false;
+    bool rdtsc_entangle = false;
+    bool opaque_predicates = false;
     bool verbose = false;
     bool seed_provided = false;
+    bool watermark_provided = false;
     uint64_t seed = 0;
     uint32_t tamper_response_level = 0;
+    uint8_t  license_hash[16] = {0};
 };
 
 static void print_usage(std::FILE* out) {
@@ -57,9 +68,22 @@ static void print_usage(std::FILE* out) {
         "  --pack-sections             Compress + AES-256-CTR encrypt sections\n"
         "  --mangle-headers            Mangle PE headers\n"
         "  --randomize-section-names   Randomize section names\n"
+        "  --polymorphic               Emit polymorphic stub variant (Phase 1)\n"
+        "  --merge-sections            Merge sections to reduce surface (Phase 2)\n"
+        "  --flatten-entropy           Flatten per-section entropy (Phase 2)\n"
+        "  --deep-steal                Deep-steal code blocks (Phase 3)\n"
+        "  --ghost-veh                 Install ghost VEH guards (Phase 4)\n"
+        "  --rdtsc-entangle            Entangle timing via rdtsc (Phase 5)\n"
+        "  --opaque-predicates         Insert opaque predicates (Phase 6)\n"
         "\n"
         "Aggregate:\n"
         "  -a, --all                   Enable all protections\n"
+        "\n"
+        "Watermark / Binding:\n"
+        "  --watermark <hex32>         128-bit license watermark (32 hex chars)\n"
+        "  --embed-watermark           Embed watermark identifier in PE header\n"
+        "  --bind-machine              Bind decryption key to current CPUID\n"
+        "  --tamper-level <0..3>       Tamper response level for orchestrator\n"
         "\n"
         "Control:\n"
         "  --seed <u64>                Deterministic seed for RNG\n"
@@ -87,6 +111,25 @@ static bool parse_uint64(const char* s, uint64_t& out) {
         return false;
     }
     out = static_cast<uint64_t>(v);
+    return true;
+}
+
+static bool parse_hex16(const char* s, uint8_t out[16]) {
+    if (s == nullptr) { return false; }
+    size_t len = std::strlen(s);
+    if (len != 32) { return false; }
+    auto hexv = [](char c, int& v) {
+        if (c >= '0' && c <= '9') { v = c - '0'; return true; }
+        if (c >= 'a' && c <= 'f') { v = c - 'a' + 10; return true; }
+        if (c >= 'A' && c <= 'F') { v = c - 'A' + 10; return true; }
+        return false;
+    };
+    for (int i = 0; i < 16; ++i) {
+        int hi = 0, lo = 0;
+        if (!hexv(s[i * 2], hi)) { return false; }
+        if (!hexv(s[i * 2 + 1], lo)) { return false; }
+        out[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
     return true;
 }
 
@@ -127,6 +170,20 @@ inline config_t parse_args(int argc, char** argv) {
             cfg.mangle_headers = true;
         } else if (arg == "--randomize-section-names") {
             cfg.randomize_section_names = true;
+        } else if (arg == "--polymorphic") {
+            cfg.polymorphic_stub = true;
+        } else if (arg == "--merge-sections") {
+            cfg.merge_sections = true;
+        } else if (arg == "--flatten-entropy") {
+            cfg.flatten_entropy = true;
+        } else if (arg == "--deep-steal") {
+            cfg.deep_steal = true;
+        } else if (arg == "--ghost-veh") {
+            cfg.ghost_veh = true;
+        } else if (arg == "--rdtsc-entangle") {
+            cfg.rdtsc_entangle = true;
+        } else if (arg == "--opaque-predicates") {
+            cfg.opaque_predicates = true;
         } else if (arg == "-a" || arg == "--all") {
             cfg.strip_rich = true;
             cfg.strip_debug = true;
@@ -136,6 +193,13 @@ inline config_t parse_args(int argc, char** argv) {
             cfg.pack_sections = true;
             cfg.mangle_headers = true;
             cfg.randomize_section_names = true;
+            cfg.polymorphic_stub = true;
+            cfg.merge_sections = true;
+            cfg.flatten_entropy = true;
+            cfg.deep_steal = true;
+            cfg.ghost_veh = true;
+            cfg.rdtsc_entangle = true;
+            cfg.opaque_predicates = true;
         } else if (arg == "-v" || arg == "--verbose") {
             cfg.verbose = true;
         } else if (arg == "--seed") {
@@ -151,6 +215,31 @@ inline config_t parse_args(int argc, char** argv) {
             }
             cfg.seed = v;
             cfg.seed_provided = true;
+        } else if (arg == "--watermark") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "Error: --watermark requires a value\n");
+                std::exit(1);
+            }
+            if (!parse_hex16(argv[++i], cfg.license_hash)) {
+                std::fprintf(stderr, "Error: --watermark must be 32 hex chars\n");
+                std::exit(1);
+            }
+            cfg.watermark_provided = true;
+        } else if (arg == "--embed-watermark") {
+            cfg.embed_watermark = true;
+        } else if (arg == "--bind-machine") {
+            cfg.bind_machine = true;
+        } else if (arg == "--tamper-level") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "Error: --tamper-level requires a value\n");
+                std::exit(1);
+            }
+            uint64_t v = 0;
+            if (!parse_uint64(argv[++i], v) || v > 3u) {
+                std::fprintf(stderr, "Error: --tamper-level must be 0..3\n");
+                std::exit(1);
+            }
+            cfg.tamper_response_level = static_cast<uint32_t>(v);
         } else {
             std::fprintf(stderr, "Unknown option: %s\n", arg.c_str());
             print_usage(stderr);
@@ -211,6 +300,17 @@ inline int run(const config_t& cfg) {
     opt.verbose = cfg.verbose;
     opt.seed_provided = cfg.seed_provided;
     opt.seed = cfg.seed;
+    opt.embed_watermark = cfg.embed_watermark;
+    opt.bind_machine = cfg.bind_machine;
+    opt.polymorphic_stub = cfg.polymorphic_stub;
+    opt.merge_sections = cfg.merge_sections;
+    opt.flatten_entropy = cfg.flatten_entropy;
+    opt.deep_steal = cfg.deep_steal;
+    opt.ghost_veh = cfg.ghost_veh;
+    opt.rdtsc_entangle = cfg.rdtsc_entangle;
+    opt.opaque_predicates = cfg.opaque_predicates;
+    opt.tamper_response_level = cfg.tamper_response_level;
+    std::memcpy(opt.license_hash, cfg.license_hash, 16);
 
     if (cfg.verbose) {
         std::fprintf(stdout, "[+] Loaded PE: %s (%llu bytes, %s)\n",
@@ -227,6 +327,14 @@ inline int run(const config_t& cfg) {
                      cfg.pack_sections ? " pack_sections" : "",
                      cfg.mangle_headers ? " mangle_headers" : "",
                      cfg.randomize_section_names ? " randomize_section_names" : "");
+        std::fprintf(stdout, "[+] Phase flags:%s%s%s%s%s%s%s\n",
+                     cfg.polymorphic_stub ? " polymorphic" : "",
+                     cfg.merge_sections ? " merge_sections" : "",
+                     cfg.flatten_entropy ? " flatten_entropy" : "",
+                     cfg.deep_steal ? " deep_steal" : "",
+                     cfg.ghost_veh ? " ghost_veh" : "",
+                     cfg.rdtsc_entangle ? " rdtsc_entangle" : "",
+                     cfg.opaque_predicates ? " opaque_predicates" : "");
     }
 
     const uint32_t reloc_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].rva;

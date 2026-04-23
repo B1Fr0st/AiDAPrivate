@@ -78,6 +78,11 @@ typedef struct packed_header_s {
     uint32_t stub_code_offset;
     uint32_t master_key_pe_timestamp;
     uint32_t master_key_pe_size_of_code;
+    uint32_t bind_flags;
+    uint32_t aux_offset;
+    uint32_t aux_size;
+    uint8_t  bind_salt[16];
+    uint32_t reserved[3];
 } packed_header_t;
 
 typedef struct section_descriptor_s {
@@ -580,14 +585,15 @@ static uint8_t* find_packed_section(uint8_t* image_base, uint32_t* out_size) {
     uint16_t n_sections = *(uint16_t*)(nt + 6);
     uint16_t opt_size = *(uint16_t*)(nt + 0x14);
     uint8_t* sec = nt + 0x18 + opt_size;
-    static const uint8_t k_packed[7] = { '.', 'p', 'a', 'c', 'k', 'e', 'd' };
     for (uint16_t i = 0; i < n_sections; ++i) {
         uint8_t* s = sec + i * 40u;
-        if (mem_eq(s, k_packed, 7)) {
-            if (out_size != 0) {
-                *out_size = *(uint32_t*)(s + 8);
-            }
-            return image_base + *(uint32_t*)(s + 12);
+        uint32_t va = *(uint32_t*)(s + 12);
+        uint32_t vsize = *(uint32_t*)(s + 8);
+        if (va == 0u || vsize < 4u) { continue; }
+        uint32_t magic = *(uint32_t*)(image_base + va);
+        if (magic == IMG_MAGIC) {
+            if (out_size != 0) { *out_size = vsize; }
+            return image_base + va;
         }
     }
     return 0;
@@ -904,6 +910,24 @@ void __cdecl aida_unpack(void* image_base_arg) {
     uint8_t master[32];
     for (int i = 0; i < 32; ++i) {
         master[i] = (uint8_t)(obfuscated[i] ^ mask[i] ^ pe_mask[i]);
+    }
+    if ((hdr->bind_flags & 0x1u) != 0u) {
+        int regs[4]; regs[0] = 0; regs[1] = 0; regs[2] = 0; regs[3] = 0;
+        __cpuid(regs, 1);
+        uint32_t fp = (uint32_t)regs[0];
+        for (int i = 0; i < 4; ++i) {
+            uint64_t k0 = 0, k1 = 0;
+            mem_copy(&k0, hdr->bind_salt + 0, 8);
+            mem_copy(&k1, hdr->bind_salt + 8, 8);
+            k0 ^= (uint64_t)fp;
+            k1 ^= (uint64_t)i * 0x9E3779B97F4A7C15ULL;
+            uint8_t blk[8] = {0};
+            blk[0] = (uint8_t)i;
+            uint64_t h = siphash_2_4(blk, 8, k0, k1);
+            for (int j = 0; j < 8; ++j) {
+                master[i * 8 + j] ^= (uint8_t)(h >> (j * 8));
+            }
+        }
     }
     unpack_sections(image_base, master, packed_base, hdr, &r);
     rebuild_iat(image_base, master, packed_base, hdr, &r);

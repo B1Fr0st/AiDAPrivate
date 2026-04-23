@@ -1,6 +1,10 @@
 #pragma once
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <cstdint>
 #include <cstddef>
@@ -332,11 +336,29 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
 
     emit::fake_branch_over_junk(m, rng);
 
+    size_t lea_pos = m.size();
+    emit::lea_rip_relative(m, reg::RAX, 0);
+    static constexpr uint8_t kAddRaxImm32[] = { 0x48, 0x05 };
+    emit::raw(m, kAddRaxImm32, 2);
+    emit::put_u32(m, aida_payload::kEntryOffset);
+    emit::call_reg(m, reg::RAX);
+
+    size_t jmp_pos = m.size();
+    emit::jmp_rel32(m, 0);
+
     while ((m.size() & 0x0Fu) != 0u) {
         emit::nop(m, 1);
     }
 
+    size_t payload_start = m.size();
+    int32_t lea_disp = static_cast<int32_t>(payload_start - (lea_pos + 7));
+    std::memcpy(m.data() + lea_pos + 3, &lea_disp, 4);
+
     emit::raw(m, aida_payload::kAidaUnpackBlob, aida_payload::kBlobSize);
+
+    size_t after_blob = m.size();
+    int32_t jmp_disp = static_cast<int32_t>(after_blob - (jmp_pos + 5));
+    std::memcpy(m.data() + jmp_pos + 1, &jmp_disp, 4);
 
     emit::opaque_jz_jnz(m, rng);
 

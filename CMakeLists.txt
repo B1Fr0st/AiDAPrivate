@@ -1166,7 +1166,7 @@ if(BUILD_PROTECTOR)
 
     add_custom_command(
         OUTPUT "${AIDA_PAYLOAD_OBJ}"
-        COMMAND "${AIDA_MSVC_CL}" /nologo /c /GS- /GR- /Od /Oi /Ob0 /Zl /EHs- /Gw /Gy /W3
+        COMMAND "${AIDA_MSVC_CL}" /nologo /c /GS- /GR- /Od /Oi /Ob0 /Zl /EHs- /Gw /W3
                 /D_NO_CRT_STDIO_INLINE /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX
                 /Fo${AIDA_PAYLOAD_OBJ}
                 ${CMAKE_SOURCE_DIR}/tools/protector/payload/payload.c
@@ -1189,6 +1189,41 @@ if(BUILD_PROTECTOR)
     add_custom_target(AiDAPayloadBlob DEPENDS "${AIDA_PAYLOAD_HDR}")
     add_dependencies(AiDAProtector AiDAPayloadBlob)
     target_include_directories(AiDAProtector PRIVATE "${CMAKE_BINARY_DIR}/generated")
+
+    add_executable(AiDAProtectorVerify tools/protector/verify.cpp)
+    target_include_directories(AiDAProtectorVerify PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/protector
+    )
+    target_compile_definitions(AiDAProtectorVerify PRIVATE
+        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
+    )
+    target_compile_options(AiDAProtectorVerify PRIVATE
+        /W4 /EHsc /O2 /Zc:__cplusplus /permissive- /MD
+    )
+    target_link_libraries(AiDAProtectorVerify PRIVATE bcrypt advapi32)
+    set_target_properties(AiDAProtectorVerify PROPERTIES
+        OUTPUT_NAME "aida_protector_verify"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+    )
+
+    add_executable(AiDAProtectorTest tools/protector/test_runner.cpp)
+    target_compile_definitions(AiDAProtectorTest PRIVATE
+        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
+    )
+    target_compile_options(AiDAProtectorTest PRIVATE
+        /W4 /EHsc /O2 /Zc:__cplusplus /permissive- /MD
+    )
+    set_target_properties(AiDAProtectorTest PROPERTIES
+        OUTPUT_NAME "aida_protector_test"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+    )
+
+    add_executable(AiDATestPayload tools/protector/test_payload/test_payload.c)
+    target_compile_options(AiDATestPayload PRIVATE /W3 /O2 /MD)
+    set_target_properties(AiDATestPayload PROPERTIES
+        OUTPUT_NAME "aida_test_payload"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+    )
 endif()
 
 if(BUILD_PROTECTOR)
