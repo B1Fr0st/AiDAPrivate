@@ -1,4 +1,4 @@
-# AiDA PE Protector — Architecture Design
+﻿# AiDA PE Protector — Architecture Design
 
 ## Overview
 
@@ -14,7 +14,7 @@ The protector complements the existing runtime anti-tamper system in `src/standa
 
 ---
 
-## 1. File-by-File Architecture
+## Phase 1: File-by-File Architecture
 
 ### 1.1 `tools/protector/main.cpp` — CLI Entry Point
 
@@ -403,7 +403,7 @@ namespace routines {
 
 ---
 
-## 2. Unpacking Stub Runtime Flow
+## Phase 2: Unpacking Stub Runtime Flow
 
 The stub executes in two phases: an early TLS callback, and the main unpacking entry point.
 
@@ -600,7 +600,7 @@ flowchart TD
 
 ---
 
-## 3. PE Layout Before vs After Protection
+## Phase 3: PE Layout Before vs After Protection
 
 ### 3.1 Before Protection (Clean Build Output)
 
@@ -745,7 +745,7 @@ struct section_descriptor_t {
 
 ---
 
-## 4. Edge Case Handling
+## Phase 4: Edge Case Handling
 
 ### 4.1 Relocations (.reloc section)
 
@@ -840,7 +840,7 @@ Callback Array:
 
 ---
 
-## 5. Encryption Key Derivation Scheme
+## Phase 5: Encryption Key Derivation Scheme
 
 The cryptographic design uses a hierarchical key derivation tree rooted in a per-protection-run random master key.
 
@@ -940,7 +940,7 @@ The stub uses the same CRC32-C instruction (`_mm_crc32_u8` loop) to hash export 
 
 ---
 
-## 6. How the Stub Resolves Its Own Dependencies (PEB Walking)
+## Phase 6: How the Stub Resolves Its Own Dependencies (PEB Walking)
 
 The stub cannot use any imports (the IAT is destroyed). It resolves everything through direct PEB traversal and export table parsing.
 
@@ -1062,7 +1062,7 @@ over_junk:
 
 ---
 
-## 7. Build Integration (CMake)
+## Phase 7: Build Integration (CMake)
 
 The protector integrates into the existing `CMakeLists.txt` as a new executable target with post-build custom commands.
 
@@ -1157,3 +1157,387 @@ endif()
 Usage: aida_protector [options]
 
 Required:
+  -i, --input <path>          Input PE file path (.exe or .dll)
+  -o, --output <path>         Output protected PE file path
+
+Protection flags (individual):
+  --strip-rich                Strip Rich header (MSVC build metadata)
+  --strip-debug               Strip debug directory and PDB path
+  --encrypt-imports           Replace IAT with CRC32 hash table; stub resolves at runtime
+  --encrypt-strings           XOR-encrypt ASCII and wide strings in .rdata
+  --encrypt-resources         XOR-encrypt RT_RCDATA resource entries
+  --pack-sections             Compress (zlib) + AES-256-CTR encrypt all code/data sections
+
+Aggregate flags:
+  -a, --all                   Enable ALL protections (equivalent to passing every flag above)
+
+Output control:
+  -v, --verbose               Print detailed transform log to stdout
+
+Examples:
+  aida_protector -i build/AiDAStandalone.exe -o dist/AiDAStandalone.exe --all -v
+  aida_protector --input AiDA.dll --output AiDA_protected.dll --encrypt-imports --pack-sections
+  aida_protector -i aida_core.dll -o aida_core.dll -a
+```
+
+**Exit codes:**
+
+| Code | Meaning |
+|------|---------|
+| `0`  | Success — protected PE written to output path |
+| `1`  | Invalid arguments — missing required flags, unknown option, or conflicting options |
+| `2`  | Parse error — input file is not a valid PE32+, or a required structure is corrupt |
+| `3`  | Transform error — a protection transform failed (e.g., no `.text` section, AES-NI unavailable) |
+| `4`  | Write error — failed to write output file (permission denied, disk full, path invalid) |
+
+**Argument parsing implementation** (in [`parse_args()`](tools/protector/DESIGN.md:38)):
+
+```cpp
+config_t parse_args(int argc, char** argv) {
+    config_t cfg{};
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-i" || arg == "--input")        { cfg.input_path = argv[++i]; }
+        else if (arg == "-o" || arg == "--output")   { cfg.output_path = argv[++i]; }
+        else if (arg == "--strip-rich")              { cfg.strip_rich = true; }
+        else if (arg == "--strip-debug")             { cfg.strip_debug = true; }
+        else if (arg == "--encrypt-imports")          { cfg.encrypt_imports = true; }
+        else if (arg == "--encrypt-strings")          { cfg.encrypt_strings = true; }
+        else if (arg == "--encrypt-resources")        { cfg.encrypt_resources = true; }
+        else if (arg == "--pack-sections")            { cfg.pack_sections = true; }
+        else if (arg == "-a" || arg == "--all") {
+            cfg.strip_rich = cfg.strip_debug = cfg.encrypt_imports = true;
+            cfg.encrypt_strings = cfg.encrypt_resources = cfg.pack_sections = true;
+        }
+        else if (arg == "-v" || arg == "--verbose")  { cfg.verbose = true; }
+        else { std::fprintf(stderr, "Unknown option: %s\n", arg.c_str()); std::exit(1); }
+    }
+    if (cfg.input_path.empty() || cfg.output_path.empty()) {
+        std::fprintf(stderr, "Error: --input and --output are required\n");
+        std::exit(1);
+    }
+    return cfg;
+}
+```
+
+---
+
+## Phase 8: Watermarking & License Binding
+
+The runtime anti-tamper system (see [`orchestrator.hpp`](src/standalone/src/core/anti-tamper/orchestrator.hpp)) handles anti-debug, anti-dump, anti-VM, code integrity, metamorphic transforms, CFF, call obfuscation, code virtualization, and direct syscalls **after** the process is running. The protector therefore does NOT duplicate those capabilities in the stub. Instead, the protector focuses on what only an on-disk static tool can provide: unique binary fingerprinting and hardware-bound decryption.
+
+### 8.1 Per-License Watermark
+
+Each protected binary contains a 128-bit watermark derived from the license key. The watermark is spread across multiple locations in the PE to survive partial extraction:
+
+```cpp
+namespace watermark {
+
+struct watermark_config_t {
+    uint8_t  license_hash[16];      // SHA-256(license_key) truncated to 128 bits
+    uint32_t spread_seed;           // CSPRNG seed for bit-placement RNG
+    bool     enable_binding;        // if true, derive key partially from HWID
+};
+
+struct watermark_placement_t {
+    uint32_t section_padding_bits;     // 32 bits in section alignment padding
+    uint32_t pe_header_reserved_bits;  // 32 bits in PE header reserved fields
+    uint32_t junk_instruction_bits;    // 32 bits in junk instruction immediates
+    uint32_t encrypted_data_bits;      // 32 bits in encrypted blob padding
+};
+
+void embed_watermark(pe_file::pe_image_t& pe,
+                     const watermark_config_t& cfg);
+
+bool extract_watermark(const pe_file::pe_image_t& pe,
+                       uint32_t spread_seed,
+                       uint8_t out_watermark[16]);
+
+}
+```
+
+**Bit-spreading algorithm:**
+
+```
+function embed_watermark(pe, cfg):
+    wm[16] = cfg.license_hash
+    rng = seed_rng(cfg.spread_seed)
+
+    // Split 128 bits into 4 groups of 32
+    group[0] = wm[0..3]    // section padding
+    group[1] = wm[4..7]    // PE header reserved
+    group[2] = wm[8..11]   // junk immediates
+    group[3] = wm[12..15]  // encrypted blob padding
+
+    // Group 0: Section padding bytes
+    // Each section is file-aligned; the gap between virtual_size and raw_size
+    // contains unused bytes. Embed 32 bits across available padding.
+    padding_offsets = find_section_padding_bytes(pe, rng)
+    for i = 0..31:
+        bit = (group[0][i/8] >> (i%8)) & 1
+        // Write bit into 3 redundant locations (error correction)
+        for replica = 0..2:
+            offset = padding_offsets[i * 3 + replica]
+            pe.raw_file[offset] = (pe.raw_file[offset] & 0xFE) | bit
+
+    // Group 1: PE header reserved fields
+    // IMAGE_OPTIONAL_HEADER64 has reserved/unused fields:
+    //   Win32VersionValue (4 bytes, always 0)
+    //   LoaderFlags (4 bytes, always 0)
+    // Plus IMAGE_FILE_HEADER has 0-padding in TimeDateStamp's upper bits
+    header_slots = [
+        &pe.optional_header.Win32VersionValue,       // 4 bytes
+        &pe.optional_header.LoaderFlags,              // 4 bytes
+    ]
+    embed_bits_into_fields(header_slots, group[1], rng)
+
+    // Group 2: Junk instruction immediates
+    // Anti-disasm junk (Phase 6 S6.5) uses random bytes after opaque branches.
+    // Replace some with watermark bits encoded into IMM32 values.
+    junk_locations = find_junk_immediate_locations(pe, rng)
+    for i = 0..31:
+        bit = (group[2][i/8] >> (i%8)) & 1
+        for replica = 0..2:
+            loc = junk_locations[i * 3 + replica]
+            pe.packed_section[loc] = (pe.packed_section[loc] & 0xFE) | bit
+
+    // Group 3: Encrypted data padding
+    // Section blobs are padded to 16-byte AES block alignment.
+    // Padding bytes are random — replace LSBs with watermark bits.
+    pad_offsets = find_encryption_padding_bytes(pe, rng)
+    embed_bits_with_redundancy(pad_offsets, group[3], rng)
+```
+
+**Extraction:** The same `spread_seed` and algorithm recreate the offset lists. Read the LSBs, apply majority vote across the 3 replicas per bit, reconstruct the 128-bit watermark. Compare against the license database to identify the licenseee.
+
+### 8.2 Machine Binding
+
+The master decryption key can optionally be derived partially from a hardware fingerprint, binding the protected binary to a specific machine.
+
+```cpp
+struct hardware_fingerprint_t {
+    uint32_t cpuid_family_model;     // CPUID(1).EAX
+    uint64_t disk_serial_hash;       // SipHash of disk serial string
+    uint64_t mac_hash;               // SipHash of primary MAC address
+    uint32_t product_id_hash;        // CRC32 of Windows Product ID
+};
+
+hardware_fingerprint_t collect_fingerprint();
+```
+
+**Key derivation with binding:**
+
+```
+function derive_bound_master_key(base_master_key[32], fingerprint):
+    // Mix fingerprint into the key via HKDF
+    fp_bytes = serialize(fingerprint)           // 24 bytes
+    salt = siphash(fp_bytes, 0x4149444142494E44)  // "AIDABIND"
+    bound_key[32] = hkdf_sha256(
+        ikm = base_master_key,
+        salt = salt,
+        info = "aida_protector_machine_bind_v1",
+        length = 32
+    )
+    return bound_key
+```
+
+At protection time, the protector:
+1. Collects the hardware fingerprint of the current machine
+2. Derives the bound master key
+3. Encrypts sections with the bound key
+4. Embeds the fingerprint hash (NOT the raw fingerprint) in the packed header for verification
+
+At runtime, the stub:
+1. Re-collects the hardware fingerprint via PEB-walked APIs
+2. Re-derives the bound key using the same HKDF
+3. Attempts decryption — if the machine differs, the key is wrong and decryption produces garbage
+
+**Server-side re-bind:** For legitimate machine transfers, the server endpoint at [`/license`](server/routes/license.js) can issue a re-bind token containing the new machine's fingerprint. The protector consumes this token to re-encrypt with the new bound key.
+
+### 8.3 Tamper Evidence
+
+If any integrity check fails (stub self-check, anti-debug, anti-VM), the stub does NOT crash immediately. Instead, it subtly corrupts the decryption:
+
+```
+function tamper_response(master_key, corruption_level):
+    // corruption_level: 1 = mild, 2 = moderate, 3 = severe
+
+    switch corruption_level:
+        case 1:  // Flip 1-4 random bits in decrypted section data
+            for i = 0..random(1,4):
+                offset = random(0, section_size)
+                decrypted[offset] ^= (1 << random(0,7))
+
+        case 2:  // Skip random IAT entries (leave as NULL)
+            skip_probability = 0.1   // 10% of imports silently not resolved
+            for each import_entry:
+                if random() < skip_probability:
+                    continue  // don't resolve, leave IAT slot as 0
+
+        case 3:  // Corrupt master key, all subsequent decryption is garbage
+            master_key[random(0,31)] ^= 0xFF
+```
+
+The program "runs" but produces wrong results. The attacker thinks they bypassed the protection but the output is garbage. This wastes reverse engineering time — they must identify exactly which check they failed and why the corruption occurs.
+
+### 8.4 Packed Header Watermark Fields
+
+The [`packed_header_t`](tools/protector/DESIGN.md:719) is extended:
+
+```cpp
+struct packed_header_v2_t {
+    // ... existing fields from packed_header_t ...
+    uint32_t magic;                // 0x41504B44
+    uint32_t version;              // 0x00020000 (v2)
+    // ... counts and offsets ...
+
+    // Watermark fields (new)
+    uint32_t watermark_spread_seed;
+    uint8_t  watermark_hash[16];       // SHA-256(watermark) for extraction verify
+    uint8_t  fingerprint_hash[32];     // SHA-256(hardware_fingerprint) — empty if no binding
+    uint8_t  bind_salt[16];            // HKDF salt for machine binding
+    uint32_t tamper_response_level;    // 0=disabled, 1-3=corruption level
+};
+```
+
+---
+
+## Phase 9: Testing & Verification Strategy
+
+### 9.1 Round-Trip Test
+
+Protect a test executable, verify it still runs correctly:
+
+```
+test_roundtrip:
+    1. Compile test_payload.exe (prints "PASS" to stdout, exits with code 42)
+    2. Run: aida_protector -i test_payload.exe -o test_protected.exe --all -v
+    3. Execute test_protected.exe, capture stdout and exit code
+    4. Assert: stdout contains "PASS"
+    5. Assert: exit code == 42
+    6. If DLL target: LoadLibrary + GetProcAddress + call export, verify return value
+```
+
+### 9.2 Tool Resistance Matrix
+
+Test the protected binary against common RE tools and document expected behavior:
+
+| Tool | Version | Expected Behavior |
+|---|---|---|
+| IDA Pro | 9.x | `.text` shows all zeroes; auto-analysis finds no functions; imports tab empty; strings window empty; entry point lands in `.packed` with anti-disasm patterns confusing recursive descent |
+| Ghidra | 11.x | Same as IDA — zero sections parsed as data; `.packed` stub partially disassembled with many "bad instruction" markers from overlapping instruction trick |
+| x64dbg | latest | TLS callback triggers first — PEB checks detect debugger; if ScyllaHide patches PEB, runtime [`anti_debug::full_scan()`](src/standalone/src/core/anti-tamper/anti_debug.hpp:303) catches NtQuery/HWBP/timing |
+| Binary Ninja | 4.x | Linear sweep on `.packed` produces ~30% valid instructions due to opaque predicates; CFG reconstruction fails |
+| PE-bear | latest | Section names are randomized garbage; section data is zeroed; headers show fake TimeDateStamp and zeroed debug directory |
+| CFF Explorer | latest | All data directories except TLS/exception show RVA=0; import directory empty; resource tree shows encrypted RT_RCDATA |
+| Detect It Easy | latest | Should NOT identify packer signature (no known signature match for custom stub) |
+| Scylla | latest | IAT reconstruction fails — original IAT is zeroed, hash table cannot be reversed without master key; if runtime [`anti_dump`](src/standalone/src/core/anti-tamper/anti_dump.hpp:1) is active, PE headers are corrupted in memory too |
+
+### 9.3 Polymorphism Verification (Diffing Test)
+
+```
+test_polymorphism:
+    1. Protect the SAME input binary twice:
+       aida_protector -i test.exe -o out_a.exe --all
+       aida_protector -i test.exe -o out_b.exe --all
+    2. Binary diff: out_a.exe vs out_b.exe
+    3. Assert: files differ (different master key → different encrypted blobs)
+    4. Assert: .packed section content differs entirely
+    5. Assert: stub code region differs (randomized junk, different key material)
+    6. Both must still execute correctly (round-trip test on each)
+```
+
+### 9.4 Size Stress Tests
+
+```
+test_size_matrix:
+    Inputs:
+      - minimal.exe       (1KB .text, no imports, no resources)
+      - small.exe          (64KB .text, 10 imports, no resources)
+      - medium.exe         (2MB .text, 200 imports, 500KB .rdata)
+      - large.exe          (50MB .text, 1000 imports, 20MB .rsrc with RT_RCDATA)
+      - huge_rdata.exe     (512KB .text, 100MB .rdata with large string tables)
+
+    For each:
+      1. Protect with --all
+      2. Verify output file is valid PE (pe_file::load succeeds)
+      3. Verify output runs correctly (round-trip)
+      4. Measure: protection time, output size delta, startup time delta
+      5. Assert: no transform exceeds 30s wall time
+      6. Assert: output size <= input size * 1.5 (packed data + stub overhead)
+```
+
+### 9.5 DLL-Specific Tests
+
+```
+test_dll:
+    1. Compile test_dll.dll with two exports: TestFuncA() returns 1, TestFuncB() returns 2
+    2. Protect: aida_protector -i test_dll.dll -o test_dll_p.dll --all
+    3. From test harness:
+       HMODULE h = LoadLibraryA("test_dll_p.dll");
+       assert(h != NULL);
+       auto fnA = GetProcAddress(h, "TestFuncA");
+       auto fnB = GetProcAddress(h, "TestFuncB");
+       assert(fnA != NULL && fnB != NULL);
+       assert(fnA() == 1);
+       assert(fnB() == 2);
+       FreeLibrary(h);
+```
+
+### 9.6 Anti-Debug Verification
+
+**Note:** The protector stub performs only basic PEB-level anti-debug checks (Phase 2, §2.1). Comprehensive anti-debug is handled by the runtime system in [`anti_debug.hpp`](src/standalone/src/core/anti-tamper/anti_debug.hpp:1), which includes NtQueryInformationProcess, hardware breakpoint detection, RDTSC timing, thread hiding, CloseHandle traps, and 15+ other techniques. Testing confirms the handoff:
+
+```
+test_anti_debug_handoff:
+    1. Protect test.exe with --all
+    2. Launch under x64dbg (no plugins):
+       - TLS callback detects PEB.BeingDebugged → spin/crash (stub check)
+    3. Launch under x64dbg + ScyllaHide (patches PEB):
+       - TLS callback passes (PEB patched)
+       - Stub unpacks successfully
+       - Runtime anti_tamper::initialize() fires
+       - anti_debug::full_scan() detects: debug_port, debug_object,
+         hw_breakpoints, rdtsc_timing, close_handle_trap
+       - enforce_violation() terminates process
+    4. Launch normally (no debugger):
+       - All checks pass
+       - Program runs correctly
+```
+
+### 9.7 Watermark Verification
+
+```
+test_watermark:
+    1. Protect with license key "TEST-LICENSE-001":
+       aida_protector -i test.exe -o test_wm.exe --all --license-key TEST-LICENSE-001
+    2. Extract watermark from test_wm.exe using extract_watermark()
+    3. Assert: extracted watermark matches SHA-256("TEST-LICENSE-001")[0..15]
+    4. Corrupt 5% of section padding bytes randomly
+    5. Re-extract watermark
+    6. Assert: watermark still recovers correctly (redundancy holds)
+    7. Corrupt 50% of padding bytes
+    8. Re-extract watermark
+    9. Assert: watermark extraction fails (exceeds error correction threshold)
+```
+
+### 9.8 Compatibility with Runtime Anti-Tamper
+
+The protector must not interfere with the runtime anti-tamper system. Integration test:
+
+```
+test_runtime_integration:
+    1. Build AiDAStandalone.exe with full runtime anti-tamper enabled
+    2. Protect with aida_protector --all
+    3. Launch the protected AiDAStandalone.exe
+    4. Verify: stub unpacks → CRT init → main() → anti_tamper::initialize() succeeds
+    5. Verify via webhook logs:
+       - "init: syscall_ok"
+       - "init: snapshot_code_ok"
+       - "init: anti_debug_ok"
+       - "init: anti_hook_ok"
+       - "init: virtualizer_ok"
+       - "init: code_encrypt_ok"
+       - "init: metamorphic_ok"
+    6. Verify: all 30 anti-tamper subsystems operational after static protection
+```

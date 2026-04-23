@@ -1124,3 +1124,107 @@ endif()
 endif()
 
 
+
+# -- AiDA PE Protector (build tool) ----------------------------------
+option(BUILD_PROTECTOR "Build the AiDA PE Protector tool" ON)
+
+if(BUILD_PROTECTOR)
+    add_executable(AiDAProtector
+        tools/protector/main.cpp
+    )
+
+    target_include_directories(AiDAProtector PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/protector
+    )
+
+    target_compile_definitions(AiDAProtector PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+    )
+
+    target_compile_options(AiDAProtector PRIVATE
+        /W4 /EHsc /O2 /Zc:__cplusplus /permissive- /MD
+    )
+
+    target_link_libraries(AiDAProtector PRIVATE bcrypt advapi32)
+
+    set_target_properties(AiDAProtector PROPERTIES
+        OUTPUT_NAME "aida_protector"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+    )
+
+    add_executable(AiDAExtractPayload tools/protector/payload/extract_payload.cpp)
+    target_compile_options(AiDAExtractPayload PRIVATE /W4 /WX /EHsc /O2 /Zc:__cplusplus /std:c++17)
+    target_compile_definitions(AiDAExtractPayload PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+
+    set(AIDA_PAYLOAD_OBJ "${CMAKE_BINARY_DIR}/aida_payload.obj")
+    set(AIDA_PAYLOAD_HDR "${CMAKE_BINARY_DIR}/generated/payload_blob.hpp")
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
+
+    find_program(AIDA_MSVC_CL cl.exe REQUIRED)
+
+    add_custom_command(
+        OUTPUT "${AIDA_PAYLOAD_OBJ}"
+        COMMAND "${AIDA_MSVC_CL}" /nologo /c /GS- /GR- /Od /Oi /Ob0 /Zl /EHs- /Gw /Gy /W3
+                /D_NO_CRT_STDIO_INLINE /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX
+                /Fo${AIDA_PAYLOAD_OBJ}
+                ${CMAKE_SOURCE_DIR}/tools/protector/payload/payload.c
+        DEPENDS "${CMAKE_SOURCE_DIR}/tools/protector/payload/payload.c"
+        COMMENT "Compiling AiDA PIC payload..."
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT "${AIDA_PAYLOAD_HDR}"
+        COMMAND "$<TARGET_FILE:AiDAExtractPayload>"
+                "${AIDA_PAYLOAD_OBJ}"
+                "${AIDA_PAYLOAD_HDR}"
+                kAidaUnpackBlob
+        DEPENDS "${AIDA_PAYLOAD_OBJ}" AiDAExtractPayload
+        COMMENT "Extracting AiDA PIC payload blob..."
+        VERBATIM
+    )
+
+    add_custom_target(AiDAPayloadBlob DEPENDS "${AIDA_PAYLOAD_HDR}")
+    add_dependencies(AiDAProtector AiDAPayloadBlob)
+    target_include_directories(AiDAProtector PRIVATE "${CMAKE_BINARY_DIR}/generated")
+endif()
+
+if(BUILD_PROTECTOR)
+    if(TARGET AiDAStandalone)
+        add_custom_command(TARGET AiDAStandalone POST_BUILD
+            COMMAND $<TARGET_FILE:AiDAProtector>
+                --input "$<TARGET_FILE:AiDAStandalone>"
+                --output "$<TARGET_FILE:AiDAStandalone>"
+                --all --verbose
+            COMMENT "Protecting AiDAStandalone.exe..."
+            VERBATIM
+        )
+        add_dependencies(AiDAStandalone AiDAProtector)
+    endif()
+
+    if(TARGET AiDA_ARC)
+        add_custom_command(TARGET AiDA_ARC POST_BUILD
+            COMMAND $<TARGET_FILE:AiDAProtector>
+                --input "$<TARGET_FILE:AiDA_ARC>"
+                --output "$<TARGET_FILE:AiDA_ARC>"
+                --all --verbose
+            COMMENT "Protecting aida_core.dll..."
+            VERBATIM
+        )
+        add_dependencies(AiDA_ARC AiDAProtector)
+    endif()
+
+    if(TARGET AiDA)
+        add_custom_command(TARGET AiDA POST_BUILD
+            COMMAND $<TARGET_FILE:AiDAProtector>
+                --input "$<TARGET_FILE:AiDA>"
+                --output "$<TARGET_FILE:AiDA>"
+                --all --verbose
+            COMMENT "Protecting AiDA.dll..."
+            VERBATIM
+        )
+        add_dependencies(AiDA AiDAProtector)
+    endif()
+endif()
