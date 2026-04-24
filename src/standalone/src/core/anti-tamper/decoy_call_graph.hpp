@@ -5,16 +5,9 @@
 #include <cstdint>
 #include <cstring>
 
+#include "virtualizer.hpp"
+
 namespace anti_tamper::virtualizer::detail {
-    struct handler_slot_t;
-    using handler_fn = void(*)(struct vm_state_t&, const uint8_t*, uint32_t);
-    struct poly_dispatch_t;
-    extern handler_slot_t  g_handler_pool[];
-    extern uint32_t        g_active_slots;
-    extern uint64_t        g_pool_guard;
-    extern handler_fn      g_dispatch_table[];
-    extern bool            g_poly_initialized;
-    extern poly_dispatch_t g_poly_table[];
 }
 
 namespace anti_tamper::virtualizer { extern uint64_t g_server_poly_seed; }

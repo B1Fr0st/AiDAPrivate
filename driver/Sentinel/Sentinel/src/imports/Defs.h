@@ -7,7 +7,7 @@
 #include <Crypter.h>
 #include <imports/Strings.h>
 
-// Process access rights — not available in kernel-mode WDK headers
+
 #ifndef PROCESS_TERMINATE
 #define PROCESS_TERMINATE           0x0001
 #endif
@@ -36,10 +36,10 @@
 #define PROCESS_SUSPEND_RESUME      0x0800
 #endif
 
-// PsGetProcessImageFileName — exported by ntoskrnl but not in all WDK headers
+
 extern "C" UCHAR* NTAPI PsGetProcessImageFileName(PEPROCESS Process);
 
-// Thread access rights — not available in kernel-mode WDK headers
+
 #ifndef THREAD_TERMINATE
 #define THREAD_TERMINATE            0x0001
 #endif

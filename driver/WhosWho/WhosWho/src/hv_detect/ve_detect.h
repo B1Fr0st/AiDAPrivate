@@ -13,14 +13,14 @@ namespace ve {
         {
             struct
             {
-                uint32_t max_lbr_records : 8;   // [7:0]
+                uint32_t max_lbr_records : 8;
 #define CPUID1C_EAX_MAX_LBR_RECORDS_BIT   0
 #define CPUID1C_EAX_MAX_LBR_RECORDS_MASK  0x000000FFu
 #define CPUID1C_EAX_MAX_LBR_RECORDS(x)    ((uint32_t)((x) & 0xFFu))
 
-                uint32_t reserved0 : 23;        // [30:8]
+                uint32_t reserved0 : 23;
 
-                uint32_t lip : 1;         // [31] 1=linear IP, 0=effective IP
+                uint32_t lip : 1;
 #define CPUID1C_EAX_LIP_BIT   31
 #define CPUID1C_EAX_LIP_FLAG  0x80000000u
 #define CPUID1C_EAX_LIP(x)    (((uint32_t)(x) >> 31) & 0x1u)
@@ -37,13 +37,13 @@ namespace ve {
         {
             struct
             {
-                uint32_t reserved0 : 16;            // [15:0]
-                uint32_t evlog_bitmap : 4;          // [19:16] Event Logging Supported bitmap
+                uint32_t reserved0 : 16;
+                uint32_t evlog_bitmap : 4;
 #define CPUID1C_ECX_EVLOG_BITMAP_BIT   16
 #define CPUID1C_ECX_EVLOG_BITMAP_MASK  0x000F0000u
 #define CPUID1C_ECX_EVLOG_BITMAP(x)    (((uint32_t)(x) >> 16) & 0xFu)
 
-                uint32_t reserved1 : 12;            // [31:20]
+                uint32_t reserved1 : 12;
             };
             uint32_t flags;
         } ecx;
@@ -57,85 +57,41 @@ namespace ve {
     {
         struct
         {
-            //
-            // Bit 0
-            // Enable LBR recording
-            //
+
+
             uint64_t lbr_en : 1;
 
-            //
-            // Bit 1
-            // Enable Conditional Branch logging (Jcc, LOOP*, J*CXZ)
-            //
+
             uint64_t cond : 1;
 
-            //
-            // Bit 2
-            // Enable Near Indirect JMP logging (JMP r/m*)
-            //
+
             uint64_t near_ind_jmp : 1;
 
-            //
-            // Bit 3
-            // Enable Near Relative JMP logging (JMP rel*)
-            //
+
             uint64_t near_rel_jmp : 1;
 
-            //
-            // Bit 4
-            // Enable Near Indirect CALL logging (CALL r/m*)
-            //
+
             uint64_t near_ind_call : 1;
 
-            //
-            // Bit 5
-            // Enable Near Relative CALL logging (CALL rel*)
-            // (excluding displacement-0 calls to next RIP)
-            //
+
             uint64_t near_rel_call : 1;
 
-            //
-            // Bit 6
-            // Enable Near RET logging (RET 0xC3)
-            //
+
             uint64_t near_ret : 1;
 
-            //
-            // Bit 7
-            // Enable OTHER_BRANCH logging:
-            //   - far CALL/JMP
-            //   - interrupts
-            //   - exceptions (except #DB)
-            //   - INTn/INT3/INTO
-            //   - IRET
-            //   - TSX abort
-            //   - EENTER/ERESUME/EEXIT/AEX
-            //   - INIT/SIPI/RSM
-            //
+
             uint64_t other_branch : 1;
 
-            //
-            // Bit 8
-            // Enable Call Stack mode (LIFO pop behavior on RET)
-            //
+
             uint64_t call_stack : 1;
 
-            //
-            // Bit 9
-            // Record CPL=0 (kernel) branches
-            //
+
             uint64_t os : 1;
 
-            //
-            // Bit 10
-            // Record CPL>0 (user) branches
-            //
+
             uint64_t usr : 1;
 
-            //
-            // Bits 11ï¿½63
-            // Reserved (must be zero)
-            //
+
             uint64_t reserved : 53;
 
         };
@@ -152,7 +108,7 @@ namespace ve {
 
     struct legacy_lbr_caps_t {
         bool supported;
-        uint8_t depth; 
+        uint8_t depth;
         bool has_info1;
     };
 
@@ -175,15 +131,12 @@ namespace ve {
 #define LBR_FORMAT_LIP             0x1
 #define LBR_FORMAT_EIP             0x2
 #define LBR_FORMAT_EIP_FLAGS       0x3
-#define LBR_FORMAT_EIP_FLAGS2      0x4 
+#define LBR_FORMAT_EIP_FLAGS2      0x4
 #define LBR_FORMAT_INFO            0x5
 #define LBR_FORMAT_TIME            0x6
-#define LBR_FORMAT_INFO2           0x7 
-#define LBR_PERF_UNSSUPORTED       0x3F      
+#define LBR_FORMAT_INFO2           0x7
+#define LBR_PERF_UNSSUPORTED       0x3F
 
-    /*
-        Helpers
-    */
 
     inline legacy_lbr_caps_t get_legacy_lbr_caps() {
         legacy_lbr_caps_t caps{};
@@ -208,9 +161,6 @@ namespace ve {
         if (fam != 0x06)
             return caps;
 
-        /*
-            Table ripped straight out of the sdm
-        */
 
         static constexpr uint8_t depth32_noinfo[] = { 0x5C, 0x5F };
 
@@ -285,16 +235,13 @@ namespace ve {
         return caps;
     }
 
-    /*
-        Detections
-    */
 
     inline bool detection_1(void) {
         safety_net::idt::reset_interrupt_count();
 
         bool hypervisor_detected = false;
         uint64_t curr_interrupt_count = safety_net::idt::get_interrupt_count();
-   
+
         __try {
             __cause_ve();
             hypervisor_detected = true;
@@ -303,7 +250,7 @@ namespace ve {
             uint64_t new_interrupt_count = safety_net::idt::get_interrupt_count();
             idt_regs_ecode_t* last_int = safety_net::idt::get_core_last_interrupt_record();
 
-            // If an incorrect interrupt or no interrupt at all was raised this means incorrect idt shadowing
+
             if (last_int->exception_vector != virtualization_exception ||
                 curr_interrupt_count == new_interrupt_count)
                 hypervisor_detected = true;
@@ -312,14 +259,9 @@ namespace ve {
         return hypervisor_detected;
     }
 
-    /*
-        Basically the idea is to cause a #ve and check whether the LBR layout contains an out of range address or not
-    */
+
     inline bool detection_2(void) {
-        /*
-            First check the CPU family via cpuid and then check if we should support lbr in some way or form?
-            Table documenting valid from and to ranges in cpu families: SDM: Vol3:19.4.8
-        */
+
 
         cpuid_eax_01 cpuid_1;
         __cpuid((int*)&cpuid_1, 1);
@@ -330,7 +272,7 @@ namespace ve {
         ia32_perf_capabilities_register cap;
         cap.flags = __readmsr(IA32_PERF_CAPABILITIES);
 
-        // As per Vol3:Chapter 20.4.3 this also defines non supported lbr features
+
         bool lbr_supported = (cap.lbr_format != LBR_PERF_UNSSUPORTED);
 
         lbr_config_t config;
@@ -340,7 +282,7 @@ namespace ve {
         if (cpuid_7.edx.arch_lbr) {
             config.mode = lbr_mode_t::LBR_MODE_ARCH;
 
-            // contradiction
+
             if (!lbr_supported) {
                 return true;
             }
@@ -351,7 +293,7 @@ namespace ve {
 
         bool hv_detected = false;
 
-        // Most processors will still have legacy lbr tracing
+
         if (lbr_supported && config.mode == lbr_mode_t::LBR_MODE_LEGACY) {
             legacy_lbr_caps_t lbr_caps = get_legacy_lbr_caps();
             if (!lbr_caps.has_info1)
@@ -391,7 +333,7 @@ namespace ve {
                 safety_net::idt::set_should_disable_lbr_in_handler(true);
 
                 __cause_ve();
-     
+
                 __try { __writemsr(IA32_DEBUGCTL, 0); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { hv_detected = true; __leave; }
             }
@@ -450,7 +392,7 @@ namespace ve {
         else if (lbr_supported && config.mode == lbr_mode_t::LBR_MODE_ARCH) {
             cpuid_eax_1c cpuid_1c;
             __cpuid((int*)&cpuid_1c, 0x1c);
-            
+
             uint64_t max_lbr_record_count = cpuid_1c.eax.max_lbr_records;
             if (lbr_supported && (max_lbr_record_count == 0 || max_lbr_record_count > 32)) {
                 return true;
@@ -485,15 +427,15 @@ namespace ve {
             new_ctl.os = 1;
 
             __try {
-                // Disable LBR first
+
                 __try { __writemsr(IA32_LBR_CTL, 0); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { hv_detected = true; __leave; }
 
-                // Program depth
+
                 __try { __writemsr(IA32_LBR_DEPTH, max_lbr_record_count); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { hv_detected = true; __leave; }
 
-                // Clear LBR stack entries
+
                 for (uint32_t i = 0; i < (uint32_t)max_lbr_record_count; ++i) {
                     __try { __writemsr(IA32_ARCH_LBR_0_FROM_IP + i, 0); }
                     __except (EXCEPTION_EXECUTE_HANDLER) { hv_detected = true; __leave; }
@@ -505,16 +447,14 @@ namespace ve {
                 __try { __writemsr(IA32_LBR_CTL, new_ctl.flags); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { hv_detected = true; __leave; }
 
-                /*
-                    This should throw in the shadowed hv info etc.
-                */
+
                 __cause_ve();
 
                 __try { __writemsr(IA32_LBR_CTL, 0); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { hv_detected = true; __leave; }
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Payload fault or something else; best-effort disable
+
                 __try { __writemsr(IA32_LBR_CTL, 0); }
                 __except (EXCEPTION_EXECUTE_HANDLER) {}
             }
@@ -552,7 +492,7 @@ namespace ve {
                 }
             }
 
-            // Restore
+
             __try { __writemsr(IA32_LBR_CTL, 0); }
             __except (EXCEPTION_EXECUTE_HANDLER) {  }
 
@@ -565,18 +505,14 @@ namespace ve {
             return hv_detected;
         }
         else {
-            // Can happen cause we can't rly assume we don't hit a new / other CPU generation, also what about AMD but still weird?
+
             return false;
         }
 
-        // Unreachable
+
     }
 
-    /*
-        Detection 3: Garbage MSR Write
-        Report method: Write to MSR outside bitmap range (0x2000-0xBFFFFFFF).
-        Real hardware generates #GP, naive VMMs may swallow the write.
-    */
+
     inline bool detection_3(void) {
         constexpr uint32_t GARBAGE_MSR = 0xDEAD;
         bool got_exception = false;
@@ -602,12 +538,7 @@ namespace ve {
         return !got_exception;
     }
 
-    /*
-        Detection 4: XSETBV #GP injection
-        Report method: Clear XCR0 bit 0 which must always be set.
-        Real hardware injects #GP(0). Naive VMMs blindly execute _xsetbv in host and bugcheck.
-        If no exception -> VMM swallowed the illegal write.
-    */
+
     inline bool detection_4(void) {
         int regs[4] = {};
         __cpuid(regs, 1);
@@ -645,12 +576,7 @@ namespace ve {
         return false;
     }
 
-    /*
-        Detection 5: Synthetic MSR probe
-        Report method: Read from MSR 0x40000000 (HV synthetic range).
-        Real hardware #GPs. Commercial HVs (Hyper-V, VMware) respond with data.
-        If we already know MS Hyper-V root is present we skip this â€” it will respond.
-    */
+
     inline bool detection_5(void) {
         int regs[4] = {};
         __cpuid(regs, 1);
@@ -668,12 +594,7 @@ namespace ve {
         return !got_exception;
     }
 
-    /*
-        Detection 6: CPUID leaf comparison
-        Report method: Compare reserved leaf 0x40000000 against an invalid leaf.
-        On bare metal both return identical data (highest standard leaf fallback).
-        A VMM intercepts 0x40000000 to report its identity.
-    */
+
     inline bool detection_6(void) {
         int regs[4] = {};
         __cpuid(regs, 1);
@@ -706,11 +627,7 @@ namespace ve {
         return false;
     }
 
-    /*
-        Detection 7: RDTSC/CPUID/RDTSC timing
-        Report method: Standard timing attack. CPUID causes VM-exit adding overhead.
-        Multiple rounds, median comparison against bare-metal baseline (~200-400 cycles).
-    */
+
     inline bool detection_7(void) {
         constexpr int ROUNDS = 64;
         constexpr uint32_t BARE_METAL_THRESHOLD = 1500;
@@ -743,12 +660,7 @@ namespace ve {
         return median > BARE_METAL_THRESHOLD;
     }
 
-    /*
-        Detection 8: IET Divergence via APERF
-        Report method: Compare APERF delta of CPUID (exiting inst) vs a non-exiting inst.
-        On bare metal the non-exiting candidate takes longer. Under VMM, CPUID takes much
-        longer because it causes a VM-exit. If CPUID APERF > candidate APERF -> VMM present.
-    */
+
     inline bool detection_8(void) {
         ia32_perf_capabilities_register perf_cap;
         __try {
@@ -822,13 +734,7 @@ namespace ve {
         return false;
     }
 
-    /*
-        Detection 9: INVD cache side-channel
-        Report method: Push value to stack (cached), set to 0 in WB memory,
-        INVD flushes caches without writeback. On real hardware the original
-        push survives (in system memory). Under a VMM that emulates INVD as
-        WBINVD (or NOP), the zero overwrites.
-    */
+
     inline bool detection_9(void) {
         bool detected = false;
 
@@ -858,12 +764,7 @@ namespace ve {
         return detected;
     }
 
-    /*
-        Detection 10: CR4.VMXE & VMX availability check
-        Report method: Some VMMs mask CR4.VMXE=0 in read shadow but still allow
-        VMX instructions. On real hardware with VMXE=0, VMREAD causes #UD.
-        If VMXE reads as 0 but VMREAD doesn't #UD -> VMM detected.
-    */
+
     inline bool detection_10(void) {
         uint64_t cr4 = __readcr4();
         bool vmxe_visible = (cr4 & (1ULL << 13)) != 0;
@@ -883,11 +784,7 @@ namespace ve {
         return !got_ud;
     }
 
-    /*
-        Detection 11: LBR stack consistency across VM-exit
-        Report method: Save LBR TOS, force VM-exit via CPUID, check LBR TOS again.
-        If TOS changed -> VMM doesn't save/restore LBR state properly.
-    */
+
     inline bool detection_11(void) {
         ia32_perf_capabilities_register cap;
         __try { cap.flags = __readmsr(IA32_PERF_CAPABILITIES); }
@@ -977,17 +874,17 @@ namespace ve {
         const int num_detections = 11;
         bool detection_results[num_detections];
         bool (*detections[])(void) = {
-            detection_1,   // #VE trigger
-            detection_2,   // LBR stack after #VE
-            detection_3,   // Garbage MSR write
-            detection_4,   // XSETBV #GP injection
-            detection_5,   // Synthetic MSR probe
-            detection_6,   // CPUID leaf comparison
-            detection_7,   // RDTSC/CPUID/RDTSC timing
-            detection_8,   // IET divergence (APERF)
-            detection_9,   // INVD cache side-channel
-            detection_10,  // CR4.VMXE + VMX check
-            detection_11,  // LBR TOS consistency
+            detection_1,
+            detection_2,
+            detection_3,
+            detection_4,
+            detection_5,
+            detection_6,
+            detection_7,
+            detection_8,
+            detection_9,
+            detection_10,
+            detection_11,
         };
 
         const char* detection_names[] = {

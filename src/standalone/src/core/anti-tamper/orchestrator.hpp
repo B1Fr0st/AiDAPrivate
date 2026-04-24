@@ -20,6 +20,7 @@
 #include "virtualizer.hpp"
 #include "code_encrypt.hpp"
 #include "metamorphic.hpp"
+#include "vm_jit.hpp"
 #include "cloakwork.hpp"
 #include "ai_deception.hpp"
 #include "token_chain.hpp"
@@ -56,12 +57,18 @@ inline bool vm_protect_function(void* func, size_t func_len)
     uint64_t base_addr = reinterpret_cast<uint64_t>(func);
     uint64_t seed = __rdtsc() ^ base_addr ^ GetCurrentProcessId();
 
+    uint64_t k0 = 0, k1 = 0;
+    integrity::get_session_keys(k0, k1);
+    uint64_t master_key = k0 ^ k1 ^ 0x9E3779B97F4A7C15ULL;
+    auto* pool = virtualizer::pool_manager::get_or_create(base_addr, master_key);
+    if (!pool) return false;
+
     virtualizer::detail::vm_state_t tmp_vm;
-    virtualizer::detail::init_vm(tmp_vm, seed);
+    virtualizer::detail::init_vm(tmp_vm, seed, pool);
 
     auto lifted = vm_compiler::x86_lifter::compile_function(
         static_cast<const uint8_t*>(func), func_len,
-        base_addr, seed ^ 0x6A09E667F3BCC908ULL, tmp_vm.opcode_map);
+        base_addr, seed ^ 0x6A09E667F3BCC908ULL, tmp_vm.opcode_map, pool);
 
     virtualizer::detail::destroy_vm(tmp_vm);
 

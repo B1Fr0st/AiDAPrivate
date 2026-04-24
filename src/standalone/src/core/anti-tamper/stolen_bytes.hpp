@@ -30,6 +30,7 @@ namespace detail {
         std::vector<uint8_t> vm_bytecode;
         uint64_t vm_seed;
         uint64_t continuation_addr;
+        anti_tamper::virtualizer::detail::handler_pool_t* pool;
     };
 
     struct stolen_state_t
@@ -48,6 +49,13 @@ namespace detail {
         return s;
     }
 
+    inline void emit_vm_entry_stub(uint32_t func_rva, std::vector<uint8_t>& out)
+    {
+        uint8_t bytes[4];
+        memcpy(bytes, &func_rva, 4);
+        out.insert(out.begin(), bytes, bytes + 4);
+    }
+
     static constexpr uint32_t MAX_BB_ENTRIES = 256;
     static constexpr uint32_t BB_TRAMPOLINE_PAGE_SIZE = 65536;
     static constexpr uint32_t BB_TRAMPOLINE_STRIDE = 96;
@@ -63,6 +71,7 @@ namespace detail {
         std::vector<uint8_t> vm_bytecode;
         uint64_t vm_seed;
         uint64_t trampoline_addr;
+        anti_tamper::virtualizer::detail::handler_pool_t* pool;
     };
 
     struct bb_state_t
@@ -187,7 +196,7 @@ inline void vm_prologue_execute(detail::stolen_entry_t* entry)
         return;
 
     anti_tamper::virtualizer::detail::vm_state_t vm;
-    anti_tamper::virtualizer::detail::init_vm(vm, entry->vm_seed);
+    anti_tamper::virtualizer::detail::init_vm(vm, entry->vm_seed, entry->pool);
     anti_tamper::virtualizer::detail::vm_execute(
         vm, entry->vm_bytecode.data(),
         static_cast<uint32_t>(entry->vm_bytecode.size()));
@@ -246,13 +255,17 @@ inline bool steal_function_prologue(void* target_func)
     uint64_t vm_seed = anti_tamper::virtualizer::detail::secure_seed();
     entry.vm_seed = vm_seed;
 
+    entry.pool = anti_tamper::virtualizer::pool_manager::get_or_create(
+        entry.original_addr,
+        s.session_key[0] ^ s.session_key[1] ^ 0x9E3779B97F4A7C15ULL);
+
     anti_tamper::virtualizer::detail::vm_state_t tmp_vm;
-    anti_tamper::virtualizer::detail::init_vm(tmp_vm, vm_seed);
+    anti_tamper::virtualizer::detail::init_vm(tmp_vm, vm_seed, entry.pool);
 
 #ifdef AIDA_STANDALONE
     auto lifted = vm_compiler::x86_lifter::compile_function(
         code, steal_len, reinterpret_cast<uint64_t>(code),
-        vm_seed ^ 0x6A09E667F3BCC908ULL, tmp_vm.opcode_map);
+        vm_seed ^ 0x6A09E667F3BCC908ULL, tmp_vm.opcode_map, entry.pool);
     entry.vm_bytecode = lifted.bytecode;
 #else
     vm_compiler::program_t prog;
@@ -364,7 +377,7 @@ inline void vm_bb_execute(detail::bb_entry_t* entry)
         return;
 
     anti_tamper::virtualizer::detail::vm_state_t vm;
-    anti_tamper::virtualizer::detail::init_vm(vm, entry->vm_seed);
+    anti_tamper::virtualizer::detail::init_vm(vm, entry->vm_seed, entry->pool);
     anti_tamper::virtualizer::detail::vm_execute(
         vm, entry->vm_bytecode.data(),
         static_cast<uint32_t>(entry->vm_bytecode.size()));
@@ -517,13 +530,17 @@ inline bool steal_basic_block(void* target_func_base, size_t func_size_hint)
         uint64_t vm_seed = anti_tamper::virtualizer::detail::secure_seed();
         entry.vm_seed = vm_seed;
 
+        entry.pool = anti_tamper::virtualizer::pool_manager::get_or_create(
+            entry.original_addr,
+            bb.session_key[0] ^ bb.session_key[1] ^ 0xBF58476D1CE4E5B9ULL);
+
         anti_tamper::virtualizer::detail::vm_state_t tmp_vm;
-        anti_tamper::virtualizer::detail::init_vm(tmp_vm, vm_seed);
+        anti_tamper::virtualizer::detail::init_vm(tmp_vm, vm_seed, entry.pool);
 
 #ifdef AIDA_STANDALONE
         auto lifted = vm_compiler::x86_lifter::compile_basic_block(
             code_ptr, block.length, block.rva_start,
-            vm_seed ^ 0x6A09E667F3BCC908ULL, tmp_vm.opcode_map);
+            vm_seed ^ 0x6A09E667F3BCC908ULL, tmp_vm.opcode_map, entry.pool);
         entry.vm_bytecode = lifted.bytecode;
 #else
         vm_compiler::program_t prog;

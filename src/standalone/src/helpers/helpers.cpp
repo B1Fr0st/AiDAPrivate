@@ -608,8 +608,7 @@ void helpers::render_title()
 			anti_tamper::webhook::write_log("render", dbg);
 		}
 
-		// Refresh integrity check timestamp every ~1000 frames (~16s at 60fps)
-		// to prevent is_chain_stale() from triggering at its 60s threshold
+
 		if ((s_inline_log_ctr % 1000) == 0) {
 			anti_tamper::run_inline_check(anti_tamper::CHECK_CODE_INTEGRITY);
 		}

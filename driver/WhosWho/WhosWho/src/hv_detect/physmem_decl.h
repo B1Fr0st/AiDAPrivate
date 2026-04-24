@@ -28,7 +28,7 @@ namespace physmem {
 		bool ensure_memory_mapping_for_range(void* target_address, uint64_t size, uint64_t mem_cr3_u64);
 		bool overwrite_virtual_address_mapping(void* target_address, void* new_memory, uint64_t target_address_cr3_u64, uint64_t new_mem_cr3_u64);
 	};
-	
+
 	namespace paging_manipulation {
 		bool win_destroy_memory_page_mapping(void* memory, uint64_t& stored_flags);
 		bool win_restore_memory_page_mapping(void* memory, uint64_t stored_flags);

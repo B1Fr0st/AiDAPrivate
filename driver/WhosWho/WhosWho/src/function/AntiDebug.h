@@ -798,15 +798,15 @@ namespace continuous_anti_debug {
         }
 
         if ((cycle % 5) == 0) {
-            // Only act if the protected process is ACTUALLY being debugged.
-            // A debugger tool merely running on the system is not a threat.
+
+
             BOOLEAN target_being_debugged = FALSE;
             {
                 PEPROCESS target_proc = nullptr;
                 if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &target_proc)) && target_proc) {
                     __try {
-                        // EPROCESS.DebugPort is at offset 0x578 on Win10/11 x64 (all major builds).
-                        // Non-null means a debug port is attached to this process.
+
+
                         ULONG_PTR* debug_port_ptr = (ULONG_PTR*)((UINT8*)target_proc + 0x578);
                         if (_MmIsAddressValid(debug_port_ptr) && *debug_port_ptr != 0)
                             target_being_debugged = TRUE;

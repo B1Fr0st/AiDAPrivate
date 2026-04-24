@@ -1,7 +1,7 @@
 #pragma once
 #include <imports/Defs.h>
 
-// Declared in DriverEntry.cpp — global scope
+
 extern volatile PVOID  g_target_driver_base;
 extern volatile PVOID  g_target_driver_object;
 extern volatile ULONG  g_target_driver_size;

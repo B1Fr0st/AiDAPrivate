@@ -1051,11 +1051,11 @@ namespace debug_attach_monitor {
                             OBJECT_ATTRIBUTES dup_oa = {};
                             InitializeObjectAttributes(&dup_oa, nullptr, 0, nullptr, nullptr);
                             if (ZwDuplicateObject(owner_handle, hval, NtCurrentProcess(),
-                                    &dup, 0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, 0, 0) >= 0 && dup) {
+                                    &dup, 0x1000 , 0, 0) >= 0 && dup) {
                                 PROCESS_BASIC_INFORMATION pbi = {};
                                 ULONG pbi_ret = 0;
-                                // ZwQueryInformationProcess declared at file scope
-                                
+
+
                                 if (NT_SUCCESS(ZwQueryInformationProcess(dup,
                                         ProcessBasicInformation, &pbi, sizeof(pbi), &pbi_ret))) {
                                     if ((HANDLE)(ULONG_PTR)pbi.UniqueProcessId == target_pid) {

@@ -76,7 +76,6 @@ inline bool find_packed(context_t& c) {
     return false;
 }
 
-// ---------- P01..P13 (unchanged) ----------
 
 inline probe_result_t probe_p01(const context_t& c) {
     return { "P01", "PE32+ image", c.pe.optional_header.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC, "" };
@@ -211,17 +210,16 @@ inline probe_result_t probe_p13(const context_t& c) {
     if (!c.packed_found) {
         return { "P13", "packed section entropy in [6400,7300]", false, "no packed section" };
     }
-    // Entropy is measured on the containing packed section, which is what the
-    // flatten_entropy transform actually shapes (structured noise around the blob).
+
+
     const pe_file::section_t* sec = c.pe.section_from_rva(c.packed_rva);
     if (sec == nullptr || sec->data.empty()) {
         return { "P13", "packed section entropy in [6400,7300]", false, "section data unavailable" };
     }
     uint32_t ent = pe_file::compute_section_entropy_fixed(sec->data.data(), sec->data.size());
     bool merged = c.aux_found && ((c.aux.phase_flags & 0x2u) != 0u);
-    // Merged sections legitimately span [3500, 7950]: small targets with lots of
-    // zero-padded tail land near the low end; large real targets land near the
-    // high end even after flatten_entropy because the encrypted blob dominates.
+
+
     uint32_t lo = merged ? 3500u : 6400u;
     uint32_t hi = merged ? 7950u : 7300u;
     bool ok = (ent >= lo && ent <= hi);
@@ -231,9 +229,7 @@ inline probe_result_t probe_p13(const context_t& c) {
     return { "P13", "packed section entropy (with merge awareness)", ok, buf };
 }
 
-// ---------- P14..P20 (new) ----------
 
-// P14: all 7 phase bits set when --all was used
 inline probe_result_t probe_p14(const context_t& c) {
     if (!c.aux_found) { return { "P14", "phase_flags = 7/7 phases fired", false, "no aux block" }; }
     uint32_t pf = c.aux.phase_flags & 0x7Fu;
@@ -245,7 +241,7 @@ inline probe_result_t probe_p14(const context_t& c) {
     return { "P14", "all 7 protection phases fired (--all)", ok, buf };
 }
 
-// P15: DllCharacteristics bits 0x4160 cleared (DYNAMIC_BASE | NX_COMPAT | GUARD_CF)
+
 inline probe_result_t probe_p15(const context_t& c) {
     uint16_t dll = c.pe.optional_header.DllCharacteristics;
     uint16_t bad = dll & 0x4160u;
@@ -255,7 +251,7 @@ inline probe_result_t probe_p15(const context_t& c) {
     return { "P15", "DYNAMIC_BASE|NX_COMPAT|GUARD_CF cleared", ok, buf };
 }
 
-// P16: RELOCS_STRIPPED in FileHeader.Characteristics
+
 inline probe_result_t probe_p16(const context_t& c) {
     uint16_t ch = c.pe.file_header.Characteristics;
     bool ok = (ch & 0x0001u) != 0u;
@@ -264,9 +260,7 @@ inline probe_result_t probe_p16(const context_t& c) {
     return { "P16", "IMAGE_FILE_RELOCS_STRIPPED set", ok, buf };
 }
 
-// P17: packed section is RWX and the packed blob (APKD onward) has nonzero stub
-// bytes in its first 256 bytes. Scans `packed_data` which begins at the APKD
-// header — ignoring any leading zero padding from merged target sections.
+
 inline probe_result_t probe_p17(const context_t& c) {
     if (!c.packed_found) { return { "P17", "packed section RWX + stub head nonzero", false, "no packed section" }; }
     const uint32_t rwx = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
@@ -283,8 +277,7 @@ inline probe_result_t probe_p17(const context_t& c) {
     return { "P17", "packed section RWX and stub has nonzero byte in first 256", ok, buf };
 }
 
-// P18: if watermark configured (nonzero), watermark_hash must also be nonzero.
-// If watermark is all-zero (no license bound at protect time), treat as INFO pass.
+
 inline probe_result_t probe_p18(const context_t& c) {
     if (!c.aux_found) { return { "P18", "watermark + watermark_hash well-formed", false, "no aux block" }; }
     bool wm_nz = false;
@@ -301,7 +294,7 @@ inline probe_result_t probe_p18(const context_t& c) {
     return { "P18", "watermark and watermark_hash both nonzero", ok, buf };
 }
 
-// P19: DataDirectories [1]=Import, [6]=Debug, [10]=LoadConfig, [12]=IAT all zeroed
+
 inline probe_result_t probe_p19(const context_t& c) {
     const int idx[4] = { 1, 6, 10, 12 };
     int bad = 0;
@@ -318,7 +311,7 @@ inline probe_result_t probe_p19(const context_t& c) {
     return { "P19", "DD[1/6/10/12] zeroed (Import/Debug/LoadCfg/IAT)", ok, buf };
 }
 
-// P20: polymorphic_build_nonce nonzero when polymorphic phase fired (build-determinism hint)
+
 inline probe_result_t probe_p20(const context_t& c) {
     if (!c.aux_found) { return { "P20", "polymorphic build nonce present", false, "no aux block" }; }
     bool poly = (c.aux.phase_flags & 0x1u) != 0u;
@@ -381,4 +374,4 @@ inline int verify_file(const std::string& path) {
     return (rep.passed == rep.total) ? 0 : 1;
 }
 
-} // namespace verifier
+}

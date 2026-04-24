@@ -723,7 +723,7 @@ inline void tick()
     static std::atomic<uint32_t> s_tick_num{0};
     uint32_t tn = s_tick_num.fetch_add(1);
     {
-        // compute score for logging
+
         uint32_t _sc = 0, _fam = 0; int _fc = 0;
         for (int _b = 0; _b < 32; ++_b) {
             if ((mask & (1u << _b)) == 0) continue;

@@ -958,6 +958,8 @@ struct protect_options_t {
     bool ghost_veh = false;
     bool rdtsc_entangle = false;
     bool opaque_predicates = false;
+    bool ast_poison = false;
+    bool symexec_bombs = false;
     uint32_t tamper_response_level = 0;
     uint8_t  license_hash[16] = {0};
 };
@@ -972,7 +974,10 @@ struct section_skip_list {
     }
 
     static bool is_skipped(const char name[8]) {
-        return name_equals(name, ".reloc") || name_equals(name, ".rsrc");
+        return name_equals(name, ".reloc")
+            || name_equals(name, ".rsrc")
+            || name_equals(name, ".gehi")
+            || name_equals(name, ".epheme");
     }
 };
 
@@ -1960,6 +1965,412 @@ inline std::vector<uint8_t> generate_structured_noise(size_t target_size,
 
 }
 
+namespace ast_poison_detail {
+
+inline uint64_t splitmix(uint64_t& s) {
+    s += 0x9E3779B97F4A7C15ull;
+    uint64_t z = s;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+inline void push_u16(std::vector<uint8_t>& v, uint16_t x) {
+    v.push_back(static_cast<uint8_t>(x & 0xFFu));
+    v.push_back(static_cast<uint8_t>((x >> 8) & 0xFFu));
+}
+
+inline void push_u32(std::vector<uint8_t>& v, uint32_t x) {
+    for (int i = 0; i < 4; ++i) { v.push_back(static_cast<uint8_t>((x >> (8 * i)) & 0xFFu)); }
+}
+
+inline void push_u64(std::vector<uint8_t>& v, uint64_t x) {
+    for (int i = 0; i < 8; ++i) { v.push_back(static_cast<uint8_t>((x >> (8 * i)) & 0xFFu)); }
+}
+
+inline void pad_record(std::vector<uint8_t>& v, size_t record_start) {
+    while (((v.size() - record_start) & 3u) != 0u) {
+        v.push_back(static_cast<uint8_t>(0xF1u + ((v.size() - record_start) & 3u)));
+    }
+}
+
+inline void build_codeview_blob(std::vector<uint8_t>& out, uint64_t seed) {
+    uint64_t st = seed ^ 0xA57C0DE70150AECDull;
+    const uint32_t kRsdsMagic = 0x53445352u;
+    push_u32(out, kRsdsMagic);
+    for (int i = 0; i < 16; ++i) { out.push_back(static_cast<uint8_t>(splitmix(st) & 0xFFu)); }
+    push_u32(out, static_cast<uint32_t>(splitmix(st) & 0x7FFFFFFFu));
+    const char pdb_name[] = "aida_private_types.pdb";
+    for (size_t i = 0; i < sizeof(pdb_name); ++i) { out.push_back(static_cast<uint8_t>(pdb_name[i])); }
+    while ((out.size() & 3u) != 0u) { out.push_back(0); }
+
+    push_u32(out, 0x00000004u);
+
+    const uint32_t kRingCount = 8192u;
+    uint32_t first_type_index = 0x1000u;
+
+    for (uint32_t n = 0; n < kRingCount; ++n) {
+        size_t rec_start = out.size();
+        push_u16(out, 0);
+        push_u16(out, 0x1203u);
+        uint32_t ref_target = first_type_index + ((n + 1u) % kRingCount);
+        push_u16(out, static_cast<uint16_t>(0x1503u));
+        push_u16(out, static_cast<uint16_t>(0x0200u));
+        push_u32(out, ref_target);
+        push_u32(out, ref_target ^ 0xDEADBEEFu);
+        push_u16(out, static_cast<uint16_t>(splitmix(st) & 0xFFFFu));
+        push_u16(out, 0x8000u);
+        pad_record(out, rec_start);
+        uint16_t len = static_cast<uint16_t>(out.size() - rec_start - 2u);
+        out[rec_start]     = static_cast<uint8_t>(len & 0xFFu);
+        out[rec_start + 1] = static_cast<uint8_t>((len >> 8) & 0xFFu);
+    }
+
+    for (uint32_t n = 0; n < kRingCount; ++n) {
+        size_t rec_start = out.size();
+        push_u16(out, 0);
+        push_u16(out, 0x1504u);
+        uint32_t field_ref = first_type_index + ((n + 1u) % kRingCount);
+        uint32_t derived_ref = first_type_index + ((n + 2u) % kRingCount);
+        uint32_t vshape_ref = first_type_index + ((n + 3u) % kRingCount);
+        push_u16(out, static_cast<uint16_t>((n & 0x7FFFu) | 0x8000u));
+        push_u16(out, 0x0200u);
+        push_u32(out, field_ref);
+        push_u32(out, derived_ref);
+        push_u32(out, vshape_ref);
+        push_u16(out, 0x8004u);
+        push_u32(out, static_cast<uint32_t>(splitmix(st) & 0xFFFFFFFFu));
+        char name[24];
+        for (int i = 0; i < 20; ++i) {
+            uint64_t x = splitmix(st);
+            name[i] = static_cast<char>(((x & 0x1Fu) + static_cast<uint64_t>('A')));
+        }
+        name[20] = '\0';
+        name[21] = '\0';
+        name[22] = '\0';
+        name[23] = '\0';
+        for (int i = 0; i < 21; ++i) { out.push_back(static_cast<uint8_t>(name[i])); }
+        pad_record(out, rec_start);
+        uint16_t len = static_cast<uint16_t>(out.size() - rec_start - 2u);
+        out[rec_start]     = static_cast<uint8_t>(len & 0xFFu);
+        out[rec_start + 1] = static_cast<uint8_t>((len >> 8) & 0xFFu);
+    }
+
+    for (uint32_t n = 0; n < 256u; ++n) {
+        size_t rec_start = out.size();
+        push_u16(out, 0);
+        push_u16(out, 0x1001u);
+        uint32_t self_ref = first_type_index + (kRingCount * 2u) + n;
+        push_u32(out, self_ref);
+        push_u16(out, 0x000Fu);
+        pad_record(out, rec_start);
+        uint16_t len = static_cast<uint16_t>(out.size() - rec_start - 2u);
+        out[rec_start]     = static_cast<uint8_t>(len & 0xFFu);
+        out[rec_start + 1] = static_cast<uint8_t>((len >> 8) & 0xFFu);
+    }
+}
+
+inline void build_dwarf_blob(std::vector<uint8_t>& out, uint64_t seed) {
+    uint64_t st = seed ^ 0xDEAD0DBBF0015A7Eull;
+    push_u32(out, 0xFFFFFFFFu);
+    push_u64(out, 0xFFFFFFFFFFFFFFF0ull);
+    size_t header_mark = out.size();
+    push_u16(out, 0x0004u);
+    push_u64(out, 0x0ull);
+    out.push_back(0x08u);
+
+    const uint32_t kCircularDies = 1024u;
+    for (uint32_t i = 0; i < kCircularDies; ++i) {
+        size_t die_off = out.size();
+        out.push_back(0x02u);
+        push_u32(out, static_cast<uint32_t>(die_off & 0xFFFFFFFFu));
+        out.push_back(0x47u);
+        push_u32(out, static_cast<uint32_t>(die_off & 0xFFFFFFFFu));
+        out.push_back(0x03u);
+        char nm[9];
+        for (int j = 0; j < 8; ++j) {
+            uint64_t x = splitmix(st);
+            nm[j] = static_cast<char>(((x & 0x1Fu) + static_cast<uint64_t>('A')));
+        }
+        nm[8] = '\0';
+        for (int j = 0; j < 9; ++j) { out.push_back(static_cast<uint8_t>(nm[j])); }
+    }
+
+    out.push_back(0x00u);
+    out.push_back(0x00u);
+    out.push_back(0x00u);
+    out.push_back(0x00u);
+    (void)header_mark;
+}
+
+}
+
+inline void inject_ast_poison(pe_file::pe_image_t& pe, uint64_t seed) {
+    std::vector<uint8_t> blob;
+    blob.resize(sizeof(IMAGE_DEBUG_DIRECTORY), 0);
+    uint32_t cv_off = static_cast<uint32_t>(blob.size());
+    ast_poison_detail::build_codeview_blob(blob, seed);
+    uint32_t cv_size = static_cast<uint32_t>(blob.size() - cv_off);
+    ast_poison_detail::build_dwarf_blob(blob, seed ^ 0xB1AC0DE11DEA7EFFull);
+
+    while (blob.size() < 0x18000u) {
+        uint64_t pad_seed = seed ^ (static_cast<uint64_t>(blob.size()) * 0x9E37u);
+        uint64_t z = pad_seed;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z = z ^ (z >> 31);
+        for (int i = 0; i < 8 && blob.size() < 0x18000u; ++i) {
+            blob.push_back(static_cast<uint8_t>((z >> (8 * i)) & 0xFFu));
+        }
+    }
+
+    char sec_name[8] = { '.','g','e','h','i',0,0,0 };
+    pe_file::section_t& sec = pe_file::add_section(
+        pe, sec_name,
+        IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_INITIALIZED_DATA,
+        blob);
+
+    IMAGE_DEBUG_DIRECTORY dd{};
+    dd.Characteristics = 0;
+    dd.TimeDateStamp = 0;
+    dd.MajorVersion = 0;
+    dd.MinorVersion = 0;
+    dd.Type = IMAGE_DEBUG_TYPE_CODEVIEW;
+    dd.SizeOfData = cv_size;
+    dd.AddressOfRawData = sec.virtual_address + cv_off;
+    dd.PointerToRawData = 0;
+    std::memcpy(sec.data.data(), &dd, sizeof(dd));
+
+    pe.data_directories[IMAGE_DIRECTORY_ENTRY_DEBUG].rva = sec.virtual_address;
+    pe.data_directories[IMAGE_DIRECTORY_ENTRY_DEBUG].size = static_cast<uint32_t>(sizeof(IMAGE_DEBUG_DIRECTORY));
+    pe.optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = sec.virtual_address;
+    pe.optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size = static_cast<uint32_t>(sizeof(IMAGE_DEBUG_DIRECTORY));
+}
+
+inline void fixup_ast_poison_debug_pointer(pe_file::pe_image_t& pe) {
+    uint32_t dbg_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_DEBUG].rva;
+    if (dbg_rva == 0u) { return; }
+    pe_file::section_t* sec = pe.section_from_rva(dbg_rva);
+    if (sec == nullptr) { return; }
+    if (std::memcmp(sec->name, ".gehi", 5) != 0) { return; }
+    uint32_t off = dbg_rva - sec->virtual_address;
+    if (off + sizeof(IMAGE_DEBUG_DIRECTORY) > sec->data.size()) { return; }
+    IMAGE_DEBUG_DIRECTORY dd{};
+    std::memcpy(&dd, sec->data.data() + off, sizeof(dd));
+    if (sec->raw_offset != 0u && dd.AddressOfRawData >= sec->virtual_address) {
+        dd.PointerToRawData = sec->raw_offset + (dd.AddressOfRawData - sec->virtual_address);
+        std::memcpy(sec->data.data() + off, &dd, sizeof(dd));
+    }
+}
+
+namespace symexec_bomb_detail {
+
+inline void emit_mov_rax_imm64(std::vector<uint8_t>& code, uint64_t imm) {
+    code.push_back(0x48u);
+    code.push_back(0xB8u);
+    for (int i = 0; i < 8; ++i) { code.push_back(static_cast<uint8_t>((imm >> (8 * i)) & 0xFFu)); }
+}
+
+inline void emit_mov_rbx_imm64(std::vector<uint8_t>& code, uint64_t imm) {
+    code.push_back(0x48u);
+    code.push_back(0xBBu);
+    for (int i = 0; i < 8; ++i) { code.push_back(static_cast<uint8_t>((imm >> (8 * i)) & 0xFFu)); }
+}
+
+inline void emit_mov_rcx_imm64(std::vector<uint8_t>& code, uint64_t imm) {
+    code.push_back(0x48u);
+    code.push_back(0xB9u);
+    for (int i = 0; i < 8; ++i) { code.push_back(static_cast<uint8_t>((imm >> (8 * i)) & 0xFFu)); }
+}
+
+inline void emit_mov_rdx_imm64(std::vector<uint8_t>& code, uint64_t imm) {
+    code.push_back(0x48u);
+    code.push_back(0xBAu);
+    for (int i = 0; i < 8; ++i) { code.push_back(static_cast<uint8_t>((imm >> (8 * i)) & 0xFFu)); }
+}
+
+inline void emit_push_regs(std::vector<uint8_t>& code) {
+    code.push_back(0x53u);
+    code.push_back(0x51u);
+    code.push_back(0x52u);
+    code.push_back(0x56u);
+    code.push_back(0x57u);
+}
+
+inline void emit_pop_regs(std::vector<uint8_t>& code) {
+    code.push_back(0x5Fu);
+    code.push_back(0x5Eu);
+    code.push_back(0x5Au);
+    code.push_back(0x59u);
+    code.push_back(0x5Bu);
+}
+
+inline uint64_t splitmix(uint64_t& s) {
+    s += 0x9E3779B97F4A7C15ull;
+    uint64_t z = s;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+inline void emit_opaque_always_false_prologue(std::vector<uint8_t>& code, uint64_t& st, size_t& body_patch_offset) {
+    uint64_t a = splitmix(st) | 1ull;
+    uint64_t b = a;
+    emit_mov_rax_imm64(code, a);
+    emit_mov_rbx_imm64(code, b);
+    code.push_back(0x48u); code.push_back(0x31u); code.push_back(0xD8u);
+    code.push_back(0x48u); code.push_back(0x83u); code.push_back(0xE0u); code.push_back(0x01u);
+    code.push_back(0x48u); code.push_back(0x0Fu); code.push_back(0xAFu); code.push_back(0xC0u);
+    code.push_back(0x48u); code.push_back(0x83u); code.push_back(0xE0u); code.push_back(0x01u);
+    code.push_back(0x0Fu); code.push_back(0x85u);
+    body_patch_offset = code.size();
+    code.push_back(0x00u); code.push_back(0x00u); code.push_back(0x00u); code.push_back(0x00u);
+}
+
+inline void emit_sha_round_inline(std::vector<uint8_t>& code, uint32_t k_const, uint64_t& st) {
+    code.push_back(0x48u); code.push_back(0x31u); code.push_back(0xC0u);
+    code.push_back(0x48u); code.push_back(0xB8u);
+    uint64_t imm = static_cast<uint64_t>(k_const) | (splitmix(st) & 0xFFFFFFFF00000000ull);
+    for (int i = 0; i < 8; ++i) { code.push_back(static_cast<uint8_t>((imm >> (8 * i)) & 0xFFu)); }
+    code.push_back(0x48u); code.push_back(0x31u); code.push_back(0xD8u);
+    code.push_back(0x48u); code.push_back(0xC1u); code.push_back(0xC8u);
+    code.push_back(static_cast<uint8_t>(0x07u + (k_const & 0x17u)));
+    code.push_back(0x48u); code.push_back(0x01u); code.push_back(0xD8u);
+    code.push_back(0x48u); code.push_back(0x29u); code.push_back(0xC8u);
+    code.push_back(0x48u); code.push_back(0xF7u); code.push_back(0xD0u);
+    code.push_back(0x48u); code.push_back(0x21u); code.push_back(0xD8u);
+    code.push_back(0x48u); code.push_back(0x09u); code.push_back(0xCBu);
+}
+
+inline void emit_sha_body(std::vector<uint8_t>& code, uint64_t& st) {
+    static const uint32_t kSha256K[64] = {
+        0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+        0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+        0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+        0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+        0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+        0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+        0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+        0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
+    };
+    emit_mov_rcx_imm64(code, 1024ull);
+    size_t loop_head = code.size();
+    for (int i = 0; i < 64; ++i) {
+        emit_sha_round_inline(code, kSha256K[i], st);
+    }
+    code.push_back(0x48u); code.push_back(0xFFu); code.push_back(0xC9u);
+    code.push_back(0x75u);
+    int64_t rel = static_cast<int64_t>(loop_head) - static_cast<int64_t>(code.size() + 1);
+    if (rel < -128 || rel > 127) {
+        code.pop_back();
+        code.push_back(0x0Fu); code.push_back(0x85u);
+        int32_t rel32 = static_cast<int32_t>(static_cast<int64_t>(loop_head) - static_cast<int64_t>(code.size() + 4));
+        for (int i = 0; i < 4; ++i) { code.push_back(static_cast<uint8_t>((rel32 >> (8 * i)) & 0xFFu)); }
+    } else {
+        code.push_back(static_cast<uint8_t>(static_cast<int8_t>(rel)));
+    }
+}
+
+inline uint32_t shannon_entropy_milli(const uint8_t* data, size_t len) {
+    if (len == 0) { return 0; }
+    uint64_t hist[256] = {0};
+    for (size_t i = 0; i < len; ++i) { ++hist[data[i]]; }
+    double ent = 0.0;
+    double dl = static_cast<double>(len);
+    for (int i = 0; i < 256; ++i) {
+        if (hist[i] == 0) { continue; }
+        double p = static_cast<double>(hist[i]) / dl;
+        ent -= p * (std::log(p) / std::log(2.0));
+    }
+    double milli = ent * 1000.0;
+    if (milli < 0.0) { milli = 0.0; }
+    if (milli > 8000.0) { milli = 8000.0; }
+    return static_cast<uint32_t>(milli);
+}
+
+}
+
+inline uint32_t inject_symexec_bombs(pe_file::pe_image_t& pe, uint64_t seed) {
+    std::vector<uint8_t> code;
+    uint64_t st = seed ^ 0x5E7EC0BB1E1A7EDAull;
+    const uint32_t kBombCount = 16u;
+
+    uint32_t text_target_rva = 0;
+    for (const auto& s : pe.sections) {
+        if ((s.characteristics & IMAGE_SCN_MEM_EXECUTE) != 0u && s.virtual_size > 0u) {
+            text_target_rva = s.virtual_address;
+            break;
+        }
+    }
+
+    std::vector<size_t> block_starts;
+    std::vector<size_t> jmp_out_offsets;
+    std::vector<size_t> body_patches;
+
+    for (uint32_t b = 0; b < kBombCount; ++b) {
+        block_starts.push_back(code.size());
+        symexec_bomb_detail::emit_push_regs(code);
+        size_t body_patch = 0;
+        symexec_bomb_detail::emit_opaque_always_false_prologue(code, st, body_patch);
+        size_t after_jcc = code.size();
+        size_t jmp_epilogue_offset = code.size();
+        code.push_back(0xE9u);
+        code.push_back(0x00u); code.push_back(0x00u); code.push_back(0x00u); code.push_back(0x00u);
+        size_t body_start = code.size();
+        int32_t body_rel = static_cast<int32_t>(static_cast<int64_t>(body_start) - static_cast<int64_t>(after_jcc));
+        for (int i = 0; i < 4; ++i) {
+            code[body_patch + i] = static_cast<uint8_t>((body_rel >> (8 * i)) & 0xFFu);
+        }
+        body_patches.push_back(body_patch);
+        symexec_bomb_detail::emit_sha_body(code, st);
+        symexec_bomb_detail::emit_pop_regs(code);
+        size_t epilogue_start = code.size();
+        int32_t epi_rel = static_cast<int32_t>(static_cast<int64_t>(epilogue_start) - static_cast<int64_t>(jmp_epilogue_offset + 5));
+        for (int i = 0; i < 4; ++i) {
+            code[jmp_epilogue_offset + 1 + i] = static_cast<uint8_t>((epi_rel >> (8 * i)) & 0xFFu);
+        }
+        symexec_bomb_detail::emit_pop_regs(code);
+        jmp_out_offsets.push_back(code.size());
+        code.push_back(0xE9u);
+        code.push_back(0x00u); code.push_back(0x00u); code.push_back(0x00u); code.push_back(0x00u);
+    }
+
+    (void)body_patches;
+
+    while (code.size() < 0x2000u) { code.push_back(0x90u); }
+
+    uint32_t current_entropy = symexec_bomb_detail::shannon_entropy_milli(code.data(), code.size());
+    if (current_entropy < 6400u || current_entropy > 7300u) {
+        size_t pad_start = code.size();
+        while (code.size() < pad_start + 0x400u) {
+            uint64_t x = symexec_bomb_detail::splitmix(st);
+            for (int i = 0; i < 8 && code.size() < pad_start + 0x400u; ++i) {
+                code.push_back(static_cast<uint8_t>((x >> (8 * i)) & 0xFFu));
+            }
+        }
+    }
+
+    char sec_name[8] = { '.','e','p','h','e','m','e',0 };
+    pe_file::section_t& sec = pe_file::add_section(
+        pe, sec_name,
+        IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE,
+        code);
+
+    uint32_t bomb_rva_base = sec.virtual_address;
+    uint32_t target_rva = (text_target_rva != 0u) ? text_target_rva : bomb_rva_base;
+
+    for (size_t i = 0; i < jmp_out_offsets.size(); ++i) {
+        size_t off = jmp_out_offsets[i];
+        uint32_t here_rva = bomb_rva_base + static_cast<uint32_t>(off + 5u);
+        int32_t rel = static_cast<int32_t>(static_cast<int64_t>(target_rva) - static_cast<int64_t>(here_rva));
+        for (int j = 0; j < 4; ++j) {
+            sec.data[off + 1 + j] = static_cast<uint8_t>((rel >> (8 * j)) & 0xFFu);
+        }
+    }
+
+    return kBombCount;
+}
+
 inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_options_t& opt) {
     transform_result_t result{};
 
@@ -2051,6 +2462,8 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
         if (opt.ghost_veh)          { pf |= 0x10u; }
         if (opt.rdtsc_entangle)     { pf |= 0x20u; }
         if (opt.opaque_predicates)  { pf |= 0x40u; }
+        if (opt.ast_poison)         { pf |= 0x80u; }
+        if (opt.symexec_bombs)      { pf |= 0x100u; }
         aux.phase_flags = pf;
     }
     result.aux_size = static_cast<uint32_t>(sizeof(aux_block_t));
@@ -2080,6 +2493,13 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
     }
     if (opt.randomize_section_names) {
         randomize_section_names(pe, hdr_rng);
+    }
+
+    if (opt.ast_poison) {
+        inject_ast_poison(pe, rng_seed ^ 0xA57C0DE70150AECDull);
+    }
+    if (opt.symexec_bombs) {
+        (void)inject_symexec_bombs(pe, rng_seed ^ 0x5E7EC0BB1E1A7EDAull);
     }
 
     std::vector<packed_section_blob_t> blobs;
@@ -2161,6 +2581,10 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
     result.resources = std::move(resources);
 
     finalize_headers(pe);
+
+    if (opt.ast_poison) {
+        fixup_ast_poison_debug_pointer(pe);
+    }
 
     if (opt.embed_watermark) {
         uint8_t wm_id[8];

@@ -3253,8 +3253,8 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
     if (!request) { NET_ERR("handle_net_cap_ctrl: NULL request"); return STATUS_INVALID_PARAMETER; }
 
     if (net_capture::g_wfp_initialized != 2) {
-        // WFP was cleaned up when the previous client session ended.
-        // Re-initialize lazily using the stored device object if available.
+
+
         if (net_capture::g_device_object != nullptr) {
             NET_DBG("handle_net_cap_ctrl: WFP not ready (state=%d), attempting lazy re-init", (int)net_capture::g_wfp_initialized);
             NTSTATUS reinit_status = net_capture::initialize(net_capture::g_device_object);

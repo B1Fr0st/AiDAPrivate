@@ -274,8 +274,7 @@ namespace process_guard {
         UNREFERENCED_PARAMETER(ThreadId);
     }
 
-    // Process creation notification: deny creation of processes that request
-    // debug/injection access to the protected client on startup.
+
     inline VOID NTAPI create_process_notify(
         PEPROCESS Process,
         HANDLE ProcessId,
@@ -284,7 +283,7 @@ namespace process_guard {
         UNREFERENCED_PARAMETER(Process);
         UNREFERENCED_PARAMETER(ProcessId);
 
-        // Only interested in process creation (not termination)
+
         if (!CreateInfo)
             return;
 
@@ -292,21 +291,18 @@ namespace process_guard {
         if (!client_pid)
             return;
 
-        // If the new process's parent is not our client, check if it lists
-        // our client's image as the file to open (DLL injection via process)
+
         HANDLE parent_pid = CreateInfo->ParentProcessId;
 
-        // Allow the client to spawn children normally
+
         if (parent_pid == client_pid)
             return;
 
-        // System process is always allowed
+
         if (reinterpret_cast<UINT64>(parent_pid) == 4)
             return;
 
-        // Deny if the creating process has an open handle to our client
-        // with dangerous permissions (indicates injection attempt)
-        // This is a lightweight check - just log for now
+
         WW_LOG("create_process_notify: pid=%llu parent=%llu creating process near client",
             reinterpret_cast<UINT64>(ProcessId),
             reinterpret_cast<UINT64>(parent_pid));
@@ -381,7 +377,7 @@ namespace process_guard {
             }
         }
 
-        // Register process creation notification for injection detection
+
         if (NT_SUCCESS(status) && _PsSetCreateProcessNotifyRoutineEx)
         {
             NTSTATUS notify_st = _PsSetCreateProcessNotifyRoutineEx(

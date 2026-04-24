@@ -81,7 +81,7 @@ namespace safety_net {
 	bool init_safety_net(uint64_t image_base, uint64_t image_size);
 	void free_safety_net(void);
 
-	
+
 	void set_safety_net_kpcr(KPCR* kpcr);
 	bool is_safety_net_active();
 	bool start_safety_net(safety_net_t& info_storage);
@@ -104,10 +104,10 @@ namespace safety_net {
 	};
 
 	namespace cpl {
-		
+
 		bool switch_to_cpl_3(void);
 
-		
+
 		bool switch_to_cpl_0(void);
 	};
 

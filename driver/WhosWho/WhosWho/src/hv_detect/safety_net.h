@@ -10,16 +10,16 @@ namespace safety_net {
 	inline bool inited = false;
 
 	namespace gdt {
-		// Compile time variables
+
 		constexpr segment_selector zero_descriptor_selector = {0, 0, 0};
 
 		constexpr segment_selector constructed_cpl0_cs = { 0, 0, 1 };
 		constexpr segment_selector constructed_cpl0_ss = { 0, 0, 2 };
-		
+
 		constexpr segment_selector constructed_cpl3_ss = { 3, 0, 3 };
 		constexpr segment_selector constructed_cpl3_cs = { 3, 0, 4 };
 
-		constexpr segment_selector constructed_tr = { 0, 0, 5 }; // Takes up 2 slots
+		constexpr segment_selector constructed_tr = { 0, 0, 5 };
 
 		constexpr segment_selector compatibility_constructed_cpl0_cs = { 0, 0, 7 };
 		constexpr segment_selector compatibility_constructed_cpl0_ss = { 0, 0, 8 };
@@ -28,7 +28,7 @@ namespace safety_net {
 
 		constexpr uint16_t constructed_gdt_size = 10;
 
-		// Runtime data
+
 		inline bool gdt_inited = false;
 
 		inline void* interrupt_stack = 0;
@@ -36,31 +36,28 @@ namespace safety_net {
 		inline segment_descriptor_32* my_gdt = 0;
 		inline segment_descriptor_register_64 my_gdtr = { 0 };
 
-		/*
-			Utility / Exposed API's
-		*/
 
 		inline segment_descriptor_register_64 get_constructed_gdtr(void) {
 			return my_gdtr;
 		}
 
 		inline void log_segment_descriptor_64(segment_descriptor_64* descriptor, const char* segment_name) {
-			// Calculate the full base address
+
 			uint64_t base_address = ((uint64_t)descriptor->base_address_upper << 32) |
 				(descriptor->base_address_high << 24) |
 				(descriptor->base_address_middle << 16) |
 				descriptor->base_address_low;
 
-			// Calculate the full segment limit
+
 			uint32_t segment_limit = (descriptor->segment_limit_high << 16) |
 				descriptor->segment_limit_low;
 
-			// Check granularity flag to determine the effective segment limit
+
 			if (descriptor->granularity) {
-				segment_limit = (segment_limit << 12) | 0xFFF; // Granularity set, multiply by 4 KB
+				segment_limit = (segment_limit << 12) | 0xFFF;
 			}
 
-			// Log information about the segment descriptor
+
 			log_info("Segment Descriptor (%s):", segment_name);
 			log_info("  Base Address: 0x%016llX", base_address);
 			log_info("  Segment Limit: 0x%X", segment_limit);
@@ -72,22 +69,22 @@ namespace safety_net {
 			log_info("  Default/Big (D flag): 0x%X", descriptor->default_big);
 			log_info("  Long Mode (L flag): 0x%X", descriptor->long_mode);
 			log_info("  System: 0x%X", descriptor->system);
-			log_info("  System: 0x%X", descriptor->descriptor_type == 0 ? 1 : 0); // System flag is derived from the S flag
+			log_info("  System: 0x%X", descriptor->descriptor_type == 0 ? 1 : 0);
 		}
 
 		inline void log_segment_descriptor_32(segment_descriptor_32* descriptor, const char* segment_name) {
-			// Calculate full base address
+
 			uint32_t base_address = (descriptor->base_address_high << 24) |
 				(descriptor->base_address_middle << 16) |
 				descriptor->base_address_low;
 
-			// Calculate full segment limit
+
 			uint32_t segment_limit = (descriptor->segment_limit_high << 16) |
 				descriptor->segment_limit_low;
 
-			// Check granularity flag to determine the effective segment limit
+
 			if (descriptor->granularity) {
-				segment_limit = (segment_limit << 12) | 0xFFF; // Granularity set, multiply by 4 KB
+				segment_limit = (segment_limit << 12) | 0xFFF;
 			}
 
 			log_info("Segment Descriptor (%s):", segment_name);
@@ -104,34 +101,34 @@ namespace safety_net {
 		}
 
 		inline void log_segment_selector(segment_selector* selector, const char* selector_name) {
-			// Extract values from the segment selector fields
-			uint16_t rpl = selector->request_privilege_level; // Requested Privilege Level (RPL)
-			uint16_t table = selector->table;                 // Table Indicator (0 = GDT, 1 = LDT)
-			uint16_t index = selector->index;                 // Descriptor index
 
-			// Determine if the selector points to the GDT or LDT
+			uint16_t rpl = selector->request_privilege_level;
+			uint16_t table = selector->table;
+			uint16_t index = selector->index;
+
+
 			const char* table_name = (table == 0) ? "GDT" : "LDT";
 
-			// Print out the segment selector details
+
 			log_info("[%s] Segment Selector Details:", selector_name);
 			log_info("  Request Privilege Level (RPL): %u", rpl);
 			log_info("  Table Indicator (TI): %s (%u)", table_name, table);
 			log_info("  Index: %u", index);
-			log_info("  Raw Flags: 0x%04X", selector->flags); // Optional: print the raw flags for debugging
+			log_info("  Raw Flags: 0x%04X", selector->flags);
 		}
 
 		inline void log_constructed_gdt_descriptors(void) {
-			// Retrieve the GDTR register
+
 			segment_descriptor_register_64 win_gdtr;
 			_sgdt(&win_gdtr);
 
-			// Get the base address of the GDT
+
 			segment_descriptor_32* win_gdt = (segment_descriptor_32*)win_gdtr.base_address;
 
-			// Define segment selectors
+
 			segment_selector cs, ds, ss, es, fs, gs, tr;
 
-			// Read the segment selectors
+
 			cs = __read_cs();
 			ds = __read_ds();
 			ss = __read_ss();
@@ -140,7 +137,7 @@ namespace safety_net {
 			gs = __read_gs();
 			tr = __read_tr();
 
-			// Log segment selector values and their corresponding GDT entries
+
 			log_info("CS: 0x%04x", *(uint16_t*)&cs);
 			log_segment_descriptor_32(&win_gdt[cs.index], "CS");
 
@@ -163,10 +160,7 @@ namespace safety_net {
 			log_segment_descriptor_64((segment_descriptor_64*)(&win_gdt[tr.index]), "TSS");
 		}
 
-		/*
-			Note: We only need 1 gdt as we lock execution
-				  to one core via disabling of interrupts and no others execute whilst it is
-		*/
+
 		inline bool init_gdt(void) {
 			PHYSICAL_ADDRESS max_addr = { 0 };
 			max_addr.QuadPart = MAXULONG64;
@@ -196,11 +190,11 @@ namespace safety_net {
 
 			uint64_t tss_base = reinterpret_cast<uint64_t>(my_tss);
 
-			// Null descriptor
+
 			segment_descriptor_32* zero_descriptor = &my_gdt[zero_descriptor_selector.index];
 			memset(zero_descriptor, 0, sizeof(segment_descriptor_32));
 
-			// Kernel Code Segment (64-bit)
+
 			segment_descriptor_32* cpl_0_cs_descriptor = &my_gdt[constructed_cpl0_cs.index];
 			memset(cpl_0_cs_descriptor, 0, sizeof(segment_descriptor_32));
 			cpl_0_cs_descriptor->present = 1;
@@ -210,7 +204,6 @@ namespace safety_net {
 			cpl_0_cs_descriptor->long_mode = 1;
 
 
-			// Kernel Data Segment (64-bit)
 			segment_descriptor_32* cpl_0_ss_descriptor = &my_gdt[constructed_cpl0_ss.index];
 			memset(cpl_0_ss_descriptor, 0, sizeof(segment_descriptor_32));
 			cpl_0_ss_descriptor->present = 1;
@@ -220,7 +213,6 @@ namespace safety_net {
 			cpl_0_ss_descriptor->default_big = 1;
 
 
-			// User Code Segment (64-bit)
 			segment_descriptor_32* cpl_3_cs_descriptor = &my_gdt[constructed_cpl3_cs.index];
 			memset(cpl_3_cs_descriptor, 0, sizeof(segment_descriptor_32));
 			cpl_3_cs_descriptor->present = 1;
@@ -229,7 +221,7 @@ namespace safety_net {
 			cpl_3_cs_descriptor->descriptor_privilege_level = 3;
 			cpl_3_cs_descriptor->long_mode = 1;
 
-			// User Data Segment (64-bit)
+
 			segment_descriptor_32* cpl_3_ss_descriptor = &my_gdt[constructed_cpl3_ss.index];
 			memset(cpl_3_ss_descriptor, 0, sizeof(segment_descriptor_32));
 			cpl_3_ss_descriptor->present = 1;
@@ -238,35 +230,35 @@ namespace safety_net {
 			cpl_3_ss_descriptor->descriptor_privilege_level = 3;
 			cpl_3_ss_descriptor->granularity = 1;
 			cpl_3_ss_descriptor->default_big = 1;
-			cpl_3_ss_descriptor->segment_limit_low = 0xFFFF; // Lower 16 bits of the segment limit.
-			cpl_3_ss_descriptor->segment_limit_high = 0xF;   // Upper 4 bits of the segment limit.
+			cpl_3_ss_descriptor->segment_limit_low = 0xFFFF;
+			cpl_3_ss_descriptor->segment_limit_high = 0xF;
 
-			// Compatibility Mode Kernel Code Segment (32-bit)
+
 			segment_descriptor_32* comp_cpl_0_cs_descriptor = &my_gdt[compatibility_constructed_cpl0_cs.index];
 			memset(comp_cpl_0_cs_descriptor, 0, sizeof(segment_descriptor_32));
 			comp_cpl_0_cs_descriptor->present = 1;
 			comp_cpl_0_cs_descriptor->type = SEGMENT_DESCRIPTOR_TYPE_CODE_EXECUTE_READ_ACCESSED;
 			comp_cpl_0_cs_descriptor->descriptor_type = SEGMENT_DESCRIPTOR_TYPE_CODE_OR_DATA;
 			comp_cpl_0_cs_descriptor->descriptor_privilege_level = 0;
-			comp_cpl_0_cs_descriptor->default_big = 1; // 32-bit operation size
-			comp_cpl_0_cs_descriptor->granularity = 1; // Get the max limits
-			comp_cpl_0_cs_descriptor->segment_limit_low = 0xFFFF; // Lower 16 bits of the segment limit.
-			comp_cpl_0_cs_descriptor->segment_limit_high = 0xF;   // Upper 4 bits of the segment limit.
+			comp_cpl_0_cs_descriptor->default_big = 1;
+			comp_cpl_0_cs_descriptor->granularity = 1;
+			comp_cpl_0_cs_descriptor->segment_limit_low = 0xFFFF;
+			comp_cpl_0_cs_descriptor->segment_limit_high = 0xF;
 			comp_cpl_0_cs_descriptor->long_mode = 0;
 
-			// Compatibility Mode Kernel Data Segment (32-bit)
+
 			segment_descriptor_32* comp_cpl_0_ss_descriptor = &my_gdt[compatibility_constructed_cpl0_ss.index];
 			memset(comp_cpl_0_ss_descriptor, 0, sizeof(segment_descriptor_32));
 			comp_cpl_0_ss_descriptor->present = 1;
 			comp_cpl_0_ss_descriptor->type = SEGMENT_DESCRIPTOR_TYPE_DATA_READ_WRITE_ACCESSED;
 			comp_cpl_0_ss_descriptor->descriptor_type = SEGMENT_DESCRIPTOR_TYPE_CODE_OR_DATA;
 			comp_cpl_0_ss_descriptor->descriptor_privilege_level = 0;
-			comp_cpl_0_ss_descriptor->default_big = 1; // 32-bit operation size
-			comp_cpl_0_ss_descriptor->granularity = 1; // Get the max limits
-			comp_cpl_0_ss_descriptor->segment_limit_low = 0xFFFF; // Lower 16 bits of the segment limit.
-			comp_cpl_0_ss_descriptor->segment_limit_high = 0xF;   // Upper 4 bits of the segment limit.
+			comp_cpl_0_ss_descriptor->default_big = 1;
+			comp_cpl_0_ss_descriptor->granularity = 1;
+			comp_cpl_0_ss_descriptor->segment_limit_low = 0xFFFF;
+			comp_cpl_0_ss_descriptor->segment_limit_high = 0xF;
 
-			// Task State Segment
+
 			segment_descriptor_64* tss_descriptor = reinterpret_cast<segment_descriptor_64*>(&my_gdt[constructed_tr.index]);
 			memset(tss_descriptor, 0, sizeof(segment_descriptor_64));
 
@@ -280,7 +272,7 @@ namespace safety_net {
 			tss_descriptor->base_address_high = (tss_base >> 24) & 0xFF;
 			tss_descriptor->base_address_upper = (tss_base >> 32) & 0xFFFFFFFF;
 
-			// DS / ES / GS
+
 			segment_descriptor_32* ds_es_fs_gs_descriptor = &my_gdt[constructed_ds_es_fs_gs.index];
 			memset(ds_es_fs_gs_descriptor, 0, sizeof(segment_descriptor_32));
 			ds_es_fs_gs_descriptor->present = 1;
@@ -308,18 +300,16 @@ namespace safety_net {
 
 		inline bool should_disable_lbr = false;
 
-		/*
-			Utility / Exposed API's
-		*/
+
 		inline segment_descriptor_interrupt_gate_64 create_interrupt_gate(void* assembly_handler) {
 			segment_descriptor_interrupt_gate_64 gate = { 0 };
 
-			gate.interrupt_stack_table = 4; // Doesn't really matter which one we point it to as all point to the same; Just has to be non 0
+			gate.interrupt_stack_table = 4;
 			gate.segment_selector = gdt::constructed_cpl0_cs.flags;
 			gate.must_be_zero_0 = 0;
 			gate.type = SEGMENT_DESCRIPTOR_TYPE_INTERRUPT_GATE;
 			gate.must_be_zero_1 = 0;
-			gate.descriptor_privilege_level = 3; // Is the minimum cpl required to use the gate
+			gate.descriptor_privilege_level = 3;
 			gate.present = 1;
 			gate.reserved = 0;
 
@@ -360,7 +350,7 @@ namespace safety_net {
 
 			idt_regs_ecode_t* record = &context_storage[total_interrupts - 1];
 
-			// Done to avoid overflows
+
 			reset_interrupt_count();
 
 			return record;
@@ -421,11 +411,7 @@ namespace safety_net {
 			}
 		}
 
-		/*
-			Core
-		*/
 
-		// Core exception handler (defined in TU that sets SAFETY_NET_IMPLEMENT)
 		extern "C" __declspec(noinline) void exception_handler(idt_regs_ecode_t* record)
 #ifdef SAFETY_NET_IMPLEMENT
 		{
@@ -433,21 +419,20 @@ namespace safety_net {
 				__writemsr(IA32_DEBUGCTL, 0);
 			}
 
-			// Safe data about the interrupt for various purposes
+
 			safe_interrupt_record(record);
 			increase_interrupt_counter();
 
-			// We use this as a mode switch from long to compatibility mode
+
 			if (execution_mode::handle_mode_switch(record))
 				return;
 
-			// stack_segment_fault faults require the real rsp in rax (;
-			// Look into detect_asm.asm:__ss_fault_sidt for more details
+
 			if (record->exception_vector == stack_segment_fault) {
 				record->rsp = record->rax;
 			}
 
-			// Just mock nmis 
+
 			if (record->exception_vector == nmi)
 				return;
 
@@ -458,7 +443,7 @@ namespace safety_net {
 
 			uint64_t rip_rva = record->rip - g_image_base;
 
-			// Try to resolve the exception directly with rip
+
 			for (ULONG idx = 0; idx < exception->Size / sizeof(RUNTIME_FUNCTION); ++idx) {
 				RUNTIME_FUNCTION* function = &rt_functions[idx];
 				if (!(rip_rva >= function->BeginAddress && rip_rva < function->EndAddress))
@@ -480,21 +465,19 @@ namespace safety_net {
 				}
 			}
 
-			// If we reached here this means that the exception couldn't get
-			// resolved with rip, so we have to stack trace to find the __except
-			// block (Just walk rsp chain by 8 bytes at a time)
+
 			uint64_t* stack_ptr = (uint64_t*)record->rsp;
 			while (stack_ptr) {
 				uint64_t potential_caller_rip = *stack_ptr;
 				uint64_t potential_caller_rva = potential_caller_rip - g_image_base;
 
-				// Check whether the current stack address can even be a function in our driver
+
 				if (potential_caller_rva > g_image_size) {
 					stack_ptr++;
 					continue;
 				}
 
-				// Check whether the potential_caller_rva corresponds to an __except block
+
 				for (ULONG idx = 0; idx < exception->Size / sizeof(RUNTIME_FUNCTION); ++idx) {
 					RUNTIME_FUNCTION* function = &rt_functions[idx];
 					if (!(potential_caller_rva >= function->BeginAddress && potential_caller_rva < function->EndAddress))
@@ -510,7 +493,7 @@ namespace safety_net {
 						if (potential_caller_rva >= scope_record->BeginAddress && potential_caller_rva < scope_record->EndAddress) {
 
 							record->rip = g_image_base + scope_record->JumpTarget;
-							record->rsp = (uint64_t)(stack_ptr + 1); // Point rsp to below the return address (*mostly* is the state of the stack of the caller function)
+							record->rsp = (uint64_t)(stack_ptr + 1);
 
 							return;
 						}
@@ -524,12 +507,9 @@ namespace safety_net {
 		;
 #endif
 
-		/*
-			Initialization
-		*/
 
 		inline void create_idt(segment_descriptor_interrupt_gate_64* idt) {
-			// Set IDT entries manually for each exception vector.
+
 			idt[divide_error] = idt::create_interrupt_gate(asm_de_handler);
 			idt[debug] = idt::create_interrupt_gate(asm_db_handler);
 			idt[nmi] = idt::create_interrupt_gate(asm_nmi_handler);
@@ -552,7 +532,7 @@ namespace safety_net {
 			idt[control_protection] = idt::create_interrupt_gate(asm_cp_handler);
 
 			my_idtr.base_address = (uint64_t)idt;
-			my_idtr.limit = MAXUINT16; // Since we allocate up to that size
+			my_idtr.limit = MAXUINT16;
 		}
 
 		inline bool init_idt(void) {
@@ -580,10 +560,7 @@ namespace safety_net {
 		inline bool cpl_switching_inited = false;
 		inline bool currently_in_cpl_3 = false;
 
-		// Runtime data
-		// IA32_STAR: Contains info about cs and ss for um and km
-		// IA32_LSTAR: Contains where rip will be set to after syscall
-		// IA32_FMASK: Every bit set in this will be unset in rflags after a syscall
+
 		inline uint64_t original_star = 0;
 		inline uint64_t original_lstar = 0;
 		inline uint64_t original_fmask = 0;
@@ -592,11 +569,7 @@ namespace safety_net {
 		inline uint64_t constructed_lstar = 0;
 		inline uint64_t constructed_fmask = 0;
 
-		/*
-			Done via sysret;
-			In here we need to ensure that we write to all necessary MSR's 
-			so that we can later restore shit
-		*/
+
 		inline bool switch_to_cpl_3(void) {
 			if (!is_safety_net_active())
 				return false;
@@ -611,14 +584,14 @@ namespace safety_net {
 			__writemsr(IA32_FMASK, constructed_fmask);
 
 			__try {
-				asm_switch_segments(gdt::constructed_cpl3_cs.flags, gdt::constructed_cpl3_ss.flags); // Note: From now on you can not execute all restricted instructions (e.g. wrmsr)
+				asm_switch_segments(gdt::constructed_cpl3_cs.flags, gdt::constructed_cpl3_ss.flags);
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
-				// All is left to do here is to pray
+
 				__writemsr(IA32_STAR, original_star);
 				__writemsr(IA32_LSTAR, original_lstar);
 				__writemsr(IA32_FMASK, original_fmask);
-				return false; 
+				return false;
 			}
 
 			currently_in_cpl_3 = true;
@@ -626,27 +599,21 @@ namespace safety_net {
 			return true;
 		}
 
-		/*
-			Done via syscall;
-			In here we need to ensure that we restore all polluted MSR's
-		*/
+
 		inline bool switch_to_cpl_0(void) {
 
-			/*
-				We can't do shit here as we do not have access to privileged instrucitons (e.g. wrmsr)
-			*/
 
-			if (!currently_in_cpl_3) {	// Here for testing
+			if (!currently_in_cpl_3) {
 				__writemsr(IA32_STAR, constructed_star);
 				__writemsr(IA32_LSTAR, constructed_lstar);
 				__writemsr(IA32_FMASK, constructed_fmask);
 			}
 
 			__try {
-				asm_switch_to_cpl_0(); // Note: From now on you can execute all privileged instructions (e.g. wrmsr)
+				asm_switch_to_cpl_0();
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
-				// All is left to do here is to pray
+
 				currently_in_cpl_3 = false;
 				__writemsr(IA32_STAR, original_star);
 				__writemsr(IA32_LSTAR, original_lstar);
@@ -670,7 +637,7 @@ namespace safety_net {
 			if (!efer.syscall_enable || !efer.ia32e_mode_enable)
 				return false;
 
-			// Backup orig values
+
 			original_star = __readmsr(IA32_STAR);
 			original_lstar = __readmsr(IA32_LSTAR);
 			original_fmask = __readmsr(IA32_FMASK);
@@ -679,13 +646,13 @@ namespace safety_net {
 			ia32_star_register star;
 			star.flags = 0;
 			star.kernel_cs_selector = gdt::constructed_cpl0_cs.flags;
-			star.user_cs_selector = gdt::constructed_cpl3_cs.flags - 16; // Honestly fuck you to whoever wrote that +16 for sysret behaviour
+			star.user_cs_selector = gdt::constructed_cpl3_cs.flags - 16;
 			constructed_star = star.flags;
 
 			constructed_lstar = (uint64_t)asm_syscall_handler;
 
 			constructed_fmask = 0;
-			
+
 			cpl_switching_inited = true;
 
 			return true;
@@ -705,13 +672,10 @@ namespace safety_net {
 
 #define EXECUTION_PAGE_32_BIT_ADDRESS 0x0001000
 #define EXECUTION_PAGE_32_BIT_USER_SHELLCODE_START EXECUTION_PAGE_32_BIT_ADDRESS + 0x100
-#define DATA_PAGE_32_BIT_ADDRESS 0x00002000 
-#define COMPATIBILITY_STACK_32_BIT_ADDRESS 0x00003000 
+#define DATA_PAGE_32_BIT_ADDRESS 0x00002000
+#define COMPATIBILITY_STACK_32_BIT_ADDRESS 0x00003000
 
-		/*
-			If the shellcode does not int 3 to go back it's your own fault (;
-			Note: The user is self responsible for setting up the data page
-		*/
+
 		inline bool execute_32_bit_shellcode(void* shellcode, uint64_t shellcode_size) {
 			if (execution_mode_changing_allocated && !execution_mode_changing_remapped) {
 				if (!physmem::remapping::overwrite_virtual_address_mapping((void*)EXECUTION_PAGE_32_BIT_ADDRESS, compatibility_execution_page, physmem::util::get_constructed_cr3().flags, physmem::util::get_system_cr3().flags))
@@ -737,38 +701,34 @@ namespace safety_net {
 				execution_mode_changing_remapped = true;
 			}
 
-			// Clear everything out before usage
+
 			memset(compatibility_stack, 0, KERNEL_STACK_SIZE);
 			memset(compatibility_execution_page, 0, 0x1000);
 
-			/*
-				Prologue is there to switch seg regs and call the actual function / shellcode
-			*/
-			static uint8_t compatibility_prologue[] = {
-				0x8C, 0xD0,                          // mov ax, ss
-				0x8E, 0xD8,                          // mov ds, ax
-				0x8E, 0xC0,                          // mov es, ax
-				0x8E, 0xE0,                          // mov fs, ax
-				0x8E, 0xE8,                          // mov gs, ax
 
-				0xB8, 0x00, 0x00, 0x00, 0x00,      // mov eax, 0x00000000
-				0xFF, 0xD0,                        // call eax
+			static uint8_t compatibility_prologue[] = {
+				0x8C, 0xD0,
+				0x8E, 0xD8,
+				0x8E, 0xC0,
+				0x8E, 0xE0,
+				0x8E, 0xE8,
+
+				0xB8, 0x00, 0x00, 0x00, 0x00,
+				0xFF, 0xD0,
 			};
 			*(uint32_t*)(compatibility_prologue + 11) = (uint32_t)EXECUTION_PAGE_32_BIT_USER_SHELLCODE_START;
 
-			/*
-				The epilogue just switches back to long mode
-			*/
+
 			static uint8_t compatibility_epilogue[] = {
-				0xB8, 0x31, 0x73, 0x00, 0x00,       // mov eax, 0x00007331
-				0xCC                                // int 3 (Will switch back to long mode via idt handler)
+				0xB8, 0x31, 0x73, 0x00, 0x00,
+				0xCC
 			};
 
 			memcpy((void*)(EXECUTION_PAGE_32_BIT_USER_SHELLCODE_START), shellcode, shellcode_size);
 			memcpy((void*)compatibility_execution_page, compatibility_prologue, sizeof(compatibility_prologue));
 			memcpy((void*)((uint64_t)compatibility_execution_page + sizeof(compatibility_prologue)), compatibility_epilogue, sizeof(compatibility_epilogue));
 
-			// Switches into compatibiltiy mode and executes code in 32 bit addressable ranges
+
 			asm_execute_compatibility_mode_code();
 
 			return true;
@@ -777,19 +737,17 @@ namespace safety_net {
 		inline void* allocate_32bit_accessible_page(uint64_t size) {
 			PHYSICAL_ADDRESS max_addr;
 
-			max_addr.QuadPart = 0xFFFFFFFF;  // 32-bit addressable range (limit to first 4GB)
+			max_addr.QuadPart = 0xFFFFFFFF;
 			void* mem = MmAllocateContiguousMemory(size, max_addr);
 			if (!mem)
 				return 0;
 
-			// Zero out the allocated memory for safety
+
 			memset(mem, 0, size);
 			return mem;
 		}
 
-		/*
-			Relies on atomicity
-		*/
+
 		inline bool handle_mode_switch(idt_regs_ecode_t* record) {
 			if (!record)
 				return false;
@@ -800,7 +758,7 @@ namespace safety_net {
 				backed_rsp = record->rsp;
 				backed_rip = record->rip;
 
-				record->rsp = (uint64_t)COMPATIBILITY_STACK_32_BIT_ADDRESS + KERNEL_STACK_SIZE; // Do not forget that the stack grows downwards
+				record->rsp = (uint64_t)COMPATIBILITY_STACK_32_BIT_ADDRESS + KERNEL_STACK_SIZE;
 				record->rip = (uint64_t)EXECUTION_PAGE_32_BIT_ADDRESS;
 
 				record->cs_selector = gdt::compatibility_constructed_cpl0_cs.flags;
@@ -817,8 +775,8 @@ namespace safety_net {
 
 				return true;
 			}
-	
-			// Primitive exception handling here; We just return back to long mode and restore everything if we hit an exception here
+
+
 			if (record->cs_selector == gdt::compatibility_constructed_cpl0_cs.flags &&
 				record->ss_selector == gdt::compatibility_constructed_cpl0_ss.flags) {
 				record->rsp = backed_rsp;
@@ -846,7 +804,7 @@ namespace safety_net {
 			compatibility_stack = allocate_32bit_accessible_page(KERNEL_STACK_SIZE);
 			if (!compatibility_stack)
 				return false;
-			
+
 			compatibility_execution_page = allocate_32bit_accessible_page(0x1000);
 			if (!compatibility_execution_page)
 				return false;
@@ -860,9 +818,6 @@ namespace safety_net {
 		}
 	};
 
-	/*
-		Exposed API's
-	*/
 
 	inline KPCR* safety_net_kpcr = 0;
 
@@ -870,7 +825,7 @@ namespace safety_net {
 		if (!inited)
 			return false;
 
-		// Check GDTR
+
 		segment_descriptor_register_64 current_gdtr;
 		_sgdt(&current_gdtr);
 		if (current_gdtr.base_address != gdt::my_gdtr.base_address ||
@@ -878,7 +833,7 @@ namespace safety_net {
 			return false;
 		}
 
-		// Check IDTR
+
 		segment_descriptor_register_64 current_idtr;
 		__sidt(&current_idtr);
 		if (current_idtr.base_address != idt::my_idtr.base_address ||
@@ -886,7 +841,7 @@ namespace safety_net {
 			return false;
 		}
 
-		// Check segment selectors
+
 		uint16_t current_ss = __read_ss().flags;
 		uint16_t current_cs = __read_cs().flags;
 		uint16_t current_tr = __read_tr().flags;
@@ -897,7 +852,7 @@ namespace safety_net {
 			return false;
 		}
 
-		// Check RFLAGS
+
 		rflags flags;
 		flags.flags = __readeflags();
 		if (flags.interrupt_enable_flag)
@@ -935,24 +890,22 @@ namespace safety_net {
 	}
 
 	inline void free_safety_net(void) {
-		// Gdt
+
 		MmFreeContiguousMemory(gdt::my_gdt);
 		MmFreeContiguousMemory(gdt::my_tss);
 		MmFreeContiguousMemory(gdt::interrupt_stack);
 
-		// Idt
+
 		MmFreeContiguousMemory(idt::my_idt);
 		MmFreeContiguousMemory(idt::context_storage);
 
-		// Compatibility mode execution
+
 		MmFreeContiguousMemory(execution_mode::compatibility_stack);
 		MmFreeContiguousMemory(execution_mode::compatibility_execution_page);
 		MmFreeContiguousMemory(execution_mode::compatibility_data_page);
 	}
 
-	/*
-		Note: Has to be called from cpl = 0
-	*/
+
 	inline bool start_safety_net(safety_net_t& info_storage) {
 		if (!inited)
 			return false;
@@ -963,35 +916,35 @@ namespace safety_net {
 		if (safety_net_kpcr)
 			__writemsr(IA32_GS_BASE, (uint64_t)safety_net_kpcr);
 
-		// Store the old gdtr
+
 		_sgdt(&info_storage.safed_gdtr);
 
-		// Load the new gdtr
+
 		_lgdt(&gdt::my_gdtr);
 
-		// Store the old selectors
+
 		info_storage.safed_ss = __read_ss().flags;
 		info_storage.safed_cs = __read_cs().flags;
 		info_storage.safed_tr = __read_tr().flags;
 
-		// Load all associated selectors
+
 		__write_ss(gdt::constructed_cpl0_ss.flags);
 		__write_cs(gdt::constructed_cpl0_cs.flags);
 
-		// Mark tss as available and switch tr
+
 		gdt::my_gdt[gdt::constructed_tr.index].type = SEGMENT_DESCRIPTOR_TYPE_TSS_AVAILABLE;
 		__write_tr(gdt::constructed_tr.flags);
 
-		// Store the old idtr
+
 		__sidt(&info_storage.safed_idtr);
 
-		// Load the new idtr
+
 		__lidt(&idt::my_idtr);
 
-		// Store the old cr3
+
 		info_storage.safed_cr3 = __readcr3();
 
-		// Load the new cr3
+
 		__writecr3(physmem::util::get_constructed_cr3().flags);
 
 		cr4 curr_cr4;
@@ -1011,7 +964,7 @@ namespace safety_net {
 		__write_ss(info_storage.safed_ss);
 		__write_cs(info_storage.safed_cs);
 
-		// Mark tss as available and switch tr
+
 		segment_descriptor_32* gdt = (segment_descriptor_32*)info_storage.safed_gdtr.base_address;
 		segment_selector tr_selec;
 		tr_selec.flags = info_storage.safed_tr;

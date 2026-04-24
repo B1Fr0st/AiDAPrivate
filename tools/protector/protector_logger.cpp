@@ -1,6 +1,5 @@
-// AiDA Protector Logger — Wave 5 tester/logger
-// Spawns aida_protector on an input, runs in-process verification via verify_api.hpp,
-// emits a structured JSON report.
+
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -24,9 +23,9 @@ namespace {
 
 struct options_t {
     std::string input;
-    std::string output;         // JSON output path; empty = stdout
-    std::string protector_path; // path to aida_protector.exe
-    std::string protected_path; // path to intermediate protected binary
+    std::string output;
+    std::string protector_path;
+    std::string protected_path;
     uint64_t    seed = 0;
     bool        seed_provided = false;
     bool        keep_protected = false;
@@ -201,7 +200,7 @@ std::string phase_name(int bit) {
     }
 }
 
-} // namespace
+}
 
 int main(int argc, char** argv) {
     options_t opt;
@@ -224,7 +223,7 @@ int main(int argc, char** argv) {
         opt.protected_path = dir + "\\" + stem + "_protected.exe";
     }
 
-    // --- spawn protector ---
+
     std::ostringstream cmd;
     cmd << "\"" << opt.protector_path << "\""
         << " --input \""  << opt.input << "\""
@@ -248,7 +247,7 @@ int main(int argc, char** argv) {
         return 4;
     }
 
-    // --- read files ---
+
     std::vector<uint8_t> in_bytes, out_bytes;
     read_all(opt.input, in_bytes);
     bool have_output = file_exists(opt.protected_path);
@@ -257,7 +256,7 @@ int main(int argc, char** argv) {
     std::string in_sha  = sha256_hex(in_bytes);
     std::string out_sha = have_output ? sha256_hex(out_bytes) : std::string(64, '0');
 
-    // --- verify in-process ---
+
     verifier::verify_report_t rep;
     auto v0 = std::chrono::steady_clock::now();
     if (have_output) { rep = verifier::verify_report(opt.protected_path); }
@@ -265,7 +264,7 @@ int main(int argc, char** argv) {
     long long verify_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(v1 - v0).count();
 
-    // --- phase summary ---
+
     uint32_t pf = rep.phase_flags & 0x7Fu;
     int phases_fired = 0;
     std::vector<std::string> names;
@@ -273,7 +272,7 @@ int main(int argc, char** argv) {
         if (pf & (1u << i)) { ++phases_fired; names.push_back(phase_name(i)); }
     }
 
-    // --- emit JSON ---
+
     std::ostringstream j;
     j << "{\n";
     j << "  \"tool\": \"aida_protector_logger\",\n";
@@ -327,7 +326,7 @@ int main(int argc, char** argv) {
     }
 
     if (!opt.keep_protected && have_output) {
-        // leave the file; let the user decide — some tests look for it
+
     }
 
     if (!have_output) { return 6; }

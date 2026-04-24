@@ -824,39 +824,39 @@ namespace secure_comm {
 
     static_assert(sizeof(SECURE_HEADER) == 32, "SECURE_HEADER must be 32 bytes");
 
-    // V2 header: adds keyed HMAC for stronger integrity than CRC32
+
     #pragma pack(push, 1)
     typedef struct _SECURE_HEADER_V2 {
         UINT64 request_id;
         UINT64 client_token;
         UINT64 entropy;
         UINT32 payload_size;
-        UINT32 version;          // must be 2
-        UINT8  payload_hmac[32]; // keyed hash of encrypted payload
+        UINT32 version;
+        UINT8  payload_hmac[32];
     } SECURE_HEADER_V2, *PSECURE_HEADER_V2;
     #pragma pack(pop)
 
     static_assert(sizeof(SECURE_HEADER_V2) == 64, "SECURE_HEADER_V2 must be 64 bytes");
 
-    // Keyed hash for v2 HMAC (software, DISPATCH_LEVEL safe)
+
     __forceinline void compute_payload_hmac(
         const UINT8* payload, SIZE_T size,
         UINT64 key, UINT64 entropy,
         UINT8 out[32])
     {
-        // SipHash-like keyed compression (runs at DISPATCH_LEVEL)
+
         UINT64 v0 = key ^ 0x736F6D6570736575ULL;
         UINT64 v1 = entropy ^ 0x646F72616E646F6DULL;
         UINT64 v2 = key ^ 0x6C7967656E657261ULL;
         UINT64 v3 = entropy ^ 0x7465646279746573ULL;
 
-        // Process payload in 8-byte blocks
+
         SIZE_T blocks = size / 8;
         for (SIZE_T i = 0; i < blocks; i++) {
             UINT64 m;
             RtlCopyMemory(&m, payload + i * 8, 8);
             v3 ^= m;
-            // 2 rounds
+
             v0 += v1; v2 += v3;
             v1 = _rotl64(v1, 13) ^ v0; v3 = _rotl64(v3, 16) ^ v2;
             v0 = _rotl64(v0, 32);
@@ -866,7 +866,7 @@ namespace secure_comm {
             v0 ^= m;
         }
 
-        // Process remaining bytes
+
         UINT64 tail = static_cast<UINT64>(size) << 56;
         SIZE_T rem_start = blocks * 8;
         for (SIZE_T i = 0; i < size - rem_start; i++)
@@ -880,7 +880,7 @@ namespace secure_comm {
         v2 = _rotl64(v2, 32);
         v0 ^= tail;
 
-        // Finalize: 4 rounds
+
         v2 ^= 0xFF;
         for (int r = 0; r < 4; r++) {
             v0 += v1; v2 += v3;
@@ -902,7 +902,7 @@ namespace secure_comm {
         RtlCopyMemory(out + 24, &h3, 8);
     }
 
-    // V2 HMAC verification (constant-time)
+
     __forceinline BOOLEAN verify_payload_hmac(
         const UINT8* payload, SIZE_T size,
         UINT64 key, UINT64 entropy,

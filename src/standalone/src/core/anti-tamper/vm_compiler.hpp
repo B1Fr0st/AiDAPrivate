@@ -4,6 +4,8 @@
 #include <windows.h>
 #include <intrin.h>
 
+#include <array>
+#include <bitset>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -17,6 +19,12 @@
 
 namespace anti_tamper {
 namespace vm_compiler {
+
+    inline std::array<uint8_t, 256> derive_function_opcode_map(
+        uint32_t func_rva, const uint8_t master_key[32])
+    {
+        return virtualizer::detail::derive_function_opcode_map(func_rva, master_key);
+    }
 
     namespace detail
     {
@@ -293,6 +301,16 @@ namespace vm_compiler {
         void emit_vm_exit()
         {
             emit_opcode(virtualizer::detail::OP_VM_EXIT);
+        }
+
+        void emit_vm_spawn(uint8_t child_pool_id, uint32_t child_bc_offset,
+                           uint32_t child_bc_len, uint8_t result_reg)
+        {
+            emit_opcode(virtualizer::detail::OP_VM_SPAWN);
+            emit_raw(child_pool_id);
+            emit_u32(child_bc_offset);
+            emit_u32(child_bc_len);
+            emit_raw(result_reg);
         }
 
         void emit_load_imm8(uint8_t dst_reg, uint8_t value)
@@ -1002,9 +1020,187 @@ namespace x86_lifter {
         lift_reg_reg(prog, m, dst_vreg, VREG_SCRATCH0);
     }
 
+    struct live_range_t
+    {
+        int32_t start;
+        int32_t end;
+        uint8_t x86_reg_class;
+        uint8_t assigned_vreg;
+        bool    spilled;
+    };
+
+    struct allocation_result_t
+    {
+        std::array<uint8_t, 10> class_to_vreg;
+        std::bitset<16>         used_vregs;
+        uint32_t                spill_slots;
+        bool                    pressure_ok;
+    };
+
+    inline uint8_t classify_gpr(ZydisRegister reg)
+    {
+        switch (reg) {
+        case ZYDIS_REGISTER_RAX: case ZYDIS_REGISTER_EAX: case ZYDIS_REGISTER_AX:
+        case ZYDIS_REGISTER_AL:  case ZYDIS_REGISTER_AH:  return 0;
+        case ZYDIS_REGISTER_RCX: case ZYDIS_REGISTER_ECX: case ZYDIS_REGISTER_CX:
+        case ZYDIS_REGISTER_CL:  case ZYDIS_REGISTER_CH:  return 1;
+        case ZYDIS_REGISTER_RDX: case ZYDIS_REGISTER_EDX: case ZYDIS_REGISTER_DX:
+        case ZYDIS_REGISTER_DL:  case ZYDIS_REGISTER_DH:  return 2;
+        case ZYDIS_REGISTER_RBX: case ZYDIS_REGISTER_EBX: case ZYDIS_REGISTER_BX:
+        case ZYDIS_REGISTER_BL:  case ZYDIS_REGISTER_BH:  return 3;
+        case ZYDIS_REGISTER_RSP: case ZYDIS_REGISTER_ESP: return 4;
+        case ZYDIS_REGISTER_RBP: case ZYDIS_REGISTER_EBP: return 5;
+        case ZYDIS_REGISTER_RSI: case ZYDIS_REGISTER_ESI: return 6;
+        case ZYDIS_REGISTER_RDI: case ZYDIS_REGISTER_EDI: return 7;
+        case ZYDIS_REGISTER_R8:  case ZYDIS_REGISTER_R8D: return 8;
+        case ZYDIS_REGISTER_R9:  case ZYDIS_REGISTER_R9D: return 9;
+        default: return 0xFF;
+        }
+    }
+
+    struct decoded_slot_t
+    {
+        ZydisDecodedInstruction instr;
+        ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT];
+    };
+
+    template <typename SlotT>
+    inline allocation_result_t linear_scan_allocate(const SlotT* slots, uint32_t count)
+    {
+        allocation_result_t out{};
+        for (int i = 0; i < 10; ++i) out.class_to_vreg[i] = 0xFF;
+        out.pressure_ok = true;
+        out.spill_slots = 0;
+
+        std::array<int32_t, 10> first_use;
+        std::array<int32_t, 10> last_use;
+        for (int i = 0; i < 10; ++i) { first_use[i] = -1; last_use[i] = -1; }
+
+        for (uint32_t idx = 0; idx < count; ++idx)
+        {
+            const auto& di = slots[idx];
+            for (int i = 0; i < di.instr.operand_count; ++i)
+            {
+                const auto& op = di.ops[i];
+                if (op.type == ZYDIS_OPERAND_TYPE_REGISTER)
+                {
+                    uint8_t cls = classify_gpr(op.reg.value);
+                    if (cls != 0xFF)
+                    {
+                        if (first_use[cls] < 0) first_use[cls] = static_cast<int32_t>(idx);
+                        last_use[cls] = static_cast<int32_t>(idx);
+                    }
+                }
+                else if (op.type == ZYDIS_OPERAND_TYPE_MEMORY)
+                {
+                    uint8_t cb = classify_gpr(op.mem.base);
+                    if (cb != 0xFF)
+                    {
+                        if (first_use[cb] < 0) first_use[cb] = static_cast<int32_t>(idx);
+                        last_use[cb] = static_cast<int32_t>(idx);
+                    }
+                    uint8_t ci = classify_gpr(op.mem.index);
+                    if (ci != 0xFF)
+                    {
+                        if (first_use[ci] < 0) first_use[ci] = static_cast<int32_t>(idx);
+                        last_use[ci] = static_cast<int32_t>(idx);
+                    }
+                }
+            }
+        }
+
+        struct ordered_t { int32_t start; int32_t end; uint8_t cls; };
+        std::array<ordered_t, 10> ordered{};
+        uint32_t n = 0;
+        for (uint8_t c = 0; c < 10; ++c)
+        {
+            if (first_use[c] >= 0)
+            {
+                ordered[n].start = first_use[c];
+                ordered[n].end = last_use[c];
+                ordered[n].cls = c;
+                ++n;
+            }
+        }
+        for (uint32_t i = 1; i < n; ++i)
+        {
+            ordered_t key = ordered[i];
+            int32_t j = static_cast<int32_t>(i) - 1;
+            while (j >= 0 && ordered[j].start > key.start)
+            {
+                ordered[j + 1] = ordered[j];
+                --j;
+            }
+            ordered[j + 1] = key;
+        }
+
+        std::array<int32_t, 10> active_end;
+        std::array<uint8_t, 10> active_vreg;
+        std::array<uint8_t, 10> active_cls;
+        uint32_t active_count = 0;
+
+        std::bitset<16> vreg_busy;
+        vreg_busy.set(VREG_SCRATCH0);
+        vreg_busy.set(VREG_SCRATCH1);
+        vreg_busy.set(VREG_SCRATCH2);
+        vreg_busy.set(VREG_SCRATCH3);
+        vreg_busy.set(VREG_KEY0);
+        vreg_busy.set(VREG_KEY1);
+
+        auto expire_at = [&](int32_t point) {
+            uint32_t w = 0;
+            for (uint32_t r = 0; r < active_count; ++r)
+            {
+                if (active_end[r] < point)
+                {
+                    vreg_busy.reset(active_vreg[r]);
+                }
+                else
+                {
+                    active_end[w] = active_end[r];
+                    active_vreg[w] = active_vreg[r];
+                    active_cls[w]  = active_cls[r];
+                    ++w;
+                }
+            }
+            active_count = w;
+        };
+
+        auto pick_free_vreg = [&]() -> uint8_t {
+            for (uint8_t v = 0; v < 10; ++v)
+            {
+                if (!vreg_busy.test(v)) return v;
+            }
+            return 0xFF;
+        };
+
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            expire_at(ordered[i].start);
+            uint8_t v = pick_free_vreg();
+            if (v == 0xFF)
+            {
+                out.pressure_ok = false;
+                out.spill_slots++;
+                out.class_to_vreg[ordered[i].cls] = ordered[i].cls;
+                continue;
+            }
+            vreg_busy.set(v);
+            out.class_to_vreg[ordered[i].cls] = v;
+            active_end[active_count]  = ordered[i].end;
+            active_vreg[active_count] = v;
+            active_cls[active_count]  = ordered[i].cls;
+            ++active_count;
+        }
+
+        out.used_vregs = vreg_busy;
+        return out;
+    }
+
     inline lifted_result_t compile_function(const uint8_t* code, size_t code_len,
                                             uint64_t base_addr, uint64_t initial_key,
-                                            const uint8_t opcode_map[256])
+                                            const uint8_t opcode_map[256],
+                                            virtualizer::detail::handler_pool_t* pool = nullptr)
     {
         lifted_result_t result{};
         result.total_lifted = 0;
@@ -1012,7 +1208,10 @@ namespace x86_lifter {
 
         program_t prog;
         prog.set_key(initial_key);
-        prog.set_opcode_map(opcode_map);
+        if (pool)
+            prog.set_opcode_map(pool->opcode_map);
+        else
+            prog.set_opcode_map(opcode_map);
 
         ZydisDecoder decoder;
         ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
@@ -1060,6 +1259,16 @@ namespace x86_lifter {
                             addr_to_label[target] = prog.create_label();
                     }
                 }
+            }
+        }
+
+        {
+            allocation_result_t alloc = linear_scan_allocate<instr_info_t>(
+                decoded.data(), static_cast<uint32_t>(decoded.size()));
+            if (!alloc.pressure_ok)
+            {
+                for (uint32_t s = 0; s < alloc.spill_slots && s < 4; ++s)
+                    prog.emit_push(static_cast<uint8_t>(VREG_SCRATCH0 + (s & 3)));
             }
         }
 
@@ -1402,9 +1611,10 @@ namespace x86_lifter {
 
     inline lifted_result_t compile_basic_block(const uint8_t* code, size_t length,
                                                uint64_t base_addr, uint64_t seed,
-                                               const uint8_t opcode_map[256])
+                                               const uint8_t opcode_map[256],
+                                               virtualizer::detail::handler_pool_t* pool = nullptr)
     {
-        lifted_result_t result = compile_function(code, length, base_addr, seed, opcode_map);
+        lifted_result_t result = compile_function(code, length, base_addr, seed, opcode_map, pool);
         return result;
     }
 

@@ -115,21 +115,21 @@ namespace sentinel_bridge {
         volatile UINT64  challenge_issued_tsc;
     };
 
-    // V2 bridge: adds crypto nonce + HMAC integrity for shared memory validation
+
     constexpr ULONG BRIDGE_VERSION_2 = 2;
 
     struct bridge_v2_t {
-        bridge_t          v1;              // backward-compatible base
-        volatile UINT64   crypto_nonce;    // random per-session; rotated on heartbeat
-        volatile UINT8    hmac[32];        // HMAC-SHA256(bridge_key, v1 fields || nonce)
-        volatile UINT64   nonce_tsc;       // TSC at last nonce rotation
-        volatile UINT32   hmac_valid;      // 1 if hmac was validated last tick
+        bridge_t          v1;
+        volatile UINT64   crypto_nonce;
+        volatile UINT8    hmac[32];
+        volatile UINT64   nonce_tsc;
+        volatile UINT32   hmac_valid;
         volatile UINT32   _pad;
     };
 
 
     inline bridge_v2_t g_bridge_v2 = {
-        {   // v1
+        {
             BRIDGE_MAGIC,
             BRIDGE_VERSION_2,
             nullptr,
@@ -142,14 +142,14 @@ namespace sentinel_bridge {
             0,
             0
         },
-        0,       // crypto_nonce
-        {0},     // hmac
-        0,       // nonce_tsc
-        0,       // hmac_valid
-        0        // _pad
+        0,
+        {0},
+        0,
+        0,
+        0
     };
 
-    // Alias for code still using g_bridge directly
+
     inline bridge_t& g_bridge = g_bridge_v2.v1;
 
     constexpr UINT64 CHALLENGE_HMAC_KEY = 0x7A3F1D9E5BC82A46ULL;
@@ -299,7 +299,7 @@ namespace sentinel_bridge {
         }
     }
 
-    // V2: rotate bridge nonce and recompute HMAC over v1 fields
+
     __forceinline void rotate_bridge_nonce() {
         UINT64 tsc = __rdtsc();
         UINT64 nonce = tsc ^ _rotl64(g_bridge_crypt_key, 23) ^ 0xA5A5A5A5A5A5A5A5ULL;
@@ -313,8 +313,7 @@ namespace sentinel_bridge {
             reinterpret_cast<volatile LONG64*>(&g_bridge_v2.nonce_tsc),
             static_cast<LONG64>(tsc));
 
-        // Compute soft HMAC: mix critical v1 fields with nonce
-        // Full BCrypt HMAC unavailable at DISPATCH_LEVEL; use keyed mix
+
         UINT8 hmac_data[32];
         UINT64 h0 = g_bridge.magic ^ nonce;
         h0 *= 0xC4CEB9FE1A85EC53ULL; h0 ^= h0 >> 33;
@@ -335,7 +334,7 @@ namespace sentinel_bridge {
             reinterpret_cast<volatile LONG*>(&g_bridge_v2.hmac_valid), 1);
     }
 
-    // V2: verify HMAC integrity of bridge shared memory
+
     __forceinline BOOLEAN verify_bridge_hmac() {
         UINT64 nonce = g_bridge_v2.crypto_nonce;
         if (nonce == 0) return FALSE;
@@ -355,7 +354,7 @@ namespace sentinel_bridge {
         RtlCopyMemory(expected + 16, &h2, 8);
         RtlCopyMemory(expected + 24, &h3, 8);
 
-        // Constant-time compare
+
         volatile UINT8 diff = 0;
         for (int i = 0; i < 32; i++)
             diff |= expected[i] ^ g_bridge_v2.hmac[i];
@@ -377,7 +376,7 @@ namespace sentinel_bridge {
                 static_cast<LONG64>(response));
         }
 
-        // V2: rotate nonce and recompute bridge HMAC each tick
+
         rotate_bridge_nonce();
 
         WW_LOG("tick: wrote whoswho_tsc=%lld", tsc);

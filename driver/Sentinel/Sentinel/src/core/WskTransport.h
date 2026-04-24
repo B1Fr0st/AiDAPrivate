@@ -140,7 +140,7 @@ namespace wsk_transport
         dispatch->WskConnect(socket, reinterpret_cast<PSOCKADDR>(&remote_addr), 0, irp);
 
         LARGE_INTEGER timeout;
-        timeout.QuadPart = -150000000LL; // 15 seconds
+        timeout.QuadPart = -150000000LL;
         NTSTATUS status = KeWaitForSingleObject(
             &conn_comp.event, Executive, KernelMode, FALSE, &timeout);
 
@@ -210,7 +210,7 @@ namespace wsk_transport
         dispatch->WskReceive(socket, &wsk_buf, 0, irp);
 
         LARGE_INTEGER timeout;
-        timeout.QuadPart = -300000000LL; // 30 seconds
+        timeout.QuadPart = -300000000LL;
         NTSTATUS status = KeWaitForSingleObject(
             &comp.event, Executive, KernelMode, FALSE, &timeout);
 

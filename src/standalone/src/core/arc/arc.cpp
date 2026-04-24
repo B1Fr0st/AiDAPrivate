@@ -24,11 +24,10 @@
 namespace arc_internal
 {
 
-// Append a timestamped line to aida_debug.log from within the ARC module.
-// Uses the EXE directory (not CWD) so log entries land in the same file as lic_log.
+
 static void arc_log(const char* tag, const char* msg)
 {
-    // Cache the absolute log path using the exe directory (same as webhook::write_log).
+
     static WCHAR s_log_path[MAX_PATH] = {};
     static bool  s_path_ready = false;
     if (!s_path_ready) {
@@ -696,23 +695,20 @@ std::string recompute_hwid()
 
 uint64_t compute_own_code_hash()
 {
-    // Use VirtualQuery-based region walking instead of PE section header parsing.
-    // PE headers are intentionally corrupted by anti_dump::inject_fake_sections()
-    // (NumberOfSections overwritten, all sections given IMAGE_SCN_MEM_EXECUTE and
-    // random VirtualAddresses). Parsing them produces a different hash at heartbeat
-    // time than at init time, which previously triggered arm_silent_kill() -> __fastfail.
+
+
     MEMORY_BASIC_INFORMATION mbi = {};
     if (VirtualQuery(reinterpret_cast<const void*>(&compute_own_code_hash), &mbi, sizeof(mbi)) == 0)
         return 0;
     const auto hMod = static_cast<const uint8_t*>(mbi.AllocationBase);
     if (!hMod) return 0;
 
-    // Walk committed executable regions that belong to this module allocation.
+
     uint64_t combined = 0;
     const uintptr_t alloc_base = reinterpret_cast<uintptr_t>(hMod);
     uintptr_t addr = alloc_base;
 
-    // Cap scan at 256 MB to avoid runaway iteration on pathological mappings.
+
     const uintptr_t scan_limit = alloc_base + (256ULL * 1024 * 1024);
 
     while (addr < scan_limit)
@@ -723,7 +719,7 @@ uint64_t compute_own_code_hash()
         if (r.RegionSize == 0)
             break;
 
-        // Stop once we leave the allocation that contains compute_own_code_hash.
+
         if (r.AllocationBase != mbi.AllocationBase)
             break;
 

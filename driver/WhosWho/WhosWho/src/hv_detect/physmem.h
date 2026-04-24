@@ -4,17 +4,14 @@
 #include "win_helpers.h"
 
 namespace physmem {
-	/*
-		Global variables
-	*/
+
+
 	inline physmem_t physmem;
 
 	namespace support {
 		inline bool is_physmem_supported(void) {
-			// Add support checks that determine whether the systems
-			// supports all our needs
 
-			// Only AMD or INTEL processors are supported
+
 			char vendor[13] = { 0 };
 			cpuidsplit_t vendor_cpuid_data;
 			__cpuid((int*)&vendor_cpuid_data, 0);
@@ -26,26 +23,26 @@ namespace physmem {
 				return false;
 			}
 
-			// Abort on 5 level paging
+
 			cr4 curr_cr4;
 			curr_cr4.flags = __readcr4();
 			if (curr_cr4.linear_addresses_57_bit) {
 				return false;
 			}
 
-			// Since we map 512 gb of physical memory to 2MB pages they should be supported -.-
+
 			cpuid_eax_01 cpuid_1;
 			__cpuid((int*)(&cpuid_1), 1);
 			if (!cpuid_1.cpuid_feature_information_edx.physical_address_extension) {
 				return false;
 			}
 
-			// SSE2 support should be enable as we use mfence etc
+
 			if (!cpuid_1.cpuid_feature_information_edx.sse2_support) {
 				return false;
 			}
 
-			// We need an apic on chip as we check for the apic id and use that as a cpu index
+
 			if(!cpuid_1.cpuid_feature_information_edx.apic_on_chip) {
 				return false;
 			}
@@ -99,7 +96,7 @@ namespace physmem {
 
 				memcpy(&curr_pid, (void*)((uintptr_t)curr_entry + 0x440), sizeof(curr_pid));
 
-				// Check whether we found our process
+
 				if (target_pid == curr_pid) {
 
 					uint32_t active_threads;
@@ -144,17 +141,14 @@ namespace physmem {
 		}
 
 		inline uint64_t calculate_physical_memory_base(uint64_t pml4e_idx) {
-			// Shift the pml4 index right 36 bits to get the virtual address of the first byte of the 512 gb we mapped
+
 			return (pml4e_idx << (9 + 9 + 9 + 12));
 		}
 
 		inline bool map_full_system_physical_memory(uint32_t free_pml4_idx) {
 			page_tables_t* page_tables = physmem.page_tables;
 
-			// TO DO:
-			// Dynamically determine the range of physical memory this pc has
 
-			// Map the first 512 gb of physical memory; If any user has more than 512 gb of memory just kill yourselfes ig?
 			page_tables->pml4_table[free_pml4_idx].present = 1;
 			page_tables->pml4_table[free_pml4_idx].write = 1;
 			page_tables->pml4_table[free_pml4_idx].page_frame_number = win::win_get_physical_address(&page_tables->pdpt_table) >> 12;
@@ -192,7 +186,7 @@ namespace physmem {
 
 			physmem.mapped_physical_mem_base = calculate_physical_memory_base(free_pml4_idx);
 			if (!physmem.mapped_physical_mem_base)
-				return false; // Can't happen basically
+				return false;
 
 			return true;
 		}
@@ -224,9 +218,7 @@ namespace physmem {
 		}
 	};
 
-	/*
-		Exposed core runtime API's
-	*/
+
 	namespace runtime {
 		inline bool translate_to_physical_address(uint64_t outside_target_cr3, void* virtual_address, uint64_t& physical_address, uint64_t* remaining_bytes) {
 			rflags flags;
@@ -274,7 +266,7 @@ namespace physmem {
 				physical_address = (mapped_pdpte_1gb_entry.page_frame_number << 30) + va.offset_1gb;
 				if(remaining_bytes)
 					*remaining_bytes = 0x40000000 - va.offset_1gb;
-	
+
 				return status;
 			}
 
@@ -307,7 +299,7 @@ namespace physmem {
 			physical_address = (mapped_pte_entry->page_frame_number << 12) + va.offset_4kb;
 			if (remaining_bytes)
 				*remaining_bytes = 0x1000 - va.offset_4kb;
-	
+
 			return status;
 		}
 
@@ -344,7 +336,7 @@ namespace physmem {
 			uint64_t copied_bytes = 0;
 
 			while (copied_bytes < size) {
-				// Translate both the src and dst into physical addresses
+
 				status = translate_to_physical_address(src_cr3, (void*)((uint64_t)src + copied_bytes), current_physical_src, &src_remaining);
 				if (status != true)
 					break;
@@ -359,7 +351,7 @@ namespace physmem {
 				copyable_size = min(copyable_size, src_remaining);
 				copyable_size = min(copyable_size, dst_remaining);
 
-				// Then copy the mem
+
 				memcpy(current_virtual_dst, current_virtual_src, copyable_size);
 
 				copied_bytes += copyable_size;
@@ -384,7 +376,7 @@ namespace physmem {
 			uint64_t copied_bytes = 0;
 
 			while (copied_bytes < size) {
-				// Translate the src into a physical address
+
 				status = translate_to_physical_address(src_cr3, (void*)((uint64_t)src + copied_bytes), current_physical_src, &src_remaining);
 				if (status != true)
 					break;
@@ -395,7 +387,7 @@ namespace physmem {
 				copyable_size = min(PAGE_SIZE, size - copied_bytes);
 				copyable_size = min(copyable_size, src_remaining);
 
-				// Then copy the mem
+
 				memcpy(current_virtual_dst, current_virtual_src, copyable_size);
 
 				copied_bytes += copyable_size;
@@ -420,7 +412,7 @@ namespace physmem {
 			uint64_t copied_bytes = 0;
 
 			while (copied_bytes < size) {
-				// Translate the dst into a physical address
+
 				status = translate_to_physical_address(dst_cr3, (void*)((uint64_t)dst + copied_bytes), current_physical_dst, &dst_remaining);
 				if (status != true)
 					break;
@@ -431,7 +423,7 @@ namespace physmem {
 				copyable_size = min(PAGE_SIZE, size - copied_bytes);
 				copyable_size = min(copyable_size, dst_remaining);
 
-				// Then copy the mem
+
 				memcpy(current_virtual_dst, current_virtual_src, copyable_size);
 
 				copied_bytes += copyable_size;
@@ -441,9 +433,7 @@ namespace physmem {
 		}
 	};
 
-	/*
-		The exposed API's in here are designed for initialization
-	*/
+
 	namespace remapping {
 		inline bool get_remapping_entry(void* mem, remapped_entry_t*& remapping_entry) {
 			va_64_t target_va = { 0 };
@@ -455,44 +445,41 @@ namespace physmem {
 			for (uint32_t i = 0; i < MAX_REMAPPINGS; i++) {
 				remapped_entry_t* curr_entry = &physmem.remapping_tables.remapping_list[i];
 
-				// Sort out all the irrelevant ones
+
 				if (!curr_entry->used)
 					continue;
 
-				// Check whether the pml4 index overlaps
+
 				if (curr_entry->remapped_va.pml4e_idx != target_va.pml4e_idx)
 					continue;
 
-				// Check whether the pdpt index overlaps
+
 				if (curr_entry->remapped_va.pdpte_idx != target_va.pdpte_idx) {
 
-					// The curr closest entry is already as good as the entry at the current index
+
 					if (curr_closest_entry->remapped_va.pml4e_idx == target_va.pml4e_idx)
 						continue;
 
-					// Set the curr entry as closest entry
+
 					curr_closest_entry = curr_entry;
 					continue;
 				}
 
-				// If it points to an entry marked as large page
-				// we can return it immediately as there won't be
-				// a more fitting entry than this one (paging hierachy
-				// for that va range ends there
+
 				if (curr_entry->pdpt_table.large_page) {
 					curr_closest_entry = curr_entry;
 					goto cleanup;
 				}
 
-				// Check whether the pde index overlaps
+
 				if (curr_entry->remapped_va.pde_idx != target_va.pde_idx) {
 
-					// The curr closest entry is already as good as the entry at the current index
+
 					if (curr_closest_entry->remapped_va.pml4e_idx == target_va.pml4e_idx &&
 						curr_closest_entry->remapped_va.pdpte_idx == target_va.pdpte_idx)
 						continue;
 
-					// Set the curr entry as closest entry
+
 					curr_closest_entry = curr_entry;
 					continue;
 				}
@@ -502,22 +489,21 @@ namespace physmem {
 					goto cleanup;
 				}
 
-				// Check whether the pte index overlaps
+
 				if (curr_entry->remapped_va.pte_idx != target_va.pte_idx) {
 
-					// The curr closest entry is already as good as the entry at the current index
+
 					if (curr_closest_entry->remapped_va.pml4e_idx == target_va.pml4e_idx &&
 						curr_closest_entry->remapped_va.pdpte_idx == target_va.pdpte_idx &&
 						curr_closest_entry->remapped_va.pde_idx == target_va.pde_idx)
 						continue;
 
-					// Set the curr entry as closest entry
+
 					curr_closest_entry = curr_entry;
 					continue;
 				}
 
-				// Everything overlapped, the address resides in the same pte table
-				// as another one we mapped, we can reuse everything
+
 				curr_closest_entry = curr_entry;
 				goto cleanup;
 			}
@@ -539,7 +525,7 @@ namespace physmem {
 			for (uint32_t i = 0; i < MAX_REMAPPINGS; i++) {
 				remapped_entry_t* curr_entry = &physmem.remapping_tables.remapping_list[i];
 
-				// Check whether the current entry is present/occupied
+
 				if (curr_entry->used)
 					continue;
 
@@ -561,13 +547,13 @@ namespace physmem {
 				return false;
 			}
 
-			// Check whether the pml4 index overlaps
+
 			if (remapping_entry->remapped_va.pml4e_idx != target_va.pml4e_idx) {
 				usable_level = non_valid;
 				return false;
 			}
 
-			// Check whether the pdpt index overlaps
+
 			if (remapping_entry->remapped_va.pdpte_idx != target_va.pdpte_idx) {
 				usable_level = pdpt_table_valid;
 				return true;
@@ -578,7 +564,7 @@ namespace physmem {
 				return true;
 			}
 
-			// Check whether the pde index overlaps
+
 			if (remapping_entry->remapped_va.pde_idx != target_va.pde_idx) {
 				usable_level = pde_table_valid;
 				return true;
@@ -605,24 +591,24 @@ namespace physmem {
 			mem_cr3.flags = mem_cr3_u64;
 			bool status = true;
 
-			// Pointers to mapped system tables
+
 			pml4e_64* mapped_pml4_table = 0;
 			pdpte_64* mapped_pdpt_table = 0;
 			pde_64* mapped_pde_table = 0;
 			pte_64* mapped_pte_table = 0;
 
-			// Pointers to my tables
+
 			pml4e_64* my_pml4_table = 0;
 			pdpte_64* my_pdpt_table = 0;
 			pde_64* my_pde_table = 0;
 			pte_64* my_pte_table = 0;
 
-			// Physical addresses of my page tables
+
 			uint64_t pdpt_phys = 0;
 			uint64_t pd_phys = 0;
 			uint64_t pt_phys = 0;
 
-			// A new entry for remapping
+
 			remapped_entry_t new_entry = { 0 };
 
 			my_pml4_table = physmem.page_tables->pml4_table;
@@ -647,7 +633,7 @@ namespace physmem {
 
 				my_pml4_table[mem_va.pml4e_idx].page_frame_number = pdpt_phys >> 12;
 
-				// Create a new remapping entry
+
 				new_entry.used = true;
 				new_entry.remapped_va = mem_va;
 
@@ -692,7 +678,7 @@ namespace physmem {
 				my_pdpt_table[mem_va.pdpte_idx].page_frame_number = pd_phys >> 12;
 				my_pml4_table[mem_va.pml4e_idx].page_frame_number = pdpt_phys >> 12;
 
-				// Create a new remapping entry
+
 				new_entry.used = true;
 				new_entry.remapped_va = mem_va;
 
@@ -755,7 +741,7 @@ namespace physmem {
 			my_pml4_table[mem_va.pml4e_idx].present = 1;
 			my_pml4_table[mem_va.pml4e_idx].page_frame_number = pdpt_phys >> 12;
 
-			// Create a new remapping entry
+
 			new_entry.used = true;
 			new_entry.remapped_va = mem_va;
 
@@ -789,13 +775,13 @@ namespace physmem {
 			mem_va.flags = (uint64_t)mem;
 			mem_cr3.flags = mem_cr3_u64;
 
-			// Pointers to mapped system tables
+
 			pml4e_64* mapped_pml4_table = 0;
 			pdpte_64* mapped_pdpt_table = 0;
 			pde_64* mapped_pde_table = 0;
 			pte_64* mapped_pte_table = 0;
 
-			// Pointers to our tables
+
 			pdpte_64* my_pdpt_table = 0;
 			pde_64* my_pde_table = 0;
 			pte_64* my_pte_table = 0;
@@ -820,7 +806,6 @@ namespace physmem {
 					}
 
 
-					// Remember the order to change mappings (pt, pd, pdpt, pml4). If you don't do it in this order you will bsod sometimes
 					memcpy(&my_pdpt_table[mem_va.pdpte_idx], &mapped_pdpt_table[mem_va.pdpte_idx], sizeof(pdpte_1gb_64));
 
 					remapped_entry_t new_entry;
@@ -862,7 +847,7 @@ namespace physmem {
 					if (status != true)
 						goto cleanup;
 
-					// Remember the order to change mappings (pt, pd, pdpt, pml4). If you don't do it in this order you will bsod sometimes
+
 					memcpy(my_pde_table, mapped_pde_table, sizeof(pde_2mb_64) * 512);
 					my_pdpt_table[mem_va.pdpte_idx].page_frame_number = pd_phys >> 12;
 
@@ -890,7 +875,7 @@ namespace physmem {
 						goto cleanup;
 					}
 
-					// Remember the order to change mappings (pt, pd, pdpt, pml4). If you don't do it in this order you will bsod sometimes
+
 					memcpy(&my_2mb_pde_table[mem_va.pde_idx], &mapped_pde_table[mem_va.pde_idx], sizeof(pde_2mb_64));
 
 					remapped_entry_t new_entry;
@@ -943,7 +928,6 @@ namespace physmem {
 					goto cleanup;
 
 
-				// Remember the order to change mappings (pt, pd, pdpt, pml4). If you don't do it in this order you will bsod sometimes
 				memcpy(my_pte_table, mapped_pte_table, sizeof(pte_64) * 512);
 				memcpy(my_pde_table, mapped_pde_table, sizeof(pde_2mb_64) * 512);
 				my_pde_table[mem_va.pde_idx].page_frame_number = pt_phys >> 12;
@@ -987,7 +971,6 @@ namespace physmem {
 					goto cleanup;
 
 
-				// Remember the order to change mappings (pt, pd, pdpt, pml4). If you don't do it in this order you will bsod sometimes
 				memcpy(my_pte_table, mapped_pte_table, sizeof(pte_64) * 512);
 				my_pde_table[mem_va.pde_idx].page_frame_number = pt_phys >> 12;
 
@@ -1069,9 +1052,7 @@ namespace physmem {
 			return status;
 		}
 
-		/*
-			Exposed API's
-		*/
+
 		inline bool ensure_memory_mapping_for_range(void* target_address, uint64_t size, uint64_t mem_cr3_u64) {
 			rflags flags;
 			flags.flags = __readeflags();
@@ -1129,8 +1110,6 @@ namespace physmem {
 			pte_64* new_mem_pte_table = 0;
 
 
-			// First ensure the mapping of the my address
-			// in our cr3
 			status = ensure_memory_mapping(target_address, target_address_cr3_u64);
 			if (status != true)
 				goto cleanup;
@@ -1217,9 +1196,6 @@ namespace physmem {
 			stored_flags = pte_table[mem_va.pte_idx].flags;
 			pte_table[mem_va.pte_idx].flags = 0;
 
-			// DO NOT FUCKING FLUSH THE TRANSLATION
-			// OR THE IDTR/GDTR STORING DETECTION
-			// WILL NOT WORK PROPERLY
 
 			return true;
 		}
@@ -1385,36 +1361,29 @@ namespace physmem {
 		}
 
 		inline bool prepare_driver_for_supervisor_access(void* driver_base, uint64_t driver_size, uint64_t mem_cr3) {
-			/*
-				First prepare the driver then the stack
-			*/
+
+
 			if (!physmem::remapping::ensure_memory_mapping_for_range((void*)driver_base, driver_size, mem_cr3))
 				return false;
 
 			if (!physmem::paging_manipulation::win_set_memory_range_supervisor((void*)driver_base, driver_size, mem_cr3, 1))
 				return false;
 
-			/*
-				Then prepare the stack
-			*/
+
 			KPCR* kpcr = (KPCR*)__readmsr(IA32_GS_BASE);
 			void* curr_thread = *(void**)((uint64_t)kpcr->CurrentPrcb + 0x8);
 			uint64_t stack_base = *(uint64_t*)((uint64_t)curr_thread + 0x38);
 			uint64_t stack_limit = *(uint64_t*)((uint64_t)curr_thread + 0x30);
 			uint64_t stack_size = stack_base - stack_limit;
 
-			/*
-				Since the stack grows downwards, stack_limit actually is the base of the mem
-			*/
+
 			if (!physmem::remapping::ensure_memory_mapping_for_range((void*)stack_limit, stack_size, mem_cr3))
 				return false;
 
 			if (!physmem::paging_manipulation::win_set_memory_range_supervisor((void*)stack_limit, stack_size, mem_cr3, 1))
 				return false;
 
-			/*
-				We need to set the interrupt record pages to supervisor to be able to access them from cpl = 3
-			*/
+
 			if (!physmem::remapping::ensure_memory_mapping_for_range((void*)safety_net::idt::get_interrupt_record(0), MAX_RECORDABLE_INTERRUPTS * sizeof(idt_regs_ecode_t), mem_cr3))
 				return false;
 

@@ -7,10 +7,17 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
+
+#include <array>
+#include <bitset>
 
 #include "integrity.hpp"
 #include "metamorphic.hpp"
+#include "state.hpp"
 #include "../../../obfuscation.hpp"
 
 namespace anti_tamper {
@@ -24,6 +31,8 @@ namespace detail
     static constexpr uint32_t CONTEXT_SHUFFLE_INTERVAL = 64;
     static constexpr uint32_t HANDLER_POOL_SIZE = 4096;
     static constexpr uint64_t HANDLER_CRYPT_MAGIC = 0x3C6EF372FE94F82BULL;
+
+    struct handler_pool_t;
 
 
     struct vm_continuation_t
@@ -77,6 +86,8 @@ namespace detail
 
         vm_continuation_t   continuation;
         context_crypt_t     ctx_crypt;
+
+        handler_pool_t* pool;
     };
 
     enum vm_ops : uint8_t
@@ -134,6 +145,7 @@ namespace detail
         OP_SAHF    = 0x32,
         OP_JNB     = 0x33,
         OP_JNBE    = 0x34,
+        OP_VM_SPAWN = 0x35,
         OP_MAX
     };
 
@@ -188,6 +200,48 @@ namespace detail
         }
     }
 
+    inline std::array<uint8_t, 256> derive_function_opcode_map(
+        uint32_t func_rva, const uint8_t master_key[32])
+    {
+        uint8_t rva_bytes[4];
+        memcpy(rva_bytes, &func_rva, 4);
+        uint8_t prk[32];
+        hmac_sha256(master_key, 32, rva_bytes, 4, prk);
+
+        static const uint8_t info[12] = {
+            'a','i','d','a','_','v','m','_','o','p','m','p'
+        };
+        uint8_t okm[256];
+        hkdf_expand_sha256(prk, info, 12, okm, 256);
+
+        std::array<uint8_t, 256> map{};
+        for (int i = 0; i < 256; ++i)
+            map[i] = static_cast<uint8_t>(i);
+
+        for (int i = 255; i > 0; --i)
+        {
+            uint32_t j = static_cast<uint32_t>(okm[i]) % static_cast<uint32_t>(i + 1);
+            uint8_t tmp = map[i];
+            map[i] = map[j];
+            map[j] = tmp;
+        }
+
+        SecureZeroMemory(prk, 32);
+        SecureZeroMemory(okm, 256);
+        return map;
+    }
+
+    inline void derive_function_maps(uint32_t func_rva, const uint8_t master_key[32],
+                                     uint8_t opcode_map[256], uint8_t reverse_map[256])
+    {
+        auto m = derive_function_opcode_map(func_rva, master_key);
+        for (int i = 0; i < 256; ++i)
+        {
+            opcode_map[i] = m[i];
+            reverse_map[m[i]] = static_cast<uint8_t>(i);
+        }
+    }
+
     inline uint64_t secure_seed()
     {
         uint8_t buf[32];
@@ -217,15 +271,48 @@ namespace detail
         bool        is_decrypted;
     };
 
-    inline handler_slot_t g_handler_pool[HANDLER_POOL_SIZE] = {};
-    inline uint32_t       g_active_slots = 0;
-    inline uint64_t       g_pool_guard = 0;
-    inline handler_fn     g_dispatch_table[256] = {};
-    inline bool           g_poly_initialized = false;
+    struct poly_dispatch_t
+    {
+        handler_fn variants[4];
+        uint8_t    count;
+    };
+
+    struct handler_pool_t
+    {
+        handler_slot_t   slots[HANDLER_POOL_SIZE];
+        poly_dispatch_t  poly_table[256];
+        handler_fn       dispatch_table[256];
+        uint32_t         active_slots;
+        uint32_t         regen_counter;
+        uint64_t         pool_guard;
+        bool             poly_initialized;
+        uint8_t          opcode_map[256];
+        uint8_t          reverse_map[256];
+        uint64_t         pool_seed;
+        uint32_t         generation;
+        uint32_t         child_pool_count;
+        handler_pool_t*  child_pools[8];
+        std::unordered_map<uint32_t, uint32_t>* hot_block_counts;
+    };
+
+    inline handler_pool_t g_default_pool{};
+
+    inline auto& g_handler_pool    = g_default_pool.slots;
+    inline auto& g_active_slots    = g_default_pool.active_slots;
+    inline auto& g_pool_guard      = g_default_pool.pool_guard;
+    inline auto& g_dispatch_table  = g_default_pool.dispatch_table;
+    inline auto& g_poly_initialized = g_default_pool.poly_initialized;
+    inline auto& g_poly_table      = g_default_pool.poly_table;
+
+    using jit_hook_fn = bool(*)(vm_state_t&, const uint8_t*, uint32_t);
+    inline jit_hook_fn g_jit_hook = nullptr;
 
     inline bool verify_handler_pool();
+    inline bool verify_handler_pool(handler_pool_t& pool);
     inline void build_handler_pool(const uint8_t* reverse_map, uint64_t pool_seed);
+    inline void build_handler_pool(handler_pool_t& pool, const uint8_t* reverse_map, uint64_t pool_seed);
     inline void build_poly_table();
+    inline void build_poly_table(handler_pool_t& pool);
     __forceinline handler_fn select_handler(vm_state_t& vm, uint8_t opcode);
     inline void init_vm(vm_state_t& vm, uint64_t seed);
     inline uint64_t vm_execute(vm_state_t& vm, const uint8_t* bytecode, uint32_t bc_size);
@@ -552,17 +639,18 @@ namespace detail
         if ((dr7 & 0xFF) == 0 && dr0 == 0 && dr1 == 0 && dr2 == 0 && dr3 == 0)
             return false;
 
-        uintptr_t pool_lo = reinterpret_cast<uintptr_t>(&g_handler_pool[0]);
-        uintptr_t pool_hi = pool_lo + sizeof(g_handler_pool);
-        uintptr_t dispatch_lo = reinterpret_cast<uintptr_t>(&g_dispatch_table[0]);
-        uintptr_t dispatch_hi = dispatch_lo + sizeof(g_dispatch_table);
+        handler_pool_t& pool = vm.pool ? *vm.pool : g_default_pool;
+        uintptr_t pool_lo = reinterpret_cast<uintptr_t>(&pool.slots[0]);
+        uintptr_t pool_hi = pool_lo + sizeof(pool.slots);
+        uintptr_t dispatch_lo = reinterpret_cast<uintptr_t>(&pool.dispatch_table[0]);
+        uintptr_t dispatch_hi = dispatch_lo + sizeof(pool.dispatch_table);
 
         auto in_range = [&](uint64_t addr) -> bool {
             if (addr == 0) return false;
             if (addr >= pool_lo && addr < pool_hi) return true;
             if (addr >= dispatch_lo && addr < dispatch_hi) return true;
-            for (uint32_t i = 0; i < g_active_slots; ++i) {
-                uintptr_t fn = reinterpret_cast<uintptr_t>(g_handler_pool[i].fn);
+            for (uint32_t i = 0; i < pool.active_slots; ++i) {
+                uintptr_t fn = reinterpret_cast<uintptr_t>(pool.slots[i].fn);
                 if (addr >= fn && addr < fn + 256) return true;
             }
             return false;
@@ -583,30 +671,47 @@ namespace detail
         uint64_t new_seed = vm.rolling_key ^ vm.handler_chain_key ^ secure_seed();
         new_seed ^= vm.insn_count * 0x9E3779B97F4A7C15ULL;
 
+        handler_pool_t& pool = vm.pool ? *vm.pool : g_default_pool;
         generate_opcode_map(new_seed, vm.opcode_map, vm.reverse_map);
-        build_handler_pool(vm.reverse_map, new_seed ^ 0x428A2F98D728AE22ULL);
+        memcpy(pool.opcode_map, vm.opcode_map, 256);
+        memcpy(pool.reverse_map, vm.reverse_map, 256);
+        build_handler_pool(pool, vm.reverse_map, new_seed ^ 0x428A2F98D728AE22ULL);
 
-        if (g_poly_initialized) {
-            g_poly_initialized = false;
-            build_poly_table();
+        if (pool.poly_initialized) {
+            pool.poly_initialized = false;
+            build_poly_table(pool);
         }
 
         vm.context_entropy ^= new_seed;
+        pool.regen_counter++;
     }
 
 
     __forceinline void dispatch_next(vm_state_t& vm, const uint8_t* bc, uint32_t bc_size)
     {
+        handler_pool_t& pool = vm.pool ? *vm.pool : g_default_pool;
 
         encrypt_context(vm);
 
         if (vm.halted || vm.rip >= bc_size || vm.insn_count >= vm.max_insn)
             return;
 
+        if (g_jit_hook)
+        {
+            decrypt_context(vm);
+            if (g_jit_hook(vm, bc, bc_size))
+            {
+                encrypt_context(vm);
+                dispatch_next(vm, bc, bc_size);
+                return;
+            }
+            encrypt_context(vm);
+        }
+
 
         if ((vm.insn_count & 0xFF) == 0)
         {
-            if (!verify_handler_pool())
+            if (!verify_handler_pool(pool))
             {
                 decrypt_context(vm);
                 write_vreg(vm, 0, 0xDEADBEEFDEADBEEFULL);
@@ -654,7 +759,7 @@ namespace detail
         ++vm.insn_count;
 
 
-        auto handler = g_poly_initialized ? select_handler(vm, decrypted) : g_dispatch_table[decrypted];
+        auto handler = pool.poly_initialized ? select_handler(vm, decrypted) : pool.dispatch_table[decrypted];
         handler(vm, bc, bc_size);
     }
 
@@ -1481,7 +1586,7 @@ namespace detail
     }
 
 
-    static constexpr uint32_t MAX_VM_DEPTH = 3;
+    static constexpr uint32_t MAX_VM_DEPTH = 8;
     inline thread_local uint32_t g_vm_depth = 0;
 
     VM_HANDLER(h_vm_enter)
@@ -1526,6 +1631,55 @@ namespace detail
         vm.halted = true;
     }
 
+    VM_HANDLER(h_vm_spawn)
+    {
+        if (g_vm_depth >= MAX_VM_DEPTH) {
+            vm.halted = true;
+            write_vreg(vm, 0, 0xDEADBEEFDEADBEEFULL);
+            return;
+        }
+
+        uint8_t  child_pool_id = fetch_byte(vm, bc, bc_size);
+        uint32_t child_bc_offset = fetch_u32(vm, bc, bc_size);
+        uint32_t child_bc_len    = fetch_u32(vm, bc, bc_size);
+        uint8_t  result_reg = fetch_byte(vm, bc, bc_size) & 0x0F;
+
+        if (child_bc_offset + child_bc_len > bc_size) {
+            vm.halted = true;
+            return;
+        }
+
+        handler_pool_t* parent_pool = vm.pool ? vm.pool : &g_default_pool;
+        handler_pool_t* child_pool = parent_pool;
+        if (child_pool_id < 8 && parent_pool->child_pools[child_pool_id])
+            child_pool = parent_pool->child_pools[child_pool_id];
+
+        uint64_t child_seed = vm.rolling_key ^ vm.handler_chain_key
+            ^ secure_seed()
+            ^ (static_cast<uint64_t>(child_pool_id) * 0x9E3779B97F4A7C15ULL);
+
+        vm_state_t child;
+        init_vm(child, child_seed);
+        child.pool = child_pool;
+        memcpy(child.opcode_map, child_pool->opcode_map, 256);
+        memcpy(child.reverse_map, child_pool->reverse_map, 256);
+
+        for (int i = 0; i < 8; ++i)
+            write_vreg(child, i, read_vreg(vm, i));
+
+        g_vm_depth++;
+        uint64_t result = vm_execute(child, bc + child_bc_offset, child_bc_len);
+        g_vm_depth--;
+
+        write_vreg(vm, result_reg, result);
+
+        if (child.stack)
+            RtlSecureZeroMemory(child.stack, child.stack_size);
+        destroy_vm(child);
+
+        dispatch_next(vm, bc, bc_size);
+    }
+
 
     __forceinline bool verify_environment(vm_state_t& vm)
     {
@@ -1556,23 +1710,15 @@ namespace detail
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 
-    struct poly_dispatch_t
-    {
-        handler_fn variants[4];
-        uint8_t    count;
-    };
-
-    inline poly_dispatch_t g_poly_table[256] = {};
-
-    inline void build_poly_table()
+    inline void build_poly_table(handler_pool_t& pool)
     {
         for (int i = 0; i < 256; ++i) {
-            g_poly_table[i].variants[0] = g_dispatch_table[i];
-            g_poly_table[i].count = 1;
+            pool.poly_table[i].variants[0] = pool.dispatch_table[i];
+            pool.poly_table[i].count = 1;
         }
 
-        auto add_variant = [](uint8_t mapped_op, handler_fn alt) {
-            auto& entry = g_poly_table[mapped_op];
+        auto add_variant = [&pool](uint8_t mapped_op, handler_fn alt) {
+            auto& entry = pool.poly_table[mapped_op];
             if (entry.count < 4) {
                 entry.variants[entry.count] = alt;
                 entry.count++;
@@ -1609,23 +1755,29 @@ namespace detail
         constexpr int num_pairs = sizeof(pairs) / sizeof(pairs[0]);
 
         for (int d = 0; d < 256; ++d) {
-            if (g_dispatch_table[d] == h_invalid) continue;
+            if (pool.dispatch_table[d] == h_invalid) continue;
             for (int p = 0; p < num_pairs; ++p) {
-                if (g_dispatch_table[d] == pairs[p].base) {
+                if (pool.dispatch_table[d] == pairs[p].base) {
                     add_variant(static_cast<uint8_t>(d), pairs[p].alt);
                 }
             }
         }
 
-        g_poly_initialized = true;
+        pool.poly_initialized = true;
+    }
+
+    inline void build_poly_table()
+    {
+        build_poly_table(g_default_pool);
     }
 
     __forceinline handler_fn select_handler(vm_state_t& vm, uint8_t opcode)
     {
-        if (!g_poly_initialized || !verify_environment(vm))
-            return g_dispatch_table[opcode];
+        handler_pool_t& pool = vm.pool ? *vm.pool : g_default_pool;
+        if (!pool.poly_initialized || !verify_environment(vm))
+            return pool.dispatch_table[opcode];
 
-        auto& entry = g_poly_table[opcode];
+        auto& entry = pool.poly_table[opcode];
         if (entry.count <= 1)
             return entry.variants[0];
 
@@ -1635,7 +1787,7 @@ namespace detail
 
 #undef VM_HANDLER
 
-    inline void build_handler_pool(const uint8_t* reverse_map, uint64_t pool_seed)
+    inline void build_handler_pool(handler_pool_t& pool, const uint8_t* reverse_map, uint64_t pool_seed)
     {
         handler_fn base_handlers[OP_MAX] = {};
         base_handlers[OP_NOP]       = h_nop;
@@ -1689,6 +1841,7 @@ namespace detail
         base_handlers[OP_SAHF]      = h_sahf;
         base_handlers[OP_JNB]       = h_jnb;
         base_handlers[OP_JNBE]      = h_jnbe;
+        base_handlers[OP_VM_SPAWN]  = h_vm_spawn;
 
         handler_fn variant_table[] = {
             h_nand_v2, h_xor_v2, h_hash_v2, h_cmp_v2,
@@ -1711,73 +1864,86 @@ namespace detail
         constexpr int num_variants = sizeof(variant_ops) / sizeof(variant_ops[0]);
 
         uint64_t seed = pool_seed;
-        g_active_slots = 0;
+        pool.active_slots = 0;
 
         for (int i = 0; i < 256; ++i)
-            g_dispatch_table[i] = h_invalid;
+            pool.dispatch_table[i] = h_invalid;
 
         for (uint8_t op = 0; op < OP_MAX; ++op)
         {
             if (!base_handlers[op]) continue;
 
             uint8_t mapped = reverse_map[op];
-            g_dispatch_table[mapped] = base_handlers[op];
+            pool.dispatch_table[mapped] = base_handlers[op];
 
-            if (g_active_slots < HANDLER_POOL_SIZE)
+            if (pool.active_slots < HANDLER_POOL_SIZE)
             {
-                auto& slot = g_handler_pool[g_active_slots];
+                auto& slot = pool.slots[pool.active_slots];
                 slot.fn = base_handlers[op];
                 slot.variant_id = 0;
                 xorshift_advance(seed);
                 slot.decrypt_key = seed;
                 slot.encrypted_next = 0;
                 slot.is_decrypted = true;
-                g_active_slots++;
+                pool.active_slots++;
             }
 
             for (int v = 0; v < num_variants; ++v)
             {
-                if (variant_ops[v] == op && g_active_slots < HANDLER_POOL_SIZE)
+                if (variant_ops[v] == op && pool.active_slots < HANDLER_POOL_SIZE)
                 {
-                    auto& slot = g_handler_pool[g_active_slots];
+                    auto& slot = pool.slots[pool.active_slots];
                     slot.fn = variant_table[v];
                     slot.variant_id = static_cast<uint8_t>(v + 1);
                     xorshift_advance(seed);
                     slot.decrypt_key = seed;
                     slot.encrypted_next = 0;
                     slot.is_decrypted = false;
-                    g_active_slots++;
+                    pool.active_slots++;
                 }
             }
         }
 
         xorshift_advance(seed);
-        for (uint32_t i = 0; i < g_active_slots; ++i)
+        for (uint32_t i = 0; i < pool.active_slots; ++i)
         {
-            uint32_t next_idx = (i + 1) % g_active_slots;
-            uint64_t next_addr = reinterpret_cast<uint64_t>(g_handler_pool[next_idx].fn);
-            g_handler_pool[i].encrypted_next = next_addr ^ g_handler_pool[i].decrypt_key ^ HANDLER_CRYPT_MAGIC;
+            uint32_t next_idx = (i + 1) % pool.active_slots;
+            uint64_t next_addr = reinterpret_cast<uint64_t>(pool.slots[next_idx].fn);
+            pool.slots[i].encrypted_next = next_addr ^ pool.slots[i].decrypt_key ^ HANDLER_CRYPT_MAGIC;
         }
 
         uint64_t guard = 0;
-        for (uint32_t i = 0; i < g_active_slots; ++i)
-            guard ^= reinterpret_cast<uint64_t>(g_handler_pool[i].fn) * (i + 1);
+        for (uint32_t i = 0; i < pool.active_slots; ++i)
+            guard ^= reinterpret_cast<uint64_t>(pool.slots[i].fn) * (i + 1);
         for (int i = 0; i < 256; ++i)
-            guard ^= reinterpret_cast<uint64_t>(g_dispatch_table[i]) * (i + 1);
-        g_pool_guard = guard;
+            guard ^= reinterpret_cast<uint64_t>(pool.dispatch_table[i]) * (i + 1);
+        pool.pool_guard = guard;
+        pool.pool_seed = pool_seed;
+        pool.generation++;
+        memcpy(pool.reverse_map, reverse_map, 256);
+    }
+
+    inline void build_handler_pool(const uint8_t* reverse_map, uint64_t pool_seed)
+    {
+        build_handler_pool(g_default_pool, reverse_map, pool_seed);
+    }
+
+    inline bool verify_handler_pool(handler_pool_t& pool)
+    {
+        uint64_t guard = 0;
+        for (uint32_t i = 0; i < pool.active_slots; ++i)
+            guard ^= reinterpret_cast<uint64_t>(pool.slots[i].fn) * (i + 1);
+        for (int i = 0; i < 256; ++i)
+            guard ^= reinterpret_cast<uint64_t>(pool.dispatch_table[i]) * (i + 1);
+        return guard == pool.pool_guard;
     }
 
     inline bool verify_handler_pool()
     {
-        uint64_t guard = 0;
-        for (uint32_t i = 0; i < g_active_slots; ++i)
-            guard ^= reinterpret_cast<uint64_t>(g_handler_pool[i].fn) * (i + 1);
-        for (int i = 0; i < 256; ++i)
-            guard ^= reinterpret_cast<uint64_t>(g_dispatch_table[i]) * (i + 1);
-        return guard == g_pool_guard;
+        return verify_handler_pool(g_default_pool);
     }
 
-    inline void init_vm(vm_state_t& vm, uint64_t seed)
+    inline void init_vm(vm_state_t& vm, uint64_t seed, handler_pool_t* pool)
     {
         memset(&vm, 0, sizeof(vm));
         vm.stack_size = 4096;
@@ -1808,14 +1974,23 @@ namespace detail
         }
         vm.reg_xor_key = 0;
 
-        generate_opcode_map(seed, vm.opcode_map, vm.reverse_map);
-        build_handler_pool(vm.reverse_map, seed ^ 0x428A2F98D728AE22ULL);
+        vm.pool = pool ? pool : &g_default_pool;
 
-        if (!g_poly_initialized)
-            build_poly_table();
+        generate_opcode_map(seed, vm.opcode_map, vm.reverse_map);
+        memcpy(vm.pool->opcode_map, vm.opcode_map, 256);
+        memcpy(vm.pool->reverse_map, vm.reverse_map, 256);
+        build_handler_pool(*vm.pool, vm.reverse_map, seed ^ 0x428A2F98D728AE22ULL);
+
+        if (!vm.pool->poly_initialized)
+            build_poly_table(*vm.pool);
 
         bind_to_environment(vm);
         shuffle_registers(vm);
+    }
+
+    inline void init_vm(vm_state_t& vm, uint64_t seed)
+    {
+        init_vm(vm, seed, &g_default_pool);
     }
 
     inline void destroy_vm(vm_state_t& vm)
@@ -1853,6 +2028,57 @@ namespace detail
         decrypt_context(vm);
 
         return read_vreg(vm, 0);
+    }
+
+    inline uint64_t vm_execute_with_rva(vm_state_t& vm,
+                                        const uint8_t* bytecode, uint32_t bc_size,
+                                        uint32_t func_rva,
+                                        const uint8_t master_key[32])
+    {
+        std::array<uint8_t, 256> local_map{};
+        uint8_t local_reverse[256];
+        {
+            auto m = derive_function_opcode_map(func_rva, master_key);
+            for (int i = 0; i < 256; ++i)
+            {
+                local_map[i] = m[i];
+                local_reverse[m[i]] = static_cast<uint8_t>(i);
+            }
+        }
+
+        uint8_t saved_opcode_map[256];
+        uint8_t saved_reverse_map[256];
+        memcpy(saved_opcode_map, vm.opcode_map, 256);
+        memcpy(saved_reverse_map, vm.reverse_map, 256);
+
+        memcpy(vm.opcode_map, local_map.data(), 256);
+        memcpy(vm.reverse_map, local_reverse, 256);
+
+        handler_pool_t* saved_pool = vm.pool;
+        handler_pool_t local_pool{};
+        memcpy(local_pool.opcode_map, vm.opcode_map, 256);
+        memcpy(local_pool.reverse_map, vm.reverse_map, 256);
+        uint64_t pool_seed = 0;
+        memcpy(&pool_seed, local_map.data(), 8);
+        pool_seed ^= static_cast<uint64_t>(func_rva) * 0x9E3779B97F4A7C15ULL;
+        local_pool.pool_seed = pool_seed;
+        build_handler_pool(local_pool, local_pool.reverse_map, pool_seed ^ 0x428A2F98D728AE22ULL);
+        build_poly_table(local_pool);
+        vm.pool = &local_pool;
+
+        uint64_t result = vm_execute(vm, bytecode, bc_size);
+
+        vm.pool = saved_pool;
+        memcpy(vm.opcode_map, saved_opcode_map, 256);
+        memcpy(vm.reverse_map, saved_reverse_map, 256);
+
+        SecureZeroMemory(local_map.data(), 256);
+        SecureZeroMemory(local_reverse, 256);
+        SecureZeroMemory(saved_opcode_map, 256);
+        SecureZeroMemory(saved_reverse_map, 256);
+        SecureZeroMemory(&local_pool, sizeof(local_pool));
+
+        return result;
     }
 
     inline void encrypt_bytecode(std::vector<uint8_t>& bc, uint64_t initial_key)
@@ -2132,6 +2358,92 @@ inline void reseed_from_server(uint64_t server_nonce)
     SecureZeroMemory(key_seed, 32);
     SecureZeroMemory(prk, 32);
     SecureZeroMemory(derived, 32);
+}
+
+
+namespace pool_manager {
+
+    inline std::mutex& mtx()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    inline std::vector<std::unique_ptr<detail::handler_pool_t>>& owner()
+    {
+        static std::vector<std::unique_ptr<detail::handler_pool_t>> v;
+        return v;
+    }
+
+    inline std::unordered_map<uint64_t, detail::handler_pool_t*>& index()
+    {
+        static std::unordered_map<uint64_t, detail::handler_pool_t*> m;
+        return m;
+    }
+
+    inline detail::handler_pool_t* get_or_create(uint64_t func_rva, uint64_t master_key)
+    {
+        std::lock_guard<std::mutex> lk(mtx());
+        auto& idx = index();
+        auto it = idx.find(func_rva);
+        if (it != idx.end())
+            return it->second;
+
+        uint8_t master32[32];
+        {
+            uint8_t seed_input[16];
+            uint64_t magic = 0xA54FF53A5F1D36F1ULL;
+            memcpy(seed_input, &master_key, 8);
+            memcpy(seed_input + 8, &magic, 8);
+            uint8_t prk[32];
+            detail::hmac_sha256(state::g_vm_master_key, 32, seed_input, 16, prk);
+            static const uint8_t info[10] = {
+                'v','m','_','m','k','_','m','i','x','2'
+            };
+            detail::hkdf_expand_sha256(prk, info, 10, master32, 32);
+            SecureZeroMemory(prk, 32);
+            SecureZeroMemory(seed_input, 16);
+        }
+
+        uint64_t pool_seed = 0;
+        memcpy(&pool_seed, master32, 8);
+        pool_seed ^= func_rva * 0x9E3779B97F4A7C15ULL;
+        pool_seed ^= integrity::siphash::siphash_3u64(master_key, func_rva, pool_seed);
+
+        auto up = std::unique_ptr<detail::handler_pool_t>(new detail::handler_pool_t{});
+        auto* raw = up.get();
+        memset(raw, 0, sizeof(*raw));
+        raw->pool_seed = pool_seed;
+
+        detail::derive_function_maps(
+            static_cast<uint32_t>(func_rva & 0xFFFFFFFFu),
+            master32, raw->opcode_map, raw->reverse_map);
+
+        detail::build_handler_pool(*raw, raw->reverse_map, pool_seed ^ 0x428A2F98D728AE22ULL);
+        detail::build_poly_table(*raw);
+
+        SecureZeroMemory(master32, 32);
+
+        idx[func_rva] = raw;
+        owner().push_back(std::move(up));
+        return raw;
+    }
+
+    inline void clear_all()
+    {
+        std::lock_guard<std::mutex> lk(mtx());
+        for (auto& up : owner())
+        {
+            if (up && up->hot_block_counts)
+            {
+                delete up->hot_block_counts;
+                up->hot_block_counts = nullptr;
+            }
+        }
+        index().clear();
+        owner().clear();
+    }
+
 }
 
 

@@ -43,6 +43,8 @@ struct config_t {
     bool ghost_veh = false;
     bool rdtsc_entangle = false;
     bool opaque_predicates = false;
+    bool ast_poison = false;
+    bool symexec_bombs = false;
     bool verbose = false;
     bool seed_provided = false;
     bool watermark_provided = false;
@@ -75,6 +77,8 @@ static void print_usage(std::FILE* out) {
         "  --ghost-veh                 Install ghost VEH guards (Phase 4)\n"
         "  --rdtsc-entangle            Entangle timing via rdtsc (Phase 5)\n"
         "  --opaque-predicates         Insert opaque predicates (Phase 6)\n"
+        "  --ast-poison                Inject AST-poisoning debug section (Phase B.1)\n"
+        "  --symexec-bombs             Inject symbolic-execution state-explosion bombs (Phase B.2)\n"
         "\n"
         "Aggregate:\n"
         "  -a, --all                   Enable all protections\n"
@@ -158,6 +162,10 @@ inline config_t parse_args(int argc, char** argv) {
             cfg.strip_rich = true;
         } else if (arg == "--strip-debug") {
             cfg.strip_debug = true;
+        } else if (arg == "--ast-poison") {
+            cfg.ast_poison = true;
+        } else if (arg == "--symexec-bombs") {
+            cfg.symexec_bombs = true;
         } else if (arg == "--encrypt-imports") {
             cfg.encrypt_imports = true;
         } else if (arg == "--encrypt-strings") {
@@ -200,6 +208,8 @@ inline config_t parse_args(int argc, char** argv) {
             cfg.ghost_veh = true;
             cfg.rdtsc_entangle = true;
             cfg.opaque_predicates = true;
+            cfg.ast_poison = true;
+            cfg.symexec_bombs = true;
         } else if (arg == "-v" || arg == "--verbose") {
             cfg.verbose = true;
         } else if (arg == "--seed") {
@@ -309,6 +319,8 @@ inline int run(const config_t& cfg) {
     opt.ghost_veh = cfg.ghost_veh;
     opt.rdtsc_entangle = cfg.rdtsc_entangle;
     opt.opaque_predicates = cfg.opaque_predicates;
+    opt.ast_poison = cfg.ast_poison;
+    opt.symexec_bombs = cfg.symexec_bombs;
     opt.tamper_response_level = cfg.tamper_response_level;
     std::memcpy(opt.license_hash, cfg.license_hash, 16);
 
@@ -335,6 +347,9 @@ inline int run(const config_t& cfg) {
                      cfg.ghost_veh ? " ghost_veh" : "",
                      cfg.rdtsc_entangle ? " rdtsc_entangle" : "",
                      cfg.opaque_predicates ? " opaque_predicates" : "");
+        std::fprintf(stdout, "[+] Phase B flags:%s%s\n",
+                     cfg.ast_poison ? " ast_poison" : "",
+                     cfg.symexec_bombs ? " symexec_bombs" : "");
     }
 
     const uint32_t reloc_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].rva;

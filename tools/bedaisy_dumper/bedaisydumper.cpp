@@ -676,7 +676,7 @@ public:
         resolve_mode_ = true;
 
         std::uint64_t stop_at = jcc_va;
-        // 10ms timeout, 200 instruction limit
+
         uc_err err = uc_emu_start(uc_, block_va, stop_at, 10 * 1000, 200);
 
 
@@ -824,12 +824,12 @@ private:
                                   int64_t value, void* user_data) {
         (void)size; (void)value;
         auto* self = static_cast<BranchResolver*>(user_data);
-        // In resolve mode, stop on unmapped access (don't leak memory)
+
         if (self && self->resolve_mode_) {
             uc_emu_stop(uc);
             return false;
         }
-        // In trace mode, auto-map so we can follow indirect branches
+
         std::uint64_t aligned = address & ~0xFFFULL;
         std::vector<std::uint8_t> zeros(0x2000, 0);
         uc_err err = uc_mem_map(uc, aligned, 0x2000, UC_PROT_ALL);
@@ -1287,7 +1287,7 @@ private:
         std::uint32_t resolved_emu = 0;
         std::uint32_t processed = 0;
 
-        // Count total conditional branches first
+
         for (const auto& fn : funcs_)
             for (const auto& bb : fn.blocks)
                 if (bb.is_conditional_jmp && bb.branch_target != 0 && bb.fallthrough_target != 0)
@@ -1295,7 +1295,7 @@ private:
 
         std::cout << "    " << total_jcc << " conditional branches to analyze...\n";
 
-        // Maximum Unicorn attempts for unresolved branches
+
         const std::uint32_t max_emu_attempts = 500;
         std::uint32_t emu_attempts = 0;
 
@@ -1310,7 +1310,7 @@ private:
                               << " (" << (resolved_static + resolved_emu) << " resolved)\r" << std::flush;
                 }
 
-                // Find the section containing this block
+
                 int si = -1; std::uint64_t ss = 0; const std::uint8_t* sd = nullptr; std::size_t sz = 0;
                 for (std::size_t s = 0; s < secs_.size(); s++) {
                     std::uint64_t a = mod_base_ + secs_[s].VirtualAddress;
@@ -1323,7 +1323,7 @@ private:
                 std::size_t boff = (std::size_t)(bb.va - ss);
                 if (boff + bb.size > sz) continue;
 
-                // Decode all instructions in the block
+
                 struct InsnEntry {
                     std::uint64_t va;
                     ZydisDecodedInstruction instr;
@@ -1342,22 +1342,21 @@ private:
                 }
                 if (insns.empty()) continue;
 
-                // Find the last Jcc in the block
+
                 int jcc_idx = -1;
                 for (int i = (int)insns.size() - 1; i >= 0; i--) {
                     if (dis_.is_jcc(insns[i].instr)) { jcc_idx = i; break; }
                 }
                 if (jcc_idx < 0) continue;
 
-                // Try static resolution: scan backwards from the Jcc looking for
-                // "MOV reg, imm" pattern followed by deterministic transforms
+
                 bool resolved = try_static_resolve(insns, jcc_idx, bb);
                 if (resolved) {
                     resolved_static++;
                     continue;
                 }
 
-                // Fallback: Unicorn emulation (limited attempts)
+
                 if (emu_attempts < max_emu_attempts) {
                     emu_attempts++;
                     auto result = resolver_.resolve(bb.va, bb.size, insns[jcc_idx].va,
@@ -1376,11 +1375,7 @@ private:
                   << " (" << resolved_static << " static, " << resolved_emu << " emulated)\n";
     }
 
-    // Static opaque predicate resolver.
-    // Scans backwards from Jcc looking for a "MOV reg, immediate" followed by
-    // register-only transforms (NOT, NEG, SHL, SHR, AND, OR, ADD, SUB, XOR, TEST, CMP)
-    // ending at a flag-setting instruction (TEST/CMP) right before the Jcc.
-    // Evaluates the chain on the constant to determine flags, then evaluates the Jcc condition.
+
     struct InsnEntry_t {
         std::uint64_t va;
         ZydisDecodedInstruction instr;
@@ -1389,11 +1384,11 @@ private:
 
     template<typename InsnEntry>
     bool try_static_resolve(const std::vector<InsnEntry>& insns, int jcc_idx, BasicBlock& bb) {
-        if (jcc_idx < 2) return false; // Need at least MOV + TEST/CMP + Jcc
+        if (jcc_idx < 2) return false;
 
         const auto& jcc = insns[jcc_idx];
 
-        // Find the TEST/CMP immediately before the Jcc (skip NOPs between)
+
         int test_idx = -1;
         for (int i = jcc_idx - 1; i >= 0; i--) {
             auto m = insns[i].instr.mnemonic;
@@ -1406,43 +1401,42 @@ private:
                 test_idx = i;
                 break;
             }
-            break; // Non-flag-setting instruction encountered
+            break;
         }
         if (test_idx < 0) return false;
 
-        // Identify which register is being tested
+
         const auto& test_insn = insns[test_idx];
         ZydisRegister track_reg = ZYDIS_REGISTER_NONE;
 
         if (test_insn.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
             track_reg = test_insn.ops[0].reg.value;
         } else {
-            return false; // Memory operand, can't statically resolve
+            return false;
         }
 
-        // Now scan backwards from test_idx, tracking the register value
-        // We need to find MOV reg, imm and then replay the chain
+
         struct ChainOp {
             ZydisMnemonic mnemonic;
-            std::int64_t imm;      // immediate operand if any
+            std::int64_t imm;
             bool has_imm;
-            ZydisRegister reg2;    // second register operand if any (e.g. TEST r, r)
-            bool self_op;          // both operands are the same register
+            ZydisRegister reg2;
+            bool self_op;
         };
 
         std::vector<ChainOp> ops_chain;
         std::uint64_t init_value = 0;
         bool found_init = false;
 
-        // Get the canonical base register for tracking across sizes (e.g. dil -> rdi)
+
         auto base_of = [](ZydisRegister r) -> int {
-            // Map to register class ID for comparison
+
             if (r >= ZYDIS_REGISTER_AL && r <= ZYDIS_REGISTER_R15B) return (r - ZYDIS_REGISTER_AL);
             if (r >= ZYDIS_REGISTER_AH && r <= ZYDIS_REGISTER_BH) return (r - ZYDIS_REGISTER_AH);
             if (r >= ZYDIS_REGISTER_AX && r <= ZYDIS_REGISTER_R15W) return (r - ZYDIS_REGISTER_AX);
             if (r >= ZYDIS_REGISTER_EAX && r <= ZYDIS_REGISTER_R15D) return (r - ZYDIS_REGISTER_EAX);
             if (r >= ZYDIS_REGISTER_RAX && r <= ZYDIS_REGISTER_R15) return (r - ZYDIS_REGISTER_RAX);
-            if (r >= ZYDIS_REGISTER_SPL && r <= ZYDIS_REGISTER_DIL) return (r - ZYDIS_REGISTER_SPL + 4); // rsp=4..rdi=7
+            if (r >= ZYDIS_REGISTER_SPL && r <= ZYDIS_REGISTER_DIL) return (r - ZYDIS_REGISTER_SPL + 4);
             return -1;
         };
 
@@ -1463,7 +1457,7 @@ private:
             return 0;
         };
 
-        // Add the test/cmp instruction itself to the chain
+
         {
             ChainOp cop;
             cop.mnemonic = test_insn.instr.mnemonic;
@@ -1477,19 +1471,19 @@ private:
             ops_chain.push_back(cop);
         }
 
-        // Walk backwards
+
         for (int i = test_idx - 1; i >= 0; i--) {
             const auto& entry = insns[i];
             auto m = entry.instr.mnemonic;
 
             if (m == ZYDIS_MNEMONIC_NOP) continue;
 
-            // Check if this instruction writes to our tracked register
+
             if (m == ZYDIS_MNEMONIC_MOV &&
                 entry.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                 same_reg(entry.ops[0].reg.value) &&
                 entry.ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                // MOV reg, imm — this is our initial value!
+
                 int bits = reg_bits(entry.ops[0].reg.value);
                 std::uint64_t mask = (bits < 64) ? ((1ULL << bits) - 1) : ~0ULL;
                 init_value = (std::uint64_t)entry.ops[1].imm.value.u & mask;
@@ -1497,7 +1491,7 @@ private:
                 break;
             }
 
-            // Single-operand ops on our register
+
             if ((m == ZYDIS_MNEMONIC_NOT || m == ZYDIS_MNEMONIC_NEG) &&
                 entry.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                 same_reg(entry.ops[0].reg.value)) {
@@ -1511,7 +1505,7 @@ private:
                 continue;
             }
 
-            // Two-operand ops: reg, imm
+
             if ((m == ZYDIS_MNEMONIC_SHL || m == ZYDIS_MNEMONIC_SHR || m == ZYDIS_MNEMONIC_SAR ||
                  m == ZYDIS_MNEMONIC_ROL || m == ZYDIS_MNEMONIC_ROR ||
                  m == ZYDIS_MNEMONIC_AND || m == ZYDIS_MNEMONIC_OR || m == ZYDIS_MNEMONIC_XOR ||
@@ -1529,7 +1523,7 @@ private:
                 continue;
             }
 
-            // Two-operand ops: reg, reg (same register — e.g. AND r14b, r14b)
+
             if ((m == ZYDIS_MNEMONIC_AND || m == ZYDIS_MNEMONIC_OR || m == ZYDIS_MNEMONIC_XOR ||
                  m == ZYDIS_MNEMONIC_ADD || m == ZYDIS_MNEMONIC_SUB || m == ZYDIS_MNEMONIC_TEST) &&
                 entry.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
@@ -1546,30 +1540,27 @@ private:
                 continue;
             }
 
-            // If we encounter an instruction that writes our register from memory or another reg
-            // (not imm), or doesn't touch our register but clobbers flags, give up
+
             bool writes_our_reg = false;
             if (entry.ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                 same_reg(entry.ops[0].reg.value)) {
                 writes_our_reg = true;
             }
-            if (writes_our_reg) return false; // Untrackable write
-            // If it doesn't touch our register, skip it
+            if (writes_our_reg) return false;
+
             continue;
         }
 
         if (!found_init) return false;
 
-        // Now evaluate the chain in reverse (ops_chain was built bottom-up)
-        // The last element is the TEST/CMP, the rest are preceding transforms
-        // Replay in reverse order (excluding the last which is TEST/CMP)
+
         int bits = reg_bits(track_reg);
         if (bits == 0) bits = 64;
         std::uint64_t mask = (bits < 64) ? ((1ULL << bits) - 1) : ~0ULL;
 
         std::uint64_t val = init_value & mask;
 
-        // Apply transforms in reverse order (skip index 0 which is the flag-setter)
+
         for (int i = (int)ops_chain.size() - 1; i > 0; i--) {
             const auto& op = ops_chain[i];
             switch (op.mnemonic) {
@@ -1578,7 +1569,7 @@ private:
                 case ZYDIS_MNEMONIC_SHL: val = (val << (op.imm & (bits - 1))) & mask; break;
                 case ZYDIS_MNEMONIC_SHR: val = (val >> (op.imm & (bits - 1))) & mask; break;
                 case ZYDIS_MNEMONIC_SAR: {
-                    std::int64_t sv = (std::int64_t)(val << (64 - bits)) >> (64 - bits); // sign-extend
+                    std::int64_t sv = (std::int64_t)(val << (64 - bits)) >> (64 - bits);
                     sv >>= (op.imm & (bits - 1));
                     val = (std::uint64_t)sv & mask;
                     break;
@@ -1614,13 +1605,13 @@ private:
                     val &= mask;
                     break;
                 case ZYDIS_MNEMONIC_TEST:
-                    // TEST in the middle of a chain doesn't modify val, just flags — skip
+
                     break;
                 default: return false;
             }
         }
 
-        // Now evaluate the flag-setting instruction (ops_chain[0])
+
         const auto& flag_op = ops_chain[0];
         std::uint64_t result_val = 0;
         bool cf = false, zf = false, sf = false, of = false;
@@ -1643,7 +1634,7 @@ private:
                 zf = result_val == 0;
                 sf = ((result_val >> (bits - 1)) & 1) != 0;
                 cf = val < rhs;
-                // Overflow: (bit signs differ) and (result sign != first operand sign)
+
                 bool s1 = ((val >> (bits - 1)) & 1) != 0;
                 bool s2 = ((rhs >> (bits - 1)) & 1) != 0;
                 bool sr = sf;
@@ -1704,7 +1695,7 @@ private:
                 break;
             }
             case ZYDIS_MNEMONIC_NOT: {
-                // NOT doesn't affect flags, so this shouldn't be the flag-setter
+
                 return false;
             }
             case ZYDIS_MNEMONIC_NEG: {
@@ -1718,7 +1709,7 @@ private:
             default: return false;
         }
 
-        // Evaluate Jcc condition based on flags
+
         bool taken = false;
         switch (jcc.instr.mnemonic) {
             case ZYDIS_MNEMONIC_JZ:   taken = zf; break;
@@ -1727,16 +1718,16 @@ private:
             case ZYDIS_MNEMONIC_JNS:  taken = !sf; break;
             case ZYDIS_MNEMONIC_JO:   taken = of; break;
             case ZYDIS_MNEMONIC_JNO:  taken = !of; break;
-            case ZYDIS_MNEMONIC_JB:   taken = cf; break;       // below (unsigned <)
-            case ZYDIS_MNEMONIC_JNB:  taken = !cf; break;      // above or equal
-            case ZYDIS_MNEMONIC_JBE:  taken = cf || zf; break; // below or equal
-            case ZYDIS_MNEMONIC_JNBE: taken = !cf && !zf; break; // above
-            case ZYDIS_MNEMONIC_JL:   taken = sf != of; break;   // less (signed)
-            case ZYDIS_MNEMONIC_JNL:  taken = sf == of; break;   // greater or equal
-            case ZYDIS_MNEMONIC_JLE:  taken = zf || (sf != of); break; // less or equal
-            case ZYDIS_MNEMONIC_JNLE: taken = !zf && (sf == of); break; // greater
-            case ZYDIS_MNEMONIC_JP:   taken = false; break; // parity — approximate
-            case ZYDIS_MNEMONIC_JNP:  taken = true; break;  // not parity — approximate
+            case ZYDIS_MNEMONIC_JB:   taken = cf; break;
+            case ZYDIS_MNEMONIC_JNB:  taken = !cf; break;
+            case ZYDIS_MNEMONIC_JBE:  taken = cf || zf; break;
+            case ZYDIS_MNEMONIC_JNBE: taken = !cf && !zf; break;
+            case ZYDIS_MNEMONIC_JL:   taken = sf != of; break;
+            case ZYDIS_MNEMONIC_JNL:  taken = sf == of; break;
+            case ZYDIS_MNEMONIC_JLE:  taken = zf || (sf != of); break;
+            case ZYDIS_MNEMONIC_JNLE: taken = !zf && (sf == of); break;
+            case ZYDIS_MNEMONIC_JP:   taken = false; break;
+            case ZYDIS_MNEMONIC_JNP:  taken = true; break;
             default: return false;
         }
 
@@ -1794,12 +1785,6 @@ private:
     void reconstruct_iat() {
         std::cout << "[8.5] Reconstructing Import Address Table...\n";
 
-        // Decode the API name table in .rdata
-        // BEDaisy stores packed 16-byte API name fragments starting at rdata+0x10 from IAT end
-        // Layout discovered via kernel memory analysis:
-        //   0xFFFFF80551F8A050: 8 cleartext 16-byte entries (Flt*/Nt* names)
-        //   0xFFFFF80551F8A0D0: 8 XOR-0xFF encoded 16-byte entries (Hal*/Dxg*/KWIN32* names)
-        //   0xFFFFF80551F8A180: 5 cleartext 16-byte entries (Zw*/Nt* names)
 
         struct ApiNameEntry {
             std::string name;
@@ -1808,14 +1793,14 @@ private:
         };
         std::vector<ApiNameEntry> api_names;
 
-        // Find .rdata section
+
         int rdata_idx = -1;
         for (std::size_t i = 0; i < secs_.size(); i++) {
             char nm[9] = {}; std::memcpy(nm, secs_[i].Name, 8);
             if (std::string(nm) == ".rdata") { rdata_idx = (int)i; break; }
         }
 
-        // BEDaisy has NO .idata section — the IAT lives at the start of .rdata
+
         if (rdata_idx < 0) {
             std::cout << "    [!] No .rdata section found — cannot reconstruct IAT\n";
             return;
@@ -1824,13 +1809,11 @@ private:
         std::uint64_t iat_base_va = mod_base_ + secs_[rdata_idx].VirtualAddress;
         std::uint32_t iat_base_rva = secs_[rdata_idx].VirtualAddress;
 
-        // The API name table starts right after the static IAT
-        // IAT is at .rdata section start, 6 entries + null + padding = 0x40 bytes
-        // Name table at .rdata base + 0x50
+
         std::uint64_t name_table_va = iat_base_va + 0x50;
         std::uint32_t name_table_rva = iat_base_rva + 0x50;
 
-        // Read from our in-memory image
+
         auto read_image = [&](std::uint64_t va, std::uint8_t* buf, std::size_t len) -> bool {
             std::uint32_t rva = (std::uint32_t)(va - mod_base_);
             if (rva + len > full_image_.size()) return false;
@@ -1838,14 +1821,14 @@ private:
             return true;
         };
 
-        // Read cleartext block 1: 8 entries at offset 0
+
         for (int i = 0; i < 8; i++) {
             std::uint8_t buf[16] = {};
             if (!read_image(name_table_va + i * 16, buf, 16)) continue;
             if (buf[0] == 0 || buf[0] == 0xFF) continue;
 
             std::string name(reinterpret_cast<char*>(buf), 16);
-            // Trim trailing nulls
+
             while (!name.empty() && name.back() == '\0') name.pop_back();
             if (name.empty()) continue;
 
@@ -1853,16 +1836,13 @@ private:
             api_names.push_back({name, is_flt, name_table_va + i * 16});
         }
 
-        // Read XOR 0xFF block: 8 entries at offset 0x80
-        // Entries 1-3 are real API name prefixes (Hal*, Dxg*)
-        // Entries 4-8 are fragments of C++ mangled global variable names — skip them
-        // We'll reconstruct the mangled names separately
+
         for (int i = 0; i < 8; i++) {
             std::uint8_t buf[16] = {};
             if (!read_image(name_table_va + 0x80 + i * 16, buf, 16)) continue;
             if (buf[0] == 0 || buf[0] == 0xFF) continue;
 
-            // Decode XOR 0xFF
+
             char decoded[17] = {};
             bool valid = true;
             for (int b = 0; b < 16; b++) {
@@ -1871,8 +1851,7 @@ private:
             }
             if (!valid) continue;
 
-            // Filter: only accept entries where first char is uppercase and second is lowercase
-            // This skips C++ mangled fragments (start with ?, @, uppercase pairs, or lowercase)
+
             if (!(decoded[0] >= 'A' && decoded[0] <= 'Z' && decoded[1] >= 'a' && decoded[1] <= 'z'))
                 continue;
 
@@ -1880,17 +1859,17 @@ private:
             while (!name.empty() && name.back() == '\0') name.pop_back();
             if (name.empty()) continue;
 
-            // These are ntoskrnl/hal exports
+
             api_names.push_back({name, false, name_table_va + 0x80 + i * 16});
         }
 
-        // Read cleartext block 2: 5 entries at offset 0x130 (after 16-byte marker gap + 16-byte 0xFF block)
+
         for (int i = 0; i < 5; i++) {
             std::uint8_t buf[16] = {};
             if (!read_image(name_table_va + 0x130 + i * 16, buf, 16)) continue;
             if (buf[0] == 0 || buf[0] == 0xFF) continue;
 
-            // Check if it starts with a valid ASCII letter
+
             if (buf[0] < 0x41 || buf[0] > 0x5A) continue;
 
             std::string name(reinterpret_cast<char*>(buf), 16);
@@ -1902,7 +1881,7 @@ private:
 
         std::cout << "    Decoded " << api_names.size() << " dynamic API names from name table\n";
 
-        // Known full API names (the 16-byte entries are truncated)
+
         static const std::pair<const char*, const char*> full_names[] = {
             {"FltGetRequestorP", "FltGetRequestorProcess"},
             {"FltReleaseFileNa", "FltReleaseFileNameInformation"},
@@ -1922,7 +1901,7 @@ private:
             {"NtDeviceIoContro", "NtDeviceIoControlFile"},
         };
 
-        // Expand truncated names
+
         for (auto& api : api_names) {
             for (const auto& [prefix, full] : full_names) {
                 if (api.name == prefix || api.name.find(prefix) == 0) {
@@ -1936,26 +1915,25 @@ private:
             std::cout << "      " << (api.is_flt ? "[FLT] " : "[NT]  ") << api.name << "\n";
         }
 
-        // Scan all code sections for CALL [rip+X] and MOV reg, [rip+X]
-        // targeting the IAT region or .rdata/.data pointer storage
+
         struct IatRef {
             std::uint64_t insn_va;
             std::uint32_t insn_rva;
             std::uint8_t  insn_len;
-            std::uint64_t target_va;   // address being read (the IAT slot)
+            std::uint64_t target_va;
             int           section_idx;
             std::size_t   offset_in_section;
-            bool          is_call;     // CALL [rip+X] vs MOV reg, [rip+X]
+            bool          is_call;
         };
         std::vector<IatRef> iat_refs;
 
-        // Known IAT range: static IAT at iat_base_va+0x00 to iat_base_va+0x38
+
         std::uint64_t static_iat_start = iat_base_va;
         std::uint64_t static_iat_end = iat_base_va + 0x40;
 
-        // Scan all executable sections
+
         for (std::size_t si = 0; si < secs_.size(); si++) {
-            if (!(secs_[si].Characteristics & 0x20000000)) continue; // IMAGE_SCN_MEM_EXECUTE
+            if (!(secs_[si].Characteristics & 0x20000000)) continue;
             const auto& sd = sec_data_[si];
             if (sd.empty()) continue;
             std::uint64_t sec_va = mod_base_ + secs_[si].VirtualAddress;
@@ -2000,7 +1978,7 @@ private:
                     int op_idx = (is_indirect_call ? 0 : 1);
                     std::uint64_t target_va = dis_.calc_abs(ip, instr, ops[op_idx]);
 
-                    // Check if this references the IAT area or name table area
+
                     if (target_va >= static_iat_start && target_va < static_iat_end + 0x200) {
                         IatRef ref;
                         ref.insn_va = ip;
@@ -2020,45 +1998,38 @@ private:
 
         std::cout << "    Found " << iat_refs.size() << " IAT/import references in code\n";
 
-        // Build the new IAT section
-        // We'll create .iat section with:
-        // 1. Original 6 static import slots (qword pointers)
-        // 2. New slots for each dynamic API (qword pointers, filled with 0 as placeholders)
-        // 3. ASCII import names for each entry
 
         std::size_t total_iat_slots = 6 + api_names.size();
-        std::size_t iat_data_size = total_iat_slots * 8; // qword per slot
-        std::size_t names_offset = (iat_data_size + 15) & ~15; // align names block
+        std::size_t iat_data_size = total_iat_slots * 8;
+        std::size_t names_offset = (iat_data_size + 15) & ~15;
 
-        // Calculate names block size
+
         std::size_t names_total = 0;
         for (const auto& api : api_names) {
-            names_total += api.name.size() + 1; // null terminator
+            names_total += api.name.size() + 1;
         }
         names_total = (names_total + 15) & ~15;
 
         iat_section_data_.resize(names_offset + names_total, 0);
 
-        // Fill static IAT slots (copy from original image at .rdata start)
+
         if (iat_base_rva > 0 && iat_base_rva < full_image_.size()) {
-            // Copy the 6 original slots (+ null slot = 7 * 8 = 56 bytes)
+
             std::size_t copy_len = std::min<std::size_t>(56, full_image_.size() - iat_base_rva);
             std::memcpy(iat_section_data_.data(), full_image_.data() + iat_base_rva, copy_len);
         }
 
-        // Assign RVAs to dynamic import slots
-        // We'll compute the actual RVA once we know where .iat goes (after .clean)
-        // For now, track offsets within the IAT section
+
         for (std::size_t i = 0; i < api_names.size(); i++) {
             ResolvedImport imp;
             imp.name = api_names[i].name;
-            imp.resolved_va = 0; // will remain 0 in output — IDA can resolve
-            imp.iat_slot_rva = 0; // filled later when section RVA assigned
+            imp.resolved_va = 0;
+            imp.iat_slot_rva = 0;
             imp.is_flt = api_names[i].is_flt;
             resolved_imports_.push_back(imp);
         }
 
-        // Write API names into the names block
+
         std::size_t name_cursor = names_offset;
         for (std::size_t i = 0; i < api_names.size(); i++) {
             std::memcpy(iat_section_data_.data() + name_cursor, api_names[i].name.c_str(), api_names[i].name.size());
@@ -2066,9 +2037,7 @@ private:
             name_cursor += api_names[i].name.size() + 1;
         }
 
-        // Now patch references in code: for CALL [rip+X] targeting the static IAT,
-        // we don't need to change anything (they already work).
-        // But we annotate the discovered names for the summary.
+
         static const char* static_iat_names[] = {
             "FltGetRoutineAddress", nullptr, "MmGetSystemRoutineAddress",
             "__C_specific_handler", "__chkstk", "MmMapLockedPagesSpecifyCache",
@@ -2084,7 +2053,7 @@ private:
             }
         }
 
-        // Count MOVDQA references to the API name table (these are the dynamic resolution call sites)
+
         std::uint32_t name_table_refs = 0;
         for (const auto& ref : iat_refs) {
             if (ref.target_va >= name_table_va && ref.target_va < name_table_va + 0x1C0) {
@@ -2101,10 +2070,7 @@ private:
     void devirtualize_indirect_branches() {
         std::cout << "[8.6] Devirtualizing indirect branches...\n";
 
-        // First: compute reachable blocks per-function via BFS from entry.
-        // Only follow direct JMPs (E9) and resolved Jcc (taken path).
-        // Blocks only reachable through unresolved Jcc are on unknown paths —
-        // in BEDaisy these are almost always junk code from opaque predicate wrong-sides.
+
         constexpr std::uint32_t MAX_EMU_ATTEMPTS = 200;
         std::uint32_t emu_attempts = 0;
         std::uint32_t skipped_unreachable = 0;
@@ -2112,11 +2078,11 @@ private:
         std::uint32_t static_resolved = 0;
 
         for (auto& fn : funcs_) {
-            // Build block-VA → block* map for BFS
+
             std::unordered_map<std::uint64_t, BasicBlock*> bmap;
             for (auto& b : fn.blocks) bmap[b.va] = &b;
 
-            // BFS from entry block
+
             std::unordered_set<std::uint64_t> reachable;
             {
                 std::queue<std::uint64_t> q;
@@ -2132,27 +2098,27 @@ private:
                         q.push(b->branch_target);
                     if (b->is_conditional_jmp) {
                         if (b->branch_resolved) {
-                            // Follow only the deterministic path
+
                             std::uint64_t target = b->branch_taken ? b->branch_target : b->fallthrough_target;
                             if (target) q.push(target);
                         }
-                        // Unresolved Jcc: don't follow either path (conservative prune)
+
                     }
-                    // is_ret / is_indirect: leaf nodes, no successors to follow
+
                 }
             }
 
             for (auto& bb : fn.blocks) {
                 if (!bb.is_indirect) continue;
 
-                // Skip blocks not reachable via resolved control flow
+
                 if (!reachable.count(bb.va)) {
                     skipped_unreachable++;
                     bb.is_indirect = false;
                     continue;
                 }
 
-                // Find the block data in section
+
                 const std::uint8_t* block_data = nullptr;
                 std::size_t block_data_size = 0;
                 int si = -1;
@@ -2168,10 +2134,7 @@ private:
                 }
                 if (!block_data || block_data_size == 0) continue;
 
-                // Scan for the FIRST non-NOP terminator in the block.
-                // After junk elimination + opaque predicate patching, many blocks now have
-                // a direct JMP (patched from Jcc) BEFORE the original indirect JMP.
-                // The indirect JMP after the direct JMP is dead code — skip it.
+
                 std::uint64_t indirect_va = 0;
                 std::uint8_t indirect_len = 0;
                 std::uint8_t* indirect_ptr = nullptr;
@@ -2184,10 +2147,10 @@ private:
                         std::uint64_t ip = bb.va + scan;
                         if (!dis_.decode(block_data + scan, block_data_size - scan, ip, instr, ops)) { scan++; continue; }
 
-                        // Skip NOP instructions
+
                         if (instr.mnemonic == ZYDIS_MNEMONIC_NOP) { scan += instr.length; continue; }
 
-                        // Check for any control flow terminator
+
                         bool is_direct_jmp = (instr.mnemonic == ZYDIS_MNEMONIC_JMP &&
                             instr.operand_count_visible >= 1 &&
                             (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE ||
@@ -2203,8 +2166,8 @@ private:
                              (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[0].mem.base != ZYDIS_REGISTER_RIP)));
 
                         if (is_direct_jmp || is_jcc || is_ret) {
-                            // Found a non-indirect terminator before any indirect JMP
-                            // The indirect JMP (if any) is in dead code after this
+
+
                             dead_indirect = true;
                             break;
                         }
@@ -2219,7 +2182,7 @@ private:
                                     break;
                                 }
                             }
-                            break; // found the first indirect JMP — this is the one to resolve
+                            break;
                         }
 
                         scan += instr.length;
@@ -2231,23 +2194,22 @@ private:
 
                 indirect_total_++;
 
-                // Try static resolution: scan backward in the block for MOV reg, imm64 / MOV reg, imm32
-                // Pattern: mov rax, <addr>; ... junk ...; jmp rax
+
                 std::uint64_t static_target = 0;
                 {
-                    // Identify which register the JMP uses
+
                     ZydisDecodedInstruction jmp_instr;
                     ZydisDecodedOperand jmp_ops[ZYDIS_MAX_OPERAND_COUNT];
                     if (dis_.decode(indirect_ptr, indirect_len, indirect_va, jmp_instr, jmp_ops) &&
                         jmp_ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
                         ZydisRegister target_reg = jmp_ops[0].reg.value;
-                        // Map to 64-bit register for matching
+
                         ZydisRegister base_reg = target_reg;
-                        // Zydis register classes: RAX=0, RCX=1, ... we need the 64-bit equiv
-                        // Check the largest enclosing register
+
+
                         ZydisRegister reg64 = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, target_reg);
 
-                        // Scan block backward for last MOV to this register with an immediate
+
                         std::size_t scan = 0;
                         std::uint64_t last_mov_imm = 0;
                         bool found_mov = false;
@@ -2257,9 +2219,9 @@ private:
                             std::uint64_t ip = bb.va + scan;
                             if (!dis_.decode(block_data + scan, block_data_size - scan, ip, instr, ops)) { scan++; continue; }
 
-                            if (ip == indirect_va) break; // stop at the jmp itself
+                            if (ip == indirect_va) break;
 
-                            // Check for MOV reg, imm where reg matches our target
+
                             if (instr.mnemonic == ZYDIS_MNEMONIC_MOV &&
                                 instr.operand_count_visible >= 2 &&
                                 ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
@@ -2267,20 +2229,20 @@ private:
                                 ZydisRegister mov_reg64 = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, ops[0].reg.value);
                                 if (mov_reg64 == reg64) {
                                     last_mov_imm = ops[1].imm.value.u;
-                                    // If it's a 32-bit mov (e.g. mov eax, imm32), it zero-extends
+
                                     if (ops[0].size == 32) {
                                         last_mov_imm &= 0xFFFFFFFF;
                                     }
                                     found_mov = true;
                                 }
                             }
-                            // If anything else writes to our target register, invalidate
+
                             else if (instr.operand_count_visible >= 1 &&
                                      ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                                      ops[0].actions & ZYDIS_OPERAND_ACTION_WRITE) {
                                 ZydisRegister wr_reg64 = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, ops[0].reg.value);
                                 if (wr_reg64 == reg64 && instr.mnemonic != ZYDIS_MNEMONIC_MOV) {
-                                    found_mov = false; // invalidated by non-MOV write
+                                    found_mov = false;
                                 }
                             }
 
@@ -2295,7 +2257,7 @@ private:
 
                 std::uint64_t resolved_target = static_target;
 
-                // Unicorn fallback (capped)
+
                 if (resolved_target == 0 && emu_attempts < MAX_EMU_ATTEMPTS) {
                     emu_attempts++;
                     auto traced = resolver_.trace_function(bb.va, 200);
@@ -2310,7 +2272,7 @@ private:
                 if (resolved_target == 0) continue;
                 if (static_target != 0) static_resolved++;
 
-                // Patch the indirect JMP to a direct JMP rel32
+
                 if (indirect_len >= 5) {
                     std::int64_t rel = (std::int64_t)resolved_target - (std::int64_t)(indirect_va + 5);
                     if (rel >= INT32_MIN && rel <= INT32_MAX) {
@@ -2520,7 +2482,7 @@ private:
 
     void patch_section_flags() {
         std::cout << "[10] Patching section characteristics...\n";
-        // Also mark .be0 as readable for analysis
+
 
         if (be0_idx_ >= 0) {
             secs_[be0_idx_].Characteristics |= IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
@@ -2660,11 +2622,11 @@ private:
         if (add_pdata) extra_sections++;
         if (add_iat) extra_sections++;
 
-        // Compute .iat section RVA (after .pdata)
+
         if (add_iat) {
             std::uint32_t after_pdata = pdata_rva_ + align_up(static_cast<std::uint32_t>(pdata_blob_.size()), sec_align);
             iat_section_rva_ = after_pdata;
-            // Assign slot RVAs to each resolved import
+
             for (std::size_t i = 0; i < resolved_imports_.size(); i++) {
                 resolved_imports_[i].iat_slot_rva = iat_section_rva_ + (6 + (std::uint32_t)i) * 8;
             }
@@ -2825,9 +2787,9 @@ private:
         if (!iat_section_data_.empty())
             std::cout << ".iat section:          " << iat_section_data_.size() << " bytes @ RVA " << hex32(iat_section_rva_) << "\n";
         std::cout << "--- Devirtualization ---\n";
-        std::cout << "Junk-path blocks:      " << (indirect_total_ + indirect_resolved_ + skipped_junk_blocks_) 
+        std::cout << "Junk-path blocks:      " << (indirect_total_ + indirect_resolved_ + skipped_junk_blocks_)
                   << " pruned (" << skipped_junk_blocks_ << " unreachable)\n";
-        std::cout << "Indirect branches:     " << indirect_total_ << " remaining (obfuscation dispatch), " 
+        std::cout << "Indirect branches:     " << indirect_total_ << " remaining (obfuscation dispatch), "
                   << indirect_resolved_ << " resolved\n";
         std::cout << "--- Linearization ---\n";
         std::cout << "Functions linearized:  " << functions_linearized_ << "\n";

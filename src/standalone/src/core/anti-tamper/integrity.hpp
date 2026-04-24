@@ -75,6 +75,15 @@ namespace siphash {
         return v0 ^ v1 ^ v2 ^ v3;
     }
 
+    __forceinline uint64_t siphash_3u64(uint64_t a, uint64_t b, uint64_t c)
+    {
+        uint8_t buf[24];
+        memcpy(buf, &a, 8);
+        memcpy(buf + 8, &b, 8);
+        memcpy(buf + 16, &c, 8);
+        return hash(buf, 24, a ^ 0x736F6D6570736575ULL, c ^ 0x646F72616E646F6DULL);
+    }
+
 }
 
 namespace sha256 {

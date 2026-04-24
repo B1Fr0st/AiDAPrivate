@@ -9,24 +9,11 @@ namespace idt {
     inline segment_descriptor_register_64 actual_idt;
 
 
-    /*
-        List of checks:
-
-        detection_1 -> #GP(0) due to lock Prefix
-        detection_2 -> #PF due to invalid memory operand
-        detection_3 -> SIDT with operand not mapped in cr3 but in TLB
-        detection_4 -> Timing check (500 tsc ticks acceptable)
-        detection_5 -> Compatibility mode idtr storing
-        detection_6 -> Non canonical address passed as memory operand
-        detection_7 -> Non canonical address passed as memory operand in SS segment -> #SS
-        detection_8 -> Executing sidt with cpl = 3 but with cr4.umip = 0 -> Should go through
-        detection_9 -> Executing sidt with cpl = 3 but with cr4.umip = 1 -> #GP(0) should be caused
-    */
     namespace storing {
         inline bool detection_1(void) {
             bool hypervisor_detected = false;
 
-            // Lock prefix should cause an exception
+
             segment_descriptor_register_64 idtr;
             __try {
                 __lock_sidt(&idtr);
@@ -43,10 +30,10 @@ namespace idt {
         inline bool detection_2(void) {
             bool hypervisor_detected = false;
 
-            // Invalid operand should cause an exception
+
             __try {
-                // This will cause #PF and not #GP as 0xdead is canonical (;
-                __sidt((void*)0xdead); // If there actually is a va 0xdead then you honestly deserve that dub
+
+                __sidt((void*)0xdead);
                 hypervisor_detected = true;
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -60,8 +47,8 @@ namespace idt {
         inline bool detection_3(void) {
 
             volatile segment_descriptor_register_64* idtr_in_tlb = (volatile segment_descriptor_register_64*)allocated_memory_page;
-            // Put the part of the memory page we will use into the tlb
-            // so that the cpu will be able to access it when executing sidt
+
+
             for (uint32_t i = 0; i < sizeof(segment_descriptor_register_64); i++) {
                 volatile uint8_t dummy = *(uint8_t*)((uint64_t)allocated_memory_page + i);
                 UNREFERENCED_PARAMETER(dummy);
@@ -76,14 +63,14 @@ namespace idt {
                 return false;
             }
 
-            // The instruction should go through as the idtr page is still in the tlb (but not mapped in cr3!)
+
             bool hypervisor_detected = false;
             __try {
                 __sidt((void*)idtr_in_tlb);
             }
 
             __except (EXCEPTION_EXECUTE_HANDLER) {
-                hypervisor_detected = true; // Should not happen on bare metal
+                hypervisor_detected = true;
             }
 
             physmem::paging_manipulation::win_restore_memory_page_mapping(allocated_memory_page, stored_flags);
@@ -111,7 +98,7 @@ namespace idt {
                 if (delta < lowest_tsc)
                     lowest_tsc = delta;
 
-                // Account for hypervisors over adjusting the tsc
+
                 if (delta & (1ull << 63)) {
                     return true;
                 }
@@ -122,14 +109,14 @@ namespace idt {
 
         inline bool detection_5(void) {
             static uint8_t compatibility_shellcode[] = {
-                0xB8, 0x00, 0x00, 0x00, 0x00,        // mov eax, 0x00000000
-                0x0F, 0x01, 0x08,                    // sidt [eax]
-                0xC3                                 // ret
+                0xB8, 0x00, 0x00, 0x00, 0x00,
+                0x0F, 0x01, 0x08,
+                0xC3
             };
 
             *(uint32_t*)(compatibility_shellcode + 1) = safety_net::execution_mode::get_compatibility_data_page_address();
 
-            void* data_page = safety_net::execution_mode::get_compatibility_data_page(); // This is where the idtr will be stored
+            void* data_page = safety_net::execution_mode::get_compatibility_data_page();
             memset(data_page, 0, 0x1000);
 
             bool result = false;
@@ -137,7 +124,7 @@ namespace idt {
                 result = safety_net::execution_mode::execute_32_bit_shellcode(compatibility_shellcode, sizeof(compatibility_shellcode));
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {
-                result = true; // Something went wrong in mode switching emulation of the hypervisor
+                result = true;
             }
 
             if (!result)
@@ -150,8 +137,6 @@ namespace idt {
             actual_idt = curr_idt;
 
 
-            // If these two match it means that a shitty hypervisor is present
-            // that stored 10 bytes instead of 6;
             if (memcmp((void*)&curr_idt, data_page, sizeof(segment_descriptor_register_64)) == 0) {
                 return true;
             }
@@ -162,9 +147,9 @@ namespace idt {
         inline bool detection_6(void) {
             bool hypervisor_detected = false;
 
-            // Invalid operand should cause an exception
+
             __try {
-                // This will cause #GP as we pass a non canonical address as an operand
+
                 __gp_fault_sidt();
                 hypervisor_detected = true;
             }
@@ -179,9 +164,9 @@ namespace idt {
         inline bool detection_7(void) {
             bool hypervisor_detected = false;
 
-            // Invalid operand should cause an exception
+
             __try {
-                // This will cause #SS as we pass a non canonical address and we do so in rsp (-> stack segment)
+
                 __ss_fault_sidt();
                 hypervisor_detected = true;
             }
@@ -223,7 +208,7 @@ namespace idt {
             segment_descriptor_register_64 idtr;
 
             __try {
-                // This should not cause an exception since we disable cr4.usermode_instruction_prevention
+
                 __sidt(&idtr);
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -272,7 +257,7 @@ namespace idt {
             segment_descriptor_register_64 idtr;
 
             __try {
-                // This should cause an exception since we set cr4.usermode_instruction_prevention
+
                 __sidt(&idtr);
                 hypervisor_detected = true;
             }
@@ -320,25 +305,15 @@ namespace idt {
         }
     };
 
-    /*
-        List of checks:
 
-        detection_1 -> #GP(0) due to lock Prefix
-        detection_2 -> #PF due to invalid memory operand
-        detection_3 -> LIDT with operand not mapped in cr3 but in TLB
-        detection_4 -> Timing check (500 tsc ticks acceptable)
-        detection_5 -> Non canonical address passed as memory operand
-        detection_6 -> Non canonical address passed as memory operand in SS segment -> #SS
-        detection_7 -> Executing lidt with cr4.umip = 0 -> Should cause #GP(0) as lidt is not affected by the state of cr4.umip
-    */
     namespace loading {
 
         inline bool detection_1(void) {
             bool hypervisor_detected = false;
 
-            // Lock prefix should cause an exception
+
             segment_descriptor_register_64 idtr;
-            __sidt(&idtr); // Just in case the hv actually loads the idtr
+            __sidt(&idtr);
 
             __try {
                 __lock_lidt(&idtr);
@@ -355,9 +330,9 @@ namespace idt {
         inline bool detection_2(void) {
             bool hypervisor_detected = false;
 
-            // Invalid operand should cause a page fault
+
             __try {
-                // This should cause #PF since 0xdead is canonical but not mapped
+
                 __lidt((void*)0xdead);
                 hypervisor_detected = true;
             }
@@ -375,7 +350,7 @@ namespace idt {
             segment_descriptor_register_64 idtr;
             __sidt(&idtr);
 
-            // This memcpy also maps the va into the tlb
+
             memcpy(allocated_memory_page, &idtr, sizeof(idtr));
 
             uint64_t stored_flags;
@@ -385,14 +360,14 @@ namespace idt {
             if (physmem::paging_manipulation::is_memory_page_mapped(allocated_memory_page))
                 return false;
 
-            // The instruction should go through as the idtr page is still in the tlb (but not mapped in cr3!)
+
             bool hypervisor_detected = false;
             __try {
                 __lidt(allocated_memory_page);
             }
 
             __except (EXCEPTION_EXECUTE_HANDLER) {
-                hypervisor_detected = true;  // Should not happen on bare metal
+                hypervisor_detected = true;
             }
 
             physmem::paging_manipulation::win_restore_memory_page_mapping(allocated_memory_page, stored_flags);
@@ -403,7 +378,7 @@ namespace idt {
             uint64_t lowest_tsc = MAXULONG64;
             segment_descriptor_register_64 idtr;
 
-            // Copy the current idtr into idtr to ensure we load valid idtrs via lidt during timing
+
             __sidt(&idtr);
 
             for (int i = 0; i < 10; i++) {
@@ -433,7 +408,7 @@ namespace idt {
         inline bool detection_5(void) {
             bool hypervisor_detected = false;
 
-            // Non-canonical address should cause a general protection fault
+
             __try {
                 __gp_fault_lidt();
                 hypervisor_detected = true;
@@ -449,7 +424,7 @@ namespace idt {
         inline bool detection_6(void) {
             bool hypervisor_detected = false;
 
-            // Non-canonical address in SS segment should cause a stack segment fault
+
             __try {
                 __ss_fault_lidt();
                 hypervisor_detected = true;
@@ -484,7 +459,7 @@ namespace idt {
 
             bool hypervisor_detected = false;
             __try {
-                // This should cause an exception since it is not affected by cr4.usermode_instruction_prevention
+
                 __lidt(&idtr);
                 hypervisor_detected = true;
             }
@@ -531,7 +506,7 @@ namespace idt {
 
     inline void execute_idt_detections(void) {
         memset(allocated_memory_page, 0, 0x1000);
-        
+
         log_new_line();
         log_info_indent(1, "SIDT");
         storing::execute_detections();
