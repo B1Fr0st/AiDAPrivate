@@ -1,6 +1,7 @@
 #pragma once
 
 #include "decrypt_oracle.hpp"
+#include "disasm_view.hpp"
 #include "ui_anim.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
@@ -9,6 +10,8 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+
+extern DisasmState g_disasm;
 
 namespace decrypt_oracle_view {
 
@@ -267,6 +270,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
 			globals::ui::active_center_view = center_view_t::disassembly;
+			disasm_view::goto_address(r.source_function, g_disasm);
 		}
 
 		char func_buf[24];

@@ -14,8 +14,11 @@
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
 #include "debugger_engine.hpp"
+#include "disasm_view.hpp"
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
+
+extern DisasmState g_disasm;
 
 namespace cfg_view {
 
@@ -48,7 +51,6 @@ struct cfg_state_t {
 	int                        selected_block = -1;
 	std::mutex                 mutex;
 	std::atomic<bool>          building{false};
-	uint64_t                   navigate_to = 0;
 };
 
 inline cfg_state_t g_state;
@@ -61,7 +63,6 @@ inline void clear()
 	g_state.entry_addr = 0;
 	g_state.built = false;
 	g_state.selected_block = -1;
-	g_state.navigate_to = 0;
 }
 
 namespace detail {
@@ -99,7 +100,6 @@ inline void build_cfg(uint64_t entry_address)
 			have_data = driver_bridge::read_memory(entry_address, max_bytes, mem);
 
 		if (!have_data || mem.empty()) {
-			extern DisasmState g_disasm;
 			have_data = static_analysis::read_bytes_from_pe(g_disasm.file, entry_address, max_bytes, mem);
 		}
 
@@ -509,8 +509,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (hovered && ImGui::IsMouseHoveringRect(tl, br, false)) {
 			if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 				g_state.selected_block = n.id;
-			if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-				g_state.navigate_to = blk.start_addr;
+			if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+				globals::ui::active_center_view = center_view_t::disassembly;
+				disasm_view::goto_address(blk.start_addr, g_disasm);
+			}
 		}
 	}
 

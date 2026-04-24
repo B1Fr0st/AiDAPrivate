@@ -11,8 +11,11 @@
 
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
+#include "disasm_view.hpp"
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
+
+extern DisasmState g_disasm;
 
 namespace seh_view {
 
@@ -299,6 +302,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (ImGui::BeginPopup("##seh_ctx")) {
 		if (g_ui.selected >= 0 && g_ui.selected < static_cast<int>(snapshot.size())) {
 			if (ImGui::MenuItem("Go to Handler")) {
+				globals::ui::active_center_view = center_view_t::disassembly;
+				disasm_view::goto_address(snapshot[g_ui.selected].handler_addr, g_disasm);
 			}
 			if (ImGui::MenuItem("Copy Address")) {
 				char abuf[24];

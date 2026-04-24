@@ -1,10 +1,15 @@
 #pragma once
 
+#include <Windows.h>
+#include <commdlg.h>
+
+#include <algorithm>
 #include <atomic>
 #include "work_queue.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -13,8 +18,14 @@
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
 #include "debugger_engine.hpp"
+#include "disasm_view.hpp"
+#include "hex_view.hpp"
+#include "toast_notification.hpp"
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/helpers.h"
+
+extern DisasmState g_disasm;
 
 namespace memory_map_view {
 
@@ -32,6 +43,11 @@ struct ui_state_t {
 	float                                      scrollbar_drag_offset = 0.f;
 	uint64_t                                   context_addr = 0;
 	bool                                       show_context = false;
+	bool                                       change_protect_open = false;
+	uint64_t                                   change_protect_addr = 0;
+	uint64_t                                   change_protect_size = 0;
+	int                                        change_protect_choice = 0;
+	uint32_t                                   change_protect_old = 0;
 };
 
 inline ui_state_t g_ui;
@@ -131,6 +147,18 @@ inline bool match_filter(const debugger_engine::memory_region_t& r, const char* 
 	return false;
 }
 
+}
+
+inline bool find_region_by_base(uint64_t base, debugger_engine::memory_region_t& out)
+{
+	std::lock_guard<std::mutex> lk(g_ui.regions_mutex);
+	for (const auto& r : g_ui.regions) {
+		if (r.base == base) {
+			out = r;
+			return true;
+		}
+	}
+	return false;
 }
 
 inline void render(float pos_x, float pos_y, float width, float height,
@@ -326,15 +354,163 @@ inline void render(float pos_x, float pos_y, float width, float height,
 									 g_ui.scroll_y, content_h, list_h, alpha,
 									 g_ui.scrollbar_dragging, g_ui.scrollbar_drag_offset);
 
+	bool open_change_protect_popup = false;
+
 	if (ImGui::BeginPopup("##memmap_ctx")) {
-		if (ImGui::MenuItem("Go to Hex View"))
+		if (ImGui::MenuItem("Go to Hex View")) {
+			debugger_engine::memory_region_t r{};
+			if (find_region_by_base(g_ui.context_addr, r)) {
+				const size_t cap = static_cast<size_t>(1024ULL * 1024ULL);
+				size_t req = static_cast<size_t>(std::min<uint64_t>(r.size, static_cast<uint64_t>(cap)));
+				if (req == 0) {
+					toast_notification::push("Region has zero size.", toast_notification::toast_type_t::error);
+				}
+				else if (hex_view::read_from_process(r.base, req)) {
+					globals::ui::active_center_view = center_view_t::hex_view;
+				}
+				else {
+					toast_notification::push("Failed to read region for hex view.", toast_notification::toast_type_t::error);
+				}
+			}
+			else {
+				toast_notification::push("Region no longer present.", toast_notification::toast_type_t::error);
+			}
 			g_ui.show_context = false;
-		if (ImGui::MenuItem("Go to Disassembly"))
+		}
+		if (ImGui::MenuItem("Go to Disassembly")) {
+			debugger_engine::memory_region_t r{};
+			if (find_region_by_base(g_ui.context_addr, r)) {
+				globals::ui::active_center_view = center_view_t::disassembly;
+				disasm_view::goto_address(r.base, g_disasm);
+			}
+			else {
+				toast_notification::push("Region no longer present.", toast_notification::toast_type_t::error);
+			}
 			g_ui.show_context = false;
-		if (ImGui::MenuItem("Change Protection"))
+		}
+		if (ImGui::MenuItem("Change Protection")) {
+			debugger_engine::memory_region_t r{};
+			if (find_region_by_base(g_ui.context_addr, r)) {
+				g_ui.change_protect_addr = r.base;
+				g_ui.change_protect_size = r.size;
+				g_ui.change_protect_choice = 0;
+				g_ui.change_protect_old = r.protect;
+				g_ui.change_protect_open = true;
+				open_change_protect_popup = true;
+			}
+			else {
+				toast_notification::push("Region no longer present.", toast_notification::toast_type_t::error);
+			}
 			g_ui.show_context = false;
-		if (ImGui::MenuItem("Dump Region"))
+		}
+		if (ImGui::MenuItem("Dump Region")) {
+			debugger_engine::memory_region_t r{};
+			if (find_region_by_base(g_ui.context_addr, r)) {
+				const uint64_t max_dump = 256ULL * 1024ULL * 1024ULL;
+				if (r.size == 0) {
+					toast_notification::push("Region has zero size.", toast_notification::toast_type_t::error);
+				}
+				else if (r.size > max_dump) {
+					toast_notification::push("Region exceeds 256 MiB dump cap.", toast_notification::toast_type_t::warning);
+				}
+				else {
+					char default_name[64] = {};
+					std::snprintf(default_name, sizeof(default_name), "dump_%016llX_%llu.bin",
+						static_cast<unsigned long long>(r.base),
+						static_cast<unsigned long long>(r.size));
+
+					char path_buf[MAX_PATH] = {};
+					std::strncpy(path_buf, default_name, sizeof(path_buf) - 1);
+
+					OPENFILENAMEA sfn = {};
+					sfn.lStructSize = sizeof(sfn);
+					sfn.hwndOwner = g_hwnd;
+					sfn.lpstrFile = path_buf;
+					sfn.nMaxFile = MAX_PATH;
+					sfn.lpstrFilter = "Binary\0*.bin\0All files\0*.*\0\0";
+					sfn.lpstrDefExt = "bin";
+					sfn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST;
+
+					if (GetSaveFileNameA(&sfn)) {
+						std::vector<uint8_t> buf;
+						size_t req = static_cast<size_t>(r.size);
+						if (driver_bridge::read_memory(r.base, req, buf) && !buf.empty()) {
+							std::ofstream ofs(path_buf, std::ios::binary | std::ios::trunc);
+							if (ofs.is_open()) {
+								ofs.write(reinterpret_cast<const char*>(buf.data()),
+									static_cast<std::streamsize>(buf.size()));
+								ofs.close();
+								char msg[MAX_PATH + 64];
+								std::snprintf(msg, sizeof(msg), "Dumped %llu bytes to %s",
+									static_cast<unsigned long long>(buf.size()), path_buf);
+								toast_notification::push(msg, toast_notification::toast_type_t::info);
+							}
+							else {
+								toast_notification::push("Failed to open dump file for writing.", toast_notification::toast_type_t::error);
+							}
+						}
+						else {
+							toast_notification::push("Failed to read region memory.", toast_notification::toast_type_t::error);
+						}
+					}
+				}
+			}
+			else {
+				toast_notification::push("Region no longer present.", toast_notification::toast_type_t::error);
+			}
 			g_ui.show_context = false;
+		}
+		ImGui::EndPopup();
+	}
+
+	if (open_change_protect_popup)
+		ImGui::OpenPopup("Change Protection");
+
+	if (ImGui::BeginPopupModal("Change Protection", &g_ui.change_protect_open, ImGuiWindowFlags_AlwaysAutoResize)) {
+		ImGui::Text("Address: %016llX", static_cast<unsigned long long>(g_ui.change_protect_addr));
+		ImGui::Text("Size:    %llu bytes", static_cast<unsigned long long>(g_ui.change_protect_size));
+		ImGui::Text("Current: 0x%X", g_ui.change_protect_old);
+		ImGui::Separator();
+
+		const char* labels[] = {
+			"PAGE_NOACCESS (0x01)",
+			"PAGE_READONLY (0x02)",
+			"PAGE_READWRITE (0x04)",
+			"PAGE_WRITECOPY (0x08)",
+			"PAGE_EXECUTE (0x10)",
+			"PAGE_EXECUTE_READ (0x20)",
+			"PAGE_EXECUTE_READWRITE (0x40)",
+			"PAGE_EXECUTE_WRITECOPY (0x80)"
+		};
+		const uint32_t values[] = { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
+		const int value_count = static_cast<int>(sizeof(values) / sizeof(values[0]));
+
+		if (g_ui.change_protect_choice < 0) g_ui.change_protect_choice = 0;
+		if (g_ui.change_protect_choice >= value_count) g_ui.change_protect_choice = value_count - 1;
+
+		ImGui::Combo("##new_protect", &g_ui.change_protect_choice, labels, value_count);
+
+		ImGui::Separator();
+		if (ImGui::Button("Apply", ImVec2(100.f, 0.f))) {
+			uint32_t new_protect = values[g_ui.change_protect_choice];
+			uint32_t old_protect = 0;
+			if (driver_bridge::protect_memory(g_ui.change_protect_addr, g_ui.change_protect_size, new_protect, &old_protect)) {
+				char msg[96];
+				std::snprintf(msg, sizeof(msg), "Protection changed 0x%X -> 0x%X", old_protect, new_protect);
+				toast_notification::push(msg, toast_notification::toast_type_t::info);
+				refresh();
+			}
+			else {
+				toast_notification::push("Failed to change protection.", toast_notification::toast_type_t::error);
+			}
+			g_ui.change_protect_open = false;
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel", ImVec2(100.f, 0.f))) {
+			g_ui.change_protect_open = false;
+			ImGui::CloseCurrentPopup();
+		}
 		ImGui::EndPopup();
 	}
 }
