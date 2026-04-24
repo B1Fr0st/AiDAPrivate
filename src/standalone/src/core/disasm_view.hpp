@@ -76,6 +76,7 @@ struct state_t {
     int   xref_popup_selected = -1;
     bool  xref_popup_sb_dragging = false;
     float xref_popup_sb_drag_offset = 0.f;
+    char  xref_popup_filter[96] = {};
     std::vector<xref_popup_entry_t> xref_results;
     std::atomic<bool> xref_scanning{false};
     std::mutex xref_mutex;

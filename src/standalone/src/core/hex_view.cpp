@@ -62,8 +62,6 @@ bool read_from_process(uint64_t address, size_t size) {
 
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b) {
-    if (!g_state.active || g_state.data.empty()) return;
-
     auto& st = g_state;
     const float a   = alpha;
     const float dt  = ImGui::GetIO().DeltaTime;
@@ -72,6 +70,26 @@ void render(float pos_x, float pos_y, float width, float height,
     const auto _ta = [a](ImU32 c) -> ImU32 {
         return ui_anim::theme_alpha(c, a);
     };
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 wpos = ImGui::GetWindowPos();
+    float ox = wpos.x + pos_x;
+    float oy = wpos.y + pos_y;
+
+    dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height), _ta(_t.bg_base));
+
+    if (!st.active || st.data.empty()) {
+        float cw = std::min(width - 40.f, 520.f);
+        if (cw < 140.f) cw = std::max(140.f, width - 12.f);
+        float cx = ox + (width - cw) * 0.5f;
+        float cy = oy + height * 0.5f - 24.f;
+        ui_anim::render_inline_callout(dl, cx, cy, cw, 48.f,
+            "No buffer loaded. Attach a process or open a file to inspect bytes.",
+            ui_anim::callout_kind_t::info,
+            accent_r, accent_g, accent_b, a);
+        return;
+    }
+
     const float line_h = 18.f;
     const float char_w = ImGui::CalcTextSize("0").x;
     const int   bytes_per_row = 16;
@@ -90,17 +108,44 @@ void render(float pos_x, float pos_y, float width, float height,
         byte_flash.assign(st.data.size(), 0.f);
     }
 
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 wpos = ImGui::GetWindowPos();
-    float ox = wpos.x + pos_x;
-    float oy = wpos.y + pos_y;
+    const float strip_h = 42.f;
+    {
+        char bytes_buf[32];
+        char sel_buf[32];
+        char base_buf[24];
+        char src_buf[48];
 
-    dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height), _ta(_t.bg_base));
+        std::snprintf(bytes_buf, sizeof(bytes_buf), "%zu", st.data.size());
+        int sel_count = 0;
+        if (st.sel_start >= 0 && st.sel_end >= 0)
+            sel_count = std::abs(st.sel_end - st.sel_start) + 1;
+        if (sel_count > 0)
+            std::snprintf(sel_buf, sizeof(sel_buf), "%d", sel_count);
+        else
+            std::snprintf(sel_buf, sizeof(sel_buf), "none");
+        std::snprintf(base_buf, sizeof(base_buf), "0x%016llX",
+            static_cast<unsigned long long>(st.base_addr));
+        if (st.source_name.empty())
+            std::snprintf(src_buf, sizeof(src_buf), "in-memory");
+        else
+            std::snprintf(src_buf, sizeof(src_buf), "%.44s", st.source_name.c_str());
+
+        ui_anim::stat_strip_item_t items[4];
+        items[0] = { "Bytes",    bytes_buf, nullptr, 0, nullptr, 0, 0 };
+        items[1] = { "Selected", sel_buf,   nullptr, 0, nullptr, 0, 0 };
+        items[2] = { "Base",     base_buf,  nullptr, 0, nullptr, 0, 0 };
+        items[3] = { "Source",   src_buf,   nullptr, 0, nullptr, 0, 0 };
+        ui_anim::render_stat_strip(dl, ox + 6.f, oy + 6.f, width - 12.f, strip_h - 10.f,
+            items, 4, accent_r, accent_g, accent_b, a);
+    }
+    oy += strip_h;
+    height -= strip_h;
 
     float col_hdr_h = line_h;
     {
         dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + col_hdr_h),
             _ta(_t.panel_header));
+        ui_anim::render_gradient_header(dl, ox, oy, width, col_hdr_h, accent_r, accent_g, accent_b, a * 0.25f);
         float hx = ox + addr_w;
         for (int c = 0; c < bytes_per_row; ++c) {
             float bx = hx + c * char_w * 3.f;

@@ -144,9 +144,45 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
-	float table_top = cy + toolbar_h + 4.f;
+	float strip_y = cy + toolbar_h + 2.f;
+	const float strip_h = 44.f;
+	{
+		int found = 0, neutralized_c = 0, active_c = 0;
+		double avg_rps = 0.0;
+		{
+			std::lock_guard<std::mutex> lk(ih.mutex);
+			found = static_cast<int>(ih.nodes.size());
+			for (auto& n : ih.nodes) {
+				if (n.neutralized) neutralized_c++;
+				else active_c++;
+				avg_rps += n.reads_per_second;
+			}
+			if (found > 0) avg_rps /= static_cast<double>(found);
+		}
+		char found_buf[16];
+		char active_buf[16];
+		char neut_buf[16];
+		char rps_buf[24];
+		std::snprintf(found_buf, sizeof(found_buf), "%d", found);
+		std::snprintf(active_buf, sizeof(active_buf), "%d", active_c);
+		std::snprintf(neut_buf, sizeof(neut_buf), "%d", neutralized_c);
+		std::snprintf(rps_buf, sizeof(rps_buf), "%.1f/s", avg_rps);
+
+		ImU32 active_col = active_c > 0 ? IM_COL32(230, 120, 120, 255) : IM_COL32(120, 200, 130, 255);
+		ImU32 neut_col   = neutralized_c > 0 ? IM_COL32(120, 200, 130, 255) : IM_COL32(180, 185, 200, 255);
+
+		ui_anim::stat_strip_item_t items[4];
+		items[0] = { "Checkers",    found_buf,  nullptr, 0, nullptr, 0, 0 };
+		items[1] = { "Active",      active_buf, nullptr, 0, nullptr, 0, active_col };
+		items[2] = { "Neutralized", neut_buf,   nullptr, 0, nullptr, 0, neut_col };
+		items[3] = { "Avg Rate",    rps_buf,    nullptr, 0, nullptr, 0, 0 };
+		ui_anim::render_stat_strip(dl, cx + 6.f, strip_y + 4.f, width - 12.f, strip_h - 8.f,
+			items, 4, accent_r, accent_g, accent_b, alpha);
+	}
+
+	float table_top = cy + toolbar_h + strip_h + 4.f;
 	float log_h = st.show_event_log ? 160.f : 0.f;
-	float table_h = height - toolbar_h - 4.f - log_h;
+	float table_h = height - toolbar_h - strip_h - 4.f - log_h;
 	if (table_h < 100.f) table_h = 100.f;
 
 	const float row_h = 22.f;
@@ -290,13 +326,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	if (total_rows == 0) {
-		const char* empty_title = hunting ? "Monitoring..." : "No Integrity Checkers";
 		const char* empty_desc = hunting
-			? "Waiting for integrity checker reads..."
-			: "Enter a code address and click 'Start Hunt' to find integrity checkers.";
-		ui_anim::render_empty_state(dl, cx, table_top, width, table_h,
-		    empty_title,
-		    accent_r, accent_g, accent_b, alpha, static_cast<float>(ImGui::GetTime()));
+			? "Monitoring for integrity checker reads — trigger the target's verification path."
+			: "Enter a code address and click Start Hunt to locate integrity checkers.";
+		float cw = std::min(width - 40.f, 620.f);
+		if (cw < 160.f) cw = std::max(160.f, width - 20.f);
+		float ccx = cx + (width - cw) * 0.5f;
+		float ccy = table_top + table_h * 0.5f - 26.f;
+		ui_anim::render_inline_callout(dl, ccx, ccy, cw, 52.f,
+		    empty_desc,
+		    hunting ? ui_anim::callout_kind_t::warn : ui_anim::callout_kind_t::info,
+		    accent_r, accent_g, accent_b, alpha);
 	}
 
 	if (st.show_event_log && log_h > 0.f) {

@@ -161,7 +161,49 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (btn_hover && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 		refresh();
 
-	float table_y = pos_y + header_h;
+	float strip_y = pos_y + header_h;
+	const float strip_h = 44.f;
+	{
+		int depth = 0;
+		int unresolved = 0;
+		int distinct_modules = 0;
+		{
+			std::lock_guard<std::mutex> lk(g_ui.mutex);
+			depth = static_cast<int>(g_ui.entries.size());
+			std::vector<std::string> seen_modules;
+			seen_modules.reserve(g_ui.entries.size());
+			for (auto& e : g_ui.entries) {
+				if (e.module_name.empty()) unresolved++;
+				else {
+					bool already = false;
+					for (auto& sm : seen_modules) {
+						if (sm == e.module_name) { already = true; break; }
+					}
+					if (!already) seen_modules.push_back(e.module_name);
+				}
+			}
+			distinct_modules = static_cast<int>(seen_modules.size());
+		}
+		char depth_buf[16];
+		char unres_buf[16];
+		char mod_buf[16];
+		std::snprintf(depth_buf, sizeof(depth_buf), "%d", depth);
+		std::snprintf(unres_buf, sizeof(unres_buf), "%d", unresolved);
+		std::snprintf(mod_buf, sizeof(mod_buf), "%d", distinct_modules);
+
+		ImU32 unres_col = unresolved > 0
+			? IM_COL32(230, 140, 80, 255)
+			: IM_COL32(120, 200, 130, 255);
+
+		ui_anim::stat_strip_item_t items[3];
+		items[0] = { "Chain Depth", depth_buf, nullptr, 0, nullptr, 0, 0 };
+		items[1] = { "Unresolved",  unres_buf, nullptr, 0, nullptr, 0, unres_col };
+		items[2] = { "Modules",     mod_buf,   nullptr, 0, nullptr, 0, 0 };
+		ui_anim::render_stat_strip(dl, pos_x + 6.f, strip_y + 4.f, width - 12.f, strip_h - 8.f,
+			items, 3, ar, ag, ab, alpha);
+	}
+
+	float table_y = strip_y + strip_h;
 
 	float col_idx = pos_x + width * 0.01f;
 	float col_frame = pos_x + width * 0.06f;
@@ -175,7 +217,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	float list_y = table_y + col_header_h;
-	float list_h = height - header_h - col_header_h;
+	float list_h = height - header_h - strip_h - col_header_h;
 	if (list_h <= 0.f) return;
 
 	dl->PushClipRect(ImVec2(pos_x, list_y), ImVec2(pos_x + width, list_y + list_h), true);
@@ -187,8 +229,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	if (snapshot.empty()) {
-		ui_anim::render_empty_state(dl, pos_x, list_y, width, list_h, "No SEH chain found",
-			ar, ag, ab, alpha, static_cast<float>(ImGui::GetTime()));
+		float cw = std::min(width - 40.f, 560.f);
+		if (cw < 160.f) cw = std::max(160.f, width - 20.f);
+		float cx = pos_x + (width - cw) * 0.5f;
+		float cy = list_y + list_h * 0.5f - 26.f;
+		ui_anim::render_inline_callout(dl, cx, cy, cw, 52.f,
+			"No SEH chain found. Attach to a 32-bit process and click Refresh — SEH is unwound per-thread.",
+			ui_anim::callout_kind_t::info, ar, ag, ab, alpha);
 		dl->PopClipRect();
 		return;
 	}

@@ -110,11 +110,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	ImGui::SameLine();
-	ImGui::PushItemWidth(120.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, _ta(_t.panel_header));
-	ImGui::InputTextWithHint("##xref_filter", "Filter...", g_view.filter_buf, sizeof(g_view.filter_buf));
-	ImGui::PopStyleColor();
-	ImGui::PopItemWidth();
+	ui_anim::render_filter_input_chip("##xref_filter", g_view.filter_buf, sizeof(g_view.filter_buf),
+		"Filter address or disasm...", 180.f, accent_r, accent_g, accent_b, a);
 
 	ImGui::PopStyleVar();
 	ImGui::PopStyleColor(3);

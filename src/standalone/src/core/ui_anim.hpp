@@ -1280,4 +1280,274 @@ inline void render_context_menu_bg(ImDrawList* dl, float x, float y, float w, fl
 		IM_COL32(60, 65, 80, static_cast<int>(100 * fa)), 6.f, 0, 1.f);
 }
 
+enum class callout_kind_t { info, warn, success, error };
+
+inline void render_inline_callout(ImDrawList* dl, float x, float y, float w, float h,
+								  const char* text, callout_kind_t kind,
+								  float ar, float ag, float ab, float alpha)
+{
+	ImU32 accent_col;
+	ImU32 fill_col;
+	const char* glyph = "";
+	switch (kind) {
+	case callout_kind_t::info:
+		accent_col = IM_COL32(100, 160, 230, static_cast<int>(230 * alpha));
+		fill_col   = IM_COL32(100, 160, 230, static_cast<int>(22 * alpha));
+		glyph = "i";
+		break;
+	case callout_kind_t::warn:
+		accent_col = IM_COL32(230, 180, 80, static_cast<int>(230 * alpha));
+		fill_col   = IM_COL32(230, 180, 80, static_cast<int>(22 * alpha));
+		glyph = "!";
+		break;
+	case callout_kind_t::success:
+		accent_col = IM_COL32(120, 200, 130, static_cast<int>(230 * alpha));
+		fill_col   = IM_COL32(120, 200, 130, static_cast<int>(22 * alpha));
+		glyph = "+";
+		break;
+	case callout_kind_t::error:
+		accent_col = IM_COL32(230, 90, 90, static_cast<int>(230 * alpha));
+		fill_col   = IM_COL32(230, 90, 90, static_cast<int>(22 * alpha));
+		glyph = "x";
+		break;
+	default:
+		accent_col = IM_COL32(180, 180, 200, static_cast<int>(200 * alpha));
+		fill_col   = IM_COL32(180, 180, 200, static_cast<int>(20 * alpha));
+		glyph = "?";
+		break;
+	}
+
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), fill_col, 5.f);
+
+	ImU32 accent_tint = IM_COL32(
+		static_cast<int>(ar * 255), static_cast<int>(ag * 255), static_cast<int>(ab * 255),
+		static_cast<int>(12 * alpha));
+	ImU32 accent_tint_zero = IM_COL32(
+		static_cast<int>(ar * 255), static_cast<int>(ag * 255), static_cast<int>(ab * 255), 0);
+	dl->AddRectFilledMultiColor(
+		ImVec2(x + 3.f, y), ImVec2(x + w, y + h),
+		accent_tint, accent_tint_zero, accent_tint_zero, accent_tint);
+
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 3.f, y + h), accent_col);
+	dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h),
+		theme_alpha(accent_col, 0.5f), 5.f, 0, 1.f);
+
+	float glyph_cx = x + 18.f;
+	float glyph_cy = y + h * 0.5f;
+	dl->AddCircleFilled(ImVec2(glyph_cx, glyph_cy), 8.f,
+		theme_alpha(accent_col, 0.6f), 16);
+	ImVec2 gs = ImGui::CalcTextSize(glyph);
+	dl->AddText(ImVec2(glyph_cx - gs.x * 0.5f, glyph_cy - gs.y * 0.5f),
+		IM_COL32(20, 22, 28, static_cast<int>(240 * alpha)), glyph);
+
+	if (text) {
+		ImVec2 ts = ImGui::CalcTextSize(text);
+		dl->AddText(ImVec2(x + 34.f, y + (h - ts.y) * 0.5f),
+			IM_COL32(220, 225, 235, static_cast<int>(230 * alpha)), text);
+	}
+}
+
+inline float render_kbd_chip(ImDrawList* dl, float x, float y, const char* label, float alpha)
+{
+	if (!label) return 0.f;
+	ImVec2 ts = ImGui::CalcTextSize(label);
+	float pad_x = 6.f;
+	float w = ts.x + pad_x * 2.f;
+	float h = ts.y + 4.f;
+	float rounding = 3.f;
+
+	dl->AddRectFilled(ImVec2(x, y + 1.f), ImVec2(x + w, y + h + 1.f),
+		IM_COL32(0, 0, 0, static_cast<int>(55 * alpha)), rounding);
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+		IM_COL32(40, 44, 58, static_cast<int>(230 * alpha)), rounding);
+	dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h),
+		IM_COL32(90, 98, 118, static_cast<int>(180 * alpha)), rounding, 0, 1.f);
+	dl->AddLine(ImVec2(x + rounding, y + 1.f), ImVec2(x + w - rounding, y + 1.f),
+		IM_COL32(255, 255, 255, static_cast<int>(28 * alpha)), 1.f);
+
+	dl->AddText(ImVec2(x + pad_x, y + 2.f),
+		IM_COL32(215, 220, 235, static_cast<int>(230 * alpha)), label);
+
+	return w;
+}
+
+inline bool render_filter_input_chip(const char* id, char* buf, size_t bufsz,
+									 const char* placeholder, float width,
+									 float ar, float ag, float ab, float alpha)
+{
+	ImU32 frame_bg = IM_COL32(26, 28, 38, static_cast<int>(220 * alpha));
+	ImU32 frame_hov = IM_COL32(
+		static_cast<int>(ar * 70 + 30), static_cast<int>(ag * 70 + 30),
+		static_cast<int>(ab * 70 + 30), static_cast<int>(230 * alpha));
+	ImU32 frame_active = IM_COL32(
+		static_cast<int>(ar * 120 + 25), static_cast<int>(ag * 120 + 25),
+		static_cast<int>(ab * 120 + 25), static_cast<int>(240 * alpha));
+	ImU32 text_col = IM_COL32(225, 230, 240, static_cast<int>(240 * alpha));
+	ImU32 hint_col = IM_COL32(140, 145, 160, static_cast<int>(180 * alpha));
+	ImU32 border_col = IM_COL32(60, 66, 82, static_cast<int>(150 * alpha));
+
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, frame_bg);
+	ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, frame_hov);
+	ImGui::PushStyleColor(ImGuiCol_FrameBgActive, frame_active);
+	ImGui::PushStyleColor(ImGuiCol_Text, text_col);
+	ImGui::PushStyleColor(ImGuiCol_TextDisabled, hint_col);
+	ImGui::PushStyleColor(ImGuiCol_Border, border_col);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+	ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
+	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 4.f));
+
+	ImGui::PushItemWidth(width);
+	bool changed = ImGui::InputTextWithHint(id, placeholder, buf, bufsz);
+	ImGui::PopItemWidth();
+
+	ImGui::PopStyleVar(3);
+	ImGui::PopStyleColor(6);
+
+	return changed;
+}
+
+struct stat_strip_item_t {
+	const char*  label;
+	const char*  value;
+	const char*  delta;
+	int          delta_sign;
+	const float* sparkline;
+	int          sparkline_count;
+	ImU32        value_color;
+};
+
+inline void render_stat_strip(ImDrawList* dl, float x, float y, float w, float h,
+							  const stat_strip_item_t* items, int count,
+							  float ar, float ag, float ab, float alpha)
+{
+	if (!items || count <= 0 || w <= 0.f || h <= 0.f) return;
+
+	const float pad_outer = 6.f;
+	const float gap = 8.f;
+	float avail = w - pad_outer * 2.f - gap * static_cast<float>(count - 1);
+	if (avail < static_cast<float>(count)) return;
+	float item_w = avail / static_cast<float>(count);
+
+	float cx = x + pad_outer;
+	for (int i = 0; i < count; ++i) {
+		float ix = cx;
+		float iy = y;
+		const auto& it = items[i];
+
+		dl->AddRectFilled(ImVec2(ix, iy), ImVec2(ix + item_w, iy + h),
+			IM_COL32(28, 30, 40, static_cast<int>(200 * alpha)), 6.f);
+		dl->AddRect(ImVec2(ix, iy), ImVec2(ix + item_w, iy + h),
+			IM_COL32(50, 55, 70, static_cast<int>(90 * alpha)), 6.f, 0, 1.f);
+
+		ImU32 accent_top = IM_COL32(
+			static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+			static_cast<int>(ab * 255), static_cast<int>(110 * alpha));
+		dl->AddRectFilled(ImVec2(ix + 6.f, iy), ImVec2(ix + item_w - 6.f, iy + 2.f),
+			accent_top, 1.f);
+
+		if (it.label) {
+			dl->AddText(ImVec2(ix + 10.f, iy + 6.f),
+				IM_COL32(150, 155, 170, static_cast<int>(200 * alpha)), it.label);
+		}
+
+		float value_baseline_y = iy + h - 8.f;
+		if (it.value) {
+			ImU32 vc = it.value_color ? theme_alpha(it.value_color, alpha)
+									  : IM_COL32(225, 230, 240, static_cast<int>(alpha * 255));
+			ImVec2 vs = ImGui::CalcTextSize(it.value);
+			float vy = value_baseline_y - vs.y;
+			dl->AddText(ImVec2(ix + 10.f, vy), vc, it.value);
+
+			if (it.delta) {
+				ImU32 dc;
+				if (it.delta_sign > 0)
+					dc = IM_COL32(120, 200, 130, static_cast<int>(220 * alpha));
+				else if (it.delta_sign < 0)
+					dc = IM_COL32(230, 120, 120, static_cast<int>(220 * alpha));
+				else
+					dc = IM_COL32(180, 185, 200, static_cast<int>(180 * alpha));
+				dl->AddText(ImVec2(ix + 10.f + vs.x + 8.f, vy + 1.f), dc, it.delta);
+			}
+		}
+
+		if (it.sparkline && it.sparkline_count > 1) {
+			float sw = item_w * 0.38f;
+			float sh = h - 14.f;
+			if (sw > 16.f && sh > 6.f) {
+				float sx = ix + item_w - sw - 8.f;
+				float sy = iy + 6.f;
+				ImU32 sc = IM_COL32(
+					static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+					static_cast<int>(ab * 255), static_cast<int>(230 * alpha));
+				render_mini_sparkline(dl, sx, sy, sw, sh,
+					it.sparkline, it.sparkline_count, sc, alpha);
+			}
+		}
+
+		cx += item_w + gap;
+	}
+}
+
+inline void render_graph_node_card(ImDrawList* dl, float x, float y, float w, float h,
+								   const char* header_text, bool is_entry, bool is_selected,
+								   float ar, float ag, float ab, float alpha, float time)
+{
+	const float rounding = 7.f;
+	const float header_h = 22.f;
+
+	dl->AddRectFilled(ImVec2(x + 3.f, y + 4.f), ImVec2(x + w + 3.f, y + h + 4.f),
+		IM_COL32(0, 0, 0, static_cast<int>(70 * alpha)), rounding);
+
+	dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h),
+		IM_COL32(22, 24, 32, static_cast<int>(240 * alpha)), rounding);
+
+	ImU32 hdr_left;
+	ImU32 hdr_right;
+	if (is_entry) {
+		hdr_left  = IM_COL32(
+			static_cast<int>(ar * 200 + 20), static_cast<int>(ag * 200 + 20),
+			static_cast<int>(ab * 200 + 20), static_cast<int>(225 * alpha));
+		hdr_right = IM_COL32(
+			static_cast<int>(ar * 140), static_cast<int>(ag * 140),
+			static_cast<int>(ab * 140), static_cast<int>(200 * alpha));
+	} else {
+		hdr_left  = IM_COL32(42, 46, 60, static_cast<int>(240 * alpha));
+		hdr_right = IM_COL32(30, 33, 44, static_cast<int>(225 * alpha));
+	}
+	dl->AddRectFilledMultiColor(
+		ImVec2(x + 1.f, y + 1.f), ImVec2(x + w - 1.f, y + header_h),
+		hdr_left, hdr_right, hdr_right, hdr_left);
+
+	dl->AddLine(ImVec2(x + 4.f, y + header_h), ImVec2(x + w - 4.f, y + header_h),
+		IM_COL32(static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+				 static_cast<int>(ab * 255), static_cast<int>(130 * alpha)), 1.f);
+
+	if (header_text) {
+		ImVec2 ts = ImGui::CalcTextSize(header_text);
+		ImU32 title_col = is_entry
+			? IM_COL32(18, 20, 28, static_cast<int>(alpha * 245))
+			: IM_COL32(
+				static_cast<int>(ar * 200 + 55), static_cast<int>(ag * 200 + 55),
+				static_cast<int>(ab * 200 + 55), static_cast<int>(alpha * 240));
+		dl->AddText(ImVec2(x + 10.f, y + (header_h - ts.y) * 0.5f + 1.f),
+			title_col, header_text);
+	}
+
+	if (is_selected) {
+		float pulse = (std::sin(time * 3.5f) + 1.f) * 0.5f;
+		ImU32 ring_core = IM_COL32(
+			static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+			static_cast<int>(ab * 255), static_cast<int>((180 + pulse * 55) * alpha));
+		ImU32 ring_halo = IM_COL32(
+			static_cast<int>(ar * 255), static_cast<int>(ag * 255),
+			static_cast<int>(ab * 255), static_cast<int>(60 * alpha * (0.4f + pulse * 0.6f)));
+		dl->AddRect(ImVec2(x - 2.f, y - 2.f), ImVec2(x + w + 2.f, y + h + 2.f),
+			ring_halo, rounding + 2.f, 0, 2.f);
+		dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), ring_core, rounding, 0, 1.8f);
+	} else {
+		dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h),
+			IM_COL32(60, 66, 82, static_cast<int>(160 * alpha)), rounding, 0, 1.f);
+	}
+}
+
 }

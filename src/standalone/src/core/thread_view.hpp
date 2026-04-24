@@ -190,7 +190,41 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (btn_hover && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 		refresh();
 
-	float table_y = pos_y + header_h;
+	float strip_y = pos_y + header_h;
+	const float strip_h = 44.f;
+	{
+		int running = 0, waiting = 0, suspended = 0;
+		{
+			std::lock_guard<std::mutex> lk(g_ui.threads_mutex);
+			for (auto& t : g_ui.threads) {
+				if (t.state_text == "Running") running++;
+				else if (t.state_text == "Suspended") suspended++;
+				else waiting++;
+			}
+		}
+		char tot_buf[16];
+		char run_buf[16];
+		char wait_buf[16];
+		char susp_buf[16];
+		std::snprintf(tot_buf, sizeof(tot_buf), "%d", thread_count);
+		std::snprintf(run_buf, sizeof(run_buf), "%d", running);
+		std::snprintf(wait_buf, sizeof(wait_buf), "%d", waiting);
+		std::snprintf(susp_buf, sizeof(susp_buf), "%d", suspended);
+
+		ImU32 run_col  = IM_COL32(120, 200, 130, 255);
+		ImU32 wait_col = IM_COL32(220, 200, 80, 255);
+		ImU32 susp_col = suspended > 0 ? IM_COL32(230, 140, 80, 255) : IM_COL32(180, 185, 200, 255);
+
+		ui_anim::stat_strip_item_t items[4];
+		items[0] = { "Threads",   tot_buf,  nullptr, 0, nullptr, 0, 0 };
+		items[1] = { "Running",   run_buf,  nullptr, 0, nullptr, 0, run_col };
+		items[2] = { "Waiting",   wait_buf, nullptr, 0, nullptr, 0, wait_col };
+		items[3] = { "Suspended", susp_buf, nullptr, 0, nullptr, 0, susp_col };
+		ui_anim::render_stat_strip(dl, pos_x + 6.f, strip_y + 4.f, width - 12.f, strip_h - 8.f,
+			items, 4, ar, ag, ab, alpha);
+	}
+
+	float table_y = strip_y + strip_h;
 
 	float col_tid = pos_x + width * 0.01f;
 	float col_entry = pos_x + width * 0.08f;
@@ -206,7 +240,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	float list_y = table_y + col_header_h;
-	float list_h = height - header_h - col_header_h;
+	float list_h = height - header_h - strip_h - col_header_h;
 	if (list_h <= 0.f) return;
 
 	dl->PushClipRect(ImVec2(pos_x, list_y), ImVec2(pos_x + width, list_y + list_h), true);
@@ -287,7 +321,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		snprintf(prio_buf, sizeof(prio_buf), "%d", t.priority);
 		dl->AddText(ImVec2(col_prio, ry + 2.f), detail::priority_color(t.priority, alpha), prio_buf);
 
-		dl->AddText(ImVec2(col_state, ry + 2.f), detail::state_color(t.state_text, alpha), t.state_text.c_str());
+		ui_anim::render_status_pill(dl, col_state, ry + 1.f, t.state_text.c_str(),
+			detail::state_color(t.state_text, 1.f), alpha,
+			static_cast<float>(ImGui::GetTime()), t.state_text == "Running");
 
 		if (idx == g_ui.selected && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
 			g_ui.context_idx = idx;

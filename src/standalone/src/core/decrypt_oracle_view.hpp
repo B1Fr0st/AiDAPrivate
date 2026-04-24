@@ -21,6 +21,7 @@ struct local_state_t {
 	bool  scrollbar_dragging = false;
 	float scrollbar_drag_offset = 0.f;
 	float anim_time = 0.f;
+	char  filter_buf[64] = {};
 };
 
 static local_state_t s_state;
@@ -60,6 +61,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + width, cy + height), bg);
 
 	const float toolbar_h = 68.f;
+	const float strip_h = 44.f;
 	const float pad = 12.f;
 
 	ui_anim::render_toolbar(dl, cx, cy, width, toolbar_h, accent_r, accent_g, accent_b, alpha);
@@ -145,12 +147,58 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
-	float table_top = cy + toolbar_h + 4.f;
-	float table_h = height - toolbar_h - 4.f;
+	float strip_y = cy + toolbar_h + 2.f;
+	{
+		std::vector<decrypt_oracle::decrypted_string_t> ss_copy;
+		{
+			std::lock_guard<std::mutex> lk(oracle.mutex);
+			ss_copy = oracle.results;
+		}
+		int found = static_cast<int>(ss_copy.size());
+		double avg_conf = 0.0;
+		int strong = 0;
+		int total_len = 0;
+		for (auto& r : ss_copy) {
+			avg_conf += r.confidence;
+			if (r.confidence >= 0.9f) strong++;
+			total_len += r.length;
+		}
+		if (found > 0) avg_conf /= static_cast<double>(found);
+
+		char found_buf[16];
+		char avg_buf[16];
+		char strong_buf[16];
+		char total_buf[24];
+		std::snprintf(found_buf, sizeof(found_buf), "%d", found);
+		std::snprintf(avg_buf, sizeof(avg_buf), "%.0f%%", avg_conf * 100.0);
+		std::snprintf(strong_buf, sizeof(strong_buf), "%d", strong);
+		std::snprintf(total_buf, sizeof(total_buf), "%d B", total_len);
+
+		ImU32 avg_col;
+		if (avg_conf > 0.75)
+			avg_col = IM_COL32(120, 200, 130, 255);
+		else if (avg_conf > 0.5)
+			avg_col = IM_COL32(220, 200, 80, 255);
+		else if (found > 0)
+			avg_col = IM_COL32(230, 140, 80, 255);
+		else
+			avg_col = IM_COL32(180, 185, 200, 255);
+
+		ui_anim::stat_strip_item_t items[4];
+		items[0] = { "Found",      found_buf,  nullptr, 0, nullptr, 0, 0 };
+		items[1] = { "Avg Conf",   avg_buf,    nullptr, 0, nullptr, 0, avg_col };
+		items[2] = { "High Conf",  strong_buf, nullptr, 0, nullptr, 0, 0 };
+		items[3] = { "Total Len",  total_buf,  nullptr, 0, nullptr, 0, 0 };
+		ui_anim::render_stat_strip(dl, cx + 6.f, strip_y + 4.f, width - 12.f, strip_h - 8.f,
+			items, 4, accent_r, accent_g, accent_b, alpha);
+	}
+
+	float table_top = cy + toolbar_h + strip_h + 4.f;
+	float table_h = height - toolbar_h - strip_h - 4.f;
 
 	const float col_func_w = 130.f;
 	const float col_offset_w = 100.f;
-	const float col_conf_w = 70.f;
+	const float col_conf_w = 86.f;
 	const float col_len_w = 50.f;
 	const float col_string_w = width - col_func_w - col_offset_w - col_conf_w - col_len_w - pad * 2.f;
 
@@ -241,10 +289,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		            green_col, display_str.c_str(), display_str.c_str() + display_str.size(),
 		            str_max_w);
 
+		float bar_w = col_conf_w - 10.f;
+		float bar_h = 7.f;
+		float bar_x = conf_x + 4.f;
+		float bar_y = ry + (row_h - bar_h) * 0.5f;
+		ui_anim::render_confidence_bar(dl, bar_x, bar_y, bar_w, bar_h, r.confidence, alpha);
 		char conf_buf[16];
 		std::snprintf(conf_buf, sizeof(conf_buf), "%.0f%%", r.confidence * 100.f);
-		ImU32 conf_color = r.confidence > 0.9f ? green_col : (r.confidence > 0.7f ? text_col : dim_col);
-		dl->AddText(ImVec2(conf_x + 4.f, ry + 3.f), conf_color, conf_buf);
+		ImVec2 confts = ImGui::CalcTextSize(conf_buf);
+		dl->AddText(ImVec2(bar_x + bar_w - confts.x, ry + 3.f), dim_col, conf_buf);
 
 		char len_buf[16];
 		std::snprintf(len_buf, sizeof(len_buf), "%d", r.length);
@@ -252,9 +305,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	if (total_rows == 0 && !scanning) {
-		ui_anim::render_empty_state(dl, cx, table_top, width, table_h,
-		    "Enter an encrypted region address and click Scan & Decrypt",
-		    accent_r, accent_g, accent_b, alpha, static_cast<float>(ImGui::GetTime()));
+		float cw = std::min(width - 40.f, 560.f);
+		if (cw < 160.f) cw = std::max(160.f, width - 20.f);
+		float ccx = cx + (width - cw) * 0.5f;
+		float ccy = table_top + table_h * 0.5f - 26.f;
+		ui_anim::render_inline_callout(dl, ccx, ccy, cw, 52.f,
+		    "Enter an encrypted region address and click Scan & Decrypt to recover strings.",
+		    ui_anim::callout_kind_t::info,
+		    accent_r, accent_g, accent_b, alpha);
 	}
 
 	ui_anim::render_custom_scrollbar(dl, cx + width - 8.f, table_top + row_h, 6.f, table_h - row_h,

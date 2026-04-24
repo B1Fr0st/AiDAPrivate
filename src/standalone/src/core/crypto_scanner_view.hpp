@@ -177,6 +177,38 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	cy += toolbar_h + 8.f;
 
+	const float strip_h = 44.f;
+	{
+		int total = 0, sym = 0, hash = 0, hi_conf = 0;
+		{
+			std::lock_guard<std::mutex> lk(cs.mutex);
+			total = static_cast<int>(cs.results.size());
+			for (auto& h : cs.results) {
+				int cat = static_cast<int>(h.category);
+				if (cat == 0 || cat == 3 || cat == 4) sym++;
+				else if (cat == 1) hash++;
+				if (h.confidence >= 0.8f) hi_conf++;
+			}
+		}
+		char total_buf[16];
+		char sym_buf[16];
+		char hash_buf[16];
+		char conf_buf[16];
+		std::snprintf(total_buf, sizeof(total_buf), "%d", total);
+		std::snprintf(sym_buf, sizeof(sym_buf), "%d", sym);
+		std::snprintf(hash_buf, sizeof(hash_buf), "%d", hash);
+		std::snprintf(conf_buf, sizeof(conf_buf), "%d", hi_conf);
+
+		ui_anim::stat_strip_item_t items[4];
+		items[0] = { "Hits",      total_buf, nullptr, 0, nullptr, 0, 0 };
+		items[1] = { "Cipher",    sym_buf,   nullptr, 0, nullptr, 0, 0 };
+		items[2] = { "Hash",      hash_buf,  nullptr, 0, nullptr, 0, 0 };
+		items[3] = { "High Conf", conf_buf,  nullptr, 0, nullptr, 0, 0 };
+		ui_anim::render_stat_strip(dl, ox + 6.f, cy, width - 12.f, strip_h - 8.f,
+			items, 4, accent_r, accent_g, accent_b, alpha);
+	}
+	cy += strip_h;
+
 	std::vector<crypto_scanner::crypto_hit_t> filtered;
 	{
 		std::lock_guard<std::mutex> lk(cs.mutex);

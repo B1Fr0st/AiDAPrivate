@@ -175,16 +175,59 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	float filter_x = pos_x + width - 220.f;
-	dl->AddText(ImVec2(filter_x - 40.f, pos_y + 8.f),
-				_ta(_t.text_dim), "Filter:");
 	ImGui::SetCursorScreenPos(ImVec2(filter_x, pos_y + 5.f));
-	ImGui::PushItemWidth(200.f);
 	ImGui::PushID("##memmapfilter");
-	ImGui::InputText("##f", g_ui.filter_buf, sizeof(g_ui.filter_buf));
+	ui_anim::render_filter_input_chip("##f", g_ui.filter_buf, sizeof(g_ui.filter_buf),
+		"Filter modules or info...", 210.f, ar, ag, ab, alpha);
 	ImGui::PopID();
-	ImGui::PopItemWidth();
 
-	float table_y = pos_y + header_h;
+	float strip_y = pos_y + header_h;
+	const float strip_h = 44.f;
+	{
+		size_t n_regions = 0;
+		uint64_t total_size = 0;
+		int rwx_count = 0;
+		{
+			std::lock_guard<std::mutex> lk(g_ui.regions_mutex);
+			n_regions = g_ui.regions.size();
+			for (auto& r : g_ui.regions) {
+				if (r.state == 0x1000)
+					total_size += r.size;
+				bool exec = (r.protect & 0xF0) != 0;
+				bool write = (r.protect == 0x04) || (r.protect == 0x08) || (r.protect == 0x40) || (r.protect == 0x80);
+				if (exec && write) rwx_count++;
+			}
+		}
+		char n_buf[24];
+		char sz_buf[24];
+		char rwx_buf[24];
+		char pid_buf[24];
+		std::snprintf(n_buf, sizeof(n_buf), "%zu", n_regions);
+		if (total_size >= 1024ULL * 1024ULL * 1024ULL)
+			std::snprintf(sz_buf, sizeof(sz_buf), "%.1f GB", static_cast<double>(total_size) / (1024.0 * 1024.0 * 1024.0));
+		else
+			std::snprintf(sz_buf, sizeof(sz_buf), "%.1f MB", static_cast<double>(total_size) / (1024.0 * 1024.0));
+		std::snprintf(rwx_buf, sizeof(rwx_buf), "%d", rwx_count);
+		uint32_t pid = driver_bridge::attached_pid();
+		if (pid)
+			std::snprintf(pid_buf, sizeof(pid_buf), "PID %u", pid);
+		else
+			std::snprintf(pid_buf, sizeof(pid_buf), "none");
+
+		ImU32 rwx_col = rwx_count > 0
+			? IM_COL32(230, 90, 90, 255)
+			: IM_COL32(120, 200, 130, 255);
+
+		ui_anim::stat_strip_item_t items[4];
+		items[0] = { "Regions",   n_buf,   nullptr, 0, nullptr, 0, 0 };
+		items[1] = { "Committed", sz_buf,  nullptr, 0, nullptr, 0, 0 };
+		items[2] = { "RWX",       rwx_buf, nullptr, 0, nullptr, 0, rwx_col };
+		items[3] = { "Attached",  pid_buf, nullptr, 0, nullptr, 0, 0 };
+		ui_anim::render_stat_strip(dl, pos_x + 6.f, strip_y + 4.f, width - 12.f, strip_h - 8.f,
+			items, 4, ar, ag, ab, alpha);
+	}
+
+	float table_y = strip_y + strip_h;
 
 	float col_addr = pos_x + width * 0.01f;
 	float col_size = pos_x + width * 0.18f;
@@ -200,7 +243,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	float list_y = table_y + col_header_h;
-	float list_h = height - header_h - col_header_h;
+	float list_h = height - header_h - strip_h - col_header_h;
 	if (list_h <= 0.f)
 		return;
 

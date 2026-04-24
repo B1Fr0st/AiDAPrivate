@@ -285,8 +285,9 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
         _ta(_t.text_secondary), count_buf);
 
     float toolbar_end = toolbar_y + toolbar_h;
+    const float footer_h = 26.f;
     float table_y = toolbar_end + 2.f;
-    float table_h = ph - header_h - toolbar_h - 4.f;
+    float table_h = ph - header_h - toolbar_h - 4.f - footer_h;
     const float row_h = 24.f;
 
     float col_type_w = 54.f;
@@ -477,11 +478,39 @@ static void render_xref_popup(float pos_x, float pos_y, float width, float heigh
     }
 
     if (results_copy.empty() && !scanning) {
-        float ey = list_y + list_h * 0.5f - 10.f;
-        const char* empty_msg = "No cross references found";
-        ImVec2 es = ImGui::CalcTextSize(empty_msg);
-        fdl->AddText(ImVec2(px + (pw - es.x) * 0.5f, ey),
-            _ta(_t.text_dim), empty_msg);
+        float cw = std::min(pw - 32.f, 420.f);
+        if (cw < 140.f) cw = std::max(140.f, pw - 20.f);
+        float ccx = px + (pw - cw) * 0.5f;
+        float ccy = list_y + list_h * 0.5f - 26.f;
+        ui_anim::render_inline_callout(fdl, ccx, ccy, cw, 52.f,
+            "No cross references found. This address is not referenced by call/jmp/lea/data.",
+            ui_anim::callout_kind_t::info, accent_r, accent_g, accent_b, fa);
+    }
+
+    {
+        float fx = px + 12.f;
+        float fy = py + ph - footer_h + 4.f;
+        float cw;
+        cw = ui_anim::render_kbd_chip(fdl, fx, fy, "\xe2\x86\x91", fa);
+        fx += cw + 4.f;
+        cw = ui_anim::render_kbd_chip(fdl, fx, fy, "\xe2\x86\x93", fa);
+        fx += cw + 6.f;
+        fdl->AddText(ImVec2(fx, fy + 2.f), _ta(_t.text_dim), "navigate");
+        fx += ImGui::CalcTextSize("navigate").x + 14.f;
+
+        cw = ui_anim::render_kbd_chip(fdl, fx, fy, "Enter", fa);
+        fx += cw + 6.f;
+        fdl->AddText(ImVec2(fx, fy + 2.f), _ta(_t.text_dim), "jump");
+        fx += ImGui::CalcTextSize("jump").x + 14.f;
+
+        cw = ui_anim::render_kbd_chip(fdl, fx, fy, "Esc", fa);
+        fx += cw + 6.f;
+        fdl->AddText(ImVec2(fx, fy + 2.f), _ta(_t.text_dim), "close");
+        fx += ImGui::CalcTextSize("close").x + 14.f;
+
+        cw = ui_anim::render_kbd_chip(fdl, fx, fy, "Dbl-click", fa);
+        fx += cw + 6.f;
+        fdl->AddText(ImVec2(fx, fy + 2.f), _ta(_t.text_dim), "goto");
     }
 
     if (!st.xref_popup_open && !popup_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -1074,16 +1103,20 @@ void render(float pos_x, float pos_y, float width, float height,
                 ImVec2(ImGui::GetWindowPos().x + pos_x + width, ImGui::GetWindowPos().y + pos_y + height));
 
             if (hovered_g || st.goto_visible) {
-                if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G, false))
+                ImGuiIO& graph_hk_io = ImGui::GetIO();
+                bool graph_hk_text_lock = graph_hk_io.WantTextInput
+                    || graph_hk_io.WantCaptureKeyboard
+                    || ImGui::IsAnyItemActive();
+                if (graph_hk_io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G, false) && !graph_hk_text_lock)
                     st.goto_visible = !st.goto_visible;
-                if (ImGui::GetIO().KeyAlt && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false))
+                if (graph_hk_io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false) && !graph_hk_text_lock)
                     navigate_back();
-                if (ImGui::GetIO().KeyAlt && ImGui::IsKeyPressed(ImGuiKey_RightArrow, false))
+                if (graph_hk_io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_RightArrow, false) && !graph_hk_text_lock)
                     navigate_forward();
 
                 if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))
                     st.graph_mode = false;
-                if (ImGui::IsKeyPressed(ImGuiKey_Space, false))
+                if (ImGui::IsKeyPressed(ImGuiKey_Space, false) && !graph_hk_text_lock)
                     st.graph_mode = false;
             }
         }
@@ -1595,7 +1628,12 @@ void render(float pos_x, float pos_y, float width, float height,
             }
         }
 
-        if (!st.xref_popup_open && !st.goto_visible && !ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyAlt) {
+        ImGuiIO& disasm_hk_io = ImGui::GetIO();
+        bool disasm_hk_text_lock = disasm_hk_io.WantTextInput
+            || disasm_hk_io.WantCaptureKeyboard
+            || ImGui::IsAnyItemActive();
+        if (!st.xref_popup_open && !st.goto_visible && !disasm_hk_io.KeyCtrl && !disasm_hk_io.KeyAlt
+            && !disasm_hk_text_lock) {
             if (ImGui::IsKeyPressed(ImGuiKey_X, false)) {
                 int row = st.selected_row;
                 if (row >= 0 && row < n) {
