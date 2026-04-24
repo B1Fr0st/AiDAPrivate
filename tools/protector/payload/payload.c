@@ -585,19 +585,20 @@ static uint8_t* find_packed_section(uint8_t* image_base, uint32_t* out_size) {
     uint16_t n_sections = *(uint16_t*)(nt + 6);
     uint16_t opt_size = *(uint16_t*)(nt + 0x14);
     uint8_t* sec = nt + 0x18 + opt_size;
-    for (uint16_t i = 0; i < n_sections; ++i) {
-        uint8_t* s = sec + i * 40u;
+    for (int32_t i = (int32_t)n_sections - 1; i >= 0; --i) {
+        uint8_t* s = sec + (uint32_t)i * 40u;
         uint32_t va = *(uint32_t*)(s + 12);
         uint32_t vsize = *(uint32_t*)(s + 8);
-        if (va == 0u || vsize < 4u) { continue; }
+        if (va == 0u || vsize < 8u) { continue; }
         uint8_t* base = image_base + va;
         uint32_t step = 8u;
-        for (uint32_t off = 0; off + 4u <= vsize; off += step) {
+        for (uint32_t off = 0; off + 8u <= vsize; off += step) {
             uint32_t magic = *(uint32_t*)(base + off);
-            if (magic == IMG_MAGIC) {
-                if (out_size != 0) { *out_size = vsize - off; }
-                return base + off;
-            }
+            if (magic != IMG_MAGIC) { continue; }
+            uint32_t version = *(uint32_t*)(base + off + 4u);
+            if (version != 0x00020000u) { continue; }
+            if (out_size != 0) { *out_size = vsize - off; }
+            return base + off;
         }
     }
     return 0;

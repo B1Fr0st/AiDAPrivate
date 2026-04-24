@@ -173,11 +173,8 @@ inline void emit_opaque_predicate(asmjit::x86::Assembler& a,
         }
         case 2: {
             a.mov(scratch, static_cast<int64_t>(rng.next()));
-            x86::Gp tmp = scratch;
-            a.mov(tmp, scratch);
-            a.not_(tmp);
-            a.and_(tmp, scratch);
-            a.test(tmp, tmp);
+            a.sub(scratch, scratch);
+            a.test(scratch, scratch);
             a.jz(lSkip);
             break;
         }
@@ -188,10 +185,14 @@ inline void emit_opaque_predicate(asmjit::x86::Assembler& a,
             break;
         }
         case 4: {
+            a.push(x86::rax);
+            a.push(x86::rdx);
             a.rdtsc();
             a.mov(scratch, x86::rax);
             a.rdtsc();
             a.cmp(x86::rax, scratch);
+            a.pop(x86::rdx);
+            a.pop(x86::rax);
             a.jae(lSkip);
             a.mov(scratch, 1);
             a.test(scratch, scratch);
@@ -265,7 +266,7 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
         masked_blob[i] = aida_payload::kAidaUnpackBlob[i] ^ key[i & 0xFFu];
     }
 
-    static const uint32_t kBaseCandidates[] = { 0, 3, 1, 2, 6, 7, 8, 9, 12, 13, 14 };
+    static const uint32_t kBaseCandidates[] = { 3, 1, 2, 6, 7, 8, 12, 13, 14 };
     static constexpr size_t kBaseCount = sizeof(kBaseCandidates) / sizeof(kBaseCandidates[0]);
     uint32_t base_reg_id = kBaseCandidates[rng.range(static_cast<uint32_t>(kBaseCount))];
 

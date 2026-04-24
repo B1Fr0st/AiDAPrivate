@@ -1294,10 +1294,33 @@ if(BUILD_PROTECTOR)
         COMMAND $<TARGET_FILE:AiDAProtector>
             --input  "$<TARGET_FILE:AiDAHelloLoop>"
             --output "$<TARGET_FILE:AiDAHelloLoop>"
-            --all --bind-machine --tamper-level 3 --verbose
+            --all --bind-machine --tamper-level 3 --jit --verbose
         COMMENT "Protecting aida_hello_loop.exe (full --all pipeline)..."
         VERBATIM
     )
+
+    add_library(AiDAHelloDll SHARED tools/protector/test_payload/hello_dll.cpp)
+    target_compile_options(AiDAHelloDll PRIVATE /W3 /O2 /MD /EHsc /std:c++17 /Zc:threadSafeInit)
+    target_compile_definitions(AiDAHelloDll PRIVATE
+        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
+    )
+    set_target_properties(AiDAHelloDll PROPERTIES
+        OUTPUT_NAME "aida_hello_dll"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+    )
+    add_dependencies(AiDAHelloDll AiDAProtector)
+
+    add_executable(AiDADllLoader tools/protector/test_payload/dll_loader.cpp)
+    target_compile_options(AiDADllLoader PRIVATE /W3 /O2 /MD /EHsc /std:c++17)
+    target_compile_definitions(AiDADllLoader PRIVATE
+        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
+    )
+    set_target_properties(AiDADllLoader PROPERTIES
+        OUTPUT_NAME "aida_dll_loader"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+    )
+    add_dependencies(AiDADllLoader AiDAHelloDll)
 
     # Wave 5: structured logger/reporter wrapping protector + verifier
     add_executable(AiDAProtectorLogger tools/protector/protector_logger.cpp)

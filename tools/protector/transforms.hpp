@@ -2424,15 +2424,20 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
         std::memcpy(fp_bytes, &cpuid_fp, 4);
         std::memcpy(fp_bytes + 4, bind_salt, 16);
         sha256_detail::sha256(fp_bytes, sizeof(fp_bytes), fingerprint_hash);
-        apply_machine_binding_xor(master, bind_salt, cpuid_fp);
         bind_flags |= kBindFlagCpuid;
     }
     std::memcpy(result.bind_salt, bind_salt, 16);
     result.bind_flags = bind_flags;
     std::memcpy(result.fingerprint_hash, fingerprint_hash, 32);
 
+    uint8_t master_for_obfuscation[32];
+    std::memcpy(master_for_obfuscation, master, 32);
+    if (opt.bind_machine) {
+        apply_machine_binding_xor(master_for_obfuscation, bind_salt, cpuid_fp);
+    }
+
     rng.get(result.key_obfuscation_mask, 32);
-    obfuscate_master_key_with_mask(master,
+    obfuscate_master_key_with_mask(master_for_obfuscation,
                                     result.key_obfuscation_mask,
                                     result.master_key_pe_timestamp,
                                     result.master_key_pe_size_of_code,
@@ -2541,6 +2546,47 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
                                           rng);
     result.packed_section_rva = pe.sections.back().virtual_address;
 
+    struct tls_preserve_range_t {
+        uint32_t rva;
+        uint32_t size;
+    };
+    std::vector<tls_preserve_range_t> tls_preserve_ranges;
+    if (pe.has_tls) {
+        const uint64_t image_base = pe.optional_header.ImageBase;
+        const uint32_t dir_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_TLS].rva;
+        const uint32_t dir_size = pe.data_directories[IMAGE_DIRECTORY_ENTRY_TLS].size;
+        if (dir_rva != 0u && dir_size != 0u) {
+            tls_preserve_ranges.push_back({dir_rva, dir_size});
+        }
+        if (pe.tls.address_of_index >= image_base) {
+            const uint64_t r = pe.tls.address_of_index - image_base;
+            if (r < 0x80000000ULL) {
+                tls_preserve_ranges.push_back({static_cast<uint32_t>(r), 8u});
+            }
+        }
+        if (pe.tls.address_of_callbacks >= image_base) {
+            const uint64_t r = pe.tls.address_of_callbacks - image_base;
+            if (r < 0x80000000ULL) {
+                const size_t entries = pe.tls.callback_rvas.size() + 1u;
+                tls_preserve_ranges.push_back({
+                    static_cast<uint32_t>(r),
+                    static_cast<uint32_t>(entries * 8u)
+                });
+            }
+        }
+        if (pe.tls.raw_data_start >= image_base
+            && pe.tls.raw_data_end > pe.tls.raw_data_start) {
+            const uint64_t s = pe.tls.raw_data_start - image_base;
+            const uint64_t e = pe.tls.raw_data_end - image_base;
+            if (e > s && e < 0x80000000ULL) {
+                tls_preserve_ranges.push_back({
+                    static_cast<uint32_t>(s),
+                    static_cast<uint32_t>(e - s)
+                });
+            }
+        }
+    }
+
     if (opt.pack_sections) {
         for (auto& sec : pe.sections) {
             if (section_skip_list::is_skipped(sec.name)) {
@@ -2552,10 +2598,46 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
             if (sec.virtual_address == result.packed_section_rva) {
                 continue;
             }
-            std::memset(sec.data.data(), 0, sec.data.size());
-            sec.data.clear();
-            sec.raw_size = 0;
-            sec.raw_offset = 0;
+
+            const uint32_t s_start = sec.virtual_address;
+            const uint32_t s_end = sec.virtual_address + sec.virtual_size;
+            bool has_preserve = false;
+            for (const auto& pr : tls_preserve_ranges) {
+                const uint32_t p_end = pr.rva + pr.size;
+                if (pr.rva < s_end && p_end > s_start) {
+                    has_preserve = true;
+                    break;
+                }
+            }
+
+            if (!has_preserve) {
+                std::memset(sec.data.data(), 0, sec.data.size());
+                sec.data.clear();
+                sec.raw_size = 0;
+                sec.raw_offset = 0;
+            } else {
+                std::vector<uint8_t> keep(sec.data.size(), 0u);
+                for (const auto& pr : tls_preserve_ranges) {
+                    const uint32_t p_end = pr.rva + pr.size;
+                    if (pr.rva >= s_end || p_end <= s_start) {
+                        continue;
+                    }
+                    const uint32_t ov_start = (pr.rva > s_start) ? pr.rva : s_start;
+                    const uint32_t ov_end = (p_end < s_end) ? p_end : s_end;
+                    const size_t off_start = static_cast<size_t>(ov_start - s_start);
+                    const size_t off_end_raw = static_cast<size_t>(ov_end - s_start);
+                    const size_t off_end = (off_end_raw > sec.data.size())
+                        ? sec.data.size() : off_end_raw;
+                    for (size_t i = off_start; i < off_end; ++i) {
+                        keep[i] = 1u;
+                    }
+                }
+                for (size_t i = 0; i < sec.data.size(); ++i) {
+                    if (keep[i] == 0u) {
+                        sec.data[i] = 0u;
+                    }
+                }
+            }
         }
         pe.optional_header.DllCharacteristics &= static_cast<uint16_t>(~0x4160u);
         pe.data_directories[1].rva = 0;
