@@ -201,7 +201,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		bool clicked = ui_anim::row_hover_select(dl, pos_x, ry, left_w - 12.f, row_h,
 												  idx, g_ui.selected_module, alpha, ar, ag, ab);
-		float mod_row_alpha = ui_anim::render_row_entrance(idx, mod_first, dt, alpha);
+		float mod_row_alpha = ui_anim::render_row_entrance(idx, static_cast<float>(mod_first), dt, alpha);
 		(void)mod_row_alpha;
 		if (clicked)
 			load_module_details(idx);

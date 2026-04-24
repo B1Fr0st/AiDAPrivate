@@ -478,7 +478,7 @@ static std::string hpack_decode_string(const uint8_t* data, size_t len, size_t& 
     }
 
 
-    struct huff_entry { uint32_t code; uint8_t bits; uint8_t sym; };
+    struct huff_entry { uint32_t code; uint8_t bits; uint16_t sym; };
     static const huff_entry huff_table[] = {
         {0x1ff8, 13, 0}, {0x7fffd8, 23, 1}, {0xfffffe2, 28, 2}, {0xfffffe3, 28, 3},
         {0xfffffe4, 28, 4}, {0xfffffe5, 28, 5}, {0xfffffe6, 28, 6}, {0xfffffe7, 28, 7},

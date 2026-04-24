@@ -179,7 +179,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	const float strip_h = 44.f;
 	{
-		int total = 0, sym = 0, hash = 0, hi_conf = 0;
+		int total = 0, sym = 0, hash = 0, referenced = 0;
 		{
 			std::lock_guard<std::mutex> lk(cs.mutex);
 			total = static_cast<int>(cs.results.size());
@@ -187,23 +187,23 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				int cat = static_cast<int>(h.category);
 				if (cat == 0 || cat == 3 || cat == 4) sym++;
 				else if (cat == 1) hash++;
-				if (h.confidence >= 0.8f) hi_conf++;
+				if (!h.referencing_functions.empty()) referenced++;
 			}
 		}
 		char total_buf[16];
 		char sym_buf[16];
 		char hash_buf[16];
-		char conf_buf[16];
+		char ref_buf[16];
 		std::snprintf(total_buf, sizeof(total_buf), "%d", total);
 		std::snprintf(sym_buf, sizeof(sym_buf), "%d", sym);
 		std::snprintf(hash_buf, sizeof(hash_buf), "%d", hash);
-		std::snprintf(conf_buf, sizeof(conf_buf), "%d", hi_conf);
+		std::snprintf(ref_buf, sizeof(ref_buf), "%d", referenced);
 
 		ui_anim::stat_strip_item_t items[4];
-		items[0] = { "Hits",      total_buf, nullptr, 0, nullptr, 0, 0 };
-		items[1] = { "Cipher",    sym_buf,   nullptr, 0, nullptr, 0, 0 };
-		items[2] = { "Hash",      hash_buf,  nullptr, 0, nullptr, 0, 0 };
-		items[3] = { "High Conf", conf_buf,  nullptr, 0, nullptr, 0, 0 };
+		items[0] = { "Hits",       total_buf, nullptr, 0, nullptr, 0, 0 };
+		items[1] = { "Cipher",     sym_buf,   nullptr, 0, nullptr, 0, 0 };
+		items[2] = { "Hash",       hash_buf,  nullptr, 0, nullptr, 0, 0 };
+		items[3] = { "Referenced", ref_buf,   nullptr, 0, nullptr, 0, 0 };
 		ui_anim::render_stat_strip(dl, ox + 6.f, cy, width - 12.f, strip_h - 8.f,
 			items, 4, accent_r, accent_g, accent_b, alpha);
 	}

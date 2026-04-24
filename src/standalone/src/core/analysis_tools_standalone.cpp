@@ -539,7 +539,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			if (entry == 0)
 				return tool_result_t::error("invalid entry_address");
 
-			size_t max_insns = static_cast<size_t>(params.value("max_instructions", 10000));
+			uint32_t max_insns = static_cast<uint32_t>(params.value("max_instructions", 10000));
 
 			auto result = deobfuscation_engine::deobfuscate_function(entry, max_insns);
 
@@ -612,7 +612,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			uint64_t start = std::strtoull(start_str.c_str(), nullptr, 16);
 			uint64_t end = std::strtoull(end_str.c_str(), nullptr, 16);
-			size_t max_insns = static_cast<size_t>(params.value("max_instructions", 5000));
+			uint32_t max_insns = static_cast<uint32_t>(params.value("max_instructions", 5000));
 
 			auto result = symbolic_engine::slice_to_register(start, end, max_insns, reg);
 
@@ -654,7 +654,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			uint64_t start = std::strtoull(start_str.c_str(), nullptr, 16);
 			uint64_t target = std::strtoull(target_str.c_str(), nullptr, 16);
-			size_t max_insns = static_cast<size_t>(params.value("max_instructions", 5000));
+			uint32_t max_insns = static_cast<uint32_t>(params.value("max_instructions", 5000));
 
 			std::vector<std::string> sym_regs;
 			{
@@ -705,7 +705,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			uint64_t start = std::strtoull(start_str.c_str(), nullptr, 16);
 			uint64_t end = std::strtoull(end_str.c_str(), nullptr, 16);
-			size_t max_insns = static_cast<size_t>(params.value("max_instructions", 5000));
+			uint32_t max_insns = static_cast<uint32_t>(params.value("max_instructions", 5000));
 
 			std::vector<std::string> taint_regs;
 			{

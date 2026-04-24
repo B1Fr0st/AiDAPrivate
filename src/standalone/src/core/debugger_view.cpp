@@ -1049,7 +1049,7 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h,
 		auto& tr = st.trace_log[static_cast<size_t>(i)];
 		bool sel = (ui.trace_selected == i);
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		float row_a = ui_anim::render_row_entrance(i, first, ImGui::GetIO().DeltaTime, a);
+		float row_a = ui_anim::render_row_entrance(i, static_cast<float>(first), ImGui::GetIO().DeltaTime, a);
 		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, row_a, 1.f, ar, ag, ab});
 
 		char ibuf[12];
@@ -1119,7 +1119,7 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 		auto& sr = st.strings[static_cast<size_t>(i)];
 		bool sel = (ui.strings_selected == i);
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(ox, ry), ImVec2(ox + w, ry + ROW_HEIGHT), false);
-		float row_a = ui_anim::render_row_entrance(i, first, ImGui::GetIO().DeltaTime, a);
+		float row_a = ui_anim::render_row_entrance(i, static_cast<float>(first), ImGui::GetIO().DeltaTime, a);
 		ui_anim::render_table_row(dl, ox, ry, w, ROW_HEIGHT, {sel, hov, i, row_a, 1.f, ar, ag, ab});
 
 		char abuf[20];

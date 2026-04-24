@@ -294,7 +294,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float ry = list_y + idx * row_h - g_ui.scroll_y;
 		if (ry + row_h < list_y || ry > list_y + list_h) continue;
 
-		float row_alpha = ui_anim::render_row_entrance(idx, first_visible, dt, alpha);
+		float row_alpha = ui_anim::render_row_entrance(idx, static_cast<float>(first_visible), dt, alpha);
 		ui_anim::row_hover_select(dl, pos_x, ry, width - 12.f, row_h, idx, g_ui.selected, row_alpha, ar, ag, ab);
 
 		char tid_buf[16];

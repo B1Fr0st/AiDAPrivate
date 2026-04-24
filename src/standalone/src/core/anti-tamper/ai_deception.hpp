@@ -306,7 +306,7 @@ namespace fake_functions {
     inline __declspec(noinline) volatile int unhook_ntdll(volatile int module_base)
     {
         volatile int original = module_base ^ 0x4E544C4C;
-        volatile int mapped = (original << 9) ^ (original * 0x5DEECE66D);
+        volatile int mapped = (original << 9) ^ static_cast<int>(static_cast<int64_t>(original) * 0x5DEECE66DLL);
         volatile int restored = mapped ^ (mapped >> 13);
         return restored;
     }

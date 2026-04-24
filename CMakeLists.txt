@@ -24,9 +24,27 @@ add_subdirectory("${zydis_SOURCE_DIR}" "${zydis_BINARY_DIR}")
 if(MSVC AND TARGET Zycore)
     get_target_property(_zycore_opts Zycore INTERFACE_COMPILE_OPTIONS)
     if(_zycore_opts)
-        list(REMOVE_ITEM _zycore_opts "/wd4201")
-        list(APPEND _zycore_opts "$<$<COMPILE_LANGUAGE:C,CXX>:/wd4201>")
-        set_target_properties(Zycore PROPERTIES INTERFACE_COMPILE_OPTIONS "${_zycore_opts}")
+        set(_zycore_opts_scoped)
+        foreach(_opt IN LISTS _zycore_opts)
+            if(_opt STREQUAL "/wd4201" OR _opt MATCHES "^/wd[0-9]+$" OR _opt MATCHES "^/W[0-9]$" OR _opt STREQUAL "/WX")
+                list(APPEND _zycore_opts_scoped "$<$<COMPILE_LANGUAGE:C,CXX>:${_opt}>")
+            else()
+                list(APPEND _zycore_opts_scoped "${_opt}")
+            endif()
+        endforeach()
+        set_target_properties(Zycore PROPERTIES INTERFACE_COMPILE_OPTIONS "${_zycore_opts_scoped}")
+    endif()
+    get_target_property(_zycore_priv Zycore COMPILE_OPTIONS)
+    if(_zycore_priv)
+        set(_zycore_priv_scoped)
+        foreach(_opt IN LISTS _zycore_priv)
+            if(_opt STREQUAL "/wd4201" OR _opt MATCHES "^/wd[0-9]+$" OR _opt MATCHES "^/W[0-9]$" OR _opt STREQUAL "/WX")
+                list(APPEND _zycore_priv_scoped "$<$<COMPILE_LANGUAGE:C,CXX>:${_opt}>")
+            else()
+                list(APPEND _zycore_priv_scoped "${_opt}")
+            endif()
+        endforeach()
+        set_target_properties(Zycore PROPERTIES COMPILE_OPTIONS "${_zycore_priv_scoped}")
     endif()
 endif()
 set(UNICORN_BUILD_SHARED OFF CACHE BOOL "" FORCE)
@@ -117,10 +135,10 @@ set(sol2_SOURCE_DIR "${DEPS_DIR}/sol2")
 add_subdirectory("${sol2_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/.deps/sol2")
 
 if(MSVC AND TARGET x86_64-softmmu)
-    target_compile_options(x86_64-softmmu PRIVATE /wd4319)
+    target_compile_options(x86_64-softmmu PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:/wd4319>)
 endif()
 if(MSVC AND TARGET unicorn-common)
-    target_compile_options(unicorn-common PRIVATE /wd4319)
+    target_compile_options(unicorn-common PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:/wd4319>)
 endif()
 
 # --- Z3 (pre-built static library) ---
@@ -742,6 +760,7 @@ if(WIN32)
         target_compile_options(AiDAStandalone PRIVATE
             /W3
             /wd4005
+            /wd4099
             /EHsc
             /Zi
             /FS

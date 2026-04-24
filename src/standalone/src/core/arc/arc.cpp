@@ -460,7 +460,7 @@ bool decrypt_session_blob(encrypted_session_t* enc, session_data_t* out)
     __m128i nonce = _mm_set_epi64x(
         static_cast<long long>(enc->xor_mask),
         static_cast<long long>(prev_key));
-    uint8_t tmp[256];
+    alignas(16) uint8_t tmp[sizeof(session_data_t)];
     memcpy(tmp, enc->blob, sizeof(session_data_t));
     aes_ctr_crypt(tmp, sizeof(session_data_t), crypt_key, nonce);
     memcpy(out, tmp, sizeof(session_data_t));

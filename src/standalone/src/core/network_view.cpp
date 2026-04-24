@@ -7,19 +7,23 @@
 #include "ssl_keylog.hpp"
 #include "script_engine.hpp"
 #include "decoder_pipeline.hpp"
+#include "toast_notification.hpp"
 #include "ui_anim.hpp"
+#include "../helpers/helpers.h"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <commdlg.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <regex>
 #include <sstream>
@@ -3076,7 +3080,49 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
     ly += 8.f;
     ImGui::SetCursorPos(ImVec2(8.f, ly));
     if (ImGui::SmallButton("Load##scr")) {
+        char path_buf[MAX_PATH] = {};
+        OPENFILENAMEA ofn = {};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = g_hwnd;
+        ofn.lpstrFile = path_buf;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.lpstrFilter = "Lua Scripts\0*.lua\0All files\0*.*\0\0";
+        ofn.lpstrDefExt = "lua";
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
 
+        if (GetOpenFileNameA(&ofn)) {
+            std::string path_str(path_buf);
+            if (script_engine::load_script(path_str)) {
+                std::filesystem::path fp(path_str);
+                std::string stem = fp.stem().string();
+
+                bool updated = false;
+                for (auto& entry : state.scripts) {
+                    if (entry.name == stem) {
+                        entry.path = path_str;
+                        entry.loaded = true;
+                        entry.enabled = true;
+                        updated = true;
+                        break;
+                    }
+                }
+                if (!updated) {
+                    state_t::script_entry ne;
+                    ne.name = stem;
+                    ne.path = path_str;
+                    ne.enabled = true;
+                    ne.loaded = true;
+                    state.scripts.push_back(std::move(ne));
+                    state.script_selected = static_cast<int>(state.scripts.size()) - 1;
+                }
+                toast_notification::push(std::string("Loaded script: ") + stem,
+                                         toast_notification::toast_type_t::info);
+            }
+            else {
+                toast_notification::push(std::string("Failed to load script: ") + path_str,
+                                         toast_notification::toast_type_t::error);
+            }
+        }
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("Unload##scr") && state.script_selected >= 0 &&
