@@ -33,6 +33,7 @@
 #include "server_pages.hpp"
 #include "vm_compiler.hpp"
 #include "stolen_bytes.hpp"
+#include "vm_nested.hpp"
 #include "../standalone_anti_dump.hpp"
 #include "re_detection_engine.hpp"
 #include "ghost_veh.hpp"
@@ -40,6 +41,144 @@
 #include "../../../obfuscation.hpp"
 
 namespace anti_tamper {
+
+static constexpr uint32_t ATP_VIRTUALIZED    = 1u << 0;
+static constexpr uint32_t ATP_STOLEN_BYTES   = 1u << 1;
+static constexpr uint32_t ATP_NANOMITE       = 1u << 2;
+static constexpr uint32_t ATP_CALL_OBF       = 1u << 3;
+static constexpr uint32_t ATP_CODE_ENCRYPT   = 1u << 4;
+static constexpr uint32_t ATP_DECOY          = 1u << 5;
+static constexpr uint32_t ATP_PACKED         = 1u << 6;
+static constexpr uint32_t ATP_JIT            = 1u << 7;
+static constexpr uint32_t ATP_VM_NESTED      = 1u << 8;
+
+inline uint32_t resolve_export_rva(const char* name)
+{
+    if (!name) return 0u;
+    HMODULE h = GetModuleHandleW(nullptr);
+    if (!h) return 0u;
+    FARPROC p = GetProcAddress(h, name);
+    if (!p) return 0u;
+    uint64_t base = reinterpret_cast<uint64_t>(h);
+    uint64_t addr = reinterpret_cast<uint64_t>(p);
+    if (addr < base) return 0u;
+    uint64_t rva = addr - base;
+    if (rva >= 0x80000000ULL) return 0u;
+    return static_cast<uint32_t>(rva);
+}
+
+inline uint64_t resolve_rolling_key_for(uint32_t rva)
+{
+    uint64_t k0 = 0, k1 = 0;
+    integrity::get_session_keys(k0, k1);
+    uint64_t base = k0 ^ k1 ^ 0x9E3779B97F4A7C15ULL;
+    return base ^ (static_cast<uint64_t>(rva) * 0xBF58476D1CE4E5B9ULL)
+               ^ vm_nested::OUTER_ROLLING_SEED_MIX;
+}
+
+inline bool extract_inner_bytecode_by_rva(uint32_t rva, std::vector<uint8_t>& out)
+{
+    out.clear();
+    HMODULE h = GetModuleHandleW(nullptr);
+    if (!h) return false;
+    uint64_t va = reinterpret_cast<uint64_t>(h) + static_cast<uint64_t>(rva);
+    auto& ps = virtualizer::protection::get_state();
+    for (uint32_t i = 0; i < ps.count; ++i)
+    {
+        const auto& e = ps.entries[i];
+        if (!e.active) continue;
+        if (e.original_addr != va) continue;
+        if (e.bytecode.empty()) continue;
+        if (e.bytecode.size() > vm_nested::MAX_INNER_BYTECODE_BYTES) return false;
+        out = e.bytecode;
+        return true;
+    }
+    return false;
+}
+
+inline std::unordered_map<uint32_t, vm_nested::wrap_result_t>& nested_map()
+{
+    static std::unordered_map<uint32_t, vm_nested::wrap_result_t> m;
+    return m;
+}
+
+inline uint32_t vm_nested_count()
+{
+    return static_cast<uint32_t>(nested_map().size());
+}
+
+inline uint32_t apply_vm_nested_tags()
+{
+    auto& rt = state::get();
+    uint32_t applied = 0;
+
+    static const char* const kCriticalNames[] = {
+        "arc_validate_tool_exec",
+        "arc_heartbeat",
+        "arc_init",
+        "arc_download_page",
+        "arc_get_comm_bridge"
+    };
+
+    rt.vm_nested_rvas.clear();
+    for (const char* name : kCriticalNames)
+    {
+        uint32_t rva = resolve_export_rva(name);
+        if (rva == 0u)
+        {
+            std::string err = std::string("vm_nested_skip_export_missing:") + name;
+            webhook::write_log("init", err.c_str());
+            continue;
+        }
+        rt.vm_nested_rvas.push_back(rva);
+    }
+
+    for (uint32_t rva : rt.vm_nested_rvas)
+    {
+        std::vector<uint8_t> inner_bc;
+        if (!extract_inner_bytecode_by_rva(rva, inner_bc))
+        {
+            char dbg[96];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "vm_nested_no_inner_bytecode rva=0x%X", rva);
+            webhook::write_log("init", dbg);
+            continue;
+        }
+        if (!vm_nested::is_eligible(inner_bc.size()))
+        {
+            char dbg[96];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "vm_nested_ineligible rva=0x%X size=%zu", rva, inner_bc.size());
+            webhook::write_log("init", dbg);
+            continue;
+        }
+
+        uint32_t outer_rva = rva | 0x80000000u;
+        uint64_t inner_key = resolve_rolling_key_for(rva);
+
+        auto wrapped = vm_nested::wrap_critical(
+            inner_bc, state::g_vm_master_key, rva, outer_rva, inner_key);
+
+        if (!wrapped.ok)
+        {
+            char dbg[128];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "vm_nested_wrap_fail rva=0x%X err=%s", rva, vm_nested::last_error());
+            webhook::write_log("init", dbg);
+            continue;
+        }
+
+        nested_map()[rva] = std::move(wrapped);
+        rt.atp_flags[rva] |= ATP_VM_NESTED;
+        ++applied;
+    }
+
+    char dbg[64];
+    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+        "vm_nested_applied=%u", applied);
+    webhook::write_log("init", dbg);
+    return applied;
+}
 
 inline uint64_t guard_now_ms()
 {
@@ -164,6 +303,14 @@ inline bool initialize()
         rt.code_snap.text_size,
         rt.code_snap.text_hash);
     webhook::write_log("init", "virtualizer_ok");
+
+    {
+        uint32_t nested_applied = apply_vm_nested_tags();
+        char dbg[64];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "vm_nested_tags_applied=%u", nested_applied);
+        webhook::write_log("init", dbg);
+    }
 
     ghost_veh::initialize();
     {

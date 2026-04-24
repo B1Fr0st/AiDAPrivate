@@ -196,6 +196,10 @@ std::string phase_name(int bit) {
         case 4: return "ghost_veh";
         case 5: return "rdtsc";
         case 6: return "opaque";
+        case 7: return "ast_poison";
+        case 8: return "symexec_bombs";
+        case 9: return "llm_poison";
+        case 10: return "jit_enclave";
         default: return "bit" + std::to_string(bit);
     }
 }
@@ -265,10 +269,10 @@ int main(int argc, char** argv) {
         std::chrono::duration_cast<std::chrono::milliseconds>(v1 - v0).count();
 
 
-    uint32_t pf = rep.phase_flags & 0x7Fu;
+    uint32_t pf = rep.phase_flags & 0x7FFu;
     int phases_fired = 0;
     std::vector<std::string> names;
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 11; ++i) {
         if (pf & (1u << i)) { ++phases_fired; names.push_back(phase_name(i)); }
     }
 
@@ -288,7 +292,7 @@ int main(int argc, char** argv) {
     j << "  \"protect_exit_code\": " << pr.exit_code << ",\n";
     j << "  \"phase_flags\": " << (rep.phase_flags) << ",\n";
     j << "  \"phases_fired\": {\"count\": " << phases_fired
-      << ", \"total\": 7, \"names\": [";
+      << ", \"total\": 11, \"names\": [";
     for (size_t i = 0; i < names.size(); ++i) {
         if (i) { j << ", "; }
         j << quote(names[i]);

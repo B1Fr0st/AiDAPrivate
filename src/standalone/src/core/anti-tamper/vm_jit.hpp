@@ -14,9 +14,12 @@
 namespace anti_tamper {
 namespace vm_jit {
 
+#ifndef ATP_JIT_DISABLED
+
     static constexpr uint32_t JIT_THRESHOLD     = 256;
     static constexpr uint64_t JIT_CACHE_TTL_MS  = 5000;
     static constexpr uint32_t JIT_MAX_ENCLAVES  = 16;
+    static constexpr uint32_t JIT_MAX_BLOCK_LEN = 128;
 
     struct jit_enclave_t
     {
@@ -131,6 +134,82 @@ namespace vm_jit {
             buf.push_back(0x5F);
             buf.push_back(0x5E);
             buf.push_back(0x5B);
+        }
+
+        inline uint32_t scan_block_len(virtualizer::detail::vm_state_t& vm,
+                                       const uint8_t* bc, uint32_t bc_offset, uint32_t bc_size)
+        {
+            using namespace virtualizer::detail;
+
+            if (bc_offset >= bc_size)
+                return 0;
+
+            uint32_t cap = bc_size - bc_offset;
+            if (cap > JIT_MAX_BLOCK_LEN)
+                cap = JIT_MAX_BLOCK_LEN;
+
+            const uint8_t* reverse_map = vm.reverse_map;
+            uint64_t rolling = vm.rolling_key;
+            uint32_t p = bc_offset;
+            uint32_t end = bc_offset + cap;
+
+            auto fetch = [&](uint32_t& cursor) -> int {
+                if (cursor >= end) return -1;
+                uint8_t raw = bc[cursor++];
+                uint8_t kb = static_cast<uint8_t>(rolling & 0xFF);
+                rolling ^= rolling << 13;
+                rolling ^= rolling >> 7;
+                rolling ^= rolling << 17;
+                return raw ^ kb;
+            };
+
+            auto skip_bytes = [&](uint32_t n) -> bool {
+                for (uint32_t i = 0; i < n; ++i) {
+                    if (fetch(p) < 0) return false;
+                }
+                return true;
+            };
+
+            while (p < end)
+            {
+                int opc = fetch(p);
+                if (opc < 0) return 0;
+                uint8_t raw_opc = reverse_map[opc];
+
+                if (raw_opc == OP_LOAD_IMM)
+                {
+                    if (!skip_bytes(1)) return 0;
+                    if (!skip_bytes(8)) return 0;
+                }
+                else if (raw_opc == OP_LOAD_REG || raw_opc == OP_STORE_REG)
+                {
+                    if (!skip_bytes(2)) return 0;
+                }
+                else if (raw_opc == OP_ADD || raw_opc == OP_SUB || raw_opc == OP_XOR
+                      || raw_opc == OP_NAND || raw_opc == OP_NOR)
+                {
+                    if (!skip_bytes(3)) return 0;
+                }
+                else if (raw_opc == OP_SHL || raw_opc == OP_SHR)
+                {
+                    if (!skip_bytes(3)) return 0;
+                }
+                else if (raw_opc == OP_JMP || raw_opc == OP_JZ || raw_opc == OP_JNZ)
+                {
+                    if (!skip_bytes(4)) return 0;
+                    return p - bc_offset;
+                }
+                else if (raw_opc == OP_VRET)
+                {
+                    return p - bc_offset;
+                }
+                else
+                {
+                    return 0;
+                }
+            }
+
+            return 0;
         }
 
     }
@@ -311,6 +390,7 @@ namespace vm_jit {
         DWORD old = 0;
         if (!VirtualProtect(exec, sz, PAGE_EXECUTE_READ, &old))
         {
+            RtlSecureZeroMemory(exec, sz);
             VirtualFree(exec, 0, MEM_RELEASE);
             return false;
         }
@@ -334,25 +414,43 @@ namespace vm_jit {
         return fn(&vm.regs[0]);
     }
 
-    inline void try_attach_and_run(virtualizer::detail::vm_state_t& vm,
-                                   const uint8_t* bc, uint32_t bc_offset, uint32_t bc_len)
+    inline void advance_rip_and_count(virtualizer::detail::vm_state_t& vm,
+                                      const jit_enclave_t& enclave,
+                                      uint32_t bc_size)
+    {
+        uint64_t new_rip = static_cast<uint64_t>(enclave.bc_offset) + static_cast<uint64_t>(enclave.bc_len);
+        if (new_rip > bc_size)
+            new_rip = bc_size;
+        vm.rip = new_rip;
+        vm.insn_count += enclave.bc_len / 2;
+    }
+
+    inline bool attach_if_hot(virtualizer::detail::vm_state_t& vm,
+                              const uint8_t* bc, uint32_t bc_offset, uint32_t bc_size)
     {
         virtualizer::detail::handler_pool_t& pool =
             vm.pool ? *vm.pool : virtualizer::detail::g_default_pool;
 
-        expire_enclaves(pool);
-
         if (!should_jit(pool, bc_offset))
-            return;
+            return false;
 
         auto& vec = detail::enclaves_for(pool);
         if (vec.size() >= JIT_MAX_ENCLAVES)
-            return;
+            return false;
+
+        uint32_t bc_len = detail::scan_block_len(vm, bc, bc_offset, bc_size);
+        if (bc_len == 0)
+            return false;
 
         jit_enclave_t enc{};
         if (!compile_block(vm, bc, bc_offset, bc_len, enc))
-            return;
+            return false;
+
         vec.push_back(enc);
+        jit_enclave_t& installed = vec.back();
+        execute_enclave(installed, vm);
+        advance_rip_and_count(vm, installed, bc_size);
+        return true;
     }
 
     inline bool jit_entry(virtualizer::detail::vm_state_t& vm,
@@ -360,20 +458,34 @@ namespace vm_jit {
     {
         if (vm.halted || vm.rip >= bc_size)
             return false;
+
         virtualizer::detail::handler_pool_t& pool =
             vm.pool ? *vm.pool : virtualizer::detail::g_default_pool;
 
         expire_enclaves(pool);
-        try_attach_and_run(vm, bc, static_cast<uint32_t>(vm.rip),
-                           static_cast<uint32_t>(bc_size - vm.rip));
-        (void)pool;
-        return false;
+
+        uint32_t bc_offset = static_cast<uint32_t>(vm.rip);
+
+        auto& vec = detail::enclaves_for(pool);
+        for (auto& e : vec)
+        {
+            if (!e.active) continue;
+            if (e.bc_offset != bc_offset) continue;
+            if (!e.base) continue;
+            execute_enclave(e, vm);
+            advance_rip_and_count(vm, e, bc_size);
+            return true;
+        }
+
+        return attach_if_hot(vm, bc, bc_offset, bc_size);
     }
 
     inline bool s_hook_installed = []() {
         virtualizer::detail::g_jit_hook = &jit_entry;
         return true;
     }();
+
+#endif
 
 }
 }

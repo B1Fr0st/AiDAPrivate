@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace anti_tamper {
@@ -74,6 +75,9 @@ struct runtime_t
     uint32_t last_kernel_flags = 0;
     uint32_t kernel_flag_persist_count = 0;
     std::atomic<bool> license_pending_activation{false};
+
+    std::vector<uint32_t> vm_nested_rvas;
+    std::unordered_map<uint32_t, uint32_t> atp_flags;
 };
 
 inline runtime_t& get()

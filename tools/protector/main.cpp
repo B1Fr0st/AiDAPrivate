@@ -45,6 +45,10 @@ struct config_t {
     bool opaque_predicates = false;
     bool ast_poison = false;
     bool symexec_bombs = false;
+    bool llm_poison = false;
+    bool no_llm_poison_explicit = false;
+    bool jit = false;
+    bool no_jit_explicit = false;
     bool verbose = false;
     bool seed_provided = false;
     bool watermark_provided = false;
@@ -79,6 +83,9 @@ static void print_usage(std::FILE* out) {
         "  --opaque-predicates         Insert opaque predicates (Phase 6)\n"
         "  --ast-poison                Inject AST-poisoning debug section (Phase B.1)\n"
         "  --symexec-bombs             Inject symbolic-execution state-explosion bombs (Phase B.2)\n"
+        "  --llm-poison                Embed LLM-prompt-injection trap strings in .rdata (Phase B.3)\n"
+        "  --jit                       Declare JIT enclave presence in aux block (runtime must also be JIT-enabled)\n"
+        "  --no-jit                    Declare JIT disabled (e.g. for AiDA.dll inside IDA Pro's ACG)\n"
         "\n"
         "Aggregate:\n"
         "  -a, --all                   Enable all protections\n"
@@ -166,6 +173,18 @@ inline config_t parse_args(int argc, char** argv) {
             cfg.ast_poison = true;
         } else if (arg == "--symexec-bombs") {
             cfg.symexec_bombs = true;
+        } else if (arg == "--llm-poison") {
+            cfg.llm_poison = true;
+            cfg.no_llm_poison_explicit = false;
+        } else if (arg == "--no-llm-poison") {
+            cfg.llm_poison = false;
+            cfg.no_llm_poison_explicit = true;
+        } else if (arg == "--jit") {
+            cfg.jit = true;
+            cfg.no_jit_explicit = false;
+        } else if (arg == "--no-jit") {
+            cfg.jit = false;
+            cfg.no_jit_explicit = true;
         } else if (arg == "--encrypt-imports") {
             cfg.encrypt_imports = true;
         } else if (arg == "--encrypt-strings") {
@@ -210,6 +229,8 @@ inline config_t parse_args(int argc, char** argv) {
             cfg.opaque_predicates = true;
             cfg.ast_poison = true;
             cfg.symexec_bombs = true;
+            cfg.llm_poison = true;
+            cfg.jit = true;
         } else if (arg == "-v" || arg == "--verbose") {
             cfg.verbose = true;
         } else if (arg == "--seed") {
@@ -256,6 +277,8 @@ inline config_t parse_args(int argc, char** argv) {
             std::exit(1);
         }
     }
+    if (cfg.no_jit_explicit) { cfg.jit = false; }
+    if (cfg.no_llm_poison_explicit) { cfg.llm_poison = false; }
     if (cfg.input_path.empty() || cfg.output_path.empty()) {
         std::fprintf(stderr, "Error: --input and --output are required\n");
         print_usage(stderr);
@@ -321,6 +344,8 @@ inline int run(const config_t& cfg) {
     opt.opaque_predicates = cfg.opaque_predicates;
     opt.ast_poison = cfg.ast_poison;
     opt.symexec_bombs = cfg.symexec_bombs;
+    opt.llm_poison = cfg.llm_poison;
+    opt.jit = cfg.jit;
     opt.tamper_response_level = cfg.tamper_response_level;
     std::memcpy(opt.license_hash, cfg.license_hash, 16);
 
@@ -347,9 +372,11 @@ inline int run(const config_t& cfg) {
                      cfg.ghost_veh ? " ghost_veh" : "",
                      cfg.rdtsc_entangle ? " rdtsc_entangle" : "",
                      cfg.opaque_predicates ? " opaque_predicates" : "");
-        std::fprintf(stdout, "[+] Phase B flags:%s%s\n",
+        std::fprintf(stdout, "[+] Phase B flags:%s%s%s%s\n",
                      cfg.ast_poison ? " ast_poison" : "",
-                     cfg.symexec_bombs ? " symexec_bombs" : "");
+                     cfg.symexec_bombs ? " symexec_bombs" : "",
+                     cfg.llm_poison ? " llm_poison" : "",
+                     cfg.jit ? " jit" : "");
     }
 
     const uint32_t reloc_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].rva;

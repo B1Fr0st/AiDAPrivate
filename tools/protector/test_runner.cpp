@@ -119,5 +119,44 @@ int main(int argc, char** argv) {
     if (!exit_ok) { std::fprintf(stderr, "[FAIL] exit code %lu (expected 42)\n", out.exit_code); rc = 1; }
     if (!stdout_ok) { std::fprintf(stderr, "[FAIL] stdout missing PASS marker\n"); rc = 1; }
     if (rc == 0) { std::printf("[OK] round-trip PASS\n"); }
+
+    {
+        std::string out_path(output);
+        bool is_standalone = false;
+        if (out_path.size() >= 20u) {
+            std::string tail = out_path.substr(out_path.size() - 20u);
+            for (auto& ch : tail) {
+                if (ch >= 'A' && ch <= 'Z') { ch = static_cast<char>(ch + 32); }
+            }
+            if (tail.find("aidastandalone.exe") != std::string::npos) { is_standalone = true; }
+        }
+        if (!is_standalone) {
+            std::printf("GUI_SMOKE=SKIP\n");
+        } else {
+            STARTUPINFOA si2{};
+            si2.cb = sizeof(si2);
+            PROCESS_INFORMATION pi2{};
+            std::string cmd2 = std::string("\"") + output + "\"";
+            BOOL launched = CreateProcessA(nullptr, cmd2.data(), nullptr, nullptr, FALSE,
+                                            CREATE_NO_WINDOW, nullptr, nullptr, &si2, &pi2);
+            if (!launched) {
+                std::printf("GUI_SMOKE=SPAWN_FAIL\n");
+            } else {
+                DWORD waited = WaitForSingleObject(pi2.hProcess, 3000);
+                if (waited == WAIT_TIMEOUT) {
+                    TerminateProcess(pi2.hProcess, 0);
+                    WaitForSingleObject(pi2.hProcess, 2000);
+                    std::printf("GUI_SMOKE=RUNNING_3S_OK\n");
+                } else {
+                    DWORD ec = 0;
+                    GetExitCodeProcess(pi2.hProcess, &ec);
+                    std::printf("GUI_SMOKE=EXITED code=%lu\n", ec);
+                }
+                CloseHandle(pi2.hProcess);
+                CloseHandle(pi2.hThread);
+            }
+        }
+    }
+
     return rc;
 }

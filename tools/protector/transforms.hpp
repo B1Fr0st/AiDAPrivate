@@ -10,6 +10,7 @@
 #include <intrin.h>
 #include <immintrin.h>
 #include "pe_file.hpp"
+#include "llm_poison.hpp"
 #include <vector>
 #include <string>
 #include <cstring>
@@ -960,6 +961,8 @@ struct protect_options_t {
     bool opaque_predicates = false;
     bool ast_poison = false;
     bool symexec_bombs = false;
+    bool llm_poison = false;
+    bool jit = false;
     uint32_t tamper_response_level = 0;
     uint8_t  license_hash[16] = {0};
 };
@@ -977,7 +980,8 @@ struct section_skip_list {
         return name_equals(name, ".reloc")
             || name_equals(name, ".rsrc")
             || name_equals(name, ".gehi")
-            || name_equals(name, ".epheme");
+            || name_equals(name, ".epheme")
+            || name_equals(name, ".rdiag");
     }
 };
 
@@ -2464,6 +2468,8 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
         if (opt.opaque_predicates)  { pf |= 0x40u; }
         if (opt.ast_poison)         { pf |= 0x80u; }
         if (opt.symexec_bombs)      { pf |= 0x100u; }
+        if (opt.llm_poison)         { pf |= 0x200u; }
+        if (opt.jit)                { pf |= 0x400u; }
         aux.phase_flags = pf;
     }
     result.aux_size = static_cast<uint32_t>(sizeof(aux_block_t));
@@ -2500,6 +2506,9 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
     }
     if (opt.symexec_bombs) {
         (void)inject_symexec_bombs(pe, rng_seed ^ 0x5E7EC0BB1E1A7EDAull);
+    }
+    if (opt.llm_poison) {
+        (void)llm_poison::inject_llm_poison(pe, rng_seed ^ 0x11AB1E1A7EC0FFEEull);
     }
 
     std::vector<packed_section_blob_t> blobs;
