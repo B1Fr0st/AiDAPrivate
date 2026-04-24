@@ -384,6 +384,7 @@ inline int run(const config_t& cfg) {
     stub_cfg.resource_table_offset = result.layout.resource_table_offset;
     stub_cfg.master_key_offset = result.layout.master_key_offset;
     stub_cfg.seed = result.seed_used;
+    stub_cfg.polymorphic = cfg.polymorphic_stub;
 
     stub::generated_stub_t gen;
     try {
@@ -420,6 +421,15 @@ inline int run(const config_t& cfg) {
         return 3;
     }
 
+    if (!protector::patch_aux_signature(pe,
+                                         result.packed_section_rva,
+                                         result.layout,
+                                         gen.build_nonce,
+                                         gen.stub_signature_tag)) {
+        std::fprintf(stderr, "[!] failed to patch aux signature fields\n");
+        return 3;
+    }
+
     const uint32_t new_entry = result.packed_section_rva
                                 + result.layout.stub_offset
                                 + gen.main_stub_entry_offset;
@@ -433,6 +443,16 @@ inline int run(const config_t& cfg) {
         tls_installed = protector::install_tls_callback(pe, tls_rva);
     }
 
+    bool flatten_applied = false;
+    bool merge_applied = false;
+    if (cfg.flatten_entropy) {
+        flatten_applied = protector::apply_flatten_entropy(
+            pe, result.packed_section_rva, cfg.seed ^ 0xF1A7ULL, cfg.verbose);
+    }
+    if (cfg.merge_sections) {
+        merge_applied = protector::apply_merge_sections(pe, cfg.seed);
+    }
+
     try {
         pe_file::recalculate_headers(pe);
     } catch (const std::bad_alloc&) {
@@ -443,11 +463,13 @@ inline int run(const config_t& cfg) {
         return 3;
     }
 
-    if (pe.optional_header.AddressOfEntryPoint < result.packed_section_rva ||
-        pe.optional_header.AddressOfEntryPoint
-            >= result.packed_section_rva + pe.sections.back().virtual_size) {
-        std::fprintf(stderr, "[!] entry point not inside .packed section\n");
-        return 3;
+    {
+        uint32_t ep = pe.optional_header.AddressOfEntryPoint;
+        const pe_file::section_t* ep_sec = pe.section_from_rva(ep);
+        if (ep_sec == nullptr) {
+            std::fprintf(stderr, "[!] entry point not inside any section\n");
+            return 3;
+        }
     }
 
     try {
@@ -496,6 +518,10 @@ inline int run(const config_t& cfg) {
         std::fprintf(stdout, "[+] tls callback: %s\n",
                      tls_installed ? "installed"
                                    : (has_existing_tls ? "skipped" : "no existing tls directory"));
+        std::fprintf(stdout, "[+] flatten_entropy: %s\n",
+                     flatten_applied ? "applied" : (cfg.flatten_entropy ? "skipped" : "disabled"));
+        std::fprintf(stdout, "[+] merge_sections: %s\n",
+                     merge_applied ? "applied" : (cfg.merge_sections ? "skipped" : "disabled"));
         std::fprintf(stdout, "[+] write: %s (%llu bytes)\n",
                      cfg.output_path.c_str(),
                      static_cast<unsigned long long>(output_size));

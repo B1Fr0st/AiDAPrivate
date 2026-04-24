@@ -55,6 +55,7 @@ struct stub_config_t {
     uint32_t resource_table_offset;
     uint32_t master_key_offset;
     uint64_t seed;
+    bool     polymorphic = false;
 };
 
 struct generated_stub_t {
@@ -62,6 +63,8 @@ struct generated_stub_t {
     std::vector<uint8_t> tls_stub;
     uint32_t main_stub_entry_offset;
     uint32_t tls_stub_entry_offset;
+    uint64_t build_nonce = 0;
+    uint32_t stub_signature_tag = 0;
 };
 
 namespace reg {
@@ -238,13 +241,15 @@ inline void opaque_jz_jnz(std::vector<uint8_t>& buf, rng_t& rng) {
     static constexpr uint8_t kJz[] = { 0x74, 0x05 };
     raw(buf, kJz, 2);
     for (int i = 0; i < 5; ++i) { buf.push_back(rng.next8()); }
-    static constexpr uint8_t kJnz[] = { 0x75, 0x05 };
-    raw(buf, kJnz, 2);
+    static constexpr uint8_t kCmpRaxRax[] = { 0x48, 0x39, 0xC0 };
+    raw(buf, kCmpRaxRax, 3);
+    static constexpr uint8_t kJz2[] = { 0x74, 0x05 };
+    raw(buf, kJz2, 2);
     for (int i = 0; i < 5; ++i) { buf.push_back(rng.next8()); }
 }
 
 inline void fake_branch_over_junk(std::vector<uint8_t>& buf, rng_t& rng) {
-    static constexpr uint8_t kStcJc[] = { 0xF9, 0x73, 0x07 };
+    static constexpr uint8_t kStcJc[] = { 0xF9, 0x72, 0x07 };
     raw(buf, kStcJc, 3);
     for (int i = 0; i < 7; ++i) { buf.push_back(rng.next8()); }
 }
@@ -293,8 +298,13 @@ inline void emit_epilogue_and_jmp_oep(std::vector<uint8_t>& buf, uint32_t origin
     emit::add_rsp_imm32(buf, 0x1C8u);
     emit::raw(buf, internal::kEpilogueRestoreBlob, sizeof(internal::kEpilogueRestoreBlob));
     emit::mov_reg_imm32(buf, reg::RAX, original_entry_rva);
-    static constexpr uint8_t kAddRaxR12[] = { 0x4C, 0x01, 0xE0 };
-    emit::raw(buf, kAddRaxR12, 3);
+    static constexpr uint8_t kPebToRcx[] = {
+        0x65, 0x48, 0x8B, 0x0C, 0x25, 0x60, 0x00, 0x00, 0x00,
+        0x48, 0x8B, 0x49, 0x10
+    };
+    emit::raw(buf, kPebToRcx, sizeof(kPebToRcx));
+    static constexpr uint8_t kAddRaxRcx[] = { 0x48, 0x01, 0xC8 };
+    emit::raw(buf, kAddRaxRcx, 3);
     emit::jmp_reg(buf, reg::RAX);
 }
 
@@ -316,7 +326,7 @@ inline void emit_tls_body(std::vector<uint8_t>& buf) {
     emit::raw(buf, kTlsBody, sizeof(kTlsBody));
 }
 
-inline generated_stub_t generate(const stub_config_t& cfg) {
+inline generated_stub_t generate_legacy(const stub_config_t& cfg) {
     generated_stub_t out{};
     out.main_stub_entry_offset = 0u;
     out.tls_stub_entry_offset = 0u;
@@ -406,6 +416,23 @@ inline generated_stub_t generate(const stub_config_t& cfg) {
     (void)cfg.master_key_offset;
 
     return out;
+}
+
+}
+
+#ifndef AIDA_PROTECTOR_LEGACY_STUB
+#include "stub_polymorphic.hpp"
+#endif
+
+namespace stub {
+
+inline generated_stub_t generate(const stub_config_t& cfg) {
+#ifndef AIDA_PROTECTOR_LEGACY_STUB
+    if (cfg.polymorphic) {
+        return stub_poly::generate(cfg);
+    }
+#endif
+    return generate_legacy(cfg);
 }
 
 }

@@ -736,6 +736,7 @@ if(WIN32)
             SOL_ALL_SAFETIES_ON=1
             TRITON_Z3_INTERFACE
             GHIDRA_SPECS_DIR="${GHIDRA_SPECS_OUTPUT_DIR}"
+            AIDA_DEEP_STEAL=1
         )
 
         target_compile_options(AiDAStandalone PRIVATE
@@ -859,6 +860,7 @@ if(WIN32)
             _CRT_SECURE_NO_WARNINGS
             NOMINMAX
             WIN32_LEAN_AND_MEAN
+            AIDA_DEEP_STEAL=1
         )
 
         target_compile_options(AiDA_ARC PRIVATE
@@ -1127,8 +1129,51 @@ endif()
 
 # -- AiDA PE Protector (build tool) ----------------------------------
 option(BUILD_PROTECTOR "Build the AiDA PE Protector tool" ON)
+option(AIDA_PROTECTOR_LEGACY_STUB "Force legacy (pre-AsmJit) stub emitter for AiDAProtector" OFF)
 
 if(BUILD_PROTECTOR)
+    set(_aida_asmjit_src "${CMAKE_SOURCE_DIR}/libs/asmjit")
+    if(NOT AIDA_PROTECTOR_LEGACY_STUB AND NOT EXISTS "${_aida_asmjit_src}/CMakeLists.txt")
+        find_package(Git QUIET)
+        if(GIT_FOUND)
+            message(STATUS "AiDAProtector: fetching AsmJit into ${_aida_asmjit_src}")
+            file(MAKE_DIRECTORY "${_aida_asmjit_src}")
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" clone https://github.com/asmjit/asmjit.git "${_aida_asmjit_src}"
+                RESULT_VARIABLE _aida_asmjit_clone_res
+                OUTPUT_QUIET
+                ERROR_QUIET
+            )
+            if(_aida_asmjit_clone_res EQUAL 0)
+                execute_process(
+                    COMMAND "${GIT_EXECUTABLE}" -C "${_aida_asmjit_src}" checkout a465fe71ab3e5e91b8dea8a5c34b22dcfbe99a15
+                    RESULT_VARIABLE _aida_asmjit_co_res
+                    OUTPUT_QUIET
+                    ERROR_QUIET
+                )
+                if(NOT _aida_asmjit_co_res EQUAL 0)
+                    message(STATUS "AiDAProtector: pinned AsmJit commit checkout failed; using default HEAD")
+                endif()
+            else()
+                message(STATUS "AiDAProtector: AsmJit clone failed (network blocked?); LEGACY_STUB fallback will apply")
+                file(REMOVE_RECURSE "${_aida_asmjit_src}")
+            endif()
+        else()
+            message(STATUS "AiDAProtector: Git not found; cannot fetch AsmJit, LEGACY_STUB fallback will apply")
+        endif()
+    endif()
+
+    if(NOT AIDA_PROTECTOR_LEGACY_STUB AND EXISTS "${_aida_asmjit_src}/CMakeLists.txt")
+        set(ASMJIT_STATIC ON CACHE BOOL "Build asmjit as static library" FORCE)
+        set(ASMJIT_NO_INSTALL ON CACHE BOOL "Disable asmjit install rules" FORCE)
+        if(NOT TARGET asmjit)
+            add_subdirectory("${_aida_asmjit_src}" "${CMAKE_BINARY_DIR}/.deps/asmjit" EXCLUDE_FROM_ALL)
+        endif()
+        if(TARGET asmjit AND NOT TARGET asmjit::asmjit)
+            add_library(asmjit::asmjit ALIAS asmjit)
+        endif()
+    endif()
+
     add_executable(AiDAProtector
         tools/protector/main.cpp
     )
@@ -1148,6 +1193,14 @@ if(BUILD_PROTECTOR)
     )
 
     target_link_libraries(AiDAProtector PRIVATE bcrypt advapi32)
+
+    if(TARGET asmjit AND NOT AIDA_PROTECTOR_LEGACY_STUB)
+        target_link_libraries(AiDAProtector PRIVATE asmjit)
+        target_include_directories(AiDAProtector PRIVATE "${_aida_asmjit_src}/src")
+    else()
+        target_compile_definitions(AiDAProtector PRIVATE AIDA_PROTECTOR_LEGACY_STUB=1)
+        message(STATUS "AiDAProtector: building with legacy stub emitter (AsmJit unavailable or disabled)")
+    endif()
 
     set_target_properties(AiDAProtector PROPERTIES
         OUTPUT_NAME "aida_protector"
@@ -1224,6 +1277,36 @@ if(BUILD_PROTECTOR)
         OUTPUT_NAME "aida_test_payload"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
     )
+
+    # Wave 5: structured logger/reporter wrapping protector + verifier
+    add_executable(AiDAProtectorLogger tools/protector/protector_logger.cpp)
+    target_include_directories(AiDAProtectorLogger PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/protector
+    )
+    target_compile_definitions(AiDAProtectorLogger PRIVATE
+        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
+    )
+    target_compile_options(AiDAProtectorLogger PRIVATE
+        /W4 /EHsc /O2 /Zc:__cplusplus /permissive- /MD
+    )
+    target_link_libraries(AiDAProtectorLogger PRIVATE bcrypt advapi32)
+    set_target_properties(AiDAProtectorLogger PROPERTIES
+        OUTPUT_NAME "aida_protector_logger"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+    )
+    add_dependencies(AiDAProtectorLogger AiDAProtector AiDATestPayload)
+
+    option(BUILD_PROTECTOR_TESTS "Register CTest for the AiDA protector full matrix" ON)
+    if(BUILD_PROTECTOR_TESTS OR BUILD_TESTING)
+        enable_testing()
+        add_test(NAME protector_full_matrix
+                 COMMAND $<TARGET_FILE:AiDAProtectorLogger>
+                         --input  $<TARGET_FILE:AiDATestPayload>
+                         --output ${CMAKE_BINARY_DIR}/Release/protector_report.json
+                         --protector $<TARGET_FILE:AiDAProtector>)
+        set_tests_properties(protector_full_matrix PROPERTIES
+            PASS_REGULAR_EXPRESSION "\"probes_passed\": 20")
+    endif()
 endif()
 
 if(BUILD_PROTECTOR)
@@ -1232,7 +1315,7 @@ if(BUILD_PROTECTOR)
             COMMAND $<TARGET_FILE:AiDAProtector>
                 --input "$<TARGET_FILE:AiDAStandalone>"
                 --output "$<TARGET_FILE:AiDAStandalone>"
-                --all --verbose
+                --all --bind-machine --tamper-level 3 --verbose
             COMMENT "Protecting AiDAStandalone.exe..."
             VERBATIM
         )
@@ -1244,7 +1327,7 @@ if(BUILD_PROTECTOR)
             COMMAND $<TARGET_FILE:AiDAProtector>
                 --input "$<TARGET_FILE:AiDA_ARC>"
                 --output "$<TARGET_FILE:AiDA_ARC>"
-                --all --verbose
+                --all --tamper-level 2 --deep-steal --verbose
             COMMENT "Protecting aida_core.dll..."
             VERBATIM
         )
@@ -1256,7 +1339,7 @@ if(BUILD_PROTECTOR)
             COMMAND $<TARGET_FILE:AiDAProtector>
                 --input "$<TARGET_FILE:AiDA>"
                 --output "$<TARGET_FILE:AiDA>"
-                --all --verbose
+                --all --tamper-level 2 --verbose
             COMMENT "Protecting AiDA.dll..."
             VERBATIM
         )

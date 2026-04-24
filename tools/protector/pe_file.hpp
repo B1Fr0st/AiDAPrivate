@@ -13,6 +13,7 @@
 #include <fstream>
 #include <algorithm>
 #include <stdexcept>
+#include <cmath>
 
 namespace pe_file {
 
@@ -1353,6 +1354,204 @@ inline void write(const pe_image_t& pe, const std::string& path) {
     }
     out.write(reinterpret_cast<const char*>(output.data()), output.size());
     out.close();
+}
+
+inline uint32_t compute_section_entropy_fixed(const uint8_t* data, size_t size) {
+    if (data == nullptr || size == 0) {
+        return 0u;
+    }
+    uint64_t hist[256] = {0};
+    for (size_t i = 0; i < size; ++i) {
+        ++hist[data[i]];
+    }
+    double n = static_cast<double>(size);
+    double entropy = 0.0;
+    for (int i = 0; i < 256; ++i) {
+        if (hist[i] == 0) {
+            continue;
+        }
+        double p = static_cast<double>(hist[i]) / n;
+        entropy -= p * (std::log(p) / std::log(2.0));
+    }
+    if (entropy < 0.0) { entropy = 0.0; }
+    if (entropy > 8.0) { entropy = 8.0; }
+    return static_cast<uint32_t>(entropy * 1000.0 + 0.5);
+}
+
+inline std::string pick_plausible_section_name(uint64_t seed, const pe_image_t& pe) {
+    static const char* kNames[6] = {
+        ".text", ".code", ".CODE", ".lorem", ".rdata", ".data"
+    };
+    auto existing = [&](const char* n) -> bool {
+        size_t nl = 0;
+        while (nl < 8 && n[nl] != 0) { ++nl; }
+        for (const auto& s : pe.sections) {
+            char buf[9] = {0};
+            std::memcpy(buf, s.name, 8);
+            size_t bl = 0;
+            while (bl < 8 && buf[bl] != 0) { ++bl; }
+            if (bl == nl && std::memcmp(buf, n, nl) == 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+    uint32_t start = static_cast<uint32_t>(seed % 6u);
+    for (uint32_t i = 0; i < 6; ++i) {
+        const char* cand = kNames[(start + i) % 6u];
+        if (!existing(cand)) {
+            return std::string(cand);
+        }
+    }
+    return std::string();
+}
+
+inline bool merge_last_section_into(pe_image_t& pe, const std::string& new_name) {
+    if (pe.sections.size() < 2) {
+        return false;
+    }
+    size_t last_idx = pe.sections.size() - 1;
+    size_t tgt_idx = last_idx - 1;
+
+    section_t& tgt = pe.sections[tgt_idx];
+    section_t& last = pe.sections[last_idx];
+
+    uint32_t sa = pe.section_alignment();
+    uint32_t old_tgt_vsize_aligned = align_up((std::max)(tgt.virtual_size, tgt.raw_size), sa);
+    uint32_t expected_last_va = tgt.virtual_address + old_tgt_vsize_aligned;
+    if (last.virtual_address != expected_last_va) {
+        return false;
+    }
+    if ((tgt.characteristics & IMAGE_SCN_MEM_WRITE) != 0u &&
+        (last.characteristics & IMAGE_SCN_MEM_WRITE) == 0u) {
+        return false;
+    }
+
+    uint32_t old_tgt_vsize = old_tgt_vsize_aligned;
+    uint32_t new_content_start_rva = tgt.virtual_address + old_tgt_vsize;
+    int64_t delta = static_cast<int64_t>(new_content_start_rva) - static_cast<int64_t>(last.virtual_address);
+
+    uint32_t last_va_begin = last.virtual_address;
+    uint32_t last_va_end = last.virtual_address + (std::max)(last.virtual_size, last.raw_size);
+
+    auto in_last = [&](uint32_t rva) -> bool {
+        return rva != 0u && rva >= last_va_begin && rva < last_va_end;
+    };
+
+    size_t offset_in_merged = old_tgt_vsize;
+    std::vector<uint8_t> merged_data;
+    merged_data.reserve(static_cast<size_t>(offset_in_merged) + last.data.size());
+    if (!tgt.data.empty()) {
+        merged_data.insert(merged_data.end(), tgt.data.begin(), tgt.data.end());
+    }
+    if (merged_data.size() < offset_in_merged) {
+        merged_data.resize(offset_in_merged, 0);
+    } else if (merged_data.size() > offset_in_merged) {
+        merged_data.resize(offset_in_merged);
+    }
+    merged_data.insert(merged_data.end(), last.data.begin(), last.data.end());
+
+    uint32_t new_vsize = old_tgt_vsize + (std::max)(last.virtual_size, last.raw_size);
+    uint32_t new_raw_size = align_up(static_cast<uint32_t>(merged_data.size()), pe.file_alignment());
+    if (merged_data.size() < new_raw_size) {
+        merged_data.resize(new_raw_size, 0);
+    }
+
+    uint32_t merged_characteristics = tgt.characteristics
+                                       | IMAGE_SCN_MEM_READ
+                                       | IMAGE_SCN_MEM_EXECUTE;
+    if ((last.characteristics & IMAGE_SCN_MEM_WRITE) != 0u) {
+        merged_characteristics |= IMAGE_SCN_MEM_WRITE;
+    }
+    if ((last.characteristics & IMAGE_SCN_CNT_CODE) != 0u) {
+        merged_characteristics |= IMAGE_SCN_CNT_CODE;
+    }
+    if ((last.characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) != 0u) {
+        merged_characteristics |= IMAGE_SCN_CNT_INITIALIZED_DATA;
+    }
+
+    auto rebase = [&](uint32_t& rva) {
+        if (in_last(rva)) {
+            rva = static_cast<uint32_t>(static_cast<int64_t>(rva) + delta);
+        }
+    };
+
+    static const int kRebaseDirs[] = {
+        IMAGE_DIRECTORY_ENTRY_EXPORT,
+        IMAGE_DIRECTORY_ENTRY_IMPORT,
+        IMAGE_DIRECTORY_ENTRY_RESOURCE,
+        IMAGE_DIRECTORY_ENTRY_EXCEPTION,
+        IMAGE_DIRECTORY_ENTRY_BASERELOC,
+        IMAGE_DIRECTORY_ENTRY_DEBUG,
+        IMAGE_DIRECTORY_ENTRY_TLS
+    };
+    for (int d : kRebaseDirs) {
+        rebase(pe.data_directories[d].rva);
+        pe.optional_header.DataDirectory[d].VirtualAddress = pe.data_directories[d].rva;
+    }
+
+    uint32_t ep = pe.optional_header.AddressOfEntryPoint;
+    if (in_last(ep)) {
+        ep = static_cast<uint32_t>(static_cast<int64_t>(ep) + delta);
+        pe.optional_header.AddressOfEntryPoint = ep;
+    }
+
+    if (pe.has_tls && pe.data_directories[IMAGE_DIRECTORY_ENTRY_TLS].rva != 0u) {
+        uint64_t image_base = pe.optional_header.ImageBase;
+        uint64_t cb_va = pe.tls.address_of_callbacks;
+        if (cb_va >= image_base) {
+            uint32_t cb_rva_list = static_cast<uint32_t>(cb_va - image_base);
+            if (in_last(cb_rva_list)) {
+                cb_rva_list = static_cast<uint32_t>(static_cast<int64_t>(cb_rva_list) + delta);
+                pe.tls.address_of_callbacks = image_base + cb_rva_list;
+            }
+            uint32_t walk_rva = static_cast<uint32_t>(pe.tls.address_of_callbacks - image_base);
+            section_t* cb_sec = nullptr;
+            for (auto& s : pe.sections) {
+                uint32_t e = s.virtual_address + static_cast<uint32_t>(s.data.size());
+                if (walk_rva >= s.virtual_address && walk_rva < e) {
+                    cb_sec = &s;
+                    break;
+                }
+            }
+            if (cb_sec != nullptr) {
+                size_t off = walk_rva - cb_sec->virtual_address;
+                for (size_t i = 0; off + 8 <= cb_sec->data.size(); ++i) {
+                    uint64_t cb_entry = 0;
+                    std::memcpy(&cb_entry, cb_sec->data.data() + off, 8);
+                    if (cb_entry == 0) {
+                        break;
+                    }
+                    if (cb_entry >= image_base) {
+                        uint32_t rva_cb = static_cast<uint32_t>(cb_entry - image_base);
+                        if (in_last(rva_cb)) {
+                            uint64_t nv = image_base + static_cast<uint32_t>(
+                                static_cast<int64_t>(rva_cb) + delta);
+                            std::memcpy(cb_sec->data.data() + off, &nv, 8);
+                        }
+                    }
+                    off += 8;
+                }
+            }
+        }
+    }
+
+    tgt.data = std::move(merged_data);
+    tgt.virtual_size = new_vsize;
+    tgt.raw_size = new_raw_size;
+    tgt.characteristics = merged_characteristics;
+    if (!new_name.empty()) {
+        std::memset(tgt.name, 0, 8);
+        size_t copy_n = new_name.size();
+        if (copy_n > 8) { copy_n = 8; }
+        std::memcpy(tgt.name, new_name.data(), copy_n);
+    }
+
+    pe.sections.pop_back();
+    pe.file_header.NumberOfSections = static_cast<uint16_t>(pe.sections.size());
+
+    recalculate_headers(pe);
+    return true;
 }
 
 }

@@ -17,6 +17,114 @@
 namespace anti_tamper {
 namespace ai_deception {
 
+#pragma region OPAQUE_PREDICATES
+
+
+namespace opaque {
+
+    __forceinline uint64_t tls_seed() noexcept
+    {
+#if defined(_M_X64)
+        uint64_t teb_self = __readgsqword(0x30);
+#else
+        uint64_t teb_self = static_cast<uint64_t>(__readfsdword(0x18));
+#endif
+        return teb_self ^ 0x9E3779B97F4A7C15ULL;
+    }
+
+    __forceinline uint64_t mix_seed(uint64_t x) noexcept
+    {
+        x ^= x >> 33;
+        x *= 0xFF51AFD7ED558CCDULL;
+        x ^= x >> 33;
+        x *= 0xC4CEB9FE1A85EC53ULL;
+        x ^= x >> 33;
+        return x;
+    }
+
+}
+
+#define AIDA_OPAQUE_ALWAYS_TRUE(x)                                                 \
+    ((((static_cast<uint64_t>(x) | 1ULL) *                                         \
+       (static_cast<uint64_t>(x) | 1ULL)) & 1ULL) == 1ULL)
+
+#define AIDA_OPAQUE_ALWAYS_FALSE(x)                                                \
+    (((static_cast<uint64_t>(x) *                                                  \
+       (static_cast<uint64_t>(x) + 1ULL)) & 1ULL) != 0ULL)
+
+#define AIDA_OPAQUE_PARITY_INV(x)                                                  \
+    ((__popcnt64(static_cast<uint64_t>(x)) +                                       \
+      __popcnt64(~static_cast<uint64_t>(x))) == 64ULL)
+
+#define AIDA_OPAQUE_COLLATZ_EVEN(x)                                                \
+    ((((static_cast<uint64_t>(x) << 1) ^                                           \
+       (static_cast<uint64_t>(x) << 1)) & 1ULL) == 0ULL)
+
+#pragma endregion
+
+
+#pragma region PHASE_FLAG_READER
+
+
+namespace phase {
+
+    inline uint32_t read_phase_flags() noexcept
+    {
+        HMODULE h = GetModuleHandleW(nullptr);
+        if (!h) { return 0u; }
+        uint8_t* base = reinterpret_cast<uint8_t*>(h);
+        IMAGE_DOS_HEADER dos{};
+        std::memcpy(&dos, base, sizeof(dos));
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE) { return 0u; }
+        IMAGE_NT_HEADERS nt{};
+        std::memcpy(&nt, base + dos.e_lfanew, sizeof(nt));
+        if (nt.Signature != IMAGE_NT_SIGNATURE) { return 0u; }
+
+        const uint32_t kAuxMagic   = 0x4D585541u;
+        const uint32_t kAuxVersion = 0x00020000u;
+        const size_t   kPhaseOff   = 120;
+        const size_t   kAuxSize    = 176;
+
+        IMAGE_SECTION_HEADER* sec = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+            base + dos.e_lfanew + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER)
+                 + nt.FileHeader.SizeOfOptionalHeader);
+
+        for (unsigned i = 0; i < nt.FileHeader.NumberOfSections; ++i, ++sec)
+        {
+            uint8_t* p = base + sec->VirtualAddress;
+            size_t sz = sec->Misc.VirtualSize;
+            if (sz < kAuxSize || sz > 0x02000000u) { continue; }
+
+            for (size_t j = 0; j + kAuxSize <= sz; j += 4)
+            {
+                uint32_t mg = 0, ver = 0, pf = 0;
+                std::memcpy(&mg,  p + j,     4);
+                if (mg != kAuxMagic) { continue; }
+                std::memcpy(&ver, p + j + 4, 4);
+                if (ver != kAuxVersion) { continue; }
+                std::memcpy(&pf,  p + j + kPhaseOff, 4);
+                return pf;
+            }
+        }
+        return 0u;
+    }
+
+    inline uint32_t cached_phase_flags() noexcept
+    {
+        static uint32_t cached = read_phase_flags();
+        return cached;
+    }
+
+    inline bool opaque_predicates_active() noexcept
+    {
+        return (cached_phase_flags() & 0x40u) != 0u;
+    }
+
+}
+
+#pragma endregion
+
+
 namespace fake_functions {
 
     inline __declspec(noinline) volatile int validate_license_v2(volatile int seed)
@@ -716,6 +824,207 @@ namespace polymorphic_decoys {
 
 }
 
+#pragma region DENSE_PREDICATE_HONEYPOTS
+
+
+namespace dense_honeypots {
+
+    // TODO: Remove hardcoded AES key before prod: 2b7e151628aed2a6abf7158809cf4f3c
+    inline const volatile unsigned char g_aes128_key[16] = {
+        0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+        0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c
+    };
+
+    // FIXME: rotate this RSA-2048 modulus with the KMS before shipping
+    inline const volatile unsigned char g_rsa_priv_seed[32] = {
+        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+        0xFE, 0xED, 0xFA, 0xCE, 0x8B, 0xAD, 0xF0, 0x0D,
+        0xB1, 0x05, 0xF0, 0x0D, 0xD0, 0x0D, 0xFE, 0xED,
+        0xC0, 0x01, 0xD0, 0x0D, 0xAB, 0xAD, 0xBA, 0xBE
+    };
+
+    // NOTE: Session derivation constant for C2 channel - see proto spec v3.7
+    inline const volatile unsigned char g_session_salt[12] = {
+        0x13, 0x37, 0xC0, 0xDE, 0xF0, 0x0D, 0xBA, 0xAD,
+        0xF0, 0x0D, 0xCA, 0xFE
+    };
+
+    inline __declspec(noinline) volatile int decrypt_c2_channel(volatile int channel_id)
+    {
+        uint64_t seed = opaque::mix_seed(opaque::tls_seed() ^ static_cast<uint64_t>(channel_id));
+        volatile int state = channel_id ^ 0xC2DEC0DE;
+
+        if (AIDA_OPAQUE_ALWAYS_TRUE(seed))
+        {
+            for (int i = 0; i < 4; ++i)
+            {
+                state ^= static_cast<int>(g_aes128_key[(seed + i) & 0xF]);
+                state = (state << 5) | (static_cast<unsigned>(state) >> 27);
+                state += static_cast<int>(g_session_salt[(seed + i) & 0xB]);
+            }
+        }
+
+        if (AIDA_OPAQUE_ALWAYS_FALSE(seed ^ static_cast<uint64_t>(state)))
+        {
+            const volatile char* url = honey_strings::fake_c2_url_1;
+            const volatile char* auth = honey_strings::fake_jwt_token;
+            const volatile char* proto = honey_strings::fake_protocol;
+            state += static_cast<int>(url[0]) ^ static_cast<int>(auth[0]);
+            state ^= static_cast<int>(proto[0]) << 3;
+            for (int i = 0; i < 8; ++i)
+            {
+                state ^= static_cast<int>(g_rsa_priv_seed[i]);
+                state = (state * 0x9E3779B9) ^ (state >> 13);
+            }
+        }
+        else if (AIDA_OPAQUE_PARITY_INV(seed))
+        {
+            state ^= static_cast<int>(honey_strings::fake_aes_schedule[0]);
+            state += static_cast<int>(honey_strings::fake_rsa_modulus[0]);
+        }
+
+        return state ^ static_cast<int>(g_aes128_key[channel_id & 0xF]);
+    }
+
+    inline __declspec(noinline) volatile int verify_license_signature(volatile int challenge)
+    {
+        uint64_t seed = opaque::mix_seed(opaque::tls_seed() + static_cast<uint64_t>(challenge));
+        volatile int acc = challenge;
+
+        if (AIDA_OPAQUE_ALWAYS_TRUE(seed ^ 0xFEEDFACEDEADBEEFULL))
+        {
+            for (int i = 0; i < 6; ++i)
+            {
+                acc = (acc * 0x01000193) ^ static_cast<int>(g_rsa_priv_seed[i & 0x1F]);
+                acc ^= (acc << 11) ^ (acc >> 7);
+                acc += static_cast<int>(g_session_salt[i & 0xB]);
+            }
+        }
+
+        if (AIDA_OPAQUE_ALWAYS_FALSE(seed))
+        {
+            const volatile char* ep = honey_strings::fake_server_ep_1;
+            const volatile char* tok = honey_strings::fake_jwt_token;
+            const volatile char* pub = honey_strings::fake_ed25519_pub;
+            int sig = 0;
+            for (int i = 0; i < 16; ++i)
+            {
+                sig ^= static_cast<int>(ep[i & 0x3F]);
+                sig += static_cast<int>(tok[i & 0x3F]);
+                sig ^= static_cast<int>(pub[i & 0x3F]) << (i & 7);
+            }
+            acc ^= sig;
+        }
+        else if (AIDA_OPAQUE_COLLATZ_EVEN(seed))
+        {
+            acc ^= static_cast<int>(g_rsa_priv_seed[0]);
+        }
+
+        return acc ^ challenge;
+    }
+
+    inline __declspec(noinline) volatile int derive_session_key(volatile int peer_nonce)
+    {
+        uint64_t seed = opaque::mix_seed(opaque::tls_seed() * 0xA5A5A5A5ULL
+                                         + static_cast<uint64_t>(peer_nonce));
+        volatile int k = peer_nonce ^ 0x5E551043;
+
+        if (AIDA_OPAQUE_ALWAYS_TRUE(seed + 1ULL))
+        {
+            for (int r = 0; r < 8; ++r)
+            {
+                k ^= static_cast<int>(g_aes128_key[r & 0xF]);
+                k = (k << 3) | (static_cast<unsigned>(k) >> 29);
+                k += static_cast<int>(g_session_salt[r & 0xB]);
+                k ^= (r * 0x01000193);
+            }
+        }
+
+        if (AIDA_OPAQUE_ALWAYS_FALSE(seed | 0xFULL))
+        {
+            const volatile char* cfg = honey_strings::fake_config_1;
+            const volatile char* creds = honey_strings::fake_db_creds;
+            const volatile char* btc = honey_strings::fake_btc_wallet;
+            for (int i = 0; i < 12; ++i)
+            {
+                k ^= static_cast<int>(cfg[i]);
+                k += static_cast<int>(creds[i]);
+                k ^= static_cast<int>(btc[i]) << (i & 3);
+            }
+        }
+
+        if (AIDA_OPAQUE_PARITY_INV(seed ^ static_cast<uint64_t>(k)))
+        {
+            k ^= static_cast<int>(g_rsa_priv_seed[k & 0x1F]);
+        }
+
+        return k ^ static_cast<int>(g_session_salt[peer_nonce & 0xB]);
+    }
+
+    inline __declspec(noinline) volatile int stage_payload_decode(volatile int chunk_id)
+    {
+        uint64_t seed = opaque::mix_seed(opaque::tls_seed() ^
+                                         (static_cast<uint64_t>(chunk_id) * 0xCC9E2D51ULL));
+        volatile int state = chunk_id ^ 0x57A6E117;
+
+        if (AIDA_OPAQUE_ALWAYS_TRUE(seed))
+        {
+            for (int i = 0; i < 5; ++i)
+            {
+                state ^= static_cast<int>(g_aes128_key[(i * 3) & 0xF]);
+                state = (state * 0x85EBCA6B) ^ (state >> 13);
+            }
+        }
+
+        if (AIDA_OPAQUE_ALWAYS_FALSE(seed ^ 0xDEADC0DEULL))
+        {
+            const volatile char* ep2 = honey_strings::fake_server_ep_5;
+            const volatile char* tls = honey_strings::fake_tls_handshake;
+            for (int i = 0; i < 10; ++i)
+            {
+                state ^= static_cast<int>(ep2[i]);
+                state += static_cast<int>(tls[i & 9]) << (i & 5);
+            }
+        }
+
+        return state + static_cast<int>(g_session_salt[chunk_id & 0xB]);
+    }
+
+    using decoy_fn_t = volatile int (*)(volatile int);
+
+    inline volatile decoy_fn_t g_decoy_table[8] = { nullptr, nullptr, nullptr, nullptr,
+                                                    nullptr, nullptr, nullptr, nullptr };
+    inline volatile int g_decoy_sink = 0;
+
+    inline void install()
+    {
+        g_decoy_table[0] = &decrypt_c2_channel;
+        g_decoy_table[1] = &verify_license_signature;
+        g_decoy_table[2] = &derive_session_key;
+        g_decoy_table[3] = &stage_payload_decode;
+        g_decoy_table[4] = &decrypt_c2_channel;
+        g_decoy_table[5] = &verify_license_signature;
+        g_decoy_table[6] = &derive_session_key;
+        g_decoy_table[7] = &stage_payload_decode;
+
+        if (phase::opaque_predicates_active())
+        {
+            volatile int r = 0;
+            uint64_t s = opaque::tls_seed();
+            int seed_i = static_cast<int>(s & 0x7FFFFFFF);
+            r ^= g_decoy_table[0](seed_i ^ 0x11);
+            r ^= g_decoy_table[1](seed_i ^ 0x22);
+            r ^= g_decoy_table[2](seed_i ^ 0x33);
+            r ^= g_decoy_table[3](seed_i ^ 0x44);
+            g_decoy_sink = r;
+        }
+    }
+
+}
+
+#pragma endregion
+
+
 inline void initialize()
 {
     webhook::write_log("ai_deception", "enter");
@@ -746,6 +1055,9 @@ inline void initialize()
 
     mcp_decoy::start_decoy_pipe();
     webhook::write_log("ai_deception", "mcp_decoy_ok");
+
+    dense_honeypots::install();
+    webhook::write_log("ai_deception", "dense_honeypots_ok");
 
     webhook::send_debug_log("ai_deception", "all_deception_modules_active", false);
 }

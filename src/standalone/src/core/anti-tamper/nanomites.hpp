@@ -12,9 +12,18 @@
 
 #include "integrity.hpp"
 #include "cff.hpp"
+#include "ghost_veh.hpp"
 
 namespace anti_tamper {
 namespace nanomites {
+
+enum class nano_trap_t : uint8_t
+{
+    kInt3      = 0,
+    kInt2d     = 1,
+    kUd2       = 2,
+    kNullDeref = 3
+};
 
 namespace detail {
 
@@ -57,7 +66,8 @@ namespace detail {
         uint64_t         fall_through;
         condition_code_t condition;
         uint8_t          original_insn_len;
-        uint16_t         _pad;
+        uint8_t          trap_kind;
+        uint8_t          _pad;
         uint64_t         guard_hash[2];
     };
 
@@ -68,6 +78,7 @@ namespace detail {
         uint64_t         session_key[2];
         uint64_t         encryption_key;
         PVOID            veh_handle;
+        ghost_veh::registration_t ghost_reg{0};
         std::mutex       mtx;
         std::atomic<bool> initialized{false};
         std::atomic<uint64_t> dispatch_count{0};
@@ -185,16 +196,19 @@ namespace detail {
 
     inline void compute_guard_hash(uint64_t addr, uint64_t target,
                                    uint64_t fall_through, uint8_t cc,
+                                   uint8_t trap_kind,
                                    const uint64_t sip_key[2],
                                    uint64_t out[2])
     {
-        uint8_t data[32];
+        uint8_t data[40];
         memcpy(data, &addr, 8);
         memcpy(data + 8, &target, 8);
         memcpy(data + 16, &fall_through, 8);
         uint64_t cc_packed = static_cast<uint64_t>(cc);
         memcpy(data + 24, &cc_packed, 8);
-        siphash_128(data, 32, sip_key[0], sip_key[1], out[0], out[1]);
+        uint64_t tk_packed = static_cast<uint64_t>(trap_kind);
+        memcpy(data + 32, &tk_packed, 8);
+        siphash_128(data, 40, sip_key[0], sip_key[1], out[0], out[1]);
     }
 
 
@@ -213,7 +227,7 @@ namespace detail {
                 uint64_t expected[2];
                 compute_guard_hash(
                     tmp.int3_addr, tmp.taken_target, tmp.fall_through,
-                    tmp.condition, s.session_key, expected);
+                    tmp.condition, tmp.trap_kind, s.session_key, expected);
                 if (tmp.guard_hash[0] != expected[0] || tmp.guard_hash[1] != expected[1])
                 {
 
@@ -232,17 +246,94 @@ namespace detail {
 
     inline LONG CALLBACK nanomite_veh_handler(PEXCEPTION_POINTERS info)
     {
-        if (info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT)
-            return EXCEPTION_CONTINUE_SEARCH;
-
         auto& s = state();
         if (!s.initialized.load(std::memory_order_acquire))
             return EXCEPTION_CONTINUE_SEARCH;
 
+        DWORD ec = info->ExceptionRecord->ExceptionCode;
         uint64_t rip = static_cast<uint64_t>(info->ContextRecord->Rip);
 
-        const nanomite_entry_t* entry = lookup(rip);
+        const nanomite_entry_t* entry = nullptr;
+        uint8_t expected_trap = 0xFF;
+
+        if (ec == EXCEPTION_BREAKPOINT)
+        {
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(rip);
+            bool is_int3 = false;
+            bool is_int2d_here = false;
+            __try
+            {
+                if (p[0] == 0xCC) is_int3 = true;
+                else if (p[0] == 0xCD && p[1] == 0x2D) is_int2d_here = true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+
+            if (is_int3)
+            {
+                entry = lookup(rip);
+                expected_trap = static_cast<uint8_t>(nano_trap_t::kInt3);
+            }
+            else if (is_int2d_here)
+            {
+                entry = lookup(rip);
+                expected_trap = static_cast<uint8_t>(nano_trap_t::kInt2d);
+            }
+            else if (rip >= 2)
+            {
+                const uint8_t* pb = reinterpret_cast<const uint8_t*>(rip - 2);
+                __try
+                {
+                    if (pb[0] == 0xCD && pb[1] == 0x2D)
+                    {
+                        entry = lookup(rip - 2);
+                        expected_trap = static_cast<uint8_t>(nano_trap_t::kInt2d);
+                        if (entry)
+                            info->ContextRecord->Rip = rip - 2;
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER)
+                {
+                    return EXCEPTION_CONTINUE_SEARCH;
+                }
+            }
+        }
+        else if (ec == EXCEPTION_ILLEGAL_INSTRUCTION)
+        {
+            entry = lookup(rip);
+            expected_trap = static_cast<uint8_t>(nano_trap_t::kUd2);
+        }
+        else if (ec == EXCEPTION_ACCESS_VIOLATION)
+        {
+            if (info->ExceptionRecord->NumberParameters >= 2 &&
+                info->ExceptionRecord->ExceptionInformation[1] == 0)
+            {
+                const uint8_t* p = reinterpret_cast<const uint8_t*>(rip);
+                bool is_nd = false;
+                __try
+                {
+                    is_nd = (p[0] == 0x48 && p[1] == 0x8B && p[2] == 0x04 &&
+                             p[3] == 0x25 && p[4] == 0x00 && p[5] == 0x00 &&
+                             p[6] == 0x00 && p[7] == 0x00);
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER)
+                {
+                    return EXCEPTION_CONTINUE_SEARCH;
+                }
+                if (is_nd)
+                {
+                    entry = lookup(rip);
+                    expected_trap = static_cast<uint8_t>(nano_trap_t::kNullDeref);
+                }
+            }
+        }
+
         if (!entry)
+            return EXCEPTION_CONTINUE_SEARCH;
+
+        if (expected_trap != 0xFF && entry->trap_kind != expected_trap)
             return EXCEPTION_CONTINUE_SEARCH;
 
         s.dispatch_count.fetch_add(1, std::memory_order_relaxed);
@@ -258,6 +349,11 @@ namespace detail {
             info->ContextRecord->Rip = entry->fall_through;
 
         return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    inline long nanomite_ghost_handler(PEXCEPTION_POINTERS info, void*)
+    {
+        return nanomite_veh_handler(info);
     }
 
 
@@ -351,9 +447,28 @@ inline bool initialize()
     s.miss_count.store(0);
 
 
-    s.veh_handle = AddVectoredExceptionHandler(1, detail::nanomite_veh_handler);
-    if (!s.veh_handle)
-        return false;
+    if (ghost_veh::is_active())
+    {
+        s.ghost_reg = ghost_veh::register_handler(
+            ghost_veh::ex_kind::kAny,
+            detail::nanomite_ghost_handler, nullptr);
+        if (s.ghost_reg.id == 0)
+        {
+            s.veh_handle = AddVectoredExceptionHandler(1, detail::nanomite_veh_handler);
+            if (!s.veh_handle)
+                return false;
+        }
+        else
+        {
+            s.veh_handle = nullptr;
+        }
+    }
+    else
+    {
+        s.veh_handle = AddVectoredExceptionHandler(1, detail::nanomite_veh_handler);
+        if (!s.veh_handle)
+            return false;
+    }
 
     s.initialized.store(true, std::memory_order_release);
     return true;
@@ -398,9 +513,38 @@ inline uint32_t protect_function(uintptr_t func_addr, size_t func_size)
             entry.original_insn_len = jcc.insn_len;
 
 
+            uint64_t pick_h0 = 0, pick_h1 = 0;
+            {
+                uint8_t addr_bytes[8];
+                memcpy(addr_bytes, &jcc.addr, 8);
+                detail::siphash_128(addr_bytes, 8,
+                                    s.session_key[0] ^ 0xA5A5A5A5A5A5A5A5ULL,
+                                    s.session_key[1] ^ 0x5A5A5A5A5A5A5A5AULL,
+                                    pick_h0, pick_h1);
+            }
+            uint8_t trap_pick = static_cast<uint8_t>(pick_h0 & 0x3u);
+
+            if (trap_pick == static_cast<uint8_t>(nano_trap_t::kNullDeref) &&
+                jcc.insn_len < 7)
+            {
+                trap_pick = static_cast<uint8_t>(nano_trap_t::kInt3);
+            }
+            if (trap_pick == static_cast<uint8_t>(nano_trap_t::kInt2d) &&
+                jcc.insn_len < 2)
+            {
+                trap_pick = static_cast<uint8_t>(nano_trap_t::kInt3);
+            }
+            if (trap_pick == static_cast<uint8_t>(nano_trap_t::kUd2) &&
+                jcc.insn_len < 2)
+            {
+                trap_pick = static_cast<uint8_t>(nano_trap_t::kInt3);
+            }
+
+            entry.trap_kind = trap_pick;
+
             detail::compute_guard_hash(
                 entry.int3_addr, entry.taken_target, entry.fall_through,
-                entry.condition, s.session_key, entry.guard_hash);
+                entry.condition, entry.trap_kind, s.session_key, entry.guard_hash);
 
 
             detail::encrypt_entry(entry, s.encryption_key);
@@ -410,9 +554,31 @@ inline uint32_t protect_function(uintptr_t func_addr, size_t func_size)
 
 
             uint8_t* patch_site = const_cast<uint8_t*>(&code[offset]);
-            patch_site[0] = 0xCC;
-            for (uint8_t i = 1; i < jcc.insn_len; ++i)
-                patch_site[i] = 0x90;
+            switch (static_cast<nano_trap_t>(trap_pick))
+            {
+            case nano_trap_t::kInt2d:
+                patch_site[0] = 0xCD;
+                patch_site[1] = 0x2D;
+                for (uint8_t i = 2; i < jcc.insn_len; ++i) patch_site[i] = 0x90;
+                break;
+            case nano_trap_t::kUd2:
+                patch_site[0] = 0x0F;
+                patch_site[1] = 0x0B;
+                for (uint8_t i = 2; i < jcc.insn_len; ++i) patch_site[i] = 0x90;
+                break;
+            case nano_trap_t::kNullDeref:
+                patch_site[0] = 0x48; patch_site[1] = 0x8B;
+                patch_site[2] = 0x04; patch_site[3] = 0x25;
+                patch_site[4] = 0x00; patch_site[5] = 0x00;
+                patch_site[6] = 0x00; patch_site[7] = 0x00;
+                for (uint8_t i = 8; i < jcc.insn_len; ++i) patch_site[i] = 0x90;
+                break;
+            case nano_trap_t::kInt3:
+            default:
+                patch_site[0] = 0xCC;
+                for (uint8_t i = 1; i < jcc.insn_len; ++i) patch_site[i] = 0x90;
+                break;
+            }
 
             replaced++;
             offset += jcc.insn_len;
@@ -472,7 +638,7 @@ inline bool verify_table_integrity()
         uint64_t expected[2];
         detail::compute_guard_hash(
             tmp.int3_addr, tmp.taken_target, tmp.fall_through,
-            tmp.condition, s.session_key, expected);
+            tmp.condition, tmp.trap_kind, s.session_key, expected);
         if (expected[0] != tmp.guard_hash[0] || expected[1] != tmp.guard_hash[1])
             return false;
     }
@@ -497,6 +663,11 @@ inline void shutdown()
     {
         RemoveVectoredExceptionHandler(s.veh_handle);
         s.veh_handle = nullptr;
+    }
+    if (s.ghost_reg.id != 0)
+    {
+        ghost_veh::unregister_handler(s.ghost_reg);
+        s.ghost_reg.id = 0;
     }
 
 

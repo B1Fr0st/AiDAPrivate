@@ -34,6 +34,7 @@
 #include "stolen_bytes.hpp"
 #include "../standalone_anti_dump.hpp"
 #include "re_detection_engine.hpp"
+#include "ghost_veh.hpp"
 
 #include "../../../obfuscation.hpp"
 
@@ -116,6 +117,14 @@ inline bool initialize()
     webhook::write_log("init", "block_chain_ok");
 
     token_chain::initialize_keys();
+    {
+        uint32_t pf = ai_deception::phase::cached_phase_flags();
+        if (pf & 0x20u)
+        {
+            token_chain::enable_rdtsc_entangle(true);
+            webhook::write_log("init", "rdtsc_entangle_enabled");
+        }
+    }
     webhook::write_log("init", "token_chain_ok");
 
     {
@@ -149,6 +158,15 @@ inline bool initialize()
         rt.code_snap.text_hash);
     webhook::write_log("init", "virtualizer_ok");
 
+    ghost_veh::initialize();
+    {
+        char dbg[64];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "ghost_veh_active=%d flags=0x%x",
+            ghost_veh::is_active() ? 1 : 0, ghost_veh::get_flags());
+        webhook::write_log("init", dbg);
+    }
+
     code_encrypt::initialize(rt.code_snap.text_hash);
     webhook::write_log("init", "code_encrypt_ok");
 
@@ -178,6 +196,29 @@ inline bool initialize()
 
     server_pages::initialize();
     webhook::write_log("init", "server_pages_ok");
+
+#if defined(AIDA_DEEP_STEAL)
+    if (stolen_bytes::initialize())
+    {
+        webhook::write_log("init", "stolen_bytes_init_ok");
+        if (stolen_bytes::initialize_basic_blocks())
+        {
+            webhook::write_log("init", "stolen_bb_init_ok");
+            uint32_t stolen = stolen_bytes::auto_steal_from_self(8);
+            char dbg[64];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "deep_steal_count=%u", stolen);
+            webhook::write_log("init", dbg);
+        }
+        else
+        {
+            webhook::write_log("init", "stolen_bb_init_fail");
+        }
+    }
+    else
+    {
+        webhook::write_log("init", "stolen_bytes_init_fail");
+    }
+#endif
 
     if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
     {
@@ -348,6 +389,12 @@ inline bool guard()
         {
             CFF_EXIT(guard_cff);
         }
+        if (ghost_veh::is_active() && !ghost_veh::verify_detour())
+        {
+            webhook::send_debug_log("guard", "ghost_veh_unhooked", true);
+            enforce_violation("ghost_veh_unhooked", "");
+            CFF_EXIT(guard_cff);
+        }
         CFF_GOTO(guard_cff, 1);
     }
     CFF_STATE(guard_cff, 1)
@@ -506,6 +553,16 @@ inline bool guard()
             CFF_EXIT(guard_cff);
         }
         nanomites::rotate_keys();
+
+#if defined(AIDA_DEEP_STEAL)
+        bool bb_ok = stolen_bytes::verify_basic_blocks();
+        if (!bb_ok)
+        {
+            webhook::send_debug_log("guard", "stolen_basic_block_tamper", true);
+            enforce_violation("stolen_basic_block_tamper");
+            CFF_EXIT(guard_cff);
+        }
+#endif
 
         CFF_GOTO(guard_cff, 8);
     }

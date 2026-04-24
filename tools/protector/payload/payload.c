@@ -590,10 +590,14 @@ static uint8_t* find_packed_section(uint8_t* image_base, uint32_t* out_size) {
         uint32_t va = *(uint32_t*)(s + 12);
         uint32_t vsize = *(uint32_t*)(s + 8);
         if (va == 0u || vsize < 4u) { continue; }
-        uint32_t magic = *(uint32_t*)(image_base + va);
-        if (magic == IMG_MAGIC) {
-            if (out_size != 0) { *out_size = vsize; }
-            return image_base + va;
+        uint8_t* base = image_base + va;
+        uint32_t step = 8u;
+        for (uint32_t off = 0; off + 4u <= vsize; off += step) {
+            uint32_t magic = *(uint32_t*)(base + off);
+            if (magic == IMG_MAGIC) {
+                if (out_size != 0) { *out_size = vsize - off; }
+                return base + off;
+            }
         }
     }
     return 0;

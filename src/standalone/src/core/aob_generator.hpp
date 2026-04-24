@@ -199,7 +199,7 @@ inline bool should_wildcard_operand_bytes(const ZydisDecodedInstruction& instr,
 		}
 		if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
 			if (op.mem.base == ZYDIS_REGISTER_RIP) return true;
-			if (op.mem.disp.has_displacement && instr.raw.disp.size >= 32) return true;
+			if (op.mem.disp.size > 0 && instr.raw.disp.size >= 32) return true;
 		}
 	}
 	return false;

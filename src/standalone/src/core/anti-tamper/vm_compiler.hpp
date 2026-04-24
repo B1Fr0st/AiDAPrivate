@@ -1265,7 +1265,7 @@ namespace x86_lifter {
                     } else {
                         uint8_t base_reg = zydis_reg_to_vreg(di.ops[1].mem.base);
                         prog.emit_load_reg(dst, base_reg);
-                        if (di.ops[1].mem.disp.has_displacement && di.ops[1].mem.disp.value != 0) {
+                        if (di.ops[1].mem.disp.size > 0 && di.ops[1].mem.disp.value != 0) {
                             int64_t disp = di.ops[1].mem.disp.value;
                             prog.emit_load_imm(VREG_SCRATCH1, static_cast<uint64_t>(disp));
                             prog.emit_add(dst, dst, VREG_SCRATCH1);
@@ -1341,7 +1341,7 @@ namespace x86_lifter {
                 } else {
                     uint8_t base_reg = zydis_reg_to_vreg(di.ops[1].mem.base);
                     prog.emit_load_reg(VREG_SCRATCH0, base_reg);
-                    if (di.ops[1].mem.disp.has_displacement && di.ops[1].mem.disp.value != 0) {
+                    if (di.ops[1].mem.disp.size > 0 && di.ops[1].mem.disp.value != 0) {
                         prog.emit_load_imm(VREG_SCRATCH1, static_cast<uint64_t>(di.ops[1].mem.disp.value));
                         prog.emit_add(VREG_SCRATCH0, VREG_SCRATCH0, VREG_SCRATCH1);
                     }
@@ -1365,7 +1365,7 @@ namespace x86_lifter {
                 } else {
                     uint8_t base_reg = zydis_reg_to_vreg(di.ops[0].mem.base);
                     prog.emit_load_reg(VREG_SCRATCH0, base_reg);
-                    if (di.ops[0].mem.disp.has_displacement && di.ops[0].mem.disp.value != 0) {
+                    if (di.ops[0].mem.disp.size > 0 && di.ops[0].mem.disp.value != 0) {
                         prog.emit_load_imm(VREG_SCRATCH1, static_cast<uint64_t>(di.ops[0].mem.disp.value));
                         prog.emit_add(VREG_SCRATCH0, VREG_SCRATCH0, VREG_SCRATCH1);
                     }
@@ -1397,6 +1397,14 @@ namespace x86_lifter {
 
         prog.emit_junk(3);
         result.bytecode = prog.finalize();
+        return result;
+    }
+
+    inline lifted_result_t compile_basic_block(const uint8_t* code, size_t length,
+                                               uint64_t base_addr, uint64_t seed,
+                                               const uint8_t opcode_map[256])
+    {
+        lifted_result_t result = compile_function(code, length, base_addr, seed, opcode_map);
         return result;
     }
 

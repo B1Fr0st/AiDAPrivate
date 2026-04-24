@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cstddef>
+#include <cstdio>
 #include <array>
 #include <algorithm>
 
@@ -1810,7 +1811,8 @@ inline packed_section_layout_t build_packed_section(pe_file::pe_image_t& pe,
     }
     packed_name[7] = '\0';
 
-    uint32_t packed_chars = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_CNT_INITIALIZED_DATA;
+    uint32_t packed_chars = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE
+                            | IMAGE_SCN_CNT_CODE | IMAGE_SCN_CNT_INITIALIZED_DATA;
     pe_file::add_section(pe, packed_name, packed_chars, buf);
 
     layout.header_offset = 0u;
@@ -1842,6 +1844,120 @@ inline uint32_t collect_cpuid_fingerprint() {
     int regs[4] = {0, 0, 0, 0};
     __cpuid(regs, 1);
     return static_cast<uint32_t>(regs[0]);
+}
+
+namespace noise_sections {
+
+inline const std::vector<uint8_t>& get_pool() {
+    static const std::vector<uint8_t> pool = [](){
+        std::vector<uint8_t> p;
+        p.reserve(2048);
+        static const char* kStrs[] = {
+            "GetProcAddress", "kernel32.dll", "ntdll.dll", "user32.dll",
+            "LoadLibraryA", "LoadLibraryW", "FreeLibrary", "VirtualAlloc",
+            "VirtualProtect", "VirtualFree", "ExitProcess", "MessageBoxA",
+            "CreateFileA", "ReadFile", "WriteFile", "CloseHandle",
+            "HeapAlloc", "HeapFree", "GetLastError", "SetLastError",
+            "Sleep", "GetModuleHandleA", "GetCommandLineA", "GetEnvironmentStringsW",
+            "RSDS", "Microsoft Visual C++ Runtime Library",
+            "D:\\\\build\\\\src\\\\main.c", "D:\\\\build\\\\src\\\\util.c",
+            "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod ",
+            "tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, ",
+            "quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo. ",
+            "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum. "
+        };
+        static const uint8_t kBigrams[64][2] = {
+            {'t','h'},{'h','e'},{'i','n'},{'e','r'},{'a','n'},{'r','e'},{'o','n'},{'a','t'},
+            {'e','n'},{'n','d'},{'t','i'},{'e','s'},{'o','r'},{'t','e'},{'o','f'},{'e','d'},
+            {'i','s'},{'i','t'},{'a','l'},{'a','r'},{'s','t'},{'t','o'},{'n','t'},{'n','g'},
+            {'s','e'},{'h','a'},{'a','s'},{'o','u'},{'i','o'},{'l','e'},{'v','e'},{'c','o'},
+            {'m','e'},{'d','e'},{'h','i'},{'r','i'},{'r','o'},{'i','c'},{'n','e'},{'e','a'},
+            {'r','a'},{'r','o'},{'l','i'},{'l','l'},{'c','h'},{'e','l'},{'n','a'},{'u','r'},
+            {'w','a'},{'s','h'},{'n','o'},{'i','l'},{'d','i'},{'f','o'},{'o','m'},{'c','e'},
+            {'t','a'},{'e','c'},{'a','m'},{'i','g'},{'n','i'},{'i','r'},{'o','l'},{'l','o'}
+        };
+        for (const char* s : kStrs) {
+            size_t k = 0;
+            while (s[k] != 0 && p.size() < 1024) {
+                p.push_back(static_cast<uint8_t>(s[k]));
+                ++k;
+            }
+            if (p.size() < 1024) {
+                p.push_back(0x20);
+            }
+        }
+        size_t bi = 0;
+        while (p.size() < 2048) {
+            p.push_back(kBigrams[bi & 63][0]);
+            p.push_back(kBigrams[bi & 63][1]);
+            if ((bi & 7u) == 7u) { p.push_back(0x20); }
+            if ((bi & 31u) == 31u) { p.push_back(0x0A); }
+            ++bi;
+        }
+        p.resize(2048);
+        return p;
+    }();
+    return pool;
+}
+
+inline std::vector<uint8_t> generate_structured_noise(size_t target_size,
+                                                      uint32_t target_entropy_milli,
+                                                      uint64_t seed) {
+    std::vector<uint8_t> out;
+    if (target_size == 0) {
+        return out;
+    }
+    out.reserve(target_size);
+    const auto& pool = get_pool();
+
+    chacha_detail::chacha20_drbg drbg;
+    uint8_t seed32[32] = {0};
+    for (int i = 0; i < 4; ++i) {
+        uint64_t w = seed ^ (0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(i + 1));
+        std::memcpy(seed32 + i * 8, &w, 8);
+    }
+    drbg.init(seed32);
+
+    uint32_t ratio = 160u;
+    int tune_remaining = 4;
+    const size_t kChunk = 4096;
+    size_t pool_pos = 0;
+
+    while (out.size() < target_size) {
+        size_t chunk_n = (std::min)(kChunk, target_size - out.size());
+        for (size_t i = 0; i < chunk_n; ++i) {
+            uint8_t rnd;
+            drbg.get(&rnd, 1);
+            if (rnd < static_cast<uint8_t>(ratio)) {
+                out.push_back(pool[pool_pos % pool.size()]);
+                ++pool_pos;
+                if ((pool_pos & 0xFu) == 0u) {
+                    uint8_t skip;
+                    drbg.get(&skip, 1);
+                    pool_pos += static_cast<size_t>(skip & 0x0Fu);
+                }
+            } else {
+                uint8_t b;
+                drbg.get(&b, 1);
+                out.push_back(b);
+            }
+        }
+        if (tune_remaining > 0) {
+            uint32_t cur = pe_file::compute_section_entropy_fixed(out.data(), out.size());
+            if (cur > target_entropy_milli + 100u) {
+                if (ratio < 240u) { ratio += 20u; }
+            } else if (cur + 100u < target_entropy_milli) {
+                if (ratio > 30u) { ratio -= 20u; }
+            } else {
+                tune_remaining = 1;
+            }
+            --tune_remaining;
+        }
+    }
+
+    return out;
+}
+
 }
 
 inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_options_t& opt) {
@@ -2012,6 +2128,32 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
             sec.raw_size = 0;
             sec.raw_offset = 0;
         }
+        pe.optional_header.DllCharacteristics &= static_cast<uint16_t>(~0x4160u);
+        pe.data_directories[1].rva = 0;
+        pe.data_directories[1].size = 0;
+        pe.optional_header.DataDirectory[1].VirtualAddress = 0;
+        pe.optional_header.DataDirectory[1].Size = 0;
+        pe.data_directories[12].rva = 0;
+        pe.data_directories[12].size = 0;
+        pe.optional_header.DataDirectory[12].VirtualAddress = 0;
+        pe.optional_header.DataDirectory[12].Size = 0;
+        pe.data_directories[10].rva = 0;
+        pe.data_directories[10].size = 0;
+        pe.optional_header.DataDirectory[10].VirtualAddress = 0;
+        pe.optional_header.DataDirectory[10].Size = 0;
+        pe.data_directories[6].rva = 0;
+        pe.data_directories[6].size = 0;
+        pe.optional_header.DataDirectory[6].VirtualAddress = 0;
+        pe.optional_header.DataDirectory[6].Size = 0;
+        pe.data_directories[5].rva = 0;
+        pe.data_directories[5].size = 0;
+        pe.optional_header.DataDirectory[5].VirtualAddress = 0;
+        pe.optional_header.DataDirectory[5].Size = 0;
+        pe.data_directories[3].rva = 0;
+        pe.data_directories[3].size = 0;
+        pe.optional_header.DataDirectory[3].VirtualAddress = 0;
+        pe.optional_header.DataDirectory[3].Size = 0;
+        pe.file_header.Characteristics |= 0x0001u;
     }
 
     result.imports = std::move(imports);
@@ -2036,6 +2178,63 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
 
     result.success = true;
     return result;
+}
+
+inline bool apply_flatten_entropy(pe_file::pe_image_t& pe,
+                                   uint32_t packed_section_rva,
+                                   uint64_t seed,
+                                   bool verbose) {
+    pe_file::section_t* psec = pe.section_from_rva(packed_section_rva);
+    if (psec == nullptr || psec->data.empty()) {
+        return false;
+    }
+    uint32_t cur_ent = pe_file::compute_section_entropy_fixed(psec->data.data(), psec->data.size());
+    if (verbose) {
+        std::fprintf(stdout, "[+] flatten_entropy: start size=%zu ent=%u\n",
+                     psec->data.size(), cur_ent);
+    }
+    const uint32_t kTargetMax = 7100u;
+    const uint32_t kTargetMin = 6700u;
+    const uint32_t kNoiseEnt  = 6500u;
+    size_t step = 2048;
+    size_t iter = 0;
+    size_t cap = psec->data.size() * 4u + 0x40000u;
+    while (cur_ent > kTargetMax && psec->data.size() < cap) {
+        size_t size_before = psec->data.size();
+        uint32_t ent_before = cur_ent;
+        std::vector<uint8_t> noise = noise_sections::generate_structured_noise(
+            step, kNoiseEnt, seed ^ (0xE17D0u + static_cast<uint64_t>(iter) * 0x9E37u));
+        psec->data.insert(psec->data.end(), noise.begin(), noise.end());
+        cur_ent = pe_file::compute_section_entropy_fixed(psec->data.data(), psec->data.size());
+        if (verbose) {
+            std::fprintf(stdout, "[+] flatten_entropy: iter=%zu step=%zu size=%zu ent=%u\n",
+                         iter, step, psec->data.size(), cur_ent);
+        }
+        if (cur_ent < kTargetMin) {
+            psec->data.resize(size_before);
+            cur_ent = ent_before;
+            if (step > 64) { step /= 2; } else { break; }
+        }
+        ++iter;
+        if (iter > 128) { break; }
+    }
+    uint32_t fa = pe.file_alignment();
+    uint32_t padded = pe_file::align_up(static_cast<uint32_t>(psec->data.size()), fa);
+    if (padded > psec->data.size()) {
+        psec->data.resize(padded, 0);
+    }
+    psec->virtual_size = static_cast<uint32_t>(psec->data.size());
+    psec->raw_size = static_cast<uint32_t>(psec->data.size());
+    pe_file::recalculate_headers(pe);
+    return true;
+}
+
+inline bool apply_merge_sections(pe_file::pe_image_t& pe, uint64_t seed) {
+    if (pe.sections.size() < 2) {
+        return false;
+    }
+    std::string new_name = pe_file::pick_plausible_section_name(seed ^ 0x9E3779B97F4A7C15ULL, pe);
+    return pe_file::merge_last_section_into(pe, new_name);
 }
 
 inline bool protect_pe(pe_file::pe_image_t& pe, const protect_options_t& opt, std::string* error_out) {
@@ -2133,6 +2332,29 @@ inline bool write_stub_into_packed(pe_file::pe_image_t& pe,
         std::memcpy(sec->data.data() + layout.tls_stub_offset,
                     tls_stub.data(), tls_stub.size());
     }
+    return true;
+}
+
+inline bool patch_aux_signature(pe_file::pe_image_t& pe,
+                                 uint32_t packed_section_rva,
+                                 const packed_section_layout_t& layout,
+                                 uint64_t build_nonce,
+                                 uint32_t stub_signature_tag) {
+    pe_file::section_t* sec = pe.section_from_rva(packed_section_rva);
+    if (sec == nullptr) {
+        return false;
+    }
+    if (layout.aux_offset == 0u) {
+        return false;
+    }
+    if (static_cast<size_t>(layout.aux_offset) + sizeof(aux_block_t) > sec->data.size()) {
+        return false;
+    }
+    aux_block_t aux{};
+    std::memcpy(&aux, sec->data.data() + layout.aux_offset, sizeof(aux_block_t));
+    aux.polymorphic_build_nonce = build_nonce;
+    aux.stub_signature_tag = stub_signature_tag;
+    std::memcpy(sec->data.data() + layout.aux_offset, &aux, sizeof(aux_block_t));
     return true;
 }
 

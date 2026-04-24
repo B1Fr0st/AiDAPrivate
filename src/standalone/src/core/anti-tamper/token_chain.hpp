@@ -26,6 +26,68 @@ enum check_class_t : uint32_t
 
 namespace token_chain {
 
+#pragma region RDTSC_ENTANGLE
+    namespace detail {
+
+        inline std::atomic<bool>& rdtsc_entangle_enabled_flag()
+        {
+            static std::atomic<bool> v{false};
+            return v;
+        }
+
+        inline std::atomic<bool>& rdtsc_entangle_violation_flag()
+        {
+            static std::atomic<bool> v{false};
+            return v;
+        }
+
+        __forceinline uint64_t rdtsc_entangle_sample()
+        {
+            int regs[4] = {0, 0, 0, 0};
+            _mm_lfence();
+            uint64_t t0 = __rdtsc();
+            _mm_lfence();
+            __cpuid(regs, 0);
+            __cpuid(regs, 1);
+            __cpuid(regs, 0);
+            _mm_lfence();
+            uint64_t t1 = __rdtsc();
+            _mm_lfence();
+
+            uint64_t delta = t1 - t0;
+            uint32_t d32 = static_cast<uint32_t>(delta);
+
+            uint64_t teb_self = __readgsqword(0x30);
+
+            if (delta < 200ULL || delta > 200000ULL)
+            {
+                rdtsc_entangle_violation_flag().store(true, std::memory_order_release);
+                return (static_cast<uint64_t>(d32) ^ teb_self)
+                     ^ 0xDEADBEEFC0FFEE01ULL;
+            }
+
+            uint32_t feat = static_cast<uint32_t>(regs[0] ^ regs[1] ^ regs[2] ^ regs[3]);
+            return (static_cast<uint64_t>(d32) | (static_cast<uint64_t>(feat) << 32))
+                 ^ teb_self;
+        }
+    }
+
+    inline void enable_rdtsc_entangle(bool on)
+    {
+        detail::rdtsc_entangle_enabled_flag().store(on, std::memory_order_release);
+    }
+
+    inline bool is_rdtsc_entangle_enabled()
+    {
+        return detail::rdtsc_entangle_enabled_flag().load(std::memory_order_acquire);
+    }
+
+    inline bool rdtsc_entangle_violation_observed()
+    {
+        return detail::rdtsc_entangle_violation_flag().load(std::memory_order_acquire);
+    }
+#pragma endregion
+
     namespace detail {
 
         inline int64_t now_ms()
@@ -49,6 +111,30 @@ namespace token_chain {
             memcpy(buf + 24, &check_result, 8);
             return integrity::siphash::hash(buf, 32, k0, k1);
         }
+
+#pragma region RDTSC_ENTANGLE
+        __forceinline uint64_t mix_token_entangled(uint64_t check_result, uint64_t chain_prev,
+                                                    uint64_t rdtsc_val, uint64_t proof_hash,
+                                                    uint64_t k0, uint64_t k1)
+        {
+            uint64_t e0 = rdtsc_entangle_sample();
+            uint64_t e1 = rdtsc_entangle_sample();
+
+            uint8_t buf[48];
+            uint64_t a = check_result ^ chain_prev;
+            uint64_t b = rdtsc_val ^ proof_hash;
+            uint64_t c = MBA_TRANSFORM(e0, _rotl64(rdtsc_val, 7));
+            uint64_t d = MBA_TRANSFORM(e1, _rotl64(chain_prev, 17));
+            memcpy(buf, &a, 8);
+            memcpy(buf + 8, &b, 8);
+            memcpy(buf + 16, &chain_prev, 8);
+            memcpy(buf + 24, &check_result, 8);
+            memcpy(buf + 32, &c, 8);
+            memcpy(buf + 40, &d, 8);
+            return integrity::siphash::hash(buf, 48, k0, k1);
+        }
+#pragma endregion
+
 
         inline uint64_t run_fast_checks(state::runtime_t& rt)
         {
@@ -272,9 +358,20 @@ namespace token_chain {
             uint64_t tsc = __rdtscp(&aux);
             uint64_t prev = rt.chain.chain_accumulator.load(std::memory_order_acquire);
 
-            token = detail::mix_token(
-                check_result, prev, tsc, proof_hash,
-                rt.chain.siphash_key[0], rt.chain.siphash_key[1]);
+#pragma region RDTSC_ENTANGLE
+            if (detail::rdtsc_entangle_enabled_flag().load(std::memory_order_acquire))
+            {
+                token = detail::mix_token_entangled(
+                    check_result, prev, tsc, proof_hash,
+                    rt.chain.siphash_key[0], rt.chain.siphash_key[1]);
+            }
+            else
+#pragma endregion
+            {
+                token = detail::mix_token(
+                    check_result, prev, tsc, proof_hash,
+                    rt.chain.siphash_key[0], rt.chain.siphash_key[1]);
+            }
 
             rt.chain.chain_accumulator.store(
                 MBA_TRANSFORM(prev ^ token, _rotl64(tsc, 13)),

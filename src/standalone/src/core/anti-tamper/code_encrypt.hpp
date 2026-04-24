@@ -13,6 +13,9 @@
 
 #include "state.hpp"
 #include "integrity.hpp"
+#include "ghost_veh.hpp"
+#include "token_chain.hpp"
+#include "enforcement.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -200,6 +203,7 @@ namespace detail {
 }
 
 inline PVOID veh_handle = nullptr;
+inline ghost_veh::registration_t ghost_reg{ 0 };
 
 inline LONG CALLBACK code_guard_handler(EXCEPTION_POINTERS* ep)
 {
@@ -305,9 +309,39 @@ inline LONG CALLBACK code_guard_handler(EXCEPTION_POINTERS* ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+inline long code_guard_ghost_handler(PEXCEPTION_POINTERS ep, void*)
+{
+    return code_guard_handler(ep);
+}
+
 inline bool initialize(uint64_t code_hash)
 {
     if (detail::active().load()) return true;
+
+#pragma region RDTSC_ENTANGLE
+    if (token_chain::is_rdtsc_entangle_enabled())
+    {
+        uint64_t e_samples[4];
+        for (int i = 0; i < 4; ++i)
+            e_samples[i] = token_chain::detail::rdtsc_entangle_sample();
+
+        uint8_t buf[32];
+        memcpy(buf, e_samples, 32);
+        uint64_t k0 = 0, k1 = 0;
+        integrity::get_session_keys(k0, k1);
+        uint64_t entangle_hmac = integrity::siphash::hash(buf, 32, k0, k1);
+        (void)entangle_hmac;
+
+        if (token_chain::rdtsc_entangle_violation_observed())
+        {
+            auto& rt = state::get();
+            rt.violation_latched.store(true, std::memory_order_release);
+            rt.violation_reason = "rdtsc_entangle_hv_spoof";
+            enforcement_detail::silent_corrupt_text(1);
+            return false;
+        }
+    }
+#pragma endregion
 
     uint8_t ikm[32];
     if (BCryptGenRandom(nullptr, ikm, 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
@@ -318,8 +352,21 @@ inline bool initialize(uint64_t code_hash)
     detail::hkdf_hmac_sha256(salt, 8, ikm, 32, detail::session_prk());
     SecureZeroMemory(ikm, 32);
 
-    veh_handle = AddVectoredExceptionHandler(1, code_guard_handler);
-    if (!veh_handle) return false;
+    if (ghost_veh::is_active())
+    {
+        ghost_reg = ghost_veh::register_handler(
+            ghost_veh::ex_kind::kAny, code_guard_ghost_handler, nullptr);
+        if (ghost_reg.id == 0)
+        {
+            veh_handle = AddVectoredExceptionHandler(1, code_guard_handler);
+            if (!veh_handle) return false;
+        }
+    }
+    else
+    {
+        veh_handle = AddVectoredExceptionHandler(1, code_guard_handler);
+        if (!veh_handle) return false;
+    }
 
     detail::active().store(true);
     return true;
