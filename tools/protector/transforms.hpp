@@ -1645,7 +1645,9 @@ inline void init_from_u64_seed(rng_source& rs, uint64_t seed, bool seed_provided
 }
 
 inline std::vector<packed_section_blob_t> pack_sections(pe_file::pe_image_t& pe,
-                                                         const uint8_t master[32]) {
+                                                         const uint8_t master[32],
+                                                         uint32_t exception_rva,
+                                                         uint32_t exception_size) {
     std::vector<packed_section_blob_t> blobs;
 
     uint32_t reloc_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].rva;
@@ -1659,6 +1661,13 @@ inline std::vector<packed_section_blob_t> pack_sections(pe_file::pe_image_t& pe,
         }
         if (section_skip_list::is_skipped(sec.name)) {
             continue;
+        }
+        if (exception_rva != 0u && exception_size != 0u) {
+            const uint32_t sec_end = sec.virtual_address + sec.virtual_size;
+            const uint32_t exc_end = exception_rva + exception_size;
+            if (exception_rva < sec_end && exc_end > sec.virtual_address) {
+                continue;
+            }
         }
 
         uint32_t plain_crc = crc32c(sec.data.data(), sec.data.size());
@@ -2393,6 +2402,47 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
     result.master_key_pe_timestamp = pe.file_header.TimeDateStamp;
     result.master_key_pe_size_of_code = pe.optional_header.SizeOfCode;
 
+    const uint32_t original_exception_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_EXCEPTION].rva;
+    const uint32_t original_exception_size = pe.data_directories[IMAGE_DIRECTORY_ENTRY_EXCEPTION].size;
+
+    const uint32_t original_load_config_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].rva;
+    const uint32_t original_load_config_size = pe.data_directories[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].size;
+    const uint64_t image_base_for_lc = pe.optional_header.ImageBase;
+
+    struct cfg_pointer_range_t {
+        uint32_t rva;
+        uint32_t size;
+    };
+    std::vector<cfg_pointer_range_t> cfg_pointer_ranges;
+    if (original_load_config_rva != 0u && original_load_config_size >= 0x80u) {
+        const uint8_t* lc_ptr = pe.rva_ptr(original_load_config_rva);
+        if (lc_ptr != nullptr) {
+            auto add_pointer_target = [&](uint32_t struct_offset) {
+                if (struct_offset + 8u > original_load_config_size) return;
+                uint64_t va = 0;
+                std::memcpy(&va, lc_ptr + struct_offset, 8);
+                if (va < image_base_for_lc) return;
+                const uint64_t r64 = va - image_base_for_lc;
+                if (r64 >= 0x80000000ULL) return;
+                cfg_pointer_ranges.push_back({static_cast<uint32_t>(r64), 8u});
+            };
+            add_pointer_target(0x58u);
+            add_pointer_target(0x70u);
+            add_pointer_target(0x78u);
+            add_pointer_target(0xD0u);
+            add_pointer_target(0xD8u);
+            add_pointer_target(0xE8u);
+            add_pointer_target(0xF0u);
+            add_pointer_target(0xF8u);
+            add_pointer_target(0x100u);
+            add_pointer_target(0x108u);
+            add_pointer_target(0x118u);
+            add_pointer_target(0x120u);
+            add_pointer_target(0x128u);
+            add_pointer_target(0x138u);
+        }
+    }
+
     rng_detail::rng_source rng;
     rng_detail::init_from_u64_seed(rng, opt.seed, opt.seed_provided);
 
@@ -2518,7 +2568,7 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
 
     std::vector<packed_section_blob_t> blobs;
     if (opt.pack_sections) {
-        blobs = pack_sections(pe, master);
+        blobs = pack_sections(pe, master, original_exception_rva, original_exception_size);
     }
 
     std::vector<uint8_t> stub_code;
@@ -2551,6 +2601,15 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
         uint32_t size;
     };
     std::vector<tls_preserve_range_t> tls_preserve_ranges;
+    if (original_exception_rva != 0u && original_exception_size != 0u) {
+        tls_preserve_ranges.push_back({original_exception_rva, original_exception_size});
+    }
+    if (original_load_config_rva != 0u && original_load_config_size != 0u) {
+        tls_preserve_ranges.push_back({original_load_config_rva, original_load_config_size});
+    }
+    for (const auto& cpr : cfg_pointer_ranges) {
+        tls_preserve_ranges.push_back({cpr.rva, cpr.size});
+    }
     if (pe.has_tls) {
         const uint64_t image_base = pe.optional_header.ImageBase;
         const uint32_t dir_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_TLS].rva;
@@ -2660,10 +2719,6 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
         pe.data_directories[5].size = 0;
         pe.optional_header.DataDirectory[5].VirtualAddress = 0;
         pe.optional_header.DataDirectory[5].Size = 0;
-        pe.data_directories[3].rva = 0;
-        pe.data_directories[3].size = 0;
-        pe.optional_header.DataDirectory[3].VirtualAddress = 0;
-        pe.optional_header.DataDirectory[3].Size = 0;
         pe.file_header.Characteristics |= 0x0001u;
     }
 

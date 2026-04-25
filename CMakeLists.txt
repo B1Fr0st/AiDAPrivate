@@ -1378,7 +1378,7 @@ if(BUILD_PROTECTOR)
             COMMAND $<TARGET_FILE:AiDAProtector>
                 --input "$<TARGET_FILE:AiDAStandalone>"
                 --output "$<TARGET_FILE:AiDAStandalone>"
-                --all --bind-machine --tamper-level 3 --jit --no-llm-poison --verbose
+                --all --no-encrypt-imports --bind-machine --tamper-level 3 --jit --no-llm-poison --verbose
             COMMENT "Protecting AiDAStandalone.exe..."
             VERBATIM
         )
@@ -1390,7 +1390,7 @@ if(BUILD_PROTECTOR)
             COMMAND $<TARGET_FILE:AiDAProtector>
                 --input "$<TARGET_FILE:AiDA_ARC>"
                 --output "$<TARGET_FILE:AiDA_ARC>"
-                --all --tamper-level 2 --deep-steal --jit --no-llm-poison --verbose
+                --all --no-encrypt-imports --tamper-level 2 --deep-steal --jit --no-llm-poison --verbose
             COMMENT "Protecting aida_core.dll..."
             VERBATIM
         )
@@ -1402,7 +1402,7 @@ if(BUILD_PROTECTOR)
             COMMAND $<TARGET_FILE:AiDAProtector>
                 --input "$<TARGET_FILE:AiDA>"
                 --output "$<TARGET_FILE:AiDA>"
-                --all --tamper-level 2 --no-jit --no-llm-poison --verbose
+                --all --no-encrypt-imports --tamper-level 2 --no-jit --no-llm-poison --verbose
             COMMENT "Protecting AiDA.dll..."
             VERBATIM
         )

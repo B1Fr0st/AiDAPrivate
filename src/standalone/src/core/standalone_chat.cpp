@@ -36,6 +36,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "../helpers/diag_log.hpp"
+
 using json = nlohmann::json;
 
 extern DisasmState g_disasm;
@@ -1068,12 +1070,58 @@ void register_standalone_protection() {
 bool g_settings_open = false;
 
 
+__declspec(noinline) static DWORD seh_settings_load(settings_sa_t& s, bool& out_ok)
+{
+    out_ok = false;
+    __try {
+        out_ok = s.load();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_standalone_license_initialize(settings_sa_t& s, bool& out_ok)
+{
+    out_ok = false;
+    __try {
+        out_ok = standalone_license::initialize(s);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_register_standalone_protection_call()
+{
+    __try {
+        register_standalone_protection();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_restore_workspace_state()
+{
+    __try {
+        restore_workspace_state();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
 void init_standalone_chat()
 {
     if (s_initialized) return;
 
-
-    g_sa_settings.load();
+    diag::log_tagged("init_chat", "settings_load_start");
+    bool settings_loaded = false;
+    DWORD seh_load = seh_settings_load(g_sa_settings, settings_loaded);
+    if (seh_load != 0)
+        diag::log_tagged_fmt("init_chat", "settings_load_seh code=0x%08X last_err=%lu", seh_load, GetLastError());
+    diag::log_tagged_fmt("init_chat", "settings_load_done loaded=%d", settings_loaded ? 1 : 0);
 
 
     themes::active = std::clamp(g_sa_settings.active_theme_idx, 0, themes::count - 1);
@@ -1124,27 +1172,37 @@ void init_standalone_chat()
     themes::changed = true;
 
 
-    license::validated = standalone_license::initialize(g_sa_settings);
+    diag::log_tagged("init_chat", "license_initialize_start");
+    bool license_ok = false;
+    DWORD seh_lic = seh_standalone_license_initialize(g_sa_settings, license_ok);
+    if (seh_lic != 0)
+        diag::log_tagged_fmt("init_chat", "license_initialize_seh code=0x%08X last_err=%lu", seh_lic, GetLastError());
+    license::validated = license_ok;
     license::saved_key = g_sa_settings.license_key;
     strncpy_s(license::key_buf, sizeof(license::key_buf),
               g_sa_settings.license_key.c_str(), _TRUNCATE);
     if (!license::validated && !standalone_license::last_error().empty())
         license::error_msg = standalone_license::last_error();
     license::check_failed = !license::validated && !license::error_msg.empty();
+    diag::log_tagged_fmt("init_chat", "license_initialize_done validated=%d", license::validated ? 1 : 0);
 
-
+    diag::log_tagged("init_chat", "ai_client_create_start");
     g_sa_ai_client = std::make_unique<standalone_ai_client_t>(g_sa_settings);
+    diag::log_tagged("init_chat", "ai_client_create_done");
 
-
+    diag::log_tagged("init_chat", "mcp_register_tools_start");
     mcp_standalone::register_standalone_tools(s_mcp_server);
+    diag::log_tagged("init_chat", "mcp_register_tools_done");
     if (g_sa_settings.mcp_enabled) {
+        diag::log_tagged_fmt("init_chat", "mcp_server_start port=%d", g_sa_settings.mcp_port);
         if (s_mcp_server.start(g_sa_settings.mcp_port)) {
             s_server_started = true;
             s_mcp_server.write_client_configs();
         }
+        diag::log_tagged_fmt("init_chat", "mcp_server_start_done started=%d", s_server_started ? 1 : 0);
     }
 
-
+    diag::log_tagged_fmt("init_chat", "mcp_client_add_servers count=%zu", g_sa_settings.mcp_client_servers.size());
     for (const auto& srv : g_sa_settings.mcp_client_servers) {
         mcp_client::server_config_t cfg;
         cfg.name         = srv.name;
@@ -1167,10 +1225,12 @@ void init_standalone_chat()
         }
         s_mcp_client_mgr.add_server(cfg);
     }
+    diag::log_tagged("init_chat", "mcp_client_connect_all_start");
     s_mcp_client_mgr.connect_all();
     s_mcp_clients_connected = true;
+    diag::log_tagged("init_chat", "mcp_client_connect_all_done");
 
-
+    diag::log_tagged("init_chat", "marketplace_load_installed_start");
     mcp_marketplace::load_installed(g_sa_settings.marketplace_installed_json);
     {
         auto installed = mcp_marketplace::get_installed();
@@ -1179,10 +1239,23 @@ void init_standalone_chat()
                 mcp_marketplace::activate_server(srv);
         }
     }
+    diag::log_tagged("init_chat", "marketplace_load_installed_done");
 
+    diag::log_tagged("init_chat", "driver_bridge_initialize_start");
     driver_bridge::initialize();
-    register_standalone_protection();
-    restore_workspace_state();
+    diag::log_tagged("init_chat", "driver_bridge_initialize_done");
+
+    diag::log_tagged("init_chat", "register_standalone_protection_start");
+    DWORD seh_rsp = seh_register_standalone_protection_call();
+    if (seh_rsp != 0)
+        diag::log_tagged_fmt("init_chat", "register_standalone_protection_seh code=0x%08X last_err=%lu", seh_rsp, GetLastError());
+    diag::log_tagged("init_chat", "register_standalone_protection_done");
+
+    diag::log_tagged("init_chat", "restore_workspace_state_start");
+    DWORD seh_rws = seh_restore_workspace_state();
+    if (seh_rws != 0)
+        diag::log_tagged_fmt("init_chat", "restore_workspace_state_seh code=0x%08X last_err=%lu", seh_rws, GetLastError());
+    diag::log_tagged("init_chat", "restore_workspace_state_done");
 
     output_log::push(bottom_tab_t::output, "[init] AiDA Standalone initialized");
     output_log::push(bottom_tab_t::output, "[init] License: " + std::string(license::validated ? "valid" : "not validated"));

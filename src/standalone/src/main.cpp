@@ -27,6 +27,7 @@
 #include "helpers/stb_image.h"
 
 #include "core/embedded_resources.hpp"
+#include "helpers/diag_log.hpp"
 
 extern "C" {
 #include <openssl/applink.c>
@@ -130,44 +131,9 @@ void set_acrylic_color(HWND hwnd)
     SetWindowCompositionAttribute(hwnd, &data);
 }
 
-static char s_cached_log_dir[MAX_PATH] = {};
-static bool s_log_dir_cached = false;
-
-static void cache_log_dir()
-{
-    if (s_log_dir_cached) return;
-    DWORD ret = GetModuleFileNameA(nullptr, s_cached_log_dir, MAX_PATH);
-    if (ret == 0 || ret >= MAX_PATH) {
-        s_cached_log_dir[0] = '\0';
-    } else {
-        char* last = strrchr(s_cached_log_dir, '\\');
-        if (last) *(last + 1) = '\0';
-        else s_cached_log_dir[0] = '\0';
-    }
-    s_log_dir_cached = true;
-}
-
 static void crash_log_write(const char* msg)
 {
-    cache_log_dir();
-    char path[MAX_PATH];
-    _snprintf_s(path, sizeof(path), _TRUNCATE, "%saida_debug.log", s_cached_log_dir);
-    HANDLE hf = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hf == INVALID_HANDLE_VALUE) return;
-    SetFilePointer(hf, 0, nullptr, FILE_END);
-    SYSTEMTIME st{};
-    GetLocalTime(&st);
-    char line[2048];
-    int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
-        "[%02d:%02d:%02d.%03d] [main] %s\r\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
-    if (len > 0) {
-        DWORD written;
-        WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
-        FlushFileBuffers(hf);
-    }
-    CloseHandle(hf);
+    diag::log_tagged("main", msg);
 }
 
 static void crash_log_fmt(const char* fmt, ...)
@@ -177,7 +143,7 @@ static void crash_log_fmt(const char* fmt, ...)
     va_start(ap, fmt);
     _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
     va_end(ap);
-    crash_log_write(buf);
+    diag::log_tagged("main", buf);
 }
 
 __declspec(noinline) static DWORD seh_render_title(helpers* h, uint64_t frame_number)
@@ -210,9 +176,184 @@ __declspec(noinline) static DWORD seh_render_toast(uint64_t frame_number)
     return 0;
 }
 
+__declspec(noinline) static bool safe_read_qword(const void* p, uintptr_t& out)
+{
+    __try {
+        out = *reinterpret_cast<const uintptr_t*>(p);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out = 0;
+        return false;
+    }
+}
+
+__declspec(noinline) static DWORD seh_init_standalone_chat()
+{
+    __try {
+        init_standalone_chat();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_network_view_initialize()
+{
+    __try {
+        network_view::initialize();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_memory_scanner_initialize()
+{
+    __try {
+        memory_scanner::initialize();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_mitm_proxy_pre_initialize()
+{
+    __try {
+        mitm_proxy::pre_initialize();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_script_engine_initialize()
+{
+    __try {
+        script_engine::initialize();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_snapshot_code_hashes()
+{
+    __try {
+        standalone_license::snapshot_code_hashes();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_anti_tamper_initialize(bool& out_result)
+{
+    out_result = false;
+    __try {
+        out_result = anti_tamper::initialize();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_driver_bridge_initialize()
+{
+    __try {
+        driver_bridge::initialize();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
 int main(int, char**)
 {
     crash_log_write("main_enter");
+
+    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
+        standalone_anti_dump::handle_strip::clear_critical_flags();
+
+        char buf[4096];
+        HMODULE crash_mod = nullptr;
+        char crash_mod_name[MAX_PATH] = "<unknown>";
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(ep->ExceptionRecord->ExceptionAddress), &crash_mod);
+        if (crash_mod)
+            GetModuleFileNameA(crash_mod, crash_mod_name, MAX_PATH);
+
+        HMODULE exe_base = GetModuleHandleA(nullptr);
+        uintptr_t rip_offset = ep->ContextRecord->Rip - reinterpret_cast<uintptr_t>(exe_base);
+        uintptr_t addr_offset = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress) - reinterpret_cast<uintptr_t>(crash_mod);
+
+        char stack_buf[512] = {};
+        {
+            const uintptr_t* rsp_ptr = reinterpret_cast<const uintptr_t*>(ep->ContextRecord->Rsp);
+            int off = 0;
+            for (int i = 0; i < 12 && off < static_cast<int>(sizeof(stack_buf) - 32); ++i) {
+                uintptr_t v = 0;
+                if (!safe_read_qword(rsp_ptr + i, v)) break;
+                off += _snprintf_s(stack_buf + off, sizeof(stack_buf) - off, _TRUNCATE,
+                    "%s[%02d]=%016llX", (i == 0 ? "" : " "), i * 8,
+                    static_cast<unsigned long long>(v));
+            }
+        }
+
+        snprintf(buf, sizeof(buf),
+            "EXCEPTION: code=0x%08X addr=0x%016llX tid=%lu\n"
+            "CrashModule=%s ModuleOffset=0x%llX\n"
+            "ExeBase=0x%p RipOffsetFromExe=0x%llX\n"
+            "Flags=0x%08X NumParams=%lu\n"
+            "Info[0]=0x%016llX Info[1]=0x%016llX\n"
+            "Rax=%016llX Rcx=%016llX Rdx=%016llX Rbx=%016llX\n"
+            "Rsp=%016llX Rbp=%016llX Rsi=%016llX Rdi=%016llX\n"
+            "R8=%016llX R9=%016llX R10=%016llX R11=%016llX\n"
+            "R12=%016llX R13=%016llX R14=%016llX R15=%016llX\n"
+            "Rip=%016llX\n"
+            "Stack: %s\n"
+            "LastError=%lu\n",
+            ep->ExceptionRecord->ExceptionCode,
+            reinterpret_cast<unsigned long long>(ep->ExceptionRecord->ExceptionAddress),
+            GetCurrentThreadId(),
+            crash_mod_name,
+            static_cast<unsigned long long>(addr_offset),
+            exe_base,
+            static_cast<unsigned long long>(rip_offset),
+            ep->ExceptionRecord->ExceptionFlags,
+            ep->ExceptionRecord->NumberParameters,
+            ep->ExceptionRecord->NumberParameters > 0 ? ep->ExceptionRecord->ExceptionInformation[0] : 0ULL,
+            ep->ExceptionRecord->NumberParameters > 1 ? ep->ExceptionRecord->ExceptionInformation[1] : 0ULL,
+            ep->ContextRecord->Rax, ep->ContextRecord->Rcx,
+            ep->ContextRecord->Rdx, ep->ContextRecord->Rbx,
+            ep->ContextRecord->Rsp, ep->ContextRecord->Rbp,
+            ep->ContextRecord->Rsi, ep->ContextRecord->Rdi,
+            ep->ContextRecord->R8,  ep->ContextRecord->R9,
+            ep->ContextRecord->R10, ep->ContextRecord->R11,
+            ep->ContextRecord->R12, ep->ContextRecord->R13,
+            ep->ContextRecord->R14, ep->ContextRecord->R15,
+            ep->ContextRecord->Rip,
+            stack_buf,
+            GetLastError());
+
+        crash_log_write(buf);
+
+        char crash_path[MAX_PATH];
+        _snprintf_s(crash_path, sizeof(crash_path), _TRUNCATE, "%saida_crash.log", diag::resolve_log_dir());
+
+        HANDLE hf = CreateFileA(crash_path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf != INVALID_HANDLE_VALUE) {
+            DWORD written;
+            WriteFile(hf, buf, static_cast<DWORD>(strlen(buf)), &written, nullptr);
+            CloseHandle(hf);
+        }
+
+        anti_tamper::webhook::send_debug_log("crash", buf, true);
+
+        return EXCEPTION_CONTINUE_SEARCH;
+    });
+    crash_log_write("exception_filter_set");
 
     {
         auto r = anti_tamper::hv_preflight::run();
@@ -375,25 +516,53 @@ int main(int, char**)
     static std::atomic<bool> bg_init_done{false};
     globals::ui::bg_init_done = &bg_init_done;
     std::thread([]() {
-        init_standalone_chat();
-        crash_log_write("standalone_chat_init_ok");
-        network_view::initialize();
-        crash_log_write("network_view_init_ok");
-        memory_scanner::initialize();
-        crash_log_write("memory_scanner_init_ok");
-        mitm_proxy::pre_initialize();
-        crash_log_write("mitm_proxy_pre_init_ok");
-        script_engine::initialize();
-        crash_log_write("script_engine_init_ok");
+        diag::log_tagged("bg_init", "thread_entry");
 
-        standalone_license::snapshot_code_hashes();
-        crash_log_write("code_hashes_snapshot_ok");
+        diag::log_tagged("bg_init", "init_standalone_chat_start");
+        DWORD seh_chat = seh_init_standalone_chat();
+        if (seh_chat != 0)
+            diag::log_tagged_fmt("bg_init", "init_standalone_chat_seh code=0x%08X last_err=%lu", seh_chat, GetLastError());
+        diag::log_tagged("bg_init", "standalone_chat_init_ok");
 
-        crash_log_write("anti_tamper_initialize_entering");
-        bool at_result = anti_tamper::initialize();
-        crash_log_fmt("anti_tamper_initialize_result=%d", at_result ? 1 : 0);
+        diag::log_tagged("bg_init", "network_view_init_start");
+        DWORD seh_nv = seh_network_view_initialize();
+        if (seh_nv != 0)
+            diag::log_tagged_fmt("bg_init", "network_view_init_seh code=0x%08X last_err=%lu", seh_nv, GetLastError());
+        diag::log_tagged("bg_init", "network_view_init_ok");
+
+        diag::log_tagged("bg_init", "memory_scanner_init_start");
+        DWORD seh_ms = seh_memory_scanner_initialize();
+        if (seh_ms != 0)
+            diag::log_tagged_fmt("bg_init", "memory_scanner_init_seh code=0x%08X last_err=%lu", seh_ms, GetLastError());
+        diag::log_tagged("bg_init", "memory_scanner_init_ok");
+
+        diag::log_tagged("bg_init", "mitm_proxy_pre_init_start");
+        DWORD seh_mp = seh_mitm_proxy_pre_initialize();
+        if (seh_mp != 0)
+            diag::log_tagged_fmt("bg_init", "mitm_proxy_pre_init_seh code=0x%08X last_err=%lu", seh_mp, GetLastError());
+        diag::log_tagged("bg_init", "mitm_proxy_pre_init_ok");
+
+        diag::log_tagged("bg_init", "script_engine_init_start");
+        DWORD seh_se = seh_script_engine_initialize();
+        if (seh_se != 0)
+            diag::log_tagged_fmt("bg_init", "script_engine_init_seh code=0x%08X last_err=%lu", seh_se, GetLastError());
+        diag::log_tagged("bg_init", "script_engine_init_ok");
+
+        diag::log_tagged("bg_init", "code_hashes_snapshot_start");
+        DWORD seh_ch = seh_snapshot_code_hashes();
+        if (seh_ch != 0)
+            diag::log_tagged_fmt("bg_init", "code_hashes_snapshot_seh code=0x%08X last_err=%lu", seh_ch, GetLastError());
+        diag::log_tagged("bg_init", "code_hashes_snapshot_ok");
+
+        diag::log_tagged("bg_init", "anti_tamper_initialize_entering");
+        bool at_result = false;
+        DWORD seh_at = seh_anti_tamper_initialize(at_result);
+        if (seh_at != 0)
+            diag::log_tagged_fmt("bg_init", "anti_tamper_initialize_seh code=0x%08X last_err=%lu", seh_at, GetLastError());
+        diag::log_tagged_fmt("bg_init", "anti_tamper_initialize_result=%d", at_result ? 1 : 0);
 
         bg_init_done.store(true, std::memory_order_release);
+        diag::log_tagged("bg_init", "thread_exit");
     }).detach();
 
 
@@ -402,76 +571,14 @@ int main(int, char**)
     });
 
 
-    std::thread([] { driver_bridge::initialize(); }).detach();
+    std::thread([] {
+        diag::log_tagged("drv_init", "thread_entry");
+        DWORD seh_dbi = seh_driver_bridge_initialize();
+        if (seh_dbi != 0)
+            diag::log_tagged_fmt("drv_init", "driver_bridge_initialize_seh code=0x%08X last_err=%lu", seh_dbi, GetLastError());
+        diag::log_tagged("drv_init", "thread_exit");
+    }).detach();
     crash_log_write("driver_bridge_thread_launched");
-
-    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
-        standalone_anti_dump::handle_strip::clear_critical_flags();
-
-        char buf[4096];
-        HMODULE crash_mod = nullptr;
-        char crash_mod_name[MAX_PATH] = "<unknown>";
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCSTR>(ep->ExceptionRecord->ExceptionAddress), &crash_mod);
-        if (crash_mod)
-            GetModuleFileNameA(crash_mod, crash_mod_name, MAX_PATH);
-
-        HMODULE exe_base = GetModuleHandleA(nullptr);
-        uintptr_t rip_offset = ep->ContextRecord->Rip - reinterpret_cast<uintptr_t>(exe_base);
-        uintptr_t addr_offset = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress) - reinterpret_cast<uintptr_t>(crash_mod);
-
-        snprintf(buf, sizeof(buf),
-            "EXCEPTION: code=0x%08X addr=0x%016llX\n"
-            "CrashModule=%s ModuleOffset=0x%llX\n"
-            "ExeBase=0x%p RipOffsetFromExe=0x%llX\n"
-            "Flags=0x%08X NumParams=%lu\n"
-            "Info[0]=0x%016llX Info[1]=0x%016llX\n"
-            "Rax=%016llX Rcx=%016llX Rdx=%016llX Rbx=%016llX\n"
-            "Rsp=%016llX Rbp=%016llX Rsi=%016llX Rdi=%016llX\n"
-            "R8=%016llX R9=%016llX R10=%016llX R11=%016llX\n"
-            "R12=%016llX R13=%016llX R14=%016llX R15=%016llX\n"
-            "Rip=%016llX\n"
-            "LastError=%lu\n",
-            ep->ExceptionRecord->ExceptionCode,
-            reinterpret_cast<unsigned long long>(ep->ExceptionRecord->ExceptionAddress),
-            crash_mod_name,
-            static_cast<unsigned long long>(addr_offset),
-            exe_base,
-            static_cast<unsigned long long>(rip_offset),
-            ep->ExceptionRecord->ExceptionFlags,
-            ep->ExceptionRecord->NumberParameters,
-            ep->ExceptionRecord->NumberParameters > 0 ? ep->ExceptionRecord->ExceptionInformation[0] : 0ULL,
-            ep->ExceptionRecord->NumberParameters > 1 ? ep->ExceptionRecord->ExceptionInformation[1] : 0ULL,
-            ep->ContextRecord->Rax, ep->ContextRecord->Rcx,
-            ep->ContextRecord->Rdx, ep->ContextRecord->Rbx,
-            ep->ContextRecord->Rsp, ep->ContextRecord->Rbp,
-            ep->ContextRecord->Rsi, ep->ContextRecord->Rdi,
-            ep->ContextRecord->R8,  ep->ContextRecord->R9,
-            ep->ContextRecord->R10, ep->ContextRecord->R11,
-            ep->ContextRecord->R12, ep->ContextRecord->R13,
-            ep->ContextRecord->R14, ep->ContextRecord->R15,
-            ep->ContextRecord->Rip,
-            GetLastError());
-
-        crash_log_write(buf);
-
-        cache_log_dir();
-        char crash_path[MAX_PATH];
-        _snprintf_s(crash_path, sizeof(crash_path), _TRUNCATE, "%saida_crash.log", s_cached_log_dir);
-
-        HANDLE hf = CreateFileA(crash_path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hf != INVALID_HANDLE_VALUE) {
-            DWORD written;
-            WriteFile(hf, buf, static_cast<DWORD>(strlen(buf)), &written, nullptr);
-            CloseHandle(hf);
-        }
-
-        anti_tamper::webhook::send_debug_log("crash", buf, true);
-
-        return EXCEPTION_CONTINUE_SEARCH;
-    });
-    crash_log_write("exception_filter_set");
 
 
     ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);

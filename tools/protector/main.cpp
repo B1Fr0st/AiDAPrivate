@@ -187,6 +187,8 @@ inline config_t parse_args(int argc, char** argv) {
             cfg.no_jit_explicit = true;
         } else if (arg == "--encrypt-imports") {
             cfg.encrypt_imports = true;
+        } else if (arg == "--no-encrypt-imports") {
+            cfg.encrypt_imports = false;
         } else if (arg == "--encrypt-strings") {
             cfg.encrypt_strings = true;
         } else if (arg == "--encrypt-resources") {

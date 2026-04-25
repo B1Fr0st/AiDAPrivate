@@ -13,6 +13,7 @@
 #include <string>
 
 #include "../../../obfuscation.hpp"
+#include "../../helpers/diag_log.hpp"
 
 namespace anti_tamper {
 namespace hv_preflight {
@@ -272,22 +273,10 @@ inline bool xsetbv_probe()
     if (!cpu_supports_xsave())
         return false;
 
-    unsigned long long xcr0 = 0;
-    bool forwarded = false;
-    __try
-    {
-        xcr0 = _xgetbv(0);
-        if ((xcr0 & 1ULL) == 0)
-            return false;
-        _xsetbv(0, xcr0 & ~1ULL);
-        _xsetbv(0, xcr0);
-        forwarded = true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        forwarded = false;
-    }
-    return forwarded;
+    unsigned long long xcr0 = _xgetbv(0);
+    if ((xcr0 & 1ULL) == 0)
+        return false;
+    return false;
 }
 
 inline uint32_t timing_probe_median()
@@ -344,49 +333,77 @@ inline report_t run()
     r.result = result_t::allow;
     r.vendor[0] = L'\0';
 
-    if (detail::devmode_bypass_set())
-        return r;
+    diag::log_tagged("hv_pf", "enter");
 
+    if (detail::devmode_bypass_set())
+    {
+        diag::log_tagged("hv_pf", "devmode_bypass_return");
+        return r;
+    }
+
+    diag::log_tagged("hv_pf", "query_kernel_debugger_start");
     bool kd = false;
     detail::query_kernel_debugger(kd);
     r.kd_enabled = kd;
+    diag::log_tagged_fmt("hv_pf", "query_kernel_debugger_done kd=%d", kd ? 1 : 0);
 
+    diag::log_tagged("hv_pf", "query_code_integrity_start");
     ULONG ci_options = 0;
     bool ci_ok = detail::query_code_integrity(ci_options);
     r.hvci_enabled = ci_ok && (ci_options & detail::kCodeIntegrityHvciKmciEnabled) != 0;
     r.test_signing = ci_ok && (ci_options & detail::kCodeIntegrityTestSign) != 0;
+    diag::log_tagged_fmt("hv_pf", "query_code_integrity_done ok=%d opts=0x%lX", ci_ok ? 1 : 0, static_cast<unsigned long>(ci_options));
 
+    diag::log_tagged("hv_pf", "query_isolated_user_mode_start");
     detail::system_isolated_user_mode_information_t ium{};
     if (detail::query_isolated_user_mode(ium))
     {
         r.vbs_enabled = ium.SecureKernelRunning != 0;
         if (ium.HvciEnabled) r.hvci_enabled = true;
     }
+    diag::log_tagged("hv_pf", "query_isolated_user_mode_done");
 
+    diag::log_tagged("hv_pf", "read_cpuid_hv_bit_start");
     r.hv_bit_set = detail::read_cpuid_hv_bit();
+    diag::log_tagged_fmt("hv_pf", "read_cpuid_hv_bit_done set=%d", r.hv_bit_set ? 1 : 0);
 
     char vendor12[12] = {};
     if (r.hv_bit_set)
     {
+        diag::log_tagged("hv_pf", "read_hv_vendor_start");
         detail::read_hv_vendor(vendor12);
         for (int i = 0; i < 12; ++i)
             r.vendor[i] = static_cast<wchar_t>(static_cast<unsigned char>(vendor12[i]));
         r.vendor[12] = L'\0';
+        diag::log_tagged("hv_pf", "read_hv_vendor_done");
     }
 
+    diag::log_tagged("hv_pf", "scan_firmware_rsmb_start");
     r.firmware_hit = detail::scan_firmware_rsmb();
+    diag::log_tagged_fmt("hv_pf", "scan_firmware_rsmb_done hit=%d", r.firmware_hit ? 1 : 0);
+
+    diag::log_tagged("hv_pf", "scan_vm_processes_start");
     r.process_hit = detail::scan_vm_processes();
+    diag::log_tagged_fmt("hv_pf", "scan_vm_processes_done hit=%d", r.process_hit ? 1 : 0);
+
+    diag::log_tagged("hv_pf", "xsetbv_probe_start");
     r.xsetbv_forwarded = detail::xsetbv_probe();
+    diag::log_tagged_fmt("hv_pf", "xsetbv_probe_done fwd=%d", r.xsetbv_forwarded ? 1 : 0);
+
+    diag::log_tagged("hv_pf", "timing_probe_start");
     r.timing_median = detail::timing_probe_median();
+    diag::log_tagged_fmt("hv_pf", "timing_probe_done median=%u", r.timing_median);
 
     if (r.kd_enabled)
     {
         r.result = result_t::refuse_kernel_debug;
+        diag::log_tagged("hv_pf", "decision=refuse_kernel_debug");
         return r;
     }
     if (r.test_signing)
     {
         r.result = result_t::refuse_test_signing;
+        diag::log_tagged("hv_pf", "decision=refuse_test_signing");
         return r;
     }
 
@@ -400,33 +417,39 @@ inline report_t run()
         if (!genuine_ms)
         {
             r.result = result_t::refuse_hv;
+            diag::log_tagged("hv_pf", "decision=refuse_hv_ms_not_genuine");
             return r;
         }
 
         g_ms_hv_approved = true;
         r.result = result_t::allow;
+        diag::log_tagged("hv_pf", "decision=allow_ms_hv");
         return r;
     }
 
     if (known_non_ms)
     {
         r.result = result_t::refuse_hv;
+        diag::log_tagged("hv_pf", "decision=refuse_hv_known_non_ms");
         return r;
     }
 
     if (r.hv_bit_set)
     {
         r.result = result_t::refuse_hv;
+        diag::log_tagged("hv_pf", "decision=refuse_hv_bit_set");
         return r;
     }
 
     if (r.firmware_hit)
     {
         r.result = result_t::refuse_hv;
+        diag::log_tagged("hv_pf", "decision=refuse_hv_firmware_hit");
         return r;
     }
 
     r.result = result_t::allow;
+    diag::log_tagged("hv_pf", "decision=allow");
     return r;
 }
 

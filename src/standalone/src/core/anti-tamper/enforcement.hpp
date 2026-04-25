@@ -200,6 +200,36 @@ namespace enforcement_detail {
         }
     }
 
+    static void violation_post_impl(int round)
+    {
+        try {
+            std::string host = get_payload_host();
+            httplib::Client cli(host);
+            cli.set_address_family(AF_INET);
+            cli.set_connection_timeout(5);
+            cli.set_read_timeout(5);
+            cli.enable_server_certificate_verification(true);
+
+            nlohmann::json body;
+            body["session_token"] = standalone_license::get_session_token();
+            body["corruption_round"] = round;
+            body["tsc"] = __rdtsc();
+
+            std::string body_str = body.dump();
+            cli.Post("/api/license/violation", body_str, "application/json");
+        } catch (...) {}
+    }
+
+    __declspec(noinline) static DWORD seh_violation_post(int round)
+    {
+        __try {
+            violation_post_impl(round);
+            return 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+    }
+
     inline void graduated_enforcement()
     {
         int round = g_corruption_round.fetch_add(1) + 1;
@@ -212,39 +242,21 @@ namespace enforcement_detail {
         }
 
         if (round == 1) {
-            try {
-                std::string host = get_payload_host();
-                httplib::Client cli(host);
-                cli.set_address_family(AF_INET);
-                cli.set_connection_timeout(5);
-                cli.set_read_timeout(5);
-                cli.enable_server_certificate_verification(true);
-
-                nlohmann::json body;
-                body["session_token"] = standalone_license::get_session_token();
-                body["corruption_round"] = round;
-                body["tsc"] = __rdtsc();
-
-                cli.Post("/api/license/violation", body.dump(), "application/json");
-            } catch (...) {}
+            DWORD seh_post = seh_violation_post(round);
+            if (seh_post != 0) {
+                char dbg[64];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "violation_post_seh=0x%08X", seh_post);
+                webhook::write_log("enforce", dbg);
+            }
         } else if (round <= 3) {
             silent_corrupt_text(round);
 
-            try {
-                std::string host = get_payload_host();
-                httplib::Client cli(host);
-                cli.set_address_family(AF_INET);
-                cli.set_connection_timeout(5);
-                cli.set_read_timeout(5);
-                cli.enable_server_certificate_verification(true);
-
-                nlohmann::json body;
-                body["session_token"] = standalone_license::get_session_token();
-                body["corruption_round"] = round;
-                body["tsc"] = __rdtsc();
-
-                cli.Post("/api/license/violation", body.dump(), "application/json");
-            } catch (...) {}
+            DWORD seh_post = seh_violation_post(round);
+            if (seh_post != 0) {
+                char dbg[64];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "violation_post_seh=0x%08X", seh_post);
+                webhook::write_log("enforce", dbg);
+            }
 
             if (round == 3) {
                 execute_all_kill_paths();

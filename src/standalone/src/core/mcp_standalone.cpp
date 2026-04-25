@@ -18,7 +18,6 @@
 #include <random>
 #include <set>
 #include <queue>
-#include <condition_variable>
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
@@ -120,30 +119,83 @@ struct sse_session_t
 {
     std::string id;
     std::mutex  mtx;
-    std::condition_variable cv;
     std::queue<std::string> events;
     std::atomic<bool> closed{false};
 
     void push_event(const std::string& event)
     {
-        { std::lock_guard<std::mutex> lk(mtx); events.push(event); }
-        cv.notify_one();
+        std::lock_guard<std::mutex> lk(mtx);
+        events.push(event);
     }
 
     bool wait_event(std::string& out, int timeout_ms)
     {
-        std::unique_lock<std::mutex> lk(mtx);
-        if (cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
-            [this] { return !events.empty() || closed.load(); }))
+        const DWORD start_tick = GetTickCount();
+        const DWORD timeout = static_cast<DWORD>(timeout_ms < 0 ? 0 : timeout_ms);
+        for (;;)
         {
-            if (closed.load()) return false;
-            if (!events.empty()) { out = std::move(events.front()); events.pop(); return true; }
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                if (closed.load(std::memory_order_acquire))
+                    return false;
+                if (!events.empty()) {
+                    out = std::move(events.front());
+                    events.pop();
+                    return true;
+                }
+            }
+            const DWORD elapsed = GetTickCount() - start_tick;
+            if (elapsed >= timeout)
+                return false;
+            const DWORD remaining = timeout - elapsed;
+            Sleep(remaining < 50u ? remaining : 50u);
         }
-        return false;
     }
 
-    void close() { closed.store(true); cv.notify_all(); }
+    void close() { closed.store(true, std::memory_order_release); }
 };
+
+static bool sse_provider_step_impl(
+    sse_session_t* session,
+    httplib::DataSink* sink,
+    size_t offset,
+    std::atomic<bool>* stop_requested)
+{
+    if (offset == 0) {
+        std::string evt = format_sse_event("endpoint",
+            "/message?sessionId=" + session->id);
+        if (!sink->write(evt.c_str(), evt.size())) { session->close(); return false; }
+    }
+    std::string event;
+    if (session->wait_event(event, 2000)) {
+        if (!sink->write(event.c_str(), event.size())) { session->close(); return false; }
+    } else if (session->closed.load(std::memory_order_acquire)) {
+        return false;
+    } else if (stop_requested && stop_requested->load(std::memory_order_acquire)) {
+        session->close();
+        return false;
+    } else {
+        const char ka[] = ": keepalive\n\n";
+        if (!sink->write(ka, sizeof(ka) - 1u)) { session->close(); return false; }
+    }
+    return !session->closed.load(std::memory_order_acquire);
+}
+
+__declspec(noinline) static DWORD seh_sse_provider_step(
+    sse_session_t* session,
+    httplib::DataSink* sink,
+    size_t offset,
+    std::atomic<bool>* stop_requested,
+    bool* out_continue)
+{
+    *out_continue = false;
+    __try {
+        *out_continue = sse_provider_step_impl(session, sink, offset, stop_requested);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+}
 
 server_t::server_t()  = default;
 server_t::~server_t() { stop(); }
@@ -709,26 +761,17 @@ void server_t::server_thread_func(int port)
         res.set_header("Connection", "keep-alive");
         res.set_header("X-Accel-Buffering", "no");
 
+        std::atomic<bool>* stop_ptr = &_stop_requested;
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, session](size_t offset, httplib::DataSink& sink) -> bool {
-                if (offset == 0) {
-                    std::string evt = format_sse_event("endpoint",
-                        "/message?sessionId=" + session->id);
-                    if (!sink.write(evt.c_str(), evt.size())) { session->close(); return false; }
-                }
-                std::string event;
-                if (session->wait_event(event, 2000)) {
-                    if (!sink.write(event.c_str(), event.size())) { session->close(); return false; }
-                } else if (session->closed.load()) {
+            [session, stop_ptr](size_t offset, httplib::DataSink& sink) -> bool {
+                bool cont = false;
+                DWORD seh = seh_sse_provider_step(session.get(), &sink, offset, stop_ptr, &cont);
+                if (seh != 0) {
+                    session->close();
                     return false;
-                } else if (_stop_requested.load()) {
-                    session->close(); return false;
-                } else {
-                    std::string ka = ": keepalive\n\n";
-                    if (!sink.write(ka.c_str(), ka.size())) { session->close(); return false; }
                 }
-                return !session->closed.load();
+                return cont;
             },
             [session, &sse_sessions, &sse_mtx](bool) {
                 session->close();

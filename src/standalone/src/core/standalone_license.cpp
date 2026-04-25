@@ -2273,6 +2273,8 @@ namespace standalone_license
 
         snapshot_code_hashes();
         restart_heartbeat(settings);
+
+        anti_tamper::state::get().license_pending_activation.store(false, std::memory_order_release);
         lic_log("initialize_complete");
         return true;
     }
