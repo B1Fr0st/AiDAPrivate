@@ -106,7 +106,7 @@ tool_result_t handle_switch_agent(const json& params)
 }
 
 
-tool_result_t handle_plan_enter(const json& )
+tool_result_t handle_plan_enter(const json&)
 {
     if (aida::agent::active_agent_name() == "plan")
         return tool_result_t::ok("Already in plan mode.");

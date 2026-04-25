@@ -200,6 +200,11 @@ namespace events {
         std::string new_agent;
     };
 
+    struct session_selected_t
+    {
+        std::string session_id;
+    };
+
     inline constexpr event_def_t<permission_asked_t>   event_permission_asked{"aida.permission.asked"};
     inline constexpr event_def_t<permission_replied_t> event_permission_replied{"aida.permission.replied"};
     inline constexpr event_def_t<session_compacted_t>  event_session_compacted{"aida.session.compacted"};
@@ -210,6 +215,7 @@ namespace events {
     inline constexpr event_def_t<binary_loaded_t>      event_binary_loaded{"aida.binary.loaded"};
     inline constexpr event_def_t<mcp_tools_changed_t>  event_mcp_tools_changed{"aida.mcp.tools_changed"};
     inline constexpr event_def_t<agent_changed_t>      event_agent_changed{"aida.agent.changed"};
+    inline constexpr event_def_t<session_selected_t>   event_session_selected{"aida.session.selected"};
 
 }
 }
