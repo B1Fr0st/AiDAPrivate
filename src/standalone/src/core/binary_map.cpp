@@ -237,15 +237,13 @@ namespace binary_map {
 					cache_slot().valid = false;
 					cache_slot().hash.clear();
 					cache_slot().map = map_t{};
-					std::string canonical;
-					try {
-						canonical = std::filesystem::weakly_canonical(
-							std::filesystem::path(payload.binary_path)).string();
-					} catch (...) {
+
+					std::error_code canon_ec;
+					auto canonical = std::filesystem::weakly_canonical(
+						std::filesystem::path(payload.binary_path), canon_ec).string();
+					if (canon_ec || canonical.empty())
 						canonical = payload.binary_path;
-					}
-					if (canonical.empty())
-						canonical = payload.binary_path;
+
 					const auto new_hash = compute_binary_hash(canonical);
 					if (new_hash != current_binary_hash()) {
 						current_binary_hash() = new_hash;
@@ -972,12 +970,11 @@ namespace binary_map {
 		const auto process_name = driver_bridge::attached_process_name();
 		const auto* main_mod = select_main_module(modules, process_name);
 		if (main_mod != nullptr) {
-			try {
-				canonical_path = std::filesystem::weakly_canonical(
-					std::filesystem::path(main_mod->path)).string();
-			} catch (...) {
+			std::error_code canon_ec;
+			canonical_path = std::filesystem::weakly_canonical(
+				std::filesystem::path(main_mod->path), canon_ec).string();
+			if (canon_ec || canonical_path.empty())
 				canonical_path = main_mod->path;
-			}
 		}
 
 		const std::string new_hash = compute_binary_hash(canonical_path);
