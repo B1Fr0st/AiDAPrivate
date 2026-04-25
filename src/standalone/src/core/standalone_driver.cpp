@@ -6,12 +6,15 @@
 #include "toast_notification.hpp"
 #include "arc/arc.h"
 #include "comm.h"
+#include "../helpers/diag_log.hpp"
 
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>
+#include <intrin.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cctype>
 #include <cstdio>
@@ -20,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #pragma comment(lib, "psapi.lib")
@@ -90,6 +94,78 @@ namespace
     {
         logf("AiDA Standalone: %s requires kernel driver.\n", func_name);
         toast_notification::push(std::string(func_name) + " requires kernel driver");
+    }
+
+    std::atomic<bool> g_driver_watchdog_started{false};
+    std::atomic<bool> g_driver_watchdog_stop{false};
+    std::atomic<int>  g_driver_consecutive_fail{0};
+
+    constexpr int    kDriverWatchdogPeriodMs       = 4000;
+    constexpr int    kDriverWatchdogFailThreshold  = 3;
+    constexpr DWORD  kDriverFastFailCode           = 0xBEA7DEADu;
+
+    [[noreturn]] void driver_fast_fail(const char* phase, DWORD err)
+    {
+        char buf[768];
+        DWORD hb_err     = device ? device->get_last_heartbeat_error() : 0u;
+        DWORD hb_bytes   = device ? device->get_last_heartbeat_bytes_returned() : 0u;
+        std::uint64_t hb_resp = device ? device->get_last_heartbeat_response() : 0ull;
+        std::uint32_t hb_ioctl = device ? device->get_last_heartbeat_ioctl_code() : 0u;
+        std::uint32_t hb_magic = device ? device->get_last_heartbeat_magic() : 0u;
+        BOOL hb_dioctl   = device ? device->get_last_heartbeat_dioctl_result() : FALSE;
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "DRIVER_REQUIRED phase=%s err=0x%08X "
+            "hb_err=%lu hb_bytes=%lu hb_resp=0x%016llX "
+            "hb_ioctl=0x%08X hb_magic=0x%08X hb_dioctl=%d",
+            phase ? phase : "?", err,
+            (unsigned long)hb_err, (unsigned long)hb_bytes,
+            (unsigned long long)hb_resp,
+            hb_ioctl, hb_magic, hb_dioctl ? 1 : 0);
+        diag::log_tagged("driver", buf);
+        OutputDebugStringA(buf);
+        anti_tamper::webhook::send_debug_log("driver", buf, true);
+        Sleep(50);
+        __fastfail(kDriverFastFailCode);
+    }
+
+    void driver_watchdog_thread()
+    {
+        diag::log_tagged("driver", "watchdog_thread_entry");
+        while (!g_driver_watchdog_stop.load(std::memory_order_acquire)) {
+            Sleep(kDriverWatchdogPeriodMs);
+            if (g_driver_watchdog_stop.load(std::memory_order_acquire)) {
+                break;
+            }
+            bool ok = false;
+            if (device && device->is_connected()) {
+                ok = device->send_heartbeat();
+            }
+            if (ok) {
+                g_driver_consecutive_fail.store(0, std::memory_order_release);
+                continue;
+            }
+            int n = g_driver_consecutive_fail.fetch_add(1, std::memory_order_acq_rel) + 1;
+            char dbg[256];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "watchdog_heartbeat_fail consecutive=%d hb_err=%lu hb_bytes=%lu",
+                n,
+                device ? (unsigned long)device->get_last_heartbeat_error() : 0ul,
+                device ? (unsigned long)device->get_last_heartbeat_bytes_returned() : 0ul);
+            diag::log_tagged("driver", dbg);
+            if (n >= kDriverWatchdogFailThreshold) {
+                driver_fast_fail("watchdog", 0xBEA70000u | (device ? device->get_last_heartbeat_error() & 0xFFFFu : 0u));
+            }
+        }
+        diag::log_tagged("driver", "watchdog_thread_exit");
+    }
+
+    void start_driver_watchdog_locked()
+    {
+        bool expected = false;
+        if (!g_driver_watchdog_started.compare_exchange_strong(expected, true)) {
+            return;
+        }
+        std::thread(driver_watchdog_thread).detach();
     }
 
     std::string utf8_from_wide(const wchar_t* text)
@@ -193,23 +269,23 @@ namespace driver_bridge
         g_kernel_mode = false;
         set_last_error_locked({});
 
-        driver_loader::initialize_and_load();
+        bool loader_ok = driver_loader::initialize_and_load();
+        diag::log_tagged_fmt("driver", "loader_initialize_result=%d", loader_ok ? 1 : 0);
 
         if (device && device->connect()) {
             g_kernel_mode = true;
             g_initialized = true;
             logf("AiDA Standalone: Live inspection bridge initialized with kernel driver backend.\n");
+            start_driver_watchdog_locked();
             return true;
         }
 
+        DWORD err = device ? device->get_last_connect_error() : 0xFFFFFFFFu;
         if (device) {
-            DWORD err = device->get_last_connect_error();
             logf("AiDA Standalone: Kernel driver connection failed (error 0x%08X).\n", err);
         }
 
-        g_initialized = true;
-        logf("AiDA Standalone: Kernel driver unavailable. Live inspection operations require the kernel driver and will not function until it is loaded.\n");
-        return true;
+        driver_fast_fail("initialize", err);
     }
 
     bool load_kernel_driver()
@@ -253,6 +329,7 @@ namespace driver_bridge
         g_initialized = true;
         set_last_error_locked({});
         logf("AiDA Standalone: Kernel driver backend is active.\n");
+        start_driver_watchdog_locked();
         return true;
     }
 

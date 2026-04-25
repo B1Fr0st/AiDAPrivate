@@ -97,7 +97,9 @@ int main() {
 
     pe_file::pe_image_t pe = make_synthetic();
     protector::import_hash_table_t iht = protector::destroy_imports(pe, master);
-    protector::string_fixup_table_t sft = protector::encrypt_strings(pe, master);
+    std::vector<protector::preserve_string_range_t> psr =
+        protector::collect_loader_string_ranges(pe, false);
+    protector::string_fixup_table_t sft = protector::encrypt_strings(pe, master, psr);
     protector::resource_fixup_table_t rft = protector::encrypt_resources(pe, master);
     protector::mangle_header(pe, rng);
     protector::randomize_section_names(pe, rng);

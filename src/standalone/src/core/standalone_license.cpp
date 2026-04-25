@@ -28,6 +28,7 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windns.h>
 
 #include <atomic>
 #include <algorithm>
@@ -45,6 +46,7 @@
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "dnsapi.lib")
 
 using json = nlohmann::json;
 
@@ -67,10 +69,10 @@ static void lic_log(const char* step)
         InitOnceComplete(&s_once, INIT_ONCE_ASYNC, nullptr);
     }
 
-    HANDLE hf = CreateFileA(s_log_path, GENERIC_WRITE, FILE_SHARE_READ,
+    HANDLE hf = CreateFileA(s_log_path, FILE_APPEND_DATA | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hf == INVALID_HANDLE_VALUE) return;
-    SetFilePointer(hf, 0, nullptr, FILE_END);
     SYSTEMTIME st{};
     GetLocalTime(&st);
     char line[1024];
@@ -297,6 +299,104 @@ struct SimpleHttpResponse {
     std::string error;
 };
 
+struct resolved_addr_t {
+    int family = 0;
+    sockaddr_storage sa = {};
+    int sa_len = 0;
+};
+
+static std::vector<resolved_addr_t> resolve_host_addrs(const std::string& host, int port,
+                                                        std::string& diag_out)
+{
+    std::vector<resolved_addr_t> results;
+    char port_str[8];
+    _snprintf_s(port_str, sizeof(port_str), _TRUNCATE, "%d", port);
+    char gai_buf[160] = {};
+
+    {
+        struct addrinfo hints = {}, *gai_res = nullptr;
+        hints.ai_family   = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        const int gai_rc = getaddrinfo(host.c_str(), port_str, &hints, &gai_res);
+        if (gai_rc == 0 && gai_res) {
+            for (addrinfo* p = gai_res; p; p = p->ai_next) {
+                if (p->ai_family != AF_INET && p->ai_family != AF_INET6) continue;
+                if (p->ai_addrlen == 0 || p->ai_addrlen > sizeof(sockaddr_storage))
+                    continue;
+                resolved_addr_t r;
+                r.family = p->ai_family;
+                r.sa_len = static_cast<int>(p->ai_addrlen);
+                memcpy(&r.sa, p->ai_addr, p->ai_addrlen);
+                results.push_back(r);
+            }
+            freeaddrinfo(gai_res);
+        } else {
+            _snprintf_s(gai_buf, sizeof(gai_buf), _TRUNCATE,
+                "getaddrinfo rc=%d wsa=%lu",
+                gai_rc, static_cast<unsigned long>(WSAGetLastError()));
+        }
+    }
+
+    if (!results.empty()) return results;
+
+    char dns_buf[160] = {};
+    const DWORD bypass_flags = DNS_QUERY_BYPASS_CACHE | DNS_QUERY_NO_HOSTS_FILE;
+    const u_short port_be = htons(static_cast<u_short>(port));
+
+    {
+        PDNS_RECORDA recA = nullptr;
+        DNS_STATUS sta = DnsQuery_A(host.c_str(), DNS_TYPE_A, bypass_flags, nullptr,
+            reinterpret_cast<PDNS_RECORD*>(&recA), nullptr);
+        if (sta == 0 && recA) {
+            for (PDNS_RECORDA p = recA; p; p = p->pNext) {
+                if (p->wType != DNS_TYPE_A) continue;
+                resolved_addr_t r;
+                r.family = AF_INET;
+                r.sa_len = static_cast<int>(sizeof(sockaddr_in));
+                auto* sin = reinterpret_cast<sockaddr_in*>(&r.sa);
+                sin->sin_family = AF_INET;
+                sin->sin_port   = port_be;
+                sin->sin_addr.S_un.S_addr = p->Data.A.IpAddress;
+                results.push_back(r);
+            }
+            DnsRecordListFree(reinterpret_cast<PDNS_RECORD>(recA), DnsFreeRecordList);
+        } else if (sta != 0 && dns_buf[0] == '\0') {
+            _snprintf_s(dns_buf, sizeof(dns_buf), _TRUNCATE, "DnsQuery_A status=%lu",
+                static_cast<unsigned long>(sta));
+        }
+    }
+
+    {
+        PDNS_RECORDA rec6 = nullptr;
+        DNS_STATUS st6 = DnsQuery_A(host.c_str(), DNS_TYPE_AAAA, bypass_flags, nullptr,
+            reinterpret_cast<PDNS_RECORD*>(&rec6), nullptr);
+        if (st6 == 0 && rec6) {
+            for (PDNS_RECORDA p = rec6; p; p = p->pNext) {
+                if (p->wType != DNS_TYPE_AAAA) continue;
+                resolved_addr_t r;
+                r.family = AF_INET6;
+                r.sa_len = static_cast<int>(sizeof(sockaddr_in6));
+                auto* sin6 = reinterpret_cast<sockaddr_in6*>(&r.sa);
+                sin6->sin6_family = AF_INET6;
+                sin6->sin6_port   = port_be;
+                memcpy(&sin6->sin6_addr, &p->Data.AAAA.Ip6Address, sizeof(IN6_ADDR));
+                results.push_back(r);
+            }
+            DnsRecordListFree(reinterpret_cast<PDNS_RECORD>(rec6), DnsFreeRecordList);
+        }
+    }
+
+    if (results.empty()) {
+        diag_out.clear();
+        if (gai_buf[0] != '\0') diag_out += gai_buf;
+        if (gai_buf[0] != '\0' && dns_buf[0] != '\0') diag_out += "; ";
+        if (dns_buf[0] != '\0') diag_out += dns_buf;
+        if (diag_out.empty()) diag_out = "no addresses returned";
+    }
+    return results;
+}
+
 static SimpleHttpResponse raw_https_request(
     const char* verb,
     const std::string& url,
@@ -336,39 +436,99 @@ static SimpleHttpResponse raw_https_request(
     }
 
 
-    struct addrinfo hints = {}, *result = nullptr;
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    char port_str[8];
-    _snprintf_s(port_str, sizeof(port_str), _TRUNCATE, "%d", port);
-    const int gai_rc = getaddrinfo(host.c_str(), port_str, &hints, &result);
-    if (gai_rc != 0 || !result) {
-        out.error = "DNS resolution failed for " + host + " rc=" + std::to_string(gai_rc)
-                  + " wsa=" + std::to_string(WSAGetLastError());
+    std::string resolve_diag;
+    auto candidate_addrs = resolve_host_addrs(host, port, resolve_diag);
+    if (candidate_addrs.empty()) {
+        out.error = "DNS resolution failed for " + host + " (" + resolve_diag + ")";
         return out;
     }
 
+    std::stable_sort(candidate_addrs.begin(), candidate_addrs.end(),
+        [](const resolved_addr_t& a, const resolved_addr_t& b) {
+            return (a.family == AF_INET) && (b.family != AF_INET);
+        });
 
-    SOCKET sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+    const auto request_start = std::chrono::steady_clock::now();
+    const auto request_deadline = request_start + std::chrono::seconds(timeout_sec);
+    auto remaining_ms = [&]() -> int {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= request_deadline) return 0;
+        return static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(request_deadline - now).count());
+    };
+
+    SOCKET sock = INVALID_SOCKET;
+    std::string connect_errors;
+    auto poll_socket = [&](short events, int wait_ms) -> int {
+        if (wait_ms < 0) wait_ms = 0;
+        WSAPOLLFD pfd = {};
+        pfd.fd = sock;
+        pfd.events = events;
+        return WSAPoll(&pfd, 1, wait_ms);
+    };
+
+    for (auto& addr : candidate_addrs) {
+        if (remaining_ms() <= 0) {
+            if (!connect_errors.empty()) connect_errors += "; ";
+            connect_errors += "deadline_reached_before_connect";
+            break;
+        }
+
+        sock = socket(addr.family, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) {
+            int wsa = WSAGetLastError();
+            if (!connect_errors.empty()) connect_errors += "; ";
+            connect_errors += "socket() wsa=" + std::to_string(wsa);
+            continue;
+        }
+
+        u_long nb_on = 1;
+        ioctlsocket(sock, FIONBIO, &nb_on);
+
+        int conn_rc = ::connect(sock, reinterpret_cast<sockaddr*>(&addr.sa), addr.sa_len);
+        if (conn_rc == SOCKET_ERROR) {
+            int wsa = WSAGetLastError();
+            if (wsa != WSAEWOULDBLOCK) {
+                if (!connect_errors.empty()) connect_errors += "; ";
+                connect_errors += "connect() wsa=" + std::to_string(wsa);
+                closesocket(sock);
+                sock = INVALID_SOCKET;
+                continue;
+            }
+            int p = poll_socket(POLLOUT, remaining_ms());
+            if (p == 0) {
+                if (!connect_errors.empty()) connect_errors += "; ";
+                connect_errors += "connect_timeout";
+                closesocket(sock);
+                sock = INVALID_SOCKET;
+                continue;
+            }
+            if (p < 0) {
+                int err = WSAGetLastError();
+                if (!connect_errors.empty()) connect_errors += "; ";
+                connect_errors += "wsapoll wsa=" + std::to_string(err);
+                closesocket(sock);
+                sock = INVALID_SOCKET;
+                continue;
+            }
+            int so_err = 0;
+            int so_len = static_cast<int>(sizeof(so_err));
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &so_len);
+            if (so_err != 0) {
+                if (!connect_errors.empty()) connect_errors += "; ";
+                connect_errors += "connect_so_err=" + std::to_string(so_err);
+                closesocket(sock);
+                sock = INVALID_SOCKET;
+                continue;
+            }
+        }
+        break;
+    }
+
     if (sock == INVALID_SOCKET) {
-        freeaddrinfo(result);
-        out.error = "socket() failed wsa=" + std::to_string(WSAGetLastError());
+        out.error = "connect failed for " + host + " (" + connect_errors + ")";
         return out;
     }
-
-
-    DWORD tv = static_cast<DWORD>(timeout_sec * 1000);
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
-
-    if (::connect(sock, result->ai_addr, (int)result->ai_addrlen) != 0) {
-        int wsa = WSAGetLastError();
-        closesocket(sock);
-        freeaddrinfo(result);
-        out.error = "connect() failed wsa=" + std::to_string(wsa);
-        return out;
-    }
-    freeaddrinfo(result);
 
 
     SSL_CTX* ctx = nullptr;
@@ -387,14 +547,38 @@ static SimpleHttpResponse raw_https_request(
             out.error = "SSL_new failed";
             return out;
         }
-        SSL_set_fd(ssl, (int)sock);
+        SSL_set_fd(ssl, static_cast<int>(sock));
         SSL_set_tlsext_host_name(ssl, host.c_str());
-        if (SSL_connect(ssl) != 1) {
-            SSL_free(ssl);
-            SSL_CTX_free(ctx);
-            closesocket(sock);
-            out.error = "SSL_connect failed";
-            return out;
+        for (;;) {
+            int rc = SSL_connect(ssl);
+            if (rc == 1) break;
+            int err = SSL_get_error(ssl, rc);
+            short events = 0;
+            if (err == SSL_ERROR_WANT_READ)       events = POLLIN;
+            else if (err == SSL_ERROR_WANT_WRITE) events = POLLOUT;
+            else {
+                SSL_free(ssl);
+                SSL_CTX_free(ctx);
+                closesocket(sock);
+                out.error = "SSL_connect failed err=" + std::to_string(err);
+                return out;
+            }
+            int p = poll_socket(events, remaining_ms());
+            if (p == 0) {
+                SSL_free(ssl);
+                SSL_CTX_free(ctx);
+                closesocket(sock);
+                out.error = "SSL_connect timed out host=" + host;
+                return out;
+            }
+            if (p < 0) {
+                int we = WSAGetLastError();
+                SSL_free(ssl);
+                SSL_CTX_free(ctx);
+                closesocket(sock);
+                out.error = "WSAPoll on SSL_connect failed wsa=" + std::to_string(we);
+                return out;
+            }
         }
     }
 
@@ -421,9 +605,23 @@ static SimpleHttpResponse raw_https_request(
             int n;
             if (ssl) n = SSL_write(ssl, data, len);
             else     n = ::send(sock, data, len, 0);
-            if (n <= 0) return false;
-            data += n;
-            len  -= n;
+            if (n > 0) {
+                data += n;
+                len  -= n;
+                continue;
+            }
+            short events = POLLOUT;
+            if (ssl) {
+                int err = SSL_get_error(ssl, n);
+                if (err == SSL_ERROR_WANT_READ)        events = POLLIN;
+                else if (err == SSL_ERROR_WANT_WRITE)  events = POLLOUT;
+                else                                   return false;
+            } else {
+                int wsa = WSAGetLastError();
+                if (wsa != WSAEWOULDBLOCK)             return false;
+            }
+            int p = poll_socket(events, remaining_ms());
+            if (p <= 0) return false;
         }
         return true;
     };
@@ -431,7 +629,7 @@ static SimpleHttpResponse raw_https_request(
     if (!send_all(http_req.c_str(), (int)http_req.size())) {
         if (ssl) { SSL_free(ssl); SSL_CTX_free(ctx); }
         closesocket(sock);
-        out.error = "send failed";
+        out.error = "send failed (timeout or error)";
         return out;
     }
 
@@ -443,9 +641,27 @@ static SimpleHttpResponse raw_https_request(
         int n;
         if (ssl) n = SSL_read(ssl, buf, sizeof(buf));
         else     n = ::recv(sock, buf, sizeof(buf), 0);
-        if (n <= 0) break;
-        raw_resp.append(buf, n);
-        if (raw_resp.size() > 4 * 1024 * 1024) break;
+        if (n > 0) {
+            raw_resp.append(buf, n);
+            if (raw_resp.size() > 4 * 1024 * 1024) break;
+            continue;
+        }
+        if (n == 0) break;
+        short events = POLLIN;
+        bool fatal = false;
+        if (ssl) {
+            int err = SSL_get_error(ssl, n);
+            if (err == SSL_ERROR_ZERO_RETURN)      { fatal = true; break; }
+            else if (err == SSL_ERROR_WANT_READ)   events = POLLIN;
+            else if (err == SSL_ERROR_WANT_WRITE)  events = POLLOUT;
+            else                                   { fatal = true; }
+        } else {
+            int wsa = WSAGetLastError();
+            if (wsa != WSAEWOULDBLOCK) fatal = true;
+        }
+        if (fatal) break;
+        int p = poll_socket(events, remaining_ms());
+        if (p <= 0) break;
     }
 
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }

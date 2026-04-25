@@ -1286,7 +1286,156 @@ struct range_t {
 
 }
 
-inline string_fixup_table_t encrypt_strings(pe_file::pe_image_t& pe, const uint8_t master[32]) {
+struct preserve_string_range_t {
+    uint32_t rva;
+    uint32_t length;
+};
+
+inline std::vector<preserve_string_range_t> collect_loader_string_ranges(const pe_file::pe_image_t& pe, bool include_imports) {
+    std::vector<preserve_string_range_t> ranges;
+    auto add_range = [&](uint32_t rva, uint32_t length) {
+        if (rva == 0u || length == 0u) {
+            return;
+        }
+        ranges.push_back({rva, length});
+    };
+    auto add_string = [&](uint32_t rva) {
+        if (rva == 0u) {
+            return;
+        }
+        const uint8_t* p = pe.rva_ptr(rva);
+        if (!p) {
+            return;
+        }
+        size_t len = std::strlen(reinterpret_cast<const char*>(p));
+        if (len == 0u) {
+            return;
+        }
+        add_range(rva, static_cast<uint32_t>(len + 1u));
+    };
+
+    if (include_imports && pe.data_directories[IMAGE_DIRECTORY_ENTRY_IMPORT].rva != 0u) {
+        uint32_t desc_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_IMPORT].rva;
+        for (;;) {
+            const uint8_t* dp = pe.rva_ptr(desc_rva);
+            if (!dp) {
+                break;
+            }
+            IMAGE_IMPORT_DESCRIPTOR desc{};
+            std::memcpy(&desc, dp, sizeof(desc));
+            if (desc.Name == 0u && desc.FirstThunk == 0u) {
+                break;
+            }
+            add_string(desc.Name);
+            uint32_t ilt = (desc.OriginalFirstThunk != 0u) ? desc.OriginalFirstThunk : desc.FirstThunk;
+            for (uint32_t idx = 0; ; ++idx) {
+                const uint8_t* tp = pe.rva_ptr(ilt + idx * 8u);
+                if (!tp) {
+                    break;
+                }
+                uint64_t tv = 0;
+                std::memcpy(&tv, tp, 8);
+                if (tv == 0ull) {
+                    break;
+                }
+                if ((tv & (1ull << 63)) == 0ull) {
+                    uint32_t hint_rva = static_cast<uint32_t>(tv & 0x7FFFFFFFu);
+                    const uint8_t* hp = pe.rva_ptr(hint_rva);
+                    if (hp) {
+                        const char* fn = reinterpret_cast<const char*>(hp + 2);
+                        size_t len = std::strlen(fn);
+                        if (len > 0u) {
+                            add_range(hint_rva, static_cast<uint32_t>(2u + len + 1u));
+                        }
+                    }
+                }
+            }
+            desc_rva += static_cast<uint32_t>(sizeof(IMAGE_IMPORT_DESCRIPTOR));
+        }
+    }
+
+    if (include_imports && pe.data_directories[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].rva != 0u) {
+        uint32_t desc_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].rva;
+        for (;;) {
+            const uint8_t* dp = pe.rva_ptr(desc_rva);
+            if (!dp) {
+                break;
+            }
+            uint32_t name_rva = 0, iat = 0, int_rva = 0;
+            std::memcpy(&name_rva, dp + 4, 4);
+            std::memcpy(&iat, dp + 12, 4);
+            std::memcpy(&int_rva, dp + 16, 4);
+            if (name_rva == 0u && iat == 0u) {
+                break;
+            }
+            add_string(name_rva);
+            uint32_t walk_rva = (int_rva != 0u) ? int_rva : iat;
+            for (uint32_t idx = 0; ; ++idx) {
+                const uint8_t* tp = pe.rva_ptr(walk_rva + idx * 8u);
+                if (!tp) {
+                    break;
+                }
+                uint64_t tv = 0;
+                std::memcpy(&tv, tp, 8);
+                if (tv == 0ull) {
+                    break;
+                }
+                if ((tv & (1ull << 63)) == 0ull) {
+                    uint32_t hint_rva = static_cast<uint32_t>(tv & 0x7FFFFFFFu);
+                    const uint8_t* hp = pe.rva_ptr(hint_rva);
+                    if (hp) {
+                        const char* fn = reinterpret_cast<const char*>(hp + 2);
+                        size_t len = std::strlen(fn);
+                        if (len > 0u) {
+                            add_range(hint_rva, static_cast<uint32_t>(2u + len + 1u));
+                        }
+                    }
+                }
+            }
+            desc_rva += 32u;
+        }
+    }
+
+    {
+        uint32_t exp_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_EXPORT].rva;
+        uint32_t exp_size = pe.data_directories[IMAGE_DIRECTORY_ENTRY_EXPORT].size;
+        if (exp_rva != 0u && exp_size != 0u) {
+            const uint8_t* dir_ptr = pe.rva_ptr(exp_rva);
+            if (dir_ptr) {
+                IMAGE_EXPORT_DIRECTORY ed{};
+                std::memcpy(&ed, dir_ptr, sizeof(ed));
+                add_string(ed.Name);
+                if (ed.AddressOfNames != 0u && ed.NumberOfNames != 0u) {
+                    const uint8_t* names_ptr = pe.rva_ptr(ed.AddressOfNames);
+                    if (names_ptr) {
+                        for (uint32_t i = 0; i < ed.NumberOfNames; ++i) {
+                            uint32_t name_rva = 0;
+                            std::memcpy(&name_rva, names_ptr + i * 4u, 4);
+                            add_string(name_rva);
+                        }
+                    }
+                }
+                if (ed.AddressOfFunctions != 0u && ed.NumberOfFunctions != 0u) {
+                    const uint8_t* funcs_ptr = pe.rva_ptr(ed.AddressOfFunctions);
+                    if (funcs_ptr) {
+                        uint32_t exp_end = exp_rva + exp_size;
+                        for (uint32_t i = 0; i < ed.NumberOfFunctions; ++i) {
+                            uint32_t func_rva = 0;
+                            std::memcpy(&func_rva, funcs_ptr + i * 4u, 4);
+                            if (func_rva >= exp_rva && func_rva < exp_end) {
+                                add_string(func_rva);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return ranges;
+}
+
+inline string_fixup_table_t encrypt_strings(pe_file::pe_image_t& pe, const uint8_t master[32], const std::vector<preserve_string_range_t>& preserve_ranges) {
     string_fixup_table_t out{};
     uint64_t base_key = derive_string_key(master);
     uint8_t base_xor = static_cast<uint8_t>(base_key & 0xFFull);
@@ -1375,6 +1524,18 @@ inline string_fixup_table_t encrypt_strings(pe_file::pe_image_t& pe, const uint8
 
         for (const auto& h : dedup) {
             uint32_t rva = sec.virtual_address + h.offset;
+            uint32_t s_end = rva + h.length;
+            bool overlaps_preserve = false;
+            for (const auto& pr : preserve_ranges) {
+                uint32_t pr_end = pr.rva + pr.length;
+                if (pr.rva < s_end && pr_end > rva) {
+                    overlaps_preserve = true;
+                    break;
+                }
+            }
+            if (overlaps_preserve) {
+                continue;
+            }
             uint8_t rva_low = static_cast<uint8_t>(rva & 0xFFu);
             uint8_t* p = sec.data.data() + h.offset;
             for (uint32_t k = 0; k < h.length; ++k) {
@@ -1647,7 +1808,8 @@ inline void init_from_u64_seed(rng_source& rs, uint64_t seed, bool seed_provided
 inline std::vector<packed_section_blob_t> pack_sections(pe_file::pe_image_t& pe,
                                                          const uint8_t master[32],
                                                          uint32_t exception_rva,
-                                                         uint32_t exception_size) {
+                                                         uint32_t exception_size,
+                                                         const std::vector<uint32_t>& keep_intact_section_rvas) {
     std::vector<packed_section_blob_t> blobs;
 
     uint32_t reloc_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].rva;
@@ -1660,6 +1822,16 @@ inline std::vector<packed_section_blob_t> pack_sections(pe_file::pe_image_t& pe,
             continue;
         }
         if (section_skip_list::is_skipped(sec.name)) {
+            continue;
+        }
+        bool keep_intact_hit = false;
+        for (uint32_t kva : keep_intact_section_rvas) {
+            if (kva != 0u && sec.virtual_address == kva) {
+                keep_intact_hit = true;
+                break;
+            }
+        }
+        if (keep_intact_hit) {
             continue;
         }
         if (exception_rva != 0u && exception_size != 0u) {
@@ -2537,7 +2709,9 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
         imports = destroy_imports(pe, master);
     }
     if (opt.encrypt_strings) {
-        strings = encrypt_strings(pe, master);
+        std::vector<preserve_string_range_t> preserve_string_ranges =
+            collect_loader_string_ranges(pe, !opt.encrypt_imports);
+        strings = encrypt_strings(pe, master, preserve_string_ranges);
     }
     if (opt.encrypt_resources) {
         resources = encrypt_resources(pe, master);
@@ -2566,9 +2740,52 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
         (void)llm_poison::inject_llm_poison(pe, rng_seed ^ 0x11AB1E1A7EC0FFEEull);
     }
 
+    std::vector<uint32_t> keep_intact_section_rvas;
+    if (!opt.encrypt_imports) {
+        const uint32_t imp_dir_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_IMPORT].rva;
+        if (imp_dir_rva != 0u) {
+            const pe_file::section_t* s_imp = pe.section_from_rva(imp_dir_rva);
+            if (s_imp != nullptr) {
+                bool already = false;
+                for (uint32_t v : keep_intact_section_rvas) {
+                    if (v == s_imp->virtual_address) { already = true; break; }
+                }
+                if (!already) {
+                    keep_intact_section_rvas.push_back(s_imp->virtual_address);
+                }
+            }
+        }
+        const uint32_t iat_dir_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_IAT].rva;
+        if (iat_dir_rva != 0u) {
+            const pe_file::section_t* s_iat = pe.section_from_rva(iat_dir_rva);
+            if (s_iat != nullptr) {
+                bool already = false;
+                for (uint32_t v : keep_intact_section_rvas) {
+                    if (v == s_iat->virtual_address) { already = true; break; }
+                }
+                if (!already) {
+                    keep_intact_section_rvas.push_back(s_iat->virtual_address);
+                }
+            }
+        }
+        const uint32_t delay_dir_rva = pe.data_directories[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].rva;
+        if (delay_dir_rva != 0u) {
+            const pe_file::section_t* s_dly = pe.section_from_rva(delay_dir_rva);
+            if (s_dly != nullptr) {
+                bool already = false;
+                for (uint32_t v : keep_intact_section_rvas) {
+                    if (v == s_dly->virtual_address) { already = true; break; }
+                }
+                if (!already) {
+                    keep_intact_section_rvas.push_back(s_dly->virtual_address);
+                }
+            }
+        }
+    }
+
     std::vector<packed_section_blob_t> blobs;
     if (opt.pack_sections) {
-        blobs = pack_sections(pe, master, original_exception_rva, original_exception_size);
+        blobs = pack_sections(pe, master, original_exception_rva, original_exception_size, keep_intact_section_rvas);
     }
 
     std::vector<uint8_t> stub_code;
@@ -2657,6 +2874,16 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
             if (sec.virtual_address == result.packed_section_rva) {
                 continue;
             }
+            bool keep_intact_hit = false;
+            for (uint32_t kva : keep_intact_section_rvas) {
+                if (kva != 0u && sec.virtual_address == kva) {
+                    keep_intact_hit = true;
+                    break;
+                }
+            }
+            if (keep_intact_hit) {
+                continue;
+            }
 
             const uint32_t s_start = sec.virtual_address;
             const uint32_t s_end = sec.virtual_address + sec.virtual_size;
@@ -2699,14 +2926,16 @@ inline transform_result_t protect_pe(pe_file::pe_image_t& pe, const protect_opti
             }
         }
         pe.optional_header.DllCharacteristics &= static_cast<uint16_t>(~0x4160u);
-        pe.data_directories[1].rva = 0;
-        pe.data_directories[1].size = 0;
-        pe.optional_header.DataDirectory[1].VirtualAddress = 0;
-        pe.optional_header.DataDirectory[1].Size = 0;
-        pe.data_directories[12].rva = 0;
-        pe.data_directories[12].size = 0;
-        pe.optional_header.DataDirectory[12].VirtualAddress = 0;
-        pe.optional_header.DataDirectory[12].Size = 0;
+        if (opt.encrypt_imports) {
+            pe.data_directories[1].rva = 0;
+            pe.data_directories[1].size = 0;
+            pe.optional_header.DataDirectory[1].VirtualAddress = 0;
+            pe.optional_header.DataDirectory[1].Size = 0;
+            pe.data_directories[12].rva = 0;
+            pe.data_directories[12].size = 0;
+            pe.optional_header.DataDirectory[12].VirtualAddress = 0;
+            pe.optional_header.DataDirectory[12].Size = 0;
+        }
         pe.data_directories[10].rva = 0;
         pe.data_directories[10].size = 0;
         pe.optional_header.DataDirectory[10].VirtualAddress = 0;

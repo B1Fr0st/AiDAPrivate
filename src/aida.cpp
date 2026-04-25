@@ -7,6 +7,9 @@
 
 #ifdef __NT__
 #include "driver_loader.hpp"
+#include <atomic>
+#include <thread>
+#include <tlhelp32.h>
 #endif
 
 #ifdef __NT__
@@ -17,6 +20,78 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL,
     if (fdwReason == DLL_PROCESS_ATTACH)
         DisableThreadLibraryCalls(hinstDLL);
     return TRUE;
+}
+
+namespace {
+
+constexpr int    kStandaloneWatchdogPeriodMs      = 5000;
+constexpr int    kStandaloneWatchdogFailThreshold = 3;
+constexpr int    kStandaloneWatchdogGraceTicks    = 6;
+constexpr DWORD  kStandaloneAbsentFastFailCode    = 0xA1DA1DA1u;
+
+std::atomic<bool> g_standalone_watchdog_started{false};
+std::atomic<bool> g_standalone_watchdog_stop{false};
+
+bool is_standalone_running()
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return true;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    bool found = false;
+    if (Process32FirstW(snap, &pe))
+    {
+        do
+        {
+            if (_wcsicmp(pe.szExeFile, L"AiDAStandalone.exe") == 0)
+            {
+                found = true;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+void standalone_watchdog_thread()
+{
+    int consecutive_fail = 0;
+    int grace_ticks = kStandaloneWatchdogGraceTicks;
+    while (!g_standalone_watchdog_stop.load(std::memory_order_acquire))
+    {
+        Sleep(kStandaloneWatchdogPeriodMs);
+        if (g_standalone_watchdog_stop.load(std::memory_order_acquire))
+            break;
+        bool present = is_standalone_running();
+        if (present)
+        {
+            consecutive_fail = 0;
+            grace_ticks = 0;
+            continue;
+        }
+        if (grace_ticks > 0)
+        {
+            --grace_ticks;
+            continue;
+        }
+        ++consecutive_fail;
+        if (consecutive_fail >= kStandaloneWatchdogFailThreshold)
+        {
+            __fastfail(kStandaloneAbsentFastFailCode);
+        }
+    }
+}
+
+void start_standalone_watchdog()
+{
+    bool expected = false;
+    if (!g_standalone_watchdog_started.compare_exchange_strong(expected, true))
+        return;
+    std::thread(standalone_watchdog_thread).detach();
+}
+
 }
 #endif
 
@@ -385,6 +460,7 @@ aida_plugin_t::aida_plugin_t()
 #ifdef __NT__
     if (!driver_loader::is_driver_loaded())
         msg(OBFSTR_C("AiDA Driver: Warning - kernel driver trust state was lost after initialization.\n"));
+    start_standalone_watchdog();
 #endif
 
     g_settings.load(this);
@@ -412,6 +488,9 @@ aida_plugin_t::aida_plugin_t()
 
 aida_plugin_t::~aida_plugin_t()
 {
+#ifdef __NT__
+    g_standalone_watchdog_stop.store(true, std::memory_order_release);
+#endif
 
     std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
     if (!bin_hash.empty())

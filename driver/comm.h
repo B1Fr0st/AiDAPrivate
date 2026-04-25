@@ -1521,6 +1521,12 @@ namespace voyager {
         [[nodiscard]] std::uint64_t get_dtb() const noexcept { return dtb_; }
         [[nodiscard]] std::uint64_t get_kernel_dtb() const noexcept { return kernel_dtb_; }
         [[nodiscard]] DWORD get_last_connect_error() const noexcept { return last_connect_error_; }
+        [[nodiscard]] DWORD get_last_heartbeat_error() const noexcept { return last_heartbeat_error_; }
+        [[nodiscard]] DWORD get_last_heartbeat_bytes_returned() const noexcept { return last_heartbeat_bytes_; }
+        [[nodiscard]] std::uint64_t get_last_heartbeat_response() const noexcept { return last_heartbeat_response_; }
+        [[nodiscard]] std::uint32_t get_last_heartbeat_ioctl_code() const noexcept { return last_heartbeat_ioctl_code_; }
+        [[nodiscard]] std::uint32_t get_last_heartbeat_magic() const noexcept { return last_heartbeat_magic_; }
+        [[nodiscard]] BOOL get_last_heartbeat_dioctl_result() const noexcept { return last_heartbeat_dioctl_result_; }
 
         void set_process_id(std::uint32_t pid) noexcept { process_id_ = pid; }
         void set_base_address(std::uint64_t base) noexcept { base_address_ = base; }
@@ -1542,6 +1548,12 @@ namespace voyager {
         DWORD last_failed_tid_ = 0;
         DWORD last_hijacked_tid_ = 0;
         DWORD last_connect_error_ = 0;
+        mutable DWORD last_heartbeat_error_ = 0;
+        mutable DWORD last_heartbeat_bytes_ = 0;
+        mutable std::uint64_t last_heartbeat_response_ = 0;
+        mutable std::uint32_t last_heartbeat_ioctl_code_ = 0;
+        mutable std::uint32_t last_heartbeat_magic_ = 0;
+        mutable BOOL  last_heartbeat_dioctl_result_ = FALSE;
 
 
         std::uint64_t ntdll_base_ = 0;

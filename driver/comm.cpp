@@ -174,7 +174,18 @@ bool voyager::device_t::connect() noexcept {
     session_key_ = static_cast<std::uint32_t>(__rdtsc() ^ 0xDEADC0DEu);
     if (session_key_ == 0) session_key_ = 0x12345678u;
     if (!send_heartbeat()) {
-        last_connect_error_ = 0xBEA70000u | GetLastError();
+        DWORD hb_err = last_heartbeat_error_;
+        if (hb_err == 0 && last_heartbeat_dioctl_result_) {
+            if (last_heartbeat_bytes_ < sizeof(detail::heartbeat_request)) {
+                hb_err = ERROR_MORE_DATA;
+            } else if (last_heartbeat_response_ == 0) {
+                hb_err = ERROR_DATATYPE_MISMATCH;
+            }
+        }
+        if (hb_err == 0) {
+            hb_err = ERROR_GEN_FAILURE;
+        }
+        last_connect_error_ = 0xBEA70000u | (hb_err & 0xFFFFu);
         CloseHandle(driver_handle_);
         driver_handle_ = INVALID_HANDLE_VALUE;
         session_key_ = 0;
@@ -277,6 +288,12 @@ bool voyager::device_t::send_heartbeat() noexcept {
     SPOOF_FUNC;
 
     if (!is_connected()) {
+        last_heartbeat_error_ = ERROR_INVALID_HANDLE;
+        last_heartbeat_dioctl_result_ = FALSE;
+        last_heartbeat_bytes_ = 0;
+        last_heartbeat_response_ = 0;
+        last_heartbeat_ioctl_code_ = 0;
+        last_heartbeat_magic_ = 0;
         return false;
     }
 
@@ -287,7 +304,11 @@ bool voyager::device_t::send_heartbeat() noexcept {
     hb.response = 0;
 
     DWORD ioctlCode = ioctl_codes::HB();
+    last_heartbeat_ioctl_code_ = static_cast<std::uint32_t>(ioctlCode);
+    last_heartbeat_magic_ = hb.magic;
+
     DWORD bytes_returned = 0;
+    SetLastError(0);
     BOOL result = DeviceIoControl(
         driver_handle_,
         ioctlCode,
@@ -298,6 +319,12 @@ bool voyager::device_t::send_heartbeat() noexcept {
         &bytes_returned,
         nullptr
     );
+    DWORD captured_error = GetLastError();
+
+    last_heartbeat_dioctl_result_ = result;
+    last_heartbeat_bytes_ = bytes_returned;
+    last_heartbeat_response_ = hb.response;
+    last_heartbeat_error_ = result ? 0 : captured_error;
 
     if (result && bytes_returned >= sizeof(hb) && hb.response != 0) {
         last_heartbeat_tsc_ = __rdtsc();

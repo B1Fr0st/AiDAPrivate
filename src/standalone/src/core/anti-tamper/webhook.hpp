@@ -92,10 +92,10 @@ inline void write_log(const char* tag, const char* detail)
     std::lock_guard<std::mutex> lk(detail::log_mtx());
     const char* path = detail::log_path();
 
-    HANDLE hf = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+    HANDLE hf = CreateFileA(path, FILE_APPEND_DATA | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hf == INVALID_HANDLE_VALUE) return;
-    SetFilePointer(hf, 0, nullptr, FILE_END);
 
     SYSTEMTIME st{};
     GetLocalTime(&st);
@@ -107,7 +107,6 @@ inline void write_log(const char* tag, const char* detail)
     if (len > 0) {
         DWORD written;
         WriteFile(hf, line, static_cast<DWORD>(len), &written, nullptr);
-        FlushFileBuffers(hf);
     }
     CloseHandle(hf);
 }

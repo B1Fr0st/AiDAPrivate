@@ -298,6 +298,26 @@ static void hex32(char* out, const uint8_t* bytes) {
     out[64] = '\0';
 }
 
+inline bool detect_already_protected(const pe_file::pe_image_t& pe, std::string& detail_out) {
+    for (const auto& sec : pe.sections) {
+        if (sec.data.size() < sizeof(uint32_t)) continue;
+        uint32_t magic = 0;
+        std::memcpy(&magic, sec.data.data(), sizeof(magic));
+        if (magic == kPackedMagic) {
+            char name_buf[16] = {};
+            std::memcpy(name_buf, sec.name, sizeof(sec.name));
+            name_buf[8] = '\0';
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                "kPackedMagic in section '%s' rva=0x%X size=%zu",
+                name_buf, static_cast<unsigned>(sec.virtual_address), sec.data.size());
+            detail_out = buf;
+            return true;
+        }
+    }
+    return false;
+}
+
 inline int run(const config_t& cfg) {
     pe_file::pe_image_t pe;
     uint64_t input_size = 0;
@@ -319,6 +339,28 @@ inline int run(const config_t& cfg) {
     if (pe.optional_header.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
         std::fprintf(stderr, "[!] not a PE32+ image\n");
         return 2;
+    }
+
+    {
+        std::string protect_detail;
+        if (detect_already_protected(pe, protect_detail)) {
+            std::fprintf(stdout,
+                "[!] %s is already protected (%s) — skipping to preserve binary integrity.\n"
+                "    Re-protection on top of a protected PE would corrupt section blobs, double-encrypt strings,\n"
+                "    and chain stubs incorrectly. Run a Clean build (deletes the binary so the linker emits a\n"
+                "    fresh unprotected PE) if you want a brand-new protected build.\n",
+                cfg.input_path.c_str(), protect_detail.c_str());
+            if (cfg.input_path != cfg.output_path) {
+                std::error_code copy_ec;
+                std::filesystem::copy_file(cfg.input_path, cfg.output_path,
+                    std::filesystem::copy_options::overwrite_existing, copy_ec);
+                if (copy_ec) {
+                    std::fprintf(stderr, "[!] copy_file failed: %s\n", copy_ec.message().c_str());
+                    return 2;
+                }
+            }
+            return 0;
+        }
     }
 
     const bool is_dll = (pe.file_header.Characteristics & IMAGE_FILE_DLL) != 0;
