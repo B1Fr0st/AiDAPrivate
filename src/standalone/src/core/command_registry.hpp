@@ -36,9 +36,9 @@ namespace commands {
 
 	bool                                  initialize();
 	bool                                  reindex();
-	const std::vector<command_t>&         list();
-	const command_t*                      find(const std::string& name);
-	std::vector<const command_t*>         fuzzy_search(const std::string& query, int limit = 50);
+	std::vector<command_t>                list();
+	bool                                  find(const std::string& name, command_t& out);
+	std::vector<command_t>                fuzzy_search(const std::string& query, int limit = 50);
 	bool                                  execute(const std::string& name,
 	                                              const std::vector<std::string>& args,
 	                                              std::string& out_resolved_text);

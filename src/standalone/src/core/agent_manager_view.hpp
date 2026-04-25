@@ -2,11 +2,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cstdio>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "imgui/imgui.h"
 
@@ -58,11 +63,10 @@ namespace agent_manager {
 			chip_input_t                        new_allowed;
 			chip_input_t                        new_denied;
 			rule_buf_t                          new_rule;
+			nlohmann::json                      preserved_options = nlohmann::json::object();
 
 			bool                                buffers_loaded_for_selected = false;
 			bool                                dirty = false;
-			bool                                pending_save_status = false;
-			std::string                         pending_save_text;
 
 			char                                left_filter[96] = {};
 
@@ -154,10 +158,12 @@ namespace agent_manager {
 			st.new_allowed.buf[0] = '\0';
 			st.new_denied.buf[0] = '\0';
 			st.new_rule = rule_buf_t{};
+			st.preserved_options = nlohmann::json::object();
 
 			if (st.selected_name.empty()) return;
 			const aida::agent::agent_info_t* info = aida::agent::get(st.selected_name);
 			if (info == nullptr) return;
+			st.preserved_options = info->options;
 
 			copy_to_buf(st.edit_name, sizeof(st.edit_name), info->name);
 			copy_to_buf(st.edit_description, sizeof(st.edit_description), info->description);
@@ -217,29 +223,8 @@ namespace agent_manager {
 			}
 			info.tools_allowed = st.tools_allowed;
 			info.tools_denied = st.tools_denied;
+			info.options = st.preserved_options;
 			return info;
-		}
-
-		inline std::string available_providers_combo_label_locked()
-		{
-			std::string label;
-			label = std::strlen(state().provider_buf) > 0 ? std::string(state().provider_buf) : std::string("(default)");
-			return label;
-		}
-
-		inline std::string available_models_combo_label_locked()
-		{
-			std::string label = std::strlen(state().model_buf) > 0 ? std::string(state().model_buf) : std::string("(default)");
-			return label;
-		}
-
-		inline ImU32 mode_color(int mode_index)
-		{
-			switch (mode_index) {
-				case 0: return IM_COL32(70, 110, 170, 220);
-				case 1: return IM_COL32(110, 170, 90, 220);
-				default: return IM_COL32(150, 130, 90, 220);
-			}
 		}
 
 		inline const char* mode_label(int mode_index)

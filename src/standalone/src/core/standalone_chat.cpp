@@ -16,6 +16,7 @@
 #include "tool_repetition.hpp"
 #include "cost_calculator.hpp"
 #include "compaction.hpp"
+#include "command_registry.hpp"
 #include "session_store.hpp"
 #include "provider_catalog.hpp"
 #include "zydis_disasm.hpp"
@@ -1314,6 +1315,10 @@ void init_standalone_chat()
     }
     diag::log_tagged("init_chat", "agent_registry_init_done");
 
+    diag::log_tagged("init_chat", "command_registry_init_start");
+    (void)aida::commands::initialize();
+    diag::log_tagged("init_chat", "command_registry_init_done");
+
     diag::log_tagged("init_chat", "mcp_register_tools_start");
     mcp_standalone::register_standalone_tools(s_mcp_server);
     diag::log_tagged("init_chat", "mcp_register_tools_done");
@@ -1438,6 +1443,67 @@ void tick_ai_chat()
 
 
     std::string user_text = last.text;
+
+
+    if (!user_text.empty() && user_text[0] == '/') {
+        size_t name_end = 1;
+        while (name_end < user_text.size() &&
+               user_text[name_end] != ' ' &&
+               user_text[name_end] != '\t' &&
+               user_text[name_end] != '\n') {
+            ++name_end;
+        }
+        const std::string cmd_name = user_text.substr(1, name_end - 1);
+        std::vector<std::string> cmd_args;
+        if (name_end < user_text.size()) {
+            std::string rest = user_text.substr(name_end);
+            size_t s = 0;
+            while (s < rest.size() && (rest[s] == ' ' || rest[s] == '\t')) ++s;
+            while (s < rest.size()) {
+                size_t e = s;
+                while (e < rest.size() && rest[e] != ' ' && rest[e] != '\t') ++e;
+                cmd_args.push_back(rest.substr(s, e - s));
+                s = e;
+                while (s < rest.size() && (rest[s] == ' ' || rest[s] == '\t')) ++s;
+            }
+        }
+
+        aida::commands::command_t cmd;
+        const bool found = aida::commands::find(cmd_name, cmd);
+        if (found) {
+            std::string resolved;
+            const bool ok = aida::commands::execute(cmd_name, cmd_args, resolved);
+            if (!ok) {
+                ChatMessage err;
+                err.is_user = false;
+                err.has_thinking = false;
+                err.streaming = false;
+                err.text = std::string("[/")+ cmd_name + "] " + aida::commands::last_error();
+                g_chat_messages.push_back(err);
+                g_chat_scroll_to_bottom = true;
+                return;
+            }
+
+            const bool is_programmatic =
+                (cmd.source == aida::commands::command_source_t::builtin && cmd.template_text.empty()) ||
+                (cmd.source == aida::commands::command_source_t::agent);
+            if (is_programmatic) {
+                ChatMessage out_msg;
+                out_msg.is_user = false;
+                out_msg.has_thinking = false;
+                out_msg.streaming = false;
+                out_msg.text = resolved.empty()
+                    ? (std::string("[/") + cmd_name + "] done")
+                    : resolved;
+                g_chat_messages.push_back(out_msg);
+                g_chat_scroll_to_bottom = true;
+                return;
+            }
+
+            user_text = resolved;
+            last.text = resolved;
+        }
+    }
 
 
     if (!g_sa_ai_client || !g_sa_ai_client->is_available()) {
@@ -2868,4 +2934,142 @@ std::string get_attached_process_name()
 unsigned long get_attached_pid()
 {
     return driver_bridge::attached_pid();
+}
+
+namespace {
+
+ImU32 hex_to_imu32_or_default(const std::string& hex, ImU32 fallback)
+{
+    if (hex.size() < 7 || hex[0] != '#') return fallback;
+    auto h = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+        if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+        return -1;
+    };
+    int r1 = h(hex[1]), r2 = h(hex[2]), g1 = h(hex[3]), g2 = h(hex[4]), b1 = h(hex[5]), b2 = h(hex[6]);
+    if (r1 < 0 || r2 < 0 || g1 < 0 || g2 < 0 || b1 < 0 || b2 < 0) return fallback;
+    return IM_COL32(r1 * 16 + r2, g1 * 16 + g2, b1 * 16 + b2, 235);
+}
+
+void plan_build_pill_meta(std::string& label, std::string& glyph, ImU32& bg, ImU32& fg)
+{
+    const std::string active = aida::agent::active_agent_name();
+    if (active == "plan") {
+        glyph = "PLAN";
+        label = "PLAN";
+        bg = IM_COL32(38, 56, 96, 230);
+        fg = IM_COL32(190, 220, 255, 245);
+        return;
+    }
+    if (active == "build") {
+        glyph = "BUILD";
+        label = "BUILD";
+        bg = IM_COL32(38, 80, 56, 230);
+        fg = IM_COL32(190, 235, 200, 245);
+        return;
+    }
+    glyph = active.empty() ? std::string("?") : active.substr(0, 1);
+    label = active.empty() ? std::string("agent") : active;
+    const aida::agent::agent_info_t* info = aida::agent::get(active);
+    ImU32 col = info != nullptr
+        ? hex_to_imu32_or_default(info->color, IM_COL32(96, 110, 150, 230))
+        : IM_COL32(96, 110, 150, 230);
+    bg = col;
+    int rr = (col >> 0) & 0xFF;
+    int gg = (col >> 8) & 0xFF;
+    int bb = (col >> 16) & 0xFF;
+    float lum = 0.299f * (rr / 255.f) + 0.587f * (gg / 255.f) + 0.114f * (bb / 255.f);
+    fg = lum < 0.5f ? IM_COL32(245, 246, 252, 245) : IM_COL32(20, 22, 30, 245);
+}
+
+}
+
+void chat_handle_agent_shortcuts()
+{
+    bool ctrl = ImGui::GetIO().KeyCtrl;
+    bool shift = ImGui::GetIO().KeyShift;
+    if (!(ctrl && shift)) return;
+
+    if (ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+        if (aida::agent_picker::is_open())
+            aida::agent_picker::close();
+        else
+            aida::agent_picker::open();
+        return;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_M, false)) {
+        std::string current = aida::agent::active_agent_name();
+        std::string target = (current == "plan") ? std::string("build") : std::string("plan");
+        if (aida::agent::set_active_agent(target)) {
+            aida::events::publish(aida::events::event_agent_changed,
+                aida::events::agent_changed_t{ chat_active_session(), current, target });
+        }
+    }
+}
+
+float chat_agent_pill_width()
+{
+    std::string label, glyph;
+    ImU32 bg, fg;
+    plan_build_pill_meta(label, glyph, bg, fg);
+    ImVec2 ts = ImGui::CalcTextSize(label.c_str());
+    return ts.x + 38.f;
+}
+
+void chat_render_agent_pill(float anchor_x, float anchor_y, float alpha)
+{
+    if (alpha <= 0.001f) return;
+
+    std::string label, glyph;
+    ImU32 bg, fg;
+    plan_build_pill_meta(label, glyph, bg, fg);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 ts = ImGui::CalcTextSize(label.c_str());
+    float pill_h = 22.f;
+    float pad_x = 12.f;
+    float gap = 6.f;
+    float dot_r = 6.f;
+    float pill_w = pad_x + dot_r * 2.f + gap + ts.x + pad_x;
+
+    ImVec2 pmin(anchor_x, anchor_y);
+    ImVec2 pmax(anchor_x + pill_w, anchor_y + pill_h);
+
+    bool hov = ImGui::IsMouseHoveringRect(pmin, pmax);
+
+    int br = (bg >> 0) & 0xFF;
+    int bg_g = (bg >> 8) & 0xFF;
+    int bb_v = (bg >> 16) & 0xFF;
+    ImU32 fill = IM_COL32(br, bg_g, bb_v, static_cast<int>(((bg >> 24) & 0xFF) * alpha));
+    ImU32 fill_hov = IM_COL32(
+        std::min(255, br + 25), std::min(255, bg_g + 25), std::min(255, bb_v + 25),
+        static_cast<int>(((bg >> 24) & 0xFF) * alpha));
+    dl->AddRectFilled(pmin, pmax, hov ? fill_hov : fill, pill_h * 0.5f);
+    dl->AddRect(pmin, pmax,
+        IM_COL32(255, 255, 255, static_cast<int>((hov ? 70 : 30) * alpha)),
+        pill_h * 0.5f, 0, 1.f);
+
+    float dot_cx = pmin.x + pad_x + dot_r * 0.5f;
+    float dot_cy = pmin.y + pill_h * 0.5f;
+    dl->AddCircleFilled(ImVec2(dot_cx, dot_cy), dot_r,
+        IM_COL32(255, 255, 255, static_cast<int>(220 * alpha)), 18);
+
+    float text_x = dot_cx + dot_r + gap;
+    int fr = (fg >> 0) & 0xFF;
+    int fg_g = (fg >> 8) & 0xFF;
+    int fb = (fg >> 16) & 0xFF;
+    ImU32 fg_a = IM_COL32(fr, fg_g, fb, static_cast<int>(((fg >> 24) & 0xFF) * alpha));
+    dl->AddText(ImVec2(text_x, pmin.y + (pill_h - ts.y) * 0.5f), fg_a, label.c_str());
+
+    ImVec2 wp = ImGui::GetWindowPos();
+    ImGui::SetCursorPos(ImVec2(pmin.x - wp.x, pmin.y - wp.y));
+    ImGui::InvisibleButton("##aida_agent_pill", ImVec2(pill_w, pill_h));
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+        aida::agent_picker::open();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Active agent: %s\nClick to switch  |  Ctrl+Shift+M to toggle plan/build  |  Ctrl+Shift+A to open picker",
+            aida::agent::active_agent_name().c_str());
+    }
 }

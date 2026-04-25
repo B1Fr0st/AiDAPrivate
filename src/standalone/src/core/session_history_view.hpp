@@ -12,6 +12,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "imgui/imgui.h"
@@ -43,6 +44,7 @@ namespace aida::session_history {
 			int64_t     cache_write = 0;
 			int         depth = 0;
 			bool        has_compaction = false;
+			bool        last_msg_costs_loaded = false;
 			std::vector<std::pair<std::string, double>> last_msg_costs;
 		};
 
@@ -57,37 +59,25 @@ namespace aida::session_history {
 		{
 			std::mutex                                   mtx;
 			std::string                                  last_error;
-
 			char                                         search_buf[128] = {};
 			bool                                         show_archived = false;
-			bool                                         expanded = true;
-
 			std::string                                  active_session_id;
 			std::string                                  selected_id;
 			std::string                                  rename_target_id;
 			char                                         rename_buf[256] = {};
-
 			std::vector<row_t>                           rows;
 			std::vector<size_t>                          visible_indices;
 			std::unordered_map<std::string, std::vector<size_t>> children_index;
 			std::unordered_set<std::string>              collapsed_parents;
 			std::unordered_set<std::string>              compacted_cache;
-			std::atomic<bool>                            compacted_dirty{true};
-
 			std::atomic<int64_t>                         next_refresh_unix_ms{0};
 			std::atomic<bool>                            initialized{false};
-
 			ctx_target_t                                 ctx;
-			bool                                         open_ctx_menu = false;
 			bool                                         open_rename_popup = false;
 			bool                                         open_delete_popup = false;
-			bool                                         open_archive_popup = false;
-			std::string                                  pending_archive_id;
 			std::string                                  pending_delete_id;
-
 			double                                       total_visible_cost = 0.0;
 			double                                       total_all_cost = 0.0;
-
 			aida::events::subscription_handle_t          sub_compacted;
 			aida::events::subscription_handle_t          sub_binary_loaded;
 		};
@@ -96,11 +86,6 @@ namespace aida::session_history {
 		{
 			static state_t s;
 			return s;
-		}
-
-		inline void set_last_error_locked(state_t& st, const std::string& msg)
-		{
-			st.last_error = msg;
 		}
 
 		inline std::string trim_copy(const std::string& s)
@@ -125,7 +110,7 @@ namespace aida::session_history {
 
 		inline std::string current_binary_path()
 		{
-			std::string p = standalone_driver::attached_process_name();
+			std::string p = driver_bridge::attached_process_name();
 			if (!p.empty()) return p;
 			return std::string();
 		}
@@ -133,15 +118,10 @@ namespace aida::session_history {
 		inline std::string format_cost_str(double usd)
 		{
 			char buf[32];
-			if (usd < 0.001) {
-				return std::string("<$0.001");
-			} else if (usd < 1.0) {
-				snprintf(buf, sizeof(buf), "$%.4f", usd);
-			} else if (usd < 100.0) {
-				snprintf(buf, sizeof(buf), "$%.2f", usd);
-			} else {
-				snprintf(buf, sizeof(buf), "$%.0f", usd);
-			}
+			if (usd < 0.001) return std::string("<$0.001");
+			if (usd < 1.0) snprintf(buf, sizeof(buf), "$%.4f", usd);
+			else if (usd < 100.0) snprintf(buf, sizeof(buf), "$%.2f", usd);
+			else snprintf(buf, sizeof(buf), "$%.0f", usd);
 			return std::string(buf);
 		}
 
@@ -153,15 +133,11 @@ namespace aida::session_history {
 			int64_t delta_s = (now_ms - unix_ms) / 1000;
 			if (delta_s < 0) delta_s = 0;
 			char buf[64];
-			if (delta_s < 60) {
-				snprintf(buf, sizeof(buf), "%llds ago", (long long)delta_s);
-			} else if (delta_s < 3600) {
-				snprintf(buf, sizeof(buf), "%lldm ago", (long long)(delta_s / 60));
-			} else if (delta_s < 86400) {
-				snprintf(buf, sizeof(buf), "%lldh ago", (long long)(delta_s / 3600));
-			} else if (delta_s < 86400 * 7) {
-				snprintf(buf, sizeof(buf), "%lldd ago", (long long)(delta_s / 86400));
-			} else {
+			if (delta_s < 60) snprintf(buf, sizeof(buf), "%llds ago", (long long)delta_s);
+			else if (delta_s < 3600) snprintf(buf, sizeof(buf), "%lldm ago", (long long)(delta_s / 60));
+			else if (delta_s < 86400) snprintf(buf, sizeof(buf), "%lldh ago", (long long)(delta_s / 3600));
+			else if (delta_s < 86400 * 7) snprintf(buf, sizeof(buf), "%lldd ago", (long long)(delta_s / 86400));
+			else {
 				time_t t = (time_t)(unix_ms / 1000);
 				struct tm tmv;
 				localtime_s(&tmv, &t);
@@ -174,11 +150,9 @@ namespace aida::session_history {
 		{
 			std::vector<aida::session::message_t> msgs;
 			if (!aida::session::list_messages(session_id, msgs, -1)) return false;
-			for (const auto& m : msgs) {
-				for (const auto& p : m.parts) {
+			for (const auto& m : msgs)
+				for (const auto& p : m.parts)
 					if (p.kind == aida::session::part_t::kind_t::compaction) return true;
-				}
-			}
 			return false;
 		}
 
@@ -191,11 +165,9 @@ namespace aida::session_history {
 			per_msg.reserve(msgs.size());
 			for (const auto& m : msgs) {
 				double cost_sum = 0.0;
-				for (const auto& p : m.parts) {
-					if (p.kind == aida::session::part_t::kind_t::step_finish) {
+				for (const auto& p : m.parts)
+					if (p.kind == aida::session::part_t::kind_t::step_finish)
 						cost_sum += p.step_finish.cost_usd;
-					}
-				}
 				if (cost_sum > 0.0) {
 					std::string label;
 					switch (m.role) {
@@ -229,11 +201,9 @@ namespace aida::session_history {
 				const auto& r = st.rows[i];
 				if (filter.empty() || icontains(r.title, filter) || icontains(r.id, filter)) return true;
 				auto it = st.children_index.find(r.id);
-				if (it != st.children_index.end()) {
-					for (size_t cidx : it->second) {
+				if (it != st.children_index.end())
+					for (size_t cidx : it->second)
 						if (any_match(cidx)) return true;
-					}
-				}
 				return false;
 			};
 			std::function<void(size_t, int)> push_subtree = [&](size_t idx, int depth) {
@@ -249,33 +219,21 @@ namespace aida::session_history {
 							[&](size_t a, size_t b) {
 								return st.rows[a].time_updated_unix > st.rows[b].time_updated_unix;
 							});
-						for (size_t cidx : sorted_children) {
-							push_subtree(cidx, depth + 1);
-						}
+						for (size_t cidx : sorted_children) push_subtree(cidx, depth + 1);
 					}
 				}
 			};
 			for (size_t r : roots) push_subtree(r, 0);
 			st.total_visible_cost = 0.0;
-			for (size_t idx : st.visible_indices) {
-				st.total_visible_cost += st.rows[idx].total_cost_usd;
-			}
+			for (size_t idx : st.visible_indices) st.total_visible_cost += st.rows[idx].total_cost_usd;
 		}
 
 		inline void refresh_locked(state_t& st)
 		{
 			std::vector<aida::session::session_info_t> infos;
 			std::string bp = current_binary_path();
-			bool ok = false;
-			if (!bp.empty()) {
-				ok = aida::session::list(bp, infos);
-			} else {
-				ok = aida::session::list_all(infos);
-			}
-			if (!ok) {
-				set_last_error_locked(st, aida::session::last_error());
-				return;
-			}
+			bool ok = bp.empty() ? aida::session::list_all(infos) : aida::session::list(bp, infos);
+			if (!ok) { st.last_error = aida::session::last_error(); return; }
 			st.rows.clear();
 			st.rows.reserve(infos.size());
 			st.total_all_cost = 0.0;
@@ -292,8 +250,12 @@ namespace aida::session_history {
 				r.out_tokens          = tk.output;
 				r.cache_read          = tk.cache_read;
 				r.cache_write         = tk.cache_write;
-				r.has_compaction      = st.compacted_cache.count(info.id) > 0;
-				st.total_all_cost     += r.total_cost_usd;
+				if (st.compacted_cache.count(info.id) > 0) r.has_compaction = true;
+				else if (detect_compaction(info.id)) {
+					r.has_compaction = true;
+					st.compacted_cache.insert(info.id);
+				}
+				st.total_all_cost += r.total_cost_usd;
 				st.rows.push_back(std::move(r));
 			}
 			rebuild_visible_locked(st);
@@ -323,18 +285,15 @@ namespace aida::session_history {
 			state_t& st = g_state();
 			std::lock_guard<std::mutex> lk(st.mtx);
 			st.compacted_cache.insert(ev.session_id);
-			for (auto& r : st.rows) {
-				if (r.id == ev.session_id) r.has_compaction = true;
-			}
+			for (auto& r : st.rows) if (r.id == ev.session_id) r.has_compaction = true;
 		}
 
 		inline void on_binary_loaded(const aida::events::binary_loaded_t&)
 		{
-			state_t& st = g_state();
-			st.next_refresh_unix_ms.store(0);
+			g_state().next_refresh_unix_ms.store(0);
 		}
 
-		inline void open_session(const std::string& session_id)
+		inline void open_session_internal(const std::string& session_id)
 		{
 			if (session_id.empty()) return;
 			chat_bind_session(session_id);
@@ -355,10 +314,10 @@ namespace aida::session_history {
 			if (!aida::session::create(out_info, project_id, bp, std::string())) {
 				state_t& st = g_state();
 				std::lock_guard<std::mutex> lk(st.mtx);
-				set_last_error_locked(st, aida::session::last_error());
+				st.last_error = aida::session::last_error();
 				return;
 			}
-			open_session(out_info.id);
+			open_session_internal(out_info.id);
 			force_refresh();
 		}
 
@@ -369,10 +328,10 @@ namespace aida::session_history {
 			if (!aida::session::fork(session_id, std::string(), out_new)) {
 				state_t& st = g_state();
 				std::lock_guard<std::mutex> lk(st.mtx);
-				set_last_error_locked(st, aida::session::last_error());
+				st.last_error = aida::session::last_error();
 				return;
 			}
-			open_session(out_new.id);
+			open_session_internal(out_new.id);
 			force_refresh();
 		}
 
@@ -384,7 +343,7 @@ namespace aida::session_history {
 			if (!aida::session::set_archived(session_id, ts)) {
 				state_t& st = g_state();
 				std::lock_guard<std::mutex> lk(st.mtx);
-				set_last_error_locked(st, aida::session::last_error());
+				st.last_error = aida::session::last_error();
 				return;
 			}
 			force_refresh();
@@ -396,7 +355,7 @@ namespace aida::session_history {
 			if (!aida::session::remove(session_id)) {
 				state_t& st = g_state();
 				std::lock_guard<std::mutex> lk(st.mtx);
-				set_last_error_locked(st, aida::session::last_error());
+				st.last_error = aida::session::last_error();
 				return;
 			}
 			state_t& st = g_state();
@@ -416,7 +375,7 @@ namespace aida::session_history {
 			if (!aida::session::set_title(session_id, trimmed)) {
 				state_t& st = g_state();
 				std::lock_guard<std::mutex> lk(st.mtx);
-				set_last_error_locked(st, aida::session::last_error());
+				st.last_error = aida::session::last_error();
 				return;
 			}
 			force_refresh();
@@ -424,9 +383,8 @@ namespace aida::session_history {
 
 		inline int find_visible_idx_for_id(const state_t& st, const std::string& id)
 		{
-			for (int i = 0; i < (int)st.visible_indices.size(); ++i) {
+			for (int i = 0; i < (int)st.visible_indices.size(); ++i)
 				if (st.rows[st.visible_indices[i]].id == id) return i;
-			}
 			return -1;
 		}
 
@@ -451,7 +409,7 @@ namespace aida::session_history {
 				state_t& st = g_state();
 				std::string sid;
 				{ std::lock_guard<std::mutex> lk(st.mtx); sid = st.selected_id; }
-				if (!sid.empty()) open_session(sid);
+				if (!sid.empty()) open_session_internal(sid);
 			}
 			if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
 				state_t& st = g_state();
@@ -460,9 +418,7 @@ namespace aida::session_history {
 				{
 					std::lock_guard<std::mutex> lk(st.mtx);
 					sid = st.selected_id;
-					for (const auto& r : st.rows) {
-						if (r.id == sid) { was_archived = r.time_archived_unix > 0; break; }
-					}
+					for (const auto& r : st.rows) if (r.id == sid) { was_archived = r.time_archived_unix > 0; break; }
 				}
 				if (sid.empty()) return;
 				if (io.KeyShift) {
@@ -472,9 +428,7 @@ namespace aida::session_history {
 					toggle_archive_session(sid, was_archived);
 				}
 			}
-			if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
-				create_new_session();
-			}
+			if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_N, false)) create_new_session();
 		}
 
 	}
@@ -485,18 +439,14 @@ namespace aida::session_history {
 		auto& st = detail::g_state();
 		bool expected = false;
 		if (!st.initialized.compare_exchange_strong(expected, true)) return;
-
 		if (st.sub_compacted.valid()) aida::events::unsubscribe(st.sub_compacted);
 		if (st.sub_binary_loaded.valid()) aida::events::unsubscribe(st.sub_binary_loaded);
-
 		st.sub_compacted = aida::events::subscribe(
 			aida::events::event_session_compacted,
 			std::function<void(const aida::events::session_compacted_t&)>(&detail::on_session_compacted));
-
 		st.sub_binary_loaded = aida::events::subscribe(
 			aida::events::event_binary_loaded,
 			std::function<void(const aida::events::binary_loaded_t&)>(&detail::on_binary_loaded));
-
 		st.next_refresh_unix_ms.store(0);
 	}
 
@@ -540,7 +490,6 @@ namespace aida::session_history {
 	inline void render(float panel_w, float panel_h)
 	{
 		using namespace detail;
-
 		if (panel_w < 8.f || panel_h < 8.f) return;
 
 		state_t& st = g_state();
@@ -564,43 +513,28 @@ namespace aida::session_history {
 		{
 			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.f, 4.f));
 			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, 3.f));
-
 			float toolbar_w = panel_w - 8.f;
-
 			ImGui::SetCursorPos(ImVec2(4.f, 4.f));
 			ImGui::PushItemWidth(toolbar_w * 0.55f);
-			char prev_buf[128];
-			std::string prev;
-			{
-				std::lock_guard<std::mutex> lk(st.mtx);
-				memcpy(prev_buf, st.search_buf, sizeof(prev_buf));
-				prev = st.search_buf;
-			}
 			char tmp_buf[128];
-			memcpy(tmp_buf, prev_buf, sizeof(tmp_buf));
+			{ std::lock_guard<std::mutex> lk(st.mtx); memcpy(tmp_buf, st.search_buf, sizeof(tmp_buf)); }
 			if (ImGui::InputTextWithHint("##sh_search", "search sessions", tmp_buf, sizeof(tmp_buf))) {
 				std::lock_guard<std::mutex> lk(st.mtx);
 				memcpy(st.search_buf, tmp_buf, sizeof(st.search_buf));
 				rebuild_visible_locked(st);
 			}
 			ImGui::PopItemWidth();
-
 			ImGui::SameLine(0.f, 4.f);
 			if (ImGui::SmallButton("+ New")) create_new_session();
 			if (ImGui::IsItemHovered()) ImGui::SetTooltip("New session (Ctrl+N)");
-
 			ImGui::SameLine(0.f, 4.f);
 			bool show_arch_local;
-			{
-				std::lock_guard<std::mutex> lk(st.mtx);
-				show_arch_local = st.show_archived;
-			}
+			{ std::lock_guard<std::mutex> lk(st.mtx); show_arch_local = st.show_archived; }
 			if (ImGui::Checkbox("Archived", &show_arch_local)) {
 				std::lock_guard<std::mutex> lk(st.mtx);
 				st.show_archived = show_arch_local;
 				rebuild_visible_locked(st);
 			}
-
 			ImGui::PopStyleVar(2);
 		}
 
@@ -613,8 +547,8 @@ namespace aida::session_history {
 		ImGui::BeginChild("##sh_body", ImVec2(panel_w, body_h), false,
 			ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
-		bool any_hovered_in_body = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows);
-		if (any_hovered_in_body) detail::handle_keyboard();
+		bool body_hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows);
+		if (body_hovered) handle_keyboard();
 
 		std::vector<size_t> visible_copy;
 		std::vector<row_t>  rows_copy;
@@ -677,9 +611,7 @@ namespace aida::session_history {
 			}
 			float title_x = arrow_x + 14.f;
 
-			if (is_active) {
-				dl->AddCircleFilled(ImVec2(title_x - 6.f, rmin.y + row_h * 0.5f), 3.f, col_active);
-			}
+			if (is_active) dl->AddCircleFilled(ImVec2(title_x - 6.f, rmin.y + row_h * 0.5f), 3.f, col_active);
 
 			std::string display_title = r.title;
 			if (display_title.empty()) display_title = r.id.substr(0, 8);
@@ -723,18 +655,19 @@ namespace aida::session_history {
 					ImGui::TextUnformatted("Last messages:");
 					for (const auto& mc : r.last_msg_costs) {
 						char l[128];
-						snprintf(l, sizeof(l), "  %s  %s", mc.first.c_str(),
-							format_cost_str(mc.second).c_str());
+						snprintf(l, sizeof(l), "  %s  %s", mc.first.c_str(), format_cost_str(mc.second).c_str());
 						ImGui::TextUnformatted(l);
 					}
 				}
 				ImGui::EndTooltip();
-				if (r.last_msg_costs.empty()) {
+				if (!r.last_msg_costs_loaded) {
 					std::vector<std::pair<std::string, double>> tmp;
 					compute_last_costs(r.id, tmp);
 					std::lock_guard<std::mutex> lk(st.mtx);
-					for (auto& rr : st.rows) {
-						if (rr.id == r.id) { rr.last_msg_costs = std::move(tmp); break; }
+					for (auto& rr : st.rows) if (rr.id == r.id) {
+						rr.last_msg_costs = std::move(tmp);
+						rr.last_msg_costs_loaded = true;
+						break;
 					}
 				}
 			}
@@ -748,7 +681,7 @@ namespace aida::session_history {
 					rebuild_visible_locked(st);
 				}
 			}
-			if (dbl) open_session(r.id);
+			if (dbl) open_session_internal(r.id);
 			if (right_clicked) {
 				ctx_payload.request_open = true;
 				ctx_payload.id           = r.id;
@@ -772,14 +705,11 @@ namespace aida::session_history {
 		}
 
 		if (ImGui::BeginPopup("##sh_ctx")) {
-			detail::ctx_target_t target;
-			{
-				std::lock_guard<std::mutex> lk(st.mtx);
-				target = st.ctx;
-			}
+			ctx_target_t target;
+			{ std::lock_guard<std::mutex> lk(st.mtx); target = st.ctx; }
 			ImGui::TextDisabled("%s", target.title.empty() ? target.id.c_str() : target.title.c_str());
 			ImGui::Separator();
-			if (ImGui::MenuItem("Open")) open_session(target.id);
+			if (ImGui::MenuItem("Open")) open_session_internal(target.id);
 			if (ImGui::MenuItem("Fork at last message")) fork_session(target.id);
 			if (ImGui::MenuItem("Rename")) {
 				std::lock_guard<std::mutex> lk(st.mtx);
@@ -789,9 +719,8 @@ namespace aida::session_history {
 				memcpy(st.rename_buf, target.title.data(), cn);
 				st.open_rename_popup = true;
 			}
-			if (ImGui::MenuItem(target.archived ? "Unarchive" : "Archive")) {
+			if (ImGui::MenuItem(target.archived ? "Unarchive" : "Archive"))
 				toggle_archive_session(target.id, target.archived);
-			}
 			ImGui::Separator();
 			if (ImGui::MenuItem("Delete...")) {
 				std::lock_guard<std::mutex> lk(st.mtx);
@@ -819,10 +748,7 @@ namespace aida::session_history {
 			ImGui::SetNextItemWidth(360.f);
 			bool submit = ImGui::InputText("##sh_rename_in", buf, sizeof(buf),
 				ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
-			{
-				std::lock_guard<std::mutex> lk(st.mtx);
-				memcpy(st.rename_buf, buf, sizeof(st.rename_buf));
-			}
+			{ std::lock_guard<std::mutex> lk(st.mtx); memcpy(st.rename_buf, buf, sizeof(st.rename_buf)); }
 			if (submit || ImGui::Button("OK", ImVec2(80.f, 0.f))) {
 				rename_session(id_local, std::string(buf));
 				ImGui::CloseCurrentPopup();
@@ -839,10 +765,7 @@ namespace aida::session_history {
 		if (ImGui::BeginPopupModal("##sh_delete", nullptr,
 			ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
 			std::string id_local;
-			{
-				std::lock_guard<std::mutex> lk(st.mtx);
-				id_local = st.pending_delete_id;
-			}
+			{ std::lock_guard<std::mutex> lk(st.mtx); id_local = st.pending_delete_id; }
 			ImGui::Text("Delete this session permanently?");
 			ImGui::TextDisabled("%s", id_local.c_str());
 			ImGui::Separator();
@@ -870,28 +793,22 @@ namespace aida::session_history {
 				total_visible_local = st.total_visible_cost;
 				total_all_local     = st.total_all_cost;
 				sel_id_local        = st.selected_id.empty() ? st.active_session_id : st.selected_id;
-				if (!sel_id_local.empty()) {
-					for (const auto& rr : st.rows) {
-						if (rr.id == sel_id_local) { sel_cost = rr.total_cost_usd; break; }
-					}
-				}
+				if (!sel_id_local.empty()) for (const auto& rr : st.rows)
+					if (rr.id == sel_id_local) { sel_cost = rr.total_cost_usd; break; }
 			}
 			if (!sel_id_local.empty()) {
 				std::vector<aida::session::message_t> msgs;
-				if (aida::session::list_messages(sel_id_local, msgs, -1)) {
-					sel_msg_count = (int)msgs.size();
-				}
+				if (aida::session::list_messages(sel_id_local, msgs, -1)) sel_msg_count = (int)msgs.size();
 			}
 			char l1[128], l2[160];
 			snprintf(l1, sizeof(l1), "Visible: %s   All: %s",
 				format_cost_str(total_visible_local).c_str(),
 				format_cost_str(total_all_local).c_str());
-			if (!sel_id_local.empty()) {
+			if (!sel_id_local.empty())
 				snprintf(l2, sizeof(l2), "Selected: %s across %d messages",
 					format_cost_str(sel_cost).c_str(), sel_msg_count);
-			} else {
+			else
 				snprintf(l2, sizeof(l2), "Selected: -");
-			}
 			ImGui::TextColored(ImVec4(0.66f, 0.66f, 0.78f, 0.9f), "%s", l1);
 			ImGui::TextColored(ImVec4(0.55f, 0.58f, 0.7f, 0.9f), "%s", l2);
 			ImGui::EndChild();

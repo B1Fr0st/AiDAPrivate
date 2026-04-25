@@ -348,7 +348,6 @@ namespace binary_map_view {
 		const auto ta = [a](ImU32 c) -> ImU32 { return ui_anim::theme_alpha(c, a); };
 
 		ImU32 bg          = ta(th.bg_base);
-		ImU32 panel_bg    = ta(th.panel_bg);
 		ImU32 panel_hdr   = ta(th.panel_header);
 		ImU32 text_main   = ta(th.text_primary);
 		ImU32 text_dim    = ta(th.text_dim);
@@ -358,9 +357,6 @@ namespace binary_map_view {
 		ImU32 accent_full = IM_COL32(
 			static_cast<int>(ax * 255), static_cast<int>(ay * 255),
 			static_cast<int>(az * 255), static_cast<int>(230 * a));
-		ImU32 accent_dim  = IM_COL32(
-			static_cast<int>(ax * 255), static_cast<int>(ay * 255),
-			static_cast<int>(az * 255), static_cast<int>(80 * a));
 
 		ImGui::BeginChild("##binary_map_view", ImVec2(w, h), false,
 			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
@@ -734,12 +730,45 @@ namespace binary_map_view {
 		}
 
 		if (draw_section_header("Imports", total_imports, "imports")) {
-			std::string current_dll;
-			std::vector<std::string> bucket;
-			auto flush_bucket = [&](const std::string& dll) {
-				if (dll.empty()) return;
+			int imp_idx = 0;
+			for (const auto& imp : s.map.imports) {
+				const auto colon = imp.find(':');
+				const std::string dll = (colon == std::string::npos) ? imp : imp.substr(0, colon);
+				std::string func_list;
+				if (colon != std::string::npos && colon + 1 < imp.size()) {
+					size_t start = colon + 1;
+					while (start < imp.size() && imp[start] == ' ') ++start;
+					func_list = imp.substr(start);
+				}
+
+				std::vector<std::string> funcs;
+				{
+					size_t pos = 0;
+					while (pos < func_list.size()) {
+						size_t next = func_list.find(',', pos);
+						if (next == std::string::npos) next = func_list.size();
+						std::string token = func_list.substr(pos, next - pos);
+						while (!token.empty() && token.front() == ' ') token.erase(token.begin());
+						while (!token.empty() && token.back() == ' ') token.pop_back();
+						if (!token.empty()) funcs.push_back(std::move(token));
+						pos = next + 1u;
+					}
+				}
+
+				bool any_match = detail::filter_matches(filter_lower, dll);
+				if (!any_match) {
+					for (const auto& fn : funcs) {
+						if (detail::filter_matches(filter_lower, fn)) {
+							any_match = true;
+							break;
+						}
+					}
+				}
+				if (!any_match) continue;
+
 				const std::string key = std::string("imports::") + dll;
 				bool collapsed = detail::group_is_collapsed(s, key);
+
 				ImVec2 cp = ImGui::GetCursorScreenPos();
 				float row_w = left_w - 20.f;
 				float row_h = 20.f;
@@ -748,16 +777,21 @@ namespace binary_map_view {
 				dl->AddRectFilled(cp, ImVec2(cp.x + row_w, cp.y + row_h), fill, 3.f);
 				const char* arrow = collapsed ? "+" : "-";
 				dl->AddText(ImVec2(cp.x + 12.f, cp.y + 2.f), accent_full, arrow);
-				char hbuf[160];
-				std::snprintf(hbuf, sizeof(hbuf), "%s (%d)",
-					dll.c_str(), static_cast<int>(bucket.size()));
+				char hbuf[200];
+				std::snprintf(hbuf, sizeof(hbuf), "%s  (%d)",
+					dll.c_str(), static_cast<int>(funcs.size()));
 				dl->AddText(ImVec2(cp.x + 28.f, cp.y + 2.f), text_main, hbuf);
-				if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+
+				ImGui::SetCursorScreenPos(cp);
+				ImGui::PushID(static_cast<int>(0x60000000 | imp_idx));
+				ImGui::InvisibleButton("##bm_imp_hdr", ImVec2(row_w, row_h));
+				if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
 					detail::toggle_group(s, key);
 				}
-				ImGui::Dummy(ImVec2(row_w, row_h));
+				ImGui::PopID();
+
 				if (!collapsed) {
-					for (const auto& fn : bucket) {
+					for (const auto& fn : funcs) {
 						if (!detail::filter_matches(filter_lower, fn) &&
 							!detail::filter_matches(filter_lower, dll)) continue;
 						ImVec2 ip = ImGui::GetCursorScreenPos();
@@ -765,22 +799,8 @@ namespace binary_map_view {
 						ImGui::Dummy(ImVec2(row_w, row_h - 2.f));
 					}
 				}
-				bucket.clear();
-			};
-
-			for (const auto& imp : s.map.imports) {
-				const auto colon = imp.find(':');
-				std::string dll = (colon == std::string::npos) ? imp : imp.substr(0, colon);
-				std::string fn  = (colon == std::string::npos) ? std::string() : imp.substr(colon + 1);
-				if (!fn.empty() && !fn.front()) fn.erase(0, 0);
-				if (!fn.empty() && fn.front() == ' ') fn.erase(0, 1);
-				if (dll != current_dll) {
-					flush_bucket(current_dll);
-					current_dll = dll;
-				}
-				bucket.push_back(fn.empty() ? imp : fn);
+				++imp_idx;
 			}
-			flush_bucket(current_dll);
 		}
 
 		if (draw_section_header("Exports", total_exports, "exports")) {

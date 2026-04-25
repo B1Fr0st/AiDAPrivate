@@ -1,9 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -32,6 +36,7 @@ namespace agent_picker {
 			aida::events::subscription_handle_t sub_changed;
 			std::string                         pending_inject_prefix;
 			std::atomic<bool>                   has_pending_inject{ false };
+			std::atomic<bool>                   prev_was_at_only{ false };
 			bool                                initialized = false;
 		};
 
@@ -248,41 +253,30 @@ namespace agent_picker {
 	inline void notify_chat_buffer_changed(const char* buf)
 	{
 		if (buf == nullptr) return;
-		if (buf[0] == '@' && buf[1] == '\0') {
-			if (!is_open()) open();
+		auto& st = detail::state();
+		bool now_at_only = (buf[0] == '@' && buf[1] == '\0');
+		bool was = st.prev_was_at_only.exchange(now_at_only);
+		if (now_at_only && !was) {
+			if (!st.open.load()) open();
 		}
 	}
 
 	inline void render_if_open()
 	{
 		auto& st = detail::state();
-		if (!st.open.load()) {
-			std::lock_guard<std::mutex> lk(st.mtx);
-			if (st.anim > 0.f)
-				st.anim = std::max(0.f, st.anim - ImGui::GetIO().DeltaTime * 6.f);
-			else
-				return;
-		}
-
 		float dt = ImGui::GetIO().DeltaTime;
-		ImDrawList* fdl = ImGui::GetForegroundDrawList();
-
 		float target = st.open.load() ? 1.f : 0.f;
+		float anim_v = 0.f;
 		{
 			std::lock_guard<std::mutex> lk(st.mtx);
 			st.anim += (target - st.anim) * std::min(10.f * dt, 1.f);
 			if (target > 0.5f && st.anim > 0.985f) st.anim = 1.f;
 			if (target < 0.5f && st.anim < 0.015f) st.anim = 0.f;
-		}
-
-		float anim_v = 0.f;
-		{
-			std::lock_guard<std::mutex> lk(st.mtx);
 			anim_v = st.anim;
 		}
+		if (anim_v <= 0.001f && target <= 0.f) return;
 
 		ImVec2 display = ImGui::GetIO().DisplaySize;
-		fdl->AddRectFilled(ImVec2(0, 0), display, IM_COL32(0, 0, 0, static_cast<int>(150 * anim_v)));
 
 		const float pw = 480.f;
 		const float ph = 420.f;
@@ -293,6 +287,33 @@ namespace agent_picker {
 		float py = display.y * 0.5f - sh * 0.5f - 16.f * (1.f - anim_v);
 		float alpha = anim_v;
 
+		float ax = globals::ui::accent.x;
+		float ay = globals::ui::accent.y;
+		float az = globals::ui::accent.z;
+
+		float content_x = px + 14.f;
+		float content_y = py + 44.f;
+		float content_w = sw - 28.f;
+
+		ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+		ImGui::SetNextWindowSize(display, ImGuiCond_Always);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
+		bool win_open = true;
+		if (ImGui::Begin("##aida_agent_picker", &win_open,
+			ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+			ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings |
+			ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoInputs)) {
+			ImGui::End();
+		}
+		ImGui::PopStyleColor();
+		ImGui::PopStyleVar(2);
+
+		ImDrawList* fdl = ImGui::GetForegroundDrawList();
+		fdl->AddRectFilled(ImVec2(0, 0), display,
+			IM_COL32(0, 0, 0, static_cast<int>(150 * anim_v)));
 		for (int s = 0; s < 4; ++s) {
 			float off = 4.f + s * 3.f;
 			fdl->AddRectFilled(
@@ -300,11 +321,6 @@ namespace agent_picker {
 				ImVec2(px + sw + off, py + sh + off),
 				IM_COL32(0, 0, 0, static_cast<int>(28 * alpha * (4 - s) / 4.f)), 12.f);
 		}
-
-		float ax = globals::ui::accent.x;
-		float ay = globals::ui::accent.y;
-		float az = globals::ui::accent.z;
-
 		fdl->AddRectFilled(ImVec2(px, py), ImVec2(px + sw, py + sh),
 			IM_COL32(28, 28, 38, static_cast<int>(245 * alpha)), 12.f);
 		fdl->AddRect(ImVec2(px, py), ImVec2(px + sw, py + sh),
@@ -314,7 +330,6 @@ namespace agent_picker {
 				static_cast<int>(180 * alpha)), 2.f);
 
 		std::string title = "Switch agent";
-		ImVec2 tts = ImGui::CalcTextSize(title.c_str());
 		fdl->AddText(ImVec2(px + 18.f, py + 14.f),
 			IM_COL32(232, 232, 245, static_cast<int>(245 * alpha)), title.c_str());
 
@@ -323,21 +338,17 @@ namespace agent_picker {
 		fdl->AddText(ImVec2(px + sw - hts.x - 18.f, py + 18.f),
 			IM_COL32(150, 152, 168, static_cast<int>(180 * alpha)), hint.c_str());
 
-		float content_x = px + 14.f;
-		float content_y = py + 44.f;
-		float content_w = sw - 28.f;
-
 		ImGui::SetNextWindowPos(ImVec2(px, py), ImGuiCond_Always);
 		ImGui::SetNextWindowSize(ImVec2(sw, sh), ImGuiCond_Always);
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
 		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
-		bool win_open = true;
-		if (ImGui::Begin("##aida_agent_picker", &win_open,
+		bool win_open2 = true;
+		if (ImGui::Begin("##aida_agent_picker_panel", &win_open2,
 			ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
 			ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
 			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings |
-			ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoBringToFrontOnFocus)) {
+			ImGuiWindowFlags_NoDocking)) {
 
 			ImGui::SetCursorScreenPos(ImVec2(content_x, content_y));
 			ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);

@@ -40,6 +40,7 @@
 #include "../core/work_queue.hpp"
 #include "../core/session_history_view.hpp"
 #include "../core/binary_map_view.hpp"
+#include "../core/agent_picker_view.hpp"
 
 static ID3D11ShaderResourceView* g_send_icon_srv    = nullptr;
 static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
@@ -661,6 +662,9 @@ void helpers::render_title()
 	const int th_bb_r = (themes::resolved.bg_base >>  0) & 0xFF;
 	const int th_bb_g = (themes::resolved.bg_base >>  8) & 0xFF;
 	const int th_bb_b = (themes::resolved.bg_base >> 16) & 0xFF;
+
+
+	chat_handle_agent_shortcuts();
 
 
 	if (!ImGui::GetIO().WantTextInput) {
@@ -2752,15 +2756,81 @@ void helpers::render_title()
 		} else {
 
 
+		static bool   s_sessions_section_expanded = true;
+		static float  s_sessions_frac = 0.40f;
+		static bool   s_sessions_dragging = false;
+
+		const char* sessions_lbl = "SESSIONS";
+		float sess_hdr_y = 6.f;
+		const char* sess_arrow = s_sessions_section_expanded ? "v" : ">";
+		ImU32 sess_label_col = IM_COL32(130, 128, 155, (int)(200 * a));
+		fdl->AddText(ImVec2(fwp.x + 10.f, fwp.y + sess_hdr_y), sess_label_col, sess_arrow);
+		fdl->AddText(ImVec2(fwp.x + 22.f, fwp.y + sess_hdr_y), sess_label_col, sessions_lbl);
+		{
+			ImGui::SetCursorPos(ImVec2(0.f, sess_hdr_y - 2.f));
+			ImGui::InvisibleButton("##sess_hdr_btn", ImVec2(fw, 18.f));
+			if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+				s_sessions_section_expanded = !s_sessions_section_expanded;
+			}
+		}
+
+		const float sh_hdr_total = 24.f;
+		float avail_below_hdr = fh - sh_hdr_total;
+		if (avail_below_hdr < 60.f) avail_below_hdr = 60.f;
+
+		float sess_h = 0.f;
+		float splitter_h = 0.f;
+		if (s_sessions_section_expanded) {
+			s_sessions_frac = std::clamp(s_sessions_frac, 0.10f, 0.85f);
+			sess_h = avail_below_hdr * s_sessions_frac - 6.f;
+			if (sess_h < 60.f) sess_h = 60.f;
+			splitter_h = 6.f;
+		}
+
+		float sess_y = sh_hdr_total;
+		if (s_sessions_section_expanded) {
+			ImGui::SetCursorPos(ImVec2(0.f, sess_y));
+			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+			ImGui::BeginChild("##sessions_panel", ImVec2(fw, sess_h), false, ImGuiWindowFlags_NoBackground);
+			aida::session_history::render(fw, sess_h);
+			ImGui::EndChild();
+			ImGui::PopStyleVar();
+
+			float spl_y = sess_y + sess_h;
+			ImVec2 spl_min(fwp.x, fwp.y + spl_y);
+			ImVec2 spl_max(fwp.x + fw, fwp.y + spl_y + splitter_h);
+			bool spl_hov = ImGui::IsMouseHoveringRect(spl_min, spl_max, false);
+			ImU32 spl_col = (spl_hov || s_sessions_dragging)
+				? IM_COL32((int)(ax3*200+50), (int)(ay3*200+50), (int)(az3*200+50), (int)(180 * a))
+				: IM_COL32(255, 255, 255, (int)(20 * a));
+			fdl->AddRectFilled(ImVec2(spl_min.x + 4.f, spl_min.y + 2.f),
+				ImVec2(spl_max.x - 4.f, spl_max.y - 2.f), spl_col, 1.5f);
+
+			ImGui::SetCursorPos(ImVec2(0.f, spl_y));
+			ImGui::InvisibleButton("##sess_split", ImVec2(fw, splitter_h));
+			if (ImGui::IsItemActive()) {
+				s_sessions_dragging = true;
+				float dy = ImGui::GetIO().MouseDelta.y;
+				if (avail_below_hdr > 1.f) s_sessions_frac += dy / avail_below_hdr;
+			} else {
+				s_sessions_dragging = false;
+			}
+			if (ImGui::IsItemHovered() || s_sessions_dragging) {
+				ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+			}
+		}
+
+		float fb_label_y = sh_hdr_total + sess_h + splitter_h + 2.f;
 		const char* explorer_lbl = "EXPLORER";
-		ImVec2 elbl_ts = ImGui::CalcTextSize(explorer_lbl);
-		fdl->AddText(ImVec2(fwp.x + 10.f, fwp.y + 8.f),
+		fdl->AddText(ImVec2(fwp.x + 10.f, fwp.y + fb_label_y),
 			IM_COL32(130, 128, 155, (int)(180 * a)), explorer_lbl);
 
-		float tree_y = 28.f;
+		float tree_y = fb_label_y + 20.f;
+		float fb_scroll_h = fh - tree_y;
+		if (fb_scroll_h < 24.f) fb_scroll_h = 24.f;
 		ImGui::SetCursorPos(ImVec2(0.f, tree_y));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
-		ImGui::BeginChild("##fb_scroll", ImVec2(fw, fh - tree_y), false, ImGuiWindowFlags_NoBackground);
+		ImGui::BeginChild("##fb_scroll", ImVec2(fw, fb_scroll_h), false, ImGuiWindowFlags_NoBackground);
 		{
 			if (file_browser::needs_refresh || file_browser::entries.empty()) {
 				file_browser::refresh();
@@ -4663,6 +4733,13 @@ void helpers::render_title()
 			float btn_sz = frame_h;
 			float igap   = 4.f;
 
+			float pill_strip_h = 26.f;
+			float pill_strip_x = 4.f;
+			ImVec2 pill_anchor_window = ImVec2(pill_strip_x, input_y - pill_strip_h - 2.f);
+			ImVec2 pill_anchor_screen = ImVec2(ImGui::GetWindowPos().x + pill_anchor_window.x,
+				ImGui::GetWindowPos().y + pill_anchor_window.y);
+			chat_render_agent_pill(pill_anchor_screen.x, pill_anchor_screen.y, a);
+
 
 			ImGui::SetCursorPos(ImVec2(0.f, input_y));
 			ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(th_pb_r/255.f, th_pb_g/255.f, th_pb_b/255.f, 0.85f * a));
@@ -4702,6 +4779,9 @@ void helpers::render_title()
 			ImVec2 input_max  = ImGui::GetItemRectMax();
 			ImGui::PopStyleVar(2);
 			ImGui::PopStyleColor(3);
+
+			aida::agent_picker::notify_chat_buffer_changed(g_chat_buf);
+			aida::agent_picker::apply_pending_inject_to_buffer(g_chat_buf, sizeof(g_chat_buf));
 
 
 			if (!input_active && g_chat_buf[0] == '\0')
