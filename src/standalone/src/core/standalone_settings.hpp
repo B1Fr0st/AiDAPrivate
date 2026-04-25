@@ -394,6 +394,11 @@ struct settings_sa_t
     std::string marketplace_installed_json;
 
 
+    std::string default_provider_id;
+    std::string default_model_id;
+    std::string small_model_provider_id;
+    std::string small_model_id;
+
     std::string api_provider = "openai_compatible";
     std::string gemini_api_key;
     std::string gemini_model_name = "gemini-2.5-flash";
@@ -835,8 +840,37 @@ struct settings_sa_t
 
     std::string get_active_profile_kind() const
     {
+        if (!default_provider_id.empty())
+            return default_provider_id;
         const auto* profile = get_active_profile();
         return profile ? sa_settings_detail::normalize_provider_kind(profile->kind) : std::string("openai_compatible");
+    }
+
+    std::string selected_provider_id() const
+    {
+        if (!default_provider_id.empty())
+            return default_provider_id;
+        return get_active_profile_kind();
+    }
+
+    std::string selected_model_id() const
+    {
+        if (!default_model_id.empty())
+            return default_model_id;
+        const auto* profile = get_active_profile();
+        return profile ? profile->model : std::string();
+    }
+
+    void set_selection(const std::string& provider_id, const std::string& model_id)
+    {
+        default_provider_id = provider_id;
+        default_model_id = model_id;
+    }
+
+    void set_small_model_selection(const std::string& provider_id, const std::string& model_id)
+    {
+        small_model_provider_id = provider_id;
+        small_model_id = model_id;
     }
 
     std::string get_active_profile_name() const
@@ -853,6 +887,8 @@ struct settings_sa_t
 
     std::string get_active_model() const
     {
+        if (!default_model_id.empty())
+            return default_model_id;
         const auto* profile = get_active_profile();
         return profile ? profile->model : std::string();
     }
@@ -1108,6 +1144,11 @@ struct settings_sa_t
                 dst = root[key].get<bool>();
         };
 
+        str("default_provider_id", default_provider_id);
+        str("default_model_id", default_model_id);
+        str("small_model_provider_id", small_model_provider_id);
+        str("small_model_id", small_model_id);
+
         str("api_provider", api_provider);
         secret("gemini_api_key", gemini_api_key);
         str("gemini_model_name", gemini_model_name);
@@ -1334,6 +1375,10 @@ struct settings_sa_t
         std::filesystem::create_directories(path.parent_path());
 
         nlohmann::json root = nlohmann::json::object();
+        root["default_provider_id"] = default_provider_id;
+        root["default_model_id"] = default_model_id;
+        root["small_model_provider_id"] = small_model_provider_id;
+        root["small_model_id"] = small_model_id;
         root["api_provider"] = api_provider;
         root["gemini_api_key"] = sa_settings_detail::obfuscate_key(gemini_api_key);
         root["gemini_model_name"] = gemini_model_name;

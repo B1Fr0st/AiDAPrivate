@@ -6,9 +6,36 @@
 #include <algorithm>
 
 #include "standalone_context.hpp"
+#include "provider_catalog.hpp"
 
 
 namespace cost_calc {
+
+
+inline context_mgmt::model_info_t model_info_from_catalog(const aida::provider::model_info_t& m)
+{
+    context_mgmt::model_info_t out;
+    out.context_window     = m.limit.context > 0 ? static_cast<int>(m.limit.context) : 128000;
+    out.supports_tools     = m.capabilities.tool_call;
+    out.supports_reasoning = m.capabilities.reasoning;
+    out.supports_caching   = (m.cost.cache_read_per_million > 0.0) || (m.cost.cache_write_per_million > 0.0);
+    out.supports_images    = m.capabilities.attachment;
+    out.input_price        = m.cost.input_per_million;
+    out.output_price       = m.cost.output_per_million;
+    out.cache_read_price   = m.cost.cache_read_per_million;
+    out.cache_write_price  = m.cost.cache_write_per_million;
+    out.openai_compatible  = (m.api.npm == "@ai-sdk/openai" || m.api.npm == "@ai-sdk/openai-compatible");
+    return out;
+}
+
+
+inline context_mgmt::model_info_t resolve_model_info(const std::string& provider_id, const std::string& model_id)
+{
+    const auto* m = aida::provider::catalog::get_model(provider_id, model_id);
+    if (m)
+        return model_info_from_catalog(*m);
+    return context_mgmt::get_model_info(model_id);
+}
 
 
 struct cost_result_t
