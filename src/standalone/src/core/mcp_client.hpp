@@ -25,6 +25,24 @@ enum class transport_type_t
     stdio
 };
 
+enum class transport_mode_t
+{
+    auto_detect,
+    streamable_http,
+    sse_legacy,
+    stdio_local
+};
+
+enum class oauth_status_t
+{
+    not_required,
+    needs_auth,
+    needs_client_registration,
+    authenticated,
+    authenticating,
+    failed
+};
+
 struct server_config_t
 {
     std::string       name;
@@ -36,6 +54,11 @@ struct server_config_t
     std::string       api_key;
     bool              enabled        = true;
     bool              auto_connect   = true;
+    bool              oauth_enabled  = true;
+    std::string       oauth_client_id;
+    std::string       oauth_client_secret;
+    std::string       oauth_scope;
+    std::string       oauth_redirect_uri;
 };
 
 
@@ -78,6 +101,37 @@ enum class connection_state_t
     reconnecting,
     error
 };
+
+
+struct oauth_state_t
+{
+    std::string server_name;
+    std::string authorization_url;
+    std::string state_token;
+    std::string code_verifier;
+    std::string code_challenge;
+    std::string client_id;
+    std::string client_secret;
+    std::string redirect_uri;
+    std::string token_endpoint;
+    std::string authorization_endpoint;
+    std::string registration_endpoint;
+    std::string scope;
+    int callback_port = 0;
+    int64_t deadline_unix = 0;
+    std::atomic<bool> done{false};
+    std::atomic<bool> cancelled{false};
+    std::string received_code;
+    std::string error;
+    void* listener_handle = nullptr;
+
+    oauth_state_t() = default;
+    oauth_state_t(const oauth_state_t&) = delete;
+    oauth_state_t& operator=(const oauth_state_t&) = delete;
+};
+
+
+using auth_completion_callback_t = std::function<void(const std::string& server_name, oauth_status_t final_status, const std::string& error)>;
 
 
 class client_t
@@ -123,6 +177,12 @@ public:
 
     const std::vector<remote_tool_t>& cached_tools() const;
 
+    oauth_status_t oauth_status() const;
+
+    transport_mode_t active_transport_mode() const;
+
+    bool poll_notifications();
+
 private:
 
     json rpc_request(const std::string& method, const json& params = json::object());
@@ -131,6 +191,14 @@ private:
 
     json send_http(const json& request);
     json send_stdio(const json& request);
+
+    bool perform_remote_handshake();
+    bool perform_initialize_locked();
+    bool ensure_access_token_fresh_locked();
+    bool refresh_access_token_locked();
+    void process_notification(const json& notif);
+    void update_server_url_metadata();
+    bool detect_oauth_metadata(const std::string& www_authenticate_hdr);
 
 
     bool  launch_stdio_process();
@@ -147,6 +215,18 @@ private:
     std::string                 _last_error;
     std::vector<remote_tool_t>  _cached_tools;
     int                         _next_id = 1;
+
+    transport_mode_t            _transport_mode = transport_mode_t::auto_detect;
+    std::string                 _sse_session_id;
+    std::string                 _sse_post_path;
+    std::string                 _streamable_session_id;
+
+    oauth_status_t              _oauth_status = oauth_status_t::not_required;
+    std::string                 _oauth_token_endpoint;
+    std::string                 _oauth_authorization_endpoint;
+    std::string                 _oauth_registration_endpoint;
+    std::string                 _oauth_resource_metadata_url;
+    std::string                 _oauth_realm;
 
 
     void*   _child_process  = nullptr;
@@ -199,12 +279,19 @@ public:
         connection_state_t state;
         std::string        error;
         size_t             tool_count;
+        oauth_status_t     oauth;
     };
 
     std::vector<server_status_t> get_status() const;
 
 
     void poll();
+
+
+    bool refresh_tools(const std::string& name);
+
+
+    bool find_config(const std::string& name, server_config_t& out) const;
 
 private:
     struct entry_t
@@ -216,5 +303,18 @@ private:
     mutable std::mutex        _mtx;
     std::vector<entry_t>      _entries;
 };
+
+
+bool supports_oauth(const std::string& server_name);
+bool has_stored_tokens(const std::string& server_name);
+bool start_auth(const std::string& server_name, oauth_state_t& out_state);
+oauth_status_t poll_auth(oauth_state_t& state);
+bool finish_auth(const std::string& server_name, const std::string& authorization_code);
+bool remove_auth(const std::string& server_name);
+oauth_status_t auth_status(const std::string& server_name);
+bool cancel_auth(oauth_state_t& state);
+bool trigger_auth_flow(const std::string& server_name, auth_completion_callback_t on_complete);
+
+const std::string& last_error();
 
 }

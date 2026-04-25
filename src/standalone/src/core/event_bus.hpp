@@ -193,6 +193,13 @@ namespace events {
         int         tool_count = 0;
     };
 
+    struct agent_changed_t
+    {
+        std::string session_id;
+        std::string previous_agent;
+        std::string new_agent;
+    };
+
     inline constexpr event_def_t<permission_asked_t>   event_permission_asked{"aida.permission.asked"};
     inline constexpr event_def_t<permission_replied_t> event_permission_replied{"aida.permission.replied"};
     inline constexpr event_def_t<session_compacted_t>  event_session_compacted{"aida.session.compacted"};
@@ -202,6 +209,7 @@ namespace events {
     inline constexpr event_def_t<model_changed_t>      event_model_changed{"aida.model.changed"};
     inline constexpr event_def_t<binary_loaded_t>      event_binary_loaded{"aida.binary.loaded"};
     inline constexpr event_def_t<mcp_tools_changed_t>  event_mcp_tools_changed{"aida.mcp.tools_changed"};
+    inline constexpr event_def_t<agent_changed_t>      event_agent_changed{"aida.agent.changed"};
 
 }
 }

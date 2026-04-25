@@ -398,6 +398,11 @@ struct settings_sa_t
     std::string default_model_id;
     std::string small_model_provider_id;
     std::string small_model_id;
+    std::string default_agent_name = "build";
+
+    std::map<std::string, std::string> preferred_model_per_provider;
+    std::map<std::string, std::string> provider_base_url_overrides;
+    std::map<std::string, std::string> provider_headers_overrides;
 
     std::string api_provider = "openai_compatible";
     std::string gemini_api_key;
@@ -1148,6 +1153,7 @@ struct settings_sa_t
         str("default_model_id", default_model_id);
         str("small_model_provider_id", small_model_provider_id);
         str("small_model_id", small_model_id);
+        str("default_agent_name", default_agent_name);
 
         str("api_provider", api_provider);
         secret("gemini_api_key", gemini_api_key);
@@ -1357,6 +1363,28 @@ struct settings_sa_t
 
         marketplace_installed_json = root.value("marketplace_installed_json", "");
 
+        if (root.contains("preferred_model_per_provider") && root["preferred_model_per_provider"].is_object()) {
+            preferred_model_per_provider.clear();
+            for (auto it = root["preferred_model_per_provider"].begin(); it != root["preferred_model_per_provider"].end(); ++it) {
+                if (it.value().is_string())
+                    preferred_model_per_provider[it.key()] = it.value().get<std::string>();
+            }
+        }
+        if (root.contains("provider_base_url_overrides") && root["provider_base_url_overrides"].is_object()) {
+            provider_base_url_overrides.clear();
+            for (auto it = root["provider_base_url_overrides"].begin(); it != root["provider_base_url_overrides"].end(); ++it) {
+                if (it.value().is_string())
+                    provider_base_url_overrides[it.key()] = it.value().get<std::string>();
+            }
+        }
+        if (root.contains("provider_headers_overrides") && root["provider_headers_overrides"].is_object()) {
+            provider_headers_overrides.clear();
+            for (auto it = root["provider_headers_overrides"].begin(); it != root["provider_headers_overrides"].end(); ++it) {
+                if (it.value().is_string())
+                    provider_headers_overrides[it.key()] = it.value().get<std::string>();
+            }
+        }
+
         migrate_legacy_fields_into_profiles();
         sync_legacy_fields_from_active_profile();
 
@@ -1379,6 +1407,7 @@ struct settings_sa_t
         root["default_model_id"] = default_model_id;
         root["small_model_provider_id"] = small_model_provider_id;
         root["small_model_id"] = small_model_id;
+        root["default_agent_name"] = default_agent_name;
         root["api_provider"] = api_provider;
         root["gemini_api_key"] = sa_settings_detail::obfuscate_key(gemini_api_key);
         root["gemini_model_name"] = gemini_model_name;
@@ -1575,6 +1604,21 @@ struct settings_sa_t
         }
         root["mcp_client_servers"] = mcp_clients;
         root["marketplace_installed_json"] = marketplace_installed_json;
+
+        nlohmann::json prefs = nlohmann::json::object();
+        for (const auto& kv : preferred_model_per_provider)
+            prefs[kv.first] = kv.second;
+        root["preferred_model_per_provider"] = prefs;
+
+        nlohmann::json base_overrides = nlohmann::json::object();
+        for (const auto& kv : provider_base_url_overrides)
+            base_overrides[kv.first] = kv.second;
+        root["provider_base_url_overrides"] = base_overrides;
+
+        nlohmann::json header_overrides = nlohmann::json::object();
+        for (const auto& kv : provider_headers_overrides)
+            header_overrides[kv.first] = kv.second;
+        root["provider_headers_overrides"] = header_overrides;
 
         std::ofstream ofs(path, std::ios::trunc);
         if (!ofs.is_open())

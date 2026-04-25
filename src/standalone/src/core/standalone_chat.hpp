@@ -2,7 +2,11 @@
 
 #include <string>
 #include <vector>
+
+#include <nlohmann/json.hpp>
+
 #include "file_context_tracker.hpp"
+#include "mcp_standalone.hpp"
 
 
 void init_standalone_chat();
@@ -16,8 +20,17 @@ void render_tool_approval_dialog();
 bool is_ai_busy();
 
 
+void        chat_bind_session(const std::string& session_id);
+std::string chat_active_session();
+void        chat_record_assistant_message_id(const std::string& message_id);
+
+
 namespace mcp_client { class manager_t; }
 mcp_client::manager_t& get_mcp_client_manager();
+
+mcp_standalone::server_t& get_local_mcp_server();
+std::vector<mcp_standalone::tool_def_t> snapshot_local_tools();
+std::string execute_local_tool(const std::string& name, const nlohmann::json& arguments);
 
 
 file_context::tracker_t& get_file_tracker();

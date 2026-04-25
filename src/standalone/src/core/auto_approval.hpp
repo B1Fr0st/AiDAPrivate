@@ -7,6 +7,133 @@
 #include <regex>
 #include <functional>
 
+#include <nlohmann/json.hpp>
+
+#include "agent_registry.hpp"
+
+
+namespace aida {
+namespace permission {
+
+
+struct rule_match_t
+{
+    enum class action_t : int
+    {
+        allow = 0,
+        deny  = 1,
+        ask   = 2
+    };
+
+    bool        matched = false;
+    action_t    action = action_t::allow;
+    std::string matched_pattern;
+    std::string matched_permission_key;
+};
+
+
+inline bool wildcard_match(const std::string& pattern, const std::string& target)
+{
+    return aida::agent::wildcard_match(pattern, target);
+}
+
+
+inline rule_match_t evaluate(const aida::agent::ruleset_t& rules,
+                             const std::string& permission_key,
+                             const std::string& argument)
+{
+    rule_match_t out;
+    out.matched = false;
+    out.action = rule_match_t::action_t::allow;
+
+    const aida::agent::permission_rule_t* match = nullptr;
+    for (const auto& r : rules)
+    {
+        if (!wildcard_match(r.permission_key, permission_key))
+            continue;
+        if (!argument.empty() && !wildcard_match(r.pattern, argument))
+            continue;
+        match = &r;
+    }
+
+    if (match == nullptr)
+        return out;
+
+    out.matched = true;
+    out.matched_pattern = match->pattern;
+    out.matched_permission_key = match->permission_key;
+    switch (match->action)
+    {
+    case aida::agent::permission_rule_t::action_t::allow:
+        out.action = rule_match_t::action_t::allow; break;
+    case aida::agent::permission_rule_t::action_t::deny:
+        out.action = rule_match_t::action_t::deny; break;
+    case aida::agent::permission_rule_t::action_t::ask:
+        out.action = rule_match_t::action_t::ask; break;
+    }
+    return out;
+}
+
+
+inline std::string first_path_or_command_argument(const std::string& tool_name,
+                                                   const nlohmann::json& args)
+{
+    if (!args.is_object()) return std::string{};
+
+    const std::string key = aida::agent::permission_key_for_tool(tool_name);
+
+    auto get_string = [&](std::initializer_list<const char*> names) -> std::string {
+        for (const char* n : names)
+        {
+            if (args.contains(n) && args[n].is_string())
+                return args[n].get<std::string>();
+        }
+        return std::string{};
+    };
+
+    if (key == "edit" || key == "read" ||
+        key == "glob" || key == "list")
+    {
+        std::string v = get_string({"path", "file_path", "file", "filepath",
+                                     "input_file", "target", "target_file",
+                                     "directory"});
+        if (!v.empty()) return v;
+    }
+
+    if (key == "bash")
+    {
+        std::string v = get_string({"command", "cmd", "shell", "bash",
+                                     "command_text", "execute"});
+        if (!v.empty()) return v;
+    }
+
+    if (key == "grep" || key == "codesearch")
+    {
+        std::string v = get_string({"path", "directory", "query", "pattern"});
+        if (!v.empty()) return v;
+    }
+
+    if (key == "webfetch" || key == "websearch")
+    {
+        std::string v = get_string({"url", "query"});
+        if (!v.empty()) return v;
+    }
+
+    if (key == "driver_write" || key == "driver_read")
+    {
+        std::string v = get_string({"address", "module", "process", "pattern"});
+        if (!v.empty()) return v;
+    }
+
+    std::string fallback = get_string({"path", "file_path", "command", "url",
+                                        "query", "name", "target"});
+    return fallback;
+}
+
+
+}
+}
+
 
 namespace auto_approval {
 
@@ -72,9 +199,9 @@ enum class tool_category_t
 
 inline tool_category_t categorize_tool(const std::string& tool_name)
 {
-    if (tool_name == "switch_mode")
+    if (tool_name == "switch_agent")
         return tool_category_t::mode_switch;
-    if (tool_name == "new_task")
+    if (tool_name == "task")
         return tool_category_t::subtask;
     if (tool_name == "ask_followup_question")
         return tool_category_t::followup;

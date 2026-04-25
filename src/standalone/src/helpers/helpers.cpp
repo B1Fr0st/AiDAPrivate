@@ -4080,7 +4080,37 @@ void helpers::render_title()
 
 			float wrap_w = cw - 20.f;
 
-			if (msg.is_user)
+			if (msg.is_user && msg.text.find("<plan_exit_handoff>") != std::string::npos)
+			{
+				std::string rendered = msg.text;
+				size_t spos = rendered.find("<plan_exit_handoff>");
+				if (spos != std::string::npos) rendered.erase(spos, sizeof("<plan_exit_handoff>") - 1);
+				while (!rendered.empty() && (rendered.back() == '\n' || rendered.back() == ' '))
+					rendered.pop_back();
+				std::string display = "[plan -> build]";
+				if (!rendered.empty()) display += "\n" + rendered;
+
+				ImVec2 ts = ImGui::CalcTextSize(display.c_str(), nullptr, false, wrap_w * 0.78f);
+				float bw = ts.x + 16.f;
+				float bh = ts.y + 10.f;
+				float target_x = (cw - bw) * 0.5f;
+				float bx = target_x;
+				float by = cursor_y;
+				ImVec2 bmin = ImVec2(wp2.x + bx, wp2.y + by);
+				ImVec2 bmax = ImVec2(bmin.x + bw, bmin.y + bh);
+				dl->AddRectFilled(bmin, bmax,
+					IM_COL32((int)(ax * 0.30f + 30), (int)(ay * 0.30f + 25), (int)(az * 0.30f + 60),
+						(int)(200 * appear * a)), 8.f);
+				dl->AddRect(bmin, bmax,
+					IM_COL32((int)(ax * 0.7f), (int)(ay * 0.7f), (int)(az * 0.9f),
+						(int)(120 * appear * a)), 8.f, 0, 1.5f);
+				dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+					ImVec2(bmin.x + 8.f, bmin.y + 5.f),
+					IM_COL32(220, 220, 255, (int)(245 * appear * a)),
+					display.c_str(), nullptr, wrap_w * 0.78f);
+				cursor_y += bh + 8.f;
+			}
+			else if (msg.is_user)
 			{
 
 				if (chat_edit::active && chat_edit::msg_idx == mi) {

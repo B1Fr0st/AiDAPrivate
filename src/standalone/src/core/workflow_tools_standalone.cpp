@@ -2,14 +2,17 @@
 #include <windows.h>
 
 #include "mcp_standalone.hpp"
-#include "standalone_modes.hpp"
+#include "agent_registry.hpp"
 #include "standalone_settings.hpp"
 #include "apply_diff.hpp"
 #include "apply_patch.hpp"
 #include "code_index.hpp"
 #include "checkpoints.hpp"
+#define AIDA_SKILLS_IMPLEMENTATION
 #include "skills.hpp"
 #include "tool_repetition.hpp"
+#include "event_bus.hpp"
+#include "session_store.hpp"
 
 #include "../helpers/globals.h"
 
@@ -20,6 +23,7 @@
 #include <vector>
 #include <mutex>
 #include <algorithm>
+#include <chrono>
 
 #include <nlohmann/json.hpp>
 
@@ -61,52 +65,186 @@ std::mutex                          g_skills_mtx;
 std::string                         g_workspace_root;
 
 
-tool_result_t handle_switch_mode(const json& params)
+tool_result_t handle_switch_agent(const json& params)
 {
-    if (!params.contains("mode_slug") || !params["mode_slug"].is_string())
-        return tool_result_t::error("Missing required parameter: mode_slug");
+    std::string name;
+    if (params.contains("agent") && params["agent"].is_string())
+        name = params["agent"].get<std::string>();
+    else if (params.contains("name") && params["name"].is_string())
+        name = params["name"].get<std::string>();
+    else if (params.contains("agent_name") && params["agent_name"].is_string())
+        name = params["agent_name"].get<std::string>();
+    if (name.empty())
+        return tool_result_t::error("Missing required parameter: agent");
 
-    std::string slug = params["mode_slug"].get<std::string>();
     std::string reason;
     if (params.contains("reason") && params["reason"].is_string())
         reason = params["reason"].get<std::string>();
 
-    const auto* mode = aida_modes::find_mode(slug);
-    if (!mode)
-        return tool_result_t::error("Unknown mode: " + slug + ". Available: agent, code, architect, ask, debug");
+    const auto* info = aida::agent::get(name);
+    if (info == nullptr)
+        return tool_result_t::error("Unknown agent: " + name + ". Use list_agents to see available agents.");
 
-    aida_modes::set_active_mode(slug);
+    std::string previous = aida::agent::active_agent_name();
+    if (!aida::agent::set_active_agent(name))
+        return tool_result_t::error("Failed to switch agent: " + aida::agent::last_error());
 
-    std::string msg = "Switched to " + mode->display_name + " mode.";
+    if (previous != name) {
+        aida::events::agent_changed_t evt;
+        evt.session_id = conversations::current_id;
+        evt.previous_agent = previous;
+        evt.new_agent = name;
+        aida::events::publish(aida::events::event_agent_changed, evt);
+    }
+
+    std::string msg = std::string("Switched to '") + name + "' agent.";
     if (!reason.empty())
         msg += " Reason: " + reason;
 
-    output_log::push(bottom_tab_t::output, "[mode] " + msg);
+    output_log::push(bottom_tab_t::output, "[agent] " + msg);
     return tool_result_t::ok(msg);
 }
 
 
-tool_result_t handle_new_task(const json& params)
+tool_result_t handle_plan_enter(const json& )
 {
-    if (!params.contains("mode") || !params["mode"].is_string())
-        return tool_result_t::error("Missing required parameter: mode");
-    if (!params.contains("message") || !params["message"].is_string())
-        return tool_result_t::error("Missing required parameter: message");
+    if (aida::agent::active_agent_name() == "plan")
+        return tool_result_t::ok("Already in plan mode.");
 
-    std::string mode = params["mode"].get<std::string>();
-    std::string message = params["message"].get<std::string>();
+    std::string previous = aida::agent::active_agent_name();
+    if (!aida::agent::set_active_agent("plan"))
+        return tool_result_t::error("Failed to enter plan mode: " + aida::agent::last_error());
 
-    const auto* mode_cfg = aida_modes::find_mode(mode);
-    if (!mode_cfg)
-        return tool_result_t::error("Unknown mode: " + mode);
+    aida::events::agent_changed_t evt;
+    evt.session_id = conversations::current_id;
+    evt.previous_agent = previous;
+    evt.new_agent = "plan";
+    aida::events::publish(aida::events::event_agent_changed, evt);
 
-    std::string result = "New task created in " + mode_cfg->display_name + " mode.\n"
-                        "Task message: " + message + "\n"
-                        "Note: Sub-task execution will be handled by the orchestrator. "
-                        "The task has been queued for processing.";
+    output_log::push(bottom_tab_t::output, "[agent] Entered plan mode (previous: " + previous + ")");
 
-    output_log::push(bottom_tab_t::output, "[task] New sub-task in mode: " + mode);
+    return tool_result_t::ok(
+        "Entered plan mode. Edit/write/bash tools are now blocked. "
+        "Use plan_exit when ready to execute.");
+}
+
+
+tool_result_t handle_plan_exit(const json& params)
+{
+    if (aida::agent::active_agent_name() != "plan")
+        return tool_result_t::error("Not in plan mode.");
+
+    std::string summary;
+    if (params.contains("summary") && params["summary"].is_string())
+        summary = params["summary"].get<std::string>();
+
+    std::string handoff_text = summary;
+    if (!handoff_text.empty()) handoff_text += "\n\n";
+    handoff_text += "<plan_exit_handoff>";
+
+    int64_t now_ms = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+
+    std::string session_id = conversations::current_id;
+    if (!session_id.empty())
+    {
+        aida::session::message_t um;
+        um.id = session_id + "-plan-exit-" + std::to_string(now_ms);
+        um.session_id = session_id;
+        um.role = aida::session::message_t::role_t::user;
+        um.agent = "build";
+        aida::session::part_t pt;
+        pt.kind = aida::session::part_t::kind_t::text;
+        pt.text.text = handoff_text;
+        pt.text.synthetic = true;
+        um.parts.push_back(pt);
+        um.created_unix = now_ms / 1000;
+        (void)aida::session::append_message(um);
+    }
+
+    {
+        ChatMessage cm;
+        cm.text = handoff_text;
+        cm.is_user = true;
+        cm.timestamp = now_ms;
+        g_chat_messages.push_back(cm);
+        g_chat_scroll_to_bottom = true;
+    }
+
+    if (!aida::agent::set_active_agent("build"))
+        return tool_result_t::error("Failed to switch to build agent: " + aida::agent::last_error());
+
+    aida::events::agent_changed_t evt;
+    evt.session_id = session_id;
+    evt.previous_agent = "plan";
+    evt.new_agent = "build";
+    aida::events::publish(aida::events::event_agent_changed, evt);
+
+    output_log::push(bottom_tab_t::output,
+        std::string("[agent] plan_exit: switching to build agent") +
+        (summary.empty() ? std::string{} : std::string(" (summary: ") + summary.substr(0, 80) + ")"));
+
+    return tool_result_t::ok("Plan complete. Switching to build agent to execute.");
+}
+
+
+tool_result_t handle_task(const json& params)
+{
+    std::string agent_name;
+    if (params.contains("agent") && params["agent"].is_string())
+        agent_name = params["agent"].get<std::string>();
+    else if (params.contains("name") && params["name"].is_string())
+        agent_name = params["name"].get<std::string>();
+    if (agent_name.empty())
+        return tool_result_t::error("Missing required parameter: agent");
+
+    std::string prompt;
+    if (params.contains("prompt") && params["prompt"].is_string())
+        prompt = params["prompt"].get<std::string>();
+    else if (params.contains("description") && params["description"].is_string())
+        prompt = params["description"].get<std::string>();
+    if (prompt.empty())
+        return tool_result_t::error("Missing required parameter: prompt");
+
+    int max_steps = 0;
+    if (params.contains("max_steps") && params["max_steps"].is_number_integer())
+        max_steps = params["max_steps"].get<int>();
+
+    const aida::agent::agent_info_t* info = aida::agent::get(agent_name);
+    if (info == nullptr)
+        return tool_result_t::error("Unknown agent: " + agent_name);
+    if (info->mode == aida::agent::agent_info_t::mode_t::primary)
+        return tool_result_t::error(
+            "Agent '" + agent_name + "' is a primary agent and cannot be invoked as a subagent. "
+            "Use the 'switch_agent' tool to switch the conversation to it instead.");
+
+    std::string parent_session_id;
+
+    output_log::push(bottom_tab_t::output, "[task] Spawning subagent: " + agent_name);
+
+    std::string result;
+    bool ok = aida::agent::task::execute(agent_name, prompt, max_steps, parent_session_id, result);
+    if (!ok && result.empty())
+        return tool_result_t::error("Subagent failed: " + aida::agent::task::last_error());
     return tool_result_t::ok(result);
+}
+
+
+tool_result_t handle_list_agents(const json&)
+{
+    std::string out = "Available agents:\n";
+    json arr = json::array();
+    auto primaries = aida::agent::primary_agents();
+    auto subs = aida::agent::subagents();
+    for (const auto* a : primaries) {
+        out += "- " + a->name + " (primary): " + a->description + "\n";
+        arr.push_back({{"name", a->name}, {"mode", "primary"}, {"description", a->description}, {"hidden", a->hidden}});
+    }
+    for (const auto* a : subs) {
+        out += "- " + a->name + " (subagent): " + a->description + "\n";
+        arr.push_back({{"name", a->name}, {"mode", "subagent"}, {"description", a->description}, {"hidden", a->hidden}});
+    }
+    return tool_result_t::ok(out, json{{"agents", arr}});
 }
 
 
@@ -477,13 +615,14 @@ tool_result_t handle_run_slash_command(const json& params)
     if (command == "help") {
         return tool_result_t::ok(
             "Available slash commands:\n"
-            "- /help — Show available commands\n"
-            "- /clear — Clear the chat history\n"
-            "- /mode <slug> — Switch to a mode\n"
-            "- /checkpoint [message] — Save a checkpoint\n"
-            "- /restore <id> — Restore a checkpoint\n"
-            "- /skills — List available skills\n"
-            "- /index — Rebuild the code index\n");
+            "- /help - Show available commands\n"
+            "- /clear - Clear the chat history\n"
+            "- /agent <name> - Switch to an agent (build, plan, general, explore)\n"
+            "- /agents - List available agents\n"
+            "- /checkpoint [message] - Save a checkpoint\n"
+            "- /restore <id> - Restore a checkpoint\n"
+            "- /skills - List available skills\n"
+            "- /index - Rebuild the code index\n");
     }
 
     if (command == "clear") {
@@ -491,12 +630,16 @@ tool_result_t handle_run_slash_command(const json& params)
         return tool_result_t::ok("Chat history cleared.");
     }
 
-    if (command == "mode") {
+    if (command == "agent") {
         if (arguments.empty())
-            return tool_result_t::error("Usage: /mode <slug>");
+            return tool_result_t::error("Usage: /agent <name>");
         json p;
-        p["mode_slug"] = arguments;
-        return handle_switch_mode(p);
+        p["agent"] = arguments;
+        return handle_switch_agent(p);
+    }
+
+    if (command == "agents") {
+        return handle_list_agents(json::object());
     }
 
     if (command == "checkpoint") {
@@ -644,17 +787,43 @@ void shutdown_services()
 
 void register_workflow_tools(mcp_standalone::server_t& srv)
 {
-    srv.register_tool({"switch_mode",
-        "Switch the current operating mode. Available modes: agent, code, architect, ask, debug.",
-        {{"mode_slug", "string", "The mode to switch to (e.g. 'code', 'architect', 'ask')", true},
-         {"reason", "string", "Why you are switching modes", false}},
-        false, handle_switch_mode});
+    srv.register_tool({"switch_agent",
+        "Switch the current operating agent. Built-in primary agents: build (default), plan. "
+        "Subagents (build/plan only) cannot be activated as primary.",
+        {{"agent", "string", "Agent name (e.g. 'build', 'plan')", true},
+         {"reason", "string", "Why you are switching agents", false}},
+        false, handle_switch_agent});
 
-    srv.register_tool({"new_task",
-        "Create a new sub-task with a specific mode. Used for task delegation and orchestration.",
-        {{"mode", "string", "The mode for the sub-task", true},
-         {"message", "string", "The task description/message", true}},
-        false, handle_new_task});
+    srv.register_tool({"plan_enter",
+        "Enter PLAN mode. Use this when the user's request would benefit from planning before "
+        "implementation. Plan mode is read-only: edit/write/bash and other mutation tools become "
+        "hard-denied. Once a plan is ready, call plan_exit to switch to the build agent. Call this "
+        "tool when: the user explicitly asks for a plan; the request is complex enough to benefit "
+        "from research and design first; the task involves multiple files or architectural decisions. "
+        "Do NOT call for trivial single-step tasks or when the user has asked for immediate execution.",
+        {},
+        true, handle_plan_enter});
+
+    srv.register_tool({"plan_exit",
+        "Exit PLAN mode and switch to the build agent so the plan can be executed. Inserts a "
+        "synthetic user handoff message into the session, then switches to the build agent. "
+        "Call this only after the plan is fully written, all clarifying questions are answered, "
+        "and the user has confirmed (explicitly or implicitly) they are ready to execute.",
+        {{"summary", "string", "Optional one-paragraph plan summary that will be attached to the handoff message.", false}},
+        false, handle_plan_exit});
+
+    srv.register_tool({"task",
+        "Spawn a subagent in an isolated context to perform a focused task and return its final result. "
+        "Available subagents: 'general' (multi-step research), 'explore' (read-only file/binary search). "
+        "The subagent runs concurrently with its own LLM client and tool stack.",
+        {{"agent", "string", "Subagent name ('general' or 'explore')", true},
+         {"prompt", "string", "The task description / instructions for the subagent", true},
+         {"max_steps", "number", "Maximum tool-use turns the subagent may take (default 16, max 64)", false}},
+        false, handle_task});
+
+    srv.register_tool({"list_agents",
+        "List all registered agents (primary and subagent), including custom user-defined ones.",
+        {}, true, handle_list_agents});
 
     srv.register_tool({"ask_followup_question",
         "Ask the user a clarifying question. Use this when you need more information before proceeding.",

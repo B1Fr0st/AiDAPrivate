@@ -7,6 +7,7 @@
 
 #include "standalone_context.hpp"
 #include "provider_catalog.hpp"
+#include "session_store.hpp"
 
 
 namespace cost_calc {
@@ -142,6 +143,37 @@ inline cost_result_t calculate(
         return calculate_generic(model, input_tokens, output_tokens);
     }
 }
+
+
+struct turn_cost_t
+{
+    double input_cost       = 0.0;
+    double output_cost      = 0.0;
+    double cache_read_cost  = 0.0;
+    double cache_write_cost = 0.0;
+    double total_cost       = 0.0;
+};
+
+
+inline turn_cost_t compute_turn_cost(const aida::provider::model_info_t& model,
+                                      const aida::session::usage_tokens_t& usage)
+{
+    turn_cost_t r;
+    const double per = 1'000'000.0;
+    r.input_cost       = (model.cost.input_per_million       / per) * static_cast<double>(usage.input);
+    r.output_cost      = (model.cost.output_per_million      / per) * static_cast<double>(usage.output);
+    r.cache_read_cost  = (model.cost.cache_read_per_million  / per) * static_cast<double>(usage.cache_read);
+    r.cache_write_cost = (model.cost.cache_write_per_million / per) * static_cast<double>(usage.cache_write);
+    r.total_cost       = r.input_cost + r.output_cost + r.cache_read_cost + r.cache_write_cost;
+    return r;
+}
+
+
+bool persist_step_finish(const std::string& session_id,
+                         const std::string& message_id,
+                         const aida::provider::model_info_t& model,
+                         const aida::session::usage_tokens_t& usage,
+                         const std::string& finish_reason);
 
 
 }
