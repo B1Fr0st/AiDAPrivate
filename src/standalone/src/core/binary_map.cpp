@@ -178,27 +178,24 @@ namespace binary_map {
 			if (!ifs.is_open())
 				return;
 
-			try {
-				nlohmann::json root = nlohmann::json::parse(ifs, nullptr, false);
-				if (root.is_discarded())
-					return;
-				if (root.contains("pins") && root["pins"].is_array()) {
-					for (const auto& v : root["pins"]) {
-						if (v.is_number_unsigned() || v.is_number_integer()) {
-							pin_set().insert(v.get<uint64_t>());
-						} else if (v.is_string()) {
-							const auto s = v.get<std::string>();
-							if (s.size() > 2 && (s[0] == '0') && (s[1] == 'x' || s[1] == 'X')) {
-								char* endp = nullptr;
-								const auto val = std::strtoull(s.c_str() + 2, &endp, 16);
-								if (endp != nullptr && *endp == '\0')
-									pin_set().insert(static_cast<uint64_t>(val));
-							}
-						}
+			nlohmann::json root = nlohmann::json::parse(ifs, nullptr, false);
+			if (root.is_discarded())
+				return;
+			if (!root.contains("pins") || !root["pins"].is_array())
+				return;
+
+			for (const auto& v : root["pins"]) {
+				if (v.is_number_unsigned() || v.is_number_integer()) {
+					pin_set().insert(v.get<uint64_t>());
+				} else if (v.is_string()) {
+					const auto s = v.get<std::string>();
+					if (s.size() > 2 && (s[0] == '0') && (s[1] == 'x' || s[1] == 'X')) {
+						char* endp = nullptr;
+						const auto val = std::strtoull(s.c_str() + 2, &endp, 16);
+						if (endp != nullptr && *endp == '\0')
+							pin_set().insert(static_cast<uint64_t>(val));
 					}
 				}
-			} catch (...) {
-				return;
 			}
 		}
 
