@@ -41,4 +41,8 @@ bool is_process_attached();
 std::string get_attached_process_name();
 unsigned long get_attached_pid();
 
+void chat_handle_agent_shortcuts();
+void chat_render_agent_pill(float anchor_x, float anchor_y, float alpha);
+float chat_agent_pill_width();
+
 extern bool g_settings_open;

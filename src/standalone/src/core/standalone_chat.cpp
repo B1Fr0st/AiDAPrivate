@@ -11,6 +11,7 @@
 #include "standalone_settings.hpp"
 #include "standalone_driver.hpp"
 #include "agent_registry.hpp"
+#include "agent_picker_view.hpp"
 #include "binary_map.hpp"
 #include "tool_repetition.hpp"
 #include "cost_calculator.hpp"

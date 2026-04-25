@@ -38,7 +38,8 @@ enum class center_view_t : int {
 	stealth_view,
 	scan_hub,
 	types_hub,
-	analysis_hub
+	analysis_hub,
+	binary_map
 };
 
 

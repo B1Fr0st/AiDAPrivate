@@ -109,6 +109,11 @@ namespace skills {
 	std::vector<const skill_metadata_t*>        available_for_agent(const std::string& agent_name);
 
 
+	bool                                        set_enabled(const std::string& name, bool enabled);
+	bool                                        is_enabled(const std::string& name);
+	std::vector<std::string>                    list_disabled();
+
+
 }
 }
 
@@ -152,6 +157,10 @@ namespace skills {
 		std::mutex          s_remote_mtx;
 		bool                s_remote_loaded = false;
 		std::vector<std::string> s_remote_urls;
+
+		std::mutex          s_disabled_mtx;
+		bool                s_disabled_loaded = false;
+		std::set<std::string> s_disabled_set;
 
 		std::unique_ptr<manager_t> s_manager;
 		std::mutex                 s_manager_mtx;
@@ -308,6 +317,36 @@ namespace skills {
 			root["skills"]["urls"] = nlohmann::json::array();
 			for (const auto& u : s_remote_urls)
 				root["skills"]["urls"].push_back(u);
+			return save_aida_json(root);
+		}
+
+		void load_disabled_set_locked()
+		{
+			if (s_disabled_loaded) return;
+			s_disabled_loaded = true;
+			s_disabled_set.clear();
+			nlohmann::json root;
+			load_aida_json_section(root);
+			if (!root.contains("skills") || !root["skills"].is_object()) return;
+			const auto& sec = root["skills"];
+			if (!sec.contains("disabled") || !sec["disabled"].is_array()) return;
+			for (const auto& d : sec["disabled"]) {
+				if (!d.is_string()) continue;
+				const auto val = d.get<std::string>();
+				if (val.empty()) continue;
+				s_disabled_set.insert(val);
+			}
+		}
+
+		bool save_disabled_set_locked()
+		{
+			nlohmann::json root;
+			load_aida_json_section(root);
+			if (!root.contains("skills") || !root["skills"].is_object())
+				root["skills"] = nlohmann::json::object();
+			root["skills"]["disabled"] = nlohmann::json::array();
+			for (const auto& d : s_disabled_set)
+				root["skills"]["disabled"].push_back(d);
 			return save_aida_json(root);
 		}
 
@@ -848,8 +887,17 @@ namespace skills {
 		std::vector<skill_as_command_t> out;
 		auto& mgr = global();
 		auto list = mgr.get_all();
+
+		std::set<std::string> disabled_snapshot;
+		{
+			std::lock_guard<std::mutex> lk(s_disabled_mtx);
+			load_disabled_set_locked();
+			disabled_snapshot = s_disabled_set;
+		}
+
 		out.reserve(list.size());
 		for (const auto& meta : list) {
+			if (disabled_snapshot.count(meta.name) > 0) continue;
 			std::string content;
 			if (!read_file_text(std::filesystem::path(meta.file_path), content)) continue;
 			std::string body = body_after_frontmatter(content);
@@ -1050,12 +1098,20 @@ namespace skills {
 
 		const ::aida::agent::agent_info_t* agent = ::aida::agent::get(agent_name);
 
+		std::set<std::string> disabled_snapshot;
+		{
+			std::lock_guard<std::mutex> lk(s_disabled_mtx);
+			load_disabled_set_locked();
+			disabled_snapshot = s_disabled_set;
+		}
+
 		std::vector<skill_metadata_t> snapshot = mgr.get_all();
 		std::sort(snapshot.begin(), snapshot.end(), [](const skill_metadata_t& a, const skill_metadata_t& b) {
 			return a.name < b.name;
 		});
 
 		for (const auto& meta : snapshot) {
+			if (disabled_snapshot.count(meta.name) > 0) continue;
 			const auto* live = mgr.find(meta.name);
 			if (live == nullptr) continue;
 
@@ -1079,6 +1135,46 @@ namespace skills {
 
 			out.push_back(live);
 		}
+		return out;
+	}
+
+
+	bool set_enabled(const std::string& name, bool enabled)
+	{
+		if (name.empty()) {
+			set_error("set_enabled: empty name");
+			return false;
+		}
+		std::lock_guard<std::mutex> lk(s_disabled_mtx);
+		load_disabled_set_locked();
+		const bool was_disabled = s_disabled_set.count(name) > 0;
+		if (enabled) {
+			if (!was_disabled) return true;
+			s_disabled_set.erase(name);
+		} else {
+			if (was_disabled) return true;
+			s_disabled_set.insert(name);
+		}
+		return save_disabled_set_locked();
+	}
+
+
+	bool is_enabled(const std::string& name)
+	{
+		if (name.empty()) return false;
+		std::lock_guard<std::mutex> lk(s_disabled_mtx);
+		load_disabled_set_locked();
+		return s_disabled_set.count(name) == 0;
+	}
+
+
+	std::vector<std::string> list_disabled()
+	{
+		std::lock_guard<std::mutex> lk(s_disabled_mtx);
+		load_disabled_set_locked();
+		std::vector<std::string> out;
+		out.reserve(s_disabled_set.size());
+		for (const auto& n : s_disabled_set) out.push_back(n);
 		return out;
 	}
 

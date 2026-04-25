@@ -82,6 +82,23 @@ struct remote_resource_t
 };
 
 
+struct prompt_argument_t
+{
+    std::string name;
+    std::string description;
+    bool        required = false;
+};
+
+
+struct remote_prompt_t
+{
+    std::string                    server_name;
+    std::string                    name;
+    std::string                    description;
+    std::vector<prompt_argument_t> arguments;
+};
+
+
 struct call_result_t
 {
     bool        success = false;
@@ -166,6 +183,13 @@ public:
 
 
     std::string read_resource(const std::string& uri);
+
+
+    std::vector<remote_prompt_t> list_prompts();
+
+
+    std::string get_prompt(const std::string& prompt_name,
+                           const std::map<std::string, std::string>& arguments);
 
 
     bool                 is_connected()  const;
@@ -271,6 +295,12 @@ public:
 
     std::vector<remote_resource_t> get_all_resources();
     std::string read_resource(const std::string& server_name, const std::string& uri);
+
+
+    std::vector<remote_prompt_t> get_all_prompts();
+    std::string                  get_prompt(const std::string& server_name,
+                                            const std::string& prompt_name,
+                                            const std::map<std::string, std::string>& arguments);
 
 
     struct server_status_t

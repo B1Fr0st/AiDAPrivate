@@ -1331,6 +1331,115 @@ std::string client_t::read_resource(const std::string& uri)
     return {};
 }
 
+std::vector<remote_prompt_t> client_t::list_prompts()
+{
+    std::lock_guard<std::mutex> lk(_mtx);
+
+    if (_state != connection_state_t::connected) {
+        _last_error = "Not connected";
+        return {};
+    }
+
+    json req = rpc_request("prompts/list");
+    json response;
+    try {
+        response = send_rpc(req);
+    } catch (const std::exception& e) {
+        _last_error = std::string("prompts/list failed: ") + e.what();
+        return {};
+    }
+
+    if (response.contains("error")) {
+        _last_error = response["error"].value("message", "prompts/list error");
+        return {};
+    }
+
+    std::vector<remote_prompt_t> prompts;
+    if (response.contains("result") && response["result"].contains("prompts")) {
+        for (const auto& p : response["result"]["prompts"]) {
+            remote_prompt_t pr;
+            pr.server_name = _server_name_str;
+            pr.name        = p.value("name", "");
+            pr.description = p.value("description", "");
+            if (p.contains("arguments") && p["arguments"].is_array()) {
+                for (const auto& a : p["arguments"]) {
+                    prompt_argument_t arg;
+                    arg.name        = a.value("name", "");
+                    arg.description = a.value("description", "");
+                    arg.required    = a.value("required", false);
+                    if (!arg.name.empty())
+                        pr.arguments.push_back(std::move(arg));
+                }
+            }
+            if (!pr.name.empty())
+                prompts.push_back(std::move(pr));
+        }
+    }
+
+    return prompts;
+}
+
+std::string client_t::get_prompt(const std::string& prompt_name,
+                                 const std::map<std::string, std::string>& arguments)
+{
+    std::lock_guard<std::mutex> lk(_mtx);
+
+    if (_state != connection_state_t::connected) {
+        _last_error = "Not connected";
+        return {};
+    }
+
+    json args_obj = json::object();
+    for (const auto& kv : arguments)
+        args_obj[kv.first] = kv.second;
+
+    json params = json::object();
+    params["name"] = prompt_name;
+    if (!arguments.empty())
+        params["arguments"] = args_obj;
+
+    json req = rpc_request("prompts/get", params);
+    json response;
+    try {
+        response = send_rpc(req);
+    } catch (const std::exception& e) {
+        _last_error = std::string("prompts/get failed: ") + e.what();
+        return {};
+    }
+
+    if (response.contains("error")) {
+        _last_error = response["error"].value("message", "prompts/get error");
+        return {};
+    }
+
+    if (!response.contains("result"))
+        return {};
+
+    const auto& result = response["result"];
+    std::string accumulated;
+    if (result.contains("messages") && result["messages"].is_array()) {
+        for (const auto& msg : result["messages"]) {
+            if (!msg.contains("content")) continue;
+            const auto& content = msg["content"];
+            if (content.is_object()) {
+                if (content.value("type", "") == "text") {
+                    if (!accumulated.empty()) accumulated += "\n";
+                    accumulated += content.value("text", "");
+                }
+            } else if (content.is_array()) {
+                for (const auto& block : content) {
+                    if (block.value("type", "") == "text") {
+                        if (!accumulated.empty()) accumulated += "\n";
+                        accumulated += block.value("text", "");
+                    }
+                }
+            }
+        }
+    }
+
+    return accumulated;
+}
+
 bool client_t::is_connected() const
 {
     std::lock_guard<std::mutex> lk(_mtx);
@@ -1992,6 +2101,33 @@ std::string manager_t::read_resource(const std::string& server_name, const std::
     for (auto& e : _entries) {
         if (e.cfg.name == server_name && e.client.is_connected())
             return e.client.read_resource(uri);
+    }
+    return {};
+}
+
+std::vector<remote_prompt_t> manager_t::get_all_prompts()
+{
+    std::lock_guard<std::mutex> lk(_mtx);
+
+    std::vector<remote_prompt_t> all;
+    for (auto& e : _entries) {
+        if (e.client.is_connected()) {
+            auto pr = e.client.list_prompts();
+            all.insert(all.end(), pr.begin(), pr.end());
+        }
+    }
+    return all;
+}
+
+std::string manager_t::get_prompt(const std::string& server_name,
+                                  const std::string& prompt_name,
+                                  const std::map<std::string, std::string>& arguments)
+{
+    std::lock_guard<std::mutex> lk(_mtx);
+
+    for (auto& e : _entries) {
+        if (e.cfg.name == server_name && e.client.is_connected())
+            return e.client.get_prompt(prompt_name, arguments);
     }
     return {};
 }

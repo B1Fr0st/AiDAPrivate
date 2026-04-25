@@ -38,6 +38,8 @@
 #include "../core/analysis_hub_view.hpp"
 #include "../core/source_reconstruct_view.hpp"
 #include "../core/work_queue.hpp"
+#include "../core/session_history_view.hpp"
+#include "../core/binary_map_view.hpp"
 
 static ID3D11ShaderResourceView* g_send_icon_srv    = nullptr;
 static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
@@ -778,6 +780,10 @@ void helpers::render_title()
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
 			globals::ui::active_center_view = center_view_t::debugger_view;
+		}
+
+		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_B, false)) {
+			globals::ui::active_center_view = center_view_t::binary_map;
 		}
 
 		if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
@@ -3411,6 +3417,7 @@ void helpers::render_title()
 			anchor = add_right_tab("Decompiler", center_view_t::decompiler, anchor);
 			anchor = add_right_tab("Types",      center_view_t::types_hub, anchor);
 			anchor = add_right_tab("Analysis",   center_view_t::analysis_hub, anchor);
+			anchor = add_right_tab("Binary Map", center_view_t::binary_map, anchor);
 		}
 
 		bool cf_clicked = ghost_btn("Choose File",
@@ -3608,6 +3615,11 @@ void helpers::render_title()
 		|| cv == center_view_t::stealth_view || cv == center_view_t::fuzzer_view)
 	{
 		analysis_hub_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+	}
+
+	else if (cv == center_view_t::binary_map)
+	{
+		aida::binary_map_view::render(0, 0, vw, vh, a, ax3, ay3, az3);
 	}
 
 	else
@@ -5398,6 +5410,7 @@ void helpers::render_title()
 			{ "Scanner Hub",                 "Ctrl+Shift+M",   28 },
 			{ "Analysis Hub",               "",                 29 },
 			{ "Debugger",                    "Ctrl+Shift+D",    30 },
+			{ "Binary Map",                  "Ctrl+Shift+B",    31 },
 		};
 		static const int cmd_count = sizeof(all_cmds) / sizeof(all_cmds[0]);
 		static int palette_sel = 0;
@@ -5518,6 +5531,7 @@ void helpers::render_title()
 			case 28: globals::ui::active_center_view = center_view_t::scan_hub; break;
 			case 29: globals::ui::active_center_view = center_view_t::analysis_hub; break;
 			case 30: globals::ui::active_center_view = center_view_t::debugger_view; break;
+			case 31: globals::ui::active_center_view = center_view_t::binary_map; break;
 			}
 			globals::ui::command_palette_open = false;
 			globals::ui::command_palette_buf[0] = '\0';
@@ -6212,6 +6226,7 @@ void helpers::render_title()
 				{ "Ctrl+W",       "Close Tab" },
 				{ "Ctrl+Tab",     "Next Tab" },
 				{ "Ctrl+Shift+Tab", "Previous Tab" },
+				{ "Ctrl+Shift+B", "Binary Map View" },
 			};
 
 			auto render_section = [&](const char* title, const ShortcutEntry* entries, int count) {
@@ -6226,7 +6241,7 @@ void helpers::render_title()
 			ImGui::BeginChild("##kb_scroll", ImVec2(-1, sh - 80.f));
 			render_section("General", general, 6);
 			render_section("Editor", editor, 9);
-			render_section("Panels", panels, 7);
+			render_section("Panels", panels, 8);
 			ImGui::EndChild();
 
 			ImGui::Spacing();
