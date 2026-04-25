@@ -24,6 +24,9 @@
 #include "core/script_engine.hpp"
 #include "core/toast_notification.hpp"
 #include "core/source_reconstruct_view.hpp"
+#include "core/command_palette_view.hpp"
+#include "core/agent_picker_view.hpp"
+#include "core/settings_overlay.hpp"
 #include "helpers/stb_image.h"
 
 #include "core/embedded_resources.hpp"
@@ -170,6 +173,30 @@ __declspec(noinline) static DWORD seh_render_toast(uint64_t frame_number)
 {
     __try {
         toast_notification::render();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_render_command_palette(uint64_t frame_number)
+{
+    __try {
+        aida::command_palette::render();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+    return 0;
+}
+
+__declspec(noinline) static DWORD seh_render_agent_picker(uint64_t frame_number)
+{
+    __try {
+        aida::agent_picker::render_if_open();
+        if (aida::agent_picker::consume_manager_request()) {
+            aida::settings_overlay::open();
+            aida::settings_overlay::set_active_tab(aida::settings_overlay::tab_agents);
+        }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         return GetExceptionCode();
     }
@@ -748,6 +775,14 @@ int main(int, char**)
 
             if (frame_number < 5)
                 crash_log_write("render_title_done");
+
+            DWORD seh_cp = seh_render_command_palette(frame_number);
+            if (seh_cp != 0)
+                crash_log_fmt("SEH_in_command_palette code=0x%08X frame=%llu", seh_cp, frame_number);
+
+            DWORD seh_ap = seh_render_agent_picker(frame_number);
+            if (seh_ap != 0)
+                crash_log_fmt("SEH_in_agent_picker code=0x%08X frame=%llu", seh_ap, frame_number);
 
             DWORD seh_sr = seh_render_source_reconstruct(frame_number);
             if (seh_sr != 0)

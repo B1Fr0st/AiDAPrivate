@@ -399,6 +399,59 @@ namespace commands {
 		}
 
 
+		bool resolver_view_switch(center_view_t target,
+		                          const std::vector<std::string>& args,
+		                          std::string& out_text)
+		{
+			(void)args;
+			globals::ui::active_center_view = target;
+			out_text = "[view] switched";
+			return true;
+		}
+
+
+		bool resolver_open_settings(const std::vector<std::string>& args, std::string& out_text)
+		{
+			(void)args;
+			g_settings_open = true;
+			out_text = "[settings] opened";
+			return true;
+		}
+
+
+		bool resolver_toggle_left(const std::vector<std::string>& args, std::string& out_text)
+		{
+			(void)args;
+			globals::ui::panel_left_visible = !globals::ui::panel_left_visible;
+			g_sa_settings.workspace.left_visible = globals::ui::panel_left_visible;
+			g_sa_settings.save();
+			out_text = "[panel] left toggled";
+			return true;
+		}
+
+
+		bool resolver_toggle_right(const std::vector<std::string>& args, std::string& out_text)
+		{
+			(void)args;
+			globals::ui::panel_right_visible = !globals::ui::panel_right_visible;
+			g_sa_settings.workspace.right_visible = globals::ui::panel_right_visible;
+			g_sa_settings.save();
+			out_text = "[panel] right toggled";
+			return true;
+		}
+
+
+		bool resolver_toggle_bottom(const std::vector<std::string>& args, std::string& out_text)
+		{
+			(void)args;
+			globals::ui::panel_bottom_visible = !globals::ui::panel_bottom_visible;
+			g_sa_settings.workspace.bottom_visible = globals::ui::panel_bottom_visible;
+			g_sa_settings.save();
+			out_text = "[panel] bottom toggled";
+			return true;
+		}
+
+
 		void register_builtins_locked(std::vector<command_t>& dst)
 		{
 			{
@@ -457,6 +510,79 @@ namespace commands {
 				c.description = "clear chat history (no LLM call)";
 				c.source      = command_source_t::builtin;
 				c.resolver    = resolver_clear;
+				dst.push_back(std::move(c));
+			}
+
+			{
+				command_t c;
+				c.name        = "settings";
+				c.description = "open the Settings overlay";
+				c.source      = command_source_t::builtin;
+				c.resolver    = resolver_open_settings;
+				dst.push_back(std::move(c));
+			}
+
+			struct view_entry_t { const char* name; const char* desc; center_view_t target; };
+			static const view_entry_t view_entries[] = {
+				{ "view:editor",            "switch to code editor",         center_view_t::code_editor      },
+				{ "view:disassembly",       "switch to disassembly view",    center_view_t::disassembly      },
+				{ "view:hex",               "switch to hex view",            center_view_t::hex_view         },
+				{ "view:network",           "switch to network monitor",     center_view_t::network_view     },
+				{ "view:scanner",           "switch to scanner hub",         center_view_t::scan_hub         },
+				{ "view:analysis",          "switch to analysis hub",        center_view_t::analysis_hub     },
+				{ "view:debugger",          "switch to debugger",            center_view_t::debugger_view    },
+				{ "view:decompiler",        "switch to decompiler",          center_view_t::decompiler       },
+				{ "view:struct",            "switch to struct recon",        center_view_t::struct_recon     },
+				{ "view:crypto",            "switch to crypto scanner",      center_view_t::crypto_scanner   },
+				{ "view:aob",               "switch to aob generator",       center_view_t::aob_generator    },
+				{ "view:fuzzer",            "switch to fuzzer",              center_view_t::fuzzer_view      },
+				{ "view:xrefs",             "switch to xref browser",        center_view_t::xref_browser     },
+				{ "view:snapshot",          "switch to snapshot diff",       center_view_t::snapshot_diff    },
+				{ "view:pointer",           "switch to pointer scanner",     center_view_t::pointer_scanner  },
+				{ "view:decrypt-oracle",    "switch to decrypt oracle",      center_view_t::decrypt_oracle   },
+				{ "view:integrity",         "switch to integrity hunter",    center_view_t::integrity_hunter },
+				{ "view:symbolic",          "switch to symbolic engine",     center_view_t::symbolic_view    },
+				{ "view:taint",             "switch to taint view",          center_view_t::taint_view       },
+				{ "view:deobfuscation",     "switch to deobfuscation",       center_view_t::deobfuscation_view },
+				{ "view:stealth",           "switch to stealth view",        center_view_t::stealth_view     },
+				{ "view:types",             "switch to types hub",           center_view_t::types_hub        },
+				{ "view:binary-map",        "switch to binary map",          center_view_t::binary_map       },
+				{ "view:memory-scanner",    "switch to memory scanner",      center_view_t::memory_scanner   },
+			};
+			for (const auto& v : view_entries) {
+				command_t c;
+				c.name        = v.name;
+				c.description = v.desc;
+				c.source      = command_source_t::builtin;
+				center_view_t target = v.target;
+				c.resolver = [target](const std::vector<std::string>& args, std::string& out) -> bool {
+					return resolver_view_switch(target, args, out);
+				};
+				dst.push_back(std::move(c));
+			}
+
+			{
+				command_t c;
+				c.name        = "panel:left";
+				c.description = "toggle left panel (explorer)";
+				c.source      = command_source_t::builtin;
+				c.resolver    = resolver_toggle_left;
+				dst.push_back(std::move(c));
+			}
+			{
+				command_t c;
+				c.name        = "panel:right";
+				c.description = "toggle right panel (chat)";
+				c.source      = command_source_t::builtin;
+				c.resolver    = resolver_toggle_right;
+				dst.push_back(std::move(c));
+			}
+			{
+				command_t c;
+				c.name        = "panel:bottom";
+				c.description = "toggle bottom panel (output)";
+				c.source      = command_source_t::builtin;
+				c.resolver    = resolver_toggle_bottom;
 				dst.push_back(std::move(c));
 			}
 		}
