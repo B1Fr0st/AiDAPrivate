@@ -65,8 +65,8 @@ namespace events {
         return detail::last_error_slot();
     }
 
-    template <typename Payload>
-    subscription_handle_t subscribe(const event_def_t<Payload>& def, std::function<void(const Payload&)> callback)
+    template <typename Payload, typename Callable>
+    subscription_handle_t subscribe(const event_def_t<Payload>& def, Callable&& callback)
     {
         subscription_handle_t handle;
         if (def.type_name == nullptr || def.type_name[0] == '\0')
@@ -74,13 +74,13 @@ namespace events {
             detail::set_last_error("event_bus.subscribe: invalid event type_name");
             return handle;
         }
-        if (!callback)
+
+        std::function<void(const Payload&)> cb_copy(std::forward<Callable>(callback));
+        if (!cb_copy)
         {
             detail::set_last_error("event_bus.subscribe: null callback");
             return handle;
         }
-
-        std::function<void(const Payload&)> cb_copy = std::move(callback);
 
         detail::callback_invoker_t invoker = [cb_copy](const void* payload_ptr)
         {

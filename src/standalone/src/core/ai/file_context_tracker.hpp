@@ -299,9 +299,6 @@ inline std::string build_environment_details(
 
     env += "# Environment Details\n\n";
 
-    OSVERSIONINFOEXW osvi{};
-    osvi.dwOSVersionInfoSize = sizeof(osvi);
-
     env += "- **OS:** Windows (x64)\n";
     env += "- **Shell:** PowerShell\n";
 

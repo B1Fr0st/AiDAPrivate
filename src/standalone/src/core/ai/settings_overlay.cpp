@@ -439,7 +439,7 @@ namespace settings_overlay {
 										toast_notification::toast_type_t::error);
 								else
 									toast_notification::push(std::string("MCP auth ") + nm + ": OK",
-										toast_notification::toast_type_t::success);
+										toast_notification::toast_type_t::info);
 							});
 					}
 				}
@@ -680,7 +680,7 @@ namespace settings_overlay {
 						char m[160];
 						std::snprintf(m, sizeof(m), "Compacted %d msgs, freed %d tokens",
 							res.messages_summarized, res.tokens_freed);
-						toast_notification::push(m, toast_notification::toast_type_t::success);
+						toast_notification::push(m, toast_notification::toast_type_t::info);
 					}
 				}
 			}

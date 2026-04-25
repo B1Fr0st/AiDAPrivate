@@ -805,11 +805,11 @@ Rules:
 			return nullptr;
 		}
 		result = *base;
-		const aida::provider::model_info_t* small = aida::provider::catalog::get_small_model(provider_id);
-		if (small) {
+		const aida::provider::model_info_t* small_model = aida::provider::catalog::get_small_model(provider_id);
+		if (small_model) {
 			agent_model_override_t override_info;
 			override_info.provider_id = provider_id;
-			override_info.model_id = small->id;
+			override_info.model_id = small_model->id;
 			result.model_override = override_info;
 		}
 		return &result;
