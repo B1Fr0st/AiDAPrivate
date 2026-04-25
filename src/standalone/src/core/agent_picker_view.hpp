@@ -291,12 +291,12 @@ namespace agent_picker {
 		float ay = globals::ui::accent.y;
 		float az = globals::ui::accent.z;
 
-		float content_x = px + 14.f;
-		float content_y = py + 44.f;
+		float content_x_local = 14.f;
+		float content_y_local = 44.f;
 		float content_w = sw - 28.f;
 
-		ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
-		ImGui::SetNextWindowSize(display, ImGuiCond_Always);
+		ImGui::SetNextWindowPos(ImVec2(px, py), ImGuiCond_Always);
+		ImGui::SetNextWindowSize(ImVec2(sw, sh), ImGuiCond_Always);
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
 		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
@@ -305,50 +305,39 @@ namespace agent_picker {
 			ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
 			ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
 			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings |
-			ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoInputs)) {
-			ImGui::End();
-		}
-		ImGui::PopStyleColor();
-		ImGui::PopStyleVar(2);
-
-		ImDrawList* fdl = ImGui::GetForegroundDrawList();
-		fdl->AddRectFilled(ImVec2(0, 0), display,
-			IM_COL32(0, 0, 0, static_cast<int>(150 * anim_v)));
-		for (int s = 0; s < 4; ++s) {
-			float off = 4.f + s * 3.f;
-			fdl->AddRectFilled(
-				ImVec2(px + off, py + off),
-				ImVec2(px + sw + off, py + sh + off),
-				IM_COL32(0, 0, 0, static_cast<int>(28 * alpha * (4 - s) / 4.f)), 12.f);
-		}
-		fdl->AddRectFilled(ImVec2(px, py), ImVec2(px + sw, py + sh),
-			IM_COL32(28, 28, 38, static_cast<int>(245 * alpha)), 12.f);
-		fdl->AddRect(ImVec2(px, py), ImVec2(px + sw, py + sh),
-			IM_COL32(80, 80, 120, static_cast<int>(60 * alpha)), 12.f);
-		fdl->AddRectFilled(ImVec2(px + 1.f, py + 1.f), ImVec2(px + sw - 1.f, py + 3.f),
-			IM_COL32(static_cast<int>(ax * 255), static_cast<int>(ay * 255), static_cast<int>(az * 255),
-				static_cast<int>(180 * alpha)), 2.f);
-
-		std::string title = "Switch agent";
-		fdl->AddText(ImVec2(px + 18.f, py + 14.f),
-			IM_COL32(232, 232, 245, static_cast<int>(245 * alpha)), title.c_str());
-
-		std::string hint = "Esc to cancel  -  Click to switch";
-		ImVec2 hts = ImGui::CalcTextSize(hint.c_str());
-		fdl->AddText(ImVec2(px + sw - hts.x - 18.f, py + 18.f),
-			IM_COL32(150, 152, 168, static_cast<int>(180 * alpha)), hint.c_str());
-
-		ImGui::SetNextWindowPos(ImVec2(px, py), ImGuiCond_Always);
-		ImGui::SetNextWindowSize(ImVec2(sw, sh), ImGuiCond_Always);
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
-		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
-		bool win_open2 = true;
-		if (ImGui::Begin("##aida_agent_picker_panel", &win_open2,
-			ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-			ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings |
 			ImGuiWindowFlags_NoDocking)) {
+
+			ImDrawList* wdl = ImGui::GetWindowDrawList();
+			ImDrawList* bgdl = ImGui::GetBackgroundDrawList();
+			bgdl->AddRectFilled(ImVec2(0, 0), display,
+				IM_COL32(0, 0, 0, static_cast<int>(150 * anim_v)));
+
+			for (int s = 0; s < 4; ++s) {
+				float off = 4.f + s * 3.f;
+				wdl->AddRectFilled(
+					ImVec2(px + off, py + off),
+					ImVec2(px + sw + off, py + sh + off),
+					IM_COL32(0, 0, 0, static_cast<int>(28 * alpha * (4 - s) / 4.f)), 12.f);
+			}
+			wdl->AddRectFilled(ImVec2(px, py), ImVec2(px + sw, py + sh),
+				IM_COL32(28, 28, 38, static_cast<int>(245 * alpha)), 12.f);
+			wdl->AddRect(ImVec2(px, py), ImVec2(px + sw, py + sh),
+				IM_COL32(80, 80, 120, static_cast<int>(60 * alpha)), 12.f);
+			wdl->AddRectFilled(ImVec2(px + 1.f, py + 1.f), ImVec2(px + sw - 1.f, py + 3.f),
+				IM_COL32(static_cast<int>(ax * 255), static_cast<int>(ay * 255), static_cast<int>(az * 255),
+					static_cast<int>(180 * alpha)), 2.f);
+
+			std::string title = "Switch agent";
+			wdl->AddText(ImVec2(px + 18.f, py + 14.f),
+				IM_COL32(232, 232, 245, static_cast<int>(245 * alpha)), title.c_str());
+
+			std::string hint = "Esc to cancel  -  Click to switch";
+			ImVec2 hts = ImGui::CalcTextSize(hint.c_str());
+			wdl->AddText(ImVec2(px + sw - hts.x - 18.f, py + 18.f),
+				IM_COL32(150, 152, 168, static_cast<int>(180 * alpha)), hint.c_str());
+
+			float content_x = px + content_x_local;
+			float content_y = py + content_y_local;
 
 			ImGui::SetCursorScreenPos(ImVec2(content_x, content_y));
 			ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
